@@ -25,6 +25,38 @@ static ts_gc_header* g_young_heap = NULL;
 static ts_gc_header* g_old_heap = NULL;
 static size_t g_alloc=0, g_young_alloc=0, g_old_alloc=0;
 static size_t g_young_threshold=65536, g_full_threshold=262144;
+
+/* ---- bump nursery (gc_moving_plan Phase B) ----
+   Young movable cells live in 256KB-aligned arena chunks: allocation is a bump
+   (pointer add + memset), death is free-of-payload only, and the whole arena
+   resets after each minor GC ("arena cells leave by copy or die" — they are
+   never promoted in place because the cell memory belongs to the chunk).
+   Large cells (>= 4KB inline strings etc.), Promise/Coro/Proxy and everything
+   under TSAOT_GC_NURSERY=0 stay on the classic calloc young list (unpooled).
+   The chunk alignment gives O(1) cell→chunk lookup by mask, which the pinned
+   path below and Phase C's pointer rewrites rely on.
+   Pinned defense: a pinned arena cell (e.g. ts_json_parse pins the source
+   string's storage across an allocating parse) can neither move nor be
+   promoted in place. Its chunk is RETAINED (kept out of the reset pool) and
+   the cell is tracked on g_pinned_young; the next collection that sees it
+   unpinned evacuates it and, once a retained chunk holds no pinned survivors,
+   the chunk returns to the free pool. */
+#define GC_NURSERY_CHUNK_BYTES ((size_t)(256u * 1024u))
+#define GC_NURSERY_MAX_CELL    ((size_t)4096u)
+typedef struct gc_chunk {
+  struct gc_chunk* next;
+  size_t used;          /* bump offset from data start */
+  uint32_t pinned_live; /* pinned survivors still resident (retained chunks) */
+} gc_chunk;
+#define GC_NURSERY_DATA_OFF  ((sizeof(gc_chunk) + 15u) & ~(size_t)15u)
+#define GC_NURSERY_DATA_BYTES (GC_NURSERY_CHUNK_BYTES - GC_NURSERY_DATA_OFF)
+static gc_chunk* g_nursery_active = NULL;   /* chunks bumped this cycle; head is current */
+static gc_chunk* g_nursery_free = NULL;     /* empty chunks kept for reuse */
+static gc_chunk* g_nursery_retained = NULL; /* chunks held in place by pinned survivors */
+static ts_gc_header* g_pinned_young = NULL; /* pinned arena survivors (gc_next reused) */
+static size_t g_nursery_used_bytes = 0;     /* bump total this cycle (minor-GC trigger) */
+static size_t g_nursery_cap_bytes = (size_t)4u * 1024u * 1024u; /* TSAOT_GC_NURSERY_BYTES */
+static int g_nursery_enabled = 1;           /* TSAOT_GC_NURSERY=0 kill switch */
 static tsv** g_roots=NULL; static int g_root_len=0, g_root_cap=0;
 static ts_gc_header** g_remset=NULL; static size_t g_rem_len=0, g_rem_cap=0;
 ts_gc_header** g_ts_handle_table = NULL;
@@ -43,6 +75,7 @@ static struct {
   unsigned long long minor_gc, full_gc, gc_pause_ns, gc_pause_max_ns;
   unsigned long long mark_stack_peak;
   unsigned long long alloc_count, alloc_bytes, handle_alloc, root_push;
+  unsigned long long nursery_alloc, nursery_chunks, retained_chunks;
   unsigned long long call_env_malloc;
   unsigned long long concat_calls, concat_bytes;
   unsigned long long intern_calls, intern_probes;
@@ -80,6 +113,8 @@ __attribute__((destructor)) static void ts_rt_stats_dump(void){
   fprintf(out, "[rt_stats] alloc: count=%llu bytes=%llu handle_alloc=%llu handle_cap=%u root_push=%llu\n",
           g_rt_stats.alloc_count, g_rt_stats.alloc_bytes, g_rt_stats.handle_alloc,
           g_handle_cap, g_rt_stats.root_push);
+  fprintf(out, "[rt_stats] nursery: alloc=%llu chunks=%llu retained=%llu\n",
+          g_rt_stats.nursery_alloc, g_rt_stats.nursery_chunks, g_rt_stats.retained_chunks);
   fprintf(out, "[rt_stats] ts_call env_malloc=%llu | concat: calls=%llu bytes=%llu\n",
           g_rt_stats.call_env_malloc, g_rt_stats.concat_calls, g_rt_stats.concat_bytes);
   rt_stats_hist_line(out, "map_find", g_rt_stats.map_find_calls, g_rt_stats.map_find_probes, g_rt_stats.map_find_hist);
@@ -177,6 +212,7 @@ static int ts_string_own_prop(tsv obj, ts_key key, tsv* out);
 static int field_name_is(uint32_t id, const char* lit);
 static int field_bytes_is(const char* n, uint32_t len, const char* lit);
 static int prop_key_is_array_index(uint32_t key, uint32_t* idx);
+static int gc_moving_minor_enabled(void);
 static void gc_config_init(void){
   static int inited = 0;
   if (inited) return;
@@ -186,6 +222,21 @@ static void gc_config_init(void){
     char* end = NULL;
     unsigned long long v = strtoull(young, &end, 10);
     if (end != young) g_young_threshold = (size_t)(v ? v : 1);
+  }
+  /* Bump-nursery config. TSAOT_GC_NURSERY=0 falls back to the classic
+     all-unpooled allocator (one milestone-period kill switch). The nursery
+     requires the moving minor: with TSAOT_DISABLE_MOVING_MINOR set, arena
+     survivors could neither move nor be promoted in place, so the nursery
+     turns itself off. */
+  const char* nursery = getenv("TSAOT_GC_NURSERY");
+  if (nursery && nursery[0] && strcmp(nursery, "0") == 0) g_nursery_enabled = 0;
+  if (!gc_moving_minor_enabled()) g_nursery_enabled = 0;
+  const char* nbytes = getenv("TSAOT_GC_NURSERY_BYTES");
+  if (nbytes && nbytes[0]){
+    char* end = NULL;
+    unsigned long long v = strtoull(nbytes, &end, 10);
+    if (end != nbytes && v) g_nursery_cap_bytes = (size_t)v;
+    if (g_nursery_cap_bytes < GC_NURSERY_CHUNK_BYTES) g_nursery_cap_bytes = GC_NURSERY_CHUNK_BYTES;
   }
 }
 static uint64_t gc_handle_alloc(ts_gc_header* h){
@@ -257,9 +308,41 @@ void ts_gc_set_root_depth(int n){
   while (g_root_len > n) g_roots[--g_root_len] = NULL;
 }
 
+/* Nursery-eligible kinds: the unconditionally movable base kinds. Promise/Coro
+   (conditionally movable, resume pins raw frames) and Proxy (non-moving) stay
+   unpooled; large cells stay unpooled so a dying 500MB inline string is freed
+   at the next minor instead of squatting in a chunk. */
+static inline int gc_is_bump_kind(uint8_t kind){
+  return kind==TS_KIND_OBJECT || kind==TS_KIND_STRING || kind==TS_KIND_FUNC ||
+         kind==TS_KIND_ARRAY || kind==TS_KIND_MAP || kind==TS_KIND_SET ||
+         kind==TS_KIND_ACCESSOR || kind==TS_KIND_SYMBOL;
+}
+static void* gc_nursery_bump(size_t sz){
+  size_t need = (sz + 15u) & ~(size_t)15u;
+  gc_chunk* c = g_nursery_active;
+  if (!c || c->used + need > GC_NURSERY_DATA_BYTES){
+    if (g_nursery_free){
+      c = g_nursery_free; g_nursery_free = c->next;
+    } else {
+      void* mem = NULL;
+      if (posix_memalign(&mem, GC_NURSERY_CHUNK_BYTES, GC_NURSERY_CHUNK_BYTES) != 0)
+        return NULL; /* fall back to the unpooled path */
+      c = (gc_chunk*)mem;
+      RT_STAT_INC(nursery_chunks);
+    }
+    c->used = 0; c->pinned_live = 0;
+    c->next = g_nursery_active; g_nursery_active = c;
+  }
+  void* p = (char*)c + GC_NURSERY_DATA_OFF + c->used;
+  c->used += need;
+  g_nursery_used_bytes += need;
+  memset(p, 0, sz); /* keep the calloc zero-init contract of the classic path */
+  return p;
+}
 static void* gc_alloc(size_t sz, uint8_t kind){
   gc_config_init();
-  if (g_young_alloc>=g_young_threshold) ts_gc_collect_young();
+  if (g_young_alloc>=g_young_threshold || g_nursery_used_bytes>=g_nursery_cap_bytes)
+    ts_gc_collect_young();
   if (g_alloc>=g_full_threshold){
     ts_gc_collect();
     size_t next = g_alloc * 2;
@@ -268,8 +351,20 @@ static void* gc_alloc(size_t sz, uint8_t kind){
     if (next < TS_GC_MIN_THRESHOLD) next = TS_GC_MIN_THRESHOLD;
     g_full_threshold = next;
   }
-  ts_gc_header* h=calloc(1,sz);
   RT_STAT_INC(alloc_count); RT_STAT_ADD(alloc_bytes, sz);
+  if (g_nursery_enabled && sz <= GC_NURSERY_MAX_CELL && gc_is_bump_kind(kind)){
+    ts_gc_header* h = (ts_gc_header*)gc_nursery_bump(sz);
+    if (h){
+      /* mark/remembered/pin_depth/gc_next are zeroed by the bump's memset;
+         arena cells are NOT linked on g_young_heap (the sweep walks chunks). */
+      h->kind=kind; h->gen=TS_GEN_YOUNG; h->size=sz;
+      h->handle = gc_handle_alloc(h);
+      g_alloc++; g_young_alloc++;
+      RT_STAT_INC(nursery_alloc);
+      return h;
+    }
+  }
+  ts_gc_header* h=calloc(1,sz);
   h->kind=kind; h->gen=TS_GEN_YOUNG; h->size=sz; h->gc_next=g_young_heap; g_young_heap=h;
   h->handle = gc_handle_alloc(h);
   g_alloc++; g_young_alloc++;
@@ -2215,7 +2310,10 @@ static void gc_scan_cell(ts_gc_header* h, int young, int depth){
     gc_scan_async_cell(h, young, depth);
   }
 }
-static void gc_free_cell(ts_gc_header* h){
+/* Free a cell's handle + external payload buffers but not the cell body —
+   the body of an arena (nursery) cell belongs to its chunk and is reclaimed
+   by the post-sweep bump reset. */
+static void gc_free_cell_payload(ts_gc_header* h){
   gc_handle_free(h);
   if (h->kind==TS_KIND_OBJECT) free(((ts_object*)h)->props);
   else if (h->kind==TS_KIND_ARRAY){ array_free_data((ts_array*)h); free(((ts_array*)h)->o.props); }
@@ -2223,6 +2321,9 @@ static void gc_free_cell(ts_gc_header* h){
   else if (h->kind==TS_KIND_MAP){ free(((ts_map*)h)->keys); free(((ts_map*)h)->vals); free(((ts_map*)h)->o.props); }
   else if (h->kind==TS_KIND_SET){ free(((ts_set_t*)h)->elems); free(((ts_set_t*)h)->o.props); }
   else if (h->kind==TS_KIND_PROMISE){ free(((ts_promise*)h)->waiters); }
+}
+static void gc_free_cell(ts_gc_header* h){
+  gc_free_cell_payload(h);
   free(h);
 }
 static int gc_moving_minor_enabled(void){
@@ -2289,7 +2390,7 @@ static void gc_fix_moved_cell(ts_gc_header* old, ts_gc_header* nw){
     if (oa->data == oa->inline_data) na->data = na->inline_data;
   }
 }
-static ts_gc_header* gc_move_young_to_old(ts_gc_header* h){
+static ts_gc_header* gc_move_young_to_old_ex(ts_gc_header* h, int free_old){
   size_t sz = h->size;
   if (sz == 0){
     if (h->kind == TS_KIND_STRING){
@@ -2314,11 +2415,100 @@ static ts_gc_header* gc_move_young_to_old(ts_gc_header* h){
   nw->gc_next = NULL;
   gc_fix_moved_cell(h, nw);
   gc_handle_move(h, nw);
-  free(h); /* external buffers were transferred by the shallow copy */
+  /* external buffers were transferred by the shallow copy. An arena cell's
+     body is chunk memory (free_old=0): it dies with the bump reset. */
+  if (free_old) free(h);
   return nw;
 }
+static ts_gc_header* gc_move_young_to_old(ts_gc_header* h){
+  return gc_move_young_to_old_ex(h, 1);
+}
+/* Sweep one side of the nursery after marking: evacuate marked cells to the
+   old gen, payload-free the dead, divert pinned survivors to g_pinned_young
+   and their chunk to the retained list. Shared by minor and full collections
+   (arena cells are always YOUNG, and both collections mark them the same
+   way), so the "leave by copy or die" rule has a single implementation. */
+static void gc_sweep_nursery(ts_gc_header** survivors){
+  gc_chunk* next = NULL;
+  for (gc_chunk* c = g_nursery_active; c; c = next){
+    next = c->next;
+    char* data = (char*)c + GC_NURSERY_DATA_OFF;
+    size_t off = 0;
+    uint32_t pinned_here = 0;
+    while (off < c->used){
+      ts_gc_header* h = (ts_gc_header*)(data + off);
+      size_t step = (h->size + 15u) & ~(size_t)15u;
+      if (h->mark){
+        if (h->pin_depth){
+          /* raw pointer active: cannot move, cannot promote in place. Track
+             on the pinned list; the chunk is retained below. */
+          h->mark = 0;
+          h->gc_next = g_pinned_young; g_pinned_young = h;
+          pinned_here++;
+        } else {
+          ts_gc_header* nw = gc_move_young_to_old_ex(h, 0);
+          nw->gc_next = *survivors; *survivors = nw;
+          g_young_alloc--; g_old_alloc++;
+        }
+      } else {
+        gc_free_cell_payload(h);
+        g_young_alloc--; g_alloc--;
+      }
+      off += step;
+    }
+    if (pinned_here){
+      c->pinned_live = pinned_here;
+      c->next = g_nursery_retained; g_nursery_retained = c;
+      RT_STAT_INC(retained_chunks);
+    } else {
+      c->used = 0;
+      c->next = g_nursery_free; g_nursery_free = c;
+    }
+  }
+  g_nursery_active = NULL;
+  g_nursery_used_bytes = 0;
+}
+/* Re-examine pinned survivors from earlier collections (they live in retained
+   chunks and stayed YOUNG): evacuate the ones whose pin was released, free the
+   dead, keep the still-pinned. Retained chunks with no pinned survivors left
+   return to the free pool. */
+static void gc_sweep_pinned_young(ts_gc_header** survivors){
+  ts_gc_header* h = g_pinned_young;
+  g_pinned_young = NULL;
+  while (h){
+    ts_gc_header* next = h->gc_next;
+    gc_chunk* c = (gc_chunk*)((uintptr_t)h & ~(uintptr_t)(GC_NURSERY_CHUNK_BYTES - 1u));
+    if (h->mark){
+      if (h->pin_depth){
+        h->mark = 0;
+        h->gc_next = g_pinned_young; g_pinned_young = h;
+      } else {
+        ts_gc_header* nw = gc_move_young_to_old_ex(h, 0);
+        nw->gc_next = *survivors; *survivors = nw;
+        g_young_alloc--; g_old_alloc++;
+        c->pinned_live--;
+      }
+    } else {
+      gc_free_cell_payload(h);
+      g_young_alloc--; g_alloc--;
+      c->pinned_live--;
+    }
+    h = next;
+  }
+  gc_chunk** pp = &g_nursery_retained;
+  while (*pp){
+    gc_chunk* c = *pp;
+    if (c->pinned_live == 0){
+      *pp = c->next;
+      c->used = 0;
+      c->next = g_nursery_free; g_nursery_free = c;
+    } else {
+      pp = &c->next;
+    }
+  }
+}
 void ts_gc_collect_young(void){
-  if (!g_young_heap) return;
+  if (!g_young_heap && !g_nursery_active && !g_pinned_young) return;
   RT_STAT_INC(minor_gc); RT_STAT_GC_T0;
   gc_mark_async_roots_young();
   for (uint32_t i=0;i<g_sym_desc_len;i++) gc_mark_value_young(g_sym_desc[i]);
@@ -2364,6 +2554,11 @@ void ts_gc_collect_young(void){
     }
     h = next;
   }
+  /* pinned-from-earlier first: the arena sweep below may divert freshly pinned
+     cells onto g_pinned_young with their mark already cleared, and this pass
+     must not mistake those for dead. */
+  gc_sweep_pinned_young(&survivors);
+  gc_sweep_nursery(&survivors);
   if (survivors){
     h = survivors;
     while (h->gc_next) h = h->gc_next;
@@ -2406,6 +2601,12 @@ void ts_gc_collect(void){
     else { g_young_alloc--; g_alloc--; gc_free_cell(y); }
     y=next;
   }
+  /* Arena cells cannot gen-flip in place (chunk-owned memory vs the old
+     sweep's free(h)), so a full GC also has them leave by copy or die. The
+     evacuated copies join `promoted` AFTER the old sweep above, so this
+     collection never re-sweeps them. Pinned pass first (see minor GC). */
+  gc_sweep_pinned_young(&promoted);
+  gc_sweep_nursery(&promoted);
   if (promoted){
     ts_gc_header* tail=promoted; while (tail->gc_next) tail=tail->gc_next;
     tail->gc_next=g_old_heap; g_old_heap=promoted;
