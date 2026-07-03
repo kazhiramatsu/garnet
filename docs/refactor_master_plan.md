@@ -13,7 +13,7 @@
   ※ v1 で挙げた emitc.ts の重複 walker・二重 emitter・生成 blob・`any` 150+ は**凍結ツリー内**となり保守コストが消えるため対象外（コンパイル可能性のみ守る）。リポ直下のゴミは s315 で削除済み。
 - **バグ（silent 系）**: 2^53 跨ぎ int ループ精度（根因は TS 移植時に特定・Rust も同一ロジック: range を落とす join が i64Safe を保持 / 無範囲のまま i64 値を主張）、JSON.stringify depth>256 の catch 不能 abort、JSON.parse 深入力 SIGSEGV、selfhost の 64MB スタック要件（switch→ネスト If lowering が根因）。
 - **性能**: native の 20 倍差はランタイム（Map/Set 線形走査・GC 閾値 64K alloc・全 reflike local の root/unroot・クロージャ呼び出し毎 malloc）＝**garnet が生成する全プログラムの品質問題**。node/Rust の ~25s は whole-program 数値解析を ~70 回再実行するアルゴリズム問題＝**Rust 側で修正**。プロパティアクセスは O(n) 線形走査で shapes/IC なし。
-- **現状の食い違い**: `./garnet` ドライバの既定は `TSAOT_ANALYZER=ts`（boxed・`TSAOT_UNTYPED=1` 強制）のまま＝Rust メイン化と不整合 → P3 で反転。VCS は s315 で導入済み（`baseline-s313`）。
+- ~~**現状の食い違い**: `./garnet` ドライバの既定は `TSAOT_ANALYZER=ts`のまま~~ → **s318 で反転済み**（既定 = rust・typed。ts/native arm は残置）。VCS は s315 で導入済み（`baseline-s313`）。
 
 **目標**: フェーズ分けで上記を完全解決し、AOT の閉世界性を武器に「実行速度 × コンパイル速度」の両軸で世界最速の TypeScript 処理系にする。コンパイル速度の主体は Rust 実装。
 
@@ -158,7 +158,7 @@ v1 の 1a/1b（TS 側 ir_walk・emitc.ts 分割・`any` 根絶）は**撤回** �
 
 ## Phase 3: ドライバの Rust 既定化（1 セッション・P0 直後に前倒し可）
 
-1. **既定反転**（garnet:81–116）: `TSAOT_ANALYZER` の既定を `ts` → **`rust`**（typed fast path が既定に。rust arm は元々 UNTYPED 強制なし）。`ts` / `native` arm はオラクル・ベンチ用に残置（ts は boxed+UNTYPED 強制のまま＝凍結時挙動を保存）。
+1. ~~**既定反転**~~ **済（s318）**: `TSAOT_ANALYZER` の既定を `ts` → `rust` に反転（typed fast path が既定・ill-typed は loud 停止・`--untyped` エスケープ）。`ts` / `native` arm はオラクル・ベンチ用に残置（ts は boxed+UNTYPED 強制のまま＝凍結時挙動を保存）。3 モード smoke + 既定依存だった profile_bench.sh は rust-typed プロファイルになり意図に合致。
 2. ハーネスの経路統一: run_conformance / mf を「ドライバ経由 + TSAOT_ANALYZER 切替」へ（Rust 直指しの段階排除。オラクル比較は明示的に ts を指す）。
 3. README / HANDOFF の既定説明更新。**ill-typed 入力は型エラーで loud 停止が既定になる**（従来 ts 既定は boxed で通していた）→ `--untyped` エスケープを明記。
 

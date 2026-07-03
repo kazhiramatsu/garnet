@@ -12,6 +12,7 @@
 #
 # Env:
 #   TSAOT_CC               C compiler+flags (default "cc -O2"; e.g. "gcc -O2").
+#   TSAOT_ANALYZER         rust (default) | ts (frozen twin) | native.
 #   TSAOT_USE_MIMALLOC=1   Route allocations through mimalloc (if installed).
 #   TSAOT_ALLOW_UNSUPPORTED=1  Emit even with UNSUPPORTED constructs (unsafe).
 #   TSAOT_UNTYPED=1        Compile as `any` — all type-driven optimization off
@@ -40,8 +41,8 @@ usage: $PROG [-c | -S] [-o <out.c>] <input.ts>
                 (TSAOT_RT_STATS_FILE=path appends there instead)
   -h, --help    show this help
 
-env: TSAOT_CC (default "cc -O2"), TSAOT_USE_MIMALLOC=1, TSAOT_ALLOW_UNSUPPORTED=1,
-     TSAOT_UNTYPED=1
+env: TSAOT_CC (default "cc -O2"), TSAOT_ANALYZER=rust|ts|native (default rust),
+     TSAOT_USE_MIMALLOC=1, TSAOT_ALLOW_UNSUPPORTED=1, TSAOT_UNTYPED=1
 EOF
 }
 
@@ -81,13 +82,15 @@ case "$input" in *.ts) ;; *) die "input must be a .ts file: $input" ;; esac
 EXPORTER="$ROOT/exporter/exporter.js"
 command -v node >/dev/null 2>&1 || die "node not found on PATH"
 [ -f "$EXPORTER" ] || die "exporter not built ($EXPORTER missing). Run: scripts/setup.sh"
-# Analyzer selection (TSAOT_ANALYZER): the self-hosted TS analyzer is the
-# development default since session 303; the frozen Rust analyzer stays
-# available as the differential oracle and for typed/perf paths.
-#   ts     node + analyzer_ts/dist (self-hosted, boxed)   <- default
-#   rust   analyzer/target/release/tsaot (frozen oracle; typed fast paths)
+# Analyzer selection (TSAOT_ANALYZER): the Rust analyzer is the main
+# implementation and the default since session 315 (roles inverted; flipped
+# here in s318 — the frozen analyzer_ts still carries silent-miscompile fixes
+# #1-#4 that only the Rust side received, see scripts/frozen_known_diffs.tsv).
+# analyzer_ts stays selectable as the frozen parity twin / selfhost bench input.
+#   rust   analyzer/target/release/tsaot (main; typed fast paths)  <- default
+#   ts     node + analyzer_ts/dist (frozen twin, boxed/untyped)
 #   native a garnet-compiled tsan binary (set TSAOT_TSAN_NATIVE to its path)
-case "${TSAOT_ANALYZER:-ts}" in
+case "${TSAOT_ANALYZER:-rust}" in
   rust)
     ANALYZER="$ROOT/analyzer/target/release/tsaot"
     [ -x "$ANALYZER" ] || die "analyzer not built ($ANALYZER missing). Run: scripts/setup.sh"
@@ -119,7 +122,7 @@ trap 'rm -rf "$work"' EXIT
 # The self-hosted analyzers are conservative/boxed: export untyped IR for them
 # (typed-IR-only instructions would be loud-rejected). The Rust path keeps the
 # caller's TSAOT_UNTYPED choice (typed fast paths by default).
-case "${TSAOT_ANALYZER:-ts}" in
+case "${TSAOT_ANALYZER:-rust}" in
   ts|native) export TSAOT_UNTYPED=1 ;;
 esac
 # Exporter prints diagnostics to stderr and exits non-zero on UNSUPPORTED.
