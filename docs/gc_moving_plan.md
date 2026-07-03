@@ -82,6 +82,10 @@ B 以降の全フェーズが評価コピー中に同じ走査を使うため、
 
 ## Phase B — bump nursery（moving GC の性能化・本丸）
 
+**状態 (s317)**: B-1（アリーナ+確保）/ B-2（評価コピー・pinned 退避・full 統一）実装・検証済み。
+**B-3（バイト基準閾値）のみ未着手**（survivors の full 頻度最適化と合わせて次回）。
+実測は下の出口基準表の「B 実測」列。
+
 **目的**: young を連続アリーナ化し、確保 = ポインタ加算・解放 = アリーナ一括リセットにする。
 死んだ短命オブジェクトのコストをゼロ近くへ（今は死ぬセルにも calloc+free+handle が掛かる）。
 
@@ -128,14 +132,20 @@ B 以降の全フェーズが評価コピー中に同じ走査を使うため、
   + MOVE_CORO/PROMISE/BOTH 行列 + conf all + bundler + gate full。
 - perf（bench_gc ABAB・アイドルマシン。ts_rt.h 不変なので rt.o 差替えプロトコル有効）:
 
-| 指標 | 現状 (s316) | B 出口目標 |
-|---|---|---|
-| gc_shortlived wall | 175ms | **≤ 100ms** |
-| gc_binarytrees wall | 116ms | ≤ 90ms |
-| gc_escape_poly wall | 151ms | ≤ 110ms |
-| gc_survivors max pause | 6.32ms | ≤ 6.5ms（非回帰） |
-| gc_strings / gc_cycles / mapset | 1096 / 48 / 750ms | 非回帰（ノイズ内） |
-| gate bench | 99/99 予算内 | 99/99 維持（gc_churn 系 budget 100/160ms） |
+| 指標 | 現状 (s316) | B 出口目標 | **B 実測 (s317 ABAB・旧→新)** |
+|---|---|---|---|
+| gc_shortlived wall | 175ms | **≤ 100ms** | 160→**135ms (-15.6%)** 未達※ |
+| gc_binarytrees wall | 116ms | ≤ 90ms | 107→**99ms (-7.5%)** 惜敗 |
+| gc_escape_poly wall | 151ms | ≤ 110ms | 136→**118ms (-13.2%)** 惜敗 |
+| gc_survivors max pause | 6.32ms | ≤ 6.5ms（非回帰） | 6.97ms（full GC のアリーナ評価コピー分。full 側は B-3 のバイト閾値で頻度を最適化予定） |
+| gc_strings / gc_cycles / mapset | 1096 / 48 / 750ms | 非回帰（ノイズ内） | 1073/**25 (-29%)**/747ms ✓（+ closures 202→172・deep_chain 33→28） |
+| gate bench | 99/99 予算内 | 99/99 維持（gc_churn 系 budget 100/160ms） | **99/99 PASS** ✓ |
+
+※ **s317 実測の教訓**: bump 化後の shortlived 残コストは GC pause でなく（総 pause 28.65ms/136ms）
+**ミューテータ側の per-alloc handle churn**（3M alloc = 3M handle_alloc、nursery 網羅率 100% でも残る）。
+≤100ms は handle を全廃する **Phase C の出口へ繰り越し**（C 目標 ≤60ms は据え置き妥当）。
+nursery 自体は設計どおり動作: 全ベンチ bump 網羅率 100%・retained_chunks=0（pin 退避経路は
+JSON.parse 関数値呼び出し + threshold=1 の専用 probe で retained=1→回収まで実証済み）。
 
 - **kill-switch**: `TSAOT_GC_NURSERY=0` で全種 unpooled（= 現行アロケータ）に落とす env を
   1 マイルストーン期間だけ持つ（単一予測分岐・ホットパス規律準拠）。selfhost ミルストーン
