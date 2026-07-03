@@ -176,6 +176,7 @@ pub fn run_sroa(program: &mut Program, result: &EscapeResult) {
             &mut numeric_scalars,
             program.functions[fi].id.0,
             &top_outside,
+            &BTreeMap::new(),
         );
         // Commit the rewritten body. Free-function inlining can rewrite the body
         // (replacing a Call with the inlined Copy/BinOp) without introducing any
@@ -945,6 +946,15 @@ fn find_sroa_targets(
             }
             cur
         }
+        /// Disqualify a reference-value observation: the raw local AND its
+        /// copy-chain root. Narrowing/temp copies alias the receiver, so a raw
+        /// insert alone lets `Copy t←recv; t !== null` slip past the net and
+        /// SROA dematerializes an object that is still observed through `t`
+        /// (s316 silent-miscompile #2: undefined reads after null-narrowing).
+        fn dq(id: u32, alias: &BTreeMap<u32, u32>, disq: &mut BTreeSet<u32>) {
+            disq.insert(id);
+            disq.insert(resolve(id, alias));
+        }
         for inst in body {
             match inst {
                 Inst::AllocObject {
@@ -957,7 +967,7 @@ fn find_sroa_targets(
                     if noescape.contains(&site.0) {
                         alloc_class.insert(dst.0, c.0);
                     } else {
-                        disq.insert(dst.0);
+                        dq(dst.0, alias, disq);
                     }
                 }
                 Inst::NewDynamic { dst, .. } => {
@@ -966,7 +976,7 @@ fn find_sroa_targets(
                     // can't be scalar-replaced. NewDynamic dsts carry no class_id today
                     // so they're already excluded above; disqualify explicitly as a
                     // guard against future changes.
-                    disq.insert(dst.0);
+                    dq(dst.0, alias, disq);
                 }
                 Inst::Copy { dst, src } => {
                     // following a copy of a tracked recv is fine; record the alias
@@ -998,12 +1008,12 @@ fn find_sroa_targets(
                                         || returns_receiver(callee_fn)
                                         || needs_materialized_this(callee_fn, bodies, 0)
                                     {
-                                        disq.insert(r.0);
+                                        dq(r.0, alias, disq);
                                     }
                                 }
                             }
                             _ => {
-                                disq.insert(r.0);
+                                dq(r.0, alias, disq);
                             }
                         }
                     }
@@ -1029,25 +1039,25 @@ fn find_sroa_targets(
                             _ => false,
                         };
                         if !pass_is_sroa_safe {
-                            disq.insert(a.0);
-                            disq.insert(ra);
+                            dq(a.0, alias, disq);
+                            dq(ra, alias, disq);
                         }
                     }
                 }
                 Inst::StoreField { src, .. } => {
-                    disq.insert(src.0);
+                    dq(src.0, alias, disq);
                 }
                 Inst::StoreGlobal { src, .. } => {
-                    disq.insert(src.0);
+                    dq(src.0, alias, disq);
                 }
                 Inst::StoreElem { src, .. } => {
-                    disq.insert(src.0);
+                    dq(src.0, alias, disq);
                 }
                 Inst::Return { src: Some(s) } => {
-                    disq.insert(s.0);
+                    dq(s.0, alias, disq);
                 }
                 Inst::Throw { src } => {
-                    disq.insert(src.0);
+                    dq(src.0, alias, disq);
                 }
                 // SROA's rewrite_body can only redirect a scalar-replaced object
                 // through LoadField/StoreField (as `obj`), Copy, and Direct
@@ -1066,110 +1076,110 @@ fn find_sroa_targets(
                             .map(|fields| fields.iter().any(|f| *f == field.0))
                             .unwrap_or(false);
                         if !is_declared_field {
-                            disq.insert(robj);
+                            dq(robj, alias, disq);
                         }
                     }
                 }
                 Inst::BinOp { lhs, rhs, .. } => {
-                    disq.insert(lhs.0);
-                    disq.insert(rhs.0);
+                    dq(lhs.0, alias, disq);
+                    dq(rhs.0, alias, disq);
                 }
                 Inst::UnOp { operand, .. } => {
-                    disq.insert(operand.0);
+                    dq(operand.0, alias, disq);
                 }
                 Inst::LoadIndex { arr, index, .. } => {
-                    disq.insert(arr.0);
-                    disq.insert(index.0);
+                    dq(arr.0, alias, disq);
+                    dq(index.0, alias, disq);
                 }
                 Inst::StoreIndex { arr, index, src } => {
-                    disq.insert(arr.0);
-                    disq.insert(index.0);
-                    disq.insert(src.0);
+                    dq(arr.0, alias, disq);
+                    dq(index.0, alias, disq);
+                    dq(src.0, alias, disq);
                 }
                 Inst::ArrayLen { arr, .. } => {
-                    disq.insert(arr.0);
+                    dq(arr.0, alias, disq);
                 }
                 Inst::StringLen { src, .. } => {
-                    disq.insert(src.0);
+                    dq(src.0, alias, disq);
                 }
                 Inst::ArrayPush { arr, src } => {
-                    disq.insert(arr.0);
-                    disq.insert(src.0);
+                    dq(arr.0, alias, disq);
+                    dq(src.0, alias, disq);
                 }
                 Inst::ArrayPushAll { arr, src } => {
-                    disq.insert(arr.0);
-                    disq.insert(src.0);
+                    dq(arr.0, alias, disq);
+                    dq(src.0, alias, disq);
                 }
                 Inst::ArraySlice { arr, start, .. } => {
-                    disq.insert(arr.0);
-                    disq.insert(start.0);
+                    dq(arr.0, alias, disq);
+                    dq(start.0, alias, disq);
                 }
                 Inst::HasField { obj, .. } => {
-                    disq.insert(obj.0);
+                    dq(obj.0, alias, disq);
                 }
                 Inst::HasFieldDynamic { obj, key, .. } => {
-                    disq.insert(obj.0);
-                    disq.insert(key.0);
+                    dq(obj.0, alias, disq);
+                    dq(key.0, alias, disq);
                 }
                 Inst::GenericLen { src, .. } => {
-                    disq.insert(src.0);
+                    dq(src.0, alias, disq);
                 }
                 Inst::LoadFieldDynamic { obj, key, .. } => {
-                    disq.insert(obj.0);
-                    disq.insert(key.0);
+                    dq(obj.0, alias, disq);
+                    dq(key.0, alias, disq);
                 }
                 Inst::StoreFieldDynamic { obj, key, src } => {
-                    disq.insert(obj.0);
-                    disq.insert(key.0);
-                    disq.insert(src.0);
+                    dq(obj.0, alias, disq);
+                    dq(key.0, alias, disq);
+                    dq(src.0, alias, disq);
                 }
                 Inst::DeleteField { obj, .. } => {
-                    disq.insert(obj.0);
+                    dq(obj.0, alias, disq);
                 }
                 Inst::ObjectRest { src, .. } => {
-                    disq.insert(src.0);
+                    dq(src.0, alias, disq);
                 }
                 Inst::ObjectCopyProps { src, .. } => {
-                    disq.insert(src.0);
+                    dq(src.0, alias, disq);
                 }
                 Inst::ConstructResult { inst, ret, .. } => {
-                    disq.insert(inst.0);
-                    disq.insert(ret.0);
+                    dq(inst.0, alias, disq);
+                    dq(ret.0, alias, disq);
                 }
                 Inst::GetProto { obj, .. } => {
-                    disq.insert(obj.0);
+                    dq(obj.0, alias, disq);
                 }
                 Inst::SetProto { obj, proto, .. } => {
-                    disq.insert(obj.0);
-                    disq.insert(proto.0);
+                    dq(obj.0, alias, disq);
+                    dq(proto.0, alias, disq);
                 }
                 Inst::StoreProtoMethod { src, .. } | Inst::StoreMethod { src, .. } => {
-                    disq.insert(src.0);
+                    dq(src.0, alias, disq);
                 }
                 Inst::Print { src } => {
-                    disq.insert(src.0);
+                    dq(src.0, alias, disq);
                 }
                 Inst::CallBuiltin { recv, args, .. } => {
-                    disq.insert(recv.0);
+                    dq(recv.0, alias, disq);
                     for a in args {
-                        disq.insert(a.0);
+                        dq(a.0, alias, disq);
                     }
                 }
                 Inst::CallBuiltinStatic { args, .. } => {
                     for a in args {
-                        disq.insert(a.0);
+                        dq(a.0, alias, disq);
                     }
                 }
                 Inst::CallSpread {
                     recv, arg_specs, ..
                 } => {
                     if let Some(r) = recv {
-                        disq.insert(r.0);
+                        dq(r.0, alias, disq);
                     }
                     for s in arg_specs {
                         match s {
                             ArgSpec::Single { local } | ArgSpec::Spread { local } => {
-                                disq.insert(local.0);
+                                dq(local.0, alias, disq);
                             }
                         }
                     }
@@ -1179,7 +1189,7 @@ fn find_sroa_targets(
                     cond_body,
                     body,
                 } => {
-                    disq.insert(cond.0);
+                    dq(cond.0, alias, disq);
                     scan(
                         cond_body,
                         noescape,
@@ -1206,7 +1216,7 @@ fn find_sroa_targets(
                     then_body,
                     else_body,
                 } => {
-                    disq.insert(cond.0);
+                    dq(cond.0, alias, disq);
                     scan(
                         then_body,
                         noescape,
@@ -1227,6 +1237,27 @@ fn find_sroa_targets(
                         disq,
                         alias,
                     );
+                }
+                Inst::TryCatch {
+                    try_body,
+                    catch_body,
+                    finally_body,
+                    ..
+                } => {
+                    // try/catch/finally 内の使用も観測・失格の対象（ここを見ないと
+                    // try 内の push/比較が失格網から漏れて dematerialize が誤発火する）
+                    for b in [try_body, catch_body, finally_body] {
+                        scan(
+                            b,
+                            noescape,
+                            class_fields,
+                            class_funcs,
+                            bodies,
+                            alloc_class,
+                            disq,
+                            alias,
+                        );
+                    }
                 }
                 _ => {}
             }
@@ -1359,6 +1390,12 @@ fn rewrite_body(
     // must stay materialized — this is the cross-`if`-branch escape analysis the
     // per-body array SROA otherwise lacks.
     outside: &BTreeSet<u32>,
+    // Copy-aliases of SROA'd receivers recorded by ENCLOSING bodies. The outer
+    // rewrite drops `Copy xn←x` (alias, no emit) for a scalar-replaced x, so a
+    // nested body reading through xn must inherit the alias map — otherwise the
+    // load stays unrewritten against a never-assigned local (= undefined reads
+    // inside if/ternary/loop bodies; s316 silent-miscompile #2b).
+    parent_alias: &BTreeMap<u32, u32>,
 ) -> Vec<Inst> {
     let targets = find_sroa_targets(body, noescape, class_fields, class_funcs, bodies);
     // allocate field scalars for each target receiver
@@ -1404,7 +1441,8 @@ fn rewrite_body(
 
     let mut out: Vec<Inst> = Vec::new();
     // map copy aliases so a `const v = newobj` recv resolves to the original
-    let mut alias: BTreeMap<u32, u32> = BTreeMap::new();
+    // (seeded with the enclosing bodies' aliases — see parent_alias)
+    let mut alias: BTreeMap<u32, u32> = parent_alias.clone();
     let mut array_alias: BTreeMap<u32, u32> = BTreeMap::new();
     let mut const_indices: BTreeMap<u32, u32> = BTreeMap::new();
     // locals that hold a freshly-allocated object of a known class in THIS body.
@@ -1763,6 +1801,7 @@ fn rewrite_body(
                     numeric_scalars,
                     cur_fn,
                     &cond_outside,
+                    &alias,
                 );
                 let bb = rewrite_body(
                     loop_body,
@@ -1778,6 +1817,7 @@ fn rewrite_body(
                     numeric_scalars,
                     cur_fn,
                     &body_outside,
+                    &alias,
                 );
                 array_alias.clear();
                 const_indices.clear();
@@ -1818,6 +1858,7 @@ fn rewrite_body(
                     numeric_scalars,
                     cur_fn,
                     &then_outside,
+                    &alias,
                 );
                 let eb = rewrite_body(
                     else_body,
@@ -1833,6 +1874,7 @@ fn rewrite_body(
                     numeric_scalars,
                     cur_fn,
                     &else_outside,
+                    &alias,
                 );
                 array_alias.clear();
                 const_indices.clear();
@@ -1840,6 +1882,87 @@ fn rewrite_body(
                     cond: *cond,
                     then_body: tb,
                     else_body: eb,
+                });
+            }
+            Inst::TryCatch {
+                try_body,
+                catch_var,
+                catch_body,
+                finally_body,
+            } => {
+                // try/catch/finally も If と同様に再帰して書き換える（降りないと
+                // 外側で dematerialize 済みレシーバの読みが未書き換えで残り、
+                // undefined 化する — s316 silent-miscompile #2c）。
+                let mut surround = outside.clone();
+                collect_local_refs(&body[..inst_idx], &mut surround);
+                collect_local_refs(&body[inst_idx + 1..], &mut surround);
+                if let Some(cv) = catch_var {
+                    surround.insert(cv.0);
+                }
+                let mut try_outside = surround.clone();
+                collect_local_refs(catch_body, &mut try_outside);
+                collect_local_refs(finally_body, &mut try_outside);
+                let mut catch_outside = surround.clone();
+                collect_local_refs(try_body, &mut catch_outside);
+                collect_local_refs(finally_body, &mut catch_outside);
+                let mut fin_outside = surround;
+                collect_local_refs(try_body, &mut fin_outside);
+                collect_local_refs(catch_body, &mut fin_outside);
+                let tb = rewrite_body(
+                    try_body,
+                    number_locs,
+                    noescape,
+                    class_fields,
+                    class_funcs,
+                    bodies,
+                    next,
+                    new_locals,
+                    sroad,
+                    numeric_fields,
+                    numeric_scalars,
+                    cur_fn,
+                    &try_outside,
+                    &alias,
+                );
+                let cb = rewrite_body(
+                    catch_body,
+                    number_locs,
+                    noescape,
+                    class_fields,
+                    class_funcs,
+                    bodies,
+                    next,
+                    new_locals,
+                    sroad,
+                    numeric_fields,
+                    numeric_scalars,
+                    cur_fn,
+                    &catch_outside,
+                    &alias,
+                );
+                let fb = rewrite_body(
+                    finally_body,
+                    number_locs,
+                    noescape,
+                    class_fields,
+                    class_funcs,
+                    bodies,
+                    next,
+                    new_locals,
+                    sroad,
+                    numeric_fields,
+                    numeric_scalars,
+                    cur_fn,
+                    &fin_outside,
+                    &alias,
+                );
+                array_alias.clear();
+                const_indices.clear();
+                out.push(Inst::TryCatch {
+                    try_body: tb,
+                    catch_var: *catch_var,
+                    catch_body: cb,
+                    finally_body: fb,
                 });
             }
             other => {

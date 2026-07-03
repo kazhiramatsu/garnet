@@ -66,20 +66,25 @@ pub fn decide(program: &Program, result: &EscapeResult) -> Vec<SiteDecision> {
             let determinable = m.map(|m| m.layout_determinable).unwrap_or(false);
             let once = matches!(m.map(|m| m.multiplicity), Some(Multiplicity::Once));
 
+            let contained = result.contained_sites.contains(&se.site.0);
             let (strategy, reason) = match se.state {
                 EscapeState::NoEscape => {
-                    if determinable {
+                    if determinable && (once || !contained) {
                         // NoEscape + determinable -> stack. For loop-body sites
                         // (multiplicity Many) the C local is emitted inside the
-                        // loop scope, giving correct per-iteration lifetime while
-                        // the C compiler reuses/scalar-replaces the slot. Sound
-                        // because NoEscape means no reference outlives the frame,
-                        // and the per-iteration C scope bounds it more tightly.
+                        // loop scope — sound ONLY if no reference outlives the
+                        // iteration. A NoEscape value stored into a container
+                        // (contained) can be retained across iterations while
+                        // the C slot is reused, so those must not go to stack
+                        // (s316 silent-miscompile: arr.push(new C()) collapsed
+                        // every element onto one reused stack cell).
                         (AllocStrategy::Stack, if once {
                             "no-escape + determinable + single-shot: stack slot / scalar-replace"
                         } else {
-                            "no-escape + determinable, loop-body: per-iteration stack slot"
+                            "no-escape + determinable, loop-body, uncontained: per-iteration stack slot"
                         })
+                    } else if determinable {
+                        (AllocStrategy::FrameArena, "no-escape but loop-contained: value may outlive the iteration")
                     } else if !once {
                         (AllocStrategy::FrameArena, "no-escape but layout not determinable, loop: frame arena")
                     } else {

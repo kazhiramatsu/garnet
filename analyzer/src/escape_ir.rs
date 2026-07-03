@@ -969,6 +969,15 @@ pub enum ArgSpec {
 pub struct EscapeResult {
     pub version: u32,
     pub sites: Vec<SiteEscape>,
+    /// Sites whose object is stored into some container (object field / array
+    /// elem), i.e. it appears in the solver's field map. Such a value can
+    /// outlive a loop iteration while still being NoEscape at function level,
+    /// so codegen must not give it a per-iteration reused stack slot
+    /// (s316 silent-miscompile: class instance kept only via arr.push /
+    /// arr[i] = x collapsed to one C stack cell).
+    /// serde(skip): 凍結 analyzer_ts と diff する escape ダンプの形式は変えない。
+    #[serde(skip, default)]
+    pub contained_sites: std::collections::BTreeSet<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -10,7 +10,7 @@ fn prog(metas: Vec<SiteMeta>) -> Program {
         scopes:vec![], bindings:vec![], functions:vec![], exports:vec![], site_meta: metas, classes: vec![], object_proto_methods: vec![], array_proto_methods: vec![], promise_proto_methods: vec![], map_proto_methods: vec![], set_proto_methods: vec![], headers_proto_methods: vec![], function_proto_methods: vec![], string_proto_methods: vec![], regexp_proto_methods: vec![], number_proto_methods: vec![], boolean_proto_methods: vec![], well_known_symbols: vec![] }
 }
 fn res(pairs: &[(u32, EscapeState)]) -> EscapeResult {
-    EscapeResult { version:1, sites: pairs.iter().map(|(s,st)| SiteEscape{site:SiteId(*s), state:*st}).collect() }
+    EscapeResult { version:1, sites: pairs.iter().map(|(s,st)| SiteEscape{site:SiteId(*s), state:*st}).collect(), contained_sites: Default::default() }
 }
 fn ck(name:&str, got:AllocStrategy, want:AllocStrategy){
     println!("[{}] {:?} (want {:?}) {}", name, got, want, if got==want {"PASS"} else {"*** FAIL ***"});

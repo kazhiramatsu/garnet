@@ -858,12 +858,24 @@ pub fn analyze_program(program: &Program) -> EscapeResult {
     }
 
     let mut out = Vec::new();
+    let mut contained = std::collections::BTreeSet::new();
     for f in &program.functions {
         let (solver, sites) = solve(f, &summaries);
+        // containment: field マップの値集合に現れる site は「何かのコンテナに
+        // 格納されて」いる。関数レベルでは NoEscape でも反復を跨いで生存し得る
+        // ため、codegen の per-iteration stack slot 判断から除外する材料になる。
+        for set in solver.field.values() {
+            for o in set {
+                if let Obj::Site(sid) = o {
+                    contained.insert(sid.0);
+                }
+            }
+        }
         out.extend(extract_escape(f, &solver, &sites));
     }
     EscapeResult {
         version: SCHEMA_VERSION,
         sites: out,
+        contained_sites: contained,
     }
 }
