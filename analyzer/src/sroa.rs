@@ -1004,12 +1004,24 @@ fn find_sroa_targets(
                                     // is NOT inlined), so its receiver must stay a real
                                     // object — scalar-replacing it strands the kept call's
                                     // `this`. Same for a method that forwards to one on `this`.
+                                    // returns_only_in_tail_position mirrors the rewrite's
+                                    // inline_callee precondition: this receiver use is
+                                    // ELIMINATED only by inlining the callee, and a return
+                                    // nested in control flow (if/loop/try) blocks inlining.
+                                    // Allowing such a callee here would drop the alloc but
+                                    // keep the call reading the never-assigned receiver
+                                    // local (wild pointer loads in the callee).
                                     if captures_this(callee_fn)
                                         || returns_receiver(callee_fn)
                                         || needs_materialized_this(callee_fn, bodies, 0)
+                                        || !returns_only_in_tail_position(callee_fn)
                                     {
                                         dq(r.0, alias, disq);
                                     }
+                                } else {
+                                    // Unknown body: the rewrite cannot inline the call
+                                    // either, so the receiver must stay materialized.
+                                    dq(r.0, alias, disq);
                                 }
                             }
                             _ => {
@@ -1029,7 +1041,12 @@ fn find_sroa_targets(
                             (None, CalleeRef::Direct { func }, Some(cls)) => {
                                 bodies.get(&func.0).map_or(false, |callee_fn| {
                                     class_fields.get(cls).map_or(false, |fields| {
+                                        // args.len()==params.len() mirrors the rewrite's
+                                        // inline condition: an arity-mismatched call (an
+                                        // omitted optional arg) is NOT inlined, so the
+                                        // kept call would read the dropped alloc.
                                         is_inlinable_free_fn(callee_fn)
+                                            && args.len() == callee_fn.params.len()
                                             && callee_param_field_only_sroa_safe(
                                                 callee_fn, i, fields,
                                             )
@@ -1263,16 +1280,27 @@ fn find_sroa_targets(
             }
         }
     }
-    scan(
-        body,
-        noescape,
-        class_fields,
-        class_funcs,
-        bodies,
-        &mut alloc_class,
-        &mut disqualified,
-        &mut copy_alias,
-    );
+    // Two passes: copy-aliases recorded at the BOTTOM of a loop body must reach
+    // observations at the TOP of the next iteration (`n.next = head; head = n;`
+    // — the StoreField's dq(head) precedes the Copy that aliases head→n, so a
+    // single linear pass misses the loop-carried disqualification and SROA
+    // deletes the `head = n` store: the chain head stays null, s317 silent
+    // miscompile #4). Pass 1 completes the alias map (Copy edges are syntactic
+    // and order-independent); pass 2 re-evaluates every dq against it. The
+    // disqualified set only grows, so the result is monotonically safe, and a
+    // third pass could not add aliases pass 2 hasn't already seen.
+    for _ in 0..2 {
+        scan(
+            body,
+            noescape,
+            class_fields,
+            class_funcs,
+            bodies,
+            &mut alloc_class,
+            &mut disqualified,
+            &mut copy_alias,
+        );
+    }
 
     // a recv survives only if not disqualified, and any copy-alias of it also not disqualified
     alloc_class
@@ -1660,6 +1688,16 @@ fn rewrite_body(
                             continue;
                         }
                     }
+                    // The disqualification net guarantees every Direct call on a
+                    // scalar-replaced receiver is inlinable (it rejects non-tail
+                    // returns, captures_this, generators/async and unknown bodies).
+                    // Reaching here means scan and rewrite drifted apart; emitting
+                    // the kept call would read the dropped allocation (dangling
+                    // receiver) — fail loudly instead of miscompiling.
+                    unreachable!(
+                        "sroa: non-inlinable call on scalar-replaced receiver (callee fn{})",
+                        func.0
+                    );
                 }
                 // Not a SROA target (e.g. the receiver escapes): still inline a
                 // trivial method/constructor so the boxed arg-array round-trip is
@@ -1733,6 +1771,17 @@ fn rewrite_body(
                     }
                 }
                 invalidate_array_tracking_defs(inst, &mut array_alias, &mut const_indices);
+                // The disqualification net only lets an object arg through when
+                // this exact call is inlinable (straight-line callee + matching
+                // arity), so a kept call must never carry a scalar-replaced arg.
+                for a in args {
+                    if sroad.contains_key(&resolve(a.0, &alias)) {
+                        unreachable!(
+                            "sroa: kept call passes scalar-replaced arg (callee fn{})",
+                            func.0
+                        );
+                    }
+                }
                 out.push(inst.clone());
             }
 
