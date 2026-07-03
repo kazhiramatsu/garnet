@@ -4,6 +4,14 @@
 # 処理する速度を、実装別・ステージ別に計測して build/bench_history/ に蓄積する。
 #
 #   scripts/bench_selfcompile.sh [--native <tsan-binary>] [--runs N] [--no-cc]
+#                                [--src <file.ts> [--label <name>]]
+#
+# --src で任意の TS を入力にできる（軽量計測モード）。毎セッションの日常計測は
+# 小さい入力 + --runs 5 で数秒（例: scripts/bench_selfcompile.sh
+#   --src tests/conformance/exhaustive/strings/optimizer_guardrails.ts --runs 5）。
+# 66k 命令の selfhost（既定入力）はフェーズ末のミルストーン計測専用。
+# 注意: 小入力はプロセス起動コスト（node ~100ms）が支配的なので、絶対値でなく
+# 同一入力での前後差分（A/B）で判断する。
 #
 # ステージ:
 #   export       node exporter（typed）: selfhost_typed.ts → self.ir.json
@@ -24,27 +32,35 @@ cd "$ROOT"
 RUNS="${TSAOT_RUNS:-3}"
 NATIVE="${TSAOT_TSAN_NATIVE:-}"
 DO_CC=1
+SRC="analyzer_ts/src/selfhost_typed.ts"
+LABEL="selfcompile"
 while [ $# -gt 0 ]; do
   case "$1" in
     --native) shift; NATIVE="${1:?--native needs a path}" ;;
     --runs)   shift; RUNS="${1:?--runs needs N}" ;;
     --no-cc)  DO_CC=0 ;;
-    *) echo "usage: bench_selfcompile.sh [--native <tsan-binary>] [--runs N] [--no-cc]"; exit 1 ;;
+    --src)    shift; SRC="${1:?--src needs a .ts path}" ;;
+    --label)  shift; LABEL="${1:?--label needs a name}" ;;
+    *) echo "usage: bench_selfcompile.sh [--native <tsan-binary>] [--runs N] [--no-cc] [--src <file.ts> [--label <name>]]"; exit 1 ;;
   esac
   shift
 done
+[ -f "$SRC" ] || { echo "[$LABEL] src not found: $SRC"; exit 1; }
+# --src 指定時に --label 省略なら basename から導出
+if [ "$SRC" != "analyzer_ts/src/selfhost_typed.ts" ] && [ "$LABEL" = "selfcompile" ]; then
+  LABEL="compile_$(basename "$SRC" .ts)"
+fi
 
 RUST="$ROOT/analyzer/target/release/tsaot"
 [ -x "$RUST" ] || { echo "[selfcompile] Rust analyzer not built ($RUST)"; exit 1; }
 [ -f "$ROOT/analyzer_ts/dist/main.js" ] || { echo "[selfcompile] analyzer_ts/dist not built (cd analyzer_ts && tsc -p tsconfig.json)"; exit 1; }
 [ -f "$ROOT/exporter/exporter.js" ] || { echo "[selfcompile] exporter not built"; exit 1; }
 
-W="${TMPDIR:-/tmp}/selfcompile_bench"; mkdir -p "$W"
+W="${TMPDIR:-/tmp}/selfcompile_bench/$LABEL"; mkdir -p "$W"
 HIST="$ROOT/build/bench_history"; mkdir -p "$HIST"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 
-now_ms() { python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null \
-        || perl -MTime::HiRes=time -e 'printf "%d\n", time()*1000'; }
+. "$ROOT/scripts/lib/now_ms.sh"
 
 best_of() { # $1=label, rest=command…  → best ms を echo（stdout はコマンド側で処理済み前提）
   local label="$1"; shift
@@ -56,10 +72,10 @@ best_of() { # $1=label, rest=command…  → best ms を echo（stdout はコマ
   echo "$best"
 }
 
-echo "[selfcompile] runs=$RUNS (best-of)"
+echo "[$LABEL] src=$SRC runs=$RUNS (best-of)"
 
 # ---- export (typed) ----
-export_run() { node exporter/exporter.js analyzer_ts/src/selfhost_typed.ts "$W/self.ir.json" "$W/self.l.json" >/dev/null 2>&1; }
+export_run() { node exporter/exporter.js "$SRC" "$W/self.ir.json" "$W/self.l.json" >/dev/null 2>&1; }
 t_export=$(best_of export export_run) || exit 1
 ir_bytes=$(wc -c < "$W/self.ir.json" | tr -d ' ')
 
@@ -111,12 +127,14 @@ printf "%-14s %10s\n" "emit-node"   "$t_node"
 printf "%-14s %10s\n" "emit-native" "$t_native"
 printf "%-14s %10s\n" "cc"          "$t_cc"
 printf -- "---------------------------\n"
-echo "[selfcompile] IR=${ir_bytes}B C=${c_bytes}B parity=$parity"
+echo "[$LABEL] IR=${ir_bytes}B C=${c_bytes}B parity=$parity"
 
-OUT="$HIST/${STAMP}_selfcompile.json"
+OUT="$HIST/${STAMP}_${LABEL}.json"
 cat > "$OUT" <<EOF
 {
   "date": "$STAMP",
+  "label": "$LABEL",
+  "src": "$SRC",
   "host": "$(uname -sm)",
   "runs": $RUNS,
   "ir_bytes": $ir_bytes,
@@ -132,5 +150,5 @@ cat > "$OUT" <<EOF
   "pass_stages_ms": null
 }
 EOF
-echo "[selfcompile] wrote $OUT"
+echo "[$LABEL] wrote $OUT"
 case "$parity" in *MISMATCH*) exit 1 ;; esac

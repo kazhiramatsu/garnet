@@ -63,11 +63,7 @@ RT_OBJ="$WORK/ts_rt.o"
 $CC -c "$RT/ts_rt.c" -I"$RT" -o "$RT_OBJ" 2>"$WORK/rt.err" || { echo "[tscconf] runtime compile FAILED"; cat "$WORK/rt.err"; exit 1; }
 
 # portable millisecond clock (macOS BSD date lacks %3N).
-now_ms() { python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null \
-        || perl -MTime::HiRes=time -e 'printf "%d\n", time()*1000' 2>/dev/null \
-        || gdate +%s%3N 2>/dev/null \
-        || date +%s%3N 2>/dev/null \
-        || echo $(( $(date +%s) * 1000 )); }
+. "$ROOT/scripts/lib/now_ms.sh"
 
 # portable timeout: GNU `timeout` (Linux) or `gtimeout` (macOS via brew coreutils).
 # If neither is present, run without a wall-clock cap (the script still works,

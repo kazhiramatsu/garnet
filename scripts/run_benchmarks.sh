@@ -41,11 +41,7 @@ if [[ ! -f "$EXPORTER" ]]; then
       --module commonjs --target es2020 --skipLibCheck --moduleResolution node --esModuleInterop)
 fi
 
-now_ms() { python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null \
-        || perl -MTime::HiRes=time -e 'printf "%d\n", time()*1000' 2>/dev/null \
-        || gdate +%s%3N 2>/dev/null \
-        || date +%s%3N 2>/dev/null \
-        || echo $(( $(date +%s) * 1000 )); }
+. "$ROOT/scripts/lib/now_ms.sh"
 
 RT_OBJ="$WORK/ts_rt.o"
 if ! $CC -c "$RT/ts_rt.c" -I"$RT" -o "$RT_OBJ" 2>"$WORK/rt.cc.err"; then

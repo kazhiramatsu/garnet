@@ -49,8 +49,7 @@ if [ -z "${TSAOT_RT_OBJ:-}" ] && { [ ! -f "$RT_STATS" ] || [ "$ROOT/runtime/ts_r
   cc -O2 -DTSAOT_RT_STATS -c runtime/ts_rt.c -Iruntime -o "$RT_STATS" || exit 1
 fi
 
-now_ms() { python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null \
-        || perl -MTime::HiRes=time -e 'printf "%d\n", time()*1000'; }
+. "$ROOT/scripts/lib/now_ms.sh"
 
 stat_of() { # $1=stats stderr file  $2=sed regex → 値 or "-"
   sed -n -E "s/.*$2.*/\1/p" "$1" | head -1
@@ -98,7 +97,7 @@ for ts in benchmarks/gc/*.ts; do
   alloc_b=$(stat_of "$serr" 'bytes=([0-9]+)')
   mapf=$(stat_of "$serr" 'map_find: calls=[0-9]+ avg_probe=([0-9.]+)')
   envm=$(stat_of "$serr" 'env_malloc=([0-9]+)')
-  alloc_mb=$(python3 -c "print(f'{${alloc_b:-0}/1e6:.1f}')" 2>/dev/null || echo "-")
+  alloc_mb=$(awk "BEGIN{printf \"%.1f\", ${alloc_b:-0}/1e6}" 2>/dev/null || echo "-")
 
   printf "%-18s %8s %7s %6s %9s %10s %9s %12s %10s\n" \
     "$name" "$best" "${minor:--}" "${full:--}" "${pause:--}" "${maxp:--}" "$alloc_mb" "${mapf:--}" "${envm:--}"
