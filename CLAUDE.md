@@ -1,6 +1,8 @@
 # garnet — Claude Code 作業ガイド
 
-**garnet** は TypeScript → C の AOT コンパイラ（旧名 tsaot。TypeScript 製・自己ホスティングを目標）。
+**garnet** は TypeScript → C の AOT コンパイラ（旧名 tsaot）。フロントエンド（exporter）は TypeScript、
+アナライザ/エミッタは **Rust がメイン実装**（自己ホスティングは §313 で実証済みだが、ビルド性能の理由で
+§315 に開発主体を Rust へ戻した。selfhost は性能指標）。
 日本語ユーザー Kaz のプロジェクト。**応答は日本語で**。
 
 > 注: コード内部の識別子・cargo バイナリ名は今も `tsaot`（改名は blast radius が大きいため保留中）。
@@ -23,20 +25,22 @@
 - 完了基準: **conformance 全緑 + ci_fast/unit + bench(perf budget) + bundler 全緑**。新機能は conformance に最小テストを追加。
 
 ## 構成
-- `exporter/` … TS→IR。大半のロジックはここ。
-- `analyzer_ts/` … **TS 製 analyzer（セルフホスト版）。§303 以降の開発主体はこちら**。
-  devirt / interproc(escape) / emit(boxed) 移植済み。`scripts/analyzer_conformance.sh` と
-  `scripts/analyzer_difftest.sh`（スモーク）、fixpoint/diffall が回帰ゲート。
-- `analyzer/` … Rust。**凍結＝差分オラクル**（cargo binary 名は `tsaot`）。新機能はまず analyzer_ts に実装し、
-  Rust 側は検証に必要な場合のみ追随（ダンプモード追加等）。
-- `runtime/ts_rt.c` … ランタイム。
-- emit_c … IR→C（Rust 版。TS 版は `analyzer_ts/src/emit.ts`）。
+- `exporter/` … TS→IR。フロントエンド唯一の実装。メイン開発対象。
+- `analyzer/` … Rust。**メイン実装・開発主体（§315 で凍結解除**。cargo binary 名は `tsaot`）。
+  emit_c（`analyzer/src/emit_c.rs`）が IR→C。挙動不変リファクタは凍結 analyzer_ts との
+  byte-parity（`scripts/emitc_diff.sh` 327/327）で検証。出力を変える変更は parity 卒業（計画 P4）後。
+- `analyzer_ts/` … TS 製 analyzer（セルフホスト版）。**§315 で凍結（ソース変更禁止・新機能移植なし）**。
+  役割は ① 旗艦ベンチマーク（66k 命令の実プログラム負荷）② 機械的 Rust リファクタ期の
+  byte-parity オラクル。
+- `runtime/ts_rt.c` … 共有ランタイム。メイン開発対象。
 
-## セルフホスト開発の方針（ユーザー指示・セッション303〜）
-- **新規開発は analyzer_ts（TS）で行う**。Rust analyzer はオラクルとして維持し、原則改変しない。
-- 検証は「パスダンプ byte 比較」（devirt/escape モード）+ conformance + スモーク + diffall + fixpoint。
-- analyzer_ts のソースは **garnet 自身でコンパイル可能に保つ**（exporter の制限: for-of 内 continue 不可等）。
-  native 化は `TSAOT_UNTYPED=1 ./garnet analyzer_ts/src/selfhost.ts`。
+## 開発方針（ユーザー指示・セッション315〜: Rust 主軸）
+- **新規開発は Rust（analyzer/）・exporter・runtime で行う**。analyzer_ts への機能移植は行わない
+  （凍結。例外は selfhost ベンチのコンパイル可能性を守る最小修正のみ・出力不変を parity で証明）。
+- **selfhost は性能指標**: garnet が凍結 analyzer_ts をコンパイルする速度と、生成 native の emit 速度を
+  旗艦ベンチとして計測。typed native 化は `scripts/typed_selfhost.sh`（selfhost_typed.ts）。
+- 検証は二層: 挙動不変の Rust 変更＝byte-parity（`emitc_diff.sh`）/ 出力が変わる変更＝V8 差分
+  （conformance + bundler + diffall/fixpoint）+ bench budget。詳細は `docs/refactor_master_plan.md`（v2）。
 
 ## 横断的な教訓（code から自明でなく毎回刺さるもの）
 - **TS/ESM は常に strict**。sloppy 挙動（frozen への書き込み無視等）は silent miscompile。オラクルを実行系と同じ module 形式(ESM)にすると隠れた意味論ズレが顕在化する。
