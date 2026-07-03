@@ -41,6 +41,7 @@ static uint32_t g_handle_free_len = 0, g_handle_free_cap = 0;
 #include <time.h>
 static struct {
   unsigned long long minor_gc, full_gc, gc_pause_ns, gc_pause_max_ns;
+  unsigned long long mark_stack_peak;
   unsigned long long alloc_count, alloc_bytes, handle_alloc, root_push;
   unsigned long long call_env_malloc;
   unsigned long long concat_calls, concat_bytes;
@@ -70,10 +71,11 @@ __attribute__((destructor)) static void ts_rt_stats_dump(void){
   if (path && path[0]){ FILE* f = fopen(path, "a"); if (f) out = f; }
   {
     unsigned long long ngc = g_rt_stats.minor_gc + g_rt_stats.full_gc;
-    fprintf(out, "[rt_stats] gc: minor=%llu full=%llu pause_ms=%.2f max_pause_ms=%.3f avg_pause_ms=%.3f\n",
+    fprintf(out, "[rt_stats] gc: minor=%llu full=%llu pause_ms=%.2f max_pause_ms=%.3f avg_pause_ms=%.3f mark_peak=%llu\n",
             g_rt_stats.minor_gc, g_rt_stats.full_gc, (double)g_rt_stats.gc_pause_ns/1e6,
             (double)g_rt_stats.gc_pause_max_ns/1e6,
-            ngc ? (double)g_rt_stats.gc_pause_ns/1e6/(double)ngc : 0.0);
+            ngc ? (double)g_rt_stats.gc_pause_ns/1e6/(double)ngc : 0.0,
+            g_rt_stats.mark_stack_peak);
   }
   fprintf(out, "[rt_stats] alloc: count=%llu bytes=%llu handle_alloc=%llu handle_cap=%u root_push=%llu\n",
           g_rt_stats.alloc_count, g_rt_stats.alloc_bytes, g_rt_stats.handle_alloc,
@@ -2093,114 +2095,124 @@ tsv ts_read_stdin(void){
 }
 
 /* ---------------- mark/sweep ---------------- */
-static void gc_mark(ts_gc_header* h);
-static void gc_scan_refs(ts_gc_header* h);
-static void gc_mark_young(ts_gc_header* h);
-static void gc_scan_young_refs(ts_gc_header* h);
-static void gc_mark_async(ts_gc_header* h);
-static void gc_mark_async_young(ts_gc_header* h);
+static void gc_scan_cell(ts_gc_header* h, int young, int depth);
+static void gc_scan_async_cell(ts_gc_header* h, int young, int depth);
 static void gc_mark_async_roots(void);
 static void gc_mark_async_roots_young(void);
 static void gc_free_cell(ts_gc_header* h);
-static void gc_mark_class_fields(ts_object* o, int young);
-static inline void gc_mark_value(tsv v){
+static void gc_mark_class_fields(ts_object* o, int young, int depth);
+
+/* ---- worklist marking (gc_moving_plan Phase A) ----
+   The marker is an explicit stack, not recursion: deep pointer chains (a 10^5
+   node linked list is legal JS) overflow the C stack in a recursive scanner.
+   Cells are marked when PUSHED, so each cell enters the stack at most once per
+   collection; the drain loop pops and scans fields. NONHEAP cells (stack/SROA
+   objects, interned strings) are not on any sweep list, so the cells whose mark
+   bit we set are recorded and cleared at the end of the collection. */
+static ts_gc_header** g_markstack = NULL;
+static size_t g_markstack_len = 0, g_markstack_cap = 0;
+static ts_gc_header** g_marked_nonheap = NULL;
+static size_t g_marked_nonheap_len = 0, g_marked_nonheap_cap = 0;
+static void gc_markstack_push(ts_gc_header* h){
+  if (g_markstack_len == g_markstack_cap){
+    size_t next = g_markstack_cap ? g_markstack_cap * 2 : 8192;
+    ts_gc_header** grown = (ts_gc_header**)realloc(g_markstack, sizeof(ts_gc_header*) * next);
+    if (!grown) ts_abort_msg("out of memory growing GC mark stack");
+    g_markstack = grown; g_markstack_cap = next;
+  }
+  g_markstack[g_markstack_len++] = h;
+#ifdef TSAOT_RT_STATS
+  if (g_markstack_len > g_rt_stats.mark_stack_peak) g_rt_stats.mark_stack_peak = g_markstack_len;
+#endif
+}
+static void gc_marked_nonheap_push(ts_gc_header* h){
+  if (g_marked_nonheap_len == g_marked_nonheap_cap){
+    size_t next = g_marked_nonheap_cap ? g_marked_nonheap_cap * 2 : 256;
+    ts_gc_header** grown = (ts_gc_header**)realloc(g_marked_nonheap, sizeof(ts_gc_header*) * next);
+    if (!grown) ts_abort_msg("out of memory growing GC visited list");
+    g_marked_nonheap = grown; g_marked_nonheap_cap = next;
+  }
+  g_marked_nonheap[g_marked_nonheap_len++] = h;
+}
+static void gc_clear_nonheap_marks(void){
+  for (size_t i=0;i<g_marked_nonheap_len;i++) g_marked_nonheap[i]->mark = 0;
+  g_marked_nonheap_len = 0;
+}
+/* Mark one value and visit its refs. young=1 keeps the minor-GC boundary: OLD
+   cells are not entered (the remembered set covers old→young edges). NONHEAP
+   cells can hold heap refs, so they are scanned in both modes and dedup through
+   the same mark bit (recorded for the end-of-collection clear).
+   Traversal is hybrid: recurse while depth < TS_GC_MARK_DEPTH_MAX (the freshly
+   marked header is still cache-hot), spill deeper cells to the explicit mark
+   stack. Bounds C-stack use to ~depth×frame while keeping the recursive
+   scanner's locality (pure worklist cost gc_survivors ~8% in the A/B). */
+#define TS_GC_MARK_DEPTH_MAX 256
+static void gc_mark_visit_slow(ts_gc_header* h, int young, int depth){
+  if (h->gen == TS_GEN_YOUNG){
+    h->mark = 1;
+  } else if (h->gen == TS_GEN_OLD){
+    if (young) return; /* minor boundary */
+    h->mark = 1;
+  } else { /* stack/SROA or interned (NONHEAP) */
+    h->mark = 1; gc_marked_nonheap_push(h);
+  }
+  if (depth < TS_GC_MARK_DEPTH_MAX) gc_scan_cell(h, young, depth + 1);
+  else gc_markstack_push(h);
+}
+/* Per-edge fast filter stays inline (bit test + header loads); the mark+scan
+   goes through the outlined slow path so the scan loops stay compact. */
+static inline void gc_mark_visit(tsv v, int young, int depth){
   if (!ts_heap_ref(v)) return;
-  ts_gc_header* h=ts_heap_ptr(v);
-  if (!h) return;
-  if (h->gen == TS_GEN_YOUNG || h->gen == TS_GEN_OLD) gc_mark(h);
-  else gc_scan_refs(h); /* stack/SROA object */
+  ts_gc_header* h = ts_heap_ptr(v);
+  if (!h || h->mark) return;
+  gc_mark_visit_slow(h, young, depth);
 }
-static inline void gc_mark_value_young(tsv v){
-  if (!ts_heap_ref(v)) return;
-  ts_gc_header* h=ts_heap_ptr(v);
-  if (!h) return;
-  if (gc_is_young(h)) gc_mark_young(h);
-  else if (h->gen != TS_GEN_OLD) gc_scan_young_refs(h); /* stack/SROA object */
-}
-static void gc_mark(ts_gc_header* h){
-  if (!h) return;
-  if (h->gen != TS_GEN_YOUNG && h->gen != TS_GEN_OLD){ gc_scan_refs(h); return; }
-  if (h->mark) return; h->mark=1;
-  gc_scan_refs(h);
-}
-static void gc_scan_refs(ts_gc_header* h){
-  if (!h) return;
-  if (h->kind==TS_KIND_OBJECT){ ts_object* o=(ts_object*)h;
-    gc_mark_class_fields(o, 0);
-    for (uint32_t i=0;i<o->len;i++) gc_mark_value(o->props[i].val);
-    gc_mark_value(o->proto);
-  } else if (h->kind==TS_KIND_ACCESSOR){ ts_accessor* ac=(ts_accessor*)h;
-    gc_mark_value(ac->getter);
-    gc_mark_value(ac->setter);
-  } else if (h->kind==TS_KIND_SYMBOL){ ts_symbol* sy=(ts_symbol*)h;
-    gc_mark_value(sy->description);
-  } else if (h->kind==TS_KIND_STRING){ ts_string* s=(ts_string*)h;
-    if (s->flags & TS_STR_FLAG_VIEW) gc_mark_value(s->parent);
-  } else if (h->kind==TS_KIND_FUNC){ ts_func* f=(ts_func*)h;
-    for (uint32_t i=0;i<f->envlen;i++) gc_mark_value(f->env[i]);
-    for (uint32_t i=0;i<f->o.len;i++) gc_mark_value(f->o.props[i].val);
-    gc_mark_value(f->prototype_prop);
-    gc_mark_value(f->o.proto);
-  } else if (h->kind==TS_KIND_ARRAY){ ts_array* a=(ts_array*)h;
-    for (uint32_t i=0;i<a->len;i++) gc_mark_value(a->data[i]);
-    /* unified model: also mark the common header's named-property map + proto. */
-    for (uint32_t i=0;i<a->o.len;i++) gc_mark_value(a->o.props[i].val);
-    gc_mark_value(a->o.proto);
-  } else if (h->kind==TS_KIND_MAP){ ts_map* m=(ts_map*)h;
-    for (uint32_t i=0;i<m->len;i++){
-      gc_mark_value(m->keys[i]);
-      gc_mark_value(m->vals[i]);
-    }
-    for (uint32_t i=0;i<m->o.len;i++) gc_mark_value(m->o.props[i].val);
-    gc_mark_value(m->o.proto);
-  } else if (h->kind==TS_KIND_SET){ ts_set_t* st=(ts_set_t*)h;
-    for (uint32_t i=0;i<st->len;i++) gc_mark_value(st->elems[i]);
-    for (uint32_t i=0;i<st->o.len;i++) gc_mark_value(st->o.props[i].val);
-    gc_mark_value(st->o.proto);
-  } else if (h->kind==TS_KIND_PROXY){ ts_proxy* px=(ts_proxy*)h;
-    gc_mark_value(px->target); gc_mark_value(px->handler);
-  } else if (h->kind==TS_KIND_PROMISE || h->kind==TS_KIND_CORO){
-    gc_mark_async(h);
+static inline void gc_mark_value(tsv v){ gc_mark_visit(v, 0, 0); }
+static inline void gc_mark_value_young(tsv v){ gc_mark_visit(v, 1, 0); }
+static void gc_mark_drain(int young){
+  while (g_markstack_len){
+    ts_gc_header* h = g_markstack[--g_markstack_len];
+    gc_scan_cell(h, young, 0);
   }
 }
-static void gc_mark_young(ts_gc_header* h){
-  if (!h || h->gen != TS_GEN_YOUNG || h->mark) return;
-  h->mark=1;
-  gc_scan_young_refs(h);
-}
-static void gc_scan_young_refs(ts_gc_header* h){
+static void gc_scan_cell(ts_gc_header* h, int young, int depth){
   if (!h) return;
   if (h->kind==TS_KIND_OBJECT){ ts_object* o=(ts_object*)h;
-    gc_mark_class_fields(o, 1);
-    for (uint32_t i=0;i<o->len;i++) gc_mark_value_young(o->props[i].val);
-    gc_mark_value_young(o->proto);
+    gc_mark_class_fields(o, young, depth);
+    for (uint32_t i=0;i<o->len;i++) gc_mark_visit(o->props[i].val, young, depth);
+    gc_mark_visit(o->proto, young, depth);
   } else if (h->kind==TS_KIND_ACCESSOR){ ts_accessor* ac=(ts_accessor*)h;
-    gc_mark_value_young(ac->getter); gc_mark_value_young(ac->setter);
+    gc_mark_visit(ac->getter, young, depth);
+    gc_mark_visit(ac->setter, young, depth);
   } else if (h->kind==TS_KIND_SYMBOL){ ts_symbol* sy=(ts_symbol*)h;
-    gc_mark_value_young(sy->description);
+    gc_mark_visit(sy->description, young, depth);
   } else if (h->kind==TS_KIND_STRING){ ts_string* s=(ts_string*)h;
-    if (s->flags & TS_STR_FLAG_VIEW) gc_mark_value_young(s->parent);
+    if (s->flags & TS_STR_FLAG_VIEW) gc_mark_visit(s->parent, young, depth);
   } else if (h->kind==TS_KIND_FUNC){ ts_func* f=(ts_func*)h;
-    for (uint32_t i=0;i<f->envlen;i++) gc_mark_value_young(f->env[i]);
-    for (uint32_t i=0;i<f->o.len;i++) gc_mark_value_young(f->o.props[i].val);
-    gc_mark_value_young(f->prototype_prop);
-    gc_mark_value_young(f->o.proto);
+    for (uint32_t i=0;i<f->envlen;i++) gc_mark_visit(f->env[i], young, depth);
+    for (uint32_t i=0;i<f->o.len;i++) gc_mark_visit(f->o.props[i].val, young, depth);
+    gc_mark_visit(f->prototype_prop, young, depth);
+    gc_mark_visit(f->o.proto, young, depth);
   } else if (h->kind==TS_KIND_ARRAY){ ts_array* a=(ts_array*)h;
-    for (uint32_t i=0;i<a->len;i++) gc_mark_value_young(a->data[i]);
-    for (uint32_t i=0;i<a->o.len;i++) gc_mark_value_young(a->o.props[i].val);
-    gc_mark_value_young(a->o.proto);
+    for (uint32_t i=0;i<a->len;i++) gc_mark_visit(a->data[i], young, depth);
+    /* unified model: also mark the common header's named-property map + proto. */
+    for (uint32_t i=0;i<a->o.len;i++) gc_mark_visit(a->o.props[i].val, young, depth);
+    gc_mark_visit(a->o.proto, young, depth);
   } else if (h->kind==TS_KIND_MAP){ ts_map* m=(ts_map*)h;
-    for (uint32_t i=0;i<m->len;i++){ gc_mark_value_young(m->keys[i]); gc_mark_value_young(m->vals[i]); }
-    for (uint32_t i=0;i<m->o.len;i++) gc_mark_value_young(m->o.props[i].val);
-    gc_mark_value_young(m->o.proto);
+    for (uint32_t i=0;i<m->len;i++){
+      gc_mark_visit(m->keys[i], young, depth);
+      gc_mark_visit(m->vals[i], young, depth);
+    }
+    for (uint32_t i=0;i<m->o.len;i++) gc_mark_visit(m->o.props[i].val, young, depth);
+    gc_mark_visit(m->o.proto, young, depth);
   } else if (h->kind==TS_KIND_SET){ ts_set_t* st=(ts_set_t*)h;
-    for (uint32_t i=0;i<st->len;i++) gc_mark_value_young(st->elems[i]);
-    for (uint32_t i=0;i<st->o.len;i++) gc_mark_value_young(st->o.props[i].val);
-    gc_mark_value_young(st->o.proto);
+    for (uint32_t i=0;i<st->len;i++) gc_mark_visit(st->elems[i], young, depth);
+    for (uint32_t i=0;i<st->o.len;i++) gc_mark_visit(st->o.props[i].val, young, depth);
+    gc_mark_visit(st->o.proto, young, depth);
   } else if (h->kind==TS_KIND_PROXY){ ts_proxy* px=(ts_proxy*)h;
-    gc_mark_value_young(px->target); gc_mark_value_young(px->handler);
+    gc_mark_visit(px->target, young, depth); gc_mark_visit(px->handler, young, depth);
   } else if (h->kind==TS_KIND_PROMISE || h->kind==TS_KIND_CORO){
-    gc_mark_async_young(h);
+    gc_scan_async_cell(h, young, depth);
   }
 }
 static void gc_free_cell(ts_gc_header* h){
@@ -2324,8 +2336,9 @@ void ts_gc_collect_young(void){
   size_t old_rem_len = g_rem_len;
   for (size_t i=0;i<old_rem_len;i++){
     ts_gc_header* h = g_remset[i];
-    if (h && h->gen == TS_GEN_OLD) gc_scan_young_refs(h);
+    if (h && h->gen == TS_GEN_OLD) gc_scan_cell(h, 1, 0);
   }
+  gc_mark_drain(1);
   for (size_t i=0;i<old_rem_len;i++) if (g_remset[i]) g_remset[i]->remembered = 0;
   g_rem_len = 0;
   for (size_t i=0;i<old_rem_len;i++){
@@ -2358,6 +2371,7 @@ void ts_gc_collect_young(void){
     g_old_heap = survivors;
   }
   g_young_heap = NULL;
+  gc_clear_nonheap_marks();
   RT_STAT_GC_T1;
 }
 void ts_gc_collect(void){
@@ -2377,6 +2391,7 @@ void ts_gc_collect(void){
 #endif
     gc_mark_value(*g_roots[i]);
   }
+  gc_mark_drain(0);
   for (size_t i=0;i<g_rem_len;i++) if (g_remset[i]) g_remset[i]->remembered = 0;
   g_rem_len = 0;
   ts_gc_header** pp=&g_old_heap;
@@ -2396,6 +2411,7 @@ void ts_gc_collect(void){
     tail->gc_next=g_old_heap; g_old_heap=promoted;
   }
   g_young_heap=NULL;
+  gc_clear_nonheap_marks();
   RT_STAT_GC_T1;
 }
 
@@ -5537,7 +5553,7 @@ static tsv class_reg_field_value(ts_class_reg* r, ts_object* o, int i){
   tsv fv; memcpy(&fv, base+r->fields[i].offset, sizeof(tsv));
   return fv;
 }
-static void gc_mark_class_fields(ts_object* o, int young){
+static void gc_mark_class_fields(ts_object* o, int young, int depth){
   ts_class_reg* reg = class_reg_for(o);
   if (!reg) return;
   char* base = (char*)o;
@@ -5545,8 +5561,7 @@ static void gc_mark_class_fields(ts_object* o, int young){
     if (reg->fields[i].numeric) continue;
     tsv fv;
     memcpy(&fv, base + reg->fields[i].offset, sizeof(tsv));
-    if (young) gc_mark_value_young(fv);
-    else gc_mark_value(fv);
+    gc_mark_visit(fv, young, depth);
   }
 }
 
@@ -8718,18 +8733,18 @@ void ts_run_event_loop(void){
 }
 
 /* mark hook for Promise / coroutine frames (defined after their structs) */
-static void gc_mark_async(ts_gc_header* h){
+static void gc_scan_async_cell(ts_gc_header* h, int young, int depth){
   if (h->kind==TS_KIND_PROMISE){
     ts_promise* p=(ts_promise*)h;
-    gc_mark_value(p->value);
-    gc_mark_value(p->comb_results);
-    for (int i=0;i<p->nwait;i++) gc_mark_value(p->waiters[i]);
+    gc_mark_visit(p->value, young, depth);
+    gc_mark_visit(p->comb_results, young, depth);
+    for (int i=0;i<p->nwait;i++) gc_mark_visit(p->waiters[i], young, depth);
   } else if (h->kind==TS_KIND_CORO){
     ts_coro* c=(ts_coro*)h;
-    gc_mark_value(c->result);
-    gc_mark_value(c->yielded);
-    for (int i=0;i<c->fin_top;i++) gc_mark_value(c->fin_exc[i]);
-    gc_mark_value(c->ret);
+    gc_mark_visit(c->result, young, depth);
+    gc_mark_visit(c->yielded, young, depth);
+    for (int i=0;i<c->fin_top;i++) gc_mark_visit(c->fin_exc[i], young, depth);
+    gc_mark_visit(c->ret, young, depth);
     /* Conservatively scan the whole frame: any 8-byte slot that looks like a
        boxed heap handle is treated as a root. Stable handles keep this safe even
        when a minor GC relocates the object body. */
@@ -8737,27 +8752,7 @@ static void gc_mark_async(ts_gc_header* h){
     char* base = (char*)c;
     for (; off + sizeof(tsv) <= c->frame_size; off += sizeof(tsv)){
       tsv v; memcpy(&v, base+off, sizeof(tsv));
-      gc_mark_value(v);
-    }
-  }
-}
-static void gc_mark_async_young(ts_gc_header* h){
-  if (h->kind==TS_KIND_PROMISE){
-    ts_promise* p=(ts_promise*)h;
-    gc_mark_value_young(p->value);
-    gc_mark_value_young(p->comb_results);
-    for (int i=0;i<p->nwait;i++) gc_mark_value_young(p->waiters[i]);
-  } else if (h->kind==TS_KIND_CORO){
-    ts_coro* c=(ts_coro*)h;
-    gc_mark_value_young(c->result);
-    gc_mark_value_young(c->yielded);
-    for (int i=0;i<c->fin_top;i++) gc_mark_value_young(c->fin_exc[i]);
-    gc_mark_value_young(c->ret);
-    size_t off = sizeof(ts_coro);
-    char* base = (char*)c;
-    for (; off + sizeof(tsv) <= c->frame_size; off += sizeof(tsv)){
-      tsv v; memcpy(&v, base+off, sizeof(tsv));
-      gc_mark_value_young(v);
+      gc_mark_visit(v, young, depth);
     }
   }
 }
