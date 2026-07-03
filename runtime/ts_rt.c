@@ -40,7 +40,7 @@ static uint32_t g_handle_free_len = 0, g_handle_free_cap = 0;
 #ifdef TSAOT_RT_STATS
 #include <time.h>
 static struct {
-  unsigned long long minor_gc, full_gc, gc_pause_ns;
+  unsigned long long minor_gc, full_gc, gc_pause_ns, gc_pause_max_ns;
   unsigned long long alloc_count, alloc_bytes, handle_alloc, root_push;
   unsigned long long call_env_malloc;
   unsigned long long concat_calls, concat_bytes;
@@ -68,8 +68,13 @@ __attribute__((destructor)) static void ts_rt_stats_dump(void){
   FILE* out = stderr;
   const char* path = getenv("TSAOT_RT_STATS_FILE");
   if (path && path[0]){ FILE* f = fopen(path, "a"); if (f) out = f; }
-  fprintf(out, "[rt_stats] gc: minor=%llu full=%llu pause_ms=%.2f\n",
-          g_rt_stats.minor_gc, g_rt_stats.full_gc, (double)g_rt_stats.gc_pause_ns/1e6);
+  {
+    unsigned long long ngc = g_rt_stats.minor_gc + g_rt_stats.full_gc;
+    fprintf(out, "[rt_stats] gc: minor=%llu full=%llu pause_ms=%.2f max_pause_ms=%.3f avg_pause_ms=%.3f\n",
+            g_rt_stats.minor_gc, g_rt_stats.full_gc, (double)g_rt_stats.gc_pause_ns/1e6,
+            (double)g_rt_stats.gc_pause_max_ns/1e6,
+            ngc ? (double)g_rt_stats.gc_pause_ns/1e6/(double)ngc : 0.0);
+  }
   fprintf(out, "[rt_stats] alloc: count=%llu bytes=%llu handle_alloc=%llu handle_cap=%u root_push=%llu\n",
           g_rt_stats.alloc_count, g_rt_stats.alloc_bytes, g_rt_stats.handle_alloc,
           g_handle_cap, g_rt_stats.root_push);
@@ -86,7 +91,9 @@ __attribute__((destructor)) static void ts_rt_stats_dump(void){
 #define RT_STAT_ADD(f,n)   (g_rt_stats.f += (unsigned long long)(n))
 #define RT_STAT_HIST(f,n)  (g_rt_stats.f[rt_stats_bucket((unsigned long long)(n))]++)
 #define RT_STAT_GC_T0      uint64_t rt_stats_t0_ = rt_stats_now_ns()
-#define RT_STAT_GC_T1      (g_rt_stats.gc_pause_ns += rt_stats_now_ns() - rt_stats_t0_)
+#define RT_STAT_GC_T1      do { uint64_t rt_d_ = rt_stats_now_ns() - rt_stats_t0_; \
+                             g_rt_stats.gc_pause_ns += rt_d_; \
+                             if (rt_d_ > g_rt_stats.gc_pause_max_ns) g_rt_stats.gc_pause_max_ns = rt_d_; } while (0)
 #else
 #define RT_STAT_INC(f)     ((void)0)
 #define RT_STAT_ADD(f,n)   ((void)0)
