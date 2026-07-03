@@ -594,17 +594,28 @@ static inline int ts_truthy_fast(tsv v){
 static inline int ts_is_nullish_fast(tsv v){ return ts_is_null(v) || ts_is_undef(v); }
 static inline int ts_is_undefined_fast(tsv v){ return ts_is_undef(v); }
 
-/* JS Map: parallel key/value arrays preserving insertion order. Linear probe on
-   SameValueZero equality. (Correctness-first; a hash index can be added later.) */
+/* JS Map: parallel key/value arrays preserving insertion order, plus a side
+   hash index (P2a). The dense arrays stay the GC-scanned ground truth; deleted
+   entries become internal HOLE sentinels (tombs counts them, live size =
+   len - tombs) and are compacted away past a threshold. The index maps hash
+   slots to dense positions and holds no tsv, so the collector ignores it.
+   Small maps (few live entries) skip the index and probe linearly. */
 typedef struct ts_map {
   ts_obj_common o;   /* proto + lazy named-prop map (unified model) */
   tsv* keys; tsv* vals; uint32_t len, cap;
+  uint32_t* index;   /* hash slots: 0=empty, 1=tombstone, else dense idx+2 */
+  uint32_t index_cap; /* power-of-2 slot count (0 = linear mode) */
+  uint32_t tombs;    /* HOLE entries in keys/vals below len */
 } ts_map;
 
-/* JS Set: insertion-ordered element array, SameValueZero membership. */
+/* JS Set: insertion-ordered element array, SameValueZero membership; same
+   dense + side-index scheme as ts_map. */
 typedef struct ts_set_t {
   ts_obj_common o;   /* proto + lazy named-prop map (unified model) */
   tsv* elems; uint32_t len, cap;
+  uint32_t* index;
+  uint32_t index_cap;
+  uint32_t tombs;
 } ts_set_t;
 
 /* a closure: code pointer + captured environment (array of cells) */

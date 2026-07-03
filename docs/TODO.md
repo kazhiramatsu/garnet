@@ -3023,3 +3023,12 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
 - **ASan 環境再確認: 依然ブロック**（CLT 17.0.0 のまま・`int main(){}` 即デッドロック再現）。C1 着手条件は未充足のまま — CLT/Xcode 更新はユーザー判断待ち（plan 未決事項 #2）。
 - **identity hash 設計確定（C0×P2a の干渉解消・plan に記録）**: 単一 inline API `ts_obj_identity_hash(tsv)` に隠蔽。**格納値 = 生の一意 id（B 期 = handle id 下位 32bit・C3 以降 = 旧 handle 領域の u32 に lazy 採番）・分布ミックスは使用側**（fibonacci mix）。アドレス由来禁止・Map 実装の handle 直読み禁止・ミックス済み保存禁止。P2a はこの API だけを見る。
 - **次**: (1) **P2a Map/Set ハッシュ**（ts_obj_identity_hash 実装込み・mapset 747ms/probe 2219 が標的）、(2) aging の設計検討（survivors データ添付済み）、(3) ZAP×threshold=1 全 conformance + gate full + selfhost ミルストーン計測（いずれも要時間枠合意）、(4) CLT 更新判断（ユーザー）。
+
+### セッション318 続き: P2a Map/Set ハッシュ索引化 — mapset_churn 742→9ms（-98.8%・probe 2219→1.30）
+
+- **実装（ts_rt.h/ts_rt.c）**: dense keys/vals（挿入順・GC scan 対象は不変）+ 側面ハッシュ索引 `uint32_t* index`（slot→dense idx+2・0=EMPTY・1=TOMB・pow2・load<3/4 維持・<9 live は線形のまま）。delete は **HOLE 番兵**（`TS_BOX(0xFFFE, 'HOLE')` — 実 NaN は canonical 0x7FF8 化済み・selector は 0xFFFD までなので衝突不可能）+ tombs カウント + **compaction は delete 経路のみ**（tombs>64 かつ tombs*2≥len。set/add 経路は索引再構築のみ = 反復中の dense 不変）。size = len - tombs。
+- **sv0_hash = C0 identity hash 設計の初консюーマ**: 数値=canonical double bits（±0 統合・NaN 1 種）/ 文字列=content hash（TS_STR_FLAG_HASHED キャッシュ利用・view は strhash_view）/ heap セル=identity（**handle id 下位 32bit × fibonacci mix** — 設計どおり格納値は生 id・mix は使用側）/ singleton=生 bits + xorshift-mult。sv0(a,b) ⇒ hash 一致を全型で確認。
+- **hole 統合**: 反復系 10 箇所（keys/values/entries/forEach×Map/Set・spread×2・inspect×2）に skip + inspect は live 数表示 & printed 基準の区切り。GC scan は hole が非 heap-ref なので無変更で安全。gc_free_cell_payload に index 解放追加。moving は memcpy がポインタごと運ぶので fix 不要。
+- **既存バグ修正（副産物）**: forEach 反復中 delete（線形モードの shift）で snapshot 範囲外を **undefined で callback する既存の V8 乖離**を発見 → `i >= len` break で修正。tombstone 化により索引モードの反復中 delete は V8 の skip 意味論に**改修前より近づいた**。
+- **検証**: 意味論バッテリー（NaN/-0/identity/文字列別経路生成/5000 規模 churn/削除→再追加順序/forEach 中 delete/spread/clear 再利用）を V8 差分 OK → conformance `maps_sets/hash_index_semantics.ts` に昇格。**conf all 336/336** / gate gc O2 18/18（索引×moving）/ unit / bundler 39/39 / iter 48 / **gate bench 99/99**。**正式 ABAB（A=HEAD の rt+ヘッダ自己整合ビルド）: mapset_churn 742→9ms（-98.8%）・他 fixture 中立（±2%）・全出力ハッシュ一致**。selfconf 再実行（runtime 変更が fixture バイナリに効くため）。
+- **次**: (1) aging 設計（survivors full=13 の本命）、(2) P2a 残り（find_prop avg 12.6 / intern avg 98.8 / ts_call env スタックバッファ化）、(3) ZAP×threshold=1 全 conformance + gate full + selfhost ミルストーン（要時間枠合意 — Phase B+P2a の効果を selfhost 実測で見る好機）、(4) CLT 更新判断（ユーザー）。
