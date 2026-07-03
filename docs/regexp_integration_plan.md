@@ -153,10 +153,10 @@ non-literal escapes.
 - `classifyRegExpLiteral` is available in the exporter and covered by
   `tests/regexp_classifier.sh`.
 - Generated C emits `TSAOT_NEEDS_REGEXP` only for accepted RegExp operations.
-  `scripts/regexp_link_flags.sh` and `tests/regexp_link_gate.sh` guard optional
+  `scripts/lib/regexp_link_flags.sh` and `tests/regexp_link_gate.sh` guard optional
   adapter linkage; `tests/regexp_aot_gate.sh` keeps no-RegExp programs clean.
 - QuickJS vendoring is present under `runtime/regexp/quickjs/upstream`.
-  `scripts/regexp_link_flags.sh` compiles and links `libunicode.o` and
+  `scripts/lib/regexp_link_flags.sh` compiles and links `libunicode.o` and
   `libregexp.o` only for generated C with `TSAOT_NEEDS_REGEXP`.
 - The QuickJS adapter owns compile/free/exec wrappers around `lre_compile` and
   `lre_exec`, including Latin1 and UTF-16 input entry points. Generated-C

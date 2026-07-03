@@ -134,8 +134,8 @@ binary="${out_c%.c}"; [ "$binary" = "$out_c" ] && binary="$out_c.out"
 
 CC="${TSAOT_CC:-cc -O2}"
 export ROOT CC
-. "$ROOT/scripts/mimalloc_flags.sh" || die "failed to load mimalloc flags"
-. "$ROOT/scripts/regexp_link_flags.sh" || die "failed to load regexp link flags"
+. "$ROOT/scripts/lib/mimalloc_flags.sh" || die "failed to load mimalloc flags"
+. "$ROOT/scripts/lib/regexp_link_flags.sh" || die "failed to load regexp link flags"
 
 # Base runtime object (also the default when the program does not need fetch).
 RT_OBJ="$ROOT/build/rt.o"

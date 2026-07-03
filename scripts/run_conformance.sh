@@ -18,8 +18,8 @@ TIER="${1:-basic}"
 FILTER="${2:-}"
 CC="${TSAOT_CC:-gcc -O2}"
 TSAOT_LDLIBS="${TSAOT_LDLIBS:-}"
-. "$ROOT/scripts/mimalloc_flags.sh" || exit 1
-. "$ROOT/scripts/regexp_link_flags.sh" || exit 1
+. "$ROOT/scripts/lib/mimalloc_flags.sh" || exit 1
+. "$ROOT/scripts/lib/regexp_link_flags.sh" || exit 1
 EX="$ROOT/exporter/exporter.js"
 TSAOT="$ROOT/analyzer/target/release/tsaot"
 RT="$ROOT/runtime"

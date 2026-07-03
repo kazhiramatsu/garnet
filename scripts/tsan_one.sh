@@ -10,8 +10,8 @@ CC="${TSAOT_CC:-cc -O2}"
 ts="$1"
 tmp=/tmp/tsan1; mkdir -p "$tmp"
 export ROOT CC
-. "$ROOT/scripts/mimalloc_flags.sh" 2>/dev/null || true
-. "$ROOT/scripts/regexp_link_flags.sh" || exit 1
+. "$ROOT/scripts/lib/mimalloc_flags.sh" 2>/dev/null || true
+. "$ROOT/scripts/lib/regexp_link_flags.sh" || exit 1
 [ -f "$tmp/rt.o" ] || $CC -c "$ROOT/runtime/ts_rt.c" -I"$ROOT/runtime" -o "$tmp/rt.o" || exit 1
 
 TSAOT_UNTYPED=1 node "$ROOT/exporter/exporter.js" "$ts" "$tmp/ir.json" "$tmp/l.json" >/dev/null || { echo "EXPORTER-FAIL"; exit 2; }

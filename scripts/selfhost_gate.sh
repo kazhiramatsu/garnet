@@ -124,8 +124,8 @@ printf '%s' "$(cat "$work/gen2.c")" > "$work/gen2_t.c"
 printf '%s' "$(cat "$work/gen2_node.c")" > "$work/gen2n_t.c"
 cmp -s "$work/gen2_t.c" "$work/gen2n_t.c" || fail "gen2 native != node"
 export ROOT CC="${TSAOT_CC:-cc -O2}"
-. scripts/mimalloc_flags.sh 2>/dev/null || true
-. scripts/regexp_link_flags.sh || fail "regexp link flags"
+. scripts/lib/mimalloc_flags.sh 2>/dev/null || true
+. scripts/lib/regexp_link_flags.sh || fail "regexp link flags"
 [ -f "$work/rt.o" ] || cc -O2 -c runtime/ts_rt.c -Iruntime -o "$work/rt.o" || fail "runtime build"
 tsaot_prepare_regexp_objs "$work/gen2.c" "$work" >/dev/null 2>&1
 tsaot_prepare_unicode_objs "$work/gen2.c" "$work" >/dev/null 2>&1

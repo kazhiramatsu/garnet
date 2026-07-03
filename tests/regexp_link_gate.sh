@@ -4,8 +4,8 @@ cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 CC="${TSAOT_CC:-gcc -O2}"
 TSAOT_LDLIBS="${TSAOT_LDLIBS:-}"
-. "$ROOT/scripts/mimalloc_flags.sh"
-. "$ROOT/scripts/regexp_link_flags.sh"
+. "$ROOT/scripts/lib/mimalloc_flags.sh"
+. "$ROOT/scripts/lib/regexp_link_flags.sh"
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT

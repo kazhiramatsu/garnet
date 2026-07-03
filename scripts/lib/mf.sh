@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # Multi-file (bundler) differential test harness.
-#   source scripts/mftest.sh
+#   source scripts/lib/mf.sh
 #   mf "name" <dir-with-entry.ts-and-siblings>
 # Compiles the entry (tsaot bundles the whole module graph) to a native binary
 # and compares its output against a node ESM baseline (each .ts transpiled to
 # .mjs with relative specifiers rewritten to .mjs, then `node entry.mjs`).
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/../.." && pwd)"
 export ROOT
 CC="${TSAOT_CC:-gcc -O2}"
-. "$ROOT/scripts/mimalloc_flags.sh" || return 1
-. "$ROOT/scripts/regexp_link_flags.sh" || return 1
+. "$ROOT/scripts/lib/mimalloc_flags.sh" || return 1
+. "$ROOT/scripts/lib/regexp_link_flags.sh" || return 1
 mkdir -p "$ROOT/build"
 [ -f "$ROOT/build/rt.o" ] || gcc -O2 -c "$ROOT/runtime/ts_rt.c" -I "$ROOT/runtime" -o "$ROOT/build/rt.o"
 

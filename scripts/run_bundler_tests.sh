@@ -4,7 +4,7 @@
 # Cases marked `# EXPECT-REJECT` must loud-reject (no silent miscompile).
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
-. "$ROOT/scripts/mftest.sh"
+. "$ROOT/scripts/lib/mf.sh"
 DIR="$ROOT/tests/bundler"
 pass=0; fail=0
 run() {

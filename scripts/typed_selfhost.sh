@@ -77,8 +77,8 @@ cp "$W/gen2_t.c" "$build_dir/tsan_typed2.c"
 ROOT="$(pwd)"
 CC="${TSAOT_CC:-cc -O2}"
 export ROOT CC
-. "$ROOT/scripts/mimalloc_flags.sh" || fail "mimalloc flags"
-. "$ROOT/scripts/regexp_link_flags.sh" || fail "regexp link flags"
+. "$ROOT/scripts/lib/mimalloc_flags.sh" || fail "mimalloc flags"
+. "$ROOT/scripts/lib/regexp_link_flags.sh" || fail "regexp link flags"
 RT_OBJ="$ROOT/build/rt.o"
 mkdir -p "$ROOT/build"
 if [ ! -f "$RT_OBJ" ] || [ "$ROOT/runtime/ts_rt.c" -nt "$RT_OBJ" ]; then

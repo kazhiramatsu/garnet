@@ -11,8 +11,8 @@ EX="exporter/exporter.js"
 TSAOT="analyzer/target/release/tsaot"
 CC="${TSAOT_CC:-gcc -O2}"
 TSAOT_LDLIBS="${TSAOT_LDLIBS:-}"
-. "$ROOT/scripts/mimalloc_flags.sh" || exit 1
-. "$ROOT/scripts/regexp_link_flags.sh" || exit 1
+. "$ROOT/scripts/lib/mimalloc_flags.sh" || exit 1
+. "$ROOT/scripts/lib/regexp_link_flags.sh" || exit 1
 tmp=$(mktemp -d)
 fail=0; n=0
 # Precompile the runtime ONCE; link each golden against it (the runtime is

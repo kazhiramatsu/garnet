@@ -4,7 +4,7 @@ cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 CC="${TSAOT_CC:-gcc -O2}"
 TSAOT_LDLIBS="${TSAOT_LDLIBS:-}"
-. "$ROOT/scripts/mimalloc_flags.sh" || exit 1
+. "$ROOT/scripts/lib/mimalloc_flags.sh" || exit 1
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT

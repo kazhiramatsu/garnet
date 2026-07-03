@@ -1,8 +1,8 @@
 #!/bin/bash
 cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.."
 ROOT="$(pwd)"; RT="$ROOT/runtime"; CC=gcc; export CC
-. "$ROOT/scripts/regexp_link_flags.sh" 2>/dev/null
-. "$ROOT/scripts/mimalloc_flags.sh" 2>/dev/null || true
+. "$ROOT/scripts/lib/regexp_link_flags.sh" 2>/dev/null
+. "$ROOT/scripts/lib/mimalloc_flags.sh" 2>/dev/null || true
 W=build/dw; mkdir -p "$W"
 RT_OBJ="$ROOT/build/rt.o"
 diff() {

@@ -3,7 +3,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 CC="${TSAOT_CC:-gcc -O2}"
-. "$ROOT/scripts/regexp_link_flags.sh"
+. "$ROOT/scripts/lib/regexp_link_flags.sh"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 

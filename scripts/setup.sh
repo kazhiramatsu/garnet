@@ -7,7 +7,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
 cd "$ROOT"
 CC="${TSAOT_CC:-gcc -O2}"
 TSAOT_LDLIBS="${TSAOT_LDLIBS:-}"
-. "$ROOT/scripts/mimalloc_flags.sh" || exit 1
+. "$ROOT/scripts/lib/mimalloc_flags.sh" || exit 1
 fail=0
 
 echo "[setup] 1/4 exporter deps (npm install)…"

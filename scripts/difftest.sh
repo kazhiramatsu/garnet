@@ -16,8 +16,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
 export ROOT
 CC="${TSAOT_CC:-gcc -O2}"
 TSAOT_LDLIBS="${TSAOT_LDLIBS:-}"
-. "$ROOT/scripts/mimalloc_flags.sh" || return 1
-. "$ROOT/scripts/regexp_link_flags.sh" || return 1
+. "$ROOT/scripts/lib/mimalloc_flags.sh" || return 1
+. "$ROOT/scripts/lib/regexp_link_flags.sh" || return 1
 mkdir -p "$ROOT/build"
 
 # Generate the node reference runner (uses the exporter's bundled typescript).

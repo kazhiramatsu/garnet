@@ -17,8 +17,8 @@ EXPORTER="$ROOT/exporter/exporter.js"
 
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 export ROOT CC
-. "$ROOT/scripts/mimalloc_flags.sh" 2>/dev/null || true
-. "$ROOT/scripts/regexp_link_flags.sh" || { echo "regexp link flags missing"; exit 1; }
+. "$ROOT/scripts/lib/mimalloc_flags.sh" 2>/dev/null || true
+. "$ROOT/scripts/lib/regexp_link_flags.sh" || { echo "regexp link flags missing"; exit 1; }
 $CC -c "$ROOT/runtime/ts_rt.c" -I"$ROOT/runtime" -o "$tmp/rt.o" 2>/dev/null || { echo "runtime build failed"; exit 1; }
 
 cc_link() { # $1=src.c $2=out

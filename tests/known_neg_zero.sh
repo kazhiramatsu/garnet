@@ -7,7 +7,7 @@ cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 CC="${TSAOT_CC:-gcc -O2}"
 TSAOT_LDLIBS="${TSAOT_LDLIBS:-}"
-. "$ROOT/scripts/mimalloc_flags.sh" || exit 1
+. "$ROOT/scripts/lib/mimalloc_flags.sh" || exit 1
 cp -r /home/claude/exporter/node_modules exporter/ 2>/dev/null || true
 tmp=$(mktemp -d); fail=0
 $CC -c runtime/ts_rt.c -Iruntime -o "$tmp/rt.o" 2>/dev/null
