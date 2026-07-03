@@ -32,6 +32,69 @@ static uint32_t g_handle_len = 0, g_handle_cap = 0;
 static uint32_t* g_handle_free = NULL;
 static uint32_t g_handle_free_len = 0, g_handle_free_cap = 0;
 
+/* ---------------- runtime stats (compile-time opt-in) ----------------
+   Build with -DTSAOT_RT_STATS to compile in lightweight counters; a summary is
+   printed to stderr at process exit (TSAOT_RT_STATS_FILE=path appends there
+   instead). Default builds compile every macro to ((void)0) — zero hot-path
+   cost, identical codegen. Perf 判断の事実基盤 (refactor plan P0)。 */
+#ifdef TSAOT_RT_STATS
+#include <time.h>
+static struct {
+  unsigned long long minor_gc, full_gc, gc_pause_ns;
+  unsigned long long alloc_count, alloc_bytes, handle_alloc, root_push;
+  unsigned long long call_env_malloc;
+  unsigned long long concat_calls, concat_bytes;
+  unsigned long long intern_calls, intern_probes;
+  unsigned long long map_find_calls, map_find_probes, map_find_hist[9];
+  unsigned long long find_prop_calls, find_prop_probes, find_prop_hist[9];
+} g_rt_stats;
+static uint64_t rt_stats_now_ns(void){
+  struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+  return (uint64_t)t.tv_sec*1000000000ull + (uint64_t)t.tv_nsec;
+}
+/* probe-count histogram bucket: 1,2,4,8,…,128,256+ (9 buckets) */
+static inline unsigned rt_stats_bucket(unsigned long long n){
+  unsigned b = 0; while (n > 1 && b < 8){ n >>= 1; b++; } return b;
+}
+static void rt_stats_hist_line(FILE* out, const char* name,
+                               unsigned long long calls, unsigned long long probes,
+                               const unsigned long long h[9]){
+  fprintf(out, "[rt_stats] %s: calls=%llu avg_probe=%.2f hist(1,2,4,…,256+)=[", name,
+          calls, calls ? (double)probes/(double)calls : 0.0);
+  for (int i=0;i<9;i++) fprintf(out, "%s%llu", i?",":"", h[i]);
+  fprintf(out, "]\n");
+}
+__attribute__((destructor)) static void ts_rt_stats_dump(void){
+  FILE* out = stderr;
+  const char* path = getenv("TSAOT_RT_STATS_FILE");
+  if (path && path[0]){ FILE* f = fopen(path, "a"); if (f) out = f; }
+  fprintf(out, "[rt_stats] gc: minor=%llu full=%llu pause_ms=%.2f\n",
+          g_rt_stats.minor_gc, g_rt_stats.full_gc, (double)g_rt_stats.gc_pause_ns/1e6);
+  fprintf(out, "[rt_stats] alloc: count=%llu bytes=%llu handle_alloc=%llu handle_cap=%u root_push=%llu\n",
+          g_rt_stats.alloc_count, g_rt_stats.alloc_bytes, g_rt_stats.handle_alloc,
+          g_handle_cap, g_rt_stats.root_push);
+  fprintf(out, "[rt_stats] ts_call env_malloc=%llu | concat: calls=%llu bytes=%llu\n",
+          g_rt_stats.call_env_malloc, g_rt_stats.concat_calls, g_rt_stats.concat_bytes);
+  rt_stats_hist_line(out, "map_find", g_rt_stats.map_find_calls, g_rt_stats.map_find_probes, g_rt_stats.map_find_hist);
+  rt_stats_hist_line(out, "find_prop", g_rt_stats.find_prop_calls, g_rt_stats.find_prop_probes, g_rt_stats.find_prop_hist);
+  fprintf(out, "[rt_stats] intern: calls=%llu avg_probe=%.2f\n",
+          g_rt_stats.intern_calls,
+          g_rt_stats.intern_calls ? (double)g_rt_stats.intern_probes/(double)g_rt_stats.intern_calls : 0.0);
+  if (out != stderr) fclose(out);
+}
+#define RT_STAT_INC(f)     (g_rt_stats.f++)
+#define RT_STAT_ADD(f,n)   (g_rt_stats.f += (unsigned long long)(n))
+#define RT_STAT_HIST(f,n)  (g_rt_stats.f[rt_stats_bucket((unsigned long long)(n))]++)
+#define RT_STAT_GC_T0      uint64_t rt_stats_t0_ = rt_stats_now_ns()
+#define RT_STAT_GC_T1      (g_rt_stats.gc_pause_ns += rt_stats_now_ns() - rt_stats_t0_)
+#else
+#define RT_STAT_INC(f)     ((void)0)
+#define RT_STAT_ADD(f,n)   ((void)0)
+#define RT_STAT_HIST(f,n)  ((void)0)
+#define RT_STAT_GC_T0      ((void)0)
+#define RT_STAT_GC_T1      ((void)0)
+#endif
+
 /* The collector uses a mark/sweep full GC and a generational minor GC. Minor GC
    relocates movable young survivors through stable handles; full GC remains
    mark/sweep. Keep fixed minimum headroom for ephemeral churn, and after each
@@ -118,6 +181,7 @@ static void gc_config_init(void){
 }
 static uint64_t gc_handle_alloc(ts_gc_header* h){
   uint32_t id;
+  RT_STAT_INC(handle_alloc);
   if (g_handle_free_len){
     id = g_handle_free[--g_handle_free_len];
   } else {
@@ -165,6 +229,7 @@ void ts_gc_remember(ts_gc_header* h){
 }
 
 void ts_gc_root(tsv* slot){
+  RT_STAT_INC(root_push);
   if (g_root_len==g_root_cap){ g_root_cap=g_root_cap?g_root_cap*2:64; g_roots=realloc(g_roots,sizeof(tsv*)*g_root_cap);}
 #if defined(TS_ASAN_ENABLED)
   __asan_unpoison_memory_region(slot, sizeof(*slot));
@@ -195,6 +260,7 @@ static void* gc_alloc(size_t sz, uint8_t kind){
     g_full_threshold = next;
   }
   ts_gc_header* h=calloc(1,sz);
+  RT_STAT_INC(alloc_count); RT_STAT_ADD(alloc_bytes, sz);
   h->kind=kind; h->gen=TS_GEN_YOUNG; h->size=sz; h->gc_next=g_young_heap; g_young_heap=h;
   h->handle = gc_handle_alloc(h);
   g_alloc++; g_young_alloc++;
@@ -348,6 +414,7 @@ tsv ts_call(tsv fn, tsv* args, int nargs){
        calling convention (captured cells are its leading parameters). */
     int total = (int)f->envlen + nargs;
     tsv* merged = malloc(sizeof(tsv)*(total>0?total:1));
+    RT_STAT_INC(call_env_malloc);
     for (uint32_t i=0;i<f->envlen;i++) merged[i]=f->env[i];
     for (int i=0;i<nargs;i++) merged[f->envlen+i]=args[i];
     tsv r = code(merged, total);
@@ -502,7 +569,12 @@ static void struct_field_set(ts_object* o, size_t off, int numeric, tsv v);
    TS_PROP_DEFAULT (all-true) so ordinary properties created here behave exactly
    as before the flags field existed. */
 static ts_prop* find_prop(ts_object* o, ts_key key, int create){
-  for (uint32_t i=0;i<o->len;i++) if (o->props[i].key==key) return &o->props[i];
+  RT_STAT_INC(find_prop_calls);
+  for (uint32_t i=0;i<o->len;i++) if (o->props[i].key==key){
+    RT_STAT_ADD(find_prop_probes, i+1); RT_STAT_HIST(find_prop_hist, i+1);
+    return &o->props[i];
+  }
+  RT_STAT_ADD(find_prop_probes, o->len); RT_STAT_HIST(find_prop_hist, o->len+1);
   if (!create) return NULL;
   if (o->len==o->cap){ o->cap=o->cap?o->cap*2:4; o->props=realloc(o->props,sizeof(ts_prop)*o->cap); }
   o->props[o->len].key=key; o->props[o->len].val=TS_UNDEFINED;
@@ -1790,6 +1862,7 @@ tsv ts_add(tsv a, tsv b){
     ts_strview x=ts_str_view_typed(sa), y=ts_str_view_typed(sb);
     uint32_t n=x.len+y.len;
     uint32_t flags = (x.flags | y.flags) & TS_STR_FLAG_UTF16;
+    RT_STAT_INC(concat_calls); RT_STAT_ADD(concat_bytes, n);
     ts_string* out = ts_string_alloc_storage(n, flags);
     x=ts_str_view_typed(sa); y=ts_str_view_typed(sb);
     ts_str_copy_units(out->data, flags, 0, x, 0, x.len);
@@ -1840,6 +1913,7 @@ tsv ts_str_concat_many(tsv* args, int n){
     return ts_new_string("",0);
   }
 
+  RT_STAT_INC(concat_calls); RT_STAT_ADD(concat_bytes, total);
   ts_string* out = ts_string_alloc_storage((uint32_t)total, out_flags);
   uint32_t pos = 0;
   for(int i=0;i<n;i++){
@@ -2226,6 +2300,7 @@ static ts_gc_header* gc_move_young_to_old(ts_gc_header* h){
 }
 void ts_gc_collect_young(void){
   if (!g_young_heap) return;
+  RT_STAT_INC(minor_gc); RT_STAT_GC_T0;
   gc_mark_async_roots_young();
   for (uint32_t i=0;i<g_sym_desc_len;i++) gc_mark_value_young(g_sym_desc[i]);
   for (uint32_t i=0;i<g_sym_value_len;i++) gc_mark_value_young(g_sym_value[i]);
@@ -2276,8 +2351,10 @@ void ts_gc_collect_young(void){
     g_old_heap = survivors;
   }
   g_young_heap = NULL;
+  RT_STAT_GC_T1;
 }
 void ts_gc_collect(void){
+  RT_STAT_INC(full_gc); RT_STAT_GC_T0;
   gc_mark_async_roots();
   /* keep symbol descriptions alive for the inspector's `Symbol(desc)` rendering
      (marked by value, so a realloc of g_sym_desc is harmless). */
@@ -2312,6 +2389,7 @@ void ts_gc_collect(void){
     tail->gc_next=g_old_heap; g_old_heap=promoted;
   }
   g_young_heap=NULL;
+  RT_STAT_GC_T1;
 }
 
 tsv ts_dynamic_method_unsupported(void){
@@ -3238,7 +3316,12 @@ tsv ts_new_set(void){
 
 /* find key index in a map, or -1 */
 static long map_find(ts_map* m, tsv k){
-  for (uint32_t i=0;i<m->len;i++) if (same_value_zero(m->keys[i], k)) return (long)i;
+  RT_STAT_INC(map_find_calls);
+  for (uint32_t i=0;i<m->len;i++) if (same_value_zero(m->keys[i], k)){
+    RT_STAT_ADD(map_find_probes, i+1); RT_STAT_HIST(map_find_hist, i+1);
+    return (long)i;
+  }
+  RT_STAT_ADD(map_find_probes, m->len); RT_STAT_HIST(map_find_hist, m->len+1);
   return -1;
 }
 static void map_grow(ts_map* m){
@@ -4537,10 +4620,12 @@ static int field_bytes_is(const char* n, uint32_t len, const char* lit){
 }
 /* intern a (possibly new) field name -> id, agreeing with compile-time ids. */
 uint32_t ts_intern_field(const char* name, uint32_t len){
+  RT_STAT_INC(intern_calls);
   for (uint32_t i=0;i<g_field_count;i++){
     const char* n=g_field_names[i];
-    if (n && g_field_lens[i]==len && memcmp(n,name,len)==0) return i;
+    if (n && g_field_lens[i]==len && memcmp(n,name,len)==0){ RT_STAT_ADD(intern_probes, i+1); return i; }
   }
+  RT_STAT_ADD(intern_probes, g_field_count);
   if (g_field_count==g_field_cap){
     g_field_cap=g_field_cap?g_field_cap*2:16;
     g_field_names=realloc(g_field_names,sizeof(char*)*g_field_cap);

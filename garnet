@@ -33,6 +33,11 @@ usage: $PROG [-c | -S] [-o <out.c>] <input.ts>
   --untyped     compile the whole program as \`any\`: disable all type-driven
                 optimization (everything boxed, correct JS semantics). Safe but
                 slower; also lets ill-typed input through (no type-error stop).
+  --profile     compile with -g -fno-omit-frame-pointer (for sample/perf;
+                see scripts/profile_bench.sh)
+  --rt-stats    compile the runtime with -DTSAOT_RT_STATS: counters (GC/alloc/
+                probe lengths/…) are printed to stderr at exit
+                (TSAOT_RT_STATS_FILE=path appends there instead)
   -h, --help    show this help
 
 env: TSAOT_CC (default "cc -O2"), TSAOT_USE_MIMALLOC=1, TSAOT_ALLOW_UNSUPPORTED=1,
@@ -45,6 +50,8 @@ die() { echo "$PROG: $*" >&2; exit 1; }
 # ----- parse arguments -----
 emit_only=0      # -c
 to_stdout=0      # -S
+profile=0        # --profile
+rt_stats=0       # --rt-stats
 out_c=""         # -o
 input=""
 while [ $# -gt 0 ]; do
@@ -54,6 +61,8 @@ while [ $# -gt 0 ]; do
     -o) shift; [ $# -gt 0 ] || die "-o requires an argument"; out_c="$1" ;;
     -o*) out_c="${1#-o}" ;;
     --untyped) export TSAOT_UNTYPED=1 ;;
+    --profile) profile=1 ;;
+    --rt-stats) rt_stats=1 ;;
     -h|--help) usage; exit 0 ;;
     --) shift; break ;;
     -*) die "unknown option: $1 (try $PROG --help)" ;;
@@ -133,12 +142,17 @@ fi
 binary="${out_c%.c}"; [ "$binary" = "$out_c" ] && binary="$out_c.out"
 
 CC="${TSAOT_CC:-cc -O2}"
+# --rt-stats / --profile append flags; the cached runtime object gets a distinct
+# name per flag combination so variants never poison each other's cache.
+rt_suffix=""
+if [ "$rt_stats" -eq 1 ]; then CC="$CC -DTSAOT_RT_STATS"; rt_suffix="${rt_suffix}_stats"; fi
+if [ "$profile" -eq 1 ]; then CC="$CC -g -fno-omit-frame-pointer"; rt_suffix="${rt_suffix}_prof"; fi
 export ROOT CC
 . "$ROOT/scripts/lib/mimalloc_flags.sh" || die "failed to load mimalloc flags"
 . "$ROOT/scripts/lib/regexp_link_flags.sh" || die "failed to load regexp link flags"
 
 # Base runtime object (also the default when the program does not need fetch).
-RT_OBJ="$ROOT/build/rt.o"
+RT_OBJ="$ROOT/build/rt${rt_suffix}.o"
 mkdir -p "$ROOT/build"
 if [ ! -f "$RT_OBJ" ] || [ "$ROOT/runtime/ts_rt.c" -nt "$RT_OBJ" ]; then
   $CC -c "$ROOT/runtime/ts_rt.c" -I"$ROOT/runtime" -o "$RT_OBJ" || die "failed to build runtime ($RT_OBJ)"
