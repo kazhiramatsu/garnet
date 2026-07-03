@@ -88,6 +88,87 @@ correctness 専用として役割分担 — 速さはこちら、正しさはあ
 - `TSAOT_RT_STATS` はコンパイル時 opt-in（`-DTSAOT_RT_STATS` / `garnet --rt-stats`）。
   既定ビルドはマクロが空になりホットパス影響ゼロ（conf all 330/330 で無退行確認）。
 
+## 計測ウィンドウ 2026-07-03（セッション316）
+
+- **`gate gc` O2 部分: PASS 18/18**（focused conformance, threshold=1, normal O2）。
+- **`gate gc` ASan 部分: 環境ブロッカーで実行不能** — Apple clang 17.0.0 (clang-1700.6.4.2,
+  CLT 26.3) の libclang_rt ASan が macOS 26.5.1 で**起動時デッドロック**する。
+  `AsanInitInternal → InitializeShadowMemory → get_dyld_hdr → _Block_copy → malloc →
+  ASan init 再入 → 自分の StaticSpinMutex を待って sched_yield 永久スピン`（sample で確認）。
+  `int main(){return 0;}` の最小 ASan バイナリでも再現 = garnet 非依存。
+  前セッションの「classes_* 台で長時間化」も実体はこれ（1 バイナリが CPU 96 分スピン）。
+  **対処候補: Xcode/CLT 更新、または homebrew gcc（実 GCC の libasan）**。解消までは
+  `TSAOT_GC_STRESS_ASAN=0 TSAOT_GC_STRESS_RUNTIME_ASAN=0` で O2 部分のみ運用。
+- 運用知見: 長時間ジョブは `taskpolicy -b -p <pid>` で E-core 限定にでき、体感負荷を
+  ほぼゼロにできる（wall 計測には使わない。correctness 専用）。
+- **`gate bench`: PASS 99/99（全行 correct + 予算内）、所要 63s**（逐次 1 コア・nice 10・
+  アイドルマシン）。当初見積 ~10 分は過大だった — スイート全体が軽い。
+- **`bench_selfcompile.sh --runs 3`（負荷ゼロ・best-of-3・所要 180s）— † 無しの確定値**:
+  export **1,344ms** / emit-rust **22,487ms** / emit-node **29,269ms** / **cc 6,343ms（初計測
+  = P2d --jobs 分割の基準値）**。IR 23,418,729B / C 5,593,546B / rust vs node parity=identical。
+  JSON: build/bench_history/20260703T093859Z_selfcompile.json。
+  （P0 検証実行の † 値より export -7% / emit-rust -9% / emit-node -17% — 負荷の影響幅の実例）
+- **`gate full`: FULL PASS、所要 767s（12.8 分）** — conf 327/327 PASS、devirt/escape 327
+  identical、native build ok、diffall/native-escape 327 identical、fixpoint ok。
+- **`gate typed` / emit-native / エンジン比較全行: ミルストーン計測へ延期**（ユーザー決定:
+  重い selfhost 系ベンチを毎回流すのは厳しい → 日常計測は軽量セットに切り替え）。
+
+### 日常計測セット（毎セッション可・合計 ~90s・全て逐次 1 コア）
+
+| 用途 | コマンド | 所要 |
+|---|---|---|
+| コンパイルステージ A/B | `scripts/bench_selfcompile.sh --src tests/conformance/exhaustive/classes/extends_same_name_scopes.ts --runs 5` | ~4s |
+| GC/ランタイム | `scripts/bench_gc.sh` | ~19s |
+| perf budget 回帰 | `scripts/gate.sh bench` | ~63s |
+
+- `bench_selfcompile.sh` に **`--src <file.ts>` / `--label`** を追加（軽量計測モード）。
+  初回計測（extends_same_name_scopes.ts・250 行級・runs=5 best）:
+  **export 267ms / emit-rust 17ms / emit-node 68ms / cc 134ms**、IR 125,726B / C 103,237B /
+  parity identical。小入力はプロセス起動が支配的なので**同一入力の前後差分でのみ判断**。
+  既定（selfhost 入力）の無退行は runs=1 で確認済み（IR/C バイト・parity 従来値と一致）。
+  注: conformance の一部（replaceAll 使用等）は単体 export だと lib 設定で型エラーになる —
+  軽量入力に使うファイルは export が通るものを選ぶ。
+
+### GC ベンチ拡充（P0 残の classics / escape-hardened、同日）
+
+新 fixture 3 本（V8 差分 OK・スイートは 8 本になり全体 ~30s のまま）:
+
+| bench | wall ms | minor | full | pause ms | max p ms | alloc MB | 特記 |
+|---|---|---|---|---|---|---|---|
+| gc_binarytrees | 116 | 16 | **4** | 1.59 | 3.92 | 111.0 | Boehm 系クラシック。survivors 以外で唯一 full GC を踏む |
+| gc_cycles | 48 | 18 | 0 | 0.83 | 1.23 | 105.6 | 閉サイクルごみの回収（mark/sweep の対サイクル検証） |
+| gc_escape_poly | 151 | 30 | 0 | 1.12 | 2.21 | 128.0 | 多相境界越えで escape/SROA に消されない alloc 圧の下限 |
+
+- **ランタイムの実弱点を発見: `gc_scan_refs` は再帰マークで、深いポインタ鎖
+  （~10^5 ノード級の一本鎖リスト）でスタックガードに激突して SIGSEGV** する
+  （クラッシュレポートで確認: `gc_alloc → ts_gc_collect → gc_scan_refs` の深い再帰）。
+  V8 の GC は任意深さのグラフを処理できるため意味論ギャップ（loud crash だが要修正）。
+  **worklist 化（iterative marking）を P2a/P6 の課題に追加**。修正後は深鎖 fixture を
+  ベンチ or conformance に昇格させる。
+
+## 既知 parity DIFF リスト（miscompile 修正由来・単調増加を許容）
+
+**ポリシー（ユーザー決定・2026-07-03/04・binding**）: rust 側で silent miscompile を修正すると
+凍結 analyzer_ts（同一アルゴリズムの双子）と emit が恒久的に食い違う。**受容して本リストで管理**
+し、凍結ソースは触らない。**再同期はミルストーン**（速度改善が貯まり、selfhost で「本当に効果が
+あるか」を fixpoint/byte 一致込みで検証したくなった時点）で、蓄積修正の一括移植 or P4 parity 卒業
+のどちらかを選ぶ。selfhost の**ベンチマークとしての役割は無傷**（凍結ソースを入力として
+コンパイルする速度・生成 native の実行速度は今後も常に有効。修正後の garnet は凍結ソースを
+以前より正しくコンパイルする）。
+
+現在の期待値: **emitc parity = identical 325 / DIFF 5**（2026-07-04・s316 修正後）:
+
+| プログラム | 由来 |
+|---|---|
+| classes_sroa_contained_escape（新規テスト） | 修正#1: 凍結側は contained ループ alloc を sobj スタック化 |
+| classes_sroa_narrowed_nullable_reads（新規） | 修正#2a/2b |
+| classes_sroa_try_body_uses（新規） | 修正#2c（+ 数値スカラ型の随伴差 long long↔double） |
+| closures_forof_loop_capture | 修正#1: site 14 Stack→FrameArena（**注釈コメントのみの差**） |
+| errors_super_assign_throws | 修正#1/#2 の随伴（要一行調査・害なしは conf 333 で確認済み） |
+
+運用: gate parity / gate full の diffall・nescape 系は上記件数までは PASS 扱いとする
+（ゲートスクリプトへの許容リスト実装は追作業。それまでは目視で件数一致を確認）。
+
 ## 計測ウィンドウで取るものリスト（チェックリスト）
 
 ユーザーと時間枠を合意してから、負荷ゼロ状態で順に実行・追記する:
