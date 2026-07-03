@@ -1,0 +1,25 @@
+function main(): void {
+  console.log(Math.sqrt(16));
+  console.log(Math.floor(3.7));
+  console.log(Math.ceil(3.2));
+  console.log(Math.round(2.5));
+  console.log(Math.abs(-7));
+  console.log(Math.pow(2, 10));
+  console.log(Math.max(3, 8));
+  console.log(Math.min(3, 8));
+  console.log(Math.sign(-3));
+  console.log(Math.trunc(4.9));
+  console.log(Math.log2(8));
+  console.log(Math.hypot(3, 4));
+  console.log(Math.PI > 3.14 && Math.PI < 3.15 ? 1 : 0);
+  console.log(Number.isInteger(5) ? 1 : 0);
+  console.log(Number.isInteger(5.5) ? 1 : 0);
+  console.log(Number.isNaN(0/0) ? 1 : 0);
+  console.log(Number.isFinite(42) ? 1 : 0);
+  console.log(parseInt("42px", 10));
+  console.log(parseFloat("3.14xyz"));
+  console.log(Number("123"));
+  console.log(Number.MAX_SAFE_INTEGER);
+}
+
+main();

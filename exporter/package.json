@@ -1,0 +1,10 @@
+{
+  "name": "tsaot-exporter",
+  "version": "0.1.0",
+  "private": true,
+  "description": "TS -> Escape IR exporter for the tsaot AOT compiler",
+  "dependencies": { "typescript": "^5.4.0", "@types/node": "^20.0.0" },
+  "scripts": {
+    "build": "tsc exporter.ts class_extract.ts --module commonjs --target es2020 --skipLibCheck --moduleResolution node --esModuleInterop"
+  }
+}

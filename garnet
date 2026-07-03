@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# garnet — TypeScript → C AOT compiler driver.
+#
+#   garnet foo.ts            Emit foo.c and compile it to a native executable `foo`.
+#   garnet -c foo.ts         Emit foo.c only (no native compile/link).
+#   garnet -o bar.c foo.ts   Use bar.c as the C output name (executable: bar).
+#   garnet -S foo.ts         Write the generated C to stdout (no files).
+#
+# Pipeline: exporter (TS → IR JSON) → analyzer `emit` (IR → C) → cc (C → binary).
+# Reuses the repo's link-flag helpers so optional RegExp / Unicode / fetch runtime
+# objects are compiled and linked exactly as the test harnesses do.
+#
+# Env:
+#   TSAOT_CC               C compiler+flags (default "cc -O2"; e.g. "gcc -O2").
+#   TSAOT_USE_MIMALLOC=1   Route allocations through mimalloc (if installed).
+#   TSAOT_ALLOW_UNSUPPORTED=1  Emit even with UNSUPPORTED constructs (unsafe).
+#   TSAOT_UNTYPED=1        Compile as `any` — all type-driven optimization off
+#                          (boxed, JS semantics; safe but slow). Same as --untyped.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+PROG="$(basename "$0")"
+
+usage() {
+  cat >&2 <<EOF
+usage: $PROG [-c | -S] [-o <out.c>] <input.ts>
+
+  (default)     emit <input>.c and compile it to a native executable
+  -c            emit the C file only (skip native compile/link)
+  -S            write the generated C to stdout (no files written)
+  -o <out.c>    name the C output file (default: <input basename>.c;
+                the executable is the same name without the .c suffix)
+  --untyped     compile the whole program as \`any\`: disable all type-driven
+                optimization (everything boxed, correct JS semantics). Safe but
+                slower; also lets ill-typed input through (no type-error stop).
+  -h, --help    show this help
+
+env: TSAOT_CC (default "cc -O2"), TSAOT_USE_MIMALLOC=1, TSAOT_ALLOW_UNSUPPORTED=1,
+     TSAOT_UNTYPED=1
+EOF
+}
+
+die() { echo "$PROG: $*" >&2; exit 1; }
+
+# ----- parse arguments -----
+emit_only=0      # -c
+to_stdout=0      # -S
+out_c=""         # -o
+input=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -c) emit_only=1 ;;
+    -S) to_stdout=1 ;;
+    -o) shift; [ $# -gt 0 ] || die "-o requires an argument"; out_c="$1" ;;
+    -o*) out_c="${1#-o}" ;;
+    --untyped) export TSAOT_UNTYPED=1 ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    -*) die "unknown option: $1 (try $PROG --help)" ;;
+    *) [ -z "$input" ] || die "multiple input files given ('$input', '$1'); only one is supported"; input="$1" ;;
+  esac
+  shift
+done
+[ -n "${input:-}" ] || { [ $# -gt 0 ] && input="$1" || { usage; exit 1; }; }
+[ "$emit_only" -eq 1 ] && [ "$to_stdout" -eq 1 ] && die "-c and -S are mutually exclusive"
+
+# ----- validate input -----
+[ -f "$input" ] || die "no such file: $input"
+case "$input" in *.ts) ;; *) die "input must be a .ts file: $input" ;; esac
+
+# ----- locate built tools -----
+EXPORTER="$ROOT/exporter/exporter.js"
+command -v node >/dev/null 2>&1 || die "node not found on PATH"
+[ -f "$EXPORTER" ] || die "exporter not built ($EXPORTER missing). Run: scripts/setup.sh"
+# Analyzer selection (TSAOT_ANALYZER): the self-hosted TS analyzer is the
+# development default since session 303; the frozen Rust analyzer stays
+# available as the differential oracle and for typed/perf paths.
+#   ts     node + analyzer_ts/dist (self-hosted, boxed)   <- default
+#   rust   analyzer/target/release/tsaot (frozen oracle; typed fast paths)
+#   native a garnet-compiled tsan binary (set TSAOT_TSAN_NATIVE to its path)
+case "${TSAOT_ANALYZER:-ts}" in
+  rust)
+    ANALYZER="$ROOT/analyzer/target/release/tsaot"
+    [ -x "$ANALYZER" ] || die "analyzer not built ($ANALYZER missing). Run: scripts/setup.sh"
+    run_analyzer() { "$ANALYZER" "$1" emit; }
+    ;;
+  native)
+    NATIVE_TSAN="${TSAOT_TSAN_NATIVE:-}"
+    [ -x "$NATIVE_TSAN" ] || die "TSAOT_ANALYZER=native needs TSAOT_TSAN_NATIVE=<path to garnet-compiled tsan>"
+    run_analyzer() { "$NATIVE_TSAN" < "$1"; }
+    ;;
+  ts)
+    TS_ANALYZER="$ROOT/analyzer_ts/dist/main.js"
+    [ -f "$TS_ANALYZER" ] || die "TS analyzer not built ($TS_ANALYZER missing). Run: cd analyzer_ts && ./node_modules/.bin/tsc -p tsconfig.json"
+    run_analyzer() { node "$TS_ANALYZER" "$1" emit; }
+    ;;
+  *) die "unknown TSAOT_ANALYZER '${TSAOT_ANALYZER}' (rust|ts|native)" ;;
+esac
+
+# absolute input path (module resolution / output naming are CWD-independent)
+input_abs="$(cd "$(dirname "$input")" && pwd)/$(basename "$input")"
+base="$(basename "$input")"; base="${base%.ts}"
+
+# default C output name (in the current directory, gcc-style)
+[ -n "$out_c" ] || out_c="$base.c"
+
+# ----- stage 1: TS → IR JSON (in a scratch dir) -----
+work="$(mktemp -d "${TMPDIR:-/tmp}/garnet.XXXXXX")"
+trap 'rm -rf "$work"' EXIT
+# The self-hosted analyzers are conservative/boxed: export untyped IR for them
+# (typed-IR-only instructions would be loud-rejected). The Rust path keeps the
+# caller's TSAOT_UNTYPED choice (typed fast paths by default).
+case "${TSAOT_ANALYZER:-ts}" in
+  ts|native) export TSAOT_UNTYPED=1 ;;
+esac
+# Exporter prints diagnostics to stderr and exits non-zero on UNSUPPORTED.
+node "$EXPORTER" "$input_abs" "$work/ir.json" "$work/labels.json" 1>&2
+
+# ----- stage 2: IR JSON → C -----
+if [ "$to_stdout" -eq 1 ]; then
+  run_analyzer "$work/ir.json"   # to stdout; scratch dir cleaned by EXIT trap
+  exit $?
+fi
+out_dir="$(dirname "$out_c")"; [ -d "$out_dir" ] || mkdir -p "$out_dir"
+run_analyzer "$work/ir.json" > "$out_c"
+
+if [ "$emit_only" -eq 1 ]; then
+  echo "$PROG: wrote $out_c" >&2
+  exit 0
+fi
+
+# ----- stage 3: C → native executable -----
+binary="${out_c%.c}"; [ "$binary" = "$out_c" ] && binary="$out_c.out"
+
+CC="${TSAOT_CC:-cc -O2}"
+export ROOT CC
+. "$ROOT/scripts/mimalloc_flags.sh" || die "failed to load mimalloc flags"
+. "$ROOT/scripts/regexp_link_flags.sh" || die "failed to load regexp link flags"
+
+# Base runtime object (also the default when the program does not need fetch).
+RT_OBJ="$ROOT/build/rt.o"
+mkdir -p "$ROOT/build"
+if [ ! -f "$RT_OBJ" ] || [ "$ROOT/runtime/ts_rt.c" -nt "$RT_OBJ" ]; then
+  $CC -c "$ROOT/runtime/ts_rt.c" -I"$ROOT/runtime" -o "$RT_OBJ" || die "failed to build runtime ($RT_OBJ)"
+fi
+
+# Optional runtime objects, gated by markers the emitted C declares.
+tsaot_prepare_regexp_objs "$out_c" "$work" || die "failed to prepare RegExp runtime"
+tsaot_prepare_unicode_objs "$out_c" "$work" || die "failed to prepare Unicode runtime"
+tsaot_prepare_fetch_runtime "$out_c" "$work" "$RT_OBJ" || die "failed to prepare fetch runtime"
+
+# shellcheck disable=SC2086  # object/lib arg vars are intentionally word-split
+$CC "$out_c" "$TSAOT_FETCH_RT_OBJ_ARG" $TSAOT_REGEXP_OBJ_ARGS $TSAOT_UNICODE_OBJ_ARGS \
+  -I"$ROOT/runtime" -lm $TSAOT_FETCH_LDLIBS ${TSAOT_LDLIBS:-} -o "$binary" \
+  || die "C compilation failed"
+
+echo "$PROG: wrote $out_c and $binary" >&2

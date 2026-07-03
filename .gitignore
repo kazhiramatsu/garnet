@@ -1,0 +1,28 @@
+# --- 依存物 / ツールチェーン ---
+node_modules/
+analyzer/target/
+
+# --- ビルド出力・作業ディレクトリ ---
+# build/ は各ハーネスの作業ダンプ場。ただし build/diff.sh（CLAUDE.md 記載の
+# V8 差分ヘルパ）だけは追跡する。
+build/*
+!build/diff.sh
+analyzer_ts/dist/
+# exporter の .js は package.json の tsc build 生成物（全 .js に .ts sibling あり）
+exporter/*.js
+*.o
+*.bin
+*.dSYM/
+
+# --- bundler テスト生成物（scripts/mftest.sh が fixture 内に再生成する）---
+tests/bundler/*/*.mjs
+tests/bundler/*/out.c
+tests/bundler/*/out.json
+tests/bundler/*/lbl.json
+tests/bundler/*/lblsites.json
+tests/bundler/*/prog
+
+# --- ローカル環境専用 ---
+.claude/settings.local.json
+.claude/*.lock
+.DS_Store

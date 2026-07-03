@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Focused moving-GC stress gate.
+#
+# This is intentionally narrower than full conformance: it codifies the cases
+# that have exposed moving-minor raw-local / escape-boundary bugs, and runs them
+# with TSAOT_GC_YOUNG_THRESHOLD=1. A normal O2 pass catches optimizer/layout
+# sensitive failures; an ASan O0 pass catches memory lifetime issues.
+set -uo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+S="$ROOT/scripts"
+THRESHOLD="${TSAOT_GC_YOUNG_THRESHOLD:-1}"
+ASAN_CC="${TSAOT_GC_STRESS_ASAN_CC:-gcc -O0 -g -fsanitize=address}"
+RUN_ASAN="${TSAOT_GC_STRESS_ASAN:-1}"
+RUN_RUNTIME_ASAN="${TSAOT_GC_STRESS_RUNTIME_ASAN:-1}"
+RUN_BASE="${TSAOT_GC_STRESS_BASE:-1}"
+RUN_FULL="${TSAOT_GC_STRESS_FULL:-0}"
+RUN_MOVE_CORO="${TSAOT_GC_STRESS_MOVE_CORO:-0}"
+RUN_MOVE_PROMISE="${TSAOT_GC_STRESS_MOVE_PROMISE:-0}"
+RUN_MOVE_BOTH="${TSAOT_GC_STRESS_MOVE_BOTH:-0}"
+
+FILTER='object_reflection_safepoints|string_runtime_safepoints|handle_identity|moving_minor_promise_coro_stress|json_runtime_safepoints|lower_level_runtime_safepoints|promise_coro_handle_edges|promise_movable_experimental|coro_entry_safepoints|coro_movable_experimental|array_callback_safepoints|generational_remembered_set|map_set_callback_safepoints|moving_minor_relocation|prototype_handle_edges|typed_class_allocation_safepoints|computed_member_names|extends_same_name_scopes'
+
+rc=0
+echo "=== tsaot GC stress [young threshold=$THRESHOLD] ==="
+
+if [[ "$RUN_BASE" != "0" ]]; then
+  echo ">>> focused conformance (normal O2)"
+  TSAOT_GC_YOUNG_THRESHOLD="$THRESHOLD" \
+    bash "$S/run_conformance.sh" exhaustive "$FILTER" || rc=1
+
+  if [[ "$RUN_ASAN" != "0" ]]; then
+    echo ">>> focused conformance (ASan)"
+    TSAOT_GC_YOUNG_THRESHOLD="$THRESHOLD" TSAOT_CC="$ASAN_CC" \
+      bash "$S/run_conformance.sh" exhaustive "$FILTER" || rc=1
+  fi
+
+  if [[ "$RUN_RUNTIME_ASAN" != "0" ]]; then
+    echo ">>> runtime unit tests (ASan)"
+    TSAOT_GC_YOUNG_THRESHOLD="$THRESHOLD" TSAOT_CC="$ASAN_CC" \
+      bash "$S/run_runtime_tests.sh" || rc=1
+  fi
+fi
+
+if [[ "$RUN_MOVE_CORO" != "0" ]]; then
+  echo ">>> focused conformance (forced Coro moving, normal O2)"
+  TSAOT_GC_YOUNG_THRESHOLD="$THRESHOLD" TSAOT_GC_MOVE_CORO=1 \
+    bash "$S/run_conformance.sh" exhaustive "$FILTER" || rc=1
+  if [[ "$RUN_ASAN" != "0" ]]; then
+    echo ">>> focused conformance (forced Coro moving, ASan)"
+    TSAOT_GC_YOUNG_THRESHOLD="$THRESHOLD" TSAOT_GC_MOVE_CORO=1 TSAOT_CC="$ASAN_CC" \
+      bash "$S/run_conformance.sh" exhaustive "$FILTER" || rc=1
+  fi
+fi
+
+if [[ "$RUN_MOVE_PROMISE" != "0" ]]; then
+  echo ">>> focused conformance (forced Promise moving, normal O2)"
+  TSAOT_GC_YOUNG_THRESHOLD="$THRESHOLD" TSAOT_GC_MOVE_PROMISE=1 \
+    bash "$S/run_conformance.sh" exhaustive "$FILTER" || rc=1
+  if [[ "$RUN_ASAN" != "0" ]]; then
+    echo ">>> focused conformance (forced Promise moving, ASan)"
+    TSAOT_GC_YOUNG_THRESHOLD="$THRESHOLD" TSAOT_GC_MOVE_PROMISE=1 TSAOT_CC="$ASAN_CC" \
+      bash "$S/run_conformance.sh" exhaustive "$FILTER" || rc=1
+  fi
+fi
+
+if [[ "$RUN_MOVE_BOTH" != "0" ]]; then
+  echo ">>> focused conformance (forced Promise+Coro moving, normal O2)"
+  TSAOT_GC_YOUNG_THRESHOLD="$THRESHOLD" TSAOT_GC_MOVE_PROMISE=1 TSAOT_GC_MOVE_CORO=1 \
+    bash "$S/run_conformance.sh" exhaustive "$FILTER" || rc=1
+  if [[ "$RUN_ASAN" != "0" ]]; then
+    echo ">>> focused conformance (forced Promise+Coro moving, ASan)"
+    TSAOT_GC_YOUNG_THRESHOLD="$THRESHOLD" TSAOT_GC_MOVE_PROMISE=1 TSAOT_GC_MOVE_CORO=1 TSAOT_CC="$ASAN_CC" \
+      bash "$S/run_conformance.sh" exhaustive "$FILTER" || rc=1
+  fi
+fi
+
+if [[ "$RUN_FULL" == "1" ]]; then
+  echo ">>> full exhaustive conformance (normal O2)"
+  TSAOT_GC_YOUNG_THRESHOLD="$THRESHOLD" \
+    bash "$S/run_conformance.sh" exhaustive || rc=1
+fi
+
+if [[ $rc -eq 0 ]]; then
+  echo " GC-STRESS PASSED"
+else
+  echo " GC-STRESS FAILED"
+fi
+exit $rc

@@ -1,0 +1,2 @@
+function risky(x){if(x<0)throw "negative";return x*2;}
+function main(){try{console.log(risky(5));}catch(e){console.log("caught");}try{console.log(risky(-1));}catch(e){console.log("caught: "+e);}try{throw 42;}catch(e){console.log(e);}try{try{throw "inner";}catch(e){console.log("inner: "+e);throw "rethrown";}}catch(e){console.log("outer: "+e);}try{console.log("try");}finally{console.log("finally");}console.log("done");} main();

@@ -1,0 +1,2 @@
+function sum(...n){let s=0;for(const x of n)s+=x;return s;}
+function main(){const base={x:1,y:2};const ext={...base,z:3,x:10};console.log(ext.x+ext.y+ext.z);const {a=5,b=6}={b:20};console.log(a+b);const [p=1,q=2,r=3]=[undefined,20];console.log(p+q+r);console.log(sum(1,2,3,4));const nums=[5,6,7];console.log(sum(...nums));console.log(sum(1,...nums,100));const merged={...base,...ext};console.log(merged.x);} main();
