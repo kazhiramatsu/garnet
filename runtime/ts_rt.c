@@ -24,7 +24,15 @@ extern int __asan_address_is_poisoned(const void *addr);
 static ts_gc_header* g_young_heap = NULL;
 static ts_gc_header* g_old_heap = NULL;
 static size_t g_alloc=0, g_young_alloc=0, g_old_alloc=0;
-static size_t g_young_threshold=65536, g_full_threshold=262144;
+static size_t g_young_threshold=65536;
+/* Full-GC trigger is LIVE CELL BYTES (gc_moving_plan B-3), not cell count: a
+   count misjudges pressure for variable-sized cells (one 500MB inline string
+   is 1 count). g_heap_bytes tracks cell bodies exactly — alloc adds sz, every
+   free subtracts h->size, an evacuation is byte-neutral. External payload
+   arrays (props/env/data) are not counted (cell-body granularity). */
+static size_t g_heap_bytes = 0;
+static size_t g_full_threshold_bytes = (size_t)16u * 1024u * 1024u;
+static int g_full_threshold_forced = 0; /* env override pins the trigger (stress knob) */
 
 /* ---- bump nursery (gc_moving_plan Phase B) ----
    Young movable cells live in 256KB-aligned arena chunks: allocation is a bump
@@ -113,8 +121,9 @@ __attribute__((destructor)) static void ts_rt_stats_dump(void){
   fprintf(out, "[rt_stats] alloc: count=%llu bytes=%llu handle_alloc=%llu handle_cap=%u root_push=%llu\n",
           g_rt_stats.alloc_count, g_rt_stats.alloc_bytes, g_rt_stats.handle_alloc,
           g_handle_cap, g_rt_stats.root_push);
-  fprintf(out, "[rt_stats] nursery: alloc=%llu chunks=%llu retained=%llu\n",
-          g_rt_stats.nursery_alloc, g_rt_stats.nursery_chunks, g_rt_stats.retained_chunks);
+  fprintf(out, "[rt_stats] nursery: alloc=%llu chunks=%llu retained=%llu | live_bytes=%zu full_next=%zu\n",
+          g_rt_stats.nursery_alloc, g_rt_stats.nursery_chunks, g_rt_stats.retained_chunks,
+          g_heap_bytes, g_full_threshold_bytes);
   fprintf(out, "[rt_stats] ts_call env_malloc=%llu | concat: calls=%llu bytes=%llu\n",
           g_rt_stats.call_env_malloc, g_rt_stats.concat_calls, g_rt_stats.concat_bytes);
   rt_stats_hist_line(out, "map_find", g_rt_stats.map_find_calls, g_rt_stats.map_find_probes, g_rt_stats.map_find_hist);
@@ -141,9 +150,9 @@ __attribute__((destructor)) static void ts_rt_stats_dump(void){
 
 /* The collector uses a mark/sweep full GC and a generational minor GC. Minor GC
    relocates movable young survivors through stable handles; full GC remains
-   mark/sweep. Keep fixed minimum headroom for ephemeral churn, and after each
-   full collection retarget the next trigger from the live size. */
-#define TS_GC_MIN_THRESHOLD 65536u
+   mark/sweep. Keep fixed minimum byte headroom for ephemeral churn, and after
+   each full collection retarget the next trigger from the live byte size. */
+#define TS_GC_MIN_FULL_BYTES ((size_t)4u * 1024u * 1024u)
 
 static inline int ts_heap_ref(tsv v){ return ts_is_obj(v)||ts_is_func(v)||ts_is_str(v); }
 static inline int gc_kind_valid(uint8_t k){
@@ -237,6 +246,15 @@ static void gc_config_init(void){
     unsigned long long v = strtoull(nbytes, &end, 10);
     if (end != nbytes && v) g_nursery_cap_bytes = (size_t)v;
     if (g_nursery_cap_bytes < GC_NURSERY_CHUNK_BYTES) g_nursery_cap_bytes = GC_NURSERY_CHUNK_BYTES;
+  }
+  /* Full-GC byte threshold override (B-3). Mainly a stress/tuning knob: a tiny
+     value forces frequent full collections the way TSAOT_GC_YOUNG_THRESHOLD=1
+     forces minors. The retarget rule still applies after each full GC. */
+  const char* fbytes = getenv("TSAOT_GC_FULL_THRESHOLD_BYTES");
+  if (fbytes && fbytes[0]){
+    char* end = NULL;
+    unsigned long long v = strtoull(fbytes, &end, 10);
+    if (end != fbytes && v){ g_full_threshold_bytes = (size_t)v; g_full_threshold_forced = 1; }
   }
 }
 static uint64_t gc_handle_alloc(ts_gc_header* h){
@@ -343,15 +361,18 @@ static void* gc_alloc(size_t sz, uint8_t kind){
   gc_config_init();
   if (g_young_alloc>=g_young_threshold || g_nursery_used_bytes>=g_nursery_cap_bytes)
     ts_gc_collect_young();
-  if (g_alloc>=g_full_threshold){
+  if (g_heap_bytes>=g_full_threshold_bytes){
     ts_gc_collect();
-    size_t next = g_alloc * 2;
-    size_t with_headroom = g_alloc + TS_GC_MIN_THRESHOLD;
-    if (next < with_headroom) next = with_headroom;
-    if (next < TS_GC_MIN_THRESHOLD) next = TS_GC_MIN_THRESHOLD;
-    g_full_threshold = next;
+    if (!g_full_threshold_forced){
+      size_t next = g_heap_bytes * 2;
+      size_t with_headroom = g_heap_bytes + TS_GC_MIN_FULL_BYTES;
+      if (next < with_headroom) next = with_headroom;
+      if (next < TS_GC_MIN_FULL_BYTES) next = TS_GC_MIN_FULL_BYTES;
+      g_full_threshold_bytes = next;
+    }
   }
   RT_STAT_INC(alloc_count); RT_STAT_ADD(alloc_bytes, sz);
+  g_heap_bytes += sz;
   if (g_nursery_enabled && sz <= GC_NURSERY_MAX_CELL && gc_is_bump_kind(kind)){
     ts_gc_header* h = (ts_gc_header*)gc_nursery_bump(sz);
     if (h){
@@ -2312,8 +2333,11 @@ static void gc_scan_cell(ts_gc_header* h, int young, int depth){
 }
 /* Free a cell's handle + external payload buffers but not the cell body —
    the body of an arena (nursery) cell belongs to its chunk and is reclaimed
-   by the post-sweep bump reset. */
+   by the post-sweep bump reset. Every dying cell passes through here (unpooled
+   and old cells via gc_free_cell), so this is the single live-bytes
+   decrement point balancing gc_alloc's increment. */
 static void gc_free_cell_payload(ts_gc_header* h){
+  g_heap_bytes -= (g_heap_bytes >= h->size) ? h->size : g_heap_bytes;
   gc_handle_free(h);
   if (h->kind==TS_KIND_OBJECT) free(((ts_object*)h)->props);
   else if (h->kind==TS_KIND_ARRAY){ array_free_data((ts_array*)h); free(((ts_array*)h)->o.props); }
