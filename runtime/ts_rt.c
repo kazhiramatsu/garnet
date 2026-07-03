@@ -33,6 +33,14 @@ static size_t g_young_threshold=65536;
 static size_t g_heap_bytes = 0;
 static size_t g_full_threshold_bytes = (size_t)16u * 1024u * 1024u;
 static int g_full_threshold_forced = 0; /* env override pins the trigger (stress knob) */
+/* TSAOT_GC_ZAP=1 fills dead and moved-from cell bodies with 0xDD during
+   collection (Phase C0 groundwork): a stale raw pointer held across a
+   safepoint then reads loud garbage (kind 0xDD fails gc_kind_valid, tsv
+   payloads are poison) instead of silently working because the old body
+   still holds a bit-copy. ASan-independent — the CLT 17.0.0 ASan runtime
+   deadlocks at startup on this host, so this is the always-available
+   use-after-move detector. GC cold paths only; zero mutator cost. */
+static int g_gc_zap = 0;
 
 /* ---- bump nursery (gc_moving_plan Phase B) ----
    Young movable cells live in 256KB-aligned arena chunks: allocation is a bump
@@ -256,6 +264,8 @@ static void gc_config_init(void){
     unsigned long long v = strtoull(fbytes, &end, 10);
     if (end != fbytes && v){ g_full_threshold_bytes = (size_t)v; g_full_threshold_forced = 1; }
   }
+  const char* zap = getenv("TSAOT_GC_ZAP");
+  if (zap && zap[0] && strcmp(zap, "0") != 0) g_gc_zap = 1;
 }
 static uint64_t gc_handle_alloc(ts_gc_header* h){
   uint32_t id;
@@ -2348,6 +2358,7 @@ static void gc_free_cell_payload(ts_gc_header* h){
 }
 static void gc_free_cell(ts_gc_header* h){
   gc_free_cell_payload(h);
+  if (g_gc_zap && h->size) memset(h, 0xDD, h->size);
   free(h);
 }
 static int gc_moving_minor_enabled(void){
@@ -2441,6 +2452,7 @@ static ts_gc_header* gc_move_young_to_old_ex(ts_gc_header* h, int free_old){
   gc_handle_move(h, nw);
   /* external buffers were transferred by the shallow copy. An arena cell's
      body is chunk memory (free_old=0): it dies with the bump reset. */
+  if (g_gc_zap) memset(h, 0xDD, sz); /* poison the moved-from body (C0 detector) */
   if (free_old) free(h);
   return nw;
 }
@@ -2476,6 +2488,7 @@ static void gc_sweep_nursery(ts_gc_header** survivors){
         }
       } else {
         gc_free_cell_payload(h);
+        if (g_gc_zap) memset(h, 0xDD, h->size);
         g_young_alloc--; g_alloc--;
       }
       off += step;
@@ -2514,6 +2527,7 @@ static void gc_sweep_pinned_young(ts_gc_header** survivors){
       }
     } else {
       gc_free_cell_payload(h);
+      if (g_gc_zap) memset(h, 0xDD, h->size);
       g_young_alloc--; g_alloc--;
       c->pinned_live--;
     }

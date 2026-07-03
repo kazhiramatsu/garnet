@@ -173,10 +173,23 @@ handle 発行コスト（今は全 alloc が負担）と handle 表自体を消�
 
 **C0 で潰す前提（着手条件）**:
 1. **ASan 復旧が必須**（CLT 更新 or homebrew 実 GCC。s316 発見の起動デッドロックが解けるまで
-   C1 は凍結）。加えて `TSAOT_GC_ZAP`（退避後の from 領域を 0xDEAD 充填する debug ビルド）を
-   先に入れ、ASan 非依存の常設検出器にする。
+   C1 は凍結。**s318 再確認: CLT 17.0.0 のまま・`int main(){}` でも依然デッドロック**）。
+   `TSAOT_GC_ZAP` は **s318 で導入済み**（moved-from/死亡セル本体を 0xDD 充填・env ゲート・
+   GC コールドパスのみ。gate gc ZAP 行と最凶複合 probe（minor=1 × full 強制 × pin）green）。
+   残: ZAP + threshold=1 での **conformance 全 fixture 完走**（C0 の root 漏れ在庫一掃・
+   計測ウィンドウ級の時間が要るためユーザーと枠合意の上で）。
 2. **P2a Map/Set ハッシュとの干渉**: オブジェクトキーのハッシュを**アドレス由来にしない**。
-   ヘッダ内 lazy identity hash（初参照時に採番して固定）を C0 で設計・P2a 側もそれを使う。
+   **設計確定（s318）**: 単一 API `ts_obj_identity_hash(tsv)`（inline）に隠蔽し、P2a は
+   これだけを使う。**格納値 = 生の一意 id**（分布はハッシュ表側で fibonacci mix
+   `id * 2654435769u >> shift` を掛ける — 格納値を混ぜないことで id の由来を将来
+   差し替え可能に保つ）。実体は段階で移行:
+   - **B 期（今）**: handle id の下位 32bit（既に全セル一意・move で不変・追加コストゼロ）。
+   - **C1 以降**: handle 撤去と同時に、C3 で空く旧 handle 領域の u32 へ **lazy 採番**
+     （初参照時にグローバルカウンタから付与・0=未採番。moving はヘッダごと memcpy する
+     ので自動追従）。切替は `ts_obj_identity_hash` の実装 1 箇所。
+   - 禁止事項: アドレス由来（moving で壊れる）・handle を Map 実装が直接読む
+     （C で消える）・格納値へのミックス済みハッシュ保存（表サイズ変更で再計算不能に
+     なる形は不可、raw id 保存 + 使用時 mix に統一）。
 3. **coro × setjmp/longjmp 監査**: yield 跨ぎの live 値はフレームセルへ spill されている
    （スキャン・書き換え可能）ことの emit 側確認。resume 区間内の allocating call を跨ぐ
    レジスタ内 tsv は root 規律の対象（今日は handle が免罪符になっている分、C では
