@@ -1,0 +1,27 @@
+# 凍結 analyzer_ts（同一アルゴリズムの双子）との既知差分リスト。
+# Rust 側で silent miscompile を修正すると凍結側と恒久的に食い違う（ユーザー決定
+# 2026-07-03/04・binding: 受容してここで管理・凍結ソースは触らない。再同期は
+# ミルストーンで一括）。背景と表は docs/refactor_baseline.md。
+#
+# 形式: <scope>\t<fixture path（tests/conformance/exhaustive/ 起点・.ts 無し）>\t<理由>
+#   scope=parity   : emitc_diff.sh（Rust emit vs 凍結TS emitc の byte 比較）で DIFF を許容
+#   scope=selfconf : analyzer_conformance.sh（凍結TS コンパイル産物の V8 差分）で DIFF を許容
+#
+# selfconf スコープは s317 実測で現状 0 件（selfconf は untyped 経路で、凍結側では
+# 当該 SROA/stack 最適化が非発現のため 332/332 PASS。Rust 側は untyped でも class
+# 形状駆動で SROA が走るという到達範囲の非対称が理由）。凍結産物を実行する経路が
+# typed 化された場合はここに selfconf 行を追加する。fixture 実行の alarm 20s ガードは
+# 防御として維持（凍結側バグはハング形になり得る — s317 で wild 文字列連結の無限
+# ループを実測）。
+#
+# 修正#1 = s316 containment escape / #2 = s316 SROA×narrowing
+# 修正#3 = s317 SROA 非インライン callee のレシーバ/引数 drop / #4 = s317 ループ逆辺 copy-alias
+parity	classes/sroa_contained_escape	修正#1: 凍結側は contained ループ alloc を sobj スタック化
+parity	closures/forof_loop_capture	修正#1: site 14 Stack→FrameArena（注釈コメントのみの差）
+parity	classes/sroa_narrowed_nullable_reads	修正#2a/2b
+parity	classes/sroa_try_body_uses	修正#2c（+ 数値スカラ型の随伴差 long long↔double）
+parity	classes/method_early_return	修正#3: 凍結側は非 tail return callee のレシーバ未使用 alloc を除去（無害形）・修正済み Rust は保持
+parity	private/brand_in_method	修正#3: 同上
+parity	errors/super_assign_throws	修正#3: 同上（main 冒頭の new B().write()。s316「要一行調査」の正体）
+parity	classes/sroa_noninlinable_callee	修正#3 の回帰テスト自体（凍結側は alloc drop のまま emit）
+parity	classes/sroa_loop_carried_alias	修正#4（s317 ループ逆辺 copy-alias）の回帰テスト自体

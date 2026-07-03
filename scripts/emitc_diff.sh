@@ -22,8 +22,12 @@ if [ ! -f "$W/json/.stamp" ] || [ "$LIST" -nt "$W/json/.stamp" ]; then
   touch "$W/json/.stamp"
 fi
 
-same=0; unported=0; diff_=0; skip=0
-: > "$W/unported.txt"; : > "$W/firstdiff.txt"
+# 凍結双子との既知差分（silent miscompile 修正の随伴。scripts/frozen_known_diffs.tsv
+# の scope=parity 行）。KNOWN として別集計し PASS 判定から除外する。
+KNOWN_SLUGS=$(awk -F'\t' '$1=="parity"{gsub("/","_",$2); print $2}' scripts/frozen_known_diffs.tsv 2>/dev/null)
+
+same=0; unported=0; diff_=0; known=0; skip=0
+: > "$W/unported.txt"; : > "$W/firstdiff.txt"; : > "$W/knowndiff.txt"
 while IFS=$'\t' read -r slug path; do
   case "$slug" in *"$FILTER"*) ;; *) continue ;; esac
   prog="$W/json/$slug.program.json"
@@ -40,6 +44,8 @@ while IFS=$'\t' read -r slug path; do
   fi
   if cmp -s "$W/r.c" "$W/t.c"; then
     same=$((same+1))
+  elif printf '%s\n' "$KNOWN_SLUGS" | grep -qx "$slug"; then
+    known=$((known+1)); echo "$slug" >> "$W/knowndiff.txt"
   else
     diff_=$((diff_+1))
     # first differing line (the porting target)
@@ -48,7 +54,11 @@ while IFS=$'\t' read -r slug path; do
   fi
 done < "$LIST"
 
-echo "emitc: identical=$same UNPORTED=$unported DIFF=$diff_ skip=$skip"
+echo "emitc: identical=$same UNPORTED=$unported DIFF=$diff_ KNOWN=$known skip=$skip"
+if [ -s "$W/knowndiff.txt" ]; then
+  echo "--- known frozen diffs (allowlist: scripts/frozen_known_diffs.tsv) ---"
+  cat "$W/knowndiff.txt"
+fi
 echo "--- UNPORTED histogram ---"
 sort "$W/unported.txt" | uniq -c | sort -rn | head -15
 echo "--- first-diff samples (work-list) ---"

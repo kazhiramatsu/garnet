@@ -35,8 +35,13 @@ cc_link() { # $1=src.c $2=out  ; sets cc.err on failure
     -I"$ROOT/runtime" -lm $TSAOT_FETCH_LDLIBS ${TSAOT_LDLIBS:-} -o "$2" 2>"$tmp/cc.err"
 }
 
-pass=0; unported=0; ccfail=0; diff=0; expfail=0; total=0
-: > "$tmp/unported.txt"; : > "$tmp/ccfail.txt"; : > "$tmp/diff.txt"
+# 凍結双子との既知差分（Rust 側で修正済みの silent miscompile を凍結側はまだ持つ
+# fixture。scripts/frozen_known_diffs.tsv の scope=selfconf 行）。KNOWN として
+# 別集計し PASS 判定から除外する。
+KNOWN_NAMES=$(awk -F'\t' '$1=="selfconf"{print $2}' "$ROOT/scripts/frozen_known_diffs.tsv" 2>/dev/null)
+
+pass=0; unported=0; ccfail=0; diff=0; known=0; expfail=0; total=0
+: > "$tmp/unported.txt"; : > "$tmp/ccfail.txt"; : > "$tmp/diff.txt"; : > "$tmp/known.txt"
 
 while IFS= read -r ts; do
   case "$ts" in *"$FILTER"*) ;; *) continue ;; esac
@@ -57,15 +62,23 @@ while IFS= read -r ts; do
   if ! NODE_PATH="$ROOT/exporter/node_modules" node "$ROOT/scripts/_oracle_transpile.js" "$ts" "$tmp/oracle.mjs" 2>/dev/null; then
     expfail=$((expfail+1)); continue; fi
   oracle=$(node "$tmp/oracle.mjs" 2>&1)
-  got=$("$tmp/ts.bin" 2>&1)
+  # alarm ガード: 凍結側の既知 miscompile はハング形になり得る（wild tsv の文字列
+  # 連結等）。ゲートを止めないよう有限化する（正常 fixture は <2s で終わる）。
+  got=$(perl -e 'alarm 20; exec @ARGV' "$tmp/ts.bin" 2>&1)
   if [ "$got" = "$oracle" ]; then pass=$((pass+1)); else
-    diff=$((diff+1)); echo "$name" >> "$tmp/diff.txt"; fi
+    if printf '%s\n' "$KNOWN_NAMES" | grep -qx "${name%.ts}"; then
+      known=$((known+1)); echo "$name" >> "$tmp/known.txt"
+    else
+      diff=$((diff+1)); echo "$name" >> "$tmp/diff.txt"
+    fi
+  fi
 done < <(find tests/conformance/exhaustive -name "*.ts" | sort)
 
 echo "==================== analyzer_ts conformance ===================="
-echo "total=$total  PASS=$pass  UNPORTED=$unported  CCFAIL=$ccfail  DIFF=$diff  EXPORTER-skip=$expfail"
+echo "total=$total  PASS=$pass  UNPORTED=$unported  CCFAIL=$ccfail  DIFF=$diff  KNOWN=$known  EXPORTER-skip=$expfail"
 echo
 echo "--- top UNPORTED reasons (Phase 1 work-list) ---"
 sort "$tmp/unported.txt" | uniq -c | sort -rn | head -30
 if [ -s "$tmp/ccfail.txt" ]; then echo; echo "--- CCFAIL (porting bugs, first 15) ---"; head -15 "$tmp/ccfail.txt"; fi
 if [ -s "$tmp/diff.txt" ]; then echo; echo "--- DIFF (output mismatch, first 15) ---"; head -15 "$tmp/diff.txt"; fi
+if [ -s "$tmp/known.txt" ]; then echo; echo "--- KNOWN frozen diffs (allowlist: scripts/frozen_known_diffs.tsv) ---"; cat "$tmp/known.txt"; fi

@@ -156,18 +156,38 @@ correctness 専用として役割分担 — 速さはこちら、正しさはあ
 コンパイルする速度・生成 native の実行速度は今後も常に有効。修正後の garnet は凍結ソースを
 以前より正しくコンパイルする）。
 
-現在の期待値: **emitc parity = identical 325 / DIFF 5**（2026-07-04・s316 修正後）:
+現在の期待値（2026-07-04・s317 修正#3/#4 後・実測）: **emitc parity = identical 323 /
+DIFF 0 / KNOWN 9**、**selfconf = 332/332 PASS / DIFF 0 / KNOWN 0**。
+
+selfconf が全緑の理由（s317 実測の発見）: selfconf は **untyped 経路**（TSAOT_UNTYPED=1）
+で、凍結側ではこの経路の SROA/stack 最適化が非発現のため、既知バグの双子を持っていても
+sroa_* 回帰テストを正しくコンパイルする。**Rust 側は untyped でも class 形状駆動で SROA が
+走る**（probe が untyped で miscompile を再現した理由）— 到達範囲の非対称。
+
+**単一の真実源 = `scripts/frozen_known_diffs.tsv`**（scope=parity / selfconf の 2 種、
+selfconf は現状 0 行）。emitc_diff.sh / analyzer_conformance.sh がこれを読み込み既知差分を
+KNOWN として別集計するため、gate parity / quick / full は DIFF=0 のまま PASS する。新たな
+miscompile 修正で凍結双子と食い違ったら tsv に追記（理由付き）。selfconf の fixture 実行には
+alarm 20s ガードを追加済み（凍結側バグがハング形でもゲートは有限で落ちる — s317 で
+wild 文字列連結の無限ループを実測済みの防御）。
 
 | プログラム | 由来 |
 |---|---|
-| classes_sroa_contained_escape（新規テスト） | 修正#1: 凍結側は contained ループ alloc を sobj スタック化 |
-| classes_sroa_narrowed_nullable_reads（新規） | 修正#2a/2b |
-| classes_sroa_try_body_uses（新規） | 修正#2c（+ 数値スカラ型の随伴差 long long↔double） |
-| closures_forof_loop_capture | 修正#1: site 14 Stack→FrameArena（**注釈コメントのみの差**） |
-| errors_super_assign_throws | 修正#1/#2 の随伴（要一行調査・害なしは conf 333 で確認済み） |
+| classes/sroa_contained_escape（s316 新規） | 修正#1: 凍結側は contained ループ alloc を sobj スタック化 |
+| classes/sroa_narrowed_nullable_reads（s316 新規） | 修正#2a/2b |
+| classes/sroa_try_body_uses（s316 新規） | 修正#2c（+ 数値スカラ型の随伴差 long long↔double） |
+| closures/forof_loop_capture | 修正#1: site 14 Stack→FrameArena（**注釈コメントのみの差**） |
+| errors/super_assign_throws | 修正#3: 凍結側はレシーバ未使用の `new B().write()` alloc を除去（無害形）・修正済み Rust は保持。s316「要一行調査」の正体 |
+| classes/method_early_return | 修正#3: 同上（無害形） |
+| private/brand_in_method | 修正#3: 同上（無害形） |
+| classes/sroa_noninlinable_callee（s317 新規） | 修正#3 の回帰テスト自体（凍結側は alloc drop のまま emit。selfconf は untyped 経路のため非発現で PASS） |
+| classes/sroa_loop_carried_alias（s317 新規） | 修正#4（ループ逆辺 copy-alias が 1 パス失格網から漏れ `head = n` ストアごと alloc 消失）の回帰テスト自体 |
 
-運用: gate parity / gate full の diffall・nescape 系は上記件数までは PASS 扱いとする
-（ゲートスクリプトへの許容リスト実装は追作業。それまでは目視で件数一致を確認）。
+修正#3（s317）= SROA の scan/rewrite 非対称: scan（失格網）が許すのに rewrite が
+インライン化できない Direct 呼び出し（非 tail return callee / arity 不一致の optional
+省略呼び出し）で「alloc 除去 + call 残置」= dangling receiver/arg の wild 読み
+（ハング/ゴミ値）。try 不要で発現するため s316 #2c 以前から両実装に潜在。#2c が
+errors/super_assign_throws の parity 差として無害な端を可視化したことから発見。
 
 ## 計測ウィンドウで取るものリスト（チェックリスト）
 
