@@ -158,6 +158,11 @@ function toWireProgram(prog: any): any {
  *  by resolveNewTarget and consumed by the dispatch in lowerExpr:
  *   - valueDynamic: a monomorphic class VALUE with an explicit ctor -> NewDynamic
  *     (construct through the runtime value K, which carries any captured cells).
+ *   - functionValue: a plain FUNCTION value (ES5 constructor: a function
+ *     declaration, or a binding whose type is callable) -> NewDynamic;
+ *     ts_construct's class_id==0 arm runs [[Construct]] (proto = fn.prototype,
+ *     this-bound call, return-override) and throws V8's catchable TypeError for
+ *     non-constructables (arrows/methods/async/generators).
  *   - staticClass: a statically-known class (classId), or a no-ctor monomorphic
  *     class value, constructed in place; classId is undefined for an identifier
  *     that is neither a known class nor a built-in (the non-class loud-reject).
@@ -165,6 +170,7 @@ function toWireProgram(prog: any): any {
  *     class value capturing a fn-local, or the dead polymorphic fallback). */
 type NewTarget =
   | { kind: "valueDynamic"; classId: number }
+  | { kind: "functionValue" }
   | { kind: "staticClass"; classId: number | undefined }
   | { kind: "reject"; reason: string };
 
@@ -1454,9 +1460,10 @@ class Exporter {
         if (ts.isFunctionDeclaration(n) && n.name && ts.isSourceFile(n.parent)) {
           const s = this.symbolOf(n.name);
           if (s) this.funcSymbols.set(s, this.fnId.get(n)!);
-          // record explicit `this` parameter so direct calls prepend a this slot.
-          if (n.parameters.length > 0 && ts.isIdentifier(n.parameters[0].name) &&
-              n.parameters[0].name.text === "this") {
+          // record explicit `this` parameter — or an ES5 body reading its own
+          // `this` (same args[0] slot) — so direct calls prepend a this slot.
+          if ((n.parameters.length > 0 && ts.isIdentifier(n.parameters[0].name) &&
+              n.parameters[0].name.text === "this") || this.fnUsesOwnThis(n)) {
             this.funcTakesThisIds.add(this.fnId.get(n)!);
           }
         }
@@ -2870,10 +2877,12 @@ class Exporter {
       // classId and applying generic specialization + RTA field-type recording as a
       // side effect, in the original order — then dispatch on the resulting kind.
       const target = this.resolveNewTarget(node);
-      if (target.kind === "valueDynamic") {
-        // Monomorphic class value with an explicit ctor: construct via the runtime
-        // class value K (carries captured cells for a factory). The static classId
-        // equals the runtime class, so downstream devirtualization agrees.
+      if (target.kind === "valueDynamic" || target.kind === "functionValue") {
+        // valueDynamic: monomorphic class value with an explicit ctor — construct
+        // via the runtime class value K (carries captured cells for a factory);
+        // the static classId equals the runtime class, so downstream
+        // devirtualization agrees. functionValue: an ES5 function constructor —
+        // ts_construct's class_id==0 arm builds the instance on fn.prototype.
         const callee = this.lowerExpr(ctx, node.expression);
         const dargs = this.lowerSequenced(ctx, node.arguments ?? []);
         const ddst = this.newLocal(ctx, "reference", hint);
@@ -4455,25 +4464,29 @@ class Exporter {
       }
       const args = this.lowerSequenced(ctx, node.arguments);
       const dst = this.newLocal(ctx, this.refKindOf(node));
-      // Step C: a Direct call to a top-level function that captures module
-      // cells must pass those cells as leading arguments (the callee's prologue
-      // expects [cells..., this, real params], mirroring AllocClosure). The
-      // caller holds the same cells in its own cellAccess (it captures the same
-      // module bindings). Without this the callee reads an empty cell -> NaN.
-      if (callee && (callee as any).kind === "Direct" && recv === undefined) {
-        const cells = this.directCallCellArgs(ctx, (callee as any).func);
-        if (cells.length) args.unshift(...cells);
-      }
+      // The callee's parameter layout is [cells..., this, real params] (Step C /
+      // AllocClosure). Both prepends below unshift, so they run in REVERSE of
+      // that layout: first the `this` slot, then the captured cells in front.
+      //
       // A direct call to a function declared with an explicit `this` parameter
-      // expects args[0] = this. A plain call `f(1,2)` (no receiver) supplies no
-      // this, so JS makes `this` undefined: prepend an undefined this slot so the
-      // remaining args land in the right positions. (Method calls set `recv` and
-      // are handled separately; call/apply/bind inject thisArg via the runtime.)
+      // (or an ES5 body reading its own `this`) expects a this slot. A plain call
+      // `f(1,2)` (no receiver) supplies no this, so JS makes `this` undefined:
+      // prepend an undefined this slot so the remaining args land in the right
+      // positions. (Method calls set `recv` and are handled separately;
+      // call/apply/bind inject thisArg via the runtime.)
       if (callee && (callee as any).kind === "Direct" && recv === undefined &&
           this.funcTakesThisIds.has((callee as any).func)) {
         const undefThis = this.newLocal(ctx, "reference");
         ctx.body.push({ kind: "Const", dst: undefThis, value: { kind: "Undef" } });
         args.unshift(undefThis);
+      }
+      // Step C: a Direct call to a top-level function that captures module
+      // cells must pass those cells as leading arguments. The caller holds the
+      // same cells in its own cellAccess (it captures the same module bindings).
+      // Without this the callee reads an empty cell -> NaN.
+      if (callee && (callee as any).kind === "Direct" && recv === undefined) {
+        const cells = this.directCallCellArgs(ctx, (callee as any).func);
+        if (cells.length) args.unshift(...cells);
       }
       const inst: any = { kind: "Call", dst, callee, args };
       if (recv !== undefined) inst.recv = recv;
@@ -4587,6 +4600,14 @@ class Exporter {
           const hasCtor = (t: ts.Type): boolean =>
             t.getConstructSignatures().length > 0 || (t.isUnion() && t.types.every(hasCtor));
           isCtorVal = hasCtor(rt);
+          // ES5 function constructor RHS (`x instanceof Foo` where Foo is a plain
+          // function), or an `any`-typed RHS: callable/any, non-builtin ->
+          // instanceof.dyn. The runtime walks fn.prototype and throws V8's
+          // TypeError for a prototype-less function (arrow/method) or a
+          // non-callable value, so a bad RHS is still loud (catchable).
+          if (!isCtorVal && !this.isBuiltinSymbol(this.checker.getSymbolAtLocation(node.right))) {
+            isCtorVal = rt.getCallSignatures().length > 0 || (rt.flags & ts.TypeFlags.Any) !== 0;
+          }
         } catch { /* leave false */ }
         if (isCtorVal) {
           const obj = this.lowerExpr(ctx, node.left);
@@ -6555,6 +6576,28 @@ class Exporter {
         return { kind: "valueDynamic", classId };
       }
       // else (no captures): fall through to static construction (emitImplicitConstruction).
+    }
+    // ES5 function constructor (`new Foo()` where Foo is a plain FUNCTION, not a
+    // class): ride the existing NewDynamic -> ts_construct path, whose class_id==0
+    // arm implements a plain function's [[Construct]]. The infra is already in
+    // place: function declarations/expressions get an own .prototype at boxing
+    // (FN_HAS_PROTOTYPE -> ts_set_fn_prototype, which also marks constructable),
+    // and module-scope declarations are boxed ONCE into a singleton global
+    // (functionValueGlobal), so `Foo.prototype.m = ...` and `new Foo()` see the
+    // same prototype object. Matches a top-level function declaration
+    // (funcSymbols) or any non-ambient binding whose type is callable
+    // (`const F = function(){...}`, nested declarations, params). Non-constructable
+    // values that slip through (arrows/methods/async/generators) throw V8's
+    // catchable TypeError in ts_construct — never a silent construct. Ambient
+    // builtins (`new isNaN()`) keep the loud reject below.
+    if (classId === undefined && !this.isAmbientGlobalSymbol(csym)) {
+      let callable = csym !== undefined && this.funcSymbols.has(csym);
+      if (!callable) {
+        try {
+          callable = this.checker.getTypeAtLocation(node.expression).getCallSignatures().length > 0;
+        } catch { /* not callable -> fall through to the loud reject */ }
+      }
+      if (callable) return { kind: "functionValue" };
     }
     return { kind: "staticClass", classId };
   }
@@ -8659,6 +8702,31 @@ class Exporter {
     return found;
   }
 
+  /** Does this plain function's body reference its OWN `this` (directly, or
+   *  through nested arrows, which inherit it)? Nested non-arrow functions rebind
+   *  `this`, so their bodies don't count. Such a function is lowered with the
+   *  args[0] `this` slot exactly like an explicit `this` parameter — the
+   *  canonical ES5 forms (`function Foo(){ this.a = 1 }` constructors,
+   *  `Foo.prototype.m = function(){ return this.a }` methods) are written
+   *  without one. */
+  fnUsesOwnThis(node: ts.FunctionDeclaration | ts.FunctionExpression): boolean {
+    let found = false;
+    const visit = (n: ts.Node) => {
+      if (found) return;
+      if (n.kind === ts.SyntaxKind.ThisKeyword) { found = true; return; }
+      if (ts.isFunctionDeclaration(n) || ts.isFunctionExpression(n) ||
+          ts.isMethodDeclaration(n) || ts.isGetAccessorDeclaration(n) ||
+          ts.isSetAccessorDeclaration(n) || ts.isConstructorDeclaration(n)) return;
+      // a class rebinds `this` for EVERYTHING inside it — methods are skipped
+      // above, but a field initializer (`f = () => this.v`) or a static block
+      // reads the CLASS's this, not this function's. Don't descend.
+      if (ts.isClassDeclaration(n) || ts.isClassExpression(n)) return;
+      ts.forEachChild(n, visit);
+    };
+    if (node.body) visit(node.body);
+    return found;
+  }
+
   lowerClosure(ctx: FnCtx, node: FnLike, hint?: string, thisParam = false, classId?: number): number {
     const fnId = this.fnId.get(node)!;
     // An arrow that uses `this` lexically must capture the enclosing function's
@@ -9408,6 +9476,17 @@ class Exporter {
     const hasExplicitThis = !!params0 && params0.length > 0 &&
       ts.isIdentifier(params0[0].name) && params0[0].name.text === "this";
     if (hasExplicitThis) thisParam = true;
+    // ES5 dynamic `this`: a plain function declaration/expression whose body
+    // reads its own `this` gets the same args[0] slot as an explicit `this`
+    // parameter (ES5 constructors/prototype methods are written without one).
+    // Every call ABI agrees on the slot: direct calls prepend undefined
+    // (funcTakesThisIds), indirect calls go through ts_call_value (runtime
+    // injects undefined for takes_this callees), method dispatch and
+    // ts_construct already pass the receiver at args[0].
+    if (!thisParam && (ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node)) &&
+        this.fnUsesOwnThis(node)) {
+      thisParam = true;
+    }
     // async functions: lowered to return a Promise. Generators: lowered to a
     // state machine returning a generator object, driven by .next() / for-of.
     const mods = (node as ts.FunctionLikeDeclaration).modifiers;

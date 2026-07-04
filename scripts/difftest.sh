@@ -35,11 +35,14 @@ JS
 dt() {
   local name="$1" src="$2"
   echo "$src" > "$ROOT/build/dt.ts"
+  # drop stale stage outputs: a failed stage must surface as a loud failure below,
+  # never as the previous fixture's json/C/binary silently running again.
+  rm -f "$ROOT/build/dt.json" "$ROOT/build/dt.c" "$ROOT/build/dt"
   local nodeout
   node "$ROOT/build/noderun.js" "$ROOT/build/dt.ts" 2>/dev/null
   nodeout=$(node "$ROOT/build/dt.mjs" 2>&1 | tr '\n' '|')
   local rej
-  rej=$(node "$ROOT/exporter/exporter.js" "$ROOT/build/dt.ts" "$ROOT/build/dt.json" "$ROOT/build/dtl.json" 2>&1 | grep -iE "UNSUPPORTED|member" | head -1)
+  rej=$(node "$ROOT/exporter/exporter.js" "$ROOT/build/dt.ts" "$ROOT/build/dt.json" "$ROOT/build/dtl.json" 2>&1 | grep -iE "UNSUPPORTED|member|type error" | head -1)
   if [ -n "$rej" ]; then printf "%-38s REJECT (node=%s)\n" "$name" "$nodeout"; return; fi
   "$ROOT/analyzer/target/release/tsaot" "$ROOT/build/dt.json" emit > "$ROOT/build/dt.c" 2>/dev/null
   tsaot_prepare_regexp_objs "$ROOT/build/dt.c" "$ROOT/build" || return

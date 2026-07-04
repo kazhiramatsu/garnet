@@ -525,6 +525,7 @@ void ts_set_fn_prototype(tsv fn, tsv proto){
   if (!ts_is_func(fn)) return;
   ts_gc_root(&fn); ts_gc_root(&proto);
   ((ts_func*)ts_ptr(fn))->prototype_prop = proto;
+  ((ts_func*)ts_ptr(fn))->constructable = 1;   /* own .prototype <=> ES5 [[Construct]] */
   ts_write_barrier(fn, proto);
   if (ts_is_obj(proto)) {
     ts_define_data(proto, ts_intern_field("constructor", 11), fn, 0, 1, 1);
@@ -953,9 +954,43 @@ static void ts_throw_not_extensible(ts_key key){
   snprintf(buf, sizeof(buf), "Cannot add property %s, object is not extensible", nm ? nm : "?");
   ts_throw_type_error_msg(buf);
 }
+/* Strict-mode receiver guard (TS/ESM is always strict): a property write on
+   undefined/null throws "Cannot set properties of ...", and on a primitive
+   number/string/boolean throws "Cannot create property ...", matching V8 (a
+   catchable TypeError; silently ignoring these was a silent-miscompile class).
+   Internal heap kinds without the common header (promise/coro) keep the
+   historical no-op — their props are unmodeled (U-5), and V8 treats them as
+   ordinary objects, so throwing would be the wrong direction for those. */
+static void ts_throw_bad_write_receiver(tsv obj, ts_key key){
+  const char* nm = ts_field_name(key);
+  char buf[256];
+  if (ts_is_undef(obj) || ts_is_null(obj)){
+    snprintf(buf, sizeof buf, "Cannot set properties of %s (setting '%s')",
+             ts_is_null(obj) ? "null" : "undefined", nm ? nm : "?");
+    ts_throw_type_error_msg(buf);
+  }
+  if (ts_is_num(obj)){
+    uint32_t sl; char* sc = ts_string_cstr_copy(ts_number_to_string_radix(obj, 10), &sl);
+    snprintf(buf, sizeof buf, "Cannot create property '%s' on number '%s'", nm ? nm : "?", sc ? sc : "?");
+    free(sc);
+    ts_throw_type_error_msg(buf);
+  }
+  if (ts_is_str(obj)){
+    uint32_t sl; char* sc = ts_string_cstr_copy(obj, &sl);
+    snprintf(buf, sizeof buf, "Cannot create property '%s' on string '%s'", nm ? nm : "?", sc ? sc : "?");
+    free(sc);
+    ts_throw_type_error_msg(buf);
+  }
+  if (ts_is_bool(obj)){
+    snprintf(buf, sizeof buf, "Cannot create property '%s' on boolean '%s'",
+             nm ? nm : "?", ts_truthy(obj) ? "true" : "false");
+    ts_throw_type_error_msg(buf);
+  }
+  /* other non-propbag kinds (symbol, promise, coro, ...): historical no-op */
+}
 void ts_set(tsv obj, ts_key key, tsv val){
   if (g_has_proxies && ts_is_proxy(obj)){ ts_proxy_set_v(obj, ts_key_to_value(key), val, obj); return; }
-  if (!ts_is_propbag(obj)) return;
+  if (!ts_is_propbag(obj)){ ts_throw_bad_write_receiver(obj, key); return; }
   if (ts_is_func(obj)){
     ts_func* f = (ts_func*)ts_ptr(obj);
     if (field_name_is(key, "prototype") && !ts_is_undef(f->prototype_prop)){
@@ -5935,7 +5970,16 @@ tsv ts_construct(tsv ctorv, tsv* args, int n){
   if (raw == 0){
     /* A plain function used as a constructor (`new fn()`): allocate an ordinary
        object whose prototype is fn.prototype (or Object.prototype), call fn with
-       this=object, and yield the object (or the function's object return). */
+       this=object, and yield the object (or the function's object return).
+       Only functions with an own .prototype are constructors (declarations and
+       function expressions — the constructable flag mirrors FN_HAS_PROTOTYPE);
+       arrows/methods/async/generators/builtins throw V8's catchable TypeError. */
+    if (!((ts_func*)ts_ptr(ctorv))->constructable){
+      const char* nm = ((ts_func*)ts_ptr(ctorv))->name;
+      char buf[192];
+      snprintf(buf, sizeof(buf), "%s is not a constructor", (nm && nm[0]) ? nm : "value");
+      ts_throw_type_error_msg(buf);
+    }
     ts_gc_root(&ctorv);
     tsv proto = ((ts_func*)ts_ptr(ctorv))->prototype_prop;
     tsv inst = ts_new_object();
@@ -6201,9 +6245,21 @@ tsv ts_instanceof_dyn(tsv obj, tsv ctorv){
     if (raw != 0){
       tsv proto = ((ts_func*)ts_ptr(ctorv))->prototype_prop;
       if (ts_is_obj(proto)) return ts_bool(ts_instanceof(obj, proto));
+      return ts_bool(0);   /* defensive: a class value always carries an object proto */
     }
+    /* Plain-function RHS (ES5 constructor): walk obj's chain against
+       fn.prototype. A function whose prototype is not an object (arrows,
+       methods, or a reassigned non-object .prototype) throws, matching V8.
+       (V8 interpolates the actual prototype value into the message; we always
+       print 'undefined' — refine if a fixture ever compares that message.) */
+    tsv proto = ((ts_func*)ts_ptr(ctorv))->prototype_prop;
+    if (ts_is_obj(proto)) return ts_bool(ts_instanceof(obj, proto));
+    ts_throw_type_error_msg("Function has non-object prototype 'undefined' in instanceof check");
   }
-  return ts_bool(0);
+  /* Non-callable RHS (a plain object without Symbol.hasInstance, a primitive):
+     JS throws — reachable now that the exporter routes any-typed RHS here. */
+  ts_throw_type_error_msg("Right-hand side of 'instanceof' is not callable");
+  return ts_bool(0);   /* unreachable */
 }
 static int ident_like_bytes(const char* n, uint32_t len){
   if (!n || len == 0) return 0;

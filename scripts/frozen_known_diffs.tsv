@@ -25,3 +25,4 @@ parity	private/brand_in_method	修正#3: 同上
 parity	errors/super_assign_throws	修正#3: 同上（main 冒頭の new B().write()。s316「要一行調査」の正体）
 parity	classes/sroa_noninlinable_callee	修正#3 の回帰テスト自体（凍結側は alloc drop のまま emit）
 parity	classes/sroa_loop_carried_alias	修正#4（s317 ループ逆辺 copy-alias）の回帰テスト自体
+parity	errors/strict_write_receiver	修正#5 (s319): StoreField 汎用 fallback の receiver rebox — 凍結側は int 特化局所を v{n} 直書きし未宣言参照の C を出す（コンパイル不能=loud）。Rust は ctx.val で rebox

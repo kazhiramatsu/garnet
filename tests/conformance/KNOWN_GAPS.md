@@ -64,3 +64,25 @@ exhaustive tier passes 37/37 as of session 4.)
 - string `lastIndexOf` — added ts_str_lastindexof.
 - **unary minus of a float truncated to int** (`-3.14` -> -3): infer_int_locals now
   handles UnOp (result int only if operand int). This fixed Math.abs(-floatvar) etc.
+
+## ES5 function constructors — Tier 1 (session 319)
+
+Supported: `new Foo()` on plain function declarations/expressions ([[Construct]]
+with fn.prototype chaining, this binding, return-override), prototype-method
+dispatch through the shared singleton prototype, `instanceof` with a
+plain-function or any-typed RHS, catchable "X is not a constructor" TypeErrors
+for arrows/methods/async/generators/non-functions. Remaining gaps:
+
+- **bound functions are not constructable**: V8 allows `new (Foo.bind(null))()`
+  (constructs Foo); our bound thunk carries no prototype/constructable flag, so
+  it throws "is not a constructor" (loud, catchable — never silent).
+- **"is not a constructor" name part**: V8 interpolates the NEW-SITE expression
+  text (`new f()` -> "f is not a constructor"); we use the boxed fn.name (or
+  "value"). Threading site text through NewDynamic would change the IR (frozen-
+  twin parity), so deferred to P4+. Tests match on the message tail.
+- **"Function has non-object prototype 'undefined' in instanceof check"**: V8
+  interpolates the actual prototype value; we always print 'undefined'.
+- **Tier 2 (not yet modeled)**: prototype REASSIGNMENT for inheritance
+  (`Child.prototype = Object.create(Base.prototype)`), `Base.call(this)`
+  chaining, `new.target`. The `new x()` path constructs through
+  ts_construct, so these fail loudly where unsupported, not silently.

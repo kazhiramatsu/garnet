@@ -15127,7 +15127,10 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     return;
                 }
             }
-            let _ = writeln!(s, "  ts_set(v{}, {}, {});", obj.0, field.0, ctx.val(src.0));
+            // ctx.val (not a hardcoded v-name): the receiver local may be numeric-
+            // unboxed (`const n: any = 5; n.c = 3`) — rebox it so ts_set sees the
+            // primitive and throws V8's "Cannot create property ..." TypeError.
+            let _ = writeln!(s, "  ts_set({}, {}, {});", ctx.val(obj.0), field.0, ctx.val(src.0));
         }
         Inst::LoadElem { dst, arr } => {
             s.push_str(&ctx.set_val(dst.0, &format!("ts_get(v{}, 0)", arr.0)));

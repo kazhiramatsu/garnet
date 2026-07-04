@@ -625,6 +625,15 @@ typedef struct ts_func {
   tsv* env; uint32_t envlen;
   uint8_t takes_this;    /* 1 if the callee reads args[0] as `this` (methods,
                             functions written with a `this` param, bound fns) */
+  uint8_t constructable; /* 1 iff `new fn()` may construct (ES5 [[Construct]]):
+                            set by ts_set_fn_prototype, i.e. exactly the functions
+                            the exporter marks FN_HAS_PROTOTYPE (declarations and
+                            function expressions; not arrows/methods/async/
+                            generators/builtins). Stays 1 even if fn.prototype is
+                            later reassigned to a non-object (JS keeps the function
+                            a constructor; construction falls back to
+                            Object.prototype). Known gap: a bound function is
+                            constructable in V8 but not marked here. */
   /* For a CLASS VALUE (a class used as a runtime value, `const K = C`): the
      class id PLUS ONE (0 = ordinary function/closure, not a constructor). `new K()`
      reads this via ts_construct. code holds the constructor cfunc; env holds the
