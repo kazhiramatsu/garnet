@@ -3059,3 +3059,19 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
 - **CLT 26.3 → 26.6（ユーザー実行・softwareupdate）**: Apple clang 17.0.0 → **21.0.0 (2100.1.1.101)**。probe exit=0 = デッドロック解消。**素の gate gc（ASan 込み既定）3 段全緑**: focused O2 + focused ASan + runtime ASan tests（ALL RUNTIME TESTS PASS / GC-STRESS PASSED）。**TSAOT_GC_STRESS_ASAN=0 の特例運用は終了 — 以後は素の gate gc に復帰**（s319 前半の教訓(4)は歴史的注記へ）。
 - **C1 の着手条件（ASan 復旧確認）が充足**。ZAP は常設検出器として併存（ASan=読んだ瞬間・確保/poison スタック付きの即時診断 / ZAP=ツール非依存・既定コストゼロの常設網 — 相補）。
 - rt.o を clang 21 で再ビルド（警告ゼロ）。bench **99/99 予算内**（予算は clang 17 較正 — コンパイラ更新の絶対値シフトなしを確認）。
+
+### セッション319 続き2: GC aging（若返り猶予）実装 — 機構完成・**既定 OFF**（C0 依存が判明）
+
+- **実装（ts_rt.c・実行時ノブ `TSAOT_GC_AGE_THRESHOLD`、1=従来/即昇格=既定・N≥2=N 回生存で昇格・clamp 1..8）**:
+  - **age の器 = young セルの remembered u8 転用**（young では remset フラグ未使用・昇格時 0 リセットは既存コードが担保）。
+  - **arena survivor**: `gc_tospace_copy` 新設 — mark 済み×age 未達×予算内（残留 ≤ nursery cap の半分）を **to-space チャンクへ young のままコピー**（handle 張替え・inline array 再接続・旧本体 ZAP は old evacuate と同一契約）。sweep 後 `g_nursery_active = to_active`・used_bytes は残留バイトで seed（物理占有の規律維持）。
+  - **unpooled survivor**: アドレス安定なので in-place age++（コピー不要）・g_young_heap 再構築。
+  - **full GC は従来どおり全昇格**（gc_sweep_nursery に allow_aging 引数）。
+  - **minor 個数トリガを per-cycle 化**（g_young_new_since_minor — 残留 young による誤発火防止。aging off では従来と同値）。RT_STATS に nursery aged=arena+unpooled。
+- **remset × aging = credit 方式**: 「全生存者は昇格」前提のサイクル毎 remset クリアは aging と矛盾（old→young エッジが collection を跨ぐ）→ `ts_gc_remember` が remembered に **scan credit（=threshold）** を格納し、minor で減算しつつ再登録。threshold=1 なら credit=1=即消費で従来と完全同値。**barrier は登録済みでも credit をリフレッシュ**（後から書かれた新規 young 参照が最後の書き込み起点でフル猶予を得る — dedup のままだと remset 脱落で値消失、object_reflection_safepoints が loud に検出）。coro の無条件再登録は既存どおり。
+- **実装中に gate gc が検出した穴 2 件（root-cause 修正済み）**: ① full GC の unpooled 昇格が remembered 未リセット（age 残存→ts_gc_remember が登録済みと誤認→old→young エッジ喪失の miscompile 経路）② 上記 credit dedup 穴。
+- **既定 OFF の理由 = 暗黙昇格の免罪（C0 依存の発見）**: 従来は「minor を 1 回生き延びたセルは old 化=以後の minor で死ねない」ため、**root せず C ローカルだけで生かしている在庫（C0 の root 漏れ）が免罪されていた**。aging はセルを young に留めるので在庫が正しく loud 発火する。**gate gc（threshold=2×YOUNG_THRESHOLD=1）が踏んだ在庫 4 件 = C0 work-list**: (1) `Object.values` — getter 呼び出し中の結果配列/要素、(2) `new Map(iterable)` — next() 呼び出し中の dense、(3) runtime `nested survives GC`、(4) runtime `headers keys array`/`ctor pair init appends`（fetch Headers 経路）。**確定した依存: 既定 ON は C0 完了後**。
+- **副産物: aging は C0 の最強検出器** — `TSAOT_GC_AGE_THRESHOLD=2 × TSAOT_GC_YOUNG_THRESHOLD=1` は昇格免罪そのものを剥がすため、ZAP（0xDD 毒化）が捕れない「昇格で偶然生きる」モードまで decisive に落とす。C0 作業のドライバはこれ + ZAP の二本立てで。
+- **survivors への negative result（今日の当初目的の答え）**: threshold=2 でも **full=13 不変・minor 16→31 倍増**。full トリガは g_heap_bytes（世代無差別）基準で、survivors の keep 配列は置換周期（10万 alloc）> minor 周期（65536）の**中寿命** — threshold=2 でも結局昇格して old で死ぬため、aging では救えない。**aging が効くのは「minor を 1 回だけ跨ぐ短命」**（binarytrees 型の一時構造）で、その検証は C0 後の既定 ON 時に ABAB で。survivors の full 削減は別レバー（old の incremental 化 or full 閾値チューニング＝P6 系）へ。
+- **検証**: gate gc **threshold=1 全緑**（O2+ASan+runtime = 従来動作の回帰ゼロ証明）/ threshold=2 は上記 4 件のみ FAIL（=在庫検出として期待どおり・aging 自体の残バグなし）。conf all **339/339** / gate bench **予算内** / unit 全 PASS / selfconf **336/336**（いずれも既定=1）。
+- **次**: C0（root 漏れ一掃）に aging 検出器を投入 → 完了後に既定 2 化 + 全 fixture ABAB で shortlived/binarytrees 系の real 効果を判定。

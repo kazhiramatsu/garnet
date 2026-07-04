@@ -73,6 +73,28 @@ static ts_gc_header* g_pinned_young = NULL; /* pinned arena survivors (gc_next r
 static size_t g_nursery_used_bytes = 0;     /* bump total this cycle (minor-GC trigger) */
 static size_t g_nursery_cap_bytes = (size_t)4u * 1024u * 1024u; /* TSAOT_GC_NURSERY_BYTES */
 static int g_nursery_enabled = 1;           /* TSAOT_GC_NURSERY=0 kill switch */
+/* Aging (tenure grace): a marked arena survivor is copied WITHIN the nursery
+   (staying YOUNG, age = its remembered byte, unused while young) until it has
+   survived this many minors; only then does it evacuate to the old gen. 1 =
+   promote on first survival (the pre-aging behavior — that value bypasses the
+   to-space path entirely). Fights premature tenuring: transient cells that
+   happen to straddle one minor no longer pollute the old gen. Pinned survivors
+   keep the old rule (promote on release). TSAOT_GC_AGE_THRESHOLD overrides;
+   full GC always promotes.
+   DEFAULT 1 (OFF) until C0 lands: immediate promotion used to AMNESTY unrooted
+   C-local references (a cell that survived one minor could never die in a
+   later one), so the aging grace exposes the known root-leak inventory
+   (s319: Object.values' getter call, Map-from-iterable's next() call, fetch
+   headers, nested-alloc runtime paths — all loud under threshold>=2 with
+   TSAOT_GC_YOUNG_THRESHOLD=1, which doubles as a STRONGER C0 detector than
+   ZAP: it removes the promotion amnesty instead of poisoning bodies). */
+static uint8_t g_gc_age_threshold = 1;
+/* Young allocations since the last collection: the minor COUNT trigger. With
+   aging, g_young_alloc includes kept survivors, so triggering on it would
+   re-fire immediately after a minor that kept a large residency; this counter
+   tracks churn only. Pre-aging the two were equal at every trigger point
+   (every minor emptied the young set), so this is behavior-neutral there. */
+static size_t g_young_new_since_minor = 0;
 static tsv** g_roots=NULL; static int g_root_len=0, g_root_cap=0;
 static ts_gc_header** g_remset=NULL; static size_t g_rem_len=0, g_rem_cap=0;
 ts_gc_header** g_ts_handle_table = NULL;
@@ -92,6 +114,7 @@ static struct {
   unsigned long long mark_stack_peak;
   unsigned long long alloc_count, alloc_bytes, handle_alloc, root_push;
   unsigned long long nursery_alloc, nursery_chunks, retained_chunks;
+  unsigned long long nursery_aged, unpooled_aged;   /* survivors kept YOUNG by aging */
   unsigned long long call_env_malloc;
   unsigned long long concat_calls, concat_bytes;
   unsigned long long intern_calls, intern_probes;
@@ -129,8 +152,9 @@ __attribute__((destructor)) static void ts_rt_stats_dump(void){
   fprintf(out, "[rt_stats] alloc: count=%llu bytes=%llu handle_alloc=%llu handle_cap=%u root_push=%llu\n",
           g_rt_stats.alloc_count, g_rt_stats.alloc_bytes, g_rt_stats.handle_alloc,
           g_handle_cap, g_rt_stats.root_push);
-  fprintf(out, "[rt_stats] nursery: alloc=%llu chunks=%llu retained=%llu | live_bytes=%zu full_next=%zu\n",
+  fprintf(out, "[rt_stats] nursery: alloc=%llu chunks=%llu retained=%llu aged=%llu+%llu | live_bytes=%zu full_next=%zu\n",
           g_rt_stats.nursery_alloc, g_rt_stats.nursery_chunks, g_rt_stats.retained_chunks,
+          g_rt_stats.nursery_aged, g_rt_stats.unpooled_aged,
           g_heap_bytes, g_full_threshold_bytes);
   fprintf(out, "[rt_stats] ts_call env_malloc=%llu | concat: calls=%llu bytes=%llu\n",
           g_rt_stats.call_env_malloc, g_rt_stats.concat_calls, g_rt_stats.concat_bytes);
@@ -248,6 +272,12 @@ static void gc_config_init(void){
   const char* nursery = getenv("TSAOT_GC_NURSERY");
   if (nursery && nursery[0] && strcmp(nursery, "0") == 0) g_nursery_enabled = 0;
   if (!gc_moving_minor_enabled()) g_nursery_enabled = 0;
+  const char* age = getenv("TSAOT_GC_AGE_THRESHOLD");
+  if (age && age[0]){
+    char* end = NULL;
+    unsigned long v = strtoul(age, &end, 10);
+    if (end != age) g_gc_age_threshold = (uint8_t)(v < 1 ? 1 : (v > 8 ? 8 : v));
+  }
   const char* nbytes = getenv("TSAOT_GC_NURSERY_BYTES");
   if (nbytes && nbytes[0]){
     char* end = NULL;
@@ -307,12 +337,24 @@ tsv ts_heap_ref_value(uint16_t sel, void* p){
   return TS_BOX(sel, h->handle);
 }
 void ts_gc_remember(ts_gc_header* h){
-  if (!h || h->gen != TS_GEN_OLD || h->remembered) return;
+  if (!h || h->gen != TS_GEN_OLD) return;
+  /* The remembered byte holds a SCAN CREDIT, not just an in-set flag. Under
+     aging a young pointee can stay young for up to g_gc_age_threshold minors,
+     so the old->young edge must survive that many per-cycle remset resets:
+     each minor decrements the credit and re-enrolls while it lasts (see the
+     minor sweep). threshold=1 (aging off) => credit 1 => enrolled for exactly
+     one minor — the pre-aging behavior.
+     An already-enrolled cell REFRESHES its credit instead of early-returning:
+     each write may store a brand-new (age 0) young ref, which needs the full
+     grace window counted from THIS write — with the plain dedup, a cell whose
+     credit had partially drained would drop out of the remset while the newer
+     pointee was still young (observed as dropped prop values under aging). */
+  if (h->remembered){ h->remembered = g_gc_age_threshold; return; }
   if (g_rem_len == g_rem_cap){
     g_rem_cap = g_rem_cap ? g_rem_cap * 2 : 1024;
     g_remset = (ts_gc_header**)realloc(g_remset, sizeof(ts_gc_header*) * g_rem_cap);
   }
-  h->remembered = 1;
+  h->remembered = g_gc_age_threshold;
   g_remset[g_rem_len++] = h;
 }
 
@@ -369,7 +411,7 @@ static void* gc_nursery_bump(size_t sz){
 }
 static void* gc_alloc(size_t sz, uint8_t kind){
   gc_config_init();
-  if (g_young_alloc>=g_young_threshold || g_nursery_used_bytes>=g_nursery_cap_bytes)
+  if (g_young_new_since_minor>=g_young_threshold || g_nursery_used_bytes>=g_nursery_cap_bytes)
     ts_gc_collect_young();
   if (g_heap_bytes>=g_full_threshold_bytes){
     ts_gc_collect();
@@ -390,7 +432,7 @@ static void* gc_alloc(size_t sz, uint8_t kind){
          arena cells are NOT linked on g_young_heap (the sweep walks chunks). */
       h->kind=kind; h->gen=TS_GEN_YOUNG; h->size=sz;
       h->handle = gc_handle_alloc(h);
-      g_alloc++; g_young_alloc++;
+      g_alloc++; g_young_alloc++; g_young_new_since_minor++;
       RT_STAT_INC(nursery_alloc);
       return h;
     }
@@ -398,7 +440,7 @@ static void* gc_alloc(size_t sz, uint8_t kind){
   ts_gc_header* h=calloc(1,sz);
   h->kind=kind; h->gen=TS_GEN_YOUNG; h->size=sz; h->gc_next=g_young_heap; g_young_heap=h;
   h->handle = gc_handle_alloc(h);
-  g_alloc++; g_young_alloc++;
+  g_alloc++; g_young_alloc++; g_young_new_since_minor++;
   return h;
 }
 
@@ -2494,13 +2536,54 @@ static ts_gc_header* gc_move_young_to_old_ex(ts_gc_header* h, int free_old){
 static ts_gc_header* gc_move_young_to_old(ts_gc_header* h){
   return gc_move_young_to_old_ex(h, 1);
 }
+/* Copy a marked, unpinned arena survivor into a TO-SPACE nursery chunk (it
+   stays YOUNG — the aging grace period). Same relocation contract as the
+   old-gen evacuation: handles are re-pointed (gc_handle_move), inline array
+   data is re-tied, the moved-from body is zapped. The to-space chunk list is
+   caller-owned and becomes g_nursery_active after the sweep; a chunk freed by
+   this same sweep may be reused (its live cells have already left). Returns
+   NULL on chunk-allocation failure — the caller promotes instead. */
+static ts_gc_header* gc_tospace_copy(gc_chunk** to_active, ts_gc_header* h){
+  size_t sz = h->size;
+  size_t need = (sz + 15u) & ~(size_t)15u;
+  gc_chunk* c = *to_active;
+  if (!c || c->used + need > GC_NURSERY_DATA_BYTES){
+    if (g_nursery_free){
+      c = g_nursery_free; g_nursery_free = c->next;
+    } else {
+      void* mem = NULL;
+      if (posix_memalign(&mem, GC_NURSERY_CHUNK_BYTES, GC_NURSERY_CHUNK_BYTES) != 0)
+        return NULL;
+      c = (gc_chunk*)mem;
+      RT_STAT_INC(nursery_chunks);
+    }
+    c->used = 0; c->pinned_live = 0;
+    c->next = *to_active; *to_active = c;
+  }
+  ts_gc_header* nw = (ts_gc_header*)((char*)c + GC_NURSERY_DATA_OFF + c->used);
+  c->used += need;
+  memcpy(nw, h, sz);
+  nw->mark = 0;
+  nw->pin_depth = 0;   /* pinned cells never take this path */
+  nw->gc_next = NULL;
+  gc_fix_moved_cell(h, nw);
+  gc_handle_move(h, nw);
+  if (g_gc_zap) memset(h, 0xDD, sz);
+  return nw;
+}
 /* Sweep one side of the nursery after marking: evacuate marked cells to the
    old gen, payload-free the dead, divert pinned survivors to g_pinned_young
    and their chunk to the retained list. Shared by minor and full collections
    (arena cells are always YOUNG, and both collections mark them the same
-   way), so the "leave by copy or die" rule has a single implementation. */
-static void gc_sweep_nursery(ts_gc_header** survivors){
+   way), so the "leave by copy or die" rule has a single implementation.
+   allow_aging (minor only): a survivor younger than g_gc_age_threshold is
+   copied within the nursery and stays YOUNG instead of evacuating — its age
+   lives in the remembered byte, which is unused while young and already
+   reset to 0 by the old-gen evacuation. Full GC passes 0 (always promote). */
+static void gc_sweep_nursery(ts_gc_header** survivors, int allow_aging){
   gc_chunk* next = NULL;
+  gc_chunk* to_active = NULL;        /* survivors' residence, next cycle's active */
+  size_t kept_bytes = 0;             /* physical residency: seeds the minor trigger */
   for (gc_chunk* c = g_nursery_active; c; c = next){
     next = c->next;
     char* data = (char*)c + GC_NURSERY_DATA_OFF;
@@ -2517,9 +2600,24 @@ static void gc_sweep_nursery(ts_gc_header** survivors){
           h->gc_next = g_pinned_young; g_pinned_young = h;
           pinned_here++;
         } else {
-          ts_gc_header* nw = gc_move_young_to_old_ex(h, 0);
-          nw->gc_next = *survivors; *survivors = nw;
-          g_young_alloc--; g_old_alloc++;
+          uint8_t age = (uint8_t)(h->remembered + 1);
+          ts_gc_header* kept = NULL;
+          /* Residency budget: survivors may keep at most half the nursery cap,
+             or back-to-back minors would fire on the seeded trigger with no
+             room for new allocation. Overflow survivors promote (chunk order). */
+          if (allow_aging && age < g_gc_age_threshold &&
+              kept_bytes < (g_nursery_cap_bytes >> 1))
+            kept = gc_tospace_copy(&to_active, h);
+          if (kept){
+            kept->remembered = age;
+            kept_bytes += step;
+            RT_STAT_INC(nursery_aged);
+          } else {
+            /* aged out (or to-space chunk allocation failed): evacuate. */
+            ts_gc_header* nw = gc_move_young_to_old_ex(h, 0);
+            nw->gc_next = *survivors; *survivors = nw;
+            g_young_alloc--; g_old_alloc++;
+          }
         }
       } else {
         gc_free_cell_payload(h);
@@ -2537,8 +2635,8 @@ static void gc_sweep_nursery(ts_gc_header** survivors){
       c->next = g_nursery_free; g_nursery_free = c;
     }
   }
-  g_nursery_active = NULL;
-  g_nursery_used_bytes = 0;
+  g_nursery_active = to_active;
+  g_nursery_used_bytes = kept_bytes;
 }
 /* Re-examine pinned survivors from earlier collections (they live in retained
    chunks and stayed YOUNG): evacuate the ones whose pin was released, free the
@@ -2602,26 +2700,50 @@ void ts_gc_collect_young(void){
     if (h && h->gen == TS_GEN_OLD) gc_scan_cell(h, 1, 0);
   }
   gc_mark_drain(1);
-  for (size_t i=0;i<old_rem_len;i++) if (g_remset[i]) g_remset[i]->remembered = 0;
+  /* Reset the remset, spending scan credits (see ts_gc_remember): an entry
+     with credit left is re-enrolled with credit-1 — its young pointees may be
+     under the aging grace and still young after this collection, so the
+     old->young edge must survive the reset. Appends reuse slots of entries
+     already processed (append count <= processed count), so entry i is never
+     clobbered before it is read. CORO cells keep their unbounded re-enroll
+     (frames may point young across arbitrarily many minors). */
   g_rem_len = 0;
   for (size_t i=0;i<old_rem_len;i++){
     ts_gc_header* h = g_remset[i];
-    if (h && h->gen == TS_GEN_OLD && h->kind == TS_KIND_CORO) ts_gc_remember(h);
+    if (!h) continue;
+    uint8_t credit = h->remembered;
+    h->remembered = 0;
+    if (h->gen != TS_GEN_OLD) continue;
+    if (h->kind == TS_KIND_CORO){ ts_gc_remember(h); continue; }
+    if (credit > 1){
+      ts_gc_remember(h);
+      h->remembered = (uint8_t)(credit - 1);
+    }
   }
   ts_gc_header* survivors = NULL;
+  ts_gc_header* young_kept = NULL;   /* unpooled survivors under the aging grace */
   ts_gc_header* h = g_young_heap;
   int moving = gc_moving_minor_enabled();
   while (h){
     ts_gc_header* next = h->gc_next;
     if (h->mark){
-      if (moving && gc_is_movable_cell(h)){
-        h = gc_move_young_to_old(h);
+      uint8_t age = (uint8_t)(h->remembered + 1);
+      if (age < g_gc_age_threshold){
+        /* aging grace: stays YOUNG in place (unpooled cells are address-
+           stable, so no copy is needed — just count the survival). */
+        h->mark = 0; h->remembered = age;
+        h->gc_next = young_kept; young_kept = h;
+        RT_STAT_INC(unpooled_aged);
       } else {
-        h->mark=0; h->gen=TS_GEN_OLD; h->remembered=0;
+        if (moving && gc_is_movable_cell(h)){
+          h = gc_move_young_to_old(h);
+        } else {
+          h->mark=0; h->gen=TS_GEN_OLD; h->remembered=0;
+        }
+        h->gc_next=survivors; survivors=h;
+        g_young_alloc--; g_old_alloc++;
+        if (h->kind == TS_KIND_CORO) ts_gc_remember(h);
       }
-      h->gc_next=survivors; survivors=h;
-      g_young_alloc--; g_old_alloc++;
-      if (h->kind == TS_KIND_CORO) ts_gc_remember(h);
     } else {
       g_young_alloc--; g_alloc--; gc_free_cell(h);
     }
@@ -2631,14 +2753,15 @@ void ts_gc_collect_young(void){
      cells onto g_pinned_young with their mark already cleared, and this pass
      must not mistake those for dead. */
   gc_sweep_pinned_young(&survivors);
-  gc_sweep_nursery(&survivors);
+  gc_sweep_nursery(&survivors, 1);
   if (survivors){
     h = survivors;
     while (h->gc_next) h = h->gc_next;
     h->gc_next = g_old_heap;
     g_old_heap = survivors;
   }
-  g_young_heap = NULL;
+  g_young_heap = young_kept;
+  g_young_new_since_minor = 0;
   gc_clear_nonheap_marks();
   RT_STAT_GC_T1;
 }
@@ -2670,21 +2793,27 @@ void ts_gc_collect(void){
   ts_gc_header* promoted = NULL;
   ts_gc_header* y = g_young_heap;
   while (y){ ts_gc_header* next=y->gc_next;
-    if (y->mark){ y->mark=0; y->gen=TS_GEN_OLD; y->gc_next=promoted; promoted=y; g_young_alloc--; g_old_alloc++; if (y->kind==TS_KIND_CORO) ts_gc_remember(y); }
+    /* remembered must reset on promotion: while young it holds the AGE
+       counter (aging), and a stale nonzero would make ts_gc_remember treat
+       the promoted cell as already-enrolled — dropping old->young edges. */
+    if (y->mark){ y->mark=0; y->gen=TS_GEN_OLD; y->remembered=0; y->gc_next=promoted; promoted=y; g_young_alloc--; g_old_alloc++; if (y->kind==TS_KIND_CORO) ts_gc_remember(y); }
     else { g_young_alloc--; g_alloc--; gc_free_cell(y); }
     y=next;
   }
   /* Arena cells cannot gen-flip in place (chunk-owned memory vs the old
      sweep's free(h)), so a full GC also has them leave by copy or die. The
      evacuated copies join `promoted` AFTER the old sweep above, so this
-     collection never re-sweeps them. Pinned pass first (see minor GC). */
+     collection never re-sweeps them. Pinned pass first (see minor GC).
+     No aging on a full collection: it just cleaned the old gen, so premature
+     tenuring costs nothing here, and always-promote keeps this path simple. */
   gc_sweep_pinned_young(&promoted);
-  gc_sweep_nursery(&promoted);
+  gc_sweep_nursery(&promoted, 0);
   if (promoted){
     ts_gc_header* tail=promoted; while (tail->gc_next) tail=tail->gc_next;
     tail->gc_next=g_old_heap; g_old_heap=promoted;
   }
   g_young_heap=NULL;
+  g_young_new_since_minor = 0;
   gc_clear_nonheap_marks();
   RT_STAT_GC_T1;
 }
