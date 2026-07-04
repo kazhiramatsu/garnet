@@ -582,6 +582,17 @@ int ts_is_callable(tsv v){ return ts_is_func(v); }
    so the method-dispatch receiver guard can reuse it. */
 void ts_throw_not_a_function(const char* name);
 static tsv ts_throw_cannot_read(tsv obj, const char* prop);
+/* Closure calls merge captured cells (env) with the actual args into one buffer
+   that lives ONLY for the duration of code() — the callee reads its leading
+   parameters (cells..., args...) at entry and never retains the pointer. So a
+   small on-stack buffer replaces the per-call malloc/free that dominated
+   closure-heavy workloads (4M mallocs on gc_closures). We only fall back to
+   malloc when the merged arity exceeds the buffer. GC reachability is unchanged:
+   neither the old heap buffer nor this stack buffer is scanned by the GC — the
+   env values stay reachable through `fn` (f->env) and the args through the
+   caller's frame, exactly as before. 16 slots = 128B/frame covers the vast
+   majority of closure arities at negligible stack cost. */
+#define TS_CALL_MERGE_STACK 16
 tsv ts_call(tsv fn, tsv* args, int nargs){
   if (g_has_proxies && ts_is_proxy(fn)) return ts_proxy_apply(fn, TS_UNDEFINED, args, nargs);
   if (!ts_is_func(fn)) ts_throw_not_a_function(NULL);
@@ -590,13 +601,15 @@ tsv ts_call(tsv fn, tsv* args, int nargs){
   if (f->envlen){
     /* Closure: prepend captured cells (env) to the args, matching the callee's
        calling convention (captured cells are its leading parameters). */
-    int total = (int)f->envlen + nargs;
-    tsv* merged = malloc(sizeof(tsv)*(total>0?total:1));
-    RT_STAT_INC(call_env_malloc);
+    int total = (int)f->envlen + nargs;   /* envlen>=1 here, nargs>=0 => total>=1 */
+    tsv stackbuf[TS_CALL_MERGE_STACK];
+    tsv* merged = (total <= TS_CALL_MERGE_STACK)
+                    ? stackbuf
+                    : (RT_STAT_INC(call_env_malloc), (tsv*)malloc(sizeof(tsv)*(size_t)total));
     for (uint32_t i=0;i<f->envlen;i++) merged[i]=f->env[i];
     for (int i=0;i<nargs;i++) merged[f->envlen+i]=args[i];
     tsv r = code(merged, total);
-    free(merged);
+    if (merged != stackbuf) free(merged);
     return r;
   }
   return code(args, nargs);
@@ -614,13 +627,17 @@ tsv ts_call_value(tsv fn, tsv* args, int nargs){
   ts_func* f = ts_ptr(fn);
   if (!f->takes_this) return ts_call(fn, args, nargs);
   /* inject undefined this at the front of the live args (cells are prepended by
-     ts_call afterwards, giving [cells..., undefinedThis, args...]). */
-  int n = nargs + 1;
-  tsv* a = malloc(sizeof(tsv)*(n>0?n:1));
+     ts_call afterwards, giving [cells..., undefinedThis, args...]). Same stack-
+     buffer treatment as ts_call: `a` lives only across the ts_call below (which
+     copies it into its own buffer), so a small on-stack array avoids the second
+     malloc on the takes_this `g(...)` path. */
+  int n = nargs + 1;                      /* nargs>=0 => n>=1 */
+  tsv stackbuf[TS_CALL_MERGE_STACK];
+  tsv* a = (n <= TS_CALL_MERGE_STACK) ? stackbuf : (tsv*)malloc(sizeof(tsv)*(size_t)n);
   a[0] = TS_UNDEFINED;
   for (int i=0;i<nargs;i++) a[1+i]=args[i];
   tsv r = ts_call(fn, a, n);
-  free(a);
+  if (a != stackbuf) free(a);
   return r;
 }
 /* Call a value as a METHOD: args[0] is the receiver (`this`) and args[1..] are
@@ -5233,6 +5250,59 @@ static const char** g_field_names = NULL;
 static uint32_t* g_field_lens = NULL;
 static uint32_t g_field_count = 0;
 static uint32_t g_field_cap = 0;
+/* ---- field-name hash index (P2a: O(1) intern vs O(#fields) memcmp scan) ----
+   Maps a field name's FNV-1a hash to its id+1 (0 = empty slot), open-addressed
+   with linear probing, power-of-two sized, kept under 3/4 load. The field table
+   is APPEND-ONLY (ids are never reused or deleted), so no tombstones are needed.
+   The index holds only integer ids — NO heap pointers — so the moving GC never
+   scans or relocates it, and it needs no free (lives to process exit). Built
+   lazily: lookups fall back to "not present" (-1) until the first reserve. */
+static uint32_t* g_field_index = NULL;     /* slot -> id+1; 0 = empty */
+static uint32_t  g_field_index_cap = 0;    /* number of slots (power of two) */
+static uint32_t field_name_hash(const char* name, uint32_t len){
+  uint32_t h = 2166136261u;                /* FNV-1a over raw bytes (same consts as strhash_units) */
+  for (uint32_t i=0;i<len;i++){ h ^= (uint8_t)name[i]; h *= 16777619u; }
+  return h;
+}
+/* Insert id into the index; caller guarantees a free slot exists. */
+static void field_index_put(uint32_t id){
+  uint32_t mask = g_field_index_cap - 1;
+  uint32_t slot = field_name_hash(g_field_names[id], g_field_lens[id]) & mask;
+  while (g_field_index[slot]) slot = (slot + 1) & mask;
+  g_field_index[slot] = id + 1;
+}
+/* Ensure the index holds `need` entries under 3/4 load, rebuilding from the live
+   field table (ids [0,g_field_count)) when it must grow or is first allocated. */
+static void field_index_reserve(uint32_t need){
+  if (g_field_index_cap && need * 4 < g_field_index_cap * 3) return;
+  uint32_t newcap = g_field_index_cap ? g_field_index_cap : 64;
+  while (need * 4 >= newcap * 3) newcap *= 2;
+  free(g_field_index);
+  g_field_index = (uint32_t*)calloc(newcap, sizeof(uint32_t));
+  g_field_index_cap = newcap;
+  for (uint32_t i = 0; i < g_field_count; i++) field_index_put(i);
+}
+/* Look up (name,len) via the index; return id or -1. *probes gets the number of
+   slots examined (for RT_STATS honesty — typically 1–2). */
+static int field_index_lookup(const char* name, uint32_t len, uint32_t hash, uint32_t* probes){
+  uint32_t p = 0;
+  if (g_field_index_cap){
+    uint32_t mask = g_field_index_cap - 1;
+    for (uint32_t slot = hash & mask; ; slot = (slot + 1) & mask){
+      p++;
+      uint32_t e = g_field_index[slot];
+      if (!e) break;                        /* empty slot: not present */
+      uint32_t id = e - 1;
+      if (g_field_lens[id] == len && memcmp(g_field_names[id], name, len) == 0){
+        if (probes) *probes = p; return (int)id;
+      }
+    }
+  } else {
+    p = 1;
+  }
+  if (probes) *probes = p;
+  return -1;
+}
 /* TS_METHOD_KEY_BASE and the ts_key tag space are defined once in ts_rt.h. */
 
 /* ---- key-kind predicates (property_model_redesign §3.6) ----
@@ -5262,6 +5332,10 @@ void ts_init_fields(const char* const* names, const uint32_t* lens, uint32_t cou
     g_field_lens[i] = lens ? lens[i] : (uint32_t)strlen(names[i]);
   }
   g_field_count = count;
+  /* build the hash index over the compile-time field table (fresh: this runs once
+     at startup; reset defensively in case of re-init). */
+  free(g_field_index); g_field_index = NULL; g_field_index_cap = 0;
+  field_index_reserve(count + 1);
 }
 const char* ts_field_name(uint32_t id){
   if (id >= g_field_count) return NULL;
@@ -5282,23 +5356,33 @@ static int field_bytes_is(const char* n, uint32_t len, const char* lit){
   uint32_t lit_len = (uint32_t)strlen(lit);
   return n && len == lit_len && memcmp(n, lit, len) == 0;
 }
-/* intern a (possibly new) field name -> id, agreeing with compile-time ids. */
+/* intern a (possibly new) field name -> id, agreeing with compile-time ids. The
+   id assignment (id = g_field_count++) is UNCHANGED — the hash index is only a
+   lookup accelerator, so compile-time/runtime id agreement is preserved. */
 uint32_t ts_intern_field(const char* name, uint32_t len){
   RT_STAT_INC(intern_calls);
-  for (uint32_t i=0;i<g_field_count;i++){
-    const char* n=g_field_names[i];
-    if (n && g_field_lens[i]==len && memcmp(n,name,len)==0){ RT_STAT_ADD(intern_probes, i+1); return i; }
-  }
-  RT_STAT_ADD(intern_probes, g_field_count);
+  uint32_t h = field_name_hash(name, len);
+  uint32_t probes = 0;
+  int found = field_index_lookup(name, len, h, &probes);
+  RT_STAT_ADD(intern_probes, probes);
+  if (found >= 0) return (uint32_t)found;
+  /* new field: grow the parallel name/len arrays if needed */
   if (g_field_count==g_field_cap){
     g_field_cap=g_field_cap?g_field_cap*2:16;
     g_field_names=realloc(g_field_names,sizeof(char*)*g_field_cap);
     g_field_lens=realloc(g_field_lens,sizeof(uint32_t)*g_field_cap);
   }
+  /* reserve index capacity for one more BEFORE appending, so the rebuild inside
+     reserve() (which re-inserts ids [0,g_field_count)) never sees the not-yet-
+     stored id. */
+  field_index_reserve(g_field_count + 1);
+  uint32_t id = g_field_count;
   char* copy=malloc(len+1); memcpy(copy,name,len); copy[len]=0;
-  g_field_names[g_field_count]=copy;
-  g_field_lens[g_field_count]=len;
-  return g_field_count++;
+  g_field_names[id]=copy;
+  g_field_lens[id]=len;
+  g_field_count = id + 1;
+  field_index_put(id);
+  return id;
 }
 static tsv ts_new_string_from_field_name_len(const char* name, uint32_t len){
   if (!name) return TS_UNDEFINED;
