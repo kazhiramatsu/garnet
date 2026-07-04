@@ -3104,3 +3104,9 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
 - **発見した silent DIFF（修正#6）**: `Bar.prototype.k = fn` は **FIELD + METHOD の二重格納**（動的 dispatch ブリッジ）なのに `delete p.k` は FIELD しか消さず、**読みは undefined・呼び出しは成功**という分裂（METHOD フォールバックが残骸にヒット）。`DeleteField` に optional `method`（METHOD twin id・nameIntern を get で probe = 新規採番なし）を追加し、Rust emit が `ts_delete_prop_strict(obj, TS_KEY_METHOD(m))` を追加発行。凍結双子は未知フィールドを無視（UNPORTED なし・旧バグ保持）→ **frozen_known_diffs に parity + selfconf の 2 行**（selfconf スコープ行は s317 の枠組みの初適用）。既知の限界: store より前に delete が lower される倒錯順（別関数間）では twin id 未採番で消し漏れ — 実害皆無としてコメント記録のみ。
 - **教訓**: 二重格納の名前空間ブリッジは**全ミューテーション操作で対称**でなければならない — store だけ二重・delete が片側は「読み書きで違う世界が見える」silent DIFF の温床（METHOD/FIELD ミスマッチ教訓の delete 版）。
 - **検証**: conf all **341/341** / parity **DIFF=0**（KNOWN=11）/ selfconf **337 PASS + KNOWN=1** / unit / bundler 39/39 / bench 予算内。
+
+### セッション319 続き6: GLOBALS[] の命名整理（ユーザー相談への回答・記録）
+
+- **相談**: GLOBALS[]/LoadGlobal/StoreGlobal の名前が実態（ESM 配管 3 種: __modcell/__fn/__static）より広く読める件、改名すべきか。
+- **判断: 今は変えず P4（parity 卒業）後の改名候補として予約** — opcode 名は凍結双子が解釈する IR スキーマの一部・配列名は全 parity fixture の生成 C に焼き込み済みで、改名 = UNPORTED/全 fixture DIFF（tsaot→garnet 改名保留と同じ blast radius 構図）。exporter 内部名だけの改名は中途半端なので見送り。
+- **対処**: scope_resolution.md §2.2 に「現状の住人 3 種一覧 + 改名は P4 送り（候補: MODULE_SLOTS / LoadSlot / StoreSlot）」を追記。誤読リスクはこれで塞ぐ。

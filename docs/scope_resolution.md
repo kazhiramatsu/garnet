@@ -150,6 +150,28 @@ So the design separates two things that the earlier draft confused:
   producers, codegen wires through to the `GLOBALS[]` array. Kept as
   infrastructure for future features.
 
+> **s319 status — who actually lives in `GLOBALS[]` today.** The
+> GlobalEnvironment role above is still producer-less: script mode landed
+> on real globalThis-object properties instead (storeGlobalObjectProperty
+> -> LoadBuiltinFn globalThis + ts_set), so every current GLOBALS producer
+> is ESM plumbing:
+>
+> - `__modcell_<name>_<id>` — a module binding's CELL (not its value),
+>   published for ABI-fixed contexts that cannot receive cell parameters:
+>   method bodies (Step E) and static initializers/blocks (Step F). The
+>   binding's single home stays the cell; this slot is a second route to it.
+> - `__fn_<name>_<bindingId>` — the singleton box of a top-level function
+>   declaration (function identity and own-`.prototype` stability; the
+>   ES5-`new` support relies on this).
+> - `__static_<classId>` — a class's static container object.
+>
+> The names `GLOBALS` / `LoadGlobal` / `StoreGlobal` therefore read wider
+> than what they hold. Renaming (e.g. `MODULE_SLOTS` / `LoadSlot` /
+> `StoreSlot`) is DEFERRED to parity graduation (P4): the opcode names are
+> part of the IR schema the frozen twin interprets, and the array name is
+> baked into every parity fixture's generated C — same blast-radius shape
+> as the tsaot->garnet rename.
+
 ### 2.3 Hoisting and TDZ — how this fits
 
 JS distinguishes:
