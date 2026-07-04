@@ -3075,3 +3075,18 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
 - **survivors への negative result（今日の当初目的の答え）**: threshold=2 でも **full=13 不変・minor 16→31 倍増**。full トリガは g_heap_bytes（世代無差別）基準で、survivors の keep 配列は置換周期（10万 alloc）> minor 周期（65536）の**中寿命** — threshold=2 でも結局昇格して old で死ぬため、aging では救えない。**aging が効くのは「minor を 1 回だけ跨ぐ短命」**（binarytrees 型の一時構造）で、その検証は C0 後の既定 ON 時に ABAB で。survivors の full 削減は別レバー（old の incremental 化 or full 閾値チューニング＝P6 系）へ。
 - **検証**: gate gc **threshold=1 全緑**（O2+ASan+runtime = 従来動作の回帰ゼロ証明）/ threshold=2 は上記 4 件のみ FAIL（=在庫検出として期待どおり・aging 自体の残バグなし）。conf all **339/339** / gate bench **予算内** / unit 全 PASS / selfconf **336/336**（いずれも既定=1）。
 - **次**: C0（root 漏れ一掃）に aging 検出器を投入 → 完了後に既定 2 化 + 全 fixture ABAB で shortlived/binarytrees 系の real 効果を判定。
+
+### セッション319 続き3（C0 着手）: 「root 漏れ在庫 4 件」は誤診断 — 真因は aging 自身の **promotion barrier 欠落**（修正済み・th=2 全緑）
+
+- **診断の経緯**: C0 着手で在庫 4 件の最小化 → `Object.entries` の消えたキーが **len3・全ゼロバイトの文字列**に化けることを実測（moved-from 読みなら ZAP で 0xDD になるはずが 0x00 = ゼロ初期化 nursery を指す別セル = 未 mark 死亡 + handle/領域再利用のシグネチャ）→ 一時診断ログ（STRING/ARRAY の tospace/evac/die を minor 番号付きで追跡）で決定的時系列: **m267 で pair 配列が old 昇格・中の "value" 文字列は young 残留 → m268 で文字列が未 mark 死亡**。
+- **真因（aging の設計欠陥 = 第 2 のバリア欠落）**: old→young エッジの発生源は (1) old への store（write barrier が捕捉 ✓）に加えて **(2) 参照ペアの片側昇格** — 親が昇格し子が aging 猶予で young 残留すると、store が young→young 時代に起きたため write barrier は何も見ていない。従来 threshold=1 は「生存者全員が同時昇格」で (2) が構造的に存在しなかった。
+- **修正 = promotion barrier（5 行・walk 不要）**: minor sweep 完了後、**今回昇格した survivors 全員を ts_gc_remember**（aging on 限定）。credit=threshold が子の残り猶予を正確にカバー: 子 S(age a) を持つ親 P の昇格時 credit=th、以後毎 minor P の scan が S を mark→age+1 → S は th−a ≤ th 回で必ず昇格し credit がそれを覆う。precise な子 walk（gc_scan_cell 複製）も probe グローバル（mark ホットパス劣化）も不要。threshold=1 はペア分裂が起き得ないためスキップ = 従来コスト不変。
+- **帰結（94ddfe3 の結論を撤回）**: 「aging は C0 依存・root 漏れ在庫 4 件」は誤り — 4 件（Object.values/entries・Map(iterable)・nested survives GC・fetch Headers）は**すべて同一バグの症状**で、修正後 **gate gc th=2 が 3 段全緑**（O2 18/18 + ASan 18/18 + runtime ASan）・th=1 も全緑（barrier は th>1 ゲート内 = 非回帰）。aging は self-contained に正しい。既定 ON は ABAB 実測待ちに戻る。
+- **真の C0（在庫探索）= 完了・在庫ゼロ**: 全 conformance 339 × `AGE_THRESHOLD=2 × YOUNG_THRESHOLD=1 × ZAP` の最凶複合フルスイープが **339/339 全緑**。s318 積み残しの「ZAP×threshold=1 全 conformance（C0 の root 漏れ在庫一掃）」はこれで消化 — **ランタイムに root 漏れは現存しない**（唯一の実在バグが上記 promotion barrier で、それは aging 自身のものだった）。**C1 着手条件はすべて充足**（ASan 復旧 + C0 完了）。
+- **ABAB（同一バイナリ・env 切替・交互 2 周 best-of-3）— aging の損益実測**:
+  - **勝ち**: binarytrees **full 6→1 回(-83%)**・wall -5.8%・maxp 2.64→1.88 / survivors **maxp 6.31→4.07ms(-35%・s318 目標 6.5ms を大幅クリア)** / cycles -4% / mapset -9%。設計狙い（minor 1 回跨ぎの偽昇格根絶）は実証。
+  - **負け**: deep_chain wall **+33%**（27→36ms・全ノード長寿命=再コピー直撃）/ survivors wall +17%（中寿命 live set の再コピー・full=13 不変は昨日の分析どおり）。
+  - **判定: 既定 1（off）維持** — 「perf 回帰ゼロ」規律の下、+33% 級の回帰ワークロードを既定に抱えない。勝ち筋は full 頻度・pause なので、それが効く実測（selfhost ミルストーン等の pause 問題）が出た時に opt-in / 既定再訪。C0 検出器としての価値（`AGE_THRESHOLD=2×YOUNG_THRESHOLD=1`）は env ノブで恒久利用可。
+- **教訓**: (1) **昇格はエッジ生成イベント** — 世代不変量を変える機能は store 以外のエッジ発生源を列挙し切ってから設計する（今回で store/昇格の 2 源が完備）。(2) 症状ベースの work-list 化（「root 漏れ 4 件」）は診断を固定化する — 最小化 + バイト実測 + 時系列ログまで下りてから在庫と呼ぶ。(3) 「綺麗な undefined 化・ZAP 無反応・全ゼロバイト」は moved-from 読みでなく**未 mark 死亡 + 領域再利用**のシグネチャ（moved-from なら 0xDD）。
+- **検証（promotion barrier 込みの最終形）**: gate gc **th=1 全緑 + th=2 全緑**（各 O2+ASan+runtime）/ conf all **339/339** / gate bench **予算内** / unit / selfconf **336/336**。
+- **次**: (1) **C1 着手可能**（ASan 復旧 + C0 完了で条件充足 — identity hash 設計は s318 で確定済み）、(2) aging 既定 ON の再訪は selfhost ミルストーン計測とセット（勝ち筋データ添付済み）、(3) P2a 残り（find_prop 12.6 / intern 98.8 / ts_call env）、(4) ES5 new Tier 2（需要駆動）。

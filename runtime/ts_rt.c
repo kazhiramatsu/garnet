@@ -2543,6 +2543,7 @@ static ts_gc_header* gc_move_young_to_old(ts_gc_header* h){
    caller-owned and becomes g_nursery_active after the sweep; a chunk freed by
    this same sweep may be reused (its live cells have already left). Returns
    NULL on chunk-allocation failure — the caller promotes instead. */
+
 static ts_gc_header* gc_tospace_copy(gc_chunk** to_active, ts_gc_header* h){
   size_t sz = h->size;
   size_t need = (sz + 15u) & ~(size_t)15u;
@@ -2754,6 +2755,17 @@ void ts_gc_collect_young(void){
      must not mistake those for dead. */
   gc_sweep_pinned_young(&survivors);
   gc_sweep_nursery(&survivors, 1);
+  /* Promotion barrier (aging only): promotion can split a reference pair
+     across generations — the parent promotes while its child stays young
+     under the aging grace, creating an old->young edge NO write barrier ever
+     saw (the store happened young->young). Enroll every cell promoted THIS
+     minor; the scan credit (= threshold) covers exactly the child's remaining
+     grace: each scan re-marks the child, aging it to promotion before the
+     credit drains. threshold=1 promotes all survivors together (no split),
+     so this pass is skipped and the pre-aging remset behavior is unchanged. */
+  if (g_gc_age_threshold > 1){
+    for (ts_gc_header* p = survivors; p; p = p->gc_next) ts_gc_remember(p);
+  }
   if (survivors){
     h = survivors;
     while (h->gc_next) h = h->gc_next;
