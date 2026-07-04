@@ -4806,17 +4806,26 @@ class Exporter {
     if (ts.isDeleteExpression(node)) {
       // delete obj.prop : remove the property; result is a boolean (true).
       const target = node.expression;
-      if (ts.isPropertyAccessExpression(target) && ts.isIdentifier(target.name)) {
-        const obj = this.lowerExpr(ctx, target.expression);
+      // A prototype-method store writes BOTH key spaces (StoreField +
+      // StoreMethod, the dynamic-dispatch bridge), so delete must clear both —
+      // otherwise the METHOD-side dispatch fallback keeps resolving the deleted
+      // method (silent DIFF: `p.k` read as undefined but `h.k()` still called).
+      // Only names already interned as method names can have a METHOD twin;
+      // nameIntern is probed with get() so the lookup never mints new ids.
+      const emitDelete = (objExpr: ts.Expression, name: string): number => {
+        const obj = this.lowerExpr(ctx, objExpr);
         const dst = this.newLocal(ctx, "reference");
-        ctx.body.push({ kind: "DeleteField", dst, obj, field: this.internField(target.name.text) });
+        const inst: any = { kind: "DeleteField", dst, obj, field: this.internField(name) };
+        const m = this.nameIntern.get(name);
+        if (m !== undefined) inst.method = m;
+        ctx.body.push(inst);
         return dst;
+      };
+      if (ts.isPropertyAccessExpression(target) && ts.isIdentifier(target.name)) {
+        return emitDelete(target.expression, target.name.text);
       }
       if (ts.isElementAccessExpression(target) && ts.isStringLiteral(target.argumentExpression)) {
-        const obj = this.lowerExpr(ctx, target.expression);
-        const dst = this.newLocal(ctx, "reference");
-        ctx.body.push({ kind: "DeleteField", dst, obj, field: this.internField(target.argumentExpression.text) });
-        return dst;
+        return emitDelete(target.expression, target.argumentExpression.text);
       }
       this.unsupported(node, "delete with a dynamic/computed property (only obj.prop and obj['lit'] supported)");
     }

@@ -26,3 +26,5 @@ parity	errors/super_assign_throws	修正#3: 同上（main 冒頭の new B().writ
 parity	classes/sroa_noninlinable_callee	修正#3 の回帰テスト自体（凍結側は alloc drop のまま emit）
 parity	classes/sroa_loop_carried_alias	修正#4（s317 ループ逆辺 copy-alias）の回帰テスト自体
 parity	errors/strict_write_receiver	修正#5 (s319): StoreField 汎用 fallback の receiver rebox — 凍結側は int 特化局所を v{n} 直書きし未宣言参照の C を出す（コンパイル不能=loud）。Rust は ctx.val で rebox
+parity	functions/es5_new_edge_cases	修正#6 (s319): DeleteField の METHOD twin 削除 — 凍結側は method フィールドを無視し FIELD のみ消す（delete 後も dispatch が旧メソッドを解決する silent DIFF を保持）
+selfconf	functions/es5_new_edge_cases	修正#6: 凍結バイナリは delete 後の h.k() が成功して V8 と出力が異なる（有限・数値/文字列観測のみ）

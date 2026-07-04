@@ -3097,3 +3097,10 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
 - **fnUsesOwnThis の __module_init 除外（穴 1 件同時修正）**: 合成 __module_init はトップレベル this のホストで、s319 前半の fnUsesOwnThis がこれを takesThis 化すると **this が空 argv の args[0] に束縛される**（script で顕在化・module でも `this` をトップレベルに書けば同型）。合成 init を除外し lowerUnboundThis に委譲。
 - **tests/script_scope.sh 修復 + this 電池 3 本追加**: 既存 fixture（`var Array` 再宣言等 = script の本質で必然的に ill-typed）が**型エラーゲート導入以降 refuse されて壊れていた** → exporter 案内どおり TSAOT_UNTYPED=1（untyped = 正しい JS 意味論）で修復。this === globalThis / this 経由 property write / arrow lexical の 3 ケースを expected に追加。
 - **検証**: script probe = V8 実測（vm）完全一致 / module モードは .mjs オラクル一致（this===globalThis → false・this への write は strict TypeError）を確認 / script_scope.sh PASS / conf all **340/340** / parity **DIFF=0**（KNOWN=10）/ bundler 39/39 / unit。
+
+### セッション319 続き5: conformance エッジケース追加 → delete × プロトメソッドの silent DIFF を発見・根治（修正#6）
+
+- **エッジ電池（es5_new_edge_cases.ts）**: new の引数評価順 / ctor の `return this` / `Foo.call(obj)` / prototype 非オブジェクト再代入（Object.prototype fallback・コンストラクタ性維持）/ constructor 上書きと instanceof の独立 / 複合代入 `u.x += 1` の strict throw / プリミティブへの optional chain。
+- **発見した silent DIFF（修正#6）**: `Bar.prototype.k = fn` は **FIELD + METHOD の二重格納**（動的 dispatch ブリッジ）なのに `delete p.k` は FIELD しか消さず、**読みは undefined・呼び出しは成功**という分裂（METHOD フォールバックが残骸にヒット）。`DeleteField` に optional `method`（METHOD twin id・nameIntern を get で probe = 新規採番なし）を追加し、Rust emit が `ts_delete_prop_strict(obj, TS_KEY_METHOD(m))` を追加発行。凍結双子は未知フィールドを無視（UNPORTED なし・旧バグ保持）→ **frozen_known_diffs に parity + selfconf の 2 行**（selfconf スコープ行は s317 の枠組みの初適用）。既知の限界: store より前に delete が lower される倒錯順（別関数間）では twin id 未採番で消し漏れ — 実害皆無としてコメント記録のみ。
+- **教訓**: 二重格納の名前空間ブリッジは**全ミューテーション操作で対称**でなければならない — store だけ二重・delete が片側は「読み書きで違う世界が見える」silent DIFF の温床（METHOD/FIELD ミスマッチ教訓の delete 版）。
+- **検証**: conf all **341/341** / parity **DIFF=0**（KNOWN=11）/ selfconf **337 PASS + KNOWN=1** / unit / bundler 39/39 / bench 予算内。

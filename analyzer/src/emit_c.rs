@@ -15264,16 +15264,30 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 ),
             ));
         }
-        Inst::DeleteField { dst, obj, field } => match dst {
-            // strict-mode `delete obj.x`: deleting a non-configurable property throws.
-            Some(d) => s.push_str(&ctx.set_val(
-                d.0,
-                &format!("ts_bool(ts_delete_prop_strict({}, {}))", ctx.val(obj.0), field.0),
-            )),
-            None => {
-                let _ = writeln!(s, "  ts_delete_prop_strict({}, {});", ctx.val(obj.0), field.0);
+        Inst::DeleteField { dst, obj, field, method } => {
+            match dst {
+                // strict-mode `delete obj.x`: deleting a non-configurable property throws.
+                Some(d) => s.push_str(&ctx.set_val(
+                    d.0,
+                    &format!("ts_bool(ts_delete_prop_strict({}, {}))", ctx.val(obj.0), field.0),
+                )),
+                None => {
+                    let _ = writeln!(s, "  ts_delete_prop_strict({}, {});", ctx.val(obj.0), field.0);
+                }
             }
-        },
+            // Clear the METHOD-space twin too (see escape_ir): a prototype-method
+            // store wrote both keys, and the dynamic-dispatch fallback reads the
+            // METHOD key when the FIELD key misses. The delete RESULT is the
+            // FIELD-side one (V8: true for an existing configurable property).
+            if let Some(m) = method {
+                let _ = writeln!(
+                    s,
+                    "  ts_delete_prop_strict({}, TS_KEY_METHOD({}u));",
+                    ctx.val(obj.0),
+                    m
+                );
+            }
+        }
         Inst::ArraySlice { dst, arr, start } => {
             s.push_str(&ctx.set_val(
                 dst.0,

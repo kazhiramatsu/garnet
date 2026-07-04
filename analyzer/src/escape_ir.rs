@@ -730,11 +730,18 @@ pub enum Inst {
         key: LocalId,
         src: LocalId,
     },
-    /// `delete obj.field` with a statically-known field id.
+    /// `delete obj.field` with a statically-known field id. `method` is the
+    /// METHOD-space name id when the name is also interned as a method name:
+    /// a prototype-method store writes BOTH key spaces (StoreField +
+    /// StoreMethod, the dynamic-dispatch bridge), so delete must clear both —
+    /// otherwise the METHOD-side dispatch fallback keeps resolving a deleted
+    /// method (reads saw it gone, calls still succeeded).
     DeleteField {
         dst: Option<LocalId>,
         obj: LocalId,
         field: FieldId,
+        #[serde(default)]
+        method: Option<u32>,
     },
     /// `[a, ...rest]`: rest = arr.slice(start).
     ArraySlice {

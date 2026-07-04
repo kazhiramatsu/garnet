@@ -2833,10 +2833,11 @@ fn remap_inst_operands(inst: &Inst, m: &dyn Fn(LocalId) -> LocalId) -> Inst {
             obj: m(*obj),
             key: m(*key),
         },
-        Inst::DeleteField { dst, obj, field } => Inst::DeleteField {
+        Inst::DeleteField { dst, obj, field, method } => Inst::DeleteField {
             dst: mopt(dst),
             obj: m(*obj),
             field: *field,
+            method: *method,
         },
         // calls
         Inst::Call {
