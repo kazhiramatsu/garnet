@@ -72,7 +72,7 @@ P0 足場(git済・計測) ─► P1 構造統一(exporter/ts_rt/emit_c, parity�
 
 **ゴール**: 「壊したら 1 コマンドで検知、1 コマンドで巻き戻し、1 コマンドで計測」。
 
-1. ✅ **`git init` + 初期コミット**（s315: `f29b891`、タグ `baseline-s313`、.gitignore 整備済み）。以後フェーズ完了ごとにタグ。
+1. ✅ **`git init` + 初期コミット**（s315: `c2f13b9`、タグ `baseline-s313`、.gitignore 整備済み）。以後フェーズ完了ごとにタグ。
 2. **棚卸し（残り）**: ルートゴミ・dead escape_ir・迷子 .o は s315 で削除済み。残: `scripts/lib/` へ helper 移設（mimalloc_flags / regexp_link_flags / mftest→lib/mf.sh — **mftest は bundler テストが source する load-bearing**）。`run_golden_iter.sh` は削除せず P4a でゲート編入予定としてマーク。
 3. **`scripts/gate.sh` 新設**（薄い dispatcher、既存スクリプト挙動不変）: `gate quick|full|typed|parity|conf|selfconf|bundler|unit|gc|bench|bench-correct|tsc|iter|ir-parity|selfbench|ci`。`gate ir-parity` は新実装（conformance 330 + bundler 39 + selfhost の batch export を byte 比較 — P1 exporter 分割の専用ゲート）。`gate selfbench` は selfhost ベンチ（P4b で自己完結化するまでは typed_selfhost.sh 相当）。
 4. **計測基盤**（性能側 P0）:
