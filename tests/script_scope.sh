@@ -72,14 +72,26 @@ function __scriptMix2(): number {
 var __scriptMix2 = 4;
 console.log(__scriptMix2);
 console.log(globalThis.__scriptMix2);
+
+// script top-level `this` is the global object (V8 classic-script semantics,
+// vm.runInThisContext-verified): reads compare equal, property writes land on
+// globalThis, and top-level arrows inherit it lexically.
+console.log((this as any) === globalThis);
+(this as any).__viaThis = 42;
+console.log((globalThis as any).__viaThis);
+const __arrowThis = () => this;
+console.log((__arrowThis() as any) === globalThis);
 TS
 
-node exporter/exporter.js --script "$tmp/script_scope.ts" "$tmp/program.json" "$tmp/labels.json" >/dev/null
+# Script-mode redeclarations (`var Array`, shadowing builtins) are inherently
+# ill-typed TS, so the type-error gate would refuse them; untyped mode compiles
+# with correct JS semantics (this suite predates the gate and broke under it).
+TSAOT_UNTYPED=1 node exporter/exporter.js --script "$tmp/script_scope.ts" "$tmp/program.json" "$tmp/labels.json" >/dev/null
 analyzer/target/release/tsaot "$tmp/program.json" emit > "$tmp/out.c"
 $CC "$tmp/out.c" runtime/ts_rt.c -Iruntime -lm $TSAOT_LDLIBS -o "$tmp/a.out"
 
 actual="$("$tmp/a.out" | tr '\n' '|')"
-expected='true|true|true|1|true|2|true|3|false|true|10|true|123|123|77|77|true|true|2|function 1|4|4|'
+expected='true|true|true|1|true|2|true|3|false|true|10|true|123|123|77|77|true|true|2|function 1|4|4|true|42|true|'
 
 if [[ "$actual" != "$expected" ]]; then
   echo "[script-scope] FAIL"

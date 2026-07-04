@@ -3090,3 +3090,10 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
 - **教訓**: (1) **昇格はエッジ生成イベント** — 世代不変量を変える機能は store 以外のエッジ発生源を列挙し切ってから設計する（今回で store/昇格の 2 源が完備）。(2) 症状ベースの work-list 化（「root 漏れ 4 件」）は診断を固定化する — 最小化 + バイト実測 + 時系列ログまで下りてから在庫と呼ぶ。(3) 「綺麗な undefined 化・ZAP 無反応・全ゼロバイト」は moved-from 読みでなく**未 mark 死亡 + 領域再利用**のシグネチャ（moved-from なら 0xDD）。
 - **検証（promotion barrier 込みの最終形）**: gate gc **th=1 全緑 + th=2 全緑**（各 O2+ASan+runtime）/ conf all **339/339** / gate bench **予算内** / unit / selfconf **336/336**。
 - **次**: (1) **C1 着手可能**（ASan 復旧 + C0 完了で条件充足 — identity hash 設計は s318 で確定済み）、(2) aging 既定 ON の再訪は selfhost ミルストーン計測とセット（勝ち筋データ添付済み）、(3) P2a 残り（find_prop 12.6 / intern 98.8 / ts_call env）、(4) ES5 new Tier 2（需要駆動）。
+
+### セッション319 続き4: --script モードのトップレベル this を V8 一致に（ユーザー依頼）
+
+- **lowerUnboundThis 新設**: thisLocal 未束縛の this の単一解決点 — **script × __module_init 本体 → `LoadBuiltinFn globalThis`**（V8 classic-script 意味論・vm.runInThisContext で実測検証: 比較 true・property write が globalThis に着地・トップレベル arrow も lexical 継承）/ それ以外（module トップレベル・strict 関数本体）は undefined 維持。ThisKeyword 直接 lowering と arrow lexical-this cell 格納の 2 経路を共通化。**sloppy の call-time this（素呼びで globalThis）は意図的に対象外**（常時 strict 規律）。
+- **fnUsesOwnThis の __module_init 除外（穴 1 件同時修正）**: 合成 __module_init はトップレベル this のホストで、s319 前半の fnUsesOwnThis がこれを takesThis 化すると **this が空 argv の args[0] に束縛される**（script で顕在化・module でも `this` をトップレベルに書けば同型）。合成 init を除外し lowerUnboundThis に委譲。
+- **tests/script_scope.sh 修復 + this 電池 3 本追加**: 既存 fixture（`var Array` 再宣言等 = script の本質で必然的に ill-typed）が**型エラーゲート導入以降 refuse されて壊れていた** → exporter 案内どおり TSAOT_UNTYPED=1（untyped = 正しい JS 意味論）で修復。this === globalThis / this 経由 property write / arrow lexical の 3 ケースを expected に追加。
+- **検証**: script probe = V8 実測（vm）完全一致 / module モードは .mjs オラクル一致（this===globalThis → false・this への write は strict TypeError）を確認 / script_scope.sh PASS / conf all **340/340** / parity **DIFF=0**（KNOWN=10）/ bundler 39/39 / unit。

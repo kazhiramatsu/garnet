@@ -730,6 +730,21 @@ class Exporter {
     if (sym && this.scriptGlobalVarSyms.has(sym)) return true;
     return !!name && this.scriptGlobalVarNames.has(name) && this.isAmbientGlobalSymbol(sym);
   }
+  /** `this` where no thisLocal is bound. SCRIPT top level (the __module_init
+   *  body) sees the GLOBAL OBJECT — V8 classic-script semantics (vm-verified:
+   *  `this === globalThis`, property writes land on globalThis, top-level
+   *  arrows inherit it lexically). Module top level and plain strict function
+   *  bodies stay undefined (the local's TS_UNDEFINED default). Sloppy
+   *  CALL-time this (bare `f()` seeing globalThis) is intentionally NOT
+   *  modeled — semantics stay always-strict; this covers only the top-level
+   *  lexical `this`. */
+  lowerUnboundThis(ctx: FnCtx): number {
+    const dst = this.newLocal(ctx, "reference", "this");
+    if (this.sourceMode === "script" && ctx.id === this.moduleInitId) {
+      ctx.body.push({ kind: "LoadBuiltinFn", dst, builtin: "globalThis" });
+    }
+    return dst;
+  }
   isLexicalTdzUse(node: ts.Identifier, sym: ts.Symbol | undefined): boolean {
     if (!sym || this.isAmbientGlobalSymbol(sym)) return false;
     const decl = (sym.valueDeclaration ?? sym.declarations?.[0]) as ts.Node | undefined;
@@ -3093,7 +3108,7 @@ class Exporter {
     if (ts.isIdentifier(node)) return this.lowerIdentifier(ctx, node);
     if (node.kind === ts.SyntaxKind.ThisKeyword) {
       if (ctx.thisLocal !== undefined) return ctx.thisLocal;
-      return this.newLocal(ctx, "reference", "this");
+      return this.lowerUnboundThis(ctx);
     }
     if (ts.isPropertyAccessExpression(node)) {
       if (this.isGlobalThisPropertyAccess(node, "fetch")) {
@@ -8740,7 +8755,9 @@ class Exporter {
       this.labels[site] = `thisCell@${ctx.name}`;
       this.recordSite(site, "cell", "once", true, node, true);
       ctx.body.push({ kind: "AllocObject", dst: cell, typeId: 0, site });
-      const tv = ctx.thisLocal ?? (() => { const u = this.newLocal(ctx, "reference"); ctx.body.push({ kind: "Const", dst: u, value: { kind: "Undef" } }); return u; })();
+      // lowerUnboundThis: a top-level arrow in SCRIPT mode inherits the global
+      // object as its lexical this (module top level / strict bodies: undefined).
+      const tv = ctx.thisLocal ?? this.lowerUnboundThis(ctx);
       ctx.body.push({ kind: "StoreField", obj: cell, field: this.VALUE, src: tv });
       ctx.cellAccess.set(this.lexicalThisSym, cell);
     }
@@ -9483,7 +9500,12 @@ class Exporter {
     // (funcTakesThisIds), indirect calls go through ts_call_value (runtime
     // injects undefined for takes_this callees), method dispatch and
     // ts_construct already pass the receiver at args[0].
+    // The synthesized __module_init is exempt: it hosts TOP-LEVEL `this`,
+    // which is lexical, not a dynamic function this — binding it to args[0]
+    // would read past the empty argv. lowerUnboundThis resolves it instead
+    // (script mode: the global object; module mode: undefined).
     if (!thisParam && (ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node)) &&
+        node !== (this.moduleInitNode as unknown as FnLike) &&
         this.fnUsesOwnThis(node)) {
       thisParam = true;
     }
