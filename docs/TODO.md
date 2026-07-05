@@ -1896,7 +1896,7 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   3. 最初の fallback 受理は fast path で reject している `i` flag または simple quantified pattern のどちらか一方に限定し、V8 conformance と no-RegExp gate を先に追加する。
 
 ### セッション210 DONE: QuickJS RegExp source import + optional object link
-- **tarball差分対応**: ユーザー取得の `/Users/hiramatsu/Downloads/quickjs-0.15.1.tar.gz` は QuickJS-NG-style layout で、`VERSION` と `cutils.c` は無いが、`libregexp.c` / `libunicode.c` / `cutils.h` / tables は揃っていた。`libregexp.c` と `libunicode.c` は `-I runtime/regexp/quickjs/upstream` で単体 compile PASS。
+- **tarball差分対応**: ユーザー取得の `quickjs-0.15.1.tar.gz` は QuickJS-NG-style layout で、`VERSION` と `cutils.c` は無いが、`libregexp.c` / `libunicode.c` / `cutils.h` / tables は揃っていた。`libregexp.c` と `libunicode.c` は `-I runtime/regexp/quickjs/upstream` で単体 compile PASS。
 - **vendor script修正**: `scripts/vendor_quickjs_regexp.sh` の必須条件から `VERSION` / `cutils.c` を外し、存在する場合だけ copy する optional file にした。ローカル tarball 指定時は manifest の Tarball/Source URL に実際の basename/path を記録するよう修正。
 - **source import完了**: `runtime/regexp/quickjs/upstream/` に `LICENSE`、`cutils.h`、`libregexp.c/h`、`libregexp-opcode.h`、`libunicode.c/h`、`libunicode-table.h`、`list.h` を取り込み、`runtime/regexp/quickjs/IMPORT.md` に version `0.15.1` と SHA-256 を記録した。
 - **optional link拡張**: `scripts/regexp_link_flags.sh` が vendored source を検出した場合、`TSAOT_NEEDS_REGEXP` marker のある generated C に限って `ts_regexp_adapter.o` に加え `libunicode.o` / `libregexp.o`（`cutils.c` がある場合は `cutils.o` も）を compile/link するようにした。adapter には QuickJS が要求する `lre_realloc` / `lre_check_timeout` / `lre_check_stack_overflow` の最小 embedder callbacks を追加。

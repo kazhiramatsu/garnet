@@ -1,10 +1,14 @@
-# tsaot — an AOT TypeScript→C compiler that exploits static analysis
+# garnet — an AOT TypeScript→C compiler that exploits static analysis
 
-tsaot compiles a typed subset of TypeScript ahead-of-time to C (and then to a
+garnet compiles a typed subset of TypeScript ahead-of-time to C (and then to a
 native binary), using **type + escape + devirtualization analysis** to erase work
 that V8 must do at runtime. On typed integer kernels it beats warmed V8; on
 startup it wins by ~18x. It is *not* a general JS engine — dynamic/`any` code
 falls back to a small NaN-boxing runtime (`ts_rt`) and is not the fast path.
+
+> **Naming:** the project is **garnet**; its cargo binary and internal identifiers
+> are still `tsaot` (the former name) — e.g. `analyzer/target/release/tsaot`.
+> The source-level rename is deferred, so the commands below invoke `tsaot`.
 
 ## Pipeline
 ```

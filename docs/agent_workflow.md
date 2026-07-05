@@ -78,7 +78,7 @@ Compare many categories against node in one shot and pick out only the DIFF line
 
 ```bash
 #!/usr/bin/env bash
-ROOT=/Users/hiramatsu/dev/garnet; W=/tmp/hunt; mkdir -p "$W"
+ROOT=$(git rev-parse --show-toplevel); W=/tmp/hunt; mkdir -p "$W"
 run(){ echo "$2" > "$W/t.ts"
   node -e 'const ts=require("'"$ROOT"'/exporter/node_modules/typescript"),fs=require("fs");
     fs.writeFileSync("'"$W"'/t.mjs",ts.transpileModule(fs.readFileSync("'"$W"'/t.ts","utf8"),

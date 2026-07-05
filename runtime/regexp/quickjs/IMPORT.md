@@ -2,7 +2,7 @@
 
 - Version: 0.15.1
 - Tarball: quickjs-0.15.1.tar.gz
-- Source URL: local:/Users/hiramatsu/Downloads/quickjs-0.15.1.tar.gz
+- Source: QuickJS-NG 0.15.1 — https://github.com/quickjs-ng/quickjs (release tarball quickjs-0.15.1.tar.gz)
 - SHA-256: c4e813951b7c46845096a948e978c620b11ab4cf5fd622ca09c727ec31f42623
 - Imported files:
   - LICENSE
