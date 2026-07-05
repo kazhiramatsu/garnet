@@ -75,6 +75,17 @@ function main(): void {
   console.log(1 / Math.trunc(-0.2)); // -Infinity
   console.log(Math.round(0.5), Math.round(2.5), Math.round(-2.5), Math.round(-0.6)); // 1 3 -2 -1
 
+  // Math.min/max carry the SIGNED zero tie (ECMA-262 21.3.2.24/25): min prefers
+  // -0, max prefers +0, regardless of argument order. C's < / > treat -0 == +0.
+  console.log(1 / Math.min(-0, 0)); // -Infinity
+  console.log(1 / Math.min(0, -0)); // -Infinity
+  console.log(1 / Math.max(-0, 0)); // Infinity
+  console.log(1 / Math.max(0, -0)); // Infinity
+  console.log(Object.is(Math.min(-0, 0, 5), -0)); // true
+  console.log(Object.is(Math.max(-0, 0, -5), 0)); // true
+  console.log(1 / Math.min(...[-0, 0]), 1 / Math.max(...[0, -0])); // -Infinity Infinity
+  console.log(Math.min(3, 1, 2), Math.max(3, 1, 2)); // 1 3  (ordinary unaffected)
+
   // regression: ordinary +0 / integers unaffected
   console.log(0); // 0
   console.log(Object.is(0, 0)); // true

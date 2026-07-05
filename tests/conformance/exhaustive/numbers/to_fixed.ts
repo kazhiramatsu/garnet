@@ -13,6 +13,12 @@ function main(): void {
   console.log((0.125).toFixed(2), (0.375).toFixed(2)); // 0.13 0.38 (exact ties -> away)
   console.log((123456.789).toFixed(2));              // 123456.79
   console.log((-1.45).toFixed(1));                   // -1.4
+  // sign of zero: -0 is NOT < 0, so it drops the sign; a genuinely-negative
+  // value keeps its sign even when it rounds to zero (ECMA-262 21.1.3.3).
+  console.log((-0).toFixed(2), (-0).toFixed(0));            // 0.00 0
+  console.log((-0.0001).toFixed(2), (-0.001).toFixed(2));  // -0.00 -0.00
+  console.log((-0.004).toFixed(2), (-0.005).toFixed(2));   // -0.00 -0.01
+  console.log((0).toFixed(2), (0.0001).toFixed(2));        // 0.00 0.00
 }
 
 main();

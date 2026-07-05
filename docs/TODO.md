@@ -3139,3 +3139,11 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
 - **検証**: 新 conformance `closures/loop_body_capture.ts`（for-c/while/do-while/for-of/for-in・self-compose・nested loop・nested block・脱出/非脱出）が **V8 完全一致**。conf all **342/342** / unit / bundler **39/39** / gate gc **PASSED** / bench 予算内 / selfconf **DIFF=0**。**脱出ケース**（クロージャを return）も Rust/凍結とも正しく Heap 昇格（1,101,201）。
 - **parity**: emitc_diff で新 fixture のみ **Stack↔FrameArena の注釈差**（凍結は determinable→Stack、Rust は FrameArena・**両出力 V8 一致**・挙動同一）。既存 `forof_loop_capture`（L20）と同種の良性差分なので `frozen_known_diffs.tsv` に allowlist 行追加（修正#7）→ **DIFF=0 KNOWN=12**。
 - **教訓**: (1) **per-iteration 束縛はループ「頭」だけでなく「本体全体」に効く** — for-of ループ変数だけ直して本体宣言を見落としていた（既存機構の適用範囲の穴）。(2) 症状は SIGSEGV（loud）だが正体は cell 共有の silent aliasing で、**自己参照クロージャで初めて無限再帰として顕在化**した — 「escape する captured loop-body const」を最小再現に選ぶと決定的。(3) **cell の local 再利用 + 反復先頭 fresh AllocObject** で per-iteration 意味論を安く実現（cellAccess 上書き不要）。
+
+### セッション320 続き2: V8 差分ハント — 符号付きゼロ(-0)の2バグ根治（toFixed / Math.min・max）
+
+- **ハント**: 多カテゴリ差分プローブ（数値整形・文字列・配列・coercion・Math）を V8 と一括比較。REJECT 群は ill-typed TS（loose coercion）で非バグ。2件の実 DIFF を捕捉。
+- **バグ1: `(-0).toFixed(2)` = "-0.00"（V8 は "0.00"）**。`neg=x<0` は -0 で正しく false だが、`ax = neg?-x:x` で ax=-0.0 のまま `%f` に渡り printf が "-0.000..." を出力→その `'-'` が整数桁として kept に混入。修正=`ax=fabs(x)`（-0→+0・他は等価）。**併せて発見: `(-0.0001).toFixed(2)` = "-0.00"（0 に丸まる負値は符号維持・ECMA 21.1.3.3）** を allzero 抑制が誤って消していた→抑制撤去し `if(neg)` のみに（-0 は neg=false なので符号なし・-0.0001 は neg=true で符号維持、両立）。
+- **バグ2: `Math.min(-0, 0)` = 0（V8 は -0）**。C の `a<b` は -0==+0 扱いなのでゼロタイの符号が引数順依存。修正=`ts_math_min2`/`max2` にゼロタイの符号処理（min は -0 優先、max は +0 優先・ECMA 21.3.2.24/25）。array 版（min_arr/max_arr）も同バグ（`x<m`/`x>m` が等値で更新せず）→2-arg 版で畳むよう書換（NaN 汚染も正しく伝播）。
+- **検証**: 既存 conformance `numbers/to_fixed.ts`・`numbers/negative_zero.ts` に該当ケース追記（-0/genuinely-negative-rounds-to-zero、Math.min/max の -0 タイ・array・混在）→ V8 一致。conf all **342/342** / unit / gate gc **PASSED** / bundler **39/39** / bench 予算内。runtime のみの変更（emitted C 不変＝parity 無関係）。
+- **教訓**: (1) **-0 は「符号ビット」と「`<0` 判定」で挙動が分岐する** — toFixed は `<0`（-0 は非負扱い＝符号なし）、Math.min のタイは符号ビット（-0 優先）。両者を混同しない。(2) `%f`/printf は -0 を "-0" と印字するので、絶対値経路には fabs を通して符号漏れを断つ。(3) 既存の -0 conformance が広範でも「特定 API の -0 経路」（toFixed・Math.min）は個別に網羅が要る＝プローブで穴が出る。

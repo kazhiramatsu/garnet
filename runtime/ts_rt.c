@@ -3086,7 +3086,7 @@ tsv ts_number_to_fixed(tsv numv, double digits){
   if (x == -1.0/0.0) return ts_new_string("-Infinity",9);
   /* |x| >= 1e21: JS toFixed falls back to Number->String (exponential). */
   if (fabs(x) >= 1e21){ char b[64]; ts_fmt_num(x, b, sizeof b); return ts_new_string(b,(uint32_t)strlen(b)); }
-  int neg = x < 0; double ax = neg ? -x : x;
+  int neg = x < 0; double ax = fabs(x);   /* fabs so -0 -> +0: `%f` would print -0 as "-0" and leak the sign */
   /* Round half away from zero based on the EXACT decimal value: scaling by 10^d
      in floating point is lossy (e.g. 1.45*10 drifts to a tie), so instead print
      the exact expansion with guard digits and round the d-th digit by hand. */
@@ -3108,7 +3108,10 @@ tsv ts_number_to_fixed(tsv numv, double digits){
   /* assemble: last d digits are fractional. */
   char out[440]; int o = 0;
   int ilen = klen - d;             /* integer-part length within kept */
-  if (neg){ int allzero = 1; for (int i = 0; i < klen; i++) if (kept[i] != '0'){ allzero = 0; break; } if (!allzero) out[o++] = '-'; }
+  /* `neg` is x<0 (false for -0), so a genuinely-negative value keeps its sign
+     even when it rounds to zero — V8: (-0.0001).toFixed(2) === "-0.00", but
+     (-0).toFixed(2) === "0.00". `ax=fabs(x)` above kept the sign out of `kept`. */
+  if (neg) out[o++] = '-';
   for (int i = 0; i < ilen; i++) out[o++] = kept[i];
   if (d > 0){ out[o++] = '.'; for (int i = ilen; i < klen; i++) out[o++] = kept[i]; }
   out[o] = 0;
@@ -4189,8 +4192,20 @@ double ts_math_round(double x){
 }
 double ts_math_sign(double x){ if (x>0) return 1; if (x<0) return -1; return x; /* +-0 or NaN */ }
 double ts_math_trunc(double x){ return trunc(x); }
-double ts_math_max2(double a, double b){ if (a!=a||b!=b) return NAN; return a>b?a:b; }
-double ts_math_min2(double a, double b){ if (a!=a||b!=b) return NAN; return a<b?a:b; }
+/* Math.max/min: NaN poisons; and the ZERO tie is signed — Math.max(-0,+0)=+0,
+   Math.min(-0,+0)=-0 (ECMA-262 21.3.2.24/25). C's a>b/a<b treat -0 and +0 as
+   equal, so the tie needs explicit sign handling or the result's sign follows
+   argument order. */
+double ts_math_max2(double a, double b){
+  if (a!=a||b!=b) return NAN;
+  if (a==b){ if (a==0.0) return (signbit(a) && signbit(b)) ? -0.0 : 0.0; return a; }
+  return a>b?a:b;
+}
+double ts_math_min2(double a, double b){
+  if (a!=a||b!=b) return NAN;
+  if (a==b){ if (a==0.0) return (signbit(a) || signbit(b)) ? -0.0 : 0.0; return a; }
+  return a<b?a:b;
+}
 double ts_math_cbrt(double x){
   /* glibc's cbrt is not correctly rounded (cbrt(27) -> 3.0000000000000004),
      while V8 returns the correctly-rounded result. One Newton step toward
@@ -4287,13 +4302,13 @@ double ts_math_hypot2(double a, double b){ return hypot(a,b); }
 /* Array-argument forms for Math.max/min/hypot(...spread). Each element is
    ToNumber-coerced; max/min propagate NaN. Identity: -Inf / +Inf / 0. */
 double ts_math_max_arr(tsv arr){
-  ts_array* a=as_arr(arr); double m=-1.0/0.0;
-  if(a) for(uint32_t i=0;i<a->len;i++){ double x=ts_number_coerce(a->data[i]); if(x!=x) return NAN; if(x>m) m=x; }
+  ts_array* a=as_arr(arr); double m=-1.0/0.0;   /* -Infinity: identity for max */
+  if(a) for(uint32_t i=0;i<a->len;i++){ m=ts_math_max2(m, ts_number_coerce(a->data[i])); }
   return m;
 }
 double ts_math_min_arr(tsv arr){
-  ts_array* a=as_arr(arr); double m=1.0/0.0;
-  if(a) for(uint32_t i=0;i<a->len;i++){ double x=ts_number_coerce(a->data[i]); if(x!=x) return NAN; if(x<m) m=x; }
+  ts_array* a=as_arr(arr); double m=1.0/0.0;    /* +Infinity: identity for min */
+  if(a) for(uint32_t i=0;i<a->len;i++){ m=ts_math_min2(m, ts_number_coerce(a->data[i])); }
   return m;
 }
 double ts_math_hypot_arr(tsv arr){
