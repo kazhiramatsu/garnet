@@ -18,6 +18,7 @@
 # 修正#3 = s317 SROA 非インライン callee のレシーバ/引数 drop / #4 = s317 ループ逆辺 copy-alias
 parity	classes/sroa_contained_escape	修正#1: 凍結側は contained ループ alloc を sobj スタック化
 parity	closures/forof_loop_capture	修正#1: site 14 Stack→FrameArena（注釈コメントのみの差）
+parity	closures/loop_body_capture	修正#7: ループ本体宣言の per-iteration capture cell。凍結側は determinable→Stack、Rust は FrameArena（forof_loop_capture と同種・注釈コメントのみの差・両出力 V8 一致）
 parity	classes/sroa_narrowed_nullable_reads	修正#2a/2b
 parity	classes/sroa_try_body_uses	修正#2c（+ 数値スカラ型の随伴差 long long↔double）
 parity	classes/method_early_return	修正#3: 凍結側は非 tail return callee のレシーバ未使用 alloc を除去（無害形）・修正済み Rust は保持

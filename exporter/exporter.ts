@@ -223,6 +223,12 @@ function isFunctionLike(n: ts.Node): boolean {
     ts.isSetAccessorDeclaration(n)
   );
 }
+function isLoopStatement(n: ts.Node): boolean {
+  return (
+    ts.isForStatement(n) || ts.isForOfStatement(n) || ts.isForInStatement(n) ||
+    ts.isWhileStatement(n) || ts.isDoStatement(n)
+  );
+}
 type FnLike = ts.FunctionDeclaration | ts.FunctionExpression | ts.ArrowFunction;
 function isLiftable(n: ts.Node): n is FnLike {
   return ts.isFunctionDeclaration(n) || ts.isFunctionExpression(n) || ts.isArrowFunction(n);
@@ -8014,6 +8020,50 @@ class Exporter {
     return cells;
   }
 
+  /** Captured let/const bindings whose fresh-per-iteration cell THIS loop owns:
+   *  those declared lexically in the loop `body`, not crossing into a nested
+   *  function (its own scope) nor a nested loop (which reallocates its own body
+   *  cells). Per JS §14.7.4 CreatePerIterationEnvironment, every iteration is a
+   *  fresh lexical environment for the WHOLE body — not just the loop head — so a
+   *  `const`/`let` declared in the body and captured by a closure must get a
+   *  fresh cell each iteration, or escaping closures from different iterations
+   *  alias one cell (observed as a self-referential closure -> infinite
+   *  recursion when the body does `const prev = acc; acc = () => prev(...)`). */
+  private collectLoopBodyCapturedSyms(body: ts.Statement): ts.Symbol[] {
+    const out: ts.Symbol[] = [];
+    const seen = new Set<ts.Symbol>();
+    const visit = (n: ts.Node) => {
+      if (isFunctionLike(n)) return;                 // nested fn: own per-call scope
+      if (n !== body && isLoopStatement(n)) return;  // nested loop: owns its body cells
+      if (ts.isVariableDeclaration(n) && ts.isVariableDeclarationList(n.parent) &&
+          (n.parent.flags & (ts.NodeFlags.Let | ts.NodeFlags.Const)) !== 0) {
+        for (const s of this.collectCapturedBindingSyms(n.name)) {
+          if (!seen.has(s)) { seen.add(s); out.push(s); }
+        }
+      }
+      ts.forEachChild(n, visit);
+    };
+    visit(body);
+    return out;
+  }
+
+  /** At the top of a loop-body iteration, allocate a FRESH cell for each captured
+   *  binding this loop's body declares (see collectLoopBodyCapturedSyms). Reuses
+   *  the binding's existing cell LOCAL (the prologue-allocated one, already in
+   *  cellAccess), rebinding it to a fresh object each iteration; closures created
+   *  in the iteration capture that iteration's object. Emitted once into the
+   *  captured loop-body template (which the Loop op replays each iteration). */
+  private emitPerIterationBodyCells(ctx: FnCtx, body: ts.Statement): void {
+    for (const sym of this.collectLoopBodyCapturedSyms(body)) {
+      const cellLocal = ctx.cellAccess.get(sym);
+      if (cellLocal === undefined) continue;   // no cell (non-captured) — nothing to refresh
+      const perSite = this.site++;
+      this.labels[perSite] = `cell:${(sym as any).name ?? "v"}@loopbody`;
+      this.recordSite(perSite, "cell", "many", true, body, true);
+      ctx.body.push({ kind: "AllocObject", dst: cellLocal, typeId: 0, site: perSite });
+    }
+  }
+
   /** Bind a for-of/for-await loop variable from its declaration (or a fresh
    *  local for non-simple binding). */
   private bindForVar(ctx: FnCtx, init: ts.ForInitializer): number {
@@ -8116,6 +8166,7 @@ class Exporter {
         ctx.body.push({ kind: "StoreField", obj: captureCells[0].cell, field: this.VALUE, src: varLocal });
       }
       if (destructurePat) this.lowerBindingPattern(ctx, destructurePat, varLocal);
+      this.emitPerIterationBodyCells(ctx, statement);
       this.lowerStmt(ctx, statement);
       if (iterIsString) this.emitStringIteratorAdvance(ctx, idx, cp);
       else this.emitIndexStep(ctx, idx, 1);
@@ -8229,6 +8280,7 @@ class Exporter {
           ctx.body.push({ kind: "StoreField", obj: captureCells[0].cell, field: this.VALUE, src: loopVar });
         }
         if (destructurePat) this.lowerBindingPattern(ctx, destructurePat, loopVar);
+        this.emitPerIterationBodyCells(ctx, body);
         this.lowerStmt(ctx, body);
       });
       ctx.body.push({ kind: "Loop", cond, condBody, body: loopBody });
@@ -9016,6 +9068,7 @@ class Exporter {
         // continue jumps to cond_body where the update is — so a real C continue
         // is correct. Use the "forc" loop kind we already wired up.
         const bodyB = this.captureLoopBody(ctx, "forc", () => {
+          this.emitPerIterationBodyCells(ctx, stmt.statement);
           this.lowerStmt(ctx, stmt.statement);
         });
         ctx.body.push({ kind: "Loop", cond: condLocal, condBody, body: bodyB });
@@ -9056,6 +9109,7 @@ class Exporter {
       });
       // loop kind "forc" => continue is a real C continue (advance is in cond_body).
       const bodyB = this.captureLoopBody(ctx, stmt.incrementor ? "forc" : "for", () => {
+        this.emitPerIterationBodyCells(ctx, stmt.statement);
         this.lowerStmt(ctx, stmt.statement);
         if (!stmt.incrementor) { /* no update */ }
       });
@@ -9063,7 +9117,10 @@ class Exporter {
     } else if (ts.isWhileStatement(stmt)) {
       let condLocal = -1;
       const condBody = this.captureBody(ctx, () => { condLocal = this.lowerExpr(ctx, stmt.expression); });
-      const bodyB = this.captureLoopBody(ctx, "while", () => this.lowerStmt(ctx, stmt.statement));
+      const bodyB = this.captureLoopBody(ctx, "while", () => {
+        this.emitPerIterationBodyCells(ctx, stmt.statement);
+        this.lowerStmt(ctx, stmt.statement);
+      });
       ctx.body.push({ kind: "Loop", cond: condLocal, condBody, body: bodyB });
     } else if (false && ts.isForStatement(stmt)) {
       // (superseded by the Loop-emitting branch above)
@@ -9090,7 +9147,10 @@ class Exporter {
         ctx.body.push({ kind: "If", cond: first, thenBody: setTrue, elseBody: evalCond });
         ctx.body.push({ kind: "Const", dst: first, value: { kind: "Num", value: 0 } });
       });
-      const bodyB = this.captureLoopBody(ctx, "while", () => this.lowerStmt(ctx, stmt.statement));
+      const bodyB = this.captureLoopBody(ctx, "while", () => {
+        this.emitPerIterationBodyCells(ctx, stmt.statement);
+        this.lowerStmt(ctx, stmt.statement);
+      });
       ctx.body.push({ kind: "Loop", cond: condLocal, condBody, body: bodyB });
     } else if (ts.isSwitchStatement(stmt)) {
       // switch(e){...} with full fall-through semantics. Modeled in two parts:
@@ -9296,6 +9356,7 @@ class Exporter {
       });
       const bodyB = this.captureLoopBody(ctx, "forof", () => {
         ctx.body.push({ kind: "LoadIndex", dst: varLocal, arr: keys, index: idx });
+        this.emitPerIterationBodyCells(ctx, stmt.statement);
         this.lowerStmt(ctx, stmt.statement);
         const one = this.newLocal(ctx, "primitive");
         ctx.body.push({ kind: "Const", dst: one, value: { kind: "Num", value: 1 } });
