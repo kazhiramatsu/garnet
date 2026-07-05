@@ -38,16 +38,34 @@ docs/        design notes per component + ci_procedure.md + bench_results.md.
 ```
 
 ## Quick start
+
+Prerequisites: **Node.js** (with npm), **Rust** (cargo), and a **C compiler** (`cc` / `gcc` / clang).
+
 ```bash
-# build analyzer
-cd analyzer && cargo build --release && cd ..
-# build exporter
-cd exporter && npm install && cd ..
-# run the full CI gate (build + runtime tests + unit tests + benchmarks)
+# 1. build everything in one shot: exporter deps + tsc, analyzer (cargo), runtime object
+bash scripts/setup.sh
+
+# 2. smoke-test the toolchain end to end
+printf 'console.log("hello, garnet " + [1,2,3].reduce((a,b)=>a+b,0));\n' > /tmp/hello.ts
+./garnet -o /tmp/hello.c /tmp/hello.ts   # exporter → analyzer → cc
+/tmp/hello                               # → hello, garnet 6
+
+# 3. (optional) run the full CI gate: build + runtime tests + unit tests + benchmarks
 bash scripts/ci.sh
 ```
 
-## Compile one TS file by hand
+## Compile one TS file
+
+The `./garnet` driver runs the whole pipeline (exporter → analyzer → cc) in one step:
+```bash
+./garnet foo.ts              # emit foo.c and build the native `foo` (then run ./foo)
+./garnet -c foo.ts           # emit the C only (skip compile/link)
+./garnet -S foo.ts           # write the generated C to stdout
+./garnet --untyped foo.ts    # compile everything as `any` (JS semantics, no type-driven opt)
+```
+Key env vars: `TSAOT_CC` (default `cc -O2`), `TSAOT_ANALYZER=rust|ts|native`; see `./garnet --help`.
+
+Under the hood it is a three-stage pipeline you can also drive by hand:
 ```bash
 cd exporter
 node exporter.js ../benchmarks/int_kernel.ts /tmp/p.json /tmp/l.json
