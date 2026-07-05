@@ -39,7 +39,7 @@ Over 313 sessions we reached the typed selfhost fixpoint via a faithful port fro
 ## Two-Tier Verification Structure (maintained with roles reversed)
 
 - **Behavior-preserving changes to Rust** (pure moves, analysis caching, worklist-ization) → `emitc_diff.sh` (byte-parity 327/327 against the frozen analyzer_ts) mechanically proves equivalence. **The detector is symmetric, so the same script works as-is even with the oracle's direction reversed**
-- **Changes that alter the IR/output C** → V8 diff (conformance 327 + bundler 39 + golden_iter 96 + tsc-subset + selfhost family) for semantics, bench budget for performance
+- **Changes that alter the IR/output C** → V8 diff (conformance 327 + bundler 39 + golden_iter 48 + tsc-subset + selfhost family) for semantics, bench budget for performance
 - **Runtime-only changes** (ts_rt.c) → the emitted C is unchanged, so parity is irrelevant. Verified by conformance + unit + GC stress + bench (**can be done even before graduation = the key that lets P2a be pulled forward**)
 - **exporter lowering changes** keep parity because both Rust and the frozen TS consume the same IR (the rationale for doing switch flattening before graduation). However, **adding a new IR instruction is limited to after graduation because the frozen TS loud-rejects it as UnknownInst** (P2c does the flattening with existing instructions)
 
@@ -59,7 +59,7 @@ P0 scaffolding(git done, measure) ─► P1 structural unification(exporter/ts_r
 | P0 | Scaffolding (git ✅ / gate unification / remaining inventory / measurement infrastructure / baseline) | 1–2 sessions left |
 | P1 | Structural unification: split exporter.ts / ts_rt.c / emit_c.rs (parity lock) | 6–9 |
 | P2 | Compiler speedup I: runtime + Rust analysis algorithm + switch flattening + parallel cc | 4–6 |
-| P3 | Make the driver default to Rust | 1 |
+| P3 | Make the driver default to Rust ✅ (done s318) | 1 |
 | P4 | parity graduation: oracle extension → selfhost bench self-containment → gate flip + generated-C slimming | 2–3 |
 | P5 | silent bug eradication: 2^53 / depth family / label quirk / loud audit (Rust + runtime) | 2–3 |
 | P6 | Execution performance: shapes+PIC / interning / StringBuilder / GC / call ABI | 5–7 |
@@ -171,7 +171,7 @@ Verification: conf + unit + `run_gc_stress.sh` + bench + RT_STATS before/after d
 **Strict order: 4a (oracle extension) → 4c (flip)**. Widen the detection net before losing the ultra-high-sensitivity detector that is parity. Rust is not retired (main implementation). analyzer_ts is not retired either (frozen bench).
 
 ### 4a. Oracle extension
-- Re-wire `run_golden_iter.sh` (96 fixtures) to go through the driver and make `gate iter` permanent. Promote `run_tsc_conformance.sh` to a pass-list gate.
+- Re-wire `run_golden_iter.sh` (48 fixtures) to go through the driver and make `gate iter` permanent. Promote `run_tsc_conformance.sh` to a pass-list gate.
 - **Add the known-fail fixtures first** that trip the bugs fixed in P5 (2^53-crossing +/-, huge switch, deep JSON, deep recursive stringify).
 
 ### 4b. Self-containment of the selfhost bench (independent of Rust evolution)

@@ -175,7 +175,7 @@ eliminating the handle-issuance cost (which today every alloc bears) and the han
 
 **Premises to clear in C0 (entry conditions)**:
 1. **ASan recovery is required** (a CLT update or a real homebrew GCC. C1 is frozen until the startup deadlock discovered
-   in s316 is resolved. **Reconfirmed in s318: still CLT 17.0.0; even `int main(){}` still deadlocks**).
+   in s316 is resolved. **Reconfirmed in s318: still clang 17.0.0; even `int main(){}` still deadlocks**).
    `TSAOT_GC_ZAP` was **introduced in s318** (fills moved-from / dead cell bodies with 0xDD, env-gated, GC cold path only;
    the gate gc ZAP row and the worst-case combined probe (minor=1 × forced full × pin) are green).
    Remaining: a **full conformance-fixture run** with ZAP + threshold=1 (to clear out the C0 root-leak inventory;

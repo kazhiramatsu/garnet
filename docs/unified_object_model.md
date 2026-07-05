@@ -1,5 +1,7 @@
 # Unified Object Model Design
 
+> **Status (design vs shipped).** §1–§10 below capture the design as of the start of this work. Units U-1–U-6 have since shipped (see the Implementation log at the end of this document), confirmed in the code. Where §1 "Current State" or §10 "current state" differ from the log/code, **the log and the code are authoritative**; the specific stale spots are corrected inline below.
+
 ## 0. Motivation and Policy (Kaz)
 
 In JS semantics, **every object** (plain object / class instance / Array / Map / Set /
@@ -34,9 +36,11 @@ proto + prop-map.
 | Set (`ts_set_t`) | ✗ | ✗ | `{h, elems, len, cap}` |
 | Promise / Coro / Accessor | ✗ | ✗ | Internal values. Users are unlikely to attach properties, but they should still have a proto |
 
-The recent memory-safety guard (early return in `ts_get`/`ts_set` when `kind != TS_KIND_OBJECT`) is a
-stopgap to prevent the heap-overflow from reading a `ts_array` as a `ts_object`. It can be removed once this
-design is complete.
+> **Shipped update:** the ✗ cells above are the pre-implementation starting state. Array/Function/Map/Set now embed `ts_obj_common` as their first member (proto + lazy prop-map) — see `runtime/ts_rt.h` and Implementation log U-2/U-3/U-5.
+
+The (former) memory-safety guard was an early return in `ts_get`/`ts_set` when `kind != TS_KIND_OBJECT`, a
+stopgap to prevent the heap-overflow from reading a `ts_array` as a `ts_object`. It has since been removed —
+the classification is now `kind_has_common_header()` / `ts_is_propbag()` (`runtime/ts_rt.c`), per Implementation log U-5.
 
 ## 2. Existing detection of "factors that break optimization" (assets to reuse/extend)
 
@@ -206,9 +210,9 @@ Because in this design every object has a proto, steps 1–2 of `new` can be exp
   ctor body per §3.5 case A).
 - step 4: **If the constructor's return value is an object, use it as the value of `new`.**
 
-### tsaot's current state and the discrepancy (needs fixing; confirmed by measurement)
-The current `new C()` lowering is AllocObject → Call(ctor, recv=inst) → return the instance, and **does not
-implement step 4** (it discards the ctor's return value). Verification:
+### tsaot's current state and the discrepancy (historical — since fixed via `ts_construct_result`; see Implementation log U-6)
+At the time of writing, the `new C()` lowering was AllocObject → Call(ctor, recv=inst) → return the instance, and **did not
+implement step 4** (it discarded the ctor's return value). *(This has since been fixed — the `ConstructResult` IR / `ts_construct_result` runtime helper implements new step 4.)* Verification:
 - `class A { constructor(){ this.x=1; return {x:99}; } }` → V8 gives `new A().x === 99` (the returned
   object), but tsaot discards the ctor return value and uses the instance (and moreover the current codegen
   breaks and emits `v2 undeclared`). `constructor-returns-value` only marks it unstable and is otherwise

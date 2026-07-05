@@ -148,7 +148,7 @@ Principle: **measurement over theory**. Minimal reproduction → a probe that pi
 | What's being worked on now / recent decisions | **The end** of `docs/TODO.md` (in session-number order; the single source of truth) |
 | Design intent by feature | `docs/*_design.md` (classes / generators / exceptions / async / capture_lowering …) |
 | The overall GC plan and current status | `docs/gc_moving_plan.md`; the Rust migration plan `docs/refactor_master_plan.md` |
-| Runtime implementation (stdlib / GC / boxing) | `runtime/ts_rt.c` (440KB, one file); `runtime/ts_rt.h` (types, inline, NaN-box macros) |
+| Runtime implementation (stdlib / GC / boxing) | `runtime/ts_rt.c` (~446KB, one file); `runtime/ts_rt.h` (types, inline, NaN-box macros) |
 | The implementation of a given JS API | `grep -nE "ts_<name>\|\"<method>\"" runtime/ts_rt.c` |
 | Number/string/coercion conversions | `ts_number_coerce` / `ts_to_num` (raw-bit reinterpretation) / `ts_str_*` / `ts_math_*2` |
 | IR→C emission | `analyzer/src/emit_c.rs`; the alloc strategy is in `analyzer/src/codegen.rs` (`decide`) |

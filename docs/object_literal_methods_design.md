@@ -90,7 +90,7 @@ same string gets a different ID in each. codegen's Method callee only carries th
 to a field-key lookup, it needs that name's field-id.
 **Approach**: when the exporter builds a Method callee, **also internally intern that name's field-id
 and give the Method callee a `method_field: FieldId`** (looking up the same string via internField).
-codegen tries `TS_KEY_METHOD(method_id)` and falls back to `<field_id>`.
+codegen tries the own `<field_id>` first and falls back to `TS_KEY_METHOD(method_id)` (own→prototype; see the §2.2 correction).
 - Add `method_field: Option<FieldId>` to the IR's `CalleeRef::Method` (backward compatible: existing ones are None).
 - Set it at the exporter's 2 Method-callee construction sites (1176-1192) by also calling `internField(name)`.
 - escape/devirt pass through untouched (this is extra callee metadata; the operand count is unchanged).
@@ -106,7 +106,7 @@ Reuse what the defineProperty method-shorthand implementation already establishe
 ## 3. Stages
 
 - **Stage 1 (method `{ g(){} }`)**: storage (StoreField, field-key, this-bound closure) +
-  call fallback (method-key→field-key) + adding CalleeRef::Method.method_field.
+  call fallback (field-key→method-key; own→prototype per §2.2) + adding CalleeRef::Method.method_field.
 - **Stage 2 (get/set accessor)**: reuse the existing ts_define_accessor_attr, store with enumerable=1.
   Reading `o.x` uses ts_get's accessor-invocation path (implemented); `o.x=v` uses ts_set's setter path (implemented).
 
@@ -114,9 +114,10 @@ Each stage: full CI green (conf/ci_fast/unit/correct1,2/perf). perf-neutral is m
 
 ## 4. Risks
 
-- **perf of the method-key→field-key fallback**: adds 1 ts_get to the dynamic method call. But on a hit
-  (class instance) it returns on the 1st lookup, so there is no added cost; only on a miss does the 2nd
-  lookup happen. The hot path (class methods) is unchanged. Verified with obj_kernel.
+- **perf of the field-key→method-key fallback**: the dynamic method call reads the own property (`<field_id>`)
+  first and falls back to the prototype method-key on a miss, so a prototype method resolves on the 2nd lookup.
+  This does not regress the hot path — class-method calls go through static/devirtualized dispatch, not this
+  dynamic fallback — so only genuinely dynamic receivers pay the extra lookup. Verified with obj_kernel.
 - **enumerable**: object-literal methods/accessors are enumerated (V8-conformant). Class methods are
   non-enumerable (prototype). It is correct that the two behave differently.
 - **existing `{g: fn}` properties**: the §2.2 fallback makes `o.g()` work for the first time (a secondary improvement).

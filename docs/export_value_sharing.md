@@ -130,7 +130,7 @@ types** lets lowering and the verifier judge correctly.
 
 ### 3.1 Extending `Binding`
 
-Add a kind to the existing `Binding` struct (around `escape_ir.rs:319`):
+Add a kind to the existing `Binding` struct (around `escape_ir.rs:391`):
 
 ```rust
 pub struct Binding {
@@ -169,7 +169,7 @@ The CJS-oriented variants (`CjsModuleExports` / `CjsImport`) are **not included*
 
 ### 3.2 Extending `RefKind` (value classification)
 
-The existing `RefKind` (`exporter.ts:23`):
+The existing `RefKind` (`exporter.ts:24`):
 
 ```ts
 type RefKind = "reference" | "primitive" | "unknown";

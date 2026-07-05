@@ -1,6 +1,6 @@
 # Property Model Redesign — Design Document (Draft for Agreement)
 
-Status: PROPOSAL (pre-implementation, awaiting agreement)
+Status: IMPLEMENTED — Stages A–E + C0 shipped (see the §9 implementation log; verified in the code). Remaining as separate tasks: PIC, user-Symbol values, array prop-map.
 Author: tsaot
 Related: object_prototype_design.md, accessor_props_design.md, coerce_design.md
 
@@ -194,7 +194,7 @@ PropertyKey (tsaot):
   └─ Symbol(SymbolId)   // named symbol key. runtime-assigned, independent 32bit. well-known are also reserved ids in the Symbol space.
 ```
 
-The physical representation is finalized as a **64-bit tagged key** (`ts_key = uint64_t`):
+The **target** physical representation is a **64-bit tagged key** (`ts_key = uint64_t`) — but note the shipped `ts_key` is currently **`uint32_t`**: the 64-bit widening is split out as a deferred step (A-2c-2, see §9 A-2c-1) that lands only when Symbol/Index values are added. The tag layout below is the design target:
 ```
 // single definition in ts_rt.h (the analyzer references this constant at emit time, resolving the METHOD_KEY_BASE double-definition)
 //   high 8 bits = tag, low 32 bits = id (the middle is reserved)
@@ -204,6 +204,7 @@ enum ts_key_tag { TS_K_STRING=0, TS_K_SYMBOL=1, TS_K_INDEX=2, TS_K_WKSYM=3 /* we
 //   ts_key_is_enumerable_data(k): enumeration targets (string data + index). method/symbol/accessor follow separate rules.
 ```
 - Extend `ts_prop.key` to `ts_key` (64bit). **Cost = the prop map key of dynamic objects goes 4→8 bytes**.
+  *(Deferred: `ts_prop.key` is still `uint32_t` per §9 A-2c-1, so this 4→8B cost has not yet been incurred.)*
   A typed struct (hot path) accesses struct fields directly without the prop map, so it is **unaffected**.
   Method names are in the String range (the old METHOD_KEY_BASE equivalent is reorganized as a sub-rule of tag=STRING or a separate tag).
 - Consolidate the scattered `key >= METHOD_KEY_BASE` comparisons and `field_enumerable` into `ts_key_*` predicates.
@@ -267,7 +268,8 @@ Each stage must be independently committable and must make all tests green on it
   - **Finalize the key space `ts_key` (§3.6, V8-style tagged key)**: resolve the `TS_METHOD_KEY_BASE` double-definition and
     add tagged keys (tag=String/Symbol/Index/WKSYM + 32bit id, physically 64-bit `ts_key`) +
     the `ts_key_make`/`ts_key_tag`/`ts_key_is_string`/`is_symbol`/`is_index`/`is_enumerable_data`
-    predicates to `ts_rt.h`. Extend `ts_prop.key` from `uint32_t`→`ts_key` (64bit). Consolidate the scattered
+    predicates to `ts_rt.h`. Extend `ts_prop.key` from `uint32_t`→`ts_key` (64bit). *(As shipped, the 64-bit widening
+    was deferred — `ts_key` remains `uint32_t`; see §9 A-2c-1.)* Consolidate the scattered
     `key >= METHOD_KEY_BASE` comparisons and `field_enumerable` through these predicates. Reserve the Symbol/Index/WKSYM
     ranges (do not implement Symbol). Finalize the WKSYM assignment table. **Behavior-invariant at this point**
     (verify across all goldens that String/method key resolution results are unchanged. prop map memory grows
@@ -325,8 +327,8 @@ After each stage: ci_fast + 3 bench shards (individually) + ASan + representativ
   struct. Reconsider when introducing shape with PIC in the future (§6).
 - **R4 GC**: GC during the enumeration callback moves the base pointer. Mitigation: as in the existing implementation,
   consolidate the pattern of re-fetching `ts_ptr(obj)` after each push into the canonical path.
-- **R5 scope creep**: the temptation to touch 8000 lines. Mitigation: adhere strictly to the stages, and do not include the field-initializer bug or
-  PIC in this task.
+- **R5 scope creep**: the temptation to touch 8000 lines. Mitigation: adhere strictly to the stages, and do not include
+  PIC in this task. (The field-initializer bug, by contrast, *was* folded into this design and shipped as Stage E — see §2, §7-4, and §9.)
 
 ---
 

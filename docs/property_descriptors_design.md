@@ -140,6 +140,8 @@ Wrap a data property that has non-default attributes in a `ts_data_desc` heap wr
 → **Option A adopted (Kaz's decision).** Accept 1.5× memory (dynamic prop only) and put no unwrap on the read
 path = speed first. The typed struct hot path is unaffected. Compatibility is guaranteed by consolidating everything into the single point of "always set flags=0b111 when allocating a slot".
 
+> **Design vs shipped (read before §3.2–§3.7).** §3.1 selected **Option A** (attributes in `ts_prop.flags`) and Stage 1 shipped exactly that — see §8. The `ts_data_desc` / `TS_KIND_PROPDESC` value-wrapper mechanism elaborated throughout §3.2–§3.7 (and referenced in §4–§7) is the **Option B** design and was **not** implemented; `ts_data_desc` does not exist in the code. Read §3.2–§3.7 for the descriptor *semantics* to preserve (enumerable/writable/configurable behavior, enumeration order, GC), which the shipped code realizes via `ts_prop.flags` rather than a heap wrapper.
+
 ### 3.2 Definition of "default attributes" (note the two different defaults)
 
 JS has **two attribute defaults depending on context**. Confusing them leads to a silent bug like §1.4:
@@ -318,8 +320,8 @@ descriptor, non-literal attribute value).
   slot**, and the typed struct field path (direct `->fN` read) does not go through it. Since the accessor's
   `is_accessor()` check is already at the same location and had a track record of being perf-neutral, the isomorphic
   `is_data_desc()` should also be neutral. Confirm on the obj_kernel bench.
-- **layout backward compatibility**: change neither `ts_prop` nor `ts_object` (the key point of Option B). All existing golden
-  objects stay stored as bare values.
+- **layout backward compatibility**: the `ts_object` layout is unchanged; as shipped (Option A) `ts_prop` gains a `uint8_t flags` (16→24 bytes), initialized all-true so existing golden
+  objects keep behaving as bare values. *(The original "change neither `ts_prop` nor `ts_object`" was the Option-B goal — see the note under §3.1.)*
 - **double wrapping**: when the same key is redefined via `defineProperty`, discard the old desc and replace it with the new one
   (no nesting of wraps). Inside `ts_define_data`, look at is_data_desc/is_accessor and
   update in place.
@@ -345,8 +347,7 @@ Follow the constraints of `property_model_redesign.md` §6:
 1. **Scope of stage 1**: is it OK to "fix" the existing bug of §1.4 (omitted `{value}` getting enumerable wrong) in stage 1
    (correcting it all at once without going through a loud-reject)? I will confirm there is no applicable case in golden,
    but if something depends on it, the behavior changes.
-2. **Is Option B (value wrapper) OK**: a design that takes hot-path-unaffected and layout-invariant, accepting a cost of one
-   heap per attributed prop. Which do you prefer — this or Option A (add flags to `ts_prop`, +memory but no unwrap)?
+2. **Option A vs Option B — RESOLVED: Option A adopted** (add `flags` to `ts_prop`, +memory but no unwrap; see §3.1/§8). The Option-B alternative (value wrapper: hot-path-unaffected and layout-invariant, but one heap per attributed prop) was declined because "slowdown is not OK."
 3. **Accessor attributes (§3.7) and method shorthand (§3.8)**: is it OK to assume these are deferred to stage 3,
    or, given demand, do you want them included in stages 1-2?
 4. **Priority of getOwnPropertyDescriptor (§3.9)**: is stage 2 OK, or if unneeded, defer it or leave it out of scope?

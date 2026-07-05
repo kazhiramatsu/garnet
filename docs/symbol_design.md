@@ -49,6 +49,8 @@ typedef struct { ts_gc_header h; uint32_t sym_id; uint32_t flags; tsv descriptio
 // flags: bit0=registered (created by Symbol.for = registry-managed). Reserved for future well-known/private use.
 // description: the desc string of Symbol(desc) (undefined if none).
 ```
+> **Shipped layout (see §6):** the planned `flags` bitfield above was realized as two separate fields — `uint32_t wksym` + `uint8_t registered`; there is no `flags` field in the shipped `ts_symbol` (`runtime/ts_rt.h`).
+
 - The assignment counter `g_next_sym_id` is a **dedicated space that does not collide with WKSYM/method/index**.
   Since `ts_key` is uint32_t and packs all partitions into a single space when used as a property key,
   user symbols must be placed in a **high range that does not collide with STRING/METHOD/WKSYM**.
