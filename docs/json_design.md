@@ -1,4 +1,4 @@
-# JSON + field-name table (方針B)
+# JSON + field-name table (Approach B)
 
 ## Goal
 Implement `JSON.stringify` and `JSON.parse` faithfully, including stringifying

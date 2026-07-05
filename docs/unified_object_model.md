@@ -1,176 +1,190 @@
-# 統一オブジェクトモデル設計 (Unified Object Model)
+# Unified Object Model Design
 
-## 0. 動機と方針 (Kaz)
+## 0. Motivation and Policy (Kaz)
 
-JS 意味論では **すべてのオブジェクト**（plain object / class instance / Array / Map / Set /
-Function / ...）が `Object.prototype` を proto チェーン経由で継承し、
+In JS semantics, **every object** (plain object / class instance / Array / Map / Set /
+Function / ...) inherits `Object.prototype` via the proto chain, and has:
 
-- 継承メソッド (`arr.hasOwnProperty`, `arr.toString`, `m.constructor`)
-- インスタンスへのカスタム named プロパティ (`arr.custom = 99`)
-- `Object.keys(arr)` へのその反映
+- Inherited methods (`arr.hasOwnProperty`, `arr.toString`, `m.constructor`)
+- Custom named properties on the instance (`arr.custom = 99`)
+- Their reflection into `Object.keys(arr)`
 
-を持つ。よって **すべての GC オブジェクトは proto + prop-map(動的プロパティ基盤)を持つべき**。
+Therefore **every GC object should have a proto + prop-map (a dynamic-property foundation)**.
 
-### 設計原則（Kaz）
-1. **動的アクセスが発生する場合は、常に従来の JS オブジェクトモデル（proto + prop-map）で動作する**
-   — これが「常に正しい」ベースライン。
-2. **最適化（struct 化・`->fN` 直アクセス・unboxed・静的メソッド dispatch）は、TypeScript の型で
-   安全と判断できる場合のみ**適用する。
-3. **最適化を壊す要因をマークし、それが存在する値・クラスは最適化ルートに乗せず、ベースライン
-   （動的モデル）で動かす**。
+### Design Principles (Kaz)
+1. **When dynamic access occurs, always operate under the conventional JS object model (proto + prop-map)**
+   — this is the "always correct" baseline.
+2. **Optimizations (struct-ification, `->fN` direct access, unboxed, static method dispatch) are applied
+   only when the TypeScript type lets us judge them safe.**
+3. **Mark the factors that break optimization; values/classes for which those factors exist are not put on
+   the optimization route but run on the baseline (dynamic model).**
 
-この原則は既に tsaot のクラス最適化に部分実装されている（`stable`/`unstable` 判定。§2 参照）。
-本設計はそれを **全オブジェクト種に一般化**し、特に配列が proto + prop-map を持つようにする。
+This principle is already partially implemented in tsaot's class optimization (the `stable`/`unstable`
+decision; see §2). This design **generalizes it to all object kinds**, in particular making arrays carry a
+proto + prop-map.
 
-## 1. 現状
+## 1. Current State
 
-| 種別 | proto | prop-map | 備考 |
-|------|-------|----------|------|
-| plain object / class instance / proto / Date (`TS_KIND_OBJECT`) | ✓ | ✓ | `ts_object {h, proto, props, cap, len, shape}`。class struct は先頭に `ts_object header` を埋め込み済み |
+| Kind | proto | prop-map | Notes |
+|------|-------|----------|-------|
+| plain object / class instance / proto / Date (`TS_KIND_OBJECT`) | ✓ | ✓ | `ts_object {h, proto, props, cap, len, shape}`. The class struct already embeds a `ts_object header` at its front |
 | Array (`ts_array`) | ✗ | ✗ | `{h, data, len, cap}` |
 | Function (`ts_func`) | ✗ | ✗ | `{h, code, env, envlen}` |
 | Map (`ts_map`) | ✗ | ✗ | `{h, keys, vals, len, cap}` |
 | Set (`ts_set_t`) | ✗ | ✗ | `{h, elems, len, cap}` |
-| Promise / Coro / Accessor | ✗ | ✗ | 内部値。ユーザがプロパティ付与する想定は薄いが、proto は持つべき |
+| Promise / Coro / Accessor | ✗ | ✗ | Internal values. Users are unlikely to attach properties, but they should still have a proto |
 
-直近のメモリ安全ガード（`ts_get`/`ts_set` で `kind != TS_KIND_OBJECT` なら早期 return）は、
-`ts_array` を `ts_object` として読む heap-overflow を防ぐ応急措置。本設計の完成で撤去できる。
+The recent memory-safety guard (early return in `ts_get`/`ts_set` when `kind != TS_KIND_OBJECT`) is a
+stopgap to prevent the heap-overflow from reading a `ts_array` as a `ts_object`. It can be removed once this
+design is complete.
 
-## 2. 既存の「最適化を壊す要因」検出（流用・拡張する資産）
+## 2. Existing detection of "factors that break optimization" (assets to reuse/extend)
 
-`exporter/class_extract.ts` が以下を検出し `stable = false` + `reasons` を記録済み:
-- `prototype-mutation` / `prototype-assign`（prototype 上書き）
-- `method-reassign` / `dynamic-prop-write`（宣言外プロパティへの動的書き込み）
-- `dynamic-elem-write` / `dynamic-this-write`（`this[expr] = ...`）
-- `Object.defineProperty` / `Object.assign` 等 `Object.*`、`Object.*-on-prototype`
-- `delete-member`、`computed-method-name`/`computed-field-name`、mixin、`constructor-returns-value`
+`exporter/class_extract.ts` already detects the following and records `stable = false` + `reasons`:
+- `prototype-mutation` / `prototype-assign` (overwriting the prototype)
+- `method-reassign` / `dynamic-prop-write` (dynamic writes to non-declared properties)
+- `dynamic-elem-write` / `dynamic-this-write` (`this[expr] = ...`)
+- `Object.defineProperty` / `Object.assign` and other `Object.*`, `Object.*-on-prototype`
+- `delete-member`, `computed-method-name`/`computed-field-name`, mixin, `constructor-returns-value`
 
-段階Bで codegen 側 `struct_direct_offset(c, field, classes)` が `c.stable` を確認し、stable な
-クラスのみ `->fN` 直アクセス、unstable は正準パス（`ts_get`/`ts_set`）にフォールバック済み。
+In stage B, the codegen-side `struct_direct_offset(c, field, classes)` checks `c.stable` and already does
+`->fN` direct access only for stable classes, falling back to the canonical path (`ts_get`/`ts_set`) for
+unstable ones.
 
-→ **方針3 はクラスについては実装済み**。本設計はこの考え方を配列等にも適用する（型で `number[]`
-等と判る配列は要素 fast path、`any` や動的プロパティ付与があれば動的モデル）。
+→ **Principle 3 is already implemented for classes.** This design applies the same idea to arrays and the
+like (arrays known by their type to be `number[]` etc. take the element fast path; `any` or dynamic-property
+attachment falls to the dynamic model).
 
-## 3. 提案レイアウト: 共通オブジェクトヘッダ
+## 3. Proposed layout: common object header
 
-class struct が `ts_object header` を先頭に埋め込んで proto/props を得ているのと同じ方式を、全
-オブジェクト種に適用する。**共通プレフィックス `ts_obj_common` を各構造体の先頭に置く**:
+Apply to every object kind the same approach by which the class struct embeds a `ts_object header` at its
+front to obtain proto/props. **Place a common prefix `ts_obj_common` at the front of each struct**:
 
 ```c
 typedef struct ts_obj_common {
   ts_gc_header h;
   struct ts_object* proto;   /* prototype chain */
-  ts_prop* props; uint32_t pcap, plen;  /* dynamic named-property map (遅延確保) */
-  uint32_t shape;            /* PIC 予約 (§6 of property_model_redesign) */
+  ts_prop* props; uint32_t pcap, plen;  /* dynamic named-property map (lazily allocated) */
+  uint32_t shape;            /* reserved for PIC (§6 of property_model_redesign) */
 } ts_obj_common;
 ```
 
-`ts_object` はこの共通部のみ（= 現状の `ts_object` と同一レイアウト）。各特殊型は先頭に共通部を
-持ち、後ろに固有フィールド:
+`ts_object` is just this common part (= the same layout as the current `ts_object`). Each specialized type
+has the common part at its front, with its own fields following:
 
 ```c
 typedef struct ts_array {
-  ts_obj_common o;           /* proto + prop-map (遅延) */
-  tsv* data; uint32_t len, cap;   /* 要素 fast path */
+  ts_obj_common o;           /* proto + prop-map (lazy) */
+  tsv* data; uint32_t len, cap;   /* element fast path */
 } ts_array;
 typedef struct ts_func { ts_obj_common o; void* code; tsv* env; uint32_t envlen; } ts_func;
 typedef struct ts_map  { ts_obj_common o; tsv* keys; tsv* vals; uint32_t len, cap; } ts_map;
 typedef struct ts_set_t{ ts_obj_common o; tsv* elems; uint32_t len, cap; } ts_set_t;
-/* promise/coro/accessor も同様に先頭に ts_obj_common */
+/* promise/coro/accessor likewise get ts_obj_common at the front */
 ```
 
-### 遅延 prop-map（perf 保全 / 方針1・2）
-- `props = NULL, pcap = plen = 0` が初期状態。**named プロパティを実際に付与するまで prop-map は
-  確保しない**（V8 の fast→dictionary 降格に相当）。
-- ホットな配列要素アクセス `ts_array_get/set` は `data/len/cap` のみ触る。共通部が前置されることで
-  これらのフィールドオフセットが後ろにずれるだけで、ロジック・計算量は不変。
+### Lazy prop-map (perf preservation / Principles 1 & 2)
+- `props = NULL, pcap = plen = 0` is the initial state. **The prop-map is not allocated until a named
+  property is actually attached** (analogous to V8's fast→dictionary demotion).
+- The hot array-element access `ts_array_get/set` touches only `data/len/cap`. Prepending the common part
+  merely shifts these field offsets back; the logic and complexity are unchanged.
 - `ts_get(arr, key)`:
-  1. 配列特有の特別扱い（`"length"` → `len`、整数 index → 要素）
-  2. 自身の prop-map（`props`、空なら即スキップ）
-  3. proto チェーン（`arr.o.proto` = Array.prototype → Object.prototype）
-  これらは「動的アクセス時のみ」通る。型付き配列の `arr.join()` 等は従来通り静的 builtin dispatch。
+  1. Array-specific special-casing (`"length"` → `len`, integer index → element)
+  2. Its own prop-map (`props`; skip immediately if empty)
+  3. The proto chain (`arr.o.proto` = Array.prototype → Object.prototype)
+  These are traversed "only on dynamic access." A typed array's `arr.join()` etc. still use static builtin
+  dispatch as before.
 
-## 4. proto の設置
+## 4. Setting up the protos
 
-- `g_object_proto`（既存）に加え、`g_array_proto` / `g_function_proto` / `g_map_proto` /
-  `g_set_proto` を追加。各々 `proto = g_object_proto`。
-- Array.prototype 上に配列 builtin（`join`/`indexOf`/`slice`/...）を `ts_func` として登録すれば、
-  `any` 型の `arr.method()` が proto チェーン経由で解決できる（動的ルートの完成）。
-  - builtin を `ts_func` でラップする薄いブリッジが要る（recv = args[0]）。callback を取る
-    `map`/`filter` も `ts_call` 経由で動く。
-- `ts_new_array` 等で `o.proto = g_array_proto` を設定。
+- In addition to `g_object_proto` (existing), add `g_array_proto` / `g_function_proto` / `g_map_proto` /
+  `g_set_proto`. Each has `proto = g_object_proto`.
+- If the array builtins (`join`/`indexOf`/`slice`/...) are registered as `ts_func` on Array.prototype, then
+  `arr.method()` on an `any` type can be resolved via the proto chain (completing the dynamic route).
+  - A thin bridge that wraps a builtin in a `ts_func` is needed (recv = args[0]). Callback-taking
+    `map`/`filter` also work via `ts_call`.
+- Set `o.proto = g_array_proto` in `ts_new_array` etc.
 
-## 5. ts_get / ts_set の一般化
+## 5. Generalizing ts_get / ts_set
 
-`kind != TS_KIND_OBJECT` ガードを撤去し、共通部 `ts_obj_common` に対して動作させる:
-- struct field（class descriptor）チェック → 自身の prop-map → proto チェーン、の現行ロジックを
-  共通部基準に。
-- 配列/Map/Set は `ts_get` で「特有の組み込みプロパティ（length/size）」を先に解決してから
-  prop-map・proto に進む。
-- `ts_set` も同様。配列に `arr.custom = 99` を付けると prop-map を遅延確保して格納。以後その配列は
-  「named プロパティ持ち」。`Object.keys(arr)` は要素キー（"0".."n"）＋ named プロパティを列挙
-  （§3.6 の整数キー先出し順序がそのまま効く）。
+Remove the `kind != TS_KIND_OBJECT` guard and make them operate on the common part `ts_obj_common`:
+- Rebase the current logic — struct-field (class descriptor) check → own prop-map → proto chain — onto the
+  common part.
+- For Array/Map/Set, `ts_get` first resolves the "kind-specific built-in property (length/size)" before
+  proceeding to the prop-map and proto.
+- `ts_set` likewise. Attaching `arr.custom = 99` to an array lazily allocates the prop-map and stores the
+  value; from then on that array "has named properties." `Object.keys(arr)` enumerates the element keys
+  ("0".."n") plus the named properties (the integer-key-first ordering of §3.6 applies as-is).
 
-## 6. 列挙 (`ts_prop_own_enum`) の一般化
+## 6. Generalizing enumeration (`ts_prop_own_enum`)
 
-現在 `ts_prop_own_enum` は `kind != OBJECT` を弾いている。配列の `Object.keys` は
-「整数 index キー("0".."len-1") を昇順 → prop-map の named キーを挿入順」。既存の整数キー先出し
-ロジック（`prop_key_is_array_index`）と統合し、配列の要素を index キーとして列挙、その後 prop-map。
+Currently `ts_prop_own_enum` rejects `kind != OBJECT`. An array's `Object.keys` is "the integer index keys
+("0".."len-1") in ascending order → the prop-map's named keys in insertion order." Integrate with the
+existing integer-key-first logic (`prop_key_is_array_index`): enumerate the array's elements as index keys,
+then the prop-map.
 
-## 7. 段階的移行（behavior-invariance gate 付き）
+## 7. Incremental migration (with behavior-invariance gates)
 
-各段階で「全 CI 緑 + ASan クリーン + perf 無退行」を確認:
+At each stage, confirm "all CI green + ASan clean + no perf regression":
 
-- **U-1**: `ts_obj_common` 型を定義。`ts_object` を `ts_obj_common` で表現（レイアウト不変）。
-  GC scan/free を共通部基準に整理。— 振る舞い完全不変。
-- **U-2**: `ts_array` に共通部を前置（`{o, data, len, cap}`）。`ts_array_get/set` 等 ~91 箇所の
-  フィールドアクセスを `a->data`→そのまま（共通部前置でオフセットのみ変化、メンバ名不変なら無修正）。
-  `ts_new_array` で `o.proto = g_array_proto`、prop-map は遅延（NULL）。GC を更新。
-  メモリ安全ガードはまだ残す。— 配列確保サイズ増のみ、振る舞い不変。
-- **U-3**: `g_array_proto` を設置し Array.prototype builtin を `ts_func` ラッパで登録。
-  `ts_get`/`ts_set` のガードを撤去し共通部で動作。配列の `length`/要素特別扱い + prop-map + proto。
-  `any` 型 `arr.method()` が proto 経由で解決。`arr.custom=99` が prop-map に格納。
-- **U-4**: `ts_prop_own_enum` を配列対応（index キー + named キー）。`Object.keys(arr)` 等が JS 一致。
-- **U-5**: Map/Set/Function にも共通部を前置し proto 設置（同パターン）。
-- 各段階で「型付き配列の要素 fast path が機械語不変」「obj_kernel 等 perf 無退行」を確認。
+- **U-1**: Define the `ts_obj_common` type. Represent `ts_object` in terms of `ts_obj_common` (layout
+  unchanged). Reorganize GC scan/free around the common part. — Behavior completely unchanged.
+- **U-2**: Prepend the common part to `ts_array` (`{o, data, len, cap}`). The ~91 field accesses in
+  `ts_array_get/set` etc. stay as `a->data` (prepending the common part only changes offsets; if member
+  names are unchanged, no edits needed). Set `o.proto = g_array_proto` in `ts_new_array`; the prop-map is
+  lazy (NULL). Update GC. Keep the memory-safety guard for now. — Only the array allocation size grows;
+  behavior unchanged.
+- **U-3**: Set up `g_array_proto` and register the Array.prototype builtins as `ts_func` wrappers. Remove
+  the `ts_get`/`ts_set` guards and operate on the common part. Array `length`/element special-casing +
+  prop-map + proto. `arr.method()` on an `any` type resolves via proto. `arr.custom=99` is stored in the
+  prop-map.
+- **U-4**: Make `ts_prop_own_enum` array-aware (index keys + named keys). `Object.keys(arr)` etc. match JS.
+- **U-5**: Prepend the common part to Map/Set/Function too and set up their protos (same pattern).
+- At each stage, confirm "the typed-array element fast path is machine-code-invariant" and "no perf
+  regression in obj_kernel etc."
 
-## 8. 最適化ルートとの関係（方針2・3 の徹底）
+## 8. Relationship to the optimization route (enforcing Principles 2 & 3)
 
-- 型で `number[]` 等と判り、かつ動的プロパティ付与・proto 上書きの無い配列は、要素 fast path と
-  静的 builtin dispatch を維持（現状の最適化を温存）。
-- `any` 型、動的プロパティ付与、proto 操作が絡む場合のみ動的モデル（proto+prop-map）に乗る。
-- これはクラスの `stable`/`unstable` と同じ構図。配列にも「最適化を壊す要因」（`arr[expr]=v` で
-  非整数キー、`arr.x=v` の named 付与、`Object.setPrototypeOf(arr,...)` 等）のマークを将来導入し、
-  無ければ fast path、有れば動的、と分岐できる（U-3 以降の拡張）。
+- Arrays known by their type to be `number[]` etc., with no dynamic-property attachment or proto
+  overwriting, keep the element fast path and static builtin dispatch (preserving the current optimization).
+- Only when `any` type, dynamic-property attachment, or proto manipulation is involved do they fall onto the
+  dynamic model (proto+prop-map).
+- This is the same structure as a class's `stable`/`unstable`. In the future we can also introduce, for
+  arrays, marks for the "factors that break optimization" (a non-integer key in `arr[expr]=v`, a named
+  attachment `arr.x=v`, `Object.setPrototypeOf(arr,...)`, etc.), branching to the fast path when absent and
+  the dynamic model when present (an extension from U-3 onward).
 
-## 9. リスクと留意
+## 9. Risks and caveats
 
-- **GC**: 共通部前置で全種のフィールドオフセットが変わる。GC の mark/free（`gc_collect`）が各 kind の
-  ポインタ（`data`/`keys`/`env` 等）を正しく辿るよう、オフセット変更に追随必須。ASan + リーク確認。
-- **emit 側**: class struct は既に `ts_object header` 前置なので影響なし。配列リテラル構築や
-  `sobj`/`hobj` 経路の確保サイズ計算を確認。
-- **perf**: 配列 +~40B/インスタンス。ホットループは要素 fast path（機械語不変）なので CPU 影響は
-  確保サイズ起因のみ。obj/typed_field/int/float/inherit カーネルで実測し budget 内を確認。
-- **ブラスト半径**: ~91 箇所の `ts_array` フィールドアクセス。メンバ名を変えず共通部を前置すれば
-  多くは無修正（`a->data` 等はそのまま）。`sizeof(ts_array)` 依存箇所のみ要確認。
+- **GC**: Prepending the common part changes the field offsets of every kind. The GC's mark/free
+  (`gc_collect`) must follow the offset changes so it correctly traverses each kind's pointers
+  (`data`/`keys`/`env` etc.). Verify with ASan + leak checks.
+- **Emit side**: The class struct already prepends the `ts_object header`, so there is no impact. Check the
+  allocation-size computation in array-literal construction and the `sobj`/`hobj` paths.
+- **Perf**: Arrays grow by +~40B/instance. Hot loops use the element fast path (machine-code-invariant), so
+  the only CPU impact stems from the allocation size. Measure with the obj/typed_field/int/float/inherit
+  kernels and confirm within budget.
+- **Blast radius**: ~91 `ts_array` field accesses. Prepending the common part without changing member names
+  leaves most of them unedited (`a->data` etc. stay the same). Only the sites that depend on
+  `sizeof(ts_array)` need checking.
 
-## 10. `new` 演算子の正確なセマンティクス (ECMA-262 準拠)
+## 10. Precise semantics of the `new` operator (ECMA-262 conformant)
 
-参考: 「JavaScript の new 演算子の意味」 nanto_vi, Days on the Moon (2005-10-24)
+Reference: "The meaning of JavaScript's new operator" nanto_vi, Days on the Moon (2005-10-24)
 https://nanto.asablo.jp/blog/2005/10/24/118564
-（典拠: ECMA-262 3rd 11.2.2 new 演算子 / 13.2.2 [[Construct]]）
+(Source: ECMA-262 3rd 11.2.2 the new operator / 13.2.2 [[Construct]])
 
-`new F(args)` の動作は以下の 4 段階（記事の要約）:
+`new F(args)` behaves in the following 4 steps (summary of the article):
 
-1. **新しいオブジェクトを作る。**
-2. **そのオブジェクトの `[[Prototype]]`（`__proto__`）に `F.prototype` の値を設定する。**
-   - `F.prototype` がオブジェクトでない（プリミティブ）なら、代わりに `Object.prototype` を設定。
-3. **`F` を呼び出す。** `this` = 1 で作ったオブジェクト、引数は `new` に与えられたものをそのまま。
-4. **3 の返り値がオブジェクトならそれを返す。そうでなければ 1 で作ったオブジェクトを返す。**
-   - 「オブジェクトである」= プリミティブ値（string / number / boolean / undefined / null）でない。
-     `new String("s")` 等はオブジェクト、`"s"`/`123`/`true` 等はプリミティブ。
+1. **Create a new object.**
+2. **Set that object's `[[Prototype]]` (`__proto__`) to the value of `F.prototype`.**
+   - If `F.prototype` is not an object (a primitive), set `Object.prototype` instead.
+3. **Call `F`.** `this` = the object created in step 1; the arguments are exactly those given to `new`.
+4. **If the return value of step 3 is an object, return it; otherwise return the object created in step 1.**
+   - "Is an object" = not a primitive value (string / number / boolean / undefined / null). `new String("s")`
+     etc. is an object; `"s"`/`123`/`true` etc. are primitives.
 
-擬似コード（記事より）:
+Pseudocode (from the article):
 ```
 Function.prototype.construct = function () {
   var newInstance = new Object();
@@ -182,269 +196,327 @@ Function.prototype.construct = function () {
 };
 ```
 
-### この設計（統一オブジェクトモデル）との接続
-本設計で全オブジェクトが proto を持つことで、`new` の step 1〜2 が一貫して表現できる:
-- step 1: `ts_obj_common` を持つインスタンスを確保（class struct / plain object）。
-- step 2: `o.proto = F.prototype`（= 当該クラスの CLASS_PROTO。`F.prototype` が非オブジェクトの
-  特殊ケースは tsaot では型で除外されるため通常 CLASS_PROTO 固定。ただし動的経路では
-  「`F.prototype` がオブジェクトでなければ `g_object_proto`」のフォールバックを正確に実装する）。
-- step 3: コンストラクタ呼び出し（recv = インスタンス、フィールド初期化子は §3.5 case A で ctor 本体に
-  注入済み）。
-- step 4: **コンストラクタの返り値がオブジェクトならそれを `new` の値とする**。
+### Connection to this design (the unified object model)
+Because in this design every object has a proto, steps 1–2 of `new` can be expressed uniformly:
+- step 1: Allocate an instance carrying `ts_obj_common` (class struct / plain object).
+- step 2: `o.proto = F.prototype` (= that class's CLASS_PROTO). The special case where `F.prototype` is a
+  non-object is excluded by type in tsaot, so it is normally fixed to CLASS_PROTO. On the dynamic path,
+  however, precisely implement the fallback "if `F.prototype` is not an object, use `g_object_proto`."
+- step 3: Call the constructor (recv = the instance; the field initializers are already injected into the
+  ctor body per §3.5 case A).
+- step 4: **If the constructor's return value is an object, use it as the value of `new`.**
 
-### tsaot の現状と差異（要修正・実測で確認済み）
-現状の `new C()` lowering は AllocObject → Call(ctor, recv=inst) → インスタンスを返す、で **step 4 を
-実装していない**（ctor の返り値を捨てている）。検証:
-- `class A { constructor(){ this.x=1; return {x:99}; } }` → V8 は `new A().x === 99`（返り値の
-  オブジェクト）だが、tsaot は ctor 返り値を捨ててインスタンスを使う（さらに現状 codegen が壊れ
-  `v2 undeclared` を出す）。`constructor-returns-value` は unstable マークするのみで未実装。
-- `class B { constructor(){ this.x=7; return 42; } }` → V8 は `new B().x === 7`（プリミティブ返り値は
-  無視）。tsaot もインスタンスを使うのでこちらは結果的に一致。
+### tsaot's current state and the discrepancy (needs fixing; confirmed by measurement)
+The current `new C()` lowering is AllocObject → Call(ctor, recv=inst) → return the instance, and **does not
+implement step 4** (it discards the ctor's return value). Verification:
+- `class A { constructor(){ this.x=1; return {x:99}; } }` → V8 gives `new A().x === 99` (the returned
+  object), but tsaot discards the ctor return value and uses the instance (and moreover the current codegen
+  breaks and emits `v2 undeclared`). `constructor-returns-value` only marks it unstable and is otherwise
+  unimplemented.
+- `class B { constructor(){ this.x=7; return 42; } }` → V8 gives `new B().x === 7` (a primitive return value
+  is ignored). tsaot also uses the instance, so this one happens to match.
 
-### 修正方針（new step 4 の正確な実装）
-A. **ctor 呼び出しに dst を付け、返り値を受け取る。**
-B. **ctor が値を返しうるか（`constructor-returns-value`）に応じて分岐:**
-   - 返さない（多数派・型で確定）: 従来通りインスタンスをそのまま `new` の値に（最適化ルート維持。
-     余分な分岐ゼロ）。
-   - 返しうる: ランタイム `ts_construct_result(inst, ret)` で step 4 を実装 ——
-     `return ts_is_object_like(ret) ? ret : inst;`（object-like = プリミティブ以外。文字列・数値・
-     真偽・undefined・null を除く NaN-box selector 判定）。
-   この分岐は「最適化を壊す要因（ctor が値を返す）をマークし、無ければ最適化ルート」という本設計の
-   方針 3 にそのまま乗る。
-C. **暗黙コンストラクタ（ctor なし）/ フィールド初期化子のみのクラスは値を返さないので、常にインスタンス**
-   （現状維持）。
-D. 親クラスの ctor が値を返す継承ケースも step 4 が連鎖するよう、`super()` 呼び出しの戻り値の扱いを
-   ECMA に合わせる（派生クラスの super 返り値がオブジェクトならそれが this になる ES2015 セマンティクス。
-   ただし tsaot の現行クラスモデルの範囲で段階的に）。
+### Fix policy (a precise implementation of new step 4)
+A. **Give the ctor call a dst and receive the return value.**
+B. **Branch on whether the ctor can return a value (`constructor-returns-value`):**
+   - Cannot return (the majority; determined by type): as before, use the instance directly as the value of
+     `new` (preserving the optimization route; zero extra branches).
+   - Can return: implement step 4 via the runtime `ts_construct_result(inst, ret)` ——
+     `return ts_is_object_like(ret) ? ret : inst;` (object-like = non-primitive; a NaN-box selector check
+     excluding string / number / boolean / undefined / null).
+   This branch rides directly on this design's Principle 3: "mark the factor that breaks optimization (the
+   ctor returning a value), and take the optimization route when absent."
+C. **Implicit constructors (no ctor) / classes with only field initializers return no value, so they always
+   yield the instance** (unchanged).
+D. So that step 4 chains in the inheritance case where a parent class's ctor returns a value, align the
+   handling of the `super()` call's return value with ECMA (the ES2015 semantics whereby, if a derived
+   class's super return value is an object, it becomes `this` — but incrementally, within the bounds of
+   tsaot's current class model).
 
-### 移行段階への追加
-- **U-6 (new step 4)**: ctor 呼び出しに dst を付与。`constructor-returns-value` クラスのみ
-  `ts_construct_result` 経由でランタイム判定（object 返り値を採用）。それ以外は現状の高速経路維持。
-  golden（object 返り / primitive 返り / ctor なし / 継承）で V8 一致を確認。U-1〜U-5 とは独立に
-  実装可能（proto 統一の前後どちらでもよいが、step 2 の proto 設定一貫化のため U-3 以降が望ましい）。
+### Addition to the migration stages
+- **U-6 (new step 4)**: Give the ctor call a dst. Only for `constructor-returns-value` classes, decide at
+  runtime via `ts_construct_result` (adopt an object return value). Otherwise keep the current fast path.
+  Confirm V8 agreement with goldens (object return / primitive return / no ctor / inheritance). Can be
+  implemented independently of U-1..U-5 (before or after proto unification is fine, but U-3 onward is
+  preferable for consistency of the step-2 proto setup).
 
 ---
-## 実装ログ
+## Implementation log
 
-- **U-1 DONE**: `ts_obj_common` 型を導入し `typedef struct ts_obj_common ts_object;`。レイアウト完全
-  不変（sizeof 48, proto@16, props@24, shape@40）。GC・既存コードは無修正。CI 緑。
-- **U-2 DONE**: `ts_array` に `ts_obj_common o;` を前置（`{o, data, len, cap}`、sizeof 64, data@48）。
-  メンバ名 data/len/cap 保持で `a->data` 等は無修正。`ts_new_array` は gc_alloc(calloc) で o.proto/
-  o.props=NULL 初期。GC mark を `a->o.props[i].val`/`a->o.proto` も辿るよう、free を `a->o.props` も
-  解放するよう更新。ASan クリーン、perf 中立（要素 fast path の機械語不変、確保サイズ +16B のみ）。
-- **U-3 DONE**: Array.prototype を実装。
-  - runtime: `ts_arrproto_*`（26 個）= 各 array builtin を ts_code シグネチャ（this=args[0]、JS 既定
-    引数）でラップ。`g_array_proto`（proto=g_object_proto）+ `ts_array_proto_init/register`。
-    `ts_new_array` で `o.proto=g_array_proto`。
-  - ts_get/ts_set のガードを `kind != OBJECT && kind != ARRAY` に緩和。OBJECT と ARRAY は
-    ts_obj_common が offset 0 で alias するので共通ヘッダ（proto + 遅延 prop-map）で動作。class_field_
-    lookup は OBJECT のみ（配列は class descriptor を持たない）。func/map/set は U-5 まで従来通り除外。
-  - exporter: `arrayProtoMethods`（name/runtime/methodId、26 メソッド）を emit。emit_c が
-    `ts_setup_array_proto()` を生成し、各メソッドを `TS_KEY_METHOD(id)` で proto に登録、main で
-    object proto の後に呼ぶ。Program に `array_proto_methods` フィールド追加（test fixtures 6 個も更新）。
-  - 成果（V8 一致・ASan クリーン）: **any 型配列の動的メソッド（join/indexOf/includes/slice/map/
-    filter 等、コールバック付き含む）が proto 経由で正しく解決**。**配列へのカスタム named プロパティ
-    `a.custom=99` が遅延 prop-map に格納**。型付き配列の静的 fast path は不変。golden any_array_methods
-    追加（計 44）。runtime_anymethod_safe を「array は動く / map・set は安全に loud-fail」に更新。
-    全 CI 緑、perf 中立（typed_field 183ms, obj 202ms, int 382ms）。
-  - これにより当初の「arr:any.join() の heap-overflow」は単に安全化されるだけでなく **正しく動作** する
-    ようになった。
+- **U-1 DONE**: Introduced the `ts_obj_common` type with `typedef struct ts_obj_common ts_object;`. Layout
+  completely unchanged (sizeof 48, proto@16, props@24, shape@40). GC and existing code unmodified. CI green.
+- **U-2 DONE**: Prepended `ts_obj_common o;` to `ts_array` (`{o, data, len, cap}`, sizeof 64, data@48).
+  Keeping member names data/len/cap, `a->data` etc. are unmodified. `ts_new_array` initializes o.proto/
+  o.props=NULL via gc_alloc(calloc). Updated GC mark to also traverse `a->o.props[i].val`/`a->o.proto`, and
+  free to also free `a->o.props`. ASan clean, perf neutral (element fast path machine-code-invariant, only
+  +16B allocation size).
+- **U-3 DONE**: Implemented Array.prototype.
+  - runtime: `ts_arrproto_*` (26 of them) = each array builtin wrapped in the ts_code signature (this=args[0],
+    JS default arguments). `g_array_proto` (proto=g_object_proto) + `ts_array_proto_init/register`.
+    `o.proto=g_array_proto` in `ts_new_array`.
+  - Relaxed the ts_get/ts_set guard to `kind != OBJECT && kind != ARRAY`. OBJECT and ARRAY alias ts_obj_common
+    at offset 0, so they operate via the common header (proto + lazy prop-map). class_field_lookup is
+    OBJECT-only (arrays have no class descriptor). func/map/set remain excluded as before until U-5.
+  - exporter: emit `arrayProtoMethods` (name/runtime/methodId, 26 methods). emit_c generates
+    `ts_setup_array_proto()`, registers each method on the proto via `TS_KEY_METHOD(id)`, and calls it in main
+    after the object proto. Added an `array_proto_methods` field to Program (also updated 6 test fixtures).
+  - Result (V8 agreement, ASan clean): **dynamic methods on `any`-typed arrays (join/indexOf/includes/slice/
+    map/filter etc., including with callbacks) resolve correctly via proto**. **A custom named property on an
+    array `a.custom=99` is stored in the lazy prop-map.** The typed-array static fast path is unchanged. Added
+    golden any_array_methods (44 total). Updated runtime_anymethod_safe to "array works / map & set safely
+    loud-fail." All CI green, perf neutral (typed_field 183ms, obj 202ms, int 382ms).
+  - As a result, the original "heap-overflow of arr:any.join()" is not merely made safe but now **works
+    correctly**.
 
-### 残り
-- **U-4**: `ts_prop_own_enum` を配列対応（index キー昇順 + named キー）。Object.keys(arr) 等を JS 一致に。
-- **U-5**: Map/Set/Function/Promise/Coro に共通ヘッダを前置 + proto 設置。ガードを完全撤去可能に。
-- **U-6**: new 演算子 step 4（ctor が object を返したらそれを採用、§10）。
+### Remaining
+- **U-4**: Make `ts_prop_own_enum` array-aware (index keys ascending + named keys). Bring Object.keys(arr)
+  etc. into JS agreement.
+- **U-5**: Prepend the common header to Map/Set/Function/Promise/Coro + set up protos. Make it possible to
+  remove the guard entirely.
+- **U-6**: new operator step 4 (if the ctor returns an object, adopt it; §10).
 
-- **U-4 DONE**: `ts_prop_own_enum` を配列対応。配列の場合まずインデックスキー("0".."len-1"、値=要素、
-  ts_intern_field で文字列キー化）を順に列挙し、その後 common header の named prop map を列挙。JSON/
-  console-inspect は配列専用パスが先にあるため影響なし（{} でなく [] のまま）。spread {...arr} の
-  ts_object_copy_props と Object.assign が配列ソースを受け付けるよう修正（従来は ts_is_array で skip）。
-  成果（V8 一致・ASan クリーン）: Object.keys(arr)=0,1,2 / values=要素 / custom 付き=0,1,2,custom /
-  entries=[["0",..],..] / {...arr}={"0":..} / Object.assign(t,arr)。golden array_enum 追加（計 45）。
-  全 CI 緑、perf 中立（obj 205ms, typed_field 168ms, int 385ms）。
-  注: any 型 2 要素配列の分割代入 `const [k,v] of entries` は別経路（配列分割代入）の既存課題で U-4 とは
-  独立（entries 自体・非分割の for-of は正しい）。
+- **U-4 DONE**: Made `ts_prop_own_enum` array-aware. For arrays, first enumerate the index keys in order
+  ("0".."len-1", value=element, string-keyed via ts_intern_field), then enumerate the common header's named
+  prop map. JSON/console-inspect are unaffected because the array-specific path comes first (it stays [] not
+  {}). Fixed spread {...arr}'s ts_object_copy_props and Object.assign to accept an array source (previously
+  skipped via ts_is_array). Result (V8 agreement, ASan clean): Object.keys(arr)=0,1,2 / values=elements /
+  with custom=0,1,2,custom / entries=[["0",..],..] / {...arr}={"0":..} / Object.assign(t,arr). Added golden
+  array_enum (45 total). All CI green, perf neutral (obj 205ms, typed_field 168ms, int 385ms).
+  Note: destructuring of a 2-element `any`-typed array `const [k,v] of entries` is a pre-existing issue on a
+  different path (array destructuring) and is independent of U-4 (entries itself and non-destructuring for-of
+  are correct).
 
-### 残り
-- **U-5**: Map/Set/Function/Promise/Coro に共通ヘッダ前置 + proto 設置。ガードを完全撤去可能に。
-- **U-6**: new 演算子 step 4（§10）。
+### Remaining
+- **U-5**: Prepend the common header to Map/Set/Function/Promise/Coro + set up protos. Make it possible to
+  remove the guard entirely.
+- **U-6**: new operator step 4 (§10).
 
-- **U-6 DONE (new 演算子 step 4)**: ctor が値を返しうるクラス（class_extract が
-  `constructor-returns-value` でマーク済み）でのみ、new lowering が ctor 呼び出しに dst を付けて返り値を
-  捕捉し、`ConstructResult{dst,inst,ret}` を発行。codegen は `ts_construct_result(inst, ret)` を emit
-  （ret が object-like ならそれ、primitive/undefined/null ならインスタンス）。escape 解析は
-  op_forces_materialization に inst+ret を追加し、escape arm で dst をインスタンスの alias として扱う。
-  ランタイム `ts_construct_result` は number/string/bool/undef/null を primitive と判定（それ以外＝
-  plain object/array/func/map/set は object-like）。
-  値を返さない多数派クラスは従来の高速パス（ConstructResult を発行しない、ctor 呼び出しに dst 無し）を
-  維持＝方針3そのまま。
-  検証（V8 一致・ASan クリーン）: object 返り 99 5 / primitive 返り 7（無視）/ 通常 3 / array 返り 3 1
-  （array も object-like）。通常クラスは ts_construct_result を 0 回（高速パス維持）。golden
-  new_ctor_return 追加（計 46）。unit テスト 7 件 PASS（ConstructResult は exhaustive match を壊さず）。
-  当初の `v2 undeclared`（ctor 返り値を捨てて codegen が壊れる）バグ解消。
-  U-1〜U-5 と独立に実装（proto 統一の前後どちらでも可）。今回は U-5 前に先行実装。
+- **U-6 DONE (new operator step 4)**: Only for classes whose ctor can return a value (already marked
+  `constructor-returns-value` by class_extract), the new lowering gives the ctor call a dst to capture the
+  return value and emits `ConstructResult{dst,inst,ret}`. codegen emits `ts_construct_result(inst, ret)`
+  (ret if it is object-like; the instance if primitive/undefined/null). escape analysis adds inst+ret to
+  op_forces_materialization and, in the escape arm, treats dst as an alias of the instance. The runtime
+  `ts_construct_result` classifies number/string/bool/undef/null as primitive (everything else = plain
+  object/array/func/map/set is object-like).
+  The majority of classes, which return no value, keep the previous fast path (no ConstructResult emitted, no
+  dst on the ctor call) = Principle 3 exactly.
+  Verification (V8 agreement, ASan clean): object return 99 5 / primitive return 7 (ignored) / normal 3 /
+  array return 3 1 (array is also object-like). Normal classes invoke ts_construct_result 0 times (fast path
+  preserved). Added golden new_ctor_return (46 total). 7 unit tests PASS (ConstructResult does not break the
+  exhaustive match). Fixed the original `v2 undeclared` bug (codegen breaking from discarding the ctor return
+  value). Implemented independently of U-1..U-5 (before or after proto unification is fine). This time it was
+  done ahead of U-5.
 
-### 残り
-- **U-5**: Map/Set/Function/Promise/Coro に共通ヘッダ前置 + proto 設置（U-2/U-3 と同パターン）。
-  これで ts_get/ts_set のガードを完全撤去でき、map:any.method() 等も proto 経由で解決可能に。
+### Remaining
+- **U-5**: Prepend the common header to Map/Set/Function/Promise/Coro + set up protos (same pattern as
+  U-2/U-3). This makes it possible to remove the ts_get/ts_set guard entirely, and lets map:any.method() etc.
+  resolve via proto as well.
 
-- **U-5 DONE（func/map/set 共通ヘッダ化、proto 設置は部分）**: ts_func/ts_map/ts_set_t に
-  `ts_obj_common o;` を前置（U-2 と同パターン、メンバ名 code/env/keys/vals/elems 保持で本体無修正）。
-  GC mark を各 o.props/o.proto も辿るよう、free を o.props も解放するよう更新。ts_get/ts_set のガードを
-  `kind_has_common_header(kind)`（OBJECT/ARRAY/FUNC/MAP/SET）に一般化。promise/coro/accessor は内部
-  オブジェクトで property-bag receiver にならないため共通ヘッダ非対象（従来通りガード外）。
-  proto は NULL 初期。Map/Set/Function プロトタイプへの builtin ラッパ登録（U-3 の配列と同じ仕組み）は
-  フォローオン。今回の主眼はメモリ安全性の確立（共通ヘッダで ts_get/ts_set が安全動作）と統一モデルの
-  構造的完成。
-  検証（V8 一致・ASan クリーン）: Map.set/get/size, Set.add/has/size, クロージャ呼び出し、500 回ループの
-  GC stress（375250）。map:any.keys() は共通ヘッダ経由で安全に loud-fail（overflow なし、ガード
-  band-aid 不要に）。runtime + golden 緑。
-  注: ts_object/ts_array/ts_func/ts_map/ts_set_t が全て ts_obj_common 前置で統一。当初の
-  「kind != TS_KIND_OBJECT ガード（band-aid）」は kind_has_common_header による正当な分類に置き換わった。
+- **U-5 DONE (func/map/set given the common header; proto setup partial)**: Prepended `ts_obj_common o;` to
+  ts_func/ts_map/ts_set_t (same pattern as U-2; keeping member names code/env/keys/vals/elems, the bodies are
+  unmodified). Updated GC mark to also traverse each o.props/o.proto, and free to also free o.props.
+  Generalized the ts_get/ts_set guard to `kind_has_common_header(kind)` (OBJECT/ARRAY/FUNC/MAP/SET).
+  promise/coro/accessor are internal objects that never become a property-bag receiver, so they are not
+  subject to the common header (still outside the guard, as before). proto is NULL-initialized. Registering
+  builtin wrappers on the Map/Set/Function prototypes (the same mechanism as U-3's array) is a follow-on. The
+  focus this time is establishing memory safety (ts_get/ts_set operate safely via the common header) and the
+  structural completion of the unified model.
+  Verification (V8 agreement, ASan clean): Map.set/get/size, Set.add/has/size, closure calls, GC stress of a
+  500-iteration loop (375250). map:any.keys() safely loud-fails via the common header (no overflow, the guard
+  band-aid is no longer needed). runtime + golden green.
+  Note: ts_object/ts_array/ts_func/ts_map/ts_set_t are all unified with the ts_obj_common prefix. The original
+  "kind != TS_KIND_OBJECT guard (band-aid)" was replaced by a legitimate classification via
+  kind_has_common_header.
 
-### フォローオン（任意）
-- Map/Set/Function プロトタイプに builtin を ts_func ラッパで登録（U-3 の配列と同パターン）→ any 型の
-  m.get()/s.has()/fn.call() 等を proto 経由で解決。現状は静的 dispatch で動き、any 型のみ loud-fail。
-- promise/coro/accessor の共通ヘッダ化（必要になれば。現状 property-bag receiver にならず不要）。
+### Follow-ons (optional)
+- Register builtins on the Map/Set/Function prototypes as ts_func wrappers (same pattern as U-3's array) → to
+  resolve `any`-typed m.get()/s.has()/fn.call() etc. via proto. Currently these work via static dispatch, and
+  only the `any` type loud-fails.
+- Give promise/coro/accessor the common header (if it becomes necessary; currently unneeded since they never
+  become a property-bag receiver).
 
-- **フォローオン DONE (Map/Set プロトタイプへの builtin 登録)**: U-3 の配列と同じ仕組みで Map.prototype /
-  Set.prototype を実装。
-  - runtime: ts_mapproto_*（set/get/has/delete/clear/keys/values/forEach）/ ts_setproto_*（add/has/
-    delete/clear/values/forEach）= 各 builtin を ts_code でラップ。g_map_proto/g_set_proto
-    （proto=g_object_proto）+ init/register。ts_new_map/ts_new_set で o.proto を設定。`size` は
-    プロパティ（メソッドでない）ので登録対象外（CallBuiltin map.size/set.size の高速パス）。
-  - exporter: mapProtoMethods/setProtoMethods を emit。emit_c が ts_setup_map_proto/ts_setup_set_proto
-    を生成し main で呼ぶ。Program に map_proto_methods/set_proto_methods 追加（fixtures 6 個更新）。
-  - 成果（V8 一致・ASan クリーン）: **any 型 Map/Set の動的メソッド（get/has/delete/forEach 等、
-    コールバック付き含む）が proto 経由で解決**。型付き Map/Set は静的 dispatch を維持（proto は動的
-    パスのみに作用）。golden any_mapset_methods 追加（計 47）。runtime_anymethod_safe を「array/map/set
-    すべて正しく解決」に更新。
+- **Follow-on DONE (registering builtins on the Map/Set prototypes)**: Implemented Map.prototype /
+  Set.prototype with the same mechanism as U-3's array.
+  - runtime: ts_mapproto_* (set/get/has/delete/clear/keys/values/forEach) / ts_setproto_* (add/has/
+    delete/clear/values/forEach) = each builtin wrapped in ts_code. g_map_proto/g_set_proto
+    (proto=g_object_proto) + init/register. Set o.proto in ts_new_map/ts_new_set. `size` is a property (not a
+    method), so it is not a registration target (the CallBuiltin map.size/set.size fast path).
+  - exporter: emit mapProtoMethods/setProtoMethods. emit_c generates ts_setup_map_proto/ts_setup_set_proto and
+    calls them in main. Added map_proto_methods/set_proto_methods to Program (updated 6 fixtures).
+  - Result (V8 agreement, ASan clean): **dynamic methods on `any`-typed Map/Set (get/has/delete/forEach etc.,
+    including with callbacks) resolve via proto**. Typed Map/Set keep static dispatch (proto acts only on the
+    dynamic path). Added golden any_mapset_methods (47 total). Updated runtime_anymethod_safe to "array/map/set
+    all resolve correctly."
 
-### フル CI（U-5 + U-6 + フォローオン）
-全グリーン: unit 7 件 / ci_fast（reject-symbol, anymethod-safe 含む）/ golden 47 / perf 全 budget 内
-（obj 207ms, typed_field 187ms, int 392ms, float 250ms, inherit 83ms, generic 198ms）/ correct1 /
-correct2。統一オブジェクトモデル U-1〜U-6 + フォローオン完了。
+### Full CI (U-5 + U-6 + follow-ons)
+All green: 7 unit tests / ci_fast (including reject-symbol, anymethod-safe) / golden 47 / all perf within
+budget (obj 207ms, typed_field 187ms, int 392ms, float 250ms, inherit 83ms, generic 198ms) / correct1 /
+correct2. Unified object model U-1..U-6 + follow-ons complete.
 
-- **フォローオン DONE (Function.prototype: call/apply/bind)**: JS 意味論を V8 で確認の上実装。
-  - 意味論: f.call(thisArg,a,b)=this=thisArg+個別引数 / f.apply(thisArg,[a,b])=配列引数 /
-    f.bind(thisArg,...partial)=this と先頭引数を固定した新関数 / free 関数(this 無し)は thisArg 無視。
-  - runtime: ts_func に `uint8_t takes_this`（callee が args[0] を this として読むか）。ts_make_fn が
-    f->o.proto=g_function_proto を設定、takes_this 付き変種 ts_make_fn_t。invoke_with_this（takes_this の
-    ときのみ thisArg を args[0] に注入）。ts_funcproto_call/apply/bind。ts_bound_thunk（env=[target,
-    thisArg,partial...] を捕捉、ts_call が env を prepend）。g_function_proto + init/register。
-  - ts_get/ts_set のエントリガードを `ts_is_propbag(v)=ts_is_obj(v)||ts_is_func(v)` に拡張（**関数は
-    TS_SEL_FUNC セレクタを持ち TS_SEL_OBJECT でないため、従来 ts_get が関数値を弾いていたバグを修正**。
-    配列/Map/Set は OBJECT セレクタなので元々通っていた）。
-  - exporter: トップレベル関数を値として参照する箇所（f.call の f、コールバック）で AllocClosure を発行し
-    ts_func 化（従来 TS_UNDEFINED のままだったバグを修正）。明示的 `this` パラメータ
-    （function f(this:T,...)）を thisParam として検出し通常パラメータループからスキップ＋takesThis=true。
-    Function struct に takes_this、Program に function_proto_methods。emit_c は fn_takes_this マップを
-    Ctx に通し AllocClosure で ts_make_fn_t(...,tt) を発行、ts_setup_function_proto を生成。
-  - **this パラメータ関数の直接呼び出し**（f(1,2)）: Direct 呼び出しサイトで callee が funcTakesThisIds に
-    含まれるとき undefined の this スロットを args 先頭に prepend。**Value/コールバック呼び出し**
-    （const g=f; g(1,2) / apply2(f)）: ts_call_value が takes_this の callee に undefined this を注入
-    （ts_call は method 経由で this が既に args[0] にあるため不変）。
-  - **任意式の callee 呼び出し**（greet.bind(o)("World") など、callee が CallExpression）: Unknown
-    fallback で callee を値に lower し Value 呼び出し（従来 dynamic-dispatch-unsupported で落ちていた）。
-  - 検証（V8 一致・ASan クリーン）: call 103 / apply 107 / bind 部分適用 115 / bind 150 / 直接呼び出し 3 /
-    Value 呼び出し 9 / free 関数 call 7 / free bind 15 / bind 即時呼び出し Hello World。通常コールバック
-    （map/reduce/高階関数）は takes_this=0 で ts_call 委譲のため不変。golden func_call_apply_bind 追加（計 48）。
+- **Follow-on DONE (Function.prototype: call/apply/bind)**: Implemented after confirming the JS semantics
+  against V8.
+  - Semantics: f.call(thisArg,a,b)=this=thisArg+individual arguments / f.apply(thisArg,[a,b])=array arguments
+    / f.bind(thisArg,...partial)=a new function with this and the leading arguments fixed / a free function
+    (no this) ignores thisArg.
+  - runtime: `uint8_t takes_this` on ts_func (whether the callee reads args[0] as this). ts_make_fn sets
+    f->o.proto=g_function_proto; the takes_this-bearing variant ts_make_fn_t. invoke_with_this (injects thisArg
+    into args[0] only when takes_this). ts_funcproto_call/apply/bind. ts_bound_thunk (captures env=[target,
+    thisArg,partial...]; ts_call prepends env). g_function_proto + init/register.
+  - Extended the ts_get/ts_set entry guard to `ts_is_propbag(v)=ts_is_obj(v)||ts_is_func(v)` (**fixes a bug
+    where ts_get previously rejected function values, because a function has the TS_SEL_FUNC selector and not
+    TS_SEL_OBJECT**; arrays/Map/Set have the OBJECT selector, so they passed all along).
+  - exporter: at sites that reference a top-level function as a value (the f in f.call, callbacks), emit
+    AllocClosure to make it a ts_func (fixes a bug where it previously stayed TS_UNDEFINED). Detect an explicit
+    `this` parameter (function f(this:T,...)) as thisParam, skip it in the normal parameter loop, and set
+    takesThis=true. takes_this on the Function struct, function_proto_methods on Program. emit_c threads the
+    fn_takes_this map through Ctx, emits ts_make_fn_t(...,tt) at AllocClosure, and generates
+    ts_setup_function_proto.
+  - **Direct call of a this-parameter function** (f(1,2)): at a Direct call site, when the callee is in
+    funcTakesThisIds, prepend an undefined this slot at the front of args. **Value/callback call**
+    (const g=f; g(1,2) / apply2(f)): ts_call_value injects an undefined this into a takes_this callee (ts_call
+    is unchanged because via method the this is already at args[0]).
+  - **Call of an arbitrary-expression callee** (greet.bind(o)("World") etc., where the callee is a
+    CallExpression): in the Unknown fallback, lower the callee to a value and do a Value call (previously it
+    fell over with dynamic-dispatch-unsupported).
+  - Verification (V8 agreement, ASan clean): call 103 / apply 107 / bind partial application 115 / bind 150 /
+    direct call 3 / Value call 9 / free function call 7 / free bind 15 / immediately-invoked bind Hello World.
+    Normal callbacks (map/reduce/higher-order functions) are unchanged because takes_this=0 delegates to
+    ts_call. Added golden func_call_apply_bind (48 total).
 
-### フル CI（Function.prototype フォローオン）
-全グリーン: unit 7 / ci_fast / golden 48 / perf 全 budget 内（obj 204ms, typed_field 181ms, int 380ms,
-float 251ms, inherit 85ms, generic 193ms）/ correct1 / correct2。
+### Full CI (Function.prototype follow-on)
+All green: unit 7 / ci_fast / golden 48 / all perf within budget (obj 204ms, typed_field 181ms, int 380ms,
+float 251ms, inherit 85ms, generic 193ms) / correct1 / correct2.
 
-### 残るフォローオン（任意）
-- fn.name / fn.length（メタ情報。現状未実装、必要時に）。
-- promise/coro/accessor の共通ヘッダ化（property-bag receiver にならず不要）。
+### Remaining follow-ons (optional)
+- fn.name / fn.length (metadata; currently unimplemented, when needed).
+- Give promise/coro/accessor the common header (unneeded since they never become a property-bag receiver).
 
-## ベンチ高速化 + 階層化テスト基盤 + 網羅テスト(session 3)
+## Bench speedup + tiered test infrastructure + exhaustive tests (session 3)
 
-### ベンチ高速化(約33倍)
-測定でボトルネックを特定: 1ベンチあたり export 約1.8s(node 起動 + tsc Program 構築)、解析 3ms、コンパイル 148ms。
-- exporter に **`--batch` モード** 追加(`exporter.ts:batchMain`):
-  - 当初「全ファイルを1つの `ts.Program` に入れる」案は壊した(各ベンチが global script で `function main()` 等が衝突)
-  - **正解**: `lib.*.d.ts` をキャッシュする共有 CompilerHost + ファイルごと独立 Program。初回 1.0s、以降 18ms/ファイル
-- **`--transpile-batch` モード** 追加: `ts.transpileModule` で型を剥がして V8 リファレンス .js を生成(`if(typeof main==='function')main();` を末尾に付加)
-- `run_benchmarks.sh` をバッチ対応に書き換え、`scripts/run_conformance.sh` を新設
-- 結果: 全62ベンチ export を 3.4s に、golden iter 48件を 16s に短縮(従来 ~90s)
+### Bench speedup (~33x)
+Measurement pinpointed the bottleneck: per benchmark, export ~1.8s (node startup + tsc Program construction),
+analysis 3ms, compile 148ms.
+- Added a **`--batch` mode** to the exporter (`exporter.ts:batchMain`):
+  - The initial idea of "put all files into one `ts.Program`" broke (each benchmark is a global script, so
+    `function main()` etc. collide)
+  - **The correct answer**: a shared CompilerHost that caches `lib.*.d.ts` + a separate Program per file. First
+    time 1.0s, thereafter 18ms/file
+- Added a **`--transpile-batch` mode**: uses `ts.transpileModule` to strip types and generate the V8 reference
+  .js (appending `if(typeof main==='function')main();` at the end)
+- Rewrote `run_benchmarks.sh` to support batch mode, and added `scripts/run_conformance.sh`
+- Result: shortened export of all 62 benchmarks to 3.4s, and the 48 golden iterations to 16s (previously ~90s)
 
-### 階層化テスト基盤(`tests/conformance/{basic,exhaustive}/`)
-- **V8 が唯一の正解**(手書きの expected 値は持たない、`--transpile-batch` で自動生成)
-- ファイルを置くだけでテスト追加可能
-- `TSAOT_CONF_SHARD=i/n` で分散実行可能
-- basic(3件、回帰ネット) / exhaustive(34件、10カテゴリ: numbers/strings/arrays/objects/control/closures/classes/generics/maps_sets/iteration)
+### Tiered test infrastructure (`tests/conformance/{basic,exhaustive}/`)
+- **V8 is the sole source of truth** (no hand-written expected values; auto-generated by `--transpile-batch`)
+- Tests can be added just by dropping in a file
+- Distributed execution is possible via `TSAOT_CONF_SHARD=i/n`
+- basic (3, regression net) / exhaustive (34, 10 categories:
+  numbers/strings/arrays/objects/control/closures/classes/generics/maps_sets/iteration)
 
-### 網羅テストが発見し、修正したバグ(全 V8 一致・ASan クリーン)
+### Bugs the exhaustive tests found and fixed (all V8-agreeing, ASan-clean)
 
-**数値・型系**:
-- 数値レシーバメソッド `.toFixed()`/`toString(radix)`/`toPrecision()` — number ビルトイン種別追加 + ランタイム(half-away-from-zero で V8 に一致)
-- 文字列 `lastIndexOf`
-- **単項マイナスの float が int に切り捨て**(`Math.abs(-3.14)→3` の重大バグ)— `infer_int_locals` に UnOp 処理追加、結果の int 性は演算子と被演算子で決定
-- ビット演算子 `& | ^ << >> >>>`、`**`、`~` — JS ToInt32/ToUint32(NaN/Inf→0、truncate toward 0、mod 2^32)で実装。`ts_to_int32(double)`/`ts_to_uint32(double)` を `ts_rt.h` に追加。`~x` は常に int32 を返す
-- 可変長 `Math.max/min` — ネスト2引数に畳み込み
-- `isNaN`/`isFinite`/`NaN`/`Infinity` グローバル — **`ConstVal::NaN/PosInf/NegInf`** 追加(NaN/Inf は有効な JSON 数値でないため専用タグが必要)、`collect_non_numeric_consts` でこれらを numeric 扱いに
+**Numeric / type system**:
+- Numeric-receiver methods `.toFixed()`/`toString(radix)`/`toPrecision()` — added a number builtin kind +
+  runtime (half-away-from-zero to match V8)
+- String `lastIndexOf`
+- **Unary-minus float truncated to int** (the serious bug `Math.abs(-3.14)→3`) — added UnOp handling to
+  `infer_int_locals`; the result's int-ness is determined by the operator and the operand
+- Bitwise operators `& | ^ << >> >>>`, `**`, `~` — implemented with JS ToInt32/ToUint32 (NaN/Inf→0, truncate
+  toward 0, mod 2^32). Added `ts_to_int32(double)`/`ts_to_uint32(double)` to `ts_rt.h`. `~x` always returns
+  int32
+- Variadic `Math.max/min` — folded into nested 2-argument calls
+- `isNaN`/`isFinite`/`NaN`/`Infinity` globals — added **`ConstVal::NaN/PosInf/NegInf`** (a dedicated tag is
+  needed since NaN/Inf are not valid JSON numbers), and treat these as numeric in `collect_non_numeric_consts`
 
-**制御構文・コレクション**:
-- **switch フォールスルー**(`case 1: case 2: case 3: <body>`)— 空ボディ case の `===` 比較を短絡 If(`||` BinOp は codegen 未対応)で OR グループ化
-- **可変長 `array.push(4,5)`** — 全引数を append、結果は新しい長さ
-- **`map.keys()`/`values()` の for-of** — ビルトイン配列返り値は dynamic iterator protocol ではなく配列反復を優先(generator/custom iterator は従来通り `resolveIterator` 経由)
-- **文字列の for-of**(`for(ch of "abc")`)— `GenericLen` + `string.charAt` で文字反復
-- **for ループ内 `continue`** — incrementor を cond_body 先頭に移動(first フラグでガード)、loop kind "forc" を追加。`continue` が cond_body へジャンプ → incrementor が走る。perf カーネル全 budget 内、回帰なし
+**Control flow / collections**:
+- **switch fall-through** (`case 1: case 2: case 3: <body>`) — OR-group the `===` comparisons of empty-body
+  cases via a short-circuit If (the `||` BinOp is unsupported in codegen)
+- **Variadic `array.push(4,5)`** — append all arguments; the result is the new length
+- **for-of over `map.keys()`/`values()`** — a builtin's array return value prefers array iteration over the
+  dynamic iterator protocol (generators/custom iterators still go via `resolveIterator` as before)
+- **for-of over a string** (`for(ch of "abc")`) — character iteration via `GenericLen` + `string.charAt`
+- **`continue` inside a for loop** — move the incrementor to the head of cond_body (guarded by a first flag),
+  add loop kind "forc". `continue` jumps to cond_body → the incrementor runs. All perf kernels within budget,
+  no regression
 
-**クロージャ**:
-- **キャプチャされた仮引数がセルに初期化されない**(重大バグ): `function compose(f,g){ return x=>f(g(x)); }` で f,g が undefined → "value is not a function"。関数入口で `StoreField(cell, VALUE, paramLocal)` を発行(`this` 除く)
-- **任意式の callee 呼び出し**(`greet.bind(o)("World")` 等、callee が CallExpression)— Unknown fallback で callee を値に lower し Value 呼び出し
+**Closures**:
+- **A captured parameter is not initialized into its cell** (serious bug): in
+  `function compose(f,g){ return x=>f(g(x)); }`, f,g are undefined → "value is not a function". Emit
+  `StoreField(cell, VALUE, paramLocal)` at function entry (excluding `this`)
+- **Call of an arbitrary-expression callee** (`greet.bind(o)("World")` etc., where the callee is a
+  CallExpression) — in the Unknown fallback, lower the callee to a value and do a Value call
 
-### 進捗
-- exhaustive: 20 → 31/34 パス
-- 残り3件は `KNOWN_GAPS.md` 記録済み・高リスクのため保留:
-  - `classes__basic`/`methods` — インライナの局所衝突(`Math.sqrt(this.x*this.x+this.y*this.y)` のインライン時、sqrt 引数局所が誤番号付け; free 関数の `Math.sqrt(x*x+y*y)` は動く)
-  - `closures__capture` — ループ `let i` のイテレーションごとキャプチャ(per-iteration セル割当が必要)
+### Progress
+- exhaustive: 20 → 31/34 pass
+- The remaining 3 are recorded in `KNOWN_GAPS.md` and deferred as high-risk:
+  - `classes__basic`/`methods` — inliner local collision (when `Math.sqrt(this.x*this.x+this.y*this.y)` is
+    inlined, the sqrt argument local is mis-numbered; the free-function `Math.sqrt(x*x+y*y)` works)
+  - `closures__capture` — per-iteration capture of a loop `let i` (needs per-iteration cell allocation)
 
-### フル CI(全シャード)
-unit 7 / ci_fast / golden 48 / perf 全 budget 内 / correct1 / correct2 すべてグリーン。
+### Full CI (all shards)
+unit 7 / ci_fast / golden 48 / all perf within budget / correct1 / correct2 all green.
 
-## 残ギャップ完全解消(session 4)
+## Complete resolution of the remaining gaps (session 4)
 
-### Bug 1: インライナ局所漏れ
-**症状**: `class Point { dist(){ return Math.sqrt(this.x*this.x+this.y*this.y); } }` がインライン化されると、`sqrt` の引数局所が誤番号付けされ(計算した sum が別局所、`sqrt` は未初期化局所を読む)、`p.dist()` が 0 を返す。
+### Bug 1: inliner local leak
+**Symptom**: when `class Point { dist(){ return Math.sqrt(this.x*this.x+this.y*this.y); } }` is inlined, the
+argument local of `sqrt` is mis-numbered (the computed sum lands in a different local, and `sqrt` reads an
+uninitialized local), so `p.dist()` returns 0.
 
-**原因**: `analyzer/src/sroa.rs::inline_callee` の `other => out.push(other.clone())` フォールスルー。`CallBuiltinStatic`、`AllocClosure`、`If`/`Loop`/`TryCatch`(ネスト本体)、その他多数の variant が **operand を remap せずに raw clone** されていた。
+**Cause**: the `other => out.push(other.clone())` fall-through in `analyzer/src/sroa.rs::inline_callee`.
+`CallBuiltinStatic`, `AllocClosure`, `If`/`Loop`/`TryCatch` (nested bodies), and many other variants were
+being **raw-cloned without remapping their operands**.
 
-**修正**: `remap_inst_operands(inst, &m)` ヘルパを追加。`Inst` 全 variant を網羅(Rust が compile-time に exhaustiveness を検証)し、ネスト本体は再帰 remap。`subst` は `callee.locals` から事前構築するため、本体内の全 LocalId をカバー。
+**Fix**: added a `remap_inst_operands(inst, &m)` helper. It covers all `Inst` variants (Rust verifies
+exhaustiveness at compile time) and recursively remaps nested bodies. `subst` is prebuilt from
+`callee.locals`, so it covers every LocalId in the body.
 
-### Bug 1.5: SROA が非数値フィールドを Primitive(double)として確保
-**症状**: `class Stack { items: number[] = []; }` で `items` スカラが double として作られ、`ts_to_num(配列ポインタ)` で値が破壊される。`classes__methods` が `0 NaN 0` を出力。
+### Bug 1.5: SROA allocated a non-numeric field as a Primitive (double)
+**Symptom**: in `class Stack { items: number[] = []; }` the `items` scalar was created as a double, and
+`ts_to_num(array pointer)` corrupted the value. `classes__methods` output `0 NaN 0`.
 
-**原因**: `process_function` の `fresh(next, new_locals, false)` がフィールド型に関係なく全スカラを Primitive にしていた。
+**Cause**: `process_function`'s `fresh(next, new_locals, false)` was making every scalar a Primitive
+regardless of the field type.
 
-**修正**: `is_numeric = numeric_fields.contains(&(cls, f))` で判定し、numeric は Primitive、それ以外は Reference に。
+**Fix**: decide via `is_numeric = numeric_fields.contains(&(cls, f))`; numeric becomes Primitive, everything
+else becomes Reference.
 
-### Bug 1.6: `.push(x)` がレシーバを確認せずに ArrayPush に lower
-**症状**: 上記修正後も `classes__methods` が `0 NaN 0`。ユーザクラスの `Stack#push` メソッド呼び出しがインスタンスを配列扱いして `ArrayPush` 化されていた。
+### Bug 1.6: `.push(x)` lowered to ArrayPush without checking the receiver
+**Symptom**: even after the above fix, `classes__methods` output `0 NaN 0`. A user class's `Stack#push`
+method call was treating the instance as an array and being turned into `ArrayPush`.
 
-**原因**: exporter の早期パス(`fnx.name.text === "push" && argc === 1`)が無条件に `ArrayPush` を発行。
+**Cause**: the exporter's early path (`fnx.name.text === "push" && argc === 1`) unconditionally emitted
+`ArrayPush`.
 
-**修正**: `builtinReceiverKind === "array"` でガード。
+**Fix**: guarded with `builtinReceiverKind === "array"`.
 
-### Bug 1.7: `numeric_fields` の継承伝播漏れ(性能リグレッション)
-**症状**: Bug 1.5 修正後、`inherit_sroa_kernel` が **192ms vs 130ms budget で SLOW**。
+### Bug 1.7: missing inheritance propagation of `numeric_fields` (performance regression)
+**Symptom**: after the Bug 1.5 fix, `inherit_sroa_kernel` was **SLOW at 192ms vs a 130ms budget**.
 
-**原因**: `IntBox extends Base<number>` のとき、SROA ターゲットが IntBox(class id 1)で `numeric_fields.contains((1, 2))` を検索するが、`numeric_fields` には `(Base$number=2, value=2)` しか入っていない。継承フィールドが numeric として認識されず、スカラが Reference になり、ホットループで box/unbox 往復が発生。
+**Cause**: with `IntBox extends Base<number>`, the SROA target is IntBox (class id 1) and it looks up
+`numeric_fields.contains((1, 2))`, but `numeric_fields` only contains `(Base$number=2, value=2)`. The
+inherited field is not recognized as numeric, the scalar becomes a Reference, and box/unbox round-trips occur
+in the hot loop.
 
-**修正**: `numeric_fields` 構築後、親チェーンを歩いて `(descendant_cls, fid)` を全子孫に伝播。`inherit_sroa_kernel` を 91ms に回復。
+**Fix**: after building `numeric_fields`, walk the parent chain to propagate `(descendant_cls, fid)` to all
+descendants. Restored `inherit_sroa_kernel` to 91ms.
 
-### Bug 2: ループ `let` のイテレーションごとキャプチャ
-**症状**: `for(let i=0;i<3;i++){fns.push(()=>i);}` で全クロージャが i=3 を見る(V8: 0 1 2)。
+### Bug 2: per-iteration capture of a loop `let`
+**Symptom**: in `for(let i=0;i<3;i++){fns.push(()=>i);}` all closures see i=3 (V8: 0 1 2).
 
-**原因**: prologue でセルを 1 個だけ確保しループ全体で共有。仕様(ECMA-262 §14.7.4.2 ForBodyEvaluation)では各イテレーションで新しい binding を作成し、closure capture は body 時点の値を保持するべき。
+**Cause**: the prologue allocates only one cell, shared across the whole loop. The spec (ECMA-262 §14.7.4.2
+ForBodyEvaluation) creates a new binding on each iteration, and a closure capture should retain the value at
+the point of the body.
 
-**設計上の重要ポイント** (`docs/inliner_and_loop_let_capture.md`):
-- 仕様の順序: body → CreatePerIterationEnvironment(値を新環境へコピー) → update(新環境を変更) → test
-- つまり update は **次のイテレーションのセルを変更する**(現イテレーションのセルではない)。iter-N の body 中に capture されたクロージャは iter-N のセル(update 前の値)を保持し続ける
+**Key design point** (`docs/inliner_and_loop_let_capture.md`):
+- The spec order: body → CreatePerIterationEnvironment (copy values into a new environment) → update (mutate
+  the new environment) → test
+- That is, update **mutates the cell of the next iteration** (not the current iteration's cell). A closure
+  captured during iter-N's body keeps holding iter-N's cell (the value before the update)
 
-**修正**: `for` 文 lowering で captured-let を検出(`initializer.flags & NodeFlags.Let` かつ単一 identifier 宣言子かつ symbol が `cellBindings` に存在)。検出時に per-iteration セル割当の構造を生成:
+**Fix**: detect a captured-let during `for` statement lowering (`initializer.flags & NodeFlags.Let` and a
+single-identifier declarator and the symbol present in `cellBindings`). On detection, generate the
+per-iteration cell-allocation structure:
 
 ```
 init_cell = AllocObject(site_init);
@@ -454,28 +526,29 @@ first = true;
 Loop {
   cond_body: {
     if (!first) {
-      prev = cellLocal.value;        // 現セル(iter-N)の値
-      cellLocal = AllocObject(site_per);  // iter-N+1 のセル
+      prev = cellLocal.value;        // value of the current cell (iter-N)
+      cellLocal = AllocObject(site_per);  // the cell for iter-N+1
       cellLocal.value = prev;
-      update;                          // iter-N+1 のセルを変更
+      update;                          // mutate the iter-N+1 cell
     }
     first = false;
     cond_local = <cond using cellLocal>
   }
-  body: { BODY }   // cellAccess を cellLocal にオーバーライド
+  body: { BODY }   // override cellAccess to cellLocal
 }
 ```
 
-`continue` は `forc` ループの C `continue`(cond_body へジャンプ)で正しく動く。prologue のセル割当は dead code(gcc が除去)。
+`continue` works correctly via the `forc` loop's C `continue` (a jump to cond_body). The prologue's cell
+allocation is dead code (gcc removes it).
 
-### 追加 conformance テスト
+### Added conformance tests
 
-- `closures/capture_continue.ts`: captured `let i` + `continue` の交互作用
-- `closures/capture_mutate.ts`: クロージャが i と arr[i] の両方を参照
-- `closures/capture_no_alloc.ts`: 非キャプチャ `let i` の単一セル経路(性能回帰ネット)
+- `closures/capture_continue.ts`: the interaction of a captured `let i` + `continue`
+- `closures/capture_mutate.ts`: a closure that references both i and arr[i]
+- `closures/capture_no_alloc.ts`: the single-cell path of a non-captured `let i` (performance regression net)
 
-### 最終状態(session 4 完了)
+### Final state (session 4 complete)
 
-- **exhaustive: 31/34 → 37/37 PASS**(新3テスト含む)
-- basic 3/3, golden 48, perf 全カーネル budget 内, correct1, correct2, ci_fast すべてグリーン
-- 既知の coverage ギャップなし
+- **exhaustive: 31/34 → 37/37 PASS** (including the 3 new tests)
+- basic 3/3, golden 48, all perf kernels within budget, correct1, correct2, ci_fast all green
+- No known coverage gaps

@@ -114,7 +114,7 @@ invoked via ts_call, which prepends the closure's captured environment.
   only the stdlib surface snapshot.
 
 
-## Field-name table & enumeration (方針B)
+## Field-name table & enumeration (Approach B)
 JSON.stringify / Object.keys|values|entries need to recover string property names
 from the interned field-id keys. The compiler emits a static FIELD_NAMES[] table
 (id -> name) into the C output; ts_init_fields seeds a runtime table at startup.

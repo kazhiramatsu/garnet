@@ -1,70 +1,75 @@
-# `export` の値共有 — ModuleEnvironment と Ref 型による設計(ESM 専用)
+# `export` value sharing — design via ModuleEnvironment and Ref types (ESM only)
 
-`module_linkage.md` の追補。**tsaot は ESM のみをサポートする。** CommonJS
-(`require` / `module.exports` / `exports.x`) は v1/v2 を通じて loud reject。
-本書では ESM の import/export の値共有を、ModuleEnvironment と Ref 型で表現
-する設計を定める。実装はしない。データ構造と Inst レベルまで設計する。
+A supplement to `module_linkage.md`. **tsaot supports ESM only.** CommonJS
+(`require` / `module.exports` / `exports.x`) is loud-rejected throughout v1/v2.
+This document defines a design that expresses ESM import/export value sharing in
+terms of ModuleEnvironment and Ref types. It is not an implementation. It designs
+down to the data-structure and Inst level.
 
-## 0. なぜ ESM のみか
+## 0. Why ESM only
 
-CJS と ESM は表面的に似て非なるもので、両方サポートすると複雑性が倍になる:
+CJS and ESM look similar on the surface but are fundamentally different; supporting
+both doubles the complexity:
 
-- **live binding の有無**: ESM の `export let x` は importer 側から live に
-  見える。CJS の `module.exports.x` はプロパティ読み(`require` 後の
-  destructure は snapshot)。意味論が根本から違う。
-- **export 形の決定タイミング**: ESM は構文的に静的(`export` 宣言で確定)。
-  CJS は `module.exports` への代入を実行して初めて決まる(動的)。tsaot の
-  型駆動・静的解析の方針には ESM が圧倒的に合う。
-- **require の実行モデル**: CJS は同期実行 + キャッシュ + 循環時の部分初期化
-  という独自の実行モデルを持つ。ESM は静的リンク + postorder init。
-- **TypeScript の実態**: `.ts` の現代コードは圧倒的に ESM。`module.exports`
-  を手書きする `.ts` は稀。
+- **Presence of live bindings**: ESM's `export let x` is visible as a live value
+  from the importer side. CJS's `module.exports.x` is a property read (a
+  destructure after `require` is a snapshot). The semantics differ fundamentally.
+- **Timing of when the export shape is decided**: ESM is syntactically static
+  (fixed by the `export` declaration). CJS is only decided once the assignment to
+  `module.exports` executes (dynamic). ESM is an overwhelmingly better fit for
+  tsaot's type-driven, static-analysis approach.
+- **require's execution model**: CJS has its own execution model of synchronous
+  execution + caching + partial initialization under cycles. ESM is static linking
+  + postorder init.
+- **The reality of TypeScript**: modern `.ts` code is overwhelmingly ESM.
+  Hand-written `module.exports` in `.ts` is rare.
 
-したがって tsaot は **ESM 単一モジュールモデル** を採用し、CJS 構文
-(`require()`, `module.exports`, `exports.x`, `import x = require()`,
-`export =`) はすべて明示的に loud reject する。
+Therefore tsaot adopts a **single ESM module model**, and explicitly loud-rejects
+all CJS syntax (`require()`, `module.exports`, `exports.x`, `import x = require()`,
+`export =`).
 
-V8 リファレンスとの整合性: 単一ファイルで import の無いコードは CJS でも
-ESM でも transpile 結果が同一(検証済み)。よって既存の V8 オラクル
-(transpileModule)はそのまま有効。将来 import を含むテストを追加する際は
-オラクルを ESM (`module: ESNext`) に切り替える。
-
----
-
-## 1. 前案の何が誤りだったか
-
-前案: ESM の `export let x = 0` を tsaot の `GLOBALS[i]` に置く。
-
-問題:
-- **名前衝突**: モジュール A の `export let x` とモジュール B の `export let x`
-  が「グローバル」を共有してしまう。別 i を振っても、それは
-  GlobalEnvironment ではなく「モジュールローカルな名前付きスロット」であって
-  `GLOBALS[]` の誤用。
-- **`globalThis` との混線**: ESM の `export let x` は `globalThis` に乗らない
-  のが spec。`GLOBALS[]` に置くと将来 `globalThis.x` を実装したとき分離困難。
-- **概念の混乱**: spec の `GlobalEnvironment` と `ModuleEnvironment` は別の
-  Environment Record。tsaot は両者を別に表現すべき。
-
-正しいモデル:
-- 各モジュールは自分の `ModuleEnvironment` を持つ
-- `ModuleEnvironment` の中に `let`/`const`/`var`/`function`/`class` の binding
-- `import { x } from "./B"` で得られる main の `x` binding は、**B モジュールの
-  `x` binding を指す参照**
-- 「参照」は **生ポインタではなく Ref 型**(振る舞いが変わるため)
-
-`GLOBALS[]` / `LoadGlobal` / `StoreGlobal` は **真のグローバル**(`globalThis.x`
-への書き込み、ホスト注入グローバル)のための infrastructure として残す。
-export の値共有には使わない。
+Consistency with the V8 reference: for a single file with no imports, the
+transpile result is identical under both CJS and ESM (verified). Thus the existing
+V8 oracle (transpileModule) remains valid as-is. When adding tests that include
+imports in the future, switch the oracle to ESM (`module: ESNext`).
 
 ---
 
-## 2. Ref 型の必要性
+## 1. What was wrong with the previous proposal
 
-「Ref 型」を入れる動機を spec の挙動で説明する。
+Previous proposal: place ESM's `export let x = 0` into tsaot's `GLOBALS[i]`.
 
-### 2.1 振る舞いが違うケース
+Problems:
+- **Name collisions**: module A's `export let x` and module B's `export let x`
+  would end up sharing a "global." Even if you assign a different i, that is not a
+  GlobalEnvironment but a "module-local named slot," which is a misuse of
+  `GLOBALS[]`.
+- **Crossed wires with `globalThis`**: per spec, ESM's `export let x` does not land
+  on `globalThis`. Placing it in `GLOBALS[]` makes it hard to separate later when
+  `globalThis.x` is implemented.
+- **Conceptual confusion**: the spec's `GlobalEnvironment` and `ModuleEnvironment`
+  are distinct Environment Records. tsaot should represent the two separately.
 
-**(a) 同じモジュール内のローカル変数**
+The correct model:
+- Each module has its own `ModuleEnvironment`
+- Inside the `ModuleEnvironment` are the `let`/`const`/`var`/`function`/`class` bindings
+- The `x` binding in main obtained via `import { x } from "./B"` is **a reference
+  that points to module B's `x` binding**
+- The "reference" is a **Ref type, not a raw pointer** (because its behavior differs)
+
+`GLOBALS[]` / `LoadGlobal` / `StoreGlobal` remain as infrastructure for **true
+globals** (writes to `globalThis.x`, host-injected globals). They are not used for
+export value sharing.
+
+---
+
+## 2. The need for a Ref type
+
+The motivation for introducing a "Ref type" is explained through spec behavior.
+
+### 2.1 Cases where the behavior differs
+
+**(a) A local variable within the same module**
 
 ```ts
 let x = 0;
@@ -72,10 +77,10 @@ function read() { return x; }
 function bump() { x++; }
 ```
 
-ローカル `x` への read/write は普通の slot 読み書き。`x` が closure に capture
-されると `ts_object` セルになる(tsaot の現状の機構)。
+Reading/writing local `x` is an ordinary slot read/write. When `x` is captured by a
+closure it becomes a `ts_object` cell (tsaot's current mechanism).
 
-**(b) ESM の export**
+**(b) An ESM export**
 
 ```ts
 // counter.mjs
@@ -85,71 +90,74 @@ export let x = 0;
 ```ts
 // main.mjs
 import { x } from "./counter.mjs";
-x;                    // OK: live read(counter.mjs の x の現在値)
-x = 1;                // ERROR: assignment to constant variable(静的に弾く)
+x;                    // OK: live read (current value of x in counter.mjs)
+x = 1;                // ERROR: assignment to constant variable (statically rejected)
 ```
 
-importer 側で **read は許可、write は静的にエラー**。「他モジュールの slot を
-指すポインタ」だけでは表現できない。**書き込み時の振る舞いが違う**。
+On the importer side, **reads are allowed, writes are a static error**. This
+cannot be expressed by just "a pointer to another module's slot." **The behavior
+on write differs**.
 
 **(c) namespace import**
 
 ```ts
 import * as ns from "./counter.mjs";
 ns.x;                 // live read
-ns.x = 1;             // TypeError(実行時、frozen object 由来)
+ns.x = 1;             // TypeError (at runtime, because it is a frozen object)
 ```
 
-`ns` 自体は frozen object。`ns.x` の読みは getter 経由で live。書きは frozen
-で TypeError。**namespace の各プロパティが live binding を指す**。
+`ns` itself is a frozen object. Reading `ns.x` is live via a getter. Writing is a
+TypeError because it is frozen. **Each property of the namespace points to a live
+binding**.
 
-### 2.2 つまり
+### 2.2 In short
 
-「他の変数への参照」は 2 つの異なる振る舞いを持つ(CJS を切ったので 2 つ):
+A "reference to another variable" has two distinct behaviors (two, since we
+dropped CJS):
 
-| 形式 | read | write |
+| Form | read | write |
 |---|---|---|
-| ローカル変数(セル) | slot 読み | slot 書き |
-| ESM import の binding | export 元の live | 静的エラー(コンパイル時拒否) |
+| Local variable (cell) | slot read | slot write |
+| ESM import binding | live from the export source | static error (compile-time rejection) |
 
-これらを全部「セルへのポインタ」で表現すると、書き込みの振る舞いの違い
-(slot 書きか静的エラーか)が消える。**Ref 型として区別する** ことで lowering
-と verifier が正しく判定できる。
+If you represent all of these as "a pointer to a cell," the difference in write
+behavior (slot write vs. static error) disappears. **Distinguishing them as Ref
+types** lets lowering and the verifier judge correctly.
 
 ---
 
-## 3. 新しい IR 概念
+## 3. New IR concepts
 
-### 3.1 `Binding` の拡張
+### 3.1 Extending `Binding`
 
-既存の `Binding` 構造体 (`escape_ir.rs:319` 付近) に kind を加える:
+Add a kind to the existing `Binding` struct (around `escape_ir.rs:319`):
 
 ```rust
 pub struct Binding {
     pub id: BindingId,
     pub name: String,
-    pub decl_kind: DeclKind,   // 既存: Var/Let/Const/Param/FunctionDecl/ClassDecl/CatchParam/Import/Builtin
+    pub decl_kind: DeclKind,   // existing: Var/Let/Const/Param/FunctionDecl/ClassDecl/CatchParam/Import/Builtin
     pub scope: ScopeId,
     pub type_id: TypeId,
     pub mutable: bool,
     pub tdz: bool,
-    pub binding_kind: BindingKind,  // NEW: 値表現の種別
+    pub binding_kind: BindingKind,  // NEW: kind of value representation
     // ...
 }
 
 pub enum BindingKind {
-    /// 通常のローカル変数。値はその function frame に格納、closure 経由で
-    /// capture されるとセル化される。今までの全ての binding はこれ。
+    /// An ordinary local variable. The value is stored in that function frame, and
+    /// becomes a cell when captured via a closure. Every binding so far is this one.
     Local,
 
-    /// このモジュールが export している binding(let/var/const)。
-    /// 実体はセルで、Local と同じ読み書き。ただし is_exported = true で
-    /// GC root 化され、他モジュールから ImportRef で参照される。
+    /// A binding that this module exports (let/var/const).
+    /// Physically it is a cell, read/written the same as Local. But with is_exported = true
+    /// it is made a GC root and referenced from other modules via ImportRef.
     LocalExport,
 
-    /// 他 ESM モジュールから import した live binding への参照。
-    /// 読み: 指し先の現在値を返す(LoadImport opcode)。
-    /// 書き: コンパイル時エラー(exporter が loud reject)。
+    /// A reference to a live binding imported from another ESM module.
+    /// Read: returns the current value of the target (LoadImport opcode).
+    /// Write: a compile-time error (the exporter loud-rejects it).
     ImportRef {
         from_module: ModuleId,
         from_binding: BindingId,
@@ -157,46 +165,46 @@ pub enum BindingKind {
 }
 ```
 
-CJS 用のバリアント(`CjsModuleExports` / `CjsImport`)は **入れない**。
+The CJS-oriented variants (`CjsModuleExports` / `CjsImport`) are **not included**.
 
-### 3.2 `RefKind` の拡張(値分類)
+### 3.2 Extending `RefKind` (value classification)
 
-既存の `RefKind` (`exporter.ts:23`):
+The existing `RefKind` (`exporter.ts:23`):
 
 ```ts
 type RefKind = "reference" | "primitive" | "unknown";
 ```
 
-に **ref-to-other-binding** の概念を足す:
+Add the concept of **ref-to-other-binding** to it:
 
 ```ts
 type RefKind =
-  | "primitive"      // 既存: unboxed scalar
-  | "reference"      // 既存: boxed reference (ts_object 値)
-  | "unknown"        // 既存: type-erased / any
-  | "import_ref";    // NEW: ImportRef binding の値表現
+  | "primitive"      // existing: unboxed scalar
+  | "reference"      // existing: boxed reference (ts_object value)
+  | "unknown"        // existing: type-erased / any
+  | "import_ref";    // NEW: value representation of an ImportRef binding
 ```
 
-`import_ref` は実行時には「指し先の cell」を持つ。read 時に LoadImport で
-間接化される。write は IR 生成時に拒否。
+At runtime, `import_ref` holds "the cell it points to." On read it is indirected
+via LoadImport. Writes are rejected at IR generation time.
 
-### 3.3 新 Inst 群
+### 3.3 New Inst set
 
 ```rust
 /// Read through an import ref. `src` is a local whose binding is an
-/// ImportRef. Codegen: ts_get(src, FIELD_VALUE) — cell read。
-/// verifier は「モジュール境界を越える読み」と認識する。
+/// ImportRef. Codegen: ts_get(src, FIELD_VALUE) — cell read.
+/// The verifier recognizes it as "a read that crosses a module boundary."
 LoadImport { dst: LocalId, src: LocalId },
 
 /// Materialize a namespace object for `import * as ns from "./B"`.
-/// `module` は対象モジュール id。結果は frozen object で、各プロパティが
-/// 対応する ImportRef を読む getter。
+/// `module` is the target module id. The result is a frozen object, each of whose
+/// properties is a getter that reads the corresponding ImportRef.
 AllocNamespace { dst: LocalId, module: ModuleId, site: SiteId },
 ```
 
-ImportRef への write opcode は **存在しない**。exporter が IR 生成段階で loud
-reject する。verifier は「ImportRef binding を src とする store は IR に
-あってはならない」を保証する。
+There is **no** write opcode for ImportRef. The exporter loud-rejects it at the IR
+generation stage. The verifier guarantees that "a store whose src is an ImportRef
+binding must not appear in the IR."
 
 ### 3.4 ModuleInfo
 
@@ -204,40 +212,41 @@ reject する。verifier は「ImportRef binding を src とする store は IR 
 pub struct ModuleInfo {
     pub id: ModuleId,
     pub name: String,          // canonical path, e.g. "./counter"
-    pub init_fn: FunctionId,   // この module の __module_init_<N>
+    pub init_fn: FunctionId,   // this module's __module_init_<N>
     pub exports: Vec<ExportEntry>,
     pub imports: Vec<ImportEntry>,
 }
 
 pub struct ExportEntry {
-    pub name: String,          // public な名前(`export { foo as bar }` の bar)
-    pub binding: BindingId,    // このモジュール内の binding(LocalExport)
+    pub name: String,          // the public name (the bar of `export { foo as bar }`)
+    pub binding: BindingId,    // the binding within this module (LocalExport)
     pub kind: ExportKind,      // Value | Function | Class | Default
 }
 
 pub struct ImportEntry {
-    pub local: BindingId,      // このモジュール内の ImportRef binding
-    pub from_module: ModuleId, // 指し先のモジュール
-    pub from_binding: BindingId, // 指し先のモジュール内の binding(LocalExport)
+    pub local: BindingId,      // the ImportRef binding within this module
+    pub from_module: ModuleId, // the target module
+    pub from_binding: BindingId, // the binding within the target module (LocalExport)
 }
 
 pub enum ExportKind { Value, Function, Class, Default }
 ```
 
-`ModuleKind` enum は不要(ESM only)。
+The `ModuleKind` enum is unnecessary (ESM only).
 
 ---
 
-## 4. ランタイム表現
+## 4. Runtime representation
 
 ### 4.1 LocalExport binding
 
-実装上は **既存のセル機構そのまま**。`__module_init_<B>` のフレームで
-`AllocObject` して `ts_object` を確保、`StoreField .VALUE` で初期化、GC root
-として登録(export されているので生存期間がプログラム全体)。
+In implementation terms it is **exactly the existing cell mechanism**. In the
+frame of `__module_init_<B>`, `AllocObject` allocates a `ts_object`, `StoreField
+.VALUE` initializes it, and it is registered as a GC root (since it is exported,
+its lifetime spans the entire program).
 
 ```c
-static tsv MODULE_B_x;   // GC root, 中身は ts_object (cell)
+static tsv MODULE_B_x;   // GC root, its content is a ts_object (cell)
 
 void __module_init_B(void) {
   MODULE_B_x = ts_new_object();
@@ -247,499 +256,520 @@ void __module_init_B(void) {
 }
 ```
 
-B 内部の `x` 参照は `ts_get(MODULE_B_x, FIELD_VALUE)` と
-`ts_set(MODULE_B_x, FIELD_VALUE, ...)`。既存のセル lowering と全く同じ。
+References to `x` inside B are `ts_get(MODULE_B_x, FIELD_VALUE)` and
+`ts_set(MODULE_B_x, FIELD_VALUE, ...)`. Exactly the same as the existing cell
+lowering.
 
 ### 4.2 ImportRef binding
 
-importer A は import した時点で参照を確立:
+Importer A establishes the reference at the point of import:
 
 ```c
-static tsv MODULE_A_x;   // ImportRef を保持する slot
+static tsv MODULE_A_x;   // slot that holds the ImportRef
 
 void __module_init_A(void) {
-  // 必須: B が先に init されている(リンカが順序保証)
-  MODULE_A_x = MODULE_B_x;   // 同じ cell オブジェクトを共有
+  // required: B must be initialized first (the linker guarantees the order)
+  MODULE_A_x = MODULE_B_x;   // shares the same cell object
   ts_gc_root(&MODULE_A_x);
 }
 ```
 
-A 内部での `x` 参照は **`LoadImport` opcode**:
+References to `x` inside A are the **`LoadImport` opcode**:
 
 ```c
 // LoadImport dst src=MODULE_A_x → dst = MODULE_A_x.VALUE
 tsv val = ts_get(MODULE_A_x, FIELD_VALUE);
 ```
 
-`MODULE_A_x` 自体が cell オブジェクトを保持しているので一段間接。A 側コードで
-`x = 1` のような write は **exporter が IR 生成時に loud reject**。
+Since `MODULE_A_x` itself holds the cell object, there is one level of
+indirection. A write like `x = 1` in A-side code is **loud-rejected by the exporter
+at IR generation time**.
 
-#### 4.2.1 「ローカル変数 ↔ ImportRef」の連続性
+#### 4.2.1 The continuity between "local variable ↔ ImportRef"
 
-cell mechanism と ImportRef は **物理レイアウトが同じ**(両方とも
-「`ts_object` の `.VALUE` フィールドが現在値」)。違いは:
+The cell mechanism and ImportRef have **the same physical layout** (in both, "the
+`.VALUE` field of a `ts_object` is the current value"). The differences:
 
-- ローカル変数: cell を作るのも読み書きするのも同じモジュール内
-- ImportRef: cell を作るのは export 元、読むのは import 側、書くのは export 元のみ
+- Local variable: creating the cell and reading/writing it both happen within the same module
+- ImportRef: the cell is created by the export source, read by the import side, and written only by the export source
 
-既存の cell 機構を「モジュール境界を越えて参照可能にする」だけで物理表現は
-完成する。**新しいランタイム機構は不要**。新規追加は IR レベルの区別だけ。
+The physical representation is complete simply by making the existing cell
+mechanism "referenceable across module boundaries." **No new runtime mechanism is
+needed**. The only new addition is the distinction at the IR level.
 
-### 4.3 関数と class の export
+### 4.3 Exporting functions and classes
 
-`export function f() {...}` の場合、`f` は再代入不可な const-like binding
-(spec 上、関数宣言は immutable な binding)。
+In the case of `export function f() {...}`, `f` is a non-reassignable, const-like
+binding (per spec, a function declaration is an immutable binding).
 
-- B 側: `f` は普通の functionId、`__module_init_B` 内では fnRef value
-- importer A 側: `import { f } from "./B"` は **f の static functionId を
-  import**。A 側の `f(...)` 呼び出しは `Call Direct { func: B's fId }`
+- B side: `f` is an ordinary functionId; inside `__module_init_B` it is an fnRef value
+- Importer A side: `import { f } from "./B"` **imports f's static functionId**. An
+  `f(...)` call on the A side is `Call Direct { func: B's fId }`
 
-ImportRef を経由しない **direct reference**。理由:
-- ESM の関数 binding は再代入不可なので、間接化の必要が無い
-- パフォーマンス上、direct call の方が圧倒的に速い
+A **direct reference** that does not go through an ImportRef. Reasons:
+- ESM's function binding is non-reassignable, so there is no need for indirection
+- For performance, a direct call is overwhelmingly faster
 
-ただし B 側で `f` がモジュール変数を capture している場合(`scope_resolution.md`
-§7 の escape hatch 不適用ケース)、`f` は cell-bound closure として表現され、
-import 側も cell 経由でアクセス。linker が決定する。
+However, if `f` on the B side captures a module variable (the case where the escape
+hatch of `scope_resolution.md` §7 does not apply), `f` is represented as a
+cell-bound closure, and the import side also accesses it via the cell. The linker
+decides.
 
-class も同様。`export class C` は classId による direct reference。
+Classes are the same. `export class C` is a direct reference via classId.
 
-#### 4.3.1 統一的な見方
+#### 4.3.1 A unified view
 
-ESM export は 2 種類:
+There are two kinds of ESM export:
 
-- **値 export**(`let`/`var`/`const`): ImportRef 経由(cell + LoadImport)
-- **静的 export**(`function`/`class`): direct reference(linker が
-  functionId/classId を解決)
+- **Value exports** (`let`/`var`/`const`): via ImportRef (cell + LoadImport)
+- **Static exports** (`function`/`class`): direct reference (the linker resolves
+  the functionId/classId)
 
-これは spec の binding mutability に対応(`export let x` は mutable、
-`export function f` は immutable)。
+This corresponds to the spec's binding mutability (`export let x` is mutable,
+`export function f` is immutable).
 
 ### 4.4 namespace import (`import * as ns from "./B"`)
 
-`ns` は Module Namespace Object(spec §18)。性質:
+`ns` is a Module Namespace Object (spec §18). Characteristics:
 
-- **read-only view**: 各プロパティは対応する binding の live read。`ns.x` は
-  毎回 export 元の現在値を返す(getter 経由)。
-- **書き込み不可**: `ns.x = 1` は実行時 TypeError(spec §18.2 の `setProperty`
-  は常に false)。
-- **exportNames は固定でソート済み**(spec §18.2)。`Object.keys(ns)` は
-  ソートされた export 名のリスト。
-- **`default` も含む**(namespace は `export *` と違い default を含む)。
-- **存在しない名前は `undefined`**(throw ではない)。
+- **read-only view**: each property is a live read of the corresponding binding.
+  `ns.x` returns the export source's current value every time (via a getter).
+- **Not writable**: `ns.x = 1` is a runtime TypeError (the `setProperty` of spec
+  §18.2 is always false).
+- **exportNames are fixed and sorted** (spec §18.2). `Object.keys(ns)` is the
+  sorted list of export names.
+- **Includes `default`** (a namespace, unlike `export *`, includes default).
+- **A non-existent name is `undefined`** (not a throw).
 
 ```c
 // AllocNamespace dst module=B site=...
 tsv ns = ts_new_namespace_object(B_module_id);
-//   exportNames はソート済み: ["bump", "counter", "default", ...]
-//   各 own-property は getter:
-//     "counter" → LoadImport from MODULE_B_counter (live, TDZ チェック付き)
+//   exportNames are sorted: ["bump", "counter", "default", ...]
+//   each own-property is a getter:
+//     "counter" → LoadImport from MODULE_B_counter (live, with a TDZ check)
 //     "bump"    → B's bump as a fn value (direct)
-//   [[Set]] は常に失敗(read-only)
+//   [[Set]] always fails (read-only)
 ```
 
-namespace の各プロパティ read は §4.2 の `LoadImport` と同じ TDZ チェックを
-通す(循環 import 中に未初期化 binding を namespace 経由で読むと
-ReferenceError)。
+Each property read of the namespace passes through the same TDZ check as the
+`LoadImport` of §4.2 (reading an uninitialized binding via a namespace during a
+circular import is a ReferenceError).
 
-最適化: namespace object の構築コストは高いので、
+Optimization: since the cost of constructing a namespace object is high,
 
-- `ns` を別の関数に渡したり変数に代入する場合 → AllocNamespace で実体化
-- `ns.x` のように propaccess の receiver としてのみ使う場合 → AllocNamespace
-  を作らず、その場で対応する LoadImport / direct reference に置換
+- If `ns` is passed to another function or assigned to a variable → materialize it with AllocNamespace
+- If it is used only as the receiver of a propaccess like `ns.x` → do not create an
+  AllocNamespace; replace it in place with the corresponding LoadImport / direct reference
 
-linker の責務。
+This is the linker's responsibility.
 
 ### 4.5 default export
 
-`export default expr` は名前 `default` の export として扱う。
+`export default expr` is treated as an export with the name `default`.
 
-- `export default 42` → 名前 `default`, kind=Value, `__module_init_B` 内で評価
-- `export default function f() {}` → 名前 `default`, kind=Function
-- `export default class C {}` → 名前 `default`, kind=Class
+- `export default 42` → name `default`, kind=Value, evaluated inside `__module_init_B`
+- `export default function f() {}` → name `default`, kind=Function
+- `export default class C {}` → name `default`, kind=Class
 
-importer 側: `import X from "./B"` は `import { default as X } from "./B"` と
-等価。§4.2 / §4.3 と同じ機制。
+Importer side: `import X from "./B"` is equivalent to
+`import { default as X } from "./B"`. Same mechanism as §4.2 / §4.3.
 
-### 4.6 再エクスポート
+### 4.6 Re-exports
 
 ```ts
 // b.mjs
 export { v } from "./c.mjs";
 ```
 
-B のエクスポートテーブルの `v` エントリは **c.mjs の v binding を直接指す**。
-リンカが alias chain を辿って解決:
+The `v` entry in B's export table **points directly to c.mjs's v binding**. The
+linker resolves it by following the alias chain:
 
 ```rust
-// b.mjs の ExportEntry:
+// b.mjs's ExportEntry:
 ExportEntry {
   name: "v",
-  binding: BindingId(c.mjs の v),  // ← c.mjs の binding を直接指す
+  binding: BindingId(c.mjs's v),  // ← points directly at c.mjs's binding
   kind: ExportKind::Value,
 }
 ```
 
-importer A が `import { v } from "./B"` した場合、A の ImportRef は **c.mjs の
-v** を from_module/from_binding にする(B を経由しない)。chain の
-オーバーヘッドが消える。
+When importer A does `import { v } from "./B"`, A's ImportRef sets **c.mjs's v** as
+from_module/from_binding (it does not go through B). The chain overhead disappears.
 
-`export * from "./c.mjs"` も同様。リンク時に c の全 export を B の export として
-平坦に登録。名前衝突は spec のルール(`export *` 同士の衝突は ambiguous、その
-名前を import すると参照エラー)に従う。`default` は `export *` では再エクスポート
-されない(spec §10.4 の注意点)。
+`export * from "./c.mjs"` is the same. At link time, all of c's exports are
+registered flatly as B's exports. Name collisions follow the spec's rules (a
+collision between two `export *`s is ambiguous, and importing that name is a
+reference error). `default` is not re-exported by `export *` (a caveat of spec
+§10.4).
 
-### 4.7 side-effect import / 全 import 形の対応表
+### 4.7 side-effect import / mapping table of all import forms
 
-提示された ESM 仕様書 §6.8 の import 形をすべて網羅する:
+This covers all the import forms of §6.8 of the provided ESM specification:
 
-| 構文 | localName | tsaot の表現 |
+| Syntax | localName | tsaot's representation |
 |---|---|---|
-| `import v from "mod"` | `v` | ImportRef(target=`default`)or direct ref |
-| `import * as ns from "mod"` | `ns` | namespace binding(§4.4)|
-| `import { x } from "mod"` | `x` | ImportRef(target=`x`)|
-| `import { x as y } from "mod"` | `y` | ImportRef(target=`x`)、local 名は `y` |
-| `import "mod"` | なし | **local binding を作らない**。依存として link/evaluate 対象に追加するのみ |
-| `import type { T } from "mod"` | (型のみ) | **erase**(ランタイム表現なし)|
+| `import v from "mod"` | `v` | ImportRef (target=`default`) or direct ref |
+| `import * as ns from "mod"` | `ns` | namespace binding (§4.4) |
+| `import { x } from "mod"` | `x` | ImportRef (target=`x`) |
+| `import { x as y } from "mod"` | `y` | ImportRef (target=`x`), local name is `y` |
+| `import "mod"` | none | **creates no local binding**. Only adds it as a dependency to the link/evaluate set |
+| `import type { T } from "mod"` | (type only) | **erase** (no runtime representation) |
 
-`import "./setup.mjs"`(side-effect import)は binding を作らないが、`setup.mjs`
-の `__module_init` は依存として **postorder で評価される**(spec §9.4)。
-tsaot はモジュールグラフの辺としては張るが ImportEntry は作らない。
+`import "./setup.mjs"` (a side-effect import) creates no binding, but
+`setup.mjs`'s `__module_init` is **evaluated in postorder** as a dependency (spec
+§9.4). tsaot draws it as an edge in the module graph but creates no ImportEntry.
 
-renamed import (`import { x as y }`)では、**`y` のみが local binding**。`x` と
-いう名前は importer の ModuleEnvironment には作られない(実測確認済み:
-renamed import 後に元名を参照すると ReferenceError)。
+In a renamed import (`import { x as y }`), **only `y` is a local binding**. The
+name `x` is not created in the importer's ModuleEnvironment (empirically confirmed:
+referencing the original name after a renamed import is a ReferenceError).
 
-### 4.8 strict-mode 不変条件(spec §21, §22)
+### 4.8 strict-mode invariants (spec §21, §22)
 
-ESM は常に strict mode code(spec §2.1)。tsaot が ESM をサポートする際の
-不変条件:
+ESM is always strict mode code (spec §2.1). The invariants when tsaot supports ESM:
 
-- **top-level `this` は `undefined`**(spec §21)。`scope_resolution.md` §9 で
-  既に module-level `this` を loud reject としているが、v2 で ESM を本実装する
-  際は `undefined` として扱うのが正しい(reject から `undefined` 返しに変更)。
-- **未宣言識別子への代入は ReferenceError**(spec §11.2)。sloppy mode の
-  暗黙グローバル生成は起きない。tsaot は未解決識別子を loud reject(コンパイル
-  時に検出できる)。
-- **`delete 識別子` は SyntaxError**(spec §22.4)。これは TS checker が静的に
-  弾く。tsaot は追加チェック不要。
-- **import binding への代入は TypeError/SyntaxError**(spec §13.2)。tsaot は
-  §4.2 の通り IR 生成時に loud reject。
+- **Top-level `this` is `undefined`** (spec §21). `scope_resolution.md` §9 already
+  loud-rejects module-level `this`, but when ESM is fully implemented in v2 the
+  correct behavior is to treat it as `undefined` (change from reject to returning
+  `undefined`).
+- **Assignment to an undeclared identifier is a ReferenceError** (spec §11.2). The
+  implicit global creation of sloppy mode does not occur. tsaot loud-rejects
+  unresolved identifiers (it can detect them at compile time).
+- **`delete identifier` is a SyntaxError** (spec §22.4). The TS checker rejects
+  this statically. tsaot needs no additional check.
+- **Assignment to an import binding is a TypeError/SyntaxError** (spec §13.2). tsaot
+  loud-rejects it at IR generation time as in §4.2.
 
 ---
 
-## 5. リンカ
+## 5. The linker
 
-tsaot は全モジュールを単一バイナリにコンパイルする。リンクは **コンパイル時**
-に解決済み(動的ロード無し)。
+tsaot compiles all modules into a single binary. Linking is resolved **at compile
+time** (no dynamic loading).
 
-提示された ESM 仕様書 §15 の 3 フェーズ(Load/Parse → Link/Instantiate →
-Evaluate)との対応:
+Correspondence with the three phases of §15 of the provided ESM specification
+(Load/Parse → Link/Instantiate → Evaluate):
 
-| spec フェーズ | tsaot での担当 | タイミング |
+| spec phase | handled in tsaot by | timing |
 |---|---|---|
-| Load / Parse | exporter が全モジュールを TS checker でパース | コンパイル時 |
-| Link / Instantiate | exporter + linker が binding/export table/import ref を確定し IR を生成 | コンパイル時 |
-| Evaluate | 生成された `__module_init_<N>` を postorder で実行 | 実行時 |
+| Load / Parse | the exporter parses all modules with the TS checker | compile time |
+| Link / Instantiate | the exporter + linker finalize bindings/export tables/import refs and generate IR | compile time |
+| Evaluate | run the generated `__module_init_<N>` in postorder | runtime |
 
-spec の `ModuleStatus`(new/loaded/linking/linked/evaluating/evaluated/
-errored)のうち、**Load〜Link は全部コンパイル時に解決される** ので、ランタイム
-には evaluating/evaluated に相当する状態しか残らない。AOT の利点で、循環の SCC
-検出やリンクエラーはコンパイル時に確定する。
+Of the spec's `ModuleStatus` (new/loaded/linking/linked/evaluating/evaluated/
+errored), **Load through Link are all resolved at compile time**, so at runtime
+only states corresponding to evaluating/evaluated remain. Thanks to AOT,
+cyclic SCC detection and link errors are settled at compile time.
 
-### 5.1 リンクの過程(コンパイル時)
+### 5.1 The linking process (compile time)
 
-1. **モジュールグラフ構築**: エントリファイルから `import`/`export from`/
-   side-effect import (`import "./x"`) の静的辺をたどり、関与する全モジュールを
-   列挙(spec §15.1 Load + requestedModules 収集)
-2. **シンボル解決**: 各 import について TS checker の alias を辿って **所有
-   モジュール + binding** を特定。再エクスポート chain は最終所有者まで平坦化。
-   `export *` の名前衝突は ambiguous として検出(spec §10.4 ResolveExport)
-3. **SCC 検出**: モジュールグラフに DFS で強連結成分を求める(spec §17.2)。
-   循環は SCC 単位で扱う。**ただし AOT なので SCC 内の binding 確定は全部
-   コンパイル時**。ランタイムには評価順序(postorder)だけ残る
-4. **コード生成**: 各モジュール用の `__module_init_<N>` を生成。エントリ
-   ポイントから全モジュールの init を postorder で順次呼び出し
-5. **セルアドレス確定**: export された binding のセルは `__module_init_<N>` 内で
-   確保され、グローバル static に保存。importer はその static を直接参照
+1. **Build the module graph**: from the entry file, follow the static edges of
+   `import`/`export from`/side-effect import (`import "./x"`) and enumerate all
+   involved modules (spec §15.1 Load + requestedModules collection)
+2. **Symbol resolution**: for each import, follow the TS checker's alias to
+   identify the **owning module + binding**. Flatten re-export chains to the final
+   owner. Name collisions from `export *` are detected as ambiguous (spec §10.4
+   ResolveExport)
+3. **SCC detection**: find strongly connected components in the module graph via
+   DFS (spec §17.2). Cycles are handled per SCC. **However, since this is AOT,
+   finalizing bindings within an SCC is entirely at compile time**. Only the
+   evaluation order (postorder) remains at runtime
+4. **Code generation**: generate a `__module_init_<N>` for each module. From the
+   entry point, call every module's init in postorder in sequence
+5. **Finalize cell addresses**: cells for exported bindings are allocated inside
+   `__module_init_<N>` and stored in a global static. The importer references that
+   static directly
 
-### 5.2 循環インポートと TDZ(重要な訂正)
+### 5.2 Circular imports and TDZ (an important correction)
 
-ESM の循環:
+An ESM cycle:
 
 ```ts
 // x.mjs
 import { yfn } from "./y.mjs";
 export let xval = 100;
 export function xfn() { return xval; }
-console.log(yfn());      // y.mjs の関数を呼ぶ(関数は前方解決済み)
+console.log(yfn());      // calls y.mjs's function (functions are forward-resolved)
 
 // y.mjs
 import { xval, xfn } from "./x.mjs";
-export function yfn() { return xfn(); }  // 実行時には xfn は初期化済み
+export function yfn() { return xfn(); }  // at runtime xfn is already initialized
 ```
 
-ESM では「binding の解決はリンク時、値の参照は実行時」。関数経由のアクセスは
-循環でも動く(実測確認済み)。
+In ESM, "binding resolution is at link time, value reference is at runtime." Access
+via functions works even in a cycle (empirically confirmed).
 
-**ここで前案を訂正する。** 前案は「TDZ は TS checker に委ね、実行時チェックを
-emit しない」(`scope_resolution.md` §6.3 の単一モジュール内方針)としていた
-が、**循環 import の TDZ は TS checker が静的に検出できない実行時条件** である
-(実測で確認: 下記コードは tsc では無エラー、実行時に ReferenceError):
+**Here we correct the previous proposal.** The previous proposal said "delegate TDZ
+to the TS checker and do not emit runtime checks" (the within-single-module policy
+of `scope_resolution.md` §6.3), but **the TDZ of a circular import is a runtime
+condition that the TS checker cannot detect statically** (confirmed empirically:
+the code below is error-free under tsc but a ReferenceError at runtime):
 
 ```ts
 // a.mjs
 import { b } from "./b.mjs";
 export let a = "A";
-console.log(b);          // b が未初期化なら ReferenceError(実行時)
+console.log(b);          // ReferenceError if b is uninitialized (at runtime)
 
 // b.mjs
 import { a } from "./a.mjs";
 export let b = "B";
-console.log(a);          // a.mjs を先に評価していなければ ReferenceError
+console.log(a);          // ReferenceError unless a.mjs was evaluated first
 ```
 
-`node a.mjs` 実行で `Cannot access 'a' before initialization` が出る(検証
-済み)。tsc は循環依存の評価順序を静的に追えないため、このエラーを **コンパイル
-時に出せない**。
+Running `node a.mjs` produces `Cannot access 'a' before initialization` (verified).
+Because tsc cannot statically trace the evaluation order of circular dependencies,
+it **cannot raise this error at compile time**.
 
-したがって **ImportRef の読みには実行時 TDZ チェックが必要**。これは単一
-モジュール内の `let`/`const` TDZ(`scope_resolution.md` §6.3 で TS checker に
-委ねるとした)とは別の話。区別:
+Therefore **reading an ImportRef requires a runtime TDZ check**. This is a separate
+matter from the within-single-module `let`/`const` TDZ (which
+`scope_resolution.md` §6.3 delegated to the TS checker). The distinction:
 
-- **同一モジュール内の `let`/`const` TDZ**: ソース順で静的に判定可能 → TS
-  checker に委ねる(従来方針を維持)。
-- **循環 import 越しの ImportRef TDZ**: 評価順序依存の実行時条件 → tsaot が
-  **実行時チェックを emit する**。
+- **Within-same-module `let`/`const` TDZ**: statically determinable by source order
+  → delegate to the TS checker (keep the existing policy).
+- **ImportRef TDZ across a circular import**: an evaluation-order-dependent runtime
+  condition → tsaot **emits a runtime check**.
 
-実装: セル(`ts_object`)に「初期化済みか」のフラグを持たせる。提示された
-ESM 仕様書 §6.6 の `Cell { initialized, mutable, value }` モデルに対応する。
-tsaot では:
+Implementation: give the cell (`ts_object`) a flag for "whether it is initialized."
+This corresponds to the `Cell { initialized, mutable, value }` model of §6.6 of the
+provided ESM specification. In tsaot:
 
-- export された binding のセルは `__module_init_<B>` で確保された時点では
-  **uninitialized**(`let`/`const` の場合)。初期化子の実行で initialized に
-  なる。`var`/`function` は確保時点で initialized(hoist)。
-- `LoadImport` の codegen は、初期化フラグを確認してから値を返す:
+- A cell for an exported binding is **uninitialized** at the point it is allocated
+  in `__module_init_<B>` (in the `let`/`const` case). It becomes initialized when
+  the initializer runs. `var`/`function` are initialized at allocation time (hoist).
+- `LoadImport`'s codegen checks the initialization flag before returning the value:
   ```c
   // LoadImport dst src=MODULE_A_x
   if (!ts_cell_initialized(MODULE_A_x)) ts_throw_tdz("x");
   dst = ts_get(MODULE_A_x, FIELD_VALUE);
   ```
-- 同一モジュール内の通常セル読み(`LoadField`)には TDZ チェックを入れない
-  (静的に保証されるため)。`LoadImport` のみがチェックを持つ。
+- Ordinary in-module cell reads (`LoadField`) do not get a TDZ check (because it is
+  statically guaranteed). Only `LoadImport` carries the check.
 
-これは v2 の話。v1 は単一ファイルなので循環 import は起き得ず、`LoadImport`
-自体が emit されない。ただし **セルに initialized フラグを持たせる設計** は
-v1 の段階で `ts_object` 表現に組み込んでおく(後付けだと runtime レイアウト
-変更になり高コスト)。詳細は §7 で。
+This is a v2 matter. Since v1 is a single file, circular imports cannot occur and
+`LoadImport` itself is not emitted. However, **the design of giving cells an
+initialized flag** should be built into the `ts_object` representation already at
+the v1 stage (retrofitting it later would be a costly runtime layout change).
+Details in §7.
 
-### 5.3 これは GlobalEnvironment 機構とは別物
+### 5.3 This is distinct from the GlobalEnvironment mechanism
 
-export された binding のセルは **モジュール毎の static**(`MODULE_B_x`)で
-あって、`GLOBALS[]` ではない。`GLOBALS[]`/`LoadGlobal`/`StoreGlobal` は真の
-グローバル(`globalThis`、ホスト注入)専用。両者は別レイヤー。
+A cell for an exported binding is a **per-module static** (`MODULE_B_x`), not
+`GLOBALS[]`. `GLOBALS[]`/`LoadGlobal`/`StoreGlobal` are exclusively for true globals
+(`globalThis`, host injection). The two are separate layers.
 
-提示された ESM 仕様書 §3 の階層に対応:
+Corresponds to the hierarchy of §3 of the provided ESM specification:
 
 ```
 Realm
-  └─ GlobalEnvironment           ← tsaot の GLOBALS[] / builtins
+  └─ GlobalEnvironment           ← tsaot's GLOBALS[] / builtins
        ├─ globalThis
        ├─ built-in globals (console, Array, ...)
        └─ global lexical bindings
 ModuleRecord(B)
-  └─ ModuleEnvironment           ← tsaot の per-module cells (MODULE_B_x)
+  └─ ModuleEnvironment           ← tsaot's per-module cells (MODULE_B_x)
        ├─ import bindings (ImportRef)
        └─ top-level var/let/const/function/class bindings
 ```
 
-`ModuleEnvironment.[[OuterEnv]] = GlobalEnvironment`(仕様書 §6.2)に対応し、
-tsaot のスコープチェーン解決順序は:
+This corresponds to `ModuleEnvironment.[[OuterEnv]] = GlobalEnvironment`
+(specification §6.2), and tsaot's scope-chain resolution order is:
 ```
-ローカル → 外側関数(capture) → ModuleEnvironment(import含む) → Global builtins
+Local → outer function (capture) → ModuleEnvironment (incl. import) → Global builtins
 ```
 
 ---
 
-## 6. 全体像
+## 6. The big picture
 
-### 6.1 BindingKind の最終形
+### 6.1 Final form of BindingKind
 
 ```rust
 pub enum BindingKind {
-    Local,        // 普通のローカル変数(closure 経由でセル化)
-    LocalExport,  // このモジュールが export する binding(セル + GC root)
+    Local,        // an ordinary local variable (made a cell via a closure)
+    LocalExport,  // a binding that this module exports (cell + GC root)
     ImportRef { from_module: ModuleId, from_binding: BindingId },  // ESM import
 }
 ```
 
-### 6.2 Inst の追加
+### 6.2 Added Insts
 
 ```rust
 LoadImport { dst: LocalId, src: LocalId },
 AllocNamespace { dst: LocalId, module: ModuleId, site: SiteId },
 ```
 
-### 6.3 lowering 規則の要点
+### 6.3 Key lowering rules
 
-| ソース | tsaot の lowering |
+| Source | tsaot's lowering |
 |---|---|
 | `let x = 1` at module top (not exported) | `Local` binding, AllocObject (cell), StoreField .VALUE = 1 |
 | `export let x = 1` | `LocalExport` binding, AllocObject, StoreField, GC root |
-| `let x` 参照(同一モジュール内、cell 化済み) | `LoadField cell FIELD_VALUE` |
-| `x = 2` 同左 | `StoreField cell FIELD_VALUE = 2` |
-| `import { x } from "./B"` | `ImportRef` binding 作成、linker 時に from_binding 確定 |
-| `x` 参照(importer 側、ImportRef) | `LoadImport src=ImportRef_local` |
-| `x = 2` 同左 | **exporter が loud reject**(static const-like) |
-| `import * as ns` 参照 | linker が ns プロパティアクセスを観察、即時 LoadImport 等に最適化、または AllocNamespace で実体化 |
-| `export function f` | linker が外部参照可能にする(direct reference) |
+| `let x` reference (within same module, already cell-ized) | `LoadField cell FIELD_VALUE` |
+| `x = 2`, same | `StoreField cell FIELD_VALUE = 2` |
+| `import { x } from "./B"` | create `ImportRef` binding, finalize from_binding at link time |
+| `x` reference (importer side, ImportRef) | `LoadImport src=ImportRef_local` |
+| `x = 2`, same | **exporter loud-rejects** (static const-like) |
+| `import * as ns` reference | the linker observes ns property accesses and optimizes to an immediate LoadImport etc., or materializes with AllocNamespace |
+| `export function f` | the linker makes it externally referenceable (direct reference) |
 | `import { f } from "./B"`, `f()` | `Call Direct { func: B::fId }` |
-| `export class C` | direct class reference(classId) |
-| `export default expr` | 名前 `default` の export |
-| `export { v } from "./c"` | 再エクスポート、最終所有者まで平坦化 |
-| `require(...)` / `module.exports` / `exports.x` / `export =` / `import x = require()` | **loud reject**(CJS は非サポート) |
+| `export class C` | direct class reference (classId) |
+| `export default expr` | export with the name `default` |
+| `export { v } from "./c"` | re-export, flattened to the final owner |
+| `require(...)` / `module.exports` / `exports.x` / `export =` / `import x = require()` | **loud reject** (CJS is unsupported) |
 
-### 6.4 analyzer の影響
+### 6.4 Impact on the analyzer
 
-`scope_redesign_analyzer_impact.md` の更新内容:
+Updates to `scope_redesign_analyzer_impact.md`:
 
-- **escape_ir.rs**: `BindingKind` enum 追加、`Inst::LoadImport` /
-  `Inst::AllocNamespace` 追加、`ModuleInfo` / `ExportEntry` / `ImportEntry`
-  追加。Global infrastructure はそのまま。
-- **interproc.rs**: `LoadImport` は `LoadField` と同シェイプ(他オブジェクトの
-  field 読み)→ 1 arm 追加。`AllocNamespace` は frozen object + getter 群 →
-  常に External 扱いで OK(1 arm)。
-- **sroa.rs**: `LoadImport` の src は cell なので materialize 必要
-  (`LoadField` の obj と同扱い)。`AllocNamespace` の dst も materialize。
-- **devirt.rs**: 影響なし。
-- **emit_c.rs**: `LoadImport` → `ts_get(src, FIELD_VALUE)` 一発。
-  `AllocNamespace` → frozen object + getter 群。
-- **call_graph.rs**: 影響なし。
+- **escape_ir.rs**: add the `BindingKind` enum, add `Inst::LoadImport` /
+  `Inst::AllocNamespace`, add `ModuleInfo` / `ExportEntry` / `ImportEntry`. The
+  Global infrastructure stays as-is.
+- **interproc.rs**: `LoadImport` has the same shape as `LoadField` (reading another
+  object's field) → add 1 arm. `AllocNamespace` is a frozen object + a set of
+  getters → always treating it as External is fine (1 arm).
+- **sroa.rs**: `LoadImport`'s src is a cell, so it needs materialization (treated
+  the same as `LoadField`'s obj). `AllocNamespace`'s dst is also materialized.
+- **devirt.rs**: no impact.
+- **emit_c.rs**: `LoadImport` → a single `ts_get(src, FIELD_VALUE)`.
+  `AllocNamespace` → frozen object + a set of getters.
+- **call_graph.rs**: no impact.
 
-ImportRef を扱うために interproc が「モジュール境界を越える alias」を追跡する
-必要は無い。ImportRef の src local 自体が普通の `ts_object` 値で、その alias
-解析は既存通り。LoadImport は LoadField と同じシェイプ。
-
----
-
-## 7. v1 で予約しておくもの
-
-v1 は単一ファイル ESM モジュール(import/export 無し)。multi-file linkage は
-v2。v1 で予約する IR 拡張:
-
-1. **`Binding.binding_kind: BindingKind`** を追加。v1 では全 binding が
-   `BindingKind::Local`(モジュールスコープ binding も含む — v1 は単一モジュール
-   なので export されても参照する他モジュールが無い)。
-2. **`Inst::LoadImport`、`Inst::AllocNamespace`** を IR enum に登録。v1 では
-   emitter は emit しない。analyzer/codegen の arm は `unreachable!()` か
-   明確なエラーで埋め、v2 で実装。
-3. **`ModuleInfo`/`ExportEntry`/`ImportEntry`** を `Program` に追加。v1 では
-   1 個の ModuleInfo(エントリファイル)、空の imports、`is_exported=true` の
-   binding に対応する exports。
-4. **`RefKind` に `import_ref`** を追加(exporter)。v1 では使わない。
-5. **CJS 構文の loud reject** は v1 の Step 0 で実施(`module_linkage.md` §4.1)。
-   `require` / `module.exports` / `exports.x` / `export =` /
-   `import x = require()` を明示的に unsupported に。
-
-6. **【新規・要注意】セルの initialized フラグ**: 提示された ESM 仕様書 §6.6 の
-   `Cell { initialized, mutable, value }` モデルに従い、tsaot のセル
-   (`ts_object`)に「初期化済みか」を表現する手段を予約する。これは循環 import
-   越しの TDZ チェック(§5.2)に必須。
-
-   **ここが後付け困難なので v1 で決めておく価値がある**: 今のセルは `ts_object`
-   の `.VALUE` フィールド一つ。initialized フラグの置き場所として選択肢:
-   - (a) セル `ts_object` のヘッダのフラグビットを 1 本使う(レイアウト変更、
-     しかし全 ts_object に効くので慎重に)
-   - (b) `.VALUE` の初期値を特別な番兵値 `TS_UNINITIALIZED`(`TS_UNDEFINED` とは
-     別の NaN-box タグ)にして、read 時に番兵なら TDZ throw
-   - (c) セルに 2 つ目のフィールド `.INITIALIZED` を持たせる
-
-   **推奨は (b)**: NaN-boxing に `TS_UNINITIALIZED` タグを 1 つ足すだけで、
-   セルのレイアウトは不変、`LoadImport` の codegen は「読んだ値が
-   TS_UNINITIALIZED なら throw」になる。単一モジュール内の通常 `let`/`const`
-   セルにも応用でき(ただし v1 では TS checker 任せなので使わない)、将来
-   一貫した TDZ 機構になる。
-
-   v1 では TDZ チェックを emit しないが、**`TS_UNINITIALIZED` タグの予約だけは
-   v1 の NaN-boxing 設計に入れておく**(タグ空間は有限なので後から押し込むのは
-   面倒)。ランタイムに番兵値の定義と `ts_is_uninitialized()` を足すのは数行。
+interproc does not need to track "aliases that cross module boundaries" in order to
+handle ImportRef. The src local of an ImportRef is itself an ordinary `ts_object`
+value, and its alias analysis is as before. LoadImport has the same shape as
+LoadField.
 
 ---
 
-## 8. 「Ref 型」の位置づけまとめ
+## 7. What to reserve in v1
 
-「他の変数への参照を持つ新しい型」は tsaot では 3 レイヤーに分かれる:
+v1 is a single-file ESM module (no import/export). Multi-file linkage is v2. IR
+extensions reserved in v1:
 
-| レイヤー | 表現 |
+1. Add **`Binding.binding_kind: BindingKind`**. In v1 all bindings are
+   `BindingKind::Local` (including module-scope bindings — since v1 is a single
+   module, even if exported there is no other module to reference them).
+2. Register **`Inst::LoadImport`, `Inst::AllocNamespace`** in the IR enum. In v1 the
+   emitter does not emit them. Fill the analyzer/codegen arms with `unreachable!()`
+   or a clear error, and implement them in v2.
+3. Add **`ModuleInfo`/`ExportEntry`/`ImportEntry`** to `Program`. In v1: a single
+   ModuleInfo (the entry file), empty imports, and exports corresponding to
+   bindings with `is_exported=true`.
+4. Add **`import_ref` to `RefKind`** (exporter). Not used in v1.
+5. **Loud reject of CJS syntax** is done in v1's Step 0 (`module_linkage.md` §4.1).
+   Explicitly make `require` / `module.exports` / `exports.x` / `export =` /
+   `import x = require()` unsupported.
+
+6. **[New, needs attention] The cell's initialized flag**: following the
+   `Cell { initialized, mutable, value }` model of §6.6 of the provided ESM
+   specification, reserve a means to represent "whether it is initialized" in
+   tsaot's cell (`ts_object`). This is essential for the TDZ check across circular
+   imports (§5.2).
+
+   **This is hard to retrofit, so it is worth deciding in v1**: the current cell is
+   a single `.VALUE` field of a `ts_object`. Options for where to put the
+   initialized flag:
+   - (a) Use one flag bit in the header of the cell `ts_object` (a layout change,
+     but be careful since it affects all ts_object)
+   - (b) Make `.VALUE`'s initial value a special sentinel `TS_UNINITIALIZED` (a
+     NaN-box tag distinct from `TS_UNDEFINED`), and on read, TDZ throw if it is the
+     sentinel
+   - (c) Give the cell a second field `.INITIALIZED`
+
+   **The recommendation is (b)**: just adding one `TS_UNINITIALIZED` tag to
+   NaN-boxing keeps the cell layout unchanged, and `LoadImport`'s codegen becomes
+   "if the read value is `TS_UNINITIALIZED`, throw." It can also be applied to
+   ordinary within-single-module `let`/`const` cells (though v1 does not use it,
+   leaving it to the TS checker), becoming a consistent TDZ mechanism in the future.
+
+   v1 does not emit TDZ checks, but **reserve just the `TS_UNINITIALIZED` tag in
+   v1's NaN-boxing design** (tag space is finite, so cramming it in later is a
+   hassle). Adding the sentinel definition and `ts_is_uninitialized()` to the
+   runtime is a few lines.
+
+---
+
+## 8. Summary of where the "Ref type" fits
+
+"A new type that holds a reference to another variable" is split into three layers
+in tsaot:
+
+| Layer | Representation |
 |---|---|
-| IR の値分類 (`RefKind`) | `import_ref` バリアント(値が live import binding であることを示す) |
-| IR の binding 分類 (`BindingKind`) | `ImportRef { from_module, from_binding }`(binding 自身の種別) |
-| IR の opcode | `LoadImport` で読みを明示。write は IR レベルで存在しない(exporter が拒否) |
+| IR value classification (`RefKind`) | the `import_ref` variant (indicates the value is a live import binding) |
+| IR binding classification (`BindingKind`) | `ImportRef { from_module, from_binding }` (the kind of the binding itself) |
+| IR opcode | `LoadImport` makes the read explicit. Writes do not exist at the IR level (the exporter rejects them) |
 
-これらが揃って初めて:
-- analyzer が「これは live binding read だ」と認識
-- codegen が「LoadImport は src cell の .VALUE を読む(初期化チェック付き)」と
-  一意に lower
-- verifier が「ImportRef binding への write は IR にあってはならない」を保証
-- 将来の最適化(同一モジュール内 export binding のインライン化など)が型情報を使う
+Only when these are all in place:
+- the analyzer recognizes "this is a live binding read"
+- codegen unambiguously lowers "LoadImport reads the src cell's .VALUE (with an
+  initialization check)"
+- the verifier guarantees "a write to an ImportRef binding must not appear in the IR"
+- future optimizations (such as inlining within-same-module export bindings) use the type information
 
-「生ポインタ」では一切表現できない情報がここに乗る。
+This carries information that "a raw pointer" cannot express at all.
 
-### 8.1 提示された ESM 仕様書との用語対応
+### 8.1 Terminology correspondence with the provided ESM specification
 
-提示された仕様書(VM 実装視点)と tsaot(AOT コンパイラ視点)の用語対応:
+Terminology correspondence between the provided specification (VM-implementation
+viewpoint) and tsaot (AOT-compiler viewpoint):
 
-| 仕様書の概念 | tsaot での対応 |
+| Specification concept | tsaot correspondence |
 |---|---|
-| `ModuleEnvironment` | モジュール毎のセル群 + exporter のシンボル解決 |
-| `ModuleFrame` / `Cell[]` | export された binding は `static tsv MODULE_B_x`(GC root された ts_object セル) |
-| `Cell { initialized, mutable, value }` | `ts_object` の `.VALUE` + `TS_UNINITIALIZED` 番兵(§7-6)+ mutable は IR の binding_kind / TS const 性で静的に決定 |
+| `ModuleEnvironment` | per-module cells + the exporter's symbol resolution |
+| `ModuleFrame` / `Cell[]` | an exported binding is `static tsv MODULE_B_x` (a GC-rooted ts_object cell) |
+| `Cell { initialized, mutable, value }` | a `ts_object`'s `.VALUE` + the `TS_UNINITIALIZED` sentinel (§7-6) + mutable is determined statically from the IR's binding_kind / TS const-ness |
 | `ImportBinding { targetModule, targetSlot }` | `BindingKind::ImportRef { from_module, from_binding }` |
 | `DirectBinding` | `BindingKind::Local` / `LocalExport` |
-| `ModuleNamespaceObject` | `Inst::AllocNamespace` が生成する read-only オブジェクト |
-| `ExportTable` / `ResolveExport` | linker のコンパイル時シンボル解決(`ModuleInfo.exports`)|
-| Load / Link / Evaluate(spec §15)| Load+Link はコンパイル時、Evaluate は `__module_init_<N>` 実行時 |
-| `ModuleStatus` 状態機械 | コンパイル時に解決(ランタイムには評価順序のみ残る)|
-| SCC 検出(spec §17.2)| linker がコンパイル時に実施 |
+| `ModuleNamespaceObject` | the read-only object generated by `Inst::AllocNamespace` |
+| `ExportTable` / `ResolveExport` | the linker's compile-time symbol resolution (`ModuleInfo.exports`) |
+| Load / Link / Evaluate (spec §15) | Load+Link are compile time, Evaluate is `__module_init_<N>` runtime |
+| `ModuleStatus` state machine | resolved at compile time (only the evaluation order remains at runtime) |
+| SCC detection (spec §17.2) | performed by the linker at compile time |
 
-**根本的な違い**: 仕様書は **インタプリタ VM**(Link/Evaluate を実行時に行う)
-を想定。tsaot は **AOT コンパイラ** なので Load/Link を全部コンパイル時に潰す。
-ランタイムに残るのは Evaluate(各モジュールの `__module_init` を postorder で
-呼ぶ)と、循環 import の TDZ 番兵チェックだけ。これにより spec の
-`ModuleStatus`/SCC 機構の大半がコンパイル時に消える。
+**The fundamental difference**: the specification assumes an **interpreter VM**
+(doing Link/Evaluate at runtime). Since tsaot is an **AOT compiler**, it collapses
+Load/Link entirely at compile time. What remains at runtime is only Evaluate
+(calling each module's `__module_init` in postorder) and the TDZ sentinel check for
+circular imports. As a result, most of the spec's `ModuleStatus`/SCC mechanism
+disappears at compile time.
 
 ---
 
-## 9. 確認したい設計判断
+## 9. Design decisions to confirm
 
-1. **ESM only**(CJS 構文はすべて loud reject)。これで OK?
-2. **「Ref 型」を IR の binding_kind / RefKind / opcode の 3 レイヤーで表現**。OK?
-3. **ImportRef の write は IR レベルで表現せず、exporter が静的に loud reject**
-   (spec の "assignment to constant" を静的翻訳)。OK?
-4. **関数と class の export は ImportRef を経由せず direct reference**。OK?
-5. **namespace import は 2 段最適化**(propaccess のみなら LoadImport に直接
-   lower、変数化されるなら namespace object 実体化)。OK?
-6. **v1 で BindingKind / LoadImport / AllocNamespace / ModuleInfo / import_ref
-   を IR に予約**(実装は v2)。OK?
-7. **循環 import 越しの TDZ は実行時チェック**。`LoadImport` は番兵値
-   `TS_UNINITIALIZED` を確認してから読む。単一モジュール内 `let`/`const` の
-   TDZ は従来通り TS checker 任せ(静的)、ここだけ実行時チェックを emit。
-   そのために **NaN-boxing に `TS_UNINITIALIZED` タグを v1 で予約**。OK?
+1. **ESM only** (all CJS syntax is loud-rejected). Is this OK?
+2. **Represent the "Ref type" across the three layers of IR binding_kind / RefKind / opcode**. OK?
+3. **Do not represent ImportRef writes at the IR level; the exporter loud-rejects
+   them statically** (a static translation of the spec's "assignment to constant").
+   OK?
+4. **Function and class exports are direct references, not via ImportRef**. OK?
+5. **namespace import has a two-tier optimization** (if it is only a propaccess,
+   lower directly to LoadImport; if it is turned into a variable, materialize the
+   namespace object). OK?
+6. **Reserve BindingKind / LoadImport / AllocNamespace / ModuleInfo / import_ref in
+   the IR in v1** (implementation in v2). OK?
+7. **TDZ across circular imports is a runtime check**. `LoadImport` reads only after
+   checking for the sentinel `TS_UNINITIALIZED`. Within-single-module `let`/`const`
+   TDZ is left to the TS checker as before (static); only here is a runtime check
+   emitted. For that, **reserve the `TS_UNINITIALIZED` tag in NaN-boxing in v1**. OK?
 
-**全 7 点 確認済み(合意完了)。** 設計は固まった。
+**All 7 points confirmed (agreement reached).** The design is settled.
 
-### 9.1 性能上の位置づけ(確定事項)
+### 9.1 Performance positioning (settled matters)
 
-変数の import(`export let`/`const` の live binding を `LoadImport` で読む)は
-**遅くてよい**。理由と帰結:
+Variable imports (reading the live binding of `export let`/`const` via
+`LoadImport`) **may be slow**. Reasons and consequences:
 
-- 実コードで変数 import は稀。import の大多数は関数・クラス・型であり、それらは
-  ImportRef を経由せず **direct call / direct reference**(チェック無し、最速)。
-- したがって `LoadImport` の TDZ 番兵チェック(`TS_UNINITIALIZED` 判定の分岐)の
-  コストは **許容**。ホットパスに乗る可能性が低く、最適化の優先度は低い。
-- まとめ:
-  - **速いまま維持**: 関数/クラスの import(direct)、同一モジュール内の通常の
-    変数アクセス(`LoadField`、チェック無し)、既存の全ベンチマーク
-  - **遅くてよい**: 変数 import の read(`LoadImport` + 番兵チェック)
-- この割り切りにより、将来 closure-call devirt のような追加最適化を変数 import に
-  入れる必要は当面ない。
+- Variable imports are rare in real code. The vast majority of imports are
+  functions, classes, and types, and those are **direct calls / direct references**
+  (no check, fastest), not via ImportRef.
+- Therefore the cost of `LoadImport`'s TDZ sentinel check (the branch that tests for
+  `TS_UNINITIALIZED`) is **acceptable**. It is unlikely to be on a hot path, and its
+  optimization priority is low.
+- Summary:
+  - **Kept fast**: function/class imports (direct), ordinary within-same-module
+    variable access (`LoadField`, no check), and all existing benchmarks
+  - **May be slow**: variable-import reads (`LoadImport` + sentinel check)
+- With this trade-off, there is no near-term need to add further optimizations such
+  as closure-call devirt to variable imports.

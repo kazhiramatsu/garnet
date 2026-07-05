@@ -1,65 +1,65 @@
-# garnet — エージェント実務ガイド（build / 調査 / デバッグ / 検索 / テスト）
+# garnet — agent operations guide (build / investigation / debugging / search / testing)
 
-これを読めば「garnet でバグを一件潰して安全にコミットする」までの手が一通り分かる、という実務書。
-方針・規律は [`CLAUDE.md`](../CLAUDE.md)、初回セットアップ手順は [`CLAUDE_CODE_HANDOFF.md`](../CLAUDE_CODE_HANDOFF.md)、
-進捗の真の情報源は [`docs/TODO.md` の末尾](./TODO.md)。**まず TODO.md の tail を読む**のが全ての起点。
+A practical handbook: read it and you'll understand the whole procedure, up to "fixing a single bug in garnet and committing it safely."
+Policy and discipline live in [`CLAUDE.md`](../CLAUDE.md); the first-time setup procedure is in [`CLAUDE_CODE_HANDOFF.md`](../CLAUDE_CODE_HANDOFF.md);
+the true source of truth for progress is [the end of `docs/TODO.md`](./TODO.md). **Reading the tail of TODO.md first** is where everything starts.
 
-garnet は TypeScript → C の AOT コンパイラ。パイプライン:
+garnet is a TypeScript → C AOT compiler. Pipeline:
 
 ```
-  in.ts ──(exporter/ = TS)──▶ IR(JSON) ──(analyzer/ = Rust, bin名 tsaot)──▶ C ──(cc)──▶ native
-                                          └ emit_c.rs が IR→C
-  native は runtime/ts_rt.c（共有ランタイム, json_core.c を unity include）をリンク
+  in.ts ──(exporter/ = TS)──▶ IR(JSON) ──(analyzer/ = Rust, bin name tsaot)──▶ C ──(cc)──▶ native
+                                          └ emit_c.rs does IR→C
+  native links runtime/ts_rt.c (shared runtime, unity-includes json_core.c)
 ```
 
-- `exporter/` … TS→IR。フロントエンド唯一の実装（TypeScript）。cell/capture・スコープ解決・型駆動情報付与。
-- `analyzer/` … Rust。**メイン実装**。escape/devirt/sroa/i64 解析 + `emit_c.rs`。cargo binary 名は `tsaot`。
-- `analyzer_ts/` … 凍結された TS 版 analyzer（**変更禁止**）。役割は ①旗艦ベンチ ②byte-parity オラクル。
-- `runtime/ts_rt.c` … NaN-boxing・オブジェクトモデル・GC・stdlib。**メイン開発対象**。
+- `exporter/` … TS→IR. The sole frontend implementation (TypeScript). cell/capture, scope resolution, type-driven annotation.
+- `analyzer/` … Rust. **The main implementation**. escape/devirt/sroa/i64 analysis + `emit_c.rs`. The cargo binary name is `tsaot`.
+- `analyzer_ts/` … The frozen TS version of the analyzer (**do not modify**). Its roles are ① flagship benchmark ② byte-parity oracle.
+- `runtime/ts_rt.c` … NaN-boxing, object model, GC, stdlib. **A primary development target**.
 
 ---
 
-## 1. ビルド
+## 1. Build
 
-3 つの成果物を個別にビルドできる（全部やるのは `scripts/setup.sh`）。**変更した層だけ**再ビルドすればよい。
+The three artifacts can be built individually (`scripts/setup.sh` builds all of them). You only need to rebuild **the layer you changed**.
 
 ```bash
-# exporter（exporter.ts を変えたら。出力は exporter/exporter.js = .gitignore 済みの build 成果物）
+# exporter (when you change exporter.ts. Output is exporter/exporter.js = a gitignored build artifact)
 cd exporter && ./node_modules/.bin/tsc exporter.ts class_extract.ts \
   --module commonjs --target es2020 --skipLibCheck --moduleResolution node --esModuleInterop
-# analyzer（Rust。emit_c.rs 等を変えたら）
+# analyzer (Rust. When you change emit_c.rs etc.)
 cd analyzer && cargo build --release          # → analyzer/target/release/tsaot
-# runtime（ts_rt.c を変えたら。build/rt.o は多くのハーネスが使う共有キャッシュ）
+# runtime (when you change ts_rt.c. build/rt.o is a shared cache used by many harnesses)
 gcc -O2 -c runtime/ts_rt.c -Iruntime -o build/rt.o
 ```
 
-### garnet ドライバ（1 プログラムを手でコンパイル）
+### The garnet driver (compile one program by hand)
 
 ```bash
-./garnet foo.ts            # foo.c を emit して native `foo` にビルド
-./garnet -o foo.c foo.ts   # 出力 C 名を指定（★ -o は必ず .c で終える。実行ファイルは .c を除いた名前）
-./garnet -c foo.ts         # C だけ emit（cc しない）
-./garnet -S foo.ts         # C を stdout へ
+./garnet foo.ts            # emit foo.c and build the native `foo`
+./garnet -o foo.c foo.ts   # specify the output C name (★ -o must always end in .c; the executable is the name with .c removed)
+./garnet -c foo.ts         # emit C only (no cc)
+./garnet -S foo.ts         # C to stdout
 ```
 
-主要 env: `TSAOT_UNTYPED=1`（全 any = 型駆動最適化 OFF・正しい JS 意味論だが遅い。ill-typed 入力の検証に必須）、
-`TSAOT_CC="gcc -O2"`（既定 `cc -O2`）、`TSAOT_ANALYZER=rust|ts|native`、`--rt-stats`（下記）、`--profile`。
+Key env vars: `TSAOT_UNTYPED=1` (everything is any = type-driven optimization OFF; correct JS semantics but slow. Essential for validating ill-typed input),
+`TSAOT_CC="gcc -O2"` (default `cc -O2`), `TSAOT_ANALYZER=rust|ts|native`, `--rt-stats` (see below), `--profile`.
 
-> ★ **落とし穴**: `./garnet -o out out.ts`（.c なし）は out を object として ld に渡し「unknown file type」で失敗する。
-> 必ず `-o out.c` にして `./out` を実行する。
+> ★ **Pitfall**: `./garnet -o out out.ts` (no .c) passes out to ld as an object and fails with "unknown file type".
+> Always use `-o out.c` and run `./out`.
 
 ---
 
-## 2. 中心の作業ループ = V8 差分テスト
+## 2. The core work loop = V8 differential testing
 
-garnet の規律は **「V8(=node) と出力を比較してバグを 1 件ずつ潰す」**。決まった型は次の通り。
+garnet's discipline is **"compare output against V8 (= node) and fix bugs one at a time."** The established recipe is as follows.
 
-### 2.1 オラクルの作り方（node = V8）
+### 2.1 How to build the oracle (node = V8)
 
-garnet は `module: ESNext` で吐くので、オラクルも **ESM(.mjs) にして strict 意味論を揃える**（sloppy 差を出さない）。
+garnet emits with `module: ESNext`, so make the oracle **ESM (.mjs) too, to align strict semantics** (don't introduce sloppy-mode differences).
 
 ```bash
-# in.ts を V8 で実行した結果（= 期待値）
+# the result of running in.ts under V8 (= the expected value)
 node -e '
   const ts=require("./exporter/node_modules/typescript"),fs=require("fs");
   const js=ts.transpileModule(fs.readFileSync("in.ts","utf8"),
@@ -68,13 +68,13 @@ node -e '
 node in.mjs
 ```
 
-既製の差分ハーネスもある（`scripts/difftest.sh` を source して `dt "name" 'function main(){...}main();'`）。
-ただし **★ zsh から bash 前提スクリプトを source すると `$CC` の word-splitting 差で古いバイナリを実行し続ける事故**が起きる
-（CLAUDE.md 教訓）。**プローブは必ず bash ファイルに切り出して `bash probe.sh` で回す**こと。
+There's also a ready-made differential harness (source `scripts/difftest.sh` and run `dt "name" 'function main(){...}main();'`).
+But **★ sourcing a bash-assuming script from zsh can misfire: a word-splitting difference in `$CC` keeps running the old binary**
+(a CLAUDE.md lesson). **Always factor probes out into a bash file and run them with `bash probe.sh`.**
 
-### 2.2 バグ探し（差分ハント）のプローブ雛形
+### 2.2 Probe template for bug hunting (differential hunting)
 
-多カテゴリを一気に node と比較して DIFF 行だけ拾う。`bash` ファイルで:
+Compare many categories against node in one shot and pick out only the DIFF lines. In a `bash` file:
 
 ```bash
 #!/usr/bin/env bash
@@ -89,151 +89,151 @@ run(){ echo "$2" > "$W/t.ts"
   [ "$no" = "$ao" ] || printf "*** %-16s node=[%s] aot=[%s]\n" "$1" "$no" "$ao"
 }
 run "toFixed -0" 'console.log((-0).toFixed(2));'
-run "ws eq"       'const x:any="\t"; console.log(x==0);'   # 型エラー回避に any / TSAOT_UNTYPED=1
-# ... 40〜50 ケース並べる
+run "ws eq"       'const x:any="\t"; console.log(x==0);'   # any to dodge the type error / TSAOT_UNTYPED=1
+# ... line up 40–50 cases
 ```
 
-判定のコツ:
-- **REJECT / BUILDFAIL は多くが非バグ**: ①ill-typed TS（`0==""`, `[]+{}` 等は strict TS で型エラー→ garnet は loud に refuse。
-  意味論を試すには `TSAOT_UNTYPED=1`）②未実装 stdlib は "UNSUPPORTED"（loud reject = 健全。silent miscompile ではない）
-  ③TS lib target 由来（`toSorted` は es2023）。
-- **良性 DIFF に注意**: 例外の出力差（node は ESM の verbose stack、garnet は 1 行）や、`-0` の inspect 表示など。
-  **挙動が同じか**を見る（両者とも throw / 同じ数値）。
+Tips for judging:
+- **REJECT / BUILDFAIL are mostly non-bugs**: ① ill-typed TS (`0==""`, `[]+{}`, etc. are type errors in strict TS → garnet refuses loudly.
+  To exercise the semantics, use `TSAOT_UNTYPED=1`) ② unimplemented stdlib is "UNSUPPORTED" (loud reject = healthy; not a silent miscompile)
+  ③ TS lib-target origin (`toSorted` is es2023).
+- **Watch out for benign DIFFs**: output differences on exceptions (node prints a verbose ESM stack, garnet one line), the inspect display of `-0`, and the like.
+  Check **whether the behavior is the same** (both throw / same number).
 
 ---
 
-## 3. デバッグ手順（クラッシュ・誤値）
+## 3. Debugging procedure (crashes, wrong values)
 
-原則: **理論より計測**。最小再現 → メカニズムを掴む probe。
+Principle: **measurement over theory**. Minimal reproduction → a probe that pins down the mechanism.
 
-1. **最小化**: 反復数 N を振る（N=0/1/2…）、機能を1つずつ削る（capture を外す/ escape を止める）。
-   「手展開は通るがループだと落ちる」等の**境界**を掴む。
-2. **env ノブで切り分け**（挙動を変えて症状の相関を見る＝症状数 = メカニズム回数の相関が決定打）:
-   - `TSAOT_GC_YOUNG_THRESHOLD=1` … 毎 alloc で minor GC（moving を最強ストレス）
-   - `TSAOT_DISABLE_MOVING_MINOR=1` … minor moving を止める（moving 起因か切り分け）
-   - `TSAOT_GC_MOVE_CORO=0` / `TSAOT_GC_MOVE_PROMISE=1` … coro/promise の移動可否
-   - `TSAOT_GC_AGE_THRESHOLD=2` … aging（昇格猶予）を入れて move 回数を変える
-   - `TSAOT_GC_ZAP=1` … 死亡/moved-from セルを 0xDD 毒化（use-after-free 検出。**綺麗な undefined/全ゼロ
-     = 未 mark 死亡 + 領域再利用のシグネチャ**、0xDD = moved-from 読み）
-   - `TSAOT_GC_NURSERY=0` … bump nursery を切る
-   - `TSAOT_UNTYPED=1` … 型駆動最適化(SROA/unbox)が原因か切り分け
-3. **バックトレース**（クラッシュが一瞬なら軽い）:
+1. **Minimize**: sweep the iteration count N (N=0/1/2…), strip features one at a time (remove capture / stop escape).
+   Capture the **boundary**, e.g. "hand-unrolled passes but the loop crashes."
+2. **Isolate with env knobs** (change behavior and watch the correlation with symptoms = a correlation between symptom count and mechanism-invocation count is the clincher):
+   - `TSAOT_GC_YOUNG_THRESHOLD=1` … minor GC on every alloc (maximum stress on moving)
+   - `TSAOT_DISABLE_MOVING_MINOR=1` … stop minor moving (isolate whether moving is the cause)
+   - `TSAOT_GC_MOVE_CORO=0` / `TSAOT_GC_MOVE_PROMISE=1` … whether coro/promise may move
+   - `TSAOT_GC_AGE_THRESHOLD=2` … introduce aging (a promotion grace period) to change the number of moves
+   - `TSAOT_GC_ZAP=1` … poison dead/moved-from cells with 0xDD (use-after-free detection. **A clean undefined/all-zeros
+     = the signature of an unmarked death + region reuse**; 0xDD = a moved-from read)
+   - `TSAOT_GC_NURSERY=0` … turn off the bump nursery
+   - `TSAOT_UNTYPED=1` … isolate whether type-driven optimization (SROA/unbox) is the cause
+3. **Backtrace** (cheap if the crash is instantaneous):
    ```bash
    cat > /tmp/bt.lldb <<EOF
-   settings set target.input-path /tmp/input     # stdin 入力の場合
+   settings set target.input-path /tmp/input     # when input comes from stdin
    run
    bt 16
    quit
    EOF
    ( ulimit -s 65520; lldb -b -s /tmp/bt.lldb ./binary ) | grep -E "frame #|stop reason"
    ```
-   selfhost native 等スタックが深いものは `ulimit -s 65520`。
-4. **ASan**: `gcc -O1 -g -fsanitize=address -DTS_ASAN_ENABLED ...`。**★ ただし ASan 限定のガード
-   （`ts_heap_ptr` の可読性 probe 等）が非 ASan 本番のバグを隠すことがある**（C1 の教訓）。非 ASan でも再現するか必ず確認。
-5. **ランタイム計測 `--rt-stats`**（`-DTSAOT_RT_STATS`）: GC 回数/pause、alloc、handle_alloc、find_prop/intern/map_find
-   のプローブ長ヒスト、call_env_malloc、concat を stderr（`TSAOT_RT_STATS_FILE=path` でファイル）へ。
-   perf 判断は「avg でなく分布(hist)とワークロード依存性」で見る。
-6. **ランタイムに一時計装**: `runtime/ts_rt.c` を `/tmp` にコピー → `fprintf(stderr,...); fflush(stderr);` を挿して
-   `gcc -O2 -c copy.c -o rt_dbg.o` → 生成 C とリンク。cell の kind / スロット値 / 昇格・退避の時系列を追う。
-   **stderr は fflush 必須**（クラッシュ前フラッシュされずロストする）。
-7. **生成 C を読む**: `./garnet -c -o /tmp/x.c x.ts` して `awk '/static tsv fn_0_main/,/^}/' /tmp/x.c`。
-   FrameArena/Stack/Heap の alloc site 注釈、cell の AllocObject 位置、ts_call の env 等が見える。
+   For deep stacks like selfhost native, use `ulimit -s 65520`.
+4. **ASan**: `gcc -O1 -g -fsanitize=address -DTS_ASAN_ENABLED ...`. **★ But an ASan-only guard
+   (e.g. the readability probe on `ts_heap_ptr`) can hide a bug that's real in a non-ASan production build** (the C1 lesson). Always confirm whether it reproduces without ASan too.
+5. **Runtime measurement `--rt-stats`** (`-DTSAOT_RT_STATS`): GC count/pause, alloc, handle_alloc, the probe-length histogram for find_prop/intern/map_find,
+   call_env_malloc, and concat, to stderr (`TSAOT_RT_STATS_FILE=path` for a file).
+   Judge perf by "the distribution (hist) and workload dependence, not the avg."
+6. **Temporary instrumentation in the runtime**: copy `runtime/ts_rt.c` to `/tmp` → insert `fprintf(stderr,...); fflush(stderr);` →
+   `gcc -O2 -c copy.c -o rt_dbg.o` → link with the generated C. Trace the time series of a cell's kind / slot value / promotion and evacuation.
+   **fflush is mandatory for stderr** (otherwise it's lost, unflushed, before the crash).
+7. **Read the generated C**: `./garnet -c -o /tmp/x.c x.ts`, then `awk '/static tsv fn_0_main/,/^}/' /tmp/x.c`.
+   You can see FrameArena/Stack/Heap alloc-site annotations, the AllocObject location of a cell, the env of ts_call, and so on.
 
 ---
 
-## 4. プロジェクト検索マップ（どこに何があるか）
+## 4. Project search map (where to find what)
 
-| 探すもの | 場所 / grep |
+| What you're looking for | Location / grep |
 |---|---|
-| いま何をしているか・直近の決定 | `docs/TODO.md` の**末尾**（セッション番号順・唯一の真） |
-| 機能別の設計意図 | `docs/*_design.md`（classes / generators / exceptions / async / capture_lowering …） |
-| GC 全体計画・現在地 | `docs/gc_moving_plan.md`、Rust 移行計画 `docs/refactor_master_plan.md` |
-| ランタイム実装（stdlib / GC / boxing） | `runtime/ts_rt.c`（440KB・1 ファイル）、`runtime/ts_rt.h`（型・inline・NaN-box マクロ） |
-| ある JS API の実装 | `grep -nE "ts_<name>\|\"<method>\"" runtime/ts_rt.c` |
-| 数値/文字列/coercion の変換 | `ts_number_coerce` / `ts_to_num`(生ビット再解釈) / `ts_str_*` / `ts_math_*2` |
-| IR→C の emit | `analyzer/src/emit_c.rs`、alloc 戦略は `analyzer/src/codegen.rs`(`decide`) |
-| exporter のスコープ/capture | `exporter/exporter.ts`（`cellBindings` / `cellAccess` / `captureLoopBody` / `setupForOfCaptureCells`） |
-| conformance テスト | `tests/conformance/exhaustive/<category>/*.ts`（V8 オラクル・別 expected 不要） |
-| 実行/ゲートのスクリプト | `scripts/*.sh`（一枚扉は `scripts/gate.sh`） |
+| What's being worked on now / recent decisions | **The end** of `docs/TODO.md` (in session-number order; the single source of truth) |
+| Design intent by feature | `docs/*_design.md` (classes / generators / exceptions / async / capture_lowering …) |
+| The overall GC plan and current status | `docs/gc_moving_plan.md`; the Rust migration plan `docs/refactor_master_plan.md` |
+| Runtime implementation (stdlib / GC / boxing) | `runtime/ts_rt.c` (440KB, one file); `runtime/ts_rt.h` (types, inline, NaN-box macros) |
+| The implementation of a given JS API | `grep -nE "ts_<name>\|\"<method>\"" runtime/ts_rt.c` |
+| Number/string/coercion conversions | `ts_number_coerce` / `ts_to_num` (raw-bit reinterpretation) / `ts_str_*` / `ts_math_*2` |
+| IR→C emission | `analyzer/src/emit_c.rs`; the alloc strategy is in `analyzer/src/codegen.rs` (`decide`) |
+| The exporter's scope/capture | `exporter/exporter.ts` (`cellBindings` / `cellAccess` / `captureLoopBody` / `setupForOfCaptureCells`) |
+| Conformance tests | `tests/conformance/exhaustive/<category>/*.ts` (V8 oracle; no separate expected file needed) |
+| Run/gate scripts | `scripts/*.sh` (the single entry point is `scripts/gate.sh`) |
 
-`ts.Symbol` キーイング + checker の alias 解決で module linking がほぼ無料、という whole-program 前提を頭に置く。
+Keep in mind the whole-program premise that module linking is nearly free thanks to `ts.Symbol` keying + the checker's alias resolution.
 
 ---
 
-## 5. バグを潰した後のテスト（変更種別で必要ゲートが変わる）
+## 5. Testing after a bug fix (the required gates depend on the kind of change)
 
-まず**変更の種別**を判定する。これで必要な検証が決まる:
+First determine **the kind of change**. This decides what validation you need:
 
-| 種別 | 例 | 生成 C | 必要ゲート |
+| Kind | Example | Generated C | Required gates |
 |---|---|---|---|
-| **A. ランタイムのみ** | `ts_rt.c` の挙動修正 | **不変** | conf + unit + gc（+ 影響あれば bench）。**parity 無関係**（emitc_diff は生成 C 比較なので） |
-| **B. exporter / 出力変更** | IR/生成 C が変わる修正 | 変わる | conf + bundler + selfconf + **emitc_diff**（凍結双子と食い違えば allowlist へ） |
-| **C. 挙動不変 Rust リファクタ** | emit_c.rs の非機能変更 | byte 不変が狙い | **emitc_diff で byte-parity** が主。conf/unit も |
+| **A. Runtime only** | A behavior fix in `ts_rt.c` | **Unchanged** | conf + unit + gc (+ bench if affected). **parity is irrelevant** (emitc_diff compares generated C) |
+| **B. exporter / output change** | A fix that changes the IR / generated C | Changes | conf + bundler + selfconf + **emitc_diff** (if it diverges from the frozen twin, move it to the allowlist) |
+| **C. Behavior-preserving Rust refactor** | A non-functional change to emit_c.rs | Byte-identical is the goal | **byte-parity via emitc_diff** is primary. conf/unit too |
 
-コマンド（一枚扉 `scripts/gate.sh <cmd>`）:
+Commands (single entry point `scripts/gate.sh <cmd>`):
 
 ```bash
-scripts/gate.sh conf all      # 全 conformance（V8 差分）★主ゲート
-scripts/gate.sh unit          # runtime 単体 + analyzer 単体
-scripts/gate.sh gc            # GC ストレス（threshold=1 × O2/ASan/runtime）
-scripts/gate.sh bundler       # モジュールバンドル 39 fixture
-scripts/gate.sh bench [flt]   # 99 ベンチの correctness + 時間 budget
-scripts/gate.sh selfconf      # 凍結双子の V8 差分
-scripts/gate.sh parity        # = scripts/emitc_diff.sh（Rust emit vs 凍結TS emitc の byte）
-scripts/gate.sh ir-parity     # exporter 出力の決定性（snap 比較）
+scripts/gate.sh conf all      # all conformance (V8 differential) ★ main gate
+scripts/gate.sh unit          # runtime unit + analyzer unit
+scripts/gate.sh gc            # GC stress (threshold=1 × O2/ASan/runtime)
+scripts/gate.sh bundler       # module bundling, 39 fixtures
+scripts/gate.sh bench [flt]   # correctness of 99 benchmarks + time budget
+scripts/gate.sh selfconf      # V8 differential of the frozen twin
+scripts/gate.sh parity        # = scripts/emitc_diff.sh (Rust emit vs frozen-TS emitc, byte-wise)
+scripts/gate.sh ir-parity     # determinism of exporter output (snapshot comparison)
 ```
 
-**新機能/修正には conformance に最小テストを追加**する（`tests/conformance/exhaustive/<cat>/xxx.ts` を置くだけ。
-V8 がオラクルなので expected ファイル不要。ただし**既定は typed** = ill-typed だと REJECT されるので、
-loose coercion 等は `any` を使って typed-valid にするか別枠で）。
+**Add a minimal test to conformance for every new feature/fix** (just drop in `tests/conformance/exhaustive/<cat>/xxx.ts`.
+V8 is the oracle, so no expected file is needed. But **the default is typed** = ill-typed input gets REJECTED, so
+for things like loose coercion, either use `any` to make it typed-valid, or put it in a separate track).
 
-### emitc_diff で凍結双子と食い違ったら
+### When emitc_diff diverges from the frozen twin
 
-exporter/analyzer 変更で新しい IR/最適化パターンが出ると、**凍結された `analyzer_ts` と Rust が食い違う**ことがある。
-- **両方が正しい出力**（V8 一致）で差が alloc 戦略名（Stack↔FrameArena 等・挙動同一）なら → **良性**。
-  `scripts/frozen_known_diffs.tsv` に `parity\t<category>/<slug>\t<理由>` 行を追加して allowlist（DIFF→KNOWN）。
-- 凍結が誤値を出すなら → 凍結は変更禁止なので同様に allowlist（Rust が production・正）で記録。
+When an exporter/analyzer change produces a new IR/optimization pattern, **the frozen `analyzer_ts` and Rust can diverge**.
+- If **both outputs are correct** (they match V8) and the difference is an alloc-strategy name (Stack↔FrameArena etc., identical behavior) → **benign**.
+  Add a `parity\t<category>/<slug>\t<reason>` line to `scripts/frozen_known_diffs.tsv` to allowlist it (DIFF→KNOWN).
+- If the frozen side produces a wrong value → since the frozen side must not be modified, record it in the allowlist the same way (Rust is production and correct).
 
-### 完了基準（CLAUDE.md）
+### Completion criteria (CLAUDE.md)
 
-**conformance 全緑 + unit + bench(perf budget) + bundler 全緑**、加えて GC を触れば gate gc、exporter を触れば selfconf/emitc_diff。
-**perf 回帰ゼロ**（ホットパスに分岐を足すなら単一予測分岐で gate）。
-
----
-
-## 6. コミット
-
-- **メッセージは英語**（ユーザー指示）。本文は「何を・なぜ」＋末尾に `Verified:` 行（回した全ゲートの結果）。
-  silent miscompile 修正には `Lesson:` 段を付けることも。
-- **main への直線コミット**運用（単独プロジェクト・履歴が全て main）。**ユーザーが「commit して」と言うまでコミットしない**。
-- コード内部識別子・cargo binary 名は今も `tsaot`（改名は blast radius 大で保留中）。明示指示なく一括置換しない。
-- 進捗は**必ず `docs/TODO.md` 末尾に追記**（メモリには進捗を入れない）。
+**All conformance green + unit + bench (perf budget) + all bundler green**, plus gate gc if you touched GC, and selfconf/emitc_diff if you touched the exporter.
+**Zero perf regression** (if you add a branch to the hot path, gate it behind a single predictable branch).
 
 ---
 
-## 7. ハマりどころ（hard-won・毎回刺さる）
+## 6. Committing
 
-- **zsh vs bash**: bash 前提の関数（`dt` 等）を zsh から source しない。プローブは bash ファイルに切り出す。
-- **`garnet -o` は `.c` 必須**（§1）。
-- **ASan 限定ガードは非 ASan 本番のバグを隠す**。非 ASan の大入力でも必ず確認（C1 のクラッシュはこれで露見）。
-- **selfhost ミルストーンは規模依存 UB の唯一の網**: 小入力の conformance が全緑でも、66k 命令の selfhost で初めて落ちる
-  バグがある（`scripts/bench_selfcompile.sh` の emit-native は数百秒＝重い。**要時間枠合意**）。
-- **重いゲート/ベンチはバックグラウンド放置しない**: 前面 + watchdog（stuck した fixture バイナリを etime×cpu で検出して kill）。
-  マシン負荷下の絶対値は不可信 → **A/B は同一入力の交互実行(ABAB)**、rt.o 差替え or フルビルド比較で。
-- **-0（負ゼロ）**: `< 0` 判定（-0 は非負扱い）と符号ビット判定で挙動が分岐する。`%f`/printf は -0 を "-0" と印字するので
-  絶対値経路は `fabs` を通す。
-- **cell / capture**: ループ変数を closure がキャプチャするとき、変数書き込みは capture cell 経由（StoreField VALUE）。
-  ループ**本体**宣言の captured `const`/`let` は反復ごとに fresh cell（`emitPerIterationBodyCells`）。
-- **型駆動最適化(unbox/SROA)は値を落としやすい**。`never`/conditional 型・per-body 処理に注意し安全側へ。
-- **METHOD キー vs FIELD キーの名前空間ミスマッチ**が silent-DIFF の常連。二重格納は全ミューテーション操作で対称に。
+- **The message is in English** (user instruction). The body is "what and why" + a trailing `Verified:` line (the results of every gate you ran).
+  For silent-miscompile fixes, you may also add a `Lesson:` paragraph.
+- **Straight-line commits to main** (a solo project; the whole history is main). **Do not commit until the user says "commit."**
+- Internal code identifiers and the cargo binary name are still `tsaot` (renaming is on hold because the blast radius is large). Do not bulk-replace without an explicit instruction.
+- **Always append progress to the end of `docs/TODO.md`** (do not put progress in memory).
 
 ---
 
-## 8. 30 秒サマリ（最短の一件潰し）
+## 7. Gotchas (hard-won; they bite every time)
 
-1. `docs/TODO.md` の tail を読む。
-2. bash プローブで node(V8) と garnet 出力を比較 → DIFF を最小再現。
-3. `runtime/ts_rt.c` か `exporter/exporter.ts` を狙い撃ち修正（生成 C / lldb / RT_STATS / 一時計装で確認）。
-4. `tests/conformance/exhaustive/…` に回帰テスト追加。
-5. 変更種別に応じ `scripts/gate.sh conf all` + unit (+ gc / bundler / selfconf / emitc_diff)。
-6. `docs/TODO.md` 末尾にセッション追記。ユーザーの指示でコミット（英語・`Verified:` 行）。
+- **zsh vs bash**: don't source bash-assuming functions (like `dt`) from zsh. Factor probes out into a bash file.
+- **`garnet -o` requires `.c`** (§1).
+- **An ASan-only guard hides a bug that's real in a non-ASan production build**. Always confirm with large non-ASan inputs too (the C1 crash surfaced this way).
+- **The selfhost milestone is the only net for scale-dependent UB**: even when small-input conformance is all green, there are bugs that first surface
+  on the 66k-instruction selfhost (`scripts/bench_selfcompile.sh`'s emit-native takes hundreds of seconds = heavy. **Requires an agreed time window**).
+- **Don't leave heavy gates/benchmarks running in the background**: keep them in the foreground + a watchdog (detect a stuck fixture binary via etime×cpu and kill it).
+  Absolute numbers under machine load are untrustworthy → **for A/B, alternate runs on the same input (ABAB)**, via rt.o swap or a full-build comparison.
+- **-0 (negative zero)**: behavior diverges between a `< 0` test (which treats -0 as non-negative) and a sign-bit test. `%f`/printf prints -0 as "-0", so
+  route the absolute-value path through `fabs`.
+- **cell / capture**: when a closure captures a loop variable, variable writes must go through the capture cell (StoreField VALUE).
+  Captured `const`/`let` declared in the loop **body** get a fresh cell per iteration (`emitPerIterationBodyCells`).
+- **Type-driven optimization (unbox/SROA) easily drops values**. Watch out for `never`/conditional types and per-body processing; err on the safe side.
+- **A namespace mismatch between METHOD keys and FIELD keys** is a frequent culprit in silent-DIFFs. Keep double-storage symmetric across every mutation operation.
+
+---
+
+## 8. 30-second summary (the shortest single-bug fix)
+
+1. Read the tail of `docs/TODO.md`.
+2. Compare node (V8) and garnet output with a bash probe → minimally reproduce the DIFF.
+3. Make a targeted fix in `runtime/ts_rt.c` or `exporter/exporter.ts` (verify with generated C / lldb / RT_STATS / temporary instrumentation).
+4. Add a regression test to `tests/conformance/exhaustive/…`.
+5. Depending on the kind of change, run `scripts/gate.sh conf all` + unit (+ gc / bundler / selfconf / emitc_diff).
+6. Append a session note to the end of `docs/TODO.md`. Commit on the user's instruction (English, with a `Verified:` line).

@@ -1,202 +1,202 @@
-# refactor baseline — P0 固定値（2026-07-03・セッション315）
+# refactor baseline — P0 pinned values (2026-07-03, session 315)
 
-リファクタ計画（`docs/refactor_master_plan.md` v2）の全 perf 判断の基準点。
-以後、各フェーズ末にこのファイルへ追記していく（上書きしない）。
+The reference point for all perf judgments in the refactoring plan (`docs/refactor_master_plan.md` v2).
+From here on, append to this file at the end of each phase (do not overwrite).
 
-- 環境: Darwin arm64 (macOS 25.5.0), `cc -O2` (Apple clang), node v25.2.1
-- 「†」= バックグラウンドで GC stress 等が並走していた時間帯の参考値
-  （教訓: マシン負荷下のベンチ絶対値は不可信 — A/B は同条件で取り直す）。
-- **運用方針（ユーザー指示・2026-07-03）**: 数分以上 CPU 100% 級のジョブ
-  （gc / bench / full / typed / native emit）は勝手に実行しない。時間枠を
-  ユーザーと合意した「計測ウィンドウ」で実行し、本ファイルに追記する。
+- Environment: Darwin arm64 (macOS 25.5.0), `cc -O2` (Apple clang), node v25.2.1
+- "†" = a reference value from a period when GC stress etc. was running concurrently in the background
+  (lesson: benchmark absolute values under machine load are untrustworthy — re-take A/B under identical conditions).
+- **Operating policy (user instruction, 2026-07-03)**: jobs at the ~100%-CPU level running for more than a few minutes
+  (gc / bench / full / typed / native emit) must not be run unilaterally. Run them in a "measurement window" whose
+  time slot has been agreed with the user, and append the results to this file.
 
-## ゲート結果と所要時間（P0 完了時点）
+## Gate results and elapsed times (as of P0 completion)
 
-| gate | 結果 | 所要 | 備考 |
+| gate | result | elapsed | notes |
 |---|---|---|---|
-| `gate parity` | **PASS** identical=327 / UNPORTED=0 / DIFF=0 / skip=0 | 28.2s | batch export キャッシュ利用時 |
-| `gate ir-parity snap`+比較 | **PASS** 2,095 ファイル自己一致 | 35.9s（比較のみ ~18s） | exporter 出力の決定性を実証 |
-| `gate conf all` | **PASS** 330/330 | 未計時 | basic 3 + exhaustive 327。export+transpile 330 は 2.7s |
-| `gate bundler` | **PASS** 39/39 | 未計時 | helper 移設後の検証で完走 |
-| `gate unit` | **PASS**（runtime + analyzer 全スイート） | 10.7s† | |
-| `gate iter` | **PASS** 48 cases | 25.5s† | 計画の「golden_iter 96」は実測 **48 cases**（計画側の誤記） |
-| `gate gc` | **中断（未完走）** | — | classes_* 台まで無 FAIL で進行後、低負荷方針により停止。完走は計測ウィンドウで |
-| `gate bench` / `gate quick` / `gate full` / `gate typed` | **延期** | — | 低負荷方針。計測ウィンドウで実行し追記 |
+| `gate parity` | **PASS** identical=327 / UNPORTED=0 / DIFF=0 / skip=0 | 28.2s | when using the batch export cache |
+| `gate ir-parity snap`+compare | **PASS** 2,095 files self-consistent | 35.9s (compare only ~18s) | demonstrates the determinism of exporter output |
+| `gate conf all` | **PASS** 330/330 | not timed | basic 3 + exhaustive 327. export+transpile 330 is 2.7s |
+| `gate bundler` | **PASS** 39/39 | not timed | ran to completion in the verification after helper relocation |
+| `gate unit` | **PASS** (runtime + analyzer full suite) | 10.7s† | |
+| `gate iter` | **PASS** 48 cases | 25.5s† | the plan's "golden_iter 96" is actually **48 cases** measured (a misprint in the plan) |
+| `gate gc` | **interrupted (not fully run)** | — | progressed with no FAIL up to the classes_* range, then stopped per the low-load policy. Full run in a measurement window |
+| `gate bench` / `gate quick` / `gate full` / `gate typed` | **deferred** | — | low-load policy. Run in a measurement window and append |
 
-## self-compile ステージ分割（旗艦ベンチ・`scripts/bench_selfcompile.sh`）
+## self-compile stage breakdown (flagship benchmark, `scripts/bench_selfcompile.sh`)
 
-対象: 凍結 analyzer_ts（selfhost_typed.ts）。IR **23,418,729 B**（23.4MB）、
-生成 C **5,593,546 B**（5.59MB）。rust vs node emit は **byte-identical**（parity 同梱検査で確認済み）。
+Target: the frozen analyzer_ts (selfhost_typed.ts). IR **23,418,729 B** (23.4MB),
+generated C **5,593,546 B** (5.59MB). rust vs node emit is **byte-identical** (confirmed by the check bundled with parity).
 
-| ステージ | best ms | 条件 |
+| stage | best ms | conditions |
 |---|---|---|
-| export（node, typed） | 1,452† | --runs 1 検証実行 |
-| emit-rust | 24,584† | 同上（s314 実測 23.7s と整合） |
-| emit-node（凍結TS） | 35,338† | 同上（s314 実測 30.8s と整合） |
-| emit-native（garnet 製 tsan） | 未計測 | s314 実測 ~600s + 64MB stack。計測ウィンドウで |
-| cc（5.59MB 単一 TU + link） | 未計測 | 計測ウィンドウで（P2d --jobs の基準値） |
+| export (node, typed) | 1,452† | --runs 1 verification run |
+| emit-rust | 24,584† | same as above (consistent with s314's measured 23.7s) |
+| emit-node (frozen TS) | 35,338† | same as above (consistent with s314's measured 30.8s) |
+| emit-native (garnet-produced tsan) | not measured | s314 measured ~600s + 64MB stack. In a measurement window |
+| cc (5.59MB single TU + link) | not measured | In a measurement window (baseline for the P2d --jobs breakdown) |
 
-負荷ゼロでの取り直し（--runs 3・cc 込み）とパス内部分割（devirt/escape/sroa/
-fixpoint 別、P2 で analyzer 計装後）は計測ウィンドウで追記。JSON は
-`build/bench_history/` に蓄積される（検証実行分: 20260703T070816Z_selfcompile.json）。
+Re-measurement under zero load (--runs 3, including cc) and per-pass internal breakdown (separate devirt/escape/sroa/
+fixpoint, after analyzer instrumentation in P2) will be appended in a measurement window. JSON
+accumulates in `build/bench_history/` (verification-run instance: 20260703T070816Z_selfcompile.json).
 
-## ランタイム統計の初期観測（`garnet --rt-stats`）
+## Initial observations of runtime statistics (`garnet --rt-stats`)
 
-smoke プログラム（10 要素 for ループ + console.log 1 回）ですら:
+Even a smoke program (10-element for loop + one console.log):
 
-- `find_prop`: 860 calls, **avg_probe=12.63**（O(n) 線形走査の実測）
-- `intern`: 298 calls, **avg_probe=98.78**（動的 intern が O(#fields) memcmp）
-- alloc 264 回 / 27.5KB, handle_cap 65,536（最小構成でも 512KB の handle 表）
+- `find_prop`: 860 calls, **avg_probe=12.63** (measured O(n) linear scan)
+- `intern`: 298 calls, **avg_probe=98.78** (dynamic intern is O(#fields) memcmp)
+- alloc 264 times / 27.5KB, handle_cap 65,536 (a 512KB handle table even in the minimal configuration)
 
-→ P2a（Map/Set・intern・find_prop のハッシュ化、GC 閾値、closure malloc 除去）の
-事実基盤。ワークロード別（selfhost native 実行時等）の統計は P2a 着手時に取得。
+→ The factual basis for P2a (hashing of Map/Set, intern, and find_prop; GC threshold; closure malloc removal).
+Per-workload statistics (e.g. during selfhost native execution) will be collected when P2a begins.
 
-## GC マイクロベンチ（`scripts/bench_gc.sh`・スイート全体 ~19s で完走）
+## GC microbenchmark (`scripts/bench_gc.sh`, whole suite finishes in ~19s)
 
-負荷ゼロ状態・runs=3 best・typed（rust analyzer）。**GC 改善（P2a/P6）の判断はこれが基準**。
-カウンタ系（回数・alloc・プローブ長・malloc 数）は決定値なので負荷非依存。
-wall/pause の A/B は「生成 C 共有 + `TSAOT_RT_OBJ` で旧/新 stats rt.o を交互差し替え（ABAB）」で取る
-（GC 内部の変更は ABI 不変なのでこれが成立する）。重い `gate gc`（threshold=1+ASan）は
-correctness 専用として役割分担 — 速さはこちら、正しさはあちら。
+Zero-load state, runs=3 best, typed (rust analyzer). **This is the baseline for judging GC improvements (P2a/P6).**
+Counter metrics (counts, alloc, probe length, malloc count) are deterministic values, hence load-independent.
+The A/B for wall/pause is taken by "sharing the generated C + alternately swapping the old/new stats rt.o via `TSAOT_RT_OBJ` (ABAB)"
+(this works because changes internal to the GC keep the ABI invariant). The heavy `gate gc` (threshold=1+ASan) is
+split by role as correctness-only — speed here, correctness there.
 
-| bench | wall ms | minor | full | pause ms | max pause ms | alloc MB | 特記 |
+| bench | wall ms | minor | full | pause ms | max pause ms | alloc MB | notes |
 |---|---|---|---|---|---|---|---|
-| gc_shortlived | 182 | 45 | 0 | 1.11 | 2.23 | 192.0 | nursery 回収の支配ケース |
-| gc_survivors | 110 | 16 | **13** | 2.50 | **7.36** | 96.0 | full GC 頻発 = full 閾値 262,144 の実挙動 |
-| gc_mapset_churn | 760 | 0 | 0 | 0 | 0 | ~0 | **map_find avg_probe=2,219.58**。Map エントリは realloc 配列（GC 外）と判明 |
-| gc_closures | 222 | 61 | 0 | 1.20 | 3.79 | 352.0 | **env_malloc=4,000,000**（呼び出し 4M 回ぶん） |
-| gc_strings | 1,194 | 6 | 0 | 3.28 | 5.18 | 536.5 | 大粒 alloc は GC 頻度より alloc/copy コスト側 |
+| gc_shortlived | 182 | 45 | 0 | 1.11 | 2.23 | 192.0 | the dominant case of nursery collection |
+| gc_survivors | 110 | 16 | **13** | 2.50 | **7.36** | 96.0 | frequent full GC = the actual behavior of the full threshold 262,144 |
+| gc_mapset_churn | 760 | 0 | 0 | 0 | 0 | ~0 | **map_find avg_probe=2,219.58**. Map entries turn out to be realloc arrays (outside the GC) |
+| gc_closures | 222 | 61 | 0 | 1.20 | 3.79 | 352.0 | **env_malloc=4,000,000** (for 4M calls) |
+| gc_strings | 1,194 | 6 | 0 | 3.28 | 5.18 | 536.5 | large-grain alloc is on the alloc/copy cost side rather than GC frequency |
 
-初回観測の含意（P2a の定量的出発点）:
-- Map churn の 760ms はほぼ全て O(n) 線形走査（プローブ 2,219/回）→ ハッシュ索引で桁が変わるはず
-- closure 呼び出しは 1 call = 1 malloc が実測で確定（4M call / 222ms）→ スタックバッファ化の効果は直接測れる
-- full GC の max pause 7.4ms（10 万 live）→ P6 bump nursery / lazy handle の前後比較指標
-- 結果 JSON は `build/bench_history/<UTC>_gc.json` に蓄積（初回: 20260703T073141Z_gc.json）
+Implications of the first observation (P2a's quantitative starting point):
+- Map churn's 760ms is almost entirely O(n) linear scan (2,219 probes/call) → a hash index should change the order of magnitude
+- closure calls are confirmed by measurement to be 1 call = 1 malloc (4M calls / 222ms) → the effect of stack-buffering can be measured directly
+- full GC's max pause 7.4ms (100k live) → a before/after comparison metric for the P6 bump nursery / lazy handle
+- result JSON accumulates in `build/bench_history/<UTC>_gc.json` (first instance: 20260703T073141Z_gc.json)
 
-## エンジン比較（`scripts/run_engine_benchmarks.sh`）
+## Engine comparison (`scripts/run_engine_benchmarks.sh`)
 
-- node v25.2.1（サブセット検証）: string_scan_kernel 131.2ms PASS。
-  kernel プロトコル（`module.exports={kernel,BENCH_N}`）を持たない .js
-  （self-executing スクリプト形）は NO_KERNEL としてスキップ集計 — サイレント省略しない。
-- 全行の node / bun / deno 計測は計測ウィンドウで実行し追記。
-- classics / escape-hardened 動的系スイートの追加は次セッション以降（P0 残）。
+- node v25.2.1 (subset verification): string_scan_kernel 131.2ms PASS.
+  .js files that lack the kernel protocol (`module.exports={kernel,BENCH_N}`)
+  (self-executing script form) are tallied as skipped with NO_KERNEL — not silently omitted.
+- Measuring all rows for node / bun / deno will be done and appended in a measurement window.
+- Adding the classics / escape-hardened dynamic suites is for the next session onward (P0 remainder).
 
-## 既知の注記
+## Known notes
 
-- 計画中の「conformance 327」は exhaustive tier のみの数。gate は basic 込み 330。
-- bundler fixture 内の生成物・`build/` は .gitignore 済み（各ハーネスが再生成）。
-- `TSAOT_RT_STATS` はコンパイル時 opt-in（`-DTSAOT_RT_STATS` / `garnet --rt-stats`）。
-  既定ビルドはマクロが空になりホットパス影響ゼロ（conf all 330/330 で無退行確認）。
+- The plan's "conformance 327" is the exhaustive-tier count only. The gate is 330 including basic.
+- Generated artifacts inside the bundler fixtures and `build/` are already .gitignored (each harness regenerates them).
+- `TSAOT_RT_STATS` is compile-time opt-in (`-DTSAOT_RT_STATS` / `garnet --rt-stats`).
+  In the default build the macro becomes empty, so hot-path impact is zero (no regression confirmed with conf all 330/330).
 
-## 計測ウィンドウ 2026-07-03（セッション316）
+## Measurement window 2026-07-03 (session 316)
 
-- **`gate gc` O2 部分: PASS 18/18**（focused conformance, threshold=1, normal O2）。
-- **`gate gc` ASan 部分: 環境ブロッカーで実行不能** — Apple clang 17.0.0 (clang-1700.6.4.2,
-  CLT 26.3) の libclang_rt ASan が macOS 26.5.1 で**起動時デッドロック**する。
+- **`gate gc` O2 portion: PASS 18/18** (focused conformance, threshold=1, normal O2).
+- **`gate gc` ASan portion: cannot run due to an environment blocker** — the libclang_rt ASan of Apple clang 17.0.0 (clang-1700.6.4.2,
+  CLT 26.3) **deadlocks at startup** on macOS 26.5.1.
   `AsanInitInternal → InitializeShadowMemory → get_dyld_hdr → _Block_copy → malloc →
-  ASan init 再入 → 自分の StaticSpinMutex を待って sched_yield 永久スピン`（sample で確認）。
-  `int main(){return 0;}` の最小 ASan バイナリでも再現 = garnet 非依存。
-  前セッションの「classes_* 台で長時間化」も実体はこれ（1 バイナリが CPU 96 分スピン）。
-  **対処候補: Xcode/CLT 更新、または homebrew gcc（実 GCC の libasan）**。解消までは
-  `TSAOT_GC_STRESS_ASAN=0 TSAOT_GC_STRESS_RUNTIME_ASAN=0` で O2 部分のみ運用。
-- 運用知見: 長時間ジョブは `taskpolicy -b -p <pid>` で E-core 限定にでき、体感負荷を
-  ほぼゼロにできる（wall 計測には使わない。correctness 専用）。
-- **`gate bench`: PASS 99/99（全行 correct + 予算内）、所要 63s**（逐次 1 コア・nice 10・
-  アイドルマシン）。当初見積 ~10 分は過大だった — スイート全体が軽い。
-- **`bench_selfcompile.sh --runs 3`（負荷ゼロ・best-of-3・所要 180s）— † 無しの確定値**:
-  export **1,344ms** / emit-rust **22,487ms** / emit-node **29,269ms** / **cc 6,343ms（初計測
-  = P2d --jobs 分割の基準値）**。IR 23,418,729B / C 5,593,546B / rust vs node parity=identical。
-  JSON: build/bench_history/20260703T093859Z_selfcompile.json。
-  （P0 検証実行の † 値より export -7% / emit-rust -9% / emit-node -17% — 負荷の影響幅の実例）
-- **`gate full`: FULL PASS、所要 767s（12.8 分）** — conf 327/327 PASS、devirt/escape 327
-  identical、native build ok、diffall/native-escape 327 identical、fixpoint ok。
-- **`gate typed` / emit-native / エンジン比較全行: ミルストーン計測へ延期**（ユーザー決定:
-  重い selfhost 系ベンチを毎回流すのは厳しい → 日常計測は軽量セットに切り替え）。
+  ASan init reentry → waits on its own StaticSpinMutex and sched_yields in a permanent spin` (confirmed with sample).
+  It reproduces even with the minimal ASan binary `int main(){return 0;}` = garnet-independent.
+  The previous session's "prolonged run in the classes_* range" was really this too (one binary spinning the CPU for 96 minutes).
+  **Remediation candidates: update Xcode/CLT, or homebrew gcc (real GCC's libasan)**. Until resolved,
+  operate only the O2 portion with `TSAOT_GC_STRESS_ASAN=0 TSAOT_GC_STRESS_RUNTIME_ASAN=0`.
+- Operating know-how: long jobs can be confined to E-cores with `taskpolicy -b -p <pid>`, reducing perceived
+  load to nearly zero (do not use for wall measurement; correctness-only).
+- **`gate bench`: PASS 99/99 (all rows correct + within budget), elapsed 63s** (serial 1 core, nice 10,
+  idle machine). The initial estimate of ~10 minutes was excessive — the whole suite is light.
+- **`bench_selfcompile.sh --runs 3` (zero load, best-of-3, elapsed 180s) — the confirmed values without †**:
+  export **1,344ms** / emit-rust **22,487ms** / emit-node **29,269ms** / **cc 6,343ms (first measurement
+  = baseline for the P2d --jobs breakdown)**. IR 23,418,729B / C 5,593,546B / rust vs node parity=identical.
+  JSON: build/bench_history/20260703T093859Z_selfcompile.json.
+  (versus the P0 verification run's † values: export -7% / emit-rust -9% / emit-node -17% — a concrete example of load's magnitude of effect)
+- **`gate full`: FULL PASS, elapsed 767s (12.8 min)** — conf 327/327 PASS, devirt/escape 327
+  identical, native build ok, diffall/native-escape 327 identical, fixpoint ok.
+- **`gate typed` / emit-native / all engine-comparison rows: deferred to milestone measurement** (user decision:
+  running the heavy selfhost benchmarks every time is too burdensome → switch daily measurement to a lightweight set).
 
-### 日常計測セット（毎セッション可・合計 ~90s・全て逐次 1 コア）
+### Daily measurement set (allowed every session, ~90s total, all serial 1 core)
 
-| 用途 | コマンド | 所要 |
+| purpose | command | elapsed |
 |---|---|---|
-| コンパイルステージ A/B | `scripts/bench_selfcompile.sh --src tests/conformance/exhaustive/classes/extends_same_name_scopes.ts --runs 5` | ~4s |
-| GC/ランタイム | `scripts/bench_gc.sh` | ~19s |
-| perf budget 回帰 | `scripts/gate.sh bench` | ~63s |
+| compilation-stage A/B | `scripts/bench_selfcompile.sh --src tests/conformance/exhaustive/classes/extends_same_name_scopes.ts --runs 5` | ~4s |
+| GC/runtime | `scripts/bench_gc.sh` | ~19s |
+| perf budget regression | `scripts/gate.sh bench` | ~63s |
 
-- `bench_selfcompile.sh` に **`--src <file.ts>` / `--label`** を追加（軽量計測モード）。
-  初回計測（extends_same_name_scopes.ts・250 行級・runs=5 best）:
-  **export 267ms / emit-rust 17ms / emit-node 68ms / cc 134ms**、IR 125,726B / C 103,237B /
-  parity identical。小入力はプロセス起動が支配的なので**同一入力の前後差分でのみ判断**。
-  既定（selfhost 入力）の無退行は runs=1 で確認済み（IR/C バイト・parity 従来値と一致）。
-  注: conformance の一部（replaceAll 使用等）は単体 export だと lib 設定で型エラーになる —
-  軽量入力に使うファイルは export が通るものを選ぶ。
+- Added **`--src <file.ts>` / `--label`** to `bench_selfcompile.sh` (lightweight measurement mode).
+  First measurement (extends_same_name_scopes.ts, ~250-line scale, runs=5 best):
+  **export 267ms / emit-rust 17ms / emit-node 68ms / cc 134ms**, IR 125,726B / C 103,237B /
+  parity identical. For small inputs, process startup dominates, so **judge only by the before/after diff on identical input**.
+  No-regression on the default (selfhost input) is already confirmed at runs=1 (IR/C bytes and parity match the previous values).
+  Note: some conformance files (e.g. those using replaceAll) hit a type error under the lib settings when exported standalone —
+  choose files whose export passes for lightweight input.
 
-### GC ベンチ拡充（P0 残の classics / escape-hardened、同日）
+### GC benchmark expansion (P0-remaining classics / escape-hardened, same day)
 
-新 fixture 3 本（V8 差分 OK・スイートは 8 本になり全体 ~30s のまま）:
+Three new fixtures (V8 diff OK, the suite becomes 8 and the whole run stays ~30s):
 
-| bench | wall ms | minor | full | pause ms | max p ms | alloc MB | 特記 |
+| bench | wall ms | minor | full | pause ms | max p ms | alloc MB | notes |
 |---|---|---|---|---|---|---|---|
-| gc_binarytrees | 116 | 16 | **4** | 1.59 | 3.92 | 111.0 | Boehm 系クラシック。survivors 以外で唯一 full GC を踏む |
-| gc_cycles | 48 | 18 | 0 | 0.83 | 1.23 | 105.6 | 閉サイクルごみの回収（mark/sweep の対サイクル検証） |
-| gc_escape_poly | 151 | 30 | 0 | 1.12 | 2.21 | 128.0 | 多相境界越えで escape/SROA に消されない alloc 圧の下限 |
+| gc_binarytrees | 116 | 16 | **4** | 1.59 | 3.92 | 111.0 | a Boehm-family classic. The only case besides survivors that hits full GC |
+| gc_cycles | 48 | 18 | 0 | 0.83 | 1.23 | 105.6 | collection of closed-cycle garbage (mark/sweep verification against cycles) |
+| gc_escape_poly | 151 | 30 | 0 | 1.12 | 2.21 | 128.0 | the lower bound of alloc pressure that escape/SROA cannot eliminate across polymorphic boundaries |
 
-- **ランタイムの実弱点を発見: `gc_scan_refs` は再帰マークで、深いポインタ鎖
-  （~10^5 ノード級の一本鎖リスト）でスタックガードに激突して SIGSEGV** する
-  （クラッシュレポートで確認: `gc_alloc → ts_gc_collect → gc_scan_refs` の深い再帰）。
-  V8 の GC は任意深さのグラフを処理できるため意味論ギャップ（loud crash だが要修正）。
-  **worklist 化（iterative marking）を P2a/P6 の課題に追加**。修正後は深鎖 fixture を
-  ベンチ or conformance に昇格させる。
+- **Found a real runtime weakness: `gc_scan_refs` uses recursive marking, and on a deep pointer chain
+  (a singly-linked list on the order of ~10^5 nodes) it slams into the stack guard and SIGSEGVs**
+  (confirmed in the crash report: deep recursion of `gc_alloc → ts_gc_collect → gc_scan_refs`).
+  Because V8's GC can handle graphs of arbitrary depth, this is a semantic gap (a loud crash, but needs fixing).
+  **Add worklist-ization (iterative marking) to the P2a/P6 task list**. After the fix, promote the deep-chain fixture
+  to a benchmark or to conformance.
 
-## 既知 parity DIFF リスト（miscompile 修正由来・単調増加を許容）
+## Known parity DIFF list (originating from miscompile fixes, monotonic increase permitted)
 
-**ポリシー（ユーザー決定・2026-07-03/04・binding**）: rust 側で silent miscompile を修正すると
-凍結 analyzer_ts（同一アルゴリズムの双子）と emit が恒久的に食い違う。**受容して本リストで管理**
-し、凍結ソースは触らない。**再同期はミルストーン**（速度改善が貯まり、selfhost で「本当に効果が
-あるか」を fixpoint/byte 一致込みで検証したくなった時点）で、蓄積修正の一括移植 or P4 parity 卒業
-のどちらかを選ぶ。selfhost の**ベンチマークとしての役割は無傷**（凍結ソースを入力として
-コンパイルする速度・生成 native の実行速度は今後も常に有効。修正後の garnet は凍結ソースを
-以前より正しくコンパイルする）。
+**Policy (user decision, 2026-07-03/04, binding)**: when a silent miscompile is fixed on the rust side, its emit
+permanently diverges from the frozen analyzer_ts (the twin of the same algorithm). **Accept this and manage it in this list**,
+and do not touch the frozen source. **Resync is a milestone** (at the point when speed improvements have accumulated and we want to
+verify on selfhost whether they "really have an effect", including fixpoint/byte match): choose either a bulk port of the accumulated
+fixes or the P4 parity graduation. selfhost's **role as a benchmark is intact** (the speed of compiling the frozen source as
+input, and the execution speed of the generated native, remain valid at all times going forward. The fixed garnet compiles the
+frozen source more correctly than before).
 
-現在の期待値（2026-07-04・s317 修正#3/#4 後・実測）: **emitc parity = identical 323 /
-DIFF 0 / KNOWN 9**、**selfconf = 332/332 PASS / DIFF 0 / KNOWN 0**。
+Current expected values (2026-07-04, after s317 fixes #3/#4, measured): **emitc parity = identical 323 /
+DIFF 0 / KNOWN 9**, **selfconf = 332/332 PASS / DIFF 0 / KNOWN 0**.
 
-selfconf が全緑の理由（s317 実測の発見）: selfconf は **untyped 経路**（TSAOT_UNTYPED=1）
-で、凍結側ではこの経路の SROA/stack 最適化が非発現のため、既知バグの双子を持っていても
-sroa_* 回帰テストを正しくコンパイルする。**Rust 側は untyped でも class 形状駆動で SROA が
-走る**（probe が untyped で miscompile を再現した理由）— 到達範囲の非対称。
+Why selfconf is all-green (a finding measured in s317): selfconf runs on the **untyped path** (TSAOT_UNTYPED=1),
+and because the frozen side does not manifest this path's SROA/stack optimizations, it compiles the
+sroa_* regression tests correctly even while holding the twin of a known bug. **On the Rust side, SROA runs
+even when untyped, driven by class shape** (the reason the probe reproduced the miscompile while untyped) — an asymmetry in reach.
 
-**単一の真実源 = `scripts/frozen_known_diffs.tsv`**（scope=parity / selfconf の 2 種、
-selfconf は現状 0 行）。emitc_diff.sh / analyzer_conformance.sh がこれを読み込み既知差分を
-KNOWN として別集計するため、gate parity / quick / full は DIFF=0 のまま PASS する。新たな
-miscompile 修正で凍結双子と食い違ったら tsv に追記（理由付き）。selfconf の fixture 実行には
-alarm 20s ガードを追加済み（凍結側バグがハング形でもゲートは有限で落ちる — s317 で
-wild 文字列連結の無限ループを実測済みの防御）。
+**Single source of truth = `scripts/frozen_known_diffs.tsv`** (two kinds, scope=parity / selfconf;
+selfconf currently 0 rows). Because emitc_diff.sh / analyzer_conformance.sh read this and tally the known diffs
+separately as KNOWN, gate parity / quick / full still PASS with DIFF=0. When a new
+miscompile fix diverges from the frozen twin, append to the tsv (with a reason). An alarm 20s guard has been added to
+selfconf's fixture execution (even if a frozen-side bug takes a hang form, the gate fails in finite time — a defense after
+measuring an infinite loop of wild string concatenation in s317).
 
-| プログラム | 由来 |
+| program | origin |
 |---|---|
-| classes/sroa_contained_escape（s316 新規） | 修正#1: 凍結側は contained ループ alloc を sobj スタック化 |
-| classes/sroa_narrowed_nullable_reads（s316 新規） | 修正#2a/2b |
-| classes/sroa_try_body_uses（s316 新規） | 修正#2c（+ 数値スカラ型の随伴差 long long↔double） |
-| closures/forof_loop_capture | 修正#1: site 14 Stack→FrameArena（**注釈コメントのみの差**） |
-| errors/super_assign_throws | 修正#3: 凍結側はレシーバ未使用の `new B().write()` alloc を除去（無害形）・修正済み Rust は保持。s316「要一行調査」の正体 |
-| classes/method_early_return | 修正#3: 同上（無害形） |
-| private/brand_in_method | 修正#3: 同上（無害形） |
-| classes/sroa_noninlinable_callee（s317 新規） | 修正#3 の回帰テスト自体（凍結側は alloc drop のまま emit。selfconf は untyped 経路のため非発現で PASS） |
-| classes/sroa_loop_carried_alias（s317 新規） | 修正#4（ループ逆辺 copy-alias が 1 パス失格網から漏れ `head = n` ストアごと alloc 消失）の回帰テスト自体 |
+| classes/sroa_contained_escape (s316 new) | fix #1: the frozen side stack-allocates the contained-loop alloc as sobj |
+| classes/sroa_narrowed_nullable_reads (s316 new) | fixes #2a/2b |
+| classes/sroa_try_body_uses (s316 new) | fix #2c (+ the accompanying difference in numeric scalar type, long long↔double) |
+| closures/forof_loop_capture | fix #1: site 14 Stack→FrameArena (**difference in annotation comment only**) |
+| errors/super_assign_throws | fix #3: the frozen side removes the receiver-unused `new B().write()` alloc (harmless form); the fixed Rust keeps it. The true identity of s316's "needs a one-line investigation" |
+| classes/method_early_return | fix #3: same as above (harmless form) |
+| private/brand_in_method | fix #3: same as above (harmless form) |
+| classes/sroa_noninlinable_callee (s317 new) | the regression test for fix #3 itself (the frozen side emits with the alloc still dropped. selfconf PASSes because it does not manifest on the untyped path) |
+| classes/sroa_loop_carried_alias (s317 new) | the regression test for fix #4 itself (a loop back-edge copy-alias slips through the single-pass disqualification net, and the `head = n` store vanishes along with the alloc) |
 
-修正#3（s317）= SROA の scan/rewrite 非対称: scan（失格網）が許すのに rewrite が
-インライン化できない Direct 呼び出し（非 tail return callee / arity 不一致の optional
-省略呼び出し）で「alloc 除去 + call 残置」= dangling receiver/arg の wild 読み
-（ハング/ゴミ値）。try 不要で発現するため s316 #2c 以前から両実装に潜在。#2c が
-errors/super_assign_throws の parity 差として無害な端を可視化したことから発見。
+Fix #3 (s317) = SROA's scan/rewrite asymmetry: for a Direct call that the scan (disqualification net) allows but
+rewrite cannot inline (a non-tail-return callee / an optional-omitted call with arity mismatch), you get
+"alloc removed + call left behind" = a wild read of a dangling receiver/arg
+(hang/garbage value). Because it manifests without needing try, it was latent in both implementations since before s316 #2c. Discovered
+because #2c made the harmless edge visible as the parity difference in errors/super_assign_throws.
 
-## 計測ウィンドウで取るものリスト（チェックリスト）
+## Checklist of things to capture in a measurement window
 
-ユーザーと時間枠を合意してから、負荷ゼロ状態で順に実行・追記する:
+After agreeing on a time slot with the user, run in order under zero load and append:
 
-1. `nice -n 19 scripts/gate.sh gc`（完走・所要時間）
-2. `nice -n 19 scripts/gate.sh bench`（全行 RESULT/TIME/BUDGET 表）
-3. `nice -n 19 scripts/bench_selfcompile.sh`（--runs 3・cc 込み）
-4. `nice -n 19 scripts/gate.sh full` → `nice -n 19 scripts/gate.sh typed`（所要時間）
-5. typed 完走後: `scripts/bench_selfcompile.sh --native "$TMPDIR/typed_selfhost/tsan_typed"`
-   （emit-native の単発計測 = KPI「~600s」の基準固定）
-6. `scripts/run_engine_benchmarks.sh node`（全行。bun/deno はインストール後）
+1. `nice -n 19 scripts/gate.sh gc` (full run, elapsed time)
+2. `nice -n 19 scripts/gate.sh bench` (all-rows RESULT/TIME/BUDGET table)
+3. `nice -n 19 scripts/bench_selfcompile.sh` (--runs 3, including cc)
+4. `nice -n 19 scripts/gate.sh full` → `nice -n 19 scripts/gate.sh typed` (elapsed time)
+5. after typed finishes: `scripts/bench_selfcompile.sh --native "$TMPDIR/typed_selfhost/tsan_typed"`
+   (single-shot measurement of emit-native = pinning the KPI "~600s" baseline)
+6. `scripts/run_engine_benchmarks.sh node` (all rows. bun/deno after installation)

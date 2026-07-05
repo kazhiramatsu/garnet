@@ -19,8 +19,8 @@ Everything else — `VariableStatement`, `ExpressionStatement`, `IfStatement`,
 discarded with no error. The exporter reports `OK` and produces an IR
 program that compiles to a C binary that does nothing.
 
-This violates the project-wide principle: "黙って間違えない" (never silently
-miscompile). It also violates JS/TS semantics: in actual JavaScript, top-level
+This violates the project-wide principle of "never silently miscompiling." It also
+violates JS/TS semantics: in actual JavaScript, top-level
 code is the module body that runs when the module is loaded.
 
 ## What programs look like

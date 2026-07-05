@@ -1,8 +1,8 @@
-# オブジェクトリテラルの method / accessor メンバ — 設計ドキュメント
+# Object-literal method / accessor members — design document
 
-## 0. 目的
+## 0. Purpose
 
-オブジェクトリテラル内の以下 3 形を実装する（現状 loud-reject、exporter.ts:696）:
+Implement the following 3 forms inside object literals (currently loud-reject, exporter.ts:696):
 
 ```js
 const o = {
@@ -12,173 +12,172 @@ const o = {
 };
 ```
 
-`this` は定義時のオブジェクト（`o`）にバインドする。
+`this` binds to the object at definition time (`o`).
 
-## 1. 現状の事実（コードで確認済み）
+## 1. Current facts (verified in code)
 
-### 1.1 オブジェクトリテラル lowering（exporter.ts:659-699）
-PropertyAssignment（`{x:1}` / `{g: fn}`）・computed key・shorthand・spread を処理し、
-それ以外（Method/Get/SetAccessor）は `this.unsupported(p, "object literal member ...")`。
-通常プロパティは `StoreField{obj, field: internField(name), src}` で **field-key 空間**に格納。
+### 1.1 Object-literal lowering (exporter.ts:659-699)
+Handles PropertyAssignment (`{x:1}` / `{g: fn}`), computed key, shorthand, and spread;
+everything else (Method/Get/SetAccessor) hits `this.unsupported(p, "object literal member ...")`.
+Ordinary properties are stored in the **field-key space** via `StoreField{obj, field: internField(name), src}`.
 
-### 1.2 メソッド呼び出し `o.g()` の解決（exporter.ts:1170-1193 / emit_c.rs:2085-2089）
-非 builtin・非クラス（any）レシーバの `o.g()` は `callee = Method{recvClass:0xffffffff,
-method: internName("g")}`。codegen の dynamic path は
-`ts_get(recv, TS_KEY_METHOD(internName_id))` で **method-key 空間**を引く
-（`method_key_str`、emit_c.rs:737）。
+### 1.2 Resolution of the method call `o.g()` (exporter.ts:1170-1193 / emit_c.rs:2085-2089)
+For a non-builtin, non-class (any) receiver, `o.g()` becomes `callee = Method{recvClass:0xffffffff,
+method: internName("g")}`. codegen's dynamic path looks up the **method-key space** via
+`ts_get(recv, TS_KEY_METHOD(internName_id))` (`method_key_str`, emit_c.rs:737).
 
-### 1.3 重要な非対称（バグの根）
-- `{g: fn}` は **field-key** に格納される。
-- `o.g()` 呼び出しは **method-key** を引く。
-- → キー空間が食い違い「method is not a function」になる（実証済み）。
-- 一方 `const f = o.g; f()`（取り出して呼ぶ）は LoadField（field-key）なので動く（実証済み）。
+### 1.3 The critical asymmetry (root of the bug)
+- `{g: fn}` is stored under the **field-key**.
+- The `o.g()` call looks up the **method-key**.
+- → The key spaces disagree, yielding "method is not a function" (verified).
+- Meanwhile `const f = o.g; f()` (extract, then call) works, because it is a LoadField (field-key) (verified).
 
-### 1.4 V8 の意味論（実証済み・設計の指針）
+### 1.4 V8 semantics (verified; guides the design)
 ```
 const o = { greet(){ return 42; } };
-typeof o.greet  // "function"   ← 値として取れる
+typeof o.greet  // "function"   ← retrievable as a value
 o.greet()       // 42
-const m=o.greet; m()  // 42       ← 取り出しても呼べる
-Object.keys(o)  // ['greet']     ← 列挙される（enumerable な通常プロパティ）
+const m=o.greet; m()  // 42       ← callable even after extraction
+Object.keys(o)  // ['greet']     ← enumerated (an enumerable ordinary property)
 ```
-**結論**: JS のオブジェクトリテラル method は「関数値を持つ enumerable な通常プロパティ」に
-過ぎない。クラス method（prototype 上・非列挙）とは別物。method-key 空間（内部最適化）に
-入れてはいけない。`o.greet`（LoadField）・`Object.keys`・JSON すべてが見える **field-key** に
-格納するのが正しい。
+**Conclusion**: a JS object-literal method is nothing more than "an enumerable ordinary property
+holding a function value." It is distinct from a class method (on the prototype, non-enumerable). It
+must NOT be placed in the method-key space (an internal optimization). The correct storage is the
+**field-key** space, which `o.greet` (LoadField), `Object.keys`, and JSON all see.
 
-## 2. 設計
+## 2. Design
 
-### 2.1 格納: 通常の enumerable プロパティ（field-key）
-3 形すべて、リフトしたクロージャ（or accessor）を **field-key** で格納する:
-- **method** `{ greet() {} }`: クロージャをリフト（this=object, thisParam=true）し
-  `StoreField{obj, field: internField("greet"), src: closure}`。= `{greet: fn}` と同じ格納。
-- **get/set** `{ get x(){}, set x(v){} }`: 既存の accessor 機構（ts_define_accessor_attr、
-  defineProperty で実装済み）を流用。`object.defineAccessor:<g>:<s>:<enum>:<conf>` builtin で
-  `obj` に accessor を field-key 格納。**オブジェクトリテラルの accessor は enumerable**
-  （V8: `Object.keys({get x(){return 1}})` → `['x']`）なので enum=1, conf=1 で定義。
+### 2.1 Storage: an ordinary enumerable property (field-key)
+For all 3 forms, store the lifted closure (or accessor) under the **field-key**:
+- **method** `{ greet() {} }`: lift the closure (this=object, thisParam=true) and emit
+  `StoreField{obj, field: internField("greet"), src: closure}`. = the same storage as `{greet: fn}`.
+- **get/set** `{ get x(){}, set x(v){} }`: reuse the existing accessor machinery (ts_define_accessor_attr,
+  already implemented via defineProperty). The `object.defineAccessor:<g>:<s>:<enum>:<conf>` builtin
+  stores an accessor into `obj` under the field-key. **Object-literal accessors are enumerable**
+  (V8: `Object.keys({get x(){return 1}})` → `['x']`), so they are defined with enum=1, conf=1.
 
-### 2.2 呼び出し `o.greet()` のキー解決順（own → prototype）
+### 2.2 Key resolution order for the call `o.greet()` (own → prototype)
 
-**重要な訂正（V8 で確認）**: JS のプロパティ探索は own → prototype の順で、**own が
-prototype を隠す**（shadowing）。
+**Important correction (verified with V8)**: JS property lookup goes own → prototype, and **own shadows
+prototype** (shadowing).
 ```js
 class C { constructor(){ this.run = ()=>1; } run(){ return 2; } }
-new C().run()   // V8: 1  ← own field が prototype method を隠す
+new C().run()   // V8: 1  ← the own field shadows the prototype method
 ```
-現状 tsaot はこのケースで TypeError（method-key しか引かず own field を見ない）= **既存バグ**。
+Currently tsaot raises a TypeError in this case (it only looks up the method-key and never sees the own field) = an **existing bug**.
 
-したがって dynamic method call のキー解決は **field-key（own）を先に、method-key
-（prototype 相当）を後に**引く:
+Therefore the dynamic method call resolves keys **field-key (own) first, then method-key
+(prototype equivalent) second**:
 ```c
-tsv _mv = ts_get(recv, <FIELD_KEY(field_id)>);          // own プロパティ（field-key）優先
+tsv _mv = ts_get(recv, <FIELD_KEY(field_id)>);          // own property (field-key) first
 if (!ts_is_callable(_mv)) _mv = ts_get(recv, TS_KEY_METHOD(method_id)); // prototype method
 if (!ts_is_callable(_mv)) ts_dynamic_method_missing(method_id);
 ```
-- object-literal method / `{g: fn}` / own field の関数 → 1 回目（field-key）で hit。
-- クラスインスタンスの prototype method → own になければ 2 回目（method-key）で hit。
-- own field が同名 method を隠すケース → field-key 先なので V8 一致（既存バグも解消）。
-- **perf 懸念**: クラスメソッド呼び出しが毎回 field-key を先に引く。own prop map が空/小
-  ならコストは小さいが、hot path（obj_kernel / typed_field のメソッド呼び出し）で要計測。
-  退行するなら「devirt で静的にクラスメソッドと確定できる呼び出しは従来の単一 method-key
-  直行を維持し、Dynamic（recvClass=0xffffffff）のみ own→proto フォールバック」に限定する
-  （静的クラス確定のメソッド呼び出しは struct/vtable 直行で ts_get すら通らないはずなので、
-  この限定で hot path は不変になる見込み）。まず計測。
+- object-literal method / `{g: fn}` / an own-field function → hits on the 1st lookup (field-key).
+- a class instance's prototype method → if not own, hits on the 2nd lookup (method-key).
+- the case where an own field shadows a same-named method → field-key first, so it matches V8 (the existing bug is fixed too).
+- **perf concern**: every class-method call now looks up the field-key first. The cost is small when
+  the own prop map is empty/small, but it must be measured on the hot path (obj_kernel / typed_field
+  method calls). If it regresses, restrict the change to: "calls that devirt can statically pin to a
+  class method keep the old single method-key direct route, and only Dynamic (recvClass=0xffffffff)
+  falls back own→proto" (a statically-pinned class-method call goes struct/vtable-direct and should not
+  even pass through ts_get, so under this restriction the hot path is expected to stay unchanged).
+  Measure first.
 
-### 2.3 name-id と field-id の橋渡し
-`internName`（method 名空間）と `internField`（field 空間）は別 ID 空間で、同じ文字列でも
-ID が違う。codegen の Method callee は name-id しか持たない。フォールバックで field-key を
-引くには、その名前の field-id が要る。
-**方針**: exporter で Method callee を作るとき、その名前の **field-id も内部 intern して
-Method callee に `method_field: FieldId` を持たせる**（同じ文字列を internField で引く）。
-codegen は `TS_KEY_METHOD(method_id)` で外して `<field_id>` でフォールバック。
-- IR の `CalleeRef::Method` に `method_field: Option<FieldId>` を追加（後方互換: 既存は None）。
-- exporter の Method callee 生成 2 箇所（1176-1192）で `internField(name)` も呼んで設定。
-- escape/devirt は素通り（callee の付加情報、オペランド数不変）。
+### 2.3 Bridging name-id and field-id
+`internName` (the method name space) and `internField` (the field space) are separate ID spaces; the
+same string gets a different ID in each. codegen's Method callee only carries the name-id. To fall back
+to a field-key lookup, it needs that name's field-id.
+**Approach**: when the exporter builds a Method callee, **also internally intern that name's field-id
+and give the Method callee a `method_field: FieldId`** (looking up the same string via internField).
+codegen tries `TS_KEY_METHOD(method_id)` and falls back to `<field_id>`.
+- Add `method_field: Option<FieldId>` to the IR's `CalleeRef::Method` (backward compatible: existing ones are None).
+- Set it at the exporter's 2 Method-callee construction sites (1176-1192) by also calling `internField(name)`.
+- escape/devirt pass through untouched (this is extra callee metadata; the operand count is unchanged).
 
-### 2.4 リフト機構（this バインド）
-defineProperty の method-shorthand 実装（lowerDefineOneProperty / assignIds / free-var
-seeding）で確立済みのものを流用:
-- assignIds（exporter.ts:368）: object-literal 内 `MethodDeclaration name=="get"||"set"` に
-  fnId 付与済み。これを **全 MethodDeclaration / GetAccessor / SetAccessor**（object-literal の
-  メンバ）に拡張する。
-- free-var seeding walk（4078 付近）: 同上、object-literal の method/accessor メンバを allFns に。
-- lowerClosure(node, hint, /*thisParam*/ true): this=object としてリフト（実績あり）。
+### 2.4 The lifting machinery (this binding)
+Reuse what the defineProperty method-shorthand implementation already established
+(lowerDefineOneProperty / assignIds / free-var seeding):
+- assignIds (exporter.ts:368): already assigns a fnId to `MethodDeclaration name=="get"||"set"` inside an
+  object literal. Extend this to **all MethodDeclaration / GetAccessor / SetAccessor** (object-literal members).
+- free-var seeding walk (near 4078): likewise, add object-literal method/accessor members to allFns.
+- lowerClosure(node, hint, /*thisParam*/ true): lift with this=object (proven approach).
 
-## 3. 段階
+## 3. Stages
 
-- **段階 1（method `{ g(){} }`）**: 格納（StoreField, field-key, this バインド closure）+
-  呼び出しフォールバック（method-key→field-key）+ CalleeRef::Method.method_field 追加。
-- **段階 2（get/set accessor）**: 既存 ts_define_accessor_attr を流用、enumerable=1 で格納。
-  `o.x` 読みは ts_get の accessor 起動経路（実装済み）、`o.x=v` は ts_set の setter 経路（実装済み）。
+- **Stage 1 (method `{ g(){} }`)**: storage (StoreField, field-key, this-bound closure) +
+  call fallback (method-key→field-key) + adding CalleeRef::Method.method_field.
+- **Stage 2 (get/set accessor)**: reuse the existing ts_define_accessor_attr, store with enumerable=1.
+  Reading `o.x` uses ts_get's accessor-invocation path (implemented); `o.x=v` uses ts_set's setter path (implemented).
 
-各段階 full CI green（conf/ci_fast/unit/correct1,2/perf）。perf 中立必須（hot path 不変）。
+Each stage: full CI green (conf/ci_fast/unit/correct1,2/perf). perf-neutral is mandatory (hot path unchanged).
 
-## 4. リスク
+## 4. Risks
 
-- **method-key→field-key フォールバックの perf**: dynamic method call に ts_get 1 回追加。
-  ただし hit 時（クラスインスタンス）は 1 回目で返るので追加コストなし。miss 時のみ 2 回目。
-  hot path（クラスメソッド）は不変。obj_kernel で確認。
-- **enumerable**: object-literal method/accessor は列挙される（V8 準拠）。class method は非列挙
-  （prototype）。両者で振る舞いが違うのは正しい。
-- **既存 `{g: fn}` プロパティ**: 2.2 のフォールバックで初めて `o.g()` が動くようになる（副次的改善）。
+- **perf of the method-key→field-key fallback**: adds 1 ts_get to the dynamic method call. But on a hit
+  (class instance) it returns on the 1st lookup, so there is no added cost; only on a miss does the 2nd
+  lookup happen. The hot path (class methods) is unchanged. Verified with obj_kernel.
+- **enumerable**: object-literal methods/accessors are enumerated (V8-conformant). Class methods are
+  non-enumerable (prototype). It is correct that the two behave differently.
+- **existing `{g: fn}` properties**: the §2.2 fallback makes `o.g()` work for the first time (a secondary improvement).
 
-## 5. 実装結果（DONE）
+## 5. Implementation result (DONE)
 
-### 段階 1（method `{ g(){} }`）+ 段階 2（accessor `{ get/set }`）両方 DONE。
+### Both Stage 1 (method `{ g(){} }`) and Stage 2 (accessor `{ get/set }`) are DONE.
 
-- **格納（exporter, object literal lowering）**: 設計どおり通常プロパティとして格納。
-  - method-shorthand `{ greet() {} }`: `lowerClosure(this=object)` でリフトし
-    `StoreField{field: internField(name)}`（field-key）。= `{greet: fn}` と同一格納。
-  - accessor `{ get x(){}, set x(v){} }`: 名前ごとに get/set を**事前ペアリング**して単一の
-    `object.defineAccessor:<g>:<s>:1:1` builtin で定義（enumerable=1, configurable=1。V8 の
-    object-literal accessor は列挙される）。2 つの AST メンバ（get と set）を 1 プロパティに
-    集約することで「後勝ち上書きで getter が消える」破綻を回避。
-- **呼び出し（emit_c, dynamic method dispatch）**: own→prototype 順に修正。
-  - `CalleeRef::Method` に `method_field: Option<FieldId>`（同名の field-key）を追加。
-  - dynamic method call は `ts_get(recv, field_key)`（own）を先に引き、callable でなければ
-    `ts_get(recv, TS_KEY_METHOD(method_id))`（prototype）にフォールバック。helper
-    `emit_method_value_lookup`。devirt の Dynamic 経路で method_field を保存。
-  - これにより object-literal method / `{g: fn}` / own field の関数がメソッド構文で呼べる。
-    クラスメソッドは devirt で Direct/struct 直行（dynamic path を通らない）なので perf 不変。
-- **lift 機構**: assignIds と free-var seeding walk を object-literal の全 method/accessor
-  メンバ（Method/Get/SetAccessorDeclaration、識別子・文字列名）に拡張。
-- **検証 vs V8**: method(42)/this(10)/値取得・keys・call の一貫性/get(5)/get+set(7)/accessor
-  enumerable(keys に出る)/`{g:fn}` 呼び出し(9)/data がメソッドを後勝ち上書き(1)。
-  computed-name メソッド `{ [Symbol.iterator]() {} }` は引き続き reject（computed 名は別途）。
-- perf 中立（obj_kernel 204ms, typed_field 183ms）。全 CI 緑、conf 69/69。
-- stale negative test 更新: rejects_async.sh の "object-literal iterator" を
-  "computed-name iterator method" に差し替え（plain method は now supported）。
-- 追加 conformance: object_methods/{method_shorthand, accessors, property_function_call}.ts。
+- **Storage (exporter, object literal lowering)**: stored as an ordinary property, as designed.
+  - method-shorthand `{ greet() {} }`: lifted via `lowerClosure(this=object)` and stored with
+    `StoreField{field: internField(name)}` (field-key). = identical storage to `{greet: fn}`.
+  - accessor `{ get x(){}, set x(v){} }`: get/set are **pre-paired** by name and defined with a single
+    `object.defineAccessor:<g>:<s>:1:1` builtin (enumerable=1, configurable=1; V8's object-literal
+    accessors are enumerated). Aggregating the 2 AST members (get and set) into 1 property avoids the
+    "last-write-wins overwrite makes the getter disappear" breakage.
+- **Call (emit_c, dynamic method dispatch)**: fixed to own→prototype order.
+  - Added `method_field: Option<FieldId>` (the same-named field-key) to `CalleeRef::Method`.
+  - The dynamic method call looks up `ts_get(recv, field_key)` (own) first, and if not callable, falls
+    back to `ts_get(recv, TS_KEY_METHOD(method_id))` (prototype). Helper `emit_method_value_lookup`.
+    method_field is saved on devirt's Dynamic path.
+  - This lets object-literal methods / `{g: fn}` / own-field functions be called with method syntax.
+    Class methods go Direct/struct-direct via devirt (they do not pass through the dynamic path), so perf is unchanged.
+- **Lift machinery**: extended assignIds and the free-var seeding walk to all object-literal method/accessor
+  members (Method/Get/SetAccessorDeclaration, both identifier and string names).
+- **Verification vs V8**: method(42)/this(10)/consistency of value-retrieval, keys, and call/get(5)/get+set(7)/accessor
+  enumerable (shows up in keys)/`{g:fn}` call(9)/a data property overwrites a method, last wins(1).
+  The computed-name method `{ [Symbol.iterator]() {} }` is still rejected (computed names are separate).
+- perf-neutral (obj_kernel 204ms, typed_field 183ms). All CI green, conf 69/69.
+- Updated a stale negative test: replaced rejects_async.sh's "object-literal iterator" with
+  "computed-name iterator method" (plain methods are now supported).
+- Added conformance: object_methods/{method_shorthand, accessors, property_function_call}.ts.
 
-### 既知の別バグ（本タスク外・要別途対応）
-調査中に発見: **サブクラスのインスタンスフィールドが親クラスの同名メソッドを shadow する**
-有効な TS パターン
+### A separate known bug (out of scope for this task; needs separate handling)
+Found during investigation: the valid TS pattern where **a subclass instance field shadows a same-named
+method of the parent class**
 ```ts
 class Base { greet(){ return 2; } }
 class Derived extends Base { greet = () => 1; }
-new Derived().greet()   // V8: 1, tsaot: 2 (誤)
+new Derived().greet()   // V8: 1, tsaot: 2 (wrong)
 ```
-が、devirt が静的に親メソッドへ解決し（さらに定数畳み込みで body をインライン）、own field の
-shadow を無視する。これは devirt の健全性問題で、object-literal メソッドとは独立。
-※ なお `class C { run; run(){} }`（同一クラスで field と method 同名）は TS 自体が
-"Duplicate identifier" で弾くので非問題。サブクラス shadow のみが有効 TS で残る。
-対策案（別タスク）: クラスに own field と同名の（自分 or 継承）メソッドがある場合、その
-メソッド呼び出しの devirt を抑止して dynamic（own→proto フォールバック）に落とす。
+but devirt statically resolves to the parent method (and further inlines the body via constant folding),
+ignoring the own-field shadow. This is a soundness problem in devirt, independent of object-literal methods.
+Note: `class C { run; run(){} }` (a field and method with the same name in the same class) is rejected by
+TS itself as "Duplicate identifier", so it is a non-issue. Only the subclass shadow remains as valid TS.
+Proposed fix (separate task): when a class has a method (own or inherited) with the same name as an own
+field, suppress devirt for that method call and drop it to dynamic (own→proto fallback).
 
-## 6. devirt field-shadows-method バグ修正（DONE）
+## 6. devirt field-shadows-method bug fix (DONE)
 
-§5 で「別バグ・要別途」とした、サブクラスのインスタンスフィールドが親メソッドを shadow する
-ケースを修正。
-- **原因**: exporter が `recvClass !== undefined && classHasMethod(recvClass, name)` で静的
-  Method callee を作り、devirt が prototype メソッドへ Direct 解決 → own field の shadow を無視。
-- **修正**: `classHasField(classId, name)`（クラス chain を歩いて instance field 名を検索）を新設。
-  メソッド呼び出しの callee 決定で、**同名の instance field がある場合は静的 devirt を抑止**し、
-  dynamic 経路（recvClass=0xffffffff）に落とす。dynamic 経路は §2.2 の own(field-key)→
-  prototype(method-key) フォールバックなので、shadow する field を先に見つけて正しく呼ぶ。
-  prototype メソッドは method-key に登録済みなので、shadow が無い継承メソッドは 2 段目で hit。
-- **検証 vs V8**: `class D extends B { greet = ()=>1 }` over `B { greet(){return 2} }` → 1（修正前 2）、
-  field shadows inherited method → 20、shadow 無し継承メソッド → 2（regression なし）、
-  通常クラスメソッド → 3（regression なし）。
-- perf 中立（obj_kernel 205ms, typed_field 182ms, inherit_sroa 82ms）。同名 field/method を持つ
-  クラスのみ dynamic 経路（稀）なので hot path 不変。全 CI 緑、conf 70/70。
-- 追加 conformance: object_methods/field_shadows_method.ts。
+Fixed the case flagged in §5 as "a separate bug, needs separate handling": a subclass instance field
+shadowing a parent method.
+- **Cause**: the exporter built a static Method callee via `recvClass !== undefined && classHasMethod(recvClass, name)`,
+  and devirt resolved Direct to the prototype method → ignoring the own-field shadow.
+- **Fix**: introduced `classHasField(classId, name)` (walks the class chain searching for an instance field name).
+  When deciding a method call's callee, **if a same-named instance field exists, suppress static devirt** and
+  drop to the dynamic path (recvClass=0xffffffff). The dynamic path is the §2.2 own(field-key)→
+  prototype(method-key) fallback, so it finds the shadowing field first and calls it correctly.
+  Prototype methods are registered on the method-key, so an inherited method with no shadow hits on the 2nd stage.
+- **Verification vs V8**: `class D extends B { greet = ()=>1 }` over `B { greet(){return 2} }` → 1 (was 2 before the fix),
+  field shadows inherited method → 20, inherited method with no shadow → 2 (no regression),
+  a normal class method → 3 (no regression).
+- perf-neutral (obj_kernel 205ms, typed_field 182ms, inherit_sroa 82ms). Only classes that have a same-named
+  field/method take the dynamic path (rare), so the hot path is unchanged. All CI green, conf 70/70.
+- Added conformance: object_methods/field_shadows_method.ts.
