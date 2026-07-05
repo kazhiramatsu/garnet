@@ -1,171 +1,174 @@
-# tsaot — V8差分コンフォーマンス作業の引き継ぎ（Claude Code 用）
+# tsaot — Handoff for V8-diff conformance work (for Claude Code)
 
-あなたは **tsaot**（TypeScript → C の AOT コンパイラ。TypeScript で書かれ、自己ホスティングを目標）の
-コンフォーマンス改善を継続します。日本語ユーザー Kaz のプロジェクトです。**応答は日本語で**。
+You are continuing the conformance work on **tsaot** (an AOT compiler from TypeScript → C, written in
+TypeScript, with self-hosting as a goal).
 
-このドキュメントだけ読めば即作業開始できます。まず「セットアップ」を実行し、規律を理解し、
-ワークフローに従って V8 差分で見つかったバグを 1 件ずつ潰してください。
+Reading this document alone is enough to start work immediately. First run "Setup", understand the
+discipline, and then follow the workflow to fix bugs found via V8 diffing, one at a time.
 
-> **このリポジトリは zip から展開された自己完結チェックアウトです。** すべてのコマンドは
-> **リポジトリのルート（この `CLAUDE_CODE_HANDOFF.md` がある場所）からの相対パス**で動きます。
-> 絶対パス（`/home/claude` や `/tmp` など）には依存しません。以下では、ルートを指す場合は `$ROOT`、
-> シェルでは「ルートに `cd` してから」を前提にします。
+> **This repository is a self-contained checkout extracted from a zip.** All commands work with
+> **paths relative to the repository root (where this `CLAUDE_CODE_HANDOFF.md` lives)**.
+> They do not depend on absolute paths (such as `/home/claude` or `/tmp`). Below, `$ROOT` refers to the
+> root, and shell commands assume you have already `cd`'d to the root.
 
 ---
 
-## 0. セットアップ（最初に必ず実行）
+## 0. Setup (always run this first)
 
-リポジトリのルートで一度だけ:
+Once, at the repository root:
 
 ```bash
 bash scripts/setup.sh
 ```
 
-これが以下を全部やります（すべて repo 相対）:
-1. `exporter/` で `npm install`（typescript を取得。`registry.npmjs.org` への通信が必要）
-2. exporter ビルド（`tsc` → `exporter/exporter.js`）
-3. analyzer ビルド（`cargo build --release` → `analyzer/target/release/tsaot`）
-4. ランタイム precompile（`gcc -c runtime/ts_rt.c` → `build/rt.o`）
+This does all of the following (all repo-relative):
+1. `npm install` in `exporter/` (fetches typescript; requires network access to `registry.npmjs.org`)
+2. Build the exporter (`tsc` → `exporter/exporter.js`)
+3. Build the analyzer (`cargo build --release` → `analyzer/target/release/tsaot`)
+4. Precompile the runtime (`gcc -c runtime/ts_rt.c` → `build/rt.o`)
 
-> `npm install` が失敗する場合はネットワーク設定で `registry.npmjs.org` が許可されているか確認。
+> If `npm install` fails, check that your network configuration allows `registry.npmjs.org`.
 
-> **macOS について**: スクリプト群は **macOS（bash 3.2 / BSD date）でも動く**ように書かれています
-> （`mapfile`・`declare -A`・`date +%s%3N` は使っていません）。Linux と同じく `bash scripts/setup.sh`
-> で立ち上がります。バッチ全体タイムアウトを使う `run_tsc_conformance.sh` だけ `gtimeout`（coreutils）
-> があると便利ですが、無くても動きます（タイムアウトしないだけ）。macOS の `gcc` は Apple clang の
-> エイリアスでそのまま使えます。Python 3 が `now_ms` のミリ秒計測に使われます（無ければ perl /
-> gdate / date / 秒精度の順にフォールバック）。
+> **About macOS**: the scripts are written to **also work on macOS (bash 3.2 / BSD date)**
+> (they do not use `mapfile`, `declare -A`, or `date +%s%3N`). They come up with `bash scripts/setup.sh`
+> just like on Linux. Only `run_tsc_conformance.sh`, which uses a whole-batch timeout, benefits from
+> `gtimeout` (coreutils), but it works without it (it just won't time out). macOS's `gcc` is an alias
+> for Apple clang and works as-is. Python 3 is used for `now_ms` millisecond timing (if absent, it
+> falls back to perl / gdate / date / second precision, in that order).
 
-サニティチェック:
+Sanity check:
 ```bash
-bash scripts/run_conformance.sh exhaustive | tail -1   # 期待: PASS=88 FAIL=0 / 88
+bash scripts/run_conformance.sh exhaustive | tail -1   # expect: PASS=88 FAIL=0 / 88
 ```
 
-### 個別ビルド（編集後の再ビルド。setup.sh の中身と同じ）
-- **exporter 編集後**:
+### Individual builds (rebuild after edits; same as what setup.sh does)
+- **After editing the exporter**:
   ```bash
   (cd exporter && ./node_modules/.bin/tsc exporter.ts class_extract.ts \
      --module commonjs --target es2020 --skipLibCheck --moduleResolution node --esModuleInterop)
   ```
-  ※ この tsc フラグは正確にこの通り（`--skipLibCheck --moduleResolution node --esModuleInterop` 必須）。
-- **analyzer 編集後**: `(cd analyzer && cargo build --release 2>&1 | grep -E "^error")`
-- **runtime 編集後**: `gcc -O2 -c runtime/ts_rt.c -Iruntime -o build/rt.o`（**毎回 build/rt.o を作り直す**）
+  Note: these tsc flags must be exactly as shown (`--skipLibCheck --moduleResolution node --esModuleInterop` are required).
+- **After editing the analyzer**: `(cd analyzer && cargo build --release 2>&1 | grep -E "^error")`
+- **After editing the runtime**: `gcc -O2 -c runtime/ts_rt.c -Iruntime -o build/rt.o` (**rebuild build/rt.o every time**)
 
 ---
 
-## 1. パイプライン全体像
+## 1. Pipeline overview
 
 ```
-TS ソース
-  → exporter（npm の typescript API を使用、exporter.ts）
+TS source
+  → exporter (uses npm's typescript API, exporter.ts)
   → Escape IR JSON
-  → Rust アナライザ（devirt → escape → SROA → monomorphization → codegen、emit_c.rs）
-  → C コード（NaN-boxing ランタイム ts_rt.c とリンク）
-  → gcc → ネイティブ実行ファイル
+  → Rust analyzer (devirt → escape → SROA → monomorphization → codegen, emit_c.rs)
+  → C code (linked with the NaN-boxing runtime ts_rt.c)
+  → gcc → native executable
 ```
 
-**3つの編集対象:**
-- `exporter/exporter.ts` — TS AST → IR の lowering（TypeScript で記述）
-- `analyzer/src/*.rs` — IR 最適化と C 生成（`emit_c.rs` `sroa.rs` `devirt.rs` `escape_ir.rs` が主）
-- `runtime/ts_rt.c` / `runtime/ts_rt.h` — C ランタイム（組み込み関数の実体）
+**Three things you'll edit:**
+- `exporter/exporter.ts` — lowering from TS AST → IR (written in TypeScript)
+- `analyzer/src/*.rs` — IR optimization and C generation (mainly `emit_c.rs` `sroa.rs` `devirt.rs` `escape_ir.rs`)
+- `runtime/ts_rt.c` / `runtime/ts_rt.h` — C runtime (the implementations of the builtins)
 
-**単一ファイルのコンパイル＆実行（デバッグの基本。すべて repo 相対）:**
+**Compile & run a single file (the basics of debugging; all repo-relative):**
 ```bash
-cd "$ROOT"                                                       # ルートに居ること（mkdir -p build しておく）
+cd "$ROOT"                                                       # be at the root (make sure to mkdir -p build)
 echo 'function main(){console.log([1,2,3].reduce((a,b)=>a*b));}main();' > build/t.ts
-node exporter/exporter.js build/t.ts build/t.json build/tl.json  # TS → IR JSON（UNSUPPORTED が出たら exporter が reject）
+node exporter/exporter.js build/t.ts build/t.json build/tl.json  # TS → IR JSON (if UNSUPPORTED appears, the exporter rejected it)
 analyzer/target/release/tsaot build/t.json emit > build/t.c      # IR JSON → C
-gcc -O2 build/t.c build/rt.o -Iruntime -lm -lcurl -o build/t     # C → 実行ファイル
-./build/t                                                        # 実行（直接！サブシェルに入れない）
+gcc -O2 build/t.c build/rt.o -Iruntime -lm -lcurl -o build/t     # C → executable
+./build/t                                                        # run (directly! don't put it in a subshell)
 ```
 
-IR の中身を見たいとき:
+When you want to inspect the IR:
 ```bash
 python3 -c "import json;d=json.load(open('build/t.json'));[print(i) for f in d['functions'] for i in f.get('body',[])]"
 ```
 
 ---
 
-## 2. 規律（厳守。Kaz はここに非常に厳しい）
+## 2. Discipline (mandatory; the bar here is very high)
 
-1. **黙って間違えるな（loud-reject over silent-miscompile）**。未対応機能は `this.unsupported(node, "理由")`
-   で明示的に reject させる。**最悪なのは間違った結果を黙って出すこと（silent miscompile）**。差分で
-   `DIFF`（誤った値）が出たら最優先。`REJECT` は次点。
+1. **Never fail silently (loud-reject over silent-miscompile)**. Reject unsupported features explicitly
+   with `this.unsupported(node, "reason")`. **The worst outcome is silently producing a wrong result
+   (silent miscompile)**. If diffing shows `DIFF` (a wrong value), that is the top priority. `REJECT` is
+   second.
 
-2. **コードを読んでから直す。推測で書かない**。該当する lowering / codegen / runtime を grep して実際の
-   挙動を確認してから設計する。
+2. **Read the code before fixing. Don't write from guesswork**. grep the relevant lowering / codegen /
+   runtime and confirm the actual behavior before designing a fix.
 
-3. **正しさ優先、ただし hot path の perf は守る**。数値・整数の高速経路（unboxed double / long long）を
-   壊さない。強制変換などのロジックを足すときも、両 unboxed の fast path は温存する。
+3. **Correctness first, but protect hot-path perf**. Don't break the numeric/integer fast paths
+   (unboxed double / long long). Even when adding logic such as coercion, preserve both unboxed fast paths.
 
-4. **影響範囲の大きい変更（SROA/devirt/escape など中核最適化）は特に慎重に**。保守的に倒す
-   （例: 動的ディスパッチ先のレシーバは escape 扱いにする）のは安全側として許容。
+4. **Be especially careful with high-blast-radius changes (core optimizations like SROA/devirt/escape)**.
+   Falling back conservatively (e.g., treating the receiver of a dynamic dispatch as escaping) is
+   acceptable as the safe side.
 
-5. **正直に**。「実装した」「正直に reject した」「別の既存バグ」を区別して報告する。スコープ外でも
-   露見したバグは正直に flag する。
+5. **Be honest**. Distinguish and report "implemented", "honestly rejected", and "a separate pre-existing
+   bug". Honestly flag bugs that surface even if they are out of scope.
 
-6. **各修正の後、必ず full CI を通してから次へ**（手順は §5）。CI が通る前に次のバグに進まない。
+6. **After each fix, always pass full CI before moving on** (procedure in §5). Do not proceed to the next bug before CI passes.
 
-7. **マイルストーンごとに docs 記録**（§6）。記録せずに次に進むと作業が失われる。
+7. **Record docs at each milestone** (§6). If you move on without recording, the work is lost.
 
 ---
 
-## 3. 差分ハーネス（バグ発見の主力ツール）
+## 3. The diff harness (the main tool for finding bugs)
 
-`scripts/difftest.sh` が tsaot の出力と node（typescript で TS を JS にしてから eval）の出力を突き合わせる。
-**repo 相対で動く**ので、ルートに `cd` してから `source` するだけ:
+`scripts/difftest.sh` compares tsaot's output against node's (which turns TS into JS via typescript and
+then evals it). It **works repo-relative**, so just `cd` to the root and `source` it:
 
 ```bash
 cd "$ROOT"
 mkdir -p build
 cat > build/r.sh <<'SH'
 #!/bin/bash
-source scripts/difftest.sh        # ROOT を自動検出し、build/noderun.js を生成し、dt() を定義
+source scripts/difftest.sh        # auto-detects ROOT, generates build/noderun.js, and defines dt()
 dt "test name"  'function main(){ ... }main();'
 dt "another"    'function main(){ ... }main();'
 SH
 bash build/r.sh
 ```
 
-注意点:
-- シェルは sh のことがあるので、`source` を**インラインで使わず必ず `bash build/r.sh` 経由**で。
-- `difftest.sh` は `exporter/node_modules`, `exporter/exporter.js`, `analyzer/target/release/tsaot`,
-  `build/rt.o` が揃っている前提（無ければ `bash scripts/setup.sh`）。
-- **runtime を編集したら必ず `gcc -O2 -c runtime/ts_rt.c -Iruntime -o build/rt.o` で作り直す。**
-  exporter 編集後は tsc 再ビルド、analyzer 編集後は cargo 再ビルド（§0）。
+Notes:
+- The shell may be sh, so **don't `source` inline; always go through `bash build/r.sh`**.
+- `difftest.sh` assumes `exporter/node_modules`, `exporter/exporter.js`, `analyzer/target/release/tsaot`,
+  and `build/rt.o` are all present (if not, run `bash scripts/setup.sh`).
+- **After editing the runtime, always rebuild with `gcc -O2 -c runtime/ts_rt.c -Iruntime -o build/rt.o`.**
+  After editing the exporter, rebuild with tsc; after editing the analyzer, rebuild with cargo (§0).
 
-判定: `OK`=一致 / `DIFF`=誤った値（最優先で修正）/ `REJECT`=未対応（exporter が明示的に拒否）。
-
----
-
-## 4. ワークフロー（1バグあたり）
-
-1. **探索**: あるカテゴリ（§7「探索候補」参照）について `dt` を 5〜15 個書いて流す。`DIFF`/`REJECT` を探す。
-2. **再現を最小化**: 失敗ケースを単一 .ts に落とし、`build/t.json` の IR と `build/t.c` の生成コードを見て
-   **どの段（exporter / analyzer / runtime）が原因か**を特定する。推測しない。
-3. **設計**: 原因の段の該当コードを読み、最小で正しい修正を考える。hot path を壊さないか確認。
-4. **実装 → 再ビルド → `dt` で V8 一致を確認**（関連ケースも複数）。
-5. **full CI gate**（§5）。緑になるまで次に進まない。stale な negative test が落ちたら更新する
-   （実装した機能を今も reject するテストは現状に合わせる）。
-6. **conformance テスト追加**（§6）。
-7. **docs 記録**（§6）。
+Verdicts: `OK` = match / `DIFF` = wrong value (fix with top priority) / `REJECT` = unsupported (the exporter explicitly refused).
 
 ---
 
-## 5. full CI gate（各修正の後、必ず全部通す。すべて repo 相対）
+## 4. Workflow (per bug)
 
-**推奨: 並列ドライバ 1 本で全ゲート（約 2x 速い, ~40s warm）。**
+1. **Explore**: for a given category (see §7 "exploration candidates"), write 5–15 `dt` cases and run them. Look for `DIFF`/`REJECT`.
+2. **Minimize the repro**: reduce the failing case to a single .ts, and by looking at the IR in
+   `build/t.json` and the generated code in `build/t.c`, identify **which stage (exporter / analyzer /
+   runtime) is the cause**. Don't guess.
+3. **Design**: read the relevant code in the culprit stage and devise the minimal correct fix. Check that it doesn't break the hot path.
+4. **Implement → rebuild → confirm V8 agreement with `dt`** (including several related cases).
+5. **full CI gate** (§5). Don't move on until it's green. If a stale negative test fails, update it
+   (bring tests that still reject a now-implemented feature in line with the current state).
+6. **Add a conformance test** (§6).
+7. **Record docs** (§6).
+
+---
+
+## 5. full CI gate (after each fix, always pass all of it; all repo-relative)
+
+**Recommended: run all gates with a single parallel driver (about 2x faster, ~40s warm).**
 ```bash
 cd "$ROOT"
-bash scripts/ci_par.sh        # exit 0 = 全緑。ビルド1回→正しさ系を並列→perfは単独計測。サマリ表示。
+bash scripts/ci_par.sh        # exit 0 = all green. Builds once → correctness suites in parallel → perf measured alone. Prints a summary.
 ```
 
-従来の逐次版（個別に確認したいとき）:
+The traditional sequential version (when you want to check them individually):
 ```bash
 cd "$ROOT"
-gcc -O2 -c runtime/ts_rt.c -Iruntime -o build/rt.o 2>&1 | grep -i error   # ランタイム編集時
+gcc -O2 -c runtime/ts_rt.c -Iruntime -o build/rt.o 2>&1 | grep -i error   # when the runtime was edited
 bash scripts/run_conformance.sh basic        | tail -1   # PASS=3 FAIL=0 / 3
-bash scripts/run_conformance.sh exhaustive   | tail -1   # PASS=88（+追加分）FAIL=0
+bash scripts/run_conformance.sh exhaustive   | tail -1   # PASS=88 (+ your additions) FAIL=0
 bash scripts/ci_fast.sh                       | tail -1   # CI-FAST PASSED
 bash scripts/run_unit_tests.sh                | tail -1   # [unit] all unit-test suites passed
 bash scripts/ci_bench_correct1.sh             | tail -1   # CI-BENCH-CORRECT-1 PASSED
@@ -173,11 +176,11 @@ bash scripts/ci_bench_correct2.sh             | tail -1   # CI-BENCH-CORRECT-2 P
 bash scripts/ci_bench_perf.sh                 | grep -E "all benchmarks|FAIL"
 ```
 
-> CI スクリプトは内部で自分のルートを検出し、`exporter/node_modules/.bin/tsc` を repo 相対で使う。
-> bench はランタイムをリンクするので `build/rt.o` を用意しておくこと。
+> The CI scripts detect their own root internally and use `exporter/node_modules/.bin/tsc` repo-relative.
+> The benchmarks link the runtime, so make sure `build/rt.o` is present.
 
-**perf 予算（超えたら回帰。budget は右の数字）:**
-| kernel | 目安(ms) | budget |
+**perf budget (exceeding it is a regression; the budget is the right-hand number):**
+| kernel | target (ms) | budget |
 |---|---|---|
 | int_kernel | ~382 | 520 |
 | float_kernel | ~252 | 480 |
@@ -187,27 +190,29 @@ bash scripts/ci_bench_perf.sh                 | grep -E "all benchmarks|FAIL"
 | typed_field_kernel | ~188 | 240 |
 | inherit_sroa_kernel | ~81 | 130 |
 
-**重要な落とし穴:**
-- **CI は stdout のみ比較し、exit code は見ない**。`$(... 2>&1)` のサブシェルで実行すると `$?` が誤解を招く。
-  **実行ファイルは直接実行して確認すること**（例: `./build/t`）。
-- nproc=1。bench は時間がかかるので `timeout 260 bash scripts/ci_bench_perf.sh` を付けてよい。
+**Important pitfalls:**
+- **CI compares stdout only and ignores the exit code**. Running inside a `$(... 2>&1)` subshell makes
+  `$?` misleading. **Run the executable directly to check it** (e.g., `./build/t`).
+- nproc=1. The benchmarks take time, so you may wrap them with `timeout 260 bash scripts/ci_bench_perf.sh`.
 
 ---
 
-## 6. 記録（マイルストーンごと）
+## 6. Recording (per milestone)
 
-1. **conformance テスト追加**: `tests/conformance/exhaustive/<category>/<name>.ts` に置く。
-   各 `console.log` の右にコメントで期待値を書く。`bash scripts/run_conformance.sh exhaustive` の
-   ハーネスが node と自動で突き合わせるので、PASS 数が増えれば V8 一致が取れた証拠。
-   既存カテゴリ: arrays, classes, closures, coercion, control, errors, generics, hoisting,
+1. **Add a conformance test**: place it at `tests/conformance/exhaustive/<category>/<name>.ts`.
+   Write the expected value in a comment to the right of each `console.log`. The
+   `bash scripts/run_conformance.sh exhaustive` harness automatically compares against node, so an
+   increased PASS count is evidence that V8 agreement was achieved.
+   Existing categories: arrays, classes, closures, coercion, control, errors, generics, hoisting,
    iteration, maps_sets, numbers, object_methods, objects, operators, private, statics, stdlib,
-   strings, symbol, toplevel など。
+   strings, symbol, toplevel, and so on.
 
-2. **docs 記録**: `docs/conformance_fixes.md`（セッション単位で番号付きに追記。過去 23 項目あり）と
-   `docs/TODO.md`（1行サマリを追記）。原因・修正・検証・perf 影響を簡潔に。
+2. **Record docs**: `docs/conformance_fixes.md` (append numbered entries per session; there are 23 prior
+   items) and `docs/TODO.md` (append a one-line summary). Briefly cover cause, fix, verification, and
+   perf impact.
 
-> このチェックアウトは zip 展開物なので、成果は git commit するか、Kaz に渡すために
-> ディレクトリごと再 zip してください（`node_modules` と `target` と `build` は除外推奨）:
+> This checkout is an unzipped artifact, so either git commit your work or re-zip the whole directory
+> to hand it off (excluding `node_modules`, `target`, and `build` is recommended):
 > ```bash
 > cd "$(dirname "$ROOT")"
 > zip -rq tsaot.zip "$(basename "$ROOT")" \
@@ -216,68 +221,69 @@ bash scripts/ci_bench_perf.sh                 | grep -E "all benchmarks|FAIL"
 
 ---
 
-## 7. すぐ着手できる既知のバグ・探索候補
+## 7. Known bugs you can start on right away, and exploration candidates
 
-### 既知バグ（未修正、すぐ直せる）
-- **optional chaining on `any` レシーバ**: `const o:any={f:()=>9}; o.g?.()` が
-  「method is not a function」で abort（node は undefined）。`o.f?.()`（存在する側）は OK。
-  any-typed レシーバの optional call で、メソッド非存在時に undefined を返すべき。
+### Known bugs (unfixed, quick to fix)
+- **optional chaining on an `any` receiver**: `const o:any={f:()=>9}; o.g?.()` aborts with
+  "method is not a function" (node returns undefined). `o.f?.()` (the side that exists) is OK.
+  For an optional call on an any-typed receiver, it should return undefined when the method is absent.
 
-### 既知の限界（silent miscompile ではない。優先度低、触るなら設計から）
-- `-0` 表現: 整数 unbox 経路が 0 の符号を落とす（`Object.is(-0,0)`→true, `console.log(-0)`→0）。
-  修正には整数ゼロの hot path を deopt する必要があり、コスト>便益。
-- `e instanceof Error`: builtin Error をコンストラクタ値としてモデル化していない（loud-reject）。
-- 多段ラベル付き break/continue: multi-level jump 未モデル化（loud-reject）。
+### Known limitations (not silent miscompiles; low priority, design first if you touch them)
+- `-0` representation: the integer unbox path drops the sign of 0 (`Object.is(-0,0)`→true, `console.log(-0)`→0).
+  Fixing it would require deopting the integer-zero hot path; cost > benefit.
+- `e instanceof Error`: builtin Error is not modeled as a constructor value (loud-reject).
+- Multi-level labeled break/continue: multi-level jumps are not modeled (loud-reject).
 
-### 探索候補（`dt` を流してまだ見ていない隅を洗う）
-- async/await の深掘り（Promise.all、async メソッド、エラー伝播、await 連鎖）
-- tagged template literal（現状 reject。`` tag`a${1}b` ``）
-- ジェネレータの応用（yield*、generator.return()/throw()、双方向 yield）
-- 文字列メソッドの隅（matchAll, replace with regex, normalize, localeCompare, codePointAt）
-- 正規表現（未対応なら reject か実装か設計判断）
-- Date メソッド（現状 getTime/valueOf のみ）、JSON の replacer/reviver/space
-- 数値の隅（BigInt、Number の各種境界、`toString(radix)` の全 radix、指数表記の細部）
-- 分割代入のさらなる隅（ネスト＋デフォルト＋rest の組み合わせ、関数引数での分割）
-- getter/setter の継承・override、static getter/setter、computed メソッド名
-- スプレッドの隅（関数呼び出しでの `f(...a, x, ...b)`、object spread の上書き順）
+### Exploration candidates (run `dt` to sweep corners not yet examined)
+- Deep dive on async/await (Promise.all, async methods, error propagation, await chaining)
+- tagged template literals (currently rejected; `` tag`a${1}b` ``)
+- Advanced generators (yield*, generator.return()/throw(), bidirectional yield)
+- String-method corners (matchAll, replace with regex, normalize, localeCompare, codePointAt)
+- Regular expressions (if unsupported, make a design call: reject or implement)
+- Date methods (currently getTime/valueOf only), JSON replacer/reviver/space
+- Numeric corners (BigInt, various Number boundaries, all radixes of `toString(radix)`, exponential-notation details)
+- Further destructuring corners (nesting + defaults + rest combined, destructuring in function parameters)
+- getter/setter inheritance/override, static getter/setter, computed method names
+- Spread corners (`f(...a, x, ...b)` in calls, object-spread override order)
 
-各カテゴリで `dt` を 10 個ほど書いて流すのが効率的。`DIFF` が出たら最小化 → 段の特定 → 修正の順で。
+Writing about 10 `dt` cases per category and running them is efficient. When `DIFF` appears, go in the order: minimize → identify the stage → fix.
 
 ---
 
-## 8. コードの地図（よく触る場所）
+## 8. Map of the code (places you'll touch often)
 
 **exporter/exporter.ts:**
-- `lowerExpr` — 式の lowering の入口
-- `lowerStmt` — 文の lowering（for-of は `isForOfStatement` 分岐、`lowerArrayIndexForOf` ヘルパ）
-- `lowerAssignTarget` — 代入ターゲット（identifier/property/element/分割代入パターン）
-- `lowerFunctionLike` — 関数本体・パラメータ（デフォルト引数、arrowThis cell）
-- `lowerClosure` — クロージャ生成（arrowThis 捕捉）
-- `builtinReceiverKind` / `namespaceBuiltin` — string/array/map/set/number/Object/Math/JSON 等の組み込み判定
-- `arrayMethods` / `mapMethods` / `setMethods` の allowlist（メソッド追加時はここと emit_c の両方）
-- NewExpression 分岐（Map/Set/Date/Error/ユーザクラス）
-- `this.unsupported(node, "理由")` で loud-reject
+- `lowerExpr` — entry point for expression lowering
+- `lowerStmt` — statement lowering (for-of goes through the `isForOfStatement` branch, `lowerArrayIndexForOf` helper)
+- `lowerAssignTarget` — assignment targets (identifier/property/element/destructuring patterns)
+- `lowerFunctionLike` — function bodies and parameters (default arguments, arrowThis cell)
+- `lowerClosure` — closure creation (arrowThis capture)
+- `builtinReceiverKind` / `namespaceBuiltin` — builtin detection for string/array/map/set/number/Object/Math/JSON, etc.
+- the `arrayMethods` / `mapMethods` / `setMethods` allowlists (when adding a method, update both here and emit_c)
+- NewExpression branch (Map/Set/Date/Error/user classes)
+- loud-reject via `this.unsupported(node, "reason")`
 
 **analyzer/src/:**
-- `emit_c.rs` — C 生成。`CallBuiltin`/`CallBuiltinStatic` の文字列→C 関数マッピング。BinOp の強制変換ルーティング。整数 unbox 分類。
-- `sroa.rs` — スカラ置換とインライン。`find_sroa_targets`（escape する受け手を disqualify）、`captures_this`、`inline_callee`。
-- `devirt.rs` — 仮想ディスパッチ解決（Direct / 動的 Method / Unknown）。
-- `escape_ir.rs` — IR の型定義（Inst の variant、CalleeRef）。
+- `emit_c.rs` — C generation. The string → C-function mapping for `CallBuiltin`/`CallBuiltinStatic`. BinOp coercion routing. Integer-unbox classification.
+- `sroa.rs` — scalar replacement and inlining. `find_sroa_targets` (disqualifies escaping receivers), `captures_this`, `inline_callee`.
+- `devirt.rs` — virtual-dispatch resolution (Direct / dynamic Method / Unknown).
+- `escape_ir.rs` — IR type definitions (Inst variants, CalleeRef).
 
 **runtime/ts_rt.c / ts_rt.h:**
-- 組み込み関数の実体（`ts_array_*`, `ts_map_*`, `ts_set_*`, `ts_string_*`, `ts_math_*`, `ts_to_*`,
-  `ts_object_is`, `ts_relational`, `ts_loose_eq` など）。新関数は .c に実体、.h にプロトタイプ。
+- The implementations of the builtins (`ts_array_*`, `ts_map_*`, `ts_set_*`, `ts_string_*`, `ts_math_*`,
+  `ts_to_*`, `ts_object_is`, `ts_relational`, `ts_loose_eq`, etc.). New functions get an implementation
+  in .c and a prototype in .h.
 
 ---
 
-## 9. これまでの実績（参考。docs/conformance_fixes.md に全 23 項目の詳細）
+## 9. Track record so far (for reference; full details of all 23 items in docs/conformance_fixes.md)
 
-Symbol 3段階・ToPrimitive・private accessor → 数値フォーマット/強制変換/parseInt hex →
-reduce 初期値なし/デフォルト引数/アロー this 捕捉 → spread・Map/Set seeding・for-of・array.entries →
-分割代入/複合代入/論理代入/Object.is → ポリモーフィック仮想ディスパッチ/super/配列エスケープ →
-Error/サブクラス/nested try → Math.cbrt 精度/Array.fill 範囲。現在 conformance 88/88、全 CI 緑。
+Symbol (3 stages), ToPrimitive, private accessor → number formatting/coercion/parseInt hex →
+reduce without initial value, default arguments, arrow-this capture → spread, Map/Set seeding, for-of, array.entries →
+destructuring, compound assignment, logical assignment, Object.is → polymorphic virtual dispatch, super, array escape →
+Error/subclasses/nested try → Math.cbrt precision, Array.fill range. Currently conformance 88/88, all CI green.
 
 ---
 
-頑張ってください。**まず `bash scripts/setup.sh` を実行し、§7 の探索候補から `dt` を流し始める**のが
-最速の立ち上がりです。1件直すごとに §5 → §6 を回してください。日本語で報告を。
+The fastest way to get going is to **first run `bash scripts/setup.sh`, then start running `dt` from the
+exploration candidates in §7**. After each fix, cycle through §5 → §6.
