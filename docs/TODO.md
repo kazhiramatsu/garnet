@@ -3147,3 +3147,10 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
 - **バグ2: `Math.min(-0, 0)` = 0（V8 は -0）**。C の `a<b` は -0==+0 扱いなのでゼロタイの符号が引数順依存。修正=`ts_math_min2`/`max2` にゼロタイの符号処理（min は -0 優先、max は +0 優先・ECMA 21.3.2.24/25）。array 版（min_arr/max_arr）も同バグ（`x<m`/`x>m` が等値で更新せず）→2-arg 版で畳むよう書換（NaN 汚染も正しく伝播）。
 - **検証**: 既存 conformance `numbers/to_fixed.ts`・`numbers/negative_zero.ts` に該当ケース追記（-0/genuinely-negative-rounds-to-zero、Math.min/max の -0 タイ・array・混在）→ V8 一致。conf all **342/342** / unit / gate gc **PASSED** / bundler **39/39** / bench 予算内。runtime のみの変更（emitted C 不変＝parity 無関係）。
 - **教訓**: (1) **-0 は「符号ビット」と「`<0` 判定」で挙動が分岐する** — toFixed は `<0`（-0 は非負扱い＝符号なし）、Math.min のタイは符号ビット（-0 優先）。両者を混同しない。(2) `%f`/printf は -0 を "-0" と印字するので、絶対値経路には fabs を通して符号漏れを断つ。(3) 既存の -0 conformance が広範でも「特定 API の -0 経路」（toFixed・Math.min）は個別に網羅が要る＝プローブで穴が出る。
+
+### セッション320 続き3: V8 差分ハント（untyped coercion）— ToNumber の末尾空白が \t 等を弾くバグ
+
+- **バグ**: `"\t" == 0` → V8=true / garnet=false（`"  "==0` スペースは正しい）。`ts_number_coerce` の**末尾空白スキップが `' '` のみ**（L4356）で、`\t\n\r\v\f` を弾いていた。全空白文字列 `"\t"` は strtod が変換せず end="\t" のまま L4357 で NAN 化。先頭スキップ（L4345・0b/0o prefix 用）は既に全空白対応だったので**末尾だけの穴**。ToNumber は JS whitespace 全集合を両端で trim（ECMA 7.1.4）。
+- **修正**: 末尾チェックを先頭と同じ `' '\t'\n'\r'\v'\f'` 集合に。`"\t"`→0・`"\t12\t"`→12・`+"6\t"`→6 が正しくなる（Unicode 空白 NBSP/BOM 等は別途の稀ケース・今回対象外）。
+- **検証**: `numbers/number_parse.ts` に全空白・数値周辺・無効ケース追記→V8 一致。conf all **342/342** / unit / gate gc **PASSED**。runtime のみ（emitted C 不変）。
+- **教訓**: 先頭と末尾で空白判定が非対称になりやすい（strtod が先頭を食うので末尾チェックを軽視しがち）。両端の trim 集合は同一述語に揃える。

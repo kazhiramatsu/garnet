@@ -4353,7 +4353,10 @@ double ts_number_coerce(tsv v){
       return (double)val;
     }
     char* end=NULL; double d=strtod(copy, &end);
-    while (end && *end==' ') end++;
+    /* trailing JS whitespace must be tolerated too — ToNumber trims the full
+       set (tab/LF/CR/VT/FF/space), so `"\t"` and `"12\t"` are 0 and 12, not NaN
+       (this mirrors the leading skip above; strtod already ate leading ws). */
+    while (end && (*end==' '||*end=='\t'||*end=='\n'||*end=='\r'||*end=='\v'||*end=='\f')) end++;
     if (end && *end!=0){ free(copy); return NAN; }
     free(copy);
     return d;
