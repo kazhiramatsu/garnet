@@ -50,6 +50,8 @@ syntax_strfield	syntax_strfield.ts	hi	50	1	correctness_only_escaping_string
 escaping_object	escaping_object.ts	1	50	1	correctness_only_escaping_class
 dynamic_dispatch	dynamic_dispatch.ts	15	50	1	correctness_only_any_receiver
 dynamic_inherited	dynamic_inherited.ts	42	50	1	correctness_only_inherited_dynamic
+property_pic_kernel	property_pic_kernel.ts	180000000	300	0	PIC_four_receiver_shapes
+property_dictionary_kernel	property_dictionary_kernel.ts	49600000	250	0	indexed_megamorphic_property_lookup
 proto_rewrite	proto_rewrite.ts	99	50	1	correctness_only_prototype_method_rewrite
 generic_kernel	generic_kernel.ts	982682	260	219	AOT_WINS_via_monomorphization
 generic_fn	generic_fn.ts	50	50	1	correctness_only_generic_function_monomorphization

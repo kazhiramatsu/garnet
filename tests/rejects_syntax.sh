@@ -45,11 +45,9 @@ chk "new of an unsupported builtin ctor"      'function main(): void { const w:a
 # method off one AS A VALUE — e.g. `Function.prototype.toString` / `[].hasOwnProperty`
 # without calling it — yields undefined, the same pre-existing gap as `({}).toString`
 # as a value. The CALL forms work. This is a known DIFF, not a reject.)
-# `x instanceof C` with a runtime constructor VALUE works when C's static type is a
-# constructor (a class var/param/union; §130). An `any`-typed RHS gives no static
-# construct signature, so it stays a loud-reject rather than risking a silent DIFF
-# (a non-constructor `any` would return false where JS throws).
-chk "instanceof with an any-typed RHS"        'function isit(o:any, C:any){ return o instanceof C; } function main(): void { console.log(isit({}, Object)); }'
+# `x instanceof C` now accepts constructor values and an `any`-typed RHS.
+# Runtime validation preserves JavaScript's TypeError for a non-constructor;
+# see classes/instanceof_dynamic_rhs.ts.
 # (`new K(...)` on a polymorphic class value (cond ? A : B) now fully supports ctor
 # args to a no-constructor member: dropped when there's no explicit-ctor ancestor, or
 # forwarded as `super(...args)` to a parent ctor — even one capturing a function local

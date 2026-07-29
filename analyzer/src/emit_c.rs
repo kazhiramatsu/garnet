@@ -1300,6 +1300,9 @@ struct Ctx<'a> {
     numeric_value_local: BTreeSet<u32>,
     i64_mode: bool,
     f64_mode: bool,
+    /// Boxed locals carried by a generated shadow-root frame. Empty for
+    /// coroutine emitters and when frame roots are disabled.
+    frame_locals: BTreeSet<u32>,
     nroot: usize,
     /// locals known to hold a nonzero integer constant (safe divisor for integer %)
     nonzero_int_const: BTreeSet<u32>,
@@ -1332,6 +1335,23 @@ struct Ctx<'a> {
     eh_depth: std::cell::Cell<u32>,
 }
 impl<'a> Ctx<'a> {
+    fn vname(&self, id: u32) -> String {
+        if self.frame_locals.contains(&id) {
+            format!("F.v{}", id)
+        } else {
+            format!("v{}", id)
+        }
+    }
+    fn root_cleanup(&self) -> String {
+        let mut parts = Vec::new();
+        if self.nroot > 0 {
+            parts.push(format!("ts_gc_unroot({});", self.nroot));
+        }
+        if !self.frame_locals.is_empty() {
+            parts.push("ts_frame_pop(&F.h);".to_string());
+        }
+        parts.join(" ")
+    }
     fn fn_name_of(&self, id: u32) -> String {
         self.fn_names
             .get(&id)
@@ -1356,7 +1376,7 @@ impl<'a> Ctx<'a> {
         } else if self.unboxed.contains(&id) {
             format!("d{}", id)
         } else {
-            format!("ts_to_num(v{})", id)
+            format!("ts_to_num({})", self.vname(id))
         }
     }
     /// ToNumber coercion for arithmetic operands (`- * / %`, unary `-`): an
@@ -1370,7 +1390,7 @@ impl<'a> Ctx<'a> {
         } else if self.unboxed.contains(&id) {
             format!("d{}", id)
         } else {
-            format!("ts_number_coerce(v{})", id)
+            format!("ts_number_coerce({})", self.vname(id))
         }
     }
     fn numc_double(&self, id: u32) -> String {
@@ -1379,7 +1399,7 @@ impl<'a> Ctx<'a> {
         } else if self.unboxed.contains(&id) {
             format!("((double)d{})", id)
         } else {
-            format!("ts_number_coerce(v{})", id)
+            format!("ts_number_coerce({})", self.vname(id))
         }
     }
     fn val(&self, id: u32) -> String {
@@ -1390,7 +1410,7 @@ impl<'a> Ctx<'a> {
         } else if self.unboxed.contains(&id) {
             format!("ts_num(d{})", id)
         } else {
-            format!("v{}", id)
+            self.vname(id)
         }
     }
     fn jval(&self, id: u32) -> String {
@@ -1404,7 +1424,7 @@ impl<'a> Ctx<'a> {
         if self.unboxed.contains(&id) {
             format!("  d{} = {};\n", id, e)
         } else {
-            format!("  v{} = ts_num({});\n", id, e)
+            format!("  {} = ts_num({});\n", self.vname(id), e)
         }
     }
     fn set_val(&self, id: u32, e: &str) -> String {
@@ -1415,7 +1435,7 @@ impl<'a> Ctx<'a> {
         } else if self.unboxed.contains(&id) {
             format!("  d{} = ts_to_num({});\n", id, e)
         } else {
-            format!("  v{} = {};\n", id, e)
+            format!("  {} = {};\n", self.vname(id), e)
         }
     }
     fn truthy(&self, id: u32) -> String {
@@ -1428,7 +1448,7 @@ impl<'a> Ctx<'a> {
         } else if self.unboxed.contains(&id) {
             format!("(d{0} != 0 && d{0} == d{0})", id)
         } else {
-            format!("ts_truthy_fast(v{})", id)
+            format!("ts_truthy_fast({})", self.vname(id))
         }
     }
     fn fresh_label(&self) -> u32 {
@@ -1449,6 +1469,26 @@ impl<'a> Ctx<'a> {
     fn current_loop_path(&self) -> LoopPath {
         LoopPath(self.emit_path.borrow().clone())
     }
+}
+
+fn frame_roots_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_FRAME_ROOTS").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
+fn prop_pic_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_PROP_PIC").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
 }
 
 fn emit_json_cleanup(s: &mut String, ctx: &Ctx) {
@@ -4674,29 +4714,52 @@ fn emit_i64_function(
     } else {
         "static"
     };
+    let mut reflike: Vec<u32> = f
+        .locals
+        .iter()
+        .filter(|l| !matches!(l.ref_kind, RefKind::Primitive) && !unboxed.contains(&l.id.0))
+        .map(|l| l.id.0)
+        .collect();
+    let use_frame_roots = frame_roots_enabled() && !reflike.is_empty();
+    if use_frame_roots {
+        reflike.sort_unstable();
+    }
+    let frame_locals: BTreeSet<u32> = if use_frame_roots {
+        reflike.iter().copied().collect()
+    } else {
+        BTreeSet::new()
+    };
     let _ = writeln!(s, "{} long long {}({}){{", storage, i64_cname(f), params);
     for l in &f.locals {
         if int_local.contains(&l.id.0) {
             let _ = writeln!(s, "  long long d{} = 0;", l.id.0);
         } else if unboxed.contains(&l.id.0) {
             let _ = writeln!(s, "  double d{} = 0;", l.id.0);
-        } else {
+        } else if !frame_locals.contains(&l.id.0) {
             let _ = writeln!(s, "  tsv v{} = TS_UNDEFINED;", l.id.0);
+        }
+    }
+    if use_frame_roots {
+        s.push_str("  struct { ts_frame_hdr h;");
+        for id in &reflike {
+            let _ = write!(s, " tsv v{};", id);
+        }
+        s.push_str(" } F;\n");
+        for id in &reflike {
+            let _ = writeln!(s, "  F.v{} = TS_UNDEFINED;", id);
         }
     }
     for (i, p) in info.params.iter().enumerate() {
         let _ = writeln!(s, "  d{} = _p{};", p, i);
     }
-    let reflike: Vec<u32> = f
-        .locals
-        .iter()
-        .filter(|l| !matches!(l.ref_kind, RefKind::Primitive) && !unboxed.contains(&l.id.0))
-        .map(|l| l.id.0)
-        .collect();
-    for id in &reflike {
-        let _ = writeln!(s, "  ts_gc_root(&v{});", id);
+    if use_frame_roots {
+        let _ = writeln!(s, "  ts_frame_push(&F.h, {});", reflike.len());
+    } else {
+        for id in &reflike {
+            let _ = writeln!(s, "  ts_gc_root(&v{});", id);
+        }
     }
-    let nroot = reflike.len();
+    let nroot = if use_frame_roots { 0 } else { reflike.len() };
     let scalar_slices: BTreeMap<u32, ScalarStringSlice> = BTreeMap::new();
     let json_locals: BTreeSet<u32> = BTreeSet::new();
     let json_roots: BTreeSet<u32> = BTreeSet::new();
@@ -4722,6 +4785,7 @@ fn emit_i64_function(
         numeric_value_local,
         i64_mode: true,
         f64_mode: false,
+        frame_locals,
         nroot,
         nonzero_int_const,
         nonzero_int,
@@ -4735,8 +4799,9 @@ fn emit_i64_function(
     };
     emit_seq(s, &f.body, &ctx, PathEdge::Function);
     emit_json_cleanup(s, &ctx);
-    if nroot > 0 {
-        let _ = writeln!(s, "  ts_gc_unroot({});", nroot);
+    let cleanup = ctx.root_cleanup();
+    if !cleanup.is_empty() {
+        let _ = writeln!(s, "  {}", cleanup);
     }
     s.push_str("  return 0;\n}\n\n");
 }
@@ -4792,29 +4857,52 @@ fn emit_f64_function(
     } else {
         "static"
     };
+    let mut reflike: Vec<u32> = f
+        .locals
+        .iter()
+        .filter(|l| !matches!(l.ref_kind, RefKind::Primitive) && !unboxed.contains(&l.id.0))
+        .map(|l| l.id.0)
+        .collect();
+    let use_frame_roots = frame_roots_enabled() && !reflike.is_empty();
+    if use_frame_roots {
+        reflike.sort_unstable();
+    }
+    let frame_locals: BTreeSet<u32> = if use_frame_roots {
+        reflike.iter().copied().collect()
+    } else {
+        BTreeSet::new()
+    };
     let _ = writeln!(s, "{} double {}({}){{", storage, f64_cname(f), params);
     for l in &f.locals {
         if int_local.contains(&l.id.0) {
             let _ = writeln!(s, "  long long d{} = 0;", l.id.0);
         } else if unboxed.contains(&l.id.0) {
             let _ = writeln!(s, "  double d{} = 0;", l.id.0);
-        } else {
+        } else if !frame_locals.contains(&l.id.0) {
             let _ = writeln!(s, "  tsv v{} = TS_UNDEFINED;", l.id.0);
+        }
+    }
+    if use_frame_roots {
+        s.push_str("  struct { ts_frame_hdr h;");
+        for id in &reflike {
+            let _ = write!(s, " tsv v{};", id);
+        }
+        s.push_str(" } F;\n");
+        for id in &reflike {
+            let _ = writeln!(s, "  F.v{} = TS_UNDEFINED;", id);
         }
     }
     for (i, p) in info.params.iter().enumerate() {
         let _ = writeln!(s, "  d{} = _p{};", p, i);
     }
-    let reflike: Vec<u32> = f
-        .locals
-        .iter()
-        .filter(|l| !matches!(l.ref_kind, RefKind::Primitive) && !unboxed.contains(&l.id.0))
-        .map(|l| l.id.0)
-        .collect();
-    for id in &reflike {
-        let _ = writeln!(s, "  ts_gc_root(&v{});", id);
+    if use_frame_roots {
+        let _ = writeln!(s, "  ts_frame_push(&F.h, {});", reflike.len());
+    } else {
+        for id in &reflike {
+            let _ = writeln!(s, "  ts_gc_root(&v{});", id);
+        }
     }
-    let nroot = reflike.len();
+    let nroot = if use_frame_roots { 0 } else { reflike.len() };
     let scalar_slices: BTreeMap<u32, ScalarStringSlice> = BTreeMap::new();
     let json_locals: BTreeSet<u32> = BTreeSet::new();
     let json_roots: BTreeSet<u32> = BTreeSet::new();
@@ -4840,6 +4928,7 @@ fn emit_f64_function(
         numeric_value_local,
         i64_mode: false,
         f64_mode: true,
+        frame_locals,
         nroot,
         nonzero_int_const,
         nonzero_int,
@@ -4853,8 +4942,9 @@ fn emit_f64_function(
     };
     emit_seq(s, &f.body, &ctx, PathEdge::Function);
     emit_json_cleanup(s, &ctx);
-    if nroot > 0 {
-        let _ = writeln!(s, "  ts_gc_unroot({});", nroot);
+    let cleanup = ctx.root_cleanup();
+    if !cleanup.is_empty() {
+        let _ = writeln!(s, "  {}", cleanup);
     }
     s.push_str("  return 0.0;\n}\n\n");
 }
@@ -4930,6 +5020,7 @@ fn emit_function(
             numeric_value_local,
             i64_mode: false,
             f64_mode: false,
+            frame_locals: BTreeSet::new(),
             nroot: 0,
             nonzero_int_const,
             nonzero_int,
@@ -4970,6 +5061,7 @@ fn emit_function(
             numeric_value_local,
             i64_mode: false,
             f64_mode: false,
+            frame_locals: BTreeSet::new(),
             nroot: 0,
             nonzero_int_const,
             nonzero_int,
@@ -5010,6 +5102,7 @@ fn emit_function(
             numeric_value_local,
             i64_mode: false,
             f64_mode: false,
+            frame_locals: BTreeSet::new(),
             nroot: 0,
             nonzero_int_const,
             nonzero_int,
@@ -5025,6 +5118,25 @@ fn emit_function(
         return;
     }
 
+    let mut reflike: Vec<u32> = f
+        .locals
+        .iter()
+        .filter(|l| {
+            !matches!(l.ref_kind, RefKind::Primitive)
+                && !unboxed.contains(&l.id.0)
+                && !json_locals.contains(&l.id.0)
+        })
+        .map(|l| l.id.0)
+        .collect();
+    let use_frame_roots = frame_roots_enabled() && !reflike.is_empty();
+    if use_frame_roots {
+        reflike.sort_unstable();
+    }
+    let frame_locals: BTreeSet<u32> = if use_frame_roots {
+        reflike.iter().copied().collect()
+    } else {
+        BTreeSet::new()
+    };
     let _ = writeln!(s, "static tsv {}(tsv* args, int nargs){{", cname(f));
     s.push_str("  (void)nargs;\n");
     for l in &f.locals {
@@ -5034,8 +5146,18 @@ fn emit_function(
             let _ = writeln!(s, "  tjson_value* j{} = NULL;", l.id.0);
         } else if unboxed.contains(&l.id.0) {
             let _ = writeln!(s, "  double d{} = 0;", l.id.0);
-        } else {
+        } else if !frame_locals.contains(&l.id.0) {
             let _ = writeln!(s, "  tsv v{} = TS_UNDEFINED;", l.id.0);
+        }
+    }
+    if use_frame_roots {
+        s.push_str("  struct { ts_frame_hdr h;");
+        for id in &reflike {
+            let _ = write!(s, " tsv v{};", id);
+        }
+        s.push_str(" } F;\n");
+        for id in &reflike {
+            let _ = writeln!(s, "  F.v{} = TS_UNDEFINED;", id);
         }
     }
     if !json_roots.is_empty() {
@@ -5062,26 +5184,26 @@ fn emit_function(
         } else if unboxed.contains(&p.0) {
             let _ = writeln!(s, "  if (nargs > {}) d{} = ts_to_num(args[{}]);", i, p.0, i);
         } else {
-            let _ = writeln!(s, "  if (nargs > {}) v{} = args[{}];", i, p.0, i);
+            let name = if frame_locals.contains(&p.0) {
+                format!("F.v{}", p.0)
+            } else {
+                format!("v{}", p.0)
+            };
+            let _ = writeln!(s, "  if (nargs > {}) {} = args[{}];", i, name, i);
         }
     }
-    let reflike: Vec<u32> = f
-        .locals
-        .iter()
-        .filter(|l| {
-            !matches!(l.ref_kind, RefKind::Primitive)
-                && !unboxed.contains(&l.id.0)
-                && !json_locals.contains(&l.id.0)
-        })
-        .map(|l| l.id.0)
-        .collect();
-    for id in &reflike {
-        let _ = writeln!(s, "  ts_gc_root(&v{});", id);
+    if use_frame_roots {
+        let _ = writeln!(s, "  ts_frame_push(&F.h, {});", reflike.len());
+    } else {
+        for id in &reflike {
+            let _ = writeln!(s, "  ts_gc_root(&v{});", id);
+        }
     }
     for id in &scalar_slice_roots {
         let _ = writeln!(s, "  ts_gc_root(&ss_base{});", id);
     }
-    let nroot = reflike.len() + scalar_slice_roots.len();
+    let nroot = scalar_slice_roots.len()
+        + if use_frame_roots { 0 } else { reflike.len() };
 
     // Rest parameter: gather args[restIndex..nargs] into a fresh array. Root the
     // destination first because ts_array_push may allocate and trigger minor GC.
@@ -5091,11 +5213,16 @@ fn emit_function(
             .iter()
             .position(|p| p.0 == rest_id)
             .unwrap_or(f.params.len().saturating_sub(1));
-        let _ = writeln!(s, "  v{} = ts_new_array(0);", rest_id);
+        let rest_name = if frame_locals.contains(&rest_id) {
+            format!("F.v{}", rest_id)
+        } else {
+            format!("v{}", rest_id)
+        };
+        let _ = writeln!(s, "  {} = ts_new_array(0);", rest_name);
         let _ = writeln!(
             s,
-            "  for (int _ri = {}; _ri < nargs; _ri++) ts_array_push(v{}, args[_ri]);",
-            rest_index, rest_id
+            "  for (int _ri = {}; _ri < nargs; _ri++) ts_array_push({}, args[_ri]);",
+            rest_index, rest_name
         );
     }
 
@@ -5121,6 +5248,7 @@ fn emit_function(
         numeric_value_local,
         i64_mode: false,
         f64_mode: false,
+        frame_locals,
         nroot,
         nonzero_int_const,
         nonzero_int,
@@ -5134,8 +5262,9 @@ fn emit_function(
     };
     emit_seq(s, &f.body, &ctx, PathEdge::Function);
     emit_json_cleanup(s, &ctx);
-    if nroot > 0 {
-        let _ = writeln!(s, "  ts_gc_unroot({});", nroot);
+    let cleanup = ctx.root_cleanup();
+    if !cleanup.is_empty() {
+        let _ = writeln!(s, "  {}", cleanup);
     }
     s.push_str("  return TS_UNDEFINED;\n}\n\n");
 }
@@ -7032,7 +7161,11 @@ fn emit_plain_finally(
     s.push_str("      ts_eh_pop();\n");
     let _ = writeln!(s, "      goto L{};", fin_label); // normal completion of try
     s.push_str("    } else {\n");
-    s.push_str("      ts_gc_set_root_depth(_h->gc_root_len);\n      ts_eh_pop();\n");
+    s.push_str("      ts_gc_set_root_depth(_h->gc_root_len);\n");
+    if frame_roots_enabled() {
+        s.push_str("      ts_frame_restore(_h->frame_top);\n");
+    }
+    s.push_str("      ts_eh_pop();\n");
     if has_catch {
         if let Some(cv) = catch_var {
             s.push_str(&format!(
@@ -7049,7 +7182,11 @@ fn emit_plain_finally(
         s.push_str("          ts_eh_pop();\n");
         let _ = writeln!(s, "          goto L{};", fin_label);
         s.push_str("        } else {\n");
-        s.push_str("          ts_gc_set_root_depth(_h2->gc_root_len);\n          ts_eh_pop();\n");
+        s.push_str("          ts_gc_set_root_depth(_h2->gc_root_len);\n");
+        if frame_roots_enabled() {
+            s.push_str("          ts_frame_restore(_h2->frame_top);\n");
+        }
+        s.push_str("          ts_eh_pop();\n");
         let _ = writeln!(
             s,
             "          {} = 4; {} = ts_current_exception(); goto L{};",
@@ -7096,8 +7233,9 @@ fn emit_plain_finally(
             pop_str, opend, opendv, pendv, ofin
         );
     } else {
-        let unroot = if ctx.nroot > 0 {
-            format!("ts_gc_unroot({}); ", ctx.nroot)
+        let cleanup = ctx.root_cleanup();
+        let unroot = if !cleanup.is_empty() {
+            format!("{} ", cleanup)
         } else {
             String::new()
         };
@@ -9234,8 +9372,8 @@ fn try_emit_fused_string_concat_loop(
     });
     let _ = writeln!(
         s,
-        "  v{} = ts_str_repeat({}, (double)({} / {}));",
-        str_local, chunk_val, len_var, chunk_len_var
+        "  {} = ts_str_repeat({}, (double)({} / {}));",
+        ctx.vname(str_local), chunk_val, len_var, chunk_len_var
     );
     s.push_str("  } else {\n");
     emit_runtime_loop(s, cond, cond_body, body, ctx);
@@ -10862,10 +11000,11 @@ fn emit_metric_acc_add(s: &mut String, acc: u32, metric: &str, ctx: &Ctx) {
     } else if ctx.unboxed.contains(&acc) {
         let _ = writeln!(s, "  d{} += (double){};", acc, metric);
     } else {
+        let acc_name = ctx.vname(acc);
         let _ = writeln!(
             s,
-            "  v{} = ts_add(v{}, ts_num((double){}));",
-            acc, acc, metric
+            "  {} = ts_add({}, ts_num((double){}));",
+            acc_name, acc_name, metric
         );
     }
 }
@@ -13482,6 +13621,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             match class_id {
                 Some(c) => {
                     let cn = struct_name(c.0);
+                    let dst_name = ctx.vname(dst.0);
                     let proto_expr = if let Some(p) = proto {
                         let pv = ctx.val(p.0);
                         format!("(ts_is_obj({}) ? {} : CLASS_PROTO[{}])", pv, pv, c.0)
@@ -13489,26 +13629,31 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         format!("CLASS_PROTO[{}]", c.0)
                     };
                     if st == AllocStrategy::Stack {
-                        let _ = writeln!(s, "  {} sobj{} = {{0}}; sobj{}.header.h.kind=TS_KIND_OBJECT; sobj{}.header.h.mark=0; sobj{}.header.h.gen=2; sobj{}.header.h.remembered=0; sobj{}.header.h.handle=0; sobj{}.header.h.size=sizeof({}); sobj{}.header.proto={}; sobj{}.header.props=0; sobj{}.header.cap=0; sobj{}.header.len=0; sobj{}.header.shape=0;", cn, dst.0, dst.0, dst.0, dst.0, dst.0, dst.0, dst.0, cn, dst.0, proto_expr, dst.0, dst.0, dst.0, dst.0);
-                        let _ = writeln!(s, "  v{} = ts_obj(&sobj{});", dst.0, dst.0);
+                        let shape = if prop_pic_enabled() {
+                            "TS_SHAPE_EMPTY"
+                        } else {
+                            "0"
+                        };
+                        let _ = writeln!(s, "  {} sobj{} = {{0}}; sobj{}.header.h.kind=TS_KIND_OBJECT; sobj{}.header.h.mark=0; sobj{}.header.h.gen=2; sobj{}.header.h.remembered=0; sobj{}.header.h.handle=0; sobj{}.header.h.size=sizeof({}); sobj{}.header.proto={}; sobj{}.header.props=0; sobj{}.header.cap=0; sobj{}.header.len=0; sobj{}.header.shape={};", cn, dst.0, dst.0, dst.0, dst.0, dst.0, dst.0, dst.0, cn, dst.0, proto_expr, dst.0, dst.0, dst.0, dst.0, shape);
+                        let _ = writeln!(s, "  {} = ts_obj(&sobj{});", dst_name, dst.0);
                     } else {
-                        let _ = writeln!(s, "  v{} = ts_new_sized(sizeof({}));", dst.0, cn);
+                        let _ = writeln!(s, "  {} = ts_new_sized(sizeof({}));", dst_name, cn);
                         let _ =
-                            writeln!(s, "  {}* hobj{} = ({}*)ts_ptr(v{});", cn, dst.0, cn, dst.0);
+                            writeln!(s, "  {}* hobj{} = ({}*)ts_ptr({});", cn, dst.0, cn, dst_name);
                         let _ = writeln!(s, "  hobj{}->header.proto={}; hobj{}->header.props=0; hobj{}->header.cap=0; hobj{}->header.len=0;", dst.0, proto_expr, dst.0, dst.0, dst.0);
                     }
                 }
                 None => {
                     let _ = writeln!(
                         s,
-                        "  v{} = ts_new_object(); /* site {} {:?} */",
-                        dst.0, site.0, st
+                        "  {} = ts_new_object(); /* site {} {:?} */",
+                        ctx.vname(dst.0), site.0, st
                     );
                 }
             }
         }
         Inst::AllocArray { dst, .. } => {
-            let _ = writeln!(s, "  v{} = ts_new_array(0);", dst.0);
+            let _ = writeln!(s, "  {} = ts_new_array(0);", ctx.vname(dst.0));
         }
         Inst::AllocClosure {
             dst,
@@ -13522,11 +13667,12 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             } else {
                 0
             };
+            let dst_name = ctx.vname(dst.0);
             let set_meta = format!(
-                "  ts_set_fn_meta(v{0}, FN_ARITY[{1}], FN_NAME[{1}]);\n  if (FN_HAS_PROTOTYPE[{1}]) ts_set_fn_prototype(v{0}, ts_new_proto());\n",
-                dst.0, func.0);
+                "  ts_set_fn_meta({0}, FN_ARITY[{1}], FN_NAME[{1}]);\n  if (FN_HAS_PROTOTYPE[{1}]) ts_set_fn_prototype({0}, ts_new_proto());\n",
+                dst_name, func.0);
             if captures.is_empty() {
-                let _ = writeln!(s, "  v{} = ts_make_fn_t({}, 0, 0, {});", dst.0, fname, tt);
+                let _ = writeln!(s, "  {} = ts_make_fn_t({}, 0, 0, {});", dst_name, fname, tt);
                 s.push_str(&set_meta);
             } else {
                 // Build the captured-cell environment (capture order matches the
@@ -13537,8 +13683,8 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 }
                 let _ = writeln!(
                     s,
-                    "    v{} = ts_make_fn_t({}, _env, {}, {});",
-                    dst.0,
+                    "    {} = ts_make_fn_t({}, _env, {}, {});",
+                    dst_name,
                     fname,
                     captures.len(),
                     tt
@@ -13557,15 +13703,16 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             // captured cells (same env construction as AllocClosure). `new K()`
             // later reads class_id via ts_construct.
             let fname = ctx.fn_name_of(ctor.0);
+            let dst_name = ctx.vname(dst.0);
             let set_meta = format!(
-                "  ts_set_fn_meta(v{}, FN_ARITY[{}], CLASS_NAME[{}]);\n",
-                dst.0, ctor.0, class_id
+                "  ts_set_fn_meta({}, FN_ARITY[{}], CLASS_NAME[{}]);\n",
+                dst_name, ctor.0, class_id
             );
             if captures.is_empty() {
                 let _ = writeln!(
                     s,
-                    "  v{} = ts_make_class_value({}u, {}, 0, 0);",
-                    dst.0, class_id, fname
+                    "  {} = ts_make_class_value({}u, {}, 0, 0);",
+                    dst_name, class_id, fname
                 );
                 s.push_str(&set_meta);
             } else {
@@ -13575,8 +13722,8 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 }
                 let _ = writeln!(
                     s,
-                    "    v{} = ts_make_class_value({}u, {}, _env, {});",
-                    dst.0,
+                    "    {} = ts_make_class_value({}u, {}, _env, {});",
+                    dst_name,
                     class_id,
                     fname,
                     captures.len()
@@ -13594,14 +13741,14 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             }
             let _ = writeln!(
                 s,
-                "  v{} = ts_construct({}, _a, {}); }}",
-                dst.0,
+                "  {} = ts_construct({}, _a, {}); }}",
+                ctx.vname(dst.0),
                 ctx.val(callee.0),
                 args.len()
             );
         }
         Inst::LoadClassProto { dst, class_id } => {
-            let _ = writeln!(s, "  v{} = CLASS_PROTO[{}];", dst.0, class_id.0);
+            let _ = writeln!(s, "  {} = CLASS_PROTO[{}];", ctx.vname(dst.0), class_id.0);
         }
         Inst::StoreProtoMethod {
             class_id,
@@ -15018,17 +15165,18 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             if let Some(&c) = ctx.local_class.get(&obj.0) {
                 if let Some(off) = struct_direct_offset(c, field.0, ctx.classes) {
                     let cn = struct_name(c);
-                    let st = format!("((({}*)ts_ptr(v{}))->{})", cn, obj.0, off);
+                    let obj_name = ctx.vname(obj.0);
+                    let st = format!("((({}*)ts_ptr({}))->{})", cn, obj_name, off);
                     // A method dispatched on a Proxy receiver gets this=proxy, which
                     // is NOT a struct of class `c`; route `this.field` through ts_get
                     // (honoring traps) in that case. The g_has_proxies gate keeps the
                     // direct struct path for all non-proxy programs (zero cost when
                     // no Proxy is ever created).
                     if numeric_field(c, field.0, ctx.classes) {
-                        let e = format!("((g_has_proxies && ts_is_proxy(v{})) ? ts_to_num(ts_get(v{}, {})) : {})", obj.0, obj.0, field.0, st);
+                        let e = format!("((g_has_proxies && ts_is_proxy({0})) ? ts_to_num(ts_get({0}, {1})) : {2})", obj_name, field.0, st);
                         s.push_str(&ctx.set_num(dst.0, &e));
                     } else {
-                        let e = format!("((g_has_proxies && ts_is_proxy(v{})) ? ts_get(v{}, {}) : {})", obj.0, obj.0, field.0, st);
+                        let e = format!("((g_has_proxies && ts_is_proxy({0})) ? ts_get({0}, {1}) : {2})", obj_name, field.0, st);
                         s.push_str(&ctx.set_val(dst.0, &e));
                     }
                     return;
@@ -15039,7 +15187,29 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             // Dynamic/`any` receiver: ts_get_checked throws a catchable TypeError
             // when the receiver is null/undefined (typed struct reads took the
             // direct-offset path above; optional chaining guards the read out).
-            s.push_str(&ctx.set_val(dst.0, &format!("ts_get_checked({}, {})", ctx.val(obj.0), field.0)));
+            if prop_pic_enabled() {
+                let pic = ctx.fresh_label();
+                let _ = writeln!(
+                    s,
+                    "  {{ static ts_prop_ic _ts_pic_{} = TS_PROP_IC_INIT;",
+                    pic
+                );
+                s.push_str(&ctx.set_val(
+                    dst.0,
+                    &format!(
+                        "ts_get_pic_checked_inline({}, {}, &_ts_pic_{})",
+                        ctx.val(obj.0),
+                        field.0,
+                        pic
+                    ),
+                ));
+                let _ = writeln!(s, "  }}");
+            } else {
+                s.push_str(&ctx.set_val(
+                    dst.0,
+                    &format!("ts_get_checked({}, {})", ctx.val(obj.0), field.0),
+                ));
+            }
         }
         Inst::LoadMethodValue { dst, recv, method } => {
             // First-class prototype method value: the boxed (unbound) method is
@@ -15118,10 +15288,11 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     // A method dispatched on a Proxy receiver gets this=proxy; route
                     // `this.field = v` through ts_set (honoring traps) in that case.
                     // The g_has_proxies gate keeps the direct struct store otherwise.
-                    let _ = writeln!(s, "  if (g_has_proxies && ts_is_proxy(v{})) {{ ts_set(v{}, {}, {}); }} else {{", obj.0, obj.0, field.0, ctx.val(src.0));
-                    let _ = writeln!(s, "    (({}*)ts_ptr(v{}))->{} = {};", cn, obj.0, off, rhs);
+                    let obj_name = ctx.vname(obj.0);
+                    let _ = writeln!(s, "  if (g_has_proxies && ts_is_proxy({0})) {{ ts_set({0}, {1}, {2}); }} else {{", obj_name, field.0, ctx.val(src.0));
+                    let _ = writeln!(s, "    (({}*)ts_ptr({}))->{} = {};", cn, obj_name, off, rhs);
                     if !is_num {
-                        let _ = writeln!(s, "    ts_write_barrier(v{}, {});", obj.0, rhs);
+                        let _ = writeln!(s, "    ts_write_barrier({}, {});", obj_name, rhs);
                     }
                     let _ = writeln!(s, "  }}");
                     return;
@@ -15130,13 +15301,37 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             // ctx.val (not a hardcoded v-name): the receiver local may be numeric-
             // unboxed (`const n: any = 5; n.c = 3`) — rebox it so ts_set sees the
             // primitive and throws V8's "Cannot create property ..." TypeError.
-            let _ = writeln!(s, "  ts_set({}, {}, {});", ctx.val(obj.0), field.0, ctx.val(src.0));
+            if prop_pic_enabled() {
+                let pic = ctx.fresh_label();
+                let _ = writeln!(
+                    s,
+                    "  {{ static ts_prop_ic _ts_pic_{} = TS_PROP_IC_INIT;",
+                    pic
+                );
+                let _ = writeln!(
+                    s,
+                    "  ts_set_pic_inline({}, {}, {}, &_ts_pic_{});",
+                    ctx.val(obj.0),
+                    field.0,
+                    ctx.val(src.0),
+                    pic
+                );
+                let _ = writeln!(s, "  }}");
+            } else {
+                let _ = writeln!(
+                    s,
+                    "  ts_set({}, {}, {});",
+                    ctx.val(obj.0),
+                    field.0,
+                    ctx.val(src.0)
+                );
+            }
         }
         Inst::LoadElem { dst, arr } => {
-            s.push_str(&ctx.set_val(dst.0, &format!("ts_get(v{}, 0)", arr.0)));
+            s.push_str(&ctx.set_val(dst.0, &format!("ts_get({}, 0)", ctx.val(arr.0))));
         }
         Inst::StoreElem { arr, src } => {
-            let _ = writeln!(s, "  ts_set(v{}, 0, {});", arr.0, ctx.val(src.0));
+            let _ = writeln!(s, "  ts_set({}, 0, {});", ctx.val(arr.0), ctx.val(src.0));
         }
         Inst::LoadIndex { dst, arr, index } => {
             if ctx.json_locals.contains(&arr.0) {
@@ -15162,14 +15357,14 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             }
             s.push_str(&ctx.set_val(
                 dst.0,
-                &format!("ts_array_get(v{}, (uint32_t)({}))", arr.0, ctx.num(index.0)),
+                &format!("ts_array_get({}, (uint32_t)({}))", ctx.val(arr.0), ctx.num(index.0)),
             ));
         }
         Inst::StoreIndex { arr, index, src } => {
             let _ = writeln!(
                 s,
-                "  ts_array_set(v{}, (uint32_t)({}), {});",
-                arr.0,
+                "  ts_array_set({}, (uint32_t)({}), {});",
+                ctx.val(arr.0),
                 ctx.num(index.0),
                 ctx.val(src.0)
             );
@@ -15181,7 +15376,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 );
                 return;
             }
-            s.push_str(&ctx.set_num(dst.0, &format!("ts_array_len_fast(v{})", arr.0)));
+            s.push_str(&ctx.set_num(dst.0, &format!("ts_array_len_fast({})", ctx.val(arr.0))));
         }
         Inst::StringLen { dst, src } => {
             if ctx.json_locals.contains(&src.0) {
@@ -15210,7 +15405,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             s.push_str(&ctx.set_num(dst.0, &format!("ts_length({})", ctx.val(src.0))));
         }
         Inst::ArrayPushAll { arr, src } => {
-            let _ = writeln!(s, "  ts_array_push_all(v{}, {});", arr.0, ctx.val(src.0));
+            let _ = writeln!(s, "  ts_array_push_all({}, {});", ctx.val(arr.0), ctx.val(src.0));
         }
         Inst::HasField { dst, obj, field } => {
             s.push_str(&ctx.set_val(
@@ -15240,19 +15435,56 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 }
                 return;
             }
-            s.push_str(&ctx.set_val(
-                dst.0,
-                &format!("ts_get_dyn_checked({}, {})", ctx.val(obj.0), ctx.val(key.0)),
-            ));
+            if prop_pic_enabled() {
+                let pic = ctx.fresh_label();
+                let _ = writeln!(
+                    s,
+                    "  {{ static ts_prop_ic _ts_pic_{} = TS_PROP_IC_INIT;",
+                    pic
+                );
+                s.push_str(&ctx.set_val(
+                    dst.0,
+                    &format!(
+                        "ts_get_dyn_pic_checked_inline({}, {}, &_ts_pic_{})",
+                        ctx.val(obj.0),
+                        ctx.val(key.0),
+                        pic
+                    ),
+                ));
+                let _ = writeln!(s, "  }}");
+            } else {
+                s.push_str(&ctx.set_val(
+                    dst.0,
+                    &format!("ts_get_dyn_checked({}, {})", ctx.val(obj.0), ctx.val(key.0)),
+                ));
+            }
         }
         Inst::StoreFieldDynamic { obj, key, src } => {
-            let _ = writeln!(
-                s,
-                "  ts_set_dyn({}, {}, {});",
-                ctx.val(obj.0),
-                ctx.val(key.0),
-                ctx.val(src.0)
-            );
+            if prop_pic_enabled() {
+                let pic = ctx.fresh_label();
+                let _ = writeln!(
+                    s,
+                    "  {{ static ts_prop_ic _ts_pic_{} = TS_PROP_IC_INIT;",
+                    pic
+                );
+                let _ = writeln!(
+                    s,
+                    "  ts_set_dyn_pic_inline({}, {}, {}, &_ts_pic_{});",
+                    ctx.val(obj.0),
+                    ctx.val(key.0),
+                    ctx.val(src.0),
+                    pic
+                );
+                let _ = writeln!(s, "  }}");
+            } else {
+                let _ = writeln!(
+                    s,
+                    "  ts_set_dyn({}, {}, {});",
+                    ctx.val(obj.0),
+                    ctx.val(key.0),
+                    ctx.val(src.0)
+                );
+            }
         }
         Inst::HasFieldDynamic { dst, obj, key } => {
             s.push_str(&ctx.set_val(
@@ -15325,7 +15557,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             }
         }
         Inst::ObjectCopyProps { dst, src } => {
-            let _ = writeln!(s, "  ts_object_copy_props(v{}, {});", dst.0, ctx.val(src.0));
+            let _ = writeln!(s, "  ts_object_copy_props({}, {});", ctx.val(dst.0), ctx.val(src.0));
         }
         Inst::ConstructResult { dst, inst, ret } => {
             // new step 4: object return overrides the instance; else the instance.
@@ -15339,7 +15571,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             ));
         }
         Inst::ArrayPush { arr, src } => {
-            let _ = writeln!(s, "  ts_array_push(v{}, {});", arr.0, ctx.val(src.0));
+            let _ = writeln!(s, "  ts_array_push({}, {});", ctx.val(arr.0), ctx.val(src.0));
         }
         // up==0: plain break/continue (innermost). up>=1: labeled multi-level jump
         // -> goto the target loop's end (break) / top (continue) label. The Loop
@@ -15477,7 +15709,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                                 let _ = writeln!(s, "  d{} = (double)({});", d.0, call);
                             }
                             Some(d) => {
-                                let _ = writeln!(s, "  v{} = ts_num((double)({}));", d.0, call);
+                                s.push_str(&ctx.set_num(d.0, &format!("(double)({})", call)));
                             }
                             None => {
                                 let _ = writeln!(s, "  {};", call);
@@ -15514,7 +15746,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                                 let _ = writeln!(s, "  d{} = {};", d.0, call);
                             }
                             Some(d) => {
-                                let _ = writeln!(s, "  v{} = ts_num({});", d.0, call);
+                                s.push_str(&ctx.set_num(d.0, &call));
                             }
                             None => {
                                 let _ = writeln!(s, "  {};", call);
@@ -15583,8 +15815,9 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             s.push_str("  }\n");
         }
         Inst::Return { src } => {
-            if ctx.nroot > 0 {
-                let _ = writeln!(s, "  ts_gc_unroot({});", ctx.nroot);
+            let cleanup = ctx.root_cleanup();
+            if !cleanup.is_empty() {
+                let _ = writeln!(s, "  {}", cleanup);
             }
             if ctx.i64_mode {
                 match src {
@@ -15595,7 +15828,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         let _ = writeln!(s, "  return (long long)d{};", v.0);
                     }
                     Some(v) => {
-                        let _ = writeln!(s, "  return (long long)ts_to_num(v{});", v.0);
+                        let _ = writeln!(s, "  return (long long)ts_to_num({});", ctx.vname(v.0));
                     }
                     None => s.push_str("  return 0;\n"),
                 }
@@ -15608,7 +15841,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         let _ = writeln!(s, "  return d{};", v.0);
                     }
                     Some(v) => {
-                        let _ = writeln!(s, "  return ts_to_num(v{});", v.0);
+                        let _ = writeln!(s, "  return ts_to_num({});", ctx.vname(v.0));
                     }
                     None => s.push_str("  return 0.0;\n"),
                 }
@@ -15669,6 +15902,9 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             emit_seq(s, finally_body, ctx, PathEdge::FinallyBody);
             s.push_str("    } else {\n");
             s.push_str("      ts_gc_set_root_depth(_h->gc_root_len);\n");
+            if frame_roots_enabled() {
+                s.push_str("      ts_frame_restore(_h->frame_top);\n");
+            }
             s.push_str("      ts_eh_pop();\n");
             if let Some(cv) = catch_var {
                 s.push_str(&ctx.set_val(cv.0, "ts_current_exception()"));
@@ -15704,8 +15940,10 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     if ctx.unboxed.contains(&dst.0) {
                         s.push_str(&ctx.set_num(dst.0, if *value { "1" } else { "0" }));
                     } else {
-                        let _ =
-                            writeln!(s, "  v{} = ts_bool({});", dst.0, if *value { 1 } else { 0 });
+                        s.push_str(&ctx.set_val(
+                            dst.0,
+                            &format!("ts_bool({})", if *value { 1 } else { 0 }),
+                        ));
                     }
                 }
                 ConstVal::Str { value } => {
@@ -15725,10 +15963,10 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     s.push_str(&ctx.set_val(dst.0, &format!("ts_str_v(&TS_STRLIT_{})", id)));
                 }
                 ConstVal::Undef => {
-                    let _ = writeln!(s, "  v{} = TS_UNDEFINED;", dst.0);
+                    s.push_str(&ctx.set_val(dst.0, "TS_UNDEFINED"));
                 }
                 ConstVal::Null => {
-                    let _ = writeln!(s, "  v{} = TS_NULL;", dst.0);
+                    s.push_str(&ctx.set_val(dst.0, "TS_NULL"));
                 }
                 ConstVal::NaN => {
                     s.push_str(&ctx.set_num(dst.0, "(0.0/0.0)"));
@@ -15768,7 +16006,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 if ctx.int_local.contains(&dst.0) {
                     s.push_str(&format!("  d{} = {};\n", dst.0, expr));
                 } else if is_cmp {
-                    let _ = writeln!(s, "  v{} = ts_bool({});", dst.0, expr);
+                    s.push_str(&ctx.set_val(dst.0, &format!("ts_bool({})", expr)));
                 } else {
                     s.push_str(&ctx.set_num(dst.0, &expr));
                 }
@@ -16036,7 +16274,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 "<" | "<=" | ">" | ">=" | "==" | "!=" | "===" | "!=="
             );
             if is_cmp && !ctx.unboxed.contains(&dst.0) {
-                let _ = writeln!(s, "  v{} = ts_bool({});", dst.0, expr);
+                s.push_str(&ctx.set_val(dst.0, &format!("ts_bool({})", expr)));
             } else {
                 s.push_str(&ctx.set_num(dst.0, &expr));
             }
@@ -16065,7 +16303,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         if ctx.unboxed.contains(&dst.0) {
                             s.push_str(&ctx.set_num(dst.0, &expr));
                         } else {
-                            let _ = writeln!(s, "  v{} = ts_bool({});", dst.0, expr);
+                            s.push_str(&ctx.set_val(dst.0, &format!("ts_bool({})", expr)));
                         }
                     } else {
                         let expr = match op.as_str() {

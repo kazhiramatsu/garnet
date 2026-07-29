@@ -2,8 +2,8 @@
 // held in a variable/parameter, or a `cond ? A : B` union), not a static class name.
 // Works for every class shape (empty/field/ctor) now that a class-as-value is a
 // proper ts_func carrying its class id: the runtime consults C[Symbol.hasInstance]
-// then walks the prototype chain against C's prototype. (RHS whose static type is
-// not a constructor — e.g. `any` — still loud-rejects; see tests/rejects_syntax.sh.)
+// then walks the prototype chain against C's prototype. An `any`-typed RHS uses
+// the same runtime path and throws a catchable TypeError when it is not callable.
 
 class Animal {}
 class Dog extends Animal {
@@ -27,6 +27,10 @@ class EvenChecker {
 
 // the canonical generic helper: RHS is a constructor-typed parameter
 function isInstance(x: unknown, C: typeof Animal): boolean {
+  return x instanceof C;
+}
+
+function isInstanceAny(x: any, C: any): boolean {
   return x instanceof C;
 }
 
@@ -58,6 +62,14 @@ function main(): void {
 
   // a real subclass chain via a variable
   console.log(new Pug() instanceof Dog, new Pug() instanceof Animal); // true true (static RHS regression)
+
+  // any-typed RHS: valid constructors work and invalid values throw at runtime
+  console.log(isInstanceAny(new Dog(), Dog), isInstanceAny({}, Dog)); // true false
+  try {
+    isInstanceAny({}, 1);
+  } catch (error: any) {
+    console.log(error instanceof TypeError);
+  }
 }
 
 main();

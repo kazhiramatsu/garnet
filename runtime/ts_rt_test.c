@@ -118,6 +118,11 @@ static int headers_immutable_mutation_caught(int op){
   return caught && unchanged && frozen;
 }
 
+typedef struct {
+  ts_object o;
+  tsv x;
+} pic_test_class;
+
 int main(){
   int fail=0;
   #define CK(name,cond) do{ printf("[%s] %s\n",name,(cond)?"PASS":"*** FAIL ***"); if(!(cond))fail++; }while(0)
@@ -145,6 +150,29 @@ int main(){
   CK("obj missing", ts_is_undef(ts_get(o,999)));
   ts_set(o,100,ts_num(70));
   CK("obj overwrite", ts_to_num(ts_get(o,100))==70);
+  /* A fixed-key PIC may see a plain object and an AOT class instance at the
+     same site. Class instances resolve registered struct fields before their
+     named-property vector, so they must not alias a plain object's shape. */
+  const ts_key pic_class_key = 424242u;
+  tsv pic_proto=ts_new_proto(); ts_gc_root(&pic_proto);
+  ts_class_field pic_field={
+    pic_class_key, offsetof(pic_test_class, x), 0
+  };
+  ts_register_class(pic_proto, &pic_field, 1);
+  tsv pic_plain=ts_new_object(); ts_gc_root(&pic_plain);
+  ts_set(pic_plain, pic_class_key, ts_num(1));
+  tsv pic_class=ts_new_sized(sizeof(pic_test_class)); ts_gc_root(&pic_class);
+  pic_test_class* pic_obj=(pic_test_class*)ts_ptr(pic_class);
+  pic_obj->o.proto=pic_proto;
+  pic_obj->x=ts_num(2);
+  /* Install the same key in the side property vector to make an accidental
+     shape collision observable: canonical class lookup must still return x. */
+  ts_define_data(pic_class, pic_class_key, ts_num(99), 1, 1, 1);
+  ts_prop_ic pic_ic=TS_PROP_IC_INIT;
+  CK("pic plain warmup", ts_to_num(ts_get_pic_checked_inline(pic_plain, pic_class_key, &pic_ic))==1);
+  CK("pic class layout domain", ts_to_num(ts_get_pic_checked_inline(pic_class, pic_class_key, &pic_ic))==2);
+  CK("pic class canonical parity", ts_get_pic_checked_inline(pic_class, pic_class_key, &pic_ic)==ts_get(pic_class, pic_class_key));
+  ts_gc_unroot(3);
   /* nested object reachable through GC */
   tsv inner=ts_new_object(); ts_set(inner,1,ts_num(123)); ts_set(o,300,inner);
   /* strings + add */

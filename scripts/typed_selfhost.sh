@@ -30,7 +30,10 @@ node exporter/exporter.js analyzer_ts/src/selfhost_typed.ts "$W/self.ir.json" "$
 ok "export"
 
 # ---- node parity on own IR ----
-"$RUST" "$W/self.ir.json" emit > "$W/gen1.c" 2>/dev/null || fail "Rust emit on own IR"
+# The frozen analyzer predates PICs and shadow frames. Use the retained legacy
+# mode only for this byte oracle; the native build below uses both production
+# defaults.
+TSAOT_PROP_PIC=0 TSAOT_FRAME_ROOTS=0 "$RUST" "$W/self.ir.json" emit > "$W/gen1.c" 2>/dev/null || fail "Rust legacy emit on own IR"
 node analyzer_ts/dist/main.js "$W/self.ir.json" emitc > "$W/gen1_node.c" 2>/dev/null || fail "node emitc on own IR"
 cmp -s "$W/gen1.c" "$W/gen1_node.c" || fail "Rust emit != node emitc on own IR"
 ok "parity (rust == node on own IR)"
@@ -81,7 +84,9 @@ export ROOT CC
 . "$ROOT/scripts/lib/regexp_link_flags.sh" || fail "regexp link flags"
 RT_OBJ="$ROOT/build/rt.o"
 mkdir -p "$ROOT/build"
-if [ ! -f "$RT_OBJ" ] || [ "$ROOT/runtime/ts_rt.c" -nt "$RT_OBJ" ]; then
+if [ ! -f "$RT_OBJ" ] ||
+   [ "$ROOT/runtime/ts_rt.c" -nt "$RT_OBJ" ] ||
+   [ "$ROOT/runtime/ts_rt.h" -nt "$RT_OBJ" ]; then
   $CC -c "$ROOT/runtime/ts_rt.c" -I"$ROOT/runtime" -o "$RT_OBJ" || fail "build runtime"
 fi
 tsaot_prepare_regexp_objs "$build_dir/tsan_typed2.c" "$build_dir" || fail "regexp objs"

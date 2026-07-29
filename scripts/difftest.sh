@@ -19,6 +19,12 @@ TSAOT_LDLIBS="${TSAOT_LDLIBS:-}"
 . "$ROOT/scripts/lib/mimalloc_flags.sh" || return 1
 . "$ROOT/scripts/lib/regexp_link_flags.sh" || return 1
 mkdir -p "$ROOT/build"
+RT_OBJ="$ROOT/build/rt.o"
+if [ ! -f "$RT_OBJ" ] ||
+   [ "$ROOT/runtime/ts_rt.c" -nt "$RT_OBJ" ] ||
+   [ "$ROOT/runtime/ts_rt.h" -nt "$RT_OBJ" ]; then
+  $CC -c "$ROOT/runtime/ts_rt.c" -I"$ROOT/runtime" -o "$RT_OBJ" || return 1
+fi
 
 # Generate the node reference runner (uses the exporter's bundled typescript).
 # Reference runner: transpile to an ES MODULE (.mjs) and run it, so the V8
@@ -47,7 +53,7 @@ dt() {
   "$ROOT/analyzer/target/release/tsaot" "$ROOT/build/dt.json" emit > "$ROOT/build/dt.c" 2>/dev/null
   tsaot_prepare_regexp_objs "$ROOT/build/dt.c" "$ROOT/build" || return
   tsaot_prepare_unicode_objs "$ROOT/build/dt.c" "$ROOT/build" || return
-  tsaot_prepare_fetch_runtime "$ROOT/build/dt.c" "$ROOT/build" "$ROOT/build/rt.o" || return
+  tsaot_prepare_fetch_runtime "$ROOT/build/dt.c" "$ROOT/build" "$RT_OBJ" || return
   $CC "$ROOT/build/dt.c" "$TSAOT_FETCH_RT_OBJ_ARG" $TSAOT_REGEXP_OBJ_ARGS $TSAOT_UNICODE_OBJ_ARGS -I"$ROOT/runtime" -lm $TSAOT_FETCH_LDLIBS $TSAOT_LDLIBS -o "$ROOT/build/dt" 2>&1 | grep -i error
   local aot
   aot=$("$ROOT/build/dt" 2>&1 | tr '\n' '|')

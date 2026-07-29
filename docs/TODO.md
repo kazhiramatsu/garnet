@@ -3154,3 +3154,75 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
 - **修正**: 末尾チェックを先頭と同じ `' '\t'\n'\r'\v'\f'` 集合に。`"\t"`→0・`"\t12\t"`→12・`+"6\t"`→6 が正しくなる（Unicode 空白 NBSP/BOM 等は別途の稀ケース・今回対象外）。
 - **検証**: `numbers/number_parse.ts` に全空白・数値周辺・無効ケース追記→V8 一致。conf all **342/342** / unit / gate gc **PASSED**。runtime のみ（emitted C 不変）。
 - **教訓**: 先頭と末尾で空白判定が非対称になりやすい（strtod が先頭を食うので末尾チェックを軽視しがち）。両端の trim 集合は同一述語に揃える。
+
+### Session 321: Performance investigation → docs/runtime_perf_plan.md (execution-perf design doc, post-C1-failure reboot)
+
+- **Task (user)**: investigate performance problems and write a step-by-step improvement design doc implementable by a low-capability agent; GC redesign (C1) already failed — plan around it.
+- **Investigation (light, within the daily-measurement policy)**: read gc_moving_plan / refactor_master_plan / bench docs + mapped runtime hot paths; profiled `gc_strings` (1093 ms, the slowest GC bench) with `sample`: **`ts_add` = 933/945 non-dyld samples (~99%)**. Root cause: every string concat does 4 full passes (alloc, copy, `strflags_storage` ASCII rescan, `strhash_units` full FNV) at ts_rt.c:2095-2100, so `s += x` loops are quadratic ×4 — and the flagship emit workload (selfhost native 595 s vs node 35.3 s ≈ 17×) is string-building (frozen emitc.ts: 74 `+=` sites incl. per-char escape loops). Also found: `class_reg_for` O(#classes) scan + per-call `need` recompute on every dynamic class-instance property access (ts_rt.c:6256-6269); `ts_construct` mallocs callargs per construction (6232/6248) — same pattern P2a-1 already removed from ts_call.
+- **Deliverable**: **`docs/runtime_perf_plan.md` (v1)** — measurement-first, runtime-only-first plan: Phase 0 flagship profiling protocol (cheap 60 s sample + user-approved milestone run, decision table); Phase 1 quick wins (derived concat flags / lazy string hashing via existing `ts_str_hash_of` pattern / ts_construct stack buffer / class_reg index — each with anchors, invariants, verify recipe, accept criteria, rollback); Phase 2 **extendable string buffers** (SpiderMonkey-style: hidden BUFFER cell + VIEW results, extend-in-place only when `lhs.len == parent.len`, width fixed at creation, prefix immutability; amortized O(1) append, contiguous reads, no ropes, zero GC/encoding changes — parity unaffected by construction); Phase 3 property lookup (conditional on Phase 0 evidence; shapes/PIC deferred to its own design doc incl. freeze-bit relocation prep); Phase 4 outlines (root batching, call ABI, GC B-3). Explicit non-goals: C1 (branch `gc-c1-directptr` untouched, re-entry criteria per s320), Rust-analyzer compile speed, bigint, ropes.
+- **Acceptance targets set**: gc_strings ≥5× (≤200 ms, alloc 536→≤60 MB) for Phase 2; deterministic RT_STATS counters (`sb_extend/sb_fresh/sb_flat`, `construct_malloc`, `class_reg_probes`) for every change; milestone re-run (output identity + wall vs 595 s) as the phase-end gate.
+- **v1.1 (same session, after user review)**: (1) added **§2 "Why the C1 GC redesign failed"** — root cause (selector aliasing: direct-pointer tsv indistinguishable from non-canonical NaN / garbage; pre-C1 low-bit-1 handles made the populations disjoint), why every gate missed it (ASan-only deref guard + conformance inputs too small for scale-dependent UB), the four "amnesty" bug classes the handle table had been masking, and a **lesson→rule table (R1–R6)** wired into the rest of the plan; (2) hardened for low-capability implementers: §3.9 GC-discipline coding rules (root-across-alloc / re-deref-after-alloc / no raw-pointer caching, with the ts_rt.c:2086-2096 exemplar), explicit load-bearing alloc orderings for Phase 2's EXTEND/FRESH arms, uint32 overflow guard, a **non-ASan ≥64 MB scale stress** as a Phase 2 acceptance gate (directly closes the C1 gate blind spot), concrete Phase 0 commands (stdin/stdout native invocation + `ulimit -s 65520` from bench_selfcompile.sh:96-99), and milestone output oracle = **byte-identity vs emit-node** (no pre-change 595 s baseline needed).
+
+### Session 321 (cont.): Phase 0.1 flagship profile EXECUTED — #1 cost = dynamic property access (44%), plan re-ranked (runtime_perf_plan v1.2)
+
+- **Measurement (light protocol)**: built `tsan_typed` with `--profile`, ran it on the full 23.4 MB self IR, sampled two 55 s windows (t=0-55 / t=180-235; ~46.5k samples each, windows agree = phase-stable), killed after. Plus an RT_STATS build run on a 125 KB medium IR slice.
+- **Results**: **#1 = dynamic property access ≈ 44%** (`ts_get` 17.3% + `ts_set` 16.3% + `lookup_prop_chain` 10.0% + `ts_get_checked` 0.8%) / **#2 = GC root churn ≈ 15%** (`ts_gc_root` 12.5% + unroot 2.1%; deterministic: **root_push = 4,028,710 on the 125 KB input = 50× alloc count**) / #3 allocator ≈ 12% / #4 `ts_strict_eq`+`ts_str_view_typed` ≈ 10%. **`ts_add` absent** from the flagship top list (frozen emitc is push/join-based) — the string-concat quadratic is real but micro-only (gc_strings). `class_reg_for` innocent at flagship scale (3 regs, 7 samples).
+- **Key diagnostic**: `find_prop` avg_probe **3.48**, 85% ≤ 4 probes → the 44% is **call count × per-call fixed overhead** (extern call + 5-step tag ladder + array check + class-registry bridge before the scan), NOT scan length ⇒ dictionary index (P2a-3 style) is the wrong tool; root fix is **shapes+PIC (P6)**; immediate runtime-only mitigation is a plain-object fast-path hoist.
+- **Plan v1.2 (runtime_perf_plan.md)**: added §1.1 (profile facts F12-F15), marked the P0.3 decision-table outcomes, new §5.0 implementation order — **(1) NEW item 1.5 `ts_get`/`ts_set` plain-object fast-path hoist + 1.4 class_reg index, (2) 1.3, (3) root batching promoted (needs its own short design doc), (4) shapes+PIC design doc (after P0.2 full-run profile, user-approved window), (5) string builder demoted to micro/general-JS justification**. 1.2 (lazy hash) narrowed: concat/derivation sites only, `ts_new_string` stays eager + `ts_str_eq` gets the caching accessor so `===` keeps its hash reject (protects the 6% F15 term from regression).
+- **Lesson**: the measure-first discipline paid out in one session — v1.1's leading hypothesis (string concat, from the gc_strings micro) was demoted by the flagship profile before any implementation was spent on it; micro-bench dominance does not transfer to the flagship (same trap as P2a-3's startup-only probes, in the opposite direction).
+- **Next**: (1) implement plan item 1.5 (+1.4) and ABAB on the medium-slice native, (2) root-batching short design doc, (3) agree a time window for P0.2 (full 595 s profile + full RT_STATS) before committing to the shapes+PIC design doc.
+
+### Session 321 (cont. 2): Root-batching policy discussion (user proposal: mruby-style GC arena) → §8.1 of runtime_perf_plan expanded
+
+- **User proposal**: mruby's `mrb_gc_arena_save/restore` — allocations auto-protected in an arena, bulk-released at scope exit, no per-value root registration.
+- **Analysis**: arena works in mruby because (1) Ruby locals are rooted by the scanned VM stack and (2) its GC is non-moving; the arena only covers C-extension fresh allocations. garnet has no scanned VM stack (ALL locals are C locals), so an allocations-only arena leaves only-reference cases unprotected (`x = arr.pop()` / `x = obj.f; obj.f = null` then alloc → dangling). Verbatim adoption rejected; the underlying idea (per-scope instead of per-value cost) adopted in both candidate designs.
+- **Two candidates recorded in §8.1**: **A) shadow-frame batching** (1 frame push/pop per function, ~8-10× fewer root ops, precise, and the local-enumeration substrate a future C1 retry needs) vs **B) conservative handle-scan** (delete registration entirely; scan used C stack + setjmp-spilled registers for handle-patterned tsvs with table validation; mutator cost → 0, runtime-internal operand rooting also disappears; safe ONLY under handle encoding — the selector-aliasing that crashed C1 is fail-RETAIN here, not fail-crash; incompatible with direct-pointer C1). Shared blocker: both change every emitted prologue ⇒ parity DIFF on all fixtures → land after P4 or add a prologue normalizer to emitc_diff (decide in design doc).
+- **Next step fixed**: split `root_push` RT_STATS counter into generated-prologue vs runtime-internal origins (B helps both, A only the former); then the A/B design doc. Current lean: evaluate B first, A as fallback.
+
+### Session 321 (cont. 3): Conservative stack scan (root-batching Design B) REJECTED after user challenge — Design A (shadow frame) confirmed primary
+
+- **User challenge**: can tsvs on the C stack be identified accurately? (cited GC-history precedent of conservative stack scanning causing leaks.)
+- **Answer: no — and the analysis killed Design B.** Two failure directions: (1) false positives → retention; handle validation bounds it to over-retaining live cells, but with the 64 MB selfhost stack the ambiguous-word population is large and long-running programs accumulate an effective leak (CRuby still pays this + RB_GC_GUARD for its machine-stack marking; SpiderMonkey/Mono abandoned conservative scanning over it). (2) **False negatives via C optimization — the killer**: at -O2 a tsv local is dead-stored after its last read while a derived raw pointer (`ts_string*`, `view.data`) is still live → scan finds neither → premature free. RB_GC_GUARD class: crash-direction, compiler/scale-dependent, invisible to small-input gates = same failure signature as C1 (violates plan rules R3/R5). Decisive: making B safe = forcing reflike locals into enumerable memory = Design A. B's safe form degenerates into A.
+- **Decision**: §8.1 updated — A (shadow-frame batching, 1 frame push/pop per function) is primary; B recorded as rejected-with-rationale (do not revisit without eliminating failure direction 2 outright). Runtime-internal operand rooting stays explicit; mruby-style fresh-alloc auto-protection remains a possible complement there, sized by the root_push counter split (generated-prologue vs runtime-internal).
+- **Lesson**: "fail-retain vs fail-crash" was the right frame but incomplete — conservative stack scanning ALSO has a fail-crash direction under optimizing compilers (dead-stored locals + live derived pointers). Evaluate GC-safety schemes against BOTH directions before ranking them.
+
+### Session 321 (cont. 4): Root batching fully specified for low-capability implementers — docs/root_batching_design.md + reading-order section
+
+- **User direction**: perf docs must be implementable by a low-capability model — concrete structs/functions/procedures, and a clear "which doc to read first" order.
+- **New doc `docs/root_batching_design.md` (v1)**: shadow-frame design with exact code (`ts_frame_hdr` + inline `ts_frame_push/pop`, intrusive list, `g_ts_frame_top`), verified anchors on both sides (runtime: g_roots walks ts_rt.c:2711/2810, eh snapshot 8836/8847, landings 9126/9423; emitter: emit_i64_function:4627 / emit_f64_function:4744 / emit_function:4862, Ctx.nroot:1303, 22 `ts_gc_unroot` sites, 69 scattered `v{}` format sites, Ctx::val:1385), v1 scope (plain functions incl. i64/f64 variants; EXCLUDED: coro state machines (eh_gc_depth arrays), GLOBALS/proto one-time roots, ss_base slice roots, _cv adapters — all recorded follow-ups), and a 5-commit plan: **S1** runtime substrate (dead code) → **S2** centralize local-name formatting into `Ctx::vname` (behavior-invariant, proven by emitc_diff byte-identity — the 69-site scatter is the main weak-agent trap, so it gets its own parity-locked commit) → **S3** frame emission behind `TSAOT_FRAME_ROOTS` (default OFF = parity stays green; flag-off byte-identity proven) → **S4** flag-ON battery (exception unwind cases incl. mixed converted/unconverted frames, deep recursion + forced GC, full-rebuild A/B; OFF/ON root_push diff doubles as the prologue-vs-runtime counter split; STOP if wall < 3%) → **S5** default flip = the parity event (user sign-off; options: after P4 / sed-normalizer prototype / re-baseline) + milestone acceptance. Correctness-obligation table (init-before-push, pop-on-every-exit, longjmp restore pairing greps) + rollback/STOP + recorded fallback (#define trick) included.
+- **Reading order added** at the top of runtime_perf_plan.md: TODO tail → plan §5.0/§2/§3 → own work-item section (1.x in plan §5 / root batching → root_batching_design.md / string builder → plan §6) → agent_workflow.md → background docs.
+- **Next**: implement plan item 1.5 (ts_get/ts_set fast path) → 1.4 → root_batching_design S1.
+
+### Session 323: Dynamic-property and GC performance implementation completed
+
+- **Object lookup**: added hidden shapes and a four-entry per-site polymorphic inline
+  cache for ordinary own-property reads/writes, with a 16-miss megamorphic fallback and
+  `TSAOT_PROP_PIC=0` legacy mode. Added an ordinary-object runtime fast path, hashed class
+  registry lookup, and a class-instance shape-domain guard. Added an adaptive
+  open-addressing property index at eight named properties; JSON construction now uses
+  the canonical `find_prop` creation path. Runtime-object cache rebuild dependencies now
+  include both `ts_rt.c` and `ts_rt.h`.
+- **GC roots**: removed inactive root-stack clearing on pop and replaced generated
+  per-local root calls with one shadow-frame push/pop per eligible function. Both young
+  and full marking scan frames, and exception handlers snapshot/restore frame top across
+  `longjmp`. After explicit user approval, frame roots are production-default;
+  `TSAOT_FRAME_ROOTS=0` retains the legacy prologue. Frozen-emitter parity uses both
+  legacy flags because the frozen analyzer predates both optimizations.
+- **Performance**: the four-shape PIC kernel improved from Git HEAD 215 ms to 93 ms in the
+  controlled A/B (about 57%); the final benchmark run was 91 ms with 39,999,992 hits out
+  of 40,000,000 reads. The 32-key dictionary benchmark reduced average probes from 16.50
+  to 1.38 and finished at 95 ms. Root-pop alone improved the GC microbenchmark by about
+  7%. Full-rebuild frame-root A/B measured 20.0 ms OFF versus 13.0 ms ON on the medium
+  compiler slice (100 interleaved runs, 35% faster), and 510.18 s OFF versus 330.11 s ON
+  for full typed self-host (35.3% faster; 44.5% faster than the earlier 595 s baseline).
+  OFF, ON, and Node emitter outputs are identical after normalizing the native trailing
+  newline.
+- **Coverage**: added PIC, dictionary, class-layout-collision, frame-unwind, and
+  GC-stress regressions. Removed the stale negative assertion that rejected an `any`
+  right-hand side of `instanceof`, matching the already-supported dynamic callable path,
+  and extended its positive/error conformance fixture.
+- **Final verification (production defaults)**: typed conformance 344/344; untyped
+  conformance 344/344; GC O2 19/19 and ASan 19/19 plus runtime ASan and threshold stress;
+  bundler 39/39; benchmarks 101/101; self-conformance 340 PASS + 1 KNOWN, DIFF=0;
+  frozen parity 329 identical + 12 KNOWN, DIFF=0; `ci_fast`; runtime and analyzer unit
+  suites. No commit was created.

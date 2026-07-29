@@ -27,6 +27,12 @@
 #include <setjmp.h>
 #include "json_core.h"
 
+#if defined(__GNUC__) || defined(__clang__)
+#define TS_RT_ALWAYS_INLINE static inline __attribute__((always_inline))
+#else
+#define TS_RT_ALWAYS_INLINE static inline
+#endif
+
 #if defined(TSAOT_USE_MIMALLOC)
 #include <mimalloc.h>
 #define malloc  mi_malloc
@@ -184,10 +190,41 @@ typedef struct { ts_key key; tsv val; uint8_t flags; } ts_prop;
    TS_PROP_DEFAULT (NOT rely on calloc 0, which would mean all-false). Slot
    creation is centralized in find_slot/find_prop, which sets this. */
 enum { TS_PROP_ENUMERABLE = 1, TS_PROP_WRITABLE = 2, TS_PROP_CONFIGURABLE = 4,
+       TS_PROP_ACCESSOR = 8,
        TS_PROP_DEFAULT = TS_PROP_ENUMERABLE | TS_PROP_WRITABLE | TS_PROP_CONFIGURABLE };
 static inline int prop_is_enumerable(const ts_prop* p){ return (p->flags & TS_PROP_ENUMERABLE) != 0; }
 static inline int prop_is_writable(const ts_prop* p){ return (p->flags & TS_PROP_WRITABLE) != 0; }
 static inline int prop_is_configurable(const ts_prop* p){ return (p->flags & TS_PROP_CONFIGURABLE) != 0; }
+static inline int prop_is_accessor(const ts_prop* p){ return (p->flags & TS_PROP_ACCESSOR) != 0; }
+/* Ordinary objects start at the shared empty shape. Shape 0 means dictionary /
+   uncacheable layout (currently reached after property deletion). */
+enum { TS_SHAPE_NONE = 0, TS_SHAPE_EMPTY = 1, TS_SHAPE_MAX = (1u << 29) - 1u };
+#define TS_PROP_IC_SIZE 4
+typedef struct {
+  ts_key key;
+  uint32_t shape;
+  uint32_t slot;
+} ts_prop_ic_entry;
+typedef struct {
+  ts_prop_ic_entry entries[TS_PROP_IC_SIZE];
+  uint8_t next;
+  uint8_t misses;
+  uint8_t megamorphic;
+} ts_prop_ic;
+#define TS_PROP_IC_INIT {0}
+#ifdef TSAOT_RT_STATS
+extern unsigned long long g_ts_pic_get_calls, g_ts_pic_get_hits;
+extern unsigned long long g_ts_pic_set_calls, g_ts_pic_set_hits;
+#define TS_RT_STAT_PIC_GET_CALL() (g_ts_pic_get_calls++)
+#define TS_RT_STAT_PIC_GET_HIT()  (g_ts_pic_get_hits++)
+#define TS_RT_STAT_PIC_SET_CALL() (g_ts_pic_set_calls++)
+#define TS_RT_STAT_PIC_SET_HIT()  (g_ts_pic_set_hits++)
+#else
+#define TS_RT_STAT_PIC_GET_CALL() ((void)0)
+#define TS_RT_STAT_PIC_GET_HIT()  ((void)0)
+#define TS_RT_STAT_PIC_SET_CALL() ((void)0)
+#define TS_RT_STAT_PIC_SET_HIT()  ((void)0)
+#endif
 /* accessor property: stored as a prop's value (OBJECT-tagged, kind ACCESSOR).
    getter/setter are function values (TS_UNDEFINED when absent). g_this/s_this
    record whether the getter/setter want `this` as a leading arg: true for
@@ -214,12 +251,24 @@ typedef struct ts_obj_common {
   ts_gc_header h;
   tsv proto;                   /* prototype chain handle (object/function or null) */
   ts_prop* props; uint32_t cap, len;   /* lazily-allocated named-property map */
-  /* PIC foundation (property_model_redesign §6): reserved shape id for a future
-     hidden-class / inline-cache layer. 0 = no shape (current behavior). */
+  /* Objects with enough named properties get a sparse open-addressing index.
+     Small objects keep this NULL and retain the cache-friendly linear scan. */
+  uint32_t* prop_index;
+  uint32_t prop_index_cap;
+  /* Low 29 bits are hidden-class identity. The high 3 bits store integrity
+     flags (frozen, non-extensible, sealed), keeping the common header compact. */
   uint32_t shape;
 } ts_obj_common;
 /* ts_object is exactly the common header (plain object / class-instance prefix). */
 typedef struct ts_obj_common ts_object;
+static inline uint32_t ts_obj_shape_id(const ts_object* o){ return o->shape & TS_SHAPE_MAX; }
+static inline uint32_t ts_obj_integrity(const ts_object* o){ return o->shape >> 29; }
+static inline void ts_obj_set_shape(ts_object* o, uint32_t shape){
+  o->shape = (o->shape & ~TS_SHAPE_MAX) | (shape & TS_SHAPE_MAX);
+}
+static inline void ts_obj_add_integrity(ts_object* o, uint32_t flags){
+  o->shape |= (flags & 7u) << 29;
+}
 
 enum {
   TS_STR_FLAG_ASCII = 1u << 0,
@@ -954,7 +1003,11 @@ tsv    ts_object_rest(tsv src, const uint32_t* excl, int nexcl);
 tsv    ts_get_dyn(tsv obj, tsv keyv);
 tsv    ts_get_checked(tsv obj, ts_key key);
 tsv    ts_get_dyn_checked(tsv obj, tsv keyv);
+tsv    ts_get_pic_checked(tsv obj, ts_key key, ts_prop_ic* ic);
+tsv    ts_get_dyn_pic_checked(tsv obj, tsv keyv, ts_prop_ic* ic);
 void   ts_set_dyn(tsv obj, tsv keyv, tsv v);
+void   ts_set_pic(tsv obj, ts_key key, tsv v, ts_prop_ic* ic);
+void   ts_set_dyn_pic(tsv obj, tsv keyv, tsv v, ts_prop_ic* ic);
 /* Reflect.* wrappers (return booleans where the spec does). */
 tsv    ts_reflect_has(tsv t, tsv k);
 tsv    ts_reflect_set(tsv t, tsv k, tsv v);
@@ -1156,6 +1209,33 @@ void ts_set_fn_prototype(tsv fn, tsv proto);
 void ts_gc_collect(void);             /* full mark/sweep over the dynamic heap */
 void ts_gc_collect_young(void);       /* minor collection of young objects */
 void ts_gc_root(tsv* slot);           /* register a root (stack slot address) */
+/* Generated non-coroutine functions batch their boxed locals into one shadow
+   frame. The slots immediately follow this header in the generated stack
+   struct and are fully initialized before the frame is linked. */
+typedef struct ts_frame_hdr {
+  struct ts_frame_hdr* prev;
+  uint32_t count;
+} ts_frame_hdr;
+extern ts_frame_hdr* g_ts_frame_top;
+#ifdef TSAOT_RT_STATS
+extern unsigned long long g_ts_frame_push_count;
+#define TS_RT_STAT_FRAME_PUSH() (g_ts_frame_push_count++)
+#else
+#define TS_RT_STAT_FRAME_PUSH() ((void)0)
+#endif
+static inline void ts_frame_push(ts_frame_hdr* frame, uint32_t count){
+  frame->prev = g_ts_frame_top;
+  frame->count = count;
+  g_ts_frame_top = frame;
+  TS_RT_STAT_FRAME_PUSH();
+}
+static inline void ts_frame_pop(ts_frame_hdr* frame){
+  g_ts_frame_top = frame->prev;
+}
+static inline tsv* ts_frame_slots(ts_frame_hdr* frame){
+  return (tsv*)(frame + 1);
+}
+void ts_frame_restore(ts_frame_hdr* frame);
 static inline void ts_write_barrier(tsv owner, tsv value){
   if (!(ts_is_obj(value)||ts_is_func(value)||ts_is_str(value))) return;
   if (!(ts_is_obj(owner)||ts_is_func(owner)||ts_is_str(owner))) return;
@@ -1163,12 +1243,88 @@ static inline void ts_write_barrier(tsv owner, tsv value){
   ts_gc_header* v = (ts_gc_header*)ts_ptr(value);
   if (o->gen == TS_GEN_OLD && v->gen == TS_GEN_YOUNG) ts_gc_remember(o);
 }
+/* The generated site calls these wrappers, so the four shape/slot guards are
+   compiled into the caller. Only a data-property hit completes inline;
+   accessors, misses, exotics, errors, and cache updates use the canonical
+   out-of-line helpers declared above. Shape identity alone is sufficient here:
+   entries cache own slots, whose layout does not depend on the prototype or
+   receiver allocation size. It also makes the cached slot/key bounds structural:
+   key-sequence changes transition the shape, and deletion sets shape 0. Each
+   fixed-key emitted site owns its cache, so its inline probe only needs shape;
+   the shared slow and computed-key paths continue to validate the key. */
+TS_RT_ALWAYS_INLINE ts_prop* ts_prop_ic_probe_fixed_inline(
+    tsv obj, ts_prop_ic* ic){
+  if (!ic || ic->megamorphic || TS_TOP16(obj) != TS_SEL_OBJECT) return NULL;
+  ts_object* o = (ts_object*)ts_ptr(obj);
+  if (o->h.kind != TS_KIND_OBJECT || ts_obj_shape_id(o) == TS_SHAPE_NONE) return NULL;
+#if defined(__clang__)
+#pragma clang loop unroll(disable)
+#elif defined(__GNUC__)
+#pragma GCC unroll 1
+#endif
+  for (uint32_t i = 0; i < TS_PROP_IC_SIZE; i++){
+    ts_prop_ic_entry* e = &ic->entries[i];
+    if (e->shape == o->shape) return &o->props[e->slot];
+  }
+  return NULL;
+}
+TS_RT_ALWAYS_INLINE int ts_prop_is_accessor_inline(const ts_prop* p){
+  return prop_is_accessor(p);
+}
+TS_RT_ALWAYS_INLINE tsv ts_get_pic_checked_inline(
+    tsv obj, ts_key key, ts_prop_ic* ic){
+  ts_prop* p = ts_prop_ic_probe_fixed_inline(obj, ic);
+  if (p && !ts_prop_is_accessor_inline(p)){
+    TS_RT_STAT_PIC_GET_CALL();
+    TS_RT_STAT_PIC_GET_HIT();
+    return p->val;
+  }
+  return ts_get_pic_checked(obj, key, ic);
+}
+TS_RT_ALWAYS_INLINE void ts_set_pic_inline(
+    tsv obj, ts_key key, tsv value, ts_prop_ic* ic){
+  ts_prop* p = ts_prop_ic_probe_fixed_inline(obj, ic);
+  if (p && !ts_prop_is_accessor_inline(p)){
+    ts_object* o = (ts_object*)ts_ptr(obj);
+    if (!(ts_obj_integrity(o) & 1u) && prop_is_writable(p)){
+      TS_RT_STAT_PIC_SET_CALL();
+      TS_RT_STAT_PIC_SET_HIT();
+      p->val = value;
+      ts_write_barrier(obj, value);
+      return;
+    }
+  }
+  ts_set_pic(obj, key, value, ic);
+}
+TS_RT_ALWAYS_INLINE tsv ts_get_dyn_pic_checked_inline(
+    tsv obj, tsv key, ts_prop_ic* ic){
+  if (ic && ic->megamorphic){
+    TS_RT_STAT_PIC_GET_CALL();
+    return ts_get_dyn_checked(obj, key);
+  }
+  return ts_get_dyn_pic_checked(obj, key, ic);
+}
+TS_RT_ALWAYS_INLINE void ts_set_dyn_pic_inline(
+    tsv obj, tsv key, tsv value, ts_prop_ic* ic){
+  if (ic && ic->megamorphic){
+    TS_RT_STAT_PIC_SET_CALL();
+    ts_set_dyn(obj, key, value);
+    return;
+  }
+  ts_set_dyn_pic(obj, key, value, ic);
+}
 void ts_gc_unroot(int n);
 
 #endif
 
 /* exceptions (try/catch via setjmp/longjmp) */
-typedef struct ts_handler { jmp_buf buf; int gc_root_len; struct ts_handler* prev; void* extbuf; } ts_handler;
+typedef struct ts_handler {
+  jmp_buf buf;
+  int gc_root_len;
+  ts_frame_hdr* frame_top;
+  struct ts_handler* prev;
+  void* extbuf;
+} ts_handler;
 int         ts_gc_root_depth(void);
 void        ts_gc_set_root_depth(int n);
 ts_handler* ts_eh_push(void);

@@ -157,7 +157,9 @@ export ROOT CC
 # Base runtime object (also the default when the program does not need fetch).
 RT_OBJ="$ROOT/build/rt${rt_suffix}.o"
 mkdir -p "$ROOT/build"
-if [ ! -f "$RT_OBJ" ] || [ "$ROOT/runtime/ts_rt.c" -nt "$RT_OBJ" ]; then
+if [ ! -f "$RT_OBJ" ] ||
+   [ "$ROOT/runtime/ts_rt.c" -nt "$RT_OBJ" ] ||
+   [ "$ROOT/runtime/ts_rt.h" -nt "$RT_OBJ" ]; then
   $CC -c "$ROOT/runtime/ts_rt.c" -I"$ROOT/runtime" -o "$RT_OBJ" || die "failed to build runtime ($RT_OBJ)"
 fi
 

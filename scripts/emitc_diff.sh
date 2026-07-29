@@ -32,7 +32,10 @@ while IFS=$'\t' read -r slug path; do
   case "$slug" in *"$FILTER"*) ;; *) continue ;; esac
   prog="$W/json/$slug.program.json"
   [ -f "$prog" ] || { skip=$((skip+1)); continue; }
-  "$RUST" "$prog" emit > "$W/r.c" 2>/dev/null || { skip=$((skip+1)); continue; }
+  # The frozen TS emitter predates both property PICs and shadow root frames.
+  # Keep this mechanical byte oracle on the explicit legacy mode while
+  # production emission uses both optimizations by default.
+  TSAOT_PROP_PIC=0 TSAOT_FRAME_ROOTS=0 "$RUST" "$prog" emit > "$W/r.c" 2>/dev/null || { skip=$((skip+1)); continue; }
   if ! node analyzer_ts/dist/main.js "$prog" emitc > "$W/t.c" 2>"$W/t.err"; then
     if grep -q "^UNPORTED:" "$W/t.err"; then
       unported=$((unported+1))

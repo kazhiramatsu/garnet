@@ -11,7 +11,12 @@ CC="${TSAOT_CC:-gcc -O2}"
 . "$ROOT/scripts/lib/mimalloc_flags.sh" || return 1
 . "$ROOT/scripts/lib/regexp_link_flags.sh" || return 1
 mkdir -p "$ROOT/build"
-[ -f "$ROOT/build/rt.o" ] || gcc -O2 -c "$ROOT/runtime/ts_rt.c" -I "$ROOT/runtime" -o "$ROOT/build/rt.o"
+RT_OBJ="$ROOT/build/rt.o"
+if [ ! -f "$RT_OBJ" ] ||
+   [ "$ROOT/runtime/ts_rt.c" -nt "$RT_OBJ" ] ||
+   [ "$ROOT/runtime/ts_rt.h" -nt "$RT_OBJ" ]; then
+  $CC -c "$ROOT/runtime/ts_rt.c" -I"$ROOT/runtime" -o "$RT_OBJ" || return 1
+fi
 
 # node ESM baseline runner: transpile every .ts in the dir to .mjs (ESNext),
 # rewrite `from "./x"` -> `from "./x.mjs"`, run entry.mjs.
@@ -46,7 +51,7 @@ mf() {
   "$ROOT/analyzer/target/release/tsaot" "$dir/out.json" emit > "$dir/out.c" 2>/dev/null
   tsaot_prepare_regexp_objs "$dir/out.c" "$dir" >/dev/null 2>&1
   tsaot_prepare_unicode_objs "$dir/out.c" "$dir" >/dev/null 2>&1
-  tsaot_prepare_fetch_runtime "$dir/out.c" "$dir" "$ROOT/build/rt.o" >/dev/null 2>&1
+  tsaot_prepare_fetch_runtime "$dir/out.c" "$dir" "$RT_OBJ" >/dev/null 2>&1
   $CC "$dir/out.c" "$TSAOT_FETCH_RT_OBJ_ARG" $TSAOT_REGEXP_OBJ_ARGS $TSAOT_UNICODE_OBJ_ARGS -I"$ROOT/runtime" -lm $TSAOT_FETCH_LDLIBS -o "$dir/prog" 2>&1 | grep -i error
   local aot
   aot=$("$dir/prog" 2>&1 | tr '\n' '|')

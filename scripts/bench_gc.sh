@@ -41,11 +41,16 @@ STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 
 # ランタイム 2 種（通常 / stats）。TSAOT_RT_OBJ は stats 側の差し替え（A/B 用）。
 RT_PLAIN="$W/rt_plain.o"
-if [ ! -f "$RT_PLAIN" ] || [ "$ROOT/runtime/ts_rt.c" -nt "$RT_PLAIN" ]; then
+if [ ! -f "$RT_PLAIN" ] ||
+   [ "$ROOT/runtime/ts_rt.c" -nt "$RT_PLAIN" ] ||
+   [ "$ROOT/runtime/ts_rt.h" -nt "$RT_PLAIN" ]; then
   cc -O2 -c runtime/ts_rt.c -Iruntime -o "$RT_PLAIN" || exit 1
 fi
 RT_STATS="${TSAOT_RT_OBJ:-$W/rt_stats.o}"
-if [ -z "${TSAOT_RT_OBJ:-}" ] && { [ ! -f "$RT_STATS" ] || [ "$ROOT/runtime/ts_rt.c" -nt "$RT_STATS" ]; }; then
+if [ -z "${TSAOT_RT_OBJ:-}" ] &&
+   { [ ! -f "$RT_STATS" ] ||
+     [ "$ROOT/runtime/ts_rt.c" -nt "$RT_STATS" ] ||
+     [ "$ROOT/runtime/ts_rt.h" -nt "$RT_STATS" ]; }; then
   cc -O2 -DTSAOT_RT_STATS -c runtime/ts_rt.c -Iruntime -o "$RT_STATS" || exit 1
 fi
 
@@ -55,9 +60,9 @@ stat_of() { # $1=stats stderr file  $2=sed regex → 値 or "-"
   sed -n -E "s/.*$2.*/\1/p" "$1" | head -1
 }
 
-printf "%-18s %8s %7s %6s %9s %10s %9s %12s %10s\n" \
-  "BENCH" "WALL_MS" "MINOR" "FULL" "PAUSE_MS" "MAXP_MS" "ALLOC_MB" "MAPF_PROBE" "ENV_MALLOC"
-printf -- "------------------------------------------------------------------------------------------------\n"
+printf "%-18s %8s %7s %6s %9s %10s %9s %12s %10s %12s %12s\n" \
+  "BENCH" "WALL_MS" "MINOR" "FULL" "PAUSE_MS" "MAXP_MS" "ALLOC_MB" "MAPF_PROBE" "ENV_MALLOC" "ROOT_PUSH" "FRAME_PUSH"
+printf -- "--------------------------------------------------------------------------------------------------------------------------\n"
 
 rows=""; fail=0
 for ts in benchmarks/gc/*.ts; do
@@ -74,7 +79,7 @@ for ts in benchmarks/gc/*.ts; do
   fi
   cc -O2 "$W/$name.c" "$RT_PLAIN" -Iruntime -lm -o "$W/$name" 2>"$W/$name.cc.err" \
     || { echo "$name: CC_FAIL"; head -2 "$W/$name.cc.err"; fail=1; continue; }
-  cc -O2 "$W/$name.c" "$RT_STATS" -Iruntime -lm -o "$W/${name}_stats" 2>/dev/null \
+  cc -O2 -DTSAOT_RT_STATS "$W/$name.c" "$RT_STATS" -Iruntime -lm -o "$W/${name}_stats" 2>/dev/null \
     || { echo "$name: CC_STATS_FAIL"; fail=1; continue; }
 
   # 1) wall（通常ビルド・best-of-N）
@@ -97,16 +102,18 @@ for ts in benchmarks/gc/*.ts; do
   alloc_b=$(stat_of "$serr" 'bytes=([0-9]+)')
   mapf=$(stat_of "$serr" 'map_find: calls=[0-9]+ avg_probe=([0-9.]+)')
   envm=$(stat_of "$serr" 'env_malloc=([0-9]+)')
+  rootp=$(stat_of "$serr" 'root_push=([0-9]+)')
+  framep=$(stat_of "$serr" 'frame_push=([0-9]+)')
   alloc_mb=$(awk "BEGIN{printf \"%.1f\", ${alloc_b:-0}/1e6}" 2>/dev/null || echo "-")
 
-  printf "%-18s %8s %7s %6s %9s %10s %9s %12s %10s\n" \
-    "$name" "$best" "${minor:--}" "${full:--}" "${pause:--}" "${maxp:--}" "$alloc_mb" "${mapf:--}" "${envm:--}"
+  printf "%-18s %8s %7s %6s %9s %10s %9s %12s %10s %12s %12s\n" \
+    "$name" "$best" "${minor:--}" "${full:--}" "${pause:--}" "${maxp:--}" "$alloc_mb" "${mapf:--}" "${envm:--}" "${rootp:--}" "${framep:--}"
   [ -n "$rows" ] && rows="$rows,"
   rows="$rows
-    {\"name\":\"$name\",\"wall_ms\":$best,\"minor\":${minor:-0},\"full\":${full:-0},\"pause_ms\":${pause:-0},\"max_pause_ms\":${maxp:-0},\"alloc_bytes\":${alloc_b:-0},\"map_find_avg_probe\":${mapf:-0},\"env_malloc\":${envm:-0}}"
+    {\"name\":\"$name\",\"wall_ms\":$best,\"minor\":${minor:-0},\"full\":${full:-0},\"pause_ms\":${pause:-0},\"max_pause_ms\":${maxp:-0},\"alloc_bytes\":${alloc_b:-0},\"map_find_avg_probe\":${mapf:-0},\"env_malloc\":${envm:-0},\"root_push\":${rootp:-0},\"frame_push\":${framep:-0}}"
 done
 
-printf -- "------------------------------------------------------------------------------------------------\n"
+printf -- "--------------------------------------------------------------------------------------------------------------------------\n"
 OUT="$HIST/${STAMP}_gc.json"
 cat > "$OUT" <<EOF
 {

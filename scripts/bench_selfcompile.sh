@@ -80,6 +80,9 @@ t_export=$(best_of export export_run) || exit 1
 ir_bytes=$(wc -c < "$W/self.ir.json" | tr -d ' ')
 
 # ---- emit: Rust ----
+# `rust.c` uses the production default and is the source compiled below.
+# A separate legacy emission remains the byte-parity oracle for the frozen TS
+# analyzer, which intentionally predates property PICs and shadow root frames.
 rust_run() { "$RUST" "$W/self.ir.json" emit > "$W/rust.c" 2>/dev/null; }
 t_rust=$(best_of emit-rust rust_run) || exit 1
 c_bytes=$(wc -c < "$W/rust.c" | tr -d ' ')
@@ -89,7 +92,9 @@ node_run() { node analyzer_ts/dist/main.js "$W/self.ir.json" emitc > "$W/node.c"
 t_node=$(best_of emit-node node_run) || exit 1
 
 # ---- parity（無料の回帰チェック）----
-if cmp -s "$W/rust.c" "$W/node.c"; then parity="identical"; else parity="**MISMATCH**"; fi
+TSAOT_PROP_PIC=0 TSAOT_FRAME_ROOTS=0 "$RUST" "$W/self.ir.json" emit > "$W/rust_legacy.c" 2>/dev/null \
+  || { echo "[selfcompile] FAIL: emit-rust-legacy" >&2; exit 1; }
+if cmp -s "$W/rust_legacy.c" "$W/node.c"; then parity="identical"; else parity="**MISMATCH**"; fi
 
 # ---- emit: native（任意・重い）----
 t_native="-"
@@ -108,7 +113,10 @@ if [ "$DO_CC" -eq 1 ]; then
   . "$ROOT/scripts/lib/mimalloc_flags.sh" 2>/dev/null || true
   . "$ROOT/scripts/lib/regexp_link_flags.sh" || exit 1
   RT_OBJ="$W/rt.o"
-  [ -f "$RT_OBJ" ] && [ ! "$ROOT/runtime/ts_rt.c" -nt "$RT_OBJ" ] || $CC -c runtime/ts_rt.c -Iruntime -o "$RT_OBJ" || exit 1
+  [ -f "$RT_OBJ" ] &&
+    [ ! "$ROOT/runtime/ts_rt.c" -nt "$RT_OBJ" ] &&
+    [ ! "$ROOT/runtime/ts_rt.h" -nt "$RT_OBJ" ] ||
+    $CC -c runtime/ts_rt.c -Iruntime -o "$RT_OBJ" || exit 1
   tsaot_prepare_regexp_objs "$W/rust.c" "$W" >/dev/null 2>&1
   tsaot_prepare_unicode_objs "$W/rust.c" "$W" >/dev/null 2>&1
   tsaot_prepare_fetch_runtime "$W/rust.c" "$W" "$RT_OBJ" >/dev/null 2>&1
