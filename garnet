@@ -13,7 +13,15 @@
 # Env:
 #   TSAOT_CC               C compiler+flags (default "cc -O2"; e.g. "gcc -O2").
 #   TSAOT_ANALYZER         rust (default) | ts (frozen twin) | native.
-#   TSAOT_USE_MIMALLOC=1   Route allocations through mimalloc (if installed).
+#   TSAOT_PROP_PIC=0       Disable production-default property PIC emission.
+#   TSAOT_FRAME_ROOTS=0    Disable production-default batched GC root frames.
+#   TSAOT_PRETENURE=0      Disable escape-guided old-generation allocation.
+#   TSAOT_GC_AGE_THRESHOLD=1  Disable the default one-minor aging grace at
+#                          application runtime (immediate first-survival promotion).
+#   TSAOT_GC_AGING_ADAPTIVE=0 Disable runtime survival feedback and use the
+#                          fixed aging threshold/capacity policy.
+#   TSAOT_USE_MIMALLOC=0   Use the libc allocator instead of the default
+#                          statically linked mimalloc allocator.
 #   TSAOT_ALLOW_UNSUPPORTED=1  Emit even with UNSUPPORTED constructs (unsafe).
 #   TSAOT_UNTYPED=1        Compile as `any` — all type-driven optimization off
 #                          (boxed, JS semantics; safe but slow). Same as --untyped.
@@ -42,7 +50,12 @@ usage: $PROG [-c | -S] [-o <out.c>] <input.ts>
   -h, --help    show this help
 
 env: TSAOT_CC (default "cc -O2"), TSAOT_ANALYZER=rust|ts|native (default rust),
-     TSAOT_USE_MIMALLOC=1, TSAOT_ALLOW_UNSUPPORTED=1, TSAOT_UNTYPED=1
+     TSAOT_PROP_PIC=0 or TSAOT_FRAME_ROOTS=0 for legacy diagnostic emission,
+     TSAOT_PRETENURE=0 to disable escape-guided pretenuring,
+     TSAOT_GC_AGE_THRESHOLD=1 for immediate promotion at application runtime,
+     TSAOT_GC_AGING_ADAPTIVE=0 for fixed-threshold aging at application runtime,
+     TSAOT_USE_MIMALLOC=0 to disable default static mimalloc,
+     TSAOT_ALLOW_UNSUPPORTED=1, TSAOT_UNTYPED=1
 EOF
 }
 
@@ -82,6 +95,13 @@ case "$input" in *.ts) ;; *) die "input must be a .ts file: $input" ;; esac
 EXPORTER="$ROOT/exporter/exporter.js"
 command -v node >/dev/null 2>&1 || die "node not found on PATH"
 [ -f "$EXPORTER" ] || die "exporter not built ($EXPORTER missing). Run: scripts/setup.sh"
+# Keep the production emitter configuration explicit at the public driver
+# boundary. The analyzer has matching defaults; these exports make the contract
+# visible and prevent an internal fallback change from silently disabling them.
+TSAOT_PROP_PIC="${TSAOT_PROP_PIC:-1}"
+TSAOT_FRAME_ROOTS="${TSAOT_FRAME_ROOTS:-1}"
+TSAOT_PRETENURE="${TSAOT_PRETENURE:-1}"
+export TSAOT_PROP_PIC TSAOT_FRAME_ROOTS TSAOT_PRETENURE
 # Analyzer selection (TSAOT_ANALYZER): the Rust analyzer is the main
 # implementation and the default since session 315 (roles inverted; flipped
 # here in s318 — the frozen analyzer_ts still carries silent-miscompile fixes
@@ -145,6 +165,11 @@ fi
 binary="${out_c%.c}"; [ "$binary" = "$out_c" ] && binary="$out_c.out"
 
 CC="${TSAOT_CC:-cc -O2}"
+# Native application builds use statically linked mimalloc by default. Keep
+# test harnesses independently selectable by setting the default here rather
+# than in the shared helper.
+TSAOT_USE_MIMALLOC="${TSAOT_USE_MIMALLOC:-1}"
+export TSAOT_USE_MIMALLOC
 # --rt-stats / --profile append flags; the cached runtime object gets a distinct
 # name per flag combination so variants never poison each other's cache.
 rt_suffix=""
@@ -153,9 +178,16 @@ if [ "$profile" -eq 1 ]; then CC="$CC -g -fno-omit-frame-pointer"; rt_suffix="${
 export ROOT CC
 . "$ROOT/scripts/lib/mimalloc_flags.sh" || die "failed to load mimalloc flags"
 . "$ROOT/scripts/lib/regexp_link_flags.sh" || die "failed to load regexp link flags"
+if [[ "${TSAOT_MIMALLOC_ACTIVE:-0}" == "1" ]]; then
+  rt_suffix="${rt_suffix}_mi"
+fi
+rt_cc_key="$(
+  printf '%s\n' "$CC|$(uname -s)|$(uname -m)" |
+    cksum | awk '{print $1}'
+)"
 
 # Base runtime object (also the default when the program does not need fetch).
-RT_OBJ="$ROOT/build/rt${rt_suffix}.o"
+RT_OBJ="$ROOT/build/rt${rt_suffix}_${rt_cc_key}.o"
 mkdir -p "$ROOT/build"
 if [ ! -f "$RT_OBJ" ] ||
    [ "$ROOT/runtime/ts_rt.c" -nt "$RT_OBJ" ] ||

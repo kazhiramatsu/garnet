@@ -39,7 +39,11 @@ docs/        design notes per component + ci_procedure.md + bench_results.md.
 
 ## Quick start
 
-Prerequisites: **Node.js** (with npm), **Rust** (cargo), and a **C compiler** (`cc` / `gcc` / clang).
+Prerequisites: **Node.js** (with npm), **Rust** (cargo), and a **C compiler**
+(`cc` / `gcc` / clang). Native application builds compile and statically link
+the repository-owned mimalloc source by default; no system mimalloc installation
+or target archiver is required. Set `TSAOT_USE_MIMALLOC=0` to build with the libc
+allocator instead.
 
 ```bash
 # 1. build everything in one shot: exporter deps + tsc, analyzer (cargo), runtime object
@@ -63,7 +67,32 @@ The `./garnet` driver runs the whole pipeline (exporter → analyzer → cc) in 
 ./garnet -S foo.ts           # write the generated C to stdout
 ./garnet --untyped foo.ts    # compile everything as `any` (JS semantics, no type-driven opt)
 ```
-Key env vars: `TSAOT_CC` (default `cc -O2`), `TSAOT_ANALYZER=rust|ts|native`; see `./garnet --help`.
+Key env vars: `TSAOT_CC` (default `cc -O2`),
+`TSAOT_ANALYZER=rust|ts|native`, and `TSAOT_USE_MIMALLOC=0` to opt out of the
+default statically linked allocator; see `./garnet --help`.
+
+### Production optimization defaults
+
+Normal `./garnet` builds use the measured production configuration:
+
+| Feature | Default | Diagnostic fallback |
+|---|---|---|
+| Rust typed analyzer and AOT specialization | on | `--untyped` |
+| Four-way property PICs | on | `TSAOT_PROP_PIC=0` |
+| Batched GC root frames | on | `TSAOT_FRAME_ROOTS=0` |
+| [Escape/lifetime-guided pretenuring](docs/pretenuring_design.md) for proven retained allocations | on | `TSAOT_PRETENURE=0` |
+| Generational moving minor GC and bump nursery | on | `TSAOT_DISABLE_MOVING_MINOR=1` or `TSAOT_GC_NURSERY=0` at application runtime |
+| [Adaptive one-minor aging grace](docs/adaptive_aging_design.md) | on | `TSAOT_GC_AGE_THRESHOLD=1` for immediate promotion |
+| Movable Promise and coroutine cells | on | `TSAOT_GC_MOVE_PROMISE=0` or `TSAOT_GC_MOVE_CORO=0` at application runtime |
+| Statically linked mimalloc | on | `TSAOT_USE_MIMALLOC=0` at build time |
+
+GC aging defaults to threshold 2 with runtime feedback. Survivor residency no
+longer shortens the next fresh-allocation interval, and cohorts whose aged bytes
+overwhelmingly promote temporarily fall back to immediate promotion. Set
+`TSAOT_GC_AGING_ADAPTIVE=0` for the fixed threshold policy or
+`TSAOT_GC_AGE_THRESHOLD=1` for the legacy immediate-promotion policy.
+`TSAOT_GC_ZAP` and `--rt-stats` likewise remain diagnostic-only to avoid adding
+work to production hot paths.
 
 Under the hood it is a three-stage pipeline you can also drive by hand:
 ```bash

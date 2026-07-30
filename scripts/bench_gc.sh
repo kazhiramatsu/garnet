@@ -60,9 +60,9 @@ stat_of() { # $1=stats stderr file  $2=sed regex → 値 or "-"
   sed -n -E "s/.*$2.*/\1/p" "$1" | head -1
 }
 
-printf "%-18s %8s %7s %6s %9s %10s %9s %12s %10s %10s %10s %10s %10s %12s %12s\n" \
-  "BENCH" "WALL_MS" "MINOR" "FULL" "PAUSE_MS" "MAXP_MS" "ALLOC_MB" "MAPF_PROBE" "SB_EXTEND" "SB_FRESH" "SB_FLAT" "SHORT" "ENV_MALLOC" "ROOT_PUSH" "FRAME_PUSH"
-printf -- "-----------------------------------------------------------------------------------------------------------------------------------------------------------------\n"
+printf "%-18s %8s %7s %6s %9s %10s %9s %9s %9s %9s %7s %12s %10s %10s %10s %10s %10s %12s %12s\n" \
+  "BENCH" "WALL_MS" "MINOR" "FULL" "PAUSE_MS" "MAXP_MS" "ALLOC_MB" "AGE_CP" "AGE_DIE" "AGE_PROM" "AGE_FB" "MAPF_PROBE" "SB_EXTEND" "SB_FRESH" "SB_FLAT" "SHORT" "ENV_MALLOC" "ROOT_PUSH" "FRAME_PUSH"
+printf -- "-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------\n"
 
 rows=""; fail=0
 for ts in benchmarks/gc/*.ts; do
@@ -108,16 +108,23 @@ for ts in benchmarks/gc/*.ts; do
   envm=$(stat_of "$serr" 'env_malloc=([0-9]+)')
   rootp=$(stat_of "$serr" 'root_push=([0-9]+)')
   framep=$(stat_of "$serr" 'frame_push=([0-9]+)')
+  agecopy=$(stat_of "$serr" 'aging: copied_bytes=([0-9]+)')
+  agedie=$(stat_of "$serr" 'died_bytes=([0-9]+)')
+  ageprom=$(stat_of "$serr" 'promoted_bytes=([0-9]+)')
+  agefb=$(stat_of "$serr" 'fallback_minors=([0-9]+)')
   alloc_mb=$(awk "BEGIN{printf \"%.1f\", ${alloc_b:-0}/1e6}" 2>/dev/null || echo "-")
+  agecopy_mb=$(awk "BEGIN{printf \"%.1f\", ${agecopy:-0}/1e6}" 2>/dev/null || echo "-")
+  agedie_mb=$(awk "BEGIN{printf \"%.1f\", ${agedie:-0}/1e6}" 2>/dev/null || echo "-")
+  ageprom_mb=$(awk "BEGIN{printf \"%.1f\", ${ageprom:-0}/1e6}" 2>/dev/null || echo "-")
 
-  printf "%-18s %8s %7s %6s %9s %10s %9s %12s %10s %10s %10s %10s %10s %12s %12s\n" \
-    "$name" "$best" "${minor:--}" "${full:--}" "${pause:--}" "${maxp:--}" "$alloc_mb" "${mapf:--}" "${sbext:--}" "${sbfresh:--}" "${sbflat:--}" "${short:--}" "${envm:--}" "${rootp:--}" "${framep:--}"
+  printf "%-18s %8s %7s %6s %9s %10s %9s %9s %9s %9s %7s %12s %10s %10s %10s %10s %10s %12s %12s\n" \
+    "$name" "$best" "${minor:--}" "${full:--}" "${pause:--}" "${maxp:--}" "$alloc_mb" "$agecopy_mb" "$agedie_mb" "$ageprom_mb" "${agefb:--}" "${mapf:--}" "${sbext:--}" "${sbfresh:--}" "${sbflat:--}" "${short:--}" "${envm:--}" "${rootp:--}" "${framep:--}"
   [ -n "$rows" ] && rows="$rows,"
   rows="$rows
-    {\"name\":\"$name\",\"wall_ms\":$best,\"minor\":${minor:-0},\"full\":${full:-0},\"pause_ms\":${pause:-0},\"max_pause_ms\":${maxp:-0},\"alloc_bytes\":${alloc_b:-0},\"map_find_avg_probe\":${mapf:-0},\"sb_extend\":${sbext:-0},\"sb_fresh\":${sbfresh:-0},\"sb_flat\":${sbflat:-0},\"short_string\":${short:-0},\"env_malloc\":${envm:-0},\"root_push\":${rootp:-0},\"frame_push\":${framep:-0}}"
+    {\"name\":\"$name\",\"wall_ms\":$best,\"minor\":${minor:-0},\"full\":${full:-0},\"pause_ms\":${pause:-0},\"max_pause_ms\":${maxp:-0},\"alloc_bytes\":${alloc_b:-0},\"aging_copied_bytes\":${agecopy:-0},\"aging_died_bytes\":${agedie:-0},\"aging_promoted_bytes\":${ageprom:-0},\"aging_fallback_minors\":${agefb:-0},\"map_find_avg_probe\":${mapf:-0},\"sb_extend\":${sbext:-0},\"sb_fresh\":${sbfresh:-0},\"sb_flat\":${sbflat:-0},\"short_string\":${short:-0},\"env_malloc\":${envm:-0},\"root_push\":${rootp:-0},\"frame_push\":${framep:-0}}"
 done
 
-printf -- "-----------------------------------------------------------------------------------------------------------------------------------------------------------------\n"
+printf -- "-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------\n"
 OUT="$HIST/${STAMP}_gc.json"
 cat > "$OUT" <<EOF
 {

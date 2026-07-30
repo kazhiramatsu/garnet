@@ -45,6 +45,11 @@ run() {  # run <name> <cmd...>
 negatives() {  # the negative + golden + fetch + runtime/unit suite (ci_fast minus rebuild)
   local rc=0
   bash "$S/run_runtime_tests.sh"            || rc=1
+  bash "$ROOT/tests/mimalloc_static_link_gate.sh" || rc=1
+  bash "$ROOT/tests/default_optimizations_gate.sh" || rc=1
+  bash "$ROOT/tests/pretenure_aot_gate.sh" || rc=1
+  bash "$ROOT/tests/gc_aging_promotion_gate.sh" || rc=1
+  bash "$ROOT/tests/gc_adaptive_aging_gate.sh" || rc=1
   bash "$S/run_unit_tests.sh"               || rc=1
   bash "$S/run_golden_iter.sh"              || rc=1
   bash "$S/run_fetch_test.sh"               || rc=1

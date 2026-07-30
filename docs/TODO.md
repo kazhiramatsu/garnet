@@ -3382,3 +3382,103 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   ASan, and 64 MiB O2/ASan scale; runtime/analyzer units; benchmark **101/101**;
   frozen parity **333 identical + 15 KNOWN, DIFF=0, UNPORTED=0**; self-conformance
   **346 PASS + 2 KNOWN, DIFF=0, CCFAIL=0, UNPORTED=0**; and `ci_fast`.
+
+### Session 327 DONE: default static mimalloc for native application builds
+
+- `garnet` now enables mimalloc by default and accepts
+  `TSAOT_USE_MIMALLOC=0` as the explicit libc allocator opt-out.
+- Automatic external mimalloc discovery requires `libmimalloc.a` and passes its
+  absolute path to the linker. It no longer uses `-lmimalloc`, which could
+  silently select a shared library installed beside the archive.
+- The runtime object cache suffix includes `_mi`, preventing libc and mimalloc
+  variants from reusing an object compiled with different allocator macros.
+- `tests/mimalloc_static_link_gate.sh` builds the vendored target object and
+  verifies that discovery and linkage do not introduce a mimalloc DSO
+  dependency.
+- Follow-up: vendored the pinned upstream mimalloc v3.3.2 source subset under
+  `third_party/mimalloc`. The shared helper now builds upstream `src/static.c`
+  into a compiler/platform-keyed object under `build/mimalloc`, with source
+  mtime invalidation and atomic replacement. Function/data sections plus
+  platform dead-section elimination keep the final binary at the same size as
+  the previously installed fine-grained static archive. Native builds no longer
+  require a system mimalloc installation; explicit prefix/library overrides
+  remain available for allocator experiments. Direct object linkage avoids a
+  target-aware archiver dependency during cross-compilation.
+  `scripts/setup.sh` also prepares the vendored object and
+  allocator/compiler-specific runtime object by default. The `garnet` runtime
+  cache now carries the same compiler key, so native and cross-compiled objects
+  cannot alias.
+
+### Session 328 DONE: lock the measured production optimizations on by default
+
+- Audited all runtime and emitter feature switches. Property PICs, batched root
+  frames, the generational moving minor collector, the bump nursery, and movable
+  Promise/coroutine cells were already default-on in their implementation.
+  `garnet` now explicitly exports the PIC and root-frame defaults at its public
+  driver boundary so an internal analyzer fallback cannot silently change the
+  production configuration.
+- `tests/default_optimizations_gate.sh` builds through the public driver with an
+  empty environment override set, verifies emitted PIC/root-frame code, executes
+  with runtime statistics, and requires PIC hits, frame pushes, minor
+  collections, nursery allocations, and vendored mimalloc selection. Both fast
+  and parallel CI run the gate.
+- Kept GC aging at threshold 1 intentionally. The completed C0 audit established
+  correctness at threshold 2, but its recorded A/B included an approximately
+  33% allocation-heavy regression. ZAP, runtime statistics, forced collection,
+  and collection-at-exit also remain diagnostic-only because enabling them adds
+  work rather than production performance.
+
+### Session 329: escape-guided pretenuring and aging regression coverage
+
+- Added `pretenure_sites` to the production escape result. The lifetime
+  classifier recognizes single-shot global allocations in `__module_init`,
+  loop-carried retained chains, and fresh values appended to an outer
+  container. Indexed replacement/ring buffers and plain loop-carried
+  overwrites are explicit negative cases.
+- Added old-generation direct constructors for plain/sized objects, arrays,
+  closures, and function prototypes. Initial prototype/capture stores and all
+  later property/element stores use the normal old-to-young write barrier.
+  `TSAOT_PRETENURE=0` is the diagnostic A/B fallback; the public driver enables
+  pretenuring by default.
+- Added runtime young/full collection tests, an AOT gate for default/disabled
+  emission and output identity, production-IR assertions for retained-chain
+  inclusion and ring-buffer exclusion, and analyzer unit coverage for
+  inclusion/exclusion rules.
+- Codified the aging promotion-barrier failure as a three-minor conformance
+  regression. The gate deliberately disables pretenuring so a young parent
+  promotes before its younger child, and it runs in both normal and ASan GC
+  stress configurations.
+- Threshold-2 A/B on `gc_deep_chain`: pretenuring reduced minor collections
+  **15 → 3** and best-of-seven wall time **35 → 22 ms** (about 37% faster).
+  `gc_survivors` remained nursery-allocated and neutral (**104 vs 103 ms**,
+  both 32 minor / 13 full). Design and safety boundaries are recorded in
+  `docs/pretenuring_design.md`.
+
+### Session 330: adaptive aging — bounded fallback for unknown medium lifetimes
+
+- Split nursery accounting into physical residency, fresh allocation bytes,
+  and survivor bytes. Adaptive mode triggers minors from fresh allocation only,
+  so to-space survivors no longer halve the next allocation interval. Survivor
+  copying remains bounded to half a nursery (normal physical bound about 1.5×,
+  excluding separately retained pinned chunks).
+- Added outcome feedback without enlarging GC headers: the existing young
+  `remembered` byte identifies aged cells, allowing copied/died/promoted/forced
+  byte accounting. A half-nursery observation window whose resolved aged bytes
+  are at least 80% promoted activates immediate promotion for eight minors,
+  then retries aging. Fallback outcomes do not bias the retry.
+- Tightened remembered-set work during fallback: old-to-young writes use one
+  scan credit, and the promotion-barrier walk is skipped when no ordinary or
+  pinned young survivor remains. The barrier still runs whenever generation
+  splitting is possible.
+- Threshold 2 plus adaptive feedback is now the runtime default.
+  `TSAOT_GC_AGE_THRESHOLD=1` restores unconditional immediate promotion;
+  `TSAOT_GC_AGING_ADAPTIVE=0` restores fixed-threshold/shared-capacity behavior
+  for exact A/B diagnosis.
+- Boundary measurements: `gc_survivors` fixed threshold 2 **104 ms, 32/13
+  minor/full** → adaptive **92 ms, 17/13**, versus immediate promotion **90 ms,
+  17/13**. `gc_binarytrees` immediate **70 ms, 6 full** / fixed threshold 2
+  **66 ms, 1 full** / adaptive **64 ms, 2 full**. Thus the former throughput
+  cliff becomes a small sampling cost while the short-lived benefit remains.
+- Added `docs/adaptive_aging_design.md`, runtime-stat counters, a default-policy
+  assertion, and `tests/gc_adaptive_aging_gate.sh`. Fast/parallel CI and GC
+  stress run the policy gate; GC stress also runs its ASan variant.

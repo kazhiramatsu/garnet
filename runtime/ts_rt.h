@@ -794,7 +794,9 @@ typedef struct ts_func {
 
 /* runtime API */
 tsv  ts_new_object(void);
+tsv  ts_new_object_pretenured(void);
 tsv  ts_new_proto(void);   /* a plain object used as a class prototype */
+tsv  ts_new_proto_pretenured(void);
 tsv  ts_object_proto(void);
 void ts_install_object_proto(tsv proto);
 void ts_global_this_init(void);
@@ -858,6 +860,7 @@ tsv  ts_function_proto(void);
 void ts_function_proto_init(void);
 void ts_function_proto_register(ts_key method_key, const char* name, ts_code fn);
 tsv  ts_make_fn_t(ts_code code, tsv* env, uint32_t envlen, int takes_this);
+tsv  ts_make_fn_t_pretenured(ts_code code, tsv* env, uint32_t envlen, int takes_this);
 tsv ts_funcproto_call(tsv* args, int n);
 tsv ts_funcproto_apply(tsv* args, int n);
 tsv ts_funcproto_bind(tsv* args, int n);
@@ -967,8 +970,10 @@ tsv  ts_call_value(tsv fn, tsv* args, int nargs);         /* value/callback call
 tsv  ts_call_method(tsv fn, tsv* args, int nargs);        /* method dispatch (args[0]=this); drops receiver if callee lacks takes_this */
 int  ts_is_callable(tsv v);
 tsv  ts_new_sized(size_t size);
+tsv  ts_new_sized_pretenured(size_t size);
 /* dense arrays */
 tsv  ts_new_array(uint32_t len);    /* length-len array, elements undefined */
+tsv  ts_new_array_pretenured(uint32_t len);
 tsv  ts_array_get(tsv arr, uint32_t i);
 void ts_array_set(tsv arr, uint32_t i, tsv v);
 void ts_array_push(tsv arr, tsv v);

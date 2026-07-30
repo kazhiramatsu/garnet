@@ -18,6 +18,8 @@ RUN_MOVE_CORO="${TSAOT_GC_STRESS_MOVE_CORO:-0}"
 RUN_MOVE_PROMISE="${TSAOT_GC_STRESS_MOVE_PROMISE:-0}"
 RUN_MOVE_BOTH="${TSAOT_GC_STRESS_MOVE_BOTH:-0}"
 RUN_STRING_SCALE="${TSAOT_GC_STRESS_STRING_SCALE:-1}"
+RUN_AGING_PROMOTION="${TSAOT_GC_STRESS_AGING_PROMOTION:-1}"
+RUN_ADAPTIVE_AGING="${TSAOT_GC_STRESS_ADAPTIVE_AGING:-1}"
 
 FILTER='frame_roots_(unwind|edge_cases)|object_reflection_safepoints|string_runtime_safepoints|concat_growth|handle_identity|moving_minor_promise_coro_stress|json_runtime_safepoints|lower_level_runtime_safepoints|promise_coro_handle_edges|promise_movable_experimental|coro_entry_safepoints|coro_movable_experimental|array_callback_safepoints|generational_remembered_set|map_set_callback_safepoints|moving_minor_relocation|prototype_handle_edges|typed_class_allocation_safepoints|computed_member_names|extends_same_name_scopes'
 
@@ -39,6 +41,24 @@ if [[ "$RUN_BASE" != "0" ]]; then
     echo ">>> runtime unit tests (ASan)"
     TSAOT_GC_YOUNG_THRESHOLD="$THRESHOLD" TSAOT_CC="$ASAN_CC" \
       bash "$S/run_runtime_tests.sh" || rc=1
+  fi
+fi
+
+if [[ "$RUN_AGING_PROMOTION" != "0" ]]; then
+  echo ">>> aging promotion barrier (threshold=2, normal O2)"
+  bash "$ROOT/tests/gc_aging_promotion_gate.sh" || rc=1
+  if [[ "$RUN_ASAN" != "0" ]]; then
+    echo ">>> aging promotion barrier (threshold=2, ASan)"
+    TSAOT_CC="$ASAN_CC" bash "$ROOT/tests/gc_aging_promotion_gate.sh" || rc=1
+  fi
+fi
+
+if [[ "$RUN_ADAPTIVE_AGING" != "0" ]]; then
+  echo ">>> adaptive aging survivor pressure (normal O2)"
+  bash "$ROOT/tests/gc_adaptive_aging_gate.sh" || rc=1
+  if [[ "$RUN_ASAN" != "0" ]]; then
+    echo ">>> adaptive aging survivor pressure (ASan)"
+    TSAOT_CC="$ASAN_CC" bash "$ROOT/tests/gc_adaptive_aging_gate.sh" || rc=1
   fi
 fi
 

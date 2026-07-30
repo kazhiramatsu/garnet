@@ -9,6 +9,7 @@ echo "=== tsaot CI [fast: build + unit + negative] ==="
 echo ">>> build analyzer (release)"
 (cd "$ROOT/analyzer" && cargo build --release --quiet) || { echo "analyzer build FAILED"; exit 1; }
 echo ">>> runtime unit tests";  bash "$S/run_runtime_tests.sh" || rc=1
+echo ">>> static mimalloc link flags"; bash "$ROOT/tests/mimalloc_static_link_gate.sh" || rc=1
 echo ">>> analyzer unit-test suites"; bash "$S/run_unit_tests.sh" || rc=1
 # exporter build (needed by negative tests)
 if [[ -d "$ROOT/exporter/node_modules" ]]; then
@@ -16,6 +17,10 @@ if [[ -d "$ROOT/exporter/node_modules" ]]; then
      --module commonjs --target es2020 --skipLibCheck --moduleResolution node --esModuleInterop) \
      || { echo "exporter build FAILED"; rc=1; }
 fi
+echo ">>> production optimization defaults"; bash "$ROOT/tests/default_optimizations_gate.sh" || rc=1
+echo ">>> escape-guided pretenuring"; bash "$ROOT/tests/pretenure_aot_gate.sh" || rc=1
+echo ">>> GC aging promotion barrier"; bash "$ROOT/tests/gc_aging_promotion_gate.sh" || rc=1
+echo ">>> adaptive GC aging"; bash "$ROOT/tests/gc_adaptive_aging_gate.sh" || rc=1
 echo ">>> golden iteration tests"
 bash "$ROOT/scripts/run_golden_iter.sh" || rc=1
 echo ">>> fetch / HTTPS transport (compile+link)"

@@ -7,7 +7,8 @@
 //!     NoEscape     → (determinable ∧ Once) ? Stack(scalar-replaceable)
 //!                                           : FrameArena   // freed at return
 //!     ArgEscape    → CallerArena            // caller-provided storage, else heap
-//!     GlobalEscape → Heap
+//!     retained     → PretenuredHeap          // skips nursery evacuation
+//!     GlobalEscape → Heap                    // unless retained above
 //!
 //! NoEscape alone already licenses a frame-local arena (sound: no reference
 //! survives the frame). Layout-determinability ∧ multiplicity=Once promote the
@@ -31,6 +32,9 @@ pub enum AllocStrategy {
     CallerArena,
     /// General heap (GC / malloc).
     Heap,
+    /// Old-generation heap. Reserved for escape/lifetime-proven retained
+    /// allocations: single-shot module roots and structural loop accumulators.
+    PretenuredHeap,
 }
 
 impl AllocStrategy {
@@ -40,6 +44,7 @@ impl AllocStrategy {
             AllocStrategy::FrameArena => "frameArena",
             AllocStrategy::CallerArena => "callerArena",
             AllocStrategy::Heap => "heap",
+            AllocStrategy::PretenuredHeap => "pretenuredHeap",
         }
     }
 }
@@ -55,7 +60,22 @@ pub struct SiteDecision {
 /// Decide a strategy for every site in the escape result, using per-site
 /// codegen metadata when available. Missing metadata is treated conservatively
 /// (Many + not-determinable ⇒ at best a frame arena), which stays sound.
+fn pretenure_enabled() -> bool {
+    !matches!(
+        std::env::var("TSAOT_PRETENURE").as_deref(),
+        Ok("0") | Ok("false") | Ok("no") | Ok("off")
+    )
+}
+
 pub fn decide(program: &Program, result: &EscapeResult) -> Vec<SiteDecision> {
+    decide_with_pretenure(program, result, pretenure_enabled())
+}
+
+pub fn decide_with_pretenure(
+    program: &Program,
+    result: &EscapeResult,
+    enable_pretenure: bool,
+) -> Vec<SiteDecision> {
     let meta: BTreeMap<u32, &SiteMeta> = program.site_meta.iter().map(|m| (m.site.0, m)).collect();
 
     result
@@ -67,38 +87,66 @@ pub fn decide(program: &Program, result: &EscapeResult) -> Vec<SiteDecision> {
             let once = matches!(m.map(|m| m.multiplicity), Some(Multiplicity::Once));
 
             let contained = result.contained_sites.contains(&se.site.0);
-            let (strategy, reason) = match se.state {
-                EscapeState::NoEscape => {
-                    if determinable && (once || !contained) {
-                        // NoEscape + determinable -> stack. For loop-body sites
-                        // (multiplicity Many) the C local is emitted inside the
-                        // loop scope — sound ONLY if no reference outlives the
-                        // iteration. A NoEscape value stored into a container
-                        // (contained) can be retained across iterations while
-                        // the C slot is reused, so those must not go to stack
-                        // (s316 silent-miscompile: arr.push(new C()) collapsed
-                        // every element onto one reused stack cell).
-                        (AllocStrategy::Stack, if once {
-                            "no-escape + determinable + single-shot: stack slot / scalar-replace"
+            let pretenured =
+                enable_pretenure && result.pretenure_sites.contains(&se.site.0);
+            let (strategy, reason) = if pretenured {
+                (
+                    AllocStrategy::PretenuredHeap,
+                    "escape/lifetime analysis: retained allocation bypasses the nursery",
+                )
+            } else {
+                match se.state {
+                    EscapeState::NoEscape => {
+                        if determinable && (once || !contained) {
+                            // NoEscape + determinable -> stack. For loop-body sites
+                            // (multiplicity Many) the C local is emitted inside the
+                            // loop scope — sound ONLY if no reference outlives the
+                            // iteration. A NoEscape value stored into a container
+                            // (contained) can be retained across iterations while
+                            // the C slot is reused, so those must not go to stack
+                            // (s316 silent-miscompile: arr.push(new C()) collapsed
+                            // every element onto one reused stack cell).
+                            (
+                                AllocStrategy::Stack,
+                                if once {
+                                    "no-escape + determinable + single-shot: stack slot / scalar-replace"
+                                } else {
+                                    "no-escape + determinable, loop-body, uncontained: per-iteration stack slot"
+                                },
+                            )
+                        } else if determinable {
+                            (
+                                AllocStrategy::FrameArena,
+                                "no-escape but loop-contained: value may outlive the iteration",
+                            )
+                        } else if !once {
+                            (
+                                AllocStrategy::FrameArena,
+                                "no-escape but layout not determinable, loop: frame arena",
+                            )
                         } else {
-                            "no-escape + determinable, loop-body, uncontained: per-iteration stack slot"
-                        })
-                    } else if determinable {
-                        (AllocStrategy::FrameArena, "no-escape but loop-contained: value may outlive the iteration")
-                    } else if !once {
-                        (AllocStrategy::FrameArena, "no-escape but layout not determinable, loop: frame arena")
-                    } else {
-                        (AllocStrategy::FrameArena, "no-escape but layout not determinable: frame arena")
+                            (
+                                AllocStrategy::FrameArena,
+                                "no-escape but layout not determinable: frame arena",
+                            )
+                        }
                     }
-                }
-                EscapeState::ArgEscape => {
-                    (AllocStrategy::CallerArena, "escapes via args/return only: caller-provided storage, else heap")
-                }
-                EscapeState::GlobalEscape => {
-                    (AllocStrategy::Heap, "escapes to a global/heap root: heap")
+                    EscapeState::ArgEscape => (
+                        AllocStrategy::CallerArena,
+                        "escapes via args/return only: caller-provided storage, else heap",
+                    ),
+                    EscapeState::GlobalEscape => (
+                        AllocStrategy::Heap,
+                        "escapes to a global/heap root: heap",
+                    ),
                 }
             };
-            SiteDecision { site: se.site, state: se.state, strategy, reason }
+            SiteDecision {
+                site: se.site,
+                state: se.state,
+                strategy,
+                reason,
+            }
         })
         .collect()
 }
@@ -119,6 +167,7 @@ pub struct Stats {
     pub frame_arena: usize,
     pub caller_arena: usize,
     pub heap: usize,
+    pub pretenured_heap: usize,
 }
 
 #[derive(Serialize)]
@@ -146,6 +195,7 @@ pub fn report(program: &Program, result: &EscapeResult) -> DecisionReport {
             AllocStrategy::FrameArena => stats.frame_arena += 1,
             AllocStrategy::CallerArena => stats.caller_arena += 1,
             AllocStrategy::Heap => stats.heap += 1,
+            AllocStrategy::PretenuredHeap => stats.pretenured_heap += 1,
         }
         sites.push(DecisionDto {
             site: d.site.0,

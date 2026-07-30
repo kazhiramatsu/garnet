@@ -126,5 +126,77 @@ fn main() {
     let r = analyze_program(&prog(vec![f]));
     ck("nonexported-return", st(&r,100), ArgEscape);
 
+    // A loop-carried retained chain is a long-lived candidate even though it
+    // remains NoEscape at function granularity. The fresh node stores the
+    // previous carrier and then replaces it; every iteration remains reachable.
+    let link = func(0, vec![0,1], 2, false, vec![
+        StoreField{obj:LocalId(0), field:FieldId(0), src:LocalId(1)},
+    ]);
+    let chain = func(1, vec![], 3, false, vec![
+        AllocObject {dst:LocalId(0), type_id:TypeId(0), site:SiteId(199), class_id:None, proto:None},
+        Loop {
+            cond:LocalId(2), cond_body:vec![],
+            body:vec![
+                AllocObject {dst:LocalId(1), type_id:TypeId(0), site:SiteId(200), class_id:None, proto:None},
+                Call {dst:None, callee:CalleeRef::Direct{func:FunctionId(0)},
+                    recv:Some(LocalId(1)), args:vec![LocalId(0)], resolved_sig:None},
+                Copy {dst:LocalId(0), src:LocalId(1)},
+            ],
+        },
+    ]);
+    let r = analyze_program(&prog(vec![link, chain]));
+    ck("retained-chain escape state", st(&r,200), NoEscape);
+    assert!(r.pretenure_sites.contains(&200), "retained chain should pretenure");
+    assert!(!r.pretenure_sites.contains(&199), "single seed should stay ordinary");
+    println!("[retained-chain pretenure] PASS");
+
+    // Appending fresh values to an outer container retains every iteration.
+    let append = func(0, vec![], 3, false, vec![
+        AllocArray {dst:LocalId(0), elem_type:TypeId(0), site:SiteId(299)},
+        Loop {
+            cond:LocalId(2), cond_body:vec![],
+            body:vec![
+                AllocObject {dst:LocalId(1), type_id:TypeId(0), site:SiteId(300), class_id:None, proto:None},
+                ArrayPush {arr:LocalId(0), src:LocalId(1)},
+            ],
+        },
+    ]);
+    let r = analyze_program(&prog(vec![append]));
+    assert!(r.pretenure_sites.contains(&300), "append-only accumulation should pretenure");
+    assert!(!r.pretenure_sites.contains(&299), "outer container should stay ordinary");
+    println!("[append-only pretenure] PASS");
+
+    // Indexed replacement is commonly a bounded ring buffer. It does not
+    // retain every iteration and must not be mistaken for append-only growth.
+    let ring = func(0, vec![], 4, false, vec![
+        AllocArray {dst:LocalId(0), elem_type:TypeId(0), site:SiteId(399)},
+        Loop {
+            cond:LocalId(3), cond_body:vec![],
+            body:vec![
+                AllocObject {dst:LocalId(1), type_id:TypeId(0), site:SiteId(400), class_id:None, proto:None},
+                StoreIndex {arr:LocalId(0), index:LocalId(2), src:LocalId(1)},
+            ],
+        },
+    ]);
+    let r = analyze_program(&prog(vec![ring]));
+    assert!(!r.pretenure_sites.contains(&400), "ring-buffer replacement must stay nursery-allocated");
+    println!("[ring-buffer pretenure exclusion] PASS");
+
+    // A loop-carried variable alone is not evidence of retention: without an
+    // edge from the fresh value to the previous carrier, the old value dies.
+    let overwrite = func(0, vec![], 3, false, vec![
+        AllocObject {dst:LocalId(0), type_id:TypeId(0), site:SiteId(499), class_id:None, proto:None},
+        Loop {
+            cond:LocalId(2), cond_body:vec![],
+            body:vec![
+                AllocObject {dst:LocalId(1), type_id:TypeId(0), site:SiteId(500), class_id:None, proto:None},
+                Copy {dst:LocalId(0), src:LocalId(1)},
+            ],
+        },
+    ]);
+    let r = analyze_program(&prog(vec![overwrite]));
+    assert!(!r.pretenure_sites.contains(&500), "plain overwrite must stay nursery-allocated");
+    println!("[plain-overwrite pretenure exclusion] PASS");
+
     println!("\nAll P3 interprocedural scenarios passed.");
 }

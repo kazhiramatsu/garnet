@@ -13637,30 +13637,75 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         let _ = writeln!(s, "  {} sobj{} = {{0}}; sobj{}.header.h.kind=TS_KIND_OBJECT; sobj{}.header.h.mark=0; sobj{}.header.h.gen=2; sobj{}.header.h.remembered=0; sobj{}.header.h.handle=0; sobj{}.header.h.size=sizeof({}); sobj{}.header.proto={}; sobj{}.header.props=0; sobj{}.header.cap=0; sobj{}.header.len=0; sobj{}.header.shape={};", cn, dst.0, dst.0, dst.0, dst.0, dst.0, dst.0, dst.0, cn, dst.0, proto_expr, dst.0, dst.0, dst.0, dst.0, shape);
                         let _ = writeln!(s, "  {} = ts_obj(&sobj{});", dst_name, dst.0);
                     } else {
-                        let _ = writeln!(s, "  {} = ts_new_sized(sizeof({}));", dst_name, cn);
+                        let alloc = if st == AllocStrategy::PretenuredHeap {
+                            "ts_new_sized_pretenured"
+                        } else {
+                            "ts_new_sized"
+                        };
+                        let _ = writeln!(s, "  {} = {}(sizeof({}));", dst_name, alloc, cn);
                         let _ =
                             writeln!(s, "  {}* hobj{} = ({}*)ts_ptr({});", cn, dst.0, cn, dst_name);
                         let _ = writeln!(s, "  hobj{}->header.proto={}; hobj{}->header.props=0; hobj{}->header.cap=0; hobj{}->header.len=0;", dst.0, proto_expr, dst.0, dst.0, dst.0);
+                        if st == AllocStrategy::PretenuredHeap {
+                            let _ = writeln!(s, "  ts_write_barrier({}, {});", dst_name, proto_expr);
+                        }
                     }
                 }
                 None => {
+                    let alloc = if st == AllocStrategy::PretenuredHeap {
+                        "ts_new_object_pretenured"
+                    } else {
+                        "ts_new_object"
+                    };
                     let _ = writeln!(
                         s,
-                        "  {} = ts_new_object(); /* site {} {:?} */",
-                        ctx.vname(dst.0), site.0, st
+                        "  {} = {}(); /* site {} {:?} */",
+                        ctx.vname(dst.0), alloc, site.0, st
                     );
                 }
             }
         }
-        Inst::AllocArray { dst, .. } => {
-            let _ = writeln!(s, "  {} = ts_new_array(0);", ctx.vname(dst.0));
+        Inst::AllocArray { dst, site, .. } => {
+            let st = ctx
+                .strat
+                .get(&site.0)
+                .copied()
+                .unwrap_or(AllocStrategy::Heap);
+            let alloc = if st == AllocStrategy::PretenuredHeap {
+                "ts_new_array_pretenured"
+            } else {
+                "ts_new_array"
+            };
+            let _ = writeln!(
+                s,
+                "  {} = {}(0); /* site {} {:?} */",
+                ctx.vname(dst.0),
+                alloc,
+                site.0,
+                st
+            );
         }
         Inst::AllocClosure {
             dst,
             func,
             captures,
-            ..
+            site,
         } => {
+            let st = ctx
+                .strat
+                .get(&site.0)
+                .copied()
+                .unwrap_or(AllocStrategy::Heap);
+            let make_fn = if st == AllocStrategy::PretenuredHeap {
+                "ts_make_fn_t_pretenured"
+            } else {
+                "ts_make_fn_t"
+            };
+            let make_proto = if st == AllocStrategy::PretenuredHeap {
+                "ts_new_proto_pretenured"
+            } else {
+                "ts_new_proto"
+            };
             let fname = ctx.fn_name_of(func.0);
             let tt = if *ctx.fn_takes_this.get(&func.0).unwrap_or(&false) {
                 1
@@ -13669,10 +13714,19 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             };
             let dst_name = ctx.vname(dst.0);
             let set_meta = format!(
-                "  ts_set_fn_meta({0}, FN_ARITY[{1}], FN_NAME[{1}]);\n  if (FN_HAS_PROTOTYPE[{1}]) ts_set_fn_prototype({0}, ts_new_proto());\n",
-                dst_name, func.0);
+                "  ts_set_fn_meta({0}, FN_ARITY[{1}], FN_NAME[{1}]);\n  if (FN_HAS_PROTOTYPE[{1}]) ts_set_fn_prototype({0}, {2}());\n",
+                dst_name, func.0, make_proto);
             if captures.is_empty() {
-                let _ = writeln!(s, "  {} = ts_make_fn_t({}, 0, 0, {});", dst_name, fname, tt);
+                let _ = writeln!(
+                    s,
+                    "  {} = {}({}, 0, 0, {}); /* site {} {:?} */",
+                    dst_name,
+                    make_fn,
+                    fname,
+                    tt,
+                    site.0,
+                    st
+                );
                 s.push_str(&set_meta);
             } else {
                 // Build the captured-cell environment (capture order matches the
@@ -13683,11 +13737,14 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 }
                 let _ = writeln!(
                     s,
-                    "    {} = ts_make_fn_t({}, _env, {}, {});",
+                    "    {} = {}({}, _env, {}, {}); /* site {} {:?} */",
                     dst_name,
+                    make_fn,
                     fname,
                     captures.len(),
-                    tt
+                    tt,
+                    site.0,
+                    st
                 );
                 s.push_str("  }\n");
                 s.push_str(&set_meta);

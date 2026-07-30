@@ -985,6 +985,14 @@ pub struct EscapeResult {
     /// serde(skip): 凍結 analyzer_ts と diff する escape ダンプの形式は変えない。
     #[serde(skip, default)]
     pub contained_sites: std::collections::BTreeSet<u32>,
+    /// Escape/lifetime-proven old-generation candidates. This stays out of the
+    /// serialized frozen-analyzer parity format; the production code generator
+    /// consumes it in-process. Candidates are deliberately narrow:
+    /// single-shot GlobalEscape sites in `__module_init`, plus loop allocation
+    /// sites whose values form a retained chain or are appended to an
+    /// outer-lifetime container.
+    #[serde(skip, default)]
+    pub pretenure_sites: std::collections::BTreeSet<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -373,6 +373,38 @@ int main(){
   ts_frame_pop(&root_frame.h);
   CK("frame pop restores top", g_ts_frame_top==frame_before);
 
+  /* Escape-guided pretenuring starts cells in old gen. Initial and subsequent
+     young references must still participate in the remembered set. */
+  tsv pre_owner=ts_new_object_pretenured(); ts_gc_root(&pre_owner);
+  CK("pretenured object starts old",
+     ((ts_gc_header*)ts_ptr(pre_owner))->gen==TS_GEN_OLD);
+  tsv pre_child=ts_new_object();
+  ts_set(pre_child,481001u,ts_num(82));
+  ts_set(pre_owner,481002u,pre_child);
+  CK("pretenured object barrier armed",
+     ((ts_gc_header*)ts_ptr(pre_owner))->remembered!=0);
+  ts_gc_collect_young();
+  CK("pretenured object keeps young child",
+     ts_to_num(ts_get(ts_get(pre_owner,481002u),481001u))==82);
+  ts_gc_collect();
+  CK("pretenured object survives full",
+     ts_to_num(ts_get(ts_get(pre_owner,481002u),481001u))==82);
+  ts_gc_unroot(1);
+
+  tsv pre_capture=ts_new_object(); ts_gc_root(&pre_capture);
+  ts_set(pre_capture,482001u,ts_num(83));
+  tsv pre_env[1]={pre_capture};
+  tsv pre_fn=ts_make_fn_t_pretenured(fetch_error_catch,pre_env,1,0);
+  ts_gc_root(&pre_fn);
+  ts_gc_unroot(1);
+  CK("pretenured closure starts old",
+     ((ts_gc_header*)ts_ptr(pre_fn))->gen==TS_GEN_OLD);
+  ts_gc_collect_young();
+  tsv pre_capture_after=((ts_func*)ts_ptr(pre_fn))->env[0];
+  CK("pretenured closure keeps young capture",
+     ts_to_num(ts_get(pre_capture_after,482001u))==83);
+  ts_gc_unroot(1);
+
   /* longjmp must unlink every frame pushed after the handler snapshot. */
   tsv frame_exception=ts_new_object(); ts_gc_root(&frame_exception);
   ts_set(frame_exception,490001u,ts_num(91));

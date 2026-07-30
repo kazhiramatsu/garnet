@@ -1,6 +1,6 @@
 mod escape_ir; mod call_graph; mod interproc; mod codegen;
 use escape_ir::*;
-use codegen::{decide, AllocStrategy};
+use codegen::{decide, decide_with_pretenure, AllocStrategy};
 
 fn meta(site: u32, m: Multiplicity, det: bool, k: AllocKind) -> SiteMeta {
     SiteMeta { site: SiteId(site), multiplicity: m, layout_determinable: det, kind: k }
@@ -10,11 +10,27 @@ fn prog(metas: Vec<SiteMeta>) -> Program {
         scopes:vec![], bindings:vec![], functions:vec![], exports:vec![], site_meta: metas, classes: vec![], object_proto_methods: vec![], array_proto_methods: vec![], promise_proto_methods: vec![], map_proto_methods: vec![], set_proto_methods: vec![], headers_proto_methods: vec![], function_proto_methods: vec![], string_proto_methods: vec![], regexp_proto_methods: vec![], number_proto_methods: vec![], boolean_proto_methods: vec![], well_known_symbols: vec![] }
 }
 fn res(pairs: &[(u32, EscapeState)]) -> EscapeResult {
-    EscapeResult { version:1, sites: pairs.iter().map(|(s,st)| SiteEscape{site:SiteId(*s), state:*st}).collect(), contained_sites: Default::default() }
+    EscapeResult { version:1, sites: pairs.iter().map(|(s,st)| SiteEscape{site:SiteId(*s), state:*st}).collect(), contained_sites: Default::default(), pretenure_sites: Default::default() }
 }
 fn ck(name:&str, got:AllocStrategy, want:AllocStrategy){
     println!("[{}] {:?} (want {:?}) {}", name, got, want, if got==want {"PASS"} else {"*** FAIL ***"});
     assert!(got==want, "{}", name);
+}
+fn alloc_fn(id:u32, name:&str, sites:&[u32]) -> Function {
+    Function {
+        id: FunctionId(id), name: Some(name.to_string()), params: vec![], ret: TypeId(0),
+        locals: sites.iter().enumerate().map(|(i, _)| Local {
+            id: LocalId(i as u32), type_id: TypeId(0), ref_kind: RefKind::Reference,
+            binding: None, name: None, nullable_numeric: false,
+        }).collect(),
+        body: sites.iter().enumerate().map(|(i, site)| Inst::AllocObject {
+            dst: LocalId(i as u32), type_id: TypeId(0), site: SiteId(*site),
+            class_id: None, proto: None,
+        }).collect(),
+        is_exported: false, param_classes: Default::default(), rest_param: None,
+        is_async: false, is_generator: false, takes_this: false, arity: 0,
+        has_prototype: false,
+    }
 }
 
 fn main() {
@@ -43,6 +59,34 @@ fn main() {
     ck("global-heap", by(104), Heap);
     ck("closure-loop-stack (det)", by(105), Stack);
     ck("no-meta-conservative", by(106), FrameArena); // missing meta => not once/det => arena (sound)
+
+    // Pretenuring is deliberately narrower than GlobalEscape: only a
+    // single-shot site owned by the exactly-once module initializer qualifies.
+    // Loop/many sites and ordinary functions stay in the nursery-backed heap.
+    let mut p = prog(vec![
+        meta(107, Once, true, Object),
+        meta(108, Many, true, Object),
+        meta(109, Once, true, Object),
+    ]);
+    p.functions = vec![
+        alloc_fn(0, "__module_init", &[107, 108]),
+        alloc_fn(1, "called_many_times", &[109]),
+    ];
+    let r = res(&[
+        (107, GlobalEscape),
+        (108, GlobalEscape),
+        (109, GlobalEscape),
+    ]);
+    let mut r = r;
+    r.pretenure_sites.insert(107);
+    let d = decide_with_pretenure(&p, &r, true);
+    let by = |s:u32| d.iter().find(|x| x.site==SiteId(s)).unwrap().strategy;
+    ck("module-once-pretenured", by(107), PretenuredHeap);
+    ck("module-loop-stays-young", by(108), Heap);
+    ck("ordinary-function-stays-young", by(109), Heap);
+    let disabled = decide_with_pretenure(&p, &r, false);
+    let disabled_by = |s:u32| disabled.iter().find(|x| x.site==SiteId(s)).unwrap().strategy;
+    ck("pretenure-kill-switch", disabled_by(107), Heap);
 
     println!("\nAll codegen decision scenarios passed.");
 }

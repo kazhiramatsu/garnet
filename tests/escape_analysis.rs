@@ -149,7 +149,7 @@ pub fn analyze(program: &Program) -> EscapeResult {
     for f in &program.functions {
         sites.extend(analyze_function(f));
     }
-    EscapeResult { version: SCHEMA_VERSION, sites, contained_sites: Default::default() }
+    EscapeResult { version: SCHEMA_VERSION, sites, contained_sites: Default::default(), pretenure_sites: Default::default() }
 }
 
 fn analyze_function(f: &Function) -> Vec<SiteEscape> {

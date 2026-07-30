@@ -70,7 +70,9 @@ static gc_chunk* g_nursery_active = NULL;   /* chunks bumped this cycle; head is
 static gc_chunk* g_nursery_free = NULL;     /* empty chunks kept for reuse */
 static gc_chunk* g_nursery_retained = NULL; /* chunks held in place by pinned survivors */
 static ts_gc_header* g_pinned_young = NULL; /* pinned arena survivors (gc_next reused) */
-static size_t g_nursery_used_bytes = 0;     /* bump total this cycle (minor-GC trigger) */
+static size_t g_nursery_used_bytes = 0;     /* physical survivor + fresh residency */
+static size_t g_nursery_fresh_bytes = 0;    /* new bump bytes since the last minor */
+static size_t g_nursery_survivor_bytes = 0; /* to-space bytes retained by the last minor */
 static size_t g_nursery_cap_bytes = (size_t)4u * 1024u * 1024u; /* TSAOT_GC_NURSERY_BYTES */
 static int g_nursery_enabled = 1;           /* TSAOT_GC_NURSERY=0 kill switch */
 /* Aging (tenure grace): a marked arena survivor is copied WITHIN the nursery
@@ -81,14 +83,24 @@ static int g_nursery_enabled = 1;           /* TSAOT_GC_NURSERY=0 kill switch */
    happen to straddle one minor no longer pollute the old gen. Pinned survivors
    keep the old rule (promote on release). TSAOT_GC_AGE_THRESHOLD overrides;
    full GC always promotes.
-   DEFAULT 1 (OFF) until C0 lands: immediate promotion used to AMNESTY unrooted
-   C-local references (a cell that survived one minor could never die in a
-   later one), so the aging grace exposes the known root-leak inventory
-   (s319: Object.values' getter call, Map-from-iterable's next() call, fetch
-   headers, nested-alloc runtime paths — all loud under threshold>=2 with
-   TSAOT_GC_YOUNG_THRESHOLD=1, which doubles as a STRONGER C0 detector than
-   ZAP: it removes the promotion amnesty instead of poisoning bodies). */
-static uint8_t g_gc_age_threshold = 1;
+   DEFAULT 2 with adaptive fallback: low-survival cohorts get one collection
+   of grace, while cohorts whose aged bytes overwhelmingly promote switch back
+   to first-survival promotion for eight minors. TSAOT_GC_AGE_THRESHOLD=1
+   restores unconditional first-survival promotion. */
+static uint8_t g_gc_age_threshold = 2;
+/* Adaptive aging keeps the threshold-2 win for low-survival cohorts without
+   letting survivor residency halve the next allocation interval or repeatedly
+   recopy high-survival cohorts. The fixed-policy kill switch restores the old
+   shared-capacity / 50%-copy-budget behavior for exact A/B comparisons. */
+static int g_gc_aging_adaptive = 1;          /* TSAOT_GC_AGING_ADAPTIVE=0 */
+static uint8_t g_gc_aging_fallback_minors = 0;
+static int g_gc_aging_collect_outcomes = 0;
+static size_t g_gc_aging_window_dead_bytes = 0;
+static size_t g_gc_aging_window_promoted_bytes = 0;
+#define GC_AGING_COPY_PERCENT       50u
+#define GC_AGING_PROMOTED_PERCENT   80u
+#define GC_AGING_FALLBACK_MINORS     8u
+#define GC_AGING_MIN_SAMPLE_BYTES ((size_t)64u * 1024u)
 /* Young allocations since the last collection: the minor COUNT trigger. With
    aging, g_young_alloc includes kept survivors, so triggering on it would
    re-fire immediately after a minor that kept a large residency; this counter
@@ -118,9 +130,11 @@ static uint32_t g_handle_free_len = 0, g_handle_free_cap = 0;
 static struct {
   unsigned long long minor_gc, full_gc, gc_pause_ns, gc_pause_max_ns;
   unsigned long long mark_stack_peak;
-  unsigned long long alloc_count, alloc_bytes, handle_alloc, root_push;
+  unsigned long long alloc_count, alloc_bytes, handle_alloc, root_push, pretenured_alloc;
   unsigned long long nursery_alloc, nursery_chunks, retained_chunks;
   unsigned long long nursery_aged, unpooled_aged;   /* survivors kept YOUNG by aging */
+  unsigned long long aging_copied_bytes, aging_died_bytes, aging_promoted_bytes;
+  unsigned long long aging_forced_bytes, aging_fallback_minors, aging_activations;
   unsigned long long call_env_malloc, construct_malloc;
   unsigned long long concat_calls, concat_bytes;
   unsigned long long sb_extend, sb_fresh, sb_flat, short_string;
@@ -157,15 +171,20 @@ __attribute__((destructor)) static void ts_rt_stats_dump(void){
             ngc ? (double)g_rt_stats.gc_pause_ns/1e6/(double)ngc : 0.0,
             g_rt_stats.mark_stack_peak);
   }
-  fprintf(out, "[rt_stats] alloc: count=%llu bytes=%llu handle_alloc=%llu handle_cap=%u root_push=%llu\n",
+  fprintf(out, "[rt_stats] alloc: count=%llu bytes=%llu handle_alloc=%llu handle_cap=%u root_push=%llu pretenured=%llu\n",
           g_rt_stats.alloc_count, g_rt_stats.alloc_bytes, g_rt_stats.handle_alloc,
-          g_handle_cap, g_rt_stats.root_push);
+          g_handle_cap, g_rt_stats.root_push, g_rt_stats.pretenured_alloc);
   fprintf(out, "[rt_stats] root_frames: frame_push=%llu\n",
           g_ts_frame_push_count);
   fprintf(out, "[rt_stats] nursery: alloc=%llu chunks=%llu retained=%llu aged=%llu+%llu | live_bytes=%zu full_next=%zu\n",
           g_rt_stats.nursery_alloc, g_rt_stats.nursery_chunks, g_rt_stats.retained_chunks,
           g_rt_stats.nursery_aged, g_rt_stats.unpooled_aged,
           g_heap_bytes, g_full_threshold_bytes);
+  fprintf(out, "[rt_stats] aging: copied_bytes=%llu died_bytes=%llu promoted_bytes=%llu forced_bytes=%llu fallback_minors=%llu activations=%llu | fresh_bytes=%zu survivor_bytes=%zu\n",
+          g_rt_stats.aging_copied_bytes, g_rt_stats.aging_died_bytes,
+          g_rt_stats.aging_promoted_bytes, g_rt_stats.aging_forced_bytes,
+          g_rt_stats.aging_fallback_minors, g_rt_stats.aging_activations,
+          g_nursery_fresh_bytes, g_nursery_survivor_bytes);
   fprintf(out, "[rt_stats] ts_call env_malloc=%llu construct_malloc=%llu | concat: calls=%llu bytes=%llu\n",
           g_rt_stats.call_env_malloc, g_rt_stats.construct_malloc,
           g_rt_stats.concat_calls, g_rt_stats.concat_bytes);
@@ -298,6 +317,9 @@ static void gc_config_init(void){
     unsigned long v = strtoul(age, &end, 10);
     if (end != age) g_gc_age_threshold = (uint8_t)(v < 1 ? 1 : (v > 8 ? 8 : v));
   }
+  const char* adaptive = getenv("TSAOT_GC_AGING_ADAPTIVE");
+  if (adaptive && adaptive[0] && strcmp(adaptive, "0") == 0)
+    g_gc_aging_adaptive = 0;
   const char* nbytes = getenv("TSAOT_GC_NURSERY_BYTES");
   if (nbytes && nbytes[0]){
     char* end = NULL;
@@ -363,18 +385,22 @@ void ts_gc_remember(ts_gc_header* h){
      so the old->young edge must survive that many per-cycle remset resets:
      each minor decrements the credit and re-enrolls while it lasts (see the
      minor sweep). threshold=1 (aging off) => credit 1 => enrolled for exactly
-     one minor — the pre-aging behavior.
+     one minor — the pre-aging behavior. Adaptive fallback also uses credit 1
+     because every marked young pointee promotes at the next minor.
      An already-enrolled cell REFRESHES its credit instead of early-returning:
      each write may store a brand-new (age 0) young ref, which needs the full
      grace window counted from THIS write — with the plain dedup, a cell whose
      credit had partially drained would drop out of the remset while the newer
      pointee was still young (observed as dropped prop values under aging). */
-  if (h->remembered){ h->remembered = g_gc_age_threshold; return; }
+  uint8_t credit =
+    (g_gc_aging_adaptive && g_gc_aging_fallback_minors)
+      ? 1 : g_gc_age_threshold;
+  if (h->remembered){ h->remembered = credit; return; }
   if (g_rem_len == g_rem_cap){
     g_rem_cap = g_rem_cap ? g_rem_cap * 2 : 1024;
     g_remset = (ts_gc_header**)realloc(g_remset, sizeof(ts_gc_header*) * g_rem_cap);
   }
-  h->remembered = g_gc_age_threshold;
+  h->remembered = credit;
   g_remset[g_rem_len++] = h;
 }
 
@@ -431,12 +457,15 @@ static void* gc_nursery_bump(size_t sz){
   void* p = (char*)c + GC_NURSERY_DATA_OFF + c->used;
   c->used += need;
   g_nursery_used_bytes += need;
+  g_nursery_fresh_bytes += need;
   memset(p, 0, sz); /* keep the calloc zero-init contract of the classic path */
   return p;
 }
-static void* gc_alloc(size_t sz, uint8_t kind){
+static void gc_before_alloc(void){
   gc_config_init();
-  if (g_young_new_since_minor>=g_young_threshold || g_nursery_used_bytes>=g_nursery_cap_bytes)
+  size_t nursery_trigger_bytes = g_gc_aging_adaptive
+    ? g_nursery_fresh_bytes : g_nursery_used_bytes;
+  if (g_young_new_since_minor>=g_young_threshold || nursery_trigger_bytes>=g_nursery_cap_bytes)
     ts_gc_collect_young();
   if (g_heap_bytes>=g_full_threshold_bytes){
     ts_gc_collect();
@@ -448,8 +477,14 @@ static void* gc_alloc(size_t sz, uint8_t kind){
       g_full_threshold_bytes = next;
     }
   }
+}
+static void gc_account_alloc(size_t sz){
   RT_STAT_INC(alloc_count); RT_STAT_ADD(alloc_bytes, sz);
   g_heap_bytes += sz;
+}
+static void* gc_alloc(size_t sz, uint8_t kind){
+  gc_before_alloc();
+  gc_account_alloc(sz);
   if (g_nursery_enabled && sz <= GC_NURSERY_MAX_CELL && gc_is_bump_kind(kind)){
     ts_gc_header* h = (ts_gc_header*)gc_nursery_bump(sz);
     if (h){
@@ -466,6 +501,22 @@ static void* gc_alloc(size_t sz, uint8_t kind){
   h->kind=kind; h->gen=TS_GEN_YOUNG; h->size=sz; h->gc_next=g_young_heap; g_young_heap=h;
   h->handle = gc_handle_alloc(h);
   g_alloc++; g_young_alloc++; g_young_new_since_minor++;
+  return h;
+}
+/* Escape-proven long-lived allocation. The cell starts in the old generation
+   and therefore avoids nursery evacuation and handle retargeting. Callers must
+   use the normal write barrier while initializing any young references in the
+   new cell; the public pretenured constructors below enforce that for their
+   direct proto/env stores. */
+static void* gc_alloc_pretenured(size_t sz, uint8_t kind){
+  gc_before_alloc();
+  gc_account_alloc(sz);
+  ts_gc_header* h=calloc(1,sz);
+  h->kind=kind; h->gen=TS_GEN_OLD; h->size=sz;
+  h->gc_next=g_old_heap; g_old_heap=h;
+  h->handle = gc_handle_alloc(h);
+  g_alloc++; g_old_alloc++;
+  RT_STAT_INC(pretenured_alloc);
   return h;
 }
 
@@ -497,17 +548,27 @@ static inline ts_object* ts_proto_ptr(tsv v){ return ts_proto_ref(v) ? (ts_objec
 static inline ts_object* ts_next_proto(ts_object* o){ return o ? ts_proto_ptr(o->proto) : NULL; }
 static void ts_root_static_once(tsv* slot, int* rooted){ if (!*rooted){ ts_gc_root(slot); *rooted = 1; } }
 static void ts_proto_register_method(tsv proto, ts_key method_key, const char* name, ts_code fn);
-tsv ts_new_object(void){
-  ts_object* o = gc_alloc(sizeof(ts_object), TS_KIND_OBJECT);
+static tsv ts_new_object_impl(int pretenured){
+  ts_object* o = pretenured
+    ? gc_alloc_pretenured(sizeof(ts_object), TS_KIND_OBJECT)
+    : gc_alloc(sizeof(ts_object), TS_KIND_OBJECT);
   o->proto = ts_proto_ref(g_object_proto_v) ? g_object_proto_v : TS_NULL;
   o->shape = TS_SHAPE_EMPTY;
-  return ts_obj(o);
+  tsv obj = ts_obj(o);
+  if (pretenured) ts_write_barrier(obj, o->proto);
+  return obj;
 }
-tsv ts_new_proto(void){
-  ts_object* o = gc_alloc(sizeof(ts_object), TS_KIND_OBJECT);
+tsv ts_new_object(void){ return ts_new_object_impl(0); }
+tsv ts_new_object_pretenured(void){ return ts_new_object_impl(1); }
+static tsv ts_new_proto_impl(int pretenured){
+  ts_object* o = pretenured
+    ? gc_alloc_pretenured(sizeof(ts_object), TS_KIND_OBJECT)
+    : gc_alloc(sizeof(ts_object), TS_KIND_OBJECT);
   o->shape = TS_SHAPE_EMPTY;
   return ts_obj(o);
 }
+tsv ts_new_proto(void){ return ts_new_proto_impl(0); }
+tsv ts_new_proto_pretenured(void){ return ts_new_proto_impl(1); }
 /* the runtime-side getter/installer used by emitted setup + ts_new_object. */
 tsv ts_object_proto(void){ return ts_proto_ref(g_object_proto_v) ? g_object_proto_v : TS_NULL; }
 void ts_install_object_proto(tsv proto){
@@ -569,21 +630,36 @@ tsv ts_set_proto(tsv obj, tsv proto){
 }
 
 /* ---- first-class callable values (methods + closures) ---- */
-tsv ts_make_fn(ts_code code, tsv* env, uint32_t envlen){
-  ts_func* f = gc_alloc(sizeof(ts_func), TS_KIND_FUNC);
+static tsv ts_make_fn_impl(ts_code code, tsv* env, uint32_t envlen, int pretenured){
+  ts_func* f = pretenured
+    ? gc_alloc_pretenured(sizeof(ts_func), TS_KIND_FUNC)
+    : gc_alloc(sizeof(ts_func), TS_KIND_FUNC);
   f->o.proto = ts_proto_ref(g_function_proto_v) ? g_function_proto_v : TS_NULL;
   f->code = (void*)code;
   f->prototype_prop = TS_UNDEFINED;
+  tsv fv = ts_func_v(f);
+  if (pretenured) ts_write_barrier(fv, f->o.proto);
   if (env && envlen){
     f->env = malloc(sizeof(tsv)*envlen);
-    for (uint32_t i=0;i<envlen;i++) f->env[i]=env[i];
+    for (uint32_t i=0;i<envlen;i++){
+      f->env[i]=env[i];
+      if (pretenured) ts_write_barrier(fv, env[i]);
+    }
     f->envlen = envlen;
   } else { f->env = NULL; f->envlen = 0; }
-  return ts_func_v(f);
+  return fv;
+}
+tsv ts_make_fn(ts_code code, tsv* env, uint32_t envlen){
+  return ts_make_fn_impl(code, env, envlen, 0);
 }
 /* variant recording whether the callee reads args[0] as `this` (for call/apply/bind). */
 tsv ts_make_fn_t(ts_code code, tsv* env, uint32_t envlen, int takes_this){
-  tsv fv = ts_make_fn(code, env, envlen);
+  tsv fv = ts_make_fn_impl(code, env, envlen, 0);
+  ((ts_func*)ts_ptr(fv))->takes_this = (uint8_t)(takes_this ? 1 : 0);
+  return fv;
+}
+tsv ts_make_fn_t_pretenured(ts_code code, tsv* env, uint32_t envlen, int takes_this){
+  tsv fv = ts_make_fn_impl(code, env, envlen, 1);
   ((ts_func*)ts_ptr(fv))->takes_this = (uint8_t)(takes_this ? 1 : 0);
   return fv;
 }
@@ -690,9 +766,11 @@ tsv ts_call_method(tsv fn, tsv* args, int nargs){
   if (nargs > 0) return ts_call(fn, args + 1, nargs - 1);
   return ts_call(fn, args, 0);
 }
-tsv ts_new_sized(size_t size){
+static tsv ts_new_sized_impl(size_t size, int pretenured){
   if (size < sizeof(ts_object)) size = sizeof(ts_object);
-  ts_object* o = gc_alloc(size, TS_KIND_OBJECT);
+  ts_object* o = pretenured
+    ? gc_alloc_pretenured(size, TS_KIND_OBJECT)
+    : gc_alloc(size, TS_KIND_OBJECT);
   /* Sized objects are AOT class instances. They share TS_KIND_OBJECT with plain
      objects, but class descriptors can resolve a struct field before the named
      property vector. A shape-only PIC entry learned from a plain object must
@@ -702,6 +780,8 @@ tsv ts_new_sized(size_t size){
   o->shape = TS_SHAPE_NONE;
   return ts_obj(o);
 }
+tsv ts_new_sized(size_t size){ return ts_new_sized_impl(size, 0); }
+tsv ts_new_sized_pretenured(size_t size){ return ts_new_sized_impl(size, 1); }
 /* ---------------- dense arrays ---------------- */
 static inline int array_uses_inline(ts_array* a){ return a->data == a->inline_data; }
 static void array_free_data(ts_array* a){ if (a->data && !array_uses_inline(a)) free(a->data); }
@@ -739,12 +819,18 @@ static void ts_array_set_length(tsv arr, uint32_t newlen){
   for (uint32_t i = old; i < newlen; i++) a->data[i] = TS_UNDEFINED;
   a->len = newlen;
 }
-tsv ts_new_array(uint32_t len){
-  ts_array* a = gc_alloc(sizeof(ts_array), TS_KIND_ARRAY);
+static tsv ts_new_array_impl(uint32_t len, int pretenured){
+  ts_array* a = pretenured
+    ? gc_alloc_pretenured(sizeof(ts_array), TS_KIND_ARRAY)
+    : gc_alloc(sizeof(ts_array), TS_KIND_ARRAY);
   a->o.proto = ts_proto_ref(g_array_proto_v) ? g_array_proto_v : TS_NULL;
   array_init_storage(a, len);
-  return ts_obj(a);
+  tsv arr = ts_obj(a);
+  if (pretenured) ts_write_barrier(arr, a->o.proto);
+  return arr;
 }
+tsv ts_new_array(uint32_t len){ return ts_new_array_impl(len, 0); }
+tsv ts_new_array_pretenured(uint32_t len){ return ts_new_array_impl(len, 1); }
 int ts_is_array(tsv v){ return ts_is_obj(v) && ((ts_gc_header*)ts_ptr(v))->kind == TS_KIND_ARRAY; }
 uint32_t ts_array_len(tsv arr){ return ts_is_array(arr) ? ((ts_array*)ts_ptr(arr))->len : 0; }
 tsv ts_array_get(tsv arr, uint32_t i){
@@ -3028,6 +3114,57 @@ static ts_gc_header* gc_tospace_copy(gc_chunk** to_active, ts_gc_header* h){
   if (g_gc_zap) memset(h, 0xDD, sz);
   return nw;
 }
+
+static void gc_aging_record_dead(uint8_t old_age, size_t bytes){
+  if (!old_age) return;
+  if (g_gc_aging_collect_outcomes)
+    g_gc_aging_window_dead_bytes += bytes;
+  RT_STAT_ADD(aging_died_bytes, bytes);
+}
+static void gc_aging_record_promotion(
+    uint8_t old_age, uint8_t next_age, size_t bytes, int force_early){
+  if (old_age){
+    if (g_gc_aging_collect_outcomes)
+      g_gc_aging_window_promoted_bytes += bytes;
+    RT_STAT_ADD(aging_promoted_bytes, bytes);
+  }
+  if (force_early && next_age < g_gc_age_threshold)
+    RT_STAT_ADD(aging_forced_bytes, bytes);
+}
+static int gc_percent_at_least(size_t part, size_t total, size_t percent){
+  if (!total) return 0;
+  size_t threshold = (total / 100u) * percent;
+  threshold += (((total % 100u) * percent) + 99u) / 100u;
+  return part >= threshold;
+}
+static void gc_aging_finish_minor(int aging_allowed){
+  if (g_gc_age_threshold <= 1 || !g_gc_aging_adaptive){
+    g_gc_aging_fallback_minors = 0;
+    return;
+  }
+  if (!aging_allowed){
+    if (g_gc_aging_fallback_minors) g_gc_aging_fallback_minors--;
+    return;
+  }
+  size_t resolved =
+    g_gc_aging_window_dead_bytes + g_gc_aging_window_promoted_bytes;
+  size_t sample_target = g_nursery_cap_bytes >> 1;
+  if (sample_target < GC_AGING_MIN_SAMPLE_BYTES)
+    sample_target = GC_AGING_MIN_SAMPLE_BYTES;
+  int mostly_promoted =
+    resolved >= sample_target &&
+    gc_percent_at_least(
+      g_gc_aging_window_promoted_bytes, resolved, GC_AGING_PROMOTED_PERCENT);
+  if (resolved >= sample_target){
+    g_gc_aging_window_dead_bytes = 0;
+    g_gc_aging_window_promoted_bytes = 0;
+    if (mostly_promoted){
+      g_gc_aging_fallback_minors = GC_AGING_FALLBACK_MINORS;
+      g_gc_aging_collect_outcomes = 0;
+      RT_STAT_INC(aging_activations);
+    }
+  }
+}
 /* Sweep one side of the nursery after marking: evacuate marked cells to the
    old gen, payload-free the dead, divert pinned survivors to g_pinned_young
    and their chunk to the retained list. Shared by minor and full collections
@@ -3036,11 +3173,17 @@ static ts_gc_header* gc_tospace_copy(gc_chunk** to_active, ts_gc_header* h){
    allow_aging (minor only): a survivor younger than g_gc_age_threshold is
    copied within the nursery and stays YOUNG instead of evacuating — its age
    lives in the remembered byte, which is unused while young and already
-   reset to 0 by the old-gen evacuation. Full GC passes 0 (always promote). */
-static void gc_sweep_nursery(ts_gc_header** survivors, int allow_aging){
+   reset to 0 by the old-gen evacuation. Full GC passes 0 (always promote).
+   force_early identifies adaptive-fallback minors; a full GC is not an
+   adaptive promotion even though it also disables aging. */
+static void gc_sweep_nursery(
+    ts_gc_header** survivors, int allow_aging, int force_early){
   gc_chunk* next = NULL;
   gc_chunk* to_active = NULL;        /* survivors' residence, next cycle's active */
-  size_t kept_bytes = 0;             /* physical residency: seeds the minor trigger */
+  size_t kept_bytes = 0;             /* physical residency; fixed mode also triggers on it */
+  size_t copy_budget = g_gc_aging_adaptive
+    ? ((g_nursery_cap_bytes / 100u) * GC_AGING_COPY_PERCENT)
+    : (g_nursery_cap_bytes >> 1);
   for (gc_chunk* c = g_nursery_active; c; c = next){
     next = c->next;
     char* data = (char*)c + GC_NURSERY_DATA_OFF;
@@ -3057,26 +3200,32 @@ static void gc_sweep_nursery(ts_gc_header** survivors, int allow_aging){
           h->gc_next = g_pinned_young; g_pinned_young = h;
           pinned_here++;
         } else {
-          uint8_t age = (uint8_t)(h->remembered + 1);
+          uint8_t old_age = h->remembered;
+          uint8_t age = (uint8_t)(old_age + 1);
           ts_gc_header* kept = NULL;
-          /* Residency budget: survivors may keep at most half the nursery cap,
-             or back-to-back minors would fire on the seeded trigger with no
-             room for new allocation. Overflow survivors promote (chunk order). */
+          /* Both modes cap survivor copying at half a nursery. Adaptive mode
+             additionally keeps that residency out of the next fresh-allocation
+             trigger and falls back when the copied cohort mostly promotes. */
           if (allow_aging && age < g_gc_age_threshold &&
-              kept_bytes < (g_nursery_cap_bytes >> 1))
+              kept_bytes + step <= copy_budget)
             kept = gc_tospace_copy(&to_active, h);
           if (kept){
             kept->remembered = age;
             kept_bytes += step;
             RT_STAT_INC(nursery_aged);
+            RT_STAT_ADD(aging_copied_bytes, step);
           } else {
             /* aged out (or to-space chunk allocation failed): evacuate. */
+            gc_aging_record_promotion(
+              old_age, age, step,
+              force_early || (allow_aging && age < g_gc_age_threshold));
             ts_gc_header* nw = gc_move_young_to_old_ex(h, 0);
             nw->gc_next = *survivors; *survivors = nw;
             g_young_alloc--; g_old_alloc++;
           }
         }
       } else {
+        gc_aging_record_dead(h->remembered, step);
         gc_free_cell_payload(h);
         if (g_gc_zap) memset(h, 0xDD, h->size);
         g_young_alloc--; g_alloc--;
@@ -3094,6 +3243,8 @@ static void gc_sweep_nursery(ts_gc_header** survivors, int allow_aging){
   }
   g_nursery_active = to_active;
   g_nursery_used_bytes = kept_bytes;
+  g_nursery_survivor_bytes = kept_bytes;
+  g_nursery_fresh_bytes = 0;
 }
 /* Re-examine pinned survivors from earlier collections (they live in retained
    chunks and stayed YOUNG): evacuate the ones whose pin was released, free the
@@ -3138,6 +3289,13 @@ static void gc_sweep_pinned_young(ts_gc_header** survivors){
 void ts_gc_collect_young(void){
   if (!g_young_heap && !g_nursery_active && !g_pinned_young) return;
   RT_STAT_INC(minor_gc); RT_STAT_GC_T0;
+  int aging_allowed =
+    g_gc_age_threshold > 1 &&
+    (!g_gc_aging_adaptive || g_gc_aging_fallback_minors == 0);
+  g_gc_aging_collect_outcomes = g_gc_aging_adaptive && aging_allowed;
+  int adaptive_forced =
+    g_gc_age_threshold > 1 && g_gc_aging_adaptive && !aging_allowed;
+  if (adaptive_forced) RT_STAT_INC(aging_fallback_minors);
   gc_mark_async_roots_young();
   for (uint32_t i=0;i<g_sym_desc_len;i++) gc_mark_value_young(g_sym_desc[i]);
   for (uint32_t i=0;i<g_sym_value_len;i++) gc_mark_value_young(g_sym_value[i]);
@@ -3188,14 +3346,16 @@ void ts_gc_collect_young(void){
   while (h){
     ts_gc_header* next = h->gc_next;
     if (h->mark){
-      uint8_t age = (uint8_t)(h->remembered + 1);
-      if (age < g_gc_age_threshold){
+      uint8_t old_age = h->remembered;
+      uint8_t age = (uint8_t)(old_age + 1);
+      if (aging_allowed && age < g_gc_age_threshold){
         /* aging grace: stays YOUNG in place (unpooled cells are address-
            stable, so no copy is needed — just count the survival). */
         h->mark = 0; h->remembered = age;
         h->gc_next = young_kept; young_kept = h;
         RT_STAT_INC(unpooled_aged);
       } else {
+        gc_aging_record_promotion(old_age, age, h->size, adaptive_forced);
         if (moving && gc_is_movable_cell(h)){
           h = gc_move_young_to_old(h);
         } else {
@@ -3206,6 +3366,7 @@ void ts_gc_collect_young(void){
         if (h->kind == TS_KIND_CORO) ts_gc_remember(h);
       }
     } else {
+      gc_aging_record_dead(h->remembered, h->size);
       g_young_alloc--; g_alloc--; gc_free_cell(h);
     }
     h = next;
@@ -3214,7 +3375,7 @@ void ts_gc_collect_young(void){
      cells onto g_pinned_young with their mark already cleared, and this pass
      must not mistake those for dead. */
   gc_sweep_pinned_young(&survivors);
-  gc_sweep_nursery(&survivors, 1);
+  gc_sweep_nursery(&survivors, aging_allowed, adaptive_forced);
   /* Promotion barrier (aging only): promotion can split a reference pair
      across generations — the parent promotes while its child stays young
      under the aging grace, creating an old->young edge NO write barrier ever
@@ -3223,7 +3384,8 @@ void ts_gc_collect_young(void){
      grace: each scan re-marks the child, aging it to promotion before the
      credit drains. threshold=1 promotes all survivors together (no split),
      so this pass is skipped and the pre-aging remset behavior is unchanged. */
-  if (g_gc_age_threshold > 1){
+  if (g_gc_age_threshold > 1 &&
+      (young_kept || g_nursery_survivor_bytes || g_pinned_young)){
     for (ts_gc_header* p = survivors; p; p = p->gc_next) ts_gc_remember(p);
   }
   if (survivors){
@@ -3234,6 +3396,7 @@ void ts_gc_collect_young(void){
   }
   g_young_heap = young_kept;
   g_young_new_since_minor = 0;
+  gc_aging_finish_minor(aging_allowed);
   gc_clear_nonheap_marks();
   RT_STAT_GC_T1;
 }
@@ -3272,8 +3435,15 @@ void ts_gc_collect(void){
     /* remembered must reset on promotion: while young it holds the AGE
        counter (aging), and a stale nonzero would make ts_gc_remember treat
        the promoted cell as already-enrolled — dropping old->young edges. */
-    if (y->mark){ y->mark=0; y->gen=TS_GEN_OLD; y->remembered=0; y->gc_next=promoted; promoted=y; g_young_alloc--; g_old_alloc++; if (y->kind==TS_KIND_CORO) ts_gc_remember(y); }
-    else { g_young_alloc--; g_alloc--; gc_free_cell(y); }
+    if (y->mark){
+      gc_aging_record_promotion(y->remembered, (uint8_t)(y->remembered + 1), y->size, 0);
+      y->mark=0; y->gen=TS_GEN_OLD; y->remembered=0; y->gc_next=promoted; promoted=y;
+      g_young_alloc--; g_old_alloc++; if (y->kind==TS_KIND_CORO) ts_gc_remember(y);
+    }
+    else {
+      gc_aging_record_dead(y->remembered, y->size);
+      g_young_alloc--; g_alloc--; gc_free_cell(y);
+    }
     y=next;
   }
   /* Arena cells cannot gen-flip in place (chunk-owned memory vs the old
@@ -3283,13 +3453,15 @@ void ts_gc_collect(void){
      No aging on a full collection: it just cleaned the old gen, so premature
      tenuring costs nothing here, and always-promote keeps this path simple. */
   gc_sweep_pinned_young(&promoted);
-  gc_sweep_nursery(&promoted, 0);
+  gc_sweep_nursery(&promoted, 0, 0);
   if (promoted){
     ts_gc_header* tail=promoted; while (tail->gc_next) tail=tail->gc_next;
     tail->gc_next=g_old_heap; g_old_heap=promoted;
   }
   g_young_heap=NULL;
   g_young_new_since_minor = 0;
+  g_nursery_fresh_bytes = 0;
+  g_nursery_survivor_bytes = 0;
   gc_clear_nonheap_marks();
   RT_STAT_GC_T1;
 }

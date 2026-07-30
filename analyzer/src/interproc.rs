@@ -812,6 +812,188 @@ fn extract_escape(f: &Function, solver: &Solver, sites: &[SiteId]) -> Vec<SiteEs
         .collect()
 }
 
+fn record_defined_local(inst: &Inst, defined: &mut BTreeSet<LocalId>) {
+    match inst {
+        Inst::AllocObject { dst, .. }
+        | Inst::AllocArray { dst, .. }
+        | Inst::AllocClosure { dst, .. }
+        | Inst::Copy { dst, .. }
+        | Inst::Const { dst, .. } => {
+            defined.insert(*dst);
+        }
+        _ => {}
+    }
+}
+
+fn loop_links_new_to_carrier(body: &[Inst], fresh: LocalId, carrier: LocalId) -> bool {
+    body.iter().any(|inst| match inst {
+        Inst::Call { recv, args, .. } => {
+            recv == &Some(fresh) && args.contains(&carrier)
+        }
+        Inst::StoreField { obj, src, .. } | Inst::StoreFieldDynamic { obj, src, .. } => {
+            *obj == fresh && *src == carrier
+        }
+        Inst::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            loop_links_new_to_carrier(then_body, fresh, carrier)
+                || loop_links_new_to_carrier(else_body, fresh, carrier)
+        }
+        Inst::TryCatch {
+            try_body,
+            catch_body,
+            finally_body,
+            ..
+        } => {
+            loop_links_new_to_carrier(try_body, fresh, carrier)
+                || loop_links_new_to_carrier(catch_body, fresh, carrier)
+                || loop_links_new_to_carrier(finally_body, fresh, carrier)
+        }
+        _ => false,
+    })
+}
+
+fn inspect_accumulating_loop(
+    body: &[Inst],
+    defined_before: &BTreeSet<LocalId>,
+    contained: &BTreeSet<u32>,
+    out: &mut BTreeSet<u32>,
+) {
+    let mut allocs = BTreeMap::<LocalId, SiteId>::new();
+    for inst in body {
+        match inst {
+            Inst::AllocObject { dst, site, .. }
+            | Inst::AllocArray { dst, site, .. }
+            | Inst::AllocClosure { dst, site, .. } => {
+                allocs.insert(*dst, *site);
+            }
+            _ => {}
+        }
+    }
+
+    for inst in body {
+        match inst {
+            // `outer.push(newValue)` retains every iteration's value in a
+            // container whose lifetime began before the loop.
+            Inst::ArrayPush { arr, src } if defined_before.contains(arr) => {
+                if let Some(site) = allocs.get(src) {
+                    if contained.contains(&site.0) {
+                        out.insert(site.0);
+                    }
+                }
+            }
+            // `next = new Node(..., previous); previous = next` forms a
+            // loop-carried retained chain. Require the constructor/store to
+            // link the old carrier into the fresh cell; a plain overwrite does
+            // not qualify and should stay nursery-allocated.
+            Inst::Copy { dst, src } if defined_before.contains(dst) => {
+                if let Some(site) = allocs.get(src) {
+                    if contained.contains(&site.0)
+                        && loop_links_new_to_carrier(body, *src, *dst)
+                    {
+                        out.insert(site.0);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_accumulating_sites(
+    body: &[Inst],
+    defined: &mut BTreeSet<LocalId>,
+    contained: &BTreeSet<u32>,
+    out: &mut BTreeSet<u32>,
+) {
+    for inst in body {
+        match inst {
+            Inst::Loop {
+                cond_body,
+                body: loop_body,
+                ..
+            } => {
+                inspect_accumulating_loop(loop_body, defined, contained, out);
+                let mut nested_defined = defined.clone();
+                collect_accumulating_sites(cond_body, &mut nested_defined, contained, out);
+                collect_accumulating_sites(loop_body, &mut nested_defined, contained, out);
+            }
+            Inst::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                let mut then_defined = defined.clone();
+                let mut else_defined = defined.clone();
+                collect_accumulating_sites(then_body, &mut then_defined, contained, out);
+                collect_accumulating_sites(else_body, &mut else_defined, contained, out);
+                defined.extend(then_defined.intersection(&else_defined).copied());
+            }
+            Inst::TryCatch {
+                try_body,
+                catch_body,
+                finally_body,
+                ..
+            } => {
+                let mut nested_defined = defined.clone();
+                collect_accumulating_sites(try_body, &mut nested_defined, contained, out);
+                collect_accumulating_sites(catch_body, &mut nested_defined, contained, out);
+                collect_accumulating_sites(finally_body, &mut nested_defined, contained, out);
+            }
+            _ => record_defined_local(inst, defined),
+        }
+    }
+}
+
+fn pretenure_candidates(
+    program: &Program,
+    escapes: &[SiteEscape],
+    contained: &BTreeSet<u32>,
+) -> BTreeSet<u32> {
+    let meta: BTreeMap<u32, &SiteMeta> =
+        program.site_meta.iter().map(|m| (m.site.0, m)).collect();
+    let states: BTreeMap<u32, EscapeState> =
+        escapes.iter().map(|s| (s.site.0, s.state)).collect();
+    let mut out = BTreeSet::new();
+
+    // Module initialization executes exactly once. A single-shot allocation
+    // proven to GlobalEscape is expected to remain reachable for module/process
+    // lifetime, so nursery copying has no upside.
+    for function in &program.functions {
+        if function.name.as_deref() != Some("__module_init") {
+            continue;
+        }
+        let mut sites = Vec::new();
+        flatten_bodies(&function.body, &mut sites);
+        for inst in sites {
+            let site = match inst {
+                Inst::AllocObject { site, .. }
+                | Inst::AllocArray { site, .. }
+                | Inst::AllocClosure { site, .. } => site,
+                _ => continue,
+            };
+            let once = matches!(
+                meta.get(&site.0).map(|m| m.multiplicity),
+                Some(Multiplicity::Once)
+            );
+            if once && states.get(&site.0) == Some(&EscapeState::GlobalEscape) {
+                out.insert(site.0);
+            }
+        }
+    }
+
+    // Within ordinary functions, identify only structural accumulation:
+    // retained chains and append-only outer containers. Ring-buffer indexed
+    // stores and plain loop-carried overwrites intentionally do not qualify.
+    for function in &program.functions {
+        let mut defined: BTreeSet<LocalId> = function.params.iter().copied().collect();
+        collect_accumulating_sites(&function.body, &mut defined, contained, &mut out);
+    }
+    out
+}
+
 // ------------------------------- driver ---------------------------------------
 
 pub fn analyze_program(program: &Program) -> EscapeResult {
@@ -873,9 +1055,11 @@ pub fn analyze_program(program: &Program) -> EscapeResult {
         }
         out.extend(extract_escape(f, &solver, &sites));
     }
+    let pretenure_sites = pretenure_candidates(program, &out, &contained);
     EscapeResult {
         version: SCHEMA_VERSION,
         sites: out,
         contained_sites: contained,
+        pretenure_sites,
     }
 }
