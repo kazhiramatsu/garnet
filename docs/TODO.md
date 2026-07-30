@@ -3529,3 +3529,18 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   UNPORTED=0**; normal, ASan, and forced Promise+Coro moving GC stress;
   benchmark correctness and performance budgets; and the complete
   bounded-parallel CI.
+
+### Session 332: user-oriented README
+
+- Reorganized the README around the user journey: prerequisites, first native
+  program, everyday driver commands, multi-file builds, typed versus untyped
+  behavior, deployment, and troubleshooting now come before implementation
+  details.
+- Replaced the stale headline benchmark table and roadmap claims with
+  workload-specific performance guidance and links to the detailed coverage
+  and benchmark documents.
+- Documented the current operational boundaries explicitly: one `.ts` entry
+  with statically bundled imports, imported TSX support, the experimental
+  React/Pages Router SSR fixture, loud unsupported-syntax diagnostics, optional
+  libcurl linkage for fetch, vendored static mimalloc, and platform-dependent
+  libc linkage.
