@@ -39,6 +39,10 @@ cc_link() { # $1=src.c $2=out  ; sets cc.err on failure
 # fixture。scripts/frozen_known_diffs.tsv の scope=selfconf 行）。KNOWN として
 # 別集計し PASS 判定から除外する。
 KNOWN_NAMES=$(awk -F'\t' '$1=="selfconf"{print $2}' "$ROOT/scripts/frozen_known_diffs.tsv" 2>/dev/null)
+# Production conformance continues to grow after analyzer_ts was frozen. Keep
+# known loud UNPORTED results separate from new regressions instead of deleting
+# production-only fixtures from the corpus.
+KNOWN_UNPORTED_NAMES=$(awk -F'\t' '$1=="selfconf-unported"{print $2}' "$ROOT/scripts/frozen_known_diffs.tsv" 2>/dev/null)
 
 pass=0; unported=0; ccfail=0; diff=0; known=0; expfail=0; total=0
 : > "$tmp/unported.txt"; : > "$tmp/ccfail.txt"; : > "$tmp/diff.txt"; : > "$tmp/known.txt"
@@ -51,7 +55,13 @@ while IFS= read -r ts; do
     expfail=$((expfail+1)); continue; fi
   if ! $TSAN "$tmp/ir.json" emit > "$tmp/ts.c" 2>"$tmp/ts.err"; then
     if grep -q "^UNPORTED:" "$tmp/ts.err"; then
-      unported=$((unported+1)); grep "^UNPORTED:" "$tmp/ts.err" | sed 's/^UNPORTED: //' >> "$tmp/unported.txt"
+      if printf '%s\n' "$KNOWN_UNPORTED_NAMES" | grep -qx "${name%.ts}"; then
+        known=$((known+1))
+        echo "$name (known UNPORTED: $(grep -m1 '^UNPORTED:' "$tmp/ts.err" | sed 's/^UNPORTED: //'))" >> "$tmp/known.txt"
+      else
+        unported=$((unported+1))
+        grep "^UNPORTED:" "$tmp/ts.err" | sed 's/^UNPORTED: //' >> "$tmp/unported.txt"
+      fi
     else
       ccfail=$((ccfail+1)); echo "$name: $(head -1 "$tmp/ts.err")" >> "$tmp/ccfail.txt"
     fi

@@ -100,13 +100,31 @@ megamorphic (zero PIC hits). The adaptive index reduces `find_prop` average
 probes from 16.50 to 1.38 and improves wall time despite repeated
 `ToPropertyKey`/interning cost.
 
-Correctness coverage lives in
-`tests/conformance/exhaustive/object_methods/property_pic.ts`; performance
-coverage lives in `benchmarks/property_pic_kernel.ts` and
+Correctness coverage is split by invariant:
+
+- `object_methods/property_pic.ts` covers ordinary warm hits, shape mutation,
+  accessors, descriptor redefinition, computed keys, and frozen writes.
+- `object_methods/property_pic_edge_cases.ts` covers equal/different insertion
+  sequences, get/set megamorphic transition, dense-slot compaction, own and
+  inherited accessors, integrity changes, string/number/symbol/object keys,
+  ToPropertyKey side effects, proxies, exotics, and nullish errors.
+- `object_methods/property_dictionary_edge_cases.ts` covers the seven/eight
+  threshold, index growth, first/middle/last deletion, shrink/re-growth,
+  descriptor transitions, prototypes, symbols, integrity operations, and JSON
+  duplicate keys.
+- `classes/dynamic_class_registry_edges.ts` covers registry growth, the
+  minimum-allocation-size guard, moving-GC revisits, and the constructor
+  stack-buffer boundary at 15/16 arguments.
+- `runtime/ts_rt_test.c` directly asserts shape sharing, the 16-miss state,
+  dictionary shape after compaction, deterministic open-addressing collisions,
+  class-registry growth, and the minimum-size guard.
+
+Performance coverage lives in `benchmarks/property_pic_kernel.ts` and
 `benchmarks/property_dictionary_kernel.ts`.
 
-The final production-default benchmark battery completed 101/101 within budget. The PIC
-kernel ran in 91 ms and the 32-key dictionary kernel in 95 ms. In the combined production
-configuration (PIC plus the independently measured root-frame work), the full typed
-self-host emitter completed in 330.11 s versus the earlier 595 s baseline; that
-end-to-end number is intentionally not attributed to PIC alone.
+The final production-default benchmark battery completed 101/101 within budget. The
+original completion run measured the PIC kernel at 91 ms and the 32-key dictionary
+kernel at 95 ms; the expanded edge-test follow-up measured 94 ms and 96 ms respectively.
+In the combined production configuration (PIC plus the independently measured root-frame
+work), the full typed self-host emitter completed in 330.11 s versus the earlier 595 s
+baseline; that end-to-end number is intentionally not attributed to PIC alone.

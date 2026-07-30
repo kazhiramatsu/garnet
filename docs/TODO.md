@@ -3235,3 +3235,53 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   bundler 39/39; benchmarks 101/101; self-conformance 340 PASS + 1 KNOWN, DIFF=0;
   frozen parity 329 identical + 12 KNOWN, DIFF=0; `ci_fast`; runtime and analyzer unit
   suites. No commit was created.
+
+### Session 324: Comprehensive PIC, property-index, class-registry, and shadow-frame edge coverage
+
+- **Task**: add comprehensive regression coverage and edge cases for the performance
+  implementation from Session 323.
+- **Property PIC coverage**: added
+  `object_methods/property_pic_edge_cases.ts`. It drives shared and reordered shapes,
+  four-entry replacement, get/set megamorphic transition after 16 misses, deletion
+  compaction, data/accessor redefinition, own and inherited accessors, prototype
+  replacement, frozen/non-writable/non-extensible writes, string/number/user-symbol/
+  well-known-symbol/object keys, repeated ToPropertyKey side effects, Proxy and exotic
+  fallbacks, and nullish receiver errors through fixed and computed cache sites.
+- **Adaptive-index coverage**: added
+  `object_methods/property_dictionary_edge_cases.ts` for the seven/eight threshold,
+  multiple capacity decisions, first/middle/last deletion, dense-slot rebuild,
+  shrink-to-linear and re-growth, duplicate updates, descriptor transitions, indexed
+  prototype lookup, symbols, seal/freeze, and large JSON objects with duplicate keys.
+  Runtime unit tests additionally synthesize nine keys with the same initial bucket to
+  deterministically cover an open-addressing collision chain, terminal miss, and
+  rebuild after a middle deletion.
+- **Class/constructor coverage**: added `classes/dynamic_class_registry_edges.ts`.
+  Twenty-four freshly cloned captured-class prototypes force registry-index growth;
+  dynamic field reads/writes, reference fields across moving GC, and a plain
+  `Object.create(C.prototype)` impostor cover lookup and the minimum-size guard.
+  `Reflect.construct` cases at 0/1/15/16/17/40 arguments cover both sides of the
+  16-entry constructor stack-buffer boundary for plain functions and AOT classes.
+- **GC frame coverage**: added `gc/frame_roots_edge_cases.ts` and included it in the
+  threshold-one GC stress filter. It covers early returns through finally, throw through
+  finally, catch/rethrow, nested handlers, loop-local closures, i64/f64 deep recursion,
+  a 16-reference wide frame, and plain-frame unwind into a coroutine catch followed by
+  suspension. Runtime unit tests directly prove frame slots survive young and full
+  collections and that `longjmp` restores the exact handler-snapshot frame top.
+- **Bug exposed and fixed**: a write to a getter-only accessor was silently ignored.
+  TS/ESM is strict, so both canonical and PIC accessor-set paths now throw a catchable
+  TypeError matching V8 semantics; own and inherited getter-only cases pin the behavior.
+- **Frozen-oracle bookkeeping**: the three new fixtures that expose pre-existing
+  Rust/frozen allocation-output differences are exact-path parity allowlist entries.
+  Added an exact-path `selfconf-unported` classification for the frame fixture because
+  frozen `analyzer_ts` predates abrupt return through finally; production Rust output
+  matches V8, and unrelated UNPORTED results still fail the gate.
+- **Path proof**: generated C contains 143 PIC declarations for the PIC edge fixture and
+  13 frame pushes for the frame edge fixture; the corresponding explicit legacy modes
+  contain zero, proving both optimized and fallback emissions were exercised.
+- **Verification**: new fixtures pass default typed, default untyped, both legacy flags,
+  young-threshold=1, and ASan. Full typed conformance **348/348**; full untyped
+  conformance **348/348**; GC stress O2 **20/20**, ASan **20/20**, and runtime ASan;
+  runtime/analyzer unit suites; bundler **39/39**; `ci_fast`; benchmark **101/101**
+  within budget (PIC 94 ms, dictionary 96 ms); frozen parity **330 identical +
+  15 KNOWN, DIFF=0, UNPORTED=0**; self-conformance **343 PASS + 2 KNOWN,
+  DIFF=0, CCFAIL=0, UNPORTED=0**.

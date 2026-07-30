@@ -123,6 +123,38 @@ typedef struct {
   tsv x;
 } pic_test_class;
 
+typedef struct {
+  ts_frame_hdr h;
+  tsv slots[3];
+} frame_root_test;
+
+typedef struct {
+  ts_object o;
+  tsv boxed;
+  double numeric;
+} registry_test_class;
+
+static void throw_from_nested_frame(tsv payload){
+  frame_root_test frame;
+  frame.slots[0] = payload;
+  frame.slots[1] = TS_UNDEFINED;
+  frame.slots[2] = TS_UNDEFINED;
+  ts_frame_push(&frame.h, 3);
+  frame.slots[1] = ts_new_object();
+  ts_set(frame.slots[1], 710001u, ts_num(17));
+  frame.slots[2] = ts_new_string("nested-frame", 12);
+  ts_throw(payload);
+}
+
+static uint32_t test_prop_hash(ts_key key){
+  uint32_t x=key;
+  x ^= x >> 16;
+  x *= 0x7feb352du;
+  x ^= x >> 15;
+  x *= 0x846ca68bu;
+  return x ^ (x >> 16);
+}
+
 int main(){
   int fail=0;
   #define CK(name,cond) do{ printf("[%s] %s\n",name,(cond)?"PASS":"*** FAIL ***"); if(!(cond))fail++; }while(0)
@@ -173,6 +205,191 @@ int main(){
   CK("pic class layout domain", ts_to_num(ts_get_pic_checked_inline(pic_class, pic_class_key, &pic_ic))==2);
   CK("pic class canonical parity", ts_get_pic_checked_inline(pic_class, pic_class_key, &pic_ic)==ts_get(pic_class, pic_class_key));
   ts_gc_unroot(3);
+  /* Equal property-key sequences share a hidden shape; insertion order changes
+     it. A cached slot from one receiver must read the other receiver's storage. */
+  const ts_key shape_a_key = 430001u, shape_x_key = 430002u;
+  tsv shape_a=ts_new_object(); ts_gc_root(&shape_a);
+  tsv shape_b=ts_new_object(); ts_gc_root(&shape_b);
+  tsv shape_rev=ts_new_object(); ts_gc_root(&shape_rev);
+  ts_set(shape_a, shape_a_key, ts_num(1)); ts_set(shape_a, shape_x_key, ts_num(10));
+  ts_set(shape_b, shape_a_key, ts_num(2)); ts_set(shape_b, shape_x_key, ts_num(20));
+  ts_set(shape_rev, shape_x_key, ts_num(30)); ts_set(shape_rev, shape_a_key, ts_num(3));
+  CK("shape sequence shared",
+     ((ts_object*)ts_ptr(shape_a))->shape == ((ts_object*)ts_ptr(shape_b))->shape);
+  CK("shape insertion order distinct",
+     ((ts_object*)ts_ptr(shape_a))->shape != ((ts_object*)ts_ptr(shape_rev))->shape);
+  ts_prop_ic shared_shape_ic=TS_PROP_IC_INIT;
+  CK("pic shared shape first",
+     ts_to_num(ts_get_pic_checked_inline(shape_a, shape_x_key, &shared_shape_ic))==10);
+  CK("pic shared shape second",
+     ts_to_num(ts_get_pic_checked_inline(shape_b, shape_x_key, &shared_shape_ic))==20);
+  ts_gc_unroot(3);
+
+  /* A fixed-key site becomes megamorphic after sixteen distinct misses and
+     remains correct for all later shapes. */
+  ts_prop_ic mega_ic=TS_PROP_IC_INIT;
+  int mega_ok=1;
+  for (int i=0;i<20;i++){
+    tsv v=ts_new_object(); ts_gc_root(&v);
+    ts_set(v, (ts_key)(440000u+i), ts_num(i));
+    ts_set(v, shape_x_key, ts_num(100+i));
+    if (ts_to_num(ts_get_pic_checked_inline(v, shape_x_key, &mega_ic)) != 100+i)
+      mega_ok=0;
+    ts_gc_unroot(1);
+  }
+  CK("pic megamorphic values", mega_ok);
+  CK("pic megamorphic threshold", mega_ic.megamorphic && mega_ic.misses==16);
+
+  /* Delete compacts the dense property vector and switches to dictionary shape,
+     preventing a cached slot index from reading the adjacent property. */
+  tsv compact=ts_new_object(); ts_gc_root(&compact);
+  const ts_key compact_before=450001u, compact_key=450002u, compact_after=450003u;
+  ts_set(compact, compact_before, ts_num(1));
+  ts_set(compact, compact_key, ts_num(2));
+  ts_set(compact, compact_after, ts_num(3));
+  ts_prop_ic compact_ic=TS_PROP_IC_INIT;
+  CK("pic compact warm", ts_to_num(ts_get_pic_checked_inline(compact, compact_key, &compact_ic))==2);
+  CK("pic compact delete", ts_delete_prop(compact, compact_before));
+  CK("pic compact dictionary shape",
+     ts_obj_shape_id((ts_object*)ts_ptr(compact))==TS_SHAPE_NONE);
+  CK("pic compact slot safe", ts_to_num(ts_get_pic_checked_inline(compact, compact_key, &compact_ic))==2);
+  ts_gc_unroot(1);
+
+  /* The adaptive property index appears at eight entries, survives growth and
+     dense compaction, disappears below eight, and can be rebuilt afterwards. */
+  tsv indexed=ts_new_object(); ts_gc_root(&indexed);
+  const ts_key index_base=460000u;
+  for (uint32_t i=0;i<24;i++) ts_set(indexed, index_base+i, ts_num((double)i));
+  ts_object* indexed_obj=(ts_object*)ts_ptr(indexed);
+  CK("prop index threshold", indexed_obj->len==24 && indexed_obj->prop_index!=NULL);
+  CK("prop index grew", indexed_obj->prop_index_cap>=32);
+  int indexed_ok=1;
+  for (uint32_t i=0;i<24;i++)
+    if (ts_to_num(ts_get(indexed, index_base+i)) != (double)i) indexed_ok=0;
+  CK("prop index all hits", indexed_ok);
+  CK("prop index delete first", ts_delete_prop(indexed, index_base));
+  CK("prop index delete middle", ts_delete_prop(indexed, index_base+11u));
+  CK("prop index delete last", ts_delete_prop(indexed, index_base+23u));
+  CK("prop index compact values",
+     ts_to_num(ts_get(indexed,index_base+1u))==1 &&
+     ts_to_num(ts_get(indexed,index_base+12u))==12 &&
+     ts_to_num(ts_get(indexed,index_base+22u))==22);
+  for (uint32_t i=1;i<=15;i++)
+    if (i!=11u) (void)ts_delete_prop(indexed,index_base+i);
+  indexed_obj=(ts_object*)ts_ptr(indexed);
+  CK("prop index shrinks to linear",
+     indexed_obj->len==7 && indexed_obj->prop_index==NULL && indexed_obj->prop_index_cap==0);
+  ts_set(indexed, index_base+100u, ts_num(100));
+  indexed_obj=(ts_object*)ts_ptr(indexed);
+  CK("prop index rebuild after shrink",
+     indexed_obj->len==8 && indexed_obj->prop_index!=NULL &&
+     ts_obj_shape_id(indexed_obj)==TS_SHAPE_NONE &&
+     ts_to_num(ts_get(indexed,index_base+100u))==100);
+  ts_gc_unroot(1);
+
+  /* Force eight keys into one initial-index bucket. This deterministically
+     covers the open-addressing probe chain, a missing key at its end, and a
+     rebuild after deleting from the middle of the chain. */
+  ts_key collision_keys[9];
+  uint32_t collision_count=0;
+  const uint32_t collision_bucket=test_prop_hash(465000u)&15u;
+  for (ts_key key=465000u; collision_count<9; key++){
+    if ((test_prop_hash(key)&15u)==collision_bucket)
+      collision_keys[collision_count++]=key;
+  }
+  tsv collisions=ts_new_object(); ts_gc_root(&collisions);
+  for (uint32_t i=0;i<8;i++) ts_set(collisions,collision_keys[i],ts_num(200+i));
+  ts_object* collision_obj=(ts_object*)ts_ptr(collisions);
+  CK("prop index collision setup",
+     collision_obj->len==8 && collision_obj->prop_index_cap==16);
+  int collision_ok=1;
+  for (uint32_t i=0;i<8;i++)
+    if (ts_to_num(ts_get(collisions,collision_keys[i])) != 200+i) collision_ok=0;
+  CK("prop index collision hits", collision_ok);
+  CK("prop index collision miss", ts_is_undef(ts_get(collisions,collision_keys[8])));
+  CK("prop index collision delete", ts_delete_prop(collisions,collision_keys[3]));
+  CK("prop index collision rebuild",
+     ts_is_undef(ts_get(collisions,collision_keys[3])) &&
+     ts_to_num(ts_get(collisions,collision_keys[4]))==204 &&
+     ((ts_object*)ts_ptr(collisions))->prop_index==NULL);
+  ts_gc_unroot(1);
+
+  /* Register enough distinct class prototypes to grow and probe the class
+     registry index. Also verify its min-size guard on a plain impostor. */
+  enum { REGISTRY_TEST_COUNT = 24 };
+  tsv registry_protos[REGISTRY_TEST_COUNT];
+  ts_class_field registry_fields[REGISTRY_TEST_COUNT];
+  const ts_key registry_key=470001u;
+  int registry_ok=1;
+  ts_prop_ic registry_ic=TS_PROP_IC_INIT;
+  for (int i=0;i<REGISTRY_TEST_COUNT;i++){
+    registry_protos[i]=ts_new_proto(); ts_gc_root(&registry_protos[i]);
+    registry_fields[i].name_id=registry_key;
+    registry_fields[i].numeric=(i&1);
+    registry_fields[i].offset=(i&1)
+      ? offsetof(registry_test_class,numeric)
+      : offsetof(registry_test_class,boxed);
+    ts_register_class(registry_protos[i],&registry_fields[i],1);
+    tsv inst=ts_new_sized(sizeof(registry_test_class)); ts_gc_root(&inst);
+    registry_test_class* data=(registry_test_class*)ts_ptr(inst);
+    data->o.proto=registry_protos[i];
+    if (i&1) data->numeric=(double)i+0.5;
+    else data->boxed=ts_num((double)i+0.5);
+    if (ts_to_num(ts_get_pic_checked_inline(inst,registry_key,&registry_ic)) != (double)i+0.5)
+      registry_ok=0;
+    ts_set_pic_inline(inst,registry_key,ts_num((double)i+100.5),&registry_ic);
+    if (ts_to_num(ts_get(inst,registry_key)) != (double)i+100.5) registry_ok=0;
+    ts_gc_unroot(1);
+  }
+  CK("class registry growth", registry_ok);
+  tsv impostor=ts_new_object(); ts_gc_root(&impostor);
+  ((ts_object*)ts_ptr(impostor))->proto=registry_protos[REGISTRY_TEST_COUNT-1];
+  ts_set(impostor,registry_key,ts_num(777));
+  CK("class registry min-size guard", ts_to_num(ts_get(impostor,registry_key))==777);
+  ts_gc_unroot(1);
+  ts_gc_unroot(REGISTRY_TEST_COUNT);
+
+  /* Frame slots are direct GC roots in both young and full collections. */
+  frame_root_test root_frame;
+  root_frame.slots[0]=TS_UNDEFINED;
+  root_frame.slots[1]=TS_UNDEFINED;
+  root_frame.slots[2]=TS_UNDEFINED;
+  ts_frame_hdr* frame_before=g_ts_frame_top;
+  ts_frame_push(&root_frame.h,3);
+  root_frame.slots[0]=ts_new_object();
+  ts_set(root_frame.slots[0],480001u,ts_num(81));
+  root_frame.slots[1]=ts_new_string("frame-root",10);
+  root_frame.slots[2]=ts_new_object();
+  ts_set(root_frame.slots[2],480002u,root_frame.slots[1]);
+  for (int i=0;i<2000;i++){ tsv tmp=ts_new_object(); ts_set(tmp,(ts_key)i,ts_num(i)); }
+  ts_gc_collect_young();
+  CK("frame roots survive young",
+     ts_to_num(ts_get(root_frame.slots[0],480001u))==81 &&
+     ts_strict_eq(ts_get(root_frame.slots[2],480002u),root_frame.slots[1]));
+  ts_gc_collect();
+  CK("frame roots survive full",
+     ts_to_num(ts_get(root_frame.slots[0],480001u))==81 &&
+     ts_strict_eq(ts_get(root_frame.slots[2],480002u),root_frame.slots[1]));
+  ts_frame_pop(&root_frame.h);
+  CK("frame pop restores top", g_ts_frame_top==frame_before);
+
+  /* longjmp must unlink every frame pushed after the handler snapshot. */
+  tsv frame_exception=ts_new_object(); ts_gc_root(&frame_exception);
+  ts_set(frame_exception,490001u,ts_num(91));
+  ts_frame_hdr* exception_top=g_ts_frame_top;
+  ts_handler* frame_handler=ts_eh_push();
+  if (setjmp(frame_handler->buf)==0){
+    throw_from_nested_frame(frame_exception);
+    CK("frame exception reached", 0);
+  } else {
+    ts_gc_set_root_depth(frame_handler->gc_root_len);
+    CK("frame exception restores top", g_ts_frame_top==exception_top);
+    CK("frame exception payload",
+       ts_current_exception()==frame_exception &&
+       ts_to_num(ts_get(ts_current_exception(),490001u))==91);
+    ts_eh_pop();
+  }
+  ts_gc_unroot(1);
   /* nested object reachable through GC */
   tsv inner=ts_new_object(); ts_set(inner,1,ts_num(123)); ts_set(o,300,inner);
   /* strings + add */

@@ -338,8 +338,14 @@ The full-rebuild A/B kept property PIC enabled and changed only frame-root mode:
 - OFF, ON, and Node emitter outputs are byte-identical after removing the single trailing
   newline added by the native executable.
 
-Final production-default verification passed: typed conformance 344/344, untyped
-conformance 344/344, GC O2 19/19, GC ASan 19/19, runtime ASan and threshold stress,
-bundler 39/39, benchmarks 101/101, self-conformance 340 PASS + 1 KNOWN with zero
-differences, frozen parity 329 identical + 12 KNOWN with zero differences, `ci_fast`,
-and runtime/analyzer unit tests.
+The follow-up edge suite adds `gc/frame_roots_edge_cases.ts`: early returns through
+finally, rethrow, nested handlers, loop-local closures, i64/f64 deep recursion, a
+16-slot wide frame, and plain-frame-to-coroutine unwind. Runtime unit tests also push a
+frame directly, force young and full collections, and assert `longjmp` restores the
+exact prior frame top.
+
+Final production-default verification after that expansion passed: typed conformance
+348/348, untyped conformance 348/348, GC O2 20/20, GC ASan 20/20, runtime ASan and
+threshold stress, bundler 39/39, benchmarks 101/101, self-conformance 343 PASS +
+2 KNOWN with zero differences or unclassified UNPORTED results, frozen parity 330
+identical + 15 KNOWN with zero differences, `ci_fast`, and runtime/analyzer unit tests.

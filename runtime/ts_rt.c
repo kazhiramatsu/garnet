@@ -1161,8 +1161,18 @@ tsv ts_get_method_value(tsv recv, uint32_t field_key, uint32_t method_key){
      func), so primitives and functions dispatch correctly too. */
   return ts_get(recv, method_key);
 }
-static void invoke_setter(ts_accessor* ac, tsv obj, tsv val){
-  if (!ts_is_func(ac->setter)) return;   /* getter-only: write ignored */
+static void ts_throw_getter_only_write(ts_key key){
+  const char* nm = ts_field_name(key);
+  char buf[256];
+  snprintf(buf, sizeof(buf), "Cannot set property %s of #<Object> which has only a getter",
+           nm ? nm : "?");
+  ts_throw_type_error_msg(buf);
+}
+static void invoke_setter(ts_accessor* ac, tsv obj, ts_key key, tsv val){
+  if (!ts_is_func(ac->setter)){
+    ts_throw_getter_only_write(key);
+    return;
+  }
   if (ac->s_this){ tsv a[2]={obj,val}; ts_call(ac->setter,a,2); }
   else { tsv a0=val; ts_call(ac->setter,&a0,1); }
 }
@@ -1232,7 +1242,7 @@ static ts_prop* ts_set_named_prop(tsv obj, ts_object* o, ts_key key, tsv val,
   ts_prop* ownp=find_prop(o,key,0);
   if (ownp){
     if (prop_is_accessor(ownp)){
-      invoke_setter((ts_accessor*)ts_ptr(ownp->val), obj, val);
+      invoke_setter((ts_accessor*)ts_ptr(ownp->val), obj, key, val);
       return ownp;
     }
     if (frozen || !prop_is_writable(ownp)){ ts_throw_readonly_write(key); return NULL; }
@@ -1243,7 +1253,7 @@ static ts_prop* ts_set_named_prop(tsv obj, ts_object* o, ts_key key, tsv val,
     tsv* s=find_slot(p,key,0);
     if (s){
       if (is_accessor(*s)){
-        invoke_setter((ts_accessor*)ts_ptr(*s), obj, val);
+        invoke_setter((ts_accessor*)ts_ptr(*s), obj, key, val);
         return NULL;
       }
       break;   /* inherited data property: fall through to create an own data prop */
@@ -8708,7 +8718,7 @@ void ts_set_pic(tsv obj, ts_key key, tsv val, ts_prop_ic* ic){
       if (p){
         TS_RT_STAT_PIC_SET_HIT();
         if (prop_is_accessor(p)){
-          invoke_setter((ts_accessor*)ts_ptr(p->val), obj, val);
+          invoke_setter((ts_accessor*)ts_ptr(p->val), obj, key, val);
           return;
         }
         if ((ts_obj_integrity(o) & 1u) || !prop_is_writable(p)){

@@ -6,6 +6,7 @@
 # 形式: <scope>\t<fixture path（tests/conformance/exhaustive/ 起点・.ts 無し）>\t<理由>
 #   scope=parity   : emitc_diff.sh（Rust emit vs 凍結TS emitc の byte 比較）で DIFF を許容
 #   scope=selfconf : analyzer_conformance.sh（凍結TS コンパイル産物の V8 差分）で DIFF を許容
+#   scope=selfconf-unported : allow a known frozen-TS UNPORTED in analyzer_conformance.sh
 #
 # selfconf スコープは s317 実測で現状 0 件（selfconf は untyped 経路で、凍結側では
 # 当該 SROA/stack 最適化が非発現のため 332/332 PASS。Rust 側は untyped でも class
@@ -29,3 +30,7 @@ parity	classes/sroa_loop_carried_alias	修正#4（s317 ループ逆辺 copy-alia
 parity	errors/strict_write_receiver	修正#5 (s319): StoreField 汎用 fallback の receiver rebox — 凍結側は int 特化局所を v{n} 直書きし未宣言参照の C を出す（コンパイル不能=loud）。Rust は ctx.val で rebox
 parity	functions/es5_new_edge_cases	修正#6 (s319): DeleteField の METHOD twin 削除 — 凍結側は method フィールドを無視し FIELD のみ消す（delete 後も dispatch が旧メソッドを解決する silent DIFF を保持）
 selfconf	functions/es5_new_edge_cases	修正#6: 凍結バイナリは delete 後の h.k() が成功して V8 と出力が異なる（有限・数値/文字列観測のみ）
+parity	classes/dynamic_class_registry_edges	New registry-growth fixture exposes an existing FrameArena-vs-Stack allocation annotation difference; both outputs match V8
+parity	gc/frame_roots_edge_cases	New unwind fixture exposes an existing FrameArena-vs-Stack allocation annotation difference; production output matches V8
+parity	object_methods/property_pic_edge_cases	Rust legacy emission retains one extra rooted temporary that the frozen optimizer removes; both outputs match V8
+selfconf-unported	gc/frame_roots_edge_cases	Frozen analyzer predates abrupt return through finally; production Rust analyzer supports it and matches V8
