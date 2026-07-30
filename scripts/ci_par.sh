@@ -2,9 +2,10 @@
 # tsaot parallel CI gate. Builds analyzer+exporter ONCE, runs all correctness
 # gates concurrently (each gate is self-isolated via mktemp, so they don't clash),
 # then runs the timed perf benchmarks ALONE (concurrent CPU load would inflate the
-# budgets). Equivalent coverage to: conformance basic+exhaustive, focused moving
-# GC stress, ci_fast (unit + runtime + golden + fetch + negative), bench-correct
-# 1&2, bench-perf.
+# budgets). Equivalent coverage to: conformance basic+exhaustive, comprehensive
+# TypeScript syntax legality/coverage/rejection, focused moving GC stress,
+# ci_fast (unit + runtime + golden + fetch + negative), bench-correct 1&2,
+# bench-perf.
 #
 # Usage: bash scripts/ci_par.sh   (exit 0 = all green)
 # Optional: TSAOT_CI_GC_STRESS_FORCED_MOVING=1 adds a forced Promise+Coro
@@ -66,6 +67,7 @@ negatives() {  # the negative + golden + fetch + runtime/unit suite (ci_fast min
 echo ">>> running correctness gates in parallel"
 run conf_exhaustive bash "$S/run_conformance.sh" exhaustive
 run conf_basic      bash "$S/run_conformance.sh" basic
+run syntax          bash "$S/run_syntax_conformance.sh"
 run gc_stress       bash "$S/run_gc_stress.sh"
 RUN_FORCED_MOVING="${TSAOT_CI_GC_STRESS_FORCED_MOVING:-${TSAOT_CI_GC_STRESS_MOVING:-0}}"
 if [[ "$RUN_FORCED_MOVING" != "0" ]]; then

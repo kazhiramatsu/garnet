@@ -7375,6 +7375,7 @@ fn fnval_adapter_body(builtin: &str) -> Option<String> {
         "object.getPrototypeOf" => hv(format!("ts_get_proto({})", val(0))),
         "object.setPrototypeOf" => hv(format!("ts_set_proto({}, {})", val(0), val(1))),
         "object.keys" => hv(format!("ts_object_keys({})", val(0))),
+        "object.forInKeys" => hv(format!("ts_object_for_in_keys({})", val(0))),
         "object.getOwnPropertyNames" => hv(format!("ts_object_get_own_property_names({})", val(0))),
         "object.getOwnPropertySymbols" => hv(format!("ts_object_get_own_property_symbols({})", val(0))),
         "object.values" => hv(format!("ts_object_values({})", val(0))),
@@ -7401,6 +7402,7 @@ fn fnval_adapter_body(builtin: &str) -> Option<String> {
         "objproto.valueOf" => Some("return ts_objproto_valueOf(a, n);".to_string()),
         // ---- Array statics ----
         "array.isArray" => hv(format!("ts_bool(ts_is_array_fast({}))", val(0))),
+        "array.pushHole" => Some(format!("ts_array_push_hole({}); return TS_UNDEFINED;", val(0))),
         "array.from" => Some(format!("return n>1 ? ts_array_from_mapped({}, {}) : ts_array_from({});", val(0), val(1), val(0))),
         "array.of" => Some("return ts_array_of(a, n);".to_string()),
         // ---- String statics ----
@@ -7593,8 +7595,9 @@ fn emit_global_setup(s: &mut String, needs_fetch: bool) {
     fn set_fn(s: &mut String, obj: &str, prop: &str, builtin: &str, arity: u32, name: &str) {
         let _ = writeln!(
             s,
-            "  ts_set_cstr({}, {}, ts_make_global_fn({}, {}u, {}, 0));",
+            "  ts_define_data({}, ts_intern_field({}, (uint32_t)strlen({})), ts_make_global_fn({}, {}u, {}, 0), 0, 1, 1);",
             obj,
+            cstr(prop),
             cstr(prop),
             fnval_adapter_name(builtin),
             arity,
@@ -7602,7 +7605,14 @@ fn emit_global_setup(s: &mut String, needs_fetch: bool) {
         );
     }
     fn set_val(s: &mut String, obj: &str, prop: &str, expr: &str) {
-        let _ = writeln!(s, "  ts_set_cstr({}, {}, {});", obj, cstr(prop), expr);
+        let _ = writeln!(
+            s,
+            "  ts_define_data({}, ts_intern_field({}, (uint32_t)strlen({})), {}, 0, 1, 1);",
+            obj,
+            cstr(prop),
+            cstr(prop),
+            expr
+        );
     }
     fn root_local(s: &mut String, var: &str) {
         let _ = writeln!(s, "  ts_gc_root(&{});", var);
@@ -14500,6 +14510,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 "date.toISOString" => (format!("ts_date_to_iso({})", n(0)), false),
                 // Object static methods (use the field-name table)
                 "object.keys" => (format!("ts_object_keys({})", v(0)), false),
+                "object.forInKeys" => (format!("ts_object_for_in_keys({})", v(0)), false),
                 // Object.prototype.toString.call(x): spec [[Class]] tag of any value.
                 "object.protoToStringCall" => {
                     (format!("ts_objproto_tostring_call({})", v(0)), false)
@@ -14591,6 +14602,10 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 // prototype-chain walk against the class value's prototype (returns tsv bool).
                 "instanceof.dyn" => (format!("ts_instanceof_dyn({}, {})", v(0), v(1)), false),
                 "array.isArray" => (format!("ts_bool(ts_is_array_fast({}))", v(0)), false),
+                "array.pushHole" => (
+                    format!("(ts_array_push_hole({}), TS_UNDEFINED)", v(0)),
+                    false,
+                ),
                 "array.newLength" => (format!("ts_array_new_length({})", n(0)), false),
                 "array.from" => (
                     if args.len() >= 2 {

@@ -714,7 +714,9 @@ static inline long long ts_str_split_join_metric3(tsv s, tsv sep, tsv join_sep, 
   return (long long)count + joined_len + (long long)part_len;
 }
 
-/* a dense JS array: contiguous tsv elements + length */
+/* A JS array uses contiguous storage plus an internal hole sentinel.  The
+   sentinel keeps sparse-array presence distinct from an explicit `undefined`
+   without adding a side allocation/bitmap to the common dense case. */
 typedef struct ts_array {
   ts_obj_common o;   /* proto + lazily-allocated named-property map (unified model) */
   tsv* data; uint32_t len, cap;   /* element fast path */
@@ -985,12 +987,14 @@ tsv  ts_call_method(tsv fn, tsv* args, int nargs);        /* method dispatch (ar
 int  ts_is_callable(tsv v);
 tsv  ts_new_sized(size_t size);
 tsv  ts_new_sized_pretenured(size_t size);
-/* dense arrays */
-tsv  ts_new_array(uint32_t len);    /* length-len array, elements undefined */
+/* arrays (contiguous storage with an internal sparse-hole sentinel) */
+tsv  ts_new_array(uint32_t len);    /* length-len sparse array (all slots holes) */
 tsv  ts_new_array_pretenured(uint32_t len);
 tsv  ts_array_get(tsv arr, uint32_t i);
 void ts_array_set(tsv arr, uint32_t i, tsv v);
 void ts_array_push(tsv arr, tsv v);
+void ts_array_push_hole(tsv arr);
+int  ts_array_has_index(tsv arr, uint32_t i);
 uint32_t ts_array_len(tsv arr);
 double   ts_length(tsv v);
 
@@ -1139,6 +1143,7 @@ uint32_t    ts_field_name_len(uint32_t id);
 uint32_t    ts_intern_field(const char* name, uint32_t len);
 /* Object static methods */
 tsv ts_object_keys(tsv obj);
+tsv ts_object_for_in_keys(tsv obj);
 tsv ts_object_get_own_property_names(tsv obj);
 tsv ts_object_get_own_property_symbols(tsv obj);
 tsv ts_object_freeze(tsv v);

@@ -120,6 +120,10 @@ static tsv ts_make_global_fn(ts_code code, uint32_t arity, const char* name, int
   return f;
 }
 
+/* Built-in own properties are non-enumerable. Keep the frozen emitter's compact
+   setup table while giving its historical ts_set_cstr calls spec attributes. */
+#define ts_set_cstr(obj, name, value) \
+  ts_define_data((obj), ts_intern_field((name), (uint32_t)strlen(name)), (value), 0, 1, 1)
 static void ts_setup_global_object(void){
   ts_global_this_init();
   tsv _g = ts_global_this();
@@ -389,3 +393,4 @@ static void ts_setup_global_object(void){
   ts_global_set("isNaN", ts_make_global_fn(ts_fnval_global_isNaN, 1u, "isNaN", 0));
   ts_global_set("isFinite", ts_make_global_fn(ts_fnval_global_isFinite, 1u, "isFinite", 0));
 }
+#undef ts_set_cstr

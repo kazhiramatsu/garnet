@@ -788,14 +788,16 @@ static tsv ts_new_sized_impl(size_t size, int pretenured){
 }
 tsv ts_new_sized(size_t size){ return ts_new_sized_impl(size, 0); }
 tsv ts_new_sized_pretenured(size_t size){ return ts_new_sized_impl(size, 1); }
-/* ---------------- dense arrays ---------------- */
+/* ---------------- arrays / sparse-hole representation ---------------- */
+#define TS_ARRAY_HOLE TS_BOX(0xFFFEu, 0x4152484Fu)
+static inline int array_is_hole(tsv v){ return v == TS_ARRAY_HOLE; }
 static inline int array_uses_inline(ts_array* a){ return a->data == a->inline_data; }
 static void array_free_data(ts_array* a){ if (a->data && !array_uses_inline(a)) free(a->data); }
 static void array_init_storage(ts_array* a, uint32_t len){
   a->len = len;
   a->cap = len < 4 ? 4 : len;
   a->data = (a->cap <= 4) ? a->inline_data : (tsv*)malloc(sizeof(tsv) * a->cap);
-  for (uint32_t i=0;i<a->cap;i++) a->data[i] = TS_UNDEFINED;
+  for (uint32_t i=0;i<a->cap;i++) a->data[i] = i < len ? TS_ARRAY_HOLE : TS_UNDEFINED;
 }
 static void array_ensure_cap(ts_array* a, uint32_t need){
   if (need <= a->cap) return;
@@ -822,7 +824,7 @@ static void ts_array_set_length(tsv arr, uint32_t newlen){
   /* clear the extended slots to undefined (holes). array_ensure_cap only zero-fills
      when it actually grows capacity; reused capacity from a prior truncate would
      otherwise leak stale elements. */
-  for (uint32_t i = old; i < newlen; i++) a->data[i] = TS_UNDEFINED;
+  for (uint32_t i = old; i < newlen; i++) a->data[i] = TS_ARRAY_HOLE;
   a->len = newlen;
 }
 static tsv ts_new_array_impl(uint32_t len, int pretenured){
@@ -845,7 +847,13 @@ tsv ts_array_get(tsv arr, uint32_t i){
     if (ts_is_str(arr)){ return i < ts_str_len_typed(arr) ? ts_string_slice_view(arr, i, 1) : TS_UNDEFINED; }
     return TS_UNDEFINED;
   }
-  ts_array* a = ts_ptr(arr); return i < a->len ? a->data[i] : TS_UNDEFINED;
+  ts_array* a = ts_ptr(arr);
+  return i < a->len && !array_is_hole(a->data[i]) ? a->data[i] : TS_UNDEFINED;
+}
+int ts_array_has_index(tsv arr, uint32_t i){
+  if (!ts_is_array(arr)) return 0;
+  ts_array* a = ts_ptr(arr);
+  return i < a->len && !array_is_hole(a->data[i]);
 }
 void ts_array_set(tsv arr, uint32_t i, tsv v){
   if (!ts_is_array(arr)) return;
@@ -857,11 +865,18 @@ void ts_array_set(tsv arr, uint32_t i, tsv v){
     ts_throw_type_error_msg(buf); return;
   }
   array_ensure_cap(a, i + 1);
+  for (uint32_t k=a->len;k<i;k++) a->data[k]=TS_ARRAY_HOLE;
   if (i >= a->len) a->len = i+1;
   a->data[i] = v;
   ts_write_barrier(arr, v);
 }
 void ts_array_push(tsv arr, tsv v){ if (ts_is_array(arr)) ts_array_set(arr, ((ts_array*)ts_ptr(arr))->len, v); }
+void ts_array_push_hole(tsv arr){
+  if (!ts_is_array(arr)) return;
+  ts_array* a = ts_ptr(arr);
+  array_ensure_cap(a, a->len + 1);
+  a->data[a->len++] = TS_ARRAY_HOLE;
+}
 static inline void ts_array_store_existing(tsv arr, uint32_t i, tsv v){
   ts_array* a = ts_is_array(arr) ? (ts_array*)ts_ptr(arr) : NULL;
   if (!a || i >= a->len) return;
@@ -1227,8 +1242,7 @@ tsv ts_get(tsv obj, ts_key key){
       if (field_bytes_is(nm, nm_len, "length")) return ts_num((double)ts_array_len(obj));
       uint32_t idx;
       if (prop_key_is_array_index(key, &idx) && idx < ts_array_len(obj)){
-        ts_array* a = ts_ptr(obj);
-        return a->data[idx];
+        return ts_array_get(obj, idx);
       }
     }
   }
@@ -1524,7 +1538,10 @@ static int ts_string_own_prop(tsv obj, ts_key key, tsv* out){
    e/c are the enumerable/configurable attributes (writable is not meaningful for
    accessors). defineProperty defaults both to false when omitted. */
 void ts_define_accessor_attr(tsv obj, ts_key key, tsv getter, tsv setter, int g_this, int s_this, int e, int c){
-  if (!ts_is_obj(obj)) return;
+  /* Functions carry the same ts_obj_common prefix as ordinary objects.  They
+     are valid ECMAScript property targets too (constructor statics and
+     Function.prototype itself rely on this path). */
+  if (!ts_is_obj(obj) && !ts_is_func(obj)) return;
   ts_gc_root(&obj); ts_gc_root(&getter); ts_gc_root(&setter);
   ts_accessor* ac = gc_alloc(sizeof(ts_accessor), TS_KIND_ACCESSOR);
   ac->getter = getter; ac->setter = setter;
@@ -1547,7 +1564,7 @@ void ts_define_accessor(tsv obj, ts_key key, tsv getter, tsv setter, int g_this,
 
 /* accessor define with a runtime key (string/number coerced + interned). */
 void ts_define_accessor_dyn(tsv obj, tsv keyv, tsv getter, tsv setter, int g_this, int s_this, int e, int c){
-  if (!ts_is_obj(obj)) return;
+  if (!ts_is_obj(obj) && !ts_is_func(obj)) return;
   ts_gc_root(&obj); ts_gc_root(&getter); ts_gc_root(&setter);
   ts_key key;
   int ok = ts_key_from_value(keyv, &key);
@@ -1560,7 +1577,7 @@ void ts_define_accessor_dyn(tsv obj, tsv keyv, tsv getter, tsv setter, int g_thi
    symbol-keyed slot is read/written/invoked by ts_get/ts_set just like any other
    key, so this is the only runtime piece needed for symbol-keyed accessors. */
 void ts_define_accessor_symkey(tsv obj, tsv sym, tsv getter, tsv setter, int g_this, int s_this, int e, int c){
-  if (!ts_is_obj(obj) || !ts_is_symbol(sym)) return;
+  if ((!ts_is_obj(obj) && !ts_is_func(obj)) || !ts_is_symbol(sym)) return;
   ts_define_accessor_attr(obj, ts_symbol_key(sym), getter, setter, g_this, s_this, e, c);
 }
 
@@ -1570,7 +1587,7 @@ void ts_define_accessor_symkey(tsv obj, tsv sym, tsv getter, tsv setter, int g_t
    flags record the attributes, honored by ts_set (writable), ts_delete_prop
    (configurable), and the enumeration path (enumerable). */
 void ts_define_data(tsv obj, ts_key key, tsv value, int e, int w, int c){
-  if (!ts_is_obj(obj)) return;
+  if (!ts_is_obj(obj) && !ts_is_func(obj)) return;
   ts_gc_root(&obj); ts_gc_root(&value);
   ts_object* o = (ts_object*)ts_ptr(obj);
   ts_prop* p = find_prop(o, key, 1);
@@ -1581,7 +1598,7 @@ void ts_define_data(tsv obj, ts_key key, tsv value, int e, int w, int c){
 }
 
 void ts_define_data_dyn(tsv obj, tsv keyv, tsv value, int e, int w, int c){
-  if (!ts_is_obj(obj)) return;
+  if (!ts_is_obj(obj) && !ts_is_func(obj)) return;
   ts_gc_root(&obj); ts_gc_root(&value);
   ts_key key;
   int ok = ts_key_from_value(keyv, &key);
@@ -4058,15 +4075,15 @@ static ts_array* as_arr(tsv v){ return ts_is_array(v) ? (ts_array*)ts_ptr(v) : N
 tsv ts_array_map(tsv arr, tsv cb){
   ts_array* a=as_arr(arr); if(!a) return ts_new_array(0);
   ts_gc_root(&arr); ts_gc_root(&cb);
-  tsv out=ts_new_array(0);
+  uint32_t len=a->len;
+  tsv out=ts_new_array(len);
   ts_gc_root(&out);
-  a=as_arr(arr);
-  uint32_t len=a ? a->len : 0;
   for(uint32_t i=0;i<len;i++){
     a=as_arr(arr);
-    tsv elem = (a && i<a->len) ? a->data[i] : TS_UNDEFINED;
+    if (!a || i>=a->len || array_is_hole(a->data[i])) continue;
+    tsv elem = a->data[i];
     tsv args[2]={ elem, ts_num((double)i) };
-    ts_array_push(out, ts_call_value(cb, args, 2));
+    ts_array_set(out, i, ts_call_value(cb, args, 2));
   }
   ts_gc_unroot(3);
   return out;
@@ -4080,7 +4097,8 @@ tsv ts_array_filter(tsv arr, tsv cb){
   uint32_t len=a ? a->len : 0;
   for(uint32_t i=0;i<len;i++){
     a=as_arr(arr);
-    tsv elem = (a && i<a->len) ? a->data[i] : TS_UNDEFINED;
+    if (!a || i>=a->len || array_is_hole(a->data[i])) continue;
+    tsv elem = a->data[i];
     tsv args[2]={ elem, ts_num((double)i) };
     if(ts_truthy(ts_call_value(cb,args,2))) ts_array_push(out, elem);
   }
@@ -4093,7 +4111,8 @@ tsv ts_array_foreach(tsv arr, tsv cb){
   ts_gc_root(&arr); ts_gc_root(&cb);
   for(uint32_t i=0;i<len;i++){
     a=as_arr(arr);
-    tsv elem = (a && i<a->len) ? a->data[i] : TS_UNDEFINED;
+    if (!a || i>=a->len || array_is_hole(a->data[i])) continue;
+    tsv elem = a->data[i];
     tsv args[2]={ elem, ts_num((double)i) };
     ts_call_value(cb,args,2);
   }
@@ -4105,16 +4124,18 @@ tsv ts_array_reduce(tsv arr, tsv cb, tsv init, int has_init){
   tsv acc; uint32_t start;
   if (has_init){ acc=init; start=0; }
   else {
-    /* No initial value: accumulator = first element, iterate from index 1.
-       (JS throws TypeError on an empty array here; we return undefined.) */
-    if (a->len==0) return TS_UNDEFINED;
-    acc=a->data[0]; start=1;
+    /* Holes are skipped when selecting the initial accumulator. */
+    start=0;
+    while (start<a->len && array_is_hole(a->data[start])) start++;
+    if (start==a->len) return TS_UNDEFINED;
+    acc=a->data[start++];
   }
   ts_gc_root(&arr); ts_gc_root(&acc); ts_gc_root(&cb);
   uint32_t len=a->len;
   for(uint32_t i=start;i<len;i++){
     a = as_arr(arr); /* re-fetch: callback may have triggered GC/realloc */
-    tsv elem = (a && i<a->len) ? a->data[i] : TS_UNDEFINED;
+    if (!a || i>=a->len || array_is_hole(a->data[i])) continue;
+    tsv elem = a->data[i];
     tsv args[3]={ acc, elem, ts_num((double)i) };
     acc=ts_call_value(cb,args,3);
   }
@@ -4126,13 +4147,16 @@ tsv ts_array_reduce_right(tsv arr, tsv cb, tsv init, int has_init){
   tsv acc; long start;
   if (has_init){ acc=init; start=(long)a->len-1; }
   else {
-    if (a->len==0) return TS_UNDEFINED;   /* JS throws TypeError; we return undefined */
-    acc=a->data[a->len-1]; start=(long)a->len-2;
+    start=(long)a->len-1;
+    while (start>=0 && array_is_hole(a->data[start])) start--;
+    if (start<0) return TS_UNDEFINED;
+    acc=a->data[start--];
   }
   ts_gc_root(&arr); ts_gc_root(&acc); ts_gc_root(&cb);
   for(long i=start;i>=0;i--){
     a = as_arr(arr);                      /* re-fetch: cb may have triggered GC/realloc */
-    tsv elem = (a && (uint32_t)i<a->len) ? a->data[i] : TS_UNDEFINED;
+    if (!a || (uint32_t)i>=a->len || array_is_hole(a->data[i])) continue;
+    tsv elem = a->data[i];
     tsv args[3]={ acc, elem, ts_num((double)i) };
     acc=ts_call_value(cb,args,3);
   }
@@ -4164,7 +4188,7 @@ tsv ts_array_entries(tsv arr){
   uint32_t len=a ? a->len : 0;
   for(uint32_t i=0;i<len;i++){
     a=as_arr(arr);
-    tsv elem=(a && i<a->len) ? a->data[i] : TS_UNDEFINED;
+    tsv elem=ts_array_get(arr, i);
     tsv pair=ts_new_array(0);
     ts_gc_root(&pair);
     ts_array_push(pair, ts_num((double)i)); ts_array_push(pair, elem);
@@ -4194,7 +4218,7 @@ tsv ts_array_values_arr(tsv arr){
   uint32_t len=a ? a->len : 0;
   for(uint32_t i=0;i<len;i++){
     a=as_arr(arr);
-    tsv elem=(a && i<a->len) ? a->data[i] : TS_UNDEFINED;
+    tsv elem=ts_array_get(arr, i);
     ts_array_push(out, elem);
   }
   ts_gc_unroot(2);
@@ -4204,7 +4228,7 @@ double ts_array_indexof(tsv arr, tsv v, double from, int has_from){
   ts_array* a=as_arr(arr); if(!a) return -1;
   long n=(long)a->len, s = has_from ? (long)from : 0;
   if(s<0){ s+=n; if(s<0) s=0; }
-  for(long i=s;i<n;i++) if(ts_strict_eq(a->data[i], v)) return (double)i;
+  for(long i=s;i<n;i++) if(!array_is_hole(a->data[i]) && ts_strict_eq(a->data[i], v)) return (double)i;
   return -1;
 }
 int ts_array_includes(tsv arr, tsv v, double from, int has_from){
@@ -4215,7 +4239,7 @@ int ts_array_includes(tsv arr, tsv v, double from, int has_from){
   if(s<0){ s+=n; if(s<0) s=0; }
   int v_is_nan = ts_is_num(v) && (ts_to_num(v) != ts_to_num(v));
   for(long i=s;i<n;i++){
-    tsv e=a->data[i];
+    tsv e=array_is_hole(a->data[i]) ? TS_UNDEFINED : a->data[i];
     if(ts_strict_eq(e, v)) return 1;
     if(v_is_nan && ts_is_num(e) && (ts_to_num(e) != ts_to_num(e))) return 1;
   }
@@ -4230,19 +4254,16 @@ tsv ts_array_slice(tsv arr, double start, double end, int has_end){
   ts_gc_root(&out);
   for(long i=s;i<e;i++){
     a=as_arr(arr);
-    ts_array_push(out, (a && i<(long)a->len) ? a->data[i] : TS_UNDEFINED);
+    if (a && i<(long)a->len && !array_is_hole(a->data[i])) ts_array_push(out, a->data[i]);
+    else ts_array_push_hole(out);
   }
   ts_gc_unroot(2);
   return out;
 }
-/* new Array(n): an array of length n with all elements undefined. (ts_new_array's
-   spare capacity is calloc'd zero-bits = the number 0, so we must fill each slot
-   with TS_UNDEFINED explicitly rather than just bumping the length.) */
+/* new Array(n): a sparse array of length n (no indexed own properties). */
 tsv ts_array_new_length(double n){
   long len=(long)n; if(len<0) len=0;
-  tsv arr=ts_new_array(0);
-  for(long i=0;i<len;i++) ts_array_push(arr, TS_UNDEFINED);
-  return arr;
+  return ts_new_array((uint32_t)len);
 }
 tsv ts_array_concat(tsv x, tsv y){
   /* concat one argument onto a copy of x: an array argument is spread, any other
@@ -4251,10 +4272,16 @@ tsv ts_array_concat(tsv x, tsv y){
   tsv out=ts_new_array(0);
   ts_gc_root(&out);
   ts_array* a=as_arr(x);
-  if(a) for(uint32_t i=0;i<a->len;i++){ ts_array_push(out,a->data[i]); a=as_arr(x); }
+  if(a) for(uint32_t i=0;i<a->len;i++){
+    if (array_is_hole(a->data[i])) ts_array_push_hole(out); else ts_array_push(out,a->data[i]);
+    a=as_arr(x);
+  }
   if(ts_is_array(y)){
     ts_array* b=as_arr(y);
-    for(uint32_t i=0;i<b->len;i++){ ts_array_push(out,b->data[i]); b=as_arr(y); }
+    for(uint32_t i=0;i<b->len;i++){
+      if (array_is_hole(b->data[i])) ts_array_push_hole(out); else ts_array_push(out,b->data[i]);
+      b=as_arr(y);
+    }
   } else {
     ts_array_push(out, y);
   }
@@ -4275,7 +4302,11 @@ tsv ts_array_splice(tsv arr, double start, double dc, int has_dc, tsv items){
   long n=(long)a->len;
   long s=(long)start; if(s<0){ s+=n; if(s<0)s=0; } if(s>n) s=n;
   long del = has_dc ? (long)dc : (n-s); if(del<0) del=0; if(del>n-s) del=n-s;
-  for(long i=0;i<del;i++){ a=as_arr(arr); ts_array_push(removed, a->data[s+i]); }
+  for(long i=0;i<del;i++){
+    a=as_arr(arr);
+    if (array_is_hole(a->data[s+i])) ts_array_push_hole(removed);
+    else ts_array_push(removed, a->data[s+i]);
+  }
   ts_array* it=as_arr(items); long ni = it?(long)it->len:0;
   long newlen = n - del + ni;
   /* rebuild data buffer: [0,s) + items + [s+del,n). No GC between malloc and
@@ -4314,7 +4345,7 @@ static tsv ts_array_join_slow(tsv arr, tsv sep){
     if(i>0) acc=ts_add(acc, sep);
     /* undefined and null render as the empty string in join (not "undefined"). */
     a=as_arr(arr);
-    tsv e=(a && i<a->len) ? a->data[i] : TS_UNDEFINED;
+    tsv e=ts_array_get(arr, i);
     if(e!=TS_UNDEFINED && e!=TS_NULL){
       tsv sv=ts_to_string_v(e);
       ts_gc_root(&sv);
@@ -4341,7 +4372,7 @@ tsv ts_array_join(tsv arr, tsv sep){
   uint32_t len=a ? a->len : 0;
   for(uint32_t i=0;i<len;i++){
     a=as_arr(arr);
-    tsv e=(a && i<a->len) ? a->data[i] : TS_UNDEFINED;
+    tsv e=ts_array_get(arr, i);
     if(!ts_array_join_fast_value(e)){
       ts_gc_unroot(2);
       return ts_array_join_slow(arr, sep);
@@ -4362,7 +4393,7 @@ tsv ts_array_join(tsv arr, tsv sep){
   if(len > 1) total += (uint64_t)sep_len * (uint64_t)(len - 1);
   for(uint32_t i=0;i<len;i++){
     a=as_arr(arr);
-    tsv e=(a && i<a->len) ? a->data[i] : TS_UNDEFINED;
+    tsv e=ts_array_get(arr, i);
     if(e==TS_UNDEFINED || e==TS_NULL){
       parts[i]=TS_UNDEFINED;
       continue;
@@ -4433,7 +4464,8 @@ tsv ts_array_join(tsv arr, tsv sep){
 tsv ts_array_pop(tsv arr){
   ts_array* a=as_arr(arr); if(!a||a->len==0) return TS_UNDEFINED;
   if (ts_arr_frozen(arr)) return TS_UNDEFINED;   /* frozen: no mutation */
-  tsv v=a->data[a->len-1]; a->len--; return v;
+  tsv v=a->data[a->len-1]; a->len--;
+  return array_is_hole(v) ? TS_UNDEFINED : v;
 }
 
 tsv ts_unsupported_builtin(const char* name){
@@ -5205,17 +5237,17 @@ double ts_math_hypot2(double a, double b){ return hypot(a,b); }
    ToNumber-coerced; max/min propagate NaN. Identity: -Inf / +Inf / 0. */
 double ts_math_max_arr(tsv arr){
   ts_array* a=as_arr(arr); double m=-1.0/0.0;   /* -Infinity: identity for max */
-  if(a) for(uint32_t i=0;i<a->len;i++){ m=ts_math_max2(m, ts_number_coerce(a->data[i])); }
+  if(a) for(uint32_t i=0;i<a->len;i++){ m=ts_math_max2(m, ts_number_coerce(ts_array_get(arr,i))); }
   return m;
 }
 double ts_math_min_arr(tsv arr){
   ts_array* a=as_arr(arr); double m=1.0/0.0;    /* +Infinity: identity for min */
-  if(a) for(uint32_t i=0;i<a->len;i++){ m=ts_math_min2(m, ts_number_coerce(a->data[i])); }
+  if(a) for(uint32_t i=0;i<a->len;i++){ m=ts_math_min2(m, ts_number_coerce(ts_array_get(arr,i))); }
   return m;
 }
 double ts_math_hypot_arr(tsv arr){
   ts_array* a=as_arr(arr); double s=0;
-  if(a) for(uint32_t i=0;i<a->len;i++){ double x=ts_number_coerce(a->data[i]); s+=x*x; }
+  if(a) for(uint32_t i=0;i<a->len;i++){ double x=ts_number_coerce(ts_array_get(arr,i)); s+=x*x; }
   return sqrt(s);
 }
 double ts_math_random(void){ return (double)rand() / ((double)RAND_MAX + 1.0); }
@@ -5572,7 +5604,7 @@ tsv ts_array_find(tsv arr, tsv cb){
   ts_array* a=as_arr(arr); if(!a) return TS_UNDEFINED;
   uint32_t len=a->len;
   ts_gc_root(&arr); ts_gc_root(&cb);
-  for(uint32_t i=0;i<len;i++){ a=as_arr(arr); tsv elem=(a && i<a->len)?a->data[i]:TS_UNDEFINED; tsv args[2]={elem,ts_num((double)i)};
+  for(uint32_t i=0;i<len;i++){ a=as_arr(arr); tsv elem=ts_array_get(arr,i); tsv args[2]={elem,ts_num((double)i)};
     if(ts_truthy(ts_call_value(cb,args,2))){ ts_gc_unroot(2); return elem; } }
   ts_gc_unroot(2);
   return TS_UNDEFINED;
@@ -5581,7 +5613,7 @@ tsv ts_array_findlast(tsv arr, tsv cb){
   ts_array* a=as_arr(arr); if(!a) return TS_UNDEFINED;
   uint32_t len=a->len;
   ts_gc_root(&arr); ts_gc_root(&cb);
-  for(uint32_t i=len; i-- > 0;){ a=as_arr(arr); tsv elem=(a && i<a->len)?a->data[i]:TS_UNDEFINED; tsv args[2]={elem,ts_num((double)i)};
+  for(uint32_t i=len; i-- > 0;){ a=as_arr(arr); tsv elem=ts_array_get(arr,i); tsv args[2]={elem,ts_num((double)i)};
     if(ts_truthy(ts_call_value(cb,args,2))){ ts_gc_unroot(2); return elem; } }
   ts_gc_unroot(2);
   return TS_UNDEFINED;
@@ -5590,7 +5622,7 @@ double ts_array_findlastindex(tsv arr, tsv cb){
   ts_array* a=as_arr(arr); if(!a) return -1;
   uint32_t len=a->len;
   ts_gc_root(&arr); ts_gc_root(&cb);
-  for(uint32_t i=len; i-- > 0;){ a=as_arr(arr); tsv elem=(a && i<a->len)?a->data[i]:TS_UNDEFINED; tsv args[2]={elem,ts_num((double)i)};
+  for(uint32_t i=len; i-- > 0;){ a=as_arr(arr); tsv elem=ts_array_get(arr,i); tsv args[2]={elem,ts_num((double)i)};
     if(ts_truthy(ts_call_value(cb,args,2))){ ts_gc_unroot(2); return (double)i; } }
   ts_gc_unroot(2);
   return -1;
@@ -5602,6 +5634,7 @@ static void flat_into(tsv out, tsv arr, int depth){
   for(uint32_t i=0;i<a->len;i++){
     a=as_arr(arr);
     tsv e=a->data[i];
+    if (array_is_hole(e)) continue;
     if(depth>0 && ts_is_array(e)) flat_into(out, e, depth-1);
     else ts_array_push(out, e);
   }
@@ -5626,13 +5659,15 @@ tsv ts_array_flatmap(tsv arr, tsv cb){
   uint32_t len=a ? a->len : 0;
   for(uint32_t i=0;i<len;i++){
     a=as_arr(arr);
-    tsv elem = (a && i<a->len) ? a->data[i] : TS_UNDEFINED;
+    if (!a || i>=a->len || array_is_hole(a->data[i])) continue;
+    tsv elem = a->data[i];
     tsv args[2]={ elem, ts_num((double)i) };
     tsv mapped=ts_call_value(cb, args, 2);
     if(ts_is_array(mapped)){
       ts_gc_root(&mapped);
       uint32_t ml=ts_array_len(mapped);
-      for(uint32_t j=0;j<ml;j++) ts_array_push(out, ts_array_get(mapped, j));
+      for(uint32_t j=0;j<ml;j++)
+        if (ts_array_has_index(mapped,j)) ts_array_push(out, ts_array_get(mapped,j));
       ts_gc_unroot(1);
     } else ts_array_push(out, mapped);
   }
@@ -5643,7 +5678,7 @@ double ts_array_findindex(tsv arr, tsv cb){
   ts_array* a=as_arr(arr); if(!a) return -1;
   uint32_t len=a->len;
   ts_gc_root(&arr); ts_gc_root(&cb);
-  for(uint32_t i=0;i<len;i++){ a=as_arr(arr); tsv elem=(a && i<a->len)?a->data[i]:TS_UNDEFINED; tsv args[2]={elem,ts_num((double)i)};
+  for(uint32_t i=0;i<len;i++){ a=as_arr(arr); tsv elem=ts_array_get(arr,i); tsv args[2]={elem,ts_num((double)i)};
     if(ts_truthy(ts_call_value(cb,args,2))){ ts_gc_unroot(2); return (double)i; } }
   ts_gc_unroot(2);
   return -1;
@@ -5652,7 +5687,9 @@ int ts_array_some(tsv arr, tsv cb){
   ts_array* a=as_arr(arr); if(!a) return 0;
   uint32_t len=a->len;
   ts_gc_root(&arr); ts_gc_root(&cb);
-  for(uint32_t i=0;i<len;i++){ a=as_arr(arr); tsv elem=(a && i<a->len)?a->data[i]:TS_UNDEFINED; tsv args[2]={elem,ts_num((double)i)};
+  for(uint32_t i=0;i<len;i++){
+    a=as_arr(arr); if(!a || i>=a->len || array_is_hole(a->data[i])) continue;
+    tsv elem=a->data[i]; tsv args[2]={elem,ts_num((double)i)};
     if(ts_truthy(ts_call_value(cb,args,2))){ ts_gc_unroot(2); return 1; } }
   ts_gc_unroot(2);
   return 0;
@@ -5661,7 +5698,9 @@ int ts_array_every(tsv arr, tsv cb){
   ts_array* a=as_arr(arr); if(!a) return 1;
   uint32_t len=a->len;
   ts_gc_root(&arr); ts_gc_root(&cb);
-  for(uint32_t i=0;i<len;i++){ a=as_arr(arr); tsv elem=(a && i<a->len)?a->data[i]:TS_UNDEFINED; tsv args[2]={elem,ts_num((double)i)};
+  for(uint32_t i=0;i<len;i++){
+    a=as_arr(arr); if(!a || i>=a->len || array_is_hole(a->data[i])) continue;
+    tsv elem=a->data[i]; tsv args[2]={elem,ts_num((double)i)};
     if(!ts_truthy(ts_call_value(cb,args,2))){ ts_gc_unroot(2); return 0; } }
   ts_gc_unroot(2);
   return 1;
@@ -5671,14 +5710,14 @@ double ts_array_lastindexof(tsv arr, tsv v, double from, int has_from){
   long n=(long)a->len, s = has_from ? (long)from : n-1;
   if(s<0) s+=n;             /* negative fromIndex counts from the end */
   if(s>=n) s=n-1;
-  for(long i=s;i>=0;i--) if(ts_strict_eq(a->data[i],v)) return (double)i;
+  for(long i=s;i>=0;i--) if(!array_is_hole(a->data[i]) && ts_strict_eq(a->data[i],v)) return (double)i;
   return -1;
 }
 tsv ts_array_at(tsv arr, double idx){
   ts_array* a=as_arr(arr); if(!a) return TS_UNDEFINED;
   long i=(long)idx; if(i<0) i+=(long)a->len;
   if(i<0||i>=(long)a->len) return TS_UNDEFINED;
-  return a->data[i];
+  return array_is_hole(a->data[i]) ? TS_UNDEFINED : a->data[i];
 }
 tsv ts_array_reverse(tsv arr){
   ts_array* a=as_arr(arr); if(!a) return arr;
@@ -5691,7 +5730,7 @@ tsv ts_array_shift(tsv arr){
   if (ts_arr_frozen(arr)) return TS_UNDEFINED;   /* frozen: no mutation */
   tsv v=a->data[0];
   for(uint32_t i=0;i+1<a->len;i++) a->data[i]=a->data[i+1];
-  a->len--; return v;
+  a->len--; return array_is_hole(v) ? TS_UNDEFINED : v;
 }
 double ts_array_unshift(tsv arr, tsv v){
   ts_array* a=as_arr(arr); if(!a) return 0;
@@ -5719,6 +5758,8 @@ static int default_cmp(tsv a, tsv b){
   /* Default sort comparator (no callback): per spec, undefined sorts to the end,
      and all other elements are compared by their STRING form lexicographically
      (so [3,1,2,10,20].sort() -> 1,10,2,20,3, not numeric order). */
+  int ah = array_is_hole(a), bh = array_is_hole(b);
+  if (ah || bh) return ah==bh ? 0 : (ah ? 1 : -1);
   int au = (a==TS_UNDEFINED), bu = (b==TS_UNDEFINED);
   if(au||bu) return au==bu ? 0 : (au?1:-1);
   tsv sa=ts_to_string_v(a);
@@ -5750,8 +5791,14 @@ tsv ts_array_sort(tsv arr, tsv cb){
       a=as_arr(arr);
       int cmp;
       tsv left=(a && (uint32_t)j<a->len) ? a->data[j] : TS_UNDEFINED;
-      if(has_cb){ tsv args[2]={left,key}; cmp = (int)ts_to_num(ts_call_value(cb,args,2)); cmp = cmp>0?1:(cmp<0?-1:0); }
-      else cmp = default_cmp(left, key);
+      if (array_is_hole(left) || array_is_hole(key) ||
+          left==TS_UNDEFINED || key==TS_UNDEFINED) {
+        cmp = default_cmp(left, key);
+      } else if(has_cb){
+        tsv args[2]={left,key};
+        cmp = (int)ts_to_num(ts_call_value(cb,args,2));
+        cmp = cmp>0?1:(cmp<0?-1:0);
+      } else cmp = default_cmp(left, key);
       a=as_arr(arr);
       if(cmp>0 && a && (uint32_t)(j+1)<a->cap){ a->data[j+1]=left; j--; } else break;
     }
@@ -5762,16 +5809,15 @@ tsv ts_array_sort(tsv arr, tsv cb){
   return arr;
 }
 
-/* Shallow-copy an array's elements into a fresh array (same length, element
-   identities preserved). Used by the ES2023 change-by-copy methods, which return
-   a NEW array and must not mutate the receiver. */
+/* ES2023 change-by-copy methods read every index with Get and create a data
+   property in the result, so source holes become explicit undefined values. */
 static tsv array_clone(tsv arr){
   ts_array* a=as_arr(arr); if(!a) return ts_new_array(0);
   ts_gc_root(&arr);
   tsv out=ts_new_array(0);
   ts_gc_root(&out);
   a=as_arr(arr);
-  for(uint32_t i=0;i<a->len;i++){ ts_array_push(out, a->data[i]); a=as_arr(arr); }
+  for(uint32_t i=0;i<a->len;i++){ ts_array_push(out, ts_array_get(arr,i)); a=as_arr(arr); }
   ts_gc_unroot(2);
   return out;
 }
@@ -5933,11 +5979,11 @@ tsv ts_array_tospliced(tsv arr, double start, double dc, int has_dc, tsv items){
   long s=(long)start; if(s<0){ s+=n; if(s<0)s=0; } if(s>n) s=n;
   long del = has_dc ? (long)dc : (n-s); if(del<0) del=0; if(del>n-s) del=n-s;
   a=as_arr(arr);
-  for(long i=0;i<s;i++){ ts_array_push(out, a->data[i]); a=as_arr(arr); }
+  for(long i=0;i<s;i++){ ts_array_push(out, ts_array_get(arr,(uint32_t)i)); a=as_arr(arr); }
   ts_array* it=as_arr(items);
-  if(it) for(uint32_t i=0;i<it->len;i++){ ts_array_push(out, it->data[i]); it=as_arr(items); }
+  if(it) for(uint32_t i=0;i<it->len;i++){ ts_array_push(out, ts_array_get(items,i)); it=as_arr(items); }
   a=as_arr(arr);
-  for(long i=s+del;i<n;i++){ ts_array_push(out, a->data[i]); a=as_arr(arr); }
+  for(long i=s+del;i<n;i++){ ts_array_push(out, ts_array_get(arr,(uint32_t)i)); a=as_arr(arr); }
   ts_gc_unroot(3);
   return out;
 }
@@ -6486,7 +6532,10 @@ tsv ts_object_get_own_property_names(tsv obj){
   if (ts_is_array(obj)){
     ts_array* a = ts_ptr(obj);
     uint32_t len = a->len;
-    for (uint32_t i=0;i<len;i++){ push_index_name(arr, i); a = ts_ptr(obj); len = a->len; }
+    for (uint32_t i=0;i<len;i++){
+      if (ts_array_has_index(obj, i)) push_index_name(arr, i);
+      a = ts_ptr(obj); len = a->len;
+    }
     push_cstr_name(arr, "length");
     push_prop_names_js_order(arr, obj, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu);
     ts_gc_unroot(2);
@@ -6875,7 +6924,7 @@ static int json_stringify_val(jbuf* b, tsv v, int depth, const char* indent){
     ts_array* a=ts_ptr(v); uint32_t len=a->len; jb_putc(b,'[');
     for (uint32_t i=0;i<len;i++){ a=ts_ptr(v); if(i) jb_putc(b,',');
       jb_indent(b, indent, depth+1);
-      tsv elem = (i<a->len) ? a->data[i] : TS_UNDEFINED;
+      tsv elem = ts_array_get(v, i);
       if (ts_is_obj(elem)){ char ib[24]; int il=snprintf(ib,sizeof ib,"%u",i); elem=json_apply_tojson(elem, ib, (uint32_t)il); }
       if (!json_stringify_val(b, elem, depth+1, indent)) jb_putz(b,"null"); /* holes/undef -> null */ }
     if (len) jb_indent(b, indent, depth);
@@ -7329,6 +7378,7 @@ static void ts_prop_own_enum(tsv obj, ts_prop_enum_cb cb, void* ud){
     for (uint32_t i=0;;i++){
       ts_array* a = ts_ptr(obj);
       if (i>=a->len) break;
+      if (array_is_hole(a->data[i])) continue;
       char b[16]; int bn = snprintf(b, sizeof b, "%u", i);
       uint32_t k = ts_intern_field(b, (uint32_t)bn);
       tsv v = a->data[i];
@@ -7622,7 +7672,7 @@ static void inspect_val(jbuf* b, tsv v, int depth, int top){
     if (a->len==0){ jb_putz(b,"[]"); ts_gc_unroot(1); return; }
     uint32_t len=a->len;
     jb_putz(b,"[ ");
-    for (uint32_t i=0;i<len;i++){ a=ts_ptr(v); if(i) jb_putz(b,", "); inspect_val(b, (i<a->len)?a->data[i]:TS_UNDEFINED, depth+1, 0); }
+    for (uint32_t i=0;i<len;i++){ a=ts_ptr(v); if(i) jb_putz(b,", "); inspect_val(b, ts_array_get(v,i), depth+1, 0); }
     jb_putz(b," ]");
     ts_gc_unroot(1);
     return;
@@ -8142,7 +8192,8 @@ static tsv json_internalize(tsv val, tsv key, tsv reviver){
       ts_gc_root(&ek);
       tsv ne=json_internalize(ts_array_get(val,i), ek, reviver);
       ts_gc_root(&ne);
-      ts_array_set(val, i, ne);                 /* undefined elem -> hole (==undefined) */
+      if (ts_is_undef(ne)) ((ts_array*)ts_ptr(val))->data[i]=TS_ARRAY_HOLE;
+      else ts_array_set(val, i, ne);
       ts_gc_unroot(2);
     }
   } else if (ts_is_obj(val)){
@@ -8183,8 +8234,7 @@ void ts_array_push_all(tsv dst, tsv src){
   if (s){
     uint32_t len = s->len;
     for(uint32_t i=0;i<len;i++){
-      s=as_arr(src);
-      ts_array_push(dst, (s && i<s->len) ? s->data[i] : TS_UNDEFINED);
+      ts_array_push(dst, ts_array_get(src, i));
     }
     ts_gc_unroot(2);
     return;
@@ -8435,7 +8485,7 @@ int ts_has_prop(tsv obj, ts_key key){
       uint32_t nm_len = ts_field_name_len(key);
       if (field_bytes_is(nm, nm_len, "length")) return 1;
       long ix = ts_canonical_array_index(nm, nm_len);
-      if (ix >= 0 && (uint32_t)ix < ts_array_len(obj)) return 1;
+      if (ix >= 0 && ts_array_has_index(obj, (uint32_t)ix)) return 1;
     }
   }
   ts_object* o=ts_ptr(obj);
@@ -8479,6 +8529,20 @@ int ts_delete_prop_strict(tsv obj, ts_key key){
   if (g_has_proxies && ts_is_proxy(obj)) return ts_proxy_delete_v(obj, ts_key_to_value(key));
   if (!ts_is_obj(obj)) return 1;
   ts_object* o=ts_ptr(obj);
+  if (ts_is_array(obj)){
+    const char* nm=ts_field_name(key);
+    long ix=nm ? ts_canonical_array_index(nm, ts_field_name_len(key)) : -1;
+    if (ix >= 0 && ts_array_has_index(obj, (uint32_t)ix)){
+      if (ts_obj_integrity(o) & (1u|4u)){
+        char buf[128];
+        snprintf(buf,sizeof buf,"Cannot delete property '%ld' of [object Array]",ix);
+        ts_throw_type_error_msg(buf);
+        return 0;
+      }
+      ((ts_array*)ts_ptr(obj))->data[ix]=TS_ARRAY_HOLE;
+      return 1;
+    }
+  }
   int nonconf = 0;
   if (ts_obj_integrity(o) & (1u|4u)) {        /* frozen / sealed => all own props non-configurable */
     if (find_prop(o, key, 0)) nonconf = 1;
@@ -8499,6 +8563,16 @@ int ts_delete_prop(tsv obj, ts_key key){
   if (g_has_proxies && ts_is_proxy(obj)) return ts_proxy_delete_v(obj, ts_key_to_value(key));
   if (!ts_is_obj(obj)) return 1;
   ts_object* o=ts_ptr(obj);
+  if (ts_is_array(obj)){
+    const char* nm=ts_field_name(key);
+    long ix=nm ? ts_canonical_array_index(nm, ts_field_name_len(key)) : -1;
+    if (ix >= 0){
+      if (!ts_array_has_index(obj, (uint32_t)ix)) return 1;
+      if (ts_obj_integrity(o) & (1u|4u)) return 0;
+      ((ts_array*)ts_ptr(obj))->data[ix]=TS_ARRAY_HOLE;
+      return 1;
+    }
+  }
   if (ts_obj_integrity(o) & (1u|4u)) return 0;   /* frozen / sealed: delete ignored (false) */
   ts_prop* found = find_prop(o, key, 0);
   if (!found) return 1;
@@ -8573,7 +8647,8 @@ static tsv ts_own_descriptor_by_key(tsv obj, ts_key key){
     ts_array* a = ts_ptr(obj);
     if (field_bytes_is(nm, nm_len, "length")) return build_data_descriptor(ts_num((double)a->len), 1, 0, 0);
     long ix = ts_canonical_array_index(nm, nm_len);
-    if (ix >= 0 && (uint32_t)ix < a->len) return build_data_descriptor(a->data[ix], 1, 1, 1);
+    if (ix >= 0 && (uint32_t)ix < a->len && !array_is_hole(a->data[ix]))
+      return build_data_descriptor(a->data[ix], 1, 1, 1);
   }
   if (ts_is_func(obj)){
     ts_object* sc = ts_class_static_container(obj);
@@ -8767,7 +8842,7 @@ int ts_has_prop_dyn(tsv obj, tsv keyv){
   /* numeric key on an array: direct bounds check (`0 in arr`). */
   if (ts_is_array(obj) && ts_is_num(keyv)){
     double d = ts_to_num(keyv);
-    return d >= 0 && d == (double)(uint32_t)d && (uint32_t)d < ts_array_len(obj);
+    return d >= 0 && d == (double)(uint32_t)d && ts_array_has_index(obj, (uint32_t)d);
   }
   ts_gc_root(&obj);
   ts_key key;
@@ -8806,7 +8881,7 @@ int ts_has_own(tsv obj, ts_key key){
     uint32_t nm_len = ts_field_name_len(key);
     if (field_bytes_is(nm, nm_len, "length")) return 1;
     long ix = ts_canonical_array_index(nm, nm_len);
-    if (ix >= 0 && (uint32_t)ix < ts_array_len(obj)) return 1;
+    if (ix >= 0 && ts_array_has_index(obj, (uint32_t)ix)) return 1;
   }
   if (class_has_field(o, key)) return 1;     /* own typed struct field */
   return find_slot(o, key, 0) != NULL;       /* own prop slot (no proto walk) */
@@ -9188,7 +9263,7 @@ tsv ts_funcproto_apply(tsv* args, int n){
     tsv* argv = malloc(sizeof(tsv)*(argc>0?argc:1));
     for (int i=0;i<argc;i++){
       a = ts_ptr(arr);
-      argv[i] = ((uint32_t)i < a->len) ? a->data[i] : TS_UNDEFINED;
+      argv[i] = ts_array_get(arr, (uint32_t)i);
     }
     tsv r = invoke_with_this(fn, thisArg, argv, argc);
     free(argv);
@@ -9618,7 +9693,7 @@ tsv ts_reflect_construct(tsv fn, tsv argsArray){
   ts_array* a = ts_ptr(argsArray);
   int argc = (int)a->len;
   tsv* argv = malloc(sizeof(tsv)*(argc>0?argc:1));
-  for (int i=0;i<argc;i++){ a = ts_ptr(argsArray); argv[i] = ((uint32_t)i < a->len) ? a->data[i] : TS_UNDEFINED; }
+  for (int i=0;i<argc;i++) argv[i] = ts_array_get(argsArray, (uint32_t)i);
   tsv r = ts_construct(fn, argv, argc);
   free(argv);
   ts_gc_unroot(2);
@@ -9950,6 +10025,46 @@ static void ts_proxy_enum(tsv pv, ts_prop_enum_cb cb, void* ud){
     ts_gc_unroot(1);
   }
   ts_gc_unroot(2);
+}
+
+/* Snapshot the keys visited by `for...in`. Unlike Object.keys this walks the
+   prototype chain. A name is marked visited before its enumerable flag is
+   checked, so a non-enumerable own property correctly shadows an enumerable
+   property of the same name on a prototype. Symbols never participate. */
+tsv ts_object_for_in_keys(tsv obj){
+  ts_gc_root(&obj);
+  tsv out=ts_new_array(0); ts_gc_root(&out);
+  tsv seen=ts_new_array(0); ts_gc_root(&seen);
+  tsv cur=obj; ts_gc_root(&cur);
+  while ((ts_is_obj(cur) || ts_is_func(cur) || ts_is_str(cur)) && !ts_is_null(cur)){
+    tsv keys=(g_has_proxies && ts_is_proxy(cur))
+      ? ts_proxy_own_keys_arr(cur)
+      : ts_object_get_own_property_names(cur);
+    ts_gc_root(&keys);
+    uint32_t n=ts_array_len(keys);
+    for (uint32_t i=0;i<n;i++){
+      tsv key=ts_array_get(keys,i);
+      if (!ts_is_str(key)) continue;
+      ts_gc_root(&key);
+      int duplicate=0;
+      uint32_t ns=ts_array_len(seen);
+      for (uint32_t j=0;j<ns;j++){
+        if (ts_strict_eq(ts_array_get(seen,j),key)){ duplicate=1; break; }
+      }
+      if (!duplicate){
+        ts_array_push(seen,key);
+        tsv desc=ts_get_own_property_descriptor(cur,key);
+        ts_gc_root(&desc);
+        if (ts_is_obj(desc) && pd_bool(desc,"enumerable")) ts_array_push(out,key);
+        ts_gc_unroot(1);
+      }
+      ts_gc_unroot(1);
+    }
+    ts_gc_unroot(1);
+    cur=ts_get_proto(cur);
+  }
+  ts_gc_unroot(4);
+  return out;
 }
 /* Proxy.revocable(target, handler) -> { proxy, revoke } */
 tsv ts_proxy_revocable(tsv target, tsv handler){

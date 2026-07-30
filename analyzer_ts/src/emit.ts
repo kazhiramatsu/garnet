@@ -461,6 +461,8 @@ function emitCallBuiltinStatic(i: any, out: Line[], indent: number): void {
     case "math.ceil": return set(`ts_num(ceil(ts_number_coerce(${a(0)})))`);
     case "math.abs": return set(`ts_num(fabs(ts_number_coerce(${a(0)})))`);
     case "math.sqrt": return set(`ts_num(sqrt(ts_number_coerce(${a(0)})))`);
+    case "object.forInKeys": return set(`ts_object_for_in_keys(${a(0)})`);
+    case "array.pushHole": return set(`(ts_array_push_hole(${a(0)}), TS_UNDEFINED)`);
     case "array.newLength": return set(`ts_array_new_length(ts_to_num(${a(0)}))`);
     case "instanceof": return set(`ts_bool(ts_instanceof(${a(0)}, ${a(1)}))`);
     case "instanceof.dyn": return set(`ts_instanceof_dyn(${a(0)}, ${a(1)})`);

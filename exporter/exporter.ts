@@ -206,6 +206,9 @@ interface FnCtx {
   restParam?: number; // local id of a rest parameter (...args), if any
   isAsync?: boolean;
   isGenerator?: boolean;
+  // A named function expression binds its name only inside its own body:
+  // `const f = function self(){ return self(); }`.
+  selfFunctionSymbol?: ts.Symbol;
   // stack of enclosing loop kinds, for break/continue lowering. "while" loops
   // can take a C continue safely; "for"/"for-of" put the increment at body end,
   // so continue would skip it — those reject continue (break is always fine).
@@ -396,6 +399,35 @@ class Exporter {
     this.checker = program.getTypeChecker();
     this.VALUE = this.internField("__value");
     this.DATE_MS_FIELD = this.internField("__date_ms");
+  }
+
+  /** Reject legal syntax whose runtime semantics would otherwise be silently
+   *  erased because it is stored as declaration metadata or node flags. */
+  preflightRuntimeSyntax(sf: ts.SourceFile): void {
+    const visit = (node: ts.Node) => {
+      const decorators = ts.canHaveDecorators(node) ? ts.getDecorators(node) : undefined;
+      if (decorators?.length) {
+        this.unsupported(node, "decorators (standard and experimental evaluation is not implemented)");
+      }
+      if (ts.isVariableDeclarationList(node) && (node.flags & ts.NodeFlags.Using)) {
+        this.unsupported(node, "`using` / `await using` explicit resource management");
+      }
+      if (ts.isPropertyDeclaration(node) &&
+          node.modifiers?.some((m) => m.kind === ts.SyntaxKind.AccessorKeyword)) {
+        this.unsupported(node, "auto-accessor class fields");
+      }
+      if (ts.isTaggedTemplateExpression(node)) {
+        this.unsupported(node, "tagged template literals (template object identity/raw strings)");
+      }
+      if (ts.isMetaProperty(node)) {
+        this.unsupported(node, `${node.getText()} meta-property`);
+      }
+      if ((ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) && node.attributes) {
+        this.unsupported(node, "import/export attributes");
+      }
+      node.forEachChild(visit);
+    };
+    visit(sf);
   }
 
   strictTypeOptimizationProfile(): StrictTypeOptimizationProfile {
@@ -3346,6 +3378,11 @@ class Exporter {
       if (contiguous) {
         // fast path: no spread, assign by static index
         node.elements.forEach((el, i) => {
+          if (ts.isOmittedExpression(el)) {
+            ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"),
+              builtin: "array.pushHole", args: [dst] });
+            return;
+          }
           const v = this.lowerExpr(ctx, el);
           const idx = this.newLocal(ctx, "primitive");
           ctx.body.push({ kind: "Const", dst: idx, value: { kind: "Num", value: i } });
@@ -3357,6 +3394,9 @@ class Exporter {
           if (ts.isSpreadElement(el)) {
             const srcArr = this.lowerExpr(ctx, el.expression);
             ctx.body.push({ kind: "ArrayPushAll", arr: dst, src: srcArr });
+          } else if (ts.isOmittedExpression(el)) {
+            ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"),
+              builtin: "array.pushHole", args: [dst] });
           } else {
             const v = this.lowerExpr(ctx, el);
             ctx.body.push({ kind: "ArrayPush", arr: dst, src: v });
@@ -4112,6 +4152,10 @@ class Exporter {
           // are classified as the concrete scalar and stay unboxed).
           const spec = this.specializeGenericCall(node, sym);
           callee = { kind: "Direct", func: spec !== undefined ? spec : this.funcSymbols.get(sym) };
+        } else if (sym && ctx.selfFunctionSymbol === sym) {
+          // The lexical name of a named function expression denotes this exact
+          // lifted function. The regular Direct-call path below threads captures.
+          callee = { kind: "Direct", func: ctx.id };
         } else {
           // An identifier that is NOT a known top-level function: it may be a
           // local/param holding a first-class function value (a closure). Lower
@@ -9626,11 +9670,12 @@ class Exporter {
       const iterIsString = this.builtinReceiverKind(stmt.expression) === "string";
       this.lowerArrayIndexForOf(ctx, stmt.initializer, stmt.statement, arr, iterIsString);
     } else if (ts.isForInStatement(stmt)) {
-      // for (const k in obj) body  ->  keys = Object.keys(obj);
+      // Snapshot enumerable string keys across the full prototype chain,
+      // deduplicating shadowed names as EnumerateObjectProperties requires.
       //   let i=0; while(i<keys.length){ k = keys[i]; body; i++ }
       const obj = this.lowerExpr(ctx, stmt.expression);
       const keys = this.newLocal(ctx, "reference");
-      ctx.body.push({ kind: "CallBuiltinStatic", dst: keys, builtin: "object.keys", args: [obj] });
+      ctx.body.push({ kind: "CallBuiltinStatic", dst: keys, builtin: "object.forInKeys", args: [obj] });
       const idx = this.newLocal(ctx, "primitive");
       const zero = this.newLocal(ctx, "primitive");
       ctx.body.push({ kind: "Const", dst: zero, value: { kind: "Num", value: 0 } });
@@ -9756,7 +9801,9 @@ class Exporter {
         this.lowerModuleDeclaration(ctx, stmt);
       }
     } else if (ts.isInterfaceDeclaration(stmt) ||
-               ts.isTypeAliasDeclaration(stmt) || stmt.kind === ts.SyntaxKind.EmptyStatement) {
+               ts.isTypeAliasDeclaration(stmt) ||
+               stmt.kind === ts.SyntaxKind.EmptyStatement ||
+               stmt.kind === ts.SyntaxKind.DebuggerStatement) {
       // erased (types) or no-op
     } else if (ts.isImportDeclaration(stmt) && this.isNamespaceImportStmt(stmt)) {
       // `import * as ns` builds a runtime namespace object (in __module_init).
@@ -9905,6 +9952,8 @@ class Exporter {
       isExported,
       isAsync,
       isGenerator,
+      selfFunctionSymbol:
+        ts.isFunctionExpression(node) && node.name ? this.symbolOf(node.name) : undefined,
       hoistedFns: new Set(),
     };
 
@@ -10924,6 +10973,7 @@ class Exporter {
   run(sf: ts.SourceFile) {
     this.modules = this.computeModuleOrder(sf);
     this.sf = sf;
+    for (const m of this.modules) this.preflightRuntimeSyntax(m);
     for (const m of this.modules) this.assignIds(m);
     this.setupClasses(sf);
 

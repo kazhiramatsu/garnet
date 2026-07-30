@@ -1,13 +1,34 @@
 # Known coverage gaps (found by the conformance harness)
 
-These are TypeScript features the exporter/codegen does not yet support. The
-conformance harness surfaces them as FAIL/UNSUPPORTED. Tracked here so the basic
-tier stays green (regression net) while the exhaustive tier documents the gaps.
+The syntax suite has three explicit layers:
 
-- `**` exponentiation operator (`AsteriskAsteriskToken`) — use `Math.pow` for now.
-- `.toFixed()` / number methods on a numeric expression result (e.g. `(a/b).toFixed(4)`)
-  — number-receiver method dispatch not wired.
-- (more added as the exhaustive suite grows)
+1. `tests/conformance/exhaustive/syntax/`: legal, executable TypeScript whose
+   native output must match V8.
+2. `tests/conformance/rejects/`: legal TypeScript with runtime semantics not yet
+   implemented; the exporter must stop with `UNSUPPORTED` instead of erasing it.
+3. `tests/conformance/static/` plus `tests/bundler/`: type/declaration-only,
+   module-graph, and JSX grammar.
+
+`scripts/run_syntax_conformance.sh` validates all three layers. Its AST guard
+checks every TypeScript 5.9 source-expressible node kind (excluding compiler
+recovery/transform nodes, the compiler-illegal `with` statement, and one legacy
+internal import-type wrapper), all operator families, and all modifier families.
+
+Current intentional legal-syntax rejects are:
+
+- BigInt literals and arithmetic;
+- standard/experimental decorators;
+- `using` and `await using`;
+- class auto-accessors;
+- tagged templates (template object identity and `.raw`);
+- `new.target` and `import.meta`;
+- dynamic `import()`;
+- import/export attributes;
+- CommonJS/namespace `import =`;
+- JSX namespaced names.
+
+Historical items below are retained as a record of bugs found by earlier
+conformance sweeps; many are already fixed.
 
 ## Found in exhaustive sweep (session 2)
 

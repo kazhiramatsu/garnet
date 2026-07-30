@@ -265,6 +265,7 @@ function fnvalAdapterBody(builtin: string): string | undefined {
     case "object.getPrototypeOf": return hv(`ts_get_proto(${val(0)})`);
     case "object.setPrototypeOf": return hv(`ts_set_proto(${val(0)}, ${val(1)})`);
     case "object.keys": return hv(`ts_object_keys(${val(0)})`);
+    case "object.forInKeys": return hv(`ts_object_for_in_keys(${val(0)})`);
     case "object.getOwnPropertyNames": return hv(`ts_object_get_own_property_names(${val(0)})`);
     case "object.getOwnPropertySymbols": return hv(`ts_object_get_own_property_symbols(${val(0)})`);
     case "object.values": return hv(`ts_object_values(${val(0)})`);
@@ -289,6 +290,7 @@ function fnvalAdapterBody(builtin: string): string | undefined {
     case "objproto.valueOf": return "return ts_objproto_valueOf(a, n);";
     // ---- Array statics ----
     case "array.isArray": return hv(`ts_bool(ts_is_array_fast(${val(0)}))`);
+    case "array.pushHole": return `ts_array_push_hole(${val(0)}); return TS_UNDEFINED;`;
     case "array.from": return `return n>1 ? ts_array_from_mapped(${val(0)}, ${val(1)}) : ts_array_from(${val(0)});`;
     case "array.of": return "return ts_array_of(a, n);";
     // ---- String statics ----
@@ -5623,6 +5625,7 @@ function emitInstC(s: string[], inst: any, cx: EmitCtx, numericFacts: NumericAna
         case "date.toISOString": expr = `ts_date_to_iso(${n(0)})`; numeric = false; break;
         // Object static methods (use the field-name table)
         case "object.keys": expr = `ts_object_keys(${v(0)})`; numeric = false; break;
+        case "object.forInKeys": expr = `ts_object_for_in_keys(${v(0)})`; numeric = false; break;
         case "object.protoToStringCall": expr = `ts_objproto_tostring_call(${v(0)})`; numeric = false; break;
         case "object.getOwnPropertyNames": expr = `ts_object_get_own_property_names(${v(0)})`; numeric = false; break;
         case "object.freeze": expr = `ts_object_freeze(${v(0)})`; numeric = false; break;
@@ -5686,6 +5689,7 @@ function emitInstC(s: string[], inst: any, cx: EmitCtx, numericFacts: NumericAna
         // prototype-chain walk against the class value's prototype (returns tsv bool).
         case "instanceof.dyn": expr = `ts_instanceof_dyn(${v(0)}, ${v(1)})`; numeric = false; break;
         case "array.isArray": expr = `ts_bool(ts_is_array_fast(${v(0)}))`; numeric = false; break;
+        case "array.pushHole": expr = `(ts_array_push_hole(${v(0)}), TS_UNDEFINED)`; numeric = false; break;
         case "array.newLength": expr = `ts_array_new_length(${n(0)})`; numeric = false; break;
         case "array.from": expr = args.length >= 2 ? `ts_array_from_mapped(${v(0)}, ${v(1)})` : `ts_array_from(${v(0)})`; numeric = false; break;
         // JSON

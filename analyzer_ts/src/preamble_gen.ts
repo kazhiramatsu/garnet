@@ -123,6 +123,10 @@ export const RUNTIME_PREAMBLE: string =
 "  return f;\n" +
 "}\n" +
 "\n" +
+"/* Built-in own properties are non-enumerable. Keep the frozen emitter's compact\n" +
+"   setup table while giving its historical ts_set_cstr calls spec attributes. */\n" +
+"#define ts_set_cstr(obj, name, value) \\\n" +
+"  ts_define_data((obj), ts_intern_field((name), (uint32_t)strlen(name)), (value), 0, 1, 1)\n" +
 "static void ts_setup_global_object(void){\n" +
 "  ts_global_this_init();\n" +
 "  tsv _g = ts_global_this();\n" +
@@ -392,4 +396,5 @@ export const RUNTIME_PREAMBLE: string =
 "  ts_global_set(\"isNaN\", ts_make_global_fn(ts_fnval_global_isNaN, 1u, \"isNaN\", 0));\n" +
 "  ts_global_set(\"isFinite\", ts_make_global_fn(ts_fnval_global_isFinite, 1u, \"isFinite\", 0));\n" +
 "}\n" +
+"#undef ts_set_cstr\n" +
 "";

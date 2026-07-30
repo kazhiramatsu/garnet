@@ -9,8 +9,9 @@
 #                       selfbench は P4b で自己完結版（pinned 入力+参照C）に置換予定）
 #   parity [filter]     emitc_diff.sh（Rust emit vs 凍結TS emitc の byte 比較）+ PASS/FAIL 判定
 #   conf [tier] [flt]   run_conformance.sh（tier 省略時 all = basic+exhaustive）
+#   syntax              TypeScript構文網羅（合法性/AST/V8差分/明示reject）
 #   selfconf [filter]   analyzer_conformance.sh（凍結TS の V8 差分）+ PASS/FAIL 判定
-#   bundler             run_bundler_tests.sh（39 fixture）
+#   bundler             run_bundler_tests.sh（40 fixture）
 #   unit                run_runtime_tests.sh + run_unit_tests.sh
 #   gc                  run_gc_stress.sh
 #   bench [filter]      run_benchmarks.sh（correctness + time budget）
@@ -149,6 +150,7 @@ case "$cmd" in
   typed|selfbench) exec bash "$S/typed_selfhost.sh" ;;
   parity)       run_parity "${1:-}" ;;
   conf)         exec bash "$S/run_conformance.sh" "${1:-all}" "${2:-}" ;;
+  syntax)       exec bash "$S/run_syntax_conformance.sh" ;;
   selfconf)     run_selfconf "${1:-}" ;;
   bundler)      exec bash "$S/run_bundler_tests.sh" ;;
   unit)         rc=0
