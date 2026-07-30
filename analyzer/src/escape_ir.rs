@@ -100,6 +100,10 @@ pub struct Program {
     pub map_proto_methods: Vec<ObjectProtoMethod>,
     #[serde(default, rename = "setProtoMethods")]
     pub set_proto_methods: Vec<ObjectProtoMethod>,
+    #[serde(default, rename = "weakMapProtoMethods")]
+    pub weak_map_proto_methods: Vec<ObjectProtoMethod>,
+    #[serde(default, rename = "weakSetProtoMethods")]
+    pub weak_set_proto_methods: Vec<ObjectProtoMethod>,
     #[serde(default, rename = "headersProtoMethods")]
     pub headers_proto_methods: Vec<ObjectProtoMethod>,
     #[serde(default, rename = "functionProtoMethods")]

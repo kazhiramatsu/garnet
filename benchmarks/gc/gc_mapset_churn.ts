@@ -1,6 +1,6 @@
-// GC bench: Map/Set churn（P2a のハッシュ索引化の主対象）。
-// 4096/2048 キー規模で set/delete を繰り返す — 現行 map_find の O(n) 走査が
-// RT_STATS のプローブ長ヒストグラムにそのまま出る。
+// GC bench: Map/Set churn（ハッシュ索引の回帰検出用）。
+// 4096/2048 キー規模で set/delete を繰り返し、RT_STATS の map_find
+// 平均プローブ長が要素数に比例して再び増えていないことを確認する。
 function main(): void {
   const m = new Map<number, number>();
   let acc = 0;

@@ -24,9 +24,14 @@ Array:  map, filter, forEach, reduce, indexOf, includes, slice, concat, join,
         reduceRight, copyWithin, toString, toSorted, toReversed, with, toSpliced.
         Static Array.isArray, Array.of, Array.from.
 Map:    set, get, has, delete, clear, size, keys, values, entries, forEach
-        (any key type via SameValueZero; insertion order preserved; GC-traced)
+        (any key type via SameValueZero; insertion order preserved; GC-traced;
+        open-addressing hash index with cached per-entry hashes)
 Set:    add, has, delete, clear, size, keys, values, entries, forEach
         (SameValueZero dedup)
+WeakMap:set, get, has, delete (object/function/non-registered-Symbol keys;
+        ephemeron GC semantics; Symbol.for keys rejected)
+WeakSet:add, has, delete (object/function/non-registered-Symbol keys;
+        weak GC semantics; Symbol.for keys rejected)
 Math:   sqrt abs floor ceil round trunc sign sin cos tan asin acos atan sinh
         cosh tanh exp log log2 log10 cbrt pow atan2 hypot max(2) min(2) random
         asinh acosh atanh expm1 log1p fround f16round clz32 imul
@@ -67,12 +72,17 @@ helpers. Link with -lm. JS `/` is always float division and `%` is fmod, EXCEPT
 `intLocal % nonzeroIntConstant` which stays integer-fast (no FPE; hot `% C` loops
 keep native speed).
 
-Map/Set are runtime containers (TS_KIND_MAP/SET) with parallel key/value arrays,
-linear-probe SameValueZero equality, insertion-order iteration, and full GC
-integration (mark traverses keys/vals/elems; sweep frees the arrays). Iterable
-constructor seeding is supported for the common array/iterator paths. Callbacks
-for map/filter/forEach/reduce and Map/Set.forEach are first-class closures
-invoked via ts_call, which prepends the closure's captured environment.
+Map/Set are runtime containers (TS_KIND_MAP/SET) with insertion-order dense
+arrays and an adaptive open-addressing side index. SameValueZero hashes are
+cached beside the dense entries, avoiding repeated string/content hashing and
+most equality checks on collision chains. Collections below eight live entries
+retain the cache-friendly linear fast path; larger collections have expected
+O(1) lookup. WeakMap/WeakSet reuse that index but are non-iterable. Their GC
+handling is described in [weak_collections.md](weak_collections.md).
+
+Iterable constructor seeding is supported for the common array/iterator paths.
+Callbacks for map/filter/forEach/reduce and Map/Set.forEach are first-class
+closures invoked via ts_call, which prepends the closure's captured environment.
 
 ## NOT yet implemented (rejected loudly)
 - String: substr, localeCompare, toLocaleString, full Intl locale casing beyond
@@ -96,7 +106,7 @@ invoked via ts_call, which prepends the closure's captured environment.
   runtime TypeError.
 - Web/fetch: streaming request/response bodies, abort events, real DOMException
   objects, and full Web-compatible Headers/Request/Response semantics.
-- WeakMap / WeakSet / WeakRef / FinalizationRegistry, Reflect, Proxy,
+- WeakRef / FinalizationRegistry,
   ArrayBuffer / DataView / TypedArray, Intl, and module value import/export
   linkage are outside the current implemented surface.
 - BigInt: DEFERRED. Arbitrary-precision integers do not fit the NaN-boxed double

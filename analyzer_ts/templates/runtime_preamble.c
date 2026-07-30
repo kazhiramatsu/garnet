@@ -34,6 +34,8 @@ static tsv ts_fnval_global_Symbol(tsv* a, int n){ (void)a; (void)n; return ts_sy
 static tsv ts_fnval_global_SyntaxError(tsv* a, int n){ (void)a; (void)n; tsv o=ts_new_object(); if(n>0) ts_set(o, ts_intern_field("message",7), ts_to_string_v(a[0])); return o; }
 static tsv ts_fnval_global_TypeError(tsv* a, int n){ (void)a; (void)n; tsv o=ts_new_object(); if(n>0) ts_set(o, ts_intern_field("message",7), ts_to_string_v(a[0])); return o; }
 static tsv ts_fnval_global_URIError(tsv* a, int n){ (void)a; (void)n; tsv o=ts_new_object(); if(n>0) ts_set(o, ts_intern_field("message",7), ts_to_string_v(a[0])); return o; }
+static tsv ts_fnval_global_WeakMap(tsv* a, int n){ (void)a; (void)n; ts_unsupported_builtin("WeakMap constructor called without supported new lowering"); return TS_UNDEFINED; }
+static tsv ts_fnval_global_WeakSet(tsv* a, int n){ (void)a; (void)n; ts_unsupported_builtin("WeakSet constructor called without supported new lowering"); return TS_UNDEFINED; }
 static tsv ts_fnval_global_isFinite(tsv* a, int n){ (void)a; (void)n; return ts_bool(isfinite(ts_number_coerce((n>0?a[0]:TS_UNDEFINED)))); }
 static tsv ts_fnval_global_isNaN(tsv* a, int n){ (void)a; (void)n; return ts_bool(isnan(ts_number_coerce((n>0?a[0]:TS_UNDEFINED)))); }
 static tsv ts_fnval_global_parseFloat(tsv* a, int n){ (void)a; (void)n; return ts_num(ts_parse_float((n>0?a[0]:TS_UNDEFINED))); }
@@ -202,6 +204,18 @@ static void ts_setup_global_object(void){
   ts_set_cstr(_Set, "prototype", ts_set_proto_obj());
   ts_set_cstr(ts_set_proto_obj(), "constructor", _Set);
   ts_global_set("Set", _Set);
+  ts_gc_unroot(1);
+  tsv _WeakMap = ts_make_global_fn(ts_fnval_global_WeakMap, 0u, "WeakMap", 0);
+  ts_gc_root(&_WeakMap);
+  ts_set_cstr(_WeakMap, "prototype", ts_weakmap_proto());
+  ts_set_cstr(ts_weakmap_proto(), "constructor", _WeakMap);
+  ts_global_set("WeakMap", _WeakMap);
+  ts_gc_unroot(1);
+  tsv _WeakSet = ts_make_global_fn(ts_fnval_global_WeakSet, 0u, "WeakSet", 0);
+  ts_gc_root(&_WeakSet);
+  ts_set_cstr(_WeakSet, "prototype", ts_weakset_proto_obj());
+  ts_set_cstr(ts_weakset_proto_obj(), "constructor", _WeakSet);
+  ts_global_set("WeakSet", _WeakSet);
   ts_gc_unroot(1);
   tsv _String = ts_make_global_fn(ts_fnval_global_String, 1u, "String", 0);
   ts_gc_root(&_String);
@@ -375,4 +389,3 @@ static void ts_setup_global_object(void){
   ts_global_set("isNaN", ts_make_global_fn(ts_fnval_global_isNaN, 1u, "isNaN", 0));
   ts_global_set("isFinite", ts_make_global_fn(ts_fnval_global_isFinite, 1u, "isFinite", 0));
 }
-

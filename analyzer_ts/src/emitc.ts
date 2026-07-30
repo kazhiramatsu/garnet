@@ -241,6 +241,8 @@ function fnvalAdapterBody(builtin: string): string | undefined {
     case "global.Promise": return 'if(n>0) return ts_promise_new_executor(a[0]); ts_unsupported_builtin("Promise constructor requires executor"); return TS_UNDEFINED;';
     case "global.Map": return 'ts_unsupported_builtin("Map constructor called without supported new lowering"); return TS_UNDEFINED;';
     case "global.Set": return 'ts_unsupported_builtin("Set constructor called without supported new lowering"); return TS_UNDEFINED;';
+    case "global.WeakMap": return 'ts_unsupported_builtin("WeakMap constructor called without supported new lowering"); return TS_UNDEFINED;';
+    case "global.WeakSet": return 'ts_unsupported_builtin("WeakSet constructor called without supported new lowering"); return TS_UNDEFINED;';
     case "global.Date": return 'ts_unsupported_builtin("Date constructor called as first-class value"); return TS_UNDEFINED;';
     case "global.Function": return 'ts_unsupported_builtin("Function constructor"); return TS_UNDEFINED;';
     case "global.Error": case "global.TypeError": case "global.RangeError": case "global.SyntaxError":
@@ -323,7 +325,7 @@ const GLOBAL_FN_VALUE_BUILTINS: string[] = [
   "global.String", "global.Number", "global.Boolean", "global.Symbol",
   "global.fetch", "global.Array", "global.Object", "global.Promise",
   "global.Headers", "global.AbortController", "global.AbortSignal",
-  "abortsignal.timeout", "global.Map", "global.Set", "global.Date",
+  "abortsignal.timeout", "global.Map", "global.Set", "global.WeakMap", "global.WeakSet", "global.Date",
   "global.Function", "global.Error", "global.TypeError", "global.RangeError",
   "global.SyntaxError", "global.ReferenceError", "global.EvalError",
   "global.URIError", "global.AggregateError", "console.log", "console.error",
@@ -2505,6 +2507,8 @@ function protoSetups(prog: any, needsRegexp: boolean, needsUnicode: boolean): st
   reg("ts_setup_promise_proto", "ts_promise_proto_init();", prog.promiseProtoMethods ?? [], "ts_promise_proto_register");
   reg("ts_setup_map_proto", "ts_map_proto_init();", prog.mapProtoMethods ?? [], "ts_map_proto_register");
   reg("ts_setup_set_proto", "ts_set_proto_init();", prog.setProtoMethods ?? [], "ts_set_proto_register");
+  reg("ts_setup_weakmap_proto", "ts_weakmap_proto_init();", prog.weakMapProtoMethods ?? [], "ts_weakmap_proto_register");
+  reg("ts_setup_weakset_proto", "ts_weakset_proto_init();", prog.weakSetProtoMethods ?? [], "ts_weakset_proto_register");
   reg("ts_setup_headers_proto", "ts_headers_proto_init();", prog.headersProtoMethods ?? [], "ts_headers_proto_register");
   reg("ts_setup_function_proto", "ts_function_proto_init();", prog.functionProtoMethods ?? [], "ts_function_proto_register");
   // string (unicode-gated remap; `normalize` skipped without unicode)
@@ -5141,6 +5145,7 @@ function emitInstC(s: string[], inst: any, cx: EmitCtx, numericFacts: NumericAna
         const acc: Record<string, string> = {
           object: "ts_object_proto", array: "ts_array_proto", string: "ts_string_proto",
           map: "ts_map_proto", set: "ts_set_proto_obj", headers: "ts_headers_proto",
+          weakmap: "ts_weakmap_proto", weakset: "ts_weakset_proto_obj",
           number: "ts_number_proto", boolean: "ts_boolean_proto", function: "ts_function_proto",
         };
         const fn = acc[b.slice("protoobj.".length)];
@@ -5641,8 +5646,12 @@ function emitInstC(s: string[], inst: any, cx: EmitCtx, numericFacts: NumericAna
         case "object.hasOwn": expr = `ts_bool(ts_has_own_dyn(${v(0)}, ${v(1)}))`; numeric = false; break;
         case "object.is": expr = `ts_bool(ts_object_is(${v(0)}, ${v(1)}))`; numeric = false; break;
         case "headers.new": expr = `ts_headers_new(${args.length === 0 ? "TS_UNDEFINED" : v(0)})`; numeric = false; break;
+        case "weakmap.new": expr = "ts_new_weakmap()"; numeric = false; break;
+        case "weakset.new": expr = "ts_new_weakset()"; numeric = false; break;
         case "map.seed": expr = `ts_map_seed(${v(0)}, ${v(1)})`; numeric = false; break;
         case "set.seed": expr = `ts_set_seed(${v(0)}, ${v(1)})`; numeric = false; break;
+        case "weakmap.seed": expr = `ts_weakmap_seed(${v(0)}, ${v(1)})`; numeric = false; break;
+        case "weakset.seed": expr = `ts_weakset_seed(${v(0)}, ${v(1)})`; numeric = false; break;
         case "object.getOwnPropertyDescriptor": expr = `ts_get_own_property_descriptor(${v(0)}, ${v(1)})`; numeric = false; break;
         case "object.getOwnPropertyDescriptors": expr = `ts_get_own_property_descriptors(${v(0)})`; numeric = false; break;
         // Reflect.* — thin wrappers over the dynamic property / call /
@@ -5833,6 +5842,10 @@ function emitInstC(s: string[], inst: any, cx: EmitCtx, numericFacts: NumericAna
         case "map.entries": expr = `ts_map_entries(${r})`; numeric = false; break;
         case "map.size": expr = `ts_map_size(${r})`; numeric = true; break;
         case "map.forEach": expr = `({ ts_map_foreach(${r}, ${v(0)}); TS_UNDEFINED; })`; numeric = false; break;
+        case "weakmap.set": expr = `ts_weakmap_set(${r}, ${v(0)}, ${v(1)})`; numeric = false; break;
+        case "weakmap.get": expr = `ts_weakmap_get(${r}, ${v(0)})`; numeric = false; break;
+        case "weakmap.has": expr = `ts_bool(ts_weakmap_has(${r}, ${v(0)}))`; numeric = false; break;
+        case "weakmap.delete": expr = `ts_bool(ts_weakmap_delete(${r}, ${v(0)}))`; numeric = false; break;
         // ---- Set ----
         case "set.add": expr = `ts_set_add(${r}, ${v(0)})`; numeric = false; break;
         case "set.has": expr = `ts_bool(ts_set_has(${r}, ${v(0)}))`; numeric = false; break;
@@ -5846,6 +5859,9 @@ function emitInstC(s: string[], inst: any, cx: EmitCtx, numericFacts: NumericAna
         case "array.values": expr = `ts_array_values_arr(${r})`; numeric = false; break;
         case "set.size": expr = `ts_set_size(${r})`; numeric = true; break;
         case "set.forEach": expr = `({ ts_set_foreach(${r}, ${v(0)}); TS_UNDEFINED; })`; numeric = false; break;
+        case "weakset.add": expr = `ts_weakset_add(${r}, ${v(0)})`; numeric = false; break;
+        case "weakset.has": expr = `ts_bool(ts_weakset_has(${r}, ${v(0)}))`; numeric = false; break;
+        case "weakset.delete": expr = `ts_bool(ts_weakset_delete(${r}, ${v(0)}))`; numeric = false; break;
         case "array.push": {
           let blk = "({ ";
           for (const a of args) blk += `ts_array_push(${r}, ${cxVal(cx, a)}); `;
@@ -6292,6 +6308,8 @@ export function emitProgramC(prog: Program, _result: EscapeResult): string {
   out.push("  ts_setup_promise_proto();\n");
   out.push("  ts_setup_map_proto();\n");
   out.push("  ts_setup_set_proto();\n");
+  out.push("  ts_setup_weakmap_proto();\n");
+  out.push("  ts_setup_weakset_proto();\n");
   out.push("  ts_setup_headers_proto();\n");
   out.push("  ts_setup_string_proto();\n");
   if (needsRegexp) out.push("  ts_setup_regexp_proto();\n");

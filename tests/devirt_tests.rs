@@ -57,7 +57,7 @@ fn main(){
   ]);
   let mut prog = Program{version:1,strict_type_optimizations: Default::default(),types:vec![],fields:vec![],signatures:vec![],globals:vec![],
     scopes:vec![],bindings:vec![],functions:vec![g,circle_area,square_area,shape_area],exports:vec![],
-    site_meta:vec![], classes: base_classes(true,true,true), object_proto_methods: vec![], array_proto_methods: vec![], promise_proto_methods: vec![], map_proto_methods: vec![], set_proto_methods: vec![], headers_proto_methods: vec![], function_proto_methods: vec![], string_proto_methods: vec![], regexp_proto_methods: vec![], number_proto_methods: vec![], boolean_proto_methods: vec![], well_known_symbols: vec![]};
+    site_meta:vec![], classes: base_classes(true,true,true), object_proto_methods: vec![], array_proto_methods: vec![], promise_proto_methods: vec![], map_proto_methods: vec![], set_proto_methods: vec![], weak_map_proto_methods: vec![], weak_set_proto_methods: vec![], headers_proto_methods: vec![], function_proto_methods: vec![], string_proto_methods: vec![], regexp_proto_methods: vec![], number_proto_methods: vec![], boolean_proto_methods: vec![], well_known_symbols: vec![]};
 
   let disp = run_devirt(&mut prog, true);
   // the call in g should have produced a Virtual dispatch

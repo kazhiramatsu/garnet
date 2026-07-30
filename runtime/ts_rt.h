@@ -746,9 +746,11 @@ static inline int ts_is_undefined_fast(tsv v){ return ts_is_undef(v); }
 typedef struct ts_map {
   ts_obj_common o;   /* proto + lazy named-prop map (unified model) */
   tsv* keys; tsv* vals; uint32_t len, cap;
+  uint32_t* hashes;  /* cached SameValueZero hash parallel to keys */
   uint32_t* index;   /* hash slots: 0=empty, 1=tombstone, else dense idx+2 */
   uint32_t index_cap; /* power-of-2 slot count (0 = linear mode) */
   uint32_t tombs;    /* HOLE entries in keys/vals below len */
+  uint8_t weak;      /* WeakMap: keys are weak and values are ephemerons */
 } ts_map;
 
 /* JS Set: insertion-ordered element array, SameValueZero membership; same
@@ -756,9 +758,11 @@ typedef struct ts_map {
 typedef struct ts_set_t {
   ts_obj_common o;   /* proto + lazy named-prop map (unified model) */
   tsv* elems; uint32_t len, cap;
+  uint32_t* hashes;  /* cached SameValueZero hash parallel to elems */
   uint32_t* index;
   uint32_t index_cap;
   uint32_t tombs;
+  uint8_t weak;      /* WeakSet: elements are weak keys */
 } ts_set_t;
 
 /* a closure: code pointer + captured environment (array of cells) */
@@ -844,16 +848,22 @@ tsv ts_promiseproto_finally(tsv* a, int n);
 /* Map.prototype / Set.prototype setup (followon to U-5). */
 tsv  ts_map_proto(void);
 tsv  ts_set_proto_obj(void);
+tsv  ts_weakmap_proto(void);
+tsv  ts_weakset_proto_obj(void);
 tsv  ts_headers_proto(void);
 tsv  ts_abort_controller_proto(void);
 tsv  ts_abort_signal_proto(void);
 void ts_map_proto_init(void);
 void ts_set_proto_init(void);
+void ts_weakmap_proto_init(void);
+void ts_weakset_proto_init(void);
 void ts_headers_proto_init(void);
 void ts_abort_controller_proto_init(void);
 void ts_abort_signal_proto_init(void);
 void ts_map_proto_register(ts_key method_key, const char* name, ts_code fn);
 void ts_set_proto_register(ts_key method_key, const char* name, ts_code fn);
+void ts_weakmap_proto_register(ts_key method_key, const char* name, ts_code fn);
+void ts_weakset_proto_register(ts_key method_key, const char* name, ts_code fn);
 void ts_headers_proto_register(ts_key method_key, const char* name, ts_code fn);
 /* Function.prototype setup (call/apply/bind). */
 tsv  ts_function_proto(void);
@@ -927,6 +937,10 @@ tsv ts_setproto_add(tsv* a, int n); tsv ts_setproto_has(tsv* a, int n);
 tsv ts_setproto_delete(tsv* a, int n); tsv ts_setproto_clear(tsv* a, int n);
 tsv ts_setproto_keys(tsv* a, int n); tsv ts_setproto_values(tsv* a, int n);
 tsv ts_setproto_entries(tsv* a, int n); tsv ts_setproto_forEach(tsv* a, int n);
+tsv ts_weakmapproto_set(tsv* a, int n); tsv ts_weakmapproto_get(tsv* a, int n);
+tsv ts_weakmapproto_has(tsv* a, int n); tsv ts_weakmapproto_delete(tsv* a, int n);
+tsv ts_weaksetproto_add(tsv* a, int n); tsv ts_weaksetproto_has(tsv* a, int n);
+tsv ts_weaksetproto_delete(tsv* a, int n);
 tsv ts_headersproto_get(tsv* a, int n); tsv ts_headersproto_has(tsv* a, int n);
 tsv ts_headersproto_keys(tsv* a, int n); tsv ts_headersproto_values(tsv* a, int n);
 tsv ts_headersproto_entries(tsv* a, int n); tsv ts_headersproto_append(tsv* a, int n);
@@ -1235,6 +1249,24 @@ tsv      ts_set_keys(tsv s);              /* array of elements */
 tsv      ts_set_values(tsv s);            /* array of elements */
 tsv      ts_set_entries(tsv s);           /* array of [value,value] pairs */
 void     ts_set_foreach(tsv s, tsv cb);   /* cb(value, value) */
+/* ---- WeakMap / WeakSet ----
+   WeakMap values use ephemeron semantics: a reachable key retains its value,
+   while the value never retains its own key. Weak containers are intentionally
+   non-iterable and expose no size/clear operation. Objects, functions, and
+   non-registered Symbols are valid keys; Symbol.for identities are rejected. */
+tsv      ts_new_weakmap(void);
+int      ts_is_weakmap(tsv v);
+tsv      ts_weakmap_set(tsv m, tsv k, tsv v);
+tsv      ts_weakmap_get(tsv m, tsv k);
+int      ts_weakmap_has(tsv m, tsv k);
+int      ts_weakmap_delete(tsv m, tsv k);
+tsv      ts_weakmap_seed(tsv m, tsv iterable);
+tsv      ts_new_weakset(void);
+int      ts_is_weakset(tsv v);
+tsv      ts_weakset_add(tsv s, tsv v);
+int      ts_weakset_has(tsv s, tsv v);
+int      ts_weakset_delete(tsv s, tsv v);
+tsv      ts_weakset_seed(tsv s, tsv iterable);
 int  ts_is_array(tsv v);            /* OBJECT-tagged value whose kind is ARRAY */
 tsv  ts_get(tsv obj, ts_key key);
 /* own/inherited data property (field key) shadows; else the inherited prototype

@@ -565,6 +565,30 @@ fn emit_program_with_string_plans(
         );
     }
     s.push_str("}\n\n");
+    s.push_str("static void ts_setup_weakmap_proto(void){\n");
+    s.push_str("  ts_weakmap_proto_init();\n");
+    for m in &program.weak_map_proto_methods {
+        let _ = writeln!(
+            s,
+            "  ts_weakmap_proto_register(TS_KEY_METHOD({}u), {}, {});",
+            m.method_id,
+            c_string_lit(&m.name),
+            m.runtime
+        );
+    }
+    s.push_str("}\n\n");
+    s.push_str("static void ts_setup_weakset_proto(void){\n");
+    s.push_str("  ts_weakset_proto_init();\n");
+    for m in &program.weak_set_proto_methods {
+        let _ = writeln!(
+            s,
+            "  ts_weakset_proto_register(TS_KEY_METHOD({}u), {}, {});",
+            m.method_id,
+            c_string_lit(&m.name),
+            m.runtime
+        );
+    }
+    s.push_str("}\n\n");
     s.push_str("static void ts_setup_headers_proto(void){\n");
     s.push_str("  ts_headers_proto_init();\n");
     for m in &program.headers_proto_methods {
@@ -1003,6 +1027,8 @@ fn emit_program_with_string_plans(
     s.push_str("  ts_setup_promise_proto();\n");
     s.push_str("  ts_setup_map_proto();\n");
     s.push_str("  ts_setup_set_proto();\n");
+    s.push_str("  ts_setup_weakmap_proto();\n");
+    s.push_str("  ts_setup_weakset_proto();\n");
     s.push_str("  ts_setup_headers_proto();\n");
     s.push_str("  ts_setup_string_proto();\n");
     if needs_regexp {
@@ -7325,6 +7351,8 @@ fn fnval_adapter_body(builtin: &str) -> Option<String> {
         "global.Promise" => Some("if(n>0) return ts_promise_new_executor(a[0]); ts_unsupported_builtin(\"Promise constructor requires executor\"); return TS_UNDEFINED;".to_string()),
         "global.Map" => Some("ts_unsupported_builtin(\"Map constructor called without supported new lowering\"); return TS_UNDEFINED;".to_string()),
         "global.Set" => Some("ts_unsupported_builtin(\"Set constructor called without supported new lowering\"); return TS_UNDEFINED;".to_string()),
+        "global.WeakMap" => Some("ts_unsupported_builtin(\"WeakMap constructor called without supported new lowering\"); return TS_UNDEFINED;".to_string()),
+        "global.WeakSet" => Some("ts_unsupported_builtin(\"WeakSet constructor called without supported new lowering\"); return TS_UNDEFINED;".to_string()),
         "global.Date" => Some("ts_unsupported_builtin(\"Date constructor called as first-class value\"); return TS_UNDEFINED;".to_string()),
         "global.Function" => Some("ts_unsupported_builtin(\"Function constructor\"); return TS_UNDEFINED;".to_string()),
         "global.Error" | "global.TypeError" | "global.RangeError" | "global.SyntaxError" |
@@ -7462,6 +7490,8 @@ fn global_fn_value_builtins() -> &'static [&'static str] {
         "abortsignal.timeout",
         "global.Map",
         "global.Set",
+        "global.WeakMap",
+        "global.WeakSet",
         "global.Date",
         "global.Function",
         "global.Error",
@@ -7763,6 +7793,20 @@ fn emit_global_setup(s: &mut String, needs_fetch: bool) {
     set_val(s, "_Set", "prototype", "ts_set_proto_obj()");
     set_val(s, "ts_set_proto_obj()", "constructor", "_Set");
     global_set_rooted(s, "Set", "_Set");
+    s.push_str(
+        "  tsv _WeakMap = ts_make_global_fn(ts_fnval_global_WeakMap, 0u, \"WeakMap\", 0);\n",
+    );
+    root_local(s, "_WeakMap");
+    set_val(s, "_WeakMap", "prototype", "ts_weakmap_proto()");
+    set_val(s, "ts_weakmap_proto()", "constructor", "_WeakMap");
+    global_set_rooted(s, "WeakMap", "_WeakMap");
+    s.push_str(
+        "  tsv _WeakSet = ts_make_global_fn(ts_fnval_global_WeakSet, 0u, \"WeakSet\", 0);\n",
+    );
+    root_local(s, "_WeakSet");
+    set_val(s, "_WeakSet", "prototype", "ts_weakset_proto_obj()");
+    set_val(s, "ts_weakset_proto_obj()", "constructor", "_WeakSet");
+    global_set_rooted(s, "WeakSet", "_WeakSet");
 
     s.push_str("  tsv _String = ts_make_global_fn(ts_fnval_global_String, 1u, \"String\", 0);\n");
     root_local(s, "_String");
@@ -14502,8 +14546,12 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     ),
                     false,
                 ),
+                "weakmap.new" => ("ts_new_weakmap()".to_string(), false),
+                "weakset.new" => ("ts_new_weakset()".to_string(), false),
                 "map.seed" => (format!("ts_map_seed({}, {})", v(0), v(1)), false),
                 "set.seed" => (format!("ts_set_seed({}, {})", v(0), v(1)), false),
+                "weakmap.seed" => (format!("ts_weakmap_seed({}, {})", v(0), v(1)), false),
+                "weakset.seed" => (format!("ts_weakset_seed({}, {})", v(0), v(1)), false),
                 "object.getOwnPropertyDescriptor" => (
                     format!("ts_get_own_property_descriptor({}, {})", v(0), v(1)),
                     false,
@@ -15136,6 +15184,11 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     format!("({{ ts_map_foreach({}, {}); TS_UNDEFINED; }})", r, v(0)),
                     false,
                 ),
+                // ---- WeakMap ----
+                "weakmap.set" => (format!("ts_weakmap_set({}, {}, {})", r, v(0), v(1)), false),
+                "weakmap.get" => (format!("ts_weakmap_get({}, {})", r, v(0)), false),
+                "weakmap.has" => (format!("ts_bool(ts_weakmap_has({}, {}))", r, v(0)), false),
+                "weakmap.delete" => (format!("ts_bool(ts_weakmap_delete({}, {}))", r, v(0)), false),
                 // ---- Set ----
                 "set.add" => (format!("ts_set_add({}, {})", r, v(0)), false),
                 "set.has" => (format!("ts_bool(ts_set_has({}, {}))", r, v(0)), false),
@@ -15152,6 +15205,10 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     format!("({{ ts_set_foreach({}, {}); TS_UNDEFINED; }})", r, v(0)),
                     false,
                 ),
+                // ---- WeakSet ----
+                "weakset.add" => (format!("ts_weakset_add({}, {})", r, v(0)), false),
+                "weakset.has" => (format!("ts_bool(ts_weakset_has({}, {}))", r, v(0)), false),
+                "weakset.delete" => (format!("ts_bool(ts_weakset_delete({}, {}))", r, v(0)), false),
                 other => {
                     let _ = writeln!(s, "  ts_unsupported_builtin(\"{}\");", other);
                     ("TS_UNDEFINED".to_string(), false)
@@ -15299,6 +15356,8 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     "string" => "ts_string_proto",
                     "map" => "ts_map_proto",
                     "set" => "ts_set_proto_obj",
+                    "weakmap" => "ts_weakmap_proto",
+                    "weakset" => "ts_weakset_proto_obj",
                     "headers" => "ts_headers_proto",
                     "number" => "ts_number_proto",
                     "boolean" => "ts_boolean_proto",

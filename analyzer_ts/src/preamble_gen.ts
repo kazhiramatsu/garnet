@@ -37,6 +37,8 @@ export const RUNTIME_PREAMBLE: string =
 "static tsv ts_fnval_global_SyntaxError(tsv* a, int n){ (void)a; (void)n; tsv o=ts_new_object(); if(n>0) ts_set(o, ts_intern_field(\"message\",7), ts_to_string_v(a[0])); return o; }\n" +
 "static tsv ts_fnval_global_TypeError(tsv* a, int n){ (void)a; (void)n; tsv o=ts_new_object(); if(n>0) ts_set(o, ts_intern_field(\"message\",7), ts_to_string_v(a[0])); return o; }\n" +
 "static tsv ts_fnval_global_URIError(tsv* a, int n){ (void)a; (void)n; tsv o=ts_new_object(); if(n>0) ts_set(o, ts_intern_field(\"message\",7), ts_to_string_v(a[0])); return o; }\n" +
+"static tsv ts_fnval_global_WeakMap(tsv* a, int n){ (void)a; (void)n; ts_unsupported_builtin(\"WeakMap constructor called without supported new lowering\"); return TS_UNDEFINED; }\n" +
+"static tsv ts_fnval_global_WeakSet(tsv* a, int n){ (void)a; (void)n; ts_unsupported_builtin(\"WeakSet constructor called without supported new lowering\"); return TS_UNDEFINED; }\n" +
 "static tsv ts_fnval_global_isFinite(tsv* a, int n){ (void)a; (void)n; return ts_bool(isfinite(ts_number_coerce((n>0?a[0]:TS_UNDEFINED)))); }\n" +
 "static tsv ts_fnval_global_isNaN(tsv* a, int n){ (void)a; (void)n; return ts_bool(isnan(ts_number_coerce((n>0?a[0]:TS_UNDEFINED)))); }\n" +
 "static tsv ts_fnval_global_parseFloat(tsv* a, int n){ (void)a; (void)n; return ts_num(ts_parse_float((n>0?a[0]:TS_UNDEFINED))); }\n" +
@@ -205,6 +207,18 @@ export const RUNTIME_PREAMBLE: string =
 "  ts_set_cstr(_Set, \"prototype\", ts_set_proto_obj());\n" +
 "  ts_set_cstr(ts_set_proto_obj(), \"constructor\", _Set);\n" +
 "  ts_global_set(\"Set\", _Set);\n" +
+"  ts_gc_unroot(1);\n" +
+"  tsv _WeakMap = ts_make_global_fn(ts_fnval_global_WeakMap, 0u, \"WeakMap\", 0);\n" +
+"  ts_gc_root(&_WeakMap);\n" +
+"  ts_set_cstr(_WeakMap, \"prototype\", ts_weakmap_proto());\n" +
+"  ts_set_cstr(ts_weakmap_proto(), \"constructor\", _WeakMap);\n" +
+"  ts_global_set(\"WeakMap\", _WeakMap);\n" +
+"  ts_gc_unroot(1);\n" +
+"  tsv _WeakSet = ts_make_global_fn(ts_fnval_global_WeakSet, 0u, \"WeakSet\", 0);\n" +
+"  ts_gc_root(&_WeakSet);\n" +
+"  ts_set_cstr(_WeakSet, \"prototype\", ts_weakset_proto_obj());\n" +
+"  ts_set_cstr(ts_weakset_proto_obj(), \"constructor\", _WeakSet);\n" +
+"  ts_global_set(\"WeakSet\", _WeakSet);\n" +
 "  ts_gc_unroot(1);\n" +
 "  tsv _String = ts_make_global_fn(ts_fnval_global_String, 1u, \"String\", 0);\n" +
 "  ts_gc_root(&_String);\n" +
@@ -378,5 +392,4 @@ export const RUNTIME_PREAMBLE: string =
 "  ts_global_set(\"isNaN\", ts_make_global_fn(ts_fnval_global_isNaN, 1u, \"isNaN\", 0));\n" +
 "  ts_global_set(\"isFinite\", ts_make_global_fn(ts_fnval_global_isFinite, 1u, \"isFinite\", 0));\n" +
 "}\n" +
-"\n" +
 "";

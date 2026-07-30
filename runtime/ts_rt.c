@@ -529,6 +529,8 @@ static tsv g_object_proto_v = TS_NULL;
 static tsv g_array_proto_v = TS_NULL;   /* unified model: Array.prototype */
 static tsv g_map_proto_v = TS_NULL;     /* unified model: Map.prototype */
 static tsv g_set_proto_v = TS_NULL;     /* unified model: Set.prototype */
+static tsv g_weakmap_proto_v = TS_NULL; /* unified model: WeakMap.prototype */
+static tsv g_weakset_proto_v = TS_NULL; /* unified model: WeakSet.prototype */
 static tsv g_headers_proto_v = TS_NULL; /* simplified Headers.prototype */
 static tsv g_abort_controller_proto_v = TS_NULL; /* simplified AbortController.prototype */
 static tsv g_abort_signal_proto_v = TS_NULL;     /* simplified AbortSignal.prototype */
@@ -589,6 +591,10 @@ void ts_object_proto_register(ts_key method_key, const char* name, ts_code fn){
    (keyv) entry points; ts_key_to_value reconstructs the value from a ts_key. */
 int g_has_proxies = 0;   /* declared in ts_rt.h; see ts_is_proxy there */
 static tsv ts_key_to_value(ts_key k);
+/* User-symbol property keys store a compact sym_id. The side table is defined
+   with the Symbol runtime below; property creation and GC scanning use it to
+   recover the heap Symbol that the numeric key strongly denotes. */
+static tsv sym_value_by_id(uint32_t sym_id);
 static tsv ts_proxy_get_v(tsv pv, tsv keyv, tsv receiver);
 static int ts_proxy_set_v(tsv pv, tsv keyv, tsv val, tsv receiver);
 static int ts_proxy_has_v(tsv pv, tsv keyv);
@@ -1019,6 +1025,11 @@ static ts_prop* find_prop(ts_object* o, ts_key key, int create){
   uint32_t added = o->len++;
   o->props[added].key=key; o->props[added].val=TS_UNDEFINED;
   o->props[added].flags=TS_PROP_DEFAULT;   /* must NOT be 0 (=all-false) */
+  /* A user-Symbol property name is a strong edge even though ts_prop stores
+     only its compact id. Enroll old owners when that Symbol is young; the GC
+     scanner reconstructs and marks the same edge from the weak side table. */
+  if (key >= TS_USERSYM_KEY_BASE)
+    ts_write_barrier(ts_obj(o), sym_value_by_id(key - TS_USERSYM_KEY_BASE));
   if (o->prop_index) prop_index_put(o, added);
   ts_obj_set_shape(o, shape_transition(ts_obj_shape_id(o), key));
   return &o->props[added];
@@ -2091,24 +2102,15 @@ static void ts_fmt_num(double d, char* buf, size_t n){
 
 /* ---------------- Symbol (symbol_design.md) ---------------- */
 static uint32_t g_next_sym_id = 0;   /* unique id per user symbol (0,1,2,...) */
-/* sym_id -> description, for console.log/dir's `Symbol(desc)` rendering of a
-   symbol-keyed property. The property key `obj[sym]` stores is TS_KEY_USERSYM(sym_id)
-   and the symbol value itself isn't retained on the object, so the inspector needs
-   this side table to recover the description. User & registered symbols register
-   here; WKSYM keys carry a wksym id and resolve via ts_wksym() instead. Append-only,
-   indexed by sym_id (gaps from wksym sym_ids stay undefined, never queried via a
-   USERSYM key). GC marks the contents (realloc-safe: we mark values, not slots). */
-static tsv* g_sym_desc = NULL;
-static uint32_t g_sym_desc_len = 0, g_sym_desc_cap = 0;
+/* Weak sym_id -> Symbol identity table. A user-symbol property key stores only
+   TS_KEY_USERSYM(sym_id), so property scanning resolves that id through this
+   table and marks the Symbol as a strong property-name edge. The table itself
+   is deliberately NOT a GC root: an ordinary Symbol that is reachable only as
+   a WeakMap/WeakSet key must be collectible. Dead slots are cleared after the
+   ephemeron fixed point and before handle reuse. Symbol.for identities remain
+   strongly held by g_symreg; well-known symbols use separate permanent roots. */
 static tsv* g_sym_value = NULL;
 static uint32_t g_sym_value_len = 0, g_sym_value_cap = 0;
-static void sym_desc_register(uint32_t sym_id, tsv desc){
-  while (sym_id >= g_sym_desc_cap){ g_sym_desc_cap = g_sym_desc_cap?g_sym_desc_cap*2:16;
-    g_sym_desc = realloc(g_sym_desc, sizeof(tsv)*g_sym_desc_cap); }
-  while (g_sym_desc_len <= sym_id) g_sym_desc[g_sym_desc_len++] = TS_UNDEFINED;
-  g_sym_desc[sym_id] = desc;
-}
-static tsv sym_desc_by_id(uint32_t sym_id){ return (sym_id < g_sym_desc_len) ? g_sym_desc[sym_id] : TS_UNDEFINED; }
 static void sym_value_register(uint32_t sym_id, tsv sym){
   while (sym_id >= g_sym_value_cap){ g_sym_value_cap = g_sym_value_cap?g_sym_value_cap*2:16;
     g_sym_value = realloc(g_sym_value, sizeof(tsv)*g_sym_value_cap); }
@@ -2129,7 +2131,6 @@ tsv ts_symbol_new(tsv description){
   s->registered = 0;
   s->description = description;
   tsv symv = ts_obj(s);
-  sym_desc_register(s->sym_id, description);
   sym_value_register(s->sym_id, symv);
   ts_gc_unroot(1);
   return symv;
@@ -2217,7 +2218,6 @@ tsv ts_symbol_for(tsv key){
   s->registered = 1;
   s->description = ks;
   tsv symv = ts_obj(s);
-  sym_desc_register(s->sym_id, ks);
   sym_value_register(s->sym_id, symv);
   if (g_symreg_len == g_symreg_cap){
     g_symreg_cap = g_symreg_cap ? g_symreg_cap*2 : 8;
@@ -2840,6 +2840,8 @@ static void gc_mark_async_roots(void);
 static void gc_mark_async_roots_young(void);
 static void gc_free_cell(ts_gc_header* h);
 static void gc_mark_class_fields(ts_object* o, int young, int depth);
+static void gc_weak_fixpoint_and_prune(int young);
+static void gc_symbol_weak_prune(int young);
 
 /* ---- worklist marking (gc_moving_plan Phase A) ----
    The marker is an explicit stack, not recursion: deep pointer chains (a 10^5
@@ -2852,6 +2854,23 @@ static ts_gc_header** g_markstack = NULL;
 static size_t g_markstack_len = 0, g_markstack_cap = 0;
 static ts_gc_header** g_marked_nonheap = NULL;
 static size_t g_marked_nonheap_len = 0, g_marked_nonheap_cap = 0;
+/* Reachable WeakMap/WeakSet cells encountered during the current mark. Raw
+   pointers are safe here: ephemeron processing and dead-key pruning finish
+   before the moving/sweep phase starts, then the length is reset. Old weak
+   containers scanned through the minor-GC remembered set enter this list too. */
+static ts_gc_header** g_weak_work = NULL;
+static size_t g_weak_work_len = 0, g_weak_work_cap = 0;
+static void gc_weak_begin(void){ g_weak_work_len = 0; }
+static void gc_weak_enqueue(ts_gc_header* h){
+  if (g_weak_work_len == g_weak_work_cap){
+    size_t next = g_weak_work_cap ? g_weak_work_cap * 2 : 64;
+    ts_gc_header** grown =
+      (ts_gc_header**)realloc(g_weak_work, sizeof(ts_gc_header*) * next);
+    if (!grown) ts_abort_msg("out of memory growing GC weak worklist");
+    g_weak_work = grown; g_weak_work_cap = next;
+  }
+  g_weak_work[g_weak_work_len++] = h;
+}
 static void gc_markstack_push(ts_gc_header* h){
   if (g_markstack_len == g_markstack_cap){
     size_t next = g_markstack_cap ? g_markstack_cap * 2 : 8192;
@@ -2908,6 +2927,19 @@ static inline void gc_mark_visit(tsv v, int young, int depth){
 }
 static inline void gc_mark_value(tsv v){ gc_mark_visit(v, 0, 0); }
 static inline void gc_mark_value_young(tsv v){ gc_mark_visit(v, 1, 0); }
+/* ts_prop keeps a compact user-Symbol id rather than a tagged heap reference.
+   Recover and trace that identity here so `obj[sym]` is a genuine strong edge.
+   The weak id table is cleared only after ephemerons reach their fixed point. */
+static inline void gc_mark_property_key(ts_key key, int young, int depth){
+  if (key >= TS_USERSYM_KEY_BASE)
+    gc_mark_visit(sym_value_by_id(key - TS_USERSYM_KEY_BASE), young, depth);
+}
+static inline void gc_mark_common_props(ts_object* o, int young, int depth){
+  for (uint32_t i=0;i<o->len;i++){
+    gc_mark_property_key(o->props[i].key, young, depth);
+    gc_mark_visit(o->props[i].val, young, depth);
+  }
+}
 static void gc_mark_drain(int young){
   while (g_markstack_len){
     ts_gc_header* h = g_markstack[--g_markstack_len];
@@ -2918,7 +2950,7 @@ static void gc_scan_cell(ts_gc_header* h, int young, int depth){
   if (!h) return;
   if (h->kind==TS_KIND_OBJECT){ ts_object* o=(ts_object*)h;
     gc_mark_class_fields(o, young, depth);
-    for (uint32_t i=0;i<o->len;i++) gc_mark_visit(o->props[i].val, young, depth);
+    gc_mark_common_props(o, young, depth);
     gc_mark_visit(o->proto, young, depth);
   } else if (h->kind==TS_KIND_ACCESSOR){ ts_accessor* ac=(ts_accessor*)h;
     gc_mark_visit(ac->getter, young, depth);
@@ -2929,24 +2961,31 @@ static void gc_scan_cell(ts_gc_header* h, int young, int depth){
     if (s->flags & TS_STR_FLAG_VIEW) gc_mark_visit(s->parent, young, depth);
   } else if (h->kind==TS_KIND_FUNC){ ts_func* f=(ts_func*)h;
     for (uint32_t i=0;i<f->envlen;i++) gc_mark_visit(f->env[i], young, depth);
-    for (uint32_t i=0;i<f->o.len;i++) gc_mark_visit(f->o.props[i].val, young, depth);
+    gc_mark_common_props(&f->o, young, depth);
     gc_mark_visit(f->prototype_prop, young, depth);
     gc_mark_visit(f->o.proto, young, depth);
   } else if (h->kind==TS_KIND_ARRAY){ ts_array* a=(ts_array*)h;
     for (uint32_t i=0;i<a->len;i++) gc_mark_visit(a->data[i], young, depth);
     /* unified model: also mark the common header's named-property map + proto. */
-    for (uint32_t i=0;i<a->o.len;i++) gc_mark_visit(a->o.props[i].val, young, depth);
+    gc_mark_common_props(&a->o, young, depth);
     gc_mark_visit(a->o.proto, young, depth);
   } else if (h->kind==TS_KIND_MAP){ ts_map* m=(ts_map*)h;
-    for (uint32_t i=0;i<m->len;i++){
-      gc_mark_visit(m->keys[i], young, depth);
-      gc_mark_visit(m->vals[i], young, depth);
+    if (m->weak){
+      /* Ephemeron entries are deliberately skipped here. Their values are
+         marked after the ordinary transitive closure, iff their keys are live. */
+      gc_weak_enqueue(h);
+    } else {
+      for (uint32_t i=0;i<m->len;i++){
+        gc_mark_visit(m->keys[i], young, depth);
+        gc_mark_visit(m->vals[i], young, depth);
+      }
     }
-    for (uint32_t i=0;i<m->o.len;i++) gc_mark_visit(m->o.props[i].val, young, depth);
+    gc_mark_common_props(&m->o, young, depth);
     gc_mark_visit(m->o.proto, young, depth);
   } else if (h->kind==TS_KIND_SET){ ts_set_t* st=(ts_set_t*)h;
-    for (uint32_t i=0;i<st->len;i++) gc_mark_visit(st->elems[i], young, depth);
-    for (uint32_t i=0;i<st->o.len;i++) gc_mark_visit(st->o.props[i].val, young, depth);
+    if (st->weak) gc_weak_enqueue(h);
+    else for (uint32_t i=0;i<st->len;i++) gc_mark_visit(st->elems[i], young, depth);
+    gc_mark_common_props(&st->o, young, depth);
     gc_mark_visit(st->o.proto, young, depth);
   } else if (h->kind==TS_KIND_PROXY){ ts_proxy* px=(ts_proxy*)h;
     gc_mark_visit(px->target, young, depth); gc_mark_visit(px->handler, young, depth);
@@ -2969,9 +3008,9 @@ static void gc_free_cell_payload(ts_gc_header* h){
   } else if (h->kind==TS_KIND_FUNC){
     ts_func* f=(ts_func*)h; free(f->env); free(f->o.props); free(f->o.prop_index);
   } else if (h->kind==TS_KIND_MAP){
-    ts_map* m=(ts_map*)h; free(m->keys); free(m->vals); free(m->index); free(m->o.props); free(m->o.prop_index);
+    ts_map* m=(ts_map*)h; free(m->keys); free(m->vals); free(m->hashes); free(m->index); free(m->o.props); free(m->o.prop_index);
   } else if (h->kind==TS_KIND_SET){
-    ts_set_t* s=(ts_set_t*)h; free(s->elems); free(s->index); free(s->o.props); free(s->o.prop_index);
+    ts_set_t* s=(ts_set_t*)h; free(s->elems); free(s->hashes); free(s->index); free(s->o.props); free(s->o.prop_index);
   }
   else if (h->kind==TS_KIND_PROMISE){ free(((ts_promise*)h)->waiters); }
 }
@@ -3289,6 +3328,7 @@ static void gc_sweep_pinned_young(ts_gc_header** survivors){
 void ts_gc_collect_young(void){
   if (!g_young_heap && !g_nursery_active && !g_pinned_young) return;
   RT_STAT_INC(minor_gc); RT_STAT_GC_T0;
+  gc_weak_begin();
   int aging_allowed =
     g_gc_age_threshold > 1 &&
     (!g_gc_aging_adaptive || g_gc_aging_fallback_minors == 0);
@@ -3297,8 +3337,8 @@ void ts_gc_collect_young(void){
     g_gc_age_threshold > 1 && g_gc_aging_adaptive && !aging_allowed;
   if (adaptive_forced) RT_STAT_INC(aging_fallback_minors);
   gc_mark_async_roots_young();
-  for (uint32_t i=0;i<g_sym_desc_len;i++) gc_mark_value_young(g_sym_desc[i]);
-  for (uint32_t i=0;i<g_sym_value_len;i++) gc_mark_value_young(g_sym_value[i]);
+  /* Only the Symbol.for registry is strong. Ordinary entries in g_sym_value
+     are weak and are reached through real roots/property-key edges instead. */
   for (uint32_t i=0;i<g_symreg_len;i++){
     gc_mark_value_young(g_symreg[i].key);
     gc_mark_value_young(g_symreg[i].sym);
@@ -3319,6 +3359,11 @@ void ts_gc_collect_young(void){
     if (h && h->gen == TS_GEN_OLD) gc_scan_cell(h, 1, 0);
   }
   gc_mark_drain(1);
+  /* Ephemerons run after the ordinary young closure. A newly marked value can
+     expose another weak key, so this helper iterates to a fixed point before
+     dead young keys are pruned and handle slots can be recycled. */
+  gc_weak_fixpoint_and_prune(1);
+  gc_symbol_weak_prune(1);
   /* Reset the remset, spending scan credits (see ts_gc_remember): an entry
      with credit left is re-enrolled with credit-1 — its young pointees may be
      under the aging grace and still young after this collection, so the
@@ -3402,11 +3447,9 @@ void ts_gc_collect_young(void){
 }
 void ts_gc_collect(void){
   RT_STAT_INC(full_gc); RT_STAT_GC_T0;
+  gc_weak_begin();
   gc_mark_async_roots();
-  /* keep symbol descriptions alive for the inspector's `Symbol(desc)` rendering
-     (marked by value, so a realloc of g_sym_desc is harmless). */
-  for (uint32_t i=0;i<g_sym_desc_len;i++) gc_mark_value(g_sym_desc[i]);
-  for (uint32_t i=0;i<g_sym_value_len;i++) gc_mark_value(g_sym_value[i]);
+  /* Symbol.for is the only dynamically growing strong Symbol registry. */
   for (uint32_t i=0;i<g_symreg_len;i++){
     gc_mark_value(g_symreg[i].key);
     gc_mark_value(g_symreg[i].sym);
@@ -3422,6 +3465,8 @@ void ts_gc_collect(void){
     for (uint32_t i = 0; i < frame->count; i++) gc_mark_value(slots[i]);
   }
   gc_mark_drain(0);
+  gc_weak_fixpoint_and_prune(0);
+  gc_symbol_weak_prune(0);
   for (size_t i=0;i<g_rem_len;i++) if (g_remset[i]) g_remset[i]->remembered = 0;
   g_rem_len = 0;
   ts_gc_header** pp=&g_old_heap;
@@ -4407,23 +4452,47 @@ static int same_value_zero(tsv a, tsv b){
   return ts_strict_eq(a,b);
 }
 
-int ts_is_map(tsv v){ return ts_is_obj(v) && ((ts_gc_header*)ts_ptr(v))->kind == TS_KIND_MAP; }
-int ts_is_set(tsv v){ return ts_is_obj(v) && ((ts_gc_header*)ts_ptr(v))->kind == TS_KIND_SET; }
+int ts_is_map(tsv v){
+  return ts_is_obj(v) && ((ts_gc_header*)ts_ptr(v))->kind == TS_KIND_MAP &&
+         !((ts_map*)ts_ptr(v))->weak;
+}
+int ts_is_set(tsv v){
+  return ts_is_obj(v) && ((ts_gc_header*)ts_ptr(v))->kind == TS_KIND_SET &&
+         !((ts_set_t*)ts_ptr(v))->weak;
+}
+int ts_is_weakmap(tsv v){
+  return ts_is_obj(v) && ((ts_gc_header*)ts_ptr(v))->kind == TS_KIND_MAP &&
+         ((ts_map*)ts_ptr(v))->weak;
+}
+int ts_is_weakset(tsv v){
+  return ts_is_obj(v) && ((ts_gc_header*)ts_ptr(v))->kind == TS_KIND_SET &&
+         ((ts_set_t*)ts_ptr(v))->weak;
+}
 
-tsv ts_new_map(void){
+static tsv ts_new_map_impl(int weak){
   ts_map* m = gc_alloc(sizeof(ts_map), TS_KIND_MAP);
-  m->o.proto = ts_proto_ref(g_map_proto_v) ? g_map_proto_v : TS_NULL;
-  m->keys=NULL; m->vals=NULL; m->len=0; m->cap=0;
+  m->o.proto = weak
+    ? (ts_proto_ref(g_weakmap_proto_v) ? g_weakmap_proto_v : TS_NULL)
+    : (ts_proto_ref(g_map_proto_v) ? g_map_proto_v : TS_NULL);
+  m->keys=NULL; m->vals=NULL; m->hashes=NULL; m->len=0; m->cap=0;
   m->index=NULL; m->index_cap=0; m->tombs=0;
+  m->weak=(uint8_t)(weak != 0);
   return ts_obj(m);
 }
-tsv ts_new_set(void){
+static tsv ts_new_set_impl(int weak){
   ts_set_t* s = gc_alloc(sizeof(ts_set_t), TS_KIND_SET);
-  s->o.proto = ts_proto_ref(g_set_proto_v) ? g_set_proto_v : TS_NULL;
-  s->elems=NULL; s->len=0; s->cap=0;
+  s->o.proto = weak
+    ? (ts_proto_ref(g_weakset_proto_v) ? g_weakset_proto_v : TS_NULL)
+    : (ts_proto_ref(g_set_proto_v) ? g_set_proto_v : TS_NULL);
+  s->elems=NULL; s->hashes=NULL; s->len=0; s->cap=0;
   s->index=NULL; s->index_cap=0; s->tombs=0;
+  s->weak=(uint8_t)(weak != 0);
   return ts_obj(s);
 }
+tsv ts_new_map(void){ return ts_new_map_impl(0); }
+tsv ts_new_set(void){ return ts_new_set_impl(0); }
+tsv ts_new_weakmap(void){ return ts_new_map_impl(1); }
+tsv ts_new_weakset(void){ return ts_new_set_impl(1); }
 
 /* ---- Map/Set hash index (P2a) ----
    The dense arrays keep insertion order and stay what the GC scans. Deleting
@@ -4468,7 +4537,8 @@ static uint32_t sv0_hash(tsv k){
    tombstone on the probe path, else the terminating empty). The maintenance
    rule keeps at least a quarter of the slots empty, so the walk terminates. */
 static long mapset_probe(const uint32_t* index, uint32_t index_cap,
-                         const tsv* keys, tsv k, uint32_t h, uint32_t* slot_out){
+                         const tsv* keys, const uint32_t* hashes,
+                         tsv k, uint32_t h, uint32_t* slot_out){
   uint32_t mask = index_cap - 1u;
   uint32_t slot = h & mask;
   long ins = -1;
@@ -4485,7 +4555,7 @@ static long mapset_probe(const uint32_t* index, uint32_t index_cap,
       if (ins < 0) ins = (long)slot;
     } else {
       uint32_t di = e - 2u;
-      if (same_value_zero(keys[di], k)){
+      if (hashes[di] == h && same_value_zero(keys[di], k)){
         if (slot_out) *slot_out = slot;
         RT_STAT_ADD(map_find_probes, probes); RT_STAT_HIST(map_find_hist, probes);
         return (long)di;
@@ -4503,7 +4573,8 @@ static void mapset_index_insert(uint32_t* index, uint32_t index_cap,
 }
 /* (Re)build the slot table over the live dense entries. Sized so the table is
    at most half full at build time (load stays < 3/4 until the next rebuild). */
-static uint32_t* mapset_index_build(const tsv* keys, uint32_t len, uint32_t* cap_io){
+static uint32_t* mapset_index_build(const tsv* keys, const uint32_t* hashes,
+                                    uint32_t len, uint32_t* cap_io){
   uint32_t want = (len + 2u) * 2u;
   uint32_t cap = 16u;
   while (cap < want) cap <<= 1;
@@ -4511,14 +4582,15 @@ static uint32_t* mapset_index_build(const tsv* keys, uint32_t len, uint32_t* cap
   if (!index){ *cap_io = 0; return NULL; }
   for (uint32_t i = 0; i < len; i++){
     if (keys[i] == TS_MAPSET_HOLE) continue;
-    mapset_index_insert(index, cap, i, sv0_hash(keys[i]));
+    mapset_index_insert(index, cap, i, hashes[i]);
   }
   *cap_io = cap;
   return index;
 }
 /* Ensure the index exists (past the linear-scan size) and has slack for one
    more insertion. Never touches the dense arrays — safe against iterators. */
-static void mapset_index_maintain(tsv* keys, uint32_t len, uint32_t tombs,
+static void mapset_index_maintain(tsv* keys, uint32_t* hashes,
+                                  uint32_t len, uint32_t tombs,
                                   uint32_t** index_io, uint32_t* cap_io){
   uint32_t live = len - tombs;
   if (!*index_io){
@@ -4526,7 +4598,7 @@ static void mapset_index_maintain(tsv* keys, uint32_t len, uint32_t tombs,
   } else if ((uint64_t)(len + 2u) * 4u <= (uint64_t)(*cap_io) * 3u){
     return;
   }
-  uint32_t* nw = mapset_index_build(keys, len, cap_io);
+  uint32_t* nw = mapset_index_build(keys, hashes, len, cap_io);
   if (nw){ free(*index_io); *index_io = nw; }
 }
 
@@ -4534,10 +4606,11 @@ static void mapset_index_maintain(tsv* keys, uint32_t len, uint32_t tombs,
    slot state, and the linear fallback compares the sentinel bit-exactly first) */
 static long map_find(ts_map* m, tsv k){
   RT_STAT_INC(map_find_calls);
-  if (m->index) return mapset_probe(m->index, m->index_cap, m->keys, k, sv0_hash(k), NULL);
+  uint32_t h = sv0_hash(k);
+  if (m->index) return mapset_probe(m->index, m->index_cap, m->keys, m->hashes, k, h, NULL);
   for (uint32_t i=0;i<m->len;i++){
     if (m->keys[i] == TS_MAPSET_HOLE) continue;
-    if (same_value_zero(m->keys[i], k)){
+    if (m->hashes[i] == h && same_value_zero(m->keys[i], k)){
       RT_STAT_ADD(map_find_probes, i+1); RT_STAT_HIST(map_find_hist, i+1);
       return (long)i;
     }
@@ -4550,6 +4623,7 @@ static void map_grow(ts_map* m){
   uint32_t nc = m->cap ? m->cap*2 : 8;
   m->keys = realloc(m->keys, sizeof(tsv)*nc);
   m->vals = realloc(m->vals, sizeof(tsv)*nc);
+  m->hashes = realloc(m->hashes, sizeof(uint32_t)*nc);
   m->cap = nc;
 }
 /* Shift live entries down over the holes (order preserved) and rebuild the
@@ -4559,33 +4633,37 @@ static void map_compact(ts_map* m){
   uint32_t w = 0;
   for (uint32_t i = 0; i < m->len; i++){
     if (m->keys[i] == TS_MAPSET_HOLE) continue;
-    m->keys[w] = m->keys[i]; m->vals[w] = m->vals[i]; w++;
+    m->keys[w] = m->keys[i]; m->vals[w] = m->vals[i];
+    m->hashes[w] = m->hashes[i]; w++;
   }
   m->len = w; m->tombs = 0;
   if (m->index){
-    uint32_t* nw = mapset_index_build(m->keys, m->len, &m->index_cap);
+    uint32_t* nw = mapset_index_build(m->keys, m->hashes, m->len, &m->index_cap);
     if (nw){ free(m->index); m->index = nw; }
   }
 }
-tsv ts_map_set(tsv mv, tsv k, tsv v){
-  if (!ts_is_map(mv)) return mv;
+static tsv map_set_unchecked(tsv mv, tsv k, tsv v){
   ts_map* m = ts_ptr(mv);
   uint32_t slot = 0;
+  uint32_t h = sv0_hash(k);
   long i;
-  if (m->index){ RT_STAT_INC(map_find_calls); i = mapset_probe(m->index, m->index_cap, m->keys, k, sv0_hash(k), &slot); }
+  if (m->index){ RT_STAT_INC(map_find_calls); i = mapset_probe(m->index, m->index_cap, m->keys, m->hashes, k, h, &slot); }
   else i = map_find(m, k);
   if (i >= 0){ m->vals[i] = v; ts_write_barrier(mv, v); return mv; }   /* update existing, keep order */
   map_grow(m);
-  m->keys[m->len]=k; m->vals[m->len]=v; m->len++;
+  m->keys[m->len]=k; m->vals[m->len]=v; m->hashes[m->len]=h; m->len++;
   if (m->index){
     /* reuse the probe's slot (tomb or empty); maintain slack afterwards */
     m->index[slot] = (m->len - 1u) + 2u;
-    mapset_index_maintain(m->keys, m->len, m->tombs, &m->index, &m->index_cap);
+    mapset_index_maintain(m->keys, m->hashes, m->len, m->tombs, &m->index, &m->index_cap);
   } else {
-    mapset_index_maintain(m->keys, m->len, m->tombs, &m->index, &m->index_cap);
+    mapset_index_maintain(m->keys, m->hashes, m->len, m->tombs, &m->index, &m->index_cap);
   }
   ts_write_barrier(mv, k); ts_write_barrier(mv, v);
   return mv;
+}
+tsv ts_map_set(tsv mv, tsv k, tsv v){
+  return ts_is_map(mv) ? map_set_unchecked(mv, k, v) : mv;
 }
 tsv ts_map_get(tsv mv, tsv k){
   if (!ts_is_map(mv)) return TS_UNDEFINED;
@@ -4596,14 +4674,13 @@ int ts_map_has(tsv mv, tsv k){
   if (!ts_is_map(mv)) return 0;
   return map_find(ts_ptr(mv), k) >= 0;
 }
-int ts_map_delete(tsv mv, tsv k){
-  if (!ts_is_map(mv)) return 0;
+static int map_delete_unchecked(tsv mv, tsv k){
   ts_map* m = ts_ptr(mv);
   uint32_t slot = 0;
   long i;
   if (m->index){
     RT_STAT_INC(map_find_calls);
-    i = mapset_probe(m->index, m->index_cap, m->keys, k, sv0_hash(k), &slot);
+    i = mapset_probe(m->index, m->index_cap, m->keys, m->hashes, k, sv0_hash(k), &slot);
     if (i < 0) return 0;
     m->index[slot] = 1u; /* tombstone */
     m->keys[i] = TS_MAPSET_HOLE; m->vals[i] = TS_UNDEFINED;
@@ -4613,8 +4690,14 @@ int ts_map_delete(tsv mv, tsv k){
   }
   i = map_find(m, k);
   if (i < 0) return 0;
-  for (uint32_t j=(uint32_t)i; j+1<m->len; j++){ m->keys[j]=m->keys[j+1]; m->vals[j]=m->vals[j+1]; }
+  for (uint32_t j=(uint32_t)i; j+1<m->len; j++){
+    m->keys[j]=m->keys[j+1]; m->vals[j]=m->vals[j+1];
+    m->hashes[j]=m->hashes[j+1];
+  }
   m->len--; return 1;
+}
+int ts_map_delete(tsv mv, tsv k){
+  return ts_is_map(mv) ? map_delete_unchecked(mv, k) : 0;
 }
 void ts_map_clear(tsv mv){
   if (ts_is_map(mv)){
@@ -4700,10 +4783,11 @@ void ts_map_foreach(tsv mv, tsv cb){
 
 static long set_find(ts_set_t* s, tsv v){
   RT_STAT_INC(map_find_calls);
-  if (s->index) return mapset_probe(s->index, s->index_cap, s->elems, v, sv0_hash(v), NULL);
+  uint32_t h = sv0_hash(v);
+  if (s->index) return mapset_probe(s->index, s->index_cap, s->elems, s->hashes, v, h, NULL);
   for (uint32_t i=0;i<s->len;i++){
     if (s->elems[i] == TS_MAPSET_HOLE) continue;
-    if (same_value_zero(s->elems[i], v)){
+    if (s->hashes[i] == h && same_value_zero(s->elems[i], v)){
       RT_STAT_ADD(map_find_probes, i+1); RT_STAT_HIST(map_find_hist, i+1);
       return (long)i;
     }
@@ -4714,42 +4798,48 @@ static long set_find(ts_set_t* s, tsv v){
 static void set_grow(ts_set_t* s){
   if (s->len < s->cap) return;
   uint32_t nc = s->cap ? s->cap*2 : 8;
-  s->elems = realloc(s->elems, sizeof(tsv)*nc); s->cap = nc;
+  s->elems = realloc(s->elems, sizeof(tsv)*nc);
+  s->hashes = realloc(s->hashes, sizeof(uint32_t)*nc);
+  s->cap = nc;
 }
 static void set_compact(ts_set_t* s){
   uint32_t w = 0;
   for (uint32_t i = 0; i < s->len; i++){
     if (s->elems[i] == TS_MAPSET_HOLE) continue;
-    s->elems[w++] = s->elems[i];
+    s->elems[w] = s->elems[i];
+    s->hashes[w] = s->hashes[i];
+    w++;
   }
   s->len = w; s->tombs = 0;
   if (s->index){
-    uint32_t* nw = mapset_index_build(s->elems, s->len, &s->index_cap);
+    uint32_t* nw = mapset_index_build(s->elems, s->hashes, s->len, &s->index_cap);
     if (nw){ free(s->index); s->index = nw; }
   }
 }
-tsv ts_set_add(tsv sv, tsv v){
-  if (!ts_is_set(sv)) return sv;
+static tsv set_add_unchecked(tsv sv, tsv v){
   ts_set_t* s = ts_ptr(sv);
   uint32_t slot = 0;
+  uint32_t h = sv0_hash(v);
   long i;
-  if (s->index){ RT_STAT_INC(map_find_calls); i = mapset_probe(s->index, s->index_cap, s->elems, v, sv0_hash(v), &slot); }
+  if (s->index){ RT_STAT_INC(map_find_calls); i = mapset_probe(s->index, s->index_cap, s->elems, s->hashes, v, h, &slot); }
   else i = set_find(s, v);
   if (i >= 0) return sv;                   /* dedup */
-  set_grow(s); s->elems[s->len++]=v;
+  set_grow(s); s->elems[s->len]=v; s->hashes[s->len]=h; s->len++;
   if (s->index) s->index[slot] = (s->len - 1u) + 2u;
-  mapset_index_maintain(s->elems, s->len, s->tombs, &s->index, &s->index_cap);
+  mapset_index_maintain(s->elems, s->hashes, s->len, s->tombs, &s->index, &s->index_cap);
   ts_write_barrier(sv, v); return sv;
 }
+tsv ts_set_add(tsv sv, tsv v){
+  return ts_is_set(sv) ? set_add_unchecked(sv, v) : sv;
+}
 int ts_set_has(tsv sv, tsv v){ return ts_is_set(sv) && set_find(ts_ptr(sv), v) >= 0; }
-int ts_set_delete(tsv sv, tsv v){
-  if (!ts_is_set(sv)) return 0;
+static int set_delete_unchecked(tsv sv, tsv v){
   ts_set_t* s = ts_ptr(sv);
   uint32_t slot = 0;
   long i;
   if (s->index){
     RT_STAT_INC(map_find_calls);
-    i = mapset_probe(s->index, s->index_cap, s->elems, v, sv0_hash(v), &slot);
+    i = mapset_probe(s->index, s->index_cap, s->elems, s->hashes, v, sv0_hash(v), &slot);
     if (i < 0) return 0;
     s->index[slot] = 1u; /* tombstone */
     s->elems[i] = TS_MAPSET_HOLE;
@@ -4759,8 +4849,14 @@ int ts_set_delete(tsv sv, tsv v){
   }
   i = set_find(s, v);
   if (i < 0) return 0;
-  for (uint32_t j=(uint32_t)i; j+1<s->len; j++) s->elems[j]=s->elems[j+1];
+  for (uint32_t j=(uint32_t)i; j+1<s->len; j++){
+    s->elems[j]=s->elems[j+1];
+    s->hashes[j]=s->hashes[j+1];
+  }
   s->len--; return 1;
+}
+int ts_set_delete(tsv sv, tsv v){
+  return ts_is_set(sv) ? set_delete_unchecked(sv, v) : 0;
 }
 void ts_set_clear(tsv sv){
   if (ts_is_set(sv)){
@@ -4827,6 +4923,163 @@ void ts_set_foreach(tsv sv, tsv cb){
     ts_call_value(cb,args,2);
   }
   ts_gc_unroot(2);
+}
+
+/* ---------------- WeakMap / WeakSet ----------------
+   The storage and hash index are shared with Map/Set, but the `weak` bit keeps
+   the public brands distinct and changes GC scanning to ephemeron semantics.
+   Objects/functions and non-registered Symbols satisfy CanBeHeldWeakly.
+   Symbol.for identities are registry-managed and therefore rejected. */
+static int weak_key_valid(tsv key){
+  if (ts_is_func(key)) return ts_ptr(key) != NULL;
+  if (!ts_is_obj(key)) return 0;
+  ts_gc_header* h = (ts_gc_header*)ts_ptr(key);
+  if (!h) return 0;
+  if (h->kind == TS_KIND_SYMBOL) return !((ts_symbol*)h)->registered;
+  return h->kind != TS_KIND_ACCESSOR;
+}
+static void weak_key_require(tsv key, const char* collection){
+  if (weak_key_valid(key)) return;
+  char msg[96];
+  snprintf(msg, sizeof msg, "Invalid value used as %s key", collection);
+  ts_throw_type_error_msg(msg);
+}
+static void weak_receiver_require(tsv value, int want_map){
+  if (want_map ? ts_is_weakmap(value) : ts_is_weakset(value)) return;
+  ts_throw_type_error_msg(
+    want_map
+      ? "Method WeakMap.prototype called on incompatible receiver"
+      : "Method WeakSet.prototype called on incompatible receiver");
+}
+
+tsv ts_weakmap_set(tsv mv, tsv key, tsv value){
+  weak_receiver_require(mv, 1);
+  weak_key_require(key, "weak map");
+  return map_set_unchecked(mv, key, value);
+}
+tsv ts_weakmap_get(tsv mv, tsv key){
+  weak_receiver_require(mv, 1);
+  if (!weak_key_valid(key)) return TS_UNDEFINED;
+  ts_map* m = (ts_map*)ts_ptr(mv);
+  long i = map_find(m, key);
+  return i >= 0 ? m->vals[i] : TS_UNDEFINED;
+}
+int ts_weakmap_has(tsv mv, tsv key){
+  weak_receiver_require(mv, 1);
+  return weak_key_valid(key) && map_find((ts_map*)ts_ptr(mv), key) >= 0;
+}
+int ts_weakmap_delete(tsv mv, tsv key){
+  weak_receiver_require(mv, 1);
+  return weak_key_valid(key) ? map_delete_unchecked(mv, key) : 0;
+}
+tsv ts_weakset_add(tsv sv, tsv key){
+  weak_receiver_require(sv, 0);
+  weak_key_require(key, "weak set");
+  return set_add_unchecked(sv, key);
+}
+int ts_weakset_has(tsv sv, tsv key){
+  weak_receiver_require(sv, 0);
+  return weak_key_valid(key) && set_find((ts_set_t*)ts_ptr(sv), key) >= 0;
+}
+int ts_weakset_delete(tsv sv, tsv key){
+  weak_receiver_require(sv, 0);
+  return weak_key_valid(key) ? set_delete_unchecked(sv, key) : 0;
+}
+
+/* A key is live for a full collection only when ordinary marking reached it.
+   During a minor collection every OLD cell is outside the collection boundary
+   and therefore live; YOUNG/NONHEAP keys still need a mark from a strong root.
+   Null handle slots are stale weak entries and are pruned before reuse. */
+static int gc_weak_key_live(tsv key, int young){
+  if (!weak_key_valid(key)) return 0;
+  ts_gc_header* h = ts_heap_ptr(key);
+  if (!h) return 0;
+  if (young && h->gen == TS_GEN_OLD) return 1;
+  return h->mark != 0;
+}
+static int gc_weak_value_unmarked(tsv value, int young){
+  if (!ts_heap_ref(value)) return 0;
+  ts_gc_header* h = ts_heap_ptr(value);
+  if (!h || h->mark) return 0;
+  return !(young && h->gen == TS_GEN_OLD);
+}
+static void gc_weak_fixpoint_and_prune(int young){
+  int changed;
+  do {
+    changed = 0;
+    /* The list may grow while a newly retained value exposes another weak
+       container. Reading each pointer before marking makes realloc harmless. */
+    for (size_t wi = 0; wi < g_weak_work_len; wi++){
+      ts_gc_header* h = g_weak_work[wi];
+      if (!h || h->kind != TS_KIND_MAP) continue;
+      ts_map* m = (ts_map*)h;
+      if (!m->weak) continue;
+      for (uint32_t i = 0; i < m->len; i++){
+        if (m->keys[i] == TS_MAPSET_HOLE ||
+            !gc_weak_key_live(m->keys[i], young)) continue;
+        if (gc_weak_value_unmarked(m->vals[i], young)){
+          changed = 1;
+          gc_mark_visit(m->vals[i], young, 0);
+        }
+      }
+    }
+    gc_mark_drain(young);
+  } while (changed);
+
+  /* Remove dead entries while key headers and handle slots are still valid.
+     Weak collections are non-iterable, so compacting their private dense arrays
+     at this GC safepoint has no observable iterator-position effect. */
+  for (size_t wi = 0; wi < g_weak_work_len; wi++){
+    ts_gc_header* h = g_weak_work[wi];
+    if (!h) continue;
+    if (h->kind == TS_KIND_MAP){
+      ts_map* m = (ts_map*)h;
+      if (!m->weak) continue;
+      uint32_t dead = 0;
+      for (uint32_t i = 0; i < m->len; i++){
+        if (m->keys[i] == TS_MAPSET_HOLE) continue;
+        if (!gc_weak_key_live(m->keys[i], young)){
+          m->keys[i] = TS_MAPSET_HOLE;
+          m->vals[i] = TS_UNDEFINED;
+          m->tombs++; dead++;
+        }
+      }
+      if (dead) map_compact(m);
+    } else if (h->kind == TS_KIND_SET){
+      ts_set_t* s = (ts_set_t*)h;
+      if (!s->weak) continue;
+      uint32_t dead = 0;
+      for (uint32_t i = 0; i < s->len; i++){
+        if (s->elems[i] == TS_MAPSET_HOLE) continue;
+        if (!gc_weak_key_live(s->elems[i], young)){
+          s->elems[i] = TS_MAPSET_HOLE;
+          s->tombs++; dead++;
+        }
+      }
+      if (dead) set_compact(s);
+    }
+  }
+  g_weak_work_len = 0;
+}
+
+/* g_sym_value is an identity lookup service, not an owner. Clear ordinary
+   Symbol entries that ordinary marking did not reach. In a minor collection,
+   old symbols are outside the collection boundary and remain valid; only dead
+   young entries are removed. This runs after the ephemeron fixed point so a
+   value discovered through a live weak key has already had a chance to expose
+   Symbol property-name edges and, in turn, more ephemerons. */
+static void gc_symbol_weak_prune(int young){
+  for (uint32_t i=0;i<g_sym_value_len;i++){
+    tsv value = g_sym_value[i];
+    if (!ts_heap_ref(value)) continue;
+    ts_gc_header* h = ts_heap_ptr(value);
+    if (!h || h->kind != TS_KIND_SYMBOL){
+      g_sym_value[i] = TS_UNDEFINED;
+      continue;
+    }
+    if (young && h->gen == TS_GEN_OLD) continue;
+    if (!h->mark) g_sym_value[i] = TS_UNDEFINED;
+  }
 }
 
 /* ---------------- Math (libm-backed) ---------------- */
@@ -7251,11 +7504,12 @@ static void inspect_qkey_bytes(jbuf* b, const char* name, uint32_t len){
 static void inspect_val(jbuf* b, tsv v, int depth, int top);
 /* Render a symbol property key as Node's util.inspect does: `Symbol(desc)`
    (no surrounding brackets, never quoted). USERSYM keys resolve their description
-   via the sym_id side table; WKSYM keys via the well-known singleton. */
+   through the weak sym_id→Symbol table; WKSYM keys via the well-known singleton. */
 static void inspect_symbol_key(jbuf* b, ts_key k){
   jb_putz(b, "Symbol(");
-  tsv desc = (k >= TS_USERSYM_KEY_BASE) ? sym_desc_by_id(k - TS_USERSYM_KEY_BASE)
-                                        : ts_symbol_description(ts_wksym(k - TS_WKSYM_KEY_BASE));
+  tsv desc = (k >= TS_USERSYM_KEY_BASE)
+    ? ts_symbol_description(sym_value_by_id(k - TS_USERSYM_KEY_BASE))
+    : ts_symbol_description(ts_wksym(k - TS_WKSYM_KEY_BASE));
   /* escape ' and \ like inspect_qstr (Node renders the description quoted-but-
      unbracketed: Symbol(a\'b)), without the surrounding quotes. */
   if (ts_is_str(desc)){ ts_strview d=ts_str_view_typed(desc);
@@ -8109,6 +8363,36 @@ tsv ts_map_seed(tsv mapv, tsv iterable){
   ts_gc_unroot(3);
   return mapv;
 }
+tsv ts_weakset_seed(tsv setv, tsv iterable){
+  if (!ts_is_weakset(setv)) return setv;
+  ts_gc_root(&setv); ts_gc_root(&iterable);
+  tsv tmp = ts_new_array(0); ts_gc_root(&tmp);
+  ts_array_push_all(tmp, iterable);
+  ts_array* a = as_arr(tmp);
+  for (uint32_t i = 0; i < a->len; i++){
+    ts_weakset_add(setv, a->data[i]);
+    a = as_arr(tmp);
+  }
+  ts_gc_unroot(3);
+  return setv;
+}
+tsv ts_weakmap_seed(tsv mapv, tsv iterable){
+  if (!ts_is_weakmap(mapv)) return mapv;
+  ts_gc_root(&mapv); ts_gc_root(&iterable);
+  tsv tmp = ts_new_array(0); ts_gc_root(&tmp);
+  ts_array_push_all(tmp, iterable);
+  ts_array* a = as_arr(tmp);
+  for (uint32_t i = 0; i < a->len; i++){
+    tsv pair = a->data[i];
+    ts_array* p = as_arr(pair);
+    tsv key = (p && p->len > 0) ? p->data[0] : TS_UNDEFINED;
+    tsv value = (p && p->len > 1) ? p->data[1] : TS_UNDEFINED;
+    ts_weakmap_set(mapv, key, value);
+    a = as_arr(tmp);
+  }
+  ts_gc_unroot(3);
+  return mapv;
+}
 
 /* `key in obj`: own-or-inherited property presence by field id. */
 /* Does `key` name one of the modeled Object.prototype methods? Used so that
@@ -8764,6 +9048,13 @@ tsv ts_setproto_keys(tsv* a, int n){ (void)n; return ts_set_keys(a[0]); }
 tsv ts_setproto_values(tsv* a, int n){ (void)n; return ts_set_values(a[0]); }
 tsv ts_setproto_entries(tsv* a, int n){ (void)n; return ts_set_entries(a[0]); }
 tsv ts_setproto_forEach(tsv* a, int n){ ts_set_foreach(a[0], n>1?a[1]:TS_UNDEFINED); return TS_UNDEFINED; }
+tsv ts_weakmapproto_set(tsv* a, int n){ return ts_weakmap_set(a[0], n>1?a[1]:TS_UNDEFINED, n>2?a[2]:TS_UNDEFINED); }
+tsv ts_weakmapproto_get(tsv* a, int n){ return ts_weakmap_get(a[0], n>1?a[1]:TS_UNDEFINED); }
+tsv ts_weakmapproto_has(tsv* a, int n){ return ts_bool(ts_weakmap_has(a[0], n>1?a[1]:TS_UNDEFINED)); }
+tsv ts_weakmapproto_delete(tsv* a, int n){ return ts_bool(ts_weakmap_delete(a[0], n>1?a[1]:TS_UNDEFINED)); }
+tsv ts_weaksetproto_add(tsv* a, int n){ return ts_weakset_add(a[0], n>1?a[1]:TS_UNDEFINED); }
+tsv ts_weaksetproto_has(tsv* a, int n){ return ts_bool(ts_weakset_has(a[0], n>1?a[1]:TS_UNDEFINED)); }
+tsv ts_weaksetproto_delete(tsv* a, int n){ return ts_bool(ts_weakset_delete(a[0], n>1?a[1]:TS_UNDEFINED)); }
 tsv ts_headersproto_get(tsv* a, int n){ return ts_headers_get(n>0?a[0]:TS_UNDEFINED, n>1?a[1]:TS_UNDEFINED); }
 tsv ts_headersproto_has(tsv* a, int n){ return ts_bool(ts_headers_has(n>0?a[0]:TS_UNDEFINED, n>1?a[1]:TS_UNDEFINED)); }
 tsv ts_headersproto_keys(tsv* a, int n){ (void)n; return ts_headers_keys(n>0?a[0]:TS_UNDEFINED); }
@@ -8775,6 +9066,8 @@ tsv ts_headersproto_delete(tsv* a, int n){ return ts_headers_delete(n>0?a[0]:TS_
 
 tsv ts_map_proto(void){ return ts_proto_ref(g_map_proto_v) ? g_map_proto_v : TS_NULL; }
 tsv ts_set_proto_obj(void){ return ts_proto_ref(g_set_proto_v) ? g_set_proto_v : TS_NULL; }
+tsv ts_weakmap_proto(void){ return ts_proto_ref(g_weakmap_proto_v) ? g_weakmap_proto_v : TS_NULL; }
+tsv ts_weakset_proto_obj(void){ return ts_proto_ref(g_weakset_proto_v) ? g_weakset_proto_v : TS_NULL; }
 tsv ts_headers_proto(void){ return ts_proto_ref(g_headers_proto_v) ? g_headers_proto_v : TS_NULL; }
 tsv ts_abort_controller_proto(void){ if (!ts_proto_ref(g_abort_controller_proto_v)) ts_abort_controller_proto_init(); return ts_proto_ref(g_abort_controller_proto_v) ? g_abort_controller_proto_v : TS_NULL; }
 tsv ts_abort_signal_proto(void){ if (!ts_proto_ref(g_abort_signal_proto_v)) ts_abort_signal_proto_init(); return ts_proto_ref(g_abort_signal_proto_v) ? g_abort_signal_proto_v : TS_NULL; }
@@ -8791,6 +9084,20 @@ void ts_set_proto_init(void){
   g_set_proto_v = ts_new_proto();
   ts_root_static_once(&g_set_proto_v, &rooted);
   ((ts_object*)ts_ptr(g_set_proto_v))->proto = g_object_proto_v;
+}
+void ts_weakmap_proto_init(void){
+  if (ts_proto_ref(g_weakmap_proto_v)) return;
+  static int rooted = 0;
+  g_weakmap_proto_v = ts_new_proto();
+  ts_root_static_once(&g_weakmap_proto_v, &rooted);
+  ((ts_object*)ts_ptr(g_weakmap_proto_v))->proto = g_object_proto_v;
+}
+void ts_weakset_proto_init(void){
+  if (ts_proto_ref(g_weakset_proto_v)) return;
+  static int rooted = 0;
+  g_weakset_proto_v = ts_new_proto();
+  ts_root_static_once(&g_weakset_proto_v, &rooted);
+  ((ts_object*)ts_ptr(g_weakset_proto_v))->proto = g_object_proto_v;
 }
 void ts_headers_proto_init(void){
   if (ts_proto_ref(g_headers_proto_v)) return;
@@ -8824,6 +9131,14 @@ void ts_map_proto_register(ts_key method_key, const char* name, ts_code fn){
 void ts_set_proto_register(ts_key method_key, const char* name, ts_code fn){
   if (!ts_proto_ref(g_set_proto_v)) ts_set_proto_init();
   ts_proto_register_method(g_set_proto_v, method_key, name, fn);
+}
+void ts_weakmap_proto_register(ts_key method_key, const char* name, ts_code fn){
+  if (!ts_proto_ref(g_weakmap_proto_v)) ts_weakmap_proto_init();
+  ts_proto_register_method(g_weakmap_proto_v, method_key, name, fn);
+}
+void ts_weakset_proto_register(ts_key method_key, const char* name, ts_code fn){
+  if (!ts_proto_ref(g_weakset_proto_v)) ts_weakset_proto_init();
+  ts_proto_register_method(g_weakset_proto_v, method_key, name, fn);
 }
 void ts_headers_proto_register(ts_key method_key, const char* name, ts_code fn){
   if (!ts_proto_ref(g_headers_proto_v)) ts_headers_proto_init();

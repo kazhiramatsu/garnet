@@ -1396,7 +1396,7 @@ class Exporter {
    *  Array.prototype.map; typeof m` work as first-class values (the boxed proto
    *  method is read off the runtime prototype via LoadMethodValue). Shadowing by a
    *  local `const Array = ...` is rejected by isBuiltinNamespaceRef. */
-  builtinProtoMethod(e: ts.Expression): { kind: "object" | "string" | "array" | "map" | "set" | "headers" | "number" | "boolean" | "function"; method: string } | undefined {
+  builtinProtoMethod(e: ts.Expression): { kind: "object" | "string" | "array" | "map" | "set" | "weakmap" | "weakset" | "headers" | "number" | "boolean" | "function"; method: string } | undefined {
     if (!ts.isPropertyAccessExpression(e)) return undefined;
     const method = e.name.text;
     const p = e.expression;                              // expect `<Builtin>.prototype`
@@ -1408,8 +1408,10 @@ class Exporter {
     if (this.isBuiltinNamespaceRef(ns, "Function") && (method === "call" || method === "apply" || method === "bind")) {
       return { kind: "function", method };
     }
-    const kinds: [string, "string" | "array" | "map" | "set" | "headers" | "number" | "boolean"][] =
-      [["Array", "array"], ["String", "string"], ["Map", "map"], ["Set", "set"], ["Headers", "headers"], ["Number", "number"], ["Boolean", "boolean"]];
+    const kinds: [string, "string" | "array" | "map" | "set" | "weakmap" | "weakset" | "headers" | "number" | "boolean"][] =
+      [["Array", "array"], ["String", "string"], ["Map", "map"], ["Set", "set"],
+       ["WeakMap", "weakmap"], ["WeakSet", "weakset"], ["Headers", "headers"],
+       ["Number", "number"], ["Boolean", "boolean"]];
     for (const [name, kind] of kinds) {
       if (this.isBuiltinNamespaceRef(ns, name) && this.builtinMethodName2(kind, method) !== undefined) {
         return { kind, method };
@@ -1426,12 +1428,15 @@ class Exporter {
    *  object is loaded via LoadBuiltinFn {protoobj.<kind>} (the §90 mechanism), which
    *  already returns the proto object itself — the bare form just omits the trailing
    *  LoadMethodValue. */
-  bareBuiltinProtoKind(e: ts.Expression): "object" | "string" | "array" | "map" | "set" | "headers" | "number" | "boolean" | "function" | undefined {
+  bareBuiltinProtoKind(e: ts.Expression): "object" | "string" | "array" | "map" | "set" | "weakmap" | "weakset" | "headers" | "number" | "boolean" | "function" | undefined {
     if (!ts.isPropertyAccessExpression(e) || e.name.text !== "prototype") return undefined;
     const ns = e.expression;
     if (!ts.isIdentifier(ns)) return undefined;
-    const kinds: [string, "object" | "string" | "array" | "map" | "set" | "headers" | "number" | "boolean" | "function"][] =
-      [["Object", "object"], ["Array", "array"], ["String", "string"], ["Map", "map"], ["Set", "set"], ["Headers", "headers"], ["Number", "number"], ["Boolean", "boolean"], ["Function", "function"]];
+    const kinds: [string, "object" | "string" | "array" | "map" | "set" | "weakmap" | "weakset" | "headers" | "number" | "boolean" | "function"][] =
+      [["Object", "object"], ["Array", "array"], ["String", "string"], ["Map", "map"],
+       ["Set", "set"], ["WeakMap", "weakmap"], ["WeakSet", "weakset"],
+       ["Headers", "headers"], ["Number", "number"], ["Boolean", "boolean"],
+       ["Function", "function"]];
     for (const [name, kind] of kinds) {
       if (this.isBuiltinNamespaceRef(ns, name)) return kind;
     }
@@ -3168,9 +3173,7 @@ class Exporter {
       // ts_construct on the class value (which holds the real class_id at runtime).
       if (target.kind === "reject" || (target.kind === "staticClass" && target.classId === undefined)) {
         try {
-          // Only for a user-defined constructable VALUE — never an ambient builtin
-          // (`new WeakMap()` etc. still loud-rejects rather than silently building a
-          // non-existent class value).
+          // Only for a user-defined constructable VALUE — never an ambient builtin.
           const ambient = this.isAmbientGlobalSymbol(this.symbolOf(node.expression));
           const ct = this.checker.getTypeAtLocation(node.expression);
           if (!ambient && ct.getConstructSignatures && ct.getConstructSignatures().length > 0) {
@@ -4814,18 +4817,26 @@ class Exporter {
         ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "instanceof.hook", args: [container, obj] });
         return dst;
       }
-      // Built-in Error family RHS (`x instanceof Error/TypeError/...`): not a user
-      // class (rclass undefined), so check obj's prototype chain against the shared
-      // runtime Error-family prototype. (instanceof.dyn can't help: the built-in
-      // constructor carries no class_id.)
+      // Built-in RHS (`x instanceof Error/Map/WeakMap/...`): not a user class
+      // (rclass undefined), so check obj's prototype chain against the shared
+      // runtime prototype. (instanceof.dyn can't help: built-in constructors carry
+      // no class_id.)
       if (rclass === undefined && ts.isIdentifier(node.right) &&
           this.isBuiltinSymbol(this.checker.getSymbolAtLocation(node.right))) {
         const ek = this.errorKindIndex(node.right.text);
-        // The shared prototype object to chain-check against: Error-family or
-        // `Object` (every object/array/function chains to Object.prototype).
+        const builtinProtoKinds: Record<string, string> = {
+          Object: "object",
+          Map: "map",
+          Set: "set",
+          WeakMap: "weakmap",
+          WeakSet: "weakset",
+        };
+        // The shared prototype object to chain-check against.
         const protoBuiltin =
           ek !== undefined ? `errorproto.${ek}` :
-          node.right.text === "Object" ? "protoobj.object" : undefined;
+          builtinProtoKinds[node.right.text] !== undefined
+            ? `protoobj.${builtinProtoKinds[node.right.text]}`
+            : undefined;
         if (protoBuiltin !== undefined) {
           const obj = this.lowerExpr(ctx, node.left);
           const proto = this.newLocal(ctx, "reference");
@@ -6649,7 +6660,7 @@ class Exporter {
   }
 
   /** Lower `new <Builtin>(...)` for the supported built-in constructors
-   *  (Map/Set/Headers/Array/Date/Error family/Promise). Returns the result local, or
+   *  (Map/Set/WeakMap/WeakSet/Headers/Array/Date/Error family/Promise). Returns the result local, or
    *  undefined when `ctorName` is not a supported built-in (caller continues to
    *  the user-class / class-value paths). Built-in-specific rejects (Date
    *  string/Date arg, Promise without an executor) live here. */
@@ -6657,11 +6668,15 @@ class Exporter {
     if (ctorName === "RegExp") {
       return this.lowerRegExpConstructor(ctx, node, hint);
     }
-    // new Map() / new Set() -> runtime container. (Constructor-arg seeding,
-    // e.g. new Map([[k,v]]), is materialized via map.seed/set.seed.)
-    if (ctorName === "Map" || ctorName === "Set") {
+    // Map/Set and their weak counterparts lower to runtime containers.
+    // Constructor-arg seeding is materialized by the matching *.seed helper.
+    if (ctorName === "Map" || ctorName === "Set" ||
+        ctorName === "WeakMap" || ctorName === "WeakSet") {
       const dst = this.newLocal(ctx, "reference");
-      ctx.body.push({ kind: ctorName === "Map" ? "NewMap" : "NewSet", dst });
+      if (ctorName === "Map") ctx.body.push({ kind: "NewMap", dst });
+      else if (ctorName === "Set") ctx.body.push({ kind: "NewSet", dst });
+      else ctx.body.push({ kind: "CallBuiltinStatic", dst,
+        builtin: ctorName === "WeakMap" ? "weakmap.new" : "weakset.new", args: [] });
       // Constructor-arg seeding: new Set(iterable) adds each element; new
       // Map(iterable) treats each element as a [key, value] pair. The iterable
       // is materialized to an array (spread handles array/generator/set/map),
@@ -6670,7 +6685,10 @@ class Exporter {
           node.arguments[0].kind !== ts.SyntaxKind.UndefinedKeyword) {
         const arg = this.lowerExpr(ctx, node.arguments[0]);
         ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"),
-          builtin: ctorName === "Map" ? "map.seed" : "set.seed", args: [dst, arg] });
+          builtin: ctorName === "Map" ? "map.seed" :
+                   ctorName === "Set" ? "set.seed" :
+                   ctorName === "WeakMap" ? "weakmap.seed" : "weakset.seed",
+          args: [dst, arg] });
       }
       return dst;
     }
@@ -7647,7 +7665,7 @@ class Exporter {
     return undefined;
   }
 
-  builtinReceiverKind(recvExpr: ts.Expression): "string" | "array" | "map" | "set" | "headers" | "number" | "boolean" | "promise" | undefined {
+  builtinReceiverKind(recvExpr: ts.Expression): "string" | "array" | "map" | "set" | "weakmap" | "weakset" | "headers" | "number" | "boolean" | "promise" | undefined {
     // An array-returning builtin call (e.g. m.keys(), arr.map(...), s.split(...))
     // yields an array at runtime even when its checker type is an iterator. Detect
     // this structurally so chained calls like m.keys().join(",") resolve.
@@ -7687,9 +7705,13 @@ class Exporter {
       const tn = this.checker.typeToString(t);
       if (sym && sym.name === "Map") return "map";
       if (sym && sym.name === "Set") return "set";
+      if (sym && sym.name === "WeakMap") return "weakmap";
+      if (sym && sym.name === "WeakSet") return "weakset";
       if (sym && sym.name === "Headers") return "headers";
       if (/^Map<|^ReadonlyMap</.test(tn)) return "map";
       if (/^Set<|^ReadonlySet</.test(tn)) return "set";
+      if (/^WeakMap</.test(tn)) return "weakmap";
+      if (/^WeakSet</.test(tn)) return "weakset";
       if (/^Headers\b/.test(tn)) return "headers";
       if (sym && sym.name === "Array") return "array";
       if (/\[\]$/.test(tn) || /^(readonly )?Array<|^readonly /.test(tn)) return "array";
@@ -7713,7 +7735,7 @@ class Exporter {
 
   /** Map (builtin kind, method) to a runtime builtin name, or undefined if the
    *  method is not implemented for that kind. */
-  builtinMethodName2(kind: "string" | "array" | "map" | "set" | "headers" | "number" | "boolean" | "promise", method: string): string | undefined {
+  builtinMethodName2(kind: "string" | "array" | "map" | "set" | "weakmap" | "weakset" | "headers" | "number" | "boolean" | "promise", method: string): string | undefined {
     const stringMethods = new Set([
       "toUpperCase","toLowerCase","toLocaleUpperCase","toLocaleLowerCase","slice","substring","indexOf","includes",
       "charAt","charCodeAt","codePointAt","concat","repeat","trim","split",
@@ -7732,6 +7754,8 @@ class Exporter {
     ]);
     const mapMethods = new Set(["set","get","has","delete","clear","keys","values","entries","forEach"]);
     const setMethods = new Set(["add","has","delete","clear","keys","values","entries","forEach"]);
+    const weakMapMethods = new Set(["set","get","has","delete"]);
+    const weakSetMethods = new Set(["add","has","delete"]);
     const headersMethods = new Set(["get","has","keys","values","entries","append","set","delete"]);
     const numberMethods = new Set(["toFixed","toString","toPrecision","valueOf"]);
     const booleanMethods = new Set(["toString","valueOf"]);
@@ -7740,6 +7764,8 @@ class Exporter {
     if (kind === "array" && arrayMethods.has(method)) return `array.${method}`;
     if (kind === "map" && mapMethods.has(method)) return `map.${method}`;
     if (kind === "set" && setMethods.has(method)) return `set.${method}`;
+    if (kind === "weakmap" && weakMapMethods.has(method)) return `weakmap.${method}`;
+    if (kind === "weakset" && weakSetMethods.has(method)) return `weakset.${method}`;
     if (kind === "headers" && headersMethods.has(method)) return `headers.${method}`;
     if (kind === "number" && numberMethods.has(method)) return `number.${method}`;
     if (kind === "boolean" && booleanMethods.has(method)) return `boolean.${method}`;
@@ -7795,6 +7821,8 @@ class Exporter {
       case "AbortSignal":
       case "Map":
       case "Set":
+      case "WeakMap":
+      case "WeakSet":
       case "String":
       case "Number":
       case "Boolean":
@@ -11255,6 +11283,14 @@ class Exporter {
       ["clear","ts_setproto_clear"],["keys","ts_setproto_keys"],["values","ts_setproto_values"],
       ["entries","ts_setproto_entries"],["forEach","ts_setproto_forEach"],
     ];
+    const weakMapProtoSpec: [string, string][] = [
+      ["set","ts_weakmapproto_set"],["get","ts_weakmapproto_get"],
+      ["has","ts_weakmapproto_has"],["delete","ts_weakmapproto_delete"],
+    ];
+    const weakSetProtoSpec: [string, string][] = [
+      ["add","ts_weaksetproto_add"],["has","ts_weaksetproto_has"],
+      ["delete","ts_weaksetproto_delete"],
+    ];
     const headersProtoSpec: [string, string][] = [
       ["get","ts_headersproto_get"],["has","ts_headersproto_has"],["keys","ts_headersproto_keys"],
       ["values","ts_headersproto_values"],["entries","ts_headersproto_entries"],
@@ -11262,6 +11298,8 @@ class Exporter {
     ];
     const mapProtoMethods = mapProtoSpec.map(([name, runtime]) => ({ name, runtime, methodId: this.internName(name) }));
     const setProtoMethods = setProtoSpec.map(([name, runtime]) => ({ name, runtime, methodId: this.internName(name) }));
+    const weakMapProtoMethods = weakMapProtoSpec.map(([name, runtime]) => ({ name, runtime, methodId: this.internName(name) }));
+    const weakSetProtoMethods = weakSetProtoSpec.map(([name, runtime]) => ({ name, runtime, methodId: this.internName(name) }));
     const headersProtoMethods = headersProtoSpec.map(([name, runtime]) => ({ name, runtime, methodId: this.internName(name) }));
     // Promise.prototype methods: then/catch/finally as first-class method VALUES.
     // ts_get on a promise resolves these via the shared Promise.prototype (the
@@ -11340,6 +11378,8 @@ class Exporter {
       promiseProtoMethods,
       mapProtoMethods,
       setProtoMethods,
+      weakMapProtoMethods,
+      weakSetProtoMethods,
       headersProtoMethods,
       functionProtoMethods,
       stringProtoMethods,

@@ -12,7 +12,7 @@ fn func(id: u32, params: Vec<u32>, nlocals: u32, exported: bool, body: Vec<Inst>
 }
 fn prog(fns: Vec<Function>) -> Program {
     Program { version: 1, strict_type_optimizations: Default::default(), types: vec![], fields: vec![], signatures: vec![], globals: vec![],
-        scopes: vec![], bindings: vec![], functions: fns, exports: vec![], site_meta: vec![], classes: vec![], object_proto_methods: vec![], array_proto_methods: vec![], promise_proto_methods: vec![], map_proto_methods: vec![], set_proto_methods: vec![], headers_proto_methods: vec![], function_proto_methods: vec![], string_proto_methods: vec![], regexp_proto_methods: vec![], number_proto_methods: vec![], boolean_proto_methods: vec![], well_known_symbols: vec![] }
+        scopes: vec![], bindings: vec![], functions: fns, exports: vec![], site_meta: vec![], classes: vec![], object_proto_methods: vec![], array_proto_methods: vec![], promise_proto_methods: vec![], map_proto_methods: vec![], set_proto_methods: vec![], weak_map_proto_methods: vec![], weak_set_proto_methods: vec![], headers_proto_methods: vec![], function_proto_methods: vec![], string_proto_methods: vec![], regexp_proto_methods: vec![], number_proto_methods: vec![], boolean_proto_methods: vec![], well_known_symbols: vec![] }
 }
 fn st(r: &EscapeResult, site: u32) -> EscapeState {
     r.sites.iter().find(|s| s.site == SiteId(site)).expect("site").state

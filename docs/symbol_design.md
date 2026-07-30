@@ -6,26 +6,28 @@ Implement Symbol-related features as a batch. Current state (empirically verifie
 
 | Feature | Current state |
 |---|---|
-| `Symbol(desc)` | reject |
-| `obj[sym]` used as a key | reject |
-| object-literal `{ [Symbol.iterator]() {} }` | reject (computed-name method) |
-| class `[Symbol.iterator]() {}` | **works** (already implemented via WKSYM) |
-| `Symbol.for(k)` / `Symbol.keyFor` | reject |
-| `Symbol.iterator` used as a value | breaks (method-id misresolution) |
-| `typeof sym` / `sym === sym` | not implemented |
-| `sym.description` / `sym.toString()` | not implemented |
+| `Symbol(desc)` | implemented |
+| `obj[sym]` used as a key | implemented |
+| object-literal `{ [Symbol.iterator]() {} }` | implemented |
+| class `[Symbol.iterator]() {}` | implemented |
+| `Symbol.for(k)` / `Symbol.keyFor` | implemented |
+| `Symbol.iterator` used as a value | implemented |
+| `typeof sym` / `sym === sym` | implemented |
+| `sym.description` / `sym.toString()` | implemented |
+| non-registered Symbol as WeakMap/WeakSet key | implemented |
 
 Implement this on top of the existing tagged-key foundation (property_model_redesign.md §3.6).
 
 ## 1. Current foundation (verified in code)
 
 ### 1.1 Key space (ts_rt.h) — already implemented via range partitioning
-`ts_key` is uint32_t. 3 partitions:
+`ts_key` is uint32_t. 4 partitions:
 - STRING: 0 onward (field id / method name id are assigned by internField/internName)
 - METHOD: `TS_METHOD_KEY_BASE = 1_000_000` onward (`TS_KEY_METHOD(id)`)
 - WKSYM:  `TS_WKSYM_KEY_BASE = 2_000_000_000` onward (`TS_KEY_WKSYM(id)`)
   well-known id fixed: iterator=0, asyncIterator=1, toPrimitive=2, hasInstance=3, toStringTag=4.
-- The SYMBOL tag is reserved in the enum but **the physical key space is unallocated** (because user Symbol is not yet implemented).
+- USERSYM: `TS_USERSYM_KEY_BASE = 2_100_000_000` onward
+  (`TS_KEY_USERSYM(sym_id)`).
 
 Thanks to WKSYM, **class `[Symbol.iterator]()` already works** (registered under `TS_KEY_WKSYM(ITERATOR)`,
 and for-of looks it up by the same key). This is the reference pattern for the user Symbol implementation.
@@ -133,14 +135,18 @@ However, since the added branches for computed key / ts_set_dyn land on the dyna
 - **stringification error**: never stringify a symbol key (dedicated path). `Object.keys` does not
   enumerate symbol keys (JS spec) = add a predicate so prop_enum_data skips the symbol-key partition.
 - **=== and the registry**: the identity of `Symbol.for` is guaranteed by making it a singleton in the registry.
-- **GC**: mark ts_symbol.description in gc_mark. The well-known singletons are permanent roots.
+- **GC**: mark `ts_symbol.description` in `gc_mark`. Well-known singletons are
+  permanent roots and the `Symbol.for` registry is traced strongly. The
+  `sym_id -> Symbol` property-key identity table is weak; reachable properties
+  reconstruct and mark their Symbol key as a strong edge, while weak
+  collections do not.
 
 ## 5. Non-goals (out of scope this time)
 
 - private symbol (`#x` class private field) — has an existing implementation and a separate mechanism.
 - The actual type-conversion effect of `Symbol.toPrimitive` (hinted ToPrimitive) — even in stage 3 only value references are done;
   the conversion logic is separate.
-- Advanced uses of Symbol such as WeakMap keys, etc.
+- WeakRef/FinalizationRegistry integration beyond WeakMap/WeakSet.
 
 ## 6. Implementation results
 
@@ -199,7 +205,7 @@ single-level all match V8. conformance: object_methods/nested_capture.ts.
 
 ### Stage 3 (registry + auxiliaries) — DONE
 - runtime: a global Symbol registry (key string→singleton ts_symbol, a small linear-search table,
-  registered=1, permanent root). `ts_symbol_for(key)` (same key yields same symbol, === by pointer identity),
+  registered=1, traced as a strong GC root). `ts_symbol_for(key)` (same key yields same symbol, === by pointer identity),
   `ts_symbol_key_for(sym)` (the registration key of a registered symbol, or undefined), `ts_symbol_tostring(sym)`
   ("Symbol(desc)", or "Symbol()" when there is no desc).
 - exporter: `Symbol.for(k)`→symbol.for, `Symbol.keyFor(s)`→symbol.keyFor, the `.toString()` of a symbol-typed receiver
@@ -211,13 +217,29 @@ single-level all match V8. conformance: object_methods/nested_capture.ts.
 - Converted rejects_symbol.sh from a **negative test to a positive smoke test** (since Symbol is fully implemented,
   verifying that Symbol.for/keyFor/toString/obj[Symbol.*] work).
 
+### WeakMap/WeakSet integration — DONE
+
+- ordinary and well-known Symbols satisfy `CanBeHeldWeakly`; `Symbol.for`
+  identities are rejected because the global registry keeps them alive;
+- the former append-only description/identity ownership was replaced by a weak
+  `sym_id -> Symbol` lookup table;
+- a user-Symbol property name is explicitly traced as a strong GC edge and its
+  creation applies the old-to-young barrier;
+- weak Symbol identities are pruned after the ephemeron fixed point and before
+  handle reuse;
+- runtime coverage includes ordinary/well-known/registered Symbols, collection,
+  cycles, minor GC barriers, property-name reachability, and an ephemeron fixed
+  point reached through a Symbol property key. Conformance coverage is compared
+  against Node/V8.
+
 ## 7. Completion status
 
 All of Symbol's initial rejects (Symbol()/obj[sym]/{[Symbol.iterator]()}/Symbol.for/Symbol.iterator value) have been
 resolved, and user Symbol, well-known symbol, computed key, the iterator protocol, the registry, and
 description/toString are all implemented. **for-of over an object literal's custom iterator** works.
 The non-goals (§5) remain deferred: private symbol (#x, a separate mechanism), the coercion effect of Symbol.toPrimitive
-(value references and keying are possible, but conversion hooks such as Number(o) are not implemented), WeakMap keys, etc.
+(value references and keying are possible; later sections describe the
+conversion-hook follow-up), and WeakRef/FinalizationRegistry.
 
 ## 8. Loose ends (follow-up work)
 

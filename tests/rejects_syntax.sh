@@ -25,7 +25,7 @@ chk "destructured rest parameter"  'function f(...{a}: any): void {} function ma
 chk "vtable method capturing function-local" 'function make(b:number){ class C { constructor(){} scale(n:number){return b*n} } return new C(); } function main(): void { const c:any=make(10); console.log(c.scale(4)); }'
 # `new X()` where X does not statically resolve to a known class or supported
 # built-in: a class value held in a variable (a class can't carry a captured env
-# as a runtime value), or an unsupported built-in constructor (new Promise, ...).
+# as a runtime value), or an unsupported built-in constructor.
 # Previously silently produced an empty object; now loud-rejected (§90).
 # `const K = C; new K()` and the explicit-ctor factory `makeClass(z)` now work
 # (§102, class value carrying classId). A NO-CTOR class that captures an enclosing
@@ -33,7 +33,6 @@ chk "vtable method capturing function-local" 'function make(b:number){ class C {
 # captured cells on the value's env, resolved at the value-creation site) — see
 # classes/class_value_noctor_capture.ts. Still rejected: a parent EXPLICIT ctor that
 # captures a function local, reached via a no-ctor subclass value (v1 conservative).
-chk "new of an unsupported builtin ctor"      'function main(): void { const w:any=new WeakMap(); console.log(typeof w); }'
 # Object.prototype.{toString,...} (§128), Array/String/Map/Set/Number/Boolean.prototype.<m>
 # (§129), and Function.prototype.{call,apply,bind} (§129) are first-class values now.
 # A bare `Array/String/Map/Set/Number/Boolean.prototype` object is ALSO a value now (§133/§203:
@@ -63,5 +62,5 @@ chk "unsupported number method as a value"    'function main(): void { const f:a
 # (`super.x = v` is now fully supported — declared data field / parent accessor setter
 # / static members; getter-only writes throw a catchable TypeError and undeclared
 # properties create own data, both matching JS — see conformance_fixes §124–§127.)
-[ $fail -eq 0 ] && echo "[reject-syntax] PASS: forof-continue / finally-crossing-label / import-linkage / TDZ / destructured-rest-param / class-member(vtable-method-capture) / new-non-class / number-method-value rejected"
+[ $fail -eq 0 ] && echo "[reject-syntax] PASS: forof-continue / finally-crossing-label / import-linkage / TDZ / destructured-rest-param / class-member(vtable-method-capture) / number-method-value rejected"
 exit $fail

@@ -133,6 +133,8 @@ function generateProtoSetups(prog: Program, needsRegexp: boolean): string {
     { fn: "ts_setup_promise_proto", reg: "ts_promise_proto_register", field: "promiseProtoMethods", init: ["ts_promise_proto_init();"] },
     { fn: "ts_setup_map_proto", reg: "ts_map_proto_register", field: "mapProtoMethods", init: ["ts_map_proto_init();"] },
     { fn: "ts_setup_set_proto", reg: "ts_set_proto_register", field: "setProtoMethods", init: ["ts_set_proto_init();"] },
+    { fn: "ts_setup_weakmap_proto", reg: "ts_weakmap_proto_register", field: "weakMapProtoMethods", init: ["ts_weakmap_proto_init();"] },
+    { fn: "ts_setup_weakset_proto", reg: "ts_weakset_proto_register", field: "weakSetProtoMethods", init: ["ts_weakset_proto_init();"] },
     { fn: "ts_setup_headers_proto", reg: "ts_headers_proto_register", field: "headersProtoMethods", init: ["ts_headers_proto_init();"] },
     { fn: "ts_setup_function_proto", reg: "ts_function_proto_register", field: "functionProtoMethods", init: ["ts_function_proto_init();"] },
     { fn: "ts_setup_string_proto", reg: "ts_string_proto_register", field: "stringProtoMethods", init: ["ts_string_proto_init();"], unicode: true },
@@ -323,6 +325,7 @@ const CONSOLE_ERR = new Set(["console.warn", "console.error"]);
 const PROTOOBJ: Record<string, string> = {
   object: "ts_object_proto", array: "ts_array_proto", string: "ts_string_proto",
   map: "ts_map_proto", set: "ts_set_proto_obj", headers: "ts_headers_proto",
+  weakmap: "ts_weakmap_proto", weakset: "ts_weakset_proto_obj",
   number: "ts_number_proto", boolean: "ts_boolean_proto", function: "ts_function_proto",
 };
 
@@ -463,6 +466,10 @@ function emitCallBuiltinStatic(i: any, out: Line[], indent: number): void {
     case "instanceof.dyn": return set(`ts_instanceof_dyn(${a(0)}, ${a(1)})`);
     case "set.seed": return set(`ts_set_seed(${a(0)}, ${a(1)})`);
     case "map.seed": return set(`ts_map_seed(${a(0)}, ${a(1)})`);
+    case "weakmap.new": return set("ts_new_weakmap()");
+    case "weakset.new": return set("ts_new_weakset()");
+    case "weakmap.seed": return set(`ts_weakmap_seed(${a(0)}, ${a(1)})`);
+    case "weakset.seed": return set(`ts_weakset_seed(${a(0)}, ${a(1)})`);
     case "object.protoToStringCall": return set(`ts_objproto_tostring_call(${a(0)})`);
     case "promise.new": return set(`ts_promise_new_executor(${a(0)})`);
     case "reflect.get": return set(`ts_get_dyn(${a(0)}, ${a(1)})`);
@@ -1706,6 +1713,8 @@ function emitMain(prog: Program, needsRegexp: boolean): string {
     "  ts_setup_promise_proto();\n" +
     "  ts_setup_map_proto();\n" +
     "  ts_setup_set_proto();\n" +
+    "  ts_setup_weakmap_proto();\n" +
+    "  ts_setup_weakset_proto();\n" +
     "  ts_setup_headers_proto();\n" +
     "  ts_setup_string_proto();\n" +
     "  ts_setup_number_proto();\n" +
@@ -1757,7 +1766,8 @@ function buildCtx(prog: Program): void {
   const cats: [string, string][] = [
     ["array", "arrayProtoMethods"], ["string", "stringProtoMethods"],
     ["object", "objectProtoMethods"], ["map", "mapProtoMethods"],
-    ["set", "setProtoMethods"], ["number", "numberProtoMethods"],
+    ["set", "setProtoMethods"], ["weakmap", "weakMapProtoMethods"],
+    ["weakset", "weakSetProtoMethods"], ["number", "numberProtoMethods"],
     ["boolean", "booleanProtoMethods"], ["promise", "promiseProtoMethods"],
     ["headers", "headersProtoMethods"], ["function", "functionProtoMethods"],
     ["regexp", "regexpProtoMethods"],
