@@ -606,6 +606,7 @@ const GEN_CONSUME: Record<string, string> = {
   "generator.return": "ts_gen_return",
   "asyncgen.next": "ts_asyncgen_next",
   "asyncgen.throw": "ts_asyncgen_throw",
+  "asyncgen.return": "ts_asyncgen_return",
 };
 
 function emitCallBuiltin(i: any, out: Line[], indent: number): void {
@@ -665,40 +666,196 @@ function push(out: Line[], indent: number, s: string): void {
 /** Structured-loop label state (goto-form loops). Reset per function; labels are
  *  function-scoped in C. The coroutine path has its own flatten-time stack. */
 let SLOOP: { n: number; stack: { top: string; end: string }[] } = { n: 0, stack: [] };
+interface PlainFinCtx {
+  pend: string;
+  pendv: string;
+  finLabel: string;
+  baseEhDepth: number;
+}
+let PLAIN_FIN: {
+  n: number;
+  ehDepth: number;
+  stack: { ctx: PlainFinCtx; ehDepth: number }[];
+} = { n: 0, ehDepth: 0, stack: [] };
 
 function emitBody(body: Inst[], out: Line[], indent: number): void {
   for (const inst of body) emitInst(inst as any, out, indent);
 }
 
-/** Conservatively true if a body can transfer control out of an enclosing
- *  try/catch (Return always; Break/Continue too — over-approximated, even
- *  loop-local ones). Used to defer the finally-completion-record lowering. */
-function hasAbruptControl(body: any[]): boolean {
-  for (const i of body) {
-    if (i.kind === "Return" || i.kind === "Break" || i.kind === "Continue") return true;
-    for (const k of Object.keys(i)) {
-      const v = (i as any)[k];
-      if (Array.isArray(v) && v.length && v[0] && v[0].kind && hasAbruptControl(v)) return true;
+/** Emit code inside a finally-protected region, routing abrupt completions to it. */
+function emitFinallyGuarded(
+  body: any[],
+  out: Line[],
+  indent: number,
+  fc: PlainFinCtx,
+  loopDepth: number,
+): void {
+  for (const inst of body) {
+    switch (inst.kind) {
+      case "Return": {
+        const value = inst.src === undefined || inst.src === null ? "TS_UNDEFINED" : `L${inst.src}`;
+        const pop = "ts_eh_pop(); ".repeat(Math.max(0, PLAIN_FIN.ehDepth - fc.baseEhDepth));
+        push(out, indent, `${fc.pendv} = ${value}; ${fc.pend} = 1; ${pop}goto ${fc.finLabel};`);
+        break;
+      }
+      case "Break":
+        if (loopDepth === 0) {
+          const pop = "ts_eh_pop(); ".repeat(Math.max(0, PLAIN_FIN.ehDepth - fc.baseEhDepth));
+          push(out, indent, `${fc.pend} = 2; ${pop}goto ${fc.finLabel};`);
+        }
+        else push(out, indent, "break;");
+        break;
+      case "Continue":
+        if (loopDepth === 0) {
+          const pop = "ts_eh_pop(); ".repeat(Math.max(0, PLAIN_FIN.ehDepth - fc.baseEhDepth));
+          push(out, indent, `${fc.pend} = 3; ${pop}goto ${fc.finLabel};`);
+        }
+        else push(out, indent, "continue;");
+        break;
+      case "If":
+        push(out, indent, `if (ts_truthy_fast(L${inst.cond})) {`);
+        emitFinallyGuarded(inst.thenBody ?? [], out, indent + 1, fc, loopDepth);
+        push(out, indent, "} else {");
+        emitFinallyGuarded(inst.elseBody ?? [], out, indent + 1, fc, loopDepth);
+        push(out, indent, "}");
+        break;
+      case "Loop":
+        push(out, indent, "for (;;) {");
+        emitFinallyGuarded(inst.condBody ?? [], out, indent + 1, fc, loopDepth + 1);
+        push(out, indent + 1, `if (!ts_truthy_fast(L${inst.cond})) break;`);
+        emitFinallyGuarded(inst.body ?? [], out, indent + 1, fc, loopDepth + 1);
+        push(out, indent, "}");
+        break;
+      case "TryCatch": {
+        const finallyBody = inst.finallyBody ?? [];
+        if (finallyBody.length) {
+          emitPlainFinally(inst, out, indent);
+        } else {
+          const baseEhDepth = PLAIN_FIN.ehDepth;
+          push(out, indent, "{");
+          push(out, indent + 1, "ts_handler* _h = ts_eh_push();");
+          push(out, indent + 1, "if (setjmp(_h->buf) == 0) {");
+          PLAIN_FIN.ehDepth = baseEhDepth + 1;
+          emitFinallyGuarded(inst.tryBody ?? [], out, indent + 2, fc, loopDepth);
+          push(out, indent + 2, "ts_eh_pop();");
+          push(out, indent + 1, "} else {");
+          push(out, indent + 2, "ts_gc_set_root_depth(_h->gc_root_len);");
+          push(out, indent + 2, "ts_eh_pop();");
+          PLAIN_FIN.ehDepth = baseEhDepth;
+          if (inst.catchVar !== undefined && inst.catchVar !== null) {
+            push(out, indent + 2, `L${inst.catchVar} = ts_current_exception();`);
+          }
+          emitFinallyGuarded(inst.catchBody ?? [], out, indent + 2, fc, loopDepth);
+          push(out, indent + 1, "}");
+          push(out, indent, "}");
+          PLAIN_FIN.ehDepth = baseEhDepth;
+        }
+        break;
+      }
+      default:
+        emitInst(inst, out, indent);
+        break;
     }
   }
-  return false;
 }
 
-/** try/catch/finally via the runtime's setjmp/longjmp handler stack. The handler
- *  snapshots the GC root depth so an unwind restores it. The abrupt-exit-through-
- *  finally case (completion records) is deferred (loud). */
+/** Completion-record lowering for a non-coroutine try/catch/finally. */
+function emitPlainFinally(inst: any, out: Line[], indent: number): void {
+  const tryBody = inst.tryBody ?? [];
+  const catchBody = inst.catchBody ?? [];
+  const finallyBody = inst.finallyBody ?? [];
+  const catchVar = inst.catchVar;
+  const id = PLAIN_FIN.n++;
+  const finLabel = `PF${id}_finally`;
+  const afterLabel = `PF${id}_after`;
+  const baseEhDepth = PLAIN_FIN.ehDepth;
+  const fc: PlainFinCtx = {
+    pend: `_pf_pending${id}`,
+    pendv: `_pf_value${id}`,
+    finLabel,
+    baseEhDepth,
+  };
+  const hasCatch = catchBody.length > 0 || (catchVar !== undefined && catchVar !== null);
+  push(out, indent, `int ${fc.pend} = 0; tsv ${fc.pendv} = TS_UNDEFINED;`);
+  PLAIN_FIN.stack.push({ ctx: fc, ehDepth: baseEhDepth });
+  push(out, indent, "{");
+  push(out, indent + 1, "ts_handler* _h = ts_eh_push();");
+  push(out, indent + 1, "if (setjmp(_h->buf) == 0) {");
+  PLAIN_FIN.ehDepth = baseEhDepth + 1;
+  emitFinallyGuarded(tryBody, out, indent + 2, fc, 0);
+  push(out, indent + 2, "ts_eh_pop();");
+  push(out, indent + 2, `goto ${finLabel};`);
+  push(out, indent + 1, "} else {");
+  push(out, indent + 2, "ts_gc_set_root_depth(_h->gc_root_len);");
+  push(out, indent + 2, "ts_eh_pop();");
+  if (hasCatch) {
+    if (catchVar !== undefined && catchVar !== null) {
+      push(out, indent + 2, `L${catchVar} = ts_current_exception();`);
+    }
+    push(out, indent + 2, "{");
+    push(out, indent + 3, "ts_handler* _h2 = ts_eh_push();");
+    push(out, indent + 3, "if (setjmp(_h2->buf) == 0) {");
+    PLAIN_FIN.ehDepth = baseEhDepth + 1;
+    emitFinallyGuarded(catchBody, out, indent + 4, fc, 0);
+    push(out, indent + 4, "ts_eh_pop();");
+    push(out, indent + 4, `goto ${finLabel};`);
+    push(out, indent + 3, "} else {");
+    push(out, indent + 4, "ts_gc_set_root_depth(_h2->gc_root_len);");
+    push(out, indent + 4, "ts_eh_pop();");
+    push(out, indent + 4, `${fc.pend} = 4; ${fc.pendv} = ts_current_exception(); goto ${finLabel};`);
+    push(out, indent + 3, "}");
+    push(out, indent + 2, "}");
+  } else {
+    push(out, indent + 2, `${fc.pend} = 4; ${fc.pendv} = ts_current_exception(); goto ${finLabel};`);
+  }
+  push(out, indent + 1, "}");
+  push(out, indent, "}");
+  PLAIN_FIN.ehDepth = baseEhDepth;
+  PLAIN_FIN.stack.pop();
+  push(out, indent, `${finLabel}: ;`);
+  emitBody(finallyBody, out, indent);
+  const outer = PLAIN_FIN.stack[PLAIN_FIN.stack.length - 1];
+  push(out, indent, `switch (${fc.pend}) {`);
+  if (outer) {
+    const pops = Math.max(0, baseEhDepth - outer.ehDepth);
+    const pop = "ts_eh_pop(); ".repeat(pops);
+    push(out, indent + 1, `case 1: ${pop}${outer.ctx.pend} = 1; ${outer.ctx.pendv} = ${fc.pendv}; goto ${outer.ctx.finLabel};`);
+    push(out, indent + 1, `case 2: ${pop}${outer.ctx.pend} = 2; goto ${outer.ctx.finLabel};`);
+    push(out, indent + 1, `case 3: ${pop}${outer.ctx.pend} = 3; goto ${outer.ctx.finLabel};`);
+    push(out, indent + 1, `case 4: ${pop}${outer.ctx.pend} = 4; ${outer.ctx.pendv} = ${fc.pendv}; goto ${outer.ctx.finLabel};`);
+  } else {
+    push(out, indent + 1, `case 1: ts_gc_unroot(NROOT); return ${fc.pendv};`);
+    const loop = SLOOP.stack[SLOOP.stack.length - 1];
+    if (loop) {
+      push(out, indent + 1, `case 2: goto ${loop.end};`);
+      push(out, indent + 1, `case 3: goto ${loop.top};`);
+    } else {
+      push(out, indent + 1, "case 2: case 3: break;");
+    }
+    push(out, indent + 1, `case 4: ts_throw(${fc.pendv});`);
+  }
+  push(out, indent + 1, "default: ;");
+  push(out, indent, "}");
+  push(out, indent, `${afterLabel}: ;`);
+}
+
+/** try/catch/finally via the runtime's setjmp/longjmp handler stack. */
 function emitTryCatch(inst: any, out: Line[], indent: number): void {
   const tryBody = inst.tryBody ?? [];
   const catchBody = inst.catchBody ?? [];
   const finallyBody = inst.finallyBody ?? [];
-  if (finallyBody.length && (hasAbruptControl(tryBody) || hasAbruptControl(catchBody))) {
-    throw new UnportedError("TryCatch with abrupt exit (return/break/continue) through finally");
+  if (finallyBody.length) {
+    emitPlainFinally(inst, out, indent);
+    return;
   }
+  const baseEhDepth = PLAIN_FIN.ehDepth;
   push(out, indent, "{");
   push(out, indent + 1, "ts_handler* _h = ts_eh_push();");
   push(out, indent + 1, "if (setjmp(_h->buf) == 0) {");
+  PLAIN_FIN.ehDepth = baseEhDepth + 1;
   emitBody(tryBody, out, indent + 2);
   push(out, indent + 2, "ts_eh_pop();");
+  PLAIN_FIN.ehDepth = baseEhDepth;
   emitBody(finallyBody, out, indent + 2);
   push(out, indent + 1, "} else {");
   push(out, indent + 2, "ts_gc_set_root_depth(_h->gc_root_len);");
@@ -706,10 +863,12 @@ function emitTryCatch(inst: any, out: Line[], indent: number): void {
   if (inst.catchVar !== undefined && inst.catchVar !== null) {
     push(out, indent + 2, `L${inst.catchVar} = ts_current_exception();`);
   }
+  PLAIN_FIN.ehDepth = baseEhDepth;
   emitBody(catchBody, out, indent + 2);
   emitBody(finallyBody, out, indent + 2);
   push(out, indent + 1, "}");
   push(out, indent, "}");
+  PLAIN_FIN.ehDepth = baseEhDepth;
 }
 
 function emitInst(inst: any, out: Line[], indent: number): void {
@@ -1333,7 +1492,16 @@ function emitSmResumeBody(fn: FunctionDef, mode: SmMode, out: Line[]): void {
   // Promise-backed catch-all: an uncaught throw rejects the function's promise.
   if (isPromiseBacked(mode)) {
     out.push("  if (setjmp(_fr->c.reject_buf) != 0) {");
-    if (mode === "AsyncGenerator") out.push("    _fr->c.done = 1;");
+    if (mode === "AsyncGenerator") {
+      out.push("    _fr->c.done = 1;");
+      out.push("    if (ts_is_gen_return_completion(ts_current_exception())) {");
+      out.push("      tsv _ge = ts_current_exception(); ts_gc_root(&_ge);");
+      out.push("      tsv _gv = ts_gen_return_completion_value(_ge); ts_gc_root(&_gv);");
+      out.push("      ts_promise_resolve_v(_fr->c.ret, ts_iter_result(_gv, 1));");
+      out.push("      ts_gc_unroot(2);");
+      out.push("      return TS_UNDEFINED;");
+      out.push("    }");
+    }
     out.push("    ts_promise_reject_v(_fr->c.ret, ts_current_exception());");
     out.push("    return TS_UNDEFINED;");
     out.push("  }");
@@ -1379,7 +1547,7 @@ function emitSmResumeBody(fn: FunctionDef, mode: SmMode, out: Line[]): void {
         break;
       case "TryEnter":
         out.push("  {");
-        out.push("    int _t = _fr->c.eh_top++;");
+        out.push("    int _t = ts_coro_eh_push_slot(&_fr->c);");
         out.push("    _fr->c.eh_gc_depth[_t] = ts_gc_root_depth();");
         out.push(`    _fr->c.eh_catch_state[_t] = ${f.catchLabel};`);
         out.push("  }");
@@ -1413,6 +1581,7 @@ function emitSmResumeBody(fn: FunctionDef, mode: SmMode, out: Line[]): void {
         break;
       case "CatchLabel":
         out.push(`  LC${f.catchLabel}: ;`);
+        out.push("  if (ts_is_gen_return_completion(ts_current_exception())) ts_throw(ts_current_exception());");
         if (f.catchVar !== undefined) out.push(`  L${f.catchVar} = ts_current_exception();`);
         break;
       case "AfterLabel":
@@ -1420,7 +1589,7 @@ function emitSmResumeBody(fn: FunctionDef, mode: SmMode, out: Line[]): void {
         break;
       case "FinallyEnterTry":
         out.push("  {");
-        out.push("    int _t = _fr->c.eh_top++;");
+        out.push("    int _t = ts_coro_eh_push_slot(&_fr->c);");
         out.push("    _fr->c.eh_gc_depth[_t] = ts_gc_root_depth();");
         out.push(`    _fr->c.eh_catch_state[_t] = ${f.finCatchLabel};`);
         out.push("  }");
@@ -1435,12 +1604,14 @@ function emitSmResumeBody(fn: FunctionDef, mode: SmMode, out: Line[]): void {
       case "FinallyGotoNormal":
         out.push("  ts_eh_pop();");
         out.push("  _fr->c.eh_top--;");
-        out.push("  { int _f = _fr->c.fin_top++; _fr->c.fin_pending[_f] = 0; }");
+        out.push("  { int _f = ts_coro_fin_push_slot(&_fr->c); _fr->c.fin_pending[_f] = 0; }");
         out.push(`  goto FL${f.finLabel};`);
         break;
       case "FinallyCatchLabel":
         out.push(`  LC${f.finCatchLabel}: ;`);
-        out.push("  { int _f = _fr->c.fin_top++; _fr->c.fin_pending[_f] = 1; _fr->c.fin_exc[_f] = ts_current_exception(); }");
+        out.push("  { int _f = ts_coro_fin_push_slot(&_fr->c); tsv _e = ts_current_exception();");
+        out.push("    _fr->c.fin_pending[_f] = ts_is_gen_return_completion(_e) ? 2 : 1;");
+        out.push("    _fr->c.fin_exc[_f] = ts_is_gen_return_completion(_e) ? ts_gen_return_completion_value(_e) : _e; }");
         out.push(`  goto FL${f.finLabel};`);
         break;
       case "FinallyLabel":
@@ -1449,7 +1620,7 @@ function emitSmResumeBody(fn: FunctionDef, mode: SmMode, out: Line[]): void {
       case "FinallyAbrupt": {
         out.push("  ts_eh_pop();");
         out.push("  _fr->c.eh_top--;");
-        out.push(`  { int _f = _fr->c.fin_top++; _fr->c.fin_pending[_f] = ${f.kind}; _fr->c.fin_tgt[_f] = ${f.target};`);
+        out.push(`  { int _f = ts_coro_fin_push_slot(&_fr->c); _fr->c.fin_pending[_f] = ${f.kind}; _fr->c.fin_tgt[_f] = ${f.target};`);
         if (f.value !== undefined) out.push(`    _fr->c.fin_exc[_f] = L${f.value};`);
         out.push("  }");
         out.push(`  goto FL${f.finLabel};`);
@@ -1459,7 +1630,7 @@ function emitSmResumeBody(fn: FunctionDef, mode: SmMode, out: Line[]): void {
         out.push("  { int _f = --_fr->c.fin_top; int _k = _fr->c.fin_pending[_f];");
         if (f.outerFin !== undefined) {
           out.push("    if (_k != 0) {");
-          out.push("      int _of = _fr->c.fin_top++;");
+          out.push("      int _of = ts_coro_fin_push_slot(&_fr->c);");
           out.push("      _fr->c.fin_pending[_of] = _k;");
           out.push("      _fr->c.fin_exc[_of] = _fr->c.fin_exc[_f];");
           out.push("      _fr->c.fin_tgt[_of] = _fr->c.fin_tgt[_f];");
@@ -1607,6 +1778,7 @@ function emitFunction(fn: FunctionDef): string {
   if (fn.isGenerator) return emitCoroutineFunction(fn, "Generator");
   if (fn.isAsync) return emitCoroutineFunction(fn, "Async");
   SLOOP = { n: 0, stack: [] };
+  PLAIN_FIN = { n: 0, ehDepth: 0, stack: [] };
   const out: Line[] = [];
   out.push(`static tsv ${fnSym(fn)}(tsv* args, int nargs){`);
   out.push("  (void)args; (void)nargs;");

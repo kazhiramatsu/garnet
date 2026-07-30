@@ -5,6 +5,10 @@
 # that have exposed moving-minor raw-local / escape-boundary bugs, and runs them
 # with TSAOT_GC_YOUNG_THRESHOLD=1. A normal O2 pass catches optimizer/layout
 # sensitive failures; an ASan O0 pass catches memory lifetime issues.
+#
+# The script itself is deliberately serial. CI must run it as an isolated phase:
+# threshold=1 turns nearly every allocation into a collection, so competing with
+# unrelated compiler/benchmark jobs burns CPU without increasing GC coverage.
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 S="$ROOT/scripts"
@@ -102,8 +106,13 @@ if [[ "$RUN_FULL" == "1" ]]; then
 fi
 
 if [[ "$RUN_STRING_SCALE" != "0" ]]; then
-  echo ">>> string-builder 64 MiB scale stress (O2 + ASan)"
-  bash "$ROOT/tests/string_builder_scale_gate.sh" || rc=1
+  if [[ "$RUN_ASAN" != "0" ]]; then
+    echo ">>> string-builder 64 MiB scale stress (O2 + ASan)"
+  else
+    echo ">>> string-builder 64 MiB scale stress (O2)"
+  fi
+  TSAOT_STRING_SCALE_ASAN="$RUN_ASAN" \
+    bash "$ROOT/tests/string_builder_scale_gate.sh" || rc=1
 fi
 
 if [[ $rc -eq 0 ]]; then

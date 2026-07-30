@@ -89,7 +89,7 @@ plain EH path: a longjmp/dispatch skips ts_gc_unroot calls).
 
 The single-handler scheme is generalized to a fixed-depth stack in the frame:
 ```c
-#define TS_CORO_EH_MAX 8
+#define TS_CORO_EH_INLINE 8
 int     eh_top;                       // number of active coroutine handlers
 int     eh_catch_state[TS_CORO_EH_MAX];
 int     eh_gc_depth[TS_CORO_EH_MAX];
@@ -97,6 +97,10 @@ jmp_buf eh_buf;                       // single shared landing pad (re-armed eac
 ```
 - `eh_top > 0` replaces the old `eh_active` flag. The INNERMOST handler is at
   index `eh_top-1`.
+- Every generated handler/finally push goes through a slot allocator. The first
+  eight records stay inline in the coroutine frame; deeper legal nesting spills
+  to dynamically grown metadata arrays. This removes the historical unchecked
+  eight-record overflow without inflating every Promise adapter frame.
 - One shared `eh_buf`: a cross-function `longjmp` lands once and we dispatch to
   the innermost handler (`eh_catch_state[eh_top-1]`). This is correct because the
   innermost try is the nearest dynamically-enclosing handler.

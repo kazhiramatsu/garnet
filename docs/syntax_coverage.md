@@ -29,7 +29,7 @@ explicit error until implemented).
 | `instanceof` | DONE (compile-time) | resolved from static class + subclass walk; dynamic-class operand errors loudly |
 | `in` / `delete` | DROPPED | need dynamic property machinery |
 | **comma, tagged template, optional chaining `?.`** | **DROPPED** | medium |
-| `yield`/`await` | **P5 — not supported (errors loudly)** | needs state-machine transform + Promise/event-loop runtime; see docs/async_design.md |
+| `yield`/`await` | DONE | coroutine state machines, Promise resolution, generator and async-generator request protocols |
 
 ## Statements
 | construct | status | notes |
@@ -47,7 +47,7 @@ explicit error until implemented).
 | generator (function*/yield) | DONE | yield in loops/conditionals via general state-machine builder; yield*/in-try rejected |
 | async/await | DONE | await in loops/conditionals/sub-exprs via general state-machine builder | state-machine coroutine; nested await rejected |
 | fetch | DONE (http://) | non-blocking Promise + I/O queue; https needs TLS |
-| try/catch/finally | DONE | setjmp/longjmp unwind; finally on normal+caught path; finally-through-return/throw rejected |
+| try/catch/finally | DONE | setjmp/longjmp unwind plus completion records for return/throw/break/continue, including coroutines |
 | **labeled stmt** | **DROPPED** | low |
 | class declaration | DONE | full (fields, methods, accessors, ctor, super, inheritance) |
 | optional chaining `?.` | DONE | TS downlevels; verified |

@@ -26,16 +26,23 @@ So we add SmMode::AsyncGenerator where:
 - Return/fall-off == resolve next-promise {value, done:true}.
 
 ## Runtime
-- ts_coro gains nothing new structurally; we reuse `ret` as the CURRENT next-promise
-  (recreated per .next()), `yielded` unused for asyncgen (value goes via promise).
-- ts_asyncgen_new(coro) -> object with __coro (like ts_gen_new).
-- ts_asyncgen_next(genobj) -> creates a fresh promise, stores as c->ret, sets
-  c->result=undefined, and if not already running, resumes; returns the promise.
-  Because an await inside may suspend, the promise resolves later (when yield or
-  completion is reached). The await path uses ts_await_register which re-enters
-  resume from the scheduler; that resume eventually resolves c->ret.
-- A makeshift "done" guard: once the generator completed, .next() returns a promise
-  resolved with {undefined, true} immediately.
+- `ts_coro` owns a FIFO of `{promise,value,kind}` requests. `.next()`, `.throw()`,
+  and `.return()` append a request; only the head may drive the frame. This is
+  required because callers may issue several requests before any of their
+  promises settle.
+- `ts_asyncgen_new_v(coro)` returns the lazy async-generator object and marks the
+  frame as async-generator-owned.
+- The active request's promise is stored in `c->ret`. Await suspensions retain
+  ownership of the frame; yield/return/rejection settles that promise, removes
+  the head, and starts the next queued request.
+- `yield e` first awaits `e`, then resolves `{value,done:false}`.
+- `.return(v)` first awaits `v`. Fulfillment injects an internal return
+  completion so user `catch` cannot consume it but every `finally` still runs;
+  rejection is injected as a normal throw. A return request against an
+  unstarted/completed generator also awaits its argument.
+- Completion drains later queued requests in FIFO order. `.next()` receives
+  `{undefined,true}`, `.throw(e)` rejects, and `.return(v)` awaits `v` and
+  receives `{v,true}`.
 
 ## Resolving {value,done} object
 We build a small object {value, done} and resolve the next-promise with it. Helper
@@ -59,5 +66,7 @@ Nested for-await works because each loop has its own g/r locals (same as for-of 
 - for-await-of over an async generator, nested.
 - try/catch/finally with suspension inside async generators reuses the coroutine EH
   paths (same flat machinery); supported as for async/generator.
-- NOT yet: yield* delegation in async generators; async-iterator protocol on
-  arbitrary objects (only our async generators).
+- concurrent `.next/.throw/.return` requests and IteratorClose on early loop exit.
+- `yield*` delegation and the general async-iterator protocol are implemented by
+  the shared iterator lowering; the runtime request queue remains specific to
+  Garnet async-generator frames.

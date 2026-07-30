@@ -3912,27 +3912,6 @@ interface EmitCtx {
   ehDepth: number; // live C EH handlers in the current emission path
 }
 
-/** True if body contains a Return/Throw, or a Break/Continue that escapes the
- *  region (i.e. not bound by a loop inside it). Mirrors body_exits_abruptly. */
-function bodyExitsAbruptly(body: any[]): boolean {
-  const walk = (b: any[], inLoop: boolean): boolean => {
-    for (const i of b) {
-      if (i.kind === "Return" || i.kind === "Throw") return true;
-      if (i.kind === "Break" || i.kind === "Continue") {
-        if (!inLoop) return true;
-      } else if (i.kind === "If") {
-        if (walk(i.thenBody ?? [], inLoop) || walk(i.elseBody ?? [], inLoop)) return true;
-      } else if (i.kind === "Loop") {
-        if (walk(i.condBody ?? [], true) || walk(i.body ?? [], true)) return true;
-      } else if (i.kind === "TryCatch") {
-        if (walk(i.tryBody ?? [], inLoop) || walk(i.catchBody ?? [], inLoop) || walk(i.finallyBody ?? [], inLoop)) return true;
-      }
-    }
-    return false;
-  };
-  return walk(body, false);
-}
-
 function cxNum(cx: EmitCtx, id: number): string {
   if (cx.jsonLocals.has(id)) return `ts_json_dom_number(j${id})`;
   return cx.unboxed.has(id) ? `d${id}` : `ts_to_num(v${id})`;
@@ -4035,6 +4014,22 @@ function smCatchVarOf(inst: any): number | undefined {
   return inst.catchVar === null || inst.catchVar === undefined ? undefined : inst.catchVar;
 }
 
+function smBodyHasSuspension(body: any[]): boolean {
+  for (const inst of body) {
+    if (inst.kind === "Await" || inst.kind === "Yield") return true;
+    if (inst.kind === "If") {
+      if (smBodyHasSuspension(inst.thenBody ?? []) || smBodyHasSuspension(inst.elseBody ?? [])) return true;
+    } else if (inst.kind === "Loop") {
+      if (smBodyHasSuspension(inst.condBody ?? []) || smBodyHasSuspension(inst.body ?? [])) return true;
+    } else if (inst.kind === "TryCatch") {
+      if (smBodyHasSuspension(inst.tryBody ?? []) ||
+          smBodyHasSuspension(inst.catchBody ?? []) ||
+          smBodyHasSuspension(inst.finallyBody ?? [])) return true;
+    }
+  }
+  return false;
+}
+
 function flattenCf(body: any[], out: Flat[], st: FlattenState): void {
   const fresh = () => st.next.n++;
   for (const inst of body) {
@@ -4102,6 +4097,12 @@ function flattenCf(body: any[], out: Flat[], st: FlattenState): void {
         out.push({ t: "InCoroThrow", src: inst.src });
         break;
       case "TryCatch": {
+        if (!smBodyHasSuspension(inst.tryBody ?? []) &&
+            !smBodyHasSuspension(inst.catchBody ?? []) &&
+            !smBodyHasSuspension(inst.finallyBody ?? [])) {
+          out.push({ t: "Inst", inst });
+          break;
+        }
         const finallyBody = inst.finallyBody ?? [];
         if (finallyBody.length > 0) {
           flattenTryFinally(inst, out, st);
@@ -4190,7 +4191,14 @@ function emitSmResumeBody(s: string[], f: any, cx: EmitCtx, numericFacts: Numeri
 
   if (smIsPromiseBacked(mode)) {
     s.push("  if (setjmp(_fr->c.reject_buf) != 0) {\n");
-    if (mode === "AsyncGenerator") s.push("    _fr->c.done = 1;\n");
+    if (mode === "AsyncGenerator") {
+      s.push("    _fr->c.done = 1;\n");
+      s.push("    if (ts_is_gen_return_completion(ts_current_exception())) {\n");
+      s.push("      tsv _ge = ts_current_exception(); ts_gc_root(&_ge);\n");
+      s.push("      tsv _gv = ts_gen_return_completion_value(_ge); ts_gc_root(&_gv);\n");
+      s.push("      ts_promise_resolve_v(_fr->c.ret, ts_iter_result(_gv, 1));\n");
+      s.push("      ts_gc_unroot(2);\n      return TS_UNDEFINED;\n    }\n");
+    }
     s.push("    ts_promise_reject_v(_fr->c.ret, ts_current_exception());\n");
     s.push("    return TS_UNDEFINED;\n");
     s.push("  }\n");
@@ -4261,7 +4269,7 @@ function emitSmResumeBody(s: string[], f: any, cx: EmitCtx, numericFacts: Numeri
         s.push(`  if (!${cxTruthy(cx, fl.cond)}) goto L${fl.id};\n`);
         break;
       case "TryEnter":
-        s.push("  {\n    int _t = _fr->c.eh_top++;\n");
+        s.push("  {\n    int _t = ts_coro_eh_push_slot(&_fr->c);\n");
         s.push("    _fr->c.eh_gc_depth[_t] = ts_gc_root_depth();\n");
         s.push(`    _fr->c.eh_catch_state[_t] = ${fl.catchLabel};\n`);
         s.push("  }\n");
@@ -4293,13 +4301,14 @@ function emitSmResumeBody(s: string[], f: any, cx: EmitCtx, numericFacts: Numeri
         break;
       case "CatchLabel":
         s.push(`  LC${fl.catchLabel}: ;\n`);
+        s.push("  if (ts_is_gen_return_completion(ts_current_exception())) ts_throw(ts_current_exception());\n");
         if (fl.catchVar !== undefined) s.push(cxSetVal(cx, fl.catchVar, "ts_current_exception()"));
         break;
       case "AfterLabel":
         s.push(`  L${fl.afterLabel}: ;\n`);
         break;
       case "FinallyEnterTry":
-        s.push("  {\n    int _t = _fr->c.eh_top++;\n");
+        s.push("  {\n    int _t = ts_coro_eh_push_slot(&_fr->c);\n");
         s.push("    _fr->c.eh_gc_depth[_t] = ts_gc_root_depth();\n");
         s.push(`    _fr->c.eh_catch_state[_t] = ${fl.finCatchLabel};\n`);
         s.push("  }\n");
@@ -4313,12 +4322,14 @@ function emitSmResumeBody(s: string[], f: any, cx: EmitCtx, numericFacts: Numeri
         break;
       case "FinallyGotoNormal":
         s.push("  ts_eh_pop();\n  _fr->c.eh_top--;\n");
-        s.push("  { int _f = _fr->c.fin_top++; _fr->c.fin_pending[_f] = 0; }\n");
+        s.push("  { int _f = ts_coro_fin_push_slot(&_fr->c); _fr->c.fin_pending[_f] = 0; }\n");
         s.push(`  goto L${fl.finLabel};\n`);
         break;
       case "FinallyCatchLabel":
         s.push(`  LC${fl.finCatchLabel}: ;\n`);
-        s.push("  { int _f = _fr->c.fin_top++; _fr->c.fin_pending[_f] = 1; _fr->c.fin_exc[_f] = ts_current_exception(); }\n");
+        s.push("  { int _f = ts_coro_fin_push_slot(&_fr->c); tsv _e = ts_current_exception();\n");
+        s.push("    _fr->c.fin_pending[_f] = ts_is_gen_return_completion(_e) ? 2 : 1;\n");
+        s.push("    _fr->c.fin_exc[_f] = ts_is_gen_return_completion(_e) ? ts_gen_return_completion_value(_e) : _e; }\n");
         s.push(`  goto L${fl.finLabel};\n`);
         break;
       case "FinallyLabel":
@@ -4326,7 +4337,7 @@ function emitSmResumeBody(s: string[], f: any, cx: EmitCtx, numericFacts: Numeri
         break;
       case "FinallyAbrupt":
         s.push("  ts_eh_pop();\n  _fr->c.eh_top--;\n");
-        s.push(`  { int _f = _fr->c.fin_top++; _fr->c.fin_pending[_f] = ${fl.kind}; _fr->c.fin_tgt[_f] = ${fl.target};\n`);
+        s.push(`  { int _f = ts_coro_fin_push_slot(&_fr->c); _fr->c.fin_pending[_f] = ${fl.kind}; _fr->c.fin_tgt[_f] = ${fl.target};\n`);
         if (fl.value !== undefined && fl.value !== null) s.push(`    _fr->c.fin_exc[_f] = ${cxVal(cx, fl.value)};\n`);
         s.push("  }\n");
         s.push(`  goto L${fl.finLabel};\n`);
@@ -4335,7 +4346,7 @@ function emitSmResumeBody(s: string[], f: any, cx: EmitCtx, numericFacts: Numeri
         s.push("  { int _f = --_fr->c.fin_top; int _k = _fr->c.fin_pending[_f];\n");
         if (fl.outerFin !== undefined) {
           s.push("    if (_k != 0) {\n");
-          s.push("      int _of = _fr->c.fin_top++;\n");
+          s.push("      int _of = ts_coro_fin_push_slot(&_fr->c);\n");
           s.push("      _fr->c.fin_pending[_of] = _k;\n");
           s.push("      _fr->c.fin_exc[_of] = _fr->c.fin_exc[_f];\n");
           s.push("      _fr->c.fin_tgt[_of] = _fr->c.fin_tgt[_f];\n");
@@ -4471,6 +4482,7 @@ interface FinCtx {
   pend: string;
   pendv: string;
   finLabel: number;
+  baseEhDepth: number;
 }
 
 /** Mirrors emit_guarded: re-route abrupt completions (return/break/continue)
@@ -4480,15 +4492,22 @@ function emitGuarded(s: string[], body: any[], cx: EmitCtx, numericFacts: Numeri
     switch (inst.kind) {
       case "Return": {
         const v = inst.src !== undefined && inst.src !== null ? cxVal(cx, inst.src) : "TS_UNDEFINED";
-        s.push(`  ${fc.pendv} = ${v}; ${fc.pend} = 1; ts_eh_pop(); goto L${fc.finLabel};\n`);
+        const pops = Math.max(0, cx.ehDepth - fc.baseEhDepth);
+        s.push(`  ${fc.pendv} = ${v}; ${fc.pend} = 1; ${"ts_eh_pop(); ".repeat(pops)}goto L${fc.finLabel};\n`);
         break;
       }
       case "Break":
-        if (loopDepth === 0) s.push(`  ${fc.pend} = 2; ts_eh_pop(); goto L${fc.finLabel};\n`);
+        if (loopDepth === 0) {
+          const pops = Math.max(0, cx.ehDepth - fc.baseEhDepth);
+          s.push(`  ${fc.pend} = 2; ${"ts_eh_pop(); ".repeat(pops)}goto L${fc.finLabel};\n`);
+        }
         else s.push("  break;\n");
         break;
       case "Continue":
-        if (loopDepth === 0) s.push(`  ${fc.pend} = 3; ts_eh_pop(); goto L${fc.finLabel};\n`);
+        if (loopDepth === 0) {
+          const pops = Math.max(0, cx.ehDepth - fc.baseEhDepth);
+          s.push(`  ${fc.pend} = 3; ${"ts_eh_pop(); ".repeat(pops)}goto L${fc.finLabel};\n`);
+        }
         else s.push("  continue;\n");
         break;
       case "If":
@@ -4508,12 +4527,26 @@ function emitGuarded(s: string[], body: any[], cx: EmitCtx, numericFacts: Numeri
         break;
       case "TryCatch": {
         const finallyBody: any[] = inst.finallyBody ?? [];
-        if (finallyBody.length > 0 && (bodyExitsAbruptly(inst.tryBody ?? []) || bodyExitsAbruptly(inst.catchBody ?? []))) {
+        if (finallyBody.length > 0) {
           // nested try/finally: propagates its completion OUT to fc via fin_stack.
           const outer = cx.loopLabels.length > 0 ? cx.loopLabels[cx.loopLabels.length - 1] : undefined;
           emitPlainFinally(s, inst, cx, numericFacts, outer);
         } else {
-          emitInstC(s, inst, cx, numericFacts);
+          const baseEhDepth = cx.ehDepth;
+          s.push("  {\n    ts_handler* _h = ts_eh_push();\n");
+          s.push("    if (setjmp(_h->buf) == 0) {\n");
+          cx.ehDepth = baseEhDepth + 1;
+          emitGuarded(s, inst.tryBody ?? [], cx, numericFacts, fc, loopDepth);
+          s.push("      ts_eh_pop();\n");
+          s.push("    } else {\n");
+          s.push("      ts_gc_set_root_depth(_h->gc_root_len);\n      ts_eh_pop();\n");
+          cx.ehDepth = baseEhDepth;
+          if (inst.catchVar !== undefined && inst.catchVar !== null) {
+            s.push(cxSetVal(cx, inst.catchVar, "ts_current_exception()"));
+          }
+          emitGuarded(s, inst.catchBody ?? [], cx, numericFacts, fc, loopDepth);
+          s.push("    }\n  }\n");
+          cx.ehDepth = baseEhDepth;
         }
         break;
       }
@@ -4535,11 +4568,11 @@ function emitPlainFinally(s: string[], inst: any, cx: EmitCtx, numericFacts: Num
   const afterLabel = cx.labelCtr.n++;
   const pend = `_pend${finLabel}`;
   const pendv = `_pendv${finLabel}`;
-  const fc: FinCtx = { pend, pendv, finLabel };
+  const baseEhDepth = cx.ehDepth;
+  const fc: FinCtx = { pend, pendv, finLabel, baseEhDepth };
   // completion record locals: kind (0 normal,1 return,2 break,3 continue,4 throw)
   s.push(`  int ${pend} = 0; tsv ${pendv} = TS_UNDEFINED;\n`);
   const hasCatch = catchBody.length > 0 || catchVar !== undefined;
-  const baseEhDepth = cx.ehDepth;
   cx.finStack.push([pend, pendv, finLabel, baseEhDepth]);
   s.push("  {\n    ts_handler* _h = ts_eh_push();\n");
   cx.ehDepth = baseEhDepth + 1;
@@ -4628,10 +4661,13 @@ function emitInstC(s: string[], inst: any, cx: EmitCtx, numericFacts: NumericAna
       s.push(`  v${inst.dst} = ts_new_object(); /* site ${inst.site} ${st} */\n`);
       return;
     }
-    case "AllocArray":
-      s.push(`  v${inst.dst} = ts_new_array(0);\n`);
+    case "AllocArray": {
+      const st = cx.strat.get(inst.site) ?? "Heap";
+      s.push(`  v${inst.dst} = ts_new_array(0); /* site ${inst.site} ${st} */\n`);
       return;
+    }
     case "AllocClosure": {
+      const st = cx.strat.get(inst.site) ?? "Heap";
       const fname = cx.fnNames.get(inst.func) ?? `fn_${inst.func}`;
       const tt = cx.fnTakesThis.get(inst.func) ? 1 : 0;
       const setMeta =
@@ -4639,12 +4675,12 @@ function emitInstC(s: string[], inst: any, cx: EmitCtx, numericFacts: NumericAna
         `  if (FN_HAS_PROTOTYPE[${inst.func}]) ts_set_fn_prototype(v${inst.dst}, ts_new_proto());\n`;
       const captures: any[] = inst.captures ?? [];
       if (captures.length === 0) {
-        s.push(`  v${inst.dst} = ts_make_fn_t(${fname}, 0, 0, ${tt});\n`);
+        s.push(`  v${inst.dst} = ts_make_fn_t(${fname}, 0, 0, ${tt}); /* site ${inst.site} ${st} */\n`);
         s.push(setMeta);
       } else {
         s.push(`  { tsv _env[${captures.length}];\n`);
         captures.forEach((c, i) => s.push(`    _env[${i}] = ${cxVal(cx, c.cell)};\n`));
-        s.push(`    v${inst.dst} = ts_make_fn_t(${fname}, _env, ${captures.length}, ${tt});\n`);
+        s.push(`    v${inst.dst} = ts_make_fn_t(${fname}, _env, ${captures.length}, ${tt}); /* site ${inst.site} ${st} */\n`);
         s.push("  }\n");
         s.push(setMeta);
       }
@@ -4981,16 +5017,19 @@ function emitInstC(s: string[], inst: any, cx: EmitCtx, numericFacts: NumericAna
       return;
     case "TryCatch": {
       const finallyBody: any[] = inst.finallyBody ?? [];
-      if (finallyBody.length > 0 && (bodyExitsAbruptly(inst.tryBody ?? []) || bodyExitsAbruptly(inst.catchBody ?? []))) {
+      if (finallyBody.length > 0) {
         const outer = cx.loopLabels.length > 0 ? cx.loopLabels[cx.loopLabels.length - 1] : undefined;
         emitPlainFinally(s, inst, cx, numericFacts, outer);
         return;
       }
+      const baseEhDepth = cx.ehDepth;
       s.push("  {\n");
       s.push("    ts_handler* _h = ts_eh_push();\n");
       s.push("    if (setjmp(_h->buf) == 0) {\n");
+      cx.ehDepth = baseEhDepth + 1;
       for (const i of inst.tryBody ?? []) emitInstC(s, i, cx, numericFacts);
       s.push("      ts_eh_pop();\n");
+      cx.ehDepth = baseEhDepth;
       for (const i of finallyBody) emitInstC(s, i, cx, numericFacts);
       s.push("    } else {\n");
       s.push("      ts_gc_set_root_depth(_h->gc_root_len);\n");
@@ -4998,10 +5037,12 @@ function emitInstC(s: string[], inst: any, cx: EmitCtx, numericFacts: NumericAna
       if (inst.catchVar !== undefined && inst.catchVar !== null) {
         s.push(cxSetVal(cx, inst.catchVar, "ts_current_exception()"));
       }
+      cx.ehDepth = baseEhDepth;
       for (const i of inst.catchBody ?? []) emitInstC(s, i, cx, numericFacts);
       for (const i of finallyBody) emitInstC(s, i, cx, numericFacts);
       s.push("    }\n");
       s.push("  }\n");
+      cx.ehDepth = baseEhDepth;
       return;
     }
     case "Throw":
@@ -5833,6 +5874,7 @@ function emitInstC(s: string[], inst: any, cx: EmitCtx, numericFacts: NumericAna
         case "generator.throw": expr = `ts_gen_throw(${r}, ${args.length === 0 ? "TS_UNDEFINED" : v(0)})`; numeric = false; break;
         case "generator.return": expr = `ts_gen_return(${r}, ${args.length === 0 ? "TS_UNDEFINED" : v(0)})`; numeric = false; break;
         case "asyncgen.throw": expr = `ts_asyncgen_throw(${r}, ${args.length === 0 ? "TS_UNDEFINED" : v(0)})`; numeric = false; break;
+        case "asyncgen.return": expr = `ts_asyncgen_return(${r}, ${args.length === 0 ? "TS_UNDEFINED" : v(0)})`; numeric = false; break;
         case "promise.then": expr = `ts_promise_then(${r}, ${v(0)}, ${v(1)})`; numeric = false; break;
         case "promise.catch": expr = `ts_promise_catch(${r}, ${v(0)})`; numeric = false; break;
         case "promise.finally": expr = `ts_promise_finally(${r}, ${v(0)})`; numeric = false; break;

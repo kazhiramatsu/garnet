@@ -44,6 +44,13 @@ Encoding without changing the resume signature `tsv resume(ts_coro*)`:
 - `ts_gen_next(genobj, sent)` -> result object `{value, done}`:
     fetch frame, set c->result = sent, if c->done return {undefined, true},
     else call c->resume(c); return { c->yielded (or final value), c->done }.
+- `ts_gen_throw` and `ts_gen_return` follow the generator lifecycle
+  (`suspendedStart`, `suspendedYield`, `executing`, `completed`). Re-entry throws
+  `TypeError`; an uncaught throw completes the generator.
+- `.return(v)` injects an internal return completion. User catch clauses rethrow
+  that completion, while finally landing pads preserve it across cleanup yields
+  and dispatch the original return after cleanup. This also powers IteratorClose
+  for an early `for...of` exit.
 - Result object: `{value, done}` plain object (interned fields "value","done").
 
 ## IR additions
@@ -59,12 +66,8 @@ Detected when the for-of iterable's static type is a Generator/Iterable that is
 NOT an array/string/map/set. v1: support for-of over a value typed as a
 generator (Generator/IterableIterator). Arrays keep the existing index loop.
 
-## v1 scope (mirrors async v1)
-- Top-level yields only (yield as a statement `yield e;` or `const x = yield e;`).
-- yield inside if/loop rejected loudly (needs general state-machine builder;
-  same limitation as nested await). NOTE: this is restrictive for generators
-  (loops with yield are common) -> see "loop yields" below; we DO want at least
-  yield-in-loop, handled by lowering the loop into the state machine. v1 keeps it
-  rejected and we extend next.
-- `yield*` (delegation) rejected.
-- Generators driven by explicit `.next()` and by for-of.
+## Current scope
+- Yield in loops, conditionals, try/catch/finally, and delegated `yield*`.
+- Explicit `.next/.throw/.return`, generator return values, and for-of
+  IteratorClose.
+- The first `.next(value)` intentionally ignores `value`, matching ECMAScript.

@@ -3030,6 +3030,16 @@ static void gc_free_cell_payload(ts_gc_header* h){
     ts_set_t* s=(ts_set_t*)h; free(s->elems); free(s->hashes); free(s->index); free(s->o.props); free(s->o.prop_index);
   }
   else if (h->kind==TS_KIND_PROMISE){ free(((ts_promise*)h)->waiters); }
+  else if (h->kind==TS_KIND_CORO){
+    ts_coro* c=(ts_coro*)h;
+    if (c->eh_catch_state && c->eh_catch_state!=c->eh_catch_inline) free(c->eh_catch_state);
+    if (c->eh_gc_depth && c->eh_gc_depth!=c->eh_gc_inline) free(c->eh_gc_depth);
+    if (c->fin_pending && c->fin_pending!=c->fin_pending_inline) free(c->fin_pending);
+    if (c->fin_exc && c->fin_exc!=c->fin_exc_inline) free(c->fin_exc);
+    if (c->fin_tgt && c->fin_tgt!=c->fin_tgt_inline) free(c->fin_tgt);
+    ts_asyncgen_req* r=c->ag_head;
+    while (r){ ts_asyncgen_req* next=r->next; free(r); r=next; }
+  }
 }
 static void gc_free_cell(ts_gc_header* h){
   gc_free_cell_payload(h);
@@ -3098,6 +3108,14 @@ static void gc_fix_moved_cell(ts_gc_header* old, ts_gc_header* nw){
     ts_array* oa = (ts_array*)old;
     ts_array* na = (ts_array*)nw;
     if (oa->data == oa->inline_data) na->data = na->inline_data;
+  } else if (old->kind == TS_KIND_CORO){
+    ts_coro* oc=(ts_coro*)old;
+    ts_coro* nc=(ts_coro*)nw;
+    if (oc->eh_catch_state==oc->eh_catch_inline) nc->eh_catch_state=nc->eh_catch_inline;
+    if (oc->eh_gc_depth==oc->eh_gc_inline) nc->eh_gc_depth=nc->eh_gc_inline;
+    if (oc->fin_pending==oc->fin_pending_inline) nc->fin_pending=nc->fin_pending_inline;
+    if (oc->fin_exc==oc->fin_exc_inline) nc->fin_exc=nc->fin_exc_inline;
+    if (oc->fin_tgt==oc->fin_tgt_inline) nc->fin_tgt=nc->fin_tgt_inline;
   }
 }
 static ts_gc_header* gc_move_young_to_old_ex(ts_gc_header* h, int free_old){
@@ -10209,6 +10227,52 @@ static void promise_finish_waiter_drain_v(tsv pv){
   free(waiters);
 }
 
+/* Run a value/method call or property read behind a temporary exception handler.
+   Promise resolution must translate abrupt completion from a then getter/call
+   into rejection of the target promise, never let it escape synchronously. */
+static tsv ts_call_catching(tsv fn, tsv* args, int n, int* threw){
+  ts_handler* h = ts_eh_push();
+  if (setjmp(h->buf) != 0){
+    ts_gc_set_root_depth(h->gc_root_len);
+    ts_frame_restore(h->frame_top);
+    ts_eh_pop();
+    *threw = 1;
+    return ts_current_exception();
+  }
+  tsv r = ts_call_value(fn, args, n);
+  ts_eh_pop();
+  *threw = 0;
+  return r;
+}
+static tsv ts_call_method_catching(tsv fn, tsv* args, int n, int* threw){
+  ts_handler* h = ts_eh_push();
+  if (setjmp(h->buf) != 0){
+    ts_gc_set_root_depth(h->gc_root_len);
+    ts_frame_restore(h->frame_top);
+    ts_eh_pop();
+    *threw = 1;
+    return ts_current_exception();
+  }
+  tsv r = ts_call_method(fn, args, n);
+  ts_eh_pop();
+  *threw = 0;
+  return r;
+}
+static tsv ts_get_catching(tsv obj, ts_key key, int* threw){
+  ts_handler* h = ts_eh_push();
+  if (setjmp(h->buf) != 0){
+    ts_gc_set_root_depth(h->gc_root_len);
+    ts_frame_restore(h->frame_top);
+    ts_eh_pop();
+    *threw = 1;
+    return ts_current_exception();
+  }
+  tsv r = ts_get(obj, key);
+  ts_eh_pop();
+  *threw = 0;
+  return r;
+}
+
 /* microtask queue: each entry is a coroutine frame to resume */
 static tsv* g_microq=NULL; static int g_mq_len=0, g_mq_cap=0;
 static void microq_push_v(tsv cv){
@@ -10255,9 +10319,17 @@ void ts_promise_settle_v(tsv pv, tsv v, int rejected){
    inner settles and forwards the state to the outer promise `out_v`. This gives
    Promises/A+ semantics: a settled inner adopts one tick later (not synchronously),
    and a PENDING inner is chained (was previously left unadopted). */
-typedef struct { ts_coro c; tsv out_v; } ts_adopt;
+typedef struct { ts_coro c; tsv out_v; tsv inner_v; int registered; } ts_adopt;
 static tsv adopt_resume(tsv cv){
   ts_adopt* w=(ts_adopt*)ts_ptr(cv);
+  if (!w->registered){
+    w->registered=1;
+    tsv inner=w->inner_v;
+    ts_gc_root(&inner);
+    ts_await_register_v(inner,cv);
+    ts_gc_unroot(1);
+    return TS_UNDEFINED;
+  }
   ts_coro* c=&w->c;
   tsv outv = w->out_v;
   tsv result = c->result;
@@ -10271,27 +10343,117 @@ static tsv adopt_resume(tsv cv){
   ts_gc_unroot(2);
   return TS_UNDEFINED;
 }
+
+/* A pair of resolving functions shares this hidden ordinary object. Its `done`
+   bit is separate from promise.state: resolving with a pending promise locks the
+   pair immediately even though the target promise remains pending while adopting. */
+static ts_key F_resolver_done=0;
+static void ensure_resolver_fields(void){
+  if (!F_resolver_done) F_resolver_done=ts_intern_field("__promise_resolver_done",23);
+}
+static int promise_resolver_claim(tsv cell){
+  ensure_resolver_fields();
+  if (ts_truthy(ts_get(cell, F_resolver_done))) return 0;
+  ts_set(cell, F_resolver_done, ts_bool(1));
+  return 1;
+}
+static tsv ts_resolve_thunk(tsv* a, int n);
+static tsv ts_reject_thunk(tsv* a, int n);
+static void promise_make_resolvers(tsv pv, tsv* resolve_out, tsv* reject_out, tsv* cell_out){
+  ts_gc_root(&pv);
+  ensure_resolver_fields();
+  tsv cell=ts_new_object(); ts_gc_root(&cell);
+  ts_set(cell, F_resolver_done, ts_bool(0));
+  tsv env[2]={pv,cell};
+  tsv resolve=ts_make_fn(ts_resolve_thunk, env, 2); ts_gc_root(&resolve);
+  tsv reject=ts_make_fn(ts_reject_thunk, env, 2);
+  *resolve_out=resolve; *reject_out=reject; *cell_out=cell;
+  ts_gc_unroot(3);
+}
+
+/* PromiseResolveThenableJob. Getter lookup happens in ts_promise_resolve_v;
+   invocation is deliberately deferred to this microtask. */
+typedef struct { ts_coro c; tsv out_v; tsv thenable; tsv then_fn; } ts_thenable_job;
+static tsv thenable_job_resume(tsv cv){
+  ts_thenable_job* w=(ts_thenable_job*)ts_ptr(cv);
+  tsv outv=w->out_v, thenable=w->thenable, then_fn=w->then_fn;
+  ts_gc_root(&outv); ts_gc_root(&thenable); ts_gc_root(&then_fn);
+  if (!promise_pending_v(outv)){ ts_gc_unroot(3); return TS_UNDEFINED; }
+  tsv resolve, reject, cell;
+  promise_make_resolvers(outv, &resolve, &reject, &cell);
+  ts_gc_root(&resolve); ts_gc_root(&reject); ts_gc_root(&cell);
+  tsv args[3]={thenable,resolve,reject};
+  int threw=0;
+  tsv exc=ts_call_method_catching(then_fn,args,3,&threw);
+  if (threw && promise_resolver_claim(cell)) ts_promise_reject_v(outv,exc);
+  ts_gc_unroot(6);
+  return TS_UNDEFINED;
+}
+
+static tsv promise_resolution_type_error(const char* msg){
+  tsv text=ts_new_string(msg,(uint32_t)strlen(msg));
+  ts_gc_root(&text);
+  tsv err=ts_new_error(TS_ERR_TYPE,text);
+  ts_gc_unroot(1);
+  return err;
+}
+
 void ts_promise_resolve_v(tsv pv, tsv v){
-  if (!ts_promise_ptr(pv)) return;
+  if (!ts_promise_ptr(pv) || !promise_pending_v(pv)) return;
+  if (ts_strict_eq(pv,v)){
+    tsv err=promise_resolution_type_error("Chaining cycle detected for promise");
+    ts_gc_root(&err);
+    ts_promise_settle_v(pv,err,1);
+    ts_gc_unroot(1);
+    return;
+  }
   if (ts_is_promise(v)){
-    /* Promises/A+ §2.3.2: adopt the inner promise's state asynchronously. The
-       adapter is pushed as a microtask when inner is already settled (the extra
-       tick), or added as a waiter when inner is pending (chaining). */
+    /* Promise Resolve Functions enqueue a job even for a native inner promise.
+       The first adapter turn registers on `v`; its second turn forwards the
+       eventual state. This preserves ordering when the inner settles between
+       resolve(inner) and the first microtask checkpoint. */
     ts_gc_root(&pv); ts_gc_root(&v);
     tsv wv = ts_coro_alloc_v(sizeof(ts_adopt), adopt_resume);
     ts_gc_root(&wv);
     ts_adopt* w=(ts_adopt*)ts_ptr(wv);
-    w->out_v=pv;
+    w->out_v=pv; w->inner_v=v; w->registered=0;
     ts_write_barrier(wv, w->out_v);
-    ts_await_register_v(v, wv);
+    ts_write_barrier(wv, w->inner_v);
+    microq_push_v(wv);
     ts_gc_unroot(3);
     return;
+  }
+  /* Thenable assimilation: read `then` exactly once. A throwing getter rejects;
+     a callable is invoked later as a PromiseResolveThenableJob with a fresh
+     already-resolved pair. */
+  if (ts_object_like(v) || ts_is_func(v)){
+    ts_gc_root(&pv); ts_gc_root(&v);
+    int threw=0;
+    tsv then_fn=ts_get_catching(v,ts_intern_field("then",4),&threw);
+    ts_gc_root(&then_fn);
+    if (threw){
+      ts_promise_settle_v(pv,then_fn,1);
+      ts_gc_unroot(3);
+      return;
+    }
+    if (ts_is_callable(then_fn)){
+      tsv wv=ts_coro_alloc_v(sizeof(ts_thenable_job),thenable_job_resume);
+      ts_gc_root(&wv);
+      ts_thenable_job* w=(ts_thenable_job*)ts_ptr(wv);
+      w->out_v=pv; w->thenable=v; w->then_fn=then_fn;
+      ts_write_barrier(wv,pv); ts_write_barrier(wv,v); ts_write_barrier(wv,then_fn);
+      microq_push_v(wv);
+      ts_gc_unroot(4);
+      return;
+    }
+    ts_gc_unroot(3);
   }
   ts_promise_settle_v(pv, v, 0);
 }
 void ts_promise_reject_v(tsv pv, tsv v){ ts_promise_settle_v(pv, v, 1); }
 
 tsv ts_promise_resolved(tsv v){
+  if (ts_is_promise(v)) return v;
   ts_gc_root(&v);
   tsv pv=ts_promise_new_v();
   ts_gc_root(&pv);
@@ -10341,17 +10503,68 @@ static tsv comb_race_resume(tsv cv){
   ts_gc_unroot(2);
   return TS_UNDEFINED;
 }
+
+/* Materialize a synchronous iterable for Promise combinators. Invalid inputs and
+   abrupt iterator operations reject the returned promise instead of escaping
+   synchronously or being mistaken for an empty iterable. */
+static int promise_materialize_inputs(tsv input, tsv* array_out, tsv* error_out){
+  if (ts_is_array(input)){ *array_out=input; return 1; }
+  ts_gc_root(&input);
+  tsv tmp=ts_new_array(0); ts_gc_root(&tmp);
+  int valid=ts_is_set(input) || ts_is_map(input) || ts_is_str(input);
+  tsv iter=input; ts_gc_root(&iter);
+  if (!valid && ts_object_like(input)){
+    int threw=0;
+    tsv itf=ts_get_catching(input,TS_KEY_WKSYM(TS_WKSYM_ITERATOR),&threw);
+    if (threw){ *error_out=itf; ts_gc_unroot(3); return 0; }
+    ts_gc_root(&itf);
+    tsv coro=ts_get_catching(input,ts_intern_field("__coro",6),&threw);
+    if (threw){ *error_out=coro; ts_gc_unroot(4); return 0; }
+    if (ts_is_coro_value(coro)){
+      valid=1; /* Garnet generator objects implement @@iterator intrinsically. */
+    } else if (ts_is_callable(itf)){
+      tsv args[1]={input};
+      iter=ts_call_method_catching(itf,args,1,&threw);
+      if (threw){ *error_out=iter; ts_gc_unroot(4); return 0; }
+      valid=ts_object_like(iter);
+    }
+    ts_gc_unroot(1);
+  }
+  if (!valid){
+    *error_out=promise_resolution_type_error("object is not iterable");
+    ts_gc_unroot(3);
+    return 0;
+  }
+  ts_handler* h=ts_eh_push();
+  if (setjmp(h->buf) != 0){
+    ts_gc_set_root_depth(h->gc_root_len);
+    ts_frame_restore(h->frame_top);
+    ts_eh_pop();
+    *error_out=ts_current_exception();
+    ts_gc_unroot(3);
+    return 0;
+  }
+  ts_array_push_all(tmp,iter);
+  ts_eh_pop();
+  *array_out=tmp;
+  ts_gc_unroot(3);
+  return 1;
+}
+
 tsv ts_promise_all(tsv arr){
   tsv arrv = arr;
   ts_gc_root(&arrv);
-  if (!ts_is_array(arrv)){ tsv tmp=ts_new_array(0); ts_gc_root(&tmp); ts_array_push_all(tmp, arrv); arrv=tmp; ts_gc_unroot(1); }
   tsv outv = ts_promise_new_v();
   ts_gc_root(&outv);   /* the alloc loop below can trigger GC */
+  tsv err=TS_UNDEFINED; ts_gc_root(&err);
+  if (!promise_materialize_inputs(arrv,&arrv,&err)){
+    ts_promise_settle_v(outv,err,1); ts_gc_unroot(3); return outv;
+  }
   uint32_t n = ts_array_len(arrv);
   tsv results = ts_new_array(n);          /* kept alive via outv + the extended PROMISE mark */
   ts_gc_root(&results);
   promise_comb_init_v(outv, n, results);
-  if (n==0){ ts_promise_resolve_v(outv, results); ts_gc_unroot(3); return outv; }
+  if (n==0){ ts_promise_resolve_v(outv, results); ts_gc_unroot(4); return outv; }
   for (uint32_t i=0;i<n;i++){
     tsv input = ts_array_get(arrv, i);
     tsv wv = ts_coro_alloc_v(sizeof(ts_comb), comb_all_resume);
@@ -10361,15 +10574,18 @@ tsv ts_promise_all(tsv arr){
     ts_await_register_v(input, wv);
     ts_gc_unroot(1);
   }
-  ts_gc_unroot(3);
+  ts_gc_unroot(4);
   return outv;
 }
 tsv ts_promise_race(tsv arr){
   tsv arrv = arr;
   ts_gc_root(&arrv);
-  if (!ts_is_array(arrv)){ tsv tmp=ts_new_array(0); ts_gc_root(&tmp); ts_array_push_all(tmp, arrv); arrv=tmp; ts_gc_unroot(1); }
   tsv outv = ts_promise_new_v();
   ts_gc_root(&outv);
+  tsv err=TS_UNDEFINED; ts_gc_root(&err);
+  if (!promise_materialize_inputs(arrv,&arrv,&err)){
+    ts_promise_settle_v(outv,err,1); ts_gc_unroot(3); return outv;
+  }
   uint32_t n = ts_array_len(arrv);
   for (uint32_t i=0;i<n;i++){           /* empty array -> stays pending forever (spec) */
     tsv input = ts_array_get(arrv, i);
@@ -10380,26 +10596,8 @@ tsv ts_promise_race(tsv arr){
     ts_await_register_v(input, wv);
     ts_gc_unroot(1);
   }
-  ts_gc_unroot(2);
+  ts_gc_unroot(3);
   return outv;
-}
-
-/* Call a user function, catching a throw: returns the result (threw=0) or the
-   thrown value (threw=1). Mirrors the structured try/catch (setjmp on the handler
-   buf; on the throw path restore the GC root depth and pop the handler). */
-static tsv ts_call_catching(tsv fn, tsv* args, int n, int* threw){
-  ts_handler* h = ts_eh_push();
-  if (setjmp(h->buf) != 0){
-    ts_gc_set_root_depth(h->gc_root_len);
-    ts_frame_restore(h->frame_top);
-    ts_eh_pop();
-    *threw = 1;
-    return ts_current_exception();
-  }
-  tsv r = ts_call_value(fn, args, n);
-  ts_eh_pop();
-  *threw = 0;
-  return r;
 }
 
 /* { status: "fulfilled", value } / { status: "rejected", reason } for allSettled. */
@@ -10411,13 +10609,13 @@ static tsv ts_allsettled_result(tsv value, int rejected){
   ts_gc_unroot(2);
   return o;
 }
-/* { name:"AggregateError", message:..., errors } for Promise.any all-reject. */
+/* AggregateError instance for Promise.any all-reject. */
 static tsv ts_aggregate_error(tsv errors){
   ts_gc_root(&errors);
-  tsv o = ts_new_object(); ts_gc_root(&o);
-  ts_set(o, ts_intern_field("name",4),    ts_new_string("AggregateError",14));
-  ts_set(o, ts_intern_field("message",7), ts_new_string("All promises were rejected",26));
-  ts_set(o, ts_intern_field("errors",6),  errors);
+  tsv msg=ts_new_string("All promises were rejected",26); ts_gc_root(&msg);
+  tsv o = ts_new_error(TS_ERR_AGGREGATE,msg); ts_gc_root(&o);
+  ts_define_data(o,ts_intern_field("errors",6),errors,0,1,1);
+  ts_gc_unroot(1);
   ts_gc_unroot(2);
   return o;
 }
@@ -10442,8 +10640,21 @@ static tsv then_resume(tsv cv){
   ts_gc_unroot(3);
   return TS_UNDEFINED;
 }
-/* .finally adapter: onFinally is called with no args; the original value/reason
-   passes through unless onFinally throws (then that rejection wins). */
+typedef struct { ts_coro c; tsv out_v; tsv original; int original_rejected; } ts_finally_after;
+static tsv finally_after_resume(tsv cv){
+  ts_finally_after* w=(ts_finally_after*)ts_ptr(cv);
+  tsv outv=w->out_v, original=w->original, cleanup=w->c.result;
+  int cleanup_rejected=w->c.rejected, original_rejected=w->original_rejected;
+  ts_gc_root(&outv); ts_gc_root(&original); ts_gc_root(&cleanup);
+  if (cleanup_rejected) ts_promise_reject_v(outv,cleanup);
+  else if (original_rejected) ts_promise_reject_v(outv,original);
+  else ts_promise_resolve_v(outv,original);
+  ts_gc_unroot(3);
+  return TS_UNDEFINED;
+}
+/* .finally adapter: onFinally is called with no args. Its result is PromiseResolve'd
+   and awaited before the original completion is propagated; a cleanup rejection
+   replaces the original completion. */
 static tsv finally_resume(tsv cv){
   ts_then* w=(ts_then*)ts_ptr(cv);
   ts_coro* c=&w->c;
@@ -10455,6 +10666,16 @@ static tsv finally_resume(tsv cv){
   if (ts_is_callable(cb)){
     int threw; tsv r = ts_call_catching(cb, NULL, 0, &threw);
     if (threw){ ts_promise_reject_v(outv, r); ts_gc_unroot(3); return TS_UNDEFINED; }
+    ts_gc_root(&r);
+    tsv av=ts_coro_alloc_v(sizeof(ts_finally_after),finally_after_resume);
+    ts_gc_root(&av);
+    ts_finally_after* a=(ts_finally_after*)ts_ptr(av);
+    a->out_v=outv; a->original=result; a->original_rejected=rejected;
+    ts_write_barrier(av,outv); ts_write_barrier(av,result);
+    ts_await_register_v(r,av);
+    ts_gc_unroot(2);
+    ts_gc_unroot(3);
+    return TS_UNDEFINED;
   }
   if (rejected) ts_promise_reject_v(outv, result); else ts_promise_resolve_v(outv, result);
   ts_gc_unroot(3);
@@ -10473,29 +10694,30 @@ tsv ts_promise_then(tsv pv, tsv on_f, tsv on_r){
   ts_gc_unroot(5);
   return outv;
 }
-/* new Promise(executor): resolve/reject are ordinary closures whose code is a C
-   thunk and whose env[0] is the bound promise (ts_make_fn leaves takes_this=0, so
-   a plain `resolve(v)` call lands the value at arg index 1 after the env-prepended
-   promise). GC marks the env, keeping the promise alive. */
-static tsv ts_resolve_thunk(tsv* a, int n){ /* a[0]=promise (env[0]); a[1]=value */
-  ts_promise_resolve_v(a[0], n>1 ? a[1] : TS_UNDEFINED);
+/* new Promise(executor): resolve/reject capture [promise, resolver-cell].
+   The shared cell implements the spec's AlreadyResolved record, which cannot be
+   inferred from promise.state while a pending promise/thenable is being adopted. */
+static tsv ts_resolve_thunk(tsv* a, int n){
+  if (n<2 || !promise_resolver_claim(a[1])) return TS_UNDEFINED;
+  ts_promise_resolve_v(a[0], n>2 ? a[2] : TS_UNDEFINED);
   return TS_UNDEFINED;
 }
 static tsv ts_reject_thunk(tsv* a, int n){
-  ts_promise_reject_v(a[0], n>1 ? a[1] : TS_UNDEFINED);
+  if (n<2 || !promise_resolver_claim(a[1])) return TS_UNDEFINED;
+  ts_promise_reject_v(a[0], n>2 ? a[2] : TS_UNDEFINED);
   return TS_UNDEFINED;
 }
 tsv ts_promise_new_executor(tsv executor){
   ts_gc_root(&executor);
   tsv pv = ts_promise_new_v();
   ts_gc_root(&pv);
-  tsv env1[1]; env1[0] = pv;
-  tsv resolve = ts_make_fn(ts_resolve_thunk, env1, 1); ts_gc_root(&resolve);
-  tsv reject  = ts_make_fn(ts_reject_thunk,  env1, 1); ts_gc_root(&reject);
+  tsv resolve, reject, cell;
+  promise_make_resolvers(pv,&resolve,&reject,&cell);
+  ts_gc_root(&resolve); ts_gc_root(&reject); ts_gc_root(&cell);
   tsv args[2]; args[0] = resolve; args[1] = reject;
   int threw; tsv r = ts_call_catching(executor, args, 2, &threw);
-  if (threw) ts_promise_reject_v(pv, r); /* a throwing executor rejects (no-op if already settled) */
-  ts_gc_unroot(4);
+  if (threw && promise_resolver_claim(cell)) ts_promise_reject_v(pv, r);
+  ts_gc_unroot(5);
   return pv;
 }
 tsv ts_promise_catch(tsv pv, tsv on_r){ return ts_promise_then(pv, TS_UNDEFINED, on_r); }
@@ -10589,14 +10811,17 @@ static tsv comb_any_resume(tsv cv){
 tsv ts_promise_allsettled(tsv arr){
   tsv arrv = arr;
   ts_gc_root(&arrv);
-  if (!ts_is_array(arrv)){ tsv tmp=ts_new_array(0); ts_gc_root(&tmp); ts_array_push_all(tmp, arrv); arrv=tmp; ts_gc_unroot(1); }
   tsv outv = ts_promise_new_v();
   ts_gc_root(&outv);
+  tsv err=TS_UNDEFINED; ts_gc_root(&err);
+  if (!promise_materialize_inputs(arrv,&arrv,&err)){
+    ts_promise_settle_v(outv,err,1); ts_gc_unroot(3); return outv;
+  }
   uint32_t n = ts_array_len(arrv);
   tsv results = ts_new_array(n);
   ts_gc_root(&results);
   promise_comb_init_v(outv, n, results);
-  if (n==0){ ts_promise_resolve_v(outv, results); ts_gc_unroot(3); return outv; }
+  if (n==0){ ts_promise_resolve_v(outv, results); ts_gc_unroot(4); return outv; }
   for (uint32_t i=0;i<n;i++){
     tsv input = ts_array_get(arrv, i);
     tsv wv = ts_coro_alloc_v(sizeof(ts_comb), comb_allsettled_resume);
@@ -10606,15 +10831,18 @@ tsv ts_promise_allsettled(tsv arr){
     ts_await_register_v(input, wv);
     ts_gc_unroot(1);
   }
-  ts_gc_unroot(3);
+  ts_gc_unroot(4);
   return outv;
 }
 tsv ts_promise_any(tsv arr){
   tsv arrv = arr;
   ts_gc_root(&arrv);
-  if (!ts_is_array(arrv)){ tsv tmp=ts_new_array(0); ts_gc_root(&tmp); ts_array_push_all(tmp, arrv); arrv=tmp; ts_gc_unroot(1); }
   tsv outv = ts_promise_new_v();
   ts_gc_root(&outv);
+  tsv mat_err=TS_UNDEFINED; ts_gc_root(&mat_err);
+  if (!promise_materialize_inputs(arrv,&arrv,&mat_err)){
+    ts_promise_settle_v(outv,mat_err,1); ts_gc_unroot(3); return outv;
+  }
   uint32_t n = ts_array_len(arrv);
   tsv results = ts_new_array(n);   /* reasons */
   ts_gc_root(&results);
@@ -10623,7 +10851,7 @@ tsv ts_promise_any(tsv arr){
     tsv err = ts_aggregate_error(results);
     ts_gc_root(&err);
     ts_promise_settle_v(outv, err, 1);
-    ts_gc_unroot(4);
+    ts_gc_unroot(5);
     return outv;
   }
   for (uint32_t i=0;i<n;i++){
@@ -10635,7 +10863,7 @@ tsv ts_promise_any(tsv arr){
     ts_await_register_v(input, wv);
     ts_gc_unroot(1);
   }
-  ts_gc_unroot(3);
+  ts_gc_unroot(4);
   return outv;
 }
 
@@ -10644,12 +10872,13 @@ tsv ts_promise_any(tsv arr){
    don't keep raw coroutine pointers live across scheduler boundaries. */
 void ts_await_register_v(tsv pv, tsv cv){
   if (!ts_is_coro_value(cv)) return;
-  ts_gc_root(&cv);
+  ts_gc_root(&pv); ts_gc_root(&cv);
   if (!ts_is_promise(pv)){
-    /* awaiting a non-promise: resolves immediately with the value */
-    coro_deliver_v(cv, pv, 0); microq_push_v(cv); ts_gc_unroot(1); return;
+    /* Await uses PromiseResolve, so arbitrary thenables must be assimilated rather
+       than delivered as plain objects. Primitives/non-thenable objects become an
+       already-fulfilled promise and still resume through the microtask queue. */
+    pv=ts_promise_resolved(pv);
   }
-  ts_gc_root(&pv);
   tsv value = TS_UNDEFINED;
   int state = promise_state_value_v(pv, &value);
   if (state==1){ coro_deliver_v(cv, value, 0); microq_push_v(cv); }
@@ -10661,6 +10890,56 @@ void ts_await_register_v(tsv pv, tsv cv){
 static void coro_init(ts_coro* c, size_t size, tsv (*resume)(tsv)){
   c->state=0; c->resume=resume; c->result=TS_UNDEFINED; c->rejected=0;
   c->nslots=0; c->frame_size=size; c->ret=TS_UNDEFINED;
+  c->gen_status=TS_GEN_SUSPENDED_START;
+  c->eh_capacity=TS_CORO_EH_INLINE;
+  c->eh_catch_state=c->eh_catch_inline;
+  c->eh_gc_depth=c->eh_gc_inline;
+  c->fin_capacity=TS_CORO_EH_INLINE;
+  c->fin_pending=c->fin_pending_inline;
+  c->fin_exc=c->fin_exc_inline;
+  c->fin_tgt=c->fin_tgt_inline;
+}
+int ts_coro_eh_push_slot(ts_coro* c){
+  if (c->eh_top >= c->eh_capacity){
+    int cap=c->eh_capacity ? c->eh_capacity*2 : TS_CORO_EH_INLINE;
+    int* states=(int*)malloc(sizeof(int)*(size_t)cap);
+    int* depths=(int*)malloc(sizeof(int)*(size_t)cap);
+    if (!states || !depths){
+      free(states); free(depths);
+      ts_abort_msg("out of memory growing coroutine exception stack");
+    }
+    memcpy(states,c->eh_catch_state,sizeof(int)*(size_t)c->eh_top);
+    memcpy(depths,c->eh_gc_depth,sizeof(int)*(size_t)c->eh_top);
+    if (c->eh_catch_state!=c->eh_catch_inline) free(c->eh_catch_state);
+    if (c->eh_gc_depth!=c->eh_gc_inline) free(c->eh_gc_depth);
+    c->eh_catch_state=states;
+    c->eh_gc_depth=depths;
+    c->eh_capacity=cap;
+  }
+  return c->eh_top++;
+}
+int ts_coro_fin_push_slot(ts_coro* c){
+  if (c->fin_top >= c->fin_capacity){
+    int cap=c->fin_capacity ? c->fin_capacity*2 : TS_CORO_EH_INLINE;
+    int* pending=(int*)malloc(sizeof(int)*(size_t)cap);
+    tsv* exc=(tsv*)malloc(sizeof(tsv)*(size_t)cap);
+    int* targets=(int*)malloc(sizeof(int)*(size_t)cap);
+    if (!pending || !exc || !targets){
+      free(pending); free(exc); free(targets);
+      ts_abort_msg("out of memory growing coroutine finally stack");
+    }
+    memcpy(pending,c->fin_pending,sizeof(int)*(size_t)c->fin_top);
+    memcpy(exc,c->fin_exc,sizeof(tsv)*(size_t)c->fin_top);
+    memcpy(targets,c->fin_tgt,sizeof(int)*(size_t)c->fin_top);
+    if (c->fin_pending!=c->fin_pending_inline) free(c->fin_pending);
+    if (c->fin_exc!=c->fin_exc_inline) free(c->fin_exc);
+    if (c->fin_tgt!=c->fin_tgt_inline) free(c->fin_tgt);
+    c->fin_pending=pending;
+    c->fin_exc=exc;
+    c->fin_tgt=targets;
+    c->fin_capacity=cap;
+  }
+  return c->fin_top++;
 }
 /* allocate a coroutine frame of `size` bytes (>= sizeof(ts_coro)); the embedded
    ts_coro is at offset 0. Extra frame fields are zeroed (calloc). */
@@ -10682,6 +10961,22 @@ tsv ts_coro_alloc_v(size_t size, tsv (*resume)(tsv)){
 tsv ts_coro_new_v(tsv (*resume)(tsv)){
   return ts_coro_alloc_v(sizeof(ts_coro), resume);
 }
+static void asyncgen_start_next_v(tsv cv);
+static int asyncgen_after_resume_v(tsv cv){
+  ts_coro* c=(ts_coro*)ts_ptr(cv);
+  if (!c || !c->is_asyncgen || !c->ag_running || !c->ag_head) return 0;
+  if (promise_state_value_v(c->ag_head->promise,NULL)==0){
+    c->gen_status=TS_GEN_EXECUTING; /* parked at await; current request still owns the frame */
+    return 0;
+  }
+  ts_asyncgen_req* done=c->ag_head;
+  c->ag_head=done->next;
+  if (!c->ag_head) c->ag_tail=NULL;
+  free(done);
+  c->ag_running=0;
+  c->gen_status=c->done ? TS_GEN_COMPLETED : TS_GEN_SUSPENDED_YIELD;
+  return c->ag_head!=NULL;
+}
 void ts_coro_resume_v(tsv cv){
   if (!ts_is_coro_value(cv)) return;
   ts_gc_root(&cv);
@@ -10699,9 +10994,11 @@ void ts_coro_resume_v(tsv cv){
   }
   ts_coro* c=(ts_coro*)ts_ptr(cv);
   if (c->resume) c->resume(cv);
+  int kick_next=asyncgen_after_resume_v(cv);
   ts_eh_pop_until(h);
   gc_unpin_value(cv);
   ts_gc_unroot(1);
+  if (kick_next) asyncgen_start_next_v(cv);
 }
 
 /* I/O task queue (for fetch): serviced when microtasks drain */
@@ -10788,6 +11085,10 @@ static void gc_scan_async_cell(ts_gc_header* h, int young, int depth){
     gc_mark_visit(c->yielded, young, depth);
     for (int i=0;i<c->fin_top;i++) gc_mark_visit(c->fin_exc[i], young, depth);
     gc_mark_visit(c->ret, young, depth);
+    for (ts_asyncgen_req* r=c->ag_head;r;r=r->next){
+      gc_mark_visit(r->promise, young, depth);
+      gc_mark_visit(r->value, young, depth);
+    }
     /* Conservatively scan the whole frame: any 8-byte slot that looks like a
        boxed heap handle is treated as a root. Stable handles keep this safe even
        when a minor GC relocates the object body. */
@@ -11769,9 +12070,65 @@ double ts_length(tsv v){
 }
 
 /* ---------------- generators (function* / yield) ---------------- */
-static uint32_t F_coro=0, F_value=0, F_done=0;
+static uint32_t F_coro=0, F_value=0, F_done=0, F_gen_return_tag=0, F_gen_return_value=0;
+static tsv g_gen_return_tag=TS_UNDEFINED;
 static void ensure_gen_fields(void){
-  if (!F_coro){ F_coro=ts_intern_field("__coro",6); F_value=ts_intern_field("value",5); F_done=ts_intern_field("done",4); }
+  if (!F_coro){
+    F_coro=ts_intern_field("__coro",6);
+    F_value=ts_intern_field("value",5);
+    F_done=ts_intern_field("done",4);
+    F_gen_return_tag=ts_intern_field("__generator_return_tag",22);
+    F_gen_return_value=ts_intern_field("__generator_return_value",24);
+  }
+  if (ts_is_undef(g_gen_return_tag)){
+    g_gen_return_tag=ts_new_object();
+    ts_gc_root(&g_gen_return_tag);
+  }
+}
+static tsv ts_gen_return_completion(tsv value){
+  ensure_gen_fields();
+  ts_gc_root(&value);
+  tsv completion=ts_new_object(); ts_gc_root(&completion);
+  ts_set(completion,F_gen_return_tag,g_gen_return_tag);
+  ts_set(completion,F_gen_return_value,value);
+  ts_gc_unroot(2);
+  return completion;
+}
+int ts_is_gen_return_completion(tsv v){
+  /* This predicate runs at generated catch labels. It must be allocation-free:
+     the current exception still lives in the runtime exception slot until the
+     catch variable assignment, so a lazy field/tag allocation here could run a
+     GC before generated code has copied the exception into its rooted frame.
+     Return injection initializes the hidden tag before such a completion can
+     exist. */
+  if (!F_gen_return_tag || ts_is_undef(g_gen_return_tag) || !ts_is_obj(v)) return 0;
+  ts_gc_header* h=(ts_gc_header*)ts_ptr(v);
+  if (!h || h->kind!=TS_KIND_OBJECT) return 0;
+  ts_prop* p=find_prop((ts_object*)h,F_gen_return_tag,0);
+  return p && !prop_is_accessor(p) && ts_strict_eq(p->val,g_gen_return_tag);
+}
+tsv ts_gen_return_completion_value(tsv v){
+  if (!ts_is_gen_return_completion(v)) return TS_UNDEFINED;
+  ts_prop* p=find_prop((ts_object*)ts_ptr(v),F_gen_return_value,0);
+  return p && !prop_is_accessor(p) ? p->val : TS_UNDEFINED;
+}
+static tsv coro_resume_catching_v(tsv cv, int* threw){
+  ts_handler* h=ts_eh_push();
+  if (setjmp(h->buf)!=0){
+    tsv exc=ts_current_exception();
+    ts_gc_set_root_depth(h->gc_root_len);
+    ts_frame_restore(h->frame_top);
+    ts_eh_pop();
+    *threw=1;
+    return exc;
+  }
+  ts_coro_resume_v(cv);
+  ts_eh_pop();
+  *threw=0;
+  return TS_UNDEFINED;
+}
+static void gen_throw_busy(void){
+  ts_throw_type_error_msg("Generator is already running");
 }
 
 /* wrap an already-allocated coroutine frame in a generator object */
@@ -11822,23 +12179,43 @@ tsv ts_gen_next(tsv genobj, tsv sent){
   if (!ts_is_obj(genobj)){ ts_set(result, F_value, TS_UNDEFINED); ts_set(result, F_done, ts_bool(1)); ts_gc_unroot(3); return result; }
   tsv cv = ts_get(genobj, F_coro);
   ts_gc_root(&cv);
+  if (!ts_is_coro_value(cv)){
+    ts_gc_unroot(4);
+    ts_throw_type_error_msg("Generator.prototype.next called on incompatible receiver");
+  }
   ts_coro* c = (ts_coro*)ts_ptr(cv);
-  if (c->done){
+  if (c->gen_status==TS_GEN_EXECUTING) gen_throw_busy();
+  if (c->done || c->gen_status==TS_GEN_COMPLETED){
+    c->done=1; c->gen_status=TS_GEN_COMPLETED;
     ts_set(result, F_value, TS_UNDEFINED);
     ts_set(result, F_done, ts_bool(1));
     ts_gc_unroot(4);
     return result;
   }
+  if (c->gen_status==TS_GEN_SUSPENDED_START){
+    c->result=TS_UNDEFINED;    /* the first next(value) argument is ignored */
+  } else {
     c->result = sent;          /* value handed to the resuming yield */
-    ts_write_barrier(ts_obj(c), sent);
+    ts_write_barrier(cv, sent);
+  }
+  c->rejected=0;
   c->yielded = TS_UNDEFINED;
-  ts_coro_resume_v(cv);      /* runs until the next yield or completion */
+  c->gen_status=TS_GEN_EXECUTING;
+  int threw=0;
+  tsv exc=coro_resume_catching_v(cv,&threw);
   c = (ts_coro*)ts_ptr(cv);
+  if (threw){
+    c->done=1; c->gen_status=TS_GEN_COMPLETED;
+    ts_gc_unroot(4);
+    ts_throw(exc);
+  }
   if (c->done){
+    c->gen_status=TS_GEN_COMPLETED;
     /* on completion, c->yielded holds the return value (set by Return) */
     ts_set(result, F_value, c->yielded);
     ts_set(result, F_done, ts_bool(1));
   } else {
+    c->gen_status=TS_GEN_SUSPENDED_YIELD;
     ts_set(result, F_value, c->yielded);
     ts_set(result, F_done, ts_bool(0));
   }
@@ -11858,18 +12235,38 @@ tsv ts_gen_throw(tsv genobj, tsv exc){
   if (!ts_is_obj(genobj)) ts_throw(exc);
   tsv cv = ts_get(genobj, F_coro);
   ts_gc_root(&cv);
+  if (!ts_is_coro_value(cv)){ ts_gc_unroot(4); ts_throw_type_error_msg("Generator.prototype.throw called on incompatible receiver"); }
   ts_coro* c = (ts_coro*)ts_ptr(cv);
-  if (c->done) ts_throw(exc);          /* throwing into a finished generator rethrows */
+  if (c->gen_status==TS_GEN_EXECUTING) gen_throw_busy();
+  if (c->gen_status==TS_GEN_SUSPENDED_START){
+    c->done=1; c->gen_status=TS_GEN_COMPLETED;
+    ts_gc_unroot(4);
+    ts_throw(exc);
+  }
+  if (c->done || c->gen_status==TS_GEN_COMPLETED){
+    c->done=1; c->gen_status=TS_GEN_COMPLETED;
+    ts_gc_unroot(4);
+    ts_throw(exc);
+  }
   c->rejected = 1;                     /* "raise c->result at the resume point" */
   c->result = exc;
-  ts_write_barrier(ts_obj(c), exc);
+  ts_write_barrier(cv, exc);
   c->yielded = TS_UNDEFINED;
-  ts_coro_resume_v(cv);                /* may catch & yield, or longjmp out if uncaught */
+  c->gen_status=TS_GEN_EXECUTING;
+  int threw=0;
+  tsv escaped=coro_resume_catching_v(cv,&threw);
   c = (ts_coro*)ts_ptr(cv);
+  if (threw){
+    c->done=1; c->gen_status=TS_GEN_COMPLETED;
+    ts_gc_unroot(4);
+    ts_throw(escaped);
+  }
   if (c->done){
+    c->gen_status=TS_GEN_COMPLETED;
     ts_set(result, F_value, c->yielded);
     ts_set(result, F_done, ts_bool(1));
   } else {
+    c->gen_status=TS_GEN_SUSPENDED_YIELD;
     ts_set(result, F_value, c->yielded);
     ts_set(result, F_done, ts_bool(0));
   }
@@ -11877,13 +12274,9 @@ tsv ts_gen_throw(tsv genobj, tsv exc){
   return result;
 }
 
-/* .return(v) on a (sync) generator: forced return at the paused yield point.
-   Per spec this injects a `return v` completion, which terminates the generator
-   and returns { value: v, done: true }. If the body is suspended inside a
-   try/finally, the finally block(s) must run (and could override the result) —
-   that injection is not modeled here, so we loud-reject rather than silently
-   skip the finally. The common cases (not started, suspended at a top-level
-   yield, or already done) terminate cleanly. */
+/* .return(v) injects an internal return completion at the suspended yield. User
+   catch clauses skip it, finally landing pads translate it to completion-kind 2,
+   so cleanup may yield/throw/override before the generator completes. */
 tsv ts_gen_return(tsv genobj, tsv val){
   ensure_gen_fields();
   ts_gc_root(&genobj); ts_gc_root(&val);
@@ -11894,20 +12287,45 @@ tsv ts_gen_return(tsv genobj, tsv val){
   }
   tsv cv = ts_get(genobj, F_coro);
   ts_gc_root(&cv);
+  if (!ts_is_coro_value(cv)){ ts_gc_unroot(4); ts_throw_type_error_msg("Generator.prototype.return called on incompatible receiver"); }
   ts_coro* c = (ts_coro*)ts_ptr(cv);
-  if (!c->done){
-    /* suspended inside an active try/catch/finally: a forced return must run
-       any enclosing finally (which may have side effects or override the
-       return value). That injection is unimplemented — fail loud, not silent. */
-    if (c->eh_top > 0 || c->fin_top > 0){
-      fprintf(stderr, "tsaot: generator.return() while suspended inside try/finally "
-              "is unsupported (would skip the finally block)\n");
-      abort();
-    }
-    c->done = 1;   /* terminate: no further body runs */
+  if (c->gen_status==TS_GEN_EXECUTING) gen_throw_busy();
+  if (c->done || c->gen_status==TS_GEN_COMPLETED || c->gen_status==TS_GEN_SUSPENDED_START){
+    c->done=1; c->gen_status=TS_GEN_COMPLETED;
+    ts_set(result,F_value,val); ts_set(result,F_done,ts_bool(1));
+    ts_gc_unroot(4);
+    return result;
   }
-  ts_set(result, F_value, val);
-  ts_set(result, F_done, ts_bool(1));
+  tsv completion=ts_gen_return_completion(val); ts_gc_root(&completion);
+  c=(ts_coro*)ts_ptr(cv);
+  c->rejected=1; c->result=completion; c->yielded=TS_UNDEFINED;
+  ts_write_barrier(cv,completion);
+  c->gen_status=TS_GEN_EXECUTING;
+  int threw=0;
+  tsv escaped=coro_resume_catching_v(cv,&threw);
+  c=(ts_coro*)ts_ptr(cv);
+  if (threw){
+    if (ts_is_gen_return_completion(escaped)){
+      c->done=1; c->gen_status=TS_GEN_COMPLETED;
+      ts_set(result,F_value,ts_gen_return_completion_value(escaped));
+      ts_set(result,F_done,ts_bool(1));
+      ts_gc_unroot(5);
+      return result;
+    }
+    c->done=1; c->gen_status=TS_GEN_COMPLETED;
+    ts_gc_unroot(5);
+    ts_throw(escaped);
+  }
+  if (c->done){
+    c->gen_status=TS_GEN_COMPLETED;
+    ts_set(result,F_value,c->yielded);
+    ts_set(result,F_done,ts_bool(1));
+  } else {
+    c->gen_status=TS_GEN_SUSPENDED_YIELD;
+    ts_set(result,F_value,c->yielded);
+    ts_set(result,F_done,ts_bool(0));
+  }
+  ts_gc_unroot(1);
   ts_gc_unroot(4);
   return result;
 }
@@ -11928,78 +12346,169 @@ tsv ts_iter_result(tsv value, int done){
 tsv ts_asyncgen_new_v(tsv cv){
   ensure_gen_fields();
   ts_gc_root(&cv);
+  if (ts_is_coro_value(cv)) ((ts_coro*)ts_ptr(cv))->is_asyncgen=1;
   tsv g = ts_new_object();
   ts_gc_root(&g);
   ts_set(g, F_coro, cv);
   ts_gc_unroot(2);
   return g;
 }
-/* .next() on an async generator: returns a Promise<{value,done}>. Creates a fresh
-   next-promise, stores it as c->ret (the resume resolves it on yield/return), and
-   resumes the body. If the body awaits, it parks on the scheduler and the resume
-   re-enters later, eventually resolving c->ret. */
-tsv ts_asyncgen_next(tsv genobj, tsv sent){
+static void asyncgen_pop_head(ts_coro* c){
+  ts_asyncgen_req* r=c->ag_head;
+  if (!r) return;
+  c->ag_head=r->next;
+  if (!c->ag_head) c->ag_tail=NULL;
+  free(r);
+}
+static void asyncgen_settle_completed(ts_asyncgen_req* r){
+  if (r->kind==1) ts_promise_reject_v(r->promise,r->value);
+  else {
+    tsv value=r->kind==2 ? r->value : TS_UNDEFINED;
+    ts_gc_root(&value);
+    tsv ir=ts_iter_result(value,1); ts_gc_root(&ir);
+    ts_promise_resolve_v(r->promise,ir);
+    ts_gc_unroot(2);
+  }
+}
+typedef struct { ts_coro c; tsv gen_v; int resume_generator; } ts_asyncgen_return_wait;
+static tsv asyncgen_return_wait_resume(tsv av){
+  ts_asyncgen_return_wait* w=(ts_asyncgen_return_wait*)ts_ptr(av);
+  tsv gen=w->gen_v, value=w->c.result;
+  int rejected=w->c.rejected;
+  ts_gc_root(&gen); ts_gc_root(&value);
+  ts_coro* c=ts_is_coro_value(gen) ? (ts_coro*)ts_ptr(gen) : NULL;
+  ts_asyncgen_req* r=c ? c->ag_head : NULL;
+  if (r && w->resume_generator){
+    r->value=value;
+    r->value_awaited=1;
+    if (rejected) r->kind=1;
+    c->ag_running=0;
+    c->gen_status=TS_GEN_SUSPENDED_YIELD;
+    ts_write_barrier(gen,value);
+    ts_gc_unroot(2);
+    asyncgen_start_next_v(gen);
+    return TS_UNDEFINED;
+  }
+  if (r){
+    if (rejected) ts_promise_reject_v(r->promise,value);
+    else {
+      tsv ir=ts_iter_result(value,1); ts_gc_root(&ir);
+      ts_promise_resolve_v(r->promise,ir);
+      ts_gc_unroot(1);
+    }
+  }
+  int kick=asyncgen_after_resume_v(gen);
+  ts_gc_unroot(2);
+  if (kick) asyncgen_start_next_v(gen);
+  return TS_UNDEFINED;
+}
+static void asyncgen_start_next_v(tsv cv){
+  if (!ts_is_coro_value(cv)) return;
+  ts_gc_root(&cv);
+  for (;;){
+    ts_coro* c=(ts_coro*)ts_ptr(cv);
+    if (!c || !c->is_asyncgen || c->ag_running || !c->ag_head){ ts_gc_unroot(1); return; }
+    ts_asyncgen_req* r=c->ag_head;
+    if (c->done || c->gen_status==TS_GEN_COMPLETED ||
+        (c->gen_status==TS_GEN_SUSPENDED_START && r->kind!=0)){
+      if (c->gen_status==TS_GEN_SUSPENDED_START && r->kind!=0){
+        c->done=1; c->gen_status=TS_GEN_COMPLETED;
+      }
+      /* AsyncGenerator.prototype.return awaits its argument even when the
+         generator has not started or has already completed. Keep this request
+         at the queue head until that await settles so later requests cannot
+         overtake it. */
+      if (r->kind==2){
+        c->ag_running=1;
+        tsv av=ts_coro_alloc_v(sizeof(ts_asyncgen_return_wait),asyncgen_return_wait_resume);
+        ts_gc_root(&av);
+        ts_asyncgen_return_wait* w=(ts_asyncgen_return_wait*)ts_ptr(av);
+        w->gen_v=cv; w->resume_generator=0; ts_write_barrier(av,cv);
+        tsv value=r->value; ts_gc_root(&value);
+        ts_await_register_v(value,av);
+        ts_gc_unroot(2);
+        ts_gc_unroot(1);
+        return;
+      }
+      asyncgen_settle_completed(r);
+      c=(ts_coro*)ts_ptr(cv);
+      asyncgen_pop_head(c);
+      continue;
+    }
+    if (r->kind==2 && !r->value_awaited){
+      /* A return request first awaits its argument. Fulfillment resumes the
+         generator with a return completion; rejection resumes it as a throw,
+         allowing user catch/finally code to observe the rejection. */
+      c->ag_running=1;
+      c->gen_status=TS_GEN_EXECUTING;
+      tsv av=ts_coro_alloc_v(sizeof(ts_asyncgen_return_wait),asyncgen_return_wait_resume);
+      ts_gc_root(&av);
+      ts_asyncgen_return_wait* w=(ts_asyncgen_return_wait*)ts_ptr(av);
+      w->gen_v=cv; w->resume_generator=1; ts_write_barrier(av,cv);
+      tsv value=r->value; ts_gc_root(&value);
+      ts_await_register_v(value,av);
+      ts_gc_unroot(2);
+      ts_gc_unroot(1);
+      return;
+    }
+    tsv delivered=(c->gen_status==TS_GEN_SUSPENDED_START) ? TS_UNDEFINED : r->value;
+    ts_gc_root(&delivered);
+    if (r->kind==2) delivered=ts_gen_return_completion(r->value);
+    c=(ts_coro*)ts_ptr(cv);
+    c->ret=r->promise;
+    c->result=delivered;
+    c->rejected=r->kind!=0;
+    c->ag_running=1;
+    c->gen_status=TS_GEN_EXECUTING;
+    ts_write_barrier(cv,c->ret); ts_write_barrier(cv,delivered);
+    ts_gc_unroot(1);
+    ts_coro_resume_v(cv);
+    ts_gc_unroot(1);
+    return;
+  }
+}
+static tsv asyncgen_enqueue(tsv genobj, tsv value, int kind){
   ensure_gen_fields();
-  ts_gc_root(&genobj); ts_gc_root(&sent);
+  ts_gc_root(&genobj); ts_gc_root(&value);
   if (!ts_is_obj(genobj)){
-    tsv r = ts_iter_result(TS_UNDEFINED, 1);
-    ts_gc_root(&r);
-    tsv p = ts_promise_resolved(r);
+    tsv err=promise_resolution_type_error("AsyncGenerator method called on incompatible receiver");
+    ts_gc_root(&err);
+    tsv p=ts_promise_rejected(err);
     ts_gc_unroot(3);
     return p;
   }
-  tsv cv = ts_get(genobj, F_coro);
-  ts_gc_root(&cv);
-  ts_coro* c = (ts_coro*)ts_ptr(cv);
-  if (c->done){
-    tsv r = ts_iter_result(TS_UNDEFINED, 1);
-    ts_gc_root(&r);
-    tsv p = ts_promise_resolved(r);
+  tsv cv=ts_get(genobj,F_coro); ts_gc_root(&cv);
+  if (!ts_is_coro_value(cv) || !((ts_coro*)ts_ptr(cv))->is_asyncgen){
+    tsv err=promise_resolution_type_error("AsyncGenerator method called on incompatible receiver");
+    ts_gc_root(&err);
+    tsv p=ts_promise_rejected(err);
     ts_gc_unroot(4);
     return p;
   }
-  tsv pv = ts_promise_new_v();
-  ts_gc_root(&pv);
-  c = (ts_coro*)ts_ptr(cv);
-  c->ret = pv;               /* the resume will resolve this with {value,done} */
-  c->result = sent;          /* value delivered to the resuming yield */
-  ts_write_barrier(cv, pv); ts_write_barrier(cv, sent);
-  c->rejected = 0;
-  ts_coro_resume_v(cv);      /* runs until next yield / await-park / completion */
+  tsv pv=ts_promise_new_v(); ts_gc_root(&pv);
+  ts_asyncgen_req* r=(ts_asyncgen_req*)calloc(1,sizeof(ts_asyncgen_req));
+  if (!r) ts_abort_msg("out of memory growing async generator request queue");
+  r->promise=pv; r->value=value; r->kind=kind;
+  ts_coro* c=(ts_coro*)ts_ptr(cv);
+  if (c->ag_tail) c->ag_tail->next=r; else c->ag_head=r;
+  c->ag_tail=r;
+  ts_write_barrier(cv,pv); ts_write_barrier(cv,value);
+  int kick=!c->ag_running;
+  if (kick) asyncgen_start_next_v(cv);
   ts_gc_unroot(4);
   return pv;
 }
 
-/* .throw(e) on an async generator: raise e at the paused yield point, returning a
-   Promise<{value,done}>. If the body catches and yields/returns, the next-promise
-   resolves accordingly; if uncaught, the asyncgen reject-buf path rejects it. */
+tsv ts_asyncgen_next(tsv genobj, tsv sent){
+  return asyncgen_enqueue(genobj,sent,0);
+}
+
 tsv ts_asyncgen_throw(tsv genobj, tsv exc){
-  ensure_gen_fields();
-  ts_gc_root(&genobj); ts_gc_root(&exc);
-  if (!ts_is_obj(genobj)){
-    tsv p = ts_promise_rejected(exc);
-    ts_gc_unroot(2);
-    return p;
-  }
-  tsv cv = ts_get(genobj, F_coro);
-  ts_gc_root(&cv);
-  ts_coro* c = (ts_coro*)ts_ptr(cv);
-  if (c->done){
-    tsv p = ts_promise_rejected(exc);
-    ts_gc_unroot(3);
-    return p;
-  }
-  tsv pv = ts_promise_new_v();
-  ts_gc_root(&pv);
-  c = (ts_coro*)ts_ptr(cv);
-  c->ret = pv;
-  ts_write_barrier(cv, pv);
-  c->rejected = 1;           /* "raise c->result at the resume point" */
-  c->result = exc;
-  ts_write_barrier(cv, exc);
-  ts_coro_resume_v(cv);      /* body catches & yields/returns, or reject-buf rejects p */
-  ts_gc_unroot(4);
-  return pv;
+  return asyncgen_enqueue(genobj,exc,1);
+}
+
+tsv ts_asyncgen_return(tsv genobj, tsv val){
+  return asyncgen_enqueue(genobj,val,2);
 }
 
 

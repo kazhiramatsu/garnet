@@ -1496,6 +1496,20 @@ typedef struct ts_promise {
   int comb_remaining;        /* Promise.all: inputs not yet fulfilled (0 otherwise) */
   tsv comb_results;          /* Promise.all: the results array (TS_UNDEFINED otherwise) */
 } ts_promise;
+typedef struct ts_asyncgen_req {
+  tsv promise;
+  tsv value;
+  int kind;                  /* 0 next, 1 throw, 2 return */
+  int value_awaited;         /* async-generator return argument was unwrapped */
+  struct ts_asyncgen_req* next;
+} ts_asyncgen_req;
+enum {
+  TS_GEN_SUSPENDED_START = 0,
+  TS_GEN_SUSPENDED_YIELD = 1,
+  TS_GEN_EXECUTING = 2,
+  TS_GEN_COMPLETED = 3
+};
+#define TS_CORO_EH_INLINE 8
 typedef struct ts_coro {
   ts_gc_header h;
   int state;
@@ -1508,16 +1522,30 @@ typedef struct ts_coro {
   int nslots;
   tsv yielded;               /* generator: value produced by the current yield */
   int done;                  /* generator: 1 when the body has completed */
+  int gen_status;            /* generator protocol lifecycle (TS_GEN_*) */
+  int is_asyncgen;
+  int ag_running;
+  ts_asyncgen_req* ag_head;
+  ts_asyncgen_req* ag_tail;
   jmp_buf eh_buf;            /* shared landing pad; re-armed each resume */
   int eh_top;                /* number of active coroutine try handlers */
-  int eh_catch_state[8];     /* catch-label id per handler (innermost = top-1) */
-  int eh_gc_depth[8];        /* GC root depth snapshot per handler */
-  int fin_pending[8];        /* per finally: completion kind 0 normal/1 throw/2 return/3 break/4 continue */
-  tsv fin_exc[8];            /* per finally: saved exception (throw) or return value */
-  int fin_tgt[8];            /* per finally: target loop label id for break/continue */
+  int eh_capacity;
+  int* eh_catch_state;        /* catch-label id per handler (innermost = top-1) */
+  int* eh_gc_depth;           /* GC root depth snapshot per handler */
+  int eh_catch_inline[TS_CORO_EH_INLINE];
+  int eh_gc_inline[TS_CORO_EH_INLINE];
+  int fin_capacity;
+  int* fin_pending;           /* completion kind 0 normal/1 throw/2 return/3 break/4 continue */
+  tsv* fin_exc;               /* saved exception (throw) or return value */
+  int* fin_tgt;               /* target loop label id for break/continue */
+  int fin_pending_inline[TS_CORO_EH_INLINE];
+  tsv fin_exc_inline[TS_CORO_EH_INLINE];
+  int fin_tgt_inline[TS_CORO_EH_INLINE];
   int fin_top;               /* active finally-pending slots */
   jmp_buf reject_buf;        /* async catch-all: uncaught throw rejects ret */
 } ts_coro;
+int         ts_coro_eh_push_slot(ts_coro* c);
+int         ts_coro_fin_push_slot(ts_coro* c);
 /* Promise/Coro handle APIs are the primary runtime boundary. */
 tsv         ts_promise_new_v(void);
 void        ts_promise_settle_v(tsv pv, tsv v, int rejected);
@@ -1568,8 +1596,11 @@ tsv ts_gen_next(tsv genobj, tsv sent);
 tsv ts_asyncgen_next(tsv genobj, tsv sent);
 tsv ts_iter_step(tsv iter, tsv sent, ts_key nmk); /* generic iterator step: field/method `next` or generator fallback */
 tsv ts_asyncgen_throw(tsv genobj, tsv exc);
+tsv ts_asyncgen_return(tsv genobj, tsv val);
 tsv ts_gen_throw(tsv genobj, tsv exc);
 tsv ts_gen_return(tsv genobj, tsv val);
 tsv ts_asyncgen_new_v(tsv cv);
 tsv ts_iter_result(tsv value, int done);
+int ts_is_gen_return_completion(tsv v);
+tsv ts_gen_return_completion_value(tsv v);
 void ts_abort_msg(const char* m);

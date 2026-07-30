@@ -5,7 +5,7 @@
 #
 # Stages (each prints PASS/FAIL; script exits non-zero on the first FAIL):
 #   build      tsc analyzer_ts
-#   conf       analyzer_ts conformance (TS emit vs node oracle, 327 fixtures)
+#   conf       analyzer_ts conformance (TS emit vs node oracle, all fixtures)
 #   smoke      analyzer_difftest.sh   (TS vs Rust vs node, 3-way)
 #   devirt     devirt-pass dump diff  (TS vs Rust, all fixtures)
 #   escape     escape-pass dump diff  (TS vs Rust, all fixtures)

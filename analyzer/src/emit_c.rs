@@ -6471,6 +6471,11 @@ fn emit_sm_resume_body(s: &mut String, f: &Function, ctx: &Ctx, mode: SmMode) {
         s.push_str("  if (setjmp(_fr->c.reject_buf) != 0) {\n");
         if mode == SmMode::AsyncGenerator {
             s.push_str("    _fr->c.done = 1;\n");
+            s.push_str("    if (ts_is_gen_return_completion(ts_current_exception())) {\n");
+            s.push_str("      tsv _ge = ts_current_exception(); ts_gc_root(&_ge);\n");
+            s.push_str("      tsv _gv = ts_gen_return_completion_value(_ge); ts_gc_root(&_gv);\n");
+            s.push_str("      ts_promise_resolve_v(_fr->c.ret, ts_iter_result(_gv, 1));\n");
+            s.push_str("      ts_gc_unroot(2);\n      return TS_UNDEFINED;\n    }\n");
         }
         s.push_str("    ts_promise_reject_v(_fr->c.ret, ts_current_exception());\n");
         s.push_str("    return TS_UNDEFINED;\n");
@@ -6524,7 +6529,7 @@ fn emit_sm_resume_body(s: &mut String, f: &Function, ctx: &Ctx, mode: SmMode) {
             Flat::TryEnter { catch_label } => {
                 // push a handler: record catch target + gc depth at the top of the
                 // stack, arm setjmp, push one global handler pointing at the buf.
-                s.push_str("  {\n    int _t = _fr->c.eh_top++;\n");
+                s.push_str("  {\n    int _t = ts_coro_eh_push_slot(&_fr->c);\n");
                 s.push_str("    _fr->c.eh_gc_depth[_t] = ts_gc_root_depth();\n");
                 let _ = writeln!(s, "    _fr->c.eh_catch_state[_t] = {};", catch_label);
                 s.push_str("  }\n");
@@ -6564,6 +6569,7 @@ fn emit_sm_resume_body(s: &mut String, f: &Function, ctx: &Ctx, mode: SmMode) {
                 catch_var,
             } => {
                 let _ = writeln!(s, "  LC{}: ;", catch_label);
+                s.push_str("  if (ts_is_gen_return_completion(ts_current_exception())) ts_throw(ts_current_exception());\n");
                 if let Some(cv) = catch_var {
                     s.push_str(&ctx.set_val(cv.0, "ts_current_exception()"));
                 }
@@ -6573,7 +6579,7 @@ fn emit_sm_resume_body(s: &mut String, f: &Function, ctx: &Ctx, mode: SmMode) {
             }
             Flat::FinallyEnterTry { fin_catch_label } => {
                 // identical to TryEnter, but the catch target is the finally landing.
-                s.push_str("  {\n    int _t = _fr->c.eh_top++;\n");
+                s.push_str("  {\n    int _t = ts_coro_eh_push_slot(&_fr->c);\n");
                 s.push_str("    _fr->c.eh_gc_depth[_t] = ts_gc_root_depth();\n");
                 let _ = writeln!(s, "    _fr->c.eh_catch_state[_t] = {};", fin_catch_label);
                 s.push_str("  }\n");
@@ -6589,7 +6595,9 @@ fn emit_sm_resume_body(s: &mut String, f: &Function, ctx: &Ctx, mode: SmMode) {
                 // normal completion of try/catch: pop the finally handler, mark this
                 // finally's pending = normal (no re-throw), then run the finally body.
                 s.push_str("  ts_eh_pop();\n  _fr->c.eh_top--;\n");
-                s.push_str("  { int _f = _fr->c.fin_top++; _fr->c.fin_pending[_f] = 0; }\n");
+                s.push_str(
+                    "  { int _f = ts_coro_fin_push_slot(&_fr->c); _fr->c.fin_pending[_f] = 0; }\n",
+                );
                 let _ = writeln!(s, "  goto L{};", fin_label);
             }
             Flat::FinallyCatchLabel {
@@ -6597,9 +6605,14 @@ fn emit_sm_resume_body(s: &mut String, f: &Function, ctx: &Ctx, mode: SmMode) {
                 fin_label,
             } => {
                 // exception landed here (try or catch threw): save it for re-throw
-                // after the finally body, mark pending = throw.
+                // after the finally body. An injected generator return is an
+                // internal completion, not a user-catchable exception.
                 let _ = writeln!(s, "  LC{}: ;", fin_catch_label);
-                s.push_str("  { int _f = _fr->c.fin_top++; _fr->c.fin_pending[_f] = 1; _fr->c.fin_exc[_f] = ts_current_exception(); }\n");
+                s.push_str("  { int _f = ts_coro_fin_push_slot(&_fr->c); tsv _e = ts_current_exception();\n");
+                s.push_str(
+                    "    _fr->c.fin_pending[_f] = ts_is_gen_return_completion(_e) ? 2 : 1;\n",
+                );
+                s.push_str("    _fr->c.fin_exc[_f] = ts_is_gen_return_completion(_e) ? ts_gen_return_completion_value(_e) : _e; }\n");
                 let _ = writeln!(s, "  goto L{};", fin_label);
             }
             Flat::FinallyLabel { fin_label } => {
@@ -6617,7 +6630,7 @@ fn emit_sm_resume_body(s: &mut String, f: &Function, ctx: &Ctx, mode: SmMode) {
                 // (the finally handler itself is popped here as it's no longer
                 // protecting; remaining outer handlers stay for re-throw/return.)
                 s.push_str("  ts_eh_pop();\n  _fr->c.eh_top--;\n");
-                let _ = writeln!(s, "  {{ int _f = _fr->c.fin_top++; _fr->c.fin_pending[_f] = {}; _fr->c.fin_tgt[_f] = {};", kind, target);
+                let _ = writeln!(s, "  {{ int _f = ts_coro_fin_push_slot(&_fr->c); _fr->c.fin_pending[_f] = {}; _fr->c.fin_tgt[_f] = {};", kind, target);
                 if let Some(v) = value {
                     let _ = writeln!(s, "    _fr->c.fin_exc[_f] = {};", ctx.val(v.0));
                 }
@@ -6636,7 +6649,7 @@ fn emit_sm_resume_body(s: &mut String, f: &Function, ctx: &Ctx, mode: SmMode) {
                     // completion outward by pushing the outer finally's pending
                     // slot (copying the record) and jumping to the outer finally.
                     s.push_str("    if (_k != 0) {\n");
-                    s.push_str("      int _of = _fr->c.fin_top++;\n");
+                    s.push_str("      int _of = ts_coro_fin_push_slot(&_fr->c);\n");
                     s.push_str("      _fr->c.fin_pending[_of] = _k;\n");
                     s.push_str("      _fr->c.fin_exc[_of] = _fr->c.fin_exc[_f];\n");
                     s.push_str("      _fr->c.fin_tgt[_of] = _fr->c.fin_tgt[_f];\n");
@@ -7006,60 +7019,6 @@ fn emit_asyncgen_function(s: &mut String, f: &Function, ctx: &Ctx) {
     s.push_str("  return _gen;\n}\n\n");
 }
 
-/// Does this body contain a Return/Break/Continue/Throw that escapes it (i.e. is
-/// not fully enclosed by an inner loop, for break/continue)? Used to decide
-/// whether a try/finally needs the completion-record lowering. Conservative:
-/// any Return/Throw counts; Break/Continue count unless inside a nested loop here.
-fn body_exits_abruptly(body: &[Inst]) -> bool {
-    fn walk(body: &[Inst], in_loop: bool) -> bool {
-        for i in body {
-            match i {
-                Inst::Return { .. } | Inst::Throw { .. } => return true,
-                Inst::Break { .. } | Inst::Continue { .. } => {
-                    if !in_loop {
-                        return true;
-                    }
-                }
-                Inst::If {
-                    then_body,
-                    else_body,
-                    ..
-                } => {
-                    if walk(then_body, in_loop) || walk(else_body, in_loop) {
-                        return true;
-                    }
-                }
-                Inst::Loop {
-                    cond_body, body, ..
-                } => {
-                    // a break/continue inside this nested loop targets it (stays local);
-                    // but a Return/Throw still escapes.
-                    if walk(cond_body, true) || walk(body, true) {
-                        return true;
-                    }
-                }
-                Inst::TryCatch {
-                    try_body,
-                    catch_body,
-                    finally_body,
-                    ..
-                } => {
-                    if walk(try_body, in_loop)
-                        || walk(catch_body, in_loop)
-                        || walk(finally_body, in_loop)
-                    {
-                        return true;
-                    }
-                }
-                _ => {}
-            }
-        }
-        false
-    }
-    // top level of a try/catch body is NOT inside a loop of its own
-    walk(body, false)
-}
-
 /// Completion-record context for the plain (non-coroutine) finally lowering.
 /// `pend` is the C variable holding the pending completion kind; the finally
 /// dispatch acts on it. Pending kinds: 0 normal,1 return,2 break,3 continue,4 throw.
@@ -7067,6 +7026,7 @@ struct FinCtx {
     pend: String,   // e.g. "_pend0"
     pendv: String,  // pending return value var
     fin_label: u32, // goto target = the finally body
+    base_eh_depth: u32,
 }
 
 /// Emit a body that is inside a finally-protected region. Return/Break/Continue
@@ -7082,20 +7042,26 @@ fn emit_guarded(s: &mut String, body: &[Inst], ctx: &Ctx, fc: &FinCtx, loop_dept
                     Some(v) => ctx.val(v.0),
                     None => "TS_UNDEFINED".to_string(),
                 };
+                let pops = ctx.eh_depth.get().saturating_sub(fc.base_eh_depth);
+                let pop_str = "ts_eh_pop(); ".repeat(pops as usize);
                 let _ = writeln!(
                     s,
-                    "  {} = {}; {} = 1; ts_eh_pop(); goto L{};",
-                    fc.pendv, v, fc.pend, fc.fin_label
+                    "  {} = {}; {} = 1; {}goto L{};",
+                    fc.pendv, v, fc.pend, pop_str, fc.fin_label
                 );
             }
             // Inside a try/finally region the exporter rejects multi-level (up>=1)
             // break/continue, so these only ever see up==0 (a plain break/continue);
             // `up` is ignored here.
             Inst::Break { .. } if loop_depth == 0 => {
-                let _ = writeln!(s, "  {} = 2; ts_eh_pop(); goto L{};", fc.pend, fc.fin_label);
+                let pops = ctx.eh_depth.get().saturating_sub(fc.base_eh_depth);
+                let pop_str = "ts_eh_pop(); ".repeat(pops as usize);
+                let _ = writeln!(s, "  {} = 2; {}goto L{};", fc.pend, pop_str, fc.fin_label);
             }
             Inst::Continue { .. } if loop_depth == 0 => {
-                let _ = writeln!(s, "  {} = 3; ts_eh_pop(); goto L{};", fc.pend, fc.fin_label);
+                let pops = ctx.eh_depth.get().saturating_sub(fc.base_eh_depth);
+                let pop_str = "ts_eh_pop(); ".repeat(pops as usize);
+                let _ = writeln!(s, "  {} = 3; {}goto L{};", fc.pend, pop_str, fc.fin_label);
             }
             Inst::Break { .. } => {
                 s.push_str("  break;\n");
@@ -7134,14 +7100,38 @@ fn emit_guarded(s: &mut String, body: &[Inst], ctx: &Ctx, fc: &FinCtx, loop_dept
                 catch_var,
                 catch_body,
                 finally_body,
-            } if !finally_body.is_empty()
-                && (body_exits_abruptly(try_body) || body_exits_abruptly(catch_body)) =>
-            {
+            } if !finally_body.is_empty() => {
                 // A nested try/finally inside a guarded region: emit it via
                 // emit_plain_finally, which pushes/pops the fin_stack so this inner
                 // finally propagates its completion OUT to the current (fc) finally.
                 let outer = ctx.loop_labels.borrow().last().copied();
                 emit_plain_finally(s, try_body, catch_var, catch_body, finally_body, ctx, outer);
+            }
+            Inst::TryCatch {
+                try_body,
+                catch_var,
+                catch_body,
+                finally_body,
+            } if finally_body.is_empty() => {
+                let base_eh_depth = ctx.eh_depth.get();
+                s.push_str("  {\n    ts_handler* _h = ts_eh_push();\n");
+                s.push_str("    if (setjmp(_h->buf) == 0) {\n");
+                ctx.eh_depth.set(base_eh_depth + 1);
+                emit_guarded(s, try_body, ctx, fc, loop_depth);
+                s.push_str("      ts_eh_pop();\n");
+                s.push_str("    } else {\n");
+                s.push_str("      ts_gc_set_root_depth(_h->gc_root_len);\n");
+                if frame_roots_enabled() {
+                    s.push_str("      ts_frame_restore(_h->frame_top);\n");
+                }
+                s.push_str("      ts_eh_pop();\n");
+                ctx.eh_depth.set(base_eh_depth);
+                if let Some(cv) = catch_var {
+                    s.push_str(&ctx.set_val(cv.0, "ts_current_exception()"));
+                }
+                emit_guarded(s, catch_body, ctx, fc, loop_depth);
+                s.push_str("    }\n  }\n");
+                ctx.eh_depth.set(base_eh_depth);
             }
             other => emit_inst(s, other, ctx),
         }
@@ -7165,17 +7155,18 @@ fn emit_plain_finally(
     let id = fin_label; // unique suffix for locals
     let pend = format!("_pend{}", id);
     let pendv = format!("_pendv{}", id);
+    // record the EH depth visible to this finally's protected region; an inner
+    // nested finally propagating outward must pop handlers down to this level.
+    let base_eh_depth = ctx.eh_depth.get();
     let fc = FinCtx {
         pend: pend.clone(),
         pendv: pendv.clone(),
         fin_label,
+        base_eh_depth,
     };
     // completion record locals: kind (0 normal,1 return,2 break,3 continue,4 throw)
     let _ = writeln!(s, "  int {} = 0; tsv {} = TS_UNDEFINED;", pend, pendv);
     let has_catch = !catch_body.is_empty() || catch_var.is_some();
-    // record the EH depth visible to this finally's protected region; an inner
-    // nested finally propagating outward must pop handlers down to this level.
-    let base_eh_depth = ctx.eh_depth.get();
     ctx.fin_stack
         .borrow_mut()
         .push((pend.clone(), pendv.clone(), fin_label, base_eh_depth));
@@ -15185,6 +15176,18 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     ),
                     false,
                 ),
+                "asyncgen.return" => (
+                    format!(
+                        "ts_asyncgen_return({}, {})",
+                        r,
+                        if args.is_empty() {
+                            "TS_UNDEFINED".to_string()
+                        } else {
+                            v(0)
+                        }
+                    ),
+                    false,
+                ),
                 // ---- Map ----
                 "map.set" => (format!("ts_map_set({}, {}, {})", r, v(0), v(1)), false),
                 "map.get" => (format!("ts_map_get({}, {})", r, v(0)), false),
@@ -16015,9 +16018,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
         } => {
             // finally + abrupt exit (return/break/continue through finally) needs the
             // completion-record lowering; otherwise the simple structured emit works.
-            if !finally_body.is_empty()
-                && (body_exits_abruptly(try_body) || body_exits_abruptly(catch_body))
-            {
+            if !finally_body.is_empty() {
                 let outer = ctx.loop_labels.borrow().last().copied();
                 emit_plain_finally(s, try_body, catch_var, catch_body, finally_body, ctx, outer);
                 return;
@@ -16025,11 +16026,14 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             // try/catch/finally via setjmp/longjmp. The handler snapshots the GC
             // root depth so an unwind restores it (a longjmp skips the intervening
             // ts_gc_unroot calls).
+            let base_eh_depth = ctx.eh_depth.get();
             s.push_str("  {\n");
             s.push_str("    ts_handler* _h = ts_eh_push();\n");
             s.push_str("    if (setjmp(_h->buf) == 0) {\n");
+            ctx.eh_depth.set(base_eh_depth + 1);
             emit_seq(s, try_body, ctx, PathEdge::TryBody);
             s.push_str("      ts_eh_pop();\n");
+            ctx.eh_depth.set(base_eh_depth);
             emit_seq(s, finally_body, ctx, PathEdge::FinallyBody);
             s.push_str("    } else {\n");
             s.push_str("      ts_gc_set_root_depth(_h->gc_root_len);\n");
@@ -16040,10 +16044,12 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             if let Some(cv) = catch_var {
                 s.push_str(&ctx.set_val(cv.0, "ts_current_exception()"));
             }
+            ctx.eh_depth.set(base_eh_depth);
             emit_seq(s, catch_body, ctx, PathEdge::CatchBody);
             emit_seq(s, finally_body, ctx, PathEdge::FinallyBody);
             s.push_str("    }\n");
             s.push_str("  }\n");
+            ctx.eh_depth.set(base_eh_depth);
         }
         Inst::Throw { src } => {
             // Raise an exception: unwinds to the nearest enclosing catch via

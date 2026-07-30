@@ -52,6 +52,9 @@ if [[ "$RUN_ASAN" != "0" ]]; then
     echo "actual:   $actual"
     exit 1
   fi
+  checked="O2 and ASan"
+else
+  checked="O2"
 fi
 
-echo "[string-builder-scale] PASS: 64 MiB prefix/branch/slice build matches V8 under O2 and ASan"
+echo "[string-builder-scale] PASS: 64 MiB prefix/branch/slice build matches V8 under $checked"

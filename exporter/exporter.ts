@@ -4488,6 +4488,16 @@ class Exporter {
             ctx.body.push({ kind: "CallBuiltin", dst, builtin: "asyncgen.throw", recv, args });
             return dst;
           }
+          // (asyncgen).return(v) -> enqueue a return completion and return its
+          // Promise<{value,done}>. The runtime serializes it with pending next/throw
+          // requests and runs generator finally blocks before completion.
+          if (fn.name.text === "return" && this.isAsyncGeneratorType(fn.expression)) {
+            const recv = this.lowerExpr(ctx, fn.expression);
+            const args = this.lowerSequenced(ctx, node.arguments);
+            const dst = this.newLocal(ctx, "reference");
+            ctx.body.push({ kind: "CallBuiltin", dst, builtin: "asyncgen.return", recv, args });
+            return dst;
+          }
           // gen.throw(e) on a Generator -> ts_gen_throw, returns {value,done}.
           if (fn.name.text === "throw" && this.isGeneratorType(fn.expression)) {
             const recv = this.lowerExpr(ctx, fn.expression);
@@ -5201,7 +5211,7 @@ class Exporter {
           ctx.body.push({ kind: "LoadField", dst: val, obj: rstar, field: valueField });
           if (!drv.throwStep) {
             // no throw forwarding possible: plain yield + advance.
-            ctx.body.push({ kind: "Yield", dst: sent, operand: val });
+            this.emitYieldInst(ctx, sent, val);
             const r = drv.step(sent);
             ctx.body.push({ kind: "Copy", dst: rstar, src: r });
             return;
@@ -5218,7 +5228,7 @@ class Exporter {
           ctx.body.push({ kind: "Const", dst: falseC, value: { kind: "Bool", value: false } });
           ctx.body.push({ kind: "Copy", dst: threw, src: falseC });
           const tryBody = this.captureBody(ctx, () => {
-            ctx.body.push({ kind: "Yield", dst: sent, operand: val });
+            this.emitYieldInst(ctx, sent, val);
           });
           const catchBody = this.captureBody(ctx, () => {
             const trueC = this.newLocal(ctx, "primitive");
@@ -5247,7 +5257,7 @@ class Exporter {
       const operand = node.expression ? this.lowerExpr(ctx, node.expression) : this.newLocal(ctx, "reference");
       if (!node.expression) ctx.body.push({ kind: "Const", dst: operand, value: { kind: "Undef" } });
       const dst = this.newLocal(ctx, this.refKindOf(node));
-      ctx.body.push({ kind: "Yield", dst, operand });
+      this.emitYieldInst(ctx, dst, operand);
       return dst;
     }
     if (ts.isAwaitExpression(node)) {
@@ -8273,12 +8283,23 @@ class Exporter {
       };
     }
 
-    // Optional iterator-close: for a CUSTOM iterator (not our generators, which
-    // run their own finally via the completion-record path) that statically has a
-    // callable `return` method, provide a closure to invoke it.return(undefined),
-    // [await]ed in async contexts. Used to close the iterator on early loop exit.
+    // Optional iterator-close. Our generator wrappers need an explicit injected
+    // return completion too; merely stopping pulls leaves their finally blocks
+    // suspended forever.
     let returnCall: (() => void) | undefined;
-    if (!useBuiltin) {
+    if (useBuiltin) {
+      returnCall = () => {
+        const undefA = this.newLocal(ctx, "reference");
+        ctx.body.push({ kind: "Const", dst: undefA, value: { kind: "Undef" } });
+        const rr = this.newLocal(ctx, "reference");
+        const returnBuiltin = nextBuiltin === "asyncgen.next" ? "asyncgen.return" : "generator.return";
+        ctx.body.push({ kind: "CallBuiltin", dst: rr, builtin: returnBuiltin, recv: itLocal, args: [undefA] });
+        if (isAsync) {
+          const awaited = this.newLocal(ctx, "reference");
+          ctx.body.push({ kind: "Await", dst: awaited, operand: rr });
+        }
+      };
+    } else {
       const itHasReturn = (ofClass !== undefined && this.classHasMethod(ofClass, "return"))
         || this.typeHasCallable(expr, "return");
       if (itHasReturn) {
@@ -8546,11 +8567,23 @@ class Exporter {
       if (isString) cp = this.emitStringIteratorElement(ctx, arr, idx, el);
       else ctx.body.push({ kind: "LoadIndex", dst: el, arr, index: idx });
       const sent = this.newLocal(ctx, "reference");
-      ctx.body.push({ kind: "Yield", dst: sent, operand: el });
+      this.emitYieldInst(ctx, sent, el);
       if (isString) this.emitStringIteratorAdvance(ctx, idx, cp);
       else this.emitIndexStep(ctx, idx, 1);
     });
     ctx.body.push({ kind: "Loop", cond: condLocal, condBody, body: bodyB });
+  }
+
+  /** AsyncGeneratorYield awaits its operand before exposing the iterator result.
+   *  Model that explicitly in IR so the ordinary Await state-machine path handles
+   *  thenables, rejection, and scheduler ordering before the Yield suspension. */
+  private emitYieldInst(ctx: FnCtx, dst: number, operand: number): void {
+    let value = operand;
+    if (ctx.isAsync && ctx.isGenerator) {
+      value = this.newLocal(ctx, "reference");
+      ctx.body.push({ kind: "Await", dst: value, operand });
+    }
+    ctx.body.push({ kind: "Yield", dst, operand: value });
   }
 
   /** Lower `for [await] (decl of <iter>) BODY` driven by a resolved iterator.
@@ -9310,8 +9343,15 @@ class Exporter {
     } else if (ts.isExpressionStatement(stmt)) {
       this.lowerExpr(ctx, stmt.expression);
     } else if (ts.isReturnStatement(stmt)) {
-      if (stmt.expression) ctx.body.push({ kind: "Return", src: this.lowerExpr(ctx, stmt.expression) });
-      else ctx.body.push({ kind: "Return" });
+      if (stmt.expression) {
+        let src=this.lowerExpr(ctx, stmt.expression);
+        if (ctx.isAsync && ctx.isGenerator) {
+          const awaited=this.newLocal(ctx,"reference");
+          ctx.body.push({ kind:"Await",dst:awaited,operand:src });
+          src=awaited;
+        }
+        ctx.body.push({ kind: "Return", src });
+      } else ctx.body.push({ kind: "Return" });
     } else if (ts.isThrowStatement(stmt)) {
       ctx.body.push({ kind: "Throw", src: this.lowerExpr(ctx, stmt.expression) });
     } else if (ts.isIfStatement(stmt)) {

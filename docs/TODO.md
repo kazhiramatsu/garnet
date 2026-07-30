@@ -3482,3 +3482,50 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
 - Added `docs/adaptive_aging_design.md`, runtime-stat counters, a default-policy
   assertion, and `tests/gc_adaptive_aging_gate.sh`. Fast/parallel CI and GC
   stress run the policy gate; GC stress also runs its ASan variant.
+
+### Session 331: Promise/coroutine protocol correctness and bounded test runners
+
+- Completed Promise Resolution Procedure behavior for native promises and foreign
+  thenables: shared already-resolved cells, self-resolution rejection, deferred
+  thenable jobs, pending-promise adoption, `Promise.resolve` identity, and await
+  assimilation. `finally` now awaits its callback result and preserves or replaces
+  the original completion correctly. Combinators validate and materialize iterable
+  inputs and use real `AggregateError` rejection.
+- Reworked synchronous generator lifecycle state, re-entry checks, first-`next`
+  handling, uncaught `throw`, completed behavior, and internal return completions.
+  `.return()` now executes nested `finally` blocks and supports yield/override
+  behavior. IteratorClose calls generator/async-generator return on abrupt loop exit.
+- Added an async-generator FIFO request queue. Concurrent next/throw/return requests
+  are serialized; yielded values, source return expressions, and external return
+  arguments are awaited before settling each request. Rejected return arguments are
+  injected as catchable throws into a suspended generator.
+- Replaced unchecked fixed-depth coroutine EH/finally arrays with eight inline slots
+  plus dynamically grown metadata. Moving-GC fixup reconnects inline pointers and GC
+  scans queued async-generator requests and pending finally values. Generator-return
+  completion recognition is allocation-free, fixing a threshold-one frame-root
+  regression found during forced moving-GC validation.
+- Fixed completion-record lowering in the Rust emitter, typed emitter, and boxed
+  self-host emitter. Calls that throw from a catch can no longer skip `finally`, and
+  abrupt completion through a nested try/catch correctly unwinds all handlers before
+  entering the outer `finally`.
+- Added focused Promise resolution, deep coroutine finally, generator protocol,
+  async-generator protocol, and nested-finally conformance fixtures.
+- Rebuilt self-conformance around batch exporter/transpiler/analyzer processes,
+  bounded native/oracle workers, prewarmed optional runtime objects, and a
+  content-addressed native binary cache, bounded to one binary plus key sidecar
+  per fixture so stale source revisions cannot accumulate indefinitely. All 371
+  fixtures retain separate V8/native processes for global-state isolation. A cold
+  cache run took 121 seconds; the verified warm run took 49 seconds with 371 cache
+  hits. Typed-emitter parity now batches its Node analyzer as well; the complete
+  371-fixture parity audit took 13 seconds.
+- Removed CI resource oversubscription. Ordinary correctness runs in waves of at
+  most four jobs, Cargo release and unit builds are isolated and default to two
+  jobs (`TSAOT_CI_RUST_JOBS` overrides), and GC stress runs alone. Forced
+  Promise+Coro moving is folded into the same GC invocation, so aging,
+  adaptive-aging, and the 64 MiB string gate are no longer duplicated.
+- Final verification: production conformance **371/371**; self-conformance
+  **370 PASS + 1 KNOWN, DIFF=0, CCFAIL=0, UNPORTED=0**; Rust and runtime unit
+  suites; frozen typed-emitter parity **356 identical + 15 KNOWN, DIFF=0,
+  UNPORTED=0**; normal, ASan, and forced Promise+Coro moving GC stress;
+  benchmark correctness and performance budgets; and the complete
+  bounded-parallel CI.
