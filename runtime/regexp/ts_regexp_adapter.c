@@ -364,6 +364,7 @@ static int ts_regexp_exec_string_tsv(ts_regexp_compiled* re, tsv input,
     return TSAOT_REGEXP_ERR_EXEC;
   }
   ts_strview sv = ts_str_view_typed(s);
+  char short_input[TS_SHORTSTR_MAX];
   int rc;
   if (sv.flags & TS_STR_FLAG_UTF16){
     uint16_t* tmp = ts_regexp_view_to_utf16(sv);
@@ -374,7 +375,9 @@ static int ts_regexp_exec_string_tsv(ts_regexp_compiled* re, tsv input,
     rc = ts_regexp_exec_utf16(re, tmp, sv.len, start_index, captures, capture_cap);
     free(tmp);
   } else {
-    rc = ts_regexp_exec_latin1(re, (const uint8_t*)sv.data, sv.len, start_index, captures, capture_cap);
+    rc = ts_regexp_exec_latin1(
+      re, (const uint8_t*)ts_str_view_data(&sv, short_input), sv.len,
+      start_index, captures, capture_cap);
   }
   ts_gc_unroot(2);
   return rc;

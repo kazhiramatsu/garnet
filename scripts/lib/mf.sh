@@ -18,19 +18,23 @@ if [ ! -f "$RT_OBJ" ] ||
   $CC -c "$ROOT/runtime/ts_rt.c" -I"$ROOT/runtime" -o "$RT_OBJ" || return 1
 fi
 
-# node ESM baseline runner: transpile every .ts in the dir to .mjs (ESNext),
+# node ESM baseline runner: transpile every .ts/.tsx in the dir to .mjs (ESNext),
 # rewrite `from "./x"` -> `from "./x.mjs"`, run entry.mjs.
 cat > "$ROOT/build/mfnode.js" <<'JS'
 const ts = require(process.env.ROOT + "/exporter/node_modules/typescript");
 const fs = require("fs"), path = require("path");
 const dir = process.argv[2];
 for (const f of fs.readdirSync(dir)) {
-  if (!f.endsWith(".ts")) continue;
+  if (!f.endsWith(".ts") && !f.endsWith(".tsx")) continue;
   const src = fs.readFileSync(path.join(dir, f), "utf8");
-  let js = ts.transpileModule(src, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } }).outputText;
+  let js = ts.transpileModule(src, { compilerOptions: {
+    target: ts.ScriptTarget.ES2022,
+    module: ts.ModuleKind.ESNext,
+    jsx: ts.JsxEmit.React,
+  } }).outputText;
   js = js.replace(/(from\s*['"])(\.\.?\/[^'"]+?)(['"])/g, (m, a, p, b) => a + (p.endsWith(".mjs") ? p : p + ".mjs") + b);
   js = js.replace(/(import\s*['"])(\.\.?\/[^'"]+?)(['"])/g, (m, a, p, b) => a + (p.endsWith(".mjs") ? p : p + ".mjs") + b);
-  fs.writeFileSync(path.join(dir, f.replace(/\.ts$/, ".mjs")), js);
+  fs.writeFileSync(path.join(dir, f.replace(/\.tsx?$/, ".mjs")), js);
 }
 JS
 

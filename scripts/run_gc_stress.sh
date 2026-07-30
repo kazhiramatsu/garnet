@@ -17,8 +17,9 @@ RUN_FULL="${TSAOT_GC_STRESS_FULL:-0}"
 RUN_MOVE_CORO="${TSAOT_GC_STRESS_MOVE_CORO:-0}"
 RUN_MOVE_PROMISE="${TSAOT_GC_STRESS_MOVE_PROMISE:-0}"
 RUN_MOVE_BOTH="${TSAOT_GC_STRESS_MOVE_BOTH:-0}"
+RUN_STRING_SCALE="${TSAOT_GC_STRESS_STRING_SCALE:-1}"
 
-FILTER='frame_roots_(unwind|edge_cases)|object_reflection_safepoints|string_runtime_safepoints|handle_identity|moving_minor_promise_coro_stress|json_runtime_safepoints|lower_level_runtime_safepoints|promise_coro_handle_edges|promise_movable_experimental|coro_entry_safepoints|coro_movable_experimental|array_callback_safepoints|generational_remembered_set|map_set_callback_safepoints|moving_minor_relocation|prototype_handle_edges|typed_class_allocation_safepoints|computed_member_names|extends_same_name_scopes'
+FILTER='frame_roots_(unwind|edge_cases)|object_reflection_safepoints|string_runtime_safepoints|concat_growth|handle_identity|moving_minor_promise_coro_stress|json_runtime_safepoints|lower_level_runtime_safepoints|promise_coro_handle_edges|promise_movable_experimental|coro_entry_safepoints|coro_movable_experimental|array_callback_safepoints|generational_remembered_set|map_set_callback_safepoints|moving_minor_relocation|prototype_handle_edges|typed_class_allocation_safepoints|computed_member_names|extends_same_name_scopes'
 
 rc=0
 echo "=== tsaot GC stress [young threshold=$THRESHOLD] ==="
@@ -78,6 +79,11 @@ if [[ "$RUN_FULL" == "1" ]]; then
   echo ">>> full exhaustive conformance (normal O2)"
   TSAOT_GC_YOUNG_THRESHOLD="$THRESHOLD" \
     bash "$S/run_conformance.sh" exhaustive || rc=1
+fi
+
+if [[ "$RUN_STRING_SCALE" != "0" ]]; then
+  echo ">>> string-builder 64 MiB scale stress (O2 + ASan)"
+  bash "$ROOT/tests/string_builder_scale_gate.sh" || rc=1
 fi
 
 if [[ $rc -eq 0 ]]; then

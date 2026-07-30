@@ -394,9 +394,14 @@ int main(){
   tsv inner=ts_new_object(); ts_set(inner,1,ts_num(123)); ts_set(o,300,inner);
   /* strings + add */
   tsv s=ts_new_string("hi",2); ts_gc_root(&s);
+  CK("short string immediate", ts_is_short_str(s) && ts_str_len_typed(s)==2 &&
+     ts_str_charcodeat_i64_typed(s,0)=='h' && ts_str_charcodeat_i64_typed(s,1)=='i');
+  tsv long6=ts_new_string("abcdef",6); ts_gc_root(&long6);
+  CK("six-char string heap", ts_is_heap_str(long6) && ts_str_len_typed(long6)==6);
   CK("str truthy", ts_truthy(s));
   tsv cat=ts_add(s, ts_num(5)); /* "hi"+5 = "hi5" */
-  CK("str concat num", ts_is_str(cat));
+  CK("str concat num", ts_is_short_str(cat) &&
+     ts_strict_eq(cat,ts_new_string("hi5",3)));
   tsv rxsrc=ts_new_string("abcabc",6); ts_gc_root(&rxsrc);
   tsv rxpre=ts_new_string("bc",2); ts_gc_root(&rxpre);
   ts_regexp_litprefix_match rxm={0,0};
@@ -409,7 +414,7 @@ int main(){
   tsv rxbmp=ts_new_string("a\343\201\202b",5); ts_gc_root(&rxbmp);
   tsv rxbmppre=ts_new_string("\343\201\202b",4); ts_gc_root(&rxbmppre);
   CK("regexp litprefix utf16", ts_regexp_litprefix_find_view(ts_str_view_typed(rxbmp), ts_str_view_typed(rxbmppre), 0, 0, &rxm) && rxm.start==1 && rxm.end==3);
-  ts_gc_unroot(5);
+  ts_gc_unroot(6);
   /* numeric add */
   CK("num add", ts_to_num(ts_add(ts_num(2),ts_num(3)))==5);
   /* strict eq */

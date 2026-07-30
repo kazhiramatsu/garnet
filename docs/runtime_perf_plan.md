@@ -415,6 +415,13 @@ Each item: Goal / Steps / Invariants / Verify / Accept / Rollback; one commit ea
 
 ## 6. Phase 2 — extendable string buffers (the quadratic-append fix; ~1–2 sessions)
 
+> **Implemented (Session 326)**: hidden BUFFER storage plus immutable prefix
+> views reduced `gc_strings` from 31 ms / 536.5 MB to 23 ms / 33.3 MB. The
+> following immediate ASCII short-string step reduced it further to
+> 12 ms / 18.0 MB. The 64 MiB O2/ASan scale gate and all acceptance gates pass.
+> See `docs/string_builder_short_design.md` for the final representation and
+> the measurement-based decision not to add ropes.
+
 > **Priority note (v1.2)**: the flagship profile (§1.1) shows `ts_add` is NOT hot on
 > selfhost — this phase's justification is the gc_strings micro (F2–F3: 99% in `ts_add`,
 > a real O(n²)) and any user program with `s += x` loops, not the 595 s target. Slot it

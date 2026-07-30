@@ -82,6 +82,9 @@ function baseCompilerOptions(strict: boolean): ts.CompilerOptions {
     // resolve to `./b.ts` without extensions, matching how editors/rolldown resolve.
     module: ts.ModuleKind.ESNext,
     moduleResolution: ts.ModuleResolutionKind.Bundler,
+    // Preserve raw JSX nodes for the exporter's AOT lowering. The Node/V8 oracle
+    // uses the classic React transform separately; no JavaScript is emitted here.
+    jsx: ts.JsxEmit.Preserve,
   };
 }
 
@@ -1293,6 +1296,25 @@ class Exporter {
       }
     }
     return undefined;
+  }
+
+  /** Fold a side-effect-free template substitution to its exact JS string.
+   *
+   *  This is deliberately narrower than general constant folding: every accepted
+   *  form is a primitive literal or a numeric expression handled by
+   *  constNumValue(), so folding cannot suppress user code or observable
+   *  ToPrimitive/ToString calls. Numeric results are stringified by the exporter
+   *  host (V8), including -0 -> "0" and NaN/Infinity spellings. */
+  constTemplateString(node: ts.Expression): string | undefined {
+    const n = this.stripTransparentExpr(node);
+    if (ts.isStringLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n)) return n.text;
+    if (n.kind === ts.SyntaxKind.TrueKeyword) return "true";
+    if (n.kind === ts.SyntaxKind.FalseKeyword) return "false";
+    if (n.kind === ts.SyntaxKind.NullKeyword) return "null";
+    if (ts.isIdentifier(n) && n.text === "undefined" &&
+        this.isAmbientGlobalSymbol(this.symbolOf(n))) return "undefined";
+    const num = this.constNumValue(n);
+    return num === undefined ? undefined : String(num);
   }
 
   constJsonNumberValue(node: ts.Expression): { value: number; usedJson: boolean } | undefined {
@@ -2761,6 +2783,233 @@ class Exporter {
     return dst;
   }
 
+  /** Resolve the classic JSX factory from `import * as React from "./..."`.
+   *
+   *  The import target is part of the whole-program bundle, so a top-level
+   *  `createElement` function can be called directly by fn id. This is the AOT
+   *  fast path: no namespace-object lookup, property PIC, or indirect call at
+   *  each JSX site. The namespace identifier remains available for a semantic
+   *  fallback and for loading React.Fragment. */
+  private jsxFactoryInfo(node: ts.Node): {
+    namespaceName: ts.Identifier;
+    moduleSymbol: ts.Symbol;
+    createElementSymbol?: ts.Symbol;
+    createElementFn?: number;
+  } | undefined {
+    const sf = node.getSourceFile();
+    for (const stmt of sf.statements) {
+      if (!ts.isImportDeclaration(stmt)) continue;
+      const bindings = stmt.importClause?.namedBindings;
+      if (!bindings || !ts.isNamespaceImport(bindings) || bindings.name.text !== "React") continue;
+      const target = this.resolveModuleSf(stmt.moduleSpecifier);
+      if (!target) continue;
+      const moduleSymbol = this.checker.getSymbolAtLocation(target) ??
+        (target as unknown as { symbol?: ts.Symbol }).symbol;
+      if (!moduleSymbol) continue;
+      const exported = this.checker.getExportsOfModule(moduleSymbol)
+        .find((s) => s.name === "createElement");
+      const createElementSymbol = exported ? (this.unwrapImportAlias(exported) ?? exported) : undefined;
+      return {
+        namespaceName: bindings.name,
+        moduleSymbol,
+        createElementSymbol,
+        createElementFn: createElementSymbol ? this.funcSymbols.get(createElementSymbol) : undefined,
+      };
+    }
+    this.unsupported(node, "JSX requires `import * as React from \"<bundled module>\"` with an exported createElement function");
+    return undefined;
+  }
+
+  private jsxExportValue(ctx: FnCtx, node: ts.Node, name: string): number | undefined {
+    const info = this.jsxFactoryInfo(node);
+    if (!info) return undefined;
+    const exported = this.checker.getExportsOfModule(info.moduleSymbol).find((s) => s.name === name);
+    const sym = exported ? (this.unwrapImportAlias(exported) ?? exported) : undefined;
+    const decl = sym?.valueDeclaration ?? sym?.declarations?.find((d) =>
+      ts.isVariableDeclaration(d) || ts.isFunctionDeclaration(d) || ts.isClassDeclaration(d));
+    const declName = decl && (decl as ts.NamedDeclaration).name;
+    if (declName && ts.isIdentifier(declName)) return this.lowerIdentifier(ctx, declName);
+    // Generic namespace fallback: preserve a loud runtime value lookup when the
+    // export exists but its declaration shape is not one of the direct forms.
+    if (exported) {
+      const recv = this.lowerIdentifier(ctx, info.namespaceName);
+      const dst = this.newLocal(ctx, "reference", name);
+      ctx.body.push({ kind: "LoadField", dst, obj: recv, field: this.internField(name) });
+      return dst;
+    }
+    this.unsupported(node, `React subset does not export ${name}`);
+    return undefined;
+  }
+
+  private decodeJsxEntities(raw: string, node: ts.Node): string {
+    const named: Record<string, string> = {
+      amp: "&", lt: "<", gt: ">", quot: "\"", apos: "'", nbsp: "\u00a0",
+    };
+    return raw.replace(/&((#((\d+)|x([\da-fA-F]+)))|(\w+));/g,
+      (match, _all: string, _number: string, _digits: string,
+       decimal: string, hex: string, word: string) => {
+        if (decimal || hex) {
+          const cp = parseInt(decimal || hex, decimal ? 10 : 16);
+          if (Number.isFinite(cp) && cp >= 0 && cp <= 0x10ffff) return String.fromCodePoint(cp);
+          this.unsupported(node, `invalid JSX character reference ${match}`);
+          return match;
+        }
+        if (Object.prototype.hasOwnProperty.call(named, word)) return named[word];
+        // The subset intentionally recognizes the common XML/HTML entities. An
+        // unknown named reference must reject loudly instead of rendering text
+        // differently from TypeScript's classic JSX transform.
+        this.unsupported(node, `JSX named entity ${match} outside the supported React subset`);
+        return match;
+      });
+  }
+
+  private jsxTextValue(raw: string, node: ts.Node): string {
+    let acc: string | undefined;
+    let firstNonWhitespace = 0;
+    let lastNonWhitespace = -1;
+    const isLineBreak = (c: number) => c === 10 || c === 13 || c === 8232 || c === 8233;
+    const isWhiteSpaceSingleLine = (c: number) =>
+      c === 32 || c === 9 || c === 11 || c === 12 || c === 160 || c === 133 ||
+      c === 5760 || (c >= 8192 && c <= 8203) || c === 8239 || c === 8287 ||
+      c === 12288 || c === 65279;
+    const addLine = (text: string) => {
+      const decoded = this.decodeJsxEntities(text, node);
+      acc = acc === undefined ? decoded : `${acc} ${decoded}`;
+    };
+    for (let i = 0; i < raw.length; i++) {
+      const c = raw.charCodeAt(i);
+      if (isLineBreak(c)) {
+        if (firstNonWhitespace !== -1 && lastNonWhitespace !== -1) {
+          addLine(raw.substring(firstNonWhitespace, lastNonWhitespace + 1));
+        }
+        firstNonWhitespace = -1;
+      } else if (!isWhiteSpaceSingleLine(c)) {
+        lastNonWhitespace = i;
+        if (firstNonWhitespace === -1) firstNonWhitespace = i;
+      }
+    }
+    if (firstNonWhitespace !== -1) addLine(raw.substring(firstNonWhitespace));
+    return acc ?? "";
+  }
+
+  private lowerJsxTag(ctx: FnCtx, node: ts.JsxOpeningLikeElement): number {
+    const tag = node.tagName;
+    if (ts.isIdentifier(tag)) {
+      const text = tag.text;
+      const first = text.charCodeAt(0);
+      if ((first >= 97 && first <= 122) || text.includes("-")) {
+        const dst = this.newLocal(ctx, "reference", "jsx.tag");
+        ctx.body.push({ kind: "Const", dst, value: { kind: "Str", value: text } });
+        return dst;
+      }
+      return this.lowerIdentifier(ctx, tag);
+    }
+    if (ts.isPropertyAccessExpression(tag)) return this.lowerExpr(ctx, tag);
+    if (tag.kind === ts.SyntaxKind.ThisKeyword) return this.lowerExpr(ctx, tag as ts.Expression);
+    this.unsupported(tag, `JSX tag ${ts.SyntaxKind[tag.kind]}`);
+    const dst = this.newLocal(ctx, "reference");
+    ctx.body.push({ kind: "Const", dst, value: { kind: "Undef" } });
+    return dst;
+  }
+
+  private lowerJsxProps(ctx: FnCtx, node: ts.JsxOpeningLikeElement): number {
+    const site = this.site++;
+    const dst = this.newLocal(ctx, "reference", "jsx.props");
+    const hasSpread = node.attributes.properties.some((p) => ts.isJsxSpreadAttribute(p));
+    this.labels[site] = `jsx-props@${ctx.name}`;
+    this.recordSite(site, "object", this.inLoop(node) ? "many" : "once", !hasSpread, node);
+    ctx.body.push({ kind: "AllocObject", dst, typeId: 0, site });
+    for (const attr of node.attributes.properties) {
+      if (ts.isJsxSpreadAttribute(attr)) {
+        const src = this.lowerExpr(ctx, attr.expression);
+        ctx.body.push({ kind: "ObjectCopyProps", dst, src });
+        continue;
+      }
+      if (!ts.isIdentifier(attr.name)) {
+        this.unsupported(attr, "JSX namespaced attribute");
+        continue;
+      }
+      let value: number;
+      if (!attr.initializer) {
+        value = this.newLocal(ctx, "primitive");
+        ctx.body.push({ kind: "Const", dst: value, value: { kind: "Bool", value: true } });
+      } else if (ts.isStringLiteral(attr.initializer)) {
+        value = this.newLocal(ctx, "reference");
+        ctx.body.push({ kind: "Const", dst: value,
+          value: { kind: "Str", value: this.decodeJsxEntities(attr.initializer.text, attr.initializer) } });
+      } else if (ts.isJsxExpression(attr.initializer)) {
+        if (!attr.initializer.expression) {
+          this.unsupported(attr, "empty JSX attribute expression");
+          continue;
+        }
+        value = this.lowerExpr(ctx, attr.initializer.expression);
+      } else {
+        value = this.lowerExpr(ctx, attr.initializer as ts.Expression);
+      }
+      ctx.body.push({ kind: "StoreField", obj: dst, field: this.internField(attr.name.text), src: value });
+    }
+    return dst;
+  }
+
+  private lowerJsxChildren(ctx: FnCtx, children: readonly ts.JsxChild[]): number[] {
+    const out: number[] = [];
+    for (const child of children) {
+      if (ts.isJsxText(child)) {
+        const text = this.jsxTextValue(child.text, child);
+        if (text.length === 0) continue;
+        const value = this.newLocal(ctx, "reference", "jsx.text");
+        ctx.body.push({ kind: "Const", dst: value, value: { kind: "Str", value: text } });
+        out.push(value);
+      } else if (ts.isJsxExpression(child)) {
+        if (!child.expression) continue; // JSX comment / empty expression
+        if (child.dotDotDotToken) {
+          this.unsupported(child, "spread JSX child");
+          continue;
+        }
+        out.push(this.lowerExpr(ctx, child.expression));
+      } else {
+        out.push(this.lowerExpr(ctx, child as ts.Expression));
+      }
+    }
+    return out;
+  }
+
+  private emitJsxFactoryCall(ctx: FnCtx, node: ts.Node, args: number[]): number {
+    const info = this.jsxFactoryInfo(node);
+    const dst = this.newLocal(ctx, "reference", "jsx");
+    if (!info) return dst;
+    const fn = info.createElementFn;
+    if (fn !== undefined && !this.funcTakesThisIds.has(fn)) {
+      const cells = this.directCallCellArgs(ctx, fn);
+      ctx.body.push({ kind: "Call", dst, callee: { kind: "Direct", func: fn }, args: [...cells, ...args] });
+      return dst;
+    }
+    const recv = this.lowerIdentifier(ctx, info.namespaceName);
+    const callee = this.newLocal(ctx, "reference", "React.createElement");
+    ctx.body.push({ kind: "LoadField", dst: callee, obj: recv, field: this.internField("createElement") });
+    ctx.body.push({ kind: "Call", dst, recv, callee: { kind: "Value", local: callee }, args });
+    return dst;
+  }
+
+  private lowerJsxElement(ctx: FnCtx, node: ts.JsxElement | ts.JsxSelfClosingElement): number {
+    const opening = ts.isJsxElement(node) ? node.openingElement : node;
+    const type = this.lowerJsxTag(ctx, opening);
+    const props = this.lowerJsxProps(ctx, opening);
+    const children = ts.isJsxElement(node) ? this.lowerJsxChildren(ctx, node.children) : [];
+    return this.emitJsxFactoryCall(ctx, node, [type, props, ...children]);
+  }
+
+  private lowerJsxFragment(ctx: FnCtx, node: ts.JsxFragment): number {
+    const type = this.jsxExportValue(ctx, node, "Fragment");
+    const props = this.newLocal(ctx, "reference", "jsx.fragment.props");
+    const site = this.site++;
+    this.labels[site] = `jsx-fragment-props@${ctx.name}`;
+    this.recordSite(site, "object", this.inLoop(node) ? "many" : "once", true, node);
+    ctx.body.push({ kind: "AllocObject", dst: props, typeId: 0, site });
+    const children = this.lowerJsxChildren(ctx, node.children);
+    return this.emitJsxFactoryCall(ctx, node, [type ?? props, props, ...children]);
+  }
+
   lowerExpr(ctx: FnCtx, node: ts.Expression, hint?: string): number {
     // Optional-chaining: a guard receiver whose value was already computed once
     // returns its memoized local (no re-evaluation, preserving side effects).
@@ -2798,6 +3047,8 @@ class Exporter {
     // assertion) and `x satisfies T`. Same erasure as `x as T`.
     if (ts.isTypeAssertionExpression(node)) return this.lowerExpr(ctx, node.expression, hint);
     if ((ts as any).isSatisfiesExpression?.(node)) return this.lowerExpr(ctx, (node as any).expression, hint);
+    if (ts.isJsxElement(node) || ts.isJsxSelfClosingElement(node)) return this.lowerJsxElement(ctx, node);
+    if (ts.isJsxFragment(node)) return this.lowerJsxFragment(ctx, node);
     if (node.kind === ts.SyntaxKind.RegularExpressionLiteral) {
       const lowered = this.lowerRegExpLiteralObject(ctx, node, node.getText(), hint);
       if (lowered !== undefined) return lowered;
@@ -5049,27 +5300,48 @@ class Exporter {
       return res;
     }
     if (ts.isTemplateExpression(node)) {
-      // `head${e1}mid${e2}tail` -> head + str(e1) + mid + str(e2) + tail.
-      // Template substitution applies ToString (string hint -> toString first) to
-      // each expression, NOT `+`'s ToPrimitive(default) (valueOf first). Coerce
-      // each interpolation explicitly via string.coerce (ts_to_string_v) so an
-      // object's toString — not valueOf — drives the conversion; both `+` operands
-      // are then strings (pure concat).
-      let acc = this.newLocal(ctx, "reference");
-      ctx.body.push({ kind: "Const", dst: acc, value: { kind: "Str", value: node.head.text } });
+      // AOT template plan: fold side-effect-free primitive substitutions into
+      // adjacent static text, evaluate every remaining substitution followed
+      // immediately by ToString, then allocate/copy the complete result once via
+      // string.concatMany. Keeping string.coerce beside lowerExpr preserves the
+      // spec-observable order between one substitution's ToString and evaluation
+      // of the next substitution.
+      const parts: number[] = [];
+      let pendingStatic = node.head.text;
+      const flushStatic = () => {
+        if (pendingStatic.length === 0) return;
+        const lit = this.newLocal(ctx, "reference");
+        ctx.body.push({ kind: "Const", dst: lit, value: { kind: "Str", value: pendingStatic } });
+        parts.push(lit);
+        pendingStatic = "";
+      };
       for (const span of node.templateSpans) {
+        const folded = this.constTemplateString(span.expression);
+        if (folded !== undefined) {
+          pendingStatic += folded;
+          pendingStatic += span.literal.text;
+          continue;
+        }
+        flushStatic();
         const raw = this.lowerExpr(ctx, span.expression);
         const e = this.newLocal(ctx, "reference");
         ctx.body.push({ kind: "CallBuiltinStatic", dst: e, builtin: "string.coerce", args: [raw] });
-        const sum1 = this.newLocal(ctx, "reference");
-        ctx.body.push({ kind: "BinOp", dst: sum1, op: "+", lhs: acc, rhs: e });
-        const lit = this.newLocal(ctx, "reference");
-        ctx.body.push({ kind: "Const", dst: lit, value: { kind: "Str", value: span.literal.text } });
-        const sum2 = this.newLocal(ctx, "reference");
-        ctx.body.push({ kind: "BinOp", dst: sum2, op: "+", lhs: sum1, rhs: lit });
-        acc = sum2;
+        parts.push(e);
+        pendingStatic = span.literal.text;
       }
-      return acc;
+      flushStatic();
+      if (parts.length === 1) return parts[0];
+      // A TemplateExpression always contains at least one substitution. The only
+      // way to have no parts is for all substitutions and static chunks to fold
+      // to the empty string.
+      if (parts.length === 0) {
+        const empty = this.newLocal(ctx, "reference");
+        ctx.body.push({ kind: "Const", dst: empty, value: { kind: "Str", value: "" } });
+        return empty;
+      }
+      const out = this.newLocal(ctx, "reference");
+      ctx.body.push({ kind: "CallBuiltinStatic", dst: out, builtin: "string.concatMany", args: parts });
+      return out;
     }
     if (ts.isNumericLiteral(node)) {
       const dst = this.newLocal(ctx, "primitive");

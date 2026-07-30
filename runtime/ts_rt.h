@@ -29,8 +29,12 @@
 
 #if defined(__GNUC__) || defined(__clang__)
 #define TS_RT_ALWAYS_INLINE static inline __attribute__((always_inline))
+#define TS_RT_LIKELY(x) __builtin_expect(!!(x), 1)
+#define TS_RT_UNLIKELY(x) __builtin_expect(!!(x), 0)
 #else
 #define TS_RT_ALWAYS_INLINE static inline
+#define TS_RT_LIKELY(x) (x)
+#define TS_RT_UNLIKELY(x) (x)
 #endif
 
 #if defined(TSAOT_USE_MIMALLOC)
@@ -57,7 +61,10 @@ enum {
   TS_SEL_FUNC   = 0xFFFAU,
   TS_SEL_BOOL   = 0xFFFBU,
   TS_SEL_UNDEF  = 0xFFFCU,
-  TS_SEL_NULL   = 0xFFFDU
+  TS_SEL_NULL   = 0xFFFDU,
+  /* Up to five ASCII bytes plus a three-bit length fit in the 48-bit payload.
+     This selector is a string primitive, but not a heap reference. */
+  TS_SEL_SHORTSTR = 0xFFFEU
 };
 #define TS_BOX(sel, payload) ((((uint64_t)(sel)) << TS_SEL_SHIFT) | ((uint64_t)(payload) & TS_PAYLOAD_MASK))
 
@@ -68,7 +75,7 @@ static inline tsv ts_num(double d) {
     v = 0x7FF8000000000000ULL; /* canonicalize a NaN that looks boxed */
   return v;
 }
-static inline int ts_is_num(tsv v) { uint16_t t = TS_TOP16(v); return t < TS_SEL_OBJECT || t > TS_SEL_NULL; }
+static inline int ts_is_num(tsv v) { uint16_t t = TS_TOP16(v); return t < TS_SEL_OBJECT || t > TS_SEL_SHORTSTR; }
 static inline double ts_to_num(tsv v) { double d; memcpy(&d, &v, 8); return d; }
 /* JS ToInt32 / ToUint32 (ECMA-262): NaN/Inf -> 0; truncate toward zero; reduce
    modulo 2^32; interpret as signed/unsigned 32-bit. Used by bitwise operators. */
@@ -127,8 +134,25 @@ static inline tsv ts_obj(void* p) { return ts_heap_ref_value(TS_SEL_OBJECT, p); 
 static inline tsv ts_str_v(void* p){ return ts_heap_ref_value(TS_SEL_STRING, p); }
 static inline tsv ts_func_v(void* p){return ts_heap_ref_value(TS_SEL_FUNC,   p); }
 static inline int ts_is_obj(tsv v) { return TS_TOP16(v) == TS_SEL_OBJECT; }
-static inline int ts_is_str(tsv v) { return TS_TOP16(v) == TS_SEL_STRING; }
+static inline int ts_is_heap_str(tsv v) { return TS_TOP16(v) == TS_SEL_STRING; }
+static inline int ts_is_short_str(tsv v) { return TS_TOP16(v) == TS_SEL_SHORTSTR; }
+static inline int ts_is_str(tsv v) {
+  uint16_t t = TS_TOP16(v);
+  return t == TS_SEL_STRING || t == TS_SEL_SHORTSTR;
+}
 static inline int ts_is_func(tsv v){ return TS_TOP16(v) == TS_SEL_FUNC; }
+#define TS_SHORTSTR_MAX 5u
+static inline uint32_t ts_short_str_len(tsv v){
+  return (uint32_t)((v >> 40) & 7u);
+}
+static inline uint8_t ts_short_str_byte(tsv v, uint32_t i){
+  return (uint8_t)((v >> (i * 8u)) & 0xffu);
+}
+static inline tsv ts_short_str_ascii(const char* data, uint32_t len){
+  uint64_t payload = (uint64_t)len << 40;
+  for (uint32_t i=0;i<len;i++) payload |= (uint64_t)(uint8_t)data[i] << (i * 8u);
+  return TS_BOX(TS_SEL_SHORTSTR, payload);
+}
 /* Proxy: gate generated struct-field access. g_has_proxies is 0 until the first
    Proxy is created, so non-proxy code keeps the direct struct path. Exposed here
    (not file-static) so emitted C can inline `this.field` proxy guards. */
@@ -275,7 +299,11 @@ enum {
   TS_STR_FLAG_STATIC = 1u << 1,
   TS_STR_FLAG_VIEW = 1u << 2,
   TS_STR_FLAG_HASHED = 1u << 3,
-  TS_STR_FLAG_UTF16 = 1u << 4
+  TS_STR_FLAG_UTF16 = 1u << 4,
+  /* Internal-only storage owner for appendable prefix views. A BUFFER value
+     must never be returned as a JavaScript string; public values are VIEW
+     cells whose parent points at this contiguous storage. */
+  TS_STR_FLAG_BUFFER = 1u << 5
 };
 
 typedef struct ts_string {
@@ -291,21 +319,46 @@ typedef struct ts_strview {
   uint32_t len;     /* JS length: UTF-16 code units */
   uint32_t hash;
   uint32_t flags;
+  /* For an immediate short string data==NULL. The first four native-order
+     bytes live here and an optional fifth byte uses hash's low byte (HASHED is
+     clear). This fills the struct's former alignment padding, keeping
+     sizeof(ts_strview)==24 on 64-bit hosts and avoiding a hot-call ABI change. */
+  uint32_t immediate;
 } ts_strview;
+#if UINTPTR_MAX == UINT64_MAX
+typedef char ts_strview_hot_abi_must_stay_24_bytes[
+  sizeof(ts_strview) == 24 ? 1 : -1
+];
+#endif
 
+static inline const char* ts_str_view_data(const ts_strview* v,
+                                           char scratch[TS_SHORTSTR_MAX]){
+  if (v->data) return v->data;
+  uint32_t first = v->len < 4u ? v->len : 4u;
+  memcpy(scratch, &v->immediate, first);
+  if (v->len > 4u) scratch[4] = (char)(v->hash & 0xffu);
+  return scratch;
+}
 static inline uint32_t ts_str_unit_size_flags(uint32_t flags){
   return (flags & TS_STR_FLAG_UTF16) ? 2u : 1u;
 }
 static inline uint32_t ts_str_storage_len_flags(uint32_t flags, uint32_t len){
   return len * ts_str_unit_size_flags(flags);
 }
-static inline uint16_t ts_str_cu_at_view(ts_strview v, uint32_t i){
+static inline uint16_t ts_str_cu_at_contiguous(ts_strview v, uint32_t i){
   if (v.flags & TS_STR_FLAG_UTF16){
     uint16_t cu;
     memcpy(&cu, v.data + ((size_t)i * 2u), sizeof(cu));
     return cu;
   }
   return (uint16_t)(unsigned char)v.data[i];
+}
+static inline uint16_t ts_str_cu_at_view(ts_strview v, uint32_t i){
+  if (TS_RT_UNLIKELY(!v.data)){
+    if (i < 4u) return (uint16_t)((const unsigned char*)&v.immediate)[i];
+    return (uint16_t)(v.hash & 0xffu);
+  }
+  return ts_str_cu_at_contiguous(v, i);
 }
 static inline void ts_str_cu_set(char* data, uint32_t flags, uint32_t i, uint16_t cu){
   if (flags & TS_STR_FLAG_UTF16){
@@ -318,7 +371,7 @@ static inline int ts_str_same_storage_width(ts_strview a, ts_strview b){
   return ((a.flags ^ b.flags) & TS_STR_FLAG_UTF16) == 0;
 }
 static inline int ts_str_unit_eq_at(ts_strview xs, uint32_t xi, ts_strview ns, uint32_t ni){
-  if (ts_str_same_storage_width(xs, ns)){
+  if (xs.data && ns.data && ts_str_same_storage_width(xs, ns)){
     uint32_t w = ts_str_unit_size_flags(xs.flags);
     return memcmp(xs.data + (size_t)xi * w, ns.data + (size_t)ni * w, w) == 0;
   }
@@ -326,7 +379,7 @@ static inline int ts_str_unit_eq_at(ts_strview xs, uint32_t xi, ts_strview ns, u
 }
 static inline int ts_str_region_eq(ts_strview xs, uint32_t xi, ts_strview ns, uint32_t ni, uint32_t len){
   if (len == 0) return 1;
-  if (ts_str_same_storage_width(xs, ns)){
+  if (xs.data && ns.data && ts_str_same_storage_width(xs, ns)){
     uint32_t w = ts_str_unit_size_flags(xs.flags);
     return memcmp(xs.data + (size_t)xi * w, ns.data + (size_t)ni * w, (size_t)len * w) == 0;
   }
@@ -338,9 +391,14 @@ static inline int ts_str_region_eq(ts_strview xs, uint32_t xi, ts_strview ns, ui
 static inline long long ts_str_find_unit_view(ts_strview xs, uint16_t wanted, uint32_t pos, uint32_t len){
   if (pos > xs.len) return -1;
   if (len > xs.len - pos) len = xs.len - pos;
-  if (!(xs.flags & TS_STR_FLAG_UTF16) && wanted <= 0xffu){
+  if (xs.data && !(xs.flags & TS_STR_FLAG_UTF16) && wanted <= 0xffu){
     const char* hit = memchr(xs.data + pos, (int)wanted, len);
     return hit ? (long long)(hit - xs.data) : -1;
+  }
+  if (xs.data){
+    for (uint32_t i=pos;i<pos+len;i++)
+      if (ts_str_cu_at_contiguous(xs, i) == wanted) return (long long)i;
+    return -1;
   }
   for (uint32_t i=pos;i<pos+len;i++) if (ts_str_cu_at_view(xs, i) == wanted) return (long long)i;
   return -1;
@@ -353,22 +411,42 @@ static inline ts_string* ts_str_ptr_typed(tsv s){
   return (ts_string*)ts_ptr(s);
 }
 static inline ts_string* ts_str_ptr(tsv s){
-  return ts_is_str(s) ? (ts_string*)ts_ptr(s) : NULL;
+  return ts_is_heap_str(s) ? (ts_string*)ts_ptr(s) : NULL;
 }
 static inline ts_strview ts_str_view_typed(tsv s){
+  if (TS_RT_UNLIKELY(ts_is_short_str(s))){
+    uint32_t len = ts_short_str_len(s);
+    ts_strview v = { NULL, len, len > 4u ? ts_short_str_byte(s, 4) : 0,
+                     TS_STR_FLAG_ASCII, 0 };
+    char* bytes = (char*)&v.immediate;
+    for (uint32_t i=0;i<len && i<4u;i++) bytes[i] = (char)ts_short_str_byte(s, i);
+    return v;
+  }
   ts_string* x = ts_str_ptr_typed(s);
   if (x->flags & TS_STR_FLAG_VIEW){
     ts_strview p = ts_str_view_typed(x->parent);
     uint32_t storage_flags = p.flags & (TS_STR_FLAG_ASCII | TS_STR_FLAG_UTF16);
+    if (!p.data){
+      ts_strview v = { NULL, x->len, x->hash,
+        (x->flags & ~(TS_STR_FLAG_ASCII | TS_STR_FLAG_UTF16)) | storage_flags, 0 };
+      char* bytes = (char*)&v.immediate;
+      for (uint32_t i=0;i<x->len;i++){
+        uint32_t cu = ts_str_cu_at_view(p, x->offset + i);
+        if (i < 4u) bytes[i] = (char)cu;
+        else v.hash = cu;
+      }
+      return v;
+    }
     ts_strview v = {
       p.data + ((size_t)x->offset * ts_str_unit_size_flags(p.flags)),
       x->len,
       x->hash,
-      (x->flags & ~(TS_STR_FLAG_ASCII | TS_STR_FLAG_UTF16)) | storage_flags
+      (x->flags & ~(TS_STR_FLAG_ASCII | TS_STR_FLAG_UTF16)) | storage_flags,
+      0
     };
     return v;
   }
-  ts_strview v = { x->data, x->len, x->hash, x->flags };
+  ts_strview v = { x->data, x->len, x->hash, x->flags, 0 };
   return v;
 }
 static inline int ts_str_view(tsv s, ts_strview* out){
@@ -377,20 +455,25 @@ static inline int ts_str_view(tsv s, ts_strview* out){
   return 1;
 }
 static inline const char* ts_str_data_typed(tsv s){
-  return ts_str_view_typed(s).data;
+  return ts_is_heap_str(s) ? ts_str_view_typed(s).data : NULL;
 }
 static inline uint32_t ts_str_hash_typed(tsv s){
-  return ts_str_ptr_typed(s)->hash;
+  return ts_is_short_str(s) ? 0 : ts_str_view_typed(s).hash;
 }
 static inline uint32_t ts_str_flags_typed(tsv s){
-  return ts_str_ptr_typed(s)->flags;
+  return ts_str_view_typed(s).flags;
 }
 
 static inline uint32_t ts_str_len_fast(tsv s){
-  return ts_is_str(s) ? ts_str_ptr_typed(s)->len : 0;
+  if (!ts_is_str(s)) return 0;
+  return TS_RT_UNLIKELY(ts_is_short_str(s))
+    ? ts_short_str_len(s)
+    : ts_str_ptr_typed(s)->len;
 }
 static inline uint32_t ts_str_len_typed(tsv s){
-  return ts_str_ptr_typed(s)->len;
+  return TS_RT_UNLIKELY(ts_is_short_str(s))
+    ? ts_short_str_len(s)
+    : ts_str_ptr_typed(s)->len;
 }
 static inline long long ts_i64_decimal_len_nonneg(long long x){
   if (x < 10LL) return 1;
@@ -446,7 +529,7 @@ static inline long long ts_str_find_forward_view(ts_strview xs, ts_strview ns, l
   if (start < 0) start = 0;
   if (ns.len == 0) return start > (long long)xs.len ? (long long)xs.len : start;
   if (ns.len > xs.len || start > (long long)xs.len - (long long)ns.len) return -1;
-  if (ts_str_same_storage_width(xs, ns)){
+  if (xs.data && ns.data && ts_str_same_storage_width(xs, ns)){
     uint32_t w = ts_str_unit_size_flags(xs.flags);
     const char* xdata = xs.data;
     const char* ndata = ns.data;
@@ -467,15 +550,15 @@ static inline long long ts_str_find_forward_view(ts_strview xs, ts_strview ns, l
       return -1;
     }
     (void)xdata; (void)ndata;
-    uint16_t first = ts_str_cu_at_view(ns, 0);
+    uint16_t first = ts_str_cu_at_contiguous(ns, 0);
     if (ns.len == 1){
-      for (uint32_t i=(uint32_t)start;i<xs.len;i++) if (ts_str_cu_at_view(xs, i) == first) return (long long)i;
+      for (uint32_t i=(uint32_t)start;i<xs.len;i++) if (ts_str_cu_at_contiguous(xs, i) == first) return (long long)i;
       return -1;
     }
-    uint16_t last = ts_str_cu_at_view(ns, ns.len - 1);
+    uint16_t last = ts_str_cu_at_contiguous(ns, ns.len - 1);
     for (uint32_t i=(uint32_t)start;i<=xs.len-ns.len;i++){
-      if (ts_str_cu_at_view(xs, i) == first &&
-          ts_str_cu_at_view(xs, i + ns.len - 1) == last &&
+      if (ts_str_cu_at_contiguous(xs, i) == first &&
+          ts_str_cu_at_contiguous(xs, i + ns.len - 1) == last &&
           ts_str_region_eq(xs, i + 1, ns, 1, ns.len - 2)) return (long long)i;
     }
     return -1;
@@ -498,6 +581,17 @@ static inline long long ts_str_find_backward_view(ts_strview xs, ts_strview ns, 
   if (ns.len > xs.len) return -1;
   if (start > maxstart) start = maxstart;
   if (start < 0) return -1;
+  if (xs.data && ns.data && ts_str_same_storage_width(xs, ns)){
+    uint16_t first = ts_str_cu_at_contiguous(ns, 0);
+    uint16_t last = ts_str_cu_at_contiguous(ns, ns.len - 1);
+    for (long long i = start; i >= 0; i--){
+      if (ts_str_cu_at_contiguous(xs, (uint32_t)i) == first &&
+          (ns.len == 1 ||
+           (ts_str_cu_at_contiguous(xs, (uint32_t)i + ns.len - 1) == last &&
+            ts_str_region_eq(xs, (uint32_t)i + 1, ns, 1, ns.len - 1)))) return i;
+    }
+    return -1;
+  }
   uint16_t first = ts_str_cu_at_view(ns, 0);
   uint16_t last = ts_str_cu_at_view(ns, ns.len - 1);
   for (long long i = start; i >= 0; i--){
@@ -1237,8 +1331,8 @@ static inline tsv* ts_frame_slots(ts_frame_hdr* frame){
 }
 void ts_frame_restore(ts_frame_hdr* frame);
 static inline void ts_write_barrier(tsv owner, tsv value){
-  if (!(ts_is_obj(value)||ts_is_func(value)||ts_is_str(value))) return;
-  if (!(ts_is_obj(owner)||ts_is_func(owner)||ts_is_str(owner))) return;
+  if (!(ts_is_obj(value)||ts_is_func(value)||ts_is_heap_str(value))) return;
+  if (!(ts_is_obj(owner)||ts_is_func(owner)||ts_is_heap_str(owner))) return;
   ts_gc_header* o = (ts_gc_header*)ts_ptr(owner);
   ts_gc_header* v = (ts_gc_header*)ts_ptr(value);
   if (o->gen == TS_GEN_OLD && v->gen == TS_GEN_YOUNG) ts_gc_remember(o);

@@ -3285,3 +3285,100 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   within budget (PIC 94 ms, dictionary 96 ms); frozen parity **330 identical +
   15 KNOWN, DIFF=0, UNPORTED=0**; self-conformance **343 PASS + 2 KNOWN,
   DIFF=0, CCFAIL=0, UNPORTED=0**.
+
+### Session 325: AOT TSX, React SSR subset, getServerSideProps, and Pages Router
+
+- **Raw TSX lowering**: the exporter now preserves JSX and lowers intrinsic/component
+  elements, property-access components, fragments, attributes, object-spread props,
+  normalized text, expression/nested children, comments, and common/numeric entities.
+  A bundled `import * as React` resolves `createElement` to a direct AOT function call;
+  JSX props use static field shapes before ordered `ObjectCopyProps` spreads.
+  Namespaced attributes, spread children, unsupported factories, and unknown named
+  entities reject loudly.
+- **AOT string planning**: template expressions fold safe primitive constants, coerce
+  every dynamic substitution immediately in observable source order, and emit one
+  `string.concatMany` instead of a left-deep chain. Fully static templates become one
+  static literal. New IR-inspection gates pin both the concat plan and JSX's direct
+  factory/static-props paths.
+- **Runtime string fast path**: concat/add/join derive ASCII/UTF-16 flags from their
+  inputs and compute content hashes lazily; flat strings cache the hash on demand.
+  Concat/join use a 16-value stack parts buffer with heap fallback. In the controlled
+  `gc_strings` A/B using identical generated C, best warm time improved from roughly
+  1.0 s to 29 ms. Allocation remains about 536.5 MB: this session did **not** add ropes,
+  extendable string buffers, or immediate short strings, so repeated append allocation
+  is still a follow-up.
+- **React subset in TypeScript**: added `createElement`, `Fragment`, function
+  components, intrinsic rendering, arrays/fragments, HTML escaping, attribute handling,
+  and `renderToString`. The TSX integration fixture exercises component identifiers,
+  property access, spreads, attributes, entities, comments, conditionals, and nested
+  arrays under both Node and Garnet.
+- **Old-style SSR**: added a typed `getServerSideProps` runner accepting sync or Promise
+  loaders. `{props}` renders a 200 response, `{notFound:true}` returns 404, redirects
+  select 307/308 or an explicit status, and malformed results throw `TypeError`.
+- **Pages Router subset**: added explicit route registration, `/`, static routes,
+  `[param]`, terminal `[...slug]`, query/context construction, custom 404 rendering,
+  pages with or without loaders, and static-over-dynamic precedence independent of
+  registration order. It intentionally omits filesystem discovery, Node request/
+  response construction, optional catch-alls, decoding/repeated-query arrays,
+  middleware/API routes/layouts, and client navigation.
+- **Documentation**: added `docs/jsx_react_ssr_design.md` and updated the syntax
+  coverage table with the supported classic JSX boundary and AOT behavior.
+- **Verification**: typed conformance **349/349**; untyped conformance **349/349**;
+  bundler **40/40** including typed and explicit untyped React/SSR/Pages Router E2E;
+  runtime and analyzer unit suites; GC stress O2 **20/20**, ASan **20/20**, and runtime
+  ASan; frozen parity **331 identical + 15 KNOWN, DIFF=0, UNPORTED=0**;
+  self-conformance **344 PASS + 2 KNOWN, DIFF=0, CCFAIL=0, UNPORTED=0**;
+  benchmark **101/101** within budget; and `ci_fast` including both new AOT gates.
+- **Next**: if allocation pressure remains material after the new concat plan, implement
+  the measured extendable-buffer design from `runtime_perf_plan.md`; evaluate an
+  immediate short-string encoding only as a separate value-layout/GC change with its
+  own compatibility and scale gates.
+
+### Session 326: Extendable flat strings and allocation-free short strings
+
+- **Measured sequence**: fixed the current lazy-hash baseline at **31 ms / 536.5 MB**
+  on `gc_strings`, implemented the contiguous builder first, then remeasured before
+  changing the value representation. Builder-only reached **23 ms / 33.3 MB**; the
+  final builder + short-immediate runtime reached **12 ms / 18.0 MB**.
+- **Extendable buffer**: added internal `TS_STR_FLAG_BUFFER` storage owners and public
+  zero-offset prefix views. Only a view whose length equals the parent's high-water
+  mark may append. Branched histories therefore copy instead of overwriting a live
+  prefix. Capacity comes from the GC cell size, grows geometrically, preserves one
+  trailing NUL, and never changes Latin-1/UTF-16 width in place.
+- **GC correctness**: EXTEND allocates its result view before mutating the rooted
+  parent and re-fetches all moving pointers after the safepoint. FRESH roots its new
+  buffer before allocating the view, then re-fetches inputs before copying. Existing
+  VIEW parent marking traces buffers without a new GC cell kind.
+- **Immediate short strings**: reserved NaN-box selector `0xFFFE` for zero-to-five
+  code-unit ASCII strings. Bytes occupy payload bits 0–39 and length bits 40–42.
+  These values satisfy `ts_is_str` but not `ts_is_heap_str`, so GC and barriers never
+  interpret the payload as a pointer. Runtime literals/conversions, concat,
+  concatMany, slices, repeat, and short joins use the representation.
+- **Hot ABI correction**: the first immediate-view draft grew `ts_strview` from 24 to
+  32 bytes and moved `string_unicode_search_kernel` from its ~80–90 ms range to
+  108 ms. The final view stores four bytes in former padding and the fifth in the
+  unhashed hash byte, retains a compile-time-asserted 24-byte size, adds unlikely
+  annotations/contiguous fast readers, and restored the kernel to **86–87 ms**.
+- **Old-emitter compatibility bug caught by the milestone**: full self-conformance
+  initially found five frozen-emitter failures. Three runtime sites (`Array.from`
+  string iteration and string own-descriptor walkers) still called `ts_ptr` after
+  `ts_is_str`; immediate values exposed the invalid assumption. All were converted to
+  string accessors. The five focused fixtures and the final full self-conformance now
+  pass with no unexpected differences.
+- **Decision counters**: final `gc_strings` recorded **223,200 extensions**, **750
+  fresh buffers**, **901 remaining flat concats**, and **225,150 immediate short
+  results**. This is direct evidence that the two representations cover the hot
+  construction paths.
+- **Scale and semantic coverage**: added `strings/concat_growth.ts`,
+  `strings/short_immediate.ts`, and a dedicated 64 MiB branch/slice/checksum fixture.
+  The scale gate runs with young-GC threshold 1 under both O2 and ASan. Runtime units
+  pin selector identity and the five/six-character boundary.
+- **Rope decision**: **not implemented**. With allocation down by ~96.6% and wall time
+  down by ~61% versus the already-optimized 31 ms baseline, the remaining profile
+  does not justify non-contiguous readers, flattening, balancing, or new GC traversal.
+  Reconsider only under the triggers recorded in `string_builder_short_design.md`.
+- **Verification**: typed conformance **351/351**; untyped conformance **351/351**;
+  typed and untyped bundler **40/40**; GC stress O2 **21/21**, ASan **21/21**, runtime
+  ASan, and 64 MiB O2/ASan scale; runtime/analyzer units; benchmark **101/101**;
+  frozen parity **333 identical + 15 KNOWN, DIFF=0, UNPORTED=0**; self-conformance
+  **346 PASS + 2 KNOWN, DIFF=0, CCFAIL=0, UNPORTED=0**; and `ci_fast`.

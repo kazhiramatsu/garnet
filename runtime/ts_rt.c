@@ -123,6 +123,7 @@ static struct {
   unsigned long long nursery_aged, unpooled_aged;   /* survivors kept YOUNG by aging */
   unsigned long long call_env_malloc, construct_malloc;
   unsigned long long concat_calls, concat_bytes;
+  unsigned long long sb_extend, sb_fresh, sb_flat, short_string;
   unsigned long long intern_calls, intern_probes;
   unsigned long long map_find_calls, map_find_probes, map_find_hist[9];
   unsigned long long find_prop_calls, find_prop_probes, find_prop_hist[9];
@@ -168,6 +169,9 @@ __attribute__((destructor)) static void ts_rt_stats_dump(void){
   fprintf(out, "[rt_stats] ts_call env_malloc=%llu construct_malloc=%llu | concat: calls=%llu bytes=%llu\n",
           g_rt_stats.call_env_malloc, g_rt_stats.construct_malloc,
           g_rt_stats.concat_calls, g_rt_stats.concat_bytes);
+  fprintf(out, "[rt_stats] string_builder: extend=%llu fresh=%llu flat=%llu short=%llu\n",
+          g_rt_stats.sb_extend, g_rt_stats.sb_fresh, g_rt_stats.sb_flat,
+          g_rt_stats.short_string);
   rt_stats_hist_line(out, "map_find", g_rt_stats.map_find_calls, g_rt_stats.map_find_probes, g_rt_stats.map_find_hist);
   rt_stats_hist_line(out, "find_prop", g_rt_stats.find_prop_calls, g_rt_stats.find_prop_probes, g_rt_stats.find_prop_hist);
   rt_stats_hist_line(out, "class_reg", g_rt_stats.class_reg_calls, g_rt_stats.class_reg_probes, g_rt_stats.class_reg_hist);
@@ -202,7 +206,7 @@ __attribute__((destructor)) static void ts_rt_stats_dump(void){
    each full collection retarget the next trigger from the live byte size. */
 #define TS_GC_MIN_FULL_BYTES ((size_t)4u * 1024u * 1024u)
 
-static inline int ts_heap_ref(tsv v){ return ts_is_obj(v)||ts_is_func(v)||ts_is_str(v); }
+static inline int ts_heap_ref(tsv v){ return ts_is_obj(v)||ts_is_func(v)||ts_is_heap_str(v); }
 static inline int gc_kind_valid(uint8_t k){
   return k >= TS_KIND_OBJECT && k <= TS_KIND_SYMBOL;
 }
@@ -246,7 +250,7 @@ static inline void gc_unpin_value(tsv v){
   if (h && (h->gen == TS_GEN_YOUNG || h->gen == TS_GEN_OLD) && h->pin_depth) h->pin_depth--;
 }
 static void gc_pin_string_storage(tsv v){
-  while (ts_is_str(v)){
+  while (ts_is_heap_str(v)){
     gc_pin_value(v);
     ts_string* s = ts_str_ptr_typed(v);
     if (!(s->flags & TS_STR_FLAG_VIEW)) return;
@@ -254,7 +258,7 @@ static void gc_pin_string_storage(tsv v){
   }
 }
 static void gc_unpin_string_storage(tsv v){
-  while (ts_is_str(v)){
+  while (ts_is_heap_str(v)){
     gc_unpin_value(v);
     ts_string* s = ts_str_ptr_typed(v);
     if (!(s->flags & TS_STR_FLAG_VIEW)) return;
@@ -1404,14 +1408,14 @@ static int ts_string_own_prop(tsv obj, ts_key key, tsv* out){
   if (!ts_is_str(obj)) return 0;
   const char* nm = ts_field_name(key);
   if (!nm) return 0;
-  ts_string* s = ts_ptr(obj);
+  uint32_t str_len = ts_str_len_typed(obj);
   uint32_t nm_len = ts_field_name_len(key);
   if (field_bytes_is(nm, nm_len, "length")){
-    if (out) *out = ts_num((double)s->len);
+    if (out) *out = ts_num((double)str_len);
     return 1;
   }
   long ix = ts_canonical_array_index(nm, nm_len);
-  if (ix >= 0 && (uint32_t)ix < s->len){
+  if (ix >= 0 && (uint32_t)ix < str_len){
     if (out) *out = ts_string_slice_view(obj, (uint32_t)ix, 1);
     return 1;
   }
@@ -1518,7 +1522,29 @@ static uint32_t strhash_units(const char* data, uint32_t flags, uint32_t n){
   }
   return h;
 }
-static uint32_t strhash_view(ts_strview v){ return strhash_units(v.data, v.flags, v.len); }
+static uint32_t strhash_view(ts_strview v){
+  uint32_t h=2166136261u;
+  for(uint32_t i=0;i<v.len;i++){
+    uint16_t cu=ts_str_cu_at_view(v,i);
+    h^=(uint8_t)(cu&0xffu); h*=16777619u;
+    h^=(uint8_t)(cu>>8); h*=16777619u;
+  }
+  return h;
+}
+static uint32_t ts_str_hash_of(tsv s){
+  if (ts_is_short_str(s)) return strhash_view(ts_str_view_typed(s));
+  ts_string* x = ts_str_ptr_typed(s);
+  if ((x->flags & TS_STR_FLAG_HASHED) && !(x->flags & TS_STR_FLAG_VIEW)) return x->hash;
+  uint32_t h = strhash_view(ts_str_view_typed(s));
+  /* A flat GC string owns immutable storage, so cache its first demanded hash.
+     Views stay uncached because their storage flags come from the parent, and
+     static literals are already pre-hashed at compile time. */
+  if (!(x->flags & (TS_STR_FLAG_VIEW | TS_STR_FLAG_STATIC))){
+    x->hash = h;
+    x->flags |= TS_STR_FLAG_HASHED;
+  }
+  return h;
+}
 static uint32_t strflags_storage(const char* data, uint32_t flags, uint32_t n){
   uint32_t f = TS_STR_FLAG_HASHED | (flags & TS_STR_FLAG_UTF16);
   ts_strview v = { data, n, 0, f };
@@ -1537,10 +1563,70 @@ static ts_string* ts_string_alloc_storage(uint32_t len, uint32_t flags){
   memset(str->data + bytes, 0, unit);
   return str;
 }
+
+/* Appendable flat storage. The buffer itself is internal and a JavaScript
+   string always sees a stable-prefix VIEW of it. The allocation size is the
+   capacity source of truth so moving GC can copy the cell without an external
+   side table or pointer fixup. */
+#define TS_SB_MIN 24u
+static uint32_t ts_string_storage_capacity(const ts_string* str){
+  uint32_t unit = ts_str_unit_size_flags(str->flags);
+  if (str->h.size < sizeof(ts_string) + unit) return 0;
+  size_t slots = (str->h.size - sizeof(ts_string)) / unit;
+  if (slots == 0) return 0;
+  slots--; /* preserve one trailing NUL code unit */
+  return slots > UINT32_MAX ? UINT32_MAX : (uint32_t)slots;
+}
+static uint32_t ts_string_builder_capacity(uint32_t used){
+  if (used > UINT32_MAX / 2u) return 0;
+  uint64_t target = (uint64_t)used * 2u;
+  if (target < 32u) target = 32u;
+  uint64_t cap = 32u;
+  while (cap < target && cap < 0x80000000ull) cap <<= 1;
+  if (cap < target) cap = target;
+  return cap <= UINT32_MAX ? (uint32_t)cap : 0;
+}
+static ts_string* ts_string_alloc_buffer(uint32_t capacity, uint32_t flags){
+  ts_string* str = ts_string_alloc_storage(capacity, flags);
+  str->len = 0;
+  str->hash = 0;
+  str->flags = (flags & TS_STR_FLAG_UTF16) | TS_STR_FLAG_BUFFER;
+  return str;
+}
+static ts_string* ts_string_alloc_buffer_view(void){
+  return gc_alloc(sizeof(ts_string) + 1, TS_KIND_STRING);
+}
+static void ts_string_init_buffer_view(ts_string* out, tsv parent, uint32_t len){
+  out->len = len;
+  out->hash = 0;
+  out->flags = TS_STR_FLAG_VIEW;
+  out->parent = parent;
+  out->offset = 0;
+  out->data[0] = 0;
+}
+static void ts_string_write_terminator(ts_string* str, uint32_t pos){
+  uint32_t unit = ts_str_unit_size_flags(str->flags);
+  memset(str->data + (size_t)pos * unit, 0, unit);
+}
+static int ts_string_extendable_parent(tsv lhs, uint32_t result_flags,
+                                       uint32_t result_len, tsv* parent_out){
+  if (!ts_is_heap_str(lhs)) return 0;
+  ts_string* view = ts_str_ptr_typed(lhs);
+  if (!(view->flags & TS_STR_FLAG_VIEW) || view->offset != 0) return 0;
+  tsv parent_v = view->parent;
+  if (!ts_is_heap_str(parent_v)) return 0;
+  ts_string* parent = ts_str_ptr_typed(parent_v);
+  if (!(parent->flags & TS_STR_FLAG_BUFFER)) return 0;
+  if (view->len != parent->len) return 0; /* only the live tail may extend */
+  if (((parent->flags ^ result_flags) & TS_STR_FLAG_UTF16) != 0) return 0;
+  if (result_len > ts_string_storage_capacity(parent)) return 0;
+  *parent_out = parent_v;
+  return 1;
+}
 static void ts_str_copy_units(char* dst, uint32_t dst_flags, uint32_t dst_pos,
                               ts_strview src, uint32_t src_pos, uint32_t len){
   if (len == 0) return;
-  if (((dst_flags ^ src.flags) & TS_STR_FLAG_UTF16) == 0){
+  if (src.data && ((dst_flags ^ src.flags) & TS_STR_FLAG_UTF16) == 0){
     uint32_t w = ts_str_unit_size_flags(dst_flags);
     memcpy(dst + (size_t)dst_pos * w, src.data + (size_t)src_pos * w, (size_t)len * w);
     return;
@@ -1593,43 +1679,26 @@ static void utf8_measure(const char* s, uint32_t len, uint32_t* out_units, int* 
   }
   *out_units = units; *out_latin1 = latin1; *out_ascii = ascii;
 }
-typedef struct {
-  ts_gc_header h;
-  uint32_t len, hash, flags;
-  tsv parent;
-  uint32_t offset;
-  char data[2];
-} ts_static_small_string;
-static ts_static_small_string g_ascii_small_strings[129];
-static int g_ascii_small_strings_inited = 0;
-static void ts_ascii_small_strings_init(void){
-  if (g_ascii_small_strings_inited) return;
-  g_ascii_small_strings_inited = 1;
-  for (uint32_t i=0;i<128;i++){
-    ts_static_small_string* s = &g_ascii_small_strings[i];
-    s->h.kind=TS_KIND_STRING; s->h.mark=0; s->h.gen=TS_GEN_NONHEAP; s->h.remembered=0;
-    s->h.pin_depth=0; s->h.handle=0; s->h.size=0; s->h.gc_next=NULL;
-    char ch = (char)i;
-    s->len=1; s->hash=strhash_units(&ch, 0, 1);
-    s->flags=TS_STR_FLAG_ASCII | TS_STR_FLAG_STATIC | TS_STR_FLAG_HASHED;
-    s->parent=TS_UNDEFINED; s->offset=0; s->data[0]=(char)i; s->data[1]=0;
-  }
-  ts_static_small_string* e = &g_ascii_small_strings[128];
-  e->h.kind=TS_KIND_STRING; e->h.mark=0; e->h.gen=TS_GEN_NONHEAP; e->h.remembered=0;
-  e->h.pin_depth=0; e->h.handle=0; e->h.size=0; e->h.gc_next=NULL;
-  e->len=0; e->hash=strhash_units("", 0, 0);
-  e->flags=TS_STR_FLAG_ASCII | TS_STR_FLAG_STATIC | TS_STR_FLAG_HASHED;
-  e->parent=TS_UNDEFINED; e->offset=0; e->data[0]=0; e->data[1]=0;
-}
 static tsv ts_ascii_small_string(uint32_t len, unsigned char c){
-  ts_ascii_small_strings_init();
-  return ts_str_v(&g_ascii_small_strings[len ? (uint32_t)c : 128u]);
+  char data[1] = { (char)c };
+  return ts_short_str_ascii(data, len ? 1u : 0u);
+}
+static int ts_short_ascii_from_view(ts_strview src, uint32_t start,
+                                    uint32_t len, tsv* out){
+  if (len > TS_SHORTSTR_MAX) return 0;
+  char data[TS_SHORTSTR_MAX];
+  for (uint32_t i=0;i<len;i++){
+    uint16_t cu = ts_str_cu_at_view(src, start + i);
+    if (cu >= 0x80u) return 0;
+    data[i] = (char)cu;
+  }
+  *out = ts_short_str_ascii(data, len);
+  return 1;
 }
 tsv ts_new_string(const char* s, uint32_t len){
   uint32_t units = 0; int latin1 = 1, ascii = 1;
   utf8_measure(s, len, &units, &latin1, &ascii);
-  if (units == 0) return ts_ascii_small_string(0, 0);
-  if (units == 1 && ascii && len == 1) return ts_ascii_small_string(1, (unsigned char)s[0]);
+  if (ascii && units <= TS_SHORTSTR_MAX) return ts_short_str_ascii(s, units);
   uint32_t flags = latin1 ? 0u : TS_STR_FLAG_UTF16;
   ts_string* str=ts_string_alloc_storage(units, flags);
   const unsigned char* p = (const unsigned char*)s;
@@ -1656,8 +1725,7 @@ tsv ts_new_string(const char* s, uint32_t len){
    no-op here since string equality falls back to a byte compare). Used for
    freshly-built ASCII payloads such as JSON.stringify output. */
 static tsv ts_new_string_ascii(const char* s, uint32_t len){
-  if (len == 0) return ts_ascii_small_string(0, 0);
-  if (len == 1) return ts_ascii_small_string(1, (unsigned char)s[0]);
+  if (len <= TS_SHORTSTR_MAX) return ts_short_str_ascii(s, len);
   ts_string* str = ts_string_alloc_storage(len, 0);
   memcpy(str->data, s, len);
   str->flags = TS_STR_FLAG_ASCII; /* 1-byte units, not hashed (lazy) */
@@ -1671,7 +1739,11 @@ static tsv ts_new_string_from_code_units(const uint16_t* units, uint32_t len){
     if (units[i] > 0xffu) latin1 = 0;
     if (units[i] >= 0x80u) ascii = 0;
   }
-  if (len == 1 && ascii) return ts_ascii_small_string(1, (unsigned char)units[0]);
+  if (ascii && len <= TS_SHORTSTR_MAX){
+    char data[TS_SHORTSTR_MAX];
+    for (uint32_t i=0;i<len;i++) data[i] = (char)units[i];
+    return ts_short_str_ascii(data, len);
+  }
   uint32_t flags = latin1 ? 0u : TS_STR_FLAG_UTF16;
   ts_string* str = ts_string_alloc_storage(len, flags);
   for(uint32_t i=0;i<len;i++) ts_str_cu_set(str->data, flags, i, units[i]);
@@ -1776,11 +1848,10 @@ static tsv ts_string_slice_view(tsv src, uint32_t start, uint32_t len){
   if (start > x.len) start = x.len;
   if (len > x.len - start) len = x.len - start;
   if (len == 0){ ts_gc_unroot(1); return ts_ascii_small_string(0, 0); }
-  uint16_t first_cu = ts_str_cu_at_view(x, start);
-  if (len == 1 && first_cu < 0x80u){
-    unsigned char c = (unsigned char)first_cu;
+  tsv short_result;
+  if (ts_short_ascii_from_view(x, start, len, &short_result)){
     ts_gc_unroot(1);
-    return ts_ascii_small_string(1, c);
+    return short_result;
   }
   if (start == 0 && len == x.len){ ts_gc_unroot(1); return src; }
   if (x.len > 65536u && len * 8u < x.len){
@@ -2084,7 +2155,13 @@ tsv ts_symbol_tostring(tsv sym){
   if (!ts_is_symbol(sym)) return ts_new_string("Symbol()", 8);
   ts_symbol* s = (ts_symbol*)ts_ptr(sym);
   const char* d = ""; uint32_t dl = 0;
-  if (ts_is_str(s->description)){ ts_strview ds = ts_str_view_typed(s->description); d = ds.data; dl = ds.len; }
+  ts_strview ds = {0};
+  char ds_short[TS_SHORTSTR_MAX];
+  if (ts_is_str(s->description)){
+    ds = ts_str_view_typed(s->description);
+    d = ts_str_view_data(&ds, ds_short);
+    dl = ds.len;
+  }
   uint32_t n = 8 + dl;   /* "Symbol(" + desc + ")" */
   char* buf = malloc(n+1);
   memcpy(buf, "Symbol(", 7);
@@ -2296,15 +2373,80 @@ tsv ts_add(tsv a, tsv b){
     tsv sb=ts_to_string_v(b);
     ts_gc_root(&sb);
     ts_strview x=ts_str_view_typed(sa), y=ts_str_view_typed(sb);
-    uint32_t n=x.len+y.len;
+    uint64_t n64=(uint64_t)x.len+(uint64_t)y.len;
+    if (n64 > UINT32_MAX){
+      ts_gc_unroot(4);
+      fprintf(stderr, "tsaot: RangeError: concatenated string too large\n");
+      abort();
+    }
+    uint32_t n=(uint32_t)n64;
     uint32_t flags = (x.flags | y.flags) & TS_STR_FLAG_UTF16;
+    int all_ascii = !!(x.flags & TS_STR_FLAG_ASCII) && !!(y.flags & TS_STR_FLAG_ASCII);
     RT_STAT_INC(concat_calls); RT_STAT_ADD(concat_bytes, n);
+    if (all_ascii && n <= TS_SHORTSTR_MAX){
+      char data[TS_SHORTSTR_MAX];
+      for (uint32_t i=0;i<x.len;i++) data[i] = (char)ts_str_cu_at_view(x, i);
+      for (uint32_t i=0;i<y.len;i++) data[x.len+i] = (char)ts_str_cu_at_view(y, i);
+      tsv r = ts_short_str_ascii(data, n);
+      RT_STAT_INC(short_string);
+      ts_gc_unroot(4);
+      return r;
+    }
+
+    /* Linear append history: allocate the public prefix view before mutating
+       its hidden parent, then re-fetch every movable pointer after allocation. */
+    tsv parent_v = TS_UNDEFINED;
+    if (n >= TS_SB_MIN && ts_string_extendable_parent(sa, flags, n, &parent_v)){
+      ts_gc_root(&parent_v);
+      ts_string* out = ts_string_alloc_buffer_view();
+      ts_string* parent = ts_str_ptr_typed(parent_v);
+      y = ts_str_view_typed(sb);
+      uint32_t old_len = parent->len;
+      ts_str_copy_units(parent->data, parent->flags, old_len, y, 0, y.len);
+      parent->len = n;
+      parent->hash = 0;
+      parent->flags = (parent->flags & ~(TS_STR_FLAG_ASCII | TS_STR_FLAG_HASHED)) |
+                      (all_ascii ? TS_STR_FLAG_ASCII : 0);
+      ts_string_write_terminator(parent, n);
+      ts_string_init_buffer_view(out, parent_v, n);
+      tsv r = ts_str_v(out);
+      RT_STAT_INC(sb_extend);
+      ts_gc_unroot(5);
+      return r;
+    }
+
+    /* Start or grow a builder. A copied prefix becomes immutable as soon as a
+       later branch advances the old buffer's high-water mark. */
+    uint32_t capacity = n >= TS_SB_MIN ? ts_string_builder_capacity(n) : 0;
+    if (capacity != 0){
+      ts_string* buffer = ts_string_alloc_buffer(capacity, flags);
+      tsv buffer_v = ts_str_v(buffer);
+      ts_gc_root(&buffer_v);
+      ts_string* out = ts_string_alloc_buffer_view();
+      buffer = ts_str_ptr_typed(buffer_v);
+      x = ts_str_view_typed(sa);
+      y = ts_str_view_typed(sb);
+      ts_str_copy_units(buffer->data, flags, 0, x, 0, x.len);
+      ts_str_copy_units(buffer->data, flags, x.len, y, 0, y.len);
+      buffer->len = n;
+      buffer->hash = 0;
+      buffer->flags = TS_STR_FLAG_BUFFER | flags |
+                      (all_ascii ? TS_STR_FLAG_ASCII : 0);
+      ts_string_write_terminator(buffer, n);
+      ts_string_init_buffer_view(out, buffer_v, n);
+      tsv r = ts_str_v(out);
+      RT_STAT_INC(sb_fresh);
+      ts_gc_unroot(5);
+      return r;
+    }
+
+    RT_STAT_INC(sb_flat);
     ts_string* out = ts_string_alloc_storage(n, flags);
     x=ts_str_view_typed(sa); y=ts_str_view_typed(sb);
     ts_str_copy_units(out->data, flags, 0, x, 0, x.len);
     ts_str_copy_units(out->data, flags, x.len, y, 0, y.len);
-    out->flags = strflags_storage(out->data, flags, n);
-    out->hash = strhash_units(out->data, out->flags, n);
+    out->flags = flags | (all_ascii ? TS_STR_FLAG_ASCII : 0);
+    out->hash = 0; /* lazy: content consumers hash on first demand */
     tsv r=ts_str_v(out); ts_gc_unroot(4); return r;
   }
   if (ts_is_num(a)&&ts_is_num(b)) return ts_num(ts_to_num(a)+ts_to_num(b));
@@ -2324,10 +2466,16 @@ tsv ts_str_concat_many(tsv* args, int n){
     return r;
   }
 
-  tsv* parts = (tsv*)malloc(sizeof(tsv) * (size_t)n);
+  enum { TS_CONCAT_STACK_PARTS = 16 };
+  tsv stack_parts[TS_CONCAT_STACK_PARTS];
+  tsv* parts = n <= TS_CONCAT_STACK_PARTS
+    ? stack_parts
+    : (tsv*)malloc(sizeof(tsv) * (size_t)n);
+  int heap_parts = parts != stack_parts;
   int rooted = 0;
   uint64_t total = 0;
   uint32_t out_flags = 0;
+  int all_ascii = 1;
   for(int i=0;i<n;i++){
     parts[i] = args[i];
     ts_gc_root(&parts[i]);
@@ -2336,20 +2484,98 @@ tsv ts_str_concat_many(tsv* args, int n){
     ts_strview v = ts_str_view_typed(parts[i]);
     total += v.len;
     out_flags |= v.flags & TS_STR_FLAG_UTF16;
+    all_ascii = all_ascii && !!(v.flags & TS_STR_FLAG_ASCII);
     if(total > UINT32_MAX){
       ts_gc_unroot(rooted);
-      free(parts);
+      if (heap_parts) free(parts);
       fprintf(stderr, "tsaot: RangeError: concatenated string too large\n");
       abort();
     }
   }
   if(total == 0){
     ts_gc_unroot(rooted);
-    free(parts);
+    if (heap_parts) free(parts);
     return ts_new_string("",0);
   }
 
   RT_STAT_INC(concat_calls); RT_STAT_ADD(concat_bytes, total);
+
+  if (all_ascii && total <= TS_SHORTSTR_MAX){
+    char data[TS_SHORTSTR_MAX];
+    uint32_t pos = 0;
+    for(int i=0;i<n;i++){
+      ts_strview v = ts_str_view_typed(parts[i]);
+      for (uint32_t j=0;j<v.len;j++) data[pos++] = (char)ts_str_cu_at_view(v, j);
+    }
+    tsv r = ts_short_str_ascii(data, (uint32_t)total);
+    RT_STAT_INC(short_string);
+    ts_gc_unroot(rooted);
+    if (heap_parts) free(parts);
+    return r;
+  }
+
+  ts_strview first = ts_str_view_typed(parts[0]);
+  if (total == first.len){
+    tsv r = parts[0];
+    ts_gc_unroot(rooted);
+    if (heap_parts) free(parts);
+    return r;
+  }
+
+  tsv parent_v = TS_UNDEFINED;
+  if (total >= TS_SB_MIN &&
+      ts_string_extendable_parent(parts[0], out_flags, (uint32_t)total, &parent_v)){
+    ts_gc_root(&parent_v);
+    ts_string* out = ts_string_alloc_buffer_view();
+    ts_string* parent = ts_str_ptr_typed(parent_v);
+    uint32_t pos = parent->len;
+    for(int i=1;i<n;i++){
+      ts_strview v = ts_str_view_typed(parts[i]);
+      ts_str_copy_units(parent->data, parent->flags, pos, v, 0, v.len);
+      pos += v.len;
+    }
+    parent->len = (uint32_t)total;
+    parent->hash = 0;
+    parent->flags = (parent->flags & ~(TS_STR_FLAG_ASCII | TS_STR_FLAG_HASHED)) |
+                    (all_ascii ? TS_STR_FLAG_ASCII : 0);
+    ts_string_write_terminator(parent, (uint32_t)total);
+    ts_string_init_buffer_view(out, parent_v, (uint32_t)total);
+    tsv r = ts_str_v(out);
+    RT_STAT_INC(sb_extend);
+    ts_gc_unroot(rooted + 1);
+    if (heap_parts) free(parts);
+    return r;
+  }
+
+  uint32_t capacity = total >= TS_SB_MIN
+    ? ts_string_builder_capacity((uint32_t)total)
+    : 0;
+  if (capacity != 0){
+    ts_string* buffer = ts_string_alloc_buffer(capacity, out_flags);
+    tsv buffer_v = ts_str_v(buffer);
+    ts_gc_root(&buffer_v);
+    ts_string* out = ts_string_alloc_buffer_view();
+    buffer = ts_str_ptr_typed(buffer_v);
+    uint32_t pos = 0;
+    for(int i=0;i<n;i++){
+      ts_strview v = ts_str_view_typed(parts[i]);
+      ts_str_copy_units(buffer->data, out_flags, pos, v, 0, v.len);
+      pos += v.len;
+    }
+    buffer->len = (uint32_t)total;
+    buffer->hash = 0;
+    buffer->flags = TS_STR_FLAG_BUFFER | out_flags |
+                    (all_ascii ? TS_STR_FLAG_ASCII : 0);
+    ts_string_write_terminator(buffer, (uint32_t)total);
+    ts_string_init_buffer_view(out, buffer_v, (uint32_t)total);
+    tsv r = ts_str_v(out);
+    RT_STAT_INC(sb_fresh);
+    ts_gc_unroot(rooted + 1);
+    if (heap_parts) free(parts);
+    return r;
+  }
+
+  RT_STAT_INC(sb_flat);
   ts_string* out = ts_string_alloc_storage((uint32_t)total, out_flags);
   uint32_t pos = 0;
   for(int i=0;i<n;i++){
@@ -2358,13 +2584,13 @@ tsv ts_str_concat_many(tsv* args, int n){
     pos += v.len;
   }
   out->len = (uint32_t)total;
-  out->flags = strflags_storage(out->data, out_flags, out->len);
-  out->hash = strhash_units(out->data, out->flags, out->len);
+  out->flags = out_flags | (all_ascii ? TS_STR_FLAG_ASCII : 0);
+  out->hash = 0; /* lazy: JSX/SSR output normally goes straight to a sink */
   out->parent = TS_UNDEFINED;
   out->offset = 0;
   tsv r = ts_str_v(out);
   ts_gc_unroot(rooted);
-  free(parts);
+  if (heap_parts) free(parts);
   return r;
 }
 int ts_strict_eq(tsv a, tsv b){
@@ -3091,7 +3317,6 @@ void ts_check_method_recv(tsv recv, uint32_t name_field){
 }
 
 /* ---------------- standard library: String methods ---------------- */
-static ts_string* as_str(tsv v){ return ts_str_ptr(v); }
 
 static uint32_t ts_str_next_code_point(ts_strview x, uint32_t* index){
   uint32_t i = *index;
@@ -3245,8 +3470,7 @@ static void ts_case_append_lower(ts_cu_builder* out, uint32_t cp, ts_strview x,
 }
 
 static tsv ts_str_case_convert(tsv s, int upper){
-  ts_string* x = as_str(s);
-  if (!x) return s;
+  if (!ts_is_str(s)) return s;
   ts_gc_root(&s);
   ts_strview sv = ts_str_view_typed(s);
   ts_cu_builder out;
@@ -3272,8 +3496,8 @@ tsv ts_str_tolower(tsv s){
 }
 /* slice(start[,end]) with JS negative-index + clamping semantics */
 tsv ts_str_slice(tsv s, double start, double end, int has_end){
-  ts_string* x=as_str(s); if(!x) return s;
-  long n=(long)x->len;
+  if(!ts_is_str(s)) return s;
+  long n=(long)ts_str_len_typed(s);
   long a=(long)start; long b= has_end ? (long)end : n;
   if(a<0) a+=n; if(b<0) b+=n;
   if(a<0)a=0; if(a>n)a=n; if(b<0)b=0; if(b>n)b=n;
@@ -3283,8 +3507,8 @@ tsv ts_str_slice(tsv s, double start, double end, int has_end){
 /* String.prototype.substring: like slice, but negatives clamp to 0 (not from the
    end) and the two indices are SWAPPED when start > end. */
 tsv ts_str_substring(tsv s, double start, double end, int has_end){
-  ts_string* x=as_str(s); if(!x) return s;
-  long n=(long)x->len;
+  if(!ts_is_str(s)) return s;
+  long n=(long)ts_str_len_typed(s);
   long a=(long)start; if(a<0)a=0; if(a>n)a=n;
   long b= has_end ? (long)end : n; if(b<0)b=0; if(b>n)b=n;
   if(a>b){ long t=a; a=b; b=t; }
@@ -3433,21 +3657,21 @@ tsv ts_number_to_precision(tsv numv, double prec){
 }
 int ts_str_includes(tsv s, tsv needle, double pos, int has_pos){ return ts_str_indexof(s,needle,pos,has_pos) >= 0; }
 tsv ts_str_charat(tsv s, double idx){
-  ts_string* x=as_str(s); if(!x) return ts_new_string("",0);
-  long i=(long)idx; if(i<0||i>=(long)x->len) return ts_new_string("",0);
+  if(!ts_is_str(s)) return ts_new_string("",0);
+  long i=(long)idx; if(i<0||i>=(long)ts_str_len_typed(s)) return ts_new_string("",0);
   return ts_string_slice_view(s, (uint32_t)i, 1);
 }
 double ts_str_charcodeat(tsv s, double idx){
-  ts_string* x=as_str(s); if(!x) return 0;
+  if(!ts_is_str(s)) return 0;
   ts_strview xs=ts_str_view_typed(s);
-  long i=(long)idx; if(i<0||i>=(long)x->len) return 0; /* NaN in JS; 0 approx */
+  long i=(long)idx; if(i<0||i>=(long)xs.len) return 0; /* NaN in JS; 0 approx */
   return (double)ts_str_cu_at_view(xs, (uint32_t)i);
 }
 /* String.prototype.codePointAt: index is a UTF-16 code-unit index. */
 tsv ts_str_codepointat(tsv s, double idx){
-  ts_string* x=as_str(s); if(!x) return TS_UNDEFINED;
+  if(!ts_is_str(s)) return TS_UNDEFINED;
   ts_strview xs=ts_str_view_typed(s);
-  long i=(long)idx; if(i<0||i>=(long)x->len) return TS_UNDEFINED;
+  long i=(long)idx; if(i<0||i>=(long)xs.len) return TS_UNDEFINED;
   uint16_t hi = ts_str_cu_at_view(xs, (uint32_t)i);
   if (hi >= 0xD800u && hi <= 0xDBFFu && i + 1 < (long)xs.len){
     uint16_t lo = ts_str_cu_at_view(xs, (uint32_t)i + 1);
@@ -3460,8 +3684,7 @@ tsv ts_str_codepointat(tsv s, double idx){
 }
 
 int ts_str_is_well_formed(tsv s){
-  ts_string* x = as_str(s);
-  if (!x) return 1;
+  if (!ts_is_str(s)) return 1;
   ts_strview xs = ts_str_view_typed(s);
   for (uint32_t i = 0; i < xs.len; i++){
     uint16_t cu = ts_str_cu_at_view(xs, i);
@@ -3478,8 +3701,7 @@ int ts_str_is_well_formed(tsv s){
 }
 
 tsv ts_str_to_well_formed(tsv s){
-  ts_string* x = as_str(s);
-  if (!x) return s;
+  if (!ts_is_str(s)) return s;
   ts_gc_root(&s);
   ts_strview xs = ts_str_view_typed(s);
   ts_cu_builder out;
@@ -3511,10 +3733,20 @@ tsv ts_str_to_well_formed(tsv s){
 
 tsv ts_str_concat(tsv a, tsv b){ return ts_add(a,b); }
 tsv ts_str_repeat(tsv s, double count){
-  ts_string* x=as_str(s); if(!x) return s;
+  if(!ts_is_str(s)) return s;
   ts_strview xs=ts_str_view_typed(s);
   long c=(long)count; if(c<0)c=0;
-  uint32_t total=xs.len*(uint32_t)c;
+  uint64_t total64=(uint64_t)xs.len*(uint64_t)c;
+  if(total64 > UINT32_MAX) ts_abort_msg("string too large");
+  uint32_t total=(uint32_t)total64;
+  if ((xs.flags & TS_STR_FLAG_ASCII) && total <= TS_SHORTSTR_MAX){
+    char data[TS_SHORTSTR_MAX];
+    uint32_t pos=0;
+    for(long k=0;k<c;k++)
+      for(uint32_t i=0;i<xs.len;i++) data[pos++]=(char)ts_str_cu_at_view(xs,i);
+    RT_STAT_INC(short_string);
+    return ts_short_str_ascii(data,total);
+  }
   ts_gc_root(&s);
   uint32_t flags = xs.flags & TS_STR_FLAG_UTF16;
   ts_string* y=ts_string_alloc_storage(total, flags);
@@ -3527,9 +3759,9 @@ tsv ts_str_repeat(tsv s, double count){
   return r;
 }
 tsv ts_str_trim(tsv s){
-  ts_string* x=as_str(s); if(!x) return s;
+  if(!ts_is_str(s)) return s;
   ts_strview xs=ts_str_view_typed(s);
-  long a=0,b=(long)x->len;
+  long a=0,b=(long)xs.len;
   while(a<b){ uint16_t c=ts_str_cu_at_view(xs,(uint32_t)a); if(ts_str_is_trim_ws(c)) a++; else break; }
   while(b>a){ uint16_t c=ts_str_cu_at_view(xs,(uint32_t)b-1); if(ts_str_is_trim_ws(c)) b--; else break; }
   return ts_string_slice_view(s, (uint32_t)a, (uint32_t)(b-a));
@@ -3538,9 +3770,9 @@ tsv ts_str_trim(tsv s){
 tsv ts_str_split(tsv s, tsv sep, tsv limit){
   if(!ts_is_str(s)) return ts_new_array(0);
   ts_gc_root(&s); ts_gc_root(&sep);
-  ts_string* x=as_str(s), *sp=as_str(sep);
+  int sep_is_str=ts_is_str(sep);
   ts_strview xs=ts_str_view_typed(s), ss={0};
-  if(sp) ss=ts_str_view_typed(sep);
+  if(sep_is_str) ss=ts_str_view_typed(sep);
   /* optional limit: truncate the result to ToUint32(limit) substrings. */
   int has_lim = (limit != TS_UNDEFINED);
   /* ToUint32 per spec (so split(sep,-1) -> 4294967295 = effectively no limit);
@@ -3559,8 +3791,8 @@ tsv ts_str_split(tsv s, tsv sep, tsv limit){
     ts_gc_unroot(3);
     return arr;
   }
-  if(!sp || sp->len==0){ /* split each char */
-    uint32_t count=x->len;
+  if(!sep_is_str || ss.len==0){ /* split each char */
+    uint32_t count=xs.len;
     if(has_lim && lim<count) count=lim;
     tsv arr=ts_new_array(count); ts_gc_root(&arr);
     for(uint32_t i=0;i<count;i++){
@@ -3899,11 +4131,17 @@ tsv ts_array_join(tsv arr, tsv sep){
     }
   }
 
-  tsv* parts = len ? (tsv*)malloc(sizeof(tsv) * len) : NULL;
+  enum { TS_JOIN_STACK_PARTS = 16 };
+  tsv stack_parts[TS_JOIN_STACK_PARTS];
+  tsv* parts = len == 0 ? NULL : (len <= TS_JOIN_STACK_PARTS
+    ? stack_parts
+    : (tsv*)malloc(sizeof(tsv) * len));
+  int heap_parts = parts && parts != stack_parts;
   uint32_t rooted = 0;
   uint64_t total = 0;
   uint32_t out_flags = ts_str_view_typed(sep).flags & TS_STR_FLAG_UTF16;
   uint32_t sep_len = ts_str_len_typed(sep);
+  int all_ascii = len <= 1 || !!(ts_str_view_typed(sep).flags & TS_STR_FLAG_ASCII);
   if(len > 1) total += (uint64_t)sep_len * (uint64_t)(len - 1);
   for(uint32_t i=0;i<len;i++){
     a=as_arr(arr);
@@ -3917,18 +4155,38 @@ tsv ts_array_join(tsv arr, tsv sep){
     rooted++;
     ts_strview pv=ts_str_view_typed(parts[i]);
     out_flags |= pv.flags & TS_STR_FLAG_UTF16;
+    all_ascii = all_ascii && !!(pv.flags & TS_STR_FLAG_ASCII);
     total += pv.len;
     if(total > UINT32_MAX){
       ts_gc_unroot((int)rooted + 2);
-      free(parts);
+      if (heap_parts) free(parts);
       fprintf(stderr, "tsaot: RangeError: joined string too large\n");
       abort();
     }
   }
   if(total==0){
     ts_gc_unroot((int)rooted + 2);
-    free(parts);
+    if (heap_parts) free(parts);
     return ts_new_string("",0);
+  }
+
+  if(all_ascii && total <= TS_SHORTSTR_MAX){
+    char data[TS_SHORTSTR_MAX];
+    uint32_t pos=0;
+    ts_strview sepv=ts_str_view_typed(sep);
+    for(uint32_t i=0;i<len;i++){
+      if(i>0)
+        for(uint32_t j=0;j<sepv.len;j++) data[pos++]=(char)ts_str_cu_at_view(sepv,j);
+      if(parts[i]!=TS_UNDEFINED){
+        ts_strview v=ts_str_view_typed(parts[i]);
+        for(uint32_t j=0;j<v.len;j++) data[pos++]=(char)ts_str_cu_at_view(v,j);
+      }
+    }
+    tsv r=ts_short_str_ascii(data,(uint32_t)total);
+    RT_STAT_INC(short_string);
+    ts_gc_unroot((int)rooted + 2);
+    if (heap_parts) free(parts);
+    return r;
   }
 
   ts_string* out=ts_string_alloc_storage((uint32_t)total, out_flags);
@@ -3946,13 +4204,13 @@ tsv ts_array_join(tsv arr, tsv sep){
     }
   }
   out->len=(uint32_t)total;
-  out->flags=strflags_storage(out->data, out_flags, out->len);
-  out->hash=strhash_units(out->data, out->flags, out->len);
+  out->flags=out_flags | (all_ascii ? TS_STR_FLAG_ASCII : 0);
+  out->hash=0; /* lazy: join/SSR sinks do not normally need a hash */
   out->parent=TS_UNDEFINED;
   out->offset=0;
   tsv r=ts_str_v(out);
   ts_gc_unroot((int)rooted + 2);
-  free(parts);
+  if (heap_parts) free(parts);
   return r;
 }
 tsv ts_array_pop(tsv arr){
@@ -4020,9 +4278,7 @@ static uint32_t sv0_hash(tsv k){
     if (d != d) bits = 0x7FF8000000000000ull;   /* canonical NaN */
     else memcpy(&bits, &d, sizeof bits);
   } else if (ts_is_str(k)){
-    ts_string* s = ts_str_ptr_typed(k);
-    if ((s->flags & TS_STR_FLAG_HASHED) && !(s->flags & TS_STR_FLAG_VIEW)) return s->hash;
-    return strhash_view(ts_str_view_typed(k));
+    return ts_str_hash_of(k);
   } else if (ts_heap_ref(k)){
     ts_gc_header* h = ts_heap_ptr(k);
     uint64_t hd = h ? h->handle : 0;
@@ -5263,34 +5519,34 @@ tsv ts_array_tospliced(tsv arr, double start, double dc, int has_dc, tsv items){
 
 /* ---------------- String: additional methods ---------------- */
 int ts_str_startswith(tsv s, tsv pre, double pos, int has_pos){
-  ts_string *x=as_str(s),*p=as_str(pre); if(!x||!p) return 0;
+  if(!ts_is_str(s)||!ts_is_str(pre)) return 0;
   ts_strview xs=ts_str_view_typed(s), ps=ts_str_view_typed(pre);
-  long start = has_pos ? (long)pos : 0; if(start<0) start=0; if(start>(long)x->len) start=(long)x->len;
+  long start = has_pos ? (long)pos : 0; if(start<0) start=0; if(start>(long)xs.len) start=(long)xs.len;
   if((long)ps.len > (long)xs.len - start) return 0;
   return ts_str_region_eq(xs, (uint32_t)start, ps, 0, ps.len);
 }
 int ts_str_endswith(tsv s, tsv suf, double endpos, int has_endpos){
-  ts_string *x=as_str(s),*p=as_str(suf); if(!x||!p) return 0;
+  if(!ts_is_str(s)||!ts_is_str(suf)) return 0;
   ts_strview xs=ts_str_view_typed(s), ps=ts_str_view_typed(suf);
-  long end = has_endpos ? (long)endpos : (long)x->len;
-  if(end<0) end=0; if(end>(long)x->len) end=(long)x->len;
+  long end = has_endpos ? (long)endpos : (long)xs.len;
+  if(end<0) end=0; if(end>(long)xs.len) end=(long)xs.len;
   if((long)ps.len > end) return 0;
   return ts_str_region_eq(xs, (uint32_t)(end-(long)ps.len), ps, 0, ps.len);
 }
 tsv ts_str_padstart(tsv s, double target, tsv pad){
-  ts_string *x=as_str(s); if(!x) return s;
-  ts_string *p=as_str(pad);
+  if(!ts_is_str(s)) return s;
+  int pad_is_str=ts_is_str(pad);
   ts_strview xs=ts_str_view_typed(s), ps={0};
-  if(p) ps=ts_str_view_typed(pad);
+  if(pad_is_str) ps=ts_str_view_typed(pad);
   long t=(long)target; if(t<=(long)xs.len) return s;
-  uint32_t need=(uint32_t)t - x->len;
+  uint32_t need=(uint32_t)t - xs.len;
   ts_gc_root(&s); ts_gc_root(&pad);
-  xs=ts_str_view_typed(s); p=as_str(pad); if(p) ps=ts_str_view_typed(pad);
-  uint32_t flags = (xs.flags | (p ? ps.flags : 0u)) & TS_STR_FLAG_UTF16;
+  xs=ts_str_view_typed(s); pad_is_str=ts_is_str(pad); if(pad_is_str) ps=ts_str_view_typed(pad);
+  uint32_t flags = (xs.flags | (pad_is_str ? ps.flags : 0u)) & TS_STR_FLAG_UTF16;
   ts_string* y=ts_string_alloc_storage((uint32_t)t, flags); y->len=(uint32_t)t;
-  uint32_t pl=p&&ps.len?ps.len:1;
+  uint32_t pl=pad_is_str&&ps.len?ps.len:1;
   for(uint32_t i=0;i<need;i++){
-    uint16_t cu = p&&ps.len ? ts_str_cu_at_view(ps, i%pl) : (uint16_t)' ';
+    uint16_t cu = pad_is_str&&ps.len ? ts_str_cu_at_view(ps, i%pl) : (uint16_t)' ';
     ts_str_cu_set(y->data, flags, i, cu);
   }
   ts_str_copy_units(y->data, flags, need, xs, 0, xs.len);
@@ -5299,20 +5555,20 @@ tsv ts_str_padstart(tsv s, double target, tsv pad){
   tsv r=ts_str_v(y); ts_gc_unroot(2); return r;
 }
 tsv ts_str_padend(tsv s, double target, tsv pad){
-  ts_string *x=as_str(s); if(!x) return s;
-  ts_string *p=as_str(pad);
+  if(!ts_is_str(s)) return s;
+  int pad_is_str=ts_is_str(pad);
   ts_strview xs=ts_str_view_typed(s), ps={0};
-  if(p) ps=ts_str_view_typed(pad);
+  if(pad_is_str) ps=ts_str_view_typed(pad);
   long t=(long)target; if(t<=(long)xs.len) return s;
-  uint32_t need=(uint32_t)t - x->len;
+  uint32_t need=(uint32_t)t - xs.len;
   ts_gc_root(&s); ts_gc_root(&pad);
-  xs=ts_str_view_typed(s); p=as_str(pad); if(p) ps=ts_str_view_typed(pad);
-  uint32_t flags = (xs.flags | (p ? ps.flags : 0u)) & TS_STR_FLAG_UTF16;
+  xs=ts_str_view_typed(s); pad_is_str=ts_is_str(pad); if(pad_is_str) ps=ts_str_view_typed(pad);
+  uint32_t flags = (xs.flags | (pad_is_str ? ps.flags : 0u)) & TS_STR_FLAG_UTF16;
   ts_string* y=ts_string_alloc_storage((uint32_t)t, flags); y->len=(uint32_t)t;
-  uint32_t pl=p&&ps.len?ps.len:1;
+  uint32_t pl=pad_is_str&&ps.len?ps.len:1;
   ts_str_copy_units(y->data, flags, 0, xs, 0, xs.len);
   for(uint32_t i=0;i<need;i++){
-    uint16_t cu = p&&ps.len ? ts_str_cu_at_view(ps, i%pl) : (uint16_t)' ';
+    uint16_t cu = pad_is_str&&ps.len ? ts_str_cu_at_view(ps, i%pl) : (uint16_t)' ';
     ts_str_cu_set(y->data, flags, xs.len+i, cu);
   }
   y->flags=strflags_storage(y->data,flags,(uint32_t)t); y->hash=strhash_units(y->data,y->flags,(uint32_t)t);
@@ -5320,21 +5576,22 @@ tsv ts_str_padend(tsv s, double target, tsv pad){
   tsv r=ts_str_v(y); ts_gc_unroot(2); return r;
 }
 tsv ts_str_trimstart(tsv s){
-  ts_string* x=as_str(s); if(!x) return s; long a=0,b=(long)x->len;
+  if(!ts_is_str(s)) return s; long a=0,b=(long)ts_str_len_typed(s);
   ts_strview xs=ts_str_view_typed(s);
   while(a<b){ uint16_t c=ts_str_cu_at_view(xs,(uint32_t)a); if(ts_str_is_trim_ws(c)) a++; else break; }
   return ts_string_slice_view(s, (uint32_t)a, (uint32_t)(b-a));
 }
 tsv ts_str_trimend(tsv s){
-  ts_string* x=as_str(s); if(!x) return s; long a=0,b=(long)x->len;
+  if(!ts_is_str(s)) return s; long a=0,b=(long)ts_str_len_typed(s);
   ts_strview xs=ts_str_view_typed(s);
   while(b>a){ uint16_t c=ts_str_cu_at_view(xs,(uint32_t)b-1); if(ts_str_is_trim_ws(c)) b--; else break; }
   return ts_string_slice_view(s, (uint32_t)a, (uint32_t)(b-a));
 }
 tsv ts_str_at(tsv s, double idx){
-  ts_string* x=as_str(s); if(!x) return TS_UNDEFINED;
-  long i=(long)idx; if(i<0) i+=(long)x->len;
-  if(i<0||i>=(long)x->len) return TS_UNDEFINED;
+  if(!ts_is_str(s)) return TS_UNDEFINED;
+  long len=(long)ts_str_len_typed(s);
+  long i=(long)idx; if(i<0) i+=len;
+  if(i<0||i>=len) return TS_UNDEFINED;
   return ts_string_slice_view(s, (uint32_t)i, 1);
 }
 /* replace / replaceAll with a STRING pattern (no regex). */
@@ -5344,11 +5601,10 @@ tsv ts_str_at(tsv s, double idx){
 static tsv expand_replacement(tsv s, tsv pat, uint32_t i, tsv rep){
   tsv out = ts_new_string("",0); ts_gc_root(&out);
   ts_gc_root(&s); ts_gc_root(&pat); ts_gc_root(&rep);
-  ts_string* r = as_str(rep);
   for(uint32_t k=0;;k++){
-    r = as_str(rep);
-    ts_strview rv = r ? ts_str_view_typed(rep) : (ts_strview){0};
-    if (!r || k>=rv.len) break;
+    int rep_is_str = ts_is_str(rep);
+    ts_strview rv = rep_is_str ? ts_str_view_typed(rep) : (ts_strview){0};
+    if (!rep_is_str || k>=rv.len) break;
     if(ts_str_cu_at_view(rv,k)=='$' && k+1<rv.len){
       uint16_t nx=ts_str_cu_at_view(rv,k+1);
       if(nx=='$'){ out=ts_add(out, ts_new_string("$",1)); k++; continue; }
@@ -5375,9 +5631,9 @@ static tsv ts_str_replace_call(tsv rep, tsv matched, uint32_t off, tsv s){
 }
 
 static tsv ts_str_replace_literal_build(tsv s, tsv pat, tsv rep, int all){
-  ts_string *x=as_str(s), *p=as_str(pat), *r=as_str(rep);
-  if(!x||!p||!r||p->len==0) return TS_UNDEFINED;
+  if(!ts_is_str(s)||!ts_is_str(pat)||!ts_is_str(rep)) return TS_UNDEFINED;
   ts_strview xs=ts_str_view_typed(s), ps=ts_str_view_typed(pat), rs=ts_str_view_typed(rep);
+  if(ps.len==0) return TS_UNDEFINED;
   uint32_t count=0;
   for(uint32_t i=0;;){
     long long hit = ts_str_find_forward_view(xs, ps, i);
@@ -5416,20 +5672,21 @@ static tsv ts_str_replace_literal_build(tsv s, tsv pat, tsv rep, int all){
 }
 
 tsv ts_str_replace(tsv s, tsv pat, tsv rep, int all){
-  ts_string *x=as_str(s),*p=as_str(pat);
+  int source_is_str=ts_is_str(s), pattern_is_str=ts_is_str(pat);
   /* rep may be a FUNCTION replacer (called per match) instead of a string. */
   int rep_is_fn = ts_is_callable(rep);
-  ts_string *r = rep_is_fn ? NULL : as_str(rep);
-  if(!x||!p||(!rep_is_fn && !r)) return x ? s : ts_new_string("",0);
-  if(p->len==0){
+  int replacement_is_str = !rep_is_fn && ts_is_str(rep);
+  if(!source_is_str||!pattern_is_str||(!rep_is_fn && !replacement_is_str))
+    return source_is_str ? s : ts_new_string("",0);
+  ts_strview pattern_view = ts_str_view_typed(pat);
+  if(pattern_view.len==0){
     /* empty pattern matches at index 0 (replace) or between every char + ends
        (replaceAll): "abc".replace("","X")="Xabc", replaceAll -> "XaXbXcX". A
        function replacer is invoked with matched="" at each such offset. */
     ts_gc_root(&s); ts_gc_root(&rep);
     tsv out = rep_is_fn ? ts_str_replace_call(rep, ts_new_string("",0), 0, s) : rep;
     ts_gc_root(&out);
-    x=as_str(s);
-    uint32_t len=x ? x->len : 0;
+    uint32_t len=ts_str_len_typed(s);
     for(uint32_t k=0;k<len;k++){
       out=ts_add(out, ts_string_slice_view(s, k, 1));
       if(all && k+1<len){
@@ -5446,7 +5703,7 @@ tsv ts_str_replace(tsv s, tsv pat, tsv rep, int all){
   }
   /* whether the replacement uses $ patterns (else append it verbatim — fast path).
      Function replacers have no string r, so skip. */
-  int has_dollar=0; if(r){ ts_strview rv=ts_str_view_typed(rep); for(uint32_t k=0;k<rv.len;k++) if(ts_str_cu_at_view(rv,k)=='$'){ has_dollar=1; break; } }
+  int has_dollar=0; if(replacement_is_str){ ts_strview rv=ts_str_view_typed(rep); for(uint32_t k=0;k<rv.len;k++) if(ts_str_cu_at_view(rv,k)=='$'){ has_dollar=1; break; } }
   if(!rep_is_fn && !has_dollar){
     tsv built = ts_str_replace_literal_build(s, pat, rep, all);
     if(built != TS_UNDEFINED) return built;
@@ -5455,18 +5712,15 @@ tsv ts_str_replace(tsv s, tsv pat, tsv rep, int all){
   ts_gc_root(&out); ts_gc_root(&s); ts_gc_root(&pat); ts_gc_root(&rep);
   uint32_t i=0,start=0; int done=0;
   for(;;){
-    x=as_str(s); p=as_str(pat);            /* re-fetch: ts_add may have allocated/GC'd */
     ts_strview xs=ts_str_view_typed(s), ps=ts_str_view_typed(pat);
     if(i+ps.len > xs.len) break;
     if(!done && ts_str_region_eq(xs, i, ps, 0, ps.len)){
       out=ts_add(out, ts_string_slice_view(s, start, i-start));
-      x=as_str(s); p=as_str(pat);
       tsv repl;
       if(rep_is_fn){
         /* matched substring == pattern for a literal-string match. */
         repl = ts_str_replace_call(rep, pat, i, s);
       } else {
-        r=as_str(rep);
         repl = has_dollar ? expand_replacement(s, pat, i, rep) : rep;
       }
       out=ts_add(out, repl);
@@ -5798,9 +6052,8 @@ tsv ts_object_get_own_property_names(tsv obj){
   tsv arr = ts_new_array(0);
   ts_gc_root(&arr);
   if (ts_is_str(obj)){
-    ts_string* s = ts_ptr(obj);
-    uint32_t len = s->len;
-    for (uint32_t i=0;i<len;i++){ push_index_name(arr, i); s = ts_ptr(obj); len = s->len; }
+    uint32_t len = ts_str_len_typed(obj);
+    for (uint32_t i=0;i<len;i++) push_index_name(arr, i);
     push_cstr_name(arr, "length");
     ts_gc_unroot(2);
     return arr;
@@ -6031,11 +6284,13 @@ static inline int json_bytes_clean_ascii(const char* d, uint32_t len){
   return 1;
 }
 static void json_quote(jbuf* b, ts_strview s){
+  char short_data[TS_SHORTSTR_MAX];
+  const char* data = ts_str_view_data(&s, short_data);
   /* Fast path: 1-byte storage with no chars needing escaping -> bulk copy. */
-  if (!(s.flags & TS_STR_FLAG_UTF16) && json_bytes_clean_ascii(s.data, s.len)){
+  if (!(s.flags & TS_STR_FLAG_UTF16) && json_bytes_clean_ascii(data, s.len)){
     if (b->len + s.len + 2 > b->cap) jb_grow(b, b->len + s.len + 2);
     b->p[b->len++]='"';
-    memcpy(b->p + b->len, s.data, s.len); b->len += s.len;
+    memcpy(b->p + b->len, data, s.len); b->len += s.len;
     b->p[b->len++]='"';
     return;
   }
@@ -6210,7 +6465,11 @@ static int json_stringify_val(jbuf* b, tsv v, int depth, const char* indent){
       tsv key=m->keys[i];
       tsv val=m->vals[i];
       ts_gc_root(&key);
-      { ts_strview kv = ts_str_view_typed(key); val = json_apply_tojson(val, kv.data, kv.len); }
+      {
+        ts_strview kv = ts_str_view_typed(key);
+        char short_key[TS_SHORTSTR_MAX];
+        val = json_apply_tojson(val, ts_str_view_data(&kv, short_key), kv.len);
+      }
       if (ts_is_undef(val)||ts_is_func(val)){ ts_gc_unroot(1); continue; }
       ts_gc_root(&val);
       if (!first) jb_putc(b,','); first=0;
@@ -7201,11 +7460,12 @@ tsv ts_json_parse(tsv text){
   if (!ts_is_str(text)) text = ts_to_string_v(text); /* JS: JSON.parse coerces ToString first (JSON.parse(5)->5) */
   ts_gc_root(&text);
   ts_strview view = ts_str_view_typed(text);
+  char short_text[TS_SHORTSTR_MAX];
   jparse p;
   if ((view.flags & TS_STR_FLAG_ASCII) && !(view.flags & TS_STR_FLAG_UTF16)){
     gc_pin_string_storage(text);
     view = ts_str_view_typed(text);
-    p = (jparse){ view.data, 0, view.len, 1 };
+    p = (jparse){ ts_str_view_data(&view, short_text), 0, view.len, 1 };
   } else {
     uint32_t text_len = 0;
     char* copy=ts_string_cstr_copy(text, &text_len);
@@ -7537,8 +7797,7 @@ void ts_array_push_all(tsv dst, tsv src){
   if (ts_is_str(src)){
     uint32_t i = 0;
     for(;;){
-      ts_string* str=ts_ptr(src);
-      uint32_t len = str ? str->len : 0;
+      uint32_t len = ts_str_len_typed(src);
       if (i >= len) break;
       ts_strview xs = ts_str_view_typed(src);
       uint32_t clen = 1;
@@ -7844,11 +8103,11 @@ static tsv ts_own_descriptor_by_key(tsv obj, ts_key key){
   const char* nm = ts_field_name(key);
   uint32_t nm_len = ts_field_name_len(key);
   if (ts_is_str(obj)){
-    ts_string* s = ts_ptr(obj);
-    if (nm && field_bytes_is(nm, nm_len, "length")) return build_data_descriptor(ts_num((double)s->len), 0, 0, 0);
+    uint32_t len = ts_str_len_typed(obj);
+    if (nm && field_bytes_is(nm, nm_len, "length")) return build_data_descriptor(ts_num((double)len), 0, 0, 0);
     if (nm){
       long ix = ts_canonical_array_index(nm, nm_len);
-      if (ix >= 0 && (uint32_t)ix < s->len){
+      if (ix >= 0 && (uint32_t)ix < len){
         return build_data_descriptor(ts_string_slice_view(obj, (uint32_t)ix, 1), 0, 1, 0);
       }
     }
@@ -7904,14 +8163,13 @@ tsv ts_get_own_property_descriptors(tsv obj){
   tsv res = ts_new_object();
   ts_gc_root(&res);
   if (ts_is_str(obj)){
-    ts_string* s = ts_ptr(obj);
-    uint32_t len = s->len;
+    uint32_t len = ts_str_len_typed(obj);
     for (uint32_t i=0;i<len;i++){
       char b[16]; int bn = snprintf(b, sizeof b, "%u", i);
       uint32_t k = ts_intern_field(b, (uint32_t)bn);
       tsv d = ts_own_descriptor_by_key(obj, k);
       if (!ts_is_undef(d)) ts_set(res, k, d);
-      s = ts_ptr(obj); len = s->len;
+      len = ts_str_len_typed(obj);
     }
     uint32_t lk = ts_intern_field("length", 6);
     tsv d = ts_own_descriptor_by_key(obj, lk);
@@ -8740,7 +8998,7 @@ void ts_set_pic(tsv obj, ts_key key, tsv val, ts_prop_ic* ic){
 tsv ts_get_dyn_checked(tsv obj, tsv keyv){
   if (ts_is_null(obj) || ts_is_undef(obj)){
     char tmp[128]; const char* prop = NULL;
-    if (ts_is_str(keyv)){ ts_strview kv = ts_str_view_typed(keyv); uint32_t n = kv.len < sizeof(tmp)-1 ? kv.len : (uint32_t)sizeof(tmp)-1; memcpy(tmp, kv.data, n); tmp[n]=0; prop=tmp; }
+    if (ts_is_str(keyv)){ ts_strview kv = ts_str_view_typed(keyv); uint32_t n = kv.len < sizeof(tmp)-1 ? kv.len : (uint32_t)sizeof(tmp)-1; for(uint32_t i=0;i<n;i++) tmp[i]=(char)ts_str_cu_at_view(kv,i); tmp[n]=0; prop=tmp; }
     else if (ts_is_num(keyv)){ ts_fmt_num(ts_to_num(keyv), tmp, sizeof tmp); prop=tmp; }
     return ts_throw_cannot_read(obj, prop);
   }

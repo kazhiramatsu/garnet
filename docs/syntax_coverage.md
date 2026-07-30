@@ -21,7 +21,8 @@ explicit error until implemented).
 | as/non-null/paren | DONE | unwrap |
 | compound assign `+= -= *= /= %=` | DONE | desugared to x = x op y |
 | logical `&& \|\| ??` | DONE | short-circuit via If; ?? approximates falsy |
-| template literal w/ `${}` | DONE | desugared to string concat |
+| template literal w/ `${}` | DONE | ordered coercion + one `concatMany`; safe constants folded |
+| JSX element / fragment | DONE (classic subset) | direct bundled `React.createElement`; intrinsic/component tags, props spread, children, fragments; see `jsx_react_ssr_design.md` |
 | **spread `...`** | **DROPPED** | medium |
 | `typeof` | DONE | ts_typeof runtime helper -> JS type-tag string |
 | `void` | DONE | evaluate operand, yield undefined |
