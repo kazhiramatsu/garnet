@@ -413,6 +413,10 @@ static inline ts_string* ts_str_ptr_typed(tsv s){
 static inline ts_string* ts_str_ptr(tsv s){
   return ts_is_heap_str(s) ? (ts_string*)ts_ptr(s) : NULL;
 }
+/* Keep the common flat/short-string view construction visible to generated C.
+   Parent-view traversal is uncommon and substantially larger, so it lives in
+   the precompiled runtime rather than being replicated at every call site. */
+ts_strview ts_str_view_typed_slow(tsv s);
 static inline ts_strview ts_str_view_typed(tsv s){
   if (TS_RT_UNLIKELY(ts_is_short_str(s))){
     uint32_t len = ts_short_str_len(s);
@@ -423,29 +427,8 @@ static inline ts_strview ts_str_view_typed(tsv s){
     return v;
   }
   ts_string* x = ts_str_ptr_typed(s);
-  if (x->flags & TS_STR_FLAG_VIEW){
-    ts_strview p = ts_str_view_typed(x->parent);
-    uint32_t storage_flags = p.flags & (TS_STR_FLAG_ASCII | TS_STR_FLAG_UTF16);
-    if (!p.data){
-      ts_strview v = { NULL, x->len, x->hash,
-        (x->flags & ~(TS_STR_FLAG_ASCII | TS_STR_FLAG_UTF16)) | storage_flags, 0 };
-      char* bytes = (char*)&v.immediate;
-      for (uint32_t i=0;i<x->len;i++){
-        uint32_t cu = ts_str_cu_at_view(p, x->offset + i);
-        if (i < 4u) bytes[i] = (char)cu;
-        else v.hash = cu;
-      }
-      return v;
-    }
-    ts_strview v = {
-      p.data + ((size_t)x->offset * ts_str_unit_size_flags(p.flags)),
-      x->len,
-      x->hash,
-      (x->flags & ~(TS_STR_FLAG_ASCII | TS_STR_FLAG_UTF16)) | storage_flags,
-      0
-    };
-    return v;
-  }
+  if (TS_RT_UNLIKELY(x->flags & TS_STR_FLAG_VIEW))
+    return ts_str_view_typed_slow(s);
   ts_strview v = { x->data, x->len, x->hash, x->flags, 0 };
   return v;
 }
@@ -525,53 +508,24 @@ static inline long long ts_str_slice_charcodeat_fast_i64_typed(tsv s, long long 
   }
   return ts_str_slice_charcodeat_i64_typed(s, start, len, i);
 }
+/* General multi-code-unit and mixed-width scanning is an out-of-line worker.
+   The allocation-free one-byte/single-unit case stays in the header because it
+   collapses to memchr at generated call sites. */
+long long ts_str_find_forward_view_slow(ts_strview xs, ts_strview ns, long long start);
 static inline long long ts_str_find_forward_view(ts_strview xs, ts_strview ns, long long start){
   if (start < 0) start = 0;
   if (ns.len == 0) return start > (long long)xs.len ? (long long)xs.len : start;
   if (ns.len > xs.len || start > (long long)xs.len - (long long)ns.len) return -1;
-  if (xs.data && ns.data && ts_str_same_storage_width(xs, ns)){
-    uint32_t w = ts_str_unit_size_flags(xs.flags);
-    const char* xdata = xs.data;
-    const char* ndata = ns.data;
-    if (w == 1u){
-      const char first = ndata[0];
-      if (ns.len == 1){
-        const char* hit = memchr(xdata + start, first, xs.len - (uint32_t)start);
-        return hit ? (long long)(hit - xdata) : -1;
-      }
-      const char* cur = xdata + start;
-      const char* end = xdata + (xs.len - ns.len + 1);
-      while (cur < end){
-        const char* hit = memchr(cur, first, (size_t)(end - cur));
-        if (!hit) return -1;
-        if (memcmp(hit + 1, ndata + 1, ns.len - 1) == 0) return (long long)(hit - xdata);
-        cur = hit + 1;
-      }
-      return -1;
-    }
-    (void)xdata; (void)ndata;
-    uint16_t first = ts_str_cu_at_contiguous(ns, 0);
-    if (ns.len == 1){
-      for (uint32_t i=(uint32_t)start;i<xs.len;i++) if (ts_str_cu_at_contiguous(xs, i) == first) return (long long)i;
-      return -1;
-    }
-    uint16_t last = ts_str_cu_at_contiguous(ns, ns.len - 1);
-    for (uint32_t i=(uint32_t)start;i<=xs.len-ns.len;i++){
-      if (ts_str_cu_at_contiguous(xs, i) == first &&
-          ts_str_cu_at_contiguous(xs, i + ns.len - 1) == last &&
-          ts_str_region_eq(xs, i + 1, ns, 1, ns.len - 2)) return (long long)i;
-    }
-    return -1;
+  if (ns.len == 1 && xs.data && ns.data &&
+      ts_str_same_storage_width(xs, ns) &&
+      !(xs.flags & TS_STR_FLAG_UTF16)){
+    const char* hit = memchr(xs.data + start, ns.data[0],
+                             xs.len - (uint32_t)start);
+    return hit ? (long long)(hit - xs.data) : -1;
   }
-  uint16_t first = ts_str_cu_at_view(ns, 0);
-  if (ns.len == 1){
-    return ts_str_find_unit_view(xs, first, (uint32_t)start, xs.len - (uint32_t)start);
-  }
-  for (uint32_t i=(uint32_t)start;i<=xs.len-ns.len;i++){
-    if (ts_str_cu_at_view(xs, i) == first && ts_str_region_eq(xs, i + 1, ns, 1, ns.len - 1)) return (long long)i;
-  }
-  return -1;
+  return ts_str_find_forward_view_slow(xs, ns, start);
 }
+long long ts_str_find_backward_view_slow(ts_strview xs, ts_strview ns, long long start);
 static inline long long ts_str_find_backward_view(ts_strview xs, ts_strview ns, long long start){
   long long maxstart = (long long)xs.len - (long long)ns.len;
   if (ns.len == 0){
@@ -581,26 +535,7 @@ static inline long long ts_str_find_backward_view(ts_strview xs, ts_strview ns, 
   if (ns.len > xs.len) return -1;
   if (start > maxstart) start = maxstart;
   if (start < 0) return -1;
-  if (xs.data && ns.data && ts_str_same_storage_width(xs, ns)){
-    uint16_t first = ts_str_cu_at_contiguous(ns, 0);
-    uint16_t last = ts_str_cu_at_contiguous(ns, ns.len - 1);
-    for (long long i = start; i >= 0; i--){
-      if (ts_str_cu_at_contiguous(xs, (uint32_t)i) == first &&
-          (ns.len == 1 ||
-           (ts_str_cu_at_contiguous(xs, (uint32_t)i + ns.len - 1) == last &&
-            ts_str_region_eq(xs, (uint32_t)i + 1, ns, 1, ns.len - 1)))) return i;
-    }
-    return -1;
-  }
-  uint16_t first = ts_str_cu_at_view(ns, 0);
-  uint16_t last = ts_str_cu_at_view(ns, ns.len - 1);
-  for (long long i = start; i >= 0; i--){
-    if (ts_str_cu_at_view(xs, (uint32_t)i) == first &&
-        (ns.len == 1 ||
-         (ts_str_cu_at_view(xs, (uint32_t)i + ns.len - 1) == last &&
-          ts_str_region_eq(xs, (uint32_t)i + 1, ns, 1, ns.len - 1)))) return i;
-  }
-  return -1;
+  return ts_str_find_backward_view_slow(xs, ns, start);
 }
 typedef struct ts_regexp_litprefix_match {
   uint32_t start;
@@ -653,66 +588,10 @@ static inline double ts_str_lastindexof_fast(tsv s, tsv needle, double from, int
   long long start = has_from ? (long long)from : (long long)xs.len - (long long)ns.len;
   return (double)ts_str_find_backward_view(xs, ns, start);
 }
-static inline long long ts_str_replace_literal_metric3(tsv s, tsv pat, tsv rep, tsv needle, long long char_idx, int all){
-  if (!ts_is_str(s) || !ts_is_str(pat) || !ts_is_str(rep) || !ts_is_str(needle)) return -1;
-  ts_strview xs = ts_str_view_typed(s), ps = ts_str_view_typed(pat), rs = ts_str_view_typed(rep), ns = ts_str_view_typed(needle);
-  if (ps.len == 0 || ns.len != 1) return -1;
-  if (ts_str_contains_unit(rs, '$')) return -1;
-  uint16_t wanted = ts_str_cu_at_view(ns, 0);
-  long long total = 0;
-  long long found = -1;
-  long long ch = 0;
-  uint32_t pos = 0;
-  int replaced = 0;
-  for (;;){
-    long long hit = all || !replaced ? ts_str_find_forward_view(xs, ps, pos) : -1;
-    uint32_t seg_end = hit >= 0 ? (uint32_t)hit : xs.len;
-    uint32_t seg_len = seg_end - pos;
-    if (found < 0 && seg_len > 0){
-      long long fh = ts_str_find_unit_view(xs, wanted, pos, seg_len);
-      if (fh >= 0) found = total + (fh - (long long)pos);
-    }
-    if (char_idx >= total && char_idx < total + (long long)seg_len) ch = ts_str_cu_at_view(xs, pos + (uint32_t)(char_idx - total));
-    total += seg_len;
-    if (hit < 0) break;
-    if (found < 0 && rs.len > 0){
-      long long rh = ts_str_find_unit_view(rs, wanted, 0, rs.len);
-      if (rh >= 0) found = total + rh;
-    }
-    if (char_idx >= total && char_idx < total + (long long)rs.len) ch = ts_str_cu_at_view(rs, (uint32_t)(char_idx - total));
-    total += rs.len;
-    pos = (uint32_t)hit + ps.len;
-    replaced = 1;
-  }
-  return total + found + ch;
-}
-static inline long long ts_str_split_join_metric3(tsv s, tsv sep, tsv join_sep, long long part_index){
-  if (!ts_is_str(s) || !ts_is_str(sep) || !ts_is_str(join_sep) || part_index < 0) return -1;
-  ts_strview xs = ts_str_view_typed(s), ss = ts_str_view_typed(sep), js = ts_str_view_typed(join_sep);
-  if (ss.len == 0) return -1;
-  uint32_t pos = 0;
-  uint32_t start = 0;
-  uint32_t count = 0;
-  uint32_t part_len = 0;
-  int saw_part = 0;
-  long long removed = 0;
-  for (;;){
-    long long hit = ts_str_find_forward_view(xs, ss, pos);
-    uint32_t end = hit >= 0 ? (uint32_t)hit : xs.len;
-    if ((long long)count == part_index){
-      part_len = end - start;
-      saw_part = 1;
-    }
-    count++;
-    if (hit < 0) break;
-    removed += ss.len;
-    pos = (uint32_t)hit + ss.len;
-    start = pos;
-  }
-  if (!saw_part) return -1;
-  long long joined_len = (long long)xs.len - removed + (long long)(count - 1) * (long long)js.len;
-  return (long long)count + joined_len + (long long)part_len;
-}
+long long ts_str_replace_literal_metric3(tsv s, tsv pat, tsv rep, tsv needle,
+                                         long long char_idx, int all);
+long long ts_str_split_join_metric3(tsv s, tsv sep, tsv join_sep,
+                                    long long part_index);
 
 /* A JS array uses contiguous storage plus an internal hole sentinel.  The
    sentinel keeps sparse-array presence distinct from an explicit `undefined`
@@ -1184,24 +1063,7 @@ static inline double ts_json_num_len_fast(double d) {
   }
   return ts_json_num_len(d);
 }
-static inline double ts_json_string_len_fast(tsv v) {
-  ts_strview s = ts_str_view_typed(v);
-  double n = 2.0;
-  for (uint32_t i=0;i<s.len;i++){
-    uint16_t c = ts_str_cu_at_view(s, i);
-    if (c >= 0xD800u && c <= 0xDBFFu && i + 1 < s.len) {
-      uint16_t lo = ts_str_cu_at_view(s, i + 1);
-      if (lo >= 0xDC00u && lo <= 0xDFFFu) { n += 2.0; i++; continue; }
-    }
-    switch(c){
-      case '"': case '\\': case '\n': case '\r': case '\t': case '\b': case '\f':
-        n += 2.0; break;
-      default:
-        n += (c < 0x20u || (c >= 0xD800u && c <= 0xDFFFu)) ? 6.0 : 1.0;
-    }
-  }
-  return n;
-}
+double ts_json_string_len_fast(tsv v);
 tsv ts_json_parse(tsv text);
 tsv ts_json_parse_reviver(tsv text, tsv reviver);
 typedef struct {

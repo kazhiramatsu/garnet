@@ -3544,3 +3544,27 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   React/Pages Router SSR fixture, loud unsupported-syntax diagnostics, optional
   libcurl linkage for fetch, vendored static mimalloc, and platform-dependent
   libc linkage.
+
+### Session 333: bounded runtime-header fast paths
+
+- Split substantial runtime work out of `ts_rt.h`: recursive parent-view
+  traversal, general forward/backward string scanning, replace/split metric
+  loops, and JSON quoted-string length scanning now live in `ts_rt.c`.
+  Generated C still sees flat/short view construction, search normalization,
+  and the one-byte single-unit `memchr` path.
+- Kept forced runtime inline expansion restricted to property PIC wrappers.
+  The existing generated numeric rule remains limited to non-coroutine,
+  straight-line functions with at most eight allowlisted IR instructions.
+- Added `docs/runtime_header_policy.md` and
+  `tests/runtime_inline_policy_gate.sh`; the runtime suite now prevents the
+  moved workers from drifting back into the header and rejects new
+  `TS_RT_ALWAYS_INLINE` helpers outside the PIC allowlist.
+- Measurement on arm64 macOS: representative generated-C compile **0.10 →
+  0.08 s**, generated object **74,248 → 72,640 B**; cached runtime cold compile
+  **1.54 → 1.74 s**, runtime object **545,496 → 585,600 B**. The representative
+  libc-linked executable grew **451,064 → 471,192 B**, including a 16 KiB
+  Mach-O text-segment step. Targeted runtime performance stayed within noise
+  and all 31 string/JSON budgets passed.
+- Verification: runtime unit and inline-policy gates, exhaustive conformance
+  **371/371**, bundler **40/40**, all string/JSON benchmarks, and normal/ASan
+  GC stress including the 64 MiB string-builder scale gate.

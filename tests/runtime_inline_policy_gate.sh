@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Keep substantial runtime workers out of the public header. Generated C needs
+# the declarations, but only bounded common-case guards should be replicated in
+# each translation unit.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+header="$ROOT/runtime/ts_rt.h"
+source="$ROOT/runtime/ts_rt.c"
+
+workers="
+ts_str_view_typed_slow
+ts_str_find_forward_view_slow
+ts_str_find_backward_view_slow
+ts_str_replace_literal_metric3
+ts_str_split_join_metric3
+ts_json_string_len_fast
+"
+
+for name in $workers; do
+  grep -Eq "^[A-Za-z_][A-Za-z0-9_ *]*${name}\\(" "$header" || {
+    echo "[runtime-inline] FAIL: $name has no header declaration"
+    exit 1
+  }
+  grep -Eq "^[A-Za-z_][A-Za-z0-9_ *]*${name}\\(" "$source" || {
+    echo "[runtime-inline] FAIL: $name has no out-of-line definition"
+    exit 1
+  }
+  if grep -Eq "^(static inline|TS_RT_ALWAYS_INLINE).*${name}\\(" "$header"; then
+    echo "[runtime-inline] FAIL: substantial worker $name moved back inline"
+    exit 1
+  fi
+done
+
+for name in \
+  ts_str_view_typed \
+  ts_str_find_forward_view \
+  ts_str_find_backward_view
+do
+  grep -Eq "^static inline .*${name}\\(" "$header" || {
+    echo "[runtime-inline] FAIL: bounded header fast path $name is missing"
+    exit 1
+  }
+done
+
+while IFS= read -r name; do
+  [ -n "$name" ] || continue
+  case "$name" in
+    ts_prop_ic_probe_fixed_inline | \
+    ts_prop_is_accessor_inline | \
+    ts_get_pic_checked_inline | \
+    ts_set_pic_inline | \
+    ts_get_dyn_pic_checked_inline | \
+    ts_set_dyn_pic_inline) ;;
+    *)
+      echo "[runtime-inline] FAIL: unexpected always-inline runtime helper $name"
+      exit 1
+      ;;
+  esac
+done < <(sed -n 's/^TS_RT_ALWAYS_INLINE [^ ]* \([A-Za-z_][A-Za-z0-9_]*\)(.*/\1/p' "$header")
+
+echo "[runtime-inline] PASS: large workers are out-of-line; only bounded fast paths and PICs stay inline"
