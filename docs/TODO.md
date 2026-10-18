@@ -4372,6 +4372,74 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   stress (all phases), bundler 42/42, selfconf 404 + 11 KNOWN (DIFF 0),
   parity 330 identical + 84 KNOWN, runtime and Rust units, all 102
   benchmarks within budget.
+- Native build at `-O2` with cold functions at O0. The direct-entry slice
+  changed the shape of a function definition (`fn_X_d(...)`), and the build
+  script's regex that marks the giant cold functions (`__module_init`,
+  `createTypeChecker`, `createNodeFactory`, `createProgram`) as `optnone`
+  stopped matching, so the 146k-line module initializer was optimized at
+  `-O1` and the build took 84 minutes instead of 5 (noticed only after the
+  fact: the previous build's duration must be the watchdog's yardstick).
+  With the regex fixed for both entry shapes, the same generated C compiles
+  at `-O2` in 5 minutes. Compiler A/B of identical C at `-O2` against `-O1`
+  (alternating three runs, outputs validated): **9.333 → 8.359 s median
+  wall (10.4% less, 1.12x)**; Node 3.282 s, so the native compiler is 2.55x
+  slower than V8. `-O2` with `TSAOT_NATIVE_COLD_O0=1` is the measured
+  configuration from here on (`TSAOT_NATIVE_CC='cc -O2 -gline-tables-only
+  -fno-omit-frame-pointer'`).
+- Rejected: branch-aware IR inlining of small free functions. The
+  generated-code profile of the direct-entry build is flat (the hottest
+  function, `getObjectFlags`, is 1.5% of samples; the top forty-five are
+  about a third) and many top entries are tiny leaves that SROA's
+  straight-line inliner rejects because a conditional expression or an
+  early return is an `If`. A second inliner (bodies of `Const`/`BinOp`/
+  `UnOp`/`Copy`/`LoadField`/`StoreField`/`Return`/`If` up to 24
+  instructions, early returns restructured by copying the rest of the body
+  into the non-returning branch, callee locals re-created with their types,
+  missing arguments undefined) removed 1,713 direct call sites on the
+  compiler (every site of `getObjectFlags`, `getEmitFlags` and
+  `isFreshLiteralType`) and passed every gate, but the compiler A/B against
+  the `-O2` direct-entry build was **8.435 → 8.551 s (1.4% slower)** on all
+  three alternating runs with outputs matching. At `-O2` Clang already
+  inlines these static leaves at their direct call sites; the IR copy only
+  adds property-read sites (67,878 → 70,813) and code (52.2 → 53.1 MB).
+  Not committed; the fixture `functions/branchy_inline` (early and nested
+  returns, void paths, missing arguments, captured cells, results used in
+  loops) stays as coverage, with its frozen-pair difference allowlisted
+  (the known any-definition numeric clone rule on `partial`). The cost
+  that remains in those leaves, inlined or not, is the root frame push and
+  pop and the slot fill, which is slice C2's target.
+- Fixed: a numeric function whose end is reachable returned 0 instead of
+  undefined through its direct-call clones. The clone eligibility
+  (`returns_numeric_values`) checked that every explicit `Return` carries a
+  numeric value but never asked whether the body can complete normally, so
+  `function partial(x: number): number | undefined { if (x > 5) return x *
+  2; }` got i64/f64 clones that fell off the end with 0 (the frozen twin
+  has the same rule). The exporter now makes an implicit return explicit:
+  when the end of a block body is reachable by a structural analysis of the
+  statements (return/throw, if with both branches, switch with a default
+  and no break leaving it whose last clause does not complete, `while
+  (true)`/`for (;;)` without a break, try/finally), a `Return` without a
+  value is appended, which both emitters already treat as non-numeric.
+  Functions that always return (switch dispatchers with a default,
+  infinite loops) keep their clones. Found by the fixture
+  `functions/branchy_inline` written for the rejected inliner. Compiler
+  A/B against the direct-entry `-O2` build: 8.658 → 8.496 s (noise level,
+  outputs validated). Gates: conformance 419/419, parity 330 identical +
+  85 KNOWN (the parity corpus is re-exported; the fixture's frozen
+  difference is the any-definition clone rule on `partial`), bundler
+  42/42, selfconf 405 + 11 KNOWN, GC stress, inline policy, units.
+- Nursery sizing experiment (roadmap D4): `TSAOT_GC_NURSERY_BYTES` of 16 MB
+  and 64 MB against the 4 MB default on the compiler (alternating runs):
+  8.543 → 8.563 s and 8.548 → 8.606 s, so fewer minors do not pay for the
+  cache locality lost; the default stays.
+- Pattern benchmarks against V8 (`scratchpad/pbench`, to be moved into the
+  repo): the flat compiler profile is being attacked pattern by pattern.
+  Twelve tsc-style kernels timed natively and under Node (scaled to
+  100–200 ms under V8): flags/optional-chaining/typeof loop 15x slower,
+  small calls with object arguments 4.7x, array callbacks 4.0x, closures
+  3.1x, arrays of objects 3.05x, scanner-style string loop 2.6x; Map with
+  string keys and method objects faster than V8. First finding:
+  `ts_typeof` allocates a fresh string on every call.
 - Next slices (`docs/v8_parity_roadmap.md`): C2 frame elision for
   functions that cannot reach a collection (562M frame pushes per compile),
   C3 lazy frame initialization, boxing a value-used nested declaration on

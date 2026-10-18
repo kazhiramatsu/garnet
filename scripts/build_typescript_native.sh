@@ -44,7 +44,8 @@ code = code.replace('  ts_setup_globals();',
                     '  ts_setup_globals();\n  garnet_native_system_init(argc, argv);')
 exceptions = []
 if os.environ.get("TSAOT_NATIVE_COLD_O0") == "1":
-    for match in re.finditer(r'^static tsv (fn_\d+_\w+)\(tsv\* args, int nargs\)\{', code, re.M):
+    # Generic entries `fn_X(tsv* args, int nargs)` and direct entries `fn_X_d(...)`.
+    for match in re.finditer(r'^static tsv (fn_\d+_\w+)\((?:tsv\* args, int nargs|[^()]*)\)\{', code, re.M):
         end = code.find('\n}\n', match.end()) + 3
         lines = code.count('\n', match.start(), end)
         if lines >= 10000 or (lines >= 2000 and re.search(r'_create[A-Z]', match[1])):

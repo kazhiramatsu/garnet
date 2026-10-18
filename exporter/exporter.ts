@@ -10766,8 +10766,15 @@ class Exporter {
       }
       // yield* (generator delegation) is now supported via lowering to an explicit
       // driving loop in lowerExpr; no rejection here.
-      if (ts.isBlock(node.body)) this.lowerStmt(ctx, node.body);
-      else ctx.body.push({ kind: "Return", src: this.lowerExpr(ctx, node.body) });
+      if (ts.isBlock(node.body)) {
+        this.lowerStmt(ctx, node.body);
+        // A reachable end of the body is an implicit `return undefined`. Make
+        // it explicit so the analyzer sees the undefined result: a function
+        // whose explicit returns are all numeric but whose end is reachable
+        // must not get a numeric direct-call clone (it would read the
+        // fall-through as 0).
+        if (this.statementsCompleteNormally(node.body.statements)) ctx.body.push({ kind: "Return" });
+      } else ctx.body.push({ kind: "Return", src: this.lowerExpr(ctx, node.body) });
     }
 
     // JS Function.prototype.length: leading params with no default, before the
@@ -10807,6 +10814,60 @@ class Exporter {
         !isAsync && !isGenerator,
     });
     if (isExported) this.exports.push(ctx.id);
+  }
+
+  // ---- reachability of a function body's end ----
+  // Can execution fall off the end of this statement list? Conservative in the
+  // direction of "yes" (an unsure answer only costs a numeric clone).
+  statementsCompleteNormally(stmts: readonly ts.Statement[]): boolean {
+    for (const s of stmts) if (!this.statementCompletesNormally(s)) return false;
+    return true;
+  }
+  statementCompletesNormally(s: ts.Statement): boolean {
+    if (ts.isReturnStatement(s) || ts.isThrowStatement(s)) return false;
+    if (ts.isBlock(s)) return this.statementsCompleteNormally(s.statements);
+    if (ts.isIfStatement(s)) {
+      return this.statementCompletesNormally(s.thenStatement) ||
+        (s.elseStatement ? this.statementCompletesNormally(s.elseStatement) : true);
+    }
+    if (ts.isSwitchStatement(s)) {
+      const clauses = s.caseBlock.clauses;
+      if (!clauses.some(ts.isDefaultClause)) return true;
+      // A `break` leaving the switch continues after it; otherwise every clause
+      // falls through to the next and the last clause decides.
+      if (clauses.some((c) => this.hasBreakLeaving(c.statements))) return true;
+      return this.statementsCompleteNormally(clauses[clauses.length - 1].statements);
+    }
+    if (ts.isWhileStatement(s) || ts.isForStatement(s) || ts.isDoStatement(s)) {
+      const cond = ts.isForStatement(s) ? s.condition : s.expression;
+      const unconditional = cond === undefined || cond.kind === ts.SyntaxKind.TrueKeyword;
+      if (!unconditional) return true;
+      // `while (true)` / `for (;;)` is only left through a break.
+      return this.hasBreakLeaving([s.statement]);
+    }
+    if (ts.isTryStatement(s)) {
+      if (s.finallyBlock && !this.statementsCompleteNormally(s.finallyBlock.statements)) return false;
+      const tryNormal = this.statementsCompleteNormally(s.tryBlock.statements);
+      const catchNormal = s.catchClause ? this.statementsCompleteNormally(s.catchClause.block.statements) : false;
+      return tryNormal || catchNormal;
+    }
+    return true; // labeled statements, expression statements, declarations, loops with conditions, ...
+  }
+  // Is there a `break` in these statements that leaves the enclosing switch or
+  // loop they belong to? A break nested in an inner loop or switch targets that
+  // inner statement; a labeled break is counted conservatively. Nested
+  // functions and classes are not entered.
+  hasBreakLeaving(stmts: readonly ts.Statement[]): boolean {
+    let found = false;
+    const visit = (n: ts.Node, nested: boolean): void => {
+      if (found) return;
+      if (ts.isBreakStatement(n)) { if (n.label || !nested) found = true; return; }
+      if (ts.isFunctionLike(n) || ts.isClassLike(n)) return;
+      const inner = nested || ts.isIterationStatement(n, false) || ts.isSwitchStatement(n);
+      ts.forEachChild(n, (c) => visit(c, inner));
+    };
+    for (const s of stmts) visit(s, false);
+    return found;
   }
 
   // ---- class helpers ----

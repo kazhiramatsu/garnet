@@ -665,3 +665,22 @@ call sites use one (argument arrays 46,368 → 13,569, environment-register
 references 39,548 → 13,655). Wall time drops 3.6% (per run 9.225 / 9.227 /
 9.235 s against 9.572 / 9.573 / 9.574 s). Native is now 2.86x slower than V8
 on this machine state. Raw records: `native_s350m/results/run-ur166mjt/`.
+
+### Generated code at `-O2` with cold functions at O0 (Session 350)
+
+Same compiler workload and the same generated C as the direct-entry build,
+three alternating runs after warmup, diagnostics and all 78 emitted files
+matching Node on every launch:
+
+| build | median wall | median process CPU | median peak RSS |
+|---|---:|---:|---:|
+| Direct entries, `cc -O1` (`native_s350m`) | 9.333 s | 9.3 s | 1.23 GB |
+| Direct entries, `cc -O2` (`native_s350m_o2`) | **8.359 s** | **8.4 s** | 1.23 GB |
+| Node 25.2.1 / V8 (same session) | 3.282 s | 5.9 s | 0.80 GB |
+
+Both builds mark the four giant cold functions (`__module_init`,
+`createTypeChecker`, `createNodeFactory`, `createProgram`) `optnone`
+(`TSAOT_NATIVE_COLD_O0=1`); the C compile takes 5 minutes at either level.
+Wall time drops 10.4% (per run 8.343 / 8.359 / 8.391 s against 9.316 /
+9.333 / 9.358 s). Native is now 2.55x slower than V8 on this machine state.
+Raw records: `native_s350m_o2/results/`.
