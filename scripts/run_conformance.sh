@@ -83,7 +83,9 @@ while IFS=$'\t' read -r slug path; do
   if [[ "$estatus" != "OK" || ! -f "$prog" ]]; then
     echo "[conf] FAIL ${slug}: export ${estatus:-?}"; grep "\[$slug\]" "$WORK/exp.err" | head -2; nfail=$((nfail+1)); fail=1; continue
   fi
-  v8="$(node "$jsref" 2>&1 | tr '\n' '|')"
+  # Default-locale fixtures (Date.toLocale*String without arguments) expect the
+  # runtime's fixed en-US subset; pin the oracle so a ja_JP shell does not flip.
+  v8="$(LC_ALL=en_US.UTF-8 node "$jsref" 2>&1 | tr '\n' '|')"
   "$TSAOT" "$prog" emit > "$WORK/$slug.c" 2>"$WORK/$slug.an.err" || { echo "[conf] FAIL ${slug}: analyze"; cat "$WORK/$slug.an.err"|head -2; nfail=$((nfail+1)); fail=1; continue; }
   if ! tsaot_prepare_regexp_objs "$WORK/$slug.c" "$WORK" 2>"$WORK/$slug.rx.err"; then
     echo "[conf] FAIL ${slug}: regexp-link-prep"; head -3 "$WORK/$slug.rx.err"; nfail=$((nfail+1)); fail=1; continue

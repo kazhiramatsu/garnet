@@ -471,6 +471,12 @@ pub struct Function {
     /// driven by .next() rather than the event loop.
     #[serde(default)]
     pub is_generator: bool,
+    /// Number of leading `params` that are captured cells (the closure
+    /// environment threaded by the creating or directly calling function).
+    /// The production emitter passes them through the runtime's environment
+    /// register; the argument array then holds only the real arguments.
+    #[serde(default)]
+    pub capture_count: u32,
     /// True if the function reads args[0] as `this` (methods, accessors, and
     /// functions written with an explicit `this` parameter). Used so that
     /// Function.prototype.call/apply/bind inject thisArg at args[0] only for

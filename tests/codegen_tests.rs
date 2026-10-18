@@ -28,7 +28,7 @@ fn alloc_fn(id:u32, name:&str, sites:&[u32]) -> Function {
             class_id: None, proto: None,
         }).collect(),
         is_exported: false, param_classes: Default::default(), rest_param: None,
-        is_async: false, is_generator: false, takes_this: false, arity: 0,
+        is_async: false, is_generator: false, capture_count: 0, takes_this: false, arity: 0,
         has_prototype: false,
     }
 }

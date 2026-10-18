@@ -3944,3 +3944,228 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   only the successful libc rerun is counted. No forced-GC workload, threshold
   changes or frozen-analyzer edits were made. Logs and saved baselines remain
   under build/typescript_603/native_host/gc_opt and logs.
+
+### Session 350: Lazy function prototypes and cached property additions
+
+- Sampled the accepted Session 349 native TypeScript compiler (8,193 stacks).
+  Generated code held 57.5% of self time; the runtime's largest shares were
+  closure calls (`ts_call` 6.3%), GC (10.4%), property stores/loads (8.3%),
+  `ts_set_fn_prototype` with its `"constructor"` interning and definition,
+  `ts_strict_eq`, regexp backtracking (2.0%) and memset/memmove. Runtime
+  counters showed 31.0M closure allocations each receiving an eager prototype
+  object plus a `constructor` property, and 73.1M fixed-key stores of which
+  only 2.5% hit the store cache because they were property additions.
+- Function `.prototype` objects are now created lazily. The emitter spells
+  `ts_set_fn_prototype_lazy(fn)`; the runtime marks the function constructable
+  and creates the prototype object together with its non-enumerable
+  `constructor` on the first observation (`fn.prototype` reads, `new fn()`,
+  own descriptors, `instanceof` on plain functions). The eager legacy form
+  defers only the `constructor` definition and is kept for the frozen oracle
+  (`TSAOT_LAZY_PROTO=0`, wired into `emitc_diff.sh`). Flags occupy former
+  padding, so `ts_func` keeps its 120-byte layout and relinks stay valid.
+- Added a bounded property-addition cache to `ts_set_pic` (4,096 entries,
+  160 KiB) keyed by site and pre-addition shape. A hit appends through the
+  shared `props_append` helper with the recorded resulting shape. Entries
+  record the direct prototype and an epoch that moves on accessor definitions,
+  `setPrototypeOf`, class registrations and every collection, so a hit implies
+  the slow path's decision. Symbol keys, sized receivers, dictionary shapes and
+  non-extensible receivers stay on the slow path. See `property_pic_design.md`.
+- `ts_strict_eq` returns early for identical bit patterns (NaN excepted), and
+  the per-allocation GC configuration check became a predictable flag test.
+- Runtime-only relink of the saved compiler object, alternating three runs
+  after warmup, all 78 emitted files, diagnostics and exit codes matching Node:
+  **28.536 → 26.415 s median wall (7.4% less)**, process CPU 28.24 → 26.05 s,
+  peak RSS 1.93 → 1.92 GB. This measures the lazy `constructor`, the addition
+  cache and the equality/allocation tweaks only; the generated C still carries
+  the eager prototype allocation. The machine was lighter than in Session 349,
+  so absolute times are not comparable to that session's table.
+- The emitted lazy form was measured on a checker-style probe (six nested
+  declarations per call, 4M calls, a few escaping closures): 1.53 → 1.24 s
+  with identical output. The TypeScript compiler C was then regenerated with
+  the production emitter (`scripts/build_typescript_native.sh`, same O1/O0
+  mix, 305 s build). Its C is line-identical to the Session 348 object source
+  apart from the 13,594 prototype sites, so the pairing isolates the lazy
+  prototypes: alternating three runs against the relinked old C with the same
+  runtime gave **24.350 → 23.872 s median wall (2.0% less)**; check-only
+  statistics show 119.7M → 92.3M cells (−1.97 GB), 2,675 → 2,153 minors and
+  2.14 → 1.82 s of pauses, and `"constructor"` interning 32.2M → 3.4M calls.
+  Peak RSS rose 1.92 → 2.02 GB in emit mode (check-only is flat at 1.43 GB):
+  with 27% fewer young cell bytes per unit of work, minors run less often and
+  the malloc'd payloads of dead young strings/environments are released later.
+  A payload-aware nursery trigger is noted below as a follow-up; the prototype
+  objects themselves were cheap bump allocations, which is why the second
+  step gains less than the first.
+- Added `functions/lazy_prototype_constructor.ts`,
+  `objects/add_transition_cache.ts` and `operators/strict_eq_identity.ts`.
+  Allowlisted two reviewed parity labels (the new objects fixture and
+  `closures/allocation_lifetimes`, whose Session 349 fixture postdated the
+  last parity run). The conformance oracle now pins `LC_ALL=en_US.UTF-8`
+  for the V8 run: under this shell's `ja_JP` locale `date_locale_time`
+  flipped Node's default-locale output while the runtime's fixed en-US subset
+  did not; the fixture passes with the pin and in an en-US shell.
+- Gates: normal conformance **407/407** with the locale pin (406/407 before
+  it, the one failure being that locale artifact), bundler **42/42**, frozen
+  parity **325 identical + 79 KNOWN**, runtime units, Rust units, a 26-kernel
+  benchmark subset (property, interface, closure, GC churn, inheritance,
+  dispatch, JSON, exceptions, generators; three runs) correct and within
+  budget, and the runtime with `-Wall -Wextra` adds no new warnings. After
+  the regenerated build, the full **102/102** benchmark battery (three runs)
+  passed its correctness and time budgets, and the forced-GC stress gate
+  (young threshold 1: focused conformance at O2 and ASan 21/21 each, runtime
+  units under ASan, aging-promotion, adaptive-aging and 64 MiB string-builder
+  phases) passed as an isolated phase. The frozen analyzer source is unchanged.
+- Second cycle, toward the V8 target. Const enum member reads now fold to
+  literals in the exporter (`constEnumMemberValue`, the checker's
+  `getConstantValue`, which answers only for const enums exactly as
+  TypeScript's own emit inlines them). `node.kind === SyntaxKind.X`, flag
+  tests and `CharacterCodes` comparisons had cost two cached property loads
+  each through the namespace object. The generated compiler C shrank
+  72.5 → 66.7 MB. The header gained a slot/key fallback inside the inline
+  property probe for shape-polymorphic sites, inline `ts_strict_eq` and
+  `ts_number_coerce` wrappers (string/object cases out of line as
+  `ts_strict_eq_slow`/`ts_number_coerce_slow`), and a lean flat-string
+  `charCodeAt` path; the inline policy gate keeps forced expansion limited to
+  the PIC wrappers. Alternating three runs: **23.352 → 17.673 s (24.3% less)**
+  against the lazy-prototype build, and against the Session 349 executable
+  in one run **24.649 → 17.630 s (28.5% less, 1.40x)**; Node measured 3.26 s,
+  so native is now about 5.4x slower than V8 (was 7.3x). Conformance 407/407.
+- Third cycle. `ts_to_int32`/`ts_to_uint32` now test whether the double is
+  already an exact integer before the floor/fmod reduction (every `flags &
+  TypeFlags.X` paid a libm call); `ts_obj`/`ts_str_v`/`ts_func_v` box a live
+  cell's handle inline; `ts_truthy_fast` keeps the object/function/bool/nullish
+  tags inline and sends only strings out of line; the property-addition cache
+  epoch moves on full collections only and records old prototypes exclusively
+  (a minor cannot recycle an old cell's handle); closure environment buffers of
+  up to 16 slots come from bounded exact-size free lists; and array growth no
+  longer fills the unused tail (slots at or beyond `len` were never read, as
+  truncation already relies on). Alternating three runs: **17.539 → 17.395 s
+  (0.8% less)**, peak RSS 2.02 → 1.94 GB. Conformance 407/407.
+- Fourth cycle: the closure environment ABI. `Function.captureCount` records
+  the leading cell parameters; callers store the cell buffer in the runtime's
+  environment register `g_ts_cur_env` right before the call (a stack array for
+  direct calls, the closure's own buffer in `ts_call`), the callee prologue
+  reads its cells from the register first, and the argument array carries only
+  real arguments. `ts_make_closure_t`/`_pretenured`/`ts_make_class_value_cells`
+  flag such closures (`ts_func.env_abi`, carved from `arity`), so runtime thunks
+  and the frozen oracle's C keep the merged convention; `TSAOT_CLOSURE_ENV_ABI=0`
+  restores the legacy emission for byte parity. See `capture_lowering.md`.
+  Two gaps surfaced and were fixed before measuring: the synthesized no-ctor
+  class constructor and the namespace export getter had cell parameters but no
+  capture count, and `main`'s entry calls (`__module_init` captures two module
+  cells in the compiler) passed no environment; entry calls now point the
+  register at an undefined buffer, reproducing the old `nargs = 0` state.
+  Alternating three runs against the third-cycle build (machine busier, so the
+  pairing matters more than the absolute values): **19.542 → 16.589 s median
+  wall (15.1% less)**, RSS unchanged at 1.94 GB; the checker-style probe went
+  1.24 → 1.03 s. Conformance 407/407, bundler 42/42, parity 325 + 79 KNOWN,
+  selfconf 395 + 9 KNOWN. selfconf also exposed undefined behavior in the
+  third cycle's `ts_to_int32` fast path (an out-of-range double cast that
+  Clang turned into a trap under the frozen untyped build); it is now range
+  checked before the integer round trip.
+- Fifth cycle: handle-table generation bit. Every handle table entry now
+  carries the cell's generation in bit 0 (set at allocation, at every move
+  and at the three in-place promotions), so the minor collector's edge
+  filter, `ts_write_barrier` and the array write barrier classify old targets
+  from the table entry without loading the cell; `ts_ptr` masks the bit. The
+  bit only ever says "old" for a cell that is old, and generations never
+  regress, so a stale "young" entry is merely slower, never unsafe.
+  Alternating three runs against the ABI build: **16.521 → 15.964 s median
+  wall (3.4% less)**, RSS unchanged. GC stress (all phases), conformance
+  407/407 and runtime units passed with this runtime.
+- Structural plan toward V8 parity written as `v8_parity_roadmap.md` (tracks:
+  object model v2, pointer-stable old generation, call convention v2,
+  collector work) and `object_model_v2_design.md` (shape-owned keys and
+  flags, value vectors, in-object slots, slices A2a/A2b/A3). Slice A2a
+  (shape descriptors with flag-aware transitions, `props_define`,
+  `obj_to_dictionary`, instrumented `SHAPE_CHECK`) is implemented behind the
+  unchanged `ts_prop` representation; its gates are listed with the final
+  gate summary below.
+- Object model v2, slice A2b (value vectors; `object_model_v2_design.md`).
+  Shaped objects now store only values (8 bytes per property); keys and
+  attribute flags live in the shape's eager vectors (`g_ts_shape_keys`,
+  `g_ts_shape_flags`), shapes with eight or more keys carry their own
+  open-addressing index, and the property reference `ts_pref {object, slot}`
+  replaced `ts_prop*` across the runtime (lookup, define, delete, descriptors,
+  enumeration, JSON, GC, inline caches). The inline probe returns a value
+  pointer plus the slot's attribute flags, which the cache entry keeps in the
+  top byte of its slot word; deletion and attribute redefinition convert the
+  object to a dictionary first. Dictionaries, sized class instances, arrays,
+  functions, maps and sets keep the entry representation. Alternating three
+  runs against the generation-bit build: **16.826 → 16.362 s median wall
+  (2.8% less)**, peak RSS **1.94 → 1.34 GB**. Conformance 407/407, GC stress
+  (all phases), bundler 42/42, 102 benchmarks within budget, selfconf
+  395 + 9 KNOWN, runtime units (the index tests now accept the per-shape
+  index for shaped objects). A regex rewrite had briefly turned the accessor
+  bodies recursive; the unoptimized runtime test build caught it as a crash.
+- Slice C5a, typed cells (toward the capture-context work the roadmap lists
+  as C5). The exporter now gives every captured-variable cell the synthetic
+  class `__cell` with the single struct field `__value` (`classId` on the
+  cell allocation sites, `paramClasses` for cell parameters), so the existing
+  typed-field codegen emits a direct struct access with the proxy guard for
+  the 55,865 cell reads and 13,551 cell writes in the compiler instead of a
+  cached property lookup. Two analyzer fixes were required: scalar
+  replacement must not dematerialize a cell captured by a closure (the
+  closure's callee reads it through the environment), and cells must stay on
+  the heap regardless of the per-frame escape verdict (plain-object cells
+  always were; typed cells would have honored a stack decision while their
+  closures could outlive the frame through containers loaded from other
+  cells). `TSAOT_TYPED_CELLS=0` keeps the plain-object IR; the parity oracle
+  exports its corpus with it. Probe: 1.03 → 0.87 s. Compiler A/B after the
+  two fixes below (alternating three runs, diagnostics and all 78 emitted
+  files validated against Node): **15.289 → 12.894 s median wall (15.7%
+  less, 1.19x)**; Node 3.219 s, so the native compiler is now 4.0x slower
+  than V8 (5.0x at the start of this slice, 7.3x at the start of Session 349).
+- Three exception-handler silent miscompiles, found while the typed-cell
+  compiler crashed (AddressSanitizer: a try handler freed by `ts_eh_pop` was
+  read again after a `longjmp` into a dead frame). (1) A `return` inside a
+  plain `try` left the handlers it crossed on the EH stack, so the next throw
+  in the CALLER landed in the dead frame (V8 diff: the caller's `catch` was
+  skipped). `emit_inst`'s Return now emits one `ts_eh_pop()` per live handler
+  (`Ctx::eh_depth`). (2) In coroutines, a try without a suspension was kept
+  structured, so a `return` inside it was a raw C return of the resume
+  function: the promise never resolved and the program exited silently. Such
+  tries (and tries with a break/continue leaving them, which made the analyzer
+  panic) now take the flat lowering. (3) A break/continue out of a suspending
+  try left `eh_top` and the global handler active, so a throw after the loop
+  was routed to the dead catch. The flattener now carries the handler depth
+  (`loops` and `FinFrame` record it) and emits `Flat::TryLeave(n)` before the
+  jump. `TSAOT_EH_RETURN_POP=0` restores the frozen emission for the parity
+  oracle only (wired into `emitc_diff.sh`; help text in `garnet`). Fixtures:
+  `errors/return_in_try_handler_pop`, `control/return_in_try_coroutine`,
+  `control/loop_escape_try_coroutine` (all three are selfconf KNOWN: the frozen
+  emitter has the bugs). Exception/coroutine subset 57/57, parity 327
+  identical + 79 KNOWN (the loop-escape fixture is skipped on the frozen side).
+- Typed-cell compiler failure, root cause: `TypeError: setScriptTarget is not
+  a function` from the checker's lazily created scanner. The checker-level
+  `var scanner: Scanner | undefined` cell held the number 0, so `scanner ??=
+  createScanner(...)` skipped the creation. A sized instance comes from zeroed
+  memory and a zero word is the number 0 under NaN-boxing; plain-object cells
+  never had this problem because a missing property reads as undefined. The
+  same bug already existed for user classes: a declared field that no
+  constructor assigns read as 0 (`class A { x?: number }`, `new A().x`). Fix:
+  every classed allocation (heap, pretenured, stack) stores `TS_UNDEFINED`
+  into its boxed fields, and the runtime's dynamic `new` path does the same
+  from the class descriptor. `TSAOT_UNDEF_FIELDS=0` restores the frozen
+  emission for the parity oracle. Known remaining limitation (CLAUDE.md):
+  a monomorphized numeric field (`x: number`) still reads as 0 before its
+  first assignment because its unboxed slot cannot hold undefined. Fixtures:
+  `classes/unassigned_field_undefined`, `closures/captured_uninitialized_cell`.
+  Observed while writing the fixture, not changed: `"x" in a` for a declared
+  but never assigned field is true natively (the class keeps the own slot) and
+  false in the ES2020 reference transpile (the declaration is erased).
+- Final gate pass on the session's tree (typed cells, the three handler
+  fixes, boxed-field initialization): conformance 412/412, runtime inline
+  policy, GC stress (all phases, including the ASan builds), bundler 42/42,
+  selfconf 398 + 11 KNOWN (DIFF 0, CCFAIL 0), parity 329 identical + 79
+  KNOWN (DIFF 0, 1 skip), runtime and Rust unit suites, all 102 benchmarks
+  correct and within budget. Nothing is committed yet.
+- Next slices, in the order agreed for the closure-heavy compiler
+  (`docs/v8_parity_roadmap.md`): C5b capture contexts (one scope record per
+  activation holding the captured variables as fixed-offset fields, a single
+  context reference per closure instead of an environment array; typed cells
+  are the stepping stone), then A3 in-object slots, C1 known-arity direct
+  entries, and B pointer-stable old generation. Smaller items still open
+  from the profile: the minor-collection trigger counts cell bytes only
+  (crediting malloc'd payload bytes would release dead payloads sooner), and
+  24M property additions still take the slow path after the addition cache
+  (per-site second entry or shape-only key).

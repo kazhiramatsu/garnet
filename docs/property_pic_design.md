@@ -155,3 +155,34 @@ emitted byte with the Node build. See `benchmarks/typescript_native/README.md`
 and `docs/bench_results.md` for commands, flags and measurements.
 `benchmarks/interface_property_kernel.ts` separately exercises interface reads,
 writes and method calls across 32 layouts, including dictionary objects.
+
+## Property-addition cache
+
+Stores that add a property can never hit the per-site shape cache: the
+receiver's hidden class changes with every addition, so a constructor or a
+literal that initializes a fresh object field by field misses on each store.
+On the native TypeScript workload the store cache hit only 2.5% of 73M
+fixed-key stores, and each miss re-ran the struct-field registry probe, the
+own-slot scan, the prototype-chain accessor walk and the transition-table
+lookup before appending.
+
+`ts_set_pic` now consults a bounded global table (4,096 entries, 160 KiB)
+keyed by the site and the receiver's pre-addition shape. An entry records the
+key, the direct prototype, the slot (the length before the addition), the
+resulting shape and an epoch. A hit appends through the same `props_append`
+helper that `find_prop` uses and reuses the recorded shape, so the slow
+path's hidden-class, index and flag behavior is reproduced exactly. The entry
+is only filled after a slow-path addition that actually appended one own data
+property to a plain, extensible, non-dictionary receiver with a string key.
+
+The hit conditions reproduce the slow path's decision: the same shape fixes
+the own key sequence and the integrity bits, the same direct prototype plus an
+unchanged class-layout state fixes the struct-field answer, and the epoch
+guards everything that could introduce an inherited setter or recycle a
+prototype handle. The epoch moves on every accessor definition, every
+`setPrototypeOf`, every class registration and every collection (minor or
+full), because freed handles may be reused by new prototypes. Symbol keys and
+sized class instances never enter the cache. `objects/add_transition_cache.ts`
+covers later-installed inherited setters, prototype relinks, frozen and
+non-extensible receivers, dictionary receivers after deletion, index growth,
+polymorphic sites and sized receivers.

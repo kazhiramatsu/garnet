@@ -218,3 +218,21 @@ can change at runtime — this is what keeps static devirtualization sound in th
 presence of these reflective operations. `getPrototypeOf` is a pure observation
 and does not affect stability. Tests: `proto_get_set` (identity change + dynamic
 dispatch after relink).
+
+## Lazy function `.prototype` objects
+
+Every function declaration and function expression owns a `.prototype`
+property (`FN_HAS_PROTOTYPE`), and nested declarations create a new closure on
+each call of their enclosing function. The TypeScript checker allocates about
+31M such closures while compiling its own sources, and almost none of them is
+ever used as a constructor. Since Session 350 the emitter spells the property as
+`ts_set_fn_prototype_lazy(fn)`: the function is marked constructable, but the
+prototype object and its non-enumerable `constructor` are created on the first
+observation. Observation points are a read of `fn.prototype` (including
+`instanceof` on a plain function and `getOwnPropertyDescriptor`), `new fn()`,
+and nothing else, because the object is reachable only through the function.
+Assigning `fn.prototype = x` before any observation simply drops the pending
+object. The legacy eager form `ts_set_fn_prototype(fn, ts_new_proto())` is
+still supported (`TSAOT_LAZY_PROTO=0`, used by the frozen parity oracle) and
+now also defers only the `constructor` definition. `functions/
+lazy_prototype_constructor.ts` covers both spellings' observable behavior.

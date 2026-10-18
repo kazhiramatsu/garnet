@@ -91,6 +91,13 @@ static inline double ts_to_num(tsv v) { double d; memcpy(&d, &v, 8); return d; }
 /* JS ToInt32 / ToUint32 (ECMA-262): NaN/Inf -> 0; truncate toward zero; reduce
    modulo 2^32; interpret as signed/unsigned 32-bit. Used by bitwise operators. */
 static inline int32_t ts_to_int32(double d) {
+  /* Flag words and indices are already int32 values: converting back and
+     comparing exactly proves it, and skips the floor/fmod reduction. The range
+     test keeps the conversion defined (NaN fails both comparisons). */
+  if (d >= -2147483648.0 && d < 2147483648.0){
+    int32_t i = (int32_t)d;
+    if ((double)i == d) return i;
+  }
   if (d != d || d == (1.0/0.0) || d == -(1.0/0.0)) return 0;
   double t = (d < 0) ? -floor(-d) : floor(d);   /* truncate toward zero */
   double m = fmod(t, 4294967296.0);             /* mod 2^32 */
@@ -99,6 +106,10 @@ static inline int32_t ts_to_int32(double d) {
   return (int32_t)u;
 }
 static inline uint32_t ts_to_uint32(double d) {
+  if (d >= 0.0 && d < 4294967296.0){
+    uint32_t u = (uint32_t)d;
+    if ((double)u == d) return u;
+  }
   if (d != d || d == (1.0/0.0) || d == -(1.0/0.0)) return 0;
   double t = (d < 0) ? -floor(-d) : floor(d);
   double m = fmod(t, 4294967296.0);
@@ -137,13 +148,32 @@ void ts_gc_remember(ts_gc_header* h);
  * (slot_id << 1) | 1. This keeps existing ts_ptr call sites working while
  * making heap object identity independent from the object's address. */
 tsv ts_heap_ref_value(uint16_t sel, void* p);
+/* Handle table entries carry the cell's generation in bit 0 (cells are at least
+   16-byte aligned): 1 = old. The minor collector and the write barriers can
+   classify a reference from the entry alone, without touching the cell, which
+   is usually cold for an old target. */
+#define TS_HANDLE_OLD_BIT ((uintptr_t)1u)
+static inline ts_gc_header* ts_handle_entry_cell(uintptr_t entry){
+  return (ts_gc_header*)(entry & ~TS_HANDLE_OLD_BIT);
+}
+/* Every managed cell receives its stable handle at allocation, so boxing a
+   live cell is a load; non-heap (stack/SROA) cells and NULL go out of line. */
+static inline tsv ts_heap_ref_fast(uint16_t sel, void* p) {
+  if (TS_RT_LIKELY(p != NULL)){
+    uint64_t handle = ((const ts_gc_header*)p)->handle;
+    if (TS_RT_LIKELY(handle != 0)) return TS_BOX(sel, handle);
+  }
+  return ts_heap_ref_value(sel, p);
+}
 static inline void* ts_ptr(tsv v) {
   uint64_t payload = v & TS_PAYLOAD_MASK;
-  return (payload & 1u) ? (void*)g_ts_handle_table[payload >> 1] : (void*)(uintptr_t)payload;
+  return (payload & 1u)
+    ? (void*)ts_handle_entry_cell((uintptr_t)g_ts_handle_table[payload >> 1])
+    : (void*)(uintptr_t)payload;
 }
-static inline tsv ts_obj(void* p) { return ts_heap_ref_value(TS_SEL_OBJECT, p); }
-static inline tsv ts_str_v(void* p){ return ts_heap_ref_value(TS_SEL_STRING, p); }
-static inline tsv ts_func_v(void* p){return ts_heap_ref_value(TS_SEL_FUNC,   p); }
+static inline tsv ts_obj(void* p) { return ts_heap_ref_fast(TS_SEL_OBJECT, p); }
+static inline tsv ts_str_v(void* p){ return ts_heap_ref_fast(TS_SEL_STRING, p); }
+static inline tsv ts_func_v(void* p){return ts_heap_ref_fast(TS_SEL_FUNC,   p); }
 static inline int ts_is_obj(tsv v) { return TS_TOP16(v) == TS_SEL_OBJECT; }
 static inline int ts_is_heap_str(tsv v) { return TS_TOP16(v) == TS_SEL_STRING; }
 static inline int ts_is_short_str(tsv v) { return TS_TOP16(v) == TS_SEL_SHORTSTR; }
@@ -234,7 +264,18 @@ static inline int prop_is_accessor(const ts_prop* p){ return (p->flags & TS_PROP
 /* Ordinary objects start at the shared empty shape. Shape 0 means dictionary /
    uncacheable layout (currently reached after property deletion). */
 enum { TS_SHAPE_NONE = 0, TS_SHAPE_EMPTY = 1, TS_SHAPE_MAX = (1u << 29) - 1u };
+/* Shape-owned key and attribute vectors (object_model_v2_design.md, slice
+   A2b). A shaped object (shape != 0) stores only values, 8 bytes each; its
+   keys and flags are the vectors of its shape, indexed by slot. Dictionary
+   objects (shape 0) keep per-entry keys and flags. */
+extern ts_key** g_ts_shape_keys;
+extern uint8_t** g_ts_shape_flags;
 #define TS_PROP_IC_SIZE 4
+/* A cache entry's slot word carries the property's attribute flags in its
+   top byte, so an inline hit knows whether the slot is plain writable data
+   without consulting the shape. */
+#define TS_PIC_SLOT_MASK 0x00FFFFFFu
+#define TS_PIC_FLAGS_SHIFT 24u
 typedef struct {
   ts_key key;
   uint32_t shape;
@@ -498,17 +539,39 @@ static inline double ts_str_charcodeat_fast(tsv s, double idx){
   long i = (long)idx;
   return (double)ts_str_cu_at_view(x, (uint32_t)i);
 }
-static inline double ts_str_charcodeat_typed(tsv s, double idx){
+static inline double ts_str_charcodeat_general(tsv s, double idx){
   ts_strview x = ts_str_view_typed(s);
   if (isnan(idx)) idx = 0;
   if (!x.len || idx <= -1 || idx >= (double)x.len) return NAN;
   long i = (long)idx;
   return (double)ts_str_cu_at_view(x, (uint32_t)i);
 }
-static inline long long ts_str_charcodeat_i64_typed(tsv s, long long i){
+/* Scanner loops call this per code unit. The flat one-byte heap string with an
+   in-range index is a few instructions, small enough for the O1 cost model;
+   NaN, negative, out-of-range, short, view and UTF-16 cases take the general
+   path (a NaN index fails both range tests and is handled there). */
+static inline double ts_str_charcodeat_typed(tsv s, double idx){
+  if (TS_RT_LIKELY(ts_is_heap_str(s))){
+    const ts_string* x = ts_str_ptr_typed(s);
+    if (TS_RT_LIKELY(!(x->flags & (TS_STR_FLAG_VIEW | TS_STR_FLAG_UTF16))) &&
+        idx >= 0 && idx < (double)x->len)
+      return (double)(unsigned char)x->data[(uint32_t)idx];
+  }
+  return ts_str_charcodeat_general(s, idx);
+}
+static inline long long ts_str_charcodeat_i64_general(tsv s, long long i){
   ts_strview x = ts_str_view_typed(s);
   if (i < 0 || i >= (long long)x.len) return 0;
   return (long long)ts_str_cu_at_view(x, (uint32_t)i);
+}
+static inline long long ts_str_charcodeat_i64_typed(tsv s, long long i){
+  if (TS_RT_LIKELY(ts_is_heap_str(s))){
+    const ts_string* x = ts_str_ptr_typed(s);
+    if (TS_RT_LIKELY(!(x->flags & (TS_STR_FLAG_VIEW | TS_STR_FLAG_UTF16))) &&
+        (unsigned long long)i < (unsigned long long)x->len)
+      return (long long)(unsigned char)x->data[(uint32_t)i];
+  }
+  return ts_str_charcodeat_i64_general(s, i);
 }
 static inline long long ts_str_slice_charcodeat_i64_typed(tsv s, long long start, long long len, long long i){
   if (i < 0 || i >= len) return 0;
@@ -637,10 +700,11 @@ static inline uint32_t ts_array_len_fast(tsv arr){
 }
 static inline int ts_truthy_fast(tsv v){
   if (ts_is_num(v)){ double d=ts_to_num(v); return d!=0 && !(d!=d); }
-  if (ts_is_bool(v)) return (int)(v&1);
-  if (ts_is_undef(v)||ts_is_null(v)) return 0;
-  if (ts_is_str(v)) return ts_str_len_typed(v)!=0;
-  return 1;
+  uint16_t t = TS_TOP16(v);
+  if (t == TS_SEL_OBJECT || t == TS_SEL_FUNC) return 1;
+  if (t == TS_SEL_BOOL) return (int)(v&1);
+  if (t == TS_SEL_UNDEF || t == TS_SEL_NULL) return 0;
+  return ts_truthy(v);   /* strings (and short strings): length test out of line */
 }
 static inline int ts_is_nullish_fast(tsv v){ return ts_is_null(v) || ts_is_undef(v); }
 static inline int ts_is_undefined_fast(tsv v){ return ts_is_undef(v); }
@@ -696,6 +760,15 @@ typedef struct ts_func {
                             a constructor; construction falls back to
                             Object.prototype). Known gap: a bound function is
                             constructable in V8 but not marked here. */
+  uint8_t ctor_pending;  /* 1 while the fresh prototype's own `constructor`
+                            data property has not been materialized yet. The
+                            runtime defines it on the first observation of
+                            fn.prototype (get, construct, descriptor). Occupies
+                            former padding, so the cell layout is unchanged. */
+  uint8_t proto_lazy;    /* 1 while the function owns a `.prototype` whose
+                            object has not been created yet (prototype_prop is
+                            still TS_UNDEFINED). Created, together with its
+                            `constructor`, on the same first observation. */
   /* For a CLASS VALUE (a class used as a runtime value, `const K = C`): the
      class id PLUS ONE (0 = ordinary function/closure, not a constructor). `new K()`
      reads this via ts_construct. code holds the constructor cfunc; env holds the
@@ -703,7 +776,12 @@ typedef struct ts_func {
   uint32_t class_id;
   /* JS first-class metadata, set when a function is boxed as a VALUE:
      `fn.length` (arity) and `fn.name`. name is a static C string (0 = ""). */
-  uint32_t arity;
+  uint16_t arity;
+  /* 1: the code reads its captured cells from g_ts_cur_env (environment
+     ABI, production emitter). 0: the legacy merged convention, where ts_call
+     prepends env to the argument array (runtime thunks, frozen emitter). */
+  uint8_t env_abi;
+  uint8_t reserved_abi;
   const char* name;
   /* JS own "prototype" data property for constructable functions/classes.
      TS_UNDEFINED means this function has no own prototype property (arrows,
@@ -983,7 +1061,12 @@ int    ts_number_is_integer(tsv v);
 int    ts_number_is_finite(tsv v);
 int    ts_number_is_nan(tsv v);
 int    ts_number_is_safe_integer(tsv v);
-double ts_number_coerce(tsv v);
+double ts_number_coerce_slow(tsv v);
+/* JS ToNumber. The number case is the overwhelmingly common one at emitted
+   sites; strings, objects and the remaining primitives convert out of line. */
+static inline double ts_number_coerce(tsv v){
+  return ts_is_num(v) ? ts_to_num(v) : ts_number_coerce_slow(v);
+}
 double ts_parse_float(tsv v);
 double ts_parse_int(tsv v, double radix);
 tsv    ts_number_tofixed(double x, double digits);
@@ -1218,7 +1301,15 @@ uint32_t* ts_string_codepoints_copy(tsv v, uint32_t* out_len);
 tsv  ts_string_from_codepoints(const uint32_t* cps, uint32_t len);
 tsv  ts_add(tsv a, tsv b);            /* JS '+' (number add or string concat) */
 tsv  ts_str_concat_many(tsv* args, int n);
-int  ts_strict_eq(tsv a, tsv b);
+/* JS `===`. Identical bits are equal unless NaN; distinct bits can only be
+   equal for two numbers (+0/-0) or two strings, which compare out of line. */
+int  ts_strict_eq_slow(tsv a, tsv b);
+static inline int ts_strict_eq(tsv a, tsv b){
+  if (a == b) return !(ts_is_num(a) && ts_to_num(a) != ts_to_num(a));
+  if (ts_is_num(a) || ts_is_num(b)) return ts_is_num(a) && ts_is_num(b) && ts_to_num(a) == ts_to_num(b);
+  if (!(ts_is_str(a) && ts_is_str(b))) return 0;
+  return ts_strict_eq_slow(a, b);
+}
 int  ts_relational(tsv a, tsv b, int op);  /* 0:< 1:<= 2:> 3:>= */
 int  ts_loose_eq(tsv a, tsv b);            /* == (returns 1/0) */
 int  ts_object_is(tsv a, tsv b);          /* Object.is SameValue */
@@ -1249,6 +1340,17 @@ tsv  ts_construct(tsv ctorv, tsv* args, int n);
 /* Set a boxed function value's first-class metadata (`fn.length` / `fn.name`). */
 void ts_set_fn_meta(tsv fn, uint32_t arity, const char* name);
 void ts_set_fn_prototype(tsv fn, tsv proto);
+/* Environment register of the closure ABI: a caller stores the callee's
+   captured-cell buffer here immediately before the call; the callee prologue
+   reads its leading cells from it before anything else runs. */
+extern tsv* g_ts_cur_env;
+/* Closure constructors for code compiled with the environment ABI. */
+tsv  ts_make_closure_t(ts_code code, tsv* env, uint32_t envlen, int takes_this);
+tsv  ts_make_closure_t_pretenured(ts_code code, tsv* env, uint32_t envlen, int takes_this);
+tsv  ts_make_class_value_cells(uint32_t class_id, ts_code ctor, tsv* env, uint32_t envlen);
+/* Give fn an own `.prototype` without allocating it: the fresh object (and its
+   `constructor`) is created on first observation. Preferred emitted form. */
+void ts_set_fn_prototype_lazy(tsv fn);
 void ts_gc_collect(void);             /* full mark/sweep over the dynamic heap */
 void ts_gc_collect_young(void);       /* minor collection of young objects */
 void ts_gc_root(tsv* slot);           /* register a root (stack slot address) */
@@ -1282,6 +1384,14 @@ void ts_frame_restore(ts_frame_hdr* frame);
 static inline void ts_write_barrier(tsv owner, tsv value){
   if (!(ts_is_obj(value)||ts_is_func(value)||ts_is_heap_str(value))) return;
   if (!(ts_is_obj(owner)||ts_is_func(owner)||ts_is_heap_str(owner))) return;
+  uint64_t op = owner & TS_PAYLOAD_MASK, vp = value & TS_PAYLOAD_MASK;
+  if ((op & 1u) && (vp & 1u)){
+    /* Both are handle references (heap cells): classify from the table. */
+    uintptr_t oe = (uintptr_t)g_ts_handle_table[op >> 1];
+    uintptr_t ve = (uintptr_t)g_ts_handle_table[vp >> 1];
+    if ((oe & TS_HANDLE_OLD_BIT) && !(ve & TS_HANDLE_OLD_BIT)) ts_gc_remember(ts_handle_entry_cell(oe));
+    return;
+  }
   ts_gc_header* o = (ts_gc_header*)ts_ptr(owner);
   ts_gc_header* v = (ts_gc_header*)ts_ptr(value);
   if (o->gen == TS_GEN_OLD && v->gen == TS_GEN_YOUNG) ts_gc_remember(o);
@@ -1291,12 +1401,15 @@ static inline void ts_write_barrier(tsv owner, tsv value){
    Unsized dictionary receivers validate a cached own slot out of line.
    Their shape is always zero, so struct precedence and registry changes cannot
    invalidate an ordinary shape hit. */
-TS_RT_ALWAYS_INLINE ts_prop* ts_prop_ic_probe_fixed_inline(
-    tsv obj, ts_key key, ts_prop_ic* ic){
-  (void)key; /* Each emitted fixed-key site owns its cache. */
+/* Inline probe for a shaped receiver: returns the value slot and the
+   property's attribute flags (from the entry on a shape hit, from the shape
+   tables on the slot/key fallback). Dictionary receivers never hit inline. */
+TS_RT_ALWAYS_INLINE tsv* ts_prop_ic_probe_fixed_inline(
+    tsv obj, ts_key key, ts_prop_ic* ic, uint8_t* flags){
   if (!ic || ic->megamorphic || TS_TOP16(obj) != TS_SEL_OBJECT) return NULL;
   ts_object* o = (ts_object*)ts_ptr(obj);
-  if (o->h.kind != TS_KIND_OBJECT || ts_obj_shape_id(o) == TS_SHAPE_NONE) return NULL;
+  uint32_t sid = ts_obj_shape_id(o);
+  if (o->h.kind != TS_KIND_OBJECT || sid == TS_SHAPE_NONE) return NULL;
 #if defined(__clang__)
 #pragma clang loop unroll(disable)
 #elif defined(__GNUC__)
@@ -1304,27 +1417,49 @@ TS_RT_ALWAYS_INLINE ts_prop* ts_prop_ic_probe_fixed_inline(
 #endif
   for (uint32_t i = 0; i < TS_PROP_IC_SIZE; i++){
     ts_prop_ic_entry* e = &ic->entries[i];
-    if (e->shape == o->shape) return &o->props[e->slot];
+    if (e->shape == o->shape){
+      *flags = (uint8_t)(e->slot >> TS_PIC_FLAGS_SHIFT);
+      return &((tsv*)o->props)[e->slot & TS_PIC_SLOT_MASK];
+    }
+  }
+  /* Shape-polymorphic sites (one key read across many constructor-initialized
+     layouts, e.g. `node.kind`) usually keep the key at one slot. Validate the
+     remembered slot against the shape's key vector instead of leaving the
+     inline path; this is the same check the out-of-line own probe performs. */
+#if defined(__clang__)
+#pragma clang loop unroll(disable)
+#elif defined(__GNUC__)
+#pragma GCC unroll 1
+#endif
+  for (uint32_t i = 0; i < TS_PROP_IC_SIZE; i++){
+    ts_prop_ic_entry* e = &ic->entries[i];
+    uint32_t slot = e->slot & TS_PIC_SLOT_MASK;
+    if (e->shape != TS_SHAPE_NONE && slot < o->len && g_ts_shape_keys[sid][slot] == key){
+      *flags = g_ts_shape_flags[sid][slot];
+      return &((tsv*)o->props)[slot];
+    }
   }
   return NULL;
 }
 TS_RT_ALWAYS_INLINE tsv ts_get_pic_checked_inline(
     tsv obj, ts_key key, ts_prop_ic* ic){
-  ts_prop* p = ts_prop_ic_probe_fixed_inline(obj, key, ic);
-  if (p && !prop_is_accessor(p)){
+  uint8_t flags = 0;
+  tsv* p = ts_prop_ic_probe_fixed_inline(obj, key, ic, &flags);
+  if (p && !(flags & TS_PROP_ACCESSOR)){
     TS_RT_STAT_PIC_GET_CALL(); TS_RT_STAT_PIC_GET_HIT();
-    return p->val;
+    return *p;
   }
   return ts_get_pic_checked(obj, key, ic);
 }
 TS_RT_ALWAYS_INLINE void ts_set_pic_inline(
     tsv obj, ts_key key, tsv value, ts_prop_ic* ic){
-  ts_prop* p = ts_prop_ic_probe_fixed_inline(obj, key, ic);
-  if (p && !prop_is_accessor(p)){
+  uint8_t flags = 0;
+  tsv* p = ts_prop_ic_probe_fixed_inline(obj, key, ic, &flags);
+  if (p && !(flags & TS_PROP_ACCESSOR) && (flags & TS_PROP_WRITABLE)){
     ts_object* o = (ts_object*)ts_ptr(obj);
-    if (!(ts_obj_integrity(o) & 1u) && prop_is_writable(p)){
+    if (!(ts_obj_integrity(o) & 1u)){
       TS_RT_STAT_PIC_SET_CALL(); TS_RT_STAT_PIC_SET_HIT();
-      p->val = value; ts_write_barrier(obj, value); return;
+      *p = value; ts_write_barrier(obj, value); return;
     }
   }
   ts_set_pic(obj, key, value, ic);

@@ -420,7 +420,7 @@ int main(){
   ts_set(varied,450000u,ts_num(1)); ts_set(varied,shape_x_key,ts_num(2));
   CK("pic slot works across unrelated shapes", ts_to_num(ts_get_pic_checked_inline(varied,shape_x_key,&mega_ic))==2);
   for (int i=0;i<32;i++) (void)ts_get_pic_checked_inline(varied,shape_x_key,&mega_ic);
-  CK("pic repeated new shape is promoted inline", ts_prop_ic_probe_fixed_inline(varied,shape_x_key,&mega_ic)!=NULL);
+  { uint8_t pf=0; CK("pic repeated new shape is promoted inline", ts_prop_ic_probe_fixed_inline(varied,shape_x_key,&mega_ic,&pf)!=NULL); }
   ts_gc_unroot(1);
   tsv same_slot_shapes[4];
   ts_prop_ic same_slot_ic=TS_PROP_IC_INIT;
@@ -433,7 +433,7 @@ int main(){
   for (int i=0;i<32;i++)
     if (ts_to_num(ts_get_pic_checked_inline(same_slot_shapes[i&3],shape_x_key,&same_slot_ic))!=10+(i&3)) same_slot_ok=0;
   for (int i=0;i<4;i++)
-    if (!ts_prop_ic_probe_fixed_inline(same_slot_shapes[i],shape_x_key,&same_slot_ic)) same_slot_ok=0;
+    { uint8_t pf=0; if (!ts_prop_ic_probe_fixed_inline(same_slot_shapes[i],shape_x_key,&same_slot_ic,&pf)) same_slot_ok=0; }
   CK("pic retains four shapes sharing one slot", same_slot_ok);
   ts_gc_unroot(4);
   ts_prop_ic missing_ic=TS_PROP_IC_INIT;
@@ -468,8 +468,11 @@ int main(){
   const ts_key index_base=460000u;
   for (uint32_t i=0;i<24;i++) ts_set(indexed, index_base+i, ts_num((double)i));
   ts_object* indexed_obj=(ts_object*)ts_ptr(indexed);
-  CK("prop index threshold", indexed_obj->len==24 && indexed_obj->prop_index!=NULL);
-  CK("prop index grew", indexed_obj->prop_index_cap>=32);
+  /* Shaped objects index their keys per shape; dictionaries keep the
+     per-object index. Either way all 24 keys must resolve (checked below). */
+  CK("prop index threshold", indexed_obj->len==24 &&
+     (ts_obj_shape_id(indexed_obj)!=TS_SHAPE_NONE || indexed_obj->prop_index!=NULL));
+  CK("prop index grew", ts_obj_shape_id(indexed_obj)!=TS_SHAPE_NONE || indexed_obj->prop_index_cap>=32);
   int indexed_ok=1;
   for (uint32_t i=0;i<24;i++)
     if (ts_to_num(ts_get(indexed, index_base+i)) != (double)i) indexed_ok=0;
@@ -508,7 +511,8 @@ int main(){
   for (uint32_t i=0;i<8;i++) ts_set(collisions,collision_keys[i],ts_num(200+i));
   ts_object* collision_obj=(ts_object*)ts_ptr(collisions);
   CK("prop index collision setup",
-     collision_obj->len==8 && collision_obj->prop_index_cap==16);
+     collision_obj->len==8 &&
+     (ts_obj_shape_id(collision_obj)!=TS_SHAPE_NONE || collision_obj->prop_index_cap==16));
   int collision_ok=1;
   for (uint32_t i=0;i<8;i++)
     if (ts_to_num(ts_get(collisions,collision_keys[i])) != 200+i) collision_ok=0;

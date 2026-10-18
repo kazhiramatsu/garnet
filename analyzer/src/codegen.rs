@@ -18,7 +18,7 @@
 //! would be unsound, so loop (`Many`) sites stay in the arena.
 
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::escape_ir::*;
 
@@ -77,6 +77,36 @@ pub fn decide_with_pretenure(
     enable_pretenure: bool,
 ) -> Vec<SiteDecision> {
     let meta: BTreeMap<u32, &SiteMeta> = program.site_meta.iter().map(|m| (m.site.0, m)).collect();
+    // Sites whose allocation carries a class id (typed cells). Plain-object
+    // cells never honor a stack/arena decision, so only typed cells need the
+    // heap rule below; this also keeps the legacy emission byte-identical.
+    let mut classed_sites: BTreeSet<u32> = BTreeSet::new();
+    fn collect_classed(body: &[Inst], out: &mut BTreeSet<u32>) {
+        for inst in body {
+            match inst {
+                Inst::AllocObject { site, class_id: Some(_), .. } => {
+                    out.insert(site.0);
+                }
+                Inst::Loop { cond_body, body, .. } => {
+                    collect_classed(cond_body, out);
+                    collect_classed(body, out);
+                }
+                Inst::If { then_body, else_body, .. } => {
+                    collect_classed(then_body, out);
+                    collect_classed(else_body, out);
+                }
+                Inst::TryCatch { try_body, catch_body, finally_body, .. } => {
+                    collect_classed(try_body, out);
+                    collect_classed(catch_body, out);
+                    collect_classed(finally_body, out);
+                }
+                _ => {}
+            }
+        }
+    }
+    for f in &program.functions {
+        collect_classed(&f.body, &mut classed_sites);
+    }
 
     result
         .sites
@@ -89,10 +119,23 @@ pub fn decide_with_pretenure(
             let contained = result.contained_sites.contains(&se.site.0);
             let pretenured =
                 enable_pretenure && result.pretenure_sites.contains(&se.site.0);
+            let is_cell = matches!(m.map(|m| m.kind), Some(AllocKind::Cell))
+                && classed_sites.contains(&se.site.0);
             let (strategy, reason) = if pretenured {
                 (
                     AllocStrategy::PretenuredHeap,
                     "escape/lifetime analysis: retained allocation bypasses the nursery",
+                )
+            } else if is_cell {
+                // A captured-variable cell is shared with every closure that
+                // captures it, and those closures may outlive this frame through
+                // paths the per-frame analysis does not bound (containers loaded
+                // from other cells, callbacks). Typed cells are class instances
+                // that WOULD honor a stack/arena decision, so keep them on the
+                // heap, which is what plain-object cells always did.
+                (
+                    AllocStrategy::Heap,
+                    "captured-variable cell: shared with closures, heap",
                 )
             } else {
                 match se.state {

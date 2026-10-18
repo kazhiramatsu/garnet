@@ -11,7 +11,7 @@ fn func(id: u32, params: Vec<u32>, nlocals: u32, body: Vec<Inst>) -> Function {
         params: params.into_iter().map(LocalId).collect(),
         ret: TypeId(0),
         locals: (0..nlocals).map(refl).collect(),
-        body, is_exported: false, param_classes: Default::default(), rest_param: None, is_async: false, is_generator: false, takes_this: false, arity: 0, has_prototype: false,
+        body, is_exported: false, param_classes: Default::default(), rest_param: None, is_async: false, is_generator: false, capture_count: 0, takes_this: false, arity: 0, has_prototype: false,
     }
 }
 fn prog(fns: Vec<Function>) -> Program {

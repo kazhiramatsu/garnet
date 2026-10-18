@@ -489,3 +489,90 @@ to earlier quiet measurements. The alternating comparison includes both wall
 and process CPU time. Its complete record is
 `build/typescript_603/native_host/gc_opt/final_emit_bench/run-01s9edcy/result.json`;
 source/object/binary hashes and layout checks are in `gc_opt/build.json`.
+
+### Lazy prototypes and cached property additions (Session 350)
+
+A 28-second `sample` of the Session 349 executable (8,193 stacks) put 57.5%
+of self time in generated code. In the runtime, closure calls (`ts_call`,
+6.3%), collection work (10.4%), property loads/stores (8.3%) and the eager
+per-closure prototype setup (`ts_set_fn_prototype`, `ts_intern_field` for
+`"constructor"`, `ts_define_data`) stood out. Counters from the check-only
+profile explained two of them: 31,000,213 closures each received a prototype
+object and a `constructor` property, and 73,092,259 fixed-key stores hit the
+store cache only 1,822,472 times because they added properties to fresh
+objects.
+
+Two runtime changes address this without touching generated code. The
+`constructor` property of a fresh prototype is defined on first observation,
+and `ts_set_pic` consults a bounded property-addition cache keyed by site and
+pre-addition shape (invalidated by accessor definitions, prototype relinks,
+class registrations and every collection). `ts_strict_eq` also short-circuits
+identical bit patterns.
+
+Relinking the saved Session 349 compiler object against the new runtime and
+alternating three timed launches after warmup (every launch matched stdout,
+diagnostics, exit status and the SHA-256 manifest of all 78 emitted files):
+
+| executable | median wall | median process CPU | median peak RSS |
+|---|---:|---:|---:|
+| Node 25.2.1 / V8 | 3.621 s | 10.2 s | 0.80 GB |
+| Session 349 native (`gc_opt/tsc-final`) | 28.536 s | 28.5 s | 1.93 GB |
+| Relinked runtime (`gc_opt/tsc-s350`) | **26.415 s** | **26.3 s** | 1.92 GB |
+
+That is **7.4% less wall time** for the native pair. The machine was lighter
+than during the Session 349 table (its baseline measured 33.9 s then), so only
+the paired comparison is meaningful. Raw samples are in the session scratch
+record copied to `build/typescript_603/native_host/gc_opt/s350_relink_bench/`.
+
+The emitter now spells function prototypes as `ts_set_fn_prototype_lazy(fn)`,
+which removes the prototype object allocation itself. On a checker-style
+probe (six nested declarations per call, 4M calls, a few escaping closures)
+the lazy emission ran in 1.24 s versus 1.53 s for the eager spelling with
+the same runtime.
+
+The compiler C was then regenerated with the production emitter
+(`scripts/build_typescript_native.sh`, O1 with the same eight O0 exceptions,
+O2 runtime, static release mimalloc; 305 s). Modulo the 13,594 prototype
+sites the C is line-identical to the Session 348 object source, so the pair
+below isolates the lazy prototypes. Three alternating runs after warmup, all
+outputs and diagnostics matching Node on every launch:
+
+| executable | median wall | median process CPU | median peak RSS |
+|---|---:|---:|---:|
+| Node 25.2.1 / V8 | 3.298 s | 9.2 s | 0.80 GB |
+| Relinked old C (`gc_opt/tsc-s350`) | 24.350 s | 24.3 s | 1.92 GB |
+| Regenerated lazy-prototype C (`native_s350/tsc-native`) | **23.872 s** | **23.7 s** | 2.02 GB |
+
+That is a further **2.0% less wall time**. Check-only statistics explain the
+size of the step: managed cells fall 119.7M → 92.3M (−1.97 GB), minors
+2,675 → 2,153, pauses 2.14 → 1.82 s and `"constructor"` interning 32.2M →
+3.4M calls, but the removed allocations were cheap bump allocations whose
+expensive companions (interning, `constructor` definition, property buffer)
+had already gone with the runtime change. Peak RSS rises by about 70–100 MB
+in emit mode only (check-only is flat at 1.43 GB): with 27% fewer young cell
+bytes per unit of work, minors run less often and the malloc'd payloads of
+dead young strings and environments are released later. A payload-aware
+minor trigger is the natural follow-up. Native remains about 7.2x slower
+than V8 on this machine state. Raw records: `native_s350/results/`.
+
+### Typed cells (Session 350, slice C5a)
+
+Captured variables now live in instances of the synthetic class `__cell`, so
+the compiler's cell reads and writes are struct accesses instead of cached
+property lookups (`docs/capture_lowering.md`). The pair below differs only in
+that exporter change plus the two fixes it exposed (handler pops on `return`
+inside `try`, `undefined` initialization of boxed class fields). Three
+alternating runs after warmup, diagnostics and all 78 emitted files matching
+Node on every launch:
+
+| executable | median wall | median process CPU | median peak RSS |
+|---|---:|---:|---:|
+| Node 25.2.1 / V8 | 3.219 s | 6.0 s | 0.80 GB |
+| Value-vector build (`native_s350f/tsc-native`) | 15.289 s | 15.3 s | 1.30 GB |
+| Typed-cell build (`native_s350g/tsc-native`) | **12.894 s** | **12.9 s** | 1.27 GB |
+
+That is **15.7% less wall time** (1.19x) from one representation change, the
+largest single step of the session: the compiler's factory-style closures
+read their captured state constantly, and each read lost a property-cache
+probe. Native is now 4.0x slower than V8 on this machine state (7.3x at the
+start of Session 349). Raw record: `native_s350g/results/run-kelqcyte/`.

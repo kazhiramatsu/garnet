@@ -989,6 +989,15 @@ fn find_sroa_targets(
                         dq(dst.0, alias, disq);
                     }
                 }
+                Inst::AllocClosure { captures, .. } | Inst::AllocClassValue { captures, .. } => {
+                    // A captured cell is stored in the closure's environment and read
+                    // by the callee through it, so the object must exist even when
+                    // the closure itself never leaves this frame (typed cells are
+                    // class instances and would otherwise be scalar-replaced here).
+                    for c in captures {
+                        dq(c.cell.0, alias, disq);
+                    }
+                }
                 Inst::NewDynamic { dst, .. } => {
                     // A dynamically-constructed instance has no compile-time class
                     // (its runtime class is one of several candidates), so its layout

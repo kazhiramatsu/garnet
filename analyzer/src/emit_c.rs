@@ -315,6 +315,7 @@ fn emit_program_with_string_plans(
         .iter()
         .map(|f| (f.id.0, f.takes_this))
         .collect();
+    set_fn_capture_counts(program);
     let indirect_funcs = infer_indirect_funcs(program);
     let param_facts_by_func = infer_program_param_facts(program, &indirect_funcs);
     let i64_fast = infer_i64_fast_funcs(program, &indirect_funcs, &param_facts_by_func);
@@ -1044,7 +1045,7 @@ fn emit_program_with_string_plans(
         .iter()
         .find(|f| f.name.as_deref() == Some("__function_values_init"))
     {
-        let _ = writeln!(s, "  {}(0, 0);", cname(ff));
+        emit_entry_call(&mut s, ff);
     }
     // Step F: static initialization. When a __module_init exists it calls each
     // class's __static_init at the class's source position (so static
@@ -1059,13 +1060,13 @@ fn emit_program_with_string_plans(
         for f in program.functions.iter() {
             if let Some(n) = f.name.as_deref() {
                 if n.starts_with("__static_init_") {
-                    let _ = writeln!(s, "  {}(0, 0);", cname(f));
+                    emit_entry_call(&mut s, f);
                 }
             }
         }
     }
     if let Some(mf) = entry_fn {
-        let _ = writeln!(s, "  {}(0, 0);", cname(mf));
+        emit_entry_call(&mut s, mf);
     }
     // Drive the microtask/I/O event loop so async work (promises, fetch, awaits)
     // completes before the program exits, like a JS runtime.
@@ -1302,6 +1303,9 @@ struct Ctx<'a> {
     wksym: &'a BTreeMap<u32, u32>,
     /// fn id -> takes_this (reads args[0] as `this`); for call/apply/bind + closures.
     fn_takes_this: &'a BTreeMap<u32, bool>,
+    /// Leading cell params of the function being emitted that arrive through
+    /// the environment register (0 under the legacy merged convention).
+    cur_capture_count: usize,
     /// Direct-call i64 clones. These are optional fast entries; generic tsv entries
     /// remain the public ABI and are used for dynamic/unsafe calls.
     i64_fast: &'a BTreeMap<u32, I64FuncInfo>,
@@ -1505,6 +1509,133 @@ fn exception_setjmp_name() -> &'static str {
         "setjmp"
     } else {
         "ts_setjmp"
+    }
+}
+
+/* Function declarations/expressions get an own `.prototype`. The production
+   form defers the object to its first observation (ts_set_fn_prototype_lazy);
+   TSAOT_LAZY_PROTO=0 keeps the eager legacy spelling for the frozen oracle. */
+fn lazy_fn_prototype_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_LAZY_PROTO").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
+/* Closure environment ABI. In production a closure's captured cells reach the
+   callee through the runtime's environment register (g_ts_cur_env): callers
+   store the environment pointer right before the call and the callee prologue
+   reads its cells from it, so the argument array holds only real arguments and
+   ts_call no longer merges env and args into a fresh buffer. The frozen oracle
+   predates this; TSAOT_CLOSURE_ENV_ABI=0 restores the merged convention. */
+/// A `return` inside a plain `try` must pop the handlers it is leaving (one
+/// `ts_eh_pop()` per live handler). TSAOT_EH_RETURN_POP=0 restores the frozen
+/// emitter's output, which leaves the handlers dangling on the EH stack (a later
+/// throw longjmps into the dead frame) and exists only for the parity oracle.
+/// Boxed (non-numeric) fields of a sized class instance, parents first, in
+/// struct order. These must start as `undefined`: the instance memory is zeroed
+/// and a zero word is the number 0 under NaN-boxing.
+fn class_boxed_fields(cid: u32, classes: &BTreeMap<u32, &ClassDef>, out: &mut Vec<u32>) {
+    if let Some(c) = classes.get(&cid) {
+        if let Some(p) = c.parent {
+            class_boxed_fields(p.0, classes, out);
+        }
+        for f in &c.own_fields {
+            if !numeric_field(cid, f.0, classes) {
+                out.push(f.0);
+            }
+        }
+    }
+}
+
+/// TSAOT_UNDEF_FIELDS=0 skips the `undefined` initialization of boxed class
+/// fields (the frozen emitter's behavior: unassigned fields read as 0). Parity
+/// oracle only.
+fn undef_fields_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_UNDEF_FIELDS").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
+fn eh_return_pop_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_EH_RETURN_POP").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+fn closure_env_abi_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_CLOSURE_ENV_ABI").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+thread_local! {
+    static FN_CAPTURE_COUNTS: std::cell::RefCell<BTreeMap<u32, u32>> =
+        std::cell::RefCell::new(BTreeMap::new());
+}
+fn set_fn_capture_counts(program: &Program) {
+    FN_CAPTURE_COUNTS.with(|m| {
+        let mut m = m.borrow_mut();
+        m.clear();
+        for f in &program.functions {
+            m.insert(f.id.0, f.capture_count);
+        }
+    });
+}
+/// Leading cells a direct call must pass through the environment register.
+fn callee_capture_count(func: u32) -> usize {
+    if !closure_env_abi_enabled() {
+        return 0;
+    }
+    FN_CAPTURE_COUNTS.with(|m| m.borrow().get(&func).copied().unwrap_or(0) as usize)
+}
+fn set_callee_capture_count(funcs: &[FunctionId]) -> usize {
+    let first = funcs.first().map(|f| callee_capture_count(f.0)).unwrap_or(0);
+    for f in funcs {
+        if callee_capture_count(f.0) != first {
+            panic!(
+                "devirtualized call set mixes closure capture counts (fn {} vs fn {})",
+                funcs[0].0, f.0
+            );
+        }
+    }
+    first
+}
+/// Entry calls from `main` never supplied cells: under the merged convention
+/// `nargs` was 0 and the cell parameters read as undefined. Keep exactly that
+/// state under the environment ABI by pointing the register at an undefined
+/// buffer of the function's capture count.
+fn emit_entry_call(s: &mut String, f: &Function) {
+    let ncap = own_capture_count(f);
+    if ncap > 0 {
+        let _ = writeln!(
+            s,
+            "  {{ tsv _e[{0}]; for (int _i = 0; _i < {0}; _i++) _e[_i] = TS_UNDEFINED; g_ts_cur_env = _e; {1}(0, 0); }}",
+            ncap,
+            cname(f)
+        );
+    } else {
+        let _ = writeln!(s, "  {}(0, 0);", cname(f));
+    }
+}
+fn own_capture_count(f: &Function) -> usize {
+    if closure_env_abi_enabled() {
+        f.capture_count as usize
+    } else {
+        0
     }
 }
 
@@ -4940,6 +5071,7 @@ fn emit_i64_function(
         fn_names,
         wksym,
         fn_takes_this,
+        cur_capture_count: own_capture_count(f),
         i64_fast,
         f64_fast,
         static_strings,
@@ -5083,6 +5215,7 @@ fn emit_f64_function(
         fn_names,
         wksym,
         fn_takes_this,
+        cur_capture_count: own_capture_count(f),
         i64_fast,
         f64_fast,
         static_strings,
@@ -5175,6 +5308,7 @@ fn emit_function(
             fn_names,
             wksym,
             fn_takes_this,
+            cur_capture_count: own_capture_count(f),
             i64_fast,
             f64_fast,
             static_strings,
@@ -5216,6 +5350,7 @@ fn emit_function(
             fn_names,
             wksym,
             fn_takes_this,
+            cur_capture_count: own_capture_count(f),
             i64_fast,
             f64_fast,
             static_strings,
@@ -5257,6 +5392,7 @@ fn emit_function(
             fn_names,
             wksym,
             fn_takes_this,
+            cur_capture_count: own_capture_count(f),
             i64_fast,
             f64_fast,
             static_strings,
@@ -5339,25 +5475,47 @@ fn emit_function(
             id, id, id, id
         );
     }
+    let ncap = own_capture_count(f);
+    if ncap > 0 {
+        // Captured cells arrive through the environment register, which the
+        // caller stored immediately before this call; read them first.
+        s.push_str("  tsv* _env = g_ts_cur_env;\n");
+    }
     for (i, p) in f.params.iter().enumerate() {
         if Some(p.0) == f.rest_param {
             continue;
         } // gathered separately below
+        if i < ncap {
+            if int_local.contains(&p.0) {
+                let _ = writeln!(s, "  d{} = (long long)ts_to_num(_env[{}]);", p.0, i);
+            } else if unboxed.contains(&p.0) {
+                let _ = writeln!(s, "  d{} = ts_to_num(_env[{}]);", p.0, i);
+            } else {
+                let name = if frame_locals.contains(&p.0) {
+                    format!("F.v{}", p.0)
+                } else {
+                    format!("v{}", p.0)
+                };
+                let _ = writeln!(s, "  {} = _env[{}];", name, i);
+            }
+            continue;
+        }
+        let j = i - ncap;
         if int_local.contains(&p.0) {
             let _ = writeln!(
                 s,
                 "  if (nargs > {}) d{} = (long long)ts_to_num(args[{}]);",
-                i, p.0, i
+                j, p.0, j
             );
         } else if unboxed.contains(&p.0) {
-            let _ = writeln!(s, "  if (nargs > {}) d{} = ts_to_num(args[{}]);", i, p.0, i);
+            let _ = writeln!(s, "  if (nargs > {}) d{} = ts_to_num(args[{}]);", j, p.0, j);
         } else {
             let name = if frame_locals.contains(&p.0) {
                 format!("F.v{}", p.0)
             } else {
                 format!("v{}", p.0)
             };
-            let _ = writeln!(s, "  if (nargs > {}) {} = args[{}];", i, name, i);
+            let _ = writeln!(s, "  if (nargs > {}) {} = args[{}];", j, name, j);
         }
     }
     if use_frame_roots {
@@ -5390,7 +5548,7 @@ fn emit_function(
         let _ = writeln!(
             s,
             "  for (int _ri = {}; _ri < nargs; _ri++) ts_array_push({}, args[_ri]);",
-            rest_index, rest_name
+            rest_index.saturating_sub(ncap), rest_name
         );
     }
 
@@ -5403,6 +5561,7 @@ fn emit_function(
         fn_names,
         wksym,
         fn_takes_this,
+        cur_capture_count: own_capture_count(f),
         i64_fast,
         f64_fast,
         static_strings,
@@ -6195,6 +6354,9 @@ enum Flat<'a> {
     GotoIfFalse(u32, u32),    // `if (!truthy(cond)) goto L<id>;`  (cond_local, label)
     Suspend(&'a Inst),        // an Await or Yield (handled by the caller's emitter)
     Ret(&'a Option<LocalId>), // a Return (handled by the caller's emitter)
+    // leave `n` coroutine try levels (pop their handlers) before a goto that
+    // crosses them (break/continue out of a suspending try).
+    TryLeave(u32),
     // try/catch that spans a suspension (coroutine EH). Carries label ids for the
     // catch entry and the after-try join, plus the catch variable.
     TryEnter {
@@ -6258,14 +6420,56 @@ enum Flat<'a> {
 struct FinFrame {
     fin_label: u32,
     loops_at_entry: usize,
+    // coroutine handler depth inside the finally's protected region (its own
+    // handler included): an abrupt completion from deeper nested tries pops the
+    // extra levels before jumping to the finally body.
+    try_depth_at_entry: u32,
 }
 
+/// Emit the handler pops for leaving coroutine try levels `cur` -> `target`
+/// (none under the frozen emission knob, which left them dangling).
+fn push_try_leave(out: &mut Vec<Flat<'_>>, cur: u32, target: u32) {
+    if eh_return_pop_enabled() && cur > target {
+        out.push(Flat::TryLeave(cur - target));
+    }
+}
+
+/// True when a break/continue in `body` targets a loop outside `body`
+/// (`depth` = loops opened inside `body` around the current position).
+fn body_escapes_loop(body: &[Inst], depth: u32) -> bool {
+    body.iter().any(|i| match i {
+        Inst::Break { up } | Inst::Continue { up } => *up >= depth,
+        Inst::If {
+            then_body,
+            else_body,
+            ..
+        } => body_escapes_loop(then_body, depth) || body_escapes_loop(else_body, depth),
+        Inst::Loop {
+            cond_body, body, ..
+        } => body_escapes_loop(cond_body, depth + 1) || body_escapes_loop(body, depth + 1),
+        Inst::TryCatch {
+            try_body,
+            catch_body,
+            finally_body,
+            ..
+        } => {
+            body_escapes_loop(try_body, depth)
+                || body_escapes_loop(catch_body, depth)
+                || body_escapes_loop(finally_body, depth)
+        }
+        _ => false,
+    })
+}
+
+/// `loops`: (top label, end label, coroutine try depth at loop entry).
+/// `try_depth`: number of coroutine handler levels active at this point.
 fn flatten_cf<'a>(
     body: &'a [Inst],
     out: &mut Vec<Flat<'a>>,
-    loops: &mut Vec<(u32, u32)>,
+    loops: &mut Vec<(u32, u32, u32)>,
     fins: &mut Vec<FinFrame>,
     next_label: &mut u32,
+    try_depth: u32,
 ) -> Result<(), String> {
     let fresh = |nl: &mut u32| {
         let id = *nl;
@@ -6282,10 +6486,10 @@ fn flatten_cf<'a>(
                 let l_else = fresh(next_label);
                 let l_end = fresh(next_label);
                 out.push(Flat::GotoIfFalse(cond.0, l_else));
-                flatten_cf(then_body, out, loops, fins, next_label)?;
+                flatten_cf(then_body, out, loops, fins, next_label, try_depth)?;
                 out.push(Flat::Goto(l_end));
                 out.push(Flat::Label(l_else));
-                flatten_cf(else_body, out, loops, fins, next_label)?;
+                flatten_cf(else_body, out, loops, fins, next_label, try_depth)?;
                 out.push(Flat::Label(l_end));
             }
             Inst::Loop {
@@ -6296,10 +6500,10 @@ fn flatten_cf<'a>(
                 let l_top = fresh(next_label);
                 let l_end = fresh(next_label);
                 out.push(Flat::Label(l_top));
-                flatten_cf(cond_body, out, loops, fins, next_label)?;
+                flatten_cf(cond_body, out, loops, fins, next_label, try_depth)?;
                 out.push(Flat::GotoIfFalse(cond.0, l_end));
-                loops.push((l_top, l_end));
-                flatten_cf(lbody, out, loops, fins, next_label)?;
+                loops.push((l_top, l_end, try_depth));
+                flatten_cf(lbody, out, loops, fins, next_label, try_depth)?;
                 loops.pop();
                 out.push(Flat::Goto(l_top));
                 out.push(Flat::Label(l_end));
@@ -6311,9 +6515,10 @@ fn flatten_cf<'a>(
                     .len()
                     .checked_sub(1 + *up as usize)
                     .ok_or("break target outside loop in async/generator")?;
-                let (_, end) = loops[idx];
+                let (_, end, loop_depth) = loops[idx];
                 if let Some(f) = fins.last() {
                     if idx < f.loops_at_entry {
+                        push_try_leave(out, try_depth, f.try_depth_at_entry);
                         out.push(Flat::FinallyAbrupt {
                             kind: 3,
                             value: None,
@@ -6323,6 +6528,7 @@ fn flatten_cf<'a>(
                         continue;
                     }
                 }
+                push_try_leave(out, try_depth, loop_depth);
                 out.push(Flat::Goto(end));
             }
             Inst::Continue { up } => {
@@ -6330,9 +6536,10 @@ fn flatten_cf<'a>(
                     .len()
                     .checked_sub(1 + *up as usize)
                     .ok_or("continue target outside loop in async/generator")?;
-                let (top, _) = loops[idx];
+                let (top, _, loop_depth) = loops[idx];
                 if let Some(f) = fins.last() {
                     if idx < f.loops_at_entry {
+                        push_try_leave(out, try_depth, f.try_depth_at_entry);
                         out.push(Flat::FinallyAbrupt {
                             kind: 4,
                             value: None,
@@ -6342,12 +6549,14 @@ fn flatten_cf<'a>(
                         continue;
                     }
                 }
+                push_try_leave(out, try_depth, loop_depth);
                 out.push(Flat::Goto(top));
             }
             Inst::Await { .. } | Inst::Yield { .. } => out.push(Flat::Suspend(inst)),
             Inst::Return { src } => {
                 // a return inside a finally region must run the finally(s) first.
                 if let Some(f) = fins.last() {
+                    push_try_leave(out, try_depth, f.try_depth_at_entry);
                     out.push(Flat::FinallyAbrupt {
                         kind: 2,
                         value: *src,
@@ -6375,9 +6584,22 @@ fn flatten_cf<'a>(
                 if !body_has_suspension(try_body)
                     && !body_has_suspension(catch_body)
                     && !body_has_suspension(finally_body)
+                    && !(eh_return_pop_enabled()
+                        && (body_has_return(try_body)
+                            || body_has_return(catch_body)
+                            || body_has_return(finally_body)
+                            || body_escapes_loop(try_body, 0)
+                            || body_escapes_loop(catch_body, 0)
+                            || body_escapes_loop(finally_body, 0)))
                 {
                     // No suspension anywhere in this try: keep it structured (emit_inst
-                    // uses inline setjmp/longjmp, which is safe here).
+                    // uses inline setjmp/longjmp, which is safe here). A `return`
+                    // inside it must still complete the coroutine (resolve the
+                    // promise / finish the generator) and pop the handlers, which
+                    // only the flat lowering's Ret does, so such tries take the flat
+                    // path (the frozen emitter emitted a raw C return there). The
+                    // same goes for a break/continue leaving the try: the enclosing
+                    // loop is flattened, so a structured C break has no target.
                     out.push(Flat::Inst(inst));
                     continue;
                 }
@@ -6393,6 +6615,7 @@ fn flatten_cf<'a>(
                         loops,
                         fins,
                         next_label,
+                        try_depth,
                     )?;
                     continue;
                 }
@@ -6408,13 +6631,14 @@ fn flatten_cf<'a>(
                     id
                 };
                 out.push(Flat::TryEnter { catch_label });
-                flatten_cf(try_body, out, loops, fins, next_label)?;
+                flatten_cf(try_body, out, loops, fins, next_label, try_depth + 1)?;
                 out.push(Flat::TryNormalExit { after_label });
                 out.push(Flat::CatchLabel {
                     catch_label,
                     catch_var,
                 });
-                flatten_cf(catch_body, out, loops, fins, next_label)?;
+                // the catch body runs after its own handler was popped.
+                flatten_cf(catch_body, out, loops, fins, next_label, try_depth)?;
                 out.push(Flat::AfterLabel { after_label });
             }
             other => out.push(Flat::Inst(other)),
@@ -6441,9 +6665,10 @@ fn flatten_try_finally<'a>(
     catch_body: &'a [Inst],
     finally_body: &'a [Inst],
     out: &mut Vec<Flat<'a>>,
-    loops: &mut Vec<(u32, u32)>,
+    loops: &mut Vec<(u32, u32, u32)>,
     fins: &mut Vec<FinFrame>,
     next_label: &mut u32,
+    try_depth: u32,
 ) -> Result<(), String> {
     let mut fresh = || {
         let id = *next_label;
@@ -6461,12 +6686,13 @@ fn flatten_try_finally<'a>(
     fins.push(FinFrame {
         fin_label,
         loops_at_entry: loops.len(),
+        try_depth_at_entry: try_depth + 1,
     });
     if has_catch {
         let catch_label = fresh();
         let catch_done = fresh();
         out.push(Flat::TryEnter { catch_label });
-        flatten_cf(try_body, out, loops, fins, next_label)?;
+        flatten_cf(try_body, out, loops, fins, next_label, try_depth + 2)?;
         out.push(Flat::TryNormalExit {
             after_label: catch_done,
         });
@@ -6474,13 +6700,13 @@ fn flatten_try_finally<'a>(
             catch_label,
             catch_var,
         });
-        flatten_cf(catch_body, out, loops, fins, next_label)?;
+        flatten_cf(catch_body, out, loops, fins, next_label, try_depth + 1)?;
         out.push(Flat::AfterLabel {
             after_label: catch_done,
         });
         out.push(Flat::FinallyGotoNormal { fin_label });
     } else {
-        flatten_cf(try_body, out, loops, fins, next_label)?;
+        flatten_cf(try_body, out, loops, fins, next_label, try_depth + 1)?;
         out.push(Flat::FinallyGotoNormal { fin_label });
     }
     out.push(Flat::FinallyCatchLabel {
@@ -6491,7 +6717,7 @@ fn flatten_try_finally<'a>(
     // context (its own abrupt completions route to the next-outer finally).
     fins.pop();
     out.push(Flat::FinallyLabel { fin_label });
-    flatten_cf(finally_body, out, loops, fins, next_label)?;
+    flatten_cf(finally_body, out, loops, fins, next_label, try_depth)?;
     // if this finally is itself nested inside another finally, a non-normal
     // completion propagates to that outer finally; else it executes here.
     let outer_fin = fins.last().map(|f| f.fin_label);
@@ -6501,6 +6727,33 @@ fn flatten_try_finally<'a>(
     });
     out.push(Flat::AfterLabel { after_label });
     Ok(())
+}
+
+/// True when `body` contains a `Return` at any structured nesting depth
+/// (if/loop/try bodies; nested functions are separate IR functions).
+fn body_has_return(body: &[Inst]) -> bool {
+    body.iter().any(|i| match i {
+        Inst::Return { .. } => true,
+        Inst::If {
+            then_body,
+            else_body,
+            ..
+        } => body_has_return(then_body) || body_has_return(else_body),
+        Inst::Loop {
+            cond_body, body, ..
+        } => body_has_return(cond_body) || body_has_return(body),
+        Inst::TryCatch {
+            try_body,
+            catch_body,
+            finally_body,
+            ..
+        } => {
+            body_has_return(try_body)
+                || body_has_return(catch_body)
+                || body_has_return(finally_body)
+        }
+        _ => false,
+    })
 }
 
 fn body_has_suspension(body: &[Inst]) -> bool {
@@ -6579,10 +6832,10 @@ fn emit_completion(s: &mut String, mode: SmMode, val: &str) {
 
 fn emit_sm_resume_body(s: &mut String, f: &Function, ctx: &Ctx, mode: SmMode) {
     let mut flat: Vec<Flat> = Vec::new();
-    let mut loops: Vec<(u32, u32)> = Vec::new();
+    let mut loops: Vec<(u32, u32, u32)> = Vec::new();
     let mut next_label = 0u32;
     let mut fins: Vec<FinFrame> = Vec::new();
-    if let Err(_e) = flatten_cf(&f.body, &mut flat, &mut loops, &mut fins, &mut next_label) {
+    if let Err(_e) = flatten_cf(&f.body, &mut flat, &mut loops, &mut fins, &mut next_label, 0) {
         // Should be unreachable (exporter rejects unsupported constructs).
         s.push_str("  default: ;\n  }\n  ts_abort_msg(\"unsupported control flow in coroutine\");\n  return TS_UNDEFINED;\n");
         return;
@@ -6676,6 +6929,13 @@ fn emit_sm_resume_body(s: &mut String, f: &Function, ctx: &Ctx, mode: SmMode) {
             }
             Flat::Goto(id) => {
                 let _ = writeln!(s, "  goto L{};", id);
+            }
+            Flat::TryLeave(n) => {
+                // leaving coroutine try levels on a jump: pop their handlers so a
+                // later throw cannot land in a catch that is no longer active.
+                for _ in 0..*n {
+                    s.push_str("  ts_eh_pop(); _fr->c.eh_top--;\n");
+                }
             }
             Flat::GotoIfFalse(cond, id) => {
                 let _ = writeln!(s, "  if (!{}) goto L{};", ctx.truthy(*cond), id);
@@ -6963,6 +7223,45 @@ fn emit_sm_resume_body(s: &mut String, f: &Function, ctx: &Ctx, mode: SmMode) {
     emit_completion(s, mode, "TS_UNDEFINED");
 }
 
+/// Copy a coroutine entry's parameters into its frame. Captured cells come
+/// from the environment register (stored by the caller right before this
+/// entry ran; nothing between can invoke another closure), the real
+/// arguments from the argument array.
+fn emit_coroutine_param_copy(s: &mut String, f: &Function, ctx: &Ctx) {
+    let ncap = own_capture_count(f);
+    if ncap > 0 {
+        s.push_str("  tsv* _env = g_ts_cur_env;\n");
+    }
+    for (i, p) in f.params.iter().enumerate() {
+        if i < ncap {
+            if ctx.int_local.contains(&p.0) {
+                let _ = writeln!(s, "  _fr->d{} = (long long)ts_to_num(_env[{}]);", p.0, i);
+            } else if ctx.unboxed.contains(&p.0) {
+                let _ = writeln!(s, "  _fr->d{} = ts_to_num(_env[{}]);", p.0, i);
+            } else {
+                let _ = writeln!(s, "  _fr->v{} = _env[{}];", p.0, i);
+            }
+            continue;
+        }
+        let j = i - ncap;
+        if ctx.int_local.contains(&p.0) {
+            let _ = writeln!(
+                s,
+                "  if (nargs > {}) _fr->d{} = (long long)ts_to_num(args[{}]);",
+                j, p.0, j
+            );
+        } else if ctx.unboxed.contains(&p.0) {
+            let _ = writeln!(
+                s,
+                "  if (nargs > {}) _fr->d{} = ts_to_num(args[{}]);",
+                j, p.0, j
+            );
+        } else {
+            let _ = writeln!(s, "  if (nargs > {}) _fr->v{} = args[{}];", j, p.0, j);
+        }
+    }
+}
+
 fn emit_async_function(s: &mut String, f: &Function, ctx: &Ctx) {
     let fname = cname(f);
     // Frame struct: header (ts_coro) + all locals as named fields.
@@ -7012,23 +7311,7 @@ fn emit_async_function(s: &mut String, f: &Function, ctx: &Ctx) {
     s.push_str("  ts_gc_root(&_cv);\n");
     let _ = writeln!(s, "  {}_frame* _fr = ({}_frame*)ts_ptr(_cv);", fname, fname);
     // copy params into frame fields
-    for (i, p) in f.params.iter().enumerate() {
-        if ctx.int_local.contains(&p.0) {
-            let _ = writeln!(
-                s,
-                "  if (nargs > {}) _fr->d{} = (long long)ts_to_num(args[{}]);",
-                i, p.0, i
-            );
-        } else if ctx.unboxed.contains(&p.0) {
-            let _ = writeln!(
-                s,
-                "  if (nargs > {}) _fr->d{} = ts_to_num(args[{}]);",
-                i, p.0, i
-            );
-        } else {
-            let _ = writeln!(s, "  if (nargs > {}) _fr->v{} = args[{}];", i, p.0, i);
-        }
-    }
+    emit_coroutine_param_copy(s, f, ctx);
     s.push_str("  tsv _ret = _fr->c.ret;\n");
     s.push_str("  ts_coro_resume_v(_cv);\n");
     s.push_str("  ts_gc_unroot(1);\n");
@@ -7084,23 +7367,7 @@ fn emit_generator_function(s: &mut String, f: &Function, ctx: &Ctx) {
     );
     s.push_str("  ts_gc_root(&_cv);\n");
     let _ = writeln!(s, "  {}_frame* _fr = ({}_frame*)ts_ptr(_cv);", fname, fname);
-    for (i, p) in f.params.iter().enumerate() {
-        if ctx.int_local.contains(&p.0) {
-            let _ = writeln!(
-                s,
-                "  if (nargs > {}) _fr->d{} = (long long)ts_to_num(args[{}]);",
-                i, p.0, i
-            );
-        } else if ctx.unboxed.contains(&p.0) {
-            let _ = writeln!(
-                s,
-                "  if (nargs > {}) _fr->d{} = ts_to_num(args[{}]);",
-                i, p.0, i
-            );
-        } else {
-            let _ = writeln!(s, "  if (nargs > {}) _fr->v{} = args[{}];", i, p.0, i);
-        }
-    }
+    emit_coroutine_param_copy(s, f, ctx);
     s.push_str("  tsv _gen = ts_gen_new_v(_cv);\n");
     s.push_str("  ts_gc_unroot(1);\n");
     s.push_str("  return _gen;\n}\n\n");
@@ -7151,23 +7418,7 @@ fn emit_asyncgen_function(s: &mut String, f: &Function, ctx: &Ctx) {
     );
     s.push_str("  ts_gc_root(&_cv);\n");
     let _ = writeln!(s, "  {}_frame* _fr = ({}_frame*)ts_ptr(_cv);", fname, fname);
-    for (i, p) in f.params.iter().enumerate() {
-        if ctx.int_local.contains(&p.0) {
-            let _ = writeln!(
-                s,
-                "  if (nargs > {}) _fr->d{} = (long long)ts_to_num(args[{}]);",
-                i, p.0, i
-            );
-        } else if ctx.unboxed.contains(&p.0) {
-            let _ = writeln!(
-                s,
-                "  if (nargs > {}) _fr->d{} = ts_to_num(args[{}]);",
-                i, p.0, i
-            );
-        } else {
-            let _ = writeln!(s, "  if (nargs > {}) _fr->v{} = args[{}];", i, p.0, i);
-        }
-    }
+    emit_coroutine_param_copy(s, f, ctx);
     s.push_str("  tsv _gen = ts_asyncgen_new_v(_cv);\n");
     s.push_str("  ts_gc_unroot(1);\n");
     s.push_str("  return _gen;\n}\n\n");
@@ -13945,6 +14196,10 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 Some(c) => {
                     let cn = struct_name(c.0);
                     let dst_name = ctx.vname(dst.0);
+                    let mut boxed = Vec::new();
+                    if undef_fields_enabled() {
+                        class_boxed_fields(c.0, ctx.classes, &mut boxed);
+                    }
                     let proto_expr = if let Some(p) = proto {
                         let pv = ctx.val(p.0);
                         format!("(ts_is_obj({}) ? {} : CLASS_PROTO[{}])", pv, pv, c.0)
@@ -13958,6 +14213,13 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                             "0"
                         };
                         let _ = writeln!(s, "  {} sobj{} = {{0}}; sobj{}.header.h.kind=TS_KIND_OBJECT; sobj{}.header.h.mark=0; sobj{}.header.h.gen=2; sobj{}.header.h.remembered=0; sobj{}.header.h.handle=0; sobj{}.header.h.size=sizeof({}); sobj{}.header.proto={}; sobj{}.header.props=0; sobj{}.header.cap=0; sobj{}.header.len=0; sobj{}.header.shape={};", cn, dst.0, dst.0, dst.0, dst.0, dst.0, dst.0, dst.0, cn, dst.0, proto_expr, dst.0, dst.0, dst.0, dst.0, shape);
+                        if !boxed.is_empty() {
+                            let inits: Vec<String> = boxed
+                                .iter()
+                                .map(|f| format!("sobj{}.f{} = TS_UNDEFINED;", dst.0, f))
+                                .collect();
+                            let _ = writeln!(s, "  {}", inits.join(" "));
+                        }
                         let _ = writeln!(s, "  {} = ts_obj(&sobj{});", dst_name, dst.0);
                     } else {
                         let alloc = if st == AllocStrategy::PretenuredHeap {
@@ -13969,6 +14231,13 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         let _ =
                             writeln!(s, "  {}* hobj{} = ({}*)ts_ptr({});", cn, dst.0, cn, dst_name);
                         let _ = writeln!(s, "  hobj{}->header.proto={}; hobj{}->header.props=0; hobj{}->header.cap=0; hobj{}->header.len=0;", dst.0, proto_expr, dst.0, dst.0, dst.0);
+                        if !boxed.is_empty() {
+                            let inits: Vec<String> = boxed
+                                .iter()
+                                .map(|f| format!("hobj{}->f{} = TS_UNDEFINED;", dst.0, f))
+                                .collect();
+                            let _ = writeln!(s, "  {}", inits.join(" "));
+                        }
                         if st == AllocStrategy::PretenuredHeap {
                             let _ = writeln!(s, "  ts_write_barrier({}, {});", dst_name, proto_expr);
                         }
@@ -14019,10 +14288,21 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 .get(&site.0)
                 .copied()
                 .unwrap_or(AllocStrategy::Heap);
-            let make_fn = if st == AllocStrategy::PretenuredHeap {
-                "ts_make_fn_t_pretenured"
-            } else {
-                "ts_make_fn_t"
+            // The callee prologue decides the convention through its own
+            // capture count; the creation site must agree with it exactly.
+            let callee_ncap = callee_capture_count(func.0);
+            if callee_ncap > 0 && callee_ncap != captures.len() {
+                panic!(
+                    "closure site for fn {} supplies {} cells but the function declares {}",
+                    func.0, captures.len(), callee_ncap
+                );
+            }
+            let env_abi = callee_ncap > 0;
+            let make_fn = match (st == AllocStrategy::PretenuredHeap, env_abi) {
+                (true, true) => "ts_make_closure_t_pretenured",
+                (true, false) => "ts_make_fn_t_pretenured",
+                (false, true) => "ts_make_closure_t",
+                (false, false) => "ts_make_fn_t",
             };
             let make_proto = if st == AllocStrategy::PretenuredHeap {
                 "ts_new_proto_pretenured"
@@ -14036,9 +14316,15 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 0
             };
             let dst_name = ctx.vname(dst.0);
-            let set_meta = format!(
-                "  ts_set_fn_meta({0}, FN_ARITY[{1}], FN_NAME[{1}]);\n  if (FN_HAS_PROTOTYPE[{1}]) ts_set_fn_prototype({0}, {2}());\n",
-                dst_name, func.0, make_proto);
+            let set_meta = if lazy_fn_prototype_enabled() {
+                format!(
+                    "  ts_set_fn_meta({0}, FN_ARITY[{1}], FN_NAME[{1}]);\n  if (FN_HAS_PROTOTYPE[{1}]) ts_set_fn_prototype_lazy({0});\n",
+                    dst_name, func.0)
+            } else {
+                format!(
+                    "  ts_set_fn_meta({0}, FN_ARITY[{1}], FN_NAME[{1}]);\n  if (FN_HAS_PROTOTYPE[{1}]) ts_set_fn_prototype({0}, {2}());\n",
+                    dst_name, func.0, make_proto)
+            };
             if captures.is_empty() {
                 let _ = writeln!(
                     s,
@@ -14100,10 +14386,18 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 for (i, c) in captures.iter().enumerate() {
                     let _ = writeln!(s, "    _env[{}] = {};", i, ctx.val(c.cell.0));
                 }
+                let ctor_ncap = callee_capture_count(ctor.0);
+                if ctor_ncap > 0 && ctor_ncap != captures.len() {
+                    panic!(
+                        "class value site for ctor {} supplies {} cells but the constructor declares {}",
+                        ctor.0, captures.len(), ctor_ncap
+                    );
+                }
                 let _ = writeln!(
                     s,
-                    "    {} = ts_make_class_value({}u, {}, _env, {});",
+                    "    {} = {}({}u, {}, _env, {});",
                     dst_name,
+                    if ctor_ncap > 0 { "ts_make_class_value_cells" } else { "ts_make_class_value" },
                     class_id,
                     fname,
                     captures.len()
@@ -14516,6 +14810,9 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             if let Some(offset) = builtin.strip_prefix("arguments.length:") {
                 if let Some(d) = dst {
                     let offset: u32 = offset.parse().expect("arguments offset");
+                    // The IR offset counts cells and receiver; cells are not in
+                    // the argument array under the environment ABI.
+                    let offset = (offset as usize).saturating_sub(ctx.cur_capture_count);
                     s.push_str(&ctx.set_num(d.0, &format!("(double)(nargs > {0} ? nargs - {0} : 0)", offset)));
                 }
                 return;
@@ -16040,9 +16337,32 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
         } => {
             // Build a dynamic argument buffer: singles contribute 1, spreads
             // contribute their array length. recv (if any) is arg 0.
+            let callee_ncap = match callee {
+                CalleeRef::Direct { func } => callee_capture_count(func.0),
+                CalleeRef::Set { funcs } => set_callee_capture_count(funcs),
+                _ => 0,
+            };
+            let mut cell_locals: Vec<u32> = Vec::new();
+            let mut arg_specs: Vec<&ArgSpec> = arg_specs.iter().collect();
+            while cell_locals.len() < callee_ncap {
+                match arg_specs.first() {
+                    Some(ArgSpec::Single { local }) => {
+                        cell_locals.push(local.0);
+                        arg_specs.remove(0);
+                    }
+                    _ => panic!("spread call to a closure lacks its leading captured cells"),
+                }
+            }
+            assert!(cell_locals.is_empty() || recv.is_none(), "closure spread call with receiver");
             s.push_str("  {\n");
+            if !cell_locals.is_empty() {
+                let _ = writeln!(s, "    tsv _e[{}];", cell_locals.len());
+                for (i, a) in cell_locals.iter().enumerate() {
+                    let _ = writeln!(s, "    _e[{}] = {};", i, ctx.val(*a));
+                }
+            }
             let _ = writeln!(s, "    int _n = {};", if recv.is_some() { 1 } else { 0 });
-            for spec in arg_specs {
+            for spec in &arg_specs {
                 match spec {
                     ArgSpec::Single { .. } => {
                         let _ = writeln!(s, "    _n += 1;");
@@ -16058,7 +16378,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             if let Some(r) = recv {
                 let _ = writeln!(s, "    _a[_k++] = {};", ctx.val(r.0));
             }
-            for spec in arg_specs {
+            for spec in &arg_specs {
                 match spec {
                     ArgSpec::Single { local } => {
                         let _ = writeln!(s, "    _a[_k++] = {};", ctx.val(local.0));
@@ -16068,6 +16388,9 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         let _ = writeln!(s, "    {{ int _m = (int)ts_array_len_fast({}); for (int _j=0;_j<_m;_j++) _a[_k++] = ts_array_get({}, _j); }}", v, v);
                     }
                 }
+            }
+            if !cell_locals.is_empty() {
+                s.push_str("    g_ts_cur_env = _e;\n");
             }
             let call = match callee {
                 CalleeRef::Direct { func } => format!("{}(_a, _n)", ctx.fn_name_of(func.0)),
@@ -16195,9 +16518,27 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     }
                 }
             }
-            let _ = writeln!(s, "  {{ tsv _a[{}];", argv.len().max(1));
+            let callee_ncap = match callee {
+                CalleeRef::Direct { func } => callee_capture_count(func.0),
+                CalleeRef::Set { funcs } => set_callee_capture_count(funcs),
+                _ => 0,
+            };
+            let ncap = callee_ncap.min(argv.len());
+            let (cells, argv) = argv.split_at(ncap);
+            if ncap > 0 {
+                let _ = writeln!(s, "  {{ tsv _e[{}];", ncap);
+                for (i, a) in cells.iter().enumerate() {
+                    let _ = writeln!(s, "    _e[{}] = {};", i, ctx.val(*a));
+                }
+                let _ = writeln!(s, "    tsv _a[{}];", argv.len().max(1));
+            } else {
+                let _ = writeln!(s, "  {{ tsv _a[{}];", argv.len().max(1));
+            }
             for (i, a) in argv.iter().enumerate() {
                 let _ = writeln!(s, "    _a[{}] = {};", i, ctx.val(*a));
+            }
+            if ncap > 0 {
+                s.push_str("    g_ts_cur_env = _e;\n");
             }
             let call = match callee {
                 CalleeRef::Direct { func } => {
@@ -16254,6 +16595,13 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             s.push_str("  }\n");
         }
         Inst::Return { src } => {
+            // Leaving the function from inside `try` bodies: pop every handler
+            // pushed by this function first (the frozen emitter forgot this, so a
+            // later throw landed in the dead frame).
+            let live = ctx.eh_depth.get();
+            if live > 0 && eh_return_pop_enabled() {
+                let _ = writeln!(s, "  {}", "ts_eh_pop(); ".repeat(live as usize).trim_end());
+            }
             let cleanup = ctx.root_cleanup();
             if !cleanup.is_empty() {
                 let _ = writeln!(s, "  {}", cleanup);

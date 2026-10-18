@@ -124,3 +124,51 @@ for both; codegen splits them via `perIteration`.
 `catch` modelling, async/generator frame objects, and exception-flow refinement
 all map onto existing sinks/objects and are added in P4/P5 without changing this
 contract.
+
+## Closure environment ABI (Session 350)
+
+The IR keeps the layout `[cells..., this?, params...]` for a function's
+parameters, and direct calls still list the cells as leading arguments. What
+changed is how emitted C moves the cells:
+
+- `Function.captureCount` (`capture_count` in Rust) records how many leading
+  parameters are captured cells.
+- A caller stores the cell buffer in the runtime's environment register
+  `g_ts_cur_env` immediately before the call. For a direct call the emitter
+  builds a stack array `_e[]` from the caller's cell locals; `ts_call` stores
+  the closure's own `env` buffer.
+- The callee prologue reads `_env = g_ts_cur_env` before anything else and
+  copies its first `captureCount` parameters from it; the argument array holds
+  only the real arguments, so `nargs`, rest gathering and `arguments.length`
+  are offset by the capture count.
+- Closures created by emitted code use `ts_make_closure_t` /
+  `ts_make_closure_t_pretenured` / `ts_make_class_value_cells`, which set
+  `ts_func.env_abi`. `ts_call` branches on that flag, so runtime-created
+  closures (bound functions, promise reaction thunks, proxy revokers) and C
+  emitted by the frozen oracle keep the merged convention untouched.
+
+Nothing runs between the register store and the prologue read: coroutine
+entries allocate their frame first, but allocation never invokes a closure, so
+the register is still valid when the entry copies its cells. The register is a
+C global, not a GC root; the cells it points to are also held by the caller's
+rooted locals or by the closure object being called. The emitter asserts that
+every function in a devirtualized call set shares one capture count, and
+`TSAOT_CLOSURE_ENV_ABI=0` restores the merged emission for the byte-parity
+oracle (`scripts/emitc_diff.sh`).
+
+## Typed cells (Session 350, slice C5a)
+
+A captured variable's cell is no longer a plain object with one property.
+The exporter gives every cell allocation the synthetic class `__cell` (one
+struct field, `__value`) and marks cell parameters with that class, so the
+typed-field codegen turns the 55,865 cell reads and 13,551 cell writes of the
+compiler into direct struct accesses guarded only by the proxy check. Three
+rules keep this sound: scalar replacement never dematerializes a cell that a
+closure captures (the callee reads it through the environment); a cell stays
+on the heap whatever the per-frame escape verdict says (its closures can
+outlive the frame through containers loaded from other cells); and the slot
+is stored as `undefined` when the cell is allocated, because the instance
+memory is zeroed and a zero word is the number 0 under NaN-boxing (a
+`let x;` captured and tested with `??=` before its first assignment was the
+failure that showed this). `TSAOT_TYPED_CELLS=0` keeps the plain-object cells
+in the exported IR; the parity oracle's corpus is exported with it.

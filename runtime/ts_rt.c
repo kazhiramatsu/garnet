@@ -137,6 +137,7 @@ static struct {
   unsigned long long kind_minor_elements[TS_KIND_PROXY + 1];
   unsigned long long minor_root_slots, minor_remembered_cells;
   unsigned long long small_props_fresh, small_props_reused;
+  unsigned long long prop_add_hits, prop_add_fills;
   unsigned long long nursery_alloc, nursery_chunks, retained_chunks;
   unsigned long long nursery_aged, unpooled_aged;   /* survivors kept YOUNG by aging */
   unsigned long long aging_copied_bytes, aging_died_bytes, aging_promoted_bytes;
@@ -185,6 +186,8 @@ __attribute__((destructor)) static void ts_rt_stats_dump(void){
           g_handle_cap, g_rt_stats.root_push, g_rt_stats.pretenured_alloc);
   fprintf(out, "[rt_stats] small_props: fresh=%llu reused=%llu\n",
           g_rt_stats.small_props_fresh, g_rt_stats.small_props_reused);
+  fprintf(out, "[rt_stats] prop_add: hits=%llu slow=%llu\n",
+          g_rt_stats.prop_add_hits, g_rt_stats.prop_add_fills);
   fprintf(out, "[rt_stats] root_frames: frame_push=%llu\n",
           g_ts_frame_push_count);
   for (unsigned k=TS_KIND_OBJECT; k<=TS_KIND_PROXY; k++){
@@ -276,7 +279,7 @@ static inline ts_gc_header* ts_heap_ptr(tsv v){
   uint64_t payload = v & TS_PAYLOAD_MASK;
   if (payload & 1u){
     uint32_t id = (uint32_t)(payload >> 1);
-    return (id < g_handle_cap) ? g_ts_handle_table[id] : NULL;
+    return (id < g_handle_cap) ? ts_handle_entry_cell((uintptr_t)g_ts_handle_table[id]) : NULL;
   }
   if ((payload & (sizeof(void*) - 1u)) != 0) return NULL;
   ts_gc_header* h = (ts_gc_header*)(uintptr_t)payload;
@@ -319,10 +322,10 @@ static int field_name_is(uint32_t id, const char* lit);
 static int field_bytes_is(const char* n, uint32_t len, const char* lit);
 static int prop_key_is_array_index(uint32_t key, uint32_t* idx);
 static int gc_moving_minor_enabled(void);
+static int g_gc_config_inited = 0;
 static void gc_config_init(void){
-  static int inited = 0;
-  if (inited) return;
-  inited = 1;
+  if (g_gc_config_inited) return;
+  g_gc_config_inited = 1;
   const char* young = getenv("TSAOT_GC_YOUNG_THRESHOLD");
   if (young && young[0]){
     char* end = NULL;
@@ -365,6 +368,18 @@ static void gc_config_init(void){
   const char* zap = getenv("TSAOT_GC_ZAP");
   if (zap && zap[0] && strcmp(zap, "0") != 0) g_gc_zap = 1;
 }
+/* Table entry for a cell: the pointer plus its generation bit. */
+static inline ts_gc_header* gc_handle_entry_for(ts_gc_header* h){
+  return (ts_gc_header*)((uintptr_t)h | (h->gen == TS_GEN_OLD ? TS_HANDLE_OLD_BIT : 0u));
+}
+/* A cell promoted in place (no move) must republish its generation. */
+static inline void gc_handle_note_old(ts_gc_header* h){
+  uint64_t payload = h->handle;
+  if (payload & 1u){
+    uint32_t id = (uint32_t)(payload >> 1);
+    if (id < g_handle_cap) g_ts_handle_table[id] = gc_handle_entry_for(h);
+  }
+}
 static uint64_t gc_handle_alloc(ts_gc_header* h){
   uint32_t id;
   RT_STAT_INC(handle_alloc);
@@ -380,14 +395,14 @@ static uint64_t gc_handle_alloc(ts_gc_header* h){
       g_handle_cap = next;
     }
   }
-  g_ts_handle_table[id] = h;
+  g_ts_handle_table[id] = gc_handle_entry_for(h);
   return (((uint64_t)id) << 1) | 1u;
 }
 static void gc_handle_free(ts_gc_header* h){
   uint64_t payload = h ? h->handle : 0;
   if (!(payload & 1u)) return;
   uint32_t id = (uint32_t)(payload >> 1);
-  if (id < g_handle_cap && g_ts_handle_table[id] == h){
+  if (id < g_handle_cap && ts_handle_entry_cell((uintptr_t)g_ts_handle_table[id]) == h){
     g_ts_handle_table[id] = NULL;
     if (g_handle_free_len == g_handle_free_cap){
       g_handle_free_cap = g_handle_free_cap ? g_handle_free_cap * 2 : 1024;
@@ -494,8 +509,8 @@ static void* gc_nursery_bump(size_t sz){
   memset(p, 0, sz); /* keep the calloc zero-init contract of the classic path */
   return p;
 }
-static void gc_before_alloc(void){
-  gc_config_init();
+static inline void gc_before_alloc(void){
+  if (TS_RT_UNLIKELY(!g_gc_config_inited)) gc_config_init();
   size_t nursery_trigger_bytes = g_gc_aging_adaptive
     ? g_nursery_fresh_bytes : g_nursery_used_bytes;
   if (g_young_new_since_minor>=g_young_threshold || nursery_trigger_bytes>=g_nursery_cap_bytes)
@@ -634,6 +649,11 @@ void ts_object_proto_register(ts_key method_key, const char* name, ts_code fn){
    (string/symbol) so the same code serves both the named (key) and computed
    (keyv) entry points; ts_key_to_value reconstructs the value from a ts_key. */
 int g_has_proxies = 0;   /* declared in ts_rt.h; see ts_is_proxy there */
+/* Property-addition cache epoch (see prop_add_* near ts_set_pic). Bumped by
+   anything that can change the result of an uncached add: accessor
+   definitions, prototype relinks, class registrations and full collections
+   (entries only name old prototypes, whose handles a minor cannot recycle). */
+static void prop_add_epoch_bump(void);
 static tsv ts_key_to_value(ts_key k);
 /* User-symbol property keys store a compact sym_id. The side table is defined
    with the Symbol runtime below; property creation and GC scanning use it to
@@ -675,11 +695,38 @@ tsv ts_set_proto(tsv obj, tsv proto){
     ts_object* o = ts_ptr(obj);
     o->proto = ts_proto_ref(proto) ? proto : TS_NULL;
     ts_write_barrier(obj, proto);
+    prop_add_epoch_bump();
   }
   return obj;
 }
 
 /* ---- first-class callable values (methods + closures) ---- */
+/* Captured-environment buffers are small, exact-size and short-lived (an
+   inner declaration is boxed on every call of its enclosing function). Keep
+   bounded per-length free lists so the common sizes bypass the allocator;
+   ASan builds keep real allocations so lifetime errors stay visible. */
+#define TS_ENV_POOL_MAX_SLOTS 16u
+#define TS_ENV_POOL_MAX_TOTAL 65536u
+static tsv* g_env_pool[TS_ENV_POOL_MAX_SLOTS + 1u];
+static uint32_t g_env_pool_count = 0;
+static tsv* env_alloc(uint32_t n){
+#if !defined(TS_ASAN_ENABLED)
+  if (n <= TS_ENV_POOL_MAX_SLOTS){
+    tsv* p = g_env_pool[n];
+    if (p){ memcpy(&g_env_pool[n], p, sizeof(void*)); g_env_pool_count--; return p; }
+  }
+#endif
+  return (tsv*)malloc(sizeof(tsv) * (size_t)n);
+}
+static void env_free(tsv* p, uint32_t n){
+  if (!p) return;
+#if !defined(TS_ASAN_ENABLED)
+  if (n && n <= TS_ENV_POOL_MAX_SLOTS && g_env_pool_count < TS_ENV_POOL_MAX_TOTAL){
+    memcpy(p, &g_env_pool[n], sizeof(void*)); g_env_pool[n] = p; g_env_pool_count++; return;
+  }
+#endif
+  free(p);
+}
 static tsv ts_make_fn_impl(ts_code code, tsv* env, uint32_t envlen, int pretenured){
   ts_func* f = pretenured
     ? gc_alloc_pretenured(sizeof(ts_func), TS_KIND_FUNC)
@@ -690,7 +737,7 @@ static tsv ts_make_fn_impl(ts_code code, tsv* env, uint32_t envlen, int pretenur
   tsv fv = ts_func_v(f);
   if (pretenured) ts_write_barrier(fv, f->o.proto);
   if (env && envlen){
-    f->env = malloc(sizeof(tsv)*envlen);
+    f->env = env_alloc(envlen);
     for (uint32_t i=0;i<envlen;i++){
       f->env[i]=env[i];
       if (pretenured) ts_write_barrier(fv, env[i]);
@@ -713,22 +760,82 @@ tsv ts_make_fn_t_pretenured(ts_code code, tsv* env, uint32_t envlen, int takes_t
   ((ts_func*)ts_ptr(fv))->takes_this = (uint8_t)(takes_this ? 1 : 0);
   return fv;
 }
+tsv* g_ts_cur_env = NULL;
+tsv ts_make_closure_t(ts_code code, tsv* env, uint32_t envlen, int takes_this){
+  tsv fv = ts_make_fn_impl(code, env, envlen, 0);
+  ts_func* f = (ts_func*)ts_ptr(fv);
+  f->takes_this = (uint8_t)(takes_this ? 1 : 0);
+  f->env_abi = (uint8_t)(envlen ? 1 : 0);
+  return fv;
+}
+tsv ts_make_closure_t_pretenured(ts_code code, tsv* env, uint32_t envlen, int takes_this){
+  tsv fv = ts_make_fn_impl(code, env, envlen, 1);
+  ts_func* f = (ts_func*)ts_ptr(fv);
+  f->takes_this = (uint8_t)(takes_this ? 1 : 0);
+  f->env_abi = (uint8_t)(envlen ? 1 : 0);
+  return fv;
+}
 void ts_set_fn_meta(tsv fn, uint32_t arity, const char* name){
   if (!ts_is_func(fn)) return;
   ts_func* f = ts_ptr(fn);
-  f->arity = arity;
+  f->arity = (uint16_t)(arity > 0xFFFFu ? 0xFFFFu : arity);
   f->name = name;
 }
+static ts_key fn_constructor_key(void){
+  static ts_key k = 0xFFFFFFFFu;
+  if (k == 0xFFFFFFFFu) k = ts_intern_field("constructor", 11);
+  return k;
+}
+/* Install a FRESH prototype object (reachable only through fn). The own
+   `constructor` property is defined lazily: every function declaration and
+   expression creates one of these at closure-creation time, and the vast
+   majority is never used as a constructor or read through `.prototype`.
+   The property is materialized on the first observation of the prototype
+   (ts_get, ts_construct, descriptor read), which is the only way program
+   code can reach the object. No allocation happens here, so no roots. */
 void ts_set_fn_prototype(tsv fn, tsv proto){
   if (!ts_is_func(fn)) return;
-  ts_gc_root(&fn); ts_gc_root(&proto);
-  ((ts_func*)ts_ptr(fn))->prototype_prop = proto;
-  ((ts_func*)ts_ptr(fn))->constructable = 1;   /* own .prototype <=> ES5 [[Construct]] */
+  ts_func* f = (ts_func*)ts_ptr(fn);
+  f->prototype_prop = proto;
+  f->constructable = 1;   /* own .prototype <=> ES5 [[Construct]] */
+  f->ctor_pending = (uint8_t)(ts_is_obj(proto) ? 1 : 0);
+  f->proto_lazy = 0;
   ts_write_barrier(fn, proto);
-  if (ts_is_obj(proto)) {
-    ts_define_data(proto, ts_intern_field("constructor", 11), fn, 0, 1, 1);
+}
+/* Same ownership semantics as ts_set_fn_prototype(fn, ts_new_proto()), but
+   the prototype object is not allocated until something can observe it. */
+void ts_set_fn_prototype_lazy(tsv fn){
+  if (!ts_is_func(fn)) return;
+  ts_func* f = (ts_func*)ts_ptr(fn);
+  f->prototype_prop = TS_UNDEFINED;
+  f->constructable = 1;
+  f->ctor_pending = 0;
+  f->proto_lazy = 1;
+}
+/* An own `.prototype` exists while the slot holds an object or is pending. */
+static inline int fn_has_own_prototype(const ts_func* f){
+  return !ts_is_undef(f->prototype_prop) || f->proto_lazy;
+}
+/* Create the pending prototype and/or its `constructor` before fn.prototype
+   becomes observable. The lazy object allocation may run a moving
+   collection, so callers must continue with the returned cell pointer. */
+static ts_func* fn_materialize_prototype(ts_func* f, tsv fnv){
+  if (f->proto_lazy){
+    f->proto_lazy = 0;
+    ts_gc_root(&fnv);
+    tsv proto = ts_new_proto();
+    f = (ts_func*)ts_ptr(fnv);
+    f->prototype_prop = proto;
+    ts_write_barrier(fnv, proto);
+    ts_define_data(proto, fn_constructor_key(), fnv, 0, 1, 1);
+    ts_gc_unroot(1);
+    return (ts_func*)ts_ptr(fnv);
   }
-  ts_gc_unroot(2);
+  if (!f->ctor_pending) return f;
+  f->ctor_pending = 0;
+  if (ts_is_obj(f->prototype_prop))
+    ts_define_data(f->prototype_prop, fn_constructor_key(), fnv, 0, 1, 1);
+  return f;
 }
 int ts_is_callable(tsv v){ return ts_is_func(v); }
 /* Calling a non-function is a catchable TypeError in JS (`x()` / `x.m()` where
@@ -768,8 +875,10 @@ tsv ts_call(tsv fn, tsv* args, int nargs){
   ts_func* f = ts_ptr(fn);
   ts_code code = (ts_code)f->code;
   if (f->envlen){
-    /* Closure: prepend captured cells (env) to the args, matching the callee's
-       calling convention (captured cells are its leading parameters). */
+    /* Environment ABI: the callee reads its cells from the register. */
+    if (f->env_abi){ g_ts_cur_env = f->env; return code(args, nargs); }
+    /* Legacy closure: prepend captured cells (env) to the args, matching the
+       callee's calling convention (captured cells are its leading parameters). */
     int total = (int)f->envlen + nargs;   /* envlen>=1 here, nargs>=0 => total>=1 */
     RT_STAT_HIST(call_env_hist, total);
     RT_STAT_ADD(call_env_slots, total);
@@ -858,8 +967,14 @@ static inline int array_uses_inline(ts_array* a){ return a->data == a->inline_da
    still use ts_gc_remember, which requests the complete element scan. */
 static inline void array_write_barrier(ts_array* a, uint32_t index, tsv value){
   if (a->o.h.gen != TS_GEN_OLD || !ts_heap_ref(value)) return;
-  ts_gc_header* child = ts_heap_ptr(value);
-  if (!child || child->gen != TS_GEN_YOUNG) return;
+  uint64_t vp = value & TS_PAYLOAD_MASK;
+  if (vp & 1u){
+    uint32_t id = (uint32_t)(vp >> 1);
+    if (id >= g_handle_cap || ((uintptr_t)g_ts_handle_table[id] & TS_HANDLE_OLD_BIT)) return;
+  } else {
+    ts_gc_header* child = ts_heap_ptr(value);
+    if (!child || child->gen != TS_GEN_YOUNG) return;
+  }
   uint32_t card = index >> GC_CONTAINER_CARD_SHIFT;
   if (card >= UINT16_MAX) a->gc_dirty_all = 1;
   else {
@@ -891,7 +1006,9 @@ static void array_ensure_cap(ts_array* a, uint32_t need){
   } else {
     a->data = (tsv*)realloc(a->data, nc * sizeof(tsv));
   }
-  for (uint32_t k=old;k<nc;k++) a->data[k]=TS_UNDEFINED;
+  /* Slots at or beyond len are never read (readers bound by len, writers fill
+     holes explicitly, truncation already leaves stale values), so the grown
+     tail is left unfilled. */
   a->cap=nc;
 }
 /* `arr.length = n`: truncate (drop the tail) or extend (new slots are holes,
@@ -1014,14 +1131,99 @@ static uint32_t prop_key_hash(ts_key key){
 typedef struct {
   uint32_t parent;
   ts_key key;
+  uint8_t flags;
   uint32_t next;
 } ts_shape_edge;
 static ts_shape_edge* g_shape_edges = NULL;
 static uint32_t g_shape_edge_cap = 0, g_shape_edge_len = 0;
 static uint32_t g_next_shape = TS_SHAPE_EMPTY + 1u;
 
-static uint32_t shape_edge_hash(uint32_t parent, ts_key key){
-  return prop_key_hash(key ^ (parent * 0x9e3779b9u));
+/* Shape descriptors (object_model_v2_design.md, slice A2a): the hidden class
+   owns its key sequence and the attribute flags of every property, so the
+   flags are part of the transition key. Key/flag vectors are materialized
+   lazily from the parent chain. Index TS_SHAPE_EMPTY stays zeroed (depth 0). */
+typedef struct {
+  uint32_t parent;
+  ts_key key;
+  uint8_t flags;
+  uint32_t depth;
+  ts_key* keys;      /* depth entries */
+  uint8_t* kflags;   /* depth entries */
+  /* Open-addressing index over `keys` (slot + 1 per entry) for shapes with at
+     least TS_PROP_INDEX_MIN keys, so keyed lookups on large shaped objects
+     stay sub-linear like the dictionary index. */
+  uint32_t* index;
+  uint32_t index_cap;
+} ts_shape_desc;
+static ts_shape_desc* g_shapes = NULL;
+static uint32_t g_shapes_cap = 0;
+/* Public key/flag vectors by shape id (ts_rt.h); the header's inline probe and
+   the accessors below read them. Index 0 and TS_SHAPE_EMPTY stay NULL. */
+ts_key** g_ts_shape_keys = NULL;
+uint8_t** g_ts_shape_flags = NULL;
+static void shape_desc_record(uint32_t id, uint32_t parent, ts_key key, uint8_t flags){
+  if (id >= g_shapes_cap){
+    uint32_t cap = g_shapes_cap ? g_shapes_cap : 1024u;
+    while (id >= cap) cap *= 2u;
+    g_shapes = (ts_shape_desc*)realloc(g_shapes, sizeof(ts_shape_desc) * cap);
+    memset(g_shapes + g_shapes_cap, 0, sizeof(ts_shape_desc) * (cap - g_shapes_cap));
+    g_ts_shape_keys = (ts_key**)realloc(g_ts_shape_keys, sizeof(ts_key*) * cap);
+    memset(g_ts_shape_keys + g_shapes_cap, 0, sizeof(ts_key*) * (cap - g_shapes_cap));
+    g_ts_shape_flags = (uint8_t**)realloc(g_ts_shape_flags, sizeof(uint8_t*) * cap);
+    memset(g_ts_shape_flags + g_shapes_cap, 0, sizeof(uint8_t*) * (cap - g_shapes_cap));
+    g_shapes_cap = cap;
+  }
+  ts_shape_desc* d = &g_shapes[id];
+  d->parent = parent; d->key = key; d->flags = flags;
+  uint32_t pdepth = parent < g_shapes_cap ? g_shapes[parent].depth : 0u;
+  d->depth = pdepth + 1u;
+  /* Eager vectors: the parent's sequence plus this key. Shaped objects index
+     them on every keyed lookup, so they must exist before the shape is used. */
+  d->keys = (ts_key*)malloc(sizeof(ts_key) * d->depth);
+  d->kflags = (uint8_t*)malloc(d->depth);
+  if (pdepth){
+    memcpy(d->keys, g_shapes[parent].keys, sizeof(ts_key) * pdepth);
+    memcpy(d->kflags, g_shapes[parent].kflags, pdepth);
+  }
+  d->keys[pdepth] = key; d->kflags[pdepth] = flags;
+  g_ts_shape_keys[id] = d->keys;
+  g_ts_shape_flags[id] = d->kflags;
+  d->index = NULL; d->index_cap = 0;
+  if (d->depth >= TS_PROP_INDEX_MIN){
+    uint32_t cap = 16u;
+    while (d->depth * 4u >= cap * 3u) cap *= 2u;
+    d->index = (uint32_t*)calloc(cap, sizeof(uint32_t));
+    d->index_cap = cap;
+    for (uint32_t i = 0; i < d->depth; i++){
+      uint32_t slot = prop_key_hash(d->keys[i]) & (cap - 1u);
+      while (d->index[slot]) slot = (slot + 1u) & (cap - 1u);
+      d->index[slot] = i + 1u;
+    }
+  }
+}
+/* Slot of `key` in a shape with an index, or -1. */
+static inline int32_t shape_index_find(uint32_t sid, ts_key key, uint32_t* probes){
+  const ts_shape_desc* d = &g_shapes[sid];
+  uint32_t mask = d->index_cap - 1u, p = 0;
+  for (uint32_t slot = prop_key_hash(key) & mask; ; slot = (slot + 1u) & mask){
+    p++;
+    uint32_t entry = d->index[slot];
+    if (!entry){ if (probes) *probes = p; return -1; }
+    if (d->keys[entry - 1u] == key){ if (probes) *probes = p; return (int32_t)(entry - 1u); }
+  }
+}
+static inline uint32_t shape_depth(uint32_t id){
+  return (id <= TS_SHAPE_EMPTY || id >= g_shapes_cap) ? 0u : g_shapes[id].depth;
+}
+static inline const ts_key* shape_keys(uint32_t id){
+  return (id <= TS_SHAPE_EMPTY || id >= g_shapes_cap) ? NULL : g_shapes[id].keys;
+}
+static inline const uint8_t* shape_kflags(uint32_t id){
+  return (id <= TS_SHAPE_EMPTY || id >= g_shapes_cap) ? NULL : g_shapes[id].kflags;
+}
+
+static uint32_t shape_edge_hash(uint32_t parent, ts_key key, uint8_t flags){
+  return prop_key_hash((key ^ (parent * 0x9e3779b9u)) + (uint32_t)flags * 0x85ebca6bu);
 }
 static int shape_edges_grow(void){
   uint32_t new_cap = g_shape_edge_cap ? g_shape_edge_cap * 2u : 64u;
@@ -1030,7 +1232,7 @@ static int shape_edges_grow(void){
   for (uint32_t i = 0; i < g_shape_edge_cap; i++){
     ts_shape_edge edge = g_shape_edges[i];
     if (!edge.next) continue;
-    uint32_t slot = shape_edge_hash(edge.parent, edge.key) & (new_cap - 1u);
+    uint32_t slot = shape_edge_hash(edge.parent, edge.key, edge.flags) & (new_cap - 1u);
     while (edges[slot].next) slot = (slot + 1u) & (new_cap - 1u);
     edges[slot] = edge;
   }
@@ -1039,14 +1241,15 @@ static int shape_edges_grow(void){
   g_shape_edge_cap = new_cap;
   return 1;
 }
-static uint32_t shape_transition(uint32_t parent, ts_key key){
+static uint32_t shape_transition_f(uint32_t parent, ts_key key, uint8_t flags){
   if (parent == TS_SHAPE_NONE) return TS_SHAPE_NONE;
   if (!g_shape_edge_cap || (g_shape_edge_len + 1u) * 4u >= g_shape_edge_cap * 3u){
     if (!shape_edges_grow()) return TS_SHAPE_NONE;
   }
-  uint32_t slot = shape_edge_hash(parent, key) & (g_shape_edge_cap - 1u);
+  uint32_t slot = shape_edge_hash(parent, key, flags) & (g_shape_edge_cap - 1u);
   while (g_shape_edges[slot].next){
-    if (g_shape_edges[slot].parent == parent && g_shape_edges[slot].key == key)
+    if (g_shape_edges[slot].parent == parent && g_shape_edges[slot].key == key &&
+        g_shape_edges[slot].flags == flags)
       return g_shape_edges[slot].next;
     slot = (slot + 1u) & (g_shape_edge_cap - 1u);
   }
@@ -1054,11 +1257,63 @@ static uint32_t shape_transition(uint32_t parent, ts_key key){
   uint32_t next = g_next_shape++;
   g_shape_edges[slot].parent = parent;
   g_shape_edges[slot].key = key;
+  g_shape_edges[slot].flags = flags;
   g_shape_edges[slot].next = next;
   g_shape_edge_len++;
+  shape_desc_record(next, parent, key, flags);
   return next;
 }
+/* Ordinary stores add properties with the default attributes. */
+static uint32_t shape_transition(uint32_t parent, ts_key key){
+  return shape_transition_f(parent, key, TS_PROP_DEFAULT);
+}
+/* Leave the hidden-class regime: convert to a dictionary (shape 0) with
+   per-entry keys and flags, as deletion and attribute changes require. */
+static void obj_to_dictionary(ts_object* o);
+#ifdef TSAOT_RT_STATS
+/* Instrumented builds verify that a shaped object's length matches its shape
+   (keys and flags are the shape's own vectors, so they cannot drift). */
+static void shape_check(const ts_object* o){
+  uint32_t id = ts_obj_shape_id(o);
+  if (id == TS_SHAPE_NONE) return;
+  if (shape_depth(id) != o->len){ fprintf(stderr, "tsaot: shape depth %u != len %u\n", shape_depth(id), o->len); abort(); }
+  if (o->len && !shape_keys(id)){ fprintf(stderr, "tsaot: shape %u has no key vector\n", id); abort(); }
+}
+#define SHAPE_CHECK(o) shape_check(o)
+#else
+#define SHAPE_CHECK(o) ((void)0)
+#endif
 
+/* ---- object model v2 (slice A2b): representation accessors ----
+   A shaped object (shape != 0) stores only values, 8 bytes per property; its
+   keys and attribute flags are the shape's vectors. A dictionary object
+   (shape 0) keeps ts_prop entries with keys and flags, plus an optional
+   open-addressing index. Sized class instances are always dictionaries. */
+static inline int obj_shaped(const ts_object* o){ return ts_obj_shape_id(o) != TS_SHAPE_NONE; }
+static inline tsv* obj_vals(ts_object* o){ return (tsv*)o->props; }
+static inline ts_key obj_key_at(const ts_object* o, uint32_t i){
+  return obj_shaped(o) ? g_ts_shape_keys[ts_obj_shape_id(o)][i] : o->props[i].key;
+}
+static inline tsv* obj_val_at(ts_object* o, uint32_t i){
+  return obj_shaped(o) ? &((tsv*)o->props)[i] : &o->props[i].val;
+}
+static inline uint8_t obj_flags_at(const ts_object* o, uint32_t i){
+  return obj_shaped(o) ? g_ts_shape_flags[ts_obj_shape_id(o)][i] : o->props[i].flags;
+}
+/* A located own property: the object and its slot index. */
+typedef struct { ts_object* o; uint32_t i; } ts_pref;
+static const ts_pref PREF_NONE = { NULL, 0u };
+static inline int pref_ok(ts_pref r){ return r.o != NULL; }
+static inline ts_key pref_key(ts_pref r){ return obj_key_at(r.o, r.i); }
+static inline tsv* pref_valp(ts_pref r){ return obj_val_at(r.o, r.i); }
+static inline tsv pref_val(ts_pref r){ return *obj_val_at(r.o, r.i); }
+static inline uint8_t pref_flags(ts_pref r){ return obj_flags_at(r.o, r.i); }
+static inline int pref_is_accessor(ts_pref r){ return (pref_flags(r) & TS_PROP_ACCESSOR) != 0; }
+static inline int pref_is_writable(ts_pref r){ return (pref_flags(r) & TS_PROP_WRITABLE) != 0; }
+static inline int pref_is_enumerable(ts_pref r){ return (pref_flags(r) & TS_PROP_ENUMERABLE) != 0; }
+static inline int pref_is_configurable(ts_pref r){ return (pref_flags(r) & TS_PROP_CONFIGURABLE) != 0; }
+
+/* Dictionary index (shape 0 only). */
 static void prop_index_put(ts_object* o, uint32_t prop_i){
   uint32_t mask = o->prop_index_cap - 1u;
   uint32_t slot = prop_key_hash(o->props[prop_i].key) & mask;
@@ -1088,7 +1343,7 @@ static void prop_index_reserve(ts_object* o, uint32_t need){
   if (!o->prop_index || need * 4u >= o->prop_index_cap * 3u)
     prop_index_rebuild(o, need);
 }
-static ts_prop* prop_index_lookup(ts_object* o, ts_key key, uint32_t* probes){
+static int32_t prop_index_lookup(ts_object* o, ts_key key, uint32_t* probes){
   uint32_t p = 0;
   uint32_t mask = o->prop_index_cap - 1u;
   for (uint32_t slot = prop_key_hash(key) & mask; ; slot = (slot + 1u) & mask){
@@ -1096,21 +1351,23 @@ static ts_prop* prop_index_lookup(ts_object* o, ts_key key, uint32_t* probes){
     uint32_t entry = o->prop_index[slot];
     if (!entry){
       if (probes) *probes = p;
-      return NULL;
+      return -1;
     }
-    ts_prop* prop = &o->props[entry - 1u];
-    if (prop->key == key){
+    if (o->props[entry - 1u].key == key){
       if (probes) *probes = p;
-      return prop;
+      return (int32_t)(entry - 1u);
     }
   }
 }
-/* A bounded recycle list for the common four-property payload. These
-   buffers often die in large nursery batches; reuse avoids repeated allocator
-   page setup without retaining an unbounded high-water mark. */
+/* Bounded recycle lists for the common four-property payloads: dictionary
+   entry vectors (64 bytes) and shaped value vectors (32 bytes). These buffers
+   often die in large nursery batches; reuse avoids repeated allocator page
+   setup without retaining an unbounded high-water mark. */
 #define TS_SMALL_PROPS_CACHE_MAX 65536u
 static ts_prop* g_small_props_free = NULL;
 static uint32_t g_small_props_count = 0;
+static tsv* g_small_vals_free = NULL;
+static uint32_t g_small_vals_count = 0;
 static ts_prop* props_alloc_small(void){
   ts_prop* p = g_small_props_free;
   if (p){
@@ -1122,56 +1379,159 @@ static ts_prop* props_alloc_small(void){
   RT_STAT_INC(small_props_fresh);
   return (ts_prop*)malloc(4u * sizeof(ts_prop));
 }
-static void props_free(ts_object* o){
-  ts_prop* p = o->props;
+static tsv* vals_alloc_small(void){
+  tsv* p = g_small_vals_free;
+  if (p){
+    memcpy(&g_small_vals_free, p, sizeof(void*));
+    g_small_vals_count--;
+    RT_STAT_INC(small_props_reused);
+    return p;
+  }
+  RT_STAT_INC(small_props_fresh);
+  return (tsv*)malloc(4u * sizeof(tsv));
+}
+static void vals_free_buf(tsv* p, uint32_t cap){
   if (!p) return;
-  if (o->cap == 4 && g_small_props_count < TS_SMALL_PROPS_CACHE_MAX){
+  if (cap == 4 && g_small_vals_count < TS_SMALL_PROPS_CACHE_MAX){
+    memcpy(p, &g_small_vals_free, sizeof(void*));
+    g_small_vals_free = p; g_small_vals_count++;
+  } else free(p);
+}
+static void props_free_buf(ts_prop* p, uint32_t cap){
+  if (!p) return;
+  if (cap == 4 && g_small_props_count < TS_SMALL_PROPS_CACHE_MAX){
     memcpy(p, &g_small_props_free, sizeof(void*));
     g_small_props_free = p; g_small_props_count++;
   } else free(p);
 }
-static ts_prop* find_prop(ts_object* o, ts_key key, int create){
-  RT_STAT_INC(find_prop_calls);
-  if (o->prop_index){
-    uint32_t probes = 0;
-    ts_prop* found = prop_index_lookup(o, key, &probes);
-    RT_STAT_ADD(find_prop_probes, probes); RT_STAT_HIST(find_prop_hist, probes);
-    if (found || !create) return found;
-  } else {
-    for (uint32_t i=0;i<o->len;i++) if (o->props[i].key==key){
-      RT_STAT_ADD(find_prop_probes, i+1); RT_STAT_HIST(find_prop_hist, i+1);
-      return &o->props[i];
-    }
-    RT_STAT_ADD(find_prop_probes, o->len); RT_STAT_HIST(find_prop_hist, o->len+1);
-    if (!create) return NULL;
+static void props_free(ts_object* o){
+  if (obj_shaped(o)) vals_free_buf(obj_vals(o), o->cap);
+  else props_free_buf(o->props, o->cap);
+}
+static void obj_to_dictionary(ts_object* o){
+  if (!obj_shaped(o)) return;
+  uint32_t sid = ts_obj_shape_id(o);
+  uint32_t len = o->len, oldcap = o->cap;
+  ts_prop* v = NULL;
+  uint32_t cap = oldcap;
+  if (cap){
+    if (cap <= 4u){ cap = 4u; v = props_alloc_small(); }
+    else v = (ts_prop*)malloc(sizeof(ts_prop) * cap);
+    const ts_key* ks = g_ts_shape_keys[sid];
+    const uint8_t* fl = g_ts_shape_flags[sid];
+    tsv* vals = obj_vals(o);
+    for (uint32_t i = 0; i < len; i++){ v[i].key = ks[i]; v[i].val = vals[i]; v[i].flags = fl[i]; }
+    vals_free_buf(vals, oldcap);
   }
+  o->props = v; o->cap = cap;
+  ts_obj_set_shape(o, TS_SHAPE_NONE);
+  if (len >= TS_PROP_INDEX_MIN) prop_index_rebuild(o, len);
+}
+/* Append a new own property whose absence the caller has established.
+   next_shape is the hidden class after the addition (shape_transition's
+   answer for the current shape and key, or a cached copy of it); it is
+   TS_SHAPE_NONE for dictionaries. */
+static ts_pref props_append_f(ts_object* o, ts_key key, uint32_t next_shape, uint8_t flags){
+  int shaped = obj_shaped(o);
+  if (shaped && next_shape == TS_SHAPE_NONE){ obj_to_dictionary(o); shaped = 0; }
   if (o->len==o->cap){
     uint32_t cap = o->cap;
-    if (!cap) o->props = props_alloc_small();
-    else if (cap == 4){
-      ts_prop* grown = (ts_prop*)malloc(8u * sizeof(ts_prop));
-      memcpy(grown, o->props, cap * sizeof(ts_prop));
-      props_free(o); o->props = grown;
-    } else o->props = realloc(o->props, sizeof(ts_prop) * (size_t)cap * 2u);
+    if (shaped){
+      if (!cap) o->props = (ts_prop*)vals_alloc_small();
+      else if (cap == 4){
+        tsv* grown = (tsv*)malloc(8u * sizeof(tsv));
+        memcpy(grown, obj_vals(o), cap * sizeof(tsv));
+        vals_free_buf(obj_vals(o), cap); o->props = (ts_prop*)grown;
+      } else o->props = (ts_prop*)realloc(o->props, sizeof(tsv) * (size_t)cap * 2u);
+    } else {
+      if (!cap) o->props = props_alloc_small();
+      else if (cap == 4){
+        ts_prop* grown = (ts_prop*)malloc(8u * sizeof(ts_prop));
+        memcpy(grown, o->props, cap * sizeof(ts_prop));
+        props_free_buf(o->props, cap); o->props = grown;
+      } else o->props = (ts_prop*)realloc(o->props, sizeof(ts_prop) * (size_t)cap * 2u);
+    }
     o->cap = cap ? cap * 2u : 4u;
   }
-  prop_index_reserve(o, o->len + 1u);
+  if (!shaped) prop_index_reserve(o, o->len + 1u);
   uint32_t added = o->len++;
-  o->props[added].key=key; o->props[added].val=TS_UNDEFINED;
-  o->props[added].flags=TS_PROP_DEFAULT;   /* must NOT be 0 (=all-false) */
-  /* A user-Symbol property name is a strong edge even though ts_prop stores
+  if (shaped) obj_vals(o)[added] = TS_UNDEFINED;
+  else { o->props[added].key=key; o->props[added].val=TS_UNDEFINED; o->props[added].flags=flags; }
+  /* A user-Symbol property name is a strong edge even though the entry stores
      only its compact id. Enroll old owners when that Symbol is young; the GC
      scanner reconstructs and marks the same edge from the weak side table. */
   if (key >= TS_USERSYM_KEY_BASE)
     ts_write_barrier(ts_obj(o), sym_value_by_id(key - TS_USERSYM_KEY_BASE));
-  if (o->prop_index) prop_index_put(o, added);
-  ts_obj_set_shape(o, shape_transition(ts_obj_shape_id(o), key));
-  return &o->props[added];
+  if (!shaped && o->prop_index) prop_index_put(o, added);
+  if (shaped) ts_obj_set_shape(o, next_shape);
+  SHAPE_CHECK(o);
+  return (ts_pref){ o, added };
+}
+static ts_pref props_append(ts_object* o, ts_key key, uint32_t next_shape){
+  return props_append_f(o, key, next_shape, TS_PROP_DEFAULT);
+}
+/* Locate an own property by key. */
+static ts_pref prop_find(ts_object* o, ts_key key){
+  RT_STAT_INC(find_prop_calls);
+  if (obj_shaped(o)){
+    uint32_t len = o->len;
+    uint32_t sid = ts_obj_shape_id(o);
+    if (len >= TS_PROP_INDEX_MIN && g_shapes[sid].index){
+      uint32_t probes = 0;
+      int32_t found = shape_index_find(sid, key, &probes);
+      RT_STAT_ADD(find_prop_probes, probes); RT_STAT_HIST(find_prop_hist, probes);
+      return found < 0 ? PREF_NONE : (ts_pref){ o, (uint32_t)found };
+    }
+    /* The shape tables exist once any property has been added anywhere; an
+       empty shaped object must not index them. */
+    const ts_key* ks = len ? g_ts_shape_keys[sid] : NULL;
+    for (uint32_t i=0;i<len;i++) if (ks[i]==key){
+      RT_STAT_ADD(find_prop_probes, i+1); RT_STAT_HIST(find_prop_hist, i+1);
+      return (ts_pref){ o, i };
+    }
+    RT_STAT_ADD(find_prop_probes, len); RT_STAT_HIST(find_prop_hist, len+1);
+    return PREF_NONE;
+  }
+  if (o->prop_index){
+    uint32_t probes = 0;
+    int32_t found = prop_index_lookup(o, key, &probes);
+    RT_STAT_ADD(find_prop_probes, probes); RT_STAT_HIST(find_prop_hist, probes);
+    return found < 0 ? PREF_NONE : (ts_pref){ o, (uint32_t)found };
+  }
+  for (uint32_t i=0;i<o->len;i++) if (o->props[i].key==key){
+    RT_STAT_ADD(find_prop_probes, i+1); RT_STAT_HIST(find_prop_hist, i+1);
+    return (ts_pref){ o, i };
+  }
+  RT_STAT_ADD(find_prop_probes, o->len); RT_STAT_HIST(find_prop_hist, o->len+1);
+  return PREF_NONE;
+}
+/* Find, or create with default attributes (the historical find_prop contract). */
+static ts_pref find_prop(ts_object* o, ts_key key, int create){
+  ts_pref r = prop_find(o, key);
+  if (pref_ok(r) || !create) return r;
+  uint32_t sid = ts_obj_shape_id(o);
+  return props_append(o, key, sid == TS_SHAPE_NONE ? TS_SHAPE_NONE : shape_transition(sid, key));
+}
+/* Define or redefine `key` with attribute flags. A new property transitions
+   with its flags; changing the flags of an existing property on a shaped
+   object demotes it to a dictionary first (attributes are part of the class). */
+static ts_pref props_define(ts_object* o, ts_key key, uint8_t flags){
+  ts_pref p = prop_find(o, key);
+  if (pref_ok(p)){
+    if (pref_flags(p) != flags){
+      obj_to_dictionary(o);
+      o->props[p.i].flags = flags;
+    }
+    return p;
+  }
+  uint32_t sid = ts_obj_shape_id(o);
+  uint32_t next = sid == TS_SHAPE_NONE ? TS_SHAPE_NONE : shape_transition_f(sid, key, flags);
+  return props_append_f(o, key, next, flags);
 }
 /* Back-compat thin wrapper: returns &val (the historical find_slot contract). */
 static tsv* find_slot(ts_object* o, ts_key key, int create){
-  ts_prop* p = find_prop(o, key, create);
-  return p ? &p->val : NULL;
+  ts_pref p = find_prop(o, key, create);
+  return pref_ok(p) ? pref_valp(p) : NULL;
 }
 static int lookup_prop_chain(tsv receiver, ts_object* o, ts_key key, tsv* out){
   while (o){
@@ -1322,7 +1682,10 @@ tsv ts_get(tsv obj, ts_key key){
     static uint32_t k_name = 0xFFFFFFFFu, k_length = 0xFFFFFFFFu, k_prototype = 0xFFFFFFFFu;
     if (k_name == 0xFFFFFFFFu){ k_name = ts_intern_field("name", 4); k_length = ts_intern_field("length", 6); k_prototype = ts_intern_field("prototype", 9); }
     ts_func* f = ts_ptr(obj);
-    if (key == k_prototype && !ts_is_undef(f->prototype_prop)) return f->prototype_prop;
+    if (key == k_prototype && fn_has_own_prototype(f)){
+      f = fn_materialize_prototype(f, obj);
+      return f->prototype_prop;
+    }
     ts_object* sc = ts_class_static_container(obj);
     if (sc){
       tsv found;
@@ -1465,27 +1828,27 @@ static void ts_throw_bad_write_receiver(tsv obj, ts_key key){
   }
   /* other non-propbag kinds (symbol, promise, coro, ...): historical no-op */
 }
-static ts_prop* ts_set_named_prop(tsv obj, ts_object* o, ts_key key, tsv val,
+static ts_pref ts_set_named_prop(tsv obj, ts_object* o, ts_key key, tsv val,
                                   int check_struct_fields){
   const int frozen = (ts_obj_integrity(o) & 1u) != 0;   /* Object.freeze */
   if (check_struct_fields && g_has_class_regs){
     size_t off; int numeric;
     if (class_field_lookup(o, key, &off, &numeric)){
-      if (frozen){ ts_throw_readonly_write(key); return NULL; }
+      if (frozen){ ts_throw_readonly_write(key); return PREF_NONE; }
       struct_field_set(o, off, numeric, val);
-      return NULL;
+      return PREF_NONE;
     }
   }
   /* 1) own prop slot? if accessor -> setter; if data -> overwrite (strict: a
      frozen object or a non-writable data property throws). */
-  ts_prop* ownp=find_prop(o,key,0);
-  if (ownp){
-    if (prop_is_accessor(ownp)){
-      invoke_setter((ts_accessor*)ts_ptr(ownp->val), obj, key, val);
+  ts_pref ownp=prop_find(o,key);
+  if (pref_ok(ownp)){
+    if (pref_is_accessor(ownp)){
+      invoke_setter((ts_accessor*)ts_ptr(pref_val(ownp)), obj, key, val);
       return ownp;
     }
-    if (frozen || !prop_is_writable(ownp)){ ts_throw_readonly_write(key); return NULL; }
-    ownp->val=val; ts_write_barrier(obj, val); return ownp;
+    if (frozen || !pref_is_writable(ownp)){ ts_throw_readonly_write(key); return PREF_NONE; }
+    *pref_valp(ownp)=val; ts_write_barrier(obj, val); return ownp;
   }
   /* 2) inherited accessor up the proto chain -> invoke its setter (this=obj). */
   for (ts_object* p=ts_next_proto(o); p; p=ts_next_proto(p)){
@@ -1493,16 +1856,16 @@ static ts_prop* ts_set_named_prop(tsv obj, ts_object* o, ts_key key, tsv val,
     if (s){
       if (is_accessor(*s)){
         invoke_setter((ts_accessor*)ts_ptr(*s), obj, key, val);
-        return NULL;
+        return PREF_NONE;
       }
       break;   /* inherited data property: fall through to create an own data prop */
     }
   }
   /* 3) create an own data property — strict: throw on a non-extensible object
      (frozen bit0 / preventExtensions bit1 / sealed bit2). */
-  if (ts_obj_integrity(o) & (1u|2u|4u)){ ts_throw_not_extensible(key); return NULL; }
-  ts_prop* created = find_prop(o,key,1);
-  created->val=val;
+  if (ts_obj_integrity(o) & (1u|2u|4u)){ ts_throw_not_extensible(key); return PREF_NONE; }
+  ts_pref created = find_prop(o,key,1);
+  *pref_valp(created)=val;
   ts_write_barrier(obj, val);
   return created;
 }
@@ -1521,8 +1884,8 @@ void ts_set(tsv obj, ts_key key, tsv val){
   if (!ts_is_propbag(obj)){ ts_throw_bad_write_receiver(obj, key); return; }
   if (ts_is_func(obj)){
     ts_func* f = (ts_func*)ts_ptr(obj);
-    if (field_name_is(key, "prototype") && !ts_is_undef(f->prototype_prop)){
-      if (!ts_is_class_value(obj)) { f->prototype_prop = val; ts_write_barrier(obj, val); }  /* class prototype is non-writable */
+    if (field_name_is(key, "prototype") && fn_has_own_prototype(f)){
+      if (!ts_is_class_value(obj)) { f->prototype_prop = val; f->ctor_pending = 0; f->proto_lazy = 0; ts_write_barrier(obj, val); }  /* class prototype is non-writable */
       return;
     }
   }
@@ -1668,18 +2031,19 @@ void ts_define_accessor_attr(tsv obj, ts_key key, tsv getter, tsv setter, int g_
      are valid ECMAScript property targets too (constructor statics and
      Function.prototype itself rely on this path). */
   if (!ts_is_obj(obj) && !ts_is_func(obj)) return;
+  prop_add_epoch_bump();
   ts_gc_root(&obj); ts_gc_root(&getter); ts_gc_root(&setter);
   ts_accessor* ac = gc_alloc(sizeof(ts_accessor), TS_KIND_ACCESSOR);
   ac->getter = getter; ac->setter = setter;
   ac->g_this = (uint8_t)(g_this?1:0); ac->s_this = (uint8_t)(s_this?1:0);
-  ts_prop* p = find_prop((ts_object*)ts_ptr(obj), key, 1);
-  p->val = ts_obj(ac);
-  ts_write_barrier(obj, p->val);
   /* accessor attributes live in the slot flags. writable bit is unused for
      accessors (kept 0). enumerable/configurable per the descriptor. */
-  p->flags = (uint8_t)(TS_PROP_ACCESSOR |
-                       (e?TS_PROP_ENUMERABLE:0) |
-                       (c?TS_PROP_CONFIGURABLE:0));
+  uint8_t flags = (uint8_t)(TS_PROP_ACCESSOR |
+                            (e?TS_PROP_ENUMERABLE:0) |
+                            (c?TS_PROP_CONFIGURABLE:0));
+  ts_pref p = props_define((ts_object*)ts_ptr(obj), key, flags);
+  *pref_valp(p) = ts_obj(ac);
+  ts_write_barrier(obj, pref_val(p));
   ts_gc_unroot(3);
 }
 /* back-compat: defineProperty accessor with default attributes (non-enumerable,
@@ -1716,10 +2080,10 @@ void ts_define_data(tsv obj, ts_key key, tsv value, int e, int w, int c){
   if (!ts_is_obj(obj) && !ts_is_func(obj)) return;
   ts_gc_root(&obj); ts_gc_root(&value);
   ts_object* o = (ts_object*)ts_ptr(obj);
-  ts_prop* p = find_prop(o, key, 1);
-  p->val = value;
+  uint8_t flags = (uint8_t)((e?TS_PROP_ENUMERABLE:0) | (w?TS_PROP_WRITABLE:0) | (c?TS_PROP_CONFIGURABLE:0));
+  ts_pref p = props_define(o, key, flags);
+  *pref_valp(p) = value;
   ts_write_barrier(obj, value);
-  p->flags = (uint8_t)((e?TS_PROP_ENUMERABLE:0) | (w?TS_PROP_WRITABLE:0) | (c?TS_PROP_CONFIGURABLE:0));
   ts_gc_unroot(2);
 }
 
@@ -1738,14 +2102,13 @@ static void ts_proto_register_method(tsv proto, ts_key method_key, const char* n
   tsv fv = ts_make_fn_t(fn, 0, 0, 1);
   ts_gc_root(&proto); ts_gc_root(&fv);
   ts_object* o = (ts_object*)ts_ptr(proto);
-  ts_prop* mp = find_prop(o, method_key, 1);
-  mp->val = fv;
-  mp->flags = (uint8_t)(TS_PROP_WRITABLE | TS_PROP_CONFIGURABLE);
+  ts_pref mp = props_define(o, method_key, (uint8_t)(TS_PROP_WRITABLE | TS_PROP_CONFIGURABLE));
+  *pref_valp(mp) = fv;
   ts_write_barrier(proto, fv);
   if (name){
-    ts_prop* fp = find_prop(o, ts_intern_field(name, (uint32_t)strlen(name)), 1);
-    fp->val = fv;
-    fp->flags = (uint8_t)(TS_PROP_WRITABLE | TS_PROP_CONFIGURABLE);
+    ts_pref fp = props_define(o, ts_intern_field(name, (uint32_t)strlen(name)),
+                              (uint8_t)(TS_PROP_WRITABLE | TS_PROP_CONFIGURABLE));
+    *pref_valp(fp) = fv;
     ts_write_barrier(proto, fv);
   }
   ts_gc_unroot(2);
@@ -3033,7 +3396,10 @@ tsv ts_str_concat_many(tsv* args, int n){
   if (heap_parts) free(parts);
   return r;
 }
-int ts_strict_eq(tsv a, tsv b){
+/* Out-of-line tail of the header's ts_strict_eq: reached for two distinct
+   string values (and kept complete so runtime callers may use it directly). */
+int ts_strict_eq_slow(tsv a, tsv b){
+  if (a == b) return !(ts_is_num(a) && ts_to_num(a) != ts_to_num(a));
   if (ts_is_num(a)&&ts_is_num(b)) return ts_to_num(a)==ts_to_num(b);
   if (ts_is_str(a)&&ts_is_str(b)){
     ts_strview x=ts_str_view_typed(a), y=ts_str_view_typed(b);
@@ -3276,7 +3642,17 @@ static void gc_mark_visit_slow(ts_gc_header* h, int young, int depth){
 static inline void gc_mark_visit(tsv v, int young, int depth){
   RT_STAT_INC(mark_edges);
   if (!ts_heap_ref(v)) return;
-  ts_gc_header* h = ts_heap_ptr(v);
+  uint64_t payload = v & TS_PAYLOAD_MASK;
+  ts_gc_header* h;
+  if (payload & 1u){
+    uint32_t id = (uint32_t)(payload >> 1);
+    uintptr_t entry = (id < g_handle_cap) ? (uintptr_t)g_ts_handle_table[id] : 0u;
+    /* A minor collection ignores old targets without touching their cells. */
+    if (young && (entry & TS_HANDLE_OLD_BIT)){ RT_STAT_INC(mark_old_edges); return; }
+    h = ts_handle_entry_cell(entry);
+  } else {
+    h = ts_heap_ptr(v);
+  }
   if (!h || h->mark) return;
   if (young && h->gen == TS_GEN_OLD){
     RT_STAT_INC(mark_old_edges);
@@ -3294,6 +3670,16 @@ static inline void gc_mark_property_key(ts_key key, int young, int depth){
     gc_mark_visit(sym_value_by_id(key - TS_USERSYM_KEY_BASE), young, depth);
 }
 static inline void gc_mark_common_props(ts_object* o, int young, int depth){
+  if (obj_shaped(o)){
+    if (!o->len) return;
+    const ts_key* ks = g_ts_shape_keys[ts_obj_shape_id(o)];
+    tsv* vals = obj_vals(o);
+    for (uint32_t i=0;i<o->len;i++){
+      gc_mark_property_key(ks[i], young, depth);
+      gc_mark_visit(vals[i], young, depth);
+    }
+    return;
+  }
   for (uint32_t i=0;i<o->len;i++){
     gc_mark_property_key(o->props[i].key, young, depth);
     gc_mark_visit(o->props[i].val, young, depth);
@@ -3382,7 +3768,7 @@ static void gc_free_cell_payload(ts_gc_header* h){
   } else if (h->kind==TS_KIND_ARRAY){
     ts_array* a=(ts_array*)h; array_free_data(a); props_free(&a->o); free(a->o.prop_index);
   } else if (h->kind==TS_KIND_FUNC){
-    ts_func* f=(ts_func*)h; free(f->env); props_free(&f->o); free(f->o.prop_index);
+    ts_func* f=(ts_func*)h; env_free(f->env, f->envlen); props_free(&f->o); free(f->o.prop_index);
   } else if (h->kind==TS_KIND_MAP){
     ts_map* m=(ts_map*)h; free(m->keys); free(m->vals); free(m->hashes); free(m->index); free(m->iteration_order); props_free(&m->o); free(m->o.prop_index);
   } else if (h->kind==TS_KIND_SET){
@@ -3456,7 +3842,7 @@ static void gc_handle_move(ts_gc_header* old, ts_gc_header* nw){
   nw->handle = payload;
   if (payload & 1u){
     uint32_t id = (uint32_t)(payload >> 1);
-    if (id < g_handle_cap) g_ts_handle_table[id] = nw;
+    if (id < g_handle_cap) g_ts_handle_table[id] = gc_handle_entry_for(nw);
   } else {
     nw->handle = gc_handle_alloc(nw);
   }
@@ -3810,7 +4196,7 @@ void ts_gc_collect_young(void){
         if (moving && gc_is_movable_cell(h)){
           h = gc_move_young_to_old(h);
         } else {
-          h->mark=0; h->gen=TS_GEN_OLD; h->remembered=0;
+          h->mark=0; h->gen=TS_GEN_OLD; h->remembered=0; gc_handle_note_old(h);
         }
         h->gc_next=survivors; survivors=h;
         g_young_alloc--; g_old_alloc++;
@@ -3853,6 +4239,7 @@ void ts_gc_collect_young(void){
 }
 void ts_gc_collect(void){
   RT_STAT_INC(full_gc); RT_STAT_GC_T0;
+  prop_add_epoch_bump();
   gc_weak_begin();
   gc_mark_async_roots();
   /* Symbol.for is the only dynamically growing strong Symbol registry. */
@@ -3888,7 +4275,7 @@ void ts_gc_collect(void){
   g_rem_len = 0;
   ts_gc_header** pp=&g_old_heap;
   while (*pp){ ts_gc_header* h=*pp;
-    if (h->mark){ h->mark=0; h->gen=TS_GEN_OLD; if (h->kind==TS_KIND_CORO) ts_gc_remember(h); pp=&h->gc_next; }
+    if (h->mark){ h->mark=0; h->gen=TS_GEN_OLD; gc_handle_note_old(h); if (h->kind==TS_KIND_CORO) ts_gc_remember(h); pp=&h->gc_next; }
     else { *pp=h->gc_next; g_alloc--; g_old_alloc--; gc_free_cell(h); }
   }
   ts_gc_header* promoted = NULL;
@@ -3899,7 +4286,7 @@ void ts_gc_collect(void){
        the promoted cell as already-enrolled — dropping old->young edges. */
     if (y->mark){
       gc_aging_record_promotion(y->remembered, (uint8_t)(y->remembered + 1), y->size, 0);
-      y->mark=0; y->gen=TS_GEN_OLD; y->remembered=0; y->gc_next=promoted; promoted=y;
+      y->mark=0; y->gen=TS_GEN_OLD; y->remembered=0; gc_handle_note_old(y); y->gc_next=promoted; promoted=y;
       g_young_alloc--; g_old_alloc++; if (y->kind==TS_KIND_CORO) ts_gc_remember(y);
     }
     else {
@@ -5816,7 +6203,7 @@ int ts_number_is_safe_integer(tsv v){
   return isfinite(d) && floor(d)==d && d>=-9007199254740991.0 && d<=9007199254740991.0;
 }
 /* Number(x) coercion to a double value. Strings parse like JS Number(). */
-double ts_number_coerce(tsv v){
+double ts_number_coerce_slow(tsv v){
   if (ts_is_num(v)) return ts_to_num(v);
   if (ts_is_bool(v)) return (double)(v & 1);
   if (ts_is_null(v)) return 0;
@@ -6983,13 +7370,13 @@ static int field_enumerable(uint32_t id){
    properties (defined via Object.defineProperty get/set) default to
    non-enumerable and hold a ts_accessor object, so they are excluded from
    Object.keys/values/entries, assign, JSON and console.dir data enumeration. */
-static int prop_enum_data(ts_prop* p){
+static int prop_enum_data_at(const ts_object* o, uint32_t i){
   /* A property is enumerated iff its key is enumerable-eligible AND its
      enumerable attribute bit is set. This now INCLUDES accessor properties whose
      enumerable bit is set (Object.keys lists the key; Object.values/entries/JSON/
      assign/spread invoke the getter for the value — done in the consuming
      callbacks, NOT here, since Object.keys must not trigger getters). */
-  return field_enumerable(p->key) && prop_is_enumerable(p);
+  return field_enumerable(obj_key_at(o, i)) && (obj_flags_at(o, i) & TS_PROP_ENUMERABLE) != 0;
 }
 /* Resolve a property's value for value-consuming enumerators (values/entries/
    JSON/assign/spread): if it's an accessor, invoke the getter with this=receiver;
@@ -7071,19 +7458,19 @@ static uint32_t propbag_len(tsv owner){
   ts_object* o = (ts_object*)ts_ptr(owner);
   return kind_has_common_header(o->h.kind) ? o->len : 0;
 }
-static ts_prop* propbag_prop(tsv owner, uint32_t i){
-  if (!ts_is_propbag(owner)) return NULL;
+static ts_pref propbag_prop(tsv owner, uint32_t i){
+  if (!ts_is_propbag(owner)) return PREF_NONE;
   ts_object* o = (ts_object*)ts_ptr(owner);
-  if (!kind_has_common_header(o->h.kind) || i >= o->len) return NULL;
-  return &o->props[i];
+  if (!kind_has_common_header(o->h.kind) || i >= o->len) return PREF_NONE;
+  return (ts_pref){ o, i };
 }
 static void push_prop_names_js_order(tsv arr, tsv owner, uint32_t skip1, uint32_t skip2, uint32_t skip3){
   ts_gc_root(&arr); ts_gc_root(&owner);
   uint32_t len = propbag_len(owner);
   uint32_t total_idx = 0;
   for (uint32_t i=0;i<len;i++){
-    ts_prop* p = propbag_prop(owner, i); if (!p) continue;
-    uint32_t k = p->key, idx;
+    ts_pref p = propbag_prop(owner, i); if (!pref_ok(p)) continue;
+    uint32_t k = pref_key(p), idx;
     if (k == skip1 || k == skip2 || k == skip3 || !own_name_visible(k)) continue;
     if (prop_key_is_array_index(k, &idx)) total_idx++;
   }
@@ -7092,8 +7479,8 @@ static void push_prop_names_js_order(tsv arr, tsv owner, uint32_t skip1, uint32_
     uint32_t best = 0, best_key = 0; int found = 0;
     len = propbag_len(owner);
     for (uint32_t i=0;i<len;i++){
-      ts_prop* p = propbag_prop(owner, i); if (!p) continue;
-      uint32_t k = p->key, idx;
+      ts_pref p = propbag_prop(owner, i); if (!pref_ok(p)) continue;
+      uint32_t k = pref_key(p), idx;
       if (k == skip1 || k == skip2 || k == skip3 || !own_name_visible(k)) continue;
       if (!prop_key_is_array_index(k, &idx)) continue;
       if (have_prev && idx <= prev_idx) continue;
@@ -7105,8 +7492,8 @@ static void push_prop_names_js_order(tsv arr, tsv owner, uint32_t skip1, uint32_
   }
   len = propbag_len(owner);
   for (uint32_t i=0;i<len;i++){
-    ts_prop* p = propbag_prop(owner, i); if (!p) continue;
-    uint32_t k = p->key, idx;
+    ts_pref p = propbag_prop(owner, i); if (!pref_ok(p)) continue;
+    uint32_t k = pref_key(p), idx;
     if (k == skip1 || k == skip2 || k == skip3 || !own_name_visible(k)) continue;
     if (prop_key_is_array_index(k, &idx)) continue;
     push_own_name(arr, k);
@@ -7122,8 +7509,8 @@ static void push_prop_symbols_js_order(tsv arr, tsv owner){
   ts_gc_root(&arr); ts_gc_root(&owner);
   uint32_t len = propbag_len(owner);
   for (uint32_t i=0;i<len;i++){
-    ts_prop* p = propbag_prop(owner, i); if (!p) continue;
-    tsv sym = symbol_value_from_prop_key(p->key);
+    ts_pref p = propbag_prop(owner, i); if (!pref_ok(p)) continue;
+    tsv sym = symbol_value_from_prop_key(pref_key(p));
     if (!ts_is_undef(sym)) ts_array_push_rooted(arr, sym);
     len = propbag_len(owner);
   }
@@ -7160,7 +7547,7 @@ tsv ts_object_get_own_property_names(tsv obj){
     return arr;
   }
   if (ts_is_func(obj)){
-    int has_proto = !ts_is_undef(((ts_func*)ts_ptr(obj))->prototype_prop);
+    int has_proto = fn_has_own_prototype((ts_func*)ts_ptr(obj));
     push_cstr_name(arr, "length");
     push_cstr_name(arr, "name");
     if (has_proto) push_cstr_name(arr, "prototype");
@@ -7517,14 +7904,14 @@ static int json_emit_prop_map_direct(jbuf* b, tsv obj, int depth, const char* in
   ts_object* o=ts_ptr(obj);
   for (uint32_t i=0;i<o->len;i++){
     uint32_t idx;
-    if (prop_enum_data(&o->props[i]) && prop_key_is_array_index(o->props[i].key, &idx)) return 0;
+    if (prop_enum_data_at(o, i) && prop_key_is_array_index(obj_key_at(o, i), &idx)) return 0;
   }
   for (uint32_t i=0;;i++){
     o=ts_ptr(obj);
     if (i>=o->len) break;
-    if (!prop_enum_data(&o->props[i])) continue;
-    uint32_t k=o->props[i].key;
-    tsv val=o->props[i].val;
+    if (!prop_enum_data_at(o, i)) continue;
+    uint32_t k=obj_key_at(o, i);
+    tsv val=(*obj_val_at(o, i));
     json_emit_obj_prop(b, obj, k, val, depth, indent, first);
   }
   return 1;
@@ -7752,6 +8139,7 @@ static void class_reg_index_reserve(uint32_t need){
   for (int i = 0; i < g_class_reg_len; i++) class_reg_index_put((uint32_t)i);
 }
 void ts_register_class(tsv proto, ts_class_field* fields, int nfields){
+  prop_add_epoch_bump();
   if (++g_ts_class_layout_epoch == 0){
     memset(g_class_field_cache, 0, sizeof(g_class_field_cache));
     prop_ic_location_reset();
@@ -7819,9 +8207,14 @@ static tsv ts_clone_class_proto(uint32_t class_id){
   if (tmpl->len){
     p->cap = tmpl->len;
     p->len = tmpl->len;
-    p->props = malloc(sizeof(ts_prop) * p->cap);
-    memcpy(p->props, tmpl->props, sizeof(ts_prop) * tmpl->len);
-    prop_index_rebuild(p, p->len);
+    if (obj_shaped(tmpl)){
+      p->props = (ts_prop*)malloc(sizeof(tsv) * p->cap);
+      memcpy(p->props, tmpl->props, sizeof(tsv) * tmpl->len);
+    } else {
+      p->props = malloc(sizeof(ts_prop) * p->cap);
+      memcpy(p->props, tmpl->props, sizeof(ts_prop) * tmpl->len);
+      prop_index_rebuild(p, p->len);
+    }
   }
   if (g_class_fields[class_id]) {
     ts_register_class(proto, g_class_fields[class_id], g_class_nfields[class_id]);
@@ -7831,6 +8224,11 @@ static tsv ts_clone_class_proto(uint32_t class_id){
 }
 /* Box a class as a callable value. class_id is stored PLUS ONE (0 = non-class).
    code = constructor cfunc; env = captured cells (threaded as ctor leading params). */
+tsv ts_make_class_value_cells(uint32_t class_id, ts_code ctor, tsv* env, uint32_t envlen){
+  tsv fv = ts_make_class_value(class_id, ctor, env, envlen);
+  if (envlen) ((ts_func*)ts_ptr(fv))->env_abi = 1;
+  return fv;
+}
 tsv ts_make_class_value(uint32_t class_id, ts_code ctor, tsv* env, uint32_t envlen){
   tsv fv = ts_make_fn_t(ctor, env, envlen, 1);
   ((ts_func*)ts_ptr(fv))->class_id = class_id + 1;
@@ -7869,6 +8267,7 @@ tsv ts_construct(tsv ctorv, tsv* args, int n){
       ts_throw_type_error_msg(buf);
     }
     ts_gc_root(&ctorv);
+    fn_materialize_prototype((ts_func*)ts_ptr(ctorv), ctorv);
     tsv proto = ((ts_func*)ts_ptr(ctorv))->prototype_prop;
     tsv inst = ts_new_object();
     ts_gc_root(&inst);
@@ -7892,6 +8291,14 @@ tsv ts_construct(tsv ctorv, tsv* args, int n){
   tsv inst = ts_new_sized(g_class_size[cid]);
   tsv proto = ((ts_func*)ts_ptr(ctorv))->prototype_prop;
   ((ts_object*)ts_ptr(inst))->proto = ts_is_obj(proto) ? proto : g_class_proto_tab[cid];
+  /* Boxed fields start as undefined (the zeroed instance memory would read as
+     the number 0); generated allocation sites do the same inline. */
+  if (g_class_fields[cid]){
+    ts_class_field* cf = g_class_fields[cid];
+    char* base = (char*)ts_ptr(inst);
+    for (int i = 0; i < g_class_nfields[cid]; i++)
+      if (!cf[i].numeric) *(tsv*)(base + cf[i].offset) = TS_UNDEFINED;
+  }
   ts_gc_root(&inst);
   int m = n + 1;
   tsv stackargs[TS_CONSTRUCT_ARGS_STACK];
@@ -8055,9 +8462,9 @@ static void ts_prop_own_enum(tsv obj, ts_prop_enum_cb cb, void* ud){
     for (uint32_t i=0;;i++){
       ts_obj_common* oc = &((ts_array*)ts_ptr(obj))->o;
       if (i>=oc->len) break;
-      if (!prop_enum_data(&oc->props[i])) continue;
-      uint32_t k = oc->props[i].key;
-      tsv v = oc->props[i].val;
+      if (!prop_enum_data_at(oc, i)) continue;
+      uint32_t k = obj_key_at(oc, i);
+      tsv v = (*obj_val_at(oc, i));
       cb(k, v, ud);
     }
     return;
@@ -8080,22 +8487,22 @@ static void ts_prop_own_enum(tsv obj, ts_prop_enum_cb cb, void* ud){
   int has_index = 0;
   for (uint32_t i=0;i<o->len;i++){
     uint32_t idx;
-    if (prop_enum_data(&o->props[i]) && prop_key_is_array_index(o->props[i].key, &idx)){ has_index = 1; break; }
+    if (prop_enum_data_at(o, i) && prop_key_is_array_index(obj_key_at(o, i), &idx)){ has_index = 1; break; }
   }
   if (has_index){
     /* selection over integer indices in ascending order (n is small in practice;
        plain objects with many integer keys should use an array anyway). */
     uint32_t prev_idx; int have_prev = 0; uint32_t emitted = 0, total_idx = 0;
     o = ts_ptr(obj);
-    for (uint32_t i=0;i<o->len;i++){ uint32_t idx; if (prop_enum_data(&o->props[i]) && prop_key_is_array_index(o->props[i].key,&idx)) total_idx++; }
+    for (uint32_t i=0;i<o->len;i++){ uint32_t idx; if (prop_enum_data_at(o, i) && prop_key_is_array_index(obj_key_at(o, i),&idx)) total_idx++; }
     while (emitted < total_idx){
       uint32_t best=0, best_key=0; tsv best_val=TS_UNDEFINED; int found=0;
       o = ts_ptr(obj);
       for (uint32_t i=0;i<o->len;i++){
         uint32_t idx;
-        if (!prop_enum_data(&o->props[i]) || !prop_key_is_array_index(o->props[i].key,&idx)) continue;
+        if (!prop_enum_data_at(o, i) || !prop_key_is_array_index(obj_key_at(o, i),&idx)) continue;
         if (have_prev && idx <= prev_idx) continue;      /* already emitted */
-        if (!found || idx < best){ best=idx; best_key=o->props[i].key; best_val=o->props[i].val; found=1; }
+        if (!found || idx < best){ best=idx; best_key=obj_key_at(o, i); best_val=(*obj_val_at(o, i)); found=1; }
       }
       if (!found) break;
       cb(best_key, best_val, ud);
@@ -8108,10 +8515,10 @@ static void ts_prop_own_enum(tsv obj, ts_prop_enum_cb cb, void* ud){
       o = ts_ptr(obj);
       if (i>=o->len) break;
       uint32_t idx;
-      if (!prop_enum_data(&o->props[i])) continue;
-      if (prop_key_is_array_index(o->props[i].key,&idx)) continue;
-      uint32_t k = o->props[i].key;
-      tsv v = o->props[i].val;
+      if (!prop_enum_data_at(o, i)) continue;
+      if (prop_key_is_array_index(obj_key_at(o, i),&idx)) continue;
+      uint32_t k = obj_key_at(o, i);
+      tsv v = (*obj_val_at(o, i));
       cb(k, v, ud);
     }
     return;
@@ -8119,9 +8526,9 @@ static void ts_prop_own_enum(tsv obj, ts_prop_enum_cb cb, void* ud){
   for (uint32_t i=0;;i++){
     o = ts_ptr(obj);
     if (i>=o->len) break;
-    if (!prop_enum_data(&o->props[i])) continue;
-    uint32_t k = o->props[i].key;
-    tsv v = o->props[i].val;
+    if (!prop_enum_data_at(o, i)) continue;
+    uint32_t k = obj_key_at(o, i);
+    tsv v = (*obj_val_at(o, i));
     cb(k, v, ud);
   }
 }
@@ -8245,7 +8652,7 @@ static void inspect_symbol_key(jbuf* b, ts_key k){
 static int count_own_enum_sym_props(tsv v){
   ts_object* o = ts_ptr(v); int c=0;
   for (uint32_t i=0;i<o->len;i++)
-    if (o->props[i].key >= TS_WKSYM_KEY_BASE && prop_is_enumerable(&o->props[i])) c++;
+    if (obj_key_at(o, i) >= TS_WKSYM_KEY_BASE && (obj_flags_at(o, i) & TS_PROP_ENUMERABLE)) c++;
   return c;
 }
 /* Emit own enumerable symbol-keyed props (`Symbol(desc): value`), in insertion
@@ -8254,9 +8661,9 @@ static int count_own_enum_sym_props(tsv v){
 static void inspect_own_sym_props(jbuf* b, tsv v, int depth, int* first){
   ts_object* o = ts_ptr(v);
   for (uint32_t i=0;i<o->len;i++){
-    ts_key k = o->props[i].key;
-    if (k < TS_WKSYM_KEY_BASE || !prop_is_enumerable(&o->props[i])) continue;
-    tsv val = o->props[i].val;
+    ts_key k = obj_key_at(o, i);
+    if (k < TS_WKSYM_KEY_BASE || !(obj_flags_at(o, i) & TS_PROP_ENUMERABLE)) continue;
+    tsv val = (*obj_val_at(o, i));
     if (!*first) jb_putz(b, ", "); *first = 0;
     inspect_symbol_key(b, k); jb_putz(b, ": ");
     if (is_accessor(val)){
@@ -8544,9 +8951,8 @@ static tsv jp_number(jparse* p){
 }
 static void jp_obj_set_data(tsv obj, uint32_t key, tsv val){
   ts_object* o=(ts_object*)ts_ptr(obj);
-  ts_prop* p=find_prop(o, key, 1);
-  p->val=val;
-  p->flags=TS_PROP_DEFAULT;
+  ts_pref p=props_define(o, key, TS_PROP_DEFAULT);
+  *pref_valp(p)=val;
   ts_write_barrier(obj, val);
 }
 static void jp_array_push_fast(tsv arr, tsv val){
@@ -9228,10 +9634,10 @@ int ts_delete_prop_strict(tsv obj, ts_key key){
   }
   int nonconf = 0;
   if (ts_obj_integrity(o) & (1u|4u)) {        /* frozen / sealed => all own props non-configurable */
-    if (find_prop(o, key, 0)) nonconf = 1;
+    if (pref_ok(prop_find(o, key))) nonconf = 1;
   } else {
-    ts_prop* p = find_prop(o, key, 0);
-    if (p && !prop_is_configurable(p)) nonconf = 1;
+    ts_pref p = prop_find(o, key);
+    if (pref_ok(p) && !pref_is_configurable(p)) nonconf = 1;
   }
   if (nonconf){
     const char* nm = ts_field_name(key);
@@ -9279,16 +9685,17 @@ int ts_delete_prop(tsv obj, ts_key key){
     }
   }
   if (ts_obj_integrity(o) & (1u|4u)) return 0;   /* frozen / sealed: delete ignored (false) */
-  ts_prop* found = find_prop(o, key, 0);
-  if (!found) return 1;
+  ts_pref found = prop_find(o, key);
+  if (!pref_ok(found)) return 1;
   /* non-configurable: delete is ignored (returns false in sloppy mode). */
-  if (!prop_is_configurable(found)) return 0;
-  uint32_t i = (uint32_t)(found - o->props);
-  /* Shift remaining entries to preserve insertion order. Indexed entries store
-     dense positions, so every successful deletion rebuilds the sparse index. */
+  if (!pref_is_configurable(found)) return 0;
+  uint32_t i = found.i;
+  /* Deletion leaves the hidden-class regime. Shift the remaining dictionary
+     entries to preserve insertion order; indexed entries store dense
+     positions, so every successful deletion rebuilds the sparse index. */
+  obj_to_dictionary(o);
   for (uint32_t j=i;j+1<o->len;j++) o->props[j]=o->props[j+1];
   o->len--;
-  ts_obj_set_shape(o, TS_SHAPE_NONE);
   if (o->prop_index) prop_index_rebuild(o, o->len);
   return 1;
 }
@@ -9320,17 +9727,17 @@ static tsv build_accessor_descriptor(tsv getter, tsv setter, int e, int c){
   ts_gc_unroot(3);
   return d;
 }
-static tsv descriptor_from_prop(ts_prop* p){
-  int e=prop_is_enumerable(p), c=prop_is_configurable(p), w=prop_is_writable(p);
-  if (prop_is_accessor(p)){
-    ts_accessor* ac=(ts_accessor*)ts_ptr(p->val);
+static tsv descriptor_from_prop(ts_pref p){
+  int e=pref_is_enumerable(p), c=pref_is_configurable(p), w=pref_is_writable(p);
+  if (pref_is_accessor(p)){
+    ts_accessor* ac=(ts_accessor*)ts_ptr(pref_val(p));
     return build_accessor_descriptor(ac->getter, ac->setter, e, c);
   }
-  return build_data_descriptor(p->val, w, e, c);
+  return build_data_descriptor(pref_val(p), w, e, c);
 }
 static tsv descriptor_from_prop_map(ts_object* o, ts_key key){
-  ts_prop* p = find_prop(o, key, 0);
-  return p ? descriptor_from_prop(p) : TS_UNDEFINED;
+  ts_pref p = prop_find(o, key);
+  return pref_ok(p) ? descriptor_from_prop(p) : TS_UNDEFINED;
 }
 /* descriptor for an already-interned own key (used by the public entry + the
    getOwnPropertyDescriptors walker). */
@@ -9367,8 +9774,10 @@ static tsv ts_own_descriptor_by_key(tsv obj, ts_key key){
       return build_data_descriptor(ts_new_string(name, (uint32_t)strlen(name)), 0, 0, 1);
     }
     if (nm && field_bytes_is(nm, nm_len, "length")) return build_data_descriptor(ts_num((double)f->arity), 0, 0, 1);
-    if (nm && field_bytes_is(nm, nm_len, "prototype") && !ts_is_undef(f->prototype_prop))
+    if (nm && field_bytes_is(nm, nm_len, "prototype") && fn_has_own_prototype(f)){
+      f = fn_materialize_prototype(f, obj);
       return build_data_descriptor(f->prototype_prop, ts_is_class_value(obj) ? 0 : 1, 0, 0);
+    }
   }
   ts_object* o = ts_ptr(obj);
   if (o->h.kind == TS_KIND_OBJECT){ size_t off; int numeric;
@@ -9431,8 +9840,8 @@ tsv ts_get_own_property_descriptors(tsv obj){
         ts_gc_root(&scv);
         uint32_t slen = propbag_len(scv);
         for (uint32_t i=0;i<slen;i++){
-          ts_prop* p = propbag_prop(scv, i); if (!p) continue;
-          uint32_t k = p->key;
+          ts_pref p = propbag_prop(scv, i); if (!pref_ok(p)) continue;
+          uint32_t k = pref_key(p);
           d = ts_own_descriptor_by_key(obj, k);
           if (!ts_is_undef(d)) ts_set(res, k, d);
           slen = propbag_len(scv);
@@ -9455,7 +9864,7 @@ tsv ts_get_own_property_descriptors(tsv obj){
     }
     o = ts_ptr(obj);
     for (uint32_t i=0;i<o->len;i++){
-      uint32_t k = o->props[i].key;
+      uint32_t k = obj_key_at(o, i);
       tsv d = ts_own_descriptor_by_key(obj, k);
       if (!ts_is_undef(d)) ts_set(res, k, d);
       o = ts_ptr(obj);
@@ -9573,7 +9982,7 @@ int ts_has_own(tsv obj, ts_key key){
      explicitly-assigned own props in its prop map. */
   if (ts_is_func(obj)){
     if (field_name_is(key, "length") || field_name_is(key, "name")) return 1;
-    if (field_name_is(key, "prototype") && !ts_is_undef(((ts_func*)ts_ptr(obj))->prototype_prop)) return 1;
+    if (field_name_is(key, "prototype") && fn_has_own_prototype((ts_func*)ts_ptr(obj))) return 1;
     ts_object* sc = ts_class_static_container(obj);
     if (sc && find_slot(sc, key, 0) != NULL) return 1;
     return find_slot((ts_object*)ts_ptr(obj), key, 0) != NULL;
@@ -10233,6 +10642,11 @@ static void prop_ic_note_miss(ts_prop_ic* ic){
 }
 static void prop_ic_fill_shape(ts_prop_ic* ic, ts_object* o, ts_key key, uint32_t slot){
   if (!ic || ic->megamorphic || o->h.size != sizeof(ts_object)) return;
+  /* The entry's slot word carries the attribute flags of that slot. Dictionary
+     receivers never hit inline (shape 0); their entries only seed the
+     out-of-line slot/key validation, which reads flags from the entry vector. */
+  slot &= TS_PIC_SLOT_MASK;
+  if (obj_shaped(o)) slot |= (uint32_t)obj_flags_at(o, slot) << TS_PIC_FLAGS_SHIFT;
   for (uint32_t i=0;i<TS_PROP_IC_SIZE;i++){
     ts_prop_ic_entry* e = &ic->entries[i];
     if (e->key == key && e->shape == o->shape && e->slot == slot) return;
@@ -10248,26 +10662,27 @@ static void prop_ic_fill_shape(ts_prop_ic* ic, ts_object* o, ts_key key, uint32_
 /* Unsized objects cannot contain registered struct storage. Their own slots
    need only a live key/bounds check, even after deletion or prototype changes.
    This avoids the auxiliary table and keeps small property vectors contiguous. */
-static ts_prop* prop_ic_probe_own(ts_prop_ic* ic, ts_object* o, ts_key key){
-  if (!ic || ic->megamorphic || o->h.size != sizeof(ts_object)) return NULL;
+static ts_pref prop_ic_probe_own(ts_prop_ic* ic, ts_object* o, ts_key key){
+  if (!ic || ic->megamorphic || o->h.size != sizeof(ts_object)) return PREF_NONE;
   for (uint32_t i=0;i<TS_PROP_IC_SIZE;i++){
     ts_prop_ic_entry* e = &ic->entries[i];
-    if (e->key == key && e->slot < o->len && o->props[e->slot].key == key){
+    uint32_t slot = e->slot & TS_PIC_SLOT_MASK;
+    if (e->key == key && slot < o->len && obj_key_at(o, slot) == key){
       /* Keep distinct shapes even when they share a slot. Overwriting the
          matching hint would make a four-shape site miss forever. After warmup,
          sample replacement to retain locality on sites with many shapes. The
          high nibble is the sample clock; the low nibble counts key diversity. */
       if (e->shape != o->shape && ts_obj_shape_id(o) != TS_SHAPE_NONE){
-        if (ic->next < TS_PROP_IC_SIZE) prop_ic_fill_shape(ic, o, key, e->slot);
+        if (ic->next < TS_PROP_IC_SIZE) prop_ic_fill_shape(ic, o, key, slot);
         else {
           ic->misses = (uint8_t)(ic->misses + 16u);
-          if (!(ic->misses & 240u)) prop_ic_fill_shape(ic, o, key, e->slot);
+          if (!(ic->misses & 240u)) prop_ic_fill_shape(ic, o, key, slot);
         }
       }
-      return &o->props[e->slot];
+      return (ts_pref){ o, slot };
     }
   }
-  return NULL;
+  return PREF_NONE;
 }
 static ts_prop_location* prop_ic_probe(ts_prop_ic* ic, tsv obj, ts_key key){
   ts_object* o = (ts_object*)ts_ptr(obj);
@@ -10278,7 +10693,7 @@ static ts_prop_location* prop_ic_probe(ts_prop_ic* ic, tsv obj, ts_key key){
     ts_prop_location* e=&cache->entries[i];
     if (e->proto != o->proto || e->receiver_size != o->h.size || e->key != key) continue;
     if (e->kind == TS_PROP_IC_STRUCT){ RT_STAT_INC(location_hits); return e; }
-    if (e->kind == TS_PROP_IC_OWN && e->slot < o->len && o->props[e->slot].key == key){
+    if (e->kind == TS_PROP_IC_OWN && e->slot < o->len && obj_key_at(o, e->slot) == key){
       prop_ic_fill_shape(ic, o, key, e->slot);
       RT_STAT_INC(location_hits);
       return e;
@@ -10308,9 +10723,9 @@ static void prop_ic_fill_entry(ts_prop_ic* ic, ts_object* o, ts_key key,
   e->proto = o->proto; e->receiver_size = o->h.size; e->key = key;
   e->slot = slot; e->kind = kind; e->numeric = numeric;
 }
-static void prop_ic_fill(ts_prop_ic* ic, ts_object* o, ts_key key, ts_prop* p){
-  if (!p) return;
-  uint32_t slot = (uint32_t)(p - o->props);
+static void prop_ic_fill(ts_prop_ic* ic, ts_object* o, ts_key key, ts_pref p){
+  if (!pref_ok(p)) return;
+  uint32_t slot = p.i;
   if (slot >= o->len) return;
   if (o->h.size == sizeof(ts_object)) prop_ic_fill_shape(ic, o, key, slot);
   else prop_ic_fill_entry(ic, o, key, slot, TS_PROP_IC_OWN, 0);
@@ -10323,9 +10738,9 @@ static tsv ts_prop_ic_struct_read(ts_object* o, const ts_prop_location* e){
   if (e->numeric){ double value; memcpy(&value, (char*)o + e->slot, sizeof value); return ts_num(value); }
   tsv value; memcpy(&value, (char*)o + e->slot, sizeof value); return value;
 }
-static tsv prop_ic_read(tsv receiver, ts_prop* p){
-  tsv value = p->val;
-  if (!prop_is_accessor(p)) return value;
+static tsv prop_ic_read(tsv receiver, ts_pref p){
+  tsv value = pref_val(p);
+  if (!pref_is_accessor(p)) return value;
   ts_accessor* ac = (ts_accessor*)ts_ptr(value);
   if (!ts_is_func(ac->getter)) return TS_UNDEFINED;
   if (ac->g_this){ tsv a0 = receiver; return ts_call(ac->getter, &a0, 1); }
@@ -10339,21 +10754,21 @@ tsv ts_get_pic_checked(tsv obj, ts_key key, ts_prop_ic* ic){
   if (TS_TOP16(obj) == TS_SEL_OBJECT){
     ts_object* o = (ts_object*)ts_ptr(obj);
     if (o->h.kind == TS_KIND_OBJECT){
-      ts_prop* own = prop_ic_probe_own(ic, o, key);
-      if (own){ TS_RT_STAT_PIC_GET_HIT(); return prop_ic_read(obj, own); }
+      ts_pref own = prop_ic_probe_own(ic, o, key);
+      if (pref_ok(own)){ TS_RT_STAT_PIC_GET_HIT(); return prop_ic_read(obj, own); }
       ts_prop_location* e = prop_ic_probe(ic, obj, key);
       if (e){
         TS_RT_STAT_PIC_GET_HIT();
         if (e->kind == TS_PROP_IC_STRUCT) return ts_prop_ic_struct_read(o, e);
-        return prop_ic_read(obj, &o->props[e->slot]);
+        return prop_ic_read(obj, (ts_pref){ o, e->slot });
       }
       size_t off; int numeric;
       if (g_has_class_regs && class_field_lookup(o, key, &off, &numeric)){
         prop_ic_fill_struct(ic, o, key, off, numeric);
         return struct_field_get(o, off, numeric);
       }
-      ts_prop* p = find_prop(o, key, 0);
-      if (p){
+      ts_pref p = prop_find(o, key);
+      if (pref_ok(p)){
         prop_ic_fill(ic, o, key, p);
         return prop_ic_read(obj, p);
       }
@@ -10364,18 +10779,84 @@ tsv ts_get_pic_checked(tsv obj, ts_key key, ts_prop_ic* ic){
   }
   return ts_get(obj, key);
 }
+/* ---- property-addition cache ----
+   Most fixed-key stores that miss the per-site shape cache are additions:
+   constructors and literals initialize fresh objects field by field, so the
+   receiver never has the key yet (the inline shape hit rate for stores stays
+   near zero by construction). The uncached addition walks the struct-field
+   registry, the own slots and the prototype chain before appending.
+   This bounded table remembers, per (site, hidden class), the verified
+   outcome of such an addition. A hit requires the same site, the same
+   receiver shape (which fixes the own key sequence, the slot and integrity
+   bits), the same direct prototype and an unchanged epoch. The epoch moves
+   whenever an accessor is defined, a prototype is relinked, a class layout is
+   registered or a full collection runs; only old prototypes are recorded, and
+   a minor collection cannot free an old cell's handle. A hit therefore implies
+   exactly the slow path's decision: no struct field, no own slot, no inherited
+   setter, extensible receiver. Symbol keys and sized receivers stay on the
+   slow path. */
+typedef struct {
+  const ts_prop_ic* site;
+  tsv proto;
+  uint32_t shape_before, shape_after;
+  ts_key key;
+  uint32_t slot;
+  uint32_t epoch;
+} ts_prop_add_entry;
+#define TS_PROP_ADD_CACHE_SIZE 4096u
+static ts_prop_add_entry g_prop_add_cache[TS_PROP_ADD_CACHE_SIZE];
+static uint32_t g_prop_add_epoch = 1;
+static void prop_add_epoch_bump(void){
+  if (++g_prop_add_epoch == 0){
+    memset(g_prop_add_cache, 0, sizeof(g_prop_add_cache));
+    g_prop_add_epoch = 1;
+  }
+}
+static inline uint32_t prop_add_slot(const ts_prop_ic* ic, uint32_t shape){
+  uintptr_t h = (uintptr_t)ic >> 2;
+  h ^= h >> 16;
+  uint32_t x = (uint32_t)h * 2654435761u;
+  x ^= shape * 0x9E3779B1u;
+  x ^= x >> 15;
+  return x & (TS_PROP_ADD_CACHE_SIZE - 1u);
+}
+static inline ts_prop_add_entry* prop_add_lookup(const ts_prop_ic* ic, ts_object* o, ts_key key){
+  if (!ic || o->h.size != sizeof(ts_object)) return NULL;
+  ts_prop_add_entry* e = &g_prop_add_cache[prop_add_slot(ic, o->shape)];
+  if (e->site == ic && e->shape_before == o->shape && e->key == key &&
+      e->proto == o->proto && e->epoch == g_prop_add_epoch && e->slot == o->len)
+    return e;
+  return NULL;
+}
+static void prop_add_fill(const ts_prop_ic* ic, ts_object* o, ts_key key, ts_pref p,
+                          uint32_t len_before, uint32_t shape_before){
+  if (!ic || !pref_ok(p) || o->h.size != sizeof(ts_object)) return;
+  if (key >= TS_USERSYM_KEY_BASE) return;
+  /* Only a plain append from a cacheable, extensible shape to another one. */
+  if ((shape_before & TS_SHAPE_MAX) == TS_SHAPE_NONE || (shape_before >> 29) != 0) return;
+  if (ts_obj_shape_id(o) == TS_SHAPE_NONE || ts_obj_integrity(o) != 0) return;
+  if (o->len != len_before + 1u || p.i != len_before) return;
+  /* Only old prototypes are remembered: their handles stay bound to the same
+     cell until a full collection, which bumps the epoch. A young prototype's
+     handle could be recycled by a minor collection. */
+  if (ts_proto_ref(o->proto) && ((ts_gc_header*)ts_ptr(o->proto))->gen != TS_GEN_OLD) return;
+  ts_prop_add_entry* e = &g_prop_add_cache[prop_add_slot(ic, shape_before)];
+  e->site = ic; e->proto = o->proto;
+  e->shape_before = shape_before; e->shape_after = o->shape;
+  e->key = key; e->slot = len_before; e->epoch = g_prop_add_epoch;
+}
 void ts_set_pic(tsv obj, ts_key key, tsv val, ts_prop_ic* ic){
   TS_RT_STAT_PIC_SET_CALL();
   if (ic && ic->megamorphic){ ts_set(obj, key, val); return; }
   if (TS_TOP16(obj) == TS_SEL_OBJECT){
     ts_object* o = (ts_object*)ts_ptr(obj);
     if (o->h.kind == TS_KIND_OBJECT){
-      ts_prop* own = prop_ic_probe_own(ic, o, key);
-      if (own){
+      ts_pref own = prop_ic_probe_own(ic, o, key);
+      if (pref_ok(own)){
         TS_RT_STAT_PIC_SET_HIT();
-        if (prop_is_accessor(own)){ invoke_setter((ts_accessor*)ts_ptr(own->val), obj, key, val); return; }
-        if ((ts_obj_integrity(o) & 1u) || !prop_is_writable(own)){ ts_throw_readonly_write(key); return; }
-        own->val = val; ts_write_barrier(obj, val); return;
+        if (pref_is_accessor(own)){ invoke_setter((ts_accessor*)ts_ptr(pref_val(own)), obj, key, val); return; }
+        if ((ts_obj_integrity(o) & 1u) || !pref_is_writable(own)){ ts_throw_readonly_write(key); return; }
+        *pref_valp(own) = val; ts_write_barrier(obj, val); return;
       }
       ts_prop_location* e = prop_ic_probe(ic, obj, key);
       if (e){
@@ -10384,16 +10865,24 @@ void ts_set_pic(tsv obj, ts_key key, tsv val, ts_prop_ic* ic){
           if (ts_obj_integrity(o) & 1u){ ts_throw_readonly_write(key); return; }
           struct_field_set(o, e->slot, e->numeric, val); return;
         }
-        ts_prop* p = &o->props[e->slot];
-        if (prop_is_accessor(p)){
-          invoke_setter((ts_accessor*)ts_ptr(p->val), obj, key, val);
+        ts_pref p = { o, e->slot };
+        if (pref_is_accessor(p)){
+          invoke_setter((ts_accessor*)ts_ptr(pref_val(p)), obj, key, val);
           return;
         }
-        if ((ts_obj_integrity(o) & 1u) || !prop_is_writable(p)){
+        if ((ts_obj_integrity(o) & 1u) || !pref_is_writable(p)){
           ts_throw_readonly_write(key);
           return;
         }
-        p->val = val;
+        *pref_valp(p) = val;
+        ts_write_barrier(obj, val);
+        return;
+      }
+      ts_prop_add_entry* add = prop_add_lookup(ic, o, key);
+      if (add){
+        RT_STAT_INC(prop_add_hits);
+        ts_pref p = props_append(o, key, add->shape_after);
+        *pref_valp(p) = val;
         ts_write_barrier(obj, val);
         return;
       }
@@ -10403,8 +10892,10 @@ void ts_set_pic(tsv obj, ts_key key, tsv val, ts_prop_ic* ic){
         struct_field_set(o, off, numeric, val);
         prop_ic_fill_struct(ic, o, key, off, numeric); return;
       }
-      ts_prop* p = ts_set_named_prop(obj, o, key, val, 0);
+      uint32_t len_before = o->len, shape_before = o->shape;
+      ts_pref p = ts_set_named_prop(obj, o, key, val, 0);
       prop_ic_fill(ic, o, key, p);
+      if (pref_ok(p)){ RT_STAT_INC(prop_add_fills); prop_add_fill(ic, o, key, p, len_before, shape_before); }
       return;
     }
   }
@@ -12945,13 +13436,13 @@ int ts_is_gen_return_completion(tsv v){
   if (!F_gen_return_tag || ts_is_undef(g_gen_return_tag) || !ts_is_obj(v)) return 0;
   ts_gc_header* h=(ts_gc_header*)ts_ptr(v);
   if (!h || h->kind!=TS_KIND_OBJECT) return 0;
-  ts_prop* p=find_prop((ts_object*)h,F_gen_return_tag,0);
-  return p && !prop_is_accessor(p) && ts_strict_eq(p->val,g_gen_return_tag);
+  ts_pref p=prop_find((ts_object*)h,F_gen_return_tag);
+  return pref_ok(p) && !pref_is_accessor(p) && ts_strict_eq(pref_val(p),g_gen_return_tag);
 }
 tsv ts_gen_return_completion_value(tsv v){
   if (!ts_is_gen_return_completion(v)) return TS_UNDEFINED;
-  ts_prop* p=find_prop((ts_object*)ts_ptr(v),F_gen_return_value,0);
-  return p && !prop_is_accessor(p) ? p->val : TS_UNDEFINED;
+  ts_pref p=prop_find((ts_object*)ts_ptr(v),F_gen_return_value);
+  return pref_ok(p) && !pref_is_accessor(p) ? pref_val(p) : TS_UNDEFINED;
 }
 static tsv coro_resume_catching_v(tsv cv, int* threw){
   ts_handler* h=ts_eh_push();

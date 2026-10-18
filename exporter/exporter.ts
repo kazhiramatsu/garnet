@@ -144,6 +144,7 @@ interface FnCtx {
   paramClasses?: Record<string, number>; // param local id -> class id (typed-field codegen)
   restParam?: number; // local id of a rest parameter (...args), if any
   argumentsOffset?: number; // captured cells and receiver preceding JS arguments
+  captureCount?: number;    // leading cell params (the closure environment)
   isAsync?: boolean;
   isGenerator?: boolean;
   // A named function expression binds its name only inside its own body:
@@ -324,6 +325,9 @@ class Exporter {
   // ---- class support ----
   classExtractor!: ClassExtractor;
   classInfos: ClassInfo[] = [];
+  /** Class id of the synthetic captured-variable cell class (typed cells), or
+   *  undefined when TSAOT_TYPED_CELLS=0. */
+  cellClassId: number | undefined = undefined;
   classSymToId = new Map<ts.Symbol, number>();
   /** class declaration/expression AST node -> class id. Covers anonymous class
    *  expressions (`const C = class {}`) that have no name symbol to key by. */
@@ -2325,6 +2329,31 @@ class Exporter {
     }
     return value;
   }
+  /** `E.A` / `E["A"]` on a `const enum` folds to the checker's constant. This is
+   *  exactly the set TypeScript's own emit inlines (`getConstantValue` answers
+   *  only for const enum members), so the member object is never observed and
+   *  the receiver, an entity name, has no side effects to preserve. Non-const
+   *  enums keep their runtime object and the ordinary field load. */
+  /** A parameter that receives a captured-variable cell is typed with the
+   *  synthetic cell class so its `__value` accesses use the struct layout. */
+  private markCellParam(ctx: FnCtx, lid: number): void {
+    if (this.cellClassId === undefined) return;
+    (ctx.paramClasses ??= {})[lid] = this.cellClassId;
+  }
+
+  private constEnumMemberValue(node: ts.PropertyAccessExpression | ts.ElementAccessExpression): number | string | undefined {
+    if (ts.isOptionalChain(node)) return undefined;
+    let value: string | number | undefined;
+    try { value = this.checker.getConstantValue(node); } catch { return undefined; }
+    if (typeof value === "string") return value;
+    if (typeof value === "number" && Number.isFinite(value) && !Object.is(value, -0)) return value;
+    return undefined;
+  }
+
+  private lowerEnumConstant(ctx: FnCtx, value: number | string, hint?: string): number {
+    return typeof value === "number" ? this.constNumber(ctx, value, hint) : this.constString(ctx, value, hint);
+  }
+
   private constNumber(ctx: FnCtx, value: number, hint?: string): number {
     const dst = this.newLocal(ctx, "primitive", hint);
     ctx.body.push({ kind: "Const", dst, value: { kind: "Num", value: this.numWire(value) } });
@@ -2411,8 +2440,8 @@ class Exporter {
         id: func, name: `__get_export_${name}`, params: [0], ret: 0,
         locals: [{ id: 0, typeId: 0, refKind: "reference" }, { id: 1, typeId: 0, refKind: "reference" }],
         body: [{ kind: "LoadField", dst: 1, obj: 0, field: this.VALUE }, { kind: "Return", src: 1 }],
-        isExported: false, paramClasses: {}, restParam: null,
-        isAsync: false, isGenerator: false, takesThis: false, arity: 0, hasPrototype: false,
+        isExported: false, paramClasses: this.cellClassId !== undefined ? { 0: this.cellClassId } : {}, restParam: null,
+        isAsync: false, isGenerator: false, takesThis: false, captureCount: 1, arity: 0, hasPrototype: false,
       });
     }
     const getter = this.newLocal(ctx, "reference");
@@ -3586,6 +3615,8 @@ class Exporter {
       return this.lowerUnboundThis(ctx);
     }
     if (ts.isPropertyAccessExpression(node)) {
+      const enumValue = this.constEnumMemberValue(node);
+      if (enumValue !== undefined) return this.lowerEnumConstant(ctx, enumValue, hint);
       if (node.name.text === "length" && ts.isIdentifier(node.expression) &&
           node.expression.text === "arguments" &&
           !this.symbolOf(node.expression)?.declarations?.length) {
@@ -3962,6 +3993,8 @@ class Exporter {
       return dst;
     }
     if (ts.isElementAccessExpression(node)) {
+      const enumValue = this.constEnumMemberValue(node);
+      if (enumValue !== undefined) return this.lowerEnumConstant(ctx, enumValue, hint);
       if (this.isGlobalThisPropertyAccess(node, "fetch")) {
         return this.loadGlobalObjectProperty(ctx, "fetch");
       }
@@ -6888,6 +6921,7 @@ class Exporter {
       const lid = this.newLocal(ctx, "reference", `cell_${(s as any).name ?? "v"}`, this.bindingIdOf(s));
       ctx.cellAccess.set(s, lid);
       ctx.params.push(lid);
+      this.markCellParam(ctx, lid);
     }
     const tid = this.newLocal(ctx, "reference", "this");
     ctx.params.push(tid);          // arg0 = this (the freshly allocated instance)
@@ -6911,7 +6945,7 @@ class Exporter {
     this.functions.push({
       id: fnId, name, params: ctx.params, ret: 0, locals: ctx.locals, body: ctx.body,
       isExported: false, paramClasses: ctx.paramClasses || {}, restParam: restLid,
-      isAsync: false, isGenerator: false, takesThis: true, arity: 0,
+      isAsync: false, isGenerator: false, takesThis: true, captureCount: frees.length, arity: 0,
     });
     return fnId;
   }
@@ -8700,7 +8734,7 @@ class Exporter {
       const perSite = this.site++;
       this.labels[perSite] = `cell:${(sym as any).name ?? "v"}@loopbody`;
       this.recordSite(perSite, "cell", "many", true, body, true);
-      ctx.body.push({ kind: "AllocObject", dst: cellLocal, typeId: 0, site: perSite });
+      ctx.body.push({ kind: "AllocObject", dst: cellLocal, typeId: 0, site: perSite, classId: this.cellClassId });
     }
   }
 
@@ -8776,7 +8810,7 @@ class Exporter {
       if (iterIsString) this.emitStringIteratorAdvance(ctx, idx, cp);
       else this.emitIndexStep(ctx, idx, 1);
       for (const c of captureCells) {
-        ctx.body.push({ kind: "AllocObject", dst: c.cell, typeId: 0, site: c.perSite });
+        ctx.body.push({ kind: "AllocObject", dst: c.cell, typeId: 0, site: c.perSite, classId: this.cellClassId });
       }
       if (decl) this.lowerBindingPattern(ctx, decl.name, varLocal);
       else this.lowerAssignTarget(ctx, init as ts.Expression, varLocal);
@@ -8870,7 +8904,7 @@ class Exporter {
       const loopBody = this.captureLoopBody(ctx, "forof_gen", () => {
         ctx.body.push({ kind: "LoadField", dst: loopVar, obj: res, field: valueField });
         for (const c of captureCells) {
-          ctx.body.push({ kind: "AllocObject", dst: c.cell, typeId: 0, site: c.perSite });
+          ctx.body.push({ kind: "AllocObject", dst: c.cell, typeId: 0, site: c.perSite, classId: this.cellClassId });
         }
         if (decl0) this.lowerBindingPattern(ctx, decl0.name, loopVar);
         else this.lowerAssignTarget(ctx, init as ts.Expression, loopVar);
@@ -9420,7 +9454,7 @@ class Exporter {
       selfCell = this.newLocal(ctx, "reference", "functionSelf", this.bindingIdOf(selfSym));
       const site = this.site++;
       this.recordSite(site, "cell", this.inLoop(node) ? "many" : "once", true, node, true);
-      ctx.body.push({ kind: "AllocObject", dst: selfCell, typeId: 0, site });
+      ctx.body.push({ kind: "AllocObject", dst: selfCell, typeId: 0, site, classId: this.cellClassId });
       ctx.cellAccess.set(selfSym, selfCell);
     }
     // An arrow that uses `this` lexically must capture the enclosing function's
@@ -9433,7 +9467,7 @@ class Exporter {
       const site = this.site++;
       this.labels[site] = `thisCell@${ctx.name}`;
       this.recordSite(site, "cell", "once", true, node, true);
-      ctx.body.push({ kind: "AllocObject", dst: cell, typeId: 0, site });
+      ctx.body.push({ kind: "AllocObject", dst: cell, typeId: 0, site, classId: this.cellClassId });
       // lowerUnboundThis: a top-level arrow in SCRIPT mode inherits the global
       // object as its lexical this (module top level / strict bodies: undefined).
       const tv = ctx.thisLocal ?? this.lowerUnboundThis(ctx);
@@ -9661,7 +9695,7 @@ class Exporter {
         const initSite = this.site++;
         this.labels[initSite] = `cell:${nameTxt}@iter0`;
         this.recordSite(initSite, "cell", "once", true, d, true);
-        ctx.body.push({ kind: "AllocObject", dst: cellLocal, typeId: 0, site: initSite });
+        ctx.body.push({ kind: "AllocObject", dst: cellLocal, typeId: 0, site: initSite, classId: this.cellClassId });
         if (d.initializer) {
           const r = this.lowerExpr(ctx, d.initializer, nameTxt);
           ctx.body.push({ kind: "StoreField", obj: cellLocal, field: this.VALUE, src: r });
@@ -9690,7 +9724,7 @@ class Exporter {
           const notFirstBody = this.captureBody(ctx, () => {
             const prevVal = this.newLocal(ctx, "primitive");
             ctx.body.push({ kind: "LoadField", dst: prevVal, obj: cellLocal, field: this.VALUE });
-            ctx.body.push({ kind: "AllocObject", dst: cellLocal, typeId: 0, site: perSite });
+            ctx.body.push({ kind: "AllocObject", dst: cellLocal, typeId: 0, site: perSite, classId: this.cellClassId });
             ctx.body.push({ kind: "StoreField", obj: cellLocal, field: this.VALUE, src: prevVal });
             // run the update — with cellAccess pointing to cellLocal, `i++` etc.
             // becomes LoadField/BinOp/StoreField on the NEW cell.
@@ -10278,12 +10312,14 @@ class Exporter {
         const lid = this.newLocal(ctx, "reference", `cell_${(s as any).name ?? "v"}`, this.bindingIdOf(s));
         ctx.cellAccess.set(s, lid);
         ctx.params.push(lid);
+        this.markCellParam(ctx, lid);
       }
       if (arrowThis) {
         // trailing lexical-this cell param; body reads `this` from its VALUE.
         const lid = this.newLocal(ctx, "reference", "cell_this", this.bindingIdOf(this.lexicalThisSym));
         ctx.cellAccess.set(this.lexicalThisSym, lid);
         ctx.params.push(lid);
+        this.markCellParam(ctx, lid);
         const tid = this.newLocal(ctx, "reference", "this");
         ctx.body.push({ kind: "LoadField", dst: tid, obj: lid, field: this.VALUE });
         ctx.thisLocal = tid;
@@ -10291,6 +10327,7 @@ class Exporter {
     };
     if (hasCaptures) { emitCells(); emitThis(); }   // [cells..., this]
     else { emitThis(); }                            // [this] (no cells)
+    ctx.captureCount = hasCaptures ? freeVars.length + (arrowThis ? 1 : 0) : 0;
     if (!ts.isArrowFunction(node)) ctx.argumentsOffset = ctx.params.length;
     // 2. real parameters
     const parameterBindings: { node: ts.ParameterDeclaration; local: number }[] = [];
@@ -10346,7 +10383,7 @@ class Exporter {
         this.labels[site] = `cell:${(s as any).name ?? "cell"}@${name}`;
         const declNode = (s.valueDeclaration ?? s.declarations?.[0]) as ts.Node | undefined;
         this.recordSite(site, "cell", this.inLoop(declNode) ? "many" : "once", true, declNode, true);
-        ctx.body.push({ kind: "AllocObject", dst: cell, typeId: 0, site });
+        ctx.body.push({ kind: "AllocObject", dst: cell, typeId: 0, site, classId: this.cellClassId });
         ctx.cellAccess.set(s, cell);
         // Step E: if this module-scope binding is captured by a method, publish
         // the cell object into its GLOBALS[] slot so methods (which can't receive
@@ -10460,6 +10497,7 @@ class Exporter {
       isAsync: ctx.isAsync ?? false,
       isGenerator: ctx.isGenerator ?? false,
       takesThis: thisParam || staticThis,
+      captureCount: ctx.captureCount ?? 0,
       arity,
       hasPrototype: !name.startsWith("__") &&
         (ts.isFunctionDeclaration(node as ts.Node) || ts.isFunctionExpression(node as ts.Node)) &&
@@ -10710,6 +10748,17 @@ class Exporter {
     // `extends` resolves and class ids are unique across files.
     const { classes, symbolToId, nodeToId } = this.classExtractor.extractAll(this.modules);
     this.classInfos = classes;
+    // Typed cells: every captured-variable cell is an instance of one synthetic
+    // class with a single struct field, so reads and writes of captured
+    // variables compile to a direct field access instead of a cached property
+    // lookup. TSAOT_TYPED_CELLS=0 keeps the plain-object cells (legacy IR).
+    if (process.env.TSAOT_TYPED_CELLS !== "0") {
+      this.cellClassId = this.classInfos.length;
+      this.classInfos.push({
+        id: this.cellClassId, name: "__cell", ownMethods: [], ownFields: ["__value"],
+        instantiated: true, stable: true, reasons: [],
+      });
+    }
     this.classSymToId = symbolToId;
     this.classIdByNode = nodeToId;
 

@@ -16,6 +16,14 @@
 #   TSAOT_PROP_PIC=0       Disable production-default property PIC emission.
 #   TSAOT_FRAME_ROOTS=0    Disable production-default batched GC root frames.
 #   TSAOT_PRETENURE=0      Disable escape-guided old-generation allocation.
+#   TSAOT_LAZY_PROTO=0     Allocate every function's .prototype eagerly instead
+#                          of on first observation (legacy emission).
+#   TSAOT_CLOSURE_ENV_ABI=0  Pass captured cells merged into the argument array
+#                          instead of through the environment register (legacy).
+#   TSAOT_EH_RETURN_POP=0  Leave try handlers unpopped on `return` (the frozen
+#                          emitter's miscompile; parity oracle only).
+#   TSAOT_UNDEF_FIELDS=0   Skip the `undefined` initialization of boxed class
+#                          fields (unassigned fields read as 0; parity oracle only).
 #   TSAOT_GC_AGE_THRESHOLD=1  Disable the default one-minor aging grace at
 #                          application runtime (immediate first-survival promotion).
 #   TSAOT_GC_AGING_ADAPTIVE=0 Disable runtime survival feedback and use the
@@ -53,6 +61,10 @@ usage: $PROG [-c | -S] [-o <out.c>] [-p <tsconfig>] <input.ts>
 env: TSAOT_CC (default "cc -O2"), TSAOT_ANALYZER=rust|ts|native (default rust),
      TSAOT_PROP_PIC=0 or TSAOT_FRAME_ROOTS=0 for legacy diagnostic emission,
      TSAOT_PRETENURE=0 to disable escape-guided pretenuring,
+     TSAOT_LAZY_PROTO=0 for eager function .prototype allocation,
+     TSAOT_CLOSURE_ENV_ABI=0 for the merged closure argument convention,
+     TSAOT_EH_RETURN_POP=0 for the frozen (unpopped-handler) return emission,
+     TSAOT_UNDEF_FIELDS=0 for the frozen (zeroed) class field initialization,
      TSAOT_GC_AGE_THRESHOLD=1 for immediate promotion at application runtime,
      TSAOT_GC_AGING_ADAPTIVE=0 for fixed-threshold aging at application runtime,
      TSAOT_USE_MIMALLOC=0 to disable default static mimalloc,

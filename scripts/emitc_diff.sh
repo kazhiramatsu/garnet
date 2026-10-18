@@ -20,7 +20,9 @@ for ts in $(find tests/conformance/exhaustive -name "*.ts" | sort); do
   printf '%s\t%s\n' "$slug" "$ts" >> "$LIST"
 done
 if [ ! -f "$W/json/.stamp" ] || [ "$LIST" -nt "$W/json/.stamp" ]; then
-  node exporter/exporter.js --batch "$LIST" "$W/json" > "$W/exp.status" 2>"$W/exp.err" || true
+  # The frozen emitter predates typed cells; export the oracle corpus with the
+  # plain-object cell IR so both emitters see the same program.
+  TSAOT_TYPED_CELLS=0 node exporter/exporter.js --batch "$LIST" "$W/json" > "$W/exp.status" 2>"$W/exp.err" || true
   touch "$W/json/.stamp"
 fi
 
@@ -47,10 +49,11 @@ while IFS=$'\t' read -r slug path; do
   case "$slug" in *"$FILTER"*) ;; *) continue ;; esac
   prog="$W/json/$slug.program.json"
   [ -f "$prog" ] || { skip=$((skip+1)); continue; }
-  # The frozen TS emitter predates property PICs, shadow root frames, and
-  # escape-guided pretenuring. Keep this mechanical byte oracle on the explicit
-  # legacy mode while production emission uses all three by default.
-  TSAOT_PROP_PIC=0 TSAOT_FRAME_ROOTS=0 TSAOT_PRETENURE=0 TSAOT_FAST_EXCEPTIONS=0 \
+  # The frozen TS emitter predates property PICs, shadow root frames,
+  # escape-guided pretenuring, lazy function prototypes and the closure
+  # environment ABI. Keep this mechanical byte oracle on the explicit legacy
+  # mode while production emission uses all of them by default.
+  TSAOT_PROP_PIC=0 TSAOT_FRAME_ROOTS=0 TSAOT_PRETENURE=0 TSAOT_FAST_EXCEPTIONS=0 TSAOT_LAZY_PROTO=0 TSAOT_CLOSURE_ENV_ABI=0 TSAOT_EH_RETURN_POP=0 TSAOT_UNDEF_FIELDS=0 \
     "$RUST" "$prog" emit > "$W/r.c" 2>/dev/null || { skip=$((skip+1)); continue; }
   astatus=$(awk -F'\t' -v n="$slug" '$1==n{print $2; exit}' "$W/an.status")
   areason=$(awk -F'\t' -v n="$slug" '$1==n{$1=$2=""; sub(/^[[:space:]]+/, ""); print; exit}' "$W/an.status")

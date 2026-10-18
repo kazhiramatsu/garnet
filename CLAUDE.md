@@ -88,3 +88,5 @@ Rust in §315; selfhost is kept as a performance metric).
   (V8 uses double rounding).
 - bigint (the whole numeric-type story; fundamentally unsupported), and Array.prototype monkey-patch
   (outside the model).
+- A monomorphized numeric class field (`x: number`, unboxed double) reads as 0 before its first
+  assignment (V8: undefined). Boxed fields and typed cells are initialized to undefined (Session 350).
