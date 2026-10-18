@@ -96,3 +96,36 @@ legacy export, GC stress, bundler, selfconf, bench, then the compiler A/B.
   not available on another (first compiler build, fixed before measuring).
 - The synthetic `__module_init` node has no source position; its record's
   allocation site is recorded without a node.
+
+## Direct calls to nested declarations (roadmap track C, item 4)
+
+A nested function declaration used to be a closure value: hoisted at the
+enclosing function's prologue (one `ts_make_fn` per declaration per
+activation) and called through `ts_call_value`. `checkTypeRelatedTo` hoisted
+about sixty helpers on each of its 275k calls, 36% of the closure
+allocations of a compile. With the records in place a direct call needs no
+closure at all: the callee receives the scope records of its free variables
+as leading parameters, exactly like a top-level callee receives module
+cells.
+
+- The exporter registers nested declarations in `funcSymbols`
+  (`nestedFuncSymbols`); a callee-position reference is a direct call and is
+  not a free variable of the caller. A caller of a nested function inherits
+  the callee's free variables that belong to enclosing functions (`calledFns`
+  rollup), so it holds the records the call must pass.
+- `computeFunctionValueUses` scans every module once for references to a
+  function declaration other than as a callee (shorthand properties and
+  export specifiers resolve to the value symbol). A declaration never used as
+  a value is not hoisted as a closure (`TSAOT_LAZY_FN_DECL=0` keeps the eager
+  hoisting); its body is still lowered at the hoisting point, in lexical
+  order. Lowering callees on demand along the call edge recursed through the
+  whole call graph of the checker and overflowed the node stack.
+- A value use of such a declaration outside its hoisted binding boxes a
+  closure with the captures the context holds; an assignment to a function
+  declaration binding is a loud reject (direct calls bind to the
+  declaration). `TSAOT_NESTED_DIRECT=0` keeps the closure-value calls (the
+  parity corpus is exported with it).
+- A type-only import merged with a local value declaration of the same name
+  (`let SourceMapSource` in nodeFactory.ts, `function SourceMapSource` in
+  utilities.ts) is kept as the local symbol: unwrapping the alias keyed both
+  modules' locals to the interface symbol and conflated the two bindings.

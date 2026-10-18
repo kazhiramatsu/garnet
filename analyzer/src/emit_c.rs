@@ -4926,6 +4926,13 @@ fn collect_return_fact(body: &[Inst], analysis: &NumericAnalysis) -> Option<NumF
     out
 }
 
+/// Locals whose value is always a number: the params plus every local all of
+/// whose definitions produce a number. This is a must-analysis (an optimistic
+/// greatest fixpoint): a local starts numeric and is dropped as soon as one of
+/// its definitions is not numeric under the current assumption. The previous
+/// any-definition rule let `c ? true : g(n)` classify the merge local as
+/// numeric, so a boolean-returning function got an f64 clone that reinterpreted
+/// `true` as NaN.
 fn numeric_value_locs(
     body: &[Inst],
     params: &[u32],
@@ -4934,6 +4941,11 @@ fn numeric_value_locs(
     let mut flat = Vec::new();
     flatten_inst(body, &mut flat);
     let mut numeric: BTreeSet<u32> = params.iter().copied().collect();
+    for inst in &flat {
+        if let Some(id) = inst_def(inst) {
+            numeric.insert(id);
+        }
+    }
     let mut changed = true;
     while changed {
         changed = false;
@@ -5006,10 +5018,11 @@ fn numeric_value_locs(
                 | Inst::GetProto { dst, .. }
                 | Inst::NewMap { dst }
                 | Inst::NewSet { dst } => Some((dst.0, false)),
-                _ => None,
+                // every other defining instruction yields a non-number
+                other => inst_def(other).map(|d| (d, false)),
             };
-            if let Some((id, is_num)) = def {
-                if is_num && numeric.insert(id) {
+            if let Some((id, false)) = def {
+                if numeric.remove(&id) {
                     changed = true;
                 }
             }

@@ -299,6 +299,18 @@ class Exporter {
   // Capture contexts (docs/capture_contexts_design.md): the scope record of each
   // owner function and the owner of every record-resident binding.
   captureContexts = false;
+  // Function declarations referenced anywhere as a VALUE (not just called
+  // directly). A nested declaration outside this set never needs its hoisted
+  // closure: direct calls thread the scope record instead.
+  fnValueUsed = new Set<ts.Symbol>();
+  lazyFnDecls = false;
+  // Nested function declarations registered as direct-call targets (their
+  // scope records are threaded like module cells). TSAOT_NESTED_DIRECT=0
+  // keeps them as closure values called through ts_call_value.
+  nestedFuncSymbols = new Set<ts.Symbol>();
+  /** nested declaration fn ids whose lowering is deferred to the driver */
+  pendingNestedFns = new Set<number>();
+  nestedDirect = process.env.TSAOT_NESTED_DIRECT !== "0";
   recordOfOwner = new Map<ts.Node, CaptureRecord>();
   recordOwnerOf = new Map<ts.Symbol, ts.Node>();
   moduleCtxGlobal: number | undefined = undefined;
@@ -1202,7 +1214,13 @@ class Exporter {
    *  module's declaration — the basis for cross-module resolution. No-op for
    *  non-alias symbols (single-file programs have no value-import aliases). */
   private unwrapImportAlias(sym: ts.Symbol | undefined): ts.Symbol | undefined {
-    if (sym && (sym.flags & ts.SymbolFlags.Alias)) {
+    // A type-only import merged with a local VALUE declaration of the same name
+    // (`import { SourceMapSource }` + `let SourceMapSource` in nodeFactory.ts,
+    // `function SourceMapSource` in utilities.ts) carries Alias plus a value
+    // flag. Its value meaning is the local declaration, so keep that symbol:
+    // unwrapping to the alias target (the interface) keyed every module's local
+    // of that name to one symbol and conflated the two bindings.
+    if (sym && (sym.flags & ts.SymbolFlags.Alias) && !(sym.flags & ts.SymbolFlags.Value)) {
       try { const t = this.checker.getAliasedSymbol(sym); if (t) return t; } catch { /* keep original */ }
     }
     return sym;
@@ -1543,9 +1561,12 @@ class Exporter {
       }
       if (isLiftable(n) && (!ts.isFunctionDeclaration(n) || n.body)) {
         if (!this.fnId.has(n)) this.fnId.set(n, this.fnId.size);
-        if (ts.isFunctionDeclaration(n) && n.name && ts.isSourceFile(n.parent)) {
+        const nestedDecl = ts.isFunctionDeclaration(n) && n.name && !ts.isSourceFile(n.parent) &&
+          this.nestedDirect && this.enclosingFunction(n) !== undefined;
+        if (ts.isFunctionDeclaration(n) && n.name && (ts.isSourceFile(n.parent) || nestedDecl)) {
           const s = this.symbolOf(n.name);
           if (s) this.funcSymbols.set(s, this.fnId.get(n)!);
+          if (s && nestedDecl) this.nestedFuncSymbols.add(s);
           // record explicit `this` parameter — or an ES5 body reading its own
           // `this` (same args[0] slot) — so direct calls prepend a this slot.
           if ((n.parameters.length > 0 && ts.isIdentifier(n.parameters[0].name) &&
@@ -1742,7 +1763,10 @@ class Exporter {
         if (s && this.isScriptGlobalVarSymbol(s, n.text)) {
           // Script top-level var bindings are runtime global-object properties,
           // not closure cells. Reads/writes lower to globalThis.<name>.
-        } else if (s && !decl.has(s) && !this.funcSymbols.has(s)) {
+        } else if (s && !decl.has(s) &&
+                   (!this.funcSymbols.has(s) ||
+                    (this.nestedFuncSymbols.has(s) &&
+                     !(ts.isCallExpression(n.parent) && n.parent.expression === n)))) {
           const owner = this.symbolOwnerFunction(s);
           if (owner && owner !== F) res.add(s); // captured from an outer function (incl. __module_init)
         }
@@ -1840,12 +1864,20 @@ class Exporter {
         if (!decl.has(s)) res.add(s);
       }
     }
-    // Transitive: pull in module-scope cells needed by called functions.
+    // Transitive: pull in the cells needed by directly called functions. For a
+    // top-level callee only module-scope symbols (owned by __module_init) can
+    // be free; a NESTED callee's free variables are its enclosing functions'
+    // locals, which the caller must hold too (it supplies the scope records).
+    // A called function's own locals/params are not our concern.
     for (const g of calledFns) {
+      const nestedCallee = !ts.isSourceFile((g as unknown as ts.Node).parent);
       for (const s of this.freeVarsInner(g)) {
-        // Only propagate module-scope symbols (owned by __module_init). A called
-        // function's own locals/params are not our concern.
-        if (!this.isScriptGlobalVarSymbol(s) && !decl.has(s) && this.moduleScopeSyms.has(s)) res.add(s);
+        if (this.isScriptGlobalVarSymbol(s) || decl.has(s)) continue;
+        if (this.moduleScopeSyms.has(s)) { res.add(s); continue; }
+        if (nestedCallee){
+          const owner = this.symbolOwnerFunction(s);
+          if (owner && owner !== F) res.add(s);
+        }
       }
     }
     // Transitive capture through `new C()` / `super(...)`: F threads the called
@@ -1907,6 +1939,62 @@ class Exporter {
     if (ts.isFunctionExpression(d) || ts.isClassExpression(d)) return false;
     if (this.inLoop(d)) return false;
     return true;
+  }
+  /** A nested declaration that is only called directly is never hoisted as a
+   *  closure, so its body must be lowered when the first direct call is seen. */
+  /** A direct call to a nested declaration that its enclosing function has not
+   *  hoisted (and so not lowered) yet. The body is lowered later, from the
+   *  top-level driver, never re-entrantly along the call edge: lowering callees
+   *  inside the caller's lowering recursed along the whole call graph of the
+   *  compiler's checker (two thousand nested functions) and overflowed the
+   *  stack. Normally hoistDeclarations lowers every nested declaration in
+   *  lexical order before its first call is reached, so this stays empty. */
+  private ensureNestedLowered(sym: ts.Symbol): void {
+    const fid = this.funcSymbols.get(sym);
+    if (fid === undefined || this.loweredFnIds.has(fid)) return;
+    this.pendingNestedFns.add(fid);
+  }
+  /** Lower the nested declarations queued by ensureNestedLowered (each lowering
+   *  may queue more). */
+  private drainPendingNested(): void {
+    while (this.pendingNestedFns.size > 0) {
+      const fid = this.pendingNestedFns.values().next().value as number;
+      this.pendingNestedFns.delete(fid);
+      if (this.loweredFnIds.has(fid)) continue;
+      const node = this.fnNodeById(fid);
+      if (node) this.lowerFunctionLike(node as FnLike, fid, false);
+    }
+  }
+  /** Every function declaration symbol that some identifier references other
+   *  than as the callee of a direct call. Computed once before lowering so
+   *  hoistDeclarations can skip the closure of a declaration that is only
+   *  ever called (the dominant closure allocation in the compiler: a function
+   *  with sixty nested helpers hoisted them all on each of 275k calls).
+   *  TSAOT_LAZY_FN_DECL=0 keeps the eager hoisting. */
+  private computeFunctionValueUses(): void {
+    this.lazyFnDecls = process.env.TSAOT_LAZY_FN_DECL !== "0";
+    if (!this.lazyFnDecls) return;
+    const visit = (n: ts.Node) => {
+      if (ts.isIdentifier(n) && this.isVarRef(n)) {
+        const parent = n.parent;
+        let sym = this.symbolOf(n);
+        // `{ g }` names the property; the value is the variable symbol.
+        if (ts.isShorthandPropertyAssignment(parent) && parent.name === n)
+          sym = this.checker.getShorthandAssignmentValueSymbol(parent) ?? sym;
+        if (ts.isExportSpecifier(parent))
+          sym = this.checker.getExportSpecifierLocalTargetSymbol(parent) ?? sym;
+        if (sym && this.funcSymbols.has(sym)) {
+          const isCallee = ts.isCallExpression(parent) && parent.expression === n;
+          if (!isCallee) this.fnValueUsed.add(sym);
+        }
+      }
+      ts.forEachChild(n, visit);
+    };
+    for (const m of this.modules) visit(m);
+    if (process.env.TSAOT_DEBUG_FNVALUE) {
+      console.error(`[fnvalue] used-as-value: [${[...this.fnValueUsed].map((s) => (s as { name?: string }).name ?? "?").join(",")}]`);
+      console.error(`[fnvalue] funcSymbols: [${[...this.funcSymbols.keys()].map((s) => (s as { name?: string }).name ?? "?").join(",")}]`);
+    }
   }
   /** Group the record-resident captured bindings by owner function and declare
    *  one synthetic class per owner (fields in binding-id order). Runs once the
@@ -4594,6 +4682,7 @@ class Exporter {
           // are classified as the concrete scalar and stay unboxed).
           const spec = this.specializeGenericCall(node, sym);
           callee = { kind: "Direct", func: spec !== undefined ? spec : this.funcSymbols.get(sym) };
+          if (spec === undefined && this.nestedFuncSymbols.has(sym)) this.ensureNestedLowered(sym);
         } else if (sym && ctx.selfFunctionSymbol === sym) {
           // The lexical name of a named function expression denotes this exact
           // lifted function. The regular Direct-call path below threads captures.
@@ -6102,6 +6191,14 @@ class Exporter {
         const dst = this.newLocal(ctx, "reference", node.text);
         ctx.body.push({ kind: "LoadGlobal", dst, gref });
         return dst;
+      }
+      if (this.nestedFuncSymbols.has(sym)) {
+        // A nested declaration's value outside its hoisted binding: box it with
+        // the captures this context holds (identity differs from the hoisted
+        // closure, which only matters for a value the scan did not see).
+        const v = this.directFunctionValue(ctx, this.funcSymbols.get(sym)!);
+        if (v !== undefined) return v;
+        this.unsupported(node, `nested function '${node.text}' used as a value where its captures are unavailable`);
       }
       // A top-level function used as a VALUE (e.g. `f` in `f.call(...)`, or passed
       // as a callback) must be boxed into a ts_func. Emit a capture-less closure;
@@ -9351,6 +9448,14 @@ class Exporter {
         this.emitThrowTypeError(ctx, lhs, "Assignment to constant variable.");
         return;
       }
+      if (sym && this.funcSymbols.has(sym) && !this.isScriptGlobalVarSymbol(sym, lhs.text)) {
+        // Direct calls bind to the declaration; a rebinding would silently be
+        // bypassed by them.
+        if (process.env.TSAOT_DEBUG_FNVALUE) {
+          console.error(`[fnvalue] assignment target '${lhs.text}' decls: ${(sym.declarations ?? []).map((d) => `${ts.SyntaxKind[d.kind]}@${d.getSourceFile().fileName}:${d.getSourceFile().getLineAndCharacterOfPosition(d.pos).line + 1}`).join(", ")}`);
+        }
+        this.unsupported(lhs, `assignment to the function declaration binding '${lhs.text}'`);
+      }
       if (this.isScriptGlobalVarSymbol(sym, lhs.text)) {
         this.storeGlobalObjectProperty(ctx, lhs.text, rhs);
       } else if (this.globalObjectValueName(lhs.text) !== undefined && this.isAmbientGlobalSymbol(sym)) {
@@ -10349,6 +10454,16 @@ class Exporter {
     for (const fd of fnDecls) {
       const sym = this.symbolOf(fd.name!);
       if (!sym) continue;
+      // A nested declaration that is only ever called directly needs no closure
+      // value at all: direct calls pass the scope record. Skip the allocation
+      // but still lower the body here, in lexical order (see ensureNestedLowered).
+      if (this.lazyFnDecls && !this.fnValueUsed.has(sym) &&
+          !this.isScriptGlobalVarSymbol(sym, fd.name!.text) &&
+          !this.hasCaptured(ctx, sym) && !this.functionValueGlobal.has(sym)) {
+        this.lowerFunctionLike(fd, this.fnId.get(fd)!, false);
+        ctx.hoistedFns.add(fd);
+        continue;
+      }
       // If captured by a nested closure, it lives in a cell (already allocated);
       // store the closure value into the cell. Otherwise bind a local alias.
       const dst = this.lowerClosure(ctx, fd, fd.name!.text);
@@ -11789,6 +11904,7 @@ class Exporter {
     // Capture contexts: group the record-resident captured bindings per owner
     // and declare the scope record classes (the cell binding set is final here).
     this.buildCaptureRecords();
+    this.computeFunctionValueUses();
 
     // lower top-level function declarations of EVERY module; nested ones lifted on demand
     for (const sf of this.modules) for (const stmt of sf.statements) {
@@ -11833,6 +11949,7 @@ class Exporter {
     for (const si of this.staticInits) {
       this.lowerStaticInit(si.classId, si.fnId, si.node);
     }
+    this.drainPendingNested();
 
     this.buildClassesTable();
   }

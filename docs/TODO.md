@@ -4280,15 +4280,76 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   stress (all phases), bundler 42/42, selfconf 401 + 11 KNOWN (DIFF 0),
   parity 330 identical + 81 KNOWN, runtime and Rust units, all 102
   benchmarks within budget.
-- Next slices (`docs/v8_parity_roadmap.md`): B pointer-stable old
-  generation (direct pointers for old cells remove the handle-table load
-  from every object access and from minor marking; needs the identity-
-  normalizing compare first), C1 known-arity direct entries, C5b-2/3 (block
-  records for per-iteration bindings, unboxed numeric record fields). The
-  latest profile puts 59% of samples in generated code, 11% in the collector
-  (1,750 minors per compile, 30.9M closure allocations = 3.7 GB of the
-  young bytes) and 8% in the dynamic call path (`ts_call`/`ts_call_value`).
-  Smaller items still open: the minor-collection trigger counts cell bytes
-  only, 10.3M property additions still take the slow path after the
-  addition cache, and closures passed to non-devirtualized callees are never
-  stack-allocated (the 270 stack-strategy closure sites are all cold).
+- Direct calls to nested function declarations with lazy hoisting
+  (roadmap track C item 4; `docs/capture_contexts_design.md`, last
+  section). The site statistics of the pointer-stable build showed 30.9M
+  closures per compile, 36% of the top-40 sites being the hoisted helpers
+  of `checkTypeRelatedTo` (about sixty declarations per call, 275k calls),
+  called through `ts_call_value` because only top-level declarations were
+  direct-call targets. Now a nested declaration is a direct-call target
+  that receives the scope records of its free variables as leading
+  parameters (a caller inherits a nested callee's free variables that
+  belong to enclosing functions), and a declaration that no identifier
+  uses as a value (one scan of every module, shorthand properties and
+  export specifiers resolved to the value symbol) is not hoisted as a
+  closure; its body is still lowered at the hoisting point in lexical
+  order. The first version lowered callees on demand along the call edge
+  and overflowed the node stack on the checker (two thousand nested
+  functions in one call graph); the second version queues such a callee
+  for the driver instead. An assignment to a function declaration binding
+  is a loud reject (`TSAOT_NESTED_DIRECT=0` / `TSAOT_LAZY_FN_DECL=0` keep
+  the closure-value form; the parity corpus is exported with them). Three
+  pre-existing silent miscompiles surfaced on the way, all fixed in Rust
+  with fixtures and allowlisted for the frozen pair: (1) the numeric
+  direct-call clone inference counted a local as numeric when ANY of its
+  definitions was numeric, so `c ? true : g(n)` gave a boolean-returning
+  function an f64 clone that returned NaN (`hoisting/mutual_recursion`
+  failed as soon as its functions became direct; the top-level form failed
+  before this slice too) — `numeric_value_locs` is now a must-analysis
+  (fixture `functions/mixed_return_numeric_clone`); (2) SROA's receiver
+  check only recognized `this` escaping into a closure cell
+  (`captures_this` needed an AllocClosure), so a method that stores `this`
+  into a scope record or passes it to a direct callee had its receiver
+  scalar-replaced and the inlined store read the caller's local 0 —
+  `needs_materialized_this` now rejects every value use of the receiver
+  (fixture `classes/receiver_used_as_value`); (3) the exporter unwrapped a
+  type-only import merged with a same-named local value declaration
+  (`let SourceMapSource` in nodeFactory.ts and `function SourceMapSource`
+  in utilities.ts both merged with the interface import) to the interface
+  symbol, keying both modules' bindings to one symbol — the merged symbol
+  is kept local now. The interprocedural escape analysis then iterated the
+  checker's recursion nest (1,609 directly-calling functions) without
+  converging for twenty minutes: the nest fixpoint is now worklist-driven
+  (a member is re-solved only when a callee's summary changed), bounded to
+  eight solves per member, and a nest of more than 128 members gets no
+  summaries at all (every reference argument escapes — the precision those
+  calls had as closure-value calls), which brings the analyzer back to 3.6
+  s on the compiler (`TSAOT_INTERPROC_TRACE=1` prints the nests). Compiler
+  A/B against the pointer-stable build (alternating three runs, outputs
+  validated): **10.985 → 9.722 s median wall (11.5% less, 1.13x)**, process
+  CPU 10.9 → 9.6 s, peak RSS 1.26 → 1.23 GB; Node 3.245 s, so the native
+  compiler is now 3.00x slower than V8. The generated C has 4,621
+  `ts_call_value` sites instead of 22,545 and 27,461 environment-passing
+  direct calls instead of 9,970 (55.1 → 52.0 MB); the site statistics
+  build counts 5.63M closure allocations per compile instead of 30.87M
+  (81.8% fewer). The hoisted closures that remain are declarations some
+  identifier uses as a value: `checkTypeRelatedTo` still boxes
+  `isRelatedTo`, `reportError`, `captureErrorCalculationState` and three
+  more per call (275k each) because they are passed as callbacks on some
+  path; boxing such a declaration on first value use per activation
+  instead of in the prologue would remove most of them.
+  Gates on the final tree: conformance 418/418 (three new fixtures),
+  runtime inline policy, GC stress (all phases), bundler 42/42, selfconf
+  404 + 11 KNOWN (DIFF 0), parity 330 identical + 84 KNOWN, runtime and
+  Rust units, all 102 benchmarks within budget.
+- Next slices (`docs/v8_parity_roadmap.md`): C1 known-arity direct entries
+  (27k direct calls now build an argument array and an environment array
+  per call), stack allocation of the scope records passed only to direct
+  callees (needs summaries for the checker's nest: a cheaper summary domain
+  or a per-parameter "never stored" flag computed without the fixpoint),
+  C5b-2/3 (block records for per-iteration bindings, unboxed numeric record
+  fields), and the remaining 4.6k closure-value call sites. Smaller items
+  still open: the minor-collection trigger counts cell bytes only, 10.3M
+  property additions still take the slow path after the addition cache,
+  and closures passed to non-devirtualized callees are never
+  stack-allocated.

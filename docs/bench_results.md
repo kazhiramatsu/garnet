@@ -620,3 +620,26 @@ compiler's frames shrink from 260,568 to 73,287 slots, so a call initializes
 and a collection scans a fifth of the slots. Native is now 3.41x slower than
 V8 on this machine state. Raw records: `native_s350i/results/run-535ko12w/`,
 `native_s350j/results/run-yy2njb_k/`.
+
+### Direct calls to nested declarations (Session 350, track C item 4)
+
+Same compiler workload, three alternating runs after warmup against the
+pointer-stable build, diagnostics and all 78 emitted files matching Node on
+every launch:
+
+| build | median wall | median process CPU | median peak RSS |
+|---|---:|---:|---:|
+| Pointer-stable build (`native_s350k`) | 10.985 s | 11.0 s | 1.26 GB |
+| + direct nested calls, lazy hoisting (`native_s350l`) | **9.722 s** | **9.7 s** | 1.23 GB |
+| Node 25.2.1 / V8 (same session) | 3.245 s | 5.9 s | 0.80 GB |
+
+A nested function declaration that is only ever called is no longer hoisted
+as a closure value: the call passes the scope records of its free variables
+directly (`checkTypeRelatedTo` hoisted about sixty helpers per call, 36% of
+the closure allocations of a compile). The generated C has 4,621
+`ts_call_value` sites instead of 22,545 and 27,461 environment-passing
+direct calls instead of 9,970; it shrinks from 55.1 to 52.0 MB. Wall time
+drops 11.5% (per run 9.614 / 9.722 / 9.949 s against 10.897 / 11.097 /
+10.985 s); the site statistics build counts 5.63M closure allocations per
+compile instead of 30.87M. Native is now 3.00x slower than V8 on this
+machine state. Raw records: `native_s350l/results/run-c3ndk50f/`.

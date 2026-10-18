@@ -123,6 +123,15 @@ Slices:
 4. **Closure devirtualization** — a local function declaration called through
    its own binding (never reassigned, never escaping before the call) becomes
    a direct call with its cells, instead of `ts_call_value` on the closure.
+   Status: landed in Session 350 on top of the scope records (the direct
+   call passes the records of the callee's free variables; a declaration
+   never used as a value is not hoisted as a closure at all): 10.99 → 9.72 s
+   (11.5% less), `ts_call_value` sites 22,545 → 4,621. An assignment to a
+   function declaration binding is a loud reject. The interprocedural
+   escape analysis gives no summaries to a recursion nest of more than 128
+   members (the checker's 1,609 directly-calling nested functions), so the
+   scope records passed to them still count as escaping; a cheaper summary
+   domain for large nests would let those records be stack-allocated.
 5. **Capture contexts** (V8-style scope records, suggested after comparing
    with Lua's upvalues) — instead of one heap cell per captured variable and
    an environment array per closure, each scope activation that has captured

@@ -1060,6 +1060,19 @@ fn pretenure_candidates(
 
 // ------------------------------- driver ---------------------------------------
 
+/// Solves per member of a recursion nest before the nest gives up on summaries
+/// (the compiler's nests converge in two to four solves per member).
+const SCC_SOLVE_BUDGET: usize = 8;
+/// A recursion nest with more members than this gets no summaries at all. The
+/// checker's nested functions form one nest of about two thousand members
+/// whose solves cost tens of milliseconds each; iterating it is minutes of
+/// analysis for summaries the budget would discard anyway.
+const SCC_SUMMARY_MAX_MEMBERS: usize = 128;
+
+fn interproc_trace() -> bool {
+    std::env::var("TSAOT_INTERPROC_TRACE").map(|v| v == "1").unwrap_or(false)
+}
+
 pub fn analyze_program(program: &Program) -> EscapeResult {
     let cg = build_call_graph(program);
     let by_id: BTreeMap<u32, &Function> = program.functions.iter().map(|f| (f.id.0, f)).collect();
@@ -1080,25 +1093,74 @@ pub fn analyze_program(program: &Program) -> EscapeResult {
             let Some(&f) = by_id.get(&scc[0].0) else { continue };
             let (solver, _) = solve(f, &summaries);
             summaries[scc[0].0 as usize] = Some(extract_summary(f, &solver));
+        } else if scc.len() > SCC_SUMMARY_MAX_MEMBERS {
+            // Already None; the constraint builder treats a callee without a
+            // summary as unknown (every reference argument escapes), the
+            // precision these calls had while they went through closure values.
+            if interproc_trace() {
+                eprintln!("[interproc] nest of {} functions: skipped, no summaries", scc.len());
+            }
         } else {
             for m in scc {
                 let Some(&f) = by_id.get(&m.0) else { continue };
                 summaries[m.0 as usize] = Some(Summary::empty(f.params.len()));
             }
-            loop {
-                let mut changed = false;
-                for m in scc {
-                    let Some(&f) = by_id.get(&m.0) else { continue };
-                    let (solver, _) = solve(f, &summaries);
-                    let s = extract_summary(f, &solver);
-                    if summaries[m.0 as usize].as_ref() != Some(&s) {
-                        summaries[m.0 as usize] = Some(s);
-                        changed = true;
+            // Worklist over the recursion nest: a member is re-solved only when
+            // the summary of one of its callees inside the nest changed. The
+            // checker's nested functions (direct calls since Session 350) form
+            // one nest of about two thousand members; re-solving every member
+            // per sweep did not converge in twenty minutes. The work is bounded:
+            // past SCC_SOLVE_BUDGET solves per member the whole nest falls back
+            // to no summary, which the constraint builder treats as an unknown
+            // callee (every reference argument escapes) — the precision the
+            // call graph without these edges had.
+            let members: BTreeSet<u32> = scc.iter().map(|m| m.0).collect();
+            let mut nest_callers: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+            for m in scc {
+                for g in &cg.callees[m.0 as usize] {
+                    if members.contains(&g.0) {
+                        nest_callers.entry(g.0).or_default().push(m.0);
                     }
                 }
-                if !changed {
+            }
+            let mut queue: std::collections::VecDeque<u32> = scc.iter().map(|m| m.0).collect();
+            let mut queued: BTreeSet<u32> = members.clone();
+            let budget = scc.len() * SCC_SOLVE_BUDGET;
+            let mut solves = 0usize;
+            let mut converged = true;
+            while let Some(id) = queue.pop_front() {
+                queued.remove(&id);
+                let Some(&f) = by_id.get(&id) else { continue };
+                if solves >= budget {
+                    converged = false;
                     break;
                 }
+                solves += 1;
+                let (solver, _) = solve(f, &summaries);
+                let s = extract_summary(f, &solver);
+                if summaries[id as usize].as_ref() != Some(&s) {
+                    summaries[id as usize] = Some(s);
+                    if let Some(callers) = nest_callers.get(&id) {
+                        for &c in callers {
+                            if queued.insert(c) {
+                                queue.push_back(c);
+                            }
+                        }
+                    }
+                }
+            }
+            if !converged {
+                for m in scc {
+                    summaries[m.0 as usize] = None;
+                }
+            }
+            if interproc_trace() {
+                eprintln!(
+                    "[interproc] nest of {} functions: {} solves, {}",
+                    scc.len(),
+                    solves,
+                    if converged { "converged" } else { "budget exhausted, no summaries" }
+                );
             }
         }
     }

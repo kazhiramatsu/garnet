@@ -32,6 +32,10 @@
 #                          instances (legacy IR; the parity corpus uses it).
 #   TSAOT_CAPTURE_CONTEXTS=0  Exporter: one cell per captured variable instead of
 #                          one scope record per activation (legacy IR).
+#   TSAOT_NESTED_DIRECT=0  Exporter: call nested function declarations through
+#                          their closure values instead of directly (legacy IR).
+#   TSAOT_LAZY_FN_DECL=0   Exporter: hoist every function declaration as a
+#                          closure even when it is only ever called directly.
 #   TSAOT_GC_AGE_THRESHOLD=1  Disable the default one-minor aging grace at
 #                          application runtime (immediate first-survival promotion).
 #   TSAOT_GC_AGING_ADAPTIVE=0 Disable runtime survival feedback and use the
@@ -76,6 +80,7 @@ env: TSAOT_CC (default "cc -O2"), TSAOT_ANALYZER=rust|ts|native (default rust),
      TSAOT_INLINE_SLOTS=0 for literals without in-object slots,
      TSAOT_FRAME_COALESCE=0 for one frame slot per local,
      TSAOT_TYPED_CELLS=0 / TSAOT_CAPTURE_CONTEXTS=0 for the legacy capture IR,
+     TSAOT_NESTED_DIRECT=0 / TSAOT_LAZY_FN_DECL=0 for closure-value nested calls,
      TSAOT_GC_AGE_THRESHOLD=1 for immediate promotion at application runtime,
      TSAOT_GC_AGING_ADAPTIVE=0 for fixed-threshold aging at application runtime,
      TSAOT_USE_MIMALLOC=0 to disable default static mimalloc,

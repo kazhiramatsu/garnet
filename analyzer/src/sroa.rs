@@ -2082,11 +2082,16 @@ fn trim_trailing_alloc_proto_load(out: &mut Vec<Inst>, proto_local: u32) {
 /// consistent); a method that never touches `this` fields (e.g. identity returns)
 /// is safe to inline onto any receiver.
 /// True if `f` needs a materialized `this`: it is a generator/async method (its
-/// receiver is captured into a coroutine frame that outlives the call), or it
-/// (transitively) makes a Direct call on its own receiver (param 0) to such a
-/// method. A receiver flowing into such a method — directly, or via inlining —
-/// must NOT be scalar-replaced (the kept state-machine call needs a real object).
-/// Depth-guarded; conservative (returns true) on overflow.
+/// receiver is captured into a coroutine frame that outlives the call), it
+/// uses its receiver (param 0) as a VALUE — stores it into another object (a
+/// closure cell, the scope record a nested declaration receives), passes it as
+/// an argument, copies, compares or returns it — or it (transitively) makes a
+/// Direct call on its own receiver to such a method. A receiver flowing into
+/// such a method — directly, or via inlining — must NOT be scalar-replaced:
+/// inline_callee only redirects the receiver's field accesses, so any other
+/// use of the receiver would be spliced into the caller with the callee's raw
+/// local id (it read the caller's local 0, the module scope record, instead of
+/// the receiver). Depth-guarded; conservative (returns true) on overflow.
 fn needs_materialized_this(f: &Function, bodies: &BTreeMap<u32, Function>, depth: u32) -> bool {
     if f.is_generator || f.is_async || f.rest_param.is_some() {
         return true;
@@ -2098,6 +2103,31 @@ fn needs_materialized_this(f: &Function, bodies: &BTreeMap<u32, Function>, depth
         Some(p) => p.0,
         None => return false,
     };
+    /// Does the instruction mention `p0` anywhere other than as the object of a
+    /// field access or the receiver of a Direct call? (Straight-line
+    /// instructions only; the structured ones are walked by `scan`.)
+    fn value_use(inst: &Inst, p0: u32) -> bool {
+        match inst {
+            Inst::LoadField { obj, .. } if obj.0 == p0 => false,
+            Inst::StoreField { obj, src, .. } if obj.0 == p0 => src.0 == p0,
+            Inst::Call {
+                recv: Some(r),
+                callee: CalleeRef::Direct { .. },
+                args,
+                ..
+            } if r.0 == p0 => args.iter().any(|a| a.0 == p0),
+            _ => {
+                let seen = std::cell::Cell::new(false);
+                remap_inst_operands(inst, &|id: LocalId| {
+                    if id.0 == p0 {
+                        seen.set(true);
+                    }
+                    id
+                });
+                seen.get()
+            }
+        }
+    }
     fn scan(body: &[Inst], p0: u32, bodies: &BTreeMap<u32, Function>, depth: u32) -> bool {
         body.iter().any(|inst| match inst {
             Inst::CallBuiltinStatic { builtin, .. } if builtin.starts_with("arguments.length:") => true,
@@ -2112,18 +2142,34 @@ fn needs_materialized_this(f: &Function, bodies: &BTreeMap<u32, Function>, depth
             Inst::Call {
                 recv: Some(r),
                 callee: CalleeRef::Direct { func },
+                args,
                 ..
-            } if r.0 == p0 => bodies
-                .get(&func.0)
-                .map_or(false, |cf| needs_materialized_this(cf, bodies, depth + 1)),
+            } if r.0 == p0 => {
+                args.iter().any(|a| a.0 == p0)
+                    || bodies
+                        .get(&func.0)
+                        .map_or(false, |cf| needs_materialized_this(cf, bodies, depth + 1))
+            }
             Inst::Loop {
-                cond_body, body, ..
-            } => scan(cond_body, p0, bodies, depth) || scan(body, p0, bodies, depth),
+                cond,
+                cond_body,
+                body,
+                ..
+            } => {
+                cond.0 == p0
+                    || scan(cond_body, p0, bodies, depth)
+                    || scan(body, p0, bodies, depth)
+            }
             Inst::If {
+                cond,
                 then_body,
                 else_body,
                 ..
-            } => scan(then_body, p0, bodies, depth) || scan(else_body, p0, bodies, depth),
+            } => {
+                cond.0 == p0
+                    || scan(then_body, p0, bodies, depth)
+                    || scan(else_body, p0, bodies, depth)
+            }
             Inst::TryCatch {
                 try_body,
                 catch_body,
@@ -2134,7 +2180,7 @@ fn needs_materialized_this(f: &Function, bodies: &BTreeMap<u32, Function>, depth
                     || scan(catch_body, p0, bodies, depth)
                     || scan(finally_body, p0, bodies, depth)
             }
-            _ => false,
+            other => value_use(other, p0),
         })
     }
     scan(&f.body, p0, bodies, depth)
