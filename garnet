@@ -30,6 +30,16 @@
 #                          of liveness-shared slots (parity oracle only).
 #   TSAOT_DIRECT_ENTRY=0   Single generic `(args, nargs)` entry per function
 #                          instead of typed direct-call entries (parity oracle only).
+#   TSAOT_TYPEOF_TEST=0    Keep `typeof x === "lit"` as a string compare instead
+#                          of a tag test (parity oracle only).
+#   TSAOT_SWITCH_TABLE=0   Nested ifs instead of a C `switch` for integer
+#                          if/else-if chains (parity oracle only).
+#   TSAOT_LAZY_FRAMES=0    Link every root frame eagerly instead of only
+#                          around slow paths in collection-free functions
+#                          (parity oracle only).
+#   TSAOT_LITERAL_LAYOUT=0 One cached property addition per literal or
+#                          constructor property instead of allocating in the
+#                          final shape (parity oracle only).
 #   TSAOT_TYPED_CELLS=0    Exporter: plain-object cells instead of typed `__cell`
 #                          instances (legacy IR; the parity corpus uses it).
 #   TSAOT_CAPTURE_CONTEXTS=0  Exporter: one cell per captured variable instead of
@@ -82,6 +92,10 @@ env: TSAOT_CC (default "cc -O2"), TSAOT_ANALYZER=rust|ts|native (default rust),
      TSAOT_INLINE_SLOTS=0 for literals without in-object slots,
      TSAOT_FRAME_COALESCE=0 for one frame slot per local,
      TSAOT_DIRECT_ENTRY=0 for the single generic entry per function,
+     TSAOT_TYPEOF_TEST=0 for string-compare typeof tests,
+     TSAOT_SWITCH_TABLE=0 for nested-if integer chains,
+     TSAOT_LAZY_FRAMES=0 for eagerly linked root frames,
+     TSAOT_LITERAL_LAYOUT=0 for per-property literal construction,
      TSAOT_TYPED_CELLS=0 / TSAOT_CAPTURE_CONTEXTS=0 for the legacy capture IR,
      TSAOT_NESTED_DIRECT=0 / TSAOT_LAZY_FN_DECL=0 for closure-value nested calls,
      TSAOT_GC_AGE_THRESHOLD=1 for immediate promotion at application runtime,

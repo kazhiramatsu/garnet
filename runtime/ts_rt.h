@@ -313,12 +313,19 @@ extern unsigned long long g_ts_pic_set_calls, g_ts_pic_set_hits;
 #define TS_RT_STAT_PIC_GET_CALL() (g_ts_pic_get_calls++)
 #define TS_RT_STAT_PIC_GET_HIT()  (g_ts_pic_get_hits++)
 #define TS_RT_STAT_SLOT(o, slot) ((slot) < (o)->h.inline_cap ? g_ts_slot_inline_hits++ : g_ts_slot_external_hits++)
+extern unsigned long long g_ts_pic_entry_hits[4], g_ts_pic_keyval_hits, g_ts_pic_ool_hits;
+#define TS_RT_STAT_PIC_ENTRY(i) (g_ts_pic_entry_hits[(i)]++)
+#define TS_RT_STAT_PIC_KEYVAL() (g_ts_pic_keyval_hits++)
+#define TS_RT_STAT_PIC_OOL() (g_ts_pic_ool_hits++)
 #define TS_RT_STAT_PIC_SET_CALL() (g_ts_pic_set_calls++)
 #define TS_RT_STAT_PIC_SET_HIT()  (g_ts_pic_set_hits++)
 #else
 #define TS_RT_STAT_PIC_GET_CALL() ((void)0)
 #define TS_RT_STAT_PIC_GET_HIT()  ((void)0)
 #define TS_RT_STAT_SLOT(o, slot) ((void)0)
+#define TS_RT_STAT_PIC_ENTRY(i) ((void)0)
+#define TS_RT_STAT_PIC_KEYVAL() ((void)0)
+#define TS_RT_STAT_PIC_OOL() ((void)0)
 #define TS_RT_STAT_PIC_SET_CALL() ((void)0)
 #define TS_RT_STAT_PIC_SET_HIT()  ((void)0)
 #endif
@@ -743,6 +750,16 @@ static inline int ts_truthy_fast(tsv v){
   return ts_truthy(v);   /* strings (and short strings): length test out of line */
 }
 static inline int ts_is_nullish_fast(tsv v){ return ts_is_null(v) || ts_is_undef(v); }
+/* `typeof x === "lit"` as a tag test (the emitter fuses the compare); each
+   predicate mirrors ts_typeof's classification order exactly. */
+int ts_is_symbol(tsv v);
+static inline int ts_typeof_is_number(tsv v){ return ts_is_num(v); }
+static inline int ts_typeof_is_string(tsv v){ return !ts_is_num(v) && ts_is_str(v); }
+static inline int ts_typeof_is_boolean(tsv v){ return !ts_is_num(v) && !ts_is_str(v) && ts_is_bool(v); }
+static inline int ts_typeof_is_undefined(tsv v){ return !ts_is_num(v) && !ts_is_str(v) && !ts_is_bool(v) && ts_is_undef(v); }
+static inline int ts_typeof_is_function(tsv v){ return !ts_is_num(v) && !ts_is_str(v) && !ts_is_bool(v) && !ts_is_undef(v) && ts_is_func(v); }
+static inline int ts_typeof_is_symbol(tsv v){ return !ts_is_num(v) && !ts_is_str(v) && !ts_is_bool(v) && !ts_is_undef(v) && !ts_is_func(v) && ts_is_symbol(v); }
+static inline int ts_typeof_is_object(tsv v){ return !ts_is_num(v) && !ts_is_str(v) && !ts_is_bool(v) && !ts_is_undef(v) && !ts_is_func(v) && !ts_is_symbol(v); }
 static inline int ts_is_undefined_fast(tsv v){ return ts_is_undef(v); }
 
 /* JS Map: parallel key/value arrays preserving insertion order, plus a side
@@ -1027,6 +1044,14 @@ tsv  ts_new_array(uint32_t len);    /* length-len sparse array (all slots holes)
 tsv  ts_new_uint16_array(tsv input);
 tsv  ts_new_array_pretenured(uint32_t len);
 tsv  ts_array_get(tsv arr, uint32_t i);
+/* Object literal / constructor layouts (docs/object_layout_design.md): the
+   static property sequence of a site, resolved to its shape at first use. */
+typedef struct ts_lit_layout { uint32_t shape; uint32_t n; const ts_key* keys; } ts_lit_layout;
+tsv ts_new_object_layout(ts_lit_layout* layout);
+tsv ts_new_object_layout_pretenured(ts_lit_layout* layout);
+/* Give a fresh empty object the layout in one step; 1 when its slots now
+   follow the layout (store by slot), 0 when the object was not empty. */
+int ts_obj_adopt_layout(tsv obj, ts_lit_layout* layout);
 void ts_array_set(tsv arr, uint32_t i, tsv v);
 void ts_array_push(tsv arr, tsv v);
 void ts_array_push_hole(tsv arr);
@@ -1471,6 +1496,7 @@ TS_RT_ALWAYS_INLINE tsv* ts_prop_ic_probe_fixed_inline(
     if (e->shape == o->shape){
       *flags = (uint8_t)(e->slot >> TS_PIC_FLAGS_SHIFT);
       TS_RT_STAT_SLOT(o, e->slot & TS_PIC_SLOT_MASK);
+      TS_RT_STAT_PIC_ENTRY(i);
       return ts_obj_slot_ptr(o, e->slot & TS_PIC_SLOT_MASK);
     }
   }
@@ -1488,6 +1514,7 @@ TS_RT_ALWAYS_INLINE tsv* ts_prop_ic_probe_fixed_inline(
     uint32_t slot = e->slot & TS_PIC_SLOT_MASK;
     if (e->shape != TS_SHAPE_NONE && slot < o->len && g_ts_shape_keys[sid][slot] == key){
       *flags = g_ts_shape_flags[sid][slot];
+      TS_RT_STAT_PIC_KEYVAL();
       return ts_obj_slot_ptr(o, slot);
     }
   }
@@ -1515,6 +1542,55 @@ TS_RT_ALWAYS_INLINE void ts_set_pic_inline(
     }
   }
   ts_set_pic(obj, key, value, ic);
+}
+/* Store property `i` of a layout object (shaped: value slot; dictionary
+   fallback: entry in insertion order). */
+static inline void ts_lit_store(tsv obj, uint32_t i, tsv v){
+  ts_object* o = (ts_object*)ts_ptr(obj);
+  if (ts_obj_shape_id(o) != TS_SHAPE_NONE) *ts_obj_slot_ptr(o, i) = v;
+  else o->props[i].val = v;
+  ts_write_barrier(obj, v);
+}
+/* Lazily linked root frames (docs/lazy_frames_design.md): a generated
+   function whose body cannot reach a collection except through these slow
+   paths keeps its root frame unlinked and links it only around them. The
+   frame's slots are fully initialized before any of these can run. */
+TS_RT_ALWAYS_INLINE tsv ts_get_pic_checked_inline_lazy(
+    tsv obj, ts_key key, ts_prop_ic* ic, ts_frame_hdr* frame, uint32_t nslots){
+  uint8_t flags = 0;
+  tsv* p = ts_prop_ic_probe_fixed_inline(obj, key, ic, &flags);
+  if (p && !(flags & TS_PROP_ACCESSOR)){
+    TS_RT_STAT_PIC_GET_CALL(); TS_RT_STAT_PIC_GET_HIT();
+    return *p;
+  }
+  ts_frame_push(frame, nslots);
+  tsv r = ts_get_pic_checked(obj, key, ic);
+  ts_frame_pop(frame);
+  return r;
+}
+TS_RT_ALWAYS_INLINE void ts_set_pic_inline_lazy(
+    tsv obj, ts_key key, tsv value, ts_prop_ic* ic, ts_frame_hdr* frame, uint32_t nslots){
+  uint8_t flags = 0;
+  tsv* p = ts_prop_ic_probe_fixed_inline(obj, key, ic, &flags);
+  if (p && !(flags & TS_PROP_ACCESSOR) && (flags & TS_PROP_WRITABLE)){
+    ts_object* o = (ts_object*)ts_ptr(obj);
+    if (!(ts_obj_integrity(o) & 1u)){
+      TS_RT_STAT_PIC_SET_CALL(); TS_RT_STAT_PIC_SET_HIT();
+      *p = value; ts_write_barrier(obj, value); return;
+    }
+  }
+  ts_frame_push(frame, nslots);
+  ts_set_pic(obj, key, value, ic);
+  ts_frame_pop(frame);
+}
+/* Element read: the array path allocates nothing; a string receiver builds a
+   one-character view, so it runs with the frame linked. */
+TS_RT_ALWAYS_INLINE tsv ts_array_get_lazy(tsv arr, uint32_t i, ts_frame_hdr* frame, uint32_t nslots){
+  if (ts_is_indexed_array_fast(arr)) return ts_array_get(arr, i);
+  ts_frame_push(frame, nslots);
+  tsv r = ts_array_get(arr, i);
+  ts_frame_pop(frame);
+  return r;
 }
 TS_RT_ALWAYS_INLINE tsv ts_get_dyn_pic_checked_inline(
     tsv obj, tsv key, ts_prop_ic* ic){

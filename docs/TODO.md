@@ -4440,6 +4440,89 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   3.1x, arrays of objects 3.05x, scanner-style string loop 2.6x; Map with
   string keys and method objects faster than V8. First finding:
   `ts_typeof` allocates a fresh string on every call.
+- Pattern slice 1: `typeof` tests and `switch` statements
+  (`docs/typeof_test_design.md`, `docs/switch_chain_design.md`). Splitting
+  the 15x kernel into one statement per kernel put `typeof v === "number"`
+  dispatch at **17.9x** slower than V8 and a 32-case `switch` at **6.0x**.
+  (1) `ts_typeof` allocated a fresh string per call; the seven results are
+  static cells hashed once at startup (17.9x → 5.5x). (2) The emitter fuses
+  `t = typeof x; c = "lit"; t === c` into a tag test (`ts_typeof_is_*`,
+  mirroring `ts_typeof`'s order) when the compare follows the `typeof` in
+  the same block with only constants between, and drops the temps when
+  the compare is their only use; the first version read the operand after
+  its frame slot had been reused for the literal (the compare extends the
+  operand's live range), so the frame layout now treats a fused compare as
+  a use of the operand (kernel 1376 → 84 ms, 1.06x of V8).
+  (3) The exporter lowers a fall-through-free `switch` as a direct
+  if/else-if chain inside the run-once loop (label groups tested lazily in
+  source order, default as the final else) instead of the `matched`/
+  `active` two-pass form; the IR kinds are unchanged, so parity holds.
+  (4) The emitter turns an if/else-if chain over one unboxed numeric local
+  and integer constants (at least four cases, no duplicates, compare temps
+  used only by the pattern) into a C `switch` with a guarded `int32_t`
+  discriminant, replaying the if/else path segments for loop-keyed plans
+  (kernel 829 → 448 ms with the later lazy frames; 6.0x → 3.25x).
+  Fixtures `statements/switch_chain` (fall-through, grouped labels, default
+  in the middle, lazy case expressions, break/continue, strings, mixed
+  types, duplicates, negative/large/non-integral/NaN/boxed discriminants,
+  hand-written chains) and `functions/branchy_inline` pass. Compiler A/B:
+  static typeof strings 8.397 → 8.387 s (noise), typeof fusion + switch
+  chain **8.426 → 8.257 s (2.0% less)**, switch tables 8.322 → 8.364 s
+  (noise level), outputs validated each time; `typeof` is not hot in the
+  compiler, the chain form is. Gates after each step: conformance 420/420,
+  parity 331 identical + 85 KNOWN, bundler 42/42, selfconf 405 + 11 KNOWN,
+  GC stress, inline policy, units.
+- Lazily linked root frames (roadmap track C item 2;
+  `docs/lazy_frames_design.md`). A function whose body cannot reach a
+  collection on its own — constants, copies, control flow, globals, lengths,
+  `typeof`/`!`/nullish tests, strict equality, arithmetic and comparisons on
+  unboxed numerics, and property reads, property writes and array element
+  reads — declares and fills its root frame but no longer links it: the
+  three slow paths that can allocate or run user code
+  (`ts_get_pic_checked_inline_lazy`, `ts_set_pic_inline_lazy`,
+  `ts_array_get_lazy`) push the frame around their out-of-line call. Calls,
+  builtins, allocations, try/catch, coercing operators on boxed operands,
+  rest parameters and JSON roots keep the eager link; a direct call to a
+  lazy callee is still a collection point for its caller (the callee's slow
+  path would root only its own locals). Fixture `gc/lazy_frame_getter` (a
+  getter reached through a lazy function's property-read slow path detaches
+  the object the function still holds and forces collections). Compiler
+  A/B against the switch-table build (alternating three runs, outputs
+  validated): **8.329 → 8.235 s (1.1% less)**; the small-calls kernel did
+  not move (its remaining cost is the inline-cache probes, see below).
+  `TSAOT_LAZY_FRAMES=0` links eagerly (parity oracle). Gates: conformance
+  421/421, parity 332 identical + 85 KNOWN, bundler 42/42, selfconf 405 +
+  11 KNOWN, GC stress (all phases), inline policy, units.
+- Direction set by Kaz (03:40): beyond pattern-by-pattern fixes, use the
+  static information an AOT compiler has (types, creation sites, known
+  callees), with matz's spinel (whole-program type inference, value-type
+  promotion of small classes, static inline short methods, symbol
+  interning, loop-invariant length hoisting) as a reference. The next
+  static-information slices: object literal and constructor layouts
+  (allocate in the final shape and store slots directly instead of one
+  cached addition per property — the compiler's `Node` constructor adds
+  ten properties through `ts_set_pic`, 29M additions per compile), and
+  callback specialization (clone a small helper per statically known
+  callback closure).
+- Object literal and constructor layouts (`docs/object_layout_design.md`;
+  the first static-information slice). A literal's property sequence and a
+  constructor's leading `this.x = ...` sequence are static, so the object
+  is allocated directly in its final shape (`ts_new_object_layout` resolves
+  a per-site static descriptor to a shape once by walking the transitions)
+  and the values are stored by slot (`ts_lit_store`); a constructor's fresh
+  `this` adopts the layout in place (`ts_obj_adopt_layout`, guarded: only
+  an empty shaped object with enough in-object slots, so `.call` on a
+  non-empty receiver keeps the generic stores). Between the stores of a
+  literal any instruction that does not mention the object is allowed (it
+  is unreachable until complete); between a constructor's stores nothing
+  that can run user code. Replaces the per-property out-of-line additions
+  (29M per compile, 9.8M of them transition-table walks) with one
+  allocation and `n` slot stores. Fixture `objects/literal_layout` (key
+  order and enumeration, side effects and a throw between stores, spread
+  after a prefix, literals in loops, `new`, `.call` on empty and non-empty
+  receivers, a 14-property constructor, deletion). `TSAOT_LITERAL_LAYOUT=0`
+  keeps the additions (parity oracle). Compiler A/B against the lazy-frame
+  build: **8.052 → 7.911 s median wall (1.8% less)**, outputs validated, peak RSS flat; the compiler is now 2.44x slower than V8 (Node 3.238 s). Gates: conformance 422/422, parity 333 identical + 85 KNOWN, bundler 42/42, selfconf 408 + 11 KNOWN, GC stress (all phases), inline policy (the three lazy-frame helpers added to its always-inline allowlist: the lazy-frame and layout gate runs had reported the policy failure inside the unit and GC-stress verdicts while every test passed — the chain summaries counted exit codes, not verdict text), units.
 - Next slices (`docs/v8_parity_roadmap.md`): C2 frame elision for
   functions that cannot reach a collection (562M frame pushes per compile),
   C3 lazy frame initialization, boxing a value-used nested declaration on

@@ -113,6 +113,7 @@ ts_frame_hdr* g_ts_frame_top = NULL;
 #ifdef TSAOT_RT_STATS
 unsigned long long g_ts_frame_push_count = 0;
 unsigned long long g_ts_pic_get_calls = 0, g_ts_pic_get_hits = 0;
+unsigned long long g_ts_pic_entry_hits[4] = {0,0,0,0}, g_ts_pic_keyval_hits = 0, g_ts_pic_ool_hits = 0;
 unsigned long long g_ts_slot_inline_hits = 0, g_ts_slot_external_hits = 0;
 unsigned long long g_ts_pic_set_calls = 0, g_ts_pic_set_hits = 0;
 #endif
@@ -229,6 +230,8 @@ __attribute__((destructor)) static void ts_rt_stats_dump(void){
           g_ts_pic_get_calls ? 100.0*(double)g_ts_pic_get_hits/(double)g_ts_pic_get_calls : 0.0,
           g_ts_pic_set_calls, g_ts_pic_set_hits,
           g_ts_pic_set_calls ? 100.0*(double)g_ts_pic_set_hits/(double)g_ts_pic_set_calls : 0.0);
+  fprintf(out, "[rt_stats] pic_paths: entry0=%llu entry1=%llu entry2=%llu entry3=%llu keyval=%llu ool_get=%llu\n",
+          g_ts_pic_entry_hits[0], g_ts_pic_entry_hits[1], g_ts_pic_entry_hits[2], g_ts_pic_entry_hits[3], g_ts_pic_keyval_hits, g_ts_pic_ool_hits);
   fprintf(out, "[rt_stats] inline_slots: shape-hit reads inline=%llu external=%llu (%.1f%% inline)\n",
           g_ts_slot_inline_hits, g_ts_slot_external_hits,
           (g_ts_slot_inline_hits + g_ts_slot_external_hits)
@@ -2997,15 +3000,39 @@ tsv ts_symbol_tostring(tsv sym){
   return r;
 }
 
+/* The seven `typeof` results are static string cells (hashed once at
+   startup by ts_typeof_strings_init), never fresh allocations: `typeof x ===
+   "string"` is one of the most frequent dispatch forms in compiler code. */
+#define TS_TYPEOF_STATIC(name, text, n) \
+  static struct { ts_gc_header h; uint32_t len, hash, flags; tsv parent; uint32_t offset; char data[n + 1]; } \
+    name = { { TS_KIND_STRING, 0, TS_GEN_NONHEAP, 0, 0, 0, 0, NULL }, n, 0u, \
+             TS_STR_FLAG_ASCII | TS_STR_FLAG_STATIC, TS_UNDEFINED, 0u, text };
+TS_TYPEOF_STATIC(g_typeof_number, "number", 6)
+TS_TYPEOF_STATIC(g_typeof_string, "string", 6)
+TS_TYPEOF_STATIC(g_typeof_boolean, "boolean", 7)
+TS_TYPEOF_STATIC(g_typeof_undefined, "undefined", 9)
+TS_TYPEOF_STATIC(g_typeof_function, "function", 8)
+TS_TYPEOF_STATIC(g_typeof_symbol, "symbol", 6)
+TS_TYPEOF_STATIC(g_typeof_object, "object", 6)
+#undef TS_TYPEOF_STATIC
+static void ts_typeof_strings_init(void){
+  ts_string* cells[7] = { (ts_string*)&g_typeof_number, (ts_string*)&g_typeof_string,
+    (ts_string*)&g_typeof_boolean, (ts_string*)&g_typeof_undefined, (ts_string*)&g_typeof_function,
+    (ts_string*)&g_typeof_symbol, (ts_string*)&g_typeof_object };
+  for (int i = 0; i < 7; i++){
+    cells[i]->hash = ts_str_hash_of(ts_str_v(cells[i]));
+    cells[i]->flags |= TS_STR_FLAG_HASHED;
+  }
+}
 tsv ts_typeof(tsv v){
   /* JS typeof. Note: typeof null === "object"; functions -> "function". */
-  if (ts_is_num(v))  return ts_new_string("number", 6);
-  if (ts_is_str(v))  return ts_new_string("string", 6);
-  if (ts_is_bool(v)) return ts_new_string("boolean", 7);
-  if (ts_is_undef(v))return ts_new_string("undefined", 9);
-  if (ts_is_func(v)) return ts_new_string("function", 8);
-  if (ts_is_symbol(v)) return ts_new_string("symbol", 6);
-  return ts_new_string("object", 6); /* objects, arrays, null */
+  if (ts_is_num(v))  return ts_str_v(&g_typeof_number);
+  if (ts_is_str(v))  return ts_str_v(&g_typeof_string);
+  if (ts_is_bool(v)) return ts_str_v(&g_typeof_boolean);
+  if (ts_is_undef(v))return ts_str_v(&g_typeof_undefined);
+  if (ts_is_func(v)) return ts_str_v(&g_typeof_function);
+  if (ts_is_symbol(v)) return ts_str_v(&g_typeof_symbol);
+  return ts_str_v(&g_typeof_object); /* objects, arrays, null */
 }
 /* The method key (METHOD_KEY_BASE + name-id) for "toString", learned from the
    emitted ts_setup_object_proto(). 0 = unset (pre-setup / no proto): fall back to
@@ -7384,6 +7411,7 @@ static inline int ts_key_is_enumerable_field(ts_key k){
 }
 
 void ts_init_fields(const char* const* names, const uint32_t* lens, uint32_t count){
+  ts_typeof_strings_init();
   g_field_cap = count < 16 ? 16 : count*2;
   g_field_names = malloc(sizeof(char*)*g_field_cap);
   g_field_lens = malloc(sizeof(uint32_t)*g_field_cap);
@@ -10848,6 +10876,7 @@ static tsv prop_ic_read(tsv receiver, ts_pref p){
   return ts_call(ac->getter, NULL, 0);
 }
 tsv ts_get_pic_checked(tsv obj, ts_key key, ts_prop_ic* ic){
+  TS_RT_STAT_PIC_OOL();
   if (ts_is_null(obj) || ts_is_undef(obj))
     return ts_throw_cannot_read(obj, ts_field_name(key));
   TS_RT_STAT_PIC_GET_CALL();
@@ -10945,6 +10974,49 @@ static void prop_add_fill(const ts_prop_ic* ic, ts_object* o, ts_key key, ts_pre
   e->site = ic; e->proto = o->proto;
   e->shape_before = shape_before; e->shape_after = o->shape;
   e->key = key; e->slot = len_before; e->epoch = g_prop_add_epoch;
+}
+/* Object literal / constructor layouts: resolve the site's shape once by
+   walking the transitions, then allocate directly in that shape. */
+static uint32_t lit_layout_shape(ts_lit_layout* L){
+  if (L->shape) return L->shape;
+  uint32_t sh = TS_SHAPE_EMPTY;
+  for (uint32_t i = 0; i < L->n && sh != TS_SHAPE_NONE; i++) sh = shape_transition(sh, L->keys[i]);
+  L->shape = sh != TS_SHAPE_NONE ? sh : UINT32_MAX;
+  return L->shape;
+}
+static tsv new_object_layout_impl(ts_lit_layout* L, int pretenured){
+  uint32_t sh = lit_layout_shape(L);
+  uint32_t n = L->n;
+  if (sh != UINT32_MAX && n <= TS_INLINE_SLOTS_MAX){
+    tsv obj = ts_new_object_impl(pretenured, n);
+    ts_object* o = (ts_object*)ts_ptr(obj);
+    tsv* slots = ts_obj_inline_vals(o);
+    for (uint32_t i = 0; i < n; i++) slots[i] = TS_UNDEFINED;
+    o->len = n;
+    ts_obj_set_shape(o, sh);
+    return obj;
+  }
+  /* shape table exhausted or an oversized literal: add the keys one by one */
+  tsv obj = ts_new_object_impl(pretenured, TS_INLINE_SLOTS_DEFAULT);
+  ts_gc_root(&obj);
+  for (uint32_t i = 0; i < n; i++) ts_set_named_prop(obj, (ts_object*)ts_ptr(obj), L->keys[i], TS_UNDEFINED, 0);
+  ts_gc_unroot(1);
+  return obj;
+}
+tsv ts_new_object_layout(ts_lit_layout* L){ return new_object_layout_impl(L, 0); }
+tsv ts_new_object_layout_pretenured(ts_lit_layout* L){ return new_object_layout_impl(L, 1); }
+int ts_obj_adopt_layout(tsv obj, ts_lit_layout* L){
+  if (TS_TOP16(obj) != TS_SEL_OBJECT) return 0;
+  ts_object* o = (ts_object*)ts_ptr(obj);
+  if (o->h.kind != TS_KIND_OBJECT || ts_obj_is_sized(o) || o->len != 0 || o->shape != TS_SHAPE_EMPTY) return 0;
+  uint32_t sh = lit_layout_shape(L);
+  uint32_t n = L->n;
+  if (sh == UINT32_MAX || n > o->h.inline_cap) return 0;
+  tsv* slots = ts_obj_inline_vals(o);
+  for (uint32_t i = 0; i < n; i++) slots[i] = TS_UNDEFINED;
+  o->len = n;
+  ts_obj_set_shape(o, sh);
+  return 1;
 }
 void ts_set_pic(tsv obj, ts_key key, tsv val, ts_prop_ic* ic){
   TS_RT_STAT_PIC_SET_CALL();

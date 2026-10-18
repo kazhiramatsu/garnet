@@ -1328,6 +1328,12 @@ struct Ctx<'a> {
     f64_fast: &'a BTreeMap<u32, F64FuncInfo>,
     /// Direct entry signatures of every eligible function (empty when disabled).
     direct_sigs: &'a BTreeMap<u32, DirectSig>,
+    typeof_fusion: TypeofFusion,
+    switch_plan: SwitchPlan,
+    layouts: LayoutPlan,
+    /// the root frame is linked only around slow paths (see lazy_frames_enabled)
+    lazy_frame: bool,
+    frame_nslots: usize,
     static_strings: &'a BTreeMap<Vec<u16>, usize>,
     string_metric_plan: Option<&'a FunctionMetricPlan>,
     string_materialization_plan: Option<&'a FunctionMaterializationPlan>,
@@ -1392,7 +1398,7 @@ impl<'a> Ctx<'a> {
         if self.nroot > 0 {
             parts.push(format!("ts_gc_unroot({});", self.nroot));
         }
-        if !self.frame_locals.is_empty() {
+        if !self.frame_locals.is_empty() && !self.lazy_frame {
             parts.push("ts_frame_pop(&F.h);".to_string());
         }
         parts.join(" ")
@@ -1698,6 +1704,9 @@ struct LiveWalk {
     first: BTreeMap<u32, (u32, Option<u32>)>, // (position, Some(def block) | None: never share)
     last: BTreeMap<u32, u32>,
     pending: Vec<(u32, usize)>,
+    /// fused `typeof x === "lit"` compares (dst, lhs, rhs) -> x: the compare
+    /// reads x, which must stay live (and keep its slot) until then.
+    fused: BTreeMap<(u32, u32, u32), u32>,
 }
 
 impl LiveWalk {
@@ -1821,6 +1830,11 @@ impl LiveWalk {
                     self.stack.pop();
                 }
                 leaf => {
+                    if let Inst::BinOp { dst, lhs, rhs, .. } = leaf {
+                        if let Some(&x) = self.fused.get(&(dst.0, lhs.0, rhs.0)) {
+                            self.note_use(x, p);
+                        }
+                    }
                     let refs = inst_refs(leaf);
                     let def = inst_def(leaf);
                     for &r in &refs {
@@ -1841,7 +1855,7 @@ impl LiveWalk {
     }
 }
 
-fn compute_frame_layout(f: &Function, reflike: &[u32]) -> FrameLayout {
+fn compute_frame_layout(f: &Function, reflike: &[u32], fusion: &TypeofFusion) -> FrameLayout {
     let mut w = LiveWalk {
         pos: 1,
         parent: vec![0],
@@ -1851,6 +1865,7 @@ fn compute_frame_layout(f: &Function, reflike: &[u32]) -> FrameLayout {
         first: BTreeMap::new(),
         last: BTreeMap::new(),
         pending: Vec::new(),
+        fused: fusion.fused.iter().map(|(k, (x, _, _))| (*k, *x)).collect(),
     };
     for prm in &f.params {
         w.first.insert(prm.0, (0, Some(0)));
@@ -2037,6 +2052,704 @@ fn own_capture_count(f: &Function) -> usize {
     } else {
         0
     }
+}
+
+/* `typeof x === "lit"` fusion (docs/typeof_test_design.md). The exporter lowers
+   the test to `t = typeof x; c = "lit"; d = (t === c)`; the runtime's typeof
+   builds a string and the compare walks it. When `t` is defined once, the
+   compare follows it in the same block with only constants between (so `x`
+   cannot change), and `c` is a string constant, the compare becomes a tag
+   test on `x`, and temps used nowhere else are not materialized at all.
+   TSAOT_TYPEOF_TEST=0 keeps the generic form (the parity oracle). */
+fn typeof_test_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_TYPEOF_TEST").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
+#[derive(Default)]
+struct TypeofFusion {
+    /// (compare dst, lhs, rhs) -> (typeof operand, literal, negated)
+    fused: BTreeMap<(u32, u32, u32), (u32, String, bool)>,
+    /// temps whose only use is a fused compare: not emitted
+    skip: BTreeSet<u32>,
+}
+
+fn typeof_fusion_plan(f: &Function) -> TypeofFusion {
+    let mut plan = TypeofFusion::default();
+    if !typeof_test_enabled() {
+        return plan;
+    }
+    let mut flat: Vec<&Inst> = Vec::new();
+    flatten_inst(&f.body, &mut flat);
+    let mut defs: BTreeMap<u32, u32> = BTreeMap::new();
+    for inst in &flat {
+        if let Some(d) = inst_def(inst) {
+            *defs.entry(d).or_insert(0) += 1;
+        }
+    }
+    let mut str_const: BTreeMap<u32, String> = BTreeMap::new();
+    let mut typeof_temps: BTreeSet<u32> = BTreeSet::new();
+    for inst in &flat {
+        match inst {
+            Inst::Const {
+                dst,
+                value: ConstVal::Str { value },
+            } if defs.get(&dst.0) == Some(&1) => {
+                str_const.insert(dst.0, value.clone());
+            }
+            Inst::UnOp { dst, op, .. } if op == "typeof" && defs.get(&dst.0) == Some(&1) => {
+                typeof_temps.insert(dst.0);
+            }
+            _ => {}
+        }
+    }
+    if typeof_temps.is_empty() || str_const.is_empty() {
+        return plan;
+    }
+    // Instructions using each candidate temp (a temp used by exactly one
+    // instruction, the fused compare, is never materialized).
+    let cands: BTreeSet<u32> = typeof_temps.iter().chain(str_const.keys()).copied().collect();
+    let mut uses: BTreeMap<u32, u32> = BTreeMap::new();
+    for inst in &flat {
+        match inst {
+            // containers: only their condition is a read here (bodies are
+            // flattened separately)
+            Inst::If { cond, .. } | Inst::Loop { cond, .. } => {
+                if cands.contains(&cond.0) {
+                    *uses.entry(cond.0).or_insert(0) += 1;
+                }
+            }
+            Inst::TryCatch { .. } => {}
+            leaf => {
+                let def = inst_def(leaf);
+                let mut seen: BTreeSet<u32> = BTreeSet::new();
+                for r in inst_refs(leaf) {
+                    if Some(r) != def && cands.contains(&r) && seen.insert(r) {
+                        *uses.entry(r).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+    }
+    fn scan(
+        insts: &[Inst],
+        typeof_temps: &BTreeSet<u32>,
+        str_const: &BTreeMap<u32, String>,
+        uses: &BTreeMap<u32, u32>,
+        plan: &mut TypeofFusion,
+        dup: &mut BTreeSet<(u32, u32, u32)>,
+    ) {
+        for (i, inst) in insts.iter().enumerate() {
+            match inst {
+                Inst::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    scan(then_body, typeof_temps, str_const, uses, plan, dup);
+                    scan(else_body, typeof_temps, str_const, uses, plan, dup);
+                }
+                Inst::Loop {
+                    cond_body, body, ..
+                } => {
+                    scan(cond_body, typeof_temps, str_const, uses, plan, dup);
+                    scan(body, typeof_temps, str_const, uses, plan, dup);
+                }
+                Inst::TryCatch {
+                    try_body,
+                    catch_body,
+                    finally_body,
+                    ..
+                } => {
+                    scan(try_body, typeof_temps, str_const, uses, plan, dup);
+                    scan(catch_body, typeof_temps, str_const, uses, plan, dup);
+                    scan(finally_body, typeof_temps, str_const, uses, plan, dup);
+                }
+                Inst::UnOp { dst, op, operand } if op == "typeof" && typeof_temps.contains(&dst.0) => {
+                    let t = dst.0;
+                    let x = operand.0;
+                    let mut j = i + 1;
+                    while j < insts.len() {
+                        match &insts[j] {
+                            Inst::Const { dst: cd, .. } if cd.0 != x && cd.0 != t => j += 1,
+                            _ => break,
+                        }
+                    }
+                    if j >= insts.len() {
+                        continue;
+                    }
+                    if let Inst::BinOp { dst: d, op, lhs, rhs } = &insts[j] {
+                        if op != "===" && op != "!==" {
+                            continue;
+                        }
+                        let c = if lhs.0 == t && str_const.contains_key(&rhs.0) {
+                            rhs.0
+                        } else if rhs.0 == t && str_const.contains_key(&lhs.0) {
+                            lhs.0
+                        } else {
+                            continue;
+                        };
+                        let key = (d.0, lhs.0, rhs.0);
+                        if dup.contains(&key) {
+                            plan.fused.remove(&key);
+                            plan.skip.remove(&t);
+                            plan.skip.remove(&c);
+                            continue;
+                        }
+                        dup.insert(key);
+                        plan.fused.insert(key, (x, str_const[&c].clone(), op == "!=="));
+                        if uses.get(&t) == Some(&1) {
+                            plan.skip.insert(t);
+                        }
+                        if uses.get(&c) == Some(&1) {
+                            plan.skip.insert(c);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut dup = BTreeSet::new();
+    scan(&f.body, &typeof_temps, &str_const, &uses, &mut plan, &mut dup);
+    plan
+}
+
+/// The tag test for `typeof x === lit` (mirrors ts_typeof's order).
+fn typeof_test_expr(lit: &str, x: &str) -> String {
+    match lit {
+        "number" => format!("ts_typeof_is_number({})", x),
+        "string" => format!("ts_typeof_is_string({})", x),
+        "boolean" => format!("ts_typeof_is_boolean({})", x),
+        "undefined" => format!("ts_typeof_is_undefined({})", x),
+        "function" => format!("ts_typeof_is_function({})", x),
+        "symbol" => format!("ts_typeof_is_symbol({})", x),
+        "object" => format!("ts_typeof_is_object({})", x),
+        _ => "0".to_string(),
+    }
+}
+
+/* Chain-to-switch (docs/switch_chain_design.md). An if/else-if chain that
+   tests one unboxed numeric local against integer constants — the exporter's
+   lowering of a fall-through-free `switch`, or a hand-written chain — is
+   emitted as a C `switch` so the C compiler builds a jump table or a binary
+   search instead of a linear compare chain. The chain's own compare temps
+   are left to dead-code elimination. TSAOT_SWITCH_TABLE=0 keeps the nested
+   ifs (the parity oracle). */
+fn switch_table_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_SWITCH_TABLE").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
+const SWITCH_TABLE_MIN_CASES: usize = 4;
+
+struct SwitchCase {
+    values: Vec<i64>,
+    body: Vec<Inst>,
+    /// else-body indices from the head `If` down to this case's `If`
+    path: Vec<usize>,
+}
+
+struct SwitchChain {
+    disc: u32,
+    cases: Vec<SwitchCase>,
+    default_body: Vec<Inst>,
+    default_path: Vec<usize>,
+}
+
+#[derive(Default)]
+struct SwitchPlan {
+    /// head `If` instruction (by address) -> chain
+    heads: BTreeMap<usize, SwitchChain>,
+}
+
+fn switch_const_i32(value: f64) -> Option<i64> {
+    if value.fract() != 0.0 || value < -2147483648.0 || value > 2147483647.0 {
+        return None;
+    }
+    // -0 is === 0 in JS; the C case is 0 either way
+    Some(value as i64)
+}
+
+/// One chain segment at `block[i..]`: `Const c; BinOp eq = (disc === c);
+/// (UnOp miss = !eq; If miss { Const ck; BinOp eqk = (disc === ck); Copy eq = eqk })*;
+/// If eq {..} else {..}`. Returns (values, index of the If) when the temps are
+/// used only by the pattern.
+fn match_switch_segment(
+    block: &[Inst],
+    i: usize,
+    disc: Option<u32>,
+    numeric: &BTreeSet<u32>,
+    defs: &BTreeMap<u32, u32>,
+    uses: &BTreeMap<u32, u32>,
+) -> Option<(u32, Vec<i64>, usize)> {
+    let single = |id: u32, n_uses: u32| defs.get(&id) == Some(&1) && uses.get(&id) == Some(&n_uses);
+    let (c0, v0) = match block.get(i)? {
+        Inst::Const {
+            dst,
+            value: ConstVal::Num { value },
+        } => (dst.0, switch_const_i32(*value)?),
+        _ => return None,
+    };
+    let (eq, d) = match block.get(i + 1)? {
+        Inst::BinOp { dst, op, lhs, rhs } if op == "===" && rhs.0 == c0 => (dst.0, lhs.0),
+        _ => return None,
+    };
+    if let Some(want) = disc {
+        if d != want {
+            return None;
+        }
+    }
+    if !numeric.contains(&d) || !single(c0, 1) || d == c0 || d == eq {
+        return None;
+    }
+    let mut values = vec![v0];
+    let mut j = i + 2;
+    let mut eq_defs = 1u32;
+    loop {
+        let miss = match block.get(j) {
+            Some(Inst::UnOp { dst, op, operand }) if op == "!" && operand.0 == eq => dst.0,
+            _ => break,
+        };
+        let (then_body, else_body) = match block.get(j + 1) {
+            Some(Inst::If {
+                cond,
+                then_body,
+                else_body,
+            }) if cond.0 == miss => (then_body, else_body),
+            _ => break,
+        };
+        if !else_body.is_empty() || then_body.len() != 3 || !single(miss, 1) {
+            return None;
+        }
+        let (ck, vk) = match &then_body[0] {
+            Inst::Const {
+                dst,
+                value: ConstVal::Num { value },
+            } => (dst.0, switch_const_i32(*value)?),
+            _ => return None,
+        };
+        let eqk = match &then_body[1] {
+            Inst::BinOp { dst, op, lhs, rhs } if op == "===" && lhs.0 == d && rhs.0 == ck => dst.0,
+            _ => return None,
+        };
+        match &then_body[2] {
+            Inst::Copy { dst, src } if dst.0 == eq && src.0 == eqk => {}
+            _ => return None,
+        }
+        if !single(ck, 1) || !single(eqk, 1) {
+            return None;
+        }
+        values.push(vk);
+        eq_defs += 1;
+        j += 2;
+    }
+    match block.get(j) {
+        Some(Inst::If { cond, .. }) if cond.0 == eq => {}
+        _ => return None,
+    }
+    // eq: one BinOp definition plus one Copy per extra label; read by each
+    // `!eq` and by the final If.
+    if defs.get(&eq) != Some(&eq_defs) || uses.get(&eq) != Some(&(values.len() as u32)) {
+        return None;
+    }
+    Some((d, values, j))
+}
+
+fn switch_plan_for(f: &Function, unboxed: &BTreeSet<u32>, int_local: &BTreeSet<u32>) -> SwitchPlan {
+    let mut plan = SwitchPlan::default();
+    if !switch_table_enabled() {
+        return plan;
+    }
+    let numeric: BTreeSet<u32> = unboxed.union(int_local).copied().collect();
+    if numeric.is_empty() {
+        return plan;
+    }
+    let mut flat: Vec<&Inst> = Vec::new();
+    flatten_inst(&f.body, &mut flat);
+    let mut defs: BTreeMap<u32, u32> = BTreeMap::new();
+    let mut uses: BTreeMap<u32, u32> = BTreeMap::new();
+    for inst in &flat {
+        match inst {
+            Inst::If { cond, .. } | Inst::Loop { cond, .. } => {
+                *uses.entry(cond.0).or_insert(0) += 1;
+            }
+            Inst::TryCatch { .. } => {}
+            leaf => {
+                let def = inst_def(leaf);
+                if let Some(d) = def {
+                    *defs.entry(d).or_insert(0) += 1;
+                }
+                let mut seen: BTreeSet<u32> = BTreeSet::new();
+                for r in inst_refs(leaf) {
+                    if Some(r) != def && seen.insert(r) {
+                        *uses.entry(r).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+    }
+    fn walk(
+        block: &[Inst],
+        numeric: &BTreeSet<u32>,
+        defs: &BTreeMap<u32, u32>,
+        uses: &BTreeMap<u32, u32>,
+        plan: &mut SwitchPlan,
+    ) {
+        let mut i = 0;
+        while i < block.len() {
+            // nested blocks first (a case body may hold its own chain)
+            match &block[i] {
+                Inst::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    walk(then_body, numeric, defs, uses, plan);
+                    walk(else_body, numeric, defs, uses, plan);
+                }
+                Inst::Loop {
+                    cond_body, body, ..
+                } => {
+                    walk(cond_body, numeric, defs, uses, plan);
+                    walk(body, numeric, defs, uses, plan);
+                }
+                Inst::TryCatch {
+                    try_body,
+                    catch_body,
+                    finally_body,
+                    ..
+                } => {
+                    walk(try_body, numeric, defs, uses, plan);
+                    walk(catch_body, numeric, defs, uses, plan);
+                    walk(finally_body, numeric, defs, uses, plan);
+                }
+                _ => {}
+            }
+            if let Some((disc, values, head_ix)) =
+                match_switch_segment(block, i, None, numeric, defs, uses)
+            {
+                let mut cases: Vec<SwitchCase> = Vec::new();
+                let mut seen: BTreeSet<i64> = BTreeSet::new();
+                let mut ok = true;
+                let mut path: Vec<usize> = Vec::new();
+                let mut cur_values = values;
+                let mut cur_if = &block[head_ix];
+                let (default_body, default_path);
+                loop {
+                    let (then_body, else_body) = match cur_if {
+                        Inst::If {
+                            then_body,
+                            else_body,
+                            ..
+                        } => (then_body, else_body),
+                        _ => unreachable!(),
+                    };
+                    for v in &cur_values {
+                        if !seen.insert(*v) {
+                            ok = false;
+                        }
+                    }
+                    cases.push(SwitchCase {
+                        values: std::mem::take(&mut cur_values),
+                        body: then_body.clone(),
+                        path: path.clone(),
+                    });
+                    // a pure chain segment as the whole else-body continues the chain
+                    match match_switch_segment(else_body, 0, Some(disc), numeric, defs, uses) {
+                        Some((_, vals, ix)) if ix + 1 == else_body.len() => {
+                            path.push(ix);
+                            cur_values = vals;
+                            cur_if = &else_body[ix];
+                        }
+                        _ => {
+                            default_body = else_body.clone();
+                            default_path = path.clone();
+                            break;
+                        }
+                    }
+                }
+                if ok && cases.len() >= SWITCH_TABLE_MIN_CASES {
+                    plan.heads.insert(
+                        &block[head_ix] as *const Inst as usize,
+                        SwitchChain {
+                            disc,
+                            cases,
+                            default_body,
+                            default_path,
+                        },
+                    );
+                }
+                i = head_ix + 1;
+                continue;
+            }
+            i += 1;
+        }
+    }
+    walk(&f.body, &numeric, &defs, &uses, &mut plan);
+    plan
+}
+
+fn emit_switch_chain(s: &mut String, chain: &SwitchChain, ctx: &Ctx) {
+    let l = ctx.fresh_label();
+    let is_int = ctx.int_local.contains(&chain.disc);
+    if is_int {
+        let _ = writeln!(s, "  switch (d{}) {{", chain.disc);
+    } else {
+        let _ = writeln!(
+            s,
+            "  {{ double _sw{} = {}; if (_sw{} >= -2147483648.0 && _sw{} <= 2147483647.0 && (double)(int32_t)_sw{} == _sw{}) switch ((int32_t)_sw{}) {{",
+            l, ctx.num(chain.disc), l, l, l, l, l
+        );
+    }
+    let push_path = |ctx: &Ctx, path: &[usize]| {
+        for &ix in path {
+            ctx.emit_path.borrow_mut().push(PathSegment {
+                edge: PathEdge::IfElse,
+                index: ix,
+            });
+        }
+    };
+    let pop_path = |ctx: &Ctx, path: &[usize]| {
+        for _ in path {
+            ctx.emit_path.borrow_mut().pop();
+        }
+    };
+    for case in &chain.cases {
+        for v in &case.values {
+            let _ = writeln!(s, "  case {}:", v);
+        }
+        s.push_str("  {\n");
+        push_path(ctx, &case.path);
+        emit_seq(s, &case.body, ctx, PathEdge::IfThen);
+        pop_path(ctx, &case.path);
+        s.push_str("  break; }\n");
+    }
+    let _ = writeln!(s, "  default: L{}_sw: ;", l);
+    s.push_str("  {\n");
+    push_path(ctx, &chain.default_path);
+    emit_seq(s, &chain.default_body, ctx, PathEdge::IfElse);
+    pop_path(ctx, &chain.default_path);
+    s.push_str("  break; }\n");
+    if is_int {
+        s.push_str("  }\n");
+    } else {
+        let _ = writeln!(s, "  }} else goto L{}_sw; }}", l);
+    }
+}
+
+/* Lazily linked root frames (docs/lazy_frames_design.md). A function whose
+   body cannot reach a collection — no allocation, call, builtin, try/catch
+   or coercing operator; only numeric arithmetic, strict equality, control
+   flow, and property and element accesses whose slow paths are the only way
+   into the runtime — declares and fills its root frame as before but does not
+   link it: the inline-cache and element-read slow paths link it around their
+   out-of-line call, the one place a collection or user code can start.
+   TSAOT_LAZY_FRAMES=0 links every frame eagerly (the parity oracle). */
+fn lazy_frames_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_LAZY_FRAMES").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
+/// Every instruction of `body` is one the emitter turns into collection-free
+/// C given the numeric (unboxed) locals, or a property/element access whose
+/// slow path is wrapped when the frame is lazy.
+fn body_is_gc_free(body: &[Inst], numeric: &BTreeSet<u32>) -> bool {
+    body.iter().all(|inst| match inst {
+        Inst::Const { .. }
+        | Inst::Copy { .. }
+        | Inst::Return { .. }
+        | Inst::Break { .. }
+        | Inst::Continue { .. }
+        | Inst::LoadGlobal { .. }
+        | Inst::StoreGlobal { .. }
+        | Inst::ArrayLen { .. }
+        | Inst::StringLen { .. } => true,
+        // wrapped lazily at the slow path
+        Inst::LoadField { .. } | Inst::StoreField { .. } | Inst::LoadIndex { .. } => true,
+        Inst::UnOp { op, operand, .. } => match op.as_str() {
+            "!" | "typeof" | "nullish" | "isundef" => true,
+            _ => numeric.contains(&operand.0),
+        },
+        Inst::BinOp { op, lhs, rhs, .. } => match op.as_str() {
+            "===" | "!==" => true,
+            _ => numeric.contains(&lhs.0) && numeric.contains(&rhs.0),
+        },
+        Inst::If {
+            then_body,
+            else_body,
+            ..
+        } => body_is_gc_free(then_body, numeric) && body_is_gc_free(else_body, numeric),
+        Inst::Loop {
+            cond_body, body, ..
+        } => body_is_gc_free(cond_body, numeric) && body_is_gc_free(body, numeric),
+        _ => false,
+    })
+}
+
+/* Object literal and constructor layouts (docs/object_layout_design.md).
+   An object literal is a fresh object followed by one store per property;
+   a constructor function stores its properties into a fresh `this`. The
+   property sequence is static, so the object is allocated directly in its
+   final shape (one transition walk per site at first use) and the values
+   are stored by slot, instead of one cached shape transition per property.
+   TSAOT_LITERAL_LAYOUT=0 keeps the per-property additions (parity oracle). */
+fn literal_layout_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_LITERAL_LAYOUT").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
+#[derive(Default)]
+struct LayoutPlan {
+    /// AllocObject (by address) -> property keys in store order
+    alloc: BTreeMap<usize, Vec<u32>>,
+    /// StoreField (by address) -> (slot, true when guarded by the constructor adopt test)
+    store: BTreeMap<usize, (u32, bool)>,
+    /// first StoreField of a constructor's `this` sequence -> keys
+    ctor_first: BTreeMap<usize, Vec<u32>>,
+}
+
+/// Stores into `obj` that follow `start` in `block` before anything else
+/// touches `obj`: (keys, store addresses). Intervening instructions may not
+/// mention `obj`; when `strict`, they may also not run user code.
+fn collect_layout_stores(block: &[Inst], start: usize, obj: u32, strict: bool) -> (Vec<u32>, Vec<usize>) {
+    let mut keys: Vec<u32> = Vec::new();
+    let mut addrs: Vec<usize> = Vec::new();
+    for inst in &block[start..] {
+        match inst {
+            Inst::StoreField { obj: o, field, src } if o.0 == obj => {
+                if src.0 == obj || keys.contains(&field.0) || keys.len() >= 255 {
+                    break;
+                }
+                keys.push(field.0);
+                addrs.push(inst as *const Inst as usize);
+            }
+            Inst::If { .. } | Inst::Loop { .. } | Inst::TryCatch { .. } => break,
+            other => {
+                if inst_def(other) == Some(obj) || inst_refs(other).contains(&obj) {
+                    break;
+                }
+                if strict
+                    && matches!(
+                        other,
+                        Inst::Call { .. }
+                            | Inst::CallSpread { .. }
+                            | Inst::CallBuiltin { .. }
+                            | Inst::CallBuiltinStatic { .. }
+                            | Inst::NewDynamic { .. }
+                            | Inst::Throw { .. }
+                            | Inst::Yield { .. }
+                            | Inst::Await { .. }
+                            | Inst::Print { .. }
+                    )
+                {
+                    break;
+                }
+            }
+        }
+    }
+    (keys, addrs)
+}
+
+fn layout_plan_for(f: &Function) -> LayoutPlan {
+    let mut plan = LayoutPlan::default();
+    if !literal_layout_enabled() || !prop_pic_enabled() || f.is_async || f.is_generator {
+        return plan;
+    }
+    fn walk(block: &[Inst], plan: &mut LayoutPlan) {
+        for (i, inst) in block.iter().enumerate() {
+            match inst {
+                Inst::AllocObject {
+                    dst,
+                    class_id: None,
+                    proto: None,
+                    ..
+                } => {
+                    let (keys, addrs) = collect_layout_stores(block, i + 1, dst.0, false);
+                    if !keys.is_empty() {
+                        for (slot, a) in addrs.iter().enumerate() {
+                            plan.store.insert(*a, (slot as u32, false));
+                        }
+                        plan.alloc.insert(inst as *const Inst as usize, keys);
+                    }
+                }
+                Inst::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    walk(then_body, plan);
+                    walk(else_body, plan);
+                }
+                Inst::Loop {
+                    cond_body, body, ..
+                } => {
+                    walk(cond_body, plan);
+                    walk(body, plan);
+                }
+                Inst::TryCatch {
+                    try_body,
+                    catch_body,
+                    finally_body,
+                    ..
+                } => {
+                    walk(try_body, plan);
+                    walk(catch_body, plan);
+                    walk(finally_body, plan);
+                }
+                _ => {}
+            }
+        }
+    }
+    walk(&f.body, &mut plan);
+    // A constructor-style body: leading stores into `this` (param 0) before
+    // anything else can observe it.
+    if f.takes_this {
+        if let Some(this) = f.params.first() {
+            let (keys, addrs) = collect_layout_stores(&f.body, 0, this.0, true);
+            if keys.len() >= 2 {
+                for (slot, a) in addrs.iter().enumerate() {
+                    plan.store.insert(*a, (slot as u32, true));
+                }
+                plan.ctor_first.insert(addrs[0], keys);
+            }
+        }
+    }
+    plan
+}
+
+fn emit_layout_decl(s: &mut String, id: u32, keys: &[u32]) {
+    let ks: Vec<String> = keys.iter().map(|k| format!("{}u", k)).collect();
+    let _ = writeln!(
+        s,
+        "  static const ts_key _ts_lk_{}[{}] = {{{}}}; static ts_lit_layout _ts_lit_{} = {{0u, {}u, _ts_lk_{}}};",
+        id,
+        keys.len(),
+        ks.join(", "),
+        id,
+        keys.len(),
+        id
+    );
 }
 
 /* Direct-call entry points (docs/direct_entry_design.md). Every eligible
@@ -5585,8 +6298,9 @@ fn emit_i64_function(
     } else {
         BTreeSet::new()
     };
+    let typeof_fusion = typeof_fusion_plan(f);
     let frame_layout = if use_frame_roots && frame_coalesce_enabled() {
-        Some(compute_frame_layout(f, &reflike))
+        Some(compute_frame_layout(f, &reflike, &typeof_fusion))
     } else {
         None
     };
@@ -5606,8 +6320,21 @@ fn emit_i64_function(
     for (i, p) in info.params.iter().enumerate() {
         let _ = writeln!(s, "  d{} = _p{};", p, i);
     }
-    if use_frame_roots {
+    let frame_nslots: usize = if use_frame_roots {
+        frame_slot_count(&reflike, frame_layout.as_ref())
+    } else {
+        0
+    };
+    let lazy_frame = use_frame_roots
+        && lazy_frames_enabled()
+        && prop_pic_enabled()
+        && f.rest_param.is_none()
+        // numeric clones carry no JSON roots
+        && body_is_gc_free(&f.body, &unboxed.union(&int_local).copied().collect());
+    if use_frame_roots && !lazy_frame {
         let _ = writeln!(s, "  ts_frame_push(&F.h, {});", frame_slot_count(&reflike, frame_layout.as_ref()));
+    } else if use_frame_roots {
+        // lazy: the frame is declared and filled but linked only around slow paths
     } else {
         for id in &reflike {
             let _ = writeln!(s, "  ts_gc_root(&v{});", id);
@@ -5618,6 +6345,10 @@ fn emit_i64_function(
     let json_locals: BTreeSet<u32> = BTreeSet::new();
     let json_roots: BTreeSet<u32> = BTreeSet::new();
     let ctx = Ctx {
+        switch_plan: switch_plan_for(f, &unboxed, &int_local),
+        layouts: layout_plan_for(f),
+        lazy_frame,
+        frame_nslots,
         unboxed,
         int_local,
         local_class,
@@ -5630,6 +6361,7 @@ fn emit_i64_function(
         i64_fast,
         f64_fast,
         direct_sigs,
+        typeof_fusion,
         static_strings,
         string_metric_plan,
         string_materialization_plan,
@@ -5730,8 +6462,9 @@ fn emit_f64_function(
     } else {
         BTreeSet::new()
     };
+    let typeof_fusion = typeof_fusion_plan(f);
     let frame_layout = if use_frame_roots && frame_coalesce_enabled() {
-        Some(compute_frame_layout(f, &reflike))
+        Some(compute_frame_layout(f, &reflike, &typeof_fusion))
     } else {
         None
     };
@@ -5751,8 +6484,21 @@ fn emit_f64_function(
     for (i, p) in info.params.iter().enumerate() {
         let _ = writeln!(s, "  d{} = _p{};", p, i);
     }
-    if use_frame_roots {
+    let frame_nslots: usize = if use_frame_roots {
+        frame_slot_count(&reflike, frame_layout.as_ref())
+    } else {
+        0
+    };
+    let lazy_frame = use_frame_roots
+        && lazy_frames_enabled()
+        && prop_pic_enabled()
+        && f.rest_param.is_none()
+        // numeric clones carry no JSON roots
+        && body_is_gc_free(&f.body, &unboxed.union(&int_local).copied().collect());
+    if use_frame_roots && !lazy_frame {
         let _ = writeln!(s, "  ts_frame_push(&F.h, {});", frame_slot_count(&reflike, frame_layout.as_ref()));
+    } else if use_frame_roots {
+        // lazy: the frame is declared and filled but linked only around slow paths
     } else {
         for id in &reflike {
             let _ = writeln!(s, "  ts_gc_root(&v{});", id);
@@ -5763,6 +6509,10 @@ fn emit_f64_function(
     let json_locals: BTreeSet<u32> = BTreeSet::new();
     let json_roots: BTreeSet<u32> = BTreeSet::new();
     let ctx = Ctx {
+        switch_plan: switch_plan_for(f, &unboxed, &int_local),
+        layouts: layout_plan_for(f),
+        lazy_frame,
+        frame_nslots,
         unboxed,
         int_local,
         local_class,
@@ -5775,6 +6525,7 @@ fn emit_f64_function(
         i64_fast,
         f64_fast,
         direct_sigs,
+        typeof_fusion,
         static_strings,
         string_metric_plan,
         string_materialization_plan,
@@ -5859,6 +6610,10 @@ fn emit_function(
         let json_locals: BTreeSet<u32> = BTreeSet::new();
         let json_roots: BTreeSet<u32> = BTreeSet::new();
         let ctx = Ctx {
+            switch_plan: SwitchPlan::default(),
+            layouts: LayoutPlan::default(),
+            lazy_frame: false,
+            frame_nslots: 0,
             unboxed,
             int_local,
             local_class,
@@ -5871,6 +6626,7 @@ fn emit_function(
             i64_fast,
             f64_fast,
             direct_sigs,
+            typeof_fusion: typeof_fusion_plan(f),
             static_strings,
             string_metric_plan: None,
             string_materialization_plan: None,
@@ -5903,6 +6659,10 @@ fn emit_function(
         let json_locals: BTreeSet<u32> = BTreeSet::new();
         let json_roots: BTreeSet<u32> = BTreeSet::new();
         let ctx = Ctx {
+            switch_plan: SwitchPlan::default(),
+            layouts: LayoutPlan::default(),
+            lazy_frame: false,
+            frame_nslots: 0,
             unboxed,
             int_local,
             local_class,
@@ -5915,6 +6675,7 @@ fn emit_function(
             i64_fast,
             f64_fast,
             direct_sigs,
+            typeof_fusion: typeof_fusion_plan(f),
             static_strings,
             string_metric_plan: None,
             string_materialization_plan: None,
@@ -5947,6 +6708,10 @@ fn emit_function(
         let json_locals: BTreeSet<u32> = BTreeSet::new();
         let json_roots: BTreeSet<u32> = BTreeSet::new();
         let ctx = Ctx {
+            switch_plan: SwitchPlan::default(),
+            layouts: LayoutPlan::default(),
+            lazy_frame: false,
+            frame_nslots: 0,
             unboxed,
             int_local,
             local_class,
@@ -5959,6 +6724,7 @@ fn emit_function(
             i64_fast,
             f64_fast,
             direct_sigs,
+            typeof_fusion: typeof_fusion_plan(f),
             static_strings,
             string_metric_plan: None,
             string_materialization_plan: None,
@@ -6006,8 +6772,9 @@ fn emit_function(
     } else {
         BTreeSet::new()
     };
+    let typeof_fusion = typeof_fusion_plan(f);
     let frame_layout = if use_frame_roots && frame_coalesce_enabled() {
-        Some(compute_frame_layout(f, &reflike))
+        Some(compute_frame_layout(f, &reflike, &typeof_fusion))
     } else {
         None
     };
@@ -6098,8 +6865,21 @@ fn emit_function(
             let _ = writeln!(s, "  if (nargs > {}) {} = args[{}];", j, name, j);
         }
     }
-    if use_frame_roots {
+    let frame_nslots: usize = if use_frame_roots {
+        frame_slot_count(&reflike, frame_layout.as_ref())
+    } else {
+        0
+    };
+    let lazy_frame = use_frame_roots
+        && lazy_frames_enabled()
+        && prop_pic_enabled()
+        && f.rest_param.is_none()
+        && json_roots.is_empty()
+        && body_is_gc_free(&f.body, &unboxed.union(&int_local).copied().collect());
+    if use_frame_roots && !lazy_frame {
         let _ = writeln!(s, "  ts_frame_push(&F.h, {});", frame_slot_count(&reflike, frame_layout.as_ref()));
+    } else if use_frame_roots {
+        // lazy: the frame is declared and filled but linked only around slow paths
     } else {
         for id in &reflike {
             let _ = writeln!(s, "  ts_gc_root(&v{});", id);
@@ -6129,6 +6909,14 @@ fn emit_function(
     }
 
     let ctx = Ctx {
+
+        switch_plan: switch_plan_for(f, &unboxed, &int_local),
+
+        layouts: layout_plan_for(f),
+
+        lazy_frame,
+
+        frame_nslots,
         unboxed,
         int_local,
         local_class,
@@ -6141,6 +6929,7 @@ fn emit_function(
         i64_fast,
         f64_fast,
         direct_sigs,
+        typeof_fusion,
         static_strings,
         string_metric_plan,
         string_materialization_plan,
@@ -14759,6 +15548,38 @@ fn try_emit_fused_scalar_slice_loop_body(
     Some(())
 }
 
+/// The generic property store: inline cache (lazy or eager frame) or the
+/// plain runtime setter when caches are disabled.
+fn emit_store_field_generic(s: &mut String, obj: u32, field: u32, src: u32, ctx: &Ctx) {
+    if prop_pic_enabled() {
+        let pic = ctx.fresh_label();
+        let _ = writeln!(s, "  {{ static ts_prop_ic _ts_pic_{} = TS_PROP_IC_INIT;", pic);
+        if ctx.lazy_frame {
+            let _ = writeln!(
+                s,
+                "  ts_set_pic_inline_lazy({}, {}, {}, &_ts_pic_{}, &F.h, {});",
+                ctx.val(obj),
+                field,
+                ctx.val(src),
+                pic,
+                ctx.frame_nslots
+            );
+        } else {
+            let _ = writeln!(
+                s,
+                "  ts_set_pic_inline({}, {}, {}, &_ts_pic_{});",
+                ctx.val(obj),
+                field,
+                ctx.val(src),
+                pic
+            );
+        }
+        let _ = writeln!(s, "  }}");
+    } else {
+        let _ = writeln!(s, "  ts_set({}, {}, {});", ctx.val(obj), field, ctx.val(src));
+    }
+}
+
 fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
     match inst {
         Inst::AllocObject {
@@ -14826,6 +15647,22 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     }
                 }
                 None => {
+                    if let Some(keys) = ctx.layouts.alloc.get(&(inst as *const Inst as usize)) {
+                        let id = ctx.fresh_label();
+                        s.push_str("  {\n");
+                        emit_layout_decl(s, id, keys);
+                        let alloc = if st == AllocStrategy::PretenuredHeap {
+                            "ts_new_object_layout_pretenured"
+                        } else {
+                            "ts_new_object_layout"
+                        };
+                        let _ = writeln!(
+                            s,
+                            "  {} = {}(&_ts_lit_{}); /* site {} {:?} layout */\n  }}",
+                            ctx.vname(dst.0), alloc, id, site.0, st
+                        );
+                        return;
+                    }
                     let alloc = if st == AllocStrategy::PretenuredHeap {
                         "ts_new_object_pretenured"
                     } else {
@@ -16530,15 +17367,23 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     "  {{ static ts_prop_ic _ts_pic_{} = TS_PROP_IC_INIT;",
                     pic
                 );
-                s.push_str(&ctx.set_val(
-                    dst.0,
-                    &format!(
+                let get_expr = if ctx.lazy_frame {
+                    format!(
+                        "ts_get_pic_checked_inline_lazy({}, {}, &_ts_pic_{}, &F.h, {})",
+                        ctx.val(obj.0),
+                        field.0,
+                        pic,
+                        ctx.frame_nslots
+                    )
+                } else {
+                    format!(
                         "ts_get_pic_checked_inline({}, {}, &_ts_pic_{})",
                         ctx.val(obj.0),
                         field.0,
                         pic
-                    ),
-                ));
+                    )
+                };
+                s.push_str(&ctx.set_val(dst.0, &get_expr));
                 let _ = writeln!(s, "  }}");
             } else {
                 s.push_str(&ctx.set_val(
@@ -16617,6 +17462,22 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             ));
         }
         Inst::StoreField { obj, field, src } => {
+            let addr = inst as *const Inst as usize;
+            if let Some(keys) = ctx.layouts.ctor_first.get(&addr) {
+                let id = ctx.fresh_label();
+                emit_layout_decl(s, id, keys);
+                let _ = writeln!(s, "  int _ts_adopt = ts_obj_adopt_layout({}, &_ts_lit_{});", ctx.val(obj.0), id);
+            }
+            if let Some(&(slot, guarded)) = ctx.layouts.store.get(&addr) {
+                if guarded {
+                    let _ = writeln!(s, "  if (_ts_adopt) {{ ts_lit_store({}, {}u, {}); }} else {{", ctx.val(obj.0), slot, ctx.val(src.0));
+                    emit_store_field_generic(s, obj.0, field.0, src.0, ctx);
+                    s.push_str("  }\n");
+                } else {
+                    let _ = writeln!(s, "  ts_lit_store({}, {}u, {});", ctx.val(obj.0), slot, ctx.val(src.0));
+                }
+                return;
+            }
             if let Some(&c) = ctx.local_class.get(&obj.0) {
                 if let Some(off) = struct_direct_offset(c, field.0, ctx.classes) {
                     let cn = struct_name(c);
@@ -16639,31 +17500,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             // ctx.val (not a hardcoded v-name): the receiver local may be numeric-
             // unboxed (`const n: any = 5; n.c = 3`) — rebox it so ts_set sees the
             // primitive and throws V8's "Cannot create property ..." TypeError.
-            if prop_pic_enabled() {
-                let pic = ctx.fresh_label();
-                let _ = writeln!(
-                    s,
-                    "  {{ static ts_prop_ic _ts_pic_{} = TS_PROP_IC_INIT;",
-                    pic
-                );
-                let _ = writeln!(
-                    s,
-                    "  ts_set_pic_inline({}, {}, {}, &_ts_pic_{});",
-                    ctx.val(obj.0),
-                    field.0,
-                    ctx.val(src.0),
-                    pic
-                );
-                let _ = writeln!(s, "  }}");
-            } else {
-                let _ = writeln!(
-                    s,
-                    "  ts_set({}, {}, {});",
-                    ctx.val(obj.0),
-                    field.0,
-                    ctx.val(src.0)
-                );
-            }
+            emit_store_field_generic(s, obj.0, field.0, src.0, ctx);
         }
         Inst::LoadElem { dst, arr } => {
             s.push_str(&ctx.set_val(dst.0, &format!("ts_get({}, 0)", ctx.val(arr.0))));
@@ -16693,10 +17530,22 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 }
                 return;
             }
-            s.push_str(&ctx.set_val(
-                dst.0,
-                &format!("ts_array_get({}, (uint32_t)({}))", ctx.val(arr.0), ctx.num(index.0)),
-            ));
+            if ctx.lazy_frame {
+                s.push_str(&ctx.set_val(
+                    dst.0,
+                    &format!(
+                        "ts_array_get_lazy({}, (uint32_t)({}), &F.h, {})",
+                        ctx.val(arr.0),
+                        ctx.num(index.0),
+                        ctx.frame_nslots
+                    ),
+                ));
+            } else {
+                s.push_str(&ctx.set_val(
+                    dst.0,
+                    &format!("ts_array_get({}, (uint32_t)({}))", ctx.val(arr.0), ctx.num(index.0)),
+                ));
+            }
         }
         Inst::StoreIndex { arr, index, src } => {
             let _ = writeln!(
@@ -17381,6 +18230,9 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     }
                 }
                 ConstVal::Str { value } => {
+                    if ctx.typeof_fusion.skip.contains(&dst.0) {
+                        return;
+                    }
                     let id = ctx
                         .static_strings
                         .get(str_units(value).as_slice())
@@ -17643,7 +18495,9 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     }
                 }
                 "===" => {
-                    if both_unboxed {
+                    if let Some((x, lit, _)) = ctx.typeof_fusion.fused.get(&(dst.0, lhs.0, rhs.0)) {
+                        typeof_test_expr(lit, &ctx.val(*x))
+                    } else if both_unboxed {
                         format!("({} == {})", l, r)
                     } else {
                         format!("ts_strict_eq({}, {})", ctx.val(lhs.0), ctx.val(rhs.0))
@@ -17657,7 +18511,9 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     }
                 }
                 "!==" => {
-                    if both_unboxed {
+                    if let Some((x, lit, _)) = ctx.typeof_fusion.fused.get(&(dst.0, lhs.0, rhs.0)) {
+                        format!("(!{})", typeof_test_expr(lit, &ctx.val(*x)))
+                    } else if both_unboxed {
                         format!("({} != {})", l, r)
                     } else {
                         format!("(!ts_strict_eq({}, {}))", ctx.val(lhs.0), ctx.val(rhs.0))
@@ -17716,7 +18572,9 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
         Inst::UnOp { dst, op, operand } => {
             match op.as_str() {
                 "typeof" => {
-                    s.push_str(&ctx.set_val(dst.0, &format!("ts_typeof({})", ctx.val(operand.0))));
+                    if !ctx.typeof_fusion.skip.contains(&dst.0) {
+                        s.push_str(&ctx.set_val(dst.0, &format!("ts_typeof({})", ctx.val(operand.0))));
+                    }
                 }
                 "nullish" => {
                     s.push_str(&ctx.set_num(
@@ -18029,6 +18887,10 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             then_body,
             else_body,
         } => {
+            if let Some(chain) = ctx.switch_plan.heads.get(&(inst as *const Inst as usize)) {
+                emit_switch_chain(s, chain, ctx);
+                return;
+            }
             let _ = writeln!(s, "  if ({}) {{", ctx.truthy(cond.0));
             emit_seq(s, then_body, ctx, PathEdge::IfThen);
             s.push_str("  } else {\n");

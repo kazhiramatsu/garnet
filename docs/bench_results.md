@@ -684,3 +684,54 @@ Both builds mark the four giant cold functions (`__module_init`,
 Wall time drops 10.4% (per run 8.343 / 8.359 / 8.391 s against 9.316 /
 9.333 / 9.358 s). Native is now 2.55x slower than V8 on this machine state.
 Raw records: `native_s350m_o2/results/`.
+
+### Pattern benchmarks against V8 (Session 350)
+
+Twelve tsc-style kernels (`scratchpad/pbench`, scaled to 100–200 ms under
+Node; Node times include about 60 ms of startup), native best-of-3 against
+Node best-of-3, same machine state, outputs checked against Node:
+
+| kernel | before | after slice 1 + lazy frames | ratio before → after |
+|---|---:|---:|---:|
+| flags / optional chaining / typeof loop | 2132 ms | 549 ms | 15.1x → 3.8x |
+| `typeof` dispatch alone | 1376 ms | 84 ms | 17.9x → 1.06x |
+| 32-case `switch` dispatch | 829 ms | 448 ms | 6.0x → 3.25x |
+| small calls with object arguments | 1026 ms | 1000 ms | 4.7x → 4.6x |
+| array callbacks | 583 ms | 554 ms | 4.0x → 3.7x |
+| closures with captured variables | 392 ms | 392 ms | 3.1x → 3.0x |
+| arrays of objects | 329 ms | 322 ms | 3.05x → 3.0x |
+| shape-polymorphic object literals | 402 ms | 415 ms | 3.3x → 3.4x |
+| scanner-style string loop | 364 ms | 260 ms | 2.6x → 1.9x |
+| tree recursion | 147 ms | 145 ms | 1.4x → 1.4x |
+| string building | 153 ms | 151 ms | 1.3x → 1.35x |
+| Map with string keys | 92 ms | 93 ms | 0.88x |
+| method objects | 47 ms | 47 ms | 0.69x |
+
+Compiler A/Bs for the slice (three alternating runs each, outputs validated):
+
+| build | median wall | note |
+|---|---:|---|
+| `native_s350o` (implicit returns) | 8.397 s | baseline |
+| `native_s350p` (static typeof strings) | 8.387 s | noise |
+| `native_s350q` (typeof fusion + switch chain) | **8.257 s** | 2.0% less than `p` (8.426 s in its own session) |
+| `native_s350r` (switch jump tables) | 8.364 s | noise against `q` (8.322 s) |
+| `native_s350s` (lazy root frames) | **8.235 s** | 1.1% less than `r` (8.329 s) |
+| `native_s350u` (object literal and constructor layouts) | **7.911 s** | 1.8% less than `s` (8.052 s in its own session); Node 3.238 s |
+
+### Inline-cache path statistics (Session 350, `native_s350s_stats`)
+
+One compile of the compiler sources with `TSAOT_NATIVE_STATS=1`, after the
+lazy-frame slice (`pic_paths` counters added in this session):
+
+| path | reads per compile | share of hits |
+|---|---:|---:|
+| shape entry 0 (monomorphic) | 214.3M | 36.7% |
+| shape entries 1–3 | 13.5M | 2.3% |
+| slot/key validation (same slot, other shape) | 360.4M | 61.7% |
+| out of line (`ts_get_pic_checked`) | 13.4M | — |
+| total reads / hits | 592.6M / 584.2M | 98.6% hit |
+
+Root frame pushes per compile: 561.7M before lazy frames, 410.2M after.
+The dominant read path is the slot/key validation, reached today only after
+the four shape-entry compares miss; a slot-first probe would make it the
+first test.

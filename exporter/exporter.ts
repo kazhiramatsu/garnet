@@ -10125,6 +10125,65 @@ class Exporter {
       const disc = this.lowerExpr(ctx, stmt.expression);
       const clauses = stmt.caseBlock.clauses;
       const n = clauses.length;
+      // Fast form (Session 350): when no clause body falls through into the
+      // next (every non-empty body but the last ends abruptly), the switch is a
+      // direct if/else-if chain inside the run-once loop: each group of labels
+      // tests `disc === label` lazily in source order and runs its body; the
+      // default group (which must carry no labels of its own) is the final
+      // else. No `matched`/`active` bookkeeping, so a 30-case dispatch costs
+      // the compares up to its case instead of three passes over every clause.
+      // TSAOT_SWITCH_CHAIN=0 keeps the matched/active form.
+      if (process.env.TSAOT_SWITCH_CHAIN !== "0") {
+        type Group = { labels: ts.Expression[]; hasDefault: boolean; body: readonly ts.Statement[] };
+        const groups: Group[] = [];
+        let cur: Group = { labels: [], hasDefault: false, body: [] };
+        for (const c of clauses) {
+          if (ts.isDefaultClause(c)) cur.hasDefault = true; else cur.labels.push(c.expression);
+          if (c.statements.length > 0) { cur.body = c.statements; groups.push(cur); cur = { labels: [], hasDefault: false, body: [] }; }
+        }
+        if (cur.labels.length || cur.hasDefault) groups.push(cur);
+        const fast = groups.every((g, i) => i === groups.length - 1 || !this.clauseFallsThrough(g.body)) &&
+          groups.every((g) => !(g.hasDefault && g.labels.length > 0)) &&
+          groups.filter((g) => g.hasDefault).length <= 1;
+        if (fast) {
+          const dflt = groups.find((g) => g.hasDefault);
+          const chain = groups.filter((g) => !g.hasDefault);
+          const loopBody = this.captureLoopBody(ctx, "switch", () => {
+            const build = (k: number): any[] => {
+              if (k >= chain.length) {
+                return dflt ? this.captureBody(ctx, () => dflt.body.forEach((s) => this.lowerStmt(ctx, s))) : [];
+              }
+              const g = chain[k];
+              return this.captureBody(ctx, () => {
+                const k0 = this.lowerExpr(ctx, g.labels[0]);
+                const eq = this.newLocal(ctx, "primitive");
+                ctx.body.push({ kind: "BinOp", dst: eq, op: "===", lhs: disc, rhs: k0 });
+                for (let li = 1; li < g.labels.length; li++) {
+                  // later labels are evaluated only when the earlier ones missed
+                  const miss = this.newLocal(ctx, "primitive");
+                  ctx.body.push({ kind: "UnOp", dst: miss, op: "!", operand: eq });
+                  const retry = this.captureBody(ctx, () => {
+                    const kl = this.lowerExpr(ctx, g.labels[li]);
+                    const eq2 = this.newLocal(ctx, "primitive");
+                    ctx.body.push({ kind: "BinOp", dst: eq2, op: "===", lhs: disc, rhs: kl });
+                    ctx.body.push({ kind: "Copy", dst: eq, src: eq2 });
+                  });
+                  ctx.body.push({ kind: "If", cond: miss, thenBody: retry, elseBody: [] });
+                }
+                const thenB = this.captureBody(ctx, () => g.body.forEach((s) => this.lowerStmt(ctx, s)));
+                const elseB = build(k + 1);
+                ctx.body.push({ kind: "If", cond: eq, thenBody: thenB, elseBody: elseB });
+              });
+            };
+            for (const inst of build(0)) ctx.body.push(inst);
+            ctx.body.push({ kind: "Break" });
+          });
+          const condTrue = this.newLocal(ctx, "primitive");
+          ctx.body.push({ kind: "Const", dst: condTrue, value: { kind: "Num", value: 1 } });
+          ctx.body.push({ kind: "Loop", cond: condTrue, condBody: [], body: loopBody });
+          return;
+        }
+      }
       let dfltIdx = -1;
       for (let i = 0; i < n; i++) if (ts.isDefaultClause(clauses[i])) dfltIdx = i;
       const caseIdxs: number[] = [];
@@ -10852,6 +10911,15 @@ class Exporter {
       return tryNormal || catchNormal;
     }
     return true; // labeled statements, expression statements, declarations, loops with conditions, ...
+  }
+  // Does a switch clause body run into the next clause? Empty bodies group
+  // labels; a body whose last statement is break/continue/return/throw, or
+  // that cannot complete normally, does not fall through.
+  clauseFallsThrough(stmts: readonly ts.Statement[]): boolean {
+    if (stmts.length === 0) return true;
+    const last = stmts[stmts.length - 1];
+    if (ts.isBreakStatement(last) || ts.isContinueStatement(last) || ts.isReturnStatement(last) || ts.isThrowStatement(last)) return false;
+    return this.statementsCompleteNormally(stmts);
   }
   // Is there a `break` in these statements that leaves the enclosing switch or
   // loop they belong to? A break nested in an inner loop or switch targets that
