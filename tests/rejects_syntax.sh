@@ -5,10 +5,8 @@ cp -r /home/claude/exporter/node_modules exporter/ 2>/dev/null || true
 tmp=$(mktemp -d); fail=0
 chk(){ echo "$2" > "$tmp/t.ts"; if node exporter/exporter.js "$tmp/t.ts" "$tmp/t.json" "$tmp/tl.json" 2>/dev/null; then echo "[reject-syntax] FAIL: $1 accepted"; fail=1; fi; }
 # multi-level labeled break/continue is now supported (conformance_fixes §44),
-# EXCEPT: (a) continue to an outer for-of-over-array loop (its index increment is
-# at body-end, so a continue would skip it), and (b) any multi-level jump inside a
-# try/finally (the structured finally path models only a single enclosing loop).
-chk "multi-level continue to for-of-array" 'function main(): void { let c=0; outer: for (const x of [1,2,3]){ for(let j=0;j<3;j++){ if(j===1) continue outer; c++; } } console.log(c); }'
+# EXCEPT: multi-level labeled jumps inside explicit try/finally remain rejected
+# until both the plain and coroutine emitters support the same completion scopes.
 chk "multi-level break inside try/finally" 'function main(): void { let r=""; outer: for(let i=0;i<3;i++){ for(let j=0;j<3;j++){ try{ if(j===1) break outer; }finally{ r+="f"; } } } console.log(r); }'
 chk "self-referential class extends" 'class C extends C {} function main(): void { console.log(1); } main();'
 chk "mutually-cyclic class extends" 'class A extends B {} class B extends A {} function main(): void { console.log(1); } main();'
@@ -62,5 +60,5 @@ chk "unsupported number method as a value"    'function main(): void { const f:a
 # (`super.x = v` is now fully supported — declared data field / parent accessor setter
 # / static members; getter-only writes throw a catchable TypeError and undeclared
 # properties create own data, both matching JS — see conformance_fixes §124–§127.)
-[ $fail -eq 0 ] && echo "[reject-syntax] PASS: forof-continue / finally-crossing-label / import-linkage / TDZ / destructured-rest-param / class-member(vtable-method-capture) / number-method-value rejected"
+[ $fail -eq 0 ] && echo "[reject-syntax] PASS: finally-crossing-label / import-linkage / TDZ / destructured-rest-param / class-member(vtable-method-capture) / number-method-value rejected"
 exit $fail

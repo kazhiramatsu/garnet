@@ -1,4 +1,4 @@
-# Dynamic object property lookup: shapes, PICs, and indexed fallback
+# Dynamic object property lookup: location caches and indexed fallback
 
 ## Motivation
 
@@ -8,7 +8,7 @@ of lookups used at most four probes, so a hash table alone does not remove the
 dominant fixed dispatch cost. The implementation therefore uses three layers:
 
 1. an ordinary-object fast path in `ts_get` and `ts_set`;
-2. hidden shapes plus emitted four-entry polymorphic inline caches;
+2. emitted four-entry caches of verified storage locations;
 3. a sparse per-object index once an object has at least eight properties.
 
 ## Object layout and shapes
@@ -25,50 +25,66 @@ global `(parent shape, key) -> child shape` transition. Objects constructed with
 the same property order therefore share a shape and dense slot layout.
 
 Deletion compacts the property vector and changes the layout id to
-`TS_SHAPE_NONE`. Such an object remains on the canonical dictionary path; it is
-not reintroduced into the shape graph. Overwrites and descriptor changes keep
-the shape because the key-to-slot mapping is unchanged.
+`TS_SHAPE_NONE`. Sized AOT class instances also start at `TS_SHAPE_NONE` because
+registered struct fields take precedence over the named-property vector.
+Both cases remain eligible for the out-of-line location cache below. Ordinary
+objects with a nonzero shape also retain a short inline shape-cache path.
 
-Sized AOT class instances also start at `TS_SHAPE_NONE`. They share the ordinary
-object runtime kind, but a registered struct field is resolved before the side
-property vector. Consequently, their layout domain cannot safely alias a plain
-object shape without adding a class/prototype guard to every cache entry. Typed
-class access already uses direct struct offsets, so excluding the uncommon
-dynamic class path preserves the compact cache and sends it through the
-canonical/indexed fallback.
-
-## Four-way PIC
+## Compact shape cache and separate location hints
 
 Each emitted fixed or computed property site owns a zero-initialized
-`ts_prop_ic`. An entry records:
+`ts_prop_ic`. It retains the original 52-byte layout: four `(key, shape, slot)`
+entries and replacement/failure state. Ordinary fixed-key hits use the original
+short inline probe, with no registry-epoch load, prototype comparison, allocation
+size comparison or auxiliary-table lookup. Only ordinary unsized objects have
+nonzero shapes; sized class instances and deleted layouts cannot alias them.
 
-- key;
-- packed receiver shape/integrity word;
-- dense property slot.
+Unsized receivers, including objects after deletion, first try a compact
+cached slot with a live bounds/key check. No auxiliary table, prototype or
+registry-epoch check is needed for their own properties. This also handles
+shape variation without enlarging the ordinary cache.
 
-A fixed-key hit validates the receiver shape in an always-inline header helper,
-then reads or writes a data property directly in the generated caller. Each
-fixed site owns its cache and always uses one key, so a matched shape is enough
-to identify the slot. Shape transitions structurally guarantee the cached
-key/slot bounds; deletion changes the receiver to the uncacheable shape.
-Accessor state has a dedicated property-flag bit, avoiding a heap-kind lookup on
-each hit. Writable flags, integrity flags, write barriers, nullish errors, and
-proxy traps retain their canonical behavior.
+Sized receivers use a separate bounded table with four verified locations per
+site address. Its 4,096 direct-mapped buckets occupy 576 KiB of zero-fill storage.
+Collisions only discard hints. Entries record the live prototype, allocation size, key, storage kind and
+offset; the bucket also checks the site address and class-registry epoch.
 
-The cache only holds own slots on ordinary, non-sized objects, so their layout
-is independent of the receiver's prototype. Omitting a prototype guard reduces
-a four-way cache from 104 to 52 bytes per emitted site. The inline four-entry
-loop is explicitly kept rolled to bound generated text growth.
+An own-slot hit validates its bounds and current key. This permits unrelated
+property additions, differing insertion orders with the same target slot, and
+deletions without accepting stale slots. Warmup populates distinct entries
+for up to four shapes, even if their target slots coincide. After warmup, unseen
+shapes are promoted at a sampled rate; dictionary hits do not evict an ordinary
+shape just to record shape zero. Struct offsets bypass both
+the class registry and its field search. Registry growth invalidates these
+auxiliary entries, preserving struct-field precedence after late registration.
+Allocation-size equality separates a real class instance from a short
+`Object.create(Class.prototype)` receiver.
 
-Only own properties are cached. Typed struct fields, inherited properties,
-missing properties, arrays, primitives, functions, promises, and proxies use
-the existing runtime path. This avoids prototype-chain invalidation machinery.
+Accessor state and write permissions remain live checks; getter/setter changes,
+frozen objects, proxies, nullish errors and write barriers retain canonical
+behavior. The inline probe stays rolled to limit generated text growth. Caches
+store handles and offsets, never raw movable pointers. Prototype handles are
+only compared with live receiver handles, never dereferenced or added as GC
+roots.
 
-After 16 misses, a site becomes megamorphic and calls the canonical lookup
-directly from a small inline wrapper. This prevents a four-entry cache from
-thrashing on sites that cycle through many shapes or computed keys and avoids
-re-entering the PIC miss machinery after the transition. `TSAOT_PROP_PIC=0`
-emits the previous non-PIC calls for A/B measurement and debugging.
+Fixed-key shape variation and missing properties no longer retire a site.
+Repeated computed-key diversity can still retire it after sixteen evictions.
+Interface method dispatch emits a field-key cache and a method-key fallback
+cache. Caching a location, rather than a function value, observes reassignment
+and invokes an accessor on every call. Inherited/missing properties, arrays,
+primitives, functions, promises and proxies retain canonical lookup.
+
+The canonical class-field path has a 1,024-entry direct-mapped cache of
+`(prototype, key, registry epoch) -> (offset, numeric flag, minimum size)`.
+Negative registry results are cached too; positive results keep the minimum-size
+guard. Registry growth invalidates hints without storing registry-vector
+pointers. `TSAOT_PROP_PIC=0` disables emitted property/method caches for comparison.
+
+Two rejected implementations enlarged every emitted cache from 52 to 136 bytes;
+one also inlined all prototype/size/key/epoch checks. Both regressed the native
+compiler despite reducing property searches. The final design preserves the
+existing ordinary-object layout and guard sequence. Hit rates alone do not
+establish profitability; whole-project comparisons remain the deciding measure.
 
 ## Indexed fallback
 
@@ -80,7 +96,9 @@ Deletion rebuilds or removes the index after compacting the dense vector.
 JSON object construction now uses the same `find_prop` creation path, so shapes,
 indices, descriptor flags, and duplicate-key handling have one source of truth.
 
-## Measurements
+## Earlier shape-cache measurements
+
+The figures in this section predate the location-cache changes above.
 
 On the dedicated four-shape benchmark (20 million iterations, 40 million
 property reads), a 40-pair interleaved A/B measured median wall times of 215 ms
@@ -115,7 +133,7 @@ Correctness coverage is split by invariant:
 - `classes/dynamic_class_registry_edges.ts` covers registry growth, the
   minimum-allocation-size guard, moving-GC revisits, and the constructor
   stack-buffer boundary at 15/16 arguments.
-- `runtime/ts_rt_test.c` directly asserts shape sharing, the 16-miss state,
+- `runtime/ts_rt_test.c` directly asserts shape sharing, fixed-key cache retention,
   dictionary shape after compaction, deterministic open-addressing collisions,
   class-registry growth, and the minimum-size guard.
 
@@ -128,3 +146,12 @@ kernel at 95 ms; the expanded edge-test follow-up measured 94 ms and 96 ms respe
 In the combined production configuration (PIC plus the independently measured root-frame
 work), the full typed self-host emitter completed in 330.11 s versus the earlier 595 s
 baseline; that end-to-end number is intentionally not attributed to PIC alone.
+
+## TypeScript compiler workload
+
+The native TypeScript 6.0.3 workload checks and emits all 78 files in the
+upstream compiler project and compares diagnostics, exit status and every
+emitted byte with the Node build. See `benchmarks/typescript_native/README.md`
+and `docs/bench_results.md` for commands, flags and measurements.
+`benchmarks/interface_property_kernel.ts` separately exercises interface reads,
+writes and method calls across 32 layouts, including dictionary objects.

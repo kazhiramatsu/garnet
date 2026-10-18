@@ -32,11 +32,12 @@ PROG="$(basename "$0")"
 
 usage() {
   cat >&2 <<EOF
-usage: $PROG [-c | -S] [-o <out.c>] <input.ts>
+usage: $PROG [-c | -S] [-o <out.c>] [-p <tsconfig>] <input.ts>
 
   (default)     emit <input>.c and compile it to a native executable
   -c            emit the C file only (skip native compile/link)
   -S            write the generated C to stdout (no files written)
+  -p, --project use compiler options from a tsconfig file or directory
   -o <out.c>    name the C output file (default: <input basename>.c;
                 the executable is the same name without the .c suffix)
   --untyped     compile the whole program as \`any\`: disable all type-driven
@@ -68,12 +69,14 @@ profile=0        # --profile
 rt_stats=0       # --rt-stats
 out_c=""         # -o
 input=""
+project=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -c) emit_only=1 ;;
     -S) to_stdout=1 ;;
     -o) shift; [ $# -gt 0 ] || die "-o requires an argument"; out_c="$1" ;;
     -o*) out_c="${1#-o}" ;;
+    -p|--project) shift; [ $# -gt 0 ] || die "--project requires an argument"; project="$1" ;;
     --untyped) export TSAOT_UNTYPED=1 ;;
     --profile) profile=1 ;;
     --rt-stats) rt_stats=1 ;;
@@ -146,7 +149,11 @@ case "${TSAOT_ANALYZER:-rust}" in
   ts|native) export TSAOT_UNTYPED=1 ;;
 esac
 # Exporter prints diagnostics to stderr and exits non-zero on UNSUPPORTED.
-node "$EXPORTER" "$input_abs" "$work/ir.json" "$work/labels.json" 1>&2
+if [ -n "$project" ]; then
+  node "$EXPORTER" --project "$project" "$input_abs" "$work/ir.json" "$work/labels.json" 1>&2
+else
+  node "$EXPORTER" "$input_abs" "$work/ir.json" "$work/labels.json" 1>&2
+fi
 
 # ----- stage 2: IR JSON → C -----
 if [ "$to_stdout" -eq 1 ]; then

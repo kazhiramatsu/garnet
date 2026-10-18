@@ -37,23 +37,8 @@ TS
 if node exporter/exporter.js "$tmp/d.ts" "$tmp/d.json" "$tmp/dl.json" 2>/dev/null; then
   echo "[reject-stdlib] FAIL: Object.fromEntries() accepted"; fail=1
 fi
-# RegExp is still partial. `.test`, `.exec`, `search`, `match`, `matchAll`,
-# replacement, split, and const-string constructor forms are accepted through
-# scanner/QuickJS paths. Unsupported consumers, dynamic construction, and global
-# value entry points must still reject at export time.
-cat > "$tmp/f.ts" <<'TS'
-function makePattern(): string { return "b"; }
-function main(): void { const r: any = new RegExp(makePattern()); console.log(r); }
-TS
-if node exporter/exporter.js "$tmp/f.ts" "$tmp/f.json" "$tmp/fl.json" 2>/dev/null; then
-  echo "[reject-stdlib] FAIL: dynamic new RegExp accepted"; fail=1
-fi
-cat > "$tmp/g.ts" <<'TS'
-function main(): void { const r: any = RegExp("b", "gg"); console.log(r); }
-TS
-if node exporter/exporter.js "$tmp/g.ts" "$tmp/g.json" "$tmp/gl.json" 2>/dev/null; then
-  echo "[reject-stdlib] FAIL: RegExp(...) invalid flags accepted"; fail=1
-fi
+# RegExp constructors now accept dynamic inputs and throw catchable SyntaxError
+# for invalid flags. Unsupported global value entry points still reject.
 cat > "$tmp/h.ts" <<'TS'
 function main(): void { const R: any = RegExp; console.log(typeof R); }
 TS

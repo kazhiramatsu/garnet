@@ -7,6 +7,7 @@
 #   scope=parity   : emitc_diff.sh（Rust emit vs 凍結TS emitc の byte 比較）で DIFF を許容
 #   scope=selfconf : analyzer_conformance.sh（凍結TS コンパイル産物の V8 差分）で DIFF を許容
 #   scope=selfconf-unported : allow a known frozen-TS UNPORTED in analyzer_conformance.sh
+#   scope=parity-unported : allow an explicitly recorded frozen typed-emitter UNPORTED
 #
 # selfconf スコープは s317 実測で現状 0 件（selfconf は untyped 経路で、凍結側では
 # 当該 SROA/stack 最適化が非発現のため 332/332 PASS。Rust 側は untyped でも class
@@ -34,3 +35,77 @@ parity	classes/dynamic_class_registry_edges	New registry-growth fixture exposes 
 parity	gc/frame_roots_edge_cases	New unwind fixture exposes an existing FrameArena-vs-Stack allocation annotation difference; production output matches V8
 parity	object_methods/property_pic_edge_cases	Rust legacy emission retains one extra rooted temporary that the frozen optimizer removes; both outputs match V8
 selfconf-unported	gc/frame_roots_edge_cases	Frozen analyzer predates abrupt return through finally; production Rust analyzer supports it and matches V8
+parity	strings/replace_unit_metrics	Rust fuses dynamic replacement metrics; the frozen emitter materializes the equivalent strings. Both typed executables match V8.
+selfconf	control/iterable_continue	Frozen plain-finally emitter ignores multi-level continue through switch/iterator-close regions and hangs; Rust matches V8, forced GC and ASan.
+selfconf	errors/finally_jump_scopes	Frozen nested-finally lowering runs enclosing finally too early and skips outer finally on an overriding return; Rust matches V8.
+parity	classes/dynkey_generator_method	Rust tracks loop destinations and scopes through finally; frozen completion dispatch differs. Native outputs were compared with V8.
+parity	classes/generator_method	Rust tracks loop destinations and scopes through finally; frozen completion dispatch differs. Native outputs were compared with V8.
+parity	control/iterable_continue	Frozen plain-finally multi-level continue hangs; Rust records the actual destination and runs iterator close before jumping.
+parity	errors/finally_jump_scopes	Rust preserves enclosing-finally scope for local jumps and overriding returns; frozen output differs from V8.
+parity	errors/nested_finally_completion	Rust tracks loop destinations and scopes through finally; frozen completion dispatch differs. Native outputs were compared with V8.
+parity	errors/throw_and_catch	Rust tracks loop destinations and scopes through finally; frozen completion dispatch differs. Native outputs were compared with V8.
+parity	iteration/forof_destructure_generator	Rust tracks loop destinations and scopes through finally; frozen completion dispatch differs. Native outputs were compared with V8.
+parity	iteration/generator_protocol_edges	Rust tracks loop destinations and scopes through finally; frozen completion dispatch differs. Native outputs were compared with V8.
+parity	iteration/generator_return	Rust tracks loop destinations and scopes through finally; frozen completion dispatch differs. Native outputs were compared with V8.
+parity	iteration/generators	Rust tracks loop destinations and scopes through finally; frozen completion dispatch differs. Native outputs were compared with V8.
+parity	iteration/yield_delegate	Rust tracks loop destinations and scopes through finally; frozen completion dispatch differs. Native outputs were compared with V8.
+parity	stdlib/json_dom_generator_fallback	Rust tracks loop destinations and scopes through finally; frozen completion dispatch differs. Native outputs were compared with V8.
+parity	syntax/syntax_statement_edges	Rust tracks loop destinations and scopes through finally; frozen completion dispatch differs. Native outputs were compared with V8.
+parity-unported	strings/substr_and_value	Frozen typed emitter does not implement string.substr/toString/valueOf; Rust implements them and matches V8 including coercion order and boundary values.
+parity-unported	regexp/regexp_constructor_dynamic	Frozen emitter lacks regexp.construct; Rust matches V8 for dynamic patterns, flags, cloning, coercion order, invalid inputs and lone surrogates.
+selfconf-unported	regexp/regexp_constructor_dynamic	Frozen emitter lacks regexp.construct; native Rust output matches V8.
+parity-unported	object_methods/dynamic_delete	Frozen emitter lacks object.deleteDynamic; Rust matches V8 for computed keys, symbols, proxies, strict deletion and method-key cleanup.
+selfconf-unported	object_methods/dynamic_delete	Frozen emitter lacks object.deleteDynamic; native Rust output matches V8.
+parity-unported	numbers/uint16_array	Frozen emitter lacks uint16array.new; Rust matches V8 for the supported fixed-length Uint16 storage operations.
+selfconf-unported	numbers/uint16_array	Frozen emitter lacks uint16array.new; native Rust output matches V8.
+parity-unported	stdlib/date_locale_time	Frozen emitter lacks date.toLocaleTimeString; Rust matches V8 for the explicitly supported locale/time-zone formatting subset.
+selfconf-unported	stdlib/date_locale_time	Frozen emitter lacks date.toLocaleTimeString; native Rust output matches V8.
+
+# Native TypeScript execution: conservative numeric representation and new ABI builtin.
+parity	classes/class_name	SROA all-definition numeric proof retains boxed-copy roots; V8 differential passes.
+parity	classes/static_symbol_members	SROA all-definition numeric proof retains boxed-copy roots; V8 differential passes.
+parity	closures/default_params	SROA all-definition numeric proof retains boxed-copy roots; V8 differential passes.
+parity	closures/destructured_type_erasure	SROA all-definition numeric proof retains boxed-copy roots; V8 differential passes.
+parity	coercion/nan_truthiness	SROA all-definition numeric proof retains boxed-copy roots; V8 differential passes.
+parity	coercion/object_to_primitive	SROA all-definition numeric proof retains boxed-copy roots; V8 differential passes.
+parity	coercion/to_primitive	SROA all-definition numeric proof retains boxed-copy roots; V8 differential passes.
+parity	control/mixed_logical_numbers	SROA all-definition numeric proof keeps mixed/opaque writes boxed; V8 differential passes.
+parity	expressions/destructure_keys	SROA all-definition numeric proof retains boxed-copy roots; V8 differential passes.
+parity	expressions/ternary_array_never	SROA all-definition numeric proof retains boxed-copy roots; V8 differential passes.
+parity	gc/moving_minor_promise_coro_stress	SROA all-definition numeric proof keeps mixed/opaque writes boxed; V8 differential passes.
+parity	numbers/increment_coercion	SROA all-definition numeric proof retains boxed-copy roots; V8 differential passes.
+parity	operators/destructure_assign	SROA all-definition numeric proof retains boxed-copy roots; V8 differential passes.
+parity	operators/optional_chaining	SROA all-definition numeric proof retains boxed-copy roots; V8 differential passes.
+parity	proxy/proxy_traps	SROA all-definition numeric proof keeps mixed/opaque writes boxed; V8 differential passes.
+parity	scope/builtin_shadowing_edges	SROA all-definition numeric proof retains boxed-copy roots; V8 differential passes.
+parity	stdlib/json_dom_mixed_assignment_fallback	SROA all-definition numeric proof keeps mixed/opaque writes boxed; V8 differential passes.
+parity	syntax/syntax_binding_patterns	SROA all-definition numeric proof retains boxed-copy roots; V8 differential passes.
+parity	syntax/syntax_class_modifiers	SROA all-definition numeric proof retains boxed-copy roots; V8 differential passes.
+parity	syntax/syntax_function_forms	SROA all-definition numeric proof keeps mixed/opaque writes boxed; V8 differential passes.
+parity	syntax/syntax_type_forms	SROA all-definition numeric proof retains boxed-copy roots; V8 differential passes.
+parity	types/nullable_numbers	SROA all-definition numeric proof retains boxed-copy roots; V8 differential passes.
+parity-unported	arrays/symbol_iterator	Frozen emitter lacks computed-delete dispatch in the iterator mutation fixture.
+selfconf-unported	arrays/symbol_iterator	Frozen emitter lacks computed-delete dispatch in the iterator mutation fixture.
+parity-unported	functions/arguments_length	Frozen emitter lacks arguments.length; frozen sources remain unchanged.
+selfconf-unported	functions/arguments_length	Frozen emitter lacks arguments.length; frozen sources remain unchanged.
+
+# Native compiler: preserve NaN and explicit undefined slice bounds.
+parity	arrays/slice_optional_end	Rust distinguishes an explicit undefined slice end and preserves NaN from charCodeAt; production V8 differential passes.
+parity	expressions/index_exprs	Rust keeps potentially out-of-bounds charCodeAt results as double to preserve NaN, disabling integer-only metric fusions where needed; production V8 differential passes.
+parity	scope/loop_uninitialized_let	SROA all-definition numeric proof retains boxed-copy roots; reviewed root-only difference and V8 differential passes.
+parity	strings/charcode_bounds	Rust keeps potentially out-of-bounds charCodeAt results as double to preserve NaN, disabling integer-only metric fusions where needed; production V8 differential passes.
+parity	strings/concat_growth	Rust keeps potentially out-of-bounds charCodeAt results as double to preserve NaN, disabling integer-only metric fusions where needed; production V8 differential passes.
+parity	strings/methods	Rust keeps potentially out-of-bounds charCodeAt results as double to preserve NaN, disabling integer-only metric fusions where needed; production V8 differential passes.
+parity	strings/optimizer_guardrails	Rust keeps potentially out-of-bounds charCodeAt results as double to preserve NaN, disabling integer-only metric fusions where needed; production V8 differential passes.
+parity	strings/short_immediate	Rust keeps potentially out-of-bounds charCodeAt results as double to preserve NaN, disabling integer-only metric fusions where needed; production V8 differential passes.
+parity	strings/slice_scalar_scope	Rust keeps potentially out-of-bounds charCodeAt results as double to preserve NaN, disabling integer-only metric fusions where needed; production V8 differential passes.
+parity	strings/surrogate_methods	Rust keeps potentially out-of-bounds charCodeAt results as double to preserve NaN, disabling integer-only metric fusions where needed; production V8 differential passes.
+parity	strings/unicode_case_table	Rust keeps potentially out-of-bounds charCodeAt results as double to preserve NaN, disabling integer-only metric fusions where needed; production V8 differential passes.
+parity	strings/unicode_case_trim	Rust keeps potentially out-of-bounds charCodeAt results as double to preserve NaN, disabling integer-only metric fusions where needed; production V8 differential passes.
+parity	strings/unicode_locale_case	Rust keeps potentially out-of-bounds charCodeAt results as double to preserve NaN, disabling integer-only metric fusions where needed; production V8 differential passes.
+parity	strings/unicode_normalize	Rust keeps potentially out-of-bounds charCodeAt results as double to preserve NaN, disabling integer-only metric fusions where needed; production V8 differential passes.
+parity	strings/unicode_utf16	Rust keeps potentially out-of-bounds charCodeAt results as double to preserve NaN, disabling integer-only metric fusions where needed; production V8 differential passes.
+parity	strings/unicode_utf8_output	Rust keeps potentially out-of-bounds charCodeAt results as double to preserve NaN, disabling integer-only metric fusions where needed; production V8 differential passes.
+parity	syntax/syntax_assignment_operator_matrix	SROA all-definition numeric proof retains boxed-copy roots; reviewed root-only difference and V8 differential passes.
+parity	syntax/syntax_lexical_literals	Rust keeps potentially out-of-bounds charCodeAt results as double to preserve NaN, disabling integer-only metric fusions where needed; production V8 differential passes.
+parity	object_methods/interface_dispatch	Rust deletes the METHOD-key twin after deleting the own method field (existing fix #6); reviewed single-line difference, both executables match V8 here.

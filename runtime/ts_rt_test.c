@@ -1,5 +1,12 @@
 #include "ts_rt.h"
 
+static tsv check_merged_call(tsv* args, int nargs){
+  int captures = (int)ts_to_num(args[0]);
+  if (nargs != captures + 2) return ts_num(-1);
+  for (int i=1;i<captures;i++) if (ts_to_num(args[i]) != i*3) return ts_num(-2);
+  return ts_num(ts_to_num(args[captures]) + ts_to_num(args[captures+1]));
+}
+
 static tsv fetch_header_value_to_string(tsv* a, int n){
   (void)a; (void)n;
   for (int i=0;i<96;i++){
@@ -155,6 +162,126 @@ static uint32_t test_prop_hash(ts_key key){
   return x ^ (x >> 16);
 }
 
+static int replace_unit_metrics_match(tsv source){
+  /* Compare the fused metrics with an independently materialized replacement.
+     Include NUL, Latin-1, BMP, and each half of a surrogate pair. */
+  const uint16_t units[] = {'-', '+', 'a', 0, 0xe9, 0x6f22, 0xd83d, 0xde00};
+  const size_t count = sizeof(units) / sizeof(units[0]);
+  tsv chars[sizeof(units) / sizeof(units[0])];
+  ts_gc_root(&source);
+  for (size_t i=0;i<count;i++){
+    tsv arg = ts_num(units[i]);
+    chars[i] = ts_string_from_char_code(&arg, 1);
+    ts_gc_root(&chars[i]);
+  }
+  tsv result = TS_UNDEFINED;
+  ts_gc_root(&result);
+  int ok = 1;
+  for (size_t p=0;p<count && ok;p++){
+    for (size_t r=0;r<count && ok;r++){
+      for (int all=0;all<=1 && ok;all++){
+        result = ts_str_replace(source, chars[p], chars[r], all);
+        for (size_t n=0;n<count && ok;n++){
+          for (long long idx=-1;idx<=(long long)ts_str_len_typed(result);idx++){
+            long long expected = (long long)ts_str_len_typed(result) +
+              (long long)ts_str_indexof(result, chars[n], 0, 1) +
+              ts_str_charcodeat_i64_typed(result, idx);
+            if (ts_str_replace_literal_metric3(source, chars[p], chars[r],
+                                               chars[n], idx, all) != expected){
+              ok = 0;
+              break;
+            }
+          }
+        }
+      }
+    }
+  }
+  ts_gc_unroot((int)count + 2);
+  return ok;
+}
+
+static void allocation_churn(void){
+  /* Exercise the ordinary nursery trigger, without an explicit collection or
+     a test-specific threshold. */
+  for (int i=0;i<200000;i++) (void)ts_new_object();
+}
+static tsv read_gc_capture(tsv* args, int nargs){
+  return nargs ? ts_get(args[0], 493001u) : TS_UNDEFINED;
+}
+static int allocation_gc_regression(void){
+  int depth = ts_gc_root_depth(), ok = 1;
+  tsv fn=TS_UNDEFINED, pre=TS_UNDEFINED, large=TS_UNDEFINED, arr=TS_UNDEFINED;
+  ts_gc_root(&fn); ts_gc_root(&pre); ts_gc_root(&large); ts_gc_root(&arr);
+  tsv child=ts_new_object(); ts_gc_root(&child);
+  ts_set(child,493001u,ts_num(137));
+  tsv env[600];
+  for (int i=0;i<600;i++) env[i] = child;
+  fn=ts_make_fn(read_gc_capture,env,1);
+  pre=ts_make_fn_t_pretenured(read_gc_capture,env,1,0);
+  large=ts_make_fn(read_gc_capture,env,600);
+  ts_gc_unroot(1);
+  allocation_churn();
+  ok &= ts_to_num(ts_call(fn,NULL,0)) == 137;
+  ok &= ts_to_num(ts_call(pre,NULL,0)) == 137;
+  ok &= ts_to_num(ts_call(large,NULL,0)) == 137;
+  for (int op=0;op<7;op++){
+    arr=ts_new_array(256);
+    allocation_churn(); /* the array is old before its indexed write */
+    child=ts_new_object(); ts_gc_root(&child);
+    ts_set(child,493001u,ts_num(200+op));
+    uint32_t index = op==1 ? 64u : op==2 ? 63u : 255u;
+    ts_array_set(arr,index,child);
+    ts_gc_unroot(1);
+    uint32_t result = 0;
+    if (op==0) ts_array_reverse(arr);
+    else if (op==1){ ts_array_shift(arr); result=63; }
+    else if (op==2){ ts_array_unshift(arr,TS_UNDEFINED); result=64; }
+    else if (op==3){
+      ts_array_copy_within(arr,0,255,256,1);
+      ts_array_set(arr,255,TS_UNDEFINED);
+    } else if (op==4) ts_array_sort(arr,TS_UNDEFINED);
+    else if (op==5){
+      tsv items=ts_new_array(0); ts_gc_root(&items);
+      ts_array_splice(arr,0,255,1,items); ts_gc_unroot(1);
+    } else {
+      ts_set(arr,493002u,ts_array_get(arr,255));
+      ts_array_set(arr,255,TS_UNDEFINED);
+    }
+    allocation_churn();
+    tsv value=op==6 ? ts_get(arr,493002u) : ts_array_get(arr,result);
+    ok &= ts_is_obj(value) && ts_to_num(ts_get(value,493001u)) == 200+op;
+  }
+  /* The last representable card is a conservative full-scan fallback. */
+  uint32_t index = (uint32_t)UINT16_MAX * 64u;
+  arr=ts_new_array(index+1u);
+  allocation_churn();
+  child=ts_new_object(); ts_gc_root(&child);
+  ts_set(child,493001u,ts_num(999)); ts_array_set(arr,index,child);
+  ts_gc_unroot(1);
+  allocation_churn();
+  ok &= ts_to_num(ts_get(ts_array_get(arr,index),493001u)) == 999;
+  tsv map=ts_new_map(); ts_gc_root(&map);
+  for (int i=0;i<512;i++) ts_map_set(map,ts_num(i),TS_UNDEFINED);
+  allocation_churn();
+  child=ts_new_object(); ts_gc_root(&child);
+  ts_set(child,493001u,ts_num(1001));
+  ts_map_set(map,ts_num(511),child); ts_gc_unroot(1);
+  tsv key=ts_new_object(); ts_gc_root(&key);
+  ts_map_set(map,key,ts_num(1002)); ts_gc_unroot(1);
+  for (int i=0;i<300;i++) ts_map_delete(map,ts_num(i));
+  allocation_churn();
+  ok &= ts_to_num(ts_get(ts_map_get(map,ts_num(511)),493001u)) == 1001;
+  ok &= ts_to_num(ts_map_get(map,key)) == 1002;
+  ts_map_clear(map);
+  child=ts_new_object(); ts_gc_root(&child);
+  ts_set(child,493001u,ts_num(1003));
+  ts_map_set(map,ts_num(0),child); ts_gc_unroot(1);
+  allocation_churn();
+  ok &= ts_to_num(ts_get(ts_map_get(map,ts_num(0)),493001u)) == 1003;
+  ts_gc_set_root_depth(depth);
+  return ok;
+}
+
 int main(){
   int fail=0;
   #define CK(name,cond) do{ printf("[%s] %s\n",name,(cond)?"PASS":"*** FAIL ***"); if(!(cond))fail++; }while(0)
@@ -176,6 +303,25 @@ int main(){
   /* Static prototype roots must be installed below all temporary test roots,
      matching generated-program startup order. */
   ts_setup_error_protos();
+  int allocation_gc_ok = allocation_gc_regression();
+  CK("closure storage and array/map dirty cards under automatic GC", allocation_gc_ok);
+  tsv iterator_map = ts_new_map(); ts_gc_root(&iterator_map);
+  int iterator_root_depth = ts_gc_root_depth();
+  tsv empty_iterator = ts_map_values(iterator_map); ts_gc_root(&empty_iterator);
+  CK("lazy iterator cache preserves temporary roots", ts_gc_root_depth() == iterator_root_depth + 1);
+  ts_gc_unroot(2);
+  const int capture_counts[] = {1, 14, 15, 16, 17, 62, 63, 64, 65, 128};
+  int merged_calls_ok = 1;
+  for (unsigned test=0;test<sizeof(capture_counts)/sizeof(capture_counts[0]);test++){
+    int count=capture_counts[test]; tsv env[128];
+    env[0]=ts_num(count);
+    for (int i=1;i<count;i++) env[i]=ts_num(i*3);
+    tsv fn=ts_make_fn(check_merged_call,env,(uint32_t)count); ts_gc_root(&fn);
+    tsv args[2]={ts_num(1001),ts_num(2002)};
+    if (ts_to_num(ts_call(fn,args,2)) != 3003) merged_calls_ok=0;
+    ts_gc_unroot(1);
+  }
+  CK("closure merge small medium and heap boundaries", merged_calls_ok);
   /* objects */
   tsv o=ts_new_object(); ts_gc_root(&o);
   ts_set(o, 100, ts_num(7));
@@ -207,7 +353,35 @@ int main(){
   CK("pic plain warmup", ts_to_num(ts_get_pic_checked_inline(pic_plain, pic_class_key, &pic_ic))==1);
   CK("pic class layout domain", ts_to_num(ts_get_pic_checked_inline(pic_class, pic_class_key, &pic_ic))==2);
   CK("pic class canonical parity", ts_get_pic_checked_inline(pic_class, pic_class_key, &pic_ic)==ts_get(pic_class, pic_class_key));
+  pic_obj=(pic_test_class*)ts_ptr(pic_class);
+  pic_obj->x=ts_num(12);
+  CK("pic class location reads live value",
+     ts_to_num(ts_get_pic_checked_inline(pic_class,pic_class_key,&pic_ic))==12);
+  pic_obj->x=ts_num(2);
+  tsv pic_short=ts_new_object(); ts_gc_root(&pic_short);
+  ts_set_proto(pic_short,pic_proto);
+  ts_set(pic_short,pic_class_key,ts_num(17));
+  CK("pic same prototype shorter storage", ts_to_num(ts_get_pic_checked_inline(pic_short,pic_class_key,&pic_ic))==17 &&
+     ts_to_num(ts_get_pic_checked_inline(pic_class,pic_class_key,&pic_ic))==2);
+  ts_set_proto(pic_class,TS_NULL);
+  CK("pic prototype change rechecks storage", ts_to_num(ts_get_pic_checked_inline(pic_class,pic_class_key,&pic_ic))==99);
+  ts_set_proto(pic_class,pic_proto);
+  ts_prop_ic pic_write_ic=TS_PROP_IC_INIT;
+  ts_set_pic_inline(pic_class,pic_class_key,ts_num(3),&pic_write_ic);
+  ts_set_pic_inline(pic_class,pic_class_key,ts_num(4),&pic_write_ic);
+  CK("pic cached struct writes", ts_to_num(ts_get(pic_class,pic_class_key))==4);
+  ts_gc_unroot(1);
   ts_gc_unroot(3);
+  tsv late_proto=ts_new_proto(); ts_gc_root(&late_proto);
+  tsv late_class=ts_new_sized(sizeof(pic_test_class)); ts_gc_root(&late_class);
+  ((pic_test_class*)ts_ptr(late_class))->o.proto=late_proto;
+  ((pic_test_class*)ts_ptr(late_class))->x=ts_num(8);
+  ts_define_data(late_class,pic_class_key,ts_num(99),1,1,1);
+  ts_prop_ic late_ic=TS_PROP_IC_INIT;
+  CK("pic before class registration", ts_to_num(ts_get_pic_checked_inline(late_class,pic_class_key,&late_ic))==99);
+  ts_register_class(late_proto,&pic_field,1);
+  CK("pic registration invalidates own location", ts_to_num(ts_get_pic_checked_inline(late_class,pic_class_key,&late_ic))==8);
+  ts_gc_unroot(2);
   /* Equal property-key sequences share a hidden shape; insertion order changes
      it. A cached slot from one receiver must read the other receiver's storage. */
   const ts_key shape_a_key = 430001u, shape_x_key = 430002u;
@@ -228,8 +402,8 @@ int main(){
      ts_to_num(ts_get_pic_checked_inline(shape_b, shape_x_key, &shared_shape_ic))==20);
   ts_gc_unroot(3);
 
-  /* A fixed-key site becomes megamorphic after sixteen distinct misses and
-     remains correct for all later shapes. */
+  /* Interface receivers can have many layouts at the same fixed-key site.
+     Shape variation must not permanently disable its cache. */
   ts_prop_ic mega_ic=TS_PROP_IC_INIT;
   int mega_ok=1;
   for (int i=0;i<20;i++){
@@ -241,7 +415,37 @@ int main(){
     ts_gc_unroot(1);
   }
   CK("pic megamorphic values", mega_ok);
-  CK("pic megamorphic threshold", mega_ic.megamorphic && mega_ic.misses==16);
+  CK("pic fixed-key shape variation stays active", !mega_ic.megamorphic);
+  tsv varied=ts_new_object(); ts_gc_root(&varied);
+  ts_set(varied,450000u,ts_num(1)); ts_set(varied,shape_x_key,ts_num(2));
+  CK("pic slot works across unrelated shapes", ts_to_num(ts_get_pic_checked_inline(varied,shape_x_key,&mega_ic))==2);
+  for (int i=0;i<32;i++) (void)ts_get_pic_checked_inline(varied,shape_x_key,&mega_ic);
+  CK("pic repeated new shape is promoted inline", ts_prop_ic_probe_fixed_inline(varied,shape_x_key,&mega_ic)!=NULL);
+  ts_gc_unroot(1);
+  tsv same_slot_shapes[4];
+  ts_prop_ic same_slot_ic=TS_PROP_IC_INIT;
+  for (int i=0;i<4;i++){
+    same_slot_shapes[i]=ts_new_object(); ts_gc_root(&same_slot_shapes[i]);
+    ts_set(same_slot_shapes[i],(ts_key)(451000u+i),ts_num(0));
+    ts_set(same_slot_shapes[i],shape_x_key,ts_num(10+i));
+  }
+  int same_slot_ok=1;
+  for (int i=0;i<32;i++)
+    if (ts_to_num(ts_get_pic_checked_inline(same_slot_shapes[i&3],shape_x_key,&same_slot_ic))!=10+(i&3)) same_slot_ok=0;
+  for (int i=0;i<4;i++)
+    if (!ts_prop_ic_probe_fixed_inline(same_slot_shapes[i],shape_x_key,&same_slot_ic)) same_slot_ok=0;
+  CK("pic retains four shapes sharing one slot", same_slot_ok);
+  ts_gc_unroot(4);
+  ts_prop_ic missing_ic=TS_PROP_IC_INIT;
+  tsv initially_missing=ts_new_object(); ts_gc_root(&initially_missing);
+  for (int i=0;i<32;i++) (void)ts_get_pic_checked_inline(initially_missing, shape_x_key, &missing_ic);
+  ts_set(initially_missing, shape_x_key, ts_num(41));
+  CK("pic missing warmup stays cacheable", !missing_ic.megamorphic &&
+     ts_to_num(ts_get_pic_checked_inline(initially_missing, shape_x_key, &missing_ic))==41);
+  ts_set(initially_missing, shape_x_key, ts_num(42));
+  CK("pic missing warmup sees later writes",
+     ts_to_num(ts_get_pic_checked_inline(initially_missing, shape_x_key, &missing_ic))==42);
+  ts_gc_unroot(1);
 
   /* Delete compacts the dense property vector and switches to dictionary shape,
      preventing a cached slot index from reading the adjacent property. */
@@ -920,6 +1124,18 @@ int main(){
      ts_str_charcodeat_i64_typed(s,0)=='h' && ts_str_charcodeat_i64_typed(s,1)=='i');
   tsv long6=ts_new_string("abcdef",6); ts_gc_root(&long6);
   CK("six-char string heap", ts_is_heap_str(long6) && ts_str_len_typed(long6)==6);
+  uint32_t utf8_len = 0;
+  char* utf8_copy = ts_string_utf8_copy(s, &utf8_len);
+  CK("utf8 copy short string", utf8_len == 2 && !memcmp(utf8_copy, "hi\0", 3));
+  free(utf8_copy);
+  const uint32_t utf8_units[] = {0, 0xe9, 0x6f22, 0xd83d, 0xde00, 0xd800, 'x', 0xdc00};
+  tsv utf8_source = ts_string_from_codepoints(utf8_units, 8); ts_gc_root(&utf8_source);
+  const char utf8_expected[] = "\0\xc3\xa9\xe6\xbc\xa2\xf0\x9f\x98\x80\xef\xbf\xbdx\xef\xbf\xbd";
+  utf8_copy = ts_string_utf8_copy(utf8_source, &utf8_len);
+  CK("utf8 copy NUL unicode and lone surrogates", utf8_len == sizeof(utf8_expected)-1 &&
+     !memcmp(utf8_copy, utf8_expected, sizeof(utf8_expected)));
+  free(utf8_copy);
+  ts_gc_unroot(1);
   CK("str truthy", ts_truthy(s));
   tsv cat=ts_add(s, ts_num(5)); /* "hi"+5 = "hi5" */
   CK("str concat num", ts_is_short_str(cat) &&
@@ -937,6 +1153,14 @@ int main(){
   tsv rxbmppre=ts_new_string("\343\201\202b",4); ts_gc_root(&rxbmppre);
   CK("regexp litprefix utf16", ts_regexp_litprefix_find_view(ts_str_view_typed(rxbmp), ts_str_view_typed(rxbmppre), 0, 0, &rxm) && rxm.start==1 && rxm.end==3);
   ts_gc_unroot(6);
+  int replace_short_ok = replace_unit_metrics_match(ts_new_string("a-+a", 4));
+  CK("replace unit metrics short", replace_short_ok);
+  int replace_empty_ok = replace_unit_metrics_match(ts_new_string("", 0));
+  CK("replace unit metrics empty", replace_empty_ok);
+  const char replace_mixed[] = "\xc3\xa9-\xe6\xbc\xa2\xf0\x9f\x98\x80-\0+\xc3\xa9";
+  int replace_mixed_ok = replace_unit_metrics_match(
+    ts_new_string(replace_mixed, sizeof(replace_mixed) - 1));
+  CK("replace unit metrics mixed UTF16", replace_mixed_ok);
   /* numeric add */
   CK("num add", ts_to_num(ts_add(ts_num(2),ts_num(3)))==5);
   /* strict eq */

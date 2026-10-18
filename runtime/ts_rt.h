@@ -27,6 +27,17 @@
 #include <setjmp.h>
 #include "json_core.h"
 
+/* JS exceptions do not manage the host thread's signal mask. Darwin's setjmp
+   queries that mask with a syscall even on the non-throwing path. Keep the
+   no-mask save/restore pair together; embedders can request the POSIX behavior. */
+#if defined(__APPLE__) && !defined(TSAOT_PRESERVE_SIGNAL_MASK)
+#define ts_setjmp(buf) _setjmp(buf)
+#define ts_longjmp(buf, value) _longjmp(buf, value)
+#else
+#define ts_setjmp(buf) setjmp(buf)
+#define ts_longjmp(buf, value) longjmp(buf, value)
+#endif
+
 #if defined(__GNUC__) || defined(__clang__)
 #define TS_RT_ALWAYS_INLINE static inline __attribute__((always_inline))
 #define TS_RT_LIKELY(x) __builtin_expect(!!(x), 1)
@@ -480,16 +491,18 @@ static inline long long ts_i64_decimal_len_nonneg(long long x){
   return 19;
 }
 static inline double ts_str_charcodeat_fast(tsv s, double idx){
-  if (!ts_is_str(s)) return 0;
+  if (!ts_is_str(s)) return NAN;
   ts_strview x = ts_str_view_typed(s);
+  if (isnan(idx)) idx = 0;
+  if (!x.len || idx <= -1 || idx >= (double)x.len) return NAN;
   long i = (long)idx;
-  if (i < 0 || i >= (long)x.len) return 0;
   return (double)ts_str_cu_at_view(x, (uint32_t)i);
 }
 static inline double ts_str_charcodeat_typed(tsv s, double idx){
   ts_strview x = ts_str_view_typed(s);
+  if (isnan(idx)) idx = 0;
+  if (!x.len || idx <= -1 || idx >= (double)x.len) return NAN;
   long i = (long)idx;
-  if (i < 0 || i >= (long)x.len) return 0;
   return (double)ts_str_cu_at_view(x, (uint32_t)i);
 }
 static inline long long ts_str_charcodeat_i64_typed(tsv s, long long i){
@@ -507,6 +520,12 @@ static inline long long ts_str_slice_charcodeat_fast_i64_typed(tsv s, long long 
     return (long long)ts_str_cu_at_view(x, (uint32_t)(start + i));
   }
   return ts_str_slice_charcodeat_i64_typed(s, start, len, i);
+}
+static inline double ts_str_slice_charcodeat_typed(tsv s, long long start, long long len, double idx){
+  if (isnan(idx)) idx = 0;
+  if (!len || idx <= -1 || idx >= (double)len) return NAN;
+  ts_strview x = ts_str_view_typed(s);
+  return (double)ts_str_cu_at_view(x, (uint32_t)(start + (long long)idx));
 }
 /* General multi-code-unit and mixed-width scanning is an out-of-line worker.
    The allocation-free one-byte/single-unit case stays in the header because it
@@ -599,14 +618,22 @@ long long ts_str_split_join_metric3(tsv s, tsv sep, tsv join_sep,
 typedef struct ts_array {
   ts_obj_common o;   /* proto + lazily-allocated named-property map (unified model) */
   tsv* data; uint32_t len, cap;   /* element fast path */
+  uint8_t element_kind;          /* 0 ordinary array, 1 fixed Uint16 storage */
+  /* Minor-GC dirty cards fit in the existing padding before inline_data.
+     A zero end means empty; generic writes/reordering request a full scan. */
+  uint8_t gc_dirty_all;
+  uint16_t gc_dirty_first, gc_dirty_end;
   tsv inline_data[4];             /* avoids a second malloc for small arrays */
 } ts_array;
 
-static inline int ts_is_array_fast(tsv v){
+static inline int ts_is_indexed_array_fast(tsv v){
   return ts_is_obj(v) && ((ts_gc_header*)ts_ptr(v))->kind == TS_KIND_ARRAY;
 }
+static inline int ts_is_array_fast(tsv v){
+  return ts_is_indexed_array_fast(v) && ((ts_array*)ts_ptr(v))->element_kind == 0;
+}
 static inline uint32_t ts_array_len_fast(tsv arr){
-  return ts_is_array_fast(arr) ? ((ts_array*)ts_ptr(arr))->len : 0;
+  return ts_is_indexed_array_fast(arr) ? ((ts_array*)ts_ptr(arr))->len : 0;
 }
 static inline int ts_truthy_fast(tsv v){
   if (ts_is_num(v)){ double d=ts_to_num(v); return d!=0 && !(d!=d); }
@@ -632,6 +659,11 @@ typedef struct ts_map {
   uint32_t index_cap; /* power-of-2 slot count (0 = linear mode) */
   uint32_t tombs;    /* HOLE entries in keys/vals below len */
   uint8_t weak;      /* WeakMap: keys are weak and values are ephemerons */
+  /* Reuse alignment padding for the same dirty-card span as arrays. */
+  uint8_t gc_dirty_all;
+  uint16_t gc_dirty_first, gc_dirty_end;
+  uint64_t* iteration_order; /* lazily allocated stable insertion IDs */
+  uint64_t next_iteration_order;
 } ts_map;
 
 /* JS Set: insertion-ordered element array, SameValueZero membership; same
@@ -644,6 +676,8 @@ typedef struct ts_set_t {
   uint32_t index_cap;
   uint32_t tombs;
   uint8_t weak;      /* WeakSet: elements are weak keys */
+  uint64_t* iteration_order; /* lazily allocated stable insertion IDs */
+  uint64_t next_iteration_order;
 } ts_set_t;
 
 /* a closure: code pointer + captured environment (array of cells) */
@@ -781,6 +815,8 @@ tsv ts_strproto_charAt(tsv* a, int n);
 tsv ts_strproto_charCodeAt(tsv* a, int n);
 tsv ts_strproto_codePointAt(tsv* a, int n);
 tsv ts_strproto_substring(tsv* a, int n);
+tsv ts_strproto_substr(tsv* a, int n);
+tsv ts_strproto_toString(tsv* a, int n);
 tsv ts_strproto_at(tsv* a, int n);
 tsv ts_strproto_isWellFormed(tsv* a, int n);
 tsv ts_strproto_toWellFormed(tsv* a, int n);
@@ -814,6 +850,7 @@ tsv ts_mapproto_set(tsv* a, int n); tsv ts_mapproto_get(tsv* a, int n);
 tsv ts_mapproto_has(tsv* a, int n); tsv ts_mapproto_delete(tsv* a, int n);
 tsv ts_mapproto_clear(tsv* a, int n); tsv ts_mapproto_keys(tsv* a, int n);
 tsv ts_mapproto_values(tsv* a, int n); tsv ts_mapproto_forEach(tsv* a, int n);
+tsv ts_mapproto_entries(tsv* a, int n);
 tsv ts_setproto_add(tsv* a, int n); tsv ts_setproto_has(tsv* a, int n);
 tsv ts_setproto_delete(tsv* a, int n); tsv ts_setproto_clear(tsv* a, int n);
 tsv ts_setproto_keys(tsv* a, int n); tsv ts_setproto_values(tsv* a, int n);
@@ -868,6 +905,7 @@ tsv  ts_new_sized(size_t size);
 tsv  ts_new_sized_pretenured(size_t size);
 /* arrays (contiguous storage with an internal sparse-hole sentinel) */
 tsv  ts_new_array(uint32_t len);    /* length-len sparse array (all slots holes) */
+tsv  ts_new_uint16_array(tsv input);
 tsv  ts_new_array_pretenured(uint32_t len);
 tsv  ts_array_get(tsv arr, uint32_t i);
 void ts_array_set(tsv arr, uint32_t i, tsv v);
@@ -882,6 +920,8 @@ tsv ts_str_toupper(tsv s);
 tsv ts_str_tolower(tsv s);
 tsv ts_str_slice(tsv s, double start, double end, int has_end);
 tsv ts_str_substring(tsv s, double start, double end, int has_end);
+tsv ts_str_substr(tsv s, tsv start, tsv length);
+tsv ts_str_value(tsv s);
 double ts_str_indexof(tsv s, tsv needle, double from, int has_from);
 double ts_str_lastindexof(tsv s, tsv needle, double from, int has_from);
 tsv ts_number_to_fixed(tsv numv, double digits);
@@ -952,6 +992,7 @@ tsv    ts_date_now_ms(void);
 double ts_date_from_components(double y,double mo,double d,double h,double mi,double s,double mil);
 double ts_date_component(double ms, int which);
 tsv    ts_date_to_iso(double ms);
+tsv    ts_date_to_locale_time(double ms, tsv locales, tsv options);
 
 /* Array: additional methods */
 tsv    ts_array_find(tsv arr, tsv cb);
@@ -992,6 +1033,7 @@ int    ts_is_undefined(tsv v);
 void   ts_object_copy_props(tsv dst, tsv src);
 int    ts_delete_prop(tsv obj, ts_key key);
 int    ts_delete_prop_strict(tsv obj, ts_key key);
+tsv    ts_delete_dynamic_strict(tsv obj, tsv key, const uint32_t* method_pairs, uint32_t count);
 int    ts_has_prop_dyn(tsv obj, tsv keyv);
 int    ts_has_own(tsv obj, ts_key key);
 int    ts_has_own_dyn(tsv obj, tsv keyv);
@@ -1098,9 +1140,10 @@ double   ts_map_size(tsv m);
 tsv      ts_array_entries(tsv arr);
 tsv      ts_array_keys_arr(tsv arr);
 tsv      ts_array_values_arr(tsv arr);
-tsv      ts_map_keys(tsv m);              /* array of keys (insertion order) */
-tsv      ts_map_entries(tsv m);           /* array of [key,value] pairs */
-tsv      ts_map_values(tsv m);            /* array of values */
+tsv      ts_map_keys(tsv m);              /* iterable iterator of keys */
+tsv      ts_map_entries(tsv m);           /* iterable iterator of pairs */
+tsv      ts_map_iterator(tsv m, int kind); /* 0 keys, 1 values, 2 entries */
+tsv      ts_map_values(tsv m);            /* iterable iterator of values */
 void     ts_map_foreach(tsv m, tsv cb);   /* cb(value, key) */
 /* ---- Set ---- */
 tsv      ts_new_set(void);
@@ -1112,9 +1155,9 @@ int      ts_set_has(tsv s, tsv v);
 int      ts_set_delete(tsv s, tsv v);
 void     ts_set_clear(tsv s);
 double   ts_set_size(tsv s);
-tsv      ts_set_keys(tsv s);              /* array of elements */
-tsv      ts_set_values(tsv s);            /* array of elements */
-tsv      ts_set_entries(tsv s);           /* array of [value,value] pairs */
+tsv      ts_set_keys(tsv s);              /* iterable iterator of elements */
+tsv      ts_set_values(tsv s);            /* iterable iterator of elements */
+tsv      ts_set_entries(tsv s);           /* iterable iterator of pairs */
 void     ts_set_foreach(tsv s, tsv cb);   /* cb(value, value) */
 /* ---- WeakMap / WeakSet ----
    WeakMap values use ephemeron semantics: a reachable key retains its value,
@@ -1169,6 +1212,8 @@ void ts_define_property(tsv obj, tsv keyv, tsv desc);
 /* Object.defineProperties(obj, descs) — runtime form (non-literal descriptor map). */
 void ts_define_properties(tsv obj, tsv descs);
 tsv  ts_new_string(const char* s, uint32_t len);
+/* Host boundary: malloc-owned UTF-8 bytes, replacing lone surrogates. */
+char* ts_string_utf8_copy(tsv s, uint32_t* out_len);
 uint32_t* ts_string_codepoints_copy(tsv v, uint32_t* out_len);
 tsv  ts_string_from_codepoints(const uint32_t* cps, uint32_t len);
 tsv  ts_add(tsv a, tsv b);            /* JS '+' (number add or string concat) */
@@ -1241,17 +1286,14 @@ static inline void ts_write_barrier(tsv owner, tsv value){
   ts_gc_header* v = (ts_gc_header*)ts_ptr(value);
   if (o->gen == TS_GEN_OLD && v->gen == TS_GEN_YOUNG) ts_gc_remember(o);
 }
-/* The generated site calls these wrappers, so the four shape/slot guards are
-   compiled into the caller. Only a data-property hit completes inline;
-   accessors, misses, exotics, errors, and cache updates use the canonical
-   out-of-line helpers declared above. Shape identity alone is sufficient here:
-   entries cache own slots, whose layout does not depend on the prototype or
-   receiver allocation size. It also makes the cached slot/key bounds structural:
-   key-sequence changes transition the shape, and deletion sets shape 0. Each
-   fixed-key emitted site owns its cache, so its inline probe only needs shape;
-   the shared slow and computed-key paths continue to validate the key. */
+/* Ordinary shape hits keep their compact cache and original guard sequence.
+   Sized receivers use a separate bounded location table in ts_rt.c.
+   Unsized dictionary receivers validate a cached own slot out of line.
+   Their shape is always zero, so struct precedence and registry changes cannot
+   invalidate an ordinary shape hit. */
 TS_RT_ALWAYS_INLINE ts_prop* ts_prop_ic_probe_fixed_inline(
-    tsv obj, ts_prop_ic* ic){
+    tsv obj, ts_key key, ts_prop_ic* ic){
+  (void)key; /* Each emitted fixed-key site owns its cache. */
   if (!ic || ic->megamorphic || TS_TOP16(obj) != TS_SEL_OBJECT) return NULL;
   ts_object* o = (ts_object*)ts_ptr(obj);
   if (o->h.kind != TS_KIND_OBJECT || ts_obj_shape_id(o) == TS_SHAPE_NONE) return NULL;
@@ -1266,30 +1308,23 @@ TS_RT_ALWAYS_INLINE ts_prop* ts_prop_ic_probe_fixed_inline(
   }
   return NULL;
 }
-TS_RT_ALWAYS_INLINE int ts_prop_is_accessor_inline(const ts_prop* p){
-  return prop_is_accessor(p);
-}
 TS_RT_ALWAYS_INLINE tsv ts_get_pic_checked_inline(
     tsv obj, ts_key key, ts_prop_ic* ic){
-  ts_prop* p = ts_prop_ic_probe_fixed_inline(obj, ic);
-  if (p && !ts_prop_is_accessor_inline(p)){
-    TS_RT_STAT_PIC_GET_CALL();
-    TS_RT_STAT_PIC_GET_HIT();
+  ts_prop* p = ts_prop_ic_probe_fixed_inline(obj, key, ic);
+  if (p && !prop_is_accessor(p)){
+    TS_RT_STAT_PIC_GET_CALL(); TS_RT_STAT_PIC_GET_HIT();
     return p->val;
   }
   return ts_get_pic_checked(obj, key, ic);
 }
 TS_RT_ALWAYS_INLINE void ts_set_pic_inline(
     tsv obj, ts_key key, tsv value, ts_prop_ic* ic){
-  ts_prop* p = ts_prop_ic_probe_fixed_inline(obj, ic);
-  if (p && !ts_prop_is_accessor_inline(p)){
+  ts_prop* p = ts_prop_ic_probe_fixed_inline(obj, key, ic);
+  if (p && !prop_is_accessor(p)){
     ts_object* o = (ts_object*)ts_ptr(obj);
     if (!(ts_obj_integrity(o) & 1u) && prop_is_writable(p)){
-      TS_RT_STAT_PIC_SET_CALL();
-      TS_RT_STAT_PIC_SET_HIT();
-      p->val = value;
-      ts_write_barrier(obj, value);
-      return;
+      TS_RT_STAT_PIC_SET_CALL(); TS_RT_STAT_PIC_SET_HIT();
+      p->val = value; ts_write_barrier(obj, value); return;
     }
   }
   ts_set_pic(obj, key, value, ic);

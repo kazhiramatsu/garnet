@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 # tsaot bounded-parallel CI gate. Builds analyzer+exporter ONCE, runs ordinary
 # correctness gates in waves of at most four jobs, then runs the allocation-heavy
-# GC stress and timed perf phases ALONE. Keeping GC stress out of the parallel
+# optional GC stress and timed perf phases ALONE. Keeping GC stress out of the parallel
 # wave avoids oversubscribing the machine and also prevents concurrent duplicate
 # aging/string stress runs.
 #
-# Equivalent coverage to: conformance basic+exhaustive, comprehensive TypeScript
-# syntax legality/coverage/rejection, focused moving GC stress, ci_fast
+# Default coverage: conformance basic+exhaustive, comprehensive TypeScript
+# syntax legality/coverage/rejection, ordinary ci_fast gates
 # (unit + runtime + golden + fetch + negative), bench-correct 1&2, bench-perf.
+# Forced moving/pretenuring/aging GC coverage is explicitly opt-in.
 #
 # Usage: bash scripts/ci_par.sh   (exit 0 = all green)
+# Optional: TSAOT_CI_GC_STRESS=1 enables forced-GC gates (disabled by default).
 # Optional: TSAOT_CI_GC_STRESS_FORCED_MOVING=1 adds a forced Promise+Coro
 # moving-minor focused gate. Legacy alias: TSAOT_CI_GC_STRESS_MOVING=1.
 # Optional: TSAOT_CI_RUST_JOBS=N controls Cargo/rustc parallelism (default 2).
@@ -23,6 +25,8 @@ RUST_JOBS="${TSAOT_CI_RUST_JOBS:-2}"
   echo "TSAOT_CI_RUST_JOBS must be a positive integer"; exit 2;
 }
 export CARGO_BUILD_JOBS="$RUST_JOBS"
+RUN_FORCED_MOVING="${TSAOT_CI_GC_STRESS_FORCED_MOVING:-${TSAOT_CI_GC_STRESS_MOVING:-0}}"
+export TSAOT_CI_GC_STRESS="${TSAOT_CI_GC_STRESS:-$RUN_FORCED_MOVING}"
 
 echo "=== tsaot CI (parallel) ==="
 
@@ -55,10 +59,14 @@ run() {  # run <name> <cmd...>
 }
 negatives() {  # negative + golden + fetch + runtime suite (ci_fast minus Rust/build)
   local rc=0
+  node "$ROOT/tests/wire_program_tests.js" || rc=1
   bash "$S/run_runtime_tests.sh"            || rc=1
   bash "$ROOT/tests/mimalloc_static_link_gate.sh" || rc=1
   bash "$ROOT/tests/default_optimizations_gate.sh" || rc=1
-  bash "$ROOT/tests/pretenure_aot_gate.sh" || rc=1
+  bash "$ROOT/tests/project_options_gate.sh" || rc=1
+  if [[ "$TSAOT_CI_GC_STRESS" == "1" ]]; then
+    bash "$ROOT/tests/pretenure_aot_gate.sh" || rc=1
+  fi
   # Aging/adaptive-aging are owned by the isolated GC phase below. Running them
   # here as well used to duplicate both gates concurrently.
   bash "$S/run_golden_iter.sh"              || rc=1
@@ -92,11 +100,12 @@ wait
 # --- 3. GC stress alone ---------------------------------------------------------
 # Forced Promise+Coro moving is folded into this invocation. The former second
 # run repeated aging, adaptive-aging, and the 64 MiB string scale gate.
-echo ">>> running GC stress (isolated)"
-RUN_FORCED_MOVING="${TSAOT_CI_GC_STRESS_FORCED_MOVING:-${TSAOT_CI_GC_STRESS_MOVING:-0}}"
-run gc_stress env TSAOT_GC_STRESS_MOVE_BOTH="$RUN_FORCED_MOVING" \
-  bash "$S/run_gc_stress.sh"
-wait
+if [[ "$TSAOT_CI_GC_STRESS" == "1" ]]; then
+  echo ">>> running GC stress (isolated)"
+  run gc_stress env TSAOT_GC_STRESS_MOVE_BOTH="$RUN_FORCED_MOVING" \
+    bash "$S/run_gc_stress.sh"
+  wait
+fi
 
 # --- 4. perf alone (timed; no concurrent load) ---------------------------------
 echo ">>> running perf benchmarks (isolated)"

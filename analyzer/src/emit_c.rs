@@ -392,10 +392,16 @@ fn emit_program_with_string_plans(
     }
     s.push('\n');
     let maxid = program.functions.iter().map(|f| f.id.0).max().unwrap_or(0);
+    // All four ABI metadata tables use the same sparse function-ID domain.
+    // Index once instead of searching every function for every table entry.
+    let mut functions_by_id = vec![None; maxid as usize + 1];
+    for function in &program.functions {
+        functions_by_id[function.id.0 as usize].get_or_insert(function);
+    }
     s.push_str("typedef tsv (*ts_fn)(tsv*, int);\n");
     let _ = write!(s, "static ts_fn FN_TABLE[{}] = {{", maxid + 1);
     for i in 0..=maxid {
-        match program.functions.iter().find(|f| f.id.0 == i) {
+        match functions_by_id[i as usize] {
             Some(f) => {
                 let _ = write!(s, "{}, ", cname(f));
             }
@@ -409,10 +415,7 @@ fn emit_program_with_string_plans(
     // function id, set on a boxed function value in AllocClosure.
     let _ = write!(s, "static const uint32_t FN_ARITY[{}] = {{", maxid + 1);
     for i in 0..=maxid {
-        let a = program
-            .functions
-            .iter()
-            .find(|f| f.id.0 == i)
+        let a = functions_by_id[i as usize]
             .map(|f| f.arity)
             .unwrap_or(0);
         let _ = write!(s, "{}, ", a);
@@ -420,10 +423,7 @@ fn emit_program_with_string_plans(
     s.push_str("};\n");
     let _ = write!(s, "static const char* FN_NAME[{}] = {{", maxid + 1);
     for i in 0..=maxid {
-        let nm = program
-            .functions
-            .iter()
-            .find(|f| f.id.0 == i)
+        let nm = functions_by_id[i as usize]
             .and_then(|f| f.name.as_deref())
             // a synthesized __module_init / anonymous fn has no JS name -> "".
             .filter(|n| !n.starts_with("__"))
@@ -437,10 +437,7 @@ fn emit_program_with_string_plans(
         maxid + 1
     );
     for i in 0..=maxid {
-        let hp = program
-            .functions
-            .iter()
-            .find(|f| f.id.0 == i)
+        let hp = functions_by_id[i as usize]
             .map(|f| f.has_prototype)
             .unwrap_or(false);
         let _ = write!(s, "{}, ", if hp { 1 } else { 0 });
@@ -1343,19 +1340,15 @@ struct Ctx<'a> {
     /// label-id allocator for the plain finally lowering (interior mutability so
     /// emit_inst can allocate fresh labels through a shared &Ctx).
     label_ctr: std::cell::Cell<u32>,
-    /// stack of (top_label, end_label) for loops emitted in the plain finally
+    /// Stack of (top_label, end_label, handler_depth) for loops emitted in the plain finally
     /// path, so a break/continue crossing a finally can target the right loop.
-    loop_labels: std::cell::RefCell<Vec<(u32, u32)>>,
+    loop_labels: std::cell::RefCell<Vec<(u32, u32, u32)>>,
     /// Active straight-line loop modulo residues. A `%` inside the current loop
     /// can read the residue instead of recomputing `ind % const`; the loop emitter
     /// advances the residue after the induction variable update.
     loop_mod_residues: std::cell::RefCell<Vec<BTreeMap<(u32, u32), LoopModResidue>>>,
-    /// stack of enclosing finally contexts (pend var, pendv var, finally label) for
-    /// the plain lowering, so an abrupt completion in a NESTED try/finally is
-    /// propagated outward through each finally rather than executed immediately.
-    /// The 4th element is the number of live C EH handlers (ts_eh_push) that the
-    /// outer finally's protected region holds, so a propagating goto can pop them.
-    fin_stack: std::cell::RefCell<Vec<(String, String, u32, u32)>>,
+    /// Enclosing finally contexts, with the loop scope at each protected entry.
+    fin_stack: std::cell::RefCell<Vec<FinCtx>>,
     /// count of live C EH handlers pushed in the current emission path (so a goto
     /// that crosses them can emit the right number of ts_eh_pop()).
     eh_depth: std::cell::Cell<u32>,
@@ -1505,6 +1498,14 @@ fn frame_roots_enabled() -> bool {
             Ok("0") | Ok("false") | Ok("no") | Ok("off")
         )
     })
+}
+
+fn exception_setjmp_name() -> &'static str {
+    if std::env::var("TSAOT_FAST_EXCEPTIONS").ok().as_deref() == Some("0") {
+        "setjmp"
+    } else {
+        "ts_setjmp"
+    }
 }
 
 fn prop_pic_enabled() -> bool {
@@ -3397,6 +3398,89 @@ fn loop_mod_residue_candidates(
     out.into_values().collect()
 }
 
+/// An ordered set of instruction indices. Dense indices make a bitset cheaper
+/// than allocating/rebalancing tree nodes during every numeric-analysis sweep.
+struct InstructionWorklist {
+    words: Vec<u64>,
+    first: usize,
+}
+
+impl InstructionWorklist {
+    fn new(len: usize, filled: bool) -> Self {
+        let mut words = vec![if filled { u64::MAX } else { 0 }; len.div_ceil(64)];
+        if filled && len % 64 != 0 {
+            *words.last_mut().unwrap() = (1u64 << (len % 64)) - 1;
+        }
+        let first = if filled { 0 } else { words.len() };
+        Self { words, first }
+    }
+
+    fn insert(&mut self, index: usize) {
+        let word = index / 64;
+        self.words[word] |= 1u64 << (index % 64);
+        self.first = self.first.min(word);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.first == self.words.len()
+    }
+
+    fn pop_first(&mut self) -> Option<usize> {
+        if self.is_empty() {
+            return None;
+        }
+        let word = self.first;
+        let bits = self.words[word];
+        self.words[word] = bits & (bits - 1);
+        while self.first < self.words.len() && self.words[self.first] == 0 {
+            self.first += 1;
+        }
+        Some(word * 64 + bits.trailing_zeros() as usize)
+    }
+}
+
+#[cfg(test)]
+mod instruction_worklist_tests {
+    use super::InstructionWorklist;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn matches_ordered_set_across_word_boundaries() {
+        for len in [0, 1, 63, 64, 65, 129, 4097] {
+            for filled in [false, true] {
+                let mut work = InstructionWorklist::new(len, filled);
+                let mut expected: BTreeSet<usize> = if filled {
+                    (0..len).collect()
+                } else {
+                    BTreeSet::new()
+                };
+                let mut random = 0x12345678u32;
+                for _ in 0..2000 {
+                    random = random.wrapping_mul(1664525).wrapping_add(1013904223);
+                    if len != 0 && random & 3 != 0 {
+                        let index = (random >> 2) as usize % len;
+                        work.insert(index);
+                        expected.insert(index);
+                    } else {
+                        assert_eq!(work.pop_first(), expected.pop_first());
+                    }
+                    assert_eq!(work.is_empty(), expected.is_empty());
+                }
+                while !expected.is_empty() {
+                    assert_eq!(work.pop_first(), expected.pop_first());
+                }
+                assert_eq!(work.pop_first(), None);
+                assert!(work.is_empty());
+                if len != 0 {
+                    work.insert(0);
+                    assert_eq!(work.pop_first(), Some(0));
+                    assert_eq!(work.pop_first(), None);
+                }
+            }
+        }
+    }
+}
+
 fn infer_numeric_analysis(
     body: &[Inst],
     unboxed: &BTreeSet<u32>,
@@ -3426,10 +3510,28 @@ fn infer_numeric_analysis(
         }
     };
 
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for inst in &flat {
+    // Keep the existing forward-sweep order, but revisit only definitions whose
+    // inputs changed. Range widening in a small loop can otherwise force every
+    // unrelated module initializer through thousands of full scans.
+    let mut users: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+    for (index, inst) in flat.iter().enumerate() {
+        match inst {
+            Inst::Copy { src, .. } => users.entry(src.0).or_default().push(index),
+            Inst::UnOp { operand, .. } => users.entry(operand.0).or_default().push(index),
+            Inst::BinOp { lhs, rhs, .. } => {
+                users.entry(lhs.0).or_default().push(index);
+                if lhs != rhs {
+                    users.entry(rhs.0).or_default().push(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut dirty = InstructionWorklist::new(flat.len(), true);
+    let mut next_sweep = InstructionWorklist::new(flat.len(), false);
+    while !dirty.is_empty() {
+        while let Some(index) = dirty.pop_first() {
+            let inst = flat[index];
             let def: Option<(u32, NumFact)> = match inst {
                 Inst::Const { dst, value } => {
                     let f = match value {
@@ -3758,7 +3860,9 @@ fn infer_numeric_analysis(
                     ..
                 } => {
                     let f = match builtin.as_str() {
-                        "string.charCodeAt" => NumFact::range(0, 65_535),
+                        // An out-of-range index produces NaN, even when its
+                        // static TypeScript type is number.
+                        "string.charCodeAt" => NumFact::unknown(),
                         "string.indexOf" | "string.lastIndexOf" => NumFact::i64_value(),
                         _ => NumFact::unknown(),
                     };
@@ -3784,10 +3888,19 @@ fn infer_numeric_analysis(
             };
             if let Some((id, nf)) = def {
                 if merge(&mut facts, id, nf) {
-                    changed = true;
+                    if let Some(dependents) = users.get(&id) {
+                        for &user in dependents {
+                            if user > index {
+                                dirty.insert(user);
+                            } else {
+                                next_sweep.insert(user);
+                            }
+                        }
+                    }
                 }
             }
         }
+        std::mem::swap(&mut dirty, &mut next_sweep);
     }
 
     let int_local: BTreeSet<u32> = facts
@@ -4070,14 +4183,35 @@ fn infer_program_param_facts(
         let mut seen: BTreeSet<(u32, usize)> = BTreeSet::new();
         let mut next: BTreeMap<u32, BTreeMap<u32, NumFact>> = BTreeMap::new();
         for f in &program.functions {
+            let mut flat = Vec::new();
+            flatten_inst(&f.body, &mut flat);
+            // Only resolved calls to non-indirect functions with parameters can
+            // contribute a parameter fact. Avoid solving unrelated callers.
+            let eligible = |target: u32| {
+                !indirect.contains(&target)
+                    && fn_params
+                        .get(&target)
+                        .is_some_and(|params| !params.is_empty())
+            };
+            if !flat.iter().any(|inst| match inst {
+                Inst::Call {
+                    callee: CalleeRef::Direct { func },
+                    ..
+                } => eligible(func.0),
+                Inst::Call {
+                    callee: CalleeRef::Set { funcs },
+                    ..
+                } => funcs.iter().any(|func| eligible(func.0)),
+                _ => false,
+            }) {
+                continue;
+            }
             let param_facts = by_func.get(&f.id.0).cloned().unwrap_or_default();
             let local_class = local_class_map(f);
             let unboxed = unboxed_candidates(f, &local_class);
             let empty_return_facts: BTreeMap<u32, NumFact> = BTreeMap::new();
             let analysis =
                 infer_numeric_analysis(&f.body, &unboxed, &param_facts, &empty_return_facts);
-            let mut flat = Vec::new();
-            flatten_inst(&f.body, &mut flat);
             for inst in flat {
                 match inst {
                     Inst::Call {
@@ -4483,6 +4617,16 @@ fn collect_i64_seed_param_facts(
         .collect();
     let mut out: BTreeMap<u32, BTreeMap<u32, NumFact>> = BTreeMap::new();
     for caller in &program.functions {
+        let mut flat = Vec::new();
+        flatten_inst(&caller.body, &mut flat);
+        // This pass only consumes arguments at direct calls to candidates.
+        if !flat.iter().any(|inst| {
+            matches!(inst,
+                Inst::Call { callee: CalleeRef::Direct { func }, .. }
+                    if candidates.contains(&func.0))
+        }) {
+            continue;
+        }
         let local_class = local_class_map(caller);
         let unboxed = unboxed_candidates(caller, &local_class);
         let empty = BTreeMap::new();
@@ -4495,8 +4639,6 @@ fn collect_i64_seed_param_facts(
             .filter(|p| local_is_number(program, caller, *p))
             .collect();
         let numeric_values = numeric_value_locs(&caller.body, &caller_numeric_params, candidates);
-        let mut flat = Vec::new();
-        flatten_inst(&caller.body, &mut flat);
         for inst in flat {
             if let Inst::Call {
                 callee: CalleeRef::Direct { func },
@@ -5911,21 +6053,33 @@ fn emit_method_value_lookup(
     let _ = writeln!(s, "    ts_check_method_recv({}, {}u);", recv_expr, name_field);
     match method_field {
         Some(fid) => {
-            let _ = writeln!(s, "    tsv _mv = ts_get({}, {}u);", recv_expr, fid);
-            let _ = writeln!(
-                s,
-                "    if (!ts_is_callable(_mv)) _mv = ts_get({}, {});",
-                recv_expr,
-                method_key_str(method_id, wksym)
-            );
+            if prop_pic_enabled() {
+                s.push_str("    static ts_prop_ic _ts_method_field_ic = TS_PROP_IC_INIT;\n");
+                s.push_str("    static ts_prop_ic _ts_method_proto_ic = TS_PROP_IC_INIT;\n");
+                let _ = writeln!(s, "    tsv _mv = ts_get_pic_checked_inline({}, {}u, &_ts_method_field_ic);", recv_expr, fid);
+                let _ = writeln!(s, "    if (!ts_is_callable(_mv)) _mv = ts_get_pic_checked_inline({}, {}, &_ts_method_proto_ic);", recv_expr, method_key_str(method_id, wksym));
+            } else {
+                let _ = writeln!(s, "    tsv _mv = ts_get({}, {}u);", recv_expr, fid);
+                let _ = writeln!(
+                    s,
+                    "    if (!ts_is_callable(_mv)) _mv = ts_get({}, {});",
+                    recv_expr,
+                    method_key_str(method_id, wksym)
+                );
+            }
         }
         None => {
-            let _ = writeln!(
-                s,
-                "    tsv _mv = ts_get({}, {});",
-                recv_expr,
-                method_key_str(method_id, wksym)
-            );
+            if prop_pic_enabled() {
+                s.push_str("    static ts_prop_ic _ts_method_proto_ic = TS_PROP_IC_INIT;\n");
+                let _ = writeln!(s, "    tsv _mv = ts_get_pic_checked_inline({}, {}, &_ts_method_proto_ic);", recv_expr, method_key_str(method_id, wksym));
+            } else {
+                let _ = writeln!(
+                    s,
+                    "    tsv _mv = ts_get({}, {});",
+                    recv_expr,
+                    method_key_str(method_id, wksym)
+                );
+            }
         }
     }
     let _ = writeln!(
@@ -6468,7 +6622,7 @@ fn emit_sm_resume_body(s: &mut String, f: &Function, ctx: &Ctx, mode: SmMode) {
     // rejects the function's promise (instead of aborting). Pushed first (bottom of
     // the handler stack), re-armed on every resume entry.
     if mode.is_promise_backed() {
-        s.push_str("  if (setjmp(_fr->c.reject_buf) != 0) {\n");
+        let _ = writeln!(s, "  if ({}(_fr->c.reject_buf) != 0) {{", exception_setjmp_name());
         if mode == SmMode::AsyncGenerator {
             s.push_str("    _fr->c.done = 1;\n");
             s.push_str("    if (ts_is_gen_return_completion(ts_current_exception())) {\n");
@@ -6489,7 +6643,7 @@ fn emit_sm_resume_body(s: &mut String, f: &Function, ctx: &Ctx, mode: SmMode) {
     // function throws come back here.
     if has_coro_try {
         s.push_str("  if (_fr->c.eh_top > 0) {\n");
-        s.push_str("    if (setjmp(_fr->c.eh_buf) != 0) {\n");
+        let _ = writeln!(s, "    if ({}(_fr->c.eh_buf) != 0) {{", exception_setjmp_name());
         s.push_str("      int _t = --_fr->c.eh_top;\n");
         s.push_str("      ts_gc_set_root_depth(_fr->c.eh_gc_depth[_t]);\n");
         s.push_str("      ts_eh_pop();\n");
@@ -6533,7 +6687,7 @@ fn emit_sm_resume_body(s: &mut String, f: &Function, ctx: &Ctx, mode: SmMode) {
                 s.push_str("    _fr->c.eh_gc_depth[_t] = ts_gc_root_depth();\n");
                 let _ = writeln!(s, "    _fr->c.eh_catch_state[_t] = {};", catch_label);
                 s.push_str("  }\n");
-                s.push_str("  if (setjmp(_fr->c.eh_buf) != 0) {\n");
+                let _ = writeln!(s, "  if ({}(_fr->c.eh_buf) != 0) {{", exception_setjmp_name());
                 s.push_str("    int _t = --_fr->c.eh_top;\n");
                 s.push_str("    ts_gc_set_root_depth(_fr->c.eh_gc_depth[_t]);\n");
                 s.push_str("    ts_eh_pop();\n");
@@ -6583,7 +6737,7 @@ fn emit_sm_resume_body(s: &mut String, f: &Function, ctx: &Ctx, mode: SmMode) {
                 s.push_str("    _fr->c.eh_gc_depth[_t] = ts_gc_root_depth();\n");
                 let _ = writeln!(s, "    _fr->c.eh_catch_state[_t] = {};", fin_catch_label);
                 s.push_str("  }\n");
-                s.push_str("  if (setjmp(_fr->c.eh_buf) != 0) {\n");
+                let _ = writeln!(s, "  if ({}(_fr->c.eh_buf) != 0) {{", exception_setjmp_name());
                 s.push_str("    int _t = --_fr->c.eh_top;\n");
                 s.push_str("    ts_gc_set_root_depth(_fr->c.eh_gc_depth[_t]);\n");
                 s.push_str("    ts_eh_pop();\n");
@@ -7021,12 +7175,16 @@ fn emit_asyncgen_function(s: &mut String, f: &Function, ctx: &Ctx) {
 
 /// Completion-record context for the plain (non-coroutine) finally lowering.
 /// `pend` is the C variable holding the pending completion kind; the finally
-/// dispatch acts on it. Pending kinds: 0 normal,1 return,2 break,3 continue,4 throw.
+/// dispatch acts on it. Pending kinds: 0 normal, 1 return, 4 throw, 5+label jump.
+#[derive(Clone)]
 struct FinCtx {
     pend: String,   // e.g. "_pend0"
     pendv: String,  // pending return value var
     fin_label: u32, // goto target = the finally body
     base_eh_depth: u32,
+    loops_at_entry: usize,
+    // Pending jump code -> (target loop index, C label, live handler depth).
+    jumps: std::rc::Rc<std::cell::RefCell<BTreeMap<u32, (usize, u32, u32)>>>,
 }
 
 /// Emit a body that is inside a finally-protected region. Return/Break/Continue
@@ -7050,24 +7208,28 @@ fn emit_guarded(s: &mut String, body: &[Inst], ctx: &Ctx, fc: &FinCtx, loop_dept
                     fc.pendv, v, fc.pend, pop_str, fc.fin_label
                 );
             }
-            // Inside a try/finally region the exporter rejects multi-level (up>=1)
-            // break/continue, so these only ever see up==0 (a plain break/continue);
-            // `up` is ignored here.
-            Inst::Break { .. } if loop_depth == 0 => {
-                let pops = ctx.eh_depth.get().saturating_sub(fc.base_eh_depth);
-                let pop_str = "ts_eh_pop(); ".repeat(pops as usize);
-                let _ = writeln!(s, "  {} = 2; {}goto L{};", fc.pend, pop_str, fc.fin_label);
-            }
-            Inst::Continue { .. } if loop_depth == 0 => {
-                let pops = ctx.eh_depth.get().saturating_sub(fc.base_eh_depth);
-                let pop_str = "ts_eh_pop(); ".repeat(pops as usize);
-                let _ = writeln!(s, "  {} = 3; {}goto L{};", fc.pend, pop_str, fc.fin_label);
-            }
-            Inst::Break { .. } => {
-                s.push_str("  break;\n");
-            }
-            Inst::Continue { .. } => {
-                s.push_str("  continue;\n");
+            Inst::Break { up } | Inst::Continue { up } => {
+                if (*up as usize) < loop_depth as usize {
+                    emit_inst(s, inst, ctx);
+                } else {
+                    let labels = ctx.loop_labels.borrow();
+                    let index = labels.len() - 1 - *up as usize;
+                    let (top, end, eh_depth) = labels[index];
+                    let label = if matches!(inst, Inst::Break { .. }) {
+                        end
+                    } else {
+                        top
+                    };
+                    let code = 5 + label;
+                    fc.jumps.borrow_mut().insert(code, (index, label, eh_depth));
+                    let pops = ctx.eh_depth.get().saturating_sub(fc.base_eh_depth);
+                    let pop_str = "ts_eh_pop(); ".repeat(pops as usize);
+                    let _ = writeln!(
+                        s,
+                        "  {} = {}; {}goto L{};",
+                        fc.pend, code, pop_str, fc.fin_label
+                    );
+                }
             }
             Inst::If {
                 cond,
@@ -7085,13 +7247,19 @@ fn emit_guarded(s: &mut String, body: &[Inst], ctx: &Ctx, fc: &FinCtx, loop_dept
                 cond_body,
                 body: lbody,
             } => {
-                // a loop local to the guarded region: break/continue inside target
-                // it, so emit as a real C loop and recurse with loop_depth+1.
+                let top = ctx.fresh_label();
+                let end = ctx.fresh_label();
+                ctx.loop_labels
+                    .borrow_mut()
+                    .push((top, end, ctx.eh_depth.get()));
+                let _ = writeln!(s, "  L{}: ;", top);
                 s.push_str("  for (;;) {\n");
                 emit_guarded(s, cond_body, ctx, fc, loop_depth + 1);
                 let _ = writeln!(s, "    if (!{}) break;", ctx.truthy(cond.0));
                 emit_guarded(s, lbody, ctx, fc, loop_depth + 1);
                 s.push_str("  }\n");
+                let _ = writeln!(s, "  L{}: ;", end);
+                ctx.loop_labels.borrow_mut().pop();
             }
             // throw inside the guarded region still uses the EH path (the finally
             // handler set up by emit_plain_finally catches it).
@@ -7104,8 +7272,7 @@ fn emit_guarded(s: &mut String, body: &[Inst], ctx: &Ctx, fc: &FinCtx, loop_dept
                 // A nested try/finally inside a guarded region: emit it via
                 // emit_plain_finally, which pushes/pops the fin_stack so this inner
                 // finally propagates its completion OUT to the current (fc) finally.
-                let outer = ctx.loop_labels.borrow().last().copied();
-                emit_plain_finally(s, try_body, catch_var, catch_body, finally_body, ctx, outer);
+                emit_plain_finally(s, try_body, catch_var, catch_body, finally_body, ctx);
             }
             Inst::TryCatch {
                 try_body,
@@ -7115,7 +7282,7 @@ fn emit_guarded(s: &mut String, body: &[Inst], ctx: &Ctx, fc: &FinCtx, loop_dept
             } if finally_body.is_empty() => {
                 let base_eh_depth = ctx.eh_depth.get();
                 s.push_str("  {\n    ts_handler* _h = ts_eh_push();\n");
-                s.push_str("    if (setjmp(_h->buf) == 0) {\n");
+                let _ = writeln!(s, "    if ({}(_h->buf) == 0) {{", exception_setjmp_name());
                 ctx.eh_depth.set(base_eh_depth + 1);
                 emit_guarded(s, try_body, ctx, fc, loop_depth);
                 s.push_str("      ts_eh_pop();\n");
@@ -7148,7 +7315,6 @@ fn emit_plain_finally(
     catch_body: &[Inst],
     finally_body: &[Inst],
     ctx: &Ctx,
-    outer_loop: Option<(u32, u32)>,
 ) {
     let fin_label = ctx.fresh_label();
     let after_label = ctx.fresh_label();
@@ -7163,17 +7329,17 @@ fn emit_plain_finally(
         pendv: pendv.clone(),
         fin_label,
         base_eh_depth,
+        loops_at_entry: ctx.loop_labels.borrow().len(),
+        jumps: std::rc::Rc::new(std::cell::RefCell::new(BTreeMap::new())),
     };
     // completion record locals: kind (0 normal,1 return,2 break,3 continue,4 throw)
     let _ = writeln!(s, "  int {} = 0; tsv {} = TS_UNDEFINED;", pend, pendv);
     let has_catch = !catch_body.is_empty() || catch_var.is_some();
-    ctx.fin_stack
-        .borrow_mut()
-        .push((pend.clone(), pendv.clone(), fin_label, base_eh_depth));
+    ctx.fin_stack.borrow_mut().push(fc.clone());
     // EH handler so a throw in try/catch lands and routes through the finally.
     s.push_str("  {\n    ts_handler* _h = ts_eh_push();\n");
     ctx.eh_depth.set(base_eh_depth + 1);
-    let _ = writeln!(s, "    if (setjmp(_h->buf) == 0) {{");
+    let _ = writeln!(s, "    if ({}(_h->buf) == 0) {{", exception_setjmp_name());
     emit_guarded(s, try_body, ctx, &fc, 0);
     s.push_str("      ts_eh_pop();\n");
     let _ = writeln!(s, "      goto L{};", fin_label); // normal completion of try
@@ -7194,7 +7360,7 @@ fn emit_plain_finally(
         s.push_str("      {\n        ts_handler* _h2 = ts_eh_push();\n");
         // within the catch body, the live handler is _h2 (the outer _h was popped).
         ctx.eh_depth.set(base_eh_depth + 1);
-        s.push_str("        if (setjmp(_h2->buf) == 0) {\n");
+        let _ = writeln!(s, "        if ({}(_h2->buf) == 0) {{", exception_setjmp_name());
         emit_guarded(s, catch_body, ctx, &fc, 0);
         s.push_str("          ts_eh_pop();\n");
         let _ = writeln!(s, "          goto L{};", fin_label);
@@ -7222,48 +7388,52 @@ fn emit_plain_finally(
     // leaving the protected region: restore EH depth and pop the finally context.
     ctx.eh_depth.set(base_eh_depth);
     ctx.fin_stack.borrow_mut().pop();
-    // finally body (emitted in the enclosing context).
-    let _ = writeln!(s, "  L{}: ;", fin_label);
-    for i in finally_body {
-        emit_inst(s, i, ctx);
-    }
-    // dispatch on the pending completion. If nested inside another finally,
-    // propagate the completion outward (popping any EH handlers between this
-    // finally and the outer one) and jump to the outer finally; else execute.
     let outer_fin = ctx.fin_stack.borrow().last().cloned();
+    let _ = writeln!(s, "  L{}: ;", fin_label);
+    if let Some(outer) = &outer_fin {
+        let depth = ctx.loop_labels.borrow().len() - outer.loops_at_entry;
+        emit_guarded(s, finally_body, ctx, outer, depth as u32);
+    } else {
+        for inst in finally_body {
+            emit_inst(s, inst, ctx);
+        }
+    }
     let _ = writeln!(s, "  switch ({}) {{", pend);
-    if let Some((opend, opendv, ofin, odepth)) = outer_fin {
-        // pop the handlers that the outer finally's region holds above its base
-        // (we are currently inside the outer try, so its _h is still live).
-        let pops = base_eh_depth.saturating_sub(odepth);
-        let pop_str = "ts_eh_pop(); ".repeat(pops as usize);
+    if let Some(outer) = &outer_fin {
+        let pop_str =
+            "ts_eh_pop(); ".repeat(base_eh_depth.saturating_sub(outer.base_eh_depth) as usize);
         let _ = writeln!(
             s,
             "    case 1: {}{} = 1; {} = {}; goto L{};",
-            pop_str, opend, opendv, pendv, ofin
-        );
-        let _ = writeln!(s, "    case 2: {}{} = 2; goto L{};", pop_str, opend, ofin);
-        let _ = writeln!(s, "    case 3: {}{} = 3; goto L{};", pop_str, opend, ofin);
-        let _ = writeln!(
-            s,
-            "    case 4: {}{} = 4; {} = {}; goto L{};",
-            pop_str, opend, opendv, pendv, ofin
+            pop_str, outer.pend, outer.pendv, pendv, outer.fin_label
         );
     } else {
+        let pop_str = "ts_eh_pop(); ".repeat(base_eh_depth as usize);
         let cleanup = ctx.root_cleanup();
-        let unroot = if !cleanup.is_empty() {
-            format!("{} ", cleanup)
-        } else {
-            String::new()
-        };
-        let _ = writeln!(s, "    case 1: {}return {};", unroot, pendv); // return
-        if let Some((top, end)) = outer_loop {
-            let _ = writeln!(s, "    case 2: goto L{};", end); // break -> outer loop end
-            let _ = writeln!(s, "    case 3: goto L{};", top); // continue -> outer loop top
-        } else {
-            s.push_str("    case 2: case 3: break;\n");
+        let _ = writeln!(s, "    case 1: {}{} return {};", pop_str, cleanup, pendv);
+    }
+    // A throw resumes the active EH chain, including an enclosing catch.
+    // Jump completions only run outer finally blocks they actually leave.
+    let _ = writeln!(s, "    case 4: ts_throw({});", pendv);
+    for (&code, &(index, label, eh_depth)) in fc.jumps.borrow().iter() {
+        if let Some(outer) = &outer_fin {
+            if index < outer.loops_at_entry {
+                outer
+                    .jumps
+                    .borrow_mut()
+                    .insert(code, (index, label, eh_depth));
+                let pop_str = "ts_eh_pop(); "
+                    .repeat(base_eh_depth.saturating_sub(outer.base_eh_depth) as usize);
+                let _ = writeln!(
+                    s,
+                    "    case {}: {}{} = {}; goto L{};",
+                    code, pop_str, outer.pend, code, outer.fin_label
+                );
+                continue;
+            }
         }
-        let _ = writeln!(s, "    case 4: ts_throw({});", pendv); // re-throw
+        let pop_str = "ts_eh_pop(); ".repeat(base_eh_depth.saturating_sub(eh_depth) as usize);
+        let _ = writeln!(s, "    case {}: {}goto L{};", code, pop_str, label);
     }
     s.push_str("    default: ;\n  }\n");
     let _ = writeln!(s, "  L{}: ;", after_label);
@@ -8047,11 +8217,13 @@ fn emit_scalar_slice_calc(s: &mut String, dst: u32, spec: &ScalarStringSlice, ct
     let end_tmp = format!("_ssb{}", dst);
     let start_expr = spec
         .start
-        .map(|id| ctx.num(id))
+        .map(|id| ctx.numc(id))
         .unwrap_or_else(|| "0".to_string());
     let end_expr = spec
         .end
-        .map(|id| ctx.num(id))
+        .map(|id| if ctx.unboxed.contains(&id) { ctx.numc(id) } else {
+            format!("(ts_is_undefined_fast({}) ? (double){} : {})", ctx.val(id), len_tmp, ctx.numc(id))
+        })
         .unwrap_or_else(|| len_tmp.clone());
 
     let _ = writeln!(
@@ -8060,12 +8232,20 @@ fn emit_scalar_slice_calc(s: &mut String, dst: u32, spec: &ScalarStringSlice, ct
         len_tmp, base
     );
     let _ = writeln!(s, "    ss_base{} = {};", spec.root, base);
-    let _ = writeln!(
-        s,
-        "    long long {} = (long long)({});",
-        start_tmp, start_expr
-    );
-    let _ = writeln!(s, "    long long {} = (long long)({});", end_tmp, end_expr);
+    if spec.start.map_or(true, |id| ctx.int_local.contains(&id)) {
+        let _ = writeln!(s, "    long long {} = (long long)({});", start_tmp, start_expr);
+    } else {
+        let _ = writeln!(s,
+            "    double _ssda{0} = {1};\n    long long {2} = isnan(_ssda{0}) ? 0 : (long long)fmax(-(double){3}, fmin((double){3}, _ssda{0}));",
+            dst, start_expr, start_tmp, len_tmp);
+    }
+    if spec.end.map_or(true, |id| ctx.int_local.contains(&id)) {
+        let _ = writeln!(s, "    long long {} = (long long)({});", end_tmp, end_expr);
+    } else {
+        let _ = writeln!(s,
+            "    double _ssdb{0} = {1};\n    long long {2} = isnan(_ssdb{0}) ? 0 : (long long)fmax(-(double){3}, fmin((double){3}, _ssdb{0}));",
+            dst, end_expr, end_tmp, len_tmp);
+    }
     match spec.kind {
         ScalarSliceKind::Slice => {
             let _ = writeln!(
@@ -8168,7 +8348,7 @@ fn scalar_slice_charcodeat_expr(spec: &ScalarStringSlice, args: &[LocalId], ctx:
     let idx = match args.first() {
         Some(a) if ctx.int_const.contains_key(&a.0) => ctx.int_const[&a.0].to_string(),
         Some(a) if ctx.int_local.contains(&a.0) => format!("d{}", a.0),
-        Some(a) => format!("(long long)({})", ctx.num(a.0)),
+        Some(a) => ctx.numc(a.0),
         None => "0".to_string(),
     };
     let len = spec
@@ -8176,8 +8356,8 @@ fn scalar_slice_charcodeat_expr(spec: &ScalarStringSlice, args: &[LocalId], ctx:
         .map(|n| n.to_string())
         .unwrap_or_else(|| format!("ss_len{}", spec.root));
     format!(
-        "ts_str_slice_charcodeat_fast_i64_typed(ss_base{}, ss_start{}, {}, {}, ss_fast{})",
-        spec.root, spec.root, len, idx, spec.root
+        "ts_str_slice_charcodeat_typed(ss_base{}, ss_start{}, {}, {})",
+        spec.root, spec.root, len, idx
     )
 }
 
@@ -8861,7 +9041,7 @@ fn try_emit_fused_charcode_scan_loop_body(
         || !ctx.int_local.contains(&idx)
         || !ctx.int_local.contains(&len.0)
         || !ctx.int_local.contains(&counter)
-        || !ctx.int_local.contains(&acc.0)
+        || !ctx.unboxed.contains(&acc.0)
     {
         return None;
     }
@@ -9365,7 +9545,7 @@ fn try_emit_fused_string_concat_loop(
         || char_idx < 0
         || threshold <= char_idx
         || counter_inc < 0
-        || !ctx.int_local.contains(&sum_copy.0)
+        || !ctx.unboxed.contains(&sum_copy.0)
     {
         return None;
     }
@@ -9406,19 +9586,57 @@ fn try_emit_fused_string_concat_loop(
         "  long long {} = 0; if ({} > 0) {} = ts_str_charcodeat_i64_typed({}, {}LL % {});",
         char_var, chunk_len_var, char_var, chunk_val, char_idx, chunk_len_var
     );
-    let _ = writeln!(s, "  if ({} == 0 && {} > 0) {{", len_var, chunk_len_var);
+    // A guarded integer shadow keeps the long concat loop cheap while the
+    // general result remains a double (charCodeAt can produce NaN). Bound every
+    // addition below 2^52; fallback retains source evaluation for other inputs.
+    let integer_guard = if ctx.int_local.contains(&sum_copy.0) {
+        "1".to_string()
+    } else if let [Inst::BinOp { dst, op, lhs, rhs }] = cond_body {
+        if dst.0 == cond.0
+            && op == "<"
+            && lhs.0 == counter
+            && ctx.int_local.contains(&rhs.0)
+            && counter_inc > 0
+        {
+            format!("(isfinite(d{a}) && trunc(d{a}) == d{a} && fabs(d{a}) + (fmax(0.0, (double)({limit}) - (double)d{counter}) + 1.0) * ((double){chunk} + {threshold}.0 + 65535.0) <= 4503599627370495.0)",
+                a=sum_copy.0, limit=ctx.num(rhs.0), chunk=chunk_len_var)
+        } else {
+            "0".to_string()
+        }
+    } else {
+        "0".to_string()
+    };
+    let acc_var = if ctx.int_local.contains(&sum_copy.0) {
+        format!("d{}", sum_copy.0)
+    } else {
+        format!("_fcacc{}", top)
+    };
+    let _ = writeln!(
+        s,
+        "  if ({} == 0 && {} > 0 && {}) {{",
+        len_var, chunk_len_var, integer_guard
+    );
+    if !ctx.int_local.contains(&sum_copy.0) {
+        let _ = writeln!(s, "  long long {} = (long long)d{};", acc_var, sum_copy.0);
+    }
     emit_checked_loop(s, cond, cond_body, ctx, |s| {
         let _ = writeln!(s, "  {} += {};", len_var, chunk_len_var);
         let _ = writeln!(s, "  if ({} >= {}LL) {{", len_var, threshold);
-        let _ = writeln!(s, "    d{} += {} + {};", sum_copy.0, len_var, char_var);
+        let _ = writeln!(s, "    {} += {} + {};", acc_var, len_var, char_var);
         let _ = writeln!(s, "    {} = 0;", len_var);
         s.push_str("  }\n");
         let _ = writeln!(s, "  d{} += {}LL;", counter, counter_inc);
     });
+    if !ctx.int_local.contains(&sum_copy.0) {
+        let _ = writeln!(s, "  d{} = (double){};", sum_copy.0, acc_var);
+    }
     let _ = writeln!(
         s,
         "  {} = ts_str_repeat({}, (double)({} / {}));",
-        ctx.vname(str_local), chunk_val, len_var, chunk_len_var
+        ctx.vname(str_local),
+        chunk_val,
+        len_var,
+        chunk_len_var
     );
     s.push_str("  } else {\n");
     emit_runtime_loop(s, cond, cond_body, body, ctx);
@@ -9588,7 +9806,7 @@ fn try_emit_fused_concat_chain_metric_loop(
         || counter_inc != 1
         || concat_args[1].0 != counter
         || !ctx.int_local.contains(&counter)
-        || !ctx.int_local.contains(&sum_copy.0)
+        || !ctx.unboxed.contains(&sum_copy.0)
     {
         return None;
     }
@@ -9707,7 +9925,14 @@ fn try_emit_fused_concat_chain_metric_loop(
             sep_len,
             digits
         );
-        emit_metric_acc_add(s, sum_copy.0, metric, ctx);
+        // Preserve each source addition when NaN-capable analysis keeps a double.
+        if ctx.int_local.contains(&sum_copy.0) {
+            let _ = writeln!(s, "  d{} += {};", sum_copy.0, metric);
+        } else {
+            let _ = writeln!(s, "  d{a} += (double)({p} + {sep} + {m} + {tail} + {digits}); d{a} += (double){first}; d{a} += (double){last}; d{a} += (double)({p} + {sep} + {digits});",
+                a=sum_copy.0, p=prefix_len, sep=sep_len, m=marker_len, tail=tail_len,
+                digits=digits, first=first_ch, last=last_ch);
+        }
         let _ = writeln!(s, "  d{} += 1LL;", counter);
     });
     let _ = writeln!(s, "  if (d{} != {}) {{", counter, start);
@@ -10024,7 +10249,7 @@ fn match_static_split_join_escape_shape(
         || last_ch.0 != sum_last_rhs.0
         || sum_last_tmp.0 != sum_last_src.0
         || sum_copy.0 != sum_len_lhs.0
-        || !ctx.int_local.contains(&sum_copy.0)
+        || !ctx.unboxed.contains(&sum_copy.0)
     {
         return None;
     }
@@ -10087,16 +10312,31 @@ fn emit_static_split_join_escape_loop(
         joined_var, parts_var, shape.joiner
     );
     let _ = writeln!(s, "  ts_gc_root(&{});", joined_var);
-    let _ = writeln!(s, "  long long {} = -1;", inc_var);
+    let first_var = format!("{}_first", inc_var);
+    let last_var = format!("{}_last", inc_var);
     let _ = writeln!(
         s,
-        "  if (ts_is_str({})) {{ long long {} = (long long)ts_str_len_typed({}); {} = {} + ts_str_charcodeat_i64_typed({}, 0) + ts_str_charcodeat_i64_typed({}, {} - 1); }}",
-        joined_var, len_var, joined_var, inc_var, len_var, joined_var, joined_var, len_var
+        "  long long {} = -1, {} = 0, {} = 0, {} = 0;",
+        inc_var, len_var, first_var, last_var
     );
+    let _ = writeln!(s,
+        "  if (ts_is_str({base}) && ({len} = (long long)ts_str_len_typed({base})) > 0) {{ {first} = ts_str_charcodeat_i64_typed({base}, 0); {last} = ts_str_charcodeat_i64_typed({base}, {len} - 1); {inc} = {len} + {first} + {last}; }}",
+        base=joined_var, len=len_var, first=first_var, last=last_var, inc=inc_var);
     let _ = writeln!(s, "  if ({} >= 0) {{", inc_var);
     emit_checked_loop(s, cond, cond_body, ctx, |s| {
         s.push_str(&ctx.set_val(shape.last, &joined_var));
-        let _ = writeln!(s, "  d{} += {};", shape.acc, inc_var);
+        if ctx.int_local.contains(&shape.acc) {
+            let _ = writeln!(s, "  d{} += {};", shape.acc, inc_var);
+        } else {
+            let _ = writeln!(
+                s,
+                "  d{a} += (double){len}; d{a} += (double){first}; d{a} += (double){last};",
+                a = shape.acc,
+                len = len_var,
+                first = first_var,
+                last = last_var
+            );
+        }
         let _ = writeln!(
             s,
             "  d{} += {}LL;",
@@ -10565,7 +10805,7 @@ fn try_emit_fused_case_trim_loop(
         || last_ch.0 != sum_last_rhs.0
         || sum_last_tmp.0 != sum_last_src.0
         || sum_copy.0 != sum_len_lhs.0
-        || !ctx.int_local.contains(&sum_copy.0)
+        || !ctx.unboxed.contains(&sum_copy.0)
     {
         return None;
     }
@@ -10616,16 +10856,31 @@ fn emit_static_case_trim_metric_loop(
         lower_var, upper_var
     );
     let _ = writeln!(s, "  ts_gc_root(&{});", lower_var);
-    let _ = writeln!(s, "  long long {} = -1;", inc_var);
+    let first_var = format!("{}_first", inc_var);
+    let last_var = format!("{}_last", inc_var);
     let _ = writeln!(
         s,
-        "  if (ts_is_str({})) {{ long long {} = (long long)ts_str_len_typed({}); {} = {} + ts_str_charcodeat_i64_typed({}, 0) + ts_str_charcodeat_i64_typed({}, {} - 1); }}",
-        lower_var, len_var, lower_var, inc_var, len_var, lower_var, lower_var, len_var
+        "  long long {} = -1, {} = 0, {} = 0, {} = 0;",
+        inc_var, len_var, first_var, last_var
     );
+    let _ = writeln!(s,
+        "  if (ts_is_str({base}) && ({len} = (long long)ts_str_len_typed({base})) > 0) {{ {first} = ts_str_charcodeat_i64_typed({base}, 0); {last} = ts_str_charcodeat_i64_typed({base}, {len} - 1); {inc} = {len} + {first} + {last}; }}",
+        base=lower_var, len=len_var, first=first_var, last=last_var, inc=inc_var);
     s.push_str("  ts_gc_unroot(3);\n");
     let _ = writeln!(s, "  if ({} >= 0) {{", inc_var);
     emit_checked_loop(s, cond, cond_body, ctx, |s| {
-        let _ = writeln!(s, "  d{} += {};", shape.acc, inc_var);
+        if ctx.int_local.contains(&shape.acc) {
+            let _ = writeln!(s, "  d{} += {};", shape.acc, inc_var);
+        } else {
+            let _ = writeln!(
+                s,
+                "  d{a} += (double){len}; d{a} += (double){first}; d{a} += (double){last};",
+                a = shape.acc,
+                len = len_var,
+                first = first_var,
+                last = last_var
+            );
+        }
         let _ = writeln!(
             s,
             "  d{} += {}LL;",
@@ -10775,7 +11030,7 @@ fn match_static_case_trim_escape_shape(
         || last_ch.0 != sum_last_rhs.0
         || sum_last_tmp.0 != sum_last_src.0
         || sum_copy.0 != sum_len_lhs.0
-        || !ctx.int_local.contains(&sum_copy.0)
+        || !ctx.unboxed.contains(&sum_copy.0)
     {
         return None;
     }
@@ -10837,16 +11092,31 @@ fn emit_static_case_trim_escape_loop(
         lower_var, upper_var
     );
     let _ = writeln!(s, "  ts_gc_root(&{});", lower_var);
-    let _ = writeln!(s, "  long long {} = -1;", inc_var);
+    let first_var = format!("{}_first", inc_var);
+    let last_var = format!("{}_last", inc_var);
     let _ = writeln!(
         s,
-        "  if (ts_is_str({})) {{ long long {} = (long long)ts_str_len_typed({}); {} = {} + ts_str_charcodeat_i64_typed({}, 0) + ts_str_charcodeat_i64_typed({}, {} - 1); }}",
-        lower_var, len_var, lower_var, inc_var, len_var, lower_var, lower_var, len_var
+        "  long long {} = -1, {} = 0, {} = 0, {} = 0;",
+        inc_var, len_var, first_var, last_var
     );
+    let _ = writeln!(s,
+        "  if (ts_is_str({base}) && ({len} = (long long)ts_str_len_typed({base})) > 0) {{ {first} = ts_str_charcodeat_i64_typed({base}, 0); {last} = ts_str_charcodeat_i64_typed({base}, {len} - 1); {inc} = {len} + {first} + {last}; }}",
+        base=lower_var, len=len_var, first=first_var, last=last_var, inc=inc_var);
     let _ = writeln!(s, "  if ({} >= 0) {{", inc_var);
     emit_checked_loop(s, cond, cond_body, ctx, |s| {
         s.push_str(&ctx.set_val(shape.last, &lower_var));
-        let _ = writeln!(s, "  d{} += {};", shape.acc, inc_var);
+        if ctx.int_local.contains(&shape.acc) {
+            let _ = writeln!(s, "  d{} += {};", shape.acc, inc_var);
+        } else {
+            let _ = writeln!(
+                s,
+                "  d{a} += (double){len}; d{a} += (double){first}; d{a} += (double){last};",
+                a = shape.acc,
+                len = len_var,
+                first = first_var,
+                last = last_var
+            );
+        }
         let _ = writeln!(
             s,
             "  d{} += {}LL;",
@@ -10908,7 +11178,7 @@ fn static_split_join_escape_shape_from_plan(
     op: &StaticSplitJoinEscapeMaterialization,
     ctx: &Ctx,
 ) -> Option<StaticSplitJoinEscapeShape> {
-    if !ctx.int_local.contains(&op.acc) || !ctx.int_local.contains(&op.counter.counter) {
+    if !ctx.unboxed.contains(&op.acc) || !ctx.int_local.contains(&op.counter.counter) {
         return None;
     }
     Some(StaticSplitJoinEscapeShape {
@@ -10950,7 +11220,7 @@ fn static_case_trim_escape_shape_from_plan(
     op: &StaticCaseTrimEscapeMaterialization,
     ctx: &Ctx,
 ) -> Option<StaticCaseTrimEscapeShape> {
-    if !ctx.int_local.contains(&op.acc) || !ctx.int_local.contains(&op.counter.counter) {
+    if !ctx.unboxed.contains(&op.acc) || !ctx.int_local.contains(&op.counter.counter) {
         return None;
     }
     Some(StaticCaseTrimEscapeShape {
@@ -11026,7 +11296,7 @@ fn static_case_trim_metric_shape_from_plan(
     op: &CaseTrimMetric,
     ctx: &Ctx,
 ) -> Option<StaticCaseTrimMetricShape> {
-    if !ctx.int_local.contains(&op.acc) || !ctx.int_local.contains(&op.counter.counter) {
+    if !ctx.unboxed.contains(&op.acc) || !ctx.int_local.contains(&op.counter.counter) {
         return None;
     }
     Some(StaticCaseTrimMetricShape {
@@ -11561,7 +11831,9 @@ fn try_emit_fused_dynamic_search_select_loop(
         last_arr, src_arr, shape.search.needle2, src_arr
     );
     s.push_str("  }\n");
-    ctx.loop_labels.borrow_mut().push((top, end));
+    ctx.loop_labels
+        .borrow_mut()
+        .push((top, end, ctx.eh_depth.get()));
     let _ = writeln!(s, "  L{}: ;", top);
     emit_checked_loop(s, cond, cond_body, ctx, |s| {
         emit_select4_clamped(s, &sel_var, &ctx.num(shape.select.pick));
@@ -11820,7 +12092,9 @@ fn emit_dynamic_replace_escape_select_loop(
         shape.mask
     );
     s.push_str("  }\n");
-    ctx.loop_labels.borrow_mut().push((top, end));
+    ctx.loop_labels
+        .borrow_mut()
+        .push((top, end, ctx.eh_depth.get()));
     let _ = writeln!(s, "  L{}: ;", top);
     emit_checked_loop(s, cond, cond_body, ctx, |s| {
         emit_select4_clamped(s, &sel_var, &ctx.num(shape.select.pick));
@@ -12086,7 +12360,9 @@ fn emit_dynamic_split_join_escape_select_loop(
     );
     s.push_str("    ts_gc_unroot(1);\n");
     s.push_str("  }\n");
-    ctx.loop_labels.borrow_mut().push((top, end));
+    ctx.loop_labels
+        .borrow_mut()
+        .push((top, end, ctx.eh_depth.get()));
     let _ = writeln!(s, "  L{}: ;", top);
     emit_checked_loop(s, cond, cond_body, ctx, |s| {
         emit_select4_clamped(s, &sel_var, &ctx.num(shape.select.pick));
@@ -12234,7 +12510,9 @@ fn try_emit_fused_polymorphic_pattern_search_loop(
         pat_arr
     );
     s.push_str("  }\n");
-    ctx.loop_labels.borrow_mut().push((top, end));
+    ctx.loop_labels
+        .borrow_mut()
+        .push((top, end, ctx.eh_depth.get()));
     let _ = writeln!(s, "  L{}: ;", top);
     emit_checked_loop(s, cond, cond_body, ctx, |s| {
         emit_select4_clamped(s, &sel_var, &ctx.num(shape.select.pick));
@@ -14022,6 +14300,15 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 }
                 return;
             }
+            if let Some(rest) = builtin.strip_prefix("object.deleteDynamic:") {
+                let pairs: Vec<_> = rest.split(';').filter_map(|pair| pair.split_once(',')).collect();
+                let entries = pairs.iter().map(|(field, method)| format!("{}, TS_KEY_METHOD({})", field, method)).collect::<Vec<_>>().join(", ");
+                let table = if pairs.is_empty() { "NULL".to_string() } else { format!("(const uint32_t[]){{{}}}", entries) };
+                let expr = format!("ts_delete_dynamic_strict({}, {}, {}, {})", ctx.val(args[0].0), ctx.val(args[1].0), table, pairs.len());
+                if let Some(dst) = dst { s.push_str(&ctx.set_val(dst.0, &expr)); }
+                else { let _ = writeln!(s, "  {};", expr); }
+                return;
+            }
             if let Some(name) = builtin.strip_prefix("global.varDecl:") {
                 let _ = writeln!(s, "  ts_global_var_decl({:?});", name);
                 if let Some(d) = dst {
@@ -14226,6 +14513,13 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 }
                 return;
             }
+            if let Some(offset) = builtin.strip_prefix("arguments.length:") {
+                if let Some(d) = dst {
+                    let offset: u32 = offset.parse().expect("arguments offset");
+                    s.push_str(&ctx.set_num(d.0, &format!("(double)(nargs > {0} ? nargs - {0} : 0)", offset)));
+                }
+                return;
+            }
             // console.dir(v): structural inspection of a single value.
             if builtin == "console.dir" {
                 let _ = writeln!(
@@ -14354,6 +14648,8 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     false,
                 ),
                 "regexp.initObject" => (format!("ts_regexp_object_init({})", v(0)), false),
+                "regexp.construct" => (format!("ts_regexp_adapter_construct_tsv({}, {}, ts_truthy({}))", v(0), v(1), v(2)), false),
+                "uint16array.new" => (format!("ts_new_uint16_array({})", v(0)), false),
                 "regexp.validateObject" => (
                     format!("ts_regexp_adapter_validate_object_tsv({})", v(0)),
                     false,
@@ -14499,6 +14795,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 ),
                 "date.component" => (format!("ts_date_component({}, (int){})", n(0), n(1)), true),
                 "date.toISOString" => (format!("ts_date_to_iso({})", n(0)), false),
+                "date.toLocaleTimeString" => (format!("ts_date_to_locale_time({}, {}, {})", n(0), v(1), v(2)), false),
                 // Object static methods (use the field-name table)
                 "object.keys" => (format!("ts_object_keys({})", v(0)), false),
                 "object.forInKeys" => (format!("ts_object_for_in_keys({})", v(0)), false),
@@ -14678,6 +14975,12 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             };
             let has = |i: usize| if args.len() > i { "1" } else { "0" };
             // (expr, is_numeric_result)
+            let optional_end = if let Some(end) = args.get(1) {
+                if ctx.unboxed.contains(&end.0) { "1".into() }
+                else { format!("!ts_is_undefined_fast({})", ctx.val(end.0)) }
+            } else {
+                "0".into()
+            };
             let (expr, numeric): (String, bool) = match builtin.as_str() {
                 "string.toUpperCase" => (format!("ts_unicode_toupper_tsv({})", r), false),
                 "string.toLowerCase" => (format!("ts_unicode_tolower_tsv({})", r), false),
@@ -14689,13 +14992,15 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 }
                 "string.normalize" => (format!("ts_unicode_normalize_tsv({}, {})", r, v(0)), false),
                 "string.slice" => (
-                    format!("ts_str_slice({}, {}, {}, {})", r, n(0), n(1), has(1)),
+                    format!("ts_str_slice({}, {}, {}, {})", r, n(0), n(1), optional_end),
                     false,
                 ),
                 "string.substring" => (
-                    format!("ts_str_substring({}, {}, {}, {})", r, n(0), n(1), has(1)),
+                    format!("ts_str_substring({}, {}, {}, {})", r, n(0), n(1), optional_end),
                     false,
                 ),
+                "string.substr" => (format!("ts_str_substr({}, {}, {})", r, v(0), v(1)), false),
+                "string.toString" | "string.valueOf" => (format!("ts_str_value({})", r), false),
                 "string.indexOf" => (
                     format!("ts_str_indexof_fast({}, {}, {}, {})", r, v(0), n(1), has(1)),
                     true,
@@ -14712,13 +15017,8 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 ),
                 "string.charAt" => (format!("ts_str_charat({}, {})", r, n(0)), false),
                 "string.charCodeAt" => {
-                    let expr = match args.first() {
-                        Some(a) if ctx.int_local.contains(&a.0) => {
-                            format!("ts_str_charcodeat_i64_typed({}, d{})", r, a.0)
-                        }
-                        Some(_) => format!("ts_str_charcodeat_typed({}, {})", r, n(0)),
-                        None => format!("ts_str_charcodeat_i64_typed({}, 0)", r),
-                    };
+                    let index = args.first().map(|a| ctx.numc(a.0)).unwrap_or_else(|| "0".into());
+                    let expr = format!("ts_str_charcodeat_typed({}, {})", r, index);
                     (expr, true)
                 }
                 "string.concat" => (format!("ts_str_concat({}, {})", r, v(0)), false),
@@ -14777,7 +15077,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     false,
                 ),
                 "array.slice" => (
-                    format!("ts_array_slice({}, {}, {}, {})", r, n(0), n(1), has(1)),
+                    format!("ts_array_slice({}, {}, {}, {})", r, n(0), n(1), optional_end),
                     false,
                 ),
                 "array.concat" => (format!("ts_array_concat({}, {})", r, v(0)), false),
@@ -15711,21 +16011,26 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
         // -> goto the target loop's end (break) / top (continue) label. The Loop
         // emitter pushes (top,end) per loop onto loop_labels in nesting order, so
         // the target is loop_labels[len-1-up].
-        Inst::Break { up } if *up == 0 => {
-            let _ = writeln!(s, "  break;");
-        }
-        Inst::Break { up } => {
+        Inst::Break { up } | Inst::Continue { up } => {
             let ll = ctx.loop_labels.borrow();
-            let (_, end) = ll[ll.len() - 1 - *up as usize];
-            let _ = writeln!(s, "  goto L{};", end);
-        }
-        Inst::Continue { up } if *up == 0 => {
-            let _ = writeln!(s, "  continue;");
-        }
-        Inst::Continue { up } => {
-            let ll = ctx.loop_labels.borrow();
-            let (top, _) = ll[ll.len() - 1 - *up as usize];
-            let _ = writeln!(s, "  goto L{};", top);
+            let (top, end, eh_depth) = ll[ll.len() - 1 - *up as usize];
+            let pop_str =
+                "ts_eh_pop(); ".repeat(ctx.eh_depth.get().saturating_sub(eh_depth) as usize);
+            if *up == 0 {
+                let keyword = if matches!(inst, Inst::Break { .. }) {
+                    "break"
+                } else {
+                    "continue"
+                };
+                let _ = writeln!(s, "  {}{};", pop_str, keyword);
+            } else {
+                let label = if matches!(inst, Inst::Break { .. }) {
+                    end
+                } else {
+                    top
+                };
+                let _ = writeln!(s, "  {}goto L{};", pop_str, label);
+            }
         }
         Inst::CallSpread {
             dst,
@@ -16019,8 +16324,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             // finally + abrupt exit (return/break/continue through finally) needs the
             // completion-record lowering; otherwise the simple structured emit works.
             if !finally_body.is_empty() {
-                let outer = ctx.loop_labels.borrow().last().copied();
-                emit_plain_finally(s, try_body, catch_var, catch_body, finally_body, ctx, outer);
+                emit_plain_finally(s, try_body, catch_var, catch_body, finally_body, ctx);
                 return;
             }
             // try/catch/finally via setjmp/longjmp. The handler snapshots the GC
@@ -16029,7 +16333,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             let base_eh_depth = ctx.eh_depth.get();
             s.push_str("  {\n");
             s.push_str("    ts_handler* _h = ts_eh_push();\n");
-            s.push_str("    if (setjmp(_h->buf) == 0) {\n");
+            let _ = writeln!(s, "    if ({}(_h->buf) == 0) {{", exception_setjmp_name());
             ctx.eh_depth.set(base_eh_depth + 1);
             emit_seq(s, try_body, ctx, PathEdge::TryBody);
             s.push_str("      ts_eh_pop();\n");
@@ -16692,7 +16996,9 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     }
                 }
             }
-            ctx.loop_labels.borrow_mut().push((top, end));
+            ctx.loop_labels
+                .borrow_mut()
+                .push((top, end, ctx.eh_depth.get()));
             ctx.loop_mod_residues.borrow_mut().push(residue_map);
             let _ = writeln!(s, "  L{}: ;", top);
             s.push_str("  for (;;) {\n");

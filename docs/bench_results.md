@@ -117,3 +117,375 @@ the numeric analyzer that JSON number/string length helpers return integer
 lengths. This shortens the generated hot loop, although the 20k-iteration benchmark
 is now close enough to process/global setup overhead that wall-clock changes are
 mostly in the 16-18 ms noise band.
+
+## Update: one-code-unit replacement metrics (2026-10-18)
+
+Measured on Apple M5, arm64 macOS (Darwin 25.5), Apple Clang 21, `cc -O2`.
+The reference runtime is revision `e2814c9`. Each comparison links the same
+generated C against the reference or optimized runtime, warms each executable
+once, then alternates AB/BA execution order for 11 runs per executable. Times
+below are median process wall times, including startup, measured with Python's
+`perf_counter_ns`. Every run checks the expected output.
+
+| workload | allocator | before | after | speedup |
+|---|---|---:|---:|---:|
+| `string_dynamic_replace_kernel` | default static mimalloc | 266.76 ms | 22.38 ms | **11.92x** |
+| `string_dynamic_replace_kernel` | libc | 273.52 ms | 21.68 ms | **12.61x** |
+| `string_dynamic_split_join_kernel` | default static mimalloc | 51.41 ms | 51.16 ms | 1.00x |
+| `string_unicode_search_kernel` | default static mimalloc | 87.32 ms | 87.27 ms | 1.00x |
+| `property_dictionary_kernel` | default static mimalloc | 162.30 ms | 161.80 ms | 1.00x |
+
+The replacement workload cycles through four source strings for 1.5 million
+iterations and sums the replacement result's length, first `+` position, and
+first code unit. A three-second sampling profile of the same kernel at 20x the
+iteration count attributed 2,485 of 2,580 samples (96.3%) to
+`ts_str_replace_literal_metric3` and its callees. The old helper visited every
+replacement and repeatedly searched each unchanged segment.
+
+Replacing one UTF-16 code unit with one code unit preserves length and indices.
+The helper now derives the first matching position from at most two searches
+of the source and substitutes the requested character directly. The measured
+gain applies to fused `replaceAll` metrics. Substantial work stays in `ts_rt.c`,
+following the runtime header policy.
+
+The benchmark output remains `294750000`. Its time budget is now 90 ms, down
+from 380 ms. Runtime tests compare 19,456 metric combinations against actual
+replacement strings, covering short/empty strings, NUL, Latin-1, BMP characters,
+surrogate halves, out-of-range indices, and single versus global replacement.
+The additional conformance fixture checks V8 agreement, including sliced strings
+and generic fallbacks for empty/multi-unit patterns and `$` replacement tokens.
+
+Run the existing performance and correctness gate with the production allocator:
+
+```bash
+TSAOT_USE_MIMALLOC=1 TSAOT_RUNS=5 bash scripts/run_benchmarks.sh
+```
+
+Raw measurements, build scripts, and logs for this run are retained locally
+under `build/perf_20261018/` (`comparison.json`, `comparison.log`,
+`baseline.log`, and `optimized.log`).
+
+Validation passed: all 101 benchmarks with static mimalloc, the complete
+bounded parallel CI, exhaustive conformance (372/372), basic conformance (3/3),
+bundler tests (40/40), runtime/Rust unit suites, and normal/ASan GC stress
+including the 64 MiB string-builder scale gate.
+
+## Update: TypeScript 6.0.3 source analysis (2026-10-18)
+
+Input: Microsoft/TypeScript **6.0.3**, commit
+`050880ce59e30b356b686bd3144efe24f875ebc8`, copied into
+`build/typescript_603/source/` using git archive. The original checkout is
+unchanged. Dependencies were installed with `npm ci --ignore-scripts`.
+
+The upstream compiler was built successfully using its LKG bootstrap:
+`node node_modules/hereby/bin/hereby.js local --lkg` (**6.764 s**). A subsequent
+Node self-build, `node built/local/tsc.js -b src/typescript src/tsc --force
+--extendedDiagnostics`, took **6.188 s** wall, including **4.14 s** checking.
+Its CPU profile attributed about **53.7%** of exclusive samples to checker code.
+These are Node measurements of the upstream build.
+
+Garnet now exports the tsc source graph through the public --project option
+with its normal diagnostic gate, resolving the original **807** unsupported
+sites. Use the compiler project options because the tsc subproject normally
+consumes referenced declarations and excludes the Node ambient types:
+
+```bash
+# From the isolated TypeScript source directory; GARNET_ROOT is the Garnet repo.
+node "$GARNET_ROOT/exporter/exporter.js" \
+  --project src/compiler/tsconfig.json src/tsc/tsc.ts \
+  ../complete.program.json ../complete.labels.json
+
+# From the Garnet repo; phase records go to stderr.
+TSAOT_PHASE_TIMINGS=1 analyzer/target/release/tsaot \
+  build/typescript_603/complete.program.json emit > build/typescript_603/tsc.c
+```
+
+Source export took **10.791 s**, peak RSS **2.30 GB**. The accepted graph contains
+13,075 functions and produces approximately **69 MiB** of C. Initial sampling
+found global-set field reachability scanning the whole field table for each
+object. After restricting traversal to the owner's BTreeMap range, a second
+profile identified repeated numeric-inference sweeps over unrelated initializers.
+Numeric inference now revisits dependent definitions while preserving the
+original sweep order and fact lattice.
+
+The table compares release Rust analyzers on the same accepted IR. Three runs
+per variant were alternated AB/BA/AB, after other builds/tests had finished.
+Times include process startup, JSON parsing, analysis and C emission to
+`/dev/null`. No forced-GC settings were used. Generated C was also captured and
+verified byte-identical across both changes.
+
+| analyzer | median wall | median CPU | speedup |
+|---|---:|---:|---:|
+| before reachability/numeric scheduling fixes | 26.070 s | 26.020 s | 1.00x |
+| after both fixes | **4.264 s** | **4.246 s** | **6.11x** |
+
+A validation native build using `cc -O0` linked in **42.693 s** with peak RSS
+**7.26 GB**, producing a **99 MiB** executable. The `cc -O2` attempt was stopped
+after **485 s**; a Clang sample was dominated by LLVM JumpThreading/LazyValueInfo.
+Running the executable with --version fails during host startup because Garnet
+does not provide the Node process/require/fs host and TypeScript's sys remains
+undefined. Native self-compilation and native compiler runtime performance are
+still unverified. The speedup above measures Garnet's analyzer/C generator.
+
+Validation: full V8 conformance **392/392**, bundler **41/41**, Rust/runtime unit
+suites, ordinary CI and all benchmark outputs passed. The frozen analyzer stays
+unchanged; explicitly recorded gaps yield typed parity **355 identical + 34
+KNOWN** and self-conformance **382 PASS + 7 KNOWN**. Heavy forced-GC gates are
+now opt-in with `TSAOT_CI_GC_STRESS=1`. Raw logs and profiles are retained in
+`build/typescript_603/`, including `analyzer_comparison.json` and `profiles/`.
+
+### Further pipeline optimization
+
+The next comparison uses the previous session's optimized analyzer/frontend as
+its baseline, with the same pinned TypeScript source and accepted IR. Each
+variant runs three times in AB/BA/AB order, after Garnet's other builds/tests
+have finished. Rust emission writes to /dev/null; frontend runs write their
+normal JSON artifacts. No forced-GC settings are used.
+
+| phase / metric | previous | current | improvement |
+|---|---:|---:|---:|
+| analyzer/C emission, median wall | 4.197 s | **2.361 s** | **1.78x** |
+| analyzer/C emission, median CPU | 4.172 s | **2.355 s** | 1.77x |
+| frontend, median wall | 10.433 s | 9.928 s | 1.05x |
+| frontend, median peak RSS | 2.298 GB | **2.183 GB** | **5.0% lower** |
+
+The analyzer reuses ordered bitsets for pending numeric instructions, skips
+callers that cannot contribute numeric parameter facts, and indexes function
+IDs once for the four ABI metadata tables. Sparse/reserved IDs retain their
+existing entries. The frontend combines wire conversion and UTF-16 validation
+in one traversal, copying only changed ancestors instead of duplicating every
+IR node. Constants, property names and field names keep their existing UTF-16
+wire representation; the original IR is never mutated.
+
+All analyzer pairs completed before an unrelated background build started.
+That build overlapped the later frontend pairs, so the frontend wall-time gain
+is indicative. Per-run frontend RSS consistently fell from 2.293–2.301 GB to
+2.183–2.186 GB. Individual observations, process CPU times and peak RSS are in
+`build/typescript_603/opt_next/comparison.json`.
+
+The complete TypeScript IR, labels and generated C match the baseline byte for
+byte. Validation passed: V8 conformance **392/392**, bundler **41/41**, ordinary
+CI, Rust unit tests **21/21**, UTF-16 wire conversion tests, typed frozen parity
+**355 identical + 34 KNOWN**, and all **101** benchmark correctness/time budgets
+with three runs and static mimalloc. The native compiler/Node-host limitations
+described above still apply; this measures source export and IR-to-C generation.
+
+## Update: Running the generated TypeScript 6.0.3 compiler
+
+The native-host limitation in the preceding historical sections is resolved.
+The generated compiler now executes the upstream command line with a synchronous
+C `System` host. It checks and emits the complete upstream compiler project;
+all 78 emitted files are byte-identical to the Node compiler's output. A
+deliberate TS2322 error and positive interface, optional-method and enum cases
+also match Node's diagnostics and exit status. There is no Node/V8 fallback in
+the native executable. Library declaration files remain external data.
+
+The first complete, correct comparison used three alternating runs after warmup:
+
+| executable | median wall |
+|---|---:|
+| Node 25.2.1, upstream TypeScript 6.0.3 | 3.380 s |
+| Generated native compiler, correctness baseline | 41.095 s |
+
+These times include process startup, source loading, checking and emission. They
+exclude Garnet export, Rust analysis and C compilation. Both executables use
+the same project and options, with incremental/composite/declaration/source-map
+output disabled. The native runtime is AppleClang O2 with static mimalloc;
+generated C is O1 except eight large initialization/factory functions at O0.
+That C build took 296.965 s. Normal automatic GC remains enabled, without
+forced collections or threshold changes. This result establishes correctness,
+and does not claim a speed advantage over Node or tsgo.
+
+Reproduction commands, mixed-optimization details and validation are in
+`benchmarks/typescript_native/README.md`. The runner records output hashes,
+per-process CPU time and peak RSS, and rejects any mismatch before publishing a
+speedup. Raw baseline records are under
+`build/typescript_603/native_host/nullish_full_bench/`.
+
+### Final three-way emit comparison
+
+All three executables passed negative/positive diagnostics and emitted the same
+78 output files on warmup and every timed run. After Garnet's builds/tests
+finished, three timed runs alternated order across Node, the saved native
+baseline and the accepted native executable. Both native versions use the same
+clean C host. No forced-GC settings were used.
+
+| executable | median wall | median process CPU | median peak RSS |
+|---|---:|---:|---:|
+| Node 25.2.1 | 3.435 s | 6.277 s | 0.800 GB |
+| Saved native correctness baseline | 41.581 s | 41.409 s | 2.181 GB |
+| Accepted native changes | **35.655 s** | **35.531 s** | **1.923 GB** |
+
+The native improvement is **1.166x**, or **14.3% less wall time**, with roughly
+12% lower peak RSS. This combines property caches, closure merge buffers,
+exception helpers and allocator build settings; it is not attributed to caches
+alone. Node remains approximately **10.4x faster**. Generated C stays at O1 with
+the same eight O0 factory/initialization exceptions, while the runtime uses O2.
+
+Native sample ranges were 41.413–41.847 s for the baseline and 35.280–35.819 s
+for the accepted executable. Node ranged 3.422–3.476 s. An unrelated background
+workload was present; the alternating comparison and CPU/RSS records expose
+that practical variability rather than claiming controlled laboratory timing.
+Raw samples and output validation are in
+`build/typescript_603/native_host/adaptive_full_bench/run-mv_wtso5/result.json`.
+
+### Runtime changes and remaining C bottlenecks
+
+The accepted implementation keeps the existing 52-byte inline shape cache.
+Unsized receivers, including dictionary objects, validate an own slot directly
+against the live key and bounds. Only sized receivers use an auxiliary location
+table (4,096 buckets, 576 KiB). Interface method lookup also uses caches.
+Missing optional properties no longer exhaust the failure budget. See
+`property_pic_design.md` for guards and invalidation.
+
+Two rejected candidates expanded every site to 136 bytes. Inlining all location
+guards also expanded native `__TEXT` to 95.14 MB. Both regressed the full compiler
+while reducing searches. The accepted executable uses 58.23 MB of `__TEXT` and
+keeps the original ordinary inline guard sequence. The baseline already had
+shape caches; this is not evidence that disabling all caches is faster.
+
+Additional measured runtime changes use a separate 64-slot stack buffer for
+medium captured environments, omit Darwin signal-mask save/restore for JS
+exceptions, and compile vendored mimalloc in release mode. O2 alone had left the
+allocator's upstream MI_DEBUG=2 checks enabled. Runtime assertions remain active.
+`TSAOT_PRESERVE_SIGNAL_MASK=1` and `TSAOT_MIMALLOC_DEBUG=1` retain those diagnostic
+behaviors when needed. The generated C build took 314.050 s, peak RSS 15.684 GB.
+
+The following counters compare successful check-only runs of the same compiler
+project. Profiling binaries instrument the runtime, while generated inline code
+remains uninstrumented: do not interpret their partial PIC counters as the whole
+program's hit rate. Baseline and optimized runs have exactly the same managed
+allocation count/bytes and normal automatic collection counts.
+
+| runtime counter | saved correctness baseline | accepted changes |
+|---|---:|---:|
+| `find_prop` calls | 657,666,832 | 279,195,419 |
+| closure argument merge heap allocations | 21,585,091 | 1,294,219 |
+| class-registry lookups | 477,224,196 | 11,598,322 |
+| managed allocations | 121,969,010 | 121,969,010 |
+| managed bytes allocated | 10,668,565,681 | 10,668,565,681 |
+| automatic minor/full collections | 2,725 / 5 | 2,725 / 5 |
+
+An opt-in PC sampler identified repeated signal-mask operations in the rejected
+candidate; the accepted no-mask helper avoids them. The final check-only profile
+recorded **9.060 s** of automatic GC pauses over a **32.322 s** instrumented run.
+Its PC samples cluster in GC tracing (`gc_mark_visit`, `gc_scan_cell`) and
+allocator free-list growth (`mi_page_free_list_extend`). Samples also frequently
+land at the system `madvise` return stub. Asynchronous signal delivery can bias
+samples toward syscall boundaries, so those counts must not be interpreted as
+precise syscall CPU-time shares. Allocation/GC traffic remains a major
+limitation: property cache hits do not remove it. Check-only profiling times
+are not substituted for the validated emit benchmark.
+
+Raw counters, PC summaries, compiler flags and build exceptions are retained in
+`build/typescript_603/native_host/`, notably `adaptive_profile.stderr`,
+`adaptive_correct_profile_summary.json`, `adaptive_profile_system_summary.json`
+and `adaptive_build.json`. Rejected candidates remain separate artifacts.
+
+The 32-layout interface kernel used 15 alternating repetitions. With identical
+C emission, the old debug allocator and signal-mask preservation on both sides,
+median wall time was 48.504 ms before and 48.139 ms after the cache/dispatch
+changes. The complete production runtime measured 47.376 ms. This is essentially flat
+in this small-object case, despite 7,999,996 hits in 8,000,000 reads and 1,999,999 hits in
+2,000,128 writes. Steady-state property searches disappear, but checks and
+indirect calls remain. The kernel uses no auxiliary location-table probes:
+small unsized objects use the compact live-slot check. All variants print the
+same `62572000000`; raw repetitions are in `interface_comparison.json`.
+
+A follow-up caught a cache-policy regression hidden by the loose time budgets:
+replacing a shape merely because its slot matched another receiver collapsed
+four stable shapes into fewer inline entries. The final policy retains all four
+warm shapes, preserves them on dictionary hits, and samples promotion of unseen
+shapes after warmup. A direct runtime regression checks all four inline hits.
+The four-shape kernel recovered from 145 to 90 ms; the dictionary kernel was
+89 ms. All **102** benchmark outputs and time budgets passed with three runs,
+alongside conformance **403/403**, bundler **42/42**, Rust **21/21**, CI-FAST,
+frozen parity **323 identical + 77 KNOWN**, and frozen self-conformance
+**391 PASS + 9 KNOWN**, with no unexplained differences. No forced-GC stress was
+run. Frozen analyzer source stayed unchanged.
+
+A separate one-slot initial-capacity experiment for the internal `__value`
+property also passed full compiler output/diagnostic validation, but measured
+35.203 s versus the accepted version's 35.280–35.819 s with essentially unchanged
+peak RSS. This did not establish a meaningful gain, so that heuristic was not
+adopted. Raw trial data remains under `cell_capacity_bench/`.
+
+
+### GC and property-buffer allocation (Session 349)
+
+The next optimization uses the accepted Session 348 executable as its saved
+baseline, with the same generated C object, host, compiler flags and release
+mimalloc. Array/Map dirty spans restrict a minor collection to recently written
+64-entry cards. The spans retain their aging credits; promotion, generic writes,
+reordering, compaction and oversized indices retain a complete-scan fallback.
+Young containers and full collections still scan every element. On arm64 the
+metadata fits existing padding: arrays remain 128 bytes and maps 144 bytes.
+An inline old-generation filter also avoids entering the outlined mark worker
+for an edge that the minor collector will not follow.
+
+Four-slot property buffers use a bounded free list, preserving the original
+capacity policy and property flags. Of 78,188,465 initial-buffer requests in the
+check-only workload, **77,110,131** reuse an existing buffer and **1,078,334**
+require malloc. This avoids about 7.40 GB of cumulative allocation requests;
+it does not mean 7.40 GB less resident memory. The free list retains at most
+65,536 buffers, or **6 MiB**. Larger property buffers use the normal allocator.
+
+Paired runtime-statistics runs of the compiler project with `--noEmit` show:
+
+| counter | saved runtime | accepted runtime |
+|---|---:|---:|
+| Minor / full collections | 2,725 / 5 | 2,725 / 5 |
+| Managed cells allocated | 121,969,010 | 121,969,010 |
+| Managed cell bytes allocated | 10,668,565,681 | 10,668,565,681 |
+| Array elements inspected by minor GC | 763,812,839 | 139,986,858 |
+| Map keys/values inspected by minor GC | 264,718,866 | 7,073,210 |
+| Mark-edge visits, all collections | 1,262,357,194 | 380,885,557 |
+| Cumulative GC pause time | 8.570 s | 2.881 s |
+
+Collection counts, aging outcomes, live cell bytes and visited cell counts by
+kind match. The collector does less repeated scanning; collection thresholds,
+root lifetimes and collection frequency are unchanged. Instrumentation compiles
+out of the production executable. Runtime-only profiling does not count all
+inline generated-C frame/PIC operations, so those counters are incomplete.
+Raw summaries are `logs/gc_final_{baseline,optimized}_profile.stderr` under
+`build/typescript_603`.
+
+A closure/environment coallocation experiment was excluded. It eliminated a
+separate buffer but increased managed cell bytes from 10.669 to 13.675 GB and
+minor collections from 2,725 to 3,412, without a convincing isolated speed gain.
+The accepted runtime retains the original closure representation. Most of the
+GC improvement comes from avoiding repeated old-container scans; allocation
+request reductions should not be confused with equivalent wall-time gains.
+
+Validation: **404/404** normal V8 conformance, **102/102** benchmark correctness
+and budgets with three runs, CI-FAST, and runtime units with both libc and static
+release mimalloc pass. Bundler **42/42** passes with libc; the existing bundler
+harness omits explicit mimalloc link libraries, so its explicit-mimalloc attempt
+failed to link and is not counted as a passing test. Added regressions use
+ordinary allocation pressure for closure captures, old-array mutations, Map
+compaction/clear, generic properties and the dirty-card range boundary. No GC
+stress or threshold overrides were used. The frozen analyzer remains unchanged.
+
+The final full-emission comparison alternated three timed launches after warmup,
+after all Garnet builds/tests finished. Every launch matched stdout, diagnostics,
+exit status and the SHA-256 manifest of all **78 emitted files**.
+
+| executable | median wall | median process CPU | median peak RSS |
+|---|---:|---:|---:|
+| Node 25.2.1 / V8 | 4.622 s | 7.698 s | 0.797 GB |
+| Saved Session 348 native | 46.201 s | 42.778 s | 1.941 GB |
+| Accepted GC/allocation changes | 33.942 s | 31.688 s | 1.941 GB |
+
+This run shows **26.5% less wall time** and **25.9% less process CPU time**
+for the native pair. Peak RSS is effectively unchanged; this is a reduction in
+scanning and allocator traffic, not a lower live-object footprint. Native remains
+approximately **7.3x slower than V8**. These figures use the same generated
+O1 object with eight O0 exceptions, O2 runtime and static release mimalloc.
+
+An unrelated TypeScript benchmark used roughly four CPU cores during these
+runs. Native baseline samples ranged 41.573–48.657 s and accepted samples
+33.315–35.486 s. Do not compare this loaded run's absolute times directly
+to earlier quiet measurements. The alternating comparison includes both wall
+and process CPU time. Its complete record is
+`build/typescript_603/native_host/gc_opt/final_emit_bench/run-01s9edcy/result.json`;
+source/object/binary hashes and layout checks are in `gc_opt/build.json`.

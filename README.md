@@ -84,6 +84,7 @@ compiler as one command.
 | `./garnet -c src/main.ts` | Emit C only; do not compile or link it |
 | `./garnet -S src/main.ts` | Print generated C to standard output |
 | `./garnet --untyped src/main.ts` | Compile supported code without type-driven optimization |
+| `./garnet -p tsconfig.json src/main.ts` | Use project checking and module-resolution options |
 | `./garnet --profile src/main.ts` | Build with symbols and frame pointers for profiling |
 | `./garnet --rt-stats src/main.ts` | Print runtime allocation, GC, and lookup counters at exit |
 | `./garnet --help` | Show all driver options and environment variables |
@@ -132,6 +133,11 @@ optimizing from an invalid type assumption.
 ```bash
 ./garnet src/main.ts
 ```
+
+Use `./garnet -p tsconfig.json src/main.ts` to load inherited project checking,
+resolution, library options and ambient declarations. Garnet bundles the entry's
+source imports; it does not run TypeScript project-reference builds or emit
+declarations. Null checking remains enabled for sound type-based lowering.
 
 Use untyped mode when you deliberately want JavaScript-style `any` behavior for
 otherwise supported code:
@@ -291,15 +297,21 @@ bash scripts/ci_par.sh
 ```
 
 It builds compiler components once, caps Cargo parallelism, runs ordinary
-correctness checks in bounded waves, and isolates GC stress and timed
-benchmarks. Useful focused gates are:
+correctness checks in bounded waves, and runs timed benchmarks separately.
+Forced-GC stress is disabled by default in both CI entry points; enable it
+explicitly with `TSAOT_CI_GC_STRESS=1`. Useful focused gates are:
 
 ```bash
 bash scripts/gate.sh conf all
 bash scripts/gate.sh unit
 bash scripts/gate.sh bundler
-bash scripts/gate.sh gc
 ```
+
+`bash scripts/gate.sh gc` explicitly runs the separate GC stress suite.
+
+For analyzer phase timings, use
+`TSAOT_PHASE_TIMINGS=1 analyzer/target/release/tsaot program.json emit > program.c`.
+Timing records go to stderr and leave generated C unchanged.
 
 The main directories are:
 

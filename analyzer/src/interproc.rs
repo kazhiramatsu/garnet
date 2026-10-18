@@ -132,12 +132,16 @@ impl Solver {
         let mut set = seed;
         let mut work: Vec<Obj> = set.iter().copied().collect();
         while let Some(o) = work.pop() {
-            for ((fo, _k), tgts) in self.field.iter() {
-                if *fo == o {
-                    for t in tgts {
-                        if set.insert(*t) {
-                            work.push(*t);
-                        }
+            // Fields are ordered by owner, then FieldKey. Visit only this
+            // owner's adjacency list instead of scanning the whole graph for
+            // every reachable object. Named is the first FieldKey variant and
+            // Capture is the last, including their full ID ranges.
+            let first = (o, FieldKey::Named(FieldId(0)));
+            let last = (o, FieldKey::Capture(BindingId(u32::MAX)));
+            for (_, tgts) in self.field.range(first..=last) {
+                for t in tgts {
+                    if set.insert(*t) {
+                        work.push(*t);
                     }
                 }
             }
@@ -148,6 +152,66 @@ impl Solver {
         let mut seed = self.pt_clone(Ref::Global);
         seed.insert(Obj::External);
         self.field_closure(seed)
+    }
+}
+
+#[cfg(test)]
+mod reachability_tests {
+    use super::*;
+
+    #[test]
+    fn field_ranges_preserve_reachability() {
+        let objects = [
+            Obj::Site(SiteId(0)),
+            Obj::Site(SiteId(u32::MAX)),
+            Obj::Param(LocalId(0)),
+            Obj::ParamField(LocalId(0), FieldKey::Elem),
+            Obj::External,
+            Obj::Opaque(u32::MAX),
+        ];
+        let fields = [
+            FieldKey::Named(FieldId(0)),
+            FieldKey::Named(FieldId(u32::MAX)),
+            FieldKey::Elem,
+            FieldKey::Capture(BindingId(0)),
+            FieldKey::Capture(BindingId(u32::MAX)),
+        ];
+        // Compare against independent full-graph propagation over graphs with
+        // cycles, disconnected components and all key/owner boundary variants.
+        for graph in 0..64 {
+            let mut solver = Solver::default();
+            for (i, &owner) in objects.iter().enumerate() {
+                for (j, &field) in fields.iter().enumerate() {
+                    if graph & (1 << i) != 0 {
+                        solver
+                            .field
+                            .entry((owner, field))
+                            .or_default()
+                            .insert(objects[(i + j + graph) % objects.len()]);
+                    }
+                }
+            }
+            for &root in &objects {
+                let seed = BTreeSet::from([root]);
+                let mut expected = seed.clone();
+                loop {
+                    let previous = expected.clone();
+                    for ((owner, _), targets) in &solver.field {
+                        if previous.contains(owner) {
+                            expected.extend(targets);
+                        }
+                    }
+                    if expected == previous {
+                        break;
+                    }
+                }
+                assert_eq!(
+                    solver.field_closure(seed),
+                    expected,
+                    "graph {graph}, root {root:?}"
+                );
+            }
+        }
     }
 }
 

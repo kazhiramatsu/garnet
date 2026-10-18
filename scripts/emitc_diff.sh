@@ -39,6 +39,7 @@ node analyzer_ts/dist/main.js --batch "$ANLIST" "$W/ts" emitc \
 # 凍結双子との既知差分（silent miscompile 修正の随伴。scripts/frozen_known_diffs.tsv
 # の scope=parity 行）。KNOWN として別集計し PASS 判定から除外する。
 KNOWN_SLUGS=$(awk -F'\t' '$1=="parity"{gsub("/","_",$2); print $2}' scripts/frozen_known_diffs.tsv 2>/dev/null)
+KNOWN_UNPORTED_SLUGS=$(awk -F'\t' '$1=="parity-unported"{gsub("/","_",$2); print $2}' scripts/frozen_known_diffs.tsv 2>/dev/null)
 
 same=0; unported=0; diff_=0; known=0; skip=0
 : > "$W/unported.txt"; : > "$W/firstdiff.txt"; : > "$W/knowndiff.txt"
@@ -49,15 +50,19 @@ while IFS=$'\t' read -r slug path; do
   # The frozen TS emitter predates property PICs, shadow root frames, and
   # escape-guided pretenuring. Keep this mechanical byte oracle on the explicit
   # legacy mode while production emission uses all three by default.
-  TSAOT_PROP_PIC=0 TSAOT_FRAME_ROOTS=0 TSAOT_PRETENURE=0 \
+  TSAOT_PROP_PIC=0 TSAOT_FRAME_ROOTS=0 TSAOT_PRETENURE=0 TSAOT_FAST_EXCEPTIONS=0 \
     "$RUST" "$prog" emit > "$W/r.c" 2>/dev/null || { skip=$((skip+1)); continue; }
   astatus=$(awk -F'\t' -v n="$slug" '$1==n{print $2; exit}' "$W/an.status")
   areason=$(awk -F'\t' -v n="$slug" '$1==n{$1=$2=""; sub(/^[[:space:]]+/, ""); print; exit}' "$W/an.status")
   tfile="$W/ts/$slug.c"
   if [ "$astatus" != "OK" ] || [ ! -f "$tfile" ]; then
     if [ "$astatus" = "UNPORTED" ]; then
-      unported=$((unported+1))
-      echo "$areason" >> "$W/unported.txt"
+      if printf '%s\n' "$KNOWN_UNPORTED_SLUGS" | grep -qx "$slug"; then
+        known=$((known+1)); echo "$slug (frozen UNPORTED: $areason)" >> "$W/knowndiff.txt"
+      else
+        unported=$((unported+1))
+        echo "$areason" >> "$W/unported.txt"
+      fi
     else
       diff_=$((diff_+1)); echo "$slug: CRASH ${areason:-missing batch output}" >> "$W/firstdiff.txt"
     fi

@@ -7,7 +7,7 @@ function main(): void {
   console.log(m.has("c") ? 1 : 0);// 0
   console.log(m.delete("b") ? 1 : 0); // 1
   console.log(m.size);            // 1
-  console.log(m.keys().join(",")); // a
+  console.log(Array.from(m.keys()).join(",")); // a
   let total = 0;
   m.set("x", 5); m.set("y", 7);
   m.forEach((v, k) => { total = total + v; });
@@ -23,7 +23,7 @@ function main(): void {
   console.log(s.has(2) ? 1 : 0);  // 1
   s.delete(2);
   console.log(s.has(2) ? 1 : 0);  // 0
-  console.log(s.values().join("-")); // 1-3
+  console.log(Array.from(s.values()).join("-")); // 1-3
   let sum = 0;
   s.forEach(v => { sum = sum + v; });
   console.log(sum);               // 4

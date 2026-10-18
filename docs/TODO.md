@@ -3568,3 +3568,379 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
 - Verification: runtime unit and inline-policy gates, exhaustive conformance
   **371/371**, bundler **40/40**, all string/JSON benchmarks, and normal/ASan
   GC stress including the 64 MiB string-builder scale gate.
+
+### Session 334: benchmark-driven one-code-unit replacement metrics
+
+- Measured all 101 existing benchmarks with the production static mimalloc
+  allocator. Profiling identified the dynamic replacement metric helper as
+  96.3% of samples in an extended run of `string_dynamic_replace_kernel`.
+- Added an out-of-line fast path for one-code-unit global substitutions.
+  Length and positions are preserved, allowing the length/index/character sum
+  to use at most two source searches instead of visiting every replacement.
+- Controlled `cc -O2` comparisons reuse identical generated C, alternate AB/BA
+  order, check every result, and report 11-run medians. Static mimalloc improved
+  **266.76 → 22.38 ms (11.92x)**; libc improved
+  **273.52 → 21.68 ms (12.61x)**. Search, split/join, and property lookup controls
+  stayed within measurement noise. Conditions and results are in
+  `docs/bench_results.md`; raw samples and scripts are in
+  `build/perf_20261018/`.
+- Added 19,456 runtime metric comparisons against materialized replacements
+  and a V8 differential fixture covering Unicode, surrogate halves, NUL,
+  sliced strings, and generic fallbacks. Tightened the dynamic replacement
+  benchmark budget from 380 to 90 ms.
+- Verification: complete bounded parallel CI; exhaustive conformance
+  **372/372**, basic **3/3**, bundler **40/40**, runtime and Rust unit suites,
+  normal/ASan GC stress and the 64 MiB string scale gate. All **101/101**
+  benchmarks passed correctness and performance budgets with static mimalloc;
+  the optimized replacement kernel measured **22 ms** in that gate.
+
+### Session 335: TypeScript 6.0.3 source baseline and capture binding support
+
+- Copied the official `v6.0.3` source at
+  `050880ce59e30b356b686bd3144efe24f875ebc8` into an isolated
+  `build/typescript_603/source` directory. Upstream `hereby local --lkg`
+  built successfully in 6.76 seconds. A profiled eight-project self-build took
+  6.19 seconds; extended diagnostics attributed 4.14 seconds to checking,
+  and V8 samples attributed 53.7% to `checker.ts`.
+- The public Garnet driver stopped on 46 diagnostics from different compiler
+  settings. A diagnostic-only exporter copy matching upstream strictness
+  reached lowering and reported 807 unsupported locations. Production exporter
+  options and unsupported-error checks remain enforced.
+- Fixed capture ownership for recursively destructured parameter/local bindings
+  and erased type syntax. Parameter defaults and destructuring now initialize
+  in source order after captured cells are allocated. Overload signatures and
+  ambient function declarations are erased during statement lowering.
+- Added a V8 regression for nested destructuring, captured parameter defaults,
+  local types, generics, and overload declarations. The configured TypeScript
+  probe now reports **325** unsupported locations, down from **807**;
+  implementation of the remaining categories continues.
+- Verification: bounded parallel CI, conformance **373/373** plus basic **3/3**,
+  bundler **40/40**, normal/ASan GC and 64 MiB string stress, runtime/Rust units,
+  and benchmark budgets. Frozen self-conformance: **372 PASS + 1 KNOWN**,
+  `UNPORTED=CCFAIL=DIFF=0`. The earlier replacement-metric fixture has a benign
+  typed-emitter optimization difference; its frozen typed executable was also
+  checked against V8 and the difference was recorded in the frozen allowlist.
+
+### Session 336: TypeScript 6.0.3 closure environments
+
+- Canonicalized named-function-expression symbols and initialized their recursive
+  self-binding cells before publishing the closure. Renamed destructuring keys
+  no longer become phantom captures. Function-value calls reuse an available
+  closure environment when a direct call cannot supply all capture cells.
+- Fixed module-cell access from fixed-ABI methods and static initialization.
+  Added regressions for recursive self references, immutable self bindings,
+  renamed properties, spread calls, and module helpers called through classes.
+- The configured TypeScript source audit now has **270** unsupported locations;
+  all **55** remaining capture-environment diagnostics have been resolved.
+- Verification: full parallel CI, exhaustive **374/374**, basic **3/3**, bundler
+  **40/40**, forced-GC/ASan coverage, benchmark budgets, frozen self-conformance
+  **373 PASS + 1 KNOWN**, typed parity **358 identical + 16 KNOWN**, no new diffs.
+
+### Session 337: Iterable and switch continue targets
+
+- Advance array/string for-of indexes before binding and executing the body,
+  preserving code-point iteration and continue semantics. Resolve continue
+  through nested switches and labeled outer array loops. Reuse the same path
+  for for-in, including assignment targets and captured lexical/var bindings.
+- Plain finally completion records now retain the actual loop destination and
+  its handler depth. Nested finally runs only when the jump leaves its protected
+  scope; overriding returns and rethrows preserve enclosing finally/catch paths.
+- Added native/V8 regressions for arrays, strings, Map/Set, generators, loop
+  captures, nested switch, iterator close and finally scope. All **150** continue
+  diagnostics in TypeScript 6.0.3 are resolved: **270 → 120** unsupported sites.
+- Full parallel CI passed: exhaustive **376/376**, basic **3/3**, runtime/Rust
+  units, GC/ASan/64 MiB stress and benchmark budgets. New fixtures also pass
+  forced-GC and ASan runs; bundler **40/40**. Typed parity is **347 identical +
+  29 KNOWN**. Verified all 13 new frozen differences by compiling the frozen
+  typed C: 11 match V8, while the two new regressions expose frozen finally bugs.
+  Recorded the differences without changing the frozen analyzer.
+
+### Session 338: Project compiler options
+
+- Added `garnet -p/--project <file-or-directory>` and exporter `--project` support
+  for inherited checking/resolution/library options and project ambient types.
+  Garnet still lowers the entry's source graph, removing TypeScript output/build
+  constraints while retaining the type-error gate and sound null checking.
+- Added a public-driver gate for inherited NodeNext settings, ambient project
+  declarations, native output and rejection of type errors/missing config files;
+  included it in both CI entry points and documented the option.
+- The production exporter now checks TypeScript 6.0.3 using
+  `--project src/compiler/tsconfig.json src/tsc/tsc.ts`, with no diagnostic-only
+  loader and no type-error bypass. It reaches the same **120** unsupported sites.
+  The tsc subproject's own config excludes Node types because it normally consumes
+  the compiler project's declarations; source-graph bundling uses the compiler
+  project's options instead.
+
+### Session 339: Builtin spread argument lists
+
+- Builtin method/static calls now accept spread arguments through their boxed
+  callable adapters. Each spread is consumed at its argument position, retaining
+  its elements before subsequent arguments can mutate the source. Mutable
+  function values and scalar arguments are also snapshotted before later effects.
+- Cache an iterator's `next` method once, validate iterator results and reject
+  primitive non-iterables. Collection constructors explicitly accept nullish
+  initializers as empty collections, preserving their existing behavior.
+- Added V8 coverage for push/unshift/splice, String.fromCharCode, Math.max,
+  strings/Set/generator spreads, observable next getters and evaluation order.
+  All **35** source spread diagnostics are resolved: **120 → 85** unsupported.
+- Normal conformance **377/377**, bundler **40/40**, frozen self-conformance
+  **374 PASS + 3 KNOWN**, typed parity **348 identical + 29 KNOWN**. The full CI
+  initially exposed the nullish collection case; its corrected exhaustive suite
+  was rerun successfully. All other CI suites and benchmark budgets passed.
+- The user requested stopping forced-GC testing because of its load. Further
+  validation uses normal GC settings and omits forced-GC stress runs.
+
+### Session 340: Constructor expressions and string compatibility
+
+- Lower arbitrary constructor expressions (calls, parenthesized assignments,
+  computed properties and namespace members) through the existing dynamic
+  constructor runtime. Added coverage for lazy constructor caching and spreads.
+- Emit nonfinite Number constants using the existing explicit IR tags, and
+  classify actual arrays/tuples before considering their printed element type.
+- Implemented substr with JS coercion order, clamping, infinities and UTF-16
+  indexing; added String toString/valueOf methods and boxed adapters.
+- TypeScript source diagnostics decreased **85 → 49**. Normal conformance
+  **381/381**, runtime/Rust units, bundler **40/40**, frozen self-conformance
+  **378 PASS + 3 KNOWN**, typed parity **351 identical + 30 KNOWN**, and timed
+  kernel budgets passed. The frozen typed emitter's missing substr operation is
+  recorded explicitly as a known unported fixture; no frozen source was changed.
+
+### Session 341: Tagged templates and dynamic regular expressions
+
+- Cache tagged-template objects by source site. Cooked/raw arrays are frozen,
+  raw descriptors are nonenumerable and immutable, invalid escapes produce
+  undefined cooked elements, and property tags retain their receiver.
+- Implement dynamic RegExp construction through the shared QuickJS adapter,
+  including flag validation, canonical ordering, cloning, call identity,
+  coercion order, escaped source text and lone UTF-16 surrogates.
+- Moved the old tagged-template rejection into positive V8 coverage and removed
+  obsolete compile-time rejections of dynamic RegExp inputs. Invalid patterns
+  now raise catchable SyntaxError. Source diagnostics decreased **49 → 37**.
+
+### Session 342: Namespace bindings, computed deletion and initialized cycles
+
+- Lower computed deletion with one property-key conversion, strict deletion,
+  proxy traps and FIELD/METHOD key cleanup.
+- Exported namespace variables use the shared namespace object's properties;
+  destructured declarations and merged namespace members retain live values.
+  Namespace imports share one null-prototype, nonextensible object with sorted,
+  readonly live getters over the export cells. This implements live reads and
+  readonly writes; full ECMAScript module-namespace exotic descriptors remain
+  outside the ordinary-object representation.
+- Compare exact module initialization positions before reporting a cross-module
+  TDZ read. All 15 source cases referenced dependencies whose initialization had
+  already completed. Hazardous cyclic initialization still rejects; a positive
+  initialized-cycle fixture was added. Diagnostics decreased **37 → 5**.
+
+### Session 343: Collection iterators and compiler-host builtins
+
+- Map/Set keys, values and entries return iterable iterators with next/done
+  state. Lazy stable insertion IDs preserve progress across deletion,
+  compaction, clear and reinsertion. Collection for-of loops observe additions
+  during iteration; exhausted iterators remain exhausted. Collection benchmarks
+  now materialize iterators explicitly with Array.from before joining them.
+- Added fixed-length Uint16 storage with zero initialization, numeric conversion,
+  wrapping, indexed access, iteration, join, JSON output and byte metadata.
+  This is a compiler-host subset: buffer views and additional typed-array
+  methods are unsupported; complete TypedArray exotic behavior is pending.
+- Added a compiler-host Date.toLocaleTimeString subset for default/en-US/en-GB/
+  Japanese formatting, local/UTC time and hour-cycle options. Other locale,
+  time-zone and formatting families fail loudly; full Intl is pending.
+- The production exporter accepts the pinned TypeScript **6.0.3** tsc source
+  graph with **zero unsupported diagnostics** (originally **807**), retaining
+  its normal type-error gate. Source export: **10.791 s**, peak RSS **2.30 GB**;
+  initial Rust C emission: **33.139 s**, peak RSS **604 MB**, about **69 MiB** C.
+- Normal conformance **392/392**, bundler **41/41**, runtime/Rust unit suites,
+  syntax and remaining ordinary gates passed. Frozen typed parity is **355
+  identical + 34 KNOWN**; frozen self-conformance is **382 PASS + 7 KNOWN**.
+  Explicit unported entries record the frozen emitter's missing new builtins;
+  frozen sources remain unchanged.
+
+### Session 344: Forced-GC checks become explicit
+
+- In response to the user's load concern, both CI entry points omit forced-GC
+  stress/pretenuring/aging gates by default. TSAOT_CI_GC_STRESS=1 enables them
+  explicitly. Existing explicit forced-moving flags remain supported by the
+  parallel entry point.
+- The production-defaults gate now runs with normal collection thresholds and
+  verifies PIC, root frames, pretenuring, nursery allocation and mimalloc.
+  Forced minor/aging assertions are conditional on the same explicit flag.
+  Ordinary automatic GC remains active; no GC stress suite was launched for
+  this CI-policy change. Documented the invocation in README.
+
+### Session 345: Measured reachability bottleneck
+
+- A five-second macOS sample of real TypeScript source C emission attributed
+  **3,891/4,228 samples (92.0%)** to global-set field reachability. Each visited
+  object previously scanned the whole ordered field table.
+- Traverse the BTreeMap range belonging to the current owner instead. The key
+  bounds include every Named/Elem/Capture variant and full identifier ranges.
+  A differential graph test checks cycles, disconnected components and key
+  boundaries against independent full-graph propagation (384 graph/root pairs).
+- The generated TypeScript C is byte-identical before/after. Initial emission
+  decreased **33.139 → 18.916 s** (1.75x); repeated isolated measurements and
+  native compilation results are recorded below when available.
+- Added opt-in TSAOT_PHASE_TIMINGS=1 records on stderr for read/parse/devirt/
+  escape/SROA/emit/write. They preserve generated stdout. After reachability was
+  fixed, another sample located the remaining cost in numeric fact inference:
+  a small range-widening loop repeatedly rescanned unrelated initializers.
+- Numeric inference now schedules only definitions whose Copy/UnOp/BinOp inputs
+  change. Sorted pending indices and a separate next-sweep set preserve the
+  original forward-sweep order, fact lattice and widening behavior. The same
+  TypeScript C remains byte-identical; initial total emission is **5.002 s**.
+  Full conformance **392/392** and frozen parity **355 identical + 34 KNOWN**
+  passed again after this change.
+- Native validation with cc -O0 linked successfully in **42.693 s**, producing
+  a **99 MiB** executable. Executing --version fails during CLI host startup:
+  sys is undefined because the runtime supplies no Node process/require/fs host.
+  Native TypeScript self-compilation is therefore still pending. The cc -O2
+  attempt was stopped after **485 s**; a Clang sample was dominated by LLVM
+  JumpThreading/LazyValueInfo. Neither native runtime speed nor an optimized
+  native build is claimed from this experiment.
+- The changed default CI passes with GC stress disabled; all benchmark outputs
+  pass with normal collection settings. Final isolated timings are below.
+- Three isolated alternating AB/BA/AB runs on the accepted IR give median
+  **26.070 → 4.264 s wall**, **26.020 → 4.246 s CPU**, a **6.11x** analyzer/C
+  emission speedup. No other build/test jobs or forced-GC settings were active.
+  Reproduction and the native-host limitation are documented in bench_results.md;
+  raw runs are in build/typescript_603/analyzer_comparison.json.
+- Final static-mimalloc timed kernels (three runs each) passed their budgets;
+  the complete benchmark output suite also passed. Shell syntax and git diff
+  whitespace checks passed. No generated compiler artifacts were committed.
+
+### Session 346: Further TypeScript source pipeline optimization
+
+- Reprofiled the accepted TypeScript 6.0.3 graph under normal GC settings.
+  Numeric inference still spent time allocating/rebalancing ordered worklists
+  and solving callers that could contribute no parameter facts.
+- Replaced instruction-index trees with reusable ordered bitsets, retaining
+  ascending processing and the separate next-sweep queue for backward edges.
+  A differential unit test compares insert/pop/empty behavior with BTreeSet
+  across empty, partial-word, word-boundary and sparse queues.
+- Skip numeric-parameter/clone-seed analysis when a caller has no eligible
+  resolved call; parameterless and indirect-only targets contribute no facts.
+  Index the sparse function-ID domain once for all four ABI metadata tables,
+  eliminating repeated whole-function searches while retaining reserved gaps.
+- Move UTF-16 wire normalization into exporter/wire_program.ts. Conversion and
+  validation share one walk and copy only changed ancestors. Unchanged IR stays
+  shared; lone-surrogate constants, field names and property names retain their
+  wire encodings. Added validation-path and input-immutability tests to both CI
+  entry points. No diagnostic or unsupported-feature gate was bypassed.
+- Three alternating AB/BA/AB comparisons against the previous session's
+  binaries: analyzer/C emission **4.197 → 2.361 s** median wall (**1.78x**),
+  **4.172 → 2.355 s** CPU. Frontend **10.433 → 9.928 s** wall and peak RSS
+  **2.298 → 2.183 GB**. A background build overlapped the later frontend pairs;
+  those timings are indicative and the per-run memory reduction is consistent.
+- Full TypeScript IR, labels and generated C are byte-identical. Normal full
+  conformance **392/392**, bundler **41/41**, CI-FAST, Rust tests **21/21**,
+  wire conversion tests and all **101** benchmark outputs/budgets (three runs)
+  pass. Typed frozen parity remains **355 identical + 34 KNOWN**. Frozen source
+  was untouched and forced-GC stress stayed disabled.
+- A bounded 90-second Clang pass probe confirmed large initializer/metadata
+  compilation remains expensive. Generated C semantics/shape were preserved;
+  optimized native compilation and the missing Node CLI host remain separate
+  limitations. Raw comparisons and the probe are in
+  build/typescript_603/opt_next/; see bench_results.md for measurements.
+
+
+### Session 347: Execute the native TypeScript 6.0.3 compiler
+
+- Added a synchronous C `System` host and a small TypeScript driver that calls
+  the unmodified upstream command line. Library declarations remain external
+  data; no Node/V8 execution fallback is used. The reproducible build script
+  copies the upstream source into a fresh isolated directory.
+- Added a benchmark runner that checks a negative TS2322 diagnostic, positive
+  interface/enum checks, exit codes, stdout and SHA-256 manifests before timing.
+  It alternates launches after warmup and records per-process CPU/RSS. Failures
+  stop the run without claiming a speedup. Normal automatic GC stays enabled;
+  no forced collections or threshold changes are used.
+- Native execution exposed and fixed colliding synthetic getter/constructor
+  IDs, mixed-value numeric SROA promotion, arguments.length ABI handling,
+  Array/generator iterator protocols, permanent-versus-temporary GC roots,
+  dynamic builtin instanceof, explicit-undefined slice ends, safe slice bounds,
+  out-of-range charCodeAt NaN, and per-iteration uninitialized lexical bindings.
+- Added Map/Set prototype size accessors for generic and optional property
+  reads. Null/undefined/void values now keep their tags instead of being
+  unboxed as numbers, including properties reinitialized by a recursive call
+  after TypeScript's flow analysis had narrowed them to undefined.
+- Preserve string metric optimizations with double accumulators and source
+  addition order. Empty string metrics take the semantic fallback. The concat
+  length loop uses an integer shadow only under a finite/integer/headroom guard.
+- The first successful complete compiler-project comparison emitted 78 files
+  byte-identical to Node and returned zero. Three-run medians: Node 3.380 s,
+  native 41.095 s. This is a correctness baseline, with runtime O2, generated
+  O1, and eight large initialization/factory functions at O0. It does not claim
+  native code is faster than Node or tsgo. The native C build took 296.965 s.
+- The frozen analyzer source remains unchanged. Reviewed representation/root
+  differences are explicit in frozen_known_diffs.tsv. Build artifacts and raw
+  logs remain under build/typescript_603/native_host and logs.
+
+### Session 348: Compact property access and measured runtime optimization
+
+- Preserve the original 52-byte per-site shape cache and short inline guards.
+  Unsized objects validate cached own slots with live bounds/key checks, including
+  dictionary objects after deletion. Sized class receivers use a separate
+  4,096-bucket location table (576 KiB), with prototype/size/registry guards.
+  Inherited/missing/exotic properties keep canonical lookup.
+- Missing optional properties and fixed-key shape variation no longer retire
+  the cache. Computed-key diversity retains its bounded fallback. Added a
+  prototype/key class-field cache with safe registry-growth invalidation.
+- Dynamic method dispatch now emits field and method-key caches, retaining
+  accessor calls and method reassignment. Larger captured environments use a
+  separate 64-slot stack frame, preserving the small common call frame.
+- Rejected two cache variants that enlarged every site to 136 bytes and slowed
+  the compiler despite fewer searches. Ordinary access does not pay their extra
+  prototype, size or epoch checks. No larger hidden-class system was added.
+- CPU sampling exposed Darwin signal-mask syscalls on the non-throwing exception
+  path. Paired ts_setjmp/ts_longjmp helpers omit those mask operations on Darwin;
+  embedders can request preservation. Frozen parity uses the legacy spelling.
+- Vendored mimalloc previously defaulted to MI_DEBUG=2 despite O2. Its static
+  object now uses release mode, separately keyed from the opt-in debug build;
+  runtime assertions and automatic GC remain enabled.
+- Added storage-domain, short-object, prototype-change, late-registration,
+  dictionary-slot, warmup, closure-ABI boundary and interface-method regressions.
+  The interface kernel mixes 32 layouts, deletion, reads, writes and method calls.
+- Full normal conformance passes 403/403, CI-FAST passes, and frozen parity is
+  323 identical + 77 reviewed KNOWN, with no new unexplained differences.
+  End-to-end measurements and remaining bottlenecks are in bench_results.md.
+
+- Final alternating three-run compiler-project comparison: native median
+  **41.581 → 35.655 s** (**14.3% less wall time**), peak RSS **2.181 → 1.923 GB**.
+  Node median **3.435 s** remains much faster. All 78 emitted files and
+  positive/negative diagnostics match on every run.
+- Preserve four distinct inline shapes even when they share a slot; sample
+  later shape promotion without changing the inline probe. This recovered the
+  four-shape kernel from 145 to 90 ms. All **102** benchmark budgets pass.
+  Bundler **42/42**, Rust **21/21**, and frozen self-conformance **391 + 9 KNOWN**
+  also pass. A one-slot initial-capacity trial gave no convincing gain and was
+  excluded. Remaining CPU cost is allocation/GC and OS memory operations.
+
+
+### Session 349: Reduce GC container scans and small-buffer allocation
+
+- Profiled managed allocations by kind, minor element scans, root/remset work
+  and raw runtime allocator call sites on the actual native TypeScript compiler.
+- Array and Map indexed writes now retain spans of 64-entry dirty cards through
+  aging. Generic writes, promotion, reordering, compaction and large indices
+  preserve complete scanning; young/full tracing and weak ephemerons retain
+  their semantics. On arm64 the metadata fits existing alignment padding.
+- Filter old-generation minor edges before the outlined mark worker. Collection
+  counts remain 2,725 minor / 5 full, with identical managed allocation bytes,
+  visited cells and aging outcomes. GC pause totals fall **8.570 → 2.881 s**.
+- Recycle four-slot property buffers with a 65,536-buffer / 6 MiB bound, retaining
+  capacity/descriptor semantics. **77,110,131** requests reuse a buffer, with
+  **1,078,334** fresh mallocs. Larger buffers remain on the normal allocator.
+- Excluded closure/environment coallocation: larger managed cells increased
+  minor collections without a convincing isolated speed gain.
+- Full emit comparison, alternating three runs: **46.201 → 33.942 s**
+  (**26.5% less wall**, **25.9% less process CPU**). RSS is effectively flat at
+  **1.941 GB**. An unrelated four-core workload was active; these are paired
+  loaded measurements, not directly comparable to earlier quiet absolute times.
+  Node/V8 median **4.622 s** is still about **7.3x faster**.
+- All **78** emitted files, stdout, positive/negative diagnostics and exit codes
+  match. Normal conformance **404/404**, benchmarks/budgets **102/102**, CI-FAST,
+  runtime units with libc and static mimalloc, and libc bundler **42/42** pass.
+  The explicit-mimalloc bundler attempt exposed its existing missing link flags;
+  only the successful libc rerun is counted. No forced-GC workload, threshold
+  changes or frozen-analyzer edits were made. Logs and saved baselines remain
+  under build/typescript_603/native_host/gc_opt and logs.

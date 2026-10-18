@@ -199,6 +199,25 @@ pub fn run_sroa(program: &mut Program, result: &EscapeResult) {
                 changed = false;
                 propagate_numeric(&rewritten, &primitive_locs, &mut numeric, &mut changed);
             }
+            // A local can have several definitions (short-circuit results and
+            // inlined return slots in particular). One numeric write does not
+            // prove that every value stored in it is a number.
+            for param in &program.functions[fi].params {
+                if !primitive_locs.contains(&param.0) {
+                    numeric.remove(&param.0);
+                }
+            }
+            let mut changed = true;
+            while changed {
+                changed = false;
+                prune_numeric(
+                    &rewritten,
+                    &primitive_locs,
+                    &numeric_scalars,
+                    &mut numeric,
+                    &mut changed,
+                );
+            }
             for l in &mut program.functions[fi].locals {
                 if numeric.contains(&l.id.0) {
                     l.ref_kind = RefKind::Primitive;
@@ -2060,7 +2079,7 @@ fn trim_trailing_alloc_proto_load(out: &mut Vec<Inst>, proto_local: u32) {
 /// must NOT be scalar-replaced (the kept state-machine call needs a real object).
 /// Depth-guarded; conservative (returns true) on overflow.
 fn needs_materialized_this(f: &Function, bodies: &BTreeMap<u32, Function>, depth: u32) -> bool {
-    if f.is_generator || f.is_async {
+    if f.is_generator || f.is_async || f.rest_param.is_some() {
         return true;
     }
     if depth > 16 {
@@ -2072,6 +2091,7 @@ fn needs_materialized_this(f: &Function, bodies: &BTreeMap<u32, Function>, depth
     };
     fn scan(body: &[Inst], p0: u32, bodies: &BTreeMap<u32, Function>, depth: u32) -> bool {
         body.iter().any(|inst| match inst {
+            Inst::CallBuiltinStatic { builtin, .. } if builtin.starts_with("arguments.length:") => true,
             Inst::LoadFieldDynamic { obj, .. }
             | Inst::StoreFieldDynamic { obj, .. }
             | Inst::HasFieldDynamic { obj, .. }
@@ -2354,7 +2374,7 @@ fn is_inlinable_free_fn(f: &Function) -> bool {
     // Generators/async are state machines (emit_generator_function / emit_async_function);
     // their bodies must never be spliced into a caller. (An empty generator whose body is a
     // lone Return would otherwise pass the checks below.)
-    if f.is_generator || f.is_async {
+    if f.is_generator || f.is_async || f.rest_param.is_some() {
         return false;
     }
     const MAX_BODY: usize = 8;
@@ -3069,6 +3089,105 @@ fn propagate_numeric(
                 propagate_numeric(finally_body, primitive_locs, numeric, changed);
             }
             _ => {}
+        }
+    }
+}
+
+fn prune_numeric(
+    body: &[Inst],
+    primitive: &BTreeSet<u32>,
+    scalars: &BTreeSet<u32>,
+    numeric: &mut BTreeSet<u32>,
+    changed: &mut bool,
+) {
+    for inst in body {
+        let is_num = |id: LocalId| numeric.contains(&id.0) || primitive.contains(&id.0);
+        let definition = match inst {
+            Inst::Const { dst, value } => Some((*dst, const_is_number_value(value))),
+            Inst::Copy { dst, src } => Some((*dst, is_num(*src))),
+            Inst::UnOp { dst, op, operand } => Some((
+                *dst,
+                matches!(op.as_str(), "+" | "-" | "~") && is_num(*operand),
+            )),
+            Inst::BinOp { dst, op, lhs, rhs } => Some((
+                *dst,
+                matches!(
+                    op.as_str(),
+                    "+" | "-" | "*" | "/" | "%" | "**" | "&" | "|" | "^" | "<<" | ">>" | ">>>"
+                ) && is_num(*lhs)
+                    && is_num(*rhs),
+            )),
+            Inst::AllocObject { dst, .. }
+            | Inst::AllocArray { dst, .. }
+            | Inst::AllocClosure { dst, .. }
+            | Inst::LoadField { dst, .. }
+            | Inst::LoadMethodValue { dst, .. }
+            | Inst::LoadBuiltinFn { dst, .. }
+            | Inst::AllocClassValue { dst, .. }
+            | Inst::NewDynamic { dst, .. }
+            | Inst::LoadElem { dst, .. }
+            | Inst::LoadGlobal { dst, .. }
+            | Inst::LoadIndex { dst, .. }
+            | Inst::ArrayLen { dst, .. }
+            | Inst::StringLen { dst, .. }
+            | Inst::HasField { dst, .. }
+            | Inst::HasFieldDynamic { dst, .. }
+            | Inst::GenericLen { dst, .. }
+            | Inst::LoadFieldDynamic { dst, .. }
+            | Inst::ArraySlice { dst, .. }
+            | Inst::ObjectRest { dst, .. }
+            | Inst::ObjectCopyProps { dst, .. }
+            | Inst::ConstructResult { dst, .. }
+            | Inst::LoadClassProto { dst, .. }
+            | Inst::GetProto { dst, .. }
+            | Inst::NewMap { dst }
+            | Inst::NewSet { dst } => {
+                Some((*dst, primitive.contains(&dst.0) || scalars.contains(&dst.0)))
+            }
+            Inst::Call { dst, .. }
+            | Inst::Yield { dst, .. }
+            | Inst::Await { dst, .. }
+            | Inst::CallSpread { dst, .. }
+            | Inst::CallBuiltin { dst, .. }
+            | Inst::CallBuiltinStatic { dst, .. }
+            | Inst::DeleteField { dst, .. }
+            | Inst::SetProto { dst, .. } => {
+                dst.map(|dst| (dst, primitive.contains(&dst.0) || scalars.contains(&dst.0)))
+            }
+            Inst::Loop {
+                cond_body, body, ..
+            } => {
+                prune_numeric(cond_body, primitive, scalars, numeric, changed);
+                prune_numeric(body, primitive, scalars, numeric, changed);
+                None
+            }
+            Inst::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                prune_numeric(then_body, primitive, scalars, numeric, changed);
+                prune_numeric(else_body, primitive, scalars, numeric, changed);
+                None
+            }
+            Inst::TryCatch {
+                try_body,
+                catch_var,
+                catch_body,
+                finally_body,
+            } => {
+                if let Some(var) = catch_var {
+                    *changed |= numeric.remove(&var.0);
+                }
+                prune_numeric(try_body, primitive, scalars, numeric, changed);
+                prune_numeric(catch_body, primitive, scalars, numeric, changed);
+                prune_numeric(finally_body, primitive, scalars, numeric, changed);
+                None
+            }
+            _ => None,
+        };
+        if let Some((dst, false)) = definition {
+            *changed |= numeric.remove(&dst.0);
         }
     }
 }

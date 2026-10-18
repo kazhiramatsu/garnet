@@ -76,6 +76,7 @@ tsv ts_regexp_adapter_match_all_tsv(tsv input, tsv pattern, uint32_t flags);
 tsv ts_regexp_adapter_replace_tsv(tsv input, tsv pattern, uint32_t flags, tsv replacement, int replace_all_method);
 tsv ts_regexp_adapter_split_tsv(tsv input, tsv pattern, uint32_t flags, tsv limit);
 tsv ts_regexp_adapter_validate_object_tsv(tsv re);
+tsv ts_regexp_adapter_construct_tsv(tsv pattern, tsv flags, int as_constructor);
 tsv ts_regexp_adapter_object_test_tsv(tsv re, tsv input);
 double ts_regexp_adapter_object_search_tsv(tsv input, tsv re);
 tsv ts_regexp_adapter_object_exec_tsv(tsv re, tsv input);

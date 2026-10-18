@@ -18,8 +18,10 @@
  */
 import * as ts from "typescript";
 import * as fs from "fs";
+import * as path from "path";
 import { ClassExtractor, ClassInfo, memberKeyName } from "./class_extract";
 import { classifyRegExpLiteral } from "./regexp";
+import { hasUnpairedSurrogate, toWireProgram } from "./wire_program";
 
 type RefKind = "reference" | "primitive" | "unknown";
 type SourceMode = "module" | "script";
@@ -94,69 +96,6 @@ function effectiveStrictOption(opts: ts.CompilerOptions, name: StrictTypeOptionN
   return opts.strict === true;
 }
 
-function utf16Units(s: string): number[] {
-  const units: number[] = [];
-  for (let i = 0; i < s.length; i++) units.push(s.charCodeAt(i));
-  return units;
-}
-
-function hasUnpairedSurrogate(s: string): boolean {
-  for (let i = 0; i < s.length; i++) {
-    const cu = s.charCodeAt(i);
-    if (cu >= 0xd800 && cu <= 0xdbff) {
-      if (i + 1 < s.length) {
-        const lo = s.charCodeAt(i + 1);
-        if (lo >= 0xdc00 && lo <= 0xdfff) {
-          i++;
-          continue;
-        }
-      }
-      return true;
-    }
-    if (cu >= 0xdc00 && cu <= 0xdfff) return true;
-  }
-  return false;
-}
-
-function toWireProgram(prog: any): any {
-  const visit = (v: any): any => {
-    if (Array.isArray(v)) return v.map(visit);
-    if (!v || typeof v !== "object") return v;
-    if (v.kind === "Str" && typeof v.value === "string" && hasUnpairedSurrogate(v.value)) {
-      return { kind: "Str16", units: utf16Units(v.value) };
-    }
-    const out: any = {};
-    for (const [k, val] of Object.entries(v)) out[k] = visit(val);
-    if (typeof out.propName === "string" && hasUnpairedSurrogate(out.propName)) {
-      out.propNameUnits = utf16Units(out.propName);
-      delete out.propName;
-    }
-    return out;
-  };
-  const out = visit(prog);
-  out.fields = prog.fields.map((f: any) => {
-    if (typeof f.name === "string" && hasUnpairedSurrogate(f.name)) {
-      return { id: f.id, nameUnits: utf16Units(f.name), declaringType: f.declaringType };
-    }
-    return f;
-  });
-  const assertNoUnpaired = (v: any, path: string): void => {
-    if (typeof v === "string") {
-      if (hasUnpairedSurrogate(v)) throw new Error(`unpaired surrogate escaped Str16 conversion at ${path}`);
-      return;
-    }
-    if (Array.isArray(v)) {
-      for (let i = 0; i < v.length; i++) assertNoUnpaired(v[i], `${path}[${i}]`);
-      return;
-    }
-    if (v && typeof v === "object") {
-      for (const [k, val] of Object.entries(v)) assertNoUnpaired(val, `${path}.${k}`);
-    }
-  };
-  assertNoUnpaired(out, "$");
-  return out;
-}
-
 /** Classification of a `new <identifier>(...)` target (after built-ins), produced
  *  by resolveNewTarget and consumed by the dispatch in lowerExpr:
  *   - valueDynamic: a monomorphic class VALUE with an explicit ctor -> NewDynamic
@@ -204,14 +143,14 @@ interface FnCtx {
   staticClass?: number; // for STATIC bodies: the defining class id, used only to resolve `super.X`
   paramClasses?: Record<string, number>; // param local id -> class id (typed-field codegen)
   restParam?: number; // local id of a rest parameter (...args), if any
+  argumentsOffset?: number; // captured cells and receiver preceding JS arguments
   isAsync?: boolean;
   isGenerator?: boolean;
   // A named function expression binds its name only inside its own body:
   // `const f = function self(){ return self(); }`.
   selfFunctionSymbol?: ts.Symbol;
-  // stack of enclosing loop kinds, for break/continue lowering. "while" loops
-  // can take a C continue safely; "for"/"for-of" put the increment at body end,
-  // so continue would skip it — those reject continue (break is always fine).
+  // Stack of enclosing loop kinds. Switches use a one-pass IR loop, so an
+  // unlabeled continue skips their entries when resolving its actual target.
   loopStack?: string[];
   loopLabels?: (string | undefined)[]; // label of each loop on loopStack (parallel)
   pendingLabel?: string;               // label to attach to the next loop entered
@@ -282,6 +221,10 @@ class Exporter {
   moduleScopeSyms = new Set<ts.Symbol>();
   // value namespaces already materialized (so repeated `namespace N {}` merge).
   materializedNamespaces = new Set<ts.Symbol>();
+  private namespaceBindings = new Map<ts.Symbol, { namespace: ts.Identifier; name: string }>();
+  private moduleNamespaceLocals = new Map<ts.Symbol, number>();
+  private namespaceGetterFunctions = new Map<ts.Symbol, number>();
+  private moduleInitializationOrder = new Map<ts.SourceFile, number>();
   // Bundler: the user's modules in ESM execution order (dependencies before
   // dependents = DFS post-order). For a single-file program this is just [entry].
   // All per-file passes iterate this list; __module_init concatenates every
@@ -356,6 +299,8 @@ class Exporter {
   fields: { id: number; name: string; declaringType: number }[] = [];
   globals: { id: number; name: string }[] = [];
   functions: any[] = [];
+  private templateObjectGlobals = new Map<ts.TaggedTemplateExpression, number>();
+  private hasDynamicDelete = false;
   // fnIds whose body has already been lowered, so lowerFunctionLike is idempotent.
   // A closure node may be lowered more than once (e.g. a class with no explicit
   // ctor that is `new`'d at several sites inlines its field-initializer closures
@@ -415,9 +360,6 @@ class Exporter {
       if (ts.isPropertyDeclaration(node) &&
           node.modifiers?.some((m) => m.kind === ts.SyntaxKind.AccessorKeyword)) {
         this.unsupported(node, "auto-accessor class fields");
-      }
-      if (ts.isTaggedTemplateExpression(node)) {
-        this.unsupported(node, "tagged template literals (template object identity/raw strings)");
       }
       if (ts.isMetaProperty(node)) {
         this.unsupported(node, `${node.getText()} meta-property`);
@@ -558,7 +500,10 @@ class Exporter {
     // array), and a never-typed return slot may hold undefined. Unboxing it to a
     // raw double would coerce that value to NaN/null. Classify it as "unknown"
     // (boxed) so the runtime value is preserved.
-    const unboxable = F.NumberLike | F.Void | F.Undefined | F.Null;
+    // Nullish values must retain their tags. A property narrowed to undefined
+    // can also be initialized by a call that TypeScript's flow model does not
+    // invalidate; converting the later read to double loses that object too.
+    const unboxable = F.NumberLike;
     if (t.flags & (F.StringLike | F.ESSymbolLike | F.BigIntLike | F.BooleanLike)) return "reference";
     if (t.flags & unboxable) return "primitive";
     return "unknown";
@@ -851,6 +796,11 @@ class Exporter {
     // Only module-init (top-level) reads are hazardous; deferred reads inside a
     // function run after both modules finished initializing.
     if (this.enclosingFunction(node) !== undefined) return false;
+    const declarationOrder = this.moduleInitializationOrder.get(declSf);
+    const useOrder = this.moduleInitializationOrder.get(useSf);
+    // A completed dependency has initialized its lexical declarations even when
+    // both files belong to the same import cycle.
+    if (declarationOrder !== undefined && useOrder !== undefined && declarationOrder < useOrder) return false;
     return this.cyclicModules.has(useSf) && this.cyclicModules.has(declSf);
   }
   loadGlobalObjectProperty(ctx: FnCtx, name: string): number {
@@ -1052,15 +1002,38 @@ class Exporter {
   globalMemberMaybeMutated(ns: string, member: string): boolean {
     return this.mutatedGlobalNames.has(ns) || this.mutatedGlobalMembers.has(`${ns}.${member}`);
   }
+  private lowerSpreadArguments(ctx: FnCtx, args: readonly ts.Expression[]): { kind: string; local: number }[] {
+    return args.map(arg => {
+      const spread = ts.isSpreadElement(arg);
+      const expression = spread ? arg.expression : arg;
+      let local = this.lowerExpr(ctx, expression);
+      if (spread) {
+        // Consume each iterator now. Later argument expressions can mutate the
+        // original array or iterator; the argument list retains the old values.
+        const site = this.site++;
+        this.recordSite(site, "array", this.inLoop(arg) ? "many" : "once", false, arg);
+        const snapshot = this.newLocal(ctx, "reference", "spreadArgs");
+        ctx.body.push({ kind: "AllocArray", dst: snapshot, elemType: 0, site });
+        ctx.body.push({ kind: "ArrayPushAll", arr: snapshot, src: local });
+        local = snapshot;
+      } else if (this.isMutableStorageLocal(ctx, local)) {
+        const snapshot = this.newLocal(ctx, this.refKindOf(expression));
+        ctx.body.push({ kind: "Copy", dst: snapshot, src: local });
+        local = snapshot;
+      }
+      return { kind: spread ? "spread" : "single", local };
+    });
+  }
   lowerDynamicValueCall(ctx: FnCtx, calleeLocal: number, recv: number | undefined,
                         argExprs: readonly ts.Expression[], resultKind: RefKind): number {
     const hasSpread = argExprs.some((a) => ts.isSpreadElement(a));
     if (hasSpread) {
-      const argSpecs = argExprs.map((a) => {
-        const spread = ts.isSpreadElement(a);
-        const e = spread ? a.expression : a;
-        return { kind: spread ? "spread" : "single", local: this.lowerExpr(ctx, e) };
-      });
+      if (this.isMutableStorageLocal(ctx, calleeLocal)) {
+        const snapshot = this.newLocal(ctx, "reference");
+        ctx.body.push({ kind: "Copy", dst: snapshot, src: calleeLocal });
+        calleeLocal = snapshot;
+      }
+      const argSpecs = this.lowerSpreadArguments(ctx, argExprs);
       const dst = this.newLocal(ctx, resultKind);
       const inst: any = { kind: "CallSpread", dst, callee: { kind: "Value", local: calleeLocal }, argSpecs };
       if (recv !== undefined) inst.recv = recv;
@@ -1212,7 +1185,15 @@ class Exporter {
   symbolOf(node: ts.Node | undefined): ts.Symbol | undefined {
     if (!node) return undefined;
     const applyTopLevelFallback = (sym: ts.Symbol | undefined): ts.Symbol | undefined => {
-      const a = this.unwrapImportAlias(sym);
+      let a = this.unwrapImportAlias(sym);
+      // Checking a named function expression can replace its reference symbol
+      // with a transient type symbol. Both denote the same lexical self binding;
+      // keep capture maps keyed by the declaration's original binding symbol.
+      const declaration = a?.valueDeclaration;
+      if (a && (a.flags & ts.SymbolFlags.Transient) && declaration &&
+          ts.isFunctionExpression(declaration) && declaration.name) {
+        a = (declaration as unknown as { symbol?: ts.Symbol }).symbol ?? a;
+      }
       if (ts.isIdentifier(node) && this.isVarRef(node) && this.isAmbientGlobalSymbol(a)) {
         return this.moduleTopBindingByName.get(node.text) ?? a;
       }
@@ -1574,23 +1555,30 @@ class Exporter {
     if (ts.isParameter(p) && p.name === id) return false;
     if (ts.isFunctionDeclaration(p) && p.name === id) return false;
     if ((ts.isClassDeclaration(p) || ts.isClassExpression(p)) && p.name === id) return false;
-    if (ts.isBindingElement(p) && p.name === id) return false;
+    if (ts.isBindingElement(p) && (p.name === id || p.propertyName === id)) return false;
     return true;
   }
   declaredIn(F: FnLike): Set<ts.Symbol> {
     const cached = this.declaredCache.get(F);
     if (cached) return cached;
     const decl = new Set<ts.Symbol>();
-    for (const p of F.parameters) {
-      if (ts.isIdentifier(p.name)) {
-        const s = this.symbolOf(p.name);
+    const bind = (name: ts.BindingName) => {
+      if (ts.isIdentifier(name)) {
+        const s = this.symbolOf(name);
         if (s) decl.add(s);
+      } else {
+        for (const element of name.elements) {
+          if (ts.isBindingElement(element)) bind(element.name);
+        }
       }
-    }
+    };
+    for (const p of F.parameters) bind(p.name);
     const visitOwn = (n: ts.Node) => {
-      if (ts.isVariableDeclaration(n) && ts.isIdentifier(n.name)) {
-        const s = this.symbolOf(n.name);
-        if (s) decl.add(s);
+      if (ts.isVariableDeclaration(n)) bind(n.name);
+      if (ts.isImportDeclaration(n) && this.isNamespaceImportStmt(n)) {
+        const name = (n.importClause!.namedBindings as ts.NamespaceImport).name;
+        const sym = this.symbolOf(name);
+        if (sym) decl.add(sym);
       }
       if (ts.isFunctionDeclaration(n) && n.name) {
         const s = this.symbolOf(n.name);
@@ -1687,7 +1675,7 @@ class Exporter {
     for (const [k, v] of prev) this.freeCache.set(k, v);
     if (process.env.TSAOT_DEBUG_FREEVARS) {
       for (const [k, v] of prev) {
-        const txt = k.getText().slice(0, 50).replace(/\n/g, " ");
+        const txt = k.pos >= 0 ? k.getText().slice(0, 50).replace(/\n/g, " ") : "<module init>";
         console.error(`[free] ${txt} => [${[...v].map((s) => (s as { name?: string }).name ?? "?").join(",")}]`);
       }
     }
@@ -1710,8 +1698,22 @@ class Exporter {
     const nested: FnLike[] = [];
     const ctorRefs: ts.ConstructorDeclaration[] = []; // ctors Direct-called from F (new/super)
     const scan = (n: ts.Node) => {
+      // Type annotations have no runtime reads. Treating a local interface,
+      // type parameter, or callback signature as a value invents capture cells.
+      // A class's extends expression still executes, including generic bases.
+      if (ts.isExpressionWithTypeArguments(n)) {
+        const clause = n.parent;
+        if (ts.isHeritageClause(clause) && clause.token === ts.SyntaxKind.ExtendsKeyword &&
+            (ts.isClassDeclaration(clause.parent) || ts.isClassExpression(clause.parent)))
+          scan(n.expression);
+        return;
+      }
+      if (ts.isTypeNode(n) || ts.isTypeParameterDeclaration(n) ||
+          ts.isInterfaceDeclaration(n) || ts.isTypeAliasDeclaration(n)) return;
       if (ts.isIdentifier(n) && this.isVarRef(n)) {
-        const s = this.symbolOf(n);
+        const symbol = this.symbolOf(n);
+        const binding = symbol && this.namespaceBindings.get(symbol);
+        const s = binding ? this.symbolOf(binding.namespace) : symbol;
         if (s && this.isScriptGlobalVarSymbol(s, n.text)) {
           // Script top-level var bindings are runtime global-object properties,
           // not closure cells. Reads/writes lower to globalThis.<name>.
@@ -1806,7 +1808,12 @@ class Exporter {
       }
     }
     for (const g of nested) {
-      for (const s of this.freeVarsInner(g)) if (!decl.has(s)) res.add(s);
+      for (const s of this.freeVarsInner(g)) {
+        // A named function expression creates its own lexical self binding at
+        // the closure site; the enclosing function does not capture that name.
+        if (ts.isFunctionExpression(g) && g.name && this.symbolOf(g.name) === s) continue;
+        if (!decl.has(s)) res.add(s);
+      }
     }
     // Transitive: pull in module-scope cells needed by called functions.
     for (const g of calledFns) {
@@ -1864,6 +1871,46 @@ class Exporter {
     }
     return this._fnNodeById.get(id);
   }
+  private availableCaptureCell(ctx: FnCtx, sym: ts.Symbol): number | undefined {
+    const local = ctx.cellAccess.get(sym);
+    if (local !== undefined) return local;
+    const global = this.moduleCellGlobal.get(sym);
+    if (global === undefined) return undefined;
+    const cell = this.newLocal(ctx, "reference", "moduleCell");
+    ctx.body.push({ kind: "LoadGlobal", dst: cell, gref: global });
+    return cell;
+  }
+
+  private directFunctionValue(ctx: FnCtx, func: number): number | undefined {
+    const node = this.fnNodeById(func);
+    if (!node || !isLiftable(node)) return undefined;
+    const sym = !ts.isArrowFunction(node) && node.name ? this.symbolOf(node.name) : undefined;
+    if (sym) {
+      const cell = ctx.cellAccess.get(sym);
+      if (cell !== undefined) {
+        const value = this.newLocal(ctx, "reference", "callee");
+        ctx.body.push({ kind: "LoadField", dst: value, obj: cell, field: this.VALUE });
+        return value;
+      }
+      const global = this.functionValueGlobal.get(sym);
+      if (global !== undefined) {
+        const value = this.newLocal(ctx, "reference", "callee");
+        ctx.body.push({ kind: "LoadGlobal", dst: value, gref: global });
+        return value;
+      }
+    }
+    const captures: { binding: number; cell: number }[] = [];
+    for (const sym of this.sortedFreeVars(node)) {
+      const cell = this.availableCaptureCell(ctx, sym);
+      if (cell === undefined) return undefined;
+      captures.push({ binding: this.bindingIdOf(sym), cell });
+    }
+    const value = this.newLocal(ctx, "reference", "callee");
+    const site = this.site++;
+    this.recordSite(site, "closure", this.inLoop(node) ? "many" : "once", true, node);
+    ctx.body.push({ kind: "AllocClosure", dst: value, func, captures, site });
+    return value;
+  }
   // Cells to prepend when calling Direct function `func` from `ctx`. If the
   // callee captures module cells, return the caller's locals holding those same
   // cells (in the callee's capture order). The caller is guaranteed to hold the
@@ -1883,7 +1930,7 @@ class Exporter {
     if (frees.length === 0) return [];
     const out: number[] = [];
     for (const s of frees) {
-      const cell = ctx.cellAccess.get(s);
+      const cell = this.availableCaptureCell(ctx, s);
       if (cell !== undefined) out.push(cell);
       else {
         // Caller doesn't hold a cell the callee needs. With the freeVars
@@ -2210,7 +2257,15 @@ class Exporter {
       return same;
     }
     const raw = this.regexpConstructorRawFromArgs(node.arguments);
-    if (raw === undefined) return undefined;
+    if (raw === undefined) {
+      const args = this.lowerSequenced(ctx, arr);
+      const undef = this.newLocal(ctx, "reference");
+      ctx.body.push({ kind: "Const", dst: undef, value: { kind: "Undef" } });
+      const dst = this.newLocal(ctx, "reference", hint);
+      const construct = this.constNumber(ctx, ts.isNewExpression(node) ? 1 : 0);
+      ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "regexp.construct", args: [args[0] ?? undef, args[1] ?? undef, construct] });
+      return dst;
+    }
     if (node.arguments) {
       for (let i = 2; i < node.arguments.length; i++) this.lowerExpr(ctx, node.arguments[i]);
     }
@@ -2318,7 +2373,17 @@ class Exporter {
     const add = (n: ts.Node | undefined) => { const s = n ? this.symbolOf(n) : undefined; if (s) this.moduleScopeSyms.add(s); };
     for (const s of stmt.body.statements) {
       if (ts.isFunctionDeclaration(s) && s.name) add(s.name);
-      else if (ts.isVariableStatement(s)) for (const d of s.declarationList.declarations) { if (ts.isIdentifier(d.name)) add(d.name); }
+      else if (ts.isVariableStatement(s)) {
+        const bind = (name: ts.BindingName) => {
+          if (ts.isIdentifier(name)) {
+            add(name);
+            const sym = this.symbolOf(name);
+            if (sym && this.isExportedDecl(s) && ts.isIdentifier(stmt.name))
+              this.namespaceBindings.set(sym, { namespace: stmt.name, name: name.text });
+          } else for (const el of name.elements) if (ts.isBindingElement(el)) bind(el.name);
+        };
+        for (const d of s.declarationList.declarations) bind(d.name);
+      }
       else if (ts.isClassDeclaration(s) && s.name) add(s.name);
       else if (ts.isEnumDeclaration(s)) add(s.name);
       else if (ts.isModuleDeclaration(s) && ts.isIdentifier(s.name) && this.isValueNamespace(s)) { add(s.name); this.registerNamespaceMemberSyms(s); }
@@ -2332,37 +2397,68 @@ class Exporter {
     return !!nb && ts.isNamespaceImport(nb) && !!this.resolveModuleSf(stmt.moduleSpecifier);
   }
 
-  /** Lower `import * as ns from "./b"` to a runtime module-namespace object whose
-   *  properties are b's exports (a snapshot at the import position — b's top-level
-   *  has already run, earlier in execution order). References to `ns` resolve to
-   *  this object via symbol linking (the alias unwraps to b's module symbol).
-   *  A mutable (non-const) export is a live binding a snapshot can't model →
-   *  loud-reject (use a named import, which IS live via the shared cell). */
+  private defineModuleExportGetter(ctx: FnCtx, obj: number, name: string, sym: ts.Symbol, node: ts.Node): void {
+    const cell = this.availableCaptureCell(ctx, sym);
+    if (cell === undefined) {
+      this.unsupported(node, `namespace export '${name}' has no binding cell`);
+      return;
+    }
+    let func = this.namespaceGetterFunctions.get(sym);
+    if (func === undefined) {
+      func = this.allocSpecFn();
+      this.namespaceGetterFunctions.set(sym, func);
+      this.functions.push({
+        id: func, name: `__get_export_${name}`, params: [0], ret: 0,
+        locals: [{ id: 0, typeId: 0, refKind: "reference" }, { id: 1, typeId: 0, refKind: "reference" }],
+        body: [{ kind: "LoadField", dst: 1, obj: 0, field: this.VALUE }, { kind: "Return", src: 1 }],
+        isExported: false, paramClasses: {}, restParam: null,
+        isAsync: false, isGenerator: false, takesThis: false, arity: 0, hasPrototype: false,
+      });
+    }
+    const getter = this.newLocal(ctx, "reference");
+    const site = this.site++;
+    this.recordSite(site, "closure", "once", true, node);
+    ctx.body.push({ kind: "AllocClosure", dst: getter, func, captures: [{ binding: this.bindingIdOf(sym), cell }], site });
+    const key = this.constString(ctx, name);
+    const setter = this.newLocal(ctx, "reference");
+    ctx.body.push({ kind: "Const", dst: setter, value: { kind: "Undef" } });
+    ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "object.defineAccessor:0:0:1:0", args: [obj, key, getter, setter] });
+  }
+
+  /** Module namespace reads follow the original export cells, including mutable
+   *  and reexported bindings. Repeated imports share one namespace object. */
   private lowerNamespaceImport(ctx: FnCtx, stmt: ts.ImportDeclaration): void {
     const nb = stmt.importClause!.namedBindings as ts.NamespaceImport;
     const target = this.resolveModuleSf(stmt.moduleSpecifier);
     if (!target) return;
     const modSym = this.checker.getSymbolAtLocation(target) ?? (target as unknown as { symbol?: ts.Symbol }).symbol;
     if (!modSym) return;
+    if (this.moduleNamespaceLocals.has(modSym)) return;
     const site = this.site++;
     const obj = this.newLocal(ctx, "reference", nb.name.text);
     this.recordSite(site, "object", "once", false, stmt);
     ctx.body.push({ kind: "AllocObject", dst: obj, typeId: 0, site });
+    this.moduleNamespaceLocals.set(modSym, obj);
     // `ns` references unwrap (symbolOf) to the module symbol; bind it there. Also
     // bind the alias symbol itself defensively.
-    this.ensureLocalAlias(ctx, modSym, obj);
+    const cell = ctx.cellAccess.get(modSym);
+    if (cell !== undefined) ctx.body.push({ kind: "StoreField", obj: cell, field: this.VALUE, src: obj });
+    else this.ensureLocalAlias(ctx, modSym, obj);
     const aliasSym = this.checker.getSymbolAtLocation(nb.name);
     if (aliasSym && aliasSym !== modSym) this.ensureLocalAlias(ctx, aliasSym, obj);
-    for (const exp of this.checker.getExportsOfModule(modSym)) {
+    const nullValue = this.newLocal(ctx, "reference");
+    ctx.body.push({ kind: "Const", dst: nullValue, value: { kind: "Null" } });
+    ctx.body.push({ kind: "SetProto", dst: this.newLocal(ctx, "reference"), obj, proto: nullValue });
+    const exports = [...this.checker.getExportsOfModule(modSym)].sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+    for (const exp of exports) {
       const name = exp.name;
       const canonical = this.unwrapImportAlias(exp) ?? exp;
       const decl = (canonical.valueDeclaration ?? canonical.declarations?.[0]) as ts.Node | undefined;
       if (!decl) continue; // type-only export (interface/type alias) — erased
       if (ts.isInterfaceDeclaration(decl) || ts.isTypeAliasDeclaration(decl)) continue;
-      if (ts.isVariableDeclaration(decl)) {
-        const list = decl.parent;
-        const isConst = !!(list && ts.isVariableDeclarationList(list) && (list.flags & ts.NodeFlags.Const));
-        if (!isConst) { this.unsupported(stmt, `namespace import of mutable export '${name}' (live binding via namespace object unsupported; use a named import)`); continue; }
+      if (this.cellBindings.has(canonical) && this.moduleScopeSyms.has(canonical)) {
+        this.defineModuleExportGetter(ctx, obj, name, canonical, stmt);
+        continue;
       }
       const nameNode = (decl as unknown as { name?: ts.Node }).name;
       if (nameNode && ts.isIdentifier(nameNode)) {
@@ -2370,6 +2466,10 @@ class Exporter {
         ctx.body.push({ kind: "StoreField", obj, field: this.internField(name), src: v });
       }
     }
+    const tag = this.newLocal(ctx, "reference");
+    ctx.body.push({ kind: "CallBuiltinStatic", dst: tag, builtin: "symbol.wksym:4", args: [] });
+    ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "object.defineData:0:0:0", args: [obj, tag, this.constString(ctx, "Module")] });
+    ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "object.preventExtensions", args: [obj] });
   }
 
   /** Lower a STANDALONE `namespace N { ... }` to a runtime object (the IIFE pattern
@@ -2425,17 +2525,23 @@ class Exporter {
         bindSym(this.symbolOf(s.name), fnLocal);
         if (exported) put(s.name.text, fnLocal);
       } else if (ts.isVariableStatement(s)) {
-        // An EXPORTED member becomes a property snapshot at this point. For `let`/
-        // `var` that is later reassigned, JS exposes a LIVE binding (`N.x` tracks
-        // the variable) which a snapshot cannot model — loud-reject rather than
-        // silently diverge. `const` (the common case) is always a faithful snapshot.
-        const isConst = (s.declarationList.flags & ts.NodeFlags.Const) !== 0;
+        this.lowerStmt(ctx, s);
         for (const d of s.declarationList.declarations) {
-          if (!ts.isIdentifier(d.name)) { this.unsupported(d, "destructuring binding in a namespace member"); continue; }
-          if (exported && !isConst) { this.unsupported(d, "exported mutable namespace member (`export let`/`var`); use `export const` (live bindings are unsupported)"); continue; }
-          const v = d.initializer ? this.lowerExpr(ctx, d.initializer, d.name.text) : (() => { const u = this.newLocal(ctx, "reference"); ctx.body.push({ kind: "Const", dst: u, value: { kind: "Undef" } }); return u; })();
-          bindSym(this.symbolOf(d.name), v);
-          if (exported) put(d.name.text, v);
+          if (!exported || !d.initializer) continue;
+          const publish = (name: ts.BindingName) => {
+            if (ts.isIdentifier(name)) {
+              const sym = this.symbolOf(name);
+              if (!sym) return;
+              let value = ctx.localOfSymbol.get(sym);
+              const cell = ctx.cellAccess.get(sym);
+              if (cell !== undefined) {
+                value = this.newLocal(ctx, "reference");
+                ctx.body.push({ kind: "LoadField", dst: value, obj: cell, field: this.VALUE });
+              }
+              if (value !== undefined) put(name.text, value);
+            } else for (const el of name.elements) if (ts.isBindingElement(el)) publish(el.name);
+          };
+          publish(d.name);
         }
       } else if (ts.isClassDeclaration(s) && s.name) {
         const csym = this.symbolOf(s.name);
@@ -3047,11 +3153,85 @@ class Exporter {
     return this.emitJsxFactoryCall(ctx, node, [type ?? props, props, ...children]);
   }
 
+  private lowerTaggedTemplate(ctx: FnCtx, node: ts.TaggedTemplateExpression): number {
+    const tag = this.unwrapExpr(node.tag);
+    let recv: number | undefined;
+    let callee: number;
+    if (ts.isPropertyAccessExpression(tag)) {
+      recv = this.lowerExpr(ctx, tag.expression);
+      if (this.isMutableStorageLocal(ctx, recv)) {
+        const snapshot = this.newLocal(ctx, "reference");
+        ctx.body.push({ kind: "Copy", dst: snapshot, src: recv });
+        recv = snapshot;
+      }
+      const saved = this.optChainBound.get(tag.expression);
+      this.optChainBound.set(tag.expression, recv);
+      try { callee = this.lowerExpr(ctx, tag); }
+      finally {
+        if (saved === undefined) this.optChainBound.delete(tag.expression);
+        else this.optChainBound.set(tag.expression, saved);
+      }
+    } else if (ts.isElementAccessExpression(tag)) {
+      const [base, key] = this.lowerSequenced(ctx, [tag.expression, tag.argumentExpression]);
+      recv = base;
+      callee = this.newLocal(ctx, "reference");
+      ctx.body.push({ kind: "LoadFieldDynamic", dst: callee, obj: base, key });
+    } else {
+      callee = this.lowerExpr(ctx, node.tag);
+      if (this.isMutableStorageLocal(ctx, callee)) {
+        const snapshot = this.newLocal(ctx, "reference");
+        ctx.body.push({ kind: "Copy", dst: snapshot, src: callee });
+        callee = snapshot;
+      }
+    }
+    let global = this.templateObjectGlobals.get(node);
+    if (global === undefined) {
+      global = this.internGlobal(`__template_${this.templateObjectGlobals.size}`);
+      this.templateObjectGlobals.set(node, global);
+    }
+    const template = this.newLocal(ctx, "reference", "templateObject");
+    ctx.body.push({ kind: "LoadGlobal", dst: template, gref: global });
+    const undefinedValue = this.newLocal(ctx, "reference");
+    ctx.body.push({ kind: "Const", dst: undefinedValue, value: { kind: "Undef" } });
+    const missing = this.newLocal(ctx, "primitive");
+    ctx.body.push({ kind: "BinOp", dst: missing, op: "===", lhs: template, rhs: undefinedValue });
+    const literals = ts.isTemplateExpression(node.template)
+      ? [node.template.head, ...node.template.templateSpans.map(span => span.literal)] : [node.template];
+    const initialize = this.captureBody(ctx, () => {
+      const raw = this.newLocal(ctx, "reference", "templateRaw");
+      for (const dst of [template, raw]) {
+        const site = this.site++;
+        this.recordSite(site, "array", "once", false, node);
+        ctx.body.push({ kind: "AllocArray", dst, elemType: 0, site });
+      }
+      for (const literal of literals) {
+        const flags = (literal as unknown as { templateFlags?: number }).templateFlags ?? 0;
+        const invalid = (flags & (ts as any).TokenFlags.ContainsInvalidEscape) !== 0;
+        const cooked = invalid ? undefinedValue : this.constString(ctx, literal.text);
+        const rawText = this.constString(ctx, literal.rawText ?? literal.text);
+        ctx.body.push({ kind: "ArrayPush", arr: template, src: cooked });
+        ctx.body.push({ kind: "ArrayPush", arr: raw, src: rawText });
+      }
+      this.defineDataField(ctx, template, "raw", raw, 0, 0, 0);
+      for (const value of [raw, template]) ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "object.freeze", args: [value] });
+      ctx.body.push({ kind: "StoreGlobal", gref: global!, src: template });
+    });
+    ctx.body.push({ kind: "If", cond: missing, thenBody: initialize, elseBody: [] });
+    const expressions = ts.isTemplateExpression(node.template) ? node.template.templateSpans.map(span => span.expression) : [];
+    const args = [template, ...this.lowerSequenced(ctx, expressions)];
+    const dst = this.newLocal(ctx, this.refKindOf(node));
+    const call: any = { kind: "Call", dst, callee: { kind: "Value", local: callee }, args };
+    if (recv !== undefined) call.recv = recv;
+    ctx.body.push(call);
+    return dst;
+  }
+
   lowerExpr(ctx: FnCtx, node: ts.Expression, hint?: string): number {
     // Optional-chaining: a guard receiver whose value was already computed once
     // returns its memoized local (no re-evaluation, preserving side effects).
     const bound = this.optChainBound.get(node);
     if (bound !== undefined) return bound;
+    if (ts.isTaggedTemplateExpression(node)) return this.lowerTaggedTemplate(ctx, node);
     const jcv = this.constJsonNumberValue(node);
     if (jcv !== undefined && jcv.usedJson && Number.isFinite(jcv.value)) {
       const dst = this.newLocal(ctx, "primitive");
@@ -3225,32 +3405,27 @@ class Exporter {
       // (classId may be undefined -> the non-class loud-reject lives in the helper.)
       return this.lowerNewStaticClass(ctx, node, target.classId, hint);
     }
-    // `new N.Point(...)` / `new Shapes.Circle(...)`: a user class reached through a
-    // namespace (or static) property. The class VALUE lives at that property, so
-    // load it and construct dynamically via ts_construct (NewDynamic).
-    if (ts.isNewExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
-      const psym = this.symbolOf(node.expression);
-      const pcid = psym ? this.classSymToId.get(psym) : undefined;
-      if (pcid !== undefined) {
-        const args = node.arguments ? Array.from(node.arguments) : [];
-        const callee = this.lowerExpr(ctx, node.expression);
-        const ddst = this.newLocal(ctx, "reference", hint);
-        if (args.some((a) => ts.isSpreadElement(a))) {
-          const site = this.site++;
-          this.recordSite(site, "array", this.inLoop(node) ? "many" : "once", false, node);
-          const arrL = this.newLocal(ctx, "reference");
-          ctx.body.push({ kind: "AllocArray", dst: arrL, elemType: 0, site });
-          for (const a of args) {
-            if (ts.isSpreadElement(a)) ctx.body.push({ kind: "ArrayPushAll", arr: arrL, src: this.lowerExpr(ctx, a.expression) });
-            else ctx.body.push({ kind: "ArrayPush", arr: arrL, src: this.lowerExpr(ctx, a) });
-          }
-          ctx.body.push({ kind: "CallBuiltinStatic", dst: ddst, builtin: "reflect.construct", args: [callee, arrL] });
-        } else {
-          const dargs = this.lowerSequenced(ctx, args);
-          ctx.body.push({ kind: "NewDynamic", dst: ddst, callee, args: dargs });
+    // Arbitrary constructor expressions retain their runtime class/function
+    // value. ts_construct enforces constructability for any/untyped inputs.
+    if (ts.isNewExpression(node)) {
+      const args = node.arguments ? Array.from(node.arguments) : [];
+      const callee = this.lowerExpr(ctx, node.expression);
+      const ddst = this.newLocal(ctx, "reference", hint);
+      if (args.some((a) => ts.isSpreadElement(a))) {
+        const site = this.site++;
+        this.recordSite(site, "array", this.inLoop(node) ? "many" : "once", false, node);
+        const arrL = this.newLocal(ctx, "reference");
+        ctx.body.push({ kind: "AllocArray", dst: arrL, elemType: 0, site });
+        for (const a of args) {
+          if (ts.isSpreadElement(a)) ctx.body.push({ kind: "ArrayPushAll", arr: arrL, src: this.lowerExpr(ctx, a.expression) });
+          else ctx.body.push({ kind: "ArrayPush", arr: arrL, src: this.lowerExpr(ctx, a) });
         }
-        return ddst;
+        ctx.body.push({ kind: "CallBuiltinStatic", dst: ddst, builtin: "reflect.construct", args: [callee, arrL] });
+      } else {
+        const dargs = this.lowerSequenced(ctx, args);
+        ctx.body.push({ kind: "NewDynamic", dst: ddst, callee, args: dargs });
       }
+      return ddst;
     }
     if (ts.isObjectLiteralExpression(node)) {
       const site = this.site++;
@@ -3411,6 +3586,16 @@ class Exporter {
       return this.lowerUnboundThis(ctx);
     }
     if (ts.isPropertyAccessExpression(node)) {
+      if (node.name.text === "length" && ts.isIdentifier(node.expression) &&
+          node.expression.text === "arguments" &&
+          !this.symbolOf(node.expression)?.declarations?.length) {
+        const dst = this.newLocal(ctx, "primitive");
+        if (ctx.argumentsOffset === undefined || ctx.isAsync || ctx.isGenerator)
+          this.unsupported(node, "arguments.length in an arrow or coroutine");
+        ctx.body.push({ kind: "CallBuiltinStatic", dst,
+          builtin: `arguments.length:${ctx.argumentsOffset ?? 0}`, args: [] });
+        return dst;
+      }
       if (this.isGlobalThisPropertyAccess(node, "fetch")) {
         return this.loadGlobalObjectProperty(ctx, "fetch");
       }
@@ -3541,6 +3726,15 @@ class Exporter {
       // treat as a namespace constant when the identifier resolves to the
       // stdlib global.
       if (ts.isIdentifier(node.expression) && this.isAmbientGlobalSymbol(this.symbolOf(node.expression))) {
+        if (node.expression.text === "Number") {
+          const special: Record<string, string> = { POSITIVE_INFINITY: "PosInf", NEGATIVE_INFINITY: "NegInf", NaN: "NaN" };
+          const kind = special[node.name.text];
+          if (kind) {
+            const dst = this.newLocal(ctx, "primitive");
+            ctx.body.push({ kind: "Const", dst, value: { kind } });
+            return dst;
+          }
+        }
         const constVal = this.namespaceConstant(node.expression.text, node.name.text);
         if (constVal !== undefined) {
           const dst = this.newLocal(ctx, "primitive");
@@ -3804,6 +3998,30 @@ class Exporter {
     if (ts.isCallExpression(node)) {
       // console.log(x) -> Print
       const fnx = node.expression;
+      if (ts.isPropertyAccessExpression(fnx) && this.typeNameOf(fnx.expression) === "Uint16Array" &&
+          !["join", "toString", "valueOf"].includes(fnx.name.text)) {
+        this.unsupported(node, `Uint16Array method '${fnx.name.text}'`);
+        return this.newLocal(ctx, "reference");
+      }
+      if (node.arguments.some(a => ts.isSpreadElement(a)) && ts.isPropertyAccessExpression(fnx)) {
+        const receiverKind = this.builtinReceiverKind(fnx.expression);
+        if (receiverKind && this.builtinMethodName2(receiverKind, fnx.name.text)) {
+          let recv = this.lowerExpr(ctx, fnx.expression);
+          if (this.isMutableStorageLocal(ctx, recv)) {
+            const snapshot = this.newLocal(ctx, "reference");
+            ctx.body.push({ kind: "Copy", dst: snapshot, src: recv });
+            recv = snapshot;
+          }
+          const callee = this.newLocal(ctx, "reference");
+          ctx.body.push({ kind: "LoadMethodValue", dst: callee, recv, method: this.internName(fnx.name.text) });
+          return this.lowerDynamicValueCall(ctx, callee, recv, node.arguments, this.refKindOf(node));
+        }
+        if (ts.isIdentifier(fnx.expression) && this.isAmbientGlobalSymbol(this.symbolOf(fnx.expression)) &&
+            this.builtinFnValueName(fnx.expression.text, fnx.name.text) &&
+            !this.globalMemberMaybeMutated(fnx.expression.text, fnx.name.text)) {
+          return this.lowerDynamicValueCall(ctx, this.lowerExpr(ctx, fnx), undefined, node.arguments, this.refKindOf(node));
+        }
+      }
       if (ts.isPropertyAccessExpression(fnx) &&
           fnx.name.text === "test" &&
           fnx.expression.kind === ts.SyntaxKind.RegularExpressionLiteral) {
@@ -4429,7 +4647,16 @@ class Exporter {
               ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "date.toISOString", args: [msL] });
               return dst;
             }
-            this.unsupported(node, `Date method '${fn.name.text}' (not implemented; getTime/valueOf/get*/getUTC*/toISOString only)`);
+            if (fn.name.text === "toLocaleTimeString") {
+              const recv = this.lowerExpr(ctx, fn.expression);
+              const ms = this.newLocal(ctx, "primitive");
+              ctx.body.push({ kind: "LoadField", dst: ms, obj: recv, field: this.DATE_MS_FIELD });
+              const args = this.lowerSequenced(ctx, node.arguments);
+              const dst = this.newLocal(ctx, "reference");
+              ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "date.toLocaleTimeString", args: [ms, ...args] });
+              return dst;
+            }
+            this.unsupported(node, `Date method '${fn.name.text}' (not implemented)`);
           }
           if (rt === "Response") {
             if (fn.name.text === "text" || fn.name.text === "json") {
@@ -4770,21 +4997,25 @@ class Exporter {
         if (vloc !== undefined) callee = { kind: "Value", local: vloc };
       }
       const hasSpread = node.arguments.some((a) => ts.isSpreadElement(a));
+      if (callee.kind === "Direct" && recv === undefined) {
+        const target = this.fnNodeById(callee.func);
+        const unavailable = target && this.sortedFreeVars(target as FnLike).some((s) =>
+          !ctx.cellAccess.has(s) && !this.moduleCellGlobal.has(s));
+        // Fixed-ABI helpers may not hold every module cell. The already-created
+        // function value carries the environment. It also supplies captured
+        // arguments and `this` correctly when the call has a spread list.
+        if (hasSpread || unavailable) {
+          const value = this.directFunctionValue(ctx, callee.func);
+          if (value !== undefined) callee = { kind: "Value", local: value };
+        }
+      }
       if (hasSpread) {
-        // f(a, ...b, c): assemble a dynamic-length arg list of singles + spreads.
-        // Sequence-point eval: snapshot a bare-variable operand if a later sibling mutates it.
-        const sargs = node.arguments;
-        const argSpecs = sargs.map((a, i) => {
-          const spread = ts.isSpreadElement(a);
-          const e = spread ? a.expression : a;
-          let local = this.lowerExpr(ctx, e);
-          if (this.isMutableStorageLocal(ctx, local)) {
-            let laterSfx = false;
-            for (let j = i + 1; j < sargs.length; j++) { if (this.mayHaveSideEffect(sargs[j])) { laterSfx = true; break; } }
-            if (laterSfx) { const s = this.newLocal(ctx, this.refKindOf(e)); ctx.body.push({ kind: "Copy", dst: s, src: local }); local = s; }
-          }
-          return { kind: spread ? "spread" : "single", local };
-        });
+        if (callee.kind === "Value" && this.isMutableStorageLocal(ctx, callee.local)) {
+          const snapshot = this.newLocal(ctx, "reference");
+          ctx.body.push({ kind: "Copy", dst: snapshot, src: callee.local });
+          callee = { kind: "Value", local: snapshot };
+        }
+        const argSpecs = this.lowerSpreadArguments(ctx, node.arguments);
         const dst = this.newLocal(ctx, this.refKindOf(node));
         const inst: any = { kind: "CallSpread", dst, callee, argSpecs };
         if (recv !== undefined) inst.recv = recv;
@@ -5149,6 +5380,13 @@ class Exporter {
       if (ts.isElementAccessExpression(target) && ts.isStringLiteral(target.argumentExpression)) {
         return emitDelete(target.expression, target.argumentExpression.text);
       }
+      if (ts.isElementAccessExpression(target)) {
+        const [obj, key] = this.lowerSequenced(ctx, [target.expression, target.argumentExpression]);
+        const dst = this.newLocal(ctx, "reference");
+        this.hasDynamicDelete = true;
+        ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "object.deleteDynamic", args: [obj, key] });
+        return dst;
+      }
       this.unsupported(node, "delete with a dynamic/computed property (only obj.prop and obj['lit'] supported)");
     }
     if (ts.isYieldExpression(node)) {
@@ -5172,6 +5410,9 @@ class Exporter {
             const recv = this.lowerExpr(ctx, innerExpr);
             arr = this.newLocal(ctx, "reference");
             ctx.body.push({ kind: "CallBuiltin", dst: arr, builtin: rk === "map" ? "map.entries" : "set.values", recv, args: [] });
+            const snapshot = this.newLocal(ctx, "reference");
+            ctx.body.push({ kind: "CallBuiltinStatic", dst: snapshot, builtin: "array.from", args: [arr] });
+            arr = snapshot;
             this.emitIndexYieldLoop(ctx, arr, false);
           } else {
             arr = this.lowerExpr(ctx, innerExpr);
@@ -5525,8 +5766,34 @@ class Exporter {
     return false;
   }
 
+  private namespaceObject(ctx: FnCtx, name: ts.Identifier): number {
+    const sym = this.symbolOf(name);
+    const cid = sym && this.classSymToId.get(sym);
+    const container = cid !== undefined ? this.staticContainerClassOf(cid) : undefined;
+    const global = container !== undefined ? this.classStaticGlobal.get(container) : undefined;
+    if (global !== undefined) {
+      const dst = this.newLocal(ctx, "reference");
+      ctx.body.push({ kind: "LoadGlobal", dst, gref: global });
+      return dst;
+    }
+    return this.lowerIdentifier(ctx, name);
+  }
+
   lowerIdentifier(ctx: FnCtx, node: ts.Identifier): number {
     const sym = this.symbolOf(node);
+    if (node.text === "arguments" && !sym?.declarations?.length) {
+      this.unsupported(node, "arguments object as a value (only arguments.length is implemented)");
+      const dst = this.newLocal(ctx, "reference");
+      ctx.body.push({ kind: "Const", dst, value: { kind: "Undef" } });
+      return dst;
+    }
+    const namespace = sym && this.namespaceBindings.get(sym);
+    if (namespace) {
+      const obj = this.namespaceObject(ctx, namespace.namespace);
+      const dst = this.newLocal(ctx, this.refKindOf(node), node.text);
+      ctx.body.push({ kind: "LoadField", dst, obj, field: this.internField(namespace.name) });
+      return dst;
+    }
     // Global value keywords that have no user symbol.
     if (node.text === "undefined" && this.isAmbientGlobalSymbol(sym)) {
       const dst = this.newLocal(ctx, "reference");
@@ -6719,6 +6986,13 @@ class Exporter {
    *  the user-class / class-value paths). Built-in-specific rejects (Date
    *  string/Date arg, Promise without an executor) live here. */
   lowerNewBuiltin(ctx: FnCtx, node: ts.NewExpression, ctorName: string, hint?: string): number | undefined {
+    if (ctorName === "Uint16Array") {
+      const args = this.lowerSequenced(ctx, node.arguments ?? []);
+      if (args.length > 1) this.unsupported(node, "Uint16Array buffer views with offset/length");
+      const dst = this.newLocal(ctx, "reference", hint);
+      ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "uint16array.new", args });
+      return dst;
+    }
     if (ctorName === "RegExp") {
       return this.lowerRegExpConstructor(ctx, node, hint);
     }
@@ -7720,17 +7994,15 @@ class Exporter {
   }
 
   builtinReceiverKind(recvExpr: ts.Expression): "string" | "array" | "map" | "set" | "weakmap" | "weakset" | "headers" | "number" | "boolean" | "promise" | undefined {
-    // An array-returning builtin call (e.g. m.keys(), arr.map(...), s.split(...))
-    // yields an array at runtime even when its checker type is an iterator. Detect
-    // this structurally so chained calls like m.keys().join(",") resolve.
+    // Identify builtins whose runtime result is an array, including the existing
+    // array/Headers iterator representations. Map/Set return actual iterators.
     let e: ts.Expression = recvExpr;
     while (ts.isParenthesizedExpression(e) || ts.isAsExpression(e) || ts.isNonNullExpression(e)) e = e.expression;
     if (ts.isCallExpression(e) && ts.isPropertyAccessExpression(e.expression)) {
       const innerKind = this.builtinReceiverKind(e.expression.expression);
       const meth = e.expression.name.text;
       const arrayReturning: Record<string, Set<string>> = {
-        map: new Set(["keys", "values", "entries"]),
-        set: new Set(["keys", "values", "entries"]),
+
         headers: new Set(["keys", "values", "entries"]),
         array: new Set(["map", "filter", "slice", "concat", "split", "entries", "keys", "values", "flat", "flatMap", "toSorted", "toReversed", "toSpliced", "with"]),
         string: new Set(["split"]),
@@ -7756,6 +8028,10 @@ class Exporter {
       // symbol, e.g. array/tuple literal types, falls through to the structural checks
       // below.)
       if (sym && !this.isAmbientGlobalSymbol(sym)) return undefined;
+      // Structural array/tuple identity takes precedence over the printed
+      // element type: Map<K,V>[] starts with "Map<" but is not a Map receiver.
+      if (this.checker.isArrayType(t) || this.checker.isTupleType(t)) return "array";
+      if (sym?.name === "Uint16Array") return "array";
       const tn = this.checker.typeToString(t);
       if (sym && sym.name === "Map") return "map";
       if (sym && sym.name === "Set") return "set";
@@ -7772,9 +8048,6 @@ class Exporter {
       // Tuple types (e.g. `[number, number]`, `[number, ...number[]]`) are arrays
       // at runtime. The checker infers these for destructured rests and literals.
       if (/^(readonly )?\[/.test(tn)) return "array";
-      const anyChecker = this.checker as any;
-      if (typeof anyChecker.isArrayType === "function" && anyChecker.isArrayType(t)) return "array";
-      if (typeof anyChecker.isTupleType === "function" && anyChecker.isTupleType(t)) return "array";
       if (sym && sym.name === "String") return "string";
       // numeric receiver: x.toFixed() / n.toString() etc. (number has no runtime
       // prototype; route to dedicated builtins).
@@ -7795,7 +8068,7 @@ class Exporter {
       "charAt","charCodeAt","codePointAt","concat","repeat","trim","split",
       "startsWith","endsWith","padStart","padEnd","trimStart","trimEnd",
       "trimLeft","trimRight","at","isWellFormed","toWellFormed",
-      "replace","replaceAll","lastIndexOf","normalize",
+      "replace","replaceAll","lastIndexOf","normalize","substr","toString","valueOf",
     ]);
     const arrayMethods = new Set([
       "map","filter","forEach","reduce","indexOf","includes","slice",
@@ -7926,7 +8199,9 @@ class Exporter {
   lowerBindingPattern(ctx: FnCtx, pat: ts.BindingName, src: number): void {
     if (ts.isIdentifier(pat)) {
       const sym = this.symbolOf(pat);
-      if (sym && ctx.cellAccess.has(sym)) {
+      if (this.isScriptGlobalVarSymbol(sym, pat.text)) {
+        this.storeGlobalObjectProperty(ctx, pat.text, src);
+      } else if (sym && ctx.cellAccess.has(sym)) {
         ctx.body.push({ kind: "StoreField", obj: ctx.cellAccess.get(sym)!, field: this.VALUE, src });
       } else {
         const lid = sym ? this.ensureLocal(ctx, sym, this.refKindOf(pat), pat.text)
@@ -8476,37 +8751,11 @@ class Exporter {
     const zero = this.newLocal(ctx, "primitive");
     ctx.body.push({ kind: "Const", dst: zero, value: { kind: "Num", value: 0 } });
     ctx.body.push({ kind: "Copy", dst: idx, src: zero });
-    // loop variable: a simple identifier binds directly; a destructuring pattern
-    // binds into a fresh element local then unpacks per iteration.
-    let varLocal = -1;
-    let destructurePat: ts.BindingName | undefined;
-    // Loop variables captured by a nested closure need a FRESH cell each
-    // iteration (per JS spec: `for (const k of xs)` / `for (const [a,b] of xs)`
-    // create new bindings per iteration), so closures created during iteration N
-    // observe iteration N's value — mirroring the captured-`let` for-statement
-    // path. The element is loaded into `varLocal`, then either stored into the
-    // single identifier cell or unpacked (destructuring) into the pattern cells.
-    let captureCells: { sym: ts.Symbol; cell: number; perSite: number; saved: number | undefined }[] = [];
-    let identCapture = false;
-    if (ts.isVariableDeclarationList(init) && init.declarations.length) {
-      const name = init.declarations[0].name;
-      if (ts.isIdentifier(name)) {
-        const sym = this.symbolOf(name);
-        if (sym && this.cellBindings.has(sym)) {
-          captureCells = this.setupForOfCaptureCells(ctx, name, init.declarations[0]);
-          identCapture = true;
-          varLocal = this.newLocal(ctx, "reference", "elem");
-        } else {
-          varLocal = sym ? this.ensureLocal(ctx, sym, "reference", name.text) : this.newLocal(ctx, "reference");
-        }
-      } else {
-        destructurePat = name;
-        varLocal = this.newLocal(ctx, "reference", "elem");
-        captureCells = this.setupForOfCaptureCells(ctx, name, init.declarations[0]);
-      }
-    } else {
-      varLocal = this.newLocal(ctx, "reference");
-    }
+    const varLocal = this.newLocal(ctx, "reference", "elem");
+    const decl = ts.isVariableDeclarationList(init) ? init.declarations[0] : undefined;
+    // Lexical loop bindings are fresh each iteration; var retains its shared cell.
+    const captureCells = decl && (init.flags & (ts.NodeFlags.Let | ts.NodeFlags.Const)) !== 0
+      ? this.setupForOfCaptureCells(ctx, decl.name, decl) : [];
     let condLocal = -1;
     const condBody = this.captureBody(ctx, () => {
       const len = this.newLocal(ctx, "primitive");
@@ -8522,19 +8771,17 @@ class Exporter {
       } else {
         ctx.body.push({ kind: "LoadIndex", dst: varLocal, arr, index: idx });
       }
-      // fresh per-iteration cells for captured loop bindings (allocated BEFORE
-      // the element is stored / the pattern is unpacked into them).
+      // Iterator.next() advances before binding or running user code. In
+      // particular, continue must not skip the index/code-point advance.
+      if (iterIsString) this.emitStringIteratorAdvance(ctx, idx, cp);
+      else this.emitIndexStep(ctx, idx, 1);
       for (const c of captureCells) {
         ctx.body.push({ kind: "AllocObject", dst: c.cell, typeId: 0, site: c.perSite });
       }
-      if (identCapture && captureCells.length === 1) {
-        ctx.body.push({ kind: "StoreField", obj: captureCells[0].cell, field: this.VALUE, src: varLocal });
-      }
-      if (destructurePat) this.lowerBindingPattern(ctx, destructurePat, varLocal);
+      if (decl) this.lowerBindingPattern(ctx, decl.name, varLocal);
+      else this.lowerAssignTarget(ctx, init as ts.Expression, varLocal);
       this.emitPerIterationBodyCells(ctx, statement);
       this.lowerStmt(ctx, statement);
-      if (iterIsString) this.emitStringIteratorAdvance(ctx, idx, cp);
-      else this.emitIndexStep(ctx, idx, 1);
     });
     for (const c of captureCells) {
       if (c.saved !== undefined) ctx.cellAccess.set(c.sym, c.saved);
@@ -8593,44 +8840,16 @@ class Exporter {
     ctx: FnCtx, init: ts.ForInitializer, body: ts.Statement,
     drv: { step: (sent: number) => number; returnCall?: () => void }
   ): void {
-    // Loop variables captured by a nested closure need a FRESH cell per iteration
-    // (same as the array path — `for (const v of g()) (()=>v)` / destructuring),
-    // so the element is loaded into a temp and stored/unpacked into the cells.
-    let captureCells: { sym: ts.Symbol; cell: number; perSite: number; saved: number | undefined }[] = [];
-    let identCapture = false;
-    let loopVar: number;
-    const decl0 = (ts.isVariableDeclarationList(init) && init.declarations.length) ? init.declarations[0] : undefined;
-    if (decl0 && ts.isIdentifier(decl0.name)) {
-      const sym = this.symbolOf(decl0.name);
-      if (sym && this.cellBindings.has(sym)) {
-        captureCells = this.setupForOfCaptureCells(ctx, decl0.name, decl0);
-        identCapture = true;
-        loopVar = this.newLocal(ctx, "reference", "elem");
-      } else {
-        loopVar = this.bindForVar(ctx, init);
-      }
-    } else if (decl0) {
-      loopVar = this.newLocal(ctx, "reference", "elem");
-      captureCells = this.setupForOfCaptureCells(ctx, decl0.name, decl0);
-    } else {
-      loopVar = this.bindForVar(ctx, init);
-    }
+    const loopVar = this.newLocal(ctx, "reference", "elem");
+    const decl0 = ts.isVariableDeclarationList(init) ? init.declarations[0] : undefined;
+    const captureCells = decl0 && (init.flags & (ts.NodeFlags.Let | ts.NodeFlags.Const)) !== 0
+      ? this.setupForOfCaptureCells(ctx, decl0.name, decl0) : [];
     const restoreCell = () => {
       for (const c of captureCells) {
         if (c.saved !== undefined) ctx.cellAccess.set(c.sym, c.saved);
         else ctx.cellAccess.delete(c.sym);
       }
     };
-    // A destructuring loop variable (`for (const [a,b] of g())`): bindForVar returns a
-    // throwaway temp for a non-identifier name, so unpack the pattern from it each
-    // iteration (mirrors lowerArrayIndexForOf). Without this the bindings stay unset
-    // (`0`/undefined) — the driven (generator/custom-iterable/for-await) path was the
-    // only for-of path missing this unpack; the array/Map fast path already does it.
-    let destructurePat: ts.BindingName | undefined;
-    if (ts.isVariableDeclarationList(init) && init.declarations.length) {
-      const name = init.declarations[0].name;
-      if (!ts.isIdentifier(name)) destructurePat = name;
-    }
     const res = this.newLocal(ctx, "reference");
     const valueField = this.internField("value");
     const doneField = this.internField("done");
@@ -8653,10 +8872,8 @@ class Exporter {
         for (const c of captureCells) {
           ctx.body.push({ kind: "AllocObject", dst: c.cell, typeId: 0, site: c.perSite });
         }
-        if (identCapture && captureCells.length === 1) {
-          ctx.body.push({ kind: "StoreField", obj: captureCells[0].cell, field: this.VALUE, src: loopVar });
-        }
-        if (destructurePat) this.lowerBindingPattern(ctx, destructurePat, loopVar);
+        if (decl0) this.lowerBindingPattern(ctx, decl0.name, loopVar);
+        else this.lowerAssignTarget(ctx, init as ts.Expression, loopVar);
         this.emitPerIterationBodyCells(ctx, body);
         this.lowerStmt(ctx, body);
       });
@@ -8789,6 +9006,7 @@ class Exporter {
   }
 
   indexAccessKind(node: ts.ElementAccessExpression): "string" | "number" {
+    if (this.typeNameOf(node.expression) === "Uint16Array") return "string";
     // A string-literal index is always a property key.
     if (ts.isStringLiteral(node.argumentExpression)) return "string";
     // The "number" path lowers to LoadIndex/StoreIndex (the array element fast
@@ -8905,6 +9123,18 @@ class Exporter {
   lowerAssignTarget(ctx: FnCtx, lhs: ts.Expression, rhs: number, pre?: { obj?: number; key?: number }) {
     if (ts.isIdentifier(lhs)) {
       const sym = this.symbolOf(lhs);
+      const namespace = sym && this.namespaceBindings.get(sym);
+      if (namespace) {
+        const obj = this.namespaceObject(ctx, namespace.namespace);
+        ctx.body.push({ kind: "StoreField", obj, field: this.internField(namespace.name), src: rhs });
+        return;
+      }
+      const declaration = sym?.valueDeclaration;
+      if (declaration && ts.isFunctionExpression(declaration) && declaration.name &&
+          this.symbolOf(declaration.name) === sym) {
+        this.emitThrowTypeError(ctx, lhs, "Assignment to constant variable.");
+        return;
+      }
       if (this.isScriptGlobalVarSymbol(sym, lhs.text)) {
         this.storeGlobalObjectProperty(ctx, lhs.text, rhs);
       } else if (this.globalObjectValueName(lhs.text) !== undefined && this.isAmbientGlobalSymbol(sym)) {
@@ -9182,6 +9412,17 @@ class Exporter {
 
   lowerClosure(ctx: FnCtx, node: FnLike, hint?: string, thisParam = false, classId?: number): number {
     const fnId = this.fnId.get(node)!;
+    const selfSym = ts.isFunctionExpression(node) && node.name ? this.symbolOf(node.name) : undefined;
+    const selfNeeded = selfSym !== undefined && this.freeVars(node).has(selfSym);
+    const savedSelf = selfSym && ctx.cellAccess.get(selfSym);
+    let selfCell: number | undefined;
+    if (selfSym && selfNeeded) {
+      selfCell = this.newLocal(ctx, "reference", "functionSelf", this.bindingIdOf(selfSym));
+      const site = this.site++;
+      this.recordSite(site, "cell", this.inLoop(node) ? "many" : "once", true, node, true);
+      ctx.body.push({ kind: "AllocObject", dst: selfCell, typeId: 0, site });
+      ctx.cellAccess.set(selfSym, selfCell);
+    }
     // An arrow that uses `this` lexically must capture the enclosing function's
     // `this`. Materialize the enclosing `this` into a cell (once per enclosing
     // activation) and capture it under the lexical-this sentinel, so the arrow's
@@ -9208,10 +9449,12 @@ class Exporter {
     // missing cell and the body would read garbage.
     const methodLike = classId !== undefined;
     const frees = this.sortedFreeVars(node).filter((s) => !(methodLike && this.moduleCellGlobal.has(s)));
+    if (process.env.TSAOT_DEBUG_CELLS)
+      console.error(`[closure] ${ctx.name}->${hint ?? fnId} self=${selfSym?.name}:${selfNeeded} captures=${frees.map((s) => `${s.name}:${s === selfSym}:${ctx.cellAccess.has(s)}`).join(",")}`);
     const captures = frees.map((s) => {
-      const cell = ctx.cellAccess.get(s);
-      // cell must be available in the creating function (owned or threaded);
-      // fall back to a fresh local if analysis missed it (keeps output valid).
+      const cell = this.availableCaptureCell(ctx, s);
+      if (cell === undefined)
+        this.unsupported(node, `closure cannot capture '${s.name}' (binding is unavailable)`);
       const cellLocal = cell ?? this.newLocal(ctx, "reference", "missingCell");
       return { binding: this.bindingIdOf(s), cell: cellLocal };
     });
@@ -9225,6 +9468,11 @@ class Exporter {
     this.labels[site] = `${hint ?? "closure"}@${ctx.name}`;
     this.recordSite(site, "closure", this.inLoop(node) ? "many" : "once", true, node);
     ctx.body.push({ kind: "AllocClosure", dst, func: fnId, captures, site });
+    if (selfSym && selfCell !== undefined) {
+      ctx.body.push({ kind: "StoreField", obj: selfCell, field: this.VALUE, src: dst });
+      if (savedSelf !== undefined) ctx.cellAccess.set(selfSym, savedSelf);
+      else ctx.cellAccess.delete(selfSym);
+    }
     return dst;
   }
 
@@ -9303,6 +9551,7 @@ class Exporter {
     if (ts.isBlock(stmt)) {
       stmt.statements.forEach((s) => this.lowerStmt(ctx, s));
     } else if (ts.isVariableStatement(stmt)) {
+      const isLexical = (stmt.declarationList.flags & ts.NodeFlags.BlockScoped) !== 0;
       const isTopLevelScriptVar =
         this.sourceMode === "script" &&
         ts.isSourceFile(stmt.parent) &&
@@ -9321,6 +9570,10 @@ class Exporter {
             if (d.initializer) {
               const r = this.lowerExpr(ctx, d.initializer, d.name.text);
               ctx.body.push({ kind: "StoreField", obj: ctx.cellAccess.get(sym)!, field: this.VALUE, src: r });
+            } else if (isLexical) {
+              const value = this.newLocal(ctx, "reference");
+              ctx.body.push({ kind: "Const", dst: value, value: { kind: "Undef" } });
+              ctx.body.push({ kind: "StoreField", obj: ctx.cellAccess.get(sym)!, field: this.VALUE, src: value });
             }
           } else {
             const lid = sym
@@ -9329,6 +9582,8 @@ class Exporter {
             if (d.initializer) {
               const r = this.lowerExpr(ctx, d.initializer, d.name.text);
               ctx.body.push({ kind: "Copy", dst: lid, src: r });
+            } else if (isLexical) {
+              ctx.body.push({ kind: "Const", dst: lid, value: { kind: "Undef" } });
             }
           }
         } else if (ts.isArrayBindingPattern(d.name) || ts.isObjectBindingPattern(d.name)) {
@@ -9613,7 +9868,7 @@ class Exporter {
       const ctxKind = stack.length ? stack[stack.length - 1] : undefined;
       const isBreak = ts.isBreakStatement(stmt);
       const targetLabel = stmt.label?.text;
-      const continueSafe = (k: string | undefined) => k === "while" || k === "forof_gen" || k === "forc";
+      const continueSafe = (k: string | undefined) => k === "while" || k === "forof_gen" || k === "forof" || k === "forc" || k === "for";
       if (targetLabel !== undefined) {
         // Resolve the labeled target's depth (0 = innermost) by walking loopLabels
         // outward. The exporter's loopLabels and the analyzer's per-loop label
@@ -9652,19 +9907,20 @@ class Exporter {
       if (ctxKind === undefined) {
         this.unsupported(stmt, `${ts.SyntaxKind[stmt.kind]} outside any loop/switch`);
       } else if (ctxKind === "switch") {
-        // switch is modeled as a run-once breakable loop: `break` exits it.
-        // `continue` inside a switch targets an enclosing loop (not modeled here).
-        if (!isBreak) this.unsupported(stmt, "continue inside switch (outer-loop target not modeled)");
-        else ctx.body.push({ kind: "Break" });
+        if (isBreak) ctx.body.push({ kind: "Break" });
+        else {
+          let depth = 1;
+          while (stack[stack.length - 1 - depth] === "switch") depth++;
+          const targetKind = stack[stack.length - 1 - depth];
+          if (continueSafe(targetKind)) ctx.body.push({ kind: "Continue", up: depth });
+          else this.unsupported(stmt, "continue without an enclosing iteration statement");
+        }
       } else if (ctxKind === "do") {
         this.unsupported(stmt, `${ts.SyntaxKind[stmt.kind]} in do-while (not yet modeled)`);
       } else if (isBreak) {
         ctx.body.push({ kind: "Break" });
       } else {
-        // while and generator-for-of put the loop advance in the cond/cond_body,
-        // which C re-runs after `continue`. for-of-array and plain for put the
-        // index increment at body end (a C continue would skip it -> reject), but
-        // "forc" (a for-loop whose incrementor we moved into cond_body) is safe.
+        // Every supported loop advances before the user body or in condBody.
         if (continueSafe(ctxKind)) ctx.body.push({ kind: "Continue" });
         else this.unsupported(stmt, `continue in ${ctxKind} loop (increment-skipping not yet modeled)`);
       }
@@ -9687,16 +9943,27 @@ class Exporter {
       // arrays/strings fall through to the index loop below.
       // for-of over a Map/Headers yields [key,value] pairs; over a Set yields
       // elements.
-      // Handle this BEFORE resolveIterator: a Map/Set's checker type may look
-      // iterable (it has [Symbol.iterator]), but our runtime maps/sets/headers
-      // have no .next() — materialize to an array (entries()/values()) and
-      // index-iterate instead.
+      // Drive Map/Set iterators directly so mutations during iteration remain
+      // visible. Headers still uses its existing array representation.
       const rkForOf = this.builtinReceiverKind(stmt.expression);
-      if (rkForOf === "map" || rkForOf === "set" || rkForOf === "headers") {
+      if (rkForOf === "map" || rkForOf === "set") {
+        const recv = this.lowerExpr(ctx, stmt.expression);
+        const iterator = this.newLocal(ctx, "reference");
+        ctx.body.push({ kind: "CallBuiltin", dst: iterator, builtin: rkForOf === "map" ? "map.entries" : "set.values", recv, args: [] });
+        const method = this.internName("next");
+        const methodField = this.internField("next");
+        this.lowerDrivenForLoop(ctx, stmt.initializer, stmt.statement, { step: () => {
+          const dst = this.newLocal(ctx, "reference");
+          ctx.body.push({ kind: "Call", dst, recv: iterator, callee: { kind: "Method", recvClass: 0xffffffff, method, methodField, recvStable: false }, args: [] });
+          return dst;
+        } });
+        return;
+      }
+      if (rkForOf === "headers") {
         const recvL = this.lowerExpr(ctx, stmt.expression);
         const arrL = this.newLocal(ctx, "reference");
         ctx.body.push({ kind: "CallBuiltin", dst: arrL,
-          builtin: rkForOf === "set" ? "set.values" : `${rkForOf}.entries`, recv: recvL, args: [] });
+          builtin: "headers.entries", recv: recvL, args: [] });
         this.lowerArrayIndexForOf(ctx, stmt.initializer, stmt.statement, arrL, false);
         return;
       }
@@ -9716,40 +9983,7 @@ class Exporter {
       const obj = this.lowerExpr(ctx, stmt.expression);
       const keys = this.newLocal(ctx, "reference");
       ctx.body.push({ kind: "CallBuiltinStatic", dst: keys, builtin: "object.forInKeys", args: [obj] });
-      const idx = this.newLocal(ctx, "primitive");
-      const zero = this.newLocal(ctx, "primitive");
-      ctx.body.push({ kind: "Const", dst: zero, value: { kind: "Num", value: 0 } });
-      ctx.body.push({ kind: "Copy", dst: idx, src: zero });
-      let varLocal = -1;
-      const decl = stmt.initializer;
-      if (ts.isVariableDeclarationList(decl) && decl.declarations.length && ts.isIdentifier(decl.declarations[0].name)) {
-        const sym = this.symbolOf(decl.declarations[0].name);
-        varLocal = sym ? this.ensureLocal(ctx, sym, "reference", decl.declarations[0].name.text)
-                       : this.newLocal(ctx, "reference");
-      } else if (ts.isIdentifier(decl)) {
-        const sym = this.symbolOf(decl);
-        varLocal = sym ? this.ensureLocal(ctx, sym, "reference", decl.text) : this.newLocal(ctx, "reference");
-      } else {
-        varLocal = this.newLocal(ctx, "reference");
-      }
-      let condLocal = -1;
-      const condBody = this.captureBody(ctx, () => {
-        const len = this.newLocal(ctx, "primitive");
-        ctx.body.push({ kind: "ArrayLen", dst: len, arr: keys });
-        condLocal = this.newLocal(ctx, "primitive");
-        ctx.body.push({ kind: "BinOp", dst: condLocal, op: "<", lhs: idx, rhs: len });
-      });
-      const bodyB = this.captureLoopBody(ctx, "forof", () => {
-        ctx.body.push({ kind: "LoadIndex", dst: varLocal, arr: keys, index: idx });
-        this.emitPerIterationBodyCells(ctx, stmt.statement);
-        this.lowerStmt(ctx, stmt.statement);
-        const one = this.newLocal(ctx, "primitive");
-        ctx.body.push({ kind: "Const", dst: one, value: { kind: "Num", value: 1 } });
-        const ni = this.newLocal(ctx, "primitive");
-        ctx.body.push({ kind: "BinOp", dst: ni, op: "+", lhs: idx, rhs: one });
-        ctx.body.push({ kind: "Copy", dst: idx, src: ni });
-      });
-      ctx.body.push({ kind: "Loop", cond: condLocal, condBody, body: bodyB });
+      this.lowerArrayIndexForOf(ctx, stmt.initializer, stmt.statement, keys, false);
     } else if (ts.isLabeledStatement(stmt)) {
       // A label on a loop: record it so an immediately-enclosed `break L` /
       // `continue L` targeting THIS loop maps to a plain break/continue. Labels
@@ -9791,6 +10025,9 @@ class Exporter {
         ? this.captureBody(ctx, () => this.lowerStmt(ctx, stmt.finallyBlock!))
         : [];
       ctx.body.push({ kind: "TryCatch", tryBody, catchVar: catchVar ?? null, catchBody, finallyBody });
+    } else if (ts.isFunctionDeclaration(stmt) && !stmt.body) {
+      // Overload signatures and ambient declarations are erased. Only the
+      // implementation owns code, a function value, and capture parameters.
     } else if (ts.isFunctionDeclaration(stmt) && stmt.body && stmt.name) {
       // Step D: if this function was hoisted at the prologue (the common case
       // for any function declaration in a block), the binding already exists —
@@ -10054,13 +10291,12 @@ class Exporter {
     };
     if (hasCaptures) { emitCells(); emitThis(); }   // [cells..., this]
     else { emitThis(); }                            // [this] (no cells)
+    if (!ts.isArrowFunction(node)) ctx.argumentsOffset = ctx.params.length;
     // 2. real parameters
-    const defaultParams: { idx: number; lid: number; init: ts.Expression }[] = [];
-    let posIdx = -1;
+    const parameterBindings: { node: ts.ParameterDeclaration; local: number }[] = [];
     for (const p of node.parameters) {
       // skip the explicit `this` parameter — already bound as thisLocal via emitThis.
       if (ts.isIdentifier(p.name) && p.name.text === "this") continue;
-      posIdx++;
       if (p.dotDotDotToken) {
         // rest parameter: a normal local that the callee fills with an array of
         // the surplus args. Must be a simple identifier (no destructured rest).
@@ -10070,6 +10306,7 @@ class Exporter {
                          : this.newLocal(ctx, "reference", p.name.text);
         ctx.params.push(lid);
         ctx.restParam = lid;
+        parameterBindings.push({ node: p, local: lid });
         continue;
       }
       if (!ts.isIdentifier(p.name)) {
@@ -10077,7 +10314,7 @@ class Exporter {
         if (ts.isArrayBindingPattern(p.name) || ts.isObjectBindingPattern(p.name)) {
           const plid = this.newLocal(ctx, "reference", "param");
           ctx.params.push(plid);
-          this.lowerBindingPattern(ctx, p.name, plid);
+          parameterBindings.push({ node: p, local: plid });
           continue;
         }
         this.unsupported(p, `parameter binding form ${ts.SyntaxKind[(p.name as ts.Node).kind]}`);
@@ -10092,27 +10329,13 @@ class Exporter {
         ? this.ensureLocal(ctx, psym, pkind, p.name.text)
         : this.newLocal(ctx, pkind, p.name.text);
       ctx.params.push(lid);
-      if (p.initializer) defaultParams.push({ idx: posIdx, lid, init: p.initializer });
+      parameterBindings.push({ node: p, local: lid });
       // Typed-field codegen: if the parameter's type is a (specialized) class,
       // record its class id so the callee uses the typed struct layout for it.
       try {
         const pcid = this.classOfExpr(p.name);
         if (pcid !== undefined) (ctx.paramClasses ||= {})[String(lid)] = pcid;
       } catch { /* ignore */ }
-    }
-    // 2b. default parameter values: for each `param = <default>`, when the argument
-    // is missing or undefined, evaluate the default and store it. Emitted in source
-    // order so a later default can reference earlier params (`(a, b=10, c=a+b)`).
-    // The guard tests the bound param local for undefined (covers both an omitted
-    // arg and an explicit `undefined`), matching JS semantics.
-    for (const dp of defaultParams) {
-      const isUndef = this.newLocal(ctx, "primitive");
-      ctx.body.push({ kind: "UnOp", dst: isUndef, op: "isundef", operand: dp.lid });
-      const thenBody = this.captureBody(ctx, () => {
-        const v = this.lowerExpr(ctx, dp.init);
-        ctx.body.push({ kind: "Copy", dst: dp.lid, src: v });
-      });
-      ctx.body.push({ kind: "If", cond: isUndef, thenBody, elseBody: [] });
     }
     // 3. prologue: pre-allocate cells this function OWNS (declared here & captured)
     const decl = this.declaredIn(node);
@@ -10134,21 +10357,26 @@ class Exporter {
         }
       }
     }
-    // 3a-bis. Captured parameters: a parameter whose binding is captured by a
-    // nested closure has a cell (allocated above), but its incoming value lives in
-    // the parameter local. Copy it into the cell once at entry so the closure sees
-    // the argument value (without this, the cell is empty -> undefined). e.g.
-    // `function compose(f,g){ return x => f(g(x)); }` captures f,g.
-    for (const p of node.parameters) {
-      if (!ts.isIdentifier(p.name)) continue;
-      if (p.name.text === "this") continue;
-      const psym = this.symbolOf(p.name);
-      if (psym && ctx.cellAccess.has(psym)) {
-        const cell = ctx.cellAccess.get(psym)!;
-        const plocal = ctx.localOfSymbol.get(psym);
-        if (plocal !== undefined && plocal !== cell) {
-          ctx.body.push({ kind: "StoreField", obj: cell, field: this.VALUE, src: plocal });
-        }
+    // Initialize parameters in source order after their captured bindings have
+    // cells. Later defaults can then read earlier destructured/captured params.
+    for (const binding of parameterBindings) {
+      const p = binding.node;
+      if (p.initializer) {
+        const isUndef = this.newLocal(ctx, "primitive");
+        ctx.body.push({ kind: "UnOp", dst: isUndef, op: "isundef", operand: binding.local });
+        const thenBody = this.captureBody(ctx, () => {
+          const v = this.lowerExpr(ctx, p.initializer!);
+          ctx.body.push({ kind: "Copy", dst: binding.local, src: v });
+        });
+        ctx.body.push({ kind: "If", cond: isUndef, thenBody, elseBody: [] });
+      }
+      if (!ts.isIdentifier(p.name)) {
+        this.lowerBindingPattern(ctx, p.name, binding.local);
+      } else {
+        const psym = this.symbolOf(p.name);
+        const cell = psym && ctx.cellAccess.get(psym);
+        if (cell !== undefined)
+          ctx.body.push({ kind: "StoreField", obj: cell, field: this.VALUE, src: binding.local });
       }
     }
     // 3b. parameter properties: `constructor(public x)` implies `this.x = x`
@@ -11012,10 +11240,37 @@ class Exporter {
 
   run(sf: ts.SourceFile) {
     this.modules = this.computeModuleOrder(sf);
+    this.modules.forEach((module, index) => this.moduleInitializationOrder.set(module, index));
     this.sf = sf;
     for (const m of this.modules) this.preflightRuntimeSyntax(m);
     for (const m of this.modules) this.assignIds(m);
     this.setupClasses(sf);
+
+    // Bindings in module-level blocks and loop heads also belong to module
+    // initialization. They can be captured even though they are not exports.
+    const registerOwned = (node: ts.Node) => {
+      if (isFunctionLike(node) || ts.isClassDeclaration(node) || ts.isClassExpression(node)) return;
+      if (ts.isVariableDeclaration(node)) {
+        const list = node.parent;
+        const isGlobalVar = this.sourceMode === "script" && ts.isVariableDeclarationList(list) &&
+          (list.flags & (ts.NodeFlags.Let | ts.NodeFlags.Const)) === 0;
+        const bind = (name: ts.BindingName) => {
+          if (ts.isIdentifier(name)) {
+            const sym = this.symbolOf(name);
+            if (sym) {
+              this.moduleScopeSyms.add(sym);
+              if (isGlobalVar) {
+                this.scriptGlobalVarSyms.add(sym);
+                this.scriptGlobalVarNames.add(name.text);
+              }
+            }
+          } else for (const el of name.elements) if (ts.isBindingElement(el)) bind(el.name);
+        };
+        bind(node.name);
+      }
+      ts.forEachChild(node, registerOwned);
+    };
+    for (const module of this.modules) registerOwned(module);
 
     // Step C: collect module-scope binding symbols (top-level var/let/const +
     // top-level function/class names) across EVERY module. These are owned by the
@@ -11069,6 +11324,20 @@ class Exporter {
         if (s && !this.classSymToId.has(s)) { this.moduleScopeSyms.add(s); this.moduleTopBindingByName.set(stmt.name.text, s); }
         // Its (inline-lowered) member bindings are owned by __module_init too.
         this.registerNamespaceMemberSyms(stmt);
+      }
+    }
+    // Namespace getters need owned export cells even when no ordinary function
+    // refers to a binding. The namespace binding itself can escape into closures.
+    for (const module of this.modules) for (const stmt of module.statements) {
+      if (!this.isNamespaceImportStmt(stmt)) continue;
+      const name = (stmt.importClause!.namedBindings as ts.NamespaceImport).name;
+      const modSym = this.symbolOf(name);
+      if (!modSym) continue;
+      this.moduleScopeSyms.add(modSym);
+      this.cellBindings.add(modSym);
+      for (const exp of this.checker.getExportsOfModule(modSym)) {
+        const canonical = this.unwrapImportAlias(exp) ?? exp;
+        if (canonical.valueDeclaration && this.moduleScopeSyms.has(canonical)) this.cellBindings.add(canonical);
       }
     }
     for (const m of this.modules) this.collectMutatedGlobalRefs(m);
@@ -11329,6 +11598,10 @@ class Exporter {
 
   programJson() {
     this.functions.sort((a, b) => a.id - b.id);
+    for (let i = 1; i < this.functions.length; i++) {
+      if (this.functions[i - 1].id === this.functions[i].id)
+        throw new Error(`duplicate IR function id ${this.functions[i].id}: ${this.functions[i - 1].name}, ${this.functions[i].name}`);
+    }
     // Object.prototype methods: pre-intern their method-name ids so the runtime
     // can register C implementations on the shared Object.prototype under the
     // same METHOD_KEY_BASE + id that dynamic dispatch (o.toString()) will use.
@@ -11366,7 +11639,7 @@ class Exporter {
     const mapProtoSpec: [string, string][] = [
       ["set","ts_mapproto_set"],["get","ts_mapproto_get"],["has","ts_mapproto_has"],
       ["delete","ts_mapproto_delete"],["clear","ts_mapproto_clear"],["keys","ts_mapproto_keys"],
-      ["values","ts_mapproto_values"],["forEach","ts_mapproto_forEach"],
+      ["values","ts_mapproto_values"],["entries","ts_mapproto_entries"],["forEach","ts_mapproto_forEach"],
     ];
     const setProtoSpec: [string, string][] = [
       ["add","ts_setproto_add"],["has","ts_setproto_has"],["delete","ts_setproto_delete"],
@@ -11410,6 +11683,7 @@ class Exporter {
       ["toUpperCase","ts_strproto_toUpperCase"],["toLowerCase","ts_strproto_toLowerCase"],
       ["toLocaleUpperCase","ts_strproto_toLocaleUpperCase"],["toLocaleLowerCase","ts_strproto_toLocaleLowerCase"],
       ["slice","ts_strproto_slice"],["substring","ts_strproto_substring"],
+      ["substr","ts_strproto_substr"],["toString","ts_strproto_toString"],["valueOf","ts_strproto_toString"],
       ["indexOf","ts_strproto_indexOf"],["lastIndexOf","ts_strproto_lastIndexOf"],
       ["includes","ts_strproto_includes"],["startsWith","ts_strproto_startsWith"],
       ["endsWith","ts_strproto_endsWith"],["charAt","ts_strproto_charAt"],
@@ -11450,6 +11724,19 @@ class Exporter {
     const wellKnownSymbols = wkSymTable
       .filter((w) => this.nameIntern.has(w.magic))
       .map((w) => ({ nameId: this.nameIntern.get(w.magic)!, wksymId: w.wksymId }));
+    if (this.hasDynamicDelete) {
+      // Resolve both property-key namespaces after every method name is known.
+      const pairs = [...this.nameIntern].map(([name, id]) => `${this.internField(name)},${id}`).join(";");
+      const resolve = (body: any[]) => {
+        for (const inst of body) {
+          if (inst.kind === "CallBuiltinStatic" && inst.builtin === "object.deleteDynamic")
+            inst.builtin += ":" + pairs;
+          for (const key of ["thenBody", "elseBody", "condBody", "body", "tryBody", "catchBody", "finallyBody"])
+            if (Array.isArray(inst[key])) resolve(inst[key]);
+        }
+      };
+      for (const fn of this.functions) resolve(fn.body);
+    }
     return {
       version: 1,
       strictTypeOptimizations: this.strictTypeOptimizationProfile(),
@@ -11533,9 +11820,23 @@ function batchMain(listPath: string, outDir: string, strictCompiler = false) {
 function main() {
   let argv = process.argv.slice(2);
   let strictCompiler = false;
-  while (argv[0] === "--strict") {
-    strictCompiler = true;
-    argv = argv.slice(1);
+  let project: string | undefined;
+  while (argv[0] === "--strict" || argv[0] === "--project" || argv[0] === "-p") {
+    if (argv[0] === "--strict") {
+      strictCompiler = true;
+      argv = argv.slice(1);
+    } else {
+      if (!argv[1] || argv[1].startsWith("--")) {
+        console.error("--project requires a tsconfig file or directory");
+        process.exit(2);
+      }
+      project = path.resolve(argv[1]);
+      argv = argv.slice(2);
+    }
+  }
+  if (project && (argv[0] === "--batch" || argv[0] === "--transpile-batch")) {
+    console.error("--project requires a single entry file");
+    process.exit(2);
   }
   if (argv[0] === "--batch") {
     batchMain(argv[1], argv[2], strictCompiler);
@@ -11582,12 +11883,43 @@ function main() {
   if (!input) {
     console.error("usage: node exporter.js <input.ts> <program.json> <labels.json>");
     console.error("   or: node exporter.js --strict <input.ts> <program.json> <labels.json>");
+    console.error("   or: node exporter.js --project <tsconfig> <input.ts> <program.json> <labels.json>");
     console.error("   or: node exporter.js --script <input.ts> <program.json> <labels.json>");
     console.error("   or: node exporter.js --strict --script <input.ts> <program.json> <labels.json>");
     console.error("   or: node exporter.js [--strict] --batch <list.tsv> <outdir>");
     process.exit(1);
   }
-  const program = ts.createProgram([input], baseCompilerOptions(strictCompiler));
+  let compilerOptions = baseCompilerOptions(strictCompiler);
+  const rootNames = [input];
+  if (project) {
+    const configFile = ts.sys.directoryExists(project) ? path.join(project, "tsconfig.json") : project;
+    const report = (diagnostics: readonly ts.Diagnostic[]) => {
+      process.stderr.write(ts.formatDiagnostics(diagnostics, {
+        getCanonicalFileName: f => f,
+        getCurrentDirectory: ts.sys.getCurrentDirectory,
+        getNewLine: () => ts.sys.newLine,
+      }));
+      process.exit(2);
+    };
+    const config = ts.readConfigFile(configFile, ts.sys.readFile);
+    if (config.error) report([config.error]);
+    const parsed = ts.parseJsonConfigFileContent(config.config, ts.sys, path.dirname(configFile), undefined, configFile);
+    if (parsed.errors.length) report(parsed.errors);
+    rootNames.push(...parsed.fileNames.filter(f => /\.d\.[cm]?ts$/.test(f)));
+    compilerOptions = { ...compilerOptions, ...parsed.options };
+    if (strictCompiler) compilerOptions.strict = true;
+    // Garnet bundles the entry's source graph instead of emitting project
+    // references/declarations. Keep resolution, libraries and checking options,
+    // removing only TypeScript's output/build constraints.
+    for (const key of ["composite", "incremental", "tsBuildInfoFile", "rootDir", "outDir", "outFile",
+      "declaration", "declarationMap", "emitDeclarationOnly", "isolatedDeclarations", "sourceMap",
+      "inlineSourceMap", "inlineSources"] as const) delete compilerOptions[key];
+    compilerOptions.noEmit = true;
+    compilerOptions.noCheck = false;
+    compilerOptions.strictNullChecks = true;
+    compilerOptions.jsx = ts.JsxEmit.Preserve;
+  }
+  const program = ts.createProgram(rootNames, compilerOptions);
   const sf = program.getSourceFile(input)!;
   // Type-error gate: the checker still assigns a type to every node when the
   // program is ill-typed, but those types are unsound — either the error type

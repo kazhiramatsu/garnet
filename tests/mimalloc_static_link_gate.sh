@@ -19,6 +19,7 @@ CC="$probe_cc"
 TSAOT_LDLIBS=""
 TSAOT_USE_MIMALLOC=1
 unset TSAOT_MIMALLOC_PREFIX TSAOT_MIMALLOC_CFLAGS TSAOT_MIMALLOC_LIBS
+unset TSAOT_MIMALLOC_DEBUG
 export ROOT CC TSAOT_LDLIBS TSAOT_USE_MIMALLOC
 . "$ROOT/scripts/lib/mimalloc_flags.sh"
 
@@ -29,6 +30,11 @@ export ROOT CC TSAOT_LDLIBS TSAOT_USE_MIMALLOC
 
 # shellcheck disable=SC2086
 $CC "$work/probe.c" $TSAOT_LDLIBS -o "$work/probe"
+MIMALLOC_VERBOSE=1 "$work/probe" >"$work/probe.out" 2>"$work/probe.err"
+grep -Eq 'debug level *: 0' "$work/probe.err" || {
+  echo "[mimalloc-static] FAIL: default allocator still has debug checks enabled"
+  exit 1
+}
 
 case "$(uname -s)" in
   Darwin)

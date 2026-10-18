@@ -423,6 +423,102 @@ static int ts_regexp_adapter_object_pattern(tsv re, tsv* out_source, uint32_t* o
   return 1;
 }
 
+/* EscapeRegExpPattern: preserve existing escapes and character classes while
+   escaping delimiters and line terminators for the observable source string. */
+static tsv ts_regexp_constructor_source(tsv pattern){
+  ts_strview view = ts_str_view_typed(pattern);
+  if (view.len == 0) return ts_new_string("(?:)", 4);
+  uint32_t* buffer = malloc(sizeof(uint32_t) * ((size_t)view.len * 6u + 1u));
+  if (!buffer) abort();
+  uint32_t length = 0;
+  int in_class = 0;
+  for (uint32_t i = 0; i < view.len; i++){
+    uint32_t cp = ts_str_cu_at_view(view, i);
+    if (cp == '\\' && i + 1 < view.len){
+      uint32_t next = ts_str_cu_at_view(view, i + 1);
+      if (next != '\n' && next != '\r' && next != 0x2028u && next != 0x2029u){
+        buffer[length++] = '\\';
+        buffer[length++] = next;
+        i++;
+        continue;
+      }
+      cp = next;
+      i++;
+    }
+    if (cp == '\n' || cp == '\r'){
+      buffer[length++] = '\\';
+      buffer[length++] = cp == '\n' ? 'n' : 'r';
+    } else if (cp == 0x2028u || cp == 0x2029u){
+      const char* escape = cp == 0x2028u ? "\\u2028" : "\\u2029";
+      for (uint32_t j = 0; j < 6; j++) buffer[length++] = (uint32_t)escape[j];
+    } else {
+      if (cp == '/' && !in_class) buffer[length++] = '\\';
+      if (cp == '[') in_class = 1;
+      else if (cp == ']') in_class = 0;
+      buffer[length++] = cp;
+    }
+  }
+  tsv result = ts_string_from_codepoints(buffer, length);
+  free(buffer);
+  return result;
+}
+
+static tsv ts_regexp_constructor_string(tsv value){
+  ts_gc_root(&value);
+  value = ts_to_primitive(value, 1);
+  if (ts_is_symbol(value)) ts_throw_type_error_msg("Cannot convert a Symbol value to a string");
+  tsv result = ts_is_str(value) ? value : ts_to_string_v(value);
+  ts_gc_unroot(1);
+  return result;
+}
+
+tsv ts_regexp_adapter_construct_tsv(tsv pattern, tsv flags, int as_constructor){
+  ts_gc_root(&pattern); ts_gc_root(&flags);
+  tsv original_source = TS_UNDEFINED;
+  uint32_t original_flags = 0;
+  int is_regexp = ts_regexp_adapter_object_pattern(pattern, &original_source, &original_flags);
+  if (is_regexp && flags == TS_UNDEFINED && !as_constructor){
+    ts_gc_unroot(2);
+    return pattern;
+  }
+  pattern = is_regexp ? original_source : pattern == TS_UNDEFINED
+    ? ts_new_string("", 0) : ts_regexp_constructor_string(pattern);
+  uint32_t mask = is_regexp && flags == TS_UNDEFINED ? original_flags : 0;
+  static const char order[] = "dgimsuvy";
+  static const uint32_t bits[] = {
+    TSAOT_REGEXP_FLAG_INDICES, TSAOT_REGEXP_FLAG_GLOBAL, TSAOT_REGEXP_FLAG_IGNORECASE,
+    TSAOT_REGEXP_FLAG_MULTILINE, TSAOT_REGEXP_FLAG_DOTALL, TSAOT_REGEXP_FLAG_UNICODE,
+    TSAOT_REGEXP_FLAG_UNICODE_SETS, TSAOT_REGEXP_FLAG_STICKY
+  };
+  if (flags != TS_UNDEFINED){
+    flags = ts_regexp_constructor_string(flags);
+    ts_strview view = ts_str_view_typed(flags);
+    for (uint32_t i = 0; i < view.len; i++){
+      uint32_t unit = ts_str_cu_at_view(view, i);
+      uint32_t bit = 0;
+      for (uint32_t j = 0; j < 8; j++) if (unit == (uint32_t)order[j]) bit = bits[j];
+      if (!bit || (mask & bit)) ts_throw_syntax_error_msg("Invalid flags supplied to RegExp constructor");
+      mask |= bit;
+    }
+    if ((mask & TSAOT_REGEXP_FLAG_UNICODE) && (mask & TSAOT_REGEXP_FLAG_UNICODE_SETS))
+      ts_throw_syntax_error_msg("Invalid flags supplied to RegExp constructor");
+  }
+  char canonical[8]; uint32_t count = 0;
+  for (uint32_t i = 0; i < 8; i++) if (mask & bits[i]) canonical[count++] = order[i];
+  flags = ts_new_string(canonical, count);
+  pattern = ts_regexp_constructor_source(pattern);
+  tsv re = ts_new_object(); ts_gc_root(&re);
+  ts_regexp_object_init(re);
+  ts_regexp_adapter_ensure_object_keys();
+  ts_define_data(re, ts_rx_k_source, pattern, 0, 0, 1);
+  ts_define_data(re, ts_intern_field("flags", 5), flags, 0, 0, 1);
+  ts_define_data(re, ts_rx_k_last_index, ts_num(0), 0, 1, 0);
+  ts_define_data(re, ts_rx_k_flags_mask, ts_num(mask), 0, 1, 0);
+  ts_regexp_adapter_validate_object_tsv(re);
+  ts_gc_unroot(3);
+  return re;
+}
+
 tsv ts_regexp_adapter_validate_object_tsv(tsv re){
   ts_gc_root(&re);
   tsv source = TS_UNDEFINED;

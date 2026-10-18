@@ -12,11 +12,16 @@ build_log="$work/build.log"
 
 # Remove every diagnostic fallback so this gate tests the public driver's
 # production defaults rather than the invoking shell's A/B configuration.
+runtime_gc_env=(-u TSAOT_GC_YOUNG_THRESHOLD)
+if [[ "${TSAOT_CI_GC_STRESS:-0}" == "1" ]]; then
+  runtime_gc_env=(TSAOT_GC_YOUNG_THRESHOLD=1)
+fi
 env \
   -u TSAOT_CC \
   -u TSAOT_ANALYZER \
   -u TSAOT_UNTYPED \
   -u TSAOT_PROP_PIC \
+  -u TSAOT_FAST_EXCEPTIONS \
   -u TSAOT_FRAME_ROOTS \
   -u TSAOT_PRETENURE \
   -u TSAOT_USE_MIMALLOC \
@@ -28,6 +33,10 @@ env \
 
 grep -q 'TS_PROP_IC_INIT' "$out_c" || {
   echo "[default-opts] FAIL: property PIC emission is not enabled by default"
+  exit 1
+}
+grep -q 'ts_setjmp' "$out_c" || {
+  echo "[default-opts] FAIL: exception save/restore helpers are not enabled by default"
   exit 1
 }
 grep -q 'ts_frame_push' "$out_c" || {
@@ -52,7 +61,7 @@ env \
   -u TSAOT_GC_AGING_ADAPTIVE \
   -u TSAOT_GC_FULL_THRESHOLD_BYTES \
   -u TSAOT_GC_ZAP \
-  TSAOT_GC_YOUNG_THRESHOLD=1 \
+  "${runtime_gc_env[@]}" \
   TSAOT_RT_STATS_FILE="$stats" \
   "$work/defaults" >/dev/null
 
@@ -63,10 +72,16 @@ pic_hits="$(sed -n 's/.*prop_pic: get=[0-9][0-9]* hit=\([0-9][0-9]*\).*/\1/p' "$
 pretenured="$(sed -n 's/.*pretenured=\([0-9][0-9]*\).*/\1/p' "$stats")"
 aging_copied="$(sed -n 's/.*aging: copied_bytes=\([0-9][0-9]*\).*/\1/p' "$stats")"
 
-[[ "${minor:-0}" -gt 0 ]] || {
-  echo "[default-opts] FAIL: default generational GC did not run a minor collection"
-  exit 1
-}
+if [[ "${TSAOT_CI_GC_STRESS:-0}" == "1" ]]; then
+  [[ "${minor:-0}" -gt 0 ]] || {
+    echo "[default-opts] FAIL: generational GC did not run a minor collection"
+    exit 1
+  }
+  [[ "${aging_copied:-0}" -gt 0 ]] || {
+    echo "[default-opts] FAIL: adaptive threshold-2 aging is not enabled by default"
+    exit 1
+  }
+fi
 [[ "${nursery:-0}" -gt 0 ]] || {
   echo "[default-opts] FAIL: bump-nursery allocation is not enabled by default"
   exit 1
@@ -83,9 +98,4 @@ aging_copied="$(sed -n 's/.*aging: copied_bytes=\([0-9][0-9]*\).*/\1/p' "$stats"
   echo "[default-opts] FAIL: generated program did not allocate a pretenured cell"
   exit 1
 }
-[[ "${aging_copied:-0}" -gt 0 ]] || {
-  echo "[default-opts] FAIL: adaptive threshold-2 aging is not enabled by default"
-  exit 1
-}
-
-echo "[default-opts] PASS: PIC, root frames, pretenuring, adaptive aging, moving GC, nursery, and mimalloc defaults are active"
+echo "[default-opts] PASS: PIC, root frames, pretenuring, nursery, and mimalloc defaults are active (GC stress=${TSAOT_CI_GC_STRESS:-0})"

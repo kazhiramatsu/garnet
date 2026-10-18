@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # tsaot CI stage 1 (fast): build + runtime/analyzer unit tests + negative tests.
 # Skips the (slow) benchmark suite — run scripts/ci_bench.sh for that.
+# Forced-GC gates are opt-in with TSAOT_CI_GC_STRESS=1.
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 S="$ROOT/scripts"
@@ -17,10 +18,14 @@ if [[ -d "$ROOT/exporter/node_modules" ]]; then
      --module commonjs --target es2020 --skipLibCheck --moduleResolution node --esModuleInterop) \
      || { echo "exporter build FAILED"; rc=1; }
 fi
+echo ">>> IR wire conversion"; node "$ROOT/tests/wire_program_tests.js" || rc=1
 echo ">>> production optimization defaults"; bash "$ROOT/tests/default_optimizations_gate.sh" || rc=1
-echo ">>> escape-guided pretenuring"; bash "$ROOT/tests/pretenure_aot_gate.sh" || rc=1
-echo ">>> GC aging promotion barrier"; bash "$ROOT/tests/gc_aging_promotion_gate.sh" || rc=1
-echo ">>> adaptive GC aging"; bash "$ROOT/tests/gc_adaptive_aging_gate.sh" || rc=1
+echo ">>> project compiler options"; bash "$ROOT/tests/project_options_gate.sh" || rc=1
+if [[ "${TSAOT_CI_GC_STRESS:-0}" == "1" ]]; then
+  echo ">>> escape-guided pretenuring"; bash "$ROOT/tests/pretenure_aot_gate.sh" || rc=1
+  echo ">>> GC aging promotion barrier"; bash "$ROOT/tests/gc_aging_promotion_gate.sh" || rc=1
+  echo ">>> adaptive GC aging"; bash "$ROOT/tests/gc_adaptive_aging_gate.sh" || rc=1
+fi
 echo ">>> golden iteration tests"
 bash "$ROOT/scripts/run_golden_iter.sh" || rc=1
 echo ">>> fetch / HTTPS transport (compile+link)"

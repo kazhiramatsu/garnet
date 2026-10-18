@@ -41,6 +41,10 @@ if [[ "${TSAOT_USE_MIMALLOC:-0}" == "1" ]]; then
       mi_build_dir="$ROOT/build/mimalloc"
       mkdir -p "$mi_build_dir"
       mi_section_cflags="-ffunction-sections -fdata-sections"
+      # Optimization flags alone leave upstream's default MI_DEBUG=2 enabled.
+      # Build the allocator in release mode without disabling runtime asserts.
+      mi_mode_cflags="-DNDEBUG"
+      if [[ "${TSAOT_MIMALLOC_DEBUG:-0}" == "1" ]]; then mi_mode_cflags=""; fi
       # Upstream prints __DATE__/__TIME__ in verbose diagnostics. Pin them so
       # the cached object and final executable are reproducible, and so
       # reproducibility-enforcing cross compilers (notably zig cc) accept it.
@@ -54,7 +58,7 @@ if [[ "${TSAOT_USE_MIMALLOC:-0}" == "1" ]]; then
         *) mi_gc_link_flag="" ;;
       esac
       mi_cache_key="$(
-        printf '%s\n' "$CC|$mi_section_cflags|$mi_repro_cflags|$mi_gc_link_flag|$(uname -s)|$(uname -m)" |
+        printf '%s\n' "$CC|$mi_mode_cflags|$mi_section_cflags|$mi_repro_cflags|$mi_gc_link_flag|$(uname -s)|$(uname -m)" |
           cksum | awk '{print $1}'
       )"
       mi_object="$mi_build_dir/mimalloc-$mi_cache_key.o"
@@ -70,7 +74,7 @@ if [[ "${TSAOT_USE_MIMALLOC:-0}" == "1" ]]; then
       if [[ "$mi_stale" == "1" ]]; then
         mi_tmp="$mi_build_dir/.mimalloc-$mi_cache_key.$$"
         # shellcheck disable=SC2086
-        if ! $CC -pthread $mi_section_cflags $mi_repro_cflags \
+        if ! $CC -pthread $mi_mode_cflags $mi_section_cflags $mi_repro_cflags \
              -I"$mi_vendor/include" \
              -c "$mi_vendor/src/static.c" \
              -o "$mi_tmp.o"; then
