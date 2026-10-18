@@ -687,25 +687,25 @@ Raw records: `native_s350m_o2/results/`.
 
 ### Pattern benchmarks against V8 (Session 350)
 
-Twelve tsc-style kernels (`scratchpad/pbench`, scaled to 100–200 ms under
-Node; Node times include about 60 ms of startup), native best-of-3 against
+Twelve tsc-style kernels (`benchmarks/patterns`, runner
+`scripts/pattern_bench.sh`, scaled to 100–200 ms under Node; Node times include about 60 ms of startup), native best-of-3 against
 Node best-of-3, same machine state, outputs checked against Node:
 
-| kernel | before | after slice 1 + lazy frames | ratio before → after |
+| kernel | before | end of session | ratio before → after |
 |---|---:|---:|---:|
-| flags / optional chaining / typeof loop | 2132 ms | 549 ms | 15.1x → 3.8x |
-| `typeof` dispatch alone | 1376 ms | 84 ms | 17.9x → 1.06x |
-| 32-case `switch` dispatch | 829 ms | 448 ms | 6.0x → 3.25x |
-| small calls with object arguments | 1026 ms | 1000 ms | 4.7x → 4.6x |
-| array callbacks | 583 ms | 554 ms | 4.0x → 3.7x |
-| closures with captured variables | 392 ms | 392 ms | 3.1x → 3.0x |
-| arrays of objects | 329 ms | 322 ms | 3.05x → 3.0x |
-| shape-polymorphic object literals | 402 ms | 415 ms | 3.3x → 3.4x |
-| scanner-style string loop | 364 ms | 260 ms | 2.6x → 1.9x |
-| tree recursion | 147 ms | 145 ms | 1.4x → 1.4x |
-| string building | 153 ms | 151 ms | 1.3x → 1.35x |
-| Map with string keys | 92 ms | 93 ms | 0.88x |
-| method objects | 47 ms | 47 ms | 0.69x |
+| flags / optional chaining / typeof loop | 2132 ms | 571 ms | 15.1x → 4.05x |
+| `typeof` dispatch alone | 1376 ms | 88 ms | 17.9x → 1.1x |
+| 32-case `switch` dispatch | 829 ms | 450 ms | 6.0x → 3.2x |
+| small calls with object arguments | 1026 ms | 980 ms | 4.7x → 4.5x |
+| array callbacks | 583 ms | 548 ms | 4.0x → 3.8x |
+| closures with captured variables | 392 ms | 385 ms | 3.1x → 3.0x |
+| arrays of objects | 329 ms | 337 ms | 3.05x → 3.1x |
+| shape-polymorphic object literals | 402 ms | 361 ms | 3.3x → 3.0x |
+| scanner-style string loop | 364 ms | 253 ms | 2.6x → 1.8x |
+| tree recursion | 147 ms | 126 ms | 1.4x → 1.2x |
+| string building | 153 ms | 149 ms | 1.3x → 1.3x |
+| Map with string keys | 92 ms | 90 ms | 0.88x |
+| method objects | 47 ms | 45 ms | 0.69x |
 
 Compiler A/Bs for the slice (three alternating runs each, outputs validated):
 
@@ -717,6 +717,7 @@ Compiler A/Bs for the slice (three alternating runs each, outputs validated):
 | `native_s350r` (switch jump tables) | 8.364 s | noise against `q` (8.322 s) |
 | `native_s350s` (lazy root frames) | **8.235 s** | 1.1% less than `r` (8.329 s) |
 | `native_s350u` (object literal and constructor layouts) | **7.911 s** | 1.8% less than `s` (8.052 s in its own session); Node 3.238 s |
+| `native_s350v` (slot-first inline-cache probe) | **7.591 s** | 4.2% less than `u` (7.925 s in its own session); Node 3.218 s |
 
 ### Inline-cache path statistics (Session 350, `native_s350s_stats`)
 

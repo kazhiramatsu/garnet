@@ -1486,12 +1486,31 @@ TS_RT_ALWAYS_INLINE tsv* ts_prop_ic_probe_fixed_inline(
   ts_object* o = (ts_object*)ts_ptr(obj);
   uint32_t sid = ts_obj_shape_id(o);
   if (o->h.kind != TS_KIND_OBJECT || sid == TS_SHAPE_NONE) return NULL;
+  /* Entry 0 first: its shape (the monomorphic case), then its slot validated
+     against this shape's key vector. The compiler's reads are mostly
+     shape-polymorphic with the key at one slot (61% of hits measured in
+     Session 350), so that validation is the second test, not the last. */
+  {
+    ts_prop_ic_entry* e0 = &ic->entries[0];
+    if (e0->shape == o->shape){
+      *flags = (uint8_t)(e0->slot >> TS_PIC_FLAGS_SHIFT);
+      TS_RT_STAT_SLOT(o, e0->slot & TS_PIC_SLOT_MASK);
+      TS_RT_STAT_PIC_ENTRY(0);
+      return ts_obj_slot_ptr(o, e0->slot & TS_PIC_SLOT_MASK);
+    }
+    uint32_t slot0 = e0->slot & TS_PIC_SLOT_MASK;
+    if (e0->shape != TS_SHAPE_NONE && slot0 < o->len && g_ts_shape_keys[sid][slot0] == key){
+      *flags = g_ts_shape_flags[sid][slot0];
+      TS_RT_STAT_PIC_KEYVAL();
+      return ts_obj_slot_ptr(o, slot0);
+    }
+  }
 #if defined(__clang__)
 #pragma clang loop unroll(disable)
 #elif defined(__GNUC__)
 #pragma GCC unroll 1
 #endif
-  for (uint32_t i = 0; i < TS_PROP_IC_SIZE; i++){
+  for (uint32_t i = 1; i < TS_PROP_IC_SIZE; i++){
     ts_prop_ic_entry* e = &ic->entries[i];
     if (e->shape == o->shape){
       *flags = (uint8_t)(e->slot >> TS_PIC_FLAGS_SHIFT);
@@ -1509,7 +1528,7 @@ TS_RT_ALWAYS_INLINE tsv* ts_prop_ic_probe_fixed_inline(
 #elif defined(__GNUC__)
 #pragma GCC unroll 1
 #endif
-  for (uint32_t i = 0; i < TS_PROP_IC_SIZE; i++){
+  for (uint32_t i = 1; i < TS_PROP_IC_SIZE; i++){
     ts_prop_ic_entry* e = &ic->entries[i];
     uint32_t slot = e->slot & TS_PIC_SLOT_MASK;
     if (e->shape != TS_SHAPE_NONE && slot < o->len && g_ts_shape_keys[sid][slot] == key){

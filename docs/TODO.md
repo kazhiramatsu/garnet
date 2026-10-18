@@ -4432,8 +4432,9 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   and 64 MB against the 4 MB default on the compiler (alternating runs):
   8.543 → 8.563 s and 8.548 → 8.606 s, so fewer minors do not pay for the
   cache locality lost; the default stays.
-- Pattern benchmarks against V8 (`scratchpad/pbench`, to be moved into the
-  repo): the flat compiler profile is being attacked pattern by pattern.
+- Pattern benchmarks against V8 (`benchmarks/patterns`, runner
+  `scripts/pattern_bench.sh`): the flat compiler profile is being attacked
+  pattern by pattern.
   Twelve tsc-style kernels timed natively and under Node (scaled to
   100–200 ms under V8): flags/optional-chaining/typeof loop 15x slower,
   small calls with object arguments 4.7x, array callbacks 4.0x, closures
@@ -4523,16 +4524,26 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   receivers, a 14-property constructor, deletion). `TSAOT_LITERAL_LAYOUT=0`
   keeps the additions (parity oracle). Compiler A/B against the lazy-frame
   build: **8.052 → 7.911 s median wall (1.8% less)**, outputs validated, peak RSS flat; the compiler is now 2.44x slower than V8 (Node 3.238 s). Gates: conformance 422/422, parity 333 identical + 85 KNOWN, bundler 42/42, selfconf 408 + 11 KNOWN, GC stress (all phases), inline policy (the three lazy-frame helpers added to its always-inline allowlist: the lazy-frame and layout gate runs had reported the policy failure inside the unit and GC-stress verdicts while every test passed — the chain summaries counted exit codes, not verdict text), units.
-- Next slices (`docs/v8_parity_roadmap.md`): C2 frame elision for
-  functions that cannot reach a collection (562M frame pushes per compile),
-  C3 lazy frame initialization, boxing a value-used nested declaration on
-  its first value use per activation instead of in the prologue (the
-  remaining 5.6M closures), the property-write PIC and addition slow path
-  (31M missed writes, 9.76M slow additions), stack allocation of the scope
-  records passed only to direct callees (needs summaries for the checker's
-  nest: a cheaper summary domain or a per-parameter "never stored" flag
-  computed without the fixpoint), C5b-2/3 (block records for
-  per-iteration bindings, unboxed numeric record fields), and the
-  remaining 4.6k closure-value call sites. Smaller items still open: the
+- Slot-first inline-cache probe (`docs/pic_slot_first_design.md`). The
+  statistics build showed 61.7% of the compiler's 592.6M property reads per
+  compile hitting the slot/key validation (same slot, another shape) only
+  after all four shape-entry compares had missed. The inline probe now
+  tests entry 0's shape, then entry 0's slot against the receiver shape's
+  key vector, before walking entries 1–3; filling and invalidation are
+  unchanged (the validation reads the shape's own key vector). Kernel
+  `obj_literal_poly` (shape-polymorphic literals): 408 → 350 ms. Compiler
+  A/B against the layout build: **7.925 → 7.591 s median wall (4.2% less)**, outputs validated; the compiler is now 2.36x slower than V8 (Node 3.218 s). Session total: 9.722 s (before direct entries) → 7.591 s, 1.28x. Gates: conformance 422/422, parity 333 identical + 85 KNOWN, bundler 42/42, selfconf 408 + 11 KNOWN, GC stress (all phases), inline policy, units (verdicts read from the gate output).
+- Next slices: the remaining pattern gaps (small calls with object
+  arguments 4.6x, array callbacks 3.8x, closures 2.9x, arrays of objects
+  3.0x, flags/optional chaining 4.0x: boxed boolean temps of `&&`/`||` in
+  conditions, `??` with a numeric fallback through the generic add),
+  callback specialization (clone a small helper per statically known
+  callback closure; the parser's `isListElement`/`parseStatement` and the
+  checker's `forEach`/`some`/`every` helpers), direct calls to lazy callees
+  with caller-frame chaining, constructor pre-sizing from layouts, local
+  classes from declared types (`const b: Body = arr[i]` keeps the typed
+  struct access, the nbody kernel is 4.3x slower through array elements),
+  C5b-2/3 (block records, unboxed numeric record fields), and the remaining
+  4.6k closure-value call sites. Smaller items still open: the
   minor-collection trigger counts cell bytes only, and closures passed to
   non-devirtualized callees are never stack-allocated.

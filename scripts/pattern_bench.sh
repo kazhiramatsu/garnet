@@ -1,0 +1,25 @@
+#!/bin/bash
+# Pattern benchmarks against V8: compile each kernel with garnet through the
+# differential harness (output must match Node), then time the native binary
+# and Node (best of 3). Kernels live in benchmarks/patterns (one tsc-style
+# pattern each, scaled to 100-200 ms under Node; Node times include ~60 ms of
+# startup). Usage: scripts/pattern_bench.sh [kernel.ts ...]
+set -u
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT" || exit 1
+source scripts/difftest.sh >/dev/null 2>&1
+ms() { python3 -c 'import time; print(int(time.time()*1000))'; }
+best_of() { local b=999999; for i in 1 2 3; do local t0=$(ms); "$@" >/dev/null 2>&1; local t1=$(ms); local d=$((t1-t0)); [ $d -lt $b ] && b=$d; done; echo $b; }
+printf "%-22s %9s %8s %6s  %s\n" kernel native_ms node_ms ratio verdict
+files=("$@"); [ $# -eq 0 ] && files=("$ROOT"/benchmarks/patterns/*.ts)
+for f in "${files[@]}"; do
+  n=$(basename "$f" .ts)
+  v=$(dt "$n" "$(cat "$f")" 2>&1 | grep -oE "OK|DIFF|REJECT" | head -n1)
+  if [ -x build/dt ] && [ -f build/dt.mjs ] && [ "$v" = "OK" ]; then
+    tn=$(best_of ./build/dt); tv=$(best_of node build/dt.mjs)
+    ratio=$(python3 -c "print(f'{$tn/max($tv,1):.2f}')")
+    printf "%-22s %9s %8s %6s  %s\n" "$n" "$tn" "$tv" "$ratio" "$v"
+  else
+    printf "%-22s %9s %8s %6s  %s\n" "$n" - - - "${v:-BUILD_FAIL}"
+  fi
+done

@@ -124,6 +124,10 @@ Slices:
    allocate (pure field/arith helpers such as `getObjectFlags`) skip the root
    frame push and the undefined fill. Requires a per-function "may allocate"
    summary from the analyzer (interproc already computes call graphs).
+   Status: landed in Session 350 as lazily linked frames
+   (`docs/lazy_frames_design.md`): the frame is declared and filled but
+   linked only around inline-cache and element-read slow paths; calls stay
+   collection points. 8.33 → 8.24 s; frame pushes 562M → 410M per compile.
 3. **Lazy frame initialization** — initialize only the slots that are live
    before the first GC point; the remaining slots are set when first written.
 4. **Closure devirtualization** — a local function declaration called through
