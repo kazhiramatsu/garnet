@@ -352,6 +352,12 @@ fn emit_program_with_string_plans(
     for f in &program.functions {
         let _ = writeln!(s, "static tsv {}(tsv* args, int nargs);", cname(f));
     }
+    let direct_sigs = direct_entry_sigs(program, &fclass, &param_facts_by_func, &i64_fast);
+    for f in &program.functions {
+        if let Some(sig) = direct_sigs.get(&f.id.0) {
+            let _ = writeln!(s, "static tsv {}_d({});", cname(f), sig.c_params());
+        }
+    }
     if needs_regexp {
         s.push_str("static tsv ts_regexpproto_test(tsv* args, int nargs);\n");
         s.push_str("static tsv ts_regexpproto_exec(tsv* args, int nargs);\n");
@@ -916,6 +922,7 @@ fn emit_program_with_string_plans(
                 &fn_takes_this,
                 &i64_fast,
                 &f64_fast,
+                &direct_sigs,
                 &static_strings,
                 f_string_metrics,
                 f_string_materializations,
@@ -934,6 +941,7 @@ fn emit_program_with_string_plans(
                 &fn_takes_this,
                 &i64_fast,
                 &f64_fast,
+                &direct_sigs,
                 &static_strings,
                 f_string_metrics,
                 f_string_materializations,
@@ -951,6 +959,7 @@ fn emit_program_with_string_plans(
             pf,
             &i64_fast,
             &f64_fast,
+            &direct_sigs,
             &static_strings,
             f_string_metrics,
             f_string_materializations,
@@ -1317,6 +1326,8 @@ struct Ctx<'a> {
     /// The public ABI remains boxed; these clones are used only when all args are
     /// already tracked as numeric unboxed values.
     f64_fast: &'a BTreeMap<u32, F64FuncInfo>,
+    /// Direct entry signatures of every eligible function (empty when disabled).
+    direct_sigs: &'a BTreeMap<u32, DirectSig>,
     static_strings: &'a BTreeMap<Vec<u16>, usize>,
     string_metric_plan: Option<&'a FunctionMetricPlan>,
     string_materialization_plan: Option<&'a FunctionMaterializationPlan>,
@@ -2026,6 +2037,149 @@ fn own_capture_count(f: &Function) -> usize {
     } else {
         0
     }
+}
+
+/* Direct-call entry points (docs/direct_entry_design.md). Every eligible
+   function gets a second entry `fn_X_d(<typed params>)` whose parameters are
+   C parameters, cells first; direct call sites call it, and the generic
+   `fn_X(args, nargs)` entry becomes a forwarder that function values keep
+   using. TSAOT_DIRECT_ENTRY=0 restores the single generic entry (the parity
+   oracle). */
+fn direct_entry_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_DIRECT_ENTRY").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    }) && closure_env_abi_enabled()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ParamKind {
+    Boxed,
+    F64,
+    I64,
+}
+
+/// The C signature of a function's direct entry: one kind per IR parameter
+/// (captured cells first), in the representation the body uses for it.
+#[derive(Clone, Debug)]
+struct DirectSig {
+    kinds: Vec<ParamKind>,
+}
+
+impl DirectSig {
+    fn c_params(&self) -> String {
+        if self.kinds.is_empty() {
+            return "void".to_string();
+        }
+        self.kinds
+            .iter()
+            .enumerate()
+            .map(|(i, k)| match k {
+                ParamKind::Boxed => format!("tsv _p{}", i),
+                ParamKind::F64 => format!("double _p{}", i),
+                ParamKind::I64 => format!("long long _p{}", i),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// A body that reads `arguments.length` needs the argument count.
+fn body_reads_arguments(body: &[Inst]) -> bool {
+    let mut flat = Vec::new();
+    flatten_inst(body, &mut flat);
+    flat.iter().any(|inst| {
+        matches!(inst, Inst::CallBuiltinStatic { builtin, .. } if builtin.starts_with("arguments."))
+    })
+}
+
+fn direct_entry_eligible(f: &Function) -> bool {
+    !f.is_async && !f.is_generator && f.rest_param.is_none() && !body_reads_arguments(&f.body)
+}
+
+/// Parameter kinds of every eligible function, from the classification the
+/// body emitter uses (`unboxed_candidates` plus the numeric analysis).
+fn direct_entry_sigs(
+    program: &Program,
+    fclass: &BTreeMap<u32, u32>,
+    param_facts_by_func: &BTreeMap<u32, BTreeMap<u32, NumFact>>,
+    i64_fast: &BTreeMap<u32, I64FuncInfo>,
+) -> BTreeMap<u32, DirectSig> {
+    let mut out = BTreeMap::new();
+    if !direct_entry_enabled() {
+        return out;
+    }
+    let return_facts = i64_return_facts(i64_fast);
+    let empty: BTreeMap<u32, NumFact> = BTreeMap::new();
+    for f in &program.functions {
+        if !direct_entry_eligible(f) {
+            continue;
+        }
+        let mut local_class = local_class_map(f);
+        if let Some(&c) = fclass.get(&f.id.0) {
+            if let Some(p0) = f.params.first() {
+                local_class.insert(p0.0, c);
+            }
+        }
+        let unboxed = unboxed_candidates(f, &local_class);
+        let pf = param_facts_by_func.get(&f.id.0).unwrap_or(&empty);
+        let numeric = infer_numeric_analysis(&f.body, &unboxed, pf, &return_facts);
+        let kinds = f
+            .params
+            .iter()
+            .map(|p| param_kind(p.0, &numeric.int_local, &unboxed))
+            .collect();
+        out.insert(f.id.0, DirectSig { kinds });
+    }
+    out
+}
+
+fn param_kind(id: u32, int_local: &BTreeSet<u32>, unboxed: &BTreeSet<u32>) -> ParamKind {
+    if int_local.contains(&id) {
+        ParamKind::I64
+    } else if unboxed.contains(&id) {
+        ParamKind::F64
+    } else {
+        ParamKind::Boxed
+    }
+}
+
+/// The generic `(args, nargs)` entry of a function with a direct entry: read
+/// the environment register and the argument array once and forward. A
+/// missing argument keeps the value the generic prologue left in place.
+fn emit_direct_forwarder(s: &mut String, f: &Function, sig: &DirectSig, ncap: usize) {
+    let _ = writeln!(s, "static tsv {}(tsv* args, int nargs){{", cname(f));
+    s.push_str("  (void)args; (void)nargs;\n");
+    if ncap > 0 {
+        s.push_str("  tsv* _env = g_ts_cur_env;\n");
+    }
+    let parts: Vec<String> = sig
+        .kinds
+        .iter()
+        .enumerate()
+        .map(|(i, k)| {
+            if i < ncap {
+                match k {
+                    ParamKind::Boxed => format!("_env[{}]", i),
+                    ParamKind::F64 => format!("ts_to_num(_env[{}])", i),
+                    ParamKind::I64 => format!("(long long)ts_to_num(_env[{}])", i),
+                }
+            } else {
+                let j = i - ncap;
+                match k {
+                    ParamKind::Boxed => format!("(nargs > {0} ? args[{0}] : TS_UNDEFINED)", j),
+                    ParamKind::F64 => format!("(nargs > {0} ? ts_to_num(args[{0}]) : 0.0)", j),
+                    ParamKind::I64 => {
+                        format!("(nargs > {0} ? (long long)ts_to_num(args[{0}]) : 0)", j)
+                    }
+                }
+            }
+        })
+        .collect();
+    let _ = writeln!(s, "  return {}_d({});\n}}\n", cname(f), parts.join(", "));
 }
 
 fn prop_pic_enabled() -> bool {
@@ -5377,6 +5531,7 @@ fn emit_i64_function(
     fn_takes_this: &BTreeMap<u32, bool>,
     i64_fast: &BTreeMap<u32, I64FuncInfo>,
     f64_fast: &BTreeMap<u32, F64FuncInfo>,
+    direct_sigs: &BTreeMap<u32, DirectSig>,
     static_strings: &BTreeMap<Vec<u16>, usize>,
     string_metric_plan: Option<&FunctionMetricPlan>,
     string_materialization_plan: Option<&FunctionMaterializationPlan>,
@@ -5474,6 +5629,7 @@ fn emit_i64_function(
         cur_capture_count: own_capture_count(f),
         i64_fast,
         f64_fast,
+        direct_sigs,
         static_strings,
         string_metric_plan,
         string_materialization_plan,
@@ -5519,6 +5675,7 @@ fn emit_f64_function(
     fn_takes_this: &BTreeMap<u32, bool>,
     i64_fast: &BTreeMap<u32, I64FuncInfo>,
     f64_fast: &BTreeMap<u32, F64FuncInfo>,
+    direct_sigs: &BTreeMap<u32, DirectSig>,
     static_strings: &BTreeMap<Vec<u16>, usize>,
     string_metric_plan: Option<&FunctionMetricPlan>,
     string_materialization_plan: Option<&FunctionMaterializationPlan>,
@@ -5617,6 +5774,7 @@ fn emit_f64_function(
         cur_capture_count: own_capture_count(f),
         i64_fast,
         f64_fast,
+        direct_sigs,
         static_strings,
         string_metric_plan,
         string_materialization_plan,
@@ -5662,6 +5820,7 @@ fn emit_function(
     param_facts: &BTreeMap<u32, NumFact>,
     i64_fast: &BTreeMap<u32, I64FuncInfo>,
     f64_fast: &BTreeMap<u32, F64FuncInfo>,
+    direct_sigs: &BTreeMap<u32, DirectSig>,
     static_strings: &BTreeMap<Vec<u16>, usize>,
     string_metric_plan: Option<&FunctionMetricPlan>,
     string_materialization_plan: Option<&FunctionMaterializationPlan>,
@@ -5711,6 +5870,7 @@ fn emit_function(
             cur_capture_count: own_capture_count(f),
             i64_fast,
             f64_fast,
+            direct_sigs,
             static_strings,
             string_metric_plan: None,
             string_materialization_plan: None,
@@ -5754,6 +5914,7 @@ fn emit_function(
             cur_capture_count: own_capture_count(f),
             i64_fast,
             f64_fast,
+            direct_sigs,
             static_strings,
             string_metric_plan: None,
             string_materialization_plan: None,
@@ -5797,6 +5958,7 @@ fn emit_function(
             cur_capture_count: own_capture_count(f),
             i64_fast,
             f64_fast,
+            direct_sigs,
             static_strings,
             string_metric_plan: None,
             string_materialization_plan: None,
@@ -5849,8 +6011,24 @@ fn emit_function(
     } else {
         None
     };
-    let _ = writeln!(s, "static tsv {}(tsv* args, int nargs){{", cname(f));
-    s.push_str("  (void)nargs;\n");
+    let dsig = direct_sigs.get(&f.id.0);
+    if let Some(sig) = dsig {
+        // The body entry: parameters arrive as C parameters, cells first, in
+        // the representation the body uses. The table was built from the same
+        // classification; a disagreement would be a type error in the C.
+        for (i, p) in f.params.iter().enumerate() {
+            let kind = param_kind(p.0, &int_local, &unboxed);
+            assert!(
+                sig.kinds.get(i) == Some(&kind),
+                "direct entry signature of fn {} disagrees with its body classification",
+                f.id.0
+            );
+        }
+        let _ = writeln!(s, "static tsv {}_d({}){{", cname(f), sig.c_params());
+    } else {
+        let _ = writeln!(s, "static tsv {}(tsv* args, int nargs){{", cname(f));
+        s.push_str("  (void)nargs;\n");
+    }
     for l in &f.locals {
         if int_local.contains(&l.id.0) {
             let _ = writeln!(s, "  long long d{} = 0;", l.id.0);
@@ -5877,7 +6055,7 @@ fn emit_function(
         );
     }
     let ncap = own_capture_count(f);
-    if ncap > 0 {
+    if ncap > 0 && dsig.is_none() {
         // Captured cells arrive through the environment register, which the
         // caller stored immediately before this call; read them first.
         s.push_str("  tsv* _env = g_ts_cur_env;\n");
@@ -5886,6 +6064,15 @@ fn emit_function(
         if Some(p.0) == f.rest_param {
             continue;
         } // gathered separately below
+        if dsig.is_some() {
+            if int_local.contains(&p.0) || unboxed.contains(&p.0) {
+                let _ = writeln!(s, "  d{} = _p{};", p.0, i);
+            } else {
+                let name = frame_local_name(p.0, &frame_locals, frame_layout.as_ref());
+                let _ = writeln!(s, "  {} = _p{};", name, i);
+            }
+            continue;
+        }
         if i < ncap {
             if int_local.contains(&p.0) {
                 let _ = writeln!(s, "  d{} = (long long)ts_to_num(_env[{}]);", p.0, i);
@@ -5953,6 +6140,7 @@ fn emit_function(
         cur_capture_count: own_capture_count(f),
         i64_fast,
         f64_fast,
+        direct_sigs,
         static_strings,
         string_metric_plan,
         string_materialization_plan,
@@ -5984,6 +6172,9 @@ fn emit_function(
         let _ = writeln!(s, "  {}", cleanup);
     }
     s.push_str("  return TS_UNDEFINED;\n}\n\n");
+    if let Some(sig) = dsig {
+        emit_direct_forwarder(s, f, sig, ncap);
+    }
 }
 
 /// A local is integer-typed if every definition is an integer constant, an
@@ -16932,6 +17123,44 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         }
                         return;
                     }
+                }
+            }
+            if let CalleeRef::Direct { func } = callee {
+                if let Some(sig) = ctx.direct_sigs.get(&func.0) {
+                    // Direct entry: every parameter in the callee's own
+                    // representation, cells first; a missing argument gets the
+                    // value the generic prologue would have left in place.
+                    let parts: Vec<String> = sig
+                        .kinds
+                        .iter()
+                        .enumerate()
+                        .map(|(i, kind)| match argv.get(i) {
+                            Some(a) => match kind {
+                                ParamKind::Boxed => ctx.val(*a),
+                                ParamKind::F64 => ctx.num(*a),
+                                ParamKind::I64 => {
+                                    if ctx.int_local.contains(a) {
+                                        format!("d{}", a)
+                                    } else {
+                                        format!("(long long)({})", ctx.num(*a))
+                                    }
+                                }
+                            },
+                            None => match kind {
+                                ParamKind::Boxed => "TS_UNDEFINED".to_string(),
+                                ParamKind::F64 => "0.0".to_string(),
+                                ParamKind::I64 => "0".to_string(),
+                            },
+                        })
+                        .collect();
+                    let call = format!("{}_d({})", ctx.fn_name_of(func.0), parts.join(", "));
+                    match dst {
+                        Some(d) => s.push_str(&ctx.set_val(d.0, &call)),
+                        None => {
+                            let _ = writeln!(s, "  {};", call);
+                        }
+                    }
+                    return;
                 }
             }
             let callee_ncap = match callee {

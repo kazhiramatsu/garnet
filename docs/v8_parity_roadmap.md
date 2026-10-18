@@ -114,6 +114,12 @@ Slices:
    second entry `fn_X_d(tsv a0, tsv a1, ...)` that the direct call sites use;
    the generic `(args, nargs)` entry forwards to it. Removes the argument array
    stores and `nargs` tests at ~15k direct sites.
+   Status: landed in Session 350 (`docs/direct_entry_design.md`): every
+   function without `arguments`, rest parameters or a coroutine frame has
+   the entry, whether or not a closure value of it escapes (the forwarder
+   keeps function values working); 32,799 direct sites use it, 9.57 → 9.23
+   s (3.6% less). Parameters arrive in the representation the body uses
+   (`tsv`, `double`, `long long`).
 2. **Frame elision** — functions without allocation and without calls that can
    allocate (pure field/arith helpers such as `getObjectFlags`) skip the root
    frame push and the undefined fill. Requires a per-function "may allocate"

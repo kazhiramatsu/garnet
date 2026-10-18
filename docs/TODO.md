@@ -4342,14 +4342,46 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   runtime inline policy, GC stress (all phases), bundler 42/42, selfconf
   404 + 11 KNOWN (DIFF 0), parity 330 identical + 84 KNOWN, runtime and
   Rust units, all 102 benchmarks within budget.
-- Next slices (`docs/v8_parity_roadmap.md`): C1 known-arity direct entries
-  (27k direct calls now build an argument array and an environment array
-  per call), stack allocation of the scope records passed only to direct
-  callees (needs summaries for the checker's nest: a cheaper summary domain
-  or a per-parameter "never stored" flag computed without the fixpoint),
-  C5b-2/3 (block records for per-iteration bindings, unboxed numeric record
-  fields), and the remaining 4.6k closure-value call sites. Smaller items
-  still open: the minor-collection trigger counts cell bytes only, 10.3M
-  property additions still take the slow path after the addition cache,
-  and closures passed to non-devirtualized callees are never
-  stack-allocated.
+- Known-arity direct entry points (roadmap track C item 1;
+  `docs/direct_entry_design.md`). Every function that is not async, not a
+  generator, has no rest parameter and does not read `arguments` gets a
+  second entry `fn_X_d(records..., params...)` whose parameters are C
+  parameters in the representation the body already uses (`tsv`, `double`
+  or `long long`, from the same classification as the prologue); the
+  generic `(args, nargs)` entry becomes a forwarder that reads the
+  environment register and the argument array once. A direct call site
+  (after the i64/f64 clone fast paths) passes each argument converted to
+  the callee's kind, with `TS_UNDEFINED` / `0.0` / `0` for a missing one,
+  so no argument array, environment array, `g_ts_cur_env` store or `nargs`
+  test remains on the direct path; spread calls, devirtualized call sets
+  and function values keep the array convention. `TSAOT_DIRECT_ENTRY=0`
+  restores the single entry (parity corpus). On the compiler 12,991 of the
+  13,079 generic functions have a direct entry and 32,799 call sites use
+  one; argument arrays drop from 46,368 to 13,569 and environment-register
+  references from 39,548 to 13,655 (C 52.0 → 52.2 MB, binary unchanged).
+  Compiler A/B against the direct-nested-call build (alternating three
+  runs, outputs validated): **9.573 → 9.227 s median wall (3.6% less,
+  1.04x)**, process CPU 9.6 → 9.2 s, peak RSS 1.23 GB both; Node 3.227 s,
+  so the native compiler is now 2.86x slower than V8. Runtime statistics
+  of the direct-nested-call build for one compile, the targets of the next
+  slices: 561.7M frame pushes, 592.6M PIC property reads (98.6% hits),
+  40.9M PIC property writes (24.1% hits; 9.76M of the 29.0M additions
+  take the slow path), 36.1M allocations (3.9 GB), 931 minor collections
+  (0.73 s of pauses), 5.63M closures.
+  Gates on the final tree: conformance 418/418, runtime inline policy, GC
+  stress (all phases), bundler 42/42, selfconf 404 + 11 KNOWN (DIFF 0),
+  parity 330 identical + 84 KNOWN, runtime and Rust units, all 102
+  benchmarks within budget.
+- Next slices (`docs/v8_parity_roadmap.md`): C2 frame elision for
+  functions that cannot reach a collection (562M frame pushes per compile),
+  C3 lazy frame initialization, boxing a value-used nested declaration on
+  its first value use per activation instead of in the prologue (the
+  remaining 5.6M closures), the property-write PIC and addition slow path
+  (31M missed writes, 9.76M slow additions), stack allocation of the scope
+  records passed only to direct callees (needs summaries for the checker's
+  nest: a cheaper summary domain or a per-parameter "never stored" flag
+  computed without the fixpoint), C5b-2/3 (block records for
+  per-iteration bindings, unboxed numeric record fields), and the
+  remaining 4.6k closure-value call sites. Smaller items still open: the
+  minor-collection trigger counts cell bytes only, and closures passed to
+  non-devirtualized callees are never stack-allocated.

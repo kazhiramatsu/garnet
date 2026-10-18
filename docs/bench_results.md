@@ -643,3 +643,25 @@ drops 11.5% (per run 9.614 / 9.722 / 9.949 s against 10.897 / 11.097 /
 10.985 s); the site statistics build counts 5.63M closure allocations per
 compile instead of 30.87M. Native is now 3.00x slower than V8 on this
 machine state. Raw records: `native_s350l/results/run-c3ndk50f/`.
+
+### Known-arity direct entry points (Session 350, track C item 1)
+
+Same compiler workload, three alternating runs after warmup against the
+direct-nested-call build, diagnostics and all 78 emitted files matching Node
+on every launch:
+
+| build | median wall | median process CPU | median peak RSS |
+|---|---:|---:|---:|
+| Direct nested calls, lazy hoisting (`native_s350l`) | 9.573 s | 9.6 s | 1.23 GB |
+| + known-arity direct entries (`native_s350m`) | **9.227 s** | **9.2 s** | 1.23 GB |
+| Node 25.2.1 / V8 (same session) | 3.227 s | 5.9 s | 0.80 GB |
+
+Every eligible function has a second entry whose scope records and
+arguments are C parameters in the representation the body uses; the generic
+`(args, nargs)` entry forwards to it, and direct call sites call it without
+an argument array, an environment array or the environment register. On the
+compiler 12,991 of 13,079 generic functions have a direct entry and 32,799
+call sites use one (argument arrays 46,368 → 13,569, environment-register
+references 39,548 → 13,655). Wall time drops 3.6% (per run 9.225 / 9.227 /
+9.235 s against 9.572 / 9.573 / 9.574 s). Native is now 2.86x slower than V8
+on this machine state. Raw records: `native_s350m/results/run-ur166mjt/`.
