@@ -4533,6 +4533,20 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   unchanged (the validation reads the shape's own key vector). Kernel
   `obj_literal_poly` (shape-polymorphic literals): 408 → 350 ms. Compiler
   A/B against the layout build: **7.925 → 7.591 s median wall (4.2% less)**, outputs validated; the compiler is now 2.36x slower than V8 (Node 3.218 s). Session total: 9.722 s (before direct entries) → 7.591 s, 1.28x. Gates: conformance 422/422, parity 333 identical + 85 KNOWN, bundler 42/42, selfconf 408 + 11 KNOWN, GC stress (all phases), inline policy, units (verdicts read from the gate output).
+- Condition temporaries kept raw (`docs/truthy_unbox_design.md`). The
+  exporter classifies booleans as references (the primitive kind means a
+  raw C double), so the `!` results and the `&&`/`||` merge temporaries of
+  every condition lived in rooted frame slots, were boxed with `ts_bool`
+  and tested with `ts_truthy_fast`. The emitter's comparison-only rule
+  (`cmp_truthy_only`) is generalized to a fixpoint: a local whose every
+  definition is a comparison, a `!` or a copy of a raw numeric or of another
+  such local, and whose every use is a condition, a `!` operand or a copy
+  into another such local, stays an unboxed numeric local; a boxed target
+  disqualifies its sources, so a raw 0/1 is never boxed as a number. The
+  probe's `if (n.flags & 1 && !(b & 2))` function lost every `ts_bool` and
+  `ts_truthy_fast` and one frame slot. Fixture `operators/condition_temps`.
+  `TSAOT_TRUTHY_UNBOX=0` keeps the comparison-only rule (parity oracle).
+  Compiler A/B against the slot-first build: **7.903 → 7.548 s median wall (4.5% less)**, outputs validated; the compiler is now 2.34x slower than V8 (Node 3.219 s). Session total: 9.722 → 7.548 s (1.29x). Gates: conformance 423/423, parity 333 identical + 86 KNOWN (the new fixture's frozen-pair difference — the frozen emitter unboxes one condition temporary the Rust emitter keeps boxed under the knob — allowlisted), bundler 42/42, selfconf 409 + 11 KNOWN, GC stress (all phases), inline policy, units.
 - Next slices: the remaining pattern gaps (small calls with object
   arguments 4.6x, array callbacks 3.8x, closures 2.9x, arrays of objects
   3.0x, flags/optional chaining 4.0x: boxed boolean temps of `&&`/`||` in

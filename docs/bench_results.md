@@ -718,6 +718,7 @@ Compiler A/Bs for the slice (three alternating runs each, outputs validated):
 | `native_s350s` (lazy root frames) | **8.235 s** | 1.1% less than `r` (8.329 s) |
 | `native_s350u` (object literal and constructor layouts) | **7.911 s** | 1.8% less than `s` (8.052 s in its own session); Node 3.238 s |
 | `native_s350v` (slot-first inline-cache probe) | **7.591 s** | 4.2% less than `u` (7.925 s in its own session); Node 3.218 s |
+| `native_s350w` (condition temporaries kept raw) | **7.548 s** | 4.5% less than `v` (7.903 s in its own session); Node 3.219 s |
 
 ### Inline-cache path statistics (Session 350, `native_s350s_stats`)
 

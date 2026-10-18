@@ -3295,6 +3295,13 @@ fn unboxed_candidates(f: &Function, local_class: &BTreeMap<u32, u32>) -> BTreeSe
             unboxed.insert(l.id.0);
         }
     }
+    // Boolean temporaries that only feed conditions, decided against the
+    // final numeric set so a copy source is never raw while its target is boxed.
+    for id in truthy_only_unbox(&f.body, &unboxed) {
+        if !local_class.contains_key(&id) {
+            unboxed.insert(id);
+        }
+    }
     unboxed
 }
 
@@ -7203,6 +7210,114 @@ fn cmp_truthy_only(body: &[Inst]) -> BTreeSet<u32> {
             t > 0 && t == truthy.get(id).copied().unwrap_or(0)
         })
         .collect()
+}
+
+/* Boolean temporaries that only feed conditions (docs/truthy_unbox_design.md).
+   The rule above unboxes a comparison result used only as a condition; the
+   `!` results and the merge temporaries of `&&`/`||` (`t = a; if (t) t = b`)
+   stayed boxed (`ts_bool`, a frame slot, `ts_truthy_fast` at the test).
+   This generalization keeps a local raw when every definition is a
+   comparison, a `!`, or a copy of a raw numeric or of another such local,
+   and every use is a condition, a `!` operand, or a copy into another such
+   local — a fixpoint, so a copy into a local that stays boxed disqualifies
+   its source (a raw 0/1 must never be boxed as a number). An undefined
+   path (a conditional definition) reads as 0, which is falsy, as undefined
+   is. TSAOT_TRUTHY_UNBOX=0 keeps the comparison-only rule (parity oracle). */
+fn truthy_unbox_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_TRUTHY_UNBOX").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
+fn truthy_only_unbox(body: &[Inst], numeric: &BTreeSet<u32>) -> BTreeSet<u32> {
+    let mut kept: BTreeSet<u32> = BTreeSet::new();
+    if !truthy_unbox_enabled() {
+        return kept;
+    }
+    let mut flat: Vec<&Inst> = Vec::new();
+    flatten_inst(body, &mut flat);
+    // definitions: Some(copy source) for a Copy, None for a comparison or `!`
+    let mut defs: BTreeMap<u32, Vec<Option<u32>>> = BTreeMap::new();
+    let mut other_def: BTreeSet<u32> = BTreeSet::new();
+    let mut total: BTreeMap<u32, u32> = BTreeMap::new();
+    let mut truthy: BTreeMap<u32, u32> = BTreeMap::new();
+    let mut copies: BTreeMap<u32, Vec<u32>> = BTreeMap::new(); // src -> copy dsts
+    for inst in &flat {
+        match inst {
+            Inst::If { cond, .. } | Inst::Loop { cond, .. } => {
+                *total.entry(cond.0).or_insert(0) += 1;
+                *truthy.entry(cond.0).or_insert(0) += 1;
+                continue;
+            }
+            Inst::TryCatch { .. } => continue,
+            _ => {}
+        }
+        let def = inst_def(inst);
+        match inst {
+            Inst::BinOp { dst, op, .. }
+                if matches!(
+                    op.as_str(),
+                    "<" | "<=" | ">" | ">=" | "==" | "!=" | "===" | "!=="
+                ) =>
+            {
+                defs.entry(dst.0).or_default().push(None);
+            }
+            Inst::UnOp { dst, op, .. } if op == "!" => {
+                defs.entry(dst.0).or_default().push(None);
+            }
+            Inst::Copy { dst, src } => {
+                defs.entry(dst.0).or_default().push(Some(src.0));
+                copies.entry(src.0).or_default().push(dst.0);
+            }
+            _ => {
+                if let Some(d) = def {
+                    other_def.insert(d);
+                }
+            }
+        }
+        let mut seen: BTreeSet<u32> = BTreeSet::new();
+        for r in inst_refs(inst) {
+            if Some(r) == def || !seen.insert(r) {
+                continue;
+            }
+            *total.entry(r).or_insert(0) += 1;
+            if matches!(inst, Inst::UnOp { op, .. } if op == "!") {
+                *truthy.entry(r).or_insert(0) += 1;
+            }
+        }
+    }
+    for (id, dl) in &defs {
+        if !other_def.contains(id) && !dl.is_empty() {
+            kept.insert(*id);
+        }
+    }
+    loop {
+        let mut drop: Vec<u32> = Vec::new();
+        for &c in &kept {
+            let defs_ok = defs[&c]
+                .iter()
+                .all(|d| d.map_or(true, |src| numeric.contains(&src) || kept.contains(&src)));
+            let into_kept = copies
+                .get(&c)
+                .map_or(0, |ds| ds.iter().filter(|d| kept.contains(d)).count() as u32);
+            let tot = total.get(&c).copied().unwrap_or(0);
+            let tru = truthy.get(&c).copied().unwrap_or(0);
+            if !defs_ok || tot == 0 || tot != tru + into_kept {
+                drop.push(c);
+            }
+        }
+        if drop.is_empty() {
+            break;
+        }
+        for c in drop {
+            kept.remove(&c);
+        }
+    }
+    kept
 }
 
 fn collect_local_class(body: &[Inst], out: &mut BTreeMap<u32, u32>) {
