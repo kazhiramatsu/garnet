@@ -126,6 +126,19 @@ interface Local {
   name?: string;
   nullableNumeric?: boolean;
 }
+/** A scope record (capture context): the synthetic class holding one owner
+ *  function's record-resident captured bindings. See docs/capture_contexts_design.md. */
+interface CaptureRecord {
+  classId: number;
+  binding: number;               // synthetic binding id shared by every local that holds the record
+  fields: Map<ts.Symbol, number>; // binding -> field id
+  syms: ts.Symbol[];
+}
+/** One entry of a callee's capture layout: a whole scope record, or one cell. */
+type CaptureSlot =
+  | { kind: "record"; owner: ts.Node; binding: number; classId: number; syms: ts.Symbol[] }
+  | { kind: "cell"; sym: ts.Symbol; binding: number };
+
 interface FnCtx {
   id: number;
   name: string;
@@ -134,6 +147,8 @@ interface FnCtx {
   body: any[];
   localOfSymbol: Map<ts.Symbol, number>;
   cellAccess: Map<ts.Symbol, number>; // captured/owned cell binding -> local holding the cell
+  recordLocals?: Map<ts.Node, number>; // capture contexts: owner function -> local holding its scope record
+  recordAccess?: Map<ts.Symbol, { obj: number; field: number }>; // record-resident binding -> (record local, field)
   storageLocals?: Set<number>;         // canonical variable-slot locals (written in place by `=`/`++`);
                                        // a read of one ALIASES the slot, so it must be snapshotted when
                                        // a later sibling in the same expression mutates it (eval order).
@@ -281,6 +296,12 @@ class Exporter {
   synthCtorMemo = new Map<number, number>();
   bindingId = new Map<ts.Symbol, number>();
   cellBindings = new Set<ts.Symbol>();
+  // Capture contexts (docs/capture_contexts_design.md): the scope record of each
+  // owner function and the owner of every record-resident binding.
+  captureContexts = false;
+  recordOfOwner = new Map<ts.Node, CaptureRecord>();
+  recordOwnerOf = new Map<ts.Symbol, ts.Node>();
+  moduleCtxGlobal: number | undefined = undefined;
   freeCache = new Map<ts.Node, Set<ts.Symbol>>();
   // freeVars fixpoint state: per-round results, previous-round results (used as
   // the value for in-progress nodes on call cycles), and the in-progress guard.
@@ -1875,6 +1896,179 @@ class Exporter {
     }
     return this._fnNodeById.get(id);
   }
+  // ---------------- capture contexts (C5b-1) ----------------
+  /** A captured binding lives in its owner's scope record unless it needs its
+   *  own cell: a binding declared inside a loop (fresh per iteration), the
+   *  lexical-this sentinel, or the self binding of a named function expression. */
+  private recordEligible(s: ts.Symbol): boolean {
+    if (s === this.lexicalThisSym) return false;
+    const d = s.valueDeclaration ?? s.declarations?.[0];
+    if (!d) return false;
+    if (ts.isFunctionExpression(d) || ts.isClassExpression(d)) return false;
+    if (this.inLoop(d)) return false;
+    return true;
+  }
+  /** Group the record-resident captured bindings by owner function and declare
+   *  one synthetic class per owner (fields in binding-id order). Runs once the
+   *  cell binding set is final and before any function is lowered. */
+  private buildCaptureRecords(): void {
+    this.captureContexts = process.env.TSAOT_CAPTURE_CONTEXTS !== "0" && this.cellClassId !== undefined;
+    if (!this.captureContexts) return;
+    const byOwner = new Map<ts.Node, ts.Symbol[]>();
+    for (const s of this.cellBindings) {
+      if (!this.recordEligible(s)) continue;
+      const owner = this.symbolOwnerFunction(s);
+      if (!owner) continue;
+      let arr = byOwner.get(owner);
+      if (!arr) { arr = []; byOwner.set(owner, arr); }
+      arr.push(s);
+    }
+    const owners = [...byOwner.keys()].sort((a, b) => (this.fnId.get(a) ?? -1) - (this.fnId.get(b) ?? -1));
+    for (const owner of owners) {
+      const syms = byOwner.get(owner)!.sort((a, b) => this.bindingIdOf(a) - this.bindingIdOf(b));
+      const classId = this.classInfos.length;
+      const fields = new Map<ts.Symbol, number>();
+      const ownFields: string[] = [];
+      for (const sym of syms) {
+        const fname = `c${this.bindingIdOf(sym)}`;
+        ownFields.push(fname);
+        fields.set(sym, this.internField(fname));
+        this.recordOwnerOf.set(sym, owner);
+      }
+      const fid = this.fnId.get(owner);
+      const ownerName = (owner as { name?: { text?: string } }).name?.text ?? `fn${fid ?? classId}`;
+      this.classInfos.push({
+        id: classId, name: `__ctx_${ownerName}`, ownMethods: [], ownFields,
+        instantiated: true, stable: true, reasons: [],
+      });
+      const sentinel = { name: `<ctx ${ownerName}>`, flags: 0 } as unknown as ts.Symbol;
+      this.recordOfOwner.set(owner, { classId, binding: this.bindingIdOf(sentinel), fields, syms });
+    }
+    if (this.moduleInitNode && this.recordOfOwner.has(this.moduleInitNode)) {
+      this.moduleCtxGlobal = this.internGlobal("__modctx");
+    }
+  }
+  /** The capture layout of a callee with free variables `frees`: one slot per
+   *  distinct owner record (by record binding id), then one slot per cell-
+   *  resident binding (by binding id). Pure in `frees`, so creation sites, call
+   *  sites and the callee prologue agree. */
+  captureSlots(frees: ts.Symbol[]): CaptureSlot[] {
+    const cells: ts.Symbol[] = [];
+    const recs = new Map<ts.Node, ts.Symbol[]>();
+    for (const s of frees) {
+      const owner = this.captureContexts ? this.recordOwnerOf.get(s) : undefined;
+      if (owner === undefined) { cells.push(s); continue; }
+      let arr = recs.get(owner);
+      if (!arr) { arr = []; recs.set(owner, arr); }
+      arr.push(s);
+    }
+    const out: CaptureSlot[] = [];
+    const owners = [...recs.keys()].sort(
+      (a, b) => this.recordOfOwner.get(a)!.binding - this.recordOfOwner.get(b)!.binding);
+    for (const owner of owners) {
+      const rec = this.recordOfOwner.get(owner)!;
+      out.push({ kind: "record", owner, binding: rec.binding, classId: rec.classId, syms: recs.get(owner)! });
+    }
+    cells.sort((a, b) => this.bindingIdOf(a) - this.bindingIdOf(b));
+    for (const sym of cells) out.push({ kind: "cell", sym, binding: this.bindingIdOf(sym) });
+    return out;
+  }
+  private slotName(slot: CaptureSlot): string {
+    if (slot.kind === "cell") return (slot.sym as { name?: string }).name ?? "?";
+    return `<record of ${(slot.owner as { name?: { text?: string } }).name?.text ?? "fn"}>`;
+  }
+  /** The local holding `owner`'s record here: the function's own record, the
+   *  record parameter it received, or (module record only) a load of `__modctx`. */
+  private availableRecord(ctx: FnCtx, owner: ts.Node): number | undefined {
+    const held = ctx.recordLocals?.get(owner);
+    if (held !== undefined) return held;
+    if (owner === this.moduleInitNode && this.moduleCtxGlobal !== undefined) {
+      // Loaded at every use (never cached in recordLocals): a load emitted on
+      // one control-flow path is not available on another.
+      const rec = this.recordOfOwner.get(owner)!;
+      const lid = this.newLocal(ctx, "reference", "moduleCtx", rec.binding);
+      ctx.body.push({ kind: "LoadGlobal", dst: lid, gref: this.moduleCtxGlobal });
+      return lid;
+    }
+    return undefined;
+  }
+  /** Supply a capture slot at a creation/call site (module fallback allowed). */
+  private supplySlot(ctx: FnCtx, slot: CaptureSlot): number | undefined {
+    if (slot.kind === "cell") return this.availableCaptureCell(ctx, slot.sym);
+    return this.availableRecord(ctx, slot.owner);
+  }
+  /** Supply a capture slot strictly from what this function holds (ctor paths). */
+  private heldSlot(ctx: FnCtx, slot: CaptureSlot): number | undefined {
+    if (slot.kind === "cell") return ctx.cellAccess.get(slot.sym);
+    return ctx.recordLocals?.get(slot.owner);
+  }
+  /** Declare the leading parameter that receives one capture slot. */
+  private bindCaptureParam(ctx: FnCtx, slot: CaptureSlot): void {
+    if (slot.kind === "cell") {
+      const lid = this.newLocal(ctx, "reference", `cell_${(slot.sym as { name?: string }).name ?? "v"}`, slot.binding);
+      ctx.cellAccess.set(slot.sym, lid);
+      ctx.params.push(lid);
+      this.markCellParam(ctx, lid);
+      return;
+    }
+    const rec = this.recordOfOwner.get(slot.owner)!;
+    const lid = this.newLocal(ctx, "reference", `ctx_${(slot.owner as { name?: { text?: string } }).name?.text ?? "fn"}`, slot.binding);
+    (ctx.recordLocals ??= new Map()).set(slot.owner, lid);
+    for (const sym of slot.syms) (ctx.recordAccess ??= new Map()).set(sym, { obj: lid, field: rec.fields.get(sym)! });
+    ctx.params.push(lid);
+    (ctx.paramClasses ??= {})[lid] = slot.classId;
+  }
+  /** Where a captured binding's value lives in this function: (record, field) or (cell, VALUE). */
+  private capturedRef(ctx: FnCtx, sym: ts.Symbol): { obj: number; field: number } | undefined {
+    const r = ctx.recordAccess?.get(sym);
+    if (r !== undefined) return r;
+    const cell = ctx.cellAccess.get(sym);
+    if (cell !== undefined) return { obj: cell, field: this.VALUE };
+    return undefined;
+  }
+  hasCaptured(ctx: FnCtx, sym: ts.Symbol): boolean {
+    return (ctx.recordAccess?.has(sym) ?? false) || ctx.cellAccess.has(sym);
+  }
+  loadCaptured(ctx: FnCtx, sym: ts.Symbol, dst: number): void {
+    const r = this.capturedRef(ctx, sym)!;
+    ctx.body.push({ kind: "LoadField", dst, obj: r.obj, field: r.field });
+  }
+  storeCaptured(ctx: FnCtx, sym: ts.Symbol, src: number): void {
+    const r = this.capturedRef(ctx, sym)!;
+    ctx.body.push({ kind: "StoreField", obj: r.obj, field: r.field, src });
+  }
+  /** A module-scope binding published for methods (Step E): its record field,
+   *  or the cell loaded from its GLOBALS[] slot. */
+  private moduleCapturedRef(ctx: FnCtx, sym: ts.Symbol): { obj: number; field: number } | undefined {
+    const owner = this.captureContexts ? this.recordOwnerOf.get(sym) : undefined;
+    if (owner !== undefined) {
+      const rl = this.availableRecord(ctx, owner);
+      if (rl === undefined) return undefined;
+      return { obj: rl, field: this.recordOfOwner.get(owner)!.fields.get(sym)! };
+    }
+    const gid = this.moduleCellGlobal.get(sym);
+    if (gid === undefined) return undefined;
+    const cell = this.newLocal(ctx, "reference");
+    ctx.body.push({ kind: "LoadGlobal", dst: cell, gref: gid });
+    return { obj: cell, field: this.VALUE };
+  }
+  /** The object that carries `sym` for a single-binding closure capture (the
+   *  namespace export getter): record or cell, with the class and binding the
+   *  callee must declare for it. */
+  private captureContainer(ctx: FnCtx, sym: ts.Symbol):
+      { obj: number; field: number; binding: number; classId: number | undefined } | undefined {
+    const owner = this.captureContexts ? this.recordOwnerOf.get(sym) : undefined;
+    if (owner !== undefined) {
+      const rl = this.availableRecord(ctx, owner);
+      if (rl === undefined) return undefined;
+      const rec = this.recordOfOwner.get(owner)!;
+      return { obj: rl, field: rec.fields.get(sym)!, binding: rec.binding, classId: rec.classId };
+    }
+    const cell = this.availableCaptureCell(ctx, sym);
+    if (cell === undefined) return undefined;
+    return { obj: cell, field: this.VALUE, binding: this.bindingIdOf(sym), classId: this.cellClassId };
+  }
+
   private availableCaptureCell(ctx: FnCtx, sym: ts.Symbol): number | undefined {
     const local = ctx.cellAccess.get(sym);
     if (local !== undefined) return local;
@@ -1890,10 +2084,9 @@ class Exporter {
     if (!node || !isLiftable(node)) return undefined;
     const sym = !ts.isArrowFunction(node) && node.name ? this.symbolOf(node.name) : undefined;
     if (sym) {
-      const cell = ctx.cellAccess.get(sym);
-      if (cell !== undefined) {
+      if (this.hasCaptured(ctx, sym)) {
         const value = this.newLocal(ctx, "reference", "callee");
-        ctx.body.push({ kind: "LoadField", dst: value, obj: cell, field: this.VALUE });
+        this.loadCaptured(ctx, sym, value);
         return value;
       }
       const global = this.functionValueGlobal.get(sym);
@@ -1904,10 +2097,10 @@ class Exporter {
       }
     }
     const captures: { binding: number; cell: number }[] = [];
-    for (const sym of this.sortedFreeVars(node)) {
-      const cell = this.availableCaptureCell(ctx, sym);
+    for (const slot of this.captureSlots(this.sortedFreeVars(node))) {
+      const cell = this.supplySlot(ctx, slot);
       if (cell === undefined) return undefined;
-      captures.push({ binding: this.bindingIdOf(sym), cell });
+      captures.push({ binding: slot.binding, cell });
     }
     const value = this.newLocal(ctx, "reference", "callee");
     const site = this.site++;
@@ -1933,8 +2126,8 @@ class Exporter {
     }
     if (frees.length === 0) return [];
     const out: number[] = [];
-    for (const s of frees) {
-      const cell = this.availableCaptureCell(ctx, s);
+    for (const slot of this.captureSlots(frees)) {
+      const cell = this.supplySlot(ctx, slot);
       if (cell !== undefined) out.push(cell);
       else {
         // Caller doesn't hold a cell the callee needs. With the freeVars
@@ -1943,7 +2136,7 @@ class Exporter {
         // miscompile (the callee read garbage through the missing cell).
         this.unsupported(
           node,
-          `direct call cannot thread captured cell '${(s as { name?: string }).name ?? "?"}' (caller does not hold it)`
+          `direct call cannot thread captured cell '${this.slotName(slot)}' (caller does not hold it)`
         );
         const u = this.newLocal(ctx, "reference", "missingCell");
         out.push(u);
@@ -1965,8 +2158,8 @@ class Exporter {
     if (!node) return [];
     const frees = this.sortedFreeVars(node as FnLike).filter((s) => !this.moduleCellGlobal.has(s));
     const out: number[] = [];
-    for (const s of frees) {
-      const cell = ctx.cellAccess.get(s);
+    for (const slot of this.captureSlots(frees)) {
+      const cell = this.heldSlot(ctx, slot);
       if (cell === undefined) return null; // cross-scope capture: can't supply -> reject
       out.push(cell);
     }
@@ -1980,10 +2173,10 @@ class Exporter {
     if (!node) return [];
     const frees = this.sortedFreeVars(node as FnLike).filter((s) => !this.moduleCellGlobal.has(s));
     const out: { binding: number; cell: number }[] = [];
-    for (const s of frees) {
-      const cell = ctx.cellAccess.get(s);
+    for (const slot of this.captureSlots(frees)) {
+      const cell = this.heldSlot(ctx, slot);
       if (cell === undefined) return null;
-      out.push({ binding: this.bindingIdOf(s), cell });
+      out.push({ binding: slot.binding, cell });
     }
     return out;
   }
@@ -2427,8 +2620,8 @@ class Exporter {
   }
 
   private defineModuleExportGetter(ctx: FnCtx, obj: number, name: string, sym: ts.Symbol, node: ts.Node): void {
-    const cell = this.availableCaptureCell(ctx, sym);
-    if (cell === undefined) {
+    const cont = this.captureContainer(ctx, sym);
+    if (cont === undefined) {
       this.unsupported(node, `namespace export '${name}' has no binding cell`);
       return;
     }
@@ -2439,15 +2632,15 @@ class Exporter {
       this.functions.push({
         id: func, name: `__get_export_${name}`, params: [0], ret: 0,
         locals: [{ id: 0, typeId: 0, refKind: "reference" }, { id: 1, typeId: 0, refKind: "reference" }],
-        body: [{ kind: "LoadField", dst: 1, obj: 0, field: this.VALUE }, { kind: "Return", src: 1 }],
-        isExported: false, paramClasses: this.cellClassId !== undefined ? { 0: this.cellClassId } : {}, restParam: null,
+        body: [{ kind: "LoadField", dst: 1, obj: 0, field: cont.field }, { kind: "Return", src: 1 }],
+        isExported: false, paramClasses: cont.classId !== undefined ? { 0: cont.classId } : {}, restParam: null,
         isAsync: false, isGenerator: false, takesThis: false, captureCount: 1, arity: 0, hasPrototype: false,
       });
     }
     const getter = this.newLocal(ctx, "reference");
     const site = this.site++;
     this.recordSite(site, "closure", "once", true, node);
-    ctx.body.push({ kind: "AllocClosure", dst: getter, func, captures: [{ binding: this.bindingIdOf(sym), cell }], site });
+    ctx.body.push({ kind: "AllocClosure", dst: getter, func, captures: [{ binding: cont.binding, cell: cont.obj }], site });
     const key = this.constString(ctx, name);
     const setter = this.newLocal(ctx, "reference");
     ctx.body.push({ kind: "Const", dst: setter, value: { kind: "Undef" } });
@@ -2470,8 +2663,7 @@ class Exporter {
     this.moduleNamespaceLocals.set(modSym, obj);
     // `ns` references unwrap (symbolOf) to the module symbol; bind it there. Also
     // bind the alias symbol itself defensively.
-    const cell = ctx.cellAccess.get(modSym);
-    if (cell !== undefined) ctx.body.push({ kind: "StoreField", obj: cell, field: this.VALUE, src: obj });
+    if (this.hasCaptured(ctx, modSym)) this.storeCaptured(ctx, modSym, obj);
     else this.ensureLocalAlias(ctx, modSym, obj);
     const aliasSym = this.checker.getSymbolAtLocation(nb.name);
     if (aliasSym && aliasSym !== modSym) this.ensureLocalAlias(ctx, aliasSym, obj);
@@ -2513,7 +2705,7 @@ class Exporter {
     // bind a symbol to a value: through its cell if captured, else a local alias.
     const bindSym = (sym: ts.Symbol | undefined, local: number) => {
       if (!sym) return;
-      if (ctx.cellAccess.has(sym)) ctx.body.push({ kind: "StoreField", obj: ctx.cellAccess.get(sym)!, field: this.VALUE, src: local });
+      if (this.hasCaptured(ctx, sym)) this.storeCaptured(ctx, sym, local);
       else this.ensureLocalAlias(ctx, sym, local);
     };
     // Target object: a namespace merged with a same-named CLASS installs its
@@ -2530,9 +2722,9 @@ class Exporter {
       // Reuse an existing object for repeated `namespace N {}` declarations (merge).
       const already = nsym !== undefined && this.materializedNamespaces.has(nsym);
       if (already && nsym) {
-        if (ctx.cellAccess.has(nsym)) {
+        if (this.hasCaptured(ctx, nsym)) {
           obj = this.newLocal(ctx, "reference", (stmt.name as ts.Identifier).text);
-          ctx.body.push({ kind: "LoadField", dst: obj, obj: ctx.cellAccess.get(nsym)!, field: this.VALUE });
+          this.loadCaptured(ctx, nsym, obj);
         } else {
           obj = ctx.localOfSymbol.get(nsym)!;
         }
@@ -2562,10 +2754,9 @@ class Exporter {
               const sym = this.symbolOf(name);
               if (!sym) return;
               let value = ctx.localOfSymbol.get(sym);
-              const cell = ctx.cellAccess.get(sym);
-              if (cell !== undefined) {
+              if (this.hasCaptured(ctx, sym)) {
                 value = this.newLocal(ctx, "reference");
-                ctx.body.push({ kind: "LoadField", dst: value, obj: cell, field: this.VALUE });
+                this.loadCaptured(ctx, sym, value);
               }
               if (value !== undefined) put(name.text, value);
             } else for (const el of name.elements) if (ts.isBindingElement(el)) publish(el.name);
@@ -2636,8 +2827,8 @@ class Exporter {
       }
     }
     if (esym) {
-      if (ctx.cellAccess.has(esym)) {
-        ctx.body.push({ kind: "StoreField", obj: ctx.cellAccess.get(esym)!, field: this.VALUE, src: obj });
+      if (this.hasCaptured(ctx, esym)) {
+        this.storeCaptured(ctx, esym, obj);
       } else {
         this.ensureLocalAlias(ctx, esym, obj);
       }
@@ -5033,7 +5224,7 @@ class Exporter {
       if (callee.kind === "Direct" && recv === undefined) {
         const target = this.fnNodeById(callee.func);
         const unavailable = target && this.sortedFreeVars(target as FnLike).some((s) =>
-          !ctx.cellAccess.has(s) && !this.moduleCellGlobal.has(s));
+          !this.hasCaptured(ctx, s) && !this.moduleCellGlobal.has(s));
         // Fixed-ABI helpers may not hold every module cell. The already-created
         // function value carries the environment. It also supplies captured
         // arguments and `this` correctly when the call has a spread list.
@@ -5875,10 +6066,9 @@ class Exporter {
       ctx.body.push({ kind: "Const", dst, value: { kind: "Undef" } });
       return dst;
     }
-    if (sym && ctx.cellAccess.has(sym)) {
-      const cell = ctx.cellAccess.get(sym)!;
+    if (sym && this.hasCaptured(ctx, sym)) {
       const dst = this.newLocal(ctx, this.refKindOf(node));
-      ctx.body.push({ kind: "LoadField", dst, obj: cell, field: this.VALUE });
+      this.loadCaptured(ctx, sym, dst);
       return dst;
     }
     if (sym && ctx.localOfSymbol.has(sym)) {
@@ -5889,11 +6079,9 @@ class Exporter {
     // cell from the global, then read its .VALUE. Only applies when the binding
     // isn't already available as a threaded cell (handled above).
     if (sym && this.moduleCellGlobal.has(sym)) {
-      const gid = this.moduleCellGlobal.get(sym)!;
-      const cell = this.newLocal(ctx, "reference");
-      ctx.body.push({ kind: "LoadGlobal", dst: cell, gref: gid });
+      const ref = this.moduleCapturedRef(ctx, sym)!;
       const dst = this.newLocal(ctx, this.refKindOf(node));
-      ctx.body.push({ kind: "LoadField", dst, obj: cell, field: this.VALUE });
+      ctx.body.push({ kind: "LoadField", dst, obj: ref.obj, field: ref.field });
       return dst;
     }
     // Fallback for class values that do not have a stored lexical binding in this
@@ -6043,18 +6231,16 @@ class Exporter {
   }
 
   loadBoundClassValue(ctx: FnCtx, sym: ts.Symbol, hint?: string): number | undefined {
-    if (ctx.cellAccess.has(sym)) {
-      const cell = ctx.cellAccess.get(sym)!;
+    if (this.hasCaptured(ctx, sym)) {
       const dst = this.newLocal(ctx, "reference", hint);
-      ctx.body.push({ kind: "LoadField", dst, obj: cell, field: this.VALUE });
+      this.loadCaptured(ctx, sym, dst);
       return dst;
     }
     if (ctx.localOfSymbol.has(sym)) return ctx.localOfSymbol.get(sym)!;
     if (this.moduleCellGlobal.has(sym)) {
-      const cell = this.newLocal(ctx, "reference", hint);
-      ctx.body.push({ kind: "LoadGlobal", dst: cell, gref: this.moduleCellGlobal.get(sym)! });
+      const ref = this.moduleCapturedRef(ctx, sym)!;
       const dst = this.newLocal(ctx, "reference", hint);
-      ctx.body.push({ kind: "LoadField", dst, obj: cell, field: this.VALUE });
+      ctx.body.push({ kind: "LoadField", dst, obj: ref.obj, field: ref.field });
       return dst;
     }
     return undefined;
@@ -6917,12 +7103,8 @@ class Exporter {
     // lowering reads each `x` through ctx.cellAccess. Mirrors lowerFunctionLike's
     // emitCells ([cells..., this]) and an explicit ctor's classValueCaptures.
     const frees = this.synthCtorFreeVars(classId);
-    for (const s of frees) {
-      const lid = this.newLocal(ctx, "reference", `cell_${(s as any).name ?? "v"}`, this.bindingIdOf(s));
-      ctx.cellAccess.set(s, lid);
-      ctx.params.push(lid);
-      this.markCellParam(ctx, lid);
-    }
+    const captureSlots = this.captureSlots(frees);
+    for (const slot of captureSlots) this.bindCaptureParam(ctx, slot);
     const tid = this.newLocal(ctx, "reference", "this");
     ctx.params.push(tid);          // arg0 = this (the freshly allocated instance)
     ctx.thisLocal = tid;
@@ -6945,7 +7127,7 @@ class Exporter {
     this.functions.push({
       id: fnId, name, params: ctx.params, ret: 0, locals: ctx.locals, body: ctx.body,
       isExported: false, paramClasses: ctx.paramClasses || {}, restParam: restLid,
-      isAsync: false, isGenerator: false, takesThis: true, captureCount: frees.length, arity: 0,
+      isAsync: false, isGenerator: false, takesThis: true, captureCount: captureSlots.length, arity: 0,
     });
     return fnId;
   }
@@ -7006,10 +7188,10 @@ class Exporter {
    *  rather than threading a garbage cell. Mirrors classValueCaptures for synth. */
   synthClassValueCaptures(ctx: FnCtx, classId: number): { binding: number; cell: number }[] | null {
     const out: { binding: number; cell: number }[] = [];
-    for (const s of this.synthCtorFreeVars(classId)) {
-      const cell = ctx.cellAccess.get(s);
+    for (const slot of this.captureSlots(this.synthCtorFreeVars(classId))) {
+      const cell = this.heldSlot(ctx, slot);
       if (cell === undefined) return null;
-      out.push({ binding: this.bindingIdOf(s), cell });
+      out.push({ binding: slot.binding, cell });
     }
     return out;
   }
@@ -8235,8 +8417,8 @@ class Exporter {
       const sym = this.symbolOf(pat);
       if (this.isScriptGlobalVarSymbol(sym, pat.text)) {
         this.storeGlobalObjectProperty(ctx, pat.text, src);
-      } else if (sym && ctx.cellAccess.has(sym)) {
-        ctx.body.push({ kind: "StoreField", obj: ctx.cellAccess.get(sym)!, field: this.VALUE, src });
+      } else if (sym && this.hasCaptured(ctx, sym)) {
+        this.storeCaptured(ctx, sym, src);
       } else {
         const lid = sym ? this.ensureLocal(ctx, sym, this.refKindOf(pat), pat.text)
                         : this.newLocal(ctx, this.refKindOf(pat), pat.text);
@@ -9175,15 +9357,13 @@ class Exporter {
         this.storeGlobalObjectProperty(ctx, lhs.text, rhs);
       } else if (this.isLexicalTdzUse(lhs, sym)) {
         this.unsupported(lhs, `TDZ write of '${lhs.text}' before initialization`);
-      } else if (sym && ctx.cellAccess.has(sym)) {
-        ctx.body.push({ kind: "StoreField", obj: ctx.cellAccess.get(sym)!, field: this.VALUE, src: rhs });
+      } else if (sym && this.hasCaptured(ctx, sym)) {
+        this.storeCaptured(ctx, sym, rhs);
       } else if (sym && this.moduleCellGlobal.has(sym)) {
-        // Step E: write to a module cell from a method — load the cell from its
-        // GLOBALS[] slot and store into its .VALUE.
-        const gid = this.moduleCellGlobal.get(sym)!;
-        const cell = this.newLocal(ctx, "reference");
-        ctx.body.push({ kind: "LoadGlobal", dst: cell, gref: gid });
-        ctx.body.push({ kind: "StoreField", obj: cell, field: this.VALUE, src: rhs });
+        // Step E: write to a module binding from a method — its record field,
+        // or the cell loaded from its GLOBALS[] slot.
+        const ref = this.moduleCapturedRef(ctx, sym)!;
+        ctx.body.push({ kind: "StoreField", obj: ref.obj, field: ref.field, src: rhs });
       } else if (sym) {
         // Step B: module bindings no longer use StoreGlobal; fall through to a
         // function-local store (cells come in Step C). See lowerIdentifier.
@@ -9378,13 +9558,11 @@ class Exporter {
           // Location(p.name) yields the property symbol, so resolve the value
           // symbol explicitly and store into its existing local.
           const vsym = this.checker.getShorthandAssignmentValueSymbol(p) ?? this.symbolOf(p.name);
-          if (vsym && ctx.cellAccess.has(vsym)) {
-            ctx.body.push({ kind: "StoreField", obj: ctx.cellAccess.get(vsym)!, field: this.VALUE, src: valL });
+          if (vsym && this.hasCaptured(ctx, vsym)) {
+            this.storeCaptured(ctx, vsym, valL);
           } else if (vsym && this.moduleCellGlobal.has(vsym)) {
-            const gid = this.moduleCellGlobal.get(vsym)!;
-            const cell = this.newLocal(ctx, "reference");
-            ctx.body.push({ kind: "LoadGlobal", dst: cell, gref: gid });
-            ctx.body.push({ kind: "StoreField", obj: cell, field: this.VALUE, src: valL });
+            const ref = this.moduleCapturedRef(ctx, vsym)!;
+            ctx.body.push({ kind: "StoreField", obj: ref.obj, field: ref.field, src: valL });
           } else if (vsym) {
             const lid = this.ensureLocal(ctx, vsym, this.refKindOf(p.name), p.name.text);
             ctx.body.push({ kind: "Copy", dst: lid, src: valL });
@@ -9485,12 +9663,12 @@ class Exporter {
     const frees = this.sortedFreeVars(node).filter((s) => !(methodLike && this.moduleCellGlobal.has(s)));
     if (process.env.TSAOT_DEBUG_CELLS)
       console.error(`[closure] ${ctx.name}->${hint ?? fnId} self=${selfSym?.name}:${selfNeeded} captures=${frees.map((s) => `${s.name}:${s === selfSym}:${ctx.cellAccess.has(s)}`).join(",")}`);
-    const captures = frees.map((s) => {
-      const cell = this.availableCaptureCell(ctx, s);
+    const captures = this.captureSlots(frees).map((slot) => {
+      const cell = this.supplySlot(ctx, slot);
       if (cell === undefined)
-        this.unsupported(node, `closure cannot capture '${s.name}' (binding is unavailable)`);
+        this.unsupported(node, `closure cannot capture '${this.slotName(slot)}' (binding is unavailable)`);
       const cellLocal = cell ?? this.newLocal(ctx, "reference", "missingCell");
-      return { binding: this.bindingIdOf(s), cell: cellLocal };
+      return { binding: slot.binding, cell: cellLocal };
     });
     // Append the lexical-this capture (if this arrow uses `this`).
     if (arrowThis) {
@@ -9599,15 +9777,15 @@ class Exporter {
               const r = this.lowerExpr(ctx, d.initializer, d.name.text);
               this.storeGlobalObjectProperty(ctx, d.name.text, r);
             }
-          } else if (sym && ctx.cellAccess.has(sym)) {
-            // captured binding: cell is pre-allocated in the prologue
+          } else if (sym && this.hasCaptured(ctx, sym)) {
+            // captured binding: its cell or record slot is pre-allocated in the prologue
             if (d.initializer) {
               const r = this.lowerExpr(ctx, d.initializer, d.name.text);
-              ctx.body.push({ kind: "StoreField", obj: ctx.cellAccess.get(sym)!, field: this.VALUE, src: r });
+              this.storeCaptured(ctx, sym, r);
             } else if (isLexical) {
               const value = this.newLocal(ctx, "reference");
               ctx.body.push({ kind: "Const", dst: value, value: { kind: "Undef" } });
-              ctx.body.push({ kind: "StoreField", obj: ctx.cellAccess.get(sym)!, field: this.VALUE, src: value });
+              this.storeCaptured(ctx, sym, value);
             }
           } else {
             const lid = sym
@@ -10071,7 +10249,7 @@ class Exporter {
       // nested function declaration: lift it, and bind its closure to the name
       const sym = this.symbolOf(stmt.name);
       const dst = this.lowerClosure(ctx, stmt, stmt.name.text);
-      if (sym && !ctx.cellAccess.has(sym)) this.ensureLocalAlias(ctx, sym, dst);
+      if (sym && !this.hasCaptured(ctx, sym)) this.ensureLocalAlias(ctx, sym, dst);
     } else if (ts.isClassDeclaration(stmt)) {
       // Class declarations create one constructor value at the declaration's
       // runtime position and bind that value lexically. Identifier reads then load
@@ -10082,8 +10260,8 @@ class Exporter {
       if (stmt.name && csym && cid !== undefined) {
         classValue = this.emitClassValue(ctx, cid, stmt.name.text, stmt, false);
         if (classValue !== undefined) {
-          if (ctx.cellAccess.has(csym)) {
-            ctx.body.push({ kind: "StoreField", obj: ctx.cellAccess.get(csym)!, field: this.VALUE, src: classValue.local });
+          if (this.hasCaptured(ctx, csym)) {
+            this.storeCaptured(ctx, csym, classValue.local);
           } else {
             this.ensureLocalAlias(ctx, csym, classValue.local);
           }
@@ -10176,8 +10354,8 @@ class Exporter {
       const dst = this.lowerClosure(ctx, fd, fd.name!.text);
       if (this.isScriptGlobalVarSymbol(sym, fd.name!.text)) {
         this.storeGlobalObjectProperty(ctx, fd.name!.text, dst);
-      } else if (ctx.cellAccess.has(sym)) {
-        ctx.body.push({ kind: "StoreField", obj: ctx.cellAccess.get(sym)!, field: this.VALUE, src: dst });
+      } else if (this.hasCaptured(ctx, sym)) {
+        this.storeCaptured(ctx, sym, dst);
       } else {
         this.ensureLocalAlias(ctx, sym, dst);
       }
@@ -10194,8 +10372,8 @@ class Exporter {
         this.declareGlobalVarProperty(ctx, id.text);
         continue;
       }
-      if (ctx.cellAccess.has(sym)) {
-        // cell var: leave undefined (AllocObject default is undefined) — fine.
+      if (this.hasCaptured(ctx, sym)) {
+        // captured var: its cell or record field already starts as undefined.
         continue;
       }
       // plain local: ensure it exists and init to undefined.
@@ -10307,13 +10485,9 @@ class Exporter {
         ctx.staticClass = classId;
       }
     };
+    const captureSlots = this.captureSlots(freeVars);
     const emitCells = () => {
-      for (const s of freeVars) {
-        const lid = this.newLocal(ctx, "reference", `cell_${(s as any).name ?? "v"}`, this.bindingIdOf(s));
-        ctx.cellAccess.set(s, lid);
-        ctx.params.push(lid);
-        this.markCellParam(ctx, lid);
-      }
+      for (const slot of captureSlots) this.bindCaptureParam(ctx, slot);
       if (arrowThis) {
         // trailing lexical-this cell param; body reads `this` from its VALUE.
         const lid = this.newLocal(ctx, "reference", "cell_this", this.bindingIdOf(this.lexicalThisSym));
@@ -10327,7 +10501,7 @@ class Exporter {
     };
     if (hasCaptures) { emitCells(); emitThis(); }   // [cells..., this]
     else { emitThis(); }                            // [this] (no cells)
-    ctx.captureCount = hasCaptures ? freeVars.length + (arrowThis ? 1 : 0) : 0;
+    ctx.captureCount = hasCaptures ? captureSlots.length + (arrowThis ? 1 : 0) : 0;
     if (!ts.isArrowFunction(node)) ctx.argumentsOffset = ctx.params.length;
     // 2. real parameters
     const parameterBindings: { node: ts.ParameterDeclaration; local: number }[] = [];
@@ -10374,10 +10548,26 @@ class Exporter {
         if (pcid !== undefined) (ctx.paramClasses ||= {})[String(lid)] = pcid;
       } catch { /* ignore */ }
     }
-    // 3. prologue: pre-allocate cells this function OWNS (declared here & captured)
+    // 3. prologue: the scope record for the record-resident bindings this
+    // function owns (one allocation; fields start as undefined), then a cell
+    // for every other captured binding it owns (declared here & captured).
     const decl = this.declaredIn(node);
+    const ownRecord = this.captureContexts ? this.recordOfOwner.get(node as ts.Node) : undefined;
+    if (ownRecord) {
+      const site = this.site++;
+      const rl = this.newLocal(ctx, "reference", `ctx_${name}`, ownRecord.binding);
+      this.labels[site] = `ctx@${name}`;
+      // the synthetic __module_init node has no source position
+      this.recordSite(site, "cell", "once", true, (node as ts.Node).pos >= 0 ? (node as ts.Node) : undefined, true);
+      ctx.body.push({ kind: "AllocObject", dst: rl, typeId: 0, site, classId: ownRecord.classId });
+      (ctx.recordLocals ??= new Map()).set(node as ts.Node, rl);
+      for (const s of ownRecord.syms) (ctx.recordAccess ??= new Map()).set(s, { obj: rl, field: ownRecord.fields.get(s)! });
+      if (node === (this.moduleInitNode as unknown as FnLike) && this.moduleCtxGlobal !== undefined) {
+        ctx.body.push({ kind: "StoreGlobal", gref: this.moduleCtxGlobal, src: rl });
+      }
+    }
     for (const s of decl) {
-      if (this.cellBindings.has(s) && !ctx.cellAccess.has(s)) {
+      if (this.cellBindings.has(s) && !ctx.cellAccess.has(s) && !(ownRecord && ownRecord.fields.has(s))) {
         const site = this.site++;
         const cell = this.newLocal(ctx, "reference", `cell_${(s as any).name ?? "v"}`, this.bindingIdOf(s));
         this.labels[site] = `cell:${(s as any).name ?? "cell"}@${name}`;
@@ -10411,9 +10601,7 @@ class Exporter {
         this.lowerBindingPattern(ctx, p.name, binding.local);
       } else {
         const psym = this.symbolOf(p.name);
-        const cell = psym && ctx.cellAccess.get(psym);
-        if (cell !== undefined)
-          ctx.body.push({ kind: "StoreField", obj: cell, field: this.VALUE, src: binding.local });
+        if (psym && this.hasCaptured(ctx, psym)) this.storeCaptured(ctx, psym, binding.local);
       }
     }
     // 3b. parameter properties: `constructor(public x)` implies `this.x = x`
@@ -11597,6 +11785,10 @@ class Exporter {
         }
       }
     }
+
+    // Capture contexts: group the record-resident captured bindings per owner
+    // and declare the scope record classes (the cell binding set is final here).
+    this.buildCaptureRecords();
 
     // lower top-level function declarations of EVERY module; nested ones lifted on demand
     for (const sf of this.modules) for (const stmt of sf.statements) {

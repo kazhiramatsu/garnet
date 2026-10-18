@@ -134,7 +134,11 @@ Slices:
    Status: slice C5a (typed cells: every cell is an instance of the synthetic
    class `__cell`, so reads and writes are struct accesses instead of cached
    property lookups) landed in Session 350: 15.29 → 12.89 s (15.7% less).
-   The scope-record slices (C5b) build on it.
+   Slice C5b-1 (scope records for function-scope bindings, closures capture
+   the record; `docs/capture_contexts_design.md`) landed in the same session:
+   13.54 → 11.94 s (11.8% less). Remaining: block records for per-iteration
+   bindings (C5b-2), unboxed numeric record fields (C5b-3), raw record
+   pointers once the old generation is pointer-stable (C5b-4).
 
 ## Track D — collector
 

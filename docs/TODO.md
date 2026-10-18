@@ -4159,6 +4159,36 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   selfconf 398 + 11 KNOWN (DIFF 0, CCFAIL 0), parity 329 identical + 79
   KNOWN (DIFF 0, 1 skip), runtime and Rust unit suites, all 102 benchmarks
   correct and within budget. Nothing is committed yet.
+- Slice C5b-1, capture contexts (`docs/capture_contexts_design.md`). A
+  function's captured bindings now live in one scope record per activation
+  (a synthetic class `__ctx_<fn>` with one boxed field per binding) instead
+  of one `__cell` each; closures and direct callees capture the record (one
+  handle per owner function) and read the bindings as struct fields.
+  Bindings declared inside loops keep their per-iteration cells, as do the
+  lexical-`this` cell and the self cell of named function expressions. The
+  capture layout (record slots by owner, then cell slots) is a pure function
+  of the callee's free variables, so creation sites, direct calls, class
+  constructors and the callee prologue agree; `__module_init`'s record is
+  published in the global `__modctx` for methods, which cannot receive
+  capture parameters. `TSAOT_CAPTURE_CONTEXTS=0` keeps the per-variable
+  cells (the parity corpus is exported with it). The generated compiler
+  shrinks from 67.4 MB to 62.1 MB of C. Fixture `closures/capture_contexts`.
+  The first compiler build failed at startup (`Cannot read properties of
+  undefined (reading 'c11432')`) although conformance was green: a method's
+  load of `__modctx` was cached per function, so a load emitted inside a
+  branch was reused on the other path. Loads of the module record are now
+  emitted at every use (a 6-line probe reproduced it; the fixture carries the
+  case).
+  Gates on the final tree: conformance 413/413, runtime inline policy, GC
+  stress, bundler 42/42, selfconf 399 + 11 KNOWN (DIFF 0), parity 329
+  identical + 80 KNOWN (the new fixture's for-of inside the iterator-close
+  finally region is laid out differently by the frozen emitter, same category
+  as `closures/forof_loop_capture`), runtime and Rust units, all 102
+  benchmarks correct and within budget. Compiler A/B against the typed-
+  cell build (alternating three runs, diagnostics and all 78 emitted files
+  validated against Node): **13.542 → 11.940 s median wall (11.8% less,
+  1.13x)**, process CPU 13.5 → 11.9 s, peak RSS 1.27 → 1.26 GB; Node 3.361 s
+  in the same session, so the native compiler is now 3.55x slower than V8.
 - Next slices, in the order agreed for the closure-heavy compiler
   (`docs/v8_parity_roadmap.md`): C5b capture contexts (one scope record per
   activation holding the captured variables as fixed-offset fields, a single

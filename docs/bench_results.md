@@ -576,3 +576,24 @@ largest single step of the session: the compiler's factory-style closures
 read their captured state constantly, and each read lost a property-cache
 probe. Native is now 4.0x slower than V8 on this machine state (7.3x at the
 start of Session 349). Raw record: `native_s350g/results/run-kelqcyte/`.
+
+### Capture contexts (Session 350, slice C5b-1)
+
+A function's captured bindings live in one scope record per activation
+(`docs/capture_contexts_design.md`); closures and nested callees capture the
+record instead of one cell per variable, so a call of a nested checker
+function copies one handle instead of up to 249 and its frame shrinks
+accordingly. The pair below differs only in that exporter change. Three
+alternating runs after warmup, diagnostics and all 78 emitted files matching
+Node on every launch:
+
+| executable | median wall | median process CPU | median peak RSS |
+|---|---:|---:|---:|
+| Node 25.2.1 / V8 | 3.361 s | 6.2 s | 0.79 GB |
+| Typed-cell build (`native_s350g/tsc-native`) | 13.542 s | 13.5 s | 1.27 GB |
+| Capture-context build (`native_s350h/tsc-native`) | **11.940 s** | **11.9 s** | 1.26 GB |
+
+That is **11.8% less wall time** (1.13x). The generated C shrank from 67.4
+to 62.1 MB (fewer cell allocations and environment copies). Native is now
+3.55x slower than V8 on this machine state (7.3x at the start of Session
+349). Raw record: `native_s350h/results/run-pk3jrt0a/`.
