@@ -168,16 +168,26 @@ static inline ts_gc_header* ts_handle_entry_cell(uintptr_t entry){
    live cell is a load; non-heap (stack/SROA) cells and NULL go out of line. */
 static inline tsv ts_heap_ref_fast(uint16_t sel, void* p) {
   if (TS_RT_LIKELY(p != NULL)){
-    uint64_t handle = ((const ts_gc_header*)p)->handle;
+    const ts_gc_header* h = (const ts_gc_header*)p;
+    /* an old cell never moves: reference it by address */
+    if (h->gen == TS_GEN_OLD) return TS_BOX(sel, (uintptr_t)p);
+    uint64_t handle = h->handle;
     if (TS_RT_LIKELY(handle != 0)) return TS_BOX(sel, handle);
   }
   return ts_heap_ref_value(sel, p);
 }
+/* Heap reference payload forms (docs/pointer_stable_old_gen_design.md):
+   bit 0 set = handle (slot << 1 | 1), the only form for a young cell;
+   bit 0 clear, bit 47 clear = the address of an old cell (never moves);
+   bit 0 clear, bit 47 set = the address of a stack/SROA/static cell
+   (TS_GEN_NONHEAP). Static literals and stack cells are only 8-byte aligned,
+   so the tag lives above the user address space, not in the low bits. */
+#define TS_PTR_STACK_TAG ((uint64_t)1u << 47)
 static inline void* ts_ptr(tsv v) {
   uint64_t payload = v & TS_PAYLOAD_MASK;
   return (payload & 1u)
     ? (void*)ts_handle_entry_cell((uintptr_t)g_ts_handle_table[payload >> 1])
-    : (void*)(uintptr_t)payload;
+    : (void*)(uintptr_t)(payload & ~TS_PTR_STACK_TAG);
 }
 static inline tsv ts_obj(void* p) { return ts_heap_ref_fast(TS_SEL_OBJECT, p); }
 static inline tsv ts_str_v(void* p){ return ts_heap_ref_fast(TS_SEL_STRING, p); }
@@ -1335,11 +1345,17 @@ tsv  ts_str_concat_many(tsv* args, int n);
 /* JS `===`. Identical bits are equal unless NaN; distinct bits can only be
    equal for two numbers (+0/-0) or two strings, which compare out of line. */
 int  ts_strict_eq_slow(tsv a, tsv b);
+/* Identity of two heap references whose bits differ: equal exactly when one
+   is a handle and the other a pointer to the same cell (handle slots and
+   addresses are each unique among live cells). Callers check the selectors. */
+static inline int ts_same_cell(tsv a, tsv b){
+  return TS_TOP16(a) == TS_TOP16(b) && (((a ^ b) & 1u) != 0) && ts_ptr(a) == ts_ptr(b);
+}
 static inline int ts_strict_eq(tsv a, tsv b){
   if (a == b) return !(ts_is_num(a) && ts_to_num(a) != ts_to_num(a));
   if (ts_is_num(a) || ts_is_num(b)) return ts_is_num(a) && ts_is_num(b) && ts_to_num(a) == ts_to_num(b);
-  if (!(ts_is_str(a) && ts_is_str(b))) return 0;
-  return ts_strict_eq_slow(a, b);
+  if (ts_is_str(a) && ts_is_str(b)) return ts_strict_eq_slow(a, b);
+  return (ts_is_obj(a) || ts_is_func(a)) && ts_same_cell(a, b);
 }
 int  ts_relational(tsv a, tsv b, int op);  /* 0:< 1:<= 2:> 3:>= */
 int  ts_loose_eq(tsv a, tsv b);            /* == (returns 1/0) */
@@ -1350,6 +1366,9 @@ tsv  ts_dynamic_method_unsupported(void); /* traps: truly-unknown callee */
 void ts_dynamic_method_missing(uint32_t name_field); /* throws TypeError: <name> is not a function */
 void ts_check_method_recv(tsv recv, uint32_t name_field); /* throws if recv is null/undefined */
 void ts_throw_not_a_function(const char* name); /* throws TypeError: <name>/value is not a function */
+/* diagnostic per-site allocation counters (TSAOT_SITE_STATS=1 builds only) */
+void ts_site_note(uint32_t site, uint32_t func);
+void ts_site_stats_init(const char** fn_names, uint32_t nfn);
 void ts_print(tsv v);                 /* console.log of one value */
 void ts_console_log(tsv* args, int n); /* console.log/.info/.debug (stdout) */
 void ts_console_err(tsv* args, int n); /* console.warn/.error (stderr) */
@@ -1416,16 +1435,17 @@ static inline void ts_write_barrier(tsv owner, tsv value){
   if (!(ts_is_obj(value)||ts_is_func(value)||ts_is_heap_str(value))) return;
   if (!(ts_is_obj(owner)||ts_is_func(owner)||ts_is_heap_str(owner))) return;
   uint64_t op = owner & TS_PAYLOAD_MASK, vp = value & TS_PAYLOAD_MASK;
-  if ((op & 1u) && (vp & 1u)){
-    /* Both are handle references (heap cells): classify from the table. */
+  /* A pointer-form value is old or on the stack: never a young pointee. */
+  if (!(vp & 1u)) return;
+  uintptr_t ve = (uintptr_t)g_ts_handle_table[vp >> 1];
+  if (ve & TS_HANDLE_OLD_BIT) return;
+  if (op & 1u){
     uintptr_t oe = (uintptr_t)g_ts_handle_table[op >> 1];
-    uintptr_t ve = (uintptr_t)g_ts_handle_table[vp >> 1];
-    if ((oe & TS_HANDLE_OLD_BIT) && !(ve & TS_HANDLE_OLD_BIT)) ts_gc_remember(ts_handle_entry_cell(oe));
+    if (oe & TS_HANDLE_OLD_BIT) ts_gc_remember(ts_handle_entry_cell(oe));
     return;
   }
-  ts_gc_header* o = (ts_gc_header*)ts_ptr(owner);
-  ts_gc_header* v = (ts_gc_header*)ts_ptr(value);
-  if (o->gen == TS_GEN_OLD && v->gen == TS_GEN_YOUNG) ts_gc_remember(o);
+  if (op & TS_PTR_STACK_TAG) return; /* a stack owner is scanned as a root */
+  ts_gc_remember((ts_gc_header*)(uintptr_t)op); /* old-pointer owner */
 }
 /* Ordinary shape hits keep their compact cache and original guard sequence.
    Sized receivers use a separate bounded location table in ts_rt.c.

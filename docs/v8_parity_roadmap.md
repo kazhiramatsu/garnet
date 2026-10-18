@@ -96,6 +96,12 @@ checker's tables) lose one dependent load; `gc_mark_visit` for old targets
 already avoids the cell via the handle generation bit introduced this session.
 Gate: full set, GC stress with forced moving, compiler A/B.
 
+Status (Session 350): B1 and B2 implemented
+(`docs/pointer_stable_old_gen_design.md`); measured 11.03 → 10.87 s (1.5%),
+well below the expectation above. B3 (branch-free `ts_ptr`) is not worth a
+slice on its own; the value of the track is the stable-address invariant
+that later slices (raw record pointers, cached receivers) can use.
+
 ## Track C — call convention v2
 
 Goal: direct calls pass arguments in C parameters and skip frame work when

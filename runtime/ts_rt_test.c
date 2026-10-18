@@ -652,7 +652,9 @@ int main(){
      dropping the key removes both, and value->key cycles do not self-retain. */
   tsv weak_map=ts_new_weakmap(); ts_gc_root(&weak_map);
   tsv weak_key=ts_new_object(); ts_gc_root(&weak_key);
+  tsv weak_key_h=weak_key; /* handle-form probe for the freed check */
   tsv weak_value=ts_new_object();
+  tsv weak_value_h=weak_value; /* handle-form probe for the freed check */
   ts_set(weak_value,483001u,ts_num(84));
   ts_weakmap_set(weak_map,weak_key,weak_value);
   CK("weakmap basic API",
@@ -664,16 +666,17 @@ int main(){
      ts_ptr(weak_value)!=NULL &&
      ts_to_num(ts_get(ts_weakmap_get(weak_map,weak_key),483001u))==84);
   tsv weak_replacement=ts_new_object();
+  tsv weak_replacement_h=weak_replacement;
   ts_set(weak_replacement,483001u,ts_num(840));
   ts_weakmap_set(weak_map,weak_key,weak_replacement);
   ts_gc_collect();
   CK("weakmap replacement releases old value",
-     ts_ptr(weak_value)==NULL && ts_ptr(weak_replacement)!=NULL &&
+     ts_ptr(weak_value_h)==NULL && ts_ptr(weak_replacement)!=NULL &&
      ts_to_num(ts_get(ts_weakmap_get(weak_map,weak_key),483001u))==840);
   ts_gc_unroot(1); /* weak_key */
   ts_gc_collect();
   CK("weakmap dead key pruned",
-     ts_ptr(weak_key)==NULL && ts_ptr(weak_replacement)==NULL &&
+     ts_ptr(weak_key_h)==NULL && ts_ptr(weak_replacement_h)==NULL &&
      ((ts_map*)ts_ptr(weak_map))->len==0);
 
   /* Explicit deletion removes the ephemeron immediately. It releases the
@@ -681,6 +684,7 @@ int main(){
   tsv delete_map=ts_new_weakmap(); ts_gc_root(&delete_map);
   tsv delete_key=ts_new_object(); ts_gc_root(&delete_key);
   tsv delete_value=ts_new_object();
+  tsv delete_value_h=delete_value; /* handle-form probe for the freed check */
   ts_weakmap_set(delete_map,delete_key,delete_value);
   int delete_first=ts_weakmap_delete(delete_map,delete_key);
   int delete_second=ts_weakmap_delete(delete_map,delete_key);
@@ -690,18 +694,20 @@ int main(){
      ts_is_undef(ts_weakmap_get(delete_map,delete_key)));
   ts_gc_collect();
   CK("weakmap delete releases value",
-     ts_ptr(delete_key)!=NULL && ts_ptr(delete_value)==NULL &&
+     ts_ptr(delete_key)!=NULL && ts_ptr(delete_value_h)==NULL &&
      ((ts_map*)ts_ptr(delete_map))->len==0);
   ts_gc_unroot(2);
 
   tsv cycle_map=ts_new_weakmap(); ts_gc_root(&cycle_map);
   tsv cycle_key=ts_new_object();
+  tsv cycle_key_h=cycle_key; /* handle-form probe for the freed check */
   tsv cycle_value=ts_new_object();
+  tsv cycle_value_h=cycle_value; /* handle-form probe for the freed check */
   ts_set(cycle_value,483002u,cycle_key); /* value -> key must not close the cycle */
   ts_weakmap_set(cycle_map,cycle_key,cycle_value);
   ts_gc_collect();
   CK("weakmap value-key cycle collected",
-     ts_ptr(cycle_key)==NULL && ts_ptr(cycle_value)==NULL &&
+     ts_ptr(cycle_key_h)==NULL && ts_ptr(cycle_value_h)==NULL &&
      ((ts_map*)ts_ptr(cycle_map))->len==0);
   ts_gc_unroot(1);
 
@@ -729,12 +735,14 @@ int main(){
      die in one collection. */
   tsv mixed_map=ts_new_weakmap(); ts_gc_root(&mixed_map);
   tsv mixed_keys[24], mixed_values[24];
+  tsv mixed_keys_h[24], mixed_values_h[24]; /* handle-form probes for the freed checks */
   for (int i=0;i<24;i++){
     mixed_keys[i]=ts_new_object();
     ts_gc_root(&mixed_keys[i]);
     mixed_values[i]=ts_new_object();
     ts_set(mixed_values[i],483010u,ts_num((double)i));
     ts_weakmap_set(mixed_map,mixed_keys[i],mixed_values[i]);
+    mixed_keys_h[i]=mixed_keys[i]; mixed_values_h[i]=mixed_values[i];
   }
   CK("weakmap hash index populated",
      ((ts_map*)ts_ptr(mixed_map))->index!=NULL &&
@@ -750,8 +758,8 @@ int main(){
         ts_weakmap_has(mixed_map,mixed_keys[i]) &&
         ts_to_num(ts_get(ts_weakmap_get(mixed_map,mixed_keys[i]),483010u))==i;
     } else {
-      mixed_ok = mixed_ok && ts_ptr(mixed_keys[i])==NULL &&
-        ts_ptr(mixed_values[i])==NULL;
+      mixed_ok = mixed_ok && ts_ptr(mixed_keys_h[i])==NULL &&
+        ts_ptr(mixed_values_h[i])==NULL;
     }
   }
   CK("weakmap indexed mixed-live pruning", mixed_ok);
@@ -768,7 +776,9 @@ int main(){
   CK("weakmap container promoted",
      ((ts_gc_header*)ts_ptr(minor_weak_map))->gen==TS_GEN_OLD);
   tsv minor_weak_key=ts_new_object(); ts_gc_root(&minor_weak_key);
+  tsv minor_weak_key_h=minor_weak_key; /* handle-form probe for the freed check */
   tsv minor_weak_value=ts_new_object();
+  tsv minor_weak_value_h=minor_weak_value; /* handle-form probe for the freed check */
   ts_set(minor_weak_value,483005u,ts_num(86));
   ts_weakmap_set(minor_weak_map,minor_weak_key,minor_weak_value);
   ts_gc_collect_young();
@@ -785,7 +795,7 @@ int main(){
   if (weak_key_remained_young) ts_gc_collect_young();
   else ts_gc_collect();
   CK("weakmap dead key pruned in its generation",
-     ts_ptr(minor_weak_key)==NULL && ts_ptr(minor_weak_value)==NULL &&
+     ts_ptr(minor_weak_key_h)==NULL && ts_ptr(minor_weak_value_h)==NULL &&
      ((ts_map*)ts_ptr(minor_weak_map))->len==0);
   ts_gc_unroot(1);
 
@@ -793,11 +803,13 @@ int main(){
      a minor collection, so a newly inserted young ephemeron value must live. */
   tsv old_key_map=ts_new_weakmap(); ts_gc_root(&old_key_map);
   tsv old_weak_key=ts_new_object(); ts_gc_root(&old_weak_key);
+  tsv old_weak_key_h=old_weak_key;
   ts_gc_collect();
   CK("weakmap key and container promoted",
      ((ts_gc_header*)ts_ptr(old_key_map))->gen==TS_GEN_OLD &&
      ((ts_gc_header*)ts_ptr(old_weak_key))->gen==TS_GEN_OLD);
   tsv young_ephemeron_value=ts_new_object();
+  tsv young_ephemeron_value_h=young_ephemeron_value;
   ts_set(young_ephemeron_value,483011u,ts_num(87));
   ts_weakmap_set(old_key_map,old_weak_key,young_ephemeron_value);
   ts_gc_collect_young();
@@ -807,12 +819,13 @@ int main(){
   ts_gc_unroot(1);
   ts_gc_collect();
   CK("weakmap old key later collected",
-     ts_ptr(old_weak_key)==NULL && ts_ptr(young_ephemeron_value)==NULL &&
+     ts_ptr(old_weak_key_h)==NULL && ts_ptr(young_ephemeron_value_h)==NULL &&
      ((ts_map*)ts_ptr(old_key_map))->len==0);
   ts_gc_unroot(1);
 
   tsv weak_set=ts_new_weakset(); ts_gc_root(&weak_set);
   tsv weak_set_key=ts_new_object(); ts_gc_root(&weak_set_key);
+  tsv weak_set_key_h=weak_set_key;
   CK("weakset basic API",
      ts_weakset_add(weak_set,weak_set_key)==weak_set &&
      ts_is_weakset(weak_set) && !ts_is_set(weak_set) &&
@@ -832,13 +845,14 @@ int main(){
   ts_gc_unroot(1);
   ts_gc_collect();
   CK("weakset dead key pruned",
-     ts_ptr(weak_set_key)==NULL &&
+     ts_ptr(weak_set_key_h)==NULL &&
      ((ts_set_t*)ts_ptr(weak_set))->len==0);
   ts_gc_unroot(2); /* weak_set + weak_map */
 
   tsv minor_weak_set=ts_new_weakset(); ts_gc_root(&minor_weak_set);
   ts_gc_collect();
   tsv minor_set_key=ts_new_object(); ts_gc_root(&minor_set_key);
+  tsv minor_set_key_h=minor_set_key; /* handle-form probe for the freed check */
   ts_weakset_add(minor_weak_set,minor_set_key);
   ts_gc_collect_young();
   CK("weakset minor live key retained",
@@ -849,21 +863,24 @@ int main(){
   if (weakset_key_remained_young) ts_gc_collect_young();
   else ts_gc_collect();
   CK("weakset dead key pruned in its generation",
-     ts_ptr(minor_set_key)==NULL &&
+     ts_ptr(minor_set_key_h)==NULL &&
      ((ts_set_t*)ts_ptr(minor_weak_set))->len==0);
   ts_gc_unroot(1);
 
   /* If the container itself is unreachable, neither its weak key nor its
      ephemeron value gains reachability as a side effect of weak processing. */
   tsv orphan_map=ts_new_weakmap(); ts_gc_root(&orphan_map);
+  tsv orphan_map_h=orphan_map; /* handle-form probe for the freed check */
   tsv orphan_key=ts_new_object(); ts_gc_root(&orphan_key);
+  tsv orphan_key_h=orphan_key; /* handle-form probe for the freed check */
   tsv orphan_value=ts_new_object(); ts_gc_root(&orphan_value);
+  tsv orphan_value_h=orphan_value; /* handle-form probe for the freed check */
   ts_weakmap_set(orphan_map,orphan_key,orphan_value);
   ts_gc_unroot(3);
   ts_gc_collect();
   CK("unreachable weakmap and entry collected",
-     ts_ptr(orphan_map)==NULL && ts_ptr(orphan_key)==NULL &&
-     ts_ptr(orphan_value)==NULL);
+     ts_ptr(orphan_map_h)==NULL && ts_ptr(orphan_key_h)==NULL &&
+     ts_ptr(orphan_value_h)==NULL);
 
   int weak_primitive_caught=0;
   tsv primitive_map=ts_new_weakmap(); ts_gc_root(&primitive_map);
@@ -910,8 +927,10 @@ int main(){
      tag path in weak_key_valid rather than only ordinary OBJECT-tagged keys. */
   tsv function_weak_map=ts_new_weakmap(); ts_gc_root(&function_weak_map);
   tsv function_weak_key=ts_make_fn(fetch_header_value_to_string,NULL,0);
+  tsv function_weak_key_h=function_weak_key;
   ts_gc_root(&function_weak_key);
   tsv function_weak_value=ts_new_object();
+  tsv function_weak_value_h=function_weak_value;
   ts_set(function_weak_value,483012u,ts_num(88));
   ts_weakmap_set(function_weak_map,function_weak_key,function_weak_value);
   ts_gc_collect();
@@ -921,7 +940,7 @@ int main(){
   ts_gc_unroot(1);
   ts_gc_collect();
   CK("weakmap dead function key pruned",
-     ts_ptr(function_weak_key)==NULL && ts_ptr(function_weak_value)==NULL &&
+     ts_ptr(function_weak_key_h)==NULL && ts_ptr(function_weak_value_h)==NULL &&
      ((ts_map*)ts_ptr(function_weak_map))->len==0);
   ts_gc_unroot(1);
 
@@ -948,7 +967,9 @@ int main(){
   tsv symbol_weak_map=ts_new_weakmap(); ts_gc_root(&symbol_weak_map);
   tsv symbol_weak_set=ts_new_weakset(); ts_gc_root(&symbol_weak_set);
   tsv weak_symbol=ts_symbol_new(ts_new_string("weak-key",8)); ts_gc_root(&weak_symbol);
+  tsv weak_symbol_h=weak_symbol;
   tsv weak_symbol_value=ts_new_object();
+  tsv weak_symbol_value_h=weak_symbol_value;
   ts_set(weak_symbol_value,483101u,ts_num(101));
   ts_weakmap_set(symbol_weak_map,weak_symbol,weak_symbol_value);
   ts_weakset_add(symbol_weak_set,weak_symbol);
@@ -960,7 +981,7 @@ int main(){
   ts_gc_unroot(1);
   ts_gc_collect();
   CK("ordinary weak symbol collected",
-     ts_ptr(weak_symbol)==NULL && ts_ptr(weak_symbol_value)==NULL &&
+     ts_ptr(weak_symbol_h)==NULL && ts_ptr(weak_symbol_value_h)==NULL &&
      ((ts_map*)ts_ptr(symbol_weak_map))->len==0 &&
      ((ts_set_t*)ts_ptr(symbol_weak_set))->len==0);
   ts_gc_unroot(2);
@@ -969,14 +990,16 @@ int main(){
      ephemeron-only cycle and must not keep either side alive. */
   tsv symbol_cycle_map=ts_new_weakmap(); ts_gc_root(&symbol_cycle_map);
   tsv symbol_cycle_key=ts_symbol_new(ts_new_string("symbol-cycle",12));
+  tsv symbol_cycle_key_h=symbol_cycle_key; /* handle-form probe for the freed check */
   ts_gc_root(&symbol_cycle_key);
   tsv symbol_cycle_value=ts_new_object(); ts_gc_root(&symbol_cycle_value);
+  tsv symbol_cycle_value_h=symbol_cycle_value; /* handle-form probe for the freed check */
   ts_set(symbol_cycle_value,483106u,symbol_cycle_key);
   ts_weakmap_set(symbol_cycle_map,symbol_cycle_key,symbol_cycle_value);
   ts_gc_unroot(2);
   ts_gc_collect();
   CK("symbol weak value-key cycle collected",
-     ts_ptr(symbol_cycle_key)==NULL && ts_ptr(symbol_cycle_value)==NULL &&
+     ts_ptr(symbol_cycle_key_h)==NULL && ts_ptr(symbol_cycle_value_h)==NULL &&
      ((ts_map*)ts_ptr(symbol_cycle_map))->len==0);
   ts_gc_unroot(1);
 
@@ -985,8 +1008,10 @@ int main(){
   tsv symbol_owner=ts_new_object(); ts_gc_root(&symbol_owner);
   tsv property_symbol_map=ts_new_weakmap(); ts_gc_root(&property_symbol_map);
   tsv property_symbol=ts_symbol_new(ts_new_string("property-key",12));
+  tsv property_symbol_h=property_symbol; /* handle-form probe for the freed check */
   ts_gc_root(&property_symbol);
   tsv property_symbol_value=ts_new_object();
+  tsv property_symbol_value_h=property_symbol_value; /* handle-form probe for the freed check */
   ts_set(property_symbol_value,483102u,ts_num(102));
   ts_set_symkey(symbol_owner,property_symbol,ts_num(1));
   ts_weakmap_set(property_symbol_map,property_symbol,property_symbol_value);
@@ -1004,7 +1029,7 @@ int main(){
   ts_delete_prop(symbol_owner,property_symbol_key);
   ts_gc_collect();
   CK("deleted symbol property releases weak key",
-     ts_ptr(property_symbol)==NULL && ts_ptr(property_symbol_value)==NULL &&
+     ts_ptr(property_symbol_h)==NULL && ts_ptr(property_symbol_value_h)==NULL &&
      ((ts_map*)ts_ptr(property_symbol_map))->len==0);
   ts_gc_unroot(2);
 
@@ -1014,7 +1039,9 @@ int main(){
   tsv old_symbol_map=ts_new_weakmap(); ts_gc_root(&old_symbol_map);
   ts_gc_collect();
   tsv young_symbol=ts_symbol_new(ts_new_string("young-key",9)); ts_gc_root(&young_symbol);
+  tsv young_symbol_h=young_symbol; /* handle-form probe for the freed check */
   tsv young_symbol_value=ts_new_object();
+  tsv young_symbol_value_h=young_symbol_value; /* handle-form probe for the freed check */
   ts_set(young_symbol_value,483103u,ts_num(103));
   ts_set_symkey(old_symbol_owner,young_symbol,ts_num(1));
   ts_weakmap_set(old_symbol_map,young_symbol,young_symbol_value);
@@ -1027,7 +1054,7 @@ int main(){
   ts_delete_prop(old_symbol_owner,young_symbol_key);
   ts_gc_collect();
   CK("minor-retained symbol released after delete",
-     ts_ptr(young_symbol)==NULL && ts_ptr(young_symbol_value)==NULL &&
+     ts_ptr(young_symbol_h)==NULL && ts_ptr(young_symbol_value_h)==NULL &&
      ((ts_map*)ts_ptr(old_symbol_map))->len==0);
   ts_gc_unroot(2);
 
@@ -1115,7 +1142,7 @@ int main(){
     ts_gc_set_root_depth(frame_handler->gc_root_len);
     CK("frame exception restores top", g_ts_frame_top==exception_top);
     CK("frame exception payload",
-       ts_current_exception()==frame_exception &&
+       ts_strict_eq(ts_current_exception(),frame_exception) &&
        ts_to_num(ts_get(ts_current_exception(),490001u))==91);
     ts_eh_pop();
   }

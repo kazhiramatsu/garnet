@@ -286,10 +286,15 @@ static inline ts_gc_header* ts_heap_ptr(tsv v){
     uint32_t id = (uint32_t)(payload >> 1);
     return (id < g_handle_cap) ? ts_handle_entry_cell((uintptr_t)g_ts_handle_table[id]) : NULL;
   }
-  if ((payload & (sizeof(void*) - 1u)) != 0) return NULL;
+  if (payload & TS_PTR_STACK_TAG){
+    ts_gc_header* h = (ts_gc_header*)(uintptr_t)(payload & ~TS_PTR_STACK_TAG);
+    if (!gc_direct_stack_plausible(h) || !gc_direct_header_readable(h)) return NULL;
+    return (h->gen == TS_GEN_NONHEAP && gc_kind_valid(h->kind)) ? h : NULL;
+  }
+  if ((payload & 0x7u) != 0) return NULL; /* cells are at least 8-byte aligned */
   ts_gc_header* h = (ts_gc_header*)(uintptr_t)payload;
-  if (!gc_direct_stack_plausible(h) || !gc_direct_header_readable(h)) return NULL;
-  return (h->gen == TS_GEN_NONHEAP && gc_kind_valid(h->kind)) ? h : NULL;
+  if (!h) return NULL;
+  return (gc_kind_valid(h->kind) && h->gen == TS_GEN_OLD) ? h : NULL;
 }
 static inline int gc_is_young(ts_gc_header* h){ return h && h->gen == TS_GEN_YOUNG; }
 static inline void gc_pin_value(tsv v){
@@ -420,7 +425,8 @@ static void gc_handle_free(ts_gc_header* h){
 tsv ts_heap_ref_value(uint16_t sel, void* p){
   if (!p) return TS_BOX(sel, 0);
   ts_gc_header* h = (ts_gc_header*)p;
-  if (h->gen == TS_GEN_NONHEAP) return TS_BOX(sel, (uintptr_t)p);
+  if (h->gen == TS_GEN_NONHEAP) return TS_BOX(sel, (uintptr_t)p | TS_PTR_STACK_TAG);
+  if (h->gen == TS_GEN_OLD) return TS_BOX(sel, (uintptr_t)p);
   if (!h->handle) h->handle = gc_handle_alloc(h);
   return TS_BOX(sel, h->handle);
 }
@@ -978,12 +984,10 @@ static inline int array_uses_inline(ts_array* a){ return a->data == a->inline_da
 static inline void array_write_barrier(ts_array* a, uint32_t index, tsv value){
   if (a->o.h.gen != TS_GEN_OLD || !ts_heap_ref(value)) return;
   uint64_t vp = value & TS_PAYLOAD_MASK;
-  if (vp & 1u){
+  if (!(vp & 1u)) return; /* pointer-form values are old or on the stack */
+  {
     uint32_t id = (uint32_t)(vp >> 1);
     if (id >= g_handle_cap || ((uintptr_t)g_ts_handle_table[id] & TS_HANDLE_OLD_BIT)) return;
-  } else {
-    ts_gc_header* child = ts_heap_ptr(value);
-    if (!child || child->gen != TS_GEN_YOUNG) return;
   }
   uint32_t card = index >> GC_CONTAINER_CARD_SHIFT;
   if (card >= UINT16_MAX) a->gc_dirty_all = 1;
@@ -2966,7 +2970,7 @@ tsv ts_symbol_for(tsv key){
 tsv ts_symbol_key_for(tsv sym){
   if (!ts_is_symbol(sym)) return TS_UNDEFINED;
   for (uint32_t i=0;i<g_symreg_len;i++){
-    if (g_symreg[i].sym == sym) return g_symreg[i].key;
+    if (g_symreg[i].sym == sym || ts_same_cell(g_symreg[i].sym, sym)) return g_symreg[i].key;
   }
   return TS_UNDEFINED;
 }
@@ -3418,6 +3422,7 @@ tsv ts_str_concat_many(tsv* args, int n){
 int ts_strict_eq_slow(tsv a, tsv b){
   if (a == b) return !(ts_is_num(a) && ts_to_num(a) != ts_to_num(a));
   if (ts_is_num(a)&&ts_is_num(b)) return ts_to_num(a)==ts_to_num(b);
+  if ((ts_is_obj(a) || ts_is_func(a)) && ts_same_cell(a, b)) return 1;
   if (ts_is_str(a)&&ts_is_str(b)){
     ts_strview x=ts_str_view_typed(a), y=ts_str_view_typed(b);
     if (x.len!=y.len) return 0;
@@ -3476,6 +3481,7 @@ int ts_object_is(tsv a, tsv b){
     if (x==0.0 && y==0.0) return signbit(x)==signbit(y);
     return x==y;
   }
+  if ((ts_is_obj(a) || ts_is_func(a)) && ts_same_cell(a, b)) return 1;
   return ts_strict_eq(a,b);
 }
 int ts_truthy(tsv v){
@@ -3576,7 +3582,7 @@ static void gc_scan_async_cell(ts_gc_header* h, int young, int depth);
 static void gc_mark_async_roots(void);
 static void gc_mark_async_roots_young(void);
 static void gc_free_cell(ts_gc_header* h);
-static void gc_mark_class_fields(ts_object* o, int young, int depth);
+static void gc_mark_class_fields(ts_object* o, int young, int depth, int stable);
 static void gc_weak_fixpoint_and_prune(int young);
 static void gc_symbol_weak_prune(int young);
 
@@ -3656,7 +3662,9 @@ static void gc_mark_visit_slow(ts_gc_header* h, int young, int depth){
 }
 /* Per-edge fast filter stays inline (bit test + header loads); the mark+scan
    goes through the outlined slow path so the scan loops stay compact. */
+static int g_gc_rewrite_only = 0; /* scanning promoted cells only to rewrite their slots */
 static inline void gc_mark_visit(tsv v, int young, int depth){
+  if (g_gc_rewrite_only) return;
   RT_STAT_INC(mark_edges);
   if (!ts_heap_ref(v)) return;
   uint64_t payload = v & TS_PAYLOAD_MASK;
@@ -3667,8 +3675,14 @@ static inline void gc_mark_visit(tsv v, int young, int depth){
     /* A minor collection ignores old targets without touching their cells. */
     if (young && (entry & TS_HANDLE_OLD_BIT)){ RT_STAT_INC(mark_old_edges); return; }
     h = ts_handle_entry_cell(entry);
-  } else {
+  } else if (payload & TS_PTR_STACK_TAG){
     h = ts_heap_ptr(v);
+  } else {
+    /* old-pointer form: old by construction, skipped by a minor collection
+       without any load; a full collection marks through the pointer. */
+    if (young){ RT_STAT_INC(mark_old_edges); return; }
+    h = (ts_gc_header*)(uintptr_t)payload;
+    if (!h || !gc_kind_valid(h->kind) || h->gen != TS_GEN_OLD) return;
   }
   if (!h || h->mark) return;
   if (young && h->gen == TS_GEN_OLD){
@@ -3676,6 +3690,58 @@ static inline void gc_mark_visit(tsv v, int young, int depth){
     return;
   }
   gc_mark_visit_slow(h, young, depth);
+}
+/* Slots the collector may rewrite (docs/pointer_stable_old_gen_design.md):
+   a handle to a cell that is already old becomes the old-pointer form on the
+   spot; a handle to a young cell held in a stable slot (an old cell, a frame,
+   a root) is recorded so it can be rewritten once this collection has
+   promoted the target. */
+static tsv** g_gc_fixup = NULL;
+static size_t g_gc_fixup_len = 0, g_gc_fixup_cap = 0;
+static inline void gc_fixup_push(tsv* slot){
+  if (g_gc_fixup_len == g_gc_fixup_cap){
+    size_t next = g_gc_fixup_cap ? g_gc_fixup_cap * 2 : 4096;
+    tsv** grown = (tsv**)realloc(g_gc_fixup, sizeof(tsv*) * next);
+    if (!grown) ts_abort_msg("out of memory growing GC fixup list");
+    g_gc_fixup = grown; g_gc_fixup_cap = next;
+  }
+  g_gc_fixup[g_gc_fixup_len++] = slot;
+}
+static inline void gc_visit_slot(tsv* slot, int young, int depth, int stable){
+  tsv v = *slot;
+  if (!ts_heap_ref(v)) return;
+  uint64_t payload = v & TS_PAYLOAD_MASK;
+  if (payload & 1u){
+    uint32_t id = (uint32_t)(payload >> 1);
+    uintptr_t entry = (id < g_handle_cap) ? (uintptr_t)g_ts_handle_table[id] : 0u;
+    if (entry & TS_HANDLE_OLD_BIT){
+      *slot = TS_BOX(TS_TOP16(v), (uintptr_t)ts_handle_entry_cell(entry));
+    } else if (stable && !g_gc_rewrite_only && entry){
+      gc_fixup_push(slot);
+    }
+  }
+  if (g_gc_rewrite_only) return;
+  gc_mark_visit(v, young, depth);
+}
+static void gc_fixup_apply(void){
+  for (size_t i = 0; i < g_gc_fixup_len; i++){
+    tsv* slot = g_gc_fixup[i];
+    tsv v = *slot;
+    if (!ts_heap_ref(v)) continue;
+    uint64_t payload = v & TS_PAYLOAD_MASK;
+    if (!(payload & 1u)) continue;
+    uint32_t id = (uint32_t)(payload >> 1);
+    uintptr_t entry = (id < g_handle_cap) ? (uintptr_t)g_ts_handle_table[id] : 0u;
+    if (entry & TS_HANDLE_OLD_BIT) *slot = TS_BOX(TS_TOP16(v), (uintptr_t)ts_handle_entry_cell(entry));
+  }
+  g_gc_fixup_len = 0;
+}
+/* After promotion: cells promoted together reference each other by handle;
+   rescan their slots so those references take the pointer form now. */
+static void gc_rewrite_promoted(ts_gc_header* list){
+  g_gc_rewrite_only = 1;
+  for (ts_gc_header* p = list; p; p = p->gc_next) gc_scan_cell(p, 0, 0);
+  g_gc_rewrite_only = 0;
 }
 static inline void gc_mark_value(tsv v){ gc_mark_visit(v, 0, 0); }
 static inline void gc_mark_value_young(tsv v){ gc_mark_visit(v, 1, 0); }
@@ -3686,19 +3752,19 @@ static inline void gc_mark_property_key(ts_key key, int young, int depth){
   if (key >= TS_USERSYM_KEY_BASE)
     gc_mark_visit(sym_value_by_id(key - TS_USERSYM_KEY_BASE), young, depth);
 }
-static inline void gc_mark_common_props(ts_object* o, int young, int depth){
+static inline void gc_mark_common_props(ts_object* o, int young, int depth, int stable){
   if (obj_shaped(o)){
     if (!o->len) return;
     const ts_key* ks = g_ts_shape_keys[ts_obj_shape_id(o)];
     for (uint32_t i=0;i<o->len;i++){
       gc_mark_property_key(ks[i], young, depth);
-      gc_mark_visit(*ts_obj_slot_ptr(o, i), young, depth);
+      gc_visit_slot(ts_obj_slot_ptr(o, i), young, depth, stable);
     }
     return;
   }
   for (uint32_t i=0;i<o->len;i++){
     gc_mark_property_key(o->props[i].key, young, depth);
-    gc_mark_visit(o->props[i].val, young, depth);
+    gc_visit_slot(&o->props[i].val, young, depth, stable);
   }
 }
 static void gc_mark_drain(int young){
@@ -3710,23 +3776,25 @@ static void gc_mark_drain(int young){
 static void gc_scan_cell(ts_gc_header* h, int young, int depth){
   if (!h) return;
   RT_STAT_INC(kind_scan[h->kind]);
+  /* slots of a cell that cannot move during this collection may be rewritten */
+  int stable = h->gen != TS_GEN_YOUNG;
   if (h->kind==TS_KIND_OBJECT){ ts_object* o=(ts_object*)h;
-    gc_mark_class_fields(o, young, depth);
-    gc_mark_common_props(o, young, depth);
-    gc_mark_visit(o->proto, young, depth);
+    gc_mark_class_fields(o, young, depth, stable);
+    gc_mark_common_props(o, young, depth, stable);
+    gc_visit_slot(&o->proto, young, depth, stable);
   } else if (h->kind==TS_KIND_ACCESSOR){ ts_accessor* ac=(ts_accessor*)h;
-    gc_mark_visit(ac->getter, young, depth);
-    gc_mark_visit(ac->setter, young, depth);
+    gc_visit_slot(&ac->getter, young, depth, stable);
+    gc_visit_slot(&ac->setter, young, depth, stable);
   } else if (h->kind==TS_KIND_SYMBOL){ ts_symbol* sy=(ts_symbol*)h;
-    gc_mark_visit(sy->description, young, depth);
+    gc_visit_slot(&sy->description, young, depth, stable);
   } else if (h->kind==TS_KIND_STRING){ ts_string* s=(ts_string*)h;
-    if (s->flags & TS_STR_FLAG_VIEW) gc_mark_visit(s->parent, young, depth);
+    if (s->flags & TS_STR_FLAG_VIEW) gc_visit_slot(&s->parent, young, depth, stable);
   } else if (h->kind==TS_KIND_FUNC){ ts_func* f=(ts_func*)h;
     if (young) RT_STAT_ADD(kind_minor_elements[h->kind], f->envlen);
-    for (uint32_t i=0;i<f->envlen;i++) gc_mark_visit(f->env[i], young, depth);
-    gc_mark_common_props(&f->o, young, depth);
-    gc_mark_visit(f->prototype_prop, young, depth);
-    gc_mark_visit(f->o.proto, young, depth);
+    for (uint32_t i=0;i<f->envlen;i++) gc_visit_slot(&f->env[i], young, depth, stable);
+    gc_mark_common_props(&f->o, young, depth, stable);
+    gc_visit_slot(&f->prototype_prop, young, depth, stable);
+    gc_visit_slot(&f->o.proto, young, depth, stable);
   } else if (h->kind==TS_KIND_ARRAY){ ts_array* a=(ts_array*)h;
     uint32_t first = 0, end = a->len;
     if (young && h->gen == TS_GEN_OLD && !a->gc_dirty_all){
@@ -3735,15 +3803,15 @@ static void gc_scan_cell(ts_gc_header* h, int young, int depth){
       if (end > a->len) end = a->len;
     }
     if (young && end > first) RT_STAT_ADD(kind_minor_elements[h->kind], end - first);
-    for (uint32_t i=first;i<end;i++) gc_mark_visit(a->data[i], young, depth);
+    for (uint32_t i=first;i<end;i++) gc_visit_slot(&a->data[i], young, depth, stable);
     /* unified model: also mark the common header's named-property map + proto. */
-    gc_mark_common_props(&a->o, young, depth);
-    gc_mark_visit(a->o.proto, young, depth);
+    gc_mark_common_props(&a->o, young, depth, stable);
+    gc_visit_slot(&a->o.proto, young, depth, stable);
   } else if (h->kind==TS_KIND_MAP){ ts_map* m=(ts_map*)h;
     if (m->weak){
       /* Ephemeron entries are deliberately skipped here. Their values are
          marked after the ordinary transitive closure, iff their keys are live. */
-      gc_weak_enqueue(h);
+      if (!g_gc_rewrite_only) gc_weak_enqueue(h);
     } else {
       uint32_t first = 0, end = m->len;
       if (young && h->gen == TS_GEN_OLD && !m->gc_dirty_all){
@@ -3753,20 +3821,20 @@ static void gc_scan_cell(ts_gc_header* h, int young, int depth){
       }
       if (young && end > first) RT_STAT_ADD(kind_minor_elements[h->kind], 2ull * (end - first));
       for (uint32_t i=first;i<end;i++){
-        gc_mark_visit(m->keys[i], young, depth);
-        gc_mark_visit(m->vals[i], young, depth);
+        gc_visit_slot(&m->keys[i], young, depth, stable);
+        gc_visit_slot(&m->vals[i], young, depth, stable);
       }
     }
-    gc_mark_common_props(&m->o, young, depth);
-    gc_mark_visit(m->o.proto, young, depth);
+    gc_mark_common_props(&m->o, young, depth, stable);
+    gc_visit_slot(&m->o.proto, young, depth, stable);
   } else if (h->kind==TS_KIND_SET){ ts_set_t* st=(ts_set_t*)h;
     if (young && !st->weak) RT_STAT_ADD(kind_minor_elements[h->kind], st->len);
-    if (st->weak) gc_weak_enqueue(h);
-    else for (uint32_t i=0;i<st->len;i++) gc_mark_visit(st->elems[i], young, depth);
-    gc_mark_common_props(&st->o, young, depth);
-    gc_mark_visit(st->o.proto, young, depth);
+    if (st->weak){ if (!g_gc_rewrite_only) gc_weak_enqueue(h); }
+    else for (uint32_t i=0;i<st->len;i++) gc_visit_slot(&st->elems[i], young, depth, stable);
+    gc_mark_common_props(&st->o, young, depth, stable);
+    gc_visit_slot(&st->o.proto, young, depth, stable);
   } else if (h->kind==TS_KIND_PROXY){ ts_proxy* px=(ts_proxy*)h;
-    gc_mark_visit(px->target, young, depth); gc_mark_visit(px->handler, young, depth);
+    gc_visit_slot(&px->target, young, depth, stable); gc_visit_slot(&px->handler, young, depth, stable);
   } else if (h->kind==TS_KIND_PROMISE || h->kind==TS_KIND_CORO){
     gc_scan_async_cell(h, young, depth);
   }
@@ -4139,18 +4207,18 @@ void ts_gc_collect_young(void){
     gc_mark_value_young(g_symreg[i].key);
     gc_mark_value_young(g_symreg[i].sym);
   }
-  for (int i=0;i<g_static_root_len;i++) gc_mark_value_young(*g_static_roots[i]);
+  for (int i=0;i<g_static_root_len;i++) gc_visit_slot(g_static_roots[i], 1, 0, 1);
   RT_STAT_ADD(minor_root_slots, g_static_root_len + g_root_len);
   for (int i=0;i<g_root_len;i++){
 #if defined(TS_ASAN_ENABLED)
     __asan_unpoison_memory_region(g_roots[i], sizeof(*g_roots[i]));
 #endif
-    gc_mark_value_young(*g_roots[i]);
+    gc_visit_slot(g_roots[i], 1, 0, 1);
   }
   for (ts_frame_hdr* frame = g_ts_frame_top; frame; frame = frame->prev){
     tsv* slots = ts_frame_slots(frame);
     RT_STAT_ADD(minor_root_slots, frame->count);
-    for (uint32_t i = 0; i < frame->count; i++) gc_mark_value_young(slots[i]);
+    for (uint32_t i = 0; i < frame->count; i++) gc_visit_slot(&slots[i], 1, 0, 1);
   }
   size_t old_rem_len = g_rem_len;
   RT_STAT_ADD(minor_remembered_cells, old_rem_len);
@@ -4229,6 +4297,11 @@ void ts_gc_collect_young(void){
      must not mistake those for dead. */
   gc_sweep_pinned_young(&survivors);
   gc_sweep_nursery(&survivors, aging_allowed, adaptive_forced);
+  /* Pointer-stable old generation: references to the cells promoted by this
+     collection switch to the pointer form (their own slots, then the stable
+     slots recorded during marking). */
+  gc_rewrite_promoted(survivors);
+  gc_fixup_apply();
   /* Promotion barrier (aging only): promotion can split a reference pair
      across generations — the parent promotes while its child stays young
      under the aging grace, creating an old->young edge NO write barrier ever
@@ -4263,16 +4336,16 @@ void ts_gc_collect(void){
     gc_mark_value(g_symreg[i].key);
     gc_mark_value(g_symreg[i].sym);
   }
-  for (int i=0;i<g_static_root_len;i++) gc_mark_value(*g_static_roots[i]);
+  for (int i=0;i<g_static_root_len;i++) gc_visit_slot(g_static_roots[i], 0, 0, 1);
   for (int i=0;i<g_root_len;i++){
 #if defined(TS_ASAN_ENABLED)
     __asan_unpoison_memory_region(g_roots[i], sizeof(*g_roots[i]));
 #endif
-    gc_mark_value(*g_roots[i]);
+    gc_visit_slot(g_roots[i], 0, 0, 1);
   }
   for (ts_frame_hdr* frame = g_ts_frame_top; frame; frame = frame->prev){
     tsv* slots = ts_frame_slots(frame);
-    for (uint32_t i = 0; i < frame->count; i++) gc_mark_value(slots[i]);
+    for (uint32_t i = 0; i < frame->count; i++) gc_visit_slot(&slots[i], 0, 0, 1);
   }
   gc_mark_drain(0);
   gc_weak_fixpoint_and_prune(0);
@@ -4319,6 +4392,8 @@ void ts_gc_collect(void){
      tenuring costs nothing here, and always-promote keeps this path simple. */
   gc_sweep_pinned_young(&promoted);
   gc_sweep_nursery(&promoted, 0, 0);
+  gc_rewrite_promoted(promoted);
+  gc_fixup_apply();
   if (promoted){
     ts_gc_header* tail=promoted; while (tail->gc_next) tail=tail->gc_next;
     tail->gc_next=g_old_heap; g_old_heap=promoted;
@@ -8134,7 +8209,9 @@ static ts_class_field_cache_entry g_class_field_cache[TS_CLASS_FIELD_CACHE_SIZE]
 uint32_t g_ts_class_layout_epoch = 1;
 static void prop_ic_location_reset(void);
 static uint32_t class_proto_hash(tsv proto){
-  uint64_t x = proto & TS_PAYLOAD_MASK;
+  /* identity hash: the handle id reaches both reference forms of a cell */
+  ts_gc_header* cell = ts_heap_ptr(proto);
+  uint64_t x = cell ? (cell->handle ? cell->handle : (uint64_t)(uintptr_t)cell) : (proto & TS_PAYLOAD_MASK);
   uint32_t h = (uint32_t)x ^ (uint32_t)(x >> 32);
   h ^= h >> 16;
   return h * 2654435761u;
@@ -8353,7 +8430,7 @@ static ts_class_reg* class_reg_for_proto(tsv proto){
       return NULL;
     }
     ts_class_reg* reg = &g_class_regs[entry - 1u];
-    if (reg->proto == proto){
+    if (reg->proto == proto || ts_same_cell(reg->proto, proto)){
       RT_STAT_ADD(class_reg_probes, probes); RT_STAT_HIST(class_reg_hist, probes);
       return reg;
     }
@@ -8416,15 +8493,13 @@ static tsv class_reg_field_value(ts_class_reg* r, ts_object* o, int i){
   tsv fv; memcpy(&fv, base+r->fields[i].offset, sizeof(tsv));
   return fv;
 }
-static void gc_mark_class_fields(ts_object* o, int young, int depth){
+static void gc_mark_class_fields(ts_object* o, int young, int depth, int stable){
   ts_class_reg* reg = class_reg_for(o);
   if (!reg) return;
   char* base = (char*)o;
   for (int i=0;i<reg->nfields;i++){
     if (reg->fields[i].numeric) continue;
-    tsv fv;
-    memcpy(&fv, base + reg->fields[i].offset, sizeof(tsv));
-    gc_mark_visit(fv, young, depth);
+    gc_visit_slot((tsv*)(base + reg->fields[i].offset), young, depth, stable);
   }
 }
 
@@ -8567,7 +8642,7 @@ int ts_instanceof(tsv obj, tsv target_proto){
   ts_object* o = (ts_object*)ts_ptr(obj);
   /* start from obj's own prototype (an instance is not its own prototype). */
   for (tsv p = o->proto; ts_proto_ref(p); ){
-    if (p == target_proto) return 1;
+    if (p == target_proto || ts_same_cell(p, target_proto)) return 1;
     p = ((ts_object*)ts_ptr(p))->proto;
   }
   return 0;
@@ -10143,7 +10218,7 @@ tsv ts_objproto_isPrototypeOf(tsv* args, int n){
       !kind_has_common_header(((ts_gc_header*)ts_ptr(value))->kind)) return ts_bool(0);
   tsv cur = ((ts_object*)ts_ptr(value))->proto;
   while (ts_proto_ref(cur)){
-    if (cur == self) return ts_bool(1);
+    if (cur == self || ts_same_cell(cur, self)) return ts_bool(1);
     if (!kind_has_common_header(((ts_gc_header*)ts_ptr(cur))->kind)) break;
     cur = ((ts_object*)ts_ptr(cur))->proto;
   }
@@ -11463,6 +11538,51 @@ tsv ts_proxy_revoke_thunk(tsv* args, int n){
   return TS_UNDEFINED;
 }
 
+/* ---------------- per-site allocation statistics (diagnostic) ----------------
+   Emitted only by TSAOT_SITE_STATS=1 builds: every closure creation site
+   reports its site id and callee function id; the top sites are printed at
+   exit (TSAOT_RT_STATS_FILE appends there, else stderr). */
+static uint64_t* g_site_count = NULL;
+static uint32_t* g_site_func = NULL;
+static uint32_t g_site_cap = 0;
+static const char** g_site_fn_names = NULL;
+static uint32_t g_site_fn_count = 0;
+void ts_site_note(uint32_t site, uint32_t func){
+  if (site >= g_site_cap){
+    uint32_t next = g_site_cap ? g_site_cap : 1024u;
+    while (site >= next) next *= 2u;
+    g_site_count = (uint64_t*)realloc(g_site_count, sizeof(uint64_t) * next);
+    g_site_func = (uint32_t*)realloc(g_site_func, sizeof(uint32_t) * next);
+    memset(g_site_count + g_site_cap, 0, sizeof(uint64_t) * (next - g_site_cap));
+    memset(g_site_func + g_site_cap, 0, sizeof(uint32_t) * (next - g_site_cap));
+    g_site_cap = next;
+  }
+  g_site_count[site]++;
+  g_site_func[site] = func;
+}
+static void ts_site_stats_dump(void){
+  const char* path = getenv("TSAOT_RT_STATS_FILE");
+  FILE* out = path ? fopen(path, "a") : stderr;
+  if (!out) out = stderr;
+  uint64_t total = 0;
+  for (uint32_t i = 0; i < g_site_cap; i++) total += g_site_count[i];
+  fprintf(out, "[site_stats] closure allocations: total=%llu sites=%u\n", (unsigned long long)total, g_site_cap);
+  for (int rank = 0; rank < 40; rank++){
+    uint32_t best = 0; uint64_t bestc = 0;
+    for (uint32_t i = 0; i < g_site_cap; i++) if (g_site_count[i] > bestc){ bestc = g_site_count[i]; best = i; }
+    if (!bestc) break;
+    uint32_t f = g_site_func[best];
+    const char* nm = (g_site_fn_names && f < g_site_fn_count) ? g_site_fn_names[f] : "?";
+    fprintf(out, "[site_stats] %12llu  site=%u  fn_%u_%s\n", (unsigned long long)bestc, best, f, nm ? nm : "?");
+    g_site_count[best] = 0;
+  }
+  if (out != stderr) fclose(out);
+}
+void ts_site_stats_init(const char** fn_names, uint32_t nfn){
+  g_site_fn_names = fn_names; g_site_fn_count = nfn;
+  atexit(ts_site_stats_dump);
+}
+
 /* ---------------- exceptions (try/catch via setjmp/longjmp) ---------------- */
 static ts_handler* g_handlers = NULL;
 static tsv g_exception;
@@ -12431,20 +12551,21 @@ void ts_run_event_loop(void){
 
 /* mark hook for Promise / coroutine frames (defined after their structs) */
 static void gc_scan_async_cell(ts_gc_header* h, int young, int depth){
+  int stable = h->gen != TS_GEN_YOUNG;
   if (h->kind==TS_KIND_PROMISE){
     ts_promise* p=(ts_promise*)h;
-    gc_mark_visit(p->value, young, depth);
-    gc_mark_visit(p->comb_results, young, depth);
-    for (int i=0;i<p->nwait;i++) gc_mark_visit(p->waiters[i], young, depth);
+    gc_visit_slot(&p->value, young, depth, stable);
+    gc_visit_slot(&p->comb_results, young, depth, stable);
+    for (int i=0;i<p->nwait;i++) gc_visit_slot(&p->waiters[i], young, depth, stable);
   } else if (h->kind==TS_KIND_CORO){
     ts_coro* c=(ts_coro*)h;
-    gc_mark_visit(c->result, young, depth);
-    gc_mark_visit(c->yielded, young, depth);
-    for (int i=0;i<c->fin_top;i++) gc_mark_visit(c->fin_exc[i], young, depth);
-    gc_mark_visit(c->ret, young, depth);
+    gc_visit_slot(&c->result, young, depth, stable);
+    gc_visit_slot(&c->yielded, young, depth, stable);
+    for (int i=0;i<c->fin_top;i++) gc_visit_slot(&c->fin_exc[i], young, depth, stable);
+    gc_visit_slot(&c->ret, young, depth, stable);
     for (ts_asyncgen_req* r=c->ag_head;r;r=r->next){
-      gc_mark_visit(r->promise, young, depth);
-      gc_mark_visit(r->value, young, depth);
+      gc_visit_slot(&r->promise, young, depth, stable);
+      gc_visit_slot(&r->value, young, depth, stable);
     }
     /* Conservatively scan the whole frame: any 8-byte slot that looks like a
        boxed heap handle is treated as a root. Stable handles keep this safe even

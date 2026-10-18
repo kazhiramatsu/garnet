@@ -4236,6 +4236,50 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   validated): **11.743 → 11.275 s median wall (4.0% less, 1.04x)**, process
   CPU 11.8 → 11.3 s, peak RSS 1.27 → 1.25 GB; Node 3.309 s in the same
   session, so the native compiler is now 3.41x slower than V8.
+- Track B, pointer-stable old generation
+  (`docs/pointer_stable_old_gen_design.md`), slices B1 and B2 together. A
+  heap reference now has three payload forms: a handle (bit 0 set, the only
+  form for a young cell), the address of an old cell (bit 0 clear; old cells
+  never move), and the address of a stack/static cell tagged in bit 47 (the
+  low bits are not free: static string literals are only 8-byte aligned, and
+  the first attempt tagged bit 1 and truncated every literal's address).
+  Boxing an old cell yields the pointer form; `ts_ptr` masks the tag on the
+  even path; the collector visits slots instead of values and rewrites a
+  handle to an old cell on the spot, records stable slots (roots, frames,
+  remembered old cells) whose target is promoted in the same collection and
+  rewrites them after evacuation, and rescans every promoted cell's own
+  slots so a cohort references itself by pointer. Identity no longer equals
+  the bit pattern: `ts_same_cell` (one handle, one pointer, same cell)
+  backs `===`, Object.is, SameValueZero, instanceof, the prototype-cycle
+  check, the class registry and `Symbol.keyFor` (the registry lookup was the
+  one site the conformance suite caught: `Symbol.keyFor` returned undefined
+  for a promoted symbol). Map/Set hashes already used the handle id. The
+  write barriers skip pointer-form values (old or stack by construction).
+  Runtime unit tests that probed "collected" through `ts_ptr(x)==NULL` now
+  keep a handle-form snapshot, because a rooted reference is rewritten to the
+  pointer form and dangles rather than nulls. Fixture `gc/pointer_identity`
+  (identity through every runtime path after 300k allocations and
+  promotions). Compiler A/B against the frame-coalescing build (alternating
+  three runs, outputs validated): 11.030 → 10.871 s median wall (1.5%
+  less), RSS flat, native 3.34x slower than V8 (Node 3.255 s). The gain is
+  far below the roadmap's expectation: the handle-table loads were mostly
+  cache hits, and references held in young cells stay handles until they
+  are scanned. Kept for the invariant it establishes (an old cell's
+  address is stable and usable directly), which later slices can build on.
+  Profile of this build (7 s sample, 5,850 samples): generated code 58.2%,
+  collector 9.1%, other runtime 9.0%, dynamic calls 7.7% (`ts_call` 3.9%,
+  `ts_call_value` 3.6%), property paths 5.6%, libc memory 3.2%, strings
+  2.9%; `gc_alloc` 2.5%, `gc_free_cell_payload` 2.4%, `ts_make_fn_impl`
+  1.3% (30.9M closures per compile). Hottest generated functions:
+  `isSimpleTypeRelatedTo`, `getObjectFlags`, `resolveNameHelper`,
+  `isTypeRelatedTo`, `getApparentType`. The GC stress gate's ASan/O2
+  variants of the runtime tests needed the same probe change as the unit
+  suite (`weakmap indexed mixed-live pruning`) and an identity-aware compare
+  of the exception payload (`frame exception payload`).
+  Gates on the final tree: conformance 415/415, runtime inline policy, GC
+  stress (all phases), bundler 42/42, selfconf 401 + 11 KNOWN (DIFF 0),
+  parity 330 identical + 81 KNOWN, runtime and Rust units, all 102
+  benchmarks within budget.
 - Next slices (`docs/v8_parity_roadmap.md`): B pointer-stable old
   generation (direct pointers for old cells remove the handle-table load
   from every object access and from minor marking; needs the identity-

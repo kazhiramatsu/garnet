@@ -1037,6 +1037,9 @@ fn emit_program_with_string_plans(
     s.push_str("  ts_setup_boolean_proto();\n");
     s.push_str("  ts_setup_global_object();\n");
     s.push_str("  ts_setup_globals();\n");
+    if site_stats_enabled() {
+        s.push_str("  ts_site_stats_init((const char**)FN_NAME, (uint32_t)(sizeof(FN_NAME) / sizeof(FN_NAME[0])));\n");
+    }
     if max_class.is_some() {
         s.push_str("  ts_setup_prototypes();\n");
     }
@@ -1570,6 +1573,13 @@ fn undef_fields_enabled() -> bool {
             Ok("0") | Ok("false") | Ok("no") | Ok("off")
         )
     })
+}
+
+/// TSAOT_SITE_STATS=1: diagnostic build that reports closure creations per
+/// site at exit (never on by default; the text differs from the parity oracle).
+fn site_stats_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| matches!(std::env::var("TSAOT_SITE_STATS").as_deref(), Ok("1")))
 }
 
 fn eh_return_pop_enabled() -> bool {
@@ -14723,6 +14733,9 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     site.0,
                     st
                 );
+                if site_stats_enabled() {
+                    let _ = writeln!(s, "  ts_site_note({}, {});", site.0, func.0);
+                }
                 s.push_str(&set_meta);
             } else {
                 // Build the captured-cell environment (capture order matches the
@@ -14743,6 +14756,9 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     st
                 );
                 s.push_str("  }\n");
+                if site_stats_enabled() {
+                    let _ = writeln!(s, "  ts_site_note({}, {});", site.0, func.0);
+                }
                 s.push_str(&set_meta);
             }
         }
