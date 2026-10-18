@@ -113,6 +113,7 @@ ts_frame_hdr* g_ts_frame_top = NULL;
 #ifdef TSAOT_RT_STATS
 unsigned long long g_ts_frame_push_count = 0;
 unsigned long long g_ts_pic_get_calls = 0, g_ts_pic_get_hits = 0;
+unsigned long long g_ts_slot_inline_hits = 0, g_ts_slot_external_hits = 0;
 unsigned long long g_ts_pic_set_calls = 0, g_ts_pic_set_hits = 0;
 #endif
 static ts_gc_header** g_remset=NULL; static size_t g_rem_len=0, g_rem_cap=0;
@@ -228,6 +229,10 @@ __attribute__((destructor)) static void ts_rt_stats_dump(void){
           g_ts_pic_get_calls ? 100.0*(double)g_ts_pic_get_hits/(double)g_ts_pic_get_calls : 0.0,
           g_ts_pic_set_calls, g_ts_pic_set_hits,
           g_ts_pic_set_calls ? 100.0*(double)g_ts_pic_set_hits/(double)g_ts_pic_set_calls : 0.0);
+  fprintf(out, "[rt_stats] inline_slots: shape-hit reads inline=%llu external=%llu (%.1f%% inline)\n",
+          g_ts_slot_inline_hits, g_ts_slot_external_hits,
+          (g_ts_slot_inline_hits + g_ts_slot_external_hits)
+            ? 100.0*(double)g_ts_slot_inline_hits/(double)(g_ts_slot_inline_hits + g_ts_slot_external_hits) : 0.0);
   fprintf(out, "[rt_stats] intern: calls=%llu avg_probe=%.2f\n",
           g_rt_stats.intern_calls,
           g_rt_stats.intern_calls ? (double)g_rt_stats.intern_probes/(double)g_rt_stats.intern_calls : 0.0);
@@ -609,18 +614,23 @@ static void ts_root_static_once(tsv* slot, int* rooted){
   *rooted = 1;
 }
 static void ts_proto_register_method(tsv proto, ts_key method_key, const char* name, ts_code fn);
-static tsv ts_new_object_impl(int pretenured){
+static tsv ts_new_object_impl(int pretenured, uint32_t slots){
+  if (slots > TS_INLINE_SLOTS_MAX) slots = TS_INLINE_SLOTS_MAX;
+  size_t size = sizeof(ts_object) + sizeof(tsv) * (size_t)slots;
   ts_object* o = pretenured
-    ? gc_alloc_pretenured(sizeof(ts_object), TS_KIND_OBJECT)
-    : gc_alloc(sizeof(ts_object), TS_KIND_OBJECT);
+    ? gc_alloc_pretenured(size, TS_KIND_OBJECT)
+    : gc_alloc(size, TS_KIND_OBJECT);
+  o->h.inline_cap = (uint8_t)slots;
   o->proto = ts_proto_ref(g_object_proto_v) ? g_object_proto_v : TS_NULL;
   o->shape = TS_SHAPE_EMPTY;
   tsv obj = ts_obj(o);
   if (pretenured) ts_write_barrier(obj, o->proto);
   return obj;
 }
-tsv ts_new_object(void){ return ts_new_object_impl(0); }
-tsv ts_new_object_pretenured(void){ return ts_new_object_impl(1); }
+tsv ts_new_object(void){ return ts_new_object_impl(0, TS_INLINE_SLOTS_DEFAULT); }
+tsv ts_new_object_pretenured(void){ return ts_new_object_impl(1, TS_INLINE_SLOTS_DEFAULT); }
+tsv ts_new_object_n(uint32_t slots){ return ts_new_object_impl(0, slots); }
+tsv ts_new_object_n_pretenured(uint32_t slots){ return ts_new_object_impl(1, slots); }
 static tsv ts_new_proto_impl(int pretenured){
   ts_object* o = pretenured
     ? gc_alloc_pretenured(sizeof(ts_object), TS_KIND_OBJECT)
@@ -1290,12 +1300,13 @@ static void shape_check(const ts_object* o){
    (shape 0) keeps ts_prop entries with keys and flags, plus an optional
    open-addressing index. Sized class instances are always dictionaries. */
 static inline int obj_shaped(const ts_object* o){ return ts_obj_shape_id(o) != TS_SHAPE_NONE; }
-static inline tsv* obj_vals(ts_object* o){ return (tsv*)o->props; }
+/* A shaped object's slot i lives in-object for i < inline_cap, else in the
+   external value vector (o->props, o->cap = its capacity). */
 static inline ts_key obj_key_at(const ts_object* o, uint32_t i){
   return obj_shaped(o) ? g_ts_shape_keys[ts_obj_shape_id(o)][i] : o->props[i].key;
 }
 static inline tsv* obj_val_at(ts_object* o, uint32_t i){
-  return obj_shaped(o) ? &((tsv*)o->props)[i] : &o->props[i].val;
+  return obj_shaped(o) ? ts_obj_slot_ptr(o, i) : &o->props[i].val;
 }
 static inline uint8_t obj_flags_at(const ts_object* o, uint32_t i){
   return obj_shaped(o) ? g_ts_shape_flags[ts_obj_shape_id(o)][i] : o->props[i].flags;
@@ -1405,7 +1416,7 @@ static void props_free_buf(ts_prop* p, uint32_t cap){
   } else free(p);
 }
 static void props_free(ts_object* o){
-  if (obj_shaped(o)) vals_free_buf(obj_vals(o), o->cap);
+  if (obj_shaped(o)) vals_free_buf((tsv*)o->props, o->cap);
   else props_free_buf(o->props, o->cap);
 }
 static void obj_to_dictionary(ts_object* o){
@@ -1413,16 +1424,18 @@ static void obj_to_dictionary(ts_object* o){
   uint32_t sid = ts_obj_shape_id(o);
   uint32_t len = o->len, oldcap = o->cap;
   ts_prop* v = NULL;
-  uint32_t cap = oldcap;
-  if (cap){
-    if (cap <= 4u){ cap = 4u; v = props_alloc_small(); }
+  uint32_t cap = 0;
+  if (len){
+    cap = len <= 4u ? 4u : len;
+    if (cap <= 4u) v = props_alloc_small();
     else v = (ts_prop*)malloc(sizeof(ts_prop) * cap);
     const ts_key* ks = g_ts_shape_keys[sid];
     const uint8_t* fl = g_ts_shape_flags[sid];
-    tsv* vals = obj_vals(o);
-    for (uint32_t i = 0; i < len; i++){ v[i].key = ks[i]; v[i].val = vals[i]; v[i].flags = fl[i]; }
-    vals_free_buf(vals, oldcap);
+    for (uint32_t i = 0; i < len; i++){ v[i].key = ks[i]; v[i].val = *obj_val_at(o, i); v[i].flags = fl[i]; }
   }
+  /* the inline area stays allocated (inline_cap keeps the cell size honest)
+     but a dictionary never reads it; the external vector is released. */
+  if (oldcap) vals_free_buf((tsv*)o->props, oldcap);
   o->props = v; o->cap = cap;
   ts_obj_set_shape(o, TS_SHAPE_NONE);
   if (len >= TS_PROP_INDEX_MIN) prop_index_rebuild(o, len);
@@ -1434,28 +1447,32 @@ static void obj_to_dictionary(ts_object* o){
 static ts_pref props_append_f(ts_object* o, ts_key key, uint32_t next_shape, uint8_t flags){
   int shaped = obj_shaped(o);
   if (shaped && next_shape == TS_SHAPE_NONE){ obj_to_dictionary(o); shaped = 0; }
-  if (o->len==o->cap){
-    uint32_t cap = o->cap;
-    if (shaped){
+  if (shaped){
+    /* slots below inline_cap are in the cell; o->cap counts external slots. */
+    uint32_t icap = o->h.inline_cap;
+    if (o->len >= icap && o->len - icap == o->cap){
+      uint32_t cap = o->cap;
       if (!cap) o->props = (ts_prop*)vals_alloc_small();
       else if (cap == 4){
         tsv* grown = (tsv*)malloc(8u * sizeof(tsv));
-        memcpy(grown, obj_vals(o), cap * sizeof(tsv));
-        vals_free_buf(obj_vals(o), cap); o->props = (ts_prop*)grown;
+        memcpy(grown, (tsv*)o->props, cap * sizeof(tsv));
+        vals_free_buf((tsv*)o->props, cap); o->props = (ts_prop*)grown;
       } else o->props = (ts_prop*)realloc(o->props, sizeof(tsv) * (size_t)cap * 2u);
-    } else {
-      if (!cap) o->props = props_alloc_small();
-      else if (cap == 4){
-        ts_prop* grown = (ts_prop*)malloc(8u * sizeof(ts_prop));
-        memcpy(grown, o->props, cap * sizeof(ts_prop));
-        props_free_buf(o->props, cap); o->props = grown;
-      } else o->props = (ts_prop*)realloc(o->props, sizeof(ts_prop) * (size_t)cap * 2u);
+      o->cap = cap ? cap * 2u : 4u;
     }
+  } else if (o->len==o->cap){
+    uint32_t cap = o->cap;
+    if (!cap) o->props = props_alloc_small();
+    else if (cap == 4){
+      ts_prop* grown = (ts_prop*)malloc(8u * sizeof(ts_prop));
+      memcpy(grown, o->props, cap * sizeof(ts_prop));
+      props_free_buf(o->props, cap); o->props = grown;
+    } else o->props = (ts_prop*)realloc(o->props, sizeof(ts_prop) * (size_t)cap * 2u);
     o->cap = cap ? cap * 2u : 4u;
   }
   if (!shaped) prop_index_reserve(o, o->len + 1u);
   uint32_t added = o->len++;
-  if (shaped) obj_vals(o)[added] = TS_UNDEFINED;
+  if (shaped) *ts_obj_slot_ptr(o, added) = TS_UNDEFINED;
   else { o->props[added].key=key; o->props[added].val=TS_UNDEFINED; o->props[added].flags=flags; }
   /* A user-Symbol property name is a strong edge even though the entry stores
      only its compact id. Enroll old owners when that Symbol is young; the GC
@@ -3673,10 +3690,9 @@ static inline void gc_mark_common_props(ts_object* o, int young, int depth){
   if (obj_shaped(o)){
     if (!o->len) return;
     const ts_key* ks = g_ts_shape_keys[ts_obj_shape_id(o)];
-    tsv* vals = obj_vals(o);
     for (uint32_t i=0;i<o->len;i++){
       gc_mark_property_key(ks[i], young, depth);
-      gc_mark_visit(vals[i], young, depth);
+      gc_mark_visit(*ts_obj_slot_ptr(o, i), young, depth);
     }
     return;
   }
@@ -8209,7 +8225,7 @@ static tsv ts_clone_class_proto(uint32_t class_id){
     p->len = tmpl->len;
     if (obj_shaped(tmpl)){
       p->props = (ts_prop*)malloc(sizeof(tsv) * p->cap);
-      memcpy(p->props, tmpl->props, sizeof(tsv) * tmpl->len);
+      for (uint32_t i = 0; i < tmpl->len; i++) ((tsv*)p->props)[i] = *obj_val_at(tmpl, i);
     } else {
       p->props = malloc(sizeof(ts_prop) * p->cap);
       memcpy(p->props, tmpl->props, sizeof(ts_prop) * tmpl->len);
@@ -8269,7 +8285,11 @@ tsv ts_construct(tsv ctorv, tsv* args, int n){
     ts_gc_root(&ctorv);
     fn_materialize_prototype((ts_func*)ts_ptr(ctorv), ctorv);
     tsv proto = ((ts_func*)ts_ptr(ctorv))->prototype_prop;
-    tsv inst = ts_new_object();
+    /* In-object slack tracking: the first instance gets a generous inline
+       area; afterwards the learned count (largest instance so far plus a
+       little slack) sizes the allocation. */
+    uint8_t est = ((ts_func*)ts_ptr(ctorv))->inst_slots;
+    tsv inst = ts_new_object_n(est ? est : 12u);
     ts_gc_root(&inst);
     ((ts_object*)ts_ptr(inst))->proto = ts_is_obj(proto) ? proto : ts_object_proto();
     int pm = n + 1;
@@ -8282,6 +8302,12 @@ tsv ts_construct(tsv ctorv, tsv* args, int n){
     for (int i = 0; i < n; i++) pcallargs[1 + i] = args[i];
     tsv pr = ts_call(ctorv, pcallargs, pm);
     if (pcallargs != pstack) free(pcallargs);
+    {
+      uint32_t used = ((ts_object*)ts_ptr(inst))->len + 4u;
+      if (used > TS_INLINE_SLOTS_MAX) used = TS_INLINE_SLOTS_MAX;
+      ts_func* cf = (ts_func*)ts_ptr(ctorv);
+      if (used > cf->inst_slots) cf->inst_slots = (uint8_t)used;
+    }
     ts_gc_unroot(2);
     return ts_is_obj(pr) ? pr : inst;
   }
@@ -10641,7 +10667,7 @@ static void prop_ic_note_miss(ts_prop_ic* ic){
   else ic->misses = (uint8_t)((ic->misses & 240u) | misses);
 }
 static void prop_ic_fill_shape(ts_prop_ic* ic, ts_object* o, ts_key key, uint32_t slot){
-  if (!ic || ic->megamorphic || o->h.size != sizeof(ts_object)) return;
+  if (!ic || ic->megamorphic || ts_obj_is_sized(o)) return;
   /* The entry's slot word carries the attribute flags of that slot. Dictionary
      receivers never hit inline (shape 0); their entries only seed the
      out-of-line slot/key validation, which reads flags from the entry vector. */
@@ -10663,7 +10689,7 @@ static void prop_ic_fill_shape(ts_prop_ic* ic, ts_object* o, ts_key key, uint32_
    need only a live key/bounds check, even after deletion or prototype changes.
    This avoids the auxiliary table and keeps small property vectors contiguous. */
 static ts_pref prop_ic_probe_own(ts_prop_ic* ic, ts_object* o, ts_key key){
-  if (!ic || ic->megamorphic || o->h.size != sizeof(ts_object)) return PREF_NONE;
+  if (!ic || ic->megamorphic || ts_obj_is_sized(o)) return PREF_NONE;
   for (uint32_t i=0;i<TS_PROP_IC_SIZE;i++){
     ts_prop_ic_entry* e = &ic->entries[i];
     uint32_t slot = e->slot & TS_PIC_SLOT_MASK;
@@ -10686,7 +10712,7 @@ static ts_pref prop_ic_probe_own(ts_prop_ic* ic, ts_object* o, ts_key key){
 }
 static ts_prop_location* prop_ic_probe(ts_prop_ic* ic, tsv obj, ts_key key){
   ts_object* o = (ts_object*)ts_ptr(obj);
-  if (o->h.size == sizeof(ts_object)) return NULL;
+  if (!ts_obj_is_sized(o)) return NULL;
   ts_prop_location_cache* cache = prop_ic_locations(ic);
   if (!cache) return NULL;
   for (uint32_t i=0;i<TS_PROP_IC_SIZE;i++){
@@ -10727,7 +10753,7 @@ static void prop_ic_fill(ts_prop_ic* ic, ts_object* o, ts_key key, ts_pref p){
   if (!pref_ok(p)) return;
   uint32_t slot = p.i;
   if (slot >= o->len) return;
-  if (o->h.size == sizeof(ts_object)) prop_ic_fill_shape(ic, o, key, slot);
+  if (!ts_obj_is_sized(o)) prop_ic_fill_shape(ic, o, key, slot);
   else prop_ic_fill_entry(ic, o, key, slot, TS_PROP_IC_OWN, 0);
 }
 static void prop_ic_fill_struct(ts_prop_ic* ic, ts_object* o, ts_key key, size_t offset, int numeric){
@@ -10821,7 +10847,7 @@ static inline uint32_t prop_add_slot(const ts_prop_ic* ic, uint32_t shape){
   return x & (TS_PROP_ADD_CACHE_SIZE - 1u);
 }
 static inline ts_prop_add_entry* prop_add_lookup(const ts_prop_ic* ic, ts_object* o, ts_key key){
-  if (!ic || o->h.size != sizeof(ts_object)) return NULL;
+  if (!ic || ts_obj_is_sized(o)) return NULL;
   ts_prop_add_entry* e = &g_prop_add_cache[prop_add_slot(ic, o->shape)];
   if (e->site == ic && e->shape_before == o->shape && e->key == key &&
       e->proto == o->proto && e->epoch == g_prop_add_epoch && e->slot == o->len)
@@ -10830,7 +10856,7 @@ static inline ts_prop_add_entry* prop_add_lookup(const ts_prop_ic* ic, ts_object
 }
 static void prop_add_fill(const ts_prop_ic* ic, ts_object* o, ts_key key, ts_pref p,
                           uint32_t len_before, uint32_t shape_before){
-  if (!ic || !pref_ok(p) || o->h.size != sizeof(ts_object)) return;
+  if (!ic || !pref_ok(p) || ts_obj_is_sized(o)) return;
   if (key >= TS_USERSYM_KEY_BASE) return;
   /* Only a plain append from a cacheable, extensible shape to another one. */
   if ((shape_before & TS_SHAPE_MAX) == TS_SHAPE_NONE || (shape_before >> 29) != 0) return;

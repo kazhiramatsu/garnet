@@ -349,3 +349,24 @@ Final production-default verification after that expansion passed: typed conform
 threshold stress, bundler 39/39, benchmarks 101/101, self-conformance 343 PASS +
 2 KNOWN with zero differences or unclassified UNPORTED results, frozen parity 330
 identical + 15 KNOWN with zero differences, `ci_fast`, and runtime/analyzer unit tests.
+
+## 10. Slot coalescing (Session 350)
+
+Every reference local used to own one slot of the shadow frame, initialized
+to `undefined` on each call and scanned on every collection: the hottest
+checker functions initialized 100 to 400 slots per call
+(`resolveNameHelper` 397). `compute_frame_layout` in `emit_c.rs` now assigns
+slots by live range. A local may share a slot only when its first reference
+is a definition and every later reference lies inside the block of that
+definition (each execution defines before it uses; a later definition in a
+nested block is fine, a use outside that block is not); a reference inside a
+loop whose owning block is inside the definition's block keeps the local
+live to the end of that loop (loop-carried). Everything else (a use before
+any definition, which relies on the entry initialization; a value flowing out
+of its defining block; a catch variable used after the handler) keeps a
+dedicated slot. Operands come from the inliner's exhaustive remapper
+(`sroa::remap_inst_operands`), definitions from `inst_def`
+(`ObjectCopyProps` and `SetProto` read their `dst`). Slots are named `F.s<k>`
+and the frame header receives the slot count; the collector is unchanged (a
+slot may hold a dead local's stale value, as before).
+`TSAOT_FRAME_COALESCE=0` restores one slot per local for the parity oracle.

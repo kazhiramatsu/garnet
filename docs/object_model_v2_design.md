@@ -92,4 +92,19 @@ dependent load from most property reads of small objects, which the Session
   and attribute redefinition convert to a dictionary first. Dictionary objects,
   sized class instances, arrays, functions, maps and sets keep the entry
   representation. Gates and the compiler A/B are recorded in `TODO.md`.
-- A3 (in-object slots): not started.
+- A3 (in-object slots): implemented (Session 350). The GC header's pin word
+  carries `inline_cap`, the number of value slots that follow the 72-byte
+  header of a plain object (`ts_obj_inline_vals`); slot `i` of a shaped
+  object lives in-object for `i < inline_cap` and in the external vector
+  otherwise (`ts_obj_slot_ptr`, used by the inline PIC probe and the
+  `obj_val_at` accessor), and `o->cap` counts external slots only. Sized
+  class instances are told apart by `ts_obj_is_sized` (cell size versus header
+  plus inline area) instead of the old `size == sizeof(ts_object)` test.
+  Sizing policy: object literal sites allocate exactly their field count
+  (`ts_new_object_n`, emitted from the literal's type shape;
+  `TSAOT_INLINE_SLOTS=0` keeps `ts_new_object()` for the parity oracle),
+  plain-function constructors learn an instance size (`ts_func.inst_slots`:
+  first instance 12 slots, then the largest observed count plus 4), and the
+  default is 4. A dictionary conversion keeps the inline area allocated but
+  never reads it; moving collections copy the cell by its size, so inline
+  values travel with it. Fixture `objects/inline_slots`.

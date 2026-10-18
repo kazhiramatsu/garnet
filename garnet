@@ -24,6 +24,10 @@
 #                          emitter's miscompile; parity oracle only).
 #   TSAOT_UNDEF_FIELDS=0   Skip the `undefined` initialization of boxed class
 #                          fields (unassigned fields read as 0; parity oracle only).
+#   TSAOT_INLINE_SLOTS=0   Allocate object literals without in-object value
+#                          slots (`ts_new_object()`; parity oracle only).
+#   TSAOT_FRAME_COALESCE=0 One rooted frame slot per reference local instead
+#                          of liveness-shared slots (parity oracle only).
 #   TSAOT_TYPED_CELLS=0    Exporter: plain-object cells instead of typed `__cell`
 #                          instances (legacy IR; the parity corpus uses it).
 #   TSAOT_CAPTURE_CONTEXTS=0  Exporter: one cell per captured variable instead of
@@ -69,6 +73,8 @@ env: TSAOT_CC (default "cc -O2"), TSAOT_ANALYZER=rust|ts|native (default rust),
      TSAOT_CLOSURE_ENV_ABI=0 for the merged closure argument convention,
      TSAOT_EH_RETURN_POP=0 for the frozen (unpopped-handler) return emission,
      TSAOT_UNDEF_FIELDS=0 for the frozen (zeroed) class field initialization,
+     TSAOT_INLINE_SLOTS=0 for literals without in-object slots,
+     TSAOT_FRAME_COALESCE=0 for one frame slot per local,
      TSAOT_TYPED_CELLS=0 / TSAOT_CAPTURE_CONTEXTS=0 for the legacy capture IR,
      TSAOT_GC_AGE_THRESHOLD=1 for immediate promotion at application runtime,
      TSAOT_GC_AGING_ADAPTIVE=0 for fixed-threshold aging at application runtime,

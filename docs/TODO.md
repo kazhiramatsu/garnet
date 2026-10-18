@@ -4189,13 +4189,62 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   validated against Node): **13.542 → 11.940 s median wall (11.8% less,
   1.13x)**, process CPU 13.5 → 11.9 s, peak RSS 1.27 → 1.26 GB; Node 3.361 s
   in the same session, so the native compiler is now 3.55x slower than V8.
-- Next slices, in the order agreed for the closure-heavy compiler
-  (`docs/v8_parity_roadmap.md`): C5b capture contexts (one scope record per
-  activation holding the captured variables as fixed-offset fields, a single
-  context reference per closure instead of an environment array; typed cells
-  are the stepping stone), then A3 in-object slots, C1 known-arity direct
-  entries, and B pointer-stable old generation. Smaller items still open
-  from the profile: the minor-collection trigger counts cell bytes only
-  (crediting malloc'd payload bytes would release dead payloads sooner), and
-  24M property additions still take the slow path after the addition cache
-  (per-site second entry or shape-only key).
+- Slice A3, in-object slots (`docs/object_model_v2_design.md`). A plain
+  object's first `inline_cap` property values now live inside its cell
+  (the GC header's pin word carries the count), the external vector holds
+  the rest, and the inline cache probe addresses both (`ts_obj_slot_ptr`).
+  Sizing: object literal sites allocate their field count
+  (`ts_new_object_n`, from the literal's type shape; `TSAOT_INLINE_SLOTS=0`
+  keeps `ts_new_object()` for the parity oracle), plain-function
+  constructors learn an instance size (`ts_func.inst_slots`), the default
+  is 4. Sized class instances are now told apart by `ts_obj_is_sized`
+  (cell size versus header plus inline area). The GC header keeps its
+  positional layout through an anonymous union, because the emitted static
+  string literals initialize it positionally. Fixture `objects/inline_slots`.
+  Gates: conformance 414/414, GC stress, bundler 42/42, selfconf 400 + 11
+  KNOWN, parity 329 identical + 80 KNOWN, runtime and Rust units. Compiler
+  A/B against the capture-context build (alternating three runs, outputs
+  validated): 12.251 → 11.903 s median (2.8% less), RSS 1.26 → 1.27 GB;
+  smaller than the design expected. The statistics build explains it: of
+  592.6M cached property gets (98.6% hit rate), the 227.7M that hit on the
+  receiver's own shape split 82.2% inline / 17.8% external, the external
+  ones being properties added to constructor-made objects after their
+  constructor ran. Two follow-ups were measured and rejected: learned
+  instance sizes per prototype (every instance of a prototype grows to the
+  largest observed, 0.6% faster within noise but peak RSS 1.27 → 1.52 GB)
+  and a 16 MB nursery instead of 4 MB (`TSAOT_GC_NURSERY_BYTES`: wall
+  unchanged within noise, peak RSS 1.27 → 1.14 GB, kept as an RSS lever,
+  not a default). GC note from the same run: 1,750 minor and 6 full
+  collections, 1.21 s of pauses.
+- Frame slot coalescing (`docs/root_batching_design.md` §10). Every
+  reference local owned one rooted frame slot, initialized to undefined on
+  every call and scanned on every collection; the hottest checker functions
+  initialized 100 to 400 slots per call (`resolveNameHelper` 397). The
+  emitter now assigns slots by live range over the structured body (a local
+  shares only when its first reference is a definition and all later
+  references stay inside that definition's block; loop-carried values are
+  extended to the loop end; everything else keeps a dedicated slot), using
+  the inliner's exhaustive operand remapper for uses and `inst_def` for
+  definitions. Compiler-wide the frames shrink from 260,568 to 73,287 slots
+  (average 20 → 5.6; `resolveNameHelper` 374 → 29, `isSimpleTypeRelatedTo`
+  83 → 11). `TSAOT_FRAME_COALESCE=0` keeps one slot per local for the parity
+  oracle. Gates: conformance 414/414, GC stress, bundler 42/42, selfconf
+  400 + 11 KNOWN, parity 329 identical + 81 KNOWN (the `objects/inline_slots`
+  fixture's one boxed temporary is a known representation difference),
+  runtime and Rust units, all 102 benchmarks within budget. Compiler A/B
+  against the in-object-slot build (alternating three runs, outputs
+  validated): **11.743 → 11.275 s median wall (4.0% less, 1.04x)**, process
+  CPU 11.8 → 11.3 s, peak RSS 1.27 → 1.25 GB; Node 3.309 s in the same
+  session, so the native compiler is now 3.41x slower than V8.
+- Next slices (`docs/v8_parity_roadmap.md`): B pointer-stable old
+  generation (direct pointers for old cells remove the handle-table load
+  from every object access and from minor marking; needs the identity-
+  normalizing compare first), C1 known-arity direct entries, C5b-2/3 (block
+  records for per-iteration bindings, unboxed numeric record fields). The
+  latest profile puts 59% of samples in generated code, 11% in the collector
+  (1,750 minors per compile, 30.9M closure allocations = 3.7 GB of the
+  young bytes) and 8% in the dynamic call path (`ts_call`/`ts_call_value`).
+  Smaller items still open: the minor-collection trigger counts cell bytes
+  only, 10.3M property additions still take the slow path after the
+  addition cache, and closures passed to non-devirtualized callees are never
+  stack-allocated (the 270 stack-strategy closure sites are all cold).

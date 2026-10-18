@@ -53,7 +53,7 @@ while IFS=$'\t' read -r slug path; do
   # escape-guided pretenuring, lazy function prototypes and the closure
   # environment ABI. Keep this mechanical byte oracle on the explicit legacy
   # mode while production emission uses all of them by default.
-  TSAOT_PROP_PIC=0 TSAOT_FRAME_ROOTS=0 TSAOT_PRETENURE=0 TSAOT_FAST_EXCEPTIONS=0 TSAOT_LAZY_PROTO=0 TSAOT_CLOSURE_ENV_ABI=0 TSAOT_EH_RETURN_POP=0 TSAOT_UNDEF_FIELDS=0 \
+  TSAOT_PROP_PIC=0 TSAOT_FRAME_ROOTS=0 TSAOT_PRETENURE=0 TSAOT_FAST_EXCEPTIONS=0 TSAOT_LAZY_PROTO=0 TSAOT_CLOSURE_ENV_ABI=0 TSAOT_EH_RETURN_POP=0 TSAOT_UNDEF_FIELDS=0 TSAOT_INLINE_SLOTS=0 TSAOT_FRAME_COALESCE=0 \
     "$RUST" "$prog" emit > "$W/r.c" 2>/dev/null || { skip=$((skip+1)); continue; }
   astatus=$(awk -F'\t' -v n="$slug" '$1==n{print $2; exit}' "$W/an.status")
   areason=$(awk -F'\t' -v n="$slug" '$1==n{$1=$2=""; sub(/^[[:space:]]+/, ""); print; exit}' "$W/an.status")

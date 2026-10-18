@@ -132,7 +132,15 @@ int ts_truthy(tsv v);
 enum { TS_KIND_OBJECT = 1, TS_KIND_STRING = 2, TS_KIND_FUNC = 3, TS_KIND_ARRAY = 4, TS_KIND_MAP = 5, TS_KIND_SET = 6, TS_KIND_PROMISE = 7, TS_KIND_CORO = 8, TS_KIND_ACCESSOR = 9, TS_KIND_SYMBOL = 10, TS_KIND_PROXY = 11 };
 typedef struct ts_gc_header {
   uint8_t kind, mark, gen, remembered;
-  uint32_t pin_depth; /* temporarily non-movable while raw pointers are active */
+  /* One 32-bit word so positional initializers of static cells (string
+     literals) keep their shape: pin_depth = temporarily non-movable while raw
+     pointers are active; inline_cap (object model v2, slice A3) = number of
+     in-object value slots after the ts_object header of a plain object, 0 for
+     every other kind and for sized class instances. */
+  union {
+    uint32_t pin_word;
+    struct { uint16_t pin_depth; uint8_t inline_cap; uint8_t hdr_spare; };
+  };
   uint64_t handle; /* odd handle payload for heap refs; 0 for stack/SROA direct refs */
   size_t size;     /* allocated cell bytes; needed to copy variable-sized heap cells */
   struct ts_gc_header* gc_next;
@@ -290,14 +298,17 @@ typedef struct {
 #define TS_PROP_IC_INIT {0}
 #ifdef TSAOT_RT_STATS
 extern unsigned long long g_ts_pic_get_calls, g_ts_pic_get_hits;
+extern unsigned long long g_ts_slot_inline_hits, g_ts_slot_external_hits;
 extern unsigned long long g_ts_pic_set_calls, g_ts_pic_set_hits;
 #define TS_RT_STAT_PIC_GET_CALL() (g_ts_pic_get_calls++)
 #define TS_RT_STAT_PIC_GET_HIT()  (g_ts_pic_get_hits++)
+#define TS_RT_STAT_SLOT(o, slot) ((slot) < (o)->h.inline_cap ? g_ts_slot_inline_hits++ : g_ts_slot_external_hits++)
 #define TS_RT_STAT_PIC_SET_CALL() (g_ts_pic_set_calls++)
 #define TS_RT_STAT_PIC_SET_HIT()  (g_ts_pic_set_hits++)
 #else
 #define TS_RT_STAT_PIC_GET_CALL() ((void)0)
 #define TS_RT_STAT_PIC_GET_HIT()  ((void)0)
+#define TS_RT_STAT_SLOT(o, slot) ((void)0)
 #define TS_RT_STAT_PIC_SET_CALL() ((void)0)
 #define TS_RT_STAT_PIC_SET_HIT()  ((void)0)
 #endif
@@ -344,6 +355,21 @@ static inline void ts_obj_set_shape(ts_object* o, uint32_t shape){
 }
 static inline void ts_obj_add_integrity(ts_object* o, uint32_t flags){
   o->shape |= (flags & 7u) << 29;
+}
+/* In-object value slots (docs/object_model_v2_design.md, slice A3): a plain
+   object allocated with inline capacity keeps its first inline_cap property
+   values right after the header; the external vector holds the rest. */
+#define TS_INLINE_SLOTS_DEFAULT 4u
+#define TS_INLINE_SLOTS_MAX 255u
+static inline tsv* ts_obj_inline_vals(ts_object* o){ return (tsv*)((char*)o + sizeof(ts_object)); }
+static inline tsv* ts_obj_slot_ptr(ts_object* o, uint32_t slot){
+  uint32_t ic = o->h.inline_cap;
+  return slot < ic ? &ts_obj_inline_vals(o)[slot] : &((tsv*)o->props)[slot - ic];
+}
+/* A sized class instance (registered struct storage after the header) versus
+   a plain object whose cell is the header plus its inline slots. */
+static inline int ts_obj_is_sized(const ts_object* o){
+  return o->h.size != sizeof(ts_object) + sizeof(tsv) * (size_t)o->h.inline_cap;
 }
 
 enum {
@@ -781,7 +807,9 @@ typedef struct ts_func {
      ABI, production emitter). 0: the legacy merged convention, where ts_call
      prepends env to the argument array (runtime thunks, frozen emitter). */
   uint8_t env_abi;
-  uint8_t reserved_abi;
+  /* Plain-function constructor (`new fn()`): learned in-object slot count for
+     its instances (0 = not constructed yet); grows with the largest instance. */
+  uint8_t inst_slots;
   const char* name;
   /* JS own "prototype" data property for constructable functions/classes.
      TS_UNDEFINED means this function has no own prototype property (arrows,
@@ -792,6 +820,9 @@ typedef struct ts_func {
 /* runtime API */
 tsv  ts_new_object(void);
 tsv  ts_new_object_pretenured(void);
+/* plain object with `slots` in-object value slots (object literal sites). */
+tsv  ts_new_object_n(uint32_t slots);
+tsv  ts_new_object_n_pretenured(uint32_t slots);
 tsv  ts_new_proto(void);   /* a plain object used as a class prototype */
 tsv  ts_new_proto_pretenured(void);
 tsv  ts_object_proto(void);
@@ -1419,7 +1450,8 @@ TS_RT_ALWAYS_INLINE tsv* ts_prop_ic_probe_fixed_inline(
     ts_prop_ic_entry* e = &ic->entries[i];
     if (e->shape == o->shape){
       *flags = (uint8_t)(e->slot >> TS_PIC_FLAGS_SHIFT);
-      return &((tsv*)o->props)[e->slot & TS_PIC_SLOT_MASK];
+      TS_RT_STAT_SLOT(o, e->slot & TS_PIC_SLOT_MASK);
+      return ts_obj_slot_ptr(o, e->slot & TS_PIC_SLOT_MASK);
     }
   }
   /* Shape-polymorphic sites (one key read across many constructor-initialized
@@ -1436,7 +1468,7 @@ TS_RT_ALWAYS_INLINE tsv* ts_prop_ic_probe_fixed_inline(
     uint32_t slot = e->slot & TS_PIC_SLOT_MASK;
     if (e->shape != TS_SHAPE_NONE && slot < o->len && g_ts_shape_keys[sid][slot] == key){
       *flags = g_ts_shape_flags[sid][slot];
-      return &((tsv*)o->props)[slot];
+      return ts_obj_slot_ptr(o, slot);
     }
   }
   return NULL;

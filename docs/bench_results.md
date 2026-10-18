@@ -597,3 +597,26 @@ That is **11.8% less wall time** (1.13x). The generated C shrank from 67.4
 to 62.1 MB (fewer cell allocations and environment copies). Native is now
 3.55x slower than V8 on this machine state (7.3x at the start of Session
 349). Raw record: `native_s350h/results/run-pk3jrt0a/`.
+
+### In-object slots and frame slot coalescing (Session 350)
+
+Two more steps on the same compiler workload, each measured against the
+build before it with three alternating runs after warmup, diagnostics and all
+78 emitted files matching Node on every launch:
+
+| step | median wall | median process CPU | median peak RSS |
+|---|---:|---:|---:|
+| Capture-context build (`native_s350h`) | 12.251 s | 12.2 s | 1.26 GB |
+| + in-object slots (`native_s350i`, A3) | 11.903 s | 11.9 s | 1.27 GB |
+| + frame slot coalescing (`native_s350j`) | **11.275 s** | **11.3 s** | 1.25 GB |
+| Node 25.2.1 / V8 (same sessions) | 3.31–3.34 s | 6.1 s | 0.79 GB |
+
+In-object slots (the first `inline_cap` values live in the object's cell)
+gave 2.8%: the statistics build shows 98.6% of cached property gets hitting,
+and of the shape hits 82% already landing inline, the rest being properties
+added to constructor-made objects after construction. Frame slot coalescing
+(reference locals share rooted frame slots by live range) gave 4.0%: the
+compiler's frames shrink from 260,568 to 73,287 slots, so a call initializes
+and a collection scans a fifth of the slots. Native is now 3.41x slower than
+V8 on this machine state. Raw records: `native_s350i/results/run-535ko12w/`,
+`native_s350j/results/run-yy2njb_k/`.

@@ -2692,7 +2692,7 @@ fn inline_callee(
 /// exhaustive over `Inst`: an unhandled variant emitted with original local
 /// IDs would silently read from the caller's wrong locals (the bug this
 /// helper fixes — see `classes__basic` conformance test).
-fn remap_inst_operands(inst: &Inst, m: &dyn Fn(LocalId) -> LocalId) -> Inst {
+pub(crate) fn remap_inst_operands(inst: &Inst, m: &dyn Fn(LocalId) -> LocalId) -> Inst {
     let mremap = |i: &Inst| remap_inst_operands(i, m);
     let mvec = |body: &[Inst]| body.iter().map(&mremap).collect::<Vec<_>>();
     let mopt = |o: &Option<LocalId>| o.map(|l| m(l));

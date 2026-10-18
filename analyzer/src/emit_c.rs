@@ -316,6 +316,7 @@ fn emit_program_with_string_plans(
         .map(|f| (f.id.0, f.takes_this))
         .collect();
     set_fn_capture_counts(program);
+    set_type_field_counts(program);
     let indirect_funcs = infer_indirect_funcs(program);
     let param_facts_by_func = infer_program_param_facts(program, &indirect_funcs);
     let i64_fast = infer_i64_fast_funcs(program, &indirect_funcs, &param_facts_by_func);
@@ -1330,6 +1331,8 @@ struct Ctx<'a> {
     /// Boxed locals carried by a generated shadow-root frame. Empty for
     /// coroutine emitters and when frame roots are disabled.
     frame_locals: BTreeSet<u32>,
+    /// coalesced frame slot of each frame local (None: one slot per local)
+    frame_slot: Option<BTreeMap<u32, u32>>,
     nroot: usize,
     /// locals known to hold a nonzero integer constant (safe divisor for integer %)
     nonzero_int_const: BTreeSet<u32>,
@@ -1360,6 +1363,11 @@ struct Ctx<'a> {
 impl<'a> Ctx<'a> {
     fn vname(&self, id: u32) -> String {
         if self.frame_locals.contains(&id) {
+            if let Some(m) = &self.frame_slot {
+                if let Some(sl) = m.get(&id) {
+                    return format!("F.s{}", sl);
+                }
+            }
             format!("F.v{}", id)
         } else {
             format!("v{}", id)
@@ -1582,9 +1590,380 @@ fn closure_env_abi_enabled() -> bool {
         )
     })
 }
+/// Frame slot coalescing: reference locals whose live ranges do not overlap
+/// share one rooted frame slot, so a call initializes (and the collector
+/// scans) only as many slots as are simultaneously live. TSAOT_FRAME_COALESCE=0
+/// keeps one slot per local (the frozen emission) for the parity oracle.
+fn frame_coalesce_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_FRAME_COALESCE").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
+/// The local an instruction writes, when its `dst` really is a definition
+/// (ObjectCopyProps and SetProto read theirs; control flow has none).
+fn inst_def(inst: &Inst) -> Option<u32> {
+    match inst {
+        Inst::AllocObject { dst, .. }
+        | Inst::AllocArray { dst, .. }
+        | Inst::AllocClosure { dst, .. }
+        | Inst::Copy { dst, .. }
+        | Inst::LoadField { dst, .. }
+        | Inst::LoadMethodValue { dst, .. }
+        | Inst::LoadBuiltinFn { dst, .. }
+        | Inst::AllocClassValue { dst, .. }
+        | Inst::NewDynamic { dst, .. }
+        | Inst::LoadElem { dst, .. }
+        | Inst::LoadGlobal { dst, .. }
+        | Inst::Const { dst, .. }
+        | Inst::BinOp { dst, .. }
+        | Inst::UnOp { dst, .. }
+        | Inst::LoadIndex { dst, .. }
+        | Inst::ArrayLen { dst, .. }
+        | Inst::StringLen { dst, .. }
+        | Inst::HasField { dst, .. }
+        | Inst::HasFieldDynamic { dst, .. }
+        | Inst::GenericLen { dst, .. }
+        | Inst::LoadFieldDynamic { dst, .. }
+        | Inst::ArraySlice { dst, .. }
+        | Inst::ObjectRest { dst, .. }
+        | Inst::ConstructResult { dst, .. }
+        | Inst::LoadClassProto { dst, .. }
+        | Inst::GetProto { dst, .. }
+        | Inst::NewMap { dst }
+        | Inst::NewSet { dst } => Some(dst.0),
+        Inst::Call { dst, .. }
+        | Inst::CallSpread { dst, .. }
+        | Inst::CallBuiltin { dst, .. }
+        | Inst::CallBuiltinStatic { dst, .. }
+        | Inst::Yield { dst, .. }
+        | Inst::Await { dst, .. }
+        | Inst::DeleteField { dst, .. } => dst.map(|d| d.0),
+        _ => None,
+    }
+}
+
+/// Every local an instruction mentions (definition included), through the
+/// inliner's exhaustive operand remapper; not for the structured instructions.
+fn inst_refs(inst: &Inst) -> Vec<u32> {
+    let refs = std::cell::RefCell::new(Vec::new());
+    let _ = crate::sroa::remap_inst_operands(inst, &|l: LocalId| {
+        refs.borrow_mut().push(l.0);
+        l
+    });
+    refs.into_inner()
+}
+
+struct FrameLayout {
+    slot_of: BTreeMap<u32, u32>,
+    nslots: u32,
+}
+
+/// Live-range walk over the structured body. A local may share a slot only
+/// when its first reference is a definition and every later reference sits
+/// inside the block of that definition (so each execution defines before it
+/// uses); a reference inside a loop whose body lies inside the definition's
+/// block keeps the local live to the end of that loop (it is loop-carried).
+struct LiveWalk {
+    pos: u32,
+    parent: Vec<u32>,
+    stack: Vec<u32>,
+    loops: Vec<(u32, u32, u32)>, // (start, end, block that holds the Loop)
+    loop_stack: Vec<usize>,
+    first: BTreeMap<u32, (u32, Option<u32>)>, // (position, Some(def block) | None: never share)
+    last: BTreeMap<u32, u32>,
+    pending: Vec<(u32, usize)>,
+}
+
+impl LiveWalk {
+    fn within(&self, mut b: u32, d: u32) -> bool {
+        loop {
+            if b == d {
+                return true;
+            }
+            if b == 0 {
+                return false;
+            }
+            b = self.parent[b as usize];
+        }
+    }
+    fn block(&mut self) -> u32 {
+        let id = self.parent.len() as u32;
+        let cur = *self.stack.last().unwrap();
+        self.parent.push(cur);
+        id
+    }
+    fn touch_last(&mut self, id: u32, p: u32) {
+        let e = self.last.entry(id).or_insert(p);
+        if p > *e {
+            *e = p;
+        }
+    }
+    fn note_use(&mut self, id: u32, p: u32) {
+        let blk = *self.stack.last().unwrap();
+        match self.first.get(&id).copied() {
+            None => {
+                self.first.insert(id, (p, None));
+            }
+            Some((_, None)) => {}
+            Some((fp, Some(d))) => {
+                if !self.within(blk, d) {
+                    self.first.insert(id, (fp, None));
+                } else {
+                    for &li in &self.loop_stack {
+                        if self.within(self.loops[li].2, d) {
+                            self.pending.push((id, li));
+                        }
+                    }
+                }
+            }
+        }
+        self.touch_last(id, p);
+    }
+    fn note_def(&mut self, id: u32, p: u32) {
+        let blk = *self.stack.last().unwrap();
+        if !self.first.contains_key(&id) {
+            self.first.insert(id, (p, Some(blk)));
+        }
+        self.touch_last(id, p);
+    }
+    fn walk(&mut self, body: &[Inst]) {
+        for inst in body {
+            let p = self.pos;
+            self.pos += 1;
+            match inst {
+                Inst::If {
+                    cond,
+                    then_body,
+                    else_body,
+                } => {
+                    self.note_use(cond.0, p);
+                    let b1 = self.block();
+                    self.stack.push(b1);
+                    self.walk(then_body);
+                    self.stack.pop();
+                    let b2 = self.block();
+                    self.stack.push(b2);
+                    self.walk(else_body);
+                    self.stack.pop();
+                }
+                Inst::Loop {
+                    cond,
+                    cond_body,
+                    body,
+                } => {
+                    let owner = *self.stack.last().unwrap();
+                    let li = self.loops.len();
+                    self.loops.push((p, u32::MAX, owner));
+                    self.loop_stack.push(li);
+                    let b1 = self.block();
+                    self.stack.push(b1);
+                    self.walk(cond_body);
+                    let cp = self.pos;
+                    self.pos += 1;
+                    self.note_use(cond.0, cp);
+                    self.stack.pop();
+                    let b2 = self.block();
+                    self.stack.push(b2);
+                    self.walk(body);
+                    self.stack.pop();
+                    self.loop_stack.pop();
+                    self.loops[li].1 = self.pos;
+                    self.pos += 1;
+                }
+                Inst::TryCatch {
+                    try_body,
+                    catch_var,
+                    catch_body,
+                    finally_body,
+                } => {
+                    let b1 = self.block();
+                    self.stack.push(b1);
+                    self.walk(try_body);
+                    self.stack.pop();
+                    let b2 = self.block();
+                    self.stack.push(b2);
+                    if let Some(cv) = catch_var {
+                        let q = self.pos;
+                        self.pos += 1;
+                        self.note_def(cv.0, q);
+                    }
+                    self.walk(catch_body);
+                    self.stack.pop();
+                    let b3 = self.block();
+                    self.stack.push(b3);
+                    self.walk(finally_body);
+                    self.stack.pop();
+                }
+                leaf => {
+                    let refs = inst_refs(leaf);
+                    let def = inst_def(leaf);
+                    for &r in &refs {
+                        if Some(r) != def {
+                            self.note_use(r, p);
+                        }
+                    }
+                    if let Some(d) = def {
+                        if refs.iter().filter(|&&r| r == d).count() >= 2 {
+                            self.note_use(d, p);
+                        } else {
+                            self.note_def(d, p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn compute_frame_layout(f: &Function, reflike: &[u32]) -> FrameLayout {
+    let mut w = LiveWalk {
+        pos: 1,
+        parent: vec![0],
+        stack: vec![0],
+        loops: Vec::new(),
+        loop_stack: Vec::new(),
+        first: BTreeMap::new(),
+        last: BTreeMap::new(),
+        pending: Vec::new(),
+    };
+    for prm in &f.params {
+        w.first.insert(prm.0, (0, Some(0)));
+        w.last.insert(prm.0, 0);
+    }
+    if let Some(r) = f.rest_param {
+        w.first.insert(r, (0, Some(0)));
+        w.last.insert(r, 0);
+    }
+    w.walk(&f.body);
+    let pending = std::mem::take(&mut w.pending);
+    for (id, li) in pending {
+        let end = w.loops[li].1;
+        w.touch_last(id, end);
+    }
+    let in_frame: BTreeSet<u32> = reflike.iter().copied().collect();
+    let mut shareable: Vec<(u32, u32, u32)> = Vec::new();
+    let mut dedicated: Vec<u32> = Vec::new();
+    for &id in reflike {
+        match w.first.get(&id) {
+            Some((fp, Some(_))) => shareable.push((*fp, w.last[&id], id)),
+            _ => dedicated.push(id),
+        }
+    }
+    let _ = in_frame;
+    shareable.sort_unstable();
+    let mut slot_of = BTreeMap::new();
+    let mut next: u32 = 0;
+    let mut active: Vec<(u32, u32)> = Vec::new(); // (last, slot)
+    let mut free: Vec<u32> = Vec::new();
+    for (fp, lp, id) in shareable {
+        let mut i = 0;
+        while i < active.len() {
+            if active[i].0 < fp {
+                free.push(active[i].1);
+                active.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        let slot = match free.pop() {
+            Some(sl) => sl,
+            None => {
+                next += 1;
+                next - 1
+            }
+        };
+        slot_of.insert(id, slot);
+        active.push((lp, slot));
+    }
+    for id in dedicated {
+        slot_of.insert(id, next);
+        next += 1;
+    }
+    FrameLayout { slot_of, nslots: next }
+}
+
+fn emit_frame_decl(s: &mut String, reflike: &[u32], layout: Option<&FrameLayout>) {
+    s.push_str("  struct { ts_frame_hdr h;");
+    match layout {
+        Some(l) => {
+            for k in 0..l.nslots {
+                let _ = write!(s, " tsv s{};", k);
+            }
+            s.push_str(" } F;\n");
+            for k in 0..l.nslots {
+                let _ = writeln!(s, "  F.s{} = TS_UNDEFINED;", k);
+            }
+        }
+        None => {
+            for id in reflike {
+                let _ = write!(s, " tsv v{};", id);
+            }
+            s.push_str(" } F;\n");
+            for id in reflike {
+                let _ = writeln!(s, "  F.v{} = TS_UNDEFINED;", id);
+            }
+        }
+    }
+}
+
+fn frame_slot_count(reflike: &[u32], layout: Option<&FrameLayout>) -> usize {
+    match layout {
+        Some(l) => l.nslots as usize,
+        None => reflike.len(),
+    }
+}
+
+fn frame_local_name(id: u32, frame_locals: &BTreeSet<u32>, layout: Option<&FrameLayout>) -> String {
+    if frame_locals.contains(&id) {
+        if let Some(l) = layout {
+            if let Some(sl) = l.slot_of.get(&id) {
+                return format!("F.s{}", sl);
+            }
+        }
+        format!("F.v{}", id)
+    } else {
+        format!("v{}", id)
+    }
+}
+
 thread_local! {
     static FN_CAPTURE_COUNTS: std::cell::RefCell<BTreeMap<u32, u32>> =
         std::cell::RefCell::new(BTreeMap::new());
+}
+thread_local! {
+    static TYPE_FIELD_COUNTS: std::cell::RefCell<BTreeMap<u32, u32>> =
+        std::cell::RefCell::new(BTreeMap::new());
+}
+/// Object literal sizes for in-object slot allocation (type id -> field count).
+fn set_type_field_counts(program: &Program) {
+    TYPE_FIELD_COUNTS.with(|m| {
+        let mut m = m.borrow_mut();
+        m.clear();
+        for t in &program.types {
+            if let TypeShape::Object { fields } = &t.shape {
+                m.insert(t.id.0, fields.len() as u32);
+            }
+        }
+    });
+}
+fn type_field_count(type_id: u32) -> Option<u32> {
+    TYPE_FIELD_COUNTS.with(|m| m.borrow().get(&type_id).copied())
+}
+/// TSAOT_INLINE_SLOTS=0 allocates object literals without an inline area
+/// (`ts_new_object()`, the frozen emission) for the parity oracle.
+fn inline_slots_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_INLINE_SLOTS").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
 }
 fn set_fn_capture_counts(program: &Program) {
     FN_CAPTURE_COUNTS.with(|m| {
@@ -5028,6 +5407,11 @@ fn emit_i64_function(
     } else {
         BTreeSet::new()
     };
+    let frame_layout = if use_frame_roots && frame_coalesce_enabled() {
+        Some(compute_frame_layout(f, &reflike))
+    } else {
+        None
+    };
     let _ = writeln!(s, "{} long long {}({}){{", storage, i64_cname(f), params);
     for l in &f.locals {
         if int_local.contains(&l.id.0) {
@@ -5039,20 +5423,13 @@ fn emit_i64_function(
         }
     }
     if use_frame_roots {
-        s.push_str("  struct { ts_frame_hdr h;");
-        for id in &reflike {
-            let _ = write!(s, " tsv v{};", id);
-        }
-        s.push_str(" } F;\n");
-        for id in &reflike {
-            let _ = writeln!(s, "  F.v{} = TS_UNDEFINED;", id);
-        }
+        emit_frame_decl(s, &reflike, frame_layout.as_ref());
     }
     for (i, p) in info.params.iter().enumerate() {
         let _ = writeln!(s, "  d{} = _p{};", p, i);
     }
     if use_frame_roots {
-        let _ = writeln!(s, "  ts_frame_push(&F.h, {});", reflike.len());
+        let _ = writeln!(s, "  ts_frame_push(&F.h, {});", frame_slot_count(&reflike, frame_layout.as_ref()));
     } else {
         for id in &reflike {
             let _ = writeln!(s, "  ts_gc_root(&v{});", id);
@@ -5086,6 +5463,7 @@ fn emit_i64_function(
         i64_mode: true,
         f64_mode: false,
         frame_locals,
+        frame_slot: frame_layout.as_ref().map(|l| l.slot_of.clone()),
         nroot,
         nonzero_int_const,
         nonzero_int,
@@ -5172,6 +5550,11 @@ fn emit_f64_function(
     } else {
         BTreeSet::new()
     };
+    let frame_layout = if use_frame_roots && frame_coalesce_enabled() {
+        Some(compute_frame_layout(f, &reflike))
+    } else {
+        None
+    };
     let _ = writeln!(s, "{} double {}({}){{", storage, f64_cname(f), params);
     for l in &f.locals {
         if int_local.contains(&l.id.0) {
@@ -5183,20 +5566,13 @@ fn emit_f64_function(
         }
     }
     if use_frame_roots {
-        s.push_str("  struct { ts_frame_hdr h;");
-        for id in &reflike {
-            let _ = write!(s, " tsv v{};", id);
-        }
-        s.push_str(" } F;\n");
-        for id in &reflike {
-            let _ = writeln!(s, "  F.v{} = TS_UNDEFINED;", id);
-        }
+        emit_frame_decl(s, &reflike, frame_layout.as_ref());
     }
     for (i, p) in info.params.iter().enumerate() {
         let _ = writeln!(s, "  d{} = _p{};", p, i);
     }
     if use_frame_roots {
-        let _ = writeln!(s, "  ts_frame_push(&F.h, {});", reflike.len());
+        let _ = writeln!(s, "  ts_frame_push(&F.h, {});", frame_slot_count(&reflike, frame_layout.as_ref()));
     } else {
         for id in &reflike {
             let _ = writeln!(s, "  ts_gc_root(&v{});", id);
@@ -5230,6 +5606,7 @@ fn emit_f64_function(
         i64_mode: false,
         f64_mode: true,
         frame_locals,
+        frame_slot: frame_layout.as_ref().map(|l| l.slot_of.clone()),
         nroot,
         nonzero_int_const,
         nonzero_int,
@@ -5323,6 +5700,7 @@ fn emit_function(
             i64_mode: false,
             f64_mode: false,
             frame_locals: BTreeSet::new(),
+            frame_slot: None,
             nroot: 0,
             nonzero_int_const,
             nonzero_int,
@@ -5365,6 +5743,7 @@ fn emit_function(
             i64_mode: false,
             f64_mode: false,
             frame_locals: BTreeSet::new(),
+            frame_slot: None,
             nroot: 0,
             nonzero_int_const,
             nonzero_int,
@@ -5407,6 +5786,7 @@ fn emit_function(
             i64_mode: false,
             f64_mode: false,
             frame_locals: BTreeSet::new(),
+            frame_slot: None,
             nroot: 0,
             nonzero_int_const,
             nonzero_int,
@@ -5441,6 +5821,11 @@ fn emit_function(
     } else {
         BTreeSet::new()
     };
+    let frame_layout = if use_frame_roots && frame_coalesce_enabled() {
+        Some(compute_frame_layout(f, &reflike))
+    } else {
+        None
+    };
     let _ = writeln!(s, "static tsv {}(tsv* args, int nargs){{", cname(f));
     s.push_str("  (void)nargs;\n");
     for l in &f.locals {
@@ -5455,14 +5840,7 @@ fn emit_function(
         }
     }
     if use_frame_roots {
-        s.push_str("  struct { ts_frame_hdr h;");
-        for id in &reflike {
-            let _ = write!(s, " tsv v{};", id);
-        }
-        s.push_str(" } F;\n");
-        for id in &reflike {
-            let _ = writeln!(s, "  F.v{} = TS_UNDEFINED;", id);
-        }
+        emit_frame_decl(s, &reflike, frame_layout.as_ref());
     }
     if !json_roots.is_empty() {
         s.push_str("  ts_json_dom_scope _json_dom_scope = {0};\n");
@@ -5491,11 +5869,7 @@ fn emit_function(
             } else if unboxed.contains(&p.0) {
                 let _ = writeln!(s, "  d{} = ts_to_num(_env[{}]);", p.0, i);
             } else {
-                let name = if frame_locals.contains(&p.0) {
-                    format!("F.v{}", p.0)
-                } else {
-                    format!("v{}", p.0)
-                };
+                let name = frame_local_name(p.0, &frame_locals, frame_layout.as_ref());
                 let _ = writeln!(s, "  {} = _env[{}];", name, i);
             }
             continue;
@@ -5510,16 +5884,12 @@ fn emit_function(
         } else if unboxed.contains(&p.0) {
             let _ = writeln!(s, "  if (nargs > {}) d{} = ts_to_num(args[{}]);", j, p.0, j);
         } else {
-            let name = if frame_locals.contains(&p.0) {
-                format!("F.v{}", p.0)
-            } else {
-                format!("v{}", p.0)
-            };
+            let name = frame_local_name(p.0, &frame_locals, frame_layout.as_ref());
             let _ = writeln!(s, "  if (nargs > {}) {} = args[{}];", j, name, j);
         }
     }
     if use_frame_roots {
-        let _ = writeln!(s, "  ts_frame_push(&F.h, {});", reflike.len());
+        let _ = writeln!(s, "  ts_frame_push(&F.h, {});", frame_slot_count(&reflike, frame_layout.as_ref()));
     } else {
         for id in &reflike {
             let _ = writeln!(s, "  ts_gc_root(&v{});", id);
@@ -5539,11 +5909,7 @@ fn emit_function(
             .iter()
             .position(|p| p.0 == rest_id)
             .unwrap_or(f.params.len().saturating_sub(1));
-        let rest_name = if frame_locals.contains(&rest_id) {
-            format!("F.v{}", rest_id)
-        } else {
-            format!("v{}", rest_id)
-        };
+        let rest_name = frame_local_name(rest_id, &frame_locals, frame_layout.as_ref());
         let _ = writeln!(s, "  {} = ts_new_array(0);", rest_name);
         let _ = writeln!(
             s,
@@ -5576,6 +5942,7 @@ fn emit_function(
         i64_mode: false,
         f64_mode: false,
         frame_locals,
+        frame_slot: frame_layout.as_ref().map(|l| l.slot_of.clone()),
         nroot,
         nonzero_int_const,
         nonzero_int,
@@ -14185,6 +14552,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             site,
             class_id,
             proto,
+            type_id,
             ..
         } => {
             let st = ctx
@@ -14249,11 +14617,30 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     } else {
                         "ts_new_object"
                     };
-                    let _ = writeln!(
-                        s,
-                        "  {} = {}(); /* site {} {:?} */",
-                        ctx.vname(dst.0), alloc, site.0, st
-                    );
+                    // An object literal with a statically known field list gets
+                    // exactly that many in-object slots; the default capacity
+                    // serves the rest.
+                    let slots = if inline_slots_enabled() {
+                        type_field_count(type_id.0).filter(|n| *n > 0)
+                    } else {
+                        None
+                    };
+                    match slots {
+                        Some(n) => {
+                            let _ = writeln!(
+                                s,
+                                "  {} = {}_n({}); /* site {} {:?} */",
+                                ctx.vname(dst.0), alloc, n, site.0, st
+                            );
+                        }
+                        None => {
+                            let _ = writeln!(
+                                s,
+                                "  {} = {}(); /* site {} {:?} */",
+                                ctx.vname(dst.0), alloc, site.0, st
+                            );
+                        }
+                    }
                 }
             }
         }
