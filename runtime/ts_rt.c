@@ -3805,6 +3805,31 @@ tsv ts_str_concat_many(tsv* args, int n){
 #undef PART_VIEW
 /* Out-of-line tail of the header's ts_strict_eq: reached for two distinct
    string values (and kept complete so runtime callers may use it directly). */
+int ts_strict_eq_str(tsv a, tsv b){
+  /* two immediate short strings are canonical: different bits, different strings */
+  if (ts_is_short_str(a) && ts_is_short_str(b)) return 0;
+  /* different lengths: different strings, before any view is built
+     (a string switch tests its discriminant against every label) */
+  uint32_t la = ts_is_short_str(a) ? ts_short_str_len(a) : ts_str_ptr_typed(a)->len;
+  uint32_t lb = ts_is_short_str(b) ? ts_short_str_len(b) : ts_str_ptr_typed(b)->len;
+  if (la != lb) return 0;
+  return ts_strict_eq_slow(a, b);
+}
+int32_t ts_to_int32_slow(double d){
+  if (d != d || d == (1.0/0.0) || d == -(1.0/0.0)) return 0;
+  double t = (d < 0) ? -floor(-d) : floor(d);   /* truncate toward zero */
+  double m = fmod(t, 4294967296.0);             /* mod 2^32 */
+  if (m < 0) m += 4294967296.0;
+  uint32_t u = (uint32_t)m;
+  return (int32_t)u;
+}
+uint32_t ts_to_uint32_slow(double d){
+  if (d != d || d == (1.0/0.0) || d == -(1.0/0.0)) return 0;
+  double t = (d < 0) ? -floor(-d) : floor(d);
+  double m = fmod(t, 4294967296.0);
+  if (m < 0) m += 4294967296.0;
+  return (uint32_t)m;
+}
 int ts_strict_eq_slow(tsv a, tsv b){
   if (a == b) return !(ts_is_num(a) && ts_to_num(a) != ts_to_num(a));
   if (ts_is_num(a)&&ts_is_num(b)) return ts_to_num(a)==ts_to_num(b);

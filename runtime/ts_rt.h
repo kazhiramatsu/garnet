@@ -90,7 +90,12 @@ static inline int ts_is_num(tsv v) { uint16_t t = TS_TOP16(v); return t < TS_SEL
 static inline double ts_to_num(tsv v) { double d; memcpy(&d, &v, 8); return d; }
 /* JS ToInt32 / ToUint32 (ECMA-262): NaN/Inf -> 0; truncate toward zero; reduce
    modulo 2^32; interpret as signed/unsigned 32-bit. Used by bitwise operators. */
-static inline int32_t ts_to_int32(double d) {
+/* ToInt32 / ToUint32 of a value outside the exact range: NaN and infinities
+   are 0, the rest truncates toward zero modulo 2^32 (out of line so the
+   inline fast path stays a compare and a conversion). */
+int32_t ts_to_int32_slow(double d);
+uint32_t ts_to_uint32_slow(double d);
+TS_RT_ALWAYS_INLINE int32_t ts_to_int32(double d) {
   /* Flag words and indices are already int32 values: converting back and
      comparing exactly proves it, and skips the floor/fmod reduction. The range
      test keeps the conversion defined (NaN fails both comparisons). */
@@ -98,23 +103,14 @@ static inline int32_t ts_to_int32(double d) {
     int32_t i = (int32_t)d;
     if ((double)i == d) return i;
   }
-  if (d != d || d == (1.0/0.0) || d == -(1.0/0.0)) return 0;
-  double t = (d < 0) ? -floor(-d) : floor(d);   /* truncate toward zero */
-  double m = fmod(t, 4294967296.0);             /* mod 2^32 */
-  if (m < 0) m += 4294967296.0;
-  uint32_t u = (uint32_t)m;
-  return (int32_t)u;
+  return ts_to_int32_slow(d);
 }
-static inline uint32_t ts_to_uint32(double d) {
+TS_RT_ALWAYS_INLINE uint32_t ts_to_uint32(double d) {
   if (d >= 0.0 && d < 4294967296.0){
     uint32_t u = (uint32_t)d;
     if ((double)u == d) return u;
   }
-  if (d != d || d == (1.0/0.0) || d == -(1.0/0.0)) return 0;
-  double t = (d < 0) ? -floor(-d) : floor(d);
-  double m = fmod(t, 4294967296.0);
-  if (m < 0) m += 4294967296.0;
-  return (uint32_t)m;
+  return ts_to_uint32_slow(d);
 }
 
 /* ---- immediates ---- */
@@ -748,7 +744,7 @@ static inline int ts_is_array_fast(tsv v){
 static inline uint32_t ts_array_len_fast(tsv arr){
   return ts_is_indexed_array_fast(arr) ? ((ts_array*)ts_ptr(arr))->len : 0;
 }
-static inline int ts_truthy_fast(tsv v){
+TS_RT_ALWAYS_INLINE int ts_truthy_fast(tsv v){
   if (ts_is_num(v)){ double d=ts_to_num(v); return d!=0 && !(d!=d); }
   uint16_t t = TS_TOP16(v);
   if (t == TS_SEL_OBJECT || t == TS_SEL_FUNC) return 1;
@@ -1385,20 +1381,17 @@ int  ts_strict_eq_slow(tsv a, tsv b);
 static inline int ts_same_cell(tsv a, tsv b){
   return TS_TOP16(a) == TS_TOP16(b) && (((a ^ b) & 1u) != 0) && ts_ptr(a) == ts_ptr(b);
 }
-static inline int ts_strict_eq(tsv a, tsv b){
+int ts_strict_eq_str(tsv a, tsv b);   /* two strings: the lengths first, then the content */
+/* Bounded fast path (always inline: a generated function compares hundreds
+   of times, and the compiler's inliner gave up on the larger body): same
+   bits, two numbers, then object identity (the checker's common case: types,
+   symbols, nodes), then two strings out of line. */
+TS_RT_ALWAYS_INLINE int ts_strict_eq(tsv a, tsv b){
   if (a == b) return !(ts_is_num(a) && ts_to_num(a) != ts_to_num(a));
   if (ts_is_num(a) || ts_is_num(b)) return ts_is_num(a) && ts_is_num(b) && ts_to_num(a) == ts_to_num(b);
-  /* two immediate short strings are canonical: different bits, different strings */
-  if (ts_is_short_str(a) && ts_is_short_str(b)) return 0;
-  if (ts_is_str(a) && ts_is_str(b)){
-    /* different lengths: different strings, without the out-of-line compare
-       (a string switch tests its discriminant against every label) */
-    uint32_t la = ts_is_short_str(a) ? ts_short_str_len(a) : ts_str_ptr_typed(a)->len;
-    uint32_t lb = ts_is_short_str(b) ? ts_short_str_len(b) : ts_str_ptr_typed(b)->len;
-    if (la != lb) return 0;
-    return ts_strict_eq_slow(a, b);
-  }
-  return (ts_is_obj(a) || ts_is_func(a)) && ts_same_cell(a, b);
+  if (ts_is_obj(a) || ts_is_func(a)) return ts_same_cell(a, b);
+  if (ts_is_str(a) && ts_is_str(b)) return ts_strict_eq_str(a, b);
+  return 0;
 }
 int  ts_relational(tsv a, tsv b, int op);  /* 0:< 1:<= 2:> 3:>= */
 int  ts_loose_eq(tsv a, tsv b);            /* == (returns 1/0) */

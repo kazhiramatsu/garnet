@@ -54,7 +54,11 @@ while IFS= read -r name; do
     ts_set_dyn_pic_inline | \
     ts_get_pic_checked_inline_lazy | \
     ts_set_pic_inline_lazy | \
-    ts_array_get_lazy) ;;
+    ts_array_get_lazy | \
+    ts_strict_eq | \
+    ts_truthy_fast | \
+    ts_to_int32 | \
+    ts_to_uint32) ;;
     *)
       echo "[runtime-inline] FAIL: unexpected always-inline runtime helper $name"
       exit 1

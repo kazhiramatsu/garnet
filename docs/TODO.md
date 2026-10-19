@@ -5302,6 +5302,35 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   GC stress (all phases), inline policy, units. Pitfall recorded in
   `docs/agent_workflow.md`: the adapter object is cached by presence under
   `build/`, so it must be deleted after an adapter change.
+- Inline fast paths: strict equality, ToInt32, truthiness
+  (`docs/inline_fast_paths_design.md`, build `x25`, runtime only). The
+  `x24` profile (2,783 samples) had `ts_strict_eq` at 114 samples (4.1%,
+  up from 20 in `x22`): the `static inline` helper grew with the `x23`
+  length check and clang's inliner, exhausted by generated functions of
+  thousands of lines, emitted an out-of-line copy and a call at most
+  `===` sites; `ts_to_int32` (19) and `ts_truthy_fast` (22) were outlined
+  the same way because of their rarely executed tails. Now `ts_strict_eq`
+  is always inline and bounded (same bits, two numbers, object identity
+  before the string tests, two strings out of line through
+  `ts_strict_eq_str`, which keeps the length check before any view is
+  built), `ts_to_int32` / `ts_to_uint32` keep only the exact-range
+  conversion in line (`ts_to_int32_slow` / `ts_to_uint32_slow` for the
+  rest), `ts_truthy_fast` is always inline, and the inline policy gate's
+  allowlist names the four. Fixture `operators/bitwise_int32_edges`
+  (bitwise operators over exact, fractional, out-of-range, huge, NaN,
+  infinite and signed-zero operands; strict equality over every value
+  kind; identity under collection pressure), identical to V8; its
+  loop-body literal exposes the known FrameArena-vs-Stack annotation
+  difference (parity row). Profile of `x25` (2,743 samples): the three
+  helpers no longer appear; `ts_strict_eq_str` 26, `ts_strict_eq_slow` 15
+  → 5; the callers absorbed the inlined compares (`isSimpleTypeRelatedTo`
+  67 → 111 self samples). Compiler A/B against `x24`, alternating three
+  runs, outputs validated, diagnostics zero: **two A/Bs, 5.653 → 5.637 s
+  and 5.800 → 5.746 s median wall (−0.3% and −0.9%; the second under a
+  load average of 3.9), Node 3.26–3.36 s; kept as a bounded, neutral to
+  slightly positive change.** Gates: conformance 446/446, parity 344
+  identical + 98 KNOWN, bundler 42/42, selfconf 429 + 14 KNOWN, GC stress
+  (all phases), inline policy, units.
 - Next slices, in order. (0) External element buffers (the malloc'd
   `data` of arrays, also strings' and maps' buffers) do not count toward
   the collector's trigger: a loop that drops large arrays grows without
