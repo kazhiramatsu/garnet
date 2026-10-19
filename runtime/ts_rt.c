@@ -134,6 +134,12 @@ static uint32_t g_handle_free_len = 0, g_handle_free_cap = 0;
    cost, identical codegen. Perf 判断の事実基盤 (refactor plan P0)。 */
 #ifdef TSAOT_RT_STATS
 #include <time.h>
+/* Per-key histograms of the out-of-line property paths (statistics build
+   only): which keys take the out-of-line read, which are read absent, which
+   are added. Keys are interned ids below TS_RT_KEY_HIST. */
+#define TS_RT_KEY_HIST 65536u
+static unsigned long long g_key_ool_get[TS_RT_KEY_HIST], g_key_absent[TS_RT_KEY_HIST], g_key_add[TS_RT_KEY_HIST];
+#define RT_STAT_KEY(arr, key) do { if ((uint32_t)(key) < TS_RT_KEY_HIST) arr[(uint32_t)(key)]++; } while (0)
 static struct {
   unsigned long long minor_gc, full_gc, gc_pause_ns, gc_pause_max_ns;
   unsigned long long mark_stack_peak;
@@ -203,6 +209,23 @@ __attribute__((destructor)) static void ts_rt_stats_dump(void){
           g_ts_frame_push_count);
   fprintf(out, "[rt_stats] array_sparse: convert=%llu put=%llu densify=%llu\n",
           g_rt_stats.array_sparse_convert, g_rt_stats.array_sparse_put, g_rt_stats.array_densify);
+  {
+    const char* names[3] = { "ool_get", "absent", "add" };
+    unsigned long long* hists[3] = { g_key_ool_get, g_key_absent, g_key_add };
+    for (int hh = 0; hh < 3; hh++){
+      unsigned long long* h = hists[hh];
+      fprintf(out, "[rt_stats] keys_%s:", names[hh]);
+      for (int rank = 0; rank < 30; rank++){
+        uint32_t best = 0; unsigned long long bv = 0;
+        for (uint32_t k = 0; k < TS_RT_KEY_HIST; k++) if (h[k] > bv){ bv = h[k]; best = k; }
+        if (!bv) break;
+        const char* nm = ts_field_name(best);
+        fprintf(out, " %s=%llu", nm ? nm : "?", bv);
+        h[best] = 0;
+      }
+      fprintf(out, "\n");
+    }
+  }
   for (unsigned k=TS_KIND_OBJECT; k<=TS_KIND_PROXY; k++){
     if (g_rt_stats.kind_alloc[k] || g_rt_stats.kind_scan[k])
       fprintf(out, "[rt_stats] kind_%u: alloc=%llu bytes=%llu scanned=%llu minor_elements=%llu\n", k,
@@ -265,6 +288,7 @@ __attribute__((destructor)) static void ts_rt_stats_dump(void){
 #else
 #define RT_STAT_INC(f)     ((void)0)
 #define RT_STAT_ADD(f,n)   ((void)0)
+#define RT_STAT_KEY(arr, key) ((void)0)
 #define RT_STAT_HIST(f,n)  ((void)0)
 #define RT_STAT_GC_T0      ((void)0)
 #define RT_STAT_GC_T1      ((void)0)
@@ -11390,6 +11414,7 @@ static inline int prop_absent_lookup(const ts_prop_ic* ic, ts_object* o, ts_key 
 static void prop_absent_fill(const ts_prop_ic* ic, ts_object* o, ts_key key);
 tsv ts_get_pic_checked(tsv obj, ts_key key, ts_prop_ic* ic){
   TS_RT_STAT_PIC_OOL();
+  RT_STAT_KEY(g_key_ool_get, key);
   if (ts_is_null(obj) || ts_is_undef(obj))
     return ts_throw_cannot_read(obj, ts_field_name(key));
   TS_RT_STAT_PIC_GET_CALL();
@@ -11397,6 +11422,7 @@ tsv ts_get_pic_checked(tsv obj, ts_key key, ts_prop_ic* ic){
     ts_object* o = (ts_object*)ts_ptr(obj);
     if (o->h.kind == TS_KIND_OBJECT && prop_absent_lookup(ic, o, key)){
       RT_STAT_INC(pic_absent_hits);
+      RT_STAT_KEY(g_key_absent, key);
       return TS_UNDEFINED;
     }
   }
@@ -11425,6 +11451,7 @@ tsv ts_get_pic_checked(tsv obj, ts_key key, ts_prop_ic* ic){
       tsv inherited;
       if (lookup_prop_chain(obj, ts_next_proto(o), key, &inherited)){ RT_STAT_INC(pic_get_inherited); return inherited; }
       RT_STAT_INC(pic_get_absent);
+      RT_STAT_KEY(g_key_absent, key);
       prop_absent_fill(ic, o, key);
       return TS_UNDEFINED;
     }
@@ -11621,6 +11648,7 @@ void ts_set_pic(tsv obj, ts_key key, tsv val, ts_prop_ic* ic){
           o->len == ic->add_slot && ic->add_key == key && o->proto == ic->add_proto &&
           !ts_obj_is_sized(o)){
         RT_STAT_INC(prop_add_site_hits);
+        RT_STAT_KEY(g_key_add, key);
         ts_pref p = props_append(o, key, ic->add_shape_after);
         tsv* vp = pref_valp(p);
         *vp = val;
@@ -11659,6 +11687,7 @@ void ts_set_pic(tsv obj, ts_key key, tsv val, ts_prop_ic* ic){
       ts_prop_add_entry* add = prop_add_lookup(ic, o, key);
       if (add){
         RT_STAT_INC(prop_add_hits);
+        RT_STAT_KEY(g_key_add, key);
         prop_add_site_fill(ic, add->shape_before, add->shape_after, add->slot, key, add->proto);
         ts_pref p = props_append(o, key, add->shape_after);
         tsv* vp = pref_valp(p);
@@ -11675,7 +11704,7 @@ void ts_set_pic(tsv obj, ts_key key, tsv val, ts_prop_ic* ic){
       uint32_t len_before = o->len, shape_before = o->shape;
       ts_pref p = ts_set_named_prop(obj, o, key, val, 0);
       prop_ic_fill(ic, o, key, p);
-      if (pref_ok(p)){ RT_STAT_INC(prop_add_fills); prop_add_fill(ic, o, key, p, len_before, shape_before); }
+      if (pref_ok(p)){ RT_STAT_INC(prop_add_fills); RT_STAT_KEY(g_key_add, key); prop_add_fill(ic, o, key, p, len_before, shape_before); }
       return;
     }
   }
