@@ -2792,10 +2792,15 @@ fn layout_plan_for(f: &Function) -> LayoutPlan {
         }
     }
     walk(&f.body, &mut plan);
-    // A constructor-style body: leading stores into `this` (param 0) before
-    // anything else can observe it.
+    // A constructor-style body: leading stores into `this` before anything
+    // else can observe it. `this` is the first parameter AFTER the captured
+    // cells (`capture_count` leading params): a module-level constructor that
+    // reads module state (every `Node`/`Symbol`/`Type` constructor of the
+    // TypeScript compiler) has a cell first, and `params.first()` named that
+    // cell, so those constructors silently kept the per-property additions
+    // (Session 350).
     if f.takes_this {
-        if let Some(this) = f.params.first() {
+        if let Some(this) = f.params.get(f.capture_count as usize) {
             let (keys, addrs) = collect_layout_stores(&f.body, 0, this.0, true);
             if keys.len() >= 2 {
                 for (slot, a) in addrs.iter().enumerate() {

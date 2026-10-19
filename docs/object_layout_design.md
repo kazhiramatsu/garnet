@@ -62,3 +62,20 @@ touched once per site instead of once per object. Fixture
 throw between stores, spread after a prefix, literals in loops,
 constructors through `new`, `.call` on empty and non-empty receivers, a
 14-property constructor, deletion after construction).
+
+## Follow-up (Session 350): constructors behind captured cells
+
+The constructor rule looked for `this` in `params[0]`. A function's leading
+parameters are its captured cells (`capture_count` of them), so a
+module-level constructor that reads any module state had a cell there and
+never matched: in the TypeScript compiler that was every `Node`, `Token`,
+`Identifier`, `Symbol`, `Type` and `Signature` constructor, which kept the
+per-property additions (20.2M out-of-line `ts_set_pic` calls per compile,
+99% of them additions). The rule now takes `params[capture_count]`.
+Fixture `objects/ctor_layout_captures` (constructors capturing a module
+counter, reached through a factory object and `new` on the function value,
+`.call` on empty and non-empty receivers, an inner arrow capturing `this`,
+a call and a repeated key inside the store sequence, 20k instances).
+Kernel `benchmarks/patterns/ctor_functions.ts` (ten adds per instance through
+a factory-provided constructor): native 265 ms vs node 96 ms before the fix.
+

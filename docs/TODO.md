@@ -4845,16 +4845,55 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   `TSAOT_GC_ZAP=1`, matching V8 each time. Also in this commit: the native build script's cold-function selection (O0 for giant functions) matches typed direct entries (`static int/double/long long fn_X_d`) as well as `static tsv` ones, and the statistics build counts array, literal and class-instance allocations per site under `TSAOT_SITE_STATS=1` (pseudo function ids 4000000001-3), which the next slice's choice relies on. Compiler A/B
   against the value-call build, alternating three runs, outputs validated,
   diagnostics zero: **6.397 → 6.395 s median wall (no measurable change; a first run taken while a statistics compile shared the machine read 6.703 → 6.767 s and was discarded)**; Node 3.222 s. Statistics relink: 735k precise slot writes against 1.87M generic (every-slot) enrollments — the out-of-line named-property writes and additions still use the generic barrier — so 871k of the 2.13M minor rescans were precise (4.8M slots visited instead of about 9.6M; the 1.26M full rescans visited 9.7M), marked edges 51.3M → 50.2M, GC pauses 686 → 581 ms; the wall-clock A/B does not resolve that. Kept as a sound, measured reduction of collector work; extending precision to the out-of-line writes is noted below. Gates: conformance 433/433, parity 339 identical + 90 KNOWN, bundler 42/42, selfconf 419 + 11 KNOWN, GC stress (all phases), inline policy, units (every verdict read from the gate output).
-- Next slices, in order. (1) Per-site allocation statistics for arrays,
-  literals and class instances (the diagnostic counters are in; the first
-  statistics compile was abandoned after 36 CPU minutes because the
-  scratchpad regeneration script still lacked the cold-function split) to
-  size the arena strategies (155 `FrameArena` arrays, 639 `CallerArena`
-  sites). (2) Sparse element storage; callback specialization; the
-  remaining 2,319 dynamic method sites. (3) Precision for the out-of-line
-  named-property writes of the remembered set (1.87M generic enrollments
-  per compile). (4) The coroutine frame (1.27 KB per generator activation;
-  a promise allocated for every generator) and dead capture cells — small.
-  (5) The remaining pattern gaps: small calls with object arguments 4.3x,
-  array callbacks 3.9x, flags 3.9x, arrays of objects 2.7x; constructor
-  pre-sizing from layouts; local classes from declared types; C5b-2/3.
+- Constructor layouts behind captured cells (`docs/object_layout_design.md`,
+  follow-up section). The constructor-layout rule of Session 350's layout
+  slice took `this` from `params[0]`, but a function's leading parameters
+  are its captured cells, so a module-level constructor that reads any
+  module state never matched. In the compiler that was every `Node`,
+  `Token`, `Identifier` and `SourceMapSource` constructor (ten `this.x = v`
+  stores each, reached through `objectAllocator` and `new` on the function
+  value): the `x11` statistics relink showed 20.2M out-of-line `ts_set_pic`
+  calls per compile with a 1.0% cache hit rate — 18.2M of them property
+  additions (16.3M addition-cache hits, 1.9M transition walks), exactly the
+  cost the layout slice was written to remove. The rule now takes
+  `params[capture_count]`; the compiler's generated C gains three adoption
+  sites (`Node`, `Token`, `Identifier`; `Symbol` already matched because it
+  captures nothing). Fixture `objects/ctor_layout_captures` (constructors
+  capturing a module counter, reached through a factory object and `new` on
+  the function value, `.call` on empty and non-empty receivers, an inner
+  arrow capturing `this`, a call and a repeated key inside the store
+  sequence, 20k instances with later additions, JSON order). Kernel
+  `benchmarks/patterns/ctor_functions.ts` (ten adds per instance through a
+  factory-provided constructor, 6M instances): native 265 ms vs node 96 ms;
+  its constructors capture nothing, so it already adopted and does not move
+  — the remaining 2.7x is the generic `new` on a function value
+  (`ts_construct`: prototype materialization, root pushes, argument copy,
+  `ts_call` through the forwarder) plus the write barrier's handle-table
+  loads, noted below. Compiler A/B against the remembered-slots build,
+  alternating three runs, outputs validated, diagnostics zero:
+  **6.720 → 6.580 s median wall (2.1% less; measured while the statistics compile of the previous slice shared one core at nice 19 — Node read 3.428 s instead of 3.22 s — but every one of the four run pairs, warm-up included, favoured the new build by 2.1–3.5%, so the result is kept and a quiet re-measurement is noted below)**; Node 3.428 s; RSS unchanged (1,161 MB). Gates: conformance 434/434, parity 340 identical + 90
+  KNOWN, bundler 42/42, selfconf 420 + 11 KNOWN, GC stress (all phases),
+  inline policy, units (every verdict read from the gate output).
+- Next slices, in order. (0) Re-measure `x12` against `x11` on a quiet
+  machine (the statistics compile was still running during the A/B above).
+  (1) Per-site allocation statistics for arrays, literals and class
+  instances (the `x11` statistics compile with the cold-function split is
+  the one in progress) to size the arena strategies (155 `FrameArena`
+  arrays, 639 `CallerArena` sites). (2) The generic `new` on a function
+  value (`ts_construct`: prototype materialization, two root pushes, the
+  argument copy, `ts_call` through the forwarder) — the `ctor_functions`
+  kernel spends 15% of its samples there and another 9% in the write
+  barrier's handle-table loads — and single-store constructors (`Type`,
+  `Signature`: one `this.flags = flags` before an `if`), which the ≥ 2
+  keys rule still leaves to the addition cache. (3) Sparse element storage;
+  callback specialization; the remaining 2,319 dynamic method sites.
+  (4) Precision for the out-of-line named-property writes of the
+  remembered set (1.87M generic enrollments per compile). (5) The
+  coroutine frame (1.27 KB per generator activation; a promise allocated
+  for every generator), dead capture cells, the nursery sweep's per-cell
+  work (`gc_free_cell_payload` 1.8% of samples: handle release and
+  `free(NULL)` calls for cells without external payload) — small. (6) The
+  remaining pattern gaps: small calls with object arguments 4.3x, array
+  callbacks 3.9x, flags 3.9x, constructors through function values 2.7x,
+  arrays of objects 2.7x; constructor pre-sizing from layouts; local
+  classes from declared types; C5b-2/3.

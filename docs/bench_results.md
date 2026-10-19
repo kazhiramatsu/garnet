@@ -742,6 +742,7 @@ Compiler A/Bs for the slice (three alternating runs each, outputs validated):
 | `native_s350x9` (stack-allocated non-escaping closures, hoisted stack cells) | **6.404 s** | 1.4% less than `x8` (6.494 s in the same session); Node 3.231 s; peak RSS 1,171 → 1,160 MB; diagnostics zero, outputs validated |
 | `native_s350x10` (inline fast path for function-value calls) | 6.478 s | 1.1% less than `x9` (6.553 s in the same session), within noise (two of three run pairs equal); Node 3.297 s; diagnostics zero, outputs validated |
 | `native_s350x11` (dirty slot ranges for remembered objects) | 6.395 s | no measurable change against `x10` (6.397 s in the same quiet session; a run shared with a statistics compile read +1.0% and was discarded); Node 3.222 s; diagnostics zero, outputs validated |
+| `native_s350x12` (constructor layouts behind captured cells) | 6.580 s | 2.1% less than `x11` (6.720 s in the same run; a statistics compile shared one core, Node 3.428 s, all four run pairs favour `x12`); diagnostics zero, outputs validated |
 
 ### Inline-cache path statistics (Session 350, `native_s350s_stats`)
 
@@ -760,3 +761,14 @@ Root frame pushes per compile: 561.7M before lazy frames, 410.2M after.
 The dominant read path is the slot/key validation, reached today only after
 the four shape-entry compares miss; a slot-first probe would make it the
 first test.
+
+New kernel `benchmarks/patterns/ctor_functions.ts` (function constructors
+reached through a factory object, `new` on the function value, ten
+`this.x = v` stores per instance, 6M instances): native 265 ms, Node 96 ms
+(2.7x). Its constructors capture nothing, so they already adopted their
+layout; the time is the generic `new` on a function value (`ts_construct`
+and `ts_call`, 15% of samples), the write barrier's handle-table loads (9%),
+allocation (8%) and the loop's inline-cache reads and writes. The same
+pattern in the compiler (`Node`, `Token`, `Identifier`) did NOT adopt its
+layout until `x12`, because `this` sits after the captured cells.
+
