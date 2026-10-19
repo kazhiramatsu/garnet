@@ -729,6 +729,10 @@ typedef struct ts_array {
      A zero end means empty; generic writes/reordering request a full scan. */
   uint8_t gc_dirty_all;
   uint16_t gc_dirty_first, gc_dirty_end;
+  /* Sparse element storage (far stores): nonzero means data is NULL, cap is 0
+     and inline_data[0] holds the index -> value side table (ts_rt.c). Dense
+     arrays keep every slot in [len, cap) a hole, so readers bound by cap. */
+  uint8_t sparse, arr_spare;
   tsv inline_data[4];             /* avoids a second malloc for small arrays */
 } ts_array;
 
@@ -1660,22 +1664,24 @@ TS_RT_ALWAYS_INLINE tsv ts_array_get_lazy(tsv arr, uint32_t i, ts_frame_hdr* fra
 /* The hole marker of a sparse array element (never a user-visible value). */
 #define TS_ARRAY_HOLE TS_BOX(0xFFFEu, 0x4152484Fu)
 static inline int array_is_hole(tsv v){ return v == TS_ARRAY_HOLE; }
-/* Element read with the array case in line: an in-range element that is not
-   a hole is the value, any other index of an array is undefined (ts_array_get
-   agrees); strings and other receivers take the out-of-line reader. */
+/* Element read with the array case in line: a dense slot (below cap: every
+   slot in [len, cap) is a hole) that is not a hole is the value, any other
+   index of a dense array is undefined (ts_array_get agrees); a sparse array
+   (cap 0) reads its side table out of line, as do strings and other
+   receivers. */
 static inline tsv ts_array_get_inline(tsv arr, uint32_t i){
   if (ts_is_indexed_array_fast(arr)){
     ts_array* a = (ts_array*)ts_ptr(arr);
-    if (i < a->len){ tsv v = a->data[i]; if (!array_is_hole(v)) return v; }
-    return TS_UNDEFINED;
+    if (i < a->cap){ tsv v = a->data[i]; return array_is_hole(v) ? TS_UNDEFINED : v; }
+    if (!a->sparse) return TS_UNDEFINED;
   }
   return ts_array_get(arr, i);
 }
 static inline tsv ts_array_get_inline_lazy(tsv arr, uint32_t i, ts_frame_hdr* frame, uint32_t nslots){
   if (ts_is_indexed_array_fast(arr)){
     ts_array* a = (ts_array*)ts_ptr(arr);
-    if (i < a->len){ tsv v = a->data[i]; if (!array_is_hole(v)) return v; }
-    return TS_UNDEFINED;
+    if (i < a->cap){ tsv v = a->data[i]; return array_is_hole(v) ? TS_UNDEFINED : v; }
+    if (!a->sparse) return TS_UNDEFINED;
   }
   ts_frame_push(frame, nslots);
   tsv r = ts_array_get(arr, i);

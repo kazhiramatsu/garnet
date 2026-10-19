@@ -36,6 +36,7 @@ static int g_full_threshold_forced = 0; /* env override pins the trigger (stress
 static int g_remembered_slots = 1;      /* TSAOT_REMEMBERED_SLOTS=0: whole-cell rescans */
 static int g_empty_class_plain = 1;     /* TSAOT_EMPTY_CLASS_PLAIN=0: field-less class instances stay dictionary cells */
 static int g_negative_pic = 1;          /* TSAOT_NEGATIVE_PIC=0: no absent-property cache entries */
+static int g_sparse_elements = 1;       /* TSAOT_SPARSE_ELEMENTS=0: far stores always materialize dense storage */
 /* TSAOT_GC_ZAP=1 fills dead and moved-from cell bodies with 0xDD during
    collection (Phase C0 groundwork): a stale raw pointer held across a
    safepoint then reads loud garbage (kind 0xDD fails gc_kind_valid, tsv
@@ -144,7 +145,8 @@ static struct {
   unsigned long long remset_slot_writes, remset_full_marks, remset_precise_scans, remset_precise_slots, remset_full_scans, remset_full_slots;
   unsigned long long small_props_fresh, small_props_reused;
   unsigned long long prop_add_hits, prop_add_fills;
-  unsigned long long pic_get_absent, pic_get_inherited, pic_absent_hits;   /* out-of-line reads resolved on the chain / missing / answered by the absent cache */
+  unsigned long long pic_get_absent, pic_get_inherited, pic_absent_hits;
+  unsigned long long array_sparse_convert, array_sparse_put, array_densify;   /* far stores: dense->sparse switches, side-table stores, sparse->dense */   /* out-of-line reads resolved on the chain / missing / answered by the absent cache */
   unsigned long long nursery_alloc, nursery_chunks, retained_chunks;
   unsigned long long nursery_aged, unpooled_aged;   /* survivors kept YOUNG by aging */
   unsigned long long aging_copied_bytes, aging_died_bytes, aging_promoted_bytes;
@@ -199,6 +201,8 @@ __attribute__((destructor)) static void ts_rt_stats_dump(void){
           g_rt_stats.pic_get_inherited, g_rt_stats.pic_get_absent, g_rt_stats.pic_absent_hits);
   fprintf(out, "[rt_stats] root_frames: frame_push=%llu\n",
           g_ts_frame_push_count);
+  fprintf(out, "[rt_stats] array_sparse: convert=%llu put=%llu densify=%llu\n",
+          g_rt_stats.array_sparse_convert, g_rt_stats.array_sparse_put, g_rt_stats.array_densify);
   for (unsigned k=TS_KIND_OBJECT; k<=TS_KIND_PROXY; k++){
     if (g_rt_stats.kind_alloc[k] || g_rt_stats.kind_scan[k])
       fprintf(out, "[rt_stats] kind_%u: alloc=%llu bytes=%llu scanned=%llu minor_elements=%llu\n", k,
@@ -394,6 +398,8 @@ static void gc_config_init(void){
   if (eplain && eplain[0] && strcmp(eplain, "0") == 0) g_empty_class_plain = 0;
   const char* npic = getenv("TSAOT_NEGATIVE_PIC");
   if (npic && npic[0] && strcmp(npic, "0") == 0) g_negative_pic = 0;
+  const char* sparse = getenv("TSAOT_SPARSE_ELEMENTS");
+  if (sparse && sparse[0] && strcmp(sparse, "0") == 0) g_sparse_elements = 0;
   const char* zap = getenv("TSAOT_GC_ZAP");
   if (zap && zap[0] && strcmp(zap, "0") != 0) g_gc_zap = 1;
 }
@@ -1046,16 +1052,19 @@ tsv ts_new_sized_pretenured(size_t size){ return ts_new_sized_impl(size, 1); }
 /* TS_ARRAY_HOLE and array_is_hole live in ts_rt.h (the inline element reader tests them). */
 static inline int array_uses_inline(ts_array* a){ return a->data == a->inline_data; }
 #define GC_CONTAINER_CARD_SHIFT 6u
+/* A heap value still in the young generation (handle form without the OLD
+   bit): the only stores an old container must remember. */
+static inline int array_value_is_young(tsv value){
+  if (!ts_heap_ref(value)) return 0;
+  uint64_t vp = value & TS_PAYLOAD_MASK;
+  if (!(vp & 1u)) return 0; /* pointer-form values are old or on the stack */
+  uint32_t id = (uint32_t)(vp >> 1);
+  return id < g_handle_cap && !((uintptr_t)g_ts_handle_table[id] & TS_HANDLE_OLD_BIT);
+}
 /* Indexed stores remember a bounded span of 64-element cards. Unknown stores
    still use ts_gc_remember, which requests the complete element scan. */
 static inline void array_write_barrier(ts_array* a, uint32_t index, tsv value){
-  if (a->o.h.gen != TS_GEN_OLD || !ts_heap_ref(value)) return;
-  uint64_t vp = value & TS_PAYLOAD_MASK;
-  if (!(vp & 1u)) return; /* pointer-form values are old or on the stack */
-  {
-    uint32_t id = (uint32_t)(vp >> 1);
-    if (id >= g_handle_cap || ((uintptr_t)g_ts_handle_table[id] & TS_HANDLE_OLD_BIT)) return;
-  }
+  if (a->o.h.gen != TS_GEN_OLD || !array_value_is_young(value)) return;
   uint32_t card = index >> GC_CONTAINER_CARD_SHIFT;
   if (card >= UINT16_MAX) a->gc_dirty_all = 1;
   else {
@@ -1067,16 +1076,133 @@ static inline void array_write_barrier(ts_array* a, uint32_t index, tsv value){
 static inline void array_invalidate_dirty(ts_array* a){
   if (a->o.h.gen == TS_GEN_OLD && a->o.h.remembered) a->gc_dirty_all = 1;
 }
-static void array_free_data(ts_array* a){ if (a->data && !array_uses_inline(a)) free(a->data); }
+
+/* ---- sparse element storage (far stores; docs/sparse_elements_design.md) ----
+   A store far beyond the dense capacity (the checker's flowTypeCache[nodeId]
+   on a fresh array) must not materialize the gap. The array switches to a
+   side table of index -> value (open addressing, linear probing): `len`
+   stays the JS length, `cap` becomes 0 and `data` NULL so every reader
+   bounded by cap sees no dense slot, and the table pointer lives in
+   inline_data[0]. Dense arrays keep the invariant "every slot in [len, cap)
+   is a hole", which lets the inline element reader (ts_rt.h) bound by cap at
+   no extra cost. Generic operations densify first (as_arr / arr_dense). */
+#define ARRAY_SPARSE_EMPTY 0xFFFFFFFFu   /* never an element index (2^32-1 is a named key) */
+#define ARRAY_SPARSE_MIN_GAP 1024u
+typedef struct ts_sparse_elems {
+  uint32_t count, mask;   /* occupied keys (tombstones included); table size - 1 */
+  uint32_t keys[];        /* table size keys, then table size values */
+} ts_sparse_elems;
+static inline ts_sparse_elems* array_sparse_table(ts_array* a){ return (ts_sparse_elems*)(uintptr_t)a->inline_data[0]; }
+static inline void array_set_sparse_table(ts_array* a, ts_sparse_elems* s){ a->inline_data[0] = (tsv)(uintptr_t)s; }
+static inline tsv* sparse_vals(ts_sparse_elems* s){ return (tsv*)(s->keys + (s->mask + 1u)); }
+static ts_sparse_elems* sparse_alloc(uint32_t size){   /* size: a power of two >= 8 */
+  ts_sparse_elems* s = (ts_sparse_elems*)malloc(sizeof(ts_sparse_elems) + (size_t)size * (sizeof(uint32_t) + sizeof(tsv)));
+  s->count = 0; s->mask = size - 1u;
+  memset(s->keys, 0xFF, (size_t)size * sizeof(uint32_t));
+  return s;
+}
+static inline uint32_t sparse_hash(uint32_t k){ k *= 0x9E3779B1u; return k ^ (k >> 16); }
+/* the slot holding key, or ARRAY_SPARSE_EMPTY */
+static inline uint32_t sparse_find(ts_sparse_elems* s, uint32_t key){
+  uint32_t h = sparse_hash(key) & s->mask;
+  for (;;){
+    uint32_t k = s->keys[h];
+    if (k == key) return h;
+    if (k == ARRAY_SPARSE_EMPTY) return ARRAY_SPARSE_EMPTY;
+    h = (h + 1u) & s->mask;
+  }
+}
+static void sparse_insert_new(ts_sparse_elems* s, uint32_t key, tsv v){   /* key absent, room guaranteed */
+  uint32_t h = sparse_hash(key) & s->mask;
+  while (s->keys[h] != ARRAY_SPARSE_EMPTY) h = (h + 1u) & s->mask;
+  s->keys[h] = key; sparse_vals(s)[h] = v; s->count++;
+}
+static ts_sparse_elems* sparse_put(ts_sparse_elems* s, uint32_t key, tsv v){   /* returns the (possibly grown) table */
+  uint32_t h = sparse_find(s, key);
+  if (h != ARRAY_SPARSE_EMPTY){ sparse_vals(s)[h] = v; return s; }
+  if ((uint64_t)(s->count + 1u) * 2u > (uint64_t)s->mask + 1u){   /* load factor 1/2 */
+    ts_sparse_elems* ns = sparse_alloc((s->mask + 1u) * 2u);
+    tsv* vals = sparse_vals(s);
+    for (uint32_t i = 0; i <= s->mask; i++) if (s->keys[i] != ARRAY_SPARSE_EMPTY) sparse_insert_new(ns, s->keys[i], vals[i]);
+    free(s); s = ns;
+  }
+  sparse_insert_new(s, key, v);
+  return s;
+}
+static void array_free_data(ts_array* a){
+  if (a->sparse){ free(array_sparse_table(a)); a->inline_data[0] = TS_UNDEFINED; a->sparse = 0; return; }
+  if (a->data && !array_uses_inline(a)) free(a->data);
+}
+/* A store at i on a dense array goes sparse when the dense buffer would have
+   to more than double by at least ARRAY_SPARSE_MIN_GAP slots (V8's
+   dictionary-elements rule in spirit). */
+static inline int array_store_is_far(ts_array* a, uint32_t i){
+  return g_sparse_elements && i >= a->cap + ARRAY_SPARSE_MIN_GAP && (i >> 1) >= a->cap;
+}
+static void array_make_sparse(ts_array* a){
+  RT_STAT_INC(array_sparse_convert);
+  uint32_t n = a->len < a->cap ? a->len : a->cap;
+  uint32_t size = 8u;
+  while ((uint64_t)size < (uint64_t)n * 2u) size *= 2u;
+  ts_sparse_elems* s = sparse_alloc(size);
+  for (uint32_t i = 0; i < n; i++) if (!array_is_hole(a->data[i])) sparse_insert_new(s, i, a->data[i]);
+  array_free_data(a);
+  a->data = NULL; a->cap = 0; a->sparse = 1;
+  array_set_sparse_table(a, s);
+  array_invalidate_dirty(a);
+}
+/* Back to dense storage of max(len, need) slots: a hole wherever the table
+   has no entry. Tombstones at or beyond the length are dropped. */
+static void array_densify(ts_array* a, uint32_t need){
+  RT_STAT_INC(array_densify);
+  ts_sparse_elems* s = array_sparse_table(a);
+  uint32_t n = a->len > need ? a->len : need;
+  uint32_t nc = n < 4u ? 4u : n;
+  tsv* nd = nc <= 4u ? a->inline_data : (tsv*)malloc(sizeof(tsv) * nc);
+  for (uint32_t i = 0; i < nc; i++) nd[i] = TS_ARRAY_HOLE;
+  tsv* vals = sparse_vals(s);
+  for (uint32_t h = 0; h <= s->mask; h++){
+    uint32_t k = s->keys[h];
+    if (k != ARRAY_SPARSE_EMPTY && k < nc) nd[k] = vals[h];
+  }
+  free(s);
+  a->data = nd; a->cap = nc; a->sparse = 0;
+  array_invalidate_dirty(a);
+}
+static inline ts_array* arr_dense(tsv arr){   /* arr is an array: its dense form */
+  ts_array* a = (ts_array*)ts_ptr(arr);
+  if (__builtin_expect(a->sparse, 0)) array_densify(a, 0);
+  return a;
+}
+static void array_sparse_store(ts_array* a, uint32_t i, tsv v){
+  RT_STAT_INC(array_sparse_put);
+  ts_sparse_elems* s = sparse_put(array_sparse_table(a), i, v);
+  array_set_sparse_table(a, s);
+  if (i >= a->len) a->len = i + 1u;
+  if (a->o.h.gen == TS_GEN_OLD && array_value_is_young(v)){ a->gc_dirty_all = 1; gc_remember(&a->o.h); }
+  /* A table holding an eighth of the length is cheaper dense (V8's
+     fast-elements heuristic): materialize it. */
+  if ((uint64_t)s->count * 8u >= (uint64_t)a->len) array_densify(a, 0);
+}
+/* delete arr[i] / a reviver's undefined: the slot becomes a hole */
+static void array_put_hole(ts_array* a, uint32_t i){
+  if (i < a->cap) a->data[i] = TS_ARRAY_HOLE;
+  else if (a->sparse){
+    ts_sparse_elems* s = array_sparse_table(a);
+    uint32_t h = sparse_find(s, i);
+    if (h != ARRAY_SPARSE_EMPTY) sparse_vals(s)[h] = TS_ARRAY_HOLE;
+  }
+}
 static void array_init_storage(ts_array* a, uint32_t len){
   a->element_kind = 0;
   a->len = len;
   a->cap = len < 4 ? 4 : len;
   a->data = (a->cap <= 4) ? a->inline_data : (tsv*)malloc(sizeof(tsv) * a->cap);
-  for (uint32_t i=0;i<a->cap;i++) a->data[i] = i < len ? TS_ARRAY_HOLE : TS_UNDEFINED;
+  for (uint32_t i=0;i<a->cap;i++) a->data[i] = TS_ARRAY_HOLE;   /* [len, cap) holes too (invariant) */
 }
 static void array_ensure_cap(ts_array* a, uint32_t need){
   if (need <= a->cap) return;
+  if (__builtin_expect(a->sparse, 0)){ array_densify(a, need); return; }
   uint32_t old = a->cap;
   uint32_t nc = old ? old * 2 : 4;
   while (nc < need) nc *= 2;
@@ -1087,9 +1213,9 @@ static void array_ensure_cap(ts_array* a, uint32_t need){
   } else {
     a->data = (tsv*)realloc(a->data, nc * sizeof(tsv));
   }
-  /* Slots at or beyond len are never read (readers bound by len, writers fill
-     holes explicitly, truncation already leaves stale values), so the grown
-     tail is left unfilled. */
+  /* The grown tail is holes: readers bound by cap, so [len, cap) must hold
+     holes (a store past len then needs no fill; truncation refills). */
+  for (uint32_t i=old;i<nc;i++) a->data[i] = TS_ARRAY_HOLE;
   a->cap=nc;
 }
 /* `arr.length = n`: truncate (drop the tail) or extend (new slots are holes,
@@ -1097,12 +1223,19 @@ static void array_ensure_cap(ts_array* a, uint32_t need){
 static void ts_array_set_length(tsv arr, uint32_t newlen){
   ts_array* a = (ts_array*)ts_ptr(arr);
   uint32_t old = a->len;
-  if (newlen <= old){ a->len = newlen; return; }
-  array_ensure_cap(a, newlen);
-  /* clear the extended slots to undefined (holes). array_ensure_cap only zero-fills
-     when it actually grows capacity; reused capacity from a prior truncate would
-     otherwise leak stale elements. */
-  for (uint32_t i = old; i < newlen; i++) a->data[i] = TS_ARRAY_HOLE;
+  if (__builtin_expect(a->sparse, 0)){
+    if (newlen < old){   /* entries at or beyond the new length become tombstones */
+      ts_sparse_elems* s = array_sparse_table(a); tsv* vals = sparse_vals(s);
+      for (uint32_t h = 0; h <= s->mask; h++) if (s->keys[h] != ARRAY_SPARSE_EMPTY && s->keys[h] >= newlen) vals[h] = TS_ARRAY_HOLE;
+    }
+    a->len = newlen; return;
+  }
+  if (newlen <= old){
+    for (uint32_t i = newlen; i < old; i++) a->data[i] = TS_ARRAY_HOLE;   /* keep [len, cap) holes */
+    a->len = newlen; return;
+  }
+  if (array_store_is_far(a, newlen - 1u)){ array_make_sparse(a); a->len = newlen; return; }
+  array_ensure_cap(a, newlen);   /* [old, cap) already holds holes */
   a->len = newlen;
 }
 static tsv ts_new_array_impl(uint32_t len, int pretenured){
@@ -1126,13 +1259,26 @@ tsv ts_array_get(tsv arr, uint32_t i){
     return TS_UNDEFINED;
   }
   ts_array* a = ts_ptr(arr);
-  return i < a->len && !array_is_hole(a->data[i]) ? a->data[i] : TS_UNDEFINED;
+  if (i < a->cap){ tsv v = a->data[i]; return array_is_hole(v) ? TS_UNDEFINED : v; }
+  if (a->sparse){
+    ts_sparse_elems* s = array_sparse_table(a);
+    uint32_t h = sparse_find(s, i);
+    if (h != ARRAY_SPARSE_EMPTY){ tsv v = sparse_vals(s)[h]; return array_is_hole(v) ? TS_UNDEFINED : v; }
+  }
+  return TS_UNDEFINED;
 }
 int ts_array_has_index(tsv arr, uint32_t i){
   if (!ts_is_indexed_array_fast(arr)) return 0;
   ts_array* a = ts_ptr(arr);
-  return i < a->len && !array_is_hole(a->data[i]);
+  if (i < a->cap) return !array_is_hole(a->data[i]);
+  if (a->sparse){
+    ts_sparse_elems* s = array_sparse_table(a);
+    uint32_t h = sparse_find(s, i);
+    return h != ARRAY_SPARSE_EMPTY && !array_is_hole(sparse_vals(s)[h]);
+  }
+  return 0;
 }
+static void ts_array_set_grow(ts_array* a, uint32_t i, tsv v);
 void ts_array_set(tsv arr, uint32_t i, tsv v){
   if (!ts_is_indexed_array_fast(arr)) return;
   ts_array* a = ts_ptr(arr);
@@ -1150,22 +1296,36 @@ void ts_array_set(tsv arr, uint32_t i, tsv v){
     else snprintf(buf, sizeof(buf), "Cannot add property %u, object is not extensible", i);
     ts_throw_type_error_msg(buf); return;
   }
-  array_ensure_cap(a, i + 1);
-  for (uint32_t k=a->len;k<i;k++) a->data[k]=TS_ARRAY_HOLE;
-  if (i >= a->len) a->len = i+1;
+  if (__builtin_expect(i < a->cap, 1)){
+    /* [len, cap) holds holes, so a store past len needs no fill. */
+    a->data[i] = v;
+    if (i >= a->len) a->len = i+1;
+    array_write_barrier(a, i, v);
+    return;
+  }
+  ts_array_set_grow(a, i, v);
+}
+/* i >= cap: grow the dense buffer, or store into the side table */
+static void ts_array_set_grow(ts_array* a, uint32_t i, tsv v){
+  if (i == UINT32_MAX){ ts_throw_range_error_msg("Invalid array index"); return; }   /* 2^32-1 is a named key: outside the element model (loud) */
+  if (a->sparse){ array_sparse_store(a, i, v); return; }
+  if (array_store_is_far(a, i)){ array_make_sparse(a); array_sparse_store(a, i, v); return; }
+  array_ensure_cap(a, i + 1u);
   a->data[i] = v;
+  a->len = i + 1u;
   array_write_barrier(a, i, v);
 }
 void ts_array_push(tsv arr, tsv v){ if (ts_is_indexed_array_fast(arr)) ts_array_set(arr, ((ts_array*)ts_ptr(arr))->len, v); }
 void ts_array_push_hole(tsv arr){
   if (!ts_is_indexed_array_fast(arr)) return;
   ts_array* a = ts_ptr(arr);
+  if (a->sparse){ if (a->len != UINT32_MAX) a->len++; return; }   /* a hole past the end is only a length */
   array_ensure_cap(a, a->len + 1);
   a->data[a->len++] = TS_ARRAY_HOLE;
 }
 static inline void ts_array_store_existing(tsv arr, uint32_t i, tsv v){
   ts_array* a = ts_is_indexed_array_fast(arr) ? (ts_array*)ts_ptr(arr) : NULL;
-  if (!a || i >= a->len) return;
+  if (!a || i >= a->len || i >= a->cap) return;   /* never a sparse array's table */
   a->data[i] = v;
   array_write_barrier(a, i, v);
 }
@@ -3975,6 +4135,12 @@ static void gc_scan_cell(ts_gc_header* h, int young, int depth){
     gc_visit_slot(&f->prototype_prop, young, depth, stable);
     gc_visit_slot(&f->o.proto, young, depth, stable);
   } else if (h->kind==TS_KIND_ARRAY){ ts_array* a=(ts_array*)h;
+    if (a->sparse){
+      /* side table (far stores): every entry; a sparse store dirties the whole cell */
+      ts_sparse_elems* s = array_sparse_table(a); tsv* vals = sparse_vals(s);
+      for (uint32_t i=0;i<=s->mask;i++) if (s->keys[i] != ARRAY_SPARSE_EMPTY) gc_visit_slot(&vals[i], young, depth, stable);
+      if (young) RT_STAT_ADD(kind_minor_elements[h->kind], s->count);
+    } else {
     uint32_t first = 0, end = a->len;
     if (young && h->gen == TS_GEN_OLD && !a->gc_dirty_all){
       first = (uint32_t)a->gc_dirty_first << GC_CONTAINER_CARD_SHIFT;
@@ -3983,6 +4149,7 @@ static void gc_scan_cell(ts_gc_header* h, int young, int depth){
     }
     if (young && end > first) RT_STAT_ADD(kind_minor_elements[h->kind], end - first);
     for (uint32_t i=first;i<end;i++) gc_visit_slot(&a->data[i], young, depth, stable);
+    }
     /* unified model: also mark the common header's named-property map + proto. */
     gc_mark_common_props(&a->o, young, depth, stable);
     gc_visit_slot(&a->o.proto, young, depth, stable);
@@ -5188,7 +5355,12 @@ tsv ts_new_uint16_array(tsv input){
   ts_gc_unroot(3);
   return result;
 }
-static ts_array* as_arr(tsv v){ return ts_is_indexed_array_fast(v) ? (ts_array*)ts_ptr(v) : NULL; }
+static ts_array* as_arr(tsv v){
+  if (!ts_is_indexed_array_fast(v)) return NULL;
+  ts_array* a = (ts_array*)ts_ptr(v);
+  if (__builtin_expect(a->sparse, 0)) array_densify(a, 0);   /* generic operations work on dense storage */
+  return a;
+}
 
 /* callback-based: map/filter/forEach/reduce. cb is a ts_func value; we invoke it
    with (element, index) — matching the common JS callback signature. */
@@ -5477,7 +5649,7 @@ static tsv ts_array_splice_impl(tsv arr, double start, double dc, int has_dc, ts
   if (newlen <= 4) {
     a->data = a->inline_data;
     a->cap = 4;
-    for (uint32_t i=0;i<4;i++) a->data[i] = (i < (uint32_t)newlen) ? nd[i] : TS_UNDEFINED;
+    for (uint32_t i=0;i<4;i++) a->data[i] = (i < (uint32_t)newlen) ? nd[i] : TS_ARRAY_HOLE;
     free(nd);
   } else {
     a->data=nd;
@@ -5619,9 +5791,21 @@ tsv ts_array_join(tsv arr, tsv sep){
   return r;
 }
 tsv ts_array_pop(tsv arr){
-  ts_array* a=as_arr(arr); if(!a||a->len==0) return TS_UNDEFINED;
+  ts_array* a = ts_is_indexed_array_fast(arr) ? (ts_array*)ts_ptr(arr) : NULL;
+  if(!a||a->len==0) return TS_UNDEFINED;
   if (ts_arr_frozen(arr)) return TS_UNDEFINED;   /* frozen: no mutation */
-  tsv v=a->data[a->len-1]; a->len--;
+  if (a->sparse){   /* stays sparse: take the last entry, if any */
+    uint32_t last = a->len - 1u;
+    ts_sparse_elems* s = array_sparse_table(a);
+    uint32_t h = sparse_find(s, last);
+    tsv v = TS_ARRAY_HOLE;
+    if (h != ARRAY_SPARSE_EMPTY){ v = sparse_vals(s)[h]; sparse_vals(s)[h] = TS_ARRAY_HOLE; }
+    a->len = last;
+    return array_is_hole(v) ? TS_UNDEFINED : v;
+  }
+  tsv v=a->data[a->len-1];
+  a->data[a->len-1]=TS_ARRAY_HOLE;   /* keep [len, cap) holes */
+  a->len--;
   return array_is_hole(v) ? TS_UNDEFINED : v;
 }
 
@@ -7034,6 +7218,7 @@ tsv ts_array_shift(tsv arr){
   array_invalidate_dirty(a);
   tsv v=a->data[0];
   for(uint32_t i=0;i+1<a->len;i++) a->data[i]=a->data[i+1];
+  a->data[a->len-1]=TS_ARRAY_HOLE;   /* keep [len, cap) holes */
   a->len--; return array_is_hole(v) ? TS_UNDEFINED : v;
 }
 double ts_array_unshift(tsv arr, tsv v){
@@ -7843,7 +8028,7 @@ tsv ts_object_get_own_property_names(tsv obj){
     return arr;
   }
   if (ts_is_indexed_array_fast(obj)){
-    ts_array* a = ts_ptr(obj);
+    ts_array* a = arr_dense(obj);
     uint32_t len = a->len;
     for (uint32_t i=0;i<len;i++){
       if (ts_array_has_index(obj, i)) push_index_name(arr, i);
@@ -8795,7 +8980,7 @@ static void ts_prop_own_enum(tsv obj, ts_prop_enum_cb cb, void* ud){
      in the common-header prop map (insertion order). Matches JS enumeration. */
   if (ts_is_indexed_array_fast(obj)){
     for (uint32_t i=0;;i++){
-      ts_array* a = ts_ptr(obj);
+      ts_array* a = arr_dense(obj);   /* the callback may have changed the storage */
       if (i>=a->len) break;
       if (array_is_hole(a->data[i])) continue;
       char b[16]; int bn = snprintf(b, sizeof b, "%u", i);
@@ -9616,7 +9801,7 @@ static tsv json_internalize(tsv val, tsv key, tsv reviver){
       ts_gc_root(&ek);
       tsv ne=json_internalize(ts_array_get(val,i), ek, reviver);
       ts_gc_root(&ne);
-      if (ts_is_undef(ne)) ((ts_array*)ts_ptr(val))->data[i]=TS_ARRAY_HOLE;
+      if (ts_is_undef(ne)) array_put_hole((ts_array*)ts_ptr(val), i);
       else ts_array_set(val, i, ne);
       ts_gc_unroot(2);
     }
@@ -9974,7 +10159,7 @@ int ts_delete_prop_strict(tsv obj, ts_key key){
         ts_throw_type_error_msg(buf);
         return 0;
       }
-      ((ts_array*)ts_ptr(obj))->data[ix]=TS_ARRAY_HOLE;
+      array_put_hole((ts_array*)ts_ptr(obj), (uint32_t)ix);
       return 1;
     }
   }
@@ -10027,7 +10212,7 @@ int ts_delete_prop(tsv obj, ts_key key){
       if (!ts_array_has_index(obj, (uint32_t)ix)) return 1;
       if (((ts_array*)ts_ptr(obj))->element_kind) return 0;
       if (ts_obj_integrity(o) & (1u|4u)) return 0;
-      ((ts_array*)ts_ptr(obj))->data[ix]=TS_ARRAY_HOLE;
+      array_put_hole((ts_array*)ts_ptr(obj), (uint32_t)ix);
       return 1;
     }
   }
@@ -10106,8 +10291,8 @@ static tsv ts_own_descriptor_by_key(tsv obj, ts_key key){
     ts_array* a = ts_ptr(obj);
     if (field_bytes_is(nm, nm_len, "length") && !a->element_kind) return build_data_descriptor(ts_num((double)a->len), 1, 0, 0);
     long ix = ts_canonical_array_index(nm, nm_len);
-    if (ix >= 0 && (uint32_t)ix < a->len && !array_is_hole(a->data[ix]))
-      return build_data_descriptor(a->data[ix], 1, 1, 1);
+    if (ix >= 0 && ts_array_has_index(obj, (uint32_t)ix))
+      return build_data_descriptor(ts_array_get(obj, (uint32_t)ix), 1, 1, 1);
   }
   if (ts_is_func(obj)){
     ts_object* sc = ts_class_static_container(obj);

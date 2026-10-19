@@ -5186,12 +5186,56 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   Node itself varied 3.38–3.55 s — the owner's desktop load made the
   afternoon's measurements noisy. 16 MB cut peak RSS 1,070 → 1,025 MB. To be
   re-measured on a quiet machine before any default changes; the earlier
-  `x10` trial (16/64 MB, aging knobs) found no gain either. The sparse
-  element storage item below has design notes in
-  `docs/sparse_elements_design.md`.
-- Next slices, in order. (0) Sparse element storage for far stores
-  (`flowTypeCache[nodeId]` on a fresh array: 3.6% of the profile in hole
-  fills, see the `x19` profile note). (1) Strings, second round: `Map<string, T>`
+  `x10` trial (16/64 MB, aging knobs) found no gain either.
+- Sparse element storage for far stores (`docs/sparse_elements_design.md`,
+  build `x22`, runtime only). The checker's `flowTypeCache` is cleared for
+  a window by `checkExpressionWithContextualType` and recreated as `[]` by
+  the next cached store, whose index is a node id in the millions; the
+  dense representation filled the gap with holes and grew its buffer to
+  match (3.6% of the `x19` profile), 2,412 times per compile by the
+  statistics relink. Two parts. (a) Dense arrays keep every slot in
+  `[len, cap)` a hole (`array_ensure_cap` fills the grown tail; truncation,
+  `pop`, `shift` and the splice rebuild refill), so the inline element
+  reader bounds by `cap` instead of `len` at the same cost and
+  `ts_array_set` no longer fills holes (the grow path is out of line).
+  (b) A store with `i >= cap + 1024` and `i >= 2*cap` switches the array to
+  a side table (open addressing, `uint32` keys, load factor 1/2; `cap` 0
+  and `data` NULL, so a reader that forgot to densify faults loudly; the
+  table pointer in `inline_data[0]`, struct size unchanged). Reads, stores,
+  `length`, `push`, `pop`, `delete`, truncation and JSON stay sparse; every
+  generic operation densifies at entry (`as_arr` / `arr_dense`, one
+  predictable branch); a table reaching an eighth of the length is
+  materialized (V8's fast-elements rule). The collector scans every table
+  entry of a remembered sparse cell. Loud reject: a store at index 2^32-1
+  (a named key in JS) throws instead of writing out of bounds. Kill switch
+  `TSAOT_SPARSE_ELEMENTS=0`. Fixture `arrays/sparse_far_stores` (far stores
+  on empty, inline-backed and heap-backed arrays, every builtin on a sparse
+  array, holes / `in` / `delete`, truncation and extension, the
+  fast-elements transition, frozen sparse arrays, reads beyond the length
+  after shrinking operations, young values in the tables of young and
+  promoted arrays), identical to V8 also under `TSAOT_GC_YOUNG_THRESHOLD=1`
+  and with the kill switch; its `delete arr[i]` is `object.deleteDynamic`,
+  unported on the frozen emitter (two allowlist rows). Kernel
+  `sparse_stores` (25,000 flow-cache windows of 40 far stores and 40 reads):
+  native 42 ms, Node 138 ms (0.30x); under the kill switch the dense
+  representation is killed after 21 s at 16.6 GB resident, because the
+  32 MB element buffers of the dropped caches are malloc'd outside the
+  collector's accounting and nothing triggers a collection (a pre-existing
+  weakness, listed below). Statistics relink: 2,412
+  conversions, 9,684 table stores, 0 densifications per compile, GC pause
+  623 → 598 ms. Compiler A/B against `x20` (the production build; `x21` is
+  off by default), alternating three runs, outputs validated, diagnostics
+  zero: **5.988 → 5.745 s median wall (−4.1%; all four pairs 5.98–6.02
+  against 5.75–5.76 s), peak RSS 1,139 → 811 MB (−29%), Node 3.23 s →
+  1.78x.** Gates: conformance 443/443, parity 342 identical + 97 KNOWN,
+  bundler 42/42, selfconf 426 + 14 KNOWN, GC stress (all phases), inline
+  policy, units.
+- Next slices, in order. (0) External element buffers (the malloc'd
+  `data` of arrays, also strings' and maps' buffers) do not count toward
+  the collector's trigger: a loop that drops large arrays grows without
+  bound (the `sparse_stores` kernel under `TSAOT_SPARSE_ELEMENTS=0`
+  reaches 16.6 GB); count payload bytes in the allocation budget.
+  (1) Strings, second round: `Map<string, T>`
   lookups and symbol-table keys (`map_find` 3.1% of samples, `ts_str_hash_of`
   1%, `ts_strict_eq_slow` 1.7% — the string `switch` of
   `getCannotFindNameDiagnosticForName`, evaluated eagerly for every
@@ -5209,8 +5253,8 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   (`some`/`map`/`forEach`/`every` and the checker's own helpers), with
   the lifetime fixtures the stack-closure slice set out. (3) The generic
   `new` on a function value (`ts_construct`) and single-store constructors
-  (`Type`, `Signature`, `NodeLinks`). (4) Sparse element storage; the
-  remaining 2,319 dynamic method sites. (5) Precision for the out-of-line
+  (`Type`, `Signature`, `NodeLinks`). (4) The remaining 2,319 dynamic
+  method sites. (5) Precision for the out-of-line
   named-property writes of the remembered set. (6) The coroutine frame,
   dead capture cells, the nursery sweep's per-cell work — small. (6b)
   `Object.setPrototypeOf(plain, C.prototype)` followed by a typed method

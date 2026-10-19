@@ -751,6 +751,7 @@ Compiler A/Bs for the slice (three alternating runs each, outputs validated):
 | `native_s350x18` (value captures, round 2: settled bindings) | 5.953 s | 0.8% less than `x17` (6.000 s in the same quiet run, all four pairs agree); Node 3.268 s; RSS 1,100 → 1,155 MB; diagnostics zero, outputs validated |
 | `native_s350x19` (splice fast paths: discarded results) | 6.021 s | 1.6% less than `x18` (6.121 s in the same run, all four pairs agree, desktop load present); Node 3.423 s; RSS 1,155 → 1,058 MB; diagnostics zero, outputs validated |
 | `native_s350x20` (string + integer without the intermediate string) | 6.139 s | no measurable change against `x19` (two A/Bs: −0.8% and +0.1%, Node 3.36–3.49 s); kernel `string_keys` 230 → 198 ms; diagnostics zero, outputs validated |
+| `native_s350x22` (sparse element storage for far stores) | 5.745 s | 4.1% less than `x20` (5.988 s in the same run, all four pairs agree; Node 3.23 s → 1.78x), peak RSS 1,139 → 811 MB; kernel `sparse_stores` 42 ms against Node's 138 ms; diagnostics zero, outputs validated |
 | `native_s350x21` (tiny leaf direct entries always_inline) | 6.253 s | 1.5% MORE than `x20` (6.160 s in the same run, all four pairs agree); the rule is off by default, the production build stays `x20`'s; diagnostics zero, outputs validated |
 
 ### Inline-cache path statistics (Session 350, `native_s350s_stats`)
