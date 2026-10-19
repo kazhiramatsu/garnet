@@ -745,6 +745,7 @@ Compiler A/Bs for the slice (three alternating runs each, outputs validated):
 | `native_s350x12` (constructor layouts behind captured cells) | 6.580 s | 2.1% less than `x11` (6.720 s in the same run; a statistics compile shared one core, Node 3.428 s, all four run pairs favour `x12`); diagnostics zero, outputs validated |
 | `native_s350x13` (field-less class instances as plain objects, `declare` fields) | 6.230 s | 1.4% less than `x12` (6.319 s in the same quiet run, all four pairs agree; a run under the stalled statistics compile read +0.8% and was discarded); Node 3.266 s, native 1.91x; diagnostics zero, outputs validated |
 | `native_s350x14` (absent-property cache) | 6.223 s | 0.9% less than `x13` (6.278 s in the same run, all four pairs agree; a first A/B under the owner's desktop load read 6.359 → 6.373 s); Node 3.354 s; diagnostics zero, outputs validated |
+| `native_s350x15` (struct fields only in sized instances; collector skips the registry) | 6.236 s | 0.4% less than `x14` (6.260 s; three A/Bs agree within noise, 11 of 12 timed pairs); Node 3.329 s; diagnostics zero, outputs validated |
 
 ### Inline-cache path statistics (Session 350, `native_s350s_stats`)
 

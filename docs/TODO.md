@@ -4965,6 +4965,39 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   hits, and its `prop_find` calls fell from 117M to 115k. Compiler A/B
   against the field-less-instance build, alternating three runs, outputs
   validated, diagnostics zero: **two A/Bs, the first 6.359 → 6.373 s (no change; the machine carried the owner's other work, Node 3.354 s), the second 6.278 → 6.223 s median wall (0.9% less, every one of the four run pairs favours the cache) — kept on the strength of the counters: the statistics relink answers 2.73M of the 3.58M absent reads from the cache (853k fills), `prop_find` calls fall from 24.9M to 19.0M and class-field cache calls from 9.9M to 7.1M, so the walk is gone and the remaining cost is the out-of-line call itself**. Gates: conformance 436/436, parity 341 identical + 91 KNOWN (the fixture's `delete` of an accessor key surfaces the known fix #6 METHOD-twin difference of the frozen emitter, allowlisted), bundler 42/42, selfconf 422 + 11 KNOWN, GC stress (all phases), inline policy, units (every verdict read from the gate output).
+- Struct fields belong to sized instances only; the collector skips the
+  class registry for the rest. The `x14` statistics relink still counted
+  11.58M class-registry lookups per compile after the absent cache had
+  removed the property-read ones: `gc_mark_class_fields` probed the
+  registry (a hash by prototype) for every object it scanned (11.7M per
+  compile) to find struct fields. Writing the fixture for the obvious skip
+  exposed the deeper defect: `class_reg_for(o)` decided "this object has
+  struct fields" from the prototype's registered layout and a size test,
+  so an unsized object behind a class prototype — `Object.create(C.prototype)`,
+  `Object.setPrototypeOf({...}, C.prototype)`, a subclass prototype — had
+  its inline slots read as struct fields by own enumeration (`Object.keys`
+  listed every key twice), JSON, descriptors, the dynamic get/set paths and
+  the collector; and typed code (`this.x` inside a method of `C`) read the
+  struct offsets of a cell that has none: `Object.create(Point.prototype)
+  .sum()` returned `3.2e-319`, a silent miscompile reading past the cell.
+  Now `class_reg_for` and `class_field_lookup` require `ts_obj_is_sized`
+  (struct instances are sized, plain objects never are) and the collector
+  tests it before the probe. A loud reject of `Object.create` on such a
+  prototype was tried and withdrawn: `classes/dynamic_class_registry_edges`
+  deliberately builds an impostor that way and reads it dynamically, which
+  the sized predicate now handles exactly. The TYPED read of a declared
+  field on an impostor (`(Object.create(C.prototype) as C).m()`, or after
+  `Object.setPrototypeOf`) still assumes the layout the cell lacks and
+  stays an open hazard (noted below). Fixture
+  `gc/unsized_with_class_proto` (objects relinked behind a class prototype
+  and read through `any`, a subclass prototype holding young references,
+  field-less class instances, sized instances and closure records across
+  repeated collections; `in`, `hasOwnProperty`, `Object.keys` and JSON on
+  the relinked objects). The build is `x14`'s generated code relinked with
+  the new runtime (`ts_rt.h` unchanged). Statistics relink: class-registry
+  lookups 11.58M → 68k per compile, GC pauses 576 ms. Compiler A/B against
+  the absent-cache build, alternating three runs, outputs validated,
+  diagnostics zero: **6.260 → 6.236 s median wall (0.4% less; three A/Bs of the slice read −0.3%, −0.2% and −0.4%, eleven of their twelve timed run pairs favouring the new build)**. Gates: conformance 437/437, parity 341 identical + 92 KNOWN (the fixture's loop literal surfaces the known FrameArena-vs-Stack annotation difference, allowlisted), bundler 42/42, selfconf 423 + 11 KNOWN, GC stress (all phases), inline policy, units (every verdict read from the gate output; a first chain failed one conformance fixture, `classes/dynamic_class_registry_edges`, on the withdrawn `Object.create` reject).
 - Next slices, in order. (1) Capture by value for immutable bindings
   (design to write): a closure that captures a never-reassigned parameter
   or constant takes the value in its environment instead of a record cell,
@@ -4980,7 +5013,11 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   (`Type`, `Signature`, `NodeLinks`). (4) Sparse element storage; the
   remaining 2,319 dynamic method sites. (5) Precision for the out-of-line
   named-property writes of the remembered set. (6) The coroutine frame,
-  dead capture cells, the nursery sweep's per-cell work — small. (7) The
+  dead capture cells, the nursery sweep's per-cell work — small. (6b)
+  `Object.setPrototypeOf(plain, C.prototype)` followed by a typed method
+  call still reads struct offsets the cell lacks (the builtin shares
+  `ts_set_proto` with the class setup); a user-facing entry that rejects
+  it loudly, or sized-instance semantics for relinked objects, is open. (7) The
   remaining pattern gaps: small calls with object arguments 4.3x, array
   callbacks 3.9x, flags 3.9x, links objects 3.2x, constructors through
   function values 2.7x, arrays of objects 2.7x; constructor pre-sizing

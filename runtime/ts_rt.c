@@ -1707,6 +1707,11 @@ tsv ts_object_is_frozen(tsv v){
   return ts_bool(!ts_is_propbag(v) || (ts_obj_integrity((ts_object*)ts_ptr(v)) & 1u));
 }
 tsv ts_object_create(tsv proto){
+  /* The result is a plain object even when `proto` carries a registered
+     class layout: the dynamic paths treat it as such (struct fields exist
+     only in sized instances), while a TYPED read of a declared field on it
+     (`(Object.create(C.prototype) as C).m()`) still assumes the layout the
+     cell lacks — an open hazard noted in docs/TODO.md (Session 350). */
   tsv o = ts_new_proto();                 /* bare object: proto=NULL */
   if (ts_is_propbag(proto)) ((ts_object*)ts_ptr(o))->proto = proto;
   return o;                               /* Object.create(null) keeps proto=NULL */
@@ -8565,14 +8570,20 @@ static ts_class_reg* class_reg_for_proto(tsv proto){
     }
   }
 }
+/* The registered layout whose struct fields THIS object carries. Struct
+   fields exist only in sized instances (the layout follows the header); an
+   unsized object behind a class prototype — `Object.setPrototypeOf({...},
+   C.prototype)`, a subclass prototype, an instance of a field-less class —
+   stores its values in inline slots, which the size test alone mistook for
+   fields (own enumeration listed every key twice, Session 350). */
 static ts_class_reg* class_reg_for(ts_object* o){
-  if (!o) return NULL;
+  if (!o || !ts_obj_is_sized(o)) return NULL;
   ts_class_reg* reg = class_reg_for_proto(o->proto);
   return reg && o->h.size >= reg->min_size ? reg : NULL;
 }
 /* canonical-path bridge (A-2b): is `key` a struct field of o? give offset+numeric. */
 static int class_field_lookup(ts_object* o, ts_key key, size_t* off, int* numeric){
-  if (!o || !ts_proto_ref(o->proto) || !g_class_reg_index_cap) return 0;
+  if (!o || !ts_obj_is_sized(o) || !ts_proto_ref(o->proto) || !g_class_reg_index_cap) return 0;
   RT_STAT_INC(class_field_calls);
   uint32_t slot = (class_proto_hash(o->proto) ^ prop_key_hash(key)) & (TS_CLASS_FIELD_CACHE_SIZE - 1u);
   ts_class_field_cache_entry* cache = &g_class_field_cache[slot];
@@ -8623,6 +8634,11 @@ static tsv class_reg_field_value(ts_class_reg* r, ts_object* o, int i){
   return fv;
 }
 static void gc_mark_class_fields(ts_object* o, int young, int depth, int stable){
+  /* Struct fields exist only in sized instances (a registered layout after
+     the header); a plain object, even one whose prototype has a registered
+     layout, has none. Skipping the registry probe for the unsized majority
+     removed 11.6M hash lookups from a compile's collections (Session 350). */
+  if (!ts_obj_is_sized(o)) return;
   ts_class_reg* reg = class_reg_for(o);
   if (!reg) return;
   char* base = (char*)o;
