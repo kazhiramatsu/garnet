@@ -28,6 +28,8 @@ use crate::escape_ir::*;
 enum FieldKey {
     Named(FieldId),
     Elem,
+    /// A store under a computed key (`o[k] = v`); every load consults it.
+    Dynamic,
     Capture(BindingId),
 }
 
@@ -37,6 +39,9 @@ enum Obj {
     Param(LocalId),
     /// Phantom: the contents of a parameter object's field (caller-provided).
     ParamField(LocalId, FieldKey),
+    /// Phantom: anything reachable from a parameter object two or more loads
+    /// deep (`p.f.g`, `p[0].list`); one node per parameter, the path is lost.
+    ParamDeep(LocalId),
     External,
     /// Collapsed callee internals introduced at a call site.
     Opaque(u32),
@@ -66,6 +71,25 @@ enum C {
 struct Solver {
     pt: BTreeMap<Ref, BTreeSet<Obj>>,
     field: BTreeMap<(Obj, FieldKey), BTreeSet<Obj>>,
+    /// Phantom links `(base, key, phantom)`: a phantom node is recorded as a
+    /// field value of the object it was loaded from, so every reachability
+    /// closure (argument, global) descends into the caller-provided contents
+    /// and whatever the function stores into them. A link is structure, not a
+    /// store, and is left out of the summary.
+    links: BTreeSet<(Obj, FieldKey, Obj)>,
+}
+
+/// TSAOT_ESCAPE_PHANTOMS=0 restores the one-level phantoms that were not
+/// reachable from their parameter (the parity oracle; unsound for a value
+/// stored through a parameter's field, Session 350).
+fn phantoms_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_ESCAPE_PHANTOMS").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
 }
 
 fn union_into(dst: &mut BTreeSet<Obj>, src: &BTreeSet<Obj>) -> bool {
@@ -77,6 +101,13 @@ fn union_into(dst: &mut BTreeSet<Obj>, src: &BTreeSet<Obj>) -> bool {
 impl Solver {
     fn pt_clone(&self, r: Ref) -> BTreeSet<Obj> {
         self.pt.get(&r).cloned().unwrap_or_default()
+    }
+    fn link(&mut self, base: Obj, f: FieldKey, phantom: Obj) -> bool {
+        let inserted = self.field.entry((base, f)).or_default().insert(phantom);
+        if inserted {
+            self.links.insert((base, f, phantom));
+        }
+        inserted
     }
     fn solve(&mut self, cs: &[C]) {
         let mut changed = true;
@@ -91,15 +122,42 @@ impl Solver {
                     }
                     C::Load(d, b, f) => {
                         let bases = self.pt_clone(b);
+                        let phantoms = phantoms_enabled();
                         let mut acc = BTreeSet::new();
                         for o in &bases {
-                            // Phantom param-field: loading a field of a parameter
-                            // object yields its caller-provided contents node.
-                            if let Obj::Param(p) = o {
-                                acc.insert(Obj::ParamField(*p, f));
+                            match *o {
+                                // Phantom param-field: loading a field of a parameter
+                                // object yields its caller-provided contents node,
+                                // linked under the parameter so that a store into
+                                // the contents is reachable from the parameter.
+                                Obj::Param(p) => {
+                                    let ph = Obj::ParamField(p, f);
+                                    acc.insert(ph);
+                                    if phantoms {
+                                        changed |= self.link(*o, f, ph);
+                                    }
+                                }
+                                // Two or more loads deep: one node per parameter.
+                                Obj::ParamField(p, _) | Obj::ParamDeep(p) if phantoms => {
+                                    let ph = Obj::ParamDeep(p);
+                                    acc.insert(ph);
+                                    changed |= self.link(*o, f, ph);
+                                }
+                                // The contents of an external object are external.
+                                Obj::External if phantoms => {
+                                    acc.insert(Obj::External);
+                                }
+                                _ => {}
                             }
                             if let Some(s) = self.field.get(&(*o, f)) {
                                 acc.extend(s.iter().copied());
+                            }
+                            // A dynamic store (`o[k] = v`) is recorded under Dynamic;
+                            // any load may read it back.
+                            if phantoms && f != FieldKey::Dynamic {
+                                if let Some(s) = self.field.get(&(*o, FieldKey::Dynamic)) {
+                                    acc.extend(s.iter().copied());
+                                }
                             }
                         }
                         changed |= union_into(self.pt.entry(d).or_default(), &acc);
@@ -220,6 +278,10 @@ mod reachability_tests {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum SObj {
     Param(usize),
+    /// The caller-provided contents of parameter i's field f (one load deep).
+    ParamField(usize, FieldKey),
+    /// Anything two or more loads deep under parameter i (the path is lost).
+    ParamDeep(usize),
     Internal,
     External,
     Global,
@@ -457,7 +519,8 @@ fn build_constraints(f: &Function, summaries: &[Option<Summary>]) -> (Vec<C>, Ve
                 }
             }
             Inst::StoreFieldDynamic { obj, src, .. } => {
-                cs.push(C::Store(Ref::Local(obj), FieldKey::Elem, Ref::Local(src)));
+                let key = if phantoms_enabled() { FieldKey::Dynamic } else { FieldKey::Elem };
+                cs.push(C::Store(Ref::Local(obj), key, Ref::Local(src)));
             }
             Inst::DeleteField { .. } => {}
             Inst::ArraySlice { dst, arr, .. } => {
@@ -672,9 +735,14 @@ fn build_constraints(f: &Function, summaries: &[Option<Summary>]) -> (Vec<C>, Ve
     (cs, sites)
 }
 
+#[derive(Clone, Copy)]
 enum Side {
     Ref(LocalId),
+    /// A temporary holding loaded parameter contents.
+    Tmp(Ref),
     Obj(Obj),
+    /// The global sink (a store whose target path is lost).
+    Global,
     None,
 }
 
@@ -728,31 +796,68 @@ fn apply_summary(
         }
     }
 
-    let as_base = |s: SObj| -> Side {
+    // The contents of actual i's field f, loaded into a fresh temporary.
+    let load_field = |i: usize, f: FieldKey, cs: &mut Vec<C>, temp: &mut u32| -> Side {
+        if i < actuals.len() && is_ref(actuals[i]) {
+            let t = Ref::Temp(*temp);
+            *temp += 1;
+            cs.push(C::Load(t, Ref::Local(actuals[i]), f));
+            Side::Tmp(t)
+        } else {
+            Side::None
+        }
+    };
+    let as_base = |s: SObj, cs: &mut Vec<C>, temp: &mut u32| -> Side {
         match s {
             SObj::Param(i) if i < actuals.len() => Side::Ref(actuals[i]),
             SObj::Param(_) => Side::None,
+            SObj::ParamField(i, f) => load_field(i, f, cs, temp),
+            // a store into the deep contents of a parameter: the path is lost,
+            // so the value escapes to the global sink
+            SObj::ParamDeep(i) if i < actuals.len() => Side::Global,
+            SObj::ParamDeep(_) => Side::None,
             SObj::Internal => Side::Obj(op),
             SObj::External => Side::Obj(Obj::External),
             SObj::Global => Side::None,
         }
     };
-    let as_val = |s: SObj| -> Side {
+    let as_val = |s: SObj, cs: &mut Vec<C>, temp: &mut u32| -> Side {
         match s {
             SObj::Param(j) if j < actuals.len() => Side::Ref(actuals[j]),
             SObj::Param(_) => Side::None,
+            SObj::ParamField(j, f) => load_field(j, f, cs, temp),
+            SObj::ParamDeep(_) => Side::Obj(Obj::External),
             SObj::Internal => Side::Obj(op),
             SObj::External | SObj::Global => Side::Obj(Obj::External),
+        }
+    };
+    let as_ref = |s: Side| -> Option<Ref> {
+        match s {
+            Side::Ref(l) => Some(Ref::Local(l)),
+            Side::Tmp(t) => Some(t),
+            _ => None,
         }
     };
 
     for (s, key, d) in &sum.fields {
         let key = *key;
-        match (as_base(*s), as_val(*d)) {
-            (Side::Ref(b), Side::Ref(v)) => cs.push(C::Store(Ref::Local(b), key, Ref::Local(v))),
-            (Side::Ref(b), Side::Obj(v)) => cs.push(C::StoreLit(Ref::Local(b), key, v)),
-            (Side::Obj(b), Side::Ref(v)) => cs.push(C::StoreObj(b, key, Ref::Local(v))),
+        let base = as_base(*s, cs, temp);
+        let val = as_val(*d, cs, temp);
+        match (base, val) {
+            (Side::Ref(_) | Side::Tmp(_), Side::Ref(_) | Side::Tmp(_)) => {
+                cs.push(C::Store(as_ref(base).unwrap(), key, as_ref(val).unwrap()))
+            }
+            (Side::Ref(_) | Side::Tmp(_), Side::Obj(v)) => {
+                cs.push(C::StoreLit(as_ref(base).unwrap(), key, v))
+            }
+            (Side::Obj(b), Side::Ref(_) | Side::Tmp(_)) => {
+                cs.push(C::StoreObj(b, key, as_ref(val).unwrap()))
+            }
             (Side::Obj(b), Side::Obj(v)) => cs.push(C::AddrField(b, key, v)),
+            (Side::Global, Side::Ref(_) | Side::Tmp(_)) => {
+                cs.push(C::Copy(Ref::Global, as_ref(val).unwrap()))
+            }
+            (Side::Global, Side::Obj(v)) => cs.push(C::AddrField(Obj::External, key, v)),
             _ => {}
         }
     }
@@ -765,6 +870,12 @@ fn apply_summary(
                         cs.push(C::Copy(Ref::Local(d), Ref::Local(actuals[i])))
                     }
                     SObj::Param(_) => {}
+                    SObj::ParamField(i, f) => {
+                        if let Some(t) = as_ref(load_field(i, f, cs, temp)) {
+                            cs.push(C::Copy(Ref::Local(d), t));
+                        }
+                    }
+                    SObj::ParamDeep(_) => cs.push(C::Addr(Ref::Local(d), Obj::External)),
                     SObj::Internal => cs.push(C::Addr(Ref::Local(d), op)),
                     SObj::External | SObj::Global => cs.push(C::Addr(Ref::Local(d), Obj::External)),
                 }
@@ -775,21 +886,103 @@ fn apply_summary(
 
 // ----------------------------- extraction -------------------------------------
 
+/// TSAOT_ESCAPE_MAX_CONSTRAINTS: a function whose constraint set exceeds this
+/// is not solved; every site of it escapes and its summary is conservative
+/// (the compiler's `__module_init` builds 400k constraints with the phantom
+/// links and took seven seconds per solve).
+fn constraint_budget() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("TSAOT_ESCAPE_MAX_CONSTRAINTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200_000)
+    })
+}
+
+/// Every site and reference parameter escapes, the return is external.
+fn conservative_constraints(f: &Function, sites: &[SiteId]) -> Vec<C> {
+    let mut cs = Vec::new();
+    for inst in {
+        let mut flat = Vec::new();
+        flatten_bodies(&f.body, &mut flat);
+        flat
+    } {
+        match inst {
+            Inst::AllocObject { dst, site, .. }
+            | Inst::AllocArray { dst, site, .. }
+            | Inst::AllocClosure { dst, site, .. } => {
+                debug_assert!(sites.contains(&site));
+                cs.push(C::Addr(Ref::Local(dst), Obj::Site(site)));
+                cs.push(C::Copy(Ref::Global, Ref::Local(dst)));
+            }
+            _ => {}
+        }
+    }
+    for &p in &f.params {
+        if is_reflike(f, p) {
+            cs.push(C::Addr(Ref::Local(p), Obj::Param(p)));
+            cs.push(C::Copy(Ref::Global, Ref::Local(p)));
+        }
+    }
+    cs.push(C::Addr(Ref::Ret, Obj::External));
+    cs
+}
+
 fn solve(f: &Function, summaries: &[Option<Summary>]) -> (Solver, Vec<SiteId>) {
-    let (cs, sites) = build_constraints(f, summaries);
+    let started = std::time::Instant::now();
+    let (mut cs, sites) = build_constraints(f, summaries);
+    if phantoms_enabled() && cs.len() > constraint_budget() {
+        if interproc_trace() {
+            eprintln!(
+                "[interproc] fn {} {:?}: {} constraints over the budget, conservative",
+                f.id.0, f.name, cs.len()
+            );
+        }
+        cs = conservative_constraints(f, &sites);
+    }
     let mut s = Solver::default();
     s.solve(&cs);
+    if interproc_trace() && (started.elapsed().as_millis() >= 200 || cs.len() >= 50000) {
+        let pt: usize = s.pt.values().map(|v| v.len()).sum();
+        let fl: usize = s.field.values().map(|v| v.len()).sum();
+        eprintln!(
+            "[interproc] slow solve {:.2}s fn {} {:?}: {} constraints, pt {} entries/{} objs, field {} keys/{} objs, {} links",
+            started.elapsed().as_secs_f64(), f.id.0, f.name, cs.len(), s.pt.len(), pt, s.field.len(), fl, s.links.len()
+        );
+    }
     (s, sites)
 }
 
 fn extract_summary(f: &Function, solver: &Solver) -> Summary {
     let param_index: BTreeMap<LocalId, usize> =
         f.params.iter().enumerate().map(|(i, p)| (*p, i)).collect();
+    let phantoms = phantoms_enabled();
+    // A phantom as the BASE of a store keeps its identity: the caller stores
+    // into the contents of its actual's field. As a stored VALUE or a return
+    // it is collapsed to External (one node, no path), which keeps the
+    // summaries small: distinct phantom values made the points-to sets of the
+    // config and module-resolution functions explode (millions of entries).
     let map = |o: Obj| -> SObj {
         match o {
-            Obj::Site(_) | Obj::Opaque(_) | Obj::ParamField(_, _) => SObj::Internal,
+            Obj::Site(_) | Obj::Opaque(_) => SObj::Internal,
+            Obj::ParamField(_, _) | Obj::ParamDeep(_) if phantoms => SObj::External,
+            Obj::ParamField(_, _) | Obj::ParamDeep(_) => SObj::Internal,
             Obj::External => SObj::External,
             Obj::Param(p) => SObj::Param(*param_index.get(&p).unwrap_or(&usize::MAX)),
+        }
+    };
+    let map_base = |o: Obj| -> SObj {
+        match o {
+            Obj::ParamField(p, f) => match param_index.get(&p) {
+                Some(&i) if phantoms => SObj::ParamField(i, f),
+                _ => SObj::Internal,
+            },
+            Obj::ParamDeep(p) => match param_index.get(&p) {
+                Some(&i) if phantoms => SObj::ParamDeep(i),
+                _ => SObj::Internal,
+            },
+            _ => map(o),
         }
     };
 
@@ -829,16 +1022,48 @@ fn extract_summary(f: &Function, solver: &Solver) -> Summary {
 
     let mut fields = BTreeSet::new();
     for ((o, key), tgts) in solver.field.iter() {
-        let so = map(*o);
+        let so = map_base(*o);
         if matches!(so, SObj::Param(i) if i == usize::MAX) {
             continue;
         }
         for t in tgts {
+            if solver.links.contains(&(*o, *key, *t)) {
+                continue;
+            }
             fields.insert((so, *key, map(*t)));
         }
     }
-    let ret = solver.pt_clone(Ref::Ret).into_iter().map(map).collect();
+    let ret: BTreeSet<SObj> = solver
+        .pt_clone(Ref::Ret)
+        .into_iter()
+        .filter(|o| !(phantoms && matches!(o, Obj::ParamField(_, _))))
+        .map(map)
+        .collect();
 
+    if std::env::var("TSAOT_INTERPROC_SHOW").ok().and_then(|v| v.parse::<u32>().ok()) == Some(f.id.0) {
+        eprintln!(
+            "[interproc] summary fn {} {:?}: params {} global {:?}, ret {:?}, field_global {:?}, field_ret {:?}, fields {:?}",
+            f.id.0, f.name, f.params.len(), param_global, ret, field_global, field_ret, fields
+        );
+    }
+    if interproc_trace() && fields.len() >= 300 {
+        let mut by_base: BTreeMap<&'static str, usize> = BTreeMap::new();
+        for (b, _, _) in &fields {
+            let k = match b {
+                SObj::Param(_) => "param",
+                SObj::ParamField(_, _) => "paramfield",
+                SObj::ParamDeep(_) => "paramdeep",
+                SObj::Internal => "internal",
+                SObj::External => "external",
+                SObj::Global => "global",
+            };
+            *by_base.entry(k).or_default() += 1;
+        }
+        eprintln!(
+            "[interproc] big summary fn {} {:?}: fields {} {:?}, ret {}, field_global {}, field_ret {}",
+            f.id.0, f.name, fields.len(), by_base, ret.len(), field_global.len(), field_ret.len()
+        );
+    }
     Summary {
         nparams: f.params.len(),
         param_global,
@@ -1069,6 +1294,14 @@ const SCC_SOLVE_BUDGET: usize = 8;
 /// analysis for summaries the budget would discard anyway.
 const SCC_SUMMARY_MAX_MEMBERS: usize = 128;
 
+/// TSAOT_NEST_BUDGET / TSAOT_NEST_MAX override the two nest limits (experiments).
+fn scc_solve_budget() -> usize {
+    std::env::var("TSAOT_NEST_BUDGET").ok().and_then(|v| v.parse().ok()).unwrap_or(SCC_SOLVE_BUDGET)
+}
+fn scc_summary_max_members() -> usize {
+    std::env::var("TSAOT_NEST_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(SCC_SUMMARY_MAX_MEMBERS)
+}
+
 fn interproc_trace() -> bool {
     std::env::var("TSAOT_INTERPROC_TRACE").map(|v| v == "1").unwrap_or(false)
 }
@@ -1093,12 +1326,14 @@ pub fn analyze_program(program: &Program) -> EscapeResult {
             let Some(&f) = by_id.get(&scc[0].0) else { continue };
             let (solver, _) = solve(f, &summaries);
             summaries[scc[0].0 as usize] = Some(extract_summary(f, &solver));
-        } else if scc.len() > SCC_SUMMARY_MAX_MEMBERS {
+        } else if scc.len() > scc_summary_max_members() {
             // Already None; the constraint builder treats a callee without a
             // summary as unknown (every reference argument escapes), the
             // precision these calls had while they went through closure values.
             if interproc_trace() {
                 eprintln!("[interproc] nest of {} functions: skipped, no summaries", scc.len());
+                let ids: Vec<String> = scc.iter().map(|m| m.0.to_string()).collect();
+                eprintln!("[interproc] nest members: {}", ids.join(" "));
             }
         } else {
             for m in scc {
@@ -1125,7 +1360,8 @@ pub fn analyze_program(program: &Program) -> EscapeResult {
             }
             let mut queue: std::collections::VecDeque<u32> = scc.iter().map(|m| m.0).collect();
             let mut queued: BTreeSet<u32> = members.clone();
-            let budget = scc.len() * SCC_SOLVE_BUDGET;
+            let budget = scc.len() * scc_solve_budget();
+            let nest_started = std::time::Instant::now();
             let mut solves = 0usize;
             let mut converged = true;
             while let Some(id) = queue.pop_front() {
@@ -1136,6 +1372,12 @@ pub fn analyze_program(program: &Program) -> EscapeResult {
                     break;
                 }
                 solves += 1;
+                if interproc_trace() && scc.len() > 100 && solves % 200 == 0 {
+                    eprintln!(
+                        "[interproc]   nest of {}: {} solves, {} queued, {:.1}s",
+                        scc.len(), solves, queue.len(), nest_started.elapsed().as_secs_f64()
+                    );
+                }
                 let (solver, _) = solve(f, &summaries);
                 let s = extract_summary(f, &solver);
                 if summaries[id as usize].as_ref() != Some(&s) {

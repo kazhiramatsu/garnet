@@ -5855,6 +5855,54 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   and 4.560 vs 4.555 s median (pairs -0.1% to +0.7%): neutral within
   noise; kept for the semantics (loud receivers, fewer lookups) rather
   than the time. Node 3.27-3.29 s (1.39x).
+- Escape analysis soundness: stores through a parameter's contents (build
+  `x48`, full build; analyzer; `docs/escape_param_contents_design.md`).
+  The allocation-site statistics of `x47` (8.7M counted allocations per
+  compile: scope records 2.34M, closures 3.34M of which 1.99M already on
+  the C stack, arrays 2.17M, literals 0.8M) pointed at the escape analysis
+  as the next structural item, and a lifetime attack on it, as the
+  Session 350 soundness note prescribes, found two holes in the
+  interprocedural summaries before anything was built on them: a value
+  stored into the contents of a parameter's field
+  (`function f(reg, i) { const b = new Box(i); reg.list.push(b) }`) was
+  `NoEscape`, because the phantom node of `reg.list` was reachable from
+  nothing, and a load from a phantom, an external object or a dynamically
+  stored field yielded nothing, so a store through it was lost. A class
+  instance or closure at such a site was emitted as a C stack struct and
+  read after the frame died: `NaN` in place of the field, or a crash (the
+  new fixture prints nothing under the old analysis). Fix: phantoms are
+  linked under the object they were loaded from (`Solver::link`, kept out
+  of the summary), loads two or more deep yield one `ParamDeep` node per
+  parameter, loads from `External` yield `External`, dynamic stores go
+  under `FieldKey::Dynamic` which every load consults, and summaries name
+  the base of a store into parameter contents (`SObj::ParamField` is
+  translated at the call site as a load of the actual's field plus the
+  store, `SObj::ParamDeep` as a store to the global sink). A first version
+  kept phantom *values* distinct and blew up the points-to sets of the
+  configuration and module-resolution functions (millions of entries, five
+  minutes of analysis): phantom values and returns are collapsed to
+  `External`, and a function over 200k constraints (`__module_init`, 400k)
+  takes the conservative decision instead of a seven-second solve.
+  Analysis of the compiler 2.8 s -> 8.8 s. Knob `TSAOT_ESCAPE_PHANTOMS=0`
+  restores the old analysis (byte-identical decision report; the parity
+  oracle sets it). Decision report of the compiler, count-weighted: closures
+  91k per compile Heap -> Stack (callbacks to `filterType` and friends: the
+  old summaries collapsed a callee's escaping arrays and its non-escaping
+  inner closure into one node), 368 module-init closure sites Stack ->
+  PretenuredHeap (zero runtime count), arrays and records unchanged. Fixture
+  `closures/param_contents_lifetimes` (known-diff row: the frozen emitter
+  does not scalar-replace `churn`'s loop instance). Gates all green.
+  A/B against `x47`, two rounds of three alternating runs: 4.538 vs 4.537 s and 4.558 vs 4.568 s median (pairs -0.2% to
+  +0.0%): neutral, as expected from 91k fewer closure allocations per
+  compile (1.374M -> 1.283M, total 14.72M -> 14.63M); Node 3.26-3.27 s
+  (1.39x).
+  Also found: the checker's nested functions form a recursion nest of 1,640
+  members (plus nests of 242 and 209) that gets no summaries at all
+  (`SCC_SUMMARY_MAX_MEMBERS` 128), so every argument of every call into the
+  checker escapes: `mapType`'s callbacks, the scope records passed to nested
+  helpers, the arrays handed to `getUnionType`. The plain fixpoint does not
+  converge within 13k solves (the hub summaries accumulate eleven thousand
+  stores into captured variables' contents); see the next slice.
 - Next slices, in order. (0) External element buffers (the malloc'd
   `data` of arrays, also strings' and maps' buffers) do not count toward
   the collector's trigger: a loop that drops large arrays grows without
