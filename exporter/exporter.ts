@@ -4346,7 +4346,7 @@ class Exporter {
       }
       // map.size / set.size -> runtime size (returns a number)
       if (node.name.text === "size") {
-        const k = this.builtinReceiverKind(node.expression);
+        const k = this.builtinReceiverKind(node.expression) ?? this.derivedCollectionKind(node.expression);
         if (k === "map" || k === "set") {
           const recv = this.lowerExpr(ctx, node.expression);
           const dst = this.newLocal(ctx, "primitive");
@@ -5438,7 +5438,12 @@ class Exporter {
         }
         // Standard-library String/Array methods -> runtime helpers (CallBuiltin).
         if (fn.expression.kind !== ts.SyntaxKind.SuperKeyword) {
-          const cls = this.builtinReceiverKind(fn.expression);
+          let cls = this.builtinReceiverKind(fn.expression);
+          if (cls === undefined) {
+            // a Map/Set-derived interface: only its builtin members take the collection path
+            const dk = this.derivedCollectionKind(fn.expression);
+            if (dk !== undefined && this.builtinMethodName2(dk, fn.name.text) !== undefined) cls = dk;
+          }
           if (cls !== undefined) {
             const bname = this.builtinMethodName2(cls, fn.name.text);
             if (bname !== undefined) {
@@ -9492,6 +9497,39 @@ class Exporter {
    *  reference's target) whose base types reach the global Array or
    *  ReadonlyArray. Classes are excluded (a class extending Array keeps the
    *  dynamic paths). */
+  /** `TSAOT_MAP_INTERFACES=0`: interfaces extending Map/Set keep the dynamic dispatch. */
+  mapInterfaces = process.env.TSAOT_MAP_INTERFACES !== "0" && process.env.TSAOT_UNTYPED !== "1";
+  /** A receiver typed as an interface whose base types reach Map/ReadonlyMap or
+   *  Set/ReadonlySet (the compiler's `MultiMap<K, V> extends Map<K, V[]>`): its
+   *  instances are Maps/Sets with extra typing, so a builtin member (`get`,
+   *  `has`, `size`, `for..of`) takes the collection path; its own members keep
+   *  the dynamic dispatch. A non-collection receiver throws the TypeError V8
+   *  throws for a Map method on an incompatible receiver. */
+  derivedCollectionKind(recvExpr: ts.Expression): "map" | "set" | undefined {
+    if (!this.mapInterfaces) return undefined;
+    try {
+      const t = this.checker.getTypeAtLocation(recvExpr);
+      const nn = t.getNonNullableType ? t.getNonNullableType() : t;
+      const sym = nn.getSymbol();
+      if (!sym || this.isAmbientGlobalSymbol(sym)) return undefined;
+      if (this.isCollectionDerivedType(nn, 0, "Map")) return "map";
+      if (this.isCollectionDerivedType(nn, 0, "Set")) return "set";
+    } catch { /* fall through */ }
+    return undefined;
+  }
+  /** An interface whose base types reach the ambient Map/ReadonlyMap (`which`
+   *  "Map") or Set/ReadonlySet ("Set"). */
+  private isCollectionDerivedType(t: ts.Type, depth: number, which: "Map" | "Set"): boolean {
+    if (depth > 6 || !(t.flags & ts.TypeFlags.Object)) return false;
+    const ot = t as ts.ObjectType;
+    const target = (ot.objectFlags & ts.ObjectFlags.Reference) ? (ot as ts.TypeReference).target : ot;
+    if (!(target.objectFlags & ts.ObjectFlags.Interface)) return false;
+    const tsym = target.getSymbol();
+    if (tsym && (tsym.name === which || tsym.name === "Readonly" + which) && this.isAmbientGlobalSymbol(tsym)) return true;
+    let bases: readonly ts.BaseType[] = [];
+    try { bases = this.checker.getBaseTypes(target as ts.InterfaceType); } catch { return false; }
+    return bases.some((b) => this.isCollectionDerivedType(b, depth + 1, which));
+  }
   private isArrayDerivedType(t: ts.Type, depth: number): boolean {
     if (depth > 6 || !(t.flags & ts.TypeFlags.Object)) return false;
     if (this.checker.isArrayType(t)) return true;
@@ -9544,6 +9582,9 @@ class Exporter {
       // extra properties, so for-of, length and the builtin methods take the
       // array paths (the compiler's NodeArray<T>, 174 for-of loops).
       if (sym && !this.isAmbientGlobalSymbol(sym) && this.arrayInterfaces && this.isArrayDerivedType(t, 0)) return "array";
+      // (An interface whose base types reach Map/Set is not a map/set receiver
+      // in general: it may add its own methods, as the compiler's MultiMap does.
+      // derivedCollectionKind serves the sites that ask about a builtin member.)
       if (sym && !this.isAmbientGlobalSymbol(sym)) return undefined;
       // Structural array/tuple identity takes precedence over the printed
       // element type: Map<K,V>[] starts with "Map<" but is not a Map receiver.
@@ -10362,13 +10403,13 @@ class Exporter {
     if (!this.forOfCursorEnabled) return undefined;
     let e: ts.Expression = expr;
     while (ts.isParenthesizedExpression(e) || ts.isAsExpression(e) || ts.isNonNullExpression(e)) e = e.expression;
-    const rk = this.builtinReceiverKind(e);
+    const rk = this.builtinReceiverKind(e) ?? this.derivedCollectionKind(e);
     if (rk === "map") return { coll: e, mode: "entries" };
     if (rk === "set") return { coll: e, mode: "values" };
     if (ts.isCallExpression(e) && e.arguments.length === 0 && ts.isPropertyAccessExpression(e.expression)) {
       const m = e.expression.name.text;
       if (m !== "keys" && m !== "values" && m !== "entries") return undefined;
-      const rrk = this.builtinReceiverKind(e.expression.expression);
+      const rrk = this.builtinReceiverKind(e.expression.expression) ?? this.derivedCollectionKind(e.expression.expression);
       if (rrk === "map") return { coll: e.expression.expression, mode: m };
       if (rrk === "set") return { coll: e.expression.expression, mode: m === "entries" ? "entries" : "values" };
     }

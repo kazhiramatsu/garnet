@@ -6302,15 +6302,16 @@ static tsv map_set_unchecked(tsv mv, tsv k, tsv v){
   return mv;
 }
 tsv ts_map_set(tsv mv, tsv k, tsv v){
-  return ts_is_map(mv) ? map_set_unchecked(mv, k, v) : mv;
+  if (!ts_is_map(mv)) ts_throw_type_error_msg("Method Map.prototype.set called on incompatible receiver");
+  return map_set_unchecked(mv, k, v);
 }
 tsv ts_map_get(tsv mv, tsv k){
-  if (!ts_is_map(mv)) return TS_UNDEFINED;
+  if (!ts_is_map(mv)){ ts_throw_type_error_msg("Method Map.prototype.get called on incompatible receiver"); return TS_UNDEFINED; }
   ts_map* m = ts_ptr(mv); long i = map_find(m,k);
   return i>=0 ? m->vals[i] : TS_UNDEFINED;
 }
 int ts_map_has(tsv mv, tsv k){
-  if (!ts_is_map(mv)) return 0;
+  if (!ts_is_map(mv)){ ts_throw_type_error_msg("Method Map.prototype.has called on incompatible receiver"); return 0; }
   return map_find(ts_ptr(mv), k) >= 0;
 }
 static int map_delete_unchecked(tsv mv, tsv k){
@@ -6338,16 +6339,18 @@ static int map_delete_unchecked(tsv mv, tsv k){
   m->len--; return 1;
 }
 int ts_map_delete(tsv mv, tsv k){
-  return ts_is_map(mv) ? map_delete_unchecked(mv, k) : 0;
+  if (!ts_is_map(mv)) ts_throw_type_error_msg("Method Map.prototype.delete called on incompatible receiver");
+  return map_delete_unchecked(mv, k);
 }
 void ts_map_clear(tsv mv){
+  if (!ts_is_map(mv)) ts_throw_type_error_msg("Method Map.prototype.clear called on incompatible receiver");
   if (ts_is_map(mv)){
     ts_map* m=ts_ptr(mv); m->len=0; m->tombs=0;
     if (m->index) memset(m->index, 0, sizeof(uint32_t)*m->index_cap);
   }
 }
 double ts_map_size(tsv mv){
-  if (!ts_is_map(mv)) return 0;
+  if (!ts_is_map(mv)){ ts_throw_type_error_msg("Method get Map.prototype.size called on incompatible receiver"); return 0; }
   ts_map* m = ts_ptr(mv);
   return (double)(m->len - m->tombs);
 }
@@ -6628,7 +6631,7 @@ tsv ts_map_cursor_pair(tsv coll, double idx){
   return pair;
 }
 void ts_map_foreach(tsv mv, tsv cb){
-  if (!ts_is_map(mv)) return;
+  if (!ts_is_map(mv)){ ts_throw_type_error_msg("Method Map.prototype.forEach called on incompatible receiver"); return; }
   ts_map* m=ts_ptr(mv);
   uint32_t len=m->len;
   ts_gc_root(&mv); ts_gc_root(&cb);
@@ -6697,9 +6700,13 @@ static tsv set_add_unchecked(tsv sv, tsv v){
   ts_write_barrier(sv, v); return sv;
 }
 tsv ts_set_add(tsv sv, tsv v){
-  return ts_is_set(sv) ? set_add_unchecked(sv, v) : sv;
+  if (!ts_is_set(sv)) ts_throw_type_error_msg("Method Set.prototype.add called on incompatible receiver");
+  return set_add_unchecked(sv, v);
 }
-int ts_set_has(tsv sv, tsv v){ return ts_is_set(sv) && set_find(ts_ptr(sv), v) >= 0; }
+int ts_set_has(tsv sv, tsv v){
+  if (!ts_is_set(sv)){ ts_throw_type_error_msg("Method Set.prototype.has called on incompatible receiver"); return 0; }
+  return set_find(ts_ptr(sv), v) >= 0;
+}
 static int set_delete_unchecked(tsv sv, tsv v){
   ts_set_t* s = ts_ptr(sv);
   uint32_t slot = 0;
@@ -6724,16 +6731,18 @@ static int set_delete_unchecked(tsv sv, tsv v){
   s->len--; return 1;
 }
 int ts_set_delete(tsv sv, tsv v){
-  return ts_is_set(sv) ? set_delete_unchecked(sv, v) : 0;
+  if (!ts_is_set(sv)) ts_throw_type_error_msg("Method Set.prototype.delete called on incompatible receiver");
+  return set_delete_unchecked(sv, v);
 }
 void ts_set_clear(tsv sv){
+  if (!ts_is_set(sv)) ts_throw_type_error_msg("Method Set.prototype.clear called on incompatible receiver");
   if (ts_is_set(sv)){
     ts_set_t* s=ts_ptr(sv); s->len=0; s->tombs=0;
     if (s->index) memset(s->index, 0, sizeof(uint32_t)*s->index_cap);
   }
 }
 double ts_set_size(tsv sv){
-  if (!ts_is_set(sv)) return 0;
+  if (!ts_is_set(sv)){ ts_throw_type_error_msg("Method get Set.prototype.size called on incompatible receiver"); return 0; }
   ts_set_t* s = ts_ptr(sv);
   return (double)(s->len - s->tombs);
 }
@@ -6747,7 +6756,7 @@ tsv ts_set_entries(tsv sv){
   return ts_map_iterator(sv, 4);
 }
 void ts_set_foreach(tsv sv, tsv cb){
-  if (!ts_is_set(sv)) return;
+  if (!ts_is_set(sv)){ ts_throw_type_error_msg("Method Set.prototype.forEach called on incompatible receiver"); return; }
   ts_set_t* s=ts_ptr(sv);
   uint32_t len=s->len;
   ts_gc_root(&sv); ts_gc_root(&cb);
@@ -14667,14 +14676,54 @@ tsv ts_gen_new_v(tsv cv){
    This makes `for...of`/`yield*` over a generator iterator work like spread, without
    regressing class iterators whose `next` lives under a method key. */
 tsv ts_iter_step(tsv iter, tsv sent, ts_key nmk){
+  /* The `next` lookups through a four-entry cache (own slot, prototype slot
+     or absent, by receiver shape): the Map/Set and array iterators and the
+     generator objects are a handful of shapes. */
+  /* `next` lives on the iterator's prototype (the Map/Set and array iterator
+     protos, a class prototype); the cached read locates it through the own
+     shape (no own `next`), the prototype handle and the prototype's shape, and
+     reads the slot each time (a reassigned method keeps its slot; an added or
+     deleted property changes a shape). Four entries: the iterator kinds of a
+     compile are a handful. */
+  static ts_key k_next;
+  static struct { uint32_t shape, proto_shape, slot; tsv proto; } nc[4];
+  static uint32_t nc_next;
+  if (!k_next) k_next = ts_intern_field("next", 4);
   ts_gc_root(&iter); ts_gc_root(&sent);
-  tsv nf = ts_get(iter, ts_intern_field("next", 4));
-  ts_gc_root(&nf);
-  if (!ts_is_callable(nf)){
-    ts_gc_unroot(1);
-    nf = ts_get(iter, nmk);
-    ts_gc_root(&nf);
+  tsv nf = TS_UNDEFINED;
+  int cached = 0;
+  if (TS_TOP16(iter) == TS_SEL_OBJECT){
+    ts_object* o = (ts_object*)ts_ptr(iter);
+    if (o->h.kind == TS_KIND_OBJECT && ts_is_obj(o->proto)){
+      for (uint32_t i = 0; i < 4u; i++){
+        if (nc[i].shape == o->shape && nc[i].proto == o->proto){
+          ts_object* p = (ts_object*)ts_ptr(o->proto);
+          if (p->shape == nc[i].proto_shape){ nf = *ts_obj_slot_ptr(p, nc[i].slot); cached = 1; }
+          break;
+        }
+      }
+    }
   }
+  if (!cached){
+    nf = ts_get(iter, k_next);
+    if (!ts_is_callable(nf)) nf = ts_get(iter, nmk);
+    else if (TS_TOP16(iter) == TS_SEL_OBJECT){
+      /* fill: an own-shaped iterator without an own `next`, the direct prototype
+         holding `next` as a plain data slot */
+      ts_object* o = (ts_object*)ts_ptr(iter);
+      if (o->h.kind == TS_KIND_OBJECT && obj_shaped(o) && !pref_ok(prop_find(o, k_next)) && ts_is_obj(o->proto)){
+        ts_object* p = (ts_object*)ts_ptr(o->proto);
+        if (p->h.kind == TS_KIND_OBJECT && obj_shaped(p)){
+          ts_pref pr = prop_find(p, k_next);
+          if (pref_ok(pr) && !pref_is_accessor(pr)){
+            uint32_t i = nc_next++ & 3u;
+            nc[i].shape = o->shape; nc[i].proto = o->proto; nc[i].proto_shape = p->shape; nc[i].slot = pr.i;
+          }
+        }
+      }
+    }
+  }
+  ts_gc_root(&nf);
   tsv r;
   if (ts_is_callable(nf)){
     tsv a[2] = { iter, sent };

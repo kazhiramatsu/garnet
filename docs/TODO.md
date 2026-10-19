@@ -5823,6 +5823,38 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   exporter does not classify as maps), `type`/`aliasSymbol`/`node` 0.3-0.4M
   each (absent reads of optional fields through the negative cache's
   misses).
+- Collection dispatch: derived interfaces, loud receivers, the cached
+  `next` (builds `x46`, full build, and `x47`, relinked; exporter,
+  runtime; `docs/collection_dispatch_design.md`). Three items from the
+  histogram. (a) Map methods called through interfaces that extend Map
+  (`core.ts`'s `MultiMap<K, V> extends Map<K, V[]>`: 48 `get`, 18 `set`,
+  11 `has` sites) went through the dynamic dispatch; a receiver typed as
+  such an interface now takes the Map/Set builtins for its *builtin*
+  members (`derivedCollectionKind`: method calls with a builtin, `.size`,
+  `for..of`) and keeps the dynamic dispatch for its own members. The
+  first attempt classified the whole receiver as a map and rejected
+  `add` as an unimplemented stdlib method, which refused the compiler
+  itself (the build "succeeded" with no binary: the build script does
+  not propagate the exporter's refusal). Typed mode only. (b) The Map/Set
+  builtins throw V8's TypeError on an incompatible receiver instead of
+  returning undefined/0/the receiver silently (`.size` through a lying
+  type throws where V8 reads a plain property). (c) `ts_iter_step` (the
+  generic `.next()` of `for..of` and `yield*`) interned the key by string
+  and walked to the prototype on every step (`next` 0.79M dictionary
+  lookups); a four-entry cache keyed by the iterator's shape and
+  prototype now reads the prototype's slot (a reassigned method keeps
+  its slot; additions change the shape). A first version through
+  `ts_get_pic_checked` did nothing: that path never fills a cache entry
+  for an inherited hit. Statistics: dictionary lookups 11.5M -> 10.7M per
+  compile, `next` gone; the 0.45M `get` lookups remain and are not the
+  dynamic dispatch (0 such sites now): their source is still unknown.
+  Fixture `maps_sets/map_interfaces` (allowlist rows: a frame-arena
+  versus stack label for one closure in parity; `array.spliceDrop`
+  unported in the frozen emitter for selfconf). Gates all green. A/B
+  against `x45`, two rounds of three alternating runs: 4.556 vs 4.533 s
+  and 4.560 vs 4.555 s median (pairs -0.1% to +0.7%): neutral within
+  noise; kept for the semantics (loud receivers, fewer lookups) rather
+  than the time. Node 3.27-3.29 s (1.39x).
 - Next slices, in order. (0) External element buffers (the malloc'd
   `data` of arrays, also strings' and maps' buffers) do not count toward
   the collector's trigger: a loop that drops large arrays grows without
