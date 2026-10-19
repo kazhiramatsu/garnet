@@ -6064,12 +6064,13 @@ fn numeric_value_locs(
 /// Tiny leaf direct entries (docs/tiny_leaf_inline_design.md): a function of
 /// at most twenty straight-line or `if` instructions that calls nothing and
 /// allocates nothing (`getObjectFlags`, `isFreshLiteralType`, `getNodeId`, the
-/// checker's accessors) is emitted `always_inline`, so every direct call site
-/// absorbs it; the generic entry keeps a real function. TSAOT_TINY_INLINE=0
-/// keeps them out of line (parity oracle).
+/// checker's accessors) can be emitted `always_inline`, so every direct call
+/// site absorbs it; the generic entry keeps a real function. The compiler ran
+/// 1.5% slower with it (3,089 functions, +2.2 MB of text), so the rule is OFF
+/// unless TSAOT_TINY_INLINE=1 (Session 350); the parity oracle passes =0.
 fn tiny_inline_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| !matches!(std::env::var("TSAOT_TINY_INLINE").as_deref(), Ok("0")))
+    *ENABLED.get_or_init(|| matches!(std::env::var("TSAOT_TINY_INLINE").as_deref(), Ok("1")))
 }
 fn tiny_leaf_direct(f: &Function) -> bool {
     if !tiny_inline_enabled() || f.is_async || f.is_generator {
