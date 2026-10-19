@@ -85,6 +85,9 @@
 #   TSAOT_LAZY_FN_VALUES=0  Exporter: create the closure of every nested function
 #                          declaration used as a value at the owner's entry
 #                          instead of on first use (legacy IR).
+#   TSAOT_SPECIALIZE_CALLBACKS=0  Exporter: do not clone a function per
+#                          module-level function passed as a callback (default:
+#                          clone, binding the parameter to the function).
 #   TSAOT_SPLICE_FAST=0     Exporter: lower every array splice to the general
 #                          builtin even when its result is discarded (legacy IR).
 #   TSAOT_TINY_INLINE=1     Emitter: mark tiny leaf direct entries always_inline

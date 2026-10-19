@@ -5425,6 +5425,44 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   little while the code at 150k read sites costs: as with `x21` and
   `x27`, gains come from fewer executed instructions and calls and from
   smaller code.
+- Callback specialization (`docs/callback_specialization_design.md`,
+  build `x30`, exporter only; whole-program item 1 of
+  `docs/whole_program_facts_design.md`). A call `f(a, cb)` to a module-level
+  function whose argument names a function (directly, or through an
+  enclosing clone's binding) is routed to a clone of `f` lowered with the
+  parameter bound to that function: calls to the parameter become direct
+  calls (specialized in turn when the clone passes the parameter on), a
+  value use boxes the function with the cells the clone holds, the clone
+  drops the bound parameters and the site drops the arguments. A
+  parameter qualifies when it is a plain identifier without a default,
+  never assigned, and referenced only as a callee or as an argument of a
+  call to a module-level function, never from a nested function; the
+  target's captured cells must be among the owner's. Clones are cached per
+  (function, bindings), sixteen per function at most. The compiler's
+  export creates 54 clones: `binarySearch` / `binarySearchKey` bound to
+  `getTypeId` + `compareValues` (the checker's `containsType` /
+  `addTypesToUnion`), `getCombinedFlags` to `getNodeFlags`,
+  `getFirstJSDocTag` to fifteen tag predicates, `insertSorted`,
+  `deduplicate`, `pushIfUnique`, `comparePathsWorker`,
+  `getSpellingSuggestion` to their comparers. Knob
+  `TSAOT_SPECIALIZE_CALLBACKS=0`; `TSAOT_SPECIALIZE_CALLBACKS_LOG=1|2`
+  lists the clones and the skipped arguments. Found and fixed on the way:
+  a direct call threads the callee's module cells by looking its
+  declaration up by function id, and a clone's fresh id was unknown to
+  that lookup (the first build shifted every argument of the clone of
+  `createModuleOrTypeReferenceResolutionCache` by one and died in `toPath`;
+  the generic-type clones of `specializeGenericCall` had the same latent
+  hole); clones now register their id against the declaration
+  (`registerSpecNode`). Fixture `functions/callback_specialization`
+  (selectors and comparers, pass-through, a throwing callback, value and
+  reassigned parameters on the unchanged path, closures and arrows, extra
+  and missing arguments, recursion through a bound parameter, owners and
+  targets capturing module cells), identical to V8. Compiler A/B against
+  `x28`, alternating three runs, outputs validated, diagnostics zero:
+  **5.554 → 5.483 s median wall (−1.3%; the pairs −0.9%, −1.9%, −1.3%),
+  Node 3.30 s → 1.66x.** Gates: conformance 449/449, parity 346 identical
+  + 99 KNOWN, bundler 42/42, selfconf 432 + 14 KNOWN, GC stress (all
+  phases), inline policy, units.
 - Next slices, in order. (0) External element buffers (the malloc'd
   `data` of arrays, also strings' and maps' buffers) do not count toward
   the collector's trigger: a loop that drops large arrays grows without

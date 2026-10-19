@@ -1977,6 +1977,12 @@ class Exporter {
     }
     return this._fnNodeById.get(id);
   }
+  /** A specialized clone shares its declaration node with the original: register
+   *  the clone id so direct calls thread the declaration's captured cells. */
+  registerSpecNode(specId: number, node: ts.Node): void {
+    this.fnNodeById(-1);
+    this._fnNodeById!.set(specId, node);
+  }
   // ---------------- capture contexts (C5b-1) ----------------
   /** A captured binding lives in its owner's scope record unless it needs its
    *  own cell: a binding declared inside a loop (fresh per iteration), the
@@ -4871,6 +4877,7 @@ class Exporter {
       }
       let recv: number | undefined;
       let callee: any = { kind: "Unknown" };
+      let droppedCallbackArgs: Set<number> | undefined;
       const fn = node.expression;
       const nsTarget = ts.isPropertyAccessExpression(fn) ? this.namespaceMemberCallTarget(fn) : undefined;
       if (nsTarget !== undefined) {
@@ -4958,8 +4965,24 @@ class Exporter {
           // is lowered with T -> concrete substitution (so params/locals/returns
           // are classified as the concrete scalar and stay unboxed).
           const spec = this.specializeGenericCall(node, sym);
-          callee = { kind: "Direct", func: spec !== undefined ? spec : this.funcSymbols.get(sym) };
+          let func = spec !== undefined ? spec : this.funcSymbols.get(sym)!;
+          if (spec === undefined) {
+            // Callback specialization: arguments naming module-level functions
+            // bind the callee's callback parameters in a clone.
+            const cb = this.specializeCallbackCall(node, sym);
+            if (cb) { func = cb.func; droppedCallbackArgs = cb.dropped; }
+          }
+          callee = { kind: "Direct", func };
           if (spec === undefined && this.nestedFuncSymbols.has(sym)) this.ensureNestedLowered(sym);
+        } else if (sym && this.callbackSubst?.has(sym)) {
+          // A bound callback parameter called inside a specialized clone: the
+          // module-level function it names, called directly and specialized in turn.
+          const target = this.callbackSubst.get(sym)!;
+          let func = this.funcSymbols.get(target)!;
+          const cb = this.specializeCallbackCall(node, target);
+          if (cb) { func = cb.func; droppedCallbackArgs = cb.dropped; }
+          else if (this.nestedFuncSymbols.has(target)) this.ensureNestedLowered(target);
+          callee = { kind: "Direct", func };
         } else if (sym && ctx.selfFunctionSymbol === sym) {
           // The lexical name of a named function expression denotes this exact
           // lifted function. The regular Direct-call path below threads captures.
@@ -5624,7 +5647,9 @@ class Exporter {
         ctx.body.push(inst);
         return dst;
       }
-      const args = this.lowerSequenced(ctx, node.arguments);
+      const args = this.lowerSequenced(ctx, droppedCallbackArgs
+        ? node.arguments.filter((_, i) => !droppedCallbackArgs!.has(i))
+        : node.arguments);
       const dst = this.newLocal(ctx, this.refKindOf(node));
       // The callee's parameter layout is [cells..., this, real params] (Step C /
       // AllocClosure). Both prepends below unshift, so they run in REVERSE of
@@ -6382,7 +6407,16 @@ class Exporter {
   }
 
   lowerIdentifier(ctx: FnCtx, node: ts.Identifier): number {
-    const sym = this.symbolOf(node);
+    let sym = this.symbolOf(node);
+    // a callback parameter bound by specialization names the function itself:
+    // box it with the cells this clone holds (the binding rule guarantees them)
+    if (sym && this.callbackSubst?.has(sym)) {
+      const target = this.callbackSubst.get(sym)!;
+      const v = this.directFunctionValue(ctx, this.funcSymbols.get(target)!);
+      if (v !== undefined) return v;
+      this.unsupported(node, `specialized callback '${node.text}' used as a value where its captures are unavailable`);
+      sym = target;
+    }
     if (node.text === "arguments" && !sym?.declarations?.length) {
       this.unsupported(node, "arguments object as a value (only arguments.length is implemented)");
       const dst = this.newLocal(ctx, "reference");
@@ -7091,6 +7125,7 @@ class Exporter {
     // method clones so ids never collide; the analyzer indexes functions by id).
     const specId = this.allocSpecFn();
     this.genFnSpecializations.set(key, specId);
+    this.registerSpecNode(specId, decl);
     const savedSubst = this.typeSubst;
     this.typeSubst = subst;
     try {
@@ -7104,6 +7139,134 @@ class Exporter {
     return specId;
   }
 
+  /** Whole-program callback specialization: a call `f(a, cb)` whose argument
+   *  `cb` names a module-level function and whose parameter is only ever
+   *  called (or passed on to another module-level function) is routed to a
+   *  clone of `f` lowered with that parameter bound to the function, so the
+   *  clone calls it directly (and specializes its own callees in turn). The
+   *  clone drops the bound parameters; the call site drops the arguments.
+   *  Returns the clone id and the dropped argument indices, or undefined. */
+  specializeCallbackCall(node: ts.CallExpression, fnSym: ts.Symbol): { func: number; dropped: Set<number> } | undefined {
+    if (!this.callbackSpecEnabled) return undefined;
+    const decl = (fnSym.valueDeclaration ?? fnSym.declarations?.[0]) as ts.Node | undefined;
+    if (!decl || !ts.isFunctionDeclaration(decl) || !decl.body) return undefined;
+    if (decl.asteriskToken || decl.modifiers?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword)) return undefined;
+    const fnId = this.funcSymbols.get(fnSym);
+    if (fnId === undefined || this.nestedFuncSymbols.has(fnSym) || this.funcTakesThisIds.has(fnId)) return undefined;
+    if (this.bodyUsesArguments(decl.body)) return undefined;
+    const subst = new Map<ts.Symbol, ts.Symbol>();
+    const dropped = new Set<number>();
+    const tagParts: string[] = [];
+    const n = Math.min(node.arguments.length, decl.parameters.length);
+    for (let i = 0; i < n; i++) {
+      const p = decl.parameters[i];
+      const arg = node.arguments[i];
+      if (!ts.isIdentifier(p.name) || p.dotDotDotToken || p.initializer || p.name.text === "this") continue;
+      if (!ts.isIdentifier(arg)) continue;
+      const target = this.resolveCallbackTarget(this.symbolOf(arg), decl);
+      const dbg = process.env.TSAOT_SPECIALIZE_CALLBACKS_LOG === "2";
+      if (!target) {
+        if (dbg) {
+          const s = this.symbolOf(arg);
+          const d = s?.valueDeclaration ?? s?.declarations?.[0];
+          const frees = d && ts.isFunctionDeclaration(d) ? this.sortedFreeVars(d as FnLike).map((v) => v.name).join(",") : "n/a";
+          console.error(`[cbspec-skip] ${fnSym.name} arg ${i} '${arg.text}': sym=${s?.name} inFuncSymbols=${s ? this.funcSymbols.has(s) : false} frees=[${frees}]`);
+        }
+        continue;
+      }
+      const psym = this.symbolOf(p.name);
+      if (!psym || this.assignedSyms.has(psym)) { if (dbg) console.error(`[cbspec-skip] ${fnSym.name} param ${i}: assigned`); continue; }
+      if (!this.paramOnlyCalledOrPassed(decl.body, psym)) { if (dbg) console.error(`[cbspec-skip] ${fnSym.name} param ${i}: used otherwise`); continue; }
+      subst.set(psym, target);
+      dropped.add(i);
+      tagParts.push(`${i}=${this.funcSymbols.get(target)}`);
+    }
+    if (subst.size === 0) return undefined;
+    const key = `${fnId}|cb:${tagParts.join(",")}`;
+    const cached = this.cbFnSpecializations.get(key);
+    if (cached !== undefined) return { func: cached, dropped };
+    const count = this.cbSpecCount.get(fnId) ?? 0;
+    if (count >= this.maxCallbackSpecs) return undefined;
+    this.cbSpecCount.set(fnId, count + 1);
+    const specId = this.allocSpecFn();
+    this.cbFnSpecializations.set(key, specId);
+    this.registerSpecNode(specId, decl);
+    const savedSubst = this.callbackSubst, savedType = this.typeSubst;
+    this.callbackSubst = subst;
+    this.typeSubst = undefined;
+    try {
+      this.lowerFunctionLike(decl as FnLike, specId, false);
+      const emitted = this.functions.find((f) => f.id === specId);
+      if (emitted) emitted.name = `${emitted.name}$cb$${[...subst.values()].map((s) => s.name).join("$")}`;
+    } finally {
+      this.callbackSubst = savedSubst;
+      this.typeSubst = savedType;
+    }
+    if (process.env.TSAOT_SPECIALIZE_CALLBACKS_LOG) console.error(`[cbspec] ${key} -> ${specId}`);
+    return { func: specId, dropped };
+  }
+  /** The module-level function a callback argument names (through an active substitution). */
+  resolveCallbackTarget(sym: ts.Symbol | undefined, owner: ts.FunctionDeclaration): ts.Symbol | undefined {
+    if (!sym) return undefined;
+    const mapped = this.callbackSubst?.get(sym);
+    if (mapped) sym = mapped;
+    if (!this.funcSymbols.has(sym)) return undefined;
+    const id = this.funcSymbols.get(sym)!;
+    if (this.funcTakesThisIds.has(id)) return undefined;
+    const d = sym.valueDeclaration ?? sym.declarations?.[0];
+    if (!d || !ts.isFunctionDeclaration(d) || !d.body) return undefined;
+    // The clone calls the target directly and may box it as a value, so every
+    // cell the target captures must be one the owner (hence the clone) holds.
+    const need = this.sortedFreeVars(d as FnLike);
+    if (need.length > 0) {
+      const have = new Set(this.sortedFreeVars(owner as FnLike));
+      if (!need.every((v) => have.has(v))) return undefined;
+    }
+    return sym;
+  }
+  bodyUsesArguments(body: ts.Node): boolean {
+    let found = false;
+    const visit = (n: ts.Node): void => {
+      if (found) return;
+      if (ts.isIdentifier(n) && n.text === "arguments") { found = true; return; }
+      if (ts.isFunctionDeclaration(n) || ts.isFunctionExpression(n)) return;
+      ts.forEachChild(n, visit);
+    };
+    visit(body);
+    return found;
+  }
+  /** Every reference to `psym` in `body` is a callee, or an argument of a call
+   *  whose callee names a module-level function (which specializes in turn),
+   *  and at least one reference is a callee. */
+  paramOnlyCalledOrPassed(body: ts.Node, psym: ts.Symbol): boolean {
+    let ok = true, used = false;
+    const visit = (n: ts.Node): void => {
+      if (!ok) return;
+      // a reference from a nested function would be a capture of a binding the
+      // clone no longer has: keep such parameters on the generic path
+      if (n !== body && (ts.isFunctionLike(n) || ts.isClassLike(n))) {
+        let inner = false;
+        const scan = (m: ts.Node): void => { if (inner) return; if (ts.isIdentifier(m) && this.symbolOf(m) === psym) inner = true; else ts.forEachChild(m, scan); };
+        scan(n);
+        if (inner) ok = false;
+        return;
+      }
+      if (ts.isIdentifier(n) && this.symbolOf(n) === psym) {
+        const parent = n.parent;
+        if (ts.isCallExpression(parent) && parent.expression === n) { used = true; return; }
+        if (ts.isCallExpression(parent) && parent.arguments.some((a) => a === n) && ts.isIdentifier(parent.expression)) {
+          const csym = this.symbolOf(parent.expression);
+          if (csym && this.funcSymbols.has(csym) && !this.nestedFuncSymbols.has(csym)) { used = true; return; }
+        }
+        ok = false;
+        return;
+      }
+      ts.forEachChild(n, visit);
+    };
+    visit(body);
+    return ok && used;
+  }
+
   /** Counter for specialized-function ids (cloned methods), dense above assigned. */
   specBase = -1;
 
@@ -7115,6 +7278,16 @@ class Exporter {
   typeSubst: Map<string, TypeSpec> | undefined = undefined;
   /** Cache of generic-function specializations: "fnId|tag" -> specialized fnId. */
   genFnSpecializations = new Map<string, number>();
+  /** Callback specialization (docs/whole_program_facts_design.md, item 1):
+   *  while lowering a clone, parameter symbol -> the module-level function
+   *  symbol bound at the specializing call site. */
+  callbackSubst: Map<ts.Symbol, ts.Symbol> | undefined = undefined;
+  /** Cache: "fnId|cb:i=targetFnId,..." -> specialized fnId. */
+  cbFnSpecializations = new Map<string, number>();
+  /** Clones per original function (cap). */
+  cbSpecCount = new Map<number, number>();
+  maxCallbackSpecs = 16;
+  callbackSpecEnabled = process.env.TSAOT_SPECIALIZE_CALLBACKS !== "0";
 
   /** Record the resolved concrete type of each field for one `new C<...>()`. */
   /** Lower a class's field initializers (`class C { a = <expr> }`) as StoreField
@@ -11047,6 +11220,12 @@ class Exporter {
     for (const p of node.parameters) {
       // skip the explicit `this` parameter — already bound as thisLocal via emitThis.
       if (ts.isIdentifier(p.name) && p.name.text === "this") continue;
+      // a callback parameter bound by specialization has no local: its
+      // references name the function (the call site drops the argument)
+      if (this.callbackSubst && ts.isIdentifier(p.name)) {
+        const ps = this.symbolOf(p.name);
+        if (ps && this.callbackSubst.has(ps)) continue;
+      }
       if (p.dotDotDotToken) {
         // rest parameter: a normal local that the callee fills with an array of
         // the surplus args. Must be a simple identifier (no destructured rest).
