@@ -750,6 +750,7 @@ Compiler A/Bs for the slice (three alternating runs each, outputs validated):
 | `native_s350x17` (lazy closure values for nested declarations) | 5.945 s | 0.5% less than `x16` (5.973 s in the same run, all four pairs agree); Node 3.243 s; RSS 1,089 → 1,100 MB; diagnostics zero, outputs validated |
 | `native_s350x18` (value captures, round 2: settled bindings) | 5.953 s | 0.8% less than `x17` (6.000 s in the same quiet run, all four pairs agree); Node 3.268 s; RSS 1,100 → 1,155 MB; diagnostics zero, outputs validated |
 | `native_s350x19` (splice fast paths: discarded results) | 6.021 s | 1.6% less than `x18` (6.121 s in the same run, all four pairs agree, desktop load present); Node 3.423 s; RSS 1,155 → 1,058 MB; diagnostics zero, outputs validated |
+| `native_s350x20` (string + integer without the intermediate string) | 6.139 s | no measurable change against `x19` (two A/Bs: −0.8% and +0.1%, Node 3.36–3.49 s); kernel `string_keys` 230 → 198 ms; diagnostics zero, outputs validated |
 
 ### Inline-cache path statistics (Session 350, `native_s350s_stats`)
 

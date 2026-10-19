@@ -5126,10 +5126,50 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   Compiler A/B against the settled-captures build, alternating three
   runs, outputs validated, diagnostics zero: **6.121 → 6.021 s median wall (1.6% less; all four run pairs favour the new build; measured under the owner's desktop load, Node 3.423 s); RSS 1,155 → 1,058 MB (the rebuilt element buffers were allocator churn)**. Gates:
   conformance 441/441, parity 342 identical + 95 KNOWN, bundler 42/42, selfconf 425 + 13 KNOWN (the two splice fixtures use builtins the frozen analyzer lacks, allowlisted as unported), GC stress (all phases), inline policy, units (every verdict read from the gate output).
-- Next slices, in order. (1) The other array allocations of the hottest
-  sites (`getTypeAtFlowBranchLabel`'s `antecedentTypes`, `map`,
-  `appendIfUnique`, the binary-expression trampoline's four cells per
-  call) and the strings (4.3M per compile). (2) Closures, second
+- String + integer without the intermediate string
+  (`docs/string_concat_fast_paths_design.md`). The profile of `x19`
+  (2,959 samples) put the string time in the checker's cache keys:
+  `getTypeListId`'s `result += startId` (58 of `ts_add`'s 78 samples),
+  `getRelationKey`'s `` `${sourceId},${targetId}` `` (21 of
+  `ts_str_concat_many`'s 23), `ts_fmt_num` 20, `ts_new_string` 15 — every
+  `string + number` materialized the number as a string cell before the
+  concatenation. `ts_add` now formats an integer operand on the stack and
+  concatenates it directly (an immediate when the result fits five ASCII
+  characters, else one allocation; results at the builder threshold keep
+  the general path), `ts_str_concat_many` keeps integer parts in per-part
+  stack buffers, and `ts_strict_eq` returns false for two different
+  immediate short strings without the out-of-line comparison. Fixture
+  `strings/concat_fast_paths` (every prefix length class against every
+  number kind, both operand orders, templates, Map keys, a string
+  `switch`, 30k keys under collection pressure; a hash of every result
+  checked against V8). Kernel `string_keys` (ids joined into union keys,
+  two-id relation keys, Map lookups): native 230 → 198 ms, Node 137 ms
+  (1.67x → 1.46x). Statistics relink: string allocations 4.30M → 4.29M per compile, root pushes 51.9M → 49.0M, allocations 14.74M → 14.72M. Compiler A/B
+  against the splice build, alternating three runs, outputs validated,
+  diagnostics zero: **two A/Bs, 6.199 → 6.152 s and 6.130 → 6.139 s median wall (−0.8% and +0.1%, both within the noise of a loaded machine, Node 3.36–3.49 s); kept as a kernel win with no measurable compiler change — the ids are at most five digits, so the number strings were immediates and the compiler's string allocations are unchanged (4.30M → 4.29M per compile); root pushes 51.9M → 49.0M**. Gates: conformance 442/442, parity 342 identical + 96 KNOWN (the fixture surfaces a pre-existing local-typing difference of the frozen emitter, allowlisted), bundler 42/42, selfconf 426 + 13 KNOWN, GC stress (all phases), inline policy, units (every verdict read from the gate output).
+- Profile of `x19` (2,959 samples), two findings for the list below. (a)
+  `getTypeOfExpression` spends 107 samples (3.6%) in `ts_array_set` and
+  `memset_pattern16`: `cache[getNodeId(node)] = type` on `flowTypeCache`,
+  which `checkExpressionWithContextualType` and `getTypeOfExpression`'s
+  callers reset to `undefined` for a window and recreate as `[]`; a store at
+  node id three million into a fresh array fills three million holes
+  (24 MB of `memset`) and grows the buffer, about sixty times per compile —
+  V8 switches such an array to dictionary elements. Sparse element
+  storage is the fix (the next-slices item), not a cheaper fill. (b)
+  `lre_exec_backtrack` 59 samples (2%): `toFileNameLowerCase` (30) and
+  `simpleNormalizePath` (29) run character-class regular expressions on
+  every path string through the backtracking engine; a class-scan fast
+  path (a single character class with `+`/`*`, tested or replaced) can
+  bypass it, as the anchored fast path did for `^` patterns.
+
+- Next slices, in order. (1) Strings, second round: `Map<string, T>`
+  lookups and symbol-table keys (`map_find` 3.1% of samples, `ts_str_hash_of`
+  1%, `ts_strict_eq_slow` 1.7% — the string `switch` of
+  `getCannotFindNameDiagnosticForName`, evaluated eagerly for every
+  identifier, and identifier strings that are never interned), then the
+  other array allocations of the hottest sites (`getTypeAtFlowBranchLabel`'s
+  `antecedentTypes`, `map`, `appendIfUnique`, the binary-expression
+  trampoline's four cells per call). (2) Closures, second
   round: the long tail of arrows (1.37M per compile, no site above 54k),
   a smaller closure cell (120 bytes today). (3) Value captures, round 3:
   bindings declared by destructuring, the lexical `this` of arrows, the

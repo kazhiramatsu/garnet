@@ -3274,8 +3274,61 @@ tsv ts_to_string_v(tsv v){
 }
 
 /* ---------------- operators ---------------- */
+/* ---- `string + integer` without the intermediate number string ----
+   The checker builds its cache keys this way (`result += startId` in
+   getTypeListId, 1.5M concatenations per compile): the digits are formatted
+   on the stack and copied into the one allocation the result needs. Only
+   results below the builder threshold take this path; longer ones keep the
+   general path and its append history. docs/string_concat_fast_paths_design.md */
+static int ts_int_digits(double d, char* buf, uint32_t* len){
+  if (!(d == (double)(long long)d && d < 9e15 && d > -9e15)) return 0;
+  *len = (uint32_t)ts_i64_to_str((long long)d, buf);
+  return 1;
+}
+static int ts_add_str_int_fast(tsv s, const char* digits, uint32_t nl, int digits_first, tsv* out){
+  ts_strview x = ts_str_view_typed(s);
+  uint64_t n64 = (uint64_t)x.len + nl;
+  if (n64 >= TS_SB_MIN) return 0;
+  uint32_t n = (uint32_t)n64;
+  uint32_t flags = x.flags & TS_STR_FLAG_UTF16;
+  int all_ascii = !!(x.flags & TS_STR_FLAG_ASCII);
+  RT_STAT_INC(concat_calls); RT_STAT_ADD(concat_bytes, n);
+  if (all_ascii && n <= TS_SHORTSTR_MAX){
+    char data[TS_SHORTSTR_MAX];
+    uint32_t pos = 0;
+    if (digits_first){ for (uint32_t i=0;i<nl;i++) data[pos++] = digits[i]; for (uint32_t i=0;i<x.len;i++) data[pos++] = (char)ts_str_cu_at_view(x, i); }
+    else { for (uint32_t i=0;i<x.len;i++) data[pos++] = (char)ts_str_cu_at_view(x, i); for (uint32_t i=0;i<nl;i++) data[pos++] = digits[i]; }
+    *out = ts_short_str_ascii(data, n);
+    RT_STAT_INC(short_string);
+    return 1;
+  }
+  ts_gc_root(&s);
+  ts_string* o = ts_string_alloc_storage(n, flags);
+  x = ts_str_view_typed(s);                     /* the cell may have moved */
+  ts_strview dv = { digits, nl, 0, TS_STR_FLAG_ASCII, 0 };
+  if (digits_first){
+    ts_str_copy_units(o->data, flags, 0, dv, 0, nl);
+    ts_str_copy_units(o->data, flags, nl, x, 0, x.len);
+  } else {
+    ts_str_copy_units(o->data, flags, 0, x, 0, x.len);
+    ts_str_copy_units(o->data, flags, x.len, dv, 0, nl);
+  }
+  o->flags = flags | (all_ascii ? TS_STR_FLAG_ASCII : 0);
+  o->hash = 0;
+  *out = ts_str_v(o);
+  ts_gc_unroot(1);
+  RT_STAT_INC(sb_flat);
+  return 1;
+}
 tsv ts_add(tsv a, tsv b){
   if (ts_is_num(a)&&ts_is_num(b)) return ts_num(ts_to_num(a)+ts_to_num(b));
+  if (ts_is_str(a) && ts_is_num(b)){
+    char nb[24]; uint32_t nl; tsv r;
+    if (ts_int_digits(ts_to_num(b), nb, &nl) && ts_add_str_int_fast(a, nb, nl, 0, &r)) return r;
+  } else if (ts_is_num(a) && ts_is_str(b)){
+    char nb[24]; uint32_t nl; tsv r;
+    if (ts_int_digits(ts_to_num(a), nb, &nl) && ts_add_str_int_fast(b, nb, nl, 1, &r)) return r;
+  }
   /* JS `+`: ToPrimitive(default) each operand first. An object becomes its
      valueOf()/toString()/Symbol.toPrimitive("default") result, so `o + 5` and
      `o + ""` follow spec instead of silently yielding 0. */
@@ -3397,12 +3450,24 @@ tsv ts_str_concat_many(tsv* args, int n){
   uint64_t total = 0;
   uint32_t out_flags = 0;
   int all_ascii = 1;
+  /* integer parts (`${sourceId},${targetId}`) are formatted on the stack and
+     never become strings of their own (docs/string_concat_fast_paths_design.md) */
+  char digit_buf[TS_CONCAT_STACK_PARTS][24];
+  uint32_t digit_len[TS_CONCAT_STACK_PARTS];
+  for (int i=0;i<TS_CONCAT_STACK_PARTS;i++) digit_len[i] = 0;
+#define PART_VIEW(i) ((!heap_parts && digit_len[i]) \
+    ? (ts_strview){ digit_buf[i], digit_len[i], 0, TS_STR_FLAG_ASCII, 0 } \
+    : ts_str_view_typed(parts[i]))
   for(int i=0;i<n;i++){
     parts[i] = args[i];
     ts_gc_root(&parts[i]);
     rooted++;
-    if (!ts_is_str(parts[i])) parts[i] = ts_to_string_v(parts[i]);
-    ts_strview v = ts_str_view_typed(parts[i]);
+    if (!ts_is_str(parts[i])){
+      if (!heap_parts && ts_is_num(parts[i]) && ts_int_digits(ts_to_num(parts[i]), digit_buf[i], &digit_len[i])){
+        /* digits stay on the stack; parts[i] keeps the number (never read as a string) */
+      } else parts[i] = ts_to_string_v(parts[i]);
+    }
+    ts_strview v = PART_VIEW(i);
     total += v.len;
     out_flags |= v.flags & TS_STR_FLAG_UTF16;
     all_ascii = all_ascii && !!(v.flags & TS_STR_FLAG_ASCII);
@@ -3425,7 +3490,7 @@ tsv ts_str_concat_many(tsv* args, int n){
     char data[TS_SHORTSTR_MAX];
     uint32_t pos = 0;
     for(int i=0;i<n;i++){
-      ts_strview v = ts_str_view_typed(parts[i]);
+      ts_strview v = PART_VIEW(i);
       for (uint32_t j=0;j<v.len;j++) data[pos++] = (char)ts_str_cu_at_view(v, j);
     }
     tsv r = ts_short_str_ascii(data, (uint32_t)total);
@@ -3435,8 +3500,8 @@ tsv ts_str_concat_many(tsv* args, int n){
     return r;
   }
 
-  ts_strview first = ts_str_view_typed(parts[0]);
-  if (total == first.len){
+  ts_strview first = PART_VIEW(0);
+  if (total == first.len && !(!heap_parts && digit_len[0])){
     tsv r = parts[0];
     ts_gc_unroot(rooted);
     if (heap_parts) free(parts);
@@ -3444,14 +3509,14 @@ tsv ts_str_concat_many(tsv* args, int n){
   }
 
   tsv parent_v = TS_UNDEFINED;
-  if (total >= TS_SB_MIN &&
+  if (total >= TS_SB_MIN && !(!heap_parts && digit_len[0]) &&
       ts_string_extendable_parent(parts[0], out_flags, (uint32_t)total, &parent_v)){
     ts_gc_root(&parent_v);
     ts_string* out = ts_string_alloc_buffer_view();
     ts_string* parent = ts_str_ptr_typed(parent_v);
     uint32_t pos = parent->len;
     for(int i=1;i<n;i++){
-      ts_strview v = ts_str_view_typed(parts[i]);
+      ts_strview v = PART_VIEW(i);
       ts_str_copy_units(parent->data, parent->flags, pos, v, 0, v.len);
       pos += v.len;
     }
@@ -3479,7 +3544,7 @@ tsv ts_str_concat_many(tsv* args, int n){
     buffer = ts_str_ptr_typed(buffer_v);
     uint32_t pos = 0;
     for(int i=0;i<n;i++){
-      ts_strview v = ts_str_view_typed(parts[i]);
+      ts_strview v = PART_VIEW(i);
       ts_str_copy_units(buffer->data, out_flags, pos, v, 0, v.len);
       pos += v.len;
     }
@@ -3500,7 +3565,7 @@ tsv ts_str_concat_many(tsv* args, int n){
   ts_string* out = ts_string_alloc_storage((uint32_t)total, out_flags);
   uint32_t pos = 0;
   for(int i=0;i<n;i++){
-    ts_strview v = ts_str_view_typed(parts[i]);
+    ts_strview v = PART_VIEW(i);
     ts_str_copy_units(out->data, out_flags, pos, v, 0, v.len);
     pos += v.len;
   }
@@ -3514,6 +3579,7 @@ tsv ts_str_concat_many(tsv* args, int n){
   if (heap_parts) free(parts);
   return r;
 }
+#undef PART_VIEW
 /* Out-of-line tail of the header's ts_strict_eq: reached for two distinct
    string values (and kept complete so runtime callers may use it directly). */
 int ts_strict_eq_slow(tsv a, tsv b){

@@ -1381,6 +1381,8 @@ static inline int ts_same_cell(tsv a, tsv b){
 static inline int ts_strict_eq(tsv a, tsv b){
   if (a == b) return !(ts_is_num(a) && ts_to_num(a) != ts_to_num(a));
   if (ts_is_num(a) || ts_is_num(b)) return ts_is_num(a) && ts_is_num(b) && ts_to_num(a) == ts_to_num(b);
+  /* two immediate short strings are canonical: different bits, different strings */
+  if (ts_is_short_str(a) && ts_is_short_str(b)) return 0;
   if (ts_is_str(a) && ts_is_str(b)) return ts_strict_eq_slow(a, b);
   return (ts_is_obj(a) || ts_is_func(a)) && ts_same_cell(a, b);
 }
