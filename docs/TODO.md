@@ -5411,6 +5411,20 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   −2.1% / 0.0% / −1.4%): about −1%.** Gates: conformance 448/448, parity
   345 identical + 99 KNOWN, bundler 42/42, selfconf 431 + 14 KNOWN, GC
   stress (all phases), inline policy, units.
+- Shape-ancestor validation of inline-cache hits — tried, not adopted
+  (build `x29`, not committed; `docs/shape_ancestor_cache_design.md`). The
+  `-O0` statistics of `x28` showed 498M inline property reads per compile,
+  63% (314M) validating a cached slot against a shape that differs from
+  the entry's through the key vector (two dependent loads). An ancestor
+  table (each shape's ancestors at depths 1-16) let an entry be validated
+  with one load; the statistics confirmed 312M of the 314M took the new
+  path, but the binary grew 55.9 → 65.0 MB and the A/B against `x28`
+  read 5.879 → 6.022 s median wall (+2.4%, pairs +2.4% / +12% / −2.3% on a
+  loaded machine). Reverted. The validation sits behind a well-predicted
+  branch (its loads are hidden by speculation), so shortening it buys
+  little while the code at 150k read sites costs: as with `x21` and
+  `x27`, gains come from fewer executed instructions and calls and from
+  smaller code.
 - Next slices, in order. (0) External element buffers (the malloc'd
   `data` of arrays, also strings' and maps' buffers) do not count toward
   the collector's trigger: a loop that drops large arrays grows without
