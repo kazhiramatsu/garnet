@@ -59,6 +59,9 @@
 #                          its frame, and declare class-instance stack cells in
 #                          their block instead of at function scope (parity
 #                          oracle only).
+#   TSAOT_VALUE_CALL_FAST=0  Every call through a function value goes through
+#                          ts_call_value instead of entering a plain closure's
+#                          generic entry directly (parity oracle only).
 #   TSAOT_TYPED_CELLS=0    Exporter: plain-object cells instead of typed `__cell`
 #                          instances (legacy IR; the parity corpus uses it).
 #   TSAOT_CAPTURE_CONTEXTS=0  Exporter: one cell per captured variable instead of
@@ -127,6 +130,7 @@ env: TSAOT_CC (default "cc -O2"), TSAOT_ANALYZER=rust|ts|native (default rust),
      TSAOT_TYPED_RETURNS=0 for boxed direct-entry returns,
      TSAOT_LOOP_STACK=1 for the legacy loop-body stack slots,
      TSAOT_STACK_CLOSURES=0 for heap closures at non-escaping sites,
+     TSAOT_VALUE_CALL_FAST=0 for ts_call_value at every function-value call,
      TSAOT_TYPED_CELLS=0 / TSAOT_CAPTURE_CONTEXTS=0 for the legacy capture IR,
      TSAOT_NESTED_DIRECT=0 / TSAOT_LAZY_FN_DECL=0 for closure-value nested calls,
      TSAOT_NAMESPACE_DIRECT=0 for closure-value namespace member calls,

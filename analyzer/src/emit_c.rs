@@ -7866,6 +7866,16 @@ fn emit_stack_cell_decls(s: &mut String, body: &[Inst], strat: &BTreeMap<u32, Al
     }
 }
 
+fn value_call_fast_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_VALUE_CALL_FAST").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
 fn truthy_unbox_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -18866,6 +18876,31 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             } = callee
             {
                 if recv.is_some() && emit_known_method_call(s, ctx, method.0, mf.0, argv, dst) {
+                    s.push_str("  }\n");
+                    return;
+                }
+            }
+            if let CalleeRef::Value { local } = callee {
+                if recv.is_none() && value_call_fast_enabled() {
+                    // A call through a function value: the common closure (no
+                    // `this` slot, environment ABI or no environment) enters its
+                    // generic entry directly with the environment register set,
+                    // as ts_call does after its checks; everything else — a
+                    // non-function (TypeError), a Proxy, a `this`-taking callee
+                    // whose first slot must be injected, a legacy merged-argument
+                    // closure — takes ts_call_value.
+                    let _ = writeln!(s, "    tsv _fv = {};", ctx.val(local.0));
+                    s.push_str("    tsv _r;\n");
+                    s.push_str("    { ts_func* _f = ts_is_func(_fv) ? (ts_func*)ts_ptr(_fv) : NULL;\n");
+                    let _ = writeln!(
+                        s,
+                        "      if (_f && !_f->takes_this && (_f->env_abi || !_f->envlen)) {{ g_ts_cur_env = _f->env; _r = ((ts_code)_f->code)(_a, {0}); }} else _r = ts_call_value(_fv, _a, {0}); }}",
+                        argv.len()
+                    );
+                    match dst {
+                        Some(d) => s.push_str(&ctx.set_val(d.0, "_r")),
+                        None => s.push_str("    (void)_r;\n"),
+                    }
                     s.push_str("  }\n");
                     return;
                 }

@@ -4796,14 +4796,43 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   oracle). Compiler A/B against the scalar-replacement build, alternating
   three runs, outputs validated, diagnostics zero: **6.494 → 6.404 s median wall (1.4% less; every native run below every baseline run), peak RSS 1,171 → 1,160 MB**; the compiler is now 1.98x slower than V8 (Node 3.231 s) — under 2x for the first time.
   Gates: conformance 432/432, parity 338 identical + 90 KNOWN (the parity corpus runs with `TSAOT_STACK_CLOSURES=0`), bundler 42/42, selfconf 418 + 11 KNOWN, GC stress (all phases), inline policy, units (every verdict read from the gate output).
-- Next slices, in order. (1) The arena strategies: 155 `FrameArena` arrays
-  and 639 `CallerArena` sites (360 arrays, 241 closures, 38 objects) are
-  still heap allocations with an annotation; a frame arena (bump allocation
-  released at function exit, scanned as a root while live) or, for small
-  fixed-size arrays, a stack cell with inline storage. The soundness
-  checklist above applies. (2) Sparse element storage for arrays written far
-  beyond their length. (3) Callback specialization for the call-only
-  parameters; the remaining 2,319 dynamic method sites. (4) The remaining
-  pattern gaps: small calls with object arguments 4.3x, array callbacks
-  3.9x, flags 3.9x, arrays of objects 2.7x; constructor pre-sizing from
-  layouts; local classes from declared types; C5b-2/3; dead capture cells.
+- Inline fast path for calls through function values. A call through a
+  closure value went through `ts_call_value` (proxy test, callable test,
+  `this` adjustment) and then `ts_call` (proxy test again, callable test,
+  environment dispatch) before entering the callee's generic entry; the
+  profile of the stack-closure build still had 3.5% of its samples in the
+  two helpers, mostly the callbacks of `binarySearchKey` and `findAncestor`.
+  The emitter now tests the common closure in line — a function cell
+  without a `this` slot whose environment uses the environment ABI (or is
+  empty) — sets the environment register and enters the generic entry
+  directly; a non-function, a Proxy, a `this`-taking callee and a legacy
+  merged-argument closure keep `ts_call_value`. The dynamic method call path
+  (`ts_call_method`, receiver adjustment) is unchanged. Covered by the
+  existing closure and callback fixtures; 1,882 call sites in the compiler's generated C take the fast path. `TSAOT_VALUE_CALL_FAST=0` keeps
+  `ts_call_value` (parity oracle). Compiler A/B against the stack-closure
+  build, alternating three runs, outputs validated, diagnostics zero:
+  **6.553 → 6.478 s median wall (1.1% less, within noise: two of the three run pairs are equal and the third favours the fast path)**; Node 3.297 s; kept as a no-regression simplification of every function-value call. Gates: conformance 432/432, parity 338 identical + 90 KNOWN, bundler 42/42, selfconf 418 + 11 KNOWN, GC stress (all phases), inline policy, units (every verdict read from the gate output).
+- Runtime statistics of `native_s350x10` (statistics relink, one
+  `--noEmit` compile of 5.65 s): 23.6M allocations, 2.64 GB; objects 12.1M
+  (1.27 GB), strings 4.3M, closures 3.26M (391 MB — the heap closures left
+  after the stack slice, 120 bytes each), arrays 3.5M (450 MB), maps 255k;
+  97,815 coroutine frames of 1.27 KB each (124 MB) with as many promise
+  cells — the checker's `getUnmatchedProperty` drives the generator
+  `getUnmatchedProperties` for its first element, and the core iterator
+  helpers (`mapIterator`, `singleIterator`, ...) are generators too. GC: 612
+  minor and 6 full collections, 686 ms of pauses (12% of the run), 2.70M
+  remembered old cells rescanned across the minors (every property of each,
+  4.4k per minor), 27.6M of the 51.3M marked edges pointing at old cells,
+  328 of the 612 minors in the forced-promotion fallback (328 MB promoted
+  early). Property additions: 16.3M cache hits, 1.9M slow (transition
+  walks). Root pushes by runtime helpers: 52M.
+- Next slices, in order. (1) The coroutine frame: 1.27 KB per generator
+  activation (sixteen inline slots, eight inline handler entries in five
+  arrays, a `jmp_buf`); the checker's `getUnmatchedProperty` pays it per
+  call — allocate the handler arrays lazily and size the frame by the
+  body's needs. (2) The remembered set: a slot-granular (or dirty-range)
+  record instead of rescanning every property of each remembered old
+  object, and the forced-promotion fallback that promotes 328 MB early. (3)
+  The arena strategies (155 `FrameArena` arrays, 639 `CallerArena` sites).
+  (4) Sparse element storage; callback specialization; the remaining
+  pattern gaps and dynamic method sites; dead capture cells.
