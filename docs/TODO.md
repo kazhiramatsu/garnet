@@ -5162,7 +5162,27 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   path (a single character class with `+`/`*`, tested or replaced) can
   bypass it, as the anchored fast path did for `^` patterns.
 
-- Next slices, in order. (1) Strings, second round: `Map<string, T>`
+- Tiny leaf direct entries inlined — tried, regressing, kept off
+  (`docs/tiny_leaf_inline_design.md`). About 6% of the `x19` profile was
+  inside two-line accessors called from hundreds of sites
+  (`getObjectFlags` 56 samples, `isFreshLiteralType` 35, `getNodeId` 22,
+  `isThisIdentifier` 17, `getCheckFlags` 16, `getTypeId` 13, ...), each a
+  real C function with a lazy root frame that clang left out of line. The
+  emitter can mark a direct entry of at most twenty straight-line or `if`
+  instructions that calls and allocates nothing `always_inline` (3,089
+  functions of the compiler, prototype and definition; the binary grows
+  55.9 → 58.1 MB, the build takes the same five minutes). Compiler A/B
+  against the string build, alternating three runs, outputs validated,
+  diagnostics zero: **6.160 → 6.253 s median wall (1.5% MORE; every one of
+  the four run pairs favours the out-of-line build)** — the code growth
+  costs more than the calls saved. The mechanism stays in the emitter
+  behind `TSAOT_TINY_INLINE=1` (off by default, so the parity oracle and
+  the production build are unchanged) for a narrower experiment later
+  (fewer instructions, no inline-cache probes, or a per-function hotness
+  cut from a profile). Gates on the inlined build: conformance 442/442, parity 342 identical + 96 KNOWN, bundler 42/42, selfconf 426 + 13 KNOWN, GC stress (all phases), inline policy, units — the mechanism is sound, only slower.
+- Next slices, in order. (0) Sparse element storage for far stores
+  (`flowTypeCache[nodeId]` on a fresh array: 3.6% of the profile in hole
+  fills, see the `x19` profile note). (1) Strings, second round: `Map<string, T>`
   lookups and symbol-table keys (`map_find` 3.1% of samples, `ts_str_hash_of`
   1%, `ts_strict_eq_slow` 1.7% — the string `switch` of
   `getCannotFindNameDiagnosticForName`, evaluated eagerly for every

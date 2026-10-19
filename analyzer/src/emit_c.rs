@@ -356,7 +356,8 @@ fn emit_program_with_string_plans(
     let known_methods = known_method_closures(program);
     for f in &program.functions {
         if let Some(sig) = direct_sigs.get(&f.id.0) {
-            let _ = writeln!(s, "static {} {}_d({});", sig.c_ret(), cname(f), sig.c_params());
+            let storage = if tiny_leaf_direct(f) { "TS_AOT_INLINE" } else { "static" };
+            let _ = writeln!(s, "{} {} {}_d({});", storage, sig.c_ret(), cname(f), sig.c_params());
         }
     }
     if needs_regexp {
@@ -6060,6 +6061,50 @@ fn numeric_value_locs(
     numeric
 }
 
+/// Tiny leaf direct entries (docs/tiny_leaf_inline_design.md): a function of
+/// at most twenty straight-line or `if` instructions that calls nothing and
+/// allocates nothing (`getObjectFlags`, `isFreshLiteralType`, `getNodeId`, the
+/// checker's accessors) is emitted `always_inline`, so every direct call site
+/// absorbs it; the generic entry keeps a real function. TSAOT_TINY_INLINE=0
+/// keeps them out of line (parity oracle).
+fn tiny_inline_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| !matches!(std::env::var("TSAOT_TINY_INLINE").as_deref(), Ok("0")))
+}
+fn tiny_leaf_direct(f: &Function) -> bool {
+    if !tiny_inline_enabled() || f.is_async || f.is_generator {
+        return false;
+    }
+    fn walk(body: &[Inst], n: &mut usize) -> bool {
+        for inst in body {
+            *n += 1;
+            if *n > 20 {
+                return false;
+            }
+            match inst {
+                Inst::Const { .. }
+                | Inst::Copy { .. }
+                | Inst::BinOp { .. }
+                | Inst::UnOp { .. }
+                | Inst::LoadField { .. }
+                | Inst::StoreField { .. }
+                | Inst::LoadIndex { .. }
+                | Inst::GenericLen { .. }
+                | Inst::Return { .. } => {}
+                Inst::If { then_body, else_body, .. } => {
+                    if !walk(then_body, n) || !walk(else_body, n) {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+        true
+    }
+    let mut n = 0;
+    walk(&f.body, &mut n)
+}
+
 fn force_inline_numeric_func(f: &Function) -> bool {
     if f.is_async || f.is_generator || f.body.len() > 8 {
         return false;
@@ -6979,7 +7024,8 @@ fn emit_function(
                 f.id.0
             );
         }
-        let _ = writeln!(s, "static {} {}_d({}){{", sig.c_ret(), cname(f), sig.c_params());
+        let storage = if tiny_leaf_direct(f) { "TS_AOT_INLINE" } else { "static" };
+        let _ = writeln!(s, "{} {} {}_d({}){{", storage, sig.c_ret(), cname(f), sig.c_params());
     } else {
         let _ = writeln!(s, "static tsv {}(tsv* args, int nargs){{", cname(f));
         s.push_str("  (void)nargs;\n");
