@@ -34,6 +34,7 @@ static size_t g_heap_bytes = 0;
 static size_t g_full_threshold_bytes = (size_t)16u * 1024u * 1024u;
 static int g_full_threshold_forced = 0; /* env override pins the trigger (stress knob) */
 static int g_remembered_slots = 1;      /* TSAOT_REMEMBERED_SLOTS=0: whole-cell rescans */
+static int g_empty_class_plain = 1;     /* TSAOT_EMPTY_CLASS_PLAIN=0: field-less class instances stay dictionary cells */
 /* TSAOT_GC_ZAP=1 fills dead and moved-from cell bodies with 0xDD during
    collection (Phase C0 groundwork): a stale raw pointer held across a
    safepoint then reads loud garbage (kind 0xDD fails gc_kind_valid, tsv
@@ -385,6 +386,8 @@ static void gc_config_init(void){
   }
   const char* rslots = getenv("TSAOT_REMEMBERED_SLOTS");
   if (rslots && rslots[0] && strcmp(rslots, "0") == 0) g_remembered_slots = 0;
+  const char* eplain = getenv("TSAOT_EMPTY_CLASS_PLAIN");
+  if (eplain && eplain[0] && strcmp(eplain, "0") == 0) g_empty_class_plain = 0;
   const char* zap = getenv("TSAOT_GC_ZAP");
   if (zap && zap[0] && strcmp(zap, "0") != 0) g_gc_zap = 1;
 }
@@ -1011,8 +1014,16 @@ tsv ts_call_method(tsv fn, tsv* args, int nargs){
   if (nargs > 0) return ts_call(fn, args + 1, nargs - 1);
   return ts_call(fn, args, 0);
 }
+/* In-object slots of a field-less class instance (docs/empty_class_instances_design.md). */
+#define TS_EMPTY_CLASS_SLOTS 8u
 static tsv ts_new_sized_impl(size_t size, int pretenured){
   if (size < sizeof(ts_object)) size = sizeof(ts_object);
+  /* A class without struct fields (`class SymbolLinks { declare _brand: any }`)
+     has nothing for a descriptor to resolve; its instance is an ordinary
+     shaped object with in-object slack, so the properties added later take
+     the addition cache and the inline caches instead of dictionary entries. */
+  if (size == sizeof(ts_object) && g_empty_class_plain)
+    return ts_new_object_impl(pretenured, TS_EMPTY_CLASS_SLOTS);
   ts_object* o = pretenured
     ? gc_alloc_pretenured(size, TS_KIND_OBJECT)
     : gc_alloc(size, TS_KIND_OBJECT);
@@ -8487,7 +8498,17 @@ tsv ts_construct(tsv ctorv, tsv* args, int n){
   uint32_t cid = raw - 1;
   if (cid >= g_class_meta_cap || g_class_size[cid] == 0){ fprintf(stderr, "tsaot: TypeError: unregistered class in new\n"); abort(); }
   ts_gc_root(&ctorv);
-  tsv inst = ts_new_sized(g_class_size[cid]);
+  /* A field-less class allocates the plain shaped instance (see
+     ts_new_sized_impl) sized by the slack learned from earlier instances of
+     this constructor, exactly as a plain function constructor does. */
+  int plain_inst = g_empty_class_plain && g_class_nfields[cid] == 0;
+  tsv inst;
+  if (plain_inst){
+    uint8_t est = ((ts_func*)ts_ptr(ctorv))->inst_slots;
+    inst = ts_new_object_n(est > TS_EMPTY_CLASS_SLOTS ? est : TS_EMPTY_CLASS_SLOTS);
+  } else {
+    inst = ts_new_sized(g_class_size[cid]);
+  }
   tsv proto = ((ts_func*)ts_ptr(ctorv))->prototype_prop;
   ((ts_object*)ts_ptr(inst))->proto = ts_is_obj(proto) ? proto : g_class_proto_tab[cid];
   /* Boxed fields start as undefined (the zeroed instance memory would read as
@@ -8509,6 +8530,12 @@ tsv ts_construct(tsv ctorv, tsv* args, int n){
   for (int i = 0; i < n; i++) callargs[1 + i] = args[i];
   tsv r = ts_call(ctorv, callargs, m);
   if (callargs != stackargs) free(callargs);
+  if (plain_inst){
+    uint32_t used = ((ts_object*)ts_ptr(inst))->len + 4u;
+    if (used > TS_INLINE_SLOTS_MAX) used = TS_INLINE_SLOTS_MAX;
+    ts_func* cf = (ts_func*)ts_ptr(ctorv);
+    if (used > cf->inst_slots) cf->inst_slots = (uint8_t)used;
+  }
   ts_gc_unroot(2);
   return ts_is_obj(r) ? r : inst;
 }

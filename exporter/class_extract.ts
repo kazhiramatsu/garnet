@@ -173,6 +173,11 @@ export class ClassExtractor {
         const isGenerator = ts.isMethodDeclaration(m) && !!m.asteriskToken;
         info.ownMethods.push({ name: mn, kind, isGenerator });
       } else if (ts.isPropertyDeclaration(m)) {
+        // `declare x: T` is an ambient declaration: the instance has no such
+        // own property at run time (no struct slot, no key), exactly as V8
+        // erases it. The compiler's `SymbolLinks` is a brand-only class of
+        // this form, instantiated once per symbol (Session 350).
+        if (mods?.some((mod) => mod.kind === ts.SyntaxKind.DeclareKeyword)) continue;
         const fn = memberKeyName(nameNode);
         if (fn === undefined) { info.reasons.push("computed-field-name(dynamic)"); info.stable = false; continue; }
         // a property initialized to a function value is effectively a reassignable

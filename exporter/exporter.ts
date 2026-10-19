@@ -6937,6 +6937,8 @@ class Exporter {
       for (const m of cnode.members) {
         if (this.isStaticMember(m)) continue;         // static: handled in __static_init
         if (this.isDynComputedInstallAccessor(m)) continue;  // handled in the pre-pass above
+        // `declare [key]: T` / `declare x: T`: ambient, no runtime property.
+        if (ts.isPropertyDeclaration(m) && ts.getModifiers(m)?.some((mod) => mod.kind === ts.SyntaxKind.DeclareKeyword)) continue;
         // dynamic/symbol-keyed computed member -> install at runtime (field, or a
         // plain/generator/async method as a data-property closure).
         if (this.isDynComputedMember(m)) {

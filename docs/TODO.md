@@ -4874,26 +4874,68 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   **6.720 → 6.580 s median wall (2.1% less; measured while the statistics compile of the previous slice shared one core at nice 19 — Node read 3.428 s instead of 3.22 s — but every one of the four run pairs, warm-up included, favoured the new build by 2.1–3.5%, so the result is kept and a quiet re-measurement is noted below)**; Node 3.428 s; RSS unchanged (1,161 MB). Gates: conformance 434/434, parity 340 identical + 90
   KNOWN, bundler 42/42, selfconf 420 + 11 KNOWN, GC stress (all phases),
   inline policy, units (every verdict read from the gate output).
-- Next slices, in order. (0) Re-measure `x12` against `x11` on a quiet
-  machine (the statistics compile was still running during the A/B above).
-  (1) Per-site allocation statistics for arrays, literals and class
-  instances (the `x11` statistics compile with the cold-function split is
-  the one in progress) to size the arena strategies (155 `FrameArena`
-  arrays, 639 `CallerArena` sites). (2) The generic `new` on a function
-  value (`ts_construct`: prototype materialization, two root pushes, the
-  argument copy, `ts_call` through the forwarder) — the `ctor_functions`
-  kernel spends 15% of its samples there and another 9% in the write
-  barrier's handle-table loads — and single-store constructors (`Type`,
-  `Signature`: one `this.flags = flags` before an `if`), which the ≥ 2
-  keys rule still leaves to the addition cache. (3) Sparse element storage;
-  callback specialization; the remaining 2,319 dynamic method sites.
-  (4) Precision for the out-of-line named-property writes of the
-  remembered set (1.87M generic enrollments per compile). (5) The
-  coroutine frame (1.27 KB per generator activation; a promise allocated
-  for every generator), dead capture cells, the nursery sweep's per-cell
-  work (`gc_free_cell_payload` 1.8% of samples: handle release and
-  `free(NULL)` calls for cells without external payload) — small. (6) The
-  remaining pattern gaps: small calls with object arguments 4.3x, array
-  callbacks 3.9x, flags 3.9x, constructors through function values 2.7x,
-  arrays of objects 2.7x; constructor pre-sizing from layouts; local
-  classes from declared types; C5b-2/3.
+- Field-less class instances as plain shaped objects, and `declare` fields
+  (`docs/empty_class_instances_design.md`). The checker's `SymbolLinks` is
+  `const SymbolLinks = class implements SymbolLinks { declare
+  _symbolLinksBrand: any }`, one instance per symbol, populated lazily
+  (`links.type = ...`, dozens of optional members). Two defects met there.
+  The exporter's class extraction counted the ambient `declare` field as a
+  real field, so every instance carried an own `undefined`
+  `_symbolLinksBrand` (visible to `Object.keys`, `in`, `hasOwnProperty`;
+  V8 erases ambient declarations) and the class was a sized one-field
+  layout. And a sized instance starts in the dictionary shape (a class
+  descriptor may resolve fields before the named-property vector), so
+  every later addition was a slow addition (the addition cache refuses
+  dictionary receivers: 1.74M slow additions per compile) and every read
+  went out of line through the class registry and the dictionary probe.
+  Ambient property declarations are now skipped by the exporter (no struct
+  slot, no key; computed ambient members are not installed), and a class
+  without struct fields allocates an ordinary shaped object with eight
+  in-object slots (`ts_new_sized` with the header-only size, and
+  `ts_construct` with the slack learned on the constructor value, as for
+  plain function constructors); `TSAOT_EMPTY_CLASS_PLAIN=0` (runtime)
+  keeps the dictionary cell. Four of the compiler's 982 class layouts are
+  field-less after the change (`SymbolLinks` among them). Fixture
+  `classes/empty_class_dynamic_props` (brand-only class expression, empty
+  declaration, empty and non-empty subclasses, dynamic `new` through a
+  function value, key order and JSON, `instanceof`/`constructor`/prototype
+  identity, `in`/`hasOwnProperty`, deletion and re-addition, freezing,
+  prototype methods and accessors reading the dynamic properties, 20k
+  instances with cross references) matches V8 on both runtime paths. New
+  kernel `benchmarks/patterns/links_objects.ts` (the pattern in
+  isolation, 24M lazy reads and writes): native 1,388 → 914 ms, Node 150 ms
+  (9.1x → 6.1x, the worst kernel measured); what remains is the read of an
+  absent property (`l.count === undefined` before the first write), which
+  misses the inline probe and walks the own probe, the location table,
+  the class registry, the key scan and the prototype chain every time —
+  the next slice. Compiler A/B against the constructor-layout build,
+  alternating three runs, outputs validated, diagnostics zero:
+  **6.319 → 6.230 s median wall (1.4% less; every one of the four run pairs favours the new build; a first A/B taken while the stalled statistics compile still held a core read 6.748 → 6.805 s and was discarded once the compile was stopped)**; Node 3.266 s, native 1.91x slower than V8; RSS 1,161 → 1,166 MB (eight in-object slots per `SymbolLinks` instance instead of dictionary entries). The quiet baseline also re-measures the previous slice: `x12` ran at 6.319 s against the 6.395 s of `x11` in its own quiet session, consistent with the 2.1% read under load. Gates: conformance 435/435, parity 341 identical + 90 KNOWN, bundler 42/42, selfconf 421 + 11 KNOWN, GC stress (all phases), inline policy, units (every verdict read from the gate output).
+- Next slices, in order. (1) Absent-property entries in the inline
+  caches (draft design in hand): a read of a property the receiver lacks
+  (`if (!links.resolvedType) ...`, the checker's lazy-caching idiom) still
+  walks the own probe, the location table, the class registry, the key
+  scan and the prototype chain every time; an entry recording the
+  receiver shape and a by-value snapshot of the prototype chain (identity
+  and shape of each prototype, three deep) answers `undefined` without an
+  epoch. (2) Per-site allocation statistics for arrays, literals and class
+  instances (the -O1 statistics compile stalled past 54 CPU minutes and
+  was stopped; a -O0 build of the same generated C is the replacement) to
+  size the arena strategies (155 `FrameArena` arrays, 639 `CallerArena`
+  sites). (3) The generic `new` on a function value (`ts_construct`:
+  prototype materialization, two root pushes, the argument copy,
+  `ts_call` through the forwarder — 15% of the `ctor_functions` kernel's
+  samples, 9% more in the write barrier's handle-table loads) and
+  single-store constructors (`Type`, `Signature`, `NodeLinks`: one
+  `this.flags = flags` before an `if`), which the ≥ 2 keys rule leaves to
+  the addition cache. (4) Sparse element storage; callback specialization;
+  the remaining 2,319 dynamic method sites. (5) Precision for the
+  out-of-line named-property writes of the remembered set (1.87M generic
+  enrollments per compile). (6) The coroutine frame (1.27 KB per generator
+  activation; a promise allocated for every generator), dead capture
+  cells, the nursery sweep's per-cell work (`gc_free_cell_payload` 1.8% of
+  samples) — small. (7) The remaining pattern gaps: links objects 6.1x,
+  small calls with object arguments 4.3x, array callbacks 3.9x, flags
+  3.9x, constructors through function values 2.7x, arrays of objects 2.7x;
+  constructor pre-sizing from layouts; local classes from declared types;
+  C5b-2/3.

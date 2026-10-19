@@ -743,6 +743,7 @@ Compiler A/Bs for the slice (three alternating runs each, outputs validated):
 | `native_s350x10` (inline fast path for function-value calls) | 6.478 s | 1.1% less than `x9` (6.553 s in the same session), within noise (two of three run pairs equal); Node 3.297 s; diagnostics zero, outputs validated |
 | `native_s350x11` (dirty slot ranges for remembered objects) | 6.395 s | no measurable change against `x10` (6.397 s in the same quiet session; a run shared with a statistics compile read +1.0% and was discarded); Node 3.222 s; diagnostics zero, outputs validated |
 | `native_s350x12` (constructor layouts behind captured cells) | 6.580 s | 2.1% less than `x11` (6.720 s in the same run; a statistics compile shared one core, Node 3.428 s, all four run pairs favour `x12`); diagnostics zero, outputs validated |
+| `native_s350x13` (field-less class instances as plain objects, `declare` fields) | 6.230 s | 1.4% less than `x12` (6.319 s in the same quiet run, all four pairs agree; a run under the stalled statistics compile read +0.8% and was discarded); Node 3.266 s, native 1.91x; diagnostics zero, outputs validated |
 
 ### Inline-cache path statistics (Session 350, `native_s350s_stats`)
 
@@ -771,4 +772,12 @@ and `ts_call`, 15% of samples), the write barrier's handle-table loads (9%),
 allocation (8%) and the loop's inline-cache reads and writes. The same
 pattern in the compiler (`Node`, `Token`, `Identifier`) did NOT adopt its
 layout until `x12`, because `this` sits after the captured cells.
+
+New kernel `benchmarks/patterns/links_objects.ts` (the checker's
+`SymbolLinks` pattern: a brand-only class expression whose instances are
+populated lazily and read back through optional members, 24M operations):
+native 1,388 ms against Node 150 ms (9.1x) before the field-less-instance
+change, 914 ms (6.1x) after it. Half of the remaining samples are reads of
+properties the receiver does not have yet (`l.count === undefined`), which
+miss the inline probe and walk every out-of-line step.
 
