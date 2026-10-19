@@ -5690,6 +5690,28 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   884 MB (+8%: the old generation's cells are not compacted); Node
   3.28-3.29 s, so 1.42x Node. Knob `TSAOT_PRETENURE_CTORS=0`. A quick
   `--noEmit` trial first read 3.68 -> 3.60 s with peak RSS 768 -> 751 MB.
+- Inline element store and inlined char-code read (build `x40`, full
+  build; runtime header, emitter). `ts_array_set` (7,603 sites in the
+  compiler) ran out of line for every `a[i] = v`; the dense in-capacity
+  store (a plain, unfrozen array, `i < cap`) is now in line
+  (`ts_array_set_inline`, under the `TSAOT_INLINE_INDEX` knob with the
+  reads), the length extended past holes as before and an old array
+  remembered out of line (`ts_array_remember`). The scanner's
+  `ts_str_charcodeat_typed` (145 sites) was `static inline` and the C
+  compiler outlined it in the big scanner functions (14 self samples); it
+  is `TS_RT_ALWAYS_INLINE` now (allowlisted). Gates all green (parity
+  identical=349: the knob is on the Rust line, conformance 453/453,
+  selfconf, bundler, GC stress, inline policy, unit). A/B against `x39`,
+  two rounds of three alternating runs: 4.615 vs 4.641 s and 4.636 vs
+  4.671 s median (five of six pairs -0.3% to -1.0%, one +0.2%): about
+  -0.6%; binary 50.01 -> 50.21 MB; Node 3.28-3.30 s (1.41x). Measured
+  on the way (`-O0` statistics, x37): `prop_find` runs 19M times per
+  compile (avg probe 1.74) and `map_find` 6.1M times (avg probe 2.15),
+  `ts_str_hash_of` 29 self samples: the string-keyed maps of the checker
+  (`getPropertyOfType`, `getUnionTypeFromSortedList`,
+  `recursiveTypeRelatedTo`); the string-key kernel reads on par with
+  Node, so the next look is at the probe lengths and at who calls
+  `prop_find`.
 - Next slices, in order. (0) External element buffers (the malloc'd
   `data` of arrays, also strings' and maps' buffers) do not count toward
   the collector's trigger: a loop that drops large arrays grows without

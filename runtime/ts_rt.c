@@ -1166,6 +1166,8 @@ static inline void array_write_barrier(ts_array* a, uint32_t index, tsv value){
   }
   gc_remember(&a->o.h);
 }
+/* The out-of-line half of ts_array_set_inline's barrier (an old array). */
+void ts_array_remember(ts_array* a, uint32_t index, tsv value){ array_write_barrier(a, index, value); }
 static inline void array_invalidate_dirty(ts_array* a){
   if (a->o.h.gen == TS_GEN_OLD && a->o.h.remembered) a->gc_dirty_all = 1;
 }

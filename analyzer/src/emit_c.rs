@@ -18645,9 +18645,12 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             }
         }
         Inst::StoreIndex { arr, index, src } => {
+            // the dense in-capacity element store is in line
+            // (TSAOT_INLINE_INDEX=0 keeps the out-of-line store, as for reads)
             let _ = writeln!(
                 s,
-                "  ts_array_set({}, (uint32_t)({}), {});",
+                "  {}({}, (uint32_t)({}), {});",
+                if inline_index_enabled() { "ts_array_set_inline" } else { "ts_array_set" },
                 ctx.val(arr.0),
                 ctx.num(index.0),
                 ctx.val(src.0)

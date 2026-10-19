@@ -625,7 +625,7 @@ static inline double ts_str_charcodeat_general(tsv s, double idx){
    in-range index is a few instructions, small enough for the O1 cost model;
    NaN, negative, out-of-range, short, view and UTF-16 cases take the general
    path (a NaN index fails both range tests and is handled there). */
-static inline double ts_str_charcodeat_typed(tsv s, double idx){
+TS_RT_ALWAYS_INLINE double ts_str_charcodeat_typed(tsv s, double idx){
   if (TS_RT_LIKELY(ts_is_heap_str(s))){
     const ts_string* x = ts_str_ptr_typed(s);
     if (TS_RT_LIKELY(!(x->flags & (TS_STR_FLAG_VIEW | TS_STR_FLAG_UTF16))) &&
@@ -1886,6 +1886,25 @@ static inline tsv ts_array_get_inline(tsv arr, uint32_t i){
     if (!a->sparse) return TS_UNDEFINED;
   }
   return ts_array_get(arr, i);
+}
+/* Element store with the dense in-capacity case in line: a plain array (no
+   fixed element kind, not frozen) with i below cap stores the slot, extends
+   the length past holes as ts_array_set does, and remembers the array when
+   it is old (the young-value test and the cards are out of line). Growth,
+   sparse arrays, typed storage, frozen arrays and other receivers take
+   ts_array_set. */
+void ts_array_remember(ts_array* a, uint32_t index, tsv value);
+static inline void ts_array_set_inline(tsv arr, uint32_t i, tsv v){
+  if (ts_is_indexed_array_fast(arr)){
+    ts_array* a = (ts_array*)ts_ptr(arr);
+    if (TS_RT_LIKELY(i < a->cap && !a->element_kind && !(ts_obj_integrity(&a->o) & 1u))){
+      a->data[i] = v;
+      if (i >= a->len) a->len = i + 1u;
+      if (a->o.h.gen == TS_GEN_OLD) ts_array_remember(a, i, v);
+      return;
+    }
+  }
+  ts_array_set(arr, i, v);
 }
 static inline tsv ts_array_get_inline_lazy(tsv arr, uint32_t i, ts_frame_hdr* frame, uint32_t nslots){
   if (ts_is_indexed_array_fast(arr)){

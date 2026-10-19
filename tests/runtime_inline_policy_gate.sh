@@ -70,6 +70,7 @@ while IFS= read -r name; do
     ts_set_static_inline_lazy | \
     ts_set_static2_inline_lazy | \
     ts_array_get_lazy | \
+    ts_str_charcodeat_typed | \
     ts_strict_eq | \
     ts_truthy_fast | \
     ts_to_int32 | \
