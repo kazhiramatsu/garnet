@@ -556,8 +556,8 @@ pub enum Inst {
         src: LocalId,
     },
     /// `slots`: the exporter's static-slot hint (docs/static_slots_design.md),
-    /// `(s1 + 1) | (s2 + 1) << 8` for one or two predicted in-object slots of
-    /// the key on the receiver's type; 0 when none. A prediction only: the
+    /// `(s1 + 1) | (s2 + 1) << 8 | (s3 + 1) << 16` for up to three predicted
+    /// in-object slots of the key on the receiver's type; 0 when none. A prediction only: the
     /// emitted probe validates it against the receiver's shape.
     LoadField {
         dst: LocalId,

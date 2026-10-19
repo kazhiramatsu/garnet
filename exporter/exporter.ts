@@ -52,6 +52,9 @@ type TypeSpec =
 type GenericInferencePattern =
   | { kind: "direct"; tpName: string }
   | { kind: "arrayElement"; tpName: string };
+/** A producer of objects of `type`: a constructor function's prefix layout or a
+ *  fresh-object store sequence; `keys` in slot order (docs/static_slots_design.md). */
+type ProducerLayout = { name: string; type: ts.Type | undefined; keys: string[]; ctor?: ts.Symbol };
 
 const STRICT_TYPE_OPTION_NAMES: StrictTypeOptionName[] = [
   "noImplicitAny",
@@ -5815,7 +5818,7 @@ class Exporter {
       return dst;
     }
     if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
-      const lhs = node.left;
+      const lhs = this.unwrapAssignTarget(node.left);
       // JS evaluates the assignment TARGET reference before the RHS. For element
       // access and plain-field property access (the targets with runtime
       // object/key), pre-evaluate object/key first and snapshot them if the RHS
@@ -5848,7 +5851,7 @@ class Exporter {
       };
       if (ts.isBinaryExpression(node) && compound[node.operatorToken.kind]) {
         const op = compound[node.operatorToken.kind];
-        const lhs = node.left;
+        const lhs = this.unwrapAssignTarget(node.left);
         // Element access and plain-field property access carry a runtime target
         // reference (object/key) that JS evaluates EXACTLY ONCE, shared by the
         // read and the write-back. Lowering read and write separately would
@@ -7343,7 +7346,8 @@ class Exporter {
       const saved = ctx.body;
       ctx.body = thenBody;
       const inst = this.newLocal(ctx, "reference", "inst");
-      ctx.body.push({ kind: "CallBuiltinStatic", dst: inst, builtin: "construct.begin", args: [callee] });
+      const cap = this.constructorCapacity(sym);
+      ctx.body.push({ kind: "CallBuiltinStatic", dst: inst, builtin: cap > 0 ? `construct.begin:${cap}` : "construct.begin", args: [callee] });
       const r = this.newLocal(ctx, "reference", "ctorResult");
       const cells = this.directCallCellArgs(ctx, fnId);
       if (cells.length > 0) ctx.body.push({ kind: "Call", dst: r, callee: { kind: "Direct", func: fnId }, args: [...cells, inst, ...dargs] });
@@ -7433,63 +7437,487 @@ class Exporter {
     }
     return false;
   }
-  /** The static-slot hint of `expr.key` (a read or a write): `(s1 + 1) | (s2 + 1) << 8`
-   *  when every candidate layout of the receiver's type has the key in its prefix,
-   *  at one or two distinct slots below the runtime's limit (the slot of more
-   *  candidates first); 0 otherwise. A prediction: the emitted probe validates it. */
+  /** The static-slot hint of `expr.key` (a read or a write): up to three
+   *  predicted in-object slots, `(s1 + 1) | (s2 + 1) << 8 | (s3 + 1) << 16`, the
+   *  slots of the receiver type's candidate producers that carry the key, the
+   *  slot of more producers first; 0 when there is no prediction (no candidate
+   *  carries the key, most candidates lack it, the slots are too spread, or a
+   *  slot is at or beyond the runtime's limit). A prediction only: the emitted
+   *  probe validates it against the receiver's shape. */
   staticSlotHint(expr: ts.Expression, key: string): number {
-    if (!this.staticSlotsEnabled || this.constructorLayouts().length === 0) return 0;
+    if (!this.staticSlotsEnabled || this.producerLayouts().length === 0) return 0;
     let t: ts.Type | undefined;
     try { t = this.checker.getTypeAtLocation(expr); } catch { return 0; }
     if (!t) return 0;
     const cands = this.staticSlotCandidates(t);
     if (!cands || cands.length === 0) return 0;
     const counts = new Map<number, number>();
+    let have = 0, lack = 0;
     for (const c of cands) {
       const slot = c.keys.indexOf(key);
-      if (slot < 0 || slot >= 16) return 0;
+      if (slot < 0) { lack++; continue; }
+      have++;
+      if (slot >= 16) return 0;
       counts.set(slot, (counts.get(slot) ?? 0) + 1);
     }
-    if (counts.size > 2) return 0;
-    const slots = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0] - b[0]).map((e) => e[0]);
+    if (have === 0 || lack > have) return 0;
+    const ranked = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0] - b[0]);
+    const top = ranked.slice(0, 3);
+    let covered = 0;
+    for (const [, n] of top) covered += n;
+    if (covered * 5 < have * 4) return 0;
+    const slots = top.map((e) => e[0]);
     if (process.env.TSAOT_STATIC_SLOTS_LOG === "1") {
       const k = `${key}@${slots.join(",")}`;
       this.staticSlotLog.set(k, (this.staticSlotLog.get(k) ?? 0) + 1);
     }
-    return (slots[0] + 1) | (slots.length > 1 ? (slots[1] + 1) << 8 : 0);
+    return (slots[0] + 1) | (slots.length > 1 ? (slots[1] + 1) << 8 : 0) | (slots.length > 2 ? (slots[2] + 1) << 16 : 0);
   }
-  /** The candidate layouts of a receiver type: for each object member of the
-   *  type (`undefined`/`null` members skipped), the layouts whose `this` type is
-   *  assignable to the member or from it (the rule of the construction guards);
-   *  undefined when a member is not an object type (`any`, a primitive, a type
-   *  parameter): no prediction. Cached by type id. */
-  private staticSlotCandidates(t: ts.Type) {
+  /** The candidate producers of a receiver type: for each object member of the
+   *  type (`undefined`/`null` members skipped), the producers whose type is the
+   *  member's interface or class, one of its bases, or derived from it (the
+   *  declared hierarchy, through `Mutable<T>` and type-parameter constraints);
+   *  undefined when a member is not an object type (`any`, a primitive): no
+   *  prediction. Cached by type id. */
+  private staticSlotCandidates(t: ts.Type): ProducerLayout[] | undefined {
     const id = (t as unknown as { id?: number }).id;
     if (id !== undefined && this.staticSlotCands.has(id)) return this.staticSlotCands.get(id);
-    const assignable = (this.checker as unknown as { isTypeAssignableTo?: (a: ts.Type, b: ts.Type) => boolean }).isTypeAssignableTo;
-    let out: { sym: ts.Symbol; thisType: ts.Type; keys: string[] }[] | undefined = [];
+    let out: ProducerLayout[] | undefined = [];
     const members = t.isUnion() ? t.types : [t];
+    const producers = this.producerLayouts();
     for (const m of members) {
       if (m.flags & (ts.TypeFlags.Undefined | ts.TypeFlags.Null | ts.TypeFlags.Void)) continue;
-      if (!(m.flags & ts.TypeFlags.Object) || !assignable) { out = undefined; break; }
-      for (const l of this.constructorLayouts()) {
-        if (out.includes(l)) continue;
-        let ok = false;
-        try { ok = assignable.call(this.checker, l.thisType, m) || assignable.call(this.checker, m, l.thisType); } catch { ok = false; }
-        if (ok) out.push(l);
+      const rroots = this.typeRoots(m);
+      if (rroots.length === 0 || !this.typeSyms(m)) { out = undefined; break; }
+      // producers typed as the receiver's interface or a derived one
+      let found = false;
+      for (const l of producers) {
+        if (out.includes(l) || !l.type) continue;
+        const psyms = this.typeSyms(l.type);
+        if (!psyms) continue;
+        if (rroots.some((r) => psyms.has(r))) { out.push(l); found = true; }
+      }
+      // else the nearest base interfaces that have producers of their own
+      // (a `StringLiteralType` receiver takes the `LiteralType` producers, not
+      // every `Type` producer)
+      const visited = new Set<ts.Symbol>(rroots);
+      let level = this.directBases(rroots, visited);
+      while (!found && level.length > 0) {
+        for (const l of producers) {
+          if (out.includes(l) || !l.type) continue;
+          if (this.typeRoots(l.type).some((r) => level.includes(r))) { out.push(l); found = true; }
+        }
+        level = this.directBases(level, visited);
       }
     }
     if (id !== undefined) this.staticSlotCands.set(id, out);
     return out;
+  }
+  /** The direct base interfaces/classes of the given symbols, not yet visited. */
+  private directBases(syms: ts.Symbol[], visited: Set<ts.Symbol>): ts.Symbol[] {
+    const out: ts.Symbol[] = [];
+    for (const sym of syms) {
+      let decl: ts.Type | undefined;
+      try { decl = this.checker.getDeclaredTypeOfSymbol(sym); } catch { decl = undefined; }
+      if (!decl || !(decl.flags & ts.TypeFlags.Object)) continue;
+      let bases: ts.BaseType[] = [];
+      try { bases = this.checker.getBaseTypes(decl as ts.InterfaceType); } catch { bases = []; }
+      for (const b of bases) for (const r of this.typeRoots(b)) if (!visited.has(r)) { visited.add(r); out.push(r); }
+    }
+    return out;
+  }
+  /** The interface/class symbols a type is declared as (through `Mutable<T>`,
+   *  type-parameter constraints, unions and intersections). */
+  private typeRoots(t: ts.Type): ts.Symbol[] {
+    const out: ts.Symbol[] = [];
+    const visit = (x: ts.Type, depth: number): void => {
+      if (depth > 8) return;
+      if (x.aliasSymbol && x.aliasSymbol.name === "Mutable" && x.aliasTypeArguments && x.aliasTypeArguments.length === 1) { visit(x.aliasTypeArguments[0], depth + 1); return; }
+      if (x.flags & (ts.TypeFlags.Union | ts.TypeFlags.Intersection)) { for (const m of (x as ts.UnionOrIntersectionType).types) visit(m, depth + 1); return; }
+      if (x.flags & ts.TypeFlags.TypeParameter) {
+        let c: ts.Type | undefined;
+        try { c = this.checker.getBaseConstraintOfType(x); } catch { c = undefined; }
+        if (c && c !== x) visit(c, depth + 1);
+        return;
+      }
+      if (x.flags & ts.TypeFlags.Object) {
+        const sym = x.getSymbol();
+        if (sym && (sym.flags & (ts.SymbolFlags.Interface | ts.SymbolFlags.Class)) && !out.includes(sym)) out.push(sym);
+      }
+    };
+    visit(t, 0);
+    return out;
+  }
+  /** The roots of a type and all their base interfaces/classes, transitively;
+   *  undefined when the type has no declared root (an `any`, a primitive, an
+   *  anonymous object type). Cached by type id. */
+  private typeSyms(t: ts.Type): Set<ts.Symbol> | undefined {
+    const id = (t as unknown as { id?: number }).id;
+    if (id !== undefined && this.typeSymsCache.has(id)) return this.typeSymsCache.get(id);
+    const roots = this.typeRoots(t);
+    let out: Set<ts.Symbol> | undefined;
+    if (roots.length > 0) {
+      out = new Set<ts.Symbol>();
+      const work = [...roots];
+      while (work.length > 0) {
+        const sym = work.pop()!;
+        if (out.has(sym)) continue;
+        out.add(sym);
+        let decl: ts.Type | undefined;
+        try { decl = this.checker.getDeclaredTypeOfSymbol(sym); } catch { decl = undefined; }
+        if (!decl || !(decl.flags & ts.TypeFlags.Object)) continue;
+        let bases: ts.BaseType[] = [];
+        try { bases = this.checker.getBaseTypes(decl as ts.InterfaceType); } catch { bases = []; }
+        for (const b of bases) for (const r of this.typeRoots(b)) work.push(r);
+      }
+    }
+    if (id !== undefined) this.typeSymsCache.set(id, out);
+    return out;
+  }
+  /** Every producer layout of the program: the constructor prefix layouts and
+   *  the fresh-object store sequences of every function body (a `const`/`let`
+   *  initialized or assigned from a construction or a producer call, followed by
+   *  `x.k = ..` stores before the object escapes), typed by the variable or by
+   *  the producer function's return type. Recomputed per registration stamp. */
+  producerLayouts(): ProducerLayout[] {
+    const stamp = this.funcSymbols.size;
+    if (this.producerLayoutsCache && stamp === this.producerLayoutsStamp) return this.producerLayoutsCache;
+    this.producerLayoutsStamp = stamp;
+    this.staticSlotCands.clear();
+    this.returnLayoutMemo.clear();
+    const out: ProducerLayout[] = [];
+    for (const l of this.constructorLayouts()) out.push({ name: l.sym.name, type: l.thisType, keys: l.keys, ctor: l.sym });
+    this.producerLayoutsCache = out;
+    this.methodImpls = this.collectMethodImpls();
+    const seen = new Set<string>();
+    const add = (name: string, type: ts.Type | undefined, keys: string[]): void => {
+      if (keys.length === 0 || !type) return;
+      const id = (type as unknown as { id?: number }).id ?? -1;
+      const k = `${id}|${keys.join(",")}`;
+      if (seen.has(k)) return;
+      seen.add(k);
+      out.push({ name, type, keys });
+    };
+    for (const sf of this.program.getSourceFiles()) {
+      if (sf.isDeclarationFile) continue;
+      const visit = (n: ts.Node): void => {
+        if (ts.isBlock(n) || ts.isSourceFile(n) || ts.isCaseClause(n) || ts.isDefaultClause(n)) this.scanSequences(n.statements, add);
+        ts.forEachChild(n, visit);
+      };
+      visit(sf);
+    }
+    return out;
+  }
+  /** Object-literal properties bound to function declarations, by property
+   *  name: `{ m }`, `{ m: f }`, `{ m() {..} }`; the method-call resolution of
+   *  producer calls (`obj.m(..)`) uses a name bound exactly once. */
+  private collectMethodImpls(): Map<string, ts.FunctionLikeDeclaration[]> {
+    const out = new Map<string, ts.FunctionLikeDeclaration[]>();
+    const push = (name: string, f: ts.FunctionLikeDeclaration): void => {
+      const arr = out.get(name);
+      if (arr) { if (!arr.includes(f)) arr.push(f); } else out.set(name, [f]);
+    };
+    for (const sf of this.program.getSourceFiles()) {
+      if (sf.isDeclarationFile) continue;
+      const visit = (n: ts.Node): void => {
+        if (ts.isObjectLiteralExpression(n)) {
+          for (const prop of n.properties) {
+            if (ts.isShorthandPropertyAssignment(prop)) {
+              // the property symbol is not the value's: resolve the referenced binding
+              let vs: ts.Symbol | undefined;
+              try { vs = this.checker.getShorthandAssignmentValueSymbol(prop); } catch { vs = undefined; }
+              const d = vs ? this.functionDeclOfSymbol(vs) : undefined;
+              if (d) push(prop.name.text, d);
+            } else if (ts.isPropertyAssignment(prop) && ts.isIdentifier(prop.name)) {
+              let init: ts.Expression = prop.initializer;
+              while (ts.isParenthesizedExpression(init) || ts.isAsExpression(init)) init = init.expression;
+              if (ts.isIdentifier(init)) { const d = this.functionDeclOfIdentifier(init); if (d) push(prop.name.text, d); }
+              else if (ts.isFunctionExpression(init) || ts.isArrowFunction(init)) push(prop.name.text, init);
+            } else if (ts.isMethodDeclaration(prop) && ts.isIdentifier(prop.name) && prop.body) {
+              push(prop.name.text, prop);
+            }
+          }
+        }
+        ts.forEachChild(n, visit);
+      };
+      visit(sf);
+    }
+    return out;
+  }
+  private functionDeclOfIdentifier(id: ts.Identifier): ts.FunctionLikeDeclaration | undefined {
+    return this.functionDeclOfSymbol(this.symbolOf(id));
+  }
+  private functionDeclOfSymbol(sym: ts.Symbol | undefined): ts.FunctionLikeDeclaration | undefined {
+    const d = sym?.valueDeclaration ?? sym?.declarations?.[0];
+    if (!d) return undefined;
+    if (ts.isFunctionDeclaration(d) && d.body) return d;
+    if (ts.isVariableDeclaration(d) && d.initializer) {
+      let init: ts.Expression = d.initializer;
+      while (ts.isParenthesizedExpression(init) || ts.isAsExpression(init)) init = init.expression;
+      if (ts.isFunctionExpression(init) || ts.isArrowFunction(init)) return init;
+    }
+    return undefined;
+  }
+  /** The key lists of the fresh objects a producer expression yields (through
+   *  parentheses and assertions): a construction (its predicted constructor
+   *  layouts: the candidate named like the callee, else every candidate) or a
+   *  call to a function with return layouts (an identifier, or a method name
+   *  bound to exactly one function). */
+  private producerExprLayouts(e: ts.Expression, depth: number): string[][] | undefined {
+    while (ts.isParenthesizedExpression(e) || ts.isAsExpression(e) || ts.isTypeAssertionExpression(e) || ts.isNonNullExpression(e) || ts.isSatisfiesExpression(e)) e = e.expression;
+    if (ts.isNewExpression(e)) {
+      const cands = this.constructorCandidates(e);
+      if (cands.length === 0) return undefined;
+      let callee: ts.Expression = e.expression;
+      for (;;) {
+        if (ts.isParenthesizedExpression(callee) || ts.isAsExpression(callee) || ts.isTypeAssertionExpression(callee) || ts.isNonNullExpression(callee)) callee = callee.expression;
+        else if (ts.isBinaryExpression(callee) && callee.operatorToken.kind === ts.SyntaxKind.BarBarToken) callee = callee.left;
+        else break;
+      }
+      const layouts = this.constructorLayouts();
+      const calleeName = ts.isIdentifier(callee) ? callee.text : "";
+      const named = calleeName ? cands.filter((c) => calleeName === c.name || calleeName.startsWith(c.name)) : [];
+      const chosen = named.length > 0 ? named.slice(0, 1) : cands;
+      const out: string[][] = [];
+      for (const c of chosen) { const l = layouts.find((x) => x.sym === c); if (l) out.push(l.keys); }
+      return out.length > 0 ? out : undefined;
+    }
+    if (ts.isCallExpression(e)) {
+      let callee: ts.Expression = e.expression;
+      while (ts.isParenthesizedExpression(callee) || ts.isNonNullExpression(callee)) callee = callee.expression;
+      if (ts.isIdentifier(callee)) {
+        const decl = this.functionDeclOfIdentifier(callee);
+        return decl ? this.returnLayoutsOf(decl, depth + 1) ?? undefined : undefined;
+      }
+      if (ts.isPropertyAccessExpression(callee) && ts.isIdentifier(callee.name)) {
+        // every function bound to a property of that name anywhere in the
+        // program (the base node factory has three `createBaseNode` bindings,
+        // all producing the same layout); the union of their return layouts
+        const impls = this.methodImpls?.get(callee.name.text);
+        if (!impls || impls.length === 0 || impls.length > 8) return undefined;
+        const out: string[][] = [];
+        const seen = new Set<string>();
+        for (const d of impls) {
+          const r = this.returnLayoutsOf(d, depth + 1);
+          if (!r) continue;
+          for (const k of r) { const key = k.join(","); if (!seen.has(key)) { seen.add(key); out.push(k); } }
+        }
+        return out.length > 0 ? out : undefined;
+      }
+      return undefined;
+    }
+    return undefined;
+  }
+  /** The key lists of the fresh objects a function returns: `return <producer>`
+   *  statements and the sequences of variables it returns. Memoized; null while
+   *  being computed (recursion) and when the function is not a producer. */
+  private returnLayoutsOf(fn: ts.FunctionLikeDeclaration, depth: number): string[][] | null {
+    if (depth > 12) return null;
+    const memo = this.returnLayoutMemo.get(fn);
+    if (memo !== undefined) return memo;
+    this.returnLayoutMemo.set(fn, null);
+    const body = fn.body;
+    if (!body) return null;
+    const out: string[][] = [];
+    const seen = new Set<string>();
+    const addAll = (ls: string[][] | undefined): void => {
+      if (!ls) return;
+      for (const k of ls) { const key = k.join(","); if (!seen.has(key)) { seen.add(key); out.push(k); } }
+    };
+    if (!ts.isBlock(body)) {
+      addAll(this.producerExprLayouts(body, depth));
+    } else {
+      const returned = new Set<ts.Symbol>();
+      const findReturns = (n: ts.Node): void => {
+        if (ts.isFunctionLike(n) && n !== fn) return;
+        if (ts.isReturnStatement(n) && n.expression) {
+          let e: ts.Expression = n.expression;
+          while (ts.isParenthesizedExpression(e) || ts.isAsExpression(e) || ts.isTypeAssertionExpression(e) || ts.isNonNullExpression(e) || ts.isSatisfiesExpression(e)) e = e.expression;
+          if (ts.isIdentifier(e)) { const sym = this.symbolOf(e); if (sym) returned.add(sym); }
+          else addAll(this.producerExprLayouts(e, depth));
+        }
+        ts.forEachChild(n, findReturns);
+      };
+      findReturns(body);
+      if (returned.size > 0) {
+        const visit = (n: ts.Node): void => {
+          if (ts.isFunctionLike(n) && n !== fn) return;
+          if (ts.isBlock(n) || ts.isCaseClause(n) || ts.isDefaultClause(n)) {
+            this.scanSequences(n.statements, (_name, _type, keys, sym) => { if (sym && returned.has(sym)) addAll([keys]); }, depth);
+          }
+          ts.forEachChild(n, visit);
+        };
+        visit(body);
+      }
+    }
+    const result = out.length > 0 ? out : null;
+    this.returnLayoutMemo.set(fn, result);
+    return result;
+  }
+  /** Fresh-object store sequences in a statement list: `const|let x = P(..)` or
+   *  `x = P(..)` with P a producer expression, then the following statements:
+   *  `x.k = ..` appends a new key (`x.k op= ..` as well), a statement that does
+   *  not let `x` escape is skipped, an `if` whose branches store only existing
+   *  keys is skipped, and anything else ends the sequence. The sequence is
+   *  reported with the variable's declared type, or the initializer's type when
+   *  the variable has no annotation. */
+  private scanSequences(stmts: readonly ts.Statement[], report: (name: string, type: ts.Type | undefined, keys: string[], sym?: ts.Symbol) => void, depth = 0): void {
+    for (let i = 0; i < stmts.length; i++) {
+      const st = stmts[i];
+      let xSym: ts.Symbol | undefined, xName: string | undefined, init: ts.Expression | undefined, typeNode: ts.Node | undefined;
+      if (ts.isVariableStatement(st) && st.declarationList.declarations.length === 1) {
+        const d = st.declarationList.declarations[0];
+        if (ts.isIdentifier(d.name) && d.initializer) { xSym = this.symbolOf(d.name); xName = d.name.text; init = d.initializer; typeNode = d.type ? d.name : d.initializer; }
+      } else if (ts.isExpressionStatement(st) && ts.isBinaryExpression(st.expression) && st.expression.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isIdentifier(st.expression.left)) {
+        xSym = this.symbolOf(st.expression.left); xName = st.expression.left.text; init = st.expression.right; typeNode = st.expression.right;
+      }
+      if (!xSym || !init || !xName) continue;
+      const bases = this.producerExprLayouts(init, depth);
+      if (!bases) continue;
+      const keys: string[][] = bases.map((b) => b.slice());
+      const has = (k: string): boolean => keys.every((l) => l.includes(k));
+      const append = (k: string): void => { for (const l of keys) if (!l.includes(k)) l.push(k); };
+      for (let j = i + 1; j < stmts.length; j++) {
+        const t = stmts[j];
+        const store = this.storeOnVar(t, xSym);
+        if (store) {
+          if (!has(store.key)) append(store.key);
+          if (store.escapes) break;
+          continue;
+        }
+        if (ts.isReturnStatement(t)) break;
+        if (ts.isIfStatement(t)) {
+          let ok = !this.escapesVar(t.expression, xSym);
+          for (const b of [t.thenStatement, t.elseStatement]) {
+            if (!ok || !b) continue;
+            for (const inner of (ts.isBlock(b) ? b.statements : [b])) {
+              const s2 = this.storeOnVar(inner, xSym);
+              if (s2) { if (s2.escapes || !has(s2.key)) { ok = false; break; } continue; }
+              if (this.escapesVar(inner, xSym)) { ok = false; break; }
+            }
+          }
+          if (!ok) break;
+          continue;
+        }
+        if (this.escapesVar(t, xSym)) break;
+      }
+      let type: ts.Type | undefined;
+      try { type = typeNode ? this.checker.getTypeAtLocation(typeNode) : undefined; } catch { type = undefined; }
+      for (const l of keys) report(xName, type, l, xSym);
+    }
+  }
+  /** `x.k = e` / `x.k op= e` as a statement: the key, and whether the right side
+   *  lets `x` escape. */
+  private storeOnVar(st: ts.Statement, x: ts.Symbol): { key: string; escapes: boolean } | undefined {
+    if (!ts.isExpressionStatement(st) || !ts.isBinaryExpression(st.expression)) return undefined;
+    const be = st.expression;
+    const k = be.operatorToken.kind;
+    const isAssign = k === ts.SyntaxKind.EqualsToken || (k >= ts.SyntaxKind.FirstCompoundAssignment && k <= ts.SyntaxKind.LastCompoundAssignment);
+    if (!isAssign) return undefined;
+    let lhs: ts.Expression = be.left;
+    while (ts.isParenthesizedExpression(lhs)) lhs = lhs.expression;
+    if (!ts.isPropertyAccessExpression(lhs) || ts.isPrivateIdentifier(lhs.name)) return undefined;
+    let base: ts.Expression = lhs.expression;
+    while (ts.isParenthesizedExpression(base) || ts.isAsExpression(base) || ts.isTypeAssertionExpression(base) || ts.isNonNullExpression(base)) base = base.expression;
+    if (!ts.isIdentifier(base) || this.symbolOf(base) !== x) return undefined;
+    return { key: lhs.name.text, escapes: this.escapesVar(be.right, x) };
+  }
+  /** Whether `x` escapes in a node: passed to a call or construction, used as a
+   *  callee or method receiver, placed in a literal, assigned, returned or
+   *  thrown, or captured by a nested function or class. Property reads and
+   *  writes on `x`, comparisons and tests do not count, nor does a value that
+   *  flows into one of `x`'s own properties. */
+  private escapesVar(node: ts.Node, x: ts.Symbol): boolean {
+    let esc = false;
+    const visit = (n: ts.Node): void => {
+      if (esc) return;
+      if (ts.isFunctionLike(n) || ts.isClassLike(n)) { if (this.referencesVar(n, x)) esc = true; return; }
+      if (ts.isIdentifier(n) && this.symbolOf(n) === x) {
+        let p: ts.Node = n.parent, child: ts.Node = n;
+        while (ts.isParenthesizedExpression(p) || ts.isAsExpression(p) || ts.isTypeAssertionExpression(p) || ts.isNonNullExpression(p) || ts.isSatisfiesExpression(p)) { child = p; p = p.parent; }
+        if (ts.isPropertyAccessExpression(p) && p.expression === child) {
+          const call = p.parent;
+          if (ts.isCallExpression(call) && call.expression === p) esc = true;
+          return;
+        }
+        if (ts.isBinaryExpression(p)) {
+          const k = p.operatorToken.kind;
+          if (k === ts.SyntaxKind.EqualsEqualsEqualsToken || k === ts.SyntaxKind.ExclamationEqualsEqualsToken || k === ts.SyntaxKind.EqualsEqualsToken || k === ts.SyntaxKind.ExclamationEqualsToken) return;
+          if ((k === ts.SyntaxKind.BarBarToken || k === ts.SyntaxKind.QuestionQuestionToken || k === ts.SyntaxKind.AmpersandAmpersandToken) && this.flowsIntoOwnStore(p, x)) return;
+        }
+        if (ts.isConditionalExpression(p) && (p.condition === child || this.flowsIntoOwnStore(p, x))) return;
+        if (ts.isPrefixUnaryExpression(p) && p.operator === ts.SyntaxKind.ExclamationToken) return;
+        if (ts.isIfStatement(p) || ts.isWhileStatement(p)) return;
+        esc = true;
+        return;
+      }
+      ts.forEachChild(n, visit);
+    };
+    visit(node);
+    return esc;
+  }
+  /** An expression whose value is stored into a property of `x` itself
+   *  (`x.k = y || x`): the object does not leave the sequence. */
+  private flowsIntoOwnStore(e: ts.Node, x: ts.Symbol): boolean {
+    let p: ts.Node = e.parent, child: ts.Node = e;
+    while (ts.isParenthesizedExpression(p) || ts.isAsExpression(p) || (ts.isBinaryExpression(p) && (p.operatorToken.kind === ts.SyntaxKind.BarBarToken || p.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken || p.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken)) || ts.isConditionalExpression(p)) { child = p; p = p.parent; }
+    if (!ts.isBinaryExpression(p) || p.right !== child || p.operatorToken.kind !== ts.SyntaxKind.EqualsToken) return false;
+    let lhs: ts.Expression = p.left;
+    while (ts.isParenthesizedExpression(lhs)) lhs = lhs.expression;
+    if (!ts.isPropertyAccessExpression(lhs)) return false;
+    let base: ts.Expression = lhs.expression;
+    while (ts.isParenthesizedExpression(base) || ts.isAsExpression(base) || ts.isNonNullExpression(base)) base = base.expression;
+    return ts.isIdentifier(base) && this.symbolOf(base) === x;
+  }
+  private referencesVar(node: ts.Node, x: ts.Symbol): boolean {
+    let found = false;
+    const visit = (n: ts.Node): void => {
+      if (found) return;
+      if (ts.isIdentifier(n) && this.symbolOf(n) === x) { found = true; return; }
+      ts.forEachChild(n, visit);
+    };
+    visit(node);
+    return found;
   }
   printStaticSlotLog(): void {
     if (process.env.TSAOT_STATIC_SLOTS_LOG !== "1") return;
     const rows = [...this.staticSlotLog.entries()].sort((a, b) => b[1] - a[1]);
     let total = 0;
     for (const [, n] of rows) total += n;
-    console.error(`[static-slots] ${total} hinted sites; layouts: ${(this.ctorLayouts ?? []).map((l) => `${l.sym.name}[${l.keys.join(",")}]`).join(" ")}`);
-    for (const [k, n] of rows.slice(0, 60)) console.error(`[static-slots] ${n}\t${k}`);
+    const producers = this.producerLayoutsCache ?? [];
+    console.error(`[static-slots] ${total} hinted sites; ${producers.length} producers; constructors: ${(this.ctorLayouts ?? []).map((l) => `${l.sym.name}[${l.keys.join(",")}]`).join(" ")}`);
+    if (process.env.TSAOT_STATIC_SLOTS_LOG_PRODUCERS === "1") for (const p of producers) console.error(`[static-slots] producer ${p.name}: ${p.keys.join(",")}`);
+    const limit = Number(process.env.TSAOT_STATIC_SLOTS_LOG_ROWS ?? "60") || 60;
+    for (const [k, n] of rows.slice(0, limit)) console.error(`[static-slots] ${n}\t${k}`);
   }
+  /** The in-object capacity for the instances of a constructor function: the
+   *  longest producer layout that starts with its prefix (the keys the program
+   *  adds right after construction), plus two, at most `TSAOT_CTOR_CAPACITY`;
+   *  0 when off (the default) or when the constructor has no prefix layout. */
+  constructorCapacity(sym: ts.Symbol): number {
+    if (!this.staticSlotsEnabled || this.ctorCapacityLimit <= 0) return 0;
+    const cached = this.ctorCapacityCache.get(sym);
+    if (cached !== undefined) return cached;
+    const ctor = this.constructorLayouts().find((l) => l.sym === sym);
+    let max = 0;
+    if (ctor) {
+      for (const p of this.producerLayouts()) {
+        if (p.keys.length <= ctor.keys.length) continue;
+        let prefix = true;
+        for (let i = 0; i < ctor.keys.length; i++) if (p.keys[i] !== ctor.keys[i]) { prefix = false; break; }
+        if (prefix && p.keys.length > max) max = p.keys.length;
+      }
+    }
+    const cap = max > 0 ? Math.min(max + 2, this.ctorCapacityLimit) : 0;
+    this.ctorCapacityCache.set(sym, cap);
+    return cap;
+  }
+  ctorCapacityCache = new Map<ts.Symbol, number>();
+  /** `TSAOT_CTOR_CAPACITY=N`: pre-size guarded constructions to their longest
+   *  producer layout, at most N in-object slots. Off by default: at 16 it cut the
+   *  static misses but cost a tenth of the compiler's memory for no measurable
+   *  time (the static probe reads external slots instead). */
+  ctorCapacityLimit = Math.max(0, Number(process.env.TSAOT_CTOR_CAPACITY ?? "0") || 0);
   /** Attach a non-zero hint to a LoadField/StoreField. */
   private withSlots<T extends { kind: string }>(inst: T, slots: number): T {
     if (slots) (inst as unknown as { slots?: number }).slots = slots;
@@ -7527,7 +7955,20 @@ class Exporter {
   ctorLayouts: { sym: ts.Symbol; thisType: ts.Type; keys: string[] }[] | undefined = undefined;
   ctorLayoutsStamp = -1;
   /** Receiver type id -> its candidate layouts (undefined: no prediction). */
-  staticSlotCands = new Map<number, { sym: ts.Symbol; thisType: ts.Type; keys: string[] }[] | undefined>();
+  staticSlotCands = new Map<number, ProducerLayout[] | undefined>();
+  /** Producer layouts (docs/static_slots_design.md, producers): the constructor
+   *  prefix layouts plus every fresh-object store sequence of the program
+   *  (`const x = new C(..) | f(..)` followed by `x.k = ..` stores), computed
+   *  once per registration stamp. */
+  producerLayoutsCache: ProducerLayout[] | undefined = undefined;
+  producerLayoutsStamp = -1;
+  /** Function declaration -> the key lists its returned fresh objects carry
+   *  (null while computing or when it is not a producer). */
+  returnLayoutMemo = new Map<ts.Node, string[][] | null>();
+  /** Object-literal property name -> the function declarations bound to it. */
+  methodImpls: Map<string, ts.FunctionLikeDeclaration[]> | undefined = undefined;
+  /** Type id -> the interface/class symbols of the type and its bases. */
+  typeSymsCache = new Map<number, Set<ts.Symbol> | undefined>();
   /** `key@slots` -> hinted sites, for TSAOT_STATIC_SLOTS_LOG=1. */
   staticSlotLog = new Map<string, number>();
 
@@ -10166,6 +10607,10 @@ class Exporter {
   }
 
   lowerAssignTarget(ctx: FnCtx, lhs: ts.Expression, rhs: number, pre?: { obj?: number; key?: number }) {
+    // `(o.f) = v`, `o.f! = v`, `(o as T).f = v`: the wrappers do not change the
+    // reference. (A wrapped target used to fall through every branch below and
+    // drop the store silently; the final branch now rejects loudly.)
+    lhs = this.unwrapAssignTarget(lhs);
     if (ts.isIdentifier(lhs)) {
       const sym = this.symbolOf(lhs);
       const namespace = sym && this.namespaceBindings.get(sym);
@@ -10412,7 +10857,15 @@ class Exporter {
           this.unsupported(p, "object destructuring assignment property form");
         }
       }
+    } else {
+      this.unsupported(lhs, `assignment target of kind ${ts.SyntaxKind[lhs.kind]}`);
     }
+  }
+  /** Strip parentheses and type assertions (`!`, `as`, `<T>`, `satisfies`) from
+   *  an assignment target; they do not change the reference being assigned. */
+  private unwrapAssignTarget(lhs: ts.Expression): ts.Expression {
+    while (ts.isParenthesizedExpression(lhs) || ts.isNonNullExpression(lhs) || ts.isAsExpression(lhs) || ts.isTypeAssertionExpression(lhs) || ts.isSatisfiesExpression(lhs)) lhs = lhs.expression;
+    return lhs;
   }
 
   /** Does this arrow function reference `this` lexically (directly, or inside a

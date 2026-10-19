@@ -140,7 +140,22 @@ static uint32_t g_handle_free_len = 0, g_handle_free_cap = 0;
 #define TS_RT_KEY_HIST 65536u
 static unsigned long long g_key_ool_get[TS_RT_KEY_HIST], g_key_absent[TS_RT_KEY_HIST], g_key_add[TS_RT_KEY_HIST];
 unsigned long long g_ts_key_inline_get[65536], g_ts_key_inline_set[65536];
-unsigned long long g_ts_static_get_hit, g_ts_static_get_miss, g_ts_static_set_hit, g_ts_static_set_miss;
+unsigned long long g_ts_static_get_hit, g_ts_static_get_miss, g_ts_static_set_hit, g_ts_static_set_miss, g_ts_static_learned;
+unsigned long long g_ts_key_static_get_miss[65536], g_ts_key_static_set_miss[65536];
+unsigned long long g_ts_static_miss_slot[65536u * 18u];
+void ts_rt_stat_static_miss_slot(tsv obj, ts_key key){
+  if ((uint32_t)key >= 65536u) return;
+  uint32_t idx = 17u;
+  if (TS_TOP16(obj) == TS_SEL_OBJECT){
+    ts_object* o = (ts_object*)ts_ptr(obj);
+    if (o->h.kind == TS_KIND_OBJECT && ts_obj_shape_id(o) != TS_SHAPE_NONE){
+      idx = 16u;
+      const ts_key* ks = g_ts_shape_keys[ts_obj_shape_id(o)];
+      for (uint32_t i = 0; i < o->len; i++) if (ks[i] == key){ idx = i < 16u ? i : 16u; break; }
+    }
+  }
+  g_ts_static_miss_slot[(uint32_t)key * 18u + idx]++;
+}
 static uint32_t g_next_shape;   /* defined with the shape table below */
 #define RT_STAT_KEY(arr, key) do { if ((uint32_t)(key) < TS_RT_KEY_HIST) arr[(uint32_t)(key)]++; } while (0)
 static struct {
@@ -213,9 +228,22 @@ __attribute__((destructor)) static void ts_rt_stats_dump(void){
   fprintf(out, "[rt_stats] array_sparse: convert=%llu put=%llu densify=%llu\n",
           g_rt_stats.array_sparse_convert, g_rt_stats.array_sparse_put, g_rt_stats.array_densify);
   {
-    const char* names[5] = { "ool_get", "absent", "add", "inline_get", "inline_set" };
-    unsigned long long* hists[5] = { g_key_ool_get, g_key_absent, g_key_add, g_ts_key_inline_get, g_ts_key_inline_set };
-    for (int hh = 0; hh < 5; hh++){
+    {
+      /* slot distribution of the static read misses, top keys */
+      for (int rank = 0; rank < 16; rank++){
+        uint32_t best = 0; unsigned long long bv = 0;
+        for (uint32_t k = 0; k < TS_RT_KEY_HIST; k++) if (g_ts_key_static_get_miss[k] > bv && !(g_ts_static_miss_slot[k * 18u + 0] == (unsigned long long)-1)){ bv = g_ts_key_static_get_miss[k]; best = k; }
+        if (!bv) break;
+        const char* nm = ts_field_name(best);
+        fprintf(out, "[rt_stats] static_miss_slots %s=%llu:", nm ? nm : "?", bv);
+        for (uint32_t i = 0; i < 18u; i++) if (g_ts_static_miss_slot[best * 18u + i]) fprintf(out, " %s%u=%llu", i == 16u ? "other" : i == 17u ? "nonobj" : "s", i < 16u ? i : 0u, g_ts_static_miss_slot[best * 18u + i]);
+        fprintf(out, "\n");
+        g_ts_static_miss_slot[best * 18u + 0] = (unsigned long long)-1;
+      }
+    }
+    const char* names[7] = { "ool_get", "absent", "add", "inline_get", "inline_set", "static_get_miss", "static_set_miss" };
+    unsigned long long* hists[7] = { g_key_ool_get, g_key_absent, g_key_add, g_ts_key_inline_get, g_ts_key_inline_set, g_ts_key_static_get_miss, g_ts_key_static_set_miss };
+    for (int hh = 0; hh < 7; hh++){
       unsigned long long* h = hists[hh];
       fprintf(out, "[rt_stats] keys_%s:", names[hh]);
       for (int rank = 0; rank < 30; rank++){
@@ -265,8 +293,8 @@ __attribute__((destructor)) static void ts_rt_stats_dump(void){
   fprintf(out, "[rt_stats] class_field_cache: calls=%llu hits=%llu\n", g_rt_stats.class_field_calls, g_rt_stats.class_field_hits);
   fprintf(out, "[rt_stats] location_cache: probes=%llu hits=%llu collisions=%llu\n",
           g_rt_stats.location_probes, g_rt_stats.location_hits, g_rt_stats.location_collisions);
-  fprintf(out, "[rt_stats] static_slots: get_hit=%llu get_miss=%llu set_hit=%llu set_miss=%llu | shapes=%u\n",
-          g_ts_static_get_hit, g_ts_static_get_miss, g_ts_static_set_hit, g_ts_static_set_miss, g_next_shape);
+  fprintf(out, "[rt_stats] static_slots: get_hit=%llu get_miss=%llu set_hit=%llu set_miss=%llu learned=%llu | shapes=%u\n",
+          g_ts_static_get_hit, g_ts_static_get_miss, g_ts_static_set_hit, g_ts_static_set_miss, g_ts_static_learned, g_next_shape);
   fprintf(out, "[rt_stats] prop_pic: get=%llu hit=%llu (%.1f%%) set=%llu hit=%llu (%.1f%%)\n",
           g_ts_pic_get_calls, g_ts_pic_get_hits,
           g_ts_pic_get_calls ? 100.0*(double)g_ts_pic_get_hits/(double)g_ts_pic_get_calls : 0.0,
@@ -11878,12 +11906,21 @@ int ts_construct_same_code(tsv ctorv, tsv fval){
   ts_func* c = (ts_func*)ts_ptr(ctorv);
   return c->code == ((ts_func*)ts_ptr(fval))->code && c->class_id == 0 && c->constructable;
 }
-tsv ts_construct_begin(tsv ctorv){
+tsv ts_construct_begin(tsv ctorv){ return ts_construct_begin_n(ctorv, 0u); }
+/* `min_slots`: the exporter's in-object capacity for the instances of this
+   site's constructor, the longest producer layout rooted at its prefix
+   (docs/static_slots_design.md, producers), so the keys the program adds after
+   construction stay in-object; the learned slack (`ts_construct_end`) only
+   covers the constructor's own stores plus four. */
+tsv ts_construct_begin_n(tsv ctorv, uint32_t min_slots){
   ts_gc_root(&ctorv);
   fn_materialize_prototype((ts_func*)ts_ptr(ctorv), ctorv);
   tsv proto = ((ts_func*)ts_ptr(ctorv))->prototype_prop;
-  uint8_t est = ((ts_func*)ts_ptr(ctorv))->inst_slots;
-  tsv inst = ts_new_object_n(est ? est : 12u);
+  uint32_t est = ((ts_func*)ts_ptr(ctorv))->inst_slots;
+  if (!est) est = 12u;
+  if (est < min_slots) est = min_slots;
+  if (est > TS_INLINE_SLOTS_MAX) est = TS_INLINE_SLOTS_MAX;
+  tsv inst = ts_new_object_n(est);
   ((ts_object*)ts_ptr(inst))->proto = ts_is_obj(proto) ? proto : ts_object_proto();
   ts_gc_unroot(1);
   return inst;

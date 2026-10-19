@@ -5588,6 +5588,62 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   of the remaining 146M cached reads, `objectFlags` 12.6M, `id` 11.6M,
   `freshType` 8.0M, `escapedText` 5.5M, `symbol` 4.6M; and the 0.90M static
   write misses deserve a per-key histogram.
+- Producer layouts for the static slots (builds `x34`-`x37`, full builds;
+  exporter, emitter, runtime; the follow-up of the static slots in
+  `docs/static_slots_design.md`, section "Producers"). The exporter now
+  collects every producer layout of the program: the constructor prefixes
+  plus every fresh-object store sequence (`const x = new C(..) | f(..)`
+  followed by `x.k = ..` stores until `x` escapes; `if` branches that
+  store only existing keys are skipped), with producer calls resolved
+  through function return layouts (memoized) and through object-literal
+  method bindings by name (the union over all bindings: the base node
+  factory binds `createBaseNode` three times). Receivers match producers
+  by the declared interface hierarchy (roots through `Mutable<T>` and
+  constraints; a `StringLiteralType` receiver takes the `LiteralType`
+  producers, not every `Type` producer), and the slot rule is relaxed:
+  the candidates carrying the key vote, up to three slots
+  (`ts_get_static3_inline`), 80% coverage, the candidates lacking the key
+  fewer than those carrying it. The compiler: 435 producers, 19,781
+  hinted sites (was 8,312), 20,824 static reads and 1,158 static writes
+  in the C (1,859 two-slot, 692 three-slot forms), cached read sites
+  39,265 -> 28,527; new hints `symbol@2`, `objectFlags@3`, `id@1`,
+  `value@3`, `types@3`, `escapedText@9,8,10`, `name@14/13/12`,
+  `expression@10`, the signature fields. Found on the way: a compound
+  assignment whose target is wrapped in a non-null assertion, a cast or
+  parentheses (`u.objectFlags! |= 64`) fell through every branch of the
+  assignment-target lowering and dropped the store silently (a
+  pre-existing silent miscompile); targets are now unwrapped and an
+  unknown target form rejects loudly (fixture
+  `operators/wrapped_assignment_targets`). The first build (`x34`) missed
+  18M static reads per compile (`freshType` 8M, `name` 2.1M, `arguments`
+  1M, ...): a stats-only histogram of where a miss finds the key
+  (`static_miss_slots`) showed the predicted slot was right but *outside
+  the in-object area*: `ts_construct_end` learns the slack from the
+  constructor's own stores plus four, so a `Type` gets 5 in-object slots
+  and `freshType@5`, `resolvedReturnType@5`, `name@14`, `initializer@15`
+  lived in the external vector. Two answers, both kept: the probe now
+  reads external slots too (`ts_obj_slot_ptr`: the in-object path is
+  unchanged, the external branch is cold) and falls back to the slot the
+  site's cache learned from its first miss (`ic->entries[0]`); and an
+  exporter capacity hint (`construct.begin:N`, N = the longest producer
+  layout rooted at the constructor) pre-sizes guarded constructions,
+  which cut the misses but cost memory: N <= 24 read RSS 1006 MB (x33:
+  813 MB, +24%), N <= 16 read 892 MB (+10%) for a wall time 1.4% below
+  the no-hint build (x36 vs x37: 4.821 vs 4.892 s, all three pairs). The
+  hint is off by default (`TSAOT_CTOR_CAPACITY=N` turns it on); the
+  shipped `x37` has x33's memory and allocation profile. Statistics
+  (`x37`, -O0): static reads 435.7M hit and 0.6M miss (160k through the
+  learned slot), static writes 4.7M hit and 4.6M miss (additions), cached
+  reads 146M -> 62M, out-of-line reads 5.7M; binary 52.46 -> 50.01 MB.
+  Fixture `objects/static_slots_producers`; gates: conformance 453/453,
+  selfconf 436+14, parity identical=349 DIFF=0 KNOWN=100, bundler, GC
+  stress, inline policy, unit. A/B against `x33`, three alternating runs
+  each: `x37` 4.882 vs 4.924 s (pairs -0.5%, -8.3% with a slow baseline
+  run, -0.3%), `x36` 4.906 vs 5.024 s (-2.3%, -1.8%, +1.4%), `x35`
+  (N <= 24) 4.848 vs 4.930 s (-2.2%, -2.0%, -0.7%); about -1% with the
+  default and -2% with the capacity hint; Node 3.29-3.34 s (1.47x).
+  The remaining static misses are receivers that are not plain shaped
+  objects (`NodeArray.transformFlags` 282k, arrays) or lack the key.
 - Next slices, in order. (0) External element buffers (the malloc'd
   `data` of arrays, also strings' and maps' buffers) do not count toward
   the collector's trigger: a loop that drops large arrays grows without

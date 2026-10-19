@@ -56,6 +56,11 @@ while IFS= read -r name; do
     ts_set_pic_inline_lazy | \
     ts_static_slot_probe | \
     ts_static_slot_probe2 | \
+    ts_static_slot_probe3 | \
+    ts_get_static3_inline | \
+    ts_set_static3_inline | \
+    ts_get_static3_inline_lazy | \
+    ts_set_static3_inline_lazy | \
     ts_get_static_inline | \
     ts_get_static2_inline | \
     ts_set_static_inline | \

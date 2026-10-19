@@ -17649,6 +17649,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 "reflect.construct" => (format!("ts_reflect_construct({}, {})", v(0), v(1)), false),
                 "construct.sameCode" => (format!("ts_bool(ts_construct_same_code({}, {}))", v(0), v(1)), false),
                 "construct.begin" => (format!("ts_construct_begin({})", v(0)), false),
+                b if b.starts_with("construct.begin:") => (format!("ts_construct_begin_n({}, {}u)", v(0), &b["construct.begin:".len()..]), false),
                 "construct.end" => (format!("ts_construct_end({}, {}, {})", v(0), v(1), v(2)), false),
                 "proxy.new" => (format!("ts_proxy_new({}, {})", v(0), v(1)), false),
                 "proxy.revocable" => (format!("ts_proxy_revocable({}, {})", v(0), v(1)), false),
@@ -18409,11 +18410,14 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 let _ = writeln!(s, "  {{ static ts_prop_ic _ts_pic_{} = TS_PROP_IC_INIT;", pic);
                 let s1 = (slots & 0xFF) - 1;
                 let s2 = (slots >> 8) & 0xFF;
-                let get_expr = match (s2, ctx.lazy_frame) {
-                    (0, false) => format!("ts_get_static_inline({}, {}, {}u, &_ts_pic_{})", ctx.val(obj.0), field.0, s1, pic),
-                    (0, true) => format!("ts_get_static_inline_lazy({}, {}, {}u, &_ts_pic_{}, &F.h, {})", ctx.val(obj.0), field.0, s1, pic, ctx.frame_nslots),
-                    (_, false) => format!("ts_get_static2_inline({}, {}, {}u, {}u, &_ts_pic_{})", ctx.val(obj.0), field.0, s1, s2 - 1, pic),
-                    (_, true) => format!("ts_get_static2_inline_lazy({}, {}, {}u, {}u, &_ts_pic_{}, &F.h, {})", ctx.val(obj.0), field.0, s1, s2 - 1, pic, ctx.frame_nslots),
+                let s3 = (slots >> 16) & 0xFF;
+                let get_expr = match (s2, s3, ctx.lazy_frame) {
+                    (0, _, false) => format!("ts_get_static_inline({}, {}, {}u, &_ts_pic_{})", ctx.val(obj.0), field.0, s1, pic),
+                    (0, _, true) => format!("ts_get_static_inline_lazy({}, {}, {}u, &_ts_pic_{}, &F.h, {})", ctx.val(obj.0), field.0, s1, pic, ctx.frame_nslots),
+                    (_, 0, false) => format!("ts_get_static2_inline({}, {}, {}u, {}u, &_ts_pic_{})", ctx.val(obj.0), field.0, s1, s2 - 1, pic),
+                    (_, 0, true) => format!("ts_get_static2_inline_lazy({}, {}, {}u, {}u, &_ts_pic_{}, &F.h, {})", ctx.val(obj.0), field.0, s1, s2 - 1, pic, ctx.frame_nslots),
+                    (_, _, false) => format!("ts_get_static3_inline({}, {}, {}u, {}u, {}u, &_ts_pic_{})", ctx.val(obj.0), field.0, s1, s2 - 1, s3 - 1, pic),
+                    (_, _, true) => format!("ts_get_static3_inline_lazy({}, {}, {}u, {}u, {}u, &_ts_pic_{}, &F.h, {})", ctx.val(obj.0), field.0, s1, s2 - 1, s3 - 1, pic, ctx.frame_nslots),
                 };
                 s.push_str(&ctx.set_val(dst.0, &get_expr));
                 let _ = writeln!(s, "  }}");
@@ -18569,11 +18573,14 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 let _ = writeln!(s, "  {{ static ts_prop_ic _ts_pic_{} = TS_PROP_IC_INIT;", pic);
                 let s1 = (slots & 0xFF) - 1;
                 let s2 = (slots >> 8) & 0xFF;
-                match (s2, ctx.lazy_frame) {
-                    (0, false) => { let _ = writeln!(s, "  ts_set_static_inline({}, {}, {}u, {}, &_ts_pic_{});", ctx.val(obj.0), field.0, s1, ctx.val(src.0), pic); }
-                    (0, true) => { let _ = writeln!(s, "  ts_set_static_inline_lazy({}, {}, {}u, {}, &_ts_pic_{}, &F.h, {});", ctx.val(obj.0), field.0, s1, ctx.val(src.0), pic, ctx.frame_nslots); }
-                    (_, false) => { let _ = writeln!(s, "  ts_set_static2_inline({}, {}, {}u, {}u, {}, &_ts_pic_{});", ctx.val(obj.0), field.0, s1, s2 - 1, ctx.val(src.0), pic); }
-                    (_, true) => { let _ = writeln!(s, "  ts_set_static2_inline_lazy({}, {}, {}u, {}u, {}, &_ts_pic_{}, &F.h, {});", ctx.val(obj.0), field.0, s1, s2 - 1, ctx.val(src.0), pic, ctx.frame_nslots); }
+                let s3 = (slots >> 16) & 0xFF;
+                match (s2, s3, ctx.lazy_frame) {
+                    (0, _, false) => { let _ = writeln!(s, "  ts_set_static_inline({}, {}, {}u, {}, &_ts_pic_{});", ctx.val(obj.0), field.0, s1, ctx.val(src.0), pic); }
+                    (0, _, true) => { let _ = writeln!(s, "  ts_set_static_inline_lazy({}, {}, {}u, {}, &_ts_pic_{}, &F.h, {});", ctx.val(obj.0), field.0, s1, ctx.val(src.0), pic, ctx.frame_nslots); }
+                    (_, 0, false) => { let _ = writeln!(s, "  ts_set_static2_inline({}, {}, {}u, {}u, {}, &_ts_pic_{});", ctx.val(obj.0), field.0, s1, s2 - 1, ctx.val(src.0), pic); }
+                    (_, 0, true) => { let _ = writeln!(s, "  ts_set_static2_inline_lazy({}, {}, {}u, {}u, {}, &_ts_pic_{}, &F.h, {});", ctx.val(obj.0), field.0, s1, s2 - 1, ctx.val(src.0), pic, ctx.frame_nslots); }
+                    (_, _, false) => { let _ = writeln!(s, "  ts_set_static3_inline({}, {}, {}u, {}u, {}u, {}, &_ts_pic_{});", ctx.val(obj.0), field.0, s1, s2 - 1, s3 - 1, ctx.val(src.0), pic); }
+                    (_, _, true) => { let _ = writeln!(s, "  ts_set_static3_inline_lazy({}, {}, {}u, {}u, {}u, {}, &_ts_pic_{}, &F.h, {});", ctx.val(obj.0), field.0, s1, s2 - 1, s3 - 1, ctx.val(src.0), pic, ctx.frame_nslots); }
                 }
                 let _ = writeln!(s, "  }}");
                 return;
