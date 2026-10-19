@@ -5180,6 +5180,15 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   the production build are unchanged) for a narrower experiment later
   (fewer instructions, no inline-cache probes, or a per-function hotness
   cut from a profile). Gates on the inlined build: conformance 442/442, parity 342 identical + 96 KNOWN, bundler 42/42, selfconf 426 + 13 KNOWN, GC stress (all phases), inline policy, units — the mechanism is sound, only slower.
+- GC nursery size, re-tried on `x20` (4 MB default against 16 MB and 64 MB
+  through `TSAOT_GC_NURSERY_BYTES`, three alternating runs each): 16 MB read
+  6.271 → 6.002 s median but with run pairs from −5% to +2%, 64 MB read +5%,
+  Node itself varied 3.38–3.55 s — the owner's desktop load made the
+  afternoon's measurements noisy. 16 MB cut peak RSS 1,070 → 1,025 MB. To be
+  re-measured on a quiet machine before any default changes; the earlier
+  `x10` trial (16/64 MB, aging knobs) found no gain either. The sparse
+  element storage item below has design notes in
+  `docs/sparse_elements_design.md`.
 - Next slices, in order. (0) Sparse element storage for far stores
   (`flowTypeCache[nodeId]` on a fresh array: 3.6% of the profile in hole
   fills, see the `x19` profile note). (1) Strings, second round: `Map<string, T>`
