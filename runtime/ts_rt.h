@@ -1461,6 +1461,12 @@ tsv  ts_construct(tsv ctorv, tsv* args, int n);
 int ts_construct_same_code(tsv ctorv, tsv fval);
 tsv ts_construct_begin(tsv ctorv);
 tsv  ts_construct_begin_n(tsv ctorv, uint32_t min_slots);
+/* Cursor-driven for..of over Map/Set (docs/map_cursor_forof_design.md). */
+double ts_map_cursor_next(tsv coll, double last, double prev);
+double ts_map_cursor_order(tsv coll, double idx);
+tsv  ts_map_cursor_key(tsv coll, double idx);
+tsv  ts_map_cursor_val(tsv coll, double idx);
+tsv  ts_map_cursor_pair(tsv coll, double idx);
 tsv ts_construct_end(tsv ctorv, tsv inst, tsv result);
 /* Set a boxed function value's first-class metadata (`fn.length` / `fn.name`). */
 void ts_set_fn_meta(tsv fn, uint32_t arity, const char* name);

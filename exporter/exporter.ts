@@ -10322,6 +10322,84 @@ class Exporter {
   /** Lower `for [await] (decl of <iter>) BODY` driven by a resolved iterator.
    *  Shared by for-of and for-await. Uses fresh loop-var/result locals (nested-
    *  safe) and the "forof_gen" loop kind (continue advances in the cond). */
+  /** `TSAOT_FOROF_CURSOR=0`: `for..of` over a Map/Set keeps the iterator protocol. */
+  forOfCursorEnabled = process.env.TSAOT_FOROF_CURSOR !== "0" && process.env.TSAOT_UNTYPED !== "1";
+  /** The collection a `for..of` can walk with a cursor: a Map (entries), a Set
+   *  (values), or `keys()` / `values()` / `entries()` called on one with no
+   *  arguments (docs/map_cursor_forof_design.md). */
+  forOfCursorTarget(expr: ts.Expression): { coll: ts.Expression; mode: "keys" | "values" | "entries" } | undefined {
+    if (!this.forOfCursorEnabled) return undefined;
+    let e: ts.Expression = expr;
+    while (ts.isParenthesizedExpression(e) || ts.isAsExpression(e) || ts.isNonNullExpression(e)) e = e.expression;
+    const rk = this.builtinReceiverKind(e);
+    if (rk === "map") return { coll: e, mode: "entries" };
+    if (rk === "set") return { coll: e, mode: "values" };
+    if (ts.isCallExpression(e) && e.arguments.length === 0 && ts.isPropertyAccessExpression(e.expression)) {
+      const m = e.expression.name.text;
+      if (m !== "keys" && m !== "values" && m !== "entries") return undefined;
+      const rrk = this.builtinReceiverKind(e.expression.expression);
+      if (rrk === "map") return { coll: e.expression.expression, mode: m };
+      if (rrk === "set") return { coll: e.expression.expression, mode: m === "entries" ? "entries" : "values" };
+    }
+    return undefined;
+  }
+  /** `for..of` over a Map/Set driven by a cursor: the runtime's insertion-order
+   *  ids give the protocol's view of mutation during the loop (entries added
+   *  are visited, deleted ones skipped), without an iterator object, result
+   *  objects or, for a `[k, v]` pattern, the pair arrays. Mirrors
+   *  lowerDrivenForLoop's per-iteration capture cells. */
+  private lowerCursorForLoop(ctx: FnCtx, init: ts.ForInitializer, body: ts.Statement, target: { coll: ts.Expression; mode: "keys" | "values" | "entries" }): void {
+    const coll = this.lowerExpr(ctx, target.coll);
+    const decl0 = ts.isVariableDeclarationList(init) ? init.declarations[0] : undefined;
+    const captureCells = decl0 && (init.flags & (ts.NodeFlags.Let | ts.NodeFlags.Const)) !== 0
+      ? this.setupForOfCaptureCells(ctx, decl0.name, decl0) : [];
+    const restoreCell = () => {
+      for (const c of captureCells) {
+        if (c.saved !== undefined) ctx.cellAccess.set(c.sym, c.saved);
+        else ctx.cellAccess.delete(c.sym);
+      }
+    };
+    const last = this.newLocal(ctx, "primitive", "cursorLast");
+    ctx.body.push({ kind: "Const", dst: last, value: { kind: "Num", value: -1 } });
+    const idx = this.newLocal(ctx, "primitive", "cursorIdx");
+    ctx.body.push({ kind: "Const", dst: idx, value: { kind: "Num", value: -1 } });
+    let cond = -1;
+    const condBody = this.captureBody(ctx, () => {
+      // the previous index is a hint: the next entry usually follows it
+      ctx.body.push({ kind: "CallBuiltinStatic", dst: idx, builtin: "map.cursorNext", args: [coll, last, idx] });
+      const zero = this.newLocal(ctx, "primitive");
+      ctx.body.push({ kind: "Const", dst: zero, value: { kind: "Num", value: 0 } });
+      cond = this.newLocal(ctx, "primitive");
+      ctx.body.push({ kind: "BinOp", dst: cond, op: ">=", lhs: idx, rhs: zero });
+    });
+    const loopBody = this.captureLoopBody(ctx, "forof_cursor", () => {
+      ctx.body.push({ kind: "CallBuiltinStatic", dst: last, builtin: "map.cursorOrder", args: [coll, idx] });
+      for (const c of captureCells) {
+        ctx.body.push({ kind: "AllocObject", dst: c.cell, typeId: 0, site: c.perSite, classId: this.cellClassId });
+      }
+      const pat = decl0 ? decl0.name : undefined;
+      const twoNames = target.mode === "entries" && pat !== undefined && ts.isArrayBindingPattern(pat) && pat.elements.length === 2 &&
+        pat.elements.every((el) => ts.isBindingElement(el) && !el.dotDotDotToken && !el.initializer);
+      if (twoNames && pat && ts.isArrayBindingPattern(pat)) {
+        const k = this.newLocal(ctx, "reference", "cursorKey");
+        ctx.body.push({ kind: "CallBuiltinStatic", dst: k, builtin: "map.cursorKey", args: [coll, idx] });
+        const v = this.newLocal(ctx, "reference", "cursorVal");
+        ctx.body.push({ kind: "CallBuiltinStatic", dst: v, builtin: "map.cursorVal", args: [coll, idx] });
+        this.lowerBindingPattern(ctx, (pat.elements[0] as ts.BindingElement).name, k);
+        this.lowerBindingPattern(ctx, (pat.elements[1] as ts.BindingElement).name, v);
+      } else {
+        const value = this.newLocal(ctx, "reference", "elem");
+        const builtin = target.mode === "keys" ? "map.cursorKey" : target.mode === "values" ? "map.cursorVal" : "map.cursorPair";
+        ctx.body.push({ kind: "CallBuiltinStatic", dst: value, builtin, args: [coll, idx] });
+        if (decl0) this.lowerBindingPattern(ctx, decl0.name, value);
+        else this.lowerAssignTarget(ctx, init as ts.Expression, value);
+      }
+      this.emitPerIterationBodyCells(ctx, body);
+      this.lowerStmt(ctx, body);
+    });
+    ctx.body.push({ kind: "Loop", cond, condBody, body: loopBody });
+    restoreCell();
+  }
   private lowerDrivenForLoop(
     ctx: FnCtx, init: ts.ForInitializer, body: ts.Statement,
     drv: { step: (sent: number) => number; returnCall?: () => void }
@@ -11432,7 +11510,8 @@ class Exporter {
       const ctxKind = stack.length ? stack[stack.length - 1] : undefined;
       const isBreak = ts.isBreakStatement(stmt);
       const targetLabel = stmt.label?.text;
-      const continueSafe = (k: string | undefined) => k === "while" || k === "forof_gen" || k === "forof" || k === "forc" || k === "for";
+      // (a cursor loop steps in its condition, so `continue` is a plain jump)
+      const continueSafe = (k: string | undefined) => k === "while" || k === "forof_gen" || k === "forof_cursor" || k === "forof" || k === "forc" || k === "for";
       if (targetLabel !== undefined) {
         // Resolve the labeled target's depth (0 = innermost) by walking loopLabels
         // outward. The exporter's loopLabels and the analyzer's per-loop label
@@ -11509,6 +11588,8 @@ class Exporter {
       // elements.
       // Drive Map/Set iterators directly so mutations during iteration remain
       // visible. Headers still uses its existing array representation.
+      const cursorTarget = this.forOfCursorTarget(stmt.expression);
+      if (cursorTarget) { this.lowerCursorForLoop(ctx, stmt.initializer, stmt.statement, cursorTarget); return; }
       const rkForOf = this.builtinReceiverKind(stmt.expression);
       if (rkForOf === "map" || rkForOf === "set") {
         const recv = this.lowerExpr(ctx, stmt.expression);

@@ -5734,6 +5734,34 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   0.43M, `source`/`__tsaot_rx_flags_mask` 0.29M each. Next: cursor-driven
   `for..of` over Map/Set (no iterator object, no result object), then
   shaped named properties on arrays and the `.call` shortcut.
+- Cursor-driven `for..of` over Map and Set (build `x42`, full build;
+  exporter, emitter, runtime; `docs/map_cursor_forof_design.md`). Such a
+  loop went through the iterator protocol: an iterator object with its
+  source, position and kind as named properties, a dynamic `next` per
+  step reading them through the dictionary, a binary search over the
+  insertion-order ids, a result object and, for entries, a pair array,
+  then `done` and `value` read back. Now a cursor over the collection:
+  `map.cursorNext(coll, last, prevIndex)` (the previous index is a hint:
+  the next entry usually follows it, else the binary search),
+  `cursorOrder`, `cursorKey` / `cursorVal` (a `[k, v]` pattern of two
+  names binds them directly), `cursorPair` for other patterns; the same
+  insertion-order ids keep the protocol's view of mutation during the
+  loop. Typed mode only (the receiver kind comes from types; untyped mode
+  and the oracle keep the protocol: knob `TSAOT_FOROF_CURSOR=0` on the
+  exporter line of `emitc_diff.sh`); `continue` is a plain jump (the step
+  is in the condition; the first build rejected it as unmodeled). Kernel
+  `benchmarks/patterns/map_forof.ts` (entries, keys, values, a Set, with
+  insertions): 348 -> 48 ms native, Node 66-71 ms (5.2x -> 0.73x). For the
+  compiler itself neutral (A/B against `x41`: 4.641 vs 4.611 s and 4.627
+  vs 4.632 s): its Map iteration runs through the `core.ts` iterator
+  helpers (`arrayFrom(iter)`, `mapIterator`, `forEachEntry`), typed
+  `Iterable`, so the protocol stays there (`__map_iterator_last` 0.57M,
+  `__coro` 0.39M, `value`/`done` 1.2M dictionary lookups per compile);
+  that is a runtime slice (fixed-layout iterator and result objects).
+  Fixture `maps_sets/forof_cursor` (an allowlist row for the pre-existing
+  rooting-count difference against the frozen emitter). Gates: unit,
+  parity identical=349 KNOWN=101, selfconf 437+14, bundler, GC stress,
+  inline policy, conformance 454/454.
 - Next slices, in order. (0) External element buffers (the malloc'd
   `data` of arrays, also strings' and maps' buffers) do not count toward
   the collector's trigger: a loop that drops large arrays grows without

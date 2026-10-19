@@ -22,7 +22,7 @@ done
 if [ ! -f "$W/json/.stamp" ] || [ "$LIST" -nt "$W/json/.stamp" ]; then
   # The frozen emitter predates typed cells; export the oracle corpus with the
   # plain-object cell IR so both emitters see the same program.
-  TSAOT_TYPED_CELLS=0 TSAOT_CAPTURE_CONTEXTS=0 TSAOT_LAZY_FN_DECL=0 TSAOT_NESTED_DIRECT=0 TSAOT_NAMESPACE_DIRECT=0 TSAOT_ARRAY_INTERFACES=0 TSAOT_VALUE_CAPTURES=0 TSAOT_LAZY_FN_VALUES=0 TSAOT_SPLICE_FAST=0 TSAOT_NEW_GUARDS=0 TSAOT_STATIC_SLOTS=0 node exporter/exporter.js --batch "$LIST" "$W/json" > "$W/exp.status" 2>"$W/exp.err" || true
+  TSAOT_TYPED_CELLS=0 TSAOT_CAPTURE_CONTEXTS=0 TSAOT_LAZY_FN_DECL=0 TSAOT_NESTED_DIRECT=0 TSAOT_NAMESPACE_DIRECT=0 TSAOT_ARRAY_INTERFACES=0 TSAOT_VALUE_CAPTURES=0 TSAOT_LAZY_FN_VALUES=0 TSAOT_SPLICE_FAST=0 TSAOT_NEW_GUARDS=0 TSAOT_STATIC_SLOTS=0 TSAOT_FOROF_CURSOR=0 node exporter/exporter.js --batch "$LIST" "$W/json" > "$W/exp.status" 2>"$W/exp.err" || true
   touch "$W/json/.stamp"
 fi
 

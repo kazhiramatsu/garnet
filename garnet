@@ -85,6 +85,9 @@
 #   TSAOT_LAZY_FN_VALUES=0  Exporter: create the closure of every nested function
 #                          declaration used as a value at the owner's entry
 #                          instead of on first use (legacy IR).
+#   TSAOT_FOROF_CURSOR=0   Exporter: for..of over a Map/Set through the iterator
+#                          protocol (default: a cursor over the collection, no
+#                          iterator or result objects).
 #   TSAOT_PRETENURE_CTORS=0 Runtime: allocate the instances of guarded
 #                          constructions young (default: in the old generation,
 #                          with a safety valve after a full collection).

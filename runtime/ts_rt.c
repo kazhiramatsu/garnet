@@ -6479,6 +6479,86 @@ tsv ts_map_iterator(tsv source, int kind){
 tsv ts_map_keys(tsv mv){ return ts_map_iterator(mv, 0); }
 tsv ts_map_values(tsv mv){ return ts_map_iterator(mv, 1); }
 tsv ts_map_entries(tsv mv){ return ts_map_iterator(mv, 2); }
+/* Cursor-driven for..of over a Map or Set (docs/map_cursor_forof_design.md):
+   the same insertion-order ids as the iterator protocol (entries added during
+   the loop are visited, deleted ones skipped, compaction harmless), without
+   the iterator object, the result objects or the pair arrays. `last` is the
+   order id of the entry visited last (-1 before the first); the next entry is
+   the dense index of the first live entry with a greater id, or -1. */
+static int mapset_cursor_view(tsv coll, uint32_t* len, tsv** keys, tsv** vals, uint64_t** order){
+  if (ts_is_map(coll)){
+    ts_map* m = (ts_map*)ts_ptr(coll);
+    if (!m->iteration_order){
+      uint32_t cap = m->cap ? m->cap : 1u;
+      m->iteration_order = (uint64_t*)malloc(sizeof(uint64_t) * cap);
+      if (!m->iteration_order) abort();
+      for (uint32_t i = 0; i < m->len; i++) m->iteration_order[i] = i + 1u;
+      m->next_iteration_order = (uint64_t)m->len + 1u;
+    }
+    *len = m->len; *keys = m->keys; *vals = m->vals; *order = m->iteration_order;
+    return 1;
+  }
+  if (ts_is_set(coll)){
+    ts_set_t* st = (ts_set_t*)ts_ptr(coll);
+    if (!st->iteration_order){
+      uint32_t cap = st->cap ? st->cap : 1u;
+      st->iteration_order = (uint64_t*)malloc(sizeof(uint64_t) * cap);
+      if (!st->iteration_order) abort();
+      for (uint32_t i = 0; i < st->len; i++) st->iteration_order[i] = i + 1u;
+      st->next_iteration_order = (uint64_t)st->len + 1u;
+    }
+    *len = st->len; *keys = st->elems; *vals = st->elems; *order = st->iteration_order;
+    return 1;
+  }
+  ts_throw_type_error_msg("for-of over a Map or Set requires a Map or Set receiver");
+  return 0;
+}
+double ts_map_cursor_next(tsv coll, double last, double prev){
+  uint32_t len; tsv* keys; tsv* vals; uint64_t* order;
+  if (!mapset_cursor_view(coll, &len, &keys, &vals, &order)) return -1;
+  uint32_t low;
+  /* The usual step: the entry visited last still sits at `prev` (no compaction
+     since), so the next candidate is the following dense slot; otherwise the
+     binary search over the order ids. */
+  if (prev >= 0 && (uint32_t)prev < len && (double)order[(uint32_t)prev] == last){
+    low = (uint32_t)prev + 1u;
+  } else {
+    uint32_t high = len;
+    low = 0;
+    while (low < high){
+      uint32_t mid = low + (high - low) / 2u;
+      if ((double)order[mid] <= last) low = mid + 1u; else high = mid;
+    }
+  }
+  while (low < len && keys[low] == TS_MAPSET_HOLE) low++;
+  return low < len ? (double)low : -1.0;
+}
+double ts_map_cursor_order(tsv coll, double idx){
+  uint32_t len; tsv* keys; tsv* vals; uint64_t* order;
+  if (!mapset_cursor_view(coll, &len, &keys, &vals, &order)) return -1;
+  uint32_t i = (uint32_t)idx;
+  return i < len ? (double)order[i] : -1.0;
+}
+tsv ts_map_cursor_key(tsv coll, double idx){
+  uint32_t len; tsv* keys; tsv* vals; uint64_t* order;
+  if (!mapset_cursor_view(coll, &len, &keys, &vals, &order)) return TS_UNDEFINED;
+  uint32_t i = (uint32_t)idx;
+  return (i < len && keys[i] != TS_MAPSET_HOLE) ? keys[i] : TS_UNDEFINED;
+}
+tsv ts_map_cursor_val(tsv coll, double idx){
+  uint32_t len; tsv* keys; tsv* vals; uint64_t* order;
+  if (!mapset_cursor_view(coll, &len, &keys, &vals, &order)) return TS_UNDEFINED;
+  uint32_t i = (uint32_t)idx;
+  return (i < len && keys[i] != TS_MAPSET_HOLE) ? vals[i] : TS_UNDEFINED;
+}
+tsv ts_map_cursor_pair(tsv coll, double idx){
+  ts_gc_root(&coll);
+  tsv pair = ts_new_array(0); ts_gc_root(&pair);
+  ts_array_push(pair, ts_map_cursor_key(coll, idx));
+  ts_array_push(pair, ts_map_cursor_val(coll, idx));
+  ts_gc_unroot(2);
+  return pair;
+}
 void ts_map_foreach(tsv mv, tsv cb){
   if (!ts_is_map(mv)) return;
   ts_map* m=ts_ptr(mv);
