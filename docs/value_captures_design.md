@@ -69,6 +69,26 @@ A third capture slot kind, `value`, next to `record` and `cell`:
 - **Loop-declared constants** (`for (const t of types) f(() => t)`) are
   value-capturable, which also removes the per-iteration cell.
 
+## Round 2: bindings settled before capture
+
+A binding that is assigned after its declaration — a `let` initialized on
+branches (`memberName` in `getSignaturesOfType`), a parameter reassigned
+once (`type = getReducedApparentType(type)`), a `let` declared without an
+initializer — also travels by value when it is *settled before capture*:
+every assignment to it *completes* before every closure that captures it
+starts, in the text — an assignment is ordered by the end of the
+expression that gives the binding its value, so an arrow inside the
+right-hand side (`cycle = p.then(() => cycle)`) is created before it; the capturing functions are all expression closures (a nested
+declaration is created or called at times the text does not fix, so it
+keeps the cell); and no loop encloses both an assignment and a capture
+unless it also encloses the declaration (a per-iteration binding, whose
+value is fixed by the time the closure is created in that iteration; a
+`for (let i ...)` header counts as inside its loop, which matches the
+per-iteration copy of the specification). A closure that writes the
+binding fails the text test by itself, since the assignment lies inside
+it, and so does any assignment after a capture (`let v = 1; const f = ()
+=> v; v = 2;` keeps the cell and `f()` reads 2).
+
 `TSAOT_VALUE_CAPTURES=0` (exporter) keeps every capture in cells; the
 parity oracle's corpus is exported with it.
 
@@ -97,3 +117,12 @@ shared; generators and async functions; methods of class expressions;
 `TSAOT_VALUE_CAPTURES=0` and `1` compared against V8; GC stress with
 captured object values; the compiler A/B and the per-site statistics
 (records per compile).
+Round 2 adds fixture `closures/settled_captures` (a `let` assigned on
+branches then captured, a parameter reassigned twice, an assignment after a
+capture, a closure that writes, a loop re-assigning an outer binding with a
+capture in the same loop, a per-iteration `let` assigned then captured,
+an inner-loop assignment with the capture after it, `for (w of ...)` over an
+existing variable, destructuring and compound assignments, a nested
+declaration reading an assigned binding, 100k loop iterations with a
+captured per-iteration value).
+

@@ -5078,15 +5078,39 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   alternating three runs, outputs validated, diagnostics zero:
   **5.973 → 5.945 s median wall (0.5% less; all four run pairs, warm-up included, favour the lazy build); Node 3.243 s, native 1.83x slower than V8; RSS 1,089 → 1,100 MB (the extra environment slots of closures that may have to create a sibling's value)**. Statistics relink: closures 3.26M → 1.37M per compile (391 → 165 MB), allocations 17.64M → 15.75M (2.13 → 1.90 GB), minor collections 487 → 429, GC pauses 624 → 553 ms. Gates:
   conformance 439/439, parity 341 identical + 94 KNOWN (the fixture's loop literal surfaces the known FrameArena-vs-Stack annotation difference, allowlisted), bundler 42/42, selfconf 425 + 11 KNOWN, GC stress (all phases), inline policy, units (every verdict read from the gate output).
-- Next slices, in order. (1) Closures, second round: the remaining
-  closures created on hot paths (arrows passed to `some`/`map`/`forEach`
-  and the checker's own helpers — stack allocation when the callee is
-  known not to retain them, with the lifetime fixtures of the
-  stack-closure slice), and a smaller closure cell (120 bytes today).
-  (2) Value captures, second round: bindings declared by destructuring,
-  `let` assigned exactly once after its declaration, the lexical `this`
-  of arrows; the records that remain because a hoisted declaration used
-  as a value captures a body constant. (3) Stack
+- Value captures, round 2: bindings settled before capture
+  (`docs/value_captures_design.md`). The x17 statistics still showed 2.5M
+  scope records at the hottest sites, and the record debug trace named the
+  bindings that kept them: a `let` initialized on branches and read by
+  arrows afterwards (`memberName` in `getSignaturesOfType`, 472k records
+  per compile), a `let` reassigned before its captures (`declaration` in
+  `checkIdentifier`, 260k), a parameter reassigned once. Such a binding
+  now travels by value when every assignment precedes every capturing
+  closure in the text, the capturing functions are expression closures,
+  and no loop encloses both an assignment and a capture unless it also
+  encloses the declaration (a per-iteration binding); a closure that
+  writes the binding, an assignment after a capture, a `for (w of ...)`
+  over an existing variable and a nested declaration reading the binding
+  all keep the cell. The first build broke
+  `closures/promise_resolution_protocol`: the rule ordered an assignment
+  by its target's position, so an arrow created inside the assignment's
+  own right-hand side (`cycle = p.then(() => cycle)`) counted as created
+  after it and captured `undefined`; an assignment is now ordered by the
+  end of the expression whose completion gives the binding its value
+  (the fixture gained that case). IR of the compiler: scope-record classes 310 → 291 (fields 4,466 → 4,425), record allocation sites 405 → 375; of the record allocations at the hottest sites of the `x17` statistics compile, 181k per compile are gone (`declareSymbol` 110k, `getNarrowedTypeWorker` 33k, `inferFromMatchingTypes` 32k, ...), while `getSignaturesOfType` (`memberName` is assigned inside its arrow) and `checkIdentifier` (`declaration` is reassigned after a capture) keep theirs, correctly. Fixture
+  `closures/settled_captures` (every case above, on both exporter paths).
+  Compiler A/B against the lazy-closure build, alternating three runs,
+  outputs validated, diagnostics zero: **6.000 → 5.953 s median wall (0.8% less; all four run pairs favour the new build; a first A/B under desktop load read 6.266 → 6.055 s); Node 3.268 s, native 1.82x slower than V8; RSS 1,100 → 1,155 MB**. Statistics
+  relink: allocations 15.75M → 15.57M per compile, objects 6.06M → 5.88M, minor collections 429 → 425. Gates: conformance 440/440, parity 341 identical + 95 KNOWN (the fixture's loop literal surfaces the known FrameArena-vs-Stack annotation difference, allowlisted), bundler 42/42, selfconf 426 + 11 KNOWN, GC stress (all phases), inline policy, units (every verdict read from the gate output; the first chain failed `closures/promise_resolution_protocol` in conformance and selfconf on the right-hand-side ordering defect above, fixed before this build).
+- Next slices, in order. (1) `splice` whose result is discarded
+  (`typeSet.splice(~index, 0, type)`, 415k result arrays per compile) and
+  the other array allocations of the hottest sites. (2) Closures, second
+  round: the long tail of arrows (1.37M per compile, no site above 54k),
+  a smaller closure cell (120 bytes today). (3) Value captures, round 3:
+  bindings declared by destructuring, the lexical `this` of arrows, the
+  records that remain because a hoisted declaration used as a value
+  captures a body constant (`isBlockScopedNameDeclaredBeforeUse`,
+  `getSignatureApplicabilityError`). (4) Stack
   allocation of callback closures the callee is known not to retain
   (`some`/`map`/`forEach`/`every` and the checker's own helpers), with
   the lifetime fixtures the stack-closure slice set out. (3) The generic

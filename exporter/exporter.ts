@@ -303,6 +303,7 @@ class Exporter {
   // creation site of unknown order captures them; the functions capturing each
   // binding; and the bindings that travel by value (removed from cellBindings).
   assignedSyms = new Set<ts.Symbol>();
+  assignmentSites = new Map<ts.Symbol, ts.Node[]>();   // every assignment target (identifier node) per binding
   cellOnlySyms = new Set<ts.Symbol>();
   capturedByFns = new Map<ts.Symbol, FnLike[]>();
   valueBindings = new Set<ts.Symbol>();
@@ -1983,31 +1984,43 @@ class Exporter {
    *  every `let`/`var` declared without an initializer. Declaration
    *  initializers do not count. */
   private computeAssignedBindings(): void {
-    const mark = (id: ts.Identifier) => { const sym = this.symbolOf(id); if (sym) this.assignedSyms.add(sym); };
-    const target = (e: ts.Expression) => {
-      if (ts.isIdentifier(e)) { mark(e); return; }
-      if (ts.isParenthesizedExpression(e)) { target(e.expression); return; }
-      if (ts.isArrayLiteralExpression(e)) { for (const el of e.elements) target(el); return; }
+    // Each assignment is recorded as the node whose COMPLETION gives the
+    // binding its value (the whole assignment expression, update expression,
+    // loop statement or declaration), so a closure created inside the
+    // right-hand side (`cycle = p.then(() => cycle)`) counts as created before
+    // the assignment.
+    const mark = (id: ts.Identifier, at: ts.Node) => {
+      const sym = this.symbolOf(id);
+      if (!sym) return;
+      this.assignedSyms.add(sym);
+      let arr = this.assignmentSites.get(sym);
+      if (!arr) { arr = []; this.assignmentSites.set(sym, arr); }
+      arr.push(at);
+    };
+    const target = (e: ts.Expression, at: ts.Node) => {
+      if (ts.isIdentifier(e)) { mark(e, at); return; }
+      if (ts.isParenthesizedExpression(e)) { target(e.expression, at); return; }
+      if (ts.isArrayLiteralExpression(e)) { for (const el of e.elements) target(el, at); return; }
       if (ts.isObjectLiteralExpression(e)) {
         for (const prop of e.properties) {
-          if (ts.isShorthandPropertyAssignment(prop)) mark(prop.name);
-          else if (ts.isPropertyAssignment(prop)) target(prop.initializer);
-          else if (ts.isSpreadAssignment(prop)) target(prop.expression);
+          if (ts.isShorthandPropertyAssignment(prop)) mark(prop.name, at);
+          else if (ts.isPropertyAssignment(prop)) target(prop.initializer, at);
+          else if (ts.isSpreadAssignment(prop)) target(prop.expression, at);
         }
         return;
       }
-      if (ts.isSpreadElement(e)) { target(e.expression); return; }
-      if (ts.isBinaryExpression(e) && e.operatorToken.kind === ts.SyntaxKind.EqualsToken) { target(e.left); return; }
+      if (ts.isSpreadElement(e)) { target(e.expression, at); return; }
+      if (ts.isBinaryExpression(e) && e.operatorToken.kind === ts.SyntaxKind.EqualsToken) { target(e.left, at); return; }
       if (ts.isOmittedExpression(e)) return;
       // property/element targets assign a property, not a binding
     };
     const visit = (n: ts.Node) => {
-      if (ts.isBinaryExpression(n) && n.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && n.operatorToken.kind <= ts.SyntaxKind.LastAssignment) target(n.left);
+      if (ts.isBinaryExpression(n) && n.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && n.operatorToken.kind <= ts.SyntaxKind.LastAssignment) target(n.left, n);
       else if ((ts.isPrefixUnaryExpression(n) || ts.isPostfixUnaryExpression(n)) &&
-               (n.operator === ts.SyntaxKind.PlusPlusToken || n.operator === ts.SyntaxKind.MinusMinusToken)) target(n.operand);
-      else if ((ts.isForInStatement(n) || ts.isForOfStatement(n)) && !ts.isVariableDeclarationList(n.initializer)) target(n.initializer);
+               (n.operator === ts.SyntaxKind.PlusPlusToken || n.operator === ts.SyntaxKind.MinusMinusToken)) target(n.operand, n);
+      else if ((ts.isForInStatement(n) || ts.isForOfStatement(n)) && !ts.isVariableDeclarationList(n.initializer)) target(n.initializer, n);
       else if (ts.isVariableDeclaration(n) && !n.initializer && ts.isIdentifier(n.name) &&
-               !(n.parent && ts.isVariableDeclarationList(n.parent) && (ts.isForOfStatement(n.parent.parent) || ts.isForInStatement(n.parent.parent)))) mark(n.name);
+               !(n.parent && ts.isVariableDeclarationList(n.parent) && (ts.isForOfStatement(n.parent.parent) || ts.isForInStatement(n.parent.parent)))) mark(n.name, n);
       ts.forEachChild(n, visit);
     };
     for (const m of this.modules) visit(m);
@@ -2017,9 +2030,20 @@ class Exporter {
    *  `const`/`let`, and — unless a parameter — captured only by closures created
    *  after its declaration (expression closures textually after it, and nested
    *  declarations that are only ever called directly). */
+  /** The innermost loop statement enclosing both nodes, below `owner`. */
+  private innermostCommonLoop(a: ts.Node, b: ts.Node, owner: ts.Node): ts.Node | undefined {
+    const loopsOf = (n: ts.Node): ts.Node[] => {
+      const out: ts.Node[] = [];
+      for (let p: ts.Node | undefined = n.parent; p && p !== owner; p = p.parent) if (isLoopStatement(p)) out.push(p);
+      return out;
+    };
+    const la = new Set(loopsOf(a));
+    for (const l of loopsOf(b)) if (la.has(l)) return l;
+    return undefined;
+  }
   private valueCapturable(s: ts.Symbol): boolean {
     if (!this.valueCaptures || s === this.lexicalThisSym) return false;
-    if (this.assignedSyms.has(s) || this.cellOnlySyms.has(s)) return false;
+    if (this.cellOnlySyms.has(s)) return false;
     if (this.funcSymbols.has(s) || this.classSymToId.has(s) || this.namespaceBindings.has(s)) return false;
     if (this.moduleScopeSyms.has(s) || this.isScriptGlobalVarSymbol(s)) return false;
     const d = s.valueDeclaration ?? s.declarations?.[0];
@@ -2032,14 +2056,16 @@ class Exporter {
       if (!(d.parent as ts.Node) || (d.parent as ts.Node) !== owner) return false;
       isParam = true;
     } else if (ts.isVariableDeclaration(d)) {
-      if (!ts.isIdentifier(d.name) || !d.initializer) return false;
+      if (!ts.isIdentifier(d.name)) return false;
       const list = d.parent;
       if (!ts.isVariableDeclarationList(list) || (list.flags & (ts.NodeFlags.Const | ts.NodeFlags.Let)) === 0) return false;
+      if (!d.initializer && !this.assignedSyms.has(s)) return false;
     } else {
       return false;
     }
+    const captures = this.capturedByFns.get(s) ?? [];
     if (!isParam) {
-      for (const f of this.capturedByFns.get(s) ?? []) {
+      for (const f of captures) {
         const fn = f as unknown as ts.Node;
         if (ts.isFunctionDeclaration(fn)) {
           const fsym = fn.name ? this.symbolOf(fn.name) : undefined;
@@ -2047,6 +2073,25 @@ class Exporter {
           continue;
         }
         if (fn.pos < d.end) return false; // created before the declaration completes
+      }
+    }
+    if (this.assignedSyms.has(s)) {
+      // Settled before capture (docs/value_captures_design.md, round 2): every
+      // assignment precedes every capturing closure's creation in the text, the
+      // capturing functions are expression closures (a declaration is created
+      // or called at times the text does not fix), and no loop encloses both
+      // an assignment and a capture unless it also encloses the declaration
+      // (a per-iteration binding). A closure that writes the binding fails the
+      // text test by itself: the assignment lies inside it.
+      const sites = this.assignmentSites.get(s) ?? [];
+      for (const f of captures) {
+        const fn = f as unknown as ts.Node;
+        if (ts.isFunctionDeclaration(fn)) return false;
+        for (const a of sites) {
+          if (a.end > fn.pos) return false;   // the closure starts before the assignment completes
+          const loop = this.innermostCommonLoop(a, fn, owner);
+          if (loop && !(ts.isVariableDeclaration(d) && d.pos >= loop.pos && d.end <= loop.end)) return false;
+        }
       }
     }
     return true;
@@ -2150,6 +2195,8 @@ class Exporter {
       });
       const sentinel = { name: `<ctx ${ownerName}>`, flags: 0 } as unknown as ts.Symbol;
       this.recordOfOwner.set(owner, { classId, binding: this.bindingIdOf(sentinel), fields, syms });
+      if (process.env.TSAOT_DEBUG_RECORDS)
+        console.error(`[record] ${ownerName}: ${syms.map((sy) => `${(sy as { name?: string }).name ?? "?"}${this.assignedSyms.has(sy) ? "=" : ""}${this.cellOnlySyms.has(sy) ? "!" : ""}`).join(",")}`);
     }
     if (this.moduleInitNode && this.recordOfOwner.has(this.moduleInitNode)) {
       this.moduleCtxGlobal = this.internGlobal("__modctx");

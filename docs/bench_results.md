@@ -748,6 +748,7 @@ Compiler A/Bs for the slice (three alternating runs each, outputs validated):
 | `native_s350x15` (struct fields only in sized instances; collector skips the registry) | 6.236 s | 0.4% less than `x14` (6.260 s; three A/Bs agree within noise, 11 of 12 timed pairs); Node 3.329 s; diagnostics zero, outputs validated |
 | `native_s350x16` (capture by value for immutable bindings) | 6.066 s | 2.7% less than `x15` (6.232 s in the same run, three timed pairs −2.0 to −2.9%); Node 3.311 s; RSS 1,166 → 1,089 MB; diagnostics zero, outputs validated |
 | `native_s350x17` (lazy closure values for nested declarations) | 5.945 s | 0.5% less than `x16` (5.973 s in the same run, all four pairs agree); Node 3.243 s; RSS 1,089 → 1,100 MB; diagnostics zero, outputs validated |
+| `native_s350x18` (value captures, round 2: settled bindings) | 5.953 s | 0.8% less than `x17` (6.000 s in the same quiet run, all four pairs agree); Node 3.268 s; RSS 1,100 → 1,155 MB; diagnostics zero, outputs validated |
 
 ### Inline-cache path statistics (Session 350, `native_s350s_stats`)
 
