@@ -5668,6 +5668,28 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   (`benchmarks/patterns/string_keys.ts`): native 265-340 ms against
   Node's 301-324 ms (0.88-1.05x), so the 58 `ts_add` samples under
   `getTypeListId` in the profile are volume, not a slow path; no slice.
+- Pretenured construction (build `x39`, relinked from `x37` with the
+  pacing of `x38`; runtime only; `docs/pretenured_construction_design.md`).
+  The minor collections remained the collector's cost after the pacing:
+  401 per compile, about 330 ms, copying 122 MB of survivors and
+  promoting 125 MB, 359 MB promoted directly when a nursery cycle ended
+  early. The survivors are the nodes, symbols, types, signatures and
+  links objects built by the constructor functions through the guarded
+  constructions, alive until the end. `ts_construct_begin_n` now
+  allocates those instances in the old generation (1.91M pretenured
+  allocations per compile), with a safety valve: a full collection that
+  reclaims more than half of the heap turns pretenuring off for the rest
+  of the run (a program whose constructed objects die young would
+  otherwise fill the old generation with garbage; the compiler's full
+  collections reclaim 3 MB of 17, 55 and 209 MB). Statistics: minors
+  401 -> 325, pauses 384 -> 251 ms, copied 122 -> 65 MB, promoted 125 ->
+  67 MB, forced 359 -> 114 MB; full collections unchanged (3). Gates:
+  unit, GC stress, conformance 453/453, outputs validated. A/B against
+  `x38`, two rounds of three alternating runs: 4.667 vs 4.761 s and
+  4.686 vs 4.751 s median (all six pairs -0.8% to -2.0%); peak RSS 821 ->
+  884 MB (+8%: the old generation's cells are not compacted); Node
+  3.28-3.29 s, so 1.42x Node. Knob `TSAOT_PRETENURE_CTORS=0`. A quick
+  `--noEmit` trial first read 3.68 -> 3.60 s with peak RSS 768 -> 751 MB.
 - Next slices, in order. (0) External element buffers (the malloc'd
   `data` of arrays, also strings' and maps' buffers) do not count toward
   the collector's trigger: a loop that drops large arrays grows without

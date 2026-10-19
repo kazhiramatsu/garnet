@@ -85,6 +85,9 @@
 #   TSAOT_LAZY_FN_VALUES=0  Exporter: create the closure of every nested function
 #                          declaration used as a value at the owner's entry
 #                          instead of on first use (legacy IR).
+#   TSAOT_PRETENURE_CTORS=0 Runtime: allocate the instances of guarded
+#                          constructions young (default: in the old generation,
+#                          with a safety valve after a full collection).
 #   TSAOT_CTOR_CAPACITY=N  Exporter: pre-size guarded constructions to their
 #                          longest producer layout, at most N in-object slots
 #                          (default 0 = off: costs memory, measured no time).

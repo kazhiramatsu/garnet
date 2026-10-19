@@ -33,6 +33,7 @@ static size_t g_young_threshold=65536;
 static size_t g_heap_bytes = 0;
 static size_t g_full_threshold_bytes = (size_t)16u * 1024u * 1024u;
 static int g_full_threshold_forced = 0; /* env override pins the trigger (stress knob) */
+static int g_pretenure_ctors = 1;       /* TSAOT_PRETENURE_CTORS=0: guarded constructions allocate young (docs/pretenured_construction_design.md) */
 static int g_remembered_slots = 1;      /* TSAOT_REMEMBERED_SLOTS=0: whole-cell rescans */
 static int g_empty_class_plain = 1;     /* TSAOT_EMPTY_CLASS_PLAIN=0: field-less class instances stay dictionary cells */
 static int g_negative_pic = 1;          /* TSAOT_NEGATIVE_PIC=0: no absent-property cache entries */
@@ -451,6 +452,8 @@ static void gc_config_init(void){
   /* Full-GC byte threshold override (B-3). Mainly a stress/tuning knob: a tiny
      value forces frequent full collections the way TSAOT_GC_YOUNG_THRESHOLD=1
      forces minors. The retarget rule still applies after each full GC. */
+  const char* pre = getenv("TSAOT_PRETENURE_CTORS");
+  if (pre && pre[0] && strcmp(pre, "0") == 0) g_pretenure_ctors = 0;
   const char* fbytes = getenv("TSAOT_GC_FULL_THRESHOLD_BYTES");
   if (fbytes && fbytes[0]){
     char* end = NULL;
@@ -660,6 +663,9 @@ static inline void gc_before_alloc(void){
       size_t live = g_heap_bytes;
       size_t reclaimed = before > live ? before - live : 0;
       size_t factor = (reclaimed * 4u < before) ? 4u : 2u;
+      /* The safety valve of the pretenured constructions: an old generation
+         that was mostly garbage means the constructed objects die young. */
+      if (reclaimed * 2u > before) g_pretenure_ctors = 0;
       size_t next = live * factor;
       size_t with_headroom = live + TS_GC_MIN_FULL_BYTES;
       if (next < with_headroom) next = with_headroom;
@@ -11950,8 +11956,16 @@ tsv ts_construct_begin_n(tsv ctorv, uint32_t min_slots){
   if (!est) est = 12u;
   if (est < min_slots) est = min_slots;
   if (est > TS_INLINE_SLOTS_MAX) est = TS_INLINE_SLOTS_MAX;
-  tsv inst = ts_new_object_n(est);
-  ((ts_object*)ts_ptr(inst))->proto = ts_is_obj(proto) ? proto : ts_object_proto();
+  /* Instances of guarded constructions go straight to the old generation
+     (docs/pretenured_construction_design.md): the objects ES5-style
+     constructor functions build are a program's long-lived data (the
+     compiler's nodes, symbols and types live to the end), and copying them
+     through the nursery is wasted. A full collection that finds the old
+     generation mostly dead turns this off for the rest of the run. */
+  tsv inst = g_pretenure_ctors ? ts_new_object_n_pretenured(est) : ts_new_object_n(est);
+  ts_object* io = (ts_object*)ts_ptr(inst);
+  io->proto = ts_is_obj(proto) ? proto : ts_object_proto();
+  if (g_pretenure_ctors) ts_write_barrier(inst, io->proto);
   ts_gc_unroot(1);
   return inst;
 }
