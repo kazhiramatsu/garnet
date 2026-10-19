@@ -744,6 +744,7 @@ Compiler A/Bs for the slice (three alternating runs each, outputs validated):
 | `native_s350x11` (dirty slot ranges for remembered objects) | 6.395 s | no measurable change against `x10` (6.397 s in the same quiet session; a run shared with a statistics compile read +1.0% and was discarded); Node 3.222 s; diagnostics zero, outputs validated |
 | `native_s350x12` (constructor layouts behind captured cells) | 6.580 s | 2.1% less than `x11` (6.720 s in the same run; a statistics compile shared one core, Node 3.428 s, all four run pairs favour `x12`); diagnostics zero, outputs validated |
 | `native_s350x13` (field-less class instances as plain objects, `declare` fields) | 6.230 s | 1.4% less than `x12` (6.319 s in the same quiet run, all four pairs agree; a run under the stalled statistics compile read +0.8% and was discarded); Node 3.266 s, native 1.91x; diagnostics zero, outputs validated |
+| `native_s350x14` (absent-property cache) | 6.223 s | 0.9% less than `x13` (6.278 s in the same run, all four pairs agree; a first A/B under the owner's desktop load read 6.359 → 6.373 s); Node 3.354 s; diagnostics zero, outputs validated |
 
 ### Inline-cache path statistics (Session 350, `native_s350s_stats`)
 
@@ -780,4 +781,8 @@ native 1,388 ms against Node 150 ms (9.1x) before the field-less-instance
 change, 914 ms (6.1x) after it. Half of the remaining samples are reads of
 properties the receiver does not have yet (`l.count === undefined`), which
 miss the inline probe and walk every out-of-line step.
+
+Kernel `links_objects` after the absent-property cache: 487 ms against Node
+151 ms (3.2x; 9.1x at the start of the day). Its 39.0M absent reads cost 6
+fills and 39.0M cache hits; `prop_find` calls fell from 117M to 115k.
 

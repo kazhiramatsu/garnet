@@ -35,6 +35,7 @@ static size_t g_full_threshold_bytes = (size_t)16u * 1024u * 1024u;
 static int g_full_threshold_forced = 0; /* env override pins the trigger (stress knob) */
 static int g_remembered_slots = 1;      /* TSAOT_REMEMBERED_SLOTS=0: whole-cell rescans */
 static int g_empty_class_plain = 1;     /* TSAOT_EMPTY_CLASS_PLAIN=0: field-less class instances stay dictionary cells */
+static int g_negative_pic = 1;          /* TSAOT_NEGATIVE_PIC=0: no absent-property cache entries */
 /* TSAOT_GC_ZAP=1 fills dead and moved-from cell bodies with 0xDD during
    collection (Phase C0 groundwork): a stale raw pointer held across a
    safepoint then reads loud garbage (kind 0xDD fails gc_kind_valid, tsv
@@ -143,6 +144,7 @@ static struct {
   unsigned long long remset_slot_writes, remset_full_marks, remset_precise_scans, remset_precise_slots, remset_full_scans, remset_full_slots;
   unsigned long long small_props_fresh, small_props_reused;
   unsigned long long prop_add_hits, prop_add_fills;
+  unsigned long long pic_get_absent, pic_get_inherited, pic_absent_hits;   /* out-of-line reads resolved on the chain / missing / answered by the absent cache */
   unsigned long long nursery_alloc, nursery_chunks, retained_chunks;
   unsigned long long nursery_aged, unpooled_aged;   /* survivors kept YOUNG by aging */
   unsigned long long aging_copied_bytes, aging_died_bytes, aging_promoted_bytes;
@@ -193,6 +195,8 @@ __attribute__((destructor)) static void ts_rt_stats_dump(void){
           g_rt_stats.small_props_fresh, g_rt_stats.small_props_reused);
   fprintf(out, "[rt_stats] prop_add: hits=%llu slow=%llu\n",
           g_rt_stats.prop_add_hits, g_rt_stats.prop_add_fills);
+  fprintf(out, "[rt_stats] pic_ool_get: inherited=%llu absent=%llu absent_cache_hits=%llu\n",
+          g_rt_stats.pic_get_inherited, g_rt_stats.pic_get_absent, g_rt_stats.pic_absent_hits);
   fprintf(out, "[rt_stats] root_frames: frame_push=%llu\n",
           g_ts_frame_push_count);
   for (unsigned k=TS_KIND_OBJECT; k<=TS_KIND_PROXY; k++){
@@ -388,6 +392,8 @@ static void gc_config_init(void){
   if (rslots && rslots[0] && strcmp(rslots, "0") == 0) g_remembered_slots = 0;
   const char* eplain = getenv("TSAOT_EMPTY_CLASS_PLAIN");
   if (eplain && eplain[0] && strcmp(eplain, "0") == 0) g_empty_class_plain = 0;
+  const char* npic = getenv("TSAOT_NEGATIVE_PIC");
+  if (npic && npic[0] && strcmp(npic, "0") == 0) g_negative_pic = 0;
   const char* zap = getenv("TSAOT_GC_ZAP");
   if (zap && zap[0] && strcmp(zap, "0") != 0) g_gc_zap = 1;
 }
@@ -10972,11 +10978,21 @@ static tsv prop_ic_read(tsv receiver, ts_pref p){
   if (ac->g_this){ tsv a0 = receiver; return ts_call(ac->getter, &a0, 1); }
   return ts_call(ac->getter, NULL, 0);
 }
+/* absent-property cache (defined with the addition cache below) */
+static inline int prop_absent_lookup(const ts_prop_ic* ic, ts_object* o, ts_key key);
+static void prop_absent_fill(const ts_prop_ic* ic, ts_object* o, ts_key key);
 tsv ts_get_pic_checked(tsv obj, ts_key key, ts_prop_ic* ic){
   TS_RT_STAT_PIC_OOL();
   if (ts_is_null(obj) || ts_is_undef(obj))
     return ts_throw_cannot_read(obj, ts_field_name(key));
   TS_RT_STAT_PIC_GET_CALL();
+  if (ic && g_negative_pic && TS_TOP16(obj) == TS_SEL_OBJECT){
+    ts_object* o = (ts_object*)ts_ptr(obj);
+    if (o->h.kind == TS_KIND_OBJECT && prop_absent_lookup(ic, o, key)){
+      RT_STAT_INC(pic_absent_hits);
+      return TS_UNDEFINED;
+    }
+  }
   if (ic && ic->megamorphic) return ts_get(obj, key);
   if (TS_TOP16(obj) == TS_SEL_OBJECT){
     ts_object* o = (ts_object*)ts_ptr(obj);
@@ -11000,7 +11016,9 @@ tsv ts_get_pic_checked(tsv obj, ts_key key, ts_prop_ic* ic){
         return prop_ic_read(obj, p);
       }
       tsv inherited;
-      if (lookup_prop_chain(obj, ts_next_proto(o), key, &inherited)) return inherited;
+      if (lookup_prop_chain(obj, ts_next_proto(o), key, &inherited)){ RT_STAT_INC(pic_get_inherited); return inherited; }
+      RT_STAT_INC(pic_get_absent);
+      prop_absent_fill(ic, o, key);
       return TS_UNDEFINED;
     }
   }
@@ -11071,6 +11089,67 @@ static void prop_add_fill(const ts_prop_ic* ic, ts_object* o, ts_key key, ts_pre
   e->site = ic; e->proto = o->proto;
   e->shape_before = shape_before; e->shape_after = o->shape;
   e->key = key; e->slot = len_before; e->epoch = g_prop_add_epoch;
+}
+/* ---- absent-property cache (docs/negative_cache_design.md) ----
+   A read that finds the key nowhere — not an own slot, not a struct field,
+   not on the prototype chain — is the checker's lazy-caching idiom
+   (`if (!links.resolvedType) ...`): 3.6M of the 5.7M out-of-line reads of a
+   compile in Session 350, each walking the own probe, the location table,
+   the class registry, the key scan and the chain. This bounded table
+   remembers, per (site, receiver shape), that the key is absent, together
+   with a by-value snapshot of the prototype chain: the shape of each
+   prototype (at most three, all plain shaped objects) and the chain's end.
+   A hit requires the same site, receiver shape and key, an unchanged epoch,
+   and every link of the snapshot to match on the CURRENT chain: a shape
+   fixes the own keys and attributes of a plain object (an added key, an
+   accessor, a deletion or a frozen attribute changes it), so whichever
+   object now sits at a link, matching shapes mean the key is not there;
+   the end test keeps a grown chain out; and the epoch (a relinked
+   prototype, a defined accessor, a registered class layout, a full
+   collection) covers the rest. No identity is recorded, so moved or
+   recycled cells cannot mislead. Dictionary receivers and sized instances
+   have shape 0 and are never recorded; neither are symbol keys, nor chains
+   through functions (lazy own properties) or proxies. */
+typedef struct {
+  const ts_prop_ic* site;
+  uint32_t shape;
+  ts_key key;
+  uint32_t epoch;
+  uint8_t depth;
+  uint32_t proto_shape[3];
+} ts_prop_absent_entry;
+#define TS_PROP_ABSENT_CACHE_SIZE 8192u
+static ts_prop_absent_entry g_prop_absent_cache[TS_PROP_ABSENT_CACHE_SIZE];
+static inline uint32_t prop_absent_slot(const ts_prop_ic* ic, uint32_t shape){
+  uintptr_t h = (uintptr_t)ic >> 2;
+  h ^= h >> 16;
+  uint32_t x = (uint32_t)h * 2654435761u;
+  x ^= shape * 0x9E3779B1u;
+  x ^= x >> 15;
+  return x & (TS_PROP_ABSENT_CACHE_SIZE - 1u);
+}
+static inline int prop_absent_lookup(const ts_prop_ic* ic, ts_object* o, ts_key key){
+  ts_prop_absent_entry* e = &g_prop_absent_cache[prop_absent_slot(ic, o->shape)];
+  if (e->site != ic || e->shape != o->shape || e->key != key || e->epoch != g_prop_add_epoch) return 0;
+  ts_object* p = o;
+  for (uint8_t i = 0; i < e->depth; i++){
+    p = ts_next_proto(p);
+    if (!p || p->h.kind != TS_KIND_OBJECT || p->shape != e->proto_shape[i]) return 0;
+  }
+  return ts_next_proto(p) == NULL;
+}
+static void prop_absent_fill(const ts_prop_ic* ic, ts_object* o, ts_key key){
+  if (!ic || !g_negative_pic || key >= TS_USERSYM_KEY_BASE) return;
+  if (ts_obj_shape_id(o) == TS_SHAPE_NONE || ts_obj_is_sized(o)) return;
+  uint32_t chain_shape[3]; uint8_t depth = 0;
+  for (ts_object* p = ts_next_proto(o); p; p = ts_next_proto(p)){
+    if (depth == 3) return;
+    if (p->h.kind != TS_KIND_OBJECT || ts_obj_shape_id(p) == TS_SHAPE_NONE) return;
+    chain_shape[depth] = p->shape; depth++;
+  }
+  ts_prop_absent_entry* e = &g_prop_absent_cache[prop_absent_slot(ic, o->shape)];
+  e->site = ic; e->shape = o->shape; e->key = key; e->epoch = g_prop_add_epoch; e->depth = depth;
+  for (uint8_t i = 0; i < depth; i++) e->proto_shape[i] = chain_shape[i];
 }
 /* Object literal / constructor layouts: resolve the site's shape once by
    walking the transitions, then allocate directly in that shape. */

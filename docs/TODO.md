@@ -4911,31 +4911,77 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   the next slice. Compiler A/B against the constructor-layout build,
   alternating three runs, outputs validated, diagnostics zero:
   **6.319 → 6.230 s median wall (1.4% less; every one of the four run pairs favours the new build; a first A/B taken while the stalled statistics compile still held a core read 6.748 → 6.805 s and was discarded once the compile was stopped)**; Node 3.266 s, native 1.91x slower than V8; RSS 1,161 → 1,166 MB (eight in-object slots per `SymbolLinks` instance instead of dictionary entries). The quiet baseline also re-measures the previous slice: `x12` ran at 6.319 s against the 6.395 s of `x11` in its own quiet session, consistent with the 2.1% read under load. Gates: conformance 435/435, parity 341 identical + 90 KNOWN, bundler 42/42, selfconf 421 + 11 KNOWN, GC stress (all phases), inline policy, units (every verdict read from the gate output).
-- Next slices, in order. (1) Absent-property entries in the inline
-  caches (draft design in hand): a read of a property the receiver lacks
-  (`if (!links.resolvedType) ...`, the checker's lazy-caching idiom) still
-  walks the own probe, the location table, the class registry, the key
-  scan and the prototype chain every time; an entry recording the
-  receiver shape and a by-value snapshot of the prototype chain (identity
-  and shape of each prototype, three deep) answers `undefined` without an
-  epoch. (2) Per-site allocation statistics for arrays, literals and class
-  instances (the -O1 statistics compile stalled past 54 CPU minutes and
-  was stopped; a -O0 build of the same generated C is the replacement) to
-  size the arena strategies (155 `FrameArena` arrays, 639 `CallerArena`
-  sites). (3) The generic `new` on a function value (`ts_construct`:
-  prototype materialization, two root pushes, the argument copy,
-  `ts_call` through the forwarder — 15% of the `ctor_functions` kernel's
-  samples, 9% more in the write barrier's handle-table loads) and
-  single-store constructors (`Type`, `Signature`, `NodeLinks`: one
-  `this.flags = flags` before an `if`), which the ≥ 2 keys rule leaves to
-  the addition cache. (4) Sparse element storage; callback specialization;
-  the remaining 2,319 dynamic method sites. (5) Precision for the
-  out-of-line named-property writes of the remembered set (1.87M generic
-  enrollments per compile). (6) The coroutine frame (1.27 KB per generator
-  activation; a promise allocated for every generator), dead capture
-  cells, the nursery sweep's per-cell work (`gc_free_cell_payload` 1.8% of
-  samples) — small. (7) The remaining pattern gaps: links objects 6.1x,
-  small calls with object arguments 4.3x, array callbacks 3.9x, flags
-  3.9x, constructors through function values 2.7x, arrays of objects 2.7x;
-  constructor pre-sizing from layouts; local classes from declared types;
-  C5b-2/3.
+- Per-site allocation statistics (the `x11` IR, one `--noEmit` compile of
+  the statistics binary; the -O1 statistics compile stalled past 54 CPU
+  minutes and was stopped, a -O0 build of the same generated C took one
+  minute). Of the 17.5M allocations at the forty hottest sites, 5.4M are
+  closure environment records allocated at function entry (`cell` sites:
+  `getTypeFactsWorker` 882k, `instantiateTypeWithSingleGenericCallSignature`
+  528k, `getSignaturesOfType` 472k, `hasMatchingRecursionIdentity` 359k,
+  `checkTypeRelatedTo` 275k, `isDeeplyNestedType` 264k, `checkIdentifier`
+  260k, `getNormalizedUnionOrIntersectionType` 256k,
+  `getFlowTypeOfReference` 250k, `narrowTypeByTruthiness` 240k, ...), 2.0M
+  are closures (`checkTypeRelatedTo` creates six per call, five of them
+  heap; `getInstanceType` 250k, `getBaseConstraint` 115k), 1.0M arrays
+  (`addTypeToUnion`'s `typeSet.splice` 352k, `getTypeAtFlowBranchLabel`
+  247k, `map` 146k, `appendIfUnique` 144k — every one `Heap`, they escape)
+  and 0.2M object literals (`createFlowNode` 203k, `Heap`). The record of
+  the hottest functions exists only because a small arrow passed to
+  `some`/`map`/`everyType`/`reduceLeft` captures an immutable parameter
+  (`callerOnlyNeeds`, `identity`, `stack`/`depth`/`maxDepth`, `writing`,
+  `assumeTrue`, `kind`), and it is allocated on every call whether or not
+  the arrow is created. So: arena strategies for arrays and literals are
+  not worth implementing (the hot sites escape); the next structural slice
+  is capture by value for immutable bindings (parameters first: a closure
+  receives the value in its environment instead of a record cell, and a
+  function whose captured bindings are all immutable allocates no record),
+  then stack allocation of callback closures that the callee is known not
+  to retain.
+- Absent-property entries in the inline caches (negative cache,
+  `docs/negative_cache_design.md`). The statistics relink of `x13` counted
+  3.58M reads of a property the receiver does not have among its 5.66M
+  out-of-line reads (63%; the checker's lazy-caching idiom, `if
+  (!links.resolvedType) ...`), each walking the own probe, the location
+  table, the class registry, the key scan and the prototype chain. A
+  bounded table (8,192 entries, like the addition cache) now remembers per
+  (site, receiver shape) that a key is absent, with a by-value snapshot of
+  the prototype chain — the shape of each prototype, three deep, and the
+  chain's end — validated on the current chain at every hit together with
+  the addition-cache epoch; no identity is recorded, so moved, dead or
+  recycled cells cannot mislead it and young prototypes are cached like
+  old ones (a first version that required old prototypes never hit in a
+  program too small to collect). Dictionary receivers, sized instances,
+  symbol keys and chains through functions or proxies are never recorded.
+  `TSAOT_NEGATIVE_PIC=0` (runtime) disables it. Fixture
+  `objects/absent_property_cache` (absent reads repeated at one site while
+  the key is added to the receiver, its prototype and `Object.prototype`
+  and deleted again, an accessor defined, redefined and deleted on the
+  prototype, the receiver and a prototype relinked, a class hierarchy
+  three deep with keys added at every level, mixed prototypes and a
+  dictionary receiver at one site, a frozen prototype, 30k receivers with
+  collections between reads and writes) matches V8 on both runtime paths.
+  Kernel `links_objects`: 914 → 487 ms (Node 151 ms; 6.1x → 3.2x, from
+  9.1x this morning); its 39.0M absent reads now cost 6 fills and 39.0M
+  hits, and its `prop_find` calls fell from 117M to 115k. Compiler A/B
+  against the field-less-instance build, alternating three runs, outputs
+  validated, diagnostics zero: **two A/Bs, the first 6.359 → 6.373 s (no change; the machine carried the owner's other work, Node 3.354 s), the second 6.278 → 6.223 s median wall (0.9% less, every one of the four run pairs favours the cache) — kept on the strength of the counters: the statistics relink answers 2.73M of the 3.58M absent reads from the cache (853k fills), `prop_find` calls fall from 24.9M to 19.0M and class-field cache calls from 9.9M to 7.1M, so the walk is gone and the remaining cost is the out-of-line call itself**. Gates: conformance 436/436, parity 341 identical + 91 KNOWN (the fixture's `delete` of an accessor key surfaces the known fix #6 METHOD-twin difference of the frozen emitter, allowlisted), bundler 42/42, selfconf 422 + 11 KNOWN, GC stress (all phases), inline policy, units (every verdict read from the gate output).
+- Next slices, in order. (1) Capture by value for immutable bindings
+  (design to write): a closure that captures a never-reassigned parameter
+  or constant takes the value in its environment instead of a record cell,
+  and a function whose captured bindings are all immutable allocates no
+  environment record — the hottest allocation sites of the compiler
+  (`getTypeFactsWorker` 882k records per compile, ...); hoisted inner
+  function declarations may capture only parameters by value, since they
+  are created before any body constant is initialized. (2) Stack
+  allocation of callback closures the callee is known not to retain
+  (`some`/`map`/`forEach`/`every` and the checker's own helpers), with
+  the lifetime fixtures the stack-closure slice set out. (3) The generic
+  `new` on a function value (`ts_construct`) and single-store constructors
+  (`Type`, `Signature`, `NodeLinks`). (4) Sparse element storage; the
+  remaining 2,319 dynamic method sites. (5) Precision for the out-of-line
+  named-property writes of the remembered set. (6) The coroutine frame,
+  dead capture cells, the nursery sweep's per-cell work — small. (7) The
+  remaining pattern gaps: small calls with object arguments 4.3x, array
+  callbacks 3.9x, flags 3.9x, links objects 3.2x, constructors through
+  function values 2.7x, arrays of objects 2.7x; constructor pre-sizing
+  from layouts; local classes from declared types; C5b-2/3.
