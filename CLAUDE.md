@@ -90,3 +90,6 @@ Rust in §315; selfhost is kept as a performance metric).
   (outside the model).
 - A monomorphized numeric class field (`x: number`, unboxed double) reads as 0 before its first
   assignment (V8: undefined). Boxed fields and typed cells are initialized to undefined (Session 350).
+- Likewise a `number`-typed parameter that receives no argument (a call or `new` through an `any`
+  cast with fewer arguments) reads as 0 in typed mode (V8: undefined); the direct entry has no
+  representation for a missing number (Session 350 x32 note).

@@ -3939,7 +3939,7 @@ class Exporter {
             ctx.body.push({ kind: "CallBuiltinStatic", dst: ddst, builtin: "reflect.construct", args: [callee, arrL] });
           } else {
             const dargs = this.lowerSequenced(ctx, args);
-            ctx.body.push({ kind: "NewDynamic", dst: ddst, callee, args: dargs });
+            this.emitNewMaybeGuarded(ctx, node, ddst, callee, dargs);
           }
           return ddst;
         }
@@ -3957,7 +3957,7 @@ class Exporter {
         const callee = this.lowerExpr(ctx, node.expression);
         const dargs = this.lowerSequenced(ctx, node.arguments ?? []);
         const ddst = this.newLocal(ctx, "reference", hint);
-        ctx.body.push({ kind: "NewDynamic", dst: ddst, callee, args: dargs });
+        this.emitNewMaybeGuarded(ctx, node, ddst, callee, dargs);
         return ddst;
       }
       // Fallback before loud-reject: the callee may be a constructable VALUE whose
@@ -3974,7 +3974,7 @@ class Exporter {
             const callee = this.lowerExpr(ctx, node.expression);
             const dargs = this.lowerSequenced(ctx, node.arguments ?? []);
             const ddst = this.newLocal(ctx, "reference", hint);
-            ctx.body.push({ kind: "NewDynamic", dst: ddst, callee, args: dargs });
+            this.emitNewMaybeGuarded(ctx, node, ddst, callee, dargs);
             return ddst;
           }
         } catch { /* fall through to loud-reject */ }
@@ -4005,7 +4005,7 @@ class Exporter {
         ctx.body.push({ kind: "CallBuiltinStatic", dst: ddst, builtin: "reflect.construct", args: [callee, arrL] });
       } else {
         const dargs = this.lowerSequenced(ctx, args);
-        ctx.body.push({ kind: "NewDynamic", dst: ddst, callee, args: dargs });
+        this.emitNewMaybeGuarded(ctx, node, ddst, callee, dargs);
       }
       return ddst;
     }
@@ -7267,6 +7267,98 @@ class Exporter {
     return ok && used;
   }
 
+  /** Module-level function declarations with an explicit `this` parameter: the
+   *  ES5 constructor functions a `new` through a function value may reach. */
+  thisParamFnsStamp = -1;
+  thisParamFunctions() {
+    // recomputed whenever functions or their value globals were registered
+    // since the last call (files are scanned and lowered in sequence)
+    const stamp = this.funcSymbols.size * 7919 + this.functionValueGlobal.size;
+    if (!this.thisParamFns || stamp !== this.thisParamFnsStamp) {
+      this.thisParamFnsStamp = stamp;
+      this.thisParamFns = [];
+      for (const [sym] of this.funcSymbols) {
+        const d = sym.valueDeclaration ?? sym.declarations?.[0];
+        if (!d || !ts.isFunctionDeclaration(d) || !d.body || d.parameters.length === 0) continue;
+        const p0 = d.parameters[0];
+        if (!ts.isIdentifier(p0.name) || p0.name.text !== "this" || !p0.type) continue;
+        if (d.asteriskToken || d.modifiers?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword)) continue;
+        if (!this.functionValueGlobal.has(sym)) continue;
+        this.thisParamFns.push({ sym, decl: d, thisType: this.checker.getTypeFromTypeNode(p0.type), nparams: d.parameters.length - 1 });
+      }
+    }
+    return this.thisParamFns;
+  }
+  /** The constructor functions a `new` site may reach, by the callee itself (through
+   *  parentheses and assertions) or by the site's instance type against each
+   *  constructor's `this` type; at most six, the one named like the callee first. */
+  constructorCandidates(node: ts.NewExpression): ts.Symbol[] {
+    if (!this.newGuardsEnabled) return [];
+    const args = node.arguments ?? [];
+    if (args.some((a) => ts.isSpreadElement(a))) return [];
+    let callee: ts.Expression = node.expression;
+    while (ts.isParenthesizedExpression(callee) || ts.isAsExpression(callee) || ts.isTypeAssertionExpression(callee) || ts.isNonNullExpression(callee)) callee = callee.expression;
+    const fns = this.thisParamFunctions();
+    const dbg = process.env.TSAOT_NEW_GUARDS_LOG === "1";
+    if (fns.length === 0) { if (dbg) console.error(`[newguard] no this-param functions yet at ${node.getSourceFile().fileName}:${node.pos}`); return []; }
+    if (ts.isIdentifier(callee)) {
+      const s = this.symbolOf(callee);
+      const direct = s && fns.find((f) => f.sym === s);
+      if (dbg) console.error(`[newguard] callee '${callee.text}' sym=${s?.name} direct=${!!direct} inFuncSymbols=${s ? this.funcSymbols.has(s) : false} hasGlobal=${s ? this.functionValueGlobal.has(s) : false} args=${args.length}`);
+      if (direct) return direct.nparams === args.length ? [direct.sym] : [];
+    }
+    let siteType: ts.Type | undefined;
+    try { siteType = this.checker.getTypeAtLocation(node); } catch { return []; }
+    if (!siteType || (siteType.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.Never))) return [];
+    const assignable = (this.checker as unknown as { isTypeAssignableTo?: (a: ts.Type, b: ts.Type) => boolean }).isTypeAssignableTo;
+    if (!assignable) return [];
+    const out: { sym: ts.Symbol; name: string }[] = [];
+    for (const f of fns) {
+      if (f.nparams !== args.length) continue;
+      let ok = false;
+      try { ok = assignable.call(this.checker, f.thisType, siteType) || assignable.call(this.checker, siteType, f.thisType); } catch { ok = false; }
+      if (ok) out.push({ sym: f.sym, name: f.sym.name });
+      if (out.length >= 6) break;
+    }
+    const calleeName = ts.isIdentifier(callee) ? callee.text : "";
+    out.sort((a, b) => Number(calleeName.startsWith(b.name)) - Number(calleeName.startsWith(a.name)));
+    return out.map((o) => o.sym);
+  }
+  /** `new <value>(args)`: the guard chain over the candidates, else the generic
+   *  construction. Each hit allocates the instance, calls the constructor body
+   *  directly with `this` = instance and applies the object-return rule. */
+  emitNewMaybeGuarded(ctx: FnCtx, node: ts.NewExpression, ddst: number, callee: number, dargs: number[]): void {
+    const cands = this.constructorCandidates(node);
+    const emitChain = (i: number): void => {
+      if (i >= cands.length) { ctx.body.push({ kind: "NewDynamic", dst: ddst, callee, args: dargs }); return; }
+      const sym = cands[i];
+      const fnId = this.funcSymbols.get(sym)!;
+      const gref = this.functionValueGlobal.get(sym)!;
+      const fval = this.newLocal(ctx, "reference", sym.name);
+      ctx.body.push({ kind: "LoadGlobal", dst: fval, gref });
+      const guard = this.newLocal(ctx, "reference", "ctorGuard");
+      ctx.body.push({ kind: "CallBuiltinStatic", dst: guard, builtin: "construct.sameCode", args: [callee, fval] });
+      const thenBody: any[] = [];
+      const elseBody: any[] = [];
+      const saved = ctx.body;
+      ctx.body = thenBody;
+      const inst = this.newLocal(ctx, "reference", "inst");
+      ctx.body.push({ kind: "CallBuiltinStatic", dst: inst, builtin: "construct.begin", args: [callee] });
+      const r = this.newLocal(ctx, "reference", "ctorResult");
+      const cells = this.directCallCellArgs(ctx, fnId);
+      if (cells.length > 0) ctx.body.push({ kind: "Call", dst: r, callee: { kind: "Direct", func: fnId }, args: [...cells, inst, ...dargs] });
+      else ctx.body.push({ kind: "Call", dst: r, recv: inst, callee: { kind: "Direct", func: fnId }, args: dargs });
+      const made = this.newLocal(ctx, "reference", "constructed");
+      ctx.body.push({ kind: "CallBuiltinStatic", dst: made, builtin: "construct.end", args: [callee, inst, r] });
+      ctx.body.push({ kind: "Copy", dst: ddst, src: made });
+      ctx.body = elseBody;
+      emitChain(i + 1);
+      ctx.body = saved;
+      ctx.body.push({ kind: "If", cond: guard, thenBody, elseBody });
+    };
+    emitChain(0);
+  }
+
   /** Counter for specialized-function ids (cloned methods), dense above assigned. */
   specBase = -1;
 
@@ -7288,6 +7380,10 @@ class Exporter {
   cbSpecCount = new Map<number, number>();
   maxCallbackSpecs = 16;
   callbackSpecEnabled = process.env.TSAOT_SPECIALIZE_CALLBACKS !== "0";
+  /** Guarded direct construction (docs/guarded_construction_design.md): off
+   *  under the oracle knob and in untyped mode (the candidates come from types). */
+  newGuardsEnabled = process.env.TSAOT_NEW_GUARDS !== "0" && process.env.TSAOT_UNTYPED !== "1";
+  thisParamFns: { sym: ts.Symbol; decl: ts.FunctionDeclaration; thisType: ts.Type; nparams: number }[] | undefined = undefined;
 
   /** Record the resolved concrete type of each field for one `new C<...>()`. */
   /** Lower a class's field initializers (`class C { a = <expr> }`) as StoreField

@@ -5486,6 +5486,54 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   `resolveNameHelper` 78, `isSimpleTypeRelatedTo` 64, `getObjectFlags`
   63, `getApparentType` 49, `isFreshLiteralType` 41, `getTypeAtFlowNode`
   37; the `binarySearch` clone 30 where `binarySearchKey` alone had 48).
+- Guarded direct construction (build `x32`, full build; exporter,
+  emitter and runtime; whole-program item 2 of
+  `docs/whole_program_facts_design.md`, design in
+  `docs/guarded_construction_design.md`). A `new` through a function
+  value (`new NodeConstructor(kind, pos, end)` in the parser, `new
+  (NodeLinks as any)()`, `new Symbol(flags, name)`, `new Type(checker,
+  flags)`) now carries the constructor functions the exporter predicts
+  from the whole program: the callee naming a function declaration with
+  an explicit `this` parameter, or else the site's instance type matched
+  against the `this` type of every module-level function declaration
+  with an explicit `this` parameter (assignable either way, the same
+  parameter count, at most six candidates, the name-prefix match first).
+  The site tests the value's code pointer against each candidate
+  (`construct.sameCode`: a plain constructable function with that code)
+  and on a hit allocates the instance on the function's prototype with
+  the learned slack (`construct.begin`), calls the body's direct entry
+  with `this` = instance (typed parameters, module cells threaded, the
+  tiny-leaf inliner applies: `NodeLinks` is inlined into `getNodeLinks`)
+  and learns the slack / applies the object-return rule
+  (`construct.end`); every miss falls to `NewDynamic` as before (class
+  values, arrows, rebound variables, the catchable TypeError). The
+  compiler has 53 guards: the 15 parser sites against each of `Node`,
+  `Token` and `Identifier`, `Type` 2, `Symbol` 2, `Signature` 1,
+  `SourceMapSource` 2, `NodeLinks` 1. Knob `TSAOT_NEW_GUARDS=0`
+  (`TSAOT_NEW_GUARDS_LOG=1` lists the sites); untyped mode never guards.
+  Fixture `functions/guarded_construction` (an allowlist row for the
+  pre-existing rooting-count difference against the frozen emitter).
+  Gates: conformance 450/450, selfconf 433+14, GC stress, inline policy,
+  unit, bundler, parity identical=346 DIFF=0 KNOWN=100. Two mistakes
+  worth remembering: the knob first sat on the Rust line of
+  `emitc_diff.sh` (the frozen emitter does not know the three builtins:
+  UNPORTED=9); it belongs on the exporter corpus line. And the first
+  fixture draft left numeric parameters without arguments: a
+  `number`-typed parameter that receives no argument (a call or `new`
+  through an `any` cast with fewer arguments) reads as 0 in typed mode
+  (V8: undefined), on the guarded path, the generic path and plain
+  calls alike; pre-existing, now listed among the known items. A/B
+  against `x31`, two rounds of three alternating runs: 5.434 vs 5.537 s
+  median (pairs +0.5%, -1.9%, -0.5%) and 5.528 vs 5.556 s (pairs -0.3%,
+  -0.5%, -0.8%): five of six pairs favor `x32`, about 0.5-1%; Node 3.29 /
+  3.37 s. Statistics: root pushes 32.66M -> 30.75M per compile (the
+  generic path rooted the arguments), allocations and inline-cache
+  counts identical; the binary grows by 1.1 KB. Kernels:
+  `ctor_functions` 2.95x -> 2.74x, `links_objects` 3.36x -> 3.30x slower
+  than Node. Still open on this path: the guard on a callee that names
+  the function itself (`new (NodeLinks as any)()`) could be dropped when
+  the binding is never assigned, and the body still stores the
+  instance's fields one transition at a time (static slots, item 3).
 - Next slices, in order. (0) External element buffers (the malloc'd
   `data` of arrays, also strings' and maps' buffers) do not count toward
   the collector's trigger: a loop that drops large arrays grows without

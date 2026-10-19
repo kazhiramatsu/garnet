@@ -85,6 +85,10 @@
 #   TSAOT_LAZY_FN_VALUES=0  Exporter: create the closure of every nested function
 #                          declaration used as a value at the owner's entry
 #                          instead of on first use (legacy IR).
+#   TSAOT_NEW_GUARDS=0     Exporter: no guarded direct construction for `new`
+#                          through a function value (default: test the value
+#                          against the constructor functions of the site's type
+#                          and call the body directly on a hit).
 #   TSAOT_SPECIALIZE_CALLBACKS=0  Exporter: do not clone a function per
 #                          module-level function passed as a callback (default:
 #                          clone, binding the parameter to the function).

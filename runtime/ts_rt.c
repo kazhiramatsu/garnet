@@ -11848,6 +11848,36 @@ tsv ts_reflect_apply(tsv fn, tsv thisArg, tsv argsArray){
   return ts_funcproto_apply(a, 3);
 }
 /* Reflect.construct(fn, argsArray) — spread argsArray and run the constructor. */
+/* ---- guarded direct construction (docs/guarded_construction_design.md) ----
+   A `new` through a function value whose target the exporter can predict
+   (a constructor function with a `this` parameter of the site's type) tests
+   the value's code pointer and, on a hit, runs the plain-function
+   construction split in two around a direct call of the constructor body:
+   begin allocates the instance on fn.prototype with the learned slack, end
+   learns the slack and applies the object-return rule. The generic
+   ts_construct stays for every other value. */
+int ts_construct_same_code(tsv ctorv, tsv fval){
+  if (!ts_is_func(ctorv) || !ts_is_func(fval)) return 0;
+  ts_func* c = (ts_func*)ts_ptr(ctorv);
+  return c->code == ((ts_func*)ts_ptr(fval))->code && c->class_id == 0 && c->constructable;
+}
+tsv ts_construct_begin(tsv ctorv){
+  ts_gc_root(&ctorv);
+  fn_materialize_prototype((ts_func*)ts_ptr(ctorv), ctorv);
+  tsv proto = ((ts_func*)ts_ptr(ctorv))->prototype_prop;
+  uint8_t est = ((ts_func*)ts_ptr(ctorv))->inst_slots;
+  tsv inst = ts_new_object_n(est ? est : 12u);
+  ((ts_object*)ts_ptr(inst))->proto = ts_is_obj(proto) ? proto : ts_object_proto();
+  ts_gc_unroot(1);
+  return inst;
+}
+tsv ts_construct_end(tsv ctorv, tsv inst, tsv result){
+  uint32_t used = ((ts_object*)ts_ptr(inst))->len + 4u;
+  if (used > TS_INLINE_SLOTS_MAX) used = TS_INLINE_SLOTS_MAX;
+  ts_func* cf = (ts_func*)ts_ptr(ctorv);
+  if (used > cf->inst_slots) cf->inst_slots = (uint8_t)used;
+  return ts_is_obj(result) ? result : inst;
+}
 tsv ts_reflect_construct(tsv fn, tsv argsArray){
   if (!ts_is_indexed_array_fast(argsArray)) return ts_construct(fn, NULL, 0);
   ts_gc_root(&fn); ts_gc_root(&argsArray);

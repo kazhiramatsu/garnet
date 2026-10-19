@@ -1432,6 +1432,11 @@ void ts_register_class(tsv proto, ts_class_field* fields, int nfields);
 void ts_register_class_meta(uint32_t class_id, size_t size, tsv proto, ts_class_field* fields, int nfields);
 tsv  ts_make_class_value(uint32_t class_id, ts_code ctor, tsv* env, uint32_t envlen);
 tsv  ts_construct(tsv ctorv, tsv* args, int n);
+/* guarded direct construction (ts_rt.c): the predicted constructor's code,
+   the instance before the direct body call, the result after it */
+int ts_construct_same_code(tsv ctorv, tsv fval);
+tsv ts_construct_begin(tsv ctorv);
+tsv ts_construct_end(tsv ctorv, tsv inst, tsv result);
 /* Set a boxed function value's first-class metadata (`fn.length` / `fn.name`). */
 void ts_set_fn_meta(tsv fn, uint32_t arity, const char* name);
 void ts_set_fn_prototype(tsv fn, tsv proto);
