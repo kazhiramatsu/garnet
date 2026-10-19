@@ -4616,23 +4616,62 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   corpus). Compiler A/B against the micro-pattern build, alternating three
   runs, outputs validated, diagnostics zero: **7.395 → 7.242 s median wall (2.1% less)**; the compiler is now 2.23x slower than V8 (Node 3.253 s). IR after
   the change: direct calls 36,843 → 40,621, function-value calls 4,524 → 1,882, dynamic method calls 7,316 → 6,180 (the compiler's output and diagnostics unchanged). Gates: conformance 426/426, parity 334 identical + 88 KNOWN (the parity corpus is exported with `TSAOT_NAMESPACE_DIRECT=0`), bundler 42/42, selfconf 412 + 11 KNOWN, GC stress (all phases), inline policy, units (every verdict read from the gate output).
-- Next slices, in order. (1) Guarded direct calls for methods that are one
-  known closure (`docs/known_method_devirt_design.md`): after the
-  namespace slice the compiler's IR still has 6,180 dynamic method calls,
-  3,879 of them on a key that is stored exactly one closure function
-  program-wide (the node factory's `createIdentifier` 205 sites,
+- Guarded direct calls for methods that are one known closure
+  (`docs/known_method_devirt_design.md`; the third static-information
+  slice). A program pass maps every field key stored only single-definition
+  `AllocClosure` locals of one function to that function (any other store
+  poisons the key); a dynamic method call on such a key keeps its own-property
+  inline-cache lookup, compares the closure's code pointer with the guessed
+  function's generic entry and, on a match, calls the direct entry with the
+  closure's cells (and the receiver as `this` only when the callee reads
+  it); otherwise the prototype lookup, the callable check and
+  `ts_call_method` run as before. The guess is verified at run time, so
+  dynamic stores, `Object.assign`, bound functions, builtins, accessors and
+  Proxies under the key all take the dynamic path. In the compiler this
+  covers the node factory's members (`createIdentifier` 205 sites,
   `createExpressionStatement` 112, `createStringLiteral` 103,
-  `createNodeArray` 91, `cloneNode` 90, ...; 91 callees read `this`); the
-  call site keeps the inline-cache lookup, compares the closure's code
-  pointer with the guessed function and calls its direct entry with the
-  closure's cells. Only 10 function-value calls still load a
-  single-closure field; 680 call a parameter (callbacks inside helpers).
-  (2) Callback specialization for `forEach`/`map`/`filter`/`some`/`every`
-  (706 call sites pass a single-definition closure into a call-only
-  parameter; `some`'s optional predicate needs truthiness uses admitted).
-  (3) The remaining pattern gaps: small calls with object arguments 4.4x
-  (inline-cache probe cost), array callbacks 3.9x, flags 3.9x, arrays of
-  objects 2.75x; constructor pre-sizing from layouts; local classes from
-  declared types; C5b-2/3. Smaller items still open: the minor-collection
-  trigger counts cell bytes only, and closures passed to non-devirtualized
-  callees are never stack-allocated.
+  `createNodeArray` 91, `cloneNode` 90, ...): 3,861 of the 6,180 dynamic method call sites are guarded direct calls in the generated C. Fixture
+  `object_methods/known_method_guard` (two instances with different
+  environments, a member reading `this`, other functions installed under the
+  same keys through computed-key stores, defineProperty, Reflect.set, bind,
+  builtins, a Proxy and an accessor, replacement after the first call, a
+  missing and a non-callable member, call/apply, extra arguments). Writing
+  the fixture surfaced two pre-existing gaps, recorded below.
+  `TSAOT_KNOWN_METHOD=0` keeps dynamic dispatch (parity oracle). Compiler
+  A/B against the namespace build, alternating three runs, outputs
+  validated, diagnostics zero: **7.340 → 7.226 s median wall (1.5% less)**; the compiler is now 2.21x slower than V8 (Node 3.267 s). Gates: conformance 427/427, parity 335 identical + 88 KNOWN, bundler 42/42, selfconf 413 + 11 KNOWN, GC stress (all phases), inline policy, units (every verdict read from the gate output).
+- Pre-existing gaps found by the fixture (not fixed in this slice): a
+  `number`-typed parameter whose argument is omitted through an `any` cast
+  (`(f.make as any)()`) reads as 0 in the direct entry where V8 computes
+  with `undefined` (NaN) — the same class as the monomorphized numeric field
+  reading 0 before its first assignment; and the "is not a function"
+  TypeError names only the member (`make is not a function`) where V8
+  names the receiver expression (`missing.make is not a function`).
+- Profile attribution after the three call slices (sample of `native_s350w`,
+  call-graph edges): the regexp engine's 3.8% is almost entirely
+  `getShebang` — `/^#!.*/.exec(text)` on every source text; the QuickJS
+  bytecode carries the search prefix, so an anchored pattern that fails at
+  position 0 is retried at every position of the file (V8's irregexp
+  analyses the anchor and stops). `simpleNormalizePath`'s unanchored segment
+  test is the next 0.6%. The `memset_pattern16` 1.8% is `ts_array_set`
+  filling holes for sparse writes: the checker's `flowTypeCache[nodeId] =
+  type` after every `flowTypeCache = undefined` reset (per flow-loop
+  antecedent and per cached expression check) re-fills a dense array up to
+  the current node id each time; V8 keeps such arrays in dictionary mode.
+- Next slices, in order. (1) Anchored regexp fast path in the adapter: a
+  pattern that starts with `^`, has no top-level alternation and no `m`
+  flag is compiled sticky (no search prefix), so a failing match costs one
+  attempt. (2) Sparse element storage for arrays written far beyond their
+  length (dictionary mode behind `element_kind`, with every fast path
+  already keyed on `element_kind == 0`), or a cheaper mitigation of the
+  hole fill. (3) Callback specialization for `forEach`/`map`/`filter`/
+  `some`/`every` (706 call sites pass a single-definition closure into a
+  call-only parameter; `some`'s optional predicate needs truthiness uses
+  admitted); the remaining 2,319 dynamic method sites (keys stored several
+  closures: a per-receiver-class guess, or an inline cache of the code
+  pointer). (4) The remaining pattern gaps: small calls with object
+  arguments 4.4x (inline-cache probe cost), array callbacks 3.9x, flags
+  3.9x, arrays of objects 2.75x; constructor pre-sizing from layouts; local
+  classes from declared types; C5b-2/3. Smaller items still open: the
+  minor-collection trigger counts cell bytes only, and closures passed to
+  non-devirtualized callees are never stack-allocated.

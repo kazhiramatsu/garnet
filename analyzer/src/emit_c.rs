@@ -353,6 +353,7 @@ fn emit_program_with_string_plans(
         let _ = writeln!(s, "static tsv {}(tsv* args, int nargs);", cname(f));
     }
     let direct_sigs = direct_entry_sigs(program, &fclass, &param_facts_by_func, &i64_fast);
+    let known_methods = known_method_closures(program);
     for f in &program.functions {
         if let Some(sig) = direct_sigs.get(&f.id.0) {
             let _ = writeln!(s, "static tsv {}_d({});", cname(f), sig.c_params());
@@ -923,6 +924,7 @@ fn emit_program_with_string_plans(
                 &i64_fast,
                 &f64_fast,
                 &direct_sigs,
+                &known_methods,
                 &static_strings,
                 f_string_metrics,
                 f_string_materializations,
@@ -942,6 +944,7 @@ fn emit_program_with_string_plans(
                 &i64_fast,
                 &f64_fast,
                 &direct_sigs,
+                &known_methods,
                 &static_strings,
                 f_string_metrics,
                 f_string_materializations,
@@ -960,6 +963,7 @@ fn emit_program_with_string_plans(
             &i64_fast,
             &f64_fast,
             &direct_sigs,
+            &known_methods,
             &static_strings,
             f_string_metrics,
             f_string_materializations,
@@ -1328,6 +1332,8 @@ struct Ctx<'a> {
     f64_fast: &'a BTreeMap<u32, F64FuncInfo>,
     /// Direct entry signatures of every eligible function (empty when disabled).
     direct_sigs: &'a BTreeMap<u32, DirectSig>,
+    /// method keys stored exactly one closure function program-wide (known_method_closures)
+    known_methods: &'a BTreeMap<u32, u32>,
     typeof_fusion: TypeofFusion,
     /// locals holding one `undefined`/`null`/boolean constant (see tag_consts_for)
     tag_consts: BTreeMap<u32, &'static str>,
@@ -6296,6 +6302,7 @@ fn emit_i64_function(
     i64_fast: &BTreeMap<u32, I64FuncInfo>,
     f64_fast: &BTreeMap<u32, F64FuncInfo>,
     direct_sigs: &BTreeMap<u32, DirectSig>,
+    known_methods: &BTreeMap<u32, u32>,
     static_strings: &BTreeMap<Vec<u16>, usize>,
     string_metric_plan: Option<&FunctionMetricPlan>,
     string_materialization_plan: Option<&FunctionMaterializationPlan>,
@@ -6412,6 +6419,7 @@ fn emit_i64_function(
         i64_fast,
         f64_fast,
         direct_sigs,
+        known_methods,
         typeof_fusion,
         tag_consts: tag_consts_for(f),
         static_strings,
@@ -6460,6 +6468,7 @@ fn emit_f64_function(
     i64_fast: &BTreeMap<u32, I64FuncInfo>,
     f64_fast: &BTreeMap<u32, F64FuncInfo>,
     direct_sigs: &BTreeMap<u32, DirectSig>,
+    known_methods: &BTreeMap<u32, u32>,
     static_strings: &BTreeMap<Vec<u16>, usize>,
     string_metric_plan: Option<&FunctionMetricPlan>,
     string_materialization_plan: Option<&FunctionMaterializationPlan>,
@@ -6577,6 +6586,7 @@ fn emit_f64_function(
         i64_fast,
         f64_fast,
         direct_sigs,
+        known_methods,
         typeof_fusion,
         tag_consts: tag_consts_for(f),
         static_strings,
@@ -6625,6 +6635,7 @@ fn emit_function(
     i64_fast: &BTreeMap<u32, I64FuncInfo>,
     f64_fast: &BTreeMap<u32, F64FuncInfo>,
     direct_sigs: &BTreeMap<u32, DirectSig>,
+    known_methods: &BTreeMap<u32, u32>,
     static_strings: &BTreeMap<Vec<u16>, usize>,
     string_metric_plan: Option<&FunctionMetricPlan>,
     string_materialization_plan: Option<&FunctionMaterializationPlan>,
@@ -6679,6 +6690,7 @@ fn emit_function(
             i64_fast,
             f64_fast,
             direct_sigs,
+            known_methods,
             typeof_fusion: typeof_fusion_plan(f),
             tag_consts: tag_consts_for(f),
             static_strings,
@@ -6729,6 +6741,7 @@ fn emit_function(
             i64_fast,
             f64_fast,
             direct_sigs,
+            known_methods,
             typeof_fusion: typeof_fusion_plan(f),
             tag_consts: tag_consts_for(f),
             static_strings,
@@ -6779,6 +6792,7 @@ fn emit_function(
             i64_fast,
             f64_fast,
             direct_sigs,
+            known_methods,
             typeof_fusion: typeof_fusion_plan(f),
             tag_consts: tag_consts_for(f),
             static_strings,
@@ -6985,6 +6999,7 @@ fn emit_function(
         i64_fast,
         f64_fast,
         direct_sigs,
+        known_methods,
         typeof_fusion,
         tag_consts: tag_consts_for(f),
         static_strings,
@@ -7350,6 +7365,163 @@ fn tag_consts_for(f: &Function) -> BTreeMap<u32, &'static str> {
         }
     }
     out
+}
+
+fn known_method_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_KNOWN_METHOD").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
+/// Field keys under which the program stores exactly one closure function
+/// (every `StoreField` of the key stores a single-definition `AllocClosure`
+/// local of that function), mapped to the function. A guess for the dynamic
+/// method call sites, verified at run time by the closure's code pointer
+/// (see the call emission); any other store poisons the key.
+fn known_method_closures(program: &Program) -> BTreeMap<u32, u32> {
+    let mut out: BTreeMap<u32, u32> = BTreeMap::new();
+    if !known_method_enabled() || !prop_pic_enabled() {
+        return out;
+    }
+    // Some(func): exactly one closure function so far; None: poisoned
+    let mut stored: BTreeMap<u32, Option<u32>> = BTreeMap::new();
+    for f in &program.functions {
+        let mut flat: Vec<&Inst> = Vec::new();
+        flatten_inst(&f.body, &mut flat);
+        let mut ndefs: BTreeMap<u32, u32> = BTreeMap::new();
+        let mut closure_of: BTreeMap<u32, u32> = BTreeMap::new();
+        for inst in &flat {
+            if let Some(d) = inst_def(inst) {
+                *ndefs.entry(d).or_insert(0) += 1;
+            }
+            if let Inst::AllocClosure { dst, func, .. } = inst {
+                closure_of.insert(dst.0, func.0);
+            }
+        }
+        for inst in &flat {
+            if let Inst::StoreField { field, src, .. } = inst {
+                let k = match closure_of.get(&src.0) {
+                    Some(fid) if ndefs.get(&src.0) == Some(&1) => Some(*fid),
+                    _ => None,
+                };
+                match stored.get(&field.0) {
+                    None => {
+                        stored.insert(field.0, k);
+                    }
+                    Some(prev) => {
+                        if *prev != k {
+                            stored.insert(field.0, None);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (field, k) in stored {
+        if let Some(k) = k {
+            out.insert(field, k);
+        }
+    }
+    out
+}
+
+/// A dynamic method call whose key is one known closure program-wide: the
+/// own-property lookup as today, then the guess verified by the closure's
+/// code pointer and taken through the function's direct entry with the
+/// closure's cells; the prototype lookup and `ts_call_method` otherwise.
+/// `argv` is [receiver, args...] (already copied into `_a`). Returns false
+/// when the site is left to the generic emission.
+fn emit_known_method_call(
+    s: &mut String,
+    ctx: &Ctx,
+    method_id: u32,
+    method_field: u32,
+    argv: &[u32],
+    dst: &Option<LocalId>,
+) -> bool {
+    let Some(&k) = ctx.known_methods.get(&method_field) else { return false };
+    let Some(sig) = ctx.direct_sigs.get(&k) else { return false };
+    if argv.is_empty() {
+        return false;
+    }
+    let ncap = callee_capture_count(k);
+    let takes_this = *ctx.fn_takes_this.get(&k).unwrap_or(&false);
+    let lead = ncap + usize::from(takes_this);
+    if sig.kinds.len() < lead || sig.kinds[..lead].iter().any(|kd| !matches!(kd, ParamKind::Boxed)) {
+        return false;
+    }
+    let mut parts: Vec<String> = (0..ncap).map(|i| format!("_kf->env[{}]", i)).collect();
+    if takes_this {
+        parts.push(ctx.val(argv[0]));
+    }
+    for (i, kind) in sig.kinds.iter().enumerate().skip(lead) {
+        let a = argv.get(1 + i - lead);
+        parts.push(match a {
+            Some(a) => match kind {
+                ParamKind::Boxed => ctx.val(*a),
+                ParamKind::F64 => ctx.num(*a),
+                ParamKind::I64 => {
+                    if ctx.int_local.contains(a) {
+                        format!("d{}", a)
+                    } else {
+                        format!("(long long)({})", ctx.num(*a))
+                    }
+                }
+            },
+            None => match kind {
+                ParamKind::Boxed => "TS_UNDEFINED".to_string(),
+                ParamKind::F64 => "0.0".to_string(),
+                ParamKind::I64 => "0".to_string(),
+            },
+        });
+    }
+    let fname = ctx.fn_name_of(k);
+    let _ = writeln!(s, "    ts_check_method_recv(_a[0], {}u);", method_field);
+    s.push_str("    static ts_prop_ic _ts_method_field_ic = TS_PROP_IC_INIT;
+");
+    s.push_str("    static ts_prop_ic _ts_method_proto_ic = TS_PROP_IC_INIT;
+");
+    let _ = writeln!(
+        s,
+        "    tsv _mv = ts_get_pic_checked_inline(_a[0], {}u, &_ts_method_field_ic);",
+        method_field
+    );
+    let _ = writeln!(
+        s,
+        "    if (ts_is_func(_mv) && ((ts_func*)ts_ptr(_mv))->code == (void*){}) {{",
+        fname
+    );
+    s.push_str("      ts_func* _kf = (ts_func*)ts_ptr(_mv); (void)_kf;
+");
+    let direct = format!("{}_d({})", fname, parts.join(", "));
+    match dst {
+        Some(d) => s.push_str(&ctx.set_val(d.0, &direct)),
+        None => {
+            let _ = writeln!(s, "      {};", direct);
+        }
+    }
+    s.push_str("    } else {
+");
+    let _ = writeln!(
+        s,
+        "      if (!ts_is_callable(_mv)) _mv = ts_get_pic_checked_inline(_a[0], {}, &_ts_method_proto_ic);",
+        method_key_str(method_id, ctx.wksym)
+    );
+    let _ = writeln!(s, "      if (!ts_is_callable(_mv)) ts_dynamic_method_missing({}u);", method_field);
+    let generic = format!("ts_call_method(_mv, _a, {})", argv.len());
+    match dst {
+        Some(d) => s.push_str(&ctx.set_val(d.0, &generic)),
+        None => {
+            let _ = writeln!(s, "      {};", generic);
+        }
+    }
+    s.push_str("    }
+");
+    true
 }
 
 fn truthy_unbox_enabled() -> bool {
@@ -18294,6 +18466,17 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             }
             if ncap > 0 {
                 s.push_str("    g_ts_cur_env = _e;\n");
+            }
+            if let CalleeRef::Method {
+                method,
+                method_field: Some(mf),
+                ..
+            } = callee
+            {
+                if recv.is_some() && emit_known_method_call(s, ctx, method.0, mf.0, argv, dst) {
+                    s.push_str("  }\n");
+                    return;
+                }
             }
             let call = match callee {
                 CalleeRef::Direct { func } => {
