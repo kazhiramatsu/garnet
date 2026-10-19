@@ -4741,6 +4741,40 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   arguments escape conservatively, so stack closures need an emitter path
   (a `ts_func` and its environment array on the C stack, initialized like
   `ts_make_closure_t`) and no analysis change.
+- Silent miscompile in scalar replacement (SROA) found while preparing the
+  stack-closure slice: a class instance created inside a loop (or any nested
+  block) and kept in a local declared outside it lost its value — `let a;
+  for (const i of [1, 2]) { a = new C(i); } if (a) ...` took the else branch
+  and `const o = new C(i); a = o;` followed by `a.i` threw "Cannot read
+  properties of undefined". Cause: `find_sroa_targets` scans nested blocks
+  and registered their allocations as candidates of the *enclosing* body,
+  whose `outside` set (locals referenced beyond the body) is empty at the top
+  level, so the allocation and the copies were elided while the read after
+  the loop saw the never-assigned raw local. Fix: a body's candidates are
+  its own allocations (nested blocks are candidates of their own rewrite,
+  with their own `outside` set), and a candidate or alias local referenced
+  outside the body keeps its object — the rule the array SROA already had.
+  Loop-body allocations used only inside the loop are still scalar-replaced.
+  Also, the per-iteration C stack slot of a non-escaping loop-body
+  allocation (`AllocStrategy::Stack` for multiplicity Many) is unsound when
+  a reference outlives the iteration (two outer locals from one site share
+  the slot); such sites now take the frame arena unless `TSAOT_LOOP_STACK=1`
+  (parity oracle). Fixture `classes/sroa_outer_alias` (copies, direct
+  assignments, two outer locals from one site, branches, try bodies, while
+  loops, closures created in a loop, and the still-replaced inner-only and
+  nested-use shapes). Compiler A/B against the array-interface build,
+  alternating three runs, outputs validated, diagnostics zero:
+  **6.609 → 6.593 s median wall (noise level, as expected: 68 loop-body sites moved from the stack slot to the frame arena, two compiler objects stay materialized)**; Node 3.271 s. Gates: conformance 431/431, parity 337 identical + 90 KNOWN (the fixture's permanent frozen-pair difference allowlisted: the frozen twin keeps the old elision), bundler 42/42, selfconf 417 + 11 KNOWN, GC stress (all phases), inline policy, units (the codegen strategy test's two loop-body expectations updated from `Stack` to `FrameArena`; every verdict read from the gate output).
+- Open challenge recorded at Kaz's request (11:50): the soundness check of
+  the escape strategies. The strategies have never been exercised beyond
+  class instances, and the first day of exploiting them found two latent
+  bugs (the loop-slot reuse and the SROA outer alias). Every slice that
+  extends stack or arena allocation to a new kind of value needs fixtures
+  that attack lifetimes (outer locals, loop-created values read after the
+  loop, two outer locals from one site, environments holding young objects
+  across forced collections, try/finally, recursion), the GC stress gate,
+  and ideally a debug mode that poisons stack cells at frame exit so a
+  surviving reference is detected rather than silently read.
 - Next slices, in order. (1) Stack-allocated non-escaping closures (the
   `Stack` strategy), then `FrameArena`/`CallerArena` arrays and literals.
   (2) Sparse element storage for arrays written far beyond their length.

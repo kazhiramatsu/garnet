@@ -37,11 +37,13 @@ fn main() {
     use Multiplicity::*; use AllocKind::*; use EscapeState::*; use AllocStrategy::*;
     let p = prog(vec![
         meta(100, Once, true,  Object),   // no-escape + det + once -> Stack
-        meta(101, Many, true,  Object),   // no-escape + det + many -> Stack (per-iteration C scope)
+        meta(101, Many, true,  Object),   // no-escape + det + many -> FrameArena (a per-iteration
+                                          // C slot is unsound when a reference outlives the
+                                          // iteration; TSAOT_LOOP_STACK=1 restores Stack)
         meta(102, Once, false, Object),   // no-escape + !det      -> FrameArena
         meta(103, Once, true,  Object),   // arg-escape             -> CallerArena
         meta(104, Once, true,  Object),   // global-escape          -> Heap
-        meta(105, Many, true,  Closure),  // no-escape closure loop, det -> Stack (per-iteration)
+        meta(105, Many, true,  Closure),  // no-escape closure loop, det -> FrameArena (same rule)
         // site 106 deliberately has NO meta -> conservative
     ]);
     let r = res(&[
@@ -53,11 +55,11 @@ fn main() {
     let by = |s:u32| d.iter().find(|x| x.site==SiteId(s)).unwrap().strategy;
 
     ck("stack", by(100), Stack);
-    ck("loop-stack (det, per-iteration C scope)", by(101), Stack);
+    ck("loop-body no-escape (det): frame arena, not a per-iteration slot", by(101), FrameArena);
     ck("nondet-arena", by(102), FrameArena);
     ck("arg-caller", by(103), CallerArena);
     ck("global-heap", by(104), Heap);
-    ck("closure-loop-stack (det)", by(105), Stack);
+    ck("closure-loop no-escape (det): frame arena", by(105), FrameArena);
     ck("no-meta-conservative", by(106), FrameArena); // missing meta => not once/det => arena (sound)
 
     // Pretenuring is deliberately narrower than GlobalEscape: only a

@@ -140,15 +140,18 @@ pub fn decide_with_pretenure(
             } else {
                 match se.state {
                     EscapeState::NoEscape => {
-                        if determinable && (once || !contained) {
-                            // NoEscape + determinable -> stack. For loop-body sites
-                            // (multiplicity Many) the C local is emitted inside the
-                            // loop scope — sound ONLY if no reference outlives the
-                            // iteration. A NoEscape value stored into a container
-                            // (contained) can be retained across iterations while
-                            // the C slot is reused, so those must not go to stack
-                            // (s316 silent-miscompile: arr.push(new C()) collapsed
-                            // every element onto one reused stack cell).
+                        if determinable && (once || (loop_stack_sites_enabled() && !contained)) {
+                            // NoEscape + determinable -> stack. A loop-body site
+                            // (multiplicity Many) reuses one C slot per iteration,
+                            // which is sound ONLY if no reference outlives the
+                            // iteration; the analysis bounds containers (s316:
+                            // arr.push(new C()) collapsed every element onto one
+                            // reused stack cell) but not a local declared outside
+                            // the loop (`let a; for (...) { const o = new C(); if
+                            // (...) a = o; }` read `a` after the loop, Session 350),
+                            // so loop-body sites now take the frame arena unless
+                            // TSAOT_LOOP_STACK=1 restores the per-iteration slot
+                            // (parity oracle only).
                             (
                                 AllocStrategy::Stack,
                                 if once {
@@ -252,4 +255,17 @@ pub fn report(program: &Program, result: &EscapeResult) -> DecisionReport {
         sites,
         stats,
     }
+}
+
+/// `TSAOT_LOOP_STACK=1`: the legacy per-iteration stack slot for a
+/// non-escaping loop-body allocation (unsound when a reference outlives the
+/// iteration; kept for the parity oracle).
+fn loop_stack_sites_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("TSAOT_LOOP_STACK").as_deref(),
+            Ok("1") | Ok("true") | Ok("yes") | Ok("on")
+        )
+    })
 }

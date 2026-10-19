@@ -938,6 +938,8 @@ fn find_sroa_targets(
     class_fields: &BTreeMap<u32, Vec<u32>>,
     class_funcs: &BTreeMap<u32, BTreeSet<u32>>,
     bodies: &BTreeMap<u32, Function>,
+    // locals referenced outside THIS body (enclosing scope, sibling branches)
+    outside: &BTreeSet<u32>,
 ) -> BTreeMap<u32, u32> {
     let mut alloc_class: BTreeMap<u32, u32> = BTreeMap::new(); // recv local -> class
     let mut disqualified: BTreeSet<u32> = BTreeSet::new();
@@ -1330,6 +1332,50 @@ fn find_sroa_targets(
         );
     }
 
+    // The scan recurses into nested blocks so their mentions can disqualify
+    // the candidates of THIS body, but an allocation inside a nested block is
+    // a candidate of that block's own rewrite (with the `outside` set of that
+    // block); registering it here let the top-level body scalar-replace a
+    // loop-body allocation whose alias was read after the loop (Session 350).
+    let direct: BTreeSet<u32> = body
+        .iter()
+        .filter_map(|i| match i {
+            Inst::AllocObject {
+                dst,
+                class_id: Some(_),
+                ..
+            } => Some(dst.0),
+            _ => None,
+        })
+        .collect();
+    alloc_class.retain(|r, _| direct.contains(r));
+    // The scan is per body: a receiver or alias local that the enclosing
+    // scope or a sibling branch also references leaves this body
+    // (`let a; for (...) { a = new C(i); } if (a) ...` and `let a; for (...)
+    // { const o = new C(i); a = o; } a.i`, Session 350: the allocation/copy
+    // was elided inside the loop body while the read outside it saw the
+    // never-assigned raw local — undefined, silently falsy). Such locals keep
+    // their object, as the array SROA already does with `outside`.
+    let roots: Vec<u32> = alloc_class.keys().copied().collect();
+    for r in roots {
+        if outside.contains(&r) {
+            disqualified.insert(r);
+        }
+    }
+    let aliases: Vec<u32> = copy_alias.keys().copied().collect();
+    for d in aliases {
+        if outside.contains(&d) {
+            disqualified.insert(d);
+            disqualified.insert(resolve_alias_root(d, &copy_alias));
+        }
+    }
+
+    if std::env::var("TSAOT_SROA_DEBUG").is_ok() {
+        eprintln!(
+            "[sroa] body({} insts) alloc_class={:?} disqualified={:?} copy_alias={:?} outside={:?}",
+            body.len(), alloc_class, disqualified, copy_alias, outside
+        );
+    }
     // a recv survives only if not disqualified, and any copy-alias of it also not disqualified
     alloc_class
         .into_iter()
@@ -1453,7 +1499,7 @@ fn rewrite_body(
     // inside if/ternary/loop bodies; s316 silent-miscompile #2b).
     parent_alias: &BTreeMap<u32, u32>,
 ) -> Vec<Inst> {
-    let targets = find_sroa_targets(body, noescape, class_fields, class_funcs, bodies);
+    let targets = find_sroa_targets(body, noescape, class_fields, class_funcs, bodies, outside);
     // allocate field scalars for each target receiver
     for (&recv, &cls) in &targets {
         let mut fmap = BTreeMap::new();
