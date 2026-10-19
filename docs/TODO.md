@@ -5762,6 +5762,35 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   rooting-count difference against the frozen emitter). Gates: unit,
   parity identical=349 KNOWN=101, selfconf 437+14, bundler, GC stress,
   inline policy, conformance 454/454.
+- Runtime inline caches for hidden fields; `hasOwnProperty.call` (build
+  `x43`, full build; runtime, the RegExp adapter, exporter;
+  `docs/runtime_field_caches_design.md`). The `x41` histogram listed the
+  runtime's own hidden-field reads among the dictionary lookups: the
+  Map/Set iterator's three fields (1.4M per compile), the array
+  iterator's two (0.7M), a generator's `__coro` (0.4M, the key interned
+  by string on each call at three sites), the RegExp internals (1.7M),
+  and `call` 1.2M (`core.ts` binds `const hasOwnProperty =
+  Object.prototype.hasOwnProperty` and calls `.call(map, key)` 600k
+  times, each walking to `Function.prototype`). `ts_get_ic` / `ts_set_ic`
+  (one shape word and slot per runtime call site, filled from the
+  own-property lookup; other receivers take `ts_get` / `ts_set`) now serve
+  those sites; iterator results come from a fixed `{ value, done }` layout
+  (one allocation, no transitions); `hasOwnProperty.call(o, k)` and
+  `Object.prototype.hasOwnProperty.call(o, k)` lower to the own-property
+  builtin, which now throws on a null or undefined receiver as V8 does
+  for all three forms (it returned false silently: fixture
+  `object_methods/hasown_call`). Statistics: `prop_find` 19.6M -> 14.8M
+  calls per compile, `call` gone, `value`/`done` 1.19M -> 0.30M, the Map
+  iterator fields gone, root pushes 30.8M -> 28.5M. Gates all green
+  (parity identical=350, conformance 455/455). A/B against `x42`, two
+  rounds of three alternating runs: 4.595 vs 4.632 s and 4.601 vs 4.641 s
+  median (five of six pairs -0.4% to -1.3%): about -0.8%; Node 3.27-3.29
+  s (1.40x). What remains in the histogram: the `NodeArray` named
+  properties (`pos` 1.2M, `end` 1.1M, `transformFlags` 1.1M,
+  `hasTrailingComma` 0.7M: arrays are allocated as dictionaries, so no
+  cache applies), `next` 0.8M (the iterator protocol's method lookup per
+  step; the spec reads `next` once per loop), `get` 0.45M, `type` 0.42M,
+  `aliasSymbol` 0.41M.
 - Next slices, in order. (0) External element buffers (the malloc'd
   `data` of arrays, also strings' and maps' buffers) do not count toward
   the collector's trigger: a loop that drops large arrays grows without

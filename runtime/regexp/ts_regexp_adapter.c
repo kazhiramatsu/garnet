@@ -722,13 +722,15 @@ static void ts_regexp_adapter_ensure_object_keys(void){
 
 static int ts_regexp_adapter_object_has_prefix(tsv re){
   ts_regexp_adapter_ensure_object_keys();
-  return ts_is_str(ts_get(re, ts_rx_k_prefix));
+  static ts_rt_ic ic_prefix;
+  return ts_is_str(ts_get_ic(re, ts_rx_k_prefix, &ic_prefix));
 }
 
 static int ts_regexp_adapter_object_pattern(tsv re, tsv* out_source, uint32_t* out_flags){
   ts_regexp_adapter_ensure_object_keys();
-  tsv source = ts_get(re, ts_rx_k_source);
-  tsv flags = ts_get(re, ts_rx_k_flags_mask);
+  static ts_rt_ic ic_source, ic_mask;
+  tsv source = ts_get_ic(re, ts_rx_k_source, &ic_source);
+  tsv flags = ts_get_ic(re, ts_rx_k_flags_mask, &ic_mask);
   if (!ts_is_str(source) || !ts_is_num(flags)) return 0;
   double d = ts_to_num(flags);
   if (!(d >= 0.0) || d > 4294967295.0) return 0;
@@ -868,7 +870,8 @@ tsv ts_regexp_adapter_validate_object_tsv(tsv re){
 
 static long long ts_regexp_adapter_last_index_value(tsv re){
   ts_regexp_adapter_ensure_object_keys();
-  double d = ts_number_coerce(ts_get(re, ts_rx_k_last_index));
+  static ts_rt_ic ic_last;
+  double d = ts_number_coerce(ts_get_ic(re, ts_rx_k_last_index, &ic_last));
   if (!(d > 0.0) || !isfinite(d)) return 0;
   if (d > 2147483647.0) return 2147483647LL;
   return (long long)floor(d);
@@ -876,7 +879,8 @@ static long long ts_regexp_adapter_last_index_value(tsv re){
 
 static void ts_regexp_adapter_set_last_index(tsv re, double value){
   ts_regexp_adapter_ensure_object_keys();
-  ts_set(re, ts_rx_k_last_index, ts_num(value));
+  static ts_rt_ic ic_last_set;
+  ts_set_ic(re, ts_rx_k_last_index, ts_num(value), &ic_last_set);
 }
 
 static tsv ts_regexp_adapter_slice(tsv s, uint32_t start, uint32_t end);

@@ -1463,6 +1463,21 @@ class Exporter {
   isObjectProtoToString(e: ts.Expression): boolean {
     return this.objectProtoMethodName(e) === "toString";
   }
+  /** `Object.prototype.hasOwnProperty` itself, or a `const` bound to it
+   *  (`const hasOwnProperty = Object.prototype.hasOwnProperty;`). */
+  isObjectProtoHasOwnValue(e: ts.Expression): boolean {
+    while (ts.isParenthesizedExpression(e)) e = e.expression;
+    if (this.objectProtoMethodName(e) === "hasOwnProperty") return true;
+    if (!ts.isIdentifier(e)) return false;
+    const sym = this.symbolOf(e);
+    const d = sym?.valueDeclaration;
+    if (!d || !ts.isVariableDeclaration(d) || !d.initializer) return false;
+    const list = d.parent;
+    if (!ts.isVariableDeclarationList(list) || !(list.flags & ts.NodeFlags.Const)) return false;
+    let init: ts.Expression = d.initializer;
+    while (ts.isParenthesizedExpression(init)) init = init.expression;
+    return this.objectProtoMethodName(init) === "hasOwnProperty";
+  }
   /** If `e` is the chain `Object.prototype.<m>` for a method we model as a
    *  first-class value, return that name; else undefined. Backs the `objproto.*`
    *  builtin function values (so `const f = Object.prototype.toString; f.call(x)`
@@ -4798,6 +4813,22 @@ class Exporter {
       // Object.prototype.toString applied to thisArg (args[0]; undefined if absent).
       // This yields the internal type tag ("[object Array]" etc.), distinct from
       // thisArg.toString(). toString takes no params, so .apply's array is ignored.
+      // hasOwnProperty.call(o, k) / Object.prototype.hasOwnProperty.call(o, k):
+      // the own-property check itself (the compiler's core.ts binds the method to
+      // a module const and calls it 600k times per compile; the generic path
+      // looked `call` up on Function.prototype every time).
+      if (ts.isPropertyAccessExpression(fnx) && fnx.name.text === "call" && node.arguments.length <= 2 &&
+          !node.arguments.some((a) => ts.isSpreadElement(a)) && this.isObjectProtoHasOwnValue(fnx.expression)) {
+        let recv: number;
+        if (node.arguments.length > 0) recv = this.lowerExpr(ctx, node.arguments[0]);
+        else { recv = this.newLocal(ctx, "reference"); ctx.body.push({ kind: "Const", dst: recv, value: { kind: "Undef" } }); }
+        let key: number;
+        if (node.arguments.length > 1) key = this.lowerExpr(ctx, node.arguments[1]);
+        else { key = this.newLocal(ctx, "reference"); ctx.body.push({ kind: "Const", dst: key, value: { kind: "Undef" } }); }
+        const dst = this.newLocal(ctx, "reference");
+        ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "object.hasOwn", args: [recv, key] });
+        return dst;
+      }
       if (ts.isPropertyAccessExpression(fnx) && (fnx.name.text === "call" || fnx.name.text === "apply") &&
           this.isObjectProtoToString(fnx.expression)) {
         let recv: number;

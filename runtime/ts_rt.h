@@ -1461,6 +1461,13 @@ tsv  ts_construct(tsv ctorv, tsv* args, int n);
 int ts_construct_same_code(tsv ctorv, tsv fval);
 tsv ts_construct_begin(tsv ctorv);
 tsv  ts_construct_begin_n(tsv ctorv, uint32_t min_slots);
+/* Runtime inline caches for the runtime's own reads of hidden fields (the
+   iterator objects' source/position, a generator's `__coro`, a RegExp's
+   internals): one shape word and slot per site, filled from the own-property
+   lookup; any other receiver takes ts_get / ts_set (docs/runtime_field_caches_design.md). */
+typedef struct { uint32_t shape; uint32_t slot; } ts_rt_ic;
+tsv  ts_get_ic(tsv obj, ts_key key, ts_rt_ic* ic);
+void ts_set_ic(tsv obj, ts_key key, tsv v, ts_rt_ic* ic);
 /* Cursor-driven for..of over Map/Set (docs/map_cursor_forof_design.md). */
 double ts_map_cursor_next(tsv coll, double last, double prev);
 double ts_map_cursor_order(tsv coll, double idx);

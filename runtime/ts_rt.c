@@ -1474,6 +1474,10 @@ typedef struct {
 static ts_shape_edge* g_shape_edges = NULL;
 static uint32_t g_shape_edge_cap = 0, g_shape_edge_len = 0;
 static uint32_t g_next_shape = TS_SHAPE_EMPTY + 1u;
+/* The generator objects' coroutine field key, interned once. */
+static uint32_t g_coro_key_cached = 0;
+static uint32_t ts_coro_key(void){ if (!g_coro_key_cached) g_coro_key_cached = ts_intern_field("__coro", 6); return g_coro_key_cached; }
+static tsv ts_iter_result_new(tsv value, int done);   /* defined with the map iterator */
 
 /* Shape descriptors (object_model_v2_design.md, slice A2a): the hidden class
    owns its key sequence and the attribute flags of every property, so the
@@ -3443,9 +3447,10 @@ static void ts_regexp_ensure_keys(void){
 static int ts_regexp_is_fast_obj(tsv re){
   if (!ts_is_propbag(re)) return 0;
   ts_regexp_ensure_keys();
-  return ts_is_str(ts_get(re, g_rx_k_source)) &&
-         ts_is_str(ts_get(re, g_rx_k_flags)) &&
-         (ts_is_str(ts_get(re, g_rx_k_prefix)) || ts_is_num(ts_get(re, g_rx_k_flags_mask)));
+  static ts_rt_ic ic_source, ic_flags, ic_prefix, ic_mask;
+  return ts_is_str(ts_get_ic(re, g_rx_k_source, &ic_source)) &&
+         ts_is_str(ts_get_ic(re, g_rx_k_flags, &ic_flags)) &&
+         (ts_is_str(ts_get_ic(re, g_rx_k_prefix, &ic_prefix)) || ts_is_num(ts_get_ic(re, g_rx_k_flags_mask, &ic_mask)));
 }
 int ts_regexp_is_object(tsv re){
   return ts_regexp_is_fast_obj(re);
@@ -6338,21 +6343,20 @@ static ts_key g_ai_source, g_ai_index, g_ai_next, g_ai_value, g_ai_done;
 static tsv ts_array_iterator_identity(tsv* args, int n){ return n ? args[0] : TS_UNDEFINED; }
 static tsv ts_array_iterator_next(tsv* args, int n){
   tsv iter = n ? args[0] : TS_UNDEFINED; ts_gc_root(&iter);
-  tsv index = ts_get(iter, g_ai_index);
+  static ts_rt_ic ic_index, ic_source;
+  tsv index = ts_get_ic(iter, g_ai_index, &ic_index);
   if (!ts_is_num(index)) ts_throw_type_error_msg("Array iterator next called on incompatible receiver");
-  tsv source = ts_get(iter, g_ai_source); ts_gc_root(&source);
+  tsv source = ts_get_ic(iter, g_ai_source, &ic_source); ts_gc_root(&source);
   double pos = ts_to_num(index);
   int done = !ts_is_array(source) || pos >= ts_array_len(source);
   tsv value = TS_UNDEFINED; ts_gc_root(&value);
-  if (done) ts_set(iter, g_ai_source, TS_UNDEFINED);
+  if (done) ts_set_ic(iter, g_ai_source, TS_UNDEFINED, &ic_source);
   else {
-    ts_set(iter, g_ai_index, ts_num(pos + 1));
+    ts_set_ic(iter, g_ai_index, ts_num(pos + 1), &ic_index);
     value = ts_array_get(source, (uint32_t)pos);
   }
-  tsv result = ts_new_object(); ts_gc_root(&result);
-  ts_set(result, g_ai_value, value);
-  ts_set(result, g_ai_done, ts_bool(done));
-  ts_gc_unroot(4);
+  tsv result = ts_iter_result_new(value, done);
+  ts_gc_unroot(3);
   return result;
 }
 static tsv ts_array_iterator(tsv* args, int n){
@@ -6384,24 +6388,74 @@ static tsv ts_array_iterator(tsv* args, int n){
   ts_gc_unroot(2);
   return iter;
 }
+/* Runtime inline caches (ts_rt.h): a monomorphic shape/slot per call site for
+   the runtime's own hidden-field reads and writes. The shape word carries the
+   integrity bits, so a frozen receiver misses and takes the generic path. */
+tsv ts_get_ic(tsv obj, ts_key key, ts_rt_ic* ic){
+  if (TS_TOP16(obj) == TS_SEL_OBJECT){
+    ts_object* o = (ts_object*)ts_ptr(obj);
+    if (o->h.kind == TS_KIND_OBJECT){
+      if (ic->shape != 0 && o->shape == ic->shape) return *ts_obj_slot_ptr(o, ic->slot);
+      if (obj_shaped(o)){
+        ts_pref p = prop_find(o, key);
+        if (pref_ok(p) && !pref_is_accessor(p)){ ic->shape = o->shape; ic->slot = p.i; return *pref_valp(p); }
+      }
+    }
+  }
+  return ts_get(obj, key);
+}
+void ts_set_ic(tsv obj, ts_key key, tsv v, ts_rt_ic* ic){
+  if (TS_TOP16(obj) == TS_SEL_OBJECT){
+    ts_object* o = (ts_object*)ts_ptr(obj);
+    if (o->h.kind == TS_KIND_OBJECT && !(ts_obj_integrity(o) & 1u)){
+      if (ic->shape != 0 && o->shape == ic->shape){
+        tsv* p = ts_obj_slot_ptr(o, ic->slot); *p = v; ts_write_barrier_ptr(obj, p, v); return;
+      }
+      if (obj_shaped(o)){
+        ts_pref p = prop_find(o, key);
+        if (pref_ok(p) && !pref_is_accessor(p) && pref_is_writable(p)){
+          ic->shape = o->shape; ic->slot = p.i;
+          tsv* vp = pref_valp(p); *vp = v; ts_write_barrier_ptr(obj, vp, v); return;
+        }
+      }
+    }
+  }
+  ts_set(obj, key, v);
+}
+/* An iterator result `{ value, done }` from a fixed layout: one allocation,
+   no transitions; the same shape every time, so the loops' cached reads hit. */
+static ts_key g_iter_result_keys[2];
+static ts_lit_layout g_iter_result_layout = { 0, 2, g_iter_result_keys };
+static tsv ts_iter_result_new(tsv value, int done){
+  if (!g_iter_result_keys[0]){
+    g_iter_result_keys[0] = ts_intern_field("value", 5);
+    g_iter_result_keys[1] = ts_intern_field("done", 4);
+  }
+  ts_gc_root(&value);
+  tsv r = ts_new_object_layout(&g_iter_result_layout);
+  ts_lit_store(r, 0, value);
+  ts_lit_store(r, 1, ts_bool(done));
+  ts_gc_unroot(1);
+  return r;
+}
 static ts_key g_mi_source, g_mi_last, g_mi_kind, g_mi_next, g_mi_value, g_mi_done;
 static tsv ts_map_iterator_identity(tsv* args, int n){ return n ? args[0] : TS_UNDEFINED; }
 static tsv ts_map_iterator_next(tsv* args, int n){
   tsv iter = n ? args[0] : TS_UNDEFINED;
   ts_gc_root(&iter);
-  tsv kindv = ts_get(iter, g_mi_kind);
+  static ts_rt_ic ic_kind, ic_source, ic_last;
+  tsv kindv = ts_get_ic(iter, g_mi_kind, &ic_kind);
   if (!ts_is_num(kindv)) ts_throw_type_error_msg("Collection iterator next called on incompatible receiver");
   int kind = (int)ts_to_num(kindv);
-  tsv source = ts_get(iter, g_mi_source); ts_gc_root(&source);
-  tsv result = ts_new_object(); ts_gc_root(&result);
-  tsv value = TS_UNDEFINED;
+  tsv source = ts_get_ic(iter, g_mi_source, &ic_source); ts_gc_root(&source);
+  tsv value = TS_UNDEFINED; ts_gc_root(&value);
   int done = 1;
   if (ts_is_map(source) || ts_is_set(source)) {
     int is_map = ts_is_map(source);
     uint32_t len = is_map ? ((ts_map*)ts_ptr(source))->len : ((ts_set_t*)ts_ptr(source))->len;
     uint64_t* order = is_map ? ((ts_map*)ts_ptr(source))->iteration_order : ((ts_set_t*)ts_ptr(source))->iteration_order;
     tsv* keys = is_map ? ((ts_map*)ts_ptr(source))->keys : ((ts_set_t*)ts_ptr(source))->elems;
-    double last = ts_number_coerce(ts_get(iter, g_mi_last));
+    double last = ts_number_coerce(ts_get_ic(iter, g_mi_last, &ic_last));
     uint32_t low = 0, high = len;
     // Insertion IDs survive deletion, compaction, clear and reinsertion. Binary
     // search avoids retaining dead iterators or disabling map compaction.
@@ -6414,7 +6468,7 @@ static tsv ts_map_iterator_next(tsv* args, int n){
     if (low < len) {
       done = 0;
       tsv key = keys[low], item = is_map ? ((ts_map*)ts_ptr(source))->vals[low] : key;
-      ts_set(iter, g_mi_last, ts_num((double)order[low]));
+      ts_set_ic(iter, g_mi_last, ts_num((double)order[low]), &ic_last);
       if (kind == 0 || kind == 3) value = key;
       else if (kind == 1) value = item;
       else {
@@ -6425,9 +6479,8 @@ static tsv ts_map_iterator_next(tsv* args, int n){
       }
     }
   }
-  if (done) ts_set(iter, g_mi_source, TS_UNDEFINED);
-  ts_set(result, g_mi_value, value);
-  ts_set(result, g_mi_done, ts_bool(done));
+  if (done) ts_set_ic(iter, g_mi_source, TS_UNDEFINED, &ic_source);
+  tsv result = ts_iter_result_new(value, done);
   ts_gc_unroot(3);
   return result;
 }
@@ -7074,8 +7127,9 @@ double ts_parse_int(tsv v, double radix){
   return out;
 }
 
+static ts_rt_ic g_ic_rx_last_index;
 static long long ts_regexp_last_index_value(tsv re, uint32_t key){
-  double d = ts_number_coerce(ts_get(re, key));
+  double d = ts_number_coerce(key == g_rx_k_last_index ? ts_get_ic(re, key, &g_ic_rx_last_index) : ts_get(re, key));
   if (!(d > 0.0) || !isfinite(d)) return 0;
   if (d > 2147483647.0) return 2147483647LL;
   return (long long)floor(d);
@@ -7104,7 +7158,7 @@ static int ts_regexp_litprefix_exec_obj(tsv re, tsv input, int use_last_index,
     matched = ts_regexp_litprefix_find_view(xs, ps, start, sticky || anchor, &m);
   }
   if (update_last_index && (global || sticky)){
-    ts_set(re, g_rx_k_last_index, ts_num(matched ? (double)m.end : 0.0));
+    ts_set_ic(re, g_rx_k_last_index, ts_num(matched ? (double)m.end : 0.0), &g_ic_rx_last_index);
   }
   if (matched && out) *out = m;
   return matched;
@@ -7202,7 +7256,7 @@ tsv ts_regexp_object_match_fast(tsv re, tsv input){
   tsv flagsv = ts_get(re, g_rx_k_flags_mask);
   uint32_t flags = ts_is_num(flagsv) ? (uint32_t)ts_to_num(flagsv) : 0u;
   int full_unicode = (flags & ((1u << 4) | (1u << 7))) != 0;
-  ts_set(re, g_rx_k_last_index, ts_num(0.0));
+  ts_set_ic(re, g_rx_k_last_index, ts_num(0.0), &g_ic_rx_last_index);
   tsv arr = ts_new_array(0);
   ts_gc_root(&arr);
   uint32_t count = 0;
@@ -7215,11 +7269,11 @@ tsv ts_regexp_object_match_fast(tsv re, tsv input){
     ts_gc_unroot(1);
     count++;
     if (m.end == m.start){
-      ts_set(re, g_rx_k_last_index,
-             ts_num((double)ts_regexp_advance_string_index_fast(input, m.end, full_unicode)));
+      ts_set_ic(re, g_rx_k_last_index,
+             ts_num((double)ts_regexp_advance_string_index_fast(input, m.end, full_unicode)), &g_ic_rx_last_index);
     }
   }
-  ts_set(re, g_rx_k_last_index, ts_num(0.0));
+  ts_set_ic(re, g_rx_k_last_index, ts_num(0.0), &g_ic_rx_last_index);
   tsv result = count ? arr : TS_NULL;
   ts_gc_unroot(3);
   return result;
@@ -10215,9 +10269,8 @@ void ts_array_push_all(tsv dst, tsv src){
        property) so iter stays = src. Then drive .next(): a plain iterator object
        has a callable `next` property; our generator coroutine has no common-header
        property map, so ts_get returns undefined and we fall back to ts_gen_next. */
-    ts_key kdone = ts_intern_field("done", 4);
-    ts_key kvalue = ts_intern_field("value", 5);
-    ts_key knext = ts_intern_field("next", 4);
+    static ts_key kdone, kvalue, knext;
+    if (!knext){ kdone = ts_intern_field("done", 4); kvalue = ts_intern_field("value", 5); knext = ts_intern_field("next", 4); }
     tsv iter = src;
     tsv itf = ts_get(src, TS_KEY_WKSYM(TS_WKSYM_ITERATOR));
     if (itf != TS_UNDEFINED && itf != TS_NULL && !ts_is_callable(itf))
@@ -10268,7 +10321,7 @@ tsv ts_array_from(tsv src){
   } else if (ts_object_like(src)){
     /* Iterator if it is one of our generators (carries a `__coro` frame) or any
        object exposing a callable `.next`; otherwise read positionally (array-like). */
-    tsv coro = ts_get(src, ts_intern_field("__coro", 6));
+    tsv coro = ts_get(src, ts_coro_key());
     tsv nextfn = ts_get(src, ts_intern_field("next", 4));
     tsv itf = ts_get(src, TS_KEY_WKSYM(TS_WKSYM_ITERATOR));
     if (ts_is_obj(coro) || ts_is_func(nextfn) || ts_is_callable(itf)){
@@ -10841,6 +10894,11 @@ int ts_has_own(tsv obj, ts_key key){
   return find_slot(o, key, 0) != NULL;       /* own prop slot (no proto walk) */
 }
 int ts_has_own_dyn(tsv obj, tsv keyv){
+  /* ToObject(this): `o.hasOwnProperty(k)`, `Object.hasOwn(o, k)` and
+     `hasOwnProperty.call(o, k)` all throw on null/undefined (V8: "Cannot
+     convert undefined or null to object"); a silent false would be a
+     miscompile. */
+  if (ts_is_null(obj) || ts_is_undef(obj)) { ts_throw_type_error_msg("Cannot convert undefined or null to object"); return 0; }
   ts_gc_root(&obj);
   ts_key key;
   int ok = ts_key_from_value(keyv, &key);
@@ -12926,7 +12984,7 @@ static int promise_materialize_inputs(tsv input, tsv* array_out, tsv* error_out)
     tsv itf=ts_get_catching(input,TS_KEY_WKSYM(TS_WKSYM_ITERATOR),&threw);
     if (threw){ *error_out=itf; ts_gc_unroot(3); return 0; }
     ts_gc_root(&itf);
-    tsv coro=ts_get_catching(input,ts_intern_field("__coro",6),&threw);
+    tsv coro=ts_get_catching(input,ts_coro_key(),&threw);
     if (threw){ *error_out=coro; ts_gc_unroot(4); return 0; }
     if (ts_is_coro_value(coro)){
       valid=1; /* Garnet generator objects implement @@iterator intrinsically. */
@@ -14307,7 +14365,7 @@ static int ts_headers_init_is_sequence(tsv init){
   if (ts_is_callable(itf)) return 1;
   tsv nextfn = ts_get(init, ts_intern_field("next", 4));
   if (ts_is_callable(nextfn)) return 1;
-  tsv coro = ts_get(init, ts_intern_field("__coro", 6));
+  tsv coro = ts_get(init, ts_coro_key());
   return ts_is_obj(coro);
 }
 
@@ -14481,6 +14539,7 @@ double ts_length(tsv v){
 
 /* ---------------- generators (function* / yield) ---------------- */
 static uint32_t F_coro=0, F_value=0, F_done=0, F_gen_return_tag=0, F_gen_return_value=0;
+static ts_rt_ic g_ic_coro;
 static tsv g_gen_return_tag=TS_UNDEFINED;
 static void ensure_gen_fields(void){
   if (!F_coro){
@@ -14619,7 +14678,7 @@ tsv ts_gen_next(tsv genobj, tsv sent){
   tsv result = ts_new_object();
   ts_gc_root(&result);
   if (!ts_is_obj(genobj)){ ts_set(result, F_value, TS_UNDEFINED); ts_set(result, F_done, ts_bool(1)); ts_gc_unroot(3); return result; }
-  tsv cv = ts_get(genobj, F_coro);
+  tsv cv = ts_get_ic(genobj, F_coro, &g_ic_coro);
   ts_gc_root(&cv);
   if (!ts_is_coro_value(cv)){
     ts_gc_unroot(4);
@@ -14675,7 +14734,7 @@ tsv ts_gen_throw(tsv genobj, tsv exc){
   tsv result = ts_new_object();
   ts_gc_root(&result);
   if (!ts_is_obj(genobj)) ts_throw(exc);
-  tsv cv = ts_get(genobj, F_coro);
+  tsv cv = ts_get_ic(genobj, F_coro, &g_ic_coro);
   ts_gc_root(&cv);
   if (!ts_is_coro_value(cv)){ ts_gc_unroot(4); ts_throw_type_error_msg("Generator.prototype.throw called on incompatible receiver"); }
   ts_coro* c = (ts_coro*)ts_ptr(cv);
@@ -14727,7 +14786,7 @@ tsv ts_gen_return(tsv genobj, tsv val){
   if (!ts_is_obj(genobj)){
     ts_set(result, F_value, val); ts_set(result, F_done, ts_bool(1)); ts_gc_unroot(3); return result;
   }
-  tsv cv = ts_get(genobj, F_coro);
+  tsv cv = ts_get_ic(genobj, F_coro, &g_ic_coro);
   ts_gc_root(&cv);
   if (!ts_is_coro_value(cv)){ ts_gc_unroot(4); ts_throw_type_error_msg("Generator.prototype.return called on incompatible receiver"); }
   ts_coro* c = (ts_coro*)ts_ptr(cv);
@@ -14921,7 +14980,7 @@ static tsv asyncgen_enqueue(tsv genobj, tsv value, int kind){
     ts_gc_unroot(3);
     return p;
   }
-  tsv cv=ts_get(genobj,F_coro); ts_gc_root(&cv);
+  tsv cv=ts_get_ic(genobj, F_coro, &g_ic_coro); ts_gc_root(&cv);
   if (!ts_is_coro_value(cv) || !((ts_coro*)ts_ptr(cv))->is_asyncgen){
     tsv err=promise_resolution_type_error("AsyncGenerator method called on incompatible receiver");
     ts_gc_root(&err);
