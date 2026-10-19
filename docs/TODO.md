@@ -5903,6 +5903,41 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   helpers, the arrays handed to `getUnionType`. The plain fixpoint does not
   converge within 13k solves (the hub summaries accumulate eleven thousand
   stores into captured variables' contents); see the next slice.
+- Summaries for large recursion nests (build `x49`, full build; analyzer;
+  `docs/nest_summaries_design.md`). The checker's nested functions form
+  one recursion nest of 1,640 members (the parser's 242, another of 209)
+  that got no interprocedural summaries at all (`SCC_SUMMARY_MAX_MEMBERS`
+  128), so every argument of every call into the checker escaped
+  globally. The plain fixpoint did not converge in 13k solves and a solve
+  took up to a minute; three changes made it converge: (a) a store into
+  the contents of a parameter (one or more loads deep) is a global escape
+  of the value, instead of the path-keeping `ParamField` bases of `x48`
+  (twelve thousand entries in `getTypeOfNode`'s summary; the emitter does
+  not distinguish ArgEscape from GlobalEscape anyway), with `deep_global`
+  reporting contents two or more deep that reach the sink; (b) nest
+  members take compact summaries (only the edges that touch a parameter;
+  the caller reads the callee's internals as external) and a new
+  `internal_global` flag transmits that a callee's own object is global
+  (the old summaries missed an object handed to an unknown callee);
+  (c) a scope record with more than 64 fields (the checker's 2,251
+  bindings, the parser's, the node factory's, the module record) is an
+  external object. The nest's worklist pops callees first (postorder of
+  the nest's call edges) and a member of a large nest still changing at
+  its sixth solve is widened to the conservative summary (small nests keep
+  the budget rule: widening them demoted the binder's converging
+  `bindEach` callbacks). The 1,640 nest converges in 7,863 solves (18 s;
+  582 widened), analysis of the compiler 8.8 s -> 27 s; the old mode's
+  decision report is byte-identical to `x47`'s (parity). Decision report,
+  count-weighted: closures 220k per compile Heap -> Stack at 37 sites
+  (`mapType` / `filterType` / `getTypeWithFacts` callbacks), none the other
+  way with a nonzero count; scope records NoEscape for 983k allocations
+  per compile (still heap by the cell rule); arrays and literals unchanged.
+  Gates all green. Statistics: closure allocations 1.283M -> 1.062M per
+  compile, all allocations 14.63M -> 14.41M. A/B against `x48`, two rounds of
+  three alternating runs: 4.576 vs 4.532 s, 4.660 vs 4.660 s and (a
+  third round) 4.657 vs 4.651 s median: neutral within the noise (Node
+  3.27-3.34 s, 1.39x), kept for the analysis precision it gives the next
+  slices (records, arrays).
 - Next slices, in order. (0) External element buffers (the malloc'd
   `data` of arrays, also strings' and maps' buffers) do not count toward
   the collector's trigger: a loop that drops large arrays grows without
