@@ -4591,29 +4591,48 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   the slot-first build (the last validated one), alternating three runs,
   outputs validated, diagnostics zero: **7.668 → 7.416 s median wall (3.3% less)**; the compiler is now 2.27x slower than V8 (Node 3.271 s). Gates:
   conformance 425/425, parity 333 identical + 88 KNOWN (the two new fixtures' frozen-pair differences allowlisted: a numeric-inference difference and a FrameArena/Stack annotation), bundler 42/42, selfconf 411 + 11 KNOWN, GC stress (all phases), inline policy, units (every verdict read from the gate output).
-- Next slices, in order. (1) Direct calls to namespace member functions
-  (`docs/namespace_direct_calls_design.md`): the IR of the compiler has
-  4,524 calls through a function value and 7,316 dynamic method calls; the
-  function-value calls resolve statically to closures held in capture cells
-  that are stored exactly one function — the parser's `token` (482 sites),
-  `finishNode` (214), `getNodePos` (176), `parseExpected` (144),
-  `nextToken` (124) — because a function declared inside a value namespace
-  is boxed by `lowerModuleDeclaration` instead of being registered as a
-  known function; the dynamic method calls are led by `Debug.assert` (439),
-  `Debug.checkDefined` (313) and `Debug.fail` (110). Registering namespace
-  members in `funcSymbols` (with value references still capturing the
-  bound closure) turns both into `Direct` calls through the existing
-  module-cell threading. (2) Known-closure call sites in general (the
-  remaining `Value` calls whose callee field holds one closure, guarded by a
-  code-pointer compare, 2,652 sites before (1)), then callback
-  specialization for `forEach`/`map`/`filter`/`some`/`every` (706 call
-  sites pass a single-definition closure into a call-only parameter;
-  `some`'s optional predicate needs truthiness uses admitted). (3) The
-  node factory's `create*` members (object literal of closures, 205 +
-  143 + ... dynamic method sites). (4) The remaining pattern gaps: small
-  calls with object arguments 4.4x (inline-cache probe cost), array
-  callbacks 3.9x, flags 3.9x, arrays of objects 2.75x; constructor
-  pre-sizing from layouts; local classes from declared types; C5b-2/3.
-  Smaller items still open: the minor-collection trigger counts cell bytes
-  only, and closures passed to non-devirtualized callees are never
-  stack-allocated.
+- Direct calls to namespace member functions
+  (`docs/namespace_direct_calls_design.md`; the second static-information
+  slice). A function declared in the block of a value namespace was boxed by
+  `lowerModuleDeclaration` and every call from a sibling member loaded the
+  closure from a capture cell and went through `ts_call_value`: in the
+  compiler's IR, 2,652 of the 4,524 function-value call sites were such
+  calls, led by the parser's `token` (482 sites), `finishNode` (214),
+  `getNodePos` (176), `parseExpected` (144) and `nextToken` (124), and
+  `Debug.assert` (439 sites), `Debug.checkDefined` (313) and `Debug.fail`
+  (110) were dynamic method calls on the namespace object. The exporter now
+  registers such declarations as known functions (`funcSymbols` plus
+  `namespaceFuncSymbols`): calls lower as `Direct` through the existing
+  module-cell threading (the transitive-capture prepass also follows
+  `N.f(...)` targets), a reference other than as a callee still captures the
+  closure value the namespace lowering binds, and `N.f(...)` where `N`
+  resolves to the declaring namespace and `f` does not read `this` is the
+  same direct call (generic members take `specializeGenericCall`). Fixture
+  `namespaces/direct_member_calls` (sibling calls before and after the
+  declaration, recursion, members as values and callbacks, calls through the
+  namespace object from outside, nested and merged namespaces, a member
+  reading a namespace `let` a sibling reassigns, generic members, a member
+  that throws). `TSAOT_NAMESPACE_DIRECT=0` keeps the closure calls (parity
+  corpus). Compiler A/B against the micro-pattern build, alternating three
+  runs, outputs validated, diagnostics zero: **7.395 → 7.242 s median wall (2.1% less)**; the compiler is now 2.23x slower than V8 (Node 3.253 s). IR after
+  the change: direct calls 36,843 → 40,621, function-value calls 4,524 → 1,882, dynamic method calls 7,316 → 6,180 (the compiler's output and diagnostics unchanged). Gates: conformance 426/426, parity 334 identical + 88 KNOWN (the parity corpus is exported with `TSAOT_NAMESPACE_DIRECT=0`), bundler 42/42, selfconf 412 + 11 KNOWN, GC stress (all phases), inline policy, units (every verdict read from the gate output).
+- Next slices, in order. (1) Guarded direct calls for methods that are one
+  known closure (`docs/known_method_devirt_design.md`): after the
+  namespace slice the compiler's IR still has 6,180 dynamic method calls,
+  3,879 of them on a key that is stored exactly one closure function
+  program-wide (the node factory's `createIdentifier` 205 sites,
+  `createExpressionStatement` 112, `createStringLiteral` 103,
+  `createNodeArray` 91, `cloneNode` 90, ...; 91 callees read `this`); the
+  call site keeps the inline-cache lookup, compares the closure's code
+  pointer with the guessed function and calls its direct entry with the
+  closure's cells. Only 10 function-value calls still load a
+  single-closure field; 680 call a parameter (callbacks inside helpers).
+  (2) Callback specialization for `forEach`/`map`/`filter`/`some`/`every`
+  (706 call sites pass a single-definition closure into a call-only
+  parameter; `some`'s optional predicate needs truthiness uses admitted).
+  (3) The remaining pattern gaps: small calls with object arguments 4.4x
+  (inline-cache probe cost), array callbacks 3.9x, flags 3.9x, arrays of
+  objects 2.75x; constructor pre-sizing from layouts; local classes from
+  declared types; C5b-2/3. Smaller items still open: the minor-collection
+  trigger counts cell bytes only, and closures passed to non-devirtualized
+  callees are never stack-allocated.

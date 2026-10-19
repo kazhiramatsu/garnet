@@ -55,6 +55,8 @@
 #                          their closure values instead of directly (legacy IR).
 #   TSAOT_LAZY_FN_DECL=0   Exporter: hoist every function declaration as a
 #                          closure even when it is only ever called directly.
+#   TSAOT_NAMESPACE_DIRECT=0  Exporter: call namespace member functions through
+#                          their closure values instead of directly (legacy IR).
 #   TSAOT_GC_AGE_THRESHOLD=1  Disable the default one-minor aging grace at
 #                          application runtime (immediate first-survival promotion).
 #   TSAOT_GC_AGING_ADAPTIVE=0 Disable runtime survival feedback and use the
@@ -108,6 +110,7 @@ env: TSAOT_CC (default "cc -O2"), TSAOT_ANALYZER=rust|ts|native (default rust),
      out-of-line element reads,
      TSAOT_TYPED_CELLS=0 / TSAOT_CAPTURE_CONTEXTS=0 for the legacy capture IR,
      TSAOT_NESTED_DIRECT=0 / TSAOT_LAZY_FN_DECL=0 for closure-value nested calls,
+     TSAOT_NAMESPACE_DIRECT=0 for closure-value namespace member calls,
      TSAOT_GC_AGE_THRESHOLD=1 for immediate promotion at application runtime,
      TSAOT_GC_AGING_ADAPTIVE=0 for fixed-threshold aging at application runtime,
      TSAOT_USE_MIMALLOC=0 to disable default static mimalloc,

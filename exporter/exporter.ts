@@ -311,6 +311,14 @@ class Exporter {
   /** nested declaration fn ids whose lowering is deferred to the driver */
   pendingNestedFns = new Set<number>();
   nestedDirect = process.env.TSAOT_NESTED_DIRECT !== "0";
+  // Function declarations in the body of a value namespace registered as
+  // direct-call targets (their free variables are module-scope bindings, so
+  // calls thread the module cells like calls to top-level functions). A
+  // reference other than as a callee still captures the closure value that
+  // lowerModuleDeclaration binds. TSAOT_NAMESPACE_DIRECT=0 keeps every call
+  // through the closure value.
+  namespaceFuncSymbols = new Set<ts.Symbol>();
+  namespaceDirect = process.env.TSAOT_NAMESPACE_DIRECT !== "0";
   recordOfOwner = new Map<ts.Node, CaptureRecord>();
   recordOwnerOf = new Map<ts.Symbol, ts.Node>();
   moduleCtxGlobal: number | undefined = undefined;
@@ -1563,10 +1571,13 @@ class Exporter {
         if (!this.fnId.has(n)) this.fnId.set(n, this.fnId.size);
         const nestedDecl = ts.isFunctionDeclaration(n) && n.name && !ts.isSourceFile(n.parent) &&
           this.nestedDirect && this.enclosingFunction(n) !== undefined;
-        if (ts.isFunctionDeclaration(n) && n.name && (ts.isSourceFile(n.parent) || nestedDecl)) {
+        const nsDecl = !nestedDecl && ts.isFunctionDeclaration(n) && n.name &&
+          this.namespaceDirect && this.isValueNamespaceMember(n);
+        if (ts.isFunctionDeclaration(n) && n.name && (ts.isSourceFile(n.parent) || nestedDecl || nsDecl)) {
           const s = this.symbolOf(n.name);
           if (s) this.funcSymbols.set(s, this.fnId.get(n)!);
           if (s && nestedDecl) this.nestedFuncSymbols.add(s);
+          if (s && nsDecl) this.namespaceFuncSymbols.add(s);
           // record explicit `this` parameter — or an ES5 body reading its own
           // `this` (same args[0] slot) — so direct calls prepend a this slot.
           if ((n.parameters.length > 0 && ts.isIdentifier(n.parameters[0].name) &&
@@ -1765,7 +1776,7 @@ class Exporter {
           // not closure cells. Reads/writes lower to globalThis.<name>.
         } else if (s && !decl.has(s) &&
                    (!this.funcSymbols.has(s) ||
-                    (this.nestedFuncSymbols.has(s) &&
+                    ((this.nestedFuncSymbols.has(s) || this.namespaceFuncSymbols.has(s)) &&
                      !(ts.isCallExpression(n.parent) && n.parent.expression === n)))) {
           const owner = this.symbolOwnerFunction(s);
           if (owner && owner !== F) res.add(s); // captured from an outer function (incl. __module_init)
@@ -1794,6 +1805,14 @@ class Exporter {
         const cs = this.symbolOf(n.expression);
         if (cs && this.funcSymbols.has(cs)) {
           const fnode = this.fnNodeById(this.funcSymbols.get(cs)!);
+          if (fnode && fnode !== (F as unknown as ts.Node)) calledFns.push(fnode as unknown as FnLike);
+        }
+      } else if (ts.isCallExpression(n) && ts.isPropertyAccessExpression(n.expression)) {
+        // `N.f(...)` on a value namespace is a direct call to the member (see
+        // namespaceMemberCallTarget): the caller must hold the cells it needs.
+        const target = this.namespaceMemberCallTarget(n.expression);
+        if (target !== undefined) {
+          const fnode = this.fnNodeById(target.fnId);
           if (fnode && fnode !== (F as unknown as ts.Node)) calledFns.push(fnode as unknown as FnLike);
         }
       }
@@ -2664,6 +2683,39 @@ class Exporter {
    *  as opposed to a pure type namespace (`namespace N { export interface I {} }`)
    *  or an ambient `declare namespace` (no member bodies). String-named ambient
    *  modules (`declare module "x" {}`) and dotted `namespace A.B` are excluded. */
+  /** True for a function declaration with a body declared directly in the
+   *  block of a value namespace whose every enclosing namespace is itself a
+   *  value namespace with a block body (the chain lowerModuleDeclaration
+   *  lowers inline into __module_init). */
+  private isValueNamespaceMember(n: ts.FunctionDeclaration): boolean {
+    if (!n.body || !n.name || !ts.isModuleBlock(n.parent)) return false;
+    let m: ts.Node = n.parent.parent;
+    for (;;) {
+      if (!ts.isModuleDeclaration(m) || !ts.isIdentifier(m.name) || !this.isValueNamespace(m)) return false;
+      if (ts.isSourceFile(m.parent)) return true;
+      if (ts.isModuleBlock(m.parent) && ts.isModuleDeclaration(m.parent.parent)) { m = m.parent.parent; continue; }
+      return false;
+    }
+  }
+
+  /** `N.f` where `N` resolves to the value namespace declaring the function
+   *  `f` (a registered namespaceFuncSymbols member that does not read `this`):
+   *  the member's symbol and function id, for a direct call. */
+  private namespaceMemberCallTarget(fn: ts.PropertyAccessExpression): { sym: ts.Symbol; fnId: number } | undefined {
+    if (!this.namespaceDirect || !ts.isIdentifier(fn.expression)) return undefined;
+    const msym = this.symbolOf(fn.name);
+    if (!msym || !this.namespaceFuncSymbols.has(msym)) return undefined;
+    const fid = this.funcSymbols.get(msym);
+    if (fid === undefined || this.funcTakesThisIds.has(fid)) return undefined;
+    const decl = msym.valueDeclaration;
+    if (!decl || !ts.isFunctionDeclaration(decl) || !ts.isModuleBlock(decl.parent) ||
+        !ts.isModuleDeclaration(decl.parent.parent) || !ts.isIdentifier(decl.parent.parent.name)) return undefined;
+    const nsym = this.symbolOf(decl.parent.parent.name);
+    const rsym = this.symbolOf(fn.expression);
+    if (!nsym || !rsym || nsym !== rsym) return undefined;
+    return { sym: msym, fnId: fid };
+  }
+
   private isValueNamespace(stmt: ts.ModuleDeclaration): boolean {
     if (!ts.isIdentifier(stmt.name)) return false;
     if (!stmt.body || !ts.isModuleBlock(stmt.body)) return false;
@@ -4604,7 +4656,16 @@ class Exporter {
       let recv: number | undefined;
       let callee: any = { kind: "Unknown" };
       const fn = node.expression;
-      if (ts.isIdentifier(fn)) {
+      const nsTarget = ts.isPropertyAccessExpression(fn) ? this.namespaceMemberCallTarget(fn) : undefined;
+      if (nsTarget !== undefined) {
+        // `N.f(...)` where `N` names a value namespace and `f` one of its
+        // function declarations: the member is statically known (checked
+        // TypeScript cannot reassign it), so call it directly; the namespace
+        // object is not touched (the member does not read `this`). Generic
+        // members take the same monomorphization as identifier callees.
+        const spec = this.specializeGenericCall(node, nsTarget.sym);
+        callee = { kind: "Direct", func: spec !== undefined ? spec : nsTarget.fnId };
+      } else if (ts.isIdentifier(fn)) {
         const sym = this.symbolOf(fn);
         // A bare identifier is a global built-in callee only if its symbol
         // resolves to the stdlib (lib.*.d.ts) and the user hasn't shadowed it.

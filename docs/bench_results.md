@@ -733,6 +733,7 @@ Compiler A/Bs for the slice (three alternating runs each, outputs validated):
 | `native_s350v` (slot-first inline-cache probe) | **7.591 s** | 4.2% less than `u` (7.925 s in its own session); Node 3.218 s |
 | `native_s350w` (condition temporaries kept raw) | (invalid) | the run recorded as this A/B measured `v` against `u` again (the script's binary paths were not updated); `w` also miscompiled reassigned boolean parameters and reported 1,419 bogus diagnostics on the compiler |
 | `native_s350x2` (condition temporaries fixed + tag compares, inline element reads, raw loop flags) | **7.416 s** | 3.3% less than `v` (7.668 s in the same session); Node 3.271 s; diagnostics zero, outputs validated |
+| `native_s350x3` (direct calls to namespace member functions) | **7.242 s** | 2.1% less than `x2` (7.395 s in the same session); Node 3.253 s; diagnostics zero, outputs validated |
 
 ### Inline-cache path statistics (Session 350, `native_s350s_stats`)
 
