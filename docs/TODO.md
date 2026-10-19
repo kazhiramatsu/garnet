@@ -5270,6 +5270,38 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   minors the rest; a 16 MB nursery reads +0% and 64 MB +1.5% (the earlier
   loaded-machine measurements were noise). Defaults unchanged; the
   remembered-set precision item below is the GC lead.
+- RegExp first-character prefilter
+  (`docs/regexp_first_char_prefilter_design.md`, build `x24`, runtime
+  only: `runtime/regexp/ts_regexp_adapter.c`). The `x22` profile had 75
+  samples under `lre_exec_backtrack`: `toFileNameLowerCase`'s
+  `/[^\u0130\u0131\u00DFa-z0-9\\/:\-_. ]+/g` (36) and
+  `simpleNormalizePath`'s `/\/\/|(?:^|\/)\.\.?(?:$|\/)/` (37), neither
+  with a literal prefix, so the engine's own search ran the backtracker at
+  every input position. The adapter now parses the first term of every
+  alternative (literals, escapes, classes, groups; a quantifier that
+  requires at least one unit) into the set of code units that can start a
+  match (a 256-entry table, a wide bit, a `pos0` bit for `^`), compiles an
+  accepted pattern sticky and tries the engine only at candidate
+  positions; `.`, zero-width assertions, nullable first terms, back
+  references, property escapes, nested classes, the `i`/`m`/`u`/`v`/`y`
+  flags and sets containing a lower-case letter decline and keep the
+  engine's search. Kill switch `TSAOT_REGEXP_PREFILTER=0`;
+  `TSAOT_REGEXP_PREFILTER_LOG=1` prints the decision per pattern (over the
+  compiler: the two hot patterns, `\s+`, `\/\.\//`, `[^\w\s/]`, `[.*?]`
+  and the JSON escape class accepted; anchored, `i`/`m` and `.`-first
+  patterns unchanged). Fixture `regexp/first_char_prefilter` (every
+  accepted and declined form, all entry points, `lastIndex`, UTF-16 input,
+  collection pressure), identical to V8 also under
+  `TSAOT_GC_YOUNG_THRESHOLD=1` and with the kill switch. Kernel
+  `path_regexps` (the two compiler functions over 96 paths, 3,000 rounds):
+  native 844 → 339 ms, Node 112 ms. Compiler A/B against `x23` (relinked:
+  the adapter object only), alternating three runs, outputs validated,
+  diagnostics zero: **5.689 → 5.613 s median wall (−1.3%; the three pairs
+  −2.1%, −1.2%, −2.0%), Node 3.27 s → 1.71x.** Gates: conformance 445/445,
+  parity 344 identical + 97 KNOWN, bundler 42/42, selfconf 428 + 14 KNOWN,
+  GC stress (all phases), inline policy, units. Pitfall recorded in
+  `docs/agent_workflow.md`: the adapter object is cached by presence under
+  `build/`, so it must be deleted after an adapter change.
 - Next slices, in order. (0) External element buffers (the malloc'd
   `data` of arrays, also strings' and maps' buffers) do not count toward
   the collector's trigger: a loop that drops large arrays grows without

@@ -20,6 +20,12 @@ struct ts_regexp_compiled {
      try instead of one per input position, and a start index past 0 is a
      miss without running the engine. */
   uint8_t anchored;
+  /* First-character prefilter (below): the bytecode is compiled sticky and
+     the engine runs only at input positions holding a code unit that can
+     start a match (first_table for units below 256, first_wide for the
+     rest; first_pos0: an alternative anchored with `^`). */
+  uint8_t prefilter, first_wide, first_pos0;
+  uint8_t first_table[256];
 };
 
 typedef struct ts_regexp_cache_entry {
@@ -70,6 +76,248 @@ static int ts_regexp_pattern_anchored(const char* p, uint32_t n){
   return 1;
 }
 
+
+/* ---- first-character prefilter ----
+   For a pattern whose every match must start with a code unit from a small
+   set (no i/m/u/v/y flags), the bytecode is compiled sticky and the adapter
+   tries the engine only at input positions holding such a unit: the
+   checker's `/[^İıßa-z0-9\\/:\-_. ]+/g` over a lower-case
+   path and `/\/\/|(?:^|\/)\.\.?(?:$|\/)/` over a normal path then cost a
+   table scan instead of an engine attempt per position. The set comes from
+   a parse of the first term of every alternative (a literal, an escape, a
+   class, a group recursively); anything else (`.`, a zero-width assertion,
+   a nullable first term, a back reference, a property escape, an unknown
+   construct) disables the prefilter and keeps the engine's own search. A
+   set containing a lower-case letter is not selective on identifiers and
+   paths and is not used either. TSAOT_REGEXP_PREFILTER=0 disables it. */
+typedef struct ts_regexp_firstset {
+  uint8_t table[256];
+  uint8_t wide;
+  uint8_t pos0;
+} ts_regexp_firstset;
+static int g_regexp_prefilter = -1;
+static void fs_add(ts_regexp_firstset* fs, uint32_t cu){ if (cu < 256u) fs->table[cu] = 1; else fs->wide = 1; }
+static void fs_add_range(ts_regexp_firstset* fs, uint32_t lo, uint32_t hi){
+  for (uint32_t c = lo; c <= hi && c < 256u; c++) fs->table[c] = 1;
+  if (hi >= 256u) fs->wide = 1;
+}
+static void fs_add_complement(ts_regexp_firstset* fs, const ts_regexp_firstset* base){
+  for (uint32_t c = 0; c < 256u; c++) if (!base->table[c]) fs->table[c] = 1;
+  fs->wide = 1;
+}
+static int fs_class_escape(char e, ts_regexp_firstset* fs){
+  switch (e){
+    case 'd': fs_add_range(fs, '0', '9'); return 1;
+    case 'w': fs_add_range(fs, 'a', 'z'); fs_add_range(fs, 'A', 'Z'); fs_add_range(fs, '0', '9'); fs_add(fs, '_'); return 1;
+    case 's': fs_add_range(fs, 9, 13); fs_add(fs, 32); fs_add(fs, 0xA0); fs->wide = 1; return 1;
+    case 'D': case 'W': case 'S': {
+      ts_regexp_firstset base; memset(&base, 0, sizeof base);
+      fs_class_escape((char)(e + ('a' - 'A')), &base);
+      fs_add_complement(fs, &base);
+      return 1;
+    }
+    default: return 0;
+  }
+}
+static int fs_decode_utf8(const char* p, uint32_t n, uint32_t* i, uint32_t* cp){
+  unsigned char c = (unsigned char)p[*i];
+  if (c < 0x80u){ *cp = c; (*i)++; return 1; }
+  int extra = c >= 0xF0u ? 3 : c >= 0xE0u ? 2 : c >= 0xC0u ? 1 : -1;
+  if (extra < 0 || *i + (uint32_t)extra >= n) return 0;
+  uint32_t v = c & (0x3Fu >> extra);
+  for (int k = 1; k <= extra; k++){
+    unsigned char d = (unsigned char)p[*i + (uint32_t)k];
+    if ((d & 0xC0u) != 0x80u) return 0;
+    v = (v << 6) | (d & 0x3Fu);
+  }
+  *i += (uint32_t)extra + 1u;
+  *cp = v;
+  return 1;
+}
+static int fs_hex(const char* p, uint32_t n, uint32_t i, uint32_t count, uint32_t* out){
+  uint32_t v = 0;
+  for (uint32_t k = 0; k < count; k++){
+    if (i + k >= n) return 0;
+    char h = p[i + k]; uint32_t d;
+    if (h >= '0' && h <= '9') d = (uint32_t)(h - '0');
+    else if (h >= 'a' && h <= 'f') d = (uint32_t)(h - 'a' + 10);
+    else if (h >= 'A' && h <= 'F') d = (uint32_t)(h - 'A' + 10);
+    else return 0;
+    v = v * 16u + d;
+  }
+  *out = v;
+  return 1;
+}
+/* An escape at p[*i] == '\\': adds its first set; *single receives the code
+   unit of a single-unit escape or UINT32_MAX for a class escape. 0 = bail. */
+static int fs_escape(const char* p, uint32_t n, uint32_t* i, ts_regexp_firstset* fs, int in_class, uint32_t* single){
+  uint32_t j = *i + 1u;
+  if (j >= n) return 0;
+  char e = p[j];
+  uint32_t cu;
+  *single = UINT32_MAX;
+  switch (e){
+    case 'd': case 'D': case 'w': case 'W': case 's': case 'S':
+      fs_class_escape(e, fs); *i = j + 1u; return 1;
+    case 'n': cu = 10; j++; break;
+    case 'r': cu = 13; j++; break;
+    case 't': cu = 9; j++; break;
+    case 'v': cu = 11; j++; break;
+    case 'f': cu = 12; j++; break;
+    case '0': if (j + 1u < n && p[j + 1u] >= '0' && p[j + 1u] <= '9') return 0; cu = 0; j++; break;
+    case 'b': if (!in_class) return 0; cu = 8; j++; break;
+    case 'B': case 'p': case 'P': case 'k': return 0;
+    case 'x': if (!fs_hex(p, n, j + 1u, 2, &cu)) return 0; j += 3u; break;
+    case 'u': if (!fs_hex(p, n, j + 1u, 4, &cu)) return 0; j += 5u; break;
+    case 'c': if (j + 1u >= n) return 0; { char l = p[j + 1u]; if (!((l >= 'a' && l <= 'z') || (l >= 'A' && l <= 'Z'))) return 0; cu = (uint32_t)l & 31u; } j += 2u; break;
+    default:
+      if (e >= '1' && e <= '9') return 0;   /* back reference or legacy octal */
+      if (!fs_decode_utf8(p, n, &j, &cu)) return 0;   /* identity escape */
+      break;
+  }
+  fs_add(fs, cu);
+  *single = cu;
+  *i = j;
+  return 1;
+}
+static int fs_class(const char* p, uint32_t n, uint32_t* i, ts_regexp_firstset* fs){
+  uint32_t j = *i + 1u;
+  int negated = 0;
+  if (j < n && p[j] == '^'){ negated = 1; j++; }
+  ts_regexp_firstset cs; memset(&cs, 0, sizeof cs);
+  while (j < n && p[j] != ']'){
+    uint32_t lo;
+    if (p[j] == '\\'){
+      if (!fs_escape(p, n, &j, &cs, 1, &lo)) return 0;
+      if (lo == UINT32_MAX) continue;   /* a class escape: no range */
+    } else if (p[j] == '['){
+      return 0;   /* nested class (v flag) */
+    } else if (!fs_decode_utf8(p, n, &j, &lo)) return 0;
+    if (j + 1u < n && p[j] == '-' && p[j + 1u] != ']'){
+      uint32_t hi;
+      j++;
+      if (p[j] == '\\'){
+        if (!fs_escape(p, n, &j, &cs, 1, &hi)) return 0;
+        if (hi == UINT32_MAX) return 0;
+      } else if (p[j] == '['){
+        return 0;
+      } else if (!fs_decode_utf8(p, n, &j, &hi)) return 0;
+      if (lo > hi) return 0;
+      fs_add_range(&cs, lo, hi);
+    } else {
+      fs_add(&cs, lo);
+    }
+  }
+  if (j >= n) return 0;
+  *i = j + 1u;
+  if (negated) fs_add_complement(fs, &cs);
+  else { for (uint32_t c = 0; c < 256u; c++) if (cs.table[c]) fs->table[c] = 1; if (cs.wide) fs->wide = 1; }
+  return 1;
+}
+static int fs_alternation(const char* p, uint32_t n, uint32_t* i, int depth, ts_regexp_firstset* fs);
+/* The first term of an alternative at p[*i] and its quantifier. 0 = bail. */
+static int fs_term(const char* p, uint32_t n, uint32_t* i, int depth, ts_regexp_firstset* fs){
+  uint32_t j = *i;
+  if (j >= n) return 0;
+  char c = p[j];
+  switch (c){
+    case '^': fs->pos0 = 1; *i = j + 1u; return 1;   /* anchored alternative: position 0 only */
+    case '$': case '.': case '|': case ')': case '*': case '+': case '?': case '{': case '}': case ']':
+      return 0;
+    case '(':
+      j++;
+      if (j < n && p[j] == '?'){
+        if (j + 1u < n && p[j + 1u] == ':') j += 2u;
+        else if (j + 2u < n && p[j + 1u] == '<' && p[j + 2u] != '=' && p[j + 2u] != '!'){
+          while (j < n && p[j] != '>') j++;
+          if (j >= n) return 0;
+          j++;
+        } else return 0;   /* lookaround, modifiers */
+      }
+      if (!fs_alternation(p, n, &j, depth + 1, fs)) return 0;
+      if (j >= n || p[j] != ')') return 0;
+      j++;
+      break;
+    case '[':
+      if (!fs_class(p, n, &j, fs)) return 0;
+      break;
+    case '\\': {
+      uint32_t single;
+      if (!fs_escape(p, n, &j, fs, 0, &single)) return 0;
+      break;
+    }
+    default: {
+      uint32_t cp;
+      if (!fs_decode_utf8(p, n, &j, &cp)) return 0;
+      fs_add(fs, cp);
+      break;
+    }
+  }
+  /* the quantifier: the first term must match at least one unit */
+  if (j < n){
+    if (p[j] == '*' || p[j] == '?') return 0;
+    if (p[j] == '+'){ j++; if (j < n && p[j] == '?') j++; }
+    else if (p[j] == '{'){
+      uint32_t k = j + 1u, min = 0; int digits = 0;
+      while (k < n && p[k] >= '0' && p[k] <= '9'){ min = min * 10u + (uint32_t)(p[k] - '0'); k++; digits++; if (min > 1000000u) return 0; }
+      if (!digits) return 0;
+      if (k < n && p[k] == ','){ k++; while (k < n && p[k] >= '0' && p[k] <= '9') k++; }
+      if (k >= n || p[k] != '}') return 0;
+      if (min == 0) return 0;
+      j = k + 1u;
+      if (j < n && p[j] == '?') j++;
+    }
+  }
+  *i = j;
+  return 1;
+}
+static int fs_alternation(const char* p, uint32_t n, uint32_t* i, int depth, ts_regexp_firstset* fs){
+  uint32_t j = *i;
+  for (;;){
+    if (!fs_term(p, n, &j, depth, fs)) return 0;
+    int d = 0, in_class = 0;
+    for (; j < n; j++){
+      char c = p[j];
+      if (c == '\\'){ j++; continue; }
+      if (in_class){ if (c == ']') in_class = 0; continue; }
+      if (c == '['){ in_class = 1; continue; }
+      if (c == '(') d++;
+      else if (c == ')'){ if (d == 0) break; d--; }
+      else if (c == '|' && d == 0) break;
+    }
+    if (j >= n){ if (depth) return 0; *i = j; return 1; }
+    if (p[j] == ')'){ if (!depth) return 0; *i = j; return 1; }
+    j++;   /* '|' */
+    if (j >= n) return 0;   /* a trailing empty alternative matches the empty string */
+  }
+}
+static int fs_analyze(const char* p, uint32_t n, ts_regexp_firstset* fs){
+  memset(fs, 0, sizeof *fs);
+  uint32_t i = 0;
+  if (n == 0 || !fs_alternation(p, n, &i, 0, fs)) return 0;
+  if (i != n) return 0;
+  for (uint32_t c = 'a'; c <= 'z'; c++) if (fs->table[c]) return 0;   /* not selective on identifiers and paths */
+  return 1;
+}
+static int fs_enabled(void){
+  if (g_regexp_prefilter < 0){
+    const char* e = getenv("TSAOT_REGEXP_PREFILTER");
+    g_regexp_prefilter = !(e && e[0] && strcmp(e, "0") == 0);
+  }
+  return g_regexp_prefilter;
+}
+/* the next input position at or after pos whose unit may start a match, or input_len */
+static uint32_t fs_next(const ts_regexp_compiled* re, const uint8_t* input, uint32_t input_len, uint32_t pos, int cbuf_type){
+  const uint8_t* t = re->first_table;
+  if (cbuf_type == 0){
+    for (; pos < input_len; pos++) if (t[input[pos]]) return pos;
+  } else {
+    const uint16_t* u = (const uint16_t*)input;
+    for (; pos < input_len; pos++){ uint16_t cu = u[pos]; if (cu < 256u ? t[cu] : re->first_wide) return pos; }
+  }
+  return input_len;
+}
+
 #ifdef TSAOT_HAS_QUICKJS_REGEXP
 static int ts_regexp_to_lre_flags(uint32_t flags){
   int out = 0;
@@ -94,11 +342,17 @@ ts_regexp_compiled* ts_regexp_compile_utf8(const char* pattern,
   char err[128];
   int bc_len = 0;
   int lre_flags = ts_regexp_to_lre_flags(flags);
-  int anchored = 0;
+  int anchored = 0, prefilter = 0;
+  ts_regexp_firstset fs;
   if (!(flags & (TSAOT_REGEXP_FLAG_MULTILINE | TSAOT_REGEXP_FLAG_STICKY)) &&
       ts_regexp_pattern_anchored(pattern, pattern_len)){
     anchored = 1;
     lre_flags |= LRE_FLAG_STICKY;   /* no search prefix: one attempt at the start index */
+  } else if (!(flags & (TSAOT_REGEXP_FLAG_MULTILINE | TSAOT_REGEXP_FLAG_STICKY | TSAOT_REGEXP_FLAG_IGNORECASE |
+                        TSAOT_REGEXP_FLAG_UNICODE | TSAOT_REGEXP_FLAG_UNICODE_SETS)) &&
+             fs_enabled() && fs_analyze(pattern, pattern_len, &fs)){
+    prefilter = 1;
+    lre_flags |= LRE_FLAG_STICKY;   /* the adapter searches: one engine attempt per candidate position */
   }
   uint8_t* bc = lre_compile(&bc_len, err, sizeof(err), pattern, pattern_len,
                             lre_flags, NULL);
@@ -117,6 +371,17 @@ ts_regexp_compiled* ts_regexp_compile_utf8(const char* pattern,
   re->capture_count = (uint32_t)lre_get_capture_count(bc);
   re->flags = flags;
   re->anchored = (uint8_t)anchored;
+  re->prefilter = (uint8_t)prefilter;
+  re->first_wide = prefilter ? fs.wide : 0;
+  re->first_pos0 = prefilter ? fs.pos0 : 0;
+  if (prefilter) memcpy(re->first_table, fs.table, sizeof re->first_table);
+  else memset(re->first_table, 0, sizeof re->first_table);
+  if (getenv("TSAOT_REGEXP_PREFILTER_LOG")){   /* verification aid: one line per compiled pattern */
+    int units = 0;
+    for (int k = 0; k < 256; k++) units += re->first_table[k];
+    fprintf(stderr, "[regexp] /%.*s/ flags=%u %s%s units=%d wide=%d pos0=%d\n", (int)pattern_len, pattern, flags,
+            anchored ? "anchored" : prefilter ? "prefilter" : "engine-search", "", units, re->first_wide, re->first_pos0);
+  }
   ts_regexp_error(error_msg, error_msg_len, "");
   return re;
 #else
@@ -173,8 +438,25 @@ static int ts_regexp_exec_impl(ts_regexp_compiled* re,
   uint32_t ncap = re->capture_count;
   uint8_t** raw = calloc((size_t)ncap * 2u, sizeof(uint8_t*));
   if (!raw) return TSAOT_REGEXP_ERR_NOMEM;
-  int ret = lre_exec(raw, re->bytecode, input, (int)start_index, (int)input_len,
-                     cbuf_type, NULL);
+  int ret;
+  if (re->prefilter){
+    /* sticky bytecode: one engine attempt per candidate position */
+    uint32_t pos = start_index;
+    ret = 0;
+    if (re->first_pos0 && pos == 0){
+      ret = lre_exec(raw, re->bytecode, input, 0, (int)input_len, cbuf_type, NULL);
+      pos = 1;
+    }
+    while (ret == 0){
+      pos = fs_next(re, input, input_len, pos, cbuf_type);
+      if (pos >= input_len) break;
+      ret = lre_exec(raw, re->bytecode, input, (int)pos, (int)input_len, cbuf_type, NULL);
+      pos++;
+    }
+  } else {
+    ret = lre_exec(raw, re->bytecode, input, (int)start_index, (int)input_len,
+                   cbuf_type, NULL);
+  }
   if (ret != 1){
     free(raw);
     return ret == 0 ? TSAOT_REGEXP_NOMATCH : TSAOT_REGEXP_ERR_EXEC;

@@ -253,3 +253,13 @@ When an exporter/analyzer change produces a new IR/optimization pattern, **the f
 4. Add a regression test to `tests/conformance/exhaustive/…`.
 5. Depending on the kind of change, run `scripts/gate.sh conf all` + unit (+ gc / bundler / selfconf / emitc_diff).
 6. Append a session note to the end of `docs/TODO.md`. Commit on the user's instruction (English, with a `Verified:` line).
+
+### Gotcha: the regexp adapter object is cached by presence, not by mtime
+
+`tsaot_prepare_regexp_objs` (`scripts/lib/regexp_link_flags.sh`) compiles
+`runtime/regexp/ts_regexp_adapter.c` into `$work/regexp/ts_regexp_adapter.o`
+only when that file is missing. After editing the adapter, delete the cached
+objects (`find build -name ts_regexp_adapter.o -not -path '*/native_s350*'
+-delete`) before `dt`, the conformance gate or a relink, or the old adapter
+is linked silently. A relink that copies a previous build's `regexp/`
+directory needs the same deletion (see `docs/regexp_first_char_prefilter_design.md`).
