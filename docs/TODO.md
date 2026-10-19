@@ -5369,6 +5369,20 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   units. Not done: performing the cached addition in line at the store
   site (the call and `props_append` remain); it adds code to all 45,578
   store sites, so it is a separate experiment with its own A/B.
+- Cached additions performed in line at the store site — tried, not
+  adopted (build `x27`, not committed). The follow-up of the per-site
+  entry: `ts_set_pic_inline` / `_lazy` tested the site's addition entry
+  after the existing-slot probe and appended in line when the receiver
+  had room (growth stayed out of line). The mechanism worked (out-of-line
+  stores 10.1M → 3.79M per compile; 6.3M additions in line), but the
+  binary grew 55.9 → 58.1 MB (the sequence at all 45,578 store sites) and
+  the compiler A/B against `x26`, alternating three runs, read 5.540 →
+  5.553 s median wall (+0.2%; the pairs +2.8%, +0.2%, −0.5%): the
+  instruction-cache cost of the inline sequence ate the saved calls, as
+  with the tiny-leaf inlining of `x21`. Reverted; the per-site entry in
+  `ts_set_pic` (`x26`) stays. A narrower variant (only the stores of
+  constructor bodies, chosen by the exporter) would need an emitter knob
+  and its own A/B.
 - Next slices, in order. (0) External element buffers (the malloc'd
   `data` of arrays, also strings' and maps' buffers) do not count toward
   the collector's trigger: a loop that drops large arrays grows without
