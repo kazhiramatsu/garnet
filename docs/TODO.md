@@ -4679,20 +4679,51 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   `ts_number_coerce` became inline (a link error on the first regexp
   fixture); the handbook now says to clear `build/regexp` and
   `build/quickjs` after runtime edits.
-- Next slices, in order. (1) Re-profile `native_s350x5`: the earlier
-  attribution also showed the regexp input being copied per call
-  (`ts_regexp_view_to_utf16` builds a UTF-16 copy of a UTF-16-flagged input
-  for every exec; `memmove`/`memcpy` under `getShebang`), which the anchored
-  path does not remove. (2) Sparse element storage for arrays written far
-  beyond their length (dictionary mode behind `element_kind`), or a cheaper
-  mitigation of the hole fill (`flowTypeCache[nodeId]` after each reset).
-  (3) Callback specialization for `forEach`/`map`/`filter`/`some`/`every`
-  and the other call-only parameters (`binarySearchKey`'s key selector and
-  comparer, `findAncestor`'s callback are the remaining `ts_call` hot spots);
-  the remaining 2,319 dynamic method sites. (4) The remaining pattern gaps:
-  small calls with object arguments 4.4x (inline-cache probe cost), array
-  callbacks 3.9x, flags 3.9x, arrays of objects 2.75x; constructor
-  pre-sizing from layouts; local classes from declared types; C5b-2/3.
-  Smaller items still open: the minor-collection trigger counts cell bytes
-  only, and closures passed to non-devirtualized callees are never
-  stack-allocated.
+- Typed direct-entry returns (`docs/typed_returns_design.md`; the fourth
+  static-information slice). A direct entry always returned a boxed `tsv`,
+  so every call to a number- or boolean-returning function boxed the result
+  and the caller unboxed it, and a returned comparison was boxed inside the
+  callee. Each direct signature now carries a return kind decided from the
+  body's classification: F64/I64 when every `return` carries a raw numeric
+  local, Bool when every `return` carries a boolean produced in place
+  (comparison, `!`, constant, a call to another raw-boolean entry, or a copy
+  of such a local, used only by returns and conditions), boxed otherwise
+  (valueless returns, `undefined`, parameters, mixed kinds). The Bool set is
+  iterated to a fixpoint over the program; the body emitter admits a call to
+  a Bool entry as a raw definition of the condition-temporary rule, so
+  `if (isLeaf(n))` tests the C `int` directly. The generic entry boxes the
+  raw result for function-value callers. In the compiler 1,933 of the 11,353 direct entries return raw: 1,549 booleans, 283 doubles, 101 integers. The first version returned the boxed pending value of a `return` inside `finally` from a typed entry (the finally machinery's own exit, not the `Return` arm) — the conformance gate's two finally fixtures caught it; that exit now converts by kind and the fixture covers returns through one and two `finally` blocks. Fixture
+  `functions/typed_returns`. `TSAOT_TYPED_RETURNS=0` keeps boxed returns
+  (parity oracle). Compiler A/B against the regexp build, alternating three
+  runs, outputs validated, diagnostics zero: **6.907 → 6.851 s median wall (0.8% less; every native run below every baseline run)**; the compiler is now 2.08x slower than V8 (Node 3.300 s). Gates:
+  conformance 429/429 (the first run caught the finally exit: 427/429), parity 336 identical + 89 KNOWN (the fixture's frozen-pair finally difference allowlisted), bundler 42/42, selfconf 415 + 11 KNOWN, GC stress (all phases), inline policy, units (every verdict read from the gate output).
+- Profile of `native_s350x5` (10 s sample, 5,190 samples): generated code
+  55.0%, GC 10.2% (`gc_mark_common_props` 2.4%, `gc_scan_cell` 1.9%,
+  `gc_alloc` 1.9%; disabling full collections changes wall time by 2.7%
+  with the same RSS, so the cost is the minor collections' marking),
+  property paths 7.7%, strings 6.3%, libc memory 4.3%, calls 3.6%
+  (`binarySearchKey`'s key selector and comparer, `findAncestor`'s
+  callback, `filter`/`some`), regexp 1.5% (`simpleNormalizePath`,
+  `toFileNameLowerCase`). Hottest generated: `isSimpleTypeRelatedTo` 1.9%
+  (100 `ts_to_int32` flag tests, 20 inline-cache reads), `resolveNameHelper`
+  1.8%, `getObjectFlags` 1.3%. The regexp input is only copied for the four
+  non-ASCII compiler sources. 917 functions carry a capture cell they never
+  read (4,941 direct call sites pass one; `getObjectFlags` carries the
+  module record it never touches) — a dead-cell elimination is small.
+- Next slices, in order. (1) Interfaces that extend `Array`/`ReadonlyArray`
+  (the compiler's `NodeArray<T>`) classified as array receivers: 174
+  `for...of` loops over them step through the generic iterator protocol
+  (`ts_iter_step` → `ts_get("next")` → `ts_array_iterator_next` allocating a
+  `{value, done}` object with two generic property sets per element) and
+  their method calls and `length` reads take the dynamic paths. (2) Sparse
+  element storage for arrays written far beyond their length (dictionary
+  mode behind `element_kind`), or a cheaper mitigation of the hole fill
+  (`flowTypeCache[nodeId]` after each reset). (3) Callback specialization
+  for the call-only parameters (`binarySearchKey`, `findAncestor`,
+  `forEach`/`map`/`filter`/`some`/`every`); the remaining 2,319 dynamic
+  method sites. (4) The remaining pattern gaps: small calls with object
+  arguments 4.4x (inline-cache probe cost), array callbacks 3.9x, flags
+  3.9x, arrays of objects 2.75x; constructor pre-sizing from layouts; local
+  classes from declared types; C5b-2/3. Smaller items still open: the
+  minor-collection trigger counts cell bytes only, closures passed to
+  non-devirtualized callees are never stack-allocated, dead capture cells.

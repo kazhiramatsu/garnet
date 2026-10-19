@@ -356,7 +356,7 @@ fn emit_program_with_string_plans(
     let known_methods = known_method_closures(program);
     for f in &program.functions {
         if let Some(sig) = direct_sigs.get(&f.id.0) {
-            let _ = writeln!(s, "static tsv {}_d({});", cname(f), sig.c_params());
+            let _ = writeln!(s, "static {} {}_d({});", sig.c_ret(), cname(f), sig.c_params());
         }
     }
     if needs_regexp {
@@ -1355,6 +1355,8 @@ struct Ctx<'a> {
     emit_path: std::cell::RefCell<Vec<PathSegment>>,
     numeric_value_local: BTreeSet<u32>,
     i64_mode: bool,
+    /// the return kind of the direct entry whose body is being emitted
+    ret_kind: RetKind,
     f64_mode: bool,
     /// Boxed locals carried by a generated shadow-root frame. Empty for
     /// coroutine emitters and when frame roots are disabled.
@@ -1493,6 +1495,37 @@ impl<'a> Ctx<'a> {
             return None;
         }
         Some((x, t))
+    }
+    /// Assignment of a direct entry's result, raw by the callee's return kind.
+    fn set_call_result(&self, dst: &Option<LocalId>, call: &str, ret: RetKind) -> String {
+        let Some(d) = dst else {
+            return format!("  {};\n", call);
+        };
+        let id = d.0;
+        match ret {
+            RetKind::Boxed => self.set_val(id, call),
+            RetKind::F64 => {
+                if self.int_local.contains(&id) {
+                    format!("  d{} = (long long)({});\n", id, call)
+                } else {
+                    self.set_num(id, call)
+                }
+            }
+            RetKind::I64 => {
+                if self.int_local.contains(&id) {
+                    format!("  d{} = {};\n", id, call)
+                } else {
+                    self.set_num(id, &format!("(double)({})", call))
+                }
+            }
+            RetKind::Bool => {
+                if self.unboxed.contains(&id) {
+                    format!("  d{} = {};\n", id, call)
+                } else {
+                    self.set_val(id, &format!("ts_bool({})", call))
+                }
+            }
+        }
     }
     fn set_num(&self, id: u32, e: &str) -> String {
         if self.unboxed.contains(&id) {
@@ -1993,6 +2026,17 @@ fn frame_local_name(id: u32, frame_locals: &BTreeSet<u32>, layout: Option<&Frame
 thread_local! {
     static FN_CAPTURE_COUNTS: std::cell::RefCell<BTreeMap<u32, u32>> =
         std::cell::RefCell::new(BTreeMap::new());
+}
+thread_local! {
+    /// functions whose direct entry returns a raw boolean (direct_entry_sigs)
+    static BOOL_CALLEES: std::cell::RefCell<BTreeSet<u32>> =
+        std::cell::RefCell::new(BTreeSet::new());
+}
+fn set_bool_callees(set: &BTreeSet<u32>) {
+    BOOL_CALLEES.with(|b| *b.borrow_mut() = set.clone());
+}
+fn is_bool_callee(func: u32) -> bool {
+    BOOL_CALLEES.with(|b| b.borrow().contains(&func))
 }
 thread_local! {
     static TYPE_FIELD_COUNTS: std::cell::RefCell<BTreeMap<u32, u32>> =
@@ -2798,14 +2842,35 @@ enum ParamKind {
     I64,
 }
 
+/// How a direct entry returns its value: boxed, or raw when every `return`
+/// of the body carries a raw numeric local (F64/I64) or a boolean produced
+/// in place (Bool, a C `int` 0/1). The generic forwarder boxes it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RetKind {
+    Boxed,
+    F64,
+    I64,
+    Bool,
+}
+
 /// The C signature of a function's direct entry: one kind per IR parameter
-/// (captured cells first), in the representation the body uses for it.
+/// (captured cells first), in the representation the body uses for it, and
+/// the return kind.
 #[derive(Clone, Debug)]
 struct DirectSig {
     kinds: Vec<ParamKind>,
+    ret: RetKind,
 }
 
 impl DirectSig {
+    fn c_ret(&self) -> &'static str {
+        match self.ret {
+            RetKind::Boxed => "tsv",
+            RetKind::F64 => "double",
+            RetKind::I64 => "long long",
+            RetKind::Bool => "int",
+        }
+    }
     fn c_params(&self) -> String {
         if self.kinds.is_empty() {
             return "void".to_string();
@@ -2850,25 +2915,42 @@ fn direct_entry_sigs(
     }
     let return_facts = i64_return_facts(i64_fast);
     let empty: BTreeMap<u32, NumFact> = BTreeMap::new();
-    for f in &program.functions {
-        if !direct_entry_eligible(f) {
-            continue;
-        }
-        let mut local_class = local_class_map(f);
-        if let Some(&c) = fclass.get(&f.id.0) {
-            if let Some(p0) = f.params.first() {
-                local_class.insert(p0.0, c);
+    // Raw-boolean returns feed each other (`return isX(n)`), so the
+    // classification is iterated to a fixpoint over the set of functions
+    // whose direct entry returns a raw boolean; the set only grows.
+    let mut bool_callees: BTreeSet<u32> = BTreeSet::new();
+    loop {
+        set_bool_callees(&bool_callees);
+        out.clear();
+        let mut next_bool: BTreeSet<u32> = BTreeSet::new();
+        for f in &program.functions {
+            if !direct_entry_eligible(f) {
+                continue;
             }
+            let mut local_class = local_class_map(f);
+            if let Some(&c) = fclass.get(&f.id.0) {
+                if let Some(p0) = f.params.first() {
+                    local_class.insert(p0.0, c);
+                }
+            }
+            let unboxed = unboxed_candidates(f, &local_class);
+            let pf = param_facts_by_func.get(&f.id.0).unwrap_or(&empty);
+            let numeric = infer_numeric_analysis(&f.body, &unboxed, pf, &return_facts);
+            let kinds = f
+                .params
+                .iter()
+                .map(|p| param_kind(p.0, &numeric.int_local, &unboxed))
+                .collect();
+            let ret = direct_return_kind(f, &unboxed, &numeric.int_local);
+            if ret == RetKind::Bool {
+                next_bool.insert(f.id.0);
+            }
+            out.insert(f.id.0, DirectSig { kinds, ret });
         }
-        let unboxed = unboxed_candidates(f, &local_class);
-        let pf = param_facts_by_func.get(&f.id.0).unwrap_or(&empty);
-        let numeric = infer_numeric_analysis(&f.body, &unboxed, pf, &return_facts);
-        let kinds = f
-            .params
-            .iter()
-            .map(|p| param_kind(p.0, &numeric.int_local, &unboxed))
-            .collect();
-        out.insert(f.id.0, DirectSig { kinds });
+        if next_bool == bool_callees {
+            break;
+        }
+        bool_callees = next_bool;
     }
     out
 }
@@ -2915,7 +2997,14 @@ fn emit_direct_forwarder(s: &mut String, f: &Function, sig: &DirectSig, ncap: us
             }
         })
         .collect();
-    let _ = writeln!(s, "  return {}_d({});\n}}\n", cname(f), parts.join(", "));
+    let call = format!("{}_d({})", cname(f), parts.join(", "));
+    let boxed = match sig.ret {
+        RetKind::Boxed => call,
+        RetKind::F64 => format!("ts_num({})", call),
+        RetKind::I64 => format!("ts_num((double)({}))", call),
+        RetKind::Bool => format!("ts_bool({})", call),
+    };
+    let _ = writeln!(s, "  return {};\n}}\n", boxed);
 }
 
 fn prop_pic_enabled() -> bool {
@@ -3334,6 +3423,14 @@ fn unboxed_candidates(f: &Function, local_class: &BTreeMap<u32, u32>) -> BTreeSe
         .collect();
     for id in truthy_only_unbox(&f.body, &unboxed) {
         if !local_class.contains_key(&id) && !outside_defined.contains(&id) {
+            unboxed.insert(id);
+        }
+    }
+    // The returned booleans of a function whose direct entry returns a raw
+    // boolean (direct_return_kind): produced in place, used only by returns
+    // and conditions.
+    for id in bool_return_locals(f) {
+        if !local_class.contains_key(&id) {
             unboxed.insert(id);
         }
     }
@@ -6432,6 +6529,7 @@ fn emit_i64_function(
         emit_path: std::cell::RefCell::new(Vec::new()),
         numeric_value_local,
         i64_mode: true,
+        ret_kind: RetKind::Boxed,
         f64_mode: false,
         frame_locals,
         frame_slot: frame_layout.as_ref().map(|l| l.slot_of.clone()),
@@ -6599,6 +6697,7 @@ fn emit_f64_function(
         emit_path: std::cell::RefCell::new(Vec::new()),
         numeric_value_local,
         i64_mode: false,
+        ret_kind: RetKind::Boxed,
         f64_mode: true,
         frame_locals,
         frame_slot: frame_layout.as_ref().map(|l| l.slot_of.clone()),
@@ -6703,6 +6802,7 @@ fn emit_function(
             emit_path: std::cell::RefCell::new(Vec::new()),
             numeric_value_local,
             i64_mode: false,
+            ret_kind: RetKind::Boxed,
             f64_mode: false,
             frame_locals: BTreeSet::new(),
             frame_slot: None,
@@ -6754,6 +6854,7 @@ fn emit_function(
             emit_path: std::cell::RefCell::new(Vec::new()),
             numeric_value_local,
             i64_mode: false,
+            ret_kind: RetKind::Boxed,
             f64_mode: false,
             frame_locals: BTreeSet::new(),
             frame_slot: None,
@@ -6805,6 +6906,7 @@ fn emit_function(
             emit_path: std::cell::RefCell::new(Vec::new()),
             numeric_value_local,
             i64_mode: false,
+            ret_kind: RetKind::Boxed,
             f64_mode: false,
             frame_locals: BTreeSet::new(),
             frame_slot: None,
@@ -6849,6 +6951,7 @@ fn emit_function(
         None
     };
     let dsig = direct_sigs.get(&f.id.0);
+    let ret_kind = dsig.map(|sg| sg.ret).unwrap_or(RetKind::Boxed);
     if let Some(sig) = dsig {
         // The body entry: parameters arrive as C parameters, cells first, in
         // the representation the body uses. The table was built from the same
@@ -6861,7 +6964,7 @@ fn emit_function(
                 f.id.0
             );
         }
-        let _ = writeln!(s, "static tsv {}_d({}){{", cname(f), sig.c_params());
+        let _ = writeln!(s, "static {} {}_d({}){{", sig.c_ret(), cname(f), sig.c_params());
     } else {
         let _ = writeln!(s, "static tsv {}(tsv* args, int nargs){{", cname(f));
         s.push_str("  (void)nargs;\n");
@@ -7012,6 +7115,7 @@ fn emit_function(
         emit_path: std::cell::RefCell::new(Vec::new()),
         numeric_value_local,
         i64_mode: false,
+        ret_kind: ret_kind,
         f64_mode: false,
         frame_locals,
         frame_slot: frame_layout.as_ref().map(|l| l.slot_of.clone()),
@@ -7032,7 +7136,15 @@ fn emit_function(
     if !cleanup.is_empty() {
         let _ = writeln!(s, "  {}", cleanup);
     }
-    s.push_str("  return TS_UNDEFINED;\n}\n\n");
+    let _ = writeln!(
+        s,
+        "  return {};\n}}\n",
+        match ctx.ret_kind {
+            RetKind::Boxed => "TS_UNDEFINED",
+            RetKind::F64 => "0.0",
+            _ => "0",
+        }
+    );
     if let Some(sig) = dsig {
         emit_direct_forwarder(s, f, sig, ncap);
     }
@@ -7498,12 +7610,7 @@ fn emit_known_method_call(
     s.push_str("      ts_func* _kf = (ts_func*)ts_ptr(_mv); (void)_kf;
 ");
     let direct = format!("{}_d({})", fname, parts.join(", "));
-    match dst {
-        Some(d) => s.push_str(&ctx.set_val(d.0, &direct)),
-        None => {
-            let _ = writeln!(s, "      {};", direct);
-        }
-    }
+    s.push_str(&ctx.set_call_result(dst, &direct, sig.ret));
     s.push_str("    } else {
 ");
     let _ = writeln!(
@@ -7522,6 +7629,181 @@ fn emit_known_method_call(
     s.push_str("    }
 ");
     true
+}
+
+fn typed_returns_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_TYPED_RETURNS").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
+/// The locals returned by the body's `return` instructions, and whether a
+/// valueless `return` exists.
+fn return_sources(body: &[Inst]) -> (Vec<u32>, bool) {
+    let mut flat: Vec<&Inst> = Vec::new();
+    flatten_inst(body, &mut flat);
+    let mut srcs: Vec<u32> = Vec::new();
+    let mut valueless = false;
+    for inst in &flat {
+        if let Inst::Return { src } = inst {
+            match src {
+                Some(v) => srcs.push(v.0),
+                None => valueless = true,
+            }
+        }
+    }
+    (srcs, valueless)
+}
+
+/// Locals returned by the function when every `return` carries one and each
+/// such local holds only booleans produced in place — comparisons, `!`,
+/// boolean constants, calls to functions whose direct entry returns a raw
+/// boolean, or copies of such locals — and is used only by returns,
+/// conditions, `!` and those copies. Empty when any return disqualifies.
+/// Parameters and catch variables are defined from outside and never qualify.
+fn bool_return_locals(f: &Function) -> BTreeSet<u32> {
+    if !typed_returns_enabled() {
+        return BTreeSet::new();
+    }
+    let mut flat: Vec<&Inst> = Vec::new();
+    flatten_inst(&f.body, &mut flat);
+    let mut returned: BTreeSet<u32> = BTreeSet::new();
+    for inst in &flat {
+        if let Inst::Return { src } = inst {
+            match src {
+                Some(v) => {
+                    returned.insert(v.0);
+                }
+                None => return BTreeSet::new(),
+            }
+        }
+    }
+    if returned.is_empty() {
+        return BTreeSet::new();
+    }
+    let outside: BTreeSet<u32> = f
+        .params
+        .iter()
+        .map(|p| p.0)
+        .chain(collect_catch_vars(&f.body))
+        .collect();
+    let mut defs: BTreeMap<u32, Vec<Option<u32>>> = BTreeMap::new();
+    let mut other_def: BTreeSet<u32> = BTreeSet::new();
+    let mut total: BTreeMap<u32, u32> = BTreeMap::new();
+    let mut ok_use: BTreeMap<u32, u32> = BTreeMap::new();
+    let mut copies: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    for inst in &flat {
+        match inst {
+            Inst::If { cond, .. } | Inst::Loop { cond, .. } => {
+                *total.entry(cond.0).or_insert(0) += 1;
+                *ok_use.entry(cond.0).or_insert(0) += 1;
+                continue;
+            }
+            Inst::TryCatch { .. } => continue,
+            _ => {}
+        }
+        let def = inst_def(inst);
+        match inst {
+            Inst::BinOp { dst, op, .. }
+                if matches!(
+                    op.as_str(),
+                    "<" | "<=" | ">" | ">=" | "==" | "!=" | "===" | "!=="
+                ) =>
+            {
+                defs.entry(dst.0).or_default().push(None);
+            }
+            Inst::UnOp { dst, op, .. } if op == "!" => {
+                defs.entry(dst.0).or_default().push(None);
+            }
+            Inst::Const {
+                dst,
+                value: ConstVal::Bool { .. },
+            } => {
+                defs.entry(dst.0).or_default().push(None);
+            }
+            Inst::Call {
+                dst: Some(dst),
+                callee: CalleeRef::Direct { func },
+                ..
+            } if is_bool_callee(func.0) => {
+                defs.entry(dst.0).or_default().push(None);
+            }
+            Inst::Copy { dst, src } => {
+                defs.entry(dst.0).or_default().push(Some(src.0));
+                copies.entry(src.0).or_default().push(dst.0);
+            }
+            _ => {
+                if let Some(d) = def {
+                    other_def.insert(d);
+                }
+            }
+        }
+        let mut seen: BTreeSet<u32> = BTreeSet::new();
+        for r in inst_refs(inst) {
+            if Some(r) == def || !seen.insert(r) {
+                continue;
+            }
+            *total.entry(r).or_insert(0) += 1;
+            if matches!(inst, Inst::UnOp { op, .. } if op == "!") || matches!(inst, Inst::Return { .. }) {
+                *ok_use.entry(r).or_insert(0) += 1;
+            }
+        }
+    }
+    let mut kept: BTreeSet<u32> = defs
+        .keys()
+        .copied()
+        .filter(|id| !other_def.contains(id) && !outside.contains(id))
+        .collect();
+    loop {
+        let mut drop: Vec<u32> = Vec::new();
+        for &c in &kept {
+            let defs_ok = defs[&c].iter().all(|d| d.map_or(true, |src| kept.contains(&src)));
+            let into_kept = copies
+                .get(&c)
+                .map_or(0, |ds| ds.iter().filter(|d| kept.contains(d)).count() as u32);
+            let tot = total.get(&c).copied().unwrap_or(0);
+            let ok = ok_use.get(&c).copied().unwrap_or(0);
+            if !defs_ok || tot == 0 || tot != ok + into_kept {
+                drop.push(c);
+            }
+        }
+        if drop.is_empty() {
+            break;
+        }
+        for c in drop {
+            kept.remove(&c);
+        }
+    }
+    if returned.iter().all(|r| kept.contains(r)) {
+        kept
+    } else {
+        BTreeSet::new()
+    }
+}
+
+/// The return kind of a direct entry, from the body's classification.
+fn direct_return_kind(f: &Function, unboxed: &BTreeSet<u32>, int_local: &BTreeSet<u32>) -> RetKind {
+    if !typed_returns_enabled() {
+        return RetKind::Boxed;
+    }
+    let (srcs, valueless) = return_sources(&f.body);
+    if valueless || srcs.is_empty() {
+        return RetKind::Boxed;
+    }
+    if !bool_return_locals(f).is_empty() {
+        return RetKind::Bool;
+    }
+    if srcs.iter().all(|s| int_local.contains(s)) {
+        return RetKind::I64;
+    }
+    if srcs.iter().all(|s| unboxed.contains(s)) {
+        return RetKind::F64;
+    }
+    RetKind::Boxed
 }
 
 fn truthy_unbox_enabled() -> bool {
@@ -7576,6 +7858,14 @@ fn truthy_only_unbox(body: &[Inst], numeric: &BTreeSet<u32>) -> BTreeSet<u32> {
                 dst,
                 value: ConstVal::Bool { .. },
             } => {
+                defs.entry(dst.0).or_default().push(None);
+            }
+            // the raw boolean result of a direct entry (direct_return_kind)
+            Inst::Call {
+                dst: Some(dst),
+                callee: CalleeRef::Direct { func },
+                ..
+            } if is_bool_callee(func.0) => {
                 defs.entry(dst.0).or_default().push(None);
             }
             Inst::Copy { dst, src } => {
@@ -9455,7 +9745,21 @@ fn emit_plain_finally(
     } else {
         let pop_str = "ts_eh_pop(); ".repeat(base_eh_depth as usize);
         let cleanup = ctx.root_cleanup();
-        let _ = writeln!(s, "    case 1: {}{} return {};", pop_str, cleanup, pendv);
+        // The pending `return` value is boxed; a raw-returning entry (a
+        // typed direct entry or a numeric clone) converts it here.
+        let ret_expr = if ctx.i64_mode {
+            format!("(long long)ts_to_num({})", pendv)
+        } else if ctx.f64_mode {
+            format!("ts_to_num({})", pendv)
+        } else {
+            match ctx.ret_kind {
+                RetKind::Boxed => pendv.clone(),
+                RetKind::F64 => format!("ts_to_num({})", pendv),
+                RetKind::I64 => format!("(long long)ts_to_num({})", pendv),
+                RetKind::Bool => format!("ts_truthy_fast({})", pendv),
+            }
+        };
+        let _ = writeln!(s, "    case 1: {}{} return {};", pop_str, cleanup, ret_expr);
     }
     // A throw resumes the active EH chain, including an enclosing catch.
     // Jump completions only run outer finally blocks they actually leave.
@@ -18436,12 +18740,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         })
                         .collect();
                     let call = format!("{}_d({})", ctx.fn_name_of(func.0), parts.join(", "));
-                    match dst {
-                        Some(d) => s.push_str(&ctx.set_val(d.0, &call)),
-                        None => {
-                            let _ = writeln!(s, "  {};", call);
-                        }
-                    }
+                    s.push_str(&ctx.set_call_result(dst, &call, sig.ret));
                     return;
                 }
             }
@@ -18569,6 +18868,41 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         let _ = writeln!(s, "  return ts_to_num({});", ctx.vname(v.0));
                     }
                     None => s.push_str("  return 0.0;\n"),
+                }
+            } else if ctx.ret_kind != RetKind::Boxed {
+                // A direct entry returning raw: the value is read in whatever
+                // representation the local has (the classification decided the
+                // kind from the same body, but the read is robust either way).
+                let expr = match (ctx.ret_kind, src) {
+                    (RetKind::Bool, Some(v)) => {
+                        if ctx.unboxed.contains(&v.0) {
+                            format!("(d{} != 0)", v.0)
+                        } else {
+                            format!("ts_truthy_fast({})", ctx.vname(v.0))
+                        }
+                    }
+                    (RetKind::I64, Some(v)) => {
+                        if ctx.int_local.contains(&v.0) {
+                            format!("d{}", v.0)
+                        } else {
+                            format!("(long long)({})", ctx.num(v.0))
+                        }
+                    }
+                    (RetKind::F64, Some(v)) => ctx.num(v.0),
+                    (_, None) => "0".to_string(),
+                    (RetKind::Boxed, _) => unreachable!("boxed return kind in the typed arm"),
+                };
+                if ctx.json_roots.is_empty() {
+                    let _ = writeln!(s, "  return {};", expr);
+                } else {
+                    let cty = match ctx.ret_kind {
+                        RetKind::F64 => "double",
+                        RetKind::I64 => "long long",
+                        _ => "int",
+                    };
+                    let _ = writeln!(s, "  {} _ret = {};", cty, expr);
+                    emit_json_cleanup(s, ctx);
+                    s.push_str("  return _ret;\n");
                 }
             } else {
                 match src {
