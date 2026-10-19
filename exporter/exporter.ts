@@ -319,6 +319,10 @@ class Exporter {
   // through the closure value.
   namespaceFuncSymbols = new Set<ts.Symbol>();
   namespaceDirect = process.env.TSAOT_NAMESPACE_DIRECT !== "0";
+  // An interface that extends Array/ReadonlyArray (the compiler's
+  // NodeArray<T>) denotes a runtime array; TSAOT_ARRAY_INTERFACES=0 keeps
+  // such receivers dynamic (generic iteration, dynamic method dispatch).
+  arrayInterfaces = process.env.TSAOT_ARRAY_INTERFACES !== "0";
   recordOfOwner = new Map<ts.Node, CaptureRecord>();
   recordOwnerOf = new Map<ts.Symbol, ts.Node>();
   moduleCtxGlobal: number | undefined = undefined;
@@ -8367,6 +8371,23 @@ class Exporter {
     return undefined;
   }
 
+  /** True for an object type that is an array type or an interface (a type
+   *  reference's target) whose base types reach the global Array or
+   *  ReadonlyArray. Classes are excluded (a class extending Array keeps the
+   *  dynamic paths). */
+  private isArrayDerivedType(t: ts.Type, depth: number): boolean {
+    if (depth > 6 || !(t.flags & ts.TypeFlags.Object)) return false;
+    if (this.checker.isArrayType(t)) return true;
+    const ot = t as ts.ObjectType;
+    const target = (ot.objectFlags & ts.ObjectFlags.Reference) ? (ot as ts.TypeReference).target : ot;
+    if (!(target.objectFlags & ts.ObjectFlags.Interface)) return false;
+    const tsym = target.getSymbol();
+    if (tsym && (tsym.name === "Array" || tsym.name === "ReadonlyArray") && this.isAmbientGlobalSymbol(tsym)) return true;
+    let bases: readonly ts.BaseType[] = [];
+    try { bases = this.checker.getBaseTypes(target as ts.InterfaceType); } catch { return false; }
+    return bases.some((b) => this.isArrayDerivedType(b, depth + 1));
+  }
+
   builtinReceiverKind(recvExpr: ts.Expression): "string" | "array" | "map" | "set" | "weakmap" | "weakset" | "headers" | "number" | "boolean" | "promise" | undefined {
     // Identify builtins whose runtime result is an array, including the existing
     // array/Headers iterator representations. Map/Set return actual iterators.
@@ -8401,6 +8422,11 @@ class Exporter {
       // ambient builtin (all decls in .d.ts) routes to builtin kinds. (No nominal
       // symbol, e.g. array/tuple literal types, falls through to the structural checks
       // below.)
+      // An interface whose base types reach Array/ReadonlyArray denotes a
+      // runtime array: its instances are created as arrays and only carry
+      // extra properties, so for-of, length and the builtin methods take the
+      // array paths (the compiler's NodeArray<T>, 174 for-of loops).
+      if (sym && !this.isAmbientGlobalSymbol(sym) && this.arrayInterfaces && this.isArrayDerivedType(t, 0)) return "array";
       if (sym && !this.isAmbientGlobalSymbol(sym)) return undefined;
       // Structural array/tuple identity takes precedence over the printed
       // element type: Map<K,V>[] starts with "Map<" but is not a Map receiver.

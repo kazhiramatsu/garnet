@@ -737,6 +737,7 @@ Compiler A/Bs for the slice (three alternating runs each, outputs validated):
 | `native_s350x4` (guarded direct calls for one-closure method keys) | **7.226 s** | 1.5% less than `x3` (7.340 s in the same session); Node 3.267 s; diagnostics zero, outputs validated |
 | `native_s350x5` (anchored regexp fast path) | **6.949 s** | 4.9% less than `x4` (7.309 s in the same session); Node 3.353 s; diagnostics zero, outputs validated |
 | `native_s350x6` (typed direct-entry returns) | **6.851 s** | 0.8% less than `x5` (6.907 s in the same session); Node 3.300 s; diagnostics zero, outputs validated |
+| `native_s350x7` (array-derived interfaces as array receivers) | **6.764 s** | 4.3% less than `x6` (7.072 s in the same session); Node 3.275 s; diagnostics zero, outputs validated |
 
 ### Inline-cache path statistics (Session 350, `native_s350s_stats`)
 

@@ -4710,20 +4710,43 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   non-ASCII compiler sources. 917 functions carry a capture cell they never
   read (4,941 direct call sites pass one; `getObjectFlags` carries the
   module record it never touches) — a dead-cell elimination is small.
-- Next slices, in order. (1) Interfaces that extend `Array`/`ReadonlyArray`
-  (the compiler's `NodeArray<T>`) classified as array receivers: 174
-  `for...of` loops over them step through the generic iterator protocol
-  (`ts_iter_step` → `ts_get("next")` → `ts_array_iterator_next` allocating a
-  `{value, done}` object with two generic property sets per element) and
-  their method calls and `length` reads take the dynamic paths. (2) Sparse
-  element storage for arrays written far beyond their length (dictionary
-  mode behind `element_kind`), or a cheaper mitigation of the hole fill
-  (`flowTypeCache[nodeId]` after each reset). (3) Callback specialization
-  for the call-only parameters (`binarySearchKey`, `findAncestor`,
-  `forEach`/`map`/`filter`/`some`/`every`); the remaining 2,319 dynamic
-  method sites. (4) The remaining pattern gaps: small calls with object
-  arguments 4.4x (inline-cache probe cost), array callbacks 3.9x, flags
-  3.9x, arrays of objects 2.75x; constructor pre-sizing from layouts; local
-  classes from declared types; C5b-2/3. Smaller items still open: the
-  minor-collection trigger counts cell bytes only, closures passed to
-  non-devirtualized callees are never stack-allocated, dead capture cells.
+- Interfaces that extend `Array`/`ReadonlyArray` are array receivers
+  (`docs/array_interfaces_design.md`; the fifth static-information slice).
+  The compiler's `NodeArray<T>` (an interface over `ReadonlyArray<T>` with
+  `pos`/`end`/`hasTrailingComma`) was a dynamic receiver: 174 `for...of`
+  loops over node arrays stepped through the generic iterator protocol
+  (`ts_iter_step` → `next` lookup → `ts_array_iterator_next` allocating a
+  `{value, done}` object with two generic property sets per element), and
+  `length` reads and method calls on them took the generic paths. The
+  exporter now classifies an interface whose base types reach the global
+  `Array`/`ReadonlyArray` as an array (classes excluded), so those loops are
+  index loops and the methods are the builtin array methods. In the compiler's generated C the generic iterator steps fall from 174 to 36, array length fast reads rise from 1,845 to 2,149 and dynamic method calls fall from 6,316 to 6,102.
+  Fixture `arrays/array_interfaces`. `TSAOT_ARRAY_INTERFACES=0` keeps the
+  dynamic paths (parity corpus). Compiler A/B against the typed-returns
+  build, alternating three runs, outputs validated, diagnostics zero:
+  **7.072 → 6.764 s median wall (4.3% less)**; the compiler is now 2.07x slower than V8 (Node 3.275 s; the machine ran slower during this A/B than during the previous one, both binaries alike). Gates: conformance 430/430, parity 337 identical + 89 KNOWN, bundler 42/42, selfconf 416 + 11 KNOWN, GC stress (all phases), inline policy, units (every verdict read from the gate output).
+- Direction from Kaz (11:35): the practical lever is object creation —
+  an object that does not escape should live on the stack. Status: the
+  analyzer's escape strategies already mark 1,368 sites `Stack`, 639
+  `CallerArena` and 87 `FrameArena` in the compiler, but only class
+  instances with the `Stack` strategy are emitted as C stack structs; the
+  1,362 `Stack` closure sites, the 87 `FrameArena` arrays, the 360/241/38
+  `CallerArena` arrays/closures/objects and the 6 `Stack` object literals
+  are still heap allocations with an annotation. The per-site statistics
+  build counted 5.6M closure allocations per compile, and several of the
+  hottest sites are `Stack` (`captureErrorCalculationState`, `reportError`,
+  `isRelatedToWorker`, `reportIncompatibleCallSignatureReturn`, 275k each).
+  The GC already marks and scans non-heap cells reached from frames, the
+  write barrier ignores pointer-form (stack) values, and builtin callback
+  arguments escape conservatively, so stack closures need an emitter path
+  (a `ts_func` and its environment array on the C stack, initialized like
+  `ts_make_closure_t`) and no analysis change.
+- Next slices, in order. (1) Stack-allocated non-escaping closures (the
+  `Stack` strategy), then `FrameArena`/`CallerArena` arrays and literals.
+  (2) Sparse element storage for arrays written far beyond their length.
+  (3) Callback specialization for the call-only parameters
+  (`binarySearchKey`, `findAncestor`, `forEach`/`map`/`filter`/`some`/
+  `every`); the remaining 2,319 dynamic method sites. (4) The remaining
+  pattern gaps: small calls with object arguments 4.4x, array callbacks
+  3.9x, flags 3.9x, arrays of objects 2.75x; constructor pre-sizing from
+  layouts; local classes from declared types; C5b-2/3; dead capture cells.
