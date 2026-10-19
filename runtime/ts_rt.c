@@ -157,6 +157,10 @@ void ts_rt_stat_static_miss_slot(tsv obj, ts_key key){
   g_ts_static_miss_slot[(uint32_t)key * 18u + idx]++;
 }
 static uint32_t g_next_shape;   /* defined with the shape table below */
+/* The first full collections of the run: heap bytes before and after, the
+   next threshold and the pause (statistics build). */
+static struct { size_t before, after, next; uint64_t pause_ns; } g_rt_full_trace[32];
+static uint32_t g_rt_full_trace_len = 0;
 #define RT_STAT_KEY(arr, key) do { if ((uint32_t)(key) < TS_RT_KEY_HIST) arr[(uint32_t)(key)]++; } while (0)
 static struct {
   unsigned long long minor_gc, full_gc, gc_pause_ns, gc_pause_max_ns;
@@ -293,6 +297,10 @@ __attribute__((destructor)) static void ts_rt_stats_dump(void){
   fprintf(out, "[rt_stats] class_field_cache: calls=%llu hits=%llu\n", g_rt_stats.class_field_calls, g_rt_stats.class_field_hits);
   fprintf(out, "[rt_stats] location_cache: probes=%llu hits=%llu collisions=%llu\n",
           g_rt_stats.location_probes, g_rt_stats.location_hits, g_rt_stats.location_collisions);
+  for (uint32_t i = 0; i < g_rt_full_trace_len; i++)
+    fprintf(out, "[rt_stats] full_gc #%u: before=%zu after=%zu next=%zu pause_ms=%.2f\n", i + 1u,
+            g_rt_full_trace[i].before, g_rt_full_trace[i].after, g_rt_full_trace[i].next,
+            (double)g_rt_full_trace[i].pause_ns / 1e6);
   fprintf(out, "[rt_stats] static_slots: get_hit=%llu get_miss=%llu set_hit=%llu set_miss=%llu learned=%llu | shapes=%u\n",
           g_ts_static_get_hit, g_ts_static_get_miss, g_ts_static_set_hit, g_ts_static_set_miss, g_ts_static_learned, g_next_shape);
   fprintf(out, "[rt_stats] prop_pic: get=%llu hit=%llu (%.1f%%) set=%llu hit=%llu (%.1f%%)\n",
@@ -637,13 +645,35 @@ static inline void gc_before_alloc(void){
   if (g_young_new_since_minor>=g_young_threshold || nursery_trigger_bytes>=g_nursery_cap_bytes)
     ts_gc_collect_young();
   if (g_heap_bytes>=g_full_threshold_bytes){
+    size_t before = g_heap_bytes;
+#ifdef TSAOT_RT_STATS
+    uint64_t pause_before = g_rt_stats.gc_pause_ns;
+#endif
     ts_gc_collect();
     if (!g_full_threshold_forced){
-      size_t next = g_heap_bytes * 2;
-      size_t with_headroom = g_heap_bytes + TS_GC_MIN_FULL_BYTES;
+      /* Full-collection pacing (docs/full_gc_pacing_design.md): the next full
+         collection when the heap has doubled its live bytes, or quadrupled
+         when this one reclaimed less than a quarter of the heap: a heap that
+         is mostly live keeps growing, and collecting it again soon only marks
+         it again (the compiler ran six full collections per compile, the
+         last ones marking 250-480 MB of live data for little garbage). */
+      size_t live = g_heap_bytes;
+      size_t reclaimed = before > live ? before - live : 0;
+      size_t factor = (reclaimed * 4u < before) ? 4u : 2u;
+      size_t next = live * factor;
+      size_t with_headroom = live + TS_GC_MIN_FULL_BYTES;
       if (next < with_headroom) next = with_headroom;
       if (next < TS_GC_MIN_FULL_BYTES) next = TS_GC_MIN_FULL_BYTES;
       g_full_threshold_bytes = next;
+#ifdef TSAOT_RT_STATS
+      if (g_rt_full_trace_len < 32u){
+        g_rt_full_trace[g_rt_full_trace_len].before = before;
+        g_rt_full_trace[g_rt_full_trace_len].after = live;
+        g_rt_full_trace[g_rt_full_trace_len].next = next;
+        g_rt_full_trace[g_rt_full_trace_len].pause_ns = g_rt_stats.gc_pause_ns - pause_before;
+        g_rt_full_trace_len++;
+      }
+#endif
     }
   }
 }

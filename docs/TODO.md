@@ -5644,6 +5644,30 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   default and -2% with the capacity hint; Node 3.29-3.34 s (1.47x).
   The remaining static misses are receivers that are not plain shaped
   objects (`NodeArray.transformFlags` 282k, arrays) or lack the key.
+- Full-collection pacing by reclaimed fraction (build `x38`, relinked
+  from `x37`; runtime only; `docs/full_gc_pacing_design.md`). The `x37`
+  profile puts the collector at 15% of the samples; the statistics count
+  399 minor and 6 full collections per compile with 498 ms of pauses, the
+  longest 100 ms. The full threshold started at 16 MB and doubled after
+  each full collection, and the compiler's old generation is almost all
+  live: the trace (statistics build, new) shows each full collection
+  reclaiming about nothing (16.8 -> 15.4 MB, 61.7 -> 61.2 MB, 244.8 ->
+  243.9 MB), so the later ones marked 250-480 MB for nothing. The
+  retarget now takes `live * 4` instead of `live * 2` when the collection
+  reclaimed less than a quarter of the heap: 3 full collections per
+  compile (2.7 + 9.0 + 40.7 ms), pauses 498 -> 384 ms, the longest 100 ->
+  41 ms; minors unchanged. A/B against `x37`, two rounds of three
+  alternating runs: 4.734 vs 4.868 s and 4.752 vs 4.865 s median (all six
+  pairs -2.0% to -3.1%), RSS 811 -> 821 MB; Node 3.27-3.29 s, so 1.44x
+  Node. A quick knob trial first (`--noEmit`, x37): pinning the threshold
+  at 2-4 GB (no full collection) read -4% for 744 -> 767 MB peak, the
+  nursery knobs (16 MB, 64 MB) +0.7% and +2.7% as in the earlier sessions.
+  Also measured on the way: the string-key pattern of the checker
+  (`getTypeListId`'s `result += id` loop, the `${a},${b}` relation keys,
+  the flow cache keys, then `Map` lookups) as a kernel
+  (`benchmarks/patterns/string_keys.ts`): native 265-340 ms against
+  Node's 301-324 ms (0.88-1.05x), so the 58 `ts_add` samples under
+  `getTypeListId` in the profile are volume, not a slow path; no slice.
 - Next slices, in order. (0) External element buffers (the malloc'd
   `data` of arrays, also strings' and maps' buffers) do not count toward
   the collector's trigger: a loop that drops large arrays grows without
