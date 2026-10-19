@@ -14,6 +14,12 @@ struct ts_regexp_compiled {
   int bytecode_len;
   uint32_t capture_count;
   uint32_t flags;
+  /* The pattern can only match at position 0 (a leading `^` without the m
+     flag and without a top-level alternation): the bytecode is compiled
+     without the engine's search prefix, so a failing attempt costs one
+     try instead of one per input position, and a start index past 0 is a
+     miss without running the engine. */
+  uint8_t anchored;
 };
 
 typedef struct ts_regexp_cache_entry {
@@ -47,6 +53,23 @@ static void ts_regexp_error(char* buf, uint32_t len, const char* msg){
   buf[n] = 0;
 }
 
+/* `^` at the very start, and no `|` outside groups and classes (an escaped
+   `|` and a `|` inside `[...]` do not split the pattern). */
+static int ts_regexp_pattern_anchored(const char* p, uint32_t n){
+  if (n == 0 || p[0] != '^') return 0;
+  int depth = 0, in_class = 0;
+  for (uint32_t i = 1; i < n; i++){
+    char c = p[i];
+    if (c == '\\'){ i++; continue; }
+    if (in_class){ if (c == ']') in_class = 0; continue; }
+    if (c == '['){ in_class = 1; continue; }
+    if (c == '(') depth++;
+    else if (c == ')'){ if (depth > 0) depth--; }
+    else if (c == '|' && depth == 0) return 0;
+  }
+  return 1;
+}
+
 #ifdef TSAOT_HAS_QUICKJS_REGEXP
 static int ts_regexp_to_lre_flags(uint32_t flags){
   int out = 0;
@@ -70,8 +93,15 @@ ts_regexp_compiled* ts_regexp_compile_utf8(const char* pattern,
 #ifdef TSAOT_HAS_QUICKJS_REGEXP
   char err[128];
   int bc_len = 0;
+  int lre_flags = ts_regexp_to_lre_flags(flags);
+  int anchored = 0;
+  if (!(flags & (TSAOT_REGEXP_FLAG_MULTILINE | TSAOT_REGEXP_FLAG_STICKY)) &&
+      ts_regexp_pattern_anchored(pattern, pattern_len)){
+    anchored = 1;
+    lre_flags |= LRE_FLAG_STICKY;   /* no search prefix: one attempt at the start index */
+  }
   uint8_t* bc = lre_compile(&bc_len, err, sizeof(err), pattern, pattern_len,
-                            ts_regexp_to_lre_flags(flags), NULL);
+                            lre_flags, NULL);
   if (!bc){
     ts_regexp_error(error_msg, error_msg_len, err);
     return NULL;
@@ -86,6 +116,7 @@ ts_regexp_compiled* ts_regexp_compile_utf8(const char* pattern,
   re->bytecode_len = bc_len;
   re->capture_count = (uint32_t)lre_get_capture_count(bc);
   re->flags = flags;
+  re->anchored = (uint8_t)anchored;
   ts_regexp_error(error_msg, error_msg_len, "");
   return re;
 #else
@@ -138,6 +169,7 @@ static int ts_regexp_exec_impl(ts_regexp_compiled* re,
   if (!re || !re->bytecode || !input) return TSAOT_REGEXP_ERR_EXEC;
   if (start_index > input_len) return TSAOT_REGEXP_NOMATCH;
   if (captures) ts_regexp_clear_spans(captures, capture_cap);
+  if (re->anchored && start_index > 0) return TSAOT_REGEXP_NOMATCH;
   uint32_t ncap = re->capture_count;
   uint8_t** raw = calloc((size_t)ncap * 2u, sizeof(uint8_t*));
   if (!raw) return TSAOT_REGEXP_ERR_NOMEM;

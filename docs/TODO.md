@@ -4658,20 +4658,41 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   type` after every `flowTypeCache = undefined` reset (per flow-loop
   antecedent and per cached expression check) re-fills a dense array up to
   the current node id each time; V8 keeps such arrays in dictionary mode.
-- Next slices, in order. (1) Anchored regexp fast path in the adapter: a
-  pattern that starts with `^`, has no top-level alternation and no `m`
-  flag is compiled sticky (no search prefix), so a failing match costs one
-  attempt. (2) Sparse element storage for arrays written far beyond their
-  length (dictionary mode behind `element_kind`, with every fast path
-  already keyed on `element_kind == 0`), or a cheaper mitigation of the
-  hole fill. (3) Callback specialization for `forEach`/`map`/`filter`/
-  `some`/`every` (706 call sites pass a single-definition closure into a
-  call-only parameter; `some`'s optional predicate needs truthiness uses
-  admitted); the remaining 2,319 dynamic method sites (keys stored several
-  closures: a per-receiver-class guess, or an inline cache of the code
-  pointer). (4) The remaining pattern gaps: small calls with object
-  arguments 4.4x (inline-cache probe cost), array callbacks 3.9x, flags
-  3.9x, arrays of objects 2.75x; constructor pre-sizing from layouts; local
-  classes from declared types; C5b-2/3. Smaller items still open: the
-  minor-collection trigger counts cell bytes only, and closures passed to
-  non-devirtualized callees are never stack-allocated.
+- Anchored regexp fast path (runtime regexp adapter). A pattern that starts
+  with `^`, has no `|` outside groups and classes and no `m` or `y` flag can
+  only match at position 0, but the QuickJS bytecode always carried the
+  engine's search prefix (try every position), so `getShebang`'s
+  `/^#!.*/.exec(text)` walked every source text once per call: 3.8% of the
+  compiler's samples were the regexp engine, 384 of its 480 samples under
+  `getShebang`. The adapter now compiles such patterns sticky (no search
+  prefix) and answers a start index past 0 without running the engine; the
+  JavaScript-level `lastIndex`/global/sticky handling is unchanged because
+  it reads the RegExp object's own flags. Fixture `regexp/anchored_fast_path`
+  (anchored exec/test/match/search on hit and miss, top-level alternation
+  kept searching, `|` in classes and escapes, multiline and sticky, global
+  iteration with an anchored pattern, empty matches in replace/split,
+  i/u flags, lookahead, a non-zero lastIndex on a global anchored pattern,
+  a 2 MB input tested 400 times). Compiler A/B against the known-method
+  build, alternating three runs, outputs validated, diagnostics zero:
+  **7.309 → 6.949 s median wall (4.9% less)**; the compiler is now 2.07x slower than V8 (Node 3.353 s). Gates: conformance 428/428, parity 336 identical + 88 KNOWN, bundler 42/42, selfconf 414 + 11 KNOWN, GC stress (all phases), inline policy, units (every verdict read from the gate output). Also found: the `dt`
+  harness kept a regexp adapter object from before the runtime's
+  `ts_number_coerce` became inline (a link error on the first regexp
+  fixture); the handbook now says to clear `build/regexp` and
+  `build/quickjs` after runtime edits.
+- Next slices, in order. (1) Re-profile `native_s350x5`: the earlier
+  attribution also showed the regexp input being copied per call
+  (`ts_regexp_view_to_utf16` builds a UTF-16 copy of a UTF-16-flagged input
+  for every exec; `memmove`/`memcpy` under `getShebang`), which the anchored
+  path does not remove. (2) Sparse element storage for arrays written far
+  beyond their length (dictionary mode behind `element_kind`), or a cheaper
+  mitigation of the hole fill (`flowTypeCache[nodeId]` after each reset).
+  (3) Callback specialization for `forEach`/`map`/`filter`/`some`/`every`
+  and the other call-only parameters (`binarySearchKey`'s key selector and
+  comparer, `findAncestor`'s callback are the remaining `ts_call` hot spots);
+  the remaining 2,319 dynamic method sites. (4) The remaining pattern gaps:
+  small calls with object arguments 4.4x (inline-cache probe cost), array
+  callbacks 3.9x, flags 3.9x, arrays of objects 2.75x; constructor
+  pre-sizing from layouts; local classes from declared types; C5b-2/3.
+  Smaller items still open: the minor-collection trigger counts cell bytes
+  only, and closures passed to non-devirtualized callees are never
+  stack-allocated.

@@ -229,6 +229,12 @@ When an exporter/analyzer change produces a new IR/optimization pattern, **the f
 
 ---
 
+- **`dt` caches the regexp/unicode support objects (`build/regexp/*.o`, `build/quickjs/*.o`) and does
+  not rebuild them when their sources or `runtime/ts_rt.h` change.** A stale adapter object shows up as
+  a link error such as `Undefined symbols: _ts_number_coerce` (a symbol that has since become
+  `static inline`). After editing anything under `runtime/regexp/` or the runtime header, run
+  `rm -f build/regexp/*.o build/quickjs/*.o` before the next `dt`. The gates build their own copies.
+
 ## 8. 30-second summary (the shortest single-bug fix)
 
 1. Read the tail of `docs/TODO.md`.
