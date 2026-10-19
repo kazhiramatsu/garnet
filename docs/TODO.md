@@ -4998,14 +4998,50 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   lookups 11.58M → 68k per compile, GC pauses 576 ms. Compiler A/B against
   the absent-cache build, alternating three runs, outputs validated,
   diagnostics zero: **6.260 → 6.236 s median wall (0.4% less; three A/Bs of the slice read −0.3%, −0.2% and −0.4%, eleven of their twelve timed run pairs favouring the new build)**. Gates: conformance 437/437, parity 341 identical + 92 KNOWN (the fixture's loop literal surfaces the known FrameArena-vs-Stack annotation difference, allowlisted), bundler 42/42, selfconf 423 + 11 KNOWN, GC stress (all phases), inline policy, units (every verdict read from the gate output; a first chain failed one conformance fixture, `classes/dynamic_class_registry_edges`, on the withdrawn `Object.create` reject).
-- Next slices, in order. (1) Capture by value for immutable bindings
-  (design to write): a closure that captures a never-reassigned parameter
-  or constant takes the value in its environment instead of a record cell,
-  and a function whose captured bindings are all immutable allocates no
-  environment record — the hottest allocation sites of the compiler
-  (`getTypeFactsWorker` 882k records per compile, ...); hoisted inner
-  function declarations may capture only parameters by value, since they
-  are created before any body constant is initialized. (2) Stack
+- Capture by value for immutable bindings
+  (`docs/value_captures_design.md`). A captured binding lived in a cell —
+  its owner's scope record, allocated in every activation of the owner,
+  or a per-iteration `__cell` — and every access went through it. The
+  per-site statistics showed the hottest allocation sites of the compiler
+  to be scope records that exist only because a small arrow passed to
+  `some`/`map`/`everyType`/`reduceLeft` reads a parameter nobody assigns.
+  The exporter now classifies bindings: one assigned anywhere other than
+  its declaration (`=`, compound, `++`/`--`, destructuring, `for (x of
+  …)` on an existing variable, or declared without an initializer) stays
+  in a cell; an immutable parameter, or an immutable `const`/`let` with
+  an initializer, owned by a real function, travels by value — the owner
+  keeps a plain local, closures and directly called nested declarations
+  receive the value as a leading parameter in the binding's own kind
+  (numbers unboxed), and reads in the callee are the ordinary local path.
+  A constant is captured by value only by closures created after its
+  declaration (expression closures textually after it; nested
+  declarations that are only ever called directly), so a hoisted
+  declaration used as a value keeps body constants in the record; a
+  parameter may go by value anywhere. Captures by class constructors,
+  dynamic members and field initializers stay cells. A first build
+  materialized a closure at every direct call of a nested declaration
+  whose value captures the caller held as plain locals (the "captures
+  unavailable" test only knew records and cells; 8,088 extra closure
+  sites, `getUnionType` created at 132 sites instead of one) — the test
+  now counts a value binding the caller holds as available.
+  `TSAOT_VALUE_CAPTURES=0` (exporter) keeps every capture in cells; the
+  parity oracle's corpus is exported with it. IR of the compiler:
+  scope-record classes 972 → 310 (fields 6,164 → 4,466), record allocation sites 1,138 → 405, closure sites unchanged at 9,219, 7,936 → 7,272 cell bindings; of the 5.41M record allocations at the forty hottest sites of the `x11` statistics compile, 3.70M are gone — `getTypeFactsWorker`, `instantiateTypeWithSingleGenericCallSignature`, `hasMatchingRecursionIdentity`, `isDeeplyNestedType`, `getNormalizedUnionOrIntersectionType`, `narrowTypeByTruthiness`, `onSuccessfullyResolvedSymbol`, `tryParseParenthesizedArrowFunctionExpression`, `withJSDoc`, `checkSourceElementWorker`, `isConstTypeVariable`, `getDeclarationName` and `filterType` no longer allocate one; `checkTypeRelatedTo`, `getFlowTypeOfReference`, `getSignaturesOfType`, `checkIdentifier` and `recursiveTypeRelatedTo` keep theirs for the bindings they assign or capture through hoisted declarations. Fixture `closures/value_captures` (parameters captured
+  by arrows passed to callbacks and by hoisted declarations, constants
+  and loop constants with per-iteration semantics, closures stored and
+  called later, nested threading three levels deep, every assignment form
+  keeping its binding shared, a default parameter, generators and async
+  functions, object-literal methods, a closure created before its
+  constant's declaration, 20k closures holding object values across
+  collections), on both exporter paths. Compiler A/B against the
+  sized-only build, alternating three runs, outputs validated,
+  diagnostics zero: **6.232 → 6.066 s median wall (2.7% less; the three timed run pairs read −2.9%, −2.3% and −2.0%); Node 3.311 s, native 1.83x slower than V8; RSS 1,166 → 1,089 MB**. Statistics relink:
+  allocations 23.64M → 17.64M per compile (2.65 → 2.13 GB), objects 12.06M → 6.06M, closures unchanged at 3.26M, minor collections 615 → 487. Gates: conformance 438/438, parity 341 identical + 93 KNOWN (the fixture surfaces a pre-existing rooting difference of the frozen emitter in its generator and async owners, allowlisted), bundler 42/42, selfconf 424 + 11 KNOWN, GC stress (all phases), inline policy, units (every verdict read from the gate output).
+- Next slices, in order. (1) Value captures, second round: bindings
+  declared by destructuring, `let` assigned exactly once after its
+  declaration, and the lexical `this` of arrows (immutable within a
+  function); the records that remain because a hoisted declaration used as
+  a value captures a body constant. (2) Stack
   allocation of callback closures the callee is known not to retain
   (`some`/`map`/`forEach`/`every` and the checker's own helpers), with
   the lifetime fixtures the stack-closure slice set out. (3) The generic

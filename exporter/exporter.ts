@@ -137,7 +137,9 @@ interface CaptureRecord {
 /** One entry of a callee's capture layout: a whole scope record, or one cell. */
 type CaptureSlot =
   | { kind: "record"; owner: ts.Node; binding: number; classId: number; syms: ts.Symbol[] }
-  | { kind: "cell"; sym: ts.Symbol; binding: number };
+  | { kind: "cell"; sym: ts.Symbol; binding: number }
+  // docs/value_captures_design.md: an immutable binding travels as its value
+  | { kind: "value"; sym: ts.Symbol; binding: number };
 
 interface FnCtx {
   id: number;
@@ -296,6 +298,15 @@ class Exporter {
   synthCtorMemo = new Map<number, number>();
   bindingId = new Map<ts.Symbol, number>();
   cellBindings = new Set<ts.Symbol>();
+  // Capture by value (docs/value_captures_design.md): bindings assigned anywhere
+  // other than their declaration; bindings that must stay cells because a
+  // creation site of unknown order captures them; the functions capturing each
+  // binding; and the bindings that travel by value (removed from cellBindings).
+  assignedSyms = new Set<ts.Symbol>();
+  cellOnlySyms = new Set<ts.Symbol>();
+  capturedByFns = new Map<ts.Symbol, FnLike[]>();
+  valueBindings = new Set<ts.Symbol>();
+  valueCaptures = process.env.TSAOT_VALUE_CAPTURES !== "0";
   // Capture contexts (docs/capture_contexts_design.md): the scope record of each
   // owner function and the owner of every record-resident binding.
   captureContexts = false;
@@ -1955,6 +1966,79 @@ class Exporter {
   /** A captured binding lives in its owner's scope record unless it needs its
    *  own cell: a binding declared inside a loop (fresh per iteration), the
    *  lexical-this sentinel, or the self binding of a named function expression. */
+  /** Every binding some assignment targets (`=`, compound, `++`/`--`, a
+   *  destructuring assignment, `for (x of …)` with an existing variable) and
+   *  every `let`/`var` declared without an initializer. Declaration
+   *  initializers do not count. */
+  private computeAssignedBindings(): void {
+    const mark = (id: ts.Identifier) => { const sym = this.symbolOf(id); if (sym) this.assignedSyms.add(sym); };
+    const target = (e: ts.Expression) => {
+      if (ts.isIdentifier(e)) { mark(e); return; }
+      if (ts.isParenthesizedExpression(e)) { target(e.expression); return; }
+      if (ts.isArrayLiteralExpression(e)) { for (const el of e.elements) target(el); return; }
+      if (ts.isObjectLiteralExpression(e)) {
+        for (const prop of e.properties) {
+          if (ts.isShorthandPropertyAssignment(prop)) mark(prop.name);
+          else if (ts.isPropertyAssignment(prop)) target(prop.initializer);
+          else if (ts.isSpreadAssignment(prop)) target(prop.expression);
+        }
+        return;
+      }
+      if (ts.isSpreadElement(e)) { target(e.expression); return; }
+      if (ts.isBinaryExpression(e) && e.operatorToken.kind === ts.SyntaxKind.EqualsToken) { target(e.left); return; }
+      if (ts.isOmittedExpression(e)) return;
+      // property/element targets assign a property, not a binding
+    };
+    const visit = (n: ts.Node) => {
+      if (ts.isBinaryExpression(n) && n.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && n.operatorToken.kind <= ts.SyntaxKind.LastAssignment) target(n.left);
+      else if ((ts.isPrefixUnaryExpression(n) || ts.isPostfixUnaryExpression(n)) &&
+               (n.operator === ts.SyntaxKind.PlusPlusToken || n.operator === ts.SyntaxKind.MinusMinusToken)) target(n.operand);
+      else if ((ts.isForInStatement(n) || ts.isForOfStatement(n)) && !ts.isVariableDeclarationList(n.initializer)) target(n.initializer);
+      else if (ts.isVariableDeclaration(n) && !n.initializer && ts.isIdentifier(n.name) &&
+               !(n.parent && ts.isVariableDeclarationList(n.parent) && (ts.isForOfStatement(n.parent.parent) || ts.isForInStatement(n.parent.parent)))) mark(n.name);
+      ts.forEachChild(n, visit);
+    };
+    for (const m of this.modules) visit(m);
+  }
+  /** May `s` travel by value (docs/value_captures_design.md)? Never assigned,
+   *  owned by a real function, a plain parameter or an initialized
+   *  `const`/`let`, and — unless a parameter — captured only by closures created
+   *  after its declaration (expression closures textually after it, and nested
+   *  declarations that are only ever called directly). */
+  private valueCapturable(s: ts.Symbol): boolean {
+    if (!this.valueCaptures || s === this.lexicalThisSym) return false;
+    if (this.assignedSyms.has(s) || this.cellOnlySyms.has(s)) return false;
+    if (this.funcSymbols.has(s) || this.classSymToId.has(s) || this.namespaceBindings.has(s)) return false;
+    if (this.moduleScopeSyms.has(s) || this.isScriptGlobalVarSymbol(s)) return false;
+    const d = s.valueDeclaration ?? s.declarations?.[0];
+    if (!d || (s.declarations?.length ?? 0) !== 1) return false;
+    const owner = this.symbolOwnerFunction(s);
+    if (!owner || owner === this.moduleInitNode || owner === this.functionValuesInitNode) return false;
+    let isParam = false;
+    if (ts.isParameter(d)) {
+      if (!ts.isIdentifier(d.name) || d.dotDotDotToken) return false;
+      if (!(d.parent as ts.Node) || (d.parent as ts.Node) !== owner) return false;
+      isParam = true;
+    } else if (ts.isVariableDeclaration(d)) {
+      if (!ts.isIdentifier(d.name) || !d.initializer) return false;
+      const list = d.parent;
+      if (!ts.isVariableDeclarationList(list) || (list.flags & (ts.NodeFlags.Const | ts.NodeFlags.Let)) === 0) return false;
+    } else {
+      return false;
+    }
+    if (!isParam) {
+      for (const f of this.capturedByFns.get(s) ?? []) {
+        const fn = f as unknown as ts.Node;
+        if (ts.isFunctionDeclaration(fn)) {
+          const fsym = fn.name ? this.symbolOf(fn.name) : undefined;
+          if (!this.lazyFnDecls || !fsym || this.fnValueUsed.has(fsym)) return false; // hoisted as a value
+          continue;
+        }
+        if (fn.pos < d.end) return false; // created before the declaration completes
+      }
+    }
+    return true;
+  }
   private recordEligible(s: ts.Symbol): boolean {
     if (s === this.lexicalThisSym) return false;
     const d = s.valueDeclaration ?? s.declarations?.[0];
@@ -2065,8 +2149,10 @@ class Exporter {
    *  sites and the callee prologue agree. */
   captureSlots(frees: ts.Symbol[]): CaptureSlot[] {
     const cells: ts.Symbol[] = [];
+    const values: ts.Symbol[] = [];
     const recs = new Map<ts.Node, ts.Symbol[]>();
     for (const s of frees) {
+      if (this.valueBindings.has(s)) { values.push(s); continue; }
       const owner = this.captureContexts ? this.recordOwnerOf.get(s) : undefined;
       if (owner === undefined) { cells.push(s); continue; }
       let arr = recs.get(owner);
@@ -2082,10 +2168,12 @@ class Exporter {
     }
     cells.sort((a, b) => this.bindingIdOf(a) - this.bindingIdOf(b));
     for (const sym of cells) out.push({ kind: "cell", sym, binding: this.bindingIdOf(sym) });
+    values.sort((a, b) => this.bindingIdOf(a) - this.bindingIdOf(b));
+    for (const sym of values) out.push({ kind: "value", sym, binding: this.bindingIdOf(sym) });
     return out;
   }
   private slotName(slot: CaptureSlot): string {
-    if (slot.kind === "cell") return (slot.sym as { name?: string }).name ?? "?";
+    if (slot.kind === "cell" || slot.kind === "value") return (slot.sym as { name?: string }).name ?? "?";
     return `<record of ${(slot.owner as { name?: { text?: string } }).name?.text ?? "fn"}>`;
   }
   /** The local holding `owner`'s record here: the function's own record, the
@@ -2105,16 +2193,33 @@ class Exporter {
   }
   /** Supply a capture slot at a creation/call site (module fallback allowed). */
   private supplySlot(ctx: FnCtx, slot: CaptureSlot): number | undefined {
+    if (slot.kind === "value") return ctx.localOfSymbol.get(slot.sym);
     if (slot.kind === "cell") return this.availableCaptureCell(ctx, slot.sym);
     return this.availableRecord(ctx, slot.owner);
   }
   /** Supply a capture slot strictly from what this function holds (ctor paths). */
   private heldSlot(ctx: FnCtx, slot: CaptureSlot): number | undefined {
+    if (slot.kind === "value") return ctx.localOfSymbol.get(slot.sym);
     if (slot.kind === "cell") return ctx.cellAccess.get(slot.sym);
     return ctx.recordLocals?.get(slot.owner);
   }
   /** Declare the leading parameter that receives one capture slot. */
   private bindCaptureParam(ctx: FnCtx, slot: CaptureSlot): void {
+    if (slot.kind === "value") {
+      // The value itself is the leading parameter; reads take the ordinary
+      // local path (never captured storage), in the binding's declared kind.
+      const d = slot.sym.valueDeclaration ?? slot.sym.declarations?.[0];
+      const nameNode = d && (ts.isParameter(d) || ts.isVariableDeclaration(d)) && ts.isIdentifier(d.name) ? d.name : undefined;
+      const kind: RefKind = nameNode ? this.refKindOf(nameNode) : "reference";
+      const lid = this.newLocal(ctx, kind, `val_${(slot.sym as { name?: string }).name ?? "v"}`, slot.binding);
+      ctx.localOfSymbol.set(slot.sym, lid);
+      ctx.params.push(lid);
+      try {
+        const pcid = nameNode ? this.classOfExpr(nameNode) : undefined;
+        if (pcid !== undefined) (ctx.paramClasses ||= {})[String(lid)] = pcid;
+      } catch { /* ignore */ }
+      return;
+    }
     if (slot.kind === "cell") {
       const lid = this.newLocal(ctx, "reference", `cell_${(slot.sym as { name?: string }).name ?? "v"}`, slot.binding);
       ctx.cellAccess.set(slot.sym, lid);
@@ -2212,6 +2317,10 @@ class Exporter {
       const cell = this.supplySlot(ctx, slot);
       if (cell === undefined) return undefined;
       captures.push({ binding: slot.binding, cell });
+    }
+    if (process.env.TSAOT_DEBUG_FNVALUE && sym) {
+      const owner = this.recordOwnerOf.get(sym);
+      console.error(`[fnvalue] ${ctx.name} creates ${(sym as { name?: string }).name}: cellBinding=${this.cellBindings.has(sym)} valueBinding=${this.valueBindings.has(sym)} recordOwner=${owner ? ((owner as { name?: { text?: string } }).name?.text ?? "fn") : "none"} recordLocal=${owner ? ctx.recordLocals?.get(owner) : "-"} recordAccess=${ctx.recordAccess?.has(sym)} cellAccess=${ctx.cellAccess.has(sym)}`);
     }
     const value = this.newLocal(ctx, "reference", "callee");
     const site = this.site++;
@@ -5378,7 +5487,8 @@ class Exporter {
       if (callee.kind === "Direct" && recv === undefined) {
         const target = this.fnNodeById(callee.func);
         const unavailable = target && this.sortedFreeVars(target as FnLike).some((s) =>
-          !this.hasCaptured(ctx, s) && !this.moduleCellGlobal.has(s));
+          !this.hasCaptured(ctx, s) && !this.moduleCellGlobal.has(s) &&
+          !(this.valueBindings.has(s) && ctx.localOfSymbol.has(s)));
         // Fixed-ABI helpers may not hold every module cell. The already-created
         // function value carries the environment. It also supplies captured
         // arguments and `this` correctly when the call has a spread list.
@@ -12006,19 +12116,25 @@ class Exporter {
     for (const m of this.modules) walk(m);
     if (this.functionValuesInitNode) allFns.push(this.functionValuesInitNode as unknown as FnLike);
     if (this.moduleInitNode) allFns.push(this.moduleInitNode as unknown as FnLike);
-    for (const f of allFns) for (const s of this.freeVars(f)) this.cellBindings.add(s);
+    this.computeAssignedBindings();
+    for (const f of allFns) for (const s of this.freeVars(f)) {
+      this.cellBindings.add(s);
+      let arr = this.capturedByFns.get(s);
+      if (!arr) { arr = []; this.capturedByFns.set(s, arr); }
+      arr.push(f);
+    }
     // Class methods/ctors aren't in allFns, but a ctor's free vars now include its
     // field-initializer / dynamic-member captures (see freeVars). Any function-local
     // such binding must be cell-allocated in its OWNER function so the `new`/`super`
     // site can thread it into the Direct-called ctor (ctorCellArgs).
-    for (const md of this.methodDecls) for (const s of this.freeVars(md.node as unknown as FnLike)) this.cellBindings.add(s);
+    for (const md of this.methodDecls) for (const s of this.freeVars(md.node as unknown as FnLike)) { this.cellBindings.add(s); this.cellOnlySyms.add(s); }
     // Installed dynamic/symbol methods are lifted as closures (lowerClosure) at the
     // install site (the ctor, or inline at `new` for a ctor-less class), capturing
     // from that site's cellAccess. Their function-local captures must therefore be
     // cells in the owning function too — even when the class has no explicit ctor.
     for (const cn of this.classNodeOfId.values())
       for (const m of cn.members)
-        if (this.isDynComputedInstallMethod(m) || this.isDynComputedInstallAccessor(m)) for (const s of this.freeVars(m as unknown as FnLike)) this.cellBindings.add(s);
+        if (this.isDynComputedInstallMethod(m) || this.isDynComputedInstallAccessor(m)) for (const s of this.freeVars(m as unknown as FnLike)) { this.cellBindings.add(s); this.cellOnlySyms.add(s); }
     // A class WITHOUT an explicit constructor used as a class value runs its field
     // initializers in a synthesized ctor (synthClassValueCtor). Function-local
     // bindings those field inits capture must be cell-allocated in the owning
@@ -12028,8 +12144,15 @@ class Exporter {
     for (const [cid, cn] of this.classNodeOfId) {
       if (this.ctorNodeOfClassId(cid)) continue; // explicit ctor: handled via methodDecls
       void cn;
-      for (const s of this.synthCtorFreeVars(cid)) this.cellBindings.add(s);
+      for (const s of this.synthCtorFreeVars(cid)) { this.cellBindings.add(s); this.cellOnlySyms.add(s); }
     }
+    // Capture by value: an immutable binding leaves cellBindings (its owner keeps
+    // a plain local) and is supplied to its closures as a value slot.
+    for (const s of [...this.cellBindings]) {
+      if (this.valueCapturable(s)) { this.cellBindings.delete(s); this.valueBindings.add(s); }
+    }
+    if (process.env.TSAOT_DEBUG_CELLS)
+      console.error(`[cells] by value: [${[...this.valueBindings].map((s) => (s as { name?: string }).name ?? "?").join(",")}]`);
 
     // A NAMED (vtable) instance/static method or accessor that captures an
     // enclosing function's local cannot work: vtable/static dispatch has a fixed

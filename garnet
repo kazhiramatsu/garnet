@@ -75,6 +75,10 @@
 #   TSAOT_ARRAY_INTERFACES=0  Exporter: treat an interface that extends Array or
 #                          ReadonlyArray as a dynamic receiver instead of an
 #                          array (legacy IR).
+#   TSAOT_VALUE_CAPTURES=0  Exporter: keep every captured binding in a cell or
+#                          scope record instead of passing immutable bindings
+#                          (parameters, constants) to closures by value
+#                          (legacy IR).
 #   TSAOT_GC_AGE_THRESHOLD=1  Disable the default one-minor aging grace at
 #                          application runtime (immediate first-survival promotion).
 #   TSAOT_GC_AGING_ADAPTIVE=0 Disable runtime survival feedback and use the
