@@ -125,7 +125,10 @@ int ts_truthy(tsv v);
 /* ---- heap object model (the dynamic fallback) ----
  * Every heap cell starts with a common GC header carrying a kind tag and the
  * sweep-list link, so the collector can free objects and strings correctly. */
-enum { TS_KIND_OBJECT = 1, TS_KIND_STRING = 2, TS_KIND_FUNC = 3, TS_KIND_ARRAY = 4, TS_KIND_MAP = 5, TS_KIND_SET = 6, TS_KIND_PROMISE = 7, TS_KIND_CORO = 8, TS_KIND_ACCESSOR = 9, TS_KIND_SYMBOL = 10, TS_KIND_PROXY = 11 };
+/* OBJECT and ARRAY are adjacent: both carry shaped named properties, and the
+   property caches admit a receiver with one compare (`kind <= TS_KIND_ARRAY`;
+   docs/shaped_array_props_design.md). */
+enum { TS_KIND_OBJECT = 1, TS_KIND_ARRAY = 2, TS_KIND_STRING = 3, TS_KIND_FUNC = 4, TS_KIND_MAP = 5, TS_KIND_SET = 6, TS_KIND_PROMISE = 7, TS_KIND_CORO = 8, TS_KIND_ACCESSOR = 9, TS_KIND_SYMBOL = 10, TS_KIND_PROXY = 11 };
 typedef struct ts_gc_header {
   uint8_t kind, mark, gen, remembered;
   /* One 32-bit word so positional initializers of static cells (string
@@ -418,7 +421,7 @@ static inline tsv* ts_obj_slot_ptr(ts_object* o, uint32_t slot){
 /* A sized class instance (registered struct storage after the header) versus
    a plain object whose cell is the header plus its inline slots. */
 static inline int ts_obj_is_sized(const ts_object* o){
-  return o->h.size != sizeof(ts_object) + sizeof(tsv) * (size_t)o->h.inline_cap;
+  return o->h.kind == TS_KIND_OBJECT && o->h.size != sizeof(ts_object) + sizeof(tsv) * (size_t)o->h.inline_cap;
 }
 
 enum {
@@ -1585,7 +1588,7 @@ TS_RT_ALWAYS_INLINE tsv* ts_prop_ic_probe_fixed_inline(
   if (!ic || ic->megamorphic || TS_TOP16(obj) != TS_SEL_OBJECT) return NULL;
   ts_object* o = (ts_object*)ts_ptr(obj);
   uint32_t sid = ts_obj_shape_id(o);
-  if (o->h.kind != TS_KIND_OBJECT || sid == TS_SHAPE_NONE) return NULL;
+  if (o->h.kind > TS_KIND_ARRAY || sid == TS_SHAPE_NONE) return NULL;   /* a plain object or an array */
   /* Entry 0 first: its shape (the monomorphic case), then its slot validated
      against this shape's key vector. The compiler's reads are mostly
      shape-polymorphic with the key at one slot (61% of hits measured in
@@ -1717,7 +1720,7 @@ TS_RT_ALWAYS_INLINE void ts_set_pic_inline_lazy(
 TS_RT_ALWAYS_INLINE tsv* ts_static_slot_probe(tsv obj, ts_key key, uint32_t slot, uint8_t mask, uint8_t want, const ts_prop_ic* ic){
   if (TS_TOP16(obj) != TS_SEL_OBJECT) return NULL;
   ts_object* o = (ts_object*)ts_ptr(obj);
-  if (o->h.kind != TS_KIND_OBJECT) return NULL;
+  if (o->h.kind > TS_KIND_ARRAY) return NULL;
   uint32_t sid = ts_obj_shape_id(o);
   const ts_key* ks = g_ts_shape_keys[sid];
   if (ks[slot] != key){
@@ -1736,7 +1739,7 @@ TS_RT_ALWAYS_INLINE tsv* ts_static_slot_probe(tsv obj, ts_key key, uint32_t slot
 TS_RT_ALWAYS_INLINE tsv* ts_static_slot_probe2(tsv obj, ts_key key, uint32_t s1, uint32_t s2, uint8_t mask, uint8_t want, const ts_prop_ic* ic){
   if (TS_TOP16(obj) != TS_SEL_OBJECT) return NULL;
   ts_object* o = (ts_object*)ts_ptr(obj);
-  if (o->h.kind != TS_KIND_OBJECT) return NULL;
+  if (o->h.kind > TS_KIND_ARRAY) return NULL;
   uint32_t sid = ts_obj_shape_id(o);
   const ts_key* ks = g_ts_shape_keys[sid];
   uint32_t slot = ks[s1] == key ? s1 : ks[s2] == key ? s2 : TS_STATIC_SLOT_LIMIT;
@@ -1755,7 +1758,7 @@ TS_RT_ALWAYS_INLINE tsv* ts_static_slot_probe2(tsv obj, ts_key key, uint32_t s1,
 TS_RT_ALWAYS_INLINE tsv* ts_static_slot_probe3(tsv obj, ts_key key, uint32_t s1, uint32_t s2, uint32_t s3, uint8_t mask, uint8_t want, const ts_prop_ic* ic){
   if (TS_TOP16(obj) != TS_SEL_OBJECT) return NULL;
   ts_object* o = (ts_object*)ts_ptr(obj);
-  if (o->h.kind != TS_KIND_OBJECT) return NULL;
+  if (o->h.kind > TS_KIND_ARRAY) return NULL;
   uint32_t sid = ts_obj_shape_id(o);
   const ts_key* ks = g_ts_shape_keys[sid];
   uint32_t slot = ks[s1] == key ? s1 : ks[s2] == key ? s2 : ks[s3] == key ? s3 : TS_STATIC_SLOT_LIMIT;

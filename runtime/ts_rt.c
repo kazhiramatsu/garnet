@@ -1339,6 +1339,7 @@ static tsv ts_new_array_impl(uint32_t len, int pretenured){
     ? gc_alloc_pretenured(sizeof(ts_array), TS_KIND_ARRAY)
     : gc_alloc(sizeof(ts_array), TS_KIND_ARRAY);
   a->o.proto = ts_proto_ref(g_array_proto_v) ? g_array_proto_v : TS_NULL;
+  a->o.shape = TS_SHAPE_EMPTY;   /* named properties (NodeArray's pos/end/...) are shaped: the caches apply */
   array_init_storage(a, len);
   tsv arr = ts_obj(a);
   if (pretenured) ts_write_barrier(arr, a->o.proto);
@@ -1947,6 +1948,20 @@ static inline int kind_has_common_header(uint8_t k){
    set use the OBJECT NaN-box selector; functions use the FUNC selector. Both are
    valid ts_get/ts_set receivers in the unified model. */
 static inline int ts_is_propbag(tsv v){ return ts_is_obj(v) || ts_is_func(v); }
+/* A receiver the property caches serve for `key`: a plain object, or an array
+   for any named key but `length` (an array's length is virtual, not a slot;
+   docs/shaped_array_props_design.md). Index keys reach the caches only through
+   the dynamic path. */
+static int prop_key_is_array_index(uint32_t k, uint32_t* idx);
+static inline int prop_cache_receiver(const ts_object* o, ts_key key){
+  if (o->h.kind == TS_KIND_OBJECT) return 1;
+  if (o->h.kind != TS_KIND_ARRAY) return 0;
+  /* A plain array (typed storage has virtual byteLength/byteOffset/...), any
+     named key but the virtual `length` and the index-like names ("1" through
+     a dynamic key is an element). */
+  uint32_t idx;
+  return ((const ts_array*)o)->element_kind == 0 && !field_name_is(key, "length") && !prop_key_is_array_index(key, &idx);
+}
 /* A class used as a runtime value is a ts_func carrying a (class_id+1) tag. It is
    object-like for ToPrimitive / iteration (its static [Symbol.toPrimitive]/
    [Symbol.iterator]/valueOf/toString live on the proto-linked static container),
@@ -11655,7 +11670,7 @@ tsv ts_get_pic_checked(tsv obj, ts_key key, ts_prop_ic* ic){
   TS_RT_STAT_PIC_GET_CALL();
   if (ic && g_negative_pic && TS_TOP16(obj) == TS_SEL_OBJECT){
     ts_object* o = (ts_object*)ts_ptr(obj);
-    if (o->h.kind == TS_KIND_OBJECT && prop_absent_lookup(ic, o, key)){
+    if (prop_cache_receiver(o, key) && prop_absent_lookup(ic, o, key)){
       RT_STAT_INC(pic_absent_hits);
       RT_STAT_KEY(g_key_absent, key);
       return TS_UNDEFINED;
@@ -11664,7 +11679,7 @@ tsv ts_get_pic_checked(tsv obj, ts_key key, ts_prop_ic* ic){
   if (ic && ic->megamorphic) return ts_get(obj, key);
   if (TS_TOP16(obj) == TS_SEL_OBJECT){
     ts_object* o = (ts_object*)ts_ptr(obj);
-    if (o->h.kind == TS_KIND_OBJECT){
+    if (prop_cache_receiver(o, key)){
       ts_pref own = prop_ic_probe_own(ic, o, key);
       if (pref_ok(own)){ TS_RT_STAT_PIC_GET_HIT(); return prop_ic_read(obj, own); }
       ts_prop_location* e = prop_ic_probe(ic, obj, key);
@@ -11875,7 +11890,7 @@ void ts_set_pic(tsv obj, ts_key key, tsv val, ts_prop_ic* ic){
   if (ic && ic->megamorphic){ ts_set(obj, key, val); return; }
   if (TS_TOP16(obj) == TS_SEL_OBJECT){
     ts_object* o = (ts_object*)ts_ptr(obj);
-    if (o->h.kind == TS_KIND_OBJECT){
+    if (prop_cache_receiver(o, key)){
       /* The addition this site cached, before any probe for an existing key
          (a constructor initializing a fresh object): the same conditions as
          the global addition cache, read from the site itself. */

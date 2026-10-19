@@ -5791,6 +5791,38 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   cache applies), `next` 0.8M (the iterator protocol's method lookup per
   step; the spec reads `next` once per loop), `get` 0.45M, `type` 0.42M,
   `aliasSymbol` 0.41M.
+- Shaped named properties on arrays (builds `x44`, full build, and `x45`,
+  relinked; runtime only; `docs/shaped_array_props_design.md`). An array
+  was allocated with shape 0, so the `NodeArray` properties the node
+  factory sets on every node list (`pos`, `end`, `hasTrailingComma`,
+  `transformFlags`: 4.1M dictionary lookups per compile) lived in the
+  dictionary and no cache served them. Arrays now start at the empty
+  shape (their named properties take shape transitions into the external
+  value vector), `ts_obj_is_sized` is true only for a plain-object cell
+  of another size, the kinds are renumbered so OBJECT and ARRAY are
+  adjacent and the inline and static probes admit a receiver with the
+  same one compare (`kind <= TS_KIND_ARRAY`; the generated C names kinds
+  symbolically), and the out-of-line cached paths serve an array for any
+  named key but `length`. The first build (`x44`) failed two conformance
+  fixtures: a typed array's virtual `byteLength`/`byteOffset`/
+  `BYTES_PER_ELEMENT` and an index-like dynamic key (`arr["1"]`) reached
+  the cached path and missed; `x45` excludes typed storage and index-like
+  names (`prop_cache_receiver`). Fixture `arrays/named_props_shaped`
+  (with an allowlist row: the Rust emitter places one non-escaping
+  literal on the frame arena where the frozen emitter stacks it). Gates
+  all green on `x45` (conformance 456/456, parity identical=350
+  KNOWN=102). Statistics: dictionary lookups 14.8M -> 11.5M per compile
+  (`pos` 1.2M -> 0.43M, `end` 1.1M -> 0.27M, `transformFlags` and
+  `hasTrailingComma` gone); peak RSS 884 -> 865 MB (a shaped slot is 8
+  bytes, a dictionary entry 16). A/B against `x43`, two rounds of three
+  alternating runs: 4.536 vs 4.566 s and 4.549 vs 4.563 s median (four
+  of six pairs -0.7% to -1.3%, one 0.0%, one +0.4%): about -0.5%; Node
+  3.27-3.31 s (1.38x). Left in the histogram: `next` 0.79M (the iterator
+  protocol's per-step method lookup), `get` 0.45M (Map methods called
+  through interfaces that extend Map, such as `MultiMap`, which the
+  exporter does not classify as maps), `type`/`aliasSymbol`/`node` 0.3-0.4M
+  each (absent reads of optional fields through the negative cache's
+  misses).
 - Next slices, in order. (0) External element buffers (the malloc'd
   `data` of arrays, also strings' and maps' buffers) do not count toward
   the collector's trigger: a loop that drops large arrays grows without
