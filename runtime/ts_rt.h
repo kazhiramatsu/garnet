@@ -1422,6 +1422,10 @@ extern tsv* g_ts_cur_env;
 /* Closure constructors for code compiled with the environment ABI. */
 tsv  ts_make_closure_t(ts_code code, tsv* env, uint32_t envlen, int takes_this);
 tsv  ts_make_closure_t_pretenured(ts_code code, tsv* env, uint32_t envlen, int takes_this);
+/* A function object on the C stack (an allocation site the escape analysis
+   proved never leaves its frame): the fields ts_make_fn_impl/ts_make_closure_t
+   set, on a non-heap cell whose environment is the caller's array. */
+void ts_init_fn_stack(ts_func* f, ts_code code, tsv* env, uint32_t envlen, int takes_this);
 tsv  ts_make_class_value_cells(uint32_t class_id, ts_code ctor, tsv* env, uint32_t envlen);
 /* Give fn an own `.prototype` without allocating it: the fresh object (and its
    `constructor`) is created on first observation. Preferred emitted form. */

@@ -794,6 +794,19 @@ tsv ts_make_closure_t_pretenured(ts_code code, tsv* env, uint32_t envlen, int ta
   f->env_abi = (uint8_t)(envlen ? 1 : 0);
   return fv;
 }
+void ts_init_fn_stack(ts_func* f, ts_code code, tsv* env, uint32_t envlen, int takes_this){
+  memset(f, 0, sizeof(*f));
+  f->o.h.kind = TS_KIND_FUNC;
+  f->o.h.gen = TS_GEN_NONHEAP;
+  f->o.h.size = sizeof(ts_func);
+  f->o.proto = ts_proto_ref(g_function_proto_v) ? g_function_proto_v : TS_NULL;
+  f->code = (void*)code;
+  f->prototype_prop = TS_UNDEFINED;
+  f->env = envlen ? env : NULL;
+  f->envlen = envlen;
+  f->env_abi = (uint8_t)(envlen ? 1 : 0);
+  f->takes_this = (uint8_t)(takes_this ? 1 : 0);
+}
 void ts_set_fn_meta(tsv fn, uint32_t arity, const char* name){
   if (!ts_is_func(fn)) return;
   ts_func* f = ts_ptr(fn);

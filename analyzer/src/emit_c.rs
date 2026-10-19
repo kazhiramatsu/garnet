@@ -1357,6 +1357,9 @@ struct Ctx<'a> {
     i64_mode: bool,
     /// the return kind of the direct entry whose body is being emitted
     ret_kind: RetKind,
+    /// the prologue declared the function-scope stack cells (emit_stack_cell_decls);
+    /// the coroutine emitters do not, so their closures stay on the heap
+    stack_cells: bool,
     f64_mode: bool,
     /// Boxed locals carried by a generated shadow-root frame. Empty for
     /// coroutine emitters and when frame roots are disabled.
@@ -6469,6 +6472,7 @@ fn emit_i64_function(
             let _ = writeln!(s, "  tsv v{} = TS_UNDEFINED;", l.id.0);
         }
     }
+    emit_stack_cell_decls(s, &f.body, strat);
     if use_frame_roots {
         emit_frame_decl(s, &reflike, frame_layout.as_ref());
     }
@@ -6530,6 +6534,7 @@ fn emit_i64_function(
         numeric_value_local,
         i64_mode: true,
         ret_kind: RetKind::Boxed,
+        stack_cells: true,
         f64_mode: false,
         frame_locals,
         frame_slot: frame_layout.as_ref().map(|l| l.slot_of.clone()),
@@ -6637,6 +6642,7 @@ fn emit_f64_function(
             let _ = writeln!(s, "  tsv v{} = TS_UNDEFINED;", l.id.0);
         }
     }
+    emit_stack_cell_decls(s, &f.body, strat);
     if use_frame_roots {
         emit_frame_decl(s, &reflike, frame_layout.as_ref());
     }
@@ -6698,6 +6704,7 @@ fn emit_f64_function(
         numeric_value_local,
         i64_mode: false,
         ret_kind: RetKind::Boxed,
+        stack_cells: true,
         f64_mode: true,
         frame_locals,
         frame_slot: frame_layout.as_ref().map(|l| l.slot_of.clone()),
@@ -6803,6 +6810,7 @@ fn emit_function(
             numeric_value_local,
             i64_mode: false,
             ret_kind: RetKind::Boxed,
+            stack_cells: false,
             f64_mode: false,
             frame_locals: BTreeSet::new(),
             frame_slot: None,
@@ -6855,6 +6863,7 @@ fn emit_function(
             numeric_value_local,
             i64_mode: false,
             ret_kind: RetKind::Boxed,
+            stack_cells: false,
             f64_mode: false,
             frame_locals: BTreeSet::new(),
             frame_slot: None,
@@ -6907,6 +6916,7 @@ fn emit_function(
             numeric_value_local,
             i64_mode: false,
             ret_kind: RetKind::Boxed,
+            stack_cells: false,
             f64_mode: false,
             frame_locals: BTreeSet::new(),
             frame_slot: None,
@@ -6980,6 +6990,7 @@ fn emit_function(
             let _ = writeln!(s, "  tsv v{} = TS_UNDEFINED;", l.id.0);
         }
     }
+    emit_stack_cell_decls(s, &f.body, strat);
     if use_frame_roots {
         emit_frame_decl(s, &reflike, frame_layout.as_ref());
     }
@@ -7116,6 +7127,7 @@ fn emit_function(
         numeric_value_local,
         i64_mode: false,
         ret_kind: ret_kind,
+        stack_cells: true,
         f64_mode: false,
         frame_locals,
         frame_slot: frame_layout.as_ref().map(|l| l.slot_of.clone()),
@@ -7804,6 +7816,54 @@ fn direct_return_kind(f: &Function, unboxed: &BTreeSet<u32>, int_local: &BTreeSe
         return RetKind::F64;
     }
     RetKind::Boxed
+}
+
+fn stack_closures_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_STACK_CLOSURES").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
+/// Function-scope declarations of the stack cells of a body: the `ts_func`
+/// (and environment array) of every closure site with the `Stack` strategy
+/// and the struct of every class-instance site with it. Declared in the
+/// prologue, not at the site, so a value created inside an `if` block and
+/// read after it does not dangle (the `Stack` strategy bounds the lifetime
+/// by the frame, not by the C block).
+fn emit_stack_cell_decls(s: &mut String, body: &[Inst], strat: &BTreeMap<u32, AllocStrategy>) {
+    if !stack_closures_enabled() {
+        return;
+    }
+    let mut flat: Vec<&Inst> = Vec::new();
+    flatten_inst(body, &mut flat);
+    for inst in &flat {
+        match inst {
+            Inst::AllocClosure {
+                dst,
+                captures,
+                site,
+                ..
+            } if strat.get(&site.0) == Some(&AllocStrategy::Stack) => {
+                let _ = writeln!(s, "  ts_func sfn{};", dst.0);
+                if !captures.is_empty() {
+                    let _ = writeln!(s, "  tsv senv{}[{}];", dst.0, captures.len());
+                }
+            }
+            Inst::AllocObject {
+                dst,
+                site,
+                class_id: Some(c),
+                ..
+            } if strat.get(&site.0) == Some(&AllocStrategy::Stack) => {
+                let _ = writeln!(s, "  {} sobj{};", struct_name(c.0), dst.0);
+            }
+            _ => {}
+        }
+    }
 }
 
 fn truthy_unbox_enabled() -> bool {
@@ -16343,7 +16403,15 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         } else {
                             "0"
                         };
-                        let _ = writeln!(s, "  {} sobj{} = {{0}}; sobj{}.header.h.kind=TS_KIND_OBJECT; sobj{}.header.h.mark=0; sobj{}.header.h.gen=2; sobj{}.header.h.remembered=0; sobj{}.header.h.handle=0; sobj{}.header.h.size=sizeof({}); sobj{}.header.proto={}; sobj{}.header.props=0; sobj{}.header.cap=0; sobj{}.header.len=0; sobj{}.header.shape={};", cn, dst.0, dst.0, dst.0, dst.0, dst.0, dst.0, dst.0, cn, dst.0, proto_expr, dst.0, dst.0, dst.0, dst.0, shape);
+                        // the struct is declared at function scope by
+                        // emit_stack_cell_decls (a block-local would dangle
+                        // when the value is read after the block)
+                        let decl = if stack_closures_enabled() && ctx.stack_cells {
+                            format!("  memset(&sobj{0}, 0, sizeof({1}));", dst.0, cn)
+                        } else {
+                            format!("  {1} sobj{0} = {{0}};", dst.0, cn)
+                        };
+                        let _ = writeln!(s, "{} sobj{}.header.h.kind=TS_KIND_OBJECT; sobj{}.header.h.mark=0; sobj{}.header.h.gen=2; sobj{}.header.h.remembered=0; sobj{}.header.h.handle=0; sobj{}.header.h.size=sizeof({}); sobj{}.header.proto={}; sobj{}.header.props=0; sobj{}.header.cap=0; sobj{}.header.len=0; sobj{}.header.shape={};", decl, dst.0, dst.0, dst.0, dst.0, dst.0, dst.0, cn, dst.0, proto_expr, dst.0, dst.0, dst.0, dst.0, shape);
                         if !boxed.is_empty() {
                             let inits: Vec<String> = boxed
                                 .iter()
@@ -16491,6 +16559,31 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     "  ts_set_fn_meta({0}, FN_ARITY[{1}], FN_NAME[{1}]);\n  if (FN_HAS_PROTOTYPE[{1}]) ts_set_fn_prototype({0}, {2}());\n",
                     dst_name, func.0, make_proto)
             };
+            if st == AllocStrategy::Stack && stack_closures_enabled() && ctx.stack_cells {
+                // A closure that never leaves this frame: the ts_func and its
+                // environment live in function-scope stack cells declared by
+                // emit_stack_cell_decls; the collector marks and scans non-heap
+                // cells reached from the frame, so the environment slots are
+                // forwarded like any other.
+                for (i, c) in captures.iter().enumerate() {
+                    let _ = writeln!(s, "  senv{}[{}] = {};", dst.0, i, ctx.val(c.cell.0));
+                }
+                let _ = writeln!(
+                    s,
+                    "  ts_init_fn_stack(&sfn{0}, (ts_code){1}, {2}, {3}, {4});",
+                    dst.0,
+                    fname,
+                    if captures.is_empty() { "NULL".to_string() } else { format!("senv{}", dst.0) },
+                    captures.len(),
+                    tt
+                );
+                let _ = writeln!(s, "  {} = ts_func_v(&sfn{}); /* site {} Stack */", dst_name, dst.0, site.0);
+                if site_stats_enabled() {
+                    let _ = writeln!(s, "  ts_site_note({}, {});", site.0, func.0);
+                }
+                s.push_str(&set_meta);
+                return;
+            }
             if captures.is_empty() {
                 let _ = writeln!(
                     s,

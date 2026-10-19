@@ -4775,12 +4775,35 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   across forced collections, try/finally, recursion), the GC stress gate,
   and ideally a debug mode that poisons stack cells at frame exit so a
   surviving reference is detected rather than silently read.
-- Next slices, in order. (1) Stack-allocated non-escaping closures (the
-  `Stack` strategy), then `FrameArena`/`CallerArena` arrays and literals.
-  (2) Sparse element storage for arrays written far beyond their length.
-  (3) Callback specialization for the call-only parameters
-  (`binarySearchKey`, `findAncestor`, `forEach`/`map`/`filter`/`some`/
-  `every`); the remaining 2,319 dynamic method sites. (4) The remaining
-  pattern gaps: small calls with object arguments 4.4x, array callbacks
-  3.9x, flags 3.9x, arrays of objects 2.75x; constructor pre-sizing from
+- Stack-allocated non-escaping closures (`docs/stack_closures_design.md`;
+  the direction Kaz set at 11:35 — an object that does not escape lives on
+  the stack). The analyzer's `Stack` strategy was annotated on 1,300
+  closure sites of the compiler but every closure was heap-allocated. A
+  closure site with the `Stack` strategy now emits a `ts_func` and its
+  environment array as function-scope C stack cells, initialized by
+  `ts_init_fn_stack` (the fields `ts_make_closure_t` sets, on a non-heap
+  cell the collector already marks, scans and forwards when it is reached
+  from the frame); the class-instance stack cells moved from the block to
+  function scope the same way (a block-local struct read after its `if`
+  block dangled). The coroutine emitters keep heap closures (their
+  prologues declare no cells). In the compiler 1,294 of the 9,254 closure sites are stack cells (the 68 loop-body sites went to the frame arena with the fix above) and the 7 class-instance stack cells are declared at function scope; peak RSS is unchanged (851 MB with --noEmit). Fixture
+  `closures/stack_closures` (callbacks to direct callees, local calls,
+  conditional and nested closures, recursion through a local function,
+  metadata, call/apply, try/catch, and an environment holding young objects
+  across 200k allocations), also run under `TSAOT_GC_YOUNG_THRESHOLD=1`,
+  with full collections forced and with a 64 KB zapped nursery, matching
+  V8 each time. `TSAOT_STACK_CLOSURES=0` keeps heap closures (parity
+  oracle). Compiler A/B against the scalar-replacement build, alternating
+  three runs, outputs validated, diagnostics zero: **6.494 → 6.404 s median wall (1.4% less; every native run below every baseline run), peak RSS 1,171 → 1,160 MB**; the compiler is now 1.98x slower than V8 (Node 3.231 s) — under 2x for the first time.
+  Gates: conformance 432/432, parity 338 identical + 90 KNOWN (the parity corpus runs with `TSAOT_STACK_CLOSURES=0`), bundler 42/42, selfconf 418 + 11 KNOWN, GC stress (all phases), inline policy, units (every verdict read from the gate output).
+- Next slices, in order. (1) The arena strategies: 155 `FrameArena` arrays
+  and 639 `CallerArena` sites (360 arrays, 241 closures, 38 objects) are
+  still heap allocations with an annotation; a frame arena (bump allocation
+  released at function exit, scanned as a root while live) or, for small
+  fixed-size arrays, a stack cell with inline storage. The soundness
+  checklist above applies. (2) Sparse element storage for arrays written far
+  beyond their length. (3) Callback specialization for the call-only
+  parameters; the remaining 2,319 dynamic method sites. (4) The remaining
+  pattern gaps: small calls with object arguments 4.3x, array callbacks
+  3.9x, flags 3.9x, arrays of objects 2.7x; constructor pre-sizing from
   layouts; local classes from declared types; C5b-2/3; dead capture cells.

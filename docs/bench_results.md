@@ -739,6 +739,7 @@ Compiler A/Bs for the slice (three alternating runs each, outputs validated):
 | `native_s350x6` (typed direct-entry returns) | **6.851 s** | 0.8% less than `x5` (6.907 s in the same session); Node 3.300 s; diagnostics zero, outputs validated |
 | `native_s350x7` (array-derived interfaces as array receivers) | **6.764 s** | 4.3% less than `x6` (7.072 s in the same session); Node 3.275 s; diagnostics zero, outputs validated |
 | `native_s350x8` (scalar-replacement outer-alias fix, loop-body stack slots to the frame arena) | 6.593 s | noise level against `x7` (6.609 s in the same session); Node 3.271 s; diagnostics zero, outputs validated |
+| `native_s350x9` (stack-allocated non-escaping closures, hoisted stack cells) | **6.404 s** | 1.4% less than `x8` (6.494 s in the same session); Node 3.231 s; peak RSS 1,171 → 1,160 MB; diagnostics zero, outputs validated |
 
 ### Inline-cache path statistics (Session 350, `native_s350s_stats`)
 
