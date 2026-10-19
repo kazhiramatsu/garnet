@@ -234,6 +234,16 @@ When an exporter/analyzer change produces a new IR/optimization pattern, **the f
   a link error such as `Undefined symbols: _ts_number_coerce` (a symbol that has since become
   `static inline`). After editing anything under `runtime/regexp/` or the runtime header, run
   `rm -f build/regexp/*.o build/quickjs/*.o` before the next `dt`. The gates build their own copies.
+- **Per-site statistics builds (`TSAOT_SITE_STATS=1`, `TSAOT_NATIVE_STATS=1`) must compile the
+  generated C at `-O0`.** With the statistics macros expanded into every inline cache probe the
+  compiler's C takes more than 50 CPU minutes at `-O1` (two abandoned attempts in Session 350);
+  at `-O0` it takes one minute and the counts are the same. Regenerate with the statistics
+  environment, then compile `compiler.c` yourself with `-O0 -DTSAOT_RT_STATS -include
+  benchmarks/typescript_native/host.h` plus the mimalloc flags, link it against a `-DTSAOT_RT_STATS`
+  runtime and the regexp/unicode objects of a complete build (set `ROOT` before sourcing
+  `scripts/lib/regexp_link_flags.sh`), and run one `--noEmit` compile with `TSAOT_RT_STATS_FILE`.
+  The dump lists the 400 hottest sites; `sites.json` of the matching build maps site ids to
+  source spans and kinds (`cell` = scope record, `closure`, `array`, `object`).
 
 ## 8. 30-second summary (the shortest single-bug fix)
 

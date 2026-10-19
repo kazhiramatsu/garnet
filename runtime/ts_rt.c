@@ -5349,17 +5349,50 @@ tsv ts_array_concat(tsv x, tsv y){
    elements at `start` and insert `items` in their place, IN PLACE (array identity
    preserved). Returns a new array of the removed elements. `items` is passed as an
    array (possibly empty). */
+/* `arr.splice(start, 0, item)` whose result is discarded (the checker's
+   `typeSet.splice(~index, 0, type)`, 352k calls per compile): insert in
+   place — grow like push, shift the tail, store — with no items array, no
+   removed array and no rebuilt buffer (docs/splice_fast_paths_design.md). */
+tsv ts_array_splice_insert1(tsv arr, double start, tsv item){
+  ts_array* a=as_arr(arr); if(!a) return TS_UNDEFINED;
+  if(a->element_kind){                  /* fixed Uint16 storage: the general path coerces */
+    ts_gc_root(&arr); ts_gc_root(&item);
+    tsv items=ts_new_array(0); ts_gc_root(&items);
+    ts_array_push(items, item);
+    ts_array_splice(arr, start, 0, 1, items);
+    ts_gc_unroot(3); return TS_UNDEFINED;
+  }
+  if(ts_arr_frozen(arr)){ ts_array_set(arr, a->len, item); return TS_UNDEFINED; }   /* strict: a frozen array throws (ts_array_set's message) */
+  long n=(long)a->len;
+  long s=(long)start; if(s<0){ s+=n; if(s<0)s=0; } if(s>n) s=n;
+  array_ensure_cap(a, (uint32_t)n+1u);
+  memmove(a->data+s+1, a->data+s, (size_t)(n-s)*sizeof(tsv));
+  a->data[s]=item;
+  a->len=(uint32_t)n+1u;
+  array_invalidate_dirty(a);
+  ts_write_barrier(arr, item);
+  return TS_UNDEFINED;
+}
+static tsv ts_array_splice_impl(tsv arr, double start, double dc, int has_dc, tsv items, int want_removed);
 tsv ts_array_splice(tsv arr, double start, double dc, int has_dc, tsv items){
-  ts_array* a=as_arr(arr); if(!a) return ts_new_array(0);
-  if(ts_arr_frozen(arr)) return ts_new_array(0);   /* frozen: JS throws; we no-op (throw欠落) */
+  return ts_array_splice_impl(arr, start, dc, has_dc, items, 1);
+}
+/* splice whose result is discarded: no removed array. */
+tsv ts_array_splice_drop(tsv arr, double start, double dc, int has_dc, tsv items){
+  ts_array_splice_impl(arr, start, dc, has_dc, items, 0);
+  return TS_UNDEFINED;
+}
+static tsv ts_array_splice_impl(tsv arr, double start, double dc, int has_dc, tsv items, int want_removed){
+  ts_array* a=as_arr(arr); if(!a) return want_removed ? ts_new_array(0) : TS_UNDEFINED;
+  if(ts_arr_frozen(arr)){ ts_array_set(arr, a->len, TS_UNDEFINED); return want_removed ? ts_new_array(0) : TS_UNDEFINED; }   /* strict: a frozen array throws (ts_array_set's message) */
   ts_gc_root(&arr); ts_gc_root(&items);
-  tsv removed=ts_new_array(0);
+  tsv removed = want_removed ? ts_new_array(0) : TS_UNDEFINED;
   ts_gc_root(&removed);
   a=as_arr(arr);
   long n=(long)a->len;
   long s=(long)start; if(s<0){ s+=n; if(s<0)s=0; } if(s>n) s=n;
   long del = has_dc ? (long)dc : (n-s); if(del<0) del=0; if(del>n-s) del=n-s;
-  for(long i=0;i<del;i++){
+  if (want_removed) for(long i=0;i<del;i++){
     a=as_arr(arr);
     if (array_is_hole(a->data[s+i])) ts_array_push_hole(removed);
     else ts_array_push(removed, a->data[s+i]);
@@ -11831,7 +11864,7 @@ static void ts_site_stats_dump(void){
   uint64_t total = 0;
   for (uint32_t i = 0; i < g_site_cap; i++) total += g_site_count[i];
   fprintf(out, "[site_stats] closure allocations: total=%llu sites=%u\n", (unsigned long long)total, g_site_cap);
-  for (int rank = 0; rank < 40; rank++){
+  for (int rank = 0; rank < 400; rank++){
     uint32_t best = 0; uint64_t bestc = 0;
     for (uint32_t i = 0; i < g_site_cap; i++) if (g_site_count[i] > bestc){ bestc = g_site_count[i]; best = i; }
     if (!bestc) break;

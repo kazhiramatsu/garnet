@@ -17646,6 +17646,15 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     format!("ts_array_splice({}, {}, 0, 0, {})", r, n(0), v(1)),
                     false,
                 ),
+                // result discarded (docs/splice_fast_paths_design.md)
+                "array.spliceInsert1" => (
+                    format!("ts_array_splice_insert1({}, {}, {})", r, n(0), v(1)),
+                    false,
+                ),
+                "array.spliceDrop" => (
+                    format!("ts_array_splice_drop({}, {}, {}, 1, {})", r, n(0), n(1), v(2)),
+                    false,
+                ),
                 "array.copyWithin" => (
                     format!(
                         "ts_array_copy_within({}, {}, {}, {}, {})",

@@ -311,6 +311,8 @@ class Exporter {
   // Lazy closure values (docs/lazy_function_values_design.md): a nested
   // declaration used as a value gets its closure on first use per activation.
   lazyFnValues = process.env.TSAOT_LAZY_FN_VALUES !== "0";
+  // Splice fast paths (docs/splice_fast_paths_design.md).
+  spliceFast = process.env.TSAOT_SPLICE_FAST !== "0";
   lazyFnValueSyms = new Set<ts.Symbol>();
   // Capture contexts (docs/capture_contexts_design.md): the scope record of each
   // owner function and the owner of every record-resident binding.
@@ -5423,6 +5425,17 @@ class Exporter {
               // Build the items array, then route to the runtime. Arg-count rules:
               //   0 args -> delete nothing; 1 arg -> delete to end; >=2 -> deleteCount given.
               if (bname === "array.splice") {
+                // A splice whose result is discarded (an expression statement):
+                // `a.splice(i, 0, x)` inserts in place with no items array and no
+                // removed array; any other form skips the removed array.
+                // TSAOT_SPLICE_FAST=0 keeps the general builtin (parity oracle).
+                const discarded = this.spliceFast && ts.isExpressionStatement(node.parent);
+                if (discarded && argLs.length === 3 && ts.isNumericLiteral(node.arguments[1]) && node.arguments[1].text === "0" &&
+                    !ts.isSpreadElement(node.arguments[2])) {
+                  const dst = this.newLocal(ctx, "reference");
+                  ctx.body.push({ kind: "CallBuiltin", dst, builtin: "array.spliceInsert1", recv: recvL, args: [argLs[0], argLs[2]] });
+                  return dst;
+                }
                 const site = this.site++;
                 this.recordSite(site, "array", this.inLoop(node) ? "many" : "once", false, node);
                 const itemsArr = this.newLocal(ctx, "reference");
@@ -5441,7 +5454,7 @@ class Exporter {
                 } else {
                   const startL = argLs.length > 0 ? argLs[0] : constNum(0);
                   const dcL = argLs.length > 1 ? argLs[1] : constNum(0);
-                  ctx.body.push({ kind: "CallBuiltin", dst, builtin: "array.splice", recv: recvL, args: [startL, dcL, itemsArr] });
+                  ctx.body.push({ kind: "CallBuiltin", dst, builtin: discarded ? "array.spliceDrop" : "array.splice", recv: recvL, args: [startL, dcL, itemsArr] });
                 }
                 return dst;
               }

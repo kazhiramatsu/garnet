@@ -5102,9 +5102,34 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   Compiler A/B against the lazy-closure build, alternating three runs,
   outputs validated, diagnostics zero: **6.000 → 5.953 s median wall (0.8% less; all four run pairs favour the new build; a first A/B under desktop load read 6.266 → 6.055 s); Node 3.268 s, native 1.82x slower than V8; RSS 1,100 → 1,155 MB**. Statistics
   relink: allocations 15.75M → 15.57M per compile, objects 6.06M → 5.88M, minor collections 429 → 425. Gates: conformance 440/440, parity 341 identical + 95 KNOWN (the fixture's loop literal surfaces the known FrameArena-vs-Stack annotation difference, allowlisted), bundler 42/42, selfconf 426 + 11 KNOWN, GC stress (all phases), inline policy, units (every verdict read from the gate output; the first chain failed `closures/promise_resolution_protocol` in conformance and selfconf on the right-hand-side ordering defect above, fixed before this build).
-- Next slices, in order. (1) `splice` whose result is discarded
-  (`typeSet.splice(~index, 0, type)`, 415k result arrays per compile) and
-  the other array allocations of the hottest sites. (2) Closures, second
+- Splice whose result is discarded (`docs/splice_fast_paths_design.md`).
+  Every `arr.splice(...)` built an items array, allocated the array of
+  removed elements and rebuilt the whole element buffer; the checker's
+  sorted insertion `typeSet.splice(~index, 0, type)` ran 352k times per
+  compile with its result unread (415k discarded result arrays per compile
+  in the `x17` statistics, three allocations and an O(n) rebuild each).
+  The exporter now recognizes a splice used as an expression statement:
+  `a.splice(i, 0, x)` lowers to `array.spliceInsert1` — the runtime grows
+  the buffer like `push`, shifts the tail in place and stores the element
+  (no items array, no removed array, no rebuilt buffer; a fixed-storage
+  array takes the general path) — and any other
+  discarded splice to `array.spliceDrop`, the general splice without the
+  removed array. Splices whose result is used are unchanged. Writing the
+  fixture also showed that a splice on a frozen array was silently
+  ignored (V8 throws in strict code): every splice entry now throws the
+  TypeError that `push` throws. `TSAOT_SPLICE_FAST=0` (exporter) keeps the general builtin; the parity
+  oracle's corpus is exported with it. Fixture `arrays/splice_fast_paths`
+  (single inserts at every kind of index into empty, inline and heap
+  arrays, 20k sorted insertions with collections, the discarded general
+  forms, holes, the result-using forms, a frozen receiver, a fixed-storage
+  array), on both exporter paths. Statistics relink: arrays 3.52M → 2.68M per compile, allocations 15.57M → 14.74M (1.88 → 1.77 GB), minor collections 425 → 400.
+  Compiler A/B against the settled-captures build, alternating three
+  runs, outputs validated, diagnostics zero: **6.121 → 6.021 s median wall (1.6% less; all four run pairs favour the new build; measured under the owner's desktop load, Node 3.423 s); RSS 1,155 → 1,058 MB (the rebuilt element buffers were allocator churn)**. Gates:
+  conformance 441/441, parity 342 identical + 95 KNOWN, bundler 42/42, selfconf 425 + 13 KNOWN (the two splice fixtures use builtins the frozen analyzer lacks, allowlisted as unported), GC stress (all phases), inline policy, units (every verdict read from the gate output).
+- Next slices, in order. (1) The other array allocations of the hottest
+  sites (`getTypeAtFlowBranchLabel`'s `antecedentTypes`, `map`,
+  `appendIfUnique`, the binary-expression trampoline's four cells per
+  call) and the strings (4.3M per compile). (2) Closures, second
   round: the long tail of arrows (1.37M per compile, no site above 54k),
   a smaller closure cell (120 bytes today). (3) Value captures, round 3:
   bindings declared by destructuring, the lexical `this` of arrows, the
