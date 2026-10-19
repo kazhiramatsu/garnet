@@ -140,6 +140,7 @@ static uint32_t g_handle_free_len = 0, g_handle_free_cap = 0;
    are added. Keys are interned ids below TS_RT_KEY_HIST. */
 #define TS_RT_KEY_HIST 65536u
 static unsigned long long g_key_ool_get[TS_RT_KEY_HIST], g_key_absent[TS_RT_KEY_HIST], g_key_add[TS_RT_KEY_HIST];
+static unsigned long long g_key_prop_find[TS_RT_KEY_HIST];
 unsigned long long g_ts_key_inline_get[65536], g_ts_key_inline_set[65536];
 unsigned long long g_ts_static_get_hit, g_ts_static_get_miss, g_ts_static_set_hit, g_ts_static_set_miss, g_ts_static_learned;
 unsigned long long g_ts_key_static_get_miss[65536], g_ts_key_static_set_miss[65536];
@@ -246,9 +247,9 @@ __attribute__((destructor)) static void ts_rt_stats_dump(void){
         g_ts_static_miss_slot[best * 18u + 0] = (unsigned long long)-1;
       }
     }
-    const char* names[7] = { "ool_get", "absent", "add", "inline_get", "inline_set", "static_get_miss", "static_set_miss" };
-    unsigned long long* hists[7] = { g_key_ool_get, g_key_absent, g_key_add, g_ts_key_inline_get, g_ts_key_inline_set, g_ts_key_static_get_miss, g_ts_key_static_set_miss };
-    for (int hh = 0; hh < 7; hh++){
+    const char* names[8] = { "ool_get", "absent", "add", "inline_get", "inline_set", "static_get_miss", "static_set_miss", "prop_find" };
+    unsigned long long* hists[8] = { g_key_ool_get, g_key_absent, g_key_add, g_ts_key_inline_get, g_ts_key_inline_set, g_ts_key_static_get_miss, g_ts_key_static_set_miss, g_key_prop_find };
+    for (int hh = 0; hh < 8; hh++){
       unsigned long long* h = hists[hh];
       fprintf(out, "[rt_stats] keys_%s:", names[hh]);
       for (int rank = 0; rank < 30; rank++){
@@ -1828,7 +1829,7 @@ static ts_pref props_append(ts_object* o, ts_key key, uint32_t next_shape){
 }
 /* Locate an own property by key. */
 static ts_pref prop_find(ts_object* o, ts_key key){
-  RT_STAT_INC(find_prop_calls);
+  RT_STAT_INC(find_prop_calls); RT_STAT_KEY(g_key_prop_find, key);
   if (obj_shaped(o)){
     uint32_t len = o->len;
     uint32_t sid = ts_obj_shape_id(o);
@@ -2714,6 +2715,15 @@ static uint32_t strhash_units(const char* data, uint32_t flags, uint32_t n){
 }
 static uint32_t strhash_view(ts_strview v){
   uint32_t h=2166136261u;
+  /* A flat one-byte string: the generic loop's two FNV-1a steps per code unit
+     (low byte, then a zero high byte) fold into one multiply by the square of
+     the prime, so the value is the same and the loop is one byte, one xor,
+     one multiply (the checker hashes long fresh cache keys constantly). */
+  if (v.data && !(v.flags & TS_STR_FLAG_UTF16)){
+    const unsigned char* p = (const unsigned char*)v.data;
+    for (uint32_t i=0;i<v.len;i++) h = (h ^ p[i]) * 637696617u;   /* 16777619^2 mod 2^32 */
+    return h;
+  }
   for(uint32_t i=0;i<v.len;i++){
     uint16_t cu=ts_str_cu_at_view(v,i);
     h^=(uint8_t)(cu&0xffu); h*=16777619u;

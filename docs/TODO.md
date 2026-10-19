@@ -5712,6 +5712,28 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   `recursiveTypeRelatedTo`); the string-key kernel reads on par with
   Node, so the next look is at the probe lengths and at who calls
   `prop_find`.
+- One-byte string hashing and the dictionary-lookup histogram (build
+  `x41`, relinked from `x40`; runtime only). `strhash_view` ran the two
+  FNV-1a steps per code unit through the view accessor; a flat one-byte
+  string now folds them into one multiply per byte (by the square of the
+  prime, the same values: the first relink used a wrong constant and two
+  conformance fixtures caught the hash mismatch between short and flat
+  strings at once). Neutral: 4.625 vs 4.627 s and 4.633 vs 4.628 s
+  against `x40`; kept as the simpler loop. The statistics build gained a
+  per-key histogram of `prop_find` (11.6M calls per compile), which
+  names the dictionary lookups: the `NodeArray` named properties `pos`
+  1.18M, `transformFlags` 1.08M, `end` 1.03M, `hasTrailingComma` 0.64M
+  (arrays keep named properties in the dictionary, so no cache ever
+  hits them); the iterator protocol `value` 1.05M, `done` 1.05M, `next`
+  0.70M, `__array_iterator_index` 0.70M (the Map/Set and array iterators
+  of `for..of` over collections and the `core.ts` iterator helpers: each
+  step looks up `next`, allocates a result object and reads it through
+  the dictionary); `call` 1.22M (`hasOwnProperty.call(map, key)` in
+  `core.ts`: the `.call` lookup walks to `Function.prototype` every
+  time); the RegExp internals `__tsaot_rx_prefix` 0.71M, `lastIndex`
+  0.43M, `source`/`__tsaot_rx_flags_mask` 0.29M each. Next: cursor-driven
+  `for..of` over Map/Set (no iterator object, no result object), then
+  shaped named properties on arrays and the `.call` shortcut.
 - Next slices, in order. (0) External element buffers (the malloc'd
   `data` of arrays, also strings' and maps' buffers) do not count toward
   the collector's trigger: a loop that drops large arrays grows without
