@@ -2598,12 +2598,15 @@ static uint32_t strhash_view(ts_strview v){
 static uint32_t ts_str_hash_of(tsv s){
   if (ts_is_short_str(s)) return strhash_view(ts_str_view_typed(s));
   ts_string* x = ts_str_ptr_typed(s);
-  if ((x->flags & TS_STR_FLAG_HASHED) && !(x->flags & TS_STR_FLAG_VIEW)) return x->hash;
-  uint32_t h = strhash_view(ts_str_view_typed(s));
-  /* A flat GC string owns immutable storage, so cache its first demanded hash.
-     Views stay uncached because their storage flags come from the parent, and
-     static literals are already pre-hashed at compile time. */
-  if (!(x->flags & (TS_STR_FLAG_VIEW | TS_STR_FLAG_STATIC))){
+  if (x->flags & TS_STR_FLAG_HASHED) return x->hash;
+  ts_strview v = ts_str_view_typed(s);
+  uint32_t h = strhash_view(v);
+  /* A flat GC string owns immutable storage, and a view's content never
+     changes either (a builder only extends beyond its views), so both cache
+     their first demanded hash; the view slow path carries the cell's hash and
+     flags into the strview. A view of an immediate parent stays uncached (its
+     strview's hash field holds the fifth byte), as do pre-hashed literals. */
+  if (!(x->flags & TS_STR_FLAG_STATIC) && v.data != NULL){
     x->hash = h;
     x->flags |= TS_STR_FLAG_HASHED;
   }
@@ -3480,14 +3483,74 @@ static int ts_add_str_int_fast(tsv s, const char* digits, uint32_t nl, int digit
   RT_STAT_INC(sb_flat);
   return 1;
 }
+/* `s + digits` at or above the builder threshold: the digits go straight into
+   the builder (extending s's live buffer in place when s is its tail, else a
+   fresh builder), with no temporary number string. digits_first (`n + s`)
+   always starts a fresh builder. Returns 0 (general path) only when the
+   result would not fit a builder. */
+static int ts_add_str_digits_builder(tsv s, const char* digits, uint32_t nl, int digits_first, tsv* out){
+  ts_strview x = ts_str_view_typed(s);
+  uint64_t n64 = (uint64_t)x.len + nl;
+  if (n64 > UINT32_MAX) return 0;
+  uint32_t n = (uint32_t)n64;
+  uint32_t flags = x.flags & TS_STR_FLAG_UTF16;
+  int all_ascii = !!(x.flags & TS_STR_FLAG_ASCII);
+  ts_strview dv = { digits, nl, 0, TS_STR_FLAG_ASCII, 0 };
+  RT_STAT_INC(concat_calls); RT_STAT_ADD(concat_bytes, n);
+  ts_gc_root(&s);
+  tsv parent_v = TS_UNDEFINED;
+  if (!digits_first && ts_string_extendable_parent(s, flags, n, &parent_v)){
+    ts_gc_root(&parent_v);
+    ts_string* out_cell = ts_string_alloc_buffer_view();
+    ts_string* parent = ts_str_ptr_typed(parent_v);
+    uint32_t old_len = parent->len;
+    ts_str_copy_units(parent->data, parent->flags, old_len, dv, 0, nl);
+    parent->len = n;
+    parent->hash = 0;
+    parent->flags = (parent->flags & ~(TS_STR_FLAG_ASCII | TS_STR_FLAG_HASHED)) |
+                    (all_ascii ? TS_STR_FLAG_ASCII : 0);
+    ts_string_write_terminator(parent, n);
+    ts_string_init_buffer_view(out_cell, parent_v, n);
+    *out = ts_str_v(out_cell);
+    RT_STAT_INC(sb_extend);
+    ts_gc_unroot(2);
+    return 1;
+  }
+  uint32_t capacity = ts_string_builder_capacity(n);
+  if (capacity == 0){ ts_gc_unroot(1); return 0; }
+  ts_string* buffer = ts_string_alloc_buffer(capacity, flags);
+  tsv buffer_v = ts_str_v(buffer);
+  ts_gc_root(&buffer_v);
+  ts_string* out_cell = ts_string_alloc_buffer_view();
+  buffer = ts_str_ptr_typed(buffer_v);
+  x = ts_str_view_typed(s);                     /* the cell may have moved */
+  if (digits_first){
+    ts_str_copy_units(buffer->data, flags, 0, dv, 0, nl);
+    ts_str_copy_units(buffer->data, flags, nl, x, 0, x.len);
+  } else {
+    ts_str_copy_units(buffer->data, flags, 0, x, 0, x.len);
+    ts_str_copy_units(buffer->data, flags, x.len, dv, 0, nl);
+  }
+  buffer->len = n;
+  buffer->hash = 0;
+  buffer->flags = TS_STR_FLAG_BUFFER | flags | (all_ascii ? TS_STR_FLAG_ASCII : 0);
+  ts_string_write_terminator(buffer, n);
+  ts_string_init_buffer_view(out_cell, buffer_v, n);
+  *out = ts_str_v(out_cell);
+  RT_STAT_INC(sb_fresh);
+  ts_gc_unroot(2);
+  return 1;
+}
 tsv ts_add(tsv a, tsv b){
   if (ts_is_num(a)&&ts_is_num(b)) return ts_num(ts_to_num(a)+ts_to_num(b));
   if (ts_is_str(a) && ts_is_num(b)){
     char nb[24]; uint32_t nl; tsv r;
-    if (ts_int_digits(ts_to_num(b), nb, &nl) && ts_add_str_int_fast(a, nb, nl, 0, &r)) return r;
+    if (ts_int_digits(ts_to_num(b), nb, &nl) &&
+        (ts_add_str_int_fast(a, nb, nl, 0, &r) || ts_add_str_digits_builder(a, nb, nl, 0, &r))) return r;
   } else if (ts_is_num(a) && ts_is_str(b)){
     char nb[24]; uint32_t nl; tsv r;
-    if (ts_int_digits(ts_to_num(a), nb, &nl) && ts_add_str_int_fast(b, nb, nl, 1, &r)) return r;
+    if (ts_int_digits(ts_to_num(a), nb, &nl) &&
+        (ts_add_str_int_fast(b, nb, nl, 1, &r) || ts_add_str_digits_builder(b, nb, nl, 1, &r))) return r;
   }
   /* JS `+`: ToPrimitive(default) each operand first. An object becomes its
      valueOf()/toString()/Symbol.toPrimitive("default") result, so `o + 5` and
@@ -3758,6 +3821,10 @@ int ts_strict_eq_slow(tsv a, tsv b){
    (Abstract Relational Comparison): if both operands ToPrimitive to strings,
    compare lexicographically; otherwise compare ToNumber values (NaN -> false). */
 int ts_relational(tsv a, tsv b, int op){
+  if (ts_is_num(a) && ts_is_num(b)){   /* the common case first: no rooting, no ToPrimitive (NaN compares false) */
+    double na = ts_to_num(a), nb = ts_to_num(b);
+    switch(op){ case 0: return na<nb; case 1: return na<=nb; case 2: return na>nb; default: return na>=nb; }
+  }
   ts_gc_root(&a); ts_gc_root(&b);
   tsv pa = (ts_object_like(a)&&!ts_is_symbol(a)) ? ts_to_primitive(a,0) : a;
   tsv pb = (ts_object_like(b)&&!ts_is_symbol(b)) ? ts_to_primitive(b,0) : b;

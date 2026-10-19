@@ -5230,17 +5230,56 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   1.78x.** Gates: conformance 443/443, parity 342 identical + 97 KNOWN,
   bundler 42/42, selfconf 426 + 14 KNOWN, GC stress (all phases), inline
   policy, units.
+- Strings, second round (`docs/strings_round2_design.md`, build `x23`,
+  runtime only). From the `x22` profile (3,265 samples): the string
+  `switch` of `getCannotFindNameDiagnosticForName`, evaluated eagerly for
+  every identifier `resolveName` checks, paid an out-of-line compare and an
+  out-of-line literal boxing per label (`ts_strict_eq_slow` 15,
+  `ts_strict_eq` 9, `ts_heap_ref_value` 9 samples in that function alone;
+  `ts_heap_ref_value` 34 in all), `getTypeListId` spent 15 of its 91
+  `ts_add` samples materializing the number as a string before a
+  builder-sized append, views never cached their hash (`ts_str_hash_of`
+  42), and `ts_relational` rooted and ToPrimitive-tested two numbers (16).
+  Five fast paths: `ts_heap_ref_fast` boxes a non-heap cell (static
+  literal, stack cell) in line after the old-cell and handle checks;
+  `ts_strict_eq` compares two strings' lengths in line before the
+  out-of-line compare; `ts_add` writes an integer's digits straight into
+  the builder at builder size (in place when the string is the live tail
+  of its buffer, else a fresh builder; `ts_add_str_digits_builder`);
+  `ts_str_hash_of` caches a view's hash in the view cell (a view of an
+  immediate parent stays uncached: its strview hash field carries the
+  fifth byte); `ts_relational` compares two numbers first. Fixture
+  `strings/equality_builders` (equality of short, flat, view and non-ASCII
+  strings of equal and different lengths, a string switch, builder-size
+  appends with a saved prefix view, two appends from one prefix, negative /
+  fractional / huge / special numbers, `integer + string`, UTF-16, view Map
+  keys, relational over NaN / signed zero / mixed values, literals under
+  collection pressure), identical to V8 also under
+  `TSAOT_GC_YOUNG_THRESHOLD=1`. Statistics relink: root pushes 49.0M →
+  32.7M per compile (the relational fast path), GC pause 598 → 492 ms,
+  allocations unchanged at 14.72M. Compiler A/B against `x22`, alternating
+  three runs, outputs validated, diagnostics zero: **5.790 → 5.696 s median
+  wall (−1.6%; all three pairs 5.78–5.80 against 5.70 s), Node 3.25 s →
+  1.75x.** Gates: conformance 444/444, parity 343 identical + 97 KNOWN,
+  bundler 42/42, selfconf 427 + 14 KNOWN, GC stress (all phases), inline
+  policy, units.
+- GC policy, measured on the quiet machine with `x22` (noEmit, two runs
+  each, alternating): no full collections at all (an 8 GB forced
+  threshold) saves 2% (4.72–4.80 → 4.61–4.67 s) for +24 MB peak RSS, so the
+  six full collections cost about 100 ms of the 598 ms pause and the
+  minors the rest; a 16 MB nursery reads +0% and 64 MB +1.5% (the earlier
+  loaded-machine measurements were noise). Defaults unchanged; the
+  remembered-set precision item below is the GC lead.
 - Next slices, in order. (0) External element buffers (the malloc'd
   `data` of arrays, also strings' and maps' buffers) do not count toward
   the collector's trigger: a loop that drops large arrays grows without
   bound (the `sparse_stores` kernel under `TSAOT_SPARSE_ELEMENTS=0`
   reaches 16.6 GB); count payload bytes in the allocation budget.
-  (1) Strings, second round: `Map<string, T>`
-  lookups and symbol-table keys (`map_find` 3.1% of samples, `ts_str_hash_of`
-  1%, `ts_strict_eq_slow` 1.7% — the string `switch` of
-  `getCannotFindNameDiagnosticForName`, evaluated eagerly for every
-  identifier, and identifier strings that are never interned), then the
-  other array allocations of the hottest sites (`getTypeAtFlowBranchLabel`'s
+  (1) Strings, third round: `map_find` itself (1% of samples: the probes
+  of `getUnionTypeFromSortedList` and `getPropertyOfType`), a
+  length-grouped lowering of string `switch` statements in the exporter
+  (the if-chain still tests every label's length), then the other array
+  allocations of the hottest sites (`getTypeAtFlowBranchLabel`'s
   `antecedentTypes`, `map`, `appendIfUnique`, the binary-expression
   trampoline's four cells per call). (2) Closures, second
   round: the long tail of arrows (1.37M per compile, no site above 54k),

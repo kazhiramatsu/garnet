@@ -166,6 +166,7 @@ static inline ts_gc_header* ts_handle_entry_cell(uintptr_t entry){
 }
 /* Every managed cell receives its stable handle at allocation, so boxing a
    live cell is a load; non-heap (stack/SROA) cells and NULL go out of line. */
+#define TS_PTR_STACK_TAG ((uint64_t)1u << 47)
 static inline tsv ts_heap_ref_fast(uint16_t sel, void* p) {
   if (TS_RT_LIKELY(p != NULL)){
     const ts_gc_header* h = (const ts_gc_header*)p;
@@ -173,6 +174,9 @@ static inline tsv ts_heap_ref_fast(uint16_t sel, void* p) {
     if (h->gen == TS_GEN_OLD) return TS_BOX(sel, (uintptr_t)p);
     uint64_t handle = h->handle;
     if (TS_RT_LIKELY(handle != 0)) return TS_BOX(sel, handle);
+    /* a static literal or a stack/SROA cell (never a handle): by address with
+       the stack tag, in line so every use of a string literal is a few loads */
+    if (h->gen == TS_GEN_NONHEAP) return TS_BOX(sel, (uintptr_t)p | TS_PTR_STACK_TAG);
   }
   return ts_heap_ref_value(sel, p);
 }
@@ -182,7 +186,6 @@ static inline tsv ts_heap_ref_fast(uint16_t sel, void* p) {
    bit 0 clear, bit 47 set = the address of a stack/SROA/static cell
    (TS_GEN_NONHEAP). Static literals and stack cells are only 8-byte aligned,
    so the tag lives above the user address space, not in the low bits. */
-#define TS_PTR_STACK_TAG ((uint64_t)1u << 47)
 static inline void* ts_ptr(tsv v) {
   uint64_t payload = v & TS_PAYLOAD_MASK;
   return (payload & 1u)
@@ -1387,7 +1390,14 @@ static inline int ts_strict_eq(tsv a, tsv b){
   if (ts_is_num(a) || ts_is_num(b)) return ts_is_num(a) && ts_is_num(b) && ts_to_num(a) == ts_to_num(b);
   /* two immediate short strings are canonical: different bits, different strings */
   if (ts_is_short_str(a) && ts_is_short_str(b)) return 0;
-  if (ts_is_str(a) && ts_is_str(b)) return ts_strict_eq_slow(a, b);
+  if (ts_is_str(a) && ts_is_str(b)){
+    /* different lengths: different strings, without the out-of-line compare
+       (a string switch tests its discriminant against every label) */
+    uint32_t la = ts_is_short_str(a) ? ts_short_str_len(a) : ts_str_ptr_typed(a)->len;
+    uint32_t lb = ts_is_short_str(b) ? ts_short_str_len(b) : ts_str_ptr_typed(b)->len;
+    if (la != lb) return 0;
+    return ts_strict_eq_slow(a, b);
+  }
   return (ts_is_obj(a) || ts_is_func(a)) && ts_same_cell(a, b);
 }
 int  ts_relational(tsv a, tsv b, int op);  /* 0:< 1:<= 2:> 3:>= */
