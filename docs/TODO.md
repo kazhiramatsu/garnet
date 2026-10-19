@@ -4547,17 +4547,73 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   `ts_truthy_fast` and one frame slot. Fixture `operators/condition_temps`.
   `TSAOT_TRUTHY_UNBOX=0` keeps the comparison-only rule (parity oracle).
   Compiler A/B against the slot-first build: **7.903 → 7.548 s median wall (4.5% less)**, outputs validated; the compiler is now 2.34x slower than V8 (Node 3.219 s). Session total: 9.722 → 7.548 s (1.29x). Gates: conformance 423/423, parity 333 identical + 86 KNOWN (the new fixture's frozen-pair difference — the frozen emitter unboxes one condition temporary the Rust emitter keeps boxed under the knob — allowlisted), bundler 42/42, selfconf 409 + 11 KNOWN, GC stress (all phases), inline policy, units.
-- Next slices: the remaining pattern gaps (small calls with object
-  arguments 4.6x, array callbacks 3.8x, closures 2.9x, arrays of objects
-  3.0x, flags/optional chaining 4.0x: boxed boolean temps of `&&`/`||` in
-  conditions, `??` with a numeric fallback through the generic add),
-  callback specialization (clone a small helper per statically known
-  callback closure; the parser's `isListElement`/`parseStatement` and the
-  checker's `forEach`/`some`/`every` helpers), direct calls to lazy callees
-  with caller-frame chaining, constructor pre-sizing from layouts, local
-  classes from declared types (`const b: Body = arr[i]` keeps the typed
-  struct access, the nbody kernel is 4.3x slower through array elements),
-  C5b-2/3 (block records, unboxed numeric record fields), and the remaining
-  4.6k closure-value call sites. Smaller items still open: the
-  minor-collection trigger counts cell bytes only, and closures passed to
-  non-devirtualized callees are never stack-allocated.
+- Miscompile in the condition-temporary rule (f7e806a) found and fixed. The
+  morning check of the compiler reported 1,419 diagnostics on `src/compiler`
+  (narrowing failures such as `Property 'elements' does not exist on type
+  'NamespaceExport'`) from every build since the condition-temporaries slice
+  while the three builds before it and Node report none; a 12-line narrowing
+  case reproduced it. Cause: `truthy_only_unbox` admitted a *parameter*
+  reassigned by a comparison (`function g(flag: boolean) { if (flag) ...;
+  flag = a < b; if (flag) ... }`), which turned the direct entry's parameter
+  kind into a number, so the generic forwarder converted the boxed `true`
+  with `ts_to_num` (garbage) — the checker's `assumeTrue`-style boolean
+  parameters are exactly this shape. Parameters and catch variables (values
+  from outside the instruction stream) are now excluded; fixture
+  `operators/condition_temps` gained reassigned boolean parameters, `&&`/`||`
+  merges into a parameter, and a reassigned catch variable. The slice's
+  recorded A/B (7.903 → 7.548 s) was invalid: its script re-measured the
+  slot-first build against its predecessor (the copy-and-edit of the previous
+  script did not change the binary paths), so the build was never validated
+  on the compiler. Lessons recorded in memory: read the A/B's `result.json`
+  commands and warmup verdicts, and check the compiler's diagnostics are
+  zero, before trusting a number.
+- Three static micro-patterns (`docs/static_micro_patterns_design.md`):
+  (1) strict and loose equality against `undefined`/`null`/boolean constants
+  (locals whose every definition is the same such constant; parameters and
+  catch variables excluded) are emitted as bit compares (`a == TS_UNDEFINED`,
+  `ts_is_nullish_fast(a)` for `== null`) instead of the inline `ts_strict_eq`
+  chain; (2) array element reads use an inline fast path
+  (`ts_array_get_inline[_lazy]`: array kind, bounds and hole test in line,
+  strings and exotic receivers out of line; the hole marker moved to the
+  header); (3) boolean constants are admitted as raw definitions of the
+  condition-temporary rule, so the `first` flag of every `for` loop with an
+  update clause is a plain `long long` that clang peels away instead of a
+  `ts_bool` tested with `ts_truthy_fast` per iteration. Fixtures
+  `operators/tag_eq` (every value kind against every tag, both operand
+  orders, reassigned parameters, catch variables, locals holding several
+  constants, the compares as values, loose equality with booleans) and
+  `arrays/index_inline` (holes, out-of-range and negative indices, strings,
+  nested arrays, growth, truncation, deletion, lazy-frame and allocating
+  callers). `TSAOT_TAG_EQ=0` / `TSAOT_INLINE_INDEX=0` keep the previous forms
+  (parity oracle). Pattern kernels: object_arrays 326 → 283 ms, switch
+  dispatch 466 → 399 ms, closures 373 → 345 ms, small calls 984 → 936 ms,
+  tree recursion 130 → 122 ms; the rest within noise. Compiler A/B against
+  the slot-first build (the last validated one), alternating three runs,
+  outputs validated, diagnostics zero: **7.668 → 7.416 s median wall (3.3% less)**; the compiler is now 2.27x slower than V8 (Node 3.271 s). Gates:
+  conformance 425/425, parity 333 identical + 88 KNOWN (the two new fixtures' frozen-pair differences allowlisted: a numeric-inference difference and a FrameArena/Stack annotation), bundler 42/42, selfconf 411 + 11 KNOWN, GC stress (all phases), inline policy, units (every verdict read from the gate output).
+- Next slices, in order. (1) Direct calls to namespace member functions
+  (`docs/namespace_direct_calls_design.md`): the IR of the compiler has
+  4,524 calls through a function value and 7,316 dynamic method calls; the
+  function-value calls resolve statically to closures held in capture cells
+  that are stored exactly one function — the parser's `token` (482 sites),
+  `finishNode` (214), `getNodePos` (176), `parseExpected` (144),
+  `nextToken` (124) — because a function declared inside a value namespace
+  is boxed by `lowerModuleDeclaration` instead of being registered as a
+  known function; the dynamic method calls are led by `Debug.assert` (439),
+  `Debug.checkDefined` (313) and `Debug.fail` (110). Registering namespace
+  members in `funcSymbols` (with value references still capturing the
+  bound closure) turns both into `Direct` calls through the existing
+  module-cell threading. (2) Known-closure call sites in general (the
+  remaining `Value` calls whose callee field holds one closure, guarded by a
+  code-pointer compare, 2,652 sites before (1)), then callback
+  specialization for `forEach`/`map`/`filter`/`some`/`every` (706 call
+  sites pass a single-definition closure into a call-only parameter;
+  `some`'s optional predicate needs truthiness uses admitted). (3) The
+  node factory's `create*` members (object literal of closures, 205 +
+  143 + ... dynamic method sites). (4) The remaining pattern gaps: small
+  calls with object arguments 4.4x (inline-cache probe cost), array
+  callbacks 3.9x, flags 3.9x, arrays of objects 2.75x; constructor
+  pre-sizing from layouts; local classes from declared types; C5b-2/3.
+  Smaller items still open: the minor-collection trigger counts cell bytes
+  only, and closures passed to non-devirtualized callees are never
+  stack-allocated.

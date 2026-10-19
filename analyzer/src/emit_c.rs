@@ -1329,6 +1329,8 @@ struct Ctx<'a> {
     /// Direct entry signatures of every eligible function (empty when disabled).
     direct_sigs: &'a BTreeMap<u32, DirectSig>,
     typeof_fusion: TypeofFusion,
+    /// locals holding one `undefined`/`null`/boolean constant (see tag_consts_for)
+    tag_consts: BTreeMap<u32, &'static str>,
     switch_plan: SwitchPlan,
     layouts: LayoutPlan,
     /// the root frame is linked only around slow paths (see lazy_frames_enabled)
@@ -1470,6 +1472,21 @@ impl<'a> Ctx<'a> {
         } else {
             format!("ts_json_dom_parse({})", self.val(id))
         }
+    }
+    /// `a === b` as a bit compare when one side is a tag constant local
+    /// (`undefined`, `null`, a boolean): (other operand, constant expression).
+    fn tag_eq_operands(&self, a: u32, b: u32) -> Option<(u32, &'static str)> {
+        let (x, t) = if let Some(t) = self.tag_consts.get(&b) {
+            (a, *t)
+        } else if let Some(t) = self.tag_consts.get(&a) {
+            (b, *t)
+        } else {
+            return None;
+        };
+        if self.json_locals.contains(&x) {
+            return None;
+        }
+        Some((x, t))
     }
     fn set_num(&self, id: u32, e: &str) -> String {
         if self.unboxed.contains(&id) {
@@ -3297,12 +3314,39 @@ fn unboxed_candidates(f: &Function, local_class: &BTreeMap<u32, u32>) -> BTreeSe
     }
     // Boolean temporaries that only feed conditions, decided against the
     // final numeric set so a copy source is never raw while its target is boxed.
+    // Parameters and catch variables receive their first value from outside the
+    // instruction stream (a boxed boolean from the caller, the thrown value), so
+    // a reassignment by a comparison never makes them raw: the direct entry's
+    // parameter kinds follow this set, and a boxed `true` read as a number is
+    // garbage (Session 350: `function g(flag: boolean) { if (flag) ...;
+    // flag = a < b; if (flag) ... }` broke the compiler's narrowing).
+    let outside_defined: BTreeSet<u32> = f
+        .params
+        .iter()
+        .map(|p| p.0)
+        .chain(collect_catch_vars(&f.body))
+        .collect();
     for id in truthy_only_unbox(&f.body, &unboxed) {
-        if !local_class.contains_key(&id) {
+        if !local_class.contains_key(&id) && !outside_defined.contains(&id) {
             unboxed.insert(id);
         }
     }
     unboxed
+}
+
+/// Locals bound by `catch (e)` anywhere in the body (defined by the handler,
+/// not by an instruction).
+fn collect_catch_vars(body: &[Inst]) -> Vec<u32> {
+    let mut flat: Vec<&Inst> = Vec::new();
+    flatten_inst(body, &mut flat);
+    flat.iter()
+        .filter_map(|inst| match inst {
+            Inst::TryCatch {
+                catch_var: Some(c), ..
+            } => Some(c.0),
+            _ => None,
+        })
+        .collect()
 }
 
 fn flatten_inst<'a>(body: &'a [Inst], out: &mut Vec<&'a Inst>) {
@@ -6369,6 +6413,7 @@ fn emit_i64_function(
         f64_fast,
         direct_sigs,
         typeof_fusion,
+        tag_consts: tag_consts_for(f),
         static_strings,
         string_metric_plan,
         string_materialization_plan,
@@ -6533,6 +6578,7 @@ fn emit_f64_function(
         f64_fast,
         direct_sigs,
         typeof_fusion,
+        tag_consts: tag_consts_for(f),
         static_strings,
         string_metric_plan,
         string_materialization_plan,
@@ -6634,6 +6680,7 @@ fn emit_function(
             f64_fast,
             direct_sigs,
             typeof_fusion: typeof_fusion_plan(f),
+            tag_consts: tag_consts_for(f),
             static_strings,
             string_metric_plan: None,
             string_materialization_plan: None,
@@ -6683,6 +6730,7 @@ fn emit_function(
             f64_fast,
             direct_sigs,
             typeof_fusion: typeof_fusion_plan(f),
+            tag_consts: tag_consts_for(f),
             static_strings,
             string_metric_plan: None,
             string_materialization_plan: None,
@@ -6732,6 +6780,7 @@ fn emit_function(
             f64_fast,
             direct_sigs,
             typeof_fusion: typeof_fusion_plan(f),
+            tag_consts: tag_consts_for(f),
             static_strings,
             string_metric_plan: None,
             string_materialization_plan: None,
@@ -6937,6 +6986,7 @@ fn emit_function(
         f64_fast,
         direct_sigs,
         typeof_fusion,
+        tag_consts: tag_consts_for(f),
         static_strings,
         string_metric_plan,
         string_materialization_plan,
@@ -7223,6 +7273,85 @@ fn cmp_truthy_only(body: &[Inst]) -> BTreeSet<u32> {
    its source (a raw 0/1 must never be boxed as a number). An undefined
    path (a conditional definition) reads as 0, which is falsy, as undefined
    is. TSAOT_TRUTHY_UNBOX=0 keeps the comparison-only rule (parity oracle). */
+fn tag_eq_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_TAG_EQ").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
+fn inline_index_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_INLINE_INDEX").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
+/// Locals whose every definition is the same `undefined`, `null` or boolean
+/// constant, mapped to that constant's C expression. Those three kinds have a
+/// single encoding each, so a strict comparison against such a local is a bit
+/// compare of the other operand (numbers and strings are excluded: NaN, -0 and
+/// string contents). Parameters and catch variables are defined outside the
+/// instruction stream and never qualify.
+fn tag_consts_for(f: &Function) -> BTreeMap<u32, &'static str> {
+    let mut out: BTreeMap<u32, &'static str> = BTreeMap::new();
+    if !tag_eq_enabled() {
+        return out;
+    }
+    let mut flat: Vec<&Inst> = Vec::new();
+    flatten_inst(&f.body, &mut flat);
+    let mut tag: BTreeMap<u32, Option<&'static str>> = BTreeMap::new();
+    for inst in &flat {
+        if let Inst::TryCatch {
+            catch_var: Some(c), ..
+        } = inst
+        {
+            tag.insert(c.0, None);
+        }
+        let Some(d) = inst_def(inst) else { continue };
+        let t: Option<&'static str> = match inst {
+            Inst::Const {
+                value: ConstVal::Undef,
+                ..
+            } => Some("TS_UNDEFINED"),
+            Inst::Const {
+                value: ConstVal::Null,
+                ..
+            } => Some("TS_NULL"),
+            Inst::Const {
+                value: ConstVal::Bool { value },
+                ..
+            } => Some(if *value { "ts_bool(1)" } else { "ts_bool(0)" }),
+            _ => None,
+        };
+        match tag.get(&d) {
+            None => {
+                tag.insert(d, t);
+            }
+            Some(prev) => {
+                if *prev != t {
+                    tag.insert(d, None);
+                }
+            }
+        }
+    }
+    for p in &f.params {
+        tag.insert(p.0, None);
+    }
+    for (id, t) in tag {
+        if let Some(t) = t {
+            out.insert(id, t);
+        }
+    }
+    out
+}
+
 fn truthy_unbox_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -7267,6 +7396,14 @@ fn truthy_only_unbox(body: &[Inst], numeric: &BTreeSet<u32>) -> BTreeSet<u32> {
                 defs.entry(dst.0).or_default().push(None);
             }
             Inst::UnOp { dst, op, .. } if op == "!" => {
+                defs.entry(dst.0).or_default().push(None);
+            }
+            // a boolean constant is a raw 0/1 as well (the `first` flag of a
+            // `for` loop with an update clause, `let done = false`)
+            Inst::Const {
+                dst,
+                value: ConstVal::Bool { .. },
+            } => {
                 defs.entry(dst.0).or_default().push(None);
             }
             Inst::Copy { dst, src } => {
@@ -17645,11 +17782,15 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 }
                 return;
             }
+            // the in-range non-hole element of an array is read in line
+            // (TSAOT_INLINE_INDEX=0 keeps the out-of-line reader)
+            let inline = inline_index_enabled();
             if ctx.lazy_frame {
                 s.push_str(&ctx.set_val(
                     dst.0,
                     &format!(
-                        "ts_array_get_lazy({}, (uint32_t)({}), &F.h, {})",
+                        "{}({}, (uint32_t)({}), &F.h, {})",
+                        if inline { "ts_array_get_inline_lazy" } else { "ts_array_get_lazy" },
                         ctx.val(arr.0),
                         ctx.num(index.0),
                         ctx.frame_nslots
@@ -17658,7 +17799,12 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             } else {
                 s.push_str(&ctx.set_val(
                     dst.0,
-                    &format!("ts_array_get({}, (uint32_t)({}))", ctx.val(arr.0), ctx.num(index.0)),
+                    &format!(
+                        "{}({}, (uint32_t)({}))",
+                        if inline { "ts_array_get_inline" } else { "ts_array_get" },
+                        ctx.val(arr.0),
+                        ctx.num(index.0)
+                    ),
                 ));
             }
         }
@@ -18614,6 +18760,10 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         typeof_test_expr(lit, &ctx.val(*x))
                     } else if both_unboxed {
                         format!("({} == {})", l, r)
+                    } else if let Some((x, t)) = ctx.tag_eq_operands(lhs.0, rhs.0) {
+                        // undefined/null/booleans have one encoding each; a boxed
+                        // number never carries one (ts_num canonicalizes NaN)
+                        format!("({} == {})", ctx.val(x), t)
                     } else {
                         format!("ts_strict_eq({}, {})", ctx.val(lhs.0), ctx.val(rhs.0))
                     }
@@ -18621,6 +18771,12 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 "==" => {
                     if both_unboxed {
                         format!("({} == {})", l, r)
+                    } else if let Some((x, t)) = ctx
+                        .tag_eq_operands(lhs.0, rhs.0)
+                        .filter(|(_, t)| *t == "TS_UNDEFINED" || *t == "TS_NULL")
+                    {
+                        let _ = t;
+                        format!("ts_is_nullish_fast({})", ctx.val(x))
                     } else {
                         format!("ts_loose_eq({}, {})", ctx.val(lhs.0), ctx.val(rhs.0))
                     }
@@ -18630,6 +18786,8 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         format!("(!{})", typeof_test_expr(lit, &ctx.val(*x)))
                     } else if both_unboxed {
                         format!("({} != {})", l, r)
+                    } else if let Some((x, t)) = ctx.tag_eq_operands(lhs.0, rhs.0) {
+                        format!("({} != {})", ctx.val(x), t)
                     } else {
                         format!("(!ts_strict_eq({}, {}))", ctx.val(lhs.0), ctx.val(rhs.0))
                     }
@@ -18637,6 +18795,12 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 "!=" => {
                     if both_unboxed {
                         format!("({} != {})", l, r)
+                    } else if let Some((x, t)) = ctx
+                        .tag_eq_operands(lhs.0, rhs.0)
+                        .filter(|(_, t)| *t == "TS_UNDEFINED" || *t == "TS_NULL")
+                    {
+                        let _ = t;
+                        format!("(!ts_is_nullish_fast({}))", ctx.val(x))
                     } else {
                         format!("(!ts_loose_eq({}, {}))", ctx.val(lhs.0), ctx.val(rhs.0))
                     }

@@ -42,6 +42,11 @@
 #                          final shape (parity oracle only).
 #   TSAOT_TRUTHY_UNBOX=0   Box `!` results and `&&`/`||` temporaries that only
 #                          feed conditions (parity oracle only).
+#   TSAOT_TAG_EQ=0         Generic strict/loose equality against undefined,
+#                          null and boolean constants instead of a bit compare
+#                          (parity oracle only).
+#   TSAOT_INLINE_INDEX=0   Out-of-line array element reads instead of the
+#                          inline in-range fast path (parity oracle only).
 #   TSAOT_TYPED_CELLS=0    Exporter: plain-object cells instead of typed `__cell`
 #                          instances (legacy IR; the parity corpus uses it).
 #   TSAOT_CAPTURE_CONTEXTS=0  Exporter: one cell per captured variable instead of
@@ -99,6 +104,8 @@ env: TSAOT_CC (default "cc -O2"), TSAOT_ANALYZER=rust|ts|native (default rust),
      TSAOT_LAZY_FRAMES=0 for eagerly linked root frames,
      TSAOT_LITERAL_LAYOUT=0 for per-property literal construction,
      TSAOT_TRUTHY_UNBOX=0 for boxed condition temporaries,
+     TSAOT_TAG_EQ=0 / TSAOT_INLINE_INDEX=0 for generic tag compares and
+     out-of-line element reads,
      TSAOT_TYPED_CELLS=0 / TSAOT_CAPTURE_CONTEXTS=0 for the legacy capture IR,
      TSAOT_NESTED_DIRECT=0 / TSAOT_LAZY_FN_DECL=0 for closure-value nested calls,
      TSAOT_GC_AGE_THRESHOLD=1 for immediate promotion at application runtime,

@@ -707,6 +707,19 @@ Node best-of-3, same machine state, outputs checked against Node:
 | Map with string keys | 92 ms | 90 ms | 0.88x |
 | method objects | 47 ms | 45 ms | 0.69x |
 
+Kernels after the fixed condition temporaries and the three micro-patterns
+(`native_s350x2`'s emitter; best-of-3, Node best-of-3 in the same run):
+
+| kernel | before | after |
+|---|---:|---:|
+| arrays of objects | 326 ms | 283 ms |
+| 32-case `switch` dispatch | 466 ms | 399 ms |
+| closures with captured variables | 373 ms | 345 ms |
+| small calls with object arguments | 984 ms | 936 ms |
+| tree recursion | 130 ms | 122 ms |
+| shape-polymorphic object literals | 322 ms | 317 ms |
+| array callbacks, flags, strings, maps, methods | — | within noise |
+
 Compiler A/Bs for the slice (three alternating runs each, outputs validated):
 
 | build | median wall | note |
@@ -718,7 +731,8 @@ Compiler A/Bs for the slice (three alternating runs each, outputs validated):
 | `native_s350s` (lazy root frames) | **8.235 s** | 1.1% less than `r` (8.329 s) |
 | `native_s350u` (object literal and constructor layouts) | **7.911 s** | 1.8% less than `s` (8.052 s in its own session); Node 3.238 s |
 | `native_s350v` (slot-first inline-cache probe) | **7.591 s** | 4.2% less than `u` (7.925 s in its own session); Node 3.218 s |
-| `native_s350w` (condition temporaries kept raw) | **7.548 s** | 4.5% less than `v` (7.903 s in its own session); Node 3.219 s |
+| `native_s350w` (condition temporaries kept raw) | (invalid) | the run recorded as this A/B measured `v` against `u` again (the script's binary paths were not updated); `w` also miscompiled reassigned boolean parameters and reported 1,419 bogus diagnostics on the compiler |
+| `native_s350x2` (condition temporaries fixed + tag compares, inline element reads, raw loop flags) | **7.416 s** | 3.3% less than `v` (7.668 s in the same session); Node 3.271 s; diagnostics zero, outputs validated |
 
 ### Inline-cache path statistics (Session 350, `native_s350s_stats`)
 

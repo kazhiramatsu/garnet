@@ -978,8 +978,7 @@ static tsv ts_new_sized_impl(size_t size, int pretenured){
 tsv ts_new_sized(size_t size){ return ts_new_sized_impl(size, 0); }
 tsv ts_new_sized_pretenured(size_t size){ return ts_new_sized_impl(size, 1); }
 /* ---------------- arrays / sparse-hole representation ---------------- */
-#define TS_ARRAY_HOLE TS_BOX(0xFFFEu, 0x4152484Fu)
-static inline int array_is_hole(tsv v){ return v == TS_ARRAY_HOLE; }
+/* TS_ARRAY_HOLE and array_is_hole live in ts_rt.h (the inline element reader tests them). */
 static inline int array_uses_inline(ts_array* a){ return a->data == a->inline_data; }
 #define GC_CONTAINER_CARD_SHIFT 6u
 /* Indexed stores remember a bounded span of 64-element cards. Unknown stores

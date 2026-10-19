@@ -1611,6 +1611,31 @@ TS_RT_ALWAYS_INLINE tsv ts_array_get_lazy(tsv arr, uint32_t i, ts_frame_hdr* fra
   ts_frame_pop(frame);
   return r;
 }
+/* The hole marker of a sparse array element (never a user-visible value). */
+#define TS_ARRAY_HOLE TS_BOX(0xFFFEu, 0x4152484Fu)
+static inline int array_is_hole(tsv v){ return v == TS_ARRAY_HOLE; }
+/* Element read with the array case in line: an in-range element that is not
+   a hole is the value, any other index of an array is undefined (ts_array_get
+   agrees); strings and other receivers take the out-of-line reader. */
+static inline tsv ts_array_get_inline(tsv arr, uint32_t i){
+  if (ts_is_indexed_array_fast(arr)){
+    ts_array* a = (ts_array*)ts_ptr(arr);
+    if (i < a->len){ tsv v = a->data[i]; if (!array_is_hole(v)) return v; }
+    return TS_UNDEFINED;
+  }
+  return ts_array_get(arr, i);
+}
+static inline tsv ts_array_get_inline_lazy(tsv arr, uint32_t i, ts_frame_hdr* frame, uint32_t nslots){
+  if (ts_is_indexed_array_fast(arr)){
+    ts_array* a = (ts_array*)ts_ptr(arr);
+    if (i < a->len){ tsv v = a->data[i]; if (!array_is_hole(v)) return v; }
+    return TS_UNDEFINED;
+  }
+  ts_frame_push(frame, nslots);
+  tsv r = ts_array_get(arr, i);
+  ts_frame_pop(frame);
+  return r;
+}
 TS_RT_ALWAYS_INLINE tsv ts_get_dyn_pic_checked_inline(
     tsv obj, tsv key, ts_prop_ic* ic){
   if (ic && ic->megamorphic){
