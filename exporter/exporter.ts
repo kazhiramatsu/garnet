@@ -307,6 +307,10 @@ class Exporter {
   capturedByFns = new Map<ts.Symbol, FnLike[]>();
   valueBindings = new Set<ts.Symbol>();
   valueCaptures = process.env.TSAOT_VALUE_CAPTURES !== "0";
+  // Lazy closure values (docs/lazy_function_values_design.md): a nested
+  // declaration used as a value gets its closure on first use per activation.
+  lazyFnValues = process.env.TSAOT_LAZY_FN_VALUES !== "0";
+  lazyFnValueSyms = new Set<ts.Symbol>();
   // Capture contexts (docs/capture_contexts_design.md): the scope record of each
   // owner function and the owner of every record-resident binding.
   captureContexts = false;
@@ -1795,6 +1799,14 @@ class Exporter {
                      !(ts.isCallExpression(n.parent) && n.parent.expression === n)))) {
           const owner = this.symbolOwnerFunction(s);
           if (owner && owner !== F) res.add(s); // captured from an outer function (incl. __module_init)
+          // Lazy closure values: the user of a nested declaration's value may
+          // have to create the closure, so it captures what the declaration
+          // captures (the direct-call rule, below, applied to value uses).
+          if (this.lazyFnValues && s && this.nestedFuncSymbols.has(s) &&
+              !(ts.isCallExpression(n.parent) && n.parent.expression === n)) {
+            const fnode = this.fnNodeById(this.funcSymbols.get(s)!);
+            if (fnode && fnode !== (F as unknown as ts.Node)) calledFns.push(fnode as unknown as FnLike);
+          }
         }
       }
       // `new C()` / `super(...)`: F Direct-calls that ctor and must thread its
@@ -2295,11 +2307,53 @@ class Exporter {
     return cell;
   }
 
+  /** The closure value of a lazily hoisted nested declaration, from its
+   *  storage here (record field, cell VALUE or the owner's local): loaded, and
+   *  allocated and stored back when still undefined, so each activation creates
+   *  it at most once and every use sees the same object. */
+  private lazyFunctionValue(ctx: FnCtx, sym: ts.Symbol, at: ts.Node): number | undefined {
+    const func = this.funcSymbols.get(sym);
+    if (func === undefined) return undefined;
+    const fnode = this.fnNodeById(func);
+    if (!fnode || !isLiftable(fnode)) return undefined;
+    const ref = this.capturedRef(ctx, sym);
+    const local = ref ? undefined : ctx.localOfSymbol.get(sym);
+    if (!ref && local === undefined) return undefined;
+    const name = (sym as { name?: string }).name ?? "fn";
+    const v = this.newLocal(ctx, "reference", name);
+    if (ref) ctx.body.push({ kind: "LoadField", dst: v, obj: ref.obj, field: ref.field });
+    else ctx.body.push({ kind: "Copy", dst: v, src: local! });
+    const isUndef = this.newLocal(ctx, "primitive");
+    ctx.body.push({ kind: "UnOp", dst: isUndef, op: "isundef", operand: v });
+    const thenBody = this.captureBody(ctx, () => {
+      const captures: { binding: number; cell: number }[] = [];
+      for (const slot of this.captureSlots(this.sortedFreeVars(fnode as FnLike))) {
+        const cell = this.supplySlot(ctx, slot);
+        if (cell === undefined)
+          this.unsupported(at, `closure of '${name}' cannot capture '${this.slotName(slot)}' here (binding is unavailable)`);
+        captures.push({ binding: slot.binding, cell: cell ?? this.newLocal(ctx, "reference", "missingCell") });
+      }
+      const made = this.newLocal(ctx, "reference", name);
+      const site = this.site++;
+      this.labels[site] = `${name}@${ctx.name}`;
+      this.recordSite(site, "closure", this.inLoop(at) ? "many" : "once", true, fnode);
+      ctx.body.push({ kind: "AllocClosure", dst: made, func, captures, site });
+      ctx.body.push({ kind: "Copy", dst: v, src: made });
+      if (ref) ctx.body.push({ kind: "StoreField", obj: ref.obj, field: ref.field, src: made });
+      else ctx.body.push({ kind: "Copy", dst: local!, src: made });
+    });
+    ctx.body.push({ kind: "If", cond: isUndef, thenBody, elseBody: [] });
+    return v;
+  }
   private directFunctionValue(ctx: FnCtx, func: number): number | undefined {
     const node = this.fnNodeById(func);
     if (!node || !isLiftable(node)) return undefined;
     const sym = !ts.isArrowFunction(node) && node.name ? this.symbolOf(node.name) : undefined;
     if (sym) {
+      if (this.lazyFnValueSyms.has(sym)) {
+        const lazy = this.lazyFunctionValue(ctx, sym, node);
+        if (lazy !== undefined) return lazy;
+      }
       if (this.hasCaptured(ctx, sym)) {
         const value = this.newLocal(ctx, "reference", "callee");
         this.loadCaptured(ctx, sym, value);
@@ -6330,6 +6384,10 @@ class Exporter {
       ctx.body.push({ kind: "Const", dst, value: { kind: "Undef" } });
       return dst;
     }
+    if (sym && this.lazyFnValueSyms.has(sym)) {
+      const lazy = this.lazyFunctionValue(ctx, sym, node);
+      if (lazy !== undefined) return lazy;
+    }
     if (sym && this.hasCaptured(ctx, sym)) {
       const dst = this.newLocal(ctx, this.refKindOf(node));
       this.loadCaptured(ctx, sym, dst);
@@ -10065,6 +10123,9 @@ class Exporter {
 
   lowerStmt(ctx: FnCtx, stmt: ts.Statement) {
     if (ts.isBlock(stmt)) {
+      // The body block of a loop instantiates its function declarations on
+      // every entry (block-scoped declarations in strict code).
+      if (stmt.parent && isLoopStatement(stmt.parent)) this.hoistDeclarations(ctx, stmt, true);
       stmt.statements.forEach((s) => this.lowerStmt(ctx, s));
     } else if (ts.isVariableStatement(stmt)) {
       const isLexical = (stmt.declarationList.flags & ts.NodeFlags.BlockScoped) !== 0;
@@ -10680,9 +10741,20 @@ class Exporter {
   // then binds functions (as closures, callable before their textual site) and
   // initializes `var` slots to undefined. Functions hoisted here are recorded in
   // ctx.hoistedFns so their textual FunctionDeclaration is a no-op when reached.
-  hoistDeclarations(ctx: FnCtx, body: ts.Block) {
+  hoistDeclarations(ctx: FnCtx, body: ts.Block, loopBody = false) {
     const fnDecls: ts.FunctionDeclaration[] = [];
     const varNames: ts.Identifier[] = [];
+    // `var` bindings are function-scoped: collected through every nested block
+    // and loop (not into other functions) and hoisted once, at the prologue.
+    const collectVars = (n: ts.Node) => {
+      if (isFunctionLike(n) || ts.isClassDeclaration(n) || ts.isClassExpression(n)) return;
+      if (ts.isVariableStatement(n)) {
+        const flags = n.declarationList.flags;
+        if (!(flags & ts.NodeFlags.Let) && !(flags & ts.NodeFlags.Const))
+          for (const d of n.declarationList.declarations) if (ts.isIdentifier(d.name)) varNames.push(d.name);
+      }
+      n.forEachChild(collectVars);
+    };
     const collect = (n: ts.Node) => {
       // A function DECLARATION at this level is hoisted (record it, then do NOT
       // descend — its body is a separate scope). Check this BEFORE the generic
@@ -10691,6 +10763,10 @@ class Exporter {
         fnDecls.push(n);
         return;
       }
+      // A function declaration inside a loop body is block-scoped: it is
+      // instantiated at every entry of that block (lowerStmt hoists it when it
+      // lowers the loop's block), so the prologue takes only the vars from it.
+      if (isLoopStatement(n)) { if (!loopBody) collectVars(n); return; }
       // Do not descend into other nested function-likes (expressions, arrows,
       // methods) or class bodies: their inner var/function declarations hoist to
       // THEIR scope, not ours.
@@ -10708,6 +10784,25 @@ class Exporter {
     };
     body.statements.forEach(collect);
 
+    // Lazy closure values are registered for the whole block before any body
+    // is lowered: a sibling lowered earlier in lexical order may read a later
+    // declaration's value (`tryParse(parseJSDocLinkPrefix)`), and that read
+    // must find the lazy storage, not a bare record field.
+    const lazyHere = new Set<ts.Symbol>();
+    if (this.lazyFnValues) {
+      for (const fd of fnDecls) {
+        const sym = this.symbolOf(fd.name!);
+        if (!sym || this.isScriptGlobalVarSymbol(sym, fd.name!.text) || this.functionValueGlobal.has(sym)) continue;
+        const directOnly = this.lazyFnDecls && !this.fnValueUsed.has(sym) && !this.hasCaptured(ctx, sym);
+        if (directOnly) continue;
+        this.lazyFnValueSyms.add(sym);
+        lazyHere.add(sym);
+        if (!this.hasCaptured(ctx, sym)) {
+          const lid = this.ensureLocal(ctx, sym, "reference", fd.name!.text);
+          ctx.body.push({ kind: "Const", dst: lid, value: { kind: "Undef" } });
+        }
+      }
+    }
     // Hoist functions first (JS: function declarations win over var of same name).
     for (const fd of fnDecls) {
       const sym = this.symbolOf(fd.name!);
@@ -10718,6 +10813,14 @@ class Exporter {
       if (this.lazyFnDecls && !this.fnValueUsed.has(sym) &&
           !this.isScriptGlobalVarSymbol(sym, fd.name!.text) &&
           !this.hasCaptured(ctx, sym) && !this.functionValueGlobal.has(sym)) {
+        this.lowerFunctionLike(fd, this.fnId.get(fd)!, false);
+        ctx.hoistedFns.add(fd);
+        continue;
+      }
+      // Lazy closure value: lower the body now; the storage was left undefined
+      // above and the first value use of this activation allocates the
+      // closure (lazyFunctionValue).
+      if (lazyHere.has(sym)) {
         this.lowerFunctionLike(fd, this.fnId.get(fd)!, false);
         ctx.hoistedFns.add(fd);
         continue;
@@ -10738,6 +10841,9 @@ class Exporter {
     }
     // Hoist `var` bindings: initialize to undefined (unless already a cell that
     // a function hoist filled, or a param). Reads before assignment see undefined.
+    // (A loop body's hoist handles its function declarations only: the vars
+    // persist across iterations and were initialized at the prologue.)
+    if (loopBody) return;
     for (const id of varNames) {
       const sym = this.symbolOf(id);
       if (!sym) continue;

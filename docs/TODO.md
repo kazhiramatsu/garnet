@@ -5037,11 +5037,56 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   sized-only build, alternating three runs, outputs validated,
   diagnostics zero: **6.232 → 6.066 s median wall (2.7% less; the three timed run pairs read −2.9%, −2.3% and −2.0%); Node 3.311 s, native 1.83x slower than V8; RSS 1,166 → 1,089 MB**. Statistics relink:
   allocations 23.64M → 17.64M per compile (2.65 → 2.13 GB), objects 12.06M → 6.06M, closures unchanged at 3.26M, minor collections 615 → 487. Gates: conformance 438/438, parity 341 identical + 93 KNOWN (the fixture surfaces a pre-existing rooting difference of the frozen emitter in its generator and async owners, allowlisted), bundler 42/42, selfconf 424 + 11 KNOWN, GC stress (all phases), inline policy, units (every verdict read from the gate output).
-- Next slices, in order. (1) Value captures, second round: bindings
-  declared by destructuring, `let` assigned exactly once after its
-  declaration, and the lexical `this` of arrows (immutable within a
-  function); the records that remain because a hoisted declaration used as
-  a value captures a body constant. (2) Stack
+- Lazy closure values for nested declarations
+  (`docs/lazy_function_values_design.md`). A nested function declaration
+  used as a value anywhere was hoisted at the owner's entry: its closure
+  was allocated in every activation whether or not the path that uses the
+  value ran, and stored in the scope record when a nested closure reads
+  it — `checkTypeRelatedTo` allocated five per call (275k calls),
+  `getFlowTypeOfReference` its `getInstanceType` for the rare `new` flow
+  node, `getResolvedBaseConstraint` its `getBaseConstraint`; closures were
+  2.0M of the 17.5M allocations at the forty hottest sites, 3.26M per
+  compile. The closure is now created on first use per activation and
+  cached in the binding's storage (record field, cell or the owner's
+  local, all `undefined` from the prologue), so identity is preserved
+  (`f === f`, keys of a Map) and a use before the declaration's text
+  still sees the function; a nested closure that uses the value can
+  create it because the free-variable rollup treats a value use of a
+  nested declaration like a direct call (the user captures what the
+  declaration captures). Direct calls are unchanged. The fixture also
+  found that a function declaration inside a loop body was hoisted to
+  the function prologue, so its closure captured the loop variable of
+  the first iteration for every later one (`for (const x of xs) {
+  function addX(y) { return x + y } ... }`): loop bodies now hoist their
+  own function declarations at each entry (block-scoped declarations),
+  while `var` bindings keep the prologue. A first build of the compiler
+  crashed on every input (`TypeError: value is not a function`): a
+  sibling lowered earlier in lexical order read a later declaration's
+  value (`tryParse(parseJSDocLinkPrefix)` in the parser) before that
+  declaration had been registered as lazy, so it loaded the bare record
+  field; the hoisting now registers every lazy value of a block before it
+  lowers any body (the fixture gained that case). `TSAOT_LAZY_FN_VALUES=0`
+  (exporter) keeps the eager hoisting; the parity oracle's corpus is
+  exported with it. IR of the compiler: closure creation sites 9,219 → 10,567 (one per value use instead of one per hoisted declaration), 3,872 of them under control flow (943 before); declarations referenced only in type positions (`captureErrorCalculationState`, 275k allocations per compile) have no creation site at all. Fixture
+  `closures/lazy_function_values` (identity across uses from the owner
+  and from nested closures, a use before the declaration's text, a
+  declaration both called directly and used as a value, recursion through
+  the value, a use on one branch only, generator and async owners, a
+  declaration in a loop body capturing the loop constant, a Map keyed by
+  the closure, 200k activations that never use the value), on both
+  exporter paths. Compiler A/B against the value-captures build,
+  alternating three runs, outputs validated, diagnostics zero:
+  **5.973 → 5.945 s median wall (0.5% less; all four run pairs, warm-up included, favour the lazy build); Node 3.243 s, native 1.83x slower than V8; RSS 1,089 → 1,100 MB (the extra environment slots of closures that may have to create a sibling's value)**. Statistics relink: closures 3.26M → 1.37M per compile (391 → 165 MB), allocations 17.64M → 15.75M (2.13 → 1.90 GB), minor collections 487 → 429, GC pauses 624 → 553 ms. Gates:
+  conformance 439/439, parity 341 identical + 94 KNOWN (the fixture's loop literal surfaces the known FrameArena-vs-Stack annotation difference, allowlisted), bundler 42/42, selfconf 425 + 11 KNOWN, GC stress (all phases), inline policy, units (every verdict read from the gate output).
+- Next slices, in order. (1) Closures, second round: the remaining
+  closures created on hot paths (arrows passed to `some`/`map`/`forEach`
+  and the checker's own helpers — stack allocation when the callee is
+  known not to retain them, with the lifetime fixtures of the
+  stack-closure slice), and a smaller closure cell (120 bytes today).
+  (2) Value captures, second round: bindings declared by destructuring,
+  `let` assigned exactly once after its declaration, the lexical `this`
+  of arrows; the records that remain because a hoisted declaration used
+  as a value captures a body constant. (3) Stack
   allocation of callback closures the callee is known not to retain
   (`some`/`map`/`forEach`/`every` and the checker's own helpers), with
   the lifetime fixtures the stack-closure slice set out. (3) The generic

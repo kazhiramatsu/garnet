@@ -79,6 +79,9 @@
 #                          scope record instead of passing immutable bindings
 #                          (parameters, constants) to closures by value
 #                          (legacy IR).
+#   TSAOT_LAZY_FN_VALUES=0  Exporter: create the closure of every nested function
+#                          declaration used as a value at the owner's entry
+#                          instead of on first use (legacy IR).
 #   TSAOT_GC_AGE_THRESHOLD=1  Disable the default one-minor aging grace at
 #                          application runtime (immediate first-survival promotion).
 #   TSAOT_GC_AGING_ADAPTIVE=0 Disable runtime survival feedback and use the
