@@ -1476,6 +1476,39 @@ static inline void ts_write_barrier(tsv owner, tsv value){
   if (op & TS_PTR_STACK_TAG) return; /* a stack owner is scanned as a root */
   ts_gc_remember((ts_gc_header*)(uintptr_t)op); /* old-pointer owner */
 }
+/* The barrier for a write whose slot is known (docs/remembered_slots_design.md):
+   an old plain object remembers a dirty card range in its header's spare
+   byte, so the next minor collection scans only those cards. `p` points at
+   the written slot of a SHAPED object (in-object or overflow value). */
+void ts_gc_remember_slot(ts_gc_header* h, uint32_t slot);
+static inline void ts_write_barrier_at(tsv owner, ts_gc_header* oh, tsv* p, tsv value){
+  if (oh->kind == TS_KIND_OBJECT){
+    ts_object* o = (ts_object*)oh;
+    tsv* iv = ts_obj_inline_vals(o);
+    uint32_t slot = (p >= iv && p < iv + oh->inline_cap)
+      ? (uint32_t)(p - iv)
+      : (uint32_t)(p - (tsv*)o->props) + oh->inline_cap;
+    ts_gc_remember_slot(oh, slot);
+  } else {
+    ts_gc_remember(oh);
+  }
+  (void)owner; (void)value;
+}
+static inline void ts_write_barrier_ptr(tsv owner, tsv* p, tsv value){
+  if (!(ts_is_obj(value)||ts_is_func(value)||ts_is_heap_str(value))) return;
+  if (!(ts_is_obj(owner)||ts_is_func(owner)||ts_is_heap_str(owner))) return;
+  uint64_t op = owner & TS_PAYLOAD_MASK, vp = value & TS_PAYLOAD_MASK;
+  if (!(vp & 1u)) return;
+  uintptr_t ve = (uintptr_t)g_ts_handle_table[vp >> 1];
+  if (ve & TS_HANDLE_OLD_BIT) return;
+  if (op & 1u){
+    uintptr_t oe = (uintptr_t)g_ts_handle_table[op >> 1];
+    if (oe & TS_HANDLE_OLD_BIT) ts_write_barrier_at(owner, ts_handle_entry_cell(oe), p, value);
+    return;
+  }
+  if (op & TS_PTR_STACK_TAG) return;
+  ts_write_barrier_at(owner, (ts_gc_header*)(uintptr_t)op, p, value);
+}
 /* Ordinary shape hits keep their compact cache and original guard sequence.
    Sized receivers use a separate bounded location table in ts_rt.c.
    Unsized dictionary receivers validate a cached own slot out of line.
@@ -1561,7 +1594,7 @@ TS_RT_ALWAYS_INLINE void ts_set_pic_inline(
     ts_object* o = (ts_object*)ts_ptr(obj);
     if (!(ts_obj_integrity(o) & 1u)){
       TS_RT_STAT_PIC_SET_CALL(); TS_RT_STAT_PIC_SET_HIT();
-      *p = value; ts_write_barrier(obj, value); return;
+      *p = value; ts_write_barrier_ptr(obj, p, value); return;
     }
   }
   ts_set_pic(obj, key, value, ic);
@@ -1570,9 +1603,14 @@ TS_RT_ALWAYS_INLINE void ts_set_pic_inline(
    fallback: entry in insertion order). */
 static inline void ts_lit_store(tsv obj, uint32_t i, tsv v){
   ts_object* o = (ts_object*)ts_ptr(obj);
-  if (ts_obj_shape_id(o) != TS_SHAPE_NONE) *ts_obj_slot_ptr(o, i) = v;
-  else o->props[i].val = v;
-  ts_write_barrier(obj, v);
+  if (ts_obj_shape_id(o) != TS_SHAPE_NONE){
+    tsv* p = ts_obj_slot_ptr(o, i);
+    *p = v;
+    ts_write_barrier_ptr(obj, p, v);
+  } else {
+    o->props[i].val = v;
+    ts_write_barrier(obj, v);
+  }
 }
 /* Lazily linked root frames (docs/lazy_frames_design.md): a generated
    function whose body cannot reach a collection except through these slow
@@ -1599,7 +1637,7 @@ TS_RT_ALWAYS_INLINE void ts_set_pic_inline_lazy(
     ts_object* o = (ts_object*)ts_ptr(obj);
     if (!(ts_obj_integrity(o) & 1u)){
       TS_RT_STAT_PIC_SET_CALL(); TS_RT_STAT_PIC_SET_HIT();
-      *p = value; ts_write_barrier(obj, value); return;
+      *p = value; ts_write_barrier_ptr(obj, p, value); return;
     }
   }
   ts_frame_push(frame, nslots);

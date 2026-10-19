@@ -4826,13 +4826,35 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   328 of the 612 minors in the forced-promotion fallback (328 MB promoted
   early). Property additions: 16.3M cache hits, 1.9M slow (transition
   walks). Root pushes by runtime helpers: 52M.
-- Next slices, in order. (1) The coroutine frame: 1.27 KB per generator
-  activation (sixteen inline slots, eight inline handler entries in five
-  arrays, a `jmp_buf`); the checker's `getUnmatchedProperty` pays it per
-  call — allocate the handler arrays lazily and size the frame by the
-  body's needs. (2) The remembered set: a slot-granular (or dirty-range)
-  record instead of rescanning every property of each remembered old
-  object, and the forced-promotion fallback that promotes 328 MB early. (3)
-  The arena strategies (155 `FrameArena` arrays, 639 `CallerArena` sites).
-  (4) Sparse element storage; callback specialization; the remaining
-  pattern gaps and dynamic method sites; dead capture cells.
+- Dirty slot ranges for remembered objects
+  (`docs/remembered_slots_design.md`). A minor collection rescanned every
+  remembered old cell completely — 2.70M rescans per compile, every property
+  visited and every key marked. Arrays and maps already kept a dirty card
+  range; plain objects now keep one in the header's spare byte (cards of
+  eight slots, fifteen cards covered, `0xFF` every slot): the inline-cache
+  set paths and layout stores record the written slot through
+  `ts_write_barrier_ptr`, every other enrollment (the generic barrier,
+  promotion, deletion, the dictionary transition) marks every slot, and the
+  minor collection visits only the dirty cards of a remembered object. The
+  class fields of a sized instance are written through the generic barrier
+  and so always rescanned. `TSAOT_REMEMBERED_SLOTS=0` (runtime) keeps the
+  whole-cell rescan. Fixture `gc/remembered_slots` (young values at low,
+  middle, high and beyond-range slots, dictionary objects, deletion,
+  prototypes, class instances, with collections between writes and reads),
+  run normally and under seven forced collection settings including
+  `TSAOT_GC_ZAP=1`, matching V8 each time. Also in this commit: the native build script's cold-function selection (O0 for giant functions) matches typed direct entries (`static int/double/long long fn_X_d`) as well as `static tsv` ones, and the statistics build counts array, literal and class-instance allocations per site under `TSAOT_SITE_STATS=1` (pseudo function ids 4000000001-3), which the next slice's choice relies on. Compiler A/B
+  against the value-call build, alternating three runs, outputs validated,
+  diagnostics zero: **6.397 → 6.395 s median wall (no measurable change; a first run taken while a statistics compile shared the machine read 6.703 → 6.767 s and was discarded)**; Node 3.222 s. Statistics relink: 735k precise slot writes against 1.87M generic (every-slot) enrollments — the out-of-line named-property writes and additions still use the generic barrier — so 871k of the 2.13M minor rescans were precise (4.8M slots visited instead of about 9.6M; the 1.26M full rescans visited 9.7M), marked edges 51.3M → 50.2M, GC pauses 686 → 581 ms; the wall-clock A/B does not resolve that. Kept as a sound, measured reduction of collector work; extending precision to the out-of-line writes is noted below. Gates: conformance 433/433, parity 339 identical + 90 KNOWN, bundler 42/42, selfconf 419 + 11 KNOWN, GC stress (all phases), inline policy, units (every verdict read from the gate output).
+- Next slices, in order. (1) Per-site allocation statistics for arrays,
+  literals and class instances (the diagnostic counters are in; the first
+  statistics compile was abandoned after 36 CPU minutes because the
+  scratchpad regeneration script still lacked the cold-function split) to
+  size the arena strategies (155 `FrameArena` arrays, 639 `CallerArena`
+  sites). (2) Sparse element storage; callback specialization; the
+  remaining 2,319 dynamic method sites. (3) Precision for the out-of-line
+  named-property writes of the remembered set (1.87M generic enrollments
+  per compile). (4) The coroutine frame (1.27 KB per generator activation;
+  a promise allocated for every generator) and dead capture cells — small.
+  (5) The remaining pattern gaps: small calls with object arguments 4.3x,
+  array callbacks 3.9x, flags 3.9x, arrays of objects 2.7x; constructor
+  pre-sizing from layouts; local classes from declared types; C5b-2/3.

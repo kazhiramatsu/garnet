@@ -33,6 +33,7 @@ static size_t g_young_threshold=65536;
 static size_t g_heap_bytes = 0;
 static size_t g_full_threshold_bytes = (size_t)16u * 1024u * 1024u;
 static int g_full_threshold_forced = 0; /* env override pins the trigger (stress knob) */
+static int g_remembered_slots = 1;      /* TSAOT_REMEMBERED_SLOTS=0: whole-cell rescans */
 /* TSAOT_GC_ZAP=1 fills dead and moved-from cell bodies with 0xDD during
    collection (Phase C0 groundwork): a stale raw pointer held across a
    safepoint then reads loud garbage (kind 0xDD fails gc_kind_valid, tsv
@@ -138,6 +139,7 @@ static struct {
   unsigned long long kind_scan[TS_KIND_PROXY + 1], mark_edges, mark_old_edges;
   unsigned long long kind_minor_elements[TS_KIND_PROXY + 1];
   unsigned long long minor_root_slots, minor_remembered_cells;
+  unsigned long long remset_slot_writes, remset_full_marks, remset_precise_scans, remset_precise_slots, remset_full_scans, remset_full_slots;
   unsigned long long small_props_fresh, small_props_reused;
   unsigned long long prop_add_hits, prop_add_fills;
   unsigned long long nursery_alloc, nursery_chunks, retained_chunks;
@@ -201,6 +203,9 @@ __attribute__((destructor)) static void ts_rt_stats_dump(void){
   fprintf(out, "[rt_stats] mark: edges=%llu old_edges=%llu minor_root_slots=%llu minor_remembered_cells=%llu\n",
           g_rt_stats.mark_edges, g_rt_stats.mark_old_edges,
           g_rt_stats.minor_root_slots, g_rt_stats.minor_remembered_cells);
+  fprintf(out, "[rt_stats] remset: slot_writes=%llu full_marks=%llu precise_scans=%llu precise_slots=%llu full_scans=%llu full_slots=%llu\n",
+          g_rt_stats.remset_slot_writes, g_rt_stats.remset_full_marks, g_rt_stats.remset_precise_scans,
+          g_rt_stats.remset_precise_slots, g_rt_stats.remset_full_scans, g_rt_stats.remset_full_slots);
   fprintf(out, "[rt_stats] nursery: alloc=%llu chunks=%llu retained=%llu aged=%llu+%llu | live_bytes=%zu full_next=%zu\n",
           g_rt_stats.nursery_alloc, g_rt_stats.nursery_chunks, g_rt_stats.retained_chunks,
           g_rt_stats.nursery_aged, g_rt_stats.unpooled_aged,
@@ -378,6 +383,8 @@ static void gc_config_init(void){
     unsigned long long v = strtoull(fbytes, &end, 10);
     if (end != fbytes && v){ g_full_threshold_bytes = (size_t)v; g_full_threshold_forced = 1; }
   }
+  const char* rslots = getenv("TSAOT_REMEMBERED_SLOTS");
+  if (rslots && rslots[0] && strcmp(rslots, "0") == 0) g_remembered_slots = 0;
   const char* zap = getenv("TSAOT_GC_ZAP");
   if (zap && zap[0] && strcmp(zap, "0") != 0) g_gc_zap = 1;
 }
@@ -450,6 +457,7 @@ static void gc_remember(ts_gc_header* h){
   uint8_t credit =
     (g_gc_aging_adaptive && g_gc_aging_fallback_minors)
       ? 1 : g_gc_age_threshold;
+  if (h->kind == TS_KIND_OBJECT && h->hdr_spare == 0) h->hdr_spare = 0xFF; /* no range known: every slot */
   if (h->remembered){ h->remembered = credit; return; }
   if (g_rem_len == g_rem_cap){
     g_rem_cap = g_rem_cap ? g_rem_cap * 2 : 1024;
@@ -463,6 +471,33 @@ void ts_gc_remember(ts_gc_header* h){
     ((ts_array*)h)->gc_dirty_all = 1;
   else if (h && h->gen == TS_GEN_OLD && h->kind == TS_KIND_MAP)
     ((ts_map*)h)->gc_dirty_all = 1;
+  else if (h && h->gen == TS_GEN_OLD && h->kind == TS_KIND_OBJECT){
+    RT_STAT_INC(remset_full_marks);
+    h->hdr_spare = 0xFF;
+  }
+  gc_remember(h);
+}
+/* A write at a known slot of an old plain object: merge the slot's card
+   (eight slots per card, fifteen cards covered) into the header's dirty range
+   — high nibble first card, low nibble end card (exclusive), 0xFF every slot. */
+void ts_gc_remember_slot(ts_gc_header* h, uint32_t slot){
+  if (!h || h->gen != TS_GEN_OLD) return;
+  if (h->kind == TS_KIND_OBJECT && g_remembered_slots){
+    RT_STAT_INC(remset_slot_writes);
+    uint32_t card = slot >> 3;
+    uint8_t cur = h->hdr_spare;
+    if (card >= 15u || cur == 0xFF){
+      h->hdr_spare = 0xFF;
+    } else {
+      uint32_t first = cur ? (cur >> 4) : card;
+      uint32_t end = cur ? (cur & 0xF) : 0;
+      if (card < first) first = card;
+      if (card + 1u > end) end = card + 1u;
+      h->hdr_spare = (uint8_t)((first << 4) | end);
+    }
+  } else if (h->kind == TS_KIND_OBJECT){
+    h->hdr_spare = 0xFF;
+  }
   gc_remember(h);
 }
 
@@ -1439,6 +1474,7 @@ static void props_free(ts_object* o){
   else props_free_buf(o->props, o->cap);
 }
 static void obj_to_dictionary(ts_object* o){
+  if (o->h.gen == TS_GEN_OLD) o->h.hdr_spare = 0xFF; /* slots renumber: a remembered range would be stale */
   if (!obj_shaped(o)) return;
   uint32_t sid = ts_obj_shape_id(o);
   uint32_t len = o->len, oldcap = o->cap;
@@ -3792,16 +3828,32 @@ static inline void gc_mark_property_key(ts_key key, int young, int depth){
     gc_mark_visit(sym_value_by_id(key - TS_USERSYM_KEY_BASE), young, depth);
 }
 static inline void gc_mark_common_props(ts_object* o, int young, int depth, int stable){
+  uint32_t first = 0, end = o->len;
+  /* A remembered old plain object rescanned by a minor collection visits its
+     dirty cards only (docs/remembered_slots_design.md); 0 (no range) and
+     0xFF (every slot) scan everything. */
+  if (young && o->h.gen == TS_GEN_OLD && o->h.kind == TS_KIND_OBJECT){
+    uint8_t r = o->h.hdr_spare;
+    if (r != 0 && r != 0xFF){
+      first = (uint32_t)(r >> 4) << 3;
+      end = (uint32_t)(r & 0xF) << 3;
+      if (end > o->len) end = o->len;
+      if (first > end) first = end;
+      RT_STAT_INC(remset_precise_scans); RT_STAT_ADD(remset_precise_slots, end - first);
+    } else {
+      RT_STAT_INC(remset_full_scans); RT_STAT_ADD(remset_full_slots, o->len);
+    }
+  }
   if (obj_shaped(o)){
     if (!o->len) return;
     const ts_key* ks = g_ts_shape_keys[ts_obj_shape_id(o)];
-    for (uint32_t i=0;i<o->len;i++){
+    for (uint32_t i=first;i<end;i++){
       gc_mark_property_key(ks[i], young, depth);
       gc_visit_slot(ts_obj_slot_ptr(o, i), young, depth, stable);
     }
     return;
   }
-  for (uint32_t i=0;i<o->len;i++){
+  for (uint32_t i=first;i<end;i++){
     gc_mark_property_key(o->props[i].key, young, depth);
     gc_visit_slot(&o->props[i].val, young, depth, stable);
   }
@@ -4297,6 +4349,8 @@ void ts_gc_collect_young(void){
     } else if (h->kind == TS_KIND_MAP){
       ts_map* m = (ts_map*)h;
       m->gc_dirty_all = 0; m->gc_dirty_end = 0;
+    } else if (h->kind == TS_KIND_OBJECT){
+      h->hdr_spare = 0;
     }
   }
   ts_gc_header* survivors = NULL;
@@ -4398,6 +4452,8 @@ void ts_gc_collect(void){
     } else if (remembered->kind == TS_KIND_MAP){
       ts_map* m = (ts_map*)remembered;
       m->gc_dirty_all = 0; m->gc_dirty_end = 0;
+    } else if (remembered->kind == TS_KIND_OBJECT){
+      remembered->hdr_spare = 0;
     }
   }
   g_rem_len = 0;
@@ -9755,6 +9811,7 @@ int ts_is_undefined(tsv v){ return ts_is_undef(v); }
    the internal ts_delete_prop which returns false. Non-own / configurable / absent
    keys delete normally. */
 int ts_delete_prop_strict(tsv obj, ts_key key){
+  if (ts_is_obj(obj)){ ts_gc_header* _dh = (ts_gc_header*)ts_ptr(obj); if (_dh->gen == TS_GEN_OLD) _dh->hdr_spare = 0xFF; }
   if (g_has_proxies && ts_is_proxy(obj)) return ts_proxy_delete_v(obj, ts_key_to_value(key));
   if (!ts_is_obj(obj)) return 1;
   ts_object* o=ts_ptr(obj);
@@ -9811,6 +9868,7 @@ tsv ts_delete_dynamic_strict(tsv obj, tsv keyv, const uint32_t* method_pairs, ui
   return ts_bool(result);
 }
 int ts_delete_prop(tsv obj, ts_key key){
+  if (ts_is_obj(obj)){ ts_gc_header* _dh = (ts_gc_header*)ts_ptr(obj); if (_dh->gen == TS_GEN_OLD) _dh->hdr_spare = 0xFF; }
   if (g_has_proxies && ts_is_proxy(obj)) return ts_proxy_delete_v(obj, ts_key_to_value(key));
   if (!ts_is_obj(obj)) return 1;
   ts_object* o=ts_ptr(obj);

@@ -741,6 +741,7 @@ Compiler A/Bs for the slice (three alternating runs each, outputs validated):
 | `native_s350x8` (scalar-replacement outer-alias fix, loop-body stack slots to the frame arena) | 6.593 s | noise level against `x7` (6.609 s in the same session); Node 3.271 s; diagnostics zero, outputs validated |
 | `native_s350x9` (stack-allocated non-escaping closures, hoisted stack cells) | **6.404 s** | 1.4% less than `x8` (6.494 s in the same session); Node 3.231 s; peak RSS 1,171 → 1,160 MB; diagnostics zero, outputs validated |
 | `native_s350x10` (inline fast path for function-value calls) | 6.478 s | 1.1% less than `x9` (6.553 s in the same session), within noise (two of three run pairs equal); Node 3.297 s; diagnostics zero, outputs validated |
+| `native_s350x11` (dirty slot ranges for remembered objects) | 6.395 s | no measurable change against `x10` (6.397 s in the same quiet session; a run shared with a statistics compile read +1.0% and was discarded); Node 3.222 s; diagnostics zero, outputs validated |
 
 ### Inline-cache path statistics (Session 350, `native_s350s_stats`)
 

@@ -16451,6 +16451,10 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                             let _ = writeln!(s, "  ts_write_barrier({}, {});", dst_name, proto_expr);
                         }
                     }
+                    if site_stats_enabled() {
+                        // diagnostic: class instances report under 4000000003
+                        let _ = writeln!(s, "  ts_site_note({}, 4000000003u);", site.0);
+                    }
                 }
                 None => {
                     if let Some(keys) = ctx.layouts.alloc.get(&(inst as *const Inst as usize)) {
@@ -16467,6 +16471,10 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                             "  {} = {}(&_ts_lit_{}); /* site {} {:?} layout */\n  }}",
                             ctx.vname(dst.0), alloc, id, site.0, st
                         );
+                        if site_stats_enabled() {
+                            // diagnostic: object literals report under 4000000002
+                            let _ = writeln!(s, "  ts_site_note({}, 4000000002u);", site.0);
+                        }
                         return;
                     }
                     let alloc = if st == AllocStrategy::PretenuredHeap {
@@ -16489,6 +16497,9 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                                 "  {} = {}_n({}); /* site {} {:?} */",
                                 ctx.vname(dst.0), alloc, n, site.0, st
                             );
+                            if site_stats_enabled() {
+                                let _ = writeln!(s, "  ts_site_note({}, 4000000002u);", site.0);
+                            }
                         }
                         None => {
                             let _ = writeln!(
@@ -16496,6 +16507,9 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                                 "  {} = {}(); /* site {} {:?} */",
                                 ctx.vname(dst.0), alloc, site.0, st
                             );
+                            if site_stats_enabled() {
+                                let _ = writeln!(s, "  ts_site_note({}, 4000000002u);", site.0);
+                            }
                         }
                     }
                 }
@@ -16520,6 +16534,10 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 site.0,
                 st
             );
+            if site_stats_enabled() {
+                // diagnostic: arrays report under the pseudo function id 4000000001
+                let _ = writeln!(s, "  ts_site_note({}, 4000000001u);", site.0);
+            }
         }
         Inst::AllocClosure {
             dst,
