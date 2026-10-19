@@ -4542,7 +4542,7 @@ class Exporter {
       }
       const base = this.lowerExpr(ctx, node.expression);
       const dst = this.newLocal(ctx, this.refKindOf(node));
-      ctx.body.push({ kind: "LoadField", dst, obj: base, field: this.internField(node.name.text) });
+      ctx.body.push(this.withSlots({ kind: "LoadField", dst, obj: base, field: this.internField(node.name.text) }, this.staticSlotHint(node.expression, node.name.text)));
       return dst;
     }
     if (ts.isElementAccessExpression(node)) {
@@ -7359,6 +7359,143 @@ class Exporter {
     emitChain(0);
   }
 
+  /** Prefix layouts of the constructor functions (docs/static_slots_design.md):
+   *  for each function declaration with an explicit `this` parameter, the keys
+   *  of its leading `this.k = <pure>` statements (parameters, literals,
+   *  `undefined`, enum members, casts and operators over those); a repeated or
+   *  computed key or any other statement ends the prefix. The runtime adds the
+   *  keys in that order, so key i sits at slot i of every instance the function
+   *  initializes from an empty object. */
+  constructorLayouts() {
+    const stamp = this.funcSymbols.size;
+    if (!this.ctorLayouts || stamp !== this.ctorLayoutsStamp) {
+      this.ctorLayoutsStamp = stamp;
+      this.ctorLayouts = [];
+      this.staticSlotCands.clear();
+      for (const [sym] of this.funcSymbols) {
+        const d = sym.valueDeclaration ?? sym.declarations?.[0];
+        if (!d || !ts.isFunctionDeclaration(d) || !d.body || d.parameters.length === 0) continue;
+        const p0 = d.parameters[0];
+        if (!ts.isIdentifier(p0.name) || p0.name.text !== "this" || !p0.type) continue;
+        if (d.asteriskToken || d.modifiers?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword)) continue;
+        const params = new Set<ts.Symbol>();
+        for (const p of d.parameters) {
+          const ps = ts.isIdentifier(p.name) ? this.symbolOf(p.name) : undefined;
+          if (ps) params.add(ps);
+        }
+        const keys: string[] = [];
+        for (const st of d.body.statements) {
+          if (!ts.isExpressionStatement(st) || !ts.isBinaryExpression(st.expression) ||
+              st.expression.operatorToken.kind !== ts.SyntaxKind.EqualsToken) break;
+          const lhs = st.expression.left;
+          if (!ts.isPropertyAccessExpression(lhs) || ts.isPrivateIdentifier(lhs.name)) break;
+          let base: ts.Expression = lhs.expression;
+          while (ts.isParenthesizedExpression(base) || ts.isAsExpression(base) || ts.isTypeAssertionExpression(base) || ts.isNonNullExpression(base)) base = base.expression;
+          if (base.kind !== ts.SyntaxKind.ThisKeyword) break;
+          const key = lhs.name.text;
+          if (keys.includes(key) || !this.isPureInitializer(st.expression.right, params)) break;
+          keys.push(key);
+        }
+        if (keys.length === 0) continue;
+        let thisType: ts.Type;
+        try { thisType = this.checker.getTypeFromTypeNode(p0.type); } catch { continue; }
+        this.ctorLayouts.push({ sym, thisType, keys });
+      }
+    }
+    return this.ctorLayouts;
+  }
+  /** An initializer that can neither run user code nor observe `this`. */
+  private isPureInitializer(e: ts.Expression, params: Set<ts.Symbol>): boolean {
+    if (ts.isNumericLiteral(e) || ts.isStringLiteral(e) || ts.isNoSubstitutionTemplateLiteral(e)) return true;
+    if (e.kind === ts.SyntaxKind.TrueKeyword || e.kind === ts.SyntaxKind.FalseKeyword || e.kind === ts.SyntaxKind.NullKeyword) return true;
+    if (ts.isIdentifier(e)) {
+      if (e.text === "undefined") return true;
+      const sym = this.symbolOf(e);
+      return sym !== undefined && params.has(sym);
+    }
+    if (ts.isParenthesizedExpression(e) || ts.isAsExpression(e) || ts.isTypeAssertionExpression(e) || ts.isNonNullExpression(e) || ts.isSatisfiesExpression(e)) {
+      return this.isPureInitializer(e.expression, params);
+    }
+    if (ts.isPrefixUnaryExpression(e)) return this.isPureInitializer(e.operand, params);
+    if (ts.isPropertyAccessExpression(e)) {
+      if (this.constEnumMemberValue(e) !== undefined) return true;
+      const bs = ts.isIdentifier(e.expression) ? this.symbolOf(e.expression) : undefined;
+      return bs !== undefined && (bs.flags & ts.SymbolFlags.Enum) !== 0;
+    }
+    if (ts.isBinaryExpression(e)) {
+      const k = e.operatorToken.kind;
+      if (k === ts.SyntaxKind.EqualsToken || k === ts.SyntaxKind.CommaToken ||
+          (k >= ts.SyntaxKind.FirstCompoundAssignment && k <= ts.SyntaxKind.LastCompoundAssignment)) return false;
+      return this.isPureInitializer(e.left, params) && this.isPureInitializer(e.right, params);
+    }
+    if (ts.isConditionalExpression(e)) {
+      return this.isPureInitializer(e.condition, params) && this.isPureInitializer(e.whenTrue, params) && this.isPureInitializer(e.whenFalse, params);
+    }
+    return false;
+  }
+  /** The static-slot hint of `expr.key` (a read or a write): `(s1 + 1) | (s2 + 1) << 8`
+   *  when every candidate layout of the receiver's type has the key in its prefix,
+   *  at one or two distinct slots below the runtime's limit (the slot of more
+   *  candidates first); 0 otherwise. A prediction: the emitted probe validates it. */
+  staticSlotHint(expr: ts.Expression, key: string): number {
+    if (!this.staticSlotsEnabled || this.constructorLayouts().length === 0) return 0;
+    let t: ts.Type | undefined;
+    try { t = this.checker.getTypeAtLocation(expr); } catch { return 0; }
+    if (!t) return 0;
+    const cands = this.staticSlotCandidates(t);
+    if (!cands || cands.length === 0) return 0;
+    const counts = new Map<number, number>();
+    for (const c of cands) {
+      const slot = c.keys.indexOf(key);
+      if (slot < 0 || slot >= 16) return 0;
+      counts.set(slot, (counts.get(slot) ?? 0) + 1);
+    }
+    if (counts.size > 2) return 0;
+    const slots = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0] - b[0]).map((e) => e[0]);
+    if (process.env.TSAOT_STATIC_SLOTS_LOG === "1") {
+      const k = `${key}@${slots.join(",")}`;
+      this.staticSlotLog.set(k, (this.staticSlotLog.get(k) ?? 0) + 1);
+    }
+    return (slots[0] + 1) | (slots.length > 1 ? (slots[1] + 1) << 8 : 0);
+  }
+  /** The candidate layouts of a receiver type: for each object member of the
+   *  type (`undefined`/`null` members skipped), the layouts whose `this` type is
+   *  assignable to the member or from it (the rule of the construction guards);
+   *  undefined when a member is not an object type (`any`, a primitive, a type
+   *  parameter): no prediction. Cached by type id. */
+  private staticSlotCandidates(t: ts.Type) {
+    const id = (t as unknown as { id?: number }).id;
+    if (id !== undefined && this.staticSlotCands.has(id)) return this.staticSlotCands.get(id);
+    const assignable = (this.checker as unknown as { isTypeAssignableTo?: (a: ts.Type, b: ts.Type) => boolean }).isTypeAssignableTo;
+    let out: { sym: ts.Symbol; thisType: ts.Type; keys: string[] }[] | undefined = [];
+    const members = t.isUnion() ? t.types : [t];
+    for (const m of members) {
+      if (m.flags & (ts.TypeFlags.Undefined | ts.TypeFlags.Null | ts.TypeFlags.Void)) continue;
+      if (!(m.flags & ts.TypeFlags.Object) || !assignable) { out = undefined; break; }
+      for (const l of this.constructorLayouts()) {
+        if (out.includes(l)) continue;
+        let ok = false;
+        try { ok = assignable.call(this.checker, l.thisType, m) || assignable.call(this.checker, m, l.thisType); } catch { ok = false; }
+        if (ok) out.push(l);
+      }
+    }
+    if (id !== undefined) this.staticSlotCands.set(id, out);
+    return out;
+  }
+  printStaticSlotLog(): void {
+    if (process.env.TSAOT_STATIC_SLOTS_LOG !== "1") return;
+    const rows = [...this.staticSlotLog.entries()].sort((a, b) => b[1] - a[1]);
+    let total = 0;
+    for (const [, n] of rows) total += n;
+    console.error(`[static-slots] ${total} hinted sites; layouts: ${(this.ctorLayouts ?? []).map((l) => `${l.sym.name}[${l.keys.join(",")}]`).join(" ")}`);
+    for (const [k, n] of rows.slice(0, 60)) console.error(`[static-slots] ${n}\t${k}`);
+  }
+  /** Attach a non-zero hint to a LoadField/StoreField. */
+  private withSlots<T extends { kind: string }>(inst: T, slots: number): T {
+    if (slots) (inst as unknown as { slots?: number }).slots = slots;
+    return inst;
+  }
+
   /** Counter for specialized-function ids (cloned methods), dense above assigned. */
   specBase = -1;
 
@@ -7384,6 +7521,15 @@ class Exporter {
    *  under the oracle knob and in untyped mode (the candidates come from types). */
   newGuardsEnabled = process.env.TSAOT_NEW_GUARDS !== "0" && process.env.TSAOT_UNTYPED !== "1";
   thisParamFns: { sym: ts.Symbol; decl: ts.FunctionDeclaration; thisType: ts.Type; nparams: number }[] | undefined = undefined;
+  /** Static slots (docs/static_slots_design.md): off under the oracle knob and
+   *  in untyped mode (the predictions come from the receiver types). */
+  staticSlotsEnabled = process.env.TSAOT_STATIC_SLOTS !== "0" && process.env.TSAOT_UNTYPED !== "1";
+  ctorLayouts: { sym: ts.Symbol; thisType: ts.Type; keys: string[] }[] | undefined = undefined;
+  ctorLayoutsStamp = -1;
+  /** Receiver type id -> its candidate layouts (undefined: no prediction). */
+  staticSlotCands = new Map<number, { sym: ts.Symbol; thisType: ts.Type; keys: string[] }[] | undefined>();
+  /** `key@slots` -> hinted sites, for TSAOT_STATIC_SLOTS_LOG=1. */
+  staticSlotLog = new Map<string, number>();
 
   /** Record the resolved concrete type of each field for one `new C<...>()`. */
   /** Lower a class's field initializers (`class C { a = <expr> }`) as StoreField
@@ -10003,7 +10149,7 @@ class Exporter {
   lowerReadFromRef(ctx: FnCtx, lhs: ts.Expression, pre: { obj?: number; key?: number }): number {
     const dst = this.newLocal(ctx, this.refKindOf(lhs));
     if (ts.isPropertyAccessExpression(lhs)) {
-      ctx.body.push({ kind: "LoadField", dst, obj: pre.obj!, field: this.internField(lhs.name.text) });
+      ctx.body.push(this.withSlots({ kind: "LoadField", dst, obj: pre.obj!, field: this.internField(lhs.name.text) }, this.staticSlotHint(lhs.expression, lhs.name.text)));
       return dst;
     }
     const lea = lhs as ts.ElementAccessExpression;
@@ -10174,7 +10320,7 @@ class Exporter {
         return;
       }
       const base = pre?.obj ?? this.lowerExpr(ctx, lhs.expression);
-      ctx.body.push({ kind: "StoreField", obj: base, field: this.internField(lhs.name.text), src: rhs });
+      ctx.body.push(this.withSlots({ kind: "StoreField", obj: base, field: this.internField(lhs.name.text), src: rhs }, this.staticSlotHint(lhs.expression, lhs.name.text)));
     } else if (ts.isElementAccessExpression(lhs)) {
       // obj[symbolKey] = v — symbol-keyed property write (user OR well-known).
       if (this.isSymbolKeyExpr(lhs.argumentExpression)) {
@@ -12914,6 +13060,7 @@ function exportOne(program: ts.Program, input: string, progOut: string, labelOut
   const ex = new Exporter(program, sourceMode);
   ex.run(sf);
   const prog = ex.programJson();
+  ex.printStaticSlotLog();
   fs.writeFileSync(progOut, JSON.stringify(toWireProgram(prog), null, 2));
   fs.writeFileSync(labelOut, JSON.stringify(ex.labels, null, 2));
   const spansOut = labelOut.replace(/labels\.json$|\.json$/, "") + "sites.json";
@@ -13102,6 +13249,7 @@ function main() {
   const ex = new Exporter(program, sourceMode);
   ex.run(sf);
   const prog = ex.programJson();
+  ex.printStaticSlotLog();
   fs.writeFileSync(progOut ?? "program.json", JSON.stringify(toWireProgram(prog), null, 2));
   fs.writeFileSync(labelOut ?? "labels.json", JSON.stringify(ex.labels, null, 2));
   const spansOut = (labelOut ?? "labels.json").replace(/labels\.json$|\.json$/, "") + "sites.json";

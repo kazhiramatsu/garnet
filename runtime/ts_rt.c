@@ -139,6 +139,9 @@ static uint32_t g_handle_free_len = 0, g_handle_free_cap = 0;
    are added. Keys are interned ids below TS_RT_KEY_HIST. */
 #define TS_RT_KEY_HIST 65536u
 static unsigned long long g_key_ool_get[TS_RT_KEY_HIST], g_key_absent[TS_RT_KEY_HIST], g_key_add[TS_RT_KEY_HIST];
+unsigned long long g_ts_key_inline_get[65536], g_ts_key_inline_set[65536];
+unsigned long long g_ts_static_get_hit, g_ts_static_get_miss, g_ts_static_set_hit, g_ts_static_set_miss;
+static uint32_t g_next_shape;   /* defined with the shape table below */
 #define RT_STAT_KEY(arr, key) do { if ((uint32_t)(key) < TS_RT_KEY_HIST) arr[(uint32_t)(key)]++; } while (0)
 static struct {
   unsigned long long minor_gc, full_gc, gc_pause_ns, gc_pause_max_ns;
@@ -210,9 +213,9 @@ __attribute__((destructor)) static void ts_rt_stats_dump(void){
   fprintf(out, "[rt_stats] array_sparse: convert=%llu put=%llu densify=%llu\n",
           g_rt_stats.array_sparse_convert, g_rt_stats.array_sparse_put, g_rt_stats.array_densify);
   {
-    const char* names[3] = { "ool_get", "absent", "add" };
-    unsigned long long* hists[3] = { g_key_ool_get, g_key_absent, g_key_add };
-    for (int hh = 0; hh < 3; hh++){
+    const char* names[5] = { "ool_get", "absent", "add", "inline_get", "inline_set" };
+    unsigned long long* hists[5] = { g_key_ool_get, g_key_absent, g_key_add, g_ts_key_inline_get, g_ts_key_inline_set };
+    for (int hh = 0; hh < 5; hh++){
       unsigned long long* h = hists[hh];
       fprintf(out, "[rt_stats] keys_%s:", names[hh]);
       for (int rank = 0; rank < 30; rank++){
@@ -262,6 +265,8 @@ __attribute__((destructor)) static void ts_rt_stats_dump(void){
   fprintf(out, "[rt_stats] class_field_cache: calls=%llu hits=%llu\n", g_rt_stats.class_field_calls, g_rt_stats.class_field_hits);
   fprintf(out, "[rt_stats] location_cache: probes=%llu hits=%llu collisions=%llu\n",
           g_rt_stats.location_probes, g_rt_stats.location_hits, g_rt_stats.location_collisions);
+  fprintf(out, "[rt_stats] static_slots: get_hit=%llu get_miss=%llu set_hit=%llu set_miss=%llu | shapes=%u\n",
+          g_ts_static_get_hit, g_ts_static_get_miss, g_ts_static_set_hit, g_ts_static_set_miss, g_next_shape);
   fprintf(out, "[rt_stats] prop_pic: get=%llu hit=%llu (%.1f%%) set=%llu hit=%llu (%.1f%%)\n",
           g_ts_pic_get_calls, g_ts_pic_get_hits,
           g_ts_pic_get_calls ? 100.0*(double)g_ts_pic_get_hits/(double)g_ts_pic_get_calls : 0.0,
@@ -1426,6 +1431,12 @@ static uint32_t g_shapes_cap = 0;
    the accessors below read them. Index 0 and TS_SHAPE_EMPTY stay NULL. */
 ts_key** g_ts_shape_keys = NULL;
 uint8_t** g_ts_shape_flags = NULL;
+/* The vectors of shapes 0 (dictionary) and 1 (empty): all NONE, so a static
+   slot probe on such a receiver misses without a shape test. */
+static ts_key g_shape_keys_none[TS_STATIC_SLOT_LIMIT] = {
+  TS_KEY_NONE, TS_KEY_NONE, TS_KEY_NONE, TS_KEY_NONE, TS_KEY_NONE, TS_KEY_NONE, TS_KEY_NONE, TS_KEY_NONE,
+  TS_KEY_NONE, TS_KEY_NONE, TS_KEY_NONE, TS_KEY_NONE, TS_KEY_NONE, TS_KEY_NONE, TS_KEY_NONE, TS_KEY_NONE };
+static uint8_t g_shape_flags_none[TS_STATIC_SLOT_LIMIT];
 static void shape_desc_record(uint32_t id, uint32_t parent, ts_key key, uint8_t flags){
   if (id >= g_shapes_cap){
     uint32_t cap = g_shapes_cap ? g_shapes_cap : 1024u;
@@ -1437,20 +1448,26 @@ static void shape_desc_record(uint32_t id, uint32_t parent, ts_key key, uint8_t 
     g_ts_shape_flags = (uint8_t**)realloc(g_ts_shape_flags, sizeof(uint8_t*) * cap);
     memset(g_ts_shape_flags + g_shapes_cap, 0, sizeof(uint8_t*) * (cap - g_shapes_cap));
     g_shapes_cap = cap;
+    g_ts_shape_keys[TS_SHAPE_NONE] = g_shape_keys_none; g_ts_shape_flags[TS_SHAPE_NONE] = g_shape_flags_none;
+    g_ts_shape_keys[TS_SHAPE_EMPTY] = g_shape_keys_none; g_ts_shape_flags[TS_SHAPE_EMPTY] = g_shape_flags_none;
   }
   ts_shape_desc* d = &g_shapes[id];
   d->parent = parent; d->key = key; d->flags = flags;
   uint32_t pdepth = parent < g_shapes_cap ? g_shapes[parent].depth : 0u;
   d->depth = pdepth + 1u;
   /* Eager vectors: the parent's sequence plus this key. Shaped objects index
-     them on every keyed lookup, so they must exist before the shape is used. */
-  d->keys = (ts_key*)malloc(sizeof(ts_key) * d->depth);
-  d->kflags = (uint8_t*)malloc(d->depth);
+     them on every keyed lookup, so they must exist before the shape is used.
+     At least TS_STATIC_SLOT_LIMIT entries, the tail NONE / zero, so a static
+     slot probe (ts_rt.h) indexes them without a length test. */
+  uint32_t vcap = d->depth < TS_STATIC_SLOT_LIMIT ? TS_STATIC_SLOT_LIMIT : d->depth;
+  d->keys = (ts_key*)malloc(sizeof(ts_key) * vcap);
+  d->kflags = (uint8_t*)malloc(vcap);
   if (pdepth){
     memcpy(d->keys, g_shapes[parent].keys, sizeof(ts_key) * pdepth);
     memcpy(d->kflags, g_shapes[parent].kflags, pdepth);
   }
   d->keys[pdepth] = key; d->kflags[pdepth] = flags;
+  for (uint32_t i = d->depth; i < vcap; i++){ d->keys[i] = TS_KEY_NONE; d->kflags[i] = 0; }
   g_ts_shape_keys[id] = d->keys;
   g_ts_shape_flags[id] = d->kflags;
   d->index = NULL; d->index_cap = 0;

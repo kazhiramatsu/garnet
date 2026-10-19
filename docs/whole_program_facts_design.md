@@ -11,6 +11,8 @@ and a cheap runtime check confirms it; nothing is trusted outright.
 
 ## 1. Which function a call site reaches (callback specialization)
 
+Implemented: slice `x30`, `docs/callback_specialization_design.md`.
+
 `binarySearch(array, key, keySelector, keyComparer)` is called through
 `containsType` and `addTypesToUnion` with `getTypeId` and `compareValues`
 (83 inclusive samples, 3%); `compareComparableValues` and `compareValues`
@@ -36,6 +38,8 @@ Estimate: 2-3% (the `binarySearch` family alone).
 
 ## 2. Which constructor a `new` reaches (guarded direct construction)
 
+Implemented: slice `x32`, `docs/guarded_construction_design.md`.
+
 `new NodeConstructor(kind, pos, end)` in the parser, `new SymbolLinks()`,
 `new (NodeLinks as any)()`, `new Type(checker, flags)` through
 `objectAllocator`: `ts_construct` has 36 inclusive samples (1.3%), 19 of
@@ -57,6 +61,10 @@ the site: one compare, and the generic path stays available.
 Estimate: about 1%.
 
 ## 3. Where a field sits for every producer of a type (static slots)
+
+Implemented: slice `x33`, `docs/static_slots_design.md` (the prefix
+layouts of the constructor functions; the post-construction sequences
+are the follow-up).
 
 498M inline reads per compile; 63% validate a cached slot against a
 shape that differs from the entry's (the ancestor table of `x29` makes

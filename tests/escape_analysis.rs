@@ -191,10 +191,10 @@ fn analyze_function(f: &Function) -> Vec<SiteEscape> {
             Inst::Copy { dst, src } => {
                 cs.push(C::Copy(Ref::Local(dst), Ref::Local(src)));
             }
-            Inst::LoadField { dst, obj, field } => {
+            Inst::LoadField { dst, obj, field, .. } => {
                 cs.push(C::Load(Ref::Local(dst), Ref::Local(obj), FieldKey::Named(field)));
             }
-            Inst::StoreField { obj, field, src } => {
+            Inst::StoreField { obj, field, src, .. } => {
                 cs.push(C::Store(Ref::Local(obj), FieldKey::Named(field), Ref::Local(src)));
             }
             Inst::LoadElem { dst, arr } => {

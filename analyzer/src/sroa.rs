@@ -1863,7 +1863,7 @@ fn rewrite_body(
             // one): redirect to the field scalar instead of leaving a LoadField/
             // StoreField that reads the (now-eliminated) heap object. Without this,
             // `const c = new C(); c.x` would emit ts_get(deadObject) -> undefined.
-            Inst::LoadField { dst, obj, field } => {
+            Inst::LoadField { dst, obj, field, .. } => {
                 let robj = resolve(obj.0, &alias);
                 if let Some(fmap) = sroad.get(&robj) {
                     if let Some(&sc) = fmap.get(&field.0) {
@@ -1878,7 +1878,7 @@ fn rewrite_body(
                 invalidate_array_tracking_defs(inst, &mut array_alias, &mut const_indices);
                 out.push(inst.clone());
             }
-            Inst::StoreField { obj, field, src } => {
+            Inst::StoreField { obj, field, src, .. } => {
                 let robj = resolve(obj.0, &alias);
                 if let Some(fmap) = sroad.get(&robj) {
                     if let Some(&sc) = fmap.get(&field.0) {
@@ -2256,7 +2256,7 @@ fn callee_param_field_only_sroa_safe(
     let field_ok = |field: FieldId| class_fields.iter().any(|f| *f == field.0);
     for inst in &f.body {
         match inst {
-            Inst::LoadField { dst, obj, field } => {
+            Inst::LoadField { dst, obj, field, .. } => {
                 if dst.0 == p {
                     return false;
                 }
@@ -2264,7 +2264,7 @@ fn callee_param_field_only_sroa_safe(
                     return false;
                 }
             }
-            Inst::StoreField { obj, field, src } => {
+            Inst::StoreField { obj, field, src, .. } => {
                 if src.0 == p {
                     return false;
                 }
@@ -2566,7 +2566,7 @@ fn inline_free_fn(
                 dst: m(*d),
                 src: m(*src),
             }),
-            Inst::LoadField { dst: d, obj, field } => {
+            Inst::LoadField { dst: d, obj, field, slots } => {
                 if let Some(fields_by_param) = scalar_param_fields {
                     if let Some(fmap) = fields_by_param.get(&obj.0) {
                         if let Some(&fs) = fmap.get(&field.0) {
@@ -2582,9 +2582,10 @@ fn inline_free_fn(
                     dst: m(*d),
                     obj: m(*obj),
                     field: *field,
+                    slots: *slots,
                 });
             }
-            Inst::StoreField { obj, field, src } => {
+            Inst::StoreField { obj, field, src, slots } => {
                 if let Some(fields_by_param) = scalar_param_fields {
                     if let Some(fmap) = fields_by_param.get(&obj.0) {
                         if let Some(&fs) = fmap.get(&field.0) {
@@ -2600,6 +2601,7 @@ fn inline_free_fn(
                     obj: m(*obj),
                     field: *field,
                     src: m(*src),
+                    slots: *slots,
                 });
             }
             Inst::Return { src } => {
@@ -2647,7 +2649,7 @@ fn inline_callee(
     for inst in &callee.body {
         match inst {
             // this.fK load -> copy from field scalar
-            Inst::LoadField { dst: d, obj, field } if Some(obj.0) == this_local => {
+            Inst::LoadField { dst: d, obj, field, slots } if Some(obj.0) == this_local => {
                 if let Some(&fs) = fmap.get(&field.0) {
                     out.push(Inst::Copy {
                         dst: m(*d),
@@ -2658,11 +2660,12 @@ fn inline_callee(
                         dst: m(*d),
                         obj: m(*obj),
                         field: *field,
+                        slots: *slots,
                     });
                 }
             }
             // this.fK store -> write field scalar
-            Inst::StoreField { obj, field, src } if Some(obj.0) == this_local => {
+            Inst::StoreField { obj, field, src, slots } if Some(obj.0) == this_local => {
                 if let Some(&fs) = fmap.get(&field.0) {
                     out.push(Inst::Copy {
                         dst: LocalId(fs),
@@ -2673,6 +2676,7 @@ fn inline_callee(
                         obj: m(*obj),
                         field: *field,
                         src: m(*src),
+                        slots: *slots,
                     });
                 }
             }
@@ -2754,15 +2758,17 @@ fn inline_callee(
                 dst: m(*d),
                 src: m(*src),
             }),
-            Inst::LoadField { dst: d, obj, field } => out.push(Inst::LoadField {
+            Inst::LoadField { dst: d, obj, field, slots } => out.push(Inst::LoadField {
                 dst: m(*d),
                 obj: m(*obj),
                 field: *field,
+                slots: *slots,
             }),
-            Inst::StoreField { obj, field, src } => out.push(Inst::StoreField {
+            Inst::StoreField { obj, field, src, slots } => out.push(Inst::StoreField {
                 obj: m(*obj),
                 field: *field,
                 src: m(*src),
+                slots: *slots,
             }),
             // Every remaining instruction kind that names a LocalId must be
             // remapped through `m`. The previous catch-all `other.clone()`
@@ -2820,15 +2826,17 @@ pub(crate) fn remap_inst_operands(inst: &Inst, m: &dyn Fn(LocalId) -> LocalId) -
             dst: m(*dst),
             src: m(*src),
         },
-        Inst::LoadField { dst, obj, field } => Inst::LoadField {
+        Inst::LoadField { dst, obj, field, slots } => Inst::LoadField {
             dst: m(*dst),
             obj: m(*obj),
             field: *field,
+            slots: *slots,
         },
-        Inst::StoreField { obj, field, src } => Inst::StoreField {
+        Inst::StoreField { obj, field, src, slots } => Inst::StoreField {
             obj: m(*obj),
             field: *field,
             src: m(*src),
+            slots: *slots,
         },
         Inst::LoadMethodValue { dst, recv, method } => Inst::LoadMethodValue {
             dst: m(*dst),

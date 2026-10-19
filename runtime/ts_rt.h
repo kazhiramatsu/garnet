@@ -287,6 +287,13 @@ enum { TS_SHAPE_NONE = 0, TS_SHAPE_EMPTY = 1, TS_SHAPE_MAX = (1u << 29) - 1u };
    objects (shape 0) keep per-entry keys and flags. */
 extern ts_key** g_ts_shape_keys;
 extern uint8_t** g_ts_shape_flags;
+/* Static-slot probes (docs/static_slots_design.md) index a shape's key vector
+   at a compile-time slot below TS_STATIC_SLOT_LIMIT without a length test:
+   every vector has at least that many entries, the tail filled with
+   TS_KEY_NONE (no key encoding reaches it), and shapes 0 and 1 point at
+   all-NONE vectors. */
+#define TS_KEY_NONE 0xFFFFFFFFu
+#define TS_STATIC_SLOT_LIMIT 16u
 #define TS_PROP_IC_SIZE 4
 /* A cache entry's slot word carries the property's attribute flags in its
    top byte, so an inline hit knows whether the slot is plain writable data
@@ -323,6 +330,12 @@ extern unsigned long long g_ts_pic_set_calls, g_ts_pic_set_hits;
 #define TS_RT_STAT_SLOT(o, slot) ((slot) < (o)->h.inline_cap ? g_ts_slot_inline_hits++ : g_ts_slot_external_hits++)
 extern unsigned long long g_ts_pic_entry_hits[4], g_ts_pic_keyval_hits, g_ts_pic_ool_hits;
 #define TS_RT_STAT_PIC_ENTRY(i) (g_ts_pic_entry_hits[(i)]++)
+/* Statistics build only: per-key histograms of the inline hits (which keys the
+   in-line reads and writes answer). */
+extern unsigned long long g_ts_key_inline_get[65536], g_ts_key_inline_set[65536];
+#define TS_RT_STAT_INLINE_KEY(arr, key) do { if ((uint32_t)(key) < 65536u) arr[(uint32_t)(key)]++; } while (0)
+extern unsigned long long g_ts_static_get_hit, g_ts_static_get_miss, g_ts_static_set_hit, g_ts_static_set_miss;
+#define TS_RT_STAT_STATIC(c) (g_ts_static_##c++)
 #define TS_RT_STAT_PIC_KEYVAL() (g_ts_pic_keyval_hits++)
 #define TS_RT_STAT_PIC_OOL() (g_ts_pic_ool_hits++)
 #define TS_RT_STAT_PIC_SET_CALL() (g_ts_pic_set_calls++)
@@ -332,6 +345,8 @@ extern unsigned long long g_ts_pic_entry_hits[4], g_ts_pic_keyval_hits, g_ts_pic
 #define TS_RT_STAT_PIC_GET_HIT()  ((void)0)
 #define TS_RT_STAT_SLOT(o, slot) ((void)0)
 #define TS_RT_STAT_PIC_ENTRY(i) ((void)0)
+#define TS_RT_STAT_INLINE_KEY(arr, key) ((void)0)
+#define TS_RT_STAT_STATIC(c) ((void)0)
 #define TS_RT_STAT_PIC_KEYVAL() ((void)0)
 #define TS_RT_STAT_PIC_OOL() ((void)0)
 #define TS_RT_STAT_PIC_SET_CALL() ((void)0)
@@ -1606,7 +1621,7 @@ TS_RT_ALWAYS_INLINE tsv ts_get_pic_checked_inline(
   uint8_t flags = 0;
   tsv* p = ts_prop_ic_probe_fixed_inline(obj, key, ic, &flags);
   if (p && !(flags & TS_PROP_ACCESSOR)){
-    TS_RT_STAT_PIC_GET_CALL(); TS_RT_STAT_PIC_GET_HIT();
+    TS_RT_STAT_PIC_GET_CALL(); TS_RT_STAT_PIC_GET_HIT(); TS_RT_STAT_INLINE_KEY(g_ts_key_inline_get, key);
     return *p;
   }
   return ts_get_pic_checked(obj, key, ic);
@@ -1618,7 +1633,7 @@ TS_RT_ALWAYS_INLINE void ts_set_pic_inline(
   if (p && !(flags & TS_PROP_ACCESSOR) && (flags & TS_PROP_WRITABLE)){
     ts_object* o = (ts_object*)ts_ptr(obj);
     if (!(ts_obj_integrity(o) & 1u)){
-      TS_RT_STAT_PIC_SET_CALL(); TS_RT_STAT_PIC_SET_HIT();
+      TS_RT_STAT_PIC_SET_CALL(); TS_RT_STAT_PIC_SET_HIT(); TS_RT_STAT_INLINE_KEY(g_ts_key_inline_set, key);
       *p = value; ts_write_barrier_ptr(obj, p, value); return;
     }
   }
@@ -1646,7 +1661,7 @@ TS_RT_ALWAYS_INLINE tsv ts_get_pic_checked_inline_lazy(
   uint8_t flags = 0;
   tsv* p = ts_prop_ic_probe_fixed_inline(obj, key, ic, &flags);
   if (p && !(flags & TS_PROP_ACCESSOR)){
-    TS_RT_STAT_PIC_GET_CALL(); TS_RT_STAT_PIC_GET_HIT();
+    TS_RT_STAT_PIC_GET_CALL(); TS_RT_STAT_PIC_GET_HIT(); TS_RT_STAT_INLINE_KEY(g_ts_key_inline_get, key);
     return *p;
   }
   ts_frame_push(frame, nslots);
@@ -1661,10 +1676,111 @@ TS_RT_ALWAYS_INLINE void ts_set_pic_inline_lazy(
   if (p && !(flags & TS_PROP_ACCESSOR) && (flags & TS_PROP_WRITABLE)){
     ts_object* o = (ts_object*)ts_ptr(obj);
     if (!(ts_obj_integrity(o) & 1u)){
-      TS_RT_STAT_PIC_SET_CALL(); TS_RT_STAT_PIC_SET_HIT();
+      TS_RT_STAT_PIC_SET_CALL(); TS_RT_STAT_PIC_SET_HIT(); TS_RT_STAT_INLINE_KEY(g_ts_key_inline_set, key);
       *p = value; ts_write_barrier_ptr(obj, p, value); return;
     }
   }
+  ts_frame_push(frame, nslots);
+  ts_set_pic(obj, key, value, ic);
+  ts_frame_pop(frame);
+}
+/* Static-slot probes (docs/static_slots_design.md): the exporter predicted
+   that `key` sits at in-object slot `slot` (below TS_STATIC_SLOT_LIMIT) on
+   this receiver's type; the shape's padded key vector confirms it and the
+   attribute byte must be plain data (`mask`/`want`: no accessor for a read,
+   writable and no accessor for a write). NULL leaves the decision to the
+   out-of-line path: any other receiver, a dictionary or sized instance (shape
+   0), an accessor or read-only slot, a slot outside the in-object area. */
+TS_RT_ALWAYS_INLINE tsv* ts_static_slot_probe(tsv obj, ts_key key, uint32_t slot, uint8_t mask, uint8_t want){
+  if (TS_TOP16(obj) != TS_SEL_OBJECT) return NULL;
+  ts_object* o = (ts_object*)ts_ptr(obj);
+  if (o->h.kind != TS_KIND_OBJECT) return NULL;
+  uint32_t sid = ts_obj_shape_id(o);
+  if (g_ts_shape_keys[sid][slot] != key) return NULL;
+  if ((g_ts_shape_flags[sid][slot] & mask) != want) return NULL;
+  if (slot >= o->h.inline_cap) return NULL;
+  return &ts_obj_inline_vals(o)[slot];
+}
+/* Two predicted slots (constructor layouts that disagree after a gap). */
+TS_RT_ALWAYS_INLINE tsv* ts_static_slot_probe2(tsv obj, ts_key key, uint32_t s1, uint32_t s2, uint8_t mask, uint8_t want){
+  if (TS_TOP16(obj) != TS_SEL_OBJECT) return NULL;
+  ts_object* o = (ts_object*)ts_ptr(obj);
+  if (o->h.kind != TS_KIND_OBJECT) return NULL;
+  uint32_t sid = ts_obj_shape_id(o);
+  const ts_key* ks = g_ts_shape_keys[sid];
+  uint32_t slot = ks[s1] == key ? s1 : ks[s2] == key ? s2 : TS_STATIC_SLOT_LIMIT;
+  if (slot == TS_STATIC_SLOT_LIMIT) return NULL;
+  if ((g_ts_shape_flags[sid][slot] & mask) != want) return NULL;
+  if (slot >= o->h.inline_cap) return NULL;
+  return &ts_obj_inline_vals(o)[slot];
+}
+TS_RT_ALWAYS_INLINE tsv ts_get_static_inline(tsv obj, ts_key key, uint32_t slot, ts_prop_ic* ic){
+  tsv* p = ts_static_slot_probe(obj, key, slot, TS_PROP_ACCESSOR, 0);
+  if (p){ TS_RT_STAT_STATIC(get_hit); return *p; }
+  TS_RT_STAT_STATIC(get_miss);
+  return ts_get_pic_checked(obj, key, ic);
+}
+TS_RT_ALWAYS_INLINE tsv ts_get_static2_inline(tsv obj, ts_key key, uint32_t s1, uint32_t s2, ts_prop_ic* ic){
+  tsv* p = ts_static_slot_probe2(obj, key, s1, s2, TS_PROP_ACCESSOR, 0);
+  if (p){ TS_RT_STAT_STATIC(get_hit); return *p; }
+  TS_RT_STAT_STATIC(get_miss);
+  return ts_get_pic_checked(obj, key, ic);
+}
+TS_RT_ALWAYS_INLINE void ts_set_static_inline(tsv obj, ts_key key, uint32_t slot, tsv value, ts_prop_ic* ic){
+  tsv* p = ts_static_slot_probe(obj, key, slot, TS_PROP_ACCESSOR | TS_PROP_WRITABLE, TS_PROP_WRITABLE);
+  if (p && !(ts_obj_integrity((ts_object*)ts_ptr(obj)) & 1u)){
+    TS_RT_STAT_STATIC(set_hit);
+    *p = value; ts_write_barrier_ptr(obj, p, value); return;
+  }
+  TS_RT_STAT_STATIC(set_miss);
+  ts_set_pic(obj, key, value, ic);
+}
+TS_RT_ALWAYS_INLINE void ts_set_static2_inline(tsv obj, ts_key key, uint32_t s1, uint32_t s2, tsv value, ts_prop_ic* ic){
+  tsv* p = ts_static_slot_probe2(obj, key, s1, s2, TS_PROP_ACCESSOR | TS_PROP_WRITABLE, TS_PROP_WRITABLE);
+  if (p && !(ts_obj_integrity((ts_object*)ts_ptr(obj)) & 1u)){
+    TS_RT_STAT_STATIC(set_hit);
+    *p = value; ts_write_barrier_ptr(obj, p, value); return;
+  }
+  TS_RT_STAT_STATIC(set_miss);
+  ts_set_pic(obj, key, value, ic);
+}
+/* Lazily linked frames: the slow path may allocate or throw. */
+TS_RT_ALWAYS_INLINE tsv ts_get_static_inline_lazy(tsv obj, ts_key key, uint32_t slot, ts_prop_ic* ic, ts_frame_hdr* frame, uint32_t nslots){
+  tsv* p = ts_static_slot_probe(obj, key, slot, TS_PROP_ACCESSOR, 0);
+  if (p){ TS_RT_STAT_STATIC(get_hit); return *p; }
+  TS_RT_STAT_STATIC(get_miss);
+  ts_frame_push(frame, nslots);
+  tsv r = ts_get_pic_checked(obj, key, ic);
+  ts_frame_pop(frame);
+  return r;
+}
+TS_RT_ALWAYS_INLINE tsv ts_get_static2_inline_lazy(tsv obj, ts_key key, uint32_t s1, uint32_t s2, ts_prop_ic* ic, ts_frame_hdr* frame, uint32_t nslots){
+  tsv* p = ts_static_slot_probe2(obj, key, s1, s2, TS_PROP_ACCESSOR, 0);
+  if (p){ TS_RT_STAT_STATIC(get_hit); return *p; }
+  TS_RT_STAT_STATIC(get_miss);
+  ts_frame_push(frame, nslots);
+  tsv r = ts_get_pic_checked(obj, key, ic);
+  ts_frame_pop(frame);
+  return r;
+}
+TS_RT_ALWAYS_INLINE void ts_set_static_inline_lazy(tsv obj, ts_key key, uint32_t slot, tsv value, ts_prop_ic* ic, ts_frame_hdr* frame, uint32_t nslots){
+  tsv* p = ts_static_slot_probe(obj, key, slot, TS_PROP_ACCESSOR | TS_PROP_WRITABLE, TS_PROP_WRITABLE);
+  if (p && !(ts_obj_integrity((ts_object*)ts_ptr(obj)) & 1u)){
+    TS_RT_STAT_STATIC(set_hit);
+    *p = value; ts_write_barrier_ptr(obj, p, value); return;
+  }
+  TS_RT_STAT_STATIC(set_miss);
+  ts_frame_push(frame, nslots);
+  ts_set_pic(obj, key, value, ic);
+  ts_frame_pop(frame);
+}
+TS_RT_ALWAYS_INLINE void ts_set_static2_inline_lazy(tsv obj, ts_key key, uint32_t s1, uint32_t s2, tsv value, ts_prop_ic* ic, ts_frame_hdr* frame, uint32_t nslots){
+  tsv* p = ts_static_slot_probe2(obj, key, s1, s2, TS_PROP_ACCESSOR | TS_PROP_WRITABLE, TS_PROP_WRITABLE);
+  if (p && !(ts_obj_integrity((ts_object*)ts_ptr(obj)) & 1u)){
+    TS_RT_STAT_STATIC(set_hit);
+    *p = value; ts_write_barrier_ptr(obj, p, value); return;
+  }
+  TS_RT_STAT_STATIC(set_miss);
   ts_frame_push(frame, nslots);
   ts_set_pic(obj, key, value, ic);
   ts_frame_pop(frame);

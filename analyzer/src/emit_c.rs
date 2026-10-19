@@ -2737,7 +2737,7 @@ fn collect_layout_stores(block: &[Inst], start: usize, obj: u32, strict: bool) -
     let mut addrs: Vec<usize> = Vec::new();
     for inst in &block[start..] {
         match inst {
-            Inst::StoreField { obj: o, field, src } if o.0 == obj => {
+            Inst::StoreField { obj: o, field, src, .. } if o.0 == obj => {
                 if src.0 == obj || keys.contains(&field.0) || keys.len() >= 255 {
                     break;
                 }
@@ -3043,6 +3043,18 @@ fn emit_direct_forwarder(s: &mut String, f: &Function, sig: &DirectSig, ncap: us
         RetKind::Bool => format!("ts_bool({})", call),
     };
     let _ = writeln!(s, "  return {};\n}}\n", boxed);
+}
+
+/// Static-slot hints (docs/static_slots_design.md): `TSAOT_STATIC_SLOTS=0`
+/// ignores the exporter's `slots` on LoadField/StoreField.
+fn static_slots_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_STATIC_SLOTS").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
 }
 
 fn prop_pic_enabled() -> bool {
@@ -18347,7 +18359,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 s.push_str(&ctx.set_val(dst.0, &ctx.val(src.0)));
             }
         }
-        Inst::LoadField { dst, obj, field } => {
+        Inst::LoadField { dst, obj, field, slots } => {
             if ctx.json_locals.contains(&obj.0) {
                 if ctx.json_locals.contains(&dst.0) {
                     let _ = writeln!(
@@ -18388,6 +18400,24 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     }
                     return;
                 }
+            }
+            // Static-slot hint (docs/static_slots_design.md): the probe checks the
+            // predicted in-object slot against the receiver's shape and falls to
+            // the out-of-line cached read otherwise.
+            if *slots != 0 && prop_pic_enabled() && static_slots_enabled() {
+                let pic = ctx.fresh_label();
+                let _ = writeln!(s, "  {{ static ts_prop_ic _ts_pic_{} = TS_PROP_IC_INIT;", pic);
+                let s1 = (slots & 0xFF) - 1;
+                let s2 = (slots >> 8) & 0xFF;
+                let get_expr = match (s2, ctx.lazy_frame) {
+                    (0, false) => format!("ts_get_static_inline({}, {}, {}u, &_ts_pic_{})", ctx.val(obj.0), field.0, s1, pic),
+                    (0, true) => format!("ts_get_static_inline_lazy({}, {}, {}u, &_ts_pic_{}, &F.h, {})", ctx.val(obj.0), field.0, s1, pic, ctx.frame_nslots),
+                    (_, false) => format!("ts_get_static2_inline({}, {}, {}u, {}u, &_ts_pic_{})", ctx.val(obj.0), field.0, s1, s2 - 1, pic),
+                    (_, true) => format!("ts_get_static2_inline_lazy({}, {}, {}u, {}u, &_ts_pic_{}, &F.h, {})", ctx.val(obj.0), field.0, s1, s2 - 1, pic, ctx.frame_nslots),
+                };
+                s.push_str(&ctx.set_val(dst.0, &get_expr));
+                let _ = writeln!(s, "  }}");
+                return;
             }
             // ctx.val boxes an unboxed-numeric receiver (int/double local) — using
             // the raw `v{id}` name here would reference an undeclared identifier.
@@ -18495,7 +18525,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 ),
             ));
         }
-        Inst::StoreField { obj, field, src } => {
+        Inst::StoreField { obj, field, src, slots } => {
             let addr = inst as *const Inst as usize;
             if let Some(keys) = ctx.layouts.ctor_first.get(&addr) {
                 let id = ctx.fresh_label();
@@ -18530,6 +18560,23 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     let _ = writeln!(s, "  }}");
                     return;
                 }
+            }
+            // Static-slot hint (docs/static_slots_design.md): the probe checks the
+            // predicted in-object slot (plain writable data, the object not
+            // frozen) and falls to the out-of-line cached store otherwise.
+            if *slots != 0 && prop_pic_enabled() && static_slots_enabled() {
+                let pic = ctx.fresh_label();
+                let _ = writeln!(s, "  {{ static ts_prop_ic _ts_pic_{} = TS_PROP_IC_INIT;", pic);
+                let s1 = (slots & 0xFF) - 1;
+                let s2 = (slots >> 8) & 0xFF;
+                match (s2, ctx.lazy_frame) {
+                    (0, false) => { let _ = writeln!(s, "  ts_set_static_inline({}, {}, {}u, {}, &_ts_pic_{});", ctx.val(obj.0), field.0, s1, ctx.val(src.0), pic); }
+                    (0, true) => { let _ = writeln!(s, "  ts_set_static_inline_lazy({}, {}, {}u, {}, &_ts_pic_{}, &F.h, {});", ctx.val(obj.0), field.0, s1, ctx.val(src.0), pic, ctx.frame_nslots); }
+                    (_, false) => { let _ = writeln!(s, "  ts_set_static2_inline({}, {}, {}u, {}u, {}, &_ts_pic_{});", ctx.val(obj.0), field.0, s1, s2 - 1, ctx.val(src.0), pic); }
+                    (_, true) => { let _ = writeln!(s, "  ts_set_static2_inline_lazy({}, {}, {}u, {}u, {}, &_ts_pic_{}, &F.h, {});", ctx.val(obj.0), field.0, s1, s2 - 1, ctx.val(src.0), pic, ctx.frame_nslots); }
+                }
+                let _ = writeln!(s, "  }}");
+                return;
             }
             // ctx.val (not a hardcoded v-name): the receiver local may be numeric-
             // unboxed (`const n: any = 5; n.c = 3`) — rebox it so ts_set sees the

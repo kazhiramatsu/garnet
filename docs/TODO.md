@@ -5534,6 +5534,60 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   the function itself (`new (NodeLinks as any)()`) could be dropped when
   the binding is never assigned, and the body still stores the
   instance's fields one transition at a time (static slots, item 3).
+- Static slots at interface-typed property sites (build `x33`, full
+  build; exporter, IR, emitter, runtime; whole-program item 3 of
+  `docs/whole_program_facts_design.md`, design in
+  `docs/static_slots_design.md`). The `-O0` statistics of `x32` (per-key
+  histograms of the in-line hits, added to the statistics build this
+  slice) put 492M in-line reads per compile on a few keys: `flags` 169M,
+  `kind` 130M, `parent` 29M, `id` 24M, mostly the fields the constructor
+  functions `Node`/`Token`/`Identifier`/`Symbol`/`Type`/`Signature`/
+  `NodeLinks` assign first. The exporter now computes each
+  `this`-parameter function's prefix layout (the leading `this.k = <pure>`
+  stores) and, at a property read or write whose receiver type's candidate
+  layouts (assignable either way, as the construction guards) all hold the
+  key at one or two slots below 16, puts the slots on the `LoadField` /
+  `StoreField` (`slots`, packed, default 0). The emitter turns such a site
+  into `ts_get_static_inline` / `ts_set_static_inline` (two-slot and
+  lazy-frame forms): the receiver is an object, its shape's key vector
+  holds the key at the slot, the attribute byte is plain data (writable and
+  not frozen for a write), the slot is in-object; otherwise the out-of-line
+  cached path with all its semantics. Shape key vectors are padded to 16
+  entries with `TS_KEY_NONE` (shapes 0 and 1 point at an all-NONE vector),
+  so the probe has no length and no shape-zero test; 13.1k shapes per
+  compile, about 1 MB. In the compiler: 8,312 hinted sites (`kind@2`
+  2,301; `parent@6,7` 1,728; `flags@0` 1,588 on `Type`/`Symbol`/
+  `Signature`/`NodeLinks`; `transformFlags@5,6` 440; `declarations@2` 402;
+  `valueDeclaration@3` 377; `pos@0` 270; `flags@4` 243 on `Node`), 10,086
+  static reads and 411 static writes in the C; `modifierFlagsCache` gets
+  no hint (`Token` and `Identifier` lack it). The `-O0` statistics of
+  `x33`: 351.8M static reads hit and 14.5k miss, 5.69M static writes hit
+  and 0.90M miss; the cached reads fall 498M -> 146M and their slot/key
+  validations 314M -> 48M. The binary shrinks 55.93 -> 52.46 MB (the probe
+  is about a third of the cache probe's code; `isThisIdentifier` 418 ->
+  333 instructions). Knob `TSAOT_STATIC_SLOTS=0` (exporter and emitter;
+  on the exporter corpus line of `emitc_diff.sh`); `TSAOT_STATIC_SLOTS_LOG=1`
+  lists the hinted sites per key. Fixture `objects/static_slots`
+  (constructed objects with one and two slots and a missing key, literals
+  in the same and another order, accessors on a hinted key, a frozen
+  receiver, a key on the prototype only, a class instance, a dictionary,
+  undefined/null receivers, `any` and union receivers, a 20-key layout).
+  Gates: conformance 451/451, selfconf 434+14, parity identical=347 DIFF=0
+  KNOWN=100, bundler 42, GC stress, inline policy (the new always-inline
+  helpers added to its allowlist: the unit and GC gates both embed that
+  check, so a "GC-STRESS FAILED" with every sub-test passing was that),
+  unit (the four IR literal files under `tests/*.rs` gained `slots: 0`).
+  A/B against `x32`, two rounds of three alternating runs: 4.881 vs
+  5.463 s median (pairs -10.2%, -5.1%, -10.9%) and 4.977 vs 5.530 s (pairs
+  -10.2%, -10.0%, -8.8%): about -10%; Node 3.28 / 3.39 s, so 1.49x Node
+  (was 1.66x). Runtime statistics otherwise unchanged (allocations, GC,
+  additions identical). Kernels: `ctor_functions` 2.74x -> 2.49x,
+  `links_objects` unchanged. Next on this path: the post-construction
+  store sequences (`createType`'s `id` at 1, `createBaseIdentifier`'s
+  `escapedText`/`jsDoc`/`flowNode`/`symbol` at 9-12, `objectFlags` at 2/3):
+  of the remaining 146M cached reads, `objectFlags` 12.6M, `id` 11.6M,
+  `freshType` 8.0M, `escapedText` 5.5M, `symbol` 4.6M; and the 0.90M static
+  write misses deserve a per-key histogram.
 - Next slices, in order. (0) External element buffers (the malloc'd
   `data` of arrays, also strings' and maps' buffers) do not count toward
   the collector's trigger: a loop that drops large arrays grows without

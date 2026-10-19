@@ -263,3 +263,12 @@ objects (`find build -name ts_regexp_adapter.o -not -path '*/native_s350*'
 -delete`) before `dt`, the conformance gate or a relink, or the old adapter
 is linked silently. A relink that copies a previous build's `regexp/`
 directory needs the same deletion (see `docs/regexp_first_char_prefilter_design.md`).
+
+### Gotcha: a new `TS_RT_ALWAYS_INLINE` helper must be allowlisted
+
+`tests/runtime_inline_policy_gate.sh` enumerates every always-inline
+helper in `runtime/ts_rt.h` against a `case` allowlist. A new one fails
+it with "unexpected always-inline runtime helper"; the **unit** gate and
+the **gc** gate both embed that check, so a `GC-STRESS FAILED` whose
+sub-tests all passed is this (Session 350, x33). Add the name to the
+allowlist in the same change.

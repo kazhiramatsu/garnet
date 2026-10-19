@@ -85,6 +85,9 @@
 #   TSAOT_LAZY_FN_VALUES=0  Exporter: create the closure of every nested function
 #                          declaration used as a value at the owner's entry
 #                          instead of on first use (legacy IR).
+#   TSAOT_STATIC_SLOTS=0   Exporter/emitter: no static-slot hints at property
+#                          sites typed by constructor functions (default: the
+#                          predicted in-object slot is probed before the cache).
 #   TSAOT_NEW_GUARDS=0     Exporter: no guarded direct construction for `new`
 #                          through a function value (default: test the value
 #                          against the constructor functions of the site's type

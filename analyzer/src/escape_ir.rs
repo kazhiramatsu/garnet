@@ -555,15 +555,23 @@ pub enum Inst {
         dst: LocalId,
         src: LocalId,
     },
+    /// `slots`: the exporter's static-slot hint (docs/static_slots_design.md),
+    /// `(s1 + 1) | (s2 + 1) << 8` for one or two predicted in-object slots of
+    /// the key on the receiver's type; 0 when none. A prediction only: the
+    /// emitted probe validates it against the receiver's shape.
     LoadField {
         dst: LocalId,
         obj: LocalId,
         field: FieldId,
+        #[serde(default)]
+        slots: u32,
     },
     StoreField {
         obj: LocalId,
         field: FieldId,
         src: LocalId,
+        #[serde(default)]
+        slots: u32,
     },
     /// First-class builtin PROTOTYPE method value: `recv.method` read as a value
     /// (not called). Loads the boxed (unbound) prototype method via ts_get with a

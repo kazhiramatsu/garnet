@@ -417,12 +417,12 @@ fn build_constraints(f: &Function, summaries: &[Option<Summary>]) -> (Vec<C>, Ve
                 }
             }
             Inst::Copy { dst, src } => cs.push(C::Copy(Ref::Local(dst), Ref::Local(src))),
-            Inst::LoadField { dst, obj, field } => cs.push(C::Load(
+            Inst::LoadField { dst, obj, field, .. } => cs.push(C::Load(
                 Ref::Local(dst),
                 Ref::Local(obj),
                 FieldKey::Named(field),
             )),
-            Inst::StoreField { obj, field, src } => cs.push(C::Store(
+            Inst::StoreField { obj, field, src, .. } => cs.push(C::Store(
                 Ref::Local(obj),
                 FieldKey::Named(field),
                 Ref::Local(src),

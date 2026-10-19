@@ -80,7 +80,7 @@ fn main() {
     let f = func(0, vec![], 2, vec![
         AllocObject { dst: LocalId(0), type_id: TypeId(0), site: SiteId(0), class_id: None, proto: None }, // outer
         AllocObject { dst: LocalId(1), type_id: TypeId(0), site: SiteId(1), class_id: None, proto: None }, // inner
-        StoreField { obj: LocalId(0), field: FieldId(0), src: LocalId(1) },
+        StoreField { obj: LocalId(0), field: FieldId(0), src: LocalId(1), slots: 0 },
         Return { src: Some(LocalId(0)) },
     ]);
     let r = analyze(&prog(vec![f]));
@@ -91,7 +91,7 @@ fn main() {
     let f = func(0, vec![], 2, vec![
         AllocObject { dst: LocalId(0), type_id: TypeId(0), site: SiteId(0), class_id: None, proto: None }, // outer
         AllocObject { dst: LocalId(1), type_id: TypeId(0), site: SiteId(1), class_id: None, proto: None }, // inner
-        StoreField { obj: LocalId(0), field: FieldId(0), src: LocalId(1) },
+        StoreField { obj: LocalId(0), field: FieldId(0), src: LocalId(1), slots: 0 },
         Return { src: Some(LocalId(1)) },
     ]);
     let r = analyze(&prog(vec![f]));
@@ -102,7 +102,7 @@ fn main() {
     // param l0 (ref), l1 = alloc(site0); l0.f = l1
     let f = func(0, vec![0], 2, vec![
         AllocObject { dst: LocalId(1), type_id: TypeId(0), site: SiteId(0), class_id: None, proto: None },
-        StoreField { obj: LocalId(0), field: FieldId(0), src: LocalId(1) },
+        StoreField { obj: LocalId(0), field: FieldId(0), src: LocalId(1), slots: 0 },
     ]);
     let r = analyze(&prog(vec![f]));
     check("S7 stored-into-param", state_of(&r,0), ArgEscape);
@@ -113,7 +113,7 @@ fn main() {
     let f = func(0, vec![], 3, vec![
         AllocObject { dst: LocalId(0), type_id: TypeId(0), site: SiteId(0), class_id: None, proto: None }, // x
         AllocObject { dst: LocalId(1), type_id: TypeId(0), site: SiteId(1), class_id: None, proto: None }, // cell
-        StoreField { obj: LocalId(1), field: FieldId(0), src: LocalId(0) },   // cell.value = x
+        StoreField { obj: LocalId(1), field: FieldId(0), src: LocalId(0), slots: 0 },   // cell.value = x
         AllocClosure { dst: LocalId(2), func: FunctionId(9),
             captures: vec![Capture { binding: BindingId(0), cell: LocalId(1) }], site: SiteId(2) },
         Return { src: Some(LocalId(2)) },
