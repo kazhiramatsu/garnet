@@ -303,6 +303,15 @@ typedef struct {
   uint8_t next;
   uint8_t misses;
   uint8_t megamorphic;
+  /* The addition this site last performed (docs/site_add_transition_design.md):
+     the receiver's shape word before and after, the slot (its length
+     before), the key, the epoch of the addition cache and the direct
+     prototype. The out-of-line store consults it before probing for an
+     existing key, so a constructor's field-by-field initialization costs one
+     compare sequence and the append. */
+  uint32_t add_shape_before, add_shape_after, add_slot, add_epoch;
+  ts_key add_key;
+  tsv add_proto;
 } ts_prop_ic;
 #define TS_PROP_IC_INIT {0}
 #ifdef TSAOT_RT_STATS

@@ -144,7 +144,7 @@ static struct {
   unsigned long long minor_root_slots, minor_remembered_cells;
   unsigned long long remset_slot_writes, remset_full_marks, remset_precise_scans, remset_precise_slots, remset_full_scans, remset_full_slots;
   unsigned long long small_props_fresh, small_props_reused;
-  unsigned long long prop_add_hits, prop_add_fills;
+  unsigned long long prop_add_hits, prop_add_fills, prop_add_site_hits;   /* additions: global cache hits, slow fills, per-site entry hits */
   unsigned long long pic_get_absent, pic_get_inherited, pic_absent_hits;
   unsigned long long array_sparse_convert, array_sparse_put, array_densify;   /* far stores: dense->sparse switches, side-table stores, sparse->dense */   /* out-of-line reads resolved on the chain / missing / answered by the absent cache */
   unsigned long long nursery_alloc, nursery_chunks, retained_chunks;
@@ -195,8 +195,8 @@ __attribute__((destructor)) static void ts_rt_stats_dump(void){
           g_handle_cap, g_rt_stats.root_push, g_rt_stats.pretenured_alloc);
   fprintf(out, "[rt_stats] small_props: fresh=%llu reused=%llu\n",
           g_rt_stats.small_props_fresh, g_rt_stats.small_props_reused);
-  fprintf(out, "[rt_stats] prop_add: hits=%llu slow=%llu\n",
-          g_rt_stats.prop_add_hits, g_rt_stats.prop_add_fills);
+  fprintf(out, "[rt_stats] prop_add: site_hits=%llu hits=%llu slow=%llu\n",
+          g_rt_stats.prop_add_site_hits, g_rt_stats.prop_add_hits, g_rt_stats.prop_add_fills);
   fprintf(out, "[rt_stats] pic_ool_get: inherited=%llu absent=%llu absent_cache_hits=%llu\n",
           g_rt_stats.pic_get_inherited, g_rt_stats.pic_get_absent, g_rt_stats.pic_absent_hits);
   fprintf(out, "[rt_stats] root_frames: frame_push=%llu\n",
@@ -1861,7 +1861,11 @@ static inline int ts_object_like(tsv v){ return ts_is_obj(v) || ts_is_class_valu
 /* Object.freeze / Object.isFrozen / Object.create. Integrity remains logically
    separate from hidden-class identity; write caches consult it on every hit.
    The packed physical word may conservatively invalidate a read-cache entry. */
-tsv ts_object_freeze(tsv v){ if (ts_is_propbag(v)) ts_obj_add_integrity((ts_object*)ts_ptr(v), 1u); return v; }
+/* Freezing makes every own property read-only: an object that is some
+   receiver's prototype then rejects inherited writes, so the addition caches
+   (keyed by receiver shape and prototype identity, not the prototype's
+   attributes) must start over. */
+tsv ts_object_freeze(tsv v){ if (ts_is_propbag(v)){ ts_obj_add_integrity((ts_object*)ts_ptr(v), 1u); prop_add_epoch_bump(); } return v; }
 tsv ts_object_is_frozen(tsv v){
   /* primitives are trivially "frozen" in JS; objects: check the flag. */
   return ts_bool(!ts_is_propbag(v) || (ts_obj_integrity((ts_object*)ts_ptr(v)) & 1u));
@@ -2104,7 +2108,10 @@ static ts_pref ts_set_named_prop(tsv obj, ts_object* o, ts_key key, tsv val,
     if (frozen || !pref_is_writable(ownp)){ ts_throw_readonly_write(key); return PREF_NONE; }
     *pref_valp(ownp)=val; ts_write_barrier(obj, val); return ownp;
   }
-  /* 2) inherited accessor up the proto chain -> invoke its setter (this=obj). */
+  /* 2) inherited property up the proto chain: an accessor invokes its setter
+     (this=obj); a read-only data property (its own attribute, or a frozen
+     holder) rejects the write (OrdinarySet: strict mode throws); a writable
+     one lets the receiver create its own property. */
   for (ts_object* p=ts_next_proto(o); p; p=ts_next_proto(p)){
     tsv* s=find_slot(p,key,0);
     if (s){
@@ -2112,7 +2119,11 @@ static ts_pref ts_set_named_prop(tsv obj, ts_object* o, ts_key key, tsv val,
         invoke_setter((ts_accessor*)ts_ptr(*s), obj, key, val);
         return PREF_NONE;
       }
-      break;   /* inherited data property: fall through to create an own data prop */
+      ts_pref ip = prop_find(p, key);
+      if ((ts_obj_integrity(p) & 1u) || (pref_ok(ip) && !pref_is_writable(ip))){
+        ts_throw_readonly_write(key); return PREF_NONE;
+      }
+      break;   /* inherited writable data property: create an own data prop */
     }
   }
   /* 3) create an own data property — strict: throw on a non-extensible object
@@ -2335,6 +2346,10 @@ void ts_define_data(tsv obj, ts_key key, tsv value, int e, int w, int c){
   ts_gc_root(&obj); ts_gc_root(&value);
   ts_object* o = (ts_object*)ts_ptr(obj);
   uint8_t flags = (uint8_t)((e?TS_PROP_ENUMERABLE:0) | (w?TS_PROP_WRITABLE:0) | (c?TS_PROP_CONFIGURABLE:0));
+  /* A read-only data property rejects inherited writes on every object that
+     has this one as a prototype: the addition caches must start over (they
+     validate the receiver's prototype by identity, not by its attributes). */
+  if (!w) prop_add_epoch_bump();
   ts_pref p = props_define(o, key, flags);
   *pref_valp(p) = value;
   ts_write_barrier(obj, value);
@@ -11465,7 +11480,13 @@ static inline ts_prop_add_entry* prop_add_lookup(const ts_prop_ic* ic, ts_object
     return e;
   return NULL;
 }
-static void prop_add_fill(const ts_prop_ic* ic, ts_object* o, ts_key key, ts_pref p,
+static inline void prop_add_site_fill(ts_prop_ic* ic, uint32_t shape_before, uint32_t shape_after,
+                                      uint32_t slot, ts_key key, tsv proto){
+  ic->add_shape_before = shape_before; ic->add_shape_after = shape_after;
+  ic->add_slot = slot; ic->add_key = key; ic->add_proto = proto;
+  ic->add_epoch = g_prop_add_epoch;
+}
+static void prop_add_fill(ts_prop_ic* ic, ts_object* o, ts_key key, ts_pref p,
                           uint32_t len_before, uint32_t shape_before){
   if (!ic || !pref_ok(p) || ts_obj_is_sized(o)) return;
   if (key >= TS_USERSYM_KEY_BASE) return;
@@ -11481,6 +11502,7 @@ static void prop_add_fill(const ts_prop_ic* ic, ts_object* o, ts_key key, ts_pre
   e->site = ic; e->proto = o->proto;
   e->shape_before = shape_before; e->shape_after = o->shape;
   e->key = key; e->slot = len_before; e->epoch = g_prop_add_epoch;
+  prop_add_site_fill(ic, shape_before, o->shape, len_before, key, o->proto);
 }
 /* ---- absent-property cache (docs/negative_cache_design.md) ----
    A read that finds the key nowhere — not an own slot, not a struct field,
@@ -11592,12 +11614,27 @@ void ts_set_pic(tsv obj, ts_key key, tsv val, ts_prop_ic* ic){
   if (TS_TOP16(obj) == TS_SEL_OBJECT){
     ts_object* o = (ts_object*)ts_ptr(obj);
     if (o->h.kind == TS_KIND_OBJECT){
+      /* The addition this site cached, before any probe for an existing key
+         (a constructor initializing a fresh object): the same conditions as
+         the global addition cache, read from the site itself. */
+      if (ic && ic->add_epoch == g_prop_add_epoch && o->shape == ic->add_shape_before &&
+          o->len == ic->add_slot && ic->add_key == key && o->proto == ic->add_proto &&
+          !ts_obj_is_sized(o)){
+        RT_STAT_INC(prop_add_site_hits);
+        ts_pref p = props_append(o, key, ic->add_shape_after);
+        tsv* vp = pref_valp(p);
+        *vp = val;
+        ts_write_barrier_ptr(obj, vp, val);   /* shaped: slot-precise */
+        return;
+      }
       ts_pref own = prop_ic_probe_own(ic, o, key);
       if (pref_ok(own)){
         TS_RT_STAT_PIC_SET_HIT();
         if (pref_is_accessor(own)){ invoke_setter((ts_accessor*)ts_ptr(pref_val(own)), obj, key, val); return; }
         if ((ts_obj_integrity(o) & 1u) || !pref_is_writable(own)){ ts_throw_readonly_write(key); return; }
-        *pref_valp(own) = val; ts_write_barrier(obj, val); return;
+        { tsv* vp = pref_valp(own); *vp = val;
+          if (obj_shaped(o)) ts_write_barrier_ptr(obj, vp, val); else ts_write_barrier(obj, val); }
+        return;
       }
       ts_prop_location* e = prop_ic_probe(ic, obj, key);
       if (e){
@@ -11615,16 +11652,18 @@ void ts_set_pic(tsv obj, ts_key key, tsv val, ts_prop_ic* ic){
           ts_throw_readonly_write(key);
           return;
         }
-        *pref_valp(p) = val;
-        ts_write_barrier(obj, val);
+        { tsv* vp = pref_valp(p); *vp = val;
+          if (obj_shaped(o)) ts_write_barrier_ptr(obj, vp, val); else ts_write_barrier(obj, val); }
         return;
       }
       ts_prop_add_entry* add = prop_add_lookup(ic, o, key);
       if (add){
         RT_STAT_INC(prop_add_hits);
+        prop_add_site_fill(ic, add->shape_before, add->shape_after, add->slot, key, add->proto);
         ts_pref p = props_append(o, key, add->shape_after);
-        *pref_valp(p) = val;
-        ts_write_barrier(obj, val);
+        tsv* vp = pref_valp(p);
+        *vp = val;
+        ts_write_barrier_ptr(obj, vp, val);
         return;
       }
       size_t off; int numeric;

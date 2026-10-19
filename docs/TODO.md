@@ -5331,6 +5331,44 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   slightly positive change.** Gates: conformance 446/446, parity 344
   identical + 98 KNOWN, bundler 42/42, selfconf 429 + 14 KNOWN, GC stress
   (all phases), inline policy, units.
+- Per-site addition entries of the property store cache
+  (`docs/site_add_transition_design.md`, build `x26`, runtime only). The
+  `x24` statistics counted 10.1M out-of-line stores per compile, 6.93M of
+  them additions answered by the global addition cache after the own-slot
+  probe, the location-table probe and a hashed probe: the checker's
+  `Type` / `Symbol` / `Node` / `Links` objects are initialized field by
+  field by constructor functions. `ts_prop_ic` now carries the addition the
+  site last performed (shape word before and after, slot, key, epoch,
+  direct prototype; 24 bytes per site), and `ts_set_pic` tests it before
+  any probe; the global cache stays as the second level and refreshes the
+  site entry. The out-of-line overwrites and additions of shaped
+  receivers use the slot-precise barrier (`ts_write_barrier_ptr`), so an
+  old receiver remembers a dirty card instead of a whole-cell scan. The
+  slice's fixture found a pre-existing silent miscompile of the slow
+  store: an inherited read-only data property (`writable: false`, or any
+  property of a frozen prototype) did not reject the write, so the
+  receiver silently gained an own property where V8 throws `TypeError`;
+  `ts_set_named_prop` now rejects it, and `Object.freeze` and a
+  `writable: false` definition bump the addition epoch (the caches
+  validate the prototype by identity, not by its attributes). Fixture
+  `objects/add_transition_site_cache` (constructor functions, one site over
+  two shapes, frozen and sealed receivers, an accessor and a read-only
+  property defined on the prototype after the entry was recorded, a
+  relinked prototype, dictionary receivers, class instances with struct
+  fields, symbol keys, growth past the in-object slots, additions to 5,000
+  old receivers across collections), identical to V8 also under
+  `TSAOT_GC_YOUNG_THRESHOLD=1`; its numeric temporary exposes the known
+  double-vs-int specialization parity difference (parity row). Statistics
+  relink: additions 6.93M site hits, 12k global hits, 1.22M slow;
+  remembered-set slot writes 735k → 825k, whole-cell marks 1.77M → 1.68M,
+  GC pause 544 → 484 ms. Compiler A/B against `x25`, alternating three
+  runs, outputs validated, diagnostics zero: **5.548 → 5.494 s median wall
+  (−1.0%; the three pairs −1.0%, −0.4%, −1.0%), Node 3.23 s → 1.70x.**
+  Gates: conformance 447/447, parity 344 identical + 99 KNOWN, bundler
+  42/42, selfconf 430 + 14 KNOWN, GC stress (all phases), inline policy,
+  units. Not done: performing the cached addition in line at the store
+  site (the call and `props_append` remain); it adds code to all 45,578
+  store sites, so it is a separate experiment with its own A/B.
 - Next slices, in order. (0) External element buffers (the malloc'd
   `data` of arrays, also strings' and maps' buffers) do not count toward
   the collector's trigger: a loop that drops large arrays grows without
