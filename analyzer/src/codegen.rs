@@ -71,6 +71,19 @@ pub fn decide(program: &Program, result: &EscapeResult) -> Vec<SiteDecision> {
     decide_with_pretenure(program, result, pretenure_enabled())
 }
 
+/// Scope records (the capture context of a function's captured mutable
+/// variables) that no closure or callee retains beyond the activation take
+/// the stack (`docs/stack_records_design.md`). Only in the phantom mode of
+/// the escape analysis, whose summaries bound those lifetimes;
+/// TSAOT_STACK_RECORDS=0 keeps every record on the heap.
+fn stack_records_enabled() -> bool {
+    crate::interproc::phantoms_enabled()
+        && !matches!(
+            std::env::var("TSAOT_STACK_RECORDS").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+}
+
 pub fn decide_with_pretenure(
     program: &Program,
     result: &EscapeResult,
@@ -107,6 +120,16 @@ pub fn decide_with_pretenure(
     for f in &program.functions {
         collect_classed(&f.body, &mut classed_sites);
     }
+    // Sites of generator and async bodies: their C frame is a state machine
+    // that does not survive a suspension, so nothing there takes the stack
+    // through the record rule.
+    let mut coroutine_sites: BTreeSet<u32> = BTreeSet::new();
+    for f in &program.functions {
+        if f.is_generator || f.is_async {
+            collect_classed(&f.body, &mut coroutine_sites);
+        }
+    }
+    let stack_records = stack_records_enabled();
 
     result
         .sites
@@ -127,16 +150,30 @@ pub fn decide_with_pretenure(
                     "escape/lifetime analysis: retained allocation bypasses the nursery",
                 )
             } else if is_cell {
-                // A captured-variable cell is shared with every closure that
-                // captures it, and those closures may outlive this frame through
-                // paths the per-frame analysis does not bound (containers loaded
-                // from other cells, callbacks). Typed cells are class instances
-                // that WOULD honor a stack/arena decision, so keep them on the
-                // heap, which is what plain-object cells always did.
-                (
-                    AllocStrategy::Heap,
-                    "captured-variable cell: shared with closures, heap",
-                )
+                // A captured-variable record is shared with every closure that
+                // captures it and every nested callee that receives it. Since
+                // the phantom mode of the analysis (stores through parameter
+                // contents, summaries for the recursion nests, callbacks of
+                // non-retaining builtins), NoEscape bounds those lifetimes to
+                // the activation, so the single-shot record of an ordinary
+                // function takes the stack; everything else stays on the heap,
+                // which is what plain-object cells always did.
+                if stack_records
+                    && se.state == EscapeState::NoEscape
+                    && once
+                    && determinable
+                    && !coroutine_sites.contains(&se.site.0)
+                {
+                    (
+                        AllocStrategy::Stack,
+                        "captured-variable record: no closure or callee outlives the frame, stack",
+                    )
+                } else {
+                    (
+                        AllocStrategy::Heap,
+                        "captured-variable cell: shared with closures, heap",
+                    )
+                }
             } else {
                 match se.state {
                     EscapeState::NoEscape => {

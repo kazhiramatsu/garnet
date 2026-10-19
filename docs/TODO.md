@@ -5965,6 +5965,37 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   compile, all allocations 14.41M -> 14.29M. A/B against `x49`, two rounds of three alternating
   runs: 4.535 vs 4.560 s and 4.497 vs 4.529 s median, all six
   pairs between -0.1% and -1.1% (about -0.6%); Node 3.25-3.28 s (1.38x).
+- Scope records on the C stack (build `x51`, full build; analyzer
+  `codegen.rs`; `docs/stack_records_design.md`). The site statistics
+  counted 2.34M scope records per compile (the capture context a function
+  allocates at entry for its captured mutable variables), the largest
+  category of counted allocations (`getSignaturesOfType` 472k,
+  `checkIdentifier` 260k); after `x48`-`x50` 1.08M of them are `NoEscape`,
+  but `decide` kept every record on the heap by a rule written when the
+  analysis lost stores through parameter contents and had no summaries
+  for the checker. A record site that is `NoEscape`, single-shot (the
+  function-entry record; per-iteration records stay `Many`) and not in a
+  generator or async body (their frame is a state machine) now takes the
+  `Stack` strategy through the existing class-instance emission (struct at
+  function scope, stack-tagged reference in the frame slot, scanned as a
+  root). Fixture `closures/stack_records_lifetimes` (a record holding young
+  objects across collections while nested functions and callbacks use it;
+  the counter closure; records kept by a module array, a Map, a promise,
+  a bound function, a storing helper, a storing nested function; a closure
+  stored into its own record; generator and async bodies; deep recursion
+  with a record per frame), under GC stress too; the other lifetime
+  fixtures unchanged; the old mode's decision report byte-identical.
+  Decision report, count-weighted: records 1.02M per compile Heap -> Stack
+  at 120 sites. Found while probing the fixture: a closure that reads a
+  captured object's numeric field (`last ? last.v : 0`) still sends the
+  whole record to the heap, because the two-deep phantom node carries no
+  path and the `+` materialization marks it global (next slice).
+  Statistics: all allocations 14.29M -> 13.27M per compile
+  (plain objects 5.88M -> 4.85M), minor collections 311 -> 291. A/B against `x50`, two rounds of three alternating
+  runs: 4.512 vs 4.487 s and 4.488 vs 4.512 s median (+0.6% and
+  -0.5%): neutral; the records were cheap bump allocations and the stack
+  version initializes the struct per call. Kept for the million fewer
+  allocations per compile. Node 3.24-3.25 s (1.38x).
 - Next slices, in order. (0) External element buffers (the malloc'd
   `data` of arrays, also strings' and maps' buffers) do not count toward
   the collector's trigger: a loop that drops large arrays grows without
