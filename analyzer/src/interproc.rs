@@ -76,7 +76,7 @@ struct Solver {
 /// TSAOT_ESCAPE_PHANTOMS=0 restores the one-level phantoms that were not
 /// reachable from their parameter (the parity oracle; unsound for a value
 /// stored through a parameter's field, Session 350).
-fn phantoms_enabled() -> bool {
+pub fn phantoms_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         !matches!(
@@ -428,6 +428,28 @@ fn record_external_fields() -> usize {
     std::env::var("TSAOT_RECORD_EXTERNAL_FIELDS").ok().and_then(|v| v.parse().ok()).unwrap_or(64)
 }
 
+/// The argument position of a callback that the builtin calls but does not
+/// retain (the iteration methods of arrays, maps and sets, the comparator of
+/// `sort`, the function form of `replace`, the map function of `Array.from`).
+/// The callback's effects on its captured cells were applied when it was
+/// created, and anything it returns from a captured variable was folded to
+/// the global sink there, so the closure object itself need not escape. A
+/// builtin that keeps its argument (`then`, `bind`, the containers' `set` /
+/// `add` / `push`) is not listed and keeps the conservative rule.
+fn callback_argument(builtin: &str) -> Option<usize> {
+    if !phantoms_enabled() {
+        return None;
+    }
+    match builtin {
+        "array.forEach" | "array.some" | "array.every" | "array.filter" | "array.map"
+        | "array.find" | "array.findIndex" | "array.findLast" | "array.findLastIndex"
+        | "array.flatMap" | "array.reduce" | "array.reduceRight" | "array.sort"
+        | "map.forEach" | "set.forEach" => Some(0),
+        "string.replace" | "string.replaceAll" | "array.from" => Some(1),
+        _ => None,
+    }
+}
+
 fn build_constraints(f: &Function, summaries: &[Option<Summary>], facts: &Facts) -> (Vec<C>, Vec<SiteId>) {
     let mut is_ref_map: BTreeMap<LocalId, bool> = BTreeMap::new();
     for l in &f.locals {
@@ -603,10 +625,14 @@ fn build_constraints(f: &Function, summaries: &[Option<Summary>], facts: &Facts)
                 dst,
                 recv,
                 ref args,
-                ..
+                ref builtin,
             } => {
                 cs.push(C::Copy(Ref::Global, Ref::Local(recv)));
-                for a in args {
+                let callback = callback_argument(builtin);
+                for (i, a) in args.iter().enumerate() {
+                    if Some(i) == callback {
+                        continue;
+                    }
                     cs.push(C::Copy(Ref::Global, Ref::Local(*a)));
                 }
                 if let Some(d) = dst {
@@ -615,8 +641,12 @@ fn build_constraints(f: &Function, summaries: &[Option<Summary>], facts: &Facts)
                     }
                 }
             }
-            Inst::CallBuiltinStatic { dst, ref args, .. } => {
-                for a in args {
+            Inst::CallBuiltinStatic { dst, ref args, ref builtin } => {
+                let callback = callback_argument(builtin);
+                for (i, a) in args.iter().enumerate() {
+                    if Some(i) == callback {
+                        continue;
+                    }
                     cs.push(C::Copy(Ref::Global, Ref::Local(*a)));
                 }
                 if let Some(d) = dst {
@@ -816,6 +846,19 @@ fn apply_summary(
     for &a in actuals.iter().skip(sum.nparams) {
         if is_ref(a) {
             cs.push(C::Copy(Ref::Global, Ref::Local(a)));
+        }
+    }
+    // At a closure's creation the body's return is unknown to any caller: a
+    // captured value (a by-value capture is a leading parameter) that the
+    // body may return leaks once the closure is invoked, exactly as a cell's
+    // contents do through field_ret below.
+    if creation && phantoms_enabled() {
+        for s in &sum.ret {
+            if let SObj::Param(i) = *s {
+                if i < actuals.len() && is_ref(actuals[i]) {
+                    cs.push(C::Copy(Ref::Global, Ref::Local(actuals[i])));
+                }
+            }
         }
     }
 

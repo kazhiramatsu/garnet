@@ -5938,6 +5938,33 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   third round) 4.657 vs 4.651 s median: neutral within the noise (Node
   3.27-3.34 s, 1.39x), kept for the analysis precision it gives the next
   slices (records, arrays).
+- Callbacks that builtins call but do not retain (build `x50`, full build;
+  analyzer; `docs/builtin_callbacks_design.md`). After `x49` the hottest
+  heap closures of a compile were callbacks handed to builtins
+  (`members.forEach` in `getNamedMembers` 55k per compile,
+  `callSignatures.some` 52k, the predicates of `filter` / `find` / `every`):
+  a builtin call made every argument escape. `callback_argument` names
+  the callback position of the array iteration methods, `sort`'s
+  comparator, `Map.forEach` / `Set.forEach`, the function form of
+  `replace`, `Array.from`'s map function; that argument is not sent to
+  the global sink (receiver and other arguments keep the conservative
+  rule; `then`, `bind`, `Map.set`, `push` are not listed). Writing the
+  lifetime fixture exposed a hole the conservative rule had hidden: a
+  captured *value* (a by-value capture is a leading parameter of the
+  lifted body) that the callback returns was not folded to the global sink
+  at creation, so `[1, 2, 3].map(() => b)` left `b` on the stack while the
+  result held it, and a callback a direct helper calls and whose result
+  the caller stores had the same hole; a `ret` entry naming a capture
+  parameter now sends the captured actual to the sink at creation. Fixture
+  `closures/builtin_callback_lifetimes` (every listed method, the retained
+  cases, the returned captures, under GC stress). The old mode's decision
+  report byte-identical. Decision report, count-weighted: closures 110k
+  per compile Heap -> Stack at 256 sites, none the other way; scope records
+  NoEscape for 1.08M allocations per compile (983k). Gates all green.
+  Statistics: closure allocations 1.062M -> 0.949M per
+  compile, all allocations 14.41M -> 14.29M. A/B against `x49`, two rounds of three alternating
+  runs: 4.535 vs 4.560 s and 4.497 vs 4.529 s median, all six
+  pairs between -0.1% and -1.1% (about -0.6%); Node 3.25-3.28 s (1.38x).
 - Next slices, in order. (0) External element buffers (the malloc'd
   `data` of arrays, also strings' and maps' buffers) do not count toward
   the collector's trigger: a loop that drops large arrays grows without
