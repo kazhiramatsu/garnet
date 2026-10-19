@@ -5383,6 +5383,34 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   `ts_set_pic` (`x26`) stays. A narrower variant (only the stores of
   constructor bodies, chosen by the exporter) would need an emitter knob
   and its own A/B.
+- int32 locals for bitwise-only uses (`docs/int32_use_locals_design.md`,
+  build `x28`, emitter only). The checker's flag idiom reads a number once
+  (`const t = target.flags`) and tests it against twenty-five constants
+  (`t & TypeFlags.X`); `isSimpleTypeRelatedTo`, the hottest generated
+  function (111 self samples in the `x25` profile), rendered a range check
+  and two conversions per test, 100 `ts_to_int32` calls per call. An
+  unboxed, non-parameter local whose every use is a bitwise operand (or a
+  copy into another such local, a fixpoint over copies) now holds ToInt32
+  of its value from the definition on (`(double)ts_to_int32(...)` in
+  `set_num` / `set_val`, the direct-entry call results and the string-sum
+  copy routed through them) and renders `(int32_t)d` at the uses; an int
+  local operand renders `(int32_t)(uint32_t)d` instead of the double round
+  trip; shift counts likewise. ToInt32 is a function of the value, so the
+  per-use semantics are unchanged (NaN and infinities 0, fractions
+  truncated, out-of-range wrapped). Knob `TSAOT_INT32_USES=0` (the parity
+  oracle sets it). Generated compiler: `ts_to_int32` calls 8,311 → 4,913,
+  `isSimpleTypeRelatedTo` 100 → 3, 3,699 cast operands. Fixture
+  `operators/bitwise_only_locals` (integers, negatives, fractions, NaN,
+  infinities, int32 and uint32 limits, huge magnitudes, negative zero,
+  shift counts around 32, copies, conditional and loop reassignment,
+  parameters, chains, call results, a mixed-use local), identical to V8.
+  Compiler A/B against `x26`, alternating three runs, outputs validated,
+  diagnostics zero: **three A/Bs on a loaded machine (Node 3.28–3.49 s):
+  5.690 → 5.759 s (+1.2%, one outlier pair of −5.5%), 5.680 → 5.636 s
+  (−0.8%, pairs −1.3% / −0.9% / −0.4%), 5.717 → 5.620 s (−1.7%, pairs
+  −2.1% / 0.0% / −1.4%): about −1%.** Gates: conformance 448/448, parity
+  345 identical + 99 KNOWN, bundler 42/42, selfconf 431 + 14 KNOWN, GC
+  stress (all phases), inline policy, units.
 - Next slices, in order. (0) External element buffers (the malloc'd
   `data` of arrays, also strings' and maps' buffers) do not count toward
   the collector's trigger: a loop that drops large arrays grows without

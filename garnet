@@ -42,6 +42,9 @@
 #                          final shape (parity oracle only).
 #   TSAOT_TRUTHY_UNBOX=0   Box `!` results and `&&`/`||` temporaries that only
 #                          feed conditions (parity oracle only).
+#   TSAOT_INT32_USES=0     Keep the per-use ToInt32 of number locals whose every
+#                          use is a bitwise operand (default: convert once at
+#                          the definition, cast at the uses).
 #   TSAOT_TAG_EQ=0         Generic strict/loose equality against undefined,
 #                          null and boolean constants instead of a bit compare
 #                          (parity oracle only).

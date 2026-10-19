@@ -1313,6 +1313,9 @@ struct ScalarStringSlice {
 struct Ctx<'a> {
     unboxed: BTreeSet<u32>,
     int_local: BTreeSet<u32>, // unboxed locals proven safe to store as int64_t
+    /// Unboxed doubles whose every use is a bitwise operand (or a copy into
+    /// such a local): ToInt32 once at each definition, `(int32_t)` at the uses.
+    int32_use: BTreeSet<u32>,
     local_class: BTreeMap<u32, u32>,
     classes: &'a BTreeMap<u32, &'a ClassDef>,
     strat: &'a BTreeMap<u32, AllocStrategy>,
@@ -1467,6 +1470,28 @@ impl<'a> Ctx<'a> {
             format!("ts_number_coerce({})", self.vname(id))
         }
     }
+    /// ToInt32 of a bitwise operand: a cast for an int32-use local (it holds
+    /// ToInt32 of its value) and for an int local (an integer wraps through
+    /// uint32), the runtime conversion otherwise.
+    fn bitwise_operand(&self, id: u32) -> String {
+        if self.int32_use.contains(&id) {
+            format!("((int32_t)d{})", id)
+        } else if self.int_local.contains(&id) && int32_uses_enabled() {
+            format!("((int32_t)(uint32_t)d{})", id)
+        } else {
+            format!("ts_to_int32({})", self.numc_double(id))
+        }
+    }
+    /// ToUint32 of a shift count, masked to five bits.
+    fn shift_count(&self, id: u32) -> String {
+        if self.int32_use.contains(&id) {
+            format!("((uint32_t)(int32_t)d{} & 31)", id)
+        } else if self.int_local.contains(&id) && int32_uses_enabled() {
+            format!("((uint32_t)d{} & 31)", id)
+        } else {
+            format!("(ts_to_uint32({}) & 31)", self.numc_double(id))
+        }
+    }
     fn val(&self, id: u32) -> String {
         if self.json_locals.contains(&id) {
             format!("ts_json_dom_to_tsv(j{})", id)
@@ -1532,7 +1557,9 @@ impl<'a> Ctx<'a> {
         }
     }
     fn set_num(&self, id: u32, e: &str) -> String {
-        if self.unboxed.contains(&id) {
+        if self.int32_use.contains(&id) {
+            format!("  d{} = (double)ts_to_int32({});\n", id, e)
+        } else if self.unboxed.contains(&id) {
             format!("  d{} = {};\n", id, e)
         } else {
             format!("  {} = ts_num({});\n", self.vname(id), e)
@@ -1543,6 +1570,8 @@ impl<'a> Ctx<'a> {
             format!("  j{} = NULL; (void)({});\n", id, e)
         } else if self.int_local.contains(&id) {
             format!("  d{} = (long long)ts_to_num({});\n", id, e)
+        } else if self.int32_use.contains(&id) {
+            format!("  d{} = (double)ts_to_int32(ts_to_num({}));\n", id, e)
         } else if self.unboxed.contains(&id) {
             format!("  d{} = ts_to_num({});\n", id, e)
         } else {
@@ -5031,6 +5060,88 @@ mod instruction_worklist_tests {
     }
 }
 
+/* ---- int32 locals for bitwise-only uses (docs/int32_use_locals_design.md) ----
+   The checker's flag idiom reads a number once (`const t = target.flags`)
+   and tests it against twenty constants (`t & TypeFlags.X`); every test
+   applied ToInt32 to the double. An unboxed, non-parameter local whose every
+   use is an operand of `& | ^ << >> >>>` or `~`, or a copy into another such
+   local, holds ToInt32 of its value from the definition on: ToInt32 is a
+   function of the value, so applying it once at each definition and casting
+   at the uses is exactly the per-use semantics (NaN and infinities become 0,
+   fractions truncate toward zero, out-of-range values wrap). The local stays
+   a double, so every definition path keeps its type and only the conversion
+   moves. TSAOT_INT32_USES=0 disables it (parity oracle). */
+fn int32_uses_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_INT32_USES").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+fn is_bitwise_op(op: &str) -> bool {
+    matches!(op, "&" | "|" | "^" | "<<" | ">>" | ">>>")
+}
+/// A use of `x` in `body` that is not a bitwise operand, a `~` operand or a
+/// copy into a candidate (nested bodies included).
+fn int32_disallowed_use(body: &[Inst], x: u32, cands: &BTreeSet<u32>) -> bool {
+    let one: BTreeSet<u32> = std::iter::once(x).collect();
+    body.iter().any(|inst| match inst {
+        Inst::BinOp { lhs, rhs, op, .. } => (lhs.0 == x || rhs.0 == x) && !is_bitwise_op(op),
+        Inst::UnOp { operand, op, .. } => operand.0 == x && op != "~",
+        Inst::Copy { dst, src } => src.0 == x && !cands.contains(&dst.0),
+        Inst::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            cond.0 == x
+                || int32_disallowed_use(then_body, x, cands)
+                || int32_disallowed_use(else_body, x, cands)
+        }
+        Inst::Loop {
+            cond,
+            cond_body,
+            body,
+        } => {
+            cond.0 == x
+                || int32_disallowed_use(cond_body, x, cands)
+                || int32_disallowed_use(body, x, cands)
+        }
+        Inst::TryCatch {
+            try_body,
+            catch_body,
+            finally_body,
+            ..
+        } => {
+            int32_disallowed_use(try_body, x, cands)
+                || int32_disallowed_use(catch_body, x, cands)
+                || int32_disallowed_use(finally_body, x, cands)
+        }
+        other => inst_uses_any(other, &one),
+    })
+}
+fn int32_use_locals(f: &Function, unboxed: &BTreeSet<u32>, int_local: &BTreeSet<u32>) -> BTreeSet<u32> {
+    if !int32_uses_enabled() {
+        return BTreeSet::new();
+    }
+    let params: BTreeSet<u32> = f.params.iter().map(|p| p.0).collect();
+    let mut cands: BTreeSet<u32> = unboxed
+        .iter()
+        .copied()
+        .filter(|id| !int_local.contains(id) && !params.contains(id))
+        .collect();
+    loop {
+        let snapshot = cands.clone();
+        cands.retain(|&x| !int32_disallowed_use(&f.body, x, &snapshot));
+        if cands.len() == snapshot.len() {
+            break;
+        }
+    }
+    cands
+}
+
 fn infer_numeric_analysis(
     body: &[Inst],
     unboxed: &BTreeSet<u32>,
@@ -6559,6 +6670,7 @@ fn emit_i64_function(
         layouts: layout_plan_for(f),
         lazy_frame,
         frame_nslots,
+        int32_use: int32_use_locals(f, &unboxed, &int_local),
         unboxed,
         int_local,
         local_class,
@@ -6729,6 +6841,7 @@ fn emit_f64_function(
         layouts: layout_plan_for(f),
         lazy_frame,
         frame_nslots,
+        int32_use: int32_use_locals(f, &unboxed, &int_local),
         unboxed,
         int_local,
         local_class,
@@ -6835,6 +6948,7 @@ fn emit_function(
             layouts: LayoutPlan::default(),
             lazy_frame: false,
             frame_nslots: 0,
+            int32_use: int32_use_locals(f, &unboxed, &int_local),
             unboxed,
             int_local,
             local_class,
@@ -6888,6 +7002,7 @@ fn emit_function(
             layouts: LayoutPlan::default(),
             lazy_frame: false,
             frame_nslots: 0,
+            int32_use: int32_use_locals(f, &unboxed, &int_local),
             unboxed,
             int_local,
             local_class,
@@ -6941,6 +7056,7 @@ fn emit_function(
             layouts: LayoutPlan::default(),
             lazy_frame: false,
             frame_nslots: 0,
+            int32_use: int32_use_locals(f, &unboxed, &int_local),
             unboxed,
             int_local,
             local_class,
@@ -7153,6 +7269,7 @@ fn emit_function(
         lazy_frame,
 
         frame_nslots,
+        int32_use: int32_use_locals(f, &unboxed, &int_local),
         unboxed,
         int_local,
         local_class,
@@ -12098,7 +12215,9 @@ fn try_emit_fused_string_concat_loop(
         s.push_str("  }\n");
         let _ = writeln!(s, "  d{} += {}LL;", counter, counter_inc);
     });
-    if !ctx.int_local.contains(&sum_copy.0) {
+    if ctx.int32_use.contains(&sum_copy.0) {
+        let _ = writeln!(s, "  d{} = (double)ts_to_int32((double){});", sum_copy.0, acc_var);
+    } else if !ctx.int_local.contains(&sum_copy.0) {
         let _ = writeln!(s, "  d{} = (double){};", sum_copy.0, acc_var);
     }
     let _ = writeln!(
@@ -18217,7 +18336,9 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 return;
             }
             // copy respecting boxed/unboxed representation of each side
-            if ctx.unboxed.contains(&dst.0) {
+            if ctx.int32_use.contains(&dst.0) && ctx.int32_use.contains(&src.0) {
+                let _ = writeln!(s, "  d{} = d{};", dst.0, src.0);
+            } else if ctx.unboxed.contains(&dst.0) {
                 s.push_str(&ctx.set_num(dst.0, &ctx.num(src.0)));
             } else {
                 s.push_str(&ctx.set_val(dst.0, &ctx.val(src.0)));
@@ -18842,9 +18963,6 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                             Some(d) if ctx.int_local.contains(&d.0) => {
                                 let _ = writeln!(s, "  d{} = {};", d.0, call);
                             }
-                            Some(d) if ctx.unboxed.contains(&d.0) => {
-                                let _ = writeln!(s, "  d{} = (double)({});", d.0, call);
-                            }
                             Some(d) => {
                                 s.push_str(&ctx.set_num(d.0, &format!("(double)({})", call)));
                             }
@@ -18879,9 +18997,6 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                                 .join(", ")
                         );
                         match dst {
-                            Some(d) if ctx.unboxed.contains(&d.0) => {
-                                let _ = writeln!(s, "  d{} = {};", d.0, call);
-                            }
                             Some(d) => {
                                 s.push_str(&ctx.set_num(d.0, &call));
                             }
@@ -19533,28 +19648,28 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 // (signed for & | ^ << >>, unsigned for >>>). Cast through int32_t /
                 // uint32_t to get the wrap-around and sign semantics V8 produces.
                 "&" => format!(
-                    "((double)((int32_t)ts_to_int32({}) & (int32_t)ts_to_int32({})))",
-                    l, r
+                    "((double)((int32_t){} & (int32_t){}))",
+                    ctx.bitwise_operand(lhs.0), ctx.bitwise_operand(rhs.0)
                 ),
                 "|" => format!(
-                    "((double)((int32_t)ts_to_int32({}) | (int32_t)ts_to_int32({})))",
-                    l, r
+                    "((double)((int32_t){} | (int32_t){}))",
+                    ctx.bitwise_operand(lhs.0), ctx.bitwise_operand(rhs.0)
                 ),
                 "^" => format!(
-                    "((double)((int32_t)ts_to_int32({}) ^ (int32_t)ts_to_int32({})))",
-                    l, r
+                    "((double)((int32_t){} ^ (int32_t){}))",
+                    ctx.bitwise_operand(lhs.0), ctx.bitwise_operand(rhs.0)
                 ),
                 "<<" => format!(
-                    "((double)((int32_t)(ts_to_int32({}) << (ts_to_uint32({}) & 31))))",
-                    l, r
+                    "((double)((int32_t)({} << {})))",
+                    ctx.bitwise_operand(lhs.0), ctx.shift_count(rhs.0)
                 ),
                 ">>" => format!(
-                    "((double)((int32_t)ts_to_int32({}) >> (ts_to_uint32({}) & 31)))",
-                    l, r
+                    "((double)((int32_t){} >> {}))",
+                    ctx.bitwise_operand(lhs.0), ctx.shift_count(rhs.0)
                 ),
                 ">>>" => format!(
-                    "((double)((uint32_t)ts_to_int32({}) >> (ts_to_uint32({}) & 31)))",
-                    l, r
+                    "((double)((uint32_t){} >> {}))",
+                    ctx.bitwise_operand(lhs.0), ctx.shift_count(rhs.0)
                 ),
                 "**" => format!("pow({}, {})", l, r),
                 _ => "0".to_string(),
@@ -19608,7 +19723,13 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                             // null->0) not num (ts_to_num gives NaN for non-numbers ->
                             // ToInt32(NaN)=0). Matches the binary bitwise ops. Unboxed
                             // operands render `d{id}` for both, so hot paths are unchanged.
-                            "~" => format!("((double)(~ts_to_int32({})))", ctx.numc(operand.0)),
+                            "~" => {
+                                if ctx.int32_use.contains(&operand.0) {
+                                    format!("((double)(~(int32_t)d{}))", operand.0)
+                                } else {
+                                    format!("((double)(~ts_to_int32({})))", ctx.numc(operand.0))
+                                }
+                            }
                             _ => "0".to_string(),
                         };
                         s.push_str(&ctx.set_num(dst.0, &expr));
