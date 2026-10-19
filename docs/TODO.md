@@ -5463,6 +5463,29 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   Node 3.30 s → 1.66x.** Gates: conformance 449/449, parity 346 identical
   + 99 KNOWN, bundler 42/42, selfconf 432 + 14 KNOWN, GC stress (all
   phases), inline policy, units.
+- Slot-precise barriers in the slow property stores (build `x31`,
+  relinked from `x30`; runtime only). `ts_set_named_prop`'s own-slot
+  overwrite and creation, `ts_define_data` and the JSON parser's object
+  stores used the whole-cell barrier; a shaped receiver now remembers the
+  written slot's card (dictionary receivers keep the whole-cell barrier).
+  The statistics moved little (slot writes 825k → 838k, whole-cell marks
+  1.68M → 1.67M per compile: the 1.2M slow additions land mostly on young
+  receivers), and a quick alternating noEmit comparison against `x30`
+  read 4.64/4.41, 4.56/4.56, 4.50/4.43 s (within noise, no regression).
+  Kept as a correctness-neutral precision improvement. Measured on the
+  side, on the loaded machine: the GC aging knobs
+  (`TSAOT_GC_AGE_THRESHOLD` 1 and 3, `TSAOT_GC_AGING_ADAPTIVE=0`) read
+  4.40–4.75 s against the default's 4.45–4.70 s, no consistent pattern;
+  defaults unchanged. The remembered-cell visits (2.36M per compile) are
+  the cost of `gc_mark_common_props`, not the slot counts.
+- Profile of `x30` (2,660 samples), the split of the listed samples:
+  direct entries of generated functions 68%, GC 12.7%, runtime 16%, calls
+  through function values 1.9% (so callback specialization has little
+  headroom left; the remaining generated-code cost is property reads,
+  flag tests and calls in the checker's hottest functions:
+  `resolveNameHelper` 78, `isSimpleTypeRelatedTo` 64, `getObjectFlags`
+  63, `getApparentType` 49, `isFreshLiteralType` 41, `getTypeAtFlowNode`
+  37; the `binarySearch` clone 30 where `binarySearchKey` alone had 48).
 - Next slices, in order. (0) External element buffers (the malloc'd
   `data` of arrays, also strings' and maps' buffers) do not count toward
   the collector's trigger: a loop that drops large arrays grows without

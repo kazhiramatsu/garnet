@@ -2130,7 +2130,9 @@ static ts_pref ts_set_named_prop(tsv obj, ts_object* o, ts_key key, tsv val,
       return ownp;
     }
     if (frozen || !pref_is_writable(ownp)){ ts_throw_readonly_write(key); return PREF_NONE; }
-    *pref_valp(ownp)=val; ts_write_barrier(obj, val); return ownp;
+    { tsv* vp = pref_valp(ownp); *vp = val;
+      if (obj_shaped(o)) ts_write_barrier_ptr(obj, vp, val); else ts_write_barrier(obj, val); }
+    return ownp;
   }
   /* 2) inherited property up the proto chain: an accessor invokes its setter
      (this=obj); a read-only data property (its own attribute, or a frozen
@@ -2154,8 +2156,10 @@ static ts_pref ts_set_named_prop(tsv obj, ts_object* o, ts_key key, tsv val,
      (frozen bit0 / preventExtensions bit1 / sealed bit2). */
   if (ts_obj_integrity(o) & (1u|2u|4u)){ ts_throw_not_extensible(key); return PREF_NONE; }
   ts_pref created = find_prop(o,key,1);
-  *pref_valp(created)=val;
-  ts_write_barrier(obj, val);
+  { tsv* vp = pref_valp(created); *vp = val;
+    /* slot-precise for a shaped receiver: an old object remembers one card,
+       not a whole-cell scan (the slow addition path ran 1.2M times a compile) */
+    if (obj_shaped(o)) ts_write_barrier_ptr(obj, vp, val); else ts_write_barrier(obj, val); }
   return created;
 }
 void ts_set(tsv obj, ts_key key, tsv val){
@@ -2375,8 +2379,8 @@ void ts_define_data(tsv obj, ts_key key, tsv value, int e, int w, int c){
      validate the receiver's prototype by identity, not by its attributes). */
   if (!w) prop_add_epoch_bump();
   ts_pref p = props_define(o, key, flags);
-  *pref_valp(p) = value;
-  ts_write_barrier(obj, value);
+  { tsv* vp = pref_valp(p); *vp = value;
+    if (obj_shaped(o)) ts_write_barrier_ptr(obj, vp, value); else ts_write_barrier(obj, value); }
   ts_gc_unroot(2);
 }
 
@@ -9613,8 +9617,8 @@ static tsv jp_number(jparse* p){
 static void jp_obj_set_data(tsv obj, uint32_t key, tsv val){
   ts_object* o=(ts_object*)ts_ptr(obj);
   ts_pref p=props_define(o, key, TS_PROP_DEFAULT);
-  *pref_valp(p)=val;
-  ts_write_barrier(obj, val);
+  { tsv* vp = pref_valp(p); *vp = val;
+    if (obj_shaped(o)) ts_write_barrier_ptr(obj, vp, val); else ts_write_barrier(obj, val); }
 }
 static void jp_array_push_fast(tsv arr, tsv val){
   ts_array* a=(ts_array*)ts_ptr(arr);
