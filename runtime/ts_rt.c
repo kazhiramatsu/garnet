@@ -14790,7 +14790,7 @@ void ts_await_register_v(tsv pv, tsv cv){
 
 static void coro_init(ts_coro* c, size_t size, tsv (*resume)(tsv)){
   c->state=0; c->resume=resume; c->result=TS_UNDEFINED; c->rejected=0;
-  c->nslots=0; c->frame_size=size; c->ret=TS_UNDEFINED;
+  c->nvals=-1; c->frame_size=size; c->ret=TS_UNDEFINED;
   c->gen_status=TS_GEN_SUSPENDED_START;
   c->eh_capacity=TS_CORO_EH_INLINE;
   c->eh_catch_state=c->eh_catch_inline;
@@ -14844,10 +14844,15 @@ int ts_coro_fin_push_slot(ts_coro* c){
 }
 /* allocate a coroutine frame of `size` bytes (>= sizeof(ts_coro)); the embedded
    ts_coro is at offset 0. Extra frame fields are zeroed (calloc). */
-tsv ts_coro_alloc_v(size_t size, tsv (*resume)(tsv)){
+static tsv coro_alloc(size_t size, tsv (*resume)(tsv), int nvals){
   if (size < sizeof(ts_coro)) size = sizeof(ts_coro);
   ts_coro* c=(ts_coro*)gc_alloc(size, TS_KIND_CORO);
   coro_init(c, size, resume);
+  if (nvals >= 0){
+    if ((size_t)nvals > (size - sizeof(ts_coro)) / sizeof(tsv))
+      ts_abort_msg("coroutine frame map is larger than the frame");
+    c->nvals = nvals;
+  }
   /* set frame_size (so a GC scan of the still-zeroed frame is bounded/harmless)
      and root cv BEFORE allocating c->ret — that alloc may trigger GC, which would
      otherwise collect or move this not-yet-referenced coro. */
@@ -14858,6 +14863,10 @@ tsv ts_coro_alloc_v(size_t size, tsv (*resume)(tsv)){
   ts_write_barrier(cv, ret);
   ts_gc_unroot(1);
   return cv;
+}
+tsv ts_coro_alloc_v(size_t size, tsv (*resume)(tsv)){ return coro_alloc(size, resume, -1); }
+tsv ts_coro_alloc_vn(size_t size, tsv (*resume)(tsv), uint32_t nvals){
+  return coro_alloc(size, resume, nvals > (uint32_t)INT32_MAX ? INT32_MAX : (int)nvals);
 }
 tsv ts_coro_new_v(tsv (*resume)(tsv)){
   return ts_coro_alloc_v(sizeof(ts_coro), resume);
@@ -14991,14 +15000,22 @@ static void gc_scan_async_cell(ts_gc_header* h, int young, int depth){
       gc_visit_slot(&r->promise, young, depth, stable);
       gc_visit_slot(&r->value, young, depth, stable);
     }
-    /* Conservatively scan the whole frame: any 8-byte slot that looks like a
-       boxed heap handle is treated as a root. Stable handles keep this safe even
-       when a minor GC relocates the object body. */
-    size_t off = sizeof(ts_coro);
-    char* base = (char*)c;
-    for (; off + sizeof(tsv) <= c->frame_size; off += sizeof(tsv)){
-      tsv v; memcpy(&v, base+off, sizeof(tsv));
-      gc_mark_visit(v, young, depth);
+    if (c->nvals >= 0){
+      /* The frame map (docs/gc_v2_design.md §6.5 step 2b): the tsv locals
+         lead the frame, visited as slots; integer and double locals follow
+         and are not looked at. */
+      tsv* vals = (tsv*)((char*)c + sizeof(ts_coro));
+      for (int i = 0; i < c->nvals; i++) gc_visit_slot(&vals[i], young, depth, stable);
+    } else {
+      /* A frame without the map: scan it conservatively; any 8-byte word that
+         looks like a heap reference is treated as a root. An integer local
+         with such bits is read as a reference too, the reason for the map. */
+      size_t off = sizeof(ts_coro);
+      char* base = (char*)c;
+      for (; off + sizeof(tsv) <= c->frame_size; off += sizeof(tsv)){
+        tsv v; memcpy(&v, base+off, sizeof(tsv));
+        gc_mark_visit(v, young, depth);
+      }
     }
   }
 }

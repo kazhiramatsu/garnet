@@ -9940,20 +9940,79 @@ fn emit_coroutine_param_copy(s: &mut String, f: &Function, ctx: &Ctx) {
     }
 }
 
-fn emit_async_function(s: &mut String, f: &Function, ctx: &Ctx) {
-    let fname = cname(f);
-    // Frame struct: header (ts_coro) + all locals as named fields.
+/// `TSAOT_CORO_PRECISE=0` keeps the coroutine frames without a map (the
+/// parity oracle's layout, scanned conservatively).
+fn coro_precise_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_CORO_PRECISE").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
+/// The frame struct of a coroutine: the `ts_coro` header, then the locals.
+/// With the frame map the `tsv` locals come first and their count is returned
+/// for the allocator, so the collector visits exactly those words
+/// (docs/gc_v2_design.md §6.5 step 2b); without it (`None`) the locals keep
+/// their declaration order and the frame is scanned conservatively.
+fn emit_coro_frame_struct(s: &mut String, f: &Function, ctx: &Ctx, fname: &str) -> Option<usize> {
     let _ = writeln!(s, "typedef struct {}_frame {{ ts_coro c;", fname);
-    for l in &f.locals {
-        if ctx.int_local.contains(&l.id.0) {
-            let _ = writeln!(s, "  long long d{};", l.id.0);
-        } else if ctx.unboxed.contains(&l.id.0) {
-            let _ = writeln!(s, "  double d{};", l.id.0);
+    let numeric = |id: u32| ctx.int_local.contains(&id) || ctx.unboxed.contains(&id);
+    let field = |s: &mut String, id: u32| {
+        if ctx.int_local.contains(&id) {
+            let _ = writeln!(s, "  long long d{};", id);
+        } else if ctx.unboxed.contains(&id) {
+            let _ = writeln!(s, "  double d{};", id);
         } else {
-            let _ = writeln!(s, "  tsv v{};", l.id.0);
+            let _ = writeln!(s, "  tsv v{};", id);
+        }
+    };
+    let nvals = if coro_precise_enabled() {
+        let mut n = 0usize;
+        for l in f.locals.iter().filter(|l| !numeric(l.id.0)) {
+            field(s, l.id.0);
+            n += 1;
+        }
+        for l in f.locals.iter().filter(|l| numeric(l.id.0)) {
+            field(s, l.id.0);
+        }
+        Some(n)
+    } else {
+        for l in &f.locals {
+            field(s, l.id.0);
+        }
+        None
+    };
+    let _ = writeln!(s, "}} {}_frame;", fname);
+    nvals
+}
+
+fn emit_coro_alloc(s: &mut String, fname: &str, nvals: Option<usize>) {
+    match nvals {
+        Some(n) => {
+            let _ = writeln!(
+                s,
+                "  tsv _cv = ts_coro_alloc_vn(sizeof({}_frame), {}_resume, {}u);",
+                fname, fname, n
+            );
+        }
+        None => {
+            let _ = writeln!(
+                s,
+                "  tsv _cv = ts_coro_alloc_v(sizeof({}_frame), {}_resume);",
+                fname, fname
+            );
         }
     }
-    let _ = writeln!(s, "}} {}_frame;", fname);
+}
+
+fn emit_async_function(s: &mut String, f: &Function, ctx: &Ctx) {
+    let fname = cname(f);
+    // Frame struct: header (ts_coro) + all locals as named fields (the tsv
+    // locals first, with the frame map).
+    let nvals = emit_coro_frame_struct(s, f, ctx, &fname);
 
     // resume function
     let _ = writeln!(s, "static tsv {}_resume(tsv _cv){{", fname);
@@ -9981,11 +10040,7 @@ fn emit_async_function(s: &mut String, f: &Function, ctx: &Ctx) {
     // return the result promise.
     let _ = writeln!(s, "static tsv {}(tsv* args, int nargs){{", fname);
     s.push_str("  (void)nargs;\n");
-    let _ = writeln!(
-        s,
-        "  tsv _cv = ts_coro_alloc_v(sizeof({}_frame), {}_resume);",
-        fname, fname
-    );
+    emit_coro_alloc(s, &fname, nvals);
     s.push_str("  ts_gc_root(&_cv);\n");
     let _ = writeln!(s, "  {}_frame* _fr = ({}_frame*)ts_ptr(_cv);", fname, fname);
     // copy params into frame fields
@@ -10003,17 +10058,7 @@ fn emit_async_function(s: &mut String, f: &Function, ctx: &Ctx) {
 fn emit_generator_function(s: &mut String, f: &Function, ctx: &Ctx) {
     let fname = cname(f);
     // Frame struct (identical layout to async).
-    let _ = writeln!(s, "typedef struct {}_frame {{ ts_coro c;", fname);
-    for l in &f.locals {
-        if ctx.int_local.contains(&l.id.0) {
-            let _ = writeln!(s, "  long long d{};", l.id.0);
-        } else if ctx.unboxed.contains(&l.id.0) {
-            let _ = writeln!(s, "  double d{};", l.id.0);
-        } else {
-            let _ = writeln!(s, "  tsv v{};", l.id.0);
-        }
-    }
-    let _ = writeln!(s, "}} {}_frame;", fname);
+    let nvals = emit_coro_frame_struct(s, f, ctx, &fname);
 
     let _ = writeln!(s, "static tsv {}_resume(tsv _cv){{", fname);
     let _ = writeln!(s, "  {}_frame* _fr = ({}_frame*)ts_ptr(_cv);", fname, fname);
@@ -10038,11 +10083,7 @@ fn emit_generator_function(s: &mut String, f: &Function, ctx: &Ctx) {
     // running the body (generators are lazy).
     let _ = writeln!(s, "static tsv {}(tsv* args, int nargs){{", fname);
     s.push_str("  (void)nargs;\n");
-    let _ = writeln!(
-        s,
-        "  tsv _cv = ts_coro_alloc_v(sizeof({}_frame), {}_resume);",
-        fname, fname
-    );
+    emit_coro_alloc(s, &fname, nvals);
     s.push_str("  ts_gc_root(&_cv);\n");
     let _ = writeln!(s, "  {}_frame* _fr = ({}_frame*)ts_ptr(_cv);", fname, fname);
     emit_coroutine_param_copy(s, f, ctx);
@@ -10054,17 +10095,7 @@ fn emit_generator_function(s: &mut String, f: &Function, ctx: &Ctx) {
 fn emit_asyncgen_function(s: &mut String, f: &Function, ctx: &Ctx) {
     let fname = cname(f);
     // Frame struct (identical layout to async/generator).
-    let _ = writeln!(s, "typedef struct {}_frame {{ ts_coro c;", fname);
-    for l in &f.locals {
-        if ctx.int_local.contains(&l.id.0) {
-            let _ = writeln!(s, "  long long d{};", l.id.0);
-        } else if ctx.unboxed.contains(&l.id.0) {
-            let _ = writeln!(s, "  double d{};", l.id.0);
-        } else {
-            let _ = writeln!(s, "  tsv v{};", l.id.0);
-        }
-    }
-    let _ = writeln!(s, "}} {}_frame;", fname);
+    let nvals = emit_coro_frame_struct(s, f, ctx, &fname);
 
     let _ = writeln!(s, "static tsv {}_resume(tsv _cv){{", fname);
     let _ = writeln!(s, "  {}_frame* _fr = ({}_frame*)ts_ptr(_cv);", fname, fname);
@@ -10089,11 +10120,7 @@ fn emit_asyncgen_function(s: &mut String, f: &Function, ctx: &Ctx) {
     // object WITHOUT running the body (driven by .next()).
     let _ = writeln!(s, "static tsv {}(tsv* args, int nargs){{", fname);
     s.push_str("  (void)nargs;\n");
-    let _ = writeln!(
-        s,
-        "  tsv _cv = ts_coro_alloc_v(sizeof({}_frame), {}_resume);",
-        fname, fname
-    );
+    emit_coro_alloc(s, &fname, nvals);
     s.push_str("  ts_gc_root(&_cv);\n");
     let _ = writeln!(s, "  {}_frame* _fr = ({}_frame*)ts_ptr(_cv);", fname, fname);
     emit_coroutine_param_copy(s, f, ctx);

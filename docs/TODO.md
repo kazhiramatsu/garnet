@@ -6679,10 +6679,28 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   frames dereferences an integer-specialized local whose bits look like an
   old-cell reference (`-2251799813685248 + 4096` held across an `await`
   crashes under frequent full collections).
+- GC v2 Y1 step 2b: precise coroutine frames (`docs/gc_v2_design.md`
+  §6.5). A coroutine's frame struct lists its `tsv` locals first and the
+  entry allocates it with `ts_coro_alloc_vn(size, resume, N)`; the
+  collector visits exactly those N words, as slots (rewritten to the
+  pointer form like frame slots), and no longer reads the integer and
+  double locals. Fixes a crash: the conservative scan dereferenced an
+  integer-specialized local whose bits look like an old-cell reference
+  (integers in [-2^51, -2^51 + 3 * 2^48) held across `await` / `yield`).
+  `ts_coro_alloc_v` frames (the frozen analyzer's output) keep the
+  conservative scan; `TSAOT_CORO_PRECISE=0` keeps the previous emission for
+  the parity oracle. The unused `slots[16]` of `ts_coro` goes (the header
+  shrinks from 896 to 768 bytes). Fixture `gc/coro_int_locals` (an async
+  function, a generator and an async generator holding such integers while
+  seven full collections run; crashes with the previous frames; also in
+  the GC stress set). Gates: unit, parity (362 identical), bundler,
+  selfconf, GC stress, inline policy, conformance 486/486; tsc rebuilt
+  (thirteen coroutine frames change) and compiled under protect mode. A/B
+  against step 2: eight ABBA pairs, wall 0.999, instructions 0.9997,
+  cycles 1.0004: neutral.
 - Next slices, in order. GC v2 first (`docs/gc_v2_design.md` §6.5, Y1:
-  2b precise coroutine frames (the emitter groups the frame's `tsv`
-  locals and records their count; fixes the crash above); 3 nursery chunks
-  from the cage; 4 direct pointers one kind at a time; 5 handles removed).
+  3 nursery chunks from the cage; 4 direct pointers one kind at a time;
+  5 handles removed).
   A slice that extends the stack or an arena to a
   new kind of allocation runs the conformance suite and a compile of the
   compiler under `--stack-check` (an arena must allocate through the

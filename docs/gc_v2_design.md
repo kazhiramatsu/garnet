@@ -589,6 +589,34 @@ program under frequent full collections (`TSAOT_GC_FULL_THRESHOLD_BYTES=65536`).
 The precise frame map of step 4 removes the conservative scan, so it moves
 ahead as its own slice (step 2b).
 
+Step 2b plan: precise coroutine frames.
+
+- Emitter: a coroutine's frame struct lists its `tsv` locals first, then
+  its integer and double locals, and the entry allocates the frame with
+  `ts_coro_alloc_vn(sizeof(frame), resume, N)`, N the number of `tsv`
+  locals. `TSAOT_CORO_PRECISE=0` keeps the previous layout and allocator
+  (the parity oracle's emission).
+- Runtime: `ts_coro.nvals` replaces the unused `slots[16]` / `nslots`
+  (the header shrinks from 896 to 768 bytes). A frame from `ts_coro_alloc_v` has -1 and is
+  scanned conservatively as before (the frozen analyzer's output in the
+  selfconf gate); a frame from `ts_coro_alloc_vn` has N, and the collector
+  visits exactly the N words after the header, as slots (`gc_visit_slot`:
+  a reference to a promoted cell is rewritten to the pointer form, as in
+  frame slots).
+- Fixture `gc/coro_int_locals`: an async function, a generator and an
+  async generator hold integers with reference-like bits across their
+  suspension points while enough cells are promoted to run full
+  collections (seven in the default configuration); also in the GC stress
+  gate's focused set (a minor collection at every allocation, protect
+  mode). With the previous frames it crashes in the default configuration.
+
+Step 2b result: as planned. The compiler has thirteen coroutines (its
+iterator generators); their frames take the map and the compiled compiler
+is otherwise unchanged. The frozen analyzer's output keeps the
+conservative scan and passes the fixture (its untyped locals are boxed).
+A/B against step 2: neutral (wall 0.999, instructions 0.9997, cycles
+1.0004).
+
 ## 7. Verification
 
 - Gates of every slice: unit, parity (`scripts/emitc_diff.sh`), bundler,

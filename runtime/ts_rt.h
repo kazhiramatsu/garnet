@@ -2233,8 +2233,8 @@ typedef struct ts_coro {
   int rejected;
   tsv ret;
   size_t frame_size;         /* total bytes of the enclosing frame (for GC scan) */
-  tsv slots[16];
-  int nslots;
+  int nvals;                 /* tsv locals leading the frame, scanned precisely;
+                                -1 = scan the frame conservatively (ts_coro_alloc_v) */
   tsv yielded;               /* generator: value produced by the current yield */
   int done;                  /* generator: 1 when the body has completed */
   int gen_status;            /* generator protocol lifecycle (TS_GEN_*) */
@@ -2279,6 +2279,9 @@ tsv         ts_promise_new_executor(tsv executor);
 void        ts_await_register_v(tsv pv, tsv cv);
 tsv         ts_coro_new_v(tsv (*resume)(tsv));
 tsv         ts_coro_alloc_v(size_t size, tsv (*resume)(tsv));
+/* The frame's first nvals words after the header are its tsv locals, and the
+   rest holds no reference (docs/gc_v2_design.md §6.5 step 2b). */
+tsv         ts_coro_alloc_vn(size_t size, tsv (*resume)(tsv), uint32_t nvals);
 void        ts_coro_resume_v(tsv cv);
 void        ts_run_event_loop(void);
 
