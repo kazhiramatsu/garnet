@@ -737,12 +737,16 @@ int main(){
   tsv mixed_keys[24], mixed_values[24];
   tsv mixed_keys_h[24], mixed_values_h[24]; /* handle-form probes for the freed checks */
   for (int i=0;i<24;i++){
+    /* probes taken at allocation: a later allocation may promote the cell
+       (in place, without aging) and rewrite the rooted slot to the pointer
+       form, which reads the address whether the cell lives or not */
     mixed_keys[i]=ts_new_object();
+    mixed_keys_h[i]=mixed_keys[i];
     ts_gc_root(&mixed_keys[i]);
     mixed_values[i]=ts_new_object();
+    mixed_values_h[i]=mixed_values[i];
     ts_set(mixed_values[i],483010u,ts_num((double)i));
     ts_weakmap_set(mixed_map,mixed_keys[i],mixed_values[i]);
-    mixed_keys_h[i]=mixed_keys[i]; mixed_values_h[i]=mixed_values[i];
   }
   CK("weakmap hash index populated",
      ((ts_map*)ts_ptr(mixed_map))->index!=NULL &&
@@ -1023,7 +1027,7 @@ int main(){
   CK("symbol property key is strong edge",
      ts_ptr(property_symbol)!=NULL && ts_ptr(property_symbol_value)!=NULL &&
      ts_array_len(own_symbols)==1 &&
-     ts_array_get(own_symbols,0)==property_symbol &&
+     ts_strict_eq(ts_array_get(own_symbols,0), property_symbol) &&
      ts_to_num(ts_get(ts_weakmap_get(property_symbol_map,property_symbol),483102u))==102);
   ts_gc_unroot(1);
   ts_delete_prop(symbol_owner,property_symbol_key);

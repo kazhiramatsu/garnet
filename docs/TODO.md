@@ -6620,8 +6620,22 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   scattered survivors, and size segregation scattered objects allocated
   together. Next: G3b, the same gate with an Immix-style cell space (lines,
   mixed-size bump allocation, overflow blocks); Y1 if it fails too.
+- GC v2 slices G3b / G3c: the non-moving gate fails again
+  (`docs/gc_v2_design.md` §6.4; runtimes not committed). G3b, an
+  Immix-style cell space (lines, mixed-size bump allocation, overflow
+  blocks): wall +3.15% against G2d, instructions -0.65%. G3c, G3b with the
+  pretenured cells bumped through blocks of their own: wall +2.7%, cycles
+  +2.6% (ten ABBA pairs, nine slower), instructions -0.8%, peak memory +12%.
+  Every non-moving variant runs fewer instructions and loses on memory: the
+  nursery copies the 12% of young cells that survive into dense old space,
+  a non-moving heap leaves them interleaved with the holes of the dead.
+  The runtime unit tests take their handle-form probes at allocation and
+  compare symbol identity with `ts_strict_eq` (a promotion-timing change
+  turned the probes into pointers; `ts_same_cell` is defined only for
+  differing bits); they pass on the current runtime too.
 - Next slices, in order. GC v2 first (`docs/gc_v2_design.md` §6: G2
-  payloads in a block heap (G3b, Immix-style cell space, next), G3 the non-moving decision gate).
+  payloads in a block heap (G3', a copying nursery without handles, next
+  if Kaz agrees), G3 the non-moving decision gate).
   A slice that extends the stack or an arena to a
   new kind of allocation runs the conformance suite and a compile of the
   compiler under `--stack-check` (an arena must allocate through the

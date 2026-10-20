@@ -465,6 +465,33 @@ builds the cell space that way (payloads keep their size classes), with the
 same gate (within 1% of G2d). If G3b also fails, the plan continues with Y1
 (G3').
 
+## 6.4 G3b / G3c result: non-moving allocation loses about 2.7%
+
+- **G3b** (Immix-style cell space: 128-byte lines, mixed-size bump allocation
+  through runs of free lines, overflow blocks for medium cells, the blocks
+  used in a cycle reused first): wall +3.15% against G2d (the quiet pairs
+  +3.5-4%), instructions -0.65%, cycles +5%. Sequential allocation alone did
+  not recover the loss.
+- **G3c** (G3b, with cells allocated old, the pretenured constructions,
+  bumped through fresh blocks of their own): ten ABBA pairs, wall +2.7%,
+  user +2.3%, cycles +2.6% (nine of ten pairs slower), instructions -0.8%,
+  peak memory +12% (939 vs 838 MB). Interleaving the long-lived pretenured
+  data with young cells was part of the loss (G3b to G3c), but most of it
+  remains.
+
+Reading: every non-moving variant executes fewer instructions than the
+moving nursery and loses on memory. The nursery's advantage on this
+workload is not only its hot, reused 4 MB region but its promotion: the
+survivors (12% of the young cells, 227 MB per compile) are copied into old
+space densely, while a non-moving heap leaves them where they were
+allocated, interleaved with the holes young death leaves (and fills again).
+The gate (within 1% of G2d) fails for all three; per §6 the plan continues
+with Y1 (G3'): keep the copying nursery and remove the handles through
+evacuation with reference rewriting, under the stale-reference protocol of
+§6 (from-space protection in stress mode, a minor collection at every
+allocation, the milestone). The three runtimes are kept in the scratchpad
+(not committed).
+
 ## 7. Verification
 
 - Gates of every slice: unit, parity (`scripts/emitc_diff.sh`), bundler,
