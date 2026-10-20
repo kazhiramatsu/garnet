@@ -172,3 +172,4 @@ selfconf-unported	arrays/numeric_index_keys	Frozen emitter lacks computed-delete
 selfconf-unported	gc/payload_arrays	Frozen analyzer lacks array.spliceDrop (the splice fast paths); the native Rust output matches V8.
 parity-unported	gc/payload_props	Frozen emitter lacks computed-delete dispatch (object.deleteDynamic: the fixture deletes computed keys); the Rust emitter supports it and matches V8.
 selfconf-unported	gc/payload_props	Frozen emitter lacks computed-delete dispatch (object.deleteDynamic); the native Rust output matches V8.
+parity	gc/finally_pending_value	Rust tracks loop destinations and scopes through finally; frozen completion dispatch differs (`case 2: case 3: break;`), and its FrameArena annotation differs. The frame slot for the pending value is not used by the parity emission (TSAOT_FRAME_ROOTS=0). Native outputs were compared with V8.

@@ -1405,6 +1405,12 @@ struct Ctx<'a> {
     loop_mod_residues: std::cell::RefCell<Vec<BTreeMap<(u32, u32), LoopModResidue>>>,
     /// Enclosing finally contexts, with the loop scope at each protected entry.
     fin_stack: std::cell::RefCell<Vec<FinCtx>>,
+    /// The pending completion value of a plain finally lives in the frame
+    /// slot `F.p<depth>` (docs/gc_v2_design.md §6.6): a C local is not seen by
+    /// the collector, and a young value moved by a collection in the finally
+    /// body would be returned from its old address.
+    fin_value_slots: bool,
+    pendv_depth: std::cell::Cell<u32>,
     /// count of live C EH handlers pushed in the current emission path (so a goto
     /// that crosses them can emit the right number of ts_eh_pop()).
     eh_depth: std::cell::Cell<u32>,
@@ -2039,12 +2045,58 @@ fn compute_frame_layout(f: &Function, reflike: &[u32], fusion: &TypeofFusion) ->
     FrameLayout { slot_of, nslots: next }
 }
 
-fn emit_frame_decl(s: &mut String, reflike: &[u32], layout: Option<&FrameLayout>) {
+/// `TSAOT_FINALLY_SLOTS=0` keeps the pending completion value of a plain
+/// finally in a C local (the previous emission, for A/B and diagnosis).
+fn finally_slots_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_FINALLY_SLOTS").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
+/// Frame slots for the pending completion values of plain finally blocks:
+/// one per nesting level (a finally nested in any part of another, its
+/// finally body included, needs its own while the outer one's value waits).
+fn finally_value_slots(body: &[Inst]) -> u32 {
+    body.iter()
+        .map(|inst| match inst {
+            Inst::Loop {
+                cond_body, body, ..
+            } => finally_value_slots(cond_body).max(finally_value_slots(body)),
+            Inst::If {
+                then_body,
+                else_body,
+                ..
+            } => finally_value_slots(then_body).max(finally_value_slots(else_body)),
+            Inst::TryCatch {
+                try_body,
+                catch_body,
+                finally_body,
+                ..
+            } => {
+                let inner = finally_value_slots(try_body)
+                    .max(finally_value_slots(catch_body))
+                    .max(finally_value_slots(finally_body));
+                inner + if finally_body.is_empty() { 0 } else { 1 }
+            }
+            _ => 0,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn emit_frame_decl(s: &mut String, reflike: &[u32], layout: Option<&FrameLayout>, fin_slots: u32) {
     s.push_str("  struct { ts_frame_hdr h;");
     match layout {
         Some(l) => {
             for k in 0..l.nslots {
                 let _ = write!(s, " tsv s{};", k);
+            }
+            for k in 0..fin_slots {
+                let _ = write!(s, " tsv p{};", k);
             }
             s.push_str(" } F;\n");
             for k in 0..l.nslots {
@@ -2055,21 +2107,35 @@ fn emit_frame_decl(s: &mut String, reflike: &[u32], layout: Option<&FrameLayout>
             for id in reflike {
                 let _ = write!(s, " tsv v{};", id);
             }
+            for k in 0..fin_slots {
+                let _ = write!(s, " tsv p{};", k);
+            }
             s.push_str(" } F;\n");
             for id in reflike {
                 let _ = writeln!(s, "  F.v{} = TS_UNDEFINED;", id);
             }
         }
     }
+    for k in 0..fin_slots {
+        let _ = writeln!(s, "  F.p{} = TS_UNDEFINED;", k);
+    }
 }
 
 /// The frame of a lazy function with register homes: a spill area filled
 /// only before a linked slow call, so declared uninitialized, and the homes.
-fn emit_frame_decl_homes(s: &mut String, reflike: &[u32], layout: Option<&FrameLayout>, homes: bool) {
+fn emit_frame_decl_homes(
+    s: &mut String,
+    reflike: &[u32],
+    layout: Option<&FrameLayout>,
+    homes: bool,
+    fin_slots: u32,
+) {
     if !homes {
-        emit_frame_decl(s, reflike, layout);
+        emit_frame_decl(s, reflike, layout, fin_slots);
         return;
     }
+    // lazy frames have no try (body_is_gc_free), so no finally value slots
+    debug_assert!(fin_slots == 0);
     s.push_str("  struct { ts_frame_hdr h;");
     match layout {
         Some(l) => {
@@ -6796,8 +6862,13 @@ fn emit_i64_function(
         (String::new(), String::new())
     };
     emit_stack_cell_decls(s, &f.body, strat);
+    let fin_slots = if use_frame_roots && !lazy_frame && finally_slots_enabled() {
+        finally_value_slots(&f.body)
+    } else {
+        0
+    };
     if use_frame_roots {
-        emit_frame_decl_homes(s, &reflike, frame_layout.as_ref(), lazy_homes);
+        emit_frame_decl_homes(s, &reflike, frame_layout.as_ref(), lazy_homes, fin_slots);
     }
     for (i, p) in info.params.iter().enumerate() {
         let _ = writeln!(s, "  d{} = _p{};", p, i);
@@ -6808,7 +6879,7 @@ fn emit_i64_function(
         0
     };
     if use_frame_roots && !lazy_frame {
-        let _ = writeln!(s, "  ts_frame_push(&F.h, {});", frame_slot_count(&reflike, frame_layout.as_ref()));
+        let _ = writeln!(s, "  ts_frame_push(&F.h, {});", frame_slot_count(&reflike, frame_layout.as_ref()) + fin_slots as usize);
     } else if use_frame_roots {
         // lazy: the frame is linked only around slow paths (with register
         // homes it is also filled only there)
@@ -6872,6 +6943,8 @@ fn emit_i64_function(
         loop_labels: std::cell::RefCell::new(Vec::new()),
         loop_mod_residues: std::cell::RefCell::new(Vec::new()),
         fin_stack: std::cell::RefCell::new(Vec::new()),
+        fin_value_slots: fin_slots > 0,
+        pendv_depth: std::cell::Cell::new(0),
         eh_depth: std::cell::Cell::new(0),
     };
     emit_seq(s, &f.body, &ctx, PathEdge::Function);
@@ -6985,8 +7058,13 @@ fn emit_f64_function(
         (String::new(), String::new())
     };
     emit_stack_cell_decls(s, &f.body, strat);
+    let fin_slots = if use_frame_roots && !lazy_frame && finally_slots_enabled() {
+        finally_value_slots(&f.body)
+    } else {
+        0
+    };
     if use_frame_roots {
-        emit_frame_decl_homes(s, &reflike, frame_layout.as_ref(), lazy_homes);
+        emit_frame_decl_homes(s, &reflike, frame_layout.as_ref(), lazy_homes, fin_slots);
     }
     for (i, p) in info.params.iter().enumerate() {
         let _ = writeln!(s, "  d{} = _p{};", p, i);
@@ -6997,7 +7075,7 @@ fn emit_f64_function(
         0
     };
     if use_frame_roots && !lazy_frame {
-        let _ = writeln!(s, "  ts_frame_push(&F.h, {});", frame_slot_count(&reflike, frame_layout.as_ref()));
+        let _ = writeln!(s, "  ts_frame_push(&F.h, {});", frame_slot_count(&reflike, frame_layout.as_ref()) + fin_slots as usize);
     } else if use_frame_roots {
         // lazy: the frame is linked only around slow paths (with register
         // homes it is also filled only there)
@@ -7061,6 +7139,8 @@ fn emit_f64_function(
         loop_labels: std::cell::RefCell::new(Vec::new()),
         loop_mod_residues: std::cell::RefCell::new(Vec::new()),
         fin_stack: std::cell::RefCell::new(Vec::new()),
+        fin_value_slots: fin_slots > 0,
+        pendv_depth: std::cell::Cell::new(0),
         eh_depth: std::cell::Cell::new(0),
     };
     emit_seq(s, &f.body, &ctx, PathEdge::Function);
@@ -7174,6 +7254,8 @@ fn emit_function(
             loop_labels: std::cell::RefCell::new(Vec::new()),
             loop_mod_residues: std::cell::RefCell::new(Vec::new()),
             fin_stack: std::cell::RefCell::new(Vec::new()),
+            fin_value_slots: false,
+            pendv_depth: std::cell::Cell::new(0),
             eh_depth: std::cell::Cell::new(0),
         };
         emit_asyncgen_function(s, f, &ctx);
@@ -7234,6 +7316,8 @@ fn emit_function(
             loop_labels: std::cell::RefCell::new(Vec::new()),
             loop_mod_residues: std::cell::RefCell::new(Vec::new()),
             fin_stack: std::cell::RefCell::new(Vec::new()),
+            fin_value_slots: false,
+            pendv_depth: std::cell::Cell::new(0),
             eh_depth: std::cell::Cell::new(0),
         };
         emit_async_function(s, f, &ctx);
@@ -7294,6 +7378,8 @@ fn emit_function(
             loop_labels: std::cell::RefCell::new(Vec::new()),
             loop_mod_residues: std::cell::RefCell::new(Vec::new()),
             fin_stack: std::cell::RefCell::new(Vec::new()),
+            fin_value_slots: false,
+            pendv_depth: std::cell::Cell::new(0),
             eh_depth: std::cell::Cell::new(0),
         };
         emit_generator_function(s, f, &ctx);
@@ -7374,8 +7460,13 @@ fn emit_function(
         (String::new(), String::new())
     };
     emit_stack_cell_decls(s, &f.body, strat);
+    let fin_slots = if use_frame_roots && !lazy_frame && finally_slots_enabled() {
+        finally_value_slots(&f.body)
+    } else {
+        0
+    };
     if use_frame_roots {
-        emit_frame_decl_homes(s, &reflike, frame_layout.as_ref(), lazy_homes);
+        emit_frame_decl_homes(s, &reflike, frame_layout.as_ref(), lazy_homes, fin_slots);
     }
     if !json_roots.is_empty() {
         s.push_str("  ts_json_dom_scope _json_dom_scope = {0};\n");
@@ -7438,7 +7529,7 @@ fn emit_function(
         0
     };
     if use_frame_roots && !lazy_frame {
-        let _ = writeln!(s, "  ts_frame_push(&F.h, {});", frame_slot_count(&reflike, frame_layout.as_ref()));
+        let _ = writeln!(s, "  ts_frame_push(&F.h, {});", frame_slot_count(&reflike, frame_layout.as_ref()) + fin_slots as usize);
     } else if use_frame_roots {
         // lazy: the frame is linked only around slow paths (with register
         // homes it is also filled only there)
@@ -7525,6 +7616,8 @@ fn emit_function(
         loop_labels: std::cell::RefCell::new(Vec::new()),
         loop_mod_residues: std::cell::RefCell::new(Vec::new()),
         fin_stack: std::cell::RefCell::new(Vec::new()),
+        fin_value_slots: fin_slots > 0,
+        pendv_depth: std::cell::Cell::new(0),
         eh_depth: std::cell::Cell::new(0),
     };
     emit_seq(s, &f.body, &ctx, PathEdge::Function);
@@ -10276,7 +10369,12 @@ fn emit_plain_finally(
     let after_label = ctx.fresh_label();
     let id = fin_label; // unique suffix for locals
     let pend = format!("_pend{}", id);
-    let pendv = format!("_pendv{}", id);
+    let depth = ctx.pendv_depth.get();
+    let pendv = if ctx.fin_value_slots {
+        format!("F.p{}", depth)
+    } else {
+        format!("_pendv{}", id)
+    };
     // record the EH depth visible to this finally's protected region; an inner
     // nested finally propagating outward must pop handlers down to this level.
     let base_eh_depth = ctx.eh_depth.get();
@@ -10289,7 +10387,12 @@ fn emit_plain_finally(
         jumps: std::rc::Rc::new(std::cell::RefCell::new(BTreeMap::new())),
     };
     // completion record locals: kind (0 normal,1 return,2 break,3 continue,4 throw)
-    let _ = writeln!(s, "  int {} = 0; tsv {} = TS_UNDEFINED;", pend, pendv);
+    if ctx.fin_value_slots {
+        let _ = writeln!(s, "  int {} = 0; {} = TS_UNDEFINED;", pend, pendv);
+    } else {
+        let _ = writeln!(s, "  int {} = 0; tsv {} = TS_UNDEFINED;", pend, pendv);
+    }
+    ctx.pendv_depth.set(depth + 1);
     let has_catch = !catch_body.is_empty() || catch_var.is_some();
     ctx.fin_stack.borrow_mut().push(fc.clone());
     // EH handler so a throw in try/catch lands and routes through the finally.
@@ -10407,6 +10510,7 @@ fn emit_plain_finally(
     }
     s.push_str("    default: ;\n  }\n");
     let _ = writeln!(s, "  L{}: ;", after_label);
+    ctx.pendv_depth.set(depth);
 }
 
 /// C identifier for a static-builtin function-value adapter (`math.sqrt` -> `ts_fnval_math_sqrt`).

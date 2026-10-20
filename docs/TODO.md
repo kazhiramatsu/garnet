@@ -6710,6 +6710,27 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   conformance 486/486; tsc compiled under protect mode. A/B against step
   2b: eight ABBA pairs, wall 0.988 (eight of eight; three pairs noisy, the
   quiet ones about -0.7%), cycles 0.989, instructions 0.9998.
+- A plain finally's pending completion value in a frame slot (found while
+  running direct strings under protect mode, `docs/gc_v2_design.md` §6.6).
+  The emitter kept the value a `return` (or a throw) defers while the
+  finally body runs in a C local the collector does not see; once the frame
+  slot that produced the value was reused by the finally body, a collection
+  there freed a fresh object or string and the function returned a freed
+  handle: `try { return { tag: "made-" + k }; } finally { ...allocation... }`
+  crashed in the default configuration (a reused handle would have been a
+  silently wrong value). The value now lives in a frame slot `F.p<depth>`,
+  one per nesting level of finally blocks (a finally nested in a finally
+  body takes the next), pushed with the frame; `TSAOT_FINALLY_SLOTS=0` keeps
+  the C local; the root-stack mode (`TSAOT_FRAME_ROOTS=0`, the parity
+  oracle's) is unchanged. Coroutines already keep it in the coroutine
+  (`fin_exc`). Fixture `gc/finally_pending_value` (a fresh object, a fresh
+  string, a return from catch, a finally nested in a finally body, a
+  rethrown object; crashes with the previous emission in every
+  configuration); a known parity row for its frozen completion dispatch.
+  Gates: unit, parity (362 identical, the new known row), bundler,
+  selfconf, GC stress, inline policy, conformance 487/487; tsc rebuilt and
+  compiled under protect mode. A/B against step 3: eight ABBA pairs,
+  instructions 0.9997, cycles 0.998, wall 0.989 (one noisy pair): neutral.
 - Next slices, in order. GC v2 first (`docs/gc_v2_design.md` §6.5, Y1:
   4 direct pointers (4a the collector's machinery behind a switch, 4b
   strings, then the other kinds); 5 handles removed).
