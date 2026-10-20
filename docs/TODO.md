@@ -6879,6 +6879,22 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   identical. A/B against `n3`: eight ABBA pairs, instructions 0.9847 (eight
   of eight), cycles 0.9845, wall 0.9847 (seven of eight). Kernel
   `small_calls` 726 -> 686 ms (3.13x Node).
+- Frame elision, round 2a: the needed slots come from a backward liveness
+  over the structured body (`NeedWalk`: an `if` joins its arms, a loop
+  iterates to the least fixpoint of `head = cond_body(after ∪ {cond} ∪
+  body(head))`, `break` / `continue` take the loop's exit and head sets,
+  `return` / `throw` end liveness) instead of the frame-layout walk's linear
+  ranges, so a value defined in both arms of a branch or carried around a
+  loop needs a slot only where it is live across a collection point. It
+  never needs a slot the walk did not (all 9,753 functions of the
+  compiler). Frames 9,120 -> 9,091, slots in all frames 58,054 -> 53,491,
+  frame pushes 360.7M -> 355.5M. Gates: unit, parity (362 identical),
+  bundler, selfconf, GC stress, inline policy, conformance 493/493 and
+  493/493 with a collection at every allocation in protect mode; tsc
+  rebuilt and compiled under protect mode, with zapping, and with a minor
+  collection every 256 allocations, its 78 output files identical. A/B
+  against round 1: eight ABBA pairs, instructions 0.9896 (eight of eight),
+  cycles 0.9896 (six of eight), wall 0.9909.
 - Where the remaining 358.7M frame pushes come from (a per-function count,
   joined with the rule under relaxations): a precise backward liveness
   would remove 1.4% (it never needs a slot the linear walk does not: checked
@@ -6896,7 +6912,7 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   `docs/gc_v2_design.md` §6.6.1: about 1-2% at most for a large refactor
   with silent-miscompile risk); handles stay. Back to the patterns slower
   than V8 (pattern kernels, worst native/node ratio first). Frame elision,
-  round 2: the precise liveness, lazy frames with calls (a spill set per
+  round 2: lazy frames with calls (a spill set per
   slow path, dead slots cleared), direct callees that never collect,
   non-allocating builtins and primitive comparisons; then measure how many
   calls of the remaining framed functions reach a point that needs the

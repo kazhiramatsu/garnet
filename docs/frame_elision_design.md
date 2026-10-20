@@ -23,20 +23,25 @@ happen while it holds a value that is read afterwards:
   code: everything but constants, copies, returns, jumps, globals, lengths,
   `!` / `typeof` / nullish tests, strict (in)equality, and arithmetic on
   unboxed operands (the set `body_is_gc_free` already accepts);
-- over the linear positions of the frame-layout walk (`LiveWalk`: the first
-  definition, the last use, a use inside a loop extended to the loop's end),
-  a local is live across a point strictly between its definition and its
-  last use;
-- a point at the last use counts too, unless that use passes the value to a
-  direct call of a generated function's direct entry (`direct_entry_eligible`:
-  not async, not a generator, no rest parameter, no `arguments`): the value
-  arrives as a C parameter and the callee's own rule gives the parameter a
-  slot when it needs one. Any other callee (the runtime, an indirect call, a
-  method set, a generic entry that gathers a rest array) may rely on the
-  caller's slot, as it does today;
-- a local the walk cannot place (used before its definition in linear order:
-  a value carried around a loop) needs a slot if the function has any
-  collection point.
+- liveness is a backward analysis over the structured body (`NeedWalk`):
+  an `if` joins its arms; a loop iterates to the least fixpoint of
+  `head = cond_body(after ∪ {cond} ∪ body(head))`; `break` and `continue`
+  take the live sets after the loop and at its head; `return` and `throw`
+  end liveness. A local live after a collection point (other than the value
+  the point defines) needs a slot;
+- a local the point reads needs one too, unless the point passes the value
+  to a direct call of a generated function's direct entry
+  (`direct_entry_eligible`: not async, not a generator, no rest parameter,
+  no `arguments`): the value arrives as a C parameter and the callee's own
+  rule gives the parameter a slot when it needs one. Any other callee (the
+  runtime, an indirect call, a method set, a generic entry that gathers a
+  rest array) may rely on the caller's slot, as it does today.
+
+The first round used the frame-layout walk's linear ranges (`LiveWalk`: the
+first definition, the last use, a use inside a loop extended to the loop's
+end; a local it cannot place needed a slot whenever the function had a
+collection point). The backward analysis never needs a slot the walk did
+not (checked on all 9,753 functions of the compiler).
 
 A function with no local needing a slot pushes no frame; its other
 reference locals are plain C locals. Unchanged (every reference local keeps
@@ -80,14 +85,16 @@ accumulator, and arguments evaluated around an allocation.
 On the compiler 668 of 9,788 frames disappear and the others lose slots;
 frame pushes fall from 390.8M to 360.7M per compile. Eight ABBA pairs
 against the previous build: instructions -1.53% (eight of eight), cycles
--1.55%, wall -1.5%. Kernel `small_calls` 726 -> 686 ms.
+-1.55%, wall -1.5%. Kernel `small_calls` 726 -> 686 ms. Round 2a (the
+backward liveness): frames 9,120 -> 9,091, slots 58,054 -> 53,491, pushes
+360.7M -> 355.5M; instructions -1.04% (eight of eight), cycles -1.04%.
 
 A per-function count of the remaining pushes, joined with the rule under
 relaxations, says where the rest is:
 
 | relaxation | pushes removed |
 |---|---|
-| precise backward liveness (never needs a slot the walk does not, on all 9,753 functions) | 1.4% |
+| precise backward liveness (round 2a, done) | 1.4% |
 | frames linked only around inline-cache slow paths when no other collection point has a live reference | 12.9% |
 | comparisons whose operands cannot be objects | 2.9% |
 | builtins that never allocate (upper bound: all builtins) | 6.5% |

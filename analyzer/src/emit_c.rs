@@ -1829,12 +1829,6 @@ struct LiveWalk {
     /// fused `typeof x === "lit"` compares (dst, lhs, rhs) -> x: the compare
     /// reads x, which must stay live (and keep its slot) until then.
     fused: BTreeMap<(u32, u32, u32), u32>,
-    /// Frame elision (docs/frame_elision_design.md): when `gc_numeric` is
-    /// set, the positions of the leaves that may collect, each with the
-    /// references it hands to a direct call that keeps them (None: none).
-    gc_numeric: Option<BTreeSet<u32>>,
-    gc_direct: BTreeSet<u32>,
-    gc_points: Vec<(u32, Option<Vec<u32>>)>,
 }
 
 impl LiveWalk {
@@ -1958,26 +1952,6 @@ impl LiveWalk {
                     self.stack.pop();
                 }
                 leaf => {
-                    if let Some(numeric) = &self.gc_numeric {
-                        if leaf_may_collect(leaf, numeric) {
-                            let kept = match leaf {
-                                Inst::Call {
-                                    callee: CalleeRef::Direct { func },
-                                    args,
-                                    recv,
-                                    ..
-                                } if self.gc_direct.contains(&func.0) => {
-                                    let mut v: Vec<u32> = args.iter().map(|a| a.0).collect();
-                                    if let Some(r) = recv {
-                                        v.push(r.0);
-                                    }
-                                    Some(v)
-                                }
-                                _ => None,
-                            };
-                            self.gc_points.push((p, kept));
-                        }
-                    }
                     if let Inst::BinOp { dst, lhs, rhs, .. } = leaf {
                         if let Some(&x) = self.fused.get(&(dst.0, lhs.0, rhs.0)) {
                             self.note_use(x, p);
@@ -2040,11 +2014,129 @@ fn leaf_may_collect(inst: &Inst, numeric: &BTreeSet<u32>) -> bool {
     }
 }
 
-/// The reference locals that need a frame slot (docs/frame_elision_design.md):
-/// those live across a collection point, or read at one that does not keep
-/// them (a direct call of a function in `direct` keeps the values it is
-/// passed), and, when the function has any collection point, those the walk
-/// cannot place (used before their definition in linear order).
+/// Backward liveness over the structured body (docs/frame_elision_design.md):
+/// collects the reference locals that need a frame slot, those live after a
+/// collection point (other than the value it defines) and those a collection
+/// point reads without keeping them (a direct call of a function in `direct`
+/// keeps the values it is passed).
+struct NeedWalk<'a> {
+    track: &'a BTreeSet<u32>,
+    numeric: &'a BTreeSet<u32>,
+    direct: &'a BTreeSet<u32>,
+    fused: BTreeMap<(u32, u32, u32), u32>,
+    /// per enclosing loop: (live after the loop, live at its head)
+    loops: Vec<(BTreeSet<u32>, BTreeSet<u32>)>,
+    needed: BTreeSet<u32>,
+}
+
+impl NeedWalk<'_> {
+    fn block(&mut self, body: &[Inst], mut live: BTreeSet<u32>) -> BTreeSet<u32> {
+        for inst in body.iter().rev() {
+            live = self.inst(inst, live);
+        }
+        live
+    }
+
+    /// The locals live before `inst`, given those live after it.
+    fn inst(&mut self, inst: &Inst, live: BTreeSet<u32>) -> BTreeSet<u32> {
+        match inst {
+            Inst::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                let mut l = self.block(then_body, live.clone());
+                l.extend(self.block(else_body, live));
+                if self.track.contains(&cond.0) {
+                    l.insert(cond.0);
+                }
+                l
+            }
+            Inst::Loop {
+                cond,
+                cond_body,
+                body,
+            } => {
+                // live at the head: the least fixpoint of
+                // head = cond_body(after ∪ {cond} ∪ body(head))
+                let mut head: BTreeSet<u32> = BTreeSet::new();
+                loop {
+                    self.loops.push((live.clone(), head.clone()));
+                    let mut next = self.block(body, head.clone());
+                    next.extend(live.iter().copied());
+                    if self.track.contains(&cond.0) {
+                        next.insert(cond.0);
+                    }
+                    let next = self.block(cond_body, next);
+                    self.loops.pop();
+                    if next.is_subset(&head) {
+                        return head;
+                    }
+                    head.extend(next);
+                }
+            }
+            Inst::TryCatch { .. } => {
+                // not analyzed: the caller keeps every slot of a function with a try
+                self.needed.extend(self.track.iter().copied());
+                live
+            }
+            Inst::Return { src } => src.iter().map(|v| v.0).filter(|v| self.track.contains(v)).collect(),
+            Inst::Break { up } => self.loops[self.loops.len() - 1 - *up as usize].0.clone(),
+            Inst::Continue { up } => self.loops[self.loops.len() - 1 - *up as usize].1.clone(),
+            leaf => {
+                let def = inst_def(leaf);
+                let refs = inst_refs(leaf);
+                let mut uses: Vec<u32> = refs.iter().copied().filter(|&r| Some(r) != def).collect();
+                if let Some(d) = def {
+                    if refs.iter().filter(|&&r| r == d).count() >= 2 {
+                        uses.push(d);
+                    }
+                }
+                if let Inst::BinOp { dst, lhs, rhs, .. } = leaf {
+                    if let Some(&x) = self.fused.get(&(dst.0, lhs.0, rhs.0)) {
+                        uses.push(x);
+                    }
+                }
+                let throws = matches!(leaf, Inst::Throw { .. });
+                if leaf_may_collect(leaf, self.numeric) {
+                    if !throws {
+                        for &x in &live {
+                            if Some(x) != def {
+                                self.needed.insert(x);
+                            }
+                        }
+                    }
+                    let kept: Vec<u32> = match leaf {
+                        Inst::Call {
+                            callee: CalleeRef::Direct { func },
+                            args,
+                            recv,
+                            ..
+                        } if self.direct.contains(&func.0) => args.iter().chain(recv.iter()).map(|a| a.0).collect(),
+                        _ => Vec::new(),
+                    };
+                    for &u in &uses {
+                        if self.track.contains(&u) && !kept.contains(&u) {
+                            self.needed.insert(u);
+                        }
+                    }
+                }
+                let mut out = if throws { BTreeSet::new() } else { live };
+                if let Some(d) = def {
+                    out.remove(&d);
+                }
+                for u in uses {
+                    if self.track.contains(&u) {
+                        out.insert(u);
+                    }
+                }
+                out
+            }
+        }
+    }
+}
+
+/// The reference locals among `reflike` that need a frame slot.
 fn frame_needed_locals(
     f: &Function,
     reflike: &[u32],
@@ -2052,57 +2144,17 @@ fn frame_needed_locals(
     fusion: &TypeofFusion,
     direct: &BTreeSet<u32>,
 ) -> BTreeSet<u32> {
-    let mut w = LiveWalk {
-        pos: 1,
-        parent: vec![0],
-        stack: vec![0],
-        loops: Vec::new(),
-        loop_stack: Vec::new(),
-        first: BTreeMap::new(),
-        last: BTreeMap::new(),
-        pending: Vec::new(),
+    let track: BTreeSet<u32> = reflike.iter().copied().collect();
+    let mut w = NeedWalk {
+        track: &track,
+        numeric,
+        direct,
         fused: fusion.fused.iter().map(|(k, (x, _, _))| (*k, *x)).collect(),
-        gc_numeric: Some(numeric.clone()),
-        gc_direct: direct.clone(),
-        gc_points: Vec::new(),
+        loops: Vec::new(),
+        needed: BTreeSet::new(),
     };
-    for prm in &f.params {
-        w.first.insert(prm.0, (0, Some(0)));
-        w.last.insert(prm.0, 0);
-    }
-    if let Some(r) = f.rest_param {
-        w.first.insert(r, (0, Some(0)));
-        w.last.insert(r, 0);
-    }
-    w.walk(&f.body);
-    let pending = std::mem::take(&mut w.pending);
-    for (id, li) in pending {
-        let end = w.loops[li].1;
-        w.touch_last(id, end);
-    }
-    let any = !w.gc_points.is_empty();
-    let mut needed = BTreeSet::new();
-    for &id in reflike {
-        let Some(&(fp, blk)) = w.first.get(&id) else { continue };
-        let lp = *w.last.get(&id).unwrap_or(&fp);
-        if blk.is_none() {
-            if any {
-                needed.insert(id);
-            }
-            continue;
-        }
-        for (g, kept) in &w.gc_points {
-            if *g > fp && *g < lp {
-                needed.insert(id);
-                break;
-            }
-            if *g == lp && lp > fp && !kept.as_ref().is_some_and(|k| k.contains(&id)) {
-                needed.insert(id);
-                break;
-            }
-        }
-    }
-    needed
+    w.block(&f.body, BTreeSet::new());
+    w.needed
 }
 
 fn body_has_try(body: &[Inst]) -> bool {
@@ -2170,9 +2222,6 @@ fn compute_frame_layout(f: &Function, reflike: &[u32], fusion: &TypeofFusion) ->
         last: BTreeMap::new(),
         pending: Vec::new(),
         fused: fusion.fused.iter().map(|(k, (x, _, _))| (*k, *x)).collect(),
-        gc_numeric: None,
-        gc_direct: BTreeSet::new(),
-        gc_points: Vec::new(),
     };
     for prm in &f.params {
         w.first.insert(prm.0, (0, Some(0)));
