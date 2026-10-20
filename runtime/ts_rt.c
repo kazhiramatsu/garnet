@@ -4732,8 +4732,23 @@ int ts_strict_eq_slow(tsv a, tsv b){
 /* JS relational comparison (< <= > >=). op: 0='<',1='<=',2='>',3='>='. Per spec
    (Abstract Relational Comparison): if both operands ToPrimitive to strings,
    compare lexicographically; otherwise compare ToNumber values (NaN -> false). */
-int ts_relational(tsv a, tsv b, int op){
-  if (ts_is_num(a) && ts_is_num(b)){   /* the common case first: no rooting, no ToPrimitive (NaN compares false) */
+/* Code-unit order of two strings: -1, 0 or 1. Two one-byte strings compare
+   with memcmp (their bytes are the code units). */
+static int str_view_compare(ts_strview x, ts_strview y){
+  uint32_t m = x.len < y.len ? x.len : y.len;
+  if (x.data && y.data && !((x.flags | y.flags) & TS_STR_FLAG_UTF16)){
+    int c = m ? memcmp(x.data, y.data, m) : 0;
+    if (c) return c < 0 ? -1 : 1;
+  } else {
+    for (uint32_t i = 0; i < m; i++){
+      uint16_t xc = ts_str_cu_at_view(x, i), yc = ts_str_cu_at_view(y, i);
+      if (xc != yc) return xc < yc ? -1 : 1;
+    }
+  }
+  return x.len < y.len ? -1 : (x.len > y.len ? 1 : 0);
+}
+int ts_relational_slow(tsv a, tsv b, int op){
+  if (ts_is_num(a) && ts_is_num(b)){   /* no rooting, no ToPrimitive (NaN compares false) */
     double na = ts_to_num(a), nb = ts_to_num(b);
     switch(op){ case 0: return na<nb; case 1: return na<=nb; case 2: return na>nb; default: return na>=nb; }
   }
@@ -4742,14 +4757,7 @@ int ts_relational(tsv a, tsv b, int op){
   tsv pb = (ts_object_like(b)&&!ts_is_symbol(b)) ? ts_to_primitive(b,0) : b;
   ts_gc_unroot(2);
   if (ts_is_str(pa) && ts_is_str(pb)){
-    ts_strview x=ts_str_view_typed(pa), y=ts_str_view_typed(pb);
-    uint32_t m = x.len<y.len ? x.len : y.len;
-    int c = 0;
-    for(uint32_t i=0;i<m;i++){
-      uint16_t xc=ts_str_cu_at_view(x,i), yc=ts_str_cu_at_view(y,i);
-      if (xc != yc){ c = xc < yc ? -1 : 1; break; }
-    }
-    if (c==0) c = (x.len<y.len)?-1:(x.len>y.len?1:0);
+    int c = str_view_compare(ts_str_view_typed(pa), ts_str_view_typed(pb));
     switch(op){ case 0: return c<0; case 1: return c<=0; case 2: return c>0; default: return c>=0; }
   }
   double na = ts_number_coerce(pa), nb = ts_number_coerce(pb);

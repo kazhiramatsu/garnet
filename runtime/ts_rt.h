@@ -1484,7 +1484,16 @@ TS_RT_ALWAYS_INLINE int ts_eq_strlit(tsv x, tsv lit, uint32_t len){
   if (ts_is_short_str(x)) return ts_short_str_len(x) == len && ts_strict_eq_str(x, lit);
   return 0;
 }
-int  ts_relational(tsv a, tsv b, int op);  /* 0:< 1:<= 2:> 3:>= */
+int  ts_relational_slow(tsv a, tsv b, int op);
+/* `<` `<=` `>` `>=` on boxed operands (op 0:< 1:<= 2:> 3:>=): two numbers in
+   line (NaN compares false), anything else out of line. */
+static inline int ts_relational(tsv a, tsv b, int op){
+  if (TS_RT_LIKELY(ts_is_num(a) && ts_is_num(b))){
+    double na = ts_to_num(a), nb = ts_to_num(b);
+    switch (op){ case 0: return na < nb; case 1: return na <= nb; case 2: return na > nb; default: return na >= nb; }
+  }
+  return ts_relational_slow(a, b, op);
+}
 int  ts_loose_eq(tsv a, tsv b);            /* == (returns 1/0) */
 int  ts_object_is(tsv a, tsv b);          /* Object.is SameValue */
 tsv  ts_to_string_v(tsv v);

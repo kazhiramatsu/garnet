@@ -6990,6 +6990,22 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   a minor collection every 256 allocations, its 78 output files identical.
   A/B against `lc`: eight ABBA pairs, instructions 0.9563 (eight of eight),
   cycles 0.9865 (seven of eight), wall 0.9853.
+- Relational operators on boxed operands: `ts_relational` (the `<`, `<=`,
+  `>`, `>=` of values not proven numbers, e.g. the checker's
+  `compareComparableValues`) was an out-of-line call even for two numbers.
+  It is now an inline wrapper in `ts_rt.h` that compares two numbers in
+  place and calls `ts_relational_slow` otherwise, and two one-byte strings
+  compare with memcmp instead of a branchy unit-by-unit loop
+  (`str_view_compare`). The emitted text is unchanged. Fixture
+  `operators/relational_strings` (one- and two-byte strings, views,
+  prefixes, NaN, mixed and object operands, a sort); known row: parity
+  (numeric specialization). Gates: unit, parity (366 identical), bundler,
+  selfconf, GC stress, inline policy, conformance 499/499 and 499/499 with
+  a collection at every allocation in protect mode; tsc rebuilt and
+  compiled under protect mode, with zapping, and with a minor collection
+  every 256 allocations, its 78 output files identical. A/B against `pt`:
+  eight ABBA pairs, instructions 0.9944 (eight of eight), cycles 0.9940
+  (seven of eight), wall 0.9925.
 - Where the remaining 358.7M frame pushes come from (a per-function count,
   joined with the rule under relaxations): a precise backward liveness
   would remove 1.4% (it never needs a slot the linear walk does not: checked
