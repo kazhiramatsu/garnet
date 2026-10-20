@@ -6404,6 +6404,26 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   Gates all green (parity: a known numeric-typing difference). A/B against
   `x66`, two rounds: 4.306 vs 4.363 s and 4.259 vs 4.304 s median, five of
   six pairs faster: about -1.2%. Node 3.27-3.40 s (1.30x).
+- RegExp replace through the string builder (build `x68`: `x67`'s compiler
+  relinked; `docs/string_accumulators_design.md`, last section). A profile
+  of a compile with emit put 1.9% in `toFileNameLowerCase`: RegExp `replace`
+  built its result by `ts_add` of a slice per piece (and per character of a
+  `$` replacement). The adapter now appends into one `ts_sb_*` builder
+  (`ts_sb_append_range` copies input units without a slice) and finishes it
+  once; the `$`-expansion loop re-reads the replacement's view after each
+  append (it was held across allocations). Fixture `regexp/replace_builder`
+  (also under GC stress). Gates all green (conformance 478/478). A/B
+  against `x67`, two rounds: 4.276 vs 4.360 s and 4.344 vs 4.361 s median,
+  four of six pairs about 2% faster, one equal, one outlier slower: about
+  -1%. Node 3.36 s (1.28-1.29x).
+  Profile notes (`x67`, a compile with emit, 3,812 samples): allocation and
+  collection about 8% self (marking 3.8%, the allocation fast path 1.4%,
+  mimalloc page setup for the pretenured cells 1.2%, freeing dead young
+  cells' payloads 1%); the emitter's `writeText` (`output += s` on a
+  captured variable, 1.4%, and `computeLineStarts` allocating an array per
+  written string); `charCodeAt` on views and UTF-16 strings through the
+  general path (1%); `firstOrUndefinedIterator`'s iterator steps (0.9%);
+  `getRelationKey`'s template concatenation (0.7%).
 - Next slices, in order. A slice that extends the stack or an arena to a
   new kind of allocation runs the conformance suite and a compile of the
   compiler under `--stack-check` (an arena must allocate through the

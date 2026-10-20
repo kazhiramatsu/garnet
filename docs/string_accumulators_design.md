@@ -74,3 +74,23 @@ early returns, short results that must compare equal to literals and work
 as Map keys, a disqualified local that is read between appends);
 conformance, GC stress, parity (old text under the knob); the compiler's
 A/B.
+
+## The RegExp replace builder (`x68`)
+
+`String.prototype.replace` with a RegExp built its result by `ts_add` of a
+slice string per piece (and, for `$` patterns, per character of the
+replacement), every piece a new string: the compiler's
+`toFileNameLowerCase` (`x.replace(fileNameLowerCaseRegExp, toLowerCase)` on
+every path with an upper-case letter) spent 1.9% of a compile with emit
+there. The adapter now builds the result in one builder
+(`ts_sb_new` / `ts_sb_append` / `ts_sb_append_range`, the units of a range
+of the input copied without a slice, `ts_sb_finish`). The `$`-expansion
+loop also re-reads the replacement's view after each append (an append can
+collect, and the view's data pointer is not a root). Fixture
+`regexp/replace_builder` (`$$`, `$&`, `` $` ``, `$'`, numbered and named
+groups, `$9` / `$0` literals, function replacers with indices, UTF-16
+inputs and replacements, long inputs, the compiler's `toFileNameLowerCase`
+in a loop; also under GC stress). A/B against `x67` (relinked runtime):
+4.276 vs 4.360 s and 4.344 vs 4.361 s median, four of six pairs 2% faster,
+one equal, one outlier slower: about -1%.
+

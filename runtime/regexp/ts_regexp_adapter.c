@@ -1112,12 +1112,11 @@ static tsv ts_regexp_build_indices_groups_result(const ts_regexp_span* captures,
   return groups;
 }
 
+/* `out` is a string builder (ts_sb_*, docs/string_accumulators_design.md):
+   the replace results are built in one buffer, no slice or intermediate
+   string per piece. */
 static tsv ts_regexp_adapter_append_slice(tsv out, tsv s, uint32_t start, uint32_t end){
-  tsv part = ts_regexp_adapter_slice(s, start, end);
-  ts_gc_root(&part);
-  out = ts_add(out, part);
-  ts_gc_unroot(1);
-  return out;
+  return ts_sb_append_range(out, s, start, end);
 }
 
 static tsv ts_regexp_adapter_expand_replacement(tsv input,
@@ -1130,20 +1129,18 @@ static tsv ts_regexp_adapter_expand_replacement(tsv input,
   ts_gc_root(&replacement);
   tsv rep = ts_is_str(replacement) ? replacement : ts_to_string_v(replacement);
   ts_gc_root(&rep);
-  tsv out = ts_new_string("", 0);
+  tsv out = ts_sb_new(ts_new_string("", 0));
   ts_gc_root(&out);
   ts_strview rv = ts_str_view_typed(rep);
   uint32_t input_len = ts_str_len_typed(input);
   uint32_t group_count = capture_count > 0 ? capture_count - 1u : 0u;
   for (uint32_t k = 0; k < rv.len; k++){
+    rv = ts_str_view_typed(rep);   /* an append may have collected: re-read the view */
     uint16_t cu = ts_str_cu_at_view(rv, k);
     if (cu == '$' && k + 1u < rv.len){
       uint16_t nx = ts_str_cu_at_view(rv, k + 1u);
       if (nx == '$'){
-        tsv dollar = ts_new_string("$", 1);
-        ts_gc_root(&dollar);
-        out = ts_add(out, dollar);
-        ts_gc_unroot(1);
+        out = ts_sb_append_range(out, rep, k, k + 1u);   /* `$$` -> `$` */
         k++;
         continue;
       }
@@ -1213,6 +1210,7 @@ static tsv ts_regexp_adapter_expand_replacement(tsv input,
     }
     out = ts_regexp_adapter_append_slice(out, rep, k, k + 1u);
   }
+  out = ts_sb_finish(out);
   ts_gc_unroot(4);
   return out;
 }
@@ -1286,7 +1284,7 @@ static tsv ts_regexp_adapter_replace_compiled(ts_regexp_compiled* compiled,
     ts_gc_unroot(object_re != TS_UNDEFINED ? 5 : 4);
     return ts_regexp_adapter_unsupported("RegExp replace out of memory");
   }
-  tsv out = ts_new_string("", 0);
+  tsv out = ts_sb_new(ts_new_string("", 0));
   ts_gc_root(&out);
   uint32_t next_source = 0;
   uint32_t search_index = start_index;
@@ -1305,7 +1303,7 @@ static tsv ts_regexp_adapter_replace_compiled(ts_regexp_compiled* compiled,
       ? ts_regexp_adapter_call_replacer(s, rep, captures, ncap, group_names)
       : ts_regexp_adapter_expand_replacement(s, rep, captures, ncap, group_names);
     ts_gc_root(&repl);
-    out = ts_add(out, repl);
+    out = ts_sb_append(out, repl);
     ts_gc_unroot(1);
     next_source = captures[0].end;
     if (object_re != TS_UNDEFINED && (flags & (TSAOT_REGEXP_FLAG_GLOBAL | TSAOT_REGEXP_FLAG_STICKY))){
@@ -1331,7 +1329,7 @@ static tsv ts_regexp_adapter_replace_compiled(ts_regexp_compiled* compiled,
     ts_regexp_adapter_set_last_index(object_re, 0.0);
   }
   free(captures);
-  tsv result = out;
+  tsv result = ts_sb_finish(out);
   ts_gc_unroot(object_re != TS_UNDEFINED ? 6 : 5);
   return result;
 }

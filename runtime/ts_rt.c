@@ -10824,6 +10824,38 @@ tsv ts_sb_append(tsv sb, tsv e){
   ts_gc_unroot(2);
   return sb;
 }
+/* Append units [start, end) of string `s` (no slice string). */
+tsv ts_sb_append_range(tsv sb, tsv s, uint32_t start, uint32_t end){
+  if (!ts_is_str(s) || end <= start) return sb_is_builder(sb) ? sb : sb_from_view_value(ts_is_str(sb) ? sb : ts_to_string_v(sb), 0, 0);
+  ts_gc_root(&sb); ts_gc_root(&s);
+  ts_strview y = ts_str_view_typed(s);
+  if (end > y.len) end = y.len;
+  if (start > end) start = end;
+  uint32_t add_len = end - start;
+  uint32_t add_utf16 = y.flags & TS_STR_FLAG_UTF16;
+  uint32_t add_ascii = (y.flags & TS_STR_FLAG_ASCII) ? 1 : 0;
+  if (!add_ascii && !add_utf16){
+    /* an 8-bit string that is not all ASCII: the range may still be ASCII,
+       but the flag is only a hint for fast paths; leave it off */
+  }
+  if (!sb_is_builder(sb)) sb = sb_from_view_value(ts_is_str(sb) ? sb : ts_to_string_v(sb), add_len, add_utf16);
+  ts_string* b = ts_str_ptr_typed(sb);
+  uint64_t n64 = (uint64_t)b->len + add_len;
+  if (n64 > UINT32_MAX / 2u){ ts_gc_unroot(2); fprintf(stderr, "tsaot: RangeError: concatenated string too large\n"); abort(); }
+  uint32_t n = (uint32_t)n64;
+  if (n > ts_string_storage_capacity(b) || (add_utf16 && !(b->flags & TS_STR_FLAG_UTF16))){
+    sb = sb_from_view_value(sb, add_len, add_utf16);
+    b = ts_str_ptr_typed(sb);
+  }
+  y = ts_str_view_typed(s);
+  ts_str_copy_units(b->data, b->flags, b->len, y, start, add_len);
+  b->len = n;
+  b->hash = 0;
+  if (!add_ascii && add_len) b->flags &= ~TS_STR_FLAG_ASCII;
+  ts_string_write_terminator(b, n);
+  ts_gc_unroot(2);
+  return sb;
+}
 double ts_sb_len(tsv sb){
   if (sb_is_builder(sb)) return (double)ts_str_ptr_typed(sb)->len;
   return (double)ts_str_len_typed(sb);

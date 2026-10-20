@@ -2031,6 +2031,7 @@ static inline void ts_array_set_inline(tsv arr, uint32_t i, tsv v){
    string a local appends into; each function also accepts an ordinary string. */
 tsv ts_sb_new(tsv init);
 tsv ts_sb_append(tsv sb, tsv e);
+tsv ts_sb_append_range(tsv sb, tsv s, uint32_t start, uint32_t end);
 double ts_sb_len(tsv sb);
 tsv ts_sb_finish(tsv sb);
 tsv ts_forof_open(tsv v);
