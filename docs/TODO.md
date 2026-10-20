@@ -6299,6 +6299,30 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   unported `uint16array.new` of the frozen pair). A/B against `x62`, two
   rounds of three alternating runs: 4.347 vs 4.424 s and 4.323 vs 4.397 s
   median, all six pairs faster: about -1.7%. Node 3.29-3.34 s (1.31x).
+- Exotic links on prototype chains, Reflect receivers (build `x64`, full
+  build; runtime, emitter; `docs/proxy_prototype_chain_design.md`). A
+  Proxy inside an ordinary object's prototype chain (`Object.create(new
+  Proxy(t, h))`) was read as an ordinary object by every chain walk: the
+  walk continued into the target through the proxy's `target` word (no
+  `get` / `has` / `set` / `getPrototypeOf` trap ran: `o.k` read the
+  target's `k`) and read map words past the proxy cell. Every walk (reads,
+  method values, `in`, OrdinarySet, `instanceof`, `isPrototypeOf`, the
+  struct-class test) now tests the link's kind once (`kind >=
+  TS_KIND_PROMISE`, never taken without such links): a proxy applies its
+  trap with the original receiver or continues on its target, a promise
+  continues on `Promise.prototype`; additions are not cached through such a
+  chain. The fixture surfaced two more defects: `Reflect.get` / `set` with a
+  receiver dropped it in the emitter (the set trap's `Reflect.set(t, k, v,
+  receiver)` wrote to the target; now `ts_reflect_get_recv` /
+  `ts_reflect_set_recv`, OrdinarySet with a receiver, `TSAOT_REFLECT_RECEIVER`),
+  and the inline-cache probe read a proxy receiver's shape word past its
+  56-byte cell (ASan; proxy cells now take an object header's size,
+  zero-filled). Fixtures `objects/proxy_prototypes` and
+  `objects/reflect_receiver` (also under GC stress); without the receiver
+  the latter printed wrong values and died of an uncaught TypeError. Gates
+  all green (selfconf: both fixtures are known frozen-emitter differences).
+  A/B against `x63`, two rounds: 4.305 vs 4.323 s and 4.354 vs 4.373 s
+  median: neutral. Node 3.29-3.32 s (1.31x).
 - Next slices, in order. A slice that extends the stack or an arena to a
   new kind of allocation runs the conformance suite and a compile of the
   compiler under `--stack-check` (an arena must allocate through the

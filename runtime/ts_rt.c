@@ -973,6 +973,15 @@ static int ts_proxy_delete_v(tsv pv, tsv keyv);
 static tsv ts_proxy_own_keys_arr(tsv pv);
 static tsv ts_proxy_get_proto(tsv pv);
 static tsv ts_proxy_set_proto(tsv pv, tsv proto);
+/* Exotic links on a prototype chain (docs/proxy_prototype_chain_design.md):
+   promise, coroutine and proxy cells do not begin with the common object
+   header, so a chain walk tests a link's kind once and hands such a link to
+   these instead of reading it as an object. */
+#define chain_link_exotic(p) TS_RT_UNLIKELY((p)->h.kind >= TS_KIND_PROMISE)
+static int chain_exotic_get(ts_object* p, ts_key key, tsv receiver, tsv* out, ts_object** next);
+static int chain_exotic_has(ts_object* p, ts_key key, int* res, ts_object** next);
+static int chain_exotic_set(ts_object* p, ts_key key, tsv receiver, tsv val, ts_object** next);
+static tsv chain_exotic_proto(tsv link);
 static int ts_proxy_is_extensible(tsv pv);
 static void ts_proxy_prevent_extensions(tsv pv);
 static tsv ts_proxy_get_own_desc(tsv pv, tsv keyv);
@@ -2062,6 +2071,12 @@ static tsv* find_slot(ts_object* o, ts_key key, int create){
 }
 static int lookup_prop_chain(tsv receiver, ts_object* o, ts_key key, tsv* out){
   while (o){
+    if (chain_link_exotic(o)){
+      ts_object* next;
+      if (chain_exotic_get(o, key, receiver, out, &next)) return 1;
+      o = next;
+      continue;
+    }
     tsv* s = find_slot(o, key, 0);
     if (s){
       if (is_accessor(*s)){
@@ -2083,6 +2098,12 @@ static int lookup_prop_chain(tsv receiver, ts_object* o, ts_key key, tsv* out){
 }
 static int lookup_prop_chain_until(tsv receiver, ts_object* o, ts_object* stop, ts_key key, tsv* out){
   while (o && o != stop){
+    if (chain_link_exotic(o)){
+      ts_object* next;
+      if (chain_exotic_get(o, key, receiver, out, &next)) return 1;
+      o = next;
+      continue;
+    }
     tsv* s = find_slot(o, key, 0);
     if (s){
       if (is_accessor(*s)){
@@ -2212,20 +2233,20 @@ tsv ts_get(tsv obj, ts_key key){
   if (ts_is_str(obj)){
     tsv own;
     if (ts_string_own_prop(obj, key, &own)) return own;
-    ts_object* p = ts_proto_ptr(g_string_proto_v);
-    while (p){ tsv* s = find_slot(p, key, 0); if (s) return *s; p = ts_next_proto(p); }
+    tsv found;
+    if (lookup_prop_chain(obj, ts_proto_ptr(g_string_proto_v), key, &found)) return found;
     return TS_UNDEFINED;
   }
   /* Same primitive-dispatch path for numbers: a method call on an any-typed value
      holding a number (`(x as any).toFixed(2)`) resolves via Number.prototype. */
   if (ts_is_num(obj)){
-    ts_object* p = ts_proto_ptr(g_number_proto_v);
-    while (p){ tsv* s = find_slot(p, key, 0); if (s) return *s; p = ts_next_proto(p); }
+    tsv found;
+    if (lookup_prop_chain(obj, ts_proto_ptr(g_number_proto_v), key, &found)) return found;
     return TS_UNDEFINED;
   }
   if (ts_is_bool(obj)){
-    ts_object* p = ts_proto_ptr(g_boolean_proto_v);
-    while (p){ tsv* s = find_slot(p, key, 0); if (s) return *s; p = ts_next_proto(p); }
+    tsv found;
+    if (lookup_prop_chain(obj, ts_proto_ptr(g_boolean_proto_v), key, &found)) return found;
     return TS_UNDEFINED;
   }
   /* functions: `fn.name` / `fn.length` derive from the boxed metadata (not the
@@ -2257,7 +2278,8 @@ tsv ts_get(tsv obj, ts_key key){
      no common header / proto field, so it is dispatched here by kind, like a
      primitive string/number. No own data properties exist on a promise. */
   if (ts_is_promise(obj)){
-    for (ts_object* p = ts_proto_ptr(g_promise_proto_v); p; p = ts_next_proto(p)){ tsv* s = find_slot(p, key, 0); if (s) return *s; }
+    tsv found;
+    if (lookup_prop_chain(obj, ts_proto_ptr(g_promise_proto_v), key, &found)) return found;
     return TS_UNDEFINED;
   }
   if (!ts_is_propbag(obj)) return TS_UNDEFINED;
@@ -2305,9 +2327,16 @@ tsv ts_get_method_value(tsv recv, uint32_t field_key, uint32_t method_key){
   if (ts_is_propbag(recv)){
     ts_object* o = ts_ptr(recv);
     if (kind_has_common_header(o->h.kind)){
-      for (ts_object* p=o; p; p=ts_next_proto(p)){      /* own + inherited data props (field key) */
+      for (ts_object* p=o; p; ){                   /* own + inherited data props (field key) */
+        if (chain_link_exotic(p)){
+          tsv out; ts_object* next;
+          if (chain_exotic_get(p, field_key, recv, &out, &next)) return out;
+          p = next;
+          continue;
+        }
         tsv* s = find_slot(p, field_key, 0);
         if (s) return *s;                        /* present (any type, incl. undefined) wins */
+        p = ts_next_proto(p);
       }
     }
   }
@@ -2409,7 +2438,20 @@ static ts_pref ts_set_named_prop(tsv obj, ts_object* o, ts_key key, tsv val,
      (this=obj); a read-only data property (its own attribute, or a frozen
      holder) rejects the write (OrdinarySet: strict mode throws); a writable
      one lets the receiver create its own property. */
-  for (ts_object* p=ts_next_proto(o); p; p=ts_next_proto(p)){
+  for (ts_object* p=ts_next_proto(o); p; ){
+    if (chain_link_exotic(p)){
+      /* a proxy's [[Set]] with this receiver (its set trap decides), or the
+         ordinary set going on at its target; the trap or a getter of the
+         handler may collect, so the receiver is re-read afterwards */
+      ts_object* next;
+      ts_gc_root(&obj); ts_gc_root(&val);
+      int done = chain_exotic_set(p, key, obj, val, &next);
+      ts_gc_unroot(2);
+      o = (ts_object*)ts_ptr(obj);
+      if (done) return PREF_NONE;
+      p = next;
+      continue;
+    }
     tsv* s=find_slot(p,key,0);
     if (s){
       if (is_accessor(*s)){
@@ -2422,6 +2464,7 @@ static ts_pref ts_set_named_prop(tsv obj, ts_object* o, ts_key key, tsv val,
       }
       break;   /* inherited writable data property: create an own data prop */
     }
+    p = ts_next_proto(p);
   }
   /* 3) create an own data property — strict: throw on a non-extensible object
      (frozen bit0 / preventExtensions bit1 / sealed bit2). */
@@ -9441,6 +9484,7 @@ static int proto_chain_has_struct_class(tsv proto){
   for (int depth = 0; depth < 64 && ts_proto_ref(proto); depth++){
     ts_class_reg* reg = class_reg_for_proto(proto);
     if (reg && reg->min_size > sizeof(ts_object)) return 1;
+    if (chain_link_exotic((ts_object*)ts_ptr(proto))) return 0;
     proto = ((ts_object*)ts_ptr(proto))->proto;
   }
   return 0;
@@ -9738,7 +9782,16 @@ int ts_instanceof(tsv obj, tsv target_proto){
   /* start from obj's own prototype (an instance is not its own prototype). */
   for (tsv p = o->proto; ts_proto_ref(p); ){
     if (p == target_proto || ts_same_cell(p, target_proto)) return 1;
-    p = ((ts_object*)ts_ptr(p))->proto;
+    ts_object* link = (ts_object*)ts_ptr(p);
+    if (chain_link_exotic(link)){
+      /* the link's [[GetPrototypeOf]] (a proxy's trap may collect: the walk
+         holds values only) */
+      ts_gc_root(&target_proto);
+      p = chain_exotic_proto(p);
+      ts_gc_unroot(1);
+      continue;
+    }
+    p = link->proto;
   }
   return 0;
 }
@@ -10753,9 +10806,16 @@ int ts_has_prop(tsv obj, ts_key key){
   if (ts_is_func(obj)){
     if (field_name_is(key, "length") || field_name_is(key, "name")) return 1;
     if (is_function_proto_name(key)) return 1;   /* call/apply/bind (METHOD-keyed) */
-    for (ts_object* p = ts_ptr(obj); p; p = ts_next_proto(p)){
+    for (ts_object* p = ts_ptr(obj); p; ){
+      if (chain_link_exotic(p)){
+        int res; ts_object* next;
+        if (chain_exotic_has(p, key, &res, &next)) return res;
+        p = next;
+        continue;
+      }
       if (find_slot(p, key, 0)) return 1;
       if (p == ts_proto_ptr(g_object_proto_v) && is_object_proto_name(key)) return 1;
+      p = ts_next_proto(p);
     }
     return 0;
   }
@@ -10776,6 +10836,12 @@ int ts_has_prop(tsv obj, ts_key key){
      class descriptor (covers the full inherited field chain). */
   if (class_has_field(o, key)) return 1;
   while (o){
+    if (chain_link_exotic(o)){
+      int res; ts_object* next;
+      if (chain_exotic_has(o, key, &res, &next)) return res;
+      o = next;
+      continue;
+    }
     if (find_slot(o,key,0)) return 1;
     /* reaching Object.prototype: the well-known methods (stored under method
        keys) count as inherited properties for the `in` operator. */
@@ -11318,11 +11384,15 @@ tsv ts_objproto_isPrototypeOf(tsv* args, int n){
   if (!kind_has_common_header(((ts_gc_header*)ts_ptr(self))->kind) ||
       !kind_has_common_header(((ts_gc_header*)ts_ptr(value))->kind)) return ts_bool(0);
   tsv cur = ((ts_object*)ts_ptr(value))->proto;
+  ts_gc_root(&self);
   while (ts_proto_ref(cur)){
-    if (cur == self || ts_same_cell(cur, self)) return ts_bool(1);
-    if (!kind_has_common_header(((ts_gc_header*)ts_ptr(cur))->kind)) break;
-    cur = ((ts_object*)ts_ptr(cur))->proto;
+    if (cur == self || ts_same_cell(cur, self)){ ts_gc_unroot(1); return ts_bool(1); }
+    ts_object* link = (ts_object*)ts_ptr(cur);
+    if (chain_link_exotic(link)){ cur = chain_exotic_proto(cur); continue; }
+    if (!kind_has_common_header(link->h.kind)) break;
+    cur = link->proto;
   }
+  ts_gc_unroot(1);
   return ts_bool(0);
 }
 /* o.propertyIsEnumerable(k): own property exists and its enumerable flag is true.
@@ -12071,6 +12141,7 @@ static void prop_add_fill(ts_prop_ic* ic, ts_object* o, ts_key key, ts_pref p,
   if ((shape_before & TS_SHAPE_MAX) == TS_SHAPE_NONE || (shape_before >> 29) != 0) return;
   if (ts_obj_shape_id(o) == TS_SHAPE_NONE || ts_obj_integrity(o) != 0) return;
   if (o->len != len_before + 1u || p.i != len_before) return;
+  for (ts_object* q = ts_next_proto(o); q; q = ts_next_proto(q)) if (chain_link_exotic(q)) return;
   /* Only old prototypes are remembered: their handles stay bound to the same
      cell until a full collection, which bumps the epoch. A young prototype's
      handle could be recycled by a minor collection. */
@@ -12385,6 +12456,98 @@ void ts_set_dyn_pic(tsv obj, tsv keyv, tsv v, ts_prop_ic* ic){
    returns the object or throws. */
 tsv ts_reflect_has(tsv t, tsv k){ return ts_bool(ts_has_prop_dyn(t, k)); }
 tsv ts_reflect_set(tsv t, tsv k, tsv v){ ts_set_dyn(t, k, v); return ts_bool(1); }
+/* Reflect.get(t, k, receiver): t.[[Get]](k, receiver) — a getter found on t's
+   chain runs with the receiver as `this`. A plain-object target walks its
+   chain with the receiver (exotic links included); other targets, and a
+   receiver that is the target itself, keep the ordinary read. */
+tsv ts_reflect_get_recv(tsv t, tsv k, tsv r){
+  if (r == t || !ts_is_obj(t) || ts_same_cell(r, t)) return ts_get_dyn(t, k);
+  if (g_has_proxies && ts_is_proxy(t)) return ts_proxy_get_v(t, k, r);
+  if (((ts_gc_header*)ts_ptr(t))->kind != TS_KIND_OBJECT) return ts_get_dyn(t, k);
+  ts_gc_root(&t); ts_gc_root(&r);
+  ts_key key;
+  tsv out = TS_UNDEFINED;
+  if (ts_key_from_value(k, &key)){
+    ts_object* o = (ts_object*)ts_ptr(t);
+    size_t off; int numeric;
+    if (g_has_class_regs && class_field_lookup(o, key, &off, &numeric)) out = struct_field_get(o, off, numeric);
+    else if (!lookup_prop_chain(r, o, key, &out)) out = TS_UNDEFINED;
+  }
+  ts_gc_unroot(2);
+  return out;
+}
+/* Reflect.set(t, k, v, receiver): OrdinarySet(t, k, v, receiver) for a
+   plain-object target. Along t's chain: a setter runs with the receiver as
+   `this`, a read-only data property fails, a proxy link applies its [[Set]]
+   with the receiver; a writable data property or none at all leaves the
+   write to the receiver, which takes it as its own writable data property
+   (an own accessor or read-only property, or a non-extensible receiver,
+   fails). Returns the success flag, as Reflect does (no throw). */
+static int ordinary_set_recv(tsv t, ts_key key, tsv v, tsv r){
+  ts_gc_root(&t); ts_gc_root(&v); ts_gc_root(&r);
+  int ok = 1;
+  ts_object* p = (ts_object*)ts_ptr(t);
+  if (!class_has_field(p, key)){
+    while (p){
+      if (chain_link_exotic(p)){
+        if (p->h.kind == TS_KIND_PROXY){
+          tsv pv = ts_obj(p);
+          ts_gc_root(&pv);
+          tsv keyv = ts_key_to_value(key);
+          ok = ts_proxy_set_v(pv, keyv, v, r);
+          ts_gc_unroot(1);
+          goto done;
+        }
+        p = p->h.kind == TS_KIND_PROMISE ? ts_proto_ptr(g_promise_proto_v) : NULL;
+        continue;
+      }
+      tsv* s = find_slot(p, key, 0);
+      if (s){
+        if (is_accessor(*s)){
+          ts_accessor* ac = (ts_accessor*)ts_ptr(*s);
+          if (!ts_is_func(ac->setter)){ ok = 0; goto done; }
+          if (ac->s_this){ tsv a[2] = { r, v }; ts_call(ac->setter, a, 2); }
+          else { tsv a0 = v; ts_call(ac->setter, &a0, 1); }
+          goto done;
+        }
+        ts_pref ip = prop_find(p, key);
+        if ((ts_obj_integrity(p) & 1u) || (pref_ok(ip) && !pref_is_writable(ip))){ ok = 0; goto done; }
+        break;
+      }
+      p = ts_next_proto(p);
+    }
+  }
+  /* the receiver's part */
+  if (!ts_is_propbag(r)){ ok = 0; goto done; }
+  if (g_has_proxies && ts_is_proxy(r)){ ts_set_dyn(r, ts_key_to_value(key), v); goto done; }
+  {
+    ts_object* ro = (ts_object*)ts_ptr(r);
+    if (kind_has_common_header(ro->h.kind) && (class_has_field(ro, key) || find_slot(ro, key, 0))){
+      if (!class_has_field(ro, key)){
+        ts_pref own = prop_find(ro, key);
+        if (pref_ok(own) && (pref_is_accessor(own) || !pref_is_writable(own) || (ts_obj_integrity(ro) & 1u))){ ok = 0; goto done; }
+      }
+      ts_set(r, key, v);          /* an own writable data property: no chain walk */
+    } else if (!kind_has_common_header(ro->h.kind) || (ts_obj_integrity(ro) & (1u|2u|4u))){
+      ok = 0;
+    } else {
+      ts_define_data(r, key, v, 1, 1, 1);
+    }
+  }
+done:
+  ts_gc_unroot(3);
+  return ok;
+}
+tsv ts_reflect_set_recv(tsv t, tsv k, tsv v, tsv r){
+  if (r == t || !ts_is_obj(t) || ts_same_cell(r, t)) return ts_reflect_set(t, k, v);
+  if (g_has_proxies && ts_is_proxy(t)) return ts_bool(ts_proxy_set_v(t, k, v, r));
+  if (((ts_gc_header*)ts_ptr(t))->kind != TS_KIND_OBJECT) return ts_reflect_set(t, k, v);
+  ts_gc_root(&t); ts_gc_root(&v); ts_gc_root(&r);
+  ts_key key;
+  int ok = ts_key_from_value(k, &key) ? ordinary_set_recv(t, key, v, r) : 0;
+  ts_gc_unroot(3);
+  return ts_bool(ok);
+}
 tsv ts_reflect_delete(tsv t, tsv k){
   ts_gc_root(&t);
   ts_key key; int ok = ts_key_from_value(k, &key);
@@ -12478,7 +12641,11 @@ tsv ts_proxy_new(tsv target, tsv handler){
   if (!ts_is_propbag(target) || !ts_is_propbag(handler))
     ts_throw_type_error("Cannot create proxy with a non-object as target or handler");
   ts_gc_root(&target); ts_gc_root(&handler);
-  ts_proxy* px = (ts_proxy*)gc_alloc(sizeof(ts_proxy), TS_KIND_PROXY);
+  /* At least an object header's size, zero-filled: inline probes read a
+     receiver's shape word before they test its kind, and a proxy cell must
+     answer with shape 0 (no cached layout) instead of bytes past its end. */
+  size_t sz = sizeof(ts_proxy) < sizeof(ts_object) ? sizeof(ts_object) : sizeof(ts_proxy);
+  ts_proxy* px = (ts_proxy*)gc_alloc(sz, TS_KIND_PROXY);
   px->target = target; px->handler = handler; px->revoked = 0;
   tsv pv = ts_obj(px);
   ts_write_barrier(pv, target); ts_write_barrier(pv, handler);
@@ -12533,7 +12700,11 @@ static tsv ts_proxy_get_v(tsv pv, tsv keyv, tsv receiver){
   tsv target = px->target, handler = px->handler;
   ts_gc_root(&target); ts_gc_root(&handler);
   tsv trap = ts_proxy_trap(pv, handler, "get");
-  if (ts_is_undef(trap)){ tsv r = ts_get_dyn(target, keyv); ts_gc_unroot(5); return r; }
+  if (ts_is_undef(trap)){
+    /* the target's [[Get]] with the receiver (a getter there sees it) */
+    tsv r = (receiver == pv) ? ts_get_dyn(target, keyv) : ts_reflect_get_recv(target, keyv, receiver);
+    ts_gc_unroot(5); return r;
+  }
   ts_gc_root(&trap);
   tsv argv[3] = { target, keyv, receiver };
   tsv result = invoke_with_this(trap, handler, argv, 3);
@@ -12563,7 +12734,14 @@ static int ts_proxy_set_v(tsv pv, tsv keyv, tsv value, tsv receiver){
   tsv target = px->target, handler = px->handler;
   ts_gc_root(&target); ts_gc_root(&handler);
   tsv trap = ts_proxy_trap(pv, handler, "set");
-  if (ts_is_undef(trap)){ ts_set_dyn(target, keyv, value); ts_gc_unroot(6); return 1; }
+  if (ts_is_undef(trap)){
+    /* the target's [[Set]] with the receiver: a write through the proxy
+       itself lands on the target, a foreign receiver takes its own property */
+    int ok = 1;
+    if (receiver == pv) ts_set_dyn(target, keyv, value);
+    else ok = ts_truthy(ts_reflect_set_recv(target, keyv, value, receiver));
+    ts_gc_unroot(6); return ok;
+  }
   ts_gc_root(&trap);
   tsv argv[4] = { target, keyv, value, receiver };
   tsv res = invoke_with_this(trap, handler, argv, 4);
@@ -12648,6 +12826,87 @@ static tsv ts_proxy_get_proto(tsv pv){
   }
   ts_gc_unroot(4);
   return r;
+}
+/* ---- exotic links on a prototype chain (docs/proxy_prototype_chain_design.md) ---- */
+/* [[Get]] reaching the exotic link `p` of `receiver`'s chain: 1 when the link
+   answered (*out: the get trap with the original receiver); 0 to go on at
+   *next: a proxy without a get trap continues on its target (a getter there
+   sees the receiver), a promise on Promise.prototype, anything else ends. */
+static int chain_exotic_get(ts_object* p, ts_key key, tsv receiver, tsv* out, ts_object** next){
+  if (p->h.kind == TS_KIND_PROMISE){ *next = ts_proto_ptr(g_promise_proto_v); return 0; }
+  if (p->h.kind != TS_KIND_PROXY){ *next = NULL; return 0; }
+  tsv pv = ts_obj(p);
+  tsv handler = ((ts_proxy*)p)->handler;
+  ts_gc_root(&pv); ts_gc_root(&receiver); ts_gc_root(&handler);
+  tsv trap = ts_proxy_trap(pv, handler, "get");     /* throws on a revoked proxy */
+  if (ts_is_undef(trap)){
+    *next = ts_proto_ptr(((ts_proxy*)ts_ptr(pv))->target);
+    ts_gc_unroot(3);
+    return 0;
+  }
+  ts_gc_root(&trap);
+  tsv keyv = ts_key_to_value(key); ts_gc_root(&keyv);
+  tsv target = ((ts_proxy*)ts_ptr(pv))->target; ts_gc_root(&target);
+  tsv argv[3] = { target, keyv, receiver };
+  tsv result = invoke_with_this(trap, handler, argv, 3);
+  ts_gc_root(&result);
+  proxy_inv_get(target, keyv, result);
+  *out = result;
+  ts_gc_unroot(7);
+  return 1;
+}
+/* [[HasProperty]] at an exotic link: 1 when decided (*res: the has trap, or
+   the target's own chain), 0 to go on at *next. */
+static int chain_exotic_has(ts_object* p, ts_key key, int* res, ts_object** next){
+  if (p->h.kind == TS_KIND_PROMISE){ *next = ts_proto_ptr(g_promise_proto_v); return 0; }
+  if (p->h.kind != TS_KIND_PROXY){ *next = NULL; return 0; }
+  tsv pv = ts_obj(p);
+  ts_gc_root(&pv);
+  tsv keyv = ts_key_to_value(key);
+  *res = ts_proxy_has_v(pv, keyv);
+  ts_gc_unroot(1);
+  return 1;
+}
+/* [[Set]] at an exotic link of `receiver`'s chain: 1 when the link decided
+   (the set trap ran with the receiver; a falsish answer is the strict-mode
+   TypeError), 0 to go on at *next: a proxy without a set trap continues the
+   ordinary set on its target (which ends in a setter called on the receiver,
+   a read-only rejection, or an own property of the receiver). */
+static int chain_exotic_set(ts_object* p, ts_key key, tsv receiver, tsv val, ts_object** next){
+  if (p->h.kind == TS_KIND_PROMISE){ *next = ts_proto_ptr(g_promise_proto_v); return 0; }
+  if (p->h.kind != TS_KIND_PROXY){ *next = NULL; return 0; }
+  tsv pv = ts_obj(p);
+  tsv handler = ((ts_proxy*)p)->handler;
+  ts_gc_root(&pv); ts_gc_root(&receiver); ts_gc_root(&val); ts_gc_root(&handler);
+  tsv trap = ts_proxy_trap(pv, handler, "set");     /* throws on a revoked proxy */
+  if (ts_is_undef(trap)){
+    *next = ts_proto_ptr(((ts_proxy*)ts_ptr(pv))->target);
+    ts_gc_unroot(4);
+    return 0;
+  }
+  ts_gc_root(&trap);
+  tsv keyv = ts_key_to_value(key); ts_gc_root(&keyv);
+  tsv target = ((ts_proxy*)ts_ptr(pv))->target; ts_gc_root(&target);
+  tsv argv[4] = { target, keyv, val, receiver };
+  int ok = ts_truthy(invoke_with_this(trap, handler, argv, 4));
+  if (!ok){
+    const char* nm = ts_field_name(key);
+    char buf[256];
+    snprintf(buf, sizeof(buf), "'set' on proxy: trap returned falsish for property '%s'", nm ? nm : "?");
+    ts_throw_type_error_msg(buf);
+  }
+  proxy_inv_set(target, keyv, val);
+  ts_gc_unroot(7);
+  return 1;
+}
+/* The link after the exotic one `link` for a walk by [[GetPrototypeOf]]
+   (instanceof, isPrototypeOf): a proxy's getPrototypeOf trap or its target's
+   prototype, Promise.prototype after a promise, null after anything else. */
+static tsv chain_exotic_proto(tsv link){
+  uint8_t kind = ((ts_gc_header*)ts_ptr(link))->kind;
+  if (kind == TS_KIND_PROXY) return ts_proxy_get_proto(link);
+  if (kind == TS_KIND_PROMISE) return ts_proto_ref(g_promise_proto_v) ? g_promise_proto_v : TS_NULL;
+  return TS_NULL;
 }
 static tsv ts_proxy_set_proto(tsv pv, tsv proto){
   ts_gc_root(&pv); ts_gc_root(&proto);

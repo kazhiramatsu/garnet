@@ -1257,6 +1257,8 @@ void   ts_set_dyn_pic(tsv obj, tsv keyv, tsv v, ts_prop_ic* ic);
 /* Reflect.* wrappers (return booleans where the spec does). */
 tsv    ts_reflect_has(tsv t, tsv k);
 tsv    ts_reflect_set(tsv t, tsv k, tsv v);
+tsv    ts_reflect_get_recv(tsv t, tsv k, tsv receiver);
+tsv    ts_reflect_set_recv(tsv t, tsv k, tsv v, tsv receiver);
 tsv    ts_reflect_delete(tsv t, tsv k);
 tsv    ts_reflect_set_proto(tsv t, tsv p);
 tsv    ts_reflect_define_property(tsv t, tsv k, tsv d);

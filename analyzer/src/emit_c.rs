@@ -2709,6 +2709,19 @@ fn lazy_frames_enabled() -> bool {
 /// them only before a linked slow call and they are reloaded after, so the
 /// fast path touches no frame and a helper's body can stay a leaf.
 /// TSAOT_LAZY_HOMES=0 keeps the frame slots as the locals' homes.
+/// `Reflect.get(t, k, receiver)` / `Reflect.set(t, k, v, receiver)` pass the
+/// receiver (getters and setters on t's chain see it; a set lands on it).
+/// TSAOT_REFLECT_RECEIVER=0 keeps the receiver-less calls (the parity oracle).
+fn reflect_receiver_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_REFLECT_RECEIVER").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
 fn lazy_homes_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -17865,7 +17878,9 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 // Reflect.* — thin wrappers over the dynamic property / call /
                 // construct runtime (Reflect.get(t,k[,recv]) ignores receiver in
                 // v1, matching the common non-proxy / non-accessor case).
+                "reflect.get" if args.len() == 3 && reflect_receiver_enabled() => (format!("ts_reflect_get_recv({}, {}, {})", v(0), v(1), v(2)), false),
                 "reflect.get" => (format!("ts_get_dyn({}, {})", v(0), v(1)), false),
+                "reflect.set" if args.len() == 4 && reflect_receiver_enabled() => (format!("ts_reflect_set_recv({}, {}, {}, {})", v(0), v(1), v(2), v(3)), false),
                 "reflect.set" => (format!("ts_reflect_set({}, {}, {})", v(0), v(1), v(2)), false),
                 "reflect.has" => (format!("ts_reflect_has({}, {})", v(0), v(1)), false),
                 "reflect.deleteProperty" => (format!("ts_reflect_delete({}, {})", v(0), v(1)), false),

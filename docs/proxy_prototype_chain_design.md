@@ -44,6 +44,31 @@ same out-of-cell reads.
   already accept only plain-object links, and an addition is no longer
   cached when the receiver's chain holds such a link (a `set` trap added to
   the handler later must still run).
+- **Reflect with a receiver.** The canonical trap body `Reflect.set(t, k,
+  v, receiver)` was lowered without its receiver (`ts_reflect_set(t, k,
+  v)`), so the write landed on the target instead of the receiver, and
+  `Reflect.get(t, k, receiver)` ran a getter on the target with the target
+  as `this` (`ts_get_dyn(t, k)`). `ts_reflect_get_recv` walks a plain-object
+  target's chain with the receiver; `ts_reflect_set_recv` is OrdinarySet
+  with a receiver (a setter on the chain runs on the receiver, a read-only
+  property or an own accessor of the receiver fails with `false`, a
+  non-extensible receiver refuses a new property, otherwise the receiver
+  takes its own data property). A trap-less proxy hands a foreign receiver
+  to the same functions. `TSAOT_REFLECT_RECEIVER=0` keeps the old calls for
+  the parity oracle.
+- **The proxy cell's size.** The inline-cache probe reads a receiver's
+  shape word before testing its kind; a proxy cell (56 bytes) is shorter
+  than an object header (72), so a proxy receiver at a cached read site
+  read past its cell (ASan, the new fixture under GC stress). A proxy is
+  now allocated at least an object header's size, zero-filled: its shape
+  word reads 0, no cached layout. Promise and coroutine cells are larger
+  already.
+
+## Results
+
+Gates all green; the compiler's A/B against `x63`: neutral (4.305 vs 4.323
+s and 4.354 vs 4.373 s median; the compiler creates no proxies, the new
+branch per chain link is never taken).
 
 ## Gates
 
