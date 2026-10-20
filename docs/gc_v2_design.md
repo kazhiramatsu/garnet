@@ -629,6 +629,116 @@ wall 0.988 (eight of eight pairs; three noisy pairs, the quiet ones about
 -0.7%), cycles 0.989, instructions 0.9998: the chunks of one contiguous
 range instead of `posix_memalign` blocks.
 
+## 6.6 Step 4 design: direct references to young cells
+
+A young cell of a *direct* kind is referenced by its address, the pointer
+form an old cell already has (bit 0 clear, bit 47 clear), and has no handle
+(`h->handle == 0`). For the pointer form, young and old are told apart by
+`gc_in_nursery(p)` (step 3), without a load from the cell. Unpooled young
+cells (the kinds outside the nursery and cells over 4 KiB) keep their
+handles: they never move, and the existing rewriting gives their references
+the pointer form when they are promoted in place.
+
+Allocation and boxing. `gc_alloc` gives no handle to a nursery cell of a
+direct kind; `ts_heap_ref_fast` boxes a young cell without a handle by
+address.
+
+Minor collection (and the young part of a full collection):
+
+1. Marking. `gc_mark_visit` on a pointer-form value: in the nursery, a young
+   cell, marked like a handle's target; elsewhere, old (skipped by a minor
+   collection without a load, as now). The full collection's validation of
+   the pointer form (`gen == OLD`) accepts nursery cells. `gc_visit_slot`
+   records a stable slot holding a reference into the nursery for rewriting
+   (the fixup list, as for a young handle). `ts_heap_ptr` decodes a nursery
+   address as a young cell.
+2. Evacuation. `gc_move_young_to_old` leaves a forwarding address in the
+   moved-from header: `gen = TS_GEN_FORWARDED`, `gc_next` = the copy (for
+   every moved cell; zapping writes the two fields after the poison).
+3. Rewriting. `gc_rewrite_promoted` (the promoted copies' slots) and
+   `gc_fixup_apply` (the recorded slots) replace a reference into the
+   nursery whose target is forwarded by the copy's address. A pinned young
+   cell does not move; references to it stay valid.
+4. Weak containers. Their entries are read as values by the ephemeron pass
+   and their entry arrays are compacted by the prune, so their slots are not
+   recorded; after the evacuation a pass over the weak work list (following
+   the forwarding of a weak map that moved) rewrites forwarded keys and
+   values.
+5. Chunk release after the rewriting: the sweeps collect the evacuated
+   chunks on a list released (and protected, in protect mode) after steps 3
+   and 4, so forwarding headers stay readable while they are needed.
+6. Coroutine frames without a map (`ts_coro_alloc_v`, the frozen analyzer's
+   output) are scanned conservatively: a word holding a nursery address that
+   starts a cell (validated by walking the chunk's cells) pins that cell for
+   the collection (`pin_depth`, released after the sweep); other words are
+   ignored. A frame with a map is visited as slots.
+
+Barrier. A value is young when it is a handle without the OLD bit or a
+pointer into the nursery; an owner is old when it is a handle with the OLD
+bit or a pointer that is neither stack-tagged nor in the nursery. The
+nursery bounds become visible to generated code (`g_ts_nursery_lo`,
+`g_ts_nursery_span`), and generated code must be recompiled (the barrier and
+boxing are inline in `ts_rt.h`): a step-4 A/B rebuilds the compiler.
+
+Identity. All references to a direct cell carry the same bits, so identity
+compares as before. Kinds hashed by identity (`sv0_hash`, the class
+registry) need an identity hash that survives the move: `h->handle` holds an
+even identity id assigned at the first hash (odd = a handle, 0 = none), and
+boxing tests bit 0. Strings are hashed by content and need none.
+
+The hazard: C code in the runtime holding an unrooted reference to a young
+cell across an allocation. With handles such a copy stays valid; a direct
+reference goes stale when the cell moves. Rooted locals are rewritten (the
+collector is given their addresses); raw cell pointers are already re-read
+after allocations (cells move today). Detection: protect mode under GC
+stress (a minor collection at every allocation, released chunks
+inaccessible) on the conformance suite, the unit tests and the compiler;
+each finding is fixed by rooting the value or re-reading it from a rooted
+container.
+
+Slices: 4a the machinery with no direct kind (`TSAOT_GC_DIRECT` selects
+kinds, default none; the barrier and boxing changes are live but find no
+nursery reference); 4b strings direct under the knob, then by default after
+protect-mode stress, the compiler under protect mode and an A/B; 4c and on,
+the other kinds (identity hashes and the cache audit first).
+
+### 6.6.1 What 4a found, and the measurement
+
+The 4a machinery was written (not committed; kept in the scratchpad) and
+run with strings direct (`TSAOT_GC_DIRECT=strings`):
+
+- The conformance suite passes in the default configuration. Under protect
+  mode with a minor collection every seven allocations, two tests failed,
+  both stale direct references: the plain finally kept its pending return
+  value in a C local (an emitter bug that also freed values under handles:
+  fixed and committed on its own, `gc/finally_pending_value`), and
+  `ts_str_replace` passed a rooted local to `ts_add` beside an allocating
+  argument (`out = ts_add(out, ts_string_slice_view(...))`: C may read
+  `out` before the allocation collects). These are the two C1 classes
+  (argument-load order, a value held where the collector does not look).
+- `scripts/gc_hazard_check.py` (clang's JSON AST; the call graph gives the
+  functions that may collect) reports, in the runtime, 66 calls that pass a
+  heap value beside an argument that may collect, and 181 reads of an
+  unrooted `tsv` or cell-pointer local after a call that may collect (177
+  after the Math fixes). Not
+  yet covered: generated C's temporaries and the `tsv*` argument arrays a
+  builtin reads after it allocates.
+- The compiler compiles itself with strings direct, its output identical,
+  also under protect mode (default thresholds).
+- Cost and gain on the compiler, eight ABBA pairs each: strings direct
+  against the same binary without: instructions -0.38% (eight of eight),
+  cycles -0.13%, wall -0.12%; the machinery itself (the barrier's nursery
+  test, the boxing and collector paths) against the build without it:
+  instructions +0.90%, cycles +0.68%, wall +0.71%. The machinery costs more
+  than strings direct gain.
+
+So Y1's remaining gain is the other kinds (objects, arrays and functions
+have identity hashes and many more young allocations) and step 5 (no
+handle table), against a barrier that tests the nursery for every
+pointer-form value (two loads; a fixed nursery address would make it a
+shift and a compare) and a runtime refactor that the hazard checker must
+gate before any kind is direct by default.
+
 ## 7. Verification
 
 - Gates of every slice: unit, parity (`scripts/emitc_diff.sh`), bundler,

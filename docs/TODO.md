@@ -6833,9 +6833,25 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   492/492; tsc rebuilt, compiled under protect mode, its 78 output files
   identical. A/B against string-to-number: eight ABBA pairs, instructions
   1.0000, cycles 0.9998, wall 1.0001: neutral.
+- GC v2 Y1 step 4a, measured and not committed (`docs/gc_v2_design.md`
+  §6.6, §6.6.1). The machinery for direct references to young cells
+  (forwarding headers, rewriting of pointer-form slots, a barrier and a
+  collector that test the nursery range, deferred chunk release, a weak
+  rewrite pass, transient pins for frames without a map) works with strings
+  direct: conformance passes, and the compiler compiles itself with its
+  output identical, also under protect mode. Under protect mode with
+  frequent minor collections it found two stale references (the finally
+  pending value, fixed separately; an argument-order read in
+  `ts_str_replace`), and the new `scripts/gc_hazard_check.py` (clang AST,
+  report only) finds 66 argument-order calls and 177 unrooted locals read
+  after a call that may collect in the runtime. On the compiler, strings
+  direct gain 0.38% of the instructions and 0.13% of the cycles, while the
+  machinery costs 0.90% and 0.68%: a net loss until the other kinds are
+  direct and the handle table is gone, after a gated runtime refactor.
 - Next slices, in order. GC v2 first (`docs/gc_v2_design.md` §6.5, Y1:
-  4 direct pointers (4a the collector's machinery behind a switch, 4b
-  strings, then the other kinds); 5 handles removed).
+  decide with Kaz whether step 4 goes on (§6.6.1: the refactor the hazard
+  checker must gate, against a gain that strings alone do not show); 5
+  handles removed).
   A slice that extends the stack or an arena to a
   new kind of allocation runs the conformance suite and a compile of the
   compiler under `--stack-check` (an arena must allocate through the
