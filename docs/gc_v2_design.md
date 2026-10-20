@@ -739,6 +739,23 @@ pointer-form value (two loads; a fixed nursery address would make it a
 shift and a compare) and a runtime refactor that the hazard checker must
 gate before any kind is direct by default.
 
+The upper bound (every bump kind but symbols and accessors direct, with
+identity ids in the handle field and prototypes allocated old) could not be
+measured: the compiler stops at once. A barrier verifier (every old cell
+checked for an unremembered young reference before each minor collection)
+found the first cause, a closure's environment copied from the caller's C
+array after the allocation that collected (`ts_make_fn_impl`); rooting it
+moved the failure to a stale value in generated code (argument arrays,
+temporaries, frame-slot stores without a barrier), the same work as the
+production refactor. Allocation counts of one compile (statistics build):
+16.0M cells, every one with a handle (2.2M of them pretenured, which never
+move); 5.6M objects, 4.5M arrays, 4.5M strings, 0.96M functions, 0.31M Maps
+and Sets; 12.2M handle frees. Scaling the strings result by allocations,
+every kind direct would save about 1.3% of the instructions and 0.5% of the
+cycles, about the machinery's cost; what step 5 would add (no handle
+allocation or release at all, no handle branch in `ts_ptr`) cannot be
+measured before the refactor.
+
 ## 7. Verification
 
 - Gates of every slice: unit, parity (`scripts/emitc_diff.sh`), bundler,
