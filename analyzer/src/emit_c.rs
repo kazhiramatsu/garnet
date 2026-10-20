@@ -10518,13 +10518,33 @@ fn fnval_adapter_name(builtin: &str) -> String {
     format!("ts_fnval_{}", builtin.replace('.', "_"))
 }
 
+/// `TSAOT_MATH_COERCE=0` keeps Math's previous argument reads (a raw
+/// reinterpretation of a boxed argument as a double, no ToNumber) for the
+/// parity oracle.
+fn math_coerce_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_MATH_COERCE").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
 /// Full C body (statements incl. `return`) of a static-builtin function-value
 /// adapter. `a`/`n` are the ts_code args. Each mirrors the call-path semantics
 /// (same runtime helper / libm). Returns None for builtins NOT supported as
 /// first-class values (the exporter loud-rejects those; this is defensive).
 fn fnval_adapter_body(builtin: &str) -> Option<String> {
     // ToNumber of arg i (NaN if absent); boxed arg i (undefined if absent).
-    let num = |i: usize| format!("(n>{i}?ts_to_num(a[{i}]):(0.0/0.0))");
+    let coerce = math_coerce_enabled();
+    let num = |i: usize| {
+        if coerce {
+            format!("(n>{i}?ts_number_coerce(a[{i}]):(0.0/0.0))")
+        } else {
+            format!("(n>{i}?ts_to_num(a[{i}]):(0.0/0.0))")
+        }
+    };
     let val = |i: usize| format!("(n>{i}?a[{i}]:TS_UNDEFINED)");
     // libm 1-arg: ts_num(fn(num0))
     let m1 = |f: &str| Some(format!("return ts_num({}({}));", f, num(0)));
@@ -10552,9 +10572,16 @@ fn fnval_adapter_body(builtin: &str) -> Option<String> {
         "math.clz32" => h1n("ts_math_clz32"),
         // ---- Math: 2-arg ----
         "math.imul" => hv(format!("ts_num(ts_math_imul(ts_number_coerce({}), ts_number_coerce({})))", val(0), val(1))),
+        // two arguments, coerced in order
+        "math.pow" if coerce => Some(format!("double x0={}; double x1={}; return ts_num(pow(x0, x1));", num(0), num(1))),
+        "math.atan2" if coerce => Some(format!("double x0={}; double x1={}; return ts_num(atan2(x0, x1));", num(0), num(1))),
         "math.pow" => hv(format!("ts_num(pow({}, {}))", num(0), num(1))),
         "math.atan2" => hv(format!("ts_num(atan2({}, {}))", num(0), num(1))),
         // ---- Math: variadic (NaN propagates) ----
+        // every argument is coerced, in order, before the result is known
+        "math.max" if coerce => Some("return ts_num(ts_math_max_args(a, n));".to_string()),
+        "math.min" if coerce => Some("return ts_num(ts_math_min_args(a, n));".to_string()),
+        "math.hypot" if coerce => Some("return ts_num(ts_math_hypot_args(a, n));".to_string()),
         "math.max" => Some("double m=-INFINITY; for(int i=0;i<n;i++){ double x=ts_to_num(a[i]); if(x!=x) return ts_num(0.0/0.0); if(x>m||(x==0&&m==0&&!signbit(x))) m=x; } return ts_num(m);".to_string()),
         "math.min" => Some("double m=INFINITY; for(int i=0;i<n;i++){ double x=ts_to_num(a[i]); if(x!=x) return ts_num(0.0/0.0); if(x<m||(x==0&&m==0&&signbit(x))) m=x; } return ts_num(m);".to_string()),
         "math.hypot" => Some("double s=0; for(int i=0;i<n;i++){ double x=ts_to_num(a[i]); s+=x*x; } return ts_num(sqrt(s));".to_string()),
@@ -17852,6 +17879,26 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     .map(|a| ctx.val(a.0))
                     .unwrap_or_else(|| "TS_UNDEFINED".into())
             };
+            // Math converts its arguments with ToNumber (valueOf, numeric
+            // strings), not a reinterpretation of the boxed bits.
+            let n = |i: usize| -> String {
+                if math_coerce_enabled() && builtin.starts_with("math.") {
+                    nc(i)
+                } else {
+                    n(i)
+                }
+            };
+            // Two arguments that may both run user code are converted in order.
+            let n2 = |f: &str| -> String {
+                let both_boxed = math_coerce_enabled()
+                    && args.len() >= 2
+                    && args[..2].iter().all(|a| !ctx.unboxed.contains(&a.0) && !ctx.json_locals.contains(&a.0));
+                if both_boxed {
+                    format!("({{ double _m0 = {}; double _m1 = {}; {}(_m0, _m1); }})", n(0), n(1), f)
+                } else {
+                    format!("{}({}, {})", f, n(0), n(1))
+                }
+            };
             let (expr, numeric): (String, bool) = match builtin.as_str() {
                 // Math: single-arg libm functions emitted inline as doubles.
                 "math.sqrt" => (format!("sqrt({})", n(0)), true),
@@ -17884,15 +17931,15 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 "math.f16round" => (format!("ts_math_f16round({})", nc(0)), true),
                 "math.clz32" => (format!("ts_math_clz32({})", n(0)), true),
                 // two-arg
-                "math.pow" => (format!("pow({}, {})", n(0), n(1)), true),
-                "math.atan2" => (format!("atan2({}, {})", n(0), n(1)), true),
-                "math.hypot" => (format!("ts_math_hypot2({}, {})", n(0), n(1)), true),
+                "math.pow" => (n2("pow"), true),
+                "math.atan2" => (n2("atan2"), true),
+                "math.hypot" => (n2("ts_math_hypot2"), true),
                 "math.imul" => (format!("ts_math_imul({}, {})", nc(0), nc(1)), true),
                 "math.maxArr" => (format!("ts_math_max_arr({})", v(0)), true),
                 "math.minArr" => (format!("ts_math_min_arr({})", v(0)), true),
                 "math.hypotArr" => (format!("ts_math_hypot_arr({})", v(0)), true),
-                "math.max" => (format!("ts_math_max2({}, {})", n(0), n(1)), true),
-                "math.min" => (format!("ts_math_min2({}, {})", n(0), n(1)), true),
+                "math.max" => (n2("ts_math_max2"), true),
+                "math.min" => (n2("ts_math_min2"), true),
                 "math.random" => ("ts_math_random()".to_string(), true),
                 // Number static methods
                 "number.isInteger" => (format!("ts_bool(ts_number_is_integer({}))", v(0)), false),

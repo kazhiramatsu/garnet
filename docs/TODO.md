@@ -6731,6 +6731,33 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   selfconf, GC stress, inline policy, conformance 487/487; tsc rebuilt and
   compiled under protect mode. A/B against step 3: eight ABBA pairs,
   instructions 0.9997, cycles 0.998, wall 0.989 (one noisy pair): neutral.
+- Math converts its arguments with ToNumber (found while probing GC
+  hazards: `Math.max(...arr)` over objects with `valueOf` printed NaN). The
+  direct calls read a boxed argument as raw double bits (`ts_to_num`), so a
+  numeric string, a boolean, null or an object became NaN
+  (`Math.max(anyObj, "7")`, `Math.abs("7")`, `Math.floor("4.5" as any)`);
+  the Math functions taken as values (spread calls, `[Math.max].map(...)`)
+  did the same, and max/min returned at the first NaN without converting
+  the rest. Now: a boxed argument goes through `ts_number_coerce`; two
+  boxed arguments of pow / atan2 / hypot / max / min are converted in order;
+  the function values convert every argument in order (`ts_math_max_args`,
+  `_min_args`, `_hypot_args`); the exporter evaluates the whole argument
+  list before the first conversion (it folded max/min/hypot with each
+  argument evaluated after the previous one was converted). Math.hypot
+  follows V8's algorithm (normalized by the largest magnitude, Kahan
+  summation; an infinity wins over NaN) to the last bit, and three or more
+  values take the array form (a fold of the 2-value form rounds
+  differently); the array forms no longer keep a cell pointer across the
+  conversions. `TSAOT_MATH_COERCE=0` keeps the previous reads for the parity
+  oracle. Fixture `numbers/math_coercion` (direct, ordered, spread and
+  function-value calls; 16,000 hypot results hashed); known rows: the
+  frozen emitter's raw reads (selfconf) and a numeric-specialization
+  difference (parity). Not changed: Math's transcendental functions use the
+  platform libm, V8 its fdlibm port; they can differ in the last bit
+  (`Math.atan2(1, 7)`). Gates: unit, parity (362 identical), bundler,
+  selfconf, GC stress, inline policy, conformance 488/488; tsc rebuilt and
+  compiled under protect mode. A/B against the finally fix: eight ABBA
+  pairs, instructions 0.9998, cycles 0.9986, wall medians equal: neutral.
 - Next slices, in order. GC v2 first (`docs/gc_v2_design.md` §6.5, Y1:
   4 direct pointers (4a the collector's machinery behind a switch, 4b
   strings, then the other kinds); 5 handles removed).

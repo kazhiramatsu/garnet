@@ -1184,6 +1184,9 @@ double ts_math_hypot2(double a, double b);
 double ts_math_max_arr(tsv arr);
 double ts_math_min_arr(tsv arr);
 double ts_math_hypot_arr(tsv arr);
+double ts_math_max_args(const tsv* a, int n);
+double ts_math_min_args(const tsv* a, int n);
+double ts_math_hypot_args(const tsv* a, int n);
 double ts_math_random(void);
 /* Number */
 int    ts_number_is_integer(tsv v);

@@ -5179,13 +5179,18 @@ class Exporter {
           // through the 2-arg runtime (which ToNumber-coerces and propagates NaN).
           // Handles 0 args (-> identity), 1 arg, and N args uniformly. Identity:
           // -Infinity (max), +Infinity (min), 0 (hypot — hypot(0,x)=|x|, hypot()=0).
+          // Every argument expression is evaluated before the first conversion
+          // (JS evaluates the argument list, then Math converts each value).
+          // hypot of three or more values is not a fold of the 2-arg form (V8
+          // normalizes all values together), so it takes the array form.
           if (ns === "Math" && (fn.name.text === "max" || fn.name.text === "min" || fn.name.text === "hypot")) {
             const seed: "NegInf" | "PosInf" | "Num" =
               fn.name.text === "max" ? "NegInf" : fn.name.text === "min" ? "PosInf" : "Num";
             const mb = `math.${fn.name.text}`;
             // Spread args (Math.max(...arr)) can't be folded statically: materialize
             // all args into an array and reduce it in the runtime.
-            if (node.arguments.some((a) => ts.isSpreadElement(a))) {
+            if (node.arguments.some((a) => ts.isSpreadElement(a)) ||
+                (fn.name.text === "hypot" && node.arguments.length >= 3)) {
               const site = this.site++;
               this.recordSite(site, "array", this.inLoop(node) ? "many" : "once", false, node);
               const arrL = this.newLocal(ctx, "reference");
@@ -5201,10 +5206,10 @@ class Exporter {
               ctx.body.push({ kind: "CallBuiltinStatic", dst: d, builtin: `${mb}Arr`, args: [arrL] });
               return d;
             }
+            const values = node.arguments.map((a) => this.lowerExpr(ctx, a));
             let acc = this.newLocal(ctx, "primitive");
             ctx.body.push({ kind: "Const", dst: acc, value: seed === "Num" ? { kind: "Num", value: 0 } : { kind: seed } });
-            for (let ai = 0; ai < node.arguments.length; ai++) {
-              const next = this.lowerExpr(ctx, node.arguments[ai]);
+            for (const next of values) {
               const d = this.newLocal(ctx, "primitive");
               ctx.body.push({ kind: "CallBuiltinStatic", dst: d, builtin: mb, args: [acc, next] });
               acc = d;

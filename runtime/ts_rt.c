@@ -7953,24 +7953,92 @@ double ts_math_f16round(double x){
 }
 double ts_math_log2(double x){ return log2(x); }
 double ts_math_log10(double x){ return log10(x); }
-double ts_math_hypot2(double a, double b){ return hypot(a,b); }
-/* Array-argument forms for Math.max/min/hypot(...spread). Each element is
-   ToNumber-coerced; max/min propagate NaN. Identity: -Inf / +Inf / 0. */
+/* Math.hypot as V8 computes it (src/builtins/math.tq), so results agree to
+   the last bit: an infinite argument wins over NaN, then NaN, then 0; the
+   values are normalized by the largest magnitude and summed with Kahan
+   compensation. Each step is its own statement, and contraction is off, so
+   no fused multiply-add changes the rounding. */
+#pragma STDC FP_CONTRACT OFF
+static double math_hypot_n(const double* xs, size_t n){
+  double max = 0;
+  int nan = 0;
+  for (size_t i = 0; i < n; i++){
+    double v = xs[i];
+    if (v != v){ nan = 1; continue; }
+    double a = fabs(v);
+    if (a > max) max = a;
+  }
+  if (max == INFINITY) return INFINITY;
+  if (nan) return NAN;
+  if (max == 0) return 0;
+  double sum = 0, compensation = 0;
+  for (size_t i = 0; i < n; i++){
+    double v = xs[i];
+    double q = fabs(v) / max;
+    double sq = q * q;
+    double summand = sq - compensation;
+    double preliminary = sum + summand;
+    double diff = preliminary - sum;
+    compensation = diff - summand;
+    sum = preliminary;
+  }
+  double root = sqrt(sum);
+  return root * max;
+}
+double ts_math_hypot2(double a, double b){ double xs[2] = { a, b }; return math_hypot_n(xs, 2); }
+/* Array-argument forms for Math.max/min/hypot(...spread) and the function
+   values. The array is the call's own argument list (a fresh array); each
+   element is ToNumber-coerced in order (valueOf may run user code, so the
+   array is re-read through its value, not a cell pointer); max/min propagate
+   NaN. Identity: -Inf / +Inf / 0. */
 double ts_math_max_arr(tsv arr){
-  ts_array* a=as_arr(arr); double m=-1.0/0.0;   /* -Infinity: identity for max */
-  if(a) for(uint32_t i=0;i<a->len;i++){ m=ts_math_max2(m, ts_number_coerce(ts_array_get(arr,i))); }
+  double m=-1.0/0.0;   /* -Infinity: identity for max */
+  ts_gc_root(&arr);
+  for(uint32_t i=0;i<ts_array_len(arr);i++){ double x=ts_number_coerce(ts_array_get(arr,i)); m=ts_math_max2(m, x); }
+  ts_gc_unroot(1);
   return m;
 }
 double ts_math_min_arr(tsv arr){
-  ts_array* a=as_arr(arr); double m=1.0/0.0;    /* +Infinity: identity for min */
-  if(a) for(uint32_t i=0;i<a->len;i++){ m=ts_math_min2(m, ts_number_coerce(ts_array_get(arr,i))); }
+  double m=1.0/0.0;    /* +Infinity: identity for min */
+  ts_gc_root(&arr);
+  for(uint32_t i=0;i<ts_array_len(arr);i++){ double x=ts_number_coerce(ts_array_get(arr,i)); m=ts_math_min2(m, x); }
+  ts_gc_unroot(1);
   return m;
 }
 double ts_math_hypot_arr(tsv arr){
-  ts_array* a=as_arr(arr); double s=0;
-  if(a) for(uint32_t i=0;i<a->len;i++){ double x=ts_number_coerce(ts_array_get(arr,i)); s+=x*x; }
-  return sqrt(s);
+  ts_gc_root(&arr);
+  uint32_t n = ts_array_len(arr);
+  double stack[16];
+  double* xs = n <= 16 ? stack : (double*)malloc(sizeof(double) * n);
+  if (!xs) ts_abort_msg("out of memory in Math.hypot");
+  uint32_t k = 0;
+  for (; k < n && k < ts_array_len(arr); k++) xs[k] = ts_number_coerce(ts_array_get(arr, k));
+  double r = math_hypot_n(xs, k);
+  if (xs != stack) free(xs);
+  ts_gc_unroot(1);
+  return r;
 }
+/* Math.max / min / hypot through a function value: the arguments in order. */
+double ts_math_max_args(const tsv* a, int n){
+  double m = -1.0/0.0;
+  for (int i = 0; i < n; i++){ double x = ts_number_coerce(a[i]); m = ts_math_max2(m, x); }
+  return m;
+}
+double ts_math_min_args(const tsv* a, int n){
+  double m = 1.0/0.0;
+  for (int i = 0; i < n; i++){ double x = ts_number_coerce(a[i]); m = ts_math_min2(m, x); }
+  return m;
+}
+double ts_math_hypot_args(const tsv* a, int n){
+  double stack[16];
+  double* xs = n <= 16 ? stack : (double*)malloc(sizeof(double) * (size_t)n);
+  if (!xs) ts_abort_msg("out of memory in Math.hypot");
+  for (int i = 0; i < n; i++) xs[i] = ts_number_coerce(a[i]);
+  double r = math_hypot_n(xs, n > 0 ? (size_t)n : 0);
+  if (xs != stack) free(xs);
+  return r;
+}
+#pragma STDC FP_CONTRACT ON
 double ts_math_random(void){ return (double)rand() / ((double)RAND_MAX + 1.0); }
 
 /* ---------------- Number ---------------- */
