@@ -6352,6 +6352,32 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   `x64`, two rounds: 4.305 vs 4.290 s and 4.335 vs 4.344 s median: neutral
   (a first build, whose union rule also split `NodeArray<Node> | Node[]`,
   read +0.7%). Node 3.27-3.30 s (1.32x).
+- Dynamic property keys without ToString (build `x66`: `x65`'s compiler
+  relinked with the new runtime; `docs/dynamic_keys_design.md`). Profiling
+  `x62` put 2.4% of the compiler's samples (inclusive) in
+  `ts_key_from_value`: every computed access converted its key by
+  ToString, a heap UTF-8 copy, the intern lookup and a free (and number
+  keys allocated their string): `forEachChildTable[node.kind]` (1.1%),
+  `isNodeArray`'s `hasOwnProperty("pos")`, `Debug[name]`. Now small
+  non-negative integers come from a table of interned decimal keys, other
+  integers are formatted on the stack, string literals (static, never
+  freed) through a direct-mapped cache by identity, and other strings
+  intern without a heap copy (an ASCII string's own bytes, a short one in
+  a stack buffer). `TSAOT_KEY_CACHES=0` turns the caches off. Kernel 138 ->
+  61 ms. Fixture `objects/dynamic_keys` (number keys from 0 to 1e21, -0,
+  NaN, the infinities, 2^53; literal and computed strings meeting; non-ASCII,
+  surrogates, long keys; symbols; also under GC stress and with the caches
+  off). Gates all green (parity / selfconf: the fixture's computed delete
+  is unported by the frozen emitter). A/B against `x65`, two rounds: 4.221
+  vs 4.310 s and 4.230 vs 4.327 s median, all six pairs faster: about
+  -2.1%. Node 3.24-3.27 s (1.30x).
+  Profile notes for the next slices (`x62`, 1,782 samples): string
+  appends 3.4% in `getTypeListId` alone (`result += ...` through the
+  generic `ts_add`: a view cell per append, dispatch and rooting), the
+  scanner's identifier substrings 2.1%, string-keyed Map lookups 3.4%
+  (`internIdentifier`, symbol tables, the union cache keyed by
+  `getTypeListId`), allocation of nodes / symbols / types 4.2%, minor
+  collections 8.6%.
 - Next slices, in order. A slice that extends the stack or an arena to a
   new kind of allocation runs the conformance suite and a compile of the
   compiler under `--stack-check` (an arena must allocate through the

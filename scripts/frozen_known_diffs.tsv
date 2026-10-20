@@ -162,3 +162,5 @@ selfconf	objects/reflect_receiver	The frozen emitter drops the receiver of Refle
 parity	arrays/array_iterators	The Rust emitter roots two more locals across an allocation than the frozen emitter (`ts_gc_root(&v112)`, `ts_gc_root(&v121)` and the matching unroot counts); the pre-existing rooting-count difference, the parity export keeps the old lowerings (TSAOT_ARRAY_ITER_FOROF=0, TSAOT_FOROF_DYNAMIC=0); Session 350 x65.
 selfconf-unported	arrays/array_iterators	Frozen analyzer lacks forof.open / forof.next (the dynamic for..of of Session 350 x65); the native Rust output matches V8.
 selfconf-unported	statements/forof_dynamic	Frozen analyzer lacks forof.open / forof.next (the dynamic for..of of Session 350 x65); the native Rust output matches V8.
+parity-unported	objects/dynamic_keys	Frozen emitter lacks computed-delete dispatch (object.deleteDynamic: the fixture deletes a computed non-ASCII key, Session 350 x66); the Rust emitter supports it and the native output matches V8.
+selfconf-unported	objects/dynamic_keys	Frozen emitter lacks computed-delete dispatch (object.deleteDynamic, Session 350 x66); native Rust output matches V8.

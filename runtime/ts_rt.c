@@ -37,6 +37,7 @@ static int g_pretenure_ctors = 1;       /* TSAOT_PRETENURE_CTORS=0: guarded cons
 static int g_remembered_slots = 1;      /* TSAOT_REMEMBERED_SLOTS=0: whole-cell rescans */
 static int g_empty_class_plain = 1;     /* TSAOT_EMPTY_CLASS_PLAIN=0: field-less class instances stay dictionary cells */
 static int g_negative_pic = 1;          /* TSAOT_NEGATIVE_PIC=0: no absent-property cache entries */
+static int g_key_caches = 1;            /* TSAOT_KEY_CACHES=0: every dynamic key goes through ToString (docs/dynamic_keys_design.md) */
 static int g_sparse_elements = 1;       /* TSAOT_SPARSE_ELEMENTS=0: far stores always materialize dense storage */
 /* TSAOT_GC_ZAP=1 fills dead and moved-from cell bodies with 0xDD during
    collection (Phase C0 groundwork): a stale raw pointer held across a
@@ -543,6 +544,8 @@ static tsv ts_string_slice_copy(tsv src, uint32_t start, uint32_t len);
 static tsv ts_string_slice_view(tsv src, uint32_t start, uint32_t len);
 static char* ts_string_cstr_copy(tsv src, uint32_t* out_len);
 static char* ts_string_key_bytes_copy(tsv src, uint32_t* out_len);
+static char* ts_str_key_bytes_copy_view(ts_strview x, uint32_t* out_len);
+static int ts_i64_to_str(long long v, char* buf);
 static int ts_string_own_prop(tsv obj, ts_key key, tsv* out);
 static int field_name_is(uint32_t id, const char* lit);
 static int field_bytes_is(const char* n, uint32_t len, const char* lit);
@@ -597,6 +600,8 @@ static void gc_config_init(void){
   if (rslots && rslots[0] && strcmp(rslots, "0") == 0) g_remembered_slots = 0;
   const char* eplain = getenv("TSAOT_EMPTY_CLASS_PLAIN");
   if (eplain && eplain[0] && strcmp(eplain, "0") == 0) g_empty_class_plain = 0;
+  const char* kc = getenv("TSAOT_KEY_CACHES");
+  if (kc && kc[0] && strcmp(kc, "0") == 0) g_key_caches = 0;
   const char* npic = getenv("TSAOT_NEGATIVE_PIC");
   if (npic && npic[0] && strcmp(npic, "0") == 0) g_negative_pic = 0;
   const char* sparse = getenv("TSAOT_SPARSE_ELEMENTS");
@@ -2566,13 +2571,45 @@ void ts_global_var_decl(const char* name){
   if (!find_slot(g, key, 0)) ts_set(g_global_this_v, key, TS_UNDEFINED);
 }
 
-static ts_key ts_intern_string_value(tsv s){
+/* A string's key without a heap copy of its bytes: an ASCII string's own
+   bytes are its key bytes; a short one converts into a stack buffer (the
+   encoding of ts_str_key_bytes_copy_view: lone surrogates kept). */
+static ts_key ts_intern_view(ts_strview x){
+  if (x.data && (x.flags & TS_STR_FLAG_ASCII)) return ts_intern_field(x.data, x.len);
+  if (x.len <= 64u){
+    char buf[64u * 3u + 1u];
+    uint32_t o = 0;
+    for (uint32_t i = 0; i < x.len; i++){
+      uint32_t cp = ts_str_cu_at_view(x, i);
+      if (cp >= 0xD800u && cp <= 0xDBFFu && i + 1 < x.len){
+        uint16_t lo = ts_str_cu_at_view(x, i + 1);
+        if (lo >= 0xDC00u && lo <= 0xDFFFu){ cp = 0x10000u + (((cp - 0xD800u) << 10) | (lo - 0xDC00u)); i++; }
+      }
+      if (cp < 0x80u) buf[o++] = (char)cp;
+      else if (cp < 0x800u){ buf[o++] = (char)(0xC0u | (cp >> 6)); buf[o++] = (char)(0x80u | (cp & 0x3Fu)); }
+      else if (cp < 0x10000u){ buf[o++] = (char)(0xE0u | (cp >> 12)); buf[o++] = (char)(0x80u | ((cp >> 6) & 0x3Fu)); buf[o++] = (char)(0x80u | (cp & 0x3Fu)); }
+      else { buf[o++] = (char)(0xF0u | (cp >> 18)); buf[o++] = (char)(0x80u | ((cp >> 12) & 0x3Fu)); buf[o++] = (char)(0x80u | ((cp >> 6) & 0x3Fu)); buf[o++] = (char)(0x80u | (cp & 0x3Fu)); }
+    }
+    return ts_intern_field(buf, o);
+  }
   uint32_t len = 0;
-  char* bytes = ts_string_key_bytes_copy(s, &len);
+  char* bytes = ts_str_key_bytes_copy_view(x, &len);
   ts_key key = ts_intern_field(bytes, len);
   free(bytes);
   return key;
 }
+static ts_key ts_intern_string_value(tsv s){
+  return ts_intern_view(ts_str_view_typed(s));
+}
+/* Keys of dynamic accesses (docs/dynamic_keys_design.md): a small
+   non-negative integer (`forEachChildTable[node.kind]`) through a table of
+   its interned decimal form, other integers formatted on the stack, and a
+   string literal (static, never freed: `hasOwnProperty("pos")`) through a
+   direct-mapped cache by identity. Entries hold key + 1 (0 is a key). */
+#define TS_INT_KEY_CACHE 4096u
+#define TS_LIT_KEY_CACHE 1024u
+static uint32_t g_int_key_cache[TS_INT_KEY_CACHE];
+static struct { tsv s; uint32_t key1; } g_lit_key_cache[TS_LIT_KEY_CACHE];
 
 /* Coerce a JS property key value to the runtime key id (ECMAScript ToPropertyKey):
    symbols stay symbol keys; everything else is ToString + string interning.
@@ -2582,6 +2619,36 @@ static int ts_key_from_value(tsv keyv, ts_key* out){
   if (ts_is_symbol(keyv)){
     *out = ts_symbol_key(keyv);
     return 1;
+  }
+  if (g_key_caches){
+    if (ts_is_num(keyv)){
+      double d = ts_to_num(keyv);
+      if (d >= 0.0 && d < (double)TS_INT_KEY_CACHE){
+        uint32_t i = (uint32_t)d;
+        if ((double)i == d){                     /* -0 too: its key is "0" */
+          uint32_t k1 = g_int_key_cache[i];
+          if (TS_RT_LIKELY(k1)){ *out = k1 - 1u; return 1; }
+          char buf[16]; int n = ts_i64_to_str((long long)i, buf);
+          ts_key k = ts_intern_field(buf, (uint32_t)n);
+          g_int_key_cache[i] = k + 1u;
+          *out = k;
+          return 1;
+        }
+      }
+      if (d > -9e15 && d < 9e15 && d == (double)(long long)d && !(d == 0.0 && 1.0 / d < 0)){
+        char buf[24]; int n = ts_i64_to_str((long long)d, buf);
+        *out = ts_intern_field(buf, (uint32_t)n);
+        return 1;
+      }
+    } else if (ts_is_heap_str(keyv) && (ts_str_flags_typed(keyv) & TS_STR_FLAG_STATIC)){
+      uint64_t x = (uint64_t)keyv ^ ((uint64_t)keyv >> 17);
+      uint32_t slot = (uint32_t)(x >> 3) & (TS_LIT_KEY_CACHE - 1u);
+      if (g_lit_key_cache[slot].s == keyv && g_lit_key_cache[slot].key1){ *out = g_lit_key_cache[slot].key1 - 1u; return 1; }
+      ts_key k = ts_intern_string_value(keyv);
+      g_lit_key_cache[slot].s = keyv; g_lit_key_cache[slot].key1 = k + 1u;
+      *out = k;
+      return 1;
+    }
   }
   tsv ks = keyv;
   if (!ts_is_str(ks)){
