@@ -6446,7 +6446,37 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   rest is about 4.0 s against V8's 3.2 s (1.25x). Direction (Kaz): the
   collector needs a fundamental redesign later (the handle indirection of
   young objects belongs to it); first the non-GC work beats V8.
-- Next slices, in order. A slice that extends the stack or an arena to a
+- GC v2: design and slice G0 (`docs/gc_v2_design.md`; statistics build
+  only, the default runtime's machine code is identical). Direction (Kaz):
+  the collector needs a fundamental redesign of its algorithms and data
+  structures, after the lessons of C1 (s320) and of the rejected
+  conservative scan (s321). Measured first: V8 allocates 4.35 GB per
+  compile against garnet's ~2.5 GB, yet pauses its main thread 170 ms
+  (79 scavenges with a new space grown to 64 MB, concurrent marking)
+  against garnet's ~0.4 s of collector, allocation and barrier samples;
+  V8 retires ~50 G instructions on the main thread against garnet's 84 G
+  (IPC 3.7 vs 4.56), so the remaining gap is instruction count, not memory;
+  cells are 1.6-4x V8's (header 32 B, object 72 B + slots, array and
+  function 128 B, string 64 B + characters). The design's lead is a
+  non-moving heap with sticky-mark generations (JavaScriptCore-style):
+  cells never move, so references become direct pointers without C1's
+  stale-reference hazard and a misdecoded word can only retain memory;
+  eden collections only mark; handles, pinning, aging, promotion copies and
+  the two reference forms go. A copying nursery (Y1) stays the fallback,
+  decided by slice G3's A/B. G0 counters (`TSAOT_G0_FATES=0` for timing
+  runs): 16.0M cells / 2.03 GB per compile, 13.8M young of which 88% die,
+  12% promote (227 MB); aging kept 0.66M cells one more collection and saved
+  5 MB against 93 MB promoted; 11% of the dying young cells own malloc'd
+  buffers (95 MB: environments 943k, Map buffers 113k, element buffers 45k);
+  98.9% of the cells are at most 256 B (3,548 above 4 KiB); 80% of strings
+  are 80 B cells with a 64-byte header; collections 320 ms in the
+  statistics build: minor marking 126 ms, nursery sweep 97 ms, rewriting
+  32 ms, full marking 32 ms; 3.1M remembered-set enrollments; the old
+  generation is 590 MB of almost entirely live data at exit. Gates: unit;
+  the default `ts_rt.o` text section is byte-identical (md5).
+- Next slices, in order. GC v2 first (`docs/gc_v2_design.md` §6: G1 quick
+  wins, then G2 payloads in a block heap, G3 the non-moving decision gate).
+  A slice that extends the stack or an arena to a
   new kind of allocation runs the conformance suite and a compile of the
   compiler under `--stack-check` (an arena must allocate through the
   quarantine in check mode). (0) External element buffers (the malloc'd
