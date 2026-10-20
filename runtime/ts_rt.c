@@ -347,6 +347,135 @@ static inline int ts_heap_ref(tsv v){ return ts_is_obj(v)||ts_is_func(v)||ts_is_
 static inline int gc_kind_valid(uint8_t k){
   return k >= TS_KIND_OBJECT && k <= TS_KIND_SYMBOL;
 }
+#ifdef TSAOT_STACK_CHECK
+/* Stack check (docs/stack_check_design.md): the emitted code allocates every
+   Stack object in this never-reused quarantine, preceded by its record; an
+   activation's records die when it returns (ts_sc_leave, a cleanup attribute)
+   or is unwound (ts_throw), and a dead object reached outside a minor
+   collection is reported. Minor collections also scan unreachable old cells
+   of the remembered set, so there a dead object is only skipped. */
+#include <sys/mman.h>
+typedef struct ts_sc_rec {
+  uint64_t magic;
+  uint32_t site, dead;
+  const char* fn;
+  uint64_t act;
+  size_t size;
+  uint32_t raw, pad;
+} ts_sc_rec;
+#define TS_SC_MAGIC 0x53544b4351524e54ull
+#define TS_SC_REGION ((size_t)16u << 30)
+static char* g_sc_base;
+static char* g_sc_top;
+static char* g_sc_end;
+static ts_sc_rec** g_sc_live;
+static size_t g_sc_len, g_sc_cap;
+static uint64_t g_sc_next_act = 1, g_sc_cur_act = 0;
+static int g_sc_minor;
+static int g_sc_continue = -1;
+/* TSAOT_STACK_CHECK_FULL_EVERY=N: a full collection after every N minor ones,
+   so a dangling reference dropped before the next scheduled full collection
+   is still seen by one. */
+static unsigned g_sc_full_every, g_sc_minors_since_full;
+static unsigned long long g_sc_reports;
+static uint32_t* g_sc_reported_sites;
+static size_t g_sc_reported_len, g_sc_reported_cap;
+void ts_gc_collect(void);
+static void sc_atexit(void){
+  if (!g_sc_base) return;
+  ts_gc_collect();
+  if (g_sc_reports)
+    fprintf(stderr, "[stack-check] %llu report(s) at %zu site(s)\n", g_sc_reports, g_sc_reported_len);
+}
+static void sc_init(void){
+  void* m = mmap(NULL, TS_SC_REGION, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+  if (m == MAP_FAILED){ fprintf(stderr, "[stack-check] cannot reserve the quarantine\n"); abort(); }
+  g_sc_base = g_sc_top = (char*)m;
+  g_sc_end = g_sc_base + TS_SC_REGION;
+  const char* c = getenv("TSAOT_STACK_CHECK_CONTINUE");
+  g_sc_continue = (c && *c && *c != '0') ? 1 : 0;
+  const char* fe = getenv("TSAOT_STACK_CHECK_FULL_EVERY");
+  g_sc_full_every = fe ? (unsigned)strtoul(fe, NULL, 10) : 0u;
+  atexit(sc_atexit);
+}
+static inline int sc_in_quarantine(const void* p){
+  return (const char*)p >= g_sc_base && (const char*)p < g_sc_top;
+}
+static void* sc_alloc(size_t size, uint32_t site, const char* fn, uint32_t raw){
+  if (!g_sc_base) sc_init();
+  size_t need = sizeof(ts_sc_rec) + ((size + 15u) & ~(size_t)15u);
+  if ((size_t)(g_sc_end - g_sc_top) < need){ fprintf(stderr, "[stack-check] quarantine exhausted\n"); abort(); }
+  ts_sc_rec* r = (ts_sc_rec*)g_sc_top;
+  g_sc_top += need;
+  r->magic = TS_SC_MAGIC; r->site = site; r->dead = 0; r->fn = fn;
+  r->act = g_sc_cur_act; r->size = size; r->raw = raw; r->pad = 0;
+  if (g_sc_len == g_sc_cap){
+    g_sc_cap = g_sc_cap ? g_sc_cap * 2 : 4096;
+    g_sc_live = (ts_sc_rec**)realloc(g_sc_live, g_sc_cap * sizeof(*g_sc_live));
+  }
+  g_sc_live[g_sc_len++] = r;
+  return (void*)(r + 1);
+}
+void* ts_sc_alloc(size_t size, uint32_t site, const char* fn){ return sc_alloc(size, site, fn, 0); }
+unsigned long long ts_sc_report_count(void){ return g_sc_reports; }
+void* ts_sc_alloc_raw(size_t size, uint32_t site, const char* fn){ return sc_alloc(size, site, fn, 1); }
+/* Death: the payload a program could still read through a dangling reference
+   becomes 0xDB bytes (a double, never a heap reference). The cell header (and a
+   class instance's object header, a function's code and env pointer) stays, so
+   the collector can still reach and identify it. */
+static void sc_kill(ts_sc_rec* r){
+  r->dead = 1;
+  char* obj = (char*)(r + 1);
+  size_t from = 0;
+  if (!r->raw){
+    uint8_t kind = ((ts_gc_header*)obj)->kind;
+    from = kind == TS_KIND_OBJECT ? sizeof(ts_obj_common) : r->size;
+  }
+  if (from < r->size) memset(obj + from, 0xDB, r->size - from);
+}
+ts_sc_act ts_sc_enter(void){
+  ts_sc_act a;
+  a.prev = g_sc_cur_act;
+  a.id = g_sc_next_act++;
+  g_sc_cur_act = a.id;
+  return a;
+}
+void ts_sc_leave(ts_sc_act* a){
+  while (g_sc_len && g_sc_live[g_sc_len - 1]->act == a->id) sc_kill(g_sc_live[--g_sc_len]);
+  g_sc_cur_act = a->prev;
+}
+/* ts_throw: the activations after the handler's are unwound without their
+   cleanups; their records are the top of the live stack. */
+static void sc_unwind_to(uint64_t act){
+  while (g_sc_len && g_sc_live[g_sc_len - 1]->act > act) sc_kill(g_sc_live[--g_sc_len]);
+  g_sc_cur_act = act;
+}
+static void sc_report(ts_sc_rec* r){
+  g_sc_reports++;
+  for (size_t i = 0; i < g_sc_reported_len; i++) if (g_sc_reported_sites[i] == r->site) return;
+  if (g_sc_reported_len == g_sc_reported_cap){
+    g_sc_reported_cap = g_sc_reported_cap ? g_sc_reported_cap * 2 : 64;
+    g_sc_reported_sites = (uint32_t*)realloc(g_sc_reported_sites, g_sc_reported_cap * sizeof(uint32_t));
+  }
+  g_sc_reported_sites[g_sc_reported_len++] = r->site;
+  fflush(stdout);
+  fprintf(stderr, "[stack-check] site %u (%s): a stack object is reachable after its frame returned\n",
+          r->site, r->fn ? r->fn : "?");
+  fflush(stderr);
+  if (!g_sc_continue) abort();
+}
+/* A stack-tagged pointer into the quarantine: NULL for a dead cell (reported
+   unless a minor collection is scanning possibly unreachable old cells). */
+static ts_gc_header* sc_quarantine_ptr(ts_gc_header* h){
+  ts_sc_rec* r = (ts_sc_rec*)h - 1;
+  if (r->magic != TS_SC_MAGIC) return NULL;
+  if (r->dead){
+    if (!g_sc_minor) sc_report(r);
+    return NULL;
+  }
+  return (h->gen == TS_GEN_NONHEAP && gc_kind_valid(h->kind)) ? h : NULL;
+}
+#endif
 static inline int gc_direct_stack_plausible(ts_gc_header* h){
   uintptr_t p = (uintptr_t)h;
   uintptr_t here = (uintptr_t)&p;
@@ -372,6 +501,9 @@ static inline ts_gc_header* ts_heap_ptr(tsv v){
   }
   if (payload & TS_PTR_STACK_TAG){
     ts_gc_header* h = (ts_gc_header*)(uintptr_t)(payload & ~TS_PTR_STACK_TAG);
+#ifdef TSAOT_STACK_CHECK
+    if (sc_in_quarantine(h)) return sc_quarantine_ptr(h);
+#endif
     if (!gc_direct_stack_plausible(h) || !gc_direct_header_readable(h)) return NULL;
     return (h->gen == TS_GEN_NONHEAP && gc_kind_valid(h->kind)) ? h : NULL;
   }
@@ -648,6 +780,12 @@ static inline void gc_before_alloc(void){
     ? g_nursery_fresh_bytes : g_nursery_used_bytes;
   if (g_young_new_since_minor>=g_young_threshold || nursery_trigger_bytes>=g_nursery_cap_bytes)
     ts_gc_collect_young();
+#ifdef TSAOT_STACK_CHECK
+  if (g_sc_full_every && g_sc_minors_since_full >= g_sc_full_every){
+    g_sc_minors_since_full = 0;
+    ts_gc_collect();
+  }
+#endif
   if (g_heap_bytes>=g_full_threshold_bytes){
     size_t before = g_heap_bytes;
 #ifdef TSAOT_RT_STATS
@@ -4786,6 +4924,9 @@ static void gc_sweep_pinned_young(ts_gc_header** survivors){
 void ts_gc_collect_young(void){
   if (!g_young_heap && !g_nursery_active && !g_pinned_young) return;
   RT_STAT_INC(minor_gc); RT_STAT_GC_T0;
+#ifdef TSAOT_STACK_CHECK
+  g_sc_minor = 1;
+#endif
   gc_weak_begin();
   int aging_allowed =
     g_gc_age_threshold > 1 &&
@@ -4920,6 +5061,10 @@ void ts_gc_collect_young(void){
   g_young_new_since_minor = 0;
   gc_aging_finish_minor(aging_allowed);
   gc_clear_nonheap_marks();
+#ifdef TSAOT_STACK_CHECK
+  g_sc_minor = 0;
+  g_sc_minors_since_full++;
+#endif
   RT_STAT_GC_T1;
 }
 void ts_gc_collect(void){
@@ -12605,6 +12750,9 @@ ts_handler* ts_eh_push(void){
   ts_handler* h = (ts_handler*)malloc(sizeof(ts_handler));
   h->gc_root_len = ts_gc_root_depth();
   h->frame_top = g_ts_frame_top;
+#ifdef TSAOT_STACK_CHECK
+  h->sc_act = g_sc_cur_act;
+#endif
   h->prev = g_handlers;
   h->extbuf = NULL;
   g_handlers = h;
@@ -12617,6 +12765,9 @@ void ts_eh_push_coro(void* extbuf){
   ts_handler* h = (ts_handler*)malloc(sizeof(ts_handler));
   h->gc_root_len = ts_gc_root_depth();
   h->frame_top = g_ts_frame_top;
+#ifdef TSAOT_STACK_CHECK
+  h->sc_act = g_sc_cur_act;
+#endif
   h->prev = g_handlers;
   h->extbuf = extbuf;
   g_handlers = h;
@@ -12642,6 +12793,9 @@ void ts_throw(tsv v){
   ts_handler* h = g_handlers;        /* longjmp target; catch-side pops it */
   ts_gc_set_root_depth(h->gc_root_len);
   ts_frame_restore(h->frame_top);
+#ifdef TSAOT_STACK_CHECK
+  sc_unwind_to(h->sc_act);
+#endif
   if (h->extbuf) ts_longjmp(*(jmp_buf*)h->extbuf, 1);
   ts_longjmp(h->buf, 1);
 }

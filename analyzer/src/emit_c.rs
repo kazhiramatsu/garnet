@@ -8009,6 +8009,16 @@ fn stack_closures_enabled() -> bool {
     })
 }
 
+/// TSAOT_STACK_CHECK=1: every `Stack` allocation goes to the runtime's
+/// quarantine and dies with its activation (docs/stack_check_design.md); the
+/// generated C must be compiled with -DTSAOT_STACK_CHECK.
+fn stack_check_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(std::env::var("TSAOT_STACK_CHECK").as_deref(), Ok("1") | Ok("true") | Ok("yes") | Ok("on"))
+    })
+}
+
 /// Function-scope declarations of the stack cells of a body: the `ts_func`
 /// (and environment array) of every closure site with the `Stack` strategy
 /// and the struct of every class-instance site with it. Declared in the
@@ -8016,6 +8026,21 @@ fn stack_closures_enabled() -> bool {
 /// read after it does not dangle (the `Stack` strategy bounds the lifetime
 /// by the frame, not by the C block).
 fn emit_stack_cell_decls(s: &mut String, body: &[Inst], strat: &BTreeMap<u32, AllocStrategy>) {
+    if stack_check_enabled() {
+        // the cells live in the quarantine; the activation scopes them
+        let mut flat: Vec<&Inst> = Vec::new();
+        flatten_inst(body, &mut flat);
+        let any_stack = flat.iter().any(|inst| match inst {
+            Inst::AllocClosure { site, .. } | Inst::AllocObject { site, class_id: Some(_), .. } => {
+                strat.get(&site.0) == Some(&AllocStrategy::Stack)
+            }
+            _ => false,
+        });
+        if any_stack {
+            s.push_str("  TS_SC_ACTIVATION;\n");
+        }
+        return;
+    }
     if !stack_closures_enabled() {
         return;
     }
@@ -16599,6 +16624,19 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         // the struct is declared at function scope by
                         // emit_stack_cell_decls (a block-local would dangle
                         // when the value is read after the block)
+                        if stack_check_enabled() {
+                            // the quarantine copy of the same initialization
+                            let o = format!("_sco{}", dst.0);
+                            let _ = writeln!(s, "  {{ {0}* {1} = ({0}*)ts_sc_alloc(sizeof({0}), {2}u, __func__);", cn, o, site.0);
+                            let _ = writeln!(s, "  {0}->header.h.kind=TS_KIND_OBJECT; {0}->header.h.gen=2; {0}->header.h.size=sizeof({1}); {0}->header.proto={2}; {0}->header.shape={3};", o, cn, proto_expr, shape);
+                            if !boxed.is_empty() {
+                                let inits: Vec<String> =
+                                    boxed.iter().map(|f| format!("{}->f{} = TS_UNDEFINED;", o, f)).collect();
+                                let _ = writeln!(s, "  {}", inits.join(" "));
+                            }
+                            let _ = writeln!(s, "  {} = ts_obj({}); }}", dst_name, o);
+                            return;
+                        }
                         let decl = if stack_closures_enabled() && ctx.stack_cells {
                             format!("  memset(&sobj{0}, 0, sizeof({1}));", dst.0, cn)
                         } else {
@@ -16770,6 +16808,26 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     "  ts_set_fn_meta({0}, FN_ARITY[{1}], FN_NAME[{1}]);\n  if (FN_HAS_PROTOTYPE[{1}]) ts_set_fn_prototype({0}, {2}());\n",
                     dst_name, func.0, make_proto)
             };
+            if st == AllocStrategy::Stack && stack_closures_enabled() && ctx.stack_cells && stack_check_enabled() {
+                let _ = writeln!(s, "  {{ ts_func* _scf = (ts_func*)ts_sc_alloc(sizeof(ts_func), {}u, __func__);", site.0);
+                let env = if captures.is_empty() {
+                    "NULL".to_string()
+                } else {
+                    let _ = writeln!(
+                        s,
+                        "  tsv* _sce = (tsv*)ts_sc_alloc_raw({} * sizeof(tsv), {}u, __func__);",
+                        captures.len(), site.0
+                    );
+                    for (i, c) in captures.iter().enumerate() {
+                        let _ = writeln!(s, "  _sce[{}] = {};", i, ctx.val(c.cell.0));
+                    }
+                    "_sce".to_string()
+                };
+                let _ = writeln!(s, "  ts_init_fn_stack(_scf, (ts_code){}, {}, {}, {});", fname, env, captures.len(), tt);
+                let _ = writeln!(s, "  {} = ts_func_v(_scf); }} /* site {} Stack (checked) */", dst_name, site.0);
+                s.push_str(&set_meta);
+                return;
+            }
             if st == AllocStrategy::Stack && stack_closures_enabled() && ctx.stack_cells {
                 // A closure that never leaves this frame: the ts_func and its
                 // environment live in function-scope stack cells declared by

@@ -143,6 +143,10 @@ usage: $PROG [-c | -S] [-o <out.c>] [-p <tsconfig>] <input.ts>
   --rt-stats    compile the runtime with -DTSAOT_RT_STATS: counters (GC/alloc/
                 probe lengths/…) are printed to stderr at exit
                 (TSAOT_RT_STATS_FILE=path appends there instead)
+  --stack-check allocate the escape analysis' stack objects in a quarantine and
+                report one reachable after its frame returned
+                (docs/stack_check_design.md; TSAOT_STACK_CHECK_CONTINUE=1
+                reports every site instead of aborting at the first)
   -h, --help    show this help
 
 env: TSAOT_CC (default "cc -O2"), TSAOT_ANALYZER=rust|ts|native (default rust),
@@ -185,6 +189,7 @@ emit_only=0      # -c
 to_stdout=0      # -S
 profile=0        # --profile
 rt_stats=0       # --rt-stats
+stack_check=0    # --stack-check
 out_c=""         # -o
 input=""
 project=""
@@ -198,6 +203,7 @@ while [ $# -gt 0 ]; do
     --untyped) export TSAOT_UNTYPED=1 ;;
     --profile) profile=1 ;;
     --rt-stats) rt_stats=1 ;;
+    --stack-check) stack_check=1; export TSAOT_STACK_CHECK=1 ;;
     -h|--help) usage; exit 0 ;;
     --) shift; break ;;
     -*) die "unknown option: $1 (try $PROG --help)" ;;
@@ -299,6 +305,7 @@ export TSAOT_USE_MIMALLOC
 # name per flag combination so variants never poison each other's cache.
 rt_suffix=""
 if [ "$rt_stats" -eq 1 ]; then CC="$CC -DTSAOT_RT_STATS"; rt_suffix="${rt_suffix}_stats"; fi
+if [ "$stack_check" -eq 1 ]; then CC="$CC -DTSAOT_STACK_CHECK"; rt_suffix="${rt_suffix}_sc"; fi
 if [ "$profile" -eq 1 ]; then CC="$CC -g -fno-omit-frame-pointer"; rt_suffix="${rt_suffix}_prof"; fi
 export ROOT CC
 . "$ROOT/scripts/lib/mimalloc_flags.sh" || die "failed to load mimalloc flags"

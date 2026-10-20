@@ -117,6 +117,14 @@ Principle: **measurement over theory**. Minimal reproduction → a probe that pi
      = the signature of an unmarked death + region reuse**; 0xDD = a moved-from read)
    - `TSAOT_GC_NURSERY=0` … turn off the bump nursery
    - `TSAOT_UNTYPED=1` … isolate whether type-driven optimization (SROA/unbox) is the cause
+   - `garnet --stack-check` … every escape-analysis `Stack` object (class instance, scope record,
+     closure) lives in a never-reused quarantine and dies with its activation; a dead one the
+     collector reaches is reported with its site and C function (`docs/stack_check_design.md`).
+     The first thing to run on a value that changes with the stack layout. Whole suites:
+     `TSAOT_STACK_CHECK=1 TSAOT_CC="gcc -O2 -DTSAOT_STACK_CHECK" scripts/gate.sh conf all`;
+     `TSAOT_STACK_CHECK_CONTINUE=1` reports every site, `TSAOT_STACK_CHECK_FULL_EVERY=N` adds a
+     full collection every N minor ones (`TSAOT_GC_FULL_THRESHOLD_BYTES` is no substitute: once
+     the heap exceeds it, every allocation collects).
 3. **Backtrace** (cheap if the crash is instantaneous):
    ```bash
    cat > /tmp/bt.lldb <<EOF

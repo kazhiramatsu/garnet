@@ -11,3 +11,6 @@ echo "[runtime] compiling ts_rt + tests"
 $CC ts_rt_test.c ts_rt.c -DTSAOT_ENABLE_FETCH=1 -lm -lcurl $TSAOT_LDLIBS -o /tmp/tsaot_rt_test
 echo "[runtime] running"
 /tmp/tsaot_rt_test
+echo "[runtime] stack check (docs/stack_check_design.md)"
+$CC -DTSAOT_STACK_CHECK ts_sc_test.c ts_rt.c -DTSAOT_ENABLE_FETCH=1 -lm -lcurl $TSAOT_LDLIBS -o /tmp/tsaot_sc_test
+/tmp/tsaot_sc_test

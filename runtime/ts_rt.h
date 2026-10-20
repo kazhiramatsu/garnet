@@ -1961,7 +1961,20 @@ typedef struct ts_handler {
   ts_frame_hdr* frame_top;
   struct ts_handler* prev;
   void* extbuf;
+#ifdef TSAOT_STACK_CHECK
+  uint64_t sc_act; /* the activation that pushed it (docs/stack_check_design.md) */
+#endif
 } ts_handler;
+#ifdef TSAOT_STACK_CHECK
+/* Stack check: Stack objects in a quarantine, dead after their activation. */
+typedef struct { uint64_t id, prev; } ts_sc_act;
+ts_sc_act ts_sc_enter(void);
+void ts_sc_leave(ts_sc_act* a);
+void* ts_sc_alloc(size_t size, uint32_t site, const char* fn);
+void* ts_sc_alloc_raw(size_t size, uint32_t site, const char* fn);
+unsigned long long ts_sc_report_count(void);
+#define TS_SC_ACTIVATION ts_sc_act _sc_act __attribute__((cleanup(ts_sc_leave))) = ts_sc_enter(); (void)_sc_act
+#endif
 int         ts_gc_root_depth(void);
 void        ts_gc_set_root_depth(int n);
 ts_handler* ts_eh_push(void);

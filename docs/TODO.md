@@ -6054,14 +6054,42 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   compile identical (13.20M). A/B against `x52`, two rounds of three
   alternating runs: 4.502 vs 4.513 s and 4.500 vs 4.513 s median:
   neutral. Node 3.28 s (1.37x).
-- Next slices, in order. First a dynamic check of the stack strategies
-  (four holes in one probing session say the analysis needs a net, not
-  more fixtures): a check mode that allocates every `Stack` object (class
-  instances, scope records, closures and their environments) in a
-  quarantine instead of the C frame, marks it dead when its frame pops or
-  unwinds, and reports a dead object the collector reaches, the site and
-  function named; run the conformance suite under GC stress and a compile
-  of the compiler in that mode. Then: (0) External element buffers (the malloc'd
+- Stack check, a dynamic net under the stack strategies (runtime,
+  emitter, driver; `docs/stack_check_design.md`; check-mode build of the
+  compiler `x54sc`). Four holes in one probing session (`x53`) said the
+  strategies need a net, not more fixtures. With `TSAOT_STACK_CHECK=1`
+  the emitter allocates every `Stack` object (class instances, scope
+  records, closures and their environments) in the runtime's quarantine
+  (`-DTSAOT_STACK_CHECK`): a never-reused region where each cell follows
+  its record (site, C function, activation). A body with a `Stack` site
+  opens an activation (`TS_SC_ACTIVATION`, a cleanup attribute: exact on
+  every return path, where the shadow frames are lazy and coalesced); its
+  cells die when it returns or when `ts_throw` unwinds past it (handlers
+  record the activation). A dead cell's payload becomes 0xDB bytes (never
+  a reference), and a dead cell reached by a full collection or touched by
+  the program is reported with its site and function (minor collections
+  also scan unreachable remembered cells, so they only skip it); an
+  `atexit` full collection catches what is still reachable at the end.
+  `garnet --stack-check`; `TSAOT_STACK_CHECK_CONTINUE=1` reports every
+  site. Validation: built with an analyzer missing one of the `x53` fixes,
+  `alias_handback_lifetimes` reports 8, 8 and 2 sites; runtime test
+  `ts_sc_test.c` (a dead cell held by a global, an unwound activation, the
+  catching activation's cell). Results: conformance 462/462 in check mode,
+  also under `TSAOT_GC_YOUNG_THRESHOLD=1`, zero reports; the bundler
+  fixtures 42/42. The compiler built in check mode (3,208 quarantine
+  sites, 955 activations) compiles `src/compiler` with zero reports,
+  diagnostics and the 78 emitted files identical to Node, also with a full
+  collection every 20 and every 2 minor ones (the new
+  `TSAOT_STACK_CHECK_FULL_EVERY`; `TSAOT_GC_FULL_THRESHOLD_BYTES` collects
+  at every allocation once the heap exceeds it and ran for eleven minutes
+  in the parser before it was stopped); the quarantine holds about 750 MB
+  per compile. The default runtime's machine code is identical and the
+  default emission unchanged (parity identical), so no A/B. Gates: unit
+  (with the new test), parity, bundler, conformance, GC stress.
+- Next slices, in order. A slice that extends the stack or an arena to a
+  new kind of allocation runs the conformance suite and a compile of the
+  compiler under `--stack-check` (an arena must allocate through the
+  quarantine in check mode). (0) External element buffers (the malloc'd
   `data` of arrays, also strings' and maps' buffers) do not count toward
   the collector's trigger: a loop that drops large arrays grows without
   bound (the `sparse_stores` kernel under `TSAOT_SPARSE_ELEMENTS=0`
