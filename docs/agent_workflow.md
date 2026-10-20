@@ -115,6 +115,9 @@ Principle: **measurement over theory**. Minimal reproduction → a probe that pi
    - `TSAOT_GC_AGE_THRESHOLD=2` … introduce aging (a promotion grace period) to change the number of moves
    - `TSAOT_GC_ZAP=1` … poison dead/moved-from cells with 0xDD (use-after-free detection. **A clean undefined/all-zeros
      = the signature of an unmarked death + region reuse**; 0xDD = a moved-from read)
+   - `TSAOT_GC_PROTECT=1` … released nursery chunks are made inaccessible for the next 64 releases
+     (`=N` for N): an access through a reference that went stale when its cell moved faults at its
+     site (run the debugger on the fault; `docs/gc_v2_design.md` §6.5)
    - `TSAOT_GC_NURSERY=0` … turn off the bump nursery
    - `TSAOT_UNTYPED=1` … isolate whether type-driven optimization (SROA/unbox) is the cause
    - `garnet --stack-check` … every escape-analysis `Stack` object (class instance, scope record,

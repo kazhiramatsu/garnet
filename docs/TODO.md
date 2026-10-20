@@ -6665,9 +6665,24 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   GC stress (with the protect step), inline policy, conformance 485/485;
   tsc compiled under protect mode. A/B against step 1: six ABBA pairs,
   wall 1.001, instructions 1.000, cycles 1.002: neutral.
+- GC v2 Y1 step 2: aging off by default (`docs/gc_v2_design.md` §6.5).
+  Every survivor promotes at its first minor collection, so a cell a minor
+  collection moves never moves again; `TSAOT_GC_AGE_THRESHOLD=2` restores
+  the adaptive policy (`docs/adaptive_aging_design.md`), which the aging
+  gates now select explicitly; the default-optimizations gate checks that
+  nothing is aged under GC stress. Gates: unit, parity (361 identical),
+  bundler, selfconf, GC stress, inline policy, conformance 485/485, the
+  three aging/default gates; tsc compiled under protect mode. A/B against
+  step 1b: eight ABBA pairs, wall -1.0%, user -1.2%, instructions -1.1%
+  (eight of eight), cycles -1.1%, peak memory +0.3%.
+  Found on the way (step 2b next): the conservative scan of coroutine
+  frames dereferences an integer-specialized local whose bits look like an
+  old-cell reference (`-2251799813685248 + 4096` held across an `await`
+  crashes under frequent full collections).
 - Next slices, in order. GC v2 first (`docs/gc_v2_design.md` §6.5, Y1:
-  2 aging off; 3 nursery chunks from the cage; 4 direct pointers one kind
-  at a time (with precise coroutine frames); 5 handles removed).
+  2b precise coroutine frames (the emitter groups the frame's `tsv`
+  locals and records their count; fixes the crash above); 3 nursery chunks
+  from the cage; 4 direct pointers one kind at a time; 5 handles removed).
   A slice that extends the stack or an arena to a
   new kind of allocation runs the conformance suite and a compile of the
   compiler under `--stack-check` (an arena must allocate through the

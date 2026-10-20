@@ -572,6 +572,23 @@ word that looks like a reference is marked; step 4 needs a precise map,
 the emitter grouping the frame's `tsv` locals and recording their count,
 or the referenced cells pinned).
 
+Step 2 result. Aging is off by default (`TSAOT_GC_AGE_THRESHOLD=1`, every
+survivor promotes at its first minor collection; `=2` restores the
+adaptive policy, which the aging gates now select explicitly). Against
+step 1b, eight ABBA pairs: wall -1.0%, instructions -1.1% (eight of eight),
+cycles -1.1%, peak memory +0.3%. The to-space path, the scan credits and
+the promotion barrier stay behind the knob until step 5 rewrites the minor
+collection.
+
+Found while reading the coroutine scan: the conservative scan also reads
+the frame's `long long` (integer-specialized) locals, and an integer whose
+bits look like an old-cell reference (top 16 bits 0xFFF8 to 0xFFFA: the
+integers in [-2^51, -2^51 + 3 * 2^48)) is dereferenced by a full
+collection: `-2251799813685248 + 4096` held across an `await` crashes the
+program under frequent full collections (`TSAOT_GC_FULL_THRESHOLD_BYTES=65536`).
+The precise frame map of step 4 removes the conservative scan, so it moves
+ahead as its own slice (step 2b).
+
 ## 7. Verification
 
 - Gates of every slice: unit, parity (`scripts/emitc_diff.sh`), bundler,

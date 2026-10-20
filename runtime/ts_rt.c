@@ -457,11 +457,14 @@ static void gc_payload_after_collection(int full){
    happen to straddle one minor no longer pollute the old gen. Pinned survivors
    keep the old rule (promote on release). TSAOT_GC_AGE_THRESHOLD overrides;
    full GC always promotes.
-   DEFAULT 2 with adaptive fallback: low-survival cohorts get one collection
-   of grace, while cohorts whose aged bytes overwhelmingly promote switch back
-   to first-survival promotion for eight minors. TSAOT_GC_AGE_THRESHOLD=1
-   restores unconditional first-survival promotion. */
-static uint8_t g_gc_age_threshold = 2;
+   DEFAULT 1 (first-survival promotion) since GC v2 Y1 step 2
+   (docs/gc_v2_design.md §6.5): measured neutral on the compiler, and every
+   cell a minor collection moves is then promoted, so a moved cell is
+   rewritten once and never moves again. TSAOT_GC_AGE_THRESHOLD=2 restores
+   the adaptive policy: low-survival cohorts get one collection of grace,
+   while cohorts whose aged bytes overwhelmingly promote switch back to
+   first-survival promotion for eight minors. */
+static uint8_t g_gc_age_threshold = 1;
 /* Adaptive aging keeps the threshold-2 win for low-survival cohorts without
    letting survivor residency halve the next allocation interval or repeatedly
    recopy high-survival cohorts. The fixed-policy kill switch restores the old

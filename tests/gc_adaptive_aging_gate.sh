@@ -11,13 +11,15 @@ fixture="$ROOT/benchmarks/gc/gc_survivors.ts"
 TSAOT_PRETENURE=0 \
   "$ROOT/garnet" --rt-stats -o "$work/survivors.c" "$fixture" >/dev/null 2>&1
 
+# Aging is off by default (docs/gc_v2_design.md §6.5 step 2); threshold 2
+# selects the adaptive policy this gate measures.
 env \
-  -u TSAOT_GC_AGE_THRESHOLD \
   -u TSAOT_GC_AGING_ADAPTIVE \
   -u TSAOT_GC_YOUNG_THRESHOLD \
   -u TSAOT_GC_NURSERY_BYTES \
   -u TSAOT_GC_NURSERY \
   -u TSAOT_DISABLE_MOVING_MINOR \
+  TSAOT_GC_AGE_THRESHOLD=2 \
   TSAOT_RT_STATS_FILE="$work/adaptive.stats" \
   ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=0}" \
   "$work/survivors" >"$work/adaptive.out"
@@ -64,7 +66,7 @@ immediate_copied="$(sed -n 's/.*aging: copied_bytes=\([0-9][0-9]*\).*/\1/p' "$wo
 [[ "${activations:-0}" -gt 0 &&
    "${fallback_minors:-0}" -gt 0 &&
    "${copied_bytes:-0}" -gt 0 ]] || {
-  echo "[gc-adaptive-aging] FAIL: default adaptive policy did not age then fall back"
+  echo "[gc-adaptive-aging] FAIL: the adaptive policy did not age then fall back"
   exit 1
 }
 [[ "${immediate_copied:-0}" -eq 0 ]] || {

@@ -77,8 +77,8 @@ if [[ "${TSAOT_CI_GC_STRESS:-0}" == "1" ]]; then
     echo "[default-opts] FAIL: generational GC did not run a minor collection"
     exit 1
   }
-  [[ "${aging_copied:-0}" -gt 0 ]] || {
-    echo "[default-opts] FAIL: adaptive threshold-2 aging is not enabled by default"
+  [[ "${aging_copied:-0}" -eq 0 ]] || {
+    echo "[default-opts] FAIL: aging is enabled by default (first-survival promotion expected)"
     exit 1
   }
 fi

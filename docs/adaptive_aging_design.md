@@ -69,8 +69,11 @@ still run so promoted parents can retain references to them.
 
 ## Runtime controls
 
-- Default: `TSAOT_GC_AGE_THRESHOLD=2`, adaptive feedback enabled.
-- `TSAOT_GC_AGE_THRESHOLD=1`: immediate first-survival promotion.
+- Default: `TSAOT_GC_AGE_THRESHOLD=1`, immediate first-survival promotion
+  (since GC v2 Y1 step 2, `docs/gc_v2_design.md` §6.5: neutral on the
+  compiler, and a cell a minor collection moves then never moves again).
+- `TSAOT_GC_AGE_THRESHOLD=2`: the adaptive policy of this document
+  (adaptive feedback enabled; the default until GC v2).
 - `TSAOT_GC_AGING_ADAPTIVE=0`: fixed threshold and legacy shared-capacity
   behavior for diagnosis and A/B measurement.
 - `TSAOT_GC_NURSERY_BYTES=N`: nursery and feedback-window scale.
