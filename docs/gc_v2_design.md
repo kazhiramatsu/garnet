@@ -287,8 +287,8 @@ encoding or the heap layout.
   neutral to 1% slower on the compile (the 256 KiB written ahead of use is
   out of L1 by the time the cells are bumped) and doubled the GC stress
   gate (a minor collection per allocation zeroes a chunk per allocation).
-  (d) To measure: aging off (`TSAOT_GC_AGE_THRESHOLD=1`), given G0's
-  finding that aging saves 5 MB for 80 MB of copies.
+  (d) Aging off (`TSAOT_GC_AGE_THRESHOLD=1`): 4.365 vs 4.400 s median, five
+  of eight pairs faster, +10 MB peak: neutral; aging goes with G3.
 - **G2 — the cage, the block heap and payloads in it.** Cage, block table,
   bitmaps, size-class blocks with cursor allocation, large runs; every
   payload of §4.6 moves into payload cells; the nursery sweep stops freeing
@@ -385,7 +385,7 @@ marking), each with the full gates, the GC stress gate under zapping and a
 compile A/B:
 
 - **G2a** the payload heap itself and closure environments (943k of the
-  1.36M dying young payloads; the environment pool goes);
+  1.36M dying young payloads; the environment pool goes); done: neutral (instructions +0.02%, cycles +0.16%);
 - **G2b** element buffers and sparse tables;
 - **G2c** property vectors, dictionary vectors and property indexes;
 - **G2d** Map and Set buffers;

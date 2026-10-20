@@ -90,6 +90,299 @@ static int g_nursery_enabled = 1;           /* TSAOT_GC_NURSERY=0 kill switch */
 static size_t g_payload_fresh_bytes = 0;
 static size_t g_payload_budget_bytes = 0;
 static inline void gc_note_payload(size_t bytes){ g_payload_fresh_bytes += bytes; }
+
+/* ---------------- payload heap (docs/gc_v2_design.md §6.1, slice G2) ----------------
+   Buffers owned by exactly one cell (closure environments first) live in a
+   reserved address range, the cage, cut into 64 KiB blocks. A small payload
+   is a cell of one size class per block; a payload above
+   GC_PAYLOAD_SMALL_MAX takes a run of whole blocks. One mark bit per 16-byte
+   granule. A set mark means "in use across collections": a payload of an
+   old owner is allocated marked, and every scan of an owner marks its
+   payloads (gc_payload_mark from gc_scan_cell), so after a collection every
+   unmarked payload is free — those of dead young owners included, without a
+   visit. Allocation bumps a per-class cursor over runs of unmarked cells; a
+   cell behind the cursor is never handed out twice in one cycle, and a
+   collection restarts the cursors (a block epoch). A full collection clears
+   every payload mark before marking. Pointers outside the cage (a stack
+   closure's borrowed environment) are not payloads and are ignored. */
+#include <sys/mman.h>
+#if defined(TS_ASAN_ENABLED)
+extern void __asan_poison_memory_region(const void *addr, size_t size);
+#define GC_PAYLOAD_POISON(p, n)   __asan_poison_memory_region((p), (n))
+#define GC_PAYLOAD_UNPOISON(p, n) __asan_unpoison_memory_region((p), (n))
+#else
+#define GC_PAYLOAD_POISON(p, n)   ((void)0)
+#define GC_PAYLOAD_UNPOISON(p, n) ((void)0)
+#endif
+#define GC_BLOCK_SHIFT 16u
+#define GC_BLOCK_BYTES ((size_t)1u << GC_BLOCK_SHIFT)
+#define GC_BLOCK_GRANULES (GC_BLOCK_BYTES >> 4)
+#define GC_BLOCK_BITMAP_WORDS (GC_BLOCK_GRANULES / 64u)
+#define GC_PAYLOAD_SMALL_MAX ((size_t)16384u)
+#define GC_PAYLOAD_NCLASS 64
+#define GC_CAGE_COMMIT_BLOCKS 16u   /* the frontier commits 1 MiB at a time */
+enum { GC_BLK_FREE = 0, GC_BLK_PAYLOAD = 1, GC_BLK_LARGE = 2, GC_BLK_LARGE_CONT = 3 };
+typedef struct gc_block {
+  uint8_t state, cls, mark, spare;
+  uint32_t epoch;      /* the cursor is valid when it equals g_payload_epoch */
+  uint32_t cursor;     /* next candidate cell offset */
+  uint32_t live;       /* marked bytes (payload blocks) */
+  uint32_t next;       /* class list, free list or large list: block index + 1 */
+  uint32_t prev;       /* large list back link */
+  uint32_t nblocks;    /* large run length in blocks */
+  uint32_t bytes;      /* large run: requested bytes */
+} gc_block;
+typedef struct { char* ptr; char* end; uint32_t head; uint32_t scan; } gc_pclass;
+static char* g_cage_base = NULL;
+static size_t g_cage_bytes = 0;
+static uint32_t g_cage_blocks = 0, g_cage_frontier = 0, g_cage_committed = 0;
+static gc_block* g_blocks = NULL;
+static uint64_t* g_cage_bitmaps = NULL;
+static uint32_t g_free_blocks = 0;        /* single free blocks (index + 1) */
+static uint32_t g_large_head = 0;         /* large runs (index + 1) */
+static uint32_t g_payload_epoch = 1;
+static gc_pclass g_pclass[GC_PAYLOAD_NCLASS];
+static uint32_t g_pclass_size[GC_PAYLOAD_NCLASS];
+static uint8_t g_pclass_of[(GC_PAYLOAD_SMALL_MAX >> 4) + 1];
+static int g_pclass_n = 0;
+/* Debug modes (TSAOT_GC_ZAP, ASan): the runs handed out in the current cycle,
+   so that after a minor collection only those are checked for cells that
+   became free (old payloads keep their marks; explicit frees are zapped at
+   once). A full collection checks every block. */
+#if defined(TS_ASAN_ENABLED)
+#define GC_PAYLOAD_CHECKED 1
+#else
+#define GC_PAYLOAD_CHECKED g_gc_zap
+#endif
+typedef struct { char* start; char* end; uint32_t size; } gc_prun;
+static gc_prun* g_payload_runs = NULL;
+static size_t g_payload_runs_len = 0, g_payload_runs_cap = 0;
+static void gc_payload_log_run(char* start, char* end, uint32_t size){
+  if (g_payload_runs_len == g_payload_runs_cap){
+    size_t next = g_payload_runs_cap ? g_payload_runs_cap * 2 : 256;
+    gc_prun* grown = (gc_prun*)realloc(g_payload_runs, sizeof(gc_prun) * next);
+    if (!grown) ts_abort_msg("out of memory growing the payload run log");
+    g_payload_runs = grown; g_payload_runs_cap = next;
+  }
+  g_payload_runs[g_payload_runs_len++] = (gc_prun){ start, end, size };
+}
+static void gc_cage_init(void){
+  size_t want = (size_t)64u << 30;
+  const char* gb = getenv("TSAOT_GC_CAGE_GB");
+  if (gb && gb[0]){ unsigned long v = strtoul(gb, NULL, 10); if (v) want = (size_t)v << 30; }
+  for (; want >= ((size_t)1u << 28); want >>= 1){
+    void* m = mmap(NULL, want + GC_BLOCK_BYTES, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (m == MAP_FAILED) continue;
+    uintptr_t base = ((uintptr_t)m + GC_BLOCK_BYTES - 1u) & ~(uintptr_t)(GC_BLOCK_BYTES - 1u);
+    g_cage_base = (char*)base; g_cage_bytes = want;
+    break;
+  }
+  if (!g_cage_base) ts_abort_msg("cannot reserve the heap cage (TSAOT_GC_CAGE_GB)");
+  g_cage_blocks = (uint32_t)(g_cage_bytes >> GC_BLOCK_SHIFT);
+  void* bt = mmap(NULL, sizeof(gc_block) * (size_t)g_cage_blocks, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+  void* bm = mmap(NULL, sizeof(uint64_t) * GC_BLOCK_BITMAP_WORDS * (size_t)g_cage_blocks, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+  if (bt == MAP_FAILED || bm == MAP_FAILED) ts_abort_msg("cannot reserve the heap cage tables");
+  g_blocks = (gc_block*)bt; g_cage_bitmaps = (uint64_t*)bm;
+  /* size classes: 16-byte steps to 256 B, then about 12.5% (multiples of 16) */
+  uint32_t sz = 16u;
+  while (g_pclass_n < GC_PAYLOAD_NCLASS){
+    g_pclass_size[g_pclass_n++] = sz;
+    if (sz >= GC_PAYLOAD_SMALL_MAX) break;
+    uint32_t next = sz < 256u ? sz + 16u : ((sz + sz / 8u + 15u) & ~15u);
+    sz = next > GC_PAYLOAD_SMALL_MAX ? (uint32_t)GC_PAYLOAD_SMALL_MAX : next;
+  }
+  if (g_pclass_size[g_pclass_n - 1] != GC_PAYLOAD_SMALL_MAX) ts_abort_msg("payload size classes do not reach the small maximum");
+  int c = 0;
+  for (uint32_t g = 0; g <= (GC_PAYLOAD_SMALL_MAX >> 4); g++){
+    while (g_pclass_size[c] < g * 16u) c++;
+    g_pclass_of[g] = (uint8_t)c;
+  }
+}
+static inline uint64_t* gc_block_bitmap(uint32_t bi){ return g_cage_bitmaps + (size_t)bi * GC_BLOCK_BITMAP_WORDS; }
+static inline char* gc_block_base(uint32_t bi){ return g_cage_base + ((size_t)bi << GC_BLOCK_SHIFT); }
+/* A run of `n` never-used blocks at the frontier, committed on the way. */
+static uint32_t gc_cage_frontier_take(uint32_t n){
+  if (!g_cage_base) gc_cage_init();
+  if ((uint64_t)g_cage_frontier + n > g_cage_blocks) ts_abort_msg("out of memory: the heap cage is full (TSAOT_GC_CAGE_GB)");
+  uint32_t bi = g_cage_frontier;
+  g_cage_frontier += n;
+  if (g_cage_frontier > g_cage_committed){
+    uint32_t to = g_cage_frontier + GC_CAGE_COMMIT_BLOCKS - 1u;
+    to -= to % GC_CAGE_COMMIT_BLOCKS;
+    if (to > g_cage_blocks) to = g_cage_blocks;
+    if (mprotect(gc_block_base(g_cage_committed), (size_t)(to - g_cage_committed) << GC_BLOCK_SHIFT, PROT_READ | PROT_WRITE) != 0)
+      ts_abort_msg("out of memory: cannot commit heap cage blocks");
+    g_cage_committed = to;
+  }
+  return bi;
+}
+static uint32_t gc_block_take(void){
+  if (g_free_blocks){
+    uint32_t bi = g_free_blocks - 1u;
+    g_free_blocks = g_blocks[bi].next;
+    return bi;
+  }
+  return gc_cage_frontier_take(1u);
+}
+/* The next run of unmarked cells of block `bi` at or after its cursor, or 0. */
+static int gc_payload_block_run(uint32_t bi, uint32_t size, char** ptr, char** end){
+  gc_block* b = &g_blocks[bi];
+  if (b->epoch != g_payload_epoch){ b->epoch = g_payload_epoch; b->cursor = 0; }
+  uint32_t ncells = (uint32_t)(GC_BLOCK_BYTES / size);
+  if (b->live + size > ncells * size) { b->cursor = ncells * size; return 0; }
+  const uint64_t* bm = gc_block_bitmap(bi);
+  uint32_t off = b->cursor, lim = ncells * size;
+  while (off < lim && (bm[off >> 10] >> ((off >> 4) & 63u) & 1u)) off += size;
+  if (off >= lim){ b->cursor = lim; return 0; }
+  uint32_t stop = off;
+  while (stop < lim && !(bm[stop >> 10] >> ((stop >> 4) & 63u) & 1u)) stop += size;
+  b->cursor = stop;
+  *ptr = gc_block_base(bi) + off; *end = gc_block_base(bi) + stop;
+  return 1;
+}
+static void gc_payload_zap_run(char* p, size_t n){
+  if (g_gc_zap) memset(p, 0xDD, n);
+  GC_PAYLOAD_POISON(p, n);
+}
+static char* gc_payload_refill(unsigned cls){
+  gc_pclass* c = &g_pclass[cls];
+  uint32_t size = g_pclass_size[cls];
+  char* ptr; char* end;
+  while (c->scan){
+    uint32_t bi = c->scan - 1u;
+    if (gc_payload_block_run(bi, size, &ptr, &end)){
+      c->ptr = ptr; c->end = end;
+      if (GC_PAYLOAD_CHECKED) gc_payload_log_run(ptr, end, size);
+      return ptr;
+    }
+    c->scan = g_blocks[bi].next;
+  }
+  uint32_t bi = gc_block_take();
+  gc_block* b = &g_blocks[bi];
+  memset(b, 0, sizeof(*b));
+  b->state = GC_BLK_PAYLOAD; b->cls = (uint8_t)cls; b->epoch = g_payload_epoch;
+  memset(gc_block_bitmap(bi), 0, sizeof(uint64_t) * GC_BLOCK_BITMAP_WORDS);
+  /* new blocks join the head of the class list; the scan continues there */
+  b->next = c->head; c->head = bi + 1u; c->scan = bi + 1u;
+  uint32_t ncells = (uint32_t)(GC_BLOCK_BYTES / size);
+  b->cursor = ncells * size;
+  c->ptr = gc_block_base(bi); c->end = c->ptr + (size_t)ncells * size;
+  GC_PAYLOAD_POISON(c->ptr, (size_t)ncells * size);
+  if (GC_PAYLOAD_CHECKED) gc_payload_log_run(c->ptr, c->end, size);
+  return c->ptr;
+}
+static inline void gc_payload_mark_small(uint32_t bi, uintptr_t off_in_block){
+  uint32_t g = (uint32_t)(off_in_block >> 4);
+  uint64_t* w = &gc_block_bitmap(bi)[g >> 6];
+  uint64_t m = (uint64_t)1u << (g & 63u);
+  if (!(*w & m)){ *w |= m; g_blocks[bi].live += g_pclass_size[g_blocks[bi].cls]; }
+}
+static void* gc_payload_alloc_large(size_t bytes, int old){
+  uint32_t n = (uint32_t)((bytes + GC_BLOCK_BYTES - 1u) >> GC_BLOCK_SHIFT);
+  uint32_t bi = gc_cage_frontier_take(n);   /* runs are not recycled yet: rare (G0) */
+  gc_block* b = &g_blocks[bi];
+  memset(b, 0, sizeof(*b));
+  b->state = GC_BLK_LARGE; b->nblocks = n; b->bytes = (uint32_t)(bytes > UINT32_MAX ? UINT32_MAX : bytes);
+  b->mark = (uint8_t)(old ? 1 : 0);
+  for (uint32_t i = 1; i < n; i++){ memset(&g_blocks[bi + i], 0, sizeof(gc_block)); g_blocks[bi + i].state = GC_BLK_LARGE_CONT; }
+  b->next = g_large_head; b->prev = 0;
+  if (g_large_head) g_blocks[g_large_head - 1u].prev = bi + 1u;
+  g_large_head = bi + 1u;
+  char* p = gc_block_base(bi);
+  GC_PAYLOAD_UNPOISON(p, bytes);
+  gc_note_payload((size_t)n << GC_BLOCK_SHIFT);
+  return p;
+}
+/* A payload for an owner (old: allocated marked). Never collects. */
+static void* gc_payload_alloc(size_t bytes, int old){
+  if (bytes > GC_PAYLOAD_SMALL_MAX) return gc_payload_alloc_large(bytes, old);
+  if (TS_RT_UNLIKELY(!g_cage_base)) gc_cage_init();
+  unsigned cls = g_pclass_of[(bytes + 15u) >> 4];
+  gc_pclass* c = &g_pclass[cls];
+  size_t size = g_pclass_size[cls];
+  char* p = c->ptr;
+  if (TS_RT_UNLIKELY(!p || p + size > c->end)) p = gc_payload_refill(cls);
+  c->ptr = p + size;
+  GC_PAYLOAD_UNPOISON(p, size);
+  if (old){
+    uintptr_t off = (uintptr_t)(p - g_cage_base);
+    gc_payload_mark_small((uint32_t)(off >> GC_BLOCK_SHIFT), off & (GC_BLOCK_BYTES - 1u));
+  }
+  gc_note_payload(size);
+  return p;
+}
+/* Mark an owner's payload (from the collector's scan of the owner). */
+static inline void gc_payload_mark(const void* p){
+  uintptr_t off = (uintptr_t)p - (uintptr_t)g_cage_base;
+  if (!p || off >= g_cage_bytes) return;
+  uint32_t bi = (uint32_t)(off >> GC_BLOCK_SHIFT);
+  gc_block* b = &g_blocks[bi];
+  if (b->state == GC_BLK_PAYLOAD) gc_payload_mark_small(bi, off & (GC_BLOCK_BYTES - 1u));
+  else if (b->state == GC_BLK_LARGE) b->mark = 1;
+}
+/* A full collection re-marks every payload it reaches. */
+static void gc_payload_begin_full(void){
+  if (!g_cage_base) return;
+  for (int cls = 0; cls < g_pclass_n; cls++)
+    for (uint32_t l = g_pclass[cls].head; l; l = g_blocks[l - 1u].next){
+      memset(gc_block_bitmap(l - 1u), 0, sizeof(uint64_t) * GC_BLOCK_BITMAP_WORDS);
+      g_blocks[l - 1u].live = 0;
+    }
+  for (uint32_t l = g_large_head; l; l = g_blocks[l - 1u].next) g_blocks[l - 1u].mark = 0;
+}
+/* After a collection: unmarked payloads are free. Large runs are released;
+   small cells become allocatable again when the cursors restart. In the
+   debug modes the cells that became free are zapped / poisoned: after a
+   minor collection those of the runs handed out in the cycle, after a full
+   one every block. */
+static inline int gc_payload_cell_marked(char* p){
+  uintptr_t off = (uintptr_t)(p - g_cage_base);
+  uint32_t bi = (uint32_t)(off >> GC_BLOCK_SHIFT);
+  uint32_t g = (uint32_t)((off & (GC_BLOCK_BYTES - 1u)) >> 4);
+  return (int)(gc_block_bitmap(bi)[g >> 6] >> (g & 63u) & 1u);
+}
+static void gc_payload_after_collection(int full){
+  if (!g_cage_base) return;
+  g_payload_epoch++;
+  if (!g_payload_epoch) g_payload_epoch = 1;
+  if (GC_PAYLOAD_CHECKED){
+    if (full){
+      for (int cls = 0; cls < g_pclass_n; cls++){
+        uint32_t size = g_pclass_size[cls], ncells = (uint32_t)(GC_BLOCK_BYTES / size);
+        for (uint32_t l = g_pclass[cls].head; l; l = g_blocks[l - 1u].next)
+          for (uint32_t i = 0; i < ncells; i++){
+            char* cell = gc_block_base(l - 1u) + (size_t)i * size;
+            if (!gc_payload_cell_marked(cell)) gc_payload_zap_run(cell, size);
+          }
+      }
+    } else {
+      for (size_t r = 0; r < g_payload_runs_len; r++)
+        for (char* cell = g_payload_runs[r].start; cell < g_payload_runs[r].end; cell += g_payload_runs[r].size)
+          if (!gc_payload_cell_marked(cell)) gc_payload_zap_run(cell, g_payload_runs[r].size);
+    }
+    g_payload_runs_len = 0;
+  }
+  for (int cls = 0; cls < g_pclass_n; cls++){
+    gc_pclass* c = &g_pclass[cls];
+    c->ptr = c->end = NULL; c->scan = c->head;
+  }
+  uint32_t l = g_large_head;
+  while (l){
+    gc_block* b = &g_blocks[l - 1u];
+    uint32_t next = b->next;
+    if (!b->mark){
+      if (b->prev) g_blocks[b->prev - 1u].next = b->next; else g_large_head = b->next;
+      if (b->next) g_blocks[b->next - 1u].prev = b->prev;
+      gc_payload_zap_run(gc_block_base(l - 1u), (size_t)b->nblocks << GC_BLOCK_SHIFT);
+      /* the run's blocks join the single-block free list */
+      for (uint32_t i = 0; i < b->nblocks; i++){
+        uint32_t bi = l - 1u + i;
+        g_blocks[bi].state = GC_BLK_FREE; g_blocks[bi].next = g_free_blocks; g_free_blocks = bi + 1u;
+      }
+    }
+    l = next;
+  }
+}
 /* Aging (tenure grace): a marked arena survivor is copied WITHIN the nursery
    (staying YOUNG, age = its remembered byte, unused while young) until it has
    survived this many minors; only then does it evacuate to the old gen. 1 =
@@ -1100,32 +1393,9 @@ tsv ts_set_proto_user(tsv obj, tsv proto){
 }
 
 /* ---- first-class callable values (methods + closures) ---- */
-/* Captured-environment buffers are small, exact-size and short-lived (an
-   inner declaration is boxed on every call of its enclosing function). Keep
-   bounded per-length free lists so the common sizes bypass the allocator;
-   ASan builds keep real allocations so lifetime errors stay visible. */
-#define TS_ENV_POOL_MAX_SLOTS 16u
-#define TS_ENV_POOL_MAX_TOTAL 65536u
-static tsv* g_env_pool[TS_ENV_POOL_MAX_SLOTS + 1u];
-static uint32_t g_env_pool_count = 0;
-static tsv* env_alloc(uint32_t n){
-#if !defined(TS_ASAN_ENABLED)
-  if (n <= TS_ENV_POOL_MAX_SLOTS){
-    tsv* p = g_env_pool[n];
-    if (p){ memcpy(&g_env_pool[n], p, sizeof(void*)); g_env_pool_count--; return p; }
-  }
-#endif
-  return (tsv*)malloc(sizeof(tsv) * (size_t)n);
-}
-static void env_free(tsv* p, uint32_t n){
-  if (!p) return;
-#if !defined(TS_ASAN_ENABLED)
-  if (n && n <= TS_ENV_POOL_MAX_SLOTS && g_env_pool_count < TS_ENV_POOL_MAX_TOTAL){
-    memcpy(p, &g_env_pool[n], sizeof(void*)); g_env_pool[n] = p; g_env_pool_count++; return;
-  }
-#endif
-  free(p);
-}
+/* A heap closure's captured-environment buffer is a payload (G2a): it is
+   released with the closure, without a visit, when a collection does not
+   mark it. A stack closure borrows its caller's array (outside the cage). */
 static tsv ts_make_fn_impl(ts_code code, tsv* env, uint32_t envlen, int pretenured){
   ts_func* f = pretenured
     ? gc_alloc_pretenured(sizeof(ts_func), TS_KIND_FUNC)
@@ -1136,7 +1406,7 @@ static tsv ts_make_fn_impl(ts_code code, tsv* env, uint32_t envlen, int pretenur
   tsv fv = ts_func_v(f);
   if (pretenured) ts_write_barrier(fv, f->o.proto);
   if (env && envlen){
-    f->env = env_alloc(envlen);
+    f->env = (tsv*)gc_payload_alloc(sizeof(tsv) * (size_t)envlen, pretenured);
     for (uint32_t i=0;i<envlen;i++){
       f->env[i]=env[i];
       if (pretenured) ts_write_barrier(fv, env[i]);
@@ -4723,6 +4993,7 @@ static void gc_scan_cell(ts_gc_header* h, int young, int depth){
     if (s->flags & TS_STR_FLAG_VIEW) gc_visit_slot(&s->parent, young, depth, stable);
   } else if (h->kind==TS_KIND_FUNC){ ts_func* f=(ts_func*)h;
     if (young) RT_STAT_ADD(kind_minor_elements[h->kind], f->envlen);
+    gc_payload_mark(f->env);
     for (uint32_t i=0;i<f->envlen;i++) gc_visit_slot(&f->env[i], young, depth, stable);
     gc_mark_common_props(&f->o, young, depth, stable);
     gc_visit_slot(&f->prototype_prop, young, depth, stable);
@@ -4792,7 +5063,7 @@ static void gc_free_cell_payload(ts_gc_header* h){
   } else if (h->kind==TS_KIND_ARRAY){
     ts_array* a=(ts_array*)h; array_free_data(a); props_free(&a->o); free(a->o.prop_index);
   } else if (h->kind==TS_KIND_FUNC){
-    ts_func* f=(ts_func*)h; env_free(f->env, f->envlen); props_free(&f->o); free(f->o.prop_index);
+    ts_func* f=(ts_func*)h; props_free(&f->o); free(f->o.prop_index);   /* the environment is a payload */
   } else if (h->kind==TS_KIND_MAP){
     ts_map* m=(ts_map*)h; free(m->keys); free(m->vals); free(m->hashes); free(m->index); free(m->iteration_order); props_free(&m->o); free(m->o.prop_index);
   } else if (h->kind==TS_KIND_SET){
@@ -5378,6 +5649,7 @@ void ts_gc_collect_young(void){
   g_sc_minor = 0;
   g_sc_minors_since_full++;
 #endif
+  gc_payload_after_collection(0);
   G0_PHASE(g0_minor_ns, 5);
   RT_STAT_GC_T1;
 }
@@ -5385,6 +5657,7 @@ void ts_gc_collect(void){
   RT_STAT_INC(full_gc); RT_STAT_GC_T0;
   G0_T0;
   g_payload_fresh_bytes = 0;
+  gc_payload_begin_full();
   prop_add_epoch_bump();
   gc_weak_begin();
   gc_mark_async_roots();
@@ -5468,6 +5741,7 @@ void ts_gc_collect(void){
   g_nursery_fresh_bytes = 0;
   g_nursery_survivor_bytes = 0;
   gc_clear_nonheap_marks();
+  gc_payload_after_collection(1);
   G0_PHASE(g0_full_ns, 5);
   RT_STAT_GC_T1;
 }

@@ -6494,8 +6494,28 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   relinked the same way (`native_s350g1base`), eight ABBA pairs under
   background load (Node 3.4-3.7 s): wall median ratio 0.994, user 0.996,
   G1 faster in five of eight: neutral.
+- GC v2 slice G2a: the payload heap, closure environments first
+  (`docs/gc_v2_design.md` §6.1; runtime only). A reserved 64 GiB range
+  (the cage, `TSAOT_GC_CAGE_GB`) of 64 KiB blocks, 1 mark bit per 16-byte
+  granule, size classes (16-byte steps to 256 B, then 12.5%) with per-class
+  cursors that bump over runs of unmarked cells, large payloads as runs of
+  blocks. A payload of an old owner is allocated marked; every scan of an
+  owner marks its payloads; after a collection every unmarked payload is
+  free, so a dead closure's environment is released without a visit (the
+  environment pool and its frees in the sweep go). A full collection
+  clears the payload marks first. Under `TSAOT_GC_ZAP` / ASan the cells that
+  became free are zapped / poisoned (after a minor collection only the runs
+  handed out in the cycle are checked). Fixture `gc/payload_envs` (also
+  under GC stress); a mutant without the environment mark crashes it even
+  in the default mode. Aging off (`TSAOT_GC_AGE_THRESHOLD=1`) measured on
+  G1: 4.365 vs 4.400 s median, five of eight pairs faster, +10 MB peak:
+  neutral, left for G3. Gates: unit, parity (a known FrameArena/Stack
+  annotation row), bundler, selfconf (a known spliceDrop row), GC stress,
+  inline policy, conformance 480/480. A/B against G1 (both relinked onto
+  `x69`): eight ABBA pairs, wall ratio 1.005, user 1.005; instructions
+  84.18 vs 84.17 G (+0.02%), cycles +0.16%: neutral.
 - Next slices, in order. GC v2 first (`docs/gc_v2_design.md` §6: G2
-  payloads in a block heap (G2a environments first), G3 the non-moving decision gate).
+  payloads in a block heap (G2b element buffers next), G3 the non-moving decision gate).
   A slice that extends the stack or an arena to a
   new kind of allocation runs the conformance suite and a compile of the
   compiler under `--stack-check` (an arena must allocate through the
