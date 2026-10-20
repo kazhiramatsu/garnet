@@ -6848,10 +6848,59 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   direct gain 0.38% of the instructions and 0.13% of the cycles, while the
   machinery costs 0.90% and 0.68%: a net loss until the other kinds are
   direct and the handle table is gone, after a gated runtime refactor.
+- Frame elision (`docs/frame_elision_design.md`). Every generated function
+  with a reference local linked a shadow frame with a slot for each; one
+  compile of the compiler pushed 390.8M frames (about 4% of its
+  instructions). A reference local now gets a slot only when a collection
+  can happen while it holds a value that is read afterwards: it is live
+  across a collection point (a leaf that may allocate or run user code: what
+  `body_is_gc_free` does not accept, field and element accesses included),
+  or a collection point reads it and does not keep it (a direct call keeps
+  the values it passes: they arrive as C parameters and the callee's own
+  rule gives a parameter a slot when it needs one; the runtime and indirect
+  callees may rely on the caller's slot, as before). A function with no
+  such local pushes no frame. Lazy frames, functions with a `try`, JSON DOM
+  locals, scalar slices and loops replaced by string plans keep every slot;
+  string accumulators keep theirs (`return` finishes the builder).
+  `TSAOT_FRAME_ELISION=0` keeps every slot (the parity oracle runs with
+  frames off anyway). On the compiler 668 of 9,788 frames disappear, the
+  others lose slots, and frame pushes fall to 360.7M (-7.7%). Fixture
+  `gc/frame_elision` (13 cases: a parameter only passed to a direct call,
+  one reused after more allocation, a runtime call at the last use,
+  loop-carried references, a catch after a throw, a definition late in a
+  loop body, `this` through a method that allocates, a getter, captured
+  cells, extra arguments, rest and `arguments` callees, an accumulator,
+  arguments evaluated around an allocation); known rows: the frozen emitter
+  lacks `arguments.length`. Gates: unit, parity (362 identical), bundler,
+  selfconf, GC stress, inline policy, conformance 493/493, and the whole
+  suite again with a collection at every allocation in protect mode
+  (493/493); tsc rebuilt and compiled under protect mode, with zapping, and
+  with a minor collection every 256 allocations, its 78 output files
+  identical. A/B against `n3`: eight ABBA pairs, instructions 0.9847 (eight
+  of eight), cycles 0.9845, wall 0.9847 (seven of eight). Kernel
+  `small_calls` 726 -> 686 ms (3.13x Node).
+- Where the remaining 358.7M frame pushes come from (a per-function count,
+  joined with the rule under relaxations): a precise backward liveness
+  would remove 1.4% (it never needs a slot the linear walk does not: checked
+  on all 9,753 functions); linking the frame only around inline-cache slow
+  paths in functions whose other collection points have no live reference
+  (lazy frames with calls) 12.9%; comparisons whose operands cannot be
+  objects 2.9%; builtins that do not allocate at most 6.5%; direct callees
+  that never collect (228 functions: numeric helpers such as
+  `isASCIILetter`) another 4%: 28% together. The other 72% are in
+  functions with a reference live across a real call on some path
+  (`isSimpleTypeRelatedTo`, `isTypeRelatedTo`, `getNodeLinks`), where only
+  linking the frame at the first point that needs it (most calls return
+  through flag tests first) would help.
 - Next slices, in order. GC v2 Y1 is paused (Kaz, 2026-10-21, after
   `docs/gc_v2_design.md` §6.6.1: about 1-2% at most for a large refactor
   with silent-miscompile risk); handles stay. Back to the patterns slower
-  than V8 (pattern kernels, worst native/node ratio first).
+  than V8 (pattern kernels, worst native/node ratio first). Frame elision,
+  round 2: the precise liveness, lazy frames with calls (a spill set per
+  slow path, dead slots cleared), direct callees that never collect,
+  non-allocating builtins and primitive comparisons; then measure how many
+  calls of the remaining framed functions reach a point that needs the
+  frame, before linking frames on first need.
   A slice that extends the stack or an arena to a
   new kind of allocation runs the conformance suite and a compile of the
   compiler under `--stack-check` (an arena must allocate through the

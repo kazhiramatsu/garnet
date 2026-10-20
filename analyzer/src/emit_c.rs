@@ -1829,6 +1829,12 @@ struct LiveWalk {
     /// fused `typeof x === "lit"` compares (dst, lhs, rhs) -> x: the compare
     /// reads x, which must stay live (and keep its slot) until then.
     fused: BTreeMap<(u32, u32, u32), u32>,
+    /// Frame elision (docs/frame_elision_design.md): when `gc_numeric` is
+    /// set, the positions of the leaves that may collect, each with the
+    /// references it hands to a direct call that keeps them (None: none).
+    gc_numeric: Option<BTreeSet<u32>>,
+    gc_direct: BTreeSet<u32>,
+    gc_points: Vec<(u32, Option<Vec<u32>>)>,
 }
 
 impl LiveWalk {
@@ -1952,6 +1958,26 @@ impl LiveWalk {
                     self.stack.pop();
                 }
                 leaf => {
+                    if let Some(numeric) = &self.gc_numeric {
+                        if leaf_may_collect(leaf, numeric) {
+                            let kept = match leaf {
+                                Inst::Call {
+                                    callee: CalleeRef::Direct { func },
+                                    args,
+                                    recv,
+                                    ..
+                                } if self.gc_direct.contains(&func.0) => {
+                                    let mut v: Vec<u32> = args.iter().map(|a| a.0).collect();
+                                    if let Some(r) = recv {
+                                        v.push(r.0);
+                                    }
+                                    Some(v)
+                                }
+                                _ => None,
+                            };
+                            self.gc_points.push((p, kept));
+                        }
+                    }
                     if let Inst::BinOp { dst, lhs, rhs, .. } = leaf {
                         if let Some(&x) = self.fused.get(&(dst.0, lhs.0, rhs.0)) {
                             self.note_use(x, p);
@@ -1977,6 +2003,162 @@ impl LiveWalk {
     }
 }
 
+/// `TSAOT_FRAME_ELISION=0` keeps a frame slot for every reference local.
+fn frame_elision_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_FRAME_ELISION").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
+/// A leaf that may allocate or run user code: everything `body_is_gc_free`
+/// does not accept (field and index accesses included: their slow paths may
+/// call accessors).
+fn leaf_may_collect(inst: &Inst, numeric: &BTreeSet<u32>) -> bool {
+    !match inst {
+        Inst::Const { .. }
+        | Inst::Copy { .. }
+        | Inst::Return { .. }
+        | Inst::Break { .. }
+        | Inst::Continue { .. }
+        | Inst::LoadGlobal { .. }
+        | Inst::StoreGlobal { .. }
+        | Inst::ArrayLen { .. }
+        | Inst::StringLen { .. } => true,
+        Inst::UnOp { op, operand, .. } => match op.as_str() {
+            "!" | "typeof" | "nullish" | "isundef" => true,
+            _ => numeric.contains(&operand.0),
+        },
+        Inst::BinOp { op, lhs, rhs, .. } => match op.as_str() {
+            "===" | "!==" => true,
+            _ => numeric.contains(&lhs.0) && numeric.contains(&rhs.0),
+        },
+        _ => false,
+    }
+}
+
+/// The reference locals that need a frame slot (docs/frame_elision_design.md):
+/// those live across a collection point, or read at one that does not keep
+/// them (a direct call of a function in `direct` keeps the values it is
+/// passed), and, when the function has any collection point, those the walk
+/// cannot place (used before their definition in linear order).
+fn frame_needed_locals(
+    f: &Function,
+    reflike: &[u32],
+    numeric: &BTreeSet<u32>,
+    fusion: &TypeofFusion,
+    direct: &BTreeSet<u32>,
+) -> BTreeSet<u32> {
+    let mut w = LiveWalk {
+        pos: 1,
+        parent: vec![0],
+        stack: vec![0],
+        loops: Vec::new(),
+        loop_stack: Vec::new(),
+        first: BTreeMap::new(),
+        last: BTreeMap::new(),
+        pending: Vec::new(),
+        fused: fusion.fused.iter().map(|(k, (x, _, _))| (*k, *x)).collect(),
+        gc_numeric: Some(numeric.clone()),
+        gc_direct: direct.clone(),
+        gc_points: Vec::new(),
+    };
+    for prm in &f.params {
+        w.first.insert(prm.0, (0, Some(0)));
+        w.last.insert(prm.0, 0);
+    }
+    if let Some(r) = f.rest_param {
+        w.first.insert(r, (0, Some(0)));
+        w.last.insert(r, 0);
+    }
+    w.walk(&f.body);
+    let pending = std::mem::take(&mut w.pending);
+    for (id, li) in pending {
+        let end = w.loops[li].1;
+        w.touch_last(id, end);
+    }
+    let any = !w.gc_points.is_empty();
+    let mut needed = BTreeSet::new();
+    for &id in reflike {
+        let Some(&(fp, blk)) = w.first.get(&id) else { continue };
+        let lp = *w.last.get(&id).unwrap_or(&fp);
+        if blk.is_none() {
+            if any {
+                needed.insert(id);
+            }
+            continue;
+        }
+        for (g, kept) in &w.gc_points {
+            if *g > fp && *g < lp {
+                needed.insert(id);
+                break;
+            }
+            if *g == lp && lp > fp && !kept.as_ref().is_some_and(|k| k.contains(&id)) {
+                needed.insert(id);
+                break;
+            }
+        }
+    }
+    needed
+}
+
+fn body_has_try(body: &[Inst]) -> bool {
+    body.iter().any(|inst| match inst {
+        Inst::TryCatch { .. } => true,
+        Inst::If {
+            then_body,
+            else_body,
+            ..
+        } => body_has_try(then_body) || body_has_try(else_body),
+        Inst::Loop {
+            cond_body, body, ..
+        } => body_has_try(cond_body) || body_has_try(body),
+        _ => false,
+    })
+}
+
+/// Drops from `reflike` the reference locals that need no frame slot
+/// (`frame_needed_locals`). The caller has excluded the shapes the rule does
+/// not cover: lazy frames, JSON locals and scalar slices (their values
+/// materialize at uses). Functions with a `try` keep every slot (a catch or
+/// finally body reads locals after a throw from anywhere in the try body),
+/// as do those whose string plans replace loops by fused code. String
+/// accumulators always keep theirs: `return` finishes the builder.
+fn elide_frame_locals(
+    f: &Function,
+    reflike: &mut Vec<u32>,
+    numeric: &BTreeSet<u32>,
+    fusion: &TypeofFusion,
+    direct_sigs: &BTreeMap<u32, DirectSig>,
+    string_plans: bool,
+) {
+    if !frame_elision_enabled() || reflike.is_empty() || string_plans || body_has_try(&f.body) {
+        return;
+    }
+    let mut flat = Vec::new();
+    flatten_inst(&f.body, &mut flat);
+    let direct: BTreeSet<u32> = flat
+        .iter()
+        .filter_map(|inst| match inst {
+            Inst::Call {
+                callee: CalleeRef::Direct { func },
+                ..
+            } if direct_sigs.contains_key(&func.0) => Some(func.0),
+            _ => None,
+        })
+        .collect();
+    let mut needed = frame_needed_locals(f, reflike, numeric, fusion, &direct);
+    if string_accum_enabled() {
+        let accums = crate::string_accum::string_accumulators(f);
+        needed.extend(accums.locals.iter().copied());
+        needed.extend(accums.temps.keys().copied());
+    }
+    reflike.retain(|id| needed.contains(id));
+}
+
 fn compute_frame_layout(f: &Function, reflike: &[u32], fusion: &TypeofFusion) -> FrameLayout {
     let mut w = LiveWalk {
         pos: 1,
@@ -1988,6 +2170,9 @@ fn compute_frame_layout(f: &Function, reflike: &[u32], fusion: &TypeofFusion) ->
         last: BTreeMap::new(),
         pending: Vec::new(),
         fused: fusion.fused.iter().map(|(k, (x, _, _))| (*k, *x)).collect(),
+        gc_numeric: None,
+        gc_direct: BTreeSet::new(),
+        gc_points: Vec::new(),
     };
     for prm in &f.params {
         w.first.insert(prm.0, (0, Some(0)));
@@ -6819,6 +7004,19 @@ fn emit_i64_function(
         .filter(|l| !matches!(l.ref_kind, RefKind::Primitive) && !unboxed.contains(&l.id.0))
         .map(|l| l.id.0)
         .collect();
+    let typeof_fusion = typeof_fusion_plan(f);
+    {
+        let numeric_all: BTreeSet<u32> = unboxed.union(&int_local).copied().collect();
+        let would_be_lazy = lazy_frames_enabled()
+            && prop_pic_enabled()
+            && f.rest_param.is_none()
+            && body_is_gc_free(&f.body, &numeric_all);
+        if frame_roots_enabled() && !would_be_lazy {
+            let string_plans = string_metric_plan.is_some_and(|p| !p.loops.is_empty())
+                || string_materialization_plan.is_some_and(|p| !p.loops.is_empty());
+            elide_frame_locals(f, &mut reflike, &numeric_all, &typeof_fusion, direct_sigs, string_plans);
+        }
+    }
     let use_frame_roots = frame_roots_enabled() && !reflike.is_empty();
     if use_frame_roots {
         reflike.sort_unstable();
@@ -6828,7 +7026,6 @@ fn emit_i64_function(
     } else {
         BTreeSet::new()
     };
-    let typeof_fusion = typeof_fusion_plan(f);
     let frame_layout = if use_frame_roots && frame_coalesce_enabled() {
         Some(compute_frame_layout(f, &reflike, &typeof_fusion))
     } else {
@@ -7015,6 +7212,19 @@ fn emit_f64_function(
         .filter(|l| !matches!(l.ref_kind, RefKind::Primitive) && !unboxed.contains(&l.id.0))
         .map(|l| l.id.0)
         .collect();
+    let typeof_fusion = typeof_fusion_plan(f);
+    {
+        let numeric_all: BTreeSet<u32> = unboxed.union(&int_local).copied().collect();
+        let would_be_lazy = lazy_frames_enabled()
+            && prop_pic_enabled()
+            && f.rest_param.is_none()
+            && body_is_gc_free(&f.body, &numeric_all);
+        if frame_roots_enabled() && !would_be_lazy {
+            let string_plans = string_metric_plan.is_some_and(|p| !p.loops.is_empty())
+                || string_materialization_plan.is_some_and(|p| !p.loops.is_empty());
+            elide_frame_locals(f, &mut reflike, &numeric_all, &typeof_fusion, direct_sigs, string_plans);
+        }
+    }
     let use_frame_roots = frame_roots_enabled() && !reflike.is_empty();
     if use_frame_roots {
         reflike.sort_unstable();
@@ -7024,7 +7234,6 @@ fn emit_f64_function(
     } else {
         BTreeSet::new()
     };
-    let typeof_fusion = typeof_fusion_plan(f);
     let frame_layout = if use_frame_roots && frame_coalesce_enabled() {
         Some(compute_frame_layout(f, &reflike, &typeof_fusion))
     } else {
@@ -7396,6 +7605,20 @@ fn emit_function(
         })
         .map(|l| l.id.0)
         .collect();
+    let typeof_fusion = typeof_fusion_plan(f);
+    {
+        let numeric_all: BTreeSet<u32> = unboxed.union(&int_local).copied().collect();
+        let would_be_lazy = lazy_frames_enabled()
+            && prop_pic_enabled()
+            && f.rest_param.is_none()
+            && json_roots.is_empty()
+            && body_is_gc_free(&f.body, &numeric_all);
+        if frame_roots_enabled() && !would_be_lazy && json_locals.is_empty() && scalar_slices.is_empty() {
+            let string_plans = string_metric_plan.is_some_and(|p| !p.loops.is_empty())
+                || string_materialization_plan.is_some_and(|p| !p.loops.is_empty());
+            elide_frame_locals(f, &mut reflike, &numeric_all, &typeof_fusion, direct_sigs, string_plans);
+        }
+    }
     let use_frame_roots = frame_roots_enabled() && !reflike.is_empty();
     if use_frame_roots {
         reflike.sort_unstable();
@@ -7405,7 +7628,6 @@ fn emit_function(
     } else {
         BTreeSet::new()
     };
-    let typeof_fusion = typeof_fusion_plan(f);
     let frame_layout = if use_frame_roots && frame_coalesce_enabled() {
         Some(compute_frame_layout(f, &reflike, &typeof_fusion))
     } else {
