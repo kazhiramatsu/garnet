@@ -6579,8 +6579,22 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   against `native_s350nk` (both relinked from its compiler object): eight
   ABBA pairs, wall 0.998, user 0.999; instructions +0.04%, cycles -0.27%:
   neutral.
+- GC v2 slice G2c: property value vectors, dictionary entry vectors and
+  property indexes in the payload heap (runtime only; §6.1). The recycle
+  lists of four-entry vectors go; growth reallocates through the payload
+  heap; every scan of an owner (objects, arrays, functions, Maps, Sets)
+  marks its property payloads; a dying cell's are released by not being
+  marked. Fixture `gc/payload_props` (objects growing after promotion,
+  deletions into dictionaries with indexes, a 3,000-key dictionary, class
+  instances with extra properties; also under GC stress); a mutant without
+  the property marks fails it under GC stress with zapping. Gates: unit,
+  parity (360 identical; known rows for the fixture's computed delete),
+  bundler, selfconf, GC stress, inline policy, conformance 484/484. A/B
+  against G2b (relinked onto `nk`): eight ABBA pairs, wall 1.000, user
+  1.000; instructions +0.04%, cycles +0.25% (six pairs; +0.53% in three):
+  neutral within noise.
 - Next slices, in order. GC v2 first (`docs/gc_v2_design.md` §6: G2
-  payloads in a block heap (G2c property vectors next), G3 the non-moving decision gate).
+  payloads in a block heap (G2d Map and Set buffers next), G3 the non-moving decision gate).
   A slice that extends the stack or an arena to a
   new kind of allocation runs the conformance suite and a compile of the
   compiler under `--stack-check` (an arena must allocate through the

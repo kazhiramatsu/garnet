@@ -391,7 +391,8 @@ compile A/B:
 - **G2a** the payload heap itself and closure environments (943k of the
   1.36M dying young payloads; the environment pool goes); done: neutral (instructions +0.02%, cycles +0.16%);
 - **G2b** element buffers and sparse tables; done: neutral (cycles -0.27%);
-- **G2c** property vectors, dictionary vectors and property indexes;
+- **G2c** property vectors, dictionary vectors and property indexes; done:
+  neutral (cycles +0.25%);
 - **G2d** Map and Set buffers;
 - **G2e** promise, coroutine and `Uint16Array` buffers; `gc_free_cell_payload`
   then frees nothing but handles.

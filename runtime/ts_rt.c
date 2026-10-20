@@ -2255,7 +2255,7 @@ static void prop_index_put(ts_object* o, uint32_t prop_i){
 }
 static void prop_index_rebuild(ts_object* o, uint32_t need){
   if (need < TS_PROP_INDEX_MIN){
-    free(o->prop_index);
+    gc_owned_free(o->prop_index);
     o->prop_index = NULL;
     o->prop_index_cap = 0;
     return;
@@ -2263,8 +2263,9 @@ static void prop_index_rebuild(ts_object* o, uint32_t need){
   uint32_t cap = o->prop_index_cap ? o->prop_index_cap : 16u;
   while (need * 4u >= cap * 3u) cap *= 2u;
   if (cap != o->prop_index_cap){
-    free(o->prop_index);
-    o->prop_index = (uint32_t*)calloc(cap, sizeof(uint32_t));
+    gc_owned_free(o->prop_index);
+    o->prop_index = (uint32_t*)gc_owned_alloc(&o->h, sizeof(uint32_t) * cap);
+    memset(o->prop_index, 0, sizeof(uint32_t) * cap);
     o->prop_index_cap = cap;
   } else {
     memset(o->prop_index, 0, sizeof(uint32_t) * cap);
@@ -2292,54 +2293,21 @@ static int32_t prop_index_lookup(ts_object* o, ts_key key, uint32_t* probes){
     }
   }
 }
-/* Bounded recycle lists for the common four-property payloads: dictionary
-   entry vectors (64 bytes) and shaped value vectors (32 bytes). These buffers
-   often die in large nursery batches; reuse avoids repeated allocator page
-   setup without retaining an unbounded high-water mark. */
-#define TS_SMALL_PROPS_CACHE_MAX 65536u
-static ts_prop* g_small_props_free = NULL;
-static uint32_t g_small_props_count = 0;
-static tsv* g_small_vals_free = NULL;
-static uint32_t g_small_vals_count = 0;
-static ts_prop* props_alloc_small(void){
-  ts_prop* p = g_small_props_free;
-  if (p){
-    memcpy(&g_small_props_free, p, sizeof(void*));
-    g_small_props_count--;
-    RT_STAT_INC(small_props_reused);
-    return p;
-  }
+/* Property value vectors (shaped) and entry vectors (dictionaries) are
+   payloads of their object (docs/gc_v2_design.md §6.1, G2c): a dead object's
+   vector is released by not being marked. */
+static ts_prop* props_alloc_small(const ts_gc_header* owner){
   RT_STAT_INC(small_props_fresh);
-  return (ts_prop*)malloc(4u * sizeof(ts_prop));
+  return (ts_prop*)gc_owned_alloc(owner, 4u * sizeof(ts_prop));
 }
-static tsv* vals_alloc_small(void){
-  tsv* p = g_small_vals_free;
-  if (p){
-    memcpy(&g_small_vals_free, p, sizeof(void*));
-    g_small_vals_count--;
-    RT_STAT_INC(small_props_reused);
-    return p;
-  }
+static tsv* vals_alloc_small(const ts_gc_header* owner){
   RT_STAT_INC(small_props_fresh);
-  return (tsv*)malloc(4u * sizeof(tsv));
+  return (tsv*)gc_owned_alloc(owner, 4u * sizeof(tsv));
 }
-static void vals_free_buf(tsv* p, uint32_t cap){
-  if (!p) return;
-  if (cap == 4 && g_small_vals_count < TS_SMALL_PROPS_CACHE_MAX){
-    memcpy(p, &g_small_vals_free, sizeof(void*));
-    g_small_vals_free = p; g_small_vals_count++;
-  } else free(p);
-}
-static void props_free_buf(ts_prop* p, uint32_t cap){
-  if (!p) return;
-  if (cap == 4 && g_small_props_count < TS_SMALL_PROPS_CACHE_MAX){
-    memcpy(p, &g_small_props_free, sizeof(void*));
-    g_small_props_free = p; g_small_props_count++;
-  } else free(p);
-}
-static void props_free(ts_object* o){
-  if (obj_shaped(o)) vals_free_buf((tsv*)o->props, o->cap);
-  else props_free_buf(o->props, o->cap);
+/* A dying object's vectors (malloc'd only for owners outside the heap). */
+static void props_release_dead(ts_object* o){
+  gc_owned_release_dead(o->props);
+  gc_owned_release_dead(o->prop_index);
 }
 static void obj_to_dictionary(ts_object* o){
   if (o->h.gen == TS_GEN_OLD) o->h.hdr_spare = 0xFF; /* slots renumber: a remembered range would be stale */
@@ -2350,15 +2318,15 @@ static void obj_to_dictionary(ts_object* o){
   uint32_t cap = 0;
   if (len){
     cap = len <= 4u ? 4u : len;
-    if (cap <= 4u) v = props_alloc_small();
-    else v = (ts_prop*)malloc(sizeof(ts_prop) * cap);
+    if (cap <= 4u) v = props_alloc_small(&o->h);
+    else v = (ts_prop*)gc_owned_alloc(&o->h, sizeof(ts_prop) * cap);
     const ts_key* ks = g_ts_shape_keys[sid];
     const uint8_t* fl = g_ts_shape_flags[sid];
     for (uint32_t i = 0; i < len; i++){ v[i].key = ks[i]; v[i].val = *obj_val_at(o, i); v[i].flags = fl[i]; }
   }
   /* the inline area stays allocated (inline_cap keeps the cell size honest)
      but a dictionary never reads it; the external vector is released. */
-  if (oldcap) vals_free_buf((tsv*)o->props, oldcap);
+  if (oldcap) gc_owned_free(o->props);
   o->props = v; o->cap = cap;
   ts_obj_set_shape(o, TS_SHAPE_NONE);
   if (len >= TS_PROP_INDEX_MIN) prop_index_rebuild(o, len);
@@ -2375,24 +2343,14 @@ static ts_pref props_append_f(ts_object* o, ts_key key, uint32_t next_shape, uin
     uint32_t icap = o->h.inline_cap;
     if (o->len >= icap && o->len - icap == o->cap){
       uint32_t cap = o->cap;
-      if (!cap) o->props = (ts_prop*)vals_alloc_small();
-      else if (cap == 4){
-        tsv* grown = (tsv*)malloc(8u * sizeof(tsv));
-        memcpy(grown, (tsv*)o->props, cap * sizeof(tsv));
-        vals_free_buf((tsv*)o->props, cap); o->props = (ts_prop*)grown;
-      } else o->props = (ts_prop*)realloc(o->props, sizeof(tsv) * (size_t)cap * 2u);
-      if (cap >= 4u) gc_note_payload(sizeof(tsv) * (size_t)cap);
+      if (!cap) o->props = (ts_prop*)vals_alloc_small(&o->h);
+      else o->props = (ts_prop*)gc_owned_realloc(&o->h, o->props, sizeof(tsv) * (size_t)cap, sizeof(tsv) * (size_t)cap * 2u);
       o->cap = cap ? cap * 2u : 4u;
     }
   } else if (o->len==o->cap){
     uint32_t cap = o->cap;
-    if (!cap) o->props = props_alloc_small();
-    else if (cap == 4){
-      ts_prop* grown = (ts_prop*)malloc(8u * sizeof(ts_prop));
-      memcpy(grown, o->props, cap * sizeof(ts_prop));
-      props_free_buf(o->props, cap); o->props = grown;
-    } else o->props = (ts_prop*)realloc(o->props, sizeof(ts_prop) * (size_t)cap * 2u);
-    if (cap >= 4u) gc_note_payload(sizeof(ts_prop) * (size_t)cap);
+    if (!cap) o->props = props_alloc_small(&o->h);
+    else o->props = (ts_prop*)gc_owned_realloc(&o->h, o->props, sizeof(ts_prop) * (size_t)cap, sizeof(ts_prop) * (size_t)cap * 2u);
     o->cap = cap ? cap * 2u : 4u;
   }
   if (!shaped) prop_index_reserve(o, o->len + 1u);
@@ -5003,6 +4961,8 @@ static inline void gc_mark_property_key(ts_key key, int young, int depth){
     gc_mark_visit(sym_value_by_id(key - TS_USERSYM_KEY_BASE), young, depth);
 }
 static inline void gc_mark_common_props(ts_object* o, int young, int depth, int stable){
+  if (o->props) gc_payload_mark(o->props);
+  if (o->prop_index) gc_payload_mark(o->prop_index);
   uint32_t first = 0, end = o->len;
   /* A remembered old plain object rescanned by a minor collection visits its
      dirty cards only (docs/remembered_slots_design.md); 0 (no range) and
@@ -5125,15 +5085,15 @@ static void gc_free_cell_payload(ts_gc_header* h){
   g_heap_bytes -= (g_heap_bytes >= h->size) ? h->size : g_heap_bytes;
   gc_handle_free(h);
   if (h->kind==TS_KIND_OBJECT){
-    ts_object* o=(ts_object*)h; props_free(o); free(o->prop_index);
+    ts_object* o=(ts_object*)h; props_release_dead(o);
   } else if (h->kind==TS_KIND_ARRAY){
-    ts_array* a=(ts_array*)h; array_release_dead(a); props_free(&a->o); free(a->o.prop_index);
+    ts_array* a=(ts_array*)h; array_release_dead(a); props_release_dead(&a->o);
   } else if (h->kind==TS_KIND_FUNC){
-    ts_func* f=(ts_func*)h; props_free(&f->o); free(f->o.prop_index);   /* the environment is a payload */
+    ts_func* f=(ts_func*)h; props_release_dead(&f->o);   /* the environment is a payload */
   } else if (h->kind==TS_KIND_MAP){
-    ts_map* m=(ts_map*)h; free(m->keys); free(m->vals); free(m->hashes); free(m->index); free(m->iteration_order); props_free(&m->o); free(m->o.prop_index);
+    ts_map* m=(ts_map*)h; free(m->keys); free(m->vals); free(m->hashes); free(m->index); free(m->iteration_order); props_release_dead(&m->o);
   } else if (h->kind==TS_KIND_SET){
-    ts_set_t* s=(ts_set_t*)h; free(s->elems); free(s->hashes); free(s->index); free(s->iteration_order); props_free(&s->o); free(s->o.prop_index);
+    ts_set_t* s=(ts_set_t*)h; free(s->elems); free(s->hashes); free(s->index); free(s->iteration_order); props_release_dead(&s->o);
   }
   else if (h->kind==TS_KIND_PROMISE){ free(((ts_promise*)h)->waiters); }
   else if (h->kind==TS_KIND_CORO){
@@ -9958,10 +9918,10 @@ static tsv ts_clone_class_proto(uint32_t class_id){
     p->cap = tmpl->len;
     p->len = tmpl->len;
     if (obj_shaped(tmpl)){
-      p->props = (ts_prop*)malloc(sizeof(tsv) * p->cap);
+      p->props = (ts_prop*)gc_owned_alloc(&p->h, sizeof(tsv) * p->cap);
       for (uint32_t i = 0; i < tmpl->len; i++) ((tsv*)p->props)[i] = *obj_val_at(tmpl, i);
     } else {
-      p->props = malloc(sizeof(ts_prop) * p->cap);
+      p->props = (ts_prop*)gc_owned_alloc(&p->h, sizeof(ts_prop) * p->cap);
       memcpy(p->props, tmpl->props, sizeof(ts_prop) * tmpl->len);
       prop_index_rebuild(p, p->len);
     }
