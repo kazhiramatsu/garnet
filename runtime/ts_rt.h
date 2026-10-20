@@ -95,6 +95,13 @@ static inline double ts_to_num(tsv v) { double d; memcpy(&d, &v, 8); return d; }
    inline fast path stays a compare and a conversion). */
 int32_t ts_to_int32_slow(double d);
 uint32_t ts_to_uint32_slow(double d);
+#if defined(__ARM_FEATURE_JCVT)
+/* ARMv8.3 FJCVTZS is ECMAScript ToInt32 in one instruction: truncation toward
+   zero modulo 2^32, NaN and the infinities 0 (docs/TODO.md, Session 350 x56).
+   ToUint32 is the same residue read unsigned. */
+TS_RT_ALWAYS_INLINE int32_t ts_to_int32(double d) { return __builtin_arm_jcvt(d); }
+TS_RT_ALWAYS_INLINE uint32_t ts_to_uint32(double d) { return (uint32_t)__builtin_arm_jcvt(d); }
+#else
 TS_RT_ALWAYS_INLINE int32_t ts_to_int32(double d) {
   /* Flag words and indices are already int32 values: converting back and
      comparing exactly proves it, and skips the floor/fmod reduction. The range
@@ -112,6 +119,7 @@ TS_RT_ALWAYS_INLINE uint32_t ts_to_uint32(double d) {
   }
   return ts_to_uint32_slow(d);
 }
+#endif
 
 /* ---- immediates ---- */
 #define TS_UNDEFINED TS_BOX(TS_SEL_UNDEF, 0)

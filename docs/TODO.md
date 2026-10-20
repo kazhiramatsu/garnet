@@ -6120,6 +6120,24 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   of the compiler (watchpoint). A/B against `x53`, two rounds of three
   alternating runs: 4.668 vs 4.673 s and 4.691 vs 4.700 s median: neutral
   (desktop load: Node 3.46 s, 1.35x).
+- ToInt32 in one instruction (build `x56`, full build; runtime header).
+  The pattern kernel `small_calls` (4.2x Node), taken apart by hand:
+  replacing its property reads by direct slot loads took 920 -> 551 ms,
+  then a plain cast for the bitwise operators' ToInt32 551 -> 343 ms (the
+  frame push of the inlined helper: nothing). ToInt32 was two range
+  compares, a conversion, a conversion back and a compare; ARMv8.3
+  FJCVTZS is ECMAScript ToInt32 exactly (truncation toward zero modulo
+  2^32, NaN and the infinities 0; checked against the reference at the
+  edges), and Apple clang's default target has it (`__ARM_FEATURE_JCVT`):
+  `ts_to_int32` and `ts_to_uint32` use `__builtin_arm_jcvt` there, the old
+  path elsewhere. Alone it is 3% on the kernel (the property reads still
+  dominate: 920 -> 879 ms) and with direct slots it reaches the cast's
+  time. Fixture `operators/toint32_edges` (every bitwise operator at NaN,
+  the infinities, the int32 and uint32 bounds, past 2^32 and 2^53). Gates
+  all green. A/B against `x55`, two rounds of three alternating runs:
+  4.608 vs 4.698 s and 4.591 vs 4.723 s median, all six pairs -1.6% to
+  -3.0% (about -2.3%): the compiler's flag tests. Node 3.46-3.47 s under
+  desktop load (1.32x).
 - Next slices, in order. A slice that extends the stack or an arena to a
   new kind of allocation runs the conformance suite and a compile of the
   compiler under `--stack-check` (an arena must allocate through the
