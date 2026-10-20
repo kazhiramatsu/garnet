@@ -279,9 +279,16 @@ encoding or the heap layout.
   §9.
 - **G1 — quick wins on the current collector.** (a) Prototypes materialized by
   `fn_materialize_prototype` are pretenured: the addition cache stops
-  depending on the collector's state. (b) Payload bytes count toward the
-  minor trigger (TODO (0)). (c) The nursery zeroes a chunk when it is reset
-  instead of each cell on allocation, keeping the zero-init contract.
+  depending on the collector's state. (b) Payload growth counts toward a
+  payload budget (sixteen nurseries) that triggers a minor collection
+  (TODO (0): `sparse_stores` without sparse elements now finishes at 137 MB
+  instead of being killed at 16.6 GB). (c) Tried and dropped: zeroing a whole
+  nursery chunk when it is taken, instead of each cell on allocation, was
+  neutral to 1% slower on the compile (the 256 KiB written ahead of use is
+  out of L1 by the time the cells are bumped) and doubled the GC stress
+  gate (a minor collection per allocation zeroes a chunk per allocation).
+  (d) To measure: aging off (`TSAOT_GC_AGE_THRESHOLD=1`), given G0's
+  finding that aging saves 5 MB for 80 MB of copies.
 - **G2 — the cage, the block heap and payloads in it.** Cage, block table,
   bitmaps, size-class blocks with cursor allocation, large runs; every
   payload of §4.6 moves into payload cells; the nursery sweep stops freeing
@@ -322,6 +329,100 @@ handle issue and dereference (2-4%); G5 shrinks allocation by about a third
 call (1-2%); G7 cuts full-collection marking (about 3%) by the thread count.
 Together about 6-10% of a compile. The rest of the gap to V8 is the
 generated code's instruction count (§1), outside this document.
+
+## 6.1 G2 in detail: the payload heap
+
+G2 is the first user of the block heap, so its allocator is the one G3 will
+extend to cells. Inventory of the payloads (`gc_free_cell_payload` and the
+44 assignment sites of `ts_rt.c`): property value vectors and dictionary
+entry vectors (`props_append_f`, `obj_to_dictionary`, `vals_alloc_small` /
+`props_alloc_small` and their recycle lists, the prototype clone of a
+template), property indexes (`prop_index_rebuild`, calloc'd), element buffers
+(`array_init_storage`, `array_ensure_cap`, the rebuilt buffers of splice and
+friends, `array_densify`), sparse tables (`sparse_alloc`), closure
+environments (`env_alloc` / `env_free` and their pool), Map and Set buffers
+(`map_grow`, `set_grow`, the side index, the iteration order arrays),
+promise waiter lists, coroutine side arrays and async-generator requests,
+`Uint16Array` storage. Strings have none (string builders grow by allocating
+a new cell).
+
+Allocator (`gc_payload_*`):
+
+- The cage and 64 KiB blocks of §4.1; the 39 size classes of G0 (16-byte steps
+  to 256 B, 12.5% steps to 4 KiB). A payload above 4 KiB is a large payload:
+  malloc'd with a small header (mark, size, list links) on a list.
+- `gc_payload_alloc(bytes, owner)`: the class's cursor bumps over cells whose
+  mark bit is clear; a cell behind the cursor is never handed out again in
+  the same cycle. The cell is allocated marked when its owner is old (an
+  eden pass does not scan old owners), unmarked otherwise. `_calloc` zeroes
+  (property indexes rely on it).
+- `gc_payload_free(p)`: clears the mark (the cell is reusable after the next
+  collection) or unlinks and frees a large payload; `gc_payload_realloc` is
+  allocate, copy, free, as `realloc` is today.
+- Marking: whenever the collector scans a cell, it marks the cell's payloads
+  (a bit in the cage, the header mark of a large payload). A minor
+  collection therefore marks the payloads of every young survivor, of every
+  remembered old cell and of every non-heap cell it scans; old owners'
+  payloads keep their marks. After a minor collection every unmarked
+  payload is free: those of dead young owners and those freed explicitly.
+  A full collection clears every payload mark first. The cursors restart
+  through a block epoch.
+- Transitional cost while aging exists: the payloads of a cell kept young
+  under aging are marked by the collection that scanned it; if the cell then
+  dies young, they stay allocated until the next full collection (G0: about
+  14 MB of payloads were aged per compile). G3 removes aging.
+- Owners outside the heap (stack and arena cells, `TS_GEN_NONHEAP`) keep
+  malloc'd payloads: the collector sees such a cell only when a frame slot
+  references it, and a cell that holds no heap reference need not be
+  visible at all, so its payload could not be marked. `gc_payload_free`
+  therefore tells the two kinds of buffer apart by the cage check.
+- Payload bytes feed the G1 (b) budget; under `TSAOT_GC_ZAP` freed and
+  reclaimed payload cells are filled with 0xDD, so a payload reached through
+  a stale or unmarked pointer reads garbage under the GC stress gate.
+
+Sub-slices, each one payload family end to end (allocation, growth, release,
+marking), each with the full gates, the GC stress gate under zapping and a
+compile A/B:
+
+- **G2a** the payload heap itself and closure environments (943k of the
+  1.36M dying young payloads; the environment pool goes);
+- **G2b** element buffers and sparse tables;
+- **G2c** property vectors, dictionary vectors and property indexes;
+- **G2d** Map and Set buffers;
+- **G2e** promise, coroutine and `Uint16Array` buffers; `gc_free_cell_payload`
+  then frees nothing but handles.
+
+## 6.2 G3 in detail: cells in the block heap, handles kept
+
+G3 changes where cells live and how young cells die, but not how they are
+referenced, so the value encoding, the write barrier and Track B's two
+reference forms are untouched; the A/B against G2 then measures the
+non-moving allocation (its locality) and the removal of copying alone.
+
+- Cell blocks: the payload allocator of G2 with a second block state (cell
+  blocks), the same size classes and cursors; cells above the small maximum
+  take large runs. The nursery chunks, the to-space, aging, the unpooled
+  young list and the old list (`gc_next`) go; `gc_alloc` and
+  `gc_alloc_pretenured` allocate from the cell blocks (a pretenured cell is
+  allocated marked and old).
+- Marking keeps the header mark byte during a collection (the weak tables
+  and the non-heap visited list read it); the block bitmap holds the
+  persistent "old" marks between collections, which is what the cursors
+  read.
+- Handles are the cell index of this transitional state: every heap cell
+  has one. A log of the handles issued since the last eden collection
+  replaces the nursery sweep: after marking, a logged handle whose cell is
+  marked is promoted in place (bitmap bit, `gen = OLD`, the handle entry's
+  old bit, the mark cleared); one whose cell is not marked is freed. A full
+  collection walks the whole handle table the same way after clearing the
+  bitmaps. Dead cells are not otherwise visited; their payloads are
+  unmarked (G2).
+- Track B's rewriting of promoted cells' slots and of the recorded stable
+  slots stays as it is (promoted cells come from the log instead of the
+  sweep).
+- Gate (§6): within 1% of G2 on the compile, RSS within 10%; plus the GC
+  microbenchmarks (`scripts/bench_gc.sh`) for the cases a copying nursery
+  favors (short-lived binary trees, survivors).
 
 ## 7. Verification
 

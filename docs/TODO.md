@@ -6474,8 +6474,28 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   32 ms, full marking 32 ms; 3.1M remembered-set enrollments; the old
   generation is 590 MB of almost entirely live data at exit. Gates: unit;
   the default `ts_rt.o` text section is byte-identical (md5).
-- Next slices, in order. GC v2 first (`docs/gc_v2_design.md` §6: G1 quick
-  wins, then G2 payloads in a block heap, G3 the non-moving decision gate).
+- GC v2 slice G1 (runtime only, `docs/gc_v2_design.md` §6): (a) the
+  prototype `fn_materialize_prototype` creates for a constructor function
+  is pretenured: the addition cache records only old prototypes, so with
+  collections disabled the constructors' property additions had run the
+  slow path for the whole compile (7 such prototypes per compile; no effect
+  on a normal run). (b) Payload growth (element buffers, sparse tables,
+  property vectors, Map and Set buffers) counts toward a payload budget of
+  sixteen nurseries (`TSAOT_GC_PAYLOAD_BUDGET_BYTES`) that triggers a minor
+  collection: `sparse_stores` under `TSAOT_SPARSE_ELEMENTS=0` now finishes
+  in 18 s at 137 MB instead of being killed after 21 s at 16.6 GB (TODO
+  "Next slices" (0)). (c) Tried and dropped: zeroing a whole nursery chunk
+  when it is taken instead of each cell was neutral to 1% slower (4.320 vs
+  4.281 s, 4.237 vs 4.243 s; the chunk written ahead of use leaves L1
+  before its cells are bumped) and doubled the GC stress gate (one chunk
+  zeroed per allocation when every allocation collects).
+  Gates on the final tree: unit, parity, bundler, selfconf, GC stress,
+  inline policy, conformance 479/479. Compile A/B against the `x69` runtime
+  relinked the same way (`native_s350g1base`), eight ABBA pairs under
+  background load (Node 3.4-3.7 s): wall median ratio 0.994, user 0.996,
+  G1 faster in five of eight: neutral.
+- Next slices, in order. GC v2 first (`docs/gc_v2_design.md` §6: G2
+  payloads in a block heap (G2a environments first), G3 the non-moving decision gate).
   A slice that extends the stack or an arena to a
   new kind of allocation runs the conformance suite and a compile of the
   compiler under `--stack-check` (an arena must allocate through the

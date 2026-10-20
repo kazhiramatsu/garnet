@@ -81,6 +81,15 @@ static size_t g_nursery_fresh_bytes = 0;    /* new bump bytes since the last min
 static size_t g_nursery_survivor_bytes = 0; /* to-space bytes retained by the last minor */
 static size_t g_nursery_cap_bytes = (size_t)4u * 1024u * 1024u; /* TSAOT_GC_NURSERY_BYTES */
 static int g_nursery_enabled = 1;           /* TSAOT_GC_NURSERY=0 kill switch */
+/* Payload bytes (malloc'd element, property and table buffers) grown since
+   the last minor collection. They are outside the cells' byte count, so a
+   loop that only drops large containers would never trigger a collection
+   (docs/gc_v2_design.md, G1 (b)): past this budget the next allocation runs a
+   minor collection. Sixteen nurseries by default
+   (TSAOT_GC_PAYLOAD_BUDGET_BYTES). */
+static size_t g_payload_fresh_bytes = 0;
+static size_t g_payload_budget_bytes = 0;
+static inline void gc_note_payload(size_t bytes){ g_payload_fresh_bytes += bytes; }
 /* Aging (tenure grace): a marked arena survivor is copied WITHIN the nursery
    (staying YOUNG, age = its remembered byte, unused while young) until it has
    survived this many minors; only then does it evacuate to the old gen. 1 =
@@ -621,6 +630,13 @@ static void gc_config_init(void){
     if (end != nbytes && v) g_nursery_cap_bytes = (size_t)v;
     if (g_nursery_cap_bytes < GC_NURSERY_CHUNK_BYTES) g_nursery_cap_bytes = GC_NURSERY_CHUNK_BYTES;
   }
+  g_payload_budget_bytes = g_nursery_cap_bytes * 16u;
+  const char* pbudget = getenv("TSAOT_GC_PAYLOAD_BUDGET_BYTES");
+  if (pbudget && pbudget[0]){
+    char* end = NULL;
+    unsigned long long v = strtoull(pbudget, &end, 10);
+    if (end != pbudget && v) g_payload_budget_bytes = (size_t)v;
+  }
   /* Full-GC byte threshold override (B-3). Mainly a stress/tuning knob: a tiny
      value forces frequent full collections the way TSAOT_GC_YOUNG_THRESHOLD=1
      forces minors. The retarget rule still applies after each full GC. */
@@ -821,7 +837,8 @@ static inline void gc_before_alloc(void){
   if (TS_RT_UNLIKELY(!g_gc_config_inited)) gc_config_init();
   size_t nursery_trigger_bytes = g_gc_aging_adaptive
     ? g_nursery_fresh_bytes : g_nursery_used_bytes;
-  if (g_young_new_since_minor>=g_young_threshold || nursery_trigger_bytes>=g_nursery_cap_bytes)
+  if (g_young_new_since_minor>=g_young_threshold || nursery_trigger_bytes>=g_nursery_cap_bytes ||
+      g_payload_fresh_bytes>=g_payload_budget_bytes)
     ts_gc_collect_young();
 #ifdef TSAOT_STACK_CHECK
   if (g_sc_full_every && g_sc_minors_since_full >= g_sc_full_every){
@@ -1219,7 +1236,11 @@ static ts_func* fn_materialize_prototype(ts_func* f, tsv fnv){
     f->proto_lazy = 0;
     G0_INC(g0_proto_materialized);
     ts_gc_root(&fnv);
-    tsv proto = ts_new_proto();
+    /* Old from the start: a prototype lives as long as its function, and the
+       addition cache records only old prototypes (docs/gc_v2_design.md,
+       G1 (a)), so a young one would keep its constructors' stores on the slow
+       path until a collection promoted it. */
+    tsv proto = ts_new_proto_pretenured();
     f = (ts_func*)ts_ptr(fnv);
     f->prototype_prop = proto;
     ts_write_barrier(fnv, proto);
@@ -1413,6 +1434,7 @@ static inline void array_set_sparse_table(ts_array* a, ts_sparse_elems* s){ a->i
 static inline tsv* sparse_vals(ts_sparse_elems* s){ return (tsv*)(s->keys + (s->mask + 1u)); }
 static ts_sparse_elems* sparse_alloc(uint32_t size){   /* size: a power of two >= 8 */
   ts_sparse_elems* s = (ts_sparse_elems*)malloc(sizeof(ts_sparse_elems) + (size_t)size * (sizeof(uint32_t) + sizeof(tsv)));
+  gc_note_payload((size_t)size * (sizeof(uint32_t) + sizeof(tsv)));
   s->count = 0; s->mask = size - 1u;
   memset(s->keys, 0xFF, (size_t)size * sizeof(uint32_t));
   return s;
@@ -1514,6 +1536,7 @@ static void array_init_storage(ts_array* a, uint32_t len){
   a->len = len;
   a->cap = len < 4 ? 4 : len;
   a->data = (a->cap <= 4) ? a->inline_data : (tsv*)malloc(sizeof(tsv) * a->cap);
+  if (a->cap > 4) gc_note_payload(sizeof(tsv) * a->cap);
   for (uint32_t i=0;i<a->cap;i++) a->data[i] = TS_ARRAY_HOLE;   /* [len, cap) holes too (invariant) */
 }
 static void array_ensure_cap(ts_array* a, uint32_t need){
@@ -1522,6 +1545,7 @@ static void array_ensure_cap(ts_array* a, uint32_t need){
   uint32_t old = a->cap;
   uint32_t nc = old ? old * 2 : 4;
   while (nc < need) nc *= 2;
+  gc_note_payload(sizeof(tsv) * (size_t)(nc - old));
   if (array_uses_inline(a)){
     tsv* nd = (tsv*)malloc(sizeof(tsv) * nc);
     for (uint32_t i=0;i<old;i++) nd[i] = a->data[i];
@@ -2023,6 +2047,7 @@ static ts_pref props_append_f(ts_object* o, ts_key key, uint32_t next_shape, uin
         memcpy(grown, (tsv*)o->props, cap * sizeof(tsv));
         vals_free_buf((tsv*)o->props, cap); o->props = (ts_prop*)grown;
       } else o->props = (ts_prop*)realloc(o->props, sizeof(tsv) * (size_t)cap * 2u);
+      if (cap >= 4u) gc_note_payload(sizeof(tsv) * (size_t)cap);
       o->cap = cap ? cap * 2u : 4u;
     }
   } else if (o->len==o->cap){
@@ -2033,6 +2058,7 @@ static ts_pref props_append_f(ts_object* o, ts_key key, uint32_t next_shape, uin
       memcpy(grown, o->props, cap * sizeof(ts_prop));
       props_free_buf(o->props, cap); o->props = grown;
     } else o->props = (ts_prop*)realloc(o->props, sizeof(ts_prop) * (size_t)cap * 2u);
+    if (cap >= 4u) gc_note_payload(sizeof(ts_prop) * (size_t)cap);
     o->cap = cap ? cap * 2u : 4u;
   }
   if (!shaped) prop_index_reserve(o, o->len + 1u);
@@ -5200,6 +5226,7 @@ static void gc_sweep_pinned_young(ts_gc_header** survivors){
   }
 }
 void ts_gc_collect_young(void){
+  g_payload_fresh_bytes = 0;
   if (!g_young_heap && !g_nursery_active && !g_pinned_young) return;
   RT_STAT_INC(minor_gc); RT_STAT_GC_T0;
   G0_T0;
@@ -5357,6 +5384,7 @@ void ts_gc_collect_young(void){
 void ts_gc_collect(void){
   RT_STAT_INC(full_gc); RT_STAT_GC_T0;
   G0_T0;
+  g_payload_fresh_bytes = 0;
   prop_add_epoch_bump();
   gc_weak_begin();
   gc_mark_async_roots();
@@ -6713,6 +6741,7 @@ static long map_find(ts_map* m, tsv k){
 static void map_grow(ts_map* m){
   if (m->len < m->cap) return;
   uint32_t nc = m->cap ? m->cap*2 : 8;
+  gc_note_payload((size_t)(nc - m->cap) * (2u * sizeof(tsv) + sizeof(uint32_t)));
   m->keys = realloc(m->keys, sizeof(tsv)*nc);
   m->vals = realloc(m->vals, sizeof(tsv)*nc);
   m->hashes = realloc(m->hashes, sizeof(uint32_t)*nc);
@@ -7154,6 +7183,7 @@ static long set_find(ts_set_t* s, tsv v){
 static void set_grow(ts_set_t* s){
   if (s->len < s->cap) return;
   uint32_t nc = s->cap ? s->cap*2 : 8;
+  gc_note_payload((size_t)(nc - s->cap) * (sizeof(tsv) + sizeof(uint32_t)));
   s->elems = realloc(s->elems, sizeof(tsv)*nc);
   s->hashes = realloc(s->hashes, sizeof(uint32_t)*nc);
   if (s->iteration_order) s->iteration_order = realloc(s->iteration_order, sizeof(uint64_t)*nc);
