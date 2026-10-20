@@ -73,6 +73,17 @@ typedef struct gc_chunk {
 } gc_chunk;
 #define GC_NURSERY_DATA_OFF  ((sizeof(gc_chunk) + 15u) & ~(size_t)15u)
 #define GC_NURSERY_DATA_BYTES (GC_NURSERY_CHUNK_BYTES - GC_NURSERY_DATA_OFF)
+/* Nursery chunks come from one reserved address range (docs/gc_v2_design.md
+   §6.5 step 3): a cell is in the nursery iff its address is in
+   [g_nursery_lo, g_nursery_lo + g_nursery_span), an address test with no
+   load from the cell. The span is 0 until the first chunk is needed. */
+#define GC_NURSERY_RANGE_BYTES ((size_t)4u << 30)
+static uintptr_t g_nursery_lo = 0;
+static size_t g_nursery_span = 0;
+static size_t g_nursery_frontier = 0;   /* bytes of the range handed out as chunks */
+static inline int gc_in_nursery(const void* p){
+  return (uintptr_t)p - g_nursery_lo < g_nursery_span;
+}
 static gc_chunk* g_nursery_active = NULL;   /* chunks bumped this cycle; head is current */
 static gc_chunk* g_nursery_free = NULL;     /* empty chunks kept for reuse */
 static gc_chunk* g_nursery_retained = NULL; /* chunks held in place by pinned survivors */
@@ -1177,27 +1188,33 @@ static inline int gc_is_bump_kind(uint8_t kind){
          kind==TS_KIND_ARRAY || kind==TS_KIND_MAP || kind==TS_KIND_SET ||
          kind==TS_KIND_ACCESSOR || kind==TS_KIND_SYMBOL;
 }
-/* Protect mode (TSAOT_GC_PROTECT, docs/gc_v2_design.md §6.5 step 1): nursery
-   chunks come from mmap, and a chunk a collection releases is made
-   inaccessible and kept in a bounded quarantine before it is reused, so an
-   access through a reference that went stale when its cell moved faults at
-   the access instead of reading a moved-from copy. */
+/* Protect mode (TSAOT_GC_PROTECT, docs/gc_v2_design.md §6.5 step 1): a chunk
+   a collection releases is made inaccessible and kept in a bounded
+   quarantine before it is reused, so an access through a reference that went
+   stale when its cell moved faults at the access instead of reading a
+   moved-from copy. */
 static gc_chunk** g_chunk_quarantine = NULL;
 static uint32_t g_chunk_q_head = 0, g_chunk_q_len = 0;
-static void* gc_chunk_alloc(void){
-  if (!g_gc_protect){
-    void* mem = NULL;
-    if (posix_memalign(&mem, GC_NURSERY_CHUNK_BYTES, GC_NURSERY_CHUNK_BYTES) != 0) return NULL;
-    return mem;
+static void gc_nursery_range_init(void){
+  for (size_t want = GC_NURSERY_RANGE_BYTES; want >= ((size_t)64u << 20); want >>= 1){
+    void* m = mmap(NULL, want + GC_NURSERY_CHUNK_BYTES, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (m == MAP_FAILED) continue;
+    g_nursery_lo = ((uintptr_t)m + GC_NURSERY_CHUNK_BYTES - 1u) & ~(uintptr_t)(GC_NURSERY_CHUNK_BYTES - 1u);
+    g_nursery_span = want;
+    return;
   }
-  size_t span = GC_NURSERY_CHUNK_BYTES * 2u;
-  char* m = (char*)mmap(NULL, span, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-  if (m == MAP_FAILED) return NULL;
-  uintptr_t a = ((uintptr_t)m + GC_NURSERY_CHUNK_BYTES - 1u) & ~(uintptr_t)(GC_NURSERY_CHUNK_BYTES - 1u);
-  if (a > (uintptr_t)m) munmap(m, a - (uintptr_t)m);
-  uintptr_t end = a + GC_NURSERY_CHUNK_BYTES, mend = (uintptr_t)m + span;
-  if (mend > end) munmap((void*)end, mend - end);
-  return (void*)a;
+  ts_abort_msg("cannot reserve the nursery range");
+}
+/* A never-used chunk at the range's frontier (released chunks are reused
+   through g_nursery_free); NULL when the range is exhausted, and the cell
+   falls back to the unpooled path. */
+static void* gc_chunk_alloc(void){
+  if (!g_nursery_span) gc_nursery_range_init();
+  if (g_nursery_frontier + GC_NURSERY_CHUNK_BYTES > g_nursery_span) return NULL;
+  void* c = (void*)(g_nursery_lo + g_nursery_frontier);
+  if (mprotect(c, GC_NURSERY_CHUNK_BYTES, PROT_READ | PROT_WRITE) != 0) return NULL;
+  g_nursery_frontier += GC_NURSERY_CHUNK_BYTES;
+  return c;
 }
 /* A chunk a collection released: to the free pool, or (protect mode) into
    the quarantine, whose oldest chunk then returns to the free pool. */
@@ -5486,6 +5503,7 @@ static void gc_sweep_nursery(
     : (g_nursery_cap_bytes >> 1);
   for (gc_chunk* c = g_nursery_active; c; c = next){
     next = c->next;
+    if (!gc_in_nursery(c)) ts_abort_msg("a nursery chunk outside the nursery range");
     char* data = (char*)c + GC_NURSERY_DATA_OFF;
     size_t off = 0;
     uint32_t pinned_here = 0;
@@ -5555,6 +5573,7 @@ static void gc_sweep_pinned_young(ts_gc_header** survivors){
   g_pinned_young = NULL;
   while (h){
     ts_gc_header* next = h->gc_next;
+    if (!gc_in_nursery(h)) ts_abort_msg("a pinned young cell outside the nursery range");
     gc_chunk* c = (gc_chunk*)((uintptr_t)h & ~(uintptr_t)(GC_NURSERY_CHUNK_BYTES - 1u));
     if (h->mark){
       if (h->pin_depth){

@@ -617,6 +617,18 @@ conservative scan and passes the fixture (its untyped locals are boxed).
 A/B against step 2: neutral (wall 0.999, instructions 0.9997, cycles
 1.0004).
 
+Step 3 result. Nursery chunks come from one reserved range (4 GiB of
+address space, `PROT_NONE` until a chunk is first handed out; 64 MiB at
+least), and `gc_in_nursery(p)` is the address test
+`p - g_nursery_lo < g_nursery_span`. Released chunks are reused as before;
+an exhausted range falls back to the unpooled path. Protect mode
+quarantines chunks inside the range. The nursery sweep and the pinned
+sweep check that every chunk and pinned cell is inside the range (abort
+otherwise). Nothing uses the test on a hot path yet. A/B against step 2b:
+wall 0.988 (eight of eight pairs; three noisy pairs, the quiet ones about
+-0.7%), cycles 0.989, instructions 0.9998: the chunks of one contiguous
+range instead of `posix_memalign` blocks.
+
 ## 7. Verification
 
 - Gates of every slice: unit, parity (`scripts/emitc_diff.sh`), bundler,

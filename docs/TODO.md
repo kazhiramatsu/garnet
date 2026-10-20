@@ -6698,9 +6698,21 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   (thirteen coroutine frames change) and compiled under protect mode. A/B
   against step 2: eight ABBA pairs, wall 0.999, instructions 0.9997,
   cycles 1.0004: neutral.
+- GC v2 Y1 step 3: nursery chunks from one reserved address range
+  (`docs/gc_v2_design.md` §6.5). 4 GiB of address space is reserved
+  (`PROT_NONE`, at least 64 MiB if that fails) and chunks are handed out
+  from its frontier, so "in the nursery" is the address test
+  `gc_in_nursery(p)` with no load from the cell (for the barrier and the
+  collector once young cells are referenced by address). Released chunks
+  are reused as before; protect mode quarantines them inside the range;
+  the sweeps abort if a chunk or a pinned cell is outside it. Gates: unit,
+  parity (362 identical), bundler, selfconf, GC stress, inline policy,
+  conformance 486/486; tsc compiled under protect mode. A/B against step
+  2b: eight ABBA pairs, wall 0.988 (eight of eight; three pairs noisy, the
+  quiet ones about -0.7%), cycles 0.989, instructions 0.9998.
 - Next slices, in order. GC v2 first (`docs/gc_v2_design.md` §6.5, Y1:
-  3 nursery chunks from the cage; 4 direct pointers one kind at a time;
-  5 handles removed).
+  4 direct pointers (4a the collector's machinery behind a switch, 4b
+  strings, then the other kinds); 5 handles removed).
   A slice that extends the stack or an arena to a
   new kind of allocation runs the conformance suite and a compile of the
   compiler under `--stack-check` (an arena must allocate through the
