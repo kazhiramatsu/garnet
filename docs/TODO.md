@@ -6176,6 +6176,25 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   vs 4.489 s median: neutral to -0.9% (the compiler's callbacks go mostly
   through its own `forEach` / `some` helpers, not the builtins). Node 3.32 s
   (1.34x).
+- Iteration callbacks: thisArg, the empty reduce (build `x59`, full
+  build; emitter, runtime). Probing the array builtins after `x58`: the
+  thisArg of `forEach` / `map` / `filter` / `some` / `every` / `find*` /
+  `flatMap` and of `Map` / `Set` `forEach` was dropped, both by the typed
+  emission (only the first argument was read) and by the dynamic wrappers,
+  so a `function` callback saw `this` undefined (a TypeError on `this.k`,
+  silent where the callback only tests `this`); and `reduce` /
+  `reduceRight` of an empty or all-holes array without an initial value
+  returned undefined instead of throwing V8's TypeError. A call that
+  passes a thisArg now hands the builtin the callback bound to it
+  (`ts_callback_with_this`, fn.bind(ctx); an undefined thisArg keeps the
+  callback), so the common call without one emits the same code; the
+  reduce paths throw. Fixture `arrays/callback_this_arg` (typed and `any`
+  receivers, Map / Set, an arrow callback, an undefined thisArg, the empty
+  reductions).
+  Gates all green (parity: the new fixture is a known diff, the frozen
+  emitter drops the thisArg). A/B against `x58`, two rounds of three
+  alternating runs: 4.492 vs 4.496 s and 4.460 vs 4.437 s median:
+  neutral. Node 3.33-3.37 s (1.34x).
 - Next slices, in order. A slice that extends the stack or an arena to a
   new kind of allocation runs the conformance suite and a compile of the
   compiler under `--stack-check` (an arena must allocate through the

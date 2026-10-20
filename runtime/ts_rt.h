@@ -2001,6 +2001,7 @@ void        ts_eh_pop(void);
 void        ts_throw(tsv v);
 void        ts_throw_range_error_msg(const char* msg);
 void        ts_throw_type_error_msg(const char* msg);
+tsv         ts_callback_with_this(tsv cb, tsv thisArg); /* arr.forEach(fn, ctx): fn bound to ctx */
 void        ts_throw_syntax_error_msg(const char* msg);
 tsv         ts_current_exception(void);
 void        g_exception_set(tsv v);

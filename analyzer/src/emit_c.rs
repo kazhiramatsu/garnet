@@ -17844,6 +17844,11 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     .unwrap_or_else(|| "0".into())
             };
             let has = |i: usize| if args.len() > i { "1" } else { "0" };
+            // The callback of an iteration method, bound to its thisArg when
+            // the call passes one (`arr.forEach(fn, ctx)`).
+            let cbv = || -> String {
+                if args.len() > 1 { format!("ts_callback_with_this({}, {})", v(0), v(1)) } else { v(0) }
+            };
             // (expr, is_numeric_result)
             let optional_end = if let Some(end) = args.get(1) {
                 if ctx.unboxed.contains(&end.0) { "1".into() }
@@ -17896,9 +17901,9 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 "string.repeat" => (format!("ts_str_repeat({}, {})", r, n(0)), false),
                 "string.trim" => (format!("ts_str_trim({})", r), false),
                 "string.split" => (format!("ts_str_split({}, {}, {})", r, v(0), v(1)), false),
-                "array.map" => (format!("ts_array_map({}, {})", r, v(0)), false),
-                "array.filter" => (format!("ts_array_filter({}, {})", r, v(0)), false),
-                "array.forEach" => (format!("ts_array_foreach({}, {})", r, v(0)), false),
+                "array.map" => (format!("ts_array_map({}, {})", r, cbv()), false),
+                "array.filter" => (format!("ts_array_filter({}, {})", r, cbv()), false),
+                "array.forEach" => (format!("ts_array_foreach({}, {})", r, cbv()), false),
                 "array.reduce" => (
                     format!("ts_array_reduce({}, {}, {}, {})", r, v(0), v(1), has(1)),
                     false,
@@ -17985,10 +17990,10 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     (blk, true)
                 }
                 "array.pop" => (format!("ts_array_pop({})", r), false),
-                "array.find" => (format!("ts_array_find({}, {})", r, v(0)), false),
-                "array.findIndex" => (format!("ts_array_findindex({}, {})", r, v(0)), true),
-                "array.findLast" => (format!("ts_array_findlast({}, {})", r, v(0)), false),
-                "array.findLastIndex" => (format!("ts_array_findlastindex({}, {})", r, v(0)), true),
+                "array.find" => (format!("ts_array_find({}, {})", r, cbv()), false),
+                "array.findIndex" => (format!("ts_array_findindex({}, {})", r, cbv()), true),
+                "array.findLast" => (format!("ts_array_findlast({}, {})", r, cbv()), false),
+                "array.findLastIndex" => (format!("ts_array_findlastindex({}, {})", r, cbv()), true),
                 "array.flat" => (
                     format!(
                         "ts_array_flat({}, {})",
@@ -18001,9 +18006,9 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     ),
                     false,
                 ),
-                "array.flatMap" => (format!("ts_array_flatmap({}, {})", r, v(0)), false),
-                "array.some" => (format!("ts_bool(ts_array_some({}, {}))", r, v(0)), false),
-                "array.every" => (format!("ts_bool(ts_array_every({}, {}))", r, v(0)), false),
+                "array.flatMap" => (format!("ts_array_flatmap({}, {})", r, cbv()), false),
+                "array.some" => (format!("ts_bool(ts_array_some({}, {}))", r, cbv()), false),
+                "array.every" => (format!("ts_bool(ts_array_every({}, {}))", r, cbv()), false),
                 "array.lastIndexOf" => (
                     format!(
                         "ts_array_lastindexof({}, {}, {}, {})",
@@ -18378,7 +18383,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 "map.entries" => (format!("ts_map_entries({})", r), false),
                 "map.size" => (format!("ts_map_size({})", r), true),
                 "map.forEach" => (
-                    format!("({{ ts_map_foreach({}, {}); TS_UNDEFINED; }})", r, v(0)),
+                    format!("({{ ts_map_foreach({}, {}); TS_UNDEFINED; }})", r, cbv()),
                     false,
                 ),
                 // ---- WeakMap ----
@@ -18399,7 +18404,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 "array.values" => (format!("ts_array_values_arr({})", r), false),
                 "set.size" => (format!("ts_set_size({})", r), true),
                 "set.forEach" => (
-                    format!("({{ ts_set_foreach({}, {}); TS_UNDEFINED; }})", r, v(0)),
+                    format!("({{ ts_set_foreach({}, {}); TS_UNDEFINED; }})", r, cbv()),
                     false,
                 ),
                 // ---- WeakSet ----

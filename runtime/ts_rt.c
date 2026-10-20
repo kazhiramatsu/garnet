@@ -5857,7 +5857,7 @@ tsv ts_array_reduce(tsv arr, tsv cb, tsv init, int has_init){
     /* Holes are skipped when selecting the initial accumulator. */
     start=0;
     while (start<a->len && array_is_hole(a->data[start])) start++;
-    if (start==a->len) return TS_UNDEFINED;
+    if (start==a->len) ts_throw_type_error_msg("Reduce of empty array with no initial value");
     acc=a->data[start++];
   }
   ts_gc_root(&arr); ts_gc_root(&acc); ts_gc_root(&cb);
@@ -5880,7 +5880,7 @@ tsv ts_array_reduce_right(tsv arr, tsv cb, tsv init, int has_init){
   else {
     start=(long)a->len-1;
     while (start>=0 && array_is_hole(a->data[start])) start--;
-    if (start<0) return TS_UNDEFINED;
+    if (start<0) ts_throw_type_error_msg("Reduce of empty array with no initial value");
     acc=a->data[start--];
   }
   ts_gc_root(&arr); ts_gc_root(&acc); ts_gc_root(&cb);
@@ -11354,9 +11354,18 @@ tsv ts_arrproto_fill(tsv* a, int n){ return ts_array_fill(a[0], n>1?a[1]:TS_UNDE
 tsv ts_arrproto_flat(tsv* a, int n){ return ts_array_flat(a[0], n>1?ts_to_num(a[1]):1); }
 tsv ts_arrproto_sort(tsv* a, int n){ return ts_array_sort(a[0], n>1?a[1]:TS_UNDEFINED); }
 /* callback-taking methods: the callback is args[1] (a ts_func/closure). */
-tsv ts_arrproto_map(tsv* a, int n){ return ts_array_map(a[0], n>1?a[1]:TS_UNDEFINED); }
-tsv ts_arrproto_filter(tsv* a, int n){ return ts_array_filter(a[0], n>1?a[1]:TS_UNDEFINED); }
-tsv ts_arrproto_forEach(tsv* a, int n){ return ts_array_foreach(a[0], n>1?a[1]:TS_UNDEFINED); }
+/* The callback of an iteration method bound to the call's thisArg
+   (`arr.forEach(fn, ctx)`), as fn.bind(ctx) would; an absent or undefined
+   thisArg keeps the callback (a plain call's this is undefined anyway). */
+tsv ts_callback_with_this(tsv cb, tsv thisArg){
+  if (ts_is_undef(thisArg)) return cb;
+  tsv a[2] = { cb, thisArg };
+  return ts_funcproto_bind(a, 2);
+}
+#define TS_ITER_CB(a, n) ((n) > 1 ? ((n) > 2 ? ts_callback_with_this((a)[1], (a)[2]) : (a)[1]) : TS_UNDEFINED)
+tsv ts_arrproto_map(tsv* a, int n){ return ts_array_map(a[0], TS_ITER_CB(a, n)); }
+tsv ts_arrproto_filter(tsv* a, int n){ return ts_array_filter(a[0], TS_ITER_CB(a, n)); }
+tsv ts_arrproto_forEach(tsv* a, int n){ return ts_array_foreach(a[0], TS_ITER_CB(a, n)); }
 tsv ts_arrproto_reduce(tsv* a, int n){ return ts_array_reduce(a[0], n>1?a[1]:TS_UNDEFINED, n>2?a[2]:TS_UNDEFINED, n>2); }
 tsv ts_arrproto_splice(tsv* a, int n){
   tsv items=ts_new_array(0); ts_gc_root(&items);
@@ -11370,13 +11379,13 @@ tsv ts_arrproto_splice(tsv* a, int n){
 }
 tsv ts_arrproto_reduceRight(tsv* a, int n){ return ts_array_reduce_right(a[0], n>1?a[1]:TS_UNDEFINED, n>2?a[2]:TS_UNDEFINED, n>2); }
 tsv ts_arrproto_copyWithin(tsv* a, int n){ return ts_array_copy_within(a[0], n>1?ts_to_num(a[1]):0, n>2?ts_to_num(a[2]):0, n>3?ts_to_num(a[3]):0, n>3); }
-tsv ts_arrproto_find(tsv* a, int n){ return ts_array_find(a[0], n>1?a[1]:TS_UNDEFINED); }
-tsv ts_arrproto_findIndex(tsv* a, int n){ return ts_num(ts_array_findindex(a[0], n>1?a[1]:TS_UNDEFINED)); }
-tsv ts_arrproto_findLast(tsv* a, int n){ return ts_array_findlast(a[0], n>1?a[1]:TS_UNDEFINED); }
-tsv ts_arrproto_findLastIndex(tsv* a, int n){ return ts_num(ts_array_findlastindex(a[0], n>1?a[1]:TS_UNDEFINED)); }
-tsv ts_arrproto_some(tsv* a, int n){ return ts_bool(ts_array_some(a[0], n>1?a[1]:TS_UNDEFINED)); }
-tsv ts_arrproto_every(tsv* a, int n){ return ts_bool(ts_array_every(a[0], n>1?a[1]:TS_UNDEFINED)); }
-tsv ts_arrproto_flatMap(tsv* a, int n){ return ts_array_flatmap(a[0], n>1?a[1]:TS_UNDEFINED); }
+tsv ts_arrproto_find(tsv* a, int n){ return ts_array_find(a[0], TS_ITER_CB(a, n)); }
+tsv ts_arrproto_findIndex(tsv* a, int n){ return ts_num(ts_array_findindex(a[0], TS_ITER_CB(a, n))); }
+tsv ts_arrproto_findLast(tsv* a, int n){ return ts_array_findlast(a[0], TS_ITER_CB(a, n)); }
+tsv ts_arrproto_findLastIndex(tsv* a, int n){ return ts_num(ts_array_findlastindex(a[0], TS_ITER_CB(a, n))); }
+tsv ts_arrproto_some(tsv* a, int n){ return ts_bool(ts_array_some(a[0], TS_ITER_CB(a, n))); }
+tsv ts_arrproto_every(tsv* a, int n){ return ts_bool(ts_array_every(a[0], TS_ITER_CB(a, n))); }
+tsv ts_arrproto_flatMap(tsv* a, int n){ return ts_array_flatmap(a[0], TS_ITER_CB(a, n)); }
 
 /* The runtime-owned Array.prototype. Created and populated by the emitted setup
    (ts_setup_array_proto, which knows the per-program method-name ids) via
@@ -11439,7 +11448,7 @@ tsv ts_mapproto_clear(tsv* a, int n){ (void)n; ts_map_clear(a[0]); return TS_UND
 tsv ts_mapproto_keys(tsv* a, int n){ (void)n; return ts_map_keys(a[0]); }
 tsv ts_mapproto_values(tsv* a, int n){ (void)n; return ts_map_values(a[0]); }
 tsv ts_mapproto_entries(tsv* a, int n){ (void)n; return ts_map_entries(a[0]); }
-tsv ts_mapproto_forEach(tsv* a, int n){ ts_map_foreach(a[0], n>1?a[1]:TS_UNDEFINED); return TS_UNDEFINED; }
+tsv ts_mapproto_forEach(tsv* a, int n){ ts_map_foreach(a[0], TS_ITER_CB(a, n)); return TS_UNDEFINED; }
 tsv ts_setproto_add(tsv* a, int n){ return ts_set_add(a[0], n>1?a[1]:TS_UNDEFINED); }
 tsv ts_setproto_has(tsv* a, int n){ return ts_bool(ts_set_has(a[0], n>1?a[1]:TS_UNDEFINED)); }
 tsv ts_setproto_delete(tsv* a, int n){ return ts_bool(ts_set_delete(a[0], n>1?a[1]:TS_UNDEFINED)); }
@@ -11447,7 +11456,7 @@ tsv ts_setproto_clear(tsv* a, int n){ (void)n; ts_set_clear(a[0]); return TS_UND
 tsv ts_setproto_keys(tsv* a, int n){ (void)n; return ts_set_keys(a[0]); }
 tsv ts_setproto_values(tsv* a, int n){ (void)n; return ts_set_values(a[0]); }
 tsv ts_setproto_entries(tsv* a, int n){ (void)n; return ts_set_entries(a[0]); }
-tsv ts_setproto_forEach(tsv* a, int n){ ts_set_foreach(a[0], n>1?a[1]:TS_UNDEFINED); return TS_UNDEFINED; }
+tsv ts_setproto_forEach(tsv* a, int n){ ts_set_foreach(a[0], TS_ITER_CB(a, n)); return TS_UNDEFINED; }
 tsv ts_weakmapproto_set(tsv* a, int n){ return ts_weakmap_set(a[0], n>1?a[1]:TS_UNDEFINED, n>2?a[2]:TS_UNDEFINED); }
 tsv ts_weakmapproto_get(tsv* a, int n){ return ts_weakmap_get(a[0], n>1?a[1]:TS_UNDEFINED); }
 tsv ts_weakmapproto_has(tsv* a, int n){ return ts_bool(ts_weakmap_has(a[0], n>1?a[1]:TS_UNDEFINED)); }
