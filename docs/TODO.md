@@ -6233,6 +6233,36 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   under GC stress). A/B against `x60`, two rounds of three alternating
   runs: 4.379 vs 4.413 s and 4.384 vs 4.412 s median (pairs -0.3% to
   -1.0% but one outlier): about -0.7%. Node 3.27-3.28 s (1.34x).
+- Lazy frames, round 2: register homes (build `x62`, full build; emitter,
+  runtime; `docs/lazy_frames_design.md`). A lazy function (collection-free
+  body, frame linked only around its slow paths) still stored every
+  reference local into its frame slot at each definition, and its inlined
+  slow paths kept the frame-top address in a callee-saved register, so the
+  fast path of a small helper paid slot stores and a register save /
+  restore for calls that never run once the caches are warm (`x60`: 144 vs
+  79 instructions in `getObjectFlags`). The locals of a lazy function now
+  live in C locals (`r{slot}`); each slow path is a frame-free test
+  (`ts_get_static_try`, `ts_get_pic_try`, the `set` and element forms) and,
+  on a miss, a spill of every home into the frame, an out-of-line linked
+  call (`ts_get_linked`, `ts_set_linked`, `ts_array_get_linked`) and a
+  reload. Out of line matters: inlined, the linked call left the
+  callee-saved register at entry and the kernel gained nothing. A function
+  with one slow path is now a leaf on its fast path; with several, a small
+  prologue stays. `TSAOT_LAZY_HOMES=0` keeps round 1. Fixture
+  `gc/lazy_homes_reload` (getters and setters that detach and churn behind
+  static-slot and inline-cache reads and writes, a returned reference, a
+  home reassigned in a loop, a string element read through an array type;
+  with the spills removed from its C it crashes), added with
+  `gc/lazy_frame_getter` to the GC stress gate. Found on the way: the
+  handle of a promoted object stays valid while the object lives, so the
+  reload is a direct-pointer refresh rather than a correctness need today;
+  and kernel A/Bs are sensitive to the binary name's length (identical C,
+  up to 5%: the initial stack shifts with `argv`). Gates all green
+  (conformance 469/469; parity: the new fixture is a known numeric-typing
+  difference of the frozen pair). `small_calls` 725 -> 721 ms (764 -> 734
+  ms with 64-byte function alignment). A/B against `x61`, two rounds of
+  three alternating runs: 4.431 vs 4.431 s and 4.435 vs 4.444 s median:
+  neutral. Node 3.31-3.34 s (1.34x).
 - Next slices, in order. A slice that extends the stack or an arena to a
   new kind of allocation runs the conformance suite and a compile of the
   compiler under `--stack-check` (an arena must allocate through the

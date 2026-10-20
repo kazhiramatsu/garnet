@@ -1905,6 +1905,82 @@ TS_RT_ALWAYS_INLINE tsv ts_array_get_lazy(tsv arr, uint32_t i, ts_frame_hdr* fra
   ts_frame_pop(frame);
   return r;
 }
+/* Lazy frames with register homes (docs/lazy_frames_design.md, round 2): the
+   fast path of each lazily linked slow path as a test that touches no frame,
+   and the slow path as the linked call, out of line (ts_rt.c) so the caller
+   needs neither the frame-top address nor a callee-saved register on its
+   fast path and can stay a leaf there. The emitter keeps a lazy
+   function's reference locals in C locals and fills the frame from them only
+   before the linked call, reloading them after (a collection may rewrite a
+   slot from a young handle to the old pointer). */
+TS_RT_ALWAYS_INLINE int ts_get_static_try(tsv obj, ts_key key, uint32_t slot, ts_prop_ic* ic, tsv* out){
+  tsv* p = ts_static_slot_probe(obj, key, slot, TS_PROP_ACCESSOR, 0, ic);
+  if (p){ TS_RT_STAT_STATIC(get_hit); *out = *p; return 1; }
+  TS_RT_STAT_STATIC(get_miss); TS_RT_STAT_STATIC_MISS_KEY(g_ts_key_static_get_miss, key); TS_RT_STAT_STATIC_MISS_SLOT(obj, key);
+  return 0;
+}
+TS_RT_ALWAYS_INLINE int ts_get_static2_try(tsv obj, ts_key key, uint32_t s1, uint32_t s2, ts_prop_ic* ic, tsv* out){
+  tsv* p = ts_static_slot_probe2(obj, key, s1, s2, TS_PROP_ACCESSOR, 0, ic);
+  if (p){ TS_RT_STAT_STATIC(get_hit); *out = *p; return 1; }
+  TS_RT_STAT_STATIC(get_miss); TS_RT_STAT_STATIC_MISS_KEY(g_ts_key_static_get_miss, key); TS_RT_STAT_STATIC_MISS_SLOT(obj, key);
+  return 0;
+}
+TS_RT_ALWAYS_INLINE int ts_get_static3_try(tsv obj, ts_key key, uint32_t s1, uint32_t s2, uint32_t s3, ts_prop_ic* ic, tsv* out){
+  tsv* p = ts_static_slot_probe3(obj, key, s1, s2, s3, TS_PROP_ACCESSOR, 0, ic);
+  if (p){ TS_RT_STAT_STATIC(get_hit); *out = *p; return 1; }
+  TS_RT_STAT_STATIC(get_miss); TS_RT_STAT_STATIC_MISS_KEY(g_ts_key_static_get_miss, key); TS_RT_STAT_STATIC_MISS_SLOT(obj, key);
+  return 0;
+}
+TS_RT_ALWAYS_INLINE int ts_get_pic_try(tsv obj, ts_key key, ts_prop_ic* ic, tsv* out){
+  uint8_t flags = 0;
+  tsv* p = ts_prop_ic_probe_fixed_inline(obj, key, ic, &flags);
+  if (p && !(flags & TS_PROP_ACCESSOR)){
+    TS_RT_STAT_PIC_GET_CALL(); TS_RT_STAT_PIC_GET_HIT(); TS_RT_STAT_INLINE_KEY(g_ts_key_inline_get, key);
+    *out = *p; return 1;
+  }
+  return 0;
+}
+tsv ts_get_linked(tsv obj, ts_key key, ts_prop_ic* ic, ts_frame_hdr* frame, uint32_t nslots);
+TS_RT_ALWAYS_INLINE int ts_set_static_try(tsv obj, ts_key key, uint32_t slot, tsv value, ts_prop_ic* ic){
+  tsv* p = ts_static_slot_probe(obj, key, slot, TS_PROP_ACCESSOR | TS_PROP_WRITABLE, TS_PROP_WRITABLE, ic);
+  if (p && !(ts_obj_integrity((ts_object*)ts_ptr(obj)) & 1u)){
+    TS_RT_STAT_STATIC(set_hit);
+    *p = value; ts_write_barrier_ptr(obj, p, value); return 1;
+  }
+  TS_RT_STAT_STATIC(set_miss); TS_RT_STAT_STATIC_MISS_KEY(g_ts_key_static_set_miss, key);
+  return 0;
+}
+TS_RT_ALWAYS_INLINE int ts_set_static2_try(tsv obj, ts_key key, uint32_t s1, uint32_t s2, tsv value, ts_prop_ic* ic){
+  tsv* p = ts_static_slot_probe2(obj, key, s1, s2, TS_PROP_ACCESSOR | TS_PROP_WRITABLE, TS_PROP_WRITABLE, ic);
+  if (p && !(ts_obj_integrity((ts_object*)ts_ptr(obj)) & 1u)){
+    TS_RT_STAT_STATIC(set_hit);
+    *p = value; ts_write_barrier_ptr(obj, p, value); return 1;
+  }
+  TS_RT_STAT_STATIC(set_miss); TS_RT_STAT_STATIC_MISS_KEY(g_ts_key_static_set_miss, key);
+  return 0;
+}
+TS_RT_ALWAYS_INLINE int ts_set_static3_try(tsv obj, ts_key key, uint32_t s1, uint32_t s2, uint32_t s3, tsv value, ts_prop_ic* ic){
+  tsv* p = ts_static_slot_probe3(obj, key, s1, s2, s3, TS_PROP_ACCESSOR | TS_PROP_WRITABLE, TS_PROP_WRITABLE, ic);
+  if (p && !(ts_obj_integrity((ts_object*)ts_ptr(obj)) & 1u)){
+    TS_RT_STAT_STATIC(set_hit);
+    *p = value; ts_write_barrier_ptr(obj, p, value); return 1;
+  }
+  TS_RT_STAT_STATIC(set_miss); TS_RT_STAT_STATIC_MISS_KEY(g_ts_key_static_set_miss, key);
+  return 0;
+}
+TS_RT_ALWAYS_INLINE int ts_set_pic_try(tsv obj, ts_key key, tsv value, ts_prop_ic* ic){
+  uint8_t flags = 0;
+  tsv* p = ts_prop_ic_probe_fixed_inline(obj, key, ic, &flags);
+  if (p && !(flags & TS_PROP_ACCESSOR) && (flags & TS_PROP_WRITABLE)){
+    ts_object* o = (ts_object*)ts_ptr(obj);
+    if (!(ts_obj_integrity(o) & 1u)){
+      TS_RT_STAT_PIC_SET_CALL(); TS_RT_STAT_PIC_SET_HIT(); TS_RT_STAT_INLINE_KEY(g_ts_key_inline_set, key);
+      *p = value; ts_write_barrier_ptr(obj, p, value); return 1;
+    }
+  }
+  return 0;
+}
+void ts_set_linked(tsv obj, ts_key key, tsv value, ts_prop_ic* ic, ts_frame_hdr* frame, uint32_t nslots);
 /* The hole marker of a sparse array element (never a user-visible value). */
 #define TS_ARRAY_HOLE TS_BOX(0xFFFEu, 0x4152484Fu)
 static inline int array_is_hole(tsv v){ return v == TS_ARRAY_HOLE; }
@@ -1940,6 +2016,19 @@ static inline void ts_array_set_inline(tsv arr, uint32_t i, tsv v){
   }
   ts_array_set(arr, i, v);
 }
+static inline int ts_array_get_inline_try(tsv arr, uint32_t i, tsv* out){
+  if (ts_is_indexed_array_fast(arr)){
+    ts_array* a = (ts_array*)ts_ptr(arr);
+    if (i < a->cap){ tsv v = a->data[i]; *out = array_is_hole(v) ? TS_UNDEFINED : v; return 1; }
+    if (!a->sparse){ *out = TS_UNDEFINED; return 1; }
+  }
+  return 0;
+}
+static inline int ts_array_get_try(tsv arr, uint32_t i, tsv* out){
+  if (ts_is_indexed_array_fast(arr)){ *out = ts_array_get(arr, i); return 1; }
+  return 0;
+}
+tsv ts_array_get_linked(tsv arr, uint32_t i, ts_frame_hdr* frame, uint32_t nslots);
 static inline tsv ts_array_get_inline_lazy(tsv arr, uint32_t i, ts_frame_hdr* frame, uint32_t nslots){
   if (ts_is_indexed_array_fast(arr)){
     ts_array* a = (ts_array*)ts_ptr(arr);

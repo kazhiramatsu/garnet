@@ -70,6 +70,14 @@ while IFS= read -r name; do
     ts_set_static_inline_lazy | \
     ts_set_static2_inline_lazy | \
     ts_array_get_lazy | \
+    ts_get_static_try | \
+    ts_get_static2_try | \
+    ts_get_static3_try | \
+    ts_get_pic_try | \
+    ts_set_static_try | \
+    ts_set_static2_try | \
+    ts_set_static3_try | \
+    ts_set_pic_try | \
     ts_str_charcodeat_typed | \
     ts_strict_eq | \
     ts_truthy_fast | \

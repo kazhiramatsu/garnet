@@ -12173,6 +12173,25 @@ int ts_obj_adopt_layout(tsv obj, ts_lit_layout* L){
   ts_obj_set_shape(o, sh);
   return 1;
 }
+/* The linked slow paths of a lazy frame with register homes (ts_rt.h): the
+   caller filled the frame; link it, run the generic operation, unlink. */
+tsv ts_get_linked(tsv obj, ts_key key, ts_prop_ic* ic, ts_frame_hdr* frame, uint32_t nslots){
+  ts_frame_push(frame, nslots);
+  tsv r = ts_get_pic_checked(obj, key, ic);
+  ts_frame_pop(frame);
+  return r;
+}
+void ts_set_linked(tsv obj, ts_key key, tsv value, ts_prop_ic* ic, ts_frame_hdr* frame, uint32_t nslots){
+  ts_frame_push(frame, nslots);
+  ts_set_pic(obj, key, value, ic);
+  ts_frame_pop(frame);
+}
+tsv ts_array_get_linked(tsv arr, uint32_t i, ts_frame_hdr* frame, uint32_t nslots){
+  ts_frame_push(frame, nslots);
+  tsv r = ts_array_get(arr, i);
+  ts_frame_pop(frame);
+  return r;
+}
 void ts_set_pic(tsv obj, ts_key key, tsv val, ts_prop_ic* ic){
   TS_RT_STAT_PIC_SET_CALL();
   if (ic && ic->megamorphic){ ts_set(obj, key, val); return; }

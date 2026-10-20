@@ -1345,6 +1345,11 @@ struct Ctx<'a> {
     layouts: LayoutPlan,
     /// the root frame is linked only around slow paths (see lazy_frames_enabled)
     lazy_frame: bool,
+    /// the lazy frame's locals live in C locals (lazy_homes_enabled); the
+    /// fill and reload around a linked slow call
+    lazy_homes: bool,
+    lazy_spill: String,
+    lazy_reload: String,
     frame_nslots: usize,
     static_strings: &'a BTreeMap<Vec<u16>, usize>,
     string_metric_plan: Option<&'a FunctionMetricPlan>,
@@ -1405,10 +1410,10 @@ impl<'a> Ctx<'a> {
         if self.frame_locals.contains(&id) {
             if let Some(m) = &self.frame_slot {
                 if let Some(sl) = m.get(&id) {
-                    return format!("F.s{}", sl);
+                    return if self.lazy_homes { format!("r{}", sl) } else { format!("F.s{}", sl) };
                 }
             }
-            format!("F.v{}", id)
+            if self.lazy_homes { format!("rv{}", id) } else { format!("F.v{}", id) }
         } else {
             format!("v{}", id)
         }
@@ -2039,6 +2044,36 @@ fn emit_frame_decl(s: &mut String, reflike: &[u32], layout: Option<&FrameLayout>
     }
 }
 
+/// The frame of a lazy function with register homes: a spill area filled
+/// only before a linked slow call, so declared uninitialized, and the homes.
+fn emit_frame_decl_homes(s: &mut String, reflike: &[u32], layout: Option<&FrameLayout>, homes: bool) {
+    if !homes {
+        emit_frame_decl(s, reflike, layout);
+        return;
+    }
+    s.push_str("  struct { ts_frame_hdr h;");
+    match layout {
+        Some(l) => {
+            for k in 0..l.nslots {
+                let _ = write!(s, " tsv s{};", k);
+            }
+            s.push_str(" } F;\n");
+            for k in 0..l.nslots {
+                let _ = writeln!(s, "  tsv r{} = TS_UNDEFINED;", k);
+            }
+        }
+        None => {
+            for id in reflike {
+                let _ = write!(s, " tsv v{};", id);
+            }
+            s.push_str(" } F;\n");
+            for id in reflike {
+                let _ = writeln!(s, "  tsv rv{} = TS_UNDEFINED;", id);
+            }
+        }
+    }
+}
+
 fn frame_slot_count(reflike: &[u32], layout: Option<&FrameLayout>) -> usize {
     match layout {
         Some(l) => l.nslots as usize,
@@ -2046,14 +2081,14 @@ fn frame_slot_count(reflike: &[u32], layout: Option<&FrameLayout>) -> usize {
     }
 }
 
-fn frame_local_name(id: u32, frame_locals: &BTreeSet<u32>, layout: Option<&FrameLayout>) -> String {
+fn frame_local_name(id: u32, frame_locals: &BTreeSet<u32>, layout: Option<&FrameLayout>, homes: bool) -> String {
     if frame_locals.contains(&id) {
         if let Some(l) = layout {
             if let Some(sl) = l.slot_of.get(&id) {
-                return format!("F.s{}", sl);
+                return if homes { format!("r{}", sl) } else { format!("F.s{}", sl) };
             }
         }
-        format!("F.v{}", id)
+        if homes { format!("rv{}", id) } else { format!("F.v{}", id) }
     } else {
         format!("v{}", id)
     }
@@ -2667,6 +2702,42 @@ fn lazy_frames_enabled() -> bool {
             Ok("0") | Ok("false") | Ok("no") | Ok("off")
         )
     })
+}
+
+/// Lazy frames, round 2 (docs/lazy_frames_design.md): a lazy function's
+/// reference locals live in C locals (`r{slot}`), the frame is filled from
+/// them only before a linked slow call and they are reloaded after, so the
+/// fast path touches no frame and a helper's body can stay a leaf.
+/// TSAOT_LAZY_HOMES=0 keeps the frame slots as the locals' homes.
+fn lazy_homes_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_LAZY_HOMES").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
+/// The frame fill before a linked slow call and the reload after it, for a
+/// lazy function with register homes.
+fn lazy_spill_reload(reflike: &[u32], layout: Option<&FrameLayout>) -> (String, String) {
+    let (mut spill, mut reload) = (String::new(), String::new());
+    match layout {
+        Some(l) => {
+            for k in 0..l.nslots {
+                let _ = write!(spill, "F.s{0} = r{0}; ", k);
+                let _ = write!(reload, " r{0} = F.s{0};", k);
+            }
+        }
+        None => {
+            for id in reflike {
+                let _ = write!(spill, "F.v{0} = rv{0}; ", id);
+                let _ = write!(reload, " rv{0} = F.v{0};", id);
+            }
+        }
+    }
+    (spill, reload)
 }
 
 /// Every instruction of `body` is one the emitter turns into collection-free
@@ -6649,9 +6720,21 @@ fn emit_i64_function(
             let _ = writeln!(s, "  tsv v{} = TS_UNDEFINED;", l.id.0);
         }
     }
+    let lazy_frame = use_frame_roots
+        && lazy_frames_enabled()
+        && prop_pic_enabled()
+        && f.rest_param.is_none()
+        // numeric clones carry no JSON roots
+        && body_is_gc_free(&f.body, &unboxed.union(&int_local).copied().collect());
+    let lazy_homes = lazy_frame && lazy_homes_enabled();
+    let (lazy_spill, lazy_reload) = if lazy_homes {
+        lazy_spill_reload(&reflike, frame_layout.as_ref())
+    } else {
+        (String::new(), String::new())
+    };
     emit_stack_cell_decls(s, &f.body, strat);
     if use_frame_roots {
-        emit_frame_decl(s, &reflike, frame_layout.as_ref());
+        emit_frame_decl_homes(s, &reflike, frame_layout.as_ref(), lazy_homes);
     }
     for (i, p) in info.params.iter().enumerate() {
         let _ = writeln!(s, "  d{} = _p{};", p, i);
@@ -6661,16 +6744,11 @@ fn emit_i64_function(
     } else {
         0
     };
-    let lazy_frame = use_frame_roots
-        && lazy_frames_enabled()
-        && prop_pic_enabled()
-        && f.rest_param.is_none()
-        // numeric clones carry no JSON roots
-        && body_is_gc_free(&f.body, &unboxed.union(&int_local).copied().collect());
     if use_frame_roots && !lazy_frame {
         let _ = writeln!(s, "  ts_frame_push(&F.h, {});", frame_slot_count(&reflike, frame_layout.as_ref()));
     } else if use_frame_roots {
-        // lazy: the frame is declared and filled but linked only around slow paths
+        // lazy: the frame is linked only around slow paths (with register
+        // homes it is also filled only there)
     } else {
         for id in &reflike {
             let _ = writeln!(s, "  ts_gc_root(&v{});", id);
@@ -6684,6 +6762,9 @@ fn emit_i64_function(
         switch_plan: switch_plan_for(f, &unboxed, &int_local),
         layouts: layout_plan_for(f),
         lazy_frame,
+        lazy_homes,
+        lazy_spill: lazy_spill.clone(),
+        lazy_reload: lazy_reload.clone(),
         frame_nslots,
         int32_use: int32_use_locals(f, &unboxed, &int_local),
         unboxed,
@@ -6821,9 +6902,21 @@ fn emit_f64_function(
             let _ = writeln!(s, "  tsv v{} = TS_UNDEFINED;", l.id.0);
         }
     }
+    let lazy_frame = use_frame_roots
+        && lazy_frames_enabled()
+        && prop_pic_enabled()
+        && f.rest_param.is_none()
+        // numeric clones carry no JSON roots
+        && body_is_gc_free(&f.body, &unboxed.union(&int_local).copied().collect());
+    let lazy_homes = lazy_frame && lazy_homes_enabled();
+    let (lazy_spill, lazy_reload) = if lazy_homes {
+        lazy_spill_reload(&reflike, frame_layout.as_ref())
+    } else {
+        (String::new(), String::new())
+    };
     emit_stack_cell_decls(s, &f.body, strat);
     if use_frame_roots {
-        emit_frame_decl(s, &reflike, frame_layout.as_ref());
+        emit_frame_decl_homes(s, &reflike, frame_layout.as_ref(), lazy_homes);
     }
     for (i, p) in info.params.iter().enumerate() {
         let _ = writeln!(s, "  d{} = _p{};", p, i);
@@ -6833,16 +6926,11 @@ fn emit_f64_function(
     } else {
         0
     };
-    let lazy_frame = use_frame_roots
-        && lazy_frames_enabled()
-        && prop_pic_enabled()
-        && f.rest_param.is_none()
-        // numeric clones carry no JSON roots
-        && body_is_gc_free(&f.body, &unboxed.union(&int_local).copied().collect());
     if use_frame_roots && !lazy_frame {
         let _ = writeln!(s, "  ts_frame_push(&F.h, {});", frame_slot_count(&reflike, frame_layout.as_ref()));
     } else if use_frame_roots {
-        // lazy: the frame is declared and filled but linked only around slow paths
+        // lazy: the frame is linked only around slow paths (with register
+        // homes it is also filled only there)
     } else {
         for id in &reflike {
             let _ = writeln!(s, "  ts_gc_root(&v{});", id);
@@ -6856,6 +6944,9 @@ fn emit_f64_function(
         switch_plan: switch_plan_for(f, &unboxed, &int_local),
         layouts: layout_plan_for(f),
         lazy_frame,
+        lazy_homes,
+        lazy_spill: lazy_spill.clone(),
+        lazy_reload: lazy_reload.clone(),
         frame_nslots,
         int32_use: int32_use_locals(f, &unboxed, &int_local),
         unboxed,
@@ -6964,6 +7055,9 @@ fn emit_function(
             switch_plan: SwitchPlan::default(),
             layouts: LayoutPlan::default(),
             lazy_frame: false,
+            lazy_homes: false,
+            lazy_spill: String::new(),
+            lazy_reload: String::new(),
             frame_nslots: 0,
             int32_use: int32_use_locals(f, &unboxed, &int_local),
             unboxed,
@@ -7019,6 +7113,9 @@ fn emit_function(
             switch_plan: SwitchPlan::default(),
             layouts: LayoutPlan::default(),
             lazy_frame: false,
+            lazy_homes: false,
+            lazy_spill: String::new(),
+            lazy_reload: String::new(),
             frame_nslots: 0,
             int32_use: int32_use_locals(f, &unboxed, &int_local),
             unboxed,
@@ -7074,6 +7171,9 @@ fn emit_function(
             switch_plan: SwitchPlan::default(),
             layouts: LayoutPlan::default(),
             lazy_frame: false,
+            lazy_homes: false,
+            lazy_spill: String::new(),
+            lazy_reload: String::new(),
             frame_nslots: 0,
             int32_use: int32_use_locals(f, &unboxed, &int_local),
             unboxed,
@@ -7178,9 +7278,21 @@ fn emit_function(
             let _ = writeln!(s, "  tsv v{} = TS_UNDEFINED;", l.id.0);
         }
     }
+    let lazy_frame = use_frame_roots
+        && lazy_frames_enabled()
+        && prop_pic_enabled()
+        && f.rest_param.is_none()
+        && json_roots.is_empty()
+        && body_is_gc_free(&f.body, &unboxed.union(&int_local).copied().collect());
+    let lazy_homes = lazy_frame && lazy_homes_enabled();
+    let (lazy_spill, lazy_reload) = if lazy_homes {
+        lazy_spill_reload(&reflike, frame_layout.as_ref())
+    } else {
+        (String::new(), String::new())
+    };
     emit_stack_cell_decls(s, &f.body, strat);
     if use_frame_roots {
-        emit_frame_decl(s, &reflike, frame_layout.as_ref());
+        emit_frame_decl_homes(s, &reflike, frame_layout.as_ref(), lazy_homes);
     }
     if !json_roots.is_empty() {
         s.push_str("  ts_json_dom_scope _json_dom_scope = {0};\n");
@@ -7207,7 +7319,7 @@ fn emit_function(
             if int_local.contains(&p.0) || unboxed.contains(&p.0) {
                 let _ = writeln!(s, "  d{} = _p{};", p.0, i);
             } else {
-                let name = frame_local_name(p.0, &frame_locals, frame_layout.as_ref());
+                let name = frame_local_name(p.0, &frame_locals, frame_layout.as_ref(), lazy_homes);
                 let _ = writeln!(s, "  {} = _p{};", name, i);
             }
             continue;
@@ -7218,7 +7330,7 @@ fn emit_function(
             } else if unboxed.contains(&p.0) {
                 let _ = writeln!(s, "  d{} = ts_to_num(_env[{}]);", p.0, i);
             } else {
-                let name = frame_local_name(p.0, &frame_locals, frame_layout.as_ref());
+                let name = frame_local_name(p.0, &frame_locals, frame_layout.as_ref(), lazy_homes);
                 let _ = writeln!(s, "  {} = _env[{}];", name, i);
             }
             continue;
@@ -7233,7 +7345,7 @@ fn emit_function(
         } else if unboxed.contains(&p.0) {
             let _ = writeln!(s, "  if (nargs > {}) d{} = ts_to_num(args[{}]);", j, p.0, j);
         } else {
-            let name = frame_local_name(p.0, &frame_locals, frame_layout.as_ref());
+            let name = frame_local_name(p.0, &frame_locals, frame_layout.as_ref(), lazy_homes);
             let _ = writeln!(s, "  if (nargs > {}) {} = args[{}];", j, name, j);
         }
     }
@@ -7242,16 +7354,11 @@ fn emit_function(
     } else {
         0
     };
-    let lazy_frame = use_frame_roots
-        && lazy_frames_enabled()
-        && prop_pic_enabled()
-        && f.rest_param.is_none()
-        && json_roots.is_empty()
-        && body_is_gc_free(&f.body, &unboxed.union(&int_local).copied().collect());
     if use_frame_roots && !lazy_frame {
         let _ = writeln!(s, "  ts_frame_push(&F.h, {});", frame_slot_count(&reflike, frame_layout.as_ref()));
     } else if use_frame_roots {
-        // lazy: the frame is declared and filled but linked only around slow paths
+        // lazy: the frame is linked only around slow paths (with register
+        // homes it is also filled only there)
     } else {
         for id in &reflike {
             let _ = writeln!(s, "  ts_gc_root(&v{});", id);
@@ -7271,7 +7378,7 @@ fn emit_function(
             .iter()
             .position(|p| p.0 == rest_id)
             .unwrap_or(f.params.len().saturating_sub(1));
-        let rest_name = frame_local_name(rest_id, &frame_locals, frame_layout.as_ref());
+        let rest_name = frame_local_name(rest_id, &frame_locals, frame_layout.as_ref(), lazy_homes);
         let _ = writeln!(s, "  {} = ts_new_array(0);", rest_name);
         let _ = writeln!(
             s,
@@ -7287,6 +7394,9 @@ fn emit_function(
         layouts: layout_plan_for(f),
 
         lazy_frame,
+        lazy_homes,
+        lazy_spill: lazy_spill.clone(),
+        lazy_reload: lazy_reload.clone(),
 
         frame_nslots,
         int32_use: int32_use_locals(f, &unboxed, &int_local),
@@ -16616,7 +16726,14 @@ fn emit_store_field_generic(s: &mut String, obj: u32, field: u32, src: u32, ctx:
     if prop_pic_enabled() {
         let pic = ctx.fresh_label();
         let _ = writeln!(s, "  {{ static ts_prop_ic _ts_pic_{} = TS_PROP_IC_INIT;", pic);
-        if ctx.lazy_frame {
+        if ctx.lazy_homes {
+            let (o, v) = (ctx.val(obj), ctx.val(src));
+            let _ = writeln!(
+                s,
+                "  if (!ts_set_pic_try({o}, {field}, {v}, &_ts_pic_{pic})) {{ {sp}ts_set_linked({o}, {field}, {v}, &_ts_pic_{pic}, &F.h, {n});{rl} }}",
+                sp = ctx.lazy_spill, rl = ctx.lazy_reload, n = ctx.frame_nslots
+            );
+        } else if ctx.lazy_frame {
             let _ = writeln!(
                 s,
                 "  ts_set_pic_inline_lazy({}, {}, {}, &_ts_pic_{}, &F.h, {});",
@@ -18539,7 +18656,17 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 let s1 = (slots & 0xFF) - 1;
                 let s2 = (slots >> 8) & 0xFF;
                 let s3 = (slots >> 16) & 0xFF;
+                let homes_try = |try_call: String| -> String {
+                    format!(
+                        "({{ tsv _lz; if (!{try_call}) {{ {sp}_lz = ts_get_linked({o}, {k}, &_ts_pic_{pic}, &F.h, {n});{rl} }} _lz; }})",
+                        try_call = try_call, sp = ctx.lazy_spill, rl = ctx.lazy_reload,
+                        o = ctx.val(obj.0), k = field.0, pic = pic, n = ctx.frame_nslots
+                    )
+                };
                 let get_expr = match (s2, s3, ctx.lazy_frame) {
+                    (0, _, true) if ctx.lazy_homes => homes_try(format!("ts_get_static_try({}, {}, {}u, &_ts_pic_{}, &_lz)", ctx.val(obj.0), field.0, s1, pic)),
+                    (_, 0, true) if ctx.lazy_homes => homes_try(format!("ts_get_static2_try({}, {}, {}u, {}u, &_ts_pic_{}, &_lz)", ctx.val(obj.0), field.0, s1, s2 - 1, pic)),
+                    (_, _, true) if ctx.lazy_homes => homes_try(format!("ts_get_static3_try({}, {}, {}u, {}u, {}u, &_ts_pic_{}, &_lz)", ctx.val(obj.0), field.0, s1, s2 - 1, s3 - 1, pic)),
                     (0, _, false) => format!("ts_get_static_inline({}, {}, {}u, &_ts_pic_{})", ctx.val(obj.0), field.0, s1, pic),
                     (0, _, true) => format!("ts_get_static_inline_lazy({}, {}, {}u, &_ts_pic_{}, &F.h, {})", ctx.val(obj.0), field.0, s1, pic, ctx.frame_nslots),
                     (_, 0, false) => format!("ts_get_static2_inline({}, {}, {}u, {}u, &_ts_pic_{})", ctx.val(obj.0), field.0, s1, s2 - 1, pic),
@@ -18563,7 +18690,13 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     "  {{ static ts_prop_ic _ts_pic_{} = TS_PROP_IC_INIT;",
                     pic
                 );
-                let get_expr = if ctx.lazy_frame {
+                let get_expr = if ctx.lazy_homes {
+                    format!(
+                        "({{ tsv _lz; if (!ts_get_pic_try({o}, {k}, &_ts_pic_{pic}, &_lz)) {{ {sp}_lz = ts_get_linked({o}, {k}, &_ts_pic_{pic}, &F.h, {n});{rl} }} _lz; }})",
+                        o = ctx.val(obj.0), k = field.0, pic = pic, n = ctx.frame_nslots,
+                        sp = ctx.lazy_spill, rl = ctx.lazy_reload
+                    )
+                } else if ctx.lazy_frame {
                     format!(
                         "ts_get_pic_checked_inline_lazy({}, {}, &_ts_pic_{}, &F.h, {})",
                         ctx.val(obj.0),
@@ -18701,7 +18834,17 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 let s1 = (slots & 0xFF) - 1;
                 let s2 = (slots >> 8) & 0xFF;
                 let s3 = (slots >> 16) & 0xFF;
+                let homes_set = |try_call: String| -> String {
+                    format!(
+                        "  if (!{try_call}) {{ {sp}ts_set_linked({o}, {k}, {v}, &_ts_pic_{pic}, &F.h, {n});{rl} }}",
+                        try_call = try_call, sp = ctx.lazy_spill, rl = ctx.lazy_reload,
+                        o = ctx.val(obj.0), k = field.0, v = ctx.val(src.0), pic = pic, n = ctx.frame_nslots
+                    )
+                };
                 match (s2, s3, ctx.lazy_frame) {
+                    (0, _, true) if ctx.lazy_homes => { let _ = writeln!(s, "{}", homes_set(format!("ts_set_static_try({}, {}, {}u, {}, &_ts_pic_{})", ctx.val(obj.0), field.0, s1, ctx.val(src.0), pic))); }
+                    (_, 0, true) if ctx.lazy_homes => { let _ = writeln!(s, "{}", homes_set(format!("ts_set_static2_try({}, {}, {}u, {}u, {}, &_ts_pic_{})", ctx.val(obj.0), field.0, s1, s2 - 1, ctx.val(src.0), pic))); }
+                    (_, _, true) if ctx.lazy_homes => { let _ = writeln!(s, "{}", homes_set(format!("ts_set_static3_try({}, {}, {}u, {}u, {}u, {}, &_ts_pic_{})", ctx.val(obj.0), field.0, s1, s2 - 1, s3 - 1, ctx.val(src.0), pic))); }
                     (0, _, false) => { let _ = writeln!(s, "  ts_set_static_inline({}, {}, {}u, {}, &_ts_pic_{});", ctx.val(obj.0), field.0, s1, ctx.val(src.0), pic); }
                     (0, _, true) => { let _ = writeln!(s, "  ts_set_static_inline_lazy({}, {}, {}u, {}, &_ts_pic_{}, &F.h, {});", ctx.val(obj.0), field.0, s1, ctx.val(src.0), pic, ctx.frame_nslots); }
                     (_, 0, false) => { let _ = writeln!(s, "  ts_set_static2_inline({}, {}, {}u, {}u, {}, &_ts_pic_{});", ctx.val(obj.0), field.0, s1, s2 - 1, ctx.val(src.0), pic); }
@@ -18748,7 +18891,17 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             // the in-range non-hole element of an array is read in line
             // (TSAOT_INLINE_INDEX=0 keeps the out-of-line reader)
             let inline = inline_index_enabled();
-            if ctx.lazy_frame {
+            if ctx.lazy_homes {
+                let (a, i) = (ctx.val(arr.0), ctx.num(index.0));
+                s.push_str(&ctx.set_val(
+                    dst.0,
+                    &format!(
+                        "({{ tsv _lz; if (!{t}({a}, (uint32_t)({i}), &_lz)) {{ {sp}_lz = ts_array_get_linked({a}, (uint32_t)({i}), &F.h, {n});{rl} }} _lz; }})",
+                        t = if inline { "ts_array_get_inline_try" } else { "ts_array_get_try" },
+                        a = a, i = i, n = ctx.frame_nslots, sp = ctx.lazy_spill, rl = ctx.lazy_reload
+                    ),
+                ));
+            } else if ctx.lazy_frame {
                 s.push_str(&ctx.set_val(
                     dst.0,
                     &format!(
