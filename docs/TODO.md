@@ -6559,8 +6559,28 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   build `native_s350nk` against `native_s350sk`: eight ABBA pairs, wall
   0.999, user 0.999; instructions +0.36% (84.39 vs 84.08 G: the double-key
   index tests), cycles +0.12%; outputs identical.
+- GC v2 slice G2b: element buffers and sparse tables in the payload heap
+  (runtime only; `docs/gc_v2_design.md` §6.1). Buffers owned by a cell now
+  go through `gc_owned_alloc` / `gc_owned_realloc` / `gc_owned_free`:
+  payloads for heap owners, malloc for owners outside the heap (stack and
+  arena cells, which the collector may not see), told apart on release by
+  the cage check; a growth that fits the payload's size class stays in
+  place; small classes now reach 32 KiB (two cells per block at the top),
+  larger buffers take runs of blocks (`MADV_FREE` when a run is released).
+  A dying array's buffers are released by not being marked
+  (`array_release_dead`). Fixture `gc/payload_arrays` (long-lived arrays
+  growing after promotion, buffers past the small classes, sparse tables
+  in both directions, splice rebuilds; also under GC stress); a mutant
+  without the array marks fails it under GC stress with zapping. Writing
+  it exposed the two element-key miscompiles fixed in the previous two
+  commits.
+  Gates: unit, parity (360 identical), bundler, selfconf (a known
+  spliceDrop row), GC stress, inline policy, conformance 483/483. A/B
+  against `native_s350nk` (both relinked from its compiler object): eight
+  ABBA pairs, wall 0.998, user 0.999; instructions +0.04%, cycles -0.27%:
+  neutral.
 - Next slices, in order. GC v2 first (`docs/gc_v2_design.md` §6: G2
-  payloads in a block heap (G2b element buffers next), G3 the non-moving decision gate).
+  payloads in a block heap (G2c property vectors next), G3 the non-moving decision gate).
   A slice that extends the stack or an arena to a
   new kind of allocation runs the conformance suite and a compile of the
   compiler under `--stack-check` (an arena must allocate through the

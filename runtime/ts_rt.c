@@ -118,7 +118,7 @@ extern void __asan_poison_memory_region(const void *addr, size_t size);
 #define GC_BLOCK_BYTES ((size_t)1u << GC_BLOCK_SHIFT)
 #define GC_BLOCK_GRANULES (GC_BLOCK_BYTES >> 4)
 #define GC_BLOCK_BITMAP_WORDS (GC_BLOCK_GRANULES / 64u)
-#define GC_PAYLOAD_SMALL_MAX ((size_t)16384u)
+#define GC_PAYLOAD_SMALL_MAX ((size_t)32768u)
 #define GC_PAYLOAD_NCLASS 64
 #define GC_CAGE_COMMIT_BLOCKS 16u   /* the frontier commits 1 MiB at a time */
 enum { GC_BLK_FREE = 0, GC_BLK_PAYLOAD = 1, GC_BLK_LARGE = 2, GC_BLK_LARGE_CONT = 3 };
@@ -319,6 +319,68 @@ static inline void gc_payload_mark(const void* p){
   gc_block* b = &g_blocks[bi];
   if (b->state == GC_BLK_PAYLOAD) gc_payload_mark_small(bi, off & (GC_BLOCK_BYTES - 1u));
   else if (b->state == GC_BLK_LARGE) b->mark = 1;
+}
+
+static inline int gc_payload_in_cage(const void* p){
+  return p && (uintptr_t)p - (uintptr_t)g_cage_base < g_cage_bytes;
+}
+/* The usable bytes of a payload (its size class, or its run). */
+static size_t gc_payload_size(const void* p){
+  uintptr_t off = (uintptr_t)p - (uintptr_t)g_cage_base;
+  const gc_block* b = &g_blocks[off >> GC_BLOCK_SHIFT];
+  return b->state == GC_BLK_PAYLOAD ? g_pclass_size[b->cls] : (size_t)b->nblocks << GC_BLOCK_SHIFT;
+}
+/* Release a payload its owner no longer references (growth, conversion):
+   a small cell loses its mark (reusable after the next collection), a large
+   run returns its blocks. */
+static void gc_payload_free(void* p){
+  uintptr_t off = (uintptr_t)p - (uintptr_t)g_cage_base;
+  uint32_t bi = (uint32_t)(off >> GC_BLOCK_SHIFT);
+  gc_block* b = &g_blocks[bi];
+  if (b->state == GC_BLK_PAYLOAD){
+    uint32_t size = g_pclass_size[b->cls];
+    uint32_t g = (uint32_t)((off & (GC_BLOCK_BYTES - 1u)) >> 4);
+    uint64_t* w = &gc_block_bitmap(bi)[g >> 6];
+    uint64_t m = (uint64_t)1u << (g & 63u);
+    if (*w & m){ *w &= ~m; b->live -= size; }
+    gc_payload_zap_run((char*)p, size);
+  } else if (b->state == GC_BLK_LARGE){
+    if (b->prev) g_blocks[b->prev - 1u].next = b->next; else g_large_head = b->next;
+    if (b->next) g_blocks[b->next - 1u].prev = b->prev;
+    size_t bytes = (size_t)b->nblocks << GC_BLOCK_SHIFT;
+    gc_payload_zap_run((char*)p, bytes);
+    if (b->nblocks > 1u) madvise(p, bytes, MADV_FREE);
+    uint32_t n = b->nblocks;
+    for (uint32_t i = 0; i < n; i++){
+      g_blocks[bi + i].state = GC_BLK_FREE; g_blocks[bi + i].next = g_free_blocks; g_free_blocks = bi + i + 1u;
+    }
+  }
+}
+/* Buffers owned by a cell: payloads for heap owners; malloc'd for owners
+   outside the heap (stack and arena cells: the collector may not see such a
+   cell, so it could not mark its payloads). The release functions tell the
+   two apart by the cage check. */
+static void* gc_owned_alloc(const ts_gc_header* owner, size_t bytes){
+  if (owner->gen == TS_GEN_NONHEAP){ gc_note_payload(bytes); return malloc(bytes); }
+  return gc_payload_alloc(bytes, owner->gen == TS_GEN_OLD);
+}
+static void gc_owned_free(void* p){
+  if (!p) return;
+  if (gc_payload_in_cage(p)) gc_payload_free(p); else free(p);
+}
+static void* gc_owned_realloc(const ts_gc_header* owner, void* p, size_t old_bytes, size_t new_bytes){
+  if (!p) return gc_owned_alloc(owner, new_bytes);
+  if (!gc_payload_in_cage(p)){ gc_note_payload(new_bytes > old_bytes ? new_bytes - old_bytes : 0); return realloc(p, new_bytes); }
+  if (new_bytes <= gc_payload_size(p)) return p;
+  void* np = gc_owned_alloc(owner, new_bytes);
+  memcpy(np, p, old_bytes < new_bytes ? old_bytes : new_bytes);
+  gc_payload_free(p);
+  return np;
+}
+/* A dying cell's buffers: payloads go by not being marked; only malloc'd
+   ones (an owner outside the heap never dies here) would need a free. */
+static inline void gc_owned_release_dead(void* p){
+  if (p && !gc_payload_in_cage(p)) free(p);
 }
 /* A full collection re-marks every payload it reaches. */
 static void gc_payload_begin_full(void){
@@ -1702,9 +1764,8 @@ typedef struct ts_sparse_elems {
 static inline ts_sparse_elems* array_sparse_table(ts_array* a){ return (ts_sparse_elems*)(uintptr_t)a->inline_data[0]; }
 static inline void array_set_sparse_table(ts_array* a, ts_sparse_elems* s){ a->inline_data[0] = (tsv)(uintptr_t)s; }
 static inline tsv* sparse_vals(ts_sparse_elems* s){ return (tsv*)(s->keys + (s->mask + 1u)); }
-static ts_sparse_elems* sparse_alloc(uint32_t size){   /* size: a power of two >= 8 */
-  ts_sparse_elems* s = (ts_sparse_elems*)malloc(sizeof(ts_sparse_elems) + (size_t)size * (sizeof(uint32_t) + sizeof(tsv)));
-  gc_note_payload((size_t)size * (sizeof(uint32_t) + sizeof(tsv)));
+static ts_sparse_elems* sparse_alloc(const ts_gc_header* owner, uint32_t size){   /* size: a power of two >= 8 */
+  ts_sparse_elems* s = (ts_sparse_elems*)gc_owned_alloc(owner, sizeof(ts_sparse_elems) + (size_t)size * (sizeof(uint32_t) + sizeof(tsv)));
   s->count = 0; s->mask = size - 1u;
   memset(s->keys, 0xFF, (size_t)size * sizeof(uint32_t));
   return s;
@@ -1725,21 +1786,26 @@ static void sparse_insert_new(ts_sparse_elems* s, uint32_t key, tsv v){   /* key
   while (s->keys[h] != ARRAY_SPARSE_EMPTY) h = (h + 1u) & s->mask;
   s->keys[h] = key; sparse_vals(s)[h] = v; s->count++;
 }
-static ts_sparse_elems* sparse_put(ts_sparse_elems* s, uint32_t key, tsv v){   /* returns the (possibly grown) table */
+static ts_sparse_elems* sparse_put(const ts_gc_header* owner, ts_sparse_elems* s, uint32_t key, tsv v){   /* returns the (possibly grown) table */
   uint32_t h = sparse_find(s, key);
   if (h != ARRAY_SPARSE_EMPTY){ sparse_vals(s)[h] = v; return s; }
   if ((uint64_t)(s->count + 1u) * 2u > (uint64_t)s->mask + 1u){   /* load factor 1/2 */
-    ts_sparse_elems* ns = sparse_alloc((s->mask + 1u) * 2u);
+    ts_sparse_elems* ns = sparse_alloc(owner, (s->mask + 1u) * 2u);
     tsv* vals = sparse_vals(s);
     for (uint32_t i = 0; i <= s->mask; i++) if (s->keys[i] != ARRAY_SPARSE_EMPTY) sparse_insert_new(ns, s->keys[i], vals[i]);
-    free(s); s = ns;
+    gc_owned_free(s); s = ns;
   }
   sparse_insert_new(s, key, v);
   return s;
 }
 static void array_free_data(ts_array* a){
-  if (a->sparse){ free(array_sparse_table(a)); a->inline_data[0] = TS_UNDEFINED; a->sparse = 0; return; }
-  if (a->data && !array_uses_inline(a)) free(a->data);
+  if (a->sparse){ gc_owned_free(array_sparse_table(a)); a->inline_data[0] = TS_UNDEFINED; a->sparse = 0; return; }
+  if (a->data && !array_uses_inline(a)) gc_owned_free(a->data);
+}
+/* A dying array: its buffers are payloads, released by not being marked. */
+static void array_release_dead(ts_array* a){
+  if (a->sparse) gc_owned_release_dead(array_sparse_table(a));
+  else if (a->data && !array_uses_inline(a)) gc_owned_release_dead(a->data);
 }
 /* A store at i on a dense array goes sparse when the dense buffer would have
    to more than double by at least ARRAY_SPARSE_MIN_GAP slots (V8's
@@ -1752,7 +1818,7 @@ static void array_make_sparse(ts_array* a){
   uint32_t n = a->len < a->cap ? a->len : a->cap;
   uint32_t size = 8u;
   while ((uint64_t)size < (uint64_t)n * 2u) size *= 2u;
-  ts_sparse_elems* s = sparse_alloc(size);
+  ts_sparse_elems* s = sparse_alloc(&a->o.h, size);
   for (uint32_t i = 0; i < n; i++) if (!array_is_hole(a->data[i])) sparse_insert_new(s, i, a->data[i]);
   array_free_data(a);
   a->data = NULL; a->cap = 0; a->sparse = 1;
@@ -1766,14 +1832,14 @@ static void array_densify(ts_array* a, uint32_t need){
   ts_sparse_elems* s = array_sparse_table(a);
   uint32_t n = a->len > need ? a->len : need;
   uint32_t nc = n < 4u ? 4u : n;
-  tsv* nd = nc <= 4u ? a->inline_data : (tsv*)malloc(sizeof(tsv) * nc);
+  tsv* nd = nc <= 4u ? a->inline_data : (tsv*)gc_owned_alloc(&a->o.h, sizeof(tsv) * nc);
   for (uint32_t i = 0; i < nc; i++) nd[i] = TS_ARRAY_HOLE;
   tsv* vals = sparse_vals(s);
   for (uint32_t h = 0; h <= s->mask; h++){
     uint32_t k = s->keys[h];
     if (k != ARRAY_SPARSE_EMPTY && k < nc) nd[k] = vals[h];
   }
-  free(s);
+  gc_owned_free(s);
   a->data = nd; a->cap = nc; a->sparse = 0;
   array_invalidate_dirty(a);
 }
@@ -1784,7 +1850,7 @@ static inline ts_array* arr_dense(tsv arr){   /* arr is an array: its dense form
 }
 static void array_sparse_store(ts_array* a, uint32_t i, tsv v){
   RT_STAT_INC(array_sparse_put);
-  ts_sparse_elems* s = sparse_put(array_sparse_table(a), i, v);
+  ts_sparse_elems* s = sparse_put(&a->o.h, array_sparse_table(a), i, v);
   array_set_sparse_table(a, s);
   if (i >= a->len) a->len = i + 1u;
   if (a->o.h.gen == TS_GEN_OLD && array_value_is_young(v)){ a->gc_dirty_all = 1; gc_remember(&a->o.h); }
@@ -1805,8 +1871,7 @@ static void array_init_storage(ts_array* a, uint32_t len){
   a->element_kind = 0;
   a->len = len;
   a->cap = len < 4 ? 4 : len;
-  a->data = (a->cap <= 4) ? a->inline_data : (tsv*)malloc(sizeof(tsv) * a->cap);
-  if (a->cap > 4) gc_note_payload(sizeof(tsv) * a->cap);
+  a->data = (a->cap <= 4) ? a->inline_data : (tsv*)gc_owned_alloc(&a->o.h, sizeof(tsv) * a->cap);
   for (uint32_t i=0;i<a->cap;i++) a->data[i] = TS_ARRAY_HOLE;   /* [len, cap) holes too (invariant) */
 }
 static void array_ensure_cap(ts_array* a, uint32_t need){
@@ -1815,13 +1880,12 @@ static void array_ensure_cap(ts_array* a, uint32_t need){
   uint32_t old = a->cap;
   uint32_t nc = old ? old * 2 : 4;
   while (nc < need) nc *= 2;
-  gc_note_payload(sizeof(tsv) * (size_t)(nc - old));
   if (array_uses_inline(a)){
-    tsv* nd = (tsv*)malloc(sizeof(tsv) * nc);
+    tsv* nd = (tsv*)gc_owned_alloc(&a->o.h, sizeof(tsv) * nc);
     for (uint32_t i=0;i<old;i++) nd[i] = a->data[i];
     a->data = nd;
   } else {
-    a->data = (tsv*)realloc(a->data, nc * sizeof(tsv));
+    a->data = (tsv*)gc_owned_realloc(&a->o.h, a->data, sizeof(tsv) * old, sizeof(tsv) * nc);
   }
   /* The grown tail is holes: readers bound by cap, so [len, cap) must hold
      holes (a store past len then needs no fill; truncation refills). */
@@ -4999,6 +5063,8 @@ static void gc_scan_cell(ts_gc_header* h, int young, int depth){
     gc_visit_slot(&f->prototype_prop, young, depth, stable);
     gc_visit_slot(&f->o.proto, young, depth, stable);
   } else if (h->kind==TS_KIND_ARRAY){ ts_array* a=(ts_array*)h;
+    if (a->sparse) gc_payload_mark(array_sparse_table(a));
+    else if (a->data && !array_uses_inline(a)) gc_payload_mark(a->data);
     if (a->sparse){
       /* side table (far stores): every entry; a sparse store dirties the whole cell */
       ts_sparse_elems* s = array_sparse_table(a); tsv* vals = sparse_vals(s);
@@ -5061,7 +5127,7 @@ static void gc_free_cell_payload(ts_gc_header* h){
   if (h->kind==TS_KIND_OBJECT){
     ts_object* o=(ts_object*)h; props_free(o); free(o->prop_index);
   } else if (h->kind==TS_KIND_ARRAY){
-    ts_array* a=(ts_array*)h; array_free_data(a); props_free(&a->o); free(a->o.prop_index);
+    ts_array* a=(ts_array*)h; array_release_dead(a); props_free(&a->o); free(a->o.prop_index);
   } else if (h->kind==TS_KIND_FUNC){
     ts_func* f=(ts_func*)h; props_free(&f->o); free(f->o.prop_index);   /* the environment is a payload */
   } else if (h->kind==TS_KIND_MAP){
@@ -6658,7 +6724,7 @@ static tsv ts_array_splice_impl(tsv arr, double start, double dc, int has_dc, ts
   long newlen = n - del + ni;
   /* rebuild data buffer: [0,s) + items + [s+del,n). No GC between malloc and
      assignment, so the raw pointers stay valid. */
-  tsv* nd = (tsv*)malloc((size_t)(newlen?newlen:1)*sizeof(tsv));
+  tsv* nd = (tsv*)gc_owned_alloc(&as_arr(arr)->o.h, (size_t)(newlen?newlen:1)*sizeof(tsv));
   long w=0;
   a=as_arr(arr);
   for(long i=0;i<s;i++) nd[w++]=a->data[i];
@@ -6669,7 +6735,7 @@ static tsv ts_array_splice_impl(tsv arr, double start, double dc, int has_dc, ts
     a->data = a->inline_data;
     a->cap = 4;
     for (uint32_t i=0;i<4;i++) a->data[i] = (i < (uint32_t)newlen) ? nd[i] : TS_ARRAY_HOLE;
-    free(nd);
+    gc_owned_free(nd);
   } else {
     a->data=nd;
     a->cap=(uint32_t)newlen;
