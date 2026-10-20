@@ -662,7 +662,27 @@ static ts_regexp_compiled* ts_regexp_compile_pattern_tsv_cached_inner(tsv patter
   return re;
 }
 
+/* A regular expression literal's pattern is a static string, never freed: its
+   value identity keys a direct-mapped cache in front of the pattern cache,
+   which converts the pattern to the engine's form (an allocation and a copy)
+   and scans every entry on each exec / test / replace. Dynamic patterns (a
+   heap string whose handle can be recycled) keep the content-keyed path. */
+#define TS_REGEXP_ID_CACHE 64u
+static struct { tsv pattern; uint32_t flags; ts_regexp_compiled* re; } g_regexp_id_cache[TS_REGEXP_ID_CACHE];
 static ts_regexp_compiled* ts_regexp_compile_pattern_tsv_cached(tsv pattern, uint32_t flags){
+  if (ts_is_heap_str(pattern) && (ts_str_flags_typed(pattern) & TS_STR_FLAG_STATIC)){
+    uint64_t x = (uint64_t)pattern ^ ((uint64_t)pattern >> 17) ^ ((uint64_t)flags * 0x9E3779B1u);
+    uint32_t slot = (uint32_t)(x >> 3) & (TS_REGEXP_ID_CACHE - 1u);
+    if (g_regexp_id_cache[slot].re && g_regexp_id_cache[slot].pattern == pattern && g_regexp_id_cache[slot].flags == flags)
+      return g_regexp_id_cache[slot].re;
+    ts_regexp_compiled* re = ts_regexp_compile_pattern_tsv_cached_inner(pattern, flags, NULL, 0, 1);
+    if (re){
+      g_regexp_id_cache[slot].pattern = pattern;
+      g_regexp_id_cache[slot].flags = flags;
+      g_regexp_id_cache[slot].re = re;
+    }
+    return re;
+  }
   return ts_regexp_compile_pattern_tsv_cached_inner(pattern, flags, NULL, 0, 1);
 }
 

@@ -6219,6 +6219,20 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   per-read checks and slow-path calls in small hot functions, which only a
   guard hoisted out of the body (function versioning on the receiver's
   layout) would remove.
+- A literal-identity cache for compiled regular expressions (build `x61`,
+  full build; runtime RegExp adapter). The kernel `path_regexps` (2.8x
+  Node, the compiler's path normalization) spent its samples in the
+  engine and in `ts_regexp_compile_pattern_tsv_cached_inner`, plus the
+  memmove and free around it: every exec / test / replace converted the
+  pattern to the engine's form (an allocation and a copy) and scanned the
+  whole pattern cache with memcmp. A regular expression literal's pattern
+  is a static string, never freed, so its value identity (with the flags)
+  now keys a 64-entry direct-mapped cache in front; dynamic patterns (a
+  heap string whose handle can be recycled) keep the content-keyed path.
+  `path_regexps` 261 -> 238 ms. Gates all green (the regexp fixtures also
+  under GC stress). A/B against `x60`, two rounds of three alternating
+  runs: 4.379 vs 4.413 s and 4.384 vs 4.412 s median (pairs -0.3% to
+  -1.0% but one outlier): about -0.7%. Node 3.27-3.28 s (1.34x).
 - Next slices, in order. A slice that extends the stack or an arena to a
   new kind of allocation runs the conformance suite and a compile of the
   compiler under `--stack-check` (an arena must allocate through the
