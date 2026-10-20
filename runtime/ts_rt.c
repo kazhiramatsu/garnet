@@ -1660,7 +1660,6 @@ static ts_func* fn_materialize_prototype(ts_func* f, tsv fnv){
     ts_define_data(f->prototype_prop, fn_constructor_key(), fnv, 0, 1, 1);
   return f;
 }
-int ts_is_callable(tsv v){ return ts_is_func(v); }
 /* Calling a non-function is a catchable TypeError in JS (`x()` / `x.m()` where
    the callee isn't callable). Implemented after the Error infrastructure (it
    needs TS_ERR_TYPE); forward-declared here so the call ABI below can throw.
@@ -16554,7 +16553,7 @@ tsv ts_headers_delete(tsv headers, tsv namev){
 }
 
 /* generic `.length`: string length for strings, element count for arrays. */
-double ts_length(tsv v){
+double ts_length_slow(tsv v){
   if (ts_is_str(v)) return (double)ts_str_len_typed(v);
   if (ts_is_indexed_array_fast(v)) return (double)((ts_array*)ts_ptr(v))->len;
   if (ts_is_func(v)) return (double)((ts_func*)ts_ptr(v))->arity; /* fn.length */

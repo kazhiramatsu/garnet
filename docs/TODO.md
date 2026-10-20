@@ -7006,6 +7006,27 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   every 256 allocations, its 78 output files identical. A/B against `pt`:
   eight ABBA pairs, instructions 0.9944 (eight of eight), cycles 0.9940
   (seven of eight), wall 0.9925.
+- `ts_is_callable` (tested on every dynamic method call) and `ts_length`
+  (`x.length` of a value known only to be a string, an array or a function)
+  were out-of-line calls; both are inline in `ts_rt.h` now (`ts_length`
+  answers strings and plain arrays in place, `ts_length_slow` the rest).
+  Gates: unit, parity (366 identical), bundler, selfconf, GC stress, inline
+  policy, conformance 499/499 and 499/499 with a collection at every
+  allocation in protect mode; tsc rebuilt and compiled under protect mode,
+  with zapping, and with a minor collection every 256 allocations, its 78
+  output files identical. A/B against `rl`: instructions 0.9984 (eight of
+  eight), cycles 1.0008, wall 1.0000: neutral on the compiler.
+- Pattern kernels after the probe tables (native / Node ms): links_objects
+  468 / 145 (3.2x), small_calls 670 / 216 (3.1x), ctor_functions 249 / 88,
+  switch_dispatch 381 / 137, object_arrays 263 / 103, flags_truthy 336 /
+  139, path_regexps 269 / 112. `links_objects` spends a third of its time
+  reading absent properties out of line: `docs/absent_reads_inline_design.md`
+  proposes the per-site check in line (option B). `object_arrays` and
+  `flags_truthy` run almost entirely in the generated loop (frame slot
+  stores of access operands, repeated element reads, double/int32 round
+  trips); the operands of an access keep their slots because the runtime's
+  slow paths may still rely on them (the H2 hazards of
+  `scripts/gc_hazard_check.py`).
 - Where the remaining 358.7M frame pushes come from (a per-function count,
   joined with the rule under relaxations): a precise backward liveness
   would remove 1.4% (it never needs a slot the linear walk does not: checked
@@ -7022,7 +7043,8 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
 - Next slices, in order. GC v2 Y1 is paused (Kaz, 2026-10-21, after
   `docs/gc_v2_design.md` §6.6.1: about 1-2% at most for a large refactor
   with silent-miscompile risk); handles stay. Back to the patterns slower
-  than V8 (pattern kernels, worst native/node ratio first). Frame elision,
+  than V8 (pattern kernels, worst native/node ratio first). Absent reads in
+  line (`docs/absent_reads_inline_design.md`, option B). Frame elision,
   round 2c: direct callees that never collect,
   non-allocating builtins and primitive comparisons; then measure how many
   calls of the remaining framed functions reach a point that needs the

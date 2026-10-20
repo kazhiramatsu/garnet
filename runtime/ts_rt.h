@@ -800,6 +800,15 @@ static inline int ts_is_indexed_array_fast(tsv v){
 static inline int ts_is_array_fast(tsv v){
   return ts_is_indexed_array_fast(v) && ((ts_array*)ts_ptr(v))->element_kind == 0;
 }
+/* `x.length` of a value the compiler only knows to be a string, an array or a
+   function (GenericLen): a string or a plain array in line, the rest (a
+   function's arity, a proxy's get trap) out of line. */
+double ts_length_slow(tsv v);
+static inline double ts_length(tsv v){
+  if (ts_is_str(v)) return (double)ts_str_len_typed(v);
+  if (ts_is_indexed_array_fast(v)) return (double)((ts_array*)ts_ptr(v))->len;
+  return ts_length_slow(v);
+}
 static inline uint32_t ts_array_len_fast(tsv arr){
   return ts_is_indexed_array_fast(arr) ? ((ts_array*)ts_ptr(arr))->len : 0;
 }
@@ -1103,7 +1112,8 @@ tsv  ts_make_fn(ts_code code, tsv* env, uint32_t envlen); /* boxed callable; env
 tsv  ts_call(tsv fn, tsv* args, int nargs);               /* invoke a callable value */
 tsv  ts_call_value(tsv fn, tsv* args, int nargs);         /* value/callback call (injects undefined this if takes_this) */
 tsv  ts_call_method(tsv fn, tsv* args, int nargs);        /* method dispatch (args[0]=this); drops receiver if callee lacks takes_this */
-int  ts_is_callable(tsv v);
+/* a function value (the method-call fallback tests it on every dynamic call) */
+static inline int ts_is_callable(tsv v){ return ts_is_func(v); }
 tsv  ts_new_sized(size_t size);
 tsv  ts_new_sized_pretenured(size_t size);
 /* arrays (contiguous storage with an internal sparse-hole sentinel) */
@@ -1124,7 +1134,6 @@ void ts_array_push(tsv arr, tsv v);
 void ts_array_push_hole(tsv arr);
 int  ts_array_has_index(tsv arr, uint32_t i);
 uint32_t ts_array_len(tsv arr);
-double   ts_length(tsv v);
 
 /* stdlib: String methods */
 tsv ts_str_toupper(tsv s);
