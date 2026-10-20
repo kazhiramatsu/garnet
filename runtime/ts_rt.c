@@ -89,6 +89,9 @@ static int g_nursery_enabled = 1;           /* TSAOT_GC_NURSERY=0 kill switch */
    (TSAOT_GC_PAYLOAD_BUDGET_BYTES). */
 static size_t g_payload_fresh_bytes = 0;
 static size_t g_payload_budget_bytes = 0;
+/* Set while a collection runs: a payload allocated then (the weak-table
+   pruning compacts a WeakMap after scanning it) is allocated marked. */
+static int g_gc_collecting = 0;
 static inline void gc_note_payload(size_t bytes){ g_payload_fresh_bytes += bytes; }
 
 /* ---------------- payload heap (docs/gc_v2_design.md §6.1, slice G2) ----------------
@@ -362,7 +365,7 @@ static void gc_payload_free(void* p){
    two apart by the cage check. */
 static void* gc_owned_alloc(const ts_gc_header* owner, size_t bytes){
   if (owner->gen == TS_GEN_NONHEAP){ gc_note_payload(bytes); return malloc(bytes); }
-  return gc_payload_alloc(bytes, owner->gen == TS_GEN_OLD);
+  return gc_payload_alloc(bytes, owner->gen == TS_GEN_OLD || g_gc_collecting);
 }
 static void gc_owned_free(void* p){
   if (!p) return;
@@ -5044,6 +5047,8 @@ static void gc_scan_cell(ts_gc_header* h, int young, int depth){
     gc_mark_common_props(&a->o, young, depth, stable);
     gc_visit_slot(&a->o.proto, young, depth, stable);
   } else if (h->kind==TS_KIND_MAP){ ts_map* m=(ts_map*)h;
+    gc_payload_mark(m->keys); gc_payload_mark(m->vals); gc_payload_mark(m->hashes);
+    gc_payload_mark(m->index); gc_payload_mark(m->iteration_order);
     if (m->weak){
       /* Ephemeron entries are deliberately skipped here. Their values are
          marked after the ordinary transitive closure, iff their keys are live. */
@@ -5064,6 +5069,8 @@ static void gc_scan_cell(ts_gc_header* h, int young, int depth){
     gc_mark_common_props(&m->o, young, depth, stable);
     gc_visit_slot(&m->o.proto, young, depth, stable);
   } else if (h->kind==TS_KIND_SET){ ts_set_t* st=(ts_set_t*)h;
+    gc_payload_mark(st->elems); gc_payload_mark(st->hashes);
+    gc_payload_mark(st->index); gc_payload_mark(st->iteration_order);
     if (young && !st->weak) RT_STAT_ADD(kind_minor_elements[h->kind], st->len);
     if (st->weak){ if (!g_gc_rewrite_only) gc_weak_enqueue(h); }
     else for (uint32_t i=0;i<st->len;i++) gc_visit_slot(&st->elems[i], young, depth, stable);
@@ -5091,9 +5098,9 @@ static void gc_free_cell_payload(ts_gc_header* h){
   } else if (h->kind==TS_KIND_FUNC){
     ts_func* f=(ts_func*)h; props_release_dead(&f->o);   /* the environment is a payload */
   } else if (h->kind==TS_KIND_MAP){
-    ts_map* m=(ts_map*)h; free(m->keys); free(m->vals); free(m->hashes); free(m->index); free(m->iteration_order); props_release_dead(&m->o);
+    ts_map* m=(ts_map*)h; gc_owned_release_dead(m->keys); gc_owned_release_dead(m->vals); gc_owned_release_dead(m->hashes); gc_owned_release_dead(m->index); gc_owned_release_dead(m->iteration_order); props_release_dead(&m->o);
   } else if (h->kind==TS_KIND_SET){
-    ts_set_t* s=(ts_set_t*)h; free(s->elems); free(s->hashes); free(s->index); free(s->iteration_order); props_release_dead(&s->o);
+    ts_set_t* s=(ts_set_t*)h; gc_owned_release_dead(s->elems); gc_owned_release_dead(s->hashes); gc_owned_release_dead(s->index); gc_owned_release_dead(s->iteration_order); props_release_dead(&s->o);
   }
   else if (h->kind==TS_KIND_PROMISE){ free(((ts_promise*)h)->waiters); }
   else if (h->kind==TS_KIND_CORO){
@@ -5525,6 +5532,7 @@ static void gc_sweep_pinned_young(ts_gc_header** survivors){
 void ts_gc_collect_young(void){
   g_payload_fresh_bytes = 0;
   if (!g_young_heap && !g_nursery_active && !g_pinned_young) return;
+  g_gc_collecting = 1;
   RT_STAT_INC(minor_gc); RT_STAT_GC_T0;
   G0_T0;
 #ifdef TSAOT_STACK_CHECK
@@ -5676,6 +5684,7 @@ void ts_gc_collect_young(void){
   g_sc_minors_since_full++;
 #endif
   gc_payload_after_collection(0);
+  g_gc_collecting = 0;
   G0_PHASE(g0_minor_ns, 5);
   RT_STAT_GC_T1;
 }
@@ -5683,6 +5692,7 @@ void ts_gc_collect(void){
   RT_STAT_INC(full_gc); RT_STAT_GC_T0;
   G0_T0;
   g_payload_fresh_bytes = 0;
+  g_gc_collecting = 1;
   gc_payload_begin_full();
   prop_add_epoch_bump();
   gc_weak_begin();
@@ -5768,6 +5778,7 @@ void ts_gc_collect(void){
   g_nursery_survivor_bytes = 0;
   gc_clear_nonheap_marks();
   gc_payload_after_collection(1);
+  g_gc_collecting = 0;
   G0_PHASE(g0_full_ns, 5);
   RT_STAT_GC_T1;
 }
@@ -6993,13 +7004,13 @@ static void mapset_index_insert(uint32_t* index, uint32_t index_cap,
 }
 /* (Re)build the slot table over the live dense entries. Sized so the table is
    at most half full at build time (load stays < 3/4 until the next rebuild). */
-static uint32_t* mapset_index_build(const tsv* keys, const uint32_t* hashes,
+static uint32_t* mapset_index_build(const ts_gc_header* owner, const tsv* keys, const uint32_t* hashes,
                                     uint32_t len, uint32_t* cap_io){
   uint32_t want = (len + 2u) * 2u;
   uint32_t cap = 16u;
   while (cap < want) cap <<= 1;
-  uint32_t* index = (uint32_t*)calloc(cap, sizeof(uint32_t));
-  if (!index){ *cap_io = 0; return NULL; }
+  uint32_t* index = (uint32_t*)gc_owned_alloc(owner, sizeof(uint32_t) * cap);
+  memset(index, 0, sizeof(uint32_t) * cap);
   for (uint32_t i = 0; i < len; i++){
     if (keys[i] == TS_MAPSET_HOLE) continue;
     mapset_index_insert(index, cap, i, hashes[i]);
@@ -7009,7 +7020,7 @@ static uint32_t* mapset_index_build(const tsv* keys, const uint32_t* hashes,
 }
 /* Ensure the index exists (past the linear-scan size) and has slack for one
    more insertion. Never touches the dense arrays — safe against iterators. */
-static void mapset_index_maintain(tsv* keys, uint32_t* hashes,
+static void mapset_index_maintain(const ts_gc_header* owner, tsv* keys, uint32_t* hashes,
                                   uint32_t len, uint32_t tombs,
                                   uint32_t** index_io, uint32_t* cap_io){
   uint32_t live = len - tombs;
@@ -7018,8 +7029,8 @@ static void mapset_index_maintain(tsv* keys, uint32_t* hashes,
   } else if ((uint64_t)(len + 2u) * 4u <= (uint64_t)(*cap_io) * 3u){
     return;
   }
-  uint32_t* nw = mapset_index_build(keys, hashes, len, cap_io);
-  if (nw){ free(*index_io); *index_io = nw; }
+  uint32_t* nw = mapset_index_build(owner, keys, hashes, len, cap_io);
+  gc_owned_free(*index_io); *index_io = nw;
 }
 
 /* find key index in a map, or -1 (holes never match: probe skips them by
@@ -7041,11 +7052,11 @@ static long map_find(ts_map* m, tsv k){
 static void map_grow(ts_map* m){
   if (m->len < m->cap) return;
   uint32_t nc = m->cap ? m->cap*2 : 8;
-  gc_note_payload((size_t)(nc - m->cap) * (2u * sizeof(tsv) + sizeof(uint32_t)));
-  m->keys = realloc(m->keys, sizeof(tsv)*nc);
-  m->vals = realloc(m->vals, sizeof(tsv)*nc);
-  m->hashes = realloc(m->hashes, sizeof(uint32_t)*nc);
-  if (m->iteration_order) m->iteration_order = realloc(m->iteration_order, sizeof(uint64_t)*nc);
+  const ts_gc_header* ow = &m->o.h;
+  m->keys = (tsv*)gc_owned_realloc(ow, m->keys, sizeof(tsv) * m->cap, sizeof(tsv) * nc);
+  m->vals = (tsv*)gc_owned_realloc(ow, m->vals, sizeof(tsv) * m->cap, sizeof(tsv) * nc);
+  m->hashes = (uint32_t*)gc_owned_realloc(ow, m->hashes, sizeof(uint32_t) * m->cap, sizeof(uint32_t) * nc);
+  if (m->iteration_order) m->iteration_order = (uint64_t*)gc_owned_realloc(ow, m->iteration_order, sizeof(uint64_t) * m->cap, sizeof(uint64_t) * nc);
   m->cap = nc;
 }
 /* Shift live entries down over the holes (order preserved) and rebuild the
@@ -7062,8 +7073,8 @@ static void map_compact(ts_map* m){
   }
   m->len = w; m->tombs = 0;
   if (m->index){
-    uint32_t* nw = mapset_index_build(m->keys, m->hashes, m->len, &m->index_cap);
-    if (nw){ free(m->index); m->index = nw; }
+    uint32_t* nw = mapset_index_build(&m->o.h, m->keys, m->hashes, m->len, &m->index_cap);
+    gc_owned_free(m->index); m->index = nw;
   }
 }
 static inline void map_write_barrier(ts_map* m, uint32_t index, tsv value){
@@ -7092,9 +7103,9 @@ static tsv map_set_unchecked(tsv mv, tsv k, tsv v){
   if (m->index){
     /* reuse the probe's slot (tomb or empty); maintain slack afterwards */
     m->index[slot] = (m->len - 1u) + 2u;
-    mapset_index_maintain(m->keys, m->hashes, m->len, m->tombs, &m->index, &m->index_cap);
+    mapset_index_maintain(&m->o.h, m->keys, m->hashes, m->len, m->tombs, &m->index, &m->index_cap);
   } else {
-    mapset_index_maintain(m->keys, m->hashes, m->len, m->tombs, &m->index, &m->index_cap);
+    mapset_index_maintain(&m->o.h, m->keys, m->hashes, m->len, m->tombs, &m->index, &m->index_cap);
   }
   map_write_barrier(m, m->len - 1u, k); map_write_barrier(m, m->len - 1u, v);
   return mv;
@@ -7379,7 +7390,7 @@ static int mapset_cursor_view(tsv coll, uint32_t* len, tsv** keys, tsv** vals, u
     ts_map* m = (ts_map*)ts_ptr(coll);
     if (!m->iteration_order){
       uint32_t cap = m->cap ? m->cap : 1u;
-      m->iteration_order = (uint64_t*)malloc(sizeof(uint64_t) * cap);
+      m->iteration_order = (uint64_t*)gc_owned_alloc(&m->o.h, sizeof(uint64_t) * cap);
       if (!m->iteration_order) abort();
       for (uint32_t i = 0; i < m->len; i++) m->iteration_order[i] = i + 1u;
       m->next_iteration_order = (uint64_t)m->len + 1u;
@@ -7391,7 +7402,7 @@ static int mapset_cursor_view(tsv coll, uint32_t* len, tsv** keys, tsv** vals, u
     ts_set_t* st = (ts_set_t*)ts_ptr(coll);
     if (!st->iteration_order){
       uint32_t cap = st->cap ? st->cap : 1u;
-      st->iteration_order = (uint64_t*)malloc(sizeof(uint64_t) * cap);
+      st->iteration_order = (uint64_t*)gc_owned_alloc(&st->o.h, sizeof(uint64_t) * cap);
       if (!st->iteration_order) abort();
       for (uint32_t i = 0; i < st->len; i++) st->iteration_order[i] = i + 1u;
       st->next_iteration_order = (uint64_t)st->len + 1u;
@@ -7483,10 +7494,10 @@ static long set_find(ts_set_t* s, tsv v){
 static void set_grow(ts_set_t* s){
   if (s->len < s->cap) return;
   uint32_t nc = s->cap ? s->cap*2 : 8;
-  gc_note_payload((size_t)(nc - s->cap) * (sizeof(tsv) + sizeof(uint32_t)));
-  s->elems = realloc(s->elems, sizeof(tsv)*nc);
-  s->hashes = realloc(s->hashes, sizeof(uint32_t)*nc);
-  if (s->iteration_order) s->iteration_order = realloc(s->iteration_order, sizeof(uint64_t)*nc);
+  const ts_gc_header* ow = &s->o.h;
+  s->elems = (tsv*)gc_owned_realloc(ow, s->elems, sizeof(tsv) * s->cap, sizeof(tsv) * nc);
+  s->hashes = (uint32_t*)gc_owned_realloc(ow, s->hashes, sizeof(uint32_t) * s->cap, sizeof(uint32_t) * nc);
+  if (s->iteration_order) s->iteration_order = (uint64_t*)gc_owned_realloc(ow, s->iteration_order, sizeof(uint64_t) * s->cap, sizeof(uint64_t) * nc);
   s->cap = nc;
 }
 static void set_compact(ts_set_t* s){
@@ -7500,8 +7511,8 @@ static void set_compact(ts_set_t* s){
   }
   s->len = w; s->tombs = 0;
   if (s->index){
-    uint32_t* nw = mapset_index_build(s->elems, s->hashes, s->len, &s->index_cap);
-    if (nw){ free(s->index); s->index = nw; }
+    uint32_t* nw = mapset_index_build(&s->o.h, s->elems, s->hashes, s->len, &s->index_cap);
+    gc_owned_free(s->index); s->index = nw;
   }
 }
 static tsv set_add_unchecked(tsv sv, tsv v){
@@ -7516,7 +7527,7 @@ static tsv set_add_unchecked(tsv sv, tsv v){
   if (s->iteration_order) s->iteration_order[s->len] = s->next_iteration_order++;
   s->elems[s->len]=v; s->hashes[s->len]=h; s->len++;
   if (s->index) s->index[slot] = (s->len - 1u) + 2u;
-  mapset_index_maintain(s->elems, s->hashes, s->len, s->tombs, &s->index, &s->index_cap);
+  mapset_index_maintain(&s->o.h, s->elems, s->hashes, s->len, s->tombs, &s->index, &s->index_cap);
   ts_write_barrier(sv, v); return sv;
 }
 tsv ts_set_add(tsv sv, tsv v){

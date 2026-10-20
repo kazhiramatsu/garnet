@@ -393,7 +393,7 @@ compile A/B:
 - **G2b** element buffers and sparse tables; done: neutral (cycles -0.27%);
 - **G2c** property vectors, dictionary vectors and property indexes; done:
   neutral (cycles +0.25%);
-- **G2d** Map and Set buffers;
+- **G2d** Map and Set buffers; done: neutral;
 - **G2e** promise, coroutine and `Uint16Array` buffers; `gc_free_cell_payload`
   then frees nothing but handles.
 

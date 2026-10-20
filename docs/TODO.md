@@ -6593,8 +6593,24 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   against G2b (relinked onto `nk`): eight ABBA pairs, wall 1.000, user
   1.000; instructions +0.04%, cycles +0.25% (six pairs; +0.53% in three):
   neutral within noise.
+- GC v2 slice G2d: Map and Set buffers in the payload heap (runtime only;
+  §6.1): the dense key / value / hash arrays, the slot index and the
+  iteration order arrays; growth reallocates through the payload heap,
+  compaction rebuilds the index there; every scan of a Map or Set (weak
+  ones included) marks its buffers. A payload allocated during a
+  collection is allocated marked (`g_gc_collecting`): the weak-table
+  pruning compacts a WeakMap and rebuilds its index after the map was
+  scanned, and an unmarked index would be free once the collection ends.
+  Fixture `gc/payload_maps` (Maps and Sets growing and shrinking after
+  promotion, clear and reuse, WeakMap / WeakSet pruning, a young WeakMap
+  whose index is rebuilt by a minor collection; also under GC stress);
+  mutants without the Map marks, and without the rule for collection-time
+  allocations, fail it under GC stress with zapping. Gates: unit, parity
+  (361 identical), bundler, selfconf, GC stress, inline policy,
+  conformance 485/485. A/B against G2c: eight ABBA pairs, wall 0.999, user
+  1.000; instructions +0.04%, cycles -0.01%: neutral.
 - Next slices, in order. GC v2 first (`docs/gc_v2_design.md` §6: G2
-  payloads in a block heap (G2d Map and Set buffers next), G3 the non-moving decision gate).
+  payloads in a block heap (G3, the non-moving decision gate, next), G3 the non-moving decision gate).
   A slice that extends the stack or an arena to a
   new kind of allocation runs the conformance suite and a compile of the
   compiler under `--stack-check` (an arena must allocate through the
