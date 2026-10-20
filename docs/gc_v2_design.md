@@ -756,6 +756,12 @@ cycles, about the machinery's cost; what step 5 would add (no handle
 allocation or release at all, no handle branch in `ts_ptr`) cannot be
 measured before the refactor.
 
+Decision (Kaz, 2026-10-21): Y1 is paused; the handle encoding stays. What
+remains from it: protect mode, aging off, precise coroutine frames, the
+reserved nursery range, the hazard checker, and the step 4a machinery in
+the scratchpad of that session (not in the tree). Reopen only with a
+measurement that shows more than the machinery's cost.
+
 ## 7. Verification
 
 - Gates of every slice: unit, parity (`scripts/emitc_diff.sh`), bundler,

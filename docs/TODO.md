@@ -6848,10 +6848,10 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   direct gain 0.38% of the instructions and 0.13% of the cycles, while the
   machinery costs 0.90% and 0.68%: a net loss until the other kinds are
   direct and the handle table is gone, after a gated runtime refactor.
-- Next slices, in order. GC v2 first (`docs/gc_v2_design.md` §6.5, Y1:
-  decide with Kaz whether step 4 goes on (§6.6.1: the refactor the hazard
-  checker must gate, against a gain that strings alone do not show); 5
-  handles removed).
+- Next slices, in order. GC v2 Y1 is paused (Kaz, 2026-10-21, after
+  `docs/gc_v2_design.md` §6.6.1: about 1-2% at most for a large refactor
+  with silent-miscompile risk); handles stay. Back to the patterns slower
+  than V8 (pattern kernels, worst native/node ratio first).
   A slice that extends the stack or an arena to a
   new kind of allocation runs the conformance suite and a compile of the
   compiler under `--stack-check` (an arena must allocate through the
