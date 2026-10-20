@@ -2709,6 +2709,19 @@ fn lazy_frames_enabled() -> bool {
 /// them only before a linked slow call and they are reloaded after, so the
 /// fast path touches no frame and a helper's body can stay a leaf.
 /// TSAOT_LAZY_HOMES=0 keeps the frame slots as the locals' homes.
+/// `arr.values()` / `keys()` / `entries()` as values are Array Iterator objects
+/// (live: `next()` reads the array at each step). TSAOT_ARRAY_ITERATORS=0
+/// keeps the array snapshots (the parity oracle).
+fn array_iterators_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_ARRAY_ITERATORS").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
 /// `Reflect.get(t, k, receiver)` / `Reflect.set(t, k, v, receiver)` pass the
 /// receiver (getters and setters on t's chain see it; a set lands on it).
 /// TSAOT_REFLECT_RECEIVER=0 keeps the receiver-less calls (the parity oracle).
@@ -18450,6 +18463,17 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     ),
                     false,
                 ),
+                // for..of over a value of no known iterable type (exporter
+                // lowerDynamicForOf): open, next element or TS_ITER_DONE
+                "forof.open" => (format!("ts_forof_open({})", r), false),
+                "forof.isDone" => (format!("(({}) == TS_ITER_DONE)", r), true),
+                _ if builtin.starts_with("forof.next:") => {
+                    let nid: u32 = builtin["forof.next:".len()..].parse().unwrap_or(0);
+                    (
+                        format!("ts_forof_next({}, {}, {})", r, args.get(0).map(|a| ctx.num(a.0)).unwrap_or_else(|| "0".into()), method_key_str(nid, ctx.wksym)),
+                        false,
+                    )
+                }
                 _ if builtin.starts_with("iter.step:") => {
                     // iter.step:<next-method-id> -> step a generic iterator, looking up
                     // `next` by field key then method key (TS_KEY_METHOD of the id),
@@ -18557,6 +18581,9 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 "set.keys" => (format!("ts_set_keys({})", r), false),
                 "set.values" => (format!("ts_set_values({})", r), false),
                 "set.entries" => (format!("ts_set_entries({})", r), false),
+                "array.entries" if array_iterators_enabled() => (format!("ts_array_iter_new({}, 2)", r), false),
+                "array.keys" if array_iterators_enabled() => (format!("ts_array_iter_new({}, 1)", r), false),
+                "array.values" if array_iterators_enabled() => (format!("ts_array_iter_new({}, 0)", r), false),
                 "array.entries" => (format!("ts_array_entries({})", r), false),
                 "array.keys" => (format!("ts_array_keys_arr({})", r), false),
                 "array.values" => (format!("ts_array_values_arr({})", r), false),

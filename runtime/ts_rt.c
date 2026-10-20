@@ -6604,33 +6604,47 @@ double ts_map_size(tsv mv){
 static tsv g_map_iterator_proto = TS_NULL;
 static tsv g_set_iterator_proto = TS_NULL;
 static tsv g_array_iterator_proto = TS_NULL;
-static ts_key g_ai_source, g_ai_index, g_ai_next, g_ai_value, g_ai_done;
+static ts_key g_ai_source, g_ai_index, g_ai_next, g_ai_value, g_ai_done, g_ai_kind;
 static tsv ts_array_iterator_identity(tsv* args, int n){ return n ? args[0] : TS_UNDEFINED; }
+/* Array Iterator objects (docs/array_iterators_design.md): the source array,
+   the next index and the kind (values 0, keys 1, entries 2) in hidden fields;
+   each step reads the array's current length, so the iteration is live. */
 static tsv ts_array_iterator_next(tsv* args, int n){
   tsv iter = n ? args[0] : TS_UNDEFINED; ts_gc_root(&iter);
-  static ts_rt_ic ic_index, ic_source;
+  static ts_rt_ic ic_index, ic_source, ic_kind;
   tsv index = ts_get_ic(iter, g_ai_index, &ic_index);
   if (!ts_is_num(index)) ts_throw_type_error_msg("Array iterator next called on incompatible receiver");
   tsv source = ts_get_ic(iter, g_ai_source, &ic_source); ts_gc_root(&source);
+  tsv kindv = ts_get_ic(iter, g_ai_kind, &ic_kind);
+  int kind = ts_is_num(kindv) ? (int)ts_to_num(kindv) : 0;
   double pos = ts_to_num(index);
   int done = !ts_is_array(source) || pos >= ts_array_len(source);
   tsv value = TS_UNDEFINED; ts_gc_root(&value);
   if (done) ts_set_ic(iter, g_ai_source, TS_UNDEFINED, &ic_source);
   else {
     ts_set_ic(iter, g_ai_index, ts_num(pos + 1), &ic_index);
-    value = ts_array_get(source, (uint32_t)pos);
+    if (kind == 1) value = ts_num(pos);
+    else {
+      value = ts_array_get(source, (uint32_t)pos);
+      if (kind == 2){
+        tsv pair = ts_new_array(0); ts_gc_root(&pair);
+        ts_array_push(pair, ts_num(pos)); ts_array_push(pair, value);
+        value = pair;
+        ts_gc_unroot(1);
+      }
+    }
   }
   tsv result = ts_iter_result_new(value, done);
   ts_gc_unroot(3);
   return result;
 }
-static tsv ts_array_iterator(tsv* args, int n){
-  tsv source = n ? args[0] : TS_UNDEFINED;
+tsv ts_array_iter_new(tsv source, int kind){
   if (!ts_is_array(source)) ts_throw_type_error_msg("Array iterator requires an array receiver");
   ts_gc_root(&source);
   if (g_array_iterator_proto == TS_NULL){
     g_ai_source = ts_intern_field("__array_iterator_source", 23);
     g_ai_index = ts_intern_field("__array_iterator_index", 22);
+    g_ai_kind = ts_intern_field("__array_iterator_kind", 21);
     g_ai_next = ts_intern_field("next", 4);
     g_ai_value = ts_intern_field("value", 5);
     g_ai_done = ts_intern_field("done", 4);
@@ -6650,9 +6664,15 @@ static tsv ts_array_iterator(tsv* args, int n){
   obj_link_fresh_proto(iter, g_array_iterator_proto);
   ts_define_data(iter, g_ai_source, source, 0, 1, 0);
   ts_define_data(iter, g_ai_index, ts_num(0), 0, 1, 0);
+  ts_define_data(iter, g_ai_kind, ts_num((double)kind), 0, 1, 0);
   ts_gc_unroot(2);
   return iter;
 }
+static tsv ts_array_iterator(tsv* args, int n){ return ts_array_iter_new(n ? args[0] : TS_UNDEFINED, 0); }
+/* Array.prototype.values / keys / entries reached dynamically */
+tsv ts_arrproto_values(tsv* args, int n){ return ts_array_iter_new(n ? args[0] : TS_UNDEFINED, 0); }
+tsv ts_arrproto_keys(tsv* args, int n){ return ts_array_iter_new(n ? args[0] : TS_UNDEFINED, 1); }
+tsv ts_arrproto_entries(tsv* args, int n){ return ts_array_iter_new(n ? args[0] : TS_UNDEFINED, 2); }
 /* Runtime inline caches (ts_rt.h): a monomorphic shape/slot per call site for
    the runtime's own hidden-field reads and writes. The shape word carries the
    integrity bits, so a frozen receiver misses and takes the generic path. */
@@ -10665,6 +10685,50 @@ void ts_array_push_all(tsv dst, tsv src){
   ts_throw_type_error_msg("Value is not iterable");
 }
 
+/* for..of over a value its type does not classify (docs/array_iterators_design.md).
+   An array is walked by index (returned as is); a string by code points (a
+   snapshot: strings are immutable); anything else through GetIterator: its
+   [Symbol.iterator]() (Map / Set iterators are live, a generator is its own),
+   or the value itself when it is already an iterator. */
+tsv ts_forof_open(tsv v){
+  if (ts_is_indexed_array_fast(v)) return v;
+  ts_gc_root(&v);
+  tsv r = TS_UNDEFINED; ts_gc_root(&r);
+  if (ts_is_str(v)){
+    r = ts_new_array(0);
+    ts_array_push_all(r, v);
+  } else if (ts_object_like(v)){
+    tsv itf = ts_get(v, TS_KEY_WKSYM(TS_WKSYM_ITERATOR));
+    if (ts_is_callable(itf)){
+      ts_gc_root(&itf);
+      tsv a0 = v;
+      r = ts_call_method(itf, &a0, 1);
+      ts_gc_unroot(1);
+      if (!ts_object_like(r)) ts_throw_type_error_msg("Result of the Symbol.iterator method is not an object");
+    } else if (itf != TS_UNDEFINED && itf != TS_NULL){
+      ts_throw_type_error_msg("Symbol.iterator is not callable");
+    } else {
+      r = v;      /* an iterator (a generator object, an object with next) */
+    }
+  } else {
+    char buf[96];
+    snprintf(buf, sizeof(buf), "%s is not iterable",
+             ts_is_undef(v) ? "undefined" : ts_is_null(v) ? "null" : ts_is_num(v) ? "number" : ts_is_bool(v) ? "boolean" : "value");
+    ts_throw_type_error_msg(buf);
+  }
+  ts_gc_unroot(2);
+  return r;
+}
+tsv ts_forof_next_slow(tsv it, ts_key next_key){
+  static ts_key kdone, kvalue;
+  if (!kdone){ kdone = ts_intern_field("done", 4); kvalue = ts_intern_field("value", 5); }
+  tsv res = ts_iter_step(it, TS_UNDEFINED, next_key);
+  if (!ts_object_like(res)) ts_throw_type_error_msg("Iterator result is not an object");
+  ts_gc_root(&res);
+  tsv out = ts_truthy(ts_get(res, kdone)) ? TS_ITER_DONE : ts_get(res, kvalue);
+  ts_gc_unroot(1);
+  return out;
+}
 /* Array.from(src): build a dense array from an iterable (array/Set/Map/string/
    generator) OR an array-like object ({ length, 0:…, 1:… }). Iterables reuse
    ts_array_push_all; an object exposing a callable `.next` is treated as an
@@ -15232,7 +15296,10 @@ static void ts_generator_proto_init(int async){
   }
   tsv identity = ts_make_fn_t(ts_genproto_identity, NULL, 0, 1); ts_gc_root(&identity);
   ts_define_data(g_generator_protos[async], TS_KEY_WKSYM(async ? TS_WKSYM_ASYNC_ITERATOR : TS_WKSYM_ITERATOR), identity, 0, 1, 1);
-  ts_gc_unroot(1);
+  /* %GeneratorPrototype%[@@toStringTag] (Object.prototype.toString) */
+  tsv tag = async ? ts_new_string("AsyncGenerator", 14) : ts_new_string("Generator", 9); ts_gc_root(&tag);
+  ts_define_data(g_generator_protos[async], TS_KEY_WKSYM(TS_WKSYM_TO_STRING_TAG), tag, 0, 0, 1);
+  ts_gc_unroot(2);
 }
 tsv ts_gen_new_v(tsv cv){
   ts_gc_root(&cv);

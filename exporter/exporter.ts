@@ -9588,7 +9588,9 @@ class Exporter {
       const arrayReturning: Record<string, Set<string>> = {
 
         headers: new Set(["keys", "values", "entries"]),
-        array: new Set(["map", "filter", "slice", "concat", "split", "entries", "keys", "values", "flat", "flatMap", "toSorted", "toReversed", "toSpliced", "with"]),
+        array: this.arrayIterForOfEnabled
+          ? new Set(["map", "filter", "slice", "concat", "split", "flat", "flatMap", "toSorted", "toReversed", "toSpliced", "with"])
+          : new Set(["map", "filter", "slice", "concat", "split", "entries", "keys", "values", "flat", "flatMap", "toSorted", "toReversed", "toSpliced", "with"]),
         string: new Set(["split"]),
       };
       if (innerKind && arrayReturning[innerKind]?.has(meth)) return "array";
@@ -9604,6 +9606,10 @@ class Exporter {
       // whose `[]`-suffixed return would otherwise mis-classify `f.call(...)` as an
       // array instance and loud-reject. Functions have no array/string methods anyway.
       if (t.getCallSignatures().length > 0) return undefined;
+      // A union of different kinds (`number[] | Set<number>`) has no single
+      // builtin kind: its printed form would otherwise classify it by its first
+      // member. Unions of one kind (with null / undefined) keep the checks below.
+      if ((t.flags & F.Union) && this.unionMixesKinds(t as ts.UnionType)) return undefined;
       if (t.flags & (F.String | F.StringLiteral)) return "string";
       const sym = t.getSymbol();
       // A user class shadowing a builtin name (`class Map {}`) is NOT a builtin
@@ -9650,6 +9656,32 @@ class Exporter {
       if (/^Promise(Like)?</.test(tn)) return "promise";
     } catch { /* fallthrough */ }
     return undefined;
+  }
+
+  /** Whether the non-nullish members of a union fall into more than one
+   *  receiver kind (array, string, number, boolean, or a named builtin; any
+   *  other object type counts as its own kind). */
+  private unionMixesKinds(u: ts.UnionType): boolean {
+    const F = ts.TypeFlags;
+    const kinds = new Set<string>();
+    for (const m of u.types) {
+      if (m.flags & (F.Undefined | F.Null | F.Void)) continue;
+      if (m.flags & (F.String | F.StringLiteral | F.TemplateLiteral)) { kinds.add("string"); continue; }
+      if (m.flags & (F.Number | F.NumberLiteral)) { kinds.add("number"); continue; }
+      if (m.flags & F.BooleanLike) { kinds.add("boolean"); continue; }
+      if (this.checker.isArrayType(m) || this.checker.isTupleType(m)) { kinds.add("array"); continue; }
+      const sym = m.getSymbol();
+      // an interface derived from Array / Map / Set is that kind at run time
+      if (sym && !this.isAmbientGlobalSymbol(sym) && this.isArrayDerivedType(m, 0)) { kinds.add("array"); continue; }
+      if (sym && !this.isAmbientGlobalSymbol(sym) && this.isCollectionDerivedType(m, 0, "Map")) { kinds.add("map"); continue; }
+      if (sym && !this.isAmbientGlobalSymbol(sym) && this.isCollectionDerivedType(m, 0, "Set")) { kinds.add("set"); continue; }
+      if (sym && this.isAmbientGlobalSymbol(sym) && ["Map", "Set", "ReadonlyMap", "ReadonlySet", "WeakMap", "WeakSet", "Headers", "Promise", "Array", "ReadonlyArray"].includes(sym.name)) {
+        kinds.add(sym.name.replace(/^Readonly/, "").toLowerCase());
+        continue;
+      }
+      kinds.add("object:" + ((m as any).id ?? this.checker.typeToString(m)));
+    }
+    return kinds.size > 1;
   }
 
   /** Map (builtin kind, method) to a runtime builtin name, or undefined if the
@@ -10338,12 +10370,13 @@ class Exporter {
    *  code-point iteration for string iteration. */
   private lowerArrayIndexForOf(
     ctx: FnCtx, init: ts.ForInitializer, statement: ts.Statement, arr: number, iterIsString: boolean,
+    mode: "values" | "keys" | "entries" = "values",
   ): void {
     const idx = this.newLocal(ctx, "primitive");
     const zero = this.newLocal(ctx, "primitive");
     ctx.body.push({ kind: "Const", dst: zero, value: { kind: "Num", value: 0 } });
     ctx.body.push({ kind: "Copy", dst: idx, src: zero });
-    const varLocal = this.newLocal(ctx, "reference", "elem");
+    const varLocal = this.newLocal(ctx, mode === "keys" ? "primitive" : "reference", "elem");
     const decl = ts.isVariableDeclarationList(init) ? init.declarations[0] : undefined;
     // Lexical loop bindings are fresh each iteration; var retains its shared cell.
     const captureCells = decl && (init.flags & (ts.NodeFlags.Let | ts.NodeFlags.Const)) !== 0
@@ -10358,9 +10391,16 @@ class Exporter {
     });
     const bodyB = this.captureLoopBody(ctx, "forof", () => {
       let cp = -1;
+      let keyLocal = -1;
       if (iterIsString) {
         cp = this.emitStringIteratorElement(ctx, arr, idx, varLocal);
+      } else if (mode === "keys") {
+        ctx.body.push({ kind: "Copy", dst: varLocal, src: idx });
       } else {
+        if (mode === "entries") {
+          keyLocal = this.newLocal(ctx, "primitive", "entryKey");
+          ctx.body.push({ kind: "Copy", dst: keyLocal, src: idx });
+        }
         ctx.body.push({ kind: "LoadIndex", dst: varLocal, arr, index: idx });
       }
       // Iterator.next() advances before binding or running user code. In
@@ -10370,8 +10410,27 @@ class Exporter {
       for (const c of captureCells) {
         ctx.body.push({ kind: "AllocObject", dst: c.cell, typeId: 0, site: c.perSite, classId: this.cellClassId });
       }
-      if (decl) this.lowerBindingPattern(ctx, decl.name, varLocal);
-      else this.lowerAssignTarget(ctx, init as ts.Expression, varLocal);
+      const pat = decl ? decl.name : undefined;
+      const twoNames = mode === "entries" && pat !== undefined && ts.isArrayBindingPattern(pat) && pat.elements.length === 2 &&
+        pat.elements.every((el) => ts.isBindingElement(el) && !el.dotDotDotToken && !el.initializer);
+      if (twoNames && pat && ts.isArrayBindingPattern(pat)) {
+        // `[i, v]`: the index and the element, no pair array
+        this.lowerBindingPattern(ctx, (pat.elements[0] as ts.BindingElement).name, keyLocal);
+        this.lowerBindingPattern(ctx, (pat.elements[1] as ts.BindingElement).name, varLocal);
+      } else {
+        let bound = varLocal;
+        if (mode === "entries") {
+          // any other pattern or target destructures a fresh [index, element]
+          const site = this.site++;
+          this.recordSite(site, "array", "many", false, statement);
+          bound = this.newLocal(ctx, "reference", "entryPair");
+          ctx.body.push({ kind: "AllocArray", dst: bound, elemType: 0, site });
+          ctx.body.push({ kind: "ArrayPush", arr: bound, src: keyLocal });
+          ctx.body.push({ kind: "ArrayPush", arr: bound, src: varLocal });
+        }
+        if (decl) this.lowerBindingPattern(ctx, decl.name, bound);
+        else this.lowerAssignTarget(ctx, init as ts.Expression, bound);
+      }
       this.emitPerIterationBodyCells(ctx, statement);
       this.lowerStmt(ctx, statement);
     });
@@ -10448,6 +10507,71 @@ class Exporter {
       if (rrk === "set") return { coll: e.expression.expression, mode: m === "entries" ? "entries" : "values" };
     }
     return undefined;
+  }
+  /** `TSAOT_FOROF_DYNAMIC=0`: a `for..of` over a value of no known iterable
+   *  type walks it as an array (the old lowering: 0 iterations for a Map, a
+   *  Set, a generator, a string or a custom iterable held in an `any`). */
+  forOfDynamicEnabled = process.env.TSAOT_FOROF_DYNAMIC !== "0";
+  /** `for..of` over a value whose iteration protocol is a run-time question
+   *  (docs/array_iterators_design.md): `forof.open` gives an array (walked by
+   *  index, no iterator object) or an iterator (GetIterator); `forof.next`
+   *  returns the next element or the done marker. The iterator is not closed
+   *  on an abrupt exit (KNOWN_GAPS.md): a try/finally per loop entry costs
+   *  more than the loops it would serve. */
+  private lowerDynamicForOf(ctx: FnCtx, init: ts.ForInitializer, statement: ts.Statement, expr: ts.Expression): void {
+    const src = this.lowerExpr(ctx, expr);
+    const it = this.newLocal(ctx, "reference", "forofIter");
+    ctx.body.push({ kind: "CallBuiltin", dst: it, builtin: "forof.open", recv: src, args: [] });
+    const idx = this.newLocal(ctx, "primitive");
+    const zero = this.newLocal(ctx, "primitive");
+    ctx.body.push({ kind: "Const", dst: zero, value: { kind: "Num", value: 0 } });
+    ctx.body.push({ kind: "Copy", dst: idx, src: zero });
+    const elem = this.newLocal(ctx, "reference", "elem");
+    const decl = ts.isVariableDeclarationList(init) ? init.declarations[0] : undefined;
+    const captureCells = decl && (init.flags & (ts.NodeFlags.Let | ts.NodeFlags.Const)) !== 0
+      ? this.setupForOfCaptureCells(ctx, decl.name, decl) : [];
+    const nextBuiltin = `forof.next:${this.internName("next")}`;
+    let condLocal = -1;
+    const condBody = this.captureBody(ctx, () => {
+      ctx.body.push({ kind: "CallBuiltin", dst: elem, builtin: nextBuiltin, recv: it, args: [idx] });
+      const done = this.newLocal(ctx, "primitive");
+      ctx.body.push({ kind: "CallBuiltin", dst: done, builtin: "forof.isDone", recv: elem, args: [] });
+      condLocal = this.newLocal(ctx, "primitive");
+      ctx.body.push({ kind: "UnOp", dst: condLocal, op: "!", operand: done });
+    });
+    const bodyB = this.captureLoopBody(ctx, "forof", () => {
+      // the index advances before user code (continue must not skip it)
+      this.emitIndexStep(ctx, idx, 1);
+      for (const c of captureCells) {
+        ctx.body.push({ kind: "AllocObject", dst: c.cell, typeId: 0, site: c.perSite, classId: this.cellClassId });
+      }
+      if (decl) this.lowerBindingPattern(ctx, decl.name, elem);
+      else this.lowerAssignTarget(ctx, init as ts.Expression, elem);
+      this.emitPerIterationBodyCells(ctx, statement);
+      this.lowerStmt(ctx, statement);
+    });
+    for (const c of captureCells) {
+      if (c.saved !== undefined) ctx.cellAccess.set(c.sym, c.saved);
+      else ctx.cellAccess.delete(c.sym);
+    }
+    ctx.body.push({ kind: "Loop", cond: condLocal, condBody, body: bodyB });
+  }
+  /** `TSAOT_ARRAY_ITER_FOROF=0`: `for..of` over `arr.values()` / `keys()` /
+   *  `entries()` iterates the builtin's result instead of the array itself. */
+  arrayIterForOfEnabled = process.env.TSAOT_ARRAY_ITER_FOROF !== "0" && process.env.TSAOT_UNTYPED !== "1";
+  /** The array a `for..of` walks for `values()` / `keys()` / `entries()` called
+   *  with no arguments on a built-in array (docs/array_iterators_design.md). */
+  arrayIteratorForOfTarget(expr: ts.Expression): { arr: ts.Expression; mode: "keys" | "values" | "entries" } | undefined {
+    if (!this.arrayIterForOfEnabled) return undefined;
+    let e: ts.Expression = expr;
+    while (ts.isParenthesizedExpression(e) || ts.isAsExpression(e) || ts.isNonNullExpression(e)) e = e.expression;
+    if (!ts.isCallExpression(e) || e.arguments.length !== 0 || e.questionDotToken) return undefined;
+    const callee = e.expression;
+    if (!ts.isPropertyAccessExpression(callee) || callee.questionDotToken) return undefined;
+    const m = callee.name.text;
+    if (m !== "keys" && m !== "values" && m !== "entries") return undefined;
+    if (this.builtinReceiverKind(callee.expression) !== "array") return undefined;
+    return { arr: callee.expression, mode: m };
   }
   /** `for..of` over a Map/Set driven by a cursor: the runtime's insertion-order
    *  ids give the protocol's view of mutation during the loop (entries added
@@ -11718,14 +11842,32 @@ class Exporter {
         this.lowerArrayIndexForOf(ctx, stmt.initializer, stmt.statement, arrL, false);
         return;
       }
+      // `for (... of arr.values() / arr.keys() / arr.entries())` over a built-in
+      // array: the array iterator reads the array live (each step tests the index
+      // against the current length), so walk the array itself with the index
+      // loop, binding the element, the index or the [index, element] pair.
+      const arrIter = this.arrayIteratorForOfTarget(stmt.expression);
+      if (arrIter) {
+        const arrL = this.lowerExpr(ctx, arrIter.arr);
+        this.lowerArrayIndexForOf(ctx, stmt.initializer, stmt.statement, arrL, false, arrIter.mode);
+        return;
+      }
       const exprIsBuiltinArray2 = this.builtinReceiverKind(stmt.expression) === "array";
       if (!exprIsBuiltinArray2) {
         const drv = this.resolveIterator(ctx, stmt.expression, {});
         if (drv) { this.lowerDrivenForLoop(ctx, stmt.initializer, stmt.statement, drv); return; }
       }
+      // A value whose type settles neither an array nor a string nor a known
+      // iterable (any, unknown, a union, a type parameter): the protocol is
+      // chosen at run time (an array still walks by index).
+      const forOfKind = this.builtinReceiverKind(stmt.expression);
+      if (this.forOfDynamicEnabled && forOfKind !== "array" && forOfKind !== "string") {
+        this.lowerDynamicForOf(ctx, stmt.initializer, stmt.statement, stmt.expression);
+        return;
+      }
       // for (const x of arr) body  ->  let i=0; while(i<arr.length){ x=arr[i]; body; i++ }
       const arr = this.lowerExpr(ctx, stmt.expression);
-      const iterIsString = this.builtinReceiverKind(stmt.expression) === "string";
+      const iterIsString = forOfKind === "string";
       this.lowerArrayIndexForOf(ctx, stmt.initializer, stmt.statement, arr, iterIsString);
     } else if (ts.isForInStatement(stmt)) {
       // Snapshot enumerable string keys across the full prototype chain,
@@ -13556,6 +13698,7 @@ class Exporter {
       ["reduce","ts_arrproto_reduce"],["reduceRight","ts_arrproto_reduceRight"],["copyWithin","ts_arrproto_copyWithin"],["find","ts_arrproto_find"],["findIndex","ts_arrproto_findIndex"],
       ["findLast","ts_arrproto_findLast"],["findLastIndex","ts_arrproto_findLastIndex"],
       ["some","ts_arrproto_some"],["every","ts_arrproto_every"],["flatMap","ts_arrproto_flatMap"],
+      ["keys","ts_arrproto_keys"],["values","ts_arrproto_values"],["entries","ts_arrproto_entries"],
     ];
     const arrayProtoMethods = arrayProtoSpec.map(([name, runtime]) => ({
       name, runtime, methodId: this.internName(name),

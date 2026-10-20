@@ -124,3 +124,16 @@ for arrows/methods/async/generators/non-functions. Remaining gaps:
   property named `__proto__` instead of relinking, and reading it does not
   return the prototype (silent; use `Object.setPrototypeOf` /
   `Object.getPrototypeOf`).
+
+## for..of over a value of no known iterable type: no IteratorClose (Session 350, x65)
+
+A `for..of` whose expression type settles neither an array, a string nor a
+known iterable (`any`, `unknown`, a union of kinds, a type parameter) picks
+the protocol at run time (`docs/array_iterators_design.md`). When such a
+loop ends early (`break`, `return`, a throw) over an iterator that has a
+`return()` method (a generator, a custom iterator), the method is not
+called: V8 calls it (a generator's `finally` blocks run then; garnet runs
+them only if the generator is resumed). Arrays, strings, Map and Set
+iterators have no `return()` and are unaffected; typed loops over
+generators and iterators close as before.
+

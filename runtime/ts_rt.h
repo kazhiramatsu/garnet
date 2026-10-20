@@ -1088,6 +1088,10 @@ tsv ts_arrproto_findLastIndex(tsv* args, int n);
 tsv ts_arrproto_some(tsv* args, int n);
 tsv ts_arrproto_every(tsv* args, int n);
 tsv ts_arrproto_flatMap(tsv* args, int n);
+tsv ts_arrproto_values(tsv* args, int n);
+tsv ts_arrproto_keys(tsv* args, int n);
+tsv ts_arrproto_entries(tsv* args, int n);
+tsv ts_array_iter_new(tsv source, int kind);
 
 tsv  ts_make_fn(ts_code code, tsv* env, uint32_t envlen); /* boxed callable; env may be NULL */
 tsv  ts_call(tsv fn, tsv* args, int nargs);               /* invoke a callable value */
@@ -2017,6 +2021,21 @@ static inline void ts_array_set_inline(tsv arr, uint32_t i, tsv v){
     }
   }
   ts_array_set(arr, i, v);
+}
+/* for..of over a value its type does not classify (docs/array_iterators_design.md):
+   ts_forof_open returns an array (walked by index here, in line) or an
+   iterator; ts_forof_next returns the next element or TS_ITER_DONE (a marker
+   no user value can be: selector 0xFFFE is internal, like the array hole). */
+#define TS_ITER_DONE TS_BOX(0xFFFEu, 0x444F4E45u)
+tsv ts_forof_open(tsv v);
+tsv ts_forof_next_slow(tsv it, ts_key next_key);
+static inline tsv ts_forof_next(tsv it, double idx, ts_key next_key){
+  if (ts_is_indexed_array_fast(it)){
+    uint32_t i = (uint32_t)idx;
+    if (i >= ((ts_array*)ts_ptr(it))->len) return TS_ITER_DONE;
+    return ts_array_get_inline(it, i);
+  }
+  return ts_forof_next_slow(it, next_key);
 }
 static inline int ts_array_get_inline_try(tsv arr, uint32_t i, tsv* out){
   if (ts_is_indexed_array_fast(arr)){

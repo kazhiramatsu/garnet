@@ -6323,6 +6323,35 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   all green (selfconf: both fixtures are known frozen-emitter differences).
   A/B against `x63`, two rounds: 4.305 vs 4.323 s and 4.354 vs 4.373 s
   median: neutral. Node 3.29-3.32 s (1.31x).
+- Iteration: live array iterators, for..of over unclassified values,
+  mixed unions (build `x65`, full build; exporter, emitter, runtime;
+  `docs/array_iterators_design.md`). Four defects found while testing
+  `x63`: (1) `arr.values()` / `keys()` / `entries()` returned a copy of the
+  array, so a `for..of` over them missed pushed elements and outlived a
+  `pop()` (silent), and as values they had no `next()`; now the loop walks
+  the array itself by index (live length; `[i, v]` binds without a pair)
+  and the values are Array Iterator objects (`ts_array_iter_new`, also
+  dynamic `Array.prototype.keys / values / entries`). (2) A `for..of` over
+  a value of no known iterable type (`any`, `unknown`, a type parameter, a
+  union) was the array index loop: an `any` holding a Map, a Set, a
+  generator, a string or a custom iterable iterated zero times (silent);
+  now `ts_forof_open` / `ts_forof_next` choose at run time (an array still
+  walks by index, in line; the iterator is not closed on an abrupt exit,
+  `KNOWN_GAPS.md`). (3) A union of different kinds was classified by its
+  printed first member (`Set<number> | number[]` took the Set cursor and
+  threw for arrays; in the compiler, `flatMapIterator`'s `yield*` over
+  `readonly U[] | Iterable<U>` walked any iterable as an array, two
+  functions called Map builtins on `ReadonlyMap | ReadonlySet`); mixed
+  unions now have no builtin kind. (4) Generator objects lacked their
+  `Symbol.toStringTag`. Knobs `TSAOT_ARRAY_ITER_FOROF`,
+  `TSAOT_FOROF_DYNAMIC` (exporter), `TSAOT_ARRAY_ITERATORS` (emitter): the
+  parity oracle keeps the old lowerings. Fixtures `arrays/array_iterators`
+  and `statements/forof_dynamic` (also under GC stress). Gates all green
+  (conformance 475/475; parity and selfconf: a known rooting-count
+  difference, and the frozen analyzer lacks `forof.open`). A/B against
+  `x64`, two rounds: 4.305 vs 4.290 s and 4.335 vs 4.344 s median: neutral
+  (a first build, whose union rule also split `NodeArray<Node> | Node[]`,
+  read +0.7%). Node 3.27-3.30 s (1.32x).
 - Next slices, in order. A slice that extends the stack or an arena to a
   new kind of allocation runs the conformance suite and a compile of the
   compiler under `--stack-check` (an arena must allocate through the
