@@ -6945,6 +6945,32 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   with zapping, and with a minor collection every 256 allocations, its 78
   output files identical. A/B against `pk`: neutral (instructions 0.9999,
   cycles 0.9986).
+- Frame elision, round 2b: lazy frames with calls
+  (`docs/frame_elision_design.md` §2b). A function whose only reason to keep
+  a frame is its inline-cache accesses (no reference live across a call or
+  an allocation, and calls read references only when they keep them) gets a
+  lazy frame with register homes, linked only around the accesses' slow
+  paths. Each slow path fills exactly the slots of the locals it must find
+  (the backward liveness records them per access) and stores `undefined` in
+  the others: a home dead before a call may hold a value that went stale at
+  a collection the unlinked frame did not see. Functions with a switch table
+  are left out (the table emits copies of the case bodies). The typed-slow
+  fallback of a struct field access (`ts_get` / `ts_set` for a proxy or an
+  object behind a class prototype) now links a lazy frame too; it ran with
+  the frame unlinked. `TSAOT_LAZY_CALLS=0` keeps the eager frames. On the
+  compiler: 725 more functions without an entry push (9,091 -> 8,366),
+  frame pushes 355.5M -> 311.0M. Fixture `gc/lazy_frame_calls` (getters and
+  setters that allocate on objects whose inline caches cannot answer
+  accessors; a getter's fresh result live across another getter's slow
+  path fails under GC stress when the fill leaves its slot out, checked
+  with a deliberately broken build); known row: parity (numeric
+  specialization). Gates: unit, parity (365 identical), bundler, selfconf,
+  GC stress, inline policy, conformance 497/497 and 497/497 with a
+  collection at every allocation in protect mode; tsc rebuilt and compiled
+  under protect mode, with zapping, and with a minor collection every 256
+  allocations, its 78 output files identical. A/B against `dp`: eight ABBA
+  pairs, instructions 0.9947 (eight of eight), cycles 0.9988, wall 1.0000:
+  the pushes were cheap.
 - Where the remaining 358.7M frame pushes come from (a per-function count,
   joined with the rule under relaxations): a precise backward liveness
   would remove 1.4% (it never needs a slot the linear walk does not: checked
@@ -6962,8 +6988,7 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   `docs/gc_v2_design.md` §6.6.1: about 1-2% at most for a large refactor
   with silent-miscompile risk); handles stay. Back to the patterns slower
   than V8 (pattern kernels, worst native/node ratio first). Frame elision,
-  round 2: lazy frames with calls (a spill set per
-  slow path, dead slots cleared), direct callees that never collect,
+  round 2c: direct callees that never collect,
   non-allocating builtins and primitive comparisons; then measure how many
   calls of the remaining framed functions reach a point that needs the
   frame, before linking frames on first need.

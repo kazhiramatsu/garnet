@@ -62,6 +62,30 @@ its slot):
 
 `TSAOT_FRAME_ELISION=0` keeps every frame.
 
+## 2b. Lazy frames with calls
+
+A function whose only reason to keep a frame is its inline-cache accesses
+(`LoadField`, `StoreField`, `LoadIndex`: their slow paths may run a getter,
+a setter or a proxy trap) gets a lazy frame with register homes, as a
+function without calls does (`docs/lazy_frames_design.md`), when the rule
+above with those accesses not counted as collection points needs no slot:
+no reference is live across a call or an allocation, and a call reads
+references only when it keeps them. The frame is then linked only around
+each access's slow path. Unlike a lazy frame without calls, a home may hold
+a value that went stale at a collection the unlinked frame did not see (a
+local dead before a call), so each slow path fills the slots of exactly the
+locals it must find (live after the access, or read by it: the backward
+liveness records the set per access) and stores `undefined` in every other
+slot, then reloads those locals after the call. Not covered: functions
+with a switch table (its case bodies are emitted from copies the per-access
+sets do not name), string accumulators, the numeric clones.
+`TSAOT_LAZY_CALLS=0` keeps the eager frame.
+
+The typed-slow fallback of a struct field access (`ts_get` / `ts_set` for a
+receiver without the sized layout: a proxy, an object behind a class
+prototype) now links a lazy frame too; before, a lazy function called it
+with its frame unlinked.
+
 ## 3. Verification
 
 The rule is about liveness under handles: a value left unrooted can be
@@ -88,6 +112,10 @@ against the previous build: instructions -1.53% (eight of eight), cycles
 -1.55%, wall -1.5%. Kernel `small_calls` 726 -> 686 ms. Round 2a (the
 backward liveness): frames 9,120 -> 9,091, slots 58,054 -> 53,491, pushes
 360.7M -> 355.5M; instructions -1.04% (eight of eight), cycles -1.04%.
+Round 2b (lazy frames with calls): 725 more functions without an entry
+push, pushes 355.5M -> 311.0M; instructions -0.53% (eight of eight), cycles
+-0.12%, wall unchanged: once the slots are gone the pushes themselves are
+cheap.
 
 A per-function count of the remaining pushes, joined with the rule under
 relaxations, says where the rest is:
@@ -95,7 +123,7 @@ relaxations, says where the rest is:
 | relaxation | pushes removed |
 |---|---|
 | precise backward liveness (round 2a, done) | 1.4% |
-| frames linked only around inline-cache slow paths when no other collection point has a live reference | 12.9% |
+| frames linked only around inline-cache slow paths when no other collection point has a live reference (round 2b, done: 12.5%) | 12.9% |
 | comparisons whose operands cannot be objects | 2.9% |
 | builtins that never allocate (upper bound: all builtins) | 6.5% |
 | direct callees that never collect (228 functions) | 4.2% |

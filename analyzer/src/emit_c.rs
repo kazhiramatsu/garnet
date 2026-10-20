@@ -1352,6 +1352,11 @@ struct Ctx<'a> {
     lazy_homes: bool,
     lazy_spill: String,
     lazy_reload: String,
+    /// a lazy frame with calls: the fill and reload of each inline-cache
+    /// access's slow path (by instruction address), and the instruction
+    /// being emitted
+    point_spills: BTreeMap<usize, (String, String)>,
+    cur_inst: std::cell::Cell<usize>,
     /// string accumulators of the function (string_accum.rs)
     accums: crate::string_accum::StringAccums,
     frame_nslots: usize,
@@ -1427,6 +1432,54 @@ impl<'a> Ctx<'a> {
         } else {
             format!("v{}", id)
         }
+    }
+    /// A runtime call returning a value that may run user code, from a
+    /// function whose frame is lazy: the frame is linked around it like the
+    /// inline-cache slow paths (with register homes, filled before and
+    /// reloaded after). Other functions make the call as it is.
+    fn lazy_linked(&self, call: &str) -> String {
+        if self.lazy_frame {
+            format!("({{ tsv _lz; {}_lz = {};{} _lz; }})", self.lazy_link(), call, self.lazy_unlink())
+        } else {
+            call.to_string()
+        }
+    }
+    /// The same for a call made as a statement.
+    fn lazy_linked_stmt(&self, call: &str) -> String {
+        if self.lazy_frame {
+            format!("{{ {}{};{} }}", self.lazy_link(), call, self.lazy_unlink())
+        } else {
+            format!("{};", call)
+        }
+    }
+    fn lazy_link(&self) -> String {
+        let sp = if self.lazy_homes { self.spill_now() } else { "" };
+        format!("{}ts_frame_push(&F.h, {}); ", sp, self.frame_nslots)
+    }
+    fn lazy_unlink(&self) -> String {
+        let rl = if self.lazy_homes { self.reload_now() } else { "" };
+        format!(" ts_frame_pop(&F.h);{}", rl)
+    }
+    /// The fill before a linked slow call of the instruction being emitted
+    /// (every slot for a lazy frame without calls).
+    fn spill_now(&self) -> &str {
+        if self.point_spills.is_empty() {
+            &self.lazy_spill
+        } else {
+            &self.point_spill_entry().0
+        }
+    }
+    fn reload_now(&self) -> &str {
+        if self.point_spills.is_empty() {
+            &self.lazy_reload
+        } else {
+            &self.point_spill_entry().1
+        }
+    }
+    fn point_spill_entry(&self) -> &(String, String) {
+        self.point_spills
+            .get(&self.cur_inst.get())
+            .expect("lazy frame with calls: a slow path emitted outside its access instruction")
     }
     fn root_cleanup(&self) -> String {
         let mut parts = Vec::new();
@@ -2041,6 +2094,12 @@ struct NeedWalk<'a> {
     /// per enclosing loop: (live after the loop, live at its head)
     loops: Vec<(BTreeSet<u32>, BTreeSet<u32>)>,
     needed: BTreeSet<u32>,
+    /// treat the inline-cache accesses as points that do not collect (their
+    /// slow paths link a lazy frame)
+    relax_access: bool,
+    /// per inline-cache access (by address): the locals its slow path must
+    /// find in the frame (live after it, or read by it)
+    points: Option<BTreeMap<usize, BTreeSet<u32>>>,
 }
 
 impl NeedWalk<'_> {
@@ -2112,7 +2171,16 @@ impl NeedWalk<'_> {
                     }
                 }
                 let throws = matches!(leaf, Inst::Throw { .. });
-                if leaf_may_collect(leaf, self.numeric) {
+                let access = is_access_point(leaf);
+                if access {
+                    if let Some(points) = self.points.as_mut() {
+                        let mut set: BTreeSet<u32> =
+                            live.iter().copied().filter(|&x| Some(x) != def).collect();
+                        set.extend(uses.iter().copied().filter(|u| self.track.contains(u)));
+                        points.insert(leaf as *const Inst as usize, set);
+                    }
+                }
+                if leaf_may_collect(leaf, self.numeric) && !(access && self.relax_access) {
                     if !throws {
                         for &x in &live {
                             if Some(x) != def {
@@ -2150,14 +2218,18 @@ impl NeedWalk<'_> {
     }
 }
 
-/// The reference locals among `reflike` that need a frame slot.
+/// The reference locals among `reflike` that need a frame slot, with the
+/// inline-cache accesses counted as collection points or not
+/// (`relax_access`), and, when `record`, each access's slow-path set.
 fn frame_needed_locals(
     f: &Function,
     reflike: &[u32],
     numeric: &BTreeSet<u32>,
     fusion: &TypeofFusion,
     direct: &BTreeSet<u32>,
-) -> BTreeSet<u32> {
+    relax_access: bool,
+    record: bool,
+) -> (BTreeSet<u32>, BTreeMap<usize, BTreeSet<u32>>) {
     let track: BTreeSet<u32> = reflike.iter().copied().collect();
     let mut w = NeedWalk {
         track: &track,
@@ -2166,9 +2238,28 @@ fn frame_needed_locals(
         fused: fusion.fused.iter().map(|(k, (x, _, _))| (*k, *x)).collect(),
         loops: Vec::new(),
         needed: BTreeSet::new(),
+        relax_access,
+        points: if record { Some(BTreeMap::new()) } else { None },
     };
     w.block(&f.body, BTreeSet::new());
-    w.needed
+    (w.needed, w.points.unwrap_or_default())
+}
+
+/// The accesses whose slow path a lazy frame links (what `body_is_gc_free`
+/// accepts besides the instructions that cannot collect).
+fn is_access_point(inst: &Inst) -> bool {
+    matches!(inst, Inst::LoadField { .. } | Inst::StoreField { .. } | Inst::LoadIndex { .. })
+}
+
+/// `TSAOT_LAZY_CALLS=0` keeps an eager frame in every function with calls.
+fn lazy_calls_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_LAZY_CALLS").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
 }
 
 fn body_has_try(body: &[Inst]) -> bool {
@@ -2193,6 +2284,11 @@ fn body_has_try(body: &[Inst]) -> bool {
 /// finally body reads locals after a throw from anywhere in the try body),
 /// as do those whose string plans replace loops by fused code. String
 /// accumulators always keep theirs: `return` finishes the builder.
+///
+/// With `lazy_ok` (the function could hold a lazy frame with register homes),
+/// a function whose other collection points need no slot gets a lazy frame:
+/// the result maps each inline-cache access to the locals its slow path
+/// spills (docs/frame_elision_design.md, round 2b).
 fn elide_frame_locals(
     f: &Function,
     reflike: &mut Vec<u32>,
@@ -2200,9 +2296,10 @@ fn elide_frame_locals(
     fusion: &TypeofFusion,
     direct_sigs: &BTreeMap<u32, DirectSig>,
     string_plans: bool,
-) {
+    lazy_ok: bool,
+) -> Option<BTreeMap<usize, BTreeSet<u32>>> {
     if !frame_elision_enabled() || reflike.is_empty() || string_plans || body_has_try(&f.body) {
-        return;
+        return None;
     }
     let mut flat = Vec::new();
     flatten_inst(&f.body, &mut flat);
@@ -2216,13 +2313,56 @@ fn elide_frame_locals(
             _ => None,
         })
         .collect();
-    let mut needed = frame_needed_locals(f, reflike, numeric, fusion, &direct);
+    let lazy = lazy_ok && lazy_calls_enabled();
+    let (mut needed, points) = frame_needed_locals(f, reflike, numeric, fusion, &direct, false, lazy);
+    let mut forced: BTreeSet<u32> = BTreeSet::new();
     if string_accum_enabled() {
         let accums = crate::string_accum::string_accumulators(f);
-        needed.extend(accums.locals.iter().copied());
-        needed.extend(accums.temps.keys().copied());
+        forced.extend(accums.locals.iter().copied());
+        forced.extend(accums.temps.keys().copied());
+    }
+    needed.extend(forced.iter().copied().filter(|id| reflike.contains(id)));
+    let mut plan = None;
+    if lazy && forced.is_empty() && !needed.is_empty() {
+        let (real, _) = frame_needed_locals(f, reflike, numeric, fusion, &direct, true, false);
+        if real.is_empty() {
+            plan = Some(points);
+        }
     }
     reflike.retain(|id| needed.contains(id));
+    plan
+}
+
+/// The fill before one linked slow call of a lazy frame with calls and the
+/// reload after it: the slots of the locals the call must find, and
+/// `undefined` in every other slot (a home not live here may hold a value
+/// that went stale at a collection the frame did not see).
+fn point_spill_reload(live: &BTreeSet<u32>, reflike: &[u32], layout: Option<&FrameLayout>) -> (String, String) {
+    let (mut spill, mut reload) = (String::new(), String::new());
+    match layout {
+        Some(l) => {
+            let occupied: BTreeSet<u32> = live.iter().filter_map(|id| l.slot_of.get(id).copied()).collect();
+            for k in 0..l.nslots {
+                if occupied.contains(&k) {
+                    let _ = write!(spill, "F.s{0} = r{0}; ", k);
+                    let _ = write!(reload, " r{0} = F.s{0};", k);
+                } else {
+                    let _ = write!(spill, "F.s{} = TS_UNDEFINED; ", k);
+                }
+            }
+        }
+        None => {
+            for id in reflike {
+                if live.contains(id) {
+                    let _ = write!(spill, "F.v{0} = rv{0}; ", id);
+                    let _ = write!(reload, " rv{0} = F.v{0};", id);
+                } else {
+                    let _ = write!(spill, "F.v{} = TS_UNDEFINED; ", id);
+                }
+            }
+        }
+    }
+    (spill, reload)
 }
 
 fn compute_frame_layout(f: &Function, reflike: &[u32], fusion: &TypeofFusion) -> FrameLayout {
@@ -7077,7 +7217,7 @@ fn emit_i64_function(
         if frame_roots_enabled() && !would_be_lazy {
             let string_plans = string_metric_plan.is_some_and(|p| !p.loops.is_empty())
                 || string_materialization_plan.is_some_and(|p| !p.loops.is_empty());
-            elide_frame_locals(f, &mut reflike, &numeric_all, &typeof_fusion, direct_sigs, string_plans);
+            let _ = elide_frame_locals(f, &mut reflike, &numeric_all, &typeof_fusion, direct_sigs, string_plans, false);
         }
     }
     let use_frame_roots = frame_roots_enabled() && !reflike.is_empty();
@@ -7159,6 +7299,8 @@ fn emit_i64_function(
         lazy_homes,
         lazy_spill: lazy_spill.clone(),
         lazy_reload: lazy_reload.clone(),
+        point_spills: BTreeMap::new(),
+        cur_inst: std::cell::Cell::new(0),
         accums: accums.clone(),
         frame_nslots,
         int32_use: int32_use_locals(f, &unboxed, &int_local),
@@ -7285,7 +7427,7 @@ fn emit_f64_function(
         if frame_roots_enabled() && !would_be_lazy {
             let string_plans = string_metric_plan.is_some_and(|p| !p.loops.is_empty())
                 || string_materialization_plan.is_some_and(|p| !p.loops.is_empty());
-            elide_frame_locals(f, &mut reflike, &numeric_all, &typeof_fusion, direct_sigs, string_plans);
+            let _ = elide_frame_locals(f, &mut reflike, &numeric_all, &typeof_fusion, direct_sigs, string_plans, false);
         }
     }
     let use_frame_roots = frame_roots_enabled() && !reflike.is_empty();
@@ -7367,6 +7509,8 @@ fn emit_f64_function(
         lazy_homes,
         lazy_spill: lazy_spill.clone(),
         lazy_reload: lazy_reload.clone(),
+        point_spills: BTreeMap::new(),
+        cur_inst: std::cell::Cell::new(0),
         accums: accums.clone(),
         frame_nslots,
         int32_use: int32_use_locals(f, &unboxed, &int_local),
@@ -7482,6 +7626,8 @@ fn emit_function(
             lazy_homes: false,
             lazy_spill: String::new(),
             lazy_reload: String::new(),
+            point_spills: BTreeMap::new(),
+            cur_inst: std::cell::Cell::new(0),
             accums: Default::default(),
             frame_nslots: 0,
             int32_use: int32_use_locals(f, &unboxed, &int_local),
@@ -7544,6 +7690,8 @@ fn emit_function(
             lazy_homes: false,
             lazy_spill: String::new(),
             lazy_reload: String::new(),
+            point_spills: BTreeMap::new(),
+            cur_inst: std::cell::Cell::new(0),
             accums: Default::default(),
             frame_nslots: 0,
             int32_use: int32_use_locals(f, &unboxed, &int_local),
@@ -7606,6 +7754,8 @@ fn emit_function(
             lazy_homes: false,
             lazy_spill: String::new(),
             lazy_reload: String::new(),
+            point_spills: BTreeMap::new(),
+            cur_inst: std::cell::Cell::new(0),
             accums: Default::default(),
             frame_nslots: 0,
             int32_use: int32_use_locals(f, &unboxed, &int_local),
@@ -7669,19 +7819,26 @@ fn emit_function(
         .map(|l| l.id.0)
         .collect();
     let typeof_fusion = typeof_fusion_plan(f);
-    {
+    let switch_plan = switch_plan_for(f, &unboxed, &int_local);
+    let lazy_points = {
         let numeric_all: BTreeSet<u32> = unboxed.union(&int_local).copied().collect();
-        let would_be_lazy = lazy_frames_enabled()
-            && prop_pic_enabled()
-            && f.rest_param.is_none()
-            && json_roots.is_empty()
-            && body_is_gc_free(&f.body, &numeric_all);
+        let lazy_shape = lazy_frames_enabled() && prop_pic_enabled() && f.rest_param.is_none() && json_roots.is_empty();
+        let would_be_lazy = lazy_shape && body_is_gc_free(&f.body, &numeric_all);
         if frame_roots_enabled() && !would_be_lazy && json_locals.is_empty() && scalar_slices.is_empty() {
             let string_plans = string_metric_plan.is_some_and(|p| !p.loops.is_empty())
                 || string_materialization_plan.is_some_and(|p| !p.loops.is_empty());
-            elide_frame_locals(f, &mut reflike, &numeric_all, &typeof_fusion, direct_sigs, string_plans);
+            // a switch table emits copies of its case bodies, whose accesses
+            // the plan (keyed by instruction) does not know
+            let lazy_ok = lazy_shape
+                && lazy_homes_enabled()
+                && !f.is_async
+                && !f.is_generator
+                && switch_plan.heads.is_empty();
+            elide_frame_locals(f, &mut reflike, &numeric_all, &typeof_fusion, direct_sigs, string_plans, lazy_ok)
+        } else {
+            None
         }
-    }
+    };
     let use_frame_roots = frame_roots_enabled() && !reflike.is_empty();
     if use_frame_roots {
         reflike.sort_unstable();
@@ -7727,13 +7884,17 @@ fn emit_function(
             let _ = writeln!(s, "  tsv v{} = TS_UNDEFINED;", l.id.0);
         }
     }
+    // a lazy frame with calls (round 2b): linked only around the inline-cache
+    // slow paths, each filling the slots of the locals it must find
+    let lazy_calls = use_frame_roots && lazy_points.is_some();
     let lazy_frame = use_frame_roots
-        && lazy_frames_enabled()
-        && prop_pic_enabled()
-        && f.rest_param.is_none()
-        && json_roots.is_empty()
-        && body_is_gc_free(&f.body, &unboxed.union(&int_local).copied().collect());
-    let lazy_homes = lazy_frame && lazy_homes_enabled();
+        && (lazy_calls
+            || (lazy_frames_enabled()
+                && prop_pic_enabled()
+                && f.rest_param.is_none()
+                && json_roots.is_empty()
+                && body_is_gc_free(&f.body, &unboxed.union(&int_local).copied().collect())));
+    let lazy_homes = lazy_frame && (lazy_calls || lazy_homes_enabled());
     let accums = if string_accum_enabled() {
         crate::string_accum::string_accumulators(f)
     } else {
@@ -7743,6 +7904,13 @@ fn emit_function(
         lazy_spill_reload(&reflike, frame_layout.as_ref())
     } else {
         (String::new(), String::new())
+    };
+    let point_spills: BTreeMap<usize, (String, String)> = match (&lazy_points, lazy_calls) {
+        (Some(points), true) => points
+            .iter()
+            .map(|(addr, live)| (*addr, point_spill_reload(live, &reflike, frame_layout.as_ref())))
+            .collect(),
+        _ => BTreeMap::new(),
     };
     emit_stack_cell_decls(s, &f.body, strat);
     let fin_slots = if use_frame_roots && !lazy_frame && finally_slots_enabled() {
@@ -7848,7 +8016,7 @@ fn emit_function(
 
     let ctx = Ctx {
 
-        switch_plan: switch_plan_for(f, &unboxed, &int_local),
+        switch_plan,
 
         layouts: layout_plan_for(f),
 
@@ -7856,6 +8024,8 @@ fn emit_function(
         lazy_homes,
         lazy_spill: lazy_spill.clone(),
         lazy_reload: lazy_reload.clone(),
+        point_spills,
+        cur_inst: std::cell::Cell::new(0),
         accums: accums.clone(),
 
         frame_nslots,
@@ -17351,7 +17521,7 @@ fn emit_store_field_generic(s: &mut String, obj: u32, field: u32, src: u32, ctx:
             let _ = writeln!(
                 s,
                 "  if (!ts_set_pic_try({o}, {field}, {v}, &_ts_pic_{pic})) {{ {sp}ts_set_linked({o}, {field}, {v}, &_ts_pic_{pic}, &F.h, {n});{rl} }}",
-                sp = ctx.lazy_spill, rl = ctx.lazy_reload, n = ctx.frame_nslots
+                sp = ctx.spill_now(), rl = ctx.reload_now(), n = ctx.frame_nslots
             );
         } else if ctx.lazy_frame {
             let _ = writeln!(
@@ -17380,6 +17550,7 @@ fn emit_store_field_generic(s: &mut String, obj: u32, field: u32, src: u32, ctx:
 }
 
 fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
+    ctx.cur_inst.set(inst as *const Inst as usize);
     match inst {
         Inst::AllocObject {
             dst,
@@ -19374,11 +19545,12 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     // g_typed_slow gate keeps the direct struct path for every
                     // program that never creates one.
                     let guard = typed_slow_guard(&obj_name);
+                    let slow = ctx.lazy_linked(&format!("ts_get({}, {})", obj_name, field.0));
                     if numeric_field(c, field.0, ctx.classes) {
-                        let e = format!("(({3}) ? ts_to_num(ts_get({0}, {1})) : {2})", obj_name, field.0, st, guard);
+                        let e = format!("(({2}) ? ts_to_num({0}) : {1})", slow, st, guard);
                         s.push_str(&ctx.set_num(dst.0, &e));
                     } else {
-                        let e = format!("(({3}) ? ts_get({0}, {1}) : {2})", obj_name, field.0, st, guard);
+                        let e = format!("(({2}) ? {0} : {1})", slow, st, guard);
                         s.push_str(&ctx.set_val(dst.0, &e));
                     }
                     return;
@@ -19396,7 +19568,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 let homes_try = |try_call: String| -> String {
                     format!(
                         "({{ tsv _lz; if (!{try_call}) {{ {sp}_lz = ts_get_linked({o}, {k}, &_ts_pic_{pic}, &F.h, {n});{rl} }} _lz; }})",
-                        try_call = try_call, sp = ctx.lazy_spill, rl = ctx.lazy_reload,
+                        try_call = try_call, sp = ctx.spill_now(), rl = ctx.reload_now(),
                         o = ctx.val(obj.0), k = field.0, pic = pic, n = ctx.frame_nslots
                     )
                 };
@@ -19431,7 +19603,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     format!(
                         "({{ tsv _lz; if (!ts_get_pic_try({o}, {k}, &_ts_pic_{pic}, &_lz)) {{ {sp}_lz = ts_get_linked({o}, {k}, &_ts_pic_{pic}, &F.h, {n});{rl} }} _lz; }})",
                         o = ctx.val(obj.0), k = field.0, pic = pic, n = ctx.frame_nslots,
-                        sp = ctx.lazy_spill, rl = ctx.lazy_reload
+                        sp = ctx.spill_now(), rl = ctx.reload_now()
                     )
                 } else if ctx.lazy_frame {
                     format!(
@@ -19553,7 +19725,8 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     // A receiver that is not a struct of class `c` routes
                     // `this.field = v` through ts_set (see the read above).
                     let obj_name = ctx.vname(obj.0);
-                    let _ = writeln!(s, "  if ({3}) {{ ts_set({0}, {1}, {2}); }} else {{", obj_name, field.0, ctx.val(src.0), typed_slow_guard(&obj_name));
+                    let slow = ctx.lazy_linked_stmt(&format!("ts_set({}, {}, {})", obj_name, field.0, ctx.val(src.0)));
+                    let _ = writeln!(s, "  if ({}) {{ {} }} else {{", typed_slow_guard(&obj_name), slow);
                     let _ = writeln!(s, "    (({}*)ts_ptr({}))->{} = {};", cn, obj_name, off, rhs);
                     if !is_num {
                         let _ = writeln!(s, "    ts_write_barrier({}, {});", obj_name, rhs);
@@ -19574,7 +19747,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 let homes_set = |try_call: String| -> String {
                     format!(
                         "  if (!{try_call}) {{ {sp}ts_set_linked({o}, {k}, {v}, &_ts_pic_{pic}, &F.h, {n});{rl} }}",
-                        try_call = try_call, sp = ctx.lazy_spill, rl = ctx.lazy_reload,
+                        try_call = try_call, sp = ctx.spill_now(), rl = ctx.reload_now(),
                         o = ctx.val(obj.0), k = field.0, v = ctx.val(src.0), pic = pic, n = ctx.frame_nslots
                     )
                 };
@@ -19639,7 +19812,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     format!(
                         "({{ tsv _lz; if (!{t}{sfx}({a}, {i}, &_lz)) {{ {sp}_lz = ts_array_get_linked{sfx}({a}, {i}, &F.h, {n});{rl} }} _lz; }})",
                         t = if inline { "ts_array_get_inline_try" } else { "ts_array_get_try" },
-                        sfx = sfx, a = a, i = i, n = ctx.frame_nslots, sp = ctx.lazy_spill, rl = ctx.lazy_reload
+                        sfx = sfx, a = a, i = i, n = ctx.frame_nslots, sp = ctx.spill_now(), rl = ctx.reload_now()
                     )
                 } else if ctx.lazy_frame {
                     format!(
@@ -19662,7 +19835,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     &format!(
                         "({{ tsv _lz; if (!{t}({a}, (uint32_t)({i}), &_lz)) {{ {sp}_lz = ts_array_get_linked({a}, (uint32_t)({i}), &F.h, {n});{rl} }} _lz; }})",
                         t = if inline { "ts_array_get_inline_try" } else { "ts_array_get_try" },
-                        a = a, i = i, n = ctx.frame_nslots, sp = ctx.lazy_spill, rl = ctx.lazy_reload
+                        a = a, i = i, n = ctx.frame_nslots, sp = ctx.spill_now(), rl = ctx.reload_now()
                     ),
                 ));
             } else if ctx.lazy_frame {
