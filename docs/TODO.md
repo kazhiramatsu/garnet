@@ -6138,6 +6138,20 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   4.608 vs 4.698 s and 4.591 vs 4.723 s median, all six pairs -1.6% to
   -3.0% (about -2.3%): the compiler's flag tests. Node 3.46-3.47 s under
   desktop load (1.32x).
+- Literal producers for the static slots (build `x57`, full build;
+  exporter; `docs/static_slots_design.md`, literal producers). An object
+  literal was not a producer layout, so the interface-typed reads of
+  literal-built objects (the kernels `small_calls`, `flags_truthy`,
+  `object_arrays`, the compiler's flow nodes and option bags) had no hint.
+  Every literal with static, non-index keys (no spread, computed key,
+  accessor, `__proto__`) is now a producer of its contextual type, and a
+  producer expression for store sequences. Producers 435 -> 1,229, hinted
+  sites 19,781 -> 24,553, 31 sites changed their hint and none lost one;
+  `small_calls` 879 -> 836 ms. Fixture `objects/static_slots_literals`
+  (also under GC stress). Gates all green. A/B against `x56`, two rounds
+  of three alternating runs: 4.625 vs 4.674 s and 4.685 vs 4.766 s
+  median, all six pairs -1.0% to -1.7% (about -1.4%). Node 3.44-3.63 s
+  under desktop load (1.32x).
 - Next slices, in order. A slice that extends the stack or an arena to a
   new kind of allocation runs the conformance suite and a compile of the
   compiler under `--stack-check` (an arena must allocate through the

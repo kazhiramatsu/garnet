@@ -221,3 +221,28 @@ vs 4.924 s median (pairs -0.5%, -8.3% with a slow baseline run, -0.3%);
 with the capacity hint, `x36` (N = 16) 4.906 vs 5.024 s (-2.3%, -1.8%,
 +1.4%) and `x35` (N = 24) 4.848 vs 4.930 s (-2.2%, -2.0%, -0.7%). Node
 3.29-3.34 s, so 1.47x Node.
+
+## Literal producers (slice `x57`)
+
+The pattern kernels with interface-typed literals (`small_calls`,
+`flags_truthy`, `object_arrays`) had no hint at all: an object literal was
+not a producer, so a `T`-typed read of a literal-built object took the
+inline cache's validation path. Every object literal whose properties all
+have a static name that is not an array index (no spread, computed key,
+accessor or `__proto__`; a repeated key keeps its first position) is now a
+producer layout of its contextual type: the declared variable, the
+function's return type for a returned literal (`createFlowNode`-style
+factories), the parameter or element type it is passed as. A literal is
+also a producer expression, so a store sequence may start from one
+(`const x: T = { a }; x.b = ..`). `TSAOT_LITERAL_PRODUCERS=0` turns it off.
+
+The compiler: producers 435 -> 1,229, hinted sites 19,781 -> 24,553; 31
+sites changed their hint (`fileName`, `statements`, `path`, `text`,
+`resolvedPath` gained literal slots), none lost one. The kernel
+`small_calls`: 879 -> 836 ms (its probes: the static probe's executed path
+is not much shorter than a first-entry PIC hit, which is where the rest of
+the gap to direct loads, 349 ms, lies). Fixture
+`objects/static_slots_literals` (literals in source and other key orders,
+a getter and a setter on hinted keys, frozen, deleted, spread, computed,
+returned by a factory, extended by stores, a union receiver). The compiler
+A/B is in the TODO entry.

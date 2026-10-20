@@ -7634,15 +7634,45 @@ class Exporter {
       seen.add(k);
       out.push({ name, type, keys });
     };
+    const literals = this.literalProducersEnabled;
     for (const sf of this.program.getSourceFiles()) {
       if (sf.isDeclarationFile) continue;
       const visit = (n: ts.Node): void => {
         if (ts.isBlock(n) || ts.isSourceFile(n) || ts.isCaseClause(n) || ts.isDefaultClause(n)) this.scanSequences(n.statements, add);
+        // an object literal builds its keys in source order: a producer of its
+        // contextual type (the declared variable, the return type, the
+        // parameter or element type it is passed as)
+        if (literals && ts.isObjectLiteralExpression(n)) {
+          const keys = this.literalLayoutKeys(n);
+          if (keys) {
+            let ct: ts.Type | undefined;
+            try { ct = this.checker.getContextualType(n) ?? undefined; } catch { ct = undefined; }
+            add("literal", ct, keys);
+          }
+        }
         ts.forEachChild(n, visit);
       };
       visit(sf);
     }
     return out;
+  }
+  /** TSAOT_LITERAL_PRODUCERS=0: object literals are not producer layouts. */
+  private literalProducersEnabled = process.env.TSAOT_LITERAL_PRODUCERS !== "0";
+  /** The key order of the object an object literal builds, when every property
+   *  has a static name that is not an array index (no spread, computed key,
+   *  accessor or `__proto__`): source order, a repeated key at its first
+   *  position (docs/static_slots_design.md, literal producers). */
+  private literalLayoutKeys(lit: ts.ObjectLiteralExpression): string[] | undefined {
+    const keys: string[] = [];
+    for (const p of lit.properties) {
+      let name: string;
+      if (ts.isShorthandPropertyAssignment(p)) name = p.name.text;
+      else if ((ts.isPropertyAssignment(p) || ts.isMethodDeclaration(p)) && (ts.isIdentifier(p.name) || ts.isStringLiteral(p.name))) name = p.name.text;
+      else return undefined;
+      if (name === "__proto__" || /^[0-9]+$/.test(name)) return undefined;
+      if (!keys.includes(name)) keys.push(name);
+    }
+    return keys.length > 0 ? keys : undefined;
   }
   /** Object-literal properties bound to function declarations, by property
    *  name: `{ m }`, `{ m: f }`, `{ m() {..} }`; the method-call resolution of
@@ -7701,6 +7731,10 @@ class Exporter {
    *  bound to exactly one function). */
   private producerExprLayouts(e: ts.Expression, depth: number): string[][] | undefined {
     while (ts.isParenthesizedExpression(e) || ts.isAsExpression(e) || ts.isTypeAssertionExpression(e) || ts.isNonNullExpression(e) || ts.isSatisfiesExpression(e)) e = e.expression;
+    if (this.literalProducersEnabled && ts.isObjectLiteralExpression(e)) {
+      const keys = this.literalLayoutKeys(e);
+      return keys ? [keys] : undefined;
+    }
     if (ts.isNewExpression(e)) {
       const cands = this.constructorCandidates(e);
       if (cands.length === 0) return undefined;
