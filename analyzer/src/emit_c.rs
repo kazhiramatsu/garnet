@@ -10543,6 +10543,18 @@ fn parseint_coerce_enabled() -> bool {
     })
 }
 
+/// `TSAOT_NUMFMT_COERCE=0` keeps toFixed / toString / toPrecision's previous
+/// calls (a raw argument, no RangeError) for the parity oracle.
+fn numfmt_coerce_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_NUMFMT_COERCE").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
 /// Full C body (statements incl. `return`) of a static-builtin function-value
 /// adapter. `a`/`n` are the ts_code args. Each mirrors the call-path semantics
 /// (same runtime helper / libm). Returns None for builtins NOT supported as
@@ -18666,6 +18678,27 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     true,
                 ),
                 // ---- Number ----
+                // The argument is converted with ToIntegerOrInfinity and checked
+                // (RangeError) as the spec says; an omitted one is the default.
+                "number.toFixed" | "number.toString" | "number.toPrecision" if numfmt_coerce_enabled() => {
+                    let base = match builtin.as_str() {
+                        "number.toFixed" => "ts_number_to_fixed",
+                        "number.toString" => "ts_number_to_string_radix",
+                        _ => "ts_number_to_precision",
+                    };
+                    let e = if args.is_empty() {
+                        match builtin.as_str() {
+                            "number.toFixed" => format!("{}_d({}, 0)", base, r),
+                            "number.toString" => format!("{}_d({}, 10)", base, r),
+                            _ => format!("{}_v({}, TS_UNDEFINED)", base, r),
+                        }
+                    } else if ctx.unboxed.contains(&args[0].0) || ctx.json_locals.contains(&args[0].0) {
+                        format!("{}_d({}, {})", base, r, n(0))
+                    } else {
+                        format!("{}_v({}, {})", base, r, v(0))
+                    };
+                    (e, false)
+                }
                 "number.toFixed" => (
                     format!(
                         "ts_number_to_fixed({}, {})",

@@ -6808,6 +6808,31 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   compiled under protect mode, its 78 output files identical. A/B against
   the number printer: eight ABBA pairs, instructions 0.9997 (eight of
   eight), wall 0.999, cycles within noise: neutral.
+- Number.prototype.toString(radix), toFixed and toPrecision as the spec and
+  V8 define them. toString(radix) crashed on magnitudes past 2^53 (its
+  integer digits came from `ipart - floor(ipart / base) * base`, inexact
+  there, so a digit index left the alphabet): it now follows V8's
+  DoubleToRadixCString (the fraction first with Steele & White digits and
+  a carry back into the integer, the integer's unrepresented digits as
+  zeros and the rest from exact `fmod`). toPrecision rounded exact ties to
+  even through printf (`(2.5).toPrecision(1)` printed "2"): it now takes
+  the exact decimal expansion and rounds half up, as the spec's "the
+  larger n" says. All three read their argument as raw bits (a string
+  radix meant 10) and clamped out-of-range values: the emitter now calls
+  `_d` (number argument) or `_v` (any value) entries that apply
+  ToIntegerOrInfinity and throw RangeError outside 2..36, 0..100 and
+  1..100 (toPrecision prints a non-finite receiver first, toFixed checks
+  the range first); the prototype method values use them too. The
+  previous entries keep their argument rules for the frozen analyzer's
+  output, with the new formatting. `TSAOT_NUMFMT_COERCE=0` keeps the
+  previous calls for the parity oracle. Fixture
+  `numbers/number_methods_formatting` (25 values through 12 forms, ten
+  RangeError cases, converted arguments, a hashed sweep over every radix);
+  a known parity row (numeric specialization). Gates: unit, parity (362
+  identical), bundler, selfconf, GC stress, inline policy, conformance
+  492/492; tsc rebuilt, compiled under protect mode, its 78 output files
+  identical. A/B against string-to-number: eight ABBA pairs, instructions
+  1.0000, cycles 0.9998, wall 1.0001: neutral.
 - Next slices, in order. GC v2 first (`docs/gc_v2_design.md` §6.5, Y1:
   4 direct pointers (4a the collector's machinery behind a switch, 4b
   strings, then the other kinds); 5 handles removed).

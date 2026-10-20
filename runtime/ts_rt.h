@@ -1132,6 +1132,15 @@ double ts_str_lastindexof(tsv s, tsv needle, double from, int has_from);
 tsv ts_number_to_fixed(tsv numv, double digits);
 tsv ts_number_to_string_radix(tsv numv, double radix);
 tsv ts_number_to_precision(tsv numv, double prec);
+/* Number.prototype.toFixed / toString / toPrecision with the spec's argument
+   conversion and RangeErrors: _d takes a number argument, _v any value
+   (undefined is the default). */
+tsv ts_number_to_fixed_d(tsv numv, double digits);
+tsv ts_number_to_fixed_v(tsv numv, tsv digits);
+tsv ts_number_to_string_radix_d(tsv numv, double radix);
+tsv ts_number_to_string_radix_v(tsv numv, tsv radix);
+tsv ts_number_to_precision_d(tsv numv, double prec);
+tsv ts_number_to_precision_v(tsv numv, tsv prec);
 int ts_str_includes(tsv s, tsv needle, double pos, int has_pos);
 tsv ts_str_charat(tsv s, double idx);
 tsv ts_str_codepointat(tsv s, double idx);

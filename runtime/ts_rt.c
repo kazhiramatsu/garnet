@@ -6112,9 +6112,29 @@ double ts_str_lastindexof(tsv s, tsv needle, double from, int has_from){
 }
 /* Number.prototype.toFixed(digits): fixed-point string. JS rounds half away from
    zero (printf %.*f uses round-half-to-even), so round explicitly to match V8. */
+static tsv number_to_fixed(double x, int d);
+static double num_to_integer_or_inf(double d);
+static double number_this_value(tsv numv);
+/* Number.prototype.toFixed(f) with a number f: ToIntegerOrInfinity,
+   RangeError outside 0..100 (checked before x is looked at). */
+tsv ts_number_to_fixed_d(tsv numv, double digits){
+  double f = num_to_integer_or_inf(digits);
+  if (!(f >= 0 && f <= 100)) ts_throw_range_error_msg("toFixed() digits argument must be between 0 and 100");
+  return number_to_fixed(number_this_value(numv), (int)f);
+}
+tsv ts_number_to_fixed_v(tsv numv, tsv digits){
+  if (ts_is_undef(digits)) return ts_number_to_fixed_d(numv, 0);
+  ts_gc_root(&numv);
+  double f = ts_number_coerce(digits);
+  ts_gc_unroot(1);
+  return ts_number_to_fixed_d(numv, f);
+}
+/* The previous entry (the frozen analyzer's output): f clamped to 0..100. */
 tsv ts_number_to_fixed(tsv numv, double digits){
-  double x = ts_to_num(numv);
   int d = (int)digits; if (d<0) d=0; if (d>100) d=100;
+  return number_to_fixed(ts_to_num(numv), d);
+}
+static tsv number_to_fixed(double x, int d){
   if (x != x) return ts_new_string("NaN",3);
   if (x == 1.0/0.0) return ts_new_string("Infinity",8);
   if (x == -1.0/0.0) return ts_new_string("-Infinity",9);
@@ -6151,98 +6171,162 @@ tsv ts_number_to_fixed(tsv numv, double digits){
   out[o] = 0;
   return ts_new_string(out, (uint32_t)o);
 }
-/* Number.prototype.toString(radix): radix 2..36 (default 10). Integer part only
-   for non-decimal radixes (matching the common integer use; JS supports fractions
-   but those are rarely used and lossy). */
-tsv ts_number_to_string_radix(tsv numv, double radix){
-  double x = ts_to_num(numv);
-  int base = (int)radix;
-  if (base==10 || base<2 || base>36){ return ts_to_string_v(numv); }
-  if (x != x) return ts_new_string("NaN",3);
-  if (x == 1.0/0.0) return ts_new_string("Infinity",8);
-  if (x == -1.0/0.0) return ts_new_string("-Infinity",9);
-  char buf[1200]; int neg = x<0; double ax = neg?-x:x;
-  double ipart = floor(ax);
-  double frac = ax - ipart;
-  const char* digs = "0123456789abcdefghijklmnopqrstuvwxyz";
-  /* integer part (use double division to support magnitudes beyond long long) */
-  char tmp[1100]; int ti=0;
-  if (ipart==0) tmp[ti++]='0';
-  while (ipart>=1){ double q=floor(ipart/base); int d=(int)(ipart - q*base); tmp[ti++]=digs[d]; ipart=q; if(ti>=1000) break; }
-  int bi=0; if(neg) buf[bi++]='-';
-  while (ti>0) buf[bi++]=tmp[--ti];
-  /* fractional part: Steele & White — emit digits until the remaining fraction is
-     within half a ULP of the original value, rounding the last digit (with carry).
-     This matches V8's shortest round-tripping output, including non-terminating
-     fractions in odd bases (e.g. (0.1).toString(3)). */
-  double delta = 0.5 * (nextafter(ax, 1.0/0.0) - ax);
-  if (delta <= 0) delta = 4.9e-324;
-  if (frac >= delta){
-    int point = bi;            /* index of the '.' */
-    buf[bi++]='.';
-    for(;;){
-      frac *= base; delta *= base;
-      int d = (int)frac;
-      buf[bi++]=digs[d];
-      frac -= d;
-      if (frac > 0.5 || (frac == 0.5 && (d & 1))){
-        if (frac + delta > 1.0){
-          /* round up: walk back incrementing, skipping the '.', carrying as needed. */
-          int j = bi-1;
-          for(;;){
-            if (j == point) j--;                 /* skip the decimal point */
-            if (j < (neg?1:0)){                  /* carried past the MSB: insert '1' */
-              int ins = neg?1:0;
-              memmove(buf+ins+1, buf+ins, (size_t)(bi-ins));
-              buf[ins]='1'; bi++;
-              break;
-            }
-            char c = buf[j];
-            int dv = (c>='a') ? (c-'a'+10) : (c-'0');
-            if (dv+1 < base){ buf[j]=digs[dv+1]; break; }
-            buf[j]='0'; j--;
+/* Number::toString(x, radix) for radix 2..36 other than 10: V8's
+   DoubleToRadixCString (src/numbers/conversions.cc). The fraction is written
+   first (Steele & White: digits until the rest is within half a unit of the
+   input's precision, rounding half to even with a carry back through the
+   digits into the integer); the integer's digits beyond the double's
+   precision are zeros, the others exact fmod remainders. */
+static tsv number_to_radix_string(double value, int radix){
+  static const char chars[] = "0123456789abcdefghijklmnopqrstuvwxyz";
+  enum { kBufferSize = 2200 };
+  char buffer[kBufferSize];
+  int integer_cursor = kBufferSize / 2;
+  int fraction_cursor = integer_cursor;
+  int negative = value < 0;
+  if (negative) value = -value;
+  double integer = floor(value);
+  double fraction = value - integer;
+  double delta = 0.5 * (nextafter(value, INFINITY) - value);
+  double min_delta = nextafter(0.0, 1.0);
+  if (delta < min_delta) delta = min_delta;
+  if (fraction >= delta){
+    buffer[fraction_cursor++] = '.';
+    do {
+      fraction *= radix;
+      delta *= radix;
+      int digit = (int)fraction;
+      buffer[fraction_cursor++] = chars[digit];
+      fraction -= digit;
+      if (fraction > 0.5 || (fraction == 0.5 && (digit & 1))){
+        if (fraction + delta > 1){
+          for (;;){
+            fraction_cursor--;
+            if (fraction_cursor == kBufferSize / 2){ integer += 1; break; }
+            char c = buffer[fraction_cursor];
+            int d = c > '9' ? (c - 'a' + 10) : (c - '0');
+            if (d + 1 < radix){ buffer[fraction_cursor++] = chars[d + 1]; break; }
           }
           break;
         }
       }
-      if (frac < delta) break;
-    }
-    /* strip a trailing '.' if rounding consumed all fractional digits */
-    if (buf[bi-1]=='.') bi--;
+    } while (fraction >= delta);
   }
-  buf[bi]=0;
-  return ts_new_string(buf,(uint32_t)bi);
+  /* integer / radix >= 2^53: no unit digit is represented, write a zero */
+  while (integer / radix >= 9007199254740992.0){
+    integer /= radix;
+    buffer[--integer_cursor] = '0';
+  }
+  do {
+    double remainder = fmod(integer, radix);
+    buffer[--integer_cursor] = chars[(int)remainder];
+    integer = (integer - remainder) / radix;
+  } while (integer > 0);
+  if (negative) buffer[--integer_cursor] = '-';
+  return ts_new_string(buffer + integer_cursor, (uint32_t)(fraction_cursor - integer_cursor));
 }
-/* Number.prototype.toPrecision(p): p significant digits. */
+/* ToIntegerOrInfinity of a number. */
+static double num_to_integer_or_inf(double d){
+  if (d != d || d == 0) return 0;
+  if (isinf(d)) return d;
+  return trunc(d);
+}
+/* The receiver's number (thisNumberValue). */
+static double number_this_value(tsv numv){
+  return ts_is_num(numv) ? ts_to_num(numv) : ts_number_coerce(numv);
+}
+/* Number.prototype.toString(radix) with a number radix: ToIntegerOrInfinity,
+   RangeError outside 2..36. */
+tsv ts_number_to_string_radix_d(tsv numv, double radix){
+  double r = num_to_integer_or_inf(radix);
+  if (!(r >= 2 && r <= 36)) ts_throw_range_error_msg("toString() radix must be between 2 and 36");
+  double x = number_this_value(numv);
+  if (r == 10 || x != x || isinf(x)) return ts_to_string_v(ts_num(x));
+  return number_to_radix_string(x, (int)r);
+}
+/* ... with any radix: undefined is 10. */
+tsv ts_number_to_string_radix_v(tsv numv, tsv radix){
+  if (ts_is_undef(radix)) return ts_number_to_string_radix_d(numv, 10);
+  ts_gc_root(&numv);
+  double r = ts_number_coerce(radix);
+  ts_gc_unroot(1);
+  return ts_number_to_string_radix_d(numv, r);
+}
+/* The previous entry (the frozen analyzer's output): an invalid radix
+   prints in decimal. */
+tsv ts_number_to_string_radix(tsv numv, double radix){
+  double x = ts_to_num(numv);
+  int base = (radix >= 2 && radix <= 36) ? (int)radix : 10;
+  if (base == 10 || x != x || isinf(x)) return ts_to_string_v(numv);
+  return number_to_radix_string(x, base);
+}
+/* Number::toPrecision for a finite x and 1 <= p <= 100 (ECMA-262
+   21.1.3.5): n, the p digits closest to x, the larger one on a tie (half up
+   on |x|), from the exact decimal expansion; exponential when e < -6 or
+   e >= p. */
+static tsv number_to_precision(double x, int p){
+  char out[160]; int o = 0;
+  if (x < 0){ out[o++] = '-'; x = -x; }
+  char d[110]; int e;
+  if (x == 0){
+    for (int i = 0; i < p; i++) d[i] = '0';
+    e = 0;
+  } else {
+    char ex[800];
+    snprintf(ex, sizeof ex, "%.770e", x);     /* every digit of the double, exactly */
+    char* ep = strchr(ex, 'e');
+    e = atoi(ep + 1);
+    char all[780]; int k = 0;
+    for (char* c = ex; c < ep; c++) if (*c != '.') all[k++] = *c;
+    for (int i = 0; i < p; i++) d[i] = i < k ? all[i] : '0';
+    if (p < k && all[p] >= '5'){
+      int j = p - 1;
+      while (j >= 0 && d[j] == '9'){ d[j] = '0'; j--; }
+      if (j >= 0) d[j]++;
+      else { d[0] = '1'; for (int i = 1; i < p; i++) d[i] = '0'; e++; }
+    }
+  }
+  if (e < -6 || e >= p){
+    out[o++] = d[0];
+    if (p > 1){ out[o++] = '.'; for (int i = 1; i < p; i++) out[o++] = d[i]; }
+    o += snprintf(out + o, sizeof out - (size_t)o, "e%c%d", e >= 0 ? '+' : '-', e >= 0 ? e : -e);
+  } else if (e == p - 1){
+    for (int i = 0; i < p; i++) out[o++] = d[i];
+  } else if (e >= 0){
+    for (int i = 0; i <= e; i++) out[o++] = d[i];
+    out[o++] = '.';
+    for (int i = e + 1; i < p; i++) out[o++] = d[i];
+  } else {
+    out[o++] = '0'; out[o++] = '.';
+    for (int i = 0; i < -(e + 1); i++) out[o++] = '0';
+    for (int i = 0; i < p; i++) out[o++] = d[i];
+  }
+  return ts_new_string(out, (uint32_t)o);
+}
+/* Number.prototype.toPrecision(p) with a number p: ToIntegerOrInfinity; a
+   non-finite x prints as itself; RangeError outside 1..100. */
+tsv ts_number_to_precision_d(tsv numv, double prec){
+  double p = num_to_integer_or_inf(prec);
+  double x = number_this_value(numv);
+  if (x != x || isinf(x)) return ts_to_string_v(ts_num(x));
+  if (!(p >= 1 && p <= 100)) ts_throw_range_error_msg("toPrecision() argument must be between 1 and 100");
+  return number_to_precision(x, (int)p);
+}
+/* ... with any p: undefined prints x with ToString. */
+tsv ts_number_to_precision_v(tsv numv, tsv prec){
+  if (ts_is_undef(prec)) return ts_to_string_v(ts_num(number_this_value(numv)));
+  ts_gc_root(&numv);
+  double p = ts_number_coerce(prec);
+  ts_gc_unroot(1);
+  return ts_number_to_precision_d(numv, p);
+}
+/* The previous entry (the frozen analyzer's output): p < 1 prints x with
+   ToString, p > 100 is 100. */
 tsv ts_number_to_precision(tsv numv, double prec){
   double x = ts_to_num(numv);
   int p = (int)prec; if (p<1) return ts_to_string_v(numv); if (p>100) p=100;
-  char buf[400];
-  if (x != x) return ts_new_string("NaN",3);
-  if (x == 1.0/0.0) return ts_new_string("Infinity",8);
-  if (x == -1.0/0.0) return ts_new_string("-Infinity",9);
-  if (x == 0){
-    if (p==1) return ts_new_string("0",1);
-    snprintf(buf, sizeof buf, "%.*f", p-1, 0.0);   /* "0.00..." */
-    return ts_new_string(buf,(uint32_t)strlen(buf));
-  }
-  /* Format the mantissa to p significant digits via %e first — printf rounds
-     consistently and carries (9.99->1.0e+1) correctly, so its exponent is the
-     true decimal exponent `e` of the rounded value. JS toPrecision then uses
-     exponential when e < -6 or e >= p, else fixed notation. */
-  snprintf(buf, sizeof buf, "%.*e", p-1, x);
-  char* ep = strchr(buf, 'e');
-  int e = ep ? atoi(ep+1) : 0;
-  if (e < -6 || e >= p){
-    /* keep the %e form; JS exponent style strips a leading zero in a 2-digit exp. */
-    if (ep && (ep[1]=='+'||ep[1]=='-') && ep[2]=='0' && ep[3]>='0' && ep[3]<='9' && ep[4]==0){
-      ep[2]=ep[3]; ep[3]=0;
-    }
-  } else {
-    int frac = p-1-e; if (frac<0) frac=0;
-    snprintf(buf, sizeof buf, "%.*f", frac, x);
-  }
-  return ts_new_string(buf,(uint32_t)strlen(buf));
+  if (x != x || isinf(x)) return ts_to_string_v(numv);
+  return number_to_precision(x, p);
 }
 int ts_str_includes(tsv s, tsv needle, double pos, int has_pos){ return ts_str_indexof(s,needle,pos,has_pos) >= 0; }
 tsv ts_str_charat(tsv s, double idx){
@@ -12895,9 +12979,9 @@ void ts_string_proto_register(ts_key method_key, const char* name, ts_code fn){
    Thin ts_code wrappers over the static number builtins so a method call on an
    any-typed number (resolved via ts_get -> g_number_proto) reaches the same
    implementation as the statically-typed `n.method()` fast path. */
-tsv ts_numproto_toFixed(tsv* a, int n){ return ts_number_to_fixed(a[0], n>1?ts_to_num(a[1]):0); }
-tsv ts_numproto_toString(tsv* a, int n){ return ts_number_to_string_radix(a[0], n>1?ts_to_num(a[1]):10); }
-tsv ts_numproto_toPrecision(tsv* a, int n){ return ts_number_to_precision(a[0], n>1?ts_to_num(a[1]):0); }
+tsv ts_numproto_toFixed(tsv* a, int n){ return ts_number_to_fixed_v(a[0], n>1?a[1]:TS_UNDEFINED); }
+tsv ts_numproto_toString(tsv* a, int n){ return ts_number_to_string_radix_v(a[0], n>1?a[1]:TS_UNDEFINED); }
+tsv ts_numproto_toPrecision(tsv* a, int n){ return ts_number_to_precision_v(a[0], n>1?a[1]:TS_UNDEFINED); }
 tsv ts_numproto_valueOf(tsv* a, int n){ (void)n; return a[0]; }
 
 tsv ts_number_proto(void){ return ts_proto_ref(g_number_proto_v) ? g_number_proto_v : TS_NULL; }
