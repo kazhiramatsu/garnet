@@ -2027,6 +2027,12 @@ static inline void ts_array_set_inline(tsv arr, uint32_t i, tsv v){
    iterator; ts_forof_next returns the next element or TS_ITER_DONE (a marker
    no user value can be: selector 0xFFFE is internal, like the array hole). */
 #define TS_ITER_DONE TS_BOX(0xFFFEu, 0x444F4E45u)
+/* String accumulators (docs/string_accumulators_design.md): a private buffer
+   string a local appends into; each function also accepts an ordinary string. */
+tsv ts_sb_new(tsv init);
+tsv ts_sb_append(tsv sb, tsv e);
+double ts_sb_len(tsv sb);
+tsv ts_sb_finish(tsv sb);
 tsv ts_forof_open(tsv v);
 tsv ts_forof_next_slow(tsv it, ts_key next_key);
 static inline tsv ts_forof_next(tsv it, double idx, ts_key next_key){

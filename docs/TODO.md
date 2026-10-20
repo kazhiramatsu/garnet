@@ -6378,6 +6378,32 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   (`internIdentifier`, symbol tables, the union cache keyed by
   `getTypeListId`), allocation of nodes / symbols / types 4.2%, minor
   collections 8.6%.
+- String accumulators (build `x67`, full build; analyzer `string_accum.rs`,
+  emitter, runtime; `docs/string_accumulators_design.md`).
+  `getTypeListId` (3.4% of the compiler's samples) builds its key with
+  `result += ...` through the generic `ts_add`: dispatch on both operands,
+  four roots, and a new view cell for every intermediate string. A local
+  initialized from a string constant at the top level and otherwise only
+  appended to (`T = L + E; L = T`, the temporary used once), read for its
+  length and returned, now holds a private buffer string: `ts_sb_new`,
+  `ts_sb_append` (ToPrimitive / ToString of the operand written into the
+  buffer; integers as digits), `ts_sb_len`, and `ts_sb_finish` at the
+  return (the buffer becomes an ordinary string; a short ASCII result the
+  canonical immediate). The analysis is conservative by construction: every
+  other mention of the local (found through the instruction's Debug text,
+  so no instruction kind can be missed) disqualifies it, and the runtime
+  functions accept an ordinary string too, so a path that emits the `+`
+  itself stays correct. `TSAOT_STRING_ACCUM=0` keeps the generic `+` (the
+  parity oracle). The compiler has 16 such functions (65 appends); kernel
+  204 -> 119 ms (Node 120 ms). Fixture `strings/string_accumulators`
+  (`getTypeListId`; appends of every value kind, objects with toString /
+  valueOf / Symbol.toPrimitive, UTF-16 and lone surrogates, growth to 5,000
+  units, a late UTF-16 widening, a throwing operand with the partial result
+  returned from the catch, short results as Map keys, early returns, a
+  local read between appends that must not qualify; also under GC stress).
+  Gates all green (parity: a known numeric-typing difference). A/B against
+  `x66`, two rounds: 4.306 vs 4.363 s and 4.259 vs 4.304 s median, five of
+  six pairs faster: about -1.2%. Node 3.27-3.40 s (1.30x).
 - Next slices, in order. A slice that extends the stack or an arena to a
   new kind of allocation runs the conformance suite and a compile of the
   compiler under `--stack-check` (an arena must allocate through the

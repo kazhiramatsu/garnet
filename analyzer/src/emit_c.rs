@@ -1350,6 +1350,8 @@ struct Ctx<'a> {
     lazy_homes: bool,
     lazy_spill: String,
     lazy_reload: String,
+    /// string accumulators of the function (string_accum.rs)
+    accums: crate::string_accum::StringAccums,
     frame_nslots: usize,
     static_strings: &'a BTreeMap<Vec<u16>, usize>,
     string_metric_plan: Option<&'a FunctionMetricPlan>,
@@ -2709,6 +2711,19 @@ fn lazy_frames_enabled() -> bool {
 /// them only before a linked slow call and they are reloaded after, so the
 /// fast path touches no frame and a helper's body can stay a leaf.
 /// TSAOT_LAZY_HOMES=0 keeps the frame slots as the locals' homes.
+/// String accumulators (docs/string_accumulators_design.md): a local only
+/// appended to, read for its length and returned is built in a private
+/// buffer. TSAOT_STRING_ACCUM=0 keeps the generic `+` (the parity oracle).
+fn string_accum_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_STRING_ACCUM").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
 /// `arr.values()` / `keys()` / `entries()` as values are Array Iterator objects
 /// (live: `next()` reads the array at each step). TSAOT_ARRAY_ITERATORS=0
 /// keeps the array snapshots (the parity oracle).
@@ -6753,6 +6768,11 @@ fn emit_i64_function(
         // numeric clones carry no JSON roots
         && body_is_gc_free(&f.body, &unboxed.union(&int_local).copied().collect());
     let lazy_homes = lazy_frame && lazy_homes_enabled();
+    let accums = if string_accum_enabled() {
+        crate::string_accum::string_accumulators(f)
+    } else {
+        Default::default()
+    };
     let (lazy_spill, lazy_reload) = if lazy_homes {
         lazy_spill_reload(&reflike, frame_layout.as_ref())
     } else {
@@ -6791,6 +6811,7 @@ fn emit_i64_function(
         lazy_homes,
         lazy_spill: lazy_spill.clone(),
         lazy_reload: lazy_reload.clone(),
+        accums: accums.clone(),
         frame_nslots,
         int32_use: int32_use_locals(f, &unboxed, &int_local),
         unboxed,
@@ -6935,6 +6956,11 @@ fn emit_f64_function(
         // numeric clones carry no JSON roots
         && body_is_gc_free(&f.body, &unboxed.union(&int_local).copied().collect());
     let lazy_homes = lazy_frame && lazy_homes_enabled();
+    let accums = if string_accum_enabled() {
+        crate::string_accum::string_accumulators(f)
+    } else {
+        Default::default()
+    };
     let (lazy_spill, lazy_reload) = if lazy_homes {
         lazy_spill_reload(&reflike, frame_layout.as_ref())
     } else {
@@ -6973,6 +6999,7 @@ fn emit_f64_function(
         lazy_homes,
         lazy_spill: lazy_spill.clone(),
         lazy_reload: lazy_reload.clone(),
+        accums: accums.clone(),
         frame_nslots,
         int32_use: int32_use_locals(f, &unboxed, &int_local),
         unboxed,
@@ -7084,6 +7111,7 @@ fn emit_function(
             lazy_homes: false,
             lazy_spill: String::new(),
             lazy_reload: String::new(),
+            accums: Default::default(),
             frame_nslots: 0,
             int32_use: int32_use_locals(f, &unboxed, &int_local),
             unboxed,
@@ -7142,6 +7170,7 @@ fn emit_function(
             lazy_homes: false,
             lazy_spill: String::new(),
             lazy_reload: String::new(),
+            accums: Default::default(),
             frame_nslots: 0,
             int32_use: int32_use_locals(f, &unboxed, &int_local),
             unboxed,
@@ -7200,6 +7229,7 @@ fn emit_function(
             lazy_homes: false,
             lazy_spill: String::new(),
             lazy_reload: String::new(),
+            accums: Default::default(),
             frame_nslots: 0,
             int32_use: int32_use_locals(f, &unboxed, &int_local),
             unboxed,
@@ -7311,6 +7341,11 @@ fn emit_function(
         && json_roots.is_empty()
         && body_is_gc_free(&f.body, &unboxed.union(&int_local).copied().collect());
     let lazy_homes = lazy_frame && lazy_homes_enabled();
+    let accums = if string_accum_enabled() {
+        crate::string_accum::string_accumulators(f)
+    } else {
+        Default::default()
+    };
     let (lazy_spill, lazy_reload) = if lazy_homes {
         lazy_spill_reload(&reflike, frame_layout.as_ref())
     } else {
@@ -7423,6 +7458,7 @@ fn emit_function(
         lazy_homes,
         lazy_spill: lazy_spill.clone(),
         lazy_reload: lazy_reload.clone(),
+        accums: accums.clone(),
 
         frame_nslots,
         int32_use: int32_use_locals(f, &unboxed, &int_local),
@@ -18625,6 +18661,10 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             }
         }
         Inst::Copy { dst, src } => {
+            if !ctx.accums.is_empty() && ctx.accums.inits.get(&dst.0) == Some(&src.0) {
+                s.push_str(&ctx.set_val(dst.0, &format!("ts_sb_new({})", ctx.val(src.0))));
+                return;
+            }
             if ctx.scalar_slice(src.0).is_some()
                 && ctx
                     .scalar_slice(dst.0)
@@ -18988,6 +19028,10 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             s.push_str(&ctx.set_num(dst.0, &format!("ts_array_len_fast({})", ctx.val(arr.0))));
         }
         Inst::StringLen { dst, src } => {
+            if ctx.accums.locals.contains(&src.0) {
+                s.push_str(&ctx.set_num(dst.0, &format!("ts_sb_len({})", ctx.val(src.0))));
+                return;
+            }
             if ctx.json_locals.contains(&src.0) {
                 s.push_str(
                     &ctx.set_num(dst.0, &format!("ts_json_dom_length({})", ctx.jval(src.0))),
@@ -19536,6 +19580,12 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             s.push_str("  }\n");
         }
         Inst::Return { src } => {
+            // a string accumulator becomes an ordinary string on its way out
+            if let Some(v) = src {
+                if ctx.accums.locals.contains(&v.0) {
+                    s.push_str(&ctx.set_val(v.0, &format!("ts_sb_finish({})", ctx.val(v.0))));
+                }
+            }
             // Leaving the function from inside `try` bodies: pop every handler
             // pushed by this function first (the frozen emitter forgot this, so a
             // later throw landed in the dead frame).
@@ -19754,6 +19804,15 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             }
         }
         Inst::BinOp { dst, op, lhs, rhs } => {
+            if let Some(&(l, e)) = ctx.accums.temps.get(&dst.0) {
+                // the append writes the accumulator's buffer; the temporary
+                // holds the same builder for the copy back (a path that
+                // emits this `+` itself leaves an ordinary string, which the
+                // ts_sb_* functions accept as well)
+                debug_assert!(op == "+" && lhs.0 == l && rhs.0 == e);
+                s.push_str(&ctx.set_val(dst.0, &format!("ts_sb_append({}, {})", ctx.val(l), ctx.val(e))));
+                return;
+            }
             // integer fast path: both operands int-typed and op int-closed
             let both_int = ctx.int_local.contains(&lhs.0) && ctx.int_local.contains(&rhs.0);
             let dst_int = ctx.int_local.contains(&dst.0);

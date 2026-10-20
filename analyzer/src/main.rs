@@ -10,6 +10,7 @@ mod emit_c;
 mod escape_ir;
 mod interproc;
 mod sroa;
+mod string_accum;
 mod string_materialization;
 mod string_metrics;
 mod string_plan;

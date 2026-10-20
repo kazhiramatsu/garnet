@@ -10752,6 +10752,91 @@ void ts_array_push_all(tsv dst, tsv src){
   ts_throw_type_error_msg("Value is not iterable");
 }
 
+/* ---- string accumulators (docs/string_accumulators_design.md) ----
+   A builder is a heap string with TS_STR_FLAG_BUFFER that only its local
+   reaches (the generic `+` never exposes its own buffers: its values are
+   views). Appends write units at the end, a bigger buffer only when the
+   capacity or the encoding runs out. */
+static int sb_is_builder(tsv v){
+  if (!ts_is_heap_str(v)) return 0;
+  uint32_t fl = ts_str_ptr_typed(v)->flags;
+  return (fl & TS_STR_FLAG_BUFFER) && !(fl & TS_STR_FLAG_VIEW);
+}
+/* A builder holding `x`'s units and room for `extra` more (at least). */
+static tsv sb_from_view_value(tsv src, uint32_t extra, uint32_t want_utf16){
+  ts_gc_root(&src);
+  ts_strview x = ts_str_view_typed(src);
+  uint32_t flags = (x.flags | want_utf16) & TS_STR_FLAG_UTF16;
+  uint64_t need = (uint64_t)x.len + extra;
+  if (need > UINT32_MAX / 2u){ ts_gc_unroot(1); fprintf(stderr, "tsaot: RangeError: concatenated string too large\n"); abort(); }
+  uint32_t cap = ts_string_builder_capacity(need < 16u ? 16u : (uint32_t)need);
+  ts_string* b = ts_string_alloc_buffer(cap, flags);
+  x = ts_str_view_typed(src);
+  ts_str_copy_units(b->data, flags, 0, x, 0, x.len);
+  b->len = x.len;
+  b->hash = 0;
+  b->flags = TS_STR_FLAG_BUFFER | flags | ((x.len == 0 || (x.flags & TS_STR_FLAG_ASCII)) ? TS_STR_FLAG_ASCII : 0);
+  ts_string_write_terminator(b, x.len);
+  ts_gc_unroot(1);
+  return ts_str_v(b);
+}
+tsv ts_sb_new(tsv init){
+  if (!ts_is_str(init)) init = ts_to_string_v(init);
+  return sb_from_view_value(init, 0, 0);
+}
+tsv ts_sb_append(tsv sb, tsv e){
+  char nb[24]; uint32_t nl = 0;
+  int digits = ts_is_num(e) && ts_int_digits(ts_to_num(e), nb, &nl);
+  ts_gc_root(&sb); ts_gc_root(&e);
+  if (!digits && !ts_is_str(e)){
+    /* `L + e` with L a string: ToPrimitive(default), then ToString */
+    if (ts_object_like(e) && !ts_is_symbol(e)) e = ts_to_primitive(e, 2);
+    e = ts_to_string_v(e);
+  }
+  uint32_t add_len, add_utf16 = 0, add_ascii = 1;
+  if (digits) add_len = nl;
+  else {
+    ts_strview y = ts_str_view_typed(e);
+    add_len = y.len;
+    add_utf16 = y.flags & TS_STR_FLAG_UTF16;
+    add_ascii = (y.len == 0 || (y.flags & TS_STR_FLAG_ASCII)) ? 1 : 0;
+  }
+  if (!sb_is_builder(sb)) sb = sb_from_view_value(ts_is_str(sb) ? sb : ts_to_string_v(sb), add_len, add_utf16);
+  ts_string* b = ts_str_ptr_typed(sb);
+  uint64_t n64 = (uint64_t)b->len + add_len;
+  if (n64 > UINT32_MAX / 2u){ ts_gc_unroot(2); fprintf(stderr, "tsaot: RangeError: concatenated string too large\n"); abort(); }
+  uint32_t n = (uint32_t)n64;
+  if (n > ts_string_storage_capacity(b) || (add_utf16 && !(b->flags & TS_STR_FLAG_UTF16))){
+    sb = sb_from_view_value(sb, add_len, add_utf16);   /* copies; the old buffer becomes garbage */
+    b = ts_str_ptr_typed(sb);
+  }
+  uint32_t at = b->len;
+  if (digits){
+    for (uint32_t i = 0; i < nl; i++) ts_str_cu_set(b->data, b->flags, at + i, (uint16_t)(unsigned char)nb[i]);
+  } else {
+    ts_strview y = ts_str_view_typed(e);
+    ts_str_copy_units(b->data, b->flags, at, y, 0, y.len);
+  }
+  b->len = n;
+  b->hash = 0;
+  if (!add_ascii) b->flags &= ~TS_STR_FLAG_ASCII;
+  ts_string_write_terminator(b, n);
+  ts_gc_unroot(2);
+  return sb;
+}
+double ts_sb_len(tsv sb){
+  if (sb_is_builder(sb)) return (double)ts_str_ptr_typed(sb)->len;
+  return (double)ts_str_len_typed(sb);
+}
+tsv ts_sb_finish(tsv sb){
+  if (!sb_is_builder(sb)) return sb;
+  ts_string* b = ts_str_ptr_typed(sb);
+  if ((b->flags & TS_STR_FLAG_ASCII) && !(b->flags & TS_STR_FLAG_UTF16) && b->len <= TS_SHORTSTR_MAX)
+    return ts_short_str_ascii(b->data, b->len);
+  b->flags &= ~TS_STR_FLAG_BUFFER;
+  b->hash = 0;
+  return sb;
+}
 /* for..of over a value its type does not classify (docs/array_iterators_design.md).
    An array is walked by index (returned as is); a string by code points (a
    snapshot: strings are immutable); anything else through GetIterator: its
