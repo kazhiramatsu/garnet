@@ -8009,6 +8009,36 @@ fn stack_closures_enabled() -> bool {
     })
 }
 
+/// The guard of a typed class-field access (a struct offset): a receiver
+/// without the sized-instance layout takes ts_get / ts_set
+/// (docs/foreign_receivers_design.md). TSAOT_TYPED_SLOW=0 keeps the Proxy-only
+/// guard of the frozen emitter (parity oracle).
+fn typed_slow_guard(obj: &str) -> String {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_TYPED_SLOW").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    });
+    if on {
+        format!("g_typed_slow && ts_typed_slow({})", obj)
+    } else {
+        format!("g_has_proxies && ts_is_proxy({})", obj)
+    }
+}
+
+/// The program's own prototype relink (it may put a class with struct fields
+/// behind an object without the layout); the frozen emitter's ts_set_proto
+/// under TSAOT_TYPED_SLOW=0.
+fn user_set_proto_fn() -> &'static str {
+    if typed_slow_guard("x").starts_with("g_typed_slow") {
+        "ts_set_proto_user"
+    } else {
+        "ts_set_proto"
+    }
+}
+
 /// TSAOT_STACK_CHECK=1: every `Stack` allocation goes to the runtime's
 /// quarantine and dies with its activation (docs/stack_check_design.md); the
 /// generated C must be compiled with -DTSAOT_STACK_CHECK.
@@ -10159,7 +10189,7 @@ fn fnval_adapter_body(builtin: &str) -> Option<String> {
         "object.assign" => Some("return ts_object_assign(a, n);".to_string()),
         "object.create" => hv(format!("ts_object_create({})", val(0))),
         "object.getPrototypeOf" => hv(format!("ts_get_proto({})", val(0))),
-        "object.setPrototypeOf" => hv(format!("ts_set_proto({}, {})", val(0), val(1))),
+        "object.setPrototypeOf" => hv(format!("{}({}, {})", user_set_proto_fn(), val(0), val(1))),
         "object.keys" => hv(format!("ts_object_keys({})", val(0))),
         "object.forInKeys" => hv(format!("ts_object_for_in_keys({})", val(0))),
         "object.getOwnPropertyNames" => hv(format!("ts_object_get_own_property_names({})", val(0))),
@@ -18393,7 +18423,10 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             s.push_str(&ctx.set_val(dst.0, &format!("ts_get_proto({})", ctx.val(obj.0))));
         }
         Inst::SetProto { dst, obj, proto } => {
-            let call = format!("ts_set_proto({}, {})", ctx.val(obj.0), ctx.val(proto.0));
+            // A SetProto with a result is the program's Object.setPrototypeOf;
+            // the class setup's links have none (see ts_set_proto_user).
+            let f = if dst.is_some() { user_set_proto_fn() } else { "ts_set_proto" };
+            let call = format!("{}({}, {})", f, ctx.val(obj.0), ctx.val(proto.0));
             match dst {
                 Some(d) => s.push_str(&ctx.set_val(d.0, &call)),
                 None => {
@@ -18450,16 +18483,17 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     let cn = struct_name(c);
                     let obj_name = ctx.vname(obj.0);
                     let st = format!("((({}*)ts_ptr({}))->{})", cn, obj_name, off);
-                    // A method dispatched on a Proxy receiver gets this=proxy, which
-                    // is NOT a struct of class `c`; route `this.field` through ts_get
-                    // (honoring traps) in that case. The g_has_proxies gate keeps the
-                    // direct struct path for all non-proxy programs (zero cost when
-                    // no Proxy is ever created).
+                    // A receiver that is NOT a struct of class `c` (a Proxy, a
+                    // plain object relinked behind the class prototype, a borrowed
+                    // method's this) routes `this.field` through ts_get. The
+                    // g_typed_slow gate keeps the direct struct path for every
+                    // program that never creates one.
+                    let guard = typed_slow_guard(&obj_name);
                     if numeric_field(c, field.0, ctx.classes) {
-                        let e = format!("((g_has_proxies && ts_is_proxy({0})) ? ts_to_num(ts_get({0}, {1})) : {2})", obj_name, field.0, st);
+                        let e = format!("(({3}) ? ts_to_num(ts_get({0}, {1})) : {2})", obj_name, field.0, st, guard);
                         s.push_str(&ctx.set_num(dst.0, &e));
                     } else {
-                        let e = format!("((g_has_proxies && ts_is_proxy({0})) ? ts_get({0}, {1}) : {2})", obj_name, field.0, st);
+                        let e = format!("(({3}) ? ts_get({0}, {1}) : {2})", obj_name, field.0, st, guard);
                         s.push_str(&ctx.set_val(dst.0, &e));
                     }
                     return;
@@ -18615,11 +18649,10 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     let is_num = numeric_field(c, field.0, ctx.classes);
                     // numeric field stores a raw double; otherwise a boxed tsv
                     let rhs = if is_num { ctx.num(src.0) } else { ctx.val(src.0) };
-                    // A method dispatched on a Proxy receiver gets this=proxy; route
-                    // `this.field = v` through ts_set (honoring traps) in that case.
-                    // The g_has_proxies gate keeps the direct struct store otherwise.
+                    // A receiver that is not a struct of class `c` routes
+                    // `this.field = v` through ts_set (see the read above).
                     let obj_name = ctx.vname(obj.0);
-                    let _ = writeln!(s, "  if (g_has_proxies && ts_is_proxy({0})) {{ ts_set({0}, {1}, {2}); }} else {{", obj_name, field.0, ctx.val(src.0));
+                    let _ = writeln!(s, "  if ({3}) {{ ts_set({0}, {1}, {2}); }} else {{", obj_name, field.0, ctx.val(src.0), typed_slow_guard(&obj_name));
                     let _ = writeln!(s, "    (({}*)ts_ptr({}))->{} = {};", cn, obj_name, off, rhs);
                     if !is_num {
                         let _ = writeln!(s, "    ts_write_barrier({}, {});", obj_name, rhs);

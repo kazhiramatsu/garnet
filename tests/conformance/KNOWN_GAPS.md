@@ -107,3 +107,20 @@ for arrows/methods/async/generators/non-functions. Remaining gaps:
   (`Child.prototype = Object.create(Base.prototype)`), `Base.call(this)`
   chaining, `new.target`. The `new x()` path constructs through
   ts_construct, so these fail loudly where unsupported, not silently.
+- **Class methods on foreign receivers, the two uncovered shapes**
+  (docs/foreign_receivers_design.md): a typed field access in a class method
+  reads a struct offset. Relinked objects (`Object.create`, `setPrototypeOf`,
+  `__proto__`) and borrowed methods (`call` / `apply` / `bind` /
+  `Reflect.apply`) raise the guard and take the dynamic path; two shapes do
+  not: a method grafted onto a plain object and called through it
+  (`o.m = C.prototype.m; o.m()`), and a method borrowed onto a sized instance
+  of an UNRELATED class (the guard tests the layout's presence, not its
+  class). Both read the wrong offset silently.
+- **`extends` of a class through a value**: `const B = Vec; class S extends B
+  {}` and a class expression extending a parameter (`(B: typeof Vec) =>
+  class extends B {}`) construct instances whose inherited methods are
+  missing: `TypeError: setX is not a function` (loud, catchable).
+- **`__proto__` accessor (Annex B)**: `o.__proto__ = P` stores an own
+  property named `__proto__` instead of relinking, and reading it does not
+  return the prototype (silent; use `Object.setPrototypeOf` /
+  `Object.getPrototypeOf`).

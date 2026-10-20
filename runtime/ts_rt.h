@@ -423,6 +423,15 @@ static inline tsv* ts_obj_slot_ptr(ts_object* o, uint32_t slot){
 static inline int ts_obj_is_sized(const ts_object* o){
   return o->h.kind == TS_KIND_OBJECT && o->h.size != sizeof(ts_object) + sizeof(tsv) * (size_t)o->h.inline_cap;
 }
+/* A typed class-field access (a struct offset) must take ts_get / ts_set for a
+   receiver without the sized-instance layout: a Proxy, a plain object relinked
+   behind a class prototype, a borrowed method's `this`. g_typed_slow, raised
+   where such a receiver can arise, gates the test so a program that never does
+   any of that keeps one predictable branch (docs/foreign_receivers_design.md). */
+extern int g_typed_slow;
+static inline int ts_typed_slow(tsv v){
+  return !ts_is_obj(v) || !ts_obj_is_sized((const ts_object*)ts_ptr(v));
+}
 
 enum {
   TS_STR_FLAG_ASCII = 1u << 0,
@@ -913,6 +922,7 @@ tsv  ts_objproto_isPrototypeOf(tsv* args, int n);
 tsv  ts_objproto_propertyIsEnumerable(tsv* args, int n);
 tsv  ts_get_proto(tsv obj);            /* Object.getPrototypeOf: returns proto or null */
 tsv  ts_set_proto(tsv obj, tsv proto); /* Object.setPrototypeOf: relinks proto, returns obj */
+tsv  ts_set_proto_user(tsv obj, tsv proto); /* Object/Reflect.setPrototypeOf: may raise g_typed_slow */
 /* Built-in Error family: shared prototype objects + instance constructor so that
    `new Error()` / thrown errors are `instanceof Error` and inherit `name`.
    kind: 0=Error 1=TypeError 2=RangeError 3=SyntaxError 4=ReferenceError

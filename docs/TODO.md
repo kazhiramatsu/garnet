@@ -6086,6 +6086,40 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   per compile. The default runtime's machine code is identical and the
   default emission unchanged (parity identical), so no A/B. Gates: unit
   (with the new test), parity, bundler, conformance, GC stress.
+- Foreign receivers of typed class-field accesses (build `x55`, full
+  build; emitter, runtime; `docs/foreign_receivers_design.md`; the (6b)
+  item of the list below). A typed class-field access is a struct offset
+  and assumed a sized instance; plain objects reach it through ordinary
+  JavaScript, all silent: `Object.create(C.prototype)` then `p.x = 5;
+  p.sum()` read 0 (V8 11); `Object.setPrototypeOf({ y: 9, x: 8 },
+  C.prototype).getX()` read the literal's first slot (9); `C.prototype.getX
+  .call({ y: 60, x: 50 })` read 60, and `C.prototype.setX.call({}, 42)`
+  wrote past the end of an empty object's cell. The three emitted guards
+  now test `g_typed_slow && ts_typed_slow(x)` (a Proxy or an object without
+  the sized-instance layout takes ts_get / ts_set; `TSAOT_TYPED_SLOW=0`
+  keeps the Proxy-only text for the parity oracle), and the one-way flag
+  is raised only where such a receiver can arise: a Proxy; a user-level
+  relink (`ts_set_proto_user`: the `SetProto` with a result, the
+  `setPrototypeOf` value, `Reflect.setPrototypeOf`) or `Object.create`
+  that puts a registered class with struct fields behind an object
+  without the layout; `call` / `apply` / `bind` / `Reflect.apply` of a
+  method of such a class (code pointers collected at registration) with a
+  `this` without the layout. The class setup keeps `ts_set_proto`: the
+  first build checked inside it, and the compiler's module init (a class
+  extending a value, linked at run time) raised the flag, so every typed
+  field access of the compiler took the layout test: A/B 5% slower
+  (4.902 vs 4.646 s); a watchpoint on the flag found it. Not covered (in
+  `KNOWN_GAPS.md`): a grafted method called through a plain object, a
+  method borrowed onto an unrelated class's instance; also recorded there,
+  both older than this slice: `o.__proto__ = P` is an own property (no
+  Annex B accessor), and `extends` of a class through a value or a
+  parameter loses the inherited methods (loud TypeError). Fixture
+  `classes/foreign_receivers` (garbage, lost writes before the change).
+  Gates all green (parity: the new fixture is a known diff, the frozen
+  emitter's loop-stack struct). The flag stays down for the whole compile
+  of the compiler (watchpoint). A/B against `x53`, two rounds of three
+  alternating runs: 4.668 vs 4.673 s and 4.691 vs 4.700 s median: neutral
+  (desktop load: Node 3.46 s, 1.35x).
 - Next slices, in order. A slice that extends the stack or an arena to a
   new kind of allocation runs the conformance suite and a compile of the
   compiler under `--stack-check` (an arena must allocate through the
@@ -6114,11 +6148,10 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   (`Type`, `Signature`, `NodeLinks`). (4) The remaining 2,319 dynamic
   method sites. (5) Precision for the out-of-line
   named-property writes of the remembered set. (6) The coroutine frame,
-  dead capture cells, the nursery sweep's per-cell work — small. (6b)
-  `Object.setPrototypeOf(plain, C.prototype)` followed by a typed method
-  call still reads struct offsets the cell lacks (the builtin shares
-  `ts_set_proto` with the class setup); a user-facing entry that rejects
-  it loudly, or sized-instance semantics for relinked objects, is open. (7) The
+  dead capture cells, the nursery sweep's per-cell work — small. (6b) The
+  foreign-receiver shapes `x55` left (`KNOWN_GAPS.md`): grafted methods,
+  borrowing onto an unrelated class, the `__proto__` accessor, `extends`
+  through a value. (7) The
   remaining pattern gaps: small calls with object arguments 4.3x, array
   callbacks 3.9x, flags 3.9x, links objects 3.2x, constructors through
   function values 2.7x, arrays of objects 2.7x; constructor pre-sizing

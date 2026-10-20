@@ -950,6 +950,12 @@ void ts_object_proto_register(ts_key method_key, const char* name, ts_code fn){
    (string/symbol) so the same code serves both the named (key) and computed
    (keyv) entry points; ts_key_to_value reconstructs the value from a ts_key. */
 int g_has_proxies = 0;   /* declared in ts_rt.h; see ts_is_proxy there */
+int g_typed_slow = 0;    /* declared in ts_rt.h; see ts_typed_slow there */
+static void typed_slow_check_relink(tsv obj, tsv proto);
+static void typed_slow_check_borrow(tsv fn, tsv thisArg);
+static void struct_methods_collect(tsv proto);
+struct ts_class_reg;
+static struct ts_class_reg* class_reg_for_proto(tsv proto);
 /* Property-addition cache epoch (see prop_add_* near ts_set_pic). Bumped by
    anything that can change the result of an uncached add: accessor
    definitions, prototype relinks, class registrations and full collections
@@ -999,6 +1005,15 @@ tsv ts_set_proto(tsv obj, tsv proto){
     prop_add_epoch_bump();
   }
   return obj;
+}
+/* The user-level relink (Object.setPrototypeOf, Reflect.setPrototypeOf): the
+   class setup, which links prototypes the same way, keeps ts_set_proto, so
+   only a program's own relink of an object behind a class with struct fields
+   raises g_typed_slow (docs/foreign_receivers_design.md). */
+tsv ts_set_proto_user(tsv obj, tsv proto){
+  tsv r = ts_set_proto(obj, proto);
+  if (!g_typed_slow && !(g_has_proxies && ts_is_proxy(obj))) typed_slow_check_relink(obj, proto);
+  return r;
 }
 
 /* ---- first-class callable values (methods + closures) ---- */
@@ -2142,7 +2157,10 @@ tsv ts_object_create(tsv proto){
      (`(Object.create(C.prototype) as C).m()`) still assumes the layout the
      cell lacks — an open hazard noted in docs/TODO.md (Session 350). */
   tsv o = ts_new_proto();                 /* bare object: proto=NULL */
-  if (ts_is_propbag(proto)) ((ts_object*)ts_ptr(o))->proto = proto;
+  if (ts_is_propbag(proto)){
+    ((ts_object*)ts_ptr(o))->proto = proto;
+    if (!g_typed_slow) typed_slow_check_relink(o, proto);
+  }
   return o;                               /* Object.create(null) keeps proto=NULL */
 }
 /* bit0=frozen, bit1=non-extensible, bit2=sealed. seal/freeze imply
@@ -9189,6 +9207,7 @@ void ts_register_class(tsv proto, ts_class_field* fields, int nfields){
   class_reg_index_put((uint32_t)g_class_reg_len);
   g_class_reg_len++;
   g_has_class_regs = 1;
+  struct_methods_collect(proto);
 }
 
 /* Class VALUE support: per-class-id instance size + prototype, so a runtime
@@ -9364,6 +9383,72 @@ tsv ts_construct(tsv ctorv, tsv* args, int n){
   }
   ts_gc_unroot(2);
   return ts_is_obj(r) ? r : inst;
+}
+/* ---- foreign receivers of typed class-field accesses
+   (docs/foreign_receivers_design.md) ---- */
+/* A prototype chain that carries a registered class with struct fields. */
+static int proto_chain_has_struct_class(tsv proto){
+  for (int depth = 0; depth < 64 && ts_proto_ref(proto); depth++){
+    ts_class_reg* reg = class_reg_for_proto(proto);
+    if (reg && reg->min_size > sizeof(ts_object)) return 1;
+    proto = ((ts_object*)ts_ptr(proto))->proto;
+  }
+  return 0;
+}
+/* The code of the methods on registered class prototypes whose chain has
+   struct fields: borrowing one with a `this` without the layout raises the
+   flag. An open-addressing set of code pointers, filled at registration. */
+static void** g_struct_methods;
+static uint32_t g_struct_methods_cap, g_struct_methods_len;
+static uint32_t struct_method_hash(void* code){
+  uint64_t x = (uint64_t)(uintptr_t)code;
+  return (uint32_t)((x >> 4) ^ (x >> 20)) * 2654435761u;
+}
+static int struct_method_has(void* code){
+  if (!g_struct_methods_len || !code) return 0;
+  uint32_t mask = g_struct_methods_cap - 1u;
+  for (uint32_t i = struct_method_hash(code) & mask; g_struct_methods[i]; i = (i + 1u) & mask)
+    if (g_struct_methods[i] == code) return 1;
+  return 0;
+}
+static void struct_method_add(void* code){
+  if (!code || struct_method_has(code)) return;
+  if ((g_struct_methods_len + 1u) * 4u >= g_struct_methods_cap * 3u){
+    uint32_t cap = g_struct_methods_cap ? g_struct_methods_cap * 2u : 64u;
+    void** old = g_struct_methods; uint32_t oldcap = g_struct_methods_cap;
+    g_struct_methods = (void**)calloc(cap, sizeof(void*));
+    g_struct_methods_cap = cap;
+    for (uint32_t i = 0; i < oldcap; i++) if (old[i]){
+      uint32_t j = struct_method_hash(old[i]) & (cap - 1u);
+      while (g_struct_methods[j]) j = (j + 1u) & (cap - 1u);
+      g_struct_methods[j] = old[i];
+    }
+    free(old);
+  }
+  uint32_t mask = g_struct_methods_cap - 1u, i = struct_method_hash(code) & mask;
+  while (g_struct_methods[i]) i = (i + 1u) & mask;
+  g_struct_methods[i] = code;
+  g_struct_methods_len++;
+}
+static uint32_t propbag_len(tsv owner);
+static ts_pref propbag_prop(tsv owner, uint32_t i);
+static void struct_methods_collect(tsv proto){
+  if (!proto_chain_has_struct_class(proto)) return;
+  uint32_t n = propbag_len(proto);
+  for (uint32_t i = 0; i < n; i++){
+    ts_pref pr = propbag_prop(proto, i);
+    if (!pref_ok(pr) || pref_is_accessor(pr)) continue;
+    tsv v = pref_val(pr);
+    if (ts_is_func(v)) struct_method_add(((ts_func*)ts_ptr(v))->code);
+  }
+}
+static void typed_slow_check_relink(tsv obj, tsv proto){
+  if (!g_has_class_regs || !ts_is_obj(obj) || !ts_typed_slow(obj)) return;
+  if (proto_chain_has_struct_class(proto)) g_typed_slow = 1;
+}
+static void typed_slow_check_borrow(tsv fn, tsv thisArg){
+  if (!g_struct_methods_len || !ts_is_func(fn) || !ts_typed_slow(thisArg)) return;
+  if (struct_method_has(((ts_func*)ts_ptr(fn))->code)) g_typed_slow = 1;
 }
 static ts_class_reg* class_reg_for_proto(tsv proto){
   if (!ts_proto_ref(proto) || !g_class_reg_index_cap) return NULL;
@@ -11441,6 +11526,7 @@ void ts_headers_proto_register(ts_key method_key, const char* name, ts_code fn){
 static tsv invoke_with_this(tsv fn, tsv thisArg, tsv* callArgs, int nCall){
   if (g_has_proxies && ts_is_proxy(fn)) return ts_proxy_apply(fn, thisArg, callArgs, nCall);
   if (!ts_is_func(fn))ts_throw_not_a_function(NULL);
+  if (!g_typed_slow) typed_slow_check_borrow(fn, thisArg);
   ts_gc_root(&fn); ts_gc_root(&thisArg);
   ts_func* f = ts_ptr(fn);
   int n = nCall + (f->takes_this ? 1 : 0);
@@ -11499,6 +11585,7 @@ tsv ts_bound_thunk(tsv* args, int n){
 tsv ts_funcproto_bind(tsv* args, int n){
   tsv fn = (n>0)?args[0]:TS_UNDEFINED;
   tsv thisArg = (n>1)?args[1]:TS_UNDEFINED;
+  if (!g_typed_slow) typed_slow_check_borrow(fn, thisArg);
   int npart = (n>2)?(n-2):0;
   uint32_t envlen = 2 + (uint32_t)npart;   /* [target, thisArg, partial...] */
   tsv* env = malloc(sizeof(tsv)*envlen);
@@ -12227,7 +12314,7 @@ tsv ts_reflect_delete(tsv t, tsv k){
   ts_gc_unroot(1);
   return ts_bool(r);
 }
-tsv ts_reflect_set_proto(tsv t, tsv p){ ts_set_proto(t, p); return ts_bool(1); }
+tsv ts_reflect_set_proto(tsv t, tsv p){ ts_set_proto_user(t, p); return ts_bool(1); }
 tsv ts_reflect_define_property(tsv t, tsv k, tsv d){ ts_define_property(t, k, d); return ts_bool(1); }
 tsv ts_reflect_prevent_extensions(tsv t){ ts_object_prevent_extensions(t); return ts_bool(1); }
 /* Reflect.ownKeys: all own string keys (incl. non-enumerable, in spec order)
@@ -12318,6 +12405,7 @@ tsv ts_proxy_new(tsv target, tsv handler){
   tsv pv = ts_obj(px);
   ts_write_barrier(pv, target); ts_write_barrier(pv, handler);
   g_has_proxies = 1;
+  g_typed_slow = 1;
   ts_gc_unroot(2);
   return pv;
 }
