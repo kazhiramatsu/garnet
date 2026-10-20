@@ -40,8 +40,10 @@ enum Obj {
     /// Phantom: the contents of a parameter object's field (caller-provided).
     ParamField(LocalId, FieldKey),
     /// Phantom: anything reachable from a parameter object two or more loads
-    /// deep (`p.f.g`, `p[0].list`); one node per parameter, the path is lost.
-    ParamDeep(LocalId),
+    /// deep under its field f (`p.f.g`, `p[0].list` under Elem); one node per
+    /// (parameter, first field), the rest of the path is lost. Its escape is
+    /// reported as the escape of the field's contents (`field_global`).
+    ParamDeep(LocalId, FieldKey),
     External,
     /// Collapsed callee internals introduced at a call site.
     Opaque(u32),
@@ -103,7 +105,7 @@ impl Solver {
     /// precision only told ArgEscape from GlobalEscape, which the emitter does
     /// not distinguish (no caller arena).
     fn captured_contents(&self, o: Obj) -> bool {
-        phantoms_enabled() && matches!(o, Obj::ParamField(_, _) | Obj::ParamDeep(_))
+        phantoms_enabled() && matches!(o, Obj::ParamField(_, _) | Obj::ParamDeep(_, _))
     }
     fn solve(&mut self, cs: &[C]) {
         let mut changed = true;
@@ -127,9 +129,9 @@ impl Solver {
                                 Obj::Param(p) => {
                                     acc.insert(Obj::ParamField(p, f));
                                 }
-                                // Two or more loads deep: one node per parameter.
-                                Obj::ParamField(p, _) | Obj::ParamDeep(p) if phantoms => {
-                                    acc.insert(Obj::ParamDeep(p));
+                                // Two or more loads deep: one node per (parameter, first field).
+                                Obj::ParamField(p, f0) | Obj::ParamDeep(p, f0) if phantoms => {
+                                    acc.insert(Obj::ParamDeep(p, f0));
                                 }
                                 // The contents of an external object are external.
                                 Obj::External if phantoms => {
@@ -291,9 +293,6 @@ struct Summary {
     /// Some object of the callee's own (a site or a callee's callee's internals)
     /// is reachable from the global sink: the caller's opaque node is global.
     internal_global: bool,
-    /// Parameters whose contents two or more loads deep reach the global sink
-    /// (the path is lost, so the caller marks the whole actual global).
-    deep_global: BTreeSet<usize>,
     /// The summary keeps only the edges that touch a parameter or the return;
     /// the caller reads the internals of the opaque node as external.
     compact: bool,
@@ -317,7 +316,6 @@ impl Summary {
             field_global: BTreeSet::new(),
             field_ret: BTreeSet::new(),
             internal_global: false,
-            deep_global: BTreeSet::new(),
             compact: false,
         }
     }
@@ -542,24 +540,30 @@ fn build_constraints(f: &Function, summaries: &[Option<Summary>], facts: &Facts)
                 }
             }
             Inst::Copy { dst, src } => cs.push(C::Copy(Ref::Local(dst), Ref::Local(src))),
-            Inst::LoadField { dst, obj, field, .. } => cs.push(C::Load(
-                Ref::Local(dst),
-                Ref::Local(obj),
-                FieldKey::Named(field),
-            )),
+            // A load into a primitive-kind local (a `number` field, typed mode)
+            // carries no reference: no phantom, no escape through it.
+            Inst::LoadField { dst, obj, field, .. } => {
+                if is_ref(dst) || !phantoms_enabled() {
+                    cs.push(C::Load(Ref::Local(dst), Ref::Local(obj), FieldKey::Named(field)))
+                }
+            }
             Inst::StoreField { obj, field, src, .. } => cs.push(C::Store(
                 Ref::Local(obj),
                 FieldKey::Named(field),
                 Ref::Local(src),
             )),
             Inst::LoadElem { dst, arr } => {
-                cs.push(C::Load(Ref::Local(dst), Ref::Local(arr), FieldKey::Elem))
+                if is_ref(dst) || !phantoms_enabled() {
+                    cs.push(C::Load(Ref::Local(dst), Ref::Local(arr), FieldKey::Elem))
+                }
             }
             Inst::StoreElem { arr, src } => {
                 cs.push(C::Store(Ref::Local(arr), FieldKey::Elem, Ref::Local(src)))
             }
             Inst::LoadIndex { dst, arr, .. } => {
-                cs.push(C::Load(Ref::Local(dst), Ref::Local(arr), FieldKey::Elem))
+                if is_ref(dst) || !phantoms_enabled() {
+                    cs.push(C::Load(Ref::Local(dst), Ref::Local(arr), FieldKey::Elem))
+                }
             }
             Inst::StoreIndex { arr, src, .. } => {
                 cs.push(C::Store(Ref::Local(arr), FieldKey::Elem, Ref::Local(src)))
@@ -832,11 +836,6 @@ fn apply_summary(
     if sum.internal_global {
         cs.push(C::AddrField(Obj::External, FieldKey::Dynamic, op));
     }
-    for &i in &sum.deep_global {
-        if i < actuals.len() && is_ref(actuals[i]) {
-            cs.push(C::Copy(Ref::Global, Ref::Local(actuals[i])));
-        }
-    }
 
     for i in 0..sum.nparams {
         if sum.param_global[i] && i < actuals.len() && is_ref(actuals[i]) {
@@ -1014,8 +1013,8 @@ fn extract_summary(f: &Function, solver: &Solver, compact: bool) -> Summary {
     let map = |o: Obj| -> SObj {
         match o {
             Obj::Site(_) | Obj::Opaque(_) => SObj::Internal,
-            Obj::ParamField(_, _) | Obj::ParamDeep(_) if phantoms => SObj::External,
-            Obj::ParamField(_, _) | Obj::ParamDeep(_) => SObj::Internal,
+            Obj::ParamField(_, _) | Obj::ParamDeep(_, _) if phantoms => SObj::External,
+            Obj::ParamField(_, _) | Obj::ParamDeep(_, _) => SObj::Internal,
             Obj::External => SObj::External,
             Obj::Param(p) => SObj::Param(*param_index.get(&p).unwrap_or(&usize::MAX)),
         }
@@ -1040,16 +1039,11 @@ fn extract_summary(f: &Function, solver: &Solver, compact: bool) -> Summary {
 
     let mut field_global = BTreeSet::new();
     let mut field_ret = BTreeSet::new();
-    let mut deep_global = BTreeSet::new();
     for o in global.iter() {
-        if let Obj::ParamField(p, fk) = o {
+        // the deep contents under a field escaping means the field's contents do
+        if let Obj::ParamField(p, fk) | Obj::ParamDeep(p, fk) = o {
             if let Some(i) = param_index.get(p) {
                 field_global.insert((*i, *fk));
-            }
-        }
-        if let Obj::ParamDeep(p) = o {
-            if let Some(i) = param_index.get(p) {
-                deep_global.insert(*i);
             }
         }
     }
@@ -1119,7 +1113,6 @@ fn extract_summary(f: &Function, solver: &Solver, compact: bool) -> Summary {
         field_global,
         field_ret,
         internal_global,
-        deep_global,
         compact,
     }
 }

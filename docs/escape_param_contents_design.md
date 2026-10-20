@@ -77,3 +77,30 @@ callee's escaping arrays and its non-escaping inner closure into one node),
 no site Stack -> Heap with a nonzero count; arrays and cells unchanged.
 Analysis of the compiler 2.8 s -> 8.8 s. The compiler A/B (`x48` against
 `x47`) is in the TODO entry.
+
+## Refinement: deep phantoms per field, loads into primitives (`x52`)
+
+Probing the stack-record fixture (`x51`) showed a closure that reads a
+captured object's numeric field (`last ? last.v : 0`) sending the whole
+record to the heap: the two-deep phantom carried no path, so its escape
+(the `+` materialization of a loaded operand marks it global) was
+reported as the escape of the entire parameter (`deep_global`), and the
+record captured by the closure became global at creation. Two changes:
+
+- `ParamDeep(p, f)` is one node per (parameter, first field): a load from
+  `ParamField(p, f)` or from `ParamDeep(p, f)` yields `ParamDeep(p, f)`,
+  and its escape is reported as the escape of the field's contents
+  (`field_global (i, f)`), which the caller translates as a load of the
+  actual's field plus a copy to the sink: the contents of `rec.last` go
+  global, the record does not. The path below the first field is still
+  lost, and stores into any phantom still go to the global sink.
+- A load into a primitive-kind local (a `number` field in typed mode)
+  carries no reference and emits no constraint, so no phantom is created
+  for it at all; the old mode keeps the constraint.
+
+Decision report, count-weighted: records a further 64k per compile Heap
+-> Stack (`getSignatureApplicabilityError` 57k), arrays 101k Heap ->
+FrameArena and 44k Heap -> CallerArena (`[type, missingOrUndefined]` in
+`getOptionalType`, `[mapped]` in `mapType`: now `NoEscape` / `ArgEscape`,
+still heap allocations until arrays have a stack or arena form), closures
+unchanged. Analysis of the compiler unchanged (27 s).

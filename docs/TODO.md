@@ -5996,6 +5996,28 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   -0.5%): neutral; the records were cheap bump allocations and the stack
   version initializes the struct per call. Kept for the million fewer
   allocations per compile. Node 3.24-3.25 s (1.38x).
+- Deep phantoms per field, loads into primitives (build `x52`, full build;
+  analyzer; appended to `docs/escape_param_contents_design.md`). Probing
+  the stack-record fixture showed a closure that reads a captured object's
+  numeric field (`last ? last.v : 0`) sending the whole record to the
+  heap: the two-deep phantom carried no path, so its escape (the `+`
+  materialization marks a loaded operand global) was reported as the
+  escape of the entire parameter (`deep_global`) and the record captured
+  by the closure went global at creation. `ParamDeep` is now one node per
+  (parameter, first field) whose escape is reported as `field_global` of
+  that field (the contents of `rec.last` go global, the record does not),
+  and a load into a primitive-kind local emits no constraint at all. All
+  lifetime fixtures and the probe variants unchanged or improved; the old
+  mode's decision report byte-identical. Decision report, count-weighted:
+  records a further 64k per compile Heap -> Stack, arrays 101k Heap ->
+  FrameArena and 44k Heap -> CallerArena (`[type, missingOrUndefined]`,
+  `[mapped]`: NoEscape / ArgEscape now, still heap allocations until
+  arrays have a stack or arena form). Gates all green. Statistics: all
+  allocations 13.27M -> 13.20M per compile (plain objects 4.85M -> 4.79M),
+  minor collections 291 -> 290.
+  A/B against `x51`, two rounds of three alternating runs: 4.571 vs 4.542 s
+  and 4.570 vs 4.550 s median (pairs -0.4% to +1.0%): neutral within the
+  noise, kept for the precision. Node 3.31 s (1.38x).
 - Next slices, in order. (0) External element buffers (the malloc'd
   `data` of arrays, also strings' and maps' buffers) do not count toward
   the collector's trigger: a loop that drops large arrays grows without
