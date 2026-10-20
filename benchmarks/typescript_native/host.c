@@ -23,14 +23,23 @@ static tsv host_write(tsv* a, int n){
   if (fwrite(bytes, 1, length, stdout) != length) { free(bytes); ts_throw_type_error_msg("stdout write failed"); }
   free(bytes); return TS_UNDEFINED;
 }
+/* open / fstat / read, as Node's readFileSync: the stdio size probe
+   (fseek to the end, ftell, rewind) cost more than the reads. */
 static tsv host_read(tsv* a, int n){
-  char* path = text(arg(a,n,0)); FILE* file = fopen(path, "rb"); free(path);
-  if (!file) return TS_UNDEFINED;
-  if (fseek(file,0,SEEK_END)) { fclose(file); return TS_UNDEFINED; }
-  long size = ftell(file); rewind(file);
-  if (size < 0 || (unsigned long)size > UINT32_MAX) { fclose(file); return TS_UNDEFINED; }
-  unsigned char* bytes = malloc((size_t)size + 1);
-  size_t length = fread(bytes,1,(size_t)size,file); int failed = ferror(file); fclose(file);
+  char* path = text(arg(a,n,0)); int fd = open(path, O_RDONLY); free(path);
+  if (fd < 0) return TS_UNDEFINED;
+  struct stat st;
+  if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size < 0 || (unsigned long long)st.st_size > UINT32_MAX) { close(fd); return TS_UNDEFINED; }
+  size_t size = (size_t)st.st_size;
+  unsigned char* bytes = malloc(size + 1);
+  size_t length = 0; int failed = 0;
+  while (length < size){
+    ssize_t got = read(fd, bytes + length, size - length);
+    if (got < 0){ if (errno == EINTR) continue; failed = 1; break; }
+    if (got == 0) break;
+    length += (size_t)got;
+  }
+  close(fd);
   if (failed) { free(bytes); return TS_UNDEFINED; }
   tsv result;
   if (length >= 2 && ((bytes[0] == 0xff && bytes[1] == 0xfe) || (bytes[0] == 0xfe && bytes[1] == 0xff))) {

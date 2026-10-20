@@ -80,6 +80,7 @@ while IFS= read -r name; do
     ts_set_pic_try | \
     ts_str_charcodeat_typed | \
     ts_strict_eq | \
+    ts_eq_strlit | \
     ts_truthy_fast | \
     ts_to_int32 | \
     ts_to_uint32) ;;

@@ -6424,6 +6424,28 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   written string); `charCodeAt` on views and UTF-16 strings through the
   general path (1%); `firstOrUndefinedIterator`'s iterator steps (0.9%);
   `getRelationKey`'s template concatenation (0.7%).
+- Strict equality against string literals; the host's file reads (build
+  `x69`, full build; emitter, runtime, host; `docs/string_switch_chains_design.md`).
+  A per-function comparison with V8 (`node --cpu-prof` against `sample`,
+  runtime frames charged to the generated caller, collections separate)
+  listed `getCannotFindNameDiagnosticForName` (a thirty-label string
+  `switch` run for every resolved identifier) at 26 ms against 6 ms and
+  `readFile` at 47 ms against 8 ms (20 ms in `fseek`). `x === "lit"` with
+  a string constant now renders the inline `ts_eq_strlit` (kind and length
+  first, the content only for an equal length; `TSAOT_STR_EQ_CONST=0` for
+  the parity oracle), and the host reads with `open` / `fstat` / `read`.
+  Fixture `strings/strict_eq_literals` (also under GC stress). Found on the
+  way: `Object(primitive)` returns the primitive (`KNOWN_GAPS.md`). Gates
+  all green (conformance 479/479). A/B against `x68`: 4.305 vs 4.291 s and
+  4.261 vs 4.264 s median: neutral.
+  Measured for Kaz: the compiler with collections disabled (thresholds
+  huge) is slower, 4.62 vs 4.55 s median at 2.6 GB (no promotion leaves
+  every object young, reached through the handle table, and 2.6 GB of
+  fresh pages are touched); so "without GC" is not a baseline in this
+  design. From the profile, collections are about 7% of a compile; the
+  rest is about 4.0 s against V8's 3.2 s (1.25x). Direction (Kaz): the
+  collector needs a fundamental redesign later (the handle indirection of
+  young objects belongs to it); first the non-GC work beats V8.
 - Next slices, in order. A slice that extends the stack or an arena to a
   new kind of allocation runs the conformance suite and a compile of the
   compiler under `--stack-check` (an arena must allocate through the

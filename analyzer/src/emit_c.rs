@@ -1341,6 +1341,8 @@ struct Ctx<'a> {
     typeof_fusion: TypeofFusion,
     /// locals holding one `undefined`/`null`/boolean constant (see tag_consts_for)
     tag_consts: BTreeMap<u32, &'static str>,
+    /// locals holding one string constant: (static literal id, length in code units)
+    str_consts: BTreeMap<u32, (usize, u32)>,
     switch_plan: SwitchPlan,
     layouts: LayoutPlan,
     /// the root frame is linked only around slow paths (see lazy_frames_enabled)
@@ -1534,6 +1536,21 @@ impl<'a> Ctx<'a> {
             return None;
         }
         Some((x, t))
+    }
+    /// `a === b` with one side a string constant local: (other operand, the
+    /// literal's expression, its length) for ts_eq_strlit.
+    fn str_eq_operands(&self, a: u32, b: u32) -> Option<(u32, String, u32)> {
+        let (x, (id, len)) = if let Some(c) = self.str_consts.get(&b) {
+            (a, *c)
+        } else if let Some(c) = self.str_consts.get(&a) {
+            (b, *c)
+        } else {
+            return None;
+        };
+        if self.json_locals.contains(&x) || self.unboxed.contains(&x) || self.int_local.contains(&x) {
+            return None;
+        }
+        Some((x, format!("ts_str_v(&TS_STRLIT_{})", id), len))
     }
     /// Assignment of a direct entry's result, raw by the callee's return kind.
     fn set_call_result(&self, dst: &Option<LocalId>, call: &str, ret: RetKind) -> String {
@@ -6829,6 +6846,7 @@ fn emit_i64_function(
         known_methods,
         typeof_fusion,
         tag_consts: tag_consts_for(f),
+        str_consts: str_consts_for(f, static_strings),
         static_strings,
         string_metric_plan,
         string_materialization_plan,
@@ -7017,6 +7035,7 @@ fn emit_f64_function(
         known_methods,
         typeof_fusion,
         tag_consts: tag_consts_for(f),
+        str_consts: str_consts_for(f, static_strings),
         static_strings,
         string_metric_plan,
         string_materialization_plan,
@@ -7129,6 +7148,7 @@ fn emit_function(
             known_methods,
             typeof_fusion: typeof_fusion_plan(f),
             tag_consts: tag_consts_for(f),
+            str_consts: str_consts_for(f, static_strings),
             static_strings,
             string_metric_plan: None,
             string_materialization_plan: None,
@@ -7188,6 +7208,7 @@ fn emit_function(
             known_methods,
             typeof_fusion: typeof_fusion_plan(f),
             tag_consts: tag_consts_for(f),
+            str_consts: str_consts_for(f, static_strings),
             static_strings,
             string_metric_plan: None,
             string_materialization_plan: None,
@@ -7247,6 +7268,7 @@ fn emit_function(
             known_methods,
             typeof_fusion: typeof_fusion_plan(f),
             tag_consts: tag_consts_for(f),
+            str_consts: str_consts_for(f, static_strings),
             static_strings,
             string_metric_plan: None,
             string_materialization_plan: None,
@@ -7477,6 +7499,7 @@ fn emit_function(
         known_methods,
         typeof_fusion,
         tag_consts: tag_consts_for(f),
+        str_consts: str_consts_for(f, static_strings),
         static_strings,
         string_metric_plan,
         string_materialization_plan,
@@ -7800,6 +7823,61 @@ fn inline_index_enabled() -> bool {
 /// compare of the other operand (numbers and strings are excluded: NaN, -0 and
 /// string contents). Parameters and catch variables are defined outside the
 /// instruction stream and never qualify.
+/// `x === "literal"` (docs/string_switch_chains_design.md): a local whose every
+/// definition is the same string constant, as (static literal id, length).
+/// TSAOT_STR_EQ_CONST=0 keeps the generic strict equality (the parity oracle).
+fn str_eq_const_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_STR_EQ_CONST").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
+fn str_consts_for(f: &Function, static_strings: &BTreeMap<Vec<u16>, usize>) -> BTreeMap<u32, (usize, u32)> {
+    let mut out: BTreeMap<u32, (usize, u32)> = BTreeMap::new();
+    if !str_eq_const_enabled() {
+        return out;
+    }
+    let mut flat: Vec<&Inst> = Vec::new();
+    flatten_inst(&f.body, &mut flat);
+    let mut seen: BTreeMap<u32, Option<Vec<u16>>> = BTreeMap::new();
+    for inst in &flat {
+        if let Inst::TryCatch { catch_var: Some(c), .. } = inst {
+            seen.insert(c.0, None);
+        }
+        let Some(d) = inst_def(inst) else { continue };
+        let units: Option<Vec<u16>> = match inst {
+            Inst::Const { value: ConstVal::Str { value }, .. } => Some(str_units(value)),
+            Inst::Const { value: ConstVal::Str16 { units }, .. } => Some(units.clone()),
+            _ => None,
+        };
+        match seen.get(&d) {
+            None => {
+                seen.insert(d, units);
+            }
+            Some(prev) => {
+                if *prev != units {
+                    seen.insert(d, None);
+                }
+            }
+        }
+    }
+    for p in &f.params {
+        seen.insert(p.0, None);
+    }
+    for (d, units) in seen {
+        if let Some(u) = units {
+            if let Some(id) = static_strings.get(&u) {
+                out.insert(d, (*id, u.len() as u32));
+            }
+        }
+    }
+    out
+}
+
 fn tag_consts_for(f: &Function) -> BTreeMap<u32, &'static str> {
     let mut out: BTreeMap<u32, &'static str> = BTreeMap::new();
     if !tag_eq_enabled() {
@@ -20051,6 +20129,8 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         // undefined/null/booleans have one encoding each; a boxed
                         // number never carries one (ts_num canonicalizes NaN)
                         format!("({} == {})", ctx.val(x), t)
+                    } else if let Some((x, lit, len)) = ctx.str_eq_operands(lhs.0, rhs.0) {
+                        format!("ts_eq_strlit({}, {}, {}u)", ctx.val(x), lit, len)
                     } else {
                         format!("ts_strict_eq({}, {})", ctx.val(lhs.0), ctx.val(rhs.0))
                     }
@@ -20075,6 +20155,8 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         format!("({} != {})", l, r)
                     } else if let Some((x, t)) = ctx.tag_eq_operands(lhs.0, rhs.0) {
                         format!("({} != {})", ctx.val(x), t)
+                    } else if let Some((x, lit, len)) = ctx.str_eq_operands(lhs.0, rhs.0) {
+                        format!("(!ts_eq_strlit({}, {}, {}u))", ctx.val(x), lit, len)
                     } else {
                         format!("(!ts_strict_eq({}, {}))", ctx.val(lhs.0), ctx.val(rhs.0))
                     }

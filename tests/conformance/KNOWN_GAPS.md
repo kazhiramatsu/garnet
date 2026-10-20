@@ -137,3 +137,11 @@ them only if the generator is resumed). Arrays, strings, Map and Set
 iterators have no `return()` and are unaffected; typed loops over
 generators and iterators close as before.
 
+## Object(primitive) returns the primitive (Session 350, found at x69)
+
+`Object("x")`, `Object(5)`, `Object(true)` return the primitive itself instead
+of a wrapper object: `typeof Object("x")` is "string" (V8 "object") and
+`Object("x") === "x"` is true (V8 false). `new String(...)` and the other
+wrapper constructors are rejected at compile time; the call form is not.
+Planned: make the call form loud for primitives, or model the wrappers.
+

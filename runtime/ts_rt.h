@@ -1453,6 +1453,16 @@ TS_RT_ALWAYS_INLINE int ts_strict_eq(tsv a, tsv b){
   if (ts_is_str(a) && ts_is_str(b)) return ts_strict_eq_str(a, b);
   return 0;
 }
+/* `x === "literal"` (a static string of `len` code units): only a string of
+   that length can be equal, so other kinds and lengths answer in line and
+   only an equal length compares the content (string switch chains test a
+   value against dozens of labels). */
+TS_RT_ALWAYS_INLINE int ts_eq_strlit(tsv x, tsv lit, uint32_t len){
+  if (x == lit) return 1;
+  if (ts_is_heap_str(x)) return ts_str_ptr_typed(x)->len == len && ts_strict_eq_str(x, lit);
+  if (ts_is_short_str(x)) return ts_short_str_len(x) == len && ts_strict_eq_str(x, lit);
+  return 0;
+}
 int  ts_relational(tsv a, tsv b, int op);  /* 0:< 1:<= 2:> 3:>= */
 int  ts_loose_eq(tsv a, tsv b);            /* == (returns 1/0) */
 int  ts_object_is(tsv a, tsv b);          /* Object.is SameValue */
