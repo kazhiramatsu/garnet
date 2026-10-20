@@ -159,9 +159,11 @@ pub fn run_sroa(program: &mut Program, result: &EscapeResult) {
         let number_locs = collect_number_locs(&body);
         let mut sroad: BTreeMap<u32, BTreeMap<u32, u32>> = BTreeMap::new(); // recv -> (field -> scalar local)
         let mut numeric_scalars: BTreeSet<u32> = BTreeSet::new();
-        // Top-level body: nothing is "outside" the function (params are never
-        // array-SROA roots, so an empty set is correct).
-        let top_outside: BTreeSet<u32> = BTreeSet::new();
+        // Top-level body: the parameters hold their entry values, a definition
+        // the body does not show; a root or alias copied into a parameter
+        // (`p = new B()`) keeps its object, like any multiply-defined local.
+        let top_outside: BTreeSet<u32> =
+            program.functions[fi].params.iter().map(|p| p.0).collect();
         let rewritten = rewrite_body(
             &body,
             &number_locs,
@@ -1369,6 +1371,25 @@ fn find_sroa_targets(
             disqualified.insert(resolve_alias_root(d, &copy_alias));
         }
     }
+    // A local with more than one definition merges values at a join
+    // (`let b = new B(i); if (c) b = new B(0); b.v`): the alias maps are
+    // flow-insensitive and keep one source per local, so the read after the
+    // join was rewritten to one allocation's scalars whichever branch ran (or
+    // read the never-assigned local of the scalarized one). Such a local and
+    // every source copied into it keep their objects.
+    let mut defs: BTreeMap<u32, u32> = BTreeMap::new();
+    let mut copy_srcs: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
+    count_defs(body, &mut defs, &mut copy_srcs);
+    for (&d, &n) in &defs {
+        if n > 1 {
+            disqualified.insert(d);
+            disqualified.insert(resolve_alias_root(d, &copy_alias));
+            for &src in copy_srcs.get(&d).into_iter().flatten() {
+                disqualified.insert(src);
+                disqualified.insert(resolve_alias_root(src, &copy_alias));
+            }
+        }
+    }
 
     if std::env::var("TSAOT_SROA_DEBUG").is_ok() {
         eprintln!(
@@ -1386,6 +1407,39 @@ fn find_sroa_targets(
                 .any(|(d, s)| *s == *r && disqualified.contains(d))
         })
         .collect()
+}
+
+/// Definitions per local over a body and its nested blocks (a catch binding
+/// included), and the sources of the copies into each local.
+fn count_defs(body: &[Inst], defs: &mut BTreeMap<u32, u32>, copy_srcs: &mut BTreeMap<u32, BTreeSet<u32>>) {
+    for inst in body {
+        match inst {
+            Inst::Loop { cond_body, body, .. } => {
+                count_defs(cond_body, defs, copy_srcs);
+                count_defs(body, defs, copy_srcs);
+            }
+            Inst::If { then_body, else_body, .. } => {
+                count_defs(then_body, defs, copy_srcs);
+                count_defs(else_body, defs, copy_srcs);
+            }
+            Inst::TryCatch { try_body, catch_var, catch_body, finally_body } => {
+                if let Some(v) = catch_var {
+                    *defs.entry(v.0).or_default() += 1;
+                }
+                count_defs(try_body, defs, copy_srcs);
+                count_defs(catch_body, defs, copy_srcs);
+                count_defs(finally_body, defs, copy_srcs);
+            }
+            _ => {
+                if let Some(d) = crate::string_plan::inst_def_local(inst) {
+                    *defs.entry(d).or_default() += 1;
+                }
+                if let Inst::Copy { dst, src } = inst {
+                    copy_srcs.entry(dst.0).or_default().insert(src.0);
+                }
+            }
+        }
+    }
 }
 
 /// True if `f` returns its receiver (`this`, param 0) — directly or via a copy.

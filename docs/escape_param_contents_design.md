@@ -104,3 +104,68 @@ FrameArena and 44k Heap -> CallerArena (`[type, missingOrUndefined]` in
 `getOptionalType`, `[mapped]` in `mapType`: now `NoEscape` / `ArgEscape`,
 still heap allocations until arrays have a stack or arena form), closures
 unchanged. Analysis of the compiler unchanged (27 s).
+
+## Soundness: aliases handed back to the caller (`x53`)
+
+The fixtures above attack one direction: a callee storing its own object
+into the caller's structure. The other direction, a callee handing the
+caller's own object back to it, had four holes, all silent miscompiles that
+predate `x52` (a class instance at the caller's site is a C stack struct;
+the caller kept the alias in a module array and read it after the frame was
+gone, or SROA read a dead local):
+
+1. **A phantom handed back as a value.** The summary collapses a phantom
+   stored as a value or returned to `External` (the explosion noted under
+   Change), and `field_ret` covered only a one-load phantom that is itself
+   the return value. A return two loads deep (`return p.a.b`), an element
+   (`return p[0].b`), a store into a field of another parameter, of the same
+   parameter or of `this` (`q.x = p.a`, `p.c = p.a`, `this.x = p.a`), or a
+   fresh object or array wrapping the contents (`return { v: p.a }`,
+   `[p.a]`) gave the caller an alias it read as `External`, so its own
+   object stayed `NoEscape`. Now every phantom stored into an object the
+   caller reaches after the call (the field closure of the return value and
+   of the parameter objects), and every phantom returned two or more loads
+   deep, is reported as `field_global` of its (parameter, first field): the
+   contents and everything below them escape. `field_ret` keeps the
+   precise one-load return (the old mode keeps its rule).
+2. **Compact summaries** (recursion nests, `x49`) dropped the edges between
+   two internal objects, so a parameter stored two fresh objects deep
+   (`return { v: { w: p } }` in a recursive function) was read back as
+   `External`. A compact summary now keeps one collapsed
+   `(Internal, Dynamic, Internal)` edge.
+3. **A closure's creation.** Whoever invokes the closure receives its
+   return, but only a returned capture parameter was folded to the sink at
+   creation (`x50`): a fresh object or array wrapping a captured value
+   (`() => ({ v: b })`, `() => [b]`, also called through a helper or
+   returned by another closure) left `b` on the stack, and a store whose
+   base is a declared parameter (`(q) => { q.x = b; }`) was dropped (that
+   parameter has no actual at creation). At creation a returned internal
+   object now goes to the global sink with everything stored into it, and a
+   declared parameter as a store base is an `External` object.
+4. **SROA** (`sroa.rs`, not the escape analysis): an allocation whose local,
+   or a copy alias of it, has another definition (`let b = new B(i); if (c)
+   b = new B(0); return b.v`, the same through `switch`, `catch`, loops, a
+   closure's assignment, a reassigned parameter) was scalar-replaced. The
+   alias maps are flow-insensitive and keep one source per local, so the
+   read after the join used the first allocation's fields whichever path
+   ran, or read the never-assigned local (a `TypeError` or a crash when the
+   local reached a closure). A local with more than one definition (a catch
+   binding counts), and every source copied into it, now keeps its object;
+   at the top level the parameters count as defined at entry.
+
+Not a lifetime issue, seen while probing: `const n: number = p.a` with
+`p.a: any` holding an object unboxes the value in typed mode (`ts_num`
+canonicalizes a NaN that looks boxed), so V8 keeps the object and garnet a
+NaN; typed mode trusts the annotation, as with the other `number` items in
+`CLAUDE.md`. It also means a reference cannot survive a primitive local,
+which the `x52` rule relies on.
+
+Verification: fixtures `closures/alias_handback_lifetimes` (twenty cases,
+heap churn between rounds) and `classes/sroa_reassigned_merge` (thirteen
+shapes over five inputs) are identical to V8, also under
+`TSAOT_GC_YOUNG_THRESHOLD=1` (914k minor collections); built with each of
+the four fixes removed alone, one of the two fixtures fails. The old
+mode's decision report is byte-identical. Decision report of the compiler,
+count-weighted: unchanged (14 sites with a zero count flip in both
+directions, from the nest's changed widening: 7,697 solves, 506 widened);
+analysis 27 s.

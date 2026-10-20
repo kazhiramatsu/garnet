@@ -93,3 +93,6 @@ Rust in §315; selfhost is kept as a performance metric).
 - Likewise a `number`-typed parameter that receives no argument (a call or `new` through an `any`
   cast with fewer arguments) reads as 0 in typed mode (V8: undefined); the direct entry has no
   representation for a missing number (Session 350 x32 note).
+- An `any` value that holds a non-number, assigned to a `number`-typed local, is unboxed in
+  typed mode (V8 keeps the value; garnet reads NaN): typed mode trusts the annotation (Session 350
+  x53 note).

@@ -184,21 +184,22 @@ impl Solver {
             }
         }
     }
+    /// The objects stored into any field of `o`. Fields are ordered by owner,
+    /// then FieldKey: visit only this owner's adjacency list instead of
+    /// scanning the whole graph. Named is the first FieldKey variant and
+    /// Capture is the last, including their full ID ranges.
+    fn field_targets(&self, o: Obj) -> impl Iterator<Item = &Obj> {
+        let first = (o, FieldKey::Named(FieldId(0)));
+        let last = (o, FieldKey::Capture(BindingId(u32::MAX)));
+        self.field.range(first..=last).flat_map(|(_, tgts)| tgts.iter())
+    }
     fn field_closure(&self, seed: BTreeSet<Obj>) -> BTreeSet<Obj> {
         let mut set = seed;
         let mut work: Vec<Obj> = set.iter().copied().collect();
         while let Some(o) = work.pop() {
-            // Fields are ordered by owner, then FieldKey. Visit only this
-            // owner's adjacency list instead of scanning the whole graph for
-            // every reachable object. Named is the first FieldKey variant and
-            // Capture is the last, including their full ID ranges.
-            let first = (o, FieldKey::Named(FieldId(0)));
-            let last = (o, FieldKey::Capture(BindingId(u32::MAX)));
-            for (_, tgts) in self.field.range(first..=last) {
-                for t in tgts {
-                    if set.insert(*t) {
-                        work.push(*t);
-                    }
+            for t in self.field_targets(o) {
+                if set.insert(*t) {
+                    work.push(*t);
                 }
             }
         }
@@ -853,10 +854,15 @@ fn apply_summary(
     // contents do through field_ret below.
     if creation && phantoms_enabled() {
         for s in &sum.ret {
-            if let SObj::Param(i) = *s {
-                if i < actuals.len() && is_ref(actuals[i]) {
+            match *s {
+                SObj::Param(i) if i < actuals.len() && is_ref(actuals[i]) => {
                     cs.push(C::Copy(Ref::Global, Ref::Local(actuals[i])));
                 }
+                // A fresh object the body returns (`() => ({ v: b })`, `[b]`)
+                // reaches whoever invokes the closure: the captured values
+                // stored into it escape with it.
+                SObj::Internal => cs.push(C::Addr(Ref::Global, op)),
+                _ => {}
             }
         }
     }
@@ -889,6 +895,10 @@ fn apply_summary(
     let as_base = |s: SObj| -> Side {
         match s {
             SObj::Param(i) if i < actuals.len() => Side::Ref(actuals[i]),
+            // At a closure's creation a declared parameter is an object some
+            // future invocation passes (`(q) => { q.x = b; }`): a store into
+            // it is a store into an unknown object.
+            SObj::Param(_) if creation && phantoms_enabled() => Side::Obj(Obj::External),
             SObj::Param(_) => Side::None,
             SObj::Internal => Side::Obj(op),
             SObj::External => Side::Obj(Obj::External),
@@ -1047,10 +1057,40 @@ fn extract_summary(f: &Function, solver: &Solver, compact: bool) -> Summary {
             }
         }
     }
-    for o in ret_set.iter() {
+    // field_ret: a one-load phantom that is itself the return value (the
+    // caller's destination aliases the actual's field contents). The old mode
+    // also takes the phantoms reachable from the return.
+    let ret_direct = solver.pt_clone(Ref::Ret);
+    for o in if phantoms { ret_direct.iter() } else { ret_set.iter() } {
         if let Obj::ParamField(p, fk) = o {
             if let Some(i) = param_index.get(p) {
                 field_ret.insert((*i, *fk));
+            }
+        }
+    }
+    if phantoms {
+        // A phantom handed back to the caller as a VALUE is collapsed to
+        // External in the summary, so the caller would lose the alias to its
+        // own object (a stack instance read after its frame is gone): the
+        // return two or more loads deep (`return p.a.b`), a store into a field
+        // of a parameter (`q.x = p.a`, `this.x = p.a`) or of an object the
+        // caller reaches through the return or a parameter (`return { v: p.a }`,
+        // `[p.a]`, a closure capturing it). Such contents escape to the global
+        // sink (the field's contents and everything below them).
+        let mut seed = ret_direct.clone();
+        for &p in &f.params {
+            if is_reflike(f, p) {
+                seed.insert(Obj::Param(p));
+            }
+        }
+        let visible = solver.field_closure(seed);
+        let stored = visible.iter().flat_map(|o| solver.field_targets(*o));
+        let deep_ret = ret_direct.iter().filter(|o| matches!(o, Obj::ParamDeep(_, _)));
+        for o in stored.chain(deep_ret) {
+            if let Obj::ParamField(p, fk) | Obj::ParamDeep(p, fk) = o {
+                if let Some(i) = param_index.get(p) {
+                    field_global.insert((*i, *fk));
+                }
             }
         }
     }
@@ -1069,7 +1109,15 @@ fn extract_summary(f: &Function, solver: &Solver, compact: bool) -> Summary {
             let sv = map(*t);
             if compact {
                 // keep only the edges that touch a parameter: the caller
-                // reads the callee's internals as external (apply_summary)
+                // reads the callee's internals as external (apply_summary).
+                // An internal object reachable from another one stays
+                // reachable through one collapsed edge, or a parameter stored
+                // two fresh objects deep (`return { v: { w: p } }`) would be
+                // read back as external by the caller.
+                if so == SObj::Internal && sv == SObj::Internal {
+                    fields.insert((so, FieldKey::Dynamic, sv));
+                    continue;
+                }
                 if !matches!(so, SObj::Param(_)) && !matches!(sv, SObj::Param(_)) {
                     continue;
                 }

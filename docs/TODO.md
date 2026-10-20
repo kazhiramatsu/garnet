@@ -6018,7 +6018,50 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   A/B against `x51`, two rounds of three alternating runs: 4.571 vs 4.542 s
   and 4.570 vs 4.550 s median (pairs -0.4% to +1.0%): neutral within the
   noise, kept for the precision. Node 3.31 s (1.38x).
-- Next slices, in order. (0) External element buffers (the malloc'd
+- Escape and SROA soundness: aliases handed back to the caller, reassigned
+  locals (build `x53`, full build; analyzer `interproc.rs`, `sroa.rs`;
+  `docs/escape_param_contents_design.md`). Before the A/B of `x52` a
+  probe of the other direction, a callee handing the caller's own object
+  back, found four silent miscompiles, all present at `x51` (the stack
+  struct of a class instance kept in a module array and read after its
+  frame was gone, or SROA reading a dead local): (1) a phantom stored as a
+  value into something the caller reaches (another parameter's field,
+  `this`, a fresh object or array returned) or returned two loads deep was
+  collapsed to `External`, so the caller lost the alias to its object;
+  such phantoms are now `field_global` of their (parameter, first field),
+  and `field_ret` keeps only a one-load phantom that is the return value.
+  (2) Compact summaries (`x49`) dropped internal-to-internal edges
+  (`return { v: { w: p } }` in a recursion nest); one collapsed edge stays.
+  (3) At a closure's creation a returned fresh object wrapping a captured
+  value (`() => ({ v: b })`, `() => [b]`) and a store into a declared
+  parameter (`(q) => { q.x = b; }`) were not folded; the returned
+  internals now go to the sink and a declared-parameter base is
+  `External`. (4) SROA scalar-replaced an allocation whose local or copy
+  alias has another definition (`let b = new B(i); if (c) b = new B(0);
+  b.v`, also switch, catch, loops, a closure's assignment, a reassigned
+  parameter): the flow-insensitive alias maps rewrote the read after the
+  join to the first allocation, or to the never-assigned local; such
+  locals keep their objects. Fixtures `closures/alias_handback_lifetimes`
+  (twenty cases) and `classes/sroa_reassigned_merge` (thirteen shapes);
+  each fix removed alone fails one of them; identical to V8 under
+  `TSAOT_GC_YOUNG_THRESHOLD=1`. The old mode's decision report
+  byte-identical; the compiler's decision report unchanged count-weighted.
+  Also noted (not lifetime): an `any` holding an object assigned to a
+  `number` local is unboxed in typed mode (`CLAUDE.md` known items).
+  Gates all green (parity: the two new fixtures are known diffs, the
+  frozen emitter's strategies differ and both match V8). The compiler's
+  generated C differs only at the 14 zero-count sites; allocations per
+  compile identical (13.20M). A/B against `x52`, two rounds of three
+  alternating runs: 4.502 vs 4.513 s and 4.500 vs 4.513 s median:
+  neutral. Node 3.28 s (1.37x).
+- Next slices, in order. First a dynamic check of the stack strategies
+  (four holes in one probing session say the analysis needs a net, not
+  more fixtures): a check mode that allocates every `Stack` object (class
+  instances, scope records, closures and their environments) in a
+  quarantine instead of the C frame, marks it dead when its frame pops or
+  unwinds, and reports a dead object the collector reaches, the site and
+  function named; run the conformance suite under GC stress and a compile
+  of the compiler in that mode. Then: (0) External element buffers (the malloc'd
   `data` of arrays, also strings' and maps' buffers) do not count toward
   the collector's trigger: a loop that drops large arrays grows without
   bound (the `sparse_stores` kernel under `TSAOT_SPARSE_ELEMENTS=0`
