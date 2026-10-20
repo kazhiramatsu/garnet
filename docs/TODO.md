@@ -6514,6 +6514,27 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   inline policy, conformance 480/480. A/B against G1 (both relinked onto
   `x69`): eight ABBA pairs, wall ratio 1.005, user 1.005; instructions
   84.18 vs 84.17 G (+0.02%), cycles +0.16%: neutral.
+- String keys on arrays (exporter; `docs/array_index_keys_design.md` §1),
+  a silent miscompile found by the G2b fixture: `indexAccessKind` sent
+  every element access on an array or string receiver down the index path,
+  which reads its key as a raw number (`(uint32_t)ts_to_num(k)`), so a
+  string key read and wrote element 0 (`for (const k in arr) arr[k]`, an
+  index held in a string, an `any` key). Only a number-typed key (number, a
+  number literal, a numeric enum, a union of those) takes the index path
+  now; any other key takes the dynamic path, whose ToPropertyKey maps a
+  canonical index string to the element. In the compiler one read and one
+  write flip (2,052 reads and 7,602 writes keep the index path): both in
+  `mergeTokenSourceMapRanges` (`for (const key in sourceRanges)
+  destRanges[key] = sourceRanges[key]`), which copied element 0 for every
+  key in the native compiler (visible only with source maps). Fixture
+  `arrays/string_index_keys`. Found on the way, next slice: number keys
+  that are not indices (`a[1.5]` reads `a[1]`, `a[2^32 + 1]` reads `a[1]`,
+  also through `any`; stores throw RangeError instead of creating the
+  property; §2 of the design). Gates: unit, parity (359 identical), bundler,
+  selfconf, GC stress, inline policy, conformance 481/481. Full build
+  `native_s350sk` (G2a runtime) against `g2a` (`x69`'s compiler object with
+  the G2a runtime), eight ABBA pairs: wall 1.001, user 1.000; outputs
+  identical.
 - Next slices, in order. GC v2 first (`docs/gc_v2_design.md` §6: G2
   payloads in a block heap (G2b element buffers next), G3 the non-moving decision gate).
   A slice that extends the stack or an arena to a

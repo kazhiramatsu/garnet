@@ -10812,8 +10812,14 @@ class Exporter {
     // (possibly numeric) key is a property access — this keeps a[0]/a["0"] unified
     // and a[1.5] correct, matching JS semantics (property keys are strings).
     const bk = this.builtinReceiverKind(node.expression);
-    if (bk === "array") return "number";
-    if (bk === "string") return "number";   // str[i] char access also uses the index path
+    // The index path reads its key as a raw number (`(uint32_t)ts_to_num(k)`
+    // in the emitted element access), so only a number-typed key may take it.
+    // A string key (`for (const k in arr) arr[k]`, an index held in a string)
+    // or an `any`, union or type-parameter key is a property key after
+    // ToPropertyKey: the dynamic path maps a canonical index string to the
+    // element. (Every such key used to read and write element 0.)
+    if (bk === "array" || bk === "string")   // str[i] char access also uses the index path
+      return this.isNumberTypedKey(node.argumentExpression) ? "number" : "string";
     try {
       const t = this.checker.getTypeAtLocation(node.argumentExpression);
       const F = ts.TypeFlags;
@@ -10822,6 +10828,18 @@ class Exporter {
       if (t.flags & (F.StringLike | F.String | F.StringLiteral)) return "string";
       return "string";
     } catch { return "string"; }
+  }
+
+  /** A key whose static type is a number (number, a number literal, a
+   *  numeric enum, or a union of those). */
+  isNumberTypedKey(e: ts.Expression): boolean {
+    try {
+      const t = this.checker.getTypeAtLocation(e);
+      const F = ts.TypeFlags;
+      if (t.flags & F.NumberLike) return true;
+      if (t.isUnion()) return t.types.every((m) => (m.flags & F.NumberLike) !== 0);
+      return false;
+    } catch { return false; }
   }
 
   lowerProtoArg(ctx: FnCtx, arg: ts.Expression): number {
