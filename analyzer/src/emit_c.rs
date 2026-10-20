@@ -1364,6 +1364,9 @@ struct Ctx<'a> {
     /// the prologue declared the function-scope stack cells (emit_stack_cell_decls);
     /// the coroutine emitters do not, so their closures stay on the heap
     stack_cells: bool,
+    /// locals of numeric type in the IR (RefKind::Primitive), whatever their
+    /// representation: a maybe-undefined or nullable numeric stays boxed
+    prim_kind: BTreeSet<u32>,
     f64_mode: bool,
     /// Boxed locals carried by a generated shadow-root frame. Empty for
     /// coroutine emitters and when frame roots are disabled.
@@ -6710,6 +6713,7 @@ fn emit_i64_function(
         i64_mode: true,
         ret_kind: RetKind::Boxed,
         stack_cells: true,
+        prim_kind: prim_kind_locals(f),
         f64_mode: false,
         frame_locals,
         frame_slot: frame_layout.as_ref().map(|l| l.slot_of.clone()),
@@ -6881,6 +6885,7 @@ fn emit_f64_function(
         i64_mode: false,
         ret_kind: RetKind::Boxed,
         stack_cells: true,
+        prim_kind: prim_kind_locals(f),
         f64_mode: true,
         frame_locals,
         frame_slot: frame_layout.as_ref().map(|l| l.slot_of.clone()),
@@ -6988,6 +6993,7 @@ fn emit_function(
             i64_mode: false,
             ret_kind: RetKind::Boxed,
             stack_cells: false,
+            prim_kind: prim_kind_locals(f),
             f64_mode: false,
             frame_locals: BTreeSet::new(),
             frame_slot: None,
@@ -7042,6 +7048,7 @@ fn emit_function(
             i64_mode: false,
             ret_kind: RetKind::Boxed,
             stack_cells: false,
+            prim_kind: prim_kind_locals(f),
             f64_mode: false,
             frame_locals: BTreeSet::new(),
             frame_slot: None,
@@ -7096,6 +7103,7 @@ fn emit_function(
             i64_mode: false,
             ret_kind: RetKind::Boxed,
             stack_cells: false,
+            prim_kind: prim_kind_locals(f),
             f64_mode: false,
             frame_locals: BTreeSet::new(),
             frame_slot: None,
@@ -7309,6 +7317,7 @@ fn emit_function(
         i64_mode: false,
         ret_kind: ret_kind,
         stack_cells: true,
+        prim_kind: prim_kind_locals(f),
         f64_mode: false,
         frame_locals,
         frame_slot: frame_layout.as_ref().map(|l| l.slot_of.clone()),
@@ -8037,6 +8046,23 @@ fn user_set_proto_fn() -> &'static str {
     } else {
         "ts_set_proto"
     }
+}
+
+/// The IR locals of numeric type (RefKind::Primitive).
+fn prim_kind_locals(f: &Function) -> BTreeSet<u32> {
+    f.locals.iter().filter(|l| matches!(l.ref_kind, RefKind::Primitive)).map(|l| l.id.0).collect()
+}
+
+/// `a + b` with both operands numeric by type but one of them boxed (a
+/// maybe-undefined or nullable numeric, e.g. `sum + (s?.length ?? 0)`): the
+/// numeric addition with ToNumber of the boxed side (undefined -> NaN, as `+`
+/// gives) instead of the generic ts_add. TSAOT_PRIM_ADD=0 keeps ts_add (the
+/// frozen emitter's output).
+fn prim_add_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(std::env::var("TSAOT_PRIM_ADD").as_deref(), Ok("0") | Ok("false") | Ok("no") | Ok("off"))
+    })
 }
 
 /// TSAOT_STACK_CHECK=1: every `Stack` allocation goes to the runtime's
@@ -19686,6 +19712,13 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             let expr = match op.as_str() {
                 "+" => {
                     if ctx.unboxed.contains(&lhs.0) && ctx.unboxed.contains(&rhs.0) {
+                        format!("({} + {})", l, r)
+                    } else if prim_add_enabled()
+                        && ctx.prim_kind.contains(&lhs.0)
+                        && ctx.prim_kind.contains(&rhs.0)
+                        && !ctx.json_locals.contains(&lhs.0)
+                        && !ctx.json_locals.contains(&rhs.0)
+                    {
                         format!("({} + {})", l, r)
                     } else if ctx.json_locals.contains(&lhs.0) && ctx.json_locals.contains(&rhs.0) {
                         s.push_str(

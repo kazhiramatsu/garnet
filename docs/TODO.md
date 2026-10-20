@@ -6195,6 +6195,30 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   emitter drops the thisArg). A/B against `x58`, two rounds of three
   alternating runs: 4.492 vs 4.496 s and 4.460 vs 4.437 s median:
   neutral. Node 3.33-3.37 s (1.34x).
+- Numeric `+` of a boxed numeric (build `x60`, full build; emitter).
+  `sum += s?.length ?? 0` (the kernel `flags_truthy`) added through the
+  generic `ts_add`: the `??` result is a number by type, but its local is
+  boxed (the `?.` local starts as undefined and the non-numeric-constant
+  rule follows the copy), and `+` took the numeric path only for two
+  unboxed operands, while the other arithmetic operators already read a
+  boxed numeric through ToNumber. `+` of two locals that are numbers by
+  type (`RefKind::Primitive`) is now the numeric addition with ToNumber of
+  the boxed side (undefined -> NaN, as `+` gives); a string operand keeps
+  `ts_add`. `TSAOT_PRIM_ADD=0` restores the old code (the parity oracle
+  sets it). `flags_truthy` 403 -> 360 ms. Fixture
+  `operators/boxed_numeric_add` (`?? 0` sums, element reads past the end,
+  optional fields, undefined reaching `+` as NaN, holes, concatenation
+  kept). Gates all green. A/B against `x59`, two rounds of three
+  alternating runs: 4.513 vs 4.543 s and 4.520 vs 4.515 s median:
+  neutral. Node 3.36-3.37 s (1.34x).
+  Measured on the way (`small_calls`, hand-edited C): removing the
+  inline-cache checks of the hinted reads one at a time changes nothing
+  (an exact-shape site cache, no kind test: 750 ms); removing the slow
+  call from the hot function gives 650 ms, removing checks and call 349
+  ms. The remaining gap of the read-heavy kernels is the presence of
+  per-read checks and slow-path calls in small hot functions, which only a
+  guard hoisted out of the body (function versioning on the receiver's
+  layout) would remove.
 - Next slices, in order. A slice that extends the stack or an arena to a
   new kind of allocation runs the conformance suite and a compile of the
   compiler under `--stack-check` (an arena must allocate through the
