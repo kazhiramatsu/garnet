@@ -6263,6 +6263,42 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   ms with 64-byte function alignment). A/B against `x61`, two rounds of
   three alternating runs: 4.431 vs 4.431 s and 4.435 vs 4.444 s median:
   neutral. Node 3.31-3.34 s (1.34x).
+- Epoch churn: fresh objects' prototypes (build `x63`: `x62`'s compiler
+  relinked with the new runtime; `docs/negative_cache_design.md`). The
+  planned follow-up of the absent-property table, an inline absent entry
+  per site (the receiver's shape word and direct prototype by identity, an
+  epoch; the chain covered by watching its links' shapes, young prototypes
+  by a move at the next minor collection), took `links_objects` from 468 to
+  403 ms but the compiler 2-3% slower. Its statistics showed 200k epoch
+  moves per compile, 197k of them from `ts_set_proto` called on objects the
+  runtime had just allocated: every Map / Set iterator and generator object
+  (also array iterators, a typed array, the abort and headers host
+  objects) was created plain and relinked, and each relink emptied every
+  addition and absent-property cache of the program, since `x26`. A fresh
+  object's prototype is now linked without moving any epoch
+  (`obj_link_fresh_proto`: it is nobody's prototype, and the caches key
+  their receivers by shape and prototype). Per compile: epoch moves 200k
+  -> 3.2k, slow additions 1.45M -> 0.30M, absent walks 856k -> 9k,
+  out-of-line reads 4.72M -> 2.01M. With that, the per-site entries were
+  neutral on the compiler (3.521 vs 3.527 s, seven interleaved runs) and
+  cost 6.6 MB of code (`__TEXT` 39.5 -> 46.1 MB), so they are not adopted;
+  if they return, only at reads of optional properties (the patch and the
+  invalidation scheme are in the design doc). Fixtures
+  `objects/absent_site_entries` (single-site invalidations of the absent
+  entries: prototypes gaining, losing and regaining a key, frozen, shared
+  shapes, relinks, accessors, read-only data, dying and promoted
+  prototypes, alternating shapes, deep chains, arrays, `Object.prototype`;
+  also under GC stress) and `objects/fresh_proto_links`. Found on the way,
+  next slices: a Proxy on a prototype chain is read as an ordinary object
+  (no traps run, the walk continues into the target, map words read past
+  the proxy cell; `docs/proxy_prototype_chain_design.md`); `arr.values()` /
+  `keys()` / `entries()` in typed mode give no iterator (`it.next()`
+  throws "next is not a function"); generator objects lack their
+  toStringTag (`[object Object]`). Gates all green (conformance 471/471;
+  parity and selfconf: the fixtures are a known DeleteField difference and
+  unported `uint16array.new` of the frozen pair). A/B against `x62`, two
+  rounds of three alternating runs: 4.347 vs 4.424 s and 4.323 vs 4.397 s
+  median, all six pairs faster: about -1.7%. Node 3.29-3.34 s (1.31x).
 - Next slices, in order. A slice that extends the stack or an arena to a
   new kind of allocation runs the conformance suite and a compile of the
   compiler under `--stack-check` (an arena must allocate through the

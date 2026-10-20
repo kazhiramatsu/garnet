@@ -1006,6 +1006,18 @@ tsv ts_set_proto(tsv obj, tsv proto){
   }
   return obj;
 }
+/* The prototype of an object the runtime has just allocated (an iterator, a
+   generator object, a typed array, a host object). Nothing can have cached a
+   decision about it: it is nobody's prototype yet, and the addition and
+   absent-property caches key their receivers by shape and prototype, so,
+   unlike a relink, no cache epoch moves. (Linking these through ts_set_proto
+   emptied every addition and absent-property cache 197k times per compile of
+   the compiler: once per Map iterator and generator object.) */
+static void obj_link_fresh_proto(tsv obj, tsv proto){
+  ts_object* o = ts_ptr(obj);
+  o->proto = ts_proto_ref(proto) ? proto : TS_NULL;
+  ts_write_barrier(obj, proto);
+}
 /* The user-level relink (Object.setPrototypeOf, Reflect.setPrototypeOf): the
    class setup, which links prototypes the same way, keeps ts_set_proto, so
    only a program's own relink of an object behind a class with struct fields
@@ -5760,7 +5772,7 @@ tsv ts_new_uint16_array(tsv input){
   ts_array* array = ts_ptr(result);
   array->element_kind = 1;
   for (uint32_t i = 0; i < array->len; i++) array->data[i] = ts_num(0);
-  ts_set_proto(result, g_uint16_proto);
+  obj_link_fresh_proto(result, g_uint16_proto);
   if (values != TS_UNDEFINED) for (uint32_t i = 0; i < (uint32_t)length; i++)
     ts_array_set(result, i, ts_array_get(values, i));
   ts_gc_unroot(3);
@@ -6592,7 +6604,7 @@ static tsv ts_array_iterator(tsv* args, int n){
     ts_gc_unroot(3);
   }
   tsv iter = ts_new_object(); ts_gc_root(&iter);
-  ts_set_proto(iter, g_array_iterator_proto);
+  obj_link_fresh_proto(iter, g_array_iterator_proto);
   ts_define_data(iter, g_ai_source, source, 0, 1, 0);
   ts_define_data(iter, g_ai_index, ts_num(0), 0, 1, 0);
   ts_gc_unroot(2);
@@ -6732,7 +6744,7 @@ tsv ts_map_iterator(tsv source, int kind){
     *next = (uint64_t)len + 1u;
   }
   tsv iter = ts_new_object(); ts_gc_root(&iter);
-  ts_set_proto(iter, is_set ? g_set_iterator_proto : g_map_iterator_proto);
+  obj_link_fresh_proto(iter, is_set ? g_set_iterator_proto : g_map_iterator_proto);
   ts_define_data(iter, g_mi_source, source, 0, 1, 0);
   ts_define_data(iter, g_mi_last, ts_num(0), 0, 1, 0);
   ts_define_data(iter, g_mi_kind, ts_num(kind), 0, 1, 0);
@@ -14185,7 +14197,7 @@ tsv ts_abort_signal_new(int aborted){
   ts_abort_signal_proto_init();
   tsv signal = ts_new_object();
   ts_gc_root(&signal);
-  ts_set_proto(signal, ts_abort_signal_proto());
+  obj_link_fresh_proto(signal, ts_abort_signal_proto());
   ts_set(signal, F_abort_aborted, ts_bool(0));
   ts_set(signal, F_abort_reason, TS_UNDEFINED);
   if (aborted) ts_abort_signal_abort_with_reason(signal, TS_UNDEFINED);
@@ -14215,7 +14227,7 @@ tsv ts_abort_controller_new(void){
   ts_gc_root(&controller);
   tsv signal = ts_abort_signal_new(0);
   ts_gc_root(&signal);
-  ts_set_proto(controller, ts_abort_controller_proto());
+  obj_link_fresh_proto(controller, ts_abort_controller_proto());
   ts_set(controller, F_abort_signal, signal);
   ts_gc_unroot(2);
   return controller;
@@ -14738,7 +14750,7 @@ tsv ts_headers_new(tsv init){
   ts_headers_proto_init();
   tsv headers = ts_new_object();
   ts_gc_root(&headers);
-  ts_set_proto(headers, ts_headers_proto());
+  obj_link_fresh_proto(headers, ts_headers_proto());
   ts_define_data(headers, TS_HEADERS_BRAND_KEY, ts_bool(1), 0, 0, 0);
   if (ts_is_undef(init) || ts_is_null(init)){
     ts_gc_unroot(2);
@@ -14969,7 +14981,7 @@ tsv ts_gen_new_v(tsv cv){
   ts_generator_proto_init(0);
   tsv g = ts_new_object();
   ts_gc_root(&g);
-  ts_set_proto(g, g_generator_protos[0]);
+  obj_link_fresh_proto(g, g_generator_protos[0]);
   ts_set(g, F_coro, cv);   /* coro is OBJECT-tagged (kind CORO) */
   ts_gc_unroot(2);
   return g;
@@ -15223,7 +15235,7 @@ tsv ts_asyncgen_new_v(tsv cv){
   if (ts_is_coro_value(cv)) ((ts_coro*)ts_ptr(cv))->is_asyncgen=1;
   tsv g = ts_new_object();
   ts_gc_root(&g);
-  ts_set_proto(g, g_generator_protos[1]);
+  obj_link_fresh_proto(g, g_generator_protos[1]);
   ts_set(g, F_coro, cv);
   ts_gc_unroot(2);
   return g;
