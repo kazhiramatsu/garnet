@@ -6609,8 +6609,19 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   (361 identical), bundler, selfconf, GC stress, inline policy,
   conformance 485/485. A/B against G2c: eight ABBA pairs, wall 0.999, user
   1.000; instructions +0.04%, cycles -0.01%: neutral.
+- GC v2 slice G3, the non-moving decision gate: failed for segregated fits
+  (`docs/gc_v2_design.md` §6.3; not committed, kept in the scratchpad).
+  Cells in blocks of their size class with sticky marks and a handle log
+  instead of the sweep: wall +2.95% against G2d (eight of eight pairs),
+  instructions -0.11%, cycles +3.3% (+3.6% with a word-at-a-time run
+  search). The collector itself got faster (about 290 vs 320 ms in the
+  statistics build); the mutator lost: the allocation slow path walked class
+  block lists across blocks filled by old cells and found short runs between
+  scattered survivors, and size segregation scattered objects allocated
+  together. Next: G3b, the same gate with an Immix-style cell space (lines,
+  mixed-size bump allocation, overflow blocks); Y1 if it fails too.
 - Next slices, in order. GC v2 first (`docs/gc_v2_design.md` §6: G2
-  payloads in a block heap (G3, the non-moving decision gate, next), G3 the non-moving decision gate).
+  payloads in a block heap (G3b, Immix-style cell space, next), G3 the non-moving decision gate).
   A slice that extends the stack or an arena to a
   new kind of allocation runs the conformance suite and a compile of the
   compiler under `--stack-check` (an arena must allocate through the

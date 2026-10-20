@@ -429,6 +429,42 @@ non-moving allocation (its locality) and the removal of copying alone.
   microbenchmarks (`scripts/bench_gc.sh`) for the cases a copying nursery
   favors (short-lived binary trees, survivors).
 
+## 6.3 G3 result: segregated fits fail the gate; Immix lines next
+
+G3 as specified (§6.2: cells in blocks of their size class, cursors over runs
+of unmarked cells, sticky marks, a handle log instead of the sweep) was built
+and measured against G2d (both relinked onto `native_s350nk`): wall +2.95%
+(eight of eight pairs slower), instructions -0.11%, cycles +3.3% (+3.6% after
+a word-at-a-time run search). Fewer instructions and more cycles: the cost is
+memory, not work. The statistics build puts its collections at about 290 ms
+against about 320 ms for the moving nursery (minor marking 93-97 ms, the
+handle-log walk 103 ms, full marking 39-48 ms), so the collector got faster;
+the loss is on the mutator side. The profile shows the allocation slow path
+(`gc_space_refill`, 91-109 samples: walking class block lists across blocks
+filled by old cells, and short runs between scattered survivors) and the
+allocation itself (`gc_alloc` +31, `memset` +18), with the generated code
+also slower: size segregation scatters objects allocated together (a node,
+its arrays, its strings) over different blocks, and young cells land in holes
+spread over the whole heap instead of one reused 4 MB region.
+
+Two unit tests failed under GC stress for an unrelated reason that any
+promotion-timing change exposes: they take a "handle-form probe" after an
+allocation that, without aging, already promoted the cell (so the probe is a
+pointer and never reads NULL), and one compares two references to a cell by
+bits (`ts_same_cell` is the rule). Both need the probe taken at allocation and
+the identity compare.
+
+Decision: the gate failed for this allocator, not for non-moving collection.
+The non-moving design that keeps allocation sequential is Immix's mark-region
+(also the basis of Sticky Immix, §3): blocks of 128-byte lines, objects of
+any size bumped through runs of free lines, a medium object that does not fit
+the current run going to an overflow block, marking setting the lines an
+object covers, and free lines reused after a collection. Survivors stay in
+place; consecutive allocations stay adjacent whatever their sizes. **G3b**
+builds the cell space that way (payloads keep their size classes), with the
+same gate (within 1% of G2d). If G3b also fails, the plan continues with Y1
+(G3').
+
 ## 7. Verification
 
 - Gates of every slice: unit, parity (`scripts/emitc_diff.sh`), bundler,
