@@ -371,6 +371,10 @@ Allocator (`gc_payload_*`):
   under aging are marked by the collection that scanned it; if the cell then
   dies young, they stay allocated until the next full collection (G0: about
   14 MB of payloads were aged per compile). G3 removes aging.
+- A payload allocated during a collection (the weak-table pruning compacts
+  a WeakMap and rebuilds its index after the map was scanned) is allocated
+  marked: its owner is live, and an unmarked cell would be free once the
+  collection ends.
 - Owners outside the heap (stack and arena cells, `TS_GEN_NONHEAP`) keep
   malloc'd payloads: the collector sees such a cell only when a frame slot
   references it, and a cell that holds no heap reference need not be

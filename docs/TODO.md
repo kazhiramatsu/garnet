@@ -6535,6 +6535,30 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   `native_s350sk` (G2a runtime) against `g2a` (`x69`'s compiler object with
   the G2a runtime), eight ABBA pairs: wall 1.001, user 1.000; outputs
   identical.
+- Number keys that are not array indices (runtime and emitter;
+  `docs/array_index_keys_design.md` §2), the second silent miscompile of
+  that family: the emitted element access cast its key to `uint32_t`
+  (`a[1.5]` read `a[1]`, an int64 key 2^32 + 1 read `a[1]`, a double out of
+  range was undefined behavior), `ts_get_dyn` / `ts_set_dyn` did the same
+  for `any` receivers and threw RangeError on a non-index store, and
+  `ts_has_prop_dyn` ignored named properties for a non-index number. An
+  index is an integer in [0, 2^32 - 1) (`ts_num_array_index`); any other
+  number is a property key under ToString. The in-line element helpers
+  take `int64_t` (the in-capacity test also rejects the non-indices, so the
+  integer-key hot path is unchanged) and a double key gets `_f64` helpers
+  that test for an index first; out-of-line key paths
+  (`ts_array_get_key_*`, `ts_array_set_key_*`) take the element path for
+  an index and the dynamic property path otherwise; `TSAOT_INDEX_KEYS=0`
+  keeps the previous emission for the parity oracle. In the compiler 9,116
+  index operands are int64 locals, 495 doubles, 36 boxed. Fixture
+  `arrays/numeric_index_keys` (int, double and boxed keys at -1, 1.5, NaN,
+  Infinity, 2^32 - 1, 2^32 + 1, -0; stores, `in`, `delete`, sparse arrays,
+  an `any` receiver; also with `TSAOT_INLINE_INDEX=0`). Gates: unit,
+  parity (359 identical; known rows for the fixture's computed delete),
+  bundler, selfconf, GC stress, inline policy, conformance 482/482. Full
+  build `native_s350nk` against `native_s350sk`: eight ABBA pairs, wall
+  0.999, user 0.999; instructions +0.36% (84.39 vs 84.08 G: the double-key
+  index tests), cycles +0.12%; outputs identical.
 - Next slices, in order. GC v2 first (`docs/gc_v2_design.md` §6: G2
   payloads in a block heap (G2b element buffers next), G3 the non-moving decision gate).
   A slice that extends the stack or an arena to a

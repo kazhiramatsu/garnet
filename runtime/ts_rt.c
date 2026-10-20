@@ -11925,8 +11925,9 @@ int ts_has_prop_dyn(tsv obj, tsv keyv){
   if (g_has_proxies && ts_is_proxy(obj)) return ts_proxy_has_v(obj, keyv);
   /* numeric key on an array: direct bounds check (`0 in arr`). */
   if (ts_is_indexed_array_fast(obj) && ts_is_num(keyv)){
-    double d = ts_to_num(keyv);
-    return d >= 0 && d == (double)(uint32_t)d && ts_array_has_index(obj, (uint32_t)d);
+    uint32_t index;
+    if (ts_num_array_index(ts_to_num(keyv), &index)) return ts_array_has_index(obj, index);
+    /* any other number is a property key (ToString), below */
   }
   ts_gc_root(&obj);
   ts_key key;
@@ -12976,11 +12977,38 @@ void ts_set_linked(tsv obj, ts_key key, tsv value, ts_prop_ic* ic, ts_frame_hdr*
   ts_set_pic(obj, key, value, ic);
   ts_frame_pop(frame);
 }
-tsv ts_array_get_linked(tsv arr, uint32_t i, ts_frame_hdr* frame, uint32_t nslots){
+tsv ts_array_get_linked(tsv arr, int64_t i, ts_frame_hdr* frame, uint32_t nslots){
   ts_frame_push(frame, nslots);
-  tsv r = ts_array_get(arr, i);
+  tsv r = ts_array_get_key_i64(arr, i);
   ts_frame_pop(frame);
   return r;
+}
+tsv ts_array_get_linked_f64(tsv arr, double d, ts_frame_hdr* frame, uint32_t nslots){
+  ts_frame_push(frame, nslots);
+  tsv r = ts_array_get_key_f64(arr, d);
+  ts_frame_pop(frame);
+  return r;
+}
+/* Element access with a number key (docs/array_index_keys_design.md): the
+   element path for an index, the dynamic property path for any other
+   number. */
+tsv ts_array_get_key_i64(tsv arr, int64_t i){
+  if ((uint64_t)i < TS_ARRAY_INDEX_LIMIT) return ts_array_get(arr, (uint32_t)i);
+  return ts_get_dyn(arr, ts_num((double)i));
+}
+tsv ts_array_get_key_f64(tsv arr, double d){
+  uint32_t i;
+  if (ts_num_array_index(d, &i)) return ts_array_get(arr, i);
+  return ts_get_dyn(arr, ts_num(d));
+}
+void ts_array_set_key_i64(tsv arr, int64_t i, tsv v){
+  if ((uint64_t)i < TS_ARRAY_INDEX_LIMIT){ ts_array_set(arr, (uint32_t)i, v); return; }
+  ts_set_dyn(arr, ts_num((double)i), v);
+}
+void ts_array_set_key_f64(tsv arr, double d, tsv v){
+  uint32_t i;
+  if (ts_num_array_index(d, &i)){ ts_array_set(arr, i, v); return; }
+  ts_set_dyn(arr, ts_num(d), v);
 }
 void ts_set_pic(tsv obj, ts_key key, tsv val, ts_prop_ic* ic){
   TS_RT_STAT_PIC_SET_CALL();
@@ -13076,11 +13104,13 @@ tsv ts_get_dyn(tsv obj, tsv keyv){
     ts_gc_unroot(1);
     return r;
   }
-  /* numeric key on an array uses the element fast path */
+  /* An index on an array uses the element path; any other number is a
+     property key (ToString) below, except on fixed-kind storage, where a
+     numeric non-index key reads undefined (integer-indexed exotic). */
   if (ts_is_indexed_array_fast(obj) && ts_is_num(keyv)) {
-    double index = ts_to_num(keyv);
-    if (((ts_array*)ts_ptr(obj))->element_kind && (!(index >= 0) || !isfinite(index) || trunc(index) != index || index >= UINT32_MAX)) return TS_UNDEFINED;
-    return ts_array_get(obj, (uint32_t)index);
+    uint32_t index;
+    if (ts_num_array_index(ts_to_num(keyv), &index)) return ts_array_get(obj, index);
+    if (((ts_array*)ts_ptr(obj))->element_kind) return TS_UNDEFINED;
   }
   /* numeric/dynamic key on a string still goes through ToPropertyKey, so
      (s as any)[0] and (s as any)["0"] both read the String exotic index. */
@@ -13131,9 +13161,10 @@ void ts_set_dyn(tsv obj, tsv keyv, tsv v){
     return;
   }
   if (ts_is_indexed_array_fast(obj) && ts_is_num(keyv)) {
-    double index = ts_to_num(keyv);
-    if (((ts_array*)ts_ptr(obj))->element_kind && (!(index >= 0) || !isfinite(index) || trunc(index) != index || index >= UINT32_MAX)) { (void)ts_number_coerce(v); return; }
-    ts_array_set(obj, (uint32_t)index, v); return;
+    uint32_t index;
+    if (ts_num_array_index(ts_to_num(keyv), &index)){ ts_array_set(obj, index, v); return; }
+    if (((ts_array*)ts_ptr(obj))->element_kind){ (void)ts_number_coerce(v); return; }
+    /* any other number is a property key (ToString), below */
   }
   /* non-string key on an object: ToPropertyKey. Number keys become string/index
      keys; symbol keys stay symbols. */

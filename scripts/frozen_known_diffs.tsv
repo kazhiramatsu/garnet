@@ -167,3 +167,5 @@ selfconf-unported	objects/dynamic_keys	Frozen emitter lacks computed-delete disp
 parity	strings/string_accumulators	The Rust emitter keeps a numeric temporary of the fixture as a double where the frozen emitter int-specializes it (`double d44` vs `long long d44`); the pre-existing numeric-specialization difference, the parity emission keeps the generic `+` (TSAOT_STRING_ACCUM=0); Session 350 x67.
 parity	gc/payload_envs	New payload-heap fixture (GC v2 G2a) exposes the existing FrameArena-vs-Stack allocation annotation difference (comment only); both outputs match V8
 selfconf-unported	gc/payload_envs	Frozen analyzer lacks array.spliceDrop (the splice fast paths); the native Rust output matches V8.
+parity-unported	arrays/numeric_index_keys	Frozen emitter lacks computed-delete dispatch (object.deleteDynamic: the fixture deletes a number key); the Rust emitter supports it and matches V8.
+selfconf-unported	arrays/numeric_index_keys	Frozen emitter lacks computed-delete dispatch (object.deleteDynamic); the native Rust output matches V8.

@@ -7807,6 +7807,18 @@ fn tag_eq_enabled() -> bool {
     })
 }
 
+/// Element access keys typed as numbers but not array indices
+/// (docs/array_index_keys_design.md): int64 / double entry points instead of a
+/// uint32 cast. TSAOT_INDEX_KEYS=0 keeps the previous emission (parity oracle).
+fn index_keys_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_INDEX_KEYS").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
 fn inline_index_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -19051,6 +19063,33 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             // the in-range non-hole element of an array is read in line
             // (TSAOT_INLINE_INDEX=0 keeps the out-of-line reader)
             let inline = inline_index_enabled();
+            if index_keys_enabled() {
+                // An int64 key goes to the int64 helpers as it is (no uint32
+                // cast); any other numeric operand is a double, tested for an
+                // index (docs/array_index_keys_design.md).
+                let int_key = ctx.unboxed.contains(&index.0) && ctx.int_local.contains(&index.0);
+                let (sfx, i) = if int_key { ("", format!("d{}", index.0)) } else { ("_f64", ctx.num(index.0)) };
+                let a = ctx.val(arr.0);
+                let call = if ctx.lazy_homes {
+                    format!(
+                        "({{ tsv _lz; if (!{t}{sfx}({a}, {i}, &_lz)) {{ {sp}_lz = ts_array_get_linked{sfx}({a}, {i}, &F.h, {n});{rl} }} _lz; }})",
+                        t = if inline { "ts_array_get_inline_try" } else { "ts_array_get_try" },
+                        sfx = sfx, a = a, i = i, n = ctx.frame_nslots, sp = ctx.lazy_spill, rl = ctx.lazy_reload
+                    )
+                } else if ctx.lazy_frame {
+                    format!(
+                        "{}{}({}, {}, &F.h, {})",
+                        if inline { "ts_array_get_inline_lazy" } else { "ts_array_get_lazy" },
+                        sfx, a, i, ctx.frame_nslots
+                    )
+                } else if inline {
+                    format!("ts_array_get_inline{}({}, {})", sfx, a, i)
+                } else {
+                    format!("ts_array_get_key{}({}, {})", if int_key { "_i64" } else { "_f64" }, a, i)
+                };
+                s.push_str(&ctx.set_val(dst.0, &call));
+                return;
+            }
             if ctx.lazy_homes {
                 let (a, i) = (ctx.val(arr.0), ctx.num(index.0));
                 s.push_str(&ctx.set_val(
@@ -19087,6 +19126,18 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
         Inst::StoreIndex { arr, index, src } => {
             // the dense in-capacity element store is in line
             // (TSAOT_INLINE_INDEX=0 keeps the out-of-line store, as for reads)
+            if index_keys_enabled() {
+                let int_key = ctx.unboxed.contains(&index.0) && ctx.int_local.contains(&index.0);
+                let i = if int_key { format!("d{}", index.0) } else { ctx.num(index.0) };
+                let f = match (inline_index_enabled(), int_key) {
+                    (true, true) => "ts_array_set_inline",
+                    (true, false) => "ts_array_set_inline_f64",
+                    (false, true) => "ts_array_set_key_i64",
+                    (false, false) => "ts_array_set_key_f64",
+                };
+                let _ = writeln!(s, "  {}({}, {}, {});", f, ctx.val(arr.0), i, ctx.val(src.0));
+                return;
+            }
             let _ = writeln!(
                 s,
                 "  {}({}, (uint32_t)({}), {});",

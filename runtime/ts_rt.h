@@ -1912,12 +1912,32 @@ TS_RT_ALWAYS_INLINE void ts_set_static3_inline_lazy(tsv obj, ts_key key, uint32_
   ts_set_pic(obj, key, value, ic);
   ts_frame_pop(frame);
 }
+/* Number keys of element access (docs/array_index_keys_design.md): an array
+   index is an integer in [0, 2^32 - 1); the key paths below take the element
+   path for an index and the dynamic property path for any other number. */
+#define TS_ARRAY_INDEX_LIMIT 4294967295ull
+static inline int ts_num_array_index(double d, uint32_t* out){
+  if (d >= 0.0 && d < 4294967295.0){ uint32_t i = (uint32_t)d; if ((double)i == d){ *out = i; return 1; } }
+  return 0;
+}
+tsv ts_array_get_key_i64(tsv arr, int64_t i);
+tsv ts_array_get_key_f64(tsv arr, double d);
+void ts_array_set_key_i64(tsv arr, int64_t i, tsv v);
+void ts_array_set_key_f64(tsv arr, double d, tsv v);
 /* Element read: the array path allocates nothing; a string receiver builds a
    one-character view, so it runs with the frame linked. */
-TS_RT_ALWAYS_INLINE tsv ts_array_get_lazy(tsv arr, uint32_t i, ts_frame_hdr* frame, uint32_t nslots){
-  if (ts_is_indexed_array_fast(arr)) return ts_array_get(arr, i);
+TS_RT_ALWAYS_INLINE tsv ts_array_get_lazy(tsv arr, int64_t i, ts_frame_hdr* frame, uint32_t nslots){
+  if (ts_is_indexed_array_fast(arr) && (uint64_t)i < TS_ARRAY_INDEX_LIMIT) return ts_array_get(arr, (uint32_t)i);
   ts_frame_push(frame, nslots);
-  tsv r = ts_array_get(arr, i);
+  tsv r = ts_array_get_key_i64(arr, i);
+  ts_frame_pop(frame);
+  return r;
+}
+static inline tsv ts_array_get_lazy_f64(tsv arr, double d, ts_frame_hdr* frame, uint32_t nslots){
+  uint32_t i;
+  if (ts_num_array_index(d, &i) && ts_is_indexed_array_fast(arr)) return ts_array_get(arr, i);
+  ts_frame_push(frame, nslots);
+  tsv r = ts_array_get_key_f64(arr, d);
   ts_frame_pop(frame);
   return r;
 }
@@ -2005,13 +2025,25 @@ static inline int array_is_hole(tsv v){ return v == TS_ARRAY_HOLE; }
    index of a dense array is undefined (ts_array_get agrees); a sparse array
    (cap 0) reads its side table out of line, as do strings and other
    receivers. */
-static inline tsv ts_array_get_inline(tsv arr, uint32_t i){
+/* Number keys (docs/array_index_keys_design.md): an array index is an
+   integer in [0, 2^32 - 1); any other number is a property key (ToString:
+   "-1", "1.5", "4294967295"). An integer key arrives as int64: the
+   in-capacity test also rejects negative values and values past the last
+   index, and past the capacity a dense array answers undefined only for an
+   index. A double key is tested for an index first. The key paths take the
+   element path for an index and the dynamic property path otherwise. */
+static inline tsv ts_array_get_inline(tsv arr, int64_t i){
   if (ts_is_indexed_array_fast(arr)){
     ts_array* a = (ts_array*)ts_ptr(arr);
-    if (i < a->cap){ tsv v = a->data[i]; return array_is_hole(v) ? TS_UNDEFINED : v; }
-    if (!a->sparse) return TS_UNDEFINED;
+    if ((uint64_t)i < a->cap){ tsv v = a->data[i]; return array_is_hole(v) ? TS_UNDEFINED : v; }
+    if (!a->sparse && (uint64_t)i < TS_ARRAY_INDEX_LIMIT) return TS_UNDEFINED;
   }
-  return ts_array_get(arr, i);
+  return ts_array_get_key_i64(arr, i);
+}
+static inline tsv ts_array_get_inline_f64(tsv arr, double d){
+  uint32_t i;
+  if (TS_RT_LIKELY(ts_num_array_index(d, &i))) return ts_array_get_inline(arr, (int64_t)i);
+  return ts_array_get_key_f64(arr, d);
 }
 /* Element store with the dense in-capacity case in line: a plain array (no
    fixed element kind, not frozen) with i below cap stores the slot, extends
@@ -2020,17 +2052,23 @@ static inline tsv ts_array_get_inline(tsv arr, uint32_t i){
    sparse arrays, typed storage, frozen arrays and other receivers take
    ts_array_set. */
 void ts_array_remember(ts_array* a, uint32_t index, tsv value);
-static inline void ts_array_set_inline(tsv arr, uint32_t i, tsv v){
+static inline void ts_array_set_inline(tsv arr, int64_t i, tsv v){
   if (ts_is_indexed_array_fast(arr)){
     ts_array* a = (ts_array*)ts_ptr(arr);
-    if (TS_RT_LIKELY(i < a->cap && !a->element_kind && !(ts_obj_integrity(&a->o) & 1u))){
-      a->data[i] = v;
-      if (i >= a->len) a->len = i + 1u;
-      if (a->o.h.gen == TS_GEN_OLD) ts_array_remember(a, i, v);
+    if (TS_RT_LIKELY((uint64_t)i < a->cap && !a->element_kind && !(ts_obj_integrity(&a->o) & 1u))){
+      uint32_t u = (uint32_t)i;
+      a->data[u] = v;
+      if (u >= a->len) a->len = u + 1u;
+      if (a->o.h.gen == TS_GEN_OLD) ts_array_remember(a, u, v);
       return;
     }
   }
-  ts_array_set(arr, i, v);
+  ts_array_set_key_i64(arr, i, v);
+}
+static inline void ts_array_set_inline_f64(tsv arr, double d, tsv v){
+  uint32_t i;
+  if (TS_RT_LIKELY(ts_num_array_index(d, &i))){ ts_array_set_inline(arr, (int64_t)i, v); return; }
+  ts_array_set_key_f64(arr, d, v);
 }
 /* for..of over a value its type does not classify (docs/array_iterators_design.md):
    ts_forof_open returns an array (walked by index here, in line) or an
@@ -2054,27 +2092,44 @@ static inline tsv ts_forof_next(tsv it, double idx, ts_key next_key){
   }
   return ts_forof_next_slow(it, next_key);
 }
-static inline int ts_array_get_inline_try(tsv arr, uint32_t i, tsv* out){
+static inline int ts_array_get_inline_try(tsv arr, int64_t i, tsv* out){
   if (ts_is_indexed_array_fast(arr)){
     ts_array* a = (ts_array*)ts_ptr(arr);
-    if (i < a->cap){ tsv v = a->data[i]; *out = array_is_hole(v) ? TS_UNDEFINED : v; return 1; }
-    if (!a->sparse){ *out = TS_UNDEFINED; return 1; }
+    if ((uint64_t)i < a->cap){ tsv v = a->data[i]; *out = array_is_hole(v) ? TS_UNDEFINED : v; return 1; }
+    if (!a->sparse && (uint64_t)i < TS_ARRAY_INDEX_LIMIT){ *out = TS_UNDEFINED; return 1; }
   }
   return 0;
 }
-static inline int ts_array_get_try(tsv arr, uint32_t i, tsv* out){
-  if (ts_is_indexed_array_fast(arr)){ *out = ts_array_get(arr, i); return 1; }
+static inline int ts_array_get_try(tsv arr, int64_t i, tsv* out){
+  if (ts_is_indexed_array_fast(arr) && (uint64_t)i < TS_ARRAY_INDEX_LIMIT){ *out = ts_array_get(arr, (uint32_t)i); return 1; }
   return 0;
 }
-tsv ts_array_get_linked(tsv arr, uint32_t i, ts_frame_hdr* frame, uint32_t nslots);
-static inline tsv ts_array_get_inline_lazy(tsv arr, uint32_t i, ts_frame_hdr* frame, uint32_t nslots){
+static inline int ts_array_get_inline_try_f64(tsv arr, double d, tsv* out){
+  uint32_t i;
+  return ts_num_array_index(d, &i) && ts_array_get_inline_try(arr, (int64_t)i, out);
+}
+static inline int ts_array_get_try_f64(tsv arr, double d, tsv* out){
+  uint32_t i;
+  return ts_num_array_index(d, &i) && ts_array_get_try(arr, (int64_t)i, out);
+}
+tsv ts_array_get_linked(tsv arr, int64_t i, ts_frame_hdr* frame, uint32_t nslots);
+tsv ts_array_get_linked_f64(tsv arr, double d, ts_frame_hdr* frame, uint32_t nslots);
+static inline tsv ts_array_get_inline_lazy(tsv arr, int64_t i, ts_frame_hdr* frame, uint32_t nslots){
   if (ts_is_indexed_array_fast(arr)){
     ts_array* a = (ts_array*)ts_ptr(arr);
-    if (i < a->cap){ tsv v = a->data[i]; return array_is_hole(v) ? TS_UNDEFINED : v; }
-    if (!a->sparse) return TS_UNDEFINED;
+    if ((uint64_t)i < a->cap){ tsv v = a->data[i]; return array_is_hole(v) ? TS_UNDEFINED : v; }
+    if (!a->sparse && (uint64_t)i < TS_ARRAY_INDEX_LIMIT) return TS_UNDEFINED;
   }
   ts_frame_push(frame, nslots);
-  tsv r = ts_array_get(arr, i);
+  tsv r = ts_array_get_key_i64(arr, i);
+  ts_frame_pop(frame);
+  return r;
+}
+static inline tsv ts_array_get_inline_lazy_f64(tsv arr, double d, ts_frame_hdr* frame, uint32_t nslots){
+  uint32_t i;
+  if (TS_RT_LIKELY(ts_num_array_index(d, &i))) return ts_array_get_inline_lazy(arr, (int64_t)i, frame, nslots);
+  ts_frame_push(frame, nslots);
+  tsv r = ts_array_get_key_f64(arr, d);
   ts_frame_pop(frame);
   return r;
 }

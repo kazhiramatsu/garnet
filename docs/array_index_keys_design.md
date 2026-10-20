@@ -62,6 +62,10 @@ Design:
     (`ts_get_dyn` / `ts_set_dyn` with the number) otherwise.
 - `TSAOT_INDEX_KEYS=0` keeps the previous emission for the parity oracle.
 
+`ts_has_prop_dyn` likewise: an index tests the element, any other number
+the named properties. `delete` already converted its key with
+ToPropertyKey.
+
 Fixture `arrays/numeric_index_keys`: reads and writes at -1, 1.5, NaN,
 Infinity, 2^32 - 1, 2^32 + 1 and -0 through int, double and boxed keys, on
 dense and sparse arrays, `in`, `delete`, `Object.keys`, and an `any` receiver.
