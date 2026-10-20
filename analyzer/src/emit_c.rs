@@ -1977,6 +1977,20 @@ impl LiveWalk {
     }
 }
 
+/// `Object.defineProperty` with a literal descriptor applies it the way
+/// ValidateAndApplyPropertyDescriptor does (an existing property keeps the
+/// fields the descriptor does not name). TSAOT_DEFINE_MERGE=0 keeps the
+/// previous calls, which apply the absent fields as false (the parity oracle).
+fn define_merge_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_DEFINE_MERGE").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
 /// `TSAOT_FRAME_ELISION=0` keeps a frame slot for every reference local.
 fn frame_elision_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -18052,16 +18066,35 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 let w = parts.get(2).copied().unwrap_or("1");
                 let c = parts.get(3).copied().unwrap_or("1");
                 let a = |i: usize| ctx.val(args.get(i).map(|x| x.0).unwrap_or(0));
-                let _ = writeln!(
-                    s,
-                    "  ts_define_data_dyn({}, {}, {}, {}, {}, {});",
-                    a(0),
-                    a(1),
-                    a(2),
-                    e,
-                    w,
-                    c
-                );
+                match parts.get(4) {
+                    // a user descriptor naming some fields: an existing
+                    // property keeps the others
+                    Some(present) if define_merge_enabled() => {
+                        let _ = writeln!(
+                            s,
+                            "  ts_define_data_desc({}, {}, {}, {}, {}, {}, {});",
+                            a(0),
+                            a(1),
+                            a(2),
+                            e,
+                            w,
+                            c,
+                            present
+                        );
+                    }
+                    _ => {
+                        let _ = writeln!(
+                            s,
+                            "  ts_define_data_dyn({}, {}, {}, {}, {}, {});",
+                            a(0),
+                            a(1),
+                            a(2),
+                            e,
+                            w,
+                            c
+                        );
+                    }
+                }
                 if let Some(d) = dst {
                     s.push_str(&ctx.set_val(d.0, "TS_UNDEFINED"));
                 }
@@ -18076,18 +18109,37 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 let e = parts.get(3).copied().unwrap_or("0");
                 let c = parts.get(4).copied().unwrap_or("0");
                 let a = |i: usize| ctx.val(args.get(i).map(|x| x.0).unwrap_or(0));
-                let _ = writeln!(
-                    s,
-                    "  ts_define_accessor_dyn({}, {}, {}, {}, {}, {}, {}, {});",
-                    a(0),
-                    a(1),
-                    a(2),
-                    a(3),
-                    g_this,
-                    s_this,
-                    e,
-                    c
-                );
+                match parts.get(5) {
+                    Some(present) if define_merge_enabled() => {
+                        let _ = writeln!(
+                            s,
+                            "  ts_define_accessor_desc({}, {}, {}, {}, {}, {}, {}, {}, {});",
+                            a(0),
+                            a(1),
+                            a(2),
+                            a(3),
+                            g_this,
+                            s_this,
+                            e,
+                            c,
+                            present
+                        );
+                    }
+                    _ => {
+                        let _ = writeln!(
+                            s,
+                            "  ts_define_accessor_dyn({}, {}, {}, {}, {}, {}, {}, {});",
+                            a(0),
+                            a(1),
+                            a(2),
+                            a(3),
+                            g_this,
+                            s_this,
+                            e,
+                            c
+                        );
+                    }
+                }
                 if let Some(d) = dst {
                     s.push_str(&ctx.set_val(d.0, "TS_UNDEFINED"));
                 }

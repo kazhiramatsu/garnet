@@ -6911,6 +6911,40 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   under protect mode, with zapping, and with a minor collection every 256
   allocations, its 78 output files identical. A/B against `fe2`: neutral
   (instructions 0.9999, cycles 0.9966).
+- Object.defineProperty with a descriptor that names only some fields
+  silently changed the rest: the exporter lowered a literal descriptor to
+  `object.defineData:<e>:<w>:<c>` with the absent attributes false (and an
+  absent value undefined), and the runtime's dynamic path read them the same
+  way, so `defineProperty(o, "a", { value: 10 })` made an existing property
+  non-writable, non-enumerable and non-configurable, `{ enumerable: false }`
+  erased its value, and a class field ignored the define altogether. Now
+  both paths apply ValidateAndApplyPropertyDescriptor: the exporter passes
+  the fields the descriptor names (`object.defineData:<e>:<w>:<c>:<named>`,
+  `object.defineAccessor:...:<named>`), the emitter calls
+  `ts_define_data_desc` / `ts_define_accessor_desc`, and one runtime core
+  (`define_own_property`) keeps the unnamed fields of an existing property,
+  converts data and accessor properties keeping enumerable / configurable,
+  rejects changes to a non-configurable property and new properties on a
+  non-extensible object (TypeError, V8's texts), and routes a proxy target
+  to its defineProperty trap. Reflect.defineProperty answers false instead
+  of throwing; a primitive target throws. A class field takes a new value;
+  other attributes on a class field throw (`KNOWN_GAPS.md`: the struct has
+  no per-field attributes). Reflect.set(target, key, value, receiver) with a
+  proxy receiver now uses the receiver's getOwnPropertyDescriptor and
+  defineProperty traps instead of its set trap, which recursed until the
+  stack overflowed (the forwarding set trap pattern). `TSAOT_DEFINE_MERGE=0`
+  keeps the previous calls for the parity oracle. Fixtures
+  `defineproperty/partial_descriptors` (partial updates, conversions,
+  non-configurable and non-extensible cases, Object.defineProperties, class
+  fields, functions, primitives, a proxy target) and
+  `reflect/reflect_set_proxy_receiver`; known rows: selfconf for both (the
+  frozen emitter's previous calls, its receiver-less Reflect.set). Gates:
+  unit, parity (365 identical), bundler, selfconf, GC stress, inline
+  policy, conformance 496/496 and 496/496 with a collection at every
+  allocation in protect mode; tsc rebuilt and compiled under protect mode,
+  with zapping, and with a minor collection every 256 allocations, its 78
+  output files identical. A/B against `pk`: neutral (instructions 0.9999,
+  cycles 0.9986).
 - Where the remaining 358.7M frame pushes come from (a per-function count,
   joined with the rule under relaxations): a precise backward liveness
   would remove 1.4% (it never needs a slot the linear walk does not: checked

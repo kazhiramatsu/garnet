@@ -145,3 +145,14 @@ of a wrapper object: `typeof Object("x")` is "string" (V8 "object") and
 wrapper constructors are rejected at compile time; the call form is not.
 Planned: make the call form loud for primitives, or model the wrappers.
 
+
+## Attributes of a class field (Session 350, found with the descriptor fix)
+
+A field of a sized class instance lives in the instance's struct, which has
+no per-field attributes. `Object.defineProperty(instance, "field", d)` with
+a descriptor that leaves the field a writable, enumerable, configurable data
+property (a new `value`, or the attributes all true) updates the field as
+V8 does; any other descriptor (`writable: false`, `enumerable: false`,
+`configurable: false`, an accessor) throws a TypeError ("Cannot redefine
+property: field (a class field keeps its default attributes)") where V8
+applies it. `Object.freeze` and `Object.seal` of an instance are modeled.

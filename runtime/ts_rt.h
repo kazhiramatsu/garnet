@@ -1429,6 +1429,8 @@ void ts_define_accessor_symkey(tsv obj, tsv sym, tsv getter, tsv setter, int g_t
    writable/configurable). e=w=c=1 behaves like an ordinary property. */
 void ts_define_data(tsv obj, ts_key key, tsv value, int e, int w, int c);
 void ts_define_data_dyn(tsv obj, tsv keyv, tsv value, int e, int w, int c);
+void ts_define_data_desc(tsv obj, tsv keyv, tsv value, int e, int w, int c, unsigned present);
+void ts_define_accessor_desc(tsv obj, tsv keyv, tsv getter, tsv setter, int g_this, int s_this, int e, int c, unsigned present);
 /* Object.getOwnPropertyDescriptor(obj,key) -> descriptor object or undefined. */
 tsv ts_get_own_property_descriptor(tsv obj, tsv keyv);
 /* Object.getOwnPropertyDescriptors(obj) -> {key: descriptor, ...}. */

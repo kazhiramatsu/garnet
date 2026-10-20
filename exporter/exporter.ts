@@ -9180,9 +9180,12 @@ class Exporter {
       // accessors and invokes the getter for their value).
       const ce = enumAttr === true ? 1 : 0;  // enumerable
       const cc = confAttr === true ? 1 : 0;  // configurable
-      // builtin carries g_this:s_this:enumerable:configurable
+      // builtin carries g_this:s_this:enumerable:configurable:present, the last
+      // the fields the descriptor names (1 get, 2 set, 4 enumerable,
+      // 8 configurable): a property that exists keeps the others.
+      const present = (getProp ? 1 : 0) | (setProp ? 2 : 0) | (enumAttr !== undefined ? 4 : 0) | (confAttr !== undefined ? 8 : 0);
       ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"),
-        builtin: `object.defineAccessor:${g.takesThis}:${s.takesThis}:${ce}:${cc}`, args: [obj, key, g.local, s.local] });
+        builtin: `object.defineAccessor:${g.takesThis}:${s.takesThis}:${ce}:${cc}:${present}`, args: [obj, key, g.local, s.local] });
       return;
     }
     // data (value) descriptor. A descriptor with no value/get/set (e.g. `{}` or
@@ -9198,8 +9201,11 @@ class Exporter {
     } else {
       valLocal = this.lowerExpr(ctx, valueProp.initializer);
     }
+    // the last field: the fields the descriptor names (1 value, 2 writable,
+    // 4 enumerable, 8 configurable): a property that exists keeps the others
+    const present = (valueProp ? 1 : 0) | (writeAttr !== undefined ? 2 : 0) | (enumAttr !== undefined ? 4 : 0) | (confAttr !== undefined ? 8 : 0);
     ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"),
-      builtin: `object.defineData:${e}:${w}:${c}`, args: [obj, key, valLocal] });
+      builtin: `object.defineData:${e}:${w}:${c}:${present}`, args: [obj, key, valLocal] });
   }
 
   lowerJsonConstValue(ctx: FnCtx, value: unknown, siteNode: ts.Node): number {

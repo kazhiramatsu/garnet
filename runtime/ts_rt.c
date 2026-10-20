@@ -12322,50 +12322,194 @@ tsv ts_get_own_property_descriptors(tsv obj){
    - accessor: get/set (absent -> undefined); e/c default false; getter/setter
      `this`: a function whose body reads `this` (takes_this) is called with
      this=receiver, an arrow uses lexical this. */
-void ts_define_property(tsv obj, tsv keyv, tsv desc){
-  if (g_has_proxies && ts_is_proxy(obj)){ ts_proxy_define_property(obj, keyv, desc); return; }
-  if (!ts_is_obj(obj)) return;
-  if (!ts_is_obj(desc)){
-    ts_throw(ts_new_string("TypeError: Property description must be an object", 48));
+/* Object.defineProperty / Reflect.defineProperty on an ordinary object
+   (ValidateAndApplyPropertyDescriptor). A new property takes the descriptor's
+   fields, absent ones false or undefined; an existing one keeps the fields the
+   descriptor does not name, and a non-configurable one accepts only what the
+   spec allows (a TypeError otherwise). A class field of a sized instance stays
+   a writable, enumerable, configurable data property: a value updates it, and
+   any other attribute throws (loudly: the struct has no per-field
+   attributes). */
+enum { DEF_VALUE = 1, DEF_WRITABLE = 2, DEF_ENUMERABLE = 4, DEF_CONFIGURABLE = 8, DEF_GET = 16, DEF_SET = 32 };
+/* `fmt` takes the property name once (V8's texts). */
+static void define_property_error(const char* fmt, ts_key key){
+  const char* nm = ts_field_name(key);
+  char buf[256];
+  snprintf(buf, sizeof(buf), fmt, nm ? nm : "?");
+  ts_throw_type_error(buf);
+}
+static tsv define_descriptor_object(unsigned present, tsv value, tsv getter, tsv setter, int e, int w, int c){
+  ts_gc_root(&value); ts_gc_root(&getter); ts_gc_root(&setter);
+  tsv d = ts_new_object();
+  ts_gc_root(&d);
+  if (present & DEF_VALUE) ts_set(d, ts_intern_field("value", 5), value);
+  if (present & DEF_WRITABLE) ts_set(d, ts_intern_field("writable", 8), ts_bool(w));
+  if (present & DEF_GET) ts_set(d, ts_intern_field("get", 3), getter);
+  if (present & DEF_SET) ts_set(d, ts_intern_field("set", 3), setter);
+  if (present & DEF_ENUMERABLE) ts_set(d, ts_intern_field("enumerable", 10), ts_bool(e));
+  if (present & DEF_CONFIGURABLE) ts_set(d, ts_intern_field("configurable", 12), ts_bool(c));
+  ts_gc_unroot(4);
+  return d;
+}
+/* 1 when applied; a refusal throws the TypeError when `throws` (Object.defineProperty)
+   and returns 0 otherwise (Reflect.defineProperty). */
+static int define_own_property(tsv obj, ts_key key, unsigned present, tsv value, tsv getter, tsv setter, int e, int w, int c, int throws){
+  ts_gc_root(&obj); ts_gc_root(&value); ts_gc_root(&getter); ts_gc_root(&setter);
+  int is_acc = (present & (DEF_GET | DEF_SET)) != 0, is_data = (present & (DEF_VALUE | DEF_WRITABLE)) != 0;
+  ts_object* o = (ts_object*)ts_ptr(obj);
+  uint32_t integ = ts_obj_integrity(o);
+  int exists = 0, cur_acc = 0, cur_e = 0, cur_w = 0, cur_c = 0, field = 0;
+  tsv cur_value = TS_UNDEFINED, cur_get = TS_UNDEFINED, cur_set = TS_UNDEFINED;
+  ts_gc_root(&cur_value); ts_gc_root(&cur_get); ts_gc_root(&cur_set);
+  if (g_has_class_regs && o->h.kind == TS_KIND_OBJECT && class_has_field(o, key)){
+    exists = field = 1;
+    cur_value = ts_get(obj, key);
+    cur_e = 1; cur_w = !(integ & 1u); cur_c = !(integ & (1u|4u));
+  } else if (kind_has_common_header(o->h.kind)){
+    ts_pref cur = prop_find(o, key);
+    if (pref_ok(cur)){
+      exists = 1;
+      cur_acc = pref_is_accessor(cur);
+      cur_e = pref_is_enumerable(cur);
+      cur_c = pref_is_configurable(cur) && !(integ & (1u|4u));
+      if (cur_acc){
+        ts_accessor* ac = (ts_accessor*)ts_ptr(pref_val(cur));
+        cur_get = ac->getter; cur_set = ac->setter;
+      } else {
+        cur_value = pref_val(cur);
+        cur_w = pref_is_writable(cur) && !(integ & 1u);
+      }
+    }
+  }
+  int ne, nw, nc;
+  tsv ng = TS_UNDEFINED, ns = TS_UNDEFINED, nv = TS_UNDEFINED;
+  if (!exists){
+    if (integ & (1u|2u|4u)){ ts_gc_unroot(7); if (throws) define_property_error("Cannot define property %s, object is not extensible", key); return 0; }
+    ne = e; nw = w; nc = c; ng = getter; ns = setter; nv = value;
+  } else {
+    /* a non-configurable property accepts no change of kind or attributes,
+       and a non-writable data property no other value */
+    if (!cur_c){
+      int bad = ((present & DEF_CONFIGURABLE) && c) || ((present & DEF_ENUMERABLE) && e != cur_e) ||
+                ((is_acc || is_data) && is_acc != cur_acc);
+      if (!bad && cur_acc)
+        bad = ((present & DEF_GET) && !ts_object_is(getter, cur_get)) ||
+              ((present & DEF_SET) && !ts_object_is(setter, cur_set));
+      if (!bad && !cur_acc && !cur_w)
+        bad = ((present & DEF_WRITABLE) && w) || ((present & DEF_VALUE) && !ts_object_is(value, cur_value));
+      if (bad){ ts_gc_unroot(7); if (throws) define_property_error("Cannot redefine property: %s", key); return 0; }
+    }
+    ne = (present & DEF_ENUMERABLE) ? e : cur_e;
+    nc = (present & DEF_CONFIGURABLE) ? c : cur_c;
+    /* a data property turned accessor keeps neither value nor writable, and
+       the other way round neither get nor set */
+    if (is_acc || (!is_data && cur_acc)){
+      ng = (present & DEF_GET) ? getter : (cur_acc ? cur_get : TS_UNDEFINED);
+      ns = (present & DEF_SET) ? setter : (cur_acc ? cur_set : TS_UNDEFINED);
+      nw = 0;
+    } else {
+      nv = (present & DEF_VALUE) ? value : (cur_acc ? TS_UNDEFINED : cur_value);
+      nw = (present & DEF_WRITABLE) ? w : (cur_acc ? 0 : cur_w);
+    }
+  }
+  int acc_result = exists ? (is_acc || (!is_data && cur_acc)) : is_acc;
+  if (field){
+    if (acc_result){ ts_gc_unroot(7); define_property_error("Cannot redefine property: %s (a class field stays a data property)", key); return 0; }
+    if (!(ne && nw && nc) && !(ne == cur_e && nw == cur_w && nc == cur_c)){
+      ts_gc_unroot(7); define_property_error("Cannot redefine property: %s (a class field keeps its default attributes)", key); return 0;
+    }
+    /* unchanged attributes (also on a frozen or sealed instance): the value */
+    if ((present & DEF_VALUE) && !ts_object_is(nv, cur_value)) ts_set(obj, key, nv);
+  } else if (acc_result){
+    int g_this = ts_is_func(ng) ? ((ts_func*)ts_ptr(ng))->takes_this : 0;
+    int s_this = ts_is_func(ns) ? ((ts_func*)ts_ptr(ns))->takes_this : 0;
+    ts_define_accessor_attr(obj, key, ng, ns, g_this, s_this, ne, nc);
+  } else {
+    ts_define_data(obj, key, nv, ne, nw, nc);
+  }
+  ts_gc_unroot(7);
+  return 1;
+}
+/* The emitted form of a literal descriptor: `present` names its fields
+   (1 value, 2 writable, 4 enumerable, 8 configurable). */
+void ts_define_data_desc(tsv obj, tsv keyv, tsv value, int e, int w, int c, unsigned present){
+  if (g_has_proxies && ts_is_proxy(obj)){
+    ts_gc_root(&obj); ts_gc_root(&keyv);
+    tsv d = define_descriptor_object(present & 15u, value, TS_UNDEFINED, TS_UNDEFINED, e, w, c);
+    ts_proxy_define_property(obj, keyv, d);
+    ts_gc_unroot(2);
     return;
   }
+  if (!ts_is_propbag(obj)){ ts_throw_type_error("Object.defineProperty called on non-object"); return; }
+  ts_gc_root(&obj); ts_gc_root(&value);
+  ts_key key;
+  int ok = ts_key_from_value(keyv, &key);
+  ts_gc_unroot(2);
+  if (ok) define_own_property(obj, key, present & 15u, value, TS_UNDEFINED, TS_UNDEFINED, e, w, c, 1);
+}
+/* `present`: 1 get, 2 set, 4 enumerable, 8 configurable. */
+void ts_define_accessor_desc(tsv obj, tsv keyv, tsv getter, tsv setter, int g_this, int s_this, int e, int c, unsigned present){
+  (void)g_this; (void)s_this;
+  unsigned bits = ((present & 1u) ? DEF_GET : 0u) | ((present & 2u) ? DEF_SET : 0u) | (present & 12u);
+  if (g_has_proxies && ts_is_proxy(obj)){
+    ts_gc_root(&obj); ts_gc_root(&keyv);
+    tsv d = define_descriptor_object(bits, TS_UNDEFINED, getter, setter, e, 0, c);
+    ts_proxy_define_property(obj, keyv, d);
+    ts_gc_unroot(2);
+    return;
+  }
+  if (!ts_is_propbag(obj)){ ts_throw_type_error("Object.defineProperty called on non-object"); return; }
+  ts_gc_root(&obj); ts_gc_root(&getter); ts_gc_root(&setter);
+  ts_key key;
+  int ok = ts_key_from_value(keyv, &key);
+  ts_gc_unroot(3);
+  if (ok) define_own_property(obj, key, bits, TS_UNDEFINED, getter, setter, e, 0, c, 1);
+}
+static int define_property_from(tsv obj, tsv keyv, tsv desc, int throws){
+  if (g_has_proxies && ts_is_proxy(obj)){ ts_proxy_define_property(obj, keyv, desc); return 1; }
+  if (!ts_is_propbag(obj)){
+    ts_throw_type_error(throws ? "Object.defineProperty called on non-object" : "Reflect.defineProperty called on non-object");
+    return 0;
+  }
+  if (!ts_is_obj(desc) && !ts_is_func(desc)){
+    ts_throw(ts_new_string("TypeError: Property description must be an object", 48));
+    return 0;
+  }
+  tsv getter = TS_UNDEFINED, setter = TS_UNDEFINED, value = TS_UNDEFINED;
   ts_gc_root(&obj); ts_gc_root(&desc); ts_gc_root(&keyv);
+  ts_gc_root(&getter); ts_gc_root(&setter); ts_gc_root(&value);
   ts_key k_value = ts_intern_field("value", 5);
   ts_key k_get   = ts_intern_field("get", 3);
   ts_key k_set   = ts_intern_field("set", 3);
   ts_key k_enum  = ts_intern_field("enumerable", 10);
   ts_key k_writ  = ts_intern_field("writable", 8);
   ts_key k_conf  = ts_intern_field("configurable", 12);
-  int has_value = ts_has_own(desc, k_value);
-  int has_get   = ts_has_own(desc, k_get);
-  int has_set   = ts_has_own(desc, k_set);
-  if (has_value && (has_get || has_set)){
-    ts_gc_unroot(3);
+  /* ToPropertyDescriptor, in the spec's order */
+  unsigned present = 0;
+  int e = 0, c = 0, w = 0;
+  if (ts_has_prop(desc, k_enum)){ present |= DEF_ENUMERABLE; e = ts_truthy(ts_get(desc, k_enum)); }
+  if (ts_has_prop(desc, k_conf)){ present |= DEF_CONFIGURABLE; c = ts_truthy(ts_get(desc, k_conf)); }
+  if (ts_has_prop(desc, k_value)){ present |= DEF_VALUE; value = ts_get(desc, k_value); }
+  if (ts_has_prop(desc, k_writ)){ present |= DEF_WRITABLE; w = ts_truthy(ts_get(desc, k_writ)); }
+  if (ts_has_prop(desc, k_get)){
+    present |= DEF_GET; getter = ts_get(desc, k_get);
+    if (!ts_is_func(getter) && !ts_is_undef(getter)){ ts_gc_unroot(6); ts_throw_type_error("Getter must be a function"); return 0; }
+  }
+  if (ts_has_prop(desc, k_set)){
+    present |= DEF_SET; setter = ts_get(desc, k_set);
+    if (!ts_is_func(setter) && !ts_is_undef(setter)){ ts_gc_unroot(6); ts_throw_type_error("Setter must be a function"); return 0; }
+  }
+  if ((present & (DEF_VALUE | DEF_WRITABLE)) && (present & (DEF_GET | DEF_SET))){
+    ts_gc_unroot(6);
     ts_throw(ts_new_string("TypeError: Invalid property descriptor (value with get/set)", 59));
-    return;
+    return 0;
   }
-  int e = ts_has_own(desc, k_enum) ? ts_truthy(ts_get(desc, k_enum)) : 0;
-  int c = ts_has_own(desc, k_conf) ? ts_truthy(ts_get(desc, k_conf)) : 0;
-  if (has_get || has_set){
-    tsv getter = has_get ? ts_get(desc, k_get) : TS_UNDEFINED;
-    ts_gc_root(&getter);
-    tsv setter = has_set ? ts_get(desc, k_set) : TS_UNDEFINED;
-    ts_gc_root(&setter);
-    int g_this = ts_is_func(getter) ? ((ts_func*)ts_ptr(getter))->takes_this : 0;
-    int s_this = ts_is_func(setter) ? ((ts_func*)ts_ptr(setter))->takes_this : 0;
-    ts_key key;
-    int ok = ts_key_from_value(keyv, &key);
-    ts_gc_unroot(2);
-    if (!ok){ ts_gc_unroot(3); return; }
-    ts_define_accessor_attr(obj, key, getter, setter, g_this, s_this, e, c);
-    ts_gc_unroot(3);
-    return;
-  }
-  int w = ts_has_own(desc, k_writ) ? ts_truthy(ts_get(desc, k_writ)) : 0;
-  tsv value = has_value ? ts_get(desc, k_value) : TS_UNDEFINED;
-  ts_define_data_dyn(obj, keyv, value, e, w, c);
-  ts_gc_unroot(3);
+  ts_key key;
+  int ok = ts_key_from_value(keyv, &key) ? define_own_property(obj, key, present, value, getter, setter, e, w, c, throws) : 1;
+  ts_gc_unroot(6);
+  return ok;
 }
+void ts_define_property(tsv obj, tsv keyv, tsv desc){ (void)define_property_from(obj, keyv, desc, 1); }
 
 /* Object.defineProperties(obj, descs): for each own enumerable key of descs,
    defineProperty(obj, key, descs[key]). */
@@ -13690,6 +13834,7 @@ tsv ts_reflect_get_recv(tsv t, tsv k, tsv r){
    write to the receiver, which takes it as its own writable data property
    (an own accessor or read-only property, or a non-extensible receiver,
    fails). Returns the success flag, as Reflect does (no throw). */
+static int proxy_receiver_set(tsv r, ts_key key, tsv v);
 static int ordinary_set_recv(tsv t, ts_key key, tsv v, tsv r){
   ts_gc_root(&t); ts_gc_root(&v); ts_gc_root(&r);
   int ok = 1;
@@ -13726,7 +13871,7 @@ static int ordinary_set_recv(tsv t, ts_key key, tsv v, tsv r){
   }
   /* the receiver's part */
   if (!ts_is_propbag(r)){ ok = 0; goto done; }
-  if (g_has_proxies && ts_is_proxy(r)){ ts_set_dyn(r, ts_key_to_value(key), v); goto done; }
+  if (g_has_proxies && ts_is_proxy(r)){ ok = proxy_receiver_set(r, key, v); goto done; }
   {
     ts_object* ro = (ts_object*)ts_ptr(r);
     if (kind_has_common_header(ro->h.kind) && (class_has_field(ro, key) || find_slot(ro, key, 0))){
@@ -13763,7 +13908,8 @@ tsv ts_reflect_delete(tsv t, tsv k){
   return ts_bool(r);
 }
 tsv ts_reflect_set_proto(tsv t, tsv p){ ts_set_proto_user(t, p); return ts_bool(1); }
-tsv ts_reflect_define_property(tsv t, tsv k, tsv d){ ts_define_property(t, k, d); return ts_bool(1); }
+/* false (not a TypeError) when the property cannot be defined as described */
+tsv ts_reflect_define_property(tsv t, tsv k, tsv d){ return ts_bool(define_property_from(t, k, d, 0)); }
 tsv ts_reflect_prevent_extensions(tsv t){ ts_object_prevent_extensions(t); return ts_bool(1); }
 /* Reflect.ownKeys: all own string keys (incl. non-enumerable, in spec order)
    followed by all own symbol keys. */
@@ -13884,6 +14030,33 @@ static tsv ts_proxy_trap(tsv pv, tsv handler, const char* name){
 static int pd_has(tsv d, const char* nm){ return ts_is_obj(d) && ts_has_prop(d, ts_intern_field(nm,(uint32_t)strlen(nm))); }
 static tsv pd_get(tsv d, const char* nm){ return ts_get(d, ts_intern_field(nm,(uint32_t)strlen(nm))); }
 static int pd_bool(tsv d, const char* nm){ return ts_truthy(pd_get(d, nm)); }
+/* OrdinarySetWithOwnDescriptor steps 2.c-2.e when the receiver is a proxy:
+   its [[GetOwnProperty]] and [[DefineOwnProperty]] (the getOwnPropertyDescriptor
+   and defineProperty traps), not its [[Set]]. A set trap that forwards with
+   Reflect.set(target, key, value, receiver) used to call itself until the
+   stack overflowed. */
+static int proxy_receiver_set(tsv r, ts_key key, tsv v){
+  ts_gc_root(&r); ts_gc_root(&v);
+  tsv keyv = ts_key_to_value(key);
+  ts_gc_root(&keyv);
+  tsv existing = ts_proxy_get_own_desc(r, keyv);
+  ts_gc_root(&existing);
+  tsv desc = TS_UNDEFINED;
+  ts_gc_root(&desc);
+  int ok = 1;
+  if (!ts_is_undef(existing)){
+    if (pd_has(existing, "get") || pd_has(existing, "set") || !pd_bool(existing, "writable")) ok = 0;
+    else {
+      desc = ts_new_object();
+      ts_set(desc, ts_intern_field("value", 5), v);
+    }
+  } else {
+    desc = build_data_descriptor(v, 1, 1, 1);
+  }
+  if (ok) ts_proxy_define_property(r, keyv, desc);
+  ts_gc_unroot(5);
+  return ok;
+}
 
 /* === GET === */
 static void proxy_inv_get(tsv target, tsv keyv, tsv result){
