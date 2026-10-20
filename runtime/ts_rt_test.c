@@ -1082,6 +1082,21 @@ int main(){
   ts_gc_unroot(3);
   ts_gc_collect();
 
+  /* The collector visits the Symbol.for registry as slots
+     (docs/gc_v2_design.md §6.5 step 1b): once its young key and symbol are
+     promoted, the registry holds both in the pointer form. */
+  tsv registry_probe=ts_symbol_for(ts_new_string("registry-slot-probe",19));
+  ts_gc_root(&registry_probe);
+  ts_gc_collect();
+  tsv registry_again=ts_symbol_for(ts_new_string("registry-slot-probe",19));
+  tsv registry_probe_key=ts_symbol_key_for(registry_again);
+  CK("symbol registry slots take the pointer form",
+     ts_strict_eq(registry_again,registry_probe) &&
+     ((ts_gc_header*)ts_ptr(registry_again))->gen==TS_GEN_OLD &&
+     ((registry_again & TS_PAYLOAD_MASK) & 1u)==0 &&
+     ts_is_str(registry_probe_key) && ((registry_probe_key & TS_PAYLOAD_MASK) & 1u)==0);
+  ts_gc_unroot(1);
+
   int registered_symbol_caught=0, registered_symbol_set_caught=0;
   tsv registered_symbol_map=ts_new_weakmap(); ts_gc_root(&registered_symbol_map);
   tsv registered_symbol_set=ts_new_weakset(); ts_gc_root(&registered_symbol_set);

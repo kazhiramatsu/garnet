@@ -4970,7 +4970,11 @@ static inline void gc_fixup_push(tsv* slot){
   }
   g_gc_fixup[g_gc_fixup_len++] = slot;
 }
-static inline void gc_visit_slot(tsv* slot, int young, int depth, int stable){
+/* Always inlined: the scan of cells is the collector's hot loop, and clang's
+   own choice flips with unrelated edits (adding the cold root sites of
+   docs/gc_v2_design.md §6.5 step 1b made it call this out of line from
+   gc_scan_cell: +1.1% instructions on the compiler). */
+TS_RT_ALWAYS_INLINE void gc_visit_slot(tsv* slot, int young, int depth, int stable){
   tsv v = *slot;
   if (!ts_heap_ref(v)) return;
   uint64_t payload = v & TS_PAYLOAD_MASK;
@@ -5599,8 +5603,8 @@ void ts_gc_collect_young(void){
   /* Only the Symbol.for registry is strong. Ordinary entries in g_sym_value
      are weak and are reached through real roots/property-key edges instead. */
   for (uint32_t i=0;i<g_symreg_len;i++){
-    gc_mark_value_young(g_symreg[i].key);
-    gc_mark_value_young(g_symreg[i].sym);
+    gc_visit_slot(&g_symreg[i].key, 1, 0, 1);
+    gc_visit_slot(&g_symreg[i].sym, 1, 0, 1);
   }
   for (int i=0;i<g_static_root_len;i++) gc_visit_slot(g_static_roots[i], 1, 0, 1);
   RT_STAT_ADD(minor_root_slots, g_static_root_len + g_root_len);
@@ -5748,8 +5752,8 @@ void ts_gc_collect(void){
   gc_mark_async_roots();
   /* Symbol.for is the only dynamically growing strong Symbol registry. */
   for (uint32_t i=0;i<g_symreg_len;i++){
-    gc_mark_value(g_symreg[i].key);
-    gc_mark_value(g_symreg[i].sym);
+    gc_visit_slot(&g_symreg[i].key, 0, 0, 1);
+    gc_visit_slot(&g_symreg[i].sym, 0, 0, 1);
   }
   for (int i=0;i<g_static_root_len;i++) gc_visit_slot(g_static_roots[i], 0, 0, 1);
   for (int i=0;i<g_root_len;i++){
@@ -14997,15 +15001,15 @@ static void gc_scan_async_cell(ts_gc_header* h, int young, int depth){
 }
 
 static void gc_mark_async_roots(void){
-  for (int i=0;i<g_mq_len;i++) gc_mark_value(g_microq[i]);
-  for (ts_io* t=g_io_head;t;t=t->next){ gc_mark_value(t->p); gc_mark_value(t->signal); }
-  for (ts_io* t=g_io_active;t;t=t->next){ gc_mark_value(t->p); gc_mark_value(t->signal); }
+  for (int i=0;i<g_mq_len;i++) gc_visit_slot(&g_microq[i], 0, 0, 1);
+  for (ts_io* t=g_io_head;t;t=t->next){ gc_visit_slot(&t->p, 0, 0, 1); gc_visit_slot(&t->signal, 0, 0, 1); }
+  for (ts_io* t=g_io_active;t;t=t->next){ gc_visit_slot(&t->p, 0, 0, 1); gc_visit_slot(&t->signal, 0, 0, 1); }
   gc_mark_abort_timer_roots();
 }
 static void gc_mark_async_roots_young(void){
-  for (int i=0;i<g_mq_len;i++) gc_mark_value_young(g_microq[i]);
-  for (ts_io* t=g_io_head;t;t=t->next){ gc_mark_value_young(t->p); gc_mark_value_young(t->signal); }
-  for (ts_io* t=g_io_active;t;t=t->next){ gc_mark_value_young(t->p); gc_mark_value_young(t->signal); }
+  for (int i=0;i<g_mq_len;i++) gc_visit_slot(&g_microq[i], 1, 0, 1);
+  for (ts_io* t=g_io_head;t;t=t->next){ gc_visit_slot(&t->p, 1, 0, 1); gc_visit_slot(&t->signal, 1, 0, 1); }
+  for (ts_io* t=g_io_active;t;t=t->next){ gc_visit_slot(&t->p, 1, 0, 1); gc_visit_slot(&t->signal, 1, 0, 1); }
   gc_mark_abort_timer_roots_young();
 }
 
@@ -15268,11 +15272,11 @@ static int ts_abort_timer_poll_timeout_ms(int default_ms){
 }
 
 static void gc_mark_abort_timer_roots(void){
-  for (ts_abort_timer* t=g_abort_timers;t;t=t->next) gc_mark_value(t->signal);
+  for (ts_abort_timer* t=g_abort_timers;t;t=t->next) gc_visit_slot(&t->signal, 0, 0, 1);
 }
 
 static void gc_mark_abort_timer_roots_young(void){
-  for (ts_abort_timer* t=g_abort_timers;t;t=t->next) gc_mark_value_young(t->signal);
+  for (ts_abort_timer* t=g_abort_timers;t;t=t->next) gc_visit_slot(&t->signal, 1, 0, 1);
 }
 
 tsv ts_abort_signal_new(int aborted){

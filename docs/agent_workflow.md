@@ -280,3 +280,16 @@ it with "unexpected always-inline runtime helper"; the **unit** gate and
 the **gc** gate both embed that check, so a `GC-STRESS FAILED` whose
 sub-tests all passed is this (Session 350, x33). Add the name to the
 allowlist in the same change.
+
+### Gotcha: a cold-path edit can move a hot helper out of line
+
+clang decides per build whether to inline a `static inline` helper, and
+call sites added elsewhere, cold ones included, can flip that decision
+inside a hot loop. GC v2 Y1 step 1b added six root visits and
+`gc_visit_slot` became a call in `gc_scan_cell`: +1.1% instructions on the
+compiler while the wall clock stayed within noise. Read the instruction
+count of every A/B; when it moves on a change that should not touch the
+hot path, compare the hot functions of the two runtimes (`objdump -d -r`
+of each relinked `rt.o`, counting the `ARM64_RELOC_BRANCH26` calls per
+function). Pin such a helper with `TS_RT_ALWAYS_INLINE` (in `ts_rt.c` the
+header's allowlist does not apply).

@@ -552,6 +552,26 @@ protect mode, with and without zapping. The GC stress gate runs the
 focused conformance and the runtime unit tests under protect mode
 (`TSAOT_GC_STRESS_PROTECT=0` skips the step).
 
+Step 1b. The collector read four runtime roots as values: the `Symbol.for`
+registry (keys and symbols), the microtask queue, the pending and active
+I/O tasks (promise and abort signal) and the abort timers (signal). A value
+read cannot be rewritten, so once cells move without handles these roots
+would keep the old address. They are now visited as slots, like the static
+roots and frame slots: a reference to a promoted cell takes the pointer
+form. A unit test checks the registry slots after a full collection (it
+fails on the previous runtime). The new call sites changed clang's inlining
+of `gc_visit_slot` in the scan of cells (it became a call there): +1.1%
+instructions on the compiler, found by the instruction count of the A/B
+(the wall clock was within noise). `gc_visit_slot` is now always inlined;
+with that, the slice is neutral. Still read as values, for step 4: the
+values of weak maps (the ephemeron pass marks them, and the pruning that
+follows compacts the entry arrays, so a slot recorded for rewriting would
+move), symbol property keys (a symbol id; the id table must be rewritten
+when a symbol moves), and coroutine frames (scanned conservatively: every
+word that looks like a reference is marked; step 4 needs a precise map,
+the emitter grouping the frame's `tsv` locals and recording their count,
+or the referenced cells pinned).
+
 ## 7. Verification
 
 - Gates of every slice: unit, parity (`scripts/emitc_diff.sh`), bundler,

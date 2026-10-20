@@ -6650,11 +6650,24 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   selfconf, GC stress, inline policy, conformance 485/485. A/B against G2d:
   eight ABBA pairs, wall 0.997, user 0.999; instructions -0.03%, cycles
   -0.06%: neutral.
+- GC v2 Y1 step 1b: runtime roots visited as slots
+  (`docs/gc_v2_design.md` §6.5). The collector marked the `Symbol.for`
+  registry, the microtask queue, the I/O tasks and the abort timers as
+  values, which cannot be rewritten when a cell moves; it now visits them
+  as slots, so a reference to a promoted cell takes the pointer form. A
+  unit test checks the registry after a full collection (it fails on the
+  previous runtime). The new call sites made clang call `gc_visit_slot` out
+  of line from `gc_scan_cell` (+1.1% instructions on the compiler, eight
+  ABBA pairs, the wall clock within noise); `gc_visit_slot` is now always
+  inlined (gotcha in `docs/agent_workflow.md`). Remaining value reads, for
+  step 4: weak map values, symbol property keys (ids), coroutine frames
+  (conservative). Gates: unit, parity (361 identical), bundler, selfconf,
+  GC stress (with the protect step), inline policy, conformance 485/485;
+  tsc compiled under protect mode. A/B against step 1: six ABBA pairs,
+  wall 1.001, instructions 1.000, cycles 1.002: neutral.
 - Next slices, in order. GC v2 first (`docs/gc_v2_design.md` §6.5, Y1:
-  1b root slots the collector reads as values (the symbol registry, the
-  microtask queue, I/O tasks, abort timers) visited as slots; 2 aging off;
-  3 nursery chunks from the cage; 4 direct pointers one kind at a time;
-  5 handles removed).
+  2 aging off; 3 nursery chunks from the cage; 4 direct pointers one kind
+  at a time (with precise coroutine frames); 5 handles removed).
   A slice that extends the stack or an arena to a
   new kind of allocation runs the conformance suite and a compile of the
   compiler under `--stack-check` (an arena must allocate through the
