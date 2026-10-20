@@ -6780,6 +6780,34 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   protect mode, its 78 output files identical to the previous build's. A/B
   against the Math slice: eight ABBA pairs, instructions +0.02%, cycles and
   wall within noise (three noisy pairs).
+- String to number as V8 computes it: ToNumber (`Number(s)`, `+s`,
+  arithmetic), parseFloat and parseInt. The runtime trimmed only ASCII
+  whitespace (`Number("\u00a0 12")` was NaN), accepted C's forms (`"inf"`,
+  a signed `"-0x10"`), parsed parseInt through `strtol` (saturating at
+  2^63; `parseInt(1e21)` and `parseInt(5e-7)` used the number instead of
+  its string, 1e21 and 0 instead of 1 and 5) and parseFloat through
+  `strtod` (`"0x10"` read as 16). Now: StrWhiteSpaceChar trimming (Unicode
+  spaces, line terminators, the BOM); StringToNumber accepts one literal
+  (unsigned `0x` / `0o` / `0b`, `Infinity`, a decimal literal);
+  parseFloat takes the longest decimal-literal prefix; parseInt converts
+  its argument with ToString, its radix with ToInt32 (`ts_parse_int_v`
+  converts a boxed radix after the string), and reads digits the way V8
+  does: radix 10 through a correctly rounded strtod of up to 310 digits,
+  power-of-two radixes rounded once to the nearest double (ties to even),
+  the other radixes folding 32-bit parts with one multiply-add per part.
+  That multiply-add is fused on arm64: V8's C++ is compiled with
+  contraction, and 20,000 radix-3..36 strings agree with node only in the
+  fused form, so the runtime calls `fma` there (and on x86 with FMA).
+  `TSAOT_PARSEINT_COERCE=0` keeps the previous radix read for the parity
+  oracle. Fixture `numbers/string_to_number` (41 inputs through Number,
+  parseFloat and 14 radices; hashes of long digit strings in radices 2..36,
+  1,500 decimal strings, 900 prefixed literals); known rows: the frozen
+  emitter's raw radix read (selfconf) and a numeric-specialization
+  difference (parity). Gates: unit, parity (362 identical), bundler,
+  selfconf, GC stress, inline policy, conformance 491/491; tsc rebuilt,
+  compiled under protect mode, its 78 output files identical. A/B against
+  the number printer: eight ABBA pairs, instructions 0.9997 (eight of
+  eight), wall 0.999, cycles within noise: neutral.
 - Next slices, in order. GC v2 first (`docs/gc_v2_design.md` §6.5, Y1:
   4 direct pointers (4a the collector's machinery behind a switch, 4b
   strings, then the other kinds); 5 handles removed).

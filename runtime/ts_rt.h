@@ -1201,6 +1201,7 @@ static inline double ts_number_coerce(tsv v){
 }
 double ts_parse_float(tsv v);
 double ts_parse_int(tsv v, double radix);
+double ts_parse_int_v(tsv v, tsv radix);   /* ToString, then ToInt32(radix) */
 tsv    ts_number_tofixed(double x, double digits);
 /* Date */
 tsv    ts_date_now_ms(void);

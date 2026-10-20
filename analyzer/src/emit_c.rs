@@ -10531,6 +10531,18 @@ fn math_coerce_enabled() -> bool {
     })
 }
 
+/// `TSAOT_PARSEINT_COERCE=0` keeps parseInt's previous radix read (raw
+/// double bits of a boxed radix) for the parity oracle.
+fn parseint_coerce_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_PARSEINT_COERCE").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
 /// Full C body (statements incl. `return`) of a static-builtin function-value
 /// adapter. `a`/`n` are the ts_code args. Each mirrors the call-path semantics
 /// (same runtime helper / libm). Returns None for builtins NOT supported as
@@ -10592,6 +10604,7 @@ fn fnval_adapter_body(builtin: &str) -> Option<String> {
         "number.isNaN" => hv(format!("ts_bool(ts_number_is_nan({}))", val(0))),
         "number.isSafeInteger" => hv(format!("ts_bool(ts_number_is_safe_integer({}))", val(0))),
         "number.parseFloat" | "global.parseFloat" => hv_n("ts_parse_float"),
+        "number.parseInt" | "global.parseInt" if parseint_coerce_enabled() => hv(format!("ts_num(ts_parse_int_v({}, {}))", val(0), val(1))),
         "number.parseInt" | "global.parseInt" => hv(format!("ts_num(ts_parse_int({}, (n>1?ts_to_num(a[1]):0.0)))", val(0))),
         "global.isNaN" => hv(format!("ts_bool(isnan(ts_number_coerce({})))", val(0))),
         "global.isFinite" => hv(format!("ts_bool(isfinite(ts_number_coerce({})))", val(0))),
@@ -17951,11 +17964,20 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 ),
                 "number.parseFloat" => (format!("ts_parse_float({})", v(0)), true),
                 "number.parseInt" => (
-                    format!(
-                        "ts_parse_int({}, {})",
-                        v(0),
-                        if args.len() > 1 { n(1) } else { "0".into() }
-                    ),
+                    if parseint_coerce_enabled()
+                        && args.len() > 1
+                        && !ctx.unboxed.contains(&args[1].0)
+                        && !ctx.json_locals.contains(&args[1].0)
+                    {
+                        // a boxed radix: ToString(string), then ToInt32(radix)
+                        format!("ts_parse_int_v({}, {})", v(0), v(1))
+                    } else {
+                        format!(
+                            "ts_parse_int({}, {})",
+                            v(0),
+                            if args.len() > 1 { n(1) } else { "0".into() }
+                        )
+                    },
                     true,
                 ),
                 "number.coerce" => (format!("ts_number_coerce({})", v(0)), true),
@@ -18092,11 +18114,20 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 // global parse functions
                 "global.parseFloat" => (format!("ts_parse_float({})", v(0)), true),
                 "global.parseInt" => (
-                    format!(
-                        "ts_parse_int({}, {})",
-                        v(0),
-                        if args.len() > 1 { n(1) } else { "0".into() }
-                    ),
+                    if parseint_coerce_enabled()
+                        && args.len() > 1
+                        && !ctx.unboxed.contains(&args[1].0)
+                        && !ctx.json_locals.contains(&args[1].0)
+                    {
+                        // a boxed radix: ToString(string), then ToInt32(radix)
+                        format!("ts_parse_int_v({}, {})", v(0), v(1))
+                    } else {
+                        format!(
+                            "ts_parse_int({}, {})",
+                            v(0),
+                            if args.len() > 1 { n(1) } else { "0".into() }
+                        )
+                    },
                     true,
                 ),
                 // global isNaN/isFinite ToNumber-coerce their argument (unlike the

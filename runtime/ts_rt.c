@@ -8053,36 +8053,13 @@ int ts_number_is_safe_integer(tsv v){
   return isfinite(d) && floor(d)==d && d>=-9007199254740991.0 && d<=9007199254740991.0;
 }
 /* Number(x) coercion to a double value. Strings parse like JS Number(). */
+static double js_string_to_number_view(ts_strview v);
 double ts_number_coerce_slow(tsv v){
   if (ts_is_num(v)) return ts_to_num(v);
   if (ts_is_bool(v)) return (double)(v & 1);
   if (ts_is_null(v)) return 0;
   if (ts_is_undef(v)) return NAN;
-  if (ts_is_str(v)){
-    uint32_t slen=0;
-    char* copy=ts_string_cstr_copy(v, &slen);
-    if (slen==0){ free(copy); return 0; } /* Number("") === 0 */
-    /* JS-specific binary/octal prefixes (strtod handles 0x but not 0b/0o). */
-    const char* q=copy;
-    while (*q==' '||*q=='\t'||*q=='\n'||*q=='\r'||*q=='\v'||*q=='\f') q++;
-    if (q[0]=='0' && (q[1]=='b'||q[1]=='B'||q[1]=='o'||q[1]=='O')){
-      int base = (q[1]=='b'||q[1]=='B') ? 2 : 8;
-      char* end=NULL; long long val=strtoll(q+2, &end, base);
-      if (end==q+2){ free(copy); return NAN; }   /* no digits after prefix */
-      while (*end==' '||*end=='\t'||*end=='\n'||*end=='\r'||*end=='\v'||*end=='\f') end++;
-      if (*end!=0){ free(copy); return NAN; }
-      free(copy);
-      return (double)val;
-    }
-    char* end=NULL; double d=strtod(copy, &end);
-    /* trailing JS whitespace must be tolerated too — ToNumber trims the full
-       set (tab/LF/CR/VT/FF/space), so `"\t"` and `"12\t"` are 0 and 12, not NaN
-       (this mirrors the leading skip above; strtod already ate leading ws). */
-    while (end && (*end==' '||*end=='\t'||*end=='\n'||*end=='\r'||*end=='\v'||*end=='\f')) end++;
-    if (end && *end!=0){ free(copy); return NAN; }
-    free(copy);
-    return d;
-  }
+  if (ts_is_str(v)) return js_string_to_number_view(ts_str_view_typed(v));
   /* object: ToPrimitive(number) via Symbol.toPrimitive / valueOf / toString,
      then coerce the resulting primitive. (Symbols are not numerically coercible.) */
   if (ts_object_like(v) && !ts_is_symbol(v)){
@@ -8092,37 +8069,263 @@ double ts_number_coerce_slow(tsv v){
   return NAN;
 }
 /* parseInt/parseFloat (global). parseInt supports an optional radix. */
-double ts_parse_float(tsv v){
-  if (ts_is_num(v)) return ts_to_num(v);
-  if (!ts_is_str(v)) return NAN;
-  char* copy=ts_string_cstr_copy(v, NULL); char* end=NULL; double d=strtod(copy,&end);
-  int empty = (end==copy);
-  free(copy);
-  return empty ? NAN : d;
+/* ---------------- string to number (ECMA-262 StringToNumber, parseFloat,
+   parseInt), the algorithms V8 uses so the results agree to the last bit ---- */
+/* StrWhiteSpaceChar: WhiteSpace and LineTerminator. */
+static int js_strws(uint32_t c){
+  return c == 0x09 || c == 0x0B || c == 0x0C || c == 0x20 || c == 0xA0 || c == 0xFEFF ||
+         c == 0x0A || c == 0x0D || c == 0x2028 || c == 0x2029 || c == 0x1680 ||
+         (c >= 0x2000 && c <= 0x200A) || c == 0x202F || c == 0x205F || c == 0x3000;
 }
+static inline int js_digit_value(uint32_t c){
+  if (c >= '0' && c <= '9') return (int)(c - '0');
+  if (c >= 'a' && c <= 'z') return (int)(c - 'a' + 10);
+  if (c >= 'A' && c <= 'Z') return (int)(c - 'A' + 10);
+  return 99;
+}
+/* The ASCII characters [a, b) of the view, for strtod. */
+static double js_strtod_span(ts_strview v, uint32_t a, uint32_t b){
+  char stack[128];
+  size_t len = (size_t)(b - a);
+  char* buf = len < sizeof stack ? stack : (char*)malloc(len + 1);
+  if (!buf) ts_abort_msg("out of memory converting a string to a number");
+  for (uint32_t i = a; i < b; i++) buf[i - a] = (char)ts_str_cu_at_view(v, i);
+  buf[len] = 0;
+  double d = strtod(buf, NULL);
+  if (buf != stack) free(buf);
+  return d;
+}
+/* V8 InternalStringToIntDouble<log2r>: the digits of a power-of-two radix,
+   rounded once (to nearest, ties to even) when they exceed 53 bits. *pos is
+   at the first digit (leading zeros allowed); returns NaN for trailing junk
+   when !allow_junk (trailing whitespace is not junk). */
+static double js_pow2_digits(ts_strview v, uint32_t* pos, uint32_t end, int log2r,
+                             int allow_junk, int negative){
+  uint32_t cur = *pos;
+  int radix = 1 << log2r;
+  while (cur < end && ts_str_cu_at_view(v, cur) == '0'){
+    cur++;
+    if (cur == end){ *pos = cur; return negative ? -0.0 : 0.0; }
+  }
+  int64_t number = 0;
+  int exponent = 0;
+  while (cur < end){
+    int digit = js_digit_value(ts_str_cu_at_view(v, cur));
+    if (digit >= radix){
+      if (!allow_junk){
+        while (cur < end && js_strws(ts_str_cu_at_view(v, cur))) cur++;
+        if (cur < end) return NAN;
+      }
+      break;
+    }
+    number = number * radix + digit;
+    int overflow = (int)(number >> 53);
+    if (overflow != 0){
+      int overflow_bits_count = 1;
+      while (overflow > 1){ overflow_bits_count++; overflow >>= 1; }
+      int dropped_bits_mask = (1 << overflow_bits_count) - 1;
+      int dropped_bits = (int)number & dropped_bits_mask;
+      number >>= overflow_bits_count;
+      exponent = overflow_bits_count;
+      int zero_tail = 1;
+      for (;;){
+        cur++;
+        if (cur == end || js_digit_value(ts_str_cu_at_view(v, cur)) >= radix) break;
+        zero_tail = zero_tail && ts_str_cu_at_view(v, cur) == '0';
+        exponent += log2r;
+      }
+      if (!allow_junk){
+        while (cur < end && js_strws(ts_str_cu_at_view(v, cur))) cur++;
+        if (cur < end) return NAN;
+      }
+      int middle_value = 1 << (overflow_bits_count - 1);
+      if (dropped_bits > middle_value) number++;
+      else if (dropped_bits == middle_value){ if ((number & 1) != 0 || !zero_tail) number++; }
+      if ((number & ((int64_t)1 << 53)) != 0){ exponent++; number >>= 1; }
+      break;
+    }
+    cur++;
+  }
+  *pos = cur;
+  if (exponent == 0){
+    if (negative){ if (number == 0) return -0.0; number = -number; }
+    return (double)number;
+  }
+  return ldexp((double)(negative ? -number : number), exponent);
+}
+/* parseInt(view, R) with R the ToInt32 of the radix (0 or 2..36). */
+static double js_parse_int_view(ts_strview v, int32_t radix){
+  uint32_t cur = 0, end = v.len;
+  while (cur < end && js_strws(ts_str_cu_at_view(v, cur))) cur++;
+  if (cur == end) return NAN;
+  int negative = 0;
+  uint32_t c = ts_str_cu_at_view(v, cur);
+  if (c == '+' || c == '-'){
+    negative = c == '-';
+    cur++;
+    if (cur == end) return NAN;
+  }
+  int leading_zero = 0;
+  if (radix == 0){
+    radix = 10;
+    if (ts_str_cu_at_view(v, cur) == '0'){
+      cur++;
+      if (cur == end) return negative ? -0.0 : 0.0;
+      c = ts_str_cu_at_view(v, cur);
+      if (c == 'x' || c == 'X'){ radix = 16; cur++; if (cur == end) return NAN; }
+      else leading_zero = 1;
+    }
+  } else if (radix == 16){
+    if (ts_str_cu_at_view(v, cur) == '0'){
+      cur++;
+      if (cur == end) return negative ? -0.0 : 0.0;
+      c = ts_str_cu_at_view(v, cur);
+      if (c == 'x' || c == 'X'){ cur++; if (cur == end) return NAN; }
+      else leading_zero = 1;
+    }
+  }
+  if (radix < 2 || radix > 36) return NAN;
+  while (ts_str_cu_at_view(v, cur) == '0'){
+    leading_zero = 1;
+    cur++;
+    if (cur == end) return negative ? -0.0 : 0.0;
+  }
+  if (js_digit_value(ts_str_cu_at_view(v, cur)) >= radix)
+    return leading_zero ? (negative ? -0.0 : 0.0) : NAN;
+  double result;
+  if ((radix & (radix - 1)) == 0){
+    int log2r = 0; while ((1 << log2r) < radix) log2r++;
+    result = js_pow2_digits(v, &cur, end, log2r, 1, 0);
+  } else if (radix == 10){
+    /* V8 keeps at most 310 digits (more is out of the double range) and
+       reads them with a correctly rounded strtod. */
+    char buf[312]; int n = 0;
+    while (cur < end){
+      uint32_t d = ts_str_cu_at_view(v, cur);
+      if (d < '0' || d > '9') break;
+      if (n <= 309) buf[n++] = (char)d;
+      cur++;
+    }
+    buf[n] = 0;
+    result = strtod(buf, NULL);
+  } else {
+    /* V8's generic case: parts that keep the multiplier within 32 bits, each
+       folded into a double as result * multiplier + part. */
+    result = 0;
+    int done = 0;
+    do {
+      uint32_t part = 0, multiplier = 1;
+      for (;;){
+        int d = js_digit_value(ts_str_cu_at_view(v, cur));
+        if (d >= radix){ done = 1; break; }
+        const uint32_t kMaximumMultiplier = 0xFFFFFFFFu / 36u;
+        uint32_t m = multiplier * (uint32_t)radix;
+        if (m > kMaximumMultiplier) break;
+        part = part * (uint32_t)radix + (uint32_t)d;
+        multiplier = m;
+        cur++;
+        if (cur == end){ done = 1; break; }
+      }
+      /* V8 computes result * multiplier + part in C++; its arm64 build fuses
+         it into one multiply-add (20,000 radix-3..36 cases agree only with
+         the fused form), its x64 build cannot (no FMA in the baseline). */
+#if defined(__aarch64__) || defined(__FMA__)
+      result = fma(result, (double)multiplier, (double)part);
+#else
+      { double t = result * (double)multiplier; result = t + (double)part; }
+#endif
+    } while (!done);
+  }
+  return negative ? -result : result;
+}
+/* The longest StrDecimalLiteral at [a, end): its end, or a when there is none.
+   Grammar: [+-] (Infinity | digits [. digits] | . digits) [(e|E) [+-] digits]. */
+static uint32_t js_decimal_literal_end(ts_strview v, uint32_t a, uint32_t end, int* infinity){
+  uint32_t cur = a;
+  *infinity = 0;
+  if (cur < end){ uint32_t c = ts_str_cu_at_view(v, cur); if (c == '+' || c == '-') cur++; }
+  static const char inf[] = "Infinity";
+  if (end - cur >= 8){
+    int ok = 1;
+    for (int i = 0; i < 8; i++) if (ts_str_cu_at_view(v, cur + (uint32_t)i) != (uint32_t)inf[i]){ ok = 0; break; }
+    if (ok){ *infinity = 1; return cur + 8; }
+  }
+  uint32_t digits = 0;
+  while (cur < end && ts_str_cu_at_view(v, cur) >= '0' && ts_str_cu_at_view(v, cur) <= '9'){ cur++; digits++; }
+  if (cur < end && ts_str_cu_at_view(v, cur) == '.'){
+    uint32_t dot = cur;
+    cur++;
+    uint32_t frac = 0;
+    while (cur < end && ts_str_cu_at_view(v, cur) >= '0' && ts_str_cu_at_view(v, cur) <= '9'){ cur++; frac++; }
+    if (!digits && !frac) cur = dot;      /* a lone "." is no literal */
+    digits += frac;
+  }
+  if (!digits) return a;
+  if (cur < end && (ts_str_cu_at_view(v, cur) == 'e' || ts_str_cu_at_view(v, cur) == 'E')){
+    uint32_t e = cur + 1;
+    if (e < end && (ts_str_cu_at_view(v, e) == '+' || ts_str_cu_at_view(v, e) == '-')) e++;
+    uint32_t ed = e;
+    while (ed < end && ts_str_cu_at_view(v, ed) >= '0' && ts_str_cu_at_view(v, ed) <= '9') ed++;
+    if (ed > e) cur = ed;                 /* an exponent needs a digit */
+  }
+  return cur;
+}
+static double js_parse_float_view(ts_strview v){
+  uint32_t cur = 0, end = v.len;
+  while (cur < end && js_strws(ts_str_cu_at_view(v, cur))) cur++;
+  int infinity = 0;
+  uint32_t lit = js_decimal_literal_end(v, cur, end, &infinity);
+  if (lit == cur) return NAN;
+  if (infinity) return ts_str_cu_at_view(v, cur) == '-' ? -INFINITY : INFINITY;
+  return js_strtod_span(v, cur, lit);
+}
+/* StringToNumber: the whole trimmed string must be one literal. */
+static double js_string_to_number_view(ts_strview v){
+  uint32_t a = 0, b = v.len;
+  while (a < b && js_strws(ts_str_cu_at_view(v, a))) a++;
+  while (b > a && js_strws(ts_str_cu_at_view(v, b - 1))) b--;
+  if (a == b) return 0;
+  if (b - a >= 3 && ts_str_cu_at_view(v, a) == '0'){
+    uint32_t p = ts_str_cu_at_view(v, a + 1);
+    int log2r = (p == 'x' || p == 'X') ? 4 : (p == 'o' || p == 'O') ? 3 : (p == 'b' || p == 'B') ? 1 : 0;
+    if (log2r){
+      uint32_t cur = a + 2;
+      if (js_digit_value(ts_str_cu_at_view(v, cur)) >= (1 << log2r)) return NAN;
+      double r = js_pow2_digits(v, &cur, b, log2r, 0, 0);
+      return (r == r && cur == b) ? r : NAN;
+    }
+  }
+  int infinity = 0;
+  uint32_t lit = js_decimal_literal_end(v, a, b, &infinity);
+  if (lit != b) return NAN;
+  if (infinity) return ts_str_cu_at_view(v, a) == '-' ? -INFINITY : INFINITY;
+  return js_strtod_span(v, a, b);
+}
+
+/* parseFloat(string): ToString, then the longest decimal literal. */
+double ts_parse_float(tsv v){
+  if (ts_is_num(v)){ double d = ts_to_num(v); return d == 0 ? 0.0 : d; }   /* ToString(-0) is "0" */
+  tsv s = ts_is_str(v) ? v : ts_to_string_v(v);
+  return js_parse_float_view(ts_str_view_typed(s));
+}
+/* parseInt(string, radix) with a radix that is already a number. */
 double ts_parse_int(tsv v, double radix){
-  if (!ts_is_str(v)){ double d = ts_is_num(v)?ts_to_num(v):NAN; return (d!=d)?NAN:trunc(d); }
-  char* copy=ts_string_cstr_copy(v, NULL);
-  const char* p = copy;
-  while (*p==' '||*p=='\t'||*p=='\n'||*p=='\r') p++;  /* skip leading whitespace */
-  int sign = 1;
-  if (*p=='+' ) p++; else if (*p=='-'){ sign=-1; p++; }
-  int base=(int)radix;
-  /* JS: radix 0/undefined -> auto-detect "0x"/"0X" as hex (base 16), else 10.
-     (Unlike C strtol base 0, a leading "0" alone is decimal, not octal.) */
-  if (base==0){
-    if (p[0]=='0' && (p[1]=='x'||p[1]=='X')){ base=16; p+=2; }
-    else base=10;
-  } else if (base==16 && p[0]=='0' && (p[1]=='x'||p[1]=='X')){ p+=2; }
-  /* JS requires a valid digit immediately after the optional sign — strtol would
-     otherwise skip whitespace / consume another sign (parseInt("- 5") -> NaN). */
-  if (*p==' '||*p=='\t'||*p=='\n'||*p=='\r'||*p=='\v'||*p=='\f'||*p=='+'||*p=='-'){ free(copy); return NAN; }
-  char* end=NULL; long val=strtol(p,&end,base);
-  /* parseInt("-0") === -0 (and "-0.9", etc.): a negative sign with a zero
-     magnitude yields negative zero, not +0. */
-  double out = (end==p) ? NAN : (sign < 0 && val == 0) ? -0.0 : (double)(sign*val);
-  free(copy);
-  return out;
+  tsv s = ts_is_str(v) ? v : ts_to_string_v(v);
+  int32_t r = ts_to_int32(radix);
+  if (r != 0 && (r < 2 || r > 36)) return NAN;
+  return js_parse_int_view(ts_str_view_typed(s), r);
+}
+/* parseInt(string, radix) with any radix: ToString(string), then
+   ToInt32(radix), in that order (both may run user code). */
+double ts_parse_int_v(tsv v, tsv radix){
+  ts_gc_root(&radix);
+  tsv s = ts_is_str(v) ? v : ts_to_string_v(v);
+  ts_gc_root(&s);
+  double rd = ts_is_undef(radix) ? 0.0 : ts_number_coerce(radix);
+  ts_gc_unroot(2);
+  int32_t r = ts_to_int32(rd);
+  if (r != 0 && (r < 2 || r > 36)) return NAN;
+  return js_parse_int_view(ts_str_view_typed(s), r);
 }
 
 static ts_rt_ic g_ic_rx_last_index;
