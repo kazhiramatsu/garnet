@@ -2155,6 +2155,8 @@ static uint32_t g_shapes_cap = 0;
    the accessors below read them. Index 0 and TS_SHAPE_EMPTY stay NULL. */
 ts_key** g_ts_shape_keys = NULL;
 uint8_t** g_ts_shape_flags = NULL;
+ts_key* g_ts_probe_rkeys = NULL;
+ts_key* g_ts_probe_wkeys = NULL;
 /* The vectors of shapes 0 (dictionary) and 1 (empty): all NONE, so a static
    slot probe on such a receiver misses without a shape test. */
 static ts_key g_shape_keys_none[TS_STATIC_SLOT_LIMIT] = {
@@ -2171,6 +2173,14 @@ static void shape_desc_record(uint32_t id, uint32_t parent, ts_key key, uint8_t 
     memset(g_ts_shape_keys + g_shapes_cap, 0, sizeof(ts_key*) * (cap - g_shapes_cap));
     g_ts_shape_flags = (uint8_t**)realloc(g_ts_shape_flags, sizeof(uint8_t*) * cap);
     memset(g_ts_shape_flags + g_shapes_cap, 0, sizeof(uint8_t*) * (cap - g_shapes_cap));
+    size_t row = sizeof(ts_key) * TS_STATIC_SLOT_LIMIT;
+    g_ts_probe_rkeys = (ts_key*)realloc(g_ts_probe_rkeys, row * cap);
+    g_ts_probe_wkeys = (ts_key*)realloc(g_ts_probe_wkeys, row * cap);
+    if (!g_shapes || !g_ts_shape_keys || !g_ts_shape_flags || !g_ts_probe_rkeys || !g_ts_probe_wkeys)
+      ts_abort_msg("out of memory growing the shape tables");
+    /* TS_KEY_NONE everywhere: shapes 0 and 1 and the rows not yet recorded */
+    memset((char*)g_ts_probe_rkeys + row * g_shapes_cap, 0xFF, row * (cap - g_shapes_cap));
+    memset((char*)g_ts_probe_wkeys + row * g_shapes_cap, 0xFF, row * (cap - g_shapes_cap));
     g_shapes_cap = cap;
     g_ts_shape_keys[TS_SHAPE_NONE] = g_shape_keys_none; g_ts_shape_flags[TS_SHAPE_NONE] = g_shape_flags_none;
     g_ts_shape_keys[TS_SHAPE_EMPTY] = g_shape_keys_none; g_ts_shape_flags[TS_SHAPE_EMPTY] = g_shape_flags_none;
@@ -2194,6 +2204,13 @@ static void shape_desc_record(uint32_t id, uint32_t parent, ts_key key, uint8_t 
   for (uint32_t i = d->depth; i < vcap; i++){ d->keys[i] = TS_KEY_NONE; d->kflags[i] = 0; }
   g_ts_shape_keys[id] = d->keys;
   g_ts_shape_flags[id] = d->kflags;
+  for (uint32_t i = 0; i < TS_STATIC_SLOT_LIMIT; i++){
+    ts_key k = d->keys[i];
+    uint8_t f = d->kflags[i];
+    size_t at = (size_t)id * TS_STATIC_SLOT_LIMIT + i;
+    g_ts_probe_rkeys[at] = !(f & TS_PROP_ACCESSOR) ? k : TS_KEY_NONE;
+    g_ts_probe_wkeys[at] = (f & (TS_PROP_ACCESSOR | TS_PROP_WRITABLE)) == TS_PROP_WRITABLE ? k : TS_KEY_NONE;
+  }
   d->index = NULL; d->index_cap = 0;
   if (d->depth >= TS_PROP_INDEX_MIN){
     uint32_t cap = 16u;

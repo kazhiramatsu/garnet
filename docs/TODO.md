@@ -6971,6 +6971,25 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   allocations, its 78 output files identical. A/B against `dp`: eight ABBA
   pairs, instructions 0.9947 (eight of eight), cycles 0.9988, wall 1.0000:
   the pushes were cheap.
+- Static-slot probes read one table (`docs/static_slots_design.md`, probe
+  tables). The compiler runs 520M static probes per compile; each validated
+  its slot through the shape's key vector and then its flag vector (seven
+  instructions of the hit path for the flags). Two flat tables built when a
+  shape is recorded, `g_ts_probe_rkeys` (the key of every slot that is not
+  an accessor) and `g_ts_probe_wkeys` (every slot of plain writable data),
+  `[shape * 16 + slot]`, `TS_KEY_NONE` elsewhere, let one load validate the
+  key and the attributes. Static hits identical (519,715,871). Kernels:
+  `small_calls` 698 -> 636 ms, `object_arrays` 306 -> 258 ms,
+  `obj_literal_poly` 295 -> 217 ms. Fixture
+  `objects/static_slots_attributes` (read-only, accessor, getter-only and
+  setter-only slots, frozen and sealed objects; known row: selfconf, the
+  frozen emitter's partial descriptors). Gates: unit, parity (366
+  identical), bundler, selfconf, GC stress, inline policy, conformance
+  498/498 and 498/498 with a collection at every allocation in protect
+  mode; tsc rebuilt and compiled under protect mode, with zapping, and with
+  a minor collection every 256 allocations, its 78 output files identical.
+  A/B against `lc`: eight ABBA pairs, instructions 0.9563 (eight of eight),
+  cycles 0.9865 (seven of eight), wall 0.9853.
 - Where the remaining 358.7M frame pushes come from (a per-function count,
   joined with the rule under relaxations): a precise backward liveness
   would remove 1.4% (it never needs a slot the linear walk does not: checked

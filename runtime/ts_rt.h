@@ -305,6 +305,12 @@ extern uint8_t** g_ts_shape_flags;
    all-NONE vectors. */
 #define TS_KEY_NONE 0xFFFFFFFFu
 #define TS_STATIC_SLOT_LIMIT 16u
+/* The probes' tables: per shape, flat ([shape * TS_STATIC_SLOT_LIMIT + slot]),
+   the keys of its first slots that a probe may take (for reads every slot
+   that is not an accessor, for writes plain writable data), TS_KEY_NONE
+   elsewhere: one load validates both the key and its attributes. */
+extern ts_key* g_ts_probe_rkeys;
+extern ts_key* g_ts_probe_wkeys;
 #define TS_PROP_IC_SIZE 4
 /* A cache entry's slot word carries the property's attribute flags in its
    top byte, so an inline hit knows whether the slot is plain writable data
@@ -1771,7 +1777,8 @@ TS_RT_ALWAYS_INLINE tsv* ts_static_slot_probe(tsv obj, ts_key key, uint32_t slot
   ts_object* o = (ts_object*)ts_ptr(obj);
   if (o->h.kind > TS_KIND_ARRAY) return NULL;
   uint32_t sid = ts_obj_shape_id(o);
-  const ts_key* ks = g_ts_shape_keys[sid];
+  /* `want` is a constant: plain writable data for a write, no accessor for a read */
+  const ts_key* ks = (want ? g_ts_probe_wkeys : g_ts_probe_rkeys) + (size_t)sid * TS_STATIC_SLOT_LIMIT;
   if (ks[slot] != key){
     /* The slot the site learned from its first miss (the out-of-line path
        fills the cache): a receiver family the prediction did not cover. */
@@ -1779,7 +1786,7 @@ TS_RT_ALWAYS_INLINE tsv* ts_static_slot_probe(tsv obj, ts_key key, uint32_t slot
     if (slot >= TS_STATIC_SLOT_LIMIT || ks[slot] != key) return NULL;
     TS_RT_STAT_STATIC(learned);
   }
-  if ((g_ts_shape_flags[sid][slot] & mask) != want) return NULL;
+  (void)mask;
   /* The key is at `slot` (so slot < len): in-object, or in the external value
      vector when the object outgrew its in-object capacity (the cold branch). */
   return ts_obj_slot_ptr(o, slot);
@@ -1790,14 +1797,15 @@ TS_RT_ALWAYS_INLINE tsv* ts_static_slot_probe2(tsv obj, ts_key key, uint32_t s1,
   ts_object* o = (ts_object*)ts_ptr(obj);
   if (o->h.kind > TS_KIND_ARRAY) return NULL;
   uint32_t sid = ts_obj_shape_id(o);
-  const ts_key* ks = g_ts_shape_keys[sid];
+  /* `want` is a constant: plain writable data for a write, no accessor for a read */
+  const ts_key* ks = (want ? g_ts_probe_wkeys : g_ts_probe_rkeys) + (size_t)sid * TS_STATIC_SLOT_LIMIT;
   uint32_t slot = ks[s1] == key ? s1 : ks[s2] == key ? s2 : TS_STATIC_SLOT_LIMIT;
   if (slot == TS_STATIC_SLOT_LIMIT){
     slot = ic->entries[0].slot & TS_PIC_SLOT_MASK;
     if (slot >= TS_STATIC_SLOT_LIMIT || ks[slot] != key) return NULL;
     TS_RT_STAT_STATIC(learned);
   }
-  if ((g_ts_shape_flags[sid][slot] & mask) != want) return NULL;
+  (void)mask;
   /* The key is at `slot` (so slot < len): in-object, or in the external value
      vector when the object outgrew its in-object capacity (the cold branch). */
   return ts_obj_slot_ptr(o, slot);
@@ -1809,14 +1817,15 @@ TS_RT_ALWAYS_INLINE tsv* ts_static_slot_probe3(tsv obj, ts_key key, uint32_t s1,
   ts_object* o = (ts_object*)ts_ptr(obj);
   if (o->h.kind > TS_KIND_ARRAY) return NULL;
   uint32_t sid = ts_obj_shape_id(o);
-  const ts_key* ks = g_ts_shape_keys[sid];
+  /* `want` is a constant: plain writable data for a write, no accessor for a read */
+  const ts_key* ks = (want ? g_ts_probe_wkeys : g_ts_probe_rkeys) + (size_t)sid * TS_STATIC_SLOT_LIMIT;
   uint32_t slot = ks[s1] == key ? s1 : ks[s2] == key ? s2 : ks[s3] == key ? s3 : TS_STATIC_SLOT_LIMIT;
   if (slot == TS_STATIC_SLOT_LIMIT){
     slot = ic->entries[0].slot & TS_PIC_SLOT_MASK;
     if (slot >= TS_STATIC_SLOT_LIMIT || ks[slot] != key) return NULL;
     TS_RT_STAT_STATIC(learned);
   }
-  if ((g_ts_shape_flags[sid][slot] & mask) != want) return NULL;
+  (void)mask;
   /* The key is at `slot` (so slot < len): in-object, or in the external value
      vector when the object outgrew its in-object capacity (the cold branch). */
   return ts_obj_slot_ptr(o, slot);

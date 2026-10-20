@@ -246,3 +246,24 @@ the gap to direct loads, 349 ms, lies). Fixture
 a getter and a setter on hinted keys, frozen, deleted, spread, computed,
 returned by a factory, extended by stores, a union receiver). The compiler
 A/B is in the TODO entry.
+
+## Probe tables (Session 350, after frame elision)
+
+The compiler executes 520M static probes per compile (statistics build:
+`static_slots: get_hit=519.7M`). Each validated its slot with two chains of
+dependent loads: the shape's key vector for the key, then the shape's flag
+vector for the attributes (seven instructions on the hit path: the flag
+vector's global, its row, the byte, a test). The probe now reads one of two
+flat tables built when a shape is recorded, `g_ts_probe_rkeys` and
+`g_ts_probe_wkeys` (`[shape * 16 + slot]`): a read table holding the key of
+every slot that is not an accessor, a write table holding the key of every
+slot that is plain writable data, `TS_KEY_NONE` elsewhere. One load
+validates the key and the attributes; the learned-slot fallback reads the
+same row. Shapes never change their flags after creation (a dictionary
+object has shape 0, whose rows are all `TS_KEY_NONE`), so the tables need
+no other maintenance. A frozen object's write still tests its integrity
+bits after the probe. Kernels: `small_calls` 698 -> 636 ms,
+`object_arrays` 306 -> 258 ms, `obj_literal_poly` 295 -> 217 ms. Fixture
+`objects/static_slots_attributes` (read-only, accessor, getter-only and
+setter-only slots, frozen and sealed objects, the same sites over all of
+them).
