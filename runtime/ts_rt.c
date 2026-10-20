@@ -47,6 +47,7 @@ static int g_sparse_elements = 1;       /* TSAOT_SPARSE_ELEMENTS=0: far stores a
    deadlocks at startup on this host, so this is the always-available
    use-after-move detector. GC cold paths only; zero mutator cost. */
 static int g_gc_zap = 0;
+static uint32_t g_gc_protect = 0;   /* TSAOT_GC_PROTECT: quarantine length of released nursery chunks; 0 = off */
 
 /* ---- bump nursery (gc_moving_plan Phase B) ----
    Young movable cells live in 256KB-aligned arena chunks: allocation is a bump
@@ -1016,6 +1017,11 @@ static void gc_config_init(void){
   if (npic && npic[0] && strcmp(npic, "0") == 0) g_negative_pic = 0;
   const char* sparse = getenv("TSAOT_SPARSE_ELEMENTS");
   if (sparse && sparse[0] && strcmp(sparse, "0") == 0) g_sparse_elements = 0;
+  const char* protect = getenv("TSAOT_GC_PROTECT");
+  if (protect && protect[0] && strcmp(protect, "0") != 0){
+    unsigned long v = strtoul(protect, NULL, 10);
+    g_gc_protect = (uint32_t)(v > 1 ? v : 64u);
+  }
   const char* zap = getenv("TSAOT_GC_ZAP");
   if (zap && zap[0] && strcmp(zap, "0") != 0) g_gc_zap = 1;
 }
@@ -1168,6 +1174,49 @@ static inline int gc_is_bump_kind(uint8_t kind){
          kind==TS_KIND_ARRAY || kind==TS_KIND_MAP || kind==TS_KIND_SET ||
          kind==TS_KIND_ACCESSOR || kind==TS_KIND_SYMBOL;
 }
+/* Protect mode (TSAOT_GC_PROTECT, docs/gc_v2_design.md §6.5 step 1): nursery
+   chunks come from mmap, and a chunk a collection releases is made
+   inaccessible and kept in a bounded quarantine before it is reused, so an
+   access through a reference that went stale when its cell moved faults at
+   the access instead of reading a moved-from copy. */
+static gc_chunk** g_chunk_quarantine = NULL;
+static uint32_t g_chunk_q_head = 0, g_chunk_q_len = 0;
+static void* gc_chunk_alloc(void){
+  if (!g_gc_protect){
+    void* mem = NULL;
+    if (posix_memalign(&mem, GC_NURSERY_CHUNK_BYTES, GC_NURSERY_CHUNK_BYTES) != 0) return NULL;
+    return mem;
+  }
+  size_t span = GC_NURSERY_CHUNK_BYTES * 2u;
+  char* m = (char*)mmap(NULL, span, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+  if (m == MAP_FAILED) return NULL;
+  uintptr_t a = ((uintptr_t)m + GC_NURSERY_CHUNK_BYTES - 1u) & ~(uintptr_t)(GC_NURSERY_CHUNK_BYTES - 1u);
+  if (a > (uintptr_t)m) munmap(m, a - (uintptr_t)m);
+  uintptr_t end = a + GC_NURSERY_CHUNK_BYTES, mend = (uintptr_t)m + span;
+  if (mend > end) munmap((void*)end, mend - end);
+  return (void*)a;
+}
+/* A chunk a collection released: to the free pool, or (protect mode) into
+   the quarantine, whose oldest chunk then returns to the free pool. */
+static void gc_chunk_release(gc_chunk* c){
+  c->used = 0;
+  if (!g_gc_protect){ c->next = g_nursery_free; g_nursery_free = c; return; }
+  if (!g_chunk_quarantine){
+    g_chunk_quarantine = (gc_chunk**)calloc(g_gc_protect, sizeof(gc_chunk*));
+    if (!g_chunk_quarantine) ts_abort_msg("out of memory allocating the chunk quarantine");
+  }
+  if (g_chunk_q_len == g_gc_protect){
+    gc_chunk* old = g_chunk_quarantine[g_chunk_q_head];
+    mprotect(old, GC_NURSERY_CHUNK_BYTES, PROT_READ | PROT_WRITE);
+    old->used = 0; old->next = g_nursery_free; g_nursery_free = old;
+    g_chunk_quarantine[g_chunk_q_head] = c;
+    g_chunk_q_head = (g_chunk_q_head + 1u) % g_gc_protect;
+  } else {
+    g_chunk_quarantine[(g_chunk_q_head + g_chunk_q_len) % g_gc_protect] = c;
+    g_chunk_q_len++;
+  }
+  mprotect(c, GC_NURSERY_CHUNK_BYTES, PROT_NONE);
+}
 static void* gc_nursery_bump(size_t sz){
   size_t need = (sz + 15u) & ~(size_t)15u;
   gc_chunk* c = g_nursery_active;
@@ -1175,9 +1224,8 @@ static void* gc_nursery_bump(size_t sz){
     if (g_nursery_free){
       c = g_nursery_free; g_nursery_free = c->next;
     } else {
-      void* mem = NULL;
-      if (posix_memalign(&mem, GC_NURSERY_CHUNK_BYTES, GC_NURSERY_CHUNK_BYTES) != 0)
-        return NULL; /* fall back to the unpooled path */
+      void* mem = gc_chunk_alloc();
+      if (!mem) return NULL; /* fall back to the unpooled path */
       c = (gc_chunk*)mem;
       RT_STAT_INC(nursery_chunks);
     }
@@ -2793,8 +2841,12 @@ static ts_pref ts_set_named_prop(tsv obj, ts_object* o, ts_key key, tsv val,
   ts_pref ownp=prop_find(o,key);
   if (pref_ok(ownp)){
     if (pref_is_accessor(ownp)){
+      /* The setter runs user code: it may collect (a young receiver moves,
+         and ownp holds its old address) or change the receiver's layout, so
+         nothing about ownp is valid afterwards; the caller's cache fill must
+         not use it (found by the protect mode, docs/gc_v2_design.md §6.5). */
       invoke_setter((ts_accessor*)ts_ptr(pref_val(ownp)), obj, key, val);
-      return ownp;
+      return PREF_NONE;
     }
     if (frozen || !pref_is_writable(ownp)){ ts_throw_readonly_write(key); return PREF_NONE; }
     { tsv* vp = pref_valp(ownp); *vp = val;
@@ -5336,9 +5388,8 @@ static ts_gc_header* gc_tospace_copy(gc_chunk** to_active, ts_gc_header* h){
     if (g_nursery_free){
       c = g_nursery_free; g_nursery_free = c->next;
     } else {
-      void* mem = NULL;
-      if (posix_memalign(&mem, GC_NURSERY_CHUNK_BYTES, GC_NURSERY_CHUNK_BYTES) != 0)
-        return NULL;
+      void* mem = gc_chunk_alloc();
+      if (!mem) return NULL;
       c = (gc_chunk*)mem;
       RT_STAT_INC(nursery_chunks);
     }
@@ -5480,8 +5531,7 @@ static void gc_sweep_nursery(
       c->next = g_nursery_retained; g_nursery_retained = c;
       RT_STAT_INC(retained_chunks);
     } else {
-      c->used = 0;
-      c->next = g_nursery_free; g_nursery_free = c;
+      gc_chunk_release(c);
     }
   }
   g_nursery_active = to_active;
@@ -5522,8 +5572,7 @@ static void gc_sweep_pinned_young(ts_gc_header** survivors){
     gc_chunk* c = *pp;
     if (c->pinned_live == 0){
       *pp = c->next;
-      c->used = 0;
-      c->next = g_nursery_free; g_nursery_free = c;
+      gc_chunk_release(c);
     } else {
       pp = &c->next;
     }

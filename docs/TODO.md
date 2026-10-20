@@ -6633,9 +6633,28 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   compare symbol identity with `ts_strict_eq` (a promotion-timing change
   turned the probes into pointers; `ts_same_cell` is defined only for
   differing bits); they pass on the current runtime too.
-- Next slices, in order. GC v2 first (`docs/gc_v2_design.md` §6: G2
-  payloads in a block heap (G3', a copying nursery without handles, next
-  if Kaz agrees), G3 the non-moving decision gate).
+- GC v2 Y1 step 1: protect mode, and a setter's stale receiver
+  (`docs/gc_v2_design.md` §6.5; Kaz chose Y1, a copying nursery with
+  direct pointers, after the non-moving gate failed). `TSAOT_GC_PROTECT=N`
+  (a debug knob, off by default) maps nursery chunks with `mmap` and makes
+  each released chunk inaccessible for the next N releases (default 64),
+  so a reference that went stale when its cell moved faults at its site.
+  It found one: `ts_set_pic` filled its cache from the receiver pointer it
+  held across an own setter, after the setter had collected and moved the
+  young receiver; `ts_set_named_prop` now answers `PREF_NONE` after a
+  setter (no cache fill from that call). The conformance suite passes under
+  protect mode with a minor collection every seven allocations, and the
+  compiler compiles tsc under protect mode (with and without zapping). The
+  GC stress gate runs the focused conformance and the runtime unit tests
+  under protect mode. Gates: unit, parity (361 identical), bundler,
+  selfconf, GC stress, inline policy, conformance 485/485. A/B against G2d:
+  eight ABBA pairs, wall 0.997, user 0.999; instructions -0.03%, cycles
+  -0.06%: neutral.
+- Next slices, in order. GC v2 first (`docs/gc_v2_design.md` §6.5, Y1:
+  1b root slots the collector reads as values (the symbol registry, the
+  microtask queue, I/O tasks, abort timers) visited as slots; 2 aging off;
+  3 nursery chunks from the cage; 4 direct pointers one kind at a time;
+  5 handles removed).
   A slice that extends the stack or an arena to a
   new kind of allocation runs the conformance suite and a compile of the
   compiler under `--stack-check` (an arena must allocate through the

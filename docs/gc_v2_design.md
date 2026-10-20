@@ -492,6 +492,66 @@ evacuation with reference rewriting, under the stale-reference protocol of
 allocation, the milestone). The three runtimes are kept in the scratchpad
 (not committed).
 
+## 6.5 Y1 plan: a copying nursery without handles, in steps
+
+Kaz chose Y1 after §6.4. References become direct pointers everywhere (object
+fields, frame slots, registers); there is no indirection on access. When the
+nursery moves a cell, the collector rewrites every reference to it: the
+fields of copied cells (scanned as they are copied), the remembered old
+cells' fields, and the root slots (shadow-frame slots and `ts_gc_root`
+slots: the collector is given the slot's address, so it can rewrite the
+slot; the program reads the slot's direct pointer). Generated code keeps a
+reference that lives across a call that can collect in a frame slot and
+reloads it after the call (the protocol that already exists for the
+pointer-form rewriting of Track B); between such calls it uses the pointer
+in a register. The copied cell's old header holds the forwarding address.
+V8 works the same way: its JIT code uses direct pointers rewritten through
+stack maps; only its C++ runtime uses indirect handles, as garnet's runtime
+uses `ts_gc_root`. The hazard is the one that sank C1: a reference held
+where the collector does not look (an unregistered C local) goes stale when
+its cell moves. Old cells never move in Y1, so only references to young
+cells are rewritten.
+
+Track B already rewrites references to the cells a minor collection
+promotes (recorded stable slots, promoted cells rescanned). The steps
+below reuse that machinery and move the encoding one kind at a time:
+
+1. **Protect mode** (`TSAOT_GC_PROTECT=1`, a debug knob): nursery chunks
+   come from `mmap`; after a collection the evacuated chunks are made
+   inaccessible (`mprotect`, a bounded quarantine before reuse), so a stale
+   access faults at its site. First run on the current design (raw `ts_object*`
+   pointers held across an allocation), then for every later step under the
+   GC stress gate (a minor collection at every allocation).
+2. **Aging off by default** (measured neutral, G1 (d)): every survivor is
+   promoted, so every moved cell is rewritten once, and the to-space path,
+   scan credits and the promotion barrier go.
+3. **Nursery chunks from the cage** (a dedicated range): "young" becomes an
+   address test, for the barrier and the collector's edges.
+4. **Direct pointers, one kind at a time** (strings first, then arrays,
+   functions, objects, the rest): boxing a young cell of a converted kind
+   yields its address; evacuation leaves a forwarding address and the
+   rewriting covers pointer-form edges to young cells; identity hashes move
+   into the header's handle field (assigned lazily); caches keyed by young
+   identities are audited per kind. Each kind: protect mode under GC
+   stress, the milestone (the compiler compiles itself with outputs
+   unchanged, selfhost), A/B.
+5. **Handles removed, Cheney evacuation**: no handle table, no handle
+   branch in `ts_ptr`, a minor collection that copies survivors while it
+   traces and never visits the dead.
+
+Step 1 result. Under `TSAOT_GC_PROTECT=1` with a minor collection every
+seven allocations the conformance suite found one stale reference, in
+`gc/lazy_homes_reload`: `ts_set_pic` filled its inline cache from the
+receiver pointer it held across an own setter, and the setter had
+collected and moved the young receiver (a fault in `prop_ic_fill`; in the
+default mode the released chunk is still mapped, so the cache could be
+filled from whatever the chunk held by then). `ts_set_named_prop` now answers `PREF_NONE` after
+running a setter, so no cache is filled from the call. With the fix the
+suite passes under protect mode, and the compiler compiles tsc under
+protect mode, with and without zapping. The GC stress gate runs the
+focused conformance and the runtime unit tests under protect mode
+(`TSAOT_GC_STRESS_PROTECT=0` skips the step).
+
 ## 7. Verification
 
 - Gates of every slice: unit, parity (`scripts/emitc_diff.sh`), bundler,

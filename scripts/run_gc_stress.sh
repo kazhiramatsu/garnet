@@ -16,6 +16,7 @@ THRESHOLD="${TSAOT_GC_YOUNG_THRESHOLD:-1}"
 ASAN_CC="${TSAOT_GC_STRESS_ASAN_CC:-gcc -O0 -g -fsanitize=address}"
 RUN_ASAN="${TSAOT_GC_STRESS_ASAN:-1}"
 RUN_RUNTIME_ASAN="${TSAOT_GC_STRESS_RUNTIME_ASAN:-1}"
+RUN_PROTECT="${TSAOT_GC_STRESS_PROTECT:-1}"
 RUN_BASE="${TSAOT_GC_STRESS_BASE:-1}"
 RUN_FULL="${TSAOT_GC_STRESS_FULL:-0}"
 RUN_MOVE_CORO="${TSAOT_GC_STRESS_MOVE_CORO:-0}"
@@ -46,6 +47,17 @@ if [[ "$RUN_BASE" != "0" ]]; then
     TSAOT_GC_YOUNG_THRESHOLD="$THRESHOLD" TSAOT_CC="$ASAN_CC" \
       bash "$S/run_runtime_tests.sh" || rc=1
   fi
+fi
+
+if [[ "$RUN_PROTECT" != "0" ]]; then
+  # Protect mode (docs/gc_v2_design.md §6.5): released nursery chunks are made
+  # inaccessible, so a reference that went stale when its cell moved faults.
+  echo ">>> focused conformance (protect mode, normal O2)"
+  TSAOT_GC_YOUNG_THRESHOLD="$THRESHOLD" TSAOT_GC_PROTECT=1 \
+    bash "$S/run_conformance.sh" exhaustive "$FILTER" || rc=1
+  echo ">>> runtime unit tests (protect mode)"
+  TSAOT_GC_YOUNG_THRESHOLD="$THRESHOLD" TSAOT_GC_PROTECT=1 \
+    bash "$S/run_runtime_tests.sh" || rc=1
 fi
 
 if [[ "$RUN_AGING_PROMOTION" != "0" ]]; then
