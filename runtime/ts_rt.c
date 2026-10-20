@@ -3888,56 +3888,55 @@ static int ts_i64_to_str(long long v, char* buf){
   return len;
 }
 /* Format a double like JS Number.toString: shortest decimal that round-trips. */
+/* Number::toString(x) for radix 10 (ECMA-262 6.1.6.1.20). s is the shortest
+   digit string that reads back as x (k digits; the correctly rounded k-digit
+   decimal, the closest one) and n its decimal exponent (x = 0.s * 10^n):
+   - k <= n <= 21: the digits and n - k zeros;
+   - 0 < n <= 21: the digits with the point after the n-th;
+   - -6 < n <= 0: "0.", -n zeros, the digits;
+   - otherwise the exponential form d[.ddd]e+/-(n-1).
+   The digits come from the smallest %.*e precision that round-trips. */
 static void ts_fmt_num(double d, char* buf, size_t n){
   if (d != d) { snprintf(buf,n,"NaN"); return; }
   if (d == 1.0/0.0) { snprintf(buf,n,"Infinity"); return; }
   if (d == -1.0/0.0) { snprintf(buf,n,"-Infinity"); return; }
   /* small integers: exact decimal via fast itoa */
   if (d == (double)(long long)d && d < 9e15 && d > -9e15) { ts_i64_to_str((long long)d, buf); return; }
-  /* JS Number->String: integers with magnitude in [2^53, 1e21) print in full
-     decimal (no exponent), but using the SHORTEST decimal that round-trips — NOT
-     the exact value of the double. `%.0f` would print the exact (longer) integer
-     (e.g. 1.2345678901234568e20 -> "...667584" instead of JS's "...680000").
-     Find the shortest significant digits via `%e`, then expand them positionally
-     with trailing zeros. (Magnitudes below 2^53 took the exact itoa path above;
-     1e21 and beyond fall through to the exponential `%g` path below.) */
-  if (d == floor(d) && fabs(d) < 1e21) {
-    char tmp[48];
-    int p;
-    for (p = 0; p <= 16; p++) { snprintf(tmp, sizeof tmp, "%.*e", p, d); if (strtod(tmp, 0) == d) break; }
-    if (p > 16) snprintf(tmp, sizeof tmp, "%.16e", d);
-    const char* s = tmp;
-    char* out = buf;
-    if (*s == '-') { *out++ = '-'; s++; }
-    char digits[40]; int nd = 0;
-    while (*s && *s != 'e' && *s != 'E') { if (*s != '.') digits[nd++] = *s; s++; }
-    int expo = (*s == 'e' || *s == 'E') ? atoi(s + 1) : 0;
-    int total = expo + 1;            /* integer digit count */
-    int i;
-    for (i = 0; i < nd && i < total; i++) *out++ = digits[i];
-    for (; i < total; i++) *out++ = '0';
-    *out = 0;
-    return;
+  char tmp[48];
+  int p;
+  for (p = 0; p <= 16; p++){ snprintf(tmp, sizeof tmp, "%.*e", p, d); if (strtod(tmp, 0) == d) break; }
+  if (p > 16) snprintf(tmp, sizeof tmp, "%.16e", d);
+  const char* t = tmp;
+  char out[64];
+  int o = 0;
+  if (*t == '-'){ out[o++] = '-'; t++; }
+  char digits[24]; int k = 0;
+  while (*t && *t != 'e' && *t != 'E'){ if (*t != '.') digits[k++] = *t; t++; }
+  int e10 = (*t == 'e' || *t == 'E') ? atoi(t + 1) : 0;
+  while (k > 1 && digits[k - 1] == '0') k--;     /* a shortest form has no trailing zero */
+  int ne = e10 + 1;                               /* n: x = 0.digits * 10^n */
+  if (k <= ne && ne <= 21){
+    for (int i = 0; i < k; i++) out[o++] = digits[i];
+    for (int i = k; i < ne; i++) out[o++] = '0';
+  } else if (0 < ne && ne <= 21){
+    for (int i = 0; i < ne; i++) out[o++] = digits[i];
+    out[o++] = '.';
+    for (int i = ne; i < k; i++) out[o++] = digits[i];
+  } else if (-6 < ne && ne <= 0){
+    out[o++] = '0'; out[o++] = '.';
+    for (int i = 0; i < -ne; i++) out[o++] = '0';
+    for (int i = 0; i < k; i++) out[o++] = digits[i];
+  } else {
+    out[o++] = digits[0];
+    if (k > 1){ out[o++] = '.'; for (int i = 1; i < k; i++) out[o++] = digits[i]; }
+    out[o++] = 'e';
+    int x = ne - 1;
+    out[o++] = x < 0 ? '-' : '+';
+    char eb[8]; int el = snprintf(eb, sizeof eb, "%d", x < 0 ? -x : x);
+    for (int i = 0; i < el; i++) out[o++] = eb[i];
   }
-  for (int p=1; p<=17; p++){ snprintf(buf,n,"%.*g",p,d); if (strtod(buf,0)==d) break; }
-  if (strtod(buf,0)!=d) snprintf(buf,n,"%.17g",d);
-  /* JS uses plain decimal notation for fractions down to 1e-6 (e.g. 0.000001),
-     but C's %g switches to exponential at 1e-5. Reformat such small fractions as
-     fixed decimal so they match V8 (1e-7 and below stay exponential). */
-  {
-    double ad = fabs(d);
-    if (strchr(buf,'e') && ad >= 1e-6 && ad < 1){
-      for (int q=1; q<=20; q++){ snprintf(buf,n,"%.*f",q,d); if (strtod(buf,0)==d) break; }
-      return;
-    }
-  }
-  /* JS exponent style: C prints "e-07"/"e+05" (zero-padded 2 digits); JS uses
-     "e-7"/"e+5" (no leading zero) but keeps 3-digit exponents ("e+100"). Strip a
-     single leading zero in a 2-digit exponent. */
-  char* e = strchr(buf, 'e');
-  if (e && (e[1]=='+'||e[1]=='-') && e[2]=='0' && e[3]>='0' && e[3]<='9' && e[4]==0){
-    e[2]=e[3]; e[3]=0;
-  }
+  out[o] = 0;
+  snprintf(buf, n, "%s", out);
 }
 
 /* ---------------- Symbol (symbol_design.md) ---------------- */

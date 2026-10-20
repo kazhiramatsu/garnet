@@ -6758,6 +6758,28 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   selfconf, GC stress, inline policy, conformance 488/488; tsc rebuilt and
   compiled under protect mode. A/B against the finally fix: eight ABBA
   pairs, instructions 0.9998, cycles 0.9986, wall medians equal: neutral.
+- Numeric literals keep their exact value: the analyzer read the IR's
+  JSON numbers with serde_json's default float parser, which is off by one
+  unit in the last place for some inputs (`9.876543210987654e-5` became
+  9.876543210987652e-5, a different number, in the emitted C). serde_json
+  now parses with `float_roundtrip`. Fixture
+  `numbers/numeric_literal_exactness` (1,500 literals of 15 to 17 digits in
+  [1e-3, 1e15), printed and hashed, fails with the previous parser); a known
+  parity row (numeric specialization). Gated together with the next entry.
+- Number to string follows Number::toString (ECMA-262 6.1.6.1.20): the
+  shortest round-trip digits placed by their decimal exponent. The printer
+  reformatted magnitudes in [1e-6, 1e-4) with at most 20 decimals, which
+  dropped digits (`4.391539096832276e-6` printed `0.00000439153909683228`,
+  a different number) and could pick a different number
+  (`0.00009999999999999999` printed `0.0001`); String, concatenation,
+  template literals, JSON.stringify and console all went through it.
+  Fixture `numbers/small_fraction_strings` (14 values in five forms and a
+  5,000-value sweep with a round-trip count); a known parity row. Gates
+  (both entries): unit, parity (362 identical), bundler, selfconf, GC
+  stress, inline policy, conformance 490/490; tsc rebuilt, compiled under
+  protect mode, its 78 output files identical to the previous build's. A/B
+  against the Math slice: eight ABBA pairs, instructions +0.02%, cycles and
+  wall within noise (three noisy pairs).
 - Next slices, in order. GC v2 first (`docs/gc_v2_design.md` §6.5, Y1:
   4 direct pointers (4a the collector's machinery behind a switch, 4b
   strings, then the other kinds); 5 handles removed).
