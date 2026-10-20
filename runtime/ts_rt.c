@@ -5773,11 +5773,36 @@ static ts_array* as_arr(tsv v){
   return a;
 }
 
-/* callback-based: map/filter/forEach/reduce. cb is a ts_func value; we invoke it
-   with (element, index) — matching the common JS callback signature. */
+/* A callback a builtin calls once per element without a `this`: resolved once
+   before the loop, each call is the environment register store and the
+   indirect call ts_call makes, without ts_call_value's per-element proxy,
+   function, takes_this and environment-form tests (Session 350 x58). Anything
+   else (a takes_this function, a legacy closure, a proxy, a non-function that
+   must throw) keeps ts_call_value. */
+typedef struct { ts_code code; tsv* env; int direct; } ts_cb;
+static inline void cb_resolve(ts_cb* c, tsv fn){
+  c->direct = 0; c->code = NULL; c->env = NULL;
+  if ((g_has_proxies && ts_is_proxy(fn)) || !ts_is_func(fn)) return;
+  ts_func* f = (ts_func*)ts_ptr(fn);
+  if (f->takes_this || (f->envlen && !f->env_abi)) return;
+  c->code = (ts_code)f->code;
+  c->env = f->envlen ? f->env : NULL;
+  c->direct = 1;
+}
+static inline tsv cb_call(const ts_cb* c, tsv fn, tsv* args, int n){
+  if (TS_RT_LIKELY(c->direct)){
+    if (c->env) g_ts_cur_env = c->env;
+    return c->code(args, n);
+  }
+  return ts_call_value(fn, args, n);
+}
+/* callback-based: map/filter/forEach/reduce. cb is a ts_func value invoked with
+   (element, index, array), the array the method was called on (reduce adds the
+   accumulator in front). */
 tsv ts_array_map(tsv arr, tsv cb){
   ts_array* a=as_arr(arr); if(!a) return ts_new_array(0);
   ts_gc_root(&arr); ts_gc_root(&cb);
+  ts_cb cbf; cb_resolve(&cbf, cb);
   uint32_t len=a->len;
   tsv out=ts_new_array(len);
   ts_gc_root(&out);
@@ -5785,8 +5810,8 @@ tsv ts_array_map(tsv arr, tsv cb){
     a=as_arr(arr);
     if (!a || i>=a->len || array_is_hole(a->data[i])) continue;
     tsv elem = a->data[i];
-    tsv args[2]={ elem, ts_num((double)i) };
-    ts_array_set(out, i, ts_call_value(cb, args, 2));
+    tsv args[3]={ elem, ts_num((double)i), arr };
+    ts_array_set(out, i, cb_call(&cbf, cb, args, 3));
   }
   ts_gc_unroot(3);
   return out;
@@ -5794,6 +5819,7 @@ tsv ts_array_map(tsv arr, tsv cb){
 tsv ts_array_filter(tsv arr, tsv cb){
   ts_array* a=as_arr(arr); if(!a) return ts_new_array(0);
   ts_gc_root(&arr); ts_gc_root(&cb);
+  ts_cb cbf; cb_resolve(&cbf, cb);
   tsv out=ts_new_array(0);
   ts_gc_root(&out);
   a=as_arr(arr);
@@ -5802,8 +5828,8 @@ tsv ts_array_filter(tsv arr, tsv cb){
     a=as_arr(arr);
     if (!a || i>=a->len || array_is_hole(a->data[i])) continue;
     tsv elem = a->data[i];
-    tsv args[2]={ elem, ts_num((double)i) };
-    if(ts_truthy(ts_call_value(cb,args,2))) ts_array_push(out, elem);
+    tsv args[3]={ elem, ts_num((double)i), arr };
+    if(ts_truthy(cb_call(&cbf, cb, args, 3))) ts_array_push(out, elem);
   }
   ts_gc_unroot(3);
   return out;
@@ -5812,12 +5838,13 @@ tsv ts_array_foreach(tsv arr, tsv cb){
   ts_array* a=as_arr(arr); if(!a) return TS_UNDEFINED;
   uint32_t len=a->len;
   ts_gc_root(&arr); ts_gc_root(&cb);
+  ts_cb cbf; cb_resolve(&cbf, cb);
   for(uint32_t i=0;i<len;i++){
     a=as_arr(arr);
     if (!a || i>=a->len || array_is_hole(a->data[i])) continue;
     tsv elem = a->data[i];
-    tsv args[2]={ elem, ts_num((double)i) };
-    ts_call_value(cb,args,2);
+    tsv args[3]={ elem, ts_num((double)i), arr };
+    cb_call(&cbf, cb, args, 3);
   }
   ts_gc_unroot(2);
   return TS_UNDEFINED;
@@ -5834,13 +5861,14 @@ tsv ts_array_reduce(tsv arr, tsv cb, tsv init, int has_init){
     acc=a->data[start++];
   }
   ts_gc_root(&arr); ts_gc_root(&acc); ts_gc_root(&cb);
+  ts_cb cbf; cb_resolve(&cbf, cb);
   uint32_t len=a->len;
   for(uint32_t i=start;i<len;i++){
     a = as_arr(arr); /* re-fetch: callback may have triggered GC/realloc */
     if (!a || i>=a->len || array_is_hole(a->data[i])) continue;
     tsv elem = a->data[i];
-    tsv args[3]={ acc, elem, ts_num((double)i) };
-    acc=ts_call_value(cb,args,3);
+    tsv args[4]={ acc, elem, ts_num((double)i), arr };
+    acc=cb_call(&cbf, cb, args, 4);
   }
   ts_gc_unroot(3);
   return acc;
@@ -5856,12 +5884,13 @@ tsv ts_array_reduce_right(tsv arr, tsv cb, tsv init, int has_init){
     acc=a->data[start--];
   }
   ts_gc_root(&arr); ts_gc_root(&acc); ts_gc_root(&cb);
+  ts_cb cbf; cb_resolve(&cbf, cb);
   for(long i=start;i>=0;i--){
     a = as_arr(arr);                      /* re-fetch: cb may have triggered GC/realloc */
     if (!a || (uint32_t)i>=a->len || array_is_hole(a->data[i])) continue;
     tsv elem = a->data[i];
-    tsv args[3]={ acc, elem, ts_num((double)i) };
-    acc=ts_call_value(cb,args,3);
+    tsv args[4]={ acc, elem, ts_num((double)i), arr };
+    acc=cb_call(&cbf, cb, args, 4);
   }
   ts_gc_unroot(3);
   return acc;
@@ -6798,14 +6827,15 @@ void ts_map_foreach(tsv mv, tsv cb){
   ts_map* m=ts_ptr(mv);
   uint32_t len=m->len;
   ts_gc_root(&mv); ts_gc_root(&cb);
+  ts_cb cbf; cb_resolve(&cbf, cb);
   for (uint32_t i=0;i<len;i++){
     m=ts_ptr(mv);
     if (i >= m->len) break; /* shrunk during iteration (linear-mode delete shifts) */
     tsv val=m->vals[i];
     tsv key=m->keys[i];
     if (key == TS_MAPSET_HOLE) continue; /* deleted during/before iteration */
-    tsv args[2]={ val, key };
-    ts_call_value(cb,args,2);
+    tsv args[3]={ val, key, mv };
+    cb_call(&cbf, cb, args, 3);
   }
   ts_gc_unroot(2);
 }
@@ -6923,13 +6953,14 @@ void ts_set_foreach(tsv sv, tsv cb){
   ts_set_t* s=ts_ptr(sv);
   uint32_t len=s->len;
   ts_gc_root(&sv); ts_gc_root(&cb);
+  ts_cb cbf; cb_resolve(&cbf, cb);
   for (uint32_t i=0;i<len;i++){
     s=ts_ptr(sv);
     if (i >= s->len) break; /* shrunk during iteration (linear-mode delete shifts) */
     tsv elem=s->elems[i];
     if (elem == TS_MAPSET_HOLE) continue; /* deleted during/before iteration */
-    tsv args[2]={ elem, elem };
-    ts_call_value(cb,args,2);
+    tsv args[3]={ elem, elem, sv };
+    cb_call(&cbf, cb, args, 3);
   }
   ts_gc_unroot(2);
 }
@@ -7639,8 +7670,9 @@ tsv ts_array_find(tsv arr, tsv cb){
   ts_array* a=as_arr(arr); if(!a) return TS_UNDEFINED;
   uint32_t len=a->len;
   ts_gc_root(&arr); ts_gc_root(&cb);
-  for(uint32_t i=0;i<len;i++){ a=as_arr(arr); tsv elem=ts_array_get(arr,i); tsv args[2]={elem,ts_num((double)i)};
-    if(ts_truthy(ts_call_value(cb,args,2))){ ts_gc_unroot(2); return elem; } }
+  ts_cb cbf; cb_resolve(&cbf, cb);
+  for(uint32_t i=0;i<len;i++){ a=as_arr(arr); tsv elem=ts_array_get(arr,i); tsv args[3]={elem,ts_num((double)i),arr};
+    if(ts_truthy(cb_call(&cbf, cb, args, 3))){ ts_gc_unroot(2); return elem; } }
   ts_gc_unroot(2);
   return TS_UNDEFINED;
 }
@@ -7648,8 +7680,9 @@ tsv ts_array_findlast(tsv arr, tsv cb){
   ts_array* a=as_arr(arr); if(!a) return TS_UNDEFINED;
   uint32_t len=a->len;
   ts_gc_root(&arr); ts_gc_root(&cb);
-  for(uint32_t i=len; i-- > 0;){ a=as_arr(arr); tsv elem=ts_array_get(arr,i); tsv args[2]={elem,ts_num((double)i)};
-    if(ts_truthy(ts_call_value(cb,args,2))){ ts_gc_unroot(2); return elem; } }
+  ts_cb cbf; cb_resolve(&cbf, cb);
+  for(uint32_t i=len; i-- > 0;){ a=as_arr(arr); tsv elem=ts_array_get(arr,i); tsv args[3]={elem,ts_num((double)i),arr};
+    if(ts_truthy(cb_call(&cbf, cb, args, 3))){ ts_gc_unroot(2); return elem; } }
   ts_gc_unroot(2);
   return TS_UNDEFINED;
 }
@@ -7657,8 +7690,9 @@ double ts_array_findlastindex(tsv arr, tsv cb){
   ts_array* a=as_arr(arr); if(!a) return -1;
   uint32_t len=a->len;
   ts_gc_root(&arr); ts_gc_root(&cb);
-  for(uint32_t i=len; i-- > 0;){ a=as_arr(arr); tsv elem=ts_array_get(arr,i); tsv args[2]={elem,ts_num((double)i)};
-    if(ts_truthy(ts_call_value(cb,args,2))){ ts_gc_unroot(2); return (double)i; } }
+  ts_cb cbf; cb_resolve(&cbf, cb);
+  for(uint32_t i=len; i-- > 0;){ a=as_arr(arr); tsv elem=ts_array_get(arr,i); tsv args[3]={elem,ts_num((double)i),arr};
+    if(ts_truthy(cb_call(&cbf, cb, args, 3))){ ts_gc_unroot(2); return (double)i; } }
   ts_gc_unroot(2);
   return -1;
 }
@@ -7688,6 +7722,7 @@ tsv ts_array_flat(tsv arr, double depth){
 tsv ts_array_flatmap(tsv arr, tsv cb){
   ts_array* a=as_arr(arr); if(!a) return ts_new_array(0);
   ts_gc_root(&arr); ts_gc_root(&cb);
+  ts_cb cbf; cb_resolve(&cbf, cb);
   tsv out=ts_new_array(0);
   ts_gc_root(&out);
   a=as_arr(arr);
@@ -7696,8 +7731,8 @@ tsv ts_array_flatmap(tsv arr, tsv cb){
     a=as_arr(arr);
     if (!a || i>=a->len || array_is_hole(a->data[i])) continue;
     tsv elem = a->data[i];
-    tsv args[2]={ elem, ts_num((double)i) };
-    tsv mapped=ts_call_value(cb, args, 2);
+    tsv args[3]={ elem, ts_num((double)i), arr };
+    tsv mapped=cb_call(&cbf, cb, args, 3);
     if(ts_is_array(mapped)){
       ts_gc_root(&mapped);
       uint32_t ml=ts_array_len(mapped);
@@ -7713,8 +7748,9 @@ double ts_array_findindex(tsv arr, tsv cb){
   ts_array* a=as_arr(arr); if(!a) return -1;
   uint32_t len=a->len;
   ts_gc_root(&arr); ts_gc_root(&cb);
-  for(uint32_t i=0;i<len;i++){ a=as_arr(arr); tsv elem=ts_array_get(arr,i); tsv args[2]={elem,ts_num((double)i)};
-    if(ts_truthy(ts_call_value(cb,args,2))){ ts_gc_unroot(2); return (double)i; } }
+  ts_cb cbf; cb_resolve(&cbf, cb);
+  for(uint32_t i=0;i<len;i++){ a=as_arr(arr); tsv elem=ts_array_get(arr,i); tsv args[3]={elem,ts_num((double)i),arr};
+    if(ts_truthy(cb_call(&cbf, cb, args, 3))){ ts_gc_unroot(2); return (double)i; } }
   ts_gc_unroot(2);
   return -1;
 }
@@ -7722,10 +7758,11 @@ int ts_array_some(tsv arr, tsv cb){
   ts_array* a=as_arr(arr); if(!a) return 0;
   uint32_t len=a->len;
   ts_gc_root(&arr); ts_gc_root(&cb);
+  ts_cb cbf; cb_resolve(&cbf, cb);
   for(uint32_t i=0;i<len;i++){
     a=as_arr(arr); if(!a || i>=a->len || array_is_hole(a->data[i])) continue;
-    tsv elem=a->data[i]; tsv args[2]={elem,ts_num((double)i)};
-    if(ts_truthy(ts_call_value(cb,args,2))){ ts_gc_unroot(2); return 1; } }
+    tsv elem=a->data[i]; tsv args[3]={elem,ts_num((double)i),arr};
+    if(ts_truthy(cb_call(&cbf, cb, args, 3))){ ts_gc_unroot(2); return 1; } }
   ts_gc_unroot(2);
   return 0;
 }
@@ -7733,10 +7770,11 @@ int ts_array_every(tsv arr, tsv cb){
   ts_array* a=as_arr(arr); if(!a) return 1;
   uint32_t len=a->len;
   ts_gc_root(&arr); ts_gc_root(&cb);
+  ts_cb cbf; cb_resolve(&cbf, cb);
   for(uint32_t i=0;i<len;i++){
     a=as_arr(arr); if(!a || i>=a->len || array_is_hole(a->data[i])) continue;
-    tsv elem=a->data[i]; tsv args[2]={elem,ts_num((double)i)};
-    if(!ts_truthy(ts_call_value(cb,args,2))){ ts_gc_unroot(2); return 0; } }
+    tsv elem=a->data[i]; tsv args[3]={elem,ts_num((double)i),arr};
+    if(!ts_truthy(cb_call(&cbf, cb, args, 3))){ ts_gc_unroot(2); return 0; } }
   ts_gc_unroot(2);
   return 1;
 }

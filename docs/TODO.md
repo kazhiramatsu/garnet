@@ -6152,6 +6152,30 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   of three alternating runs: 4.625 vs 4.674 s and 4.685 vs 4.766 s
   median, all six pairs -1.0% to -1.7% (about -1.4%). Node 3.44-3.63 s
   under desktop load (1.32x).
+- Array callbacks: the container argument, one dispatch per loop (build
+  `x58`, full build; runtime). The kernel `callbacks` (3.4x Node, half its
+  samples in `ts_call` and `ts_call_value`) showed a silent miscompile on
+  the way: the iteration builtins passed `(element, index)` only, so a
+  callback's array parameter was undefined (`arr.forEach((x, i, a) =>
+  a.length)` read 0, `map`, `filter`, `some`, `every`, `find*`, `flatMap`
+  alike); `reduce` / `reduceRight` lacked their fourth argument and
+  `Map` / `Set` `forEach` their third. Every builtin now passes the
+  container. And a callback is resolved once per loop (`cb_resolve`): a
+  function that takes no `this`, with the environment ABI or no
+  environment, is called the way `ts_call` would (the environment register
+  store and the indirect call) without `ts_call_value`'s per-element
+  proxy, function, takes_this and environment-form tests; anything else
+  keeps `ts_call_value`. Kernel `callbacks` 509 -> 284 ms (3.37x -> 1.92x
+  Node). Fixture `arrays/callback_arguments` (every method's container
+  argument, `Map` / `Set` `forEach`, a callback calling other closures
+  under it, a `function` callback, a throw, growing, shrinking and holes
+  during iteration, a bound method value; also under GC stress).
+  Gates all green (the fixture's `delete a[2]` is a known unported
+  builtin of the frozen emitter in parity and selfconf). A/B against
+  `x57`, two rounds of three alternating runs: 4.479 vs 4.491 s and 4.449
+  vs 4.489 s median: neutral to -0.9% (the compiler's callbacks go mostly
+  through its own `forEach` / `some` helpers, not the builtins). Node 3.32 s
+  (1.34x).
 - Next slices, in order. A slice that extends the stack or an arena to a
   new kind of allocation runs the conformance suite and a compile of the
   compiler under `--stack-check` (an arena must allocate through the
