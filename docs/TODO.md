@@ -6895,6 +6895,22 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   collection every 256 allocations, its 78 output files identical. A/B
   against round 1: eight ABBA pairs, instructions 0.9896 (eight of eight),
   cycles 0.9896 (six of eight), wall 0.9909.
+- A full collection freed a live Proxy. `gc_kind_valid` stopped at
+  `TS_KIND_SYMBOL`, one short of `TS_KIND_PROXY`, so the full mark skipped a
+  proxy referenced in the old-pointer form (any proxy that had been promoted
+  and whose references the collector had rewritten): the cell was swept
+  while live and later traps read freed memory (wrong values, NaN; found
+  under GC stress from a lazy-frame probe, then reproduced without stress).
+  The check now covers every kind. Fixture `gc/proxy_old_generation` (a
+  proxy and a plain-target proxy read and written across rounds of churn
+  that promote cells and force full collections: wrong without the fix,
+  also with the default thresholds); the GC stress filter runs it and
+  `gc/frame_elision`. Gates: unit, parity (363 identical), bundler,
+  selfconf, GC stress, inline policy, conformance 494/494 and 494/494 with a
+  collection at every allocation in protect mode; tsc relinked and compiled
+  under protect mode, with zapping, and with a minor collection every 256
+  allocations, its 78 output files identical. A/B against `fe2`: neutral
+  (instructions 0.9999, cycles 0.9966).
 - Where the remaining 358.7M frame pushes come from (a per-function count,
   joined with the rule under relaxations): a precise backward liveness
   would remove 1.4% (it never needs a slot the linear walk does not: checked

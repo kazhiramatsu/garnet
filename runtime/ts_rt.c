@@ -763,8 +763,11 @@ __attribute__((destructor)) static void ts_rt_stats_dump(void){
 #define TS_GC_MIN_FULL_BYTES ((size_t)4u * 1024u * 1024u)
 
 static inline int ts_heap_ref(tsv v){ return ts_is_obj(v)||ts_is_func(v)||ts_is_heap_str(v); }
+/* Every cell kind, the last one included: an old Proxy referenced only in
+   the old-pointer form was skipped by a full collection's marking and freed
+   while live. */
 static inline int gc_kind_valid(uint8_t k){
-  return k >= TS_KIND_OBJECT && k <= TS_KIND_SYMBOL;
+  return k >= TS_KIND_OBJECT && k <= TS_KIND_PROXY;
 }
 #ifdef TSAOT_STACK_CHECK
 /* Stack check (docs/stack_check_design.md): the emitted code allocates every
