@@ -61,3 +61,72 @@ memoryUsage).
 Each slice keeps the usual gates; the typed arrays need GC stress (buffers
 are payloads, views alias them) and the stack check if any view is
 stack-allocated.
+
+## Host as built (slice 3)
+
+`benchmarks/tsc_ts_native/` (its README): TypeScript shims for the eight
+modules tsc-ts imports, mapped by the tsconfig's `paths` (synchronous file
+calls, POSIX `dirname`, one available CPU so the checkers default to one, no
+workers or child processes, `publish` as the identity); `process` and
+`Buffer` (the parts tsc-ts uses) in a prelude the entry imports first; and a
+C host that registers the primitives as the global `__garnetHost` (file
+system, arguments, environment, clocks, exit, the UTF-8 length and UTF-16LE
+writes `Buffer` needs) before the module initializer runs. The entry is
+tsc-ts's `src/main.ts` with one thread; the compiler's sources are
+unmodified. `scripts/build_tsc_ts_native.sh` copies the checkout's sources
+next to the shims (the checkout stays unchanged), exports with that
+tsconfig (strict, so the strict type profile), emits, adds the host's
+initialization to `main`, and compiles with the tsc recipe
+(`TSAOT_NATIVE_COLD_O0=1`: -O2, the few giant functions -O0).
+
+## Bring-up as built (slice 4)
+
+Each defect found on the way was a silent wrong value and is a conformance
+fixture now:
+
+- the environment's values (`declare var`, `declare global`, `.d.ts`
+  globals such as `process`) read a local nothing assigns:
+  `toplevel/ambient_globals`;
+- a constructor body reading its parameter properties by name read a local
+  nothing assigns: `classes/parameter_property_reads`;
+- SROA-inlined constructors and methods called with arguments left out read
+  an unrelated caller local for each: `classes/inlined_omitted_arguments`;
+- a subclass redeclaring an inherited field (its constructor assigns it)
+  under the strict profile read the ancestor's boxed slot as a double, and
+  the parser printed `var` for `const`: `classes/redeclared_field_slots`,
+  and the conformance suite's strict mode (`TSAOT_CONF_STRICT=1`);
+- SROA-inlined methods rewrote the field accesses and calls on `this` only
+  at the body's top level (one in an if, a ternary, a loop or a try read an
+  unrelated caller local in place of the eliminated object), and mapped a
+  parameter the body assigns to the caller's argument local (the assignment
+  overwrote the caller's variable): tsc-ts's template literal inference
+  (`TemplateMatcher`) crashed and reported false errors;
+  `classes/inlined_method_blocks`.
+
+garnet's tsc-ts compiles the TypeScript 6.0.3 compiler project (78 files)
+without diagnostics, its output byte-identical to scriptc's binary (whose
+output differs from tsc 6.0.3's in 22 files and from tsgo's in 7), and
+matches scriptc's diagnostics and outputs on small projects (template
+literal types included). A build at -O0 overflows the 8 MB main thread stack
+in the transformer's visitor recursion (about 200 KB of frames per level);
+the optimized build does not. garnet does not detect a stack overflow (V8
+throws a RangeError): a follow-up.
+
+## First measurement (slice 5)
+
+The TypeScript 6.0.3 compiler project, five interleaved rounds, medians,
+one thread each (`--singleThreaded`; garnet's tsc-ts has one). V8 runs
+tsc-ts's own Node build (the `build` script of its package: `tsc` to
+ES2024 modules), the same source.
+
+| | emit | `--noEmit` |
+|---|---|---|
+| node (V8) | 3.18 s (6.65 s CPU with its helper threads) | 2.29 s |
+| scriptc's binary | 1.04 s | 0.65 s |
+| garnet | 8.30 s (963 MB) | 5.25 s |
+
+All three emit the same 78 files. garnet is 2.3-2.6x slower than V8 on this
+source, where it is 1.2x slower on tsc 6.0.3's (the JS-era design), and 8x
+slower than scriptc: tsc-ts is the static subset garnet's type-driven
+lowering is for, so the gap is the pattern work's next input (profile the
+run, take the worst patterns first).

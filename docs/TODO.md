@@ -7447,3 +7447,16 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   mode, with zapping, and with a minor collection every 256 allocations,
   its 78 output files identical. A/B against `pp`, sixteen ABBA pairs:
   wall 1.0000, instructions 1.0000, cycles 1.0009: neutral.
+- tsc-ts bring-up (slices 3 and 4 of `docs/tsc_ts_native_design.md`, "Host
+  as built", "Bring-up as built"): `benchmarks/tsc_ts_native/` (the module
+  shims, `process` and `Buffer`, the C host) and
+  `scripts/build_tsc_ts_native.sh`. garnet's tsc-ts compiles the
+  TypeScript 6.0.3 compiler project without diagnostics, its 78 output
+  files byte-identical to scriptc's binary, and matches scriptc's
+  diagnostics and outputs on small projects. Measured on that project (five
+  interleaved rounds, medians; tsc-ts's own Node build, `tsc` of its
+  package scripts, for V8 on the same source): emitting, node 3.18 s (6.65 s
+  of CPU with its helper threads), scriptc's binary on one thread 1.04 s,
+  garnet 8.30 s; checking only (`--noEmit`), 2.29 s, 0.65 s and 5.25 s.
+  garnet is 2.3-2.6x slower than V8 on this source (1.2x on tsc 6.0.3's)
+  and 8x slower than scriptc: the next pattern work.
