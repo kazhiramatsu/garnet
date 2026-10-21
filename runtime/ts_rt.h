@@ -431,12 +431,22 @@ typedef struct ts_obj_common {
   ts_prop* props; uint32_t cap, len;   /* lazily-allocated named-property map */
   /* Objects with enough named properties get a sparse open-addressing index.
      Small objects keep this NULL and retain the cache-friendly linear scan. */
-  uint32_t* prop_index;
-  uint32_t prop_index_cap;
+  uint32_t* prop_index;          /* capacity in prop_index[0], entries after it */
+  /* A sized class instance's class index plus one: its class's position in
+     a depth-first numbering of the class forest, so a class and its
+     subclasses are one interval (docs/class_index_dispatch_design.md); 0 for
+     every other object and after a user-level prototype change, TS_CLS_PROTO
+     on a class's prototype object. */
+  uint32_t cls;
   /* Low 29 bits are hidden-class identity. The high 3 bits store integrity
      flags (frozen, non-extensible, sealed), keeping the common header compact. */
   uint32_t shape;
 } ts_obj_common;
+/* The class index word of a class's prototype object: no instance's, so
+   intervals and tables reject it, and relinking such an object
+   (setPrototypeOf on a class prototype) is what can change an instance's
+   chain (g_class_relinked). */
+#define TS_CLS_PROTO 0xFFFFFFFFu
 /* ts_object is exactly the common header (plain object / class-instance prefix). */
 typedef struct ts_obj_common ts_object;
 static inline uint32_t ts_obj_shape_id(const ts_object* o){ return o->shape & TS_SHAPE_MAX; }
@@ -1615,6 +1625,11 @@ void ts_register_class(tsv proto, ts_class_field* fields, int nfields);
    instance from a class value at runtime. */
 void ts_register_class_meta(uint32_t class_id, size_t size, tsv proto, ts_class_field* fields, int nfields);
 tsv  ts_make_class_value(uint32_t class_id, ts_code ctor, tsv* env, uint32_t envlen);
+/* The class index words by class id (the generated CLASS_INDEX_TAB). */
+void ts_register_class_indices(const uint32_t* tab, uint32_t n);
+/* Raised when a prototype other than a sized instance's own is relinked by
+   the program: a class interval may no longer describe a prototype chain. */
+extern int g_class_relinked;
 tsv  ts_make_class_value_once(uint32_t class_id, ts_code ctor, tsv* env, uint32_t envlen);
 void ts_throw_uninitialized(const char* name);
 tsv  ts_construct(tsv ctorv, tsv* args, int n);

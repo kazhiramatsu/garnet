@@ -7553,3 +7553,39 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   its 78 output files identical. A/B against `rc` and `sp`, sixteen ABBA
   pairs each: wall 1.0000 and 0.9988, instructions 0.9999 and 0.9999,
   cycles 1.0005 and 0.9998: neutral.
+- Class index and dispatch tables (`docs/class_index_dispatch_design.md`,
+  slices CI1-CI4): a sized class instance carries its class's depth-first
+  index (`ts_obj_common.cls`, in the four bytes of the sparse property
+  index's capacity, which moved into the index block), so a class and its
+  subclasses are one interval. `instanceof` of a class with a shared
+  prototype answers by the interval (the chain walk for anything without an
+  index or after a class prototype was relinked); a hinted access to a
+  field a class below the root declares tests the declaring class's
+  interval (exact; intermediate classes' fields join); a virtual call (the
+  devirtualizer left several implementations: overrides, abstract methods
+  such as tsc-ts's `forEachChild` and `visit`) dispatches through a table
+  over the receiver class's interval, direct entries when every
+  implementation shares one signature, the prototype lookup behind it.
+  Class prototypes are marked (`TS_CLS_PROTO`) so that only relinking one
+  disables the intervals: tsc-ts's module initialization makes dictionaries
+  with `setPrototypeOf(o, null)`, which the first version took for a
+  relinked class. Found on the way (silent wrong values): abstract methods
+  were installed on their prototypes as function 0 (`C.prototype.m.call(x)`
+  ran an unrelated function); the static `instanceof` answer ignored a
+  relinked class prototype; `extends ns.Base` was not linked; a base that
+  is not a class declaration (a mixin call, a class-valued constant) was
+  neither laid out nor linked (now a compile-time rejection, with tests in
+  `rejects_syntax.sh`). tsc-ts: 3.64 s -> 2.93 s emitting, 2.38 s -> 2.04 s
+  checking only; against node on the same source, interleaved: 2.88 s and
+  2.09 s against 3.16 s and 2.43 s (garnet 1.10x and 1.16x faster, 2.3x
+  less CPU); scriptc 1.04 s and 0.67 s. Fixtures `classes/virtual_calls`,
+  `classes/abstract_methods`, `classes/class_index_instanceof`; interval
+  guards and intermediate fields in `classes/receiver_class_hints`.
+  Gates: unit, runtime tests, rejection tests, parity (373 identical),
+  bundler 43/43, selfconf, GC stress, inline policy, conformance 522/522,
+  522/522 under the strict profile, and 522/522 with a collection at every
+  allocation in protect mode; tsc rebuilt (`native_s350cv`; 656 lines of
+  its C differ) and compiled under protect mode, with zapping, and with a
+  minor collection every 256 allocations, its 78 output files identical.
+  A/B against `ch`, sixteen ABBA pairs: wall 1.0000, instructions 1.0001,
+  cycles 0.9983: neutral.

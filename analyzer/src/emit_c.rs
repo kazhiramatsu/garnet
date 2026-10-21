@@ -341,6 +341,7 @@ fn emit_program_with_string_plans(
         .collect();
     let _table = ClassTable::new(&program.classes);
     let classes: BTreeMap<u32, &ClassDef> = program.classes.iter().map(|c| (c.id.0, c)).collect();
+    set_class_dfs(&program.classes);
 
     // Classes whose instances flow into a dynamic enumeration builtin
     // (JSON.stringify / Object.keys|values|entries). Such objects must keep their
@@ -478,6 +479,9 @@ fn emit_program_with_string_plans(
         }
     }
     s.push_str("};\n");
+    emit_vtables(&mut s, program, &classes, &direct_sigs, &fn_takes_this, &|id| {
+        functions_by_id.get(id as usize).copied().flatten().map(cname).unwrap_or_default()
+    });
     // Per-function first-class metadata (`fn.length` arity, `fn.name`) indexed by
     // function id, set on a boxed function value in AllocClosure.
     let _ = write!(s, "static const uint32_t FN_ARITY[{}] = {{", maxid + 1);
@@ -790,6 +794,10 @@ fn emit_program_with_string_plans(
                 "  CLASS_PROTO[{}] = ts_new_proto(); ts_gc_root(&CLASS_PROTO[{}]);",
                 c.id.0, c.id.0
             );
+            if class_index_enabled() {
+                // a class prototype's mark (TS_CLS_PROTO, ts_rt.h)
+                let _ = writeln!(s, "  ((ts_object*)ts_ptr(CLASS_PROTO[{}]))->cls = TS_CLS_PROTO;", c.id.0);
+            }
         }
         // Link each prototype to its parent's prototype, forming a real JS
         // prototype chain (Sub.prototype.__proto__ = Base.prototype). Method
@@ -1168,6 +1176,359 @@ fn struct_name(id: u32) -> String {
     format!("Class{}", id)
 }
 
+/// Depth-first class numbering (docs/class_index_dispatch_design.md): the
+/// class forest walked from its roots in id order, children in id order. A
+/// sized instance's header carries its class's index plus one (`cls`), so a
+/// class and its subclasses are the interval `[index, index + span)`.
+pub(crate) struct ClassDfs {
+    index: BTreeMap<u32, u32>,
+    span: BTreeMap<u32, u32>,
+    /// The interval of a class describes its instances' prototype chains: the
+    /// subtree is stable (nobody relinks its prototypes or redefines its
+    /// methods) and its root extends nothing the table does not record (a
+    /// library class, a class-valued constant, a mixin expression).
+    ranged: BTreeSet<u32>,
+}
+
+thread_local! {
+    static CLASS_DFS: std::cell::RefCell<std::rc::Rc<ClassDfs>> = std::cell::RefCell::new(std::rc::Rc::new(ClassDfs {
+        index: BTreeMap::new(),
+        span: BTreeMap::new(),
+        ranged: BTreeSet::new(),
+    }));
+}
+
+fn compute_class_dfs(classes: &[ClassDef]) -> ClassDfs {
+    let ids: BTreeSet<u32> = classes.iter().map(|c| c.id.0).collect();
+    let by_id: BTreeMap<u32, &ClassDef> = classes.iter().map(|c| (c.id.0, c)).collect();
+    let mut children: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    let mut roots: Vec<u32> = Vec::new();
+    for c in classes {
+        match c.parent {
+            Some(p) if ids.contains(&p.0) && p.0 != c.id.0 => children.entry(p.0).or_default().push(c.id.0),
+            _ => roots.push(c.id.0),
+        }
+    }
+    for v in children.values_mut() {
+        v.sort_unstable();
+    }
+    roots.sort_unstable();
+    let mut dfs = ClassDfs { index: BTreeMap::new(), span: BTreeMap::new(), ranged: BTreeSet::new() };
+    let mut next = 0u32;
+    fn visit(c: u32, children: &BTreeMap<u32, Vec<u32>>, dfs: &mut ClassDfs, next: &mut u32) {
+        let lo = *next;
+        dfs.index.insert(c, lo);
+        *next += 1;
+        if let Some(ch) = children.get(&c) {
+            for &k in ch {
+                visit(k, children, dfs, next);
+            }
+        }
+        dfs.span.insert(c, *next - lo);
+    }
+    for &r in &roots {
+        visit(r, &children, &mut dfs, &mut next);
+    }
+    let foreign_base = |c: &ClassDef| {
+        c.reasons.iter().any(|r| {
+            r.starts_with("extends-non-identifier") || r.starts_with("extends-value") || r.starts_with("extends-library") || r.starts_with("cyclic-extends")
+        })
+    };
+    // A class extending a value or an expression may have any class of the
+    // program as its runtime ancestor: no interval holds then.
+    let user_foreign = classes.iter().any(|c| {
+        c.reasons.iter().any(|r| r.starts_with("extends-non-identifier") || r.starts_with("extends-value") || r.starts_with("cyclic-extends"))
+    });
+    if user_foreign {
+        return dfs;
+    }
+    // a class is ranged when every class of its subtree is stable and the
+    // hierarchy's root extends nothing unrecorded
+    let mut order: Vec<u32> = dfs.index.keys().copied().collect();
+    order.sort_by_key(|c| dfs.index[c]);
+    for &c in &order {
+        let lo = dfs.index[&c];
+        let span = dfs.span[&c];
+        let mut root = c;
+        while let Some(p) = by_id.get(&root).and_then(|cd| cd.parent).map(|p| p.0) {
+            if !ids.contains(&p) || p == root {
+                break;
+            }
+            root = p;
+        }
+        let root_ok = by_id.get(&root).map_or(false, |cd| !foreign_base(cd));
+        let subtree_ok = order
+            .iter()
+            .filter(|k| {
+                let i = dfs.index[k];
+                i >= lo && i < lo + span
+            })
+            .all(|k| by_id.get(k).map_or(false, |cd| cd.stable && !foreign_base(cd)));
+        if root_ok && subtree_ok {
+            dfs.ranged.insert(c);
+        }
+    }
+    dfs
+}
+
+fn set_class_dfs(classes: &[ClassDef]) {
+    let d = std::rc::Rc::new(compute_class_dfs(classes));
+    CLASS_DFS.with(|c| *c.borrow_mut() = d);
+}
+
+fn class_dfs() -> std::rc::Rc<ClassDfs> {
+    CLASS_DFS.with(|c| c.borrow().clone())
+}
+
+/// TSAOT_CLASS_INDEX=0 keeps the class index out of the emitted C (the parity
+/// oracle's text).
+fn class_index_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_CLASS_INDEX").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
+/// The header word of a sized instance of class `c` (its index plus one).
+fn class_index_word(c: u32) -> u32 {
+    class_dfs().index.get(&c).map_or(0, |i| i + 1)
+}
+
+/// A virtual call's dispatch table (docs/class_index_dispatch_design.md):
+/// for each class of the receiver class's interval, in class index order,
+/// the function implementing the method (none for an abstract class), and
+/// the direct signature they all share (else the generic entries are used).
+struct VtPlan {
+    table: String,
+    lo: u32,
+    span: u32,
+    sig: Option<DirectSig>,
+}
+
+thread_local! {
+    static VT_PLANS: std::cell::RefCell<BTreeMap<(u32, u32), std::rc::Rc<VtPlan>>> = std::cell::RefCell::new(BTreeMap::new());
+}
+
+/// TSAOT_VTABLES=0 keeps virtual calls on the prototype lookup.
+fn vtables_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_VTABLES").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
+fn collect_method_calls(body: &[Inst], out: &mut BTreeSet<(u32, u32, Option<u32>)>) {
+    for inst in body {
+        match inst {
+            Inst::Call {
+                callee: CalleeRef::Method { recv_class, method, recv_stable: true, method_field },
+                recv: Some(_),
+                ..
+            } if recv_class.0 != u32::MAX => {
+                out.insert((recv_class.0, method.0, method_field.map(|f| f.0)));
+            }
+            Inst::If { then_body, else_body, .. } => {
+                collect_method_calls(then_body, out);
+                collect_method_calls(else_body, out);
+            }
+            Inst::Loop { cond_body, body, .. } => {
+                collect_method_calls(cond_body, out);
+                collect_method_calls(body, out);
+            }
+            Inst::TryCatch { try_body, catch_body, finally_body, .. } => {
+                collect_method_calls(try_body, out);
+                collect_method_calls(catch_body, out);
+                collect_method_calls(finally_body, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The implementations a call of `method` on a receiver of class `c` can
+/// reach, by class index, when a table can dispatch it: the interval's
+/// classes are stable (no prototype relinked, no method reassigned), no
+/// class on a chain has an own field of the method's name (an instance
+/// property would shadow the method), the implementations take `this` and
+/// capture nothing (a table entry has no environment), and there are two at
+/// least (one is a direct call already).
+fn plan_vtable(
+    classes: &BTreeMap<u32, &ClassDef>,
+    c: u32,
+    method: u32,
+    method_field: Option<u32>,
+    direct_sigs: &BTreeMap<u32, DirectSig>,
+    takes_this: &BTreeMap<u32, bool>,
+) -> Option<(Vec<Option<u32>>, Option<DirectSig>)> {
+    let dfs = class_dfs();
+    let lo = *dfs.index.get(&c)?;
+    let span = *dfs.span.get(&c)?;
+    let mut by_index: BTreeMap<u32, u32> = BTreeMap::new();
+    for (&k, &i) in &dfs.index {
+        if i >= lo && i < lo + span {
+            by_index.insert(i, k);
+        }
+    }
+    let mut impls: Vec<Option<u32>> = Vec::with_capacity(span as usize);
+    for i in lo..lo + span {
+        let k = *by_index.get(&i)?;
+        let kd = classes.get(&k)?;
+        if !kd.stable {
+            return None;
+        }
+        let mut found = None;
+        let mut cur = Some(k);
+        while let Some(id) = cur {
+            let cd = classes.get(&id)?;
+            if let Some(mf) = method_field {
+                if cd.own_fields.iter().any(|f| f.0 == mf) {
+                    return None;
+                }
+            }
+            if found.is_none() {
+                if let Some(m) = cd.own_methods.iter().find(|m| m.name.0 == method && m.kind == MethodKind::Method) {
+                    found = Some(m.func.0);
+                }
+            }
+            cur = cd.parent.map(|p| p.0);
+        }
+        impls.push(found);
+    }
+    let distinct: BTreeSet<u32> = impls.iter().flatten().copied().collect();
+    if distinct.len() < 2 {
+        return None;
+    }
+    for &f in &distinct {
+        if callee_capture_count(f) != 0 || !takes_this.get(&f).copied().unwrap_or(false) {
+            return None;
+        }
+    }
+    let mut sig: Option<DirectSig> = None;
+    let mut shared = true;
+    for &f in &distinct {
+        match (direct_sigs.get(&f), &sig) {
+            (Some(d), None) => sig = Some(d.clone()),
+            (Some(d), Some(prev)) => {
+                if d.kinds != prev.kinds || d.ret != prev.ret {
+                    shared = false;
+                }
+            }
+            (None, _) => shared = false,
+        }
+    }
+    let sig = if shared { sig } else { None };
+    if let Some(d) = &sig {
+        // `this` leads, boxed
+        if d.kinds.first() != Some(&ParamKind::Boxed) {
+            return None;
+        }
+    }
+    Some((impls, sig))
+}
+
+/// Emit the dispatch tables of the program's virtual calls (after the
+/// function prototypes) and remember their plans for the call sites.
+fn emit_vtables(
+    s: &mut String,
+    program: &Program,
+    classes: &BTreeMap<u32, &ClassDef>,
+    direct_sigs: &BTreeMap<u32, DirectSig>,
+    takes_this: &BTreeMap<u32, bool>,
+    fn_name: &dyn Fn(u32) -> String,
+) {
+    VT_PLANS.with(|p| p.borrow_mut().clear());
+    if !class_index_enabled() || !vtables_enabled() {
+        return;
+    }
+    let mut calls: BTreeSet<(u32, u32, Option<u32>)> = BTreeSet::new();
+    for f in &program.functions {
+        collect_method_calls(&f.body, &mut calls);
+    }
+    let dfs = class_dfs();
+    for (c, m, mf) in calls {
+        if VT_PLANS.with(|p| p.borrow().contains_key(&(c, m))) {
+            continue;
+        }
+        let Some((impls, sig)) = plan_vtable(classes, c, m, mf, direct_sigs, takes_this) else { continue };
+        let table = format!("VT_{}_{}", c, m);
+        let entries: Vec<String> = impls
+            .iter()
+            .map(|f| match f {
+                Some(f) => {
+                    if sig.is_some() {
+                        format!("(void*){}_d", fn_name(*f))
+                    } else {
+                        format!("(void*){}", fn_name(*f))
+                    }
+                }
+                None => "(void*)0".to_string(),
+            })
+            .collect();
+        let _ = writeln!(s, "static void* const {}[{}] = {{{}}};", table, impls.len(), entries.join(", "));
+        let plan = VtPlan { table, lo: dfs.index[&c] + 1, span: dfs.span[&c], sig };
+        VT_PLANS.with(|p| p.borrow_mut().insert((c, m), std::rc::Rc::new(plan)));
+    }
+}
+
+/// A virtual call through its table: a sized instance of the receiver class
+/// or a subclass calls its class's implementation; anything else (or after a
+/// prototype was relinked) takes the prototype lookup that follows.
+fn emit_vtable_call(s: &mut String, ctx: &Ctx, plan: &VtPlan, argv: &[u32], dst: &Option<LocalId>) {
+    let _ = writeln!(
+        s,
+        "    {{ ts_object* _vo = ts_is_obj(_a[0]) ? (ts_object*)ts_ptr(_a[0]) : NULL; uint32_t _vk = _vo ? _vo->cls - {lo}u : UINT32_MAX; void* _vf = (_vk < {span}u && !g_class_relinked) ? {t}[_vk] : NULL;",
+        lo = plan.lo,
+        span = plan.span,
+        t = plan.table
+    );
+    s.push_str("    if (_vf) {
+");
+    match &plan.sig {
+        Some(sig) => {
+            let mut parts: Vec<String> = vec![ctx.val(argv[0])];
+            for (i, kind) in sig.kinds.iter().enumerate().skip(1) {
+                parts.push(match argv.get(i) {
+                    Some(a) => match kind {
+                        ParamKind::Boxed => ctx.val(*a),
+                        ParamKind::F64 => ctx.num(*a),
+                        ParamKind::I64 => {
+                            if ctx.int_local.contains(a) {
+                                format!("d{}", a)
+                            } else {
+                                format!("(long long)({})", ctx.num(*a))
+                            }
+                        }
+                    },
+                    None => match kind {
+                        ParamKind::Boxed => "TS_UNDEFINED".to_string(),
+                        ParamKind::F64 => "0.0".to_string(),
+                        ParamKind::I64 => "0".to_string(),
+                    },
+                });
+            }
+            let call = format!("(({} (*)({}))_vf)({})", sig.c_ret(), sig.c_params(), parts.join(", "));
+            s.push_str(&ctx.set_call_result(dst, &call, sig.ret));
+        }
+        None => {
+            let call = format!("((ts_fn)_vf)(_a, {})", argv.len());
+            match dst {
+                Some(d) => s.push_str(&ctx.set_val(d.0, &call)),
+                None => {
+                    let _ = writeln!(s, "    {};", call);
+                }
+            }
+        }
+    }
+    s.push_str("    } else {
+");
+}
+
 /// Emit a class field-descriptor table + a registrar so the runtime inspector
 /// can render typed class instances structurally. For each class we list its
 /// fields in struct order (parent fields first) with: field-name id, byte offset
@@ -1218,7 +1579,17 @@ fn emit_class_descriptors(s: &mut String, program: &Program) {
         }
         s.push_str("};\n");
     }
+    let index_tab = class_index_enabled() && !program.classes.is_empty();
+    if index_tab {
+        let n = program.classes.iter().map(|c| c.id.0).max().unwrap_or(0) + 1;
+        let words: Vec<String> = (0..n).map(|c| format!("{}u", class_index_word(c))).collect();
+        let _ = writeln!(s, "static const uint32_t CLASS_INDEX_TAB[{}] = {{{}}};", n, words.join(", "));
+    }
     s.push_str("static void ts_register_classes(void){\n");
+    if index_tab {
+        let n = program.classes.iter().map(|c| c.id.0).max().unwrap_or(0) + 1;
+        let _ = writeln!(s, "  ts_register_class_indices(CLASS_INDEX_TAB, {}u);", n);
+    }
     for (cid, fields) in &typed {
         let _ = writeln!(
             s,
@@ -8966,6 +9337,10 @@ enum HintGuard {
     /// Leaf).f` reads another kind of node's field there), so the receiver's
     /// prototype must be the leaf's.
     Leaf(u32),
+    /// A class below the root declares it: the receiver must be a sized
+    /// instance of that class or a subclass, by the class index
+    /// (`cls - lo < span`, docs/class_index_dispatch_design.md).
+    Range { lo: u32, span: u32 },
 }
 
 /// `None`: no struct access for the hint (an intermediate class declares
@@ -8984,6 +9359,12 @@ fn hint_guard(c: u32, field: u32, classes: &BTreeMap<u32, &ClassDef>) -> Option<
     if classes.get(&d)?.parent.is_none() {
         return Some(HintGuard::Root);
     }
+    if class_index_enabled() {
+        let dfs = class_dfs();
+        if let (Some(&i), Some(&span)) = (dfs.index.get(&d), dfs.span.get(&d)) {
+            return Some(HintGuard::Range { lo: i + 1, span });
+        }
+    }
     if classes.values().any(|o| o.parent.map(|p| p.0) == Some(d)) {
         return None;
     }
@@ -8998,6 +9379,13 @@ fn receiver_guard(obj: &str, hint: &Option<HintGuard>) -> String {
             "!ts_is_obj({o}) || ((ts_object*)ts_ptr({o}))->proto != CLASS_PROTO[{d}] || ({g})",
             o = obj,
             d = d,
+            g = typed_slow_guard(obj)
+        ),
+        Some(HintGuard::Range { lo, span }) => format!(
+            "!ts_is_obj({o}) || (uint32_t)(((ts_object*)ts_ptr({o}))->cls - {lo}u) >= {span}u || ({g})",
+            o = obj,
+            lo = lo,
+            span = span,
             g = typed_slow_guard(obj)
         ),
     }
@@ -17825,6 +18213,9 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                             let o = format!("_sco{}", dst.0);
                             let _ = writeln!(s, "  {{ {0}* {1} = ({0}*)ts_sc_alloc(sizeof({0}), {2}u, __func__);", cn, o, site.0);
                             let _ = writeln!(s, "  {0}->header.h.kind=TS_KIND_OBJECT; {0}->header.h.gen=2; {0}->header.h.size=sizeof({1}); {0}->header.proto={2}; {0}->header.shape={3};", o, cn, proto_expr, shape);
+                            if class_index_enabled() {
+                                let _ = writeln!(s, "  {}->header.cls={}u;", o, class_index_word(c.0));
+                            }
                             if !boxed.is_empty() {
                                 let inits: Vec<String> =
                                     boxed.iter().map(|f| format!("{}->f{} = TS_UNDEFINED;", o, f)).collect();
@@ -17839,6 +18230,9 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                             format!("  {1} sobj{0} = {{0}};", dst.0, cn)
                         };
                         let _ = writeln!(s, "{} sobj{}.header.h.kind=TS_KIND_OBJECT; sobj{}.header.h.mark=0; sobj{}.header.h.gen=2; sobj{}.header.h.remembered=0; sobj{}.header.h.handle=0; sobj{}.header.h.size=sizeof({}); sobj{}.header.proto={}; sobj{}.header.props=0; sobj{}.header.cap=0; sobj{}.header.len=0; sobj{}.header.shape={};", decl, dst.0, dst.0, dst.0, dst.0, dst.0, dst.0, cn, dst.0, proto_expr, dst.0, dst.0, dst.0, dst.0, shape);
+                        if class_index_enabled() {
+                            let _ = writeln!(s, "  sobj{}.header.cls={}u;", dst.0, class_index_word(c.0));
+                        }
                         if !boxed.is_empty() {
                             let inits: Vec<String> = boxed
                                 .iter()
@@ -17857,6 +18251,9 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         let _ =
                             writeln!(s, "  {}* hobj{} = ({}*)ts_ptr({});", cn, dst.0, cn, dst_name);
                         let _ = writeln!(s, "  hobj{}->header.proto={}; hobj{}->header.props=0; hobj{}->header.cap=0; hobj{}->header.len=0;", dst.0, proto_expr, dst.0, dst.0, dst.0);
+                        if class_index_enabled() {
+                            let _ = writeln!(s, "  hobj{}->header.cls={}u;", dst.0, class_index_word(c.0));
+                        }
                         if !boxed.is_empty() {
                             let inits: Vec<String> = boxed
                                 .iter()
@@ -19085,14 +19482,35 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 b if b.starts_with("instanceof.class:") => {
                     let c = &b["instanceof.class:".len()..];
                     let o = v(0);
-                    (
-                        format!(
-                            "ts_bool((ts_is_obj({o}) && ((ts_object*)ts_ptr({o}))->proto == CLASS_PROTO[{c}]) || ts_instanceof({o}, CLASS_PROTO[{c}]))",
-                            o = o,
-                            c = c
-                        ),
-                        false,
-                    )
+                    let cid: u32 = c.parse().unwrap_or(u32::MAX);
+                    let dfs = class_dfs();
+                    if class_index_enabled() && dfs.ranged.contains(&cid) {
+                        // a sized instance answers by its class's interval
+                        // (docs/class_index_dispatch_design.md); anything else
+                        // (no index, a class prototype's mark), or after a class
+                        // prototype was relinked, walks its chain
+                        let lo = dfs.index[&cid] + 1;
+                        let span = dfs.span[&cid];
+                        (
+                            format!(
+                                "ts_bool(ts_is_obj({o}) && ({{ uint32_t _ci = ((ts_object*)ts_ptr({o}))->cls; ((uint32_t)(_ci - 1u) < 0xFFFFFFFEu && !g_class_relinked) ? (uint32_t)(_ci - {lo}u) < {span}u : ts_instanceof({o}, CLASS_PROTO[{c}]); }}))",
+                                o = o,
+                                c = c,
+                                lo = lo,
+                                span = span
+                            ),
+                            false,
+                        )
+                    } else {
+                        (
+                            format!(
+                                "ts_bool((ts_is_obj({o}) && ((ts_object*)ts_ptr({o}))->proto == CLASS_PROTO[{c}]) || ts_instanceof({o}, CLASS_PROTO[{c}]))",
+                                o = o,
+                                c = c
+                            ),
+                            false,
+                        )
+                    }
                 }
                 // x instanceof C with a Symbol.hasInstance hook: C[Symbol.hasInstance](x).
                 // ts_instanceof_hook already returns a tsv bool (ToBoolean of the result).
@@ -20744,6 +21162,24 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             }
             if ncap > 0 {
                 s.push_str("    g_ts_cur_env = _e;\n");
+            }
+            if let CalleeRef::Method { recv_class, method, recv_stable: true, method_field } = callee {
+                if recv.is_some() {
+                    let plan = VT_PLANS.with(|p| p.borrow().get(&(recv_class.0, method.0)).cloned());
+                    if let Some(plan) = plan {
+                        emit_vtable_call(s, ctx, &plan, argv, dst);
+                        emit_method_value_lookup(s, "_a[0]", method.0, method_field.map(|f| f.0), ctx.wksym);
+                        let call = format!("ts_call_method(_mv, _a, {})", argv.len());
+                        match dst {
+                            Some(d) => s.push_str(&ctx.set_val(d.0, &call)),
+                            None => {
+                                let _ = writeln!(s, "    {};", call);
+                            }
+                        }
+                        s.push_str("    }\n    }\n  }\n");
+                        return;
+                    }
+                }
             }
             if let CalleeRef::Method {
                 method,

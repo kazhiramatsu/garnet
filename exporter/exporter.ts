@@ -5866,10 +5866,16 @@ class Exporter {
       // identical) has lclass = one member, but its runtime class may be the other —
       // so the static `instanceof` answer is unsound. Suppress the shortcut and emit
       // the always-correct runtime proto-walk for such LHSs.
+      // (only along stable classes: a program that relinks a class prototype,
+      // `Object.setPrototypeOf(C.prototype, X)`, changes the answer)
       let staticallyTrue = false;
       if (lclass !== undefined && rclass !== undefined && !this.exprMayBePolyInstance(node.left)) {
         let cur: number | undefined = lclass;
-        while (cur !== undefined) { if (cur === rclass) { staticallyTrue = true; break; } cur = this.parentIdOf(cur); }
+        while (cur !== undefined) {
+          if (!this.classInfos[cur]?.stable) break;
+          if (cur === rclass) { staticallyTrue = true; break; }
+          cur = this.parentIdOf(cur);
+        }
       }
       if (staticallyTrue) {
         this.lowerExpr(ctx, node.left);   // evaluate LHS for side effects
@@ -13096,6 +13102,14 @@ class Exporter {
           if (this.classInfos[classId]?.reasons.includes("cyclic-extends")) {
             this.unsupported(n, "cyclic class extends hierarchy (self/mutual extends would throw at runtime)");
           }
+          // A base that is not a class declaration (a mixin call, a class-valued
+          // constant) was neither laid out nor linked: the instance lacked the
+          // base's fields and methods (silent wrong values). Reject it loudly.
+          const reasons = this.classInfos[classId]?.reasons ?? [];
+          const ext = n.heritageClauses?.find((h) => h.token === ts.SyntaxKind.ExtendsKeyword)?.types[0]?.expression;
+          if (ext && (reasons.includes("extends-non-identifier(mixin)") || reasons.includes("extends-value(unresolved)"))) {
+            this.unsupported(ext, "class extends an expression or a class-valued binding (only a class declaration or a library class is supported as a base)");
+          }
           let hasStatic = false;
           for (const m of n.members) {
             const isStatic = this.isStaticMember(m);
@@ -13481,15 +13495,19 @@ class Exporter {
   /** Build the classes table for programJson, resolving names/methods to ids. */
   buildClassesTable() {
     this.classesOut = this.classInfos.map((c) => {
+      // (an abstract method has no body and no runtime existence: not on the
+      // prototype, `"m" in C.prototype` is false; it used to be installed as
+      // function 0)
       const methods = c.ownMethods
         .filter((m) => m.kind === "method" || m.kind === "getter" || m.kind === "setter")
+        .filter((m) => this.methodFunc.has(`${c.id}:${m.kind}:${m.name}`))
         .map((m) => {
           const callName = m.kind === "getter" ? `get ${m.name}` : m.kind === "setter" ? `set ${m.name}` : m.name;
           const propName = m.name.startsWith("@@") || m.name.startsWith("#") ? undefined : m.name;
           return {
             name: this.internName(callName),
             propName,
-            func: this.methodFunc.get(`${c.id}:${m.kind}:${m.name}`) ?? 0,
+            func: this.methodFunc.get(`${c.id}:${m.kind}:${m.name}`)!,
             kind: m.kind,
           };
         });

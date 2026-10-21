@@ -472,7 +472,7 @@ int main(){
      per-object index. Either way all 24 keys must resolve (checked below). */
   CK("prop index threshold", indexed_obj->len==24 &&
      (ts_obj_shape_id(indexed_obj)!=TS_SHAPE_NONE || indexed_obj->prop_index!=NULL));
-  CK("prop index grew", ts_obj_shape_id(indexed_obj)!=TS_SHAPE_NONE || indexed_obj->prop_index_cap>=32);
+  CK("prop index grew", ts_obj_shape_id(indexed_obj)!=TS_SHAPE_NONE || (indexed_obj->prop_index && indexed_obj->prop_index[0]>=32));
   int indexed_ok=1;
   for (uint32_t i=0;i<24;i++)
     if (ts_to_num(ts_get(indexed, index_base+i)) != (double)i) indexed_ok=0;
@@ -488,7 +488,7 @@ int main(){
     if (i!=11u) (void)ts_delete_prop(indexed,index_base+i);
   indexed_obj=(ts_object*)ts_ptr(indexed);
   CK("prop index shrinks to linear",
-     indexed_obj->len==7 && indexed_obj->prop_index==NULL && indexed_obj->prop_index_cap==0);
+     indexed_obj->len==7 && indexed_obj->prop_index==NULL);
   ts_set(indexed, index_base+100u, ts_num(100));
   indexed_obj=(ts_object*)ts_ptr(indexed);
   CK("prop index rebuild after shrink",
@@ -512,7 +512,7 @@ int main(){
   ts_object* collision_obj=(ts_object*)ts_ptr(collisions);
   CK("prop index collision setup",
      collision_obj->len==8 &&
-     (ts_obj_shape_id(collision_obj)!=TS_SHAPE_NONE || collision_obj->prop_index_cap==16));
+     (ts_obj_shape_id(collision_obj)!=TS_SHAPE_NONE || (collision_obj->prop_index && collision_obj->prop_index[0]==16)));
   int collision_ok=1;
   for (uint32_t i=0;i<8;i++)
     if (ts_to_num(ts_get(collisions,collision_keys[i])) != 200+i) collision_ok=0;

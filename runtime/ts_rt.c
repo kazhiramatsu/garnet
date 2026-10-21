@@ -1537,7 +1537,19 @@ static void obj_link_fresh_proto(tsv obj, tsv proto){
    class setup, which links prototypes the same way, keeps ts_set_proto, so
    only a program's own relink of an object behind a class with struct fields
    raises g_typed_slow (docs/foreign_receivers_design.md). */
+int g_class_relinked = 0;
+static const uint32_t* g_class_index_tab = NULL;
+static uint32_t g_class_index_n = 0;
+void ts_register_class_indices(const uint32_t* tab, uint32_t n){ g_class_index_tab = tab; g_class_index_n = n; }
 tsv ts_set_proto_user(tsv obj, tsv proto){
+  /* A sized instance relinked leaves its class's interval; a class's
+     prototype relinked changes its instances' chains
+     (docs/class_index_dispatch_design.md); other objects concern nobody. */
+  if (ts_is_obj(obj)){
+    ts_object* o = (ts_object*)ts_ptr(obj);
+    if (o->cls == TS_CLS_PROTO) g_class_relinked = 1;
+    else if (o->cls) o->cls = 0;
+  }
   tsv r = ts_set_proto(obj, proto);
   if (!g_typed_slow && !(g_has_proxies && ts_is_proxy(obj))) typed_slow_check_relink(obj, proto);
   return r;
@@ -2344,42 +2356,44 @@ static inline int pref_is_enumerable(ts_pref r){ return (pref_flags(r) & TS_PROP
 static inline int pref_is_configurable(ts_pref r){ return (pref_flags(r) & TS_PROP_CONFIGURABLE) != 0; }
 
 /* Dictionary index (shape 0 only). */
+/* The index block: its capacity, then the entries. */
+static inline uint32_t prop_index_capacity(const ts_object* o){ return o->prop_index ? o->prop_index[0] : 0u; }
 static void prop_index_put(ts_object* o, uint32_t prop_i){
-  uint32_t mask = o->prop_index_cap - 1u;
+  uint32_t* entries = o->prop_index + 1;
+  uint32_t mask = o->prop_index[0] - 1u;
   uint32_t slot = prop_key_hash(o->props[prop_i].key) & mask;
-  while (o->prop_index[slot]) slot = (slot + 1u) & mask;
-  o->prop_index[slot] = prop_i + 1u;
+  while (entries[slot]) slot = (slot + 1u) & mask;
+  entries[slot] = prop_i + 1u;
 }
 static void prop_index_rebuild(ts_object* o, uint32_t need){
   if (need < TS_PROP_INDEX_MIN){
     gc_owned_free(o->prop_index);
     o->prop_index = NULL;
-    o->prop_index_cap = 0;
     return;
   }
-  uint32_t cap = o->prop_index_cap ? o->prop_index_cap : 16u;
+  uint32_t old_cap = prop_index_capacity(o);
+  uint32_t cap = old_cap ? old_cap : 16u;
   while (need * 4u >= cap * 3u) cap *= 2u;
-  if (cap != o->prop_index_cap){
+  if (cap != old_cap){
     gc_owned_free(o->prop_index);
-    o->prop_index = (uint32_t*)gc_owned_alloc(&o->h, sizeof(uint32_t) * cap);
-    memset(o->prop_index, 0, sizeof(uint32_t) * cap);
-    o->prop_index_cap = cap;
-  } else {
-    memset(o->prop_index, 0, sizeof(uint32_t) * cap);
+    o->prop_index = (uint32_t*)gc_owned_alloc(&o->h, sizeof(uint32_t) * (cap + 1u));
   }
+  memset(o->prop_index, 0, sizeof(uint32_t) * (cap + 1u));
+  o->prop_index[0] = cap;
   for (uint32_t i = 0; i < o->len; i++) prop_index_put(o, i);
 }
 static void prop_index_reserve(ts_object* o, uint32_t need){
   if (need < TS_PROP_INDEX_MIN) return;
-  if (!o->prop_index || need * 4u >= o->prop_index_cap * 3u)
+  if (!o->prop_index || need * 4u >= prop_index_capacity(o) * 3u)
     prop_index_rebuild(o, need);
 }
 static int32_t prop_index_lookup(ts_object* o, ts_key key, uint32_t* probes){
   uint32_t p = 0;
-  uint32_t mask = o->prop_index_cap - 1u;
+  uint32_t mask = o->prop_index[0] - 1u;
+  const uint32_t* entries = o->prop_index + 1;
   for (uint32_t slot = prop_key_hash(key) & mask; ; slot = (slot + 1u) & mask){
     p++;
-    uint32_t entry = o->prop_index[slot];
+    uint32_t entry = entries[slot];
     if (!entry){
       if (probes) *probes = p;
       return -1;
@@ -5427,7 +5441,7 @@ static void g0_count_fate(ts_gc_header* h, int fate){
       if (obj_shaped(common)) g0_payload(fate, G0_P_VALS, (unsigned long long)common->cap * sizeof(tsv), &any);
       else g0_payload(fate, G0_P_DICT, (unsigned long long)common->cap * sizeof(ts_prop), &any);
     }
-    if (common->prop_index) g0_payload(fate, G0_P_INDEX, (unsigned long long)common->prop_index_cap * sizeof(uint32_t), &any);
+    if (common->prop_index) g0_payload(fate, G0_P_INDEX, (unsigned long long)(common->prop_index[0] + 1u) * sizeof(uint32_t), &any);
   }
   if (any) g0_owner_cells[fate][kind]++;
 }
@@ -10582,6 +10596,7 @@ static tsv ts_clone_class_proto(uint32_t class_id){
   tmpl = (ts_object*)ts_ptr(tmplv);
   p->proto = tmpl->proto;
   p->shape = tmpl->shape;
+  p->cls = tmpl->cls;   /* a class prototype's mark */
   if (tmpl->len){
     p->cap = tmpl->len;
     p->len = tmpl->len;
@@ -10712,6 +10727,7 @@ tsv ts_construct(tsv ctorv, tsv* args, int n){
   }
   tsv proto = ((ts_func*)ts_ptr(ctorv))->prototype_prop;
   ((ts_object*)ts_ptr(inst))->proto = ts_is_obj(proto) ? proto : g_class_proto_tab[cid];
+  if (cid < g_class_index_n) ((ts_object*)ts_ptr(inst))->cls = g_class_index_tab[cid];
   /* Boxed fields start as undefined (the zeroed instance memory would read as
      the number 0); generated allocation sites do the same inline. */
   if (g_class_fields[cid]){

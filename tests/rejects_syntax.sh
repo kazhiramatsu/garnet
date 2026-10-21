@@ -10,6 +10,11 @@ chk(){ echo "$2" > "$tmp/t.ts"; if node exporter/exporter.js "$tmp/t.ts" "$tmp/t
 chk "multi-level break inside try/finally" 'function main(): void { let r=""; outer: for(let i=0;i<3;i++){ for(let j=0;j<3;j++){ try{ if(j===1) break outer; }finally{ r+="f"; } } } console.log(r); }'
 chk "self-referential class extends" 'class C extends C {} function main(): void { console.log(1); } main();'
 chk "mutually-cyclic class extends" 'class A extends B {} class B extends A {} function main(): void { console.log(1); } main();'
+# A base that is not a class declaration (a mixin call, a class-valued binding)
+# was neither laid out nor linked: the instance lacked the base's fields and
+# methods (silent wrong values before). `extends ns.Base` is a class name.
+chk "class extending a mixin call" 'class A { a = 1; } function mix<B extends new (...a: any[]) => object>(b: B) { return class extends b {}; } class M extends mix(A) {} console.log(new M());'
+chk "class extending a class-valued constant" 'const K = class { k = 1; }; class D extends K {} console.log(new D().k);'
 chk "value import linkage" 'import { value } from "./dep"; console.log(value);'
 chk "lexical TDZ read" 'console.log(x); let x = 1;'
 chk "lexical TDZ self read" 'let x = x; console.log(x);'

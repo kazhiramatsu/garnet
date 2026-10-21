@@ -46,6 +46,11 @@ export function memberKeyName(nameNode: ts.PropertyName | undefined): string | u
   return undefined; // dynamic / symbol
 }
 
+/** `a.b.C`: identifiers joined by property accesses (an entity name). */
+function isQualifiedName(e: ts.Expression): boolean {
+  return ts.isIdentifier(e) || (ts.isPropertyAccessExpression(e) && ts.isIdentifier(e.name) && isQualifiedName(e.expression));
+}
+
 export type MKind = "method" | "getter" | "setter";
 
 export interface MethodInfo { name: string; kind: MKind; isGenerator?: boolean; }
@@ -155,6 +160,10 @@ export class ClassExtractor {
         info.parentName = expr.text;
         // Capture the lexically-resolved symbol so the parent is identified by scope,
         // not by name (rule: `extends X` uses normal outer-scope name resolution).
+        info.parentSym = this.sym(expr);
+      } else if (ts.isPropertyAccessExpression(expr) && isQualifiedName(expr)) {
+        // `extends ns.Base`: a qualified name of a class resolves like a name
+        info.parentName = expr.name.text;
         info.parentSym = this.sym(expr);
       } else {
         info.reasons.push("extends-non-identifier(mixin)");
@@ -780,6 +789,16 @@ export class ClassExtractor {
     // user class (a builtin like Error, or a `const K = class {}` binding) stays undefined.
     for (const ci of this.classes) {
       ci.parentId = ci.parentSym ? this.bySymbol.get(ci.parentSym) : undefined;
+      // An `extends` the class table does not record: a library class
+      // (Error, Array, ...) or a value that is not a class declaration (a
+      // class-valued constant). The runtime prototype chain then has an
+      // ancestor outside the table's intervals
+      // (docs/class_index_dispatch_design.md).
+      if (ci.parentSym !== undefined && ci.parentId === undefined) {
+        const decls = ci.parentSym.getDeclarations() ?? [];
+        const library = decls.length > 0 && decls.every((d) => d.getSourceFile().isDeclarationFile);
+        ci.reasons.push(library ? `extends-library(${ci.parentName ?? "?"})` : "extends-value(unresolved)");
+      }
     }
     this.breakParentCycles();
     for (const sf of sfs) this.scanStability(sf);

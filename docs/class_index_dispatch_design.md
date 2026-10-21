@@ -64,3 +64,51 @@ indirect call with typed arguments.
 Each slice: conformance (default and strict profiles, GC stress), parity,
 selfconf, bundler, tsc rebuilt with A/B, tsc-ts measured against scriptc
 and node.
+
+## As built (CI1-CI4)
+
+- **The index** (`ts_obj_common.cls`; `prop_index[0]` holds the sparse
+  index's capacity): the emitter numbers the class forest depth first
+  (roots and children in id order), writes each sized allocation's word
+  (`header.cls`, heap, stack and stack-check copies) and registers the
+  table (`CLASS_INDEX_TAB`, `ts_register_class_indices`) for `new` through
+  a class value (`ts_construct`). A class's prototype object carries
+  `TS_CLS_PROTO`. `setPrototypeOf` on a sized instance clears its word; on
+  a class prototype it raises `g_class_relinked`; on any other object (a
+  dictionary made with `setPrototypeOf(o, null)`, which tsc-ts's module
+  initialization does) nothing. TSAOT_CLASS_INDEX=0 restores the old text
+  (the parity oracle).
+- **`instanceof C`** (C's prototype shared, C's subtree stable, its root
+  extending nothing the table does not record, and no class of the program
+  extending a value or an expression): the interval when the word is an
+  instance's and no class prototype was relinked, the chain walk otherwise.
+- **Guards**: a hinted access to a field a class below the root declares
+  tests the declaring class's interval (exact, and it admits instances of
+  classes evaluated in functions, whose prototypes are not CLASS_PROTO);
+  a root's field stays unguarded.
+- **Tables**: every `Method` callee the devirtualizer left (several
+  implementations: overrides, abstract methods) whose receiver class's
+  subtree is stable, whose implementations take `this`, capture nothing
+  and are not shadowed by an own field, gets a table over the class's
+  interval (`VT_<class>_<method>`, direct entries when every implementation
+  shares one direct signature, generic entries otherwise); the call tests
+  the interval and calls through the table, the prototype lookup behind it.
+- **Found on the way** (silent wrong values): an abstract method was
+  installed on its class's prototype as function 0 (`"m" in C.prototype`,
+  `C.prototype.m.call(x)` ran an unrelated function); the static
+  `instanceof` answer ignored a relinked class prototype; `extends ns.Base`
+  was not linked (now a class name); a base that is not a class declaration
+  (a mixin call, a class-valued constant) was neither laid out nor linked
+  (now rejected at compile time).
+
+tsc-ts (the TypeScript 6.0.3 compiler project, one thread, emitting):
+3.64 s -> 2.93 s; checking only 2.38 s -> 2.04 s. Interleaved against
+node running the same source: 2.88 s against 3.16 s emitting (garnet 1.10x
+faster, 2.3x less CPU), 2.09 s against 2.43 s checking; scriptc 1.04 s and
+0.67 s. 144 tables, 1,232 table call sites, 3,589 interval `instanceof`s,
+8,700 interval guards.
+
+Not covered: a sized instance whose prototype the program replaces runs
+the new class's methods on its own struct (they read their offsets: the
+foreign receiver gap of `docs/foreign_receivers_design.md`); the word is
+cleared, so interval checks and tables fall back for it.

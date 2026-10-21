@@ -19,6 +19,23 @@ class Num extends AstNode {
   value: number;
   constructor(value: number) { super(2); this.value = value; }
 }
+abstract class Expr extends AstNode {
+  typeTag = "expr";
+  constructor(kind: number) { super(kind); }
+}
+class Call extends Expr {
+  args: number;
+  constructor(args: number) { super(4); this.args = args; }
+}
+class Paren extends Expr {
+  inner: AstNode;
+  constructor(inner: AstNode) { super(5); this.inner = inner; }
+}
+function tagOf(n: AstNode): string {
+  const e = n as Expr;
+  return e.typeTag !== undefined ? e.typeTag + "/" + e.kind : "none";
+}
+function retag(n: AstNode, t: string): void { (n as Expr).typeTag = t; }
 class Pair extends AstNode {
   left: AstNode;
   right: AstNode;
@@ -78,6 +95,10 @@ function main(): void {
   bump(a); bump(a); bump(b);
   console.log(a.count, a.text, firstLeaf(q) === a, kindOfParent(a), kindOfParent(q));
   try { liar(undefined); } catch (e) { console.log((e as Error).constructor.name); }
+  const call = new Call(2), paren = new Paren(call);
+  retag(paren, "grouped");
+  retag(a, "named");
+  console.log(tagOf(call), tagOf(paren), tagOf(a), tagOf(b), (a as unknown as { typeTag: string }).typeTag, paren.inner === call);
   const nodes: AstNode[] = [a, b, p, q, new Ident("z"), new Num(-1)];
   let total = 0;
   for (let i = 0; i < 3000; i++) for (const n of nodes) total += n.kind + (n.parent === undefined ? 1 : 0);
