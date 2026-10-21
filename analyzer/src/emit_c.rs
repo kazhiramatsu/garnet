@@ -3881,10 +3881,20 @@ fn layout_plan_for(f: &Function) -> LayoutPlan {
     // TypeScript compiler) has a cell first, and `params.first()` named that
     // cell, so those constructors silently kept the per-property additions
     // (Session 350).
+    // A class constructor's or method's `this` (its stores carry the
+    // exporter's class hint) is a class instance: its fields are struct slots
+    // the hinted stores reach directly, and a sized instance never adopts a
+    // literal layout, so planning them sent every store to the property cache
+    // (tsc-ts: the Node constructor, `FlowState.reset`).
     if f.takes_this {
         if let Some(this) = f.params.get(f.capture_count as usize) {
             let (keys, addrs) = collect_layout_stores(&f.body, 0, this.0, true);
-            if keys.len() >= 2 {
+            let hinted = addrs.iter().any(|a| {
+                f.body.iter().any(|inst| {
+                    inst as *const Inst as usize == *a && matches!(inst, Inst::StoreField { cls, .. } if *cls != 0)
+                })
+            });
+            if keys.len() >= 2 && !hinted {
                 for (slot, a) in addrs.iter().enumerate() {
                     plan.store.insert(*a, (slot as u32, true));
                 }
