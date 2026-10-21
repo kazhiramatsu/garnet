@@ -10091,7 +10091,7 @@ fn emit_static_string_literals(s: &mut String, literals: &BTreeMap<Vec<u16>, usi
         let (len, storage) = c_string_storage_bytes_units(units);
         let _ = writeln!(
             s,
-            "static struct {{ ts_gc_header h; uint32_t len, hash, flags; tsv parent; uint32_t offset; char data[{}]; }} TS_STRLIT_{} = {{ {{ TS_KIND_STRING, 0, TS_GEN_NONHEAP, 0, 0, 0, 0, NULL }}, {}u, {}u, {}, TS_UNDEFINED, 0u, {} }};",
+            "static struct {{ ts_gc_header h; uint32_t len, hash, flags; tsv parent; uint32_t offset; char data[{}]; }} TS_STRLIT_{} = {{ {{ TS_KIND_STRING, 0, TS_GEN_NONHEAP, 0, 0, 0 }}, {}u, {}u, {}, TS_UNDEFINED, 0u, {} }};",
             storage.len(),
             id,
             len,
@@ -18360,7 +18360,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         } else {
                             format!("  {1} sobj{0} = {{0}};", dst.0, cn)
                         };
-                        let _ = writeln!(s, "{} sobj{}.header.h.kind=TS_KIND_OBJECT; sobj{}.header.h.mark=0; sobj{}.header.h.gen=2; sobj{}.header.h.remembered=0; sobj{}.header.h.handle=0; sobj{}.header.h.size=sizeof({}); sobj{}.header.proto={}; sobj{}.header.props=0; sobj{}.header.cap=0; sobj{}.header.len=0; sobj{}.header.shape={};", decl, dst.0, dst.0, dst.0, dst.0, dst.0, dst.0, cn, dst.0, proto_expr, dst.0, dst.0, dst.0, dst.0, shape);
+                        let _ = writeln!(s, "{} sobj{}.header.h.kind=TS_KIND_OBJECT; sobj{}.header.h.mark=0; sobj{}.header.h.gen=2; sobj{}.header.h.remembered=0; sobj{}.header.h.size=sizeof({}); sobj{}.header.proto={}; sobj{}.header.props=0; sobj{}.header.cap=0; sobj{}.header.len=0; sobj{}.header.shape={};", decl, dst.0, dst.0, dst.0, dst.0, dst.0, cn, dst.0, proto_expr, dst.0, dst.0, dst.0, dst.0, shape);
                         if class_index_enabled() {
                             let _ = writeln!(s, "  sobj{}.header.cls={}u;", dst.0, class_index_word(c.0));
                         }

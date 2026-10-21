@@ -220,7 +220,7 @@ function str16Decls(prog: Program): string {
     flags.push("TS_STR_FLAG_STATIC");
     s +=
       `static struct { ts_gc_header h; uint32_t len, hash, flags; tsv parent; uint32_t offset; char data[${bytes.length}]; } ` +
-      `TS_STRLIT16_${id} = { { TS_KIND_STRING, 0, TS_GEN_NONHEAP, 0, 0, 0, 0, NULL }, ${units.length}u, ${h}u, ${flags.join(" | ")}, TS_UNDEFINED, 0u, {${bytes.join(", ")}} };\n`;
+      `TS_STRLIT16_${id} = { { TS_KIND_STRING, 0, TS_GEN_NONHEAP, 0, 0, 0 }, ${units.length}u, ${h}u, ${flags.join(" | ")}, TS_UNDEFINED, 0u, {${bytes.join(", ")}} };\n`;
   });
   return s + "\n";
 }

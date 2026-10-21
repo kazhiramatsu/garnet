@@ -4109,7 +4109,7 @@ tsv ts_symbol_tostring(tsv sym){
    "string"` is one of the most frequent dispatch forms in compiler code. */
 #define TS_TYPEOF_STATIC(name, text, n) \
   static struct { ts_gc_header h; uint32_t len, hash, flags; tsv parent; uint32_t offset; char data[n + 1]; } \
-    name = { { TS_KIND_STRING, 0, TS_GEN_NONHEAP, 0, 0, 0, 0, NULL }, n, 0u, \
+    name = { { TS_KIND_STRING, 0, TS_GEN_NONHEAP, 0, 0, 0 }, n, 0u, \
              TS_STR_FLAG_ASCII | TS_STR_FLAG_STATIC, TS_UNDEFINED, 0u, text };
 TS_TYPEOF_STATIC(g_typeof_number, "number", 6)
 TS_TYPEOF_STATIC(g_typeof_string, "string", 6)

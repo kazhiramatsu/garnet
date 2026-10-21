@@ -924,6 +924,31 @@ the minimal fix the frozen-source rule allows, parity proving both emit the
 same). The nursery's remains (its configuration, chunk code, aging
 counters) go in a cleanup before it.
 
+### 6.8.2 D3 as built: the 16-byte header
+
+The cleanup came first (commit "Retire the copying nursery's remains"):
+the chunk code, the chunk quarantine, aging and its counters, the
+moving-minor switch and the stress gate's forced-moving modes went; the
+remembered byte became a flag. D3 then removes the two dead header words:
+
+```c
+typedef struct ts_gc_header {
+  uint8_t kind, mark, gen, remembered;
+  union { uint32_t pin_word; struct { uint16_t spare; uint8_t inline_cap; uint8_t hdr_spare; }; };
+  size_t size;
+} ts_gc_header;   /* 16 bytes, asserted */
+```
+
+The static string literals' positional initializers lose their last two
+elements and stack objects their `handle` store, in the Rust emitter and in
+the frozen emitter's three templates (the minimal fix the frozen-source rule
+allows: without it the frozen output no longer compiles; parity shows both
+emit the same bytes, 376 identical). Against D2 (eight pairs each, outputs
+identical): tsc-ts wall 0.992 (instructions 0.999, peak memory 0.929), the
+TypeScript compiler wall 0.999 (instructions 1.002, peak memory 0.919):
+time-neutral, 7-8% less memory. §4.4's further steps (the mark bit into the
+bitmap, the size from the size class: an 8-byte header) remain.
+
 ## 7. Verification
 
 - Gates of every slice: unit, parity (`scripts/emitc_diff.sh`), bundler,

@@ -146,18 +146,20 @@ enum { TS_KIND_OBJECT = 1, TS_KIND_ARRAY = 2, TS_KIND_STRING = 3, TS_KIND_FUNC =
 typedef struct ts_gc_header {
   uint8_t kind, mark, gen, remembered;
   /* One 32-bit word so positional initializers of static cells (string
-     literals) keep their shape: pin_depth = temporarily non-movable while raw
-     pointers are active; inline_cap (object model v2, slice A3) = number of
-     in-object value slots after the ts_object header of a plain object, 0 for
-     every other kind and for sized class instances. */
+     literals) keep their shape: inline_cap (object model v2, slice A3) =
+     number of in-object value slots after the ts_object header of a plain
+     object, 0 for every other kind and for sized class instances;
+     hdr_spare = a remembered plain object's dirty card range; spare is
+     free (cells never move, so nothing pins them). */
   union {
     uint32_t pin_word;
-    struct { uint16_t pin_depth; uint8_t inline_cap; uint8_t hdr_spare; };
+    struct { uint16_t spare; uint8_t inline_cap; uint8_t hdr_spare; };
   };
-  uint64_t handle; /* unused since direct references (docs/gc_v2_design.md §6.8 D2; D3 drops it) */
-  size_t size;     /* allocated cell bytes; needed to copy variable-sized heap cells */
-  struct ts_gc_header* gc_next;
+  size_t size;     /* allocated cell bytes */
 } ts_gc_header;
+/* 16 bytes (docs/gc_v2_design.md §4.4): a heap reference is the address,
+   so the cell carries no handle and no list link. */
+_Static_assert(sizeof(ts_gc_header) == 16, "the cell header is 16 bytes");
 enum { TS_GEN_YOUNG = 0, TS_GEN_OLD = 1, TS_GEN_NONHEAP = 2 };
 void ts_gc_remember(ts_gc_header* h);
 

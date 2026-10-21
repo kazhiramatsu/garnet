@@ -7789,3 +7789,19 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   milestone ran its stages with the parity export. Next: the nursery's
   remains out, then D3 (the 16-byte header: `handle` and `gc_next` are
   dead).
+- GC v2 Y2-D, the cleanup and slice D3 (`docs/gc_v2_design.md` §6.8.2).
+  The copying nursery's remains left the runtime (chunk code and its
+  quarantine, aging and its counters, the moving-minor switch, the stress
+  gate's forced-moving modes; the remembered byte is a flag now), then the
+  cell header dropped from 32 to 16 bytes: `handle` and `gc_next` were dead
+  since D2. The static literals' initializers and the stack objects'
+  `handle` store change in the Rust emitter and in the frozen emitter's
+  three templates (the frozen-source rule's minimal-fix exception: its
+  output would no longer compile; parity 376 identical shows both emit the
+  same). Against D2 (eight pairs each, outputs identical): tsc-ts wall
+  0.992, peak memory 0.929; the TypeScript compiler wall 0.999, peak memory
+  0.919. Gates: unit, parity, bundler 43/43, selfconf, defaults (plain and
+  stress), GC stress, inline policy, conformance 529/529 three ways (plain,
+  strict, every allocation under protect mode).
+  Milestone: the selfhost bench's own IR byte-identical (also under protect
+  mode) and 503/503 corpus fixtures equal to the frozen emitter on node.
