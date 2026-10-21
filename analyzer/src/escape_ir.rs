@@ -531,6 +531,11 @@ pub struct Capture {
 fn no_view_elem(elem: &u8) -> bool {
     *elem == 0
 }
+
+/// serde: an unset receiver class hint stays out of the JSON dumps.
+fn no_class_hint(cls: &u32) -> bool {
+    *cls == 0
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all_fields = "camelCase")]
 pub enum Inst {
@@ -574,6 +579,10 @@ pub enum Inst {
         /// `elem - 1`, docs/typed_arrays_design.md); 0 otherwise.
         #[serde(default, skip_serializing_if = "no_view_elem")]
         elem: u8,
+        /// The receiver's static type is one stable class (`cls - 1`,
+        /// docs/receiver_class_hints_design.md); 0 otherwise.
+        #[serde(default, skip_serializing_if = "no_class_hint")]
+        cls: u32,
     },
     StoreField {
         obj: LocalId,
@@ -581,6 +590,9 @@ pub enum Inst {
         src: LocalId,
         #[serde(default)]
         slots: u32,
+        /// As LoadField's.
+        #[serde(default, skip_serializing_if = "no_class_hint")]
+        cls: u32,
     },
     /// First-class builtin PROTOTYPE method value: `recv.method` read as a value
     /// (not called). Loads the boxed (unbound) prototype method via ts_get with a

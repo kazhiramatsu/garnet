@@ -115,6 +115,21 @@ export class ClassExtractor {
     }
     return cur;
   }
+  /** The receiver of a property write as its class is read: parentheses
+   *  and `!` stripped, a cast through `any` or `unknown` looked through, any
+   *  other cast kept (its type is the receiver's). */
+  private writeReceiver(e: ts.Expression): ts.Expression {
+    let cur = e;
+    for (;;) {
+      if (ts.isParenthesizedExpression(cur) || ts.isNonNullExpression(cur)) { cur = cur.expression; continue; }
+      if ((ts.isAsExpression(cur) || ts.isTypeAssertionExpression(cur)) &&
+          (cur.type.kind === ts.SyntaxKind.AnyKeyword || cur.type.kind === ts.SyntaxKind.UnknownKeyword)) {
+        cur = cur.expression;
+        continue;
+      }
+      return cur;
+    }
+  }
   private markUnstable(id: number, reason: string) {
     const c = this.classes[id];
     if (c.stable) c.stable = false;
@@ -294,9 +309,12 @@ export class ClassExtractor {
             const id = this.idOfClassSymbol(this.sym(this.unwrap(lhs.expression)));
             if (id !== undefined) this.markUnstable(id, "prototype-assign");
           }
-          // case: o.member = ...  (o is an instance, not `this`)
+          // case: o.member = ...  (o is an instance, not `this`). The
+          // receiver is read as the cast says (`(node as Identifier).flowNode
+          // = f` writes Identifier's field), except through `any` / `unknown`
+          // (`(o as any).extra = v` adds a property to o's class instance).
           if (base.kind !== ts.SyntaxKind.ThisKeyword) {
-            const t = this.checker.getTypeAtLocation(base);
+            const t = this.checker.getTypeAtLocation(this.writeReceiver(lhs.expression));
             const id = classOfType(t);
             if (id !== undefined) {
               const prop = lhs.name.text;

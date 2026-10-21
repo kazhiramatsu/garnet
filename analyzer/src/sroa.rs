@@ -2635,7 +2635,7 @@ fn inline_free_fn(
                 dst: m(*d),
                 src: m(*src),
             }),
-            Inst::LoadField { dst: d, obj, field, slots, elem } => {
+            Inst::LoadField { dst: d, obj, field, slots, elem, cls } => {
                 if let Some(fields_by_param) = scalar_param_fields {
                     if let Some(fmap) = fields_by_param.get(&obj.0) {
                         if let Some(&fs) = fmap.get(&field.0) {
@@ -2653,9 +2653,10 @@ fn inline_free_fn(
                     field: *field,
                     slots: *slots,
                     elem: *elem,
+                    cls: *cls,
                 });
             }
-            Inst::StoreField { obj, field, src, slots } => {
+            Inst::StoreField { obj, field, src, slots, cls } => {
                 if let Some(fields_by_param) = scalar_param_fields {
                     if let Some(fmap) = fields_by_param.get(&obj.0) {
                         if let Some(&fs) = fmap.get(&field.0) {
@@ -2672,6 +2673,7 @@ fn inline_free_fn(
                     field: *field,
                     src: m(*src),
                     slots: *slots,
+                    cls: *cls,
                 });
             }
             Inst::Return { src } => {
@@ -2778,7 +2780,7 @@ fn inline_insts(
     for inst in body {
         match inst {
             // this.fK load -> copy from field scalar
-            Inst::LoadField { dst: d, obj, field, slots, elem } if Some(obj.0) == cx.this_local => {
+            Inst::LoadField { dst: d, obj, field, slots, elem, cls } if Some(obj.0) == cx.this_local => {
                 if let Some(&fs) = cx.fmap.get(&field.0) {
                     out.push(Inst::Copy {
                         dst: m(*d),
@@ -2791,11 +2793,12 @@ fn inline_insts(
                         field: *field,
                         slots: *slots,
                         elem: *elem,
+                        cls: *cls,
                     });
                 }
             }
             // this.fK store -> write field scalar
-            Inst::StoreField { obj, field, src, slots } if Some(obj.0) == cx.this_local => {
+            Inst::StoreField { obj, field, src, slots, cls } if Some(obj.0) == cx.this_local => {
                 if let Some(&fs) = cx.fmap.get(&field.0) {
                     out.push(Inst::Copy {
                         dst: LocalId(fs),
@@ -2807,6 +2810,7 @@ fn inline_insts(
                         field: *field,
                         src: m(*src),
                         slots: *slots,
+                        cls: *cls,
                     });
                 }
             }
@@ -2942,18 +2946,20 @@ fn inline_insts(
                 dst: m(*d),
                 src: m(*src),
             }),
-            Inst::LoadField { dst: d, obj, field, slots, elem } => out.push(Inst::LoadField {
+            Inst::LoadField { dst: d, obj, field, slots, elem, cls } => out.push(Inst::LoadField {
                 dst: m(*d),
                 obj: m(*obj),
                 field: *field,
                 slots: *slots,
                 elem: *elem,
+                cls: *cls,
             }),
-            Inst::StoreField { obj, field, src, slots } => out.push(Inst::StoreField {
+            Inst::StoreField { obj, field, src, slots, cls } => out.push(Inst::StoreField {
                 obj: m(*obj),
                 field: *field,
                 src: m(*src),
                 slots: *slots,
+                cls: *cls,
             }),
             // Every remaining instruction kind that names a LocalId must be
             // remapped through `m`. The previous catch-all `other.clone()`
@@ -3021,18 +3027,20 @@ pub(crate) fn remap_inst_operands(inst: &Inst, m: &dyn Fn(LocalId) -> LocalId) -
             dst: m(*dst),
             src: m(*src),
         },
-        Inst::LoadField { dst, obj, field, slots, elem } => Inst::LoadField {
+        Inst::LoadField { dst, obj, field, slots, elem, cls } => Inst::LoadField {
             dst: m(*dst),
             obj: m(*obj),
             field: *field,
             slots: *slots,
             elem: *elem,
+            cls: *cls,
         },
-        Inst::StoreField { obj, field, src, slots } => Inst::StoreField {
+        Inst::StoreField { obj, field, src, slots, cls } => Inst::StoreField {
             obj: m(*obj),
             field: *field,
             src: m(*src),
             slots: *slots,
+            cls: *cls,
         },
         Inst::LoadMethodValue { dst, recv, method } => Inst::LoadMethodValue {
             dst: m(*dst),

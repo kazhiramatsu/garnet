@@ -4606,7 +4606,7 @@ class Exporter {
       }
       const base = this.lowerExpr(ctx, node.expression);
       const dst = this.newLocal(ctx, this.refKindOf(node));
-      const load = this.withSlots({ kind: "LoadField", dst, obj: base, field: this.internField(node.name.text) }, this.staticSlotHint(node.expression, node.name.text));
+      const load = this.withClassHint(this.withSlots({ kind: "LoadField", dst, obj: base, field: this.internField(node.name.text) }, this.staticSlotHint(node.expression, node.name.text)), node.expression);
       ctx.body.push(node.name.text === "length" ? this.withViewElem(load, node.expression) : load);
       return dst;
     }
@@ -11013,6 +11013,43 @@ class Exporter {
   /** Mark an element access or a `length` read whose receiver is statically a
    *  view (docs/typed_arrays_design.md, TA2): the emitter reads and writes its
    *  elements in line. */
+  /** The receiver class hint of a field access (`cls`: class id + 1, 0
+   *  none): under the strict type profile, a receiver whose static type at the
+   *  access (narrowed, without null and undefined; a type parameter by its
+   *  constraint) is one stable, non-generic class. The structural flow pass
+   *  (`class_extract.ts`) makes a class unstable when a value that is not one
+   *  of its instances can be typed as it. A cast receiver (`(x as C).f`, a
+   *  downcast that may probe for a property) takes none. The emitter reads
+   *  the field at the class's struct offset; a receiver that is not an object
+   *  takes the generic access (docs/receiver_class_hints_design.md). */
+  private receiverClassHint(e: ts.Expression): number {
+    if (process.env.TSAOT_CLASS_HINTS === "0" || !this.strictTypeOptimizationProfile().enabled) return 0;
+    let r = e;
+    while (ts.isParenthesizedExpression(r)) r = r.expression;
+    if (ts.isAsExpression(r) || ts.isTypeAssertionExpression(r)) return 0;
+    try {
+      let t = this.checker.getNonNullableType(this.checker.getTypeAtLocation(r));
+      if (t.flags & ts.TypeFlags.TypeParameter) {
+        const c = this.checker.getBaseConstraintOfType(t);
+        if (!c) return 0;
+        t = this.checker.getNonNullableType(c);
+      }
+      if (t.getConstructSignatures().length > 0) return 0;
+      const sym = t.getSymbol();
+      const cid = sym ? this.classSymToId.get(sym) : undefined;
+      if (cid === undefined || !this.classInfos[cid]?.stable) return 0;
+      const decl = this.classNodeOfId.get(cid);
+      if (!decl || (decl.typeParameters && decl.typeParameters.length > 0)) return 0;
+      return cid + 1;
+    } catch {
+      return 0;
+    }
+  }
+  private withClassHint<T extends { kind: string }>(inst: T, receiver: ts.Expression): T {
+    const cls = this.receiverClassHint(receiver);
+    if (cls !== 0) (inst as unknown as { cls?: number }).cls = cls;
+    return inst;
+  }
   private withViewElem<T extends { kind: string }>(inst: T, receiver: ts.Expression): T {
     const elem = this.viewElemOf(receiver);
     if (elem !== undefined) (inst as unknown as { elem?: number }).elem = elem + 1;
@@ -11117,7 +11154,7 @@ class Exporter {
   lowerReadFromRef(ctx: FnCtx, lhs: ts.Expression, pre: { obj?: number; key?: number }): number {
     const dst = this.newLocal(ctx, this.refKindOf(lhs));
     if (ts.isPropertyAccessExpression(lhs)) {
-      ctx.body.push(this.withSlots({ kind: "LoadField", dst, obj: pre.obj!, field: this.internField(lhs.name.text) }, this.staticSlotHint(lhs.expression, lhs.name.text)));
+      ctx.body.push(this.withClassHint(this.withSlots({ kind: "LoadField", dst, obj: pre.obj!, field: this.internField(lhs.name.text) }, this.staticSlotHint(lhs.expression, lhs.name.text)), lhs.expression));
       return dst;
     }
     const lea = lhs as ts.ElementAccessExpression;
@@ -11297,7 +11334,7 @@ class Exporter {
         return;
       }
       const base = pre?.obj ?? this.lowerExpr(ctx, lhs.expression);
-      ctx.body.push(this.withSlots({ kind: "StoreField", obj: base, field: this.internField(lhs.name.text), src: rhs }, this.staticSlotHint(lhs.expression, lhs.name.text)));
+      ctx.body.push(this.withClassHint(this.withSlots({ kind: "StoreField", obj: base, field: this.internField(lhs.name.text), src: rhs }, this.staticSlotHint(lhs.expression, lhs.name.text)), lhs.expression));
     } else if (ts.isElementAccessExpression(lhs)) {
       // obj[symbolKey] = v — symbol-keyed property write (user OR well-known).
       if (this.isSymbolKeyExpr(lhs.argumentExpression)) {

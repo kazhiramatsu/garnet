@@ -8922,6 +8922,87 @@ fn stack_closures_enabled() -> bool {
 /// without the sized-instance layout takes ts_get / ts_set
 /// (docs/foreign_receivers_design.md). TSAOT_TYPED_SLOW=0 keeps the Proxy-only
 /// guard of the frozen emitter (parity oracle).
+/// The class a field access's receiver is read as: the analysis's (a
+/// parameter's class, an allocation's), else the exporter's hint from the
+/// receiver's static type (`cls`, docs/receiver_class_hints_design.md),
+/// with what the hinted access must test.
+fn receiver_class(ctx: &Ctx, obj: u32, cls: u32, field: u32) -> (Option<u32>, Option<HintGuard>) {
+    let known = ctx.local_class.get(&obj).copied();
+    // the analysis's class is flow-insensitive: a downcast's copy keeps the
+    // parameter's class, which may lack the field the hint's class has
+    if let Some(c) = known {
+        if struct_direct_offset(c, field, ctx.classes).is_some() {
+            return (Some(c), None);
+        }
+    }
+    if cls != 0 && class_hints_enabled() {
+        if let Some(g) = hint_guard(cls - 1, field, ctx.classes) {
+            return (Some(cls - 1), Some(g));
+        }
+    }
+    (known, None)
+}
+
+fn class_hints_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_CLASS_HINTS").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
+/// What a hinted struct-offset access tests besides the receiver being an
+/// object (its type is the program's claim; null or undefined takes the
+/// generic access, which throws as V8 does). The slot belongs to the
+/// topmost ancestor declaring the field (`numeric_field`'s rule).
+enum HintGuard {
+    /// The root of a hierarchy declares the field: every class of the
+    /// hierarchy has it at the offset (a value of another hierarchy cannot be
+    /// typed as the class, `class_extract.ts` pass 3).
+    Root,
+    /// A leaf class declares it: a downcast to the leaf may be wrong (`(n as
+    /// Leaf).f` reads another kind of node's field there), so the receiver's
+    /// prototype must be the leaf's.
+    Leaf(u32),
+}
+
+/// `None`: no struct access for the hint (an intermediate class declares
+/// the field, or nobody does).
+fn hint_guard(c: u32, field: u32, classes: &BTreeMap<u32, &ClassDef>) -> Option<HintGuard> {
+    let mut decl = None;
+    let mut cur = Some(c);
+    while let Some(id) = cur {
+        let Some(cd) = classes.get(&id) else { break };
+        if cd.own_fields.iter().any(|f| f.0 == field) {
+            decl = Some(id);
+        }
+        cur = cd.parent.map(|p| p.0);
+    }
+    let d = decl?;
+    if classes.get(&d)?.parent.is_none() {
+        return Some(HintGuard::Root);
+    }
+    if classes.values().any(|o| o.parent.map(|p| p.0) == Some(d)) {
+        return None;
+    }
+    Some(HintGuard::Leaf(d))
+}
+
+fn receiver_guard(obj: &str, hint: &Option<HintGuard>) -> String {
+    match hint {
+        None => typed_slow_guard(obj),
+        Some(HintGuard::Root) => format!("!ts_is_obj({}) || ({})", obj, typed_slow_guard(obj)),
+        Some(HintGuard::Leaf(d)) => format!(
+            "!ts_is_obj({o}) || ((ts_object*)ts_ptr({o}))->proto != CLASS_PROTO[{d}] || ({g})",
+            o = obj,
+            d = d,
+            g = typed_slow_guard(obj)
+        ),
+    }
+}
+
 fn typed_slow_guard(obj: &str) -> String {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let on = *ENABLED.get_or_init(|| {
@@ -19737,7 +19818,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 s.push_str(&ctx.set_val(dst.0, &ctx.val(src.0)));
             }
         }
-        Inst::LoadField { dst, obj, field, slots, elem } => {
+        Inst::LoadField { dst, obj, field, slots, elem, cls } => {
             if ctx.json_locals.contains(&obj.0) {
                 if is_length_field(field.0) && !ctx.json_locals.contains(&dst.0) {
                     s.push_str(&ctx.set_val(
@@ -19766,7 +19847,8 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 }
                 return;
             }
-            if let Some(&c) = ctx.local_class.get(&obj.0) {
+            let (class, hinted) = receiver_class(ctx, obj.0, *cls, field.0);
+            if let Some(c) = class {
                 if let Some(off) = struct_direct_offset(c, field.0, ctx.classes) {
                     let cn = struct_name(c);
                     let obj_name = ctx.vname(obj.0);
@@ -19776,8 +19858,10 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     // method's this) routes `this.field` through ts_get. The
                     // g_typed_slow gate keeps the direct struct path for every
                     // program that never creates one.
-                    let guard = typed_slow_guard(&obj_name);
-                    let slow = ctx.lazy_linked(&format!("ts_get({}, {})", obj_name, field.0));
+                    let guard = receiver_guard(&obj_name, &hinted);
+                    // a hinted receiver may be null or undefined: the read throws
+                    let getter = if hinted.is_some() { "ts_get_checked" } else { "ts_get" };
+                    let slow = ctx.lazy_linked(&format!("{}({}, {})", getter, obj_name, field.0));
                     if numeric_field(c, field.0, ctx.classes) {
                         let e = format!("(({2}) ? ts_to_num({0}) : {1})", slow, st, guard);
                         s.push_str(&ctx.set_num(dst.0, &e));
@@ -19960,7 +20044,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 ),
             ));
         }
-        Inst::StoreField { obj, field, src, slots } => {
+        Inst::StoreField { obj, field, src, slots, cls } => {
             let addr = inst as *const Inst as usize;
             if let Some(keys) = ctx.layouts.ctor_first.get(&addr) {
                 let id = ctx.fresh_label();
@@ -19977,7 +20061,8 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 }
                 return;
             }
-            if let Some(&c) = ctx.local_class.get(&obj.0) {
+            let (class, hinted) = receiver_class(ctx, obj.0, *cls, field.0);
+            if let Some(c) = class {
                 if let Some(off) = struct_direct_offset(c, field.0, ctx.classes) {
                     let cn = struct_name(c);
                     let is_num = numeric_field(c, field.0, ctx.classes);
@@ -19987,7 +20072,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     // `this.field = v` through ts_set (see the read above).
                     let obj_name = ctx.vname(obj.0);
                     let slow = ctx.lazy_linked_stmt(&format!("ts_set({}, {}, {})", obj_name, field.0, ctx.val(src.0)));
-                    let _ = writeln!(s, "  if ({}) {{ {} }} else {{", typed_slow_guard(&obj_name), slow);
+                    let _ = writeln!(s, "  if ({}) {{ {} }} else {{", receiver_guard(&obj_name, &hinted), slow);
                     let _ = writeln!(s, "    (({}*)ts_ptr({}))->{} = {};", cn, obj_name, off, rhs);
                     if !is_num {
                         let _ = writeln!(s, "    ts_write_barrier({}, {});", obj_name, rhs);

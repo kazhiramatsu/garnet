@@ -7487,3 +7487,33 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   a minor collection every 256 allocations, its 78 output files identical.
   A/B against `nb`, sixteen ABBA pairs: wall 1.0012, instructions 1.0000,
   cycles 1.0018: neutral.
+- Receiver class hints (`docs/receiver_class_hints_design.md`; slice 5 of
+  `docs/tsc_ts_native_design.md`, the first pattern work on tsc-ts, whose
+  profile put 44% of the time in property cache lookups): the class
+  extractor read `(node as Identifier).flowNode = f` through `node`'s
+  uncast type and marked tsc-ts's `Node` and `Type` unstable (a dynamic
+  property write), so every field access on them took the property cache,
+  megamorphic across the AST classes; a write's receiver is now read as its
+  cast says (only `as any` / `as unknown` are looked through). Under the
+  strict type profile the exporter hints a field access's receiver class
+  (`cls` on LoadField/StoreField: one stable, non-generic class as the
+  narrowed static type, a type parameter by its constraint, no casts), and
+  the emitter reads the field at the struct offset of the topmost ancestor
+  declaring it: a root's field for any object, a leaf's behind a prototype
+  test (a wrong downcast probing `id.text` reads undefined, as in V8), an
+  intermediate class's never; a receiver failing the guard takes the
+  generic access, which throws for null and undefined. tsc-ts on the
+  TypeScript 6.0.3 project: 8.51 s -> 6.26 s (Node and Type stable) -> 4.96
+  s (43,700 hinted accesses), output still identical to scriptc's; node
+  3.2-3.4 s. Fixture `classes/receiver_class_hints` (subclasses through the
+  base, narrowing, optional chains, constrained type parameters, wrong
+  downcasts probed through locals, a lying non-null assertion, writes).
+  Known: a class-typed parameter still trusts its class (a wrong downcast
+  passed to it reads the struct offset). Gates: unit, parity (369
+  identical), bundler 42/42, selfconf, GC stress, inline policy, conformance
+  518/518, 518/518 under the strict profile, and 518/518 with a collection
+  at every allocation in protect mode; tsc rebuilt (`native_s350rc`; its C
+  unchanged, its tsconfig does not select the strict profile) and compiled
+  under protect mode, with zapping, and with a minor collection every 256
+  allocations, its 78 output files identical. A/B against `sf`, sixteen
+  ABBA pairs: wall 1.0000, instructions 1.0000, cycles 1.0004: neutral.
