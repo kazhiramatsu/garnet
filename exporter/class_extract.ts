@@ -74,6 +74,16 @@ export interface ClassInfo {
   reasons: string[]; // why it was marked unstable (diagnostics)
 }
 
+/** docs/closed_receivers_design.md: whether the program can reach none of
+ *  the runtime points that raise g_typed_slow, and the sites that open it. */
+export interface ClosedReceivers {
+  closed: boolean;
+  /** the first sites found (`what at file:line`), for TSAOT_CLOSED_LOG */
+  reasons: string[];
+  /** every site found */
+  count: number;
+}
+
 export interface ClassExtractionResult {
   classes: ClassInfo[];
   /** symbol of class declaration -> class id */
@@ -81,10 +91,12 @@ export interface ClassExtractionResult {
   /** class declaration/expression AST node -> class id (covers anonymous class
    *  expressions that have no name symbol to key by). */
   nodeToId: Map<ts.Node, number>;
+  closedReceivers: ClosedReceivers;
 }
 
 export class ClassExtractor {
   private checker: ts.TypeChecker;
+  private program: ts.Program;
   private classes: ClassInfo[] = [];
   private bySymbol = new Map<ts.Symbol, number>();
   private byNode = new Map<ts.Node, number>();
@@ -92,6 +104,7 @@ export class ClassExtractor {
   private declOfId: ts.ClassLikeDeclaration[] = [];
 
   constructor(program: ts.Program) {
+    this.program = program;
     this.checker = program.getTypeChecker();
   }
 
@@ -708,6 +721,234 @@ export class ClassExtractor {
     }
   }
 
+  // ----- pass 4: closed receivers (docs/closed_receivers_design.md) -----
+  // Every typed field access tests g_typed_slow, which the runtime raises
+  // where an object without a class's struct layout can come to be read as
+  // the class: a Proxy; a relink behind a class prototype
+  // (Object.setPrototypeOf, Reflect.setPrototypeOf, Object.create); a
+  // struct method called with another `this` (call, apply, bind,
+  // Reflect.apply, the thisArg of an iteration method). A program whose
+  // source reaches none of them, by name or by any dynamic route, has closed
+  // receivers: the flag stays down for the whole run, so its test can go.
+  private openReasons: string[] = [];
+  private openCount = 0;
+  private openAt(n: ts.Node, what: string): void {
+    this.openCount++;
+    if (this.openReasons.length >= 40) return;
+    const sf = n.getSourceFile();
+    this.openReasons.push(`${what} at ${sf.fileName.split("/").slice(-2).join("/")}:${sf.getLineAndCharacterOfPosition(n.getStart()).line + 1}`);
+  }
+  private fromDefaultLib(sym: ts.Symbol | undefined): boolean {
+    const decls = sym?.declarations ?? [];
+    return decls.length > 0 && decls.every((d) => this.program.isSourceFileDefaultLibrary(d.getSourceFile()));
+  }
+  /** `Owner.name` of a member the default library declares (an interface
+   *  or namespace member: `ObjectConstructor.create`, `Reflect.apply`). */
+  private libMemberOf(sym: ts.Symbol | undefined): string | undefined {
+    if (!sym || !this.fromDefaultLib(sym)) return undefined;
+    for (const d of sym.declarations ?? []) {
+      let owner: ts.Node | undefined = d.parent;
+      if (owner && ts.isModuleBlock(owner)) owner = owner.parent;
+      if (owner && (ts.isInterfaceDeclaration(owner) || ts.isModuleDeclaration(owner)) && ts.isIdentifier(owner.name)) {
+        return `${owner.name.text}.${sym.name}`;
+      }
+    }
+    return undefined;
+  }
+  /** A value the default library declares under `name` (`declare var Proxy`). */
+  private libValue(sym: ts.Symbol | undefined, name: string): boolean {
+    return !!sym && sym.name === name && (sym.flags & ts.SymbolFlags.Value) !== 0 && this.fromDefaultLib(sym);
+  }
+  /** A function that cannot be a class method: a function or arrow
+   *  expression, a function declaration, a library function
+   *  (`Object.prototype.hasOwnProperty`, `Math.max`), a `const` initialized
+   *  with one of these. */
+  private plainFunction(e: ts.Expression, depth = 0): boolean {
+    let cur = e;
+    while (ts.isParenthesizedExpression(cur)) cur = cur.expression;
+    if (ts.isFunctionExpression(cur) || ts.isArrowFunction(cur)) return true;
+    if (ts.isPropertyAccessExpression(cur)) return this.fromDefaultLib(this.checker.getSymbolAtLocation(cur.name));
+    if (!ts.isIdentifier(cur)) return false;
+    const sym = this.sym(cur);
+    if (this.fromDefaultLib(sym)) return (sym!.flags & ts.SymbolFlags.Function) !== 0;
+    const d = sym?.valueDeclaration;
+    if (d && ts.isFunctionDeclaration(d)) return true;
+    if (d && ts.isVariableDeclaration(d) && d.initializer && (ts.getCombinedNodeFlags(d) & ts.NodeFlags.Const) !== 0 && depth < 4) {
+      return this.plainFunction(d.initializer, depth + 1);
+    }
+    return false;
+  }
+  /** A `this` for a borrowed call that the runtime does not count as
+   *  foreign: an instance of a stable class with struct fields (a sized
+   *  instance; a field-less class's instances are plain objects). */
+  private sizedThis(e: ts.Expression | undefined): boolean {
+    if (!e) return false;
+    const t = this.checker.getTypeAtLocation(e);
+    if (!this.stableInstances(t) || (t.flags & ts.TypeFlags.Union && (t as ts.UnionType).types.some((m) =>
+        (m.flags & (ts.TypeFlags.Null | ts.TypeFlags.Undefined | ts.TypeFlags.Void)) !== 0))) return false;
+    for (let m of t.isUnion() ? t.types : [t]) {
+      if (m.flags & ts.TypeFlags.TypeParameter) m = m.getConstraint() ?? m;
+      const id = this.classIdOfInstanceType(m);
+      if (id === undefined || !this.hasStructFields(id)) return false;
+    }
+    return true;
+  }
+  private hasStructFields(id: number): boolean {
+    for (let cur: number | undefined = id; cur !== undefined; cur = this.classes[cur].parentId) {
+      if (this.classes[cur].ownFields.length > 0) return true;
+    }
+    return false;
+  }
+  private dynamicType(t: ts.Type): boolean {
+    return (t.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0;
+  }
+  /** Every value of type `t` (null and undefined aside) is an instance of a
+   *  stable class: not a function, not a builtin namespace. */
+  private stableInstances(t: ts.Type): boolean {
+    let some = false;
+    for (let m of t.isUnion() ? t.types : [t]) {
+      if (m.flags & (ts.TypeFlags.Null | ts.TypeFlags.Undefined | ts.TypeFlags.Void)) continue;
+      if (m.flags & ts.TypeFlags.TypeParameter) m = m.getConstraint() ?? m;
+      const id = this.classIdOfInstanceType(m);
+      if (id === undefined || !this.classes[id].stable) return false;
+      some = true;
+    }
+    return some;
+  }
+  /** An identifier used as a value (not a type, a declared name, a property
+   *  name or an import / export specifier). */
+  private valuePosition(id: ts.Identifier): boolean {
+    const p = id.parent;
+    if (!p) return false;
+    if (ts.isPropertyAccessExpression(p)) return p.expression === id;
+    if (ts.isQualifiedName(p) || ts.isImportSpecifier(p) || ts.isExportSpecifier(p) || ts.isImportClause(p) ||
+        ts.isNamespaceImport(p) || ts.isImportEqualsDeclaration(p)) return false;
+    if (!ts.isShorthandPropertyAssignment(p) && (p as { name?: ts.Node }).name === id) return false;
+    if (ts.isPropertyAssignment(p) && p.name === id) return false;
+    for (let q: ts.Node | undefined = p; q && !ts.isStatement(q) && !ts.isSourceFile(q); q = q.parent) {
+      if (ts.isTypeNode(q) && !ts.isExpressionWithTypeArguments(q)) return false;
+      if (ts.isHeritageClause(q)) return q.token === ts.SyntaxKind.ExtendsKeyword;
+    }
+    return true;
+  }
+  private scanClosedReceivers(sf: ts.SourceFile): void {
+    const checker = this.checker;
+    const RELINK = new Set(["ObjectConstructor.setPrototypeOf", "ObjectConstructor.create", "Reflect.setPrototypeOf"]);
+    const BORROW = new Set(["Function.call", "Function.apply", "Function.bind", "CallableFunction.call",
+      "CallableFunction.apply", "CallableFunction.bind", "NewableFunction.call", "NewableFunction.apply",
+      "NewableFunction.bind", "Reflect.apply"]);
+    // members reached by name through an `any` receiver or a computed key
+    const NAMES = ["setPrototypeOf", "create", "call", "apply", "bind"];
+    const THISARG = new Set(["every", "filter", "find", "findIndex", "findLast", "findLastIndex", "flatMap",
+      "forEach", "map", "some", "from"]);
+    const GLOBALS = new Set(["Proxy", "Function", "Object", "Reflect"]);
+    const callOf = (n: ts.Node): ts.CallExpression | undefined =>
+      n.parent && ts.isCallExpression(n.parent) && n.parent.expression === n ? n.parent : undefined;
+    // `Object.create(null)`, `Object.setPrototypeOf(o, null)`: no prototype
+    const nullProto = (n: ts.Node, member: string): boolean => {
+      const call = callOf(n);
+      const arg = call?.arguments[member === "ObjectConstructor.create" ? 0 : 1];
+      return arg !== undefined && arg.kind === ts.SyntaxKind.NullKeyword;
+    };
+    // a value of type `t` may hold one of the members by name
+    const holdsBuiltin = (t: ts.Type): boolean => {
+      if (t.getCallSignatures().length > 0 || t.getConstructSignatures().length > 0) return true;
+      const at = checker.getApparentType(t);
+      for (const name of [...NAMES, ...GLOBALS]) {
+        const p = checker.getPropertyOfType(at, name);
+        if (!p) continue;
+        const m = this.libMemberOf(p);
+        if ((m && (RELINK.has(m) || BORROW.has(m))) || this.libValue(p, name)) return true;
+      }
+      return false;
+    };
+    const member = (n: ts.Node, name: string, recv: ts.Expression, sym: ts.Symbol | undefined): void => {
+      if (name === "__proto__") { this.openAt(n, "__proto__"); return; }
+      if (GLOBALS.has(name) && this.libValue(sym, name)) { this.openAt(n, `${name} read as a property`); return; }
+      const lib = this.libMemberOf(sym);
+      if (lib && RELINK.has(lib)) { if (!nullProto(n, lib)) this.openAt(n, lib); return; }
+      if (lib && BORROW.has(lib)) {
+        const call = callOf(n);
+        if (lib === "Reflect.apply" || !(this.plainFunction(recv) || (call !== undefined && this.sizedThis(call.arguments[0])))) {
+          this.openAt(n, lib);
+        }
+        return;
+      }
+      if (lib) return;
+      const t = checker.getTypeAtLocation(recv);
+      if (this.dynamicType(t)) {
+        if (NAMES.includes(name) || GLOBALS.has(name)) this.openAt(n, `${name} of an any value`);
+        else if (THISARG.has(name) && (callOf(n)?.arguments.length ?? 0) >= 2) this.openAt(n, `${name}(callback, thisArg) of an any value`);
+        return;
+      }
+      // a user-declared `call` / `apply` / `bind` that is a function (an
+      // interface member) on a value a function can satisfy structurally may
+      // be the builtin at run time; a data property of another type (a
+      // record's `call: Node`) is not
+      if ((name === "call" || name === "apply" || name === "bind") && !this.stableInstances(t) && !this.plainFunction(recv)) {
+        const mt = checker.getTypeAtLocation(n);
+        if (this.dynamicType(mt) || mt.getCallSignatures().length > 0) this.openAt(n, `${name} of a value that may be a function`);
+      }
+    };
+    const visit = (n: ts.Node): void => {
+      try {
+        if (ts.isIdentifier(n) && GLOBALS.has(n.text) && this.valuePosition(n) && this.libValue(checker.getSymbolAtLocation(n), n.text)) {
+          const p = n.parent;
+          const asObject = (ts.isPropertyAccessExpression(p) || ts.isElementAccessExpression(p)) && p.expression === n;
+          const asCallee = (ts.isCallExpression(p) || ts.isNewExpression(p)) && p.expression === n;
+          const tested = ts.isBinaryExpression(p) && p.operatorToken.kind === ts.SyntaxKind.InstanceOfKeyword && p.right === n;
+          if (n.text === "Proxy") this.openAt(n, "Proxy");
+          else if (n.text === "Function" ? asCallee : false) this.openAt(n, "the Function constructor");
+          else if (!asObject && !asCallee && !tested && !ts.isTypeOfExpression(p)) this.openAt(n, `${n.text} as a value`);
+        }
+        if (ts.isPropertyAccessExpression(n)) member(n, n.name.text, n.expression, checker.getSymbolAtLocation(n.name));
+        if (ts.isElementAccessExpression(n)) {
+          const k = n.argumentExpression;
+          if (ts.isStringLiteralLike(k)) {
+            const sym = checker.getPropertyOfType(checker.getApparentType(checker.getTypeAtLocation(n.expression)), k.text);
+            member(n, k.text, n.expression, sym);
+          } else if (!ts.isNumericLiteral(k)) {
+            const t = checker.getTypeAtLocation(n.expression);
+            if (this.dynamicType(t)) this.openAt(n, "a computed key on an any value");
+            else if (holdsBuiltin(t)) this.openAt(n, "a computed key on a function or a builtin namespace");
+          }
+        }
+        if ((ts.isPropertyAssignment(n) || ts.isShorthandPropertyAssignment(n) || ts.isMethodDeclaration(n) ||
+             ts.isGetAccessorDeclaration(n) || ts.isSetAccessorDeclaration(n)) && n.parent && ts.isObjectLiteralExpression(n.parent)) {
+          const nm = n.name;
+          if ((ts.isIdentifier(nm) || ts.isStringLiteral(nm)) && nm.text === "__proto__") this.openAt(n, "a __proto__ literal key");
+        }
+        if (ts.isBindingElement(n) && n.parent && ts.isObjectBindingPattern(n.parent)) {
+          const key = n.propertyName ?? n.name;
+          const name = ts.isIdentifier(key) || ts.isStringLiteral(key) ? key.text : undefined;
+          if (name === undefined && n.propertyName && ts.isComputedPropertyName(n.propertyName)) {
+            const t = checker.getTypeAtLocation(n.parent);
+            if (this.dynamicType(t) || holdsBuiltin(t)) this.openAt(n, "a computed key in a pattern");
+          } else if (name !== undefined && (NAMES.includes(name) || GLOBALS.has(name) || name === "__proto__")) {
+            const t = checker.getTypeAtLocation(n.parent);
+            if (this.dynamicType(t) || holdsBuiltin(t)) this.openAt(n, `${name} taken by a pattern`);
+          }
+        }
+        if (ts.isCallExpression(n)) {
+          // a library method's thisArg (`arr.forEach(cb, ctx)`) binds the callback to it
+          const sig = checker.getResolvedSignature(n);
+          const decl = sig?.declaration;
+          if (sig && decl && !ts.isJSDocSignature(decl) && this.program.isSourceFileDefaultLibrary(decl.getSourceFile())) {
+            const params = sig.getParameters();
+            for (let i = 0; i < params.length && i < n.arguments.length; i++) {
+              if (params[i].name !== "thisArg") continue;
+              const callbacks = n.arguments.slice(0, i).filter((a) => checker.getTypeAtLocation(a).getCallSignatures().length > 0 ||
+                this.dynamicType(checker.getTypeAtLocation(a)));
+              if (!callbacks.every((a) => this.plainFunction(a)) && !this.sizedThis(n.arguments[i])) this.openAt(n, "a thisArg");
+            }
+          }
+        }
+      } catch { this.openAt(n, "a site the checker could not resolve"); }
+      n.forEachChild(visit);
+    };
+    visit(sf);
+  }
+
   private classMemberKindNames(id: number, kind: MKind): Set<string> {
     const s = new Set<string>();
     let cur: number | undefined = id;
@@ -804,6 +1045,12 @@ export class ClassExtractor {
     for (const sf of sfs) this.scanStability(sf);
     for (const sf of sfs) this.scanStructuralFlows(sf);
     this.closeStructuralFlows();
-    return { classes: this.classes, symbolToId: this.bySymbol, nodeToId: this.byNode };
+    for (const sf of sfs) this.scanClosedReceivers(sf);
+    const closedReceivers = { closed: this.openCount === 0, reasons: this.openReasons, count: this.openCount };
+    if (process.env.TSAOT_CLOSED_LOG === "1") {
+      process.stderr.write(`[closed] receivers ${closedReceivers.closed ? "closed" : `open (${this.openCount} sites)`}\n`);
+      for (const r of this.openReasons) process.stderr.write(`[closed]   ${r}\n`);
+    }
+    return { classes: this.classes, symbolToId: this.bySymbol, nodeToId: this.byNode, closedReceivers };
   }
 }

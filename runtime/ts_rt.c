@@ -1447,6 +1447,18 @@ void ts_object_proto_register(ts_key method_key, const char* name, ts_code fn){
    (keyv) entry points; ts_key_to_value reconstructs the value from a ts_key. */
 int g_has_proxies = 0;   /* declared in ts_rt.h; see ts_is_proxy there */
 int g_typed_slow = 0;    /* declared in ts_rt.h; see ts_typed_slow there */
+int g_closed_receivers = 0;
+/* A foreign receiver can arise from here on. A closed program's typed
+   accesses do not test the flag: the exporter's proof missed a route to this
+   point, so stop loudly rather than read struct offsets of the wrong cell. */
+static void typed_slow_raise(const char* what){
+  if (g_closed_receivers){
+    fprintf(stderr, "garnet: internal error: %s in a program compiled with closed receivers "
+                    "(docs/closed_receivers_design.md); recompile with TSAOT_CLOSED_RECEIVERS=0\n", what);
+    abort();
+  }
+  g_typed_slow = 1;
+}
 static void typed_slow_check_relink(tsv obj, tsv proto);
 static void typed_slow_check_borrow(tsv fn, tsv thisArg);
 static void struct_methods_collect(tsv proto);
@@ -10831,11 +10843,11 @@ static void struct_methods_collect(tsv proto){
 }
 static void typed_slow_check_relink(tsv obj, tsv proto){
   if (!g_has_class_regs || !ts_is_obj(obj) || !ts_typed_slow(obj)) return;
-  if (proto_chain_has_struct_class(proto)) g_typed_slow = 1;
+  if (proto_chain_has_struct_class(proto)) typed_slow_raise("an object relinked behind a class with struct fields");
 }
 static void typed_slow_check_borrow(tsv fn, tsv thisArg){
   if (!g_struct_methods_len || !ts_is_func(fn) || !ts_typed_slow(thisArg)) return;
-  if (struct_method_has(((ts_func*)ts_ptr(fn))->code)) g_typed_slow = 1;
+  if (struct_method_has(((ts_func*)ts_ptr(fn))->code)) typed_slow_raise("a class method called with a foreign this");
 }
 static ts_class_reg* class_reg_for_proto(tsv proto){
   if (!ts_proto_ref(proto) || !g_class_reg_index_cap) return NULL;
@@ -15813,8 +15825,8 @@ tsv ts_proxy_new(tsv target, tsv handler){
   px->target = target; px->handler = handler; px->revoked = 0;
   tsv pv = ts_obj(px);
   ts_write_barrier(pv, target); ts_write_barrier(pv, handler);
+  typed_slow_raise("a Proxy");
   g_has_proxies = 1;
-  g_typed_slow = 1;
   ts_gc_unroot(2);
   return pv;
 }

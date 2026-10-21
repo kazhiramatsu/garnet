@@ -478,6 +478,10 @@ static inline int ts_obj_is_sized(const ts_object* o){
    where such a receiver can arise, gates the test so a program that never does
    any of that keeps one predictable branch (docs/foreign_receivers_design.md). */
 extern int g_typed_slow;
+/* Set by a program the exporter proved to have closed receivers
+   (docs/closed_receivers_design.md): its typed accesses do not test
+   g_typed_slow, so raising it there stops the program instead. */
+extern int g_closed_receivers;
 static inline int ts_typed_slow(tsv v){
   return !ts_is_obj(v) || !ts_obj_is_sized((const ts_object*)ts_ptr(v));
 }

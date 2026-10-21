@@ -342,6 +342,7 @@ fn emit_program_with_string_plans(
     let _table = ClassTable::new(&program.classes);
     let classes: BTreeMap<u32, &ClassDef> = program.classes.iter().map(|c| (c.id.0, c)).collect();
     set_class_dfs(&program.classes);
+    set_closed_receivers(program.closed_receivers.closed);
 
     // Classes whose instances flow into a dynamic enumeration builtin
     // (JSON.stringify / Object.keys|values|entries). Such objects must keep their
@@ -1115,6 +1116,10 @@ fn emit_program_with_string_plans(
     s.push_str("  ts_setup_number_proto();\n");
     s.push_str("  ts_setup_boolean_proto();\n");
     s.push_str("  ts_setup_global_object();\n");
+    if closed_receivers() {
+        // the runtime's raise points stop a closed program (an analysis miss)
+        s.push_str("  g_closed_receivers = 1;\n");
+    }
     s.push_str("  ts_setup_globals();\n");
     if site_stats_enabled() {
         s.push_str("  ts_site_stats_init((const char**)FN_NAME, (uint32_t)(sizeof(FN_NAME) / sizeof(FN_NAME[0])));\n");
@@ -9391,15 +9396,41 @@ fn receiver_guard(obj: &str, hint: &Option<HintGuard>) -> String {
     }
 }
 
-fn typed_slow_guard(obj: &str) -> String {
+/// The foreign-receiver flag guards (docs/foreign_receivers_design.md);
+/// TSAOT_TYPED_SLOW=0 keeps the frozen emitter's Proxy-only test.
+fn typed_slow_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let on = *ENABLED.get_or_init(|| {
+    *ENABLED.get_or_init(|| {
         !matches!(
             std::env::var("TSAOT_TYPED_SLOW").as_deref(),
             Ok("0") | Ok("false") | Ok("no") | Ok("off")
         )
-    });
-    if on {
+    })
+}
+
+thread_local! {
+    static CLOSED_RECEIVERS: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
+
+/// docs/closed_receivers_design.md: a program the exporter found closed never
+/// raises g_typed_slow (nor makes a Proxy), so the flag's test is false for the
+/// whole run. TSAOT_CLOSED_RECEIVERS=0 keeps the test.
+fn set_closed_receivers(closed: bool) {
+    let off = matches!(
+        std::env::var("TSAOT_CLOSED_RECEIVERS").as_deref(),
+        Ok("0") | Ok("false") | Ok("no") | Ok("off")
+    );
+    CLOSED_RECEIVERS.with(|c| c.set(closed && !off));
+}
+
+fn closed_receivers() -> bool {
+    CLOSED_RECEIVERS.with(|c| c.get())
+}
+
+fn typed_slow_guard(obj: &str) -> String {
+    if closed_receivers() {
+        "0".to_string()
+    } else if typed_slow_enabled() {
         format!("g_typed_slow && ts_typed_slow({})", obj)
     } else {
         format!("g_has_proxies && ts_is_proxy({})", obj)
@@ -9410,7 +9441,7 @@ fn typed_slow_guard(obj: &str) -> String {
 /// behind an object without the layout); the frozen emitter's ts_set_proto
 /// under TSAOT_TYPED_SLOW=0.
 fn user_set_proto_fn() -> &'static str {
-    if typed_slow_guard("x").starts_with("g_typed_slow") {
+    if typed_slow_enabled() {
         "ts_set_proto_user"
     } else {
         "ts_set_proto"

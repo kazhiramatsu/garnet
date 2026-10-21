@@ -55,7 +55,7 @@ fn main(){
            callee:CalleeRef::Method{recv_class:ClassId(0),method:Name(AREA),recv_stable:true,method_field:None}, args:vec![], resolved_sig:None},
       StoreGlobal{gref:GlobalId(0),src:LocalId(1)},  // leak the returned object
   ]);
-  let mut prog = Program{version:1,strict_type_optimizations: Default::default(),types:vec![],fields:vec![],signatures:vec![],globals:vec![],
+  let mut prog = Program{version:1,strict_type_optimizations: Default::default(), closed_receivers: Default::default(),types:vec![],fields:vec![],signatures:vec![],globals:vec![],
     scopes:vec![],bindings:vec![],functions:vec![g,circle_area,square_area,shape_area],exports:vec![],
     site_meta:vec![], classes: base_classes(true,true,true), object_proto_methods: vec![], array_proto_methods: vec![], promise_proto_methods: vec![], map_proto_methods: vec![], set_proto_methods: vec![], weak_map_proto_methods: vec![], weak_set_proto_methods: vec![], headers_proto_methods: vec![], function_proto_methods: vec![], string_proto_methods: vec![], regexp_proto_methods: vec![], number_proto_methods: vec![], boolean_proto_methods: vec![], well_known_symbols: vec![]};
 

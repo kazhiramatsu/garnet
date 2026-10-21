@@ -12,7 +12,7 @@ fn func(id: u32, params: Vec<u32>, nlocals: u32, exported: bool, body: Vec<Inst>
         ret: TypeId(0), locals: (0..nlocals).map(refl).collect(), body, is_exported: exported, param_classes: Default::default(), rest_param: None, is_async: false, is_generator: false, capture_count: 0, takes_this: false, arity: 0, has_prototype: false }
 }
 fn prog(fns: Vec<Function>) -> Program {
-    Program { version: 1, strict_type_optimizations: Default::default(), types: vec![], fields: vec![], signatures: vec![], globals: vec![],
+    Program { version: 1, strict_type_optimizations: Default::default(), closed_receivers: Default::default(), types: vec![], fields: vec![], signatures: vec![], globals: vec![],
         scopes: vec![], bindings: vec![], functions: fns, exports: vec![], site_meta: vec![], classes: vec![], object_proto_methods: vec![], array_proto_methods: vec![], promise_proto_methods: vec![], map_proto_methods: vec![], set_proto_methods: vec![], weak_map_proto_methods: vec![], weak_set_proto_methods: vec![], headers_proto_methods: vec![], function_proto_methods: vec![], string_proto_methods: vec![], regexp_proto_methods: vec![], number_proto_methods: vec![], boolean_proto_methods: vec![], well_known_symbols: vec![] }
 }
 fn st(r: &EscapeResult, site: u32) -> EscapeState {

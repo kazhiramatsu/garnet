@@ -6,7 +6,7 @@ fn meta(site: u32, m: Multiplicity, det: bool, k: AllocKind) -> SiteMeta {
     SiteMeta { site: SiteId(site), multiplicity: m, layout_determinable: det, kind: k }
 }
 fn prog(metas: Vec<SiteMeta>) -> Program {
-    Program { version:1, strict_type_optimizations: Default::default(), types:vec![], fields:vec![], signatures:vec![], globals:vec![],
+    Program { version:1, strict_type_optimizations: Default::default(), closed_receivers: Default::default(), types:vec![], fields:vec![], signatures:vec![], globals:vec![],
         scopes:vec![], bindings:vec![], functions:vec![], exports:vec![], site_meta: metas, classes: vec![], object_proto_methods: vec![], array_proto_methods: vec![], promise_proto_methods: vec![], map_proto_methods: vec![], set_proto_methods: vec![], weak_map_proto_methods: vec![], weak_set_proto_methods: vec![], headers_proto_methods: vec![], function_proto_methods: vec![], string_proto_methods: vec![], regexp_proto_methods: vec![], number_proto_methods: vec![], boolean_proto_methods: vec![], well_known_symbols: vec![] }
 }
 fn res(pairs: &[(u32, EscapeState)]) -> EscapeResult {

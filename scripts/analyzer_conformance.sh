@@ -93,7 +93,7 @@ $CC -c "$ROOT/runtime/ts_rt.c" -I"$ROOT/runtime" -o "$tmp/rt.o" 2>"$tmp/rt.err" 
 
 t0=$(now_ms)
 # (the frozen emitter copies class prototypes and knows no instanceof.class:N)
-TSAOT_UNTYPED=1 TSAOT_SHARED_CLASS_PROTO=0 TSAOT_INSTANCEOF_CLASS=0 node "$EXPORTER" --batch "$LIST" "$tmp/json" \
+TSAOT_UNTYPED=1 TSAOT_SHARED_CLASS_PROTO=0 TSAOT_INSTANCEOF_CLASS=0 TSAOT_CLOSED_RECEIVERS=0 node "$EXPORTER" --batch "$LIST" "$tmp/json" \
   >"$tmp/exp.status" 2>"$tmp/exp.err" || true
 node "$EXPORTER" --transpile-batch "$LIST" "$tmp/v8" \
   >"$tmp/tr.status" 2>"$tmp/tr.err" || true

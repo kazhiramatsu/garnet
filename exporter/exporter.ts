@@ -19,7 +19,7 @@
 import * as ts from "typescript";
 import * as fs from "fs";
 import * as path from "path";
-import { ClassExtractor, ClassInfo, memberKeyName } from "./class_extract";
+import { ClassExtractor, ClassInfo, ClosedReceivers, memberKeyName } from "./class_extract";
 import { classifyRegExpLiteral } from "./regexp";
 import { hasUnpairedSurrogate, toWireProgram } from "./wire_program";
 
@@ -401,6 +401,9 @@ class Exporter {
 
   // ---- class support ----
   classExtractor!: ClassExtractor;
+  /** docs/closed_receivers_design.md: no runtime point that raises
+   *  g_typed_slow is reachable (TSAOT_CLOSED_RECEIVERS=0 records it open). */
+  closedReceivers: ClosedReceivers = { closed: false, reasons: ["not analyzed"], count: 1 };
   classInfos: ClassInfo[] = [];
   /** Class id of the synthetic captured-variable cell class (typed cells), or
    *  undefined when TSAOT_TYPED_CELLS=0. */
@@ -13071,8 +13074,9 @@ class Exporter {
     this.classExtractor = new ClassExtractor(this.program);
     // Bundler: extract classes from EVERY module at once so cross-module
     // `extends` resolves and class ids are unique across files.
-    const { classes, symbolToId, nodeToId } = this.classExtractor.extractAll(this.modules);
+    const { classes, symbolToId, nodeToId, closedReceivers } = this.classExtractor.extractAll(this.modules);
     this.classInfos = classes;
+    this.closedReceivers = closedReceivers;
     // Typed cells: every captured-variable cell is an instance of one synthetic
     // class with a single struct field, so reads and writes of captured
     // variables compile to a direct field access instead of a cached property
@@ -14150,6 +14154,9 @@ class Exporter {
     return {
       version: 1,
       strictTypeOptimizations: this.strictTypeOptimizationProfile(),
+      closedReceivers: process.env.TSAOT_CLOSED_RECEIVERS === "0"
+        ? { closed: false, reasons: ["TSAOT_CLOSED_RECEIVERS=0"], count: 0 }
+        : this.closedReceivers,
       types: [],
       fields: this.fields,
       signatures: [],

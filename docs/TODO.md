@@ -7623,3 +7623,41 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   left. scriptc guards too (a null test per access, the class id for
   `instanceof` and downcasts), but a failed guard traps, so nothing merges
   back, and its class ids never change.
+- Closed receivers (`docs/closed_receivers_design.md`, slice 1): what the
+  receiver guards cost, measured by dropping each part without proof (tsc-ts
+  emitting, six interleaved rounds, output identical): no guards at all
+  x0.823 cycles, no `g_typed_slow && ts_typed_slow(x)` term x0.843, no object
+  test x0.992, no interval test x0.985. The flag term is on about 59,000
+  accesses (every `this.f`, every class-typed parameter's access, every
+  store), and its slow path is a call the C compiler must assume writes the
+  frame and the globals. The runtime raises the flag at five points (a
+  Proxy, `ts_set_proto_user`, `ts_object_create`, `invoke_with_this`,
+  `ts_funcproto_bind`); a program that can reach none of them never raises
+  it, so the term is false for the whole run. The class extractor's new pass
+  4 proves that from the source (a reference to `Proxy`; `setPrototypeOf` /
+  `Object.create` except with a literal `null` prototype; `__proto__`; the
+  library's `call` / `apply` / `bind` / `Reflect.apply` except on a function
+  that cannot be a method (a function or arrow expression, a function
+  declaration, a library function) or with a sized instance as `this`; an
+  iteration method's thisArg on the same terms; and every dynamic route to
+  them: a member of an `any` value named like one, a computed key on an
+  `any` value, a function or a builtin namespace, `Object` or `Reflect`
+  escaping as a value, the `Function` constructor). A closed program's
+  accesses drop the term (`program.json` `closedReceivers`;
+  `TSAOT_CLOSED_LOG=1` names the sites that open a program,
+  `TSAOT_CLOSED_RECEIVERS=0` keeps the term); the runtime's raise points stop
+  a closed program with a message instead (an analysis miss is loud).
+  tsc-ts is closed: 2.895 s -> 2.448 s emitting (x0.845, eight interleaved
+  rounds, 52.6 G -> 47.3 G instructions, output identical). The TypeScript
+  6.0.3 compiler stays open (80 sites), its C unchanged. Found while
+  measuring, left for slice 2 (silent wrong values): `delete` of a class
+  field does nothing; a class method grafted onto an instance of another
+  class (`d.m = C.prototype.m; d.m()`) reads C's offsets in it. Tests:
+  `tests/closed_receivers.sh` (31 programs, every rule and exception; in
+  `gate.sh unit`), fixture `classes/closed_receivers`; parity known row for
+  it (the frozen emitter drops a thisArg). Gates: unit, parity (374
+  identical), bundler 43/43, selfconf, GC stress, inline policy,
+  conformance 524/524, 524/524 strict, 524/524 at every allocation; tsc
+  rebuilt (`native_s350cl`, C unchanged) under protect, zap and frequent
+  minors, outputs identical, A/B neutral (wall 0.9989); tsc-ts closed under
+  the same three modes, outputs identical.

@@ -64,6 +64,10 @@ pub struct Program {
     /// behavior unless a pass explicitly consults this field.
     #[serde(default, rename = "strictTypeOptimizations")]
     pub strict_type_optimizations: StrictTypeOptimizations,
+    /// docs/closed_receivers_design.md: the program reaches no runtime point
+    /// that raises g_typed_slow, so typed accesses drop the flag's test.
+    #[serde(default, rename = "closedReceivers")]
+    pub closed_receivers: ClosedReceivers,
     pub types: Vec<TypeInfo>,
     pub fields: Vec<FieldInfo>,
     pub signatures: Vec<SignatureInfo>,
@@ -135,6 +139,18 @@ pub struct StrictTypeOptimizations {
     pub reason: String,
     #[serde(default)]
     pub options: StrictTypeOptimizationOptions,
+}
+
+/// The exporter's closed-receivers fact (`ClosedReceivers` in
+/// exporter/class_extract.ts): `reasons` names the first sites that open the
+/// program, `count` all of them.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ClosedReceivers {
+    pub closed: bool,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+    #[serde(default)]
+    pub count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
