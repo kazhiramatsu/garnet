@@ -141,6 +141,15 @@ static int g_pclass_n = 0;
 #else
 #define GC_PAYLOAD_CHECKED g_gc_zap
 #endif
+/* A run of free cells is zeroed once, when the allocator takes it (one
+   memset of the run, which the hardware zeroes by cache line), so a cell's
+   allocation stores no zeros. Under ASan the cells of a run stay poisoned
+   until they are handed out, so each cell is zeroed then instead. */
+#if defined(TS_ASAN_ENABLED)
+#define GC_CELL_RUNS_ZEROED 0
+#else
+#define GC_CELL_RUNS_ZEROED 1
+#endif
 typedef struct { char* start; char* end; uint32_t size; } gc_prun;
 static gc_prun* g_payload_runs = NULL;
 static size_t g_payload_runs_len = 0, g_payload_runs_cap = 0;
@@ -259,6 +268,7 @@ static char* gc_space_refill(gc_pclass* classes, uint8_t state, unsigned cls, in
     if (gc_payload_block_run(bi, cls, &ptr, &end)){
       c->ptr = ptr; c->end = end;
       if (log_runs) gc_payload_log_run(ptr, end, size);
+      if (GC_CELL_RUNS_ZEROED && state == GC_BLK_CELL) memset(ptr, 0, (size_t)(end - ptr));
       return ptr;
     }
     c->scan = g_blocks[bi].next;
@@ -273,6 +283,8 @@ static char* gc_space_refill(gc_pclass* classes, uint8_t state, unsigned cls, in
   uint32_t ncells = (uint32_t)(GC_BLOCK_BYTES / size);
   b->cursor = ncells * size;
   c->ptr = gc_block_base(bi); c->end = c->ptr + (size_t)ncells * size;
+  /* a block from the free list may hold a released run's old bytes */
+  if (GC_CELL_RUNS_ZEROED && state == GC_BLK_CELL) memset(c->ptr, 0, (size_t)ncells * size);
   GC_PAYLOAD_POISON(c->ptr, (size_t)ncells * size);
   if (log_runs) gc_payload_log_run(c->ptr, c->end, size);
   return c->ptr;
@@ -359,7 +371,8 @@ static void* gc_cell_alloc_large(size_t bytes, int old){
   memset(p, 0, bytes);
   return p;
 }
-/* A zeroed cell (the calloc contract of the previous allocator). */
+/* A zeroed cell (the calloc contract of the previous allocator): its run
+   was zeroed when the allocator took it (GC_CELL_RUNS_ZEROED). */
 static inline void* gc_cell_alloc(size_t bytes, int old){
   if (TS_RT_UNLIKELY(bytes > GC_PAYLOAD_SMALL_MAX)) return gc_cell_alloc_large(bytes, old);
   if (TS_RT_UNLIKELY(!g_cage_base)) gc_cage_init();
@@ -370,7 +383,7 @@ static inline void* gc_cell_alloc(size_t bytes, int old){
   if (TS_RT_UNLIKELY(!p || p + size > c->end)) p = gc_space_refill(g_cclass, GC_BLK_CELL, cls, 0);
   c->ptr = p + size;
   GC_PAYLOAD_UNPOISON(p, size);
-  memset(p, 0, bytes);
+  if (!GC_CELL_RUNS_ZEROED) memset(p, 0, bytes);
   if (old){
     uintptr_t off = (uintptr_t)(p - g_cage_base);
     gc_payload_mark_small((uint32_t)(off >> GC_BLOCK_SHIFT), off & (GC_BLOCK_BYTES - 1u));
