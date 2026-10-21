@@ -7337,3 +7337,31 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   node, bound by the int-double conversions around `Math.imul` and the
   `+ c` (both computed in doubles); moving the small Math helpers in line
   did not change it (0.89 s against 0.87 s, so they stay out of line).
+- Text and number formatting (slice 2 of `docs/tsc_ts_native_design.md`):
+  `TextEncoder` and `TextDecoder` (`docs/text_codecs_design.md`) and
+  `Number.prototype.toExponential`. The encoder writes UTF-8 (a lone
+  surrogate as U+FFFD) into a new Uint8Array; `encodeInto` writes whole code
+  points while they fit and returns `{ read, written }`. The decoder takes
+  the WHATWG labels of UTF-8, UTF-16LE and UTF-16BE (trimmed,
+  case-folded; others a RangeError with node's message), `fatal` and
+  `ignoreBOM`, decodes an ArrayBuffer, a SharedArrayBuffer or a view with
+  the standard's decoders (UTF-8's maximal-subpart replacement, UTF-16's
+  unpaired surrogates and odd last byte), removes the byte order mark, and
+  throws with `fatal`; streaming is a TypeError (not modeled). Plain
+  objects with prototypes, accessors (`encoding`, `fatal`, `ignoreBOM`),
+  brand checks with node's messages, the constructors as values,
+  `instanceof`. `toExponential` shares toPrecision's exact digit generation
+  (now `number_exact_digits`): f fraction digits rounded half up on the
+  exact value, or the shortest round-trip digits without an argument (those
+  of ToString), the argument's conversion and RangeError, non-finite
+  receivers as themselves, prototype method for `any` receivers. Fixtures
+  `stdlib/text_codecs` (in the GC stress filter) and
+  `numbers/to_exponential`; known rows for the frozen emitter (selfconf
+  passes `to_exponential` through the prototype method). Gates: unit,
+  parity (367 identical), bundler 42/42, selfconf, GC stress, inline
+  policy, conformance 511/511 and 511/511 with a collection at every
+  allocation in protect mode; tsc relinked (`native_s350tc`; the
+  compiler's sources use none of the new builtins) and compiled under
+  protect mode, with zapping, and with a minor collection every 256
+  allocations, its 78 output files identical. A/B against `at`, sixteen
+  ABBA pairs: wall 0.9962, instructions 0.9999, cycles 0.9965: neutral.

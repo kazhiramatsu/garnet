@@ -5807,6 +5807,8 @@ class Exporter {
         if (taElem !== undefined) builtinProtoKinds[node.right.text] = `typedarray:${taElem}`;
         if (node.right.text === "ArrayBuffer") builtinProtoKinds.ArrayBuffer = "arraybuffer";
         if (node.right.text === "SharedArrayBuffer") builtinProtoKinds.SharedArrayBuffer = "sharedarraybuffer";
+        if (node.right.text === "TextEncoder") builtinProtoKinds.TextEncoder = "textencoder";
+        if (node.right.text === "TextDecoder") builtinProtoKinds.TextDecoder = "textdecoder";
         // The shared prototype object to chain-check against.
         const protoBuiltin =
           ek !== undefined ? `errorproto.${ek}` :
@@ -8575,6 +8577,21 @@ class Exporter {
       ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin, args });
       return dst;
     }
+    // TextEncoder / TextDecoder (docs/text_codecs_design.md): every argument is
+    // evaluated; the decoder takes its label and options.
+    if (ctorName === "TextEncoder" || ctorName === "TextDecoder") {
+      const argNodes = node.arguments ?? [];
+      if (argNodes.some((a) => ts.isSpreadElement(a))) {
+        this.unsupported(node, `new ${ctorName}(...spread)`);
+        return this.newLocal(ctx, "reference", hint);
+      }
+      const args = this.lowerSequenced(ctx, argNodes);
+      const dst = this.newLocal(ctx, "reference", hint);
+      ctx.body.push({ kind: "CallBuiltinStatic", dst,
+        builtin: ctorName === "TextEncoder" ? "textencoder.new" : "textdecoder.new",
+        args: ctorName === "TextEncoder" ? [] : args.slice(0, 2) });
+      return dst;
+    }
     if (ctorName === "RegExp") {
       return this.lowerRegExpConstructor(ctx, node, hint);
     }
@@ -9816,7 +9833,7 @@ class Exporter {
     const weakMapMethods = new Set(["set","get","has","delete"]);
     const weakSetMethods = new Set(["add","has","delete"]);
     const headersMethods = new Set(["get","has","keys","values","entries","append","set","delete"]);
-    const numberMethods = new Set(["toFixed","toString","toPrecision","valueOf"]);
+    const numberMethods = new Set(["toFixed","toString","toPrecision","toExponential","valueOf"]);
     const booleanMethods = new Set(["toString","valueOf"]);
     const promiseMethods = new Set(["then","catch","finally"]);
     if (kind === "string" && stringMethods.has(method)) return `string.${method}`;
@@ -13937,7 +13954,8 @@ class Exporter {
     // number (`(x as any).toFixed(2)`). this = args[0] = the number value.
     const numberProtoSpec: [string, string][] = [
       ["toFixed","ts_numproto_toFixed"],["toString","ts_numproto_toString"],
-      ["toPrecision","ts_numproto_toPrecision"],["valueOf","ts_numproto_valueOf"],
+      ["toPrecision","ts_numproto_toPrecision"],["toExponential","ts_numproto_toExponential"],
+      ["valueOf","ts_numproto_valueOf"],
     ];
     const numberProtoMethods = numberProtoSpec.map(([name, runtime]) => ({ name, runtime, methodId: this.internName(name) }));
     const booleanProtoSpec: [string, string][] = [

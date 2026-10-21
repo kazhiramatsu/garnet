@@ -154,6 +154,8 @@ fn builtin_needs_typed_array_globals(builtin: &str) -> bool {
                 | "ArrayBuffer"
                 | "SharedArrayBuffer"
                 | "Atomics"
+                | "TextEncoder"
+                | "TextDecoder"
         )
     )
 }
@@ -18674,6 +18676,9 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 "regexp.construct" => (format!("ts_regexp_adapter_construct_tsv({}, {}, ts_truthy({}))", v(0), v(1), v(2)), false),
                 "uint16array.new" => (format!("ts_new_uint16_array({})", v(0)), false),
                 "arraybuffer.isView" => (format!("ts_bool(ts_array_buffer_is_view({}))", v(0)), false),
+                // docs/text_codecs_design.md
+                "textencoder.new" => ("ts_text_encoder_new()".to_string(), false),
+                "textdecoder.new" => (format!("ts_text_decoder_new({}, {})", v(0), v(1)), false),
                 // Atomics on one thread (docs/typed_arrays_design.md, TA3)
                 "atomics.load" => (format!("ts_atomics_load({}, {})", v(0), v(1)), false),
                 "atomics.store" => (format!("ts_atomics_store({}, {}, {})", v(0), v(1), v(2)), false),
@@ -19421,6 +19426,18 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     ),
                     false,
                 ),
+                // the argument as for toPrecision; undefined is as many digits
+                // as necessary
+                "number.toExponential" => (
+                    if args.is_empty() {
+                        format!("ts_number_to_exponential_v({}, TS_UNDEFINED)", r)
+                    } else if ctx.unboxed.contains(&args[0].0) || ctx.json_locals.contains(&args[0].0) {
+                        format!("ts_number_to_exponential_d({}, {})", r, n(0))
+                    } else {
+                        format!("ts_number_to_exponential_v({}, {})", r, v(0))
+                    },
+                    false,
+                ),
                 "number.valueOf" => (ctx.num(recv.0), true),
                 "boolean.toString" => (
                     format!(
@@ -19868,6 +19885,8 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 let ta = match kind {
                     "arraybuffer" => Some("ts_array_buffer_proto(0)".to_string()),
                     "sharedarraybuffer" => Some("ts_array_buffer_proto(1)".to_string()),
+                    "textencoder" => Some("ts_text_encoder_proto()".to_string()),
+                    "textdecoder" => Some("ts_text_decoder_proto()".to_string()),
                     _ => kind
                         .strip_prefix("typedarray:")
                         .map(|e| format!("ts_typed_array_proto({})", e.parse::<u32>().unwrap_or(0))),

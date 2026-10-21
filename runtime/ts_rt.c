@@ -6427,6 +6427,23 @@ tsv ts_number_to_string_radix(tsv numv, double radix){
    21.1.3.5): n, the p digits closest to x, the larger one on a tie (half up
    on |x|), from the exact decimal expansion; exponential when e < -6 or
    e >= p. */
+/* The p (1..101) decimal digits closest to x > 0 and the exponent of the
+   first, the larger on a tie (half up), from the exact decimal expansion. */
+static void number_exact_digits(double x, int p, char* d, int* e){
+  char ex[800];
+  snprintf(ex, sizeof ex, "%.770e", x);     /* every digit of the double, exactly */
+  char* ep = strchr(ex, 'e');
+  *e = atoi(ep + 1);
+  char all[780]; int k = 0;
+  for (char* c = ex; c < ep; c++) if (*c != '.') all[k++] = *c;
+  for (int i = 0; i < p; i++) d[i] = i < k ? all[i] : '0';
+  if (p < k && all[p] >= '5'){
+    int j = p - 1;
+    while (j >= 0 && d[j] == '9'){ d[j] = '0'; j--; }
+    if (j >= 0) d[j]++;
+    else { d[0] = '1'; for (int i = 1; i < p; i++) d[i] = '0'; (*e)++; }
+  }
+}
 static tsv number_to_precision(double x, int p){
   char out[160]; int o = 0;
   if (x < 0){ out[o++] = '-'; x = -x; }
@@ -6434,21 +6451,7 @@ static tsv number_to_precision(double x, int p){
   if (x == 0){
     for (int i = 0; i < p; i++) d[i] = '0';
     e = 0;
-  } else {
-    char ex[800];
-    snprintf(ex, sizeof ex, "%.770e", x);     /* every digit of the double, exactly */
-    char* ep = strchr(ex, 'e');
-    e = atoi(ep + 1);
-    char all[780]; int k = 0;
-    for (char* c = ex; c < ep; c++) if (*c != '.') all[k++] = *c;
-    for (int i = 0; i < p; i++) d[i] = i < k ? all[i] : '0';
-    if (p < k && all[p] >= '5'){
-      int j = p - 1;
-      while (j >= 0 && d[j] == '9'){ d[j] = '0'; j--; }
-      if (j >= 0) d[j]++;
-      else { d[0] = '1'; for (int i = 1; i < p; i++) d[i] = '0'; e++; }
-    }
-  }
+  } else number_exact_digits(x, p, d, &e);
   if (e < -6 || e >= p){
     out[o++] = d[0];
     if (p > 1){ out[o++] = '.'; for (int i = 1; i < p; i++) out[o++] = d[i]; }
@@ -6465,6 +6468,63 @@ static tsv number_to_precision(double x, int p){
     for (int i = 0; i < p; i++) out[o++] = d[i];
   }
   return ts_new_string(out, (uint32_t)o);
+}
+/* Number::toExponential (ECMA-262 21.1.3.2) for a finite x: f fraction
+   digits (the f + 1 digits closest to |x|, the larger on a tie), or, for
+   f < 0 (an undefined argument), the shortest digits that round-trip: those
+   of ToString, without its leading and trailing zeros. */
+static tsv number_to_exponential(double x, int f){
+  char out[160]; int o = 0;
+  if (x < 0){ out[o++] = '-'; x = -x; }
+  char d[120]; int nd, e;
+  if (x == 0){
+    nd = f < 0 ? 1 : f + 1;
+    for (int i = 0; i < nd; i++) d[i] = '0';
+    e = 0;
+  } else if (f < 0){
+    char sbuf[40]; ts_fmt_num(x, sbuf, sizeof sbuf);
+    char* ep = strchr(sbuf, 'e');
+    char* end = ep ? ep : sbuf + strlen(sbuf);
+    int exp10 = ep ? atoi(ep + 1) : 0, intlen = 0, seen_point = 0, z = 0, leading = 1;
+    nd = 0;
+    for (char* c = sbuf; c < end; c++){
+      if (*c == '.'){ seen_point = 1; continue; }
+      if (!seen_point) intlen++;
+      if (leading && *c == '0'){ z++; continue; }
+      leading = 0;
+      d[nd++] = *c;
+    }
+    while (nd > 1 && d[nd - 1] == '0') nd--;
+    e = exp10 + intlen - 1 - z;
+  } else {
+    nd = f + 1;
+    number_exact_digits(x, nd, d, &e);
+  }
+  out[o++] = d[0];
+  if (nd > 1){ out[o++] = '.'; for (int i = 1; i < nd; i++) out[o++] = d[i]; }
+  o += snprintf(out + o, sizeof out - (size_t)o, "e%c%d", e >= 0 ? '+' : '-', e >= 0 ? e : -e);
+  return ts_new_string(out, (uint32_t)o);
+}
+/* Number.prototype.toExponential(f) with a number f: ToIntegerOrInfinity; a
+   non-finite x prints as itself; RangeError outside 0..100. */
+tsv ts_number_to_exponential_d(tsv numv, double digits){
+  double f = num_to_integer_or_inf(digits);
+  double x = number_this_value(numv);
+  if (x != x || isinf(x)) return ts_to_string_v(ts_num(x));
+  if (!(f >= 0 && f <= 100)) ts_throw_range_error_msg("toExponential() argument must be between 0 and 100");
+  return number_to_exponential(x, (int)f);
+}
+/* ... with any f: undefined is as many digits as necessary. */
+tsv ts_number_to_exponential_v(tsv numv, tsv digits){
+  if (ts_is_undef(digits)){
+    double x = number_this_value(numv);
+    if (x != x || isinf(x)) return ts_to_string_v(ts_num(x));
+    return number_to_exponential(x, -1);
+  }
+  ts_gc_root(&numv);
+  double f = ts_number_coerce(digits);
+  ts_gc_unroot(1);
+  return ts_number_to_exponential_d(numv, f);
 }
 /* Number.prototype.toPrecision(p) with a number p: ToIntegerOrInfinity; a
    non-finite x prints as itself; RangeError outside 1..100. */
@@ -13973,6 +14033,326 @@ tsv ts_atomics_notify(tsv ta, tsv index, tsv count){
   ts_gc_unroot(1);
   return ts_num(0);           /* no thread waits */
 }
+/* ---------------- TextEncoder / TextDecoder (docs/text_codecs_design.md) ----
+   Plain objects with their prototypes; a decoder keeps its encoding (0 UTF-8,
+   1 UTF-16LE, 2 UTF-16BE), fatal and ignoreBOM in hidden fields. */
+static tsv g_te_proto = TS_NULL, g_td_proto = TS_NULL;
+static tsv g_te_ctor = TS_UNDEFINED, g_td_ctor = TS_UNDEFINED;
+static ts_key g_tc_k_brand, g_tc_k_enc, g_tc_k_fatal, g_tc_k_bom;
+static void text_codecs_init(void);
+/* The UTF-8 form of a string's units, a lone surrogate as U+FFFD: writes
+   whole code points while they fit in `cap` bytes (out NULL measures); *read
+   is the units consumed. */
+static uint32_t utf8_encode_view(ts_strview v, uint8_t* out, uint32_t cap, uint32_t* read){
+  uint32_t o = 0, i = 0;
+  while (i < v.len){
+    uint32_t cp = ts_str_cu_at_view(v, i), units = 1;
+    if (cp >= 0xD800u && cp <= 0xDBFFu && i + 1 < v.len){
+      uint32_t lo = ts_str_cu_at_view(v, i + 1);
+      if (lo >= 0xDC00u && lo <= 0xDFFFu){ cp = 0x10000u + ((cp - 0xD800u) << 10) + (lo - 0xDC00u); units = 2; }
+    }
+    if (cp >= 0xD800u && cp <= 0xDFFFu) cp = 0xFFFDu;
+    uint32_t n = cp < 0x80u ? 1 : cp < 0x800u ? 2 : cp < 0x10000u ? 3 : 4;
+    if (o + n > cap) break;
+    if (out){
+      if (n == 1) out[o] = (uint8_t)cp;
+      else if (n == 2){ out[o] = (uint8_t)(0xC0u | (cp >> 6)); out[o + 1] = (uint8_t)(0x80u | (cp & 0x3Fu)); }
+      else if (n == 3){ out[o] = (uint8_t)(0xE0u | (cp >> 12)); out[o + 1] = (uint8_t)(0x80u | ((cp >> 6) & 0x3Fu)); out[o + 2] = (uint8_t)(0x80u | (cp & 0x3Fu)); }
+      else { out[o] = (uint8_t)(0xF0u | (cp >> 18)); out[o + 1] = (uint8_t)(0x80u | ((cp >> 12) & 0x3Fu)); out[o + 2] = (uint8_t)(0x80u | ((cp >> 6) & 0x3Fu)); out[o + 3] = (uint8_t)(0x80u | (cp & 0x3Fu)); }
+    }
+    o += n; i += units;
+  }
+  if (read) *read = i;
+  return o;
+}
+/* A string from UTF-16 units: one byte each when all are Latin-1. */
+static tsv string_from_units(const uint16_t* u, uint32_t n){
+  int latin1 = 1, ascii = 1;
+  for (uint32_t i = 0; i < n; i++){ if (u[i] > 0x7Fu) ascii = 0; if (u[i] > 0xFFu){ latin1 = 0; break; } }
+  if (ascii && n <= TS_SHORTSTR_MAX){
+    char tmp[TS_SHORTSTR_MAX];
+    for (uint32_t i = 0; i < n; i++) tmp[i] = (char)u[i];
+    return ts_short_str_ascii(tmp, n);
+  }
+  uint32_t flags = latin1 ? 0u : TS_STR_FLAG_UTF16;
+  ts_string* str = ts_string_alloc_storage(n, flags);
+  for (uint32_t i = 0; i < n; i++){
+    if (latin1) str->data[i] = (char)(uint8_t)u[i];
+    else ts_str_cu_set(str->data, flags, i, u[i]);
+  }
+  str->flags = strflags_storage(str->data, flags, n);
+  str->hash = strhash_units(str->data, str->flags, n);
+  return ts_str_v(str);
+}
+/* node's description of a bad argument (ERR_INVALID_ARG_TYPE's "Received ..."). */
+static void tc_received(tsv v, char* out, size_t cap){
+  if (ts_is_undef(v)){ snprintf(out, cap, "Received undefined"); return; }
+  if (ts_is_null(v)){ snprintf(out, cap, "Received null"); return; }
+  if (ts_is_num(v)){ char num[40]; ts_fmt_num(ts_to_num(v), num, sizeof num); snprintf(out, cap, "Received type number (%s)", num); return; }
+  if (ts_is_bool(v)){ snprintf(out, cap, "Received type boolean (%s)", ts_truthy(v) ? "true" : "false"); return; }
+  if (ts_is_str(v)){
+    uint32_t n; char* c = ts_string_cstr_copy(v, &n);
+    if (c && n > 28){ c[25] = 0; snprintf(out, cap, "Received type string ('%s...')", c); }
+    else snprintf(out, cap, "Received type string ('%s')", c ? c : "");
+    free(c); return;
+  }
+  if (ts_is_symbol(v)){ snprintf(out, cap, "Received type symbol"); return; }
+  if (ts_is_func(v)){ snprintf(out, cap, "Received function"); return; }
+  char tag[96]; tsv t = ts_objproto_tostring_call(v);
+  uint32_t n; char* c = ts_string_cstr_copy(t, &n);
+  snprintf(tag, sizeof tag, "%s", c ? c : "[object Object]"); free(c);
+  size_t tl = strlen(tag);
+  if (tl > 9 && tag[tl - 1] == ']'){ tag[tl - 1] = 0; snprintf(out, cap, "Received an instance of %s", tag + 8); }
+  else snprintf(out, cap, "Received an instance of Object");
+}
+static void tc_bad_this(const char* type){
+  char buf[96]; snprintf(buf, sizeof buf, "Value of \"this\" must be of type %s", type);
+  ts_throw_type_error_msg(buf);
+}
+static int tc_has_brand(tsv v, ts_key key){
+  return ts_is_obj(v) && ((ts_gc_header*)ts_ptr(v))->kind == TS_KIND_OBJECT && find_slot((ts_object*)ts_ptr(v), key, 0) != NULL;
+}
+static tsv tc_hidden(tsv obj, ts_key key){
+  tsv* slot = find_slot((ts_object*)ts_ptr(obj), key, 0);
+  return slot ? *slot : TS_UNDEFINED;
+}
+tsv ts_text_encoder_new(void){
+  text_codecs_init();
+  tsv o = ts_new_object(); ts_gc_root(&o);
+  ts_set_proto(o, g_te_proto);
+  ts_define_data(o, g_tc_k_brand, ts_bool(1), 0, 0, 0);
+  ts_gc_unroot(1);
+  return o;
+}
+/* encode(input = ""): the UTF-8 bytes in a new Uint8Array. */
+static tsv te_m_encode(tsv* a, int n){
+  if (!tc_has_brand(n ? a[0] : TS_UNDEFINED, g_tc_k_brand)) tc_bad_this("TextEncoder");
+  tsv str = n > 1 && !ts_is_undef(a[1]) ? ts_to_string_v(a[1]) : ts_new_string("", 0);
+  ts_gc_root(&str);
+  uint32_t len = utf8_encode_view(ts_str_view_typed(str), NULL, UINT32_MAX, NULL);
+  tsv out = ta_new_length(TS_TA_UINT8, len); ts_gc_root(&out);
+  (void)utf8_encode_view(ts_str_view_typed(str), ta_ptr(out)->data, len, NULL);
+  ts_gc_unroot(2);
+  return out;
+}
+/* encodeInto(source, destination): whole code points while they fit;
+   { read, written }. */
+static tsv te_m_encode_into(tsv* a, int n){
+  if (!tc_has_brand(n ? a[0] : TS_UNDEFINED, g_tc_k_brand)) tc_bad_this("TextEncoder");
+  tsv dst = n > 2 ? a[2] : TS_UNDEFINED; ts_gc_root(&dst);
+  if (!ts_is_typed_array(dst) || ta_ptr(dst)->elem != TS_TA_UINT8){
+    char rec[160], buf[256]; tc_received(dst, rec, sizeof rec);
+    snprintf(buf, sizeof buf, "The \"dest\" argument must be an instance of Uint8Array. %s", rec);
+    ts_throw_type_error_msg(buf);
+  }
+  tsv str = ts_to_string_v(n > 1 ? a[1] : TS_UNDEFINED); ts_gc_root(&str);
+  uint32_t read = 0;
+  uint32_t written = utf8_encode_view(ts_str_view_typed(str), ta_ptr(dst)->data, ta_ptr(dst)->length, &read);
+  tsv r = ts_new_object(); ts_gc_root(&r);
+  ts_set(r, ts_intern_field("read", 4), ts_num((double)read));
+  ts_set(r, ts_intern_field("written", 7), ts_num((double)written));
+  ts_gc_unroot(3);
+  return r;
+}
+static tsv te_g_encoding(tsv* a, int n){
+  if (!tc_has_brand(n ? a[0] : TS_UNDEFINED, g_tc_k_brand)) tc_bad_this("TextEncoder");
+  return ts_new_string("utf-8", 5);
+}
+/* new TextDecoder(label, options): the label trimmed and ASCII-case-folded. */
+tsv ts_text_decoder_new(tsv label, tsv options){
+  text_codecs_init();
+  ts_gc_root(&label); ts_gc_root(&options);
+  int enc = 0;
+  if (!ts_is_undef(label)){
+    tsv ls = ts_to_string_v(label); ts_gc_root(&ls);
+    ts_strview v = ts_str_view_typed(ls);
+    uint32_t b = 0, e = v.len;
+    #define TC_ASCII_WS(cu) ((cu) == 0x09u || (cu) == 0x0Au || (cu) == 0x0Cu || (cu) == 0x0Du || (cu) == 0x20u)
+    while (b < e && TC_ASCII_WS(ts_str_cu_at_view(v, b))) b++;
+    while (e > b && TC_ASCII_WS(ts_str_cu_at_view(v, e - 1))) e--;
+    #undef TC_ASCII_WS
+    char name[40]; uint32_t k = 0; int ok = e - b < sizeof name;
+    for (uint32_t i = b; ok && i < e; i++){
+      uint32_t cu = ts_str_cu_at_view(v, i);
+      if (cu >= 0x80u){ ok = 0; break; }
+      name[k++] = (char)(cu >= 'A' && cu <= 'Z' ? cu + 32 : cu);
+    }
+    name[k] = 0;
+    static const char* const utf8[] = { "unicode-1-1-utf-8", "unicode11utf8", "unicode20utf8", "utf-8", "utf8", "x-unicode20utf8" };
+    static const char* const utf16le[] = { "csunicode", "iso-10646-ucs-2", "ucs-2", "unicode", "unicodefeff", "utf-16", "utf-16le" };
+    static const char* const utf16be[] = { "unicodefffe", "utf-16be" };
+    enc = -1;
+    if (ok){
+      for (size_t i = 0; i < sizeof utf8 / sizeof *utf8; i++) if (!strcmp(name, utf8[i])) enc = 0;
+      for (size_t i = 0; i < sizeof utf16le / sizeof *utf16le; i++) if (!strcmp(name, utf16le[i])) enc = 1;
+      for (size_t i = 0; i < sizeof utf16be / sizeof *utf16be; i++) if (!strcmp(name, utf16be[i])) enc = 2;
+    }
+    if (enc < 0){
+      uint32_t sl; char* sc = ts_string_cstr_copy(ls, &sl);
+      char buf[200]; snprintf(buf, sizeof buf, "The \"%s\" encoding is not supported", sc ? sc : "?");
+      free(sc);
+      ts_throw_range_error_msg(buf);
+    }
+    ts_gc_unroot(1);
+  }
+  int fatal = 0, bom = 0;
+  if (!ts_is_undef(options) && !ts_is_null(options)){
+    if (!ts_object_like(options)){
+      char rec[160], buf[256]; tc_received(options, rec, sizeof rec);
+      snprintf(buf, sizeof buf, "The \"options\" argument must be of type object. %s", rec);
+      ts_throw_type_error_msg(buf);
+    }
+    fatal = ts_truthy(ts_get(options, ts_intern_field("fatal", 5)));
+    bom = ts_truthy(ts_get(options, ts_intern_field("ignoreBOM", 9)));
+  }
+  tsv o = ts_new_object(); ts_gc_root(&o);
+  ts_set_proto(o, g_td_proto);
+  ts_define_data(o, g_tc_k_enc, ts_num((double)enc), 0, 0, 0);
+  ts_define_data(o, g_tc_k_fatal, ts_bool(fatal), 0, 0, 0);
+  ts_define_data(o, g_tc_k_bom, ts_bool(bom), 0, 0, 0);
+  ts_gc_unroot(3);
+  return o;
+}
+static void td_invalid(int enc){
+  ts_throw_type_error_msg(enc == 0 ? "The encoded data was not valid for encoding utf-8"
+                                   : enc == 1 ? "The encoded data was not valid for encoding utf-16le"
+                                              : "The encoded data was not valid for encoding utf-16be");
+}
+/* The standard's UTF-8 decoder: each maximal invalid subpart one U+FFFD. */
+static uint32_t td_decode_utf8(const uint8_t* b, uint32_t n, uint16_t* u, int fatal){
+  uint32_t o = 0, cp = 0, needed = 0, seen = 0, lower = 0x80u, upper = 0xBFu;
+  for (uint32_t i = 0; i < n; i++){
+    uint32_t x = b[i];
+    if (needed == 0){
+      if (x <= 0x7Fu){ u[o++] = (uint16_t)x; continue; }
+      if (x >= 0xC2u && x <= 0xDFu){ needed = 1; cp = x & 0x1Fu; }
+      else if (x >= 0xE0u && x <= 0xEFu){ if (x == 0xE0u) lower = 0xA0u; if (x == 0xEDu) upper = 0x9Fu; needed = 2; cp = x & 0xFu; }
+      else if (x >= 0xF0u && x <= 0xF4u){ if (x == 0xF0u) lower = 0x90u; if (x == 0xF4u) upper = 0x8Fu; needed = 3; cp = x & 0x7u; }
+      else { if (fatal) td_invalid(0); u[o++] = 0xFFFDu; }
+      continue;
+    }
+    if (x < lower || x > upper){
+      cp = needed = seen = 0; lower = 0x80u; upper = 0xBFu;
+      if (fatal) td_invalid(0);
+      u[o++] = 0xFFFDu;
+      i--;                    /* the byte starts again */
+      continue;
+    }
+    lower = 0x80u; upper = 0xBFu;
+    cp = (cp << 6) | (x & 0x3Fu);
+    if (++seen != needed) continue;
+    if (cp > 0xFFFFu){ cp -= 0x10000u; u[o++] = (uint16_t)(0xD800u + (cp >> 10)); u[o++] = (uint16_t)(0xDC00u + (cp & 0x3FFu)); }
+    else u[o++] = (uint16_t)cp;
+    cp = needed = seen = 0;
+  }
+  if (needed){ if (fatal) td_invalid(0); u[o++] = 0xFFFDu; }
+  return o;
+}
+/* The standard's UTF-16 decoder: an unpaired surrogate or an odd last byte
+   is U+FFFD. */
+static uint32_t td_decode_utf16(const uint8_t* b, uint32_t n, uint16_t* u, int be, int fatal){
+  uint32_t o = 0; int lead = -1;
+  uint32_t i = 0;
+  for (; i + 1 < n; i += 2){
+    uint32_t cu = be ? ((uint32_t)b[i] << 8) | b[i + 1] : b[i] | ((uint32_t)b[i + 1] << 8);
+    if (lead >= 0){
+      if (cu >= 0xDC00u && cu <= 0xDFFFu){ u[o++] = (uint16_t)lead; u[o++] = (uint16_t)cu; lead = -1; continue; }
+      lead = -1;
+      if (fatal) td_invalid(be ? 2 : 1);
+      u[o++] = 0xFFFDu;
+    }
+    if (cu >= 0xD800u && cu <= 0xDBFFu){ lead = (int)cu; continue; }
+    if (cu >= 0xDC00u && cu <= 0xDFFFu){ if (fatal) td_invalid(be ? 2 : 1); u[o++] = 0xFFFDu; continue; }
+    u[o++] = (uint16_t)cu;
+  }
+  if (lead >= 0 || i < n){ if (fatal) td_invalid(be ? 2 : 1); u[o++] = 0xFFFDu; }
+  return o;
+}
+/* decode(input, options) */
+static tsv td_m_decode(tsv* a, int n){
+  tsv self = n ? a[0] : TS_UNDEFINED;
+  if (!tc_has_brand(self, g_tc_k_enc)) tc_bad_this("TextDecoder");
+  tsv input = n > 1 ? a[1] : TS_UNDEFINED, options = n > 2 ? a[2] : TS_UNDEFINED;
+  ts_gc_root(&self); ts_gc_root(&input);
+  if (!ts_is_undef(options) && !ts_is_null(options) && ts_object_like(options) &&
+      ts_truthy(ts_get(options, ts_intern_field("stream", 6))))
+    ts_throw_type_error_msg("TextDecoder streaming (decode with { stream: true }) is not supported");
+  int enc = (int)ts_to_num(tc_hidden(self, g_tc_k_enc));
+  int fatal = ts_truthy(tc_hidden(self, g_tc_k_fatal));
+  int keep_bom = ts_truthy(tc_hidden(self, g_tc_k_bom));
+  const uint8_t* bytes = NULL; uint32_t len = 0;
+  if (ts_is_undef(input)){ bytes = NULL; len = 0; }
+  else if (ts_is_array_buffer(input)){ ts_arraybuffer* ab = (ts_arraybuffer*)ts_ptr(input); bytes = ab->bytes; len = ab->byte_length; }
+  else if (ts_is_typed_array(input)){ ts_typedarray* t = ta_ptr(input); bytes = t->data; len = t->length * g_ta_size[t->elem]; }
+  else ts_throw_type_error_msg("The \"list\" argument must be an instance of SharedArrayBuffer, ArrayBuffer or ArrayBufferView.");
+  /* the byte order mark */
+  if (!keep_bom && bytes){
+    if (enc == 0 && len >= 3 && bytes[0] == 0xEFu && bytes[1] == 0xBBu && bytes[2] == 0xBFu){ bytes += 3; len -= 3; }
+    else if (enc == 1 && len >= 2 && bytes[0] == 0xFFu && bytes[1] == 0xFEu){ bytes += 2; len -= 2; }
+    else if (enc == 2 && len >= 2 && bytes[0] == 0xFEu && bytes[1] == 0xFFu){ bytes += 2; len -= 2; }
+  }
+  /* the bytes are outside the heap and their buffer is rooted: they stay put */
+  uint16_t stackbuf[256];
+  uint16_t* u = len + 1 <= 256 ? stackbuf : (uint16_t*)malloc(sizeof(uint16_t) * ((size_t)len + 1));
+  uint32_t units = enc == 0 ? td_decode_utf8(bytes, len, u, fatal) : td_decode_utf16(bytes, len, u, enc == 2, fatal);
+  tsv r = string_from_units(u, units);
+  if (u != stackbuf) free(u);
+  ts_gc_unroot(2);
+  return r;
+}
+static tsv td_g_encoding(tsv* a, int n){
+  tsv self = n ? a[0] : TS_UNDEFINED;
+  if (!tc_has_brand(self, g_tc_k_enc)) tc_bad_this("TextDecoder");
+  int enc = (int)ts_to_num(tc_hidden(self, g_tc_k_enc));
+  return enc == 0 ? ts_new_string("utf-8", 5) : enc == 1 ? ts_new_string("utf-16le", 8) : ts_new_string("utf-16be", 8);
+}
+static tsv td_g_fatal(tsv* a, int n){
+  tsv self = n ? a[0] : TS_UNDEFINED;
+  if (!tc_has_brand(self, g_tc_k_enc)) tc_bad_this("TextDecoder");
+  return ts_bool(ts_truthy(tc_hidden(self, g_tc_k_fatal)));
+}
+static tsv td_g_ignore_bom(tsv* a, int n){
+  tsv self = n ? a[0] : TS_UNDEFINED;
+  if (!tc_has_brand(self, g_tc_k_enc)) tc_bad_this("TextDecoder");
+  return ts_bool(ts_truthy(tc_hidden(self, g_tc_k_bom)));
+}
+static void tc_getter(tsv proto, const char* name, ts_code fn){
+  tsv g = ts_make_fn_t(fn, NULL, 0, 1); ts_gc_root(&g);
+  char nm[40]; snprintf(nm, sizeof nm, "get %s", name);
+  ts_set_fn_meta(g, 0, nm);
+  ts_define_accessor_attr(proto, ts_intern_field(name, (uint32_t)strlen(name)), g, TS_UNDEFINED, 1, 0, 1, 1);
+  ts_gc_unroot(1);
+}
+static tsv tc_ctor_call_encoder(tsv* a, int n){ (void)a; (void)n; ta_requires_new("TextEncoder"); return TS_UNDEFINED; }
+static tsv tc_ctor_call_decoder(tsv* a, int n){ (void)a; (void)n; ta_requires_new("TextDecoder"); return TS_UNDEFINED; }
+static void text_codecs_init(void){
+  if (g_te_proto != TS_NULL) return;
+  static int rooted_te = 0, rooted_td = 0, rooted_tec = 0, rooted_tdc = 0;
+  g_tc_k_brand = ts_intern_field("__text_encoder", 14);
+  g_tc_k_enc = ts_intern_field("__text_decoder_encoding", 23);
+  g_tc_k_fatal = ts_intern_field("__text_decoder_fatal", 20);
+  g_tc_k_bom = ts_intern_field("__text_decoder_ignore_bom", 25);
+  g_te_proto = ts_new_proto(); ts_root_static_once(&g_te_proto, &rooted_te);
+  g_td_proto = ts_new_proto(); ts_root_static_once(&g_td_proto, &rooted_td);
+  if (ts_proto_ref(g_object_proto_v)){ ts_set_proto(g_te_proto, g_object_proto_v); ts_set_proto(g_td_proto, g_object_proto_v); }
+  ta_proto_method(g_te_proto, "encode", te_m_encode, 0);
+  ta_proto_method(g_te_proto, "encodeInto", te_m_encode_into, 2);
+  tc_getter(g_te_proto, "encoding", te_g_encoding);
+  ta_proto_method(g_td_proto, "decode", td_m_decode, 0);
+  tc_getter(g_td_proto, "encoding", td_g_encoding);
+  tc_getter(g_td_proto, "fatal", td_g_fatal);
+  tc_getter(g_td_proto, "ignoreBOM", td_g_ignore_bom);
+  { tsv tag = ts_new_string("TextEncoder", 11); ts_gc_root(&tag);
+    ts_define_data(g_te_proto, TS_KEY_WKSYM(TS_WKSYM_TO_STRING_TAG), tag, 0, 0, 1); ts_gc_unroot(1); }
+  { tsv tag = ts_new_string("TextDecoder", 11); ts_gc_root(&tag);
+    ts_define_data(g_td_proto, TS_KEY_WKSYM(TS_WKSYM_TO_STRING_TAG), tag, 0, 0, 1); ts_gc_unroot(1); }
+  g_te_ctor = ta_ctor_value("TextEncoder", tc_ctor_call_encoder, 0, g_te_proto);
+  ts_root_static_once(&g_te_ctor, &rooted_tec);
+  g_td_ctor = ta_ctor_value("TextDecoder", tc_ctor_call_decoder, 0, g_td_proto);
+  ts_root_static_once(&g_td_ctor, &rooted_tdc);
+}
+tsv ts_text_encoder_proto(void){ text_codecs_init(); return g_te_proto; }
+tsv ts_text_decoder_proto(void){ text_codecs_init(); return g_td_proto; }
 /* The Atomics namespace as a value (its functions, named as calls, lower to
    the builtins above). */
 #define ATOMICS_ARG(i) (n > (i) ? a[i] : TS_UNDEFINED)
@@ -14011,6 +14391,9 @@ void ts_typed_array_globals(void){
   ts_define_data(at, TS_KEY_WKSYM(TS_WKSYM_TO_STRING_TAG), tag, 0, 0, 1);
   ts_global_set("Atomics", at);
   ts_gc_unroot(2);
+  text_codecs_init();
+  ts_global_set("TextEncoder", g_te_ctor);
+  ts_global_set("TextDecoder", g_td_ctor);
 }
 /* Canonical numeric string keys of a view (integer-indexed exotic): an index,
    or another numeric string such as "-0" or "1.5" that names no element. */
@@ -14394,6 +14777,7 @@ void ts_string_proto_register(ts_key method_key, const char* name, ts_code fn){
 tsv ts_numproto_toFixed(tsv* a, int n){ return ts_number_to_fixed_v(a[0], n>1?a[1]:TS_UNDEFINED); }
 tsv ts_numproto_toString(tsv* a, int n){ return ts_number_to_string_radix_v(a[0], n>1?a[1]:TS_UNDEFINED); }
 tsv ts_numproto_toPrecision(tsv* a, int n){ return ts_number_to_precision_v(a[0], n>1?a[1]:TS_UNDEFINED); }
+tsv ts_numproto_toExponential(tsv* a, int n){ return ts_number_to_exponential_v(a[0], n>1?a[1]:TS_UNDEFINED); }
 tsv ts_numproto_valueOf(tsv* a, int n){ (void)n; return a[0]; }
 
 tsv ts_number_proto(void){ return ts_proto_ref(g_number_proto_v) ? g_number_proto_v : TS_NULL; }

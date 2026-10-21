@@ -864,6 +864,10 @@ tsv  ts_atomics_compare_exchange(tsv ta, tsv index, tsv expected, tsv replacemen
 tsv  ts_atomics_is_lock_free(tsv n);
 tsv  ts_atomics_wait(tsv ta, tsv index, tsv value, tsv timeout);
 tsv  ts_atomics_notify(tsv ta, tsv index, tsv count);
+tsv  ts_text_encoder_new(void);
+tsv  ts_text_decoder_new(tsv label, tsv options);
+tsv  ts_text_encoder_proto(void);
+tsv  ts_text_decoder_proto(void);
 tsv  ts_ta_get(tsv v, uint32_t i);
 void ts_ta_set(tsv v, uint32_t i, tsv x);
 static inline int ts_is_array_fast(tsv v){
@@ -1121,6 +1125,7 @@ void ts_number_proto_register(ts_key method_key, const char* name, ts_code fn);
 tsv ts_numproto_toFixed(tsv* a, int n);
 tsv ts_numproto_toString(tsv* a, int n);
 tsv ts_numproto_toPrecision(tsv* a, int n);
+tsv ts_numproto_toExponential(tsv* a, int n);
 tsv ts_numproto_valueOf(tsv* a, int n);
 /* Boolean.prototype setup (any-typed boolean method dispatch). */
 tsv  ts_boolean_proto(void);
@@ -1230,6 +1235,8 @@ tsv ts_number_to_string_radix_d(tsv numv, double radix);
 tsv ts_number_to_string_radix_v(tsv numv, tsv radix);
 tsv ts_number_to_precision_d(tsv numv, double prec);
 tsv ts_number_to_precision_v(tsv numv, tsv prec);
+tsv ts_number_to_exponential_d(tsv numv, double digits);
+tsv ts_number_to_exponential_v(tsv numv, tsv digits);
 int ts_str_includes(tsv s, tsv needle, double pos, int has_pos);
 tsv ts_str_charat(tsv s, double idx);
 tsv ts_str_codepointat(tsv s, double idx);
