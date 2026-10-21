@@ -18264,6 +18264,13 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 else { let _ = writeln!(s, "  {};", expr); }
                 return;
             }
+            if let Some(name) = builtin.strip_prefix("global.assignRef:") {
+                let _ = writeln!(s, "  ts_global_assign_ref({:?}, {});", name, ctx.val(args[0].0));
+                if let Some(d) = dst {
+                    s.push_str(&ctx.set_val(d.0, "TS_UNDEFINED"));
+                }
+                return;
+            }
             if let Some(name) = builtin.strip_prefix("global.varDecl:") {
                 let _ = writeln!(s, "  ts_global_var_decl({:?});", name);
                 if let Some(d) = dst {
@@ -19873,6 +19880,11 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             }
             if let Some(name) = builtin.strip_prefix("globalobj.") {
                 s.push_str(&ctx.set_val(dst.0, &format!("ts_global_get({:?})", name)));
+                return;
+            }
+            // an ambient value: ReferenceError when the global object lacks it
+            if let Some(name) = builtin.strip_prefix("globalref.") {
+                s.push_str(&ctx.set_val(dst.0, &format!("ts_global_get_ref({:?})", name)));
                 return;
             }
             // `protoobj.<kind>`: not a function value but the runtime prototype

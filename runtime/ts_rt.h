@@ -1006,6 +1006,8 @@ void ts_install_object_proto(tsv proto);
 void ts_global_this_init(void);
 tsv  ts_global_this(void);
 tsv  ts_global_get(const char* name);
+tsv ts_global_get_ref(const char* name);
+void ts_global_assign_ref(const char* name, tsv val);
 void ts_global_set(const char* name, tsv val);
 void ts_global_var_decl(const char* name);
 void ts_set_cstr(tsv obj, const char* name, tsv val);

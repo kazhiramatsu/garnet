@@ -7365,3 +7365,26 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   protect mode, with zapping, and with a minor collection every 256
   allocations, its 78 output files identical. A/B against `at`, sixteen
   ABBA pairs: wall 0.9962, instructions 0.9999, cycles 0.9965: neutral.
+- The environment's values (silent wrong values; found preparing the tsc-ts
+  host, whose sources read Node's `process` and `Buffer` globals): an
+  identifier naming an ambient declaration (`declare var`, `declare
+  global { ... }`, `declare namespace`, a `.d.ts` file other than the
+  default library) read a local nothing assigns (undefined), wrote that
+  local, and was a captured cell in closures; `declare global` was even
+  materialized as a namespace object. Now such reads and writes go to the
+  global object, as V8 resolves them: reading one the global object lacks
+  is a ReferenceError ("X is not defined") except under `typeof`, and so
+  is a strict assignment to one (`globalref.X`, `global.assignRef:X`);
+  ambient statements bind nothing at module scope, hoist no `var`, and
+  build no namespace. The compiler reads `process`, `require`,
+  `__filename`, `Buffer`, `Intl`, `setTimeout`, ... through it on paths
+  its native run does not take. Fixture `toplevel/ambient_globals` (reads,
+  calls, writes, updates from a function, a deleted global, a missing one);
+  known rows for the frozen emitter. Gates: unit, parity (367 identical),
+  bundler 42/42, selfconf, GC stress, inline policy, conformance 512/512
+  and 512/512 with a collection at every allocation in protect mode; tsc
+  rebuilt (`native_s350ag`; its C differs mostly in renumbered fields) and
+  compiled under protect mode, with zapping, and with a minor collection
+  every 256 allocations, its 78 output files identical. A/B against `tc`,
+  sixteen ABBA pairs: wall 1.0000, instructions 0.9999, cycles 0.9994:
+  neutral.

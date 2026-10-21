@@ -3129,6 +3129,25 @@ void ts_global_set(const char* name, tsv val){
   ts_global_this_init();
   ts_set_cstr(g_global_this_v, name, val);
 }
+/* An identifier that names a value of the environment (an ambient
+   declaration) resolves to the global object's property: reading or (strict)
+   assigning one that is not there is a ReferenceError, as for any
+   unresolvable reference. */
+static void ts_throw_not_defined(const char* name);
+tsv ts_global_get_ref(const char* name){
+  ts_global_this_init();
+  ts_key key = ts_intern_field(name, (uint32_t)strlen(name));
+  if (!ts_has_prop(g_global_this_v, key)) ts_throw_not_defined(name);
+  return ts_get(g_global_this_v, key);
+}
+void ts_global_assign_ref(const char* name, tsv val){
+  ts_global_this_init();
+  ts_key key = ts_intern_field(name, (uint32_t)strlen(name));
+  ts_gc_root(&val);
+  if (!ts_has_prop(g_global_this_v, key)) ts_throw_not_defined(name);
+  ts_set(g_global_this_v, key, val);
+  ts_gc_unroot(1);
+}
 void ts_global_var_decl(const char* name){
   ts_global_this_init();
   if (!name) return;
@@ -9192,6 +9211,10 @@ static tsv ts_error_proto_tostring(tsv* args, int n){
 }
 enum { TS_ERR_ERROR=0, TS_ERR_TYPE, TS_ERR_RANGE, TS_ERR_SYNTAX, TS_ERR_REFERENCE,
        TS_ERR_EVAL, TS_ERR_URI, TS_ERR_AGGREGATE, TS_ERR_KINDS };
+static void ts_throw_not_defined(const char* name){
+  char buf[200]; snprintf(buf, sizeof buf, "%s is not defined", name);
+  ts_throw(ts_new_error(TS_ERR_REFERENCE, ts_new_string(buf, (uint32_t)strlen(buf))));
+}
 static const char* const TS_ERROR_NAMES[TS_ERR_KINDS] = {
   "Error", "TypeError", "RangeError", "SyntaxError",
   "ReferenceError", "EvalError", "URIError", "AggregateError"

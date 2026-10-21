@@ -63,6 +63,9 @@ const TYPED_ARRAY_ELEMS: ReadonlyMap<string, number> = new Map([
   ["Int32Array", 5], ["Uint32Array", 6], ["Float32Array", 7], ["Float64Array", 8],
 ]);
 const TYPED_ARRAY_BYTES = [1, 1, 1, 2, 2, 4, 4, 4, 8];
+/** NodeFlags.Ambient (internal in the public typings): set on every node in an
+ *  ambient context (a .d.ts file, `declare`, `declare global`). */
+const AMBIENT_NODE_FLAG = (ts.NodeFlags as unknown as { Ambient: number }).Ambient;
 
 const STRICT_TYPE_OPTION_NAMES: StrictTypeOptionName[] = [
   "noImplicitAny",
@@ -881,6 +884,17 @@ class Exporter {
     if (declarationOrder !== undefined && useOrder !== undefined && declarationOrder < useOrder) return false;
     return this.cyclicModules.has(useSf) && this.cyclicModules.has(declSf);
   }
+  /** The environment's value an identifier names (an ambient declaration): the
+   *  global object's property, a ReferenceError when it is not there, except as
+   *  the operand of `typeof`. */
+  loadEnvironmentValue(ctx: FnCtx, id: ts.Identifier): number {
+    let e: ts.Node = id;
+    while (ts.isParenthesizedExpression(e.parent)) e = e.parent;
+    if (ts.isTypeOfExpression(e.parent)) return this.loadGlobalObjectProperty(ctx, id.text);
+    const dst = this.newLocal(ctx, "reference", id.text);
+    ctx.body.push({ kind: "LoadBuiltinFn", dst, builtin: `globalref.${id.text}` });
+    return dst;
+  }
   loadGlobalObjectProperty(ctx: FnCtx, name: string): number {
     const dst = this.newLocal(ctx, "reference", name);
     ctx.body.push({ kind: "LoadBuiltinFn", dst, builtin: `globalobj.${name}` });
@@ -1638,7 +1652,7 @@ class Exporter {
     };
     walk(sf);
     for (const stmt of sf.statements) {
-      if (ts.isVariableStatement(stmt)) {
+      if (ts.isVariableStatement(stmt) && !(stmt.flags & AMBIENT_NODE_FLAG)) {
         for (const d of stmt.declarationList.declarations) {
           if (ts.isIdentifier(d.name)) {
             const s = this.symbolOf(d.name);
@@ -1819,9 +1833,10 @@ class Exporter {
         const symbol = this.symbolOf(n);
         const binding = symbol && this.namespaceBindings.get(symbol);
         const s = binding ? this.symbolOf(binding.namespace) : symbol;
-        if (s && this.isScriptGlobalVarSymbol(s, n.text)) {
-          // Script top-level var bindings are runtime global-object properties,
-          // not closure cells. Reads/writes lower to globalThis.<name>.
+        if (s && (this.isScriptGlobalVarSymbol(s, n.text) || this.isAmbientValueSymbol(s))) {
+          // Script top-level var bindings and the environment's values are
+          // runtime global-object properties, not closure cells. Reads/writes
+          // lower to globalThis.<name>.
         } else if (s && !decl.has(s) &&
                    (!this.funcSymbols.has(s) ||
                     ((this.nestedFuncSymbols.has(s) || this.namespaceFuncSymbols.has(s)) &&
@@ -2966,6 +2981,9 @@ class Exporter {
 
   private isValueNamespace(stmt: ts.ModuleDeclaration): boolean {
     if (!ts.isIdentifier(stmt.name)) return false;
+    // `declare global` / `declare namespace`: the environment provides the
+    // values, nothing is built here
+    if (stmt.flags & AMBIENT_NODE_FLAG) return false;
     if (!stmt.body || !ts.isModuleBlock(stmt.body)) return false;
     return stmt.body.statements.some((s) =>
       (ts.isFunctionDeclaration(s) && !!s.body) ||
@@ -6612,12 +6630,22 @@ class Exporter {
     // opcodes + GLOBALS[] infra remain in the IR/runtime for the
     // GlobalEnvironment record (globalThis, host globals) — they just have no
     // producer for module bindings.
-    // Any other value of the default library (`Intl`, `WeakRef`, ...) is a
-    // property of the global object: read it there (undefined when the runtime
-    // does not model it) rather than from a local nothing assigns.
-    if (sym && this.isDefaultLibSymbol(sym)) return this.loadGlobalObjectProperty(ctx, node.text);
+    // Any other value the environment provides (the default library's `Intl`,
+    // `WeakRef`, ...; a host's `declare var` or `declare global`) is a property
+    // of the global object: read it there (undefined when nothing defines it)
+    // rather than from a local nothing assigns.
+    if (sym && (this.isDefaultLibSymbol(sym) || this.isAmbientValueSymbol(sym))) return this.loadEnvironmentValue(ctx, node);
     if (sym) return this.ensureLocal(ctx, sym, this.refKindOf(node), node.text);
     return this.newLocal(ctx, this.refKindOf(node), node.text);
+  }
+  /** A value the environment provides: a variable, function or class whose
+   *  every declaration is ambient (a .d.ts file, `declare`, `declare global`). */
+  isAmbientValueSymbol(sym: ts.Symbol | undefined): boolean {
+    if (!sym || (sym.flags & ts.SymbolFlags.Alias)) return false;
+    if (!(sym.flags & (ts.SymbolFlags.Variable | ts.SymbolFlags.Function | ts.SymbolFlags.Class | ts.SymbolFlags.ValueModule))) return false;
+    const decls = sym.declarations;
+    return !!decls && decls.length > 0 &&
+      decls.every((d) => d.getSourceFile().isDeclarationFile || (ts.getCombinedNodeFlags(d) & AMBIENT_NODE_FLAG) !== 0);
   }
   /** A symbol declared only in the default library files (lib.*.d.ts). */
   isDefaultLibSymbol(sym: ts.Symbol): boolean {
@@ -11128,6 +11156,11 @@ class Exporter {
         this.storeGlobalObjectProperty(ctx, lhs.text, rhs);
       } else if (this.globalObjectValueName(lhs.text) !== undefined && this.isAmbientGlobalSymbol(sym)) {
         this.storeGlobalObjectProperty(ctx, lhs.text, rhs);
+      } else if (this.isAmbientValueSymbol(sym)) {
+        // a value the environment provides lives on the global object (strict:
+        // assigning one that is not there is a ReferenceError)
+        ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"),
+          builtin: `global.assignRef:${lhs.text}`, args: [rhs] });
       } else if (this.isLexicalTdzUse(lhs, sym)) {
         this.unsupported(lhs, `TDZ write of '${lhs.text}' before initialization`);
       } else if (sym && this.hasCaptured(ctx, sym)) {
@@ -12188,6 +12221,9 @@ class Exporter {
     // and loop (not into other functions) and hoisted once, at the prologue.
     const collectVars = (n: ts.Node) => {
       if (isFunctionLike(n) || ts.isClassDeclaration(n) || ts.isClassExpression(n)) return;
+      // an ambient `var` (`declare var`, `declare global`) binds nothing here:
+      // the environment provides it on the global object
+      if (n.flags & AMBIENT_NODE_FLAG) return;
       if (ts.isVariableStatement(n)) {
         const flags = n.declarationList.flags;
         if (!(flags & ts.NodeFlags.Let) && !(flags & ts.NodeFlags.Const))
@@ -12196,6 +12232,7 @@ class Exporter {
       n.forEachChild(collectVars);
     };
     const collect = (n: ts.Node) => {
+      if (n.flags & AMBIENT_NODE_FLAG) return;
       // A function DECLARATION at this level is hoisted (record it, then do NOT
       // descend — its body is a separate scope). Check this BEFORE the generic
       // function-like early-return, since a FunctionDeclaration is function-like.
@@ -13508,7 +13545,8 @@ class Exporter {
     // top-level function/class names) across EVERY module. These are owned by the
     // single __module_init (rolldown-style scope hoisting into one scope).
     for (const sf of this.modules) for (const stmt of sf.statements) {
-      if (ts.isVariableStatement(stmt) && ts.isSourceFile(stmt.parent)) {
+      // `declare var` binds nothing in the module: the environment's global
+      if (ts.isVariableStatement(stmt) && ts.isSourceFile(stmt.parent) && !(stmt.flags & AMBIENT_NODE_FLAG)) {
         const isVar =
           !(stmt.declarationList.flags & ts.NodeFlags.Let) &&
           !(stmt.declarationList.flags & ts.NodeFlags.Const);
@@ -13584,6 +13622,7 @@ class Exporter {
       (stmt): stmt is ts.FunctionDeclaration => ts.isFunctionDeclaration(stmt) && !!stmt.body,
     );
     const needsModuleInitFor = (stmt: ts.Statement): boolean => {
+      if (stmt.flags & AMBIENT_NODE_FLAG) return false;   // declarations of the environment's values
       if (ts.isFunctionDeclaration(stmt)) return this.sourceMode === "script" && !!stmt.body;
       if (ts.isClassDeclaration(stmt)) return true;
       if (ts.isInterfaceDeclaration(stmt)) return false;
@@ -13602,6 +13641,7 @@ class Exporter {
     // so symbol/position resolution stays per-module-correct.
     const moduleStmts: ts.Statement[] = [];
     for (const stmt of allTopStmts) {
+      if (stmt.flags & AMBIENT_NODE_FLAG) continue;
       if (ts.isFunctionDeclaration(stmt)) {
         if (stmt.body && (this.sourceMode === "script" || needsModuleInit)) moduleStmts.push(stmt);
         continue;

@@ -208,3 +208,5 @@ selfconf-unported	stdlib/atomics	Frozen emitter lacks the Atomics and typed arra
 parity-unported	stdlib/text_codecs	Frozen emitter lacks the typed array and text codec builtins (typedarray.new:N, textencoder.new, textdecoder.new, docs/text_codecs_design.md); the Rust output matches V8.
 selfconf-unported	stdlib/text_codecs	Frozen emitter lacks the typed array and text codec builtins (docs/text_codecs_design.md); native Rust output matches V8.
 parity-unported	numbers/to_exponential	Frozen emitter lacks the number.toExponential builtin; the Rust output matches V8 (the frozen selfconf route reaches the runtime prototype method and passes).
+parity-unported	toplevel/ambient_globals	Frozen emitter lacks the checked global reads and assignments of the environment's values (globalref.X, global.assignRef:X); the Rust output matches V8.
+selfconf-unported	toplevel/ambient_globals	Frozen emitter lacks the checked global reads and assignments (globalref.X, global.assignRef:X); native Rust output matches V8.
