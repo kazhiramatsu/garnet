@@ -46,3 +46,95 @@ reads at the same sites (a key added to the prototype, a relinked
 prototype, an accessor defined on the chain, a proxy in the chain, a
 dictionary prototype), run under GC stress. Measure `links_objects` and the
 compiler A/B; keep it only if the compiler does not lose.
+
+## Implementation (option B, as built)
+
+**Record.** A read site's `ts_prop_ic` keeps its absent record in the bytes
+a store site uses for its addition record (`add_*`,
+`docs/site_add_transition_design.md`): an anonymous union, so the cache
+stays 80 bytes and no static data is added (49.5k of the compiler's 57.6k
+caches are read sites, which never used those bytes). The record holds the
+key, two receiver shape words, the chain's depth and up to three prototype
+shape words. `rec_epoch`, outside the union, is the epoch of the addition
+cache for an addition and the same epoch with `TS_ABSENT_EPOCH_TAG` (bit
+31) set for an absent read, so neither check accepts the other's record,
+whatever a cache was used for. The epoch now saturates below that bit
+instead of wrapping: the sites' records cannot all be cleared, so once it
+is exhausted nothing is filled and nothing matches any more (the old wrap
+cleared the global addition table only, and the per-site addition records
+and the absent table could match stale entries after 2^32 moves).
+
+**Check.** `prop_absent_site_hit` (`ts_rt.c`) validates the record as the
+table validates its entries: the key and the epoch first (most records are
+empty or stale), then a plain object (`TS_KIND_OBJECT`; the array's
+virtual `length` is why) whose shape word is one of the two, each current
+prototype link a plain object with the recorded shape word, and the chain
+ending after the last one. It runs at the top of `ts_get_pic_checked` as a
+leaf (no frame, no saved registers: seven instructions when the record does
+not apply), in front of the slow read, now `ts_get_pic_checked_slow`,
+reached by a tail jump. Every read helper's miss path already ends in that
+call, the lazily linked ones through `ts_get_linked`, so no read site gains
+code: `__text` +716 bytes, all in the runtime.
+
+**Fill.** The slow read copies a verified entry into the site's record
+where it answers from the global table and where it fills the table (plain
+objects only: the table also serves named reads on arrays). A record stays
+for its epoch: a second receiver shape with the same key and chain joins it
+once, and any other absent read of the site is left to the table. The two
+shapes are independent facts (a shape fixes the receiver's own keys, the
+chain's shape words the inherited ones), so a record is sound for either
+shape under its chain. `TSAOT_ABSENT_SITE=0` fills no record;
+`TSAOT_NEGATIVE_PIC=0` disables the table and the records.
+
+**Variants measured and dropped.**
+
+- The check in line after every read helper's probe: the kernel 1% faster
+  than the leaf, about 45 instructions of code at each of 49.5k read sites
+  (the `x63` per-site entries cost 6.6 MB of `__TEXT` for the same reason).
+- In line only in the reads of lazily linked frames, before they link
+  (3.2k sites): `__text` +842 KB (2.2%); compiler cycles 1.0093 against
+  `ih`, eight pairs, none faster.
+- Records replaced on every table hit (the latest shape wins): 2.6M record
+  rewrites per compile at sites with more than two absent shapes; compiler
+  cycles 1.0034 (leaf only). The sticky records answer 3.34M of the 5.43M
+  absent reads per compile instead of 2.80M.
+
+## Measurements
+
+Kernel `links_objects`: 39.0M absent reads, all answered by the records
+(slow reads 39.0M -> 18); against the previous runtime, eight alternating
+runs: cycles 0.921, instructions 0.898, wall 466 -> 427 ms.
+
+Compiler (one compile of the compiler project with emit, runtime
+statistics): 5.43M absent reads, 3.34M answered by the records, 2.06M by
+the table, 24k walked; slow reads 7.0M -> 3.67M. A/B against `ih` (the same
+compiler object relinked; the header's in-line code is unchanged), sixteen
+ABBA pairs: cycles 0.9996 (lower in 9 of 16), instructions 0.9996 (16 of
+16), wall 1.0000. An A/A of `ih` read cycles 0.9990, wall 0.9975: neutral,
+as expected from 5.4M absent reads in a 17G-cycle compile.
+
+What remains on the kernel is the chain walk itself: a check without it
+(unsound, measured only) gives cycles 0.828 against 0.921. Option C (a
+validity cell for the chain, an O(1) test) would take about another 10% of
+the kernel, and about nothing on the compiler.
+
+## Verification
+
+Fixture `objects/absent_site_records` (in the GC stress filter): three
+receiver shapes over one chain with the prototype gaining the key, an
+accessor and a data property again, then losing it; the lazily linked
+readers with a key on the prototype, an own key and a relinked receiver;
+method calls whose field read is absent, an own field shadowing the method
+and the prototypes' methods replaced; one dynamic-key site with alternating
+keys; a plain object and an array with the same own keys and chain at one
+dynamic-key site (`length`); a proxy and a function inserted into the
+chain; frozen and sealed receivers, a prototype turned into a dictionary;
+collections between the reads; static-slot reads of receivers of another
+layout; `Object.prototype` gaining and losing the key, last (a deletion
+leaves a prototype in dictionary mode, which nothing records afterwards, so
+every case has prototypes of its own). The records answer 16k reads of the
+run. Built against runtimes with one test removed, the fixture fails without
+the chain walk (seven cases), without the key test (the dynamic site) and
+without the receiver's kind test (the array); removing the epoch test, the
+end-of-chain test or the links' kind test alone is not observable, as a
+relink always moves the epoch (they are kept as defence in depth).

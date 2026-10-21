@@ -120,3 +120,7 @@ removed, it fails without the watched-shape move and without the shared
 epoch. Fixture `objects/fresh_proto_links`: the prototypes, tags and
 iteration of the objects now linked fresh, and additions to plain objects
 interleaved with them.
+
+Later in Session 350 the table's answers moved to the read sites without
+code at the sites: each read site's cache keeps one absent record that the
+out-of-line read checks first, as a leaf (`docs/absent_reads_inline_design.md`).

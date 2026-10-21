@@ -322,22 +322,41 @@ typedef struct {
   uint32_t shape;
   uint32_t slot;
 } ts_prop_ic_entry;
+/* A site's own record carries the epoch of the addition cache (ts_rt.c); a
+   read site's absent record carries it with this bit set, so a store's check
+   can never accept a read's record or the other way round. The epoch stays
+   below the bit (it saturates instead of wrapping). */
+#define TS_ABSENT_EPOCH_TAG 0x80000000u
 typedef struct {
   ts_prop_ic_entry entries[TS_PROP_IC_SIZE];
   uint8_t next;
   uint8_t misses;
   uint8_t megamorphic;
-  /* The addition this site last performed (docs/site_add_transition_design.md):
-     the receiver's shape word before and after, the slot (its length
-     before), the key, the epoch of the addition cache and the direct
-     prototype. The out-of-line store consults it before probing for an
-     existing key, so a constructor's field-by-field initialization costs one
-     compare sequence and the append. */
-  uint32_t add_shape_before, add_shape_after, add_slot, add_epoch;
-  ts_key add_key;
-  tsv add_proto;
+  uint8_t absent_depth;
+  /* The site's record: for a store, the addition it last performed
+     (docs/site_add_transition_design.md); for a read, the absent property it
+     last proved (docs/absent_reads_inline_design.md). rec_epoch is the epoch
+     of the addition cache, tagged with TS_ABSENT_EPOCH_TAG for an absent
+     record. */
+  uint32_t rec_epoch;
+  union {
+    /* The addition: the receiver's shape word before and after, the slot (its
+       length before), the key and the direct prototype. The out-of-line
+       store consults it before probing for an existing key, so a
+       constructor's field-by-field initialization costs one compare sequence
+       and the append. */
+    struct { uint32_t add_shape_before, add_shape_after, add_slot; ts_key add_key; tsv add_proto; };
+    /* The absent read: receivers with either shape word lack absent_key, and
+       so does every link of the prototype chain the out-of-line read walked:
+       absent_depth plain shaped objects with these shape words, then the end
+       of the chain. A second receiver shape with the same chain (a site that
+       sees two layouts of one class) takes absent_shape2, which repeats
+       absent_shape until then. */
+    struct { uint32_t absent_shape; ts_key absent_key; uint32_t absent_proto_shape[3]; uint32_t absent_shape2; };
+  };
 } ts_prop_ic;
 #define TS_PROP_IC_INIT {0}
+_Static_assert(sizeof(ts_prop_ic) == 80, "ts_prop_ic keeps its size: one per access site");
 #ifdef TSAOT_RT_STATS
 extern unsigned long long g_ts_pic_get_calls, g_ts_pic_get_hits;
 extern unsigned long long g_ts_slot_inline_hits, g_ts_slot_external_hits;

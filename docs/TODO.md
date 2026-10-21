@@ -7043,8 +7043,9 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
 - Next slices, in order. GC v2 Y1 is paused (Kaz, 2026-10-21, after
   `docs/gc_v2_design.md` §6.6.1: about 1-2% at most for a large refactor
   with silent-miscompile risk); handles stay. Back to the patterns slower
-  than V8 (pattern kernels, worst native/node ratio first). Absent reads in
-  line (`docs/absent_reads_inline_design.md`, option B). Frame elision,
+  than V8 (pattern kernels, worst native/node ratio first). Absent reads
+  from the site's record (`docs/absent_reads_inline_design.md`, option B):
+  done, see below; the two silent wrong values found there come first. Frame elision,
   round 2c: direct callees that never collect,
   non-allocating builtins and primitive comparisons; then measure how many
   calls of the remaining framed functions reach a point that needs the
@@ -7085,3 +7086,63 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   callbacks 3.9x, flags 3.9x, links objects 3.2x, constructors through
   function values 2.7x, arrays of objects 2.7x; constructor pre-sizing
   from layouts; local classes from declared types; C5b-2/3.
+- Absent reads from the site's record (`docs/absent_reads_inline_design.md`,
+  option B). A read site's inline cache keeps an absent record (the key,
+  two receiver shape words, the chain's depth and up to three prototype
+  shape words) in the bytes a store site uses for its addition record (a
+  union: the cache stays 80 bytes, no static data is added). The record's
+  epoch carries bit 31, so a store's check never accepts it nor a read's
+  check an addition; the epoch of the addition caches now saturates below
+  that bit instead of wrapping (the old wrap left the per-site addition
+  records and the absent table able to match stale entries after 2^32
+  moves). `ts_get_pic_checked` checks the record first, as a leaf (seven
+  instructions when it does not apply), with the table's validation (key,
+  epoch, a plain-object receiver with either shape, each current link's
+  shape, the chain's end), and tail-jumps to the slow read otherwise; every
+  read helper already ends in that call, so no read site gains code
+  (`__text` +716 bytes). The slow read fills the record where it answers
+  from or fills the table; a record stays for its epoch (a second shape with
+  the same chain joins once). `TSAOT_ABSENT_SITE=0` fills no record.
+  Dropped after measuring: the check in line after every probe (1% faster
+  on the kernel, ~45 instructions at each of 49.5k read sites); in line in
+  the lazily linked reads only (`__text` +842 KB, compiler cycles 1.0093);
+  records replaced on every table hit (2.6M rewrites per compile, cycles
+  1.0034). Kernel `links_objects`: 39.0M absent reads all answered by the
+  records (slow reads -> 18), cycles 0.921, instructions 0.898, wall 466 ->
+  427 ms. Compiler: of 5.43M absent reads per compile the records answer
+  3.34M, the table 2.06M; slow reads 7.0M -> 3.67M. A check without the
+  chain walk (unsound, measured only) gives kernel cycles 0.828: the walk is
+  what remains (option C, about 10% of the kernel, nothing on the
+  compiler). Fixture `objects/absent_site_records` (prototypes of its own
+  per case, since a deletion leaves a prototype in dictionary mode that
+  nothing records; the records answer 16k reads of the run; in the GC
+  stress filter): fails against runtimes without the chain walk, the key
+  test or the receiver's kind test (an array with a plain object's shape
+  and chain, `length`); known row: parity (fix #6 deletions, a loop-body
+  stack slot of the frozen emitter's legacy mode, one more root). Gates:
+  unit, parity (366 identical), bundler, selfconf, GC stress, inline
+  policy, conformance 500/500 and 500/500 with a collection at every
+  allocation in protect mode; tsc relinked (`native_s350as3`: the header's
+  in-line code is unchanged) and compiled under protect mode, with zapping,
+  with a minor collection every 256 allocations and with
+  `TSAOT_ABSENT_SITE=0`, its 78 output files identical to `ih`'s. A/B
+  against `ih`, sixteen ABBA pairs: cycles 0.9996 (9 of 16), instructions
+  0.9996 (16 of 16), wall 1.0000: neutral (an A/A of `ih`: cycles 0.9990).
+- Silent wrong values found while writing that fixture (both on HEAD
+  before it, not fixed yet; next):
+  (a) A function in a prototype chain hides its own `name`, `length` and
+  `prototype`: `Object.create(fn).name` reads undefined, `.length` 0
+  (Function.prototype's), `.prototype` undefined; `"name" in
+  Object.create(fn)` is false; an assignment to the inherited read-only
+  `name` or `length` creates an own property instead of throwing.
+  `lookup_prop_chain`, `ts_has_prop` and the inherited loop of
+  `ts_set_named_prop` look a function link up in its property map only;
+  only the receiver-is-a-function path of `ts_get` knows the virtual
+  properties. A class in the chain works (its static container).
+  (b) A typed `.length` read whose receiver is not statically an array or
+  a string is lowered to `GenericLen` (`ts_length`), which answers 0 for
+  any plain object: `interface Bag { length?: number }` reads 0 for `{}` and
+  for `{ length: 5 }` (V8: undefined, 5); `ArrayLike` values are the common
+  case. The exporter's `.length` lowering (`exporter.ts`, the
+  `builtinReceiverKind` switch) should keep the property read for object
+  types that are not strings, arrays or functions.
