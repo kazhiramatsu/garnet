@@ -7460,3 +7460,30 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   garnet 8.30 s; checking only (`--noEmit`), 2.29 s, 0.65 s and 5.25 s.
   garnet is 2.3-2.6x slower than V8 on this source (1.2x on tsc 6.0.3's)
   and 8x slower than scriptc: the next pattern work.
+- Structural values typed as classes (silent wrong values; found while
+  extending typed field access to tsc-ts's receivers): TypeScript types
+  classes structurally, so an object literal, an instance of an unrelated
+  class, an interface-typed or `any` value can be typed as a class without
+  private members, and a cast claims any type. Read through the class type
+  (a class-typed parameter whose callee is not inlined, a return, an array
+  element, a generic constrained by the class, an upcast) such a value took
+  the class's struct offsets (a literal with its keys in another order read
+  the other field) and the class's methods in place of its own. The class
+  extractor's new pass 3 finds where a value can acquire a class type
+  (every contextually typed expression matched by position, casts and type
+  guards as narrowings, type arguments against their constraints, flows
+  between classes of a hierarchy, ancestors) and marks the class unstable,
+  the existing fallback (`docs/foreign_receivers_design.md`, "Structural
+  values"); downcasts between classes stay trusted. `TSAOT_STRUCTURAL_LOG=1`
+  lists the marked classes with the flow's site: tsc-ts six (worker data
+  cast from `any`, two structurally swapped completion classes), the
+  TypeScript 6.0.3 compiler two, the self-hosted analyzer none. Fixture
+  `classes/structural_class_values` (wrong on fourteen of fifteen lines
+  before). Gates: unit, parity (369 identical), bundler 42/42, selfconf,
+  GC stress, inline policy, conformance 517/517, 517/517 under the strict
+  profile, and 517/517 with a collection at every allocation in protect
+  mode; tsc rebuilt (`native_s350sf`; 1139 lines of its C differ, the two
+  marked classes) and compiled under protect mode, with zapping, and with
+  a minor collection every 256 allocations, its 78 output files identical.
+  A/B against `nb`, sixteen ABBA pairs: wall 1.0012, instructions 1.0000,
+  cycles 1.0018: neutral.

@@ -73,3 +73,47 @@ Fixture `classes/foreign_receivers` (the cases above through typed and
 `unsized_with_class_proto` and `proxy` fixtures; conformance, parity
 (old text under the knob), unit, GC stress, bundler; A/B of the compiler
 (the flag stays down there: no relinking of class prototypes).
+
+## Structural values (session 350, `exporter/class_extract.ts` pass 3)
+
+The receivers above are foreign at run time. TypeScript makes another kind
+legal statically: classes are typed structurally, so an object literal, an
+instance of an unrelated class or an interface-typed value is assignable to
+a class type without private members, and `any`, `unknown` and casts admit
+anything. Such a value read through the class type took a struct offset (a
+literal with its keys in another order gave another field's value) or the
+class's method in place of its own (silent wrong values; fixture
+`classes/structural_class_values`, wrong on fourteen of its fifteen lines
+before).
+
+The class extractor now finds where a value can acquire a class type and
+marks the class unstable (the existing fallback: its receivers take the
+dynamic paths):
+
+- every contextually typed expression (an initializer, an assignment, an
+  argument, a return, a property or element of a literal, a default): its
+  own type against the contextual type, matched by position (union members
+  one by one, a class target against the source as a whole, object targets
+  property by property, type arguments argument by argument); `any` or
+  `unknown`, a non-class type assignable to the class, or an unrelated class
+  assignable to it seeds the class. A literal itself is checked against the
+  classes at the top of its contextual type only (its elements are checked
+  one by one); an empty library container (`new Map()`, whose zero-argument
+  signature says `Map<any, any>`) holds nothing yet; the operands of `??`,
+  `||`, `&&`, `,` and the branches of `?:` are checked themselves.
+- casts and type guards narrow: any non-class source seeds the target, a
+  union narrowed to a member related to the target excludes the other
+  members, and a double cast through `unknown` or `any` reads what it
+  reinterprets (`this as unknown as IndexType` is a downcast).
+- type arguments (inferred or explicit, of calls, `new` and heritage
+  clauses) against their parameters' constraints, so a value typed as a
+  type parameter constrained by a class is an instance of it.
+- flows between classes of one hierarchy (an upcast or a downcast) carry a
+  marked class's values along, and a marked class marks its ancestors (an
+  inherited method reads its `this` as the ancestor).
+
+Downcasts between classes stay trusted, as before. `TSAOT_STRUCTURAL_LOG=1`
+prints each marked class, its reason and the flow's site. Marked: tsc-ts six
+classes (worker data cast from `any`, two structurally swapped completion
+classes), the TypeScript 6.0.3 compiler two (casts from interface types),
+the self-hosted analyzer none.

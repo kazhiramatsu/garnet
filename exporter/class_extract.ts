@@ -358,6 +358,329 @@ export class ClassExtractor {
     visit(sf);
   }
 
+  // ----- pass 3: structural flows -----
+  // TypeScript types classes structurally: an object literal, an instance of
+  // an unrelated class, or an interface-typed value is assignable to a class
+  // type without private members, and `any`, `unknown` and casts admit any
+  // value. A typed field access is a struct offset and a call on a
+  // class-typed receiver is bound to the class's method, so such a value read
+  // through the class type yielded another field's value or ran the wrong
+  // method (silent wrong values). A class such a value can reach is marked
+  // unstable: its receivers take the dynamic paths. Reached means: a flow
+  // into a position typed with the class (an initializer, an assignment, an
+  // argument, a return, a property or element of a literal, a default: every
+  // contextually typed expression; a cast; a type guard; a type argument
+  // against its parameter's constraint), then on from there through flows
+  // between classes (an upcast or a downcast carries the value along) and to
+  // the ancestors (an inherited method reads its `this` as the ancestor).
+  private flowSeed = new Map<number, string>();
+  private flowEdges = new Map<number, Set<number>>();
+  private leafCache = new Map<ts.Type, Map<number, ts.Type>>();
+
+  /** The class (instance type, not `typeof C`) a type names, if any. */
+  private classIdOfInstanceType(t: ts.Type): number | undefined {
+    const id = this.idOfClassSymbol(t.getSymbol());
+    if (id === undefined) return undefined;
+    return t.getConstructSignatures().length > 0 ? undefined : id;
+  }
+  /** The classes a value of type `t` may be read as: `t`, union and
+   *  intersection members, type arguments (arrays, tuples, generic types) and,
+   *  two levels deep, property types of other object types; a type parameter
+   *  by its constraint. Class id -> a representative instance type. */
+  private classLeaves(t: ts.Type): Map<number, ts.Type> {
+    const hit = this.leafCache.get(t);
+    if (hit) return hit;
+    const out = new Map<number, ts.Type>();
+    this.leafCache.set(t, out);
+    const seen = new Set<ts.Type>();
+    const walk = (u: ts.Type, depth: number): void => {
+      if (seen.has(u) || depth > 3) return;
+      seen.add(u);
+      if (u.isUnionOrIntersection()) { for (const m of u.types) walk(m, depth); return; }
+      if (u.flags & ts.TypeFlags.TypeParameter) {
+        const c = u.getConstraint();
+        if (c) walk(c, depth);
+        return;
+      }
+      const id = this.classIdOfInstanceType(u);
+      if (id !== undefined) { if (!out.has(id)) out.set(id, u); return; }
+      if (!(u.flags & ts.TypeFlags.Object)) return;
+      if (((u as ts.ObjectType).objectFlags & ts.ObjectFlags.Reference) !== 0) {
+        for (const a of this.checker.getTypeArguments(u as ts.TypeReference)) walk(a, depth + 1);
+      }
+      if (depth >= 2) return;
+      for (const p of this.checker.getPropertiesOfType(u)) {
+        if (p.flags & ts.SymbolFlags.Method) continue;
+        let pt: ts.Type;
+        try { pt = this.checker.getTypeOfSymbol(p); } catch { continue; }
+        walk(pt, depth + 1);
+      }
+    };
+    walk(t, 0);
+    return out;
+  }
+  private isAncestorClass(a: number, c: number): boolean {
+    for (let cur = this.classes[c].parentId; cur !== undefined; cur = this.classes[cur].parentId) {
+      if (cur === a) return true;
+    }
+    return false;
+  }
+  private relatedClasses(a: number, b: number): boolean {
+    return a === b || this.isAncestorClass(a, b) || this.isAncestorClass(b, a);
+  }
+  /** ` at file:line` for the structural flow log. */
+  private flowSite(n: ts.Node): string {
+    if (process.env.TSAOT_STRUCTURAL_LOG !== "1") return "";
+    const sf = n.getSourceFile();
+    return ` at ${sf.fileName.split("/").slice(-2).join("/")}:${sf.getLineAndCharacterOfPosition(n.getStart()).line + 1}`;
+  }
+  private seedFlow(c: number, reason: string): void {
+    if (!this.flowSeed.has(c)) this.flowSeed.set(c, reason);
+  }
+  private flowEdge(d: number, c: number): void {
+    let e = this.flowEdges.get(d);
+    if (!e) this.flowEdges.set(d, (e = new Set()));
+    e.add(c);
+  }
+  private flowDone = new Set<string>();
+  /** A value of type `s` flows into a position of type `t` (`kind` "flow":
+   *  TypeScript checked `s` assignable to `t`; "cast" and "guard" narrow: the
+   *  value is claimed to be a `t`). Matched by position: union members one by
+   *  one, a class target against the source as a whole, other object targets
+   *  property by property, type arguments argument by argument. */
+  private flowInto(s: ts.Type, t: ts.Type, kind: string, at: ts.Node, depth: number): void {
+    if (s === t || depth > 4) return;
+    if (this.classLeaves(t).size === 0) return;
+    const sid = (s as unknown as { id?: number }).id, tid = (t as unknown as { id?: number }).id;
+    const memo = sid !== undefined && tid !== undefined ? `${sid}:${tid}:${kind}` : undefined;
+    if (memo !== undefined) { if (this.flowDone.has(memo)) return; this.flowDone.add(memo); }
+    const narrows = kind !== "flow";
+    if (s.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) {
+      for (const c of this.classLeaves(t).keys()) this.seedFlow(c, `${kind}: any${this.flowSite(at)}`);
+      return;
+    }
+    if (s.flags & (ts.TypeFlags.Undefined | ts.TypeFlags.Null | ts.TypeFlags.Void | ts.TypeFlags.Never)) return;
+    if (s.flags & ts.TypeFlags.TypeParameter) {
+      const c = s.getConstraint();
+      if (c) this.flowInto(c, t, kind, at, depth);
+      else if (narrows) for (const k of this.classLeaves(t).keys()) this.seedFlow(k, `${kind}: ${this.checker.typeToString(s)}${this.flowSite(at)}`);
+      return;
+    }
+    if (s.isUnion()) {
+      let members = s.types;
+      // A cast or a guard picks the target out of a union: the members
+      // unrelated to the target's classes are the alternatives it excludes.
+      if (narrows) {
+        const tcs = this.topClasses(t);
+        const related = members.filter((m) => {
+          const d = this.classIdOfInstanceType(m);
+          return d !== undefined && tcs.some((c) => this.relatedClasses(d, c));
+        });
+        if (related.length > 0) members = related;
+      }
+      for (const m of members) this.flowInto(m, t, kind, at, depth);
+      return;
+    }
+    if (s.isIntersection()) {
+      // a value of `T & C` is a C (an `instanceof` narrowing of a type parameter)
+      const cls = s.types.filter((m) => this.classIdOfInstanceType(m) !== undefined);
+      if (cls.length > 0) { for (const m of cls) this.flowInto(m, t, kind, at, depth); return; }
+    }
+    if (t.isUnionOrIntersection()) {
+      for (const m of t.types) this.flowInto(s, m, kind, at, depth);
+      return;
+    }
+    if (t.flags & ts.TypeFlags.TypeParameter) {
+      const c = t.getConstraint();
+      if (c) this.flowInto(s, c, kind, at, depth);
+      return;
+    }
+    const c = this.classIdOfInstanceType(t);
+    if (c !== undefined) {
+      const d = this.classIdOfInstanceType(s);
+      if (d !== undefined) {
+        if (d === c) return;
+        if (this.relatedClasses(d, c)) { this.flowEdge(d, c); return; }
+        if (narrows || this.checker.isTypeAssignableTo(s, t)) {
+          this.seedFlow(c, `${kind}: class ${this.classes[d].name}${this.flowSite(at)}`);
+        }
+        return;
+      }
+      if (narrows || this.checker.isTypeAssignableTo(s, t)) {
+        this.seedFlow(c, `${kind}: ${this.checker.typeToString(s)}${this.flowSite(at)}`);
+      }
+      return;
+    }
+    if (!(t.flags & ts.TypeFlags.Object) || !(s.flags & ts.TypeFlags.Object)) return;
+    const isRef = (u: ts.Type) => (((u as ts.ObjectType).objectFlags & ts.ObjectFlags.Reference) !== 0);
+    if (isRef(t) && isRef(s)) {
+      const targs = this.checker.getTypeArguments(t as ts.TypeReference);
+      const sargs = this.checker.getTypeArguments(s as ts.TypeReference);
+      const same = (s as ts.TypeReference).target === (t as ts.TypeReference).target;
+      for (let j = 0; j < targs.length; j++) {
+        if (this.classLeaves(targs[j]).size === 0) continue;
+        if (same) { if (j < sargs.length) this.flowInto(sargs[j], targs[j], kind, at, depth + 1); }
+        else for (const a of sargs) this.flowInto(a, targs[j], kind, at, depth + 1);
+      }
+    }
+    for (const tp of this.checker.getPropertiesOfType(t)) {
+      if (tp.flags & ts.SymbolFlags.Method) continue;
+      let tpt: ts.Type;
+      try { tpt = this.checker.getTypeOfSymbol(tp); } catch { continue; }
+      if (this.classLeaves(tpt).size === 0) continue;
+      const sp = this.checker.getPropertyOfType(s, tp.name);
+      if (!sp) continue;
+      let spt: ts.Type;
+      try { spt = this.checker.getTypeOfSymbol(sp); } catch { continue; }
+      this.flowInto(spt, tpt, kind, at, depth + 1);
+    }
+    const tix = this.checker.getIndexTypeOfType(t, ts.IndexKind.String);
+    if (tix && this.classLeaves(tix).size > 0) {
+      const six = this.checker.getIndexTypeOfType(s, ts.IndexKind.String);
+      if (six) this.flowInto(six, tix, kind, at, depth + 1);
+      for (const sp of this.checker.getPropertiesOfType(s)) {
+        if (sp.flags & ts.SymbolFlags.Method) continue;
+        try { this.flowInto(this.checker.getTypeOfSymbol(sp), tix, kind, at, depth + 1); } catch { /* skip */ }
+      }
+    }
+  }
+  /** `new Map()` and the like: a library container constructed empty holds
+   *  no value yet (its zero-argument signature says `Map<any, any>`). */
+  private emptyLibraryValue(n: ts.Node): boolean {
+    if (!ts.isNewExpression(n) || (n.arguments !== undefined && n.arguments.length > 0)) return false;
+    const sym = this.checker.getTypeAtLocation(n).getSymbol();
+    const decls = sym?.getDeclarations() ?? [];
+    return decls.length > 0 && decls.every((d) => d.getSourceFile().isDeclarationFile);
+  }
+  /** The classes `t` names at its top level (itself or a union member). */
+  private topClasses(t: ts.Type): number[] {
+    const out: number[] = [];
+    for (const m of t.isUnion() ? t.types : [t]) {
+      const c = this.classIdOfInstanceType(m);
+      if (c !== undefined) out.push(c);
+    }
+    return out;
+  }
+  /** The expression a cast reinterprets: through the `as unknown` / `as any`
+   *  steps of a double cast (`e as unknown as C` reinterprets `e`). */
+  private castSource(e: ts.Expression): ts.Expression {
+    let cur = e;
+    for (;;) {
+      while (ts.isParenthesizedExpression(cur)) cur = cur.expression;
+      if ((ts.isAsExpression(cur) || ts.isTypeAssertionExpression(cur)) &&
+          (cur.type.kind === ts.SyntaxKind.UnknownKeyword || cur.type.kind === ts.SyntaxKind.AnyKeyword)) {
+        cur = cur.expression;
+        continue;
+      }
+      return cur;
+    }
+  }
+  private scanStructuralFlows(sf: ts.SourceFile): void {
+    const checker = this.checker;
+    const typeArgs = (n: ts.CallExpression | ts.NewExpression): void => {
+      let sig: ts.Signature | undefined;
+      try { sig = checker.getResolvedSignature(n); } catch { return; }
+      if (!sig) return;
+      const args = checker.getTypeArgumentsForResolvedSignature(sig);
+      if (!args || args.length === 0) return;
+      const gen = sig.declaration && !ts.isJSDocSignature(sig.declaration) ? checker.getSignatureFromDeclaration(sig.declaration) : undefined;
+      const params = gen?.getTypeParameters() ?? (sig as { target?: ts.Signature }).target?.getTypeParameters();
+      if (!params) return;
+      for (let i = 0; i < params.length && i < args.length; i++) {
+        const c = params[i].getConstraint();
+        if (c) this.flowInto(args[i], c, "flow", n, 0);
+      }
+    };
+    const visit = (n: ts.Node): void => {
+      try {
+        // (a cast's operand is contextually typed by the cast's type: the
+        // cast check below reads what it reinterprets)
+        const castOperand = n.parent !== undefined && (ts.isAsExpression(n.parent) || ts.isTypeAssertionExpression(n.parent)) &&
+          n.parent.expression === n;
+        // (a property's or declaration's name is not a value; `{ x }` is)
+        const nameSlot = ts.isIdentifier(n) && n.parent !== undefined && !ts.isShorthandPropertyAssignment(n.parent) &&
+          (n.parent as { name?: ts.Node }).name === n;
+        // (the operands of `??`, `||`, `&&`, `,` and the branches of `?:` are
+        // contextually typed themselves; the whole adds nothing but its
+        // operands' union, an empty `new Map()`'s `Map<any, any>` included)
+        const passes = ts.isConditionalExpression(n) || (ts.isBinaryExpression(n) && (
+          n.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken || n.operatorToken.kind === ts.SyntaxKind.BarBarToken ||
+          n.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken || n.operatorToken.kind === ts.SyntaxKind.CommaToken));
+        if (ts.isExpression(n) && !ts.isParenthesizedExpression(n) && !castOperand && !nameSlot && !passes && !this.emptyLibraryValue(n)) {
+          const ct = checker.getContextualType(n);
+          if (ct && this.classLeaves(ct).size > 0) {
+            const st = checker.getTypeAtLocation(n);
+            // A literal's elements and properties are checked one by one (each
+            // is contextually typed); the literal itself is a new object that
+            // is not an instance of any class.
+            const literal = (ts.isObjectLiteralExpression(n) && !n.properties.some(ts.isSpreadAssignment)) ||
+              (ts.isArrayLiteralExpression(n) && !n.elements.some(ts.isSpreadElement));
+            if (literal) {
+              for (const c of this.topClasses(ct)) {
+                const ctype = (ct.isUnion() ? ct.types : [ct]).find((m) => this.classIdOfInstanceType(m) === c)!;
+                if (checker.isTypeAssignableTo(st, ctype)) this.seedFlow(c, `flow: ${checker.typeToString(st)}${this.flowSite(n)}`);
+              }
+            } else {
+              this.flowInto(st, ct, "flow", n, 0);
+            }
+          }
+        }
+        if (ts.isAsExpression(n) || ts.isTypeAssertionExpression(n)) {
+          this.flowInto(checker.getTypeAtLocation(this.castSource(n.expression)), checker.getTypeFromTypeNode(n.type), "cast", n, 0);
+        }
+        if (ts.isCallExpression(n) || ts.isNewExpression(n)) typeArgs(n);
+        if (ts.isExpressionWithTypeArguments(n) && n.typeArguments && n.typeArguments.length > 0) {
+          const bt = checker.getTypeAtLocation(n);
+          const params = (bt as { target?: ts.InterfaceType }).target?.typeParameters;
+          if (params && (((bt as ts.ObjectType).objectFlags & ts.ObjectFlags.Reference) !== 0)) {
+            const args = checker.getTypeArguments(bt as ts.TypeReference);
+            for (let i = 0; i < params.length && i < args.length; i++) {
+              const c = params[i].getConstraint();
+              if (c) this.flowInto(args[i], c, "flow", n, 0);
+            }
+          }
+        }
+        if (ts.isTypePredicateNode(n) && n.type) {
+          const fn = n.parent;
+          const guarded = ts.isIdentifier(n.parameterName) && ts.isFunctionLike(fn)
+            ? fn.parameters.find((p) => ts.isIdentifier(p.name) && p.name.text === (n.parameterName as ts.Identifier).text)
+            : undefined;
+          let from: ts.Type | undefined;
+          if (guarded) from = checker.getTypeAtLocation(guarded.name);
+          else if (n.parameterName.kind === ts.SyntaxKind.ThisType) {
+            const cls = ts.findAncestor(fn, ts.isClassLike);
+            if (cls) { const id = this.byNode.get(cls); if (id !== undefined) from = checker.getTypeAtLocation(cls.name ?? cls); }
+          }
+          if (from) this.flowInto(from, checker.getTypeFromTypeNode(n.type), "guard", n, 0);
+        }
+      } catch { /* a checker failure leaves the flow unrecorded */ }
+      n.forEachChild(visit);
+    };
+    visit(sf);
+  }
+  private closeStructuralFlows(): void {
+    const work = [...this.flowSeed.keys()];
+    const done = new Set<number>();
+    while (work.length > 0) {
+      const c = work.pop()!;
+      if (done.has(c)) continue;
+      done.add(c);
+      this.markUnstable(c, `structural-flow (${this.flowSeed.get(c)})`);
+      const next: [number, string][] = [];
+      const p = this.classes[c].parentId;
+      if (p !== undefined) next.push([p, `subclass ${this.classes[c].name}`]);
+      for (const d of this.flowEdges.get(c) ?? []) next.push([d, `from ${this.classes[c].name}`]);
+      for (const [d, why] of next) {
+        if (done.has(d)) continue;
+        this.seedFlow(d, why);
+        work.push(d);
+      }
+    }
+    if (process.env.TSAOT_STRUCTURAL_LOG === "1") {
+      for (const c of done) process.stderr.write(`[structural] ${this.classes[c].name}: ${this.flowSeed.get(c)}\n`);
+    }
+  }
+
   private classMemberKindNames(id: number, kind: MKind): Set<string> {
     const s = new Set<string>();
     let cur: number | undefined = id;
@@ -442,6 +765,8 @@ export class ClassExtractor {
     }
     this.breakParentCycles();
     for (const sf of sfs) this.scanStability(sf);
+    for (const sf of sfs) this.scanStructuralFlows(sf);
+    this.closeStructuralFlows();
     return { classes: this.classes, symbolToId: this.bySymbol, nodeToId: this.byNode };
   }
 }
