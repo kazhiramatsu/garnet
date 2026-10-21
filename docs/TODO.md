@@ -7830,3 +7830,14 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   under protect mode), 503/503 corpus fixtures equal to the frozen emitter
   on node; tsc-ts and the compiler under protect mode, protect with a minor
   every 64 allocations, and zap with one every 16: outputs identical.
+- GC v2 Y2-D, slice D4d: the temporary mallocs. Exception handlers come
+  from a free list (pushed and popped in LIFO order: a `try` allocates
+  nothing), and `fn.call` / `apply` / `bind` / `Reflect.construct` and the
+  generated spread calls build argument arrays of up to sixteen values on
+  the stack (`TSAOT_SPREAD_STACK=0` keeps the frozen emitter's malloc for
+  parity); a call that threw had leaked its malloc'd array. Time-neutral
+  (tsc-ts 0.997, the compiler 1.002, eight pairs, outputs identical).
+  Gates: unit, parity, bundler, selfconf, defaults, GC stress, conformance
+  529/529 plain and at every allocation under protect mode. The Y2-D plan
+  as a whole against the build before D1: tsc-ts about 15% faster, the
+  TypeScript compiler 12%, peak memory 0.87 and 0.89.

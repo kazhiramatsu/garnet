@@ -14409,7 +14409,8 @@ static tsv invoke_with_this(tsv fn, tsv thisArg, tsv* callArgs, int nCall){
   ts_gc_root(&fn); ts_gc_root(&thisArg);
   ts_func* f = ts_ptr(fn);
   int n = nCall + (f->takes_this ? 1 : 0);
-  tsv* a = malloc(sizeof(tsv)*(n>0?n:1));
+  tsv stackbuf[TS_CALL_MERGE_STACK];
+  tsv* a = n <= TS_CALL_MERGE_STACK ? stackbuf : (tsv*)malloc(sizeof(tsv)*(size_t)n);
   if (f->takes_this){
     a[0] = thisArg;
     for (int i=0;i<nCall;i++) a[1+i]=callArgs[i];
@@ -14419,7 +14420,7 @@ static tsv invoke_with_this(tsv fn, tsv thisArg, tsv* callArgs, int nCall){
   for (int i=0;i<n;i++) ts_gc_root(&a[i]);
   tsv r = ts_call(fn, a, n);   /* free fn: thisArg ignored, per JS */
   ts_gc_unroot(n + 2);
-  free(a);
+  if (a != stackbuf) free(a);
   return r;
 }
 /* fn.call(thisArg, a, b, ...) */
@@ -14437,13 +14438,14 @@ tsv ts_funcproto_apply(tsv* args, int n){
     ts_gc_root(&fn); ts_gc_root(&thisArg); ts_gc_root(&arr);
     ts_array* a = ts_ptr(arr);
     int argc = (int)a->len;
-    tsv* argv = malloc(sizeof(tsv)*(argc>0?argc:1));
+    tsv stackbuf[TS_CALL_MERGE_STACK];
+    tsv* argv = argc <= TS_CALL_MERGE_STACK ? stackbuf : (tsv*)malloc(sizeof(tsv)*(size_t)argc);
     for (int i=0;i<argc;i++){
       a = ts_ptr(arr);
       argv[i] = ts_array_get(arr, (uint32_t)i);
     }
     tsv r = invoke_with_this(fn, thisArg, argv, argc);
-    free(argv);
+    if (argv != stackbuf) free(argv);
     ts_gc_unroot(3);
     return r;
   }
@@ -14467,11 +14469,12 @@ tsv ts_funcproto_bind(tsv* args, int n){
   if (!g_typed_slow) typed_slow_check_borrow(fn, thisArg);
   int npart = (n>2)?(n-2):0;
   uint32_t envlen = 2 + (uint32_t)npart;   /* [target, thisArg, partial...] */
-  tsv* env = malloc(sizeof(tsv)*envlen);
+  tsv stackbuf[TS_CALL_MERGE_STACK];
+  tsv* env = envlen <= TS_CALL_MERGE_STACK ? stackbuf : (tsv*)malloc(sizeof(tsv)*envlen);
   env[0]=fn; env[1]=thisArg;
   for (int i=0;i<npart;i++) env[2+i]=args[2+i];
   tsv bound = ts_make_fn(ts_bound_thunk, env, envlen);
-  free(env);                                /* ts_make_fn copies env */
+  if (env != stackbuf) free(env);           /* ts_make_fn copies env */
   /* the bound function itself does NOT take a separate `this` (its this is fixed),
      so a further .call on it won't re-inject — takes_this stays 0. */
   return bound;
@@ -15490,10 +15493,11 @@ tsv ts_reflect_construct(tsv fn, tsv argsArray){
   ts_gc_root(&fn); ts_gc_root(&argsArray);
   ts_array* a = ts_ptr(argsArray);
   int argc = (int)a->len;
-  tsv* argv = malloc(sizeof(tsv)*(argc>0?argc:1));
+  tsv stackbuf[TS_CALL_MERGE_STACK];
+  tsv* argv = argc <= TS_CALL_MERGE_STACK ? stackbuf : (tsv*)malloc(sizeof(tsv)*(size_t)argc);
   for (int i=0;i<argc;i++) argv[i] = ts_array_get(argsArray, (uint32_t)i);
   tsv r = ts_construct(fn, argv, argc);
-  free(argv);
+  if (argv != stackbuf) free(argv);
   ts_gc_unroot(2);
   return r;
 }
@@ -16059,9 +16063,19 @@ void ts_site_stats_init(const char** fn_names, uint32_t nfn){
 /* ---------------- exceptions (try/catch via setjmp/longjmp) ---------------- */
 static ts_handler* g_handlers = NULL;
 static tsv g_exception;
+/* Handlers are pushed and popped in LIFO order: a popped one goes on a free
+   list and the next push reuses it, so a `try` costs no allocation. */
+static ts_handler* g_handler_free = NULL;
+static inline ts_handler* eh_handler_take(void){
+  ts_handler* h = g_handler_free;
+  if (TS_RT_LIKELY(h != NULL)){ g_handler_free = h->prev; return h; }
+  h = (ts_handler*)malloc(sizeof(ts_handler));
+  if (!h) ts_abort_msg("out of memory pushing an exception handler");
+  return h;
+}
 
 ts_handler* ts_eh_push(void){
-  ts_handler* h = (ts_handler*)malloc(sizeof(ts_handler));
+  ts_handler* h = eh_handler_take();
   h->gc_root_len = ts_gc_root_depth();
   h->frame_top = g_ts_frame_top;
 #ifdef TSAOT_STACK_CHECK
@@ -16076,7 +16090,7 @@ ts_handler* ts_eh_push(void){
    frame's eh_buf). Used for try/catch that spans a suspension: the resume fn
    re-arms setjmp on the frame buf each entry and (re)pushes this handler. */
 void ts_eh_push_coro(void* extbuf){
-  ts_handler* h = (ts_handler*)malloc(sizeof(ts_handler));
+  ts_handler* h = eh_handler_take();
   h->gc_root_len = ts_gc_root_depth();
   h->frame_top = g_ts_frame_top;
 #ifdef TSAOT_STACK_CHECK
@@ -16087,7 +16101,7 @@ void ts_eh_push_coro(void* extbuf){
   g_handlers = h;
 }
 void ts_eh_pop(void){
-  if (g_handlers){ ts_handler* h=g_handlers; g_handlers=h->prev; free(h); }
+  if (g_handlers){ ts_handler* h=g_handlers; g_handlers=h->prev; h->prev=g_handler_free; g_handler_free=h; }
 }
 static void ts_eh_pop_until(ts_handler* target){
   while (g_handlers && g_handlers != target) ts_eh_pop();

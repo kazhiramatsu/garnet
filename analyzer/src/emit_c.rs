@@ -9314,6 +9314,18 @@ fn direct_return_kind(f: &Function, unboxed: &BTreeSet<u32>, int_local: &BTreeSe
     RetKind::Boxed
 }
 
+/// A spread call builds its argument array on the stack up to sixteen values
+/// (TSAOT_SPREAD_STACK=0: always malloc, the frozen emitter's form).
+fn spread_stack_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_SPREAD_STACK").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
 fn stack_closures_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -21110,7 +21122,12 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     }
                 }
             }
-            s.push_str("    tsv* _a = (tsv*)malloc(sizeof(tsv) * (_n > 0 ? _n : 1));\n");
+            if spread_stack_enabled() {
+                s.push_str("    tsv _abuf[16];\n");
+                s.push_str("    tsv* _a = _n <= 16 ? _abuf : (tsv*)malloc(sizeof(tsv) * (size_t)_n);\n");
+            } else {
+                s.push_str("    tsv* _a = (tsv*)malloc(sizeof(tsv) * (_n > 0 ? _n : 1));\n");
+            }
             s.push_str("    int _k = 0;\n");
             if let Some(r) = recv {
                 let _ = writeln!(s, "    _a[_k++] = {};", ctx.val(r.0));
@@ -21163,12 +21180,12 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             match dst {
                 Some(d) => {
                     let _ = writeln!(s, "    tsv _r = {};", call);
-                    s.push_str("    free(_a);\n");
+                    s.push_str(if spread_stack_enabled() { "    if (_a != _abuf) free(_a);\n" } else { "    free(_a);\n" });
                     s.push_str(&ctx.set_val(d.0, "_r"));
                 }
                 None => {
                     let _ = writeln!(s, "    {};", call);
-                    s.push_str("    free(_a);\n");
+                    s.push_str(if spread_stack_enabled() { "    if (_a != _abuf) free(_a);\n" } else { "    free(_a);\n" });
                 }
             }
             s.push_str("  }\n");

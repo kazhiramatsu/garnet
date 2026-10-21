@@ -977,6 +977,17 @@ program, outputs identical):
   aborts: that buffer would leak in production. The check found one at
   once: the Map and Set iterators allocated their insertion-order array with
   `malloc`, not as a payload of the collection. 0.989 and 0.983.
+- **D4d**, the temporary mallocs: exception handlers come from a free list
+  (they are pushed and popped in LIFO order, so a `try` allocates nothing),
+  and `fn.call`, `apply`, `bind`, `Reflect.construct` and the generated
+  spread calls build argument arrays of up to sixteen values on the stack
+  (a call that threw had leaked its malloc'd array). Time-neutral on both
+  programs (0.997 and 1.002): neither runs these paths hot.
+
+Together, against the build before D1: tsc-ts and the compiler about 15%
+and 12% faster, peak memory 0.87 and 0.89. Inline allocation in the
+generated code (G6) remains: the allocation call is now a small part of a
+cell's cost.
 
 ## 7. Verification
 
