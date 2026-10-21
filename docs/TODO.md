@@ -7593,3 +7593,33 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   walked each string unit by unit; an ASCII string answers its length and
   8-bit storage counts the units past 0x7F. tsc-ts emitting: 3.00 s ->
   2.94 s (A/B, six pairs), its 78 output files identical to scriptc's.
+- Map and Set lookups: measured on tsc-ts (16.2 million lookups emitting
+  the TypeScript compiler project), 41% are misses, a miss walked several
+  slots of the hash index reading each slot's dense hash at random, and 98%
+  of hits have the very bits of the stored key. A slot now holds the dense
+  index under the table mask and the key's hash bits above it (the bits the
+  slot position does not fix), so a probe passes over other keys without
+  reading the dense arrays; a hit compares the key's bits before
+  SameValueZero, and the small-collection scan does the same. Found on the
+  way (silent wrong value): `Map.prototype.set` and `Set.prototype.add`
+  kept a -0 key as -0 (iteration yielded -0; V8 stores +0). Timing: neutral
+  on tsc-ts (a 64-bit slot with the full hash was neutral too, and doubled
+  the index); a lookup costs about 9 ns, not a bottleneck. Fixture
+  `maps_sets/negative_zero_keys` (-0 in the scan and indexed modes, strided
+  keys sharing slot bits, strings built apart, "" after a deleted "").
+  Gates: unit, parity (374 identical), bundler 43/43, selfconf, GC stress,
+  inline policy, conformance 523/523, 523/523 under the strict profile,
+  523/523 with a collection at every allocation; tsc rebuilt (`native_s350mp`,
+  its C unchanged) under protect mode, zapping and a minor collection every
+  256 allocations, 78 output files identical; A/B against `cv`, sixteen
+  pairs: wall 1.0024, instructions 0.9992: neutral.
+  Also measured, for what to do next: 32 more header bytes per object cost
+  tsc-ts 0.9% (110 MB more memory), so the header's size is not what makes
+  it slower than scriptc; it retires 52.8 billion instructions at 4.2 per
+  cycle. Emitting it with no receiver guards at all (unsound, measurement
+  only) retires 45.9 billion and runs about 19% faster with identical
+  output: the guards (and the generic paths they merge back from, which
+  keep the C compiler from reusing loads across them) are the largest cost
+  left. scriptc guards too (a null test per access, the class id for
+  `instanceof` and downcasts), but a failed guard traps, so nothing merges
+  back, and its class ids never change.

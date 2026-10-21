@@ -7313,13 +7313,16 @@ tsv ts_new_weakset(void){ return ts_new_set_impl(1); }
    selectors stop at 0xFFFD. */
 #define TS_MAPSET_HOLE TS_BOX(0xFFFEu, 0x484F4C45u)
 #define TS_MAPSET_LINEAR_MAX 8u
+/* The bits of -0: Map.prototype.set and Set.prototype.add store a -0 key as
+   +0 (ECMA-262 24.1.3.9 step 5, 24.2.3.1 step 4), so iteration yields +0. */
+#define TS_MAPSET_NEG_ZERO 0x8000000000000000ull
 
 /* Hash consistent with same_value_zero: sv0(a,b) => hash(a)==hash(b).
    numbers by canonical double value (±0 folded, one NaN), strings by content
    (cached storage hash when present), heap cells by identity — the C0
    identity-hash design: raw stable id (handle id today; the NONHEAP fallback
    is the address, stable because NONHEAP never moves) mixed at the use site. */
-static uint32_t sv0_hash(tsv k){
+static inline uint32_t sv0_hash(tsv k){
   uint64_t bits;
   if (ts_is_num(k)){
     double d = ts_to_num(k);
@@ -7340,30 +7343,39 @@ static uint32_t sv0_hash(tsv k){
   return (uint32_t)bits;
 }
 
+/* A slot word of the hash index: 0 (empty), 1 (tombstone), or the dense index
+   + 2 in the bits under the table mask and the key's hash bits above it (the
+   bits the slot position does not already fix). A probe passes over other
+   keys by those bits, without reading the dense arrays: a miss reads
+   contiguous slots only (a third of the lookups of a compiler's side tables
+   are misses, which walk several slots), and a hit reads the one key. The
+   table has at least 2 * (len + 2) slots, so the index + 2 fits the mask. */
+#define TS_MAPSET_SLOT(dense_idx, h, mask) (((h) & ~(mask)) | ((dense_idx) + 2u))
+
 /* Probe the slot table for k. Hit: returns the dense index, *slot_out = its
    slot. Miss: returns -1, *slot_out = preferred insertion slot (first
    tombstone on the probe path, else the terminating empty). The maintenance
    rule keeps at least a quarter of the slots empty, so the walk terminates. */
-static long mapset_probe(const uint32_t* index, uint32_t index_cap,
-                         const tsv* keys, const uint32_t* hashes,
-                         tsv k, uint32_t h, uint32_t* slot_out){
+static inline long mapset_probe(const uint32_t* index, uint32_t index_cap, const tsv* keys,
+                                tsv k, uint32_t h, uint32_t* slot_out){
   uint32_t mask = index_cap - 1u;
   uint32_t slot = h & mask;
   long ins = -1;
   unsigned long long probes = 0;
   for (;;){
-    uint32_t e = index[slot];
+    uint32_t w = index[slot];
     probes++;
-    if (e == 0u){
+    if (w == 0u){
       if (slot_out) *slot_out = (ins >= 0) ? (uint32_t)ins : slot;
       RT_STAT_ADD(map_find_probes, probes); RT_STAT_HIST(map_find_hist, probes);
       return -1;
     }
-    if (e == 1u){
+    if (w == 1u){
       if (ins < 0) ins = (long)slot;
-    } else {
-      uint32_t di = e - 2u;
-      if (hashes[di] == h && same_value_zero(keys[di], k)){
+    } else if (((w ^ h) & ~mask) == 0u){
+      uint32_t di = (w & mask) - 2u;
+      tsv key = keys[di];
+      if (key == k || same_value_zero(key, k)){   /* identical bits are SameValueZero */
         if (slot_out) *slot_out = slot;
         RT_STAT_ADD(map_find_probes, probes); RT_STAT_HIST(map_find_hist, probes);
         return (long)di;
@@ -7372,12 +7384,28 @@ static long mapset_probe(const uint32_t* index, uint32_t index_cap,
     slot = (slot + 1u) & mask;
   }
 }
+/* Find k by a scan of the dense entries (a collection below the index size).
+   Holes are skipped before the SameValueZero test: a hole is a short-string
+   pattern of length 0, equal to "" by content. */
+static inline long mapset_scan(const tsv* keys, const uint32_t* hashes, uint32_t len,
+                               tsv k, uint32_t h){
+  for (uint32_t i = 0; i < len; i++){
+    tsv key = keys[i];
+    if (key == k ||
+        (hashes[i] == h && key != TS_MAPSET_HOLE && same_value_zero(key, k))){
+      RT_STAT_ADD(map_find_probes, i+1); RT_STAT_HIST(map_find_hist, i+1);
+      return (long)i;
+    }
+  }
+  RT_STAT_ADD(map_find_probes, len); RT_STAT_HIST(map_find_hist, len+1);
+  return -1;
+}
 static void mapset_index_insert(uint32_t* index, uint32_t index_cap,
                                 uint32_t dense_idx, uint32_t h){
   uint32_t mask = index_cap - 1u;
   uint32_t slot = h & mask;
   while (index[slot] > 1u) slot = (slot + 1u) & mask; /* stop at empty or tomb */
-  index[slot] = dense_idx + 2u;
+  index[slot] = TS_MAPSET_SLOT(dense_idx, h, mask);
 }
 /* (Re)build the slot table over the live dense entries. Sized so the table is
    at most half full at build time (load stays < 3/4 until the next rebuild). */
@@ -7415,16 +7443,8 @@ static void mapset_index_maintain(const ts_gc_header* owner, tsv* keys, uint32_t
 static long map_find(ts_map* m, tsv k){
   RT_STAT_INC(map_find_calls);
   uint32_t h = sv0_hash(k);
-  if (m->index) return mapset_probe(m->index, m->index_cap, m->keys, m->hashes, k, h, NULL);
-  for (uint32_t i=0;i<m->len;i++){
-    if (m->keys[i] == TS_MAPSET_HOLE) continue;
-    if (m->hashes[i] == h && same_value_zero(m->keys[i], k)){
-      RT_STAT_ADD(map_find_probes, i+1); RT_STAT_HIST(map_find_hist, i+1);
-      return (long)i;
-    }
-  }
-  RT_STAT_ADD(map_find_probes, m->len); RT_STAT_HIST(map_find_hist, m->len+1);
-  return -1;
+  if (m->index) return mapset_probe(m->index, m->index_cap, m->keys, k, h, NULL);
+  return mapset_scan(m->keys, m->hashes, m->len, k, h);
 }
 static void map_grow(ts_map* m){
   if (m->len < m->cap) return;
@@ -7469,17 +7489,18 @@ static inline void map_write_barrier(ts_map* m, uint32_t index, tsv value){
 static tsv map_set_unchecked(tsv mv, tsv k, tsv v){
   ts_map* m = ts_ptr(mv);
   uint32_t slot = 0;
+  if (k == TS_MAPSET_NEG_ZERO) k = ts_num(0);   /* a -0 key is stored as +0 */
   uint32_t h = sv0_hash(k);
   long i;
-  if (m->index){ RT_STAT_INC(map_find_calls); i = mapset_probe(m->index, m->index_cap, m->keys, m->hashes, k, h, &slot); }
-  else i = map_find(m, k);
+  if (m->index){ RT_STAT_INC(map_find_calls); i = mapset_probe(m->index, m->index_cap, m->keys, k, h, &slot); }
+  else { RT_STAT_INC(map_find_calls); i = mapset_scan(m->keys, m->hashes, m->len, k, h); }
   if (i >= 0){ m->vals[i] = v; map_write_barrier(m, (uint32_t)i, v); return mv; }   /* update existing, keep order */
   map_grow(m);
   if (m->iteration_order) m->iteration_order[m->len] = m->next_iteration_order++;
   m->keys[m->len]=k; m->vals[m->len]=v; m->hashes[m->len]=h; m->len++;
   if (m->index){
     /* reuse the probe's slot (tomb or empty); maintain slack afterwards */
-    m->index[slot] = (m->len - 1u) + 2u;
+    m->index[slot] = TS_MAPSET_SLOT(m->len - 1u, h, m->index_cap - 1u);
     mapset_index_maintain(&m->o.h, m->keys, m->hashes, m->len, m->tombs, &m->index, &m->index_cap);
   } else {
     mapset_index_maintain(&m->o.h, m->keys, m->hashes, m->len, m->tombs, &m->index, &m->index_cap);
@@ -7506,7 +7527,7 @@ static int map_delete_unchecked(tsv mv, tsv k){
   long i;
   if (m->index){
     RT_STAT_INC(map_find_calls);
-    i = mapset_probe(m->index, m->index_cap, m->keys, m->hashes, k, sv0_hash(k), &slot);
+    i = mapset_probe(m->index, m->index_cap, m->keys, k, sv0_hash(k), &slot);
     if (i < 0) return 0;
     m->index[slot] = 1u; /* tombstone */
     m->keys[i] = TS_MAPSET_HOLE; m->vals[i] = TS_UNDEFINED;
@@ -7858,16 +7879,8 @@ void ts_map_foreach(tsv mv, tsv cb){
 static long set_find(ts_set_t* s, tsv v){
   RT_STAT_INC(map_find_calls);
   uint32_t h = sv0_hash(v);
-  if (s->index) return mapset_probe(s->index, s->index_cap, s->elems, s->hashes, v, h, NULL);
-  for (uint32_t i=0;i<s->len;i++){
-    if (s->elems[i] == TS_MAPSET_HOLE) continue;
-    if (s->hashes[i] == h && same_value_zero(s->elems[i], v)){
-      RT_STAT_ADD(map_find_probes, i+1); RT_STAT_HIST(map_find_hist, i+1);
-      return (long)i;
-    }
-  }
-  RT_STAT_ADD(map_find_probes, s->len); RT_STAT_HIST(map_find_hist, s->len+1);
-  return -1;
+  if (s->index) return mapset_probe(s->index, s->index_cap, s->elems, v, h, NULL);
+  return mapset_scan(s->elems, s->hashes, s->len, v, h);
 }
 static void set_grow(ts_set_t* s){
   if (s->len < s->cap) return;
@@ -7896,15 +7909,16 @@ static void set_compact(ts_set_t* s){
 static tsv set_add_unchecked(tsv sv, tsv v){
   ts_set_t* s = ts_ptr(sv);
   uint32_t slot = 0;
+  if (v == TS_MAPSET_NEG_ZERO) v = ts_num(0);   /* a -0 element is stored as +0 */
   uint32_t h = sv0_hash(v);
   long i;
-  if (s->index){ RT_STAT_INC(map_find_calls); i = mapset_probe(s->index, s->index_cap, s->elems, s->hashes, v, h, &slot); }
-  else i = set_find(s, v);
+  if (s->index){ RT_STAT_INC(map_find_calls); i = mapset_probe(s->index, s->index_cap, s->elems, v, h, &slot); }
+  else { RT_STAT_INC(map_find_calls); i = mapset_scan(s->elems, s->hashes, s->len, v, h); }
   if (i >= 0) return sv;                   /* dedup */
   set_grow(s);
   if (s->iteration_order) s->iteration_order[s->len] = s->next_iteration_order++;
   s->elems[s->len]=v; s->hashes[s->len]=h; s->len++;
-  if (s->index) s->index[slot] = (s->len - 1u) + 2u;
+  if (s->index) s->index[slot] = TS_MAPSET_SLOT(s->len - 1u, h, s->index_cap - 1u);
   mapset_index_maintain(&s->o.h, s->elems, s->hashes, s->len, s->tombs, &s->index, &s->index_cap);
   ts_write_barrier(sv, v); return sv;
 }
@@ -7922,7 +7936,7 @@ static int set_delete_unchecked(tsv sv, tsv v){
   long i;
   if (s->index){
     RT_STAT_INC(map_find_calls);
-    i = mapset_probe(s->index, s->index_cap, s->elems, s->hashes, v, sv0_hash(v), &slot);
+    i = mapset_probe(s->index, s->index_cap, s->elems, v, sv0_hash(v), &slot);
     if (i < 0) return 0;
     s->index[slot] = 1u; /* tombstone */
     s->elems[i] = TS_MAPSET_HOLE;

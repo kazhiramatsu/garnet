@@ -926,7 +926,8 @@ typedef struct ts_map {
   ts_obj_common o;   /* proto + lazy named-prop map (unified model) */
   tsv* keys; tsv* vals; uint32_t len, cap;
   uint32_t* hashes;  /* cached SameValueZero hash parallel to keys */
-  uint32_t* index;   /* hash slots: 0=empty, 1=tombstone, else dense idx+2 */
+  uint32_t* index;   /* hash slots: 0=empty, 1=tombstone, else dense idx+2
+                        under the mask and hash bits above it (TS_MAPSET_SLOT) */
   uint32_t index_cap; /* power-of-2 slot count (0 = linear mode) */
   uint32_t tombs;    /* HOLE entries in keys/vals below len */
   uint8_t weak;      /* WeakMap: keys are weak and values are ephemerons */
@@ -943,7 +944,7 @@ typedef struct ts_set_t {
   ts_obj_common o;   /* proto + lazy named-prop map (unified model) */
   tsv* elems; uint32_t len, cap;
   uint32_t* hashes;  /* cached SameValueZero hash parallel to elems */
-  uint32_t* index;
+  uint32_t* index;   /* slot words as in ts_map */
   uint32_t index_cap;
   uint32_t tombs;
   uint8_t weak;      /* WeakSet: elements are weak keys */
