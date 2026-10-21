@@ -4381,17 +4381,29 @@ class Exporter {
             }
           }
         }
-        const base = this.lowerExpr(ctx, node.expression);
-        const dst = this.newLocal(ctx, "primitive");
+        // Only a string or an array answers `.length` with its own number;
+        // any other receiver (an object with a `length` property, ArrayLike,
+        // a function, any, unknown, null) reads the property below.
         const rk = this.builtinReceiverKind(node.expression);
-        if (rk === "array") {
-          ctx.body.push({ kind: "ArrayLen", dst, arr: base });
-        } else if (rk === "string") {
-          ctx.body.push({ kind: "StringLen", dst, src: base });
-        } else {
-          ctx.body.push({ kind: "GenericLen", dst, src: base });
+        if (rk === "array" || rk === "string" || this.lengthIsBuiltinNumber(node)) {
+          const base = this.lowerExpr(ctx, node.expression);
+          const dst = this.newLocal(ctx, "primitive");
+          if (rk === "array") {
+            ctx.body.push({ kind: "ArrayLen", dst, arr: base });
+          } else if (rk === "string") {
+            ctx.body.push({ kind: "StringLen", dst, src: base });
+          } else {
+            ctx.body.push({ kind: "GenericLen", dst, src: base });
+          }
+          return dst;
         }
-        return dst;
+        if (process.env.TSAOT_LENGTH_LOG === "1") {
+          const sf = node.getSourceFile();
+          const lc = sf.getLineAndCharacterOfPosition(node.getStart());
+          let ty = "?";
+          try { ty = this.checker.typeToString(this.checker.getTypeAtLocation(node.expression)); } catch { /* keep ? */ }
+          console.error(`[length] property read ${sf.fileName}:${lc.line + 1}:${lc.character + 1} ${ty}`);
+        }
       }
       // sym.description -> the symbol's description string (or undefined).
       if (node.name.text === "description") {
@@ -9588,6 +9600,40 @@ class Exporter {
     return bases.some((b) => this.isArrayDerivedType(b, depth + 1));
   }
 
+  /** `.length` of this receiver is a builtin string's or array's number
+   * (GenericLen): on every member of the receiver's type, `length` resolves to
+   * the declaration in the default library's String, Array or ReadonlyArray
+   * (tuples, NodeArray, `Readonly<string[] & ...>`, a type parameter so
+   * constrained). Other receivers (an object with a `length` field such as
+   * TextSpan, ArrayLike, typed arrays, functions, any, unknown) read the
+   * property. Null and undefined members only pass in an optional chain,
+   * whose guard has excluded them. */
+  lengthIsBuiltinNumber(access: ts.PropertyAccessExpression): boolean {
+    let t: ts.Type;
+    try { t = this.checker.getTypeAtLocation(access.expression); } catch { return false; }
+    const F = ts.TypeFlags;
+    const optional = ts.isOptionalChain(access);
+    const builtinOwners = new Set(["String", "Array", "ReadonlyArray"]);
+    const builtin = (m: ts.Type, depth: number): boolean => {
+      if (depth > 4) return false;
+      if (m.flags & (F.Null | F.Undefined | F.Void)) return optional;
+      if (m.flags & (F.String | F.StringLiteral | F.TemplateLiteral | F.StringMapping)) return true;
+      if (m.flags & F.TypeParameter) {
+        const c = this.checker.getBaseConstraintOfType(m);
+        return !!c && c !== m && builtin(c, depth + 1);
+      }
+      if (m.flags & F.Union) return (m as ts.UnionType).types.every(u => builtin(u, depth + 1));
+      const len = this.checker.getPropertyOfType(this.checker.getApparentType(m), "length");
+      const decls = len?.declarations;
+      if (!decls || decls.length === 0) return false;
+      return decls.some(d => {
+        const owner = d.parent;
+        return ts.isInterfaceDeclaration(owner) && builtinOwners.has(owner.name.text) &&
+          owner.getSourceFile().hasNoDefaultLib;
+      });
+    };
+    return builtin(t, 0);
+  }
   builtinReceiverKind(recvExpr: ts.Expression): "string" | "array" | "map" | "set" | "weakmap" | "weakset" | "headers" | "number" | "boolean" | "promise" | undefined {
     // Identify builtins whose runtime result is an array, including the existing
     // array/Headers iterator representations. Map/Set return actual iterators.

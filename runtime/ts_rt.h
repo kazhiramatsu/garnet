@@ -1381,6 +1381,7 @@ tjson_value* ts_json_dom_get(tjson_value* obj, uint32_t key);
 tjson_value* ts_json_dom_get_dyn(tjson_value* obj, tsv key);
 tjson_value* ts_json_dom_index(tjson_value* arr, double index);
 double ts_json_dom_length(tjson_value* value);
+tsv ts_json_dom_length_value(tjson_value* value);
 double ts_json_dom_number(tjson_value* value);
 tsv ts_json_dom_add(tjson_value* lhs, tjson_value* rhs);
 tsv ts_json_dom_add_left(tjson_value* lhs, tsv rhs);

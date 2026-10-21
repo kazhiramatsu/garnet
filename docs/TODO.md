@@ -7170,3 +7170,37 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   The comparison is of compilers as a whole: tsc-ts runs tsgo's design
   (TypeScript 7), garnet the unmodified 6.0.3 sources; single-threaded,
   tsc-ts is 3.7x faster than garnet's build and 1.15x faster than tsgo.
+- `.length` of objects read 0 (silent wrong values): the exporter lowered
+  every `.length` whose receiver was not statically an array or a string to
+  `GenericLen` (`ts_length`), which answers 0 for any object and for null.
+  In the compiler 44 of the 120 such sites read objects with a `length`
+  field: `TextSpan` (26), `Diagnostic` and its variants (14),
+  `Partial<TextSpan>`, a function type and a `Buffer`, all read as 0 (an
+  error-free compile's outputs do not depend on them). Now `.length` is a
+  builtin length (`ArrayLen`, `StringLen`, `GenericLen`) only when, on every
+  member of the receiver's type, `length` resolves to the declaration of the
+  default library's `String`, `Array` or `ReadonlyArray` (tuples,
+  `NodeArray`, `Readonly<string[] & ...>`, constrained type parameters;
+  null and undefined members only in an optional chain); any other receiver
+  (objects, ArrayLike, functions, typed arrays, any, unknown) reads the
+  property, which also makes `null.length` throw. In the JSON DOM path a
+  `length` read is no longer a DOM node: `ts_json_dom_length_value` gives an
+  array's or a string's length, an object's member, undefined on numbers and
+  booleans, and throws for null and a missing member. `TSAOT_LENGTH_LOG=1`
+  prints the sites that read the property; the compiler keeps 76
+  `GenericLen` sites. Fixture `objects/length_property_reads`
+  (strings, arrays, optional chains, constrained type parameters, objects
+  with own, inherited and accessor `length`, ArrayLike, class fields and
+  getters, any-typed strings, arrays, objects, functions, numbers, null and
+  undefined, template strings, match arrays, and JSON documents read in
+  place and materialized); known rows: parity (the frozen emitter keeps a
+  DOM `length` read a DOM node: this fixture and
+  `stdlib/json_dom_alias_reparse`, `stdlib/json_dom_dynamic_parse`). The
+  `length` half of item (a) above was this bug (the probe read through
+  `any`). Gates: unit, parity (365 identical), bundler, selfconf, GC
+  stress, inline policy, conformance 501/501 and 501/501 with a collection
+  at every allocation in protect mode; tsc rebuilt (`native_s350ln2`) and
+  compiled under protect mode, with zapping, and with a minor collection
+  every 256 allocations, its 78 output files identical. A/B against `as3`,
+  eight ABBA pairs: cycles 0.9913 (eight of eight), instructions 1.0001,
+  wall 0.9868: neutral.

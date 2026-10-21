@@ -11405,6 +11405,20 @@ tjson_value* ts_json_dom_index(tjson_value* arr, double index){
 double ts_json_dom_length(tjson_value* value){
   return tjson_length(value);
 }
+/* `x.length` of a DOM value (docs: objects/length_property_reads): an
+   array's or a string's length, an object's `length` member, undefined on a
+   number or a boolean; a missing member (NULL) or null throws, as reading a
+   property of undefined or null does. */
+tsv ts_json_dom_length_value(tjson_value* value){
+  if (!value) return ts_throw_cannot_read(TS_UNDEFINED, "length");
+  switch (value->kind){
+    case TJSON_ARRAY:
+    case TJSON_STRING: return ts_num(tjson_length(value));
+    case TJSON_OBJECT: return ts_json_dom_to_tsv(tjson_object_get(value, "length", 6));
+    case TJSON_NULL: return ts_throw_cannot_read(TS_NULL, "length");
+    default: return TS_UNDEFINED;
+  }
+}
 
 static tsv ts_json_dom_materialize(tjson_value* value){
   if (!value) return TS_UNDEFINED;

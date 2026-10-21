@@ -317,6 +317,7 @@ fn emit_program_with_string_plans(
         .collect();
     set_fn_capture_counts(program);
     set_type_field_counts(program);
+    set_length_fields(program);
     let indirect_funcs = infer_indirect_funcs(program);
     let param_facts_by_func = infer_program_param_facts(program, &indirect_funcs);
     let i64_fast = infer_i64_fast_funcs(program, &indirect_funcs, &param_facts_by_func);
@@ -2585,6 +2586,25 @@ fn is_bool_callee(func: u32) -> bool {
 thread_local! {
     static TYPE_FIELD_COUNTS: std::cell::RefCell<BTreeMap<u32, u32>> =
         std::cell::RefCell::new(BTreeMap::new());
+    static LENGTH_FIELDS: std::cell::RefCell<BTreeSet<u32>> =
+        std::cell::RefCell::new(BTreeSet::new());
+}
+/// The field ids named `length`: a JSON DOM read of `length` is the array's
+/// or string's length (or an object's member), not a DOM node.
+fn set_length_fields(program: &Program) {
+    let length: Vec<u16> = "length".encode_utf16().collect();
+    LENGTH_FIELDS.with(|m| {
+        let mut m = m.borrow_mut();
+        m.clear();
+        for f in &program.fields {
+            if field_name_units(f) == length {
+                m.insert(f.id.0);
+            }
+        }
+    });
+}
+fn is_length_field(field: u32) -> bool {
+    LENGTH_FIELDS.with(|m| m.borrow().contains(&field))
 }
 /// Object literal sizes for in-object slot allocation (type id -> field count).
 fn set_type_field_counts(program: &Program) {
@@ -4244,7 +4264,7 @@ fn json_dom_inst_scan(body: &[Inst], out: &mut BTreeSet<u32>) -> bool {
             Inst::Copy { dst, src } if out.contains(&src.0) => {
                 changed |= out.insert(dst.0);
             }
-            Inst::LoadField { dst, obj, .. } if out.contains(&obj.0) => {
+            Inst::LoadField { dst, obj, field, .. } if out.contains(&obj.0) && !is_length_field(field.0) => {
                 changed |= out.insert(dst.0);
             }
             Inst::LoadIndex { dst, arr, .. } if out.contains(&arr.0) => {
@@ -4423,8 +4443,8 @@ fn json_dom_def_matches(inst: &Inst, candidates: &BTreeSet<u32>) -> bool {
         Inst::Copy { dst, src } if candidates.contains(&dst.0) && candidates.contains(&src.0) => {
             true
         }
-        Inst::LoadField { dst, obj, .. }
-            if candidates.contains(&dst.0) && candidates.contains(&obj.0) =>
+        Inst::LoadField { dst, obj, field, .. }
+            if candidates.contains(&dst.0) && candidates.contains(&obj.0) && !is_length_field(field.0) =>
         {
             true
         }
@@ -19514,6 +19534,13 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
         }
         Inst::LoadField { dst, obj, field, slots } => {
             if ctx.json_locals.contains(&obj.0) {
+                if is_length_field(field.0) && !ctx.json_locals.contains(&dst.0) {
+                    s.push_str(&ctx.set_val(
+                        dst.0,
+                        &format!("ts_json_dom_length_value({})", ctx.jval(obj.0)),
+                    ));
+                    return;
+                }
                 if ctx.json_locals.contains(&dst.0) {
                     let _ = writeln!(
                         s,
