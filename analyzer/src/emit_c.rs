@@ -2225,7 +2225,7 @@ impl NeedWalk<'_> {
                     }
                 }
                 let throws = matches!(leaf, Inst::Throw { .. });
-                let access = is_access_point(leaf);
+                let access = is_access_point(leaf) || is_view_store_point(leaf, self.numeric);
                 if access {
                     if let Some(points) = self.points.as_mut() {
                         let mut set: BTreeSet<u32> =
@@ -2303,6 +2303,14 @@ fn frame_needed_locals(
 /// accepts besides the instructions that cannot collect).
 fn is_access_point(inst: &Inst) -> bool {
     matches!(inst, Inst::LoadField { .. } | Inst::StoreField { .. } | Inst::LoadIndex { .. })
+}
+
+/// A store into a view element with a numeric value (TA2,
+/// docs/typed_arrays_design.md): the in-line store cannot collect, its slow
+/// path links the frame, as an access point's does. A boxed value keeps its
+/// ToNumber, which may run user code, outside: the generic store.
+fn is_view_store_point(inst: &Inst, numeric: &BTreeSet<u32>) -> bool {
+    matches!(inst, Inst::StoreIndex { elem, src, .. } if *elem != 0 && numeric.contains(&src.0))
 }
 
 /// `TSAOT_LAZY_CALLS=0` keeps an eager frame in every function with calls.
@@ -3341,6 +3349,7 @@ fn body_is_gc_free(body: &[Inst], numeric: &BTreeSet<u32>) -> bool {
         | Inst::StringLen { .. } => true,
         // wrapped lazily at the slow path
         Inst::LoadField { .. } | Inst::StoreField { .. } | Inst::LoadIndex { .. } => true,
+        Inst::StoreIndex { .. } if is_view_store_point(inst, numeric) => true,
         Inst::UnOp { op, operand, .. } => match op.as_str() {
             "!" | "typeof" | "nullish" | "isundef" => true,
             _ => numeric.contains(&operand.0),
@@ -5161,7 +5170,7 @@ fn validate_scalar_string_slices(
                     invalidate_scalar_use(candidates, invalid, arr.0);
                     invalidate_scalar_use(candidates, invalid, index.0);
                 }
-                Inst::StoreIndex { arr, index, src } => {
+                Inst::StoreIndex { arr, index, src, .. } => {
                     invalidate_scalar_use(candidates, invalid, arr.0);
                     invalidate_scalar_use(candidates, invalid, index.0);
                     invalidate_scalar_use(candidates, invalid, src.0);
@@ -5488,7 +5497,7 @@ fn inst_uses_any(inst: &Inst, ids: &BTreeSet<u32>) -> bool {
         Inst::StoreFieldDynamic { obj, key, src } => {
             ids.contains(&obj.0) || ids.contains(&key.0) || ids.contains(&src.0)
         }
-        Inst::StoreIndex { arr, index, src } => {
+        Inst::StoreIndex { arr, index, src, .. } => {
             ids.contains(&arr.0) || ids.contains(&index.0) || ids.contains(&src.0)
         }
         Inst::AllocClassValue { captures, .. } => captures.iter().any(|c| ids.contains(&c.cell.0)),
@@ -8298,7 +8307,7 @@ fn cmp_truthy_only(body: &[Inst]) -> BTreeSet<u32> {
                     bump(total, arr.0, cand);
                     bump(total, index.0, cand);
                 }
-                Inst::StoreIndex { arr, index, src } => {
+                Inst::StoreIndex { arr, index, src, .. } => {
                     bump(total, arr.0, cand);
                     bump(total, index.0, cand);
                     bump(total, src.0, cand);
@@ -11867,6 +11876,57 @@ fn emit_global_setup(s: &mut String, needs_fetch: bool, needs_typed_array_global
     s.push_str("}\n\n");
 }
 
+/// A view element read (TA2, docs/typed_arrays_design.md): the typed load in
+/// line; the generic element entry for any other receiver, element type or
+/// index, linked like the array read's slow path. An unboxed destination
+/// takes the double; a boxed one keeps undefined for an index out of range.
+fn emit_view_load(s: &mut String, ctx: &Ctx, dst: u32, arr: u32, index: u32, elem: u8) {
+    let a = ctx.val(arr);
+    let int_key = ctx.unboxed.contains(&index) && ctx.int_local.contains(&index);
+    let (try_fn, i, slow_fn) = if int_key {
+        ("ts_ta_try_load_i", format!("d{}", index), "ts_array_get_key_i64")
+    } else {
+        ("ts_ta_try_load_f", ctx.num(index), "ts_array_get_key_f64")
+    };
+    let slow = ctx.lazy_linked(&format!("{}({}, {})", slow_fn, a, i));
+    if ctx.unboxed.contains(&dst) && !ctx.int_local.contains(&dst) {
+        let e = format!(
+            "({{ double _ta; if (!{}({}, {}, {}, &_ta)) _ta = ts_to_num({}); _ta; }})",
+            try_fn, a, i, elem, slow
+        );
+        s.push_str(&ctx.set_num(dst, &e));
+    } else {
+        let e = format!(
+            "({{ double _ta; tsv _tv; if ({}({}, {}, {}, &_ta)) _tv = ts_num(_ta); else _tv = {}; _tv; }})",
+            try_fn, a, i, elem, slow
+        );
+        s.push_str(&ctx.set_val(dst, &e));
+    }
+}
+
+/// A view element store of a numeric value (TA2): the converted store in
+/// line; the generic element entry, linked, otherwise.
+fn emit_view_store(s: &mut String, ctx: &Ctx, arr: u32, index: u32, src: u32, elem: u8) {
+    let a = ctx.val(arr);
+    let int_key = ctx.unboxed.contains(&index) && ctx.int_local.contains(&index);
+    let (try_fn, i, slow_fn) = if int_key {
+        ("ts_ta_try_store_i", format!("d{}", index), "ts_array_set_key_i64")
+    } else {
+        ("ts_ta_try_store_f", ctx.num(index), "ts_array_set_key_f64")
+    };
+    let slow = ctx.lazy_linked_stmt(&format!("{}({}, {}, ts_num(_tx))", slow_fn, a, i));
+    let _ = writeln!(
+        s,
+        "  {{ double _tx = {}; if (!{}({}, {}, _tx, {})) {} }}",
+        ctx.num(src),
+        try_fn,
+        a,
+        i,
+        elem,
+        slow
+    );
+}
+
 fn emit_scalar_slice_calc(s: &mut String, dst: u32, spec: &ScalarStringSlice, ctx: &Ctx) {
     let base = ctx.val(spec.base);
     let len_tmp = format!("_ssn{}", dst);
@@ -13674,6 +13734,7 @@ fn try_emit_fused_split_join_loop(
             dst: part_value,
             arr: load_arr,
             index: load_index,
+            ..
         },
         Inst::StringLen {
             dst: part_len,
@@ -15828,6 +15889,7 @@ fn match_dynamic_split_join_escape_select_shape(
             dst: part_value,
             arr: part_arr,
             index: part_index,
+            ..
         },
         Inst::StringLen {
             dst: part_len,
@@ -16568,6 +16630,7 @@ fn match_dynamic_split_join_metric_shape(
             dst: part_value,
             arr: load_arr,
             index: load_index,
+            ..
         },
         Inst::StringLen {
             dst: part_len,
@@ -19624,7 +19687,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 s.push_str(&ctx.set_val(dst.0, &ctx.val(src.0)));
             }
         }
-        Inst::LoadField { dst, obj, field, slots } => {
+        Inst::LoadField { dst, obj, field, slots, elem } => {
             if ctx.json_locals.contains(&obj.0) {
                 if is_length_field(field.0) && !ctx.json_locals.contains(&dst.0) {
                     s.push_str(&ctx.set_val(
@@ -19739,6 +19802,16 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         field.0,
                         pic
                     )
+                };
+                // A receiver typed as a view: its length in line (TA2).
+                let get_expr = if *elem != 0 && is_length_field(field.0) {
+                    format!(
+                        "({{ tsv _tl; if (!ts_ta_try_length({}, &_tl)) _tl = {}; _tl; }})",
+                        ctx.val(obj.0),
+                        get_expr
+                    )
+                } else {
+                    get_expr
                 };
                 s.push_str(&ctx.set_val(dst.0, &get_expr));
                 let _ = writeln!(s, "  }}");
@@ -19907,7 +19980,11 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
         Inst::StoreElem { arr, src } => {
             let _ = writeln!(s, "  ts_set({}, 0, {});", ctx.val(arr.0), ctx.val(src.0));
         }
-        Inst::LoadIndex { dst, arr, index } => {
+        Inst::LoadIndex { dst, arr, index, elem } => {
+            if *elem != 0 && !ctx.json_locals.contains(&arr.0) {
+                emit_view_load(s, ctx, dst.0, arr.0, index.0, *elem - 1);
+                return;
+            }
             if ctx.json_locals.contains(&arr.0) {
                 if ctx.json_locals.contains(&dst.0) {
                     let _ = writeln!(
@@ -19992,7 +20069,11 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 ));
             }
         }
-        Inst::StoreIndex { arr, index, src } => {
+        Inst::StoreIndex { arr, index, src, elem } => {
+            if *elem != 0 && (ctx.unboxed.contains(&src.0) || ctx.int_local.contains(&src.0)) {
+                emit_view_store(s, ctx, arr.0, index.0, src.0, *elem - 1);
+                return;
+            }
             // the dense in-capacity element store is in line
             // (TSAOT_INLINE_INDEX=0 keeps the out-of-line store, as for reads)
             if index_keys_enabled() {

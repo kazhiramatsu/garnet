@@ -4580,7 +4580,8 @@ class Exporter {
       }
       const base = this.lowerExpr(ctx, node.expression);
       const dst = this.newLocal(ctx, this.refKindOf(node));
-      ctx.body.push(this.withSlots({ kind: "LoadField", dst, obj: base, field: this.internField(node.name.text) }, this.staticSlotHint(node.expression, node.name.text)));
+      const load = this.withSlots({ kind: "LoadField", dst, obj: base, field: this.internField(node.name.text) }, this.staticSlotHint(node.expression, node.name.text));
+      ctx.body.push(node.name.text === "length" ? this.withViewElem(load, node.expression) : load);
       return dst;
     }
     if (ts.isElementAccessExpression(node)) {
@@ -4616,7 +4617,7 @@ class Exporter {
       const idx = this.lowerExpr(ctx, node.argumentExpression);
       const dst = this.newLocal(ctx, this.refKindOf(node));
       this.markNullableNumeric(ctx, dst, node);
-      ctx.body.push({ kind: "LoadIndex", dst, arr: base, index: idx });
+      ctx.body.push(this.withViewElem({ kind: "LoadIndex", dst, arr: base, index: idx }, node.expression));
       return dst;
     }
     if (ts.isCallExpression(node)) {
@@ -10933,6 +10934,29 @@ class Exporter {
     } catch { return "string"; }
   }
 
+  /** The element type (TS_TA_*) of a receiver whose static type is a view of
+   *  one element type (a union of such views, with null / undefined, too);
+   *  undefined otherwise. */
+  viewElemOf(e: ts.Expression): number | undefined {
+    try {
+      const t = this.checker.getNonNullableType(this.checker.getTypeAtLocation(e));
+      const elemOf = (m: ts.Type): number | undefined => {
+        const sym = m.getSymbol();
+        return sym && this.isAmbientGlobalSymbol(sym) ? TYPED_ARRAY_ELEMS.get(sym.name) : undefined;
+      };
+      if (!t.isUnion()) return elemOf(t);
+      const elems = t.types.map(elemOf);
+      return elems.every((x) => x !== undefined && x === elems[0]) ? elems[0] : undefined;
+    } catch { return undefined; }
+  }
+  /** Mark an element access or a `length` read whose receiver is statically a
+   *  view (docs/typed_arrays_design.md, TA2): the emitter reads and writes its
+   *  elements in line. */
+  private withViewElem<T extends { kind: string }>(inst: T, receiver: ts.Expression): T {
+    const elem = this.viewElemOf(receiver);
+    if (elem !== undefined) (inst as unknown as { elem?: number }).elem = elem + 1;
+    return inst;
+  }
   /** A receiver whose static type is an ambient typed array (or a union of
    *  them, with null / undefined). */
   isTypedArrayReceiver(e: ts.Expression): boolean {
@@ -11044,7 +11068,7 @@ class Exporter {
       ctx.body.push({ kind: "LoadFieldDynamic", dst, obj: pre.obj!, key: pre.key! });
       return dst;
     }
-    ctx.body.push({ kind: "LoadIndex", dst, arr: pre.obj!, index: pre.key! });
+    ctx.body.push(this.withViewElem({ kind: "LoadIndex", dst, arr: pre.obj!, index: pre.key! }, lea.expression));
     return dst;
   }
 
@@ -11223,7 +11247,7 @@ class Exporter {
         ctx.body.push({ kind: "StoreFieldDynamic", obj: base, key, src: rhs });
       } else {
         const idx = pre?.key ?? this.lowerExpr(ctx, lhs.argumentExpression);
-        ctx.body.push({ kind: "StoreIndex", arr: base, index: idx, src: rhs });
+        ctx.body.push(this.withViewElem({ kind: "StoreIndex", arr: base, index: idx, src: rhs }, lhs.expression));
       }
     } else if (ts.isArrayLiteralExpression(lhs)) {
       // destructuring ASSIGNMENT target: [a, b, ...rest] = rhsArray. Read each

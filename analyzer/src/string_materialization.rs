@@ -823,6 +823,7 @@ fn match_dynamic_split_join_escape(body: &[Inst]) -> Option<MaterializationOp> {
             dst: part_value,
             arr: part_arr,
             index: part_index,
+            ..
         },
         Inst::StringLen {
             dst: part_len,
@@ -1591,6 +1592,7 @@ mod tests {
                 dst: l(38),
                 arr: l(31),
                 index: l(22),
+                elem: 0,
             },
             Inst::StringLen {
                 dst: l(39),

@@ -57,7 +57,7 @@ fn main() {
 
     // C3: closure body leaks captured value to global; box stays local.
     let arrow_leak = func(0, vec![0], 2, false, vec![
-        LoadField{dst:LocalId(1), obj:LocalId(0), field:FieldId(VALUE), slots: 0},
+        LoadField{dst:LocalId(1), obj:LocalId(0), field:FieldId(VALUE), slots: 0, elem: 0},
         StoreGlobal{gref:GlobalId(0), src:LocalId(1)},
     ]);
     let f = func(1, vec![], 3, false, vec![

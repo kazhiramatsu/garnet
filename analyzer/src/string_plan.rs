@@ -182,7 +182,7 @@ fn inst_uses_any(inst: &Inst, ids: &BTreeSet<u32>) -> bool {
         Inst::StoreFieldDynamic { obj, key, src } => {
             ids.contains(&obj.0) || ids.contains(&key.0) || ids.contains(&src.0)
         }
-        Inst::StoreIndex { arr, index, src } => {
+        Inst::StoreIndex { arr, index, src, .. } => {
             ids.contains(&arr.0) || ids.contains(&index.0) || ids.contains(&src.0)
         }
         Inst::AllocClassValue { captures, .. } => captures.iter().any(|c| ids.contains(&c.cell.0)),

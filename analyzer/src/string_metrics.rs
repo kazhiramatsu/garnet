@@ -830,6 +830,7 @@ fn match_split_join_metric(body: &[Inst], start: usize) -> Option<MetricOp> {
             dst: part_value,
             arr: load_arr,
             index: load_index,
+            ..
         },
         Inst::StringLen {
             dst: part_len,
@@ -954,6 +955,7 @@ fn match_dynamic_split_join_metric(body: &[Inst], start: usize) -> Option<Metric
             dst: part_value,
             arr: load_arr,
             index: load_index,
+            ..
         },
         Inst::StringLen {
             dst: part_len,
@@ -1324,6 +1326,7 @@ mod tests {
                 dst: l(38),
                 arr: l(31),
                 index: l(22),
+                elem: 0,
             },
             Inst::StringLen {
                 dst: l(39),
@@ -1389,6 +1392,7 @@ mod tests {
                 dst: l(38),
                 arr: l(31),
                 index: l(22),
+                elem: 0,
             },
             Inst::StringLen {
                 dst: l(39),

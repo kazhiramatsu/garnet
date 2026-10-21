@@ -13201,39 +13201,10 @@ static tsv ta_require(tsv v, const char* method){
   if (!ts_is_typed_array(v)) ts_throw_type_error_msg("this is not a typed array.");
   return v;
 }
-/* Element load and store: the store takes the number already converted by ToNumber. */
-static inline double ta_load(const ts_typedarray* t, uint32_t i){
-  const uint8_t* p = t->data + (size_t)i * g_ta_size[t->elem];
-  switch (t->elem){
-    case TS_TA_INT8: return (double)*(const int8_t*)p;
-    case TS_TA_UINT8: case TS_TA_UINT8C: return (double)*p;
-    case TS_TA_INT16: { int16_t x; memcpy(&x, p, 2); return (double)x; }
-    case TS_TA_UINT16: { uint16_t x; memcpy(&x, p, 2); return (double)x; }
-    case TS_TA_INT32: { int32_t x; memcpy(&x, p, 4); return (double)x; }
-    case TS_TA_UINT32: { uint32_t x; memcpy(&x, p, 4); return (double)x; }
-    case TS_TA_FLOAT32: { float x; memcpy(&x, p, 4); return (double)x; }
-    default: { double x; memcpy(&x, p, 8); return x; }
-  }
-}
-static inline uint8_t ta_clamp_u8(double d){
-  if (!(d > 0)) return 0;           /* NaN, -0, negatives */
-  if (d >= 255) return 255;
-  double f = floor(d), r = d - f;
-  uint32_t u = (uint32_t)f;
-  if (r > 0.5 || (r == 0.5 && (u & 1u))) u++;   /* round half to even */
-  return (uint8_t)u;
-}
-static inline void ta_store(ts_typedarray* t, uint32_t i, double d){
-  uint8_t* p = t->data + (size_t)i * g_ta_size[t->elem];
-  switch (t->elem){
-    case TS_TA_INT8: case TS_TA_UINT8: *p = (uint8_t)(uint32_t)ts_to_int32(d); break;
-    case TS_TA_UINT8C: *p = ta_clamp_u8(d); break;
-    case TS_TA_INT16: case TS_TA_UINT16: { uint16_t x = (uint16_t)(uint32_t)ts_to_int32(d); memcpy(p, &x, 2); break; }
-    case TS_TA_INT32: case TS_TA_UINT32: { int32_t x = ts_to_int32(d); memcpy(p, &x, 4); break; }
-    case TS_TA_FLOAT32: { float x = (float)d; memcpy(p, &x, 4); break; }
-    default: memcpy(p, &d, 8); break;
-  }
-}
+/* Element load and store (the header's in-line forms with the view's element
+   type); the store takes the number already converted by ToNumber. */
+static inline double ta_load(const ts_typedarray* t, uint32_t i){ return ts_ta_elem_load(t->data, i, t->elem); }
+static inline void ta_store(ts_typedarray* t, uint32_t i, double d){ ts_ta_elem_store(t->data, i, d, t->elem); }
 tsv ts_ta_get(tsv v, uint32_t i){
   ts_typedarray* t = ta_ptr(v);
   return i < t->length ? ts_num(ta_load(t, i)) : TS_UNDEFINED;
@@ -14796,24 +14767,44 @@ tsv ts_array_get_linked_f64(tsv arr, double d, ts_frame_hdr* frame, uint32_t nsl
 }
 /* Element access with a number key (docs/array_index_keys_design.md): the
    element path for an index, the dynamic property path for any other
-   number. */
+   number. A receiver with no elements of its own (a value its static type
+   does not describe: an object cast to an array or a view) is read and
+   written by the key as a property; null and undefined throw, and a write
+   to another primitive throws as strict code does. */
+static inline int elem_read_receiver(tsv v){ return ts_is_indexed_array_fast(v) || ts_is_str(v) || ts_is_typed_array(v); }
+static inline int elem_write_receiver(tsv v){ return ts_is_indexed_array_fast(v) || ts_is_typed_array(v); }
+static void elem_set_other(tsv obj, tsv keyv, tsv v){
+  if (ts_is_propbag(obj)){ ts_set_dyn(obj, keyv, v); return; }
+  if (ts_is_str(obj)){
+    double d = ts_to_num(keyv);
+    if (d >= 0 && d < (double)ts_str_len_typed(obj)){
+      char num[40], buf[160]; ts_fmt_num(d, num, sizeof num);
+      uint32_t sl; char* sc = ts_string_cstr_copy(obj, &sl);
+      snprintf(buf, sizeof buf, "Cannot assign to read only property '%s' of string '%s'", num, sc ? sc : "?");
+      free(sc);
+      ts_throw_type_error_msg(buf);
+    }
+  }
+  ts_key key;
+  if (ts_key_from_value(keyv, &key)) ts_throw_bad_write_receiver(obj, key);
+}
 tsv ts_array_get_key_i64(tsv arr, int64_t i){
-  if ((uint64_t)i < TS_ARRAY_INDEX_LIMIT) return ts_array_get(arr, (uint32_t)i);
-  return ts_get_dyn(arr, ts_num((double)i));
+  if ((uint64_t)i < TS_ARRAY_INDEX_LIMIT && elem_read_receiver(arr)) return ts_array_get(arr, (uint32_t)i);
+  return ts_get_dyn_checked(arr, ts_num((double)i));
 }
 tsv ts_array_get_key_f64(tsv arr, double d){
   uint32_t i;
-  if (ts_num_array_index(d, &i)) return ts_array_get(arr, i);
-  return ts_get_dyn(arr, ts_num(d));
+  if (ts_num_array_index(d, &i) && elem_read_receiver(arr)) return ts_array_get(arr, i);
+  return ts_get_dyn_checked(arr, ts_num(d));
 }
 void ts_array_set_key_i64(tsv arr, int64_t i, tsv v){
-  if ((uint64_t)i < TS_ARRAY_INDEX_LIMIT){ ts_array_set(arr, (uint32_t)i, v); return; }
-  ts_set_dyn(arr, ts_num((double)i), v);
+  if ((uint64_t)i < TS_ARRAY_INDEX_LIMIT && elem_write_receiver(arr)){ ts_array_set(arr, (uint32_t)i, v); return; }
+  elem_set_other(arr, ts_num((double)i), v);
 }
 void ts_array_set_key_f64(tsv arr, double d, tsv v){
   uint32_t i;
-  if (ts_num_array_index(d, &i)){ ts_array_set(arr, i, v); return; }
-  ts_set_dyn(arr, ts_num(d), v);
+  if (ts_num_array_index(d, &i) && elem_write_receiver(arr)){ ts_array_set(arr, i, v); return; }
+  elem_set_other(arr, ts_num(d), v);
 }
 void ts_set_pic(tsv obj, ts_key key, tsv val, ts_prop_ic* ic){
   TS_RT_STAT_PIC_SET_CALL();

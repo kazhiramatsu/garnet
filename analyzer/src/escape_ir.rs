@@ -526,6 +526,11 @@ pub struct Capture {
     pub cell: LocalId,
 }
 
+
+/// serde: an unset view element hint stays out of the JSON dumps.
+fn no_view_elem(elem: &u8) -> bool {
+    *elem == 0
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all_fields = "camelCase")]
 pub enum Inst {
@@ -565,6 +570,10 @@ pub enum Inst {
         field: FieldId,
         #[serde(default)]
         slots: u32,
+        /// The receiver's static type is a typed array view (element type
+        /// `elem - 1`, docs/typed_arrays_design.md); 0 otherwise.
+        #[serde(default, skip_serializing_if = "no_view_elem")]
+        elem: u8,
     },
     StoreField {
         obj: LocalId,
@@ -687,17 +696,22 @@ pub enum Inst {
         op: String,
         operand: LocalId,
     },
-    /// Codegen-only: indexed array read `dst = arr[idx]`.
+    /// Codegen-only: indexed array read `dst = arr[idx]`. `elem` as for
+    /// LoadField: the receiver is statically a view of that element type.
     LoadIndex {
         dst: LocalId,
         arr: LocalId,
         index: LocalId,
+        #[serde(default, skip_serializing_if = "no_view_elem")]
+        elem: u8,
     },
     /// Codegen-only: indexed array write `arr[idx] = src`.
     StoreIndex {
         arr: LocalId,
         index: LocalId,
         src: LocalId,
+        #[serde(default, skip_serializing_if = "no_view_elem")]
+        elem: u8,
     },
     /// Codegen-only: `dst = arr.length`.
     ArrayLen {

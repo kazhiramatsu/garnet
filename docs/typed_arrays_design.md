@@ -108,6 +108,49 @@ prototype: garnet runs one thread, so nothing else can observe it.
 - **Messages** follow V8 (the RangeErrors name the offending number, a bad
   callback is described as V8 does).
 
+## TA2 as built
+
+Measured after TA1 (kernels in the session scratchpad; node takes about
+160 ms on each): a byte sieve 3.2x slower than node, an Int32 histogram
+5.7x, Float64 loops 5.9x, subarray/set/byte loops 8.9x. Each element access
+of a view took the generic element entry (the array test fails, the lazy
+frame is linked, `ts_array_get_key_i64`, `ts_array_get`, `ts_ta_get`
+switching on the element type and boxing), and `view.length` was a
+property read missing the inline cache.
+
+- **IR hints.** LoadIndex, StoreIndex and LoadField carry `elem` (0 none,
+  else the element type + 1) when the exporter sees a receiver whose static
+  type is a view of one element type (`viewElemOf`; a union of views of one
+  element type too). The hint never decides correctness: the emitted code
+  tests the receiver.
+- **Element reads.** `ts_ta_try_load_i/f`: kind and element-type test,
+  bounds, the typed load (memcpy; the element type is a constant, so the
+  switch folds), in line; any other receiver, element type or index takes
+  the generic entry as the access point's slow path (linked like the array
+  read's). An unboxed destination takes the double; a boxed one keeps
+  undefined for an index out of range.
+- **Element stores** of an unboxed numeric value: `ts_ta_try_store_i/f`
+  with the conversion in line, the generic entry otherwise. Such a store is
+  an access point (`is_view_store_point`: the in-line store cannot
+  collect), so loops over views keep their lazy frames. A boxed value keeps
+  the generic store (its ToNumber may run user code).
+- **`length`** of a receiver typed as a view: in line when the view has no
+  own properties (an own `length` shadows the accessor), the property read
+  otherwise.
+- **The generic element entries** (`ts_array_get_key_*`,
+  `ts_array_set_key_*`) answered undefined for, and dropped writes to, any
+  receiver without elements of its own: a value its static type does not
+  describe (an object cast to an array or a view) is now read and written
+  by the index as a property, null and undefined throw, and a write to
+  another primitive throws as strict code does.
+
+After TA2: sieve 1.1x node, Float64 loops 1.8x, subarray/set/byte loops
+3.75x; the histogram is held back by `Math.imul`, an out-of-line call (the
+typed array half of it is 2x node). Next: the loop-invariant receiver's
+data and length hoisted out of loops (the bytes do not move, a view's
+length is fixed), static dispatch of the methods, `for...of` over views as
+an index loop, allocation of small buffers.
+
 ## Slices
 
 1. **TA1, correctness**: the kinds, GC (scan the buffer slot and the

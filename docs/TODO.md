@@ -7281,3 +7281,35 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   V8 does) and say "value is not a function"; `console.log` does not group
   long numeric arrays into columns as node does, nor print an array's or a
   view's named properties.
+- Typed arrays, slice TA2 (`docs/typed_arrays_design.md`, "TA2 as built"):
+  element reads and stores and `length` of a receiver whose static type is
+  a view, in line. LoadIndex, StoreIndex and LoadField carry `elem` (the
+  element type + 1) from the exporter (`viewElemOf`); the emitted code tests
+  the kind, the element type and the bounds, loads or converts and stores
+  through memcpy, and takes the generic element entry otherwise (as the
+  access point's slow path, linked like the array read's); a store of an
+  unboxed number is an access point, so loops over views keep lazy frames;
+  `length` is in line for a view without own properties. Silent wrong values
+  fixed in the generic element entries (`ts_array_get_key_*`,
+  `ts_array_set_key_*`): a receiver its static type did not describe (an
+  object cast to an array or a view, a Map) read undefined and dropped
+  writes; it is now read and written by the index as a property (getters
+  and setters run), null and undefined throw, and writes to other
+  primitives throw as strict code does. Kernels against node: sieve 3.2x to
+  1.1x, Float64 loops 5.9x to 1.8x, subarray/set/byte loops 8.9x to 3.75x;
+  the histogram stays at 6.8x because of `Math.imul`, an out-of-line call
+  (its typed array half is 2x node). Fixtures
+  `stdlib/typed_array_elements` (bounds and keys, every conversion through
+  the in-line store, compound updates, mistyped receivers, an own `length`,
+  a loop that allocates while holding a view) and
+  `arrays/element_receivers`, both in the GC stress filter; known rows for
+  the first (the frozen emitter) and a selfconf row for the second (the
+  frozen emitter's legacy element path calls `ts_array_get` directly). The
+  inline policy gate allows the bounded view helpers. Gates: unit, parity
+  (367 identical), bundler 42/42, selfconf, GC stress, inline policy,
+  conformance 508/508 and 508/508 with a collection at every allocation in
+  protect mode; tsc rebuilt (`native_s350t2`; 14 lines of its C differ,
+  the `Uint16Array` of `parsePseudoBigInt`) and compiled under protect
+  mode, with zapping, and with a minor collection every 256 allocations,
+  its 78 output files identical. A/B against `ta`, sixteen ABBA pairs:
+  wall 0.9975, instructions 1.0004, cycles 0.9980: neutral.

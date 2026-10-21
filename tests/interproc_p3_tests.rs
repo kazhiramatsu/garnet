@@ -174,7 +174,7 @@ fn main() {
             cond:LocalId(3), cond_body:vec![],
             body:vec![
                 AllocObject {dst:LocalId(1), type_id:TypeId(0), site:SiteId(400), class_id:None, proto:None},
-                StoreIndex {arr:LocalId(0), index:LocalId(2), src:LocalId(1)},
+                StoreIndex {arr:LocalId(0), index:LocalId(2), src:LocalId(1), elem:0},
             ],
         },
     ]);

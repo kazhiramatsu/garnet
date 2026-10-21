@@ -601,12 +601,12 @@ fn disqualify_array_roots_in_inst(
             l!(*dst);
             l!(*operand);
         }
-        Inst::LoadIndex { dst, arr, index } => {
+        Inst::LoadIndex { dst, arr, index, .. } => {
             l!(*dst);
             l!(*arr);
             l!(*index);
         }
-        Inst::StoreIndex { arr, index, src } => {
+        Inst::StoreIndex { arr, index, src, .. } => {
             l!(*arr);
             l!(*index);
             l!(*src);
@@ -780,7 +780,7 @@ fn find_array_sroa_targets(
                     alias.insert(dst.0, root);
                     }
             }
-            Inst::StoreIndex { arr, index, src } => {
+            Inst::StoreIndex { arr, index, src, .. } => {
                 if let Some(root) = array_sroa_root_for_target(arr.0, &targets, &alias) {
                     if const_indices.get(&index.0).is_none() {
                         disq.insert(root);
@@ -796,7 +796,7 @@ fn find_array_sroa_targets(
                 disq_local(*index, &targets, &alias, &mut disq);
                 disq_local(*src, &targets, &alias, &mut disq);
             }
-            Inst::LoadIndex { dst, arr, index } => {
+            Inst::LoadIndex { dst, arr, index, .. } => {
                 alias.remove(&dst.0);
                 const_indices.remove(&dst.0);
                 if targets.contains_key(&dst.0) {
@@ -1140,7 +1140,7 @@ fn find_sroa_targets(
                     dq(arr.0, alias, disq);
                     dq(index.0, alias, disq);
                 }
-                Inst::StoreIndex { arr, index, src } => {
+                Inst::StoreIndex { arr, index, src, .. } => {
                     dq(arr.0, alias, disq);
                     dq(index.0, alias, disq);
                     dq(src.0, alias, disq);
@@ -1675,7 +1675,7 @@ fn rewrite_body(
                 }
             }
 
-            Inst::StoreIndex { arr, index, src } => {
+            Inst::StoreIndex { arr, index, src, .. } => {
                 if let Some(root) = array_sroa_root_for_scalars(arr.0, &array_scalars, &array_alias)
                 {
                     if let Some(idx) = const_indices.get(&index.0).copied() {
@@ -1695,7 +1695,7 @@ fn rewrite_body(
                 out.push(inst.clone());
             }
 
-            Inst::LoadIndex { dst, arr, index } => {
+            Inst::LoadIndex { dst, arr, index, .. } => {
                 invalidate_array_tracking_def(*dst, &mut array_alias, &mut const_indices);
                 if let Some(root) = array_sroa_root_for_scalars(arr.0, &array_scalars, &array_alias)
                 {
@@ -2620,7 +2620,7 @@ fn inline_free_fn(
                 dst: m(*d),
                 src: m(*src),
             }),
-            Inst::LoadField { dst: d, obj, field, slots } => {
+            Inst::LoadField { dst: d, obj, field, slots, elem } => {
                 if let Some(fields_by_param) = scalar_param_fields {
                     if let Some(fmap) = fields_by_param.get(&obj.0) {
                         if let Some(&fs) = fmap.get(&field.0) {
@@ -2637,6 +2637,7 @@ fn inline_free_fn(
                     obj: m(*obj),
                     field: *field,
                     slots: *slots,
+                    elem: *elem,
                 });
             }
             Inst::StoreField { obj, field, src, slots } => {
@@ -2703,7 +2704,7 @@ fn inline_callee(
     for inst in &callee.body {
         match inst {
             // this.fK load -> copy from field scalar
-            Inst::LoadField { dst: d, obj, field, slots } if Some(obj.0) == this_local => {
+            Inst::LoadField { dst: d, obj, field, slots, elem } if Some(obj.0) == this_local => {
                 if let Some(&fs) = fmap.get(&field.0) {
                     out.push(Inst::Copy {
                         dst: m(*d),
@@ -2715,6 +2716,7 @@ fn inline_callee(
                         obj: m(*obj),
                         field: *field,
                         slots: *slots,
+                        elem: *elem,
                     });
                 }
             }
@@ -2812,11 +2814,12 @@ fn inline_callee(
                 dst: m(*d),
                 src: m(*src),
             }),
-            Inst::LoadField { dst: d, obj, field, slots } => out.push(Inst::LoadField {
+            Inst::LoadField { dst: d, obj, field, slots, elem } => out.push(Inst::LoadField {
                 dst: m(*d),
                 obj: m(*obj),
                 field: *field,
                 slots: *slots,
+                elem: *elem,
             }),
             Inst::StoreField { obj, field, src, slots } => out.push(Inst::StoreField {
                 obj: m(*obj),
@@ -2880,11 +2883,12 @@ pub(crate) fn remap_inst_operands(inst: &Inst, m: &dyn Fn(LocalId) -> LocalId) -
             dst: m(*dst),
             src: m(*src),
         },
-        Inst::LoadField { dst, obj, field, slots } => Inst::LoadField {
+        Inst::LoadField { dst, obj, field, slots, elem } => Inst::LoadField {
             dst: m(*dst),
             obj: m(*obj),
             field: *field,
             slots: *slots,
+            elem: *elem,
         },
         Inst::StoreField { obj, field, src, slots } => Inst::StoreField {
             obj: m(*obj),
@@ -2978,15 +2982,17 @@ pub(crate) fn remap_inst_operands(inst: &Inst, m: &dyn Fn(LocalId) -> LocalId) -
             arr: m(*arr),
             src: m(*src),
         },
-        Inst::LoadIndex { dst, arr, index } => Inst::LoadIndex {
+        Inst::LoadIndex { dst, arr, index, elem } => Inst::LoadIndex {
             dst: m(*dst),
             arr: m(*arr),
             index: m(*index),
+            elem: *elem,
         },
-        Inst::StoreIndex { arr, index, src } => Inst::StoreIndex {
+        Inst::StoreIndex { arr, index, src, elem } => Inst::StoreIndex {
             arr: m(*arr),
             index: m(*index),
             src: m(*src),
+            elem: *elem,
         },
         Inst::LoadGlobal { dst, gref } => Inst::LoadGlobal {
             dst: m(*dst),

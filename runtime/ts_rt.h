@@ -2034,6 +2034,77 @@ tsv ts_array_get_key_i64(tsv arr, int64_t i);
 tsv ts_array_get_key_f64(tsv arr, double d);
 void ts_array_set_key_i64(tsv arr, int64_t i, tsv v);
 void ts_array_set_key_f64(tsv arr, double d, tsv v);
+/* Elements and length of a view in line (TA2, docs/typed_arrays_design.md),
+   for a receiver whose static type is a view of element type `elem` (a
+   constant at every site, so the switches fold). A view of that type with
+   the index in range reads or writes the element; for anything else the try
+   functions return 0 and the caller takes the generic element entry. The
+   bytes move through memcpy: views of different element types alias one
+   buffer. */
+static inline ts_typedarray* ts_ta_as(tsv v, int elem){
+  if (!ts_is_obj(v)) return NULL;
+  ts_typedarray* t = (ts_typedarray*)ts_ptr(v);
+  return t->o.h.kind == TS_KIND_TYPEDARRAY && t->elem == (uint8_t)elem ? t : NULL;
+}
+static inline uint8_t ts_ta_clamp_u8(double d){
+  if (!(d > 0)) return 0;           /* NaN, -0, negatives */
+  if (d >= 255) return 255;
+  double f = floor(d), r = d - f;
+  uint32_t u = (uint32_t)f;
+  if (r > 0.5 || (r == 0.5 && (u & 1u))) u++;   /* round half to even */
+  return (uint8_t)u;
+}
+TS_RT_ALWAYS_INLINE double ts_ta_elem_load(const uint8_t* data, uint32_t i, int elem){
+  switch (elem){
+    case TS_TA_INT8: return (double)((const int8_t*)data)[i];
+    case TS_TA_UINT8: case TS_TA_UINT8C: return (double)data[i];
+    case TS_TA_INT16: { int16_t x; memcpy(&x, data + (size_t)i * 2u, 2); return (double)x; }
+    case TS_TA_UINT16: { uint16_t x; memcpy(&x, data + (size_t)i * 2u, 2); return (double)x; }
+    case TS_TA_INT32: { int32_t x; memcpy(&x, data + (size_t)i * 4u, 4); return (double)x; }
+    case TS_TA_UINT32: { uint32_t x; memcpy(&x, data + (size_t)i * 4u, 4); return (double)x; }
+    case TS_TA_FLOAT32: { float x; memcpy(&x, data + (size_t)i * 4u, 4); return (double)x; }
+    default: { double x; memcpy(&x, data + (size_t)i * 8u, 8); return x; }
+  }
+}
+/* The element conversions: ToInt8 .. ToUint32 by ToInt32's bits, Uint8Clamped
+   by rounding half to even, Float32 by rounding. */
+TS_RT_ALWAYS_INLINE void ts_ta_elem_store(uint8_t* data, uint32_t i, double d, int elem){
+  switch (elem){
+    case TS_TA_INT8: case TS_TA_UINT8: data[i] = (uint8_t)(uint32_t)ts_to_int32(d); break;
+    case TS_TA_UINT8C: data[i] = ts_ta_clamp_u8(d); break;
+    case TS_TA_INT16: case TS_TA_UINT16: { uint16_t x = (uint16_t)(uint32_t)ts_to_int32(d); memcpy(data + (size_t)i * 2u, &x, 2); break; }
+    case TS_TA_INT32: case TS_TA_UINT32: { int32_t x = ts_to_int32(d); memcpy(data + (size_t)i * 4u, &x, 4); break; }
+    case TS_TA_FLOAT32: { float x = (float)d; memcpy(data + (size_t)i * 4u, &x, 4); break; }
+    default: memcpy(data + (size_t)i * 8u, &d, 8); break;
+  }
+}
+TS_RT_ALWAYS_INLINE int ts_ta_try_load_i(tsv v, int64_t i, int elem, double* out){
+  ts_typedarray* t = ts_ta_as(v, elem);
+  if (TS_RT_LIKELY(t && (uint64_t)i < t->length)){ *out = ts_ta_elem_load(t->data, (uint32_t)i, elem); return 1; }
+  return 0;
+}
+TS_RT_ALWAYS_INLINE int ts_ta_try_load_f(tsv v, double d, int elem, double* out){
+  uint32_t i;
+  return ts_num_array_index(d, &i) && ts_ta_try_load_i(v, (int64_t)i, elem, out);
+}
+TS_RT_ALWAYS_INLINE int ts_ta_try_store_i(tsv v, int64_t i, double x, int elem){
+  ts_typedarray* t = ts_ta_as(v, elem);
+  if (TS_RT_LIKELY(t && (uint64_t)i < t->length)){ ts_ta_elem_store(t->data, (uint32_t)i, x, elem); return 1; }
+  return 0;
+}
+TS_RT_ALWAYS_INLINE int ts_ta_try_store_f(tsv v, double d, double x, int elem){
+  uint32_t i;
+  return ts_num_array_index(d, &i) && ts_ta_try_store_i(v, (int64_t)i, x, elem);
+}
+/* `view.length`: any view without own properties (an own `length` would
+   shadow the accessor). */
+TS_RT_ALWAYS_INLINE int ts_ta_try_length(tsv v, tsv* out){
+  if (!ts_is_obj(v)) return 0;
+  ts_typedarray* t = (ts_typedarray*)ts_ptr(v);
+  if (t->o.h.kind != TS_KIND_TYPEDARRAY || t->o.len != 0) return 0;
+  *out = ts_num((double)t->length);
+  return 1;
+}
 /* Element read: the array path allocates nothing; a string receiver builds a
    one-character view, so it runs with the frame linked. */
 TS_RT_ALWAYS_INLINE tsv ts_array_get_lazy(tsv arr, int64_t i, ts_frame_hdr* frame, uint32_t nslots){

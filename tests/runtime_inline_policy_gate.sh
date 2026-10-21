@@ -83,7 +83,14 @@ while IFS= read -r name; do
     ts_eq_strlit | \
     ts_truthy_fast | \
     ts_to_int32 | \
-    ts_to_uint32) ;;
+    ts_to_uint32 | \
+    ts_ta_elem_load | \
+    ts_ta_elem_store | \
+    ts_ta_try_load_i | \
+    ts_ta_try_load_f | \
+    ts_ta_try_store_i | \
+    ts_ta_try_store_f | \
+    ts_ta_try_length) ;;
     *)
       echo "[runtime-inline] FAIL: unexpected always-inline runtime helper $name"
       exit 1
