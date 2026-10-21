@@ -113,11 +113,26 @@ And one loud gap: `{ __proto__: P }` in a literal makes an own property
 
 1. This one: the flag term.
 2. Grafted methods and deleted fields (the gaps above), so that a class's
-   `this` and its fields are what its accesses assume: a method value that
-   leaves a call position (`x.m` not called, `C.prototype.m`, a method
-   read through `any` or a computed key) and `delete` on a value that can
-   be a class instance are the whole-program sites to find; a class whose
-   methods never leave call positions needs nothing at run time.
+   `this` and its fields are what its accesses assume, in open programs too:
+   - the flag's test of a struct access (a method's `this`, a class-typed
+     parameter) checks the analysis class's interval (`cls`), not only the
+     sized layout, once the flag is up: a sized instance of another class
+     fails it;
+   - new raise points: a relink of any object (a sized one too) behind a
+     class with struct fields; `call` / `apply` / `bind` of a struct method
+     with a `this` that is not an instance of the method's class; `delete`
+     of a struct field (the instance becomes a plain object behind its
+     prototype: the struct area turned into in-object slots, the remaining
+     fields and its own properties re-added in order); a method value that
+     leaves a call position (`x.m` not called, a method read through `any`
+     or a computed key: the emitter marks each such site);
+   - a relinked sized instance's layout from its allocation class, not from
+     its prototype (the generic paths read a relinked instance at the new
+     prototype's class offsets today);
+   - the closed-receivers pass treats the new points like the old ones: a
+     method value leaving a call position (except as an iteration method's
+     callback or a `bind` with a `this` of the method's class) and `delete`
+     on a value that can be a class instance open the program.
 3. Object tests that do not merge back: in a closed program a non-object
    in a stable class's position can only be `null` or `undefined` (any
    other value needs an `any` flow or a cast, which the structural pass

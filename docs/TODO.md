@@ -7661,3 +7661,36 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   rebuilt (`native_s350cl`, C unchanged) under protect, zap and frequent
   minors, outputs identical, A/B neutral (wall 0.9989); tsc-ts closed under
   the same three modes, outputs identical.
+- Literal layouts of class receivers: the emitter planned every function
+  whose body starts with two or more stores into `this` as a function-style
+  constructor (adopt a literal layout, else store through the property
+  cache), ahead of the struct path. A class constructor's or method's
+  `this` is a class instance, which never adopts one, so every such store
+  took the cache: tsc-ts's `Node` constructor (every node), `FlowState.reset`,
+  `Relater.reset`, `EmitNode`'s. The plan now skips a sequence whose stores
+  carry the exporter's class hint (they reach the struct slots directly):
+  362 -> 180 adoption sites in tsc-ts; emitting x0.920 (eight interleaved
+  rounds, 47.2 G -> 41.7 G instructions, output identical). Fixture
+  `classes/constructor_field_stores` (an abstract base's constructor storing
+  the fields every subclass shares, a reset method, pooled instances, a
+  function-style constructor that still adopts its layout).
+- JSON.stringify: a circular structure aborted the program ("structure too
+  deep (cycle?)", at a depth of 256, so a deep acyclic value aborted too);
+  it now throws V8's TypeError ("Converting circular structure to JSON")
+  when an object or array is already open on the path being stringified
+  (each frame's rooted slot, linked from the buffer, so a throw leaves no
+  state behind), and V8's RangeError past a depth of 4096. A Map
+  stringified its string-keyed entries (silent wrong value: V8 gives `{}`
+  plus the Map's own properties); it stringifies as the object it is.
+  Fixture `stdlib/json_cycles_and_maps`; parity known row (the frozen
+  emitter leaves an `unknown` local that holds arrays unrooted). Gates for
+  both: unit, parity (375 identical), bundler 43/43, selfconf, GC stress,
+  inline policy, conformance 526/526 (the JSON fixture's first version read
+  a class instance's key order, which the ES2020 oracle defines otherwise),
+  strict and allocation-stress runs; tsc rebuilt (`native_s350ly`, C
+  unchanged) under protect, zap and frequent minors, outputs identical, A/B
+  neutral; tsc-ts under the same three modes, outputs identical. tsc-ts
+  against node and scriptc, interleaved (five rounds): emitting 2.222 s,
+  3.257 s, 1.064 s (garnet 1.47x node); checking only 1.546 s, 2.356 s,
+  0.666 s (1.52x). Later: JSON's speed (a class's layout looked up per
+  field, `toJSON` per value, keys quoted every time).

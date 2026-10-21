@@ -10114,8 +10114,13 @@ tsv ts_object_from_entries(tsv entries){
 
 /* ---------------- JSON ---------------- */
 /* growable byte buffer for stringify */
-typedef struct { char* p; size_t len, cap; int heap; int nonascii; char small[256]; } jbuf;
-static void jb_init(jbuf* b){ b->p=b->small; b->len=0; b->cap=sizeof(b->small); b->heap=0; b->nonascii=0; }
+/* The objects and arrays open on the way from the value being stringified
+   down to the current one, each frame's rooted slot (the collector keeps it
+   current): the cycle test. Frames live on the C stack, so a throw that
+   leaves a stringify call leaves nothing behind. */
+typedef struct json_path { tsv* slot; struct json_path* up; } json_path;
+typedef struct { char* p; size_t len, cap; int heap; int nonascii; json_path* path; char small[256]; } jbuf;
+static void jb_init(jbuf* b){ b->p=b->small; b->len=0; b->cap=sizeof(b->small); b->heap=0; b->nonascii=0; b->path=NULL; }
 static void jb_grow(jbuf* b, size_t need){
   size_t nc=b->cap;
   while(need>nc) nc*=2;
@@ -10333,8 +10338,19 @@ static int json_emit_prop_map_direct(jbuf* b, tsv obj, int depth, const char* in
   return 1;
 }
 
+/* Open an object or array: a value already open on the path is a cycle
+   (V8: TypeError "Converting circular structure to JSON"); past a depth the
+   C stack cannot take, V8's RangeError for a stack overflow. */
+#define TS_JSON_MAX_DEPTH 4096
+static void json_enter(jbuf* b, json_path* node, tsv* slot, int depth){
+  if (depth > TS_JSON_MAX_DEPTH) ts_throw_range_error_msg("Maximum call stack size exceeded");
+  void* p = ts_ptr(*slot);
+  for (json_path* q = b->path; q; q = q->up)
+    if (ts_ptr(*q->slot) == p) ts_throw_type_error_msg("Converting circular structure to JSON");
+  node->slot = slot; node->up = b->path; b->path = node;
+}
+static inline void json_leave(jbuf* b, json_path* node){ b->path = node->up; }
 static int json_stringify_val(jbuf* b, tsv v, int depth, const char* indent){
-  if (depth > 256){ fprintf(stderr,"tsaot: JSON.stringify: structure too deep (cycle?)\n"); abort(); }
   /* top-level toJSON (key ""): children get toJSON applied by their property /
      element / map emitters, so depth>0 never re-applies it to the same value. */
   if (depth == 0 && ts_is_obj(v)) v = json_apply_tojson(v, "", 0);
@@ -10345,6 +10361,7 @@ static int json_stringify_val(jbuf* b, tsv v, int depth, const char* indent){
   if (ts_is_str(v)){ json_quote(b, ts_str_view_typed(v)); return 1; }
   if (ts_is_array(v)){
     ts_gc_root(&v);
+    json_path node; json_enter(b, &node, &v, depth);
     ts_array* a=ts_ptr(v); uint32_t len=a->len; jb_putc(b,'[');
     for (uint32_t i=0;i<len;i++){ a=ts_ptr(v); if(i) jb_putc(b,',');
       jb_indent(b, indent, depth+1);
@@ -10352,39 +10369,18 @@ static int json_stringify_val(jbuf* b, tsv v, int depth, const char* indent){
       if (ts_is_obj(elem)){ char ib[24]; int il=snprintf(ib,sizeof ib,"%u",i); elem=json_apply_tojson(elem, ib, (uint32_t)il); }
       if (!json_stringify_val(b, elem, depth+1, indent)) jb_putz(b,"null"); /* holes/undef -> null */ }
     if (len) jb_indent(b, indent, depth);
+    json_leave(b, &node);
     jb_putc(b,']'); ts_gc_unroot(1); return 1;
   }
-  if (ts_is_map(v)){
-    ts_gc_root(&v);
-    ts_map* m=ts_ptr(v); uint32_t len=m->len; jb_putc(b,'{'); int first=1;
-    for (uint32_t i=0;i<len;i++){
-      m=ts_ptr(v);
-      if (i>=m->len || !ts_is_str(m->keys[i])) continue;  /* only string keys */
-      tsv key=m->keys[i];
-      tsv val=m->vals[i];
-      ts_gc_root(&key);
-      {
-        ts_strview kv = ts_str_view_typed(key);
-        char short_key[TS_SHORTSTR_MAX];
-        val = json_apply_tojson(val, ts_str_view_data(&kv, short_key), kv.len);
-      }
-      if (ts_is_undef(val)||ts_is_func(val)){ ts_gc_unroot(1); continue; }
-      ts_gc_root(&val);
-      if (!first) jb_putc(b,','); first=0;
-      jb_indent(b, indent, depth+1);
-      json_quote(b, ts_str_view_typed(key)); jb_putc(b,':');
-      if (indent && *indent) jb_putc(b,' ');
-      json_stringify_val(b, val, depth+1, indent);
-      ts_gc_unroot(2);
-    }
-    if (!first) jb_indent(b, indent, depth);
-    jb_putc(b,'}'); ts_gc_unroot(1); return 1;
-  }
+  /* a Map's entries are not properties: it stringifies as the object it is
+     (its own enumerable properties, V8's {} for a bare Map) */
   if (g_has_proxies && ts_is_proxy(v)){                     /* proxy: enumerate via traps */
     jb_putc(b,'{');
     ts_gc_root(&v);
+    json_path node; json_enter(b, &node, &v, depth);
     json_obj_ctx jc; jc.b=b; jc.depth=depth; jc.first=1; jc.recv=v; jc.indent=indent;
     ts_proxy_enum(v, cb_json_obj_prop, &jc);
+    json_leave(b, &node);
     ts_gc_unroot(1);
     if (!jc.first) jb_indent(b, indent, depth);
     jb_putc(b,'}'); return 1;
@@ -10392,6 +10388,7 @@ static int json_stringify_val(jbuf* b, tsv v, int depth, const char* indent){
   if (ts_is_obj(v)){                                        /* plain object / class instance */
     jb_putc(b,'{');
     ts_gc_root(&v);
+    json_path node; json_enter(b, &node, &v, depth);
     int first=1;
     if (ts_is_typed_array(v)) {
       for (uint32_t i = 0; i < ((ts_typedarray*)ts_ptr(v))->length; i++) {
@@ -10420,6 +10417,7 @@ static int json_stringify_val(jbuf* b, tsv v, int depth, const char* indent){
       first=jc.first;
       used_direct=0;
     }
+    json_leave(b, &node);
     ts_gc_unroot(1);
     (void)used_direct;
     if (!first) jb_indent(b, indent, depth);
