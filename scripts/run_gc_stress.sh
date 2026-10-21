@@ -48,8 +48,9 @@ if [[ "$RUN_BASE" != "0" ]]; then
 fi
 
 if [[ "$RUN_PROTECT" != "0" ]]; then
-  # Protect mode (docs/gc_v2_design.md §6.5): released nursery chunks are made
-  # inaccessible, so a reference that went stale when its cell moved faults.
+  # Protect mode (docs/gc_v2_design.md §6.8): freed cells are zapped and
+  # quarantined instead of reused, and a collection that reaches one reports
+  # the dangling reference (a missing root or write barrier).
   echo ">>> focused conformance (protect mode, normal O2)"
   TSAOT_GC_YOUNG_THRESHOLD="$THRESHOLD" TSAOT_GC_PROTECT=1 \
     bash "$S/run_conformance.sh" exhaustive "$FILTER" || rc=1

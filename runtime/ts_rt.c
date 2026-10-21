@@ -48,7 +48,14 @@ static int g_sparse_elements = 1;       /* TSAOT_SPARSE_ELEMENTS=0: far stores a
    deadlocks at startup on this host, so this is the always-available
    use-after-move detector. GC cold paths only; zero mutator cost. */
 static int g_gc_zap = 0;
-static uint32_t g_gc_protect = 0;   /* TSAOT_GC_PROTECT: quarantine length of released nursery chunks; 0 = off */
+static uint32_t g_gc_protect = 0;   /* TSAOT_GC_PROTECT: MiB of freed cells kept in quarantine; 0 = off */
+/* The gen of a cell in protect mode's quarantine (gc_cell_quarantine). */
+#define GC_GEN_FREED 3u
+static void gc_freed_reached(ts_gc_header* h){
+  fprintf(stderr, "tsaot: GC protect mode: a reachable reference names a freed cell (%p): "
+                  "a missing root or write barrier\n", (void*)h);
+  abort();
+}
 
 /* ---- bump nursery (gc_moving_plan Phase B) ----
    Young movable cells live in 256KB-aligned arena chunks: allocation is a bump
@@ -336,23 +343,25 @@ static void* gc_payload_alloc(size_t bytes, int old){
    Cells live in blocks of their size class and never move. A set mark bit
    means "old": a pretenured cell is allocated marked, an eden collection
    sets the bit of every young cell it found reachable (promotion in place),
-   and a full collection rebuilds the bits from its marks. Between
+   and a full collection clears the bits of the old cells it did not
+   reach. Between
    collections the young cells of the cycle sit behind the class cursors, so
    they are never handed out twice; after a collection every unmarked cell is
    free. Cells above the small maximum take runs of blocks with a run mark.
-   Handles stay (the value encoding is unchanged): the handles issued in a
-   cycle are logged, and the log is how an eden collection finds the young
-   cells, promoting the marked and releasing the dead without a sweep. */
-static uint32_t* g_young_log = NULL;
+   A reference is the cell's address (slice D2). The cells allocated young
+   in a cycle are logged, and the log is how a collection finds them,
+   promoting the marked and releasing the dead without a sweep (a dying
+   cell's side buffers and the heap accounting need the visit). */
+static ts_gc_header** g_young_log = NULL;
 static size_t g_young_log_len = 0, g_young_log_cap = 0;
-static inline void gc_young_log_push(uint32_t id){
+static inline void gc_young_log_push(ts_gc_header* h){
   if (TS_RT_UNLIKELY(g_young_log_len == g_young_log_cap)){
     size_t next = g_young_log_cap ? g_young_log_cap * 2 : 65536;
-    uint32_t* grown = (uint32_t*)realloc(g_young_log, sizeof(uint32_t) * next);
-    if (!grown) ts_abort_msg("out of memory growing the young handle log");
+    ts_gc_header** grown = (ts_gc_header**)realloc(g_young_log, sizeof(ts_gc_header*) * next);
+    if (!grown) ts_abort_msg("out of memory growing the young cell log");
     g_young_log = grown; g_young_log_cap = next;
   }
-  g_young_log[g_young_log_len++] = id;
+  g_young_log[g_young_log_len++] = h;
 }
 static void* gc_cell_alloc_large(size_t bytes, int old){
   uint32_t n = (uint32_t)((bytes + GC_BLOCK_BYTES - 1u) >> GC_BLOCK_SHIFT);
@@ -411,16 +420,6 @@ static void gc_cell_release_large(ts_gc_header* h){
   for (uint32_t i = 0; i < n; i++){
     g_blocks[bi + i].state = GC_BLK_FREE; g_blocks[bi + i].next = g_free_blocks; g_free_blocks = bi + i + 1u;
   }
-}
-/* A full collection rebuilds the cells' marks. */
-static void gc_cells_begin_full(void){
-  if (!g_cage_base) return;
-  for (int cls = 0; cls < g_pclass_n; cls++)
-    for (uint32_t l = g_cclass[cls].head; l; l = g_blocks[l - 1u].next){
-      memset(gc_block_bitmap(l - 1u), 0, sizeof(uint64_t) * GC_BLOCK_BITMAP_WORDS);
-      g_blocks[l - 1u].live = 0;
-    }
-  for (uint32_t l = g_large_cell_head; l; l = g_blocks[l - 1u].next) g_blocks[l - 1u].mark = 0;
 }
 /* Mark an owner's payload (from the collector's scan of the owner). */
 static inline void gc_payload_mark(const void* p){
@@ -604,10 +603,6 @@ unsigned long long g_ts_slot_inline_hits = 0, g_ts_slot_external_hits = 0;
 unsigned long long g_ts_pic_set_calls = 0, g_ts_pic_set_hits = 0;
 #endif
 static ts_gc_header** g_remset=NULL; static size_t g_rem_len=0, g_rem_cap=0;
-ts_gc_header** g_ts_handle_table = NULL;
-static uint32_t g_handle_len = 0, g_handle_cap = 0;
-static uint32_t* g_handle_free = NULL;
-static uint32_t g_handle_free_len = 0, g_handle_free_cap = 0;
 
 /* ---------------- runtime stats (compile-time opt-in) ----------------
    Build with -DTSAOT_RT_STATS to compile in lightweight counters; a summary is
@@ -685,7 +680,7 @@ static unsigned long long g0_owner_cells[G0_FATE_N][TS_KIND_LAST + 1];
 static unsigned long long g0_payload_n[G0_FATE_N][G0_P_N], g0_payload_bytes[G0_FATE_N][G0_P_N];
 static unsigned long long g0_alloc_gran[TS_KIND_LAST + 1][G0_GRANULES], g0_resident_gran[TS_KIND_LAST + 1][G0_GRANULES];
 static unsigned long long g0_minor_ns[6], g0_full_ns[6];
-static unsigned long long g0_handle_frees, g0_rem_enroll, g0_proto_materialized, g0_pretenured_bytes;
+static unsigned long long g0_rem_enroll, g0_proto_materialized, g0_pretenured_bytes;
 static void g0_count_fate(ts_gc_header* h, int fate);
 static void g0_dump(FILE* out);
 /* TSAOT_G0_FATES=0 skips the per-cell fate accounting, so the phase timings
@@ -724,9 +719,9 @@ __attribute__((destructor)) static void ts_rt_stats_dump(void){
             ngc ? (double)g_rt_stats.gc_pause_ns/1e6/(double)ngc : 0.0,
             g_rt_stats.mark_stack_peak);
   }
-  fprintf(out, "[rt_stats] alloc: count=%llu bytes=%llu handle_alloc=%llu handle_cap=%u root_push=%llu pretenured=%llu\n",
-          g_rt_stats.alloc_count, g_rt_stats.alloc_bytes, g_rt_stats.handle_alloc,
-          g_handle_cap, g_rt_stats.root_push, g_rt_stats.pretenured_alloc);
+  fprintf(out, "[rt_stats] alloc: count=%llu bytes=%llu young_log_cap=%zu root_push=%llu pretenured=%llu\n",
+          g_rt_stats.alloc_count, g_rt_stats.alloc_bytes,
+          g_young_log_cap, g_rt_stats.root_push, g_rt_stats.pretenured_alloc);
   fprintf(out, "[rt_stats] small_props: fresh=%llu reused=%llu\n",
           g_rt_stats.small_props_fresh, g_rt_stats.small_props_reused);
   fprintf(out, "[rt_stats] prop_add: site_hits=%llu hits=%llu slow=%llu\n",
@@ -1016,10 +1011,6 @@ static inline int gc_direct_header_readable(ts_gc_header* h){
 }
 static inline ts_gc_header* ts_heap_ptr(tsv v){
   uint64_t payload = v & TS_PAYLOAD_MASK;
-  if (payload & 1u){
-    uint32_t id = (uint32_t)(payload >> 1);
-    return (id < g_handle_cap) ? ts_handle_entry_cell((uintptr_t)g_ts_handle_table[id]) : NULL;
-  }
   if (payload & TS_PTR_STACK_TAG){
     ts_gc_header* h = (ts_gc_header*)(uintptr_t)(payload & ~TS_PTR_STACK_TAG);
 #ifdef TSAOT_STACK_CHECK
@@ -1028,38 +1019,12 @@ static inline ts_gc_header* ts_heap_ptr(tsv v){
     if (!gc_direct_stack_plausible(h) || !gc_direct_header_readable(h)) return NULL;
     return (h->gen == TS_GEN_NONHEAP && gc_kind_valid(h->kind)) ? h : NULL;
   }
-  if ((payload & 0x7u) != 0) return NULL; /* cells are at least 8-byte aligned */
+  /* a heap cell: in the cage, 16-byte aligned */
   ts_gc_header* h = (ts_gc_header*)(uintptr_t)payload;
-  if (!h) return NULL;
-  return (gc_kind_valid(h->kind) && h->gen == TS_GEN_OLD) ? h : NULL;
+  if (!gc_payload_in_cage(h) || (payload & 0xFu) != 0) return NULL;
+  return (gc_kind_valid(h->kind) && h->gen <= TS_GEN_OLD) ? h : NULL;
 }
 static inline int gc_is_young(ts_gc_header* h){ return h && h->gen == TS_GEN_YOUNG; }
-static inline void gc_pin_value(tsv v){
-  if (!ts_heap_ref(v)) return;
-  ts_gc_header* h = ts_heap_ptr(v);
-  if (h && (h->gen == TS_GEN_YOUNG || h->gen == TS_GEN_OLD)) h->pin_depth++;
-}
-static inline void gc_unpin_value(tsv v){
-  if (!ts_heap_ref(v)) return;
-  ts_gc_header* h = ts_heap_ptr(v);
-  if (h && (h->gen == TS_GEN_YOUNG || h->gen == TS_GEN_OLD) && h->pin_depth) h->pin_depth--;
-}
-static void gc_pin_string_storage(tsv v){
-  while (ts_is_heap_str(v)){
-    gc_pin_value(v);
-    ts_string* s = ts_str_ptr_typed(v);
-    if (!(s->flags & TS_STR_FLAG_VIEW)) return;
-    v = s->parent;
-  }
-}
-static void gc_unpin_string_storage(tsv v){
-  while (ts_is_heap_str(v)){
-    gc_unpin_value(v);
-    ts_string* s = ts_str_ptr_typed(v);
-    if (!(s->flags & TS_STR_FLAG_VIEW)) return;
-    v = s->parent;
-  }
-}
 static tsv ts_string_slice_copy(tsv src, uint32_t start, uint32_t len);
 static tsv ts_string_slice_view(tsv src, uint32_t start, uint32_t len);
 static char* ts_string_cstr_copy(tsv src, uint32_t* out_len);
@@ -1144,58 +1109,11 @@ static void gc_config_init(void){
   const char* zap = getenv("TSAOT_GC_ZAP");
   if (zap && zap[0] && strcmp(zap, "0") != 0) g_gc_zap = 1;
 }
-/* Table entry for a cell: the pointer plus its generation bit. */
-static inline ts_gc_header* gc_handle_entry_for(ts_gc_header* h){
-  return (ts_gc_header*)((uintptr_t)h | (h->gen == TS_GEN_OLD ? TS_HANDLE_OLD_BIT : 0u));
-}
-/* A cell promoted in place (no move) must republish its generation. */
-static inline void gc_handle_note_old(ts_gc_header* h){
-  uint64_t payload = h->handle;
-  if (payload & 1u){
-    uint32_t id = (uint32_t)(payload >> 1);
-    if (id < g_handle_cap) g_ts_handle_table[id] = gc_handle_entry_for(h);
-  }
-}
-static uint64_t gc_handle_alloc(ts_gc_header* h){
-  uint32_t id;
-  RT_STAT_INC(handle_alloc);
-  if (g_handle_free_len){
-    id = g_handle_free[--g_handle_free_len];
-  } else {
-    id = ++g_handle_len;
-    if (id >= g_handle_cap){
-      uint32_t next = g_handle_cap ? g_handle_cap * 2 : 65536;
-      while (id >= next) next *= 2;
-      g_ts_handle_table = (ts_gc_header**)realloc(g_ts_handle_table, sizeof(ts_gc_header*) * next);
-      memset(g_ts_handle_table + g_handle_cap, 0, sizeof(ts_gc_header*) * (next - g_handle_cap));
-      g_handle_cap = next;
-    }
-  }
-  g_ts_handle_table[id] = gc_handle_entry_for(h);
-  return (((uint64_t)id) << 1) | 1u;
-}
-static void gc_handle_free(ts_gc_header* h){
-  uint64_t payload = h ? h->handle : 0;
-  if (!(payload & 1u)) return;
-  uint32_t id = (uint32_t)(payload >> 1);
-  if (id < g_handle_cap && ts_handle_entry_cell((uintptr_t)g_ts_handle_table[id]) == h){
-    g_ts_handle_table[id] = NULL;
-    G0_INC(g0_handle_frees);
-    if (g_handle_free_len == g_handle_free_cap){
-      g_handle_free_cap = g_handle_free_cap ? g_handle_free_cap * 2 : 1024;
-      g_handle_free = (uint32_t*)realloc(g_handle_free, sizeof(uint32_t) * g_handle_free_cap);
-    }
-    g_handle_free[g_handle_free_len++] = id;
-  }
-  h->handle = 0;
-}
 tsv ts_heap_ref_value(uint16_t sel, void* p){
   if (!p) return TS_BOX(sel, 0);
   ts_gc_header* h = (ts_gc_header*)p;
   if (h->gen == TS_GEN_NONHEAP) return TS_BOX(sel, (uintptr_t)p | TS_PTR_STACK_TAG);
-  if (h->gen == TS_GEN_OLD) return TS_BOX(sel, (uintptr_t)p);
-  if (!h->handle) h->handle = gc_handle_alloc(h);
-  return TS_BOX(sel, h->handle);
+  return TS_BOX(sel, (uintptr_t)p);
 }
 static void gc_remember(ts_gc_header* h){
   if (!h || h->gen != TS_GEN_OLD) return;
@@ -1424,15 +1342,14 @@ static void* gc_alloc(size_t sz, uint8_t kind){
   RT_STAT_INC(kind_alloc[kind]); RT_STAT_ADD(kind_bytes[kind], sz);
   ts_gc_header* h = (ts_gc_header*)gc_cell_alloc(sz, 0);
   h->kind=kind; h->gen=TS_GEN_YOUNG; h->size=sz;
-  h->handle = gc_handle_alloc(h);
-  gc_young_log_push((uint32_t)(h->handle >> 1));
+  gc_young_log_push(h);
   g_nursery_fresh_bytes += sz;
   g_alloc++; g_young_alloc++; g_young_new_since_minor++;
   RT_STAT_INC(nursery_alloc);
   return h;
 }
 /* Escape-proven long-lived allocation. The cell starts in the old generation
-   and therefore avoids nursery evacuation and handle retargeting. Callers must
+   and therefore skips the young log and promotion. Callers must
    use the normal write barrier while initializing any young references in the
    new cell; the public pretenured constructors below enforce that for their
    direct proto/env stores. */
@@ -1443,7 +1360,6 @@ static void* gc_alloc_pretenured(size_t sz, uint8_t kind){
   RT_STAT_INC(kind_alloc[kind]); RT_STAT_ADD(kind_bytes[kind], sz);
   ts_gc_header* h = (ts_gc_header*)gc_cell_alloc(sz, 1);
   h->kind=kind; h->gen=TS_GEN_OLD; h->size=sz;
-  h->handle = gc_handle_alloc(h);
   g_alloc++; g_old_alloc++;
   RT_STAT_INC(pretenured_alloc);
   return h;
@@ -1938,14 +1854,13 @@ tsv ts_new_sized_pretenured(size_t size){ return ts_new_sized_impl(size, 1); }
 /* TS_ARRAY_HOLE and array_is_hole live in ts_rt.h (the inline element reader tests them). */
 static inline int array_uses_inline(ts_array* a){ return a->data == a->inline_data; }
 #define GC_CONTAINER_CARD_SHIFT 6u
-/* A heap value still in the young generation (handle form without the OLD
-   bit): the only stores an old container must remember. */
+/* A heap value still in the young generation: the only stores an old
+   container must remember. */
 static inline int array_value_is_young(tsv value){
   if (!ts_heap_ref(value)) return 0;
   uint64_t vp = value & TS_PAYLOAD_MASK;
-  if (!(vp & 1u)) return 0; /* pointer-form values are old or on the stack */
-  uint32_t id = (uint32_t)(vp >> 1);
-  return id < g_handle_cap && !((uintptr_t)g_ts_handle_table[id] & TS_HANDLE_OLD_BIT);
+  if (!vp || (vp & TS_PTR_STACK_TAG)) return 0; /* stack cells are never young */
+  return ((const ts_gc_header*)(uintptr_t)vp)->gen == TS_GEN_YOUNG;
 }
 /* Indexed stores remember a bounded span of 64-element cards. Unknown stores
    still use ts_gc_remember, which requests the complete element scan. */
@@ -5169,7 +5084,6 @@ static void gc_scan_cell(ts_gc_header* h, int young, int depth);
 static void gc_scan_async_cell(ts_gc_header* h, int young, int depth);
 static void gc_mark_async_roots(void);
 static void gc_mark_async_roots_young(void);
-static void gc_free_cell(ts_gc_header* h);
 static void gc_mark_class_fields(ts_object* o, int young, int depth, int stable);
 static void gc_weak_fixpoint_and_prune(int young);
 static void gc_symbol_weak_prune(int young);
@@ -5242,98 +5156,52 @@ static void gc_mark_visit_slow(ts_gc_header* h, int young, int depth){
   } else if (h->gen == TS_GEN_OLD){
     if (young) return; /* minor boundary */
     h->mark = 1;
+  } else if (TS_RT_UNLIKELY(h->gen == GC_GEN_FREED)){
+    gc_freed_reached(h);
   } else { /* stack/SROA or interned (NONHEAP) */
     h->mark = 1; gc_marked_nonheap_push(h);
   }
   if (depth < TS_GC_MARK_DEPTH_MAX) gc_scan_cell(h, young, depth + 1);
   else gc_markstack_push(h);
 }
-/* Per-edge fast filter stays inline (bit test + header loads); the mark+scan
-   goes through the outlined slow path so the scan loops stay compact. */
-static int g_gc_rewrite_only = 0; /* scanning promoted cells only to rewrite their slots */
+/* Per-edge fast filter stays inline (tag test + header loads); the mark+scan
+   goes through the outlined slow path so the scan loops stay compact. A
+   reference outside the cage (NULL among them) is not a heap cell, and one
+   inside is marked only when its header reads as a live cell (a valid kind,
+   YOUNG or OLD): references are made by boxing a cell's first byte, and a
+   cell block keeps its size class, so only a bug could name anything else
+   (a freed cell in protect mode is reported as the dangling reference). */
 static inline void gc_mark_visit(tsv v, int young, int depth){
-  if (g_gc_rewrite_only) return;
   RT_STAT_INC(mark_edges);
   if (!ts_heap_ref(v)) return;
   uint64_t payload = v & TS_PAYLOAD_MASK;
   ts_gc_header* h;
-  if (payload & 1u){
-    uint32_t id = (uint32_t)(payload >> 1);
-    uintptr_t entry = (id < g_handle_cap) ? (uintptr_t)g_ts_handle_table[id] : 0u;
-    /* A minor collection ignores old targets without touching their cells. */
-    if (young && (entry & TS_HANDLE_OLD_BIT)){ RT_STAT_INC(mark_old_edges); return; }
-    h = ts_handle_entry_cell(entry);
-  } else if (payload & TS_PTR_STACK_TAG){
+  if (TS_RT_UNLIKELY(payload & TS_PTR_STACK_TAG)){
     h = ts_heap_ptr(v);
+    if (!h) return;
   } else {
-    /* old-pointer form: old by construction, skipped by a minor collection
-       without any load; a full collection marks through the pointer. */
-    if (young){ RT_STAT_INC(mark_old_edges); return; }
+    if ((uintptr_t)payload - (uintptr_t)g_cage_base >= g_cage_bytes) return;
     h = (ts_gc_header*)(uintptr_t)payload;
-    if (!h || !gc_kind_valid(h->kind) || h->gen != TS_GEN_OLD) return;
+    if (TS_RT_UNLIKELY(h->gen > TS_GEN_OLD || !gc_kind_valid(h->kind))){
+      if (h->gen == GC_GEN_FREED) gc_freed_reached(h);
+      return;
+    }
   }
-  if (!h || h->mark) return;
+  if (h->mark) return;
   if (young && h->gen == TS_GEN_OLD){
     RT_STAT_INC(mark_old_edges);
     return;
   }
   gc_mark_visit_slow(h, young, depth);
 }
-/* Slots the collector may rewrite (docs/pointer_stable_old_gen_design.md):
-   a handle to a cell that is already old becomes the old-pointer form on the
-   spot; a handle to a young cell held in a stable slot (an old cell, a frame,
-   a root) is recorded so it can be rewritten once this collection has
-   promoted the target. */
-static tsv** g_gc_fixup = NULL;
-static size_t g_gc_fixup_len = 0, g_gc_fixup_cap = 0;
-static inline void gc_fixup_push(tsv* slot){
-  if (g_gc_fixup_len == g_gc_fixup_cap){
-    size_t next = g_gc_fixup_cap ? g_gc_fixup_cap * 2 : 4096;
-    tsv** grown = (tsv**)realloc(g_gc_fixup, sizeof(tsv*) * next);
-    if (!grown) ts_abort_msg("out of memory growing GC fixup list");
-    g_gc_fixup = grown; g_gc_fixup_cap = next;
-  }
-  g_gc_fixup[g_gc_fixup_len++] = slot;
-}
 /* Always inlined: the scan of cells is the collector's hot loop, and clang's
    own choice flips with unrelated edits (adding the cold root sites of
    docs/gc_v2_design.md §6.5 step 1b made it call this out of line from
-   gc_scan_cell: +1.1% instructions on the compiler). */
+   gc_scan_cell: +1.1% instructions on the compiler). Cells never move, so
+   a slot is only read (`stable` no longer matters). */
 TS_RT_ALWAYS_INLINE void gc_visit_slot(tsv* slot, int young, int depth, int stable){
-  tsv v = *slot;
-  if (!ts_heap_ref(v)) return;
-  uint64_t payload = v & TS_PAYLOAD_MASK;
-  if (payload & 1u){
-    uint32_t id = (uint32_t)(payload >> 1);
-    uintptr_t entry = (id < g_handle_cap) ? (uintptr_t)g_ts_handle_table[id] : 0u;
-    if (entry & TS_HANDLE_OLD_BIT){
-      *slot = TS_BOX(TS_TOP16(v), (uintptr_t)ts_handle_entry_cell(entry));
-    } else if (stable && !g_gc_rewrite_only && entry){
-      gc_fixup_push(slot);
-    }
-  }
-  if (g_gc_rewrite_only) return;
-  gc_mark_visit(v, young, depth);
-}
-static void gc_fixup_apply(void){
-  for (size_t i = 0; i < g_gc_fixup_len; i++){
-    tsv* slot = g_gc_fixup[i];
-    tsv v = *slot;
-    if (!ts_heap_ref(v)) continue;
-    uint64_t payload = v & TS_PAYLOAD_MASK;
-    if (!(payload & 1u)) continue;
-    uint32_t id = (uint32_t)(payload >> 1);
-    uintptr_t entry = (id < g_handle_cap) ? (uintptr_t)g_ts_handle_table[id] : 0u;
-    if (entry & TS_HANDLE_OLD_BIT) *slot = TS_BOX(TS_TOP16(v), (uintptr_t)ts_handle_entry_cell(entry));
-  }
-  g_gc_fixup_len = 0;
-}
-/* After promotion: cells promoted together reference each other by handle;
-   rescan their slots so those references take the pointer form now. */
-static void gc_rewrite_promoted(ts_gc_header* list){
-  g_gc_rewrite_only = 1;
-  for (ts_gc_header* p = list; p; p = p->gc_next) gc_scan_cell(p, 0, 0);
-  g_gc_rewrite_only = 0;
+  (void)stable;
+  gc_mark_visit(*slot, young, depth);
 }
 static inline void gc_mark_value(tsv v){ gc_mark_visit(v, 0, 0); }
 static inline void gc_mark_value_young(tsv v){ gc_mark_visit(v, 1, 0); }
@@ -5433,7 +5301,7 @@ static void gc_scan_cell(ts_gc_header* h, int young, int depth){
     if (m->weak){
       /* Ephemeron entries are deliberately skipped here. Their values are
          marked after the ordinary transitive closure, iff their keys are live. */
-      if (!g_gc_rewrite_only) gc_weak_enqueue(h);
+      gc_weak_enqueue(h);
     } else {
       uint32_t first = 0, end = m->len;
       if (young && h->gen == TS_GEN_OLD && !m->gc_dirty_all){
@@ -5453,7 +5321,7 @@ static void gc_scan_cell(ts_gc_header* h, int young, int depth){
     gc_payload_mark(st->elems); gc_payload_mark(st->hashes);
     gc_payload_mark(st->index); gc_payload_mark(st->iteration_order);
     if (young && !st->weak) RT_STAT_ADD(kind_minor_elements[h->kind], st->len);
-    if (st->weak){ if (!g_gc_rewrite_only) gc_weak_enqueue(h); }
+    if (st->weak){ gc_weak_enqueue(h); }
     else for (uint32_t i=0;i<st->len;i++) gc_visit_slot(&st->elems[i], young, depth, stable);
     gc_mark_common_props(&st->o, young, depth, stable);
     gc_visit_slot(&st->o.proto, young, depth, stable);
@@ -5471,15 +5339,13 @@ static void gc_scan_cell(ts_gc_header* h, int young, int depth){
     gc_scan_async_cell(h, young, depth);
   }
 }
-/* Free a cell's handle + external payload buffers but not the cell body —
-   the body of an arena (nursery) cell belongs to its chunk and is reclaimed
-   by the post-sweep bump reset. Every dying cell passes through here (unpooled
-   and old cells via gc_free_cell), so this is the single live-bytes
-   decrement point balancing gc_alloc's increment. */
+/* Release a dying cell's external buffers, not its body (the cell space
+   reclaims that). Every dying cell passes through here (gc_cell_die), so
+   this is the single live-bytes decrement point balancing gc_alloc's
+   increment. */
 static void gc_free_cell_payload(ts_gc_header* h){
   G0_FATE(h, h->gen == TS_GEN_OLD ? G0_DEAD_OLD : G0_DEAD_YOUNG);
   g_heap_bytes -= (g_heap_bytes >= h->size) ? h->size : g_heap_bytes;
-  gc_handle_free(h);
   if (h->kind==TS_KIND_OBJECT){
     ts_object* o=(ts_object*)h; props_release_dead(o);
   } else if (h->kind==TS_KIND_ARRAY){
@@ -5509,17 +5375,56 @@ static void gc_free_cell_payload(ts_gc_header* h){
     while (r){ ts_asyncgen_req* next=r->next; free(r); r=next; }
   }
 }
-static void gc_free_cell(ts_gc_header* h){
-  gc_free_cell_payload(h);
-  if (g_gc_zap && h->size) memset(h, 0xDD, h->size);
-  free(h);
+/* Protect mode for the cell space (TSAOT_GC_PROTECT=N, docs/gc_v2_design.md
+   §6.8): a dying cell is zapped and kept from the allocator (its mark bit
+   stays set, its gen says FREED) in a FIFO quarantine of up to N MiB, so an
+   access through a dangling reference reads poison instead of a new cell,
+   and a collection that reaches a quarantined cell reports the dangling
+   reference. The end of each collection frees the oldest cells over the
+   budget. The header stays readable under ASan (the collector tests it). */
+static ts_gc_header** g_cq = NULL;
+static size_t g_cq_head = 0, g_cq_len = 0, g_cq_cap = 0, g_cq_bytes = 0;
+static size_t gc_cell_footprint(const gc_block* b){
+  return b->state == GC_BLK_LARGE_CELL ? (size_t)b->nblocks << GC_BLOCK_SHIFT : g_pclass_size[b->cls];
 }
-/* A dead cell of the cell space: its handle and side buffers go; the memory
+static void gc_cell_quarantine(ts_gc_header* h, gc_block* b, size_t size){
+  if (g_cq_len == g_cq_cap){
+    size_t next = g_cq_cap ? g_cq_cap * 2 : 4096;
+    ts_gc_header** grown = (ts_gc_header**)malloc(sizeof(ts_gc_header*) * next);
+    if (!grown) ts_abort_msg("out of memory growing the cell quarantine");
+    for (size_t i = 0; i < g_cq_len; i++) grown[i] = g_cq[(g_cq_head + i) % g_cq_cap];
+    free(g_cq); g_cq = grown; g_cq_cap = next; g_cq_head = 0;
+  }
+  g_cq[(g_cq_head + g_cq_len) % g_cq_cap] = h; g_cq_len++;
+  g_cq_bytes += gc_cell_footprint(b);
+  if (size) memset(h, 0xDD, size);
+  h->mark = 0; h->gen = GC_GEN_FREED;
+  if (b->state == GC_BLK_LARGE_CELL) b->mark = 1; else gc_cell_set_old_bit(h);
+  if (size > sizeof(ts_gc_header)) GC_PAYLOAD_POISON((char*)h + sizeof(ts_gc_header), size - sizeof(ts_gc_header));
+}
+static void gc_cell_quarantine_trim(void){
+  size_t budget = (size_t)g_gc_protect << 20;
+  while (g_cq_len && g_cq_bytes > budget){
+    ts_gc_header* h = g_cq[g_cq_head];
+    g_cq_head = (g_cq_head + 1u) % g_cq_cap; g_cq_len--;
+    gc_block* b = gc_cell_block(h);
+    g_cq_bytes -= gc_cell_footprint(b);
+    if (b->state == GC_BLK_LARGE_CELL){ gc_cell_release_large(h); continue; }
+    uintptr_t off = (uintptr_t)h - (uintptr_t)g_cage_base;
+    uint32_t g = (uint32_t)((off & (GC_BLOCK_BYTES - 1u)) >> 4);
+    uint64_t* w = &gc_block_bitmap((uint32_t)(off >> GC_BLOCK_SHIFT))[g >> 6];
+    uint64_t m = (uint64_t)1u << (g & 63u);
+    if (*w & m){ *w &= ~m; b->live -= g_pclass_size[b->cls]; }
+    GC_PAYLOAD_POISON(h, g_pclass_size[b->cls]);
+  }
+}
+/* A dead cell of the cell space: its side buffers go; the memory
    is free because no mark bit covers it (a large run is released). */
 static void gc_cell_die(ts_gc_header* h){
   size_t size = h->size;
   gc_free_cell_payload(h);
   gc_block* b = gc_cell_block(h);
+  if (TS_RT_UNLIKELY(g_gc_protect)){ gc_cell_quarantine(h, b, size); return; }
   if (b->state == GC_BLK_LARGE_CELL){ gc_cell_release_large(h); return; }
   if (g_gc_zap && size) memset(h, 0xDD, size);
   GC_PAYLOAD_POISON(h, g_pclass_size[b->cls]);
@@ -5527,7 +5432,88 @@ static void gc_cell_die(ts_gc_header* h){
 static void gc_cell_promote(ts_gc_header* h){
   gc_cell_set_old_bit(h);
   h->mark = 0; h->gen = TS_GEN_OLD; h->remembered = 0;
-  gc_handle_note_old(h);
+}
+/* The young cells of the cycle, after marking (both collections): the
+   marked are promoted in place, the others die (no mark bit covers their
+   memory, so it is free). */
+static void gc_young_log_sweep(void){
+  for (size_t i = 0; i < g_young_log_len; i++){
+    ts_gc_header* h = g_young_log[i];
+    if (h->gen != TS_GEN_YOUNG) continue;
+    if (h->mark){
+      G0_FATE(h, G0_PROMOTED);
+      gc_cell_promote(h);
+      g_young_alloc--; g_old_alloc++;
+      if (h->kind == TS_KIND_CORO) ts_gc_remember(h);
+    } else {
+      gc_cell_die(h);
+      g_young_alloc--; g_alloc--;
+    }
+  }
+  g_young_log_len = 0;
+}
+/* A full collection's sweep of the old cells, after marking and before the
+   young log's: an unmarked old cell dies and loses its bit, a marked one
+   stays old (coroutine frames re-enroll in the remembered set: they may
+   point young across collections). Young cells have no bit. */
+static void gc_cells_sweep_old(void){
+  if (!g_cage_base) return;
+  for (int cls = 0; cls < g_pclass_n; cls++){
+    uint32_t size = g_pclass_size[cls];
+    for (uint32_t l = g_cclass[cls].head; l; l = g_blocks[l - 1u].next){
+      uint32_t bi = l - 1u;
+      uint64_t* bm = gc_block_bitmap(bi);
+      char* base = gc_block_base(bi);
+      for (uint32_t w = 0; w < GC_BLOCK_BITMAP_WORDS; w++){
+        uint64_t bits = bm[w];
+        while (bits){
+          uint32_t g = (w << 6) + (uint32_t)__builtin_ctzll(bits);
+          bits &= bits - 1u;
+          ts_gc_header* h = (ts_gc_header*)(base + ((size_t)g << 4));
+          if (h->mark){
+            h->mark = 0; h->remembered = 0;
+            if (h->kind == TS_KIND_CORO) ts_gc_remember(h);
+            continue;
+          }
+          if (TS_RT_UNLIKELY(h->gen == GC_GEN_FREED)) continue; /* quarantined */
+          bm[w] &= ~((uint64_t)1u << (g & 63u));
+          g_blocks[bi].live -= size;
+          gc_cell_die(h);
+          g_old_alloc--; g_alloc--;
+        }
+      }
+    }
+  }
+  for (uint32_t l = g_large_cell_head; l; ){
+    gc_block* b = &g_blocks[l - 1u];
+    uint32_t next = b->next;
+    if (b->mark){
+      ts_gc_header* h = (ts_gc_header*)gc_block_base(l - 1u);
+      if (h->mark){
+        h->mark = 0; h->remembered = 0;
+        if (h->kind == TS_KIND_CORO) ts_gc_remember(h);
+      } else if (h->gen != GC_GEN_FREED){
+        gc_cell_die(h);
+        g_old_alloc--; g_alloc--;
+      }
+    }
+    l = next;
+  }
+}
+/* Tests: does `v` still name an allocated cell? A stale reference keeps the
+   address of a freed cell; the cell space knows it is free (no mark bit,
+   and not a young cell of this cycle). */
+int ts_gc_debug_cell_live(tsv v){
+  if (!ts_heap_ref(v)) return 0;
+  uint64_t payload = v & TS_PAYLOAD_MASK;
+  if (payload & TS_PTR_STACK_TAG) return 1;
+  char* p = (char*)(uintptr_t)payload;
+  if (!gc_payload_in_cage(p)) return 0;
+  for (size_t i = 0; i < g_young_log_len; i++) if ((char*)g_young_log[i] == p) return 1;
+  gc_block* b = gc_cell_block((ts_gc_header*)p);
+  int bit = b->state == GC_BLK_LARGE_CELL ? b->mark != 0
+          : (b->state == GC_BLK_CELL && gc_payload_cell_marked(p));
+  return bit && ((ts_gc_header*)p)->gen != GC_GEN_FREED;
 }
 #ifdef TSAOT_RT_STATS
 static inline void g0_payload(int fate, int type, unsigned long long bytes, int* any){
@@ -5590,11 +5576,19 @@ static void g0_dump(FILE* out){
   static const char* ptypes[G0_P_N] = { "vals", "dict", "index", "elems", "sparse", "env", "map", "set", "other" };
   static const char* minor_phases[6] = { "mark", "weak", "remset_reset", "unpooled_sweep", "nursery_sweep", "rewrite_rest" };
   static const char* full_phases[6] = { "mark", "weak", "remset_reset", "old_sweep", "young_sweep", "rewrite_rest" };
-  if (g0_fates_on())
-    for (uint32_t id = 1; id <= g_handle_len && id < g_handle_cap; id++){
-      uintptr_t entry = (uintptr_t)g_ts_handle_table[id];
-      if (entry & TS_HANDLE_OLD_BIT) g0_count_fate(ts_handle_entry_cell(entry), G0_RESIDENT_OLD);
-    }
+  if (g0_fates_on() && g_cage_base){
+    for (int cls = 0; cls < g_pclass_n; cls++)
+      for (uint32_t l = g_cclass[cls].head; l; l = g_blocks[l - 1u].next){
+        const uint64_t* bm = gc_block_bitmap(l - 1u);
+        for (uint32_t w = 0; w < GC_BLOCK_BITMAP_WORDS; w++)
+          for (uint64_t bits = bm[w]; bits; bits &= bits - 1u){
+            uint32_t g = (w << 6) + (uint32_t)__builtin_ctzll(bits);
+            g0_count_fate((ts_gc_header*)(gc_block_base(l - 1u) + ((size_t)g << 4)), G0_RESIDENT_OLD);
+          }
+      }
+    for (uint32_t l = g_large_cell_head; l; l = g_blocks[l - 1u].next)
+      if (g_blocks[l - 1u].mark) g0_count_fate((ts_gc_header*)gc_block_base(l - 1u), G0_RESIDENT_OLD);
+  }
   fprintf(out, "[rt_stats] g0_minor_ms:");
   for (int i = 0; i < 6; i++) fprintf(out, " %s=%.2f", minor_phases[i], (double)g0_minor_ns[i] / 1e6);
   fprintf(out, "\n[rt_stats] g0_full_ms:");
@@ -5623,8 +5617,8 @@ static void g0_dump(FILE* out){
     }
     if (any) fprintf(out, "\n");
   }
-  fprintf(out, "[rt_stats] g0_misc: handle_ids=%u handle_free_list=%u handle_frees=%llu rem_enroll=%llu proto_materialized=%llu pretenured_bytes=%llu\n",
-          g_handle_len, g_handle_free_len, g0_handle_frees, g0_rem_enroll, g0_proto_materialized, g0_pretenured_bytes);
+  fprintf(out, "[rt_stats] g0_misc: young_log_cap=%zu rem_enroll=%llu proto_materialized=%llu pretenured_bytes=%llu\n",
+          g_young_log_cap, g0_rem_enroll, g0_proto_materialized, g0_pretenured_bytes);
 }
 #endif
 static int gc_moving_minor_enabled(void){
@@ -5634,314 +5628,6 @@ static int gc_moving_minor_enabled(void){
     enabled = !(off && off[0] && strcmp(off, "0") != 0);
   }
   return enabled;
-}
-static int gc_move_coro_enabled(void){
-  static int enabled = -1;
-  if (enabled < 0){
-    const char* flag = getenv("TSAOT_GC_MOVE_CORO");
-    enabled = !(flag && flag[0] && strcmp(flag, "0") == 0);
-  }
-  return enabled;
-}
-static int gc_move_promise_enabled(void){
-  static int enabled = -1;
-  if (enabled < 0){
-    const char* flag = getenv("TSAOT_GC_MOVE_PROMISE");
-    enabled = !(flag && flag[0] && strcmp(flag, "0") == 0);
-  }
-  return enabled;
-}
-static int gc_is_movable_kind(uint8_t kind){
-  /* Moving minor boundary:
-     - movable: ordinary JS heap values whose public identity is the stable tsv
-       handle (object/string/function/array/map/set/accessor/symbol). Heap fields
-       store handles, and runtime code must re-fetch raw pointers after safepoints.
-     - Promise/Coro are movable by default when unpinned. Their stored edges are
-       handles and are scanned normally; active raw ts_promise/ts_coro pointers are
-       protected by pinning or by immediate handle re-fetch after safepoints.
-     - fallback: TSAOT_GC_MOVE_CORO=0 or TSAOT_GC_MOVE_PROMISE=0 keeps that kind
-       non-moving for targeted debugging.
-     - pinned cells: even if a kind is movable, a temporarily pinned cell is
-       promoted in place for this collection because a raw pointer is active. */
-  return kind==TS_KIND_OBJECT || kind==TS_KIND_STRING || kind==TS_KIND_FUNC ||
-         kind==TS_KIND_ARRAY || kind==TS_KIND_MAP || kind==TS_KIND_SET ||
-         kind==TS_KIND_ACCESSOR || kind==TS_KIND_SYMBOL ||
-         kind==TS_KIND_ARRAYBUFFER || kind==TS_KIND_TYPEDARRAY;
-}
-static int gc_is_movable_cell(ts_gc_header* h){
-  if (!h || h->pin_depth != 0) return 0;
-  if (gc_is_movable_kind(h->kind)) return 1;
-  if (h->kind == TS_KIND_PROMISE) return gc_move_promise_enabled();
-  return h->kind == TS_KIND_CORO && gc_move_coro_enabled();
-}
-static void gc_handle_move(ts_gc_header* old, ts_gc_header* nw){
-  uint64_t payload = old->handle;
-  nw->handle = payload;
-  if (payload & 1u){
-    uint32_t id = (uint32_t)(payload >> 1);
-    if (id < g_handle_cap) g_ts_handle_table[id] = gc_handle_entry_for(nw);
-  } else {
-    nw->handle = gc_handle_alloc(nw);
-  }
-  old->handle = 0;
-}
-static void gc_fix_moved_cell(ts_gc_header* old, ts_gc_header* nw){
-  if (old->kind == TS_KIND_ARRAY){
-    ts_array* oa = (ts_array*)old;
-    ts_array* na = (ts_array*)nw;
-    if (oa->data == oa->inline_data) na->data = na->inline_data;
-  } else if (old->kind == TS_KIND_CORO){
-    ts_coro* oc=(ts_coro*)old;
-    ts_coro* nc=(ts_coro*)nw;
-    if (oc->eh_catch_state==oc->eh_catch_inline) nc->eh_catch_state=nc->eh_catch_inline;
-    if (oc->eh_gc_depth==oc->eh_gc_inline) nc->eh_gc_depth=nc->eh_gc_inline;
-    if (oc->fin_pending==oc->fin_pending_inline) nc->fin_pending=nc->fin_pending_inline;
-    if (oc->fin_exc==oc->fin_exc_inline) nc->fin_exc=nc->fin_exc_inline;
-    if (oc->fin_tgt==oc->fin_tgt_inline) nc->fin_tgt=nc->fin_tgt_inline;
-  }
-}
-static ts_gc_header* gc_move_young_to_old_ex(ts_gc_header* h, int free_old){
-  G0_FATE(h, G0_PROMOTED);
-  size_t sz = h->size;
-  if (sz == 0){
-    if (h->kind == TS_KIND_STRING){
-      ts_string* s = (ts_string*)h;
-      sz = sizeof(ts_string) + ((s->flags & TS_STR_FLAG_VIEW) ? 1 : s->len + 1);
-    }
-    else if (h->kind == TS_KIND_OBJECT) sz = sizeof(ts_object);
-    else if (h->kind == TS_KIND_FUNC) sz = sizeof(ts_func);
-    else if (h->kind == TS_KIND_ARRAY) sz = sizeof(ts_array);
-    else if (h->kind == TS_KIND_MAP) sz = sizeof(ts_map);
-    else if (h->kind == TS_KIND_SET) sz = sizeof(ts_set_t);
-    else if (h->kind == TS_KIND_ACCESSOR) sz = sizeof(ts_accessor);
-    else if (h->kind == TS_KIND_SYMBOL) sz = sizeof(ts_symbol);
-  }
-  ts_gc_header* nw = (ts_gc_header*)malloc(sz);
-  memcpy(nw, h, sz);
-  nw->mark = 0;
-  nw->gen = TS_GEN_OLD;
-  nw->remembered = 0;
-  nw->pin_depth = 0;
-  nw->size = sz;
-  nw->gc_next = NULL;
-  gc_fix_moved_cell(h, nw);
-  gc_handle_move(h, nw);
-  /* external buffers were transferred by the shallow copy. An arena cell's
-     body is chunk memory (free_old=0): it dies with the bump reset. */
-  if (g_gc_zap) memset(h, 0xDD, sz); /* poison the moved-from body (C0 detector) */
-  if (free_old) free(h);
-  return nw;
-}
-static ts_gc_header* gc_move_young_to_old(ts_gc_header* h){
-  return gc_move_young_to_old_ex(h, 1);
-}
-/* Copy a marked, unpinned arena survivor into a TO-SPACE nursery chunk (it
-   stays YOUNG — the aging grace period). Same relocation contract as the
-   old-gen evacuation: handles are re-pointed (gc_handle_move), inline array
-   data is re-tied, the moved-from body is zapped. The to-space chunk list is
-   caller-owned and becomes g_nursery_active after the sweep; a chunk freed by
-   this same sweep may be reused (its live cells have already left). Returns
-   NULL on chunk-allocation failure — the caller promotes instead. */
-
-static ts_gc_header* gc_tospace_copy(gc_chunk** to_active, ts_gc_header* h){
-  size_t sz = h->size;
-  size_t need = (sz + 15u) & ~(size_t)15u;
-  gc_chunk* c = *to_active;
-  if (!c || c->used + need > GC_NURSERY_DATA_BYTES){
-    if (g_nursery_free){
-      c = g_nursery_free; g_nursery_free = c->next;
-    } else {
-      void* mem = gc_chunk_alloc();
-      if (!mem) return NULL;
-      c = (gc_chunk*)mem;
-      RT_STAT_INC(nursery_chunks);
-    }
-    c->used = 0; c->pinned_live = 0;
-    c->next = *to_active; *to_active = c;
-  }
-  ts_gc_header* nw = (ts_gc_header*)((char*)c + GC_NURSERY_DATA_OFF + c->used);
-  c->used += need;
-  memcpy(nw, h, sz);
-  nw->mark = 0;
-  nw->pin_depth = 0;   /* pinned cells never take this path */
-  nw->gc_next = NULL;
-  gc_fix_moved_cell(h, nw);
-  gc_handle_move(h, nw);
-  if (g_gc_zap) memset(h, 0xDD, sz);
-  return nw;
-}
-
-static void gc_aging_record_dead(uint8_t old_age, size_t bytes){
-  if (!old_age) return;
-  if (g_gc_aging_collect_outcomes)
-    g_gc_aging_window_dead_bytes += bytes;
-  RT_STAT_ADD(aging_died_bytes, bytes);
-}
-static void gc_aging_record_promotion(
-    uint8_t old_age, uint8_t next_age, size_t bytes, int force_early){
-  if (old_age){
-    if (g_gc_aging_collect_outcomes)
-      g_gc_aging_window_promoted_bytes += bytes;
-    RT_STAT_ADD(aging_promoted_bytes, bytes);
-  }
-  if (force_early && next_age < g_gc_age_threshold)
-    RT_STAT_ADD(aging_forced_bytes, bytes);
-}
-static int gc_percent_at_least(size_t part, size_t total, size_t percent){
-  if (!total) return 0;
-  size_t threshold = (total / 100u) * percent;
-  threshold += (((total % 100u) * percent) + 99u) / 100u;
-  return part >= threshold;
-}
-static void gc_aging_finish_minor(int aging_allowed){
-  if (g_gc_age_threshold <= 1 || !g_gc_aging_adaptive){
-    g_gc_aging_fallback_minors = 0;
-    return;
-  }
-  if (!aging_allowed){
-    if (g_gc_aging_fallback_minors) g_gc_aging_fallback_minors--;
-    return;
-  }
-  size_t resolved =
-    g_gc_aging_window_dead_bytes + g_gc_aging_window_promoted_bytes;
-  size_t sample_target = g_nursery_cap_bytes >> 1;
-  if (sample_target < GC_AGING_MIN_SAMPLE_BYTES)
-    sample_target = GC_AGING_MIN_SAMPLE_BYTES;
-  int mostly_promoted =
-    resolved >= sample_target &&
-    gc_percent_at_least(
-      g_gc_aging_window_promoted_bytes, resolved, GC_AGING_PROMOTED_PERCENT);
-  if (resolved >= sample_target){
-    g_gc_aging_window_dead_bytes = 0;
-    g_gc_aging_window_promoted_bytes = 0;
-    if (mostly_promoted){
-      g_gc_aging_fallback_minors = GC_AGING_FALLBACK_MINORS;
-      g_gc_aging_collect_outcomes = 0;
-      RT_STAT_INC(aging_activations);
-    }
-  }
-}
-/* Sweep one side of the nursery after marking: evacuate marked cells to the
-   old gen, payload-free the dead, divert pinned survivors to g_pinned_young
-   and their chunk to the retained list. Shared by minor and full collections
-   (arena cells are always YOUNG, and both collections mark them the same
-   way), so the "leave by copy or die" rule has a single implementation.
-   allow_aging (minor only): a survivor younger than g_gc_age_threshold is
-   copied within the nursery and stays YOUNG instead of evacuating — its age
-   lives in the remembered byte, which is unused while young and already
-   reset to 0 by the old-gen evacuation. Full GC passes 0 (always promote).
-   force_early identifies adaptive-fallback minors; a full GC is not an
-   adaptive promotion even though it also disables aging. */
-static void gc_sweep_nursery(
-    ts_gc_header** survivors, int allow_aging, int force_early){
-  gc_chunk* next = NULL;
-  gc_chunk* to_active = NULL;        /* survivors' residence, next cycle's active */
-  size_t kept_bytes = 0;             /* physical residency; fixed mode also triggers on it */
-  size_t copy_budget = g_gc_aging_adaptive
-    ? ((g_nursery_cap_bytes / 100u) * GC_AGING_COPY_PERCENT)
-    : (g_nursery_cap_bytes >> 1);
-  for (gc_chunk* c = g_nursery_active; c; c = next){
-    next = c->next;
-    if (!gc_in_nursery(c)) ts_abort_msg("a nursery chunk outside the nursery range");
-    char* data = (char*)c + GC_NURSERY_DATA_OFF;
-    size_t off = 0;
-    uint32_t pinned_here = 0;
-    while (off < c->used){
-      ts_gc_header* h = (ts_gc_header*)(data + off);
-      size_t step = (h->size + 15u) & ~(size_t)15u;
-      if (h->mark){
-        if (h->pin_depth){
-          /* raw pointer active: cannot move, cannot promote in place. Track
-             on the pinned list; the chunk is retained below. */
-          h->mark = 0;
-          h->gc_next = g_pinned_young; g_pinned_young = h;
-          pinned_here++;
-        } else {
-          uint8_t old_age = h->remembered;
-          uint8_t age = (uint8_t)(old_age + 1);
-          ts_gc_header* kept = NULL;
-          /* Both modes cap survivor copying at half a nursery. Adaptive mode
-             additionally keeps that residency out of the next fresh-allocation
-             trigger and falls back when the copied cohort mostly promotes. */
-          if (allow_aging && age < g_gc_age_threshold &&
-              kept_bytes + step <= copy_budget)
-            kept = gc_tospace_copy(&to_active, h);
-          if (kept){
-            G0_FATE(kept, G0_AGED);
-            kept->remembered = age;
-            kept_bytes += step;
-            RT_STAT_INC(nursery_aged);
-            RT_STAT_ADD(aging_copied_bytes, step);
-          } else {
-            /* aged out (or to-space chunk allocation failed): evacuate. */
-            gc_aging_record_promotion(
-              old_age, age, step,
-              force_early || (allow_aging && age < g_gc_age_threshold));
-            ts_gc_header* nw = gc_move_young_to_old_ex(h, 0);
-            nw->gc_next = *survivors; *survivors = nw;
-            g_young_alloc--; g_old_alloc++;
-          }
-        }
-      } else {
-        gc_aging_record_dead(h->remembered, step);
-        gc_free_cell_payload(h);
-        if (g_gc_zap) memset(h, 0xDD, h->size);
-        g_young_alloc--; g_alloc--;
-      }
-      off += step;
-    }
-    if (pinned_here){
-      c->pinned_live = pinned_here;
-      c->next = g_nursery_retained; g_nursery_retained = c;
-      RT_STAT_INC(retained_chunks);
-    } else {
-      gc_chunk_release(c);
-    }
-  }
-  g_nursery_active = to_active;
-  g_nursery_used_bytes = kept_bytes;
-  g_nursery_survivor_bytes = kept_bytes;
-  g_nursery_fresh_bytes = 0;
-}
-/* Re-examine pinned survivors from earlier collections (they live in retained
-   chunks and stayed YOUNG): evacuate the ones whose pin was released, free the
-   dead, keep the still-pinned. Retained chunks with no pinned survivors left
-   return to the free pool. */
-static void gc_sweep_pinned_young(ts_gc_header** survivors){
-  ts_gc_header* h = g_pinned_young;
-  g_pinned_young = NULL;
-  while (h){
-    ts_gc_header* next = h->gc_next;
-    if (!gc_in_nursery(h)) ts_abort_msg("a pinned young cell outside the nursery range");
-    gc_chunk* c = (gc_chunk*)((uintptr_t)h & ~(uintptr_t)(GC_NURSERY_CHUNK_BYTES - 1u));
-    if (h->mark){
-      if (h->pin_depth){
-        h->mark = 0;
-        h->gc_next = g_pinned_young; g_pinned_young = h;
-      } else {
-        ts_gc_header* nw = gc_move_young_to_old_ex(h, 0);
-        nw->gc_next = *survivors; *survivors = nw;
-        g_young_alloc--; g_old_alloc++;
-        c->pinned_live--;
-      }
-    } else {
-      gc_free_cell_payload(h);
-      if (g_gc_zap) memset(h, 0xDD, h->size);
-      g_young_alloc--; g_alloc--;
-      c->pinned_live--;
-    }
-    h = next;
-  }
-  gc_chunk** pp = &g_nursery_retained;
-  while (*pp){
-    gc_chunk* c = *pp;
-    if (c->pinned_live == 0){
-      *pp = c->next;
-      gc_chunk_release(c);
-    } else {
-      pp = &c->next;
-    }
-  }
 }
 void ts_gc_collect_young(void){
   g_payload_fresh_bytes = 0;
@@ -6008,33 +5694,8 @@ void ts_gc_collect_young(void){
     }
   }
   G0_PHASE(g0_minor_ns, 2);
-  /* The young cells of the cycle, through the handle log: the marked are
-     promoted in place, the others die (their memory is free because no
-     mark bit covers it). */
-  ts_gc_header* survivors = NULL;
-  for (size_t i = 0; i < g_young_log_len; i++){
-    uint32_t id = g_young_log[i];
-    uintptr_t entry = id < g_handle_cap ? (uintptr_t)g_ts_handle_table[id] : 0u;
-    if (!entry || (entry & TS_HANDLE_OLD_BIT)) continue;
-    ts_gc_header* h = ts_handle_entry_cell(entry);
-    if (h->mark){
-      G0_FATE(h, G0_PROMOTED);
-      gc_cell_promote(h);
-      h->gc_next = survivors; survivors = h;
-      g_young_alloc--; g_old_alloc++;
-      if (h->kind == TS_KIND_CORO) ts_gc_remember(h);
-    } else {
-      gc_cell_die(h);
-      g_young_alloc--; g_alloc--;
-    }
-  }
-  g_young_log_len = 0;
+  gc_young_log_sweep();
   G0_PHASE(g0_minor_ns, 4);
-  /* Pointer-stable old generation: references to the cells promoted by this
-     collection switch to the pointer form (their own slots, then the stable
-     slots recorded during marking). */
-  gc_rewrite_promoted(survivors);
-  gc_fixup_apply();
   g_young_new_since_minor = 0;
   g_nursery_fresh_bytes = 0;
   gc_clear_nonheap_marks();
@@ -6042,6 +5703,7 @@ void ts_gc_collect_young(void){
   g_sc_minor = 0;
   g_sc_minors_since_full++;
 #endif
+  if (g_gc_protect) gc_cell_quarantine_trim();
   gc_payload_after_collection(0);
   g_gc_collecting = 0;
   G0_PHASE(g0_minor_ns, 5);
@@ -6053,7 +5715,6 @@ void ts_gc_collect(void){
   g_payload_fresh_bytes = 0;
   g_gc_collecting = 1;
   gc_payload_begin_full();
-  gc_cells_begin_full();
   prop_add_epoch_bump();
   gc_weak_begin();
   gc_mark_async_roots();
@@ -6093,33 +5754,16 @@ void ts_gc_collect(void){
   }
   g_rem_len = 0;
   G0_PHASE(g0_full_ns, 2);
-  /* Every cell, through the handle table: the marked are (or become) old
-     and get their mark bit back, the others die. */
-  ts_gc_header* promoted = NULL;
-  for (uint32_t id = 1; id <= g_handle_len && id < g_handle_cap; id++){
-    uintptr_t entry = (uintptr_t)g_ts_handle_table[id];
-    if (!entry) continue;
-    ts_gc_header* h = ts_handle_entry_cell(entry);
-    int young = h->gen == TS_GEN_YOUNG;
-    if (h->mark){
-      if (young){ G0_FATE(h, G0_PROMOTED); g_young_alloc--; g_old_alloc++; }
-      gc_cell_promote(h);
-      if (young){ h->gc_next = promoted; promoted = h; }
-      if (h->kind == TS_KIND_CORO) ts_gc_remember(h);
-    } else {
-      gc_cell_die(h);
-      if (young) g_young_alloc--; else g_old_alloc--;
-      g_alloc--;
-    }
-  }
-  g_young_log_len = 0;
+  /* The old cells through their mark bits (the unreached die and lose the
+     bit), then the young cells of the cycle through the log. */
+  gc_cells_sweep_old();
+  gc_young_log_sweep();
   G0_PHASE(g0_full_ns, 3);
-  gc_rewrite_promoted(promoted);
-  gc_fixup_apply();
   g_young_new_since_minor = 0;
   g_nursery_fresh_bytes = 0;
   g_nursery_survivor_bytes = 0;
   gc_clear_nonheap_marks();
+  if (g_gc_protect) gc_cell_quarantine_trim();
   gc_payload_after_collection(1);
   g_gc_collecting = 0;
   G0_PHASE(g0_full_ns, 5);
@@ -7412,10 +7056,10 @@ TS_RT_ALWAYS_INLINE uint32_t sv0_hash(tsv k){
   } else if (ts_is_str(k)){
     return ts_str_hash_of(k);
   } else if (ts_heap_ref(k)){
-    ts_gc_header* h = ts_heap_ptr(k);
-    uint64_t hd = h ? h->handle : 0;
-    uint32_t id = (hd & 1u) ? (uint32_t)(hd >> 1) : (uint32_t)((uintptr_t)h >> 4);
-    return id * 2654435769u;                    /* fibonacci mix over the raw id */
+    /* identity: the cell's address (cells never move); the high half of
+       the product mixes every address bit into the index bits */
+    uint64_t x = ((k & TS_PAYLOAD_MASK) >> 4) * 0x9E3779B97F4A7C15ull;
+    return (uint32_t)(x >> 32);
   } else {
     bits = k;                                    /* bool/undefined/null singletons */
   }
@@ -10622,12 +10266,9 @@ static ts_class_field_cache_entry g_class_field_cache[TS_CLASS_FIELD_CACHE_SIZE]
 uint32_t g_ts_class_layout_epoch = 1;
 static void prop_ic_location_reset(void);
 static uint32_t class_proto_hash(tsv proto){
-  /* identity hash: the handle id reaches both reference forms of a cell */
-  ts_gc_header* cell = ts_heap_ptr(proto);
-  uint64_t x = cell ? (cell->handle ? cell->handle : (uint64_t)(uintptr_t)cell) : (proto & TS_PAYLOAD_MASK);
-  uint32_t h = (uint32_t)x ^ (uint32_t)(x >> 32);
-  h ^= h >> 16;
-  return h * 2654435761u;
+  /* identity hash: the cell's address (cells never move) */
+  uint64_t x = ((proto & TS_PAYLOAD_MASK) >> 4) * 0x9E3779B97F4A7C15ull;
+  return (uint32_t)(x >> 32);
 }
 static void class_reg_index_put(uint32_t reg_i){
   uint32_t mask = g_class_reg_index_cap - 1u;
@@ -11742,8 +11383,6 @@ tsv ts_json_parse(tsv text){
   char short_text[TS_SHORTSTR_MAX];
   jparse p;
   if ((view.flags & TS_STR_FLAG_ASCII) && !(view.flags & TS_STR_FLAG_UTF16)){
-    gc_pin_string_storage(text);
-    view = ts_str_view_typed(text);
     p = (jparse){ ts_str_view_data(&view, short_text), 0, view.len, 1 };
   } else {
     uint32_t text_len = 0;
@@ -11752,11 +11391,7 @@ tsv ts_json_parse(tsv text){
   }
   tsv r=jp_value(&p);
   jp_ws(&p);
-  if ((view.flags & TS_STR_FLAG_ASCII) && !(view.flags & TS_STR_FLAG_UTF16)){
-    gc_unpin_string_storage(text);
-  } else {
-    free((void*)p.s);
-  }
+  if (!((view.flags & TS_STR_FLAG_ASCII) && !(view.flags & TS_STR_FLAG_UTF16))) free((void*)p.s);
   ts_gc_unroot(1);
   if (!p.ok || p.i!=p.n){ ts_throw(ts_new_error(TS_ERR_SYNTAX, ts_new_string("Unexpected token in JSON", 24))); }
   return r;
@@ -17443,14 +17078,11 @@ static int asyncgen_after_resume_v(tsv cv){
 void ts_coro_resume_v(tsv cv){
   if (!ts_is_coro_value(cv)) return;
   ts_gc_root(&cv);
-  gc_pin_value(cv);
   ts_handler* h = ts_eh_push();
   if (ts_setjmp(h->buf) != 0){
-    tsv pinned_cv = cv;
     tsv exc = ts_current_exception();
     ts_gc_set_root_depth(h->gc_root_len);
     ts_frame_restore(h->frame_top);
-    gc_unpin_value(pinned_cv);
     ts_eh_pop_until(h);
     cv = exc;  /* keep the exception rooted while rethrowing past this cleanup frame */
     ts_throw(exc);
@@ -17459,7 +17091,6 @@ void ts_coro_resume_v(tsv cv){
   if (c->resume) c->resume(cv);
   int kick_next=asyncgen_after_resume_v(cv);
   ts_eh_pop_until(h);
-  gc_unpin_value(cv);
   ts_gc_unroot(1);
   if (kick_next) asyncgen_start_next_v(cv);
 }

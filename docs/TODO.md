@@ -7752,3 +7752,40 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   compiler 7.9% slower (+55% peak memory: the earlier non-moving gate's
   finding), and dropping the handle branch of `ts_ptr` on top makes tsc-ts
   13% faster in all. Proposed next: allocation-site pretenuring by survival.
+- GC v2 Y2-D, slices D1 and D2 (`docs/gc_v2_design.md` §6.8, §6.8.1): the
+  non-moving heap with direct references. D1: cells live in the cell blocks
+  of the payload allocator's size classes, a mark bit means old, an eden
+  collection promotes in place through a young log, a full one sweeps; the
+  copying nursery, to-space and aging leave the collectors (the two aging
+  gates retire with them). D2: a reference is the cell's address
+  (`ts_ptr` is a mask, `ts_same_cell` bit equality), the barriers read the
+  owner's and the value's gen bytes, identity hashes come from addresses,
+  and the handle table, slot fixups, promoted-cell rewriting, pinning and
+  the moving collector's dead code are gone; a full collection sweeps the
+  old cells through their bitmaps; the marker takes a cage reference only
+  when its header reads as a live cell. Protect mode is rebuilt for the
+  non-moving heap (freed cells zapped and quarantined, a collection that
+  reaches one aborts naming it), and its first run found an older silent
+  miscompile: `+` and the relational operators left the first operand's
+  ToPrimitive result unrooted while the second operand's conversion ran, so
+  an allocating `valueOf`/`toString` freed it (`({valueOf(){return
+  "v-first"}}) + ({valueOf(){churn(); return "-second"}})` printed a churned
+  string; fixture `gc/to_primitive_pairs`, the result now rooted).
+  Gates: unit, parity (376 identical, one new known row), bundler 43/43,
+  selfconf, GC stress (ASan, protect), inline policy, conformance 529/529,
+  529/529 strict, 529/529 at every allocation under protect mode.
+  Against the build before D1 (eight interleaved pairs each, the same
+  generated C, outputs byte-identical): tsc-ts wall 0.887 (2.27 -> 2.01 s;
+  41.2 G -> 36.2 G instructions, peak memory 0.931), the TypeScript
+  compiler compiling itself 0.925 (4.23 -> 3.82 s; 77.2 G -> 72.5 G, peak
+  0.965), the selfhost bench (the frozen typed analyzer emitting its own
+  IR) 0.917 (3234 G -> 2885 G, peak 1.051). Milestone: the selfhost bench's
+  output byte-identical, also under protect mode, and 503/503 corpus
+  fixtures equal to the frozen emitter on node; tsc-ts and the compiler
+  under protect mode, protect with a minor every 64 allocations, and zap
+  with one every 16: outputs identical. `scripts/typed_selfhost.sh` stops
+  at its parity stage at HEAD already (its production export emits
+  `binding.check:` builtins the frozen emitter does not know); the
+  milestone ran its stages with the parity export. Next: the nursery's
+  remains out, then D3 (the 16-byte header: `handle` and `gc_next` are
+  dead).

@@ -846,6 +846,84 @@ Locality (G3's loss) is the risk D2 has to outrun; spinel's allocator
 remaining ideas (two young epochs instead of one bitmap pass, chunk
 ownership) are D1 follow-ups if the A/B asks for them.
 
+### 6.8.1 D1 and D2 as built
+
+**D1** as planned: cells are allocated in the cell blocks of the payload
+allocator's size classes (runs of free bits, bumped through), a set mark bit
+means old, an eden collection promotes the marked cells of the cycle in
+place and a full one sweeps; the nursery, the to-space, aging, the unpooled
+young list and `gc_next` are out of the collectors. Aging needed a copying
+nursery, so the two aging gates (`gc_aging_promotion_gate.sh`,
+`gc_adaptive_aging_gate.sh`) retired with it; every other gate passed
+unchanged.
+
+**D2**: a reference is the cell's address. `ts_heap_ref_fast` tags only
+`TS_GEN_NONHEAP` cells (bit 47, as before), `ts_ptr` is a mask,
+`ts_same_cell` is bit equality, the write barriers read the owner's and the
+value's gen bytes (owner first: most stores go to young owners), the array
+and Map card barriers the value's, and identity hashes (Map/Set keys, the
+class registry) come from the address: the high half of a 64-bit product,
+because a 16-byte-aligned address put straight into a power-of-two table
+would use a quarter of its home slots. The handle table, slot fixups, the
+rewriting of promoted cells and pinning are gone, and so is the moving
+collector's dead code. The young log stays, as pointers: a dying young cell
+needs its visit (side buffers such as an ArrayBuffer's bytes, the heap
+accounting); spinel's finalizer bitmap would make it unnecessary, a
+follow-up. A full collection sweeps the old cells through their block
+bitmaps (set bits whose cell is unmarked die and lose the bit), then the
+young log. The marker takes a reference in the cage only when its header
+reads as a live cell (a valid kind, YOUNG or OLD; references are made by
+boxing a cell's first byte and a cell block keeps its size class, so only
+a bug can name anything else), the production check of §4.7 in its cheap
+form; outside the cage it is not a heap cell.
+
+**Protect mode** (`TSAOT_GC_PROTECT=N`) quarantined released nursery chunks,
+which D1 no longer has, so D2 rebuilds it for the cell space: a dying cell
+is zapped and kept from the allocator (its bit stays set, its gen byte says
+FREED) in a FIFO of up to N MiB, so a dangling reference reads poison rather
+than a new cell, and a collection that reaches a quarantined cell aborts
+naming it (a missing root or write barrier). Its first full run (every
+conformance fixture at every allocation) found a silent miscompile older
+than this work: `+` and the relational operators converted the first
+operand with ToPrimitive and left the result unrooted while the second
+operand's conversion ran, so a `valueOf` or `toString` that allocates could
+free it; with handles its slot was recycled for another cell, with
+addresses its memory is. `({ valueOf() { return "v-first" } }) +
+({ valueOf() { churn(); return "-second" } })` printed a churned string
+(fixture `gc/to_primitive_pairs`; the fix roots the result). The runtime
+unit tests had one temporary of their own unrooted across allocations (the
+ephemeron fixed-point test), and the freed-cell probes of the weak-map tests
+ask the cell space now (`ts_gc_debug_cell_live`), since a stale address
+does not turn NULL the way a freed handle did.
+
+Measured against the build before D1 (eight interleaved pairs each, the
+same generated C, outputs byte-identical):
+
+| | wall | instructions | cycles | peak memory |
+|---|---|---|---|---|
+| tsc-ts, emitting the TypeScript 6.0.3 compiler | 0.887 (2.27 -> 2.01 s) | 0.879 (41.2 -> 36.2 G) | 0.884 | 0.931 |
+| the TypeScript compiler compiling itself | 0.925 (4.23 -> 3.82 s) | 0.939 (77.2 -> 72.5 G) | 0.916 | 0.965 |
+
+Both beat §6.7's estimate (about 4% and 6%), and every pair was faster.
+The milestone: the second row is the TypeScript compiler compiling itself.
+The selfhost bench (the frozen typed analyzer built by garnet, emitting its
+own 42 MB IR) emits byte-identical C, also under protect mode, and matches
+the frozen emitter on node on all 503 corpus fixtures that emitter handles:
+wall 0.917 (125.5 -> 115.0 s, two ABBA pairs), instructions 0.892
+(3234 -> 2885 G), peak memory 1.051 (624 -> 656 MB). The IR is exported
+with the parity knobs: `scripts/typed_selfhost.sh` stops at its parity
+stage before this work already, since the production export emits
+`binding.check:` builtins the frozen emitter does not know. D2's builds of tsc-ts and the
+compiler also ran under protect mode, protect mode with a minor collection
+every 64 allocations, and zapping with one every 16: outputs identical.
+
+Next, D3: `handle` and `gc_next` are dead, so the header can drop to 16 B
+(§4.4) by removing them; the static-literal and stack-object initializers
+of both emitters change with it (the frozen emitter's three templates are
+the minimal fix the frozen-source rule allows, parity proving both emit the
+same). The nursery's remains (its configuration, chunk code, aging
+counters) go in a cleanup before it.
+
 ## 7. Verification
 
 - Gates of every slice: unit, parity (`scripts/emitc_diff.sh`), bundler,

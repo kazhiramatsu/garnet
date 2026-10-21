@@ -5,7 +5,7 @@
  * there. A value is a number IFF it is NOT a quiet-NaN with our tag bits set.
  *
  *   bits 63..50 : 0xFFF8 | tag(3)   when boxed (the quiet-NaN prefix 0x7FF8/0xFFF8)
- *   bits 49..0  : 48-bit payload (immediate, stable heap handle, or stack pointer)
+ *   bits 49..0  : 48-bit payload (immediate, heap cell address, or tagged stack pointer)
  *
  * Doubles pass through untouched; only actual NaNs are canonicalized.
  *
@@ -154,56 +154,33 @@ typedef struct ts_gc_header {
     uint32_t pin_word;
     struct { uint16_t pin_depth; uint8_t inline_cap; uint8_t hdr_spare; };
   };
-  uint64_t handle; /* odd handle payload for heap refs; 0 for stack/SROA direct refs */
+  uint64_t handle; /* unused since direct references (docs/gc_v2_design.md §6.8 D2; D3 drops it) */
   size_t size;     /* allocated cell bytes; needed to copy variable-sized heap cells */
   struct ts_gc_header* gc_next;
 } ts_gc_header;
 enum { TS_GEN_YOUNG = 0, TS_GEN_OLD = 1, TS_GEN_NONHEAP = 2 };
-extern ts_gc_header** g_ts_handle_table;
 void ts_gc_remember(ts_gc_header* h);
 
-/* ---- heap refs ----
- * Heap values use a stable object handle in the NaN-box payload. Stack/SROA
- * objects are non-moving and keep the old direct-pointer payload; aligned C
- * object pointers have low bit 0, while handle payloads are encoded as
- * (slot_id << 1) | 1. This keeps existing ts_ptr call sites working while
- * making heap object identity independent from the object's address. */
+/* ---- heap refs (docs/gc_v2_design.md §6.8, slice D2) ----
+ * Heap cells never move (they live in the cell blocks of the heap cage), so
+ * a reference is the cell's address: boxing tags it, unboxing masks it, and
+ * two references to one cell always have the same bits. The generation is
+ * the header's gen byte. Stack/SROA cells and static literals
+ * (TS_GEN_NONHEAP) carry bit 47 as a tag: they are only 8-byte aligned and
+ * the collector and the write barriers tell them from heap cells without a
+ * load; the tag lives above the user address space. */
 tsv ts_heap_ref_value(uint16_t sel, void* p);
-/* Handle table entries carry the cell's generation in bit 0 (cells are at least
-   16-byte aligned): 1 = old. The minor collector and the write barriers can
-   classify a reference from the entry alone, without touching the cell, which
-   is usually cold for an old target. */
-#define TS_HANDLE_OLD_BIT ((uintptr_t)1u)
-static inline ts_gc_header* ts_handle_entry_cell(uintptr_t entry){
-  return (ts_gc_header*)(entry & ~TS_HANDLE_OLD_BIT);
-}
-/* Every managed cell receives its stable handle at allocation, so boxing a
-   live cell is a load; non-heap (stack/SROA) cells and NULL go out of line. */
 #define TS_PTR_STACK_TAG ((uint64_t)1u << 47)
 static inline tsv ts_heap_ref_fast(uint16_t sel, void* p) {
   if (TS_RT_LIKELY(p != NULL)){
     const ts_gc_header* h = (const ts_gc_header*)p;
-    /* an old cell never moves: reference it by address */
-    if (h->gen == TS_GEN_OLD) return TS_BOX(sel, (uintptr_t)p);
-    uint64_t handle = h->handle;
-    if (TS_RT_LIKELY(handle != 0)) return TS_BOX(sel, handle);
-    /* a static literal or a stack/SROA cell (never a handle): by address with
-       the stack tag, in line so every use of a string literal is a few loads */
-    if (h->gen == TS_GEN_NONHEAP) return TS_BOX(sel, (uintptr_t)p | TS_PTR_STACK_TAG);
+    if (TS_RT_LIKELY(h->gen != TS_GEN_NONHEAP)) return TS_BOX(sel, (uintptr_t)p);
+    return TS_BOX(sel, (uintptr_t)p | TS_PTR_STACK_TAG);
   }
   return ts_heap_ref_value(sel, p);
 }
-/* Heap reference payload forms (docs/pointer_stable_old_gen_design.md):
-   bit 0 set = handle (slot << 1 | 1), the only form for a young cell;
-   bit 0 clear, bit 47 clear = the address of an old cell (never moves);
-   bit 0 clear, bit 47 set = the address of a stack/SROA/static cell
-   (TS_GEN_NONHEAP). Static literals and stack cells are only 8-byte aligned,
-   so the tag lives above the user address space, not in the low bits. */
 static inline void* ts_ptr(tsv v) {
-  uint64_t payload = v & TS_PAYLOAD_MASK;
-  return (payload & 1u)
-    ? (void*)ts_handle_entry_cell((uintptr_t)g_ts_handle_table[payload >> 1])
-    : (void*)(uintptr_t)(payload & ~TS_PTR_STACK_TAG);
+  return (void*)(uintptr_t)(v & TS_PAYLOAD_MASK & ~TS_PTR_STACK_TAG);
 }
 static inline tsv ts_obj(void* p) { return ts_heap_ref_fast(TS_SEL_OBJECT, p); }
 static inline tsv ts_str_v(void* p){ return ts_heap_ref_fast(TS_SEL_STRING, p); }
@@ -1593,12 +1570,9 @@ tsv  ts_str_concat_many(tsv* args, int n);
 /* JS `===`. Identical bits are equal unless NaN; distinct bits can only be
    equal for two numbers (+0/-0) or two strings, which compare out of line. */
 int  ts_strict_eq_slow(tsv a, tsv b);
-/* Identity of two heap references whose bits differ: equal exactly when one
-   is a handle and the other a pointer to the same cell (handle slots and
-   addresses are each unique among live cells). Callers check the selectors. */
-static inline int ts_same_cell(tsv a, tsv b){
-  return TS_TOP16(a) == TS_TOP16(b) && (((a ^ b) & 1u) != 0) && ts_ptr(a) == ts_ptr(b);
-}
+/* Identity of two heap references: a cell has one reference (its address),
+   so two references name one cell exactly when their bits are equal. */
+static inline int ts_same_cell(tsv a, tsv b){ return a == b; }
 int ts_strict_eq_str(tsv a, tsv b);   /* two strings: the lengths first, then the content */
 /* Bounded fast path (always inline: a generated function compares hundreds
    of times, and the compiler's inliner gave up on the larger body): same
@@ -1707,6 +1681,7 @@ tsv  ts_make_class_value_cells_once(uint32_t class_id, ts_code ctor, tsv* env, u
 void ts_set_fn_prototype_lazy(tsv fn);
 void ts_gc_collect(void);             /* full mark/sweep over the dynamic heap */
 void ts_gc_collect_young(void);       /* minor collection of young objects */
+int  ts_gc_debug_cell_live(tsv v);    /* tests: does v still name an allocated cell? */
 void ts_gc_root(tsv* slot);           /* register a root (stack slot address) */
 /* Generated non-coroutine functions batch their boxed locals into one shadow
    frame. The slots immediately follow this header in the generated stack
@@ -1735,21 +1710,18 @@ static inline tsv* ts_frame_slots(ts_frame_hdr* frame){
   return (tsv*)(frame + 1);
 }
 void ts_frame_restore(ts_frame_hdr* frame);
+/* The generational barrier reads header bytes: only an old owner taking a
+   young value is remembered. A stack owner is scanned as a root and a stack
+   value is never young, so the tag answers both without a load; most stores
+   go to young owners, so the owner is tested first. */
 static inline void ts_write_barrier(tsv owner, tsv value){
   if (!(ts_is_obj(value)||ts_is_func(value)||ts_is_heap_str(value))) return;
   if (!(ts_is_obj(owner)||ts_is_func(owner)||ts_is_heap_str(owner))) return;
   uint64_t op = owner & TS_PAYLOAD_MASK, vp = value & TS_PAYLOAD_MASK;
-  /* A pointer-form value is old or on the stack: never a young pointee. */
-  if (!(vp & 1u)) return;
-  uintptr_t ve = (uintptr_t)g_ts_handle_table[vp >> 1];
-  if (ve & TS_HANDLE_OLD_BIT) return;
-  if (op & 1u){
-    uintptr_t oe = (uintptr_t)g_ts_handle_table[op >> 1];
-    if (oe & TS_HANDLE_OLD_BIT) ts_gc_remember(ts_handle_entry_cell(oe));
-    return;
-  }
-  if (op & TS_PTR_STACK_TAG) return; /* a stack owner is scanned as a root */
-  ts_gc_remember((ts_gc_header*)(uintptr_t)op); /* old-pointer owner */
+  if (((op | vp) & TS_PTR_STACK_TAG) || !op || !vp) return;
+  ts_gc_header* oh = (ts_gc_header*)(uintptr_t)op;
+  if (oh->gen != TS_GEN_OLD || ((const ts_gc_header*)(uintptr_t)vp)->gen != TS_GEN_YOUNG) return;
+  ts_gc_remember(oh);
 }
 /* The barrier for a write whose slot is known (docs/remembered_slots_design.md):
    an old plain object remembers a dirty card range in its header's spare
@@ -1773,16 +1745,10 @@ static inline void ts_write_barrier_ptr(tsv owner, tsv* p, tsv value){
   if (!(ts_is_obj(value)||ts_is_func(value)||ts_is_heap_str(value))) return;
   if (!(ts_is_obj(owner)||ts_is_func(owner)||ts_is_heap_str(owner))) return;
   uint64_t op = owner & TS_PAYLOAD_MASK, vp = value & TS_PAYLOAD_MASK;
-  if (!(vp & 1u)) return;
-  uintptr_t ve = (uintptr_t)g_ts_handle_table[vp >> 1];
-  if (ve & TS_HANDLE_OLD_BIT) return;
-  if (op & 1u){
-    uintptr_t oe = (uintptr_t)g_ts_handle_table[op >> 1];
-    if (oe & TS_HANDLE_OLD_BIT) ts_write_barrier_at(owner, ts_handle_entry_cell(oe), p, value);
-    return;
-  }
-  if (op & TS_PTR_STACK_TAG) return;
-  ts_write_barrier_at(owner, (ts_gc_header*)(uintptr_t)op, p, value);
+  if (((op | vp) & TS_PTR_STACK_TAG) || !op || !vp) return;
+  ts_gc_header* oh = (ts_gc_header*)(uintptr_t)op;
+  if (oh->gen != TS_GEN_OLD || ((const ts_gc_header*)(uintptr_t)vp)->gen != TS_GEN_YOUNG) return;
+  ts_write_barrier_at(owner, oh, p, value);
 }
 /* Ordinary shape hits keep their compact cache and original guard sequence.
    Sized receivers use a separate bounded location table in ts_rt.c.
@@ -2196,8 +2162,7 @@ static inline tsv ts_array_get_lazy_f64(tsv arr, double d, ts_frame_hdr* frame, 
    needs neither the frame-top address nor a callee-saved register on its
    fast path and can stay a leaf there. The emitter keeps a lazy
    function's reference locals in C locals and fills the frame from them only
-   before the linked call, reloading them after (a collection may rewrite a
-   slot from a young handle to the old pointer). */
+   before the linked call, reloading them after. */
 TS_RT_ALWAYS_INLINE int ts_get_static_try(tsv obj, ts_key key, uint32_t slot, ts_prop_ic* ic, tsv* out){
   tsv* p = ts_static_slot_probe(obj, key, slot, TS_PROP_ACCESSOR, 0, ic);
   if (p){ TS_RT_STAT_STATIC(get_hit); *out = *p; return 1; }
