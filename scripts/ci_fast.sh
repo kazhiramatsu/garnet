@@ -23,8 +23,6 @@ echo ">>> production optimization defaults"; bash "$ROOT/tests/default_optimizat
 echo ">>> project compiler options"; bash "$ROOT/tests/project_options_gate.sh" || rc=1
 if [[ "${TSAOT_CI_GC_STRESS:-0}" == "1" ]]; then
   echo ">>> escape-guided pretenuring"; bash "$ROOT/tests/pretenure_aot_gate.sh" || rc=1
-  echo ">>> GC aging promotion barrier"; bash "$ROOT/tests/gc_aging_promotion_gate.sh" || rc=1
-  echo ">>> adaptive GC aging"; bash "$ROOT/tests/gc_adaptive_aging_gate.sh" || rc=1
 fi
 echo ">>> golden iteration tests"
 bash "$ROOT/scripts/run_golden_iter.sh" || rc=1
