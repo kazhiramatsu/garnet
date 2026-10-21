@@ -19,9 +19,6 @@ RUN_RUNTIME_ASAN="${TSAOT_GC_STRESS_RUNTIME_ASAN:-1}"
 RUN_PROTECT="${TSAOT_GC_STRESS_PROTECT:-1}"
 RUN_BASE="${TSAOT_GC_STRESS_BASE:-1}"
 RUN_FULL="${TSAOT_GC_STRESS_FULL:-0}"
-RUN_MOVE_CORO="${TSAOT_GC_STRESS_MOVE_CORO:-0}"
-RUN_MOVE_PROMISE="${TSAOT_GC_STRESS_MOVE_PROMISE:-0}"
-RUN_MOVE_BOTH="${TSAOT_GC_STRESS_MOVE_BOTH:-0}"
 RUN_STRING_SCALE="${TSAOT_GC_STRESS_STRING_SCALE:-1}"
 
 FILTER='frame_roots_(unwind|edge_cases)|object_reflection_safepoints|string_runtime_safepoints|concat_growth|handle_identity|moving_minor_promise_coro_stress|json_runtime_safepoints|lower_level_runtime_safepoints|promise_coro_handle_edges|promise_movable_experimental|coro_entry_safepoints|coro_movable_experimental|array_callback_safepoints|generational_remembered_set|map_set_callback_safepoints|moving_minor_relocation|prototype_handle_edges|typed_class_allocation_safepoints|computed_member_names|extends_same_name_scopes|lazy_frame_getter|lazy_homes_reload|absent_site_entries|absent_site_records|function_own_properties|proxy_prototypes|reflect_receiver|array_iterators|forof_dynamic|dynamic_keys|string_accumulators|replace_builder|strict_eq_literals|payload_envs|payload_arrays|payload_props|payload_maps|coro_int_locals|proxy_old_generation|frame_elision|lazy_frame_calls|typed_array_buffers|typed_array_methods|typed_array_reflection|typed_array_elements|element_receivers|atomics|text_codecs'
@@ -61,39 +58,6 @@ fi
 
 # The aging gates retired with the copying nursery: the non-moving heap
 # promotes in place at the first survival (docs/gc_v2_design.md §6.8).
-
-if [[ "$RUN_MOVE_CORO" != "0" ]]; then
-  echo ">>> focused conformance (forced Coro moving, normal O2)"
-  TSAOT_GC_YOUNG_THRESHOLD="$THRESHOLD" TSAOT_GC_MOVE_CORO=1 \
-    bash "$S/run_conformance.sh" exhaustive "$FILTER" || rc=1
-  if [[ "$RUN_ASAN" != "0" ]]; then
-    echo ">>> focused conformance (forced Coro moving, ASan)"
-    TSAOT_GC_YOUNG_THRESHOLD="$THRESHOLD" TSAOT_GC_MOVE_CORO=1 TSAOT_CC="$ASAN_CC" \
-      bash "$S/run_conformance.sh" exhaustive "$FILTER" || rc=1
-  fi
-fi
-
-if [[ "$RUN_MOVE_PROMISE" != "0" ]]; then
-  echo ">>> focused conformance (forced Promise moving, normal O2)"
-  TSAOT_GC_YOUNG_THRESHOLD="$THRESHOLD" TSAOT_GC_MOVE_PROMISE=1 \
-    bash "$S/run_conformance.sh" exhaustive "$FILTER" || rc=1
-  if [[ "$RUN_ASAN" != "0" ]]; then
-    echo ">>> focused conformance (forced Promise moving, ASan)"
-    TSAOT_GC_YOUNG_THRESHOLD="$THRESHOLD" TSAOT_GC_MOVE_PROMISE=1 TSAOT_CC="$ASAN_CC" \
-      bash "$S/run_conformance.sh" exhaustive "$FILTER" || rc=1
-  fi
-fi
-
-if [[ "$RUN_MOVE_BOTH" != "0" ]]; then
-  echo ">>> focused conformance (forced Promise+Coro moving, normal O2)"
-  TSAOT_GC_YOUNG_THRESHOLD="$THRESHOLD" TSAOT_GC_MOVE_PROMISE=1 TSAOT_GC_MOVE_CORO=1 \
-    bash "$S/run_conformance.sh" exhaustive "$FILTER" || rc=1
-  if [[ "$RUN_ASAN" != "0" ]]; then
-    echo ">>> focused conformance (forced Promise+Coro moving, ASan)"
-    TSAOT_GC_YOUNG_THRESHOLD="$THRESHOLD" TSAOT_GC_MOVE_PROMISE=1 TSAOT_GC_MOVE_CORO=1 TSAOT_CC="$ASAN_CC" \
-      bash "$S/run_conformance.sh" exhaustive "$FILTER" || rc=1
-  fi
-fi
 
 if [[ "$RUN_FULL" == "1" ]]; then
   echo ">>> full exhaustive conformance (normal O2)"

@@ -53,12 +53,6 @@ grep -Fq '[mimalloc] enabled (vendored)' "$build_log" || {
 }
 
 env \
-  -u TSAOT_DISABLE_MOVING_MINOR \
-  -u TSAOT_GC_NURSERY \
-  -u TSAOT_GC_MOVE_PROMISE \
-  -u TSAOT_GC_MOVE_CORO \
-  -u TSAOT_GC_AGE_THRESHOLD \
-  -u TSAOT_GC_AGING_ADAPTIVE \
   -u TSAOT_GC_FULL_THRESHOLD_BYTES \
   -u TSAOT_GC_ZAP \
   "${runtime_gc_env[@]}" \
@@ -66,24 +60,19 @@ env \
   "$work/defaults" >/dev/null
 
 minor="$(sed -n 's/.*gc: minor=\([0-9][0-9]*\).*/\1/p' "$stats")"
-nursery="$(sed -n 's/.*nursery: alloc=\([0-9][0-9]*\).*/\1/p' "$stats")"
+young="$(sed -n 's/.*young: alloc=\([0-9][0-9]*\).*/\1/p' "$stats")"
 frames="$(sed -n 's/.*root_frames: frame_push=\([0-9][0-9]*\).*/\1/p' "$stats")"
 pic_hits="$(sed -n 's/.*prop_pic: get=[0-9][0-9]* hit=\([0-9][0-9]*\).*/\1/p' "$stats")"
 pretenured="$(sed -n 's/.*pretenured=\([0-9][0-9]*\).*/\1/p' "$stats")"
-aging_copied="$(sed -n 's/.*aging: copied_bytes=\([0-9][0-9]*\).*/\1/p' "$stats")"
 
 if [[ "${TSAOT_CI_GC_STRESS:-0}" == "1" ]]; then
   [[ "${minor:-0}" -gt 0 ]] || {
     echo "[default-opts] FAIL: generational GC did not run a minor collection"
     exit 1
   }
-  [[ "${aging_copied:-0}" -eq 0 ]] || {
-    echo "[default-opts] FAIL: aging is enabled by default (first-survival promotion expected)"
-    exit 1
-  }
 fi
-[[ "${nursery:-0}" -gt 0 ]] || {
-  echo "[default-opts] FAIL: bump-nursery allocation is not enabled by default"
+[[ "${young:-0}" -gt 0 ]] || {
+  echo "[default-opts] FAIL: generated program did not allocate a young cell"
   exit 1
 }
 [[ "${frames:-0}" -gt 0 ]] || {
@@ -98,4 +87,4 @@ fi
   echo "[default-opts] FAIL: generated program did not allocate a pretenured cell"
   exit 1
 }
-echo "[default-opts] PASS: PIC, root frames, pretenuring, nursery, and mimalloc defaults are active (GC stress=${TSAOT_CI_GC_STRESS:-0})"
+echo "[default-opts] PASS: PIC, root frames, pretenuring, young allocation, and mimalloc defaults are active (GC stress=${TSAOT_CI_GC_STRESS:-0})"

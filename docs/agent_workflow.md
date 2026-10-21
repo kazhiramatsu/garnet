@@ -109,16 +109,13 @@ Principle: **measurement over theory**. Minimal reproduction → a probe that pi
 1. **Minimize**: sweep the iteration count N (N=0/1/2…), strip features one at a time (remove capture / stop escape).
    Capture the **boundary**, e.g. "hand-unrolled passes but the loop crashes."
 2. **Isolate with env knobs** (change behavior and watch the correlation with symptoms = a correlation between symptom count and mechanism-invocation count is the clincher):
-   - `TSAOT_GC_YOUNG_THRESHOLD=1` … minor GC on every alloc (maximum stress on moving)
-   - `TSAOT_DISABLE_MOVING_MINOR=1` … stop minor moving (isolate whether moving is the cause)
-   - `TSAOT_GC_MOVE_CORO=0` / `TSAOT_GC_MOVE_PROMISE=1` … whether coro/promise may move
-   - `TSAOT_GC_AGE_THRESHOLD=2` … introduce aging (a promotion grace period) to change the number of moves
-   - `TSAOT_GC_ZAP=1` … poison dead/moved-from cells with 0xDD (use-after-free detection. **A clean undefined/all-zeros
-     = the signature of an unmarked death + region reuse**; 0xDD = a moved-from read)
-   - `TSAOT_GC_PROTECT=1` … released nursery chunks are made inaccessible for the next 64 releases
-     (`=N` for N): an access through a reference that went stale when its cell moved faults at its
-     site (run the debugger on the fault; `docs/gc_v2_design.md` §6.5)
-   - `TSAOT_GC_NURSERY=0` … turn off the bump nursery
+   - `TSAOT_GC_YOUNG_THRESHOLD=1` … minor GC on every alloc (maximum collection stress; cells
+     never move, so a stale reference can only outlive its cell)
+   - `TSAOT_GC_ZAP=1` … poison dead cells with 0xDD (use-after-free detection. **A clean undefined/all-zeros
+     = the signature of an unmarked death + region reuse**; 0xDD = a read of a freed cell)
+   - `TSAOT_GC_PROTECT=1` … freed cells are zapped and quarantined (up to 64 MiB; `=N` for N MiB)
+     instead of reused, and a collection that reaches one aborts naming it: a missing root or
+     write barrier (`docs/gc_v2_design.md` §6.8.1)
    - `TSAOT_UNTYPED=1` … isolate whether type-driven optimization (SROA/unbox) is the cause
    - `garnet --stack-check` … every escape-analysis `Stack` object (class instance, scope record,
      closure) lives in a never-reused quarantine and dies with its activation; a dead one the

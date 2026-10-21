@@ -21,14 +21,12 @@ extern int __asan_address_is_poisoned(const void *addr);
 #endif
 
 /* ---------------- GC heap ---------------- */
-static ts_gc_header* g_young_heap = NULL;
-static ts_gc_header* g_old_heap = NULL;
 static size_t g_alloc=0, g_young_alloc=0, g_old_alloc=0;
 static size_t g_young_threshold=65536;
 /* Full-GC trigger is LIVE CELL BYTES (gc_moving_plan B-3), not cell count: a
    count misjudges pressure for variable-sized cells (one 500MB inline string
    is 1 count). g_heap_bytes tracks cell bodies exactly — alloc adds sz, every
-   free subtracts h->size, an evacuation is byte-neutral. External payload
+   free subtracts h->size. External payload
    arrays (props/env/data) are not counted (cell-body granularity). */
 static size_t g_heap_bytes = 0;
 static size_t g_full_threshold_bytes = (size_t)16u * 1024u * 1024u;
@@ -40,13 +38,10 @@ static int g_negative_pic = 1;          /* TSAOT_NEGATIVE_PIC=0: no absent-prope
 static int g_absent_site = 1;           /* TSAOT_ABSENT_SITE=0: read sites keep no absent record (docs/absent_reads_inline_design.md) */
 static int g_key_caches = 1;            /* TSAOT_KEY_CACHES=0: every dynamic key goes through ToString (docs/dynamic_keys_design.md) */
 static int g_sparse_elements = 1;       /* TSAOT_SPARSE_ELEMENTS=0: far stores always materialize dense storage */
-/* TSAOT_GC_ZAP=1 fills dead and moved-from cell bodies with 0xDD during
-   collection (Phase C0 groundwork): a stale raw pointer held across a
-   safepoint then reads loud garbage (kind 0xDD fails gc_kind_valid, tsv
-   payloads are poison) instead of silently working because the old body
-   still holds a bit-copy. ASan-independent — the CLT 17.0.0 ASan runtime
-   deadlocks at startup on this host, so this is the always-available
-   use-after-move detector. GC cold paths only; zero mutator cost. */
+/* TSAOT_GC_ZAP=1 fills dead cell bodies with 0xDD during collection: a
+   stale reference then reads loud garbage (kind 0xDD fails gc_kind_valid,
+   tsv payloads are poison) instead of the cell's last contents.
+   ASan-independent; GC cold paths only, zero mutator cost. */
 static int g_gc_zap = 0;
 static uint32_t g_gc_protect = 0;   /* TSAOT_GC_PROTECT: MiB of freed cells kept in quarantine; 0 = off */
 /* The gen of a cell in protect mode's quarantine (gc_cell_quarantine). */
@@ -57,55 +52,16 @@ static void gc_freed_reached(ts_gc_header* h){
   abort();
 }
 
-/* ---- bump nursery (gc_moving_plan Phase B) ----
-   Young movable cells live in 256KB-aligned arena chunks: allocation is a bump
-   (pointer add + memset), death is free-of-payload only, and the whole arena
-   resets after each minor GC ("arena cells leave by copy or die" — they are
-   never promoted in place because the cell memory belongs to the chunk).
-   Large cells (>= 4KB inline strings etc.), Promise/Coro/Proxy and everything
-   under TSAOT_GC_NURSERY=0 stay on the classic calloc young list (unpooled).
-   The chunk alignment gives O(1) cell→chunk lookup by mask, which the pinned
-   path below and Phase C's pointer rewrites rely on.
-   Pinned defense: a pinned arena cell (e.g. ts_json_parse pins the source
-   string's storage across an allocating parse) can neither move nor be
-   promoted in place. Its chunk is RETAINED (kept out of the reset pool) and
-   the cell is tracked on g_pinned_young; the next collection that sees it
-   unpinned evacuates it and, once a retained chunk holds no pinned survivors,
-   the chunk returns to the free pool. */
-#define GC_NURSERY_CHUNK_BYTES ((size_t)(256u * 1024u))
-#define GC_NURSERY_MAX_CELL    ((size_t)4096u)
-typedef struct gc_chunk {
-  struct gc_chunk* next;
-  size_t used;          /* bump offset from data start */
-  uint32_t pinned_live; /* pinned survivors still resident (retained chunks) */
-} gc_chunk;
-#define GC_NURSERY_DATA_OFF  ((sizeof(gc_chunk) + 15u) & ~(size_t)15u)
-#define GC_NURSERY_DATA_BYTES (GC_NURSERY_CHUNK_BYTES - GC_NURSERY_DATA_OFF)
-/* Nursery chunks come from one reserved address range (docs/gc_v2_design.md
-   §6.5 step 3): a cell is in the nursery iff its address is in
-   [g_nursery_lo, g_nursery_lo + g_nursery_span), an address test with no
-   load from the cell. The span is 0 until the first chunk is needed. */
-#define GC_NURSERY_RANGE_BYTES ((size_t)4u << 30)
-static uintptr_t g_nursery_lo = 0;
-static size_t g_nursery_span = 0;
-static size_t g_nursery_frontier = 0;   /* bytes of the range handed out as chunks */
-static inline int gc_in_nursery(const void* p){
-  return (uintptr_t)p - g_nursery_lo < g_nursery_span;
-}
-static gc_chunk* g_nursery_active = NULL;   /* chunks bumped this cycle; head is current */
-static gc_chunk* g_nursery_free = NULL;     /* empty chunks kept for reuse */
-static gc_chunk* g_nursery_retained = NULL; /* chunks held in place by pinned survivors */
-static ts_gc_header* g_pinned_young = NULL; /* pinned arena survivors (gc_next reused) */
-static size_t g_nursery_used_bytes = 0;     /* physical survivor + fresh residency */
-static size_t g_nursery_fresh_bytes = 0;    /* new bump bytes since the last minor */
-static size_t g_nursery_survivor_bytes = 0; /* to-space bytes retained by the last minor */
-static size_t g_nursery_cap_bytes = (size_t)4u * 1024u * 1024u; /* TSAOT_GC_NURSERY_BYTES */
-static int g_nursery_enabled = 1;           /* TSAOT_GC_NURSERY=0 kill switch */
+/* The young cycle: bytes allocated young since the last collection, and
+   the budget that triggers a minor collection (TSAOT_GC_NURSERY_BYTES, the
+   copying nursery's knob, keeps its name). */
+static size_t g_young_fresh_bytes = 0;
+static size_t g_young_cap_bytes = (size_t)4u * 1024u * 1024u;
 /* Payload bytes (malloc'd element, property and table buffers) grown since
    the last minor collection. They are outside the cells' byte count, so a
    loop that only drops large containers would never trigger a collection
    (docs/gc_v2_design.md, G1 (b)): past this budget the next allocation runs a
-   minor collection. Sixteen nurseries by default
+   minor collection. Sixteen young budgets by default
    (TSAOT_GC_PAYLOAD_BUDGET_BYTES). */
 static size_t g_payload_fresh_bytes = 0;
 static size_t g_payload_budget_bytes = 0;
@@ -557,40 +513,7 @@ static void gc_payload_after_collection(int full){
     l = next;
   }
 }
-/* Aging (tenure grace): a marked arena survivor is copied WITHIN the nursery
-   (staying YOUNG, age = its remembered byte, unused while young) until it has
-   survived this many minors; only then does it evacuate to the old gen. 1 =
-   promote on first survival (the pre-aging behavior — that value bypasses the
-   to-space path entirely). Fights premature tenuring: transient cells that
-   happen to straddle one minor no longer pollute the old gen. Pinned survivors
-   keep the old rule (promote on release). TSAOT_GC_AGE_THRESHOLD overrides;
-   full GC always promotes.
-   DEFAULT 1 (first-survival promotion) since GC v2 Y1 step 2
-   (docs/gc_v2_design.md §6.5): measured neutral on the compiler, and every
-   cell a minor collection moves is then promoted, so a moved cell is
-   rewritten once and never moves again. TSAOT_GC_AGE_THRESHOLD=2 restores
-   the adaptive policy: low-survival cohorts get one collection of grace,
-   while cohorts whose aged bytes overwhelmingly promote switch back to
-   first-survival promotion for eight minors. */
-static uint8_t g_gc_age_threshold = 1;
-/* Adaptive aging keeps the threshold-2 win for low-survival cohorts without
-   letting survivor residency halve the next allocation interval or repeatedly
-   recopy high-survival cohorts. The fixed-policy kill switch restores the old
-   shared-capacity / 50%-copy-budget behavior for exact A/B comparisons. */
-static int g_gc_aging_adaptive = 1;          /* TSAOT_GC_AGING_ADAPTIVE=0 */
-static uint8_t g_gc_aging_fallback_minors = 0;
-static int g_gc_aging_collect_outcomes = 0;
-static size_t g_gc_aging_window_dead_bytes = 0;
-static size_t g_gc_aging_window_promoted_bytes = 0;
-#define GC_AGING_COPY_PERCENT       50u
-#define GC_AGING_PROMOTED_PERCENT   80u
-#define GC_AGING_FALLBACK_MINORS     8u
-#define GC_AGING_MIN_SAMPLE_BYTES ((size_t)64u * 1024u)
-/* Young allocations since the last collection: the minor COUNT trigger. With
-   aging, g_young_alloc includes kept survivors, so triggering on it would
-   re-fire immediately after a minor that kept a large residency; this counter
-   tracks churn only. Pre-aging the two were equal at every trigger point
-   (every minor emptied the young set), so this is behavior-neutral there. */
+/* Young allocations since the last collection: the minor COUNT trigger. */
 static size_t g_young_new_since_minor = 0;
 static tsv** g_roots=NULL; static int g_root_len=0, g_root_cap=0;
 static tsv** g_static_roots=NULL; static int g_static_root_len=0, g_static_root_cap=0;
@@ -653,10 +576,7 @@ static struct {
   unsigned long long prop_add_hits, prop_add_fills, prop_add_site_hits;   /* additions: global cache hits, slow fills, per-site entry hits */
   unsigned long long pic_get_absent, pic_get_inherited, pic_absent_hits, absent_site_hits;
   unsigned long long array_sparse_convert, array_sparse_put, array_densify;   /* far stores: dense->sparse switches, side-table stores, sparse->dense */   /* out-of-line reads resolved on the chain / missing / answered by the absent cache */
-  unsigned long long nursery_alloc, nursery_chunks, retained_chunks;
-  unsigned long long nursery_aged, unpooled_aged;   /* survivors kept YOUNG by aging */
-  unsigned long long aging_copied_bytes, aging_died_bytes, aging_promoted_bytes;
-  unsigned long long aging_forced_bytes, aging_fallback_minors, aging_activations;
+  unsigned long long young_alloc;
   unsigned long long call_env_malloc, construct_malloc;
   unsigned long long call_env_hist[9], call_env_slots;
   unsigned long long concat_calls, concat_bytes;
@@ -775,15 +695,8 @@ __attribute__((destructor)) static void ts_rt_stats_dump(void){
   fprintf(out, "[rt_stats] remset: slot_writes=%llu full_marks=%llu precise_scans=%llu precise_slots=%llu full_scans=%llu full_slots=%llu\n",
           g_rt_stats.remset_slot_writes, g_rt_stats.remset_full_marks, g_rt_stats.remset_precise_scans,
           g_rt_stats.remset_precise_slots, g_rt_stats.remset_full_scans, g_rt_stats.remset_full_slots);
-  fprintf(out, "[rt_stats] nursery: alloc=%llu chunks=%llu retained=%llu aged=%llu+%llu | live_bytes=%zu full_next=%zu\n",
-          g_rt_stats.nursery_alloc, g_rt_stats.nursery_chunks, g_rt_stats.retained_chunks,
-          g_rt_stats.nursery_aged, g_rt_stats.unpooled_aged,
-          g_heap_bytes, g_full_threshold_bytes);
-  fprintf(out, "[rt_stats] aging: copied_bytes=%llu died_bytes=%llu promoted_bytes=%llu forced_bytes=%llu fallback_minors=%llu activations=%llu | fresh_bytes=%zu survivor_bytes=%zu\n",
-          g_rt_stats.aging_copied_bytes, g_rt_stats.aging_died_bytes,
-          g_rt_stats.aging_promoted_bytes, g_rt_stats.aging_forced_bytes,
-          g_rt_stats.aging_fallback_minors, g_rt_stats.aging_activations,
-          g_nursery_fresh_bytes, g_nursery_survivor_bytes);
+  fprintf(out, "[rt_stats] young: alloc=%llu fresh_bytes=%zu | live_bytes=%zu full_next=%zu\n",
+          g_rt_stats.young_alloc, g_young_fresh_bytes, g_heap_bytes, g_full_threshold_bytes);
   fprintf(out, "[rt_stats] ts_call env_malloc=%llu construct_malloc=%llu | concat: calls=%llu bytes=%llu\n",
           g_rt_stats.call_env_malloc, g_rt_stats.construct_malloc,
           g_rt_stats.concat_calls, g_rt_stats.concat_bytes);
@@ -1024,7 +937,6 @@ static inline ts_gc_header* ts_heap_ptr(tsv v){
   if (!gc_payload_in_cage(h) || (payload & 0xFu) != 0) return NULL;
   return (gc_kind_valid(h->kind) && h->gen <= TS_GEN_OLD) ? h : NULL;
 }
-static inline int gc_is_young(ts_gc_header* h){ return h && h->gen == TS_GEN_YOUNG; }
 static tsv ts_string_slice_copy(tsv src, uint32_t start, uint32_t len);
 static tsv ts_string_slice_view(tsv src, uint32_t start, uint32_t len);
 static char* ts_string_cstr_copy(tsv src, uint32_t* out_len);
@@ -1035,7 +947,6 @@ static int ts_string_own_prop(tsv obj, ts_key key, tsv* out);
 static int field_name_is(uint32_t id, const char* lit);
 static int field_bytes_is(const char* n, uint32_t len, const char* lit);
 static int prop_key_is_array_index(uint32_t key, uint32_t* idx);
-static int gc_moving_minor_enabled(void);
 static int g_gc_config_inited = 0;
 static void gc_config_init(void){
   if (g_gc_config_inited) return;
@@ -1046,32 +957,14 @@ static void gc_config_init(void){
     unsigned long long v = strtoull(young, &end, 10);
     if (end != young) g_young_threshold = (size_t)(v ? v : 1);
   }
-  /* Bump-nursery config. TSAOT_GC_NURSERY=0 falls back to the classic
-     all-unpooled allocator (one milestone-period kill switch). The nursery
-     requires the moving minor: with TSAOT_DISABLE_MOVING_MINOR set, arena
-     survivors could neither move nor be promoted in place, so the nursery
-     turns itself off. */
-  const char* nursery = getenv("TSAOT_GC_NURSERY");
-  if (nursery && nursery[0] && strcmp(nursery, "0") == 0) g_nursery_enabled = 0;
-  if (!gc_moving_minor_enabled()) g_nursery_enabled = 0;
-  g_gc_age_threshold = 1;   /* G3: promotion at the first survival, in place */
-  const char* age = NULL;
-  if (age && age[0]){
-    char* end = NULL;
-    unsigned long v = strtoul(age, &end, 10);
-    if (end != age) g_gc_age_threshold = (uint8_t)(v < 1 ? 1 : (v > 8 ? 8 : v));
-  }
-  const char* adaptive = getenv("TSAOT_GC_AGING_ADAPTIVE");
-  if (adaptive && adaptive[0] && strcmp(adaptive, "0") == 0)
-    g_gc_aging_adaptive = 0;
   const char* nbytes = getenv("TSAOT_GC_NURSERY_BYTES");
   if (nbytes && nbytes[0]){
     char* end = NULL;
     unsigned long long v = strtoull(nbytes, &end, 10);
-    if (end != nbytes && v) g_nursery_cap_bytes = (size_t)v;
-    if (g_nursery_cap_bytes < GC_NURSERY_CHUNK_BYTES) g_nursery_cap_bytes = GC_NURSERY_CHUNK_BYTES;
+    if (end != nbytes && v) g_young_cap_bytes = (size_t)v;
+    if (g_young_cap_bytes < ((size_t)256u << 10)) g_young_cap_bytes = (size_t)256u << 10;
   }
-  g_payload_budget_bytes = g_nursery_cap_bytes * 16u;
+  g_payload_budget_bytes = g_young_cap_bytes * 16u;
   const char* pbudget = getenv("TSAOT_GC_PAYLOAD_BUDGET_BYTES");
   if (pbudget && pbudget[0]){
     char* end = NULL;
@@ -1115,30 +1008,17 @@ tsv ts_heap_ref_value(uint16_t sel, void* p){
   if (h->gen == TS_GEN_NONHEAP) return TS_BOX(sel, (uintptr_t)p | TS_PTR_STACK_TAG);
   return TS_BOX(sel, (uintptr_t)p);
 }
+/* Every young survivor is promoted at the next collection, so an old cell
+   stays in the remembered set for exactly one cycle: the byte is a flag. */
 static void gc_remember(ts_gc_header* h){
   if (!h || h->gen != TS_GEN_OLD) return;
-  /* The remembered byte holds a SCAN CREDIT, not just an in-set flag. Under
-     aging a young pointee can stay young for up to g_gc_age_threshold minors,
-     so the old->young edge must survive that many per-cycle remset resets:
-     each minor decrements the credit and re-enrolls while it lasts (see the
-     minor sweep). threshold=1 (aging off) => credit 1 => enrolled for exactly
-     one minor — the pre-aging behavior. Adaptive fallback also uses credit 1
-     because every marked young pointee promotes at the next minor.
-     An already-enrolled cell REFRESHES its credit instead of early-returning:
-     each write may store a brand-new (age 0) young ref, which needs the full
-     grace window counted from THIS write — with the plain dedup, a cell whose
-     credit had partially drained would drop out of the remset while the newer
-     pointee was still young (observed as dropped prop values under aging). */
-  uint8_t credit =
-    (g_gc_aging_adaptive && g_gc_aging_fallback_minors)
-      ? 1 : g_gc_age_threshold;
   if (h->kind == TS_KIND_OBJECT && h->hdr_spare == 0) h->hdr_spare = 0xFF; /* no range known: every slot */
-  if (h->remembered){ h->remembered = credit; return; }
+  if (h->remembered) return;
   if (g_rem_len == g_rem_cap){
     g_rem_cap = g_rem_cap ? g_rem_cap * 2 : 1024;
     g_remset = (ts_gc_header**)realloc(g_remset, sizeof(ts_gc_header*) * g_rem_cap);
   }
-  h->remembered = credit;
+  h->remembered = 1;
   g_remset[g_rem_len++] = h;
   G0_INC(g0_rem_enroll);
 }
@@ -1202,91 +1082,9 @@ void ts_gc_set_root_depth(int n){
 }
 void ts_frame_restore(ts_frame_hdr* frame){ g_ts_frame_top = frame; }
 
-/* Nursery-eligible kinds: the unconditionally movable base kinds. Promise/Coro
-   (conditionally movable, resume pins raw frames) and Proxy (non-moving) stay
-   unpooled; large cells stay unpooled so a dying 500MB inline string is freed
-   at the next minor instead of squatting in a chunk. */
-static inline int gc_is_bump_kind(uint8_t kind){
-  return kind==TS_KIND_OBJECT || kind==TS_KIND_STRING || kind==TS_KIND_FUNC ||
-         kind==TS_KIND_ARRAY || kind==TS_KIND_MAP || kind==TS_KIND_SET ||
-         kind==TS_KIND_ACCESSOR || kind==TS_KIND_SYMBOL ||
-         kind==TS_KIND_ARRAYBUFFER || kind==TS_KIND_TYPEDARRAY;
-}
-/* Protect mode (TSAOT_GC_PROTECT, docs/gc_v2_design.md §6.5 step 1): a chunk
-   a collection releases is made inaccessible and kept in a bounded
-   quarantine before it is reused, so an access through a reference that went
-   stale when its cell moved faults at the access instead of reading a
-   moved-from copy. */
-static gc_chunk** g_chunk_quarantine = NULL;
-static uint32_t g_chunk_q_head = 0, g_chunk_q_len = 0;
-static void gc_nursery_range_init(void){
-  for (size_t want = GC_NURSERY_RANGE_BYTES; want >= ((size_t)64u << 20); want >>= 1){
-    void* m = mmap(NULL, want + GC_NURSERY_CHUNK_BYTES, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (m == MAP_FAILED) continue;
-    g_nursery_lo = ((uintptr_t)m + GC_NURSERY_CHUNK_BYTES - 1u) & ~(uintptr_t)(GC_NURSERY_CHUNK_BYTES - 1u);
-    g_nursery_span = want;
-    return;
-  }
-  ts_abort_msg("cannot reserve the nursery range");
-}
-/* A never-used chunk at the range's frontier (released chunks are reused
-   through g_nursery_free); NULL when the range is exhausted, and the cell
-   falls back to the unpooled path. */
-static void* gc_chunk_alloc(void){
-  if (!g_nursery_span) gc_nursery_range_init();
-  if (g_nursery_frontier + GC_NURSERY_CHUNK_BYTES > g_nursery_span) return NULL;
-  void* c = (void*)(g_nursery_lo + g_nursery_frontier);
-  if (mprotect(c, GC_NURSERY_CHUNK_BYTES, PROT_READ | PROT_WRITE) != 0) return NULL;
-  g_nursery_frontier += GC_NURSERY_CHUNK_BYTES;
-  return c;
-}
-/* A chunk a collection released: to the free pool, or (protect mode) into
-   the quarantine, whose oldest chunk then returns to the free pool. */
-static void gc_chunk_release(gc_chunk* c){
-  c->used = 0;
-  if (!g_gc_protect){ c->next = g_nursery_free; g_nursery_free = c; return; }
-  if (!g_chunk_quarantine){
-    g_chunk_quarantine = (gc_chunk**)calloc(g_gc_protect, sizeof(gc_chunk*));
-    if (!g_chunk_quarantine) ts_abort_msg("out of memory allocating the chunk quarantine");
-  }
-  if (g_chunk_q_len == g_gc_protect){
-    gc_chunk* old = g_chunk_quarantine[g_chunk_q_head];
-    mprotect(old, GC_NURSERY_CHUNK_BYTES, PROT_READ | PROT_WRITE);
-    old->used = 0; old->next = g_nursery_free; g_nursery_free = old;
-    g_chunk_quarantine[g_chunk_q_head] = c;
-    g_chunk_q_head = (g_chunk_q_head + 1u) % g_gc_protect;
-  } else {
-    g_chunk_quarantine[(g_chunk_q_head + g_chunk_q_len) % g_gc_protect] = c;
-    g_chunk_q_len++;
-  }
-  mprotect(c, GC_NURSERY_CHUNK_BYTES, PROT_NONE);
-}
-static void* gc_nursery_bump(size_t sz){
-  size_t need = (sz + 15u) & ~(size_t)15u;
-  gc_chunk* c = g_nursery_active;
-  if (!c || c->used + need > GC_NURSERY_DATA_BYTES){
-    if (g_nursery_free){
-      c = g_nursery_free; g_nursery_free = c->next;
-    } else {
-      void* mem = gc_chunk_alloc();
-      if (!mem) return NULL; /* fall back to the unpooled path */
-      c = (gc_chunk*)mem;
-      RT_STAT_INC(nursery_chunks);
-    }
-    c->used = 0; c->pinned_live = 0;
-    c->next = g_nursery_active; g_nursery_active = c;
-  }
-  void* p = (char*)c + GC_NURSERY_DATA_OFF + c->used;
-  c->used += need;
-  g_nursery_used_bytes += need;
-  g_nursery_fresh_bytes += need;
-  memset(p, 0, sz); /* keep the calloc zero-init contract of the classic path */
-  return p;
-}
 static inline void gc_before_alloc(void){
   if (TS_RT_UNLIKELY(!g_gc_config_inited)) gc_config_init();
-  size_t nursery_trigger_bytes = g_nursery_fresh_bytes;   /* young bytes of the cycle (G3) */
-  if (g_young_new_since_minor>=g_young_threshold || nursery_trigger_bytes>=g_nursery_cap_bytes ||
+  if (g_young_new_since_minor>=g_young_threshold || g_young_fresh_bytes>=g_young_cap_bytes ||
       g_payload_fresh_bytes>=g_payload_budget_bytes)
     ts_gc_collect_young();
 #ifdef TSAOT_STACK_CHECK
@@ -1343,9 +1141,9 @@ static void* gc_alloc(size_t sz, uint8_t kind){
   ts_gc_header* h = (ts_gc_header*)gc_cell_alloc(sz, 0);
   h->kind=kind; h->gen=TS_GEN_YOUNG; h->size=sz;
   gc_young_log_push(h);
-  g_nursery_fresh_bytes += sz;
+  g_young_fresh_bytes += sz;
   g_alloc++; g_young_alloc++; g_young_new_since_minor++;
-  RT_STAT_INC(nursery_alloc);
+  RT_STAT_INC(young_alloc);
   return h;
 }
 /* Escape-proven long-lived allocation. The cell starts in the old generation
@@ -5203,8 +5001,6 @@ TS_RT_ALWAYS_INLINE void gc_visit_slot(tsv* slot, int young, int depth, int stab
   (void)stable;
   gc_mark_visit(*slot, young, depth);
 }
-static inline void gc_mark_value(tsv v){ gc_mark_visit(v, 0, 0); }
-static inline void gc_mark_value_young(tsv v){ gc_mark_visit(v, 1, 0); }
 /* ts_prop keeps a compact user-Symbol id rather than a tagged heap reference.
    Recover and trace that identity here so `obj[sym]` is a genuine strong edge.
    The weak id table is cleared only after ephemerons reach their fixed point. */
@@ -5621,17 +5417,9 @@ static void g0_dump(FILE* out){
           g_young_log_cap, g0_rem_enroll, g0_proto_materialized, g0_pretenured_bytes);
 }
 #endif
-static int gc_moving_minor_enabled(void){
-  static int enabled = -1;
-  if (enabled < 0){
-    const char* off = getenv("TSAOT_DISABLE_MOVING_MINOR");
-    enabled = !(off && off[0] && strcmp(off, "0") != 0);
-  }
-  return enabled;
-}
 void ts_gc_collect_young(void){
   g_payload_fresh_bytes = 0;
-  if (!g_young_log_len){ g_nursery_fresh_bytes = 0; g_young_new_since_minor = 0; return; }
+  if (!g_young_log_len){ g_young_fresh_bytes = 0; g_young_new_since_minor = 0; return; }
   g_gc_collecting = 1;
   RT_STAT_INC(minor_gc); RT_STAT_GC_T0;
   G0_T0;
@@ -5697,7 +5485,7 @@ void ts_gc_collect_young(void){
   gc_young_log_sweep();
   G0_PHASE(g0_minor_ns, 4);
   g_young_new_since_minor = 0;
-  g_nursery_fresh_bytes = 0;
+  g_young_fresh_bytes = 0;
   gc_clear_nonheap_marks();
 #ifdef TSAOT_STACK_CHECK
   g_sc_minor = 0;
@@ -5760,8 +5548,7 @@ void ts_gc_collect(void){
   gc_young_log_sweep();
   G0_PHASE(g0_full_ns, 3);
   g_young_new_since_minor = 0;
-  g_nursery_fresh_bytes = 0;
-  g_nursery_survivor_bytes = 0;
+  g_young_fresh_bytes = 0;
   gc_clear_nonheap_marks();
   if (g_gc_protect) gc_cell_quarantine_trim();
   gc_payload_after_collection(1);
