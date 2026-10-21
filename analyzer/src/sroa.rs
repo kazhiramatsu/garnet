@@ -2695,16 +2695,37 @@ fn inline_callee(
     bodies: &BTreeMap<u32, Function>,
     depth: u32,
 ) {
+    // A parameter the body assigns gets a local of its own holding the
+    // argument: mapped to the argument's local, the assignment would overwrite
+    // the caller's variable.
+    let mut assigned: BTreeMap<u32, u32> = BTreeMap::new();
+    count_defs(&callee.body, &mut assigned, &mut BTreeMap::new());
     // param 0 is `this`; params 1.. map to args
     let mut subst: BTreeMap<u32, u32> = BTreeMap::new();
     for (i, p) in callee.params.iter().enumerate() {
         if i == 0 {
             continue;
         } // this -> handled via field map
-        if let Some(a) = args.get(i - 1) {
-            subst.insert(p.0, a.0);
-        } else {
-            subst.insert(p.0, omitted_argument(next, new_locals, out));
+        match args.get(i - 1) {
+            Some(a) if assigned.contains_key(&p.0) => {
+                let reference = callee
+                    .locals
+                    .iter()
+                    .find(|l| l.id.0 == p.0)
+                    .map_or(true, |l| !matches!(l.ref_kind, RefKind::Primitive));
+                let id = fresh(next, new_locals, reference);
+                out.push(Inst::Copy {
+                    dst: LocalId(id),
+                    src: *a,
+                });
+                subst.insert(p.0, id);
+            }
+            Some(a) => {
+                subst.insert(p.0, a.0);
+            }
+            None => {
+                subst.insert(p.0, omitted_argument(next, new_locals, out));
+            }
         }
     }
     // fresh-rename all non-param callee locals
@@ -2715,14 +2736,50 @@ fn inline_callee(
         let nl = fresh(next, new_locals, !matches!(l.ref_kind, RefKind::Primitive));
         subst.insert(l.id.0, nl);
     }
-    let this_local = callee.params.first().map(|p| p.0);
-    let m = |id: LocalId| -> LocalId { LocalId(*subst.get(&id.0).unwrap_or(&id.0)) };
+    let cx = InlineCx {
+        this_local: callee.params.first().map(|p| p.0),
+        subst: &subst,
+        fmap,
+        dst,
+        bodies,
+        depth,
+    };
+    inline_insts(&callee.body, &cx, next, new_locals, out);
+}
 
-    for inst in &callee.body {
+/// What `inline_insts` substitutes in an inlined method body.
+struct InlineCx<'a> {
+    this_local: Option<u32>,
+    subst: &'a BTreeMap<u32, u32>,
+    fmap: &'a BTreeMap<u32, u32>,
+    dst: Option<LocalId>,
+    bodies: &'a BTreeMap<u32, Function>,
+    depth: u32,
+}
+
+impl InlineCx<'_> {
+    fn m(&self, id: LocalId) -> LocalId {
+        LocalId(*self.subst.get(&id.0).unwrap_or(&id.0))
+    }
+}
+
+/// Splice an inlined method's instructions into `out`, and those of its
+/// nested blocks (if, loop, try) into the rebuilt blocks: a field access or a
+/// call on `this` is rewritten wherever it is (the receiver no longer exists,
+/// and `this` has no local in the caller).
+fn inline_insts(
+    body: &[Inst],
+    cx: &InlineCx,
+    next: &mut u32,
+    new_locals: &mut Vec<Local>,
+    out: &mut Vec<Inst>,
+) {
+    let m = |id: LocalId| cx.m(id);
+    for inst in body {
         match inst {
             // this.fK load -> copy from field scalar
-            Inst::LoadField { dst: d, obj, field, slots, elem } if Some(obj.0) == this_local => {
-                if let Some(&fs) = fmap.get(&field.0) {
+            Inst::LoadField { dst: d, obj, field, slots, elem } if Some(obj.0) == cx.this_local => {
+                if let Some(&fs) = cx.fmap.get(&field.0) {
                     out.push(Inst::Copy {
                         dst: m(*d),
                         src: LocalId(fs),
@@ -2738,8 +2795,8 @@ fn inline_callee(
                 }
             }
             // this.fK store -> write field scalar
-            Inst::StoreField { obj, field, src, slots } if Some(obj.0) == this_local => {
-                if let Some(&fs) = fmap.get(&field.0) {
+            Inst::StoreField { obj, field, src, slots } if Some(obj.0) == cx.this_local => {
+                if let Some(&fs) = cx.fmap.get(&field.0) {
                     out.push(Inst::Copy {
                         dst: LocalId(fs),
                         src: m(*src),
@@ -2763,25 +2820,26 @@ fn inline_callee(
                 recv: Some(r),
                 args: cargs,
                 ..
-            } if Some(r.0) == this_local && depth < 16 => {
+            } if Some(r.0) == cx.this_local && cx.depth < 16 => {
                 // Skip generator/async inner methods (state machines): inlining their body
                 // would destroy the coroutine. The .filter drops them to the remapped-Call
                 // fallback below, keeping a Direct call to the state-machine entry point.
-                if let Some(inner) = bodies
+                if let Some(inner) = cx
+                    .bodies
                     .get(&func.0)
                     .filter(|c| !c.is_generator && !c.is_async)
                 {
                     let mapped_args: Vec<LocalId> = cargs.iter().map(|a| m(*a)).collect();
                     inline_callee(
                         inner,
-                        fmap,
+                        cx.fmap,
                         &mapped_args,
                         cd.map(|d| m(d)),
                         next,
                         new_locals,
                         out,
-                        bodies,
-                        depth + 1,
+                        cx.bodies,
+                        cx.depth + 1,
                     );
                 } else {
                     // body unavailable: fall back to remapped call (best effort)
@@ -2796,11 +2854,64 @@ fn inline_callee(
                 }
             }
             Inst::Return { src } => {
-                if let (Some(d), Some(s)) = (dst, src) {
+                if let (Some(d), Some(s)) = (cx.dst, src) {
                     out.push(Inst::Copy { dst: d, src: m(*s) });
                 }
                 // a return inside an inlined body just stops contributing values;
-                // for our straight-line callees this is the last instruction.
+                // the callee returns only from its last instruction
+                // (returns_only_in_tail_position), so nested blocks hold none.
+            }
+            Inst::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                let mut r = remap_inst_operands(inst, &m);
+                if let Inst::If {
+                    then_body: t,
+                    else_body: e,
+                    ..
+                } = &mut r
+                {
+                    *t = inline_block(then_body, cx, next, new_locals);
+                    *e = inline_block(else_body, cx, next, new_locals);
+                }
+                out.push(r);
+            }
+            Inst::Loop {
+                cond_body, body, ..
+            } => {
+                let mut r = remap_inst_operands(inst, &m);
+                if let Inst::Loop {
+                    cond_body: c,
+                    body: b,
+                    ..
+                } = &mut r
+                {
+                    *c = inline_block(cond_body, cx, next, new_locals);
+                    *b = inline_block(body, cx, next, new_locals);
+                }
+                out.push(r);
+            }
+            Inst::TryCatch {
+                try_body,
+                catch_body,
+                finally_body,
+                ..
+            } => {
+                let mut r = remap_inst_operands(inst, &m);
+                if let Inst::TryCatch {
+                    try_body: t,
+                    catch_body: c,
+                    finally_body: f,
+                    ..
+                } = &mut r
+                {
+                    *t = inline_block(try_body, cx, next, new_locals);
+                    *c = inline_block(catch_body, cx, next, new_locals);
+                    *f = inline_block(finally_body, cx, next, new_locals);
+                }
+                out.push(r);
             }
             // generic instructions: remap operands through subst
             Inst::Const { dst: d, value } => out.push(Inst::Const {
@@ -2850,11 +2961,21 @@ fn inline_callee(
             // aliasing or reading uninitialized locals (e.g. inlining
             // `dist(){ return Math.sqrt(this.x*this.x+this.y*this.y); }` copied
             // `CallBuiltinStatic math.sqrt args=[7]` verbatim, but the sum lived
-            // in the renamed local). Exhaustive remap closes that hole. Nested
-            // bodies (If/Loop/TryCatch) are walked recursively through `m`.
+            // in the renamed local). Exhaustive remap closes that hole.
             other => out.push(remap_inst_operands(other, &m)),
         }
     }
+}
+
+fn inline_block(
+    body: &[Inst],
+    cx: &InlineCx,
+    next: &mut u32,
+    new_locals: &mut Vec<Local>,
+) -> Vec<Inst> {
+    let mut v = Vec::new();
+    inline_insts(body, cx, next, new_locals, &mut v);
+    v
 }
 
 /// Clone an Inst while remapping every `LocalId` operand through `m`. Used by

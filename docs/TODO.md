@@ -7426,3 +7426,24 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   protect mode, with zapping, and with a minor collection every 256
   allocations, its 78 output files identical. A/B against `ag`, sixteen
   ABBA pairs: wall 1.0000, instructions 1.0000, cycles 1.0013: neutral.
+- Methods SROA inlines (silent wrong values; tsc-ts's template literal
+  inference crashed in its `TemplateMatcher` and reported false errors):
+  the receiver check (`needs_materialized_this`) accepts field accesses and
+  calls on `this` anywhere in the method, but the inliner rewrote them to
+  the field scalars only at the body's top level, so one inside an if, a
+  ternary, a loop or a try read and wrote an unrelated caller local (the
+  parameter's id) in place of the eliminated object; and a parameter the
+  body assigns was mapped to the caller's argument local, so the assignment
+  overwrote the caller's variable (`bump(x) { x = x * 2; ... }` doubled the
+  caller's `a`). The inliner now rewrites nested blocks the same way and
+  gives an assigned parameter a local of its own holding the argument.
+  Fixture `classes/inlined_method_blocks` (the matcher, assigned and
+  defaulted parameters, branches, loops, try/catch/finally, nested calls on
+  `this`, constructors with branches and `super`); a known parity row.
+  Gates: unit, parity (368 identical), bundler 42/42, selfconf, GC stress,
+  inline policy, conformance 516/516, 516/516 under the strict profile, and
+  516/516 with a collection at every allocation in protect mode; tsc
+  rebuilt (`native_s350nb`; its C unchanged) and compiled under protect
+  mode, with zapping, and with a minor collection every 256 allocations,
+  its 78 output files identical. A/B against `pp`, sixteen ABBA pairs:
+  wall 1.0000, instructions 1.0000, cycles 1.0009: neutral.
