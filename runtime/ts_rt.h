@@ -1615,6 +1615,8 @@ void ts_register_class(tsv proto, ts_class_field* fields, int nfields);
    instance from a class value at runtime. */
 void ts_register_class_meta(uint32_t class_id, size_t size, tsv proto, ts_class_field* fields, int nfields);
 tsv  ts_make_class_value(uint32_t class_id, ts_code ctor, tsv* env, uint32_t envlen);
+tsv  ts_make_class_value_once(uint32_t class_id, ts_code ctor, tsv* env, uint32_t envlen);
+void ts_throw_uninitialized(const char* name);
 tsv  ts_construct(tsv ctorv, tsv* args, int n);
 /* guarded direct construction (ts_rt.c): the predicted constructor's code,
    the instance before the direct body call, the result after it */
@@ -1650,6 +1652,7 @@ tsv  ts_make_closure_t_pretenured(ts_code code, tsv* env, uint32_t envlen, int t
    set, on a non-heap cell whose environment is the caller's array. */
 void ts_init_fn_stack(ts_func* f, ts_code code, tsv* env, uint32_t envlen, int takes_this);
 tsv  ts_make_class_value_cells(uint32_t class_id, ts_code ctor, tsv* env, uint32_t envlen);
+tsv  ts_make_class_value_cells_once(uint32_t class_id, ts_code ctor, tsv* env, uint32_t envlen);
 /* Give fn an own `.prototype` without allocating it: the fresh object (and its
    `constructor`) is created on first observation. Preferred emitted form. */
 void ts_set_fn_prototype_lazy(tsv fn);

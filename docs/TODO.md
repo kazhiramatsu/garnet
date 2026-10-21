@@ -7517,3 +7517,39 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   under protect mode, with zapping, and with a minor collection every 256
   allocations, its 78 output files identical. A/B against `sf`, sixteen
   ABBA pairs: wall 1.0000, instructions 1.0000, cycles 1.0004: neutral.
+- Class dispatch and record hints (`docs/receiver_class_hints_design.md`,
+  "Shared prototypes, `instanceof`, casts and records"): a class whose
+  declaration runs once takes its registered prototype as its class value's
+  prototype (`ts_make_class_value_once`, `AllocClassValue { once }`), so a
+  static `new` no longer reads the class value's `prototype` through a
+  property cache, and the leaf guard and `instanceof` compare with
+  CLASS_PROTO; `instanceof` of an imported class (the alias was not
+  resolved: `ts_instanceof_dyn` read `prototype` by name) compiles to
+  `instanceof.class:C`, the own prototype compared in line; neither reads
+  the class value any more, so a read from another function checks the
+  binding (`binding.check:C`: V8's "Cannot access 'C' before
+  initialization"; before, a TypeError from reading `prototype` of
+  undefined); cast receivers take the cast's class; module records and
+  cells loaded from their globals name their class in every profile. The
+  polymorphic-class taint check treats the two new builtins as reads.
+  tsc-ts: 4.96 s -> 3.98 s -> 3.64 s emitting, 2.38 s checking only (node
+  3.2-3.4 s and 2.3-2.6 s), output identical to scriptc's. Fixtures
+  `classes/shared_class_prototypes` (prototype identity, `constructor`,
+  `Object.create`, prototype edits, classes per evaluation in functions and
+  loops, the TDZ, a `Symbol.hasInstance` hook) and the bundler test
+  `class_identity_cross` (classes and `instanceof` across modules); cast
+  probes in `classes/receiver_class_hints`; known rows (parity: the Rust
+  SROA inlines inside try blocks; selfconf: the frozen emitter's TDZ
+  error). Noted: deferred TDZ reads of other lexical bindings still read
+  undefined; `class D extends K` with K a class-valued constant fails
+  loudly ("kget is not a function"); a class instance's keys follow its
+  fields' declaration order (ES2022 semantics; the suite's ES2020 oracle
+  orders initialized fields first). Gates: unit, parity (370 identical),
+  bundler 43/43, selfconf, GC stress, inline policy, conformance 519/519,
+  519/519 under the strict profile, and 519/519 with a collection at every
+  allocation in protect mode; tsc rebuilt (`native_s350ch`; the shared
+  prototypes changed 130,000 lines of its C) and compiled under protect
+  mode, with zapping, and with a minor collection every 256 allocations,
+  its 78 output files identical. A/B against `rc` and `sp`, sixteen ABBA
+  pairs each: wall 1.0000 and 0.9988, instructions 0.9999 and 0.9999,
+  cycles 1.0005 and 0.9998: neutral.

@@ -9215,6 +9215,13 @@ static void ts_throw_not_defined(const char* name){
   char buf[200]; snprintf(buf, sizeof buf, "%s is not defined", name);
   ts_throw(ts_new_error(TS_ERR_REFERENCE, ts_new_string(buf, (uint32_t)strlen(buf))));
 }
+/* A lexical binding read before its declaration ran (the temporal dead
+   zone): V8's ReferenceError. */
+void ts_throw_uninitialized(const char* name){
+  char buf[256];
+  snprintf(buf, sizeof buf, "Cannot access '%s' before initialization", name);
+  ts_throw(ts_new_error(TS_ERR_REFERENCE, ts_new_string(buf, (uint32_t)strlen(buf))));
+}
 static const char* const TS_ERROR_NAMES[TS_ERR_KINDS] = {
   "Error", "TypeError", "RangeError", "SyntaxError",
   "ReferenceError", "EvalError", "URIError", "AggregateError"
@@ -10614,6 +10621,29 @@ tsv ts_make_class_value(uint32_t class_id, ts_code ctor, tsv* env, uint32_t envl
     }
     ts_gc_unroot(2);
   }
+  return fv;
+}
+/* A class declaration evaluated once (a module's, not one inside a function
+   or a loop): its class value takes the registered prototype itself, no
+   copy, so the instances' prototype is CLASS_PROTO[class_id] and a static
+   `new`, `instanceof` and the receiver class guards compare with it
+   (docs/receiver_class_hints_design.md). */
+tsv ts_make_class_value_once(uint32_t class_id, ts_code ctor, tsv* env, uint32_t envlen){
+  tsv fv = ts_make_fn_t(ctor, env, envlen, 1);
+  ((ts_func*)ts_ptr(fv))->class_id = class_id + 1;
+  if (class_id < g_class_meta_cap && ts_is_obj(g_class_proto_tab[class_id])){
+    ts_gc_root(&fv);
+    tsv proto = g_class_proto_tab[class_id];
+    ((ts_func*)ts_ptr(fv))->prototype_prop = proto;
+    ts_write_barrier(fv, proto);
+    ts_define_data(proto, ts_intern_field("constructor", 11), fv, 0, 1, 1);
+    ts_gc_unroot(1);
+  }
+  return fv;
+}
+tsv ts_make_class_value_cells_once(uint32_t class_id, ts_code ctor, tsv* env, uint32_t envlen){
+  tsv fv = ts_make_class_value_once(class_id, ctor, env, envlen);
+  if (envlen) ((ts_func*)ts_ptr(fv))->env_abi = 1;
   return fv;
 }
 /* `new K(args...)`: allocate a typed instance for K's class, wire its prototype,

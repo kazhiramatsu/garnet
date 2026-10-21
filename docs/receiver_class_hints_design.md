@@ -52,10 +52,50 @@ the prototype guard, which costs nothing measurable); node runs the same
 source in 3.2-3.4 s. The TypeScript 6.0.3 compiler build is unchanged (its
 tsconfig does not select the strict profile).
 
+## Shared prototypes, `instanceof`, casts and records
+
+The next profile showed `instanceof` of imported classes on the dynamic
+path (the class's import alias was not resolved: `ts_instanceof_dyn` read
+the class value's `prototype` by name), every `new C()` reading the class
+value's `prototype` through a property cache, and the leaf guard failing
+for most instances: a class value took a copy of the registered prototype
+(`ts_make_class_value`), so `CLASS_PROTO[C]` was nobody's prototype.
+
+- **Shared prototypes.** A class whose declaration runs once (not inside a
+  function, a loop or another class) gets `AllocClassValue { once }`: its
+  value takes the registered prototype itself
+  (`ts_make_class_value_once`), so CLASS_PROTO[C] is its instances'
+  prototype; a static `new C()` sets it without reading the class value;
+  classes evaluated again keep a prototype per evaluation.
+- **`instanceof C`** resolves C through an import alias and, for a shared
+  prototype, compiles to `instanceof.class:C`: the instance's own prototype
+  compared in line, the chain walked otherwise.
+- **The binding check.** Neither reads the class value any more, so a use
+  before the declaration ran would have succeeded silently (before: a
+  TypeError reading `prototype` of undefined). A read from another function
+  checks the binding (`binding.check:C`): "Cannot access 'C' before
+  initialization", V8's ReferenceError.
+- **Casts** (`(n as Ident).text`) take the cast's class: the guards catch a
+  wrong downcast, the structural pass a reinterpretation.
+- **Records and cells**: a module binding read or written through its scope
+  record (or its cell) loaded from a global names the record's class (`cls`
+  in every profile: the exporter made the object).
+- TSAOT_SHARED_CLASS_PROTO=0, TSAOT_INSTANCEOF_CLASS=0, TSAOT_CAST_HINTS=0
+  and TSAOT_CLASS_HINTS=0 restore the old IR (the frozen emitter's gates use
+  them).
+
+tsc-ts: 4.96 s -> 3.98 s (shared prototypes, `instanceof`) -> 3.64 s (casts,
+records); 49,600 hinted accesses, 16,600 property cache sites left of
+22,600.
+
 ## Known gaps
 
 - A class-typed parameter trusts its class: a wrong downcast passed to it
   (`f(node as Leaf)` for another kind of node) reads the leaf's struct
   offset (V8: the value's own property or undefined).
-- Interface-typed receivers, cast receivers and intermediate classes'
-  fields still take the property cache.
+- Interface-typed receivers and intermediate classes' fields still take
+  the property cache, and polymorphic method calls dispatch through the
+  receiver's prototype (`docs/class_index_dispatch_design.md`).
+- A deferred read of a lexical binding (`let`, `const`, `class`) before
+  its declaration ran (from a function called earlier) reads undefined
+  instead of throwing; only the class binding checks above throw.

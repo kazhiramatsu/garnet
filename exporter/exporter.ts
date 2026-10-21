@@ -2371,18 +2371,25 @@ class Exporter {
   }
   /** A module-scope binding published for methods (Step E): its record field,
    *  or the cell loaded from its GLOBALS[] slot. */
-  private moduleCapturedRef(ctx: FnCtx, sym: ts.Symbol): { obj: number; field: number } | undefined {
+  private moduleCapturedRef(ctx: FnCtx, sym: ts.Symbol): { obj: number; field: number; cls?: number } | undefined {
     const owner = this.captureContexts ? this.recordOwnerOf.get(sym) : undefined;
     if (owner !== undefined) {
       const rl = this.availableRecord(ctx, owner);
       if (rl === undefined) return undefined;
-      return { obj: rl, field: this.recordOfOwner.get(owner)!.fields.get(sym)! };
+      const rec = this.recordOfOwner.get(owner)!;
+      return { obj: rl, field: rec.fields.get(sym)!, cls: this.recordClassHint(rec.classId) };
     }
     const gid = this.moduleCellGlobal.get(sym);
     if (gid === undefined) return undefined;
     const cell = this.newLocal(ctx, "reference");
     ctx.body.push({ kind: "LoadGlobal", dst: cell, gref: gid });
-    return { obj: cell, field: this.VALUE };
+    return { obj: cell, field: this.VALUE, cls: this.cellClassId !== undefined ? this.recordClassHint(this.cellClassId) : undefined };
+  }
+  /** The receiver class hint of a read or write of a scope record or a cell
+   *  loaded from its global: the exporter made the object, an instance of
+   *  that class, in every profile (docs/receiver_class_hints_design.md). */
+  private recordClassHint(classId: number): number | undefined {
+    return process.env.TSAOT_CLASS_HINTS === "0" ? undefined : classId + 1;
   }
   /** The object that carries `sym` for a single-binding closure capture (the
    *  namespace export getter): record or cell, with the class and binding the
@@ -5799,8 +5806,9 @@ class Exporter {
       const lclass = this.classOfExpr(node.left);
       let rclass: number | undefined;
       if (ts.isIdentifier(node.right)) {
+        // an imported class is read through its import alias
         const sym = this.checker.getSymbolAtLocation(node.right);
-        if (sym) rclass = this.classSymToId.get(sym);
+        if (sym) rclass = this.classSymToId.get(this.unwrapImportAlias(sym) ?? sym);
       }
       const dst = this.newLocal(ctx, "reference");
       // Symbol.hasInstance hook: `x instanceof C` calls C[Symbol.hasInstance](x)
@@ -5871,8 +5879,15 @@ class Exporter {
         // obj's prototype chain (subclasses chain their protos to the parent).
         const obj = this.lowerExpr(ctx, node.left);
         const klass = this.lowerExpr(ctx, node.right);
-        const proto = this.loadClassValuePrototype(ctx, klass);
-        ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "instanceof", args: [obj, proto] });
+        if (this.sharedClassProto(rclass) && process.env.TSAOT_INSTANCEOF_CLASS !== "0") {
+          // A class declaration evaluated once has one prototype, the
+          // registered one: no read of the class value's `prototype`.
+          this.checkClassBindingInitialized(ctx, node.right, klass);
+          ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: `instanceof.class:${rclass}`, args: [obj, klass] });
+        } else {
+          const proto = this.loadClassValuePrototype(ctx, klass);
+          ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "instanceof", args: [obj, proto] });
+        }
       } else {
         // RHS is a runtime constructor VALUE (a class held in a variable/parameter,
         // or a conditional like `cond ? A : B`). Lower left then right (JS eval order)
@@ -6589,7 +6604,7 @@ class Exporter {
     if (sym && this.moduleCellGlobal.has(sym)) {
       const ref = this.moduleCapturedRef(ctx, sym)!;
       const dst = this.newLocal(ctx, this.refKindOf(node));
-      ctx.body.push({ kind: "LoadField", dst, obj: ref.obj, field: ref.field });
+      ctx.body.push({ kind: "LoadField", dst, obj: ref.obj, field: ref.field, ...(ref.cls ? { cls: ref.cls } : {}) });
       return dst;
     }
     // Fallback for class values that do not have a stored lexical binding in this
@@ -6702,7 +6717,7 @@ class Exporter {
       if (captures !== null) {
         if (this.classInfos[classId]) this.classInfos[classId].instantiated = true;
         const dst = this.newLocal(ctx, "reference", hint);
-        ctx.body.push({ kind: "AllocClassValue", dst, classId, ctor: cvCtor, captures });
+        ctx.body.push({ kind: "AllocClassValue", dst, classId, ctor: cvCtor, captures, ...(this.sharedClassProto(classId) ? { once: true } : {}) });
         this.defineClassPrototypeConstructor(ctx, classId, dst);
         this.linkClassValuePrototypeParent(ctx, dst, classId);
         if (linkStatic) this.linkClassValueStaticContainer(ctx, dst, classId);
@@ -6715,7 +6730,7 @@ class Exporter {
       if (captures !== null) {
         if (this.classInfos[classId]) this.classInfos[classId].instantiated = true;
         const dst = this.newLocal(ctx, "reference", hint);
-        ctx.body.push({ kind: "AllocClassValue", dst, classId, ctor: synthFn, captures });
+        ctx.body.push({ kind: "AllocClassValue", dst, classId, ctor: synthFn, captures, ...(this.sharedClassProto(classId) ? { once: true } : {}) });
         this.defineClassPrototypeConstructor(ctx, classId, dst);
         this.linkClassValuePrototypeParent(ctx, dst, classId);
         if (linkStatic) this.linkClassValueStaticContainer(ctx, dst, classId);
@@ -6752,6 +6767,39 @@ class Exporter {
       builtin: "object.defineData:0:1:1", args: [proto, key, classValue] });
   }
 
+  /** A class binding read where its declaration may not have run yet (from
+   *  another function: the same function's earlier reads are rejected at
+   *  compile time) holds undefined until then: reading it is a ReferenceError
+   *  in JS, which the shared-prototype `new` and `instanceof` (they need no
+   *  value from it) must still raise. */
+  checkClassBindingInitialized(ctx: FnCtx, ref: ts.Expression, value: number): void {
+    if (!ts.isIdentifier(ref)) return;
+    const sym = this.unwrapImportAlias(this.checker.getSymbolAtLocation(ref)) ?? this.checker.getSymbolAtLocation(ref);
+    const decl = sym?.valueDeclaration ?? sym?.declarations?.[0];
+    if (decl && decl.getSourceFile() === ref.getSourceFile() && this.enclosingFunction(decl) === this.enclosingFunction(ref) &&
+        decl.getStart() < ref.getStart()) return;
+    ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: `binding.check:${ref.text}`, args: [value] });
+  }
+  /** A class whose declaration runs once: its class value takes the
+   *  registered prototype (CLASS_PROTO) itself instead of a copy
+   *  (`ts_make_class_value_once`), so a static `new` sets it without reading
+   *  the class value's `prototype`, and `instanceof` and the receiver class
+   *  guards compare with it. TSAOT_SHARED_CLASS_PROTO=0 keeps the copies
+   *  (the frozen emitter's IR). */
+  sharedClassProto(classId: number): boolean {
+    return process.env.TSAOT_SHARED_CLASS_PROTO !== "0" && this.classEvaluatedOnce(classId);
+  }
+  /** A class whose declaration runs once (not inside a function, a loop or
+   *  another class). */
+  classEvaluatedOnce(classId: number): boolean {
+    const decl = this.classNodeOfId.get(classId);
+    if (!decl) return false;
+    for (let n: ts.Node | undefined = decl.parent; n !== undefined; n = n.parent) {
+      if (ts.isSourceFile(n)) return true;
+      if (ts.isFunctionLike(n) || ts.isIterationStatement(n, false) || ts.isClassLike(n)) return false;
+    }
+    return false;
+  }
   loadClassValuePrototype(ctx: FnCtx, classValue: number): number {
     const proto = this.newLocal(ctx, "reference");
     ctx.body.push({ kind: "LoadField", dst: proto, obj: classValue, field: this.internField("prototype") });
@@ -6775,7 +6823,7 @@ class Exporter {
     if (this.moduleCellGlobal.has(sym)) {
       const ref = this.moduleCapturedRef(ctx, sym)!;
       const dst = this.newLocal(ctx, "reference", hint);
-      ctx.body.push({ kind: "LoadField", dst, obj: ref.obj, field: ref.field });
+      ctx.body.push({ kind: "LoadField", dst, obj: ref.obj, field: ref.field, ...(ref.cls ? { cls: ref.cls } : {}) });
       return dst;
     }
     return undefined;
@@ -8902,7 +8950,9 @@ class Exporter {
     if (classId !== undefined) {
       const klass = this.lowerExpr(ctx, node.expression);
       inst.classId = classId;
-      inst.proto = this.loadClassValuePrototype(ctx, klass);
+      // a shared prototype is the registered one: the emitter sets CLASS_PROTO
+      if (!this.sharedClassProto(classId)) inst.proto = this.loadClassValuePrototype(ctx, klass);
+      else this.checkClassBindingInitialized(ctx, node.expression, klass);
     }
     ctx.body.push(inst);
     // constructor call: Direct to C's ctor, recv = the new object. Field
@@ -11018,15 +11068,19 @@ class Exporter {
    *  access (narrowed, without null and undefined; a type parameter by its
    *  constraint) is one stable, non-generic class. The structural flow pass
    *  (`class_extract.ts`) makes a class unstable when a value that is not one
-   *  of its instances can be typed as it. A cast receiver (`(x as C).f`, a
-   *  downcast that may probe for a property) takes none. The emitter reads
+   *  of its instances can be typed as it; a cast receiver takes the cast's
+   *  class. The emitter reads
    *  the field at the class's struct offset; a receiver that is not an object
    *  takes the generic access (docs/receiver_class_hints_design.md). */
   private receiverClassHint(e: ts.Expression): number {
     if (process.env.TSAOT_CLASS_HINTS === "0" || !this.strictTypeOptimizationProfile().enabled) return 0;
     let r = e;
     while (ts.isParenthesizedExpression(r)) r = r.expression;
-    if (ts.isAsExpression(r) || ts.isTypeAssertionExpression(r)) return 0;
+    // A cast receiver (`(x as C).f`) is read as the cast's class: a wrong
+    // downcast is caught by the emitted guard (a leaf's field tests the
+    // prototype), and a reinterpretation across hierarchies (through `unknown`,
+    // from an interface or an unrelated class) left the class unstable.
+    if ((ts.isAsExpression(r) || ts.isTypeAssertionExpression(r)) && process.env.TSAOT_CAST_HINTS === "0") return 0;
     try {
       let t = this.checker.getNonNullableType(this.checker.getTypeAtLocation(r));
       if (t.flags & ts.TypeFlags.TypeParameter) {
@@ -11214,7 +11268,7 @@ class Exporter {
         // Step E: write to a module binding from a method — its record field,
         // or the cell loaded from its GLOBALS[] slot.
         const ref = this.moduleCapturedRef(ctx, sym)!;
-        ctx.body.push({ kind: "StoreField", obj: ref.obj, field: ref.field, src: rhs });
+        ctx.body.push({ kind: "StoreField", obj: ref.obj, field: ref.field, src: rhs, ...(ref.cls ? { cls: ref.cls } : {}) });
       } else if (sym) {
         // Step B: module bindings no longer use StoreGlobal; fall through to a
         // function-local store (cells come in Step C). See lowerIdentifier.
@@ -11413,7 +11467,7 @@ class Exporter {
             this.storeCaptured(ctx, vsym, valL);
           } else if (vsym && this.moduleCellGlobal.has(vsym)) {
             const ref = this.moduleCapturedRef(ctx, vsym)!;
-            ctx.body.push({ kind: "StoreField", obj: ref.obj, field: ref.field, src: valL });
+            ctx.body.push({ kind: "StoreField", obj: ref.obj, field: ref.field, src: valL, ...(ref.cls ? { cls: ref.cls } : {}) });
           } else if (vsym) {
             const lid = this.ensureLocal(ctx, vsym, this.refKindOf(p.name), p.name.text);
             ctx.body.push({ kind: "Copy", dst: lid, src: valL });

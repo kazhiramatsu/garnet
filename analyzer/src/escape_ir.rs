@@ -532,6 +532,10 @@ fn no_view_elem(elem: &u8) -> bool {
     *elem == 0
 }
 
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 /// serde: an unset receiver class hint stays out of the JSON dumps.
 fn no_class_hint(cls: &u32) -> bool {
     *cls == 0
@@ -616,6 +620,10 @@ pub enum Inst {
         class_id: u32,
         ctor: FunctionId,
         captures: Vec<Capture>,
+        /// The class declaration runs once: the value takes the registered
+        /// prototype itself (docs/receiver_class_hints_design.md).
+        #[serde(default, skip_serializing_if = "is_false")]
+        once: bool,
     },
     /// `new K(args)` where K is a class VALUE — construct an instance at runtime
     /// from the class value (reads class_id, allocates, calls the ctor).

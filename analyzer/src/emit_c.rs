@@ -18094,6 +18094,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             class_id,
             ctor,
             captures,
+            once,
         } => {
             // Box a class as a callable value carrying class_id + the ctor's
             // captured cells (same env construction as AllocClosure). `new K()`
@@ -18107,8 +18108,11 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             if captures.is_empty() {
                 let _ = writeln!(
                     s,
-                    "  {} = ts_make_class_value({}u, {}, 0, 0);",
-                    dst_name, class_id, fname
+                    "  {} = {}({}u, {}, 0, 0);",
+                    dst_name,
+                    if *once { "ts_make_class_value_once" } else { "ts_make_class_value" },
+                    class_id,
+                    fname
                 );
                 s.push_str(&set_meta);
             } else {
@@ -18127,7 +18131,12 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     s,
                     "    {} = {}({}u, {}, _env, {});",
                     dst_name,
-                    if ctor_ncap > 0 { "ts_make_class_value_cells" } else { "ts_make_class_value" },
+                    match (ctor_ncap > 0, *once) {
+                        (true, false) => "ts_make_class_value_cells",
+                        (true, true) => "ts_make_class_value_cells_once",
+                        (false, false) => "ts_make_class_value",
+                        (false, true) => "ts_make_class_value_once",
+                    },
                     class_id,
                     fname,
                     captures.len()
@@ -19059,6 +19068,32 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 "symbol.keyFor" => (format!("ts_symbol_key_for({})", v(0)), false),
                 "symbol.toString" => (format!("ts_symbol_tostring({})", v(0)), false),
                 "instanceof" => (format!("ts_bool(ts_instanceof({}, {}))", v(0), v(1)), false),
+                // A class binding that may not be initialized yet: undefined
+                // until its declaration ran (a ReferenceError to read).
+                b if b.starts_with("binding.check:") => (
+                    format!(
+                        "(ts_is_undef({v}) ? (ts_throw_uninitialized({n}), TS_UNDEFINED) : TS_UNDEFINED)",
+                        v = v(0),
+                        n = c_string_lit(&b["binding.check:".len()..])
+                    ),
+                    false,
+                ),
+                // x instanceof C, C a class declaration evaluated once: its one
+                // prototype is CLASS_PROTO[C]; an instance of C itself answers in
+                // line, any other value walks its chain. (The class value, operand
+                // 1, was read for its binding's checks.)
+                b if b.starts_with("instanceof.class:") => {
+                    let c = &b["instanceof.class:".len()..];
+                    let o = v(0);
+                    (
+                        format!(
+                            "ts_bool((ts_is_obj({o}) && ((ts_object*)ts_ptr({o}))->proto == CLASS_PROTO[{c}]) || ts_instanceof({o}, CLASS_PROTO[{c}]))",
+                            o = o,
+                            c = c
+                        ),
+                        false,
+                    )
+                }
                 // x instanceof C with a Symbol.hasInstance hook: C[Symbol.hasInstance](x).
                 // ts_instanceof_hook already returns a tsv bool (ToBoolean of the result).
                 "instanceof.hook" => (format!("ts_instanceof_hook({}, {})", v(0), v(1)), false),

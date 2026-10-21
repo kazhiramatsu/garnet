@@ -3056,10 +3056,12 @@ pub(crate) fn remap_inst_operands(inst: &Inst, m: &dyn Fn(LocalId) -> LocalId) -
             class_id,
             ctor,
             captures,
+            once,
         } => Inst::AllocClassValue {
             dst: m(*dst),
             class_id: *class_id,
             ctor: *ctor,
+            once: *once,
             captures: captures
                 .iter()
                 .map(|c| Capture {

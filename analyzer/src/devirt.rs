@@ -314,7 +314,13 @@ fn escape_locals(inst: &Inst) -> Vec<u32> {
         // …), so their args escape. (`instanceof.hook` passes the object to a user
         // [Symbol.hasInstance] method, so it is NOT whitelisted.)
         Inst::CallBuiltinStatic { builtin, args, .. } => {
-            if builtin == "instanceof" || builtin == "instanceof.dyn" {
+            // (`instanceof.class:C` reads the object's prototype too, and
+            // `binding.check:C` only tests the class value it is given)
+            if builtin == "instanceof"
+                || builtin == "instanceof.dyn"
+                || builtin.starts_with("instanceof.class:")
+                || builtin.starts_with("binding.check:")
+            {
                 vec![]
             } else {
                 args.iter().map(|a| a.0).collect()

@@ -1,6 +1,6 @@
 // Field reads and writes on receivers whose static type is a class (locals,
 // narrowed unions, optional chains, type parameters constrained by a class,
-// downcast results), which the strict type profile compiles to
+// downcast results, casts), which the strict type profile compiles to
 // struct offsets: values of subclasses through the base class, a wrong
 // downcast probed for a field the value lacks (V8: undefined), a receiver a
 // non-null assertion lies about (TypeError), writes, numeric fields.
@@ -51,6 +51,8 @@ function doubled(n: AstNode): number {
   const x = n as Num;
   return x.value * 2;
 }
+function probeInline(n: AstNode): string { return (n as Ident).text !== undefined ? "ident:" + (n as Ident).text : "other"; }
+function setCountInline(n: AstNode): void { (n as Ident).count = 99; }
 function valueOf(x: Num): string { return String(x.value); }
 function textParam(x: Ident): string | undefined { return x.text; }
 function bump(n: AstNode): void {
@@ -70,7 +72,9 @@ function main(): void {
   const p = new Pair(a, b), q = new Pair(p, new Ident("c"));
   console.log(rootOf(a) === q, rootOf(q) === q, sumKinds(a), a.flags, p.flags, q.flags);
   console.log(textOf(a), textOf(b), textOf(p), doubled(b), doubled(a), doubled(p));
-  console.log(valueOf(b), textParam(a));
+  console.log(valueOf(b), textParam(a), probeInline(a), probeInline(b), probeInline(p));
+  setCountInline(b);
+  console.log((b as unknown as { count: number }).count, b instanceof Ident, Object.keys(b).sort().join(","));
   bump(a); bump(a); bump(b);
   console.log(a.count, a.text, firstLeaf(q) === a, kindOfParent(a), kindOfParent(q));
   try { liar(undefined); } catch (e) { console.log((e as Error).constructor.name); }
