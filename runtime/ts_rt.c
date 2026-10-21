@@ -7354,13 +7354,20 @@ tsv ts_new_weakset(void){ return ts_new_set_impl(1); }
    (cached storage hash when present), heap cells by identity — the C0
    identity-hash design: raw stable id (handle id today; the NONHEAP fallback
    is the address, stable because NONHEAP never moves) mixed at the use site. */
-static inline uint32_t sv0_hash(tsv k){
+/* sv0_hash of a number: ±0 folded, one NaN, then the finalizer below. */
+TS_RT_ALWAYS_INLINE uint32_t sv0_hash_num(tsv k){
+  double d = ts_to_num(k);
+  uint64_t bits;
+  if (d == 0) d = 0;                            /* -0 → +0 */
+  if (d != d) bits = 0x7FF8000000000000ull;     /* canonical NaN */
+  else memcpy(&bits, &d, sizeof bits);
+  bits ^= bits >> 33; bits *= 0xff51afd7ed558ccdull; bits ^= bits >> 33;
+  return (uint32_t)bits;
+}
+TS_RT_ALWAYS_INLINE uint32_t sv0_hash(tsv k){
   uint64_t bits;
   if (ts_is_num(k)){
-    double d = ts_to_num(k);
-    if (d == 0) d = 0;                          /* -0 → +0 */
-    if (d != d) bits = 0x7FF8000000000000ull;   /* canonical NaN */
-    else memcpy(&bits, &d, sizeof bits);
+    return sv0_hash_num(k);
   } else if (ts_is_str(k)){
     return ts_str_hash_of(k);
   } else if (ts_heap_ref(k)){
@@ -7544,14 +7551,37 @@ tsv ts_map_set(tsv mv, tsv k, tsv v){
   if (!ts_is_map(mv)) ts_throw_type_error_msg("Method Map.prototype.set called on incompatible receiver");
   return map_set_unchecked(mv, k, v);
 }
+/* The common lookup, without a call: an indexed map and a number key, found
+   by the key's very bits (a stored number key is canonical: +0, one NaN) or
+   absent. -2 for anything else (another kind of key, a slot whose key is an
+   equal number with other bits): map_find decides. */
+TS_RT_ALWAYS_INLINE long map_find_num_fast(const ts_map* m, tsv k){
+  if (!m->index || !ts_is_num(k)) return -2;
+  uint32_t h = sv0_hash_num(k);
+  uint32_t mask = m->index_cap - 1u, slot = h & mask;
+  for (;;){
+    uint32_t w = m->index[slot];
+    if (w == 0u) return -1;
+    if (w != 1u && ((w ^ h) & ~mask) == 0u){
+      uint32_t di = (w & mask) - 2u;
+      return m->keys[di] == k ? (long)di : -2;
+    }
+    slot = (slot + 1u) & mask;
+  }
+}
 tsv ts_map_get(tsv mv, tsv k){
   if (!ts_is_map(mv)){ ts_throw_type_error_msg("Method Map.prototype.get called on incompatible receiver"); return TS_UNDEFINED; }
-  ts_map* m = ts_ptr(mv); long i = map_find(m,k);
+  ts_map* m = ts_ptr(mv);
+  long i = map_find_num_fast(m, k);
+  if (TS_RT_UNLIKELY(i == -2)) i = map_find(m, k);
   return i>=0 ? m->vals[i] : TS_UNDEFINED;
 }
 int ts_map_has(tsv mv, tsv k){
   if (!ts_is_map(mv)){ ts_throw_type_error_msg("Method Map.prototype.has called on incompatible receiver"); return 0; }
-  return map_find(ts_ptr(mv), k) >= 0;
+  ts_map* m = ts_ptr(mv);
+  long i = map_find_num_fast(m, k);
+  if (TS_RT_UNLIKELY(i == -2)) i = map_find(m, k);
+  return i >= 0;
 }
 static int map_delete_unchecked(tsv mv, tsv k){
   ts_map* m = ts_ptr(mv);
