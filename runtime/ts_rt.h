@@ -908,10 +908,15 @@ typedef struct ts_func {
                             runtime defines it on the first observation of
                             fn.prototype (get, construct, descriptor). Occupies
                             former padding, so the cell layout is unchanged. */
-  uint8_t proto_lazy;    /* 1 while the function owns a `.prototype` whose
+  uint8_t proto_lazy : 1; /* 1 while the function owns a `.prototype` whose
                             object has not been created yet (prototype_prop is
                             still TS_UNDEFINED). Created, together with its
                             `constructor`, on the same first observation. */
+  /* 1 once `name` / `length` stopped being the metadata's virtual own
+     properties: deleted, or turned into an own entry by a definition
+     (docs/function_own_properties_design.md). Same byte as proto_lazy. */
+  uint8_t name_gone : 1;
+  uint8_t length_gone : 1;
   /* For a CLASS VALUE (a class used as a runtime value, `const K = C`): the
      class id PLUS ONE (0 = ordinary function/closure, not a constructor). `new K()`
      reads this via ts_construct. code holds the constructor cfunc; env holds the

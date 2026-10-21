@@ -7204,3 +7204,28 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   every 256 allocations, its 78 output files identical. A/B against `as3`,
   eight ABBA pairs: cycles 0.9913 (eight of eight), instructions 1.0001,
   wall 0.9868: neutral.
+- A function's own `name`, `length` and `prototype`
+  (`docs/function_own_properties_design.md`; item (a) above, which was
+  wider than reported): through a prototype chain they were not found
+  (`Object.create(fn).name` undefined, `"name" in` false); writes to
+  `fn.name` and `fn.length` were silently ignored and inherited ones
+  shadowed by a new own property, as were writes to a class's
+  `prototype`; `delete` was a no-op for every key of every function (user
+  properties, statics, `name`, `length`) and true even for the
+  non-configurable `prototype`; a definition of `name` or `length` was
+  never read back; `Object.keys` of a function was empty. Now `name` and
+  `length` are virtual own properties of the metadata (read-only, not
+  enumerable, configurable) until an own entry supersedes them or they are
+  deleted (two bits sharing `proto_lazy`'s byte, the cell layout
+  unchanged), and every path applies the same rule as the receiver and as
+  a chain link; deletions and definitions follow the spec (strict
+  TypeErrors for read-only writes and non-configurable deletions).
+  Fixture `functions/function_own_properties` (in the GC stress filter).
+  Known row: selfconf (the frozen emitter's partial descriptors). Gates:
+  unit, parity (366 identical), bundler, selfconf, GC stress, inline
+  policy, conformance 502/502 and 502/502 with a collection at every
+  allocation in protect mode; tsc relinked (`native_s350fp`, the `ts_func`
+  layout checked unchanged field by field) and compiled under protect mode,
+  with zapping, and with a minor collection every 256 allocations, its 78
+  output files identical. A/B against `ln2`, sixteen ABBA pairs: cycles
+  0.9980, instructions 0.9999, wall 0.9915: neutral.

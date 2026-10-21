@@ -2527,6 +2527,78 @@ static tsv* find_slot(ts_object* o, ts_key key, int create){
   ts_pref p = find_prop(o, key, create);
   return pref_ok(p) ? pref_valp(p) : NULL;
 }
+/* ---- a function's own properties (docs/function_own_properties_design.md) ----
+   `name` and `length` are virtual own data properties built from the boxed
+   metadata (read-only, not enumerable, configurable) while the function has
+   no own entry by that key (in its property map or, a class value, its
+   static container) and they were neither deleted nor redefined (the gone
+   bits); `prototype` lives in prototype_prop. */
+static ts_key g_fn_key_name = 0xFFFFFFFFu, g_fn_key_length = 0xFFFFFFFFu, g_fn_key_prototype = 0xFFFFFFFFu;
+static void fn_keys_init(void){
+  if (g_fn_key_name != 0xFFFFFFFFu) return;
+  g_fn_key_name = ts_intern_field("name", 4);
+  g_fn_key_length = ts_intern_field("length", 6);
+  g_fn_key_prototype = ts_intern_field("prototype", 9);
+}
+enum { FN_VIRTUAL_NONE = 0, FN_VIRTUAL_NAME = 1, FN_VIRTUAL_LENGTH = 2 };
+static int fn_virtual(ts_func* f, ts_key key){
+  fn_keys_init();
+  int which = key == g_fn_key_name ? FN_VIRTUAL_NAME : key == g_fn_key_length ? FN_VIRTUAL_LENGTH : FN_VIRTUAL_NONE;
+  if (!which || (which == FN_VIRTUAL_NAME ? f->name_gone : f->length_gone)) return FN_VIRTUAL_NONE;
+  if (find_slot(&f->o, key, 0)) return FN_VIRTUAL_NONE;
+  if (f->class_id){
+    ts_object* sc = ts_proto_ptr(f->o.proto);
+    if (sc && sc->h.kind == TS_KIND_OBJECT && find_slot(sc, key, 0)) return FN_VIRTUAL_NONE;
+  }
+  return which;
+}
+/* The value of a virtual property (allocates the name string). */
+static tsv fn_virtual_value(const ts_func* f, int which){
+  if (which == FN_VIRTUAL_NAME){
+    const char* nm = f->name ? f->name : "";
+    return ts_new_string(nm, (uint32_t)strlen(nm));
+  }
+  return ts_num((double)f->arity);
+}
+/* A function link of another object's prototype chain: its `prototype` and
+   its virtual properties, which find_slot (its property map) does not see.
+   May allocate (the prototype object, the name string). */
+static int fn_link_get(ts_object* link, ts_key key, tsv* out){
+  ts_func* f = (ts_func*)link;
+  fn_keys_init();
+  if (key == g_fn_key_prototype && fn_has_own_prototype(f)){
+    f = fn_materialize_prototype(f, ts_func_v(f));
+    *out = f->prototype_prop;
+    return 1;
+  }
+  int which = fn_virtual(f, key);
+  if (!which) return 0;
+  *out = fn_virtual_value(f, which);
+  return 1;
+}
+static int fn_link_has(ts_object* link, ts_key key){
+  ts_func* f = (ts_func*)link;
+  fn_keys_init();
+  if (key == g_fn_key_prototype && fn_has_own_prototype(f)) return 1;
+  return fn_virtual(f, key) != FN_VIRTUAL_NONE;
+}
+/* Before a definition applies to a virtual `name` or `length`: an own entry
+   with its value and current attributes takes its place for good. */
+static void fn_realize_virtual(tsv fnv, ts_key key){
+  ts_func* f = (ts_func*)ts_ptr(fnv);
+  int which = fn_virtual(f, key);
+  if (!which) return;
+  ts_gc_root(&fnv);
+  tsv v = fn_virtual_value(f, which);
+  ts_gc_root(&v);
+  f = (ts_func*)ts_ptr(fnv);
+  if (which == FN_VIRTUAL_NAME) f->name_gone = 1; else f->length_gone = 1;
+  uint8_t flags = (ts_obj_integrity(&f->o) & (1u|4u)) ? 0 : TS_PROP_CONFIGURABLE;
+  ts_pref p = props_define(&f->o, key, flags);
+  *pref_valp(p) = v;
+  ts_write_barrier(fnv, v);
+  ts_gc_unroot(2);
+}
 static int lookup_prop_chain(tsv receiver, ts_object* o, ts_key key, tsv* out){
   while (o){
     if (chain_link_exotic(o)){
@@ -2535,6 +2607,7 @@ static int lookup_prop_chain(tsv receiver, ts_object* o, ts_key key, tsv* out){
       o = next;
       continue;
     }
+    if (TS_RT_UNLIKELY(o->h.kind == TS_KIND_FUNC) && fn_link_get(o, key, out)) return 1;
     tsv* s = find_slot(o, key, 0);
     if (s){
       if (is_accessor(*s)){
@@ -2562,6 +2635,7 @@ static int lookup_prop_chain_until(tsv receiver, ts_object* o, ts_object* stop, 
       o = next;
       continue;
     }
+    if (TS_RT_UNLIKELY(o->h.kind == TS_KIND_FUNC) && fn_link_get(o, key, out)) return 1;
     tsv* s = find_slot(o, key, 0);
     if (s){
       if (is_accessor(*s)){
@@ -2711,10 +2785,9 @@ tsv ts_get(tsv obj, ts_key key){
      prop map). Resolve the field keys lazily and cache. Other keys fall through
      to the prototype walk below (Function.prototype.call/apply/bind). */
   if (ts_is_func(obj)){
-    static uint32_t k_name = 0xFFFFFFFFu, k_length = 0xFFFFFFFFu, k_prototype = 0xFFFFFFFFu;
-    if (k_name == 0xFFFFFFFFu){ k_name = ts_intern_field("name", 4); k_length = ts_intern_field("length", 6); k_prototype = ts_intern_field("prototype", 9); }
+    fn_keys_init();
     ts_func* f = ts_ptr(obj);
-    if (key == k_prototype && fn_has_own_prototype(f)){
+    if (key == g_fn_key_prototype && fn_has_own_prototype(f)){
       f = fn_materialize_prototype(f, obj);
       return f->prototype_prop;
     }
@@ -2723,8 +2796,7 @@ tsv ts_get(tsv obj, ts_key key){
       tsv found;
       if (lookup_prop_chain_until(obj, sc, ts_proto_ptr(g_object_proto_v), key, &found)) return found;
     }
-    if (key == k_name){ const char* nm = f->name ? f->name : ""; return ts_new_string(nm, (uint32_t)strlen(nm)); }
-    if (key == k_length) return ts_num((double)f->arity);
+    { int which = fn_virtual(f, key); if (which) return fn_virtual_value(f, which); }
     if (ts_is_class_value(obj) && ts_proto_ref(g_function_proto_v)){
       tsv found;
       if (lookup_prop_chain(obj, ts_proto_ptr(g_function_proto_v), key, &found)) return found;
@@ -2901,6 +2973,18 @@ static ts_pref ts_set_named_prop(tsv obj, ts_object* o, ts_key key, tsv val,
      holder) rejects the write (OrdinarySet: strict mode throws); a writable
      one lets the receiver create its own property. */
   for (ts_object* p=ts_next_proto(o); p; ){
+    if (TS_RT_UNLIKELY(p->h.kind == TS_KIND_FUNC)){
+      /* a function link: its read-only `name` and `length`, and its
+         `prototype` (writable for a function, so the receiver gets its own;
+         not for a class or a frozen function) */
+      ts_func* lf = (ts_func*)p;
+      fn_keys_init();
+      if (key == g_fn_key_prototype && fn_has_own_prototype(lf)){
+        if (lf->class_id || (ts_obj_integrity(p) & 1u)){ ts_throw_readonly_write(key); return PREF_NONE; }
+        break;
+      }
+      if (fn_virtual(lf, key)){ ts_throw_readonly_write(key); return PREF_NONE; }
+    }
     if (chain_link_exotic(p)){
       /* a proxy's [[Set]] with this receiver (its set trap decides), or the
          ordinary set going on at its target; the trap or a getter of the
@@ -2953,10 +3037,15 @@ void ts_set(tsv obj, ts_key key, tsv val){
   if (!ts_is_propbag(obj)){ ts_throw_bad_write_receiver(obj, key); return; }
   if (ts_is_func(obj)){
     ts_func* f = (ts_func*)ts_ptr(obj);
-    if (field_name_is(key, "prototype") && fn_has_own_prototype(f)){
-      if (!ts_is_class_value(obj)) { f->prototype_prop = val; f->ctor_pending = 0; f->proto_lazy = 0; ts_write_barrier(obj, val); }  /* class prototype is non-writable */
+    fn_keys_init();
+    if (key == g_fn_key_prototype && fn_has_own_prototype(f)){
+      /* a class's prototype is not writable, nor a frozen function's */
+      if (ts_is_class_value(obj) || (ts_obj_integrity(&f->o) & 1u)){ ts_throw_readonly_write(key); return; }
+      f->prototype_prop = val; f->ctor_pending = 0; f->proto_lazy = 0; ts_write_barrier(obj, val);
       return;
     }
+    /* `name` and `length` are read-only (docs/function_own_properties_design.md) */
+    if (fn_virtual(f, key)){ ts_throw_readonly_write(key); return; }
   }
   ts_object* sc = ts_class_static_container(obj);
   if (sc){ ts_set(ts_obj(sc), key, val); return; }
@@ -3164,6 +3253,7 @@ void ts_define_accessor_attr(tsv obj, ts_key key, tsv getter, tsv setter, int g_
   if (!ts_is_obj(obj) && !ts_is_func(obj)) return;
   prop_add_epoch_bump();
   ts_gc_root(&obj); ts_gc_root(&getter); ts_gc_root(&setter);
+  if (ts_is_func(obj)) fn_realize_virtual(obj, key);
   ts_accessor* ac = gc_alloc(sizeof(ts_accessor), TS_KIND_ACCESSOR);
   ac->getter = getter; ac->setter = setter;
   ac->g_this = (uint8_t)(g_this?1:0); ac->s_this = (uint8_t)(s_this?1:0);
@@ -3210,6 +3300,7 @@ void ts_define_accessor_symkey(tsv obj, tsv sym, tsv getter, tsv setter, int g_t
 void ts_define_data(tsv obj, ts_key key, tsv value, int e, int w, int c){
   if (!ts_is_obj(obj) && !ts_is_func(obj)) return;
   ts_gc_root(&obj); ts_gc_root(&value);
+  if (ts_is_func(obj)) fn_realize_virtual(obj, key);
   ts_object* o = (ts_object*)ts_ptr(obj);
   uint8_t flags = (uint8_t)((e?TS_PROP_ENUMERABLE:0) | (w?TS_PROP_WRITABLE:0) | (c?TS_PROP_CONFIGURABLE:0));
   /* A read-only data property rejects inherited writes on every object that
@@ -9725,21 +9816,27 @@ tsv ts_object_get_own_property_names(tsv obj){
     return arr;
   }
   if (ts_is_func(obj)){
-    int has_proto = fn_has_own_prototype((ts_func*)ts_ptr(obj));
-    push_cstr_name(arr, "length");
-    push_cstr_name(arr, "name");
-    if (has_proto) push_cstr_name(arr, "prototype");
+    /* V8's order: length, name, prototype, then the rest (statics of a class
+       value, the function's own map) */
+    fn_keys_init();
+    ts_func* f = (ts_func*)ts_ptr(obj);
+    int has_proto = fn_has_own_prototype(f);
     ts_object* sc = ts_class_static_container(obj);
+    int has_len = fn_virtual(f, g_fn_key_length) || find_slot(&f->o, g_fn_key_length, 0) ||
+                  (sc && find_slot(sc, g_fn_key_length, 0));
+    int has_name = fn_virtual(f, g_fn_key_name) || find_slot(&f->o, g_fn_key_name, 0) ||
+                   (sc && find_slot(sc, g_fn_key_name, 0));
+    if (has_len) push_cstr_name(arr, "length");
+    if (has_name) push_cstr_name(arr, "name");
+    if (has_proto) push_cstr_name(arr, "prototype");
+    sc = ts_class_static_container(obj);
     if (sc){
-      uint32_t k_len = ts_intern_field("length", 6);
-      uint32_t k_name = ts_intern_field("name", 4);
-    uint32_t k_proto = ts_intern_field("prototype", 9);
       tsv scv = ts_obj(sc);
-      push_prop_names_js_order(arr, scv, k_len, k_name, k_proto);
+      push_prop_names_js_order(arr, scv, g_fn_key_length, g_fn_key_name, g_fn_key_prototype);
       ts_gc_unroot(2);
       return arr;
     }
-    push_prop_names_js_order(arr, obj, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu);
+    push_prop_names_js_order(arr, obj, g_fn_key_length, g_fn_key_name, g_fn_key_prototype);
     ts_gc_unroot(2);
     return arr;
   }
@@ -10727,7 +10824,9 @@ static void ts_prop_own_enum(tsv obj, ts_prop_enum_cb cb, void* ud){
   }
   ts_object* sc = ts_class_static_container(obj);
   if (sc) obj = ts_obj(sc);
-  if (!ts_is_obj(obj) || ts_is_map(obj) || ts_is_set(obj)) return;
+  /* a plain function's own enumerable properties are its map's (its name,
+     length and prototype are not enumerable) */
+  if (!(ts_is_obj(obj) || ts_is_func(obj)) || ts_is_map(obj) || ts_is_set(obj)) return;
   /* Arrays (unified model): own enumerable keys are the integer indices
      "0".."len-1" (in order, value = element) followed by any named properties
      in the common-header prop map (insertion order). Matches JS enumeration. */
@@ -12022,7 +12121,6 @@ int ts_has_prop(tsv obj, ts_key key){
   /* function: own length/name, else walk the proto chain (Function.prototype's
      call/apply/bind, then Object.prototype's well-known methods). */
   if (ts_is_func(obj)){
-    if (field_name_is(key, "length") || field_name_is(key, "name")) return 1;
     if (is_function_proto_name(key)) return 1;   /* call/apply/bind (METHOD-keyed) */
     for (ts_object* p = ts_ptr(obj); p; ){
       if (chain_link_exotic(p)){
@@ -12031,6 +12129,7 @@ int ts_has_prop(tsv obj, ts_key key){
         p = next;
         continue;
       }
+      if (p->h.kind == TS_KIND_FUNC && fn_link_has(p, key)) return 1;
       if (find_slot(p, key, 0)) return 1;
       if (p == ts_proto_ptr(g_object_proto_v) && is_object_proto_name(key)) return 1;
       p = ts_next_proto(p);
@@ -12060,6 +12159,7 @@ int ts_has_prop(tsv obj, ts_key key){
       o = next;
       continue;
     }
+    if (TS_RT_UNLIKELY(o->h.kind == TS_KIND_FUNC) && fn_link_has(o, key)) return 1;
     if (find_slot(o,key,0)) return 1;
     /* reaching Object.prototype: the well-known methods (stored under method
        keys) count as inherited properties for the `in` operator. */
@@ -12092,9 +12192,11 @@ int ts_is_undefined(tsv v){ return ts_is_undef(v); }
    non-configurable own property throws a catchable TypeError (V8 message), unlike
    the internal ts_delete_prop which returns false. Non-own / configurable / absent
    keys delete normally. */
+static int fn_delete(tsv obj, ts_key key, int strict);
 int ts_delete_prop_strict(tsv obj, ts_key key){
   if (ts_is_obj(obj)){ ts_gc_header* _dh = (ts_gc_header*)ts_ptr(obj); if (_dh->gen == TS_GEN_OLD) _dh->hdr_spare = 0xFF; }
   if (g_has_proxies && ts_is_proxy(obj)) return ts_proxy_delete_v(obj, ts_key_to_value(key));
+  if (ts_is_func(obj)) return fn_delete(obj, key, 1);
   if (!ts_is_obj(obj)) return 1;
   ts_object* o=ts_ptr(obj);
   if (ts_is_indexed_array_fast(obj)){
@@ -12149,22 +12251,11 @@ tsv ts_delete_dynamic_strict(tsv obj, tsv keyv, const uint32_t* method_pairs, ui
   ts_gc_unroot(2);
   return ts_bool(result);
 }
-int ts_delete_prop(tsv obj, ts_key key){
-  if (ts_is_obj(obj)){ ts_gc_header* _dh = (ts_gc_header*)ts_ptr(obj); if (_dh->gen == TS_GEN_OLD) _dh->hdr_spare = 0xFF; }
-  if (g_has_proxies && ts_is_proxy(obj)) return ts_proxy_delete_v(obj, ts_key_to_value(key));
-  if (!ts_is_obj(obj)) return 1;
-  ts_object* o=ts_ptr(obj);
-  if (ts_is_indexed_array_fast(obj)){
-    const char* nm=ts_field_name(key);
-    long ix=nm ? ts_canonical_array_index(nm, ts_field_name_len(key)) : -1;
-    if (ix >= 0){
-      if (!ts_array_has_index(obj, (uint32_t)ix)) return 1;
-      if (((ts_array*)ts_ptr(obj))->element_kind) return 0;
-      if (ts_obj_integrity(o) & (1u|4u)) return 0;
-      array_put_hole((ts_array*)ts_ptr(obj), (uint32_t)ix);
-      return 1;
-    }
-  }
+/* Delete own property `key` of a property-map holder (an object, a
+   function's map, a class's static container): 1 deleted or absent, 0
+   refused (non-configurable, sealed or frozen). */
+static int props_delete_own(ts_object* o, ts_key key){
+  if (o->h.gen == TS_GEN_OLD) o->h.hdr_spare = 0xFF;
   if (ts_obj_integrity(o) & (1u|4u)) return 0;   /* frozen / sealed: delete ignored (false) */
   ts_pref found = prop_find(o, key);
   if (!pref_ok(found)) return 1;
@@ -12179,6 +12270,57 @@ int ts_delete_prop(tsv obj, ts_key key){
   o->len--;
   if (o->prop_index) prop_index_rebuild(o, o->len);
   return 1;
+}
+static void fn_delete_refused(ts_key key){
+  const char* nm = ts_field_name(key);
+  char buf[256];
+  snprintf(buf, sizeof(buf), "Cannot delete property '%s' of function", nm ? nm : "?");
+  ts_throw_type_error_msg(buf);
+}
+/* `delete fn.key` (docs/function_own_properties_design.md): the prototype is
+   not configurable, a virtual `name` or `length` is deleted by its bit, an
+   own entry lives in the function's map or a class value's static
+   container. 1 deleted or absent; 0 refused (strict: TypeError). */
+static int fn_delete(tsv obj, ts_key key, int strict){
+  ts_func* f = (ts_func*)ts_ptr(obj);
+  fn_keys_init();
+  int sealed = (ts_obj_integrity(&f->o) & (1u|4u)) != 0;
+  if (key == g_fn_key_prototype && fn_has_own_prototype(f)){ if (strict) fn_delete_refused(key); return 0; }
+  int which = fn_virtual(f, key);
+  if (which){
+    if (sealed){ if (strict) fn_delete_refused(key); return 0; }
+    if (which == FN_VIRTUAL_NAME) f->name_gone = 1; else f->length_gone = 1;
+    prop_add_epoch_bump();
+    return 1;
+  }
+  ts_object* holder = find_slot(&f->o, key, 0) ? &f->o : NULL;
+  if (!holder && f->class_id){
+    ts_object* sc = ts_proto_ptr(f->o.proto);
+    if (sc && sc->h.kind == TS_KIND_OBJECT && find_slot(sc, key, 0)) holder = sc;
+  }
+  if (!holder) return 1;
+  int r = props_delete_own(holder, key);
+  if (!r && strict) fn_delete_refused(key);
+  return r;
+}
+int ts_delete_prop(tsv obj, ts_key key){
+  if (ts_is_obj(obj)){ ts_gc_header* _dh = (ts_gc_header*)ts_ptr(obj); if (_dh->gen == TS_GEN_OLD) _dh->hdr_spare = 0xFF; }
+  if (g_has_proxies && ts_is_proxy(obj)) return ts_proxy_delete_v(obj, ts_key_to_value(key));
+  if (ts_is_func(obj)) return fn_delete(obj, key, 0);
+  if (!ts_is_obj(obj)) return 1;
+  ts_object* o=ts_ptr(obj);
+  if (ts_is_indexed_array_fast(obj)){
+    const char* nm=ts_field_name(key);
+    long ix=nm ? ts_canonical_array_index(nm, ts_field_name_len(key)) : -1;
+    if (ix >= 0){
+      if (!ts_array_has_index(obj, (uint32_t)ix)) return 1;
+      if (((ts_array*)ts_ptr(obj))->element_kind) return 0;
+      if (ts_obj_integrity(o) & (1u|4u)) return 0;
+      array_put_hole((ts_array*)ts_ptr(obj), (uint32_t)ix);
+      return 1;
+    }
+  }
+  return props_delete_own(o, key);
 }
 
 /* Object.getOwnPropertyDescriptor(obj, key): build a descriptor object for an
@@ -12250,11 +12392,11 @@ static tsv ts_own_descriptor_by_key(tsv obj, ts_key key){
       if (!ts_is_undef(d)) return d;
     }
     ts_func* f = ts_ptr(obj);
-    if (nm && field_bytes_is(nm, nm_len, "name")){
-      const char* name = f->name ? f->name : "";
-      return build_data_descriptor(ts_new_string(name, (uint32_t)strlen(name)), 0, 0, 1);
+    int which = fn_virtual(f, key);
+    if (which){
+      int conf = !(ts_obj_integrity(&f->o) & (1u|4u));
+      return build_data_descriptor(fn_virtual_value(f, which), 0, 0, conf);
     }
-    if (nm && field_bytes_is(nm, nm_len, "length")) return build_data_descriptor(ts_num((double)f->arity), 0, 0, 1);
     if (nm && field_bytes_is(nm, nm_len, "prototype") && fn_has_own_prototype(f)){
       f = fn_materialize_prototype(f, obj);
       return build_data_descriptor(f->prototype_prop, ts_is_class_value(obj) ? 0 : 1, 0, 0);
@@ -12397,6 +12539,7 @@ static tsv define_descriptor_object(unsigned present, tsv value, tsv getter, tsv
    and returns 0 otherwise (Reflect.defineProperty). */
 static int define_own_property(tsv obj, ts_key key, unsigned present, tsv value, tsv getter, tsv setter, int e, int w, int c, int throws){
   ts_gc_root(&obj); ts_gc_root(&value); ts_gc_root(&getter); ts_gc_root(&setter);
+  if (ts_is_func(obj)) fn_realize_virtual(obj, key);   /* the definition applies to an own entry */
   int is_acc = (present & (DEF_GET | DEF_SET)) != 0, is_data = (present & (DEF_VALUE | DEF_WRITABLE)) != 0;
   ts_object* o = (ts_object*)ts_ptr(obj);
   uint32_t integ = ts_obj_integrity(o);
@@ -12607,8 +12750,7 @@ int ts_has_own(tsv obj, ts_key key){
      from Function.prototype, so they are NOT own. A function may also carry
      explicitly-assigned own props in its prop map. */
   if (ts_is_func(obj)){
-    if (field_name_is(key, "length") || field_name_is(key, "name")) return 1;
-    if (field_name_is(key, "prototype") && fn_has_own_prototype((ts_func*)ts_ptr(obj))) return 1;
+    if (fn_link_has((ts_object*)ts_ptr(obj), key)) return 1;   /* prototype, name, length */
     ts_object* sc = ts_class_static_container(obj);
     if (sc && find_slot(sc, key, 0) != NULL) return 1;
     return find_slot((ts_object*)ts_ptr(obj), key, 0) != NULL;
