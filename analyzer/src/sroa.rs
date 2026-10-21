@@ -230,6 +230,17 @@ pub fn run_sroa(program: &mut Program, result: &EscapeResult) {
     }
 }
 
+/// A fresh local holding undefined, for a parameter an inlined call does not
+/// pass.
+fn omitted_argument(next: &mut u32, new_locals: &mut Vec<Local>, out: &mut Vec<Inst>) -> u32 {
+    let id = fresh(next, new_locals, true);
+    out.push(Inst::Const {
+        dst: LocalId(id),
+        value: ConstVal::Undef,
+    });
+    id
+}
+
 fn fresh(next: &mut u32, new_locals: &mut Vec<Local>, reference: bool) -> u32 {
     let id = *next;
     *next += 1;
@@ -2580,6 +2591,10 @@ fn inline_free_fn(
     for (i, p) in callee.params.iter().enumerate() {
         if let Some(a) = args.get(i) {
             subst.insert(p.0, a.0);
+        } else {
+            // an omitted argument is undefined (unmapped, the parameter's id
+            // would name an unrelated local of the caller)
+            subst.insert(p.0, omitted_argument(next, new_locals, out));
         }
     }
     for l in &callee.locals {
@@ -2688,6 +2703,8 @@ fn inline_callee(
         } // this -> handled via field map
         if let Some(a) = args.get(i - 1) {
             subst.insert(p.0, a.0);
+        } else {
+            subst.insert(p.0, omitted_argument(next, new_locals, out));
         }
     }
     // fresh-rename all non-param callee locals

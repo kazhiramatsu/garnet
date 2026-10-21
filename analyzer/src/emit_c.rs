@@ -1174,12 +1174,17 @@ fn struct_name(id: u32) -> String {
 /// (via offsetof), and whether the slot is an unboxed double or a boxed tsv.
 fn emit_class_descriptors(s: &mut String, program: &Program) {
     let classes: BTreeMap<u32, &ClassDef> = program.classes.iter().map(|c| (c.id.0, c)).collect();
+    // the struct's members (emit_field_chain): a redeclared field keeps the
+    // slot, and the kind, of the ancestor that declares it first
     fn chain(cid: u32, classes: &BTreeMap<u32, &ClassDef>, out: &mut Vec<(u32, bool)>) {
         if let Some(c) = classes.get(&cid) {
             if let Some(p) = c.parent {
                 chain(p.0, classes, out);
             }
             for f in &c.own_fields {
+                if out.iter().any(|(id, _)| *id == f.0) {
+                    continue;
+                }
                 let numeric = c
                     .field_types
                     .get(&f.0.to_string())
@@ -9253,22 +9258,26 @@ fn collect_non_numeric_consts(body: &[Inst], out: &mut BTreeSet<u32>) {
 }
 
 /// Is (class `c`, field `field`) a monomorphized numeric (unboxed double) field?
-/// The field may be declared on `c` or any ancestor; its `field_types` entry
-/// ("number") lives on the class that declares it. Walks the inheritance chain.
+/// The struct slot is the one of the topmost ancestor that declares the field
+/// (`emit_field_chain` emits parents first and skips a redeclaration), so its
+/// `field_types` entry decides, not a subclass's that redeclares the field (a
+/// constructor assigning an inherited field): reading that slot by the
+/// subclass's type took a boxed slot for a double.
 fn numeric_field(c: u32, field: u32, classes: &BTreeMap<u32, &ClassDef>) -> bool {
-    if let Some(cd) = classes.get(&c) {
+    let mut decision = false;
+    let mut cur = Some(c);
+    while let Some(id) = cur {
+        let Some(cd) = classes.get(&id) else { break };
         if cd.own_fields.iter().any(|f| f.0 == field) {
-            return cd
+            decision = cd
                 .field_types
                 .get(&field.to_string())
                 .map(|t| t == "number")
                 .unwrap_or(false);
         }
-        if let Some(p) = cd.parent {
-            return numeric_field(p.0, field, classes);
-        }
+        cur = cd.parent.map(|p| p.0);
     }
-    false
+    decision
 }
 
 /// The runtime property key (as a C expression) for a method-name id: a

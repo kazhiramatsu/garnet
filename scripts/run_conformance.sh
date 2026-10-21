@@ -12,6 +12,7 @@
 # once. This keeps even thousands of cases practical on a single core.
 #
 # Env:  TSAOT_CONF_SHARD="i/n"  run only shard i of n (1-indexed) for distribution
+#       TSAOT_CONF_STRICT=1      export with the strict type profile (`--strict`)
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TIER="${1:-basic}"
@@ -72,7 +73,11 @@ $CC -c "$RT/ts_rt.c" -I"$RT" -o "$RT_OBJ" 2>"$WORK/rt.err" || { echo "[conf] run
 
 # batch export (AOT IR) + batch transpile (V8 ref), each in one node process
 t0=$(now_ms)
-node "$EX" --batch "$LIST" "$WORK/json" >"$WORK/exp.status" 2>"$WORK/exp.err" || true
+# TSAOT_CONF_STRICT=1 exports with the strict type profile (`--strict`), as a
+# project with a strict tsconfig is: the type-driven optimizations it enables
+# (monomorphized numeric fields, specialization) are otherwise untested here.
+STRICT_FLAG=""; [[ "${TSAOT_CONF_STRICT:-0}" == 1 ]] && STRICT_FLAG="--strict"
+node "$EX" $STRICT_FLAG --batch "$LIST" "$WORK/json" >"$WORK/exp.status" 2>"$WORK/exp.err" || true
 node "$EX" --transpile-batch "$LIST" "$WORK/v8" >"$WORK/tr.status" 2>"$WORK/tr.err" || true
 t1=$(now_ms)
 echo "[conf:$TIER] $ntotal tests | export+transpile ${ntotal} in $((t1-t0))ms"

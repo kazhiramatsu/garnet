@@ -1282,6 +1282,14 @@ class Exporter {
   }
   symbolOf(node: ts.Node | undefined): ts.Symbol | undefined {
     if (!node) return undefined;
+    // A parameter property's name (`constructor(private x)`) resolves to the
+    // class's PROPERTY symbol; the constructor body's `x` is the PARAMETER.
+    // Bind and capture the parameter, which the body reads.
+    if (ts.isIdentifier(node) && node.parent && ts.isParameter(node.parent) && node.parent.name === node &&
+        ts.isParameterPropertyDeclaration(node.parent, node.parent.parent)) {
+      const symbols = this.checker.getSymbolsOfParameterPropertyDeclaration(node.parent, node.text);
+      if (symbols.length > 0) return symbols[0];
+    }
     const applyTopLevelFallback = (sym: ts.Symbol | undefined): ts.Symbol | undefined => {
       let a = this.unwrapImportAlias(sym);
       // Checking a named function expression can replace its reference symbol

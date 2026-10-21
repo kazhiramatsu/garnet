@@ -7388,3 +7388,41 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   every 256 allocations, its 78 output files identical. A/B against `tc`,
   sixteen ABBA pairs: wall 1.0000, instructions 0.9999, cycles 0.9994:
   neutral.
+- Three silent wrong values found bringing up tsc-ts (slice 4 of
+  `docs/tsc_ts_native_design.md`), whose classes declare fields as
+  constructor parameters, leave optional arguments out of constructor and
+  method calls, and redeclare inherited fields in subclass constructors;
+  and the conformance suite under the strict type profile, which a strict
+  tsconfig (tsc-ts's) selects and the suite had never run
+  (`TSAOT_CONF_STRICT=1 scripts/run_conformance.sh` passes `--strict` to
+  the batch export):
+  - A constructor body reading a parameter property by name
+    (`constructor(private sys: Sys) { use(sys); }`) read a local nothing
+    assigns: the checker answers the class's property symbol for the
+    parameter's name, so the parameter was bound under that symbol while
+    the body's reads resolve to the parameter's. The exporter now binds the
+    parameter's own symbol (`getSymbolsOfParameterPropertyDeclaration`).
+    Fixture `classes/parameter_property_reads` (every modifier form,
+    closures, a subclass).
+  - A constructor or method that SROA inlines (its object never leaves the
+    caller), called with trailing arguments left out, read each omitted
+    parameter from whatever caller local had the parameter's id (a class's
+    prototype, say) instead of undefined; the inliner now binds an omitted
+    parameter to a fresh local holding undefined, so defaults and `??`
+    apply. Fixture `classes/inlined_omitted_arguments`.
+  - A subclass constructor assigning an inherited field declares it again;
+    the struct slot stays the ancestor's, but under the strict profile the
+    subclass's numeric field type made typed accesses treat the boxed slot
+    as a double (a write stored the double's bits, a read through `any`
+    or a base-typed `|=` saw garbage: tsc-ts printed `var` for `const`).
+    The topmost ancestor that declares the field now decides its kind, and
+    class descriptors list a redeclared slot once. Fixture
+    `classes/redeclared_field_slots`.
+  Known parity rows for the second and third (the frozen twin keeps both
+  bugs). Gates: unit, parity (368 identical), bundler 42/42, selfconf, GC
+  stress, inline policy, conformance 515/515, 515/515 under the strict
+  profile, and 515/515 with a collection at every allocation in protect
+  mode; tsc rebuilt (`native_s350pp`; its C unchanged) and compiled under
+  protect mode, with zapping, and with a minor collection every 256
+  allocations, its 78 output files identical. A/B against `ag`, sixteen
+  ABBA pairs: wall 1.0000, instructions 1.0000, cycles 1.0013: neutral.
