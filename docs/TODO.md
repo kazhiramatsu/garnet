@@ -7589,3 +7589,7 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   minor collection every 256 allocations, its 78 output files identical.
   A/B against `ch`, sixteen ABBA pairs: wall 1.0000, instructions 1.0001,
   cycles 0.9983: neutral.
+- tsc-ts host: `utf8Length` (`Buffer.byteLength` of every output file)
+  walked each string unit by unit; an ASCII string answers its length and
+  8-bit storage counts the units past 0x7F. tsc-ts emitting: 3.00 s ->
+  2.94 s (A/B, six pairs), its 78 output files identical to scriptc's.

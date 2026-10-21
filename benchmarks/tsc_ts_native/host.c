@@ -293,6 +293,15 @@ static tsv host_utf8_length(tsv* a, int n){
   tsv s = arg(a, n, 0);
   if (!ts_is_str(s)) return ts_num(0);
   ts_strview v = ts_str_view_typed(s);
+  /* ASCII: one byte per unit; 8-bit storage: two bytes for each unit past
+     0x7F; UTF-16 storage: the general walk */
+  if (v.flags & TS_STR_FLAG_ASCII) return ts_num((double)v.len);
+  if (v.data && !(v.flags & TS_STR_FLAG_UTF16)){
+    const unsigned char* b = (const unsigned char*)v.data;
+    uint64_t high = 0;
+    for (uint32_t i = 0; i < v.len; i++) high += b[i] >> 7;
+    return ts_num((double)v.len + (double)high);
+  }
   double total = 0;
   for (uint32_t i = 0; i < v.len; i++){
     uint32_t cu = ts_str_cu_at_view(v, i);
