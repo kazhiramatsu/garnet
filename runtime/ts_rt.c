@@ -125,6 +125,11 @@ static gc_pclass g_pclass[GC_PAYLOAD_NCLASS];
 static gc_pclass g_cclass[GC_PAYLOAD_NCLASS];
 static uint32_t g_large_cell_head = 0;   /* large cell runs (index + 1) */
 static uint32_t g_pclass_size[GC_PAYLOAD_NCLASS];
+/* Per class: the bytes its cells tile from a block's start, and the cell
+   starts as bitmap words (bit j of word w set when granule 64w + j starts a
+   cell): a block's free run is then found with word operations. */
+static uint32_t g_pclass_lim[GC_PAYLOAD_NCLASS];
+static uint64_t g_pclass_starts[GC_PAYLOAD_NCLASS][GC_BLOCK_BITMAP_WORDS];
 static uint8_t g_pclass_of[(GC_PAYLOAD_SMALL_MAX >> 4) + 1];
 static int g_pclass_n = 0;
 /* Debug modes (TSAOT_GC_ZAP, ASan): the runs handed out in the current cycle,
@@ -179,6 +184,14 @@ static void gc_cage_init(void){
     while (g_pclass_size[c] < g * 16u) c++;
     g_pclass_of[g] = (uint8_t)c;
   }
+  for (int k = 0; k < g_pclass_n; k++){
+    uint32_t size = g_pclass_size[k], ncells = (uint32_t)(GC_BLOCK_BYTES / size);
+    g_pclass_lim[k] = ncells * size;
+    for (uint32_t i = 0; i < ncells; i++){
+      uint32_t g = (i * size) >> 4;
+      g_pclass_starts[k][g >> 6] |= (uint64_t)1u << (g & 63u);
+    }
+  }
 }
 static inline uint64_t* gc_block_bitmap(uint32_t bi){ return g_cage_bitmaps + (size_t)bi * GC_BLOCK_BITMAP_WORDS; }
 static inline char* gc_block_base(uint32_t bi){ return g_cage_base + ((size_t)bi << GC_BLOCK_SHIFT); }
@@ -206,20 +219,31 @@ static uint32_t gc_block_take(void){
   }
   return gc_cage_frontier_take(1u);
 }
-/* The next run of unmarked cells of block `bi` at or after its cursor, or 0. */
-static int gc_payload_block_run(uint32_t bi, uint32_t size, char** ptr, char** end){
+/* The next run of unmarked cells of block `bi` at or after its cursor, or 0.
+   Bits are set only at cell starts (a mark or old bit), so the run starts at
+   the first cell start whose bit is clear and ends at the next set bit; both
+   are found a word at a time (a dense block of survivors was walked a cell
+   at a time before: 7% of the TypeScript compiler's run). */
+static int gc_payload_block_run(uint32_t bi, unsigned cls, char** ptr, char** end){
   gc_block* b = &g_blocks[bi];
   if (b->epoch != g_payload_epoch){ b->epoch = g_payload_epoch; b->cursor = 0; }
-  uint32_t ncells = (uint32_t)(GC_BLOCK_BYTES / size);
-  if (b->live + size > ncells * size) { b->cursor = ncells * size; return 0; }
+  uint32_t size = g_pclass_size[cls], lim = g_pclass_lim[cls];
+  if (b->live + size > lim || b->cursor >= lim){ b->cursor = lim; return 0; }
   const uint64_t* bm = gc_block_bitmap(bi);
-  uint32_t off = b->cursor, lim = ncells * size;
-  while (off < lim && (bm[off >> 10] >> ((off >> 4) & 63u) & 1u)) off += size;
-  if (off >= lim){ b->cursor = lim; return 0; }
-  uint32_t stop = off;
-  while (stop < lim && !(bm[stop >> 10] >> ((stop >> 4) & 63u) & 1u)) stop += size;
+  const uint64_t* starts = g_pclass_starts[cls];
+  uint32_t g = b->cursor >> 4, w = g >> 6;
+  uint64_t free_starts = ~bm[w] & starts[w] & (~(uint64_t)0 << (g & 63u));
+  while (!free_starts){
+    if (++w == GC_BLOCK_BITMAP_WORDS){ b->cursor = lim; return 0; }
+    free_starts = ~bm[w] & starts[w];
+  }
+  uint32_t first = (w << 6) + (uint32_t)__builtin_ctzll(free_starts);
+  uint64_t set = bm[w] & (~(uint64_t)0 << (first & 63u));
+  while (!set && ++w < GC_BLOCK_BITMAP_WORDS) set = bm[w];
+  uint32_t stop = set ? ((w << 6) + (uint32_t)__builtin_ctzll(set)) << 4 : lim;
+  if (stop > lim) stop = lim;
   b->cursor = stop;
-  *ptr = gc_block_base(bi) + off; *end = gc_block_base(bi) + stop;
+  *ptr = gc_block_base(bi) + ((size_t)first << 4); *end = gc_block_base(bi) + stop;
   return 1;
 }
 static void gc_payload_zap_run(char* p, size_t n){
@@ -232,7 +256,7 @@ static char* gc_space_refill(gc_pclass* classes, uint8_t state, unsigned cls, in
   char* ptr; char* end;
   while (c->scan){
     uint32_t bi = c->scan - 1u;
-    if (gc_payload_block_run(bi, size, &ptr, &end)){
+    if (gc_payload_block_run(bi, cls, &ptr, &end)){
       c->ptr = ptr; c->end = end;
       if (log_runs) gc_payload_log_run(ptr, end, size);
       return ptr;
