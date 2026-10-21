@@ -4717,8 +4717,9 @@ tsv ts_add(tsv a, tsv b){
   if ((ts_object_like(a)&&!ts_is_symbol(a)) || (ts_object_like(b)&&!ts_is_symbol(b))){
     ts_gc_root(&a); ts_gc_root(&b);
     tsv pa = ts_to_primitive(a, 2);  /* hint: default */
+    ts_gc_root(&pa);                 /* the second conversion may collect */
     tsv pb = ts_to_primitive(b, 2);
-    ts_gc_unroot(2);
+    ts_gc_unroot(3);
     /* avoid infinite recursion if ToPrimitive returned an object (shouldn't) */
     if (!ts_is_obj(pa) || !ts_is_obj(pb) || pa!=a || pb!=b) return ts_add(pa, pb);
   }
@@ -5026,15 +5027,20 @@ int ts_relational_slow(tsv a, tsv b, int op){
   }
   ts_gc_root(&a); ts_gc_root(&b);
   tsv pa = (ts_object_like(a)&&!ts_is_symbol(a)) ? ts_to_primitive(a,0) : a;
+  ts_gc_root(&pa);   /* the second conversion may collect */
   tsv pb = (ts_object_like(b)&&!ts_is_symbol(b)) ? ts_to_primitive(b,0) : b;
-  ts_gc_unroot(2);
+  ts_gc_root(&pb);
+  int r;
   if (ts_is_str(pa) && ts_is_str(pb)){
     int c = str_view_compare(ts_str_view_typed(pa), ts_str_view_typed(pb));
-    switch(op){ case 0: return c<0; case 1: return c<=0; case 2: return c>0; default: return c>=0; }
+    switch(op){ case 0: r = c<0; break; case 1: r = c<=0; break; case 2: r = c>0; break; default: r = c>=0; }
+  } else {
+    double na = ts_number_coerce(pa), nb = ts_number_coerce(pb);
+    if (na!=na || nb!=nb) r = 0; /* NaN -> all relational false */
+    else switch(op){ case 0: r = na<nb; break; case 1: r = na<=nb; break; case 2: r = na>nb; break; default: r = na>=nb; }
   }
-  double na = ts_number_coerce(pa), nb = ts_number_coerce(pb);
-  if (na!=na || nb!=nb) return 0; /* NaN -> all relational false */
-  switch(op){ case 0: return na<nb; case 1: return na<=nb; case 2: return na>nb; default: return na>=nb; }
+  ts_gc_unroot(4);
+  return r;
 }
 /* JS loose equality (== / !=) for the cases strict-eq misses: null == undefined,
    number == string (coerce string), bool == x (coerce bool to number), etc.
