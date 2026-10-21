@@ -762,6 +762,39 @@ reserved nursery range, the hazard checker, and the step 4a machinery in
 the scratchpad of that session (not in the tree). Reopen only with a
 measurement that shows more than the machinery's cost.
 
+## 6.7 tsc-ts measurements (Session 351): the nursery and the handles
+
+tsc-ts (`docs/tsc_ts_native_design.md`, a modern, closed program: most of
+its objects live to the end) after the closed receivers work
+(`docs/closed_receivers_design.md`): 2.17 s emitting the TypeScript 6.0.3
+compiler project, 41.5 G instructions at IPC 4.45; scriptc runs the same
+source in 1.03 s, 18.4 G instructions at IPC 4.08 (one thread; 0.48 s on
+its threads). The gap is instructions, not IPC: scriptc's `getName` is
+about 15-20 instructions a call (a null test, an i32 kind into a jump
+table, the class id read through the vtable, the field load), garnet's
+40-50 (the handle branch of `ts_ptr` per dereference, NaN-box tests, the
+kind as a double into the switch, `g_class_relinked` and a guard the
+`instanceof` just proved). Two measurement builds (scratch, not committed;
+outputs identical), six interleaved rounds:
+
+| build | tsc-ts wall | instructions | TypeScript compiler wall |
+|---|---|---|---|
+| current | 1 | 41.5 G | 1 |
+| every cell allocated old (no nursery; references all pointer form) | 0.943 | 38.1 G | 1.079, peak memory +55% |
+| the same, and `ts_ptr` without the handle branch | 0.869 | 35.6 G | (not built) |
+
+The nursery costs tsc-ts 5.7% (copying, promotion, handles, barriers for
+cells that survive anyway) and pays the TypeScript compiler 7.9% (it makes
+much short-lived garbage); the handle branch costs tsc-ts another 7.5% (a
+load the C compiler cannot hoist across calls, and code). This is the
+measurement §6.6.1 asked for before reopening direct references, for one
+workload: what removing the handles would gain is far more than the
+machinery's measured cost (about 0.7%), but only a design that keeps a
+nursery for the compiler's short-lived cells (Y1) or one that sends
+long-lived allocation sites to the old generation (allocation-site
+pretenuring, survival feedback per site) serves both programs. Decision
+pending (Kaz).
+
 ## 7. Verification
 
 - Gates of every slice: unit, parity (`scripts/emitc_diff.sh`), bundler,

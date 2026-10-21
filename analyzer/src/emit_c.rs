@@ -1883,6 +1883,14 @@ impl<'a> Ctx<'a> {
             call.to_string()
         }
     }
+    /// The same for a slow call answering an int (`ts_instanceof`).
+    fn lazy_linked_int(&self, call: &str) -> String {
+        if self.lazy_frame {
+            format!("({{ int _lz; {}_lz = {};{} _lz; }})", self.lazy_link(), call, self.lazy_unlink())
+        } else {
+            call.to_string()
+        }
+    }
     /// The same for a call made as a statement.
     fn lazy_linked_stmt(&self, call: &str) -> String {
         if self.lazy_frame {
@@ -3734,6 +3742,13 @@ fn body_is_gc_free(body: &[Inst], numeric: &BTreeSet<u32>) -> bool {
         | Inst::StringLen { .. } => true,
         // wrapped lazily at the slow path
         Inst::LoadField { .. } | Inst::StoreField { .. } | Inst::LoadIndex { .. } => true,
+        // `x instanceof C` links around its chain walk; a class binding's
+        // check only throws, leaving the function (a lazy body has no try)
+        Inst::CallBuiltinStatic { builtin, .. }
+            if builtin.starts_with("instanceof.class:") || builtin.starts_with("binding.check:") =>
+        {
+            true
+        }
         Inst::StoreIndex { .. } if is_view_store_point(inst, numeric) => true,
         Inst::UnOp { op, operand, .. } => match op.as_str() {
             "!" | "typeof" | "nullish" | "isundef" => true,
@@ -19610,22 +19625,27 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         // prototype was relinked, walks its chain
                         let lo = dfs.index[&cid] + 1;
                         let span = dfs.span[&cid];
+                        // (the chain walk may run a Proxy's trap: a lazy frame
+                        // links around it)
+                        let walk = ctx.lazy_linked_int(&format!("ts_instanceof({}, CLASS_PROTO[{}])", o, c));
                         (
                             format!(
-                                "ts_bool(ts_is_obj({o}) && ({{ uint32_t _ci = ((ts_object*)ts_ptr({o}))->cls; ((uint32_t)(_ci - 1u) < 0x7FFFFFFFu && !g_class_relinked) ? (uint32_t)(_ci - {lo}u) < {span}u : ts_instanceof({o}, CLASS_PROTO[{c}]); }}))",
+                                "ts_bool(ts_is_obj({o}) && ({{ uint32_t _ci = ((ts_object*)ts_ptr({o}))->cls; ((uint32_t)(_ci - 1u) < 0x7FFFFFFFu && !g_class_relinked) ? (uint32_t)(_ci - {lo}u) < {span}u : {walk}; }}))",
                                 o = o,
-                                c = c,
                                 lo = lo,
-                                span = span
+                                span = span,
+                                walk = walk
                             ),
                             false,
                         )
                     } else {
+                        let walk = ctx.lazy_linked_int(&format!("ts_instanceof({}, CLASS_PROTO[{}])", o, c));
                         (
                             format!(
-                                "ts_bool((ts_is_obj({o}) && ((ts_object*)ts_ptr({o}))->proto == CLASS_PROTO[{c}]) || ts_instanceof({o}, CLASS_PROTO[{c}]))",
+                                "ts_bool((ts_is_obj({o}) && ((ts_object*)ts_ptr({o}))->proto == CLASS_PROTO[{c}]) || {walk})",
                                 o = o,
-                                c = c
+                                c = c,
+                                walk = walk
                             ),
                             false,
                         )

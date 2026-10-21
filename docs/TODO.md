@@ -7732,3 +7732,23 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   inline policy, conformance 528/528, 528/528 strict, 528/528 at every
   allocation; tsc rebuilt (`native_s350s2`) and tsc-ts (closed, its C as
   before) under protect, zap and frequent minors, outputs identical.
+- Two small ones, gated together. Map lookups: `ts_map_get` / `ts_map_has`
+  took two calls (`map_find`, `sv0_hash`) and a ten-register prologue per
+  lookup; an indexed map and a number key now probe in line and answer by
+  the key's very bits (98% of hits), `map_find` deciding the rest:
+  tsc-ts x0.996 (eight rounds, 41.66 G -> 41.44 G instructions); a lookup's
+  cost is its cache misses. Lazy frames: a function whose only ways into
+  the runtime are an `instanceof` of a shared-prototype class (its chain
+  walk, which a Proxy's trap could run) and a class binding's check (it
+  only throws) is now lazily framed with register homes, the walk linked
+  around (tsc-ts's `getName`, `getLocals` and the like): 0.5% fewer
+  instructions, time neutral. Gates: unit, parity, bundler, selfconf, GC
+  stress, inline policy, conformance 528/528 three ways; tsc and tsc-ts
+  under protect, zap and frequent minors, outputs identical; tsc A/B
+  against `s2` neutral (wall 1.0025).
+  Measured for what comes next (`docs/gc_v2_design.md` §6.7): scriptc runs
+  tsc-ts in 18.4 G instructions to garnet's 41.5 G (IPC 4.08 and 4.45);
+  every cell allocated old makes tsc-ts 5.7% faster and the TypeScript
+  compiler 7.9% slower (+55% peak memory: the earlier non-moving gate's
+  finding), and dropping the handle branch of `ts_ptr` on top makes tsc-ts
+  13% faster in all. Proposed next: allocation-site pretenuring by survival.
