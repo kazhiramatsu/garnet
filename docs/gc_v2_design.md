@@ -817,6 +817,35 @@ loses the compiler its nursery) or the handles kept (G3), is estimated to
 gain on both. Allocation-site pretenuring stays an option on top (tsc-ts
 loses 5.7% to copying cells that survive). Decision pending (Kaz).
 
+## 6.8 Y2-D plan (Session 351, Kaz: go): the non-moving heap with direct references
+
+§6.7 reopens Y2 as one change: the gain is in the references, so the
+non-moving heap is gated together with them, never alone. Slices:
+
+- **D1 — cells in the block heap, handles kept.** G3 as built (§6.2, §6.3:
+  segregated size classes, spinel's model) re-applied to the current
+  runtime: cells allocated in cell blocks of the payload allocator's size
+  classes, sticky marks in the block bitmaps, promotion in place, the
+  nursery, to-space, aging, the unpooled young list and `gc_next` gone, a
+  handle log instead of the nursery sweep. Behavior-invariant; its own
+  commit, measured (expected about +3%, G3's result) but not pushed alone.
+- **D2 — direct references.** G4 of §6: every heap cell boxed by address;
+  `ts_ptr` masks; `ts_same_cell` is equality; the handle table, the log,
+  slot fixups, promoted-cell rewriting and pinning go; identity hashes from
+  addresses; the write barrier reads header bytes (the owner old, the value
+  young) instead of handle entries. Gated with D1 as one A/B against the
+  current build on both programs (estimate: about 6% and 4% faster),
+  plus the milestone (the compiler compiling itself, the selfhost bench),
+  the GC stress gate with zapping, and protect mode.
+- **D3 — 16-byte header** (§4.4) and the layout of §4.5.
+- **D4 — inline allocation** (G6) and the runtime's temporary `malloc`s
+  (argument and environment arrays) into stack buffers or a scratch arena.
+
+Locality (G3's loss) is the risk D2 has to outrun; spinel's allocator
+(runs of free bits, bumped through) is what D1 already does, and its
+remaining ideas (two young epochs instead of one bitmap pass, chunk
+ownership) are D1 follow-ups if the A/B asks for them.
+
 ## 7. Verification
 
 - Gates of every slice: unit, parity (`scripts/emitc_diff.sh`), bundler,
