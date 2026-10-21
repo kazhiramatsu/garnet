@@ -781,19 +781,41 @@ outputs identical), six interleaved rounds:
 |---|---|---|---|
 | current | 1 | 41.5 G | 1 |
 | every cell allocated old (no nursery; references all pointer form) | 0.943 | 38.1 G | 1.079, peak memory +55% |
-| the same, and `ts_ptr` without the handle branch | 0.869 | 35.6 G | (not built) |
+| the same, and `ts_ptr` without the handle branch | 0.869 | 35.6 G | 0.978 (0.906 against the row above) |
 
 The nursery costs tsc-ts 5.7% (copying, promotion, handles, barriers for
 cells that survive anyway) and pays the TypeScript compiler 7.9% (it makes
 much short-lived garbage); the handle branch costs tsc-ts another 7.5% (a
-load the C compiler cannot hoist across calls, and code). This is the
-measurement §6.6.1 asked for before reopening direct references, for one
-workload: what removing the handles would gain is far more than the
-machinery's measured cost (about 0.7%), but only a design that keeps a
-nursery for the compiler's short-lived cells (Y1) or one that sends
-long-lived allocation sites to the old generation (allocation-site
-pretenuring, survival feedback per site) serves both programs. Decision
-pending (Kaz).
+load the C compiler cannot hoist across calls, and code).
+
+Both halves of Y2 measured on both programs (six interleaved rounds each,
+outputs identical):
+
+| | non-moving young cells, handles kept (`TSAOT_GC_NURSERY=0`) | the handle branch gone (every cell old, against every cell old) |
+|---|---|---|
+| TypeScript compiler | wall 1.037 (+0.8% instructions) | wall 0.906 (-4.8% instructions, -9.3% cycles) |
+| tsc-ts | wall 1.040 | wall 0.920 (35.6 G against 38.1 G instructions) |
+
+G3 (§6.3) measured the left column only: the gate kept the handles, so it
+saw the non-moving heap's cost without its gain. Added, the two columns
+estimate Y2 with direct references at about 6% faster on the TypeScript
+compiler and 4% on tsc-ts, and Y2 removes C1's hazard class by
+construction (nothing moves: a reference held in an unscanned C local can
+only outlive its cell, which the roots already prevent). spinel
+(`matz/spinel`, `lib/sp_gc.h`, `lib/sp_slab.c`) is a working example of the
+same design: precise roots in per-function frames on its own shadow stack,
+16 KB chunks per size class with side bitmaps (two young epochs, old, mark,
+finalize, pin), allocation that claims a run of free bits and bumps through
+it, a sweep that computes the dead set from the bitmaps alone, a minor
+collection that never frees old cells, and an owner-side write barrier on
+the header's old and dirty bits.
+
+This is the measurement §6.6.1 asked for before reopening direct
+references: the handles cost both programs far more than the machinery
+(about 0.7%), and Y2 with direct references, unlike every cell old (which
+loses the compiler its nursery) or the handles kept (G3), is estimated to
+gain on both. Allocation-site pretenuring stays an option on top (tsc-ts
+loses 5.7% to copying cells that survive). Decision pending (Kaz).
 
 ## 7. Verification
 
