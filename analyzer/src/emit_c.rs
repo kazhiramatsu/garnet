@@ -343,6 +343,7 @@ fn emit_program_with_string_plans(
     let classes: BTreeMap<u32, &ClassDef> = program.classes.iter().map(|c| (c.id.0, c)).collect();
     set_class_dfs(&program.classes);
     set_closed_receivers(program.closed_receivers.closed);
+    set_method_classes(program);
 
     // Classes whose instances flow into a dynamic enumeration builtin
     // (JSON.stringify / Object.keys|values|entries). Such objects must keep their
@@ -7711,6 +7712,7 @@ fn emit_i64_function(
         None
     };
     let _ = writeln!(s, "{} long long {}({}){{", storage, i64_cname(f), params);
+    s.push_str(&method_this_check(f, &format!("_p{}", f.capture_count)));
     for l in &f.locals {
         if int_local.contains(&l.id.0) {
             let _ = writeln!(s, "  long long d{} = 0;", l.id.0);
@@ -7921,6 +7923,7 @@ fn emit_f64_function(
         None
     };
     let _ = writeln!(s, "{} double {}({}){{", storage, f64_cname(f), params);
+    s.push_str(&method_this_check(f, &format!("_p{}", f.capture_count)));
     for l in &f.locals {
         if int_local.contains(&l.id.0) {
             let _ = writeln!(s, "  long long d{} = 0;", l.id.0);
@@ -8345,9 +8348,11 @@ fn emit_function(
         }
         let storage = if tiny_leaf_direct(f) { "TS_AOT_INLINE" } else { "static" };
         let _ = writeln!(s, "{} {} {}_d({}){{", storage, sig.c_ret(), cname(f), sig.c_params());
+        s.push_str(&method_this_check(f, &format!("_p{}", f.capture_count)));
     } else {
         let _ = writeln!(s, "static tsv {}(tsv* args, int nargs){{", cname(f));
         s.push_str("  (void)nargs;\n");
+        s.push_str(&method_this_check(f, &format!("(nargs > {c} ? args[{c}] : TS_UNDEFINED)", c = f.capture_count)));
     }
     for l in &f.locals {
         if int_local.contains(&l.id.0) {
@@ -9386,24 +9391,41 @@ fn hint_guard(c: u32, field: u32, classes: &BTreeMap<u32, &ClassDef>) -> Option<
     Some(HintGuard::Leaf(d))
 }
 
-fn receiver_guard(obj: &str, hint: &Option<HintGuard>) -> String {
+/// `c`: the class whose struct offset the access uses.
+fn receiver_guard(obj: &str, hint: &Option<HintGuard>, c: u32) -> String {
     match hint {
-        None => typed_slow_guard(obj),
-        Some(HintGuard::Root) => format!("!ts_is_obj({}) || ({})", obj, typed_slow_guard(obj)),
+        None => typed_slow_guard_for(obj, c),
+        Some(HintGuard::Root) => format!("!ts_is_obj({}) || ({})", obj, typed_slow_guard_for(obj, c)),
         Some(HintGuard::Leaf(d)) => format!(
             "!ts_is_obj({o}) || ((ts_object*)ts_ptr({o}))->proto != CLASS_PROTO[{d}] || ({g})",
             o = obj,
             d = d,
             g = typed_slow_guard(obj)
         ),
+        // a class index in the declaring class's interval is a sized,
+        // unrelinked instance of it or a subclass: the flag adds nothing
         Some(HintGuard::Range { lo, span }) => format!(
-            "!ts_is_obj({o}) || (uint32_t)(((ts_object*)ts_ptr({o}))->cls - {lo}u) >= {span}u || ({g})",
+            "!ts_is_obj({o}) || (uint32_t)(((ts_object*)ts_ptr({o}))->cls - {lo}u) >= {span}u",
             o = obj,
             lo = lo,
-            span = span,
-            g = typed_slow_guard(obj)
+            span = span
         ),
     }
+}
+
+/// The flag's test of a struct access through class `c`: once a foreign
+/// receiver can exist, the receiver must be a sized, unrelinked instance of
+/// `c` or a subclass (its class index in `c`'s interval), which a borrowed or
+/// grafted method's `this` of another class is not; without class indices,
+/// a sized instance at all (docs/closed_receivers_design.md, slice 2).
+fn typed_slow_guard_for(obj: &str, c: u32) -> String {
+    if !closed_receivers() && typed_slow_enabled() && class_index_enabled() {
+        let dfs = class_dfs();
+        if let (Some(&i), Some(&span)) = (dfs.index.get(&c), dfs.span.get(&c)) {
+            return format!("(g_typed_slow & TS_TYPED_SLOW_ANY) && ts_typed_outside({}, {}u, {}u)", obj, i + 1, span);
+        }
+    }
+    typed_slow_guard(obj)
 }
 
 /// The foreign-receiver flag guards (docs/foreign_receivers_design.md);
@@ -9437,11 +9459,64 @@ fn closed_receivers() -> bool {
     CLOSED_RECEIVERS.with(|c| c.get())
 }
 
+thread_local! {
+    /// Instance methods and accessors of classes with struct fields: function
+    /// id -> class id (`method_this_check`).
+    static METHOD_CLASS: std::cell::RefCell<BTreeMap<u32, u32>> = std::cell::RefCell::new(BTreeMap::new());
+}
+
+fn set_method_classes(program: &Program) {
+    let classes: BTreeMap<u32, &ClassDef> = program.classes.iter().map(|c| (c.id.0, c)).collect();
+    let mut m = BTreeMap::new();
+    for c in &program.classes {
+        let mut sized = false;
+        let mut cur = Some(c.id.0);
+        while let Some(id) = cur {
+            let Some(cd) = classes.get(&id) else { break };
+            if !cd.own_fields.is_empty() {
+                sized = true;
+                break;
+            }
+            cur = cd.parent.map(|p| p.0);
+        }
+        if sized {
+            for meth in &c.own_methods {
+                m.insert(meth.func.0, c.id.0);
+            }
+        }
+    }
+    METHOD_CLASS.with(|x| *x.borrow_mut() = m);
+}
+
+/// A class method's entry in an open program (docs/closed_receivers_design.md,
+/// slice 2): once a method may run with a foreign `this` (TS_TYPED_SLOW_THIS
+/// alone), a receiver outside the method's class interval raises ANY, so the
+/// typed accesses it reaches (`this`'s, and those it is passed on to) test
+/// their receivers from then on. `this` is the C expression of the receiver.
+fn method_this_check(f: &Function, this: &str) -> String {
+    if closed_receivers() || !typed_slow_enabled() || !class_index_enabled() || !f.takes_this {
+        return String::new();
+    }
+    let Some(c) = METHOD_CLASS.with(|m| m.borrow().get(&f.id.0).copied()) else {
+        return String::new();
+    };
+    let dfs = class_dfs();
+    let (Some(&i), Some(&span)) = (dfs.index.get(&c), dfs.span.get(&c)) else {
+        return String::new();
+    };
+    format!(
+        "  if (TS_RT_UNLIKELY(g_typed_slow == TS_TYPED_SLOW_THIS) && ts_typed_outside({}, {}u, {}u)) ts_foreign_this_seen();\n",
+        this,
+        i + 1,
+        span
+    )
+}
+
 fn typed_slow_guard(obj: &str) -> String {
     if closed_receivers() {
         "0".to_string()
     } else if typed_slow_enabled() {
-        format!("g_typed_slow && ts_typed_slow({})", obj)
+        format!("(g_typed_slow & TS_TYPED_SLOW_ANY) && ts_typed_slow({})", obj)
     } else {
         format!("g_has_proxies && ts_is_proxy({})", obj)
     }
@@ -19506,6 +19581,9 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 "symbol.keyFor" => (format!("ts_symbol_key_for({})", v(0)), false),
                 "symbol.toString" => (format!("ts_symbol_tostring({})", v(0)), false),
                 "instanceof" => (format!("ts_bool(ts_instanceof({}, {}))", v(0), v(1)), false),
+                // A class method read as a value (docs/closed_receivers_design.md,
+                // slice 2): it may run with any `this` from here on.
+                "class.methodEscape" => ("(ts_note_method_escape(), TS_UNDEFINED)".to_string(), false),
                 // A class binding that may not be initialized yet: undefined
                 // until its declaration ran (a ReferenceError to read).
                 b if b.starts_with("binding.check:") => (
@@ -19534,7 +19612,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         let span = dfs.span[&cid];
                         (
                             format!(
-                                "ts_bool(ts_is_obj({o}) && ({{ uint32_t _ci = ((ts_object*)ts_ptr({o}))->cls; ((uint32_t)(_ci - 1u) < 0xFFFFFFFEu && !g_class_relinked) ? (uint32_t)(_ci - {lo}u) < {span}u : ts_instanceof({o}, CLASS_PROTO[{c}]); }}))",
+                                "ts_bool(ts_is_obj({o}) && ({{ uint32_t _ci = ((ts_object*)ts_ptr({o}))->cls; ((uint32_t)(_ci - 1u) < 0x7FFFFFFFu && !g_class_relinked) ? (uint32_t)(_ci - {lo}u) < {span}u : ts_instanceof({o}, CLASS_PROTO[{c}]); }}))",
                                 o = o,
                                 c = c,
                                 lo = lo,
@@ -20352,9 +20430,11 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     // method's this) routes `this.field` through ts_get. The
                     // g_typed_slow gate keeps the direct struct path for every
                     // program that never creates one.
-                    let guard = receiver_guard(&obj_name, &hinted);
-                    // a hinted receiver may be null or undefined: the read throws
-                    let getter = if hinted.is_some() { "ts_get_checked" } else { "ts_get" };
+                    let guard = receiver_guard(&obj_name, &hinted, c);
+                    // a hinted receiver may be null or undefined, and so may a
+                    // method's `this` once it can be called bare: the read throws
+                    // (the frozen emitter's ts_get under TSAOT_TYPED_SLOW=0)
+                    let getter = if hinted.is_some() || typed_slow_enabled() { "ts_get_checked" } else { "ts_get" };
                     let slow = ctx.lazy_linked(&format!("{}({}, {})", getter, obj_name, field.0));
                     if numeric_field(c, field.0, ctx.classes) {
                         let e = format!("(({2}) ? ts_to_num({0}) : {1})", slow, st, guard);
@@ -20566,7 +20646,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     // `this.field = v` through ts_set (see the read above).
                     let obj_name = ctx.vname(obj.0);
                     let slow = ctx.lazy_linked_stmt(&format!("ts_set({}, {}, {})", obj_name, field.0, ctx.val(src.0)));
-                    let _ = writeln!(s, "  if ({}) {{ {} }} else {{", receiver_guard(&obj_name, &hinted), slow);
+                    let _ = writeln!(s, "  if ({}) {{ {} }} else {{", receiver_guard(&obj_name, &hinted, c), slow);
                     let _ = writeln!(s, "    (({}*)ts_ptr({}))->{} = {};", cn, obj_name, off, rhs);
                     if !is_num {
                         let _ = writeln!(s, "    ts_write_barrier({}, {});", obj_name, rhs);

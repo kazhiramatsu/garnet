@@ -3870,11 +3870,20 @@ class Exporter {
     return dst;
   }
 
+  /** A class method read as a value here (class_extract.ts pass 5): note it
+   *  at run time, before the read, so typed accesses test the class interval
+   *  from then on (docs/closed_receivers_design.md, slice 2). */
+  noteMethodEscape(ctx: FnCtx, node: ts.Node): void {
+    // (TSAOT_METHOD_ESCAPES=0: the frozen emitter's IR, without the notes)
+    if (process.env.TSAOT_METHOD_ESCAPES === "0" || !this.classExtractor?.methodEscapes.has(node)) return;
+    ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "class.methodEscape", args: [] });
+  }
   lowerExpr(ctx: FnCtx, node: ts.Expression, hint?: string): number {
     // Optional-chaining: a guard receiver whose value was already computed once
     // returns its memoized local (no re-evaluation, preserving side effects).
     const bound = this.optChainBound.get(node);
     if (bound !== undefined) return bound;
+    this.noteMethodEscape(ctx, node);
     if (ts.isTaggedTemplateExpression(node)) return this.lowerTaggedTemplate(ctx, node);
     const jcv = this.constJsonNumberValue(node);
     if (jcv !== undefined && jcv.usedJson && Number.isFinite(jcv.value)) {
@@ -10080,6 +10089,7 @@ class Exporter {
     if (ts.isObjectBindingPattern(pat)) {
       const boundKeys: string[] = [];
       for (const el of pat.elements) {
+        this.noteMethodEscape(ctx, el);
         if (el.dotDotDotToken) {
           // rest: {a, ...others} -> others = copy of src minus already-bound keys.
           const restObj = this.newLocal(ctx, "reference");

@@ -447,6 +447,11 @@ typedef struct ts_obj_common {
    (setPrototypeOf on a class prototype) is what can change an instance's
    chain (g_class_relinked). */
 #define TS_CLS_PROTO 0xFFFFFFFFu
+/* Set on a sized instance's class index word by a user-level prototype
+   change (docs/closed_receivers_design.md, slice 2): the word stays its
+   allocation class, so its layout is still found from it, but it falls out
+   of every interval (instanceof, field guards, dispatch tables). */
+#define TS_CLS_RELINKED 0x80000000u
 /* ts_object is exactly the common header (plain object / class-instance prefix). */
 typedef struct ts_obj_common ts_object;
 static inline uint32_t ts_obj_shape_id(const ts_object* o){ return o->shape & TS_SHAPE_MAX; }
@@ -478,12 +483,36 @@ static inline int ts_obj_is_sized(const ts_object* o){
    where such a receiver can arise, gates the test so a program that never does
    any of that keeps one predictable branch (docs/foreign_receivers_design.md). */
 extern int g_typed_slow;
+/* g_typed_slow's bits (docs/closed_receivers_design.md, slice 2): ANY, a
+   foreign receiver may reach any typed access (a Proxy, a relink, a
+   converted instance), which then tests it; THIS, a class method may run
+   with a foreign `this` (one was read as a value or borrowed), which the
+   method's entry tests, raising ANY when one arrives. */
+#define TS_TYPED_SLOW_ANY 1
+#define TS_TYPED_SLOW_THIS 2
+void ts_foreign_this_seen(void);
 /* Set by a program the exporter proved to have closed receivers
    (docs/closed_receivers_design.md): its typed accesses do not test
    g_typed_slow, so raising it there stops the program instead. */
 extern int g_closed_receivers;
 static inline int ts_typed_slow(tsv v){
   return !ts_is_obj(v) || !ts_obj_is_sized((const ts_object*)ts_ptr(v));
+}
+/* A receiver outside the class interval [lo, lo + span) of a typed access
+   (the class index words of the access's class and its subclasses): not a
+   sized instance of them as allocated and never relinked. Once g_typed_slow
+   is up, typed accesses test this instead of the layout alone, so a sized
+   instance of another class (a borrowed or grafted method's `this`) takes
+   the generic path too. */
+static inline int ts_typed_outside(tsv v, uint32_t lo, uint32_t span){
+  return !ts_is_obj(v) || (uint32_t)(((const ts_object*)ts_ptr(v))->cls - lo) >= span;
+}
+/* A class method read as a value (not called): it may run with any `this`
+   from here on (docs/closed_receivers_design.md, slice 2). In line: a site
+   in a loop costs a load and a branch once the flag is up. */
+void ts_note_method_escape_slow(void);
+static inline void ts_note_method_escape(void){
+  if (TS_RT_UNLIKELY(!(g_typed_slow & TS_TYPED_SLOW_THIS))) ts_note_method_escape_slow();
 }
 
 enum {

@@ -1451,14 +1451,22 @@ int g_closed_receivers = 0;
 /* A foreign receiver can arise from here on. A closed program's typed
    accesses do not test the flag: the exporter's proof missed a route to this
    point, so stop loudly rather than read struct offsets of the wrong cell. */
-static void typed_slow_raise(const char* what){
-  if (g_closed_receivers){
-    fprintf(stderr, "garnet: internal error: %s in a program compiled with closed receivers "
-                    "(docs/closed_receivers_design.md); recompile with TSAOT_CLOSED_RECEIVERS=0\n", what);
-    abort();
-  }
-  g_typed_slow = 1;
+static void typed_slow_stop(const char* what){
+  fprintf(stderr, "garnet: internal error: %s in a program compiled with closed receivers "
+                  "(docs/closed_receivers_design.md); recompile with TSAOT_CLOSED_RECEIVERS=0\n", what);
+  abort();
 }
+static void typed_slow_raise(const char* what){
+  if (g_closed_receivers) typed_slow_stop(what);
+  g_typed_slow |= TS_TYPED_SLOW_ANY;
+}
+/* A class method may run with a foreign `this` from here on: its entry
+   tests the receiver (ts_foreign_this_seen raises ANY when one arrives). */
+static void typed_this_raise(const char* what){
+  if (g_closed_receivers) typed_slow_stop(what);
+  g_typed_slow |= TS_TYPED_SLOW_THIS;
+}
+void ts_foreign_this_seen(void){ typed_slow_raise("a class method ran with a foreign this"); }
 static void typed_slow_check_relink(tsv obj, tsv proto);
 static void typed_slow_check_borrow(tsv fn, tsv thisArg);
 static void struct_methods_collect(tsv proto);
@@ -1552,18 +1560,30 @@ static void obj_link_fresh_proto(tsv obj, tsv proto){
 int g_class_relinked = 0;
 static const uint32_t* g_class_index_tab = NULL;
 static uint32_t g_class_index_n = 0;
-void ts_register_class_indices(const uint32_t* tab, uint32_t n){ g_class_index_tab = tab; g_class_index_n = n; }
+/* class index word (index + 1) -> class id, for a relinked instance's layout */
+static uint32_t* g_class_of_word = NULL;
+static uint32_t g_class_of_word_n = 0;
+void ts_register_class_indices(const uint32_t* tab, uint32_t n){
+  g_class_index_tab = tab; g_class_index_n = n;
+  uint32_t top = 0;
+  for (uint32_t c = 0; c < n; c++) if (tab[c] > top) top = tab[c];
+  free(g_class_of_word);
+  g_class_of_word = (uint32_t*)calloc((size_t)top + 1u, sizeof(uint32_t));
+  g_class_of_word_n = top + 1u;
+  for (uint32_t c = 0; c < n; c++) if (tab[c]) g_class_of_word[tab[c]] = c + 1u;
+}
 tsv ts_set_proto_user(tsv obj, tsv proto){
   /* A sized instance relinked leaves its class's interval; a class's
      prototype relinked changes its instances' chains
      (docs/class_index_dispatch_design.md); other objects concern nobody. */
   if (ts_is_obj(obj)){
     ts_object* o = (ts_object*)ts_ptr(obj);
+    if (o->proto == proto) return obj;   /* no change of chain */
     if (o->cls == TS_CLS_PROTO) g_class_relinked = 1;
-    else if (o->cls) o->cls = 0;
+    else if (o->cls) o->cls |= TS_CLS_RELINKED;
   }
   tsv r = ts_set_proto(obj, proto);
-  if (!g_typed_slow && !(g_has_proxies && ts_is_proxy(obj))) typed_slow_check_relink(obj, proto);
+  if (!(g_typed_slow & TS_TYPED_SLOW_ANY) && !(g_has_proxies && ts_is_proxy(obj))) typed_slow_check_relink(obj, proto);
   return r;
 }
 
@@ -2765,7 +2785,7 @@ tsv ts_object_create(tsv proto){
   tsv o = ts_new_proto();                 /* bare object: proto=NULL */
   if (ts_is_propbag(proto)){
     ((ts_object*)ts_ptr(o))->proto = proto;
-    if (!g_typed_slow) typed_slow_check_relink(o, proto);
+    if (!(g_typed_slow & TS_TYPED_SLOW_ANY)) typed_slow_check_relink(o, proto);
   }
   return o;                               /* Object.create(null) keeps proto=NULL */
 }
@@ -10796,35 +10816,42 @@ static int proto_chain_has_struct_class(tsv proto){
    struct fields: borrowing one with a `this` without the layout raises the
    flag. An open-addressing set of code pointers, filled at registration. */
 static void** g_struct_methods;
+static tsv* g_struct_method_home;   /* the prototype each was first found on (a CLASS_PROTO entry) */
 static uint32_t g_struct_methods_cap, g_struct_methods_len;
 static uint32_t struct_method_hash(void* code){
   uint64_t x = (uint64_t)(uintptr_t)code;
   return (uint32_t)((x >> 4) ^ (x >> 20)) * 2654435761u;
 }
-static int struct_method_has(void* code){
-  if (!g_struct_methods_len || !code) return 0;
+/* The prototype a struct method was registered from, TS_UNDEFINED for any
+   other code. */
+static tsv struct_method_home(void* code){
+  if (!g_struct_methods_len || !code) return TS_UNDEFINED;
   uint32_t mask = g_struct_methods_cap - 1u;
   for (uint32_t i = struct_method_hash(code) & mask; g_struct_methods[i]; i = (i + 1u) & mask)
-    if (g_struct_methods[i] == code) return 1;
-  return 0;
+    if (g_struct_methods[i] == code) return g_struct_method_home[i];
+  return TS_UNDEFINED;
 }
-static void struct_method_add(void* code){
+static int struct_method_has(void* code){ return !ts_is_undef(struct_method_home(code)); }
+static void struct_method_add(void* code, tsv home){
   if (!code || struct_method_has(code)) return;
   if ((g_struct_methods_len + 1u) * 4u >= g_struct_methods_cap * 3u){
     uint32_t cap = g_struct_methods_cap ? g_struct_methods_cap * 2u : 64u;
-    void** old = g_struct_methods; uint32_t oldcap = g_struct_methods_cap;
+    void** old = g_struct_methods; tsv* old_home = g_struct_method_home; uint32_t oldcap = g_struct_methods_cap;
     g_struct_methods = (void**)calloc(cap, sizeof(void*));
+    g_struct_method_home = (tsv*)calloc(cap, sizeof(tsv));
     g_struct_methods_cap = cap;
     for (uint32_t i = 0; i < oldcap; i++) if (old[i]){
       uint32_t j = struct_method_hash(old[i]) & (cap - 1u);
       while (g_struct_methods[j]) j = (j + 1u) & (cap - 1u);
       g_struct_methods[j] = old[i];
+      g_struct_method_home[j] = old_home[i];
     }
-    free(old);
+    free(old); free(old_home);
   }
   uint32_t mask = g_struct_methods_cap - 1u, i = struct_method_hash(code) & mask;
   while (g_struct_methods[i]) i = (i + 1u) & mask;
   g_struct_methods[i] = code;
+  g_struct_method_home[i] = home;
   g_struct_methods_len++;
 }
 static uint32_t propbag_len(tsv owner);
@@ -10836,16 +10863,37 @@ static void struct_methods_collect(tsv proto){
     ts_pref pr = propbag_prop(proto, i);
     if (!pref_ok(pr) || pref_is_accessor(pr)) continue;
     tsv v = pref_val(pr);
-    if (ts_is_func(v)) struct_method_add(((ts_func*)ts_ptr(v))->code);
+    if (ts_is_func(v)) struct_method_add(((ts_func*)ts_ptr(v))->code, proto);
   }
 }
+/* An object put behind a class with struct fields: one without the layout,
+   or a sized instance of its own class (its cls word is marked relinked,
+   so the class's methods find it outside their interval). */
 static void typed_slow_check_relink(tsv obj, tsv proto){
-  if (!g_has_class_regs || !ts_is_obj(obj) || !ts_typed_slow(obj)) return;
+  if (!g_has_class_regs || !ts_is_obj(obj)) return;
   if (proto_chain_has_struct_class(proto)) typed_slow_raise("an object relinked behind a class with struct fields");
 }
+static int proto_chain_includes(tsv proto, tsv home){
+  for (int depth = 0; depth < 256 && ts_proto_ref(proto); depth++){
+    if (proto == home || ts_same_cell(proto, home)) return 1;
+    proto = ((ts_object*)ts_ptr(proto))->proto;
+  }
+  return 0;
+}
+/* A struct method called with a `this` that is not a sized, unrelinked
+   instance of its class (one whose chain holds the method's prototype). */
 static void typed_slow_check_borrow(tsv fn, tsv thisArg){
-  if (!g_struct_methods_len || !ts_is_func(fn) || !ts_typed_slow(thisArg)) return;
-  if (struct_method_has(((ts_func*)ts_ptr(fn))->code)) typed_slow_raise("a class method called with a foreign this");
+  if (!g_struct_methods_len || !ts_is_func(fn)) return;
+  tsv home = struct_method_home(((ts_func*)ts_ptr(fn))->code);
+  if (ts_is_undef(home)) return;
+  if (ts_is_obj(thisArg)){
+    ts_object* t = (ts_object*)ts_ptr(thisArg);
+    if (ts_obj_is_sized(t) && !(t->cls & TS_CLS_RELINKED) && proto_chain_includes(t->proto, home)) return;
+  }
+  typed_this_raise("a class method called with a foreign this");
+}
+void ts_note_method_escape_slow(void){
+  typed_this_raise("a class method read as a value");
 }
 static ts_class_reg* class_reg_for_proto(tsv proto){
   if (!ts_proto_ref(proto) || !g_class_reg_index_cap) return NULL;
@@ -10873,24 +10921,35 @@ static ts_class_reg* class_reg_for_proto(tsv proto){
    C.prototype)`, a subclass prototype, an instance of a field-less class —
    stores its values in inline slots, which the size test alone mistook for
    fields (own enumeration listed every key twice, Session 350). */
+/* The prototype whose registered layout a sized instance carries: its own,
+   or for an instance relinked by the program, its allocation class's. */
+static tsv layout_proto_of(const ts_object* o){
+  uint32_t w = o->cls;
+  if (TS_RT_LIKELY(!(w & TS_CLS_RELINKED)) || w == TS_CLS_PROTO) return o->proto;
+  w &= ~TS_CLS_RELINKED;
+  uint32_t c = w < g_class_of_word_n ? g_class_of_word[w] : 0u;
+  return (c && c - 1u < g_class_meta_cap) ? g_class_proto_tab[c - 1u] : o->proto;
+}
 static ts_class_reg* class_reg_for(ts_object* o){
   if (!o || !ts_obj_is_sized(o)) return NULL;
-  ts_class_reg* reg = class_reg_for_proto(o->proto);
+  ts_class_reg* reg = class_reg_for_proto(layout_proto_of(o));
   return reg && o->h.size >= reg->min_size ? reg : NULL;
 }
 /* canonical-path bridge (A-2b): is `key` a struct field of o? give offset+numeric. */
 static int class_field_lookup(ts_object* o, ts_key key, size_t* off, int* numeric){
-  if (!o || !ts_obj_is_sized(o) || !ts_proto_ref(o->proto) || !g_class_reg_index_cap) return 0;
+  if (!o || !ts_obj_is_sized(o) || !g_class_reg_index_cap) return 0;
+  tsv lp = layout_proto_of(o);
+  if (!ts_proto_ref(lp)) return 0;
   RT_STAT_INC(class_field_calls);
-  uint32_t slot = (class_proto_hash(o->proto) ^ prop_key_hash(key)) & (TS_CLASS_FIELD_CACHE_SIZE - 1u);
+  uint32_t slot = (class_proto_hash(lp) ^ prop_key_hash(key)) & (TS_CLASS_FIELD_CACHE_SIZE - 1u);
   ts_class_field_cache_entry* cache = &g_class_field_cache[slot];
-  if (cache->epoch == g_ts_class_layout_epoch && cache->proto == o->proto && cache->key == key){
+  if (cache->epoch == g_ts_class_layout_epoch && cache->proto == lp && cache->key == key){
     RT_STAT_INC(class_field_hits);
     if (!cache->found || o->h.size < cache->min_size) return 0;
     *off = cache->offset; *numeric = cache->numeric; return 1;
   }
-  ts_class_reg* reg = class_reg_for_proto(o->proto);
-  cache->proto = o->proto; cache->key = key; cache->epoch = g_ts_class_layout_epoch;
+  ts_class_reg* reg = class_reg_for_proto(lp);
+  cache->proto = lp; cache->key = key; cache->epoch = g_ts_class_layout_epoch;
   cache->found = 0;
   if (!reg) return 0;
   cache->min_size = reg->min_size;
@@ -12435,7 +12494,8 @@ int ts_delete_prop_strict(tsv obj, ts_key key){
   }
   int nonconf = 0;
   if (ts_obj_integrity(o) & (1u|4u)) {        /* frozen / sealed => all own props non-configurable */
-    if (pref_ok(prop_find(o, key))) nonconf = 1;
+    /* (a class instance's struct fields are own properties too) */
+    if (pref_ok(prop_find(o, key)) || (g_has_class_regs && class_has_field(o, key))) nonconf = 1;
   } else {
     ts_pref p = prop_find(o, key);
     if (pref_ok(p) && !pref_is_configurable(p)) nonconf = 1;
@@ -12473,6 +12533,49 @@ tsv ts_delete_dynamic_strict(tsv obj, tsv keyv, const uint32_t* method_pairs, ui
 /* Delete own property `key` of a property-map holder (an object, a
    function's map, a class's static container): 1 deleted or absent, 0
    refused (non-configurable, sealed or frozen). */
+/* A sized class instance becomes a plain object behind the same prototype
+   (a delete of one of its struct fields; docs/closed_receivers_design.md,
+   slice 2): its fields in declaration order, then its own properties in
+   order, become the entries of a property dictionary; the struct area turns
+   into the in-object slots of a plain cell of the same size (a dictionary
+   never reads them); its class index word leaves every interval, and the
+   typed accesses' flag goes up. 0 when the cell cannot be described as a
+   plain object (more struct area than in-object slots can cover). */
+static int obj_abandon_layout(tsv obj){
+  ts_object* o = (ts_object*)ts_ptr(obj);
+  ts_class_reg* reg = class_reg_for(o);
+  size_t area = o->h.size - sizeof(ts_object);
+  if (!reg || area % sizeof(tsv) != 0 || area / sizeof(tsv) > TS_INLINE_SLOTS_MAX) return 0;
+  uint32_t nf = (uint32_t)reg->nfields, ne = o->len, n = nf + ne;
+  ts_gc_root(&obj);
+  ts_prop* d = n ? (ts_prop*)gc_owned_alloc(&o->h, sizeof(ts_prop) * (n < 4u ? 4u : n)) : NULL;
+  o = (ts_object*)ts_ptr(obj);
+  reg = class_reg_for(o);
+  for (uint32_t i = 0; i < nf; i++){
+    d[i].key = reg->fields[i].name_id;
+    d[i].val = struct_field_get(o, reg->fields[i].offset, reg->fields[i].numeric);
+    d[i].flags = TS_PROP_WRITABLE | TS_PROP_ENUMERABLE | TS_PROP_CONFIGURABLE;
+  }
+  for (uint32_t j = 0; j < ne; j++){
+    d[nf + j].key = obj_key_at(o, j);
+    d[nf + j].val = *obj_val_at(o, j);
+    d[nf + j].flags = obj_flags_at(o, j);
+  }
+  if (o->props && o->cap) gc_owned_free(o->props);
+  if (o->prop_index) gc_owned_free(o->prop_index);
+  tsv* slots = (tsv*)((char*)o + sizeof(ts_object));
+  for (size_t i = 0; i < area / sizeof(tsv); i++) slots[i] = TS_UNDEFINED;
+  o->h.inline_cap = (uint8_t)(area / sizeof(tsv));
+  o->props = d; o->len = n; o->cap = n ? (n < 4u ? 4u : n) : 0u; o->prop_index = NULL;
+  ts_obj_set_shape(o, TS_SHAPE_NONE);
+  o->cls = 0;
+  if (o->h.gen == TS_GEN_OLD) o->h.hdr_spare = 0xFF;   /* slots renumbered */
+  if (n >= TS_PROP_INDEX_MIN) prop_index_rebuild(o, n);
+  prop_add_epoch_bump();
+  ts_gc_unroot(1);
+  typed_slow_raise("a class field deleted");
+  return 1;
+}
 static int props_delete_own(ts_object* o, ts_key key){
   if (o->h.gen == TS_GEN_OLD) o->h.hdr_spare = 0xFF;
   if (ts_obj_integrity(o) & (1u|4u)) return 0;   /* frozen / sealed: delete ignored (false) */
@@ -12540,6 +12643,15 @@ int ts_delete_prop(tsv obj, ts_key key){
       if (ts_obj_integrity(o) & (1u|4u)) return 0;
       array_put_hole((ts_array*)ts_ptr(obj), (uint32_t)ix);
       return 1;
+    }
+  }
+  if (g_has_class_regs){
+    size_t off; int numeric;
+    if (class_field_lookup(o, key, &off, &numeric)){
+      if (ts_obj_integrity(o) & (1u|4u)) return 0;     /* sealed or frozen: not configurable */
+      if (!obj_abandon_layout(obj))
+        ts_throw_type_error_msg("Cannot delete a field of this class instance (garnet: its layout is too large to become a plain object)");
+      o = ts_ptr(obj);
     }
   }
   return props_delete_own(o, key);

@@ -868,8 +868,14 @@ export class ClassExtractor {
       const lib = this.libMemberOf(sym);
       if (lib && RELINK.has(lib)) { if (!nullProto(n, lib)) this.openAt(n, lib); return; }
       if (lib && BORROW.has(lib)) {
+        // (a method read directly, `x.m.call(t)`, is pass 5's: it accepts a
+        // `this` of the method's class only)
         const call = callOf(n);
-        if (lib === "Reflect.apply" || !(this.plainFunction(recv) || (call !== undefined && this.sizedThis(call.arguments[0])))) {
+        let r: ts.Expression = recv;
+        while (ts.isParenthesizedExpression(r)) r = r.expression;
+        const direct = (ts.isPropertyAccessExpression(r) || ts.isElementAccessExpression(r)) &&
+          this.methodClassOf(ts.isPropertyAccessExpression(r) ? checker.getSymbolAtLocation(r.name) : undefined) !== undefined;
+        if (lib === "Reflect.apply" || (!direct && !(this.plainFunction(recv) || (call !== undefined && this.sizedThis(call.arguments[0]))))) {
           this.openAt(n, lib);
         }
         return;
@@ -944,6 +950,149 @@ export class ClassExtractor {
           }
         }
       } catch { this.openAt(n, "a site the checker could not resolve"); }
+      n.forEachChild(visit);
+    };
+    visit(sf);
+  }
+
+  // ----- pass 5: method values (docs/closed_receivers_design.md, slice 2) -----
+  // A class method's typed `this` accesses assume an instance of its class.
+  // A method read as a value can run with any `this` (grafted onto another
+  // object, borrowed, called bare): each such site is noted at run time
+  // (`class.methodEscape` raises the flag, so typed accesses test the class
+  // interval from then on) and opens the program's receivers. Not a value:
+  // a call (`x.m()`), `typeof x.m`, a borrow with a `this` of the method's
+  // class (`x.m.call(t)`, `x.m.bind(t)`, an iteration method's thisArg),
+  // which the runtime's borrow check accepts.
+  readonly methodEscapes = new Set<ts.Node>();
+  private escapeCounts = new Map<string, number>();
+  private escapeAt(n: ts.Node, what: string): void {
+    this.methodEscapes.add(n);
+    this.openAt(n, what);
+    this.escapeCounts.set(what, (this.escapeCounts.get(what) ?? 0) + 1);
+  }
+  /** The user class declaring an instance method symbol, if it is one. */
+  private methodClassOf(sym: ts.Symbol | undefined): number | undefined {
+    if (!sym || !(sym.flags & ts.SymbolFlags.Method)) return undefined;
+    const d = sym.valueDeclaration ?? sym.declarations?.[0];
+    if (!d || !ts.isMethodDeclaration(d) || !d.parent || !ts.isClassLike(d.parent)) return undefined;
+    if (d.modifiers?.some((m) => m.kind === ts.SyntaxKind.StaticKeyword)) return undefined;
+    return this.byNode.get(d.parent);
+  }
+  /** `t` is an instance of class `c` or a subclass of it (a sized, stable
+   *  class: the runtime's borrow check accepts such a `this`). */
+  private relatedThis(c: number, t: ts.Expression | undefined): boolean {
+    if (!t || !this.sizedThis(t)) return false;
+    const tt = this.checker.getNonNullableType(this.checker.getTypeAtLocation(t));
+    for (let m of tt.isUnion() ? tt.types : [tt]) {
+      if (m.flags & ts.TypeFlags.TypeParameter) m = m.getConstraint() ?? m;
+      const d = this.classIdOfInstanceType(m);
+      if (d === undefined || !(d === c || this.isAncestorClass(c, d))) return false;
+    }
+    return true;
+  }
+  /** Every value of `e`'s type (null and undefined aside) is a record or an
+   *  array: its type has an index signature, which no class instance type
+   *  satisfies, so a `delete` on it cannot reach a class field. */
+  private indexedOnly(e: ts.Expression): boolean {
+    const t = this.checker.getNonNullableType(this.checker.getTypeAtLocation(e));
+    if (this.dynamicType(t)) return false;
+    for (const m of t.isUnion() ? t.types : [t]) {
+      const at = this.checker.getApparentType(m);
+      if (this.classIdOfInstanceType(m) !== undefined) return false;
+      if (!this.checker.getIndexTypeOfType(at, ts.IndexKind.String) && !this.checker.getIndexTypeOfType(at, ts.IndexKind.Number)) return false;
+    }
+    return true;
+  }
+  private scanMethodEscapes(sf: ts.SourceFile): void {
+    const checker = this.checker;
+    const methodNames = new Set<string>();
+    for (const c of this.classes) for (const m of c.ownMethods) if (m.kind === "method") methodNames.add(m.name);
+    const callee = (n: ts.Node): boolean => !!n.parent && ts.isCallExpression(n.parent) && n.parent.expression === n;
+    const maybeInstance = (t: ts.Type): boolean =>
+      this.dynamicType(t) || this.topClasses(checker.getNonNullableType(t)).length > 0;
+    const methodOfAccess = (n: ts.PropertyAccessExpression | ts.ElementAccessExpression): number | undefined => {
+      const sym = ts.isPropertyAccessExpression(n) ? checker.getSymbolAtLocation(n.name)
+        : checker.getPropertyOfType(checker.getApparentType(checker.getTypeAtLocation(n.expression)), (n.argumentExpression as ts.StringLiteral).text);
+      return this.methodClassOf(sym);
+    };
+    // a library call's thisArg for its callbacks (`arr.forEach(cb, t)`)
+    const thisArgOf = (call: ts.CallExpression): ts.Expression | undefined => {
+      const sig = checker.getResolvedSignature(call);
+      const decl = sig?.declaration;
+      if (!sig || !decl || ts.isJSDocSignature(decl) || !this.program.isSourceFileDefaultLibrary(decl.getSourceFile())) return undefined;
+      const i = sig.getParameters().findIndex((p) => p.name === "thisArg");
+      return i >= 0 ? call.arguments[i] : undefined;
+    };
+    const visit = (n: ts.Node): void => {
+      try {
+        if (ts.isPropertyAccessExpression(n) || (ts.isElementAccessExpression(n) && ts.isStringLiteralLike(n.argumentExpression))) {
+          const cls = methodOfAccess(n);
+          if (cls !== undefined && !callee(n)) {
+            const p = n.parent;
+            if (p && ts.isPropertyAccessExpression(p) && ["call", "apply", "bind"].includes(p.name.text) && callee(p)) {
+              if (!this.relatedThis(cls, (p.parent as ts.CallExpression).arguments[0])) this.escapeAt(n, "a method borrowed with another this");
+            } else if (p && ts.isCallExpression(p) && p.arguments.includes(n as ts.Expression)) {
+              if (!this.relatedThis(cls, thisArgOf(p))) this.escapeAt(n, "a method passed as a value");
+            } else if (!(p && ts.isTypeOfExpression(p))) {
+              this.escapeAt(n, "a method read as a value");
+            }
+          } else if (cls === undefined && ts.isPropertyAccessExpression(n) && !callee(n) && methodNames.has(n.name.text) &&
+                     this.dynamicType(checker.getTypeAtLocation(n.expression)) && !(n.parent && ts.isTypeOfExpression(n.parent))) {
+            this.escapeAt(n, "a method name read from an any value");
+          }
+        }
+        if (ts.isElementAccessExpression(n) && !ts.isStringLiteralLike(n.argumentExpression) && !ts.isNumericLiteral(n.argumentExpression) &&
+            !callee(n) && maybeInstance(checker.getTypeAtLocation(n.expression))) {
+          this.escapeAt(n, "a computed key on a class instance");
+        }
+        if (ts.isBindingElement(n) && n.parent && ts.isObjectBindingPattern(n.parent) && !n.dotDotDotToken) {
+          const src = checker.getTypeAtLocation(n.parent);
+          const key = n.propertyName ?? n.name;
+          if (ts.isComputedPropertyName(key)) {
+            if (maybeInstance(src)) this.escapeAt(n, "a computed key in a pattern");
+          } else if (ts.isIdentifier(key) || ts.isStringLiteral(key)) {
+            const p = checker.getPropertyOfType(checker.getApparentType(src), key.text);
+            if (this.methodClassOf(p) !== undefined || (this.dynamicType(src) && methodNames.has(key.text))) this.escapeAt(n, "a method taken by a pattern");
+          }
+        }
+        if (ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isObjectLiteralExpression(n.left)) {
+          const src = checker.getTypeAtLocation(n.right);
+          for (const pr of n.left.properties) {
+            const nm = pr.name;
+            const name = nm && (ts.isIdentifier(nm) || ts.isStringLiteral(nm)) ? nm.text : undefined;
+            const p = name !== undefined ? checker.getPropertyOfType(checker.getApparentType(src), name) : undefined;
+            if ((nm && ts.isComputedPropertyName(nm) && maybeInstance(src)) || this.methodClassOf(p) !== undefined ||
+                (name !== undefined && this.dynamicType(src) && methodNames.has(name))) {
+              this.escapeAt(n, "a method taken by a destructuring assignment");
+              break;
+            }
+          }
+        }
+        // `delete` of a class field turns the instance into a plain object
+        // and raises the flag: on a value that may be a class instance (one
+        // whose type has no index signature), it opens the program
+        if (ts.isDeleteExpression(n)) {
+          let e: ts.Expression = n.expression;
+          while (ts.isParenthesizedExpression(e)) e = e.expression;
+          if ((ts.isPropertyAccessExpression(e) || ts.isElementAccessExpression(e)) && !this.indexedOnly(e.expression)) {
+            this.openAt(n, "delete of a property of a value that may be a class instance");
+          }
+        }
+        if (ts.isCallExpression(n) && ts.isPropertyAccessExpression(n.expression) &&
+            this.libMemberOf(checker.getSymbolAtLocation(n.expression.name)) === "Reflect.deleteProperty" &&
+            !(n.arguments[0] !== undefined && this.indexedOnly(n.arguments[0]))) {
+          this.openAt(n, "Reflect.deleteProperty of a value that may be a class instance");
+        }
+        if (ts.isCallExpression(n) && ts.isPropertyAccessExpression(n.expression)) {
+          const lib = this.libMemberOf(checker.getSymbolAtLocation(n.expression.name));
+          if ((lib === "ObjectConstructor.getOwnPropertyDescriptor" || lib === "ObjectConstructor.getOwnPropertyDescriptors" ||
+               lib === "Reflect.get" || lib === "Reflect.getOwnPropertyDescriptor") &&
+              n.arguments[0] !== undefined && maybeInstance(checker.getTypeAtLocation(n.arguments[0]))) {
+            this.escapeAt(n, `${lib} of a class instance`);
+          }
+        }
+      } catch { this.escapeAt(n, "a site the checker could not resolve"); }
       n.forEachChild(visit);
     };
     visit(sf);
@@ -1046,6 +1195,10 @@ export class ClassExtractor {
     for (const sf of sfs) this.scanStructuralFlows(sf);
     this.closeStructuralFlows();
     for (const sf of sfs) this.scanClosedReceivers(sf);
+    for (const sf of sfs) this.scanMethodEscapes(sf);
+    if (process.env.TSAOT_ESCAPE_LOG === "1") {
+      for (const [k, v] of this.escapeCounts) process.stderr.write(`[escape] ${v} ${k}\n`);
+    }
     const closedReceivers = { closed: this.openCount === 0, reasons: this.openReasons, count: this.openCount };
     if (process.env.TSAOT_CLOSED_LOG === "1") {
       process.stderr.write(`[closed] receivers ${closedReceivers.closed ? "closed" : `open (${this.openCount} sites)`}\n`);

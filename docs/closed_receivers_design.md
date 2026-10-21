@@ -133,6 +133,39 @@ And one loud gap: `{ __proto__: P }` in a literal makes an own property
      method value leaving a call position (except as an iteration method's
      callback or a `bind` with a `this` of the method's class) and `delete`
      on a value that can be a class instance open the program.
+   As built: `ts_typed_outside(x, lo, span)` is the flag's test of a
+   struct access through a class with an interval (the analysis class's),
+   and a Range guard drops the flag's term (an index in the interval is a
+   sized, unrelinked instance); a relink marks the instance's word
+   (`TS_CLS_RELINKED`) instead of clearing it, so the generic paths find its
+   layout from its allocation class (`layout_proto_of`) and `instanceof`
+   walks its chain; a struct method's prototype is kept with its code, and a
+   borrow raises unless `this` is a sized, unrelinked instance whose chain
+   holds it; `delete` of a struct field converts the instance
+   (`obj_abandon_layout`: its fields and own properties into a property
+   dictionary, the struct area into in-object slots, a TypeError for a
+   frozen or sealed instance in strict code as V8 throws); a method read as a
+   value is noted in line (`class.methodEscape`, a load and a branch once the
+   flag is up), as is a computed key or a method name read on a value that
+   may be a class instance, a method taken by a pattern and a descriptor read
+   off one. The structural reads' slow path is `ts_get_checked`, so a method
+   called bare throws V8's TypeError reading its `this`.
+   The flag has two bits: ANY (a Proxy, a relink, a converted instance:
+   typed accesses test their receivers) and THIS (a method read as a value,
+   a borrow: a foreign `this` may arrive). THIS alone costs the typed
+   accesses nothing; a struct method's entry tests its `this` against its
+   class interval while THIS alone is up, and raises ANY when a foreign one
+   arrives, so the accesses it reaches (its own and those `this` is passed
+   on to) test from then on. The first version raised one flag for both:
+   the TypeScript compiler (open) reads a method as a value early and every
+   typed access took the interval test, 1.5% slower; with the bits, THIS
+   rises, ANY never, and the A/B is neutral (wall 1.0011, 0.45% more
+   instructions: 32 method entries and the notes). The closed pass
+   opens a program on each such site and on a `delete` or
+   `Reflect.deleteProperty` on a value whose type has no index signature;
+   tsc-ts has none of them (still closed); the TypeScript 6.0.3 compiler has
+   33 (it was open already). Fixtures `classes/grafted_methods` and
+   `classes/deleted_fields`; 43 verdict tests.
 3. Object tests that do not merge back: in a closed program a non-object
    in a stable class's position can only be `null` or `undefined` (any
    other value needs an `any` flow or a cast, which the structural pass

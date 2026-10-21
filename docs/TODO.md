@@ -7694,3 +7694,41 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   3.257 s, 1.064 s (garnet 1.47x node); checking only 1.546 s, 2.356 s,
   0.666 s (1.52x). Later: JSON's speed (a class's layout looked up per
   field, `toJSON` per value, keys quoted every time).
+- Closed receivers, slice 2 (`docs/closed_receivers_design.md`): a class
+  method that runs with a `this` of another class, and deleted class
+  fields, in open programs. Found while measuring slice 1 (silent wrong
+  values): a method grafted onto an instance of another class (`d.m =
+  C.prototype.m; d.m()`) read C's struct offsets in a D (V8 `undefined`,
+  garnet `NaN`), because the flag's test of a typed access checked only the
+  sized layout; a method called bare read its `this` without the TypeError;
+  a sized instance relinked behind another class's prototype was read at
+  the new prototype's offsets by the generic paths; `delete` of a class
+  field did nothing (`in`, keys and JSON kept it) and a frozen or sealed
+  instance's `delete` returned false in strict code (V8 throws). Now: once
+  the flag is up, a struct access through a class with an interval tests
+  the receiver's class index (`ts_typed_outside`), and a Range guard drops
+  the flag's term; a relink marks the instance's word (`TS_CLS_RELINKED`)
+  so its layout comes from its allocation class and `instanceof` walks the
+  chain; a borrow raises the flag unless `this` is a sized, unrelinked
+  instance whose chain holds the method's prototype; `delete` of a struct
+  field turns the instance into a plain object (its fields and own
+  properties into a dictionary, in order); a method read as a value is
+  noted in line where it happens (`class.methodEscape`; also a computed key
+  or a method name read on a value that may be an instance, a pattern, a
+  descriptor); the structural reads' slow path throws for a null or
+  undefined receiver. The closed pass opens a program on those sites and on
+  a `delete` that can reach a class field; tsc-ts has none (still closed),
+  the TypeScript compiler 33 (open already). Fixtures
+  `classes/grafted_methods`, `classes/deleted_fields`; 43 verdict tests. The flag splits in
+  two bits: ANY (what the typed accesses test: a Proxy, a relink, a
+  converted instance) and THIS (a method read as a value or borrowed),
+  which a struct method's entry tests against its class interval, raising
+  ANY when a foreign `this` arrives: the first, one-flag version made the
+  TypeScript compiler (open, a method read as a value early in its run)
+  1.5% slower; now it is not (A/B against `ly`, sixteen pairs: wall 0.9925,
+  cycles 0.9940, instructions 1.0044: the notes and 32 method entries cost
+  instructions, the Range guards without the flag's term saved more).
+  Gates: unit, parity (376 identical), bundler 43/43, selfconf, GC stress,
+  inline policy, conformance 528/528, 528/528 strict, 528/528 at every
+  allocation; tsc rebuilt (`native_s350s2`) and tsc-ts (closed, its C as
+  before) under protect, zap and frequent minors, outputs identical.
