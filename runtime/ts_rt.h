@@ -136,7 +136,13 @@ int ts_truthy(tsv v);
 /* OBJECT and ARRAY are adjacent: both carry shaped named properties, and the
    property caches admit a receiver with one compare (`kind <= TS_KIND_ARRAY`;
    docs/shaped_array_props_design.md). */
-enum { TS_KIND_OBJECT = 1, TS_KIND_ARRAY = 2, TS_KIND_STRING = 3, TS_KIND_FUNC = 4, TS_KIND_MAP = 5, TS_KIND_SET = 6, TS_KIND_PROMISE = 7, TS_KIND_CORO = 8, TS_KIND_ACCESSOR = 9, TS_KIND_SYMBOL = 10, TS_KIND_PROXY = 11 };
+/* The kinds below TS_KIND_PROMISE carry the common header and are ordinary
+   prototype-chain links; ArrayBuffer and the typed array views
+   (docs/typed_arrays_design.md) sit among them. */
+enum { TS_KIND_OBJECT = 1, TS_KIND_ARRAY = 2, TS_KIND_STRING = 3, TS_KIND_FUNC = 4, TS_KIND_MAP = 5, TS_KIND_SET = 6,
+       TS_KIND_ARRAYBUFFER = 7, TS_KIND_TYPEDARRAY = 8,
+       TS_KIND_PROMISE = 9, TS_KIND_CORO = 10, TS_KIND_ACCESSOR = 11, TS_KIND_SYMBOL = 12, TS_KIND_PROXY = 13,
+       TS_KIND_LAST = TS_KIND_PROXY };
 typedef struct ts_gc_header {
   uint8_t kind, mark, gen, remembered;
   /* One 32-bit word so positional initializers of static cells (string
@@ -801,7 +807,7 @@ long long ts_str_split_join_metric3(tsv s, tsv sep, tsv join_sep,
 typedef struct ts_array {
   ts_obj_common o;   /* proto + lazily-allocated named-property map (unified model) */
   tsv* data; uint32_t len, cap;   /* element fast path */
-  uint8_t element_kind;          /* 0 ordinary array, 1 fixed Uint16 storage */
+  uint8_t kind_spare;            /* spare (typed arrays are their own kind) */
   /* Minor-GC dirty cards fit in the existing padding before inline_data.
      A zero end means empty; generic writes/reordering request a full scan. */
   uint8_t gc_dirty_all;
@@ -816,8 +822,45 @@ typedef struct ts_array {
 static inline int ts_is_indexed_array_fast(tsv v){
   return ts_is_obj(v) && ((ts_gc_header*)ts_ptr(v))->kind == TS_KIND_ARRAY;
 }
+/* Typed arrays (docs/typed_arrays_design.md): a buffer owns bytes outside the
+   heap; a view points into them and keeps the buffer alive. */
+enum { TS_TA_INT8, TS_TA_UINT8, TS_TA_UINT8C, TS_TA_INT16, TS_TA_UINT16, TS_TA_INT32,
+       TS_TA_UINT32, TS_TA_FLOAT32, TS_TA_FLOAT64, TS_TA_COUNT };
+typedef struct ts_arraybuffer {
+  ts_obj_common o;
+  uint8_t* bytes;
+  uint32_t byte_length;
+  uint8_t shared;
+} ts_arraybuffer;
+typedef struct ts_typedarray {
+  ts_obj_common o;
+  uint8_t* data;            /* bytes + byte_offset of the buffer */
+  uint32_t length, byte_offset;
+  uint8_t elem;             /* TS_TA_* */
+  tsv buffer;
+} ts_typedarray;
+static inline int ts_is_typed_array(tsv v){
+  return ts_is_obj(v) && ((ts_gc_header*)ts_ptr(v))->kind == TS_KIND_TYPEDARRAY;
+}
+/* One test for both kinds (they are adjacent). */
+static inline int ts_kind_is_buffer_or_view(uint8_t kind){
+  return (uint8_t)(kind - TS_KIND_ARRAYBUFFER) <= (uint8_t)(TS_KIND_TYPEDARRAY - TS_KIND_ARRAYBUFFER);
+}
+static inline int ts_is_array_buffer(tsv v){
+  return ts_is_obj(v) && ((ts_gc_header*)ts_ptr(v))->kind == TS_KIND_ARRAYBUFFER;
+}
+tsv  ts_new_typed_array(int elem, tsv* args, int n);
+tsv  ts_new_array_buffer(tsv length, int shared);
+tsv  ts_typed_array_from(int elem, tsv src, tsv mapfn, tsv this_arg);
+tsv  ts_typed_array_of(int elem, tsv* items, int n);
+int  ts_array_buffer_is_view(tsv v);
+tsv  ts_typed_array_proto(int elem);
+tsv  ts_array_buffer_proto(int shared);
+void ts_typed_array_globals(void);
+tsv  ts_ta_get(tsv v, uint32_t i);
+void ts_ta_set(tsv v, uint32_t i, tsv x);
 static inline int ts_is_array_fast(tsv v){
-  return ts_is_indexed_array_fast(v) && ((ts_array*)ts_ptr(v))->element_kind == 0;
+  return ts_is_indexed_array_fast(v);
 }
 /* `x.length` of a value the compiler only knows to be a string, an array or a
    function (GenericLen): a string or a plain array in line, the rest (a
@@ -2112,17 +2155,16 @@ static inline tsv ts_array_get_inline_f64(tsv arr, double d){
   if (TS_RT_LIKELY(ts_num_array_index(d, &i))) return ts_array_get_inline(arr, (int64_t)i);
   return ts_array_get_key_f64(arr, d);
 }
-/* Element store with the dense in-capacity case in line: a plain array (no
-   fixed element kind, not frozen) with i below cap stores the slot, extends
-   the length past holes as ts_array_set does, and remembers the array when
-   it is old (the young-value test and the cards are out of line). Growth,
-   sparse arrays, typed storage, frozen arrays and other receivers take
-   ts_array_set. */
+/* Element store with the dense in-capacity case in line: a plain array (not
+   frozen) with i below cap stores the slot, extends the length past holes as
+   ts_array_set does, and remembers the array when it is old (the young-value
+   test and the cards are out of line). Growth, sparse arrays, frozen arrays
+   and other receivers (typed arrays among them) take ts_array_set. */
 void ts_array_remember(ts_array* a, uint32_t index, tsv value);
 static inline void ts_array_set_inline(tsv arr, int64_t i, tsv v){
   if (ts_is_indexed_array_fast(arr)){
     ts_array* a = (ts_array*)ts_ptr(arr);
-    if (TS_RT_LIKELY((uint64_t)i < a->cap && !a->element_kind && !(ts_obj_integrity(&a->o) & 1u))){
+    if (TS_RT_LIKELY((uint64_t)i < a->cap && !(ts_obj_integrity(&a->o) & 1u))){
       uint32_t u = (uint32_t)i;
       a->data[u] = v;
       if (u >= a->len) a->len = u + 1u;

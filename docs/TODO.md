@@ -7229,3 +7229,55 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   with zapping, and with a minor collection every 256 allocations, its 78
   output files identical. A/B against `ln2`, sixteen ABBA pairs: cycles
   0.9980, instructions 0.9999, wall 0.9915: neutral.
+- Typed arrays, slice TA1 (`docs/typed_arrays_design.md`; first slice of
+  `docs/tsc_ts_native_design.md`): two cell kinds, `ArrayBuffer` /
+  `SharedArrayBuffer` (zeroed bytes outside the heap, freed with the cell)
+  and the views (a raw pointer into the bytes and the buffer, which keeps
+  them alive), for all nine element types. Construction from a length, an
+  array-like or iterable, or a buffer with offset and length, with V8's
+  RangeErrors; element conversion (ToInt8 .. Float32 rounding, Uint8Clamped
+  half-to-even); `length`, `byteLength`, `byteOffset`, `buffer`,
+  `BYTES_PER_ELEMENT`; the methods on `%TypedArray%.prototype` (subarray,
+  slice, set, fill, copyWithin, indexOf, lastIndexOf, includes, join,
+  toString, at, reverse, numeric stable sort, forEach, map, filter, every,
+  some, find, findIndex, reduce, keys, values, entries, `Symbol.iterator`);
+  `T.from`, `T.of`, `ArrayBuffer.isView`, `instanceof`, constructor values
+  with their statics (named as values, they land on the global object; a
+  call throws "requires 'new'", constructing through one throws like the
+  other builtin constructor values); tags, JSON, `console.log` forms,
+  `Object.keys` / descriptors / `in` / `delete` / `defineProperty` /
+  freeze / seal with the integer-indexed rules. `Uint16Array` moves to the
+  new representation and the fixed-kind array paths (`element_kind`) are
+  gone (the byte is spare; array stores lose a test). Silent wrong values
+  fixed on the way: an identifier naming another default-library value
+  (`Uint8Array`, `Intl`, ...) read a local nothing assigns (undefined) and
+  is now read from the global object; `Array.prototype.<method>.call(x)`
+  answered empty results for every receiver that is not an array (views,
+  strings, array-likes): the reading methods now run on the receiver's
+  elements and the mutating ones throw for it (a view's reverse / fill /
+  copyWithin use its own); the rest of an array pattern over a view was
+  empty. Fixtures `stdlib/typed_arrays`, `stdlib/typed_array_methods`,
+  `stdlib/typed_array_reflection`, `gc/typed_array_buffers` (the last
+  three in the GC stress filter); known rows: parity-unported and
+  selfconf-unported for the four (the frozen emitter lacks the builtins),
+  `numbers/uint16_array` and `objects/fresh_proto_links` rows reworded.
+  The buffer bytes pace the collections (the young payload budget and the
+  heap bytes): 1,500 short-lived 1 MB buffers reached 1.58 GB of RSS
+  before the first collection, now 20 MB (node 153 MB). A view's named
+  keys skip the numeric-string parse unless they begin with a digit, `-`,
+  `I` or `N` (every `.length` and method read parsed the name).
+  Gates: unit, parity (366 identical), bundler 42/42, selfconf, GC stress,
+  inline policy, conformance 506/506 and 506/506 with a collection at every
+  allocation in protect mode (unit, GC stress and both conformance runs
+  again after the two runtime fixes); tsc rebuilt (`native_s350ta`) and
+  compiled under protect mode, with zapping, and with a minor collection
+  every 256 allocations, its 78 output files identical. A/B against `fp`,
+  sixteen ABBA pairs: wall 1.0000, instructions 0.9993 (sixteen of
+  sixteen), cycles 1.0006: neutral. Native against node on four typed
+  array kernels (node about 160 ms each): sieve 3.2x, histogram 5.7x,
+  Float64 loops 5.9x, subarray/set/byte loops 8.9x slower, the work of
+  TA2. Follow-ups noted: an array's callback methods do not check the
+  callback before iterating (`[].map(3)` and `[1].reduce(3)` do not throw;
+  V8 does) and say "value is not a function"; `console.log` does not group
+  long numeric arrays into columns as node does, nor print an array's or a
+  view's named properties.

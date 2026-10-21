@@ -56,6 +56,14 @@ type GenericInferencePattern =
  *  fresh-object store sequence; `keys` in slot order (docs/static_slots_design.md). */
 type ProducerLayout = { name: string; type: ts.Type | undefined; keys: string[]; ctor?: ts.Symbol };
 
+/** Typed array constructors and their runtime element types (TS_TA_* in
+ *  runtime/ts_rt.h; docs/typed_arrays_design.md). */
+const TYPED_ARRAY_ELEMS: ReadonlyMap<string, number> = new Map([
+  ["Int8Array", 0], ["Uint8Array", 1], ["Uint8ClampedArray", 2], ["Int16Array", 3], ["Uint16Array", 4],
+  ["Int32Array", 5], ["Uint32Array", 6], ["Float32Array", 7], ["Float64Array", 8],
+]);
+const TYPED_ARRAY_BYTES = [1, 1, 1, 2, 2, 4, 4, 4, 8];
+
 const STRICT_TYPE_OPTION_NAMES: StrictTypeOptionName[] = [
   "noImplicitAny",
   "strictNullChecks",
@@ -4614,11 +4622,6 @@ class Exporter {
     if (ts.isCallExpression(node)) {
       // console.log(x) -> Print
       const fnx = node.expression;
-      if (ts.isPropertyAccessExpression(fnx) && this.typeNameOf(fnx.expression) === "Uint16Array" &&
-          !["join", "toString", "valueOf"].includes(fnx.name.text)) {
-        this.unsupported(node, `Uint16Array method '${fnx.name.text}'`);
-        return this.newLocal(ctx, "reference");
-      }
       if (node.arguments.some(a => ts.isSpreadElement(a)) && ts.isPropertyAccessExpression(fnx)) {
         const receiverKind = this.builtinReceiverKind(fnx.expression);
         if (receiverKind && this.builtinMethodName2(receiverKind, fnx.name.text)) {
@@ -5799,10 +5802,14 @@ class Exporter {
           WeakMap: "weakmap",
           WeakSet: "weakset",
         };
+        const taElem = TYPED_ARRAY_ELEMS.get(node.right.text);
+        if (taElem !== undefined) builtinProtoKinds[node.right.text] = `typedarray:${taElem}`;
+        if (node.right.text === "ArrayBuffer") builtinProtoKinds.ArrayBuffer = "arraybuffer";
+        if (node.right.text === "SharedArrayBuffer") builtinProtoKinds.SharedArrayBuffer = "sharedarraybuffer";
         // The shared prototype object to chain-check against.
         const protoBuiltin =
           ek !== undefined ? `errorproto.${ek}` :
-          builtinProtoKinds[node.right.text] !== undefined
+          Object.prototype.hasOwnProperty.call(builtinProtoKinds, node.right.text)
             ? `protoobj.${builtinProtoKinds[node.right.text]}`
             : undefined;
         if (protoBuiltin !== undefined) {
@@ -6602,8 +6609,17 @@ class Exporter {
     // opcodes + GLOBALS[] infra remain in the IR/runtime for the
     // GlobalEnvironment record (globalThis, host globals) — they just have no
     // producer for module bindings.
+    // Any other value of the default library (`Intl`, `WeakRef`, ...) is a
+    // property of the global object: read it there (undefined when the runtime
+    // does not model it) rather than from a local nothing assigns.
+    if (sym && this.isDefaultLibSymbol(sym)) return this.loadGlobalObjectProperty(ctx, node.text);
     if (sym) return this.ensureLocal(ctx, sym, this.refKindOf(node), node.text);
     return this.newLocal(ctx, this.refKindOf(node), node.text);
+  }
+  /** A symbol declared only in the default library files (lib.*.d.ts). */
+  isDefaultLibSymbol(sym: ts.Symbol): boolean {
+    const decls = sym.declarations;
+    return !!decls && decls.length > 0 && decls.every((d) => this.program.isSourceFileDefaultLibrary(d.getSourceFile()));
   }
 
   /** Lower a class EXPRESSION (`const C = class { ... }`, named or anonymous) to a
@@ -8537,11 +8553,25 @@ class Exporter {
    *  the user-class / class-value paths). Built-in-specific rejects (Date
    *  string/Date arg, Promise without an executor) live here. */
   lowerNewBuiltin(ctx: FnCtx, node: ts.NewExpression, ctorName: string, hint?: string): number | undefined {
-    if (ctorName === "Uint16Array") {
-      const args = this.lowerSequenced(ctx, node.arguments ?? []);
-      if (args.length > 1) this.unsupported(node, "Uint16Array buffer views with offset/length");
+    // Typed arrays and buffers (docs/typed_arrays_design.md): the runtime
+    // constructor takes every argument (a length, an array-like or iterable, or
+    // a buffer with an optional offset and length).
+    const taElem = TYPED_ARRAY_ELEMS.get(ctorName);
+    if (taElem !== undefined || ctorName === "ArrayBuffer" || ctorName === "SharedArrayBuffer") {
+      const argNodes = node.arguments ?? [];
+      if (argNodes.some((a) => ts.isSpreadElement(a))) {
+        this.unsupported(node, `new ${ctorName}(...spread)`);
+        return this.newLocal(ctx, "reference", hint);
+      }
+      // A second ArrayBuffer argument makes a resizable buffer, which is not modeled.
+      if (taElem === undefined && argNodes.length > 1) {
+        this.unsupported(node, `resizable ${ctorName} (an options argument)`);
+        return this.newLocal(ctx, "reference", hint);
+      }
+      const args = this.lowerSequenced(ctx, argNodes);
       const dst = this.newLocal(ctx, "reference", hint);
-      ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "uint16array.new", args });
+      const builtin = taElem !== undefined ? `typedarray.new:${taElem}` : `arraybuffer.new:${ctorName === "ArrayBuffer" ? 0 : 1}`;
+      ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin, args });
       return dst;
     }
     if (ctorName === "RegExp") {
@@ -9104,6 +9134,8 @@ class Exporter {
         // JSON and would corrupt the IR. They fall through (unsupported) for now.
       }
     }
+    const taElem = TYPED_ARRAY_ELEMS.get(ns);
+    if (taElem !== undefined && member === "BYTES_PER_ELEMENT") return TYPED_ARRAY_BYTES[taElem];
     return undefined;
   }
 
@@ -9521,6 +9553,17 @@ class Exporter {
       if (member === "from") return (argc === 1 || argc === 2) ? "array.from" : "__UNSUPPORTED__";
       return "__UNSUPPORTED__";
     }
+    const taElem = TYPED_ARRAY_ELEMS.get(ns);
+    if (taElem !== undefined) {
+      if (member === "of") return `typedarray.of:${taElem}`;           // variadic
+      // T.from(iterable | arrayLike [, mapFn [, thisArg]]).
+      if (member === "from") return (argc >= 1 && argc <= 3) ? `typedarray.from:${taElem}` : "__UNSUPPORTED__";
+      return "__UNSUPPORTED__";
+    }
+    if (ns === "ArrayBuffer") {
+      if (member === "isView") return argc === 1 ? "arraybuffer.isView" : "__UNSUPPORTED__";
+      return "__UNSUPPORTED__";
+    }
     if (ns === "AbortSignal") {
       if (member === "timeout") return argc === 1 ? "abortsignal.timeout" : "__UNSUPPORTED__";
       return undefined;
@@ -9686,7 +9729,6 @@ class Exporter {
       // Structural array/tuple identity takes precedence over the printed
       // element type: Map<K,V>[] starts with "Map<" but is not a Map receiver.
       if (this.checker.isArrayType(t) || this.checker.isTupleType(t)) return "array";
-      if (sym?.name === "Uint16Array") return "array";
       const tn = this.checker.typeToString(t);
       if (sym && sym.name === "Map") return "map";
       if (sym && sym.name === "Set") return "set";
@@ -9854,7 +9896,8 @@ class Exporter {
       case "isFinite":
       case "fetch":
         return name;
-      default: return undefined;
+      default: return TYPED_ARRAY_ELEMS.has(name) || name === "ArrayBuffer" || name === "SharedArrayBuffer"
+        ? name : undefined;
     }
   }
 
@@ -10857,7 +10900,6 @@ class Exporter {
   }
 
   indexAccessKind(node: ts.ElementAccessExpression): "string" | "number" {
-    if (this.typeNameOf(node.expression) === "Uint16Array") return "string";
     // A string-literal index is always a property key.
     if (ts.isStringLiteral(node.argumentExpression)) return "string";
     // The "number" path lowers to LoadIndex/StoreIndex (the array element fast
@@ -10868,6 +10910,10 @@ class Exporter {
     // ToString normalization. So route to "number" only for arrays; otherwise the
     // (possibly numeric) key is a property access — this keeps a[0]/a["0"] unified
     // and a[1.5] correct, matching JS semantics (property keys are strings).
+    // A typed array's index is an element read through the runtime's element
+    // path; any other key is a property key (docs/typed_arrays_design.md).
+    if (this.isTypedArrayReceiver(node.expression))
+      return this.isNumberTypedKey(node.argumentExpression) ? "number" : "string";
     const bk = this.builtinReceiverKind(node.expression);
     // The index path reads its key as a raw number (`(uint32_t)ts_to_num(k)`
     // in the emitted element access), so only a number-typed key may take it.
@@ -10885,6 +10931,19 @@ class Exporter {
       if (t.flags & (F.StringLike | F.String | F.StringLiteral)) return "string";
       return "string";
     } catch { return "string"; }
+  }
+
+  /** A receiver whose static type is an ambient typed array (or a union of
+   *  them, with null / undefined). */
+  isTypedArrayReceiver(e: ts.Expression): boolean {
+    try {
+      const t = this.checker.getNonNullableType(this.checker.getTypeAtLocation(e));
+      const isTa = (m: ts.Type): boolean => {
+        const sym = m.getSymbol();
+        return !!sym && TYPED_ARRAY_ELEMS.has(sym.name) && this.isAmbientGlobalSymbol(sym);
+      };
+      return t.isUnion() ? t.types.every(isTa) : isTa(t);
+    } catch { return false; }
   }
 
   /** A key whose static type is a number (number, a number literal, a
