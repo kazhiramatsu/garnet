@@ -7805,3 +7805,28 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   strict, every allocation under protect mode).
   Milestone: the selfhost bench's own IR byte-identical (also under protect
   mode) and 503/503 corpus fixtures equal to the frozen emitter on node.
+- GC v2 Y2-D, slice D4: the allocator and the young sweep
+  (`docs/gc_v2_design.md` §6.8.3), from a profile of the TypeScript
+  compiler that put a fifth of its time in allocation and collection. D4a:
+  a block's next free run is found a bitmap word at a time (per class, the
+  cell starts as precomputed bitmap words); the refill had walked a block
+  dense with survivors a cell at a time (7% of the run). D4b: a run of free
+  cells is zeroed once when the allocator takes it, not each cell (ASan
+  keeps the per-cell zeroing). D4c: a collection no longer visits the young
+  cells that die: the marker lists the young cells it reaches and they are
+  promoted from the list; only the kinds whose death frees memory outside
+  the heap (ArrayBuffer bytes, promise waiters, coroutine side arrays) and
+  large cells are logged at allocation; the heap byte count is the old
+  cells' bytes plus the cycle's young bytes. The debug modes (zap, protect,
+  ASan, stats, unit tests) visit every dead cell and abort when one owns a
+  malloc'd buffer (a production leak); it caught the Map/Set iterators'
+  insertion-order array, allocated with malloc instead of as a payload of
+  the collection (now a payload). Eight pairs each, outputs identical:
+  D4a tsc-ts 0.987 / the compiler 0.986, D4b 0.989 / 0.989, D4c 0.989 /
+  0.983 (about 3.5% and 4.1% together). Gates for each step: unit, parity,
+  bundler 43/43, selfconf, defaults, GC stress, conformance 529/529 plain
+  and at every allocation under protect mode.
+  Milestone after D4c: the selfhost bench's own IR byte-identical (also
+  under protect mode), 503/503 corpus fixtures equal to the frozen emitter
+  on node; tsc-ts and the compiler under protect mode, protect with a minor
+  every 64 allocations, and zap with one every 16: outputs identical.

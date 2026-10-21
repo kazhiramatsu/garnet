@@ -21,14 +21,16 @@ extern int __asan_address_is_poisoned(const void *addr);
 #endif
 
 /* ---------------- GC heap ---------------- */
-static size_t g_alloc=0, g_young_alloc=0, g_old_alloc=0;
 static size_t g_young_threshold=65536;
 /* Full-GC trigger is LIVE CELL BYTES (gc_moving_plan B-3), not cell count: a
    count misjudges pressure for variable-sized cells (one 500MB inline string
-   is 1 count). g_heap_bytes tracks cell bodies exactly — alloc adds sz, every
-   free subtracts h->size. External payload
-   arrays (props/env/data) are not counted (cell-body granularity). */
+   is 1 count). g_old_bytes counts the old cells' bodies (and ArrayBuffer
+   bytes): a promotion or a pretenured allocation adds, an old death
+   subtracts. g_heap_bytes adds the cycle's young bytes to it and is reset to
+   it by every collection, so a dying young cell needs no visit. External
+   payload arrays (props/env/data) are not counted. */
 static size_t g_heap_bytes = 0;
+static size_t g_old_bytes = 0;
 static size_t g_full_threshold_bytes = (size_t)16u * 1024u * 1024u;
 static int g_full_threshold_forced = 0; /* env override pins the trigger (stress knob) */
 static int g_pretenure_ctors = 1;       /* TSAOT_PRETENURE_CTORS=0: guarded constructions allocate young (docs/pretenured_construction_design.md) */
@@ -346,6 +348,30 @@ static void* gc_payload_alloc(size_t bytes, int old){
    cell's side buffers and the heap accounting need the visit). */
 static ts_gc_header** g_young_log = NULL;
 static size_t g_young_log_len = 0, g_young_log_cap = 0;
+/* The kinds whose death releases memory outside the heap: an ArrayBuffer's
+   bytes, a promise's waiters, a coroutine's side arrays. Only they (and
+   large cells, whose blocks go back) are logged, so the collector visits
+   the young cells that die only for those; every other dead young cell is
+   free because no bit covers it. The debug modes (zap, protect, ASan, the
+   statistics build, the unit tests) log every young cell. */
+#define GC_FINALIZABLE_KINDS ((1u << TS_KIND_ARRAYBUFFER) | (1u << TS_KIND_PROMISE) | (1u << TS_KIND_CORO))
+#if defined(TS_ASAN_ENABLED) || defined(TSAOT_RT_STATS)
+static uint32_t g_young_log_kinds = ~0u;
+#else
+static uint32_t g_young_log_kinds = GC_FINALIZABLE_KINDS;
+#endif
+/* The young cells the marker reached, promoted after marking. */
+static ts_gc_header** g_survivors = NULL;
+static size_t g_survivors_len = 0, g_survivors_cap = 0;
+static inline void gc_survivor_push(ts_gc_header* h){
+  if (TS_RT_UNLIKELY(g_survivors_len == g_survivors_cap)){
+    size_t next = g_survivors_cap ? g_survivors_cap * 2 : 4096;
+    ts_gc_header** grown = (ts_gc_header**)realloc(g_survivors, sizeof(ts_gc_header*) * next);
+    if (!grown) ts_abort_msg("out of memory growing the survivor list");
+    g_survivors = grown; g_survivors_cap = next;
+  }
+  g_survivors[g_survivors_len++] = h;
+}
 static inline void gc_young_log_push(ts_gc_header* h){
   if (TS_RT_UNLIKELY(g_young_log_len == g_young_log_cap)){
     size_t next = g_young_log_cap ? g_young_log_cap * 2 : 65536;
@@ -483,7 +509,13 @@ static void* gc_owned_realloc(const ts_gc_header* owner, void* p, size_t old_byt
 /* A dying cell's buffers: payloads go by not being marked; only malloc'd
    ones (an owner outside the heap never dies here) would need a free. */
 static inline void gc_owned_release_dead(void* p){
-  if (p && !gc_payload_in_cage(p)) free(p);
+  if (p && !gc_payload_in_cage(p)){
+    /* A heap owner's buffers are payloads; a dead cell is visited only in
+       the debug modes, which check that production loses nothing here. */
+    if (g_young_log_kinds != GC_FINALIZABLE_KINDS)
+      ts_abort_msg("a dead heap cell owned a malloc'd buffer (a young death would leak it)");
+    free(p);
+  }
 }
 /* A full collection re-marks every payload it reaches. */
 static void gc_payload_begin_full(void){
@@ -1038,6 +1070,7 @@ static void gc_config_init(void){
   }
   const char* zap = getenv("TSAOT_GC_ZAP");
   if (zap && zap[0] && strcmp(zap, "0") != 0) g_gc_zap = 1;
+  if (g_gc_zap || g_gc_protect) g_young_log_kinds = ~0u;   /* dead cells are zapped or quarantined */
 }
 tsv ts_heap_ref_value(uint16_t sel, void* p){
   if (!p) return TS_BOX(sel, 0);
@@ -1177,9 +1210,9 @@ static void* gc_alloc(size_t sz, uint8_t kind){
   RT_STAT_INC(kind_alloc[kind]); RT_STAT_ADD(kind_bytes[kind], sz);
   ts_gc_header* h = (ts_gc_header*)gc_cell_alloc(sz, 0);
   h->kind=kind; h->gen=TS_GEN_YOUNG; h->size=sz;
-  gc_young_log_push(h);
+  if (TS_RT_UNLIKELY(((g_young_log_kinds >> kind) & 1u) || sz > GC_PAYLOAD_SMALL_MAX)) gc_young_log_push(h);
   g_young_fresh_bytes += sz;
-  g_alloc++; g_young_alloc++; g_young_new_since_minor++;
+  g_young_new_since_minor++;
   RT_STAT_INC(young_alloc);
   return h;
 }
@@ -1195,7 +1228,7 @@ static void* gc_alloc_pretenured(size_t sz, uint8_t kind){
   RT_STAT_INC(kind_alloc[kind]); RT_STAT_ADD(kind_bytes[kind], sz);
   ts_gc_header* h = (ts_gc_header*)gc_cell_alloc(sz, 1);
   h->kind=kind; h->gen=TS_GEN_OLD; h->size=sz;
-  g_alloc++; g_old_alloc++;
+  g_old_bytes += sz;
   RT_STAT_INC(pretenured_alloc);
   return h;
 }
@@ -4987,7 +5020,7 @@ static void gc_clear_nonheap_marks(void){
 #define TS_GC_MARK_DEPTH_MAX 256
 static void gc_mark_visit_slow(ts_gc_header* h, int young, int depth){
   if (h->gen == TS_GEN_YOUNG){
-    h->mark = 1;
+    h->mark = 1; gc_survivor_push(h);
   } else if (h->gen == TS_GEN_OLD){
     if (young) return; /* minor boundary */
     h->mark = 1;
@@ -5172,13 +5205,15 @@ static void gc_scan_cell(ts_gc_header* h, int young, int depth){
     gc_scan_async_cell(h, young, depth);
   }
 }
+/* A cell's bytes in the heap count: its body, and an ArrayBuffer's bytes. */
+static inline size_t gc_cell_heap_bytes(const ts_gc_header* h){
+  return h->size + (h->kind == TS_KIND_ARRAYBUFFER ? ((const ts_arraybuffer*)h)->byte_length : 0u);
+}
+static inline void gc_old_bytes_sub(size_t n){ g_old_bytes = g_old_bytes > n ? g_old_bytes - n : 0u; }
 /* Release a dying cell's external buffers, not its body (the cell space
-   reclaims that). Every dying cell passes through here (gc_cell_die), so
-   this is the single live-bytes decrement point balancing gc_alloc's
-   increment. */
+   reclaims that). */
 static void gc_free_cell_payload(ts_gc_header* h){
   G0_FATE(h, h->gen == TS_GEN_OLD ? G0_DEAD_OLD : G0_DEAD_YOUNG);
-  g_heap_bytes -= (g_heap_bytes >= h->size) ? h->size : g_heap_bytes;
   if (h->kind==TS_KIND_OBJECT){
     ts_object* o=(ts_object*)h; props_release_dead(o);
   } else if (h->kind==TS_KIND_ARRAY){
@@ -5192,7 +5227,6 @@ static void gc_free_cell_payload(ts_gc_header* h){
   }
   else if (h->kind==TS_KIND_ARRAYBUFFER){
     ts_arraybuffer* ab=(ts_arraybuffer*)h;
-    g_heap_bytes -= (g_heap_bytes >= ab->byte_length) ? ab->byte_length : g_heap_bytes;
     free(ab->bytes); ab->bytes = NULL; props_release_dead(&ab->o);
   }
   else if (h->kind==TS_KIND_TYPEDARRAY){ props_release_dead(&((ts_typedarray*)h)->o); }
@@ -5266,22 +5300,25 @@ static void gc_cell_promote(ts_gc_header* h){
   gc_cell_set_old_bit(h);
   h->mark = 0; h->gen = TS_GEN_OLD; h->remembered = 0;
 }
-/* The young cells of the cycle, after marking (both collections): the
-   marked are promoted in place, the others die (no mark bit covers their
-   memory, so it is free). */
+/* After marking (both collections): the young cells the marker reached are
+   promoted in place (coroutine frames re-enroll in the remembered set). */
+static void gc_promote_survivors(void){
+  for (size_t i = 0; i < g_survivors_len; i++){
+    ts_gc_header* h = g_survivors[i];
+    G0_FATE(h, G0_PROMOTED);
+    gc_cell_promote(h);
+    g_old_bytes += gc_cell_heap_bytes(h);
+    if (h->kind == TS_KIND_CORO) ts_gc_remember(h);
+  }
+  g_survivors_len = 0;
+}
+/* Then the logged young cells still young die: the finalizable kinds and
+   the large cells (every young cell in the debug modes). The other dead
+   young cells are free without a visit (no bit covers their memory). */
 static void gc_young_log_sweep(void){
   for (size_t i = 0; i < g_young_log_len; i++){
     ts_gc_header* h = g_young_log[i];
-    if (h->gen != TS_GEN_YOUNG) continue;
-    if (h->mark){
-      G0_FATE(h, G0_PROMOTED);
-      gc_cell_promote(h);
-      g_young_alloc--; g_old_alloc++;
-      if (h->kind == TS_KIND_CORO) ts_gc_remember(h);
-    } else {
-      gc_cell_die(h);
-      g_young_alloc--; g_alloc--;
-    }
+    if (h->gen == TS_GEN_YOUNG) gc_cell_die(h);
   }
   g_young_log_len = 0;
 }
@@ -5311,8 +5348,8 @@ static void gc_cells_sweep_old(void){
           if (TS_RT_UNLIKELY(h->gen == GC_GEN_FREED)) continue; /* quarantined */
           bm[w] &= ~((uint64_t)1u << (g & 63u));
           g_blocks[bi].live -= size;
+          gc_old_bytes_sub(gc_cell_heap_bytes(h));
           gc_cell_die(h);
-          g_old_alloc--; g_alloc--;
         }
       }
     }
@@ -5326,16 +5363,18 @@ static void gc_cells_sweep_old(void){
         h->mark = 0; h->remembered = 0;
         if (h->kind == TS_KIND_CORO) ts_gc_remember(h);
       } else if (h->gen != GC_GEN_FREED){
+        gc_old_bytes_sub(gc_cell_heap_bytes(h));
         gc_cell_die(h);
-        g_old_alloc--; g_alloc--;
       }
     }
     l = next;
   }
 }
+/* Tests: log every young cell (the probe below needs them). */
+void ts_gc_debug_log_young(void){ g_young_log_kinds = ~0u; }
 /* Tests: does `v` still name an allocated cell? A stale reference keeps the
    address of a freed cell; the cell space knows it is free (no mark bit,
-   and not a young cell of this cycle). */
+   and not a young cell of this cycle). Needs ts_gc_debug_log_young. */
 int ts_gc_debug_cell_live(tsv v){
   if (!ts_heap_ref(v)) return 0;
   uint64_t payload = v & TS_PAYLOAD_MASK;
@@ -5456,7 +5495,7 @@ static void g0_dump(FILE* out){
 #endif
 void ts_gc_collect_young(void){
   g_payload_fresh_bytes = 0;
-  if (!g_young_log_len){ g_young_fresh_bytes = 0; g_young_new_since_minor = 0; return; }
+  if (!g_young_new_since_minor && !g_young_log_len){ g_young_fresh_bytes = 0; return; }
   g_gc_collecting = 1;
   RT_STAT_INC(minor_gc); RT_STAT_GC_T0;
   G0_T0;
@@ -5519,7 +5558,9 @@ void ts_gc_collect_young(void){
     }
   }
   G0_PHASE(g0_minor_ns, 2);
+  gc_promote_survivors();
   gc_young_log_sweep();
+  g_heap_bytes = g_old_bytes;
   G0_PHASE(g0_minor_ns, 4);
   g_young_new_since_minor = 0;
   g_young_fresh_bytes = 0;
@@ -5582,7 +5623,9 @@ void ts_gc_collect(void){
   /* The old cells through their mark bits (the unreached die and lose the
      bit), then the young cells of the cycle through the log. */
   gc_cells_sweep_old();
+  gc_promote_survivors();
   gc_young_log_sweep();
+  g_heap_bytes = g_old_bytes;
   G0_PHASE(g0_full_ns, 3);
   g_young_new_since_minor = 0;
   g_young_fresh_bytes = 0;
@@ -7333,7 +7376,10 @@ tsv ts_map_iterator(tsv source, int kind){
   uint64_t** order = is_set ? &((ts_set_t*)ts_ptr(source))->iteration_order : &((ts_map*)ts_ptr(source))->iteration_order;
   uint64_t* next = is_set ? &((ts_set_t*)ts_ptr(source))->next_iteration_order : &((ts_map*)ts_ptr(source))->next_iteration_order;
   if (!*order) {
-    *order = malloc(sizeof(uint64_t) * (cap ? cap : 1));
+    /* a payload of the collection, like mapset_cursor_view's (not malloc:
+       the collector frees a young collection without visiting it) */
+    const ts_gc_header* owner = is_set ? &((ts_set_t*)ts_ptr(source))->o.h : &((ts_map*)ts_ptr(source))->o.h;
+    *order = (uint64_t*)gc_owned_alloc(owner, sizeof(uint64_t) * (cap ? cap : 1));
     if (!*order) abort();
     for (uint32_t i = 0; i < len; i++) (*order)[i] = i + 1u;
     *next = (uint64_t)len + 1u;
@@ -13030,8 +13076,8 @@ static tsv ta_new_buffer(double length, int shared){
      reclaimed by the young collections their bytes trigger, long-lived ones
      count toward the next full collection. */
   gc_note_payload(n);
-  g_heap_bytes += n;
   ts_arraybuffer* b = (ts_arraybuffer*)gc_alloc(sizeof(ts_arraybuffer), TS_KIND_ARRAYBUFFER);
+  g_heap_bytes += n;   /* after the allocation: a collection resets the count */
   b->bytes = bytes; b->byte_length = n; b->shared = (uint8_t)(shared ? 1 : 0);
   b->o.shape = TS_SHAPE_EMPTY;
   tsv bv = ts_obj(b);

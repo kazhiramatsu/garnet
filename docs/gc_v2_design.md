@@ -949,6 +949,35 @@ TypeScript compiler wall 0.999 (instructions 1.002, peak memory 0.919):
 time-neutral, 7-8% less memory. §4.4's further steps (the mark bit into the
 bitmap, the size from the size class: an 8-byte header) remain.
 
+### 6.8.3 D4: the allocator and the young sweep
+
+A profile of the TypeScript compiler after D3 put a fifth of its time in
+allocation and collection: the run search of the refill 7%, the young sweep
+(visiting every young cell, dead ones included) and the per-cell memset
+about as much again. Three slices, each its own A/B (eight pairs per
+program, outputs identical):
+
+- **D4a**: a block's next free run is found a bitmap word at a time. Bits
+  are set only at cell starts, so the run starts at the first cell start
+  whose bit is clear (per class, the cell starts are precomputed as bitmap
+  words) and ends at the next set bit; the refill had walked a block dense
+  with survivors a cell at a time. tsc-ts 0.987, the compiler 0.986.
+- **D4b**: a run is zeroed when the allocator takes it (one memset; the
+  hardware zeroes whole cache lines) rather than each cell when it is
+  handed out; ASan builds keep the per-cell zeroing. 0.989 and 0.989.
+- **D4c**: a collection does not visit the young cells that die. The marker
+  lists the young cells it reaches and the collector promotes them from the
+  list; only the kinds whose death frees memory outside the heap
+  (ArrayBuffer bytes, promise waiters, coroutine side arrays) and large
+  cells are logged when allocated, and every other dead young cell is free
+  because no bit covers it. The heap byte count becomes the old cells' bytes
+  plus the cycle's young bytes, reset at each collection. The debug modes
+  (zap, protect, ASan, the statistics build, the unit tests) still log and
+  visit every young cell, and there a dead cell owning a malloc'd buffer
+  aborts: that buffer would leak in production. The check found one at
+  once: the Map and Set iterators allocated their insertion-order array with
+  `malloc`, not as a payload of the collection. 0.989 and 0.983.
+
 ## 7. Verification
 
 - Gates of every slice: unit, parity (`scripts/emitc_diff.sh`), bundler,

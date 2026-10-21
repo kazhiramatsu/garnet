@@ -283,6 +283,7 @@ static int allocation_gc_regression(void){
 }
 
 int main(){
+  ts_gc_debug_log_young();
   int fail=0;
   #define CK(name,cond) do{ printf("[%s] %s\n",name,(cond)?"PASS":"*** FAIL ***"); if(!(cond))fail++; }while(0)
   /* numbers round-trip and stay numbers */

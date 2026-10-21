@@ -1684,6 +1684,7 @@ void ts_set_fn_prototype_lazy(tsv fn);
 void ts_gc_collect(void);             /* full mark/sweep over the dynamic heap */
 void ts_gc_collect_young(void);       /* minor collection of young objects */
 int  ts_gc_debug_cell_live(tsv v);    /* tests: does v still name an allocated cell? */
+void ts_gc_debug_log_young(void);    /* tests: log every young cell (for the probe) */
 void ts_gc_root(tsv* slot);           /* register a root (stack slot address) */
 /* Generated non-coroutine functions batch their boxed locals into one shadow
    frame. The slots immediately follow this header in the generated stack
