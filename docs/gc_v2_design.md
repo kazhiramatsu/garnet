@@ -984,8 +984,10 @@ program, outputs identical):
   (a call that threw had leaked its malloc'd array). Time-neutral on both
   programs (0.997 and 1.002): neither runs these paths hot.
 
-Together, against the build before D1: tsc-ts and the compiler about 15%
-and 12% faster, peak memory 0.87 and 0.89. Inline allocation in the
+Together, measured directly against the build before D1 (eight pairs
+each, outputs identical): tsc-ts wall 0.846 (2.14 -> 1.81 s, instructions
+0.864, peak memory 0.883), the TypeScript compiler wall 0.876 (3.94 ->
+3.44 s, instructions 0.918, peak memory 0.890). Inline allocation in the
 generated code (G6) remains: the allocation call is now a small part of a
 cell's cost.
 

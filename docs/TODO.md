@@ -7839,5 +7839,7 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   (tsc-ts 0.997, the compiler 1.002, eight pairs, outputs identical).
   Gates: unit, parity, bundler, selfconf, defaults, GC stress, conformance
   529/529 plain and at every allocation under protect mode. The Y2-D plan
-  as a whole against the build before D1: tsc-ts about 15% faster, the
-  TypeScript compiler 12%, peak memory 0.87 and 0.89.
+  as a whole, measured directly against the build before D1 (eight pairs
+  each, outputs identical): tsc-ts wall 0.846 (2.14 -> 1.81 s, peak memory
+  0.883), the TypeScript compiler wall 0.876 (3.94 -> 3.44 s, peak memory
+  0.890).
