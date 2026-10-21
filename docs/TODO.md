@@ -7313,3 +7313,27 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   mode, with zapping, and with a minor collection every 256 allocations,
   its 78 output files identical. A/B against `ta`, sixteen ABBA pairs:
   wall 0.9975, instructions 1.0004, cycles 0.9980: neutral.
+- Typed arrays, slice TA3 (`docs/typed_arrays_design.md`, "TA3 as built"):
+  `Atomics` (load, store, add, sub, and, or, xor, exchange,
+  compareExchange, isLockFree, wait, notify) as runtime calls with one
+  thread's semantics: the plain read-modify-write, the spec's checks and
+  conversions with V8's messages (integer element types only; wait and
+  notify on Int32, wait over a shared buffer; ToIndex with a RangeError
+  past the end; `store` returns ToIntegerOrInfinity of its operand; the
+  bitwise operations on the element's bits; `compareExchange` compares the
+  element's bytes with the expected value converted). Nothing can notify
+  the one thread: `wait` answers "not-equal" or, after a finite timeout,
+  "timed-out", and throws for an unbounded wait instead of hanging. The
+  namespace is also a value in a program that names it. Fixture
+  `stdlib/atomics` (in the GC stress filter); known rows for the frozen
+  emitter. Gates: unit, parity (367 identical), bundler 42/42, selfconf,
+  GC stress, inline policy, conformance 509/509 and 509/509 with a
+  collection at every allocation in protect mode; tsc relinked
+  (`native_s350at`, the compiler's C unchanged) and compiled under protect
+  mode, with zapping, and with a minor collection every 256 allocations,
+  its 78 output files identical. A/B against `t2`, sixteen ABBA pairs:
+  wall 0.9950, instructions 1.0000, cycles 0.9949: neutral. Noted for the
+  pattern work: an LCG step (`x = (Math.imul(x, a) + c) | 0`) runs 5.8x
+  node, bound by the int-double conversions around `Math.imul` and the
+  `+ c` (both computed in doubles); moving the small Math helpers in line
+  did not change it (0.89 s against 0.87 s, so they stay out of line).

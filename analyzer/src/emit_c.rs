@@ -153,6 +153,7 @@ fn builtin_needs_typed_array_globals(builtin: &str) -> bool {
                 | "Float64Array"
                 | "ArrayBuffer"
                 | "SharedArrayBuffer"
+                | "Atomics"
         )
     )
 }
@@ -18673,6 +18674,22 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 "regexp.construct" => (format!("ts_regexp_adapter_construct_tsv({}, {}, ts_truthy({}))", v(0), v(1), v(2)), false),
                 "uint16array.new" => (format!("ts_new_uint16_array({})", v(0)), false),
                 "arraybuffer.isView" => (format!("ts_bool(ts_array_buffer_is_view({}))", v(0)), false),
+                // Atomics on one thread (docs/typed_arrays_design.md, TA3)
+                "atomics.load" => (format!("ts_atomics_load({}, {})", v(0), v(1)), false),
+                "atomics.store" => (format!("ts_atomics_store({}, {}, {})", v(0), v(1), v(2)), false),
+                "atomics.add" => (format!("ts_atomics_rmw(0, {}, {}, {})", v(0), v(1), v(2)), false),
+                "atomics.sub" => (format!("ts_atomics_rmw(1, {}, {}, {})", v(0), v(1), v(2)), false),
+                "atomics.and" => (format!("ts_atomics_rmw(2, {}, {}, {})", v(0), v(1), v(2)), false),
+                "atomics.or" => (format!("ts_atomics_rmw(3, {}, {}, {})", v(0), v(1), v(2)), false),
+                "atomics.xor" => (format!("ts_atomics_rmw(4, {}, {}, {})", v(0), v(1), v(2)), false),
+                "atomics.exchange" => (format!("ts_atomics_rmw(5, {}, {}, {})", v(0), v(1), v(2)), false),
+                "atomics.compareExchange" => (
+                    format!("ts_atomics_compare_exchange({}, {}, {}, {})", v(0), v(1), v(2), v(3)),
+                    false,
+                ),
+                "atomics.isLockFree" => (format!("ts_atomics_is_lock_free({})", v(0)), false),
+                "atomics.wait" => (format!("ts_atomics_wait({}, {}, {}, {})", v(0), v(1), v(2), v(3)), false),
+                "atomics.notify" => (format!("ts_atomics_notify({}, {}, {})", v(0), v(1), v(2)), false),
                 b if b.starts_with("arraybuffer.new:") => (
                     format!("ts_new_array_buffer({}, {})", v(0), &b["arraybuffer.new:".len()..]),
                     false,

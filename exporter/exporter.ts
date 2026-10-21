@@ -9565,6 +9565,14 @@ class Exporter {
       if (member === "isView") return argc === 1 ? "arraybuffer.isView" : "__UNSUPPORTED__";
       return "__UNSUPPORTED__";
     }
+    // Atomics on one thread (docs/typed_arrays_design.md, TA3); a missing
+    // operand reads undefined.
+    if (ns === "Atomics") {
+      const arity: Record<string, number> = { load: 2, store: 3, add: 3, sub: 3, and: 3, or: 3, xor: 3,
+        exchange: 3, compareExchange: 4, isLockFree: 1, wait: 4, notify: 3 };
+      if (!Object.prototype.hasOwnProperty.call(arity, member)) return "__UNSUPPORTED__";
+      return argc <= arity[member] ? `atomics.${member}` : "__UNSUPPORTED__";
+    }
     if (ns === "AbortSignal") {
       if (member === "timeout") return argc === 1 ? "abortsignal.timeout" : "__UNSUPPORTED__";
       return undefined;

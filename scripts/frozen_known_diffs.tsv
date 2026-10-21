@@ -203,3 +203,5 @@ selfconf-unported	gc/typed_array_buffers	Frozen emitter lacks the typed array bu
 parity-unported	stdlib/typed_array_elements	Frozen emitter lacks the typed array builtins (typedarray.new:N, docs/typed_arrays_design.md) and the view element hints; the Rust output matches V8.
 selfconf-unported	stdlib/typed_array_elements	Frozen emitter lacks the typed array builtins (docs/typed_arrays_design.md); native Rust output matches V8.
 selfconf	arrays/element_receivers	The frozen emitter reads and writes elements through ts_array_get/ts_array_set directly (the legacy index path), which answer undefined for and drop writes to a receiver without elements of its own; the Rust emitter goes through the element entries, which read and write such a receiver by the index as a property (TA2, docs/typed_arrays_design.md), and matches V8.
+parity-unported	stdlib/atomics	Frozen emitter lacks the Atomics and typed array builtins (atomics.*, typedarray.new:N, docs/typed_arrays_design.md); the Rust output matches V8.
+selfconf-unported	stdlib/atomics	Frozen emitter lacks the Atomics and typed array builtins (docs/typed_arrays_design.md); native Rust output matches V8.

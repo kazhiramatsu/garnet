@@ -151,6 +151,25 @@ data and length hoisted out of loops (the bytes do not move, a view's
 length is fixed), static dispatch of the methods, `for...of` over views as
 an index loop, allocation of small buffers.
 
+## TA3 as built
+
+`Atomics.load`, `store`, `add`, `sub`, `and`, `or`, `xor`, `exchange`,
+`compareExchange`, `isLockFree`, `wait` and `notify` lower to runtime calls
+(`atomics.<name>`; a missing operand reads undefined). garnet runs one
+thread, so each is the plain read-modify-write of the element. The checks
+and conversions follow the spec and V8's messages: an integer element type
+(Uint8Clamped and the float views are refused; `wait` and `notify` take an
+Int32Array, `wait` only over a SharedArrayBuffer), ToIndex with a
+RangeError past the end, ToIntegerOrInfinity of the operand (`store`
+returns it), the bitwise operations on the element's bits, the old value
+returned, `compareExchange` comparing the element's bytes with the expected
+value converted to the element type. Nothing can notify the one thread:
+`wait` answers "not-equal" for a different value, sleeps a finite timeout
+and answers "timed-out", and throws for an unbounded wait instead of
+hanging; `notify` wakes nobody (0). The namespace exists as a value too
+(`typeof Atomics`, `[object Atomics]`, its functions callable dynamically)
+in a program that names it. Fixture `stdlib/atomics`.
+
 ## Slices
 
 1. **TA1, correctness**: the kinds, GC (scan the buffer slot and the

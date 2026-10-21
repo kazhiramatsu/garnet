@@ -13843,11 +13843,174 @@ static void ta_ctors_init(void){
   g_sab_ctor = ta_ctor_value("SharedArrayBuffer", ab_ctor_call_1, 1, g_sab_proto);
   ts_root_static_once(&g_sab_ctor, &rooted_sab);
 }
+/* Atomics (docs/typed_arrays_design.md, TA3). garnet runs one thread, so
+   each operation is the plain read-modify-write of the element (no other
+   agent can observe a torn or reordered access). ValidateIntegerTypedArray
+   (an integer element type; wait and notify Int32 on a shared buffer),
+   ValidateAtomicAccess (ToIndex, a RangeError past the end), the operand's
+   ToIntegerOrInfinity, then the operation on the element's bits; the old
+   value is returned. */
+static tsv atomics_tag_text(tsv v, char* out, size_t cap){
+  tsv tag = ts_objproto_tostring_call(v);
+  uint32_t n; char* c = ts_string_cstr_copy(tag, &n);
+  snprintf(out, cap, "%s", c ? c : "[object Object]");
+  free(c);
+  return tag;
+}
+static void atomics_view_error(tsv v, const char* what){
+  char tag[96], buf[160];
+  (void)atomics_tag_text(v, tag, sizeof tag);
+  snprintf(buf, sizeof buf, "%s is not %s typed array.", tag, what);
+  ts_throw_type_error_msg(buf);
+}
+static int atomics_integer_elem(int elem){ return elem != TS_TA_UINT8C && elem != TS_TA_FLOAT32 && elem != TS_TA_FLOAT64; }
+/* The element index of an access (the view is rooted by the caller). */
+static uint32_t atomics_index(tsv ta, tsv index){
+  double x = ts_is_num(index) ? ts_to_num(index) : ts_number_coerce(index);
+  double d = x != x ? 0 : x < 0 ? ceil(x) : floor(x);
+  if (d < 0 || d >= (double)ta_ptr(ta)->length) ts_throw_range_error_msg("Invalid atomic access index");
+  return (uint32_t)d;
+}
+static double atomics_operand(tsv v){
+  double x = ts_is_num(v) ? ts_to_num(v) : ts_number_coerce(v);
+  if (x != x) return 0;
+  if (isinf(x)) return x;
+  x = x < 0 ? ceil(x) : floor(x);
+  return x == 0 ? 0 : x;     /* ToIntegerOrInfinity: -0 is +0 */
+}
+static tsv atomics_require(tsv ta){
+  if (!ts_is_typed_array(ta) || !atomics_integer_elem(ta_ptr(ta)->elem)) atomics_view_error(ta, "an integer");
+  return ta;
+}
+tsv ts_atomics_load(tsv ta, tsv index){
+  ts_gc_root(&ta);
+  atomics_require(ta);
+  uint32_t i = atomics_index(ta, index);
+  ts_gc_unroot(1);
+  return ts_num(ta_load(ta_ptr(ta), i));
+}
+tsv ts_atomics_store(tsv ta, tsv index, tsv value){
+  ts_gc_root(&ta);
+  atomics_require(ta);
+  uint32_t i = atomics_index(ta, index);
+  double v = atomics_operand(value);
+  ts_gc_unroot(1);
+  ta_store(ta_ptr(ta), i, v);
+  return ts_num(v);
+}
+/* op: 0 add, 1 sub, 2 and, 3 or, 4 xor, 5 exchange */
+tsv ts_atomics_rmw(int op, tsv ta, tsv index, tsv value){
+  ts_gc_root(&ta);
+  atomics_require(ta);
+  uint32_t i = atomics_index(ta, index);
+  double v = atomics_operand(value);
+  ts_gc_unroot(1);
+  ts_typedarray* t = ta_ptr(ta);
+  double old = ta_load(t, i);
+  uint32_t a = ts_to_uint32(old), b = ts_to_uint32(v), r;
+  switch (op){
+    case 0: r = a + b; break;
+    case 1: r = a - b; break;
+    case 2: r = a & b; break;
+    case 3: r = a | b; break;
+    case 4: r = a ^ b; break;
+    default: r = b; break;
+  }
+  ta_store(t, i, (double)r);   /* the element conversion keeps the low bits */
+  return ts_num(old);
+}
+tsv ts_atomics_compare_exchange(tsv ta, tsv index, tsv expected, tsv replacement){
+  ts_gc_root(&ta); ts_gc_root(&replacement);
+  atomics_require(ta);
+  uint32_t i = atomics_index(ta, index);
+  double e = atomics_operand(expected);
+  double r = atomics_operand(replacement);
+  ts_gc_unroot(2);
+  ts_typedarray* t = ta_ptr(ta);
+  double old = ta_load(t, i);
+  /* compare the element's bytes with the expected value converted to the
+     element type */
+  uint8_t probe[8];
+  ts_ta_elem_store(probe, 0, e, t->elem);
+  if (memcmp(probe, t->data + (size_t)i * g_ta_size[t->elem], g_ta_size[t->elem]) == 0) ta_store(t, i, r);
+  return ts_num(old);
+}
+tsv ts_atomics_is_lock_free(tsv n){
+  double d = atomics_operand(n);
+  return ts_bool(d == 1 || d == 2 || d == 4 || d == 8);
+}
+static tsv atomics_waitable(tsv ta){
+  if (!ts_is_typed_array(ta) || ta_ptr(ta)->elem != TS_TA_INT32) atomics_view_error(ta, "an int32 or BigInt64");
+  return ta;
+}
+/* Atomics.wait: nothing else can notify the one thread. A value that differs
+   answers "not-equal"; a finite timeout elapses and answers "timed-out"; an
+   unbounded wait could never end and throws instead of hanging. */
+tsv ts_atomics_wait(tsv ta, tsv index, tsv value, tsv timeout){
+  ts_gc_root(&ta); ts_gc_root(&timeout);
+  atomics_waitable(ta);
+  if (!((ts_arraybuffer*)ts_ptr(ta_ptr(ta)->buffer))->shared) atomics_view_error(ta, "a shared");
+  uint32_t i = atomics_index(ta, index);
+  double v = atomics_operand(value);
+  double ms = ts_is_undef(timeout) ? INFINITY : (ts_is_num(timeout) ? ts_to_num(timeout) : ts_number_coerce(timeout));
+  ts_gc_unroot(2);
+  ts_typedarray* t = ta_ptr(ta);
+  int32_t cur; memcpy(&cur, t->data + (size_t)i * 4u, 4);
+  if (cur != ts_to_int32(v)) return ts_new_string("not-equal", 9);
+  if (ms != ms) ms = INFINITY;
+  if (ms == INFINITY) ts_throw_type_error_msg("Atomics.wait would never end: no other thread can notify it");
+  if (ms > 0){
+    struct timespec req; req.tv_sec = (time_t)(ms / 1000.0); req.tv_nsec = (long)(fmod(ms, 1000.0) * 1e6);
+    nanosleep(&req, NULL);
+  }
+  return ts_new_string("timed-out", 9);
+}
+tsv ts_atomics_notify(tsv ta, tsv index, tsv count){
+  (void)count;
+  ts_gc_root(&ta);
+  atomics_waitable(ta);
+  (void)atomics_index(ta, index);
+  ts_gc_unroot(1);
+  return ts_num(0);           /* no thread waits */
+}
+/* The Atomics namespace as a value (its functions, named as calls, lower to
+   the builtins above). */
+#define ATOMICS_ARG(i) (n > (i) ? a[i] : TS_UNDEFINED)
+static tsv atomics_m_load(tsv* a, int n){ return ts_atomics_load(ATOMICS_ARG(0), ATOMICS_ARG(1)); }
+static tsv atomics_m_store(tsv* a, int n){ return ts_atomics_store(ATOMICS_ARG(0), ATOMICS_ARG(1), ATOMICS_ARG(2)); }
+static tsv atomics_m_add(tsv* a, int n){ return ts_atomics_rmw(0, ATOMICS_ARG(0), ATOMICS_ARG(1), ATOMICS_ARG(2)); }
+static tsv atomics_m_sub(tsv* a, int n){ return ts_atomics_rmw(1, ATOMICS_ARG(0), ATOMICS_ARG(1), ATOMICS_ARG(2)); }
+static tsv atomics_m_and(tsv* a, int n){ return ts_atomics_rmw(2, ATOMICS_ARG(0), ATOMICS_ARG(1), ATOMICS_ARG(2)); }
+static tsv atomics_m_or(tsv* a, int n){ return ts_atomics_rmw(3, ATOMICS_ARG(0), ATOMICS_ARG(1), ATOMICS_ARG(2)); }
+static tsv atomics_m_xor(tsv* a, int n){ return ts_atomics_rmw(4, ATOMICS_ARG(0), ATOMICS_ARG(1), ATOMICS_ARG(2)); }
+static tsv atomics_m_exchange(tsv* a, int n){ return ts_atomics_rmw(5, ATOMICS_ARG(0), ATOMICS_ARG(1), ATOMICS_ARG(2)); }
+static tsv atomics_m_compare_exchange(tsv* a, int n){ return ts_atomics_compare_exchange(ATOMICS_ARG(0), ATOMICS_ARG(1), ATOMICS_ARG(2), ATOMICS_ARG(3)); }
+static tsv atomics_m_is_lock_free(tsv* a, int n){ return ts_atomics_is_lock_free(ATOMICS_ARG(0)); }
+static tsv atomics_m_wait(tsv* a, int n){ return ts_atomics_wait(ATOMICS_ARG(0), ATOMICS_ARG(1), ATOMICS_ARG(2), ATOMICS_ARG(3)); }
+static tsv atomics_m_notify(tsv* a, int n){ return ts_atomics_notify(ATOMICS_ARG(0), ATOMICS_ARG(1), ATOMICS_ARG(2)); }
+#undef ATOMICS_ARG
 void ts_typed_array_globals(void){
   ta_protos_init();
   for (int e = 0; e < TS_TA_COUNT; e++) ts_global_set(g_ta_name[e], g_ta_ctor[e]);
   ts_global_set("ArrayBuffer", g_ab_ctor);
   ts_global_set("SharedArrayBuffer", g_sab_ctor);
+  tsv at = ts_new_object(); ts_gc_root(&at);
+  ta_static_fn(at, "load", atomics_m_load, 2);
+  ta_static_fn(at, "store", atomics_m_store, 3);
+  ta_static_fn(at, "add", atomics_m_add, 3);
+  ta_static_fn(at, "sub", atomics_m_sub, 3);
+  ta_static_fn(at, "and", atomics_m_and, 3);
+  ta_static_fn(at, "or", atomics_m_or, 3);
+  ta_static_fn(at, "xor", atomics_m_xor, 3);
+  ta_static_fn(at, "exchange", atomics_m_exchange, 3);
+  ta_static_fn(at, "compareExchange", atomics_m_compare_exchange, 4);
+  ta_static_fn(at, "isLockFree", atomics_m_is_lock_free, 1);
+  ta_static_fn(at, "wait", atomics_m_wait, 4);
+  ta_static_fn(at, "notify", atomics_m_notify, 3);
+  tsv tag = ts_new_string("Atomics", 7); ts_gc_root(&tag);
+  ts_define_data(at, TS_KEY_WKSYM(TS_WKSYM_TO_STRING_TAG), tag, 0, 0, 1);
+  ts_global_set("Atomics", at);
+  ts_gc_unroot(2);
 }
 /* Canonical numeric string keys of a view (integer-indexed exotic): an index,
    or another numeric string such as "-0" or "1.5" that names no element. */

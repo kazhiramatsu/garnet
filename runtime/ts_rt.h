@@ -857,6 +857,13 @@ int  ts_array_buffer_is_view(tsv v);
 tsv  ts_typed_array_proto(int elem);
 tsv  ts_array_buffer_proto(int shared);
 void ts_typed_array_globals(void);
+tsv  ts_atomics_load(tsv ta, tsv index);
+tsv  ts_atomics_store(tsv ta, tsv index, tsv value);
+tsv  ts_atomics_rmw(int op, tsv ta, tsv index, tsv value);
+tsv  ts_atomics_compare_exchange(tsv ta, tsv index, tsv expected, tsv replacement);
+tsv  ts_atomics_is_lock_free(tsv n);
+tsv  ts_atomics_wait(tsv ta, tsv index, tsv value, tsv timeout);
+tsv  ts_atomics_notify(tsv ta, tsv index, tsv count);
 tsv  ts_ta_get(tsv v, uint32_t i);
 void ts_ta_set(tsv v, uint32_t i, tsv x);
 static inline int ts_is_array_fast(tsv v){
