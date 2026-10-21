@@ -7146,3 +7146,27 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   case. The exporter's `.length` lowering (`exporter.ts`, the
   `builtinReceiverKind` switch) should keep the property read for object
   types that are not strings, arrays or functions.
+- Reference: other native TypeScript compilers (2026-10-21, Apple M5, ten
+  cores; the compiler project of TypeScript 6.0.3 with emit, 78 files;
+  eight interleaved rounds, medians; every run exit 0, no diagnostics).
+  Vercel Labs' `scriptc` 0.4.0 (TypeScript to C/LLVM, reference counting
+  with a generational trial-deletion cycle collector) does not compile the
+  TypeScript 6.0.3 compiler: 26 type errors in its own type environment,
+  then preflight refuses namespace imports inside module cycles (15) and
+  then the 164 enums of the compiler, all inside the `_namespaces` cycle.
+  Its `tsc-ts` (vercel-labs/tsc-ts c002e8e, a TypeScript port of tsgo 7.0.2
+  built with scriptc in 50 s) and tsgo at the same commit compile the
+  6.0.3 project:
+  node 3.371 s (CPU 6.19 s, 796 MB); garnet 4.062 s (4.04 s, 872 MB);
+  tsc-ts 0.490 s (1.87 s, 531 MB), single-threaded 1.086 s (413 MB);
+  tsgo 0.684 s (2.17 s, 602 MB), single-threaded 1.254 s. Check only
+  (`--noEmit`, five rounds): node 2.777, garnet 3.191, tsc-ts 0.309 (one
+  thread 0.684), tsgo 0.482 (one thread 0.866). Output against node's:
+  garnet 78 of 78 files identical; tsc-ts 56 (it does not inline const
+  enum members read through a namespace, e.g. `tracing.Phase.Bind`), tsgo
+  59. tsc-ts's cycle collector is idle on this workload: its threshold
+  (`SCR_CYCLE_THRESHOLD`) from 10 to 1e9 changes neither time nor
+  instructions (18.4G single-threaded); reference counting frees the rest.
+  The comparison is of compilers as a whole: tsc-ts runs tsgo's design
+  (TypeScript 7), garnet the unmodified 6.0.3 sources; single-threaded,
+  tsc-ts is 3.7x faster than garnet's build and 1.15x faster than tsgo.
