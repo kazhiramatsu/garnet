@@ -8249,3 +8249,31 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   cost 3-4%. The document proposes it, with the block as the fallback. The
   review itself did not run (Fable out of usage credits); a package for it
   bundles the document, the design, the code and the data.
+- Threads, the review (`docs/threads_scaling_review.md`, revised; Fable 5.1
+  reviewed the first version at Kaz's request). The finding that changes the
+  plan: scriptc's timelines (`TSC_TS_TIMELINE=1`) show that from three
+  checkers on its time is one file, `src/compiler/checker.ts` (3.15 MB, 64% of
+  the project), parsed, checked and emitted on one thread while the other
+  checkers idle (four checkers: c0 376 ms for that file, c1-c3 247 ms with
+  19-31 files each; eight: 407 against 160 ms); the flat curve beyond four is
+  not the efficiency cores. tsc-ts schedules whole files, so no implementation
+  scales past three checkers on this project, garnet's B lands on the same
+  floor at garnet's speed (about 0.71 s), and beating scriptc's 0.43 s is a
+  single-thread matter: about 1.8x on the largest file's parse (2.7x behind),
+  check (1.57x) and emit (1.41x), plus startup (23 ms against 1.5 ms).
+  Parallel efficiency needs a second benchmark with files of similar size.
+  Also found: scriptc parses and binds on ten threads and publishes per chunk
+  in 0-1.2 ms (the program in 0.07 ms), so B's publication must be
+  region-based, not a walk; the first mode 3 declared the key `const` to the
+  generated code and non-const to the runtime (incompatible declarations,
+  undefined behavior, an LTO hazard): the key is now a word defined in
+  assembly, const everywhere, written once by a constructor and verified; a
+  thread sets its slot with `ts_iso_enter` in a function without `TS_ISO()`
+  uses (the pure read may move above calls). Decision: accessor mode 3, mode 2
+  the fallback. Plan: a `fork` prototype of B's sharing first (forking a 740
+  MB process costs 0.6-0.8 ms per child; no isolates needed; one to two weeks
+  for the real B-shaped number), A1 deferred until it answers, A4 demoted to a
+  correctness test, the critical path's single-thread speed as the standing
+  track. The default build is unchanged (preprocessed runtime identical apart
+  from blank lines); runtime tests pass; mode 3 programs match the plain
+  build.

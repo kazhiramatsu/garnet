@@ -85,23 +85,32 @@ typedef struct ts_iso {
 extern __thread ts_iso* ts_iso_cur;
 #define TS_ISO() (ts_iso_cur)
 #elif TS_ISO_MODE == 3
-/* thread-specific data read directly: the thread's slot array from
-   tpidrro_el0 (Darwin) and a pthread key's slot, as Go's runtime reaches g.
-   A thread's isolate never changes while it runs, so the read is one pure
-   asm (no memory operand) and the key a constant once set: the compiler
-   computes the isolate once per function, as it does the masked stack
-   pointer. ts_iso_key is written once, by a constructor, before main. */
-#ifdef TS_ISO_KEY_WRITABLE
-extern long ts_iso_key;   /* ts_rt.c, which writes it */
-#else
-extern const long ts_iso_key;
+/* Thread-specific data read directly (Darwin arm64): the thread's slot
+   array from tpidrro_el0 (its low three bits hold the CPU number) and a
+   pthread key's slot, as Go's runtime reaches g on darwin/arm64 and as
+   Apple's own libraries read their slots. A thread's isolate never changes
+   while it runs, so the read is one asm without memory operands and the
+   key is const to every translation unit: the compiler computes the
+   isolate once per function, as it would the masked stack pointer. The
+   key's storage is defined in assembly (ts_rt.c), written once by a
+   constructor before main and verified against pthread_getspecific; no C
+   code ever writes it. Two rules follow: a thread sets its slot
+   (ts_iso_enter) in a function that contains no TS_ISO() use, and runs its
+   body in a function that is not inlined into it, since the compiler may
+   move this pure read above any call; and nothing reads TS_ISO() before the
+   constructor ran (the key would be 0: slot 0 holds pthread_self). */
+#if !(defined(__APPLE__) && defined(__aarch64__))
+#error "TS_ISO_MODE 3 reads Darwin's arm64 thread-specific data"
 #endif
+extern const long ts_iso_key;
 static inline __attribute__((always_inline)) ts_iso* ts_iso_get(void){
   ts_iso* p;
   __asm__("mrs %0, tpidrro_el0\n\tand %0, %0, #-8\n\tldr %0, [%0, %1, lsl #3]" : "=&r"(p) : "r"(ts_iso_key));
   return p;
 }
 #define TS_ISO() (ts_iso_get())
+/* a thread's isolate, set before its body runs (the rules above) */
+void ts_iso_enter(ts_iso* iso);
 #else
 #define TS_ISO_STACK_BITS 26
 static inline __attribute__((always_inline)) ts_iso* ts_iso_get(void){

@@ -2,7 +2,8 @@
 
 Session 352. Status: design v3, after three reviews by Codex (gpt-6.1-sol,
 xhigh effort; every claim that could be checked against the code was
-checked); the accessor measured (the stack-aligned block, below). Runtime (`ts_rt.c`, `ts_rt.h`), emitter
+checked); the accessor measured and chosen (mode 3, below); reviewed
+again after the measurements (`docs/threads_scaling_review.md`). Runtime (`ts_rt.c`, `ts_rt.h`), emitter
 (`emit_c.rs`), exporter (`class_extract.ts`), regexp adapter, tsc-ts host
 and shims (`benchmarks/tsc_ts_native`).
 
@@ -103,6 +104,18 @@ included), 1.28 s and 1.19 s (1.47x). So A should bring about 1.5x at four
 checkers for about four times the memory; B's sharing is where scriptc's
 2.4x comes from.
 
+**The floor** (the review, `docs/threads_scaling_review.md`): scriptc's
+timeline shows that from three checkers on its time is one file,
+`src/compiler/checker.ts` (3.15 MB, 64% of the project's text), parsed,
+checked and emitted on one thread while the other checkers idle (at four
+checkers c0 takes 376 ms for that file alone, c1-c3 finish in 247 ms with
+19-31 files each; at eight, 407 ms against 160 ms). tsc-ts schedules whole
+files, so no implementation scales past three checkers on this project,
+and garnet's B lands on the same floor at garnet's speed: about 0.71 s.
+Beating scriptc there is a single-thread matter, about 1.8x on the parse,
+check and emit of the largest file. Parallel efficiency needs a second
+benchmark whose files are of similar size.
+
 ## Milestone A: isolated workers
 
 ### Per isolate: everything mutable
@@ -177,19 +190,30 @@ eight pairs each, outputs identical:
 |---|---|---|---|---|---|---|
 | a thread-local isolate pointer | 1.059 | 1.059 | 1.093 | 1.060 | 1.055 | 1.088 |
 | the stack-aligned isolate block | 1.014 | 1.011 | 1.001 | 0.985 | 0.984 | 0.993 |
+| thread-specific data read directly (`TS_ISO_MODE` 3) | 1.011 | 1.017 | 1.027 | 0.989 | 0.996 | 1.020 |
 
 The thread-local form costs 6% before the runtime's own state moves (a
-lower bound: every runtime function touching isolate state would add a
-TLV access); the stack-aligned block costs nothing measurable. A uses the
-stack-aligned block: every isolate, main's included, runs on a stack
-aligned to its size (64 MiB in the experiment) whose lowest pages hold the
-isolate block, a guard page between it and the stack; the runtime's `main`
-starts the program's on such a stack (`ts_iso_user_main`). Its policies
-become rules of A: no JavaScript or runtime call on another stack (signal
-handlers stay out of the runtime, no foreign threads call in), stack
-probing for frames larger than the guard page (Darwin probes them with
-`___chkstk_darwin`), ASan's fake stacks leave the stack pointer on the real
-stack.
+lower bound, as every row is: each runtime function touching isolate
+state will compute the isolate once more). The other two cost the same
+within code-layout noise (about 1.5%; 3 takes 2.6% more instructions).
+
+**A uses 3** (the review, `docs/threads_scaling_review.md`): the thread's
+slot array from `tpidrro_el0` and a pthread key's slot, as Go's runtime
+reaches its thread pointer on darwin/arm64, read by one asm without memory
+operands with the key `const` to every translation unit, so the compiler
+computes the isolate once per function. The key is a word defined in
+assembly (`ts_rt.c`), written once by a constructor and verified against
+`pthread_getspecific` at every start. Two rules follow from the pure read,
+which the compiler may move above any call: a thread sets its slot with
+`ts_iso_enter` in a function that contains no `TS_ISO()` use and runs its
+body in a function not inlined into it; nothing reads `TS_ISO()` before
+the constructor ran. On Linux the same accessor is `__thread` with the
+local-exec model. Mode 2, the stack-aligned block (every isolate on a
+stack aligned to its size, the block in its lowest pages, main on a
+trampoline thread), stays the build-time fallback should a Darwin release
+change the slot array's layout; its policies (no JavaScript or runtime
+call on another stack, stack probing for frames larger than the guard
+page, ASan's fake stacks) apply only then.
 
 The threaded forms are selected per program at build time when it can
 construct a `Worker` (tsc-ts's entry imports `node:worker_threads`, so it
@@ -265,8 +289,18 @@ words that a message or an atomic operation published).
 
 ### Slices of A
 
+The order after the review (`docs/threads_scaling_review.md`): first a
+prototype of B's sharing by `fork` (the main process parses, binds and
+publishes, then forks its checkers; `Worker` over `fork`, `postMessage` as
+a structured clone through a pipe, `SharedArrayBuffer` on shared memory,
+real `Atomics`, cells older than the fork immortal to the child's
+collector), which needs no isolates and measures garnet's B-shaped time
+(projected 0.71 s) in one to two weeks; slice 1 waits for that result, and
+slice 4 is a correctness test of workers and messages, not a target
+(about 1.5x for four times the memory).
+
 1. **Isolates on one thread** (behavior-invariant): every item under "Per
-   isolate" behind the isolate pointer (the stack-aligned block), the process and
+   isolate" behind the isolate pointer (`TS_ISO()`, mode 3), the process and
    isolate setup split, registered stack ranges, the shared literals
    skipped by the collector. Gates: everything as for a runtime change, an
    A/B of the threaded build against the plain one on tsc-ts (the
@@ -297,7 +331,13 @@ program.
 
 ## Milestone B: published graphs (later)
 
-After A is measured. v2 of this design (Session 352) worked out
+After A is measured. **Publication must cost nothing on the critical
+path** (the review): scriptc publishes each parsed chunk in 0-1.2 ms and
+the program in 0.07 ms, by region (`TSC_TS_REGION`), where a walk over
+garnet's 400 MB graph would take tens to hundreds of milliseconds of a
+430 ms budget; parse threads should allocate into regions that change
+owner wholesale, or the operating system should share (`fork`). With that
+constraint, v2 of this design (Session 352) worked out
 publication in place: a validate, prepare and commit transaction; a new
 IMMORTAL generation that no collector marks, sweeps or remembers; payloads
 relocated into process-owned immortal storage; precomputed metadata so

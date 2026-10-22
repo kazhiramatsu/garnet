@@ -1,6 +1,5 @@
 #include <limits.h>
 #include <unistd.h>   /* isatty: gate console.log colorization on a TTY (Node parity) */
-#define TS_ISO_KEY_WRITABLE 1   /* the accessor experiment's key (ts_rt.h, mode 3) */
 #include "ts_rt.h"
 #include "json_core.c"
 
@@ -18846,19 +18845,29 @@ int ts_handlers_count(void){ int n=0; for(ts_handler* h=g_handlers;h;h=h->prev)n
 static ts_iso ts_iso_main;
 __thread ts_iso* ts_iso_cur = &ts_iso_main;
 #elif TS_ISO_MODE == 3
-/* The accessor experiment (ts_rt.h): the isolate pointer in a pthread key's
-   slot, read directly; set before any constructor or main touches it. */
+/* The isolate pointer in a pthread key's slot, read directly (ts_rt.h).
+   The key's storage is this assembly word, never a C object: every
+   translation unit, this one included, declares ts_iso_key const, and the
+   constructor writes the word through the assembler's name. */
 #include <pthread.h>
+__asm__(".data\n.globl _ts_iso_key\n.p2align 3\n_ts_iso_key:\n.quad 0\n.text");
 static ts_iso ts_iso_main;
-/* const to the generated code (ts_rt.h), written here once before main */
-long ts_iso_key;
-__attribute__((constructor(101))) static void ts_iso_key_init(void){
-  pthread_key_t key;
-  if (pthread_key_create(&key, NULL) != 0 || pthread_setspecific(key, &ts_iso_main) != 0) abort();
-  ts_iso_key = (long)key;
+static pthread_key_t ts_iso_pkey;
+/* the direct read with the key in a register: the constructor's check and
+   ts_iso_enter's, where the const ts_iso_key must not be read yet */
+static ts_iso* ts_iso_slot(pthread_key_t key){
   uintptr_t tsd;
   __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(tsd));
-  if (((ts_iso**)(tsd & ~(uintptr_t)7))[key] != &ts_iso_main) abort();
+  return ((ts_iso**)(tsd & ~(uintptr_t)7))[key];
+}
+void ts_iso_enter(ts_iso* iso){
+  if (pthread_setspecific(ts_iso_pkey, iso) != 0 || ts_iso_slot(ts_iso_pkey) != iso) abort();
+}
+__attribute__((constructor(101))) static void ts_iso_key_init(void){
+  if (pthread_key_create(&ts_iso_pkey, NULL) != 0) abort();
+  long key = (long)ts_iso_pkey, addr;
+  __asm__ volatile("adrp %0, _ts_iso_key@PAGE\n\tadd %0, %0, _ts_iso_key@PAGEOFF\n\tstr %1, [%0]" : "=&r"(addr) : "r"(key) : "memory");
+  ts_iso_enter(&ts_iso_main);
 }
 #elif TS_ISO_MODE == 2
 /* The accessor experiment (ts_rt.h): the isolate block at the base of a
