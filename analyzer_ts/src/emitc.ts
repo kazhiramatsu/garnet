@@ -541,7 +541,7 @@ function emitClassLayout(out: string[], classes: Map<number, any>): void {
   out.push("\n");
   for (const cid of order) {
     out.push(`struct ${structName(cid)} {\n`);
-    out.push("  ts_object header;\n");
+    out.push("  ts_sized_head header;\n");
     const seen = new Set<number>();
     emitFieldChain(out, cid, classes, seen);
     out.push("};\n");
@@ -4649,12 +4649,12 @@ function emitInstC(s: string[], inst: any, cx: EmitCtx, numericFacts: NumericAna
           protoExpr = `CLASS_PROTO[${c}]`;
         }
         if (st === "Stack") {
-          s.push(`  ${cn} sobj${d} = {0}; sobj${d}.header.h.kind=TS_KIND_OBJECT; sobj${d}.header.h.mark=0; sobj${d}.header.h.gen=2; ts_hdr_init_sized(&sobj${d}.header.h, sizeof(${cn})); sobj${d}.header.proto=${protoExpr}; sobj${d}.header.props=0; sobj${d}.header.cap=0; sobj${d}.header.len=0; sobj${d}.header.shape=0;\n`);
+          s.push(`  ${cn} sobj${d} = {0}; sobj${d}.header.h.kind=TS_KIND_OBJECT; sobj${d}.header.h.mark=0; sobj${d}.header.h.gen=2; ts_hdr_init_sized(&sobj${d}.header.h, sizeof(${cn})); sobj${d}.header.proto=${protoExpr}; sobj${d}.header.shape=0;\n`);
           s.push(`  v${d} = ts_obj(&sobj${d});\n`);
         } else {
           s.push(`  v${d} = ts_new_sized(sizeof(${cn}));\n`);
           s.push(`  ${cn}* hobj${d} = (${cn}*)ts_ptr(v${d});\n`);
-          s.push(`  hobj${d}->header.proto=${protoExpr}; hobj${d}->header.props=0; hobj${d}->header.cap=0; hobj${d}->header.len=0;\n`);
+          s.push(`  hobj${d}->header.proto=${protoExpr};\n`);
         }
         return;
       }

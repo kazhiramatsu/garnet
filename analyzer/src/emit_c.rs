@@ -1650,7 +1650,7 @@ fn emit_class_layout(s: &mut String, classes: &BTreeMap<u32, &ClassDef>) {
     s.push('\n');
     for &cid in &order {
         let _ = writeln!(s, "struct {} {{", struct_name(cid));
-        s.push_str("  ts_object header;\n");
+        s.push_str("  ts_sized_head header;\n");
         let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
         emit_field_chain(s, cid, classes, &mut seen);
         let _ = writeln!(s, "}};");
@@ -18416,7 +18416,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         } else {
                             format!("  {1} sobj{0} = {{0}};", dst.0, cn)
                         };
-                        let _ = writeln!(s, "{0} sobj{1}.header.h.kind=TS_KIND_OBJECT; sobj{1}.header.h.mark=0; sobj{1}.header.h.gen=2; ts_hdr_init_sized(&sobj{1}.header.h, sizeof({2})); sobj{1}.header.proto={3}; sobj{1}.header.props=0; sobj{1}.header.cap=0; sobj{1}.header.len=0; sobj{1}.header.shape={4};", decl, dst.0, cn, proto_expr, shape);
+                        let _ = writeln!(s, "{0} sobj{1}.header.h.kind=TS_KIND_OBJECT; sobj{1}.header.h.mark=0; sobj{1}.header.h.gen=2; ts_hdr_init_sized(&sobj{1}.header.h, sizeof({2})); sobj{1}.header.proto={3}; sobj{1}.header.shape={4};", decl, dst.0, cn, proto_expr, shape);
                         if class_index_enabled() {
                             let _ = writeln!(s, "  sobj{}.header.cls={}u;", dst.0, class_index_word(c.0));
                         }
@@ -18436,7 +18436,6 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                             // old cell needs
                             let _ = writeln!(s, "  {} = ts_new_sized_site(sizeof({}), {}u, {});", dst_name, cn, id, proto_expr);
                             let _ = writeln!(s, "  {}* hobj{} = ({}*)ts_ptr({});", cn, dst.0, cn, dst_name);
-                            let _ = writeln!(s, "  hobj{}->header.props=0; hobj{}->header.cap=0; hobj{}->header.len=0;", dst.0, dst.0, dst.0);
                         } else {
                             let alloc = if st == AllocStrategy::PretenuredHeap {
                                 "ts_new_sized_pretenured"
@@ -18445,7 +18444,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                             };
                             let _ = writeln!(s, "  {} = {}(sizeof({}));", dst_name, alloc, cn);
                             let _ = writeln!(s, "  {}* hobj{} = ({}*)ts_ptr({});", cn, dst.0, cn, dst_name);
-                            let _ = writeln!(s, "  hobj{}->header.proto={}; hobj{}->header.props=0; hobj{}->header.cap=0; hobj{}->header.len=0;", dst.0, proto_expr, dst.0, dst.0, dst.0);
+                            let _ = writeln!(s, "  hobj{}->header.proto={};", dst.0, proto_expr);
                         }
                         if class_index_enabled() {
                             let _ = writeln!(s, "  hobj{}->header.cls={}u;", dst.0, class_index_word(c.0));

@@ -302,7 +302,7 @@ of 316; in the compiler two allocation sites fewer tenure, so more cells
 are promoted by minor collections (mark edges +11%), which is where its
 0.4% more instructions go (time unchanged).
 
-## H2: sized instances without the property-map fields (design)
+## H2: sized instances without the property-map fields
 
 A sized instance carries the common object header's property map, `props`,
 `cap`, `len` and `prop_index` (24 bytes), for the rare dynamic property
@@ -427,6 +427,26 @@ elsewhere); `tests/propmap_access_gate.sh` (in the unit gate) is the
 renamed-copy check, for the plain and the statistics builds. Outputs
 identical; tsc-ts wall 0.994 and instructions 1.000, the compiler wall
 1.003 and instructions 1.000 (twelve and eight pairs).
+
+Slice 2 as built (Session 352), as designed above, plus what the first
+A/B asked for: `obj_map`'s test costs the TypeScript compiler 0.3% more
+instructions and 0.8% more cycles where its plain objects go through the
+generic paths (10.2 M cached property additions, the out-of-line property
+caches, `prop_find`), so the paths that know their object is shaped (a
+matched addition record or shape, `prop_find`'s shaped branch, a shaped
+append) take `obj_map_plain`, the own-slot probe reads the map once, and
+the collector tests the flag once (an instance without a sidecar has
+nothing more to mark). New fixture `gc/sized_sidecar_props` (data,
+accessor, Symbol and non-enumerable properties on young and old sized and
+header-only instances, enumeration, deletes, frozen and sealed instances,
+relinks, a 260-field instance) in the GC stress filter and the cell header
+gate. Measured against slice 1, outputs identical: tsc-ts (twelve pairs)
+wall 0.994, cycles 0.992, instructions 1.002, peak memory 0.943; the
+compiler (ten pairs) wall 1.000, cycles 1.001, instructions 1.000, peak
+0.988. Old cells live at exit: tsc-ts 463.2 -> 416.9 MB (-10.0%), the
+compiler 539.8 -> 530.6 MB (-1.7%). With H1, tsc-ts's live cells went from
+503.5 to 416.9 MB (-17.2%; the walk predicted -18.7%) and its peak memory
+from 823 to 738 MB (-10.3%); the compiler's peak from 774 to 728 MB (-5.9%).
 
 Gates for each: unit, parity, bundler, selfconf, defaults, GC stress (with
 the cell header gate), conformance plain, strict and at every allocation

@@ -5,7 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-typedef struct { ts_object header; tsv f0; tsv f1; } Cell2;
+typedef struct { ts_sized_head header; tsv f0; tsv f1; } Cell2;
 
 static tsv g_keep = TS_UNDEFINED;   /* a rooted global: what the analysis missed */
 static tsv g_outer = TS_UNDEFINED;  /* the catching activation's own cell */

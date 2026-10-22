@@ -8129,3 +8129,35 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   1.000. Gates: unit, parity (379 identical), bundler 43/43, selfconf,
   defaults (plain and stress), conformance 537/537 plain and strict and
   534/534 at every allocation under protect mode, GC stress.
+- Cell header H2, slice 2: a class instance's prefix is the 32-byte
+  `ts_sized_head` (`{h, proto, cls, shape, dyn}`), its property map an owned
+  sidecar behind `dyn`, made as a zeroed payload on its first own property
+  (`obj_map_w`); `TS_HDR_SIDECAR` marks every class instance (header-only
+  ones too: 32 bytes has no room for a map in place) and survives `delete`'s
+  conversion, which now moves fields and properties into the sidecar's
+  dictionary (the 255-slot limit goes); `obj_map` answers a sidecar object
+  without a sidecar with a shared read-only empty map; the collector marks
+  the sidecar payload; the emitters and the frozen templates use
+  `ts_sized_head` and drop the map stores; field-less classes allocate
+  header-only instances whatever size they registered. The first A/B cost
+  the compiler 0.8% of its cycles through `obj_map`'s test on plain objects,
+  so the paths that know their object is shaped take `obj_map_plain`, the
+  own-slot probe reads the map once and the collector tests the flag once.
+  A/B against slice 1, outputs identical: tsc-ts (twelve pairs) wall 0.994,
+  cycles 0.992, instructions 1.002, peak memory 0.943; the compiler (ten
+  pairs) wall 1.000, cycles 1.001, instructions 1.000, peak 0.988. Old
+  cells live at exit: tsc-ts 463.2 -> 416.9 MB (-10.0%), the compiler
+  539.8 -> 530.6 MB (-1.7%). H1 and H2 together: tsc-ts's live cells
+  503.5 -> 416.9 MB (-17.2%), peak memory 823 -> 738 MB (-10.3%); the
+  compiler's peak 774 -> 728 MB (-5.9%). Fixture `gc/sized_sidecar_props`.
+  Gates: unit (with the propmap and header gates), parity (380 identical),
+  bundler 43/43, selfconf, defaults (plain and stress), conformance 538/538
+  plain and strict and 535/535 at every allocation under protect mode, GC
+  stress (with the cell header gate), tsc-ts and the compiler under protect
+  mode, protect with a minor every 64 allocations and zap with one every 16
+  (outputs identical), the selfhost milestone (own IR identical, plain and
+  under protect; 512/512 corpus fixtures). Next candidates: the native
+  builds compile one generated C file in one process (tsc-ts about 4
+  minutes, the compiler about 5): split the generated C into translation
+  units, compile them in parallel and reuse unchanged objects by content
+  hash (Kaz's request, after the GC work); then the threads work.

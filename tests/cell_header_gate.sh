@@ -16,7 +16,7 @@ CC_BASE="${TSAOT_CC:-gcc -O2}"
 # layout (only the class index word remembers its allocation class; a known
 # limitation of the TSAOT_CLASS_INDEX=0 mode, which production does not use),
 # so the relinks fixture runs with the index on only.
-CORE='sized_header_(layouts|big_record|stack_props)|string_slack_growth|remembered_slots|unsized_with_class_proto'
+CORE='sized_header_(layouts|big_record|stack_props)|sized_sidecar_props|string_slack_growth|remembered_slots|unsized_with_class_proto'
 SMALL="$CORE|sized_header_relinks"
 ALL="$SMALL|site_pretenured_classes"
 NOINDEX="$CORE|site_pretenured_classes"

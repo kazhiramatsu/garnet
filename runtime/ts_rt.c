@@ -946,7 +946,9 @@ static void sc_kill(ts_sc_rec* r){
   size_t from = 0;
   if (!r->raw){
     uint8_t kind = ((ts_gc_header*)obj)->kind;
-    from = kind == TS_KIND_OBJECT ? sizeof(ts_obj_common) : r->size;
+    from = kind == TS_KIND_OBJECT
+      ? ((((ts_gc_header*)obj)->flags & TS_HDR_SIDECAR) ? sizeof(ts_sized_head) : sizeof(ts_obj_common))
+      : r->size;
   }
   if (from < r->size) memset(obj + from, 0xDB, r->size - from);
 }
@@ -1866,7 +1868,7 @@ static tsv ts_new_sized_impl(size_t size, int pretenured){
      has nothing for a descriptor to resolve; its instance is an ordinary
      shaped object with in-object slack, so the properties added later take
      the addition cache and the inline caches instead of dictionary entries. */
-  if (size == sizeof(ts_object) && g_empty_class_plain)
+  if (size == sizeof(ts_sized_head) && g_empty_class_plain)
     return ts_new_object_impl(pretenured, TS_EMPTY_CLASS_SLOTS);
   ts_object* o = pretenured
     ? gc_alloc_pretenured(size, TS_KIND_OBJECT)
@@ -2494,6 +2496,22 @@ static int32_t prop_index_lookup(ts_object* o, ts_key key, uint32_t* probes){
 /* Property value vectors (shaped) and entry vectors (dictionaries) are
    payloads of their object (docs/gc_v2_design.md §6.1, G2c): a dead object's
    vector is released by not being marked. */
+/* A sidecar object's map before its first own property: empty, shared, and
+   read-only (a write through obj_map instead of obj_map_w faults). */
+const ts_propmap g_ts_empty_propmap = { NULL, 0u, 0u, NULL };
+/* The map a property addition (or a conversion) writes: a sidecar object's
+   sidecar, allocated as a zeroed payload of the object on its first own
+   property (docs/cell_header_design.md, H2). */
+static ts_propmap* obj_map_w(ts_object* o){
+  if (!(o->h.flags & TS_HDR_SIDECAR)) return obj_map_plain(o);
+  ts_sized_head* sh = (ts_sized_head*)o;
+  if (!sh->dyn){
+    ts_propmap* m = (ts_propmap*)gc_owned_alloc(&o->h, sizeof(ts_propmap));
+    memset(m, 0, sizeof *m);
+    sh->dyn = m;
+  }
+  return sh->dyn;
+}
 static ts_prop* props_alloc_small(const ts_gc_header* owner){
   RT_STAT_INC(small_props_fresh);
   return (ts_prop*)gc_owned_alloc(owner, 4u * sizeof(ts_prop));
@@ -2506,6 +2524,7 @@ static tsv* vals_alloc_small(const ts_gc_header* owner){
 static void props_release_dead(ts_object* o){
   gc_owned_release_dead(obj_map(o)->props);
   gc_owned_release_dead(obj_map(o)->prop_index);
+  if (o->h.flags & TS_HDR_SIDECAR) gc_owned_release_dead(((ts_sized_head*)o)->dyn);
 }
 static void obj_to_dictionary(ts_object* o){
   if (o->h.gen == TS_GEN_OLD) gc_cards_all(&o->h); /* slots renumber: a remembered range would be stale */
@@ -2536,31 +2555,32 @@ static void obj_to_dictionary(ts_object* o){
 static ts_pref props_append_f(ts_object* o, ts_key key, uint32_t next_shape, uint8_t flags){
   int shaped = obj_shaped(o);
   if (shaped && next_shape == TS_SHAPE_NONE){ obj_to_dictionary(o); shaped = 0; }
+  ts_propmap* m = shaped ? obj_map_plain(o) : obj_map_w(o);   /* a sidecar object's sidecar, made on its first property */
   if (shaped){
-    /* slots below inline_cap are in the cell; o->cap counts external slots. */
+    /* slots below inline_cap are in the cell; m->cap counts external slots. */
     uint32_t icap = o->h.inline_cap;
-    if (obj_map(o)->len >= icap && obj_map(o)->len - icap == obj_map(o)->cap){
-      uint32_t cap = obj_map(o)->cap;
-      if (!cap) obj_map(o)->props = (ts_prop*)vals_alloc_small(&o->h);
-      else obj_map(o)->props = (ts_prop*)gc_owned_realloc(&o->h, obj_map(o)->props, sizeof(tsv) * (size_t)cap, sizeof(tsv) * (size_t)cap * 2u);
-      obj_map(o)->cap = cap ? cap * 2u : 4u;
+    if (m->len >= icap && m->len - icap == m->cap){
+      uint32_t cap = m->cap;
+      if (!cap) m->props = (ts_prop*)vals_alloc_small(&o->h);
+      else m->props = (ts_prop*)gc_owned_realloc(&o->h, m->props, sizeof(tsv) * (size_t)cap, sizeof(tsv) * (size_t)cap * 2u);
+      m->cap = cap ? cap * 2u : 4u;
     }
-  } else if (obj_map(o)->len==obj_map(o)->cap){
-    uint32_t cap = obj_map(o)->cap;
-    if (!cap) obj_map(o)->props = props_alloc_small(&o->h);
-    else obj_map(o)->props = (ts_prop*)gc_owned_realloc(&o->h, obj_map(o)->props, sizeof(ts_prop) * (size_t)cap, sizeof(ts_prop) * (size_t)cap * 2u);
-    obj_map(o)->cap = cap ? cap * 2u : 4u;
+  } else if (m->len==m->cap){
+    uint32_t cap = m->cap;
+    if (!cap) m->props = props_alloc_small(&o->h);
+    else m->props = (ts_prop*)gc_owned_realloc(&o->h, m->props, sizeof(ts_prop) * (size_t)cap, sizeof(ts_prop) * (size_t)cap * 2u);
+    m->cap = cap ? cap * 2u : 4u;
   }
-  if (!shaped) prop_index_reserve(o, obj_map(o)->len + 1u);
-  uint32_t added = obj_map(o)->len++;
+  if (!shaped) prop_index_reserve(o, m->len + 1u);
+  uint32_t added = m->len++;
   if (shaped) *ts_obj_slot_ptr(o, added) = TS_UNDEFINED;
-  else { obj_map(o)->props[added].key=key; obj_map(o)->props[added].val=TS_UNDEFINED; obj_map(o)->props[added].flags=flags; }
+  else { m->props[added].key=key; m->props[added].val=TS_UNDEFINED; m->props[added].flags=flags; }
   /* A user-Symbol property name is a strong edge even though the entry stores
      only its compact id. Enroll old owners when that Symbol is young; the GC
      scanner reconstructs and marks the same edge from the weak side table. */
   if (key >= TS_USERSYM_KEY_BASE)
     ts_write_barrier(ts_obj(o), sym_value_by_id(key - TS_USERSYM_KEY_BASE));
-  if (!shaped && obj_map(o)->prop_index) prop_index_put(o, added);
+  if (!shaped && m->prop_index) prop_index_put(o, added);
   if (shaped) ts_obj_set_shape(o, next_shape);
   SHAPE_CHECK(o);
   return (ts_pref){ o, added };
@@ -2572,7 +2592,7 @@ static ts_pref props_append(ts_object* o, ts_key key, uint32_t next_shape){
 static ts_pref prop_find(ts_object* o, ts_key key){
   RT_STAT_INC(find_prop_calls); RT_STAT_KEY(g_key_prop_find, key);
   if (obj_shaped(o)){
-    uint32_t len = obj_map(o)->len;
+    uint32_t len = obj_map_plain(o)->len;
     uint32_t sid = ts_obj_shape_id(o);
     if (len >= TS_PROP_INDEX_MIN && g_shapes[sid].index){
       uint32_t probes = 0;
@@ -5268,9 +5288,18 @@ static inline void gc_mark_property_key(ts_key key, int young, int depth){
     gc_mark_visit(sym_value_by_id(key - TS_USERSYM_KEY_BASE), young, depth);
 }
 static inline void gc_mark_common_props(ts_object* o, int young, int depth, int stable){
-  if (obj_map(o)->props) gc_payload_mark(obj_map(o)->props);
-  if (obj_map(o)->prop_index) gc_payload_mark(obj_map(o)->prop_index);
-  uint32_t first = 0, end = obj_map(o)->len;
+  /* a sidecar object's map is a payload of its own (docs/cell_header_design.md, H2) */
+  ts_propmap* m;
+  if (TS_RT_UNLIKELY(o->h.flags & TS_HDR_SIDECAR)){
+    m = ((ts_sized_head*)o)->dyn;
+    if (!m) return;
+    gc_payload_mark(m);
+  } else {
+    m = obj_map_plain(o);
+  }
+  if (m->props) gc_payload_mark(m->props);
+  if (m->prop_index) gc_payload_mark(m->prop_index);
+  uint32_t first = 0, end = m->len;
   /* A remembered old plain object rescanned by a minor collection visits its
      dirty cards only (docs/remembered_slots_design.md); 0 (no range) and
      0xFF (every slot) scan everything, as does a sized instance (its header
@@ -5280,15 +5309,15 @@ static inline void gc_mark_common_props(ts_object* o, int young, int depth, int 
     if (r != 0 && r != 0xFF){
       first = (uint32_t)(r >> 4) << 3;
       end = (uint32_t)(r & 0xF) << 3;
-      if (end > obj_map(o)->len) end = obj_map(o)->len;
+      if (end > m->len) end = m->len;
       if (first > end) first = end;
       RT_STAT_INC(remset_precise_scans); RT_STAT_ADD(remset_precise_slots, end - first);
     } else {
-      RT_STAT_INC(remset_full_scans); RT_STAT_ADD(remset_full_slots, obj_map(o)->len);
+      RT_STAT_INC(remset_full_scans); RT_STAT_ADD(remset_full_slots, m->len);
     }
   }
   if (obj_shaped(o)){
-    if (!obj_map(o)->len) return;
+    if (!m->len) return;
     const ts_key* ks = g_ts_shape_keys[ts_obj_shape_id(o)];
     for (uint32_t i=first;i<end;i++){
       gc_mark_property_key(ks[i], young, depth);
@@ -5297,8 +5326,8 @@ static inline void gc_mark_common_props(ts_object* o, int young, int depth, int 
     return;
   }
   for (uint32_t i=first;i<end;i++){
-    gc_mark_property_key(obj_map(o)->props[i].key, young, depth);
-    gc_visit_slot(&obj_map(o)->props[i].val, young, depth, stable);
+    gc_mark_property_key(m->props[i].key, young, depth);
+    gc_visit_slot(&m->props[i].val, young, depth, stable);
   }
 }
 static void gc_mark_drain(int young){
@@ -10375,7 +10404,7 @@ void ts_register_class(tsv proto, ts_class_field* fields, int nfields){
   reg->proto = proto;
   reg->fields = fields;
   reg->nfields = nfields;
-  reg->min_size = sizeof(ts_object);
+  reg->min_size = sizeof(ts_sized_head);
   for (int i = 0; i < nfields; i++){
     size_t width = fields[i].numeric ? sizeof(double) : sizeof(tsv);
     size_t end = fields[i].offset + width;
@@ -10554,7 +10583,10 @@ tsv ts_construct(tsv ctorv, tsv* args, int n){
     uint8_t est = ((ts_func*)ts_ptr(ctorv))->inst_slots;
     inst = ts_new_object_n(est > TS_EMPTY_CLASS_SLOTS ? est : TS_EMPTY_CLASS_SLOTS);
   } else {
-    inst = ts_new_sized(g_class_size[cid]);
+    /* a class registered without fields is header-only, whatever size it
+       was registered with (the frozen untyped emitter registers
+       sizeof(ts_object)) */
+    inst = ts_new_sized(g_class_nfields[cid] ? g_class_size[cid] : sizeof(ts_sized_head));
   }
   tsv proto = ((ts_func*)ts_ptr(ctorv))->prototype_prop;
   ((ts_object*)ts_ptr(inst))->proto = ts_is_obj(proto) ? proto : g_class_proto_tab[cid];
@@ -10593,7 +10625,7 @@ tsv ts_construct(tsv ctorv, tsv* args, int n){
 static int proto_chain_has_struct_class(tsv proto){
   for (int depth = 0; depth < 64 && ts_proto_ref(proto); depth++){
     ts_class_reg* reg = class_reg_for_proto(proto);
-    if (reg && reg->min_size > sizeof(ts_object)) return 1;
+    if (reg && reg->min_size > sizeof(ts_sized_head)) return 1;
     if (chain_link_exotic((ts_object*)ts_ptr(proto))) return 0;
     proto = ((ts_object*)ts_ptr(proto))->proto;
   }
@@ -12314,30 +12346,28 @@ tsv ts_delete_dynamic_strict(tsv obj, tsv keyv, const uint32_t* method_pairs, ui
 /* Delete own property `key` of a property-map holder (an object, a
    function's map, a class's static container): 1 deleted or absent, 0
    refused (non-configurable, sealed or frozen). */
-/* A sized class instance becomes a plain object behind the same prototype
-   (a delete of one of its struct fields; docs/closed_receivers_design.md,
+/* A sized class instance becomes a dictionary object behind the same
+   prototype (a delete of one of its struct fields; docs/closed_receivers_design.md,
    slice 2): its fields in declaration order, then its own properties in
-   order, become the entries of a property dictionary; the struct area turns
-   into the in-object slots of a plain cell of the same size (a dictionary
-   never reads them); its class index word leaves every interval, and the
-   typed accesses' flag goes up. 0 when the cell cannot be described as a
-   plain object (more struct area than in-object slots can cover). */
-/* The conversion's header: no longer sized, the struct area's words become
-   in-object slots (at most TS_INLINE_SLOTS_MAX, so the extent's high byte
-   was 0), and the card range starts empty (an old cell's is marked whole
-   after). */
-static inline void gc_hdr_unsize(ts_gc_header* h, uint32_t slots){
+   order, become the entries of the property dictionary in its sidecar
+   (docs/cell_header_design.md, H2); the struct area is dead space; its class
+   index word leaves every interval, and the typed accesses' flag goes up.
+   0 when the object carries no layout. */
+/* The conversion's header: no longer sized, the map stays in the sidecar
+   (TS_HDR_SIDECAR), no in-object slots, and the card range starts empty (an
+   old cell's is marked whole after). */
+static inline void gc_hdr_unsize(ts_gc_header* h){
   h->flags &= (uint8_t)~TS_HDR_SIZED;
-  h->inline_cap = (uint8_t)slots;
+  h->inline_cap = 0;
   h->hdr_spare = 0;
 }
 static int obj_abandon_layout(tsv obj){
   ts_object* o = (ts_object*)ts_ptr(obj);
   ts_class_reg* reg = class_reg_for(o);
-  size_t area = reg ? ts_obj_sized_bytes(o) - sizeof(ts_object) : 0;
-  if (!reg || area % sizeof(tsv) != 0 || area / sizeof(tsv) > TS_INLINE_SLOTS_MAX) return 0;
+  if (!reg || !(o->h.flags & TS_HDR_SIDECAR)) return 0;
   uint32_t nf = (uint32_t)reg->nfields, ne = obj_map(o)->len, n = nf + ne;
   ts_gc_root(&obj);
+  ts_propmap* m = obj_map_w(o);
   ts_prop* d = n ? (ts_prop*)gc_owned_alloc(&o->h, sizeof(ts_prop) * (n < 4u ? 4u : n)) : NULL;
   o = (ts_object*)ts_ptr(obj);
   reg = class_reg_for(o);
@@ -12351,12 +12381,10 @@ static int obj_abandon_layout(tsv obj){
     d[nf + j].val = *obj_val_at(o, j);
     d[nf + j].flags = obj_flags_at(o, j);
   }
-  if (obj_map(o)->props && obj_map(o)->cap) gc_owned_free(obj_map(o)->props);
-  if (obj_map(o)->prop_index) gc_owned_free(obj_map(o)->prop_index);
-  tsv* slots = (tsv*)((char*)o + sizeof(ts_object));
-  for (size_t i = 0; i < area / sizeof(tsv); i++) slots[i] = TS_UNDEFINED;
-  gc_hdr_unsize(&o->h, (uint32_t)(area / sizeof(tsv)));
-  obj_map(o)->props = d; obj_map(o)->len = n; obj_map(o)->cap = n ? (n < 4u ? 4u : n) : 0u; obj_map(o)->prop_index = NULL;
+  if (m->props && m->cap) gc_owned_free(m->props);
+  if (m->prop_index) gc_owned_free(m->prop_index);
+  gc_hdr_unsize(&o->h);
+  m->props = d; m->len = n; m->cap = n ? (n < 4u ? 4u : n) : 0u; m->prop_index = NULL;
   ts_obj_set_shape(o, TS_SHAPE_NONE);
   o->cls = 0;
   if (o->h.gen == TS_GEN_OLD) gc_cards_all(&o->h);   /* slots renumbered */
@@ -14915,10 +14943,11 @@ static void prop_ic_fill_shape(ts_prop_ic* ic, ts_object* o, ts_key key, uint32_
    This avoids the auxiliary table and keeps small property vectors contiguous. */
 static ts_pref prop_ic_probe_own(ts_prop_ic* ic, ts_object* o, ts_key key){
   if (!ic || ic->megamorphic || ts_obj_is_sized(o)) return PREF_NONE;
+  uint32_t len = obj_map(o)->len;
   for (uint32_t i=0;i<TS_PROP_IC_SIZE;i++){
     ts_prop_ic_entry* e = &ic->entries[i];
     uint32_t slot = e->slot & TS_PIC_SLOT_MASK;
-    if (e->key == key && slot < obj_map(o)->len && obj_key_at(o, slot) == key){
+    if (e->key == key && slot < len && obj_key_at(o, slot) == key){
       /* Keep distinct shapes even when they share a slot. Overwriting the
          matching hint would make a four-shape site miss forever. After warmup,
          sample replacement to retain locality on sites with many shapes. The
@@ -15132,7 +15161,7 @@ static inline ts_prop_add_entry* prop_add_lookup(const ts_prop_ic* ic, ts_object
   if (!ic || ts_obj_is_sized(o)) return NULL;
   ts_prop_add_entry* e = &g_prop_add_cache[prop_add_slot(ic, o->shape)];
   if (e->site == ic && e->shape_before == o->shape && e->key == key &&
-      e->proto == o->proto && e->epoch == g_prop_add_epoch && e->slot == obj_map(o)->len)
+      e->proto == o->proto && e->epoch == g_prop_add_epoch && e->slot == obj_map_plain(o)->len)
     return e;
   return NULL;
 }
@@ -15150,7 +15179,7 @@ static void prop_add_fill(ts_prop_ic* ic, ts_object* o, ts_key key, ts_pref p,
   /* Only a plain append from a cacheable, extensible shape to another one. */
   if ((shape_before & TS_SHAPE_MAX) == TS_SHAPE_NONE || (shape_before >> 29) != 0) return;
   if (ts_obj_shape_id(o) == TS_SHAPE_NONE || ts_obj_integrity(o) != 0) return;
-  if (obj_map(o)->len != len_before + 1u || p.i != len_before) return;
+  if (obj_map_plain(o)->len != len_before + 1u || p.i != len_before) return;
   for (ts_object* q = ts_next_proto(o); q; q = ts_next_proto(q)) if (chain_link_exotic(q)) return;
   /* Only old prototypes are remembered: their handles stay bound to the same
      cell until a full collection, which bumps the epoch. A young prototype's
@@ -15366,7 +15395,7 @@ void ts_set_pic(tsv obj, ts_key key, tsv val, ts_prop_ic* ic){
          (a constructor initializing a fresh object): the same conditions as
          the global addition cache, read from the site itself. */
       if (ic && ic->rec_epoch == g_prop_add_epoch && o->shape == ic->add_shape_before &&
-          obj_map(o)->len == ic->add_slot && ic->add_key == key && o->proto == ic->add_proto &&
+          obj_map_plain(o)->len == ic->add_slot && ic->add_key == key && o->proto == ic->add_proto &&
           !ts_obj_is_sized(o)){
         RT_STAT_INC(prop_add_site_hits);
         RT_STAT_KEY(g_key_add, key);

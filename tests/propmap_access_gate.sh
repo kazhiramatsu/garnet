@@ -32,13 +32,21 @@ for defs in "" "-DTSAOT_RT_STATS"; do
 import re, sys
 out, work = sys.argv[1], sys.argv[2]
 bad = []
+defre = re.compile(r"^[A-Za-z_][^;]*\(")
+def enclosing(lines, ln):
+    for i in range(ln - 1, -1, -1):
+        l = lines[i]
+        if defre.match(l) and not re.match(r"^(typedef|enum|struct|union|#)", l):
+            name = re.sub(r"\(.*", "", l)
+            return re.sub(r".*[^A-Za-z0-9_]", "", name)
+    return "?"
 for line in open(out):
     m = re.match(r"(\S+?):(\d+):\d+: error: (.*)", line)
     if not m: continue
     path, ln, msg = m.group(1), int(m.group(2)), m.group(3)
-    src = open(path if path.startswith("/") else work + "/" + path.lstrip("./")).read().split("\n")[ln - 1]
-    if re.search(r"static inline ts_propmap\* obj_map(_plain)?\(", src): continue
-    bad.append(f"{path.split('/')[-1]}:{ln}: {msg}: {src.strip()}")
+    lines = open(path if path.startswith("/") else work + "/" + path.lstrip("./")).read().split("\n")
+    if enclosing(lines, ln) in ("obj_map", "obj_map_plain"): continue
+    bad.append(f"{path.split('/')[-1]}:{ln}: {msg}: {lines[ln - 1].strip()}")
 for b in bad: print("[propmap] FAIL:", b)
 sys.exit(1 if bad else 0)
 PY

@@ -161,10 +161,13 @@ typedef struct ts_gc_header {
   };
 } ts_gc_header;
 /* The flags byte: in the remembered set (for exactly one cycle; every
-   enrollment, reset, promotion and sweep masks this bit alone), and a sized
-   class instance whose extent the two bytes above hold. */
+   enrollment, reset, promotion and sweep masks this bit alone); a sized
+   class instance whose extent the two bytes above hold; an object whose
+   property map lives in its sidecar (a class instance, sized or header-only,
+   and one `delete` converted; docs/cell_header_design.md, H2). */
 #define TS_HDR_REMEMBERED 1u
 #define TS_HDR_SIZED 2u
+#define TS_HDR_SIDECAR 4u
 /* 8 bytes (docs/cell_header_design.md; docs/gc_v2_design.md §4.4): a heap
    reference is the address, so the cell carries no handle and no list link,
    and its size is its size class's (or its large run's), so it carries no
@@ -457,12 +460,46 @@ typedef struct ts_obj_common {
 #define TS_CLS_RELINKED 0x80000000u
 /* ts_object is exactly the common header (plain object / class-instance prefix). */
 typedef struct ts_obj_common ts_object;
-/* An object's property map (docs/cell_header_design.md, H2). Any object:
-   obj_map. A shaped object, or one of a kind that never moves its map out
-   (arrays, functions, collections, prototypes): obj_map_plain, which the
-   checked builds verify. */
-static inline ts_propmap* obj_map(const ts_object* o){ return (ts_propmap*)&o->map; }
-static inline ts_propmap* obj_map_plain(const ts_object* o){ return (ts_propmap*)&o->map; }
+/* A class instance's prefix (docs/cell_header_design.md, H2): the common
+   prefix's header, prototype, class word and shape at the same offsets, and
+   instead of the 24-byte property map one pointer to an owned sidecar
+   holding it, NULL until the instance's first own dynamic property. Every
+   generated class struct starts with it; its fields follow. */
+typedef struct ts_sized_head {
+  ts_gc_header h;
+  tsv proto;
+  uint32_t cls;
+  uint32_t shape;
+  ts_propmap* dyn;
+} ts_sized_head;
+_Static_assert(sizeof(ts_sized_head) == 32, "a class instance's prefix is 32 bytes");
+_Static_assert(offsetof(ts_sized_head, proto) == offsetof(ts_obj_common, proto) &&
+               offsetof(ts_sized_head, cls) == offsetof(ts_obj_common, cls) &&
+               offsetof(ts_sized_head, shape) == offsetof(ts_obj_common, shape),
+               "both prefixes share the header, prototype, class word and shape");
+/* An object's property map. Any object: obj_map, which for a sidecar object
+   without a sidecar yet answers the shared empty map (read-only memory: a
+   write through it faults; writers take obj_map_w). A shaped object, or one
+   of a kind that never moves its map out (arrays, functions, collections,
+   prototypes): obj_map_plain, which the checked builds verify. */
+extern const ts_propmap g_ts_empty_propmap;
+void ts_abort_msg(const char* m);
+static inline ts_propmap* obj_map(const ts_object* o){
+  if (TS_RT_UNLIKELY(o->h.flags & TS_HDR_SIDECAR)){
+    ts_propmap* d = ((const ts_sized_head*)o)->dyn;
+    return d ? d : (ts_propmap*)&g_ts_empty_propmap;
+  }
+  return (ts_propmap*)&o->map;
+}
+#if (defined(__has_feature) && __has_feature(address_sanitizer)) || defined(__SANITIZE_ADDRESS__) || defined(TSAOT_RT_STATS)
+#define TS_RT_CHECK_PLAIN_MAP 1
+#endif
+static inline ts_propmap* obj_map_plain(const ts_object* o){
+#if defined(TS_RT_CHECK_PLAIN_MAP)
+  if (o->h.flags & TS_HDR_SIDECAR) ts_abort_msg("obj_map_plain on an object whose map is in its sidecar");
+#endif
+  return (ts_propmap*)&o->map;
+}
 static inline uint32_t ts_obj_shape_id(const ts_object* o){ return o->shape & TS_SHAPE_MAX; }
 static inline uint32_t ts_obj_integrity(const ts_object* o){ return o->shape >> 29; }
 static inline void ts_obj_set_shape(ts_object* o, uint32_t shape){
@@ -491,30 +528,32 @@ static inline int ts_obj_is_sized(const ts_object* o){
    extent words after the header (inline_cap low, hdr_spare high). Exact,
    as the allocation's size was: layouts and the location cache compare it. */
 static inline size_t ts_obj_sized_bytes(const ts_object* o){
-  return sizeof(ts_object) + sizeof(tsv) * ((size_t)o->h.inline_cap | (size_t)o->h.hdr_spare << 8);
+  return sizeof(ts_sized_head) + sizeof(tsv) * ((size_t)o->h.inline_cap | (size_t)o->h.hdr_spare << 8);
 }
 /* The extent the two header bytes can describe: 65,535 words after the
-   header (module records are the largest classes: 2,428 fields in the
-   TypeScript compiler). A struct size below the header, off the word grid or
-   past the extent aborts with a message, never truncates. */
+   class instance's prefix (module records are the largest classes: 2,428
+   fields in the TypeScript compiler). A struct size below the prefix, off
+   the word grid or past the extent aborts with a message, never truncates. */
 #define TS_SIZED_EXTENT_MAX 65535u
 __attribute__((noreturn)) void ts_sized_extent_abort(size_t bytes);
 static inline size_t ts_sized_extent_words(size_t bytes){
-  if (TS_RT_UNLIKELY(bytes < sizeof(ts_object) || (bytes - sizeof(ts_object)) % sizeof(tsv) != 0 ||
-                     (bytes - sizeof(ts_object)) / sizeof(tsv) > TS_SIZED_EXTENT_MAX))
+  if (TS_RT_UNLIKELY(bytes < sizeof(ts_sized_head) || (bytes - sizeof(ts_sized_head)) % sizeof(tsv) != 0 ||
+                     (bytes - sizeof(ts_sized_head)) / sizeof(tsv) > TS_SIZED_EXTENT_MAX))
     ts_sized_extent_abort(bytes);
-  return (bytes - sizeof(ts_object)) / sizeof(tsv);
+  return (bytes - sizeof(ts_sized_head)) / sizeof(tsv);
 }
-/* A sized cell's header (heap, stack and stack-check instances alike):
-   TS_HDR_SIZED and the extent. A header-only instance (a class without
-   struct fields) has no extent and stays an unsized object, as it was when
-   the allocation size decided. One of the writers of inline_cap and
-   hdr_spare the header gate admits (tests/header_bytes_gate.sh). */
+/* A class instance's header (heap, stack and stack-check instances alike):
+   its map is in its sidecar (TS_HDR_SIDECAR; the prefix has no room for one
+   in place), and a sized one carries TS_HDR_SIZED and the extent. A
+   header-only instance (a class without struct fields) has no extent and
+   is not sized, as it was when the allocation size decided. One of the
+   writers of inline_cap and hdr_spare the header gate admits
+   (tests/header_bytes_gate.sh). */
 static inline void ts_hdr_init_sized(ts_gc_header* h, size_t bytes){
   size_t words = ts_sized_extent_words(bytes);
   h->inline_cap = (uint8_t)words;
   h->hdr_spare = (uint8_t)(words >> 8);
-  if (words) h->flags |= TS_HDR_SIZED;
+  h->flags |= (uint8_t)(words ? TS_HDR_SIDECAR | TS_HDR_SIZED : TS_HDR_SIDECAR);
 }
 /* A typed class-field access (a struct offset) must take ts_get / ts_set for a
    receiver without the sized-instance layout: a Proxy, a plain object relinked
@@ -1806,7 +1845,7 @@ static inline void ts_write_barrier(tsv owner, tsv value){
    whole (docs/cell_header_design.md). */
 void ts_gc_remember_slot(ts_gc_header* h, uint32_t slot);
 static inline void ts_write_barrier_at(tsv owner, ts_gc_header* oh, tsv* p, tsv value){
-  if (oh->kind == TS_KIND_OBJECT && !(oh->flags & TS_HDR_SIZED)){
+  if (oh->kind == TS_KIND_OBJECT && !(oh->flags & (TS_HDR_SIZED | TS_HDR_SIDECAR))){
     ts_object* o = (ts_object*)oh;
     tsv* iv = ts_obj_inline_vals(o);
     uint32_t slot = (p >= iv && p < iv + oh->inline_cap)

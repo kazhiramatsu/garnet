@@ -146,7 +146,7 @@ static int headers_immutable_mutation_caught(int op){
 }
 
 typedef struct {
-  ts_object o;
+  ts_sized_head o;
   tsv x;
 } pic_test_class;
 
@@ -156,7 +156,7 @@ typedef struct {
 } frame_root_test;
 
 typedef struct {
-  ts_object o;
+  ts_sized_head o;
   tsv boxed;
   double numeric;
 } registry_test_class;
@@ -1422,7 +1422,7 @@ int main(){
      tenured site whose old cells die in a full collection returns to young. */
   {
     const uint32_t site = 7u;
-    const size_t size = sizeof(ts_object) + 2u * sizeof(tsv);
+    const size_t size = sizeof(ts_sized_head) + 2u * sizeof(tsv);
     tsv keep = ts_new_array(0); ts_gc_root(&keep);
     tsv proto = ts_new_object(); ts_gc_root(&proto);
     int young_first = 0;
@@ -1472,8 +1472,8 @@ int main(){
   /* The class registry does not keep prototypes alive: a prototype that
      takes a dead registered prototype's cell answers with its own layout. */
   {
-    typedef struct { ts_object o; tsv a, b; } two_fields;
-    typedef struct { ts_object o; tsv x; } one_field;
+    typedef struct { ts_sized_head o; tsv a, b; } two_fields;
+    typedef struct { ts_sized_head o; tsv x; } one_field;
     static ts_class_field f_two[2], f_one[1];
     f_two[0].name_id = 495001u; f_two[0].offset = offsetof(two_fields, a); f_two[0].numeric = 0;
     f_two[1].name_id = 495002u; f_two[1].offset = offsetof(two_fields, b); f_two[1].numeric = 0;
@@ -1497,7 +1497,7 @@ int main(){
       ((ts_object*)ts_ptr(inst))->proto = reused;
       tsv val = ts_new_string("own layout", 10); ts_gc_root(&val);
       ts_set(inst, f_one[0].name_id, val);
-      own_layout = ((one_field*)ts_ptr(inst))->x == val && ((ts_object*)ts_ptr(inst))->len == 0u;
+      own_layout = ((one_field*)ts_ptr(inst))->x == val && obj_map((ts_object*)ts_ptr(inst))->len == 0u;
       ts_gc_unroot(2);
     }
     /* protect mode quarantines dead cells: no cell is reused, nothing to check */
@@ -1510,21 +1510,22 @@ int main(){
      across promotion, full collections, barriers and absent deletes; dictionary
      entries of an old sized instance are rescanned whole. */
   {
-    const size_t w3 = sizeof(ts_object) + 3u * sizeof(tsv);
-    const size_t w300 = sizeof(ts_object) + 300u * sizeof(tsv);
+    const size_t w3 = sizeof(ts_sized_head) + 3u * sizeof(tsv);
+    const size_t w300 = sizeof(ts_sized_head) + 300u * sizeof(tsv);
     tsv small = ts_new_sized(w3); ts_gc_root(&small);
     ts_object* so = (ts_object*)ts_ptr(small);
     int small_ok = ts_obj_is_sized(so) && so->h.inline_cap == 3u && so->h.hdr_spare == 0u
       && ts_obj_sized_bytes(so) == w3 && so->shape == TS_SHAPE_NONE;
-    tsv header_only = ts_new_sized(sizeof(ts_object)); ts_gc_root(&header_only);
+    tsv header_only = ts_new_sized(sizeof(ts_sized_head)); ts_gc_root(&header_only);
     int header_only_ok = !ts_obj_is_sized((ts_object*)ts_ptr(header_only));
     /* the helper itself, as stack instances use it: no extent, no flag */
-    struct { ts_object o; tsv f[2]; } stack_cells[2];
+    struct { ts_sized_head o; tsv f[2]; } stack_cells[2];
     memset(stack_cells, 0, sizeof stack_cells);
-    ts_hdr_init_sized(&stack_cells[0].o.h, sizeof(ts_object));
-    ts_hdr_init_sized(&stack_cells[1].o.h, sizeof(ts_object) + 2u * sizeof(tsv));
-    header_only_ok = header_only_ok && !ts_obj_is_sized(&stack_cells[0].o)
-      && ts_obj_is_sized(&stack_cells[1].o) && stack_cells[1].o.h.inline_cap == 2u;
+    ts_hdr_init_sized(&stack_cells[0].o.h, sizeof(ts_sized_head));
+    ts_hdr_init_sized(&stack_cells[1].o.h, sizeof(ts_sized_head) + 2u * sizeof(tsv));
+    header_only_ok = header_only_ok && !ts_obj_is_sized((ts_object*)&stack_cells[0].o)
+      && ts_obj_is_sized((ts_object*)&stack_cells[1].o) && stack_cells[1].o.h.inline_cap == 2u
+      && (stack_cells[0].o.h.flags & TS_HDR_SIDECAR) && (stack_cells[1].o.h.flags & TS_HDR_SIDECAR);
     /* a 300-word layout: the extent's high byte is where a plain object keeps its cards */
     tsv big_proto = ts_new_proto(); ts_gc_root(&big_proto);
     static ts_class_field big_field;
@@ -1578,26 +1579,26 @@ int main(){
       ts_class_field* hi_fields = (ts_class_field*)calloc(w + 1u, sizeof(ts_class_field));
       for (uint32_t f = 0; f <= w; f++){
         hi_fields[f].name_id = 494000u + 10u * w + f;
-        hi_fields[f].offset = sizeof(ts_object) + f * sizeof(tsv);
+        hi_fields[f].offset = sizeof(ts_sized_head) + f * sizeof(tsv);
       }
       ts_register_class(lo_proto, hi_fields, (int)w);        /* the first w fields */
       ts_register_class(hi_proto, hi_fields, (int)w + 1);    /* and one more */
-      tsv lo = ts_new_sized(sizeof(ts_object) + w * sizeof(tsv)); ts_gc_root(&lo);
+      tsv lo = ts_new_sized(sizeof(ts_sized_head) + w * sizeof(tsv)); ts_gc_root(&lo);
       ((ts_object*)ts_ptr(lo))->proto = hi_proto;
       ts_key extra = hi_fields[w].name_id;
       tsv before = ts_get(lo, extra);
       ts_set(lo, extra, ts_num(7.5));
       tsv after = ts_get(lo, extra);
-      int own = ((ts_object*)ts_ptr(lo))->len == 1u;   /* a dictionary entry, not a field */
+      int own = obj_map((ts_object*)ts_ptr(lo))->len == 1u;   /* a dictionary entry, not a field */
       if (!ts_is_undef(before) || ts_to_num(after) != 7.5 || !own) layouts_ok = 0;
       ts_gc_unroot(3);
     }
     CK("cell header: a layout is exact, not a size class", layouts_ok);
     CK("cell header: sizes the header cannot describe abort",
-       sized_extent_aborts(sizeof(ts_object) + 65536u * sizeof(tsv)) &&
-       sized_extent_aborts(sizeof(ts_object) + 4u) &&
+       sized_extent_aborts(sizeof(ts_sized_head) + 65536u * sizeof(tsv)) &&
+       sized_extent_aborts(sizeof(ts_sized_head) + 4u) &&
        sized_extent_aborts(sizeof(ts_gc_header)) &&
-       !sized_extent_aborts(sizeof(ts_object) + 65535u * sizeof(tsv)));
+       !sized_extent_aborts(sizeof(ts_sized_head) + 65535u * sizeof(tsv)));
     ts_gc_unroot(4);
   }
   printf("\n%s\n", fail==0?"ALL RUNTIME TESTS PASS":"FAILURES");
