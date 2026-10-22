@@ -8102,3 +8102,17 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   dynamic-property fields into a sidecar, 16 more bytes per instance; the
   walk put H1 and H2 together at -94 MB of tsc-ts's live cells), then the
   threads work.
+- Cell header H2, design (`docs/cell_header_design.md`, H2 section): a
+  sized instance's property map (24 bytes) moves into an owned sidecar
+  behind one pointer, 16 bytes per instance (tsc-ts holds 2.82 M sized
+  instances at exit; 923 objects own any property storage). The common
+  prefix reorders to `{h, proto, cls, shape, map}` so `h`, `proto`, `cls`
+  and `shape` share offsets with the new 32-byte `ts_sized_head`;
+  `TS_HDR_SIDECAR` marks objects whose map lives behind `dyn` (every class
+  instance, header-only ones included, and converted ones). The compiler
+  lists every map access (128 places in 39 functions, 13 more in the
+  statistics build): the shaped and plain-only paths keep the in-place
+  fields, about 25 generic functions go through `obj_map`, and a gate
+  compiles a renamed copy to keep it so. Slice 1 (no behavior change):
+  the reorder, `obj_map`, the conversions and the gate; slice 2: the
+  sidecar itself.

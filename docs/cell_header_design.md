@@ -302,17 +302,133 @@ of 316; in the compiler two allocation sites fewer tenure, so more cells
 are promoted by minor collections (mark edges +11%), which is where its
 0.4% more instructions go (time unchanged).
 
-## H2 (sketch, after H1)
+## H2: sized instances without the property-map fields (design)
 
-The review's simpler direction comes first: a sized instance keeps `h`,
-`proto`, `cls` and `shape` and replaces `props`, `cap`, `len` and
-`prop_index` (24 bytes) with one nullable pointer to an owned property
-sidecar holding them, allocated as a payload when a property is first
-added to an instance: 16 bytes saved per instance, no address-keyed side
-table, no extra young-death logging, the existing payload tracing.
-(Moving a dictionary's capacity and index into its payload, proposed in
-`docs/gc_v2_design.md` §4.5, is a smaller step on the way.) Open: every
-generic property path that reads `props` on an object (about 60 sites),
-the property caches, `delete`'s in-place conversion to a plain
-`ts_object`, integrity flags (they stay in `shape`), and the GC's scan of
-an instance with a sidecar.
+A sized instance carries the common object header's property map, `props`,
+`cap`, `len` and `prop_index` (24 bytes), for the rare dynamic property
+added to it: of the 2.83 M objects tsc-ts holds at exit, 2.82 M are sized
+instances and 923 own any property storage (the statistics build's
+resident walk).
+H2 moves the map of a sized instance into an owned sidecar: one nullable
+pointer instead of 24 bytes, 16 bytes saved per instance (tsc-ts: the walk
+above put H1 and H2 together at -94.1 MB of live cells, H1 alone measured
+-40.4 MB). This is the review's direction: no address-keyed side table, no
+extra young-death logging, payload tracing as it is.
+
+### Layout
+
+```c
+typedef struct ts_propmap {          /* a named-property map */
+  ts_prop* props; uint32_t cap, len;
+  uint32_t* prop_index;
+} ts_propmap;
+typedef struct ts_obj_common {       /* every object kind's prefix, 48 bytes */
+  ts_gc_header h; tsv proto;
+  uint32_t cls, shape;               /* moved up: common to both layouts */
+  union { ts_propmap map; struct { ts_prop* props; uint32_t cap, len; uint32_t* prop_index; }; };
+} ts_obj_common;
+typedef struct ts_sized_head {       /* a class instance's prefix, 32 bytes */
+  ts_gc_header h; tsv proto;
+  uint32_t cls, shape;
+  ts_propmap* dyn;                   /* its own dynamic properties: NULL until the first */
+} ts_sized_head;
+```
+
+`h`, `proto`, `cls` and `shape` keep one offset in both prefixes, so
+everything that reads them (the property caches' shape guards, the class
+index tests, the generated code's typed guards, relinking, integrity) works
+on either. A new header flag, `TS_HDR_SIDECAR` (bit 2), says the map lives
+behind `dyn`: set on every instance made from a class struct (heap through
+`ts_new_sized`, stack, stack-check copies), sized or header-only, and kept
+by `delete`'s conversion; `TS_HDR_SIZED` keeps its meaning (an extent above
+zero). A header-only instance is now 32 bytes, smaller than an in-place map
+needs, so it is a sidecar object too, never a plain one (which would read
+its map past the cell). Generated class structs start with
+`ts_sized_head header;`; the extent counts words after it; the emitters no
+longer store `props`, `cap` and `len` at allocation (cells and stack structs
+are zeroed, `dyn` starts NULL).
+
+### Every access to the map
+
+The compiler lists them: with the four fields renamed in a scratch copy,
+the runtime fails to compile at 128 places in 39 functions, 13 more under
+`TSAOT_RT_STATS`, a few in the unit tests, three emitter templates and the
+frozen template. They fall in two classes.
+
+- **Plain objects only** (no sidecar object reaches them; they keep the
+  in-place fields): the shaped paths (`ts_obj_slot_ptr`, the inline
+  property cache probes, `ts_write_barrier_at`'s slot computation, literal
+  layouts: `ts_lit_store`, `new_object_layout_impl`,
+  `ts_obj_adopt_layout`), prototype objects (`ts_clone_class_proto`),
+  function-constructed instances (`ts_construct`'s slot estimate,
+  `ts_construct_end`), typed arrays (`ts_ta_try_length`), the shape
+  statistics, and `obj_to_dictionary` past its early return for unshaped
+  objects.
+- **Any object** (they go through `ts_propmap* m = obj_map(o)` for reads,
+  `obj_map_w(o)` for writes, which allocates the sidecar as a payload owned
+  by the object): the dictionary accessors (`obj_key_at`, `obj_val_at`,
+  `obj_flags_at`), the index (`prop_index_capacity`, `_put`, `_rebuild`,
+  `_reserve`, `_lookup`, which take the map), `prop_find`, `props_define`,
+  `props_append_f`'s dictionary path, `props_delete_own`,
+  `props_release_dead`, enumeration (`ts_prop_own_enum`,
+  `count_own_enum_sym_props`, `inspect_own_sym_props`,
+  `ts_get_own_property_descriptors`, `propbag_len` and `_prop`,
+  `json_emit_prop_map_direct`), the out-of-line property caches
+  (`prop_ic_probe_own`, `prop_ic_probe`, `prop_ic_fill`, `prop_add_lookup`,
+  `prop_add_fill`, `ts_set_pic`), `obj_abandon_layout`, and the collector
+  (`gc_mark_common_props`, the statistics' `g0_count_fate`).
+
+`obj_map(o)` is `&o->map` for a plain object and `o->dyn` (or a shared
+empty map) for a sidecar object: one test of the header byte the paths
+already load. The shaped hot paths do not take it.
+
+**A gate keeps it that way**: a script copies the runtime, renames the
+in-place fields, compiles it (also under `TSAOT_RT_STATS`) and fails when a
+function outside the plain-only list touches them; a new direct access in
+generic code fails the build check, not a program.
+
+### What changes besides the accessors
+
+- **The collector**: `gc_mark_common_props` marks the sidecar payload, then
+  the map's vector and index, then its entries; a sized instance stays
+  whole (no card window), a converted sidecar object (below) keeps the card
+  window over its dictionary entries.
+- **`delete` of a struct field** (`obj_abandon_layout`): the fields and the
+  own properties become dictionary entries in the sidecar (allocated if
+  NULL), `TS_HDR_SIZED` clears, `TS_HDR_SIDECAR` stays; the struct area is
+  dead space (it was in-object slots no dictionary reads). The 255-slot
+  limit goes: the area no longer has to fit `inline_cap`.
+- **Stack instances** allocate their sidecar with `malloc`, as their
+  property vectors are today (`gc_owned_alloc` for an owner outside the
+  heap).
+- **The class registry and `ts_construct`**: sizes count from
+  `sizeof(ts_sized_head)`; a class registered without fields allocates a
+  header-only instance, whatever size it was registered with (the frozen
+  untyped emitter registers `sizeof(ts_object)`).
+- **The frozen emitter's templates** (the minimal fix the frozen-source rule
+  allows): `ts_sized_head header;` and no map stores, so the selfhost bench
+  keeps compiling and the parity stays byte-identical.
+
+### Slices and verification
+
+1. No behavior change, runtime only: reorder `ts_obj_common`, add
+   `ts_propmap` and `obj_map` (always in place), convert the generic
+   functions, add the gate. Generated code unchanged (parity trivially), A/B
+   neutral.
+2. The sidecar: `ts_sized_head`, `TS_HDR_SIDECAR`, `obj_map`'s branch and
+   `obj_map_w`, the collector, `obj_abandon_layout`, header-only instances,
+   the emitters and the frozen templates, the registry's base size.
+
+Gates for each: unit, parity, bundler, selfconf, defaults, GC stress (with
+the cell header gate), conformance plain, strict and at every allocation
+under protect mode; new targeted tests: dynamic properties (data,
+accessors, Symbol keys, non-enumerable, frozen and sealed instances) added
+to young and old sized and header-only instances, heap and stack, before
+and after promotion, rescanned by minor and full collections; enumeration
+(`Object.keys`, `entries`, `for-in`, spread, `Object.assign`,
+`JSON.stringify`, `console.log`) of instances with dynamic properties;
+`delete` of struct fields and dynamic properties, including instances
+whose struct area is under three words and above 255; the property caches
+on sidecar objects (own, absent, added); relinked instances with dynamic
+properties; tsc-ts and the compiler under protect and zap modes; A/B (wall,
+instructions, collections, peak memory); the selfhost milestone.
