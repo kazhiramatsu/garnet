@@ -8010,3 +8010,23 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   estimate: main parses before starting its workers, so about 0.97 s at
   four checkers and 0.85 s at eight (1.8-2x), at about 812 MB per checker.
   Harness for the accessor measurement: `benchmarks/threads/isolate_access.c`.
+- Cell header H1, design only (`docs/cell_header_design.md`), ahead of the
+  threads work (milestone A holds a program per checker): the header drops
+  from 16 to 8 bytes by removing `size`. Measured with a walk over the live
+  old cells at exit (class bytes, payloads excluded): tsc-ts 503 MB, -35.4 MB
+  with H1 and -94.1 MB with H2 (sized instances without their 24 bytes of
+  dynamic-property fields); the TypeScript compiler 579 MB, -30.9 MB (its
+  long-lived objects are plain). `size` doubled as the sized-instance test,
+  the layout-size check and the location cache's key: a sized instance now
+  carries `TS_HDR_SIZED` (the `remembered` byte becomes a flags byte) and its
+  exact struct extent in words in `inline_cap` and `hdr_spare` (module
+  records reach 2,428 fields), every `hdr_spare` writer goes through helpers
+  that leave sized instances alone, stack instances start unshaped, and
+  header-only instances stay unsized. Three reviews (Codex, gpt-6.1-sol at
+  xhigh effort) found what a first inventory missed: capacity cannot stand
+  in for the exact size (stack instances have no block, a capacity admits a
+  larger layout), production stack instances start shaped, four defensive
+  `hdr_spare` stores run before any check (an absent `delete` would have
+  rewritten an old instance's extent), `gc_block.bytes` saturates at 4 GiB,
+  and header-only instances must stay unsized; the third round found
+  nothing minor left.
