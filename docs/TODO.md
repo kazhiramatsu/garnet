@@ -7891,3 +7891,34 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   (`s352s1`) and run under protect mode, protect with a minor every 64
   allocations, every site tenured at once with protect and a minor every
   64, and zap with one every 16: outputs identical.
+- Allocation-site pretenuring, slice 2: arrays and object literals
+  (`docs/site_pretenuring_design.md`, "Slice 2 as built"). `AllocArray` and
+  class-less `AllocObject` sites call `ts_new_array_site`,
+  `ts_new_object_site`, `ts_new_object_n_site` and
+  `ts_new_object_layout_site` under the same rule; an old array's element
+  storage follows its owner. At the 85% threshold the arrays made tsc-ts no
+  faster: array sites surviving between 85% and 90% left garbage early, the
+  first full collection reclaimed 27% of the heap instead of 13%, and the
+  full-collection pacing (twice the live bytes after a quarter or more is
+  reclaimed) added a fourth full collection (the last one pausing 72 ms).
+  At 90% the run keeps three, reverts 11 sites instead of 18 and pretenures
+  slightly more cells, so the default became 90% (class sites included).
+  Eight ABBA pairs each, outputs identical: tsc-ts 90% against 85% (one
+  binary) wall 0.981; against slice 1 wall 0.992 (instructions 0.996, peak
+  memory 1.013); the TypeScript compiler against slice 1 wall 0.987
+  (instructions 0.994, peak memory 1.031). Fixture
+  `gc/site_pretenured_literals` (literals, empty objects and arrays kept
+  then grown with young values and new properties, a phase change; in the
+  GC stress list); `tests/pretenure_aot_gate.sh` keeps the runtime's
+  feedback off (it checks the static strategy's counts); parity known row
+  (a strategy name in a comment). Gates: unit, parity (376 identical),
+  bundler 43/43, selfconf, defaults (plain and stress), the pretenure gate,
+  GC stress, conformance 531/531 plain, strict, at every allocation under
+  protect mode, and with every site tenured at once; tsc-ts and the
+  compiler rebuilt (`s352s2`) and run under protect mode, protect with a
+  minor every 64 allocations, every site tenured at once, and zap with a
+  minor every 16: outputs identical; after the default change: unit, GC
+  stress, conformance 531/531.
+  Also measured: tsc-ts against scriptc's binary, interleaved: emitting
+  1.750 s against 1.020 s (34.4 G against 18.3 G instructions, 812 MB
+  against 403 MB peak memory), checking only 1.220 s against 0.640 s.

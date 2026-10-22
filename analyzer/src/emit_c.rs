@@ -18454,16 +18454,24 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         let id = ctx.fresh_label();
                         s.push_str("  {\n");
                         emit_layout_decl(s, id, keys);
-                        let alloc = if st == AllocStrategy::PretenuredHeap {
-                            "ts_new_object_layout_pretenured"
+                        if let Some(sid) = alloc_site_id(site.0, st) {
+                            let _ = writeln!(
+                                s,
+                                "  {} = ts_new_object_layout_site(&_ts_lit_{}, {}u); /* site {} {:?} layout */\n  }}",
+                                ctx.vname(dst.0), id, sid, site.0, st
+                            );
                         } else {
-                            "ts_new_object_layout"
-                        };
-                        let _ = writeln!(
-                            s,
-                            "  {} = {}(&_ts_lit_{}); /* site {} {:?} layout */\n  }}",
-                            ctx.vname(dst.0), alloc, id, site.0, st
-                        );
+                            let alloc = if st == AllocStrategy::PretenuredHeap {
+                                "ts_new_object_layout_pretenured"
+                            } else {
+                                "ts_new_object_layout"
+                            };
+                            let _ = writeln!(
+                                s,
+                                "  {} = {}(&_ts_lit_{}); /* site {} {:?} layout */\n  }}",
+                                ctx.vname(dst.0), alloc, id, site.0, st
+                            );
+                        }
                         if site_stats_enabled() {
                             // diagnostic: object literals report under 4000000002
                             let _ = writeln!(s, "  ts_site_note({}, 4000000002u);", site.0);
@@ -18483,7 +18491,28 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     } else {
                         None
                     };
+                    let sid = alloc_site_id(site.0, st);
                     match slots {
+                        Some(n) if sid.is_some() => {
+                            let _ = writeln!(
+                                s,
+                                "  {} = ts_new_object_n_site({}, {}u); /* site {} {:?} */",
+                                ctx.vname(dst.0), n, sid.unwrap(), site.0, st
+                            );
+                            if site_stats_enabled() {
+                                let _ = writeln!(s, "  ts_site_note({}, 4000000002u);", site.0);
+                            }
+                        }
+                        None if sid.is_some() => {
+                            let _ = writeln!(
+                                s,
+                                "  {} = ts_new_object_site({}u); /* site {} {:?} */",
+                                ctx.vname(dst.0), sid.unwrap(), site.0, st
+                            );
+                            if site_stats_enabled() {
+                                let _ = writeln!(s, "  ts_site_note({}, 4000000002u);", site.0);
+                            }
+                        }
                         Some(n) => {
                             let _ = writeln!(
                                 s,
@@ -18514,19 +18543,30 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 .get(&site.0)
                 .copied()
                 .unwrap_or(AllocStrategy::Heap);
-            let alloc = if st == AllocStrategy::PretenuredHeap {
-                "ts_new_array_pretenured"
+            if let Some(sid) = alloc_site_id(site.0, st) {
+                let _ = writeln!(
+                    s,
+                    "  {} = ts_new_array_site(0, {}u); /* site {} {:?} */",
+                    ctx.vname(dst.0),
+                    sid,
+                    site.0,
+                    st
+                );
             } else {
-                "ts_new_array"
-            };
-            let _ = writeln!(
-                s,
-                "  {} = {}(0); /* site {} {:?} */",
-                ctx.vname(dst.0),
-                alloc,
-                site.0,
-                st
-            );
+                let alloc = if st == AllocStrategy::PretenuredHeap {
+                    "ts_new_array_pretenured"
+                } else {
+                    "ts_new_array"
+                };
+                let _ = writeln!(
+                    s,
+                    "  {} = {}(0); /* site {} {:?} */",
+                    ctx.vname(dst.0),
+                    alloc,
+                    site.0,
+                    st
+                );
+            }
             if site_stats_enabled() {
                 // diagnostic: arrays report under the pseudo function id 4000000001
                 let _ = writeln!(s, "  ts_site_note({}, 4000000001u);", site.0);

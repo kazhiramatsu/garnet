@@ -34,7 +34,7 @@ static size_t g_old_bytes = 0;
 static size_t g_full_threshold_bytes = (size_t)16u * 1024u * 1024u;
 static int g_full_threshold_forced = 0; /* env override pins the trigger (stress knob) */
 static int g_site_pretenure = 1;           /* TSAOT_GC_SITE_PRETENURE=0: every allocation site stays young (docs/site_pretenuring_design.md) */
-static uint32_t g_site_tenure_pct = 85u;   /* TSAOT_GC_SITE_TENURE_PCT: the survival a site needs to allocate old */
+static uint32_t g_site_tenure_pct = 90u;   /* TSAOT_GC_SITE_TENURE_PCT: the survival a site needs to allocate old */
 static uint32_t g_site_min_allocs = 100u;  /* TSAOT_GC_SITE_MIN_ALLOCS: the allocations a decision window needs */
 static int g_site_log = 0;                 /* TSAOT_GC_SITE_LOG=1: each site decision on stderr */
 static int g_pretenure_ctors = 1;       /* TSAOT_PRETENURE_CTORS=0: guarded constructions allocate young (docs/pretenured_construction_design.md) */
@@ -1331,6 +1331,16 @@ static void gc_sites_digest(int full){
   }
   g_site_touched_len = 0;
 }
+/* A generated allocation's site: young or old as the site has decided, and
+   its id in the cell's header for the feedback. */
+static inline int gc_site_tenured(uint32_t site){
+  return g_alloc_sites[site].state == TS_SITE_TENURED;
+}
+static inline tsv gc_site_note(tsv v, uint32_t site){
+  ((ts_gc_header*)ts_ptr(v))->spare = (uint16_t)site;
+  g_alloc_sites[site].allocs++;
+  return v;
+}
 #ifdef TSAOT_RT_STATS
 static void gc_sites_stats(FILE* out){
   unsigned tenured = 0, reverted = 0;
@@ -1398,6 +1408,12 @@ tsv ts_new_object(void){ return ts_new_object_impl(0, TS_INLINE_SLOTS_DEFAULT); 
 tsv ts_new_object_pretenured(void){ return ts_new_object_impl(1, TS_INLINE_SLOTS_DEFAULT); }
 tsv ts_new_object_n(uint32_t slots){ return ts_new_object_impl(0, slots); }
 tsv ts_new_object_n_pretenured(uint32_t slots){ return ts_new_object_impl(1, slots); }
+tsv ts_new_object_site(uint32_t site){
+  return gc_site_note(ts_new_object_impl(gc_site_tenured(site), TS_INLINE_SLOTS_DEFAULT), site);
+}
+tsv ts_new_object_n_site(uint32_t slots, uint32_t site){
+  return gc_site_note(ts_new_object_impl(gc_site_tenured(site), slots), site);
+}
 static tsv ts_new_proto_impl(int pretenured){
   ts_object* o = pretenured
     ? gc_alloc_pretenured(sizeof(ts_object), TS_KIND_OBJECT)
@@ -1832,13 +1848,9 @@ tsv ts_new_sized_pretenured(size_t size){ return ts_new_sized_impl(size, 1); }
    feedback, and the prototype stored here with the barrier an old cell
    needs (class prototypes start young). */
 tsv ts_new_sized_site(size_t size, uint32_t site, tsv proto){
-  ts_alloc_site* s = &g_alloc_sites[site];
-  int old = s->state == TS_SITE_TENURED;
-  tsv v = ts_new_sized_impl(size, old);
-  ts_object* o = (ts_object*)ts_ptr(v);
-  o->h.spare = (uint16_t)site;
-  o->proto = proto;
-  s->allocs++;
+  int old = gc_site_tenured(site);
+  tsv v = gc_site_note(ts_new_sized_impl(size, old), site);
+  ((ts_object*)ts_ptr(v))->proto = proto;
   if (old) ts_write_barrier(v, proto);
   return v;
 }
@@ -2050,6 +2062,9 @@ static tsv ts_new_array_impl(uint32_t len, int pretenured){
 }
 tsv ts_new_array(uint32_t len){ return ts_new_array_impl(len, 0); }
 tsv ts_new_array_pretenured(uint32_t len){ return ts_new_array_impl(len, 1); }
+tsv ts_new_array_site(uint32_t len, uint32_t site){
+  return gc_site_note(ts_new_array_impl(len, gc_site_tenured(site)), site);
+}
 int ts_is_array(tsv v){ return ts_is_array_fast(v); }
 uint32_t ts_array_len(tsv arr){ return ts_is_indexed_array_fast(arr) ? ((ts_array*)ts_ptr(arr))->len : 0; }
 tsv ts_array_get(tsv arr, uint32_t i){
@@ -15187,6 +15202,9 @@ static tsv new_object_layout_impl(ts_lit_layout* L, int pretenured){
 }
 tsv ts_new_object_layout(ts_lit_layout* L){ return new_object_layout_impl(L, 0); }
 tsv ts_new_object_layout_pretenured(ts_lit_layout* L){ return new_object_layout_impl(L, 1); }
+tsv ts_new_object_layout_site(ts_lit_layout* L, uint32_t site){
+  return gc_site_note(new_object_layout_impl(L, gc_site_tenured(site)), site);
+}
 int ts_obj_adopt_layout(tsv obj, ts_lit_layout* L){
   if (TS_TOP16(obj) != TS_SEL_OBJECT) return 0;
   ts_object* o = (ts_object*)ts_ptr(obj);

@@ -56,10 +56,14 @@ if grep -q '_pretenured' "$disabled_c"; then
   exit 1
 fi
 
+# The runtime's own feedback (docs/site_pretenuring_design.md) stays off:
+# the counts below are the static strategy's.
 TSAOT_GC_YOUNG_THRESHOLD=1 \
+TSAOT_GC_SITE_PRETENURE=0 \
 TSAOT_RT_STATS_FILE="$stats" \
   "$work/default" >"$work/output"
 TSAOT_GC_YOUNG_THRESHOLD=1 \
+TSAOT_GC_SITE_PRETENURE=0 \
 TSAOT_RT_STATS_FILE="$disabled_stats" \
   "$work/disabled" >"$work/disabled.output"
 

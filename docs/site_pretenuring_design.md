@@ -77,8 +77,9 @@ it finds dead. After each collection, `gc_sites_digest` visits the listed
 sites only:
 
 - a young site whose window holds at least `g_site_min_allocs` (100)
-  allocations is decided: survivors at `g_site_tenure_pct` (85) percent or
-  more of the window tenure the site; either way the window restarts. A
+  allocations is decided: survivors at `g_site_tenure_pct` (90; 85 in
+  slice 1, see slice 2) percent or more of the window tenure the site;
+  either way the window restarts. A
   site with no survivor is never listed, so its window stays open and its
   later survivors weigh against everything it allocated;
 - a tenured site, at a full collection, returns to young for good (`NEVER`)
@@ -136,14 +137,44 @@ feedback off the binary retires 0.4% more instructions than the build
 before (the site's count, the header store, the promotion's count): the
 plumbing's cost, inside the total.
 
+## Slice 2 as built: arrays and object literals
+
+`AllocArray` calls `ts_new_array_site(0, id)` and an object literal
+`ts_new_object_site(id)`, `ts_new_object_n_site(n, id)` or
+`ts_new_object_layout_site(&layout, id)`, under the same rule as classes
+(not for `Stack` and `PretenuredHeap` sites; a literal's or an array's
+strategy is an annotation, so an unproved one stays as it was). Their
+prototypes are the runtime's (`Object.prototype`, `Array.prototype`), which
+the pretenured constructors already store with the barrier. An old array's
+element storage is allocated old (`gc_owned_alloc` follows the owner), so
+an array that grows after its site tenured keeps a valid payload.
+
+At 85% the arrays made tsc-ts no faster (wall 1.005, instructions 1.006
+against slice 1): the statistics build showed a fourth full collection.
+Array sites whose survival sits between 85% and 90% leave garbage in the
+old generation early in the run, the first full collection (at 16 MB)
+reclaims 27% of the heap instead of 13%, and the pacing rule
+(`docs/full_gc_pacing_design.md`: the next threshold at twice the live
+bytes when a collection reclaims a quarter or more, four times otherwise)
+schedules the later ones sooner; the last one, at 284 MB, paused 72 ms. At
+90% the run keeps three full collections, reverts 11 sites instead of 18,
+and pretenures slightly more cells (3.14 M against 3.12 M). The default
+became 90%. Eight ABBA pairs each, outputs identical:
+
+| | wall | instructions | cycles | peak memory |
+|---|---|---|---|---|
+| tsc-ts, slice 2 at 90% against 85% (one binary) | 0.981 | 0.989 | 0.979 | 1.006 |
+| tsc-ts, slice 2 at 90% against slice 1 | 0.992 | 0.996 | 0.992 | 1.013 |
+| the TypeScript compiler, slice 2 at 90% against slice 1 | 0.987 | 0.994 | 0.988 | 1.031 |
+
+tsc-ts tenures 307 sites (11 return). The compiler's long-lived literals
+and arrays (the measurement's emit nodes among them) pay for the extra
+memory with 1.3% of its time.
+
 ## Slices
 
-1. Class instances (this document).
-2. Arrays and object literals (`AllocArray`, `AllocObject` without a class:
-   `ts_new_object_n`, layouts): tsc-ts's arrays (69% of their survivors at
-   85%), the compiler's emit nodes and long-lived literals. Arrays grow
-   their element storage after allocation; the payload of an old array is
-   allocated old.
+1. Class instances (done, above).
+2. Arrays and object literals (done, below).
 3. If measurement asks for it: the runtime's own sites with a site passed
    in (`ts_construct`'s generic instances: 222 K in the compiler, all
    surviving; `Array.prototype.slice`).

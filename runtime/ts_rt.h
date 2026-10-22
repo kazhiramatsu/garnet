@@ -1236,6 +1236,12 @@ tsv  ts_array_get(tsv arr, uint32_t i);
 typedef struct ts_lit_layout { uint32_t shape; uint32_t n; const ts_key* keys; } ts_lit_layout;
 tsv ts_new_object_layout(ts_lit_layout* layout);
 tsv ts_new_object_layout_pretenured(ts_lit_layout* layout);
+/* The site forms of the generated object, literal and array allocations
+   (docs/site_pretenuring_design.md, slice 2). */
+tsv ts_new_object_site(uint32_t site);
+tsv ts_new_object_n_site(uint32_t slots, uint32_t site);
+tsv ts_new_object_layout_site(ts_lit_layout* layout, uint32_t site);
+tsv ts_new_array_site(uint32_t len, uint32_t site);
 /* Give a fresh empty object the layout in one step; 1 when its slots now
    follow the layout (store by slot), 0 when the object was not empty. */
 int ts_obj_adopt_layout(tsv obj, ts_lit_layout* layout);
