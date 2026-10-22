@@ -3612,16 +3612,34 @@ fn switch_plan_for(f: &Function, unboxed: &BTreeSet<u32>, int_local: &BTreeSet<u
     plan
 }
 
+/// The smallest int32 no case of the chain has (INT32_MIN unless a case
+/// takes it): a non-integral discriminant switches on it to reach the default.
+fn switch_no_case_value(chain: &SwitchChain) -> String {
+    let used: BTreeSet<i64> = chain.cases.iter().flat_map(|c| c.values.iter().copied()).collect();
+    let mut v = i32::MIN as i64;
+    while used.contains(&v) {
+        v += 1;
+    }
+    if v == i32::MIN as i64 { "INT32_MIN".to_string() } else { v.to_string() }
+}
+
 fn emit_switch_chain(s: &mut String, chain: &SwitchChain, ctx: &Ctx) {
     let l = ctx.fresh_label();
     let is_int = ctx.int_local.contains(&chain.disc);
     if is_int {
         let _ = writeln!(s, "  switch (d{}) {{", chain.disc);
     } else {
+        // ToInt32 of the double (one instruction on ARMv8.3: ts_to_int32), and
+        // a value no case has when the double is not exactly that integer (a
+        // fraction, NaN, an infinity, out of range): it reaches the default
+        // through the switch's own bounds check. -0 converts to 0 and compares
+        // equal, as `-0 === 0`.
         let _ = writeln!(
             s,
-            "  {{ double _sw{} = {}; if (_sw{} >= -2147483648.0 && _sw{} <= 2147483647.0 && (double)(int32_t)_sw{} == _sw{}) switch ((int32_t)_sw{}) {{",
-            l, ctx.num(chain.disc), l, l, l, l, l
+            "  {{ double _sw{l} = {d}; int32_t _si{l} = ts_to_int32(_sw{l}); if ((double)_si{l} != _sw{l}) _si{l} = {none}; switch (_si{l}) {{",
+            l = l,
+            d = ctx.num(chain.disc),
+            none = switch_no_case_value(chain)
         );
     }
     let push_path = |ctx: &Ctx, path: &[usize]| {
@@ -3656,7 +3674,7 @@ fn emit_switch_chain(s: &mut String, chain: &SwitchChain, ctx: &Ctx) {
     if is_int {
         s.push_str("  }\n");
     } else {
-        let _ = writeln!(s, "  }} else goto L{}_sw; }}", l);
+        s.push_str("  } }\n");
     }
 }
 

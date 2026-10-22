@@ -7922,3 +7922,50 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   Also measured: tsc-ts against scriptc's binary, interleaved: emitting
   1.750 s against 1.020 s (34.4 G against 18.3 G instructions, 812 MB
   against 403 MB peak memory), checking only 1.220 s against 0.640 s.
+- Measured: clang's profile-guided optimization of the generated C
+  (`-fprofile-instr-generate`, a training run, `-fprofile-instr-use`, for
+  the generated code, the runtime and the host alike; scratch builds of
+  `s352s2`'s C, not a driver feature). Eight ABBA pairs each against the same
+  C built without a profile, tsc-ts emitting the TypeScript 6.0.3 compiler
+  project (ES2020 target), outputs identical: trained on that very run, wall
+  0.880 (instructions 0.870); trained out of sample on tsc-ts's own source
+  emitting for ES2024, wall 1.342 (instructions 1.023, cycles 1.349: the
+  ES2020 downlevel transforms the measured run needs were never trained, so
+  clang compiled and placed them as cold code; text 23.2 -> 18.2 MB); trained
+  on tsc-ts's own source emitting for both ES2024 and ES2020, wall 0.914
+  (instructions 0.888). PGO is worth about 9% when the training covers the
+  program's paths and costs a third more time when it does not; a `garnet
+  --pgo` path (`docs/refactor_master_plan.md` Phase 7, item 6) would need
+  the user's own training runs and protection for the untrained paths.
+  Deferred by Kaz's call: PGO goes in last, after the generated code and the
+  runtime improvements it would otherwise mask.
+- Tried and dropped: a Map's keys and values interleaved in one array (entry
+  i's key at `kv[2i]`, its value at `kv[2i + 1]`), expected to save a hit's
+  second cache miss (`ts_map_get` and `mapset_probe` held the second and
+  third places of tsc-ts's top-of-stack profile). Relinked runtimes, eight
+  ABBA pairs each, outputs identical: tsc-ts wall 0.992 (cycles 0.998,
+  instructions 1.001), the TypeScript compiler 0.997 (cycles 0.999, peak
+  memory 1.012). The value's load was never a second wait: once the slot
+  gives the dense index, the key's and the value's addresses are both known
+  and the core issues the two loads together; the lookup's latency is the
+  chain slot -> entry, which interleaving does not shorten. Reverted.
+- Switch discriminants (`docs/switch_chain_design.md`): a numeric switch
+  emitted as a C jump table guarded its double discriminant with two
+  compares against materialized double constants and a branch to the
+  default label (8 instructions before the table's own bounds check). It
+  now switches on `ts_to_int32(d)` (one FJCVTZS on ARMv8.3) and replaces it
+  with a value no case has (INT32_MIN unless a case takes it) when the double
+  is not exactly that integer, so fractions, NaN, the infinities and values
+  off by a multiple of 2^32 reach the default through the table's own bounds
+  check, branch-free (fjcvtzs, scvtf, fcmp, csel); -0 matches case 0. Kaz's
+  suggestion ("default でエラーにする"): dropping the guard alone would have
+  sent 261.5 to case 261 and NaN to case 0. Measured first, unsoundly: tsc-ts
+  without any guard retires 1.4% fewer instructions (cycles 0.995). As built,
+  eight ABBA pairs each, outputs identical: tsc-ts instructions 0.991, the
+  TypeScript compiler 0.997, both time-neutral. A computed goto (labels as
+  values) would not help: clang already emits these switches as compact jump
+  tables, and the bounds check cannot go (most kinds take the default).
+  Fixture `control/switch_table_discriminants`. Gates: unit, parity (377
+  identical), bundler 43/43, selfconf, conformance 532/532 plain and strict.
+  Also measured, unsoundly: the class-binding TDZ checks (6,428 sites in
+  tsc-ts) cost at most 0.7% of its cycles.

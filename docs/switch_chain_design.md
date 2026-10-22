@@ -37,9 +37,17 @@ have dozens of cases.
    jump table or a binary search. Requirements checked per chain: at least
    four cases, no duplicate value (JS picks the first, C would reject),
    every compare temp defined once and read only by the pattern, and each
-   nested segment being the whole else-body. A `double` discriminant is
-   guarded (`-2^31 <= d <= 2^31-1` and integral) and otherwise jumps to the
-   default label; an integer local switches directly. The chain's own
+   nested segment being the whole else-body. A `double` discriminant
+   switches on its ToInt32 (`ts_to_int32`, one FJCVTZS on ARMv8.3), replaced
+   by a value no case has (INT32_MIN unless a case takes it) when the double
+   is not exactly that integer — a fraction, NaN, an infinity, out of range —
+   so it reaches the default through the jump table's own bounds check; -0
+   converts to 0 and compares equal (`-0 === 0`). Session 352: this replaced
+   an explicit range guard (two compares against materialized double
+   constants and a branch to the default label before the switch): tsc-ts
+   retires 0.9% fewer instructions and the TypeScript compiler 0.3%, both
+   time-neutral (eight ABBA pairs each). An integer local switches
+   directly. The chain's own
    constant and compare temps are still emitted and left to dead-code
    elimination; nested chains inside case bodies convert too. Emission
    replays the original if/else path segments so loop-keyed plans still
