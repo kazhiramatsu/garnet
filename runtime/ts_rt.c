@@ -1269,7 +1269,7 @@ static void* gc_alloc(size_t sz, uint8_t kind){
   size_t cap;
   ts_gc_header* h = (ts_gc_header*)gc_cell_alloc(sz, 0, &cap);
   gc_account_alloc(sz, cap);
-  h->kind=kind; h->gen=TS_GEN_YOUNG; h->size=sz;
+  h->kind=kind; h->gen=TS_GEN_YOUNG;
   if (TS_RT_UNLIKELY(((g_young_log_kinds >> kind) & 1u) || sz > GC_PAYLOAD_SMALL_MAX)) gc_young_log_push(h);
   g_young_fresh_bytes += sz;
   g_young_new_since_minor++;
@@ -1288,7 +1288,7 @@ static void* gc_alloc_pretenured(size_t sz, uint8_t kind){
   size_t cap;
   ts_gc_header* h = (ts_gc_header*)gc_cell_alloc(sz, 1, &cap);
   gc_account_alloc(sz, cap);
-  h->kind=kind; h->gen=TS_GEN_OLD; h->size=sz;
+  h->kind=kind; h->gen=TS_GEN_OLD;
   g_old_bytes += cap;
   RT_STAT_INC(pretenured_alloc);
   return h;
@@ -1677,7 +1677,6 @@ void ts_init_fn_stack(ts_func* f, ts_code code, tsv* env, uint32_t envlen, int t
   memset(f, 0, sizeof(*f));
   f->o.h.kind = TS_KIND_FUNC;
   f->o.h.gen = TS_GEN_NONHEAP;
-  f->o.h.size = sizeof(ts_func);
   f->o.proto = ts_proto_ref(g_function_proto_v) ? g_function_proto_v : TS_NULL;
   f->code = (void*)code;
   f->prototype_prop = TS_UNDEFINED;
@@ -4369,7 +4368,7 @@ tsv ts_symbol_tostring(tsv sym){
    "string"` is one of the most frequent dispatch forms in compiler code. */
 #define TS_TYPEOF_STATIC(name, text, n) \
   static struct { ts_gc_header h; uint32_t len, hash, flags; tsv parent; uint32_t offset; char data[n + 1]; } \
-    name = { { TS_KIND_STRING, 0, TS_GEN_NONHEAP, 0, 0, 0 }, n, 0u, \
+    name = { { TS_KIND_STRING, 0, TS_GEN_NONHEAP, 0, 0 }, n, 0u, \
              TS_STR_FLAG_ASCII | TS_STR_FLAG_STATIC, TS_UNDEFINED, 0u, text };
 TS_TYPEOF_STATIC(g_typeof_number, "number", 6)
 TS_TYPEOF_STATIC(g_typeof_string, "string", 6)

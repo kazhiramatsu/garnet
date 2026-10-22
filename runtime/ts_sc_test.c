@@ -13,7 +13,7 @@ static tsv g_outer = TS_UNDEFINED;  /* the catching activation's own cell */
 /* What the emitted code does for a Stack class instance in check mode. */
 static tsv new_cell(uint32_t site, const char* fn, double v){
   Cell2* o = (Cell2*)ts_sc_alloc(sizeof(Cell2), site, fn);
-  o->header.h.kind = TS_KIND_OBJECT; o->header.h.gen = 2; o->header.h.size = sizeof(Cell2);
+  o->header.h.kind = TS_KIND_OBJECT; o->header.h.gen = 2;
   ts_hdr_init_sized(&o->header.h, sizeof(Cell2));
   o->header.proto = TS_NULL; o->header.shape = TS_SHAPE_NONE;
   o->f0 = ts_num(v); o->f1 = TS_UNDEFINED;

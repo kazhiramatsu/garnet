@@ -8080,3 +8080,25 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   minor every 64 allocations and zap with one every 16 (outputs
   identical), the selfhost milestone (own IR identical, plain and under
   protect; 511/511 corpus fixtures).
+- Cell header H1, commit 2: `size` leaves the header, which is 8 bytes
+  now (asserted): its writers in allocation and stack functions, the stack
+  instances' stores in both emitters (the frozen template's minimal fix)
+  and the static strings' positional initializers (runtime, both emitters,
+  frozen templates) go. A/B against commit 1, outputs identical: tsc-ts
+  (twelve pairs) wall 0.989, instructions 0.998, peak memory 0.947; the
+  TypeScript compiler (eight pairs) wall 1.000, instructions 1.004, peak
+  0.953. Old cells live at exit: tsc-ts 503.5 -> 463.2 MB (-8.0%), the
+  compiler 573.6 -> 539.8 MB (-5.9%). Smaller requests fill the young
+  byte budget later (tsc-ts 99 minor collections instead of 107, the
+  compiler 295 instead of 316); in the compiler two sites fewer tenure,
+  so more cells are promoted by minor collections (mark edges +11%), the
+  0.4% instructions. Gates: unit, parity (379 identical), bundler 43/43,
+  selfconf, defaults (plain and stress), conformance 537/537 plain and
+  strict and 534/534 at every allocation under protect mode, GC stress
+  (with the cell header gate), tsc-ts and the compiler under protect mode,
+  protect with a minor every 64 allocations and zap with one every 16
+  (outputs identical), the selfhost milestone (own IR identical, plain and
+  under protect; 511/511 corpus fixtures). Next: H2 (a sized instance's
+  dynamic-property fields into a sidecar, 16 more bytes per instance; the
+  walk put H1 and H2 together at -94 MB of tsc-ts's live cells), then the
+  threads work.

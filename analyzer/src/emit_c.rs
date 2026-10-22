@@ -10148,7 +10148,7 @@ fn emit_static_string_literals(s: &mut String, literals: &BTreeMap<Vec<u16>, usi
         let (len, storage) = c_string_storage_bytes_units(units);
         let _ = writeln!(
             s,
-            "static struct {{ ts_gc_header h; uint32_t len, hash, flags; tsv parent; uint32_t offset; char data[{}]; }} TS_STRLIT_{} = {{ {{ TS_KIND_STRING, 0, TS_GEN_NONHEAP, 0, 0, 0 }}, {}u, {}u, {}, TS_UNDEFINED, 0u, {} }};",
+            "static struct {{ ts_gc_header h; uint32_t len, hash, flags; tsv parent; uint32_t offset; char data[{}]; }} TS_STRLIT_{} = {{ {{ TS_KIND_STRING, 0, TS_GEN_NONHEAP, 0, 0 }}, {}u, {}u, {}, TS_UNDEFINED, 0u, {} }};",
             storage.len(),
             id,
             len,
@@ -18399,7 +18399,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                             // the quarantine copy of the same initialization
                             let o = format!("_sco{}", dst.0);
                             let _ = writeln!(s, "  {{ {0}* {1} = ({0}*)ts_sc_alloc(sizeof({0}), {2}u, __func__);", cn, o, site.0);
-                            let _ = writeln!(s, "  {0}->header.h.kind=TS_KIND_OBJECT; {0}->header.h.gen=2; {0}->header.h.size=sizeof({1}); ts_hdr_init_sized(&{0}->header.h, sizeof({1})); {0}->header.proto={2}; {0}->header.shape={3};", o, cn, proto_expr, shape);
+                            let _ = writeln!(s, "  {0}->header.h.kind=TS_KIND_OBJECT; {0}->header.h.gen=2; ts_hdr_init_sized(&{0}->header.h, sizeof({1})); {0}->header.proto={2}; {0}->header.shape={3};", o, cn, proto_expr, shape);
                             if class_index_enabled() {
                                 let _ = writeln!(s, "  {}->header.cls={}u;", o, class_index_word(c.0));
                             }
@@ -18416,7 +18416,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         } else {
                             format!("  {1} sobj{0} = {{0}};", dst.0, cn)
                         };
-                        let _ = writeln!(s, "{0} sobj{1}.header.h.kind=TS_KIND_OBJECT; sobj{1}.header.h.mark=0; sobj{1}.header.h.gen=2; sobj{1}.header.h.size=sizeof({2}); ts_hdr_init_sized(&sobj{1}.header.h, sizeof({2})); sobj{1}.header.proto={3}; sobj{1}.header.props=0; sobj{1}.header.cap=0; sobj{1}.header.len=0; sobj{1}.header.shape={4};", decl, dst.0, cn, proto_expr, shape);
+                        let _ = writeln!(s, "{0} sobj{1}.header.h.kind=TS_KIND_OBJECT; sobj{1}.header.h.mark=0; sobj{1}.header.h.gen=2; ts_hdr_init_sized(&sobj{1}.header.h, sizeof({2})); sobj{1}.header.proto={3}; sobj{1}.header.props=0; sobj{1}.header.cap=0; sobj{1}.header.len=0; sobj{1}.header.shape={4};", decl, dst.0, cn, proto_expr, shape);
                         if class_index_enabled() {
                             let _ = writeln!(s, "  sobj{}.header.cls={}u;", dst.0, class_index_word(c.0));
                         }

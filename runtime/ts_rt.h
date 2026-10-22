@@ -159,16 +159,17 @@ typedef struct ts_gc_header {
     uint32_t pin_word;
     struct { uint16_t spare; uint8_t inline_cap; uint8_t hdr_spare; };
   };
-  size_t size;     /* allocated cell bytes (written, no longer read: H1 removes it) */
 } ts_gc_header;
 /* The flags byte: in the remembered set (for exactly one cycle; every
    enrollment, reset, promotion and sweep masks this bit alone), and a sized
    class instance whose extent the two bytes above hold. */
 #define TS_HDR_REMEMBERED 1u
 #define TS_HDR_SIZED 2u
-/* 16 bytes (docs/gc_v2_design.md §4.4): a heap reference is the address,
-   so the cell carries no handle and no list link. */
-_Static_assert(sizeof(ts_gc_header) == 16, "the cell header is 16 bytes");
+/* 8 bytes (docs/cell_header_design.md; docs/gc_v2_design.md §4.4): a heap
+   reference is the address, so the cell carries no handle and no list link,
+   and its size is its size class's (or its large run's), so it carries no
+   size. A cell stays 16-byte aligned; its body starts at offset 8. */
+_Static_assert(sizeof(ts_gc_header) == 8, "the cell header is 8 bytes");
 enum { TS_GEN_YOUNG = 0, TS_GEN_OLD = 1, TS_GEN_NONHEAP = 2 };
 void ts_gc_remember(ts_gc_header* h);
 

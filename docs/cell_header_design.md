@@ -3,8 +3,8 @@
 Session 352. Status: design for H1, revised after a review (Codex,
 gpt-6.1-sol at xhigh effort: one blocking, three major and one minor
 finding), a second (two blocking, two major) and a third (one blocking,
-one major, nothing minor), all answered below; H1's first commit built
-("H1 commit 1 as built", below); H2 sketched. Runtime (`ts_rt.c`, `ts_rt.h`),
+one major, nothing minor), all answered below; H1 built in two commits
+("H1 as built", below); H2 sketched. Runtime (`ts_rt.c`, `ts_rt.h`),
 emitter (`emit_c.rs`), the frozen emitter's templates
 (`analyzer_ts/src/emit.ts`, `emitc.ts`: the minimal fix the frozen-source
 rule allows, as for D3). Follows `docs/gc_v2_design.md` §4.4 and §6.8.2
@@ -232,11 +232,13 @@ allocations and zap with one every 16 (outputs identical); A/B of both
 programs (wall, instructions, collection counts, peak memory); the selfhost
 milestone (the frozen typed analyzer's own IR byte-identical).
 
-## H1 commit 1 as built
+## H1 as built
 
-Session 352. The flags byte, `TS_HDR_SIZED` and the extent, as designed
-above; the header keeps `size` (written, never read). Where the build
-departs from the draft:
+Session 352. Commit 1: the flags byte, `TS_HDR_SIZED` and the extent, as
+designed above, with `size` still written and never read. Commit 2: `size`
+leaves the header (8 bytes, asserted), with its three writers and the
+positional initializers of static strings in the runtime, both emitters and
+the frozen templates. Where the build departs from the draft:
 
 - **The encoding check** runs at class registration and in `ts_new_sized`
   (`ts_sized_extent_words`, aborting through `ts_sized_extent_abort`), not
@@ -283,12 +285,22 @@ four mutations (card writes over a sized instance, shaped stack instances,
 flagged header-only instances, the card window over a sized instance's
 entries) fails at least one of them.
 
-Measured against the previous commit (outputs identical): tsc-ts, twelve
-pairs, wall 1.000, instructions 1.000, peak memory 1.004; the TypeScript
-compiler, eight pairs, wall 0.998, instructions 0.999, peak 1.000. The
-collections are the same (tsc-ts 107 minor and 3 full; the compiler 317
-and 316 minor, 3 full), and the heap counted at tsc-ts's third full
-collection is 0.8% larger: capacities, not requests.
+Measured, outputs identical throughout. Commit 1 against the commit
+before it: tsc-ts (twelve pairs) wall 1.000, instructions 1.000, peak
+memory 1.004; the TypeScript compiler (eight pairs) wall 0.998,
+instructions 0.999, peak 1.000; the same collections (tsc-ts 107 minor and
+3 full; the compiler 317 and 316 minor, 3 full), and the heap counted at
+tsc-ts's third full collection 0.8% larger (capacities, not requests).
+Commit 2 against commit 1: tsc-ts wall 0.989, instructions 0.998, peak
+memory 0.947; the compiler wall 1.000, instructions 1.004, peak 0.953.
+The old cells live at exit (the statistics build's resident walk) shrink
+from 503.5 MB to 463.2 MB in tsc-ts (-8.0%; the walk above predicted
+-7.0%) and from 573.6 MB to 539.8 MB in the compiler (-5.9%; predicted
+-5.3%). Smaller requests fill the young generation's byte budget later:
+tsc-ts runs 99 minor collections instead of 107, the compiler 295 instead
+of 316; in the compiler two allocation sites fewer tenure, so more cells
+are promoted by minor collections (mark edges +11%), which is where its
+0.4% more instructions go (time unchanged).
 
 ## H2 (sketch, after H1)
 
