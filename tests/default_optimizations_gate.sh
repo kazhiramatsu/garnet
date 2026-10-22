@@ -87,4 +87,30 @@ fi
   echo "[default-opts] FAIL: generated program did not allocate a pretenured cell"
   exit 1
 }
-echo "[default-opts] PASS: PIC, root frames, pretenuring, young allocation, and mimalloc defaults are active (GC stress=${TSAOT_CI_GC_STRESS:-0})"
+
+# Allocation-site pretenuring (docs/site_pretenuring_design.md): class
+# allocations name their sites, and a site whose instances survive tenures.
+site_fixture="$ROOT/tests/conformance/exhaustive/gc/site_pretenured_classes.ts"
+env \
+  -u TSAOT_CC \
+  -u TSAOT_ANALYZER \
+  -u TSAOT_UNTYPED \
+  -u TSAOT_PRETENURE \
+  -u TSAOT_SITE_PRETENURE \
+  "$ROOT/garnet" -o "$work/sites.c" "$site_fixture" >>"$build_log" 2>&1
+grep -q 'ts_new_sized_site(' "$work/sites.c" || {
+  echo "[default-opts] FAIL: class allocations do not name their sites by default"
+  exit 1
+}
+env \
+  -u TSAOT_GC_SITE_PRETENURE \
+  -u TSAOT_GC_SITE_TENURE_PCT \
+  -u TSAOT_GC_SITE_MIN_ALLOCS \
+  "${runtime_gc_env[@]}" \
+  TSAOT_GC_SITE_LOG=1 \
+  "$work/sites" >/dev/null 2>"$work/sites.log"
+grep -q ' tenured: ' "$work/sites.log" || {
+  echo "[default-opts] FAIL: no allocation site tenured"
+  exit 1
+}
+echo "[default-opts] PASS: PIC, root frames, pretenuring (escape-guided and by site), young allocation, and mimalloc defaults are active (GC stress=${TSAOT_CI_GC_STRESS:-0})"

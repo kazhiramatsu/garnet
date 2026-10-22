@@ -1220,6 +1220,12 @@ tsv  ts_call_method(tsv fn, tsv* args, int nargs);        /* method dispatch (ar
 static inline int ts_is_callable(tsv v){ return ts_is_func(v); }
 tsv  ts_new_sized(size_t size);
 tsv  ts_new_sized_pretenured(size_t size);
+/* Allocation-site pretenuring (docs/site_pretenuring_design.md): a generated
+   class allocation names its site (the IR site + 1, 1..TS_ALLOC_SITE_MAX)
+   and hands over the prototype, which the runtime stores with the barrier
+   an old cell needs. */
+#define TS_ALLOC_SITE_MAX 65535u
+tsv  ts_new_sized_site(size_t size, uint32_t site, tsv proto);
 /* arrays (contiguous storage with an internal sparse-hole sentinel) */
 tsv  ts_new_array(uint32_t len);    /* length-len sparse array (all slots holes) */
 tsv  ts_new_uint16_array(tsv input);

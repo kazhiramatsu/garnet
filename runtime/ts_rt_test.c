@@ -1396,6 +1396,59 @@ int main(){
   CK("fetch promise survives minor", ts_is_obj(fp));
   ts_gc_unroot(4);
   ts_gc_unroot(2);
+  /* Allocation-site pretenuring (docs/site_pretenuring_design.md): a site
+     whose cells survive their collection allocates old, an old cell keeps a
+     young prototype and a young property alive through the barrier, and a
+     tenured site whose old cells die in a full collection returns to young. */
+  {
+    const uint32_t site = 7u;
+    const size_t size = sizeof(ts_object) + 2u * sizeof(tsv);
+    tsv keep = ts_new_array(0); ts_gc_root(&keep);
+    tsv proto = ts_new_object(); ts_gc_root(&proto);
+    int young_first = 0;
+    for (int i = 0; i < 200; i++){
+      tsv x = ts_new_sized_site(size, site, proto);
+      if (i == 0)   /* before anything else allocates (the stress gate collects at every allocation) */
+        young_first = ((ts_gc_header*)ts_ptr(x))->gen == TS_GEN_YOUNG
+          && ((ts_gc_header*)ts_ptr(x))->spare == site
+          && ts_strict_eq(((ts_object*)ts_ptr(x))->proto, proto);
+      ts_gc_root(&x);
+      ts_array_push(keep, x);
+      ts_gc_unroot(1);
+    }
+    tsv first = ts_array_get(keep, 0);
+    ts_gc_collect_young();
+    /* two old cells: one holds a young prototype (the allocation's own
+       barrier), the other a young property (the store's barrier) */
+    tsv young_proto = ts_new_object(); ts_gc_root(&young_proto);
+    tsv tenured = ts_new_sized_site(size, site, young_proto); ts_gc_root(&tenured);
+    tsv holder = ts_new_sized_site(size, site, proto); ts_gc_root(&holder);
+    ts_gc_unroot(3); ts_gc_root(&tenured); ts_gc_root(&holder);   /* the young prototype only through the old cell */
+    tsv young_val = ts_new_string("kept by an old cell", 19);
+    ts_gc_root(&young_val);
+    ts_set(holder, (ts_key)(4242), young_val);
+    ts_gc_unroot(1);
+    tsv young_proto_h = ((ts_object*)ts_ptr(tenured))->proto;
+    int old_alloc = ((ts_gc_header*)ts_ptr(tenured))->gen == TS_GEN_OLD
+      && ((ts_gc_header*)ts_ptr(holder))->gen == TS_GEN_OLD;
+    ts_gc_collect_young();
+    tsv expect = ts_new_string("kept by an old cell", 19); ts_gc_root(&expect);
+    int barrier_ok = ts_gc_debug_cell_live(young_proto_h)
+      && ts_strict_eq(((ts_object*)ts_ptr(tenured))->proto, young_proto_h)
+      && ts_strict_eq(ts_get(holder, (ts_key)(4242)), expect);
+    ts_gc_unroot(1);
+    for (int i = 0; i < 300; i++) (void)ts_new_sized_site(size, site, proto);   /* old garbage */
+    ts_gc_collect();
+    tsv after = ts_new_sized_site(size, site, proto);
+    int reverted = ((ts_gc_header*)ts_ptr(after))->gen == TS_GEN_YOUNG;
+    tsv other = ts_new_sized_site(size, site + 1u, proto);   /* an untouched site starts young */
+    int other_young = ((ts_gc_header*)ts_ptr(other))->gen == TS_GEN_YOUNG;
+    int kept_ok = ts_array_len(keep) == 200u && ts_gc_debug_cell_live(first);
+    CK("site pretenuring: young first, tenured after a surviving window", young_first && old_alloc);
+    CK("site pretenuring: an old cell keeps its young prototype and property", barrier_ok);
+    CK("site pretenuring: a tenured site with dying old cells returns to young", reverted && other_young && kept_ok);
+    ts_gc_unroot(4);
+  }
   printf("\n%s\n", fail==0?"ALL RUNTIME TESTS PASS":"FAILURES");
   return fail?1:0;
 }

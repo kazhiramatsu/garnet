@@ -7843,3 +7843,51 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   each, outputs identical): tsc-ts wall 0.846 (2.14 -> 1.81 s, peak memory
   0.883), the TypeScript compiler wall 0.876 (3.94 -> 3.44 s, peak memory
   0.890).
+
+### Session 352: Allocation-site pretenuring
+
+- Allocation-site pretenuring by survival feedback, slice 1: class instances
+  (`docs/site_pretenuring_design.md`). Measured first, with a relinked
+  runtime that keys each allocation by its return address: tsc-ts allocates
+  3.41 M class instances from 707 sites and 77% survive their first
+  collection, bimodally by site (at a threshold of 85%, 237 sites hold 70%
+  of the allocations and 88.5% of the survivors, and 3% of what they
+  allocate dies young); the TypeScript compiler's 1.26 M come from 119 sites
+  that all stay below 10%. A heap class allocation now calls
+  `ts_new_sized_site(sizeof(S), IR site + 1, proto)`: the site's id rides in
+  the header's spare half-word, promotion counts each site's survivors, and
+  after a collection the sites it touched are digested: a window of at
+  least 100 allocations with 85% surviving tenures the site (it allocates
+  old from then on, so the collector neither marks nor promotes its cells),
+  and a tenured site whose old cells a full collection finds mostly dead
+  returns to young for good. The runtime stores the prototype with the
+  barrier an old cell needs (class prototypes start young); every other
+  store into an instance already has one. Knobs: `TSAOT_SITE_PRETENURE=0`
+  (emitter: the plain allocation, the parity oracle's form),
+  `TSAOT_GC_SITE_PRETENURE=0`, `TSAOT_GC_SITE_TENURE_PCT`,
+  `TSAOT_GC_SITE_MIN_ALLOCS` (0 and 1 tenure every site at its first
+  collection: a stress mode for the barriers), `TSAOT_GC_SITE_LOG=1`.
+  tsc-ts: 235 sites tenure, 5 small ones return; against the build before
+  (eight ABBA pairs, outputs identical) wall 0.967 (1.82 -> 1.765 s),
+  instructions 0.965, peak memory 1.004 (every class instance old had given
+  0.970 at +20% memory); the same binary with the feedback off against on
+  0.9645, the plumbing costing 0.4% instructions; a threshold of 75%
+  neutral against 85%. The TypeScript compiler: neutral (wall 0.999, peak
+  memory 0.997; every instance old had given 1.009).
+  Tests: a runtime unit test (the decision, an old cell keeping a young
+  prototype and a young property, the return to young; dropping the
+  prototype's barrier fails it), fixture `gc/site_pretenured_classes`
+  (factories, a class evaluated per call, subclasses, dynamic properties, a
+  phase change; added to the GC stress list), and the defaults gate checks
+  that class allocations name their sites and one tenures. Found while
+  testing (not a bug): a site whose kept array stops being used reverts at
+  the next full collection, its instances really dead (the frame slot is
+  reused after the array's last use). Gates: unit, parity (376 identical,
+  one known row: the frozen escape analysis puts a Point stored into a
+  module-level ring on the stack), bundler 43/43, selfconf, defaults (plain
+  and stress), GC stress, conformance 530/530 plain, strict, at every
+  allocation under protect mode, and with every site tenured at once at
+  every allocation under protect mode; tsc-ts and the compiler rebuilt
+  (`s352s1`) and run under protect mode, protect with a minor every 64
+  allocations, every site tenured at once with protect and a minor every
+  64, and zap with one every 16: outputs identical.

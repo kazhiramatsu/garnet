@@ -33,6 +33,10 @@ static size_t g_heap_bytes = 0;
 static size_t g_old_bytes = 0;
 static size_t g_full_threshold_bytes = (size_t)16u * 1024u * 1024u;
 static int g_full_threshold_forced = 0; /* env override pins the trigger (stress knob) */
+static int g_site_pretenure = 1;           /* TSAOT_GC_SITE_PRETENURE=0: every allocation site stays young (docs/site_pretenuring_design.md) */
+static uint32_t g_site_tenure_pct = 85u;   /* TSAOT_GC_SITE_TENURE_PCT: the survival a site needs to allocate old */
+static uint32_t g_site_min_allocs = 100u;  /* TSAOT_GC_SITE_MIN_ALLOCS: the allocations a decision window needs */
+static int g_site_log = 0;                 /* TSAOT_GC_SITE_LOG=1: each site decision on stderr */
 static int g_pretenure_ctors = 1;       /* TSAOT_PRETENURE_CTORS=0: guarded constructions allocate young (docs/pretenured_construction_design.md) */
 static int g_remembered_slots = 1;      /* TSAOT_REMEMBERED_SLOTS=0: whole-cell rescans */
 static int g_empty_class_plain = 1;     /* TSAOT_EMPTY_CLASS_PLAIN=0: field-less class instances stay dictionary cells */
@@ -672,6 +676,7 @@ static unsigned long long g0_minor_ns[6], g0_full_ns[6];
 static unsigned long long g0_rem_enroll, g0_proto_materialized, g0_pretenured_bytes;
 static void g0_count_fate(ts_gc_header* h, int fate);
 static void g0_dump(FILE* out);
+static void gc_sites_stats(FILE* out);
 /* TSAOT_G0_FATES=0 skips the per-cell fate accounting, so the phase timings
    are not inflated by it (one run for counts, one for timings). */
 static int g0_fates_on(void){
@@ -711,6 +716,7 @@ __attribute__((destructor)) static void ts_rt_stats_dump(void){
   fprintf(out, "[rt_stats] alloc: count=%llu bytes=%llu young_log_cap=%zu root_push=%llu pretenured=%llu\n",
           g_rt_stats.alloc_count, g_rt_stats.alloc_bytes,
           g_young_log_cap, g_rt_stats.root_push, g_rt_stats.pretenured_alloc);
+  gc_sites_stats(out);
   fprintf(out, "[rt_stats] small_props: fresh=%llu reused=%llu\n",
           g_rt_stats.small_props_fresh, g_rt_stats.small_props_reused);
   fprintf(out, "[rt_stats] prop_add: site_hits=%llu hits=%llu slow=%llu\n",
@@ -1045,6 +1051,26 @@ static void gc_config_init(void){
      forces minors. The retarget rule still applies after each full GC. */
   const char* pre = getenv("TSAOT_PRETENURE_CTORS");
   if (pre && pre[0] && strcmp(pre, "0") == 0) g_pretenure_ctors = 0;
+  /* Allocation-site pretenuring (docs/site_pretenuring_design.md): =0 keeps
+     every site young; the percentage and the window are tuning and stress
+     knobs (a percentage of 0 and a window of 1 tenure every site that saw a
+     collection). */
+  const char* spre = getenv("TSAOT_GC_SITE_PRETENURE");
+  if (spre && spre[0] && strcmp(spre, "0") == 0) g_site_pretenure = 0;
+  const char* spct = getenv("TSAOT_GC_SITE_TENURE_PCT");
+  if (spct && spct[0]){
+    char* end = NULL;
+    unsigned long v = strtoul(spct, &end, 10);
+    if (end != spct && v <= 100u) g_site_tenure_pct = (uint32_t)v;
+  }
+  const char* smin = getenv("TSAOT_GC_SITE_MIN_ALLOCS");
+  if (smin && smin[0]){
+    char* end = NULL;
+    unsigned long v = strtoul(smin, &end, 10);
+    if (end != smin && v) g_site_min_allocs = (uint32_t)v;
+  }
+  const char* slog = getenv("TSAOT_GC_SITE_LOG");
+  if (slog && slog[0] && strcmp(slog, "0") != 0) g_site_log = 1;
   const char* fbytes = getenv("TSAOT_GC_FULL_THRESHOLD_BYTES");
   if (fbytes && fbytes[0]){
     char* end = NULL;
@@ -1232,6 +1258,89 @@ static void* gc_alloc_pretenured(size_t sz, uint8_t kind){
   RT_STAT_INC(pretenured_alloc);
   return h;
 }
+
+/* ---- allocation-site pretenuring (docs/site_pretenuring_design.md) ----
+   A generated allocation names its site, and the site's id rides in the
+   cell header's spare half-word. Promotion counts each site's survivors;
+   after a collection the sites it touched are digested. A site whose young
+   cells survive their first collection at g_site_tenure_pct percent or more
+   over a window of at least g_site_min_allocs allocations allocates old from
+   then on: its survivors were going to be promoted at that collection
+   anyway, and now the collector neither marks nor promotes them. A tenured
+   site whose old cells a full collection finds mostly dead returns to young
+   for good. Ids index a static table (the IR site + 1; 0 is no site). */
+typedef struct ts_alloc_site {
+  uint32_t allocs;   /* young: cells allocated in the open window; tenured: old cells since the last digest */
+  uint32_t counted;  /* young: the window's cells that survived; tenured: old cells a full collection found dead */
+  uint8_t state;     /* TS_SITE_YOUNG, TS_SITE_TENURED, TS_SITE_NEVER */
+  uint8_t touched;   /* listed for the next digest */
+  uint16_t pad;
+} ts_alloc_site;
+enum { TS_SITE_YOUNG = 0, TS_SITE_TENURED = 1, TS_SITE_NEVER = 2 };
+static ts_alloc_site g_alloc_sites[TS_ALLOC_SITE_MAX + 1u];
+static uint16_t* g_site_touched = NULL;
+static uint32_t g_site_touched_len = 0, g_site_touched_cap = 0;
+static void gc_site_touch(ts_alloc_site* s, uint16_t id){
+  s->touched = 1;
+  if (TS_RT_UNLIKELY(g_site_touched_len == g_site_touched_cap)){
+    uint32_t next = g_site_touched_cap ? g_site_touched_cap * 2u : 256u;
+    uint16_t* grown = (uint16_t*)realloc(g_site_touched, sizeof(uint16_t) * next);
+    if (!grown) ts_abort_msg("out of memory growing the allocation-site list");
+    g_site_touched = grown; g_site_touched_cap = next;
+  }
+  g_site_touched[g_site_touched_len++] = id;
+}
+/* A young cell of the site survived its collection (promotion), or an old
+   cell of a tenured site died (a full collection's sweep). */
+static inline void gc_site_count(uint16_t id){
+  ts_alloc_site* s = &g_alloc_sites[id];
+  s->counted++;
+  if (!s->touched) gc_site_touch(s, id);
+}
+static inline void gc_site_count_dead_old(const ts_gc_header* h){
+  uint16_t id = h->spare;
+  if (id && g_alloc_sites[id].state == TS_SITE_TENURED) gc_site_count(id);
+}
+/* After a collection's promotions (and, for a full one, its sweep). A young
+   site's window closes once it holds g_site_min_allocs allocations; the
+   sites with no survivor are never listed and keep their window open, so
+   their few later survivors weigh against everything they allocated. */
+static void gc_sites_digest(int full){
+  for (uint32_t i = 0; i < g_site_touched_len; i++){
+    uint16_t id = g_site_touched[i];
+    ts_alloc_site* s = &g_alloc_sites[id];
+    s->touched = 0;
+    if (s->state == TS_SITE_YOUNG){
+      if (s->counted > s->allocs) s->counted = s->allocs;   /* a wrapped window */
+      if (s->allocs < g_site_min_allocs) continue;
+      if (g_site_pretenure && (uint64_t)s->counted * 100u >= (uint64_t)s->allocs * g_site_tenure_pct){
+        s->state = TS_SITE_TENURED;
+        if (g_site_log) fprintf(stderr, "[gc] site %u tenured: %u of %u survived\n", (unsigned)id - 1u, s->counted, s->allocs);
+      }
+      s->allocs = 0; s->counted = 0;
+    } else if (s->state == TS_SITE_TENURED){
+      if (!full) continue;
+      if (s->counted >= 32u && (uint64_t)s->counted * 2u > (uint64_t)s->allocs){
+        s->state = TS_SITE_NEVER;
+        if (g_site_log) fprintf(stderr, "[gc] site %u back to young: %u of its old cells died, %u allocated since the last count\n", (unsigned)id - 1u, s->counted, s->allocs);
+      }
+      s->allocs = 0; s->counted = 0;
+    } else {
+      s->allocs = 0; s->counted = 0;
+    }
+  }
+  g_site_touched_len = 0;
+}
+#ifdef TSAOT_RT_STATS
+static void gc_sites_stats(FILE* out){
+  unsigned tenured = 0, reverted = 0;
+  for (uint32_t i = 1; i <= TS_ALLOC_SITE_MAX; i++){
+    if (g_alloc_sites[i].state == TS_SITE_TENURED) tenured++;
+    else if (g_alloc_sites[i].state == TS_SITE_NEVER) reverted++;
+  }
+  fprintf(out, "[rt_stats] alloc_sites: tenured=%u reverted=%u\n", tenured, reverted);
+}
+#endif
 
 /* ---------------- objects ---------------- */
 /* The shared Object.prototype: carries the modeled Object.prototype methods under
@@ -1718,6 +1827,21 @@ static tsv ts_new_sized_impl(size_t size, int pretenured){
 }
 tsv ts_new_sized(size_t size){ return ts_new_sized_impl(size, 0); }
 tsv ts_new_sized_pretenured(size_t size){ return ts_new_sized_impl(size, 1); }
+/* A generated class allocation (docs/site_pretenuring_design.md): young or
+   old as its site has decided, the site's id in the header for the
+   feedback, and the prototype stored here with the barrier an old cell
+   needs (class prototypes start young). */
+tsv ts_new_sized_site(size_t size, uint32_t site, tsv proto){
+  ts_alloc_site* s = &g_alloc_sites[site];
+  int old = s->state == TS_SITE_TENURED;
+  tsv v = ts_new_sized_impl(size, old);
+  ts_object* o = (ts_object*)ts_ptr(v);
+  o->h.spare = (uint16_t)site;
+  o->proto = proto;
+  s->allocs++;
+  if (old) ts_write_barrier(v, proto);
+  return v;
+}
 /* ---------------- arrays / sparse-hole representation ---------------- */
 /* TS_ARRAY_HOLE and array_is_hole live in ts_rt.h (the inline element reader tests them). */
 static inline int array_uses_inline(ts_array* a){ return a->data == a->inline_data; }
@@ -5306,6 +5430,7 @@ static void gc_promote_survivors(void){
   for (size_t i = 0; i < g_survivors_len; i++){
     ts_gc_header* h = g_survivors[i];
     G0_FATE(h, G0_PROMOTED);
+    if (h->spare) gc_site_count(h->spare);
     gc_cell_promote(h);
     g_old_bytes += gc_cell_heap_bytes(h);
     if (h->kind == TS_KIND_CORO) ts_gc_remember(h);
@@ -5349,6 +5474,7 @@ static void gc_cells_sweep_old(void){
           bm[w] &= ~((uint64_t)1u << (g & 63u));
           g_blocks[bi].live -= size;
           gc_old_bytes_sub(gc_cell_heap_bytes(h));
+          gc_site_count_dead_old(h);
           gc_cell_die(h);
         }
       }
@@ -5364,6 +5490,7 @@ static void gc_cells_sweep_old(void){
         if (h->kind == TS_KIND_CORO) ts_gc_remember(h);
       } else if (h->gen != GC_GEN_FREED){
         gc_old_bytes_sub(gc_cell_heap_bytes(h));
+        gc_site_count_dead_old(h);
         gc_cell_die(h);
       }
     }
@@ -5560,6 +5687,7 @@ void ts_gc_collect_young(void){
   G0_PHASE(g0_minor_ns, 2);
   gc_promote_survivors();
   gc_young_log_sweep();
+  if (g_site_touched_len) gc_sites_digest(0);
   g_heap_bytes = g_old_bytes;
   G0_PHASE(g0_minor_ns, 4);
   g_young_new_since_minor = 0;
@@ -5625,6 +5753,7 @@ void ts_gc_collect(void){
   gc_cells_sweep_old();
   gc_promote_survivors();
   gc_young_log_sweep();
+  if (g_site_touched_len) gc_sites_digest(1);
   g_heap_bytes = g_old_bytes;
   G0_PHASE(g0_full_ns, 3);
   g_young_new_since_minor = 0;

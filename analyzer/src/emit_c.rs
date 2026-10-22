@@ -2201,6 +2201,33 @@ fn class_boxed_fields(cid: u32, classes: &BTreeMap<u32, &ClassDef>, out: &mut Ve
     }
 }
 
+/* Allocation-site pretenuring (docs/site_pretenuring_design.md): a heap
+   class allocation names its site, whose survival feedback decides at run
+   time whether it allocates young or old. TSAOT_SITE_PRETENURE=0 keeps the
+   plain young allocation (the parity oracle's form). */
+fn site_pretenure_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_SITE_PRETENURE").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
+/// The runtime id of a heap allocation site (the IR site + 1; the runtime
+/// table holds 65535), or None for a site that allocates as before: a
+/// stack or statically pretenured one, one past the table, or every site
+/// when the feedback is off.
+fn alloc_site_id(site: u32, st: AllocStrategy) -> Option<u32> {
+    const TS_ALLOC_SITE_MAX: u32 = 65535;
+    if !site_pretenure_enabled() || matches!(st, AllocStrategy::Stack | AllocStrategy::PretenuredHeap) {
+        return None;
+    }
+    let id = site.checked_add(1)?;
+    (id <= TS_ALLOC_SITE_MAX).then_some(id)
+}
+
 /// TSAOT_UNDEF_FIELDS=0 skips the `undefined` initialization of boxed class
 /// fields (the frozen emitter's behavior: unassigned fields read as 0). Parity
 /// oracle only.
@@ -18385,15 +18412,24 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         }
                         let _ = writeln!(s, "  {} = ts_obj(&sobj{});", dst_name, dst.0);
                     } else {
-                        let alloc = if st == AllocStrategy::PretenuredHeap {
-                            "ts_new_sized_pretenured"
+                        if let Some(id) = alloc_site_id(site.0, st) {
+                            // the site's survival decides young or old at run
+                            // time (docs/site_pretenuring_design.md); the
+                            // runtime stores the prototype with the barrier an
+                            // old cell needs
+                            let _ = writeln!(s, "  {} = ts_new_sized_site(sizeof({}), {}u, {});", dst_name, cn, id, proto_expr);
+                            let _ = writeln!(s, "  {}* hobj{} = ({}*)ts_ptr({});", cn, dst.0, cn, dst_name);
+                            let _ = writeln!(s, "  hobj{}->header.props=0; hobj{}->header.cap=0; hobj{}->header.len=0;", dst.0, dst.0, dst.0);
                         } else {
-                            "ts_new_sized"
-                        };
-                        let _ = writeln!(s, "  {} = {}(sizeof({}));", dst_name, alloc, cn);
-                        let _ =
-                            writeln!(s, "  {}* hobj{} = ({}*)ts_ptr({});", cn, dst.0, cn, dst_name);
-                        let _ = writeln!(s, "  hobj{}->header.proto={}; hobj{}->header.props=0; hobj{}->header.cap=0; hobj{}->header.len=0;", dst.0, proto_expr, dst.0, dst.0, dst.0);
+                            let alloc = if st == AllocStrategy::PretenuredHeap {
+                                "ts_new_sized_pretenured"
+                            } else {
+                                "ts_new_sized"
+                            };
+                            let _ = writeln!(s, "  {} = {}(sizeof({}));", dst_name, alloc, cn);
+                            let _ = writeln!(s, "  {}* hobj{} = ({}*)ts_ptr({});", cn, dst.0, cn, dst_name);
+                            let _ = writeln!(s, "  hobj{}->header.proto={}; hobj{}->header.props=0; hobj{}->header.cap=0; hobj{}->header.len=0;", dst.0, proto_expr, dst.0, dst.0, dst.0);
+                        }
                         if class_index_enabled() {
                             let _ = writeln!(s, "  hobj{}->header.cls={}u;", dst.0, class_index_word(c.0));
                         }
