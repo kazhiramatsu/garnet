@@ -1,5 +1,6 @@
 #include <limits.h>
 #include <unistd.h>   /* isatty: gate console.log colorization on a TTY (Node parity) */
+#define TS_ISO_KEY_WRITABLE 1   /* the accessor experiment's key (ts_rt.h, mode 3) */
 #include "ts_rt.h"
 #include "json_core.c"
 
@@ -18844,6 +18845,21 @@ int ts_handlers_count(void){ int n=0; for(ts_handler* h=g_handlers;h;h=h->prev)n
    thread-local pointer. */
 static ts_iso ts_iso_main;
 __thread ts_iso* ts_iso_cur = &ts_iso_main;
+#elif TS_ISO_MODE == 3
+/* The accessor experiment (ts_rt.h): the isolate pointer in a pthread key's
+   slot, read directly; set before any constructor or main touches it. */
+#include <pthread.h>
+static ts_iso ts_iso_main;
+/* const to the generated code (ts_rt.h), written here once before main */
+long ts_iso_key;
+__attribute__((constructor(101))) static void ts_iso_key_init(void){
+  pthread_key_t key;
+  if (pthread_key_create(&key, NULL) != 0 || pthread_setspecific(key, &ts_iso_main) != 0) abort();
+  ts_iso_key = (long)key;
+  uintptr_t tsd;
+  __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(tsd));
+  if (((ts_iso**)(tsd & ~(uintptr_t)7))[key] != &ts_iso_main) abort();
+}
 #elif TS_ISO_MODE == 2
 /* The accessor experiment (ts_rt.h): the isolate block at the base of a
    stack aligned to its size, a guard page above it; the program's main

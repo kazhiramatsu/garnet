@@ -8227,3 +8227,25 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   state into the isolate block (the X-list of per-isolate variables, the
   process and isolate setup split), the emitter's isolate forms replacing the
   experiment's text rewrite.
+- Threads, the path to beating scriptc (`docs/threads_scaling_review.md`,
+  written for the independent review Kaz asked for before settling the plan;
+  goal: beat scriptc's tsc-ts, with time falling linearly in the number of
+  checkers). Measured on the M5 (four performance, six efficiency cores):
+  tsc-ts on Node, the Node path, barely scales (1.19x at two checkers, slower
+  beyond four: every worker JIT-compiles tsc-ts again); scriptc's shared
+  graphs scale 1.88x at two and 2.44x at four, flat beyond; garnet's whole
+  compiles side by side slow 4% at two, 14% at four; scriptc parses in
+  parallel and runs bind, check and emit on its checkers (2.6x at four); one
+  thread, garnet against scriptc: parse 2.6x, bind 3.7x, check 1.44x, emit
+  1.37x, total 1.65x. Projected: A about 1.5x at four checkers for four times
+  the memory; B about 2.6x, still 1.6x behind scriptc; beating scriptc takes B
+  and single-thread parity. scriptc cannot run the Node path natively (built
+  with `sharesPublishedGraphs` forced false, its typed message decoding
+  rejects the plain results). Thread-local storage reconsidered: reading the
+  thread-specific data directly (`TS_ISO_MODE` 3: `tpidrro_el0` and a pthread
+  key's slot as one pure asm, the key constant to the generated code) costs
+  the cycles of the stack-aligned block (tsc-ts 1.000, the compiler 1.010;
+  2.6% more instructions) without its constraints; its first, plain-C version
+  cost 3-4%. The document proposes it, with the block as the fallback. The
+  review itself did not run (Fable out of usage credits); a package for it
+  bundles the document, the design, the code and the data.

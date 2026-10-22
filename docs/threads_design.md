@@ -75,6 +75,34 @@ contention. Memory: N parsed and bound programs plus each checker's
 caches; 812 MB per checker as a stress budget (3.3 GB at four, 6.5 GB at
 eight). B removes the repeated P and the copies.
 
+**Measured proxies** (Session 352, Apple M5: four performance and six
+efficiency cores; the TypeScript 6.0.3 compiler project; medians of three,
+outputs identical to one checker's):
+
+| checkers | Node, the Node path | scriptc, shared graphs (B) | garnet copies at once |
+|---|---|---|---|
+| 1 | 3.27 s, 821 MB | 1.05 s, 403 MB | 1.75 s each |
+| 2 | 2.75 s (x1.19), 1.3 GB | 0.56 s (x1.88), 434 MB | 1.83 s each |
+| 4 | 3.05 s (x1.07), 2.2 GB | 0.43 s (x2.44), 472 MB | 1.99 s each |
+| 6 | 3.52 s (x0.93), 3.0 GB | 0.46 s (x2.28), 484 MB | 2.42 s each |
+| 8 | 4.20 s (x0.78), 4.0 GB | 0.47 s (x2.23), 509 MB | |
+
+Node's Node path barely scales: every worker starts cold and JIT-compiles
+tsc-ts again, with V8's helper threads competing for the cores (user time
+6.6 s at one checker, 18.8 s at four), costs garnet's native workers do not
+pay. scriptc runs only the shared path natively (built with
+`sharesPublishedGraphs` forced false, its typed message decoding rejects
+the Node path's plain results: "expected CheckerResult at $.result"). The
+last column runs whole one-thread compiles of garnet's tsc-ts side by side:
+concurrency alone costs 4% at two, 14% at four, 38% at six (the efficiency
+cores). With garnet's phases (parse and bind P = 0.36 s, check and emit
+1.38 s) and that slowdown s, T = P + P s + (W - P) s / N gives 1.27 s at
+two checkers and 1.06 s at four (1.65x); with scriptc's effective
+parallelism for the divisible work instead (duplicated cross-file checking
+included), 1.28 s and 1.19 s (1.47x). So A should bring about 1.5x at four
+checkers for about four times the memory; B's sharing is where scriptc's
+2.4x comes from.
+
 ## Milestone A: isolated workers
 
 ### Per isolate: everything mutable

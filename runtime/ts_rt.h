@@ -84,6 +84,24 @@ typedef struct ts_iso {
 #if TS_ISO_MODE == 1
 extern __thread ts_iso* ts_iso_cur;
 #define TS_ISO() (ts_iso_cur)
+#elif TS_ISO_MODE == 3
+/* thread-specific data read directly: the thread's slot array from
+   tpidrro_el0 (Darwin) and a pthread key's slot, as Go's runtime reaches g.
+   A thread's isolate never changes while it runs, so the read is one pure
+   asm (no memory operand) and the key a constant once set: the compiler
+   computes the isolate once per function, as it does the masked stack
+   pointer. ts_iso_key is written once, by a constructor, before main. */
+#ifdef TS_ISO_KEY_WRITABLE
+extern long ts_iso_key;   /* ts_rt.c, which writes it */
+#else
+extern const long ts_iso_key;
+#endif
+static inline __attribute__((always_inline)) ts_iso* ts_iso_get(void){
+  ts_iso* p;
+  __asm__("mrs %0, tpidrro_el0\n\tand %0, %0, #-8\n\tldr %0, [%0, %1, lsl #3]" : "=&r"(p) : "r"(ts_iso_key));
+  return p;
+}
+#define TS_ISO() (ts_iso_get())
 #else
 #define TS_ISO_STACK_BITS 26
 static inline __attribute__((always_inline)) ts_iso* ts_iso_get(void){
