@@ -3,7 +3,8 @@
 Session 352. Status: design for H1, revised after a review (Codex,
 gpt-6.1-sol at xhigh effort: one blocking, three major and one minor
 finding), a second (two blocking, two major) and a third (one blocking,
-one major, nothing minor), all answered below; H2 sketched. Runtime (`ts_rt.c`, `ts_rt.h`),
+one major, nothing minor), all answered below; H1's first commit built
+("H1 commit 1 as built", below); H2 sketched. Runtime (`ts_rt.c`, `ts_rt.h`),
 emitter (`emit_c.rs`), the frozen emitter's templates
 (`analyzer_ts/src/emit.ts`, `emitc.ts`: the minimal fix the frozen-source
 rule allows, as for D3). Follows `docs/gc_v2_design.md` §4.4 and §6.8.2
@@ -78,10 +79,11 @@ remembered set's resets after a minor and a full collection, and defensive
 `props_delete_own`, several of them before any check of the object (the
 second review found four that the first draft missed: an absent or refused
 `delete` would have rewritten an old instance's extent). All of them go
-through three helpers (mark every card, merge a slot's card, reset) that
-leave a sized instance's bytes alone and remember it whole, and a gate
-check, like the inline-policy gate, fails on any other assignment to
-`hdr_spare` or `inline_cap` in the runtime. `ts_write_barrier_at` and
+through three helpers (`gc_cards_all`, `gc_cards_merge`, `gc_cards_reset`)
+that leave a sized instance's bytes alone and remember it whole, and a gate
+check (`tests/header_bytes_gate.sh`, run by the unit gate like the
+inline-policy gate) fails on any other assignment to `hdr_spare` or
+`inline_cap` in the runtime or the emitters. `ts_write_barrier_at` and
 `ts_write_barrier_ptr` remember a sized owner whole instead of deriving a
 slot from `inline_cap`; `gc_mark_common_props` scans a sized instance's
 dictionary entries without the card window (there are rarely any; its
@@ -101,9 +103,13 @@ the slot statistics) are shaped paths.
 
 **The encoding is checked.** `ts_hdr_init_sized(h, bytes)` aborts with a
 message when `bytes` is below `sizeof(ts_object)`, not a multiple of 8 past
-it, or more than 65,535 words: the emitter adds a static assertion per
-class struct; the public `ts_new_sized` passes through the same check,
-before the existing clamp to `sizeof(ts_object)` (`ts_rt.c` 1827).
+it, or more than 65,535 words (`ts_sized_extent_words`): class
+registration (`ts_register_class_meta`) checks every instantiated class's
+size at startup, before any instance exists, and the public `ts_new_sized`
+passes through the same check, which replaces the clamp to
+`sizeof(ts_object)`; a stack instance's call folds it at compile time. (The
+draft's static assertion per class struct would have needed the frozen
+emitter's templates too, beyond the minimal fix.)
 
 **A header-only instance stays unsized.** An instance of a class without
 struct fields (a stack instance, or a heap one under
@@ -141,16 +147,18 @@ unicode adapters and the tsc-ts host touch neither `size` nor
 1. **Heap accounting** (`gc_account_alloc`, `gc_cell_heap_bytes`,
    `gc_cell_die`, protect mode's quarantine, the G0 statistics): the cell's
    capacity: its size class's size for a small cell; for a large cell the
-   bytes its run records (`gc_block.bytes`, the request: large runs only
-   unpoison and zero the request, so their slack is never exposed).
-   `gc_block.bytes` is a `uint32_t` saturated at `UINT32_MAX` (`ts_rt.c` 310
-   and 393), and a UTF-16 string can ask for more: it widens to 64 bits and
-   both saturating stores go (the block table grows by a few bytes per 64
-   KiB block). Protect mode's quarantine budget keeps
-   counting a run's physical footprint.
-   Allocation accounts the same capacity. The byte counters drive minor and
-   full collections, so collection timing moves slightly: the A/B reports
-   collection counts and instructions as well as time.
+   bytes its run records (the request: large runs only unpoison and zero
+   the request, so their slack is never exposed). The run kept the request
+   in a `uint32_t` saturated at `UINT32_MAX`, and a UTF-16 string can ask
+   for more: as built, the block records the run's slack instead (its
+   blocks' bytes past the request, always below one block), so the request
+   is exact at any size and the block table keeps 32 bytes per block.
+   Protect mode's quarantine budget keeps counting a run's physical
+   footprint. Allocation accounts the same capacity in the heap and
+   old-generation counters, which drive full collections; the young
+   trigger and the statistics keep counting requests, so minor collections
+   come exactly when they did. The A/B reports collection counts and
+   instructions as well as time.
 2. **Is this a sized instance** (`ts_obj_is_sized`): `TS_HDR_SIZED`, set
    with the extent wherever a sized cell is made: `ts_new_sized_impl`'s
    sized path, before any pretenured prototype barrier (not the
@@ -190,7 +198,7 @@ Two commits:
    emitters and the frozen templates (minimal fix); stack instances start
    unshaped; `ts_obj_is_sized`, the layout checks and the location cache
    read the extent; the card helpers and their gate check; the checked
-   encoding; `gc_block.bytes` widened; accounting uses capacities. The
+   encoding; a large run's exact request; accounting uses capacities. The
    header keeps its `size` (still written, no longer read). Same language
    behavior; collection timing moves (capacity accounting).
 2. `size` leaves the header: the 8-byte header and assertion, the positional
@@ -223,6 +231,64 @@ compiler rebuilt and run under protect mode, protect with a minor every 64
 allocations and zap with one every 16 (outputs identical); A/B of both
 programs (wall, instructions, collection counts, peak memory); the selfhost
 milestone (the frozen typed analyzer's own IR byte-identical).
+
+## H1 commit 1 as built
+
+Session 352. The flags byte, `TS_HDR_SIZED` and the extent, as designed
+above; the header keeps `size` (written, never read). Where the build
+departs from the draft:
+
+- **The encoding check** runs at class registration and in `ts_new_sized`
+  (`ts_sized_extent_words`, aborting through `ts_sized_extent_abort`), not
+  as a static assertion per class struct.
+- **A large run's request** is kept as its slack in the block table
+  (`gc_block.slack`), not a widened `bytes` field.
+- **The young trigger** keeps counting requests, so minor collections come
+  when they did; the heap and old-generation counters (full collections)
+  count capacities.
+- **Stack instances** are initialized by `ts_hdr_init_sized(&h, sizeof(S))`
+  in both emitters (the frozen template's minimal fix drops the redundant
+  `remembered=0` store); their shape is `0` with property caches on too.
+
+Found on the way, not H1's: the class registry does not keep its
+prototypes alive, and its index answered for a cell with its oldest
+registration, so a prototype that took a dead registered prototype's cell
+(a class evaluated per call registers a fresh prototype each time) found
+the dead class's layout: its own fields went to the dictionary and the
+collector scanned the wrong ones. A registration now replaces the entry
+for its cell (`class_reg_index_put`). And with `TSAOT_CLASS_INDEX=0` a
+sized instance relinked behind another class's prototype takes that
+class's layout (only the class index word remembers the allocation class):
+the relinks fixture reads its own fields as undefined there, as it did
+before H1; production keeps the class index.
+
+Tests: `gc/sized_header_layouts` (header-only instances relinked behind a
+field-bearing prototype and used through its typed fields and methods,
+subclasses, factories, converting, absent and refused deletes, attribute
+changes, numeric fields), `gc/sized_header_relinks` (sized instances behind
+smaller and larger layouts' prototypes, with the class index),
+`gc/sized_header_big_record` (a 300-field class and a 300-binding module
+record taking young values, dictionary entries and Symbol keys before and
+after promotion), `gc/sized_header_stack_props` (stack instances, also
+header-only, taking dynamic properties) and `gc/string_slack_growth`
+(builders growing into recycled slack, 8-bit and UTF-16, small and large),
+all in the GC stress filter; unit tests for the flag, the extent across
+promotion, barriers and collections, exact layouts at one word apart, the
+encoding's limits (a child process must abort) and the registry; and
+`tests/cell_header_gate.sh` (in the GC stress gate) running the fixtures
+with the class index off, property caches off, header-only instances as
+unsized cells, whole-cell rescans, stack check, protect and zap modes with
+frequent minor collections and a forced full-collection threshold. Each of
+four mutations (card writes over a sized instance, shaped stack instances,
+flagged header-only instances, the card window over a sized instance's
+entries) fails at least one of them.
+
+Measured against the previous commit (outputs identical): tsc-ts, twelve
+pairs, wall 1.000, instructions 1.000, peak memory 1.004; the TypeScript
+compiler, eight pairs, wall 0.998, instructions 0.999, peak 1.000. The
+collections are the same (tsc-ts 107 minor and 3 full; the compiler 317
+and 316 minor, 3 full), and the heap counted at tsc-ts's third full
+collection is 0.8% larger: capacities, not requests.
 
 ## H2 (sketch, after H1)
 

@@ -18388,11 +18388,10 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         format!("CLASS_PROTO[{}]", c.0)
                     };
                     if st == AllocStrategy::Stack {
-                        let shape = if prop_pic_enabled() {
-                            "TS_SHAPE_EMPTY"
-                        } else {
-                            "0"
-                        };
+                        // A sized instance is never shaped: its header bytes
+                        // hold its struct extent (ts_hdr_init_sized), not
+                        // in-object slots (docs/cell_header_design.md).
+                        let shape = "0";
                         // the struct is declared at function scope by
                         // emit_stack_cell_decls (a block-local would dangle
                         // when the value is read after the block)
@@ -18400,7 +18399,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                             // the quarantine copy of the same initialization
                             let o = format!("_sco{}", dst.0);
                             let _ = writeln!(s, "  {{ {0}* {1} = ({0}*)ts_sc_alloc(sizeof({0}), {2}u, __func__);", cn, o, site.0);
-                            let _ = writeln!(s, "  {0}->header.h.kind=TS_KIND_OBJECT; {0}->header.h.gen=2; {0}->header.h.size=sizeof({1}); {0}->header.proto={2}; {0}->header.shape={3};", o, cn, proto_expr, shape);
+                            let _ = writeln!(s, "  {0}->header.h.kind=TS_KIND_OBJECT; {0}->header.h.gen=2; {0}->header.h.size=sizeof({1}); ts_hdr_init_sized(&{0}->header.h, sizeof({1})); {0}->header.proto={2}; {0}->header.shape={3};", o, cn, proto_expr, shape);
                             if class_index_enabled() {
                                 let _ = writeln!(s, "  {}->header.cls={}u;", o, class_index_word(c.0));
                             }
@@ -18417,7 +18416,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         } else {
                             format!("  {1} sobj{0} = {{0}};", dst.0, cn)
                         };
-                        let _ = writeln!(s, "{} sobj{}.header.h.kind=TS_KIND_OBJECT; sobj{}.header.h.mark=0; sobj{}.header.h.gen=2; sobj{}.header.h.remembered=0; sobj{}.header.h.size=sizeof({}); sobj{}.header.proto={}; sobj{}.header.props=0; sobj{}.header.cap=0; sobj{}.header.len=0; sobj{}.header.shape={};", decl, dst.0, dst.0, dst.0, dst.0, dst.0, cn, dst.0, proto_expr, dst.0, dst.0, dst.0, dst.0, shape);
+                        let _ = writeln!(s, "{0} sobj{1}.header.h.kind=TS_KIND_OBJECT; sobj{1}.header.h.mark=0; sobj{1}.header.h.gen=2; sobj{1}.header.h.size=sizeof({2}); ts_hdr_init_sized(&sobj{1}.header.h, sizeof({2})); sobj{1}.header.proto={3}; sobj{1}.header.props=0; sobj{1}.header.cap=0; sobj{1}.header.len=0; sobj{1}.header.shape={4};", decl, dst.0, cn, proto_expr, shape);
                         if class_index_enabled() {
                             let _ = writeln!(s, "  sobj{}.header.cls={}u;", dst.0, class_index_word(c.0));
                         }

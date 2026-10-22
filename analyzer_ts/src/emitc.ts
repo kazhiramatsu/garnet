@@ -4649,7 +4649,7 @@ function emitInstC(s: string[], inst: any, cx: EmitCtx, numericFacts: NumericAna
           protoExpr = `CLASS_PROTO[${c}]`;
         }
         if (st === "Stack") {
-          s.push(`  ${cn} sobj${d} = {0}; sobj${d}.header.h.kind=TS_KIND_OBJECT; sobj${d}.header.h.mark=0; sobj${d}.header.h.gen=2; sobj${d}.header.h.remembered=0; sobj${d}.header.h.size=sizeof(${cn}); sobj${d}.header.proto=${protoExpr}; sobj${d}.header.props=0; sobj${d}.header.cap=0; sobj${d}.header.len=0; sobj${d}.header.shape=0;\n`);
+          s.push(`  ${cn} sobj${d} = {0}; sobj${d}.header.h.kind=TS_KIND_OBJECT; sobj${d}.header.h.mark=0; sobj${d}.header.h.gen=2; sobj${d}.header.h.size=sizeof(${cn}); ts_hdr_init_sized(&sobj${d}.header.h, sizeof(${cn})); sobj${d}.header.proto=${protoExpr}; sobj${d}.header.props=0; sobj${d}.header.cap=0; sobj${d}.header.len=0; sobj${d}.header.shape=0;\n`);
           s.push(`  v${d} = ts_obj(&sobj${d});\n`);
         } else {
           s.push(`  v${d} = ts_new_sized(sizeof(${cn}));\n`);

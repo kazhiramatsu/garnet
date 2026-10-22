@@ -20,8 +20,9 @@ RUN_PROTECT="${TSAOT_GC_STRESS_PROTECT:-1}"
 RUN_BASE="${TSAOT_GC_STRESS_BASE:-1}"
 RUN_FULL="${TSAOT_GC_STRESS_FULL:-0}"
 RUN_STRING_SCALE="${TSAOT_GC_STRESS_STRING_SCALE:-1}"
+RUN_CELL_HEADER="${TSAOT_GC_STRESS_CELL_HEADER:-1}"
 
-FILTER='frame_roots_(unwind|edge_cases)|object_reflection_safepoints|string_runtime_safepoints|concat_growth|handle_identity|moving_minor_promise_coro_stress|json_runtime_safepoints|lower_level_runtime_safepoints|promise_coro_handle_edges|promise_movable_experimental|coro_entry_safepoints|coro_movable_experimental|array_callback_safepoints|generational_remembered_set|map_set_callback_safepoints|moving_minor_relocation|prototype_handle_edges|typed_class_allocation_safepoints|computed_member_names|extends_same_name_scopes|lazy_frame_getter|lazy_homes_reload|absent_site_entries|absent_site_records|function_own_properties|proxy_prototypes|reflect_receiver|array_iterators|forof_dynamic|dynamic_keys|string_accumulators|replace_builder|strict_eq_literals|payload_envs|payload_arrays|payload_props|payload_maps|coro_int_locals|proxy_old_generation|frame_elision|lazy_frame_calls|typed_array_buffers|typed_array_methods|typed_array_reflection|typed_array_elements|element_receivers|atomics|text_codecs|site_pretenured_classes|site_pretenured_literals'
+FILTER='frame_roots_(unwind|edge_cases)|object_reflection_safepoints|string_runtime_safepoints|concat_growth|handle_identity|moving_minor_promise_coro_stress|json_runtime_safepoints|lower_level_runtime_safepoints|promise_coro_handle_edges|promise_movable_experimental|coro_entry_safepoints|coro_movable_experimental|array_callback_safepoints|generational_remembered_set|map_set_callback_safepoints|moving_minor_relocation|prototype_handle_edges|typed_class_allocation_safepoints|computed_member_names|extends_same_name_scopes|lazy_frame_getter|lazy_homes_reload|absent_site_entries|absent_site_records|function_own_properties|proxy_prototypes|reflect_receiver|array_iterators|forof_dynamic|dynamic_keys|string_accumulators|replace_builder|strict_eq_literals|payload_envs|payload_arrays|payload_props|payload_maps|coro_int_locals|proxy_old_generation|frame_elision|lazy_frame_calls|typed_array_buffers|typed_array_methods|typed_array_reflection|typed_array_elements|element_receivers|atomics|text_codecs|site_pretenured_classes|site_pretenured_literals|sized_header_layouts|sized_header_relinks|sized_header_big_record|sized_header_stack_props|string_slack_growth'
 
 rc=0
 echo "=== tsaot GC stress [young threshold=$THRESHOLD] ==="
@@ -73,6 +74,14 @@ if [[ "$RUN_STRING_SCALE" != "0" ]]; then
   fi
   TSAOT_STRING_SCALE_ASAN="$RUN_ASAN" \
     bash "$ROOT/tests/string_builder_scale_gate.sh" || rc=1
+fi
+
+if [[ "$RUN_CELL_HEADER" != "0" ]]; then
+  # The cell header's flags byte and sized instances' extents under every knob
+  # that changes how instances are made, shaped or rescanned
+  # (docs/cell_header_design.md).
+  echo ">>> cell header knobs"
+  bash "$ROOT/tests/cell_header_gate.sh" || rc=1
 fi
 
 if [[ $rc -eq 0 ]]; then

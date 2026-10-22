@@ -144,19 +144,28 @@ enum { TS_KIND_OBJECT = 1, TS_KIND_ARRAY = 2, TS_KIND_STRING = 3, TS_KIND_FUNC =
        TS_KIND_PROMISE = 9, TS_KIND_CORO = 10, TS_KIND_ACCESSOR = 11, TS_KIND_SYMBOL = 12, TS_KIND_PROXY = 13,
        TS_KIND_LAST = TS_KIND_PROXY };
 typedef struct ts_gc_header {
-  uint8_t kind, mark, gen, remembered;
+  uint8_t kind, mark, gen;
+  uint8_t flags;   /* TS_HDR_REMEMBERED, TS_HDR_SIZED */
   /* One 32-bit word so positional initializers of static cells (string
-     literals) keep their shape: inline_cap (object model v2, slice A3) =
-     number of in-object value slots after the ts_object header of a plain
-     object, 0 for every other kind and for sized class instances;
-     hdr_spare = a remembered plain object's dirty card range; spare is
-     free (cells never move, so nothing pins them). */
+     literals) keep their shape: spare = the allocation site id
+     (docs/site_pretenuring_design.md). A plain object keeps the number of
+     its in-object value slots after the ts_object header in inline_cap
+     (object model v2, slice A3) and its remembered dirty card range in
+     hdr_spare; a sized class instance (TS_HDR_SIZED) keeps its struct
+     extent there instead, in words after the ts_object header (inline_cap
+     the low byte, hdr_spare the high one; docs/cell_header_design.md).
+     No other kind reads them. */
   union {
     uint32_t pin_word;
     struct { uint16_t spare; uint8_t inline_cap; uint8_t hdr_spare; };
   };
-  size_t size;     /* allocated cell bytes */
+  size_t size;     /* allocated cell bytes (written, no longer read: H1 removes it) */
 } ts_gc_header;
+/* The flags byte: in the remembered set (for exactly one cycle; every
+   enrollment, reset, promotion and sweep masks this bit alone), and a sized
+   class instance whose extent the two bytes above hold. */
+#define TS_HDR_REMEMBERED 1u
+#define TS_HDR_SIZED 2u
 /* 16 bytes (docs/gc_v2_design.md §4.4): a heap reference is the address,
    so the cell carries no handle and no list link. */
 _Static_assert(sizeof(ts_gc_header) == 16, "the cell header is 16 bytes");
@@ -452,9 +461,39 @@ static inline tsv* ts_obj_slot_ptr(ts_object* o, uint32_t slot){
   return slot < ic ? &ts_obj_inline_vals(o)[slot] : &((tsv*)o->props)[slot - ic];
 }
 /* A sized class instance (registered struct storage after the header) versus
-   a plain object whose cell is the header plus its inline slots. */
+   a plain object whose cell is the header plus its inline slots: the
+   TS_HDR_SIZED flag, set only on objects (docs/cell_header_design.md). */
 static inline int ts_obj_is_sized(const ts_object* o){
-  return o->h.kind == TS_KIND_OBJECT && o->h.size != sizeof(ts_object) + sizeof(tsv) * (size_t)o->h.inline_cap;
+  return (o->h.flags & TS_HDR_SIZED) != 0;
+}
+/* A sized instance's struct bytes, the ts_object header included: its
+   extent words after the header (inline_cap low, hdr_spare high). Exact,
+   as the allocation's size was: layouts and the location cache compare it. */
+static inline size_t ts_obj_sized_bytes(const ts_object* o){
+  return sizeof(ts_object) + sizeof(tsv) * ((size_t)o->h.inline_cap | (size_t)o->h.hdr_spare << 8);
+}
+/* The extent the two header bytes can describe: 65,535 words after the
+   header (module records are the largest classes: 2,428 fields in the
+   TypeScript compiler). A struct size below the header, off the word grid or
+   past the extent aborts with a message, never truncates. */
+#define TS_SIZED_EXTENT_MAX 65535u
+__attribute__((noreturn)) void ts_sized_extent_abort(size_t bytes);
+static inline size_t ts_sized_extent_words(size_t bytes){
+  if (TS_RT_UNLIKELY(bytes < sizeof(ts_object) || (bytes - sizeof(ts_object)) % sizeof(tsv) != 0 ||
+                     (bytes - sizeof(ts_object)) / sizeof(tsv) > TS_SIZED_EXTENT_MAX))
+    ts_sized_extent_abort(bytes);
+  return (bytes - sizeof(ts_object)) / sizeof(tsv);
+}
+/* A sized cell's header (heap, stack and stack-check instances alike):
+   TS_HDR_SIZED and the extent. A header-only instance (a class without
+   struct fields) has no extent and stays an unsized object, as it was when
+   the allocation size decided. One of the writers of inline_cap and
+   hdr_spare the header gate admits (tests/header_bytes_gate.sh). */
+static inline void ts_hdr_init_sized(ts_gc_header* h, size_t bytes){
+  size_t words = ts_sized_extent_words(bytes);
+  h->inline_cap = (uint8_t)words;
+  h->hdr_spare = (uint8_t)(words >> 8);
+  if (words) h->flags |= TS_HDR_SIZED;
 }
 /* A typed class-field access (a struct offset) must take ts_get / ts_set for a
    receiver without the sized-instance layout: a Proxy, a plain object relinked
@@ -1741,10 +1780,12 @@ static inline void ts_write_barrier(tsv owner, tsv value){
 /* The barrier for a write whose slot is known (docs/remembered_slots_design.md):
    an old plain object remembers a dirty card range in its header's spare
    byte, so the next minor collection scans only those cards. `p` points at
-   the written slot of a SHAPED object (in-object or overflow value). */
+   the written slot of a SHAPED object (in-object or overflow value). A sized
+   instance's header bytes hold its extent, not slots: it is remembered
+   whole (docs/cell_header_design.md). */
 void ts_gc_remember_slot(ts_gc_header* h, uint32_t slot);
 static inline void ts_write_barrier_at(tsv owner, ts_gc_header* oh, tsv* p, tsv value){
-  if (oh->kind == TS_KIND_OBJECT){
+  if (oh->kind == TS_KIND_OBJECT && !(oh->flags & TS_HDR_SIZED)){
     ts_object* o = (ts_object*)oh;
     tsv* iv = ts_obj_inline_vals(o);
     uint32_t slot = (p >= iv && p < iv + oh->inline_cap)

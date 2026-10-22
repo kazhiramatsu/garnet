@@ -8042,3 +8042,41 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   allocation (a dead cell is reused at once). A registration now replaces
   the entry for its cell (`class_reg_index_put`); unit test (fails on the
   previous runtime).
+- Cell header H1, commit 1 (`docs/cell_header_design.md`, "H1 commit 1 as
+  built"): the `remembered` byte becomes a flags byte (bit 0 remembered,
+  bit 1 `TS_HDR_SIZED`); a sized instance keeps its exact struct extent in
+  words in `inline_cap` and `hdr_spare` (up to 65,535), which
+  `ts_obj_is_sized`, the layout checks and the location cache read; every
+  writer of those two bytes goes through helpers that leave a sized
+  instance alone (`tests/header_bytes_gate.sh` in the unit gate rejects
+  any other); the slot barrier and the minor collection's card window take
+  a sized instance whole; stack instances and stack-check copies start
+  unshaped; class registration and `ts_new_sized` check the extent; a large
+  run's exact request is kept as its slack in the block table; the heap and
+  old-generation counters count cell capacities (the young trigger keeps
+  requests), and a heap string grows in place up to its cell's capacity.
+  `size` is still written, no longer read (commit 2 removes it). A/B
+  against the previous commit, outputs identical: tsc-ts twelve pairs, wall
+  1.000, instructions 1.000, peak memory 1.004; the TypeScript compiler
+  eight pairs, wall 0.998, instructions 0.999, peak 1.000. Collections as
+  before (tsc-ts 107 minor and 3 full on both sides, the compiler 317/316
+  and 3); the heap counted at tsc-ts's third full collection is 0.8% larger
+  (capacities). Tests: fixtures `gc/sized_header_{layouts,relinks,
+  big_record,stack_props}` and `gc/string_slack_growth` (in the GC stress
+  filter), cell header unit tests, and `tests/cell_header_gate.sh` (in the
+  GC stress gate: the class index off, property caches off, header-only
+  instances as unsized cells, whole-cell rescans, stack check, protect and
+  zap modes with frequent minor collections, a forced full-collection
+  threshold); four mutations of the new rules each fail at least one of
+  them. With `TSAOT_CLASS_INDEX=0` a sized instance relinked behind another
+  class's prototype takes that class's layout (as before H1: only the class
+  index word remembers the allocation class), so the relinks fixture runs
+  with the index on. Gates: unit, parity (379 identical; the new
+  fixtures' frozen-twin differences, an escape strategy, a rooted
+  temporary and a charCodeAt width, listed as known), bundler 43/43,
+  selfconf, defaults (plain and stress), conformance 537/537 plain
+  and strict and 534/534 exhaustive at every allocation under protect mode,
+  GC stress, tsc-ts and the compiler under protect mode, protect with a
+  minor every 64 allocations and zap with one every 16 (outputs
+  identical), the selfhost milestone (own IR identical, plain and under
+  protect; 511/511 corpus fixtures).

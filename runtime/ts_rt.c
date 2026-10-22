@@ -115,7 +115,7 @@ typedef struct gc_block {
   uint32_t next;       /* class list, free list or large list: block index + 1 */
   uint32_t prev;       /* large list back link */
   uint32_t nblocks;    /* large run length in blocks */
-  uint32_t bytes;      /* large run: requested bytes */
+  uint32_t slack;      /* large run: its blocks' bytes past the request (below one block) */
 } gc_block;
 typedef struct { char* ptr; char* end; uint32_t head; uint32_t scan; } gc_pclass;
 static char* g_cage_base = NULL;
@@ -307,7 +307,7 @@ static void* gc_payload_alloc_large(size_t bytes, int old){
   uint32_t bi = gc_cage_frontier_take(n);   /* runs are not recycled yet: rare (G0) */
   gc_block* b = &g_blocks[bi];
   memset(b, 0, sizeof(*b));
-  b->state = GC_BLK_LARGE; b->nblocks = n; b->bytes = (uint32_t)(bytes > UINT32_MAX ? UINT32_MAX : bytes);
+  b->state = GC_BLK_LARGE; b->nblocks = n; b->slack = (uint32_t)(((size_t)n << GC_BLOCK_SHIFT) - bytes);
   b->mark = (uint8_t)(old ? 1 : 0);
   for (uint32_t i = 1; i < n; i++){ memset(&g_blocks[bi + i], 0, sizeof(gc_block)); g_blocks[bi + i].state = GC_BLK_LARGE_CONT; }
   b->next = g_large_head; b->prev = 0;
@@ -390,7 +390,7 @@ static void* gc_cell_alloc_large(size_t bytes, int old){
   uint32_t bi = n == 1u ? gc_block_take() : gc_cage_frontier_take(n);
   gc_block* b = &g_blocks[bi];
   memset(b, 0, sizeof(*b));
-  b->state = GC_BLK_LARGE_CELL; b->nblocks = n; b->bytes = (uint32_t)(bytes > UINT32_MAX ? UINT32_MAX : bytes);
+  b->state = GC_BLK_LARGE_CELL; b->nblocks = n; b->slack = (uint32_t)(((size_t)n << GC_BLOCK_SHIFT) - bytes);
   b->mark = (uint8_t)(old ? 1 : 0);
   for (uint32_t i = 1; i < n; i++){ memset(&g_blocks[bi + i], 0, sizeof(gc_block)); g_blocks[bi + i].state = GC_BLK_LARGE_CONT; }
   b->next = g_large_cell_head; b->prev = 0;
@@ -402,13 +402,15 @@ static void* gc_cell_alloc_large(size_t bytes, int old){
   return p;
 }
 /* A zeroed cell (the calloc contract of the previous allocator): its run
-   was zeroed when the allocator took it (GC_CELL_RUNS_ZEROED). */
-static inline void* gc_cell_alloc(size_t bytes, int old){
-  if (TS_RT_UNLIKELY(bytes > GC_PAYLOAD_SMALL_MAX)) return gc_cell_alloc_large(bytes, old);
+   was zeroed when the allocator took it (GC_CELL_RUNS_ZEROED). *cap is the
+   cell's capacity, what the heap counts for it (gc_cell_capacity). */
+static inline void* gc_cell_alloc(size_t bytes, int old, size_t* cap){
+  if (TS_RT_UNLIKELY(bytes > GC_PAYLOAD_SMALL_MAX)){ *cap = bytes; return gc_cell_alloc_large(bytes, old); }
   if (TS_RT_UNLIKELY(!g_cage_base)) gc_cage_init();
   unsigned cls = g_pclass_of[(bytes + 15u) >> 4];
   gc_pclass* c = &g_cclass[cls];
   size_t size = g_pclass_size[cls];
+  *cap = size;
   char* p = c->ptr;
   if (TS_RT_UNLIKELY(!p || p + size > c->end)) p = gc_space_refill(g_cclass, GC_BLK_CELL, cls, 0);
   c->ptr = p + size;
@@ -423,13 +425,24 @@ static inline void* gc_cell_alloc(size_t bytes, int old){
 static inline gc_block* gc_cell_block(const ts_gc_header* h){
   return &g_blocks[((uintptr_t)h - (uintptr_t)g_cage_base) >> GC_BLOCK_SHIFT];
 }
-/* Promotion in place: the cell's mark bit (or run mark) makes it old. */
-static void gc_cell_set_old_bit(ts_gc_header* h){
+/* A heap cell's capacity (docs/cell_header_design.md): its size class's
+   bytes, or a large run's request (large runs unpoison and zero only the
+   request, so their slack is never exposed). The heap accounting counts it
+   at allocation and at death; a heap string grows in place up to it. */
+static inline size_t gc_block_cell_capacity(const gc_block* b){
+  return b->state == GC_BLK_CELL ? (size_t)g_pclass_size[b->cls]
+                                 : ((size_t)b->nblocks << GC_BLOCK_SHIFT) - b->slack;
+}
+static inline size_t gc_cell_capacity(const ts_gc_header* h){ return gc_block_cell_capacity(gc_cell_block(h)); }
+/* Promotion in place: the cell's mark bit (or run mark) makes it old.
+   Returns the cell's capacity (the block is at hand). */
+static size_t gc_cell_set_old_bit(ts_gc_header* h){
   gc_block* b = gc_cell_block(h);
   if (b->state == GC_BLK_CELL){
     uintptr_t off = (uintptr_t)h - (uintptr_t)g_cage_base;
     gc_payload_mark_small((uint32_t)(off >> GC_BLOCK_SHIFT), off & (GC_BLOCK_BYTES - 1u));
   } else b->mark = 1;
+  return gc_block_cell_capacity(b);
 }
 static void gc_cell_release_large(ts_gc_header* h){
   gc_block* b = gc_cell_block(h);
@@ -1104,17 +1117,46 @@ tsv ts_heap_ref_value(uint16_t sel, void* p){
   if (h->gen == TS_GEN_NONHEAP) return TS_BOX(sel, (uintptr_t)p | TS_PTR_STACK_TAG);
   return TS_BOX(sel, (uintptr_t)p);
 }
+/* A plain object's remembered card range lives in hdr_spare; a sized class
+   instance keeps the high byte of its extent there and is remembered whole
+   (its struct fields are scanned whole, its few dictionary entries without
+   a card window). Every write of the range goes through these three, which
+   leave a sized instance's bytes alone (docs/cell_header_design.md; the
+   header gate, tests/header_bytes_gate.sh, rejects any other). */
+static inline void gc_cards_all(ts_gc_header* h){
+  if (!(h->flags & TS_HDR_SIZED)) h->hdr_spare = 0xFF;
+}
+static inline void gc_cards_reset(ts_gc_header* h){
+  if (!(h->flags & TS_HDR_SIZED)) h->hdr_spare = 0;
+}
+/* Merge a slot's card (eight slots per card, fifteen cards covered) into the
+   dirty range: high nibble first card, low nibble end card (exclusive),
+   0xFF every slot. */
+static inline void gc_cards_merge(ts_gc_header* h, uint32_t slot){
+  if (h->flags & TS_HDR_SIZED) return;
+  uint32_t card = slot >> 3;
+  uint8_t cur = h->hdr_spare;
+  if (card >= 15u || cur == 0xFF){
+    h->hdr_spare = 0xFF;
+  } else {
+    uint32_t first = cur ? (cur >> 4) : card;
+    uint32_t end = cur ? (cur & 0xF) : 0;
+    if (card < first) first = card;
+    if (card + 1u > end) end = card + 1u;
+    h->hdr_spare = (uint8_t)((first << 4) | end);
+  }
+}
 /* Every young survivor is promoted at the next collection, so an old cell
-   stays in the remembered set for exactly one cycle: the byte is a flag. */
+   stays in the remembered set for exactly one cycle: the bit is a flag. */
 static void gc_remember(ts_gc_header* h){
   if (!h || h->gen != TS_GEN_OLD) return;
-  if (h->kind == TS_KIND_OBJECT && h->hdr_spare == 0) h->hdr_spare = 0xFF; /* no range known: every slot */
-  if (h->remembered) return;
+  if (h->kind == TS_KIND_OBJECT && h->hdr_spare == 0) gc_cards_all(h); /* no range known: every slot */
+  if (h->flags & TS_HDR_REMEMBERED) return;
   if (g_rem_len == g_rem_cap){
     g_rem_cap = g_rem_cap ? g_rem_cap * 2 : 1024;
     g_remset = (ts_gc_header**)realloc(g_remset, sizeof(ts_gc_header*) * g_rem_cap);
   }
-  h->remembered = 1;
+  h->flags |= TS_HDR_REMEMBERED;
   g_remset[g_rem_len++] = h;
   G0_INC(g0_rem_enroll);
 }
@@ -1125,30 +1167,19 @@ void ts_gc_remember(ts_gc_header* h){
     ((ts_map*)h)->gc_dirty_all = 1;
   else if (h && h->gen == TS_GEN_OLD && h->kind == TS_KIND_OBJECT){
     RT_STAT_INC(remset_full_marks);
-    h->hdr_spare = 0xFF;
+    gc_cards_all(h);
   }
   gc_remember(h);
 }
-/* A write at a known slot of an old plain object: merge the slot's card
-   (eight slots per card, fifteen cards covered) into the header's dirty range
-   — high nibble first card, low nibble end card (exclusive), 0xFF every slot. */
+/* A write at a known slot of an old plain object: its card joins the
+   header's dirty range. */
 void ts_gc_remember_slot(ts_gc_header* h, uint32_t slot){
   if (!h || h->gen != TS_GEN_OLD) return;
   if (h->kind == TS_KIND_OBJECT && g_remembered_slots){
     RT_STAT_INC(remset_slot_writes);
-    uint32_t card = slot >> 3;
-    uint8_t cur = h->hdr_spare;
-    if (card >= 15u || cur == 0xFF){
-      h->hdr_spare = 0xFF;
-    } else {
-      uint32_t first = cur ? (cur >> 4) : card;
-      uint32_t end = cur ? (cur & 0xF) : 0;
-      if (card < first) first = card;
-      if (card + 1u > end) end = card + 1u;
-      h->hdr_spare = (uint8_t)((first << 4) | end);
-    }
+    gc_cards_merge(h, slot);
   } else if (h->kind == TS_KIND_OBJECT){
-    h->hdr_spare = 0xFF;
+    gc_cards_all(h);
   }
   gc_remember(h);
 }
@@ -1225,16 +1256,19 @@ static inline void gc_before_alloc(void){
     }
   }
 }
-static void gc_account_alloc(size_t sz){
+/* The heap counts a cell's capacity (its size class), the measure its
+   death subtracts (gc_cell_capacity); the statistics count requests. */
+static void gc_account_alloc(size_t sz, size_t cap){
   RT_STAT_INC(alloc_count); RT_STAT_ADD(alloc_bytes, sz);
-  g_heap_bytes += sz;
+  g_heap_bytes += cap;
 }
 static void* gc_alloc(size_t sz, uint8_t kind){
   gc_before_alloc();
-  gc_account_alloc(sz);
   G0_ALLOC(kind, sz);
   RT_STAT_INC(kind_alloc[kind]); RT_STAT_ADD(kind_bytes[kind], sz);
-  ts_gc_header* h = (ts_gc_header*)gc_cell_alloc(sz, 0);
+  size_t cap;
+  ts_gc_header* h = (ts_gc_header*)gc_cell_alloc(sz, 0, &cap);
+  gc_account_alloc(sz, cap);
   h->kind=kind; h->gen=TS_GEN_YOUNG; h->size=sz;
   if (TS_RT_UNLIKELY(((g_young_log_kinds >> kind) & 1u) || sz > GC_PAYLOAD_SMALL_MAX)) gc_young_log_push(h);
   g_young_fresh_bytes += sz;
@@ -1249,12 +1283,13 @@ static void* gc_alloc(size_t sz, uint8_t kind){
    direct proto/env stores. */
 static void* gc_alloc_pretenured(size_t sz, uint8_t kind){
   gc_before_alloc();
-  gc_account_alloc(sz);
   G0_ALLOC(kind, sz); G0_ADD(g0_pretenured_bytes, sz);
   RT_STAT_INC(kind_alloc[kind]); RT_STAT_ADD(kind_bytes[kind], sz);
-  ts_gc_header* h = (ts_gc_header*)gc_cell_alloc(sz, 1);
+  size_t cap;
+  ts_gc_header* h = (ts_gc_header*)gc_cell_alloc(sz, 1, &cap);
+  gc_account_alloc(sz, cap);
   h->kind=kind; h->gen=TS_GEN_OLD; h->size=sz;
-  g_old_bytes += sz;
+  g_old_bytes += cap;
   RT_STAT_INC(pretenured_alloc);
   return h;
 }
@@ -1391,13 +1426,16 @@ static void ts_root_static_once(tsv* slot, int* rooted){
   *rooted = 1;
 }
 static void ts_proto_register_method(tsv proto, ts_key method_key, const char* name, ts_code fn);
+/* A fresh plain object's in-object slot count (its cell is zeroed: no
+   flag, no card range). */
+static inline void gc_hdr_init_plain(ts_gc_header* h, uint32_t slots){ h->inline_cap = (uint8_t)slots; }
 static tsv ts_new_object_impl(int pretenured, uint32_t slots){
   if (slots > TS_INLINE_SLOTS_MAX) slots = TS_INLINE_SLOTS_MAX;
   size_t size = sizeof(ts_object) + sizeof(tsv) * (size_t)slots;
   ts_object* o = pretenured
     ? gc_alloc_pretenured(size, TS_KIND_OBJECT)
     : gc_alloc(size, TS_KIND_OBJECT);
-  o->h.inline_cap = (uint8_t)slots;
+  gc_hdr_init_plain(&o->h, slots);
   o->proto = ts_proto_ref(g_object_proto_v) ? g_object_proto_v : TS_NULL;
   o->shape = TS_SHAPE_EMPTY;
   tsv obj = ts_obj(o);
@@ -1824,7 +1862,7 @@ tsv ts_call_method(tsv fn, tsv* args, int nargs){
 /* In-object slots of a field-less class instance (docs/empty_class_instances_design.md). */
 #define TS_EMPTY_CLASS_SLOTS 8u
 static tsv ts_new_sized_impl(size_t size, int pretenured){
-  if (size < sizeof(ts_object)) size = sizeof(ts_object);
+  (void)ts_sized_extent_words(size);   /* a size the header cannot describe aborts */
   /* A class without struct fields (`class SymbolLinks { declare _brand: any }`)
      has nothing for a descriptor to resolve; its instance is an ordinary
      shaped object with in-object slack, so the properties added later take
@@ -1834,12 +1872,21 @@ static tsv ts_new_sized_impl(size_t size, int pretenured){
   ts_object* o = pretenured
     ? gc_alloc_pretenured(size, TS_KIND_OBJECT)
     : gc_alloc(size, TS_KIND_OBJECT);
+  /* The flag and the extent before anything can remember the cell (the
+     site path's prototype barrier). */
+  ts_hdr_init_sized(&o->h, size);
   /* Sized objects use the dictionary shape because a class descriptor can
      resolve fields before the named-property vector. Location caches guard the
-     prototype, allocation size and registry epoch, so these objects can still
-     use cached struct offsets and verified named-property slots. */
+     prototype, struct extent and registry epoch, so these objects can still
+     use cached struct offsets and verified named-property slots. A sized
+     instance is never shaped: its header bytes are its extent, not slots. */
   o->shape = TS_SHAPE_NONE;
   return ts_obj(o);
+}
+void ts_sized_extent_abort(size_t bytes){
+  fprintf(stderr, "tsaot: a class instance of %zu bytes: a sized instance's struct must be the object header plus at most %u words (docs/cell_header_design.md)\n",
+          bytes, TS_SIZED_EXTENT_MAX);
+  abort();
 }
 tsv ts_new_sized(size_t size){ return ts_new_sized_impl(size, 0); }
 tsv ts_new_sized_pretenured(size_t size){ return ts_new_sized_impl(size, 1); }
@@ -1881,7 +1928,7 @@ static inline void array_write_barrier(ts_array* a, uint32_t index, tsv value){
 /* The out-of-line half of ts_array_set_inline's barrier (an old array). */
 void ts_array_remember(ts_array* a, uint32_t index, tsv value){ array_write_barrier(a, index, value); }
 static inline void array_invalidate_dirty(ts_array* a){
-  if (a->o.h.gen == TS_GEN_OLD && a->o.h.remembered) a->gc_dirty_all = 1;
+  if (a->o.h.gen == TS_GEN_OLD && (a->o.h.flags & TS_HDR_REMEMBERED)) a->gc_dirty_all = 1;
 }
 
 /* ---- sparse element storage (far stores; docs/sparse_elements_design.md) ----
@@ -2462,7 +2509,7 @@ static void props_release_dead(ts_object* o){
   gc_owned_release_dead(o->prop_index);
 }
 static void obj_to_dictionary(ts_object* o){
-  if (o->h.gen == TS_GEN_OLD) o->h.hdr_spare = 0xFF; /* slots renumber: a remembered range would be stale */
+  if (o->h.gen == TS_GEN_OLD) gc_cards_all(&o->h); /* slots renumber: a remembered range would be stale */
   if (!obj_shaped(o)) return;
   uint32_t sid = ts_obj_shape_id(o);
   uint32_t len = o->len, oldcap = o->cap;
@@ -3713,14 +3760,18 @@ static ts_string* ts_string_alloc_storage(uint32_t len, uint32_t flags){
 }
 
 /* Appendable flat storage. The buffer itself is internal and a JavaScript
-   string always sees a stable-prefix VIEW of it. The allocation size is the
-   capacity source of truth so moving GC can copy the cell without an external
-   side table or pointer fixup. */
+   string always sees a stable-prefix VIEW of it. The cell's capacity is the
+   storage's (docs/cell_header_design.md): a small cell's size class, a large
+   one's request; the builders write the units they append and the
+   terminator, so the slack past the request needs no zeroing. A static
+   literal never grows in place. */
 #define TS_SB_MIN 24u
 static uint32_t ts_string_storage_capacity(const ts_string* str){
   uint32_t unit = ts_str_unit_size_flags(str->flags);
-  if (str->h.size < sizeof(ts_string) + unit) return 0;
-  size_t slots = (str->h.size - sizeof(ts_string)) / unit;
+  if (str->h.gen == TS_GEN_NONHEAP) return 0;
+  size_t bytes = gc_cell_capacity(&str->h);
+  if (bytes < sizeof(ts_string) + unit) return 0;
+  size_t slots = (bytes - sizeof(ts_string)) / unit;
   if (slots == 0) return 0;
   slots--; /* preserve one trailing NUL code unit */
   return slots > UINT32_MAX ? UINT32_MAX : (uint32_t)slots;
@@ -5223,9 +5274,10 @@ static inline void gc_mark_common_props(ts_object* o, int young, int depth, int 
   uint32_t first = 0, end = o->len;
   /* A remembered old plain object rescanned by a minor collection visits its
      dirty cards only (docs/remembered_slots_design.md); 0 (no range) and
-     0xFF (every slot) scan everything. */
+     0xFF (every slot) scan everything, as does a sized instance (its header
+     byte is its extent's; docs/cell_header_design.md). */
   if (young && o->h.gen == TS_GEN_OLD && o->h.kind == TS_KIND_OBJECT){
-    uint8_t r = o->h.hdr_spare;
+    uint8_t r = (o->h.flags & TS_HDR_SIZED) ? 0xFF : o->h.hdr_spare;
     if (r != 0 && r != 0xFF){
       first = (uint32_t)(r >> 4) << 3;
       end = (uint32_t)(r & 0xF) << 3;
@@ -5344,9 +5396,9 @@ static void gc_scan_cell(ts_gc_header* h, int young, int depth){
     gc_scan_async_cell(h, young, depth);
   }
 }
-/* A cell's bytes in the heap count: its body, and an ArrayBuffer's bytes. */
-static inline size_t gc_cell_heap_bytes(const ts_gc_header* h){
-  return h->size + (h->kind == TS_KIND_ARRAYBUFFER ? ((const ts_arraybuffer*)h)->byte_length : 0u);
+/* A cell's bytes in the heap count: its capacity, and an ArrayBuffer's bytes. */
+static inline size_t gc_cell_heap_bytes(const ts_gc_header* h, size_t cap){
+  return cap + (h->kind == TS_KIND_ARRAYBUFFER ? ((const ts_arraybuffer*)h)->byte_length : 0u);
 }
 static inline void gc_old_bytes_sub(size_t n){ g_old_bytes = g_old_bytes > n ? g_old_bytes - n : 0u; }
 /* Release a dying cell's external buffers, not its body (the cell space
@@ -5427,17 +5479,18 @@ static void gc_cell_quarantine_trim(void){
 /* A dead cell of the cell space: its side buffers go; the memory
    is free because no mark bit covers it (a large run is released). */
 static void gc_cell_die(ts_gc_header* h){
-  size_t size = h->size;
   gc_free_cell_payload(h);
   gc_block* b = gc_cell_block(h);
+  size_t size = gc_block_cell_capacity(b);
   if (TS_RT_UNLIKELY(g_gc_protect)){ gc_cell_quarantine(h, b, size); return; }
   if (b->state == GC_BLK_LARGE_CELL){ gc_cell_release_large(h); return; }
   if (g_gc_zap && size) memset(h, 0xDD, size);
   GC_PAYLOAD_POISON(h, g_pclass_size[b->cls]);
 }
-static void gc_cell_promote(ts_gc_header* h){
-  gc_cell_set_old_bit(h);
-  h->mark = 0; h->gen = TS_GEN_OLD; h->remembered = 0;
+static size_t gc_cell_promote(ts_gc_header* h){
+  size_t cap = gc_cell_set_old_bit(h);
+  h->mark = 0; h->gen = TS_GEN_OLD; h->flags &= (uint8_t)~TS_HDR_REMEMBERED;
+  return cap;
 }
 /* After marking (both collections): the young cells the marker reached are
    promoted in place (coroutine frames re-enroll in the remembered set). */
@@ -5446,8 +5499,7 @@ static void gc_promote_survivors(void){
     ts_gc_header* h = g_survivors[i];
     G0_FATE(h, G0_PROMOTED);
     if (h->spare) gc_site_count(h->spare);
-    gc_cell_promote(h);
-    g_old_bytes += gc_cell_heap_bytes(h);
+    g_old_bytes += gc_cell_heap_bytes(h, gc_cell_promote(h));
     if (h->kind == TS_KIND_CORO) ts_gc_remember(h);
   }
   g_survivors_len = 0;
@@ -5481,14 +5533,14 @@ static void gc_cells_sweep_old(void){
           bits &= bits - 1u;
           ts_gc_header* h = (ts_gc_header*)(base + ((size_t)g << 4));
           if (h->mark){
-            h->mark = 0; h->remembered = 0;
+            h->mark = 0; h->flags &= (uint8_t)~TS_HDR_REMEMBERED;
             if (h->kind == TS_KIND_CORO) ts_gc_remember(h);
             continue;
           }
           if (TS_RT_UNLIKELY(h->gen == GC_GEN_FREED)) continue; /* quarantined */
           bm[w] &= ~((uint64_t)1u << (g & 63u));
           g_blocks[bi].live -= size;
-          gc_old_bytes_sub(gc_cell_heap_bytes(h));
+          gc_old_bytes_sub(gc_cell_heap_bytes(h, size));
           gc_site_count_dead_old(h);
           gc_cell_die(h);
         }
@@ -5501,10 +5553,10 @@ static void gc_cells_sweep_old(void){
     if (b->mark){
       ts_gc_header* h = (ts_gc_header*)gc_block_base(l - 1u);
       if (h->mark){
-        h->mark = 0; h->remembered = 0;
+        h->mark = 0; h->flags &= (uint8_t)~TS_HDR_REMEMBERED;
         if (h->kind == TS_KIND_CORO) ts_gc_remember(h);
       } else if (h->gen != GC_GEN_FREED){
-        gc_old_bytes_sub(gc_cell_heap_bytes(h));
+        gc_old_bytes_sub(gc_cell_heap_bytes(h, gc_block_cell_capacity(b)));
         gc_site_count_dead_old(h);
         gc_cell_die(h);
       }
@@ -5535,8 +5587,9 @@ static inline void g0_payload(int fate, int type, unsigned long long bytes, int*
 }
 static void g0_count_fate(ts_gc_header* h, int fate){
   unsigned kind = h->kind <= TS_KIND_LAST ? h->kind : 0u;
-  g0_cells[fate][kind]++; g0_cell_bytes[fate][kind] += h->size;
-  if (fate == G0_RESIDENT_OLD) g0_resident_gran[kind][g0_gran(h->size)]++;
+  size_t cap = gc_cell_capacity(h);
+  g0_cells[fate][kind]++; g0_cell_bytes[fate][kind] += cap;
+  if (fate == G0_RESIDENT_OLD) g0_resident_gran[kind][g0_gran(cap)]++;
   int any = 0;
   ts_obj_common* common = NULL;
   if (kind == TS_KIND_OBJECT) common = (ts_obj_common*)h;
@@ -5686,7 +5739,7 @@ void ts_gc_collect_young(void){
   for (size_t i=0;i<old_rem_len;i++){
     ts_gc_header* h = g_remset[i];
     if (!h) continue;
-    h->remembered = 0;
+    h->flags &= (uint8_t)~TS_HDR_REMEMBERED;
     if (h->gen != TS_GEN_OLD) continue;
     if (h->kind == TS_KIND_CORO){ ts_gc_remember(h); continue; }
     if (h->kind == TS_KIND_ARRAY){
@@ -5696,7 +5749,7 @@ void ts_gc_collect_young(void){
       ts_map* m = (ts_map*)h;
       m->gc_dirty_all = 0; m->gc_dirty_end = 0;
     } else if (h->kind == TS_KIND_OBJECT){
-      h->hdr_spare = 0;
+      gc_cards_reset(h);
     }
   }
   G0_PHASE(g0_minor_ns, 2);
@@ -5750,7 +5803,7 @@ void ts_gc_collect(void){
   G0_PHASE(g0_full_ns, 1);
   for (size_t i=0;i<g_rem_len;i++) if (g_remset[i]){
     ts_gc_header* remembered = g_remset[i];
-    remembered->remembered = 0;
+    remembered->flags &= (uint8_t)~TS_HDR_REMEMBERED;
     if (remembered->kind == TS_KIND_ARRAY){
       ts_array* a = (ts_array*)remembered;
       a->gc_dirty_all = 0; a->gc_dirty_end = 0;
@@ -5758,7 +5811,7 @@ void ts_gc_collect(void){
       ts_map* m = (ts_map*)remembered;
       m->gc_dirty_all = 0; m->gc_dirty_end = 0;
     } else if (remembered->kind == TS_KIND_OBJECT){
-      remembered->hdr_spare = 0;
+      gc_cards_reset(remembered);
     }
   }
   g_rem_len = 0;
@@ -7195,7 +7248,7 @@ static void map_grow(ts_map* m){
    index. Delete-path only: iteration positions move, which is the same
    observable class as the pre-index implementation's immediate shift. */
 static void map_compact(ts_map* m){
-  if (m->o.h.gen == TS_GEN_OLD && m->o.h.remembered) m->gc_dirty_all = 1;
+  if (m->o.h.gen == TS_GEN_OLD && (m->o.h.flags & TS_HDR_REMEMBERED)) m->gc_dirty_all = 1;
   uint32_t w = 0;
   for (uint32_t i = 0; i < m->len; i++){
     if (m->keys[i] == TS_MAPSET_HOLE) continue;
@@ -7295,7 +7348,7 @@ static int map_delete_unchecked(tsv mv, tsv k){
   }
   i = map_find(m, k);
   if (i < 0) return 0;
-  if (m->o.h.gen == TS_GEN_OLD && m->o.h.remembered) m->gc_dirty_all = 1;
+  if (m->o.h.gen == TS_GEN_OLD && (m->o.h.flags & TS_HDR_REMEMBERED)) m->gc_dirty_all = 1;
   for (uint32_t j=(uint32_t)i; j+1<m->len; j++){
     m->keys[j]=m->keys[j+1]; m->vals[j]=m->vals[j+1];
     if (m->iteration_order) m->iteration_order[j]=m->iteration_order[j+1];
@@ -10344,6 +10397,7 @@ static ts_class_field** g_class_fields = NULL;
 static int*             g_class_nfields = NULL;
 static uint32_t         g_class_meta_cap = 0;
 void ts_register_class_meta(uint32_t class_id, size_t size, tsv proto, ts_class_field* fields, int nfields){
+  (void)ts_sized_extent_words(size);   /* a class the header cannot describe fails at startup */
   if (class_id >= g_class_meta_cap){
     uint32_t nc = (class_id + 1 > g_class_meta_cap * 2) ? class_id + 1 : g_class_meta_cap * 2;
     if (nc < 8) nc = 8;
@@ -10667,7 +10721,7 @@ static tsv layout_proto_of(const ts_object* o){
 static ts_class_reg* class_reg_for(ts_object* o){
   if (!o || !ts_obj_is_sized(o)) return NULL;
   ts_class_reg* reg = class_reg_for_proto(layout_proto_of(o));
-  return reg && o->h.size >= reg->min_size ? reg : NULL;
+  return reg && ts_obj_sized_bytes(o) >= reg->min_size ? reg : NULL;
 }
 /* canonical-path bridge (A-2b): is `key` a struct field of o? give offset+numeric. */
 static int class_field_lookup(ts_object* o, ts_key key, size_t* off, int* numeric){
@@ -10679,7 +10733,7 @@ static int class_field_lookup(ts_object* o, ts_key key, size_t* off, int* numeri
   ts_class_field_cache_entry* cache = &g_class_field_cache[slot];
   if (cache->epoch == g_ts_class_layout_epoch && cache->proto == lp && cache->key == key){
     RT_STAT_INC(class_field_hits);
-    if (!cache->found || o->h.size < cache->min_size) return 0;
+    if (!cache->found || ts_obj_sized_bytes(o) < cache->min_size) return 0;
     *off = cache->offset; *numeric = cache->numeric; return 1;
   }
   ts_class_reg* reg = class_reg_for_proto(lp);
@@ -10690,7 +10744,7 @@ static int class_field_lookup(ts_object* o, ts_key key, size_t* off, int* numeri
   for (int i=0;i<reg->nfields;i++) if (reg->fields[i].name_id == key){
     cache->found = 1;
     cache->offset = reg->fields[i].offset; cache->numeric = reg->fields[i].numeric;
-    *off = cache->offset; *numeric = cache->numeric; return o->h.size >= cache->min_size;
+    *off = cache->offset; *numeric = cache->numeric; return ts_obj_sized_bytes(o) >= cache->min_size;
   }
   return 0;
 }
@@ -12192,7 +12246,7 @@ int ts_is_undefined(tsv v){ return ts_is_undef(v); }
    keys delete normally. */
 static int fn_delete(tsv obj, ts_key key, int strict);
 int ts_delete_prop_strict(tsv obj, ts_key key){
-  if (ts_is_obj(obj)){ ts_gc_header* _dh = (ts_gc_header*)ts_ptr(obj); if (_dh->gen == TS_GEN_OLD) _dh->hdr_spare = 0xFF; }
+  if (ts_is_obj(obj)){ ts_gc_header* _dh = (ts_gc_header*)ts_ptr(obj); if (_dh->gen == TS_GEN_OLD) gc_cards_all(_dh); }
   if (g_has_proxies && ts_is_proxy(obj)) return ts_proxy_delete_v(obj, ts_key_to_value(key));
   if (ts_is_func(obj)) return fn_delete(obj, key, 1);
   if (!ts_is_obj(obj)) return 1;
@@ -12269,10 +12323,19 @@ tsv ts_delete_dynamic_strict(tsv obj, tsv keyv, const uint32_t* method_pairs, ui
    never reads them); its class index word leaves every interval, and the
    typed accesses' flag goes up. 0 when the cell cannot be described as a
    plain object (more struct area than in-object slots can cover). */
+/* The conversion's header: no longer sized, the struct area's words become
+   in-object slots (at most TS_INLINE_SLOTS_MAX, so the extent's high byte
+   was 0), and the card range starts empty (an old cell's is marked whole
+   after). */
+static inline void gc_hdr_unsize(ts_gc_header* h, uint32_t slots){
+  h->flags &= (uint8_t)~TS_HDR_SIZED;
+  h->inline_cap = (uint8_t)slots;
+  h->hdr_spare = 0;
+}
 static int obj_abandon_layout(tsv obj){
   ts_object* o = (ts_object*)ts_ptr(obj);
   ts_class_reg* reg = class_reg_for(o);
-  size_t area = o->h.size - sizeof(ts_object);
+  size_t area = reg ? ts_obj_sized_bytes(o) - sizeof(ts_object) : 0;
   if (!reg || area % sizeof(tsv) != 0 || area / sizeof(tsv) > TS_INLINE_SLOTS_MAX) return 0;
   uint32_t nf = (uint32_t)reg->nfields, ne = o->len, n = nf + ne;
   ts_gc_root(&obj);
@@ -12293,11 +12356,11 @@ static int obj_abandon_layout(tsv obj){
   if (o->prop_index) gc_owned_free(o->prop_index);
   tsv* slots = (tsv*)((char*)o + sizeof(ts_object));
   for (size_t i = 0; i < area / sizeof(tsv); i++) slots[i] = TS_UNDEFINED;
-  o->h.inline_cap = (uint8_t)(area / sizeof(tsv));
+  gc_hdr_unsize(&o->h, (uint32_t)(area / sizeof(tsv)));
   o->props = d; o->len = n; o->cap = n ? (n < 4u ? 4u : n) : 0u; o->prop_index = NULL;
   ts_obj_set_shape(o, TS_SHAPE_NONE);
   o->cls = 0;
-  if (o->h.gen == TS_GEN_OLD) o->h.hdr_spare = 0xFF;   /* slots renumbered */
+  if (o->h.gen == TS_GEN_OLD) gc_cards_all(&o->h);   /* slots renumbered */
   if (n >= TS_PROP_INDEX_MIN) prop_index_rebuild(o, n);
   prop_add_epoch_bump();
   ts_gc_unroot(1);
@@ -12305,7 +12368,7 @@ static int obj_abandon_layout(tsv obj){
   return 1;
 }
 static int props_delete_own(ts_object* o, ts_key key){
-  if (o->h.gen == TS_GEN_OLD) o->h.hdr_spare = 0xFF;
+  if (o->h.gen == TS_GEN_OLD) gc_cards_all(&o->h);
   if (ts_obj_integrity(o) & (1u|4u)) return 0;   /* frozen / sealed: delete ignored (false) */
   ts_pref found = prop_find(o, key);
   if (!pref_ok(found)) return 1;
@@ -12354,7 +12417,7 @@ static int fn_delete(tsv obj, ts_key key, int strict){
   return r;
 }
 int ts_delete_prop(tsv obj, ts_key key){
-  if (ts_is_obj(obj)){ ts_gc_header* _dh = (ts_gc_header*)ts_ptr(obj); if (_dh->gen == TS_GEN_OLD) _dh->hdr_spare = 0xFF; }
+  if (ts_is_obj(obj)){ ts_gc_header* _dh = (ts_gc_header*)ts_ptr(obj); if (_dh->gen == TS_GEN_OLD) gc_cards_all(_dh); }
   if (g_has_proxies && ts_is_proxy(obj)) return ts_proxy_delete_v(obj, ts_key_to_value(key));
   if (ts_is_func(obj)) return fn_delete(obj, key, 0);
   if (!ts_is_obj(obj)) return 1;
@@ -14878,9 +14941,10 @@ static ts_prop_location* prop_ic_probe(ts_prop_ic* ic, tsv obj, ts_key key){
   if (!ts_obj_is_sized(o)) return NULL;
   ts_prop_location_cache* cache = prop_ic_locations(ic);
   if (!cache) return NULL;
+  size_t receiver_size = ts_obj_sized_bytes(o);
   for (uint32_t i=0;i<TS_PROP_IC_SIZE;i++){
     ts_prop_location* e=&cache->entries[i];
-    if (e->proto != o->proto || e->receiver_size != o->h.size || e->key != key) continue;
+    if (e->proto != o->proto || e->receiver_size != receiver_size || e->key != key) continue;
     if (e->kind == TS_PROP_IC_STRUCT){ RT_STAT_INC(location_hits); return e; }
     if (e->kind == TS_PROP_IC_OWN && e->slot < o->len && obj_key_at(o, e->slot) == key){
       prop_ic_fill_shape(ic, o, key, e->slot);
@@ -14895,9 +14959,10 @@ static void prop_ic_fill_entry(ts_prop_ic* ic, ts_object* o, ts_key key,
   ts_prop_location_cache* cache = prop_ic_locations(ic);
   if (!cache) return;
   uint32_t target = TS_PROP_IC_SIZE;
+  size_t receiver_size = ts_obj_sized_bytes(o);
   for (uint32_t i=0;i<TS_PROP_IC_SIZE;i++){
     ts_prop_location* e = &cache->entries[i];
-    if (e->proto == o->proto && e->receiver_size == o->h.size &&
+    if (e->proto == o->proto && e->receiver_size == receiver_size &&
         e->key == key && e->kind == kind && e->slot == slot){ target = i; break; }
     if (target == TS_PROP_IC_SIZE && e->kind == 0) target = i;
   }
@@ -14909,7 +14974,7 @@ static void prop_ic_fill_entry(ts_prop_ic* ic, ts_object* o, ts_key key,
     }
   }
   ts_prop_location* e = &cache->entries[target];
-  e->proto = o->proto; e->receiver_size = o->h.size; e->key = key;
+  e->proto = o->proto; e->receiver_size = receiver_size; e->key = key;
   e->slot = slot; e->kind = kind; e->numeric = numeric;
 }
 static void prop_ic_fill(ts_prop_ic* ic, ts_object* o, ts_key key, ts_pref p){
@@ -14920,7 +14985,7 @@ static void prop_ic_fill(ts_prop_ic* ic, ts_object* o, ts_key key, ts_pref p){
   else prop_ic_fill_entry(ic, o, key, slot, TS_PROP_IC_OWN, 0);
 }
 static void prop_ic_fill_struct(ts_prop_ic* ic, ts_object* o, ts_key key, size_t offset, int numeric){
-  if (offset <= UINT32_MAX && offset + sizeof(tsv) <= o->h.size)
+  if (offset <= UINT32_MAX && offset + sizeof(tsv) <= ts_obj_sized_bytes(o))
     prop_ic_fill_entry(ic, o, key, (uint32_t)offset, TS_PROP_IC_STRUCT, (uint8_t)numeric);
 }
 static tsv ts_prop_ic_struct_read(ts_object* o, const ts_prop_location* e){
