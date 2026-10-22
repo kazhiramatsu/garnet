@@ -7969,3 +7969,22 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   identical), bundler 43/43, selfconf, conformance 532/532 plain and strict.
   Also measured, unsoundly: the class-binding TDZ checks (6,428 sites in
   tsc-ts) cost at most 0.7% of its cycles.
+- Threads, design only (`docs/threads_design.md`): to run tsc-ts's parallel
+  paths (parse and bind threads; checker threads that share the published
+  program and emit), garnet implements `node:worker_threads` and
+  `@scriptc/threads` with scriptc's contract (Node-compatible results).
+  Surveyed: the API tsc-ts uses (one Worker form, `parentPort`, messages,
+  nine SharedArrayBuffers with `Atomics` add/compareExchange/or/load/store,
+  no `wait`), what it publishes (the program; parse batches that outlive
+  their thread), and the runtime's state (255 live file-scope variables,
+  no thread awareness; 16,561 site caches of 80 bytes in tsc-ts's C;
+  hazards: non-atomic site-cache entries, shape and intern tables
+  reallocated under readers). Model 1 chosen (isolates with their own
+  heaps, published graphs immortal) ahead of model 2 (one shared heap,
+  parallel marking). Measured: a frame push and pop through Darwin's
+  thread-local variables costs 1.1 ns against 0.44 ns for a global; an
+  isolate block at the base of a stack aligned to its size (the stack
+  pointer masked) costs 0.44 ns, so per-isolate state needs neither TLV nor
+  a context parameter. The threaded forms are selected per program at
+  build time (a program that does not import `node:worker_threads` is
+  unchanged). Five slices planned; no code yet.
