@@ -10284,10 +10284,18 @@ static uint32_t class_proto_hash(tsv proto){
   uint64_t x = ((proto & TS_PAYLOAD_MASK) >> 4) * 0x9E3779B97F4A7C15ull;
   return (uint32_t)(x >> 32);
 }
+/* The registry does not keep its prototypes alive: a class evaluated per
+   call registers a fresh prototype that dies with its class value, and a
+   later prototype can take the dead one's cell. The newest registration of a
+   cell answers for it (a dead class's layout must not), so a registration
+   replaces an entry for the same cell; a rebuild inserts in registration
+   order, so the newest still wins. */
 static void class_reg_index_put(uint32_t reg_i){
   uint32_t mask = g_class_reg_index_cap - 1u;
-  uint32_t slot = class_proto_hash(g_class_regs[reg_i].proto) & mask;
-  while (g_class_reg_index[slot]) slot = (slot + 1u) & mask;
+  tsv proto = g_class_regs[reg_i].proto;
+  uint32_t slot = class_proto_hash(proto) & mask;
+  while (g_class_reg_index[slot] && !ts_same_cell(g_class_regs[g_class_reg_index[slot] - 1u].proto, proto))
+    slot = (slot + 1u) & mask;
   g_class_reg_index[slot] = reg_i + 1u;
 }
 static void class_reg_index_reserve(uint32_t need){

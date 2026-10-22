@@ -8030,3 +8030,15 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   rewritten an old instance's extent), `gc_block.bytes` saturates at 4 GiB,
   and header-only instances must stay unsized; the third round found
   nothing minor left.
+- Class registry: a prototype in a dead registered prototype's cell. The
+  registry does not keep its prototypes alive (a class evaluated per call
+  registers a fresh prototype, which dies with its class value), and its
+  index answered for a cell with the cell's oldest registration, so a
+  prototype that took a dead registered prototype's cell found the dead
+  class's layout: its own fields went to the dictionary, and the collector
+  scanned the dead layout's fields (or none, when the dead layout was the
+  larger), so values held only in the real fields could be freed. Found by
+  the cell header unit tests under ASan with a minor collection at every
+  allocation (a dead cell is reused at once). A registration now replaces
+  the entry for its cell (`class_reg_index_put`); unit test (fails on the
+  previous runtime).

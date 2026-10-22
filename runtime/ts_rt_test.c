@@ -1449,6 +1449,42 @@ int main(){
     CK("site pretenuring: a tenured site with dying old cells returns to young", reverted && other_young && kept_ok);
     ts_gc_unroot(4);
   }
+  /* The class registry does not keep prototypes alive: a prototype that
+     takes a dead registered prototype's cell answers with its own layout. */
+  {
+    typedef struct { ts_object o; tsv a, b; } two_fields;
+    typedef struct { ts_object o; tsv x; } one_field;
+    static ts_class_field f_two[2], f_one[1];
+    f_two[0].name_id = 495001u; f_two[0].offset = offsetof(two_fields, a); f_two[0].numeric = 0;
+    f_two[1].name_id = 495002u; f_two[1].offset = offsetof(two_fields, b); f_two[1].numeric = 0;
+    f_one[0].name_id = 495011u; f_one[0].offset = offsetof(one_field, x); f_one[0].numeric = 0;
+    tsv dead = ts_new_proto();
+    uintptr_t dead_cell = (uintptr_t)ts_ptr(dead);
+    ts_register_class(dead, f_two, 2);
+    dead = TS_UNDEFINED;
+    ts_gc_collect();
+    tsv keep = ts_new_array(0); ts_gc_root(&keep);
+    tsv reused = TS_UNDEFINED; ts_gc_root(&reused);
+    for (int i = 0; i < 200000 && ts_is_undef(reused); i++){
+      tsv p = ts_new_proto();
+      if ((uintptr_t)ts_ptr(p) == dead_cell) reused = p;
+      else { ts_gc_root(&p); ts_array_push(keep, p); ts_gc_unroot(1); }
+    }
+    int found = !ts_is_undef(reused), own_layout = 0;
+    if (found){
+      ts_register_class(reused, f_one, 1);
+      tsv inst = ts_new_sized(sizeof(one_field)); ts_gc_root(&inst);
+      ((ts_object*)ts_ptr(inst))->proto = reused;
+      tsv val = ts_new_string("own layout", 10); ts_gc_root(&val);
+      ts_set(inst, f_one[0].name_id, val);
+      own_layout = ((one_field*)ts_ptr(inst))->x == val && ((ts_object*)ts_ptr(inst))->len == 0u;
+      ts_gc_unroot(2);
+    }
+    /* protect mode quarantines dead cells: no cell is reused, nothing to check */
+    if (!found) printf("  (class registry: the dead prototype's cell was not reused)\n");
+    CK("class registry: a prototype in a dead registered prototype's cell has its own layout", !found || own_layout);
+    ts_gc_unroot(2);
+  }
   printf("\n%s\n", fail==0?"ALL RUNTIME TESTS PASS":"FAILURES");
   return fail?1:0;
 }
