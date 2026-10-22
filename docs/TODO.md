@@ -7988,3 +7988,25 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   a context parameter. The threaded forms are selected per program at
   build time (a program that does not import `node:worker_threads` is
   unchanged). Five slices planned; no code yet.
+- Threads design, v2 and v3 (`docs/threads_design.md`), after three
+  reviews by Codex (gpt-6.1-sol, xhigh), every checkable claim verified
+  against the code. Round 1 (sixteen findings, six blocking) caught real
+  holes in v1: a full collection clears every payload mark and re-marks
+  from owners, so unscanned immortal cells would lose their property
+  vectors and elements (`gc_payload_begin_full`); string concatenation
+  extends a view's buffer parent in place; the 128 MB proximity test for
+  stack cells (`gc_direct_stack_plausible`) conflicts with large worker
+  stacks; `scripts/tsan_one.sh` is not ThreadSanitizer; `process.exit` in a
+  Node worker ends only the worker. Round 2 left publication open (a commit
+  that allocates, payload ownership, sparse arrays that densify on read,
+  ephemerons looping on immortal values, the store-guard closure). Then a
+  restructuring: tsc-ts's Node path (`--checkers N`, every checker
+  rebuilding its own program; garnet's tsc-ts phases: parse 0.260 s, bind
+  0.098 s, check 0.825 s, emit 0.534 s) needs no publication, so v3 makes
+  **milestone A** isolated workers (Node's model: everything mutable per
+  isolate, nothing shared but code, constants, flat static literals,
+  `SharedArrayBuffer` stores and inboxes) and defers publication to
+  milestone B. Round 3 agreed, verified the Node path, and corrected the
+  estimate: main parses before starting its workers, so about 0.97 s at
+  four checkers and 0.85 s at eight (1.8-2x), at about 812 MB per checker.
+  Harness for the accessor measurement: `benchmarks/threads/isolate_access.c`.

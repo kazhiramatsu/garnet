@@ -1,246 +1,297 @@
-# Threads: worker isolates and published graphs
+# Threads: isolated workers first, published graphs later
 
-Session 352. Status: design (no code yet). Runtime (`ts_rt.c`), emitter
-(`emit_c.rs`), module shims (`benchmarks/tsc_ts_native/garnet`).
+Session 352. Status: design v3, after three reviews by Codex (gpt-6.1-sol,
+xhigh effort; every claim that could be checked against the code was
+checked); no code yet. Runtime (`ts_rt.c`, `ts_rt.h`), emitter
+(`emit_c.rs`), exporter (`class_extract.ts`), regexp adapter, tsc-ts host
+and shims (`benchmarks/tsc_ts_native`).
 
 ## Why
 
-tsc-ts (`docs/tsc_ts_native_design.md`) parallelizes parsing and binding
-(`compiler/parallel-parse.ts`) and checking and emitting
-(`compiler/parallel-check.ts`) on worker threads, sharing the bound program
-between them by reference through `@scriptc/threads`. On the TypeScript
-6.0.3 compiler project, scriptc's binary takes 1.02 s on one thread and
-0.48 s on its threads; garnet runs it single-threaded in 1.75 s (Session
-352, interleaved). The same parallel fraction would bring garnet to about
-0.8 s. The code that would run is the code tsc-ts already has.
+tsc-ts (`docs/tsc_ts_native_design.md`) can check and emit on several
+threads. On the TypeScript 6.0.3 compiler project garnet's tsc-ts takes
+1.73 s on one thread (`--extendedDiagnostics`: parse 0.260 s, bind 0.098 s,
+check 0.825 s, emit 0.534 s; peak memory 812 MB); scriptc's binary takes
+1.02 s on one thread and 0.48 s on its threads, which share the bound
+program through `@scriptc/threads`.
 
-## The contract
+## Two milestones
 
-garnet implements the API tsc-ts is written against, with the semantics
-`@scriptc/threads` documents, so a program behaves the same under Node.js
-(the V8 oracle) and natively:
+- **A, isolated workers** (Node's model): `node:worker_threads` with
+  structured-clone messages, `SharedArrayBuffer` and `Atomics`, every worker
+  an independent isolate. tsc-ts runs its existing Node path
+  (`sharesPublishedGraphs` false, `--checkers N`).
+- **B, published graphs** (scriptc's model), later: `@scriptc/threads`'
+  `publish`, so workers share the parsed and bound program instead of
+  rebuilding it, and parse threads become possible.
 
-- `node:worker_threads`: workers with their own JavaScript heap and realm,
-  `postMessage` and `workerData` by structured clone (the subset tsc-ts
-  uses: see "What tsc-ts uses").
-- `@scriptc/threads`: `publish(value)` makes `value` and everything it
-  reaches immutable and immortal, and `postMessage` / `workerData` deliver
-  a published graph by reference (`sharesPublishedGraphs` is true).
-  Publishable: primitives other than symbols, plain objects, arrays, class
-  instances, Maps and Sets; anything else reached throws a TypeError before
-  anything changes. Writes into a published graph throw the frozen-object
-  TypeErrors; published Maps and Sets reject their mutators.
-- `SharedArrayBuffer` and `Atomics`: real shared memory between isolates.
+A comes first (the third review agreed): it removes every
+publication-specific problem the first two reviews found, and it builds
+what B needs anyway (isolates, workers, messages, atomics).
 
-## What tsc-ts uses
+## What tsc-ts's Node path does
 
-(Survey of tsc-ts's source; paths under `packages/tsc-ts/src/compiler`.)
+(Verified against tsc-ts's source; paths under `packages/tsc-ts/src`.)
 
-- **Workers**: one constructor form, `new Worker(new URL(import.meta.url),
-  { workerData })` (`main.ts`), so a worker re-runs the program's entry with
-  every module initializer in a fresh isolate and dispatches on
-  `workerData.kind`. `isMainThread`, `workerData`, `parentPort`
-  (`postMessage`, `on('message')`, `close`), and on a `Worker`
-  `postMessage`, `on('message')`, `on('error')`. Never: `terminate`, exit
-  events, `MessageChannel`, transfer lists, `resourceLimits`. Only the main
-  thread spawns. `node:os` `availableParallelism()` and `totalmem()`.
-- **Parse threads** (`parallel-parse.ts`, `parse-thread.ts`): main hands out
-  chunks of files (`LoadMessage`, cloned); a thread parses and binds them,
-  publishes the batch (`PreparedBatch`: the bound `SourceFile`s and their
-  resolutions) and posts it; main adopts the files into its program by
-  reference and sends more; at the end main posts `stop` and the thread
-  exits. Published cells therefore outlive the isolate that allocated them.
-- **Checker threads** (`parallel-check.ts`, `thread-entry.ts`): main
-  publishes the whole program (`shareWithCheckers`: lazy values computed,
-  caches switched to per-thread tables, merged globals, emit indexes) and
-  passes it in `workerData`; each thread builds its own checker over it,
-  pulls files from a shared schedule in a `SharedArrayBuffer`
-  (compare-and-swap cursor, two busy-wait spin locks, work stealing), emits
-  the files it checks, and posts one packed result (`Int32Array`s and
-  strings, cloned) when it ends, so nothing on its heap stays reachable.
-- **Shared memory**: nine `SharedArrayBuffer`s (id counters, the schedule,
-  incremental-build verdicts); `Atomics` `add`, `compareExchange`, `or`,
-  `load`, `store`; never `wait` or `notify`. Node and symbol ids come in
-  chunks from a shared counter, so published ids stay unique.
-- **Blocking**: none on main (its event loop must deliver the workers'
-  `message` and `error` events); the checkers spin.
-- **Per-isolate module state** tsc-ts relies on: id counters, per-thread
-  caches over shared objects (file system, resolution, package.json, string
-  lengths: a cache inside a published string must not be written in place),
-  scratch buffers, the checker's tables, the global `process`.
-- **garnet's shims today** (`benchmarks/tsc_ts_native/garnet`): `Worker`
-  throws, `isMainThread` is true, `publish` is the identity,
-  `sharesPublishedGraphs` is false and `availableParallelism()` is 1, so
-  tsc-ts takes its single-threaded path (`--checkers N` crashes). The host's
-  `g_last_errno` (`host.c`) would have to become per thread, and worker
-  threads need large stacks (an -O0 build already overflows 8 MB).
+- `--checkers N` selects N checkers in all (default one when graphs are not
+  shared; capped at 256, `compiler/parallel-check.ts`). Main is checker 0
+  and starts N-1 workers, each `new Worker(new URL(import.meta.url),
+  { workerData })` (`main.ts`): a worker re-runs the program's entry, every
+  module initializer included, and dispatches on `workerData.kind`
+  (`compiler/thread-entry.ts`).
+- Main parses and binds its program first, then schedules and starts the
+  workers, then checks while they start. A worker rebuilds the program from
+  the command line (`drivers/node-system.ts`, `executeCommandLine`), binds
+  every file (`compiler/program-checker.ts`), and does not recurse into the
+  parallel compiler.
+- Every checker claims files from a schedule in a `SharedArrayBuffer`
+  (`Atomics.compareExchange` cursor, two spin locks, work stealing, groups
+  of files sharing costly declarations) and emits each file right after
+  checking it, writing it itself (under `noEmitOnError` workers hold the
+  text for main). Checkers therefore write output files concurrently
+  through their own `SystemWriter`s.
+- A worker posts one result when it ends: cloned objects (results are
+  packed only when graphs are shared), which main revives into diagnostics
+  and emit results against its own program.
+- Needed from the platform: cloning of primitives, strings, arrays and
+  class instances' own enumerable fields (they arrive as plain objects);
+  `Int32Array` views on `SharedArrayBuffer`s; `Atomics` `add`,
+  `compareExchange`, `or`, `load`, `store`; `parentPort` (`postMessage`,
+  `on('message')`, `close`); on a `Worker`, `postMessage`, `on('message')`,
+  `on('error')`; `node:os` `availableParallelism()` and `totalmem()`. Not
+  needed: transfer lists, `MessageChannel`, `structuredClone`,
+  `terminate`, `Atomics.wait`/`notify`.
+- garnet's shims today (`benchmarks/tsc_ts_native/garnet`): `Worker`
+  throws, `isMainThread` is true, `availableParallelism()` is 1, and the
+  entry (`garnet/main.ts`) always runs the main path; it needs the
+  `isMainThread` branch.
 
-## Two runtime models
+**Estimate.** Main's parse and bind (P = 0.36 s) precede the workers', which
+precede their checking; with the divisible check and emit work W = 1.36 s,
+an idealized T = P + P + (W - P) / N is 0.97 s at four checkers and 0.85 s
+at eight (about 1.8-2x), before duplicated lazy cross-file checking, worker
+startup (module initialization per isolate), bandwidth, cache and allocator
+contention. Memory: N parsed and bound programs plus each checker's
+caches; 812 MB per checker as a stress budget (3.3 GB at four, 6.5 GB at
+eight). B removes the repeated P and the copies.
 
-1. **Isolates with their own heaps, published graphs immortal** (scriptc's
-   model). Each worker is an isolate: its own heap, collector, roots,
-   exception state and realm. A published graph is frozen and its cells
-   marked immortal: the publishing isolate's collector neither sweeps nor
-   traces them (everything they reach is published too), and other
-   isolates read them in place (cells never move). Collections stay
-   single-threaded and per isolate, so the collector needs no change beyond
-   the immortal state. A published graph is never freed: right for a
-   compiler (the program lives to the end), a leak for a server that
-   publishes per request.
-2. **One shared heap, many mutators** (Dart's isolate groups). Isolates
-   share one heap and collector; immutable objects are sent by reference
-   and stay collectable. A collection stops every isolate and can mark on
-   every core (garnet's collector is single-threaded today, which is what
-   keeps its pauses above V8's). It needs thread-local allocation buffers,
-   safepoints for all mutators, per-thread remembered sets and a parallel
-   marker.
+## Milestone A: isolated workers
 
-Model 1 first: it is the smaller step and what tsc-ts needs; model 2 stays
-open as the follow-up that also parallelizes collection.
+### Per isolate: everything mutable
 
-## The isolate block
+Each worker is a complete runtime instance on its own OS thread. Per
+isolate (from the survey of the runtime and the generated code; the third
+review added the generated storage, function-local statics and the
+adapters):
 
-Model 1 needs every isolate's state reached cheaply from any code: the
-runtime's 255 live file-scope variables (Session 352 survey of `ts_rt.c`,
-plus 36 function-local statics, the regexp adapter's, JSON's and the
-host's), and the generated code's mutable statics (tsc-ts: 16,561 site
-inline caches of 80 bytes, `GLOBALS[6219]`, `CLASS_PROTO[812]`). Measured
-on this machine, one frame push and pop through the state:
+- the heap and collector: pacing, the cage and its block table, cursors,
+  work lists, young log, survivors, remembered set, mark stacks;
+- roots: `g_roots`, `g_static_roots`, `g_ts_frame_top`, the registered
+  stack range;
+- exceptions (`g_handlers`, `g_exception`), the event loop, the inbox;
+- the object model's tables: shapes and transitions, the field intern
+  table, symbols (`g_next_sym_id`, `g_sym_value`, the registry), the class
+  registry and every cache keyed by a prototype, with their epochs. No
+  object ever crosses isolates, so ids may diverge between them;
+- prototypes and builtin singletons, with the `rooted` flag of each lazy
+  slot (function-local statics move with their slots);
+- in the generated code: the site inline caches (16,561 in tsc-ts, 80
+  bytes each), `GLOBALS`, `CLASS_PROTO`, `OBJECT_PROTO`, the literal
+  layouts' lazily computed shapes, the lazily interned key ids;
+- the regexp adapter's pattern lists, literal caches, interned keys and
+  inline caches; JSON's chunk pool; `g_inspect_color`; `Math.random`'s
+  state (an isolate PRNG instead of libc `rand`); the host's `g_last_errno`
+  and clock and argument state; lazy environment caches such as
+  `g0_fates_on`; the allocation-site feedback; `g_typed_slow`,
+  `g_has_proxies`, `g_closed_receivers`, `g_class_relinked`.
 
-| access | ns |
-|---|---|
-| a plain global (today) | 0.44 |
-| a `__thread` variable or a `__thread` pointer to a struct (Darwin's TLV thunk, `blr`) | 1.05-1.13 |
-| the isolate block at the base of a stack aligned to its size (`mov x, sp; and x, x, #mask`) | 0.44 |
+### Shared
 
-So each thread that runs JavaScript (the main isolate included) runs on a
-stack region aligned to its size (say 256 MB, reserved, committed as it
-grows), with its isolate block at the region's lowest pages behind a guard
-page: `ts_iso()` is the stack pointer masked, no call, no extra load.
-garnet's coroutines and exceptions never switch stacks (state machines,
-`setjmp`/`longjmp` on the same stack), and C callbacks run on the caller's
-stack. A threaded build starts its main isolate on such a thread and the
-process's first thread only joins it.
+- Code and constant tables (`FN_TABLE`, `FN_ARITY`, `CLASS_INDEX_TAB`,
+  vtables, `CLASS_FIELDS_N`, `FIELD_NAME_N`).
+- Flat static string literals (`TS_STRLIT_N`), only when verified flat
+  leaves and fully initialized (hashes) before the first worker starts.
+  Today the collector writes the mark byte of every NONHEAP cell it reaches
+  (`gc_mark_visit_slow`) and clears it afterwards: it must skip these
+  cells without touching their headers. NONHEAP cells in general are not
+  skipped: stack cells hold heap references. The runtime's `typeof` cells
+  are written at startup and become process-initialized.
+- `SharedArrayBuffer` backing stores and the inboxes.
+- Process resources: the working directory, the environment, file
+  descriptors, stdio (records may interleave), mimalloc (already
+  thread-aware; its storage must outlive queued buffers), curl's global
+  initialization (once; easy and multi handles stay per isolate).
 
-The build is chosen per program: the compiler knows whether the program
-imports `node:worker_threads` (whole program), and only then emits the
-threaded forms (`TSAOT_THREADS`): a state accessor that is a plain global
-otherwise, so a single-threaded program's C and runtime stay as they are.
+### Reaching isolate state
 
-## State, by category
+Thread-local storage first: the isolate pointer is loaded once per function
+that needs it and kept in a local. `benchmarks/threads/isolate_access.c`
+measures one frame push and pop: 0.45 ns through a plain global (today),
+1.1 ns through a `__thread` pointer (Darwin's TLV thunk), 0.45 ns through an
+isolate block at the base of a stack aligned to its size (the stack pointer
+masked). The whole-program cost of the thread-local form is measured in
+slice A1; the stack-aligned block stays a fallback with its own policies
+(no JavaScript on alternate signal stacks or foreign threads, guard pages
+and stack probing, ASan's fake stacks, debuggers and profilers).
 
-From the survey (`ts_rt.c` lines in the survey's notes):
+The threaded forms are selected per program at build time when it can
+construct a `Worker` (tsc-ts's entry imports `node:worker_threads`, so it
+always builds threaded); a program without workers keeps today's C and
+runtime. All translation units of a program get the same selection.
 
-- **Per isolate**: the heap and collector (pacing, cage cursors, work lists,
-  young log, survivors, remembered set, mark stacks), the roots
-  (`g_roots`, `g_static_roots`, `g_ts_frame_top`), the allocation-site
-  feedback, exceptions (`g_handlers`, `g_exception`), the event loop and
-  its queues, the prototypes and builtin singletons (34 names, created at
-  setup or lazily), the class registry, every cache holding a prototype's
-  identity and its epochs (location, addition, absent, class-field caches),
-  the symbol registry and `g_sym_value`, `g_ts_cur_env`, the JSON chunk
-  pool, `g_inspect_color`, the regexp caches, `Math.random`'s state, the
-  host's `g_last_errno`; in the generated code the site caches, `GLOBALS`,
-  `CLASS_PROTO`, `OBJECT_PROTO`, the lazily interned key ids. Moving the
-  site caches into the isolate block also removes the worst race: a site
-  cache entry is a 12-byte record written non-atomically, and the inline
-  hit path trusts its slot without a bounds check.
-- **Shared, read-mostly**: the shape tables and the field intern table
-  (their ids are baked into the generated code, the site caches and every
-  object, so isolates must agree), the symbol id counter, the class-index
-  and size-class tables, the configuration, the static string literals and
-  the constant tables. Appends take a process mutex; rows live in chunks
-  that never move (no `realloc` under a reader), the transition hash table
-  is replaced but the old one never freed, and an id is published with a
-  release store before any object carries it. One-time initializations
-  (`fn_keys_init`, `ts_wksym_init`, the regexp keys, `gc_config_init`) run
-  at startup, before any worker.
-- **Process-wide flags**: `g_has_proxies`, `g_typed_slow`,
-  `g_class_relinked` only go from 0 to 1; they stay global (one isolate's
-  Proxy slows the others' guarded accesses, which is correct).
+### Initialization
 
-## Heaps and published graphs
+**Process** setup runs once, before any worker: constant tables, the
+static string literals' hashes, the `typeof` cells, curl's global
+initialization, the configuration. **Isolate** setup runs per isolate: the
+field table (`ts_init_fields` resets tables and also initializes the
+`typeof` strings: split), the class index's reverse table (rebuilt by
+class registration), well-known symbols (they allocate rooted cells), the
+prototypes and builtin singletons, the module initialization.
 
-One cage for the process; its blocks are owned by isolates (the block table
-records the owner, the free-block list is shared under a lock), and a
-collection visits its own isolate's roots and blocks only.
+### The collector
 
-A published cell's gen byte says IMMORTAL. The marker stops at it without
-marking (everything a published cell reaches is published), sweeps keep it,
-and no barrier fires on it (it is frozen), so no collector of any isolate
-writes a published cell's header. An isolate that exits (tsc-ts's parse
-threads, once main has their files) runs a last collection with no roots,
-keeps its blocks that hold immortal cells (owned by the process from then
-on, never swept) and frees the rest.
+Unchanged per isolate, with two fixes: the proximity test for stack cells
+(`gc_direct_stack_plausible`, 128 MB from the collector's frame) becomes a
+test against the isolate's registered stack range (worker stacks are
+large; ASan's fake stacks need their own registration), and the shared
+static literals are skipped as above. Each isolate's cage reserves 64 GiB
+of address space plus about 544 MiB of metadata (not resident; reservation
+falls back to smaller sizes): an exiting worker must unmap its cage and
+release its external resources, which no path does today, and isolate
+teardown must be separated from process-wide `atexit` callbacks.
 
-`publish(value)` walks the graph twice: first to validate (a function, a
-symbol, an accessor or another unpublishable cell throws the TypeError and
-nothing has changed), then to freeze every cell and mark it immortal
-(young cells take their old bit). Strings are flattened first (a view's
-parent is published with it); the lazy caches inside strings (hashes) are
-not written once a string is published. Writes into a published graph throw
-the frozen-object TypeErrors: the generic paths already test the integrity
-flags; the emitter guards the struct stores of the classes a program can
-publish (the classes reachable from `publish` arguments, found by the class
-extractor like the closed-receivers proof); Map, Set and array mutators test
-the immortal gen.
+### Workers and messages
 
-Prototypes: a published class instance keeps its class index. In another
-isolate, `instanceof`, receiver guards and dispatch tables work by that
-index already; the dynamic paths read a published sized instance's
-prototype through `obj_proto(o)`, which takes the receiving isolate's own
-`CLASS_PROTO` for its class, so every isolate has its own prototypes (as
-realms do) and no thread ever reads another isolate's prototype objects
-(which their isolate may still write: lazily created method values and
-prototypes).
+- `new Worker(url, { workerData })` starts an OS thread with a large stack
+  (tsc-ts's -O0 build overflows 8 MB) running a fresh isolate.
+- `postMessage` serializes synchronously on the sender's thread into an
+  owned buffer: cycles and aliases preserved; primitives, strings
+  (lossless), arrays, plain objects and class instances (their own
+  enumerable fields, delivered as plain objects), typed arrays copied with
+  their offsets, a `SharedArrayBuffer` as a counted reference to its
+  backing store. Property names travel as strings and are interned by the
+  receiver. No sender-heap reference is ever queued. Messages are FIFO per
+  sender; the receiver decodes on its own thread with its temporaries
+  rooted; a port buffers messages until a `message` listener is attached.
+- Decoded values are foreign receivers: plain objects where the code reads
+  class-typed parameters (tsc-ts's revival does). The closed-receivers proof
+  (`docs/closed_receivers_design.md`) treats a received message or
+  `workerData` as a source of foreign receivers, so such programs keep their
+  receiver guards.
+- Lifetime: main's event loop stays alive while a started worker is alive
+  and delivers its `message` and `error` events; a worker whose entry
+  returns with nothing referenced (no listener) ends naturally after its
+  last post is queued, as tsc-ts's checkers do. An outer exception
+  boundary turns an uncaught exception in a worker's initialization or
+  event dispatch into an `error` event on its `Worker` (today an uncaught
+  exception aborts the process); early errors are buffered until a
+  listener is attached. `process.exit` in a worker ends that worker; on
+  main it ends the process.
 
-## Workers and messages
+### SharedArrayBuffer and Atomics
 
-- `new Worker(url, { workerData })` starts an OS thread on an aligned stack
-  with a fresh isolate that runs the program's module initialization, then
-  the entry's code sees `isMainThread` false and its `workerData`.
-- Each isolate has an inbox (mutex and condition variable). `postMessage`
-  serializes its value on the sender's thread (the structured clone: plain
-  objects, arrays, strings, numbers, booleans, `null`, `undefined`; class
-  instances as plain objects, as Node delivers them; typed arrays copied;
-  a `SharedArrayBuffer` by reference to its backing store; a published
-  graph by reference) and the receiver deserializes it on its own thread.
-  The event loop waits on the inbox when it has nothing else to do and
-  dispatches `message` events; an uncaught exception in a worker becomes an
-  `error` event on its `Worker` (not a process abort).
-- `SharedArrayBuffer` backing stores live outside the cage, reference
-  counted across isolates; `Atomics` operations are C11 atomics on them.
-  `Atomics.wait` / `notify` (unused by tsc-ts) come later.
-- `availableParallelism()` reads `hw.activecpu`; `process.exit` from any
-  isolate ends the process.
+`Atomics` operations on `Int32Array` views become real, sequentially
+consistent atomic operations (`compareExchange` a compare-and-swap; today
+they are plain read-modify-write sequences): tsc-ts's scheduler needs them
+from the first parallel run. Backing stores live outside the cage with an
+atomic reference count held by every `SharedArrayBuffer` cell, every queued
+message and every `workerData` that carries one, released on failed
+construction or decode and on discarded queues; finalization drops a count
+instead of freeing. General shared-memory correctness (ordinary element
+reads and writes on shared views as relaxed atomics, mixed widths,
+overlapping `set` with snapshot semantics, byte consumers such as
+`TextEncoder.encodeInto`) needs a shared-access path through the emitted
+and runtime element accesses; until then ordinary accesses to shared
+memory are documented as unsupported races (tsc-ts only reads schedule
+words that a message or an atomic operation published).
 
-## Slices
+### Slices of A
 
-1. **The isolate block, one thread** (behavior-invariant): per-isolate state
-   behind an accessor that is today's global in single-threaded builds and
-   the masked stack pointer under `TSAOT_THREADS`; the main isolate on an
-   aligned stack. Gates as for any runtime change; A/B of a threaded build
-   of tsc-ts, still on one thread, against the plain one (expected neutral).
-2. **Shared tables made concurrent**: chunked shape and intern rows, the
-   append mutex, startup-time initialization. ThreadSanitizer runs
-   (`scripts/tsan_one.sh`) from here on.
-3. **Workers and messages**: threads, inboxes, the structured clone, the
-   event loop's waiting, `error` events, `availableParallelism`; worker
-   fixtures checked against Node (the same programs run under the V8
-   oracle), GC stress in several isolates at once.
-4. **`SharedArrayBuffer` and `Atomics`.**
-5. **`publish`**: the walk, the immortal gen, the store guards, the
-   prototypes; tsc-ts's shims switched to the real modules
-   (`sharesPublishedGraphs` true); tsc-ts measured on its threads against
-   one thread and against scriptc's threads.
-6. Later, if collection shows up: model 2 (one shared heap, parallel
-   marking).
+1. **Isolates on one thread** (behavior-invariant): every item under "Per
+   isolate" behind the isolate pointer (thread-local), the process and
+   isolate setup split, registered stack ranges, the shared literals
+   skipped by the collector. Gates: everything as for a runtime change, an
+   A/B of the threaded build against the plain one on tsc-ts (the
+   whole-program cost of the accessor), then two isolates run one after the
+   other in one process, then two isolates allocating and collecting at
+   once (shared literals untouched), under ThreadSanitizer.
+2. **Workers and messages**: threads, the structured clone, inboxes, the
+   event loop's waiting and lifetime rules, `error` events, worker
+   `process.exit`, cage teardown. Gates: deterministic worker fixtures
+   checked against Node (handshakes, not sleeps): class instances round
+   trip as plain objects, cycles and aliases, typed-array offsets,
+   initialization errors, a sender that exits before delivery; GC stress in
+   several isolates at once; ThreadSanitizer.
+3. **`SharedArrayBuffer` and `Atomics`** (Int32 first): scheduler-style
+   contention (compare-and-swap cursors, spin locks), visibility through
+   messages, finalization with queued references.
+4. **tsc-ts on its threads**: the entry's dispatch, the host's per-thread
+   state and concurrent output writes (directory creation races);
+   diagnostics and emitted files compared at N = 1, 2, 4, 8 (also
+   `noEmitOnError`, failures, recycling); wall time and RSS measured
+   against one thread and against scriptc.
 
-## Open questions
+Gates from slice 1 on: a ThreadSanitizer build (`-fsanitize=thread`: the
+Rust-emitted C, the runtime, the host and the adapters) as a new gate
+(`scripts/tsan_one.sh` is the TypeScript-analyzer debug script, not this),
+ASan as a separate run, and the existing gates for every single-threaded
+program.
 
-- The stack region size (tsc-ts's -O0 build overflows 8 MB; a stack
-  overflow is still undetected, so the guard page turns it into a crash
-  instead of a write into the isolate block).
-- Per-isolate memory: each worker carries its own prototypes, site caches
-  (1.3 MB for tsc-ts) and heap headroom.
-- Programs that publish per request (servers) leak under model 1.
+## Milestone B: published graphs (later)
+
+After A is measured. v2 of this design (Session 352) worked out
+publication in place: a validate, prepare and commit transaction; a new
+IMMORTAL generation that no collector marks, sweeps or remembers; payloads
+relocated into process-owned immortal storage; precomputed metadata so
+that no read writes a published cell; prototype descriptors (a class
+index, a builtin id or null) read by every prototype consumer; store
+guards on the classes a program may publish; `publish` arguments escaping
+globally. The second review left these open, to resolve before B starts:
+
+- **Transaction**: commit must not allocate (payload destinations and
+  ownership records reserved in prepare, which allocates: flattening,
+  iteration orders); rooted staging; cleanup on failure; already-immortal
+  subgraphs terminal in all three phases (tsc-ts republishes received
+  programs).
+- **Payload ownership**: `gc_owned_alloc`, `gc_owned_realloc` and
+  `gc_owned_free` treat unknown generations as young and outside-cage
+  storage with `realloc`/`free`: reject growth of published owners; large
+  payload runs, `prop_index`, sparse tables, the hole-filled `[len, cap)`
+  region (inline reads bound by capacity); retained cell blocks owned by
+  the process.
+- **Writes on read paths**: sparse arrays densify on read; array length
+  assignment, prototype setters, repeated seal and preventExtensions;
+  mutators that call back into JavaScript (`sort`) and resume storing after
+  a callback published the receiver.
+- **IMMORTAL liveness**: weak values as well as keys (an unmarked immortal
+  value would keep the ephemeron loop running forever); the full audit of
+  generation tests, both sweep forms, accounting and debug liveness;
+  process-level recognition of foreign immortal cells; barrier tests kept
+  strict.
+- **Store guards**: a sound closure over subclasses, aliases, `{}`,
+  `object`, `unknown`, type parameters, recursion and analysis failures, or
+  guards on every class; literal-slot stores; `publish` as an intrinsic the
+  escape analysis sees before summaries are computed.
+- **Prototypes**: the consumer inventory beyond `o->proto` reads and
+  `class_reg_for` (`class_field_lookup` and its cache, location caches,
+  generated receiver guards and `instanceof` shortcuts, JSON, inspect and
+  spread enumeration, for-in); class identity distinct from the current
+  prototype; Error objects are ordinary objects too.
+- **Shared tables**: the acquire operation for every reader (directories,
+  literal layouts, field-name arrays and counts, shape descriptors).
+- **Capabilities**: publication tracked separately from workers.
+
+## Review history
+
+- Round 1 (v1): sixteen findings, six blocking: payloads of immortal cells
+  lost at full collections, the IMMORTAL generation's reach, prototype
+  substitution, reads that write, escape and store guards, shared-table
+  concurrency. Answered by v2.
+- Round 2 (v2): five findings settled; publication still not a
+  failure-free transaction, payload ownership, writes on read paths,
+  IMMORTAL liveness, store-guard closure. Listed under milestone B.
+- Round 3: milestone A first; its blocking items (shared static literals
+  written by the collector, isolation of generated and function-local
+  statics, real atomics for the scheduler) and the corrected estimate are
+  above.
