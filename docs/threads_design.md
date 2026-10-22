@@ -2,7 +2,7 @@
 
 Session 352. Status: design v3, after three reviews by Codex (gpt-6.1-sol,
 xhigh effort; every claim that could be checked against the code was
-checked); no code yet. Runtime (`ts_rt.c`, `ts_rt.h`), emitter
+checked); the accessor measured (the stack-aligned block, below). Runtime (`ts_rt.c`, `ts_rt.h`), emitter
 (`emit_c.rs`), exporter (`class_extract.ts`), regexp adapter, tsc-ts host
 and shims (`benchmarks/tsc_ts_native`).
 
@@ -124,15 +124,44 @@ adapters):
 
 ### Reaching isolate state
 
-Thread-local storage first: the isolate pointer is loaded once per function
-that needs it and kept in a local. `benchmarks/threads/isolate_access.c`
-measures one frame push and pop: 0.45 ns through a plain global (today),
-1.1 ns through a `__thread` pointer (Darwin's TLV thunk), 0.45 ns through an
+Two candidates, the isolate pointer loaded once per function that needs it
+and kept in a local: `benchmarks/threads/isolate_access.c` measures one
+frame push and pop at 0.45 ns through a plain global (today), 1.1 ns
+through a `__thread` pointer (Darwin's TLV thunk), 0.45 ns through an
 isolate block at the base of a stack aligned to its size (the stack pointer
-masked). The whole-program cost of the thread-local form is measured in
-slice A1; the stack-aligned block stays a fallback with its own policies
-(no JavaScript on alternate signal stacks or foreign threads, guard pages
-and stack probing, ASan's fake stacks, debuggers and profilers).
+masked). v3 planned thread-local storage first, with the stack-aligned
+block as the fallback (its policies: no JavaScript on alternate signal
+stacks or foreign threads, guard pages and stack probing, ASan's fake
+stacks, debuggers and profilers); the whole-program measurement chose the
+block.
+
+**Measured: the stack-aligned block** (Session 352, the accessor
+experiment: `TS_ISO_MODE` in the runtime, `TSAOT_ISOLATE=1` in the
+emitter). The generated code's per-isolate state, the site caches (16,561
+in tsc-ts, moved into one table per isolate), `GLOBALS`, `CLASS_PROTO` and
+`OBJECT_PROTO`, and the ten runtime variables it reads through `ts_rt.h`
+(the frame stack's top, the environment register, the shape and probe
+tables, four guard flags) were reached through `TS_ISO()`; the rest of the
+runtime kept its globals. A/B against the plain builds (units, ThinLTO),
+eight pairs each, outputs identical:
+
+| `TS_ISO()` | tsc-ts wall | cycles | instructions | compiler wall | cycles | instructions |
+|---|---|---|---|---|---|---|
+| a thread-local isolate pointer | 1.059 | 1.059 | 1.093 | 1.060 | 1.055 | 1.088 |
+| the stack-aligned isolate block | 1.014 | 1.011 | 1.001 | 0.985 | 0.984 | 0.993 |
+
+The thread-local form costs 6% before the runtime's own state moves (a
+lower bound: every runtime function touching isolate state would add a
+TLV access); the stack-aligned block costs nothing measurable. A uses the
+stack-aligned block: every isolate, main's included, runs on a stack
+aligned to its size (64 MiB in the experiment) whose lowest pages hold the
+isolate block, a guard page between it and the stack; the runtime's `main`
+starts the program's on such a stack (`ts_iso_user_main`). Its policies
+become rules of A: no JavaScript or runtime call on another stack (signal
+handlers stay out of the runtime, no foreign threads call in), stack
+probing for frames larger than the guard page (Darwin probes them with
+`___chkstk_darwin`), ASan's fake stacks leave the stack pointer on the real
+stack.
 
 The threaded forms are selected per program at build time when it can
 construct a `Worker` (tsc-ts's entry imports `node:worker_threads`, so it
@@ -209,7 +238,7 @@ words that a message or an atomic operation published).
 ### Slices of A
 
 1. **Isolates on one thread** (behavior-invariant): every item under "Per
-   isolate" behind the isolate pointer (thread-local), the process and
+   isolate" behind the isolate pointer (the stack-aligned block), the process and
    isolate setup split, registered stack ranges, the shared literals
    skipped by the collector. Gates: everything as for a runtime change, an
    A/B of the threaded build against the plain one on tsc-ts (the

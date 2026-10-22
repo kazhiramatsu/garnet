@@ -399,7 +399,8 @@ fn rewrite_calls(body: &str, copied: impl Fn(&str) -> bool) -> (String, BTreeSet
 }
 
 fn has_local_static(body: &str) -> bool {
-    identifiers(body).iter().any(|&(s, e)| &body[s..e] == "static")
+    // TS_ISO_IC: the threads accessor experiment keeps the plain build's copies
+    identifiers(body).iter().any(|&(s, e)| &body[s..e] == "static" || &body[s..e] == "TS_ISO_IC")
 }
 
 pub struct Unit {

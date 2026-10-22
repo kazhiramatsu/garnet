@@ -603,7 +603,9 @@ static void gc_payload_after_collection(int full){
 static size_t g_young_new_since_minor = 0;
 static tsv** g_roots=NULL; static int g_root_len=0, g_root_cap=0;
 static tsv** g_static_roots=NULL; static int g_static_root_len=0, g_static_root_cap=0;
+#if !TS_ISO_MODE
 ts_frame_hdr* g_ts_frame_top = NULL;
+#endif
 #ifdef TSAOT_RT_STATS
 unsigned long long g_ts_frame_push_count = 0;
 unsigned long long g_ts_pic_get_calls = 0, g_ts_pic_get_hits = 0;
@@ -1481,9 +1483,11 @@ void ts_object_proto_register(ts_key method_key, const char* name, ts_code fn){
    ts_get/ts_set/... can call them. Core handlers take the key as a tsv value
    (string/symbol) so the same code serves both the named (key) and computed
    (keyv) entry points; ts_key_to_value reconstructs the value from a ts_key. */
+#if !TS_ISO_MODE
 int g_has_proxies = 0;   /* declared in ts_rt.h; see ts_is_proxy there */
 int g_typed_slow = 0;    /* declared in ts_rt.h; see ts_typed_slow there */
 int g_closed_receivers = 0;
+#endif
 /* A foreign receiver can arise from here on. A closed program's typed
    accesses do not test the flag: the exporter's proof missed a route to this
    point, so stop loudly rather than read struct offsets of the wrong cell. */
@@ -1593,7 +1597,9 @@ static void obj_link_fresh_proto(tsv obj, tsv proto){
    class setup, which links prototypes the same way, keeps ts_set_proto, so
    only a program's own relink of an object behind a class with struct fields
    raises g_typed_slow (docs/foreign_receivers_design.md). */
+#if !TS_ISO_MODE
 int g_class_relinked = 0;
+#endif
 static const uint32_t* g_class_index_tab = NULL;
 static uint32_t g_class_index_n = 0;
 /* class index word (index + 1) -> class id, for a relinked instance's layout */
@@ -1660,7 +1666,9 @@ tsv ts_make_fn_t_pretenured(ts_code code, tsv* env, uint32_t envlen, int takes_t
   ((ts_func*)ts_ptr(fv))->takes_this = (uint8_t)(takes_this ? 1 : 0);
   return fv;
 }
+#if !TS_ISO_MODE
 tsv* g_ts_cur_env = NULL;
+#endif
 tsv ts_make_closure_t(ts_code code, tsv* env, uint32_t envlen, int takes_this){
   tsv fv = ts_make_fn_impl(code, env, envlen, 0);
   ts_func* f = (ts_func*)ts_ptr(fv);
@@ -2260,10 +2268,12 @@ static ts_shape_desc* g_shapes = NULL;
 static uint32_t g_shapes_cap = 0;
 /* Public key/flag vectors by shape id (ts_rt.h); the header's inline probe and
    the accessors below read them. Index 0 and TS_SHAPE_EMPTY stay NULL. */
+#if !TS_ISO_MODE
 ts_key** g_ts_shape_keys = NULL;
 uint8_t** g_ts_shape_flags = NULL;
 ts_key* g_ts_probe_rkeys = NULL;
 ts_key* g_ts_probe_wkeys = NULL;
+#endif
 /* The vectors of shapes 0 (dictionary) and 1 (empty): all NONE, so a static
    slot probe on such a receiver misses without a shape test. */
 static ts_key g_shape_keys_none[TS_STATIC_SLOT_LIMIT] = {
@@ -18828,3 +18838,41 @@ tsv ts_asyncgen_return(tsv genobj, tsv val){
 
 void ts_abort_msg(const char* m){ fflush(stdout); fprintf(stderr, "tsaot: %s\n", m); fflush(stderr); abort(); }
 int ts_handlers_count(void){ int n=0; for(ts_handler* h=g_handlers;h;h=h->prev)n++; return n; }
+
+#if TS_ISO_MODE == 1
+/* The accessor experiment (ts_rt.h): one isolate, reached through a
+   thread-local pointer. */
+static ts_iso ts_iso_main;
+__thread ts_iso* ts_iso_cur = &ts_iso_main;
+#elif TS_ISO_MODE == 2
+/* The accessor experiment (ts_rt.h): the isolate block at the base of a
+   stack aligned to its size, a guard page above it; the program's main
+   runs on a thread with that stack. */
+#include <pthread.h>
+#undef main
+int ts_iso_user_main(int argc, char** argv);
+static int ts_iso_argc, ts_iso_rc;
+static char** ts_iso_argv;
+static void* ts_iso_thread(void* arg){
+  (void)arg;
+  ts_iso_rc = ts_iso_user_main(ts_iso_argc, ts_iso_argv);
+  return NULL;
+}
+int main(int argc, char** argv){
+  size_t size = (size_t)1 << TS_ISO_STACK_BITS, page = (size_t)sysconf(_SC_PAGESIZE);
+  char* raw = mmap(NULL, 2 * size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+  if (raw == MAP_FAILED) { perror("isolate stack"); return 1; }
+  uintptr_t base = ((uintptr_t)raw + size - 1) & ~(uintptr_t)(size - 1);
+  size_t block = (sizeof(ts_iso) + page - 1) / page * page;
+  mprotect((void*)(base + block), page, PROT_NONE);
+  pthread_attr_t attr;
+  pthread_attr_init(&attr);
+  pthread_attr_setstack(&attr, (void*)(base + block + page), size - block - page);
+  ts_iso_argc = argc;
+  ts_iso_argv = argv;
+  pthread_t thread;
+  if (pthread_create(&thread, &attr, ts_iso_thread, NULL) != 0) { perror("isolate thread"); return 1; }
+  pthread_join(thread, NULL);
+  return ts_iso_rc;
+}
+#endif

@@ -8207,3 +8207,23 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   slice 2 (an addition still changes the shared header and recompiles every
   unit: stable numbering, and each unit declaring only what it uses), slice 3
   (a parallel emit).
+- Threads A1, the accessor measured (`docs/threads_design.md`, "Reaching
+  isolate state"; Kaz chose to measure before moving the state): an inventory
+  first, the runtime's mutable storage is 307 symbols (252 at file scope, 55
+  function-local statics), the generated code's per-isolate state tsc-ts's
+  16,561 site caches, `GLOBALS` (6,219), `CLASS_PROTO` (812) and
+  `OBJECT_PROTO` (shared: `FN_TABLE`, 7,016 static literals, the class field
+  tables, the vtables). The experiment (`TS_ISO_MODE` 1 or 2 in the runtime,
+  `TSAOT_ISOLATE=1` in the emitter; the default build's preprocessed runtime
+  and emitted C unchanged, parity 380 identical) reached the generated code's
+  state, the site caches moved into one table per isolate, and the ten runtime
+  variables `ts_rt.h` exposes, through `TS_ISO()`. A/B against the plain unit
+  builds, eight pairs each, outputs identical: a thread-local isolate pointer
+  costs tsc-ts wall 1.059 (instructions 1.093) and the compiler 1.060 (1.088),
+  a lower bound before the runtime's own state moves; the isolate block at the
+  base of a stack aligned to its size (the runtime's `main` runs the program's
+  on a 64 MiB aligned stack) costs tsc-ts 1.014 (1.001) and the compiler 0.985
+  (0.993). A1 takes the stack-aligned block. Next: A1 proper, the runtime's
+  state into the isolate block (the X-list of per-isolate variables, the
+  process and isolate setup split), the emitter's isolate forms replacing the
+  experiment's text rewrite.

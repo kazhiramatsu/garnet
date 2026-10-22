@@ -58,6 +58,59 @@
 
 typedef uint64_t tsv; /* a tagged Value */
 
+/* Threads, slice A1's accessor experiment (docs/threads_design.md): with
+   TS_ISO_MODE 1 the per-isolate state the generated code touches is reached
+   through a thread-local isolate pointer, with 2 through an isolate block at
+   the base of a stack aligned to its size (the stack pointer masked; the
+   runtime runs main on such a stack). 0, the default, keeps the globals. */
+#ifndef TS_ISO_MODE
+#define TS_ISO_MODE 0
+#endif
+#if TS_ISO_MODE
+struct ts_frame_hdr;
+typedef struct ts_iso {
+  struct ts_frame_hdr* frame_top;
+  tsv* cur_env;
+  uint32_t** shape_keys;
+  uint8_t** shape_flags;
+  uint32_t* probe_rkeys;
+  uint32_t* probe_wkeys;
+  int has_proxies, typed_slow, closed_receivers, class_relinked;
+  tsv* globals;
+  tsv* class_proto;
+  tsv object_proto;
+  void* ics;
+} ts_iso;
+#if TS_ISO_MODE == 1
+extern __thread ts_iso* ts_iso_cur;
+#define TS_ISO() (ts_iso_cur)
+#else
+#define TS_ISO_STACK_BITS 26
+static inline __attribute__((always_inline)) ts_iso* ts_iso_get(void){
+  uintptr_t sp;
+#if defined(__aarch64__)
+  __asm__("mov %0, sp" : "=r"(sp));
+#else
+  sp = (uintptr_t)__builtin_frame_address(0);
+#endif
+  return (ts_iso*)(sp & ~(((uintptr_t)1 << TS_ISO_STACK_BITS) - 1));
+}
+#define TS_ISO() (ts_iso_get())
+/* the program's main runs on the isolate's stack (ts_rt.c defines main) */
+#define main ts_iso_user_main
+#endif
+#define g_ts_frame_top (TS_ISO()->frame_top)
+#define g_ts_cur_env (TS_ISO()->cur_env)
+#define g_ts_shape_keys (TS_ISO()->shape_keys)
+#define g_ts_shape_flags (TS_ISO()->shape_flags)
+#define g_ts_probe_rkeys (TS_ISO()->probe_rkeys)
+#define g_ts_probe_wkeys (TS_ISO()->probe_wkeys)
+#define g_has_proxies (TS_ISO()->has_proxies)
+#define g_typed_slow (TS_ISO()->typed_slow)
+#define g_closed_receivers (TS_ISO()->closed_receivers)
+#define g_class_relinked (TS_ISO()->class_relinked)
+#endif
+
 /* NaN-boxing layout: a normal double is any pattern that is NOT a boxed form.
  * Boxed values set the top 16 bits to a quiet-NaN selector 0xFFF8..0xFFFD
  * (sign=1, exp all ones, quiet bit) plus a 3-bit tag, leaving a 48-bit payload.
@@ -223,7 +276,9 @@ static inline tsv ts_short_str_ascii(const char* data, uint32_t len){
 /* Proxy: gate generated struct-field access. g_has_proxies is 0 until the first
    Proxy is created, so non-proxy code keeps the direct struct path. Exposed here
    (not file-static) so emitted C can inline `this.field` proxy guards. */
+#if !TS_ISO_MODE
 extern int g_has_proxies;
+#endif
 static inline int ts_is_proxy(tsv v){ return ts_is_obj(v) && ((ts_gc_header*)ts_ptr(v))->kind == TS_KIND_PROXY; }
 
 /* ---- property key space (property_model_redesign §3.6) ----
@@ -294,8 +349,12 @@ enum { TS_SHAPE_NONE = 0, TS_SHAPE_EMPTY = 1, TS_SHAPE_MAX = (1u << 29) - 1u };
    A2b). A shaped object (shape != 0) stores only values, 8 bytes each; its
    keys and flags are the vectors of its shape, indexed by slot. Dictionary
    objects (shape 0) keep per-entry keys and flags. */
+#if !TS_ISO_MODE
 extern ts_key** g_ts_shape_keys;
+#endif
+#if !TS_ISO_MODE
 extern uint8_t** g_ts_shape_flags;
+#endif
 /* Static-slot probes (docs/static_slots_design.md) index a shape's key vector
    at a compile-time slot below TS_STATIC_SLOT_LIMIT without a length test:
    every vector has at least that many entries, the tail filled with
@@ -307,8 +366,12 @@ extern uint8_t** g_ts_shape_flags;
    the keys of its first slots that a probe may take (for reads every slot
    that is not an accessor, for writes plain writable data), TS_KEY_NONE
    elsewhere: one load validates both the key and its attributes. */
+#if !TS_ISO_MODE
 extern ts_key* g_ts_probe_rkeys;
+#endif
+#if !TS_ISO_MODE
 extern ts_key* g_ts_probe_wkeys;
+#endif
 #define TS_PROP_IC_SIZE 4
 /* A cache entry's slot word carries the property's attribute flags in its
    top byte, so an inline hit knows whether the slot is plain writable data
@@ -354,6 +417,10 @@ typedef struct {
   };
 } ts_prop_ic;
 #define TS_PROP_IC_INIT {0}
+#if TS_ISO_MODE
+/* a site's inline cache in the isolate's table (the accessor experiment) */
+#define TS_ISO_IC(k) (&((ts_prop_ic*)TS_ISO()->ics)[k])
+#endif
 _Static_assert(sizeof(ts_prop_ic) == 80, "ts_prop_ic keeps its size: one per access site");
 #ifdef TSAOT_RT_STATS
 extern unsigned long long g_ts_pic_get_calls, g_ts_pic_get_hits;
@@ -560,7 +627,9 @@ static inline void ts_hdr_init_sized(ts_gc_header* h, size_t bytes){
    behind a class prototype, a borrowed method's `this`. g_typed_slow, raised
    where such a receiver can arise, gates the test so a program that never does
    any of that keeps one predictable branch (docs/foreign_receivers_design.md). */
+#if !TS_ISO_MODE
 extern int g_typed_slow;
+#endif
 /* g_typed_slow's bits (docs/closed_receivers_design.md, slice 2): ANY, a
    foreign receiver may reach any typed access (a Proxy, a relink, a
    converted instance), which then tests it; THIS, a class method may run
@@ -572,7 +641,9 @@ void ts_foreign_this_seen(void);
 /* Set by a program the exporter proved to have closed receivers
    (docs/closed_receivers_design.md): its typed accesses do not test
    g_typed_slow, so raising it there stops the program instead. */
+#if !TS_ISO_MODE
 extern int g_closed_receivers;
+#endif
 static inline int ts_typed_slow(tsv v){
   return !ts_is_obj(v) || !ts_obj_is_sized((const ts_object*)ts_ptr(v));
 }
@@ -1750,7 +1821,9 @@ tsv  ts_make_class_value(uint32_t class_id, ts_code ctor, tsv* env, uint32_t env
 void ts_register_class_indices(const uint32_t* tab, uint32_t n);
 /* Raised when a prototype other than a sized instance's own is relinked by
    the program: a class interval may no longer describe a prototype chain. */
+#if !TS_ISO_MODE
 extern int g_class_relinked;
+#endif
 tsv  ts_make_class_value_once(uint32_t class_id, ts_code ctor, tsv* env, uint32_t envlen);
 void ts_throw_uninitialized(const char* name);
 tsv  ts_construct(tsv ctorv, tsv* args, int n);
@@ -1779,7 +1852,9 @@ void ts_set_fn_prototype(tsv fn, tsv proto);
 /* Environment register of the closure ABI: a caller stores the callee's
    captured-cell buffer here immediately before the call; the callee prologue
    reads its leading cells from it before anything else runs. */
+#if !TS_ISO_MODE
 extern tsv* g_ts_cur_env;
+#endif
 /* Closure constructors for code compiled with the environment ABI. */
 tsv  ts_make_closure_t(ts_code code, tsv* env, uint32_t envlen, int takes_this);
 tsv  ts_make_closure_t_pretenured(ts_code code, tsv* env, uint32_t envlen, int takes_this);
@@ -1804,7 +1879,9 @@ typedef struct ts_frame_hdr {
   struct ts_frame_hdr* prev;
   uint32_t count;
 } ts_frame_hdr;
+#if !TS_ISO_MODE
 extern ts_frame_hdr* g_ts_frame_top;
+#endif
 #ifdef TSAOT_RT_STATS
 extern unsigned long long g_ts_frame_push_count;
 #define TS_RT_STAT_FRAME_PUSH() (g_ts_frame_push_count++)

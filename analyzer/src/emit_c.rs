@@ -34,7 +34,51 @@ use crate::string_plan::{LoopPath, PathEdge, PathSegment};
 
 pub fn emit_program(program: &Program, result: &EscapeResult) -> String {
     let string_metric_plan = crate::string_metrics::analyze_program(program);
-    emit_program_with_string_metrics(program, result, &string_metric_plan)
+    let out = emit_program_with_string_metrics(program, result, &string_metric_plan);
+    if iso_mode() {
+        iso_site_caches(out)
+    } else {
+        out
+    }
+}
+
+/// Threads, slice A1's accessor experiment (docs/threads_design.md;
+/// `TSAOT_ISOLATE=1`): the program's per-isolate state (the site caches,
+/// GLOBALS, CLASS_PROTO, OBJECT_PROTO) is reached through `TS_ISO()`, which
+/// the runtime defines per `TS_ISO_MODE`. The default output is unchanged.
+fn iso_mode() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TSAOT_ISOLATE").as_deref() == Ok("1"))
+}
+
+/// The experiment's site caches: every `static ts_prop_ic NAME =
+/// TS_PROP_IC_INIT;` becomes a pointer into the isolate's table,
+/// `ts_prop_ic* const NAME = TS_ISO_IC(k);`, and every `&NAME` the pointer.
+fn iso_site_caches(c: String) -> String {
+    const DECL: &str = "static ts_prop_ic ";
+    const INIT: &str = " = TS_PROP_IC_INIT;";
+    let mut out = String::with_capacity(c.len() + c.len() / 16);
+    let mut k = 0usize;
+    let mut rest = c.as_str();
+    while let Some(i) = rest.find(DECL) {
+        let after = &rest[i + DECL.len()..];
+        let name_len = after.find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')).unwrap_or(after.len());
+        if after[name_len..].starts_with(INIT) {
+            out.push_str(&rest[..i]);
+            let _ = write!(out, "ts_prop_ic* const {} = TS_ISO_IC({});", &after[..name_len], k);
+            k += 1;
+            rest = &after[name_len + INIT.len()..];
+        } else {
+            out.push_str(&rest[..i + DECL.len()]);
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    let out = out
+        .replace("&_ts_pic_", "_ts_pic_")
+        .replace("&_ts_method_field_ic", "_ts_method_field_ic")
+        .replace("&_ts_method_proto_ic", "_ts_method_proto_ic");
+    out.replace("@@TS_ISO_NICS@@", &k.max(1).to_string())
 }
 
 pub fn emit_program_with_string_metrics(
@@ -543,7 +587,11 @@ fn emit_program_with_string_plans(
     // Object.prototype: a shared prototype carrying the modeled Object.prototype
     // methods under METHOD_KEY_BASE+id. Held in a rooted static; installed
     // via ts_install_object_proto so ts_new_object() chains new objects to it.
-    s.push_str("static tsv OBJECT_PROTO;\n");
+    if iso_mode() {
+        s.push_str("#define OBJECT_PROTO (TS_ISO()->object_proto)\n");
+    } else {
+        s.push_str("static tsv OBJECT_PROTO;\n");
+    }
     s.push_str("static void ts_setup_object_proto(void){\n");
     s.push_str("  OBJECT_PROTO = ts_new_proto(); ts_gc_root(&OBJECT_PROTO);\n");
     // Install Object.prototype, then init Function.prototype, BEFORE boxing the
@@ -773,7 +821,11 @@ fn emit_program_with_string_plans(
     // before the initializer runs).
     let nglobals = program.globals.len();
     if nglobals > 0 {
-        let _ = writeln!(s, "static tsv GLOBALS[{}];", nglobals);
+        if iso_mode() {
+            let _ = writeln!(s, "static tsv GLOBALS_ISO0[{}];\n#define GLOBALS (TS_ISO()->globals)", nglobals);
+        } else {
+            let _ = writeln!(s, "static tsv GLOBALS[{}];", nglobals);
+        }
         s.push_str("static void ts_setup_globals(void){\n");
         for g in &program.globals {
             let _ = writeln!(
@@ -788,7 +840,11 @@ fn emit_program_with_string_plans(
     }
 
     if let Some(maxc) = max_class {
-        let _ = writeln!(s, "static tsv CLASS_PROTO[{}];", maxc + 1);
+        if iso_mode() {
+            let _ = writeln!(s, "static tsv CLASS_PROTO_ISO0[{}];\n#define CLASS_PROTO (TS_ISO()->class_proto)", maxc + 1);
+        } else {
+            let _ = writeln!(s, "static tsv CLASS_PROTO[{}];", maxc + 1);
+        }
         s.push_str("static void ts_setup_prototypes(void){\n");
         for c in &program.classes {
             let _ = writeln!(
@@ -1093,7 +1149,20 @@ fn emit_program_with_string_plans(
             .find(|f| f.name.as_deref() == Some("main"))
             .or_else(|| program.functions.first());
     }
+    if iso_mode() {
+        // the site caches' table, sized once every cache is numbered
+        s.push_str("static ts_prop_ic TS_ICS_ISO0[@@TS_ISO_NICS@@];\n");
+    }
     s.push_str("int main(void){\n");
+    if iso_mode() {
+        s.push_str("  TS_ISO()->ics = TS_ICS_ISO0;\n");
+        if !program.globals.is_empty() {
+            s.push_str("  TS_ISO()->globals = GLOBALS_ISO0;\n");
+        }
+        if max_class.is_some() {
+            s.push_str("  TS_ISO()->class_proto = CLASS_PROTO_ISO0;\n");
+        }
+    }
     s.push_str("  ts_init_fields(FIELD_NAMES, FIELD_NAME_LENS, FIELD_NAMES_COUNT);\n");
     s.push_str("  ts_setup_object_proto();\n");
     // Function.prototype must be set up BEFORE the array/map/set prototypes: each
