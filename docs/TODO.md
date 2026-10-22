@@ -8161,3 +8161,17 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   minutes, the compiler about 5): split the generated C into translation
   units, compile them in parallel and reuse unchanged objects by content
   hash (Kaz's request, after the GC work); then the threads work.
+- Native builds in parallel units, design (`docs/build_split_design.md`,
+  Kaz's request): tsc-ts's native build spends 151 of its 201 s compiling
+  the one generated C file, 65 s of it on the module initializer (its
+  register allocation, `optnone` notwithstanding). A prototype split the C
+  into a header, a data unit, a cold unit at `-O0` and 16 function units:
+  151 s became 26 s, but calls between units lost their inlining (tsc-ts
+  4% slower). Two countermeasures, `static inline` copies of small
+  functions called from other units (address identity kept by the one
+  external definition) and `static` for functions referenced only in their
+  unit, bring that to about 1%; ThinLTO with both is as fast as the one-file
+  build (wall 0.997, instructions 0.989) at 21.5 + 13.1 s. Slice 1: the
+  emitter's unit mode, a function's module in the IR (a stable partition, so
+  a function body's edit recompiles one unit), the driver's parallel ThinLTO
+  build with an object cache, the native build scripts on it.
