@@ -24,12 +24,20 @@ Build (the checkout is copied, not changed; `exporter/exporter.js` and
 `analyzer/target/release/tsaot` must be built):
 
 ```sh
-TSAOT_NATIVE_COLD_O0=1 TSAOT_NATIVE_CC='cc -O2 -gline-tables-only -fno-omit-frame-pointer' \
+TSAOT_NATIVE_CC='cc -O2 -gline-tables-only -fno-omit-frame-pointer' \
   bash scripts/build_tsc_ts_native.sh /path/to/tsc-ts build/tsc_ts_native
 ```
 
 Build it optimized as above: at -O0 the transformer's visitor recursion
 overflows the 8 MB main thread stack on large projects.
+
+The generated C is built as parallel units (`docs/build_split_design.md`):
+the giant run-once functions (the module initializer, the large `create*`
+factories) are units of their own compiled at -O0, the rest at
+`TSAOT_NATIVE_CC` with ThinLTO, and each unit's object is cached by content
+in `build/unit-cache`, so a rebuild compiles only the units that changed.
+`TSAOT_NATIVE_UNITS=0` builds one C file instead (more than twice as long);
+there `TSAOT_NATIVE_COLD_O0=1` marks the same functions `optnone`.
 
 Run with the lib files of scriptc's TypeScript package (`TSC_TS_LIB_DIR`),
 for example on the TypeScript 6.0.3 compiler project:

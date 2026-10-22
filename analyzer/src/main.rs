@@ -1,8 +1,13 @@
 //! tsaot analyzer+codegen driver.
 //! Usage:
 //!   tsaot <program.json> emit      -> print generated C to stdout
+//!   tsaot <program.json> emit --units <dir>
+//!                                  -> write the C as parallel units into <dir>
+//!                                     (docs/build_split_design.md); the build
+//!                                     order is printed, one unit per line
 //!   tsaot <program.json> escape    -> print escape result JSON
 //!   tsaot <program.json> report    -> print codegen strategy report JSON
+mod c_units;
 mod call_graph;
 mod codegen;
 mod devirt;
@@ -69,8 +74,31 @@ fn main() {
         "emit" => {
             let output = emit_c::emit_program(&prog, &res);
             report_phase(timings, &mut phase_started, "emit");
-            print!("{}", output);
-            report_phase(timings, &mut phase_started, "write");
+            if let Some(k) = args.iter().position(|a| a == "--units") {
+                let dir = match args.get(k + 1) {
+                    Some(d) => std::path::PathBuf::from(d),
+                    None => {
+                        eprintln!("--units needs a directory");
+                        std::process::exit(2);
+                    }
+                };
+                let opt = c_units::Options::from_env();
+                match c_units::split(&output, &prog.modules, &prog.function_modules, &dir, &opt) {
+                    Ok(units) => {
+                        for u in units {
+                            println!("{}{}", u.file, if u.cold { " cold" } else { "" });
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("tsaot: the unit split failed: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+                report_phase(timings, &mut phase_started, "units");
+            } else {
+                print!("{}", output);
+                report_phase(timings, &mut phase_started, "write");
+            }
         }
         // Differential target for the self-hosting TS devirt port: the IR after
         // run_devirt (callee rewrites applied, pre-sroa), as JSON.

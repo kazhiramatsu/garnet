@@ -75,6 +75,14 @@ pub struct Program {
     pub scopes: Vec<Scope>,
     pub bindings: Vec<Binding>,
     pub functions: Vec<Function>,
+    /// Each function's source module (docs/build_split_design.md): the
+    /// emitter's unit mode groups functions by module, so an edit recompiles
+    /// its own module's units. Module paths are relative to the export's
+    /// working directory; both default to empty for older inputs.
+    #[serde(default)]
+    pub modules: Vec<String>,
+    #[serde(default, rename = "functionModules")]
+    pub function_modules: std::collections::BTreeMap<u32, u32>,
     /// Functions reachable from outside the analyzed unit. Their parameters
     /// and return are external roots (treated as opaque / escaping sources).
     pub exports: Vec<FunctionId>,

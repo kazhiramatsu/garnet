@@ -147,6 +147,11 @@ usage: $PROG [-c | -S] [-o <out.c>] [-p <tsconfig>] <input.ts>
                 report one reachable after its frame returned
                 (docs/stack_check_design.md; TSAOT_STACK_CHECK_CONTINUE=1
                 reports every site instead of aborting at the first)
+  --units       write the C as parallel units (<name>.units/) and build them
+                in parallel with ThinLTO and an object cache, for large
+                programs (docs/build_split_design.md; TSAOT_UNITS=1)
+  --no-lto      with --units: link native objects without ThinLTO (faster
+                rebuilds, calls between units are not inlined; TSAOT_UNITS_LTO=0)
   -h, --help    show this help
 
 env: TSAOT_CC (default "cc -O2"), TSAOT_ANALYZER=rust|ts|native (default rust),
@@ -190,6 +195,7 @@ to_stdout=0      # -S
 profile=0        # --profile
 rt_stats=0       # --rt-stats
 stack_check=0    # --stack-check
+units="${TSAOT_UNITS:-0}"   # --units (TSAOT_UNITS=1)
 out_c=""         # -o
 input=""
 project=""
@@ -204,6 +210,8 @@ while [ $# -gt 0 ]; do
     --profile) profile=1 ;;
     --rt-stats) rt_stats=1 ;;
     --stack-check) stack_check=1; export TSAOT_STACK_CHECK=1 ;;
+    --units) units=1 ;;
+    --no-lto) export TSAOT_UNITS_LTO=0 ;;
     -h|--help) usage; exit 0 ;;
     --) shift; break ;;
     -*) die "unknown option: $1 (try $PROG --help)" ;;
@@ -285,11 +293,24 @@ if [ "$to_stdout" -eq 1 ]; then
   exit $?
 fi
 out_dir="$(dirname "$out_c")"; [ -d "$out_dir" ] || mkdir -p "$out_dir"
-run_analyzer "$work/ir.json" > "$out_c"
-
-if [ "$emit_only" -eq 1 ]; then
-  echo "$PROG: wrote $out_c" >&2
-  exit 0
+if [ "$units" = 1 ]; then
+  # parallel units (docs/build_split_design.md): <name>.units/ instead of <name>.c
+  [ "${TSAOT_ANALYZER:-rust}" = rust ] || die "--units needs the Rust analyzer"
+  units_dir="${out_c%.c}.units"
+  rm -rf "$units_dir"
+  "$ANALYZER" "$work/ir.json" emit --units "$units_dir" > "$work/units.order" || die "unit emission failed"
+  markers_c="$units_dir/prog.h"
+  if [ "$emit_only" -eq 1 ]; then
+    echo "$PROG: wrote $units_dir" >&2
+    exit 0
+  fi
+else
+  run_analyzer "$work/ir.json" > "$out_c"
+  markers_c="$out_c"
+  if [ "$emit_only" -eq 1 ]; then
+    echo "$PROG: wrote $out_c" >&2
+    exit 0
+  fi
 fi
 
 # ----- stage 3: C → native executable -----
@@ -328,9 +349,19 @@ if [ ! -f "$RT_OBJ" ] ||
 fi
 
 # Optional runtime objects, gated by markers the emitted C declares.
-tsaot_prepare_regexp_objs "$out_c" "$work" || die "failed to prepare RegExp runtime"
-tsaot_prepare_unicode_objs "$out_c" "$work" || die "failed to prepare Unicode runtime"
-tsaot_prepare_fetch_runtime "$out_c" "$work" "$RT_OBJ" || die "failed to prepare fetch runtime"
+tsaot_prepare_regexp_objs "$markers_c" "$work" || die "failed to prepare RegExp runtime"
+tsaot_prepare_unicode_objs "$markers_c" "$work" || die "failed to prepare Unicode runtime"
+tsaot_prepare_fetch_runtime "$markers_c" "$work" "$RT_OBJ" || die "failed to prepare fetch runtime"
+
+if [ "$units" = 1 ]; then
+  . "$ROOT/scripts/lib/units.sh" || die "failed to load the unit build"
+  # shellcheck disable=SC2086
+  TSAOT_UNITS_CC="$CC" TSAOT_UNITS_CFLAGS="-I$ROOT/runtime" \
+    tsaot_units_build "$units_dir" "$binary" "$TSAOT_FETCH_RT_OBJ_ARG" $TSAOT_REGEXP_OBJ_ARGS $TSAOT_UNICODE_OBJ_ARGS \
+      -lm $TSAOT_FETCH_LDLIBS ${TSAOT_LDLIBS:-} || die "unit build failed"
+  echo "$PROG: wrote $units_dir and $binary" >&2
+  exit 0
+fi
 
 # shellcheck disable=SC2086  # object/lib arg vars are intentionally word-split
 $CC "$out_c" "$TSAOT_FETCH_RT_OBJ_ARG" $TSAOT_REGEXP_OBJ_ARGS $TSAOT_UNICODE_OBJ_ARGS \

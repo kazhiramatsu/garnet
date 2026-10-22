@@ -8175,3 +8175,35 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   emitter's unit mode, a function's module in the IR (a stable partition, so
   a function body's edit recompiles one unit), the driver's parallel ThinLTO
   build with an object cache, the native build scripts on it.
+- Native builds in parallel units, slice 1 (`docs/build_split_design.md`,
+  "Slice 1 as built"): the exporter records each function's module in the IR
+  (resolved paths, relative to the modules' common directory); `tsaot <ir>
+  emit --units <dir>` (`analyzer/src/c_units.rs`) splits the emitted C into a
+  hidden-visibility header, a data unit, one `-O0` unit per giant cold
+  function, chunks of the modules above 20k lines and 16 bins for the rest; a
+  small function another unit calls gets a `static inline` copy in each unit
+  that calls it (in the units, not the shared header: tsc-ts's header 7.9 ->
+  2.5 MB, and editing a copied function recompiles its callers' units only),
+  and a function referenced only in its unit stays `static`.
+  `scripts/lib/units.sh` compiles the units in parallel with ThinLTO and
+  caches each object by its text, the preprocessed header with its macros, the
+  command and the compiler's version. Both native build scripts use it by
+  default (`TSAOT_NATIVE_UNITS=0`: one file); `./garnet --units [--no-lto]`;
+  `TSAOT_CONF_UNITS=1` for the conformance suite. Found and fixed on the way,
+  each covered by a test: the first cache key hashed the header's text only
+  and reused stale objects after a change in an included header (`ts_rt.h`); a
+  relative entry (as the build scripts give it) made every module path
+  relative to `/`, work directory included, so an edit moved modules between
+  bins and recompiled everything; a copy that takes its own function's address
+  must keep the original extern. tsc-ts's native build: 201 s -> 86 s from an
+  empty cache, 53 s with nothing changed, 68 s after a one-line edit (one unit
+  of 35 recompiled; export and emit are 48 s of it); the compiler: about five
+  minutes -> 104 s. A/B against the one-file builds, eight pairs each, outputs
+  identical: tsc-ts wall 0.957, cycles 0.984, instructions 0.985, peak 1.002;
+  the compiler wall 0.989, cycles 0.990, instructions 0.991, peak 1.001.
+  Tests: `tests/c_units_tests.rs` (unit suite), `tests/units_build_gate.sh`
+  (fast CI). Gates: fast CI (with both), parity (380 identical), bundler
+  43/43, selfconf, conformance 538/538 plain, strict and through units. Next:
+  slice 2 (an addition still changes the shared header and recompiles every
+  unit: stable numbering, and each unit declaring only what it uses), slice 3
+  (a parallel emit).

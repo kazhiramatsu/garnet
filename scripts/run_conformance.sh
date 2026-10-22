@@ -64,6 +64,10 @@ for f in "${allts[@]}"; do
   printf '%s\t%s\n' "$slug" "$f" >> "$LIST"
 done
 
+# TSAOT_CONF_UNITS=1 builds every test as parallel units
+# (docs/build_split_design.md: tsaot emit --units, scripts/lib/units.sh).
+UNITS="${TSAOT_CONF_UNITS:-0}"
+if [[ "$UNITS" == 1 ]]; then . "$ROOT/scripts/lib/units.sh"; fi
 # runtime once
 RT_OBJ="$WORK/ts_rt.o"
 $CC -c "$RT/ts_rt.c" -I"$RT" -o "$RT_OBJ" 2>"$WORK/rt.err" || { echo "[conf] runtime compile FAILED"; cat "$WORK/rt.err"; exit 1; }
@@ -91,17 +95,28 @@ while IFS=$'\t' read -r slug path; do
   # Default-locale fixtures (Date.toLocale*String without arguments) expect the
   # runtime's fixed en-US subset; pin the oracle so a ja_JP shell does not flip.
   v8="$(LC_ALL=en_US.UTF-8 node "$jsref" 2>&1 | tr '\n' '|')"
-  "$TSAOT" "$prog" emit > "$WORK/$slug.c" 2>"$WORK/$slug.an.err" || { echo "[conf] FAIL ${slug}: analyze"; cat "$WORK/$slug.an.err"|head -2; nfail=$((nfail+1)); fail=1; continue; }
-  if ! tsaot_prepare_regexp_objs "$WORK/$slug.c" "$WORK" 2>"$WORK/$slug.rx.err"; then
+  if [[ "$UNITS" == 1 ]]; then
+    "$TSAOT" "$prog" emit --units "$WORK/$slug.units" > /dev/null 2>"$WORK/$slug.an.err" || { echo "[conf] FAIL ${slug}: analyze"; cat "$WORK/$slug.an.err"|head -2; nfail=$((nfail+1)); fail=1; continue; }
+    CFILE="$WORK/$slug.units/prog.h"
+  else
+    "$TSAOT" "$prog" emit > "$WORK/$slug.c" 2>"$WORK/$slug.an.err" || { echo "[conf] FAIL ${slug}: analyze"; cat "$WORK/$slug.an.err"|head -2; nfail=$((nfail+1)); fail=1; continue; }
+    CFILE="$WORK/$slug.c"
+  fi
+  if ! tsaot_prepare_regexp_objs "$CFILE" "$WORK" 2>"$WORK/$slug.rx.err"; then
     echo "[conf] FAIL ${slug}: regexp-link-prep"; head -3 "$WORK/$slug.rx.err"; nfail=$((nfail+1)); fail=1; continue
   fi
-  if ! tsaot_prepare_unicode_objs "$WORK/$slug.c" "$WORK" 2>"$WORK/$slug.uc.err"; then
+  if ! tsaot_prepare_unicode_objs "$CFILE" "$WORK" 2>"$WORK/$slug.uc.err"; then
     echo "[conf] FAIL ${slug}: unicode-link-prep"; head -3 "$WORK/$slug.uc.err"; nfail=$((nfail+1)); fail=1; continue
   fi
-  if ! tsaot_prepare_fetch_runtime "$WORK/$slug.c" "$WORK" "$RT_OBJ" 2>"$WORK/$slug.fetch.err"; then
+  if ! tsaot_prepare_fetch_runtime "$CFILE" "$WORK" "$RT_OBJ" 2>"$WORK/$slug.fetch.err"; then
     echo "[conf] FAIL ${slug}: fetch-link-prep"; head -3 "$WORK/$slug.fetch.err"; nfail=$((nfail+1)); fail=1; continue
   fi
-  if ! $CC "$WORK/$slug.c" "$TSAOT_FETCH_RT_OBJ_ARG" $TSAOT_REGEXP_OBJ_ARGS $TSAOT_UNICODE_OBJ_ARGS -I"$RT" -lm $TSAOT_FETCH_LDLIBS $TSAOT_LDLIBS -o "$WORK/$slug.bin" 2>"$WORK/$slug.cc.err"; then
+  if [[ "$UNITS" == 1 ]]; then
+    if ! TSAOT_UNITS_CC="$CC" TSAOT_UNITS_CFLAGS="-I$RT" TSAOT_UNITS_CACHE="$WORK/unit-cache" \
+         tsaot_units_build "$WORK/$slug.units" "$WORK/$slug.bin" "$TSAOT_FETCH_RT_OBJ_ARG" $TSAOT_REGEXP_OBJ_ARGS $TSAOT_UNICODE_OBJ_ARGS -lm $TSAOT_FETCH_LDLIBS $TSAOT_LDLIBS > "$WORK/$slug.cc.err" 2>&1; then
+      echo "[conf] FAIL ${slug}: units build"; head -5 "$WORK/$slug.cc.err"; nfail=$((nfail+1)); fail=1; continue
+    fi
+  elif ! $CC "$WORK/$slug.c" "$TSAOT_FETCH_RT_OBJ_ARG" $TSAOT_REGEXP_OBJ_ARGS $TSAOT_UNICODE_OBJ_ARGS -I"$RT" -lm $TSAOT_FETCH_LDLIBS $TSAOT_LDLIBS -o "$WORK/$slug.bin" 2>"$WORK/$slug.cc.err"; then
     echo "[conf] FAIL ${slug}: gcc"; head -3 "$WORK/$slug.cc.err"; nfail=$((nfail+1)); fail=1; continue
   fi
   aot="$("$WORK/$slug.bin" 2>&1 | tr '\n' '|')"

@@ -32,10 +32,21 @@ PY
   node --max-old-space-size=8192 "$ROOT/exporter/exporter.js" \
     --project tsconfig.json garnet/main.ts "$WORK/program.json" "$WORK/labels.json"
 )
-"$ROOT/analyzer/target/release/tsaot" "$WORK/program.json" emit > "$WORK/tsc-ts.c"
-python3 - "$WORK/tsc-ts.c" <<'PY'
+# The generated C as parallel units (docs/build_split_design.md; main lives in
+# the data unit), or with TSAOT_NATIVE_UNITS=0 as one file.
+UNITS="${TSAOT_NATIVE_UNITS:-1}"
+if [[ "$UNITS" == "1" ]]; then
+  rm -rf "$WORK/units"
+  "$ROOT/analyzer/target/release/tsaot" "$WORK/program.json" emit --units "$WORK/units" > "$WORK/units.order"
+  MAIN_C="$WORK/units/data.c"; MARKERS_C="$WORK/units/prog.h"
+else
+  "$ROOT/analyzer/target/release/tsaot" "$WORK/program.json" emit > "$WORK/tsc-ts.c"
+  MAIN_C="$WORK/tsc-ts.c"; MARKERS_C="$WORK/tsc-ts.c"
+fi
+python3 - "$MAIN_C" "$UNITS" <<'PY'
 import json, os, pathlib, re, sys
 file = pathlib.Path(sys.argv[1])
+units = sys.argv[2] == "1"
 code = file.read_text()
 assert code.count('int main(void){') == 1
 assert code.count('  ts_setup_globals();') == 1
@@ -43,7 +54,11 @@ code = code.replace('int main(void){', 'int main(int argc, char** argv){')
 code = code.replace('  ts_setup_globals();',
                     '  ts_setup_globals();\n  garnet_tsc_ts_host_init(argc, argv);')
 exceptions = []
-if os.environ.get("TSAOT_NATIVE_COLD_O0") == "1":
+if units:
+    # the cold functions are units of their own, compiled at -O0
+    order = file.parent.with_name("units.order").read_text().split("\n")
+    exceptions = [dict(unit=l.split()[0]) for l in order if l.endswith(" cold")]
+elif os.environ.get("TSAOT_NATIVE_COLD_O0") == "1":
     for match in re.finditer(r'^static (?:tsv|int|double|long long) (fn_\d+_\w+)\((?:tsv\* args, int nargs|[^()]*)\)\{', code, re.M):
         end = code.find('\n}\n', match.end()) + 3
         lines = code.count('\n', match.start(), end)
@@ -54,7 +69,7 @@ if os.environ.get("TSAOT_NATIVE_COLD_O0") == "1":
     for item in reversed(exceptions):
         offset = item.pop("offset")
         code = code[:offset] + annotation + code[offset:]
-file.with_name("optimization_exceptions.json").write_text(json.dumps(exceptions, indent=2) + "\n")
+(file.parent.parent if units else file.parent).joinpath("optimization_exceptions.json").write_text(json.dumps(exceptions, indent=2) + "\n")
 file.write_text(code)
 PY
 CC="${TSAOT_HOST_CC:-cc -O2 -g -fno-omit-frame-pointer}"
@@ -65,23 +80,33 @@ TSAOT_LDLIBS="${TSAOT_LDLIBS:-}"
 . "$ROOT/scripts/lib/regexp_link_flags.sh"
 $CC -c "$ROOT/runtime/ts_rt.c" -I"$ROOT/runtime" -o "$WORK/rt.o"
 $CC -c "$ROOT/benchmarks/tsc_ts_native/host.c" -I"$ROOT/runtime" -o "$WORK/host.o"
-tsaot_prepare_regexp_objs "$WORK/tsc-ts.c" "$WORK"
-tsaot_prepare_unicode_objs "$WORK/tsc-ts.c" "$WORK"
-tsaot_prepare_fetch_runtime "$WORK/tsc-ts.c" "$WORK" "$WORK/rt.o"
+tsaot_prepare_regexp_objs "$MARKERS_C" "$WORK"
+tsaot_prepare_unicode_objs "$MARKERS_C" "$WORK"
+tsaot_prepare_fetch_runtime "$MARKERS_C" "$WORK" "$WORK/rt.o"
 if [[ -n "${TSAOT_MIMALLOC_ACTIVE:-}" ]]; then
   GEN_CC="$GEN_CC -DTSAOT_USE_MIMALLOC -I$ROOT/third_party/mimalloc/include"
 fi
-$GEN_CC -c -include "$ROOT/benchmarks/tsc_ts_native/host.h" \
-  "$WORK/tsc-ts.c" -I"$ROOT/runtime" -o "$WORK/tsc-ts.o"
-$GEN_CC "$WORK/tsc-ts.o" "$WORK/host.o" "$TSAOT_FETCH_RT_OBJ_ARG" \
-  $TSAOT_REGEXP_OBJ_ARGS $TSAOT_UNICODE_OBJ_ARGS -lm $TSAOT_FETCH_LDLIBS $TSAOT_LDLIBS \
-  -o "$WORK/tsc-ts"
-python3 - "$WORK" "$CHECKOUT" "$CC" "$GEN_CC" <<'PY'
+if [[ "$UNITS" == "1" ]]; then
+  . "$ROOT/scripts/lib/units.sh"
+  TSAOT_UNITS_CC="$GEN_CC" \
+  TSAOT_UNITS_CFLAGS="-include $ROOT/benchmarks/tsc_ts_native/host.h -I$ROOT/runtime" \
+    tsaot_units_build "$WORK/units" "$WORK/tsc-ts" "$WORK/host.o" "$TSAOT_FETCH_RT_OBJ_ARG" \
+      $TSAOT_REGEXP_OBJ_ARGS $TSAOT_UNICODE_OBJ_ARGS -lm $TSAOT_FETCH_LDLIBS $TSAOT_LDLIBS
+else
+  $GEN_CC -c -include "$ROOT/benchmarks/tsc_ts_native/host.h" \
+    "$WORK/tsc-ts.c" -I"$ROOT/runtime" -o "$WORK/tsc-ts.o"
+  $GEN_CC "$WORK/tsc-ts.o" "$WORK/host.o" "$TSAOT_FETCH_RT_OBJ_ARG" \
+    $TSAOT_REGEXP_OBJ_ARGS $TSAOT_UNICODE_OBJ_ARGS -lm $TSAOT_FETCH_LDLIBS $TSAOT_LDLIBS \
+    -o "$WORK/tsc-ts"
+fi
+python3 - "$WORK" "$CHECKOUT" "$CC" "$GEN_CC" "$UNITS" "${TSAOT_UNITS_LTO:-1}" <<'PY'
 import json, pathlib, subprocess, sys
 work, checkout = map(pathlib.Path, sys.argv[1:3])
 commit = subprocess.run(["git", "-C", str(checkout), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+units = sys.argv[5] == "1"
 metadata = dict(checkout=str(checkout), commit=commit, source=str(work / "source"),
                 runtime_cc=sys.argv[3], generated_cc=sys.argv[4],
+                units=units, thin_lto=units and sys.argv[6] == "1",
                 optimization_exceptions=json.loads((work / "optimization_exceptions.json").read_text()))
 (work / "build.json").write_text(json.dumps(metadata, indent=2) + "\n")
 PY

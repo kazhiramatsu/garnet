@@ -30,7 +30,7 @@ rewrite_mods() { # rewrite `mod X;` and `mod A; mod B;` to #[path="../X.rs"] for
 }
 
 for test in escape_analysis_p1_tests call_graph_p2_tests interproc_p3_tests \
-            interproc_closure_tests codegen_tests classes_tests devirt_tests; do
+            interproc_closure_tests codegen_tests classes_tests devirt_tests c_units_tests; do
   [[ -f "$TST/$test.rs" ]] || { echo "[unit] SKIP $test"; continue; }
   for m in $(extras_for "$test"); do cp "$TST/$m.rs" "$SRC/$m.rs"; done
   rewrite_mods "$TST/$test.rs" > "$BIN/$test.rs"

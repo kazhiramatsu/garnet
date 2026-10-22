@@ -252,6 +252,12 @@ When an exporter/analyzer change produces a new IR/optimization pattern, **the f
   `scripts/lib/regexp_link_flags.sh`), and run one `--noEmit` compile with `TSAOT_RT_STATS_FILE`.
   The dump lists the 400 hottest sites; `sites.json` of the matching build maps site ids to
   source spans and kinds (`cell` = scope record, `closure`, `array`, `object`).
+- **The native build scripts build parallel units by default (Session 352,
+  `docs/build_split_design.md`):** they write `units/` instead of `tsc-ts.c`/`compiler.c` and cache
+  objects in `build/unit-cache` by content (the unit, the preprocessed header with its macros, the
+  command). `TSAOT_NATIVE_UNITS=0` builds the one file (the statistics build above needs it). Compare
+  like with like in an A/B: a units build (ThinLTO) is 1-4% faster than a one-file build of the
+  same source.
 
 ## 8. 30-second summary (the shortest single-bug fix)
 

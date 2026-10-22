@@ -377,6 +377,38 @@ class Exporter {
   fields: { id: number; name: string; declaringType: number }[] = [];
   globals: { id: number; name: string }[] = [];
   functions: any[] = [];
+  /* Each function's source module (docs/build_split_design.md): the native
+     build's units group functions by module, so an edit recompiles its own
+     module's units. Synthetic functions take the module being lowered when
+     they are made. */
+  moduleNames: string[] = [];
+  moduleIds = new Map<string, number>();
+  fnModule = new Map<number, number>();
+  curModuleFile: string | undefined;
+  moduleId(fileName: string): number {
+    let id = this.moduleIds.get(fileName);
+    if (id === undefined) { id = this.moduleNames.length; this.moduleNames.push(fileName); this.moduleIds.set(fileName, id); }
+    return id;
+  }
+  /* The module paths relative to the directory that contains them all, so
+     the units do not depend on where the build runs. */
+  relativeModuleNames(): string[] {
+    // a root file given relative to the working directory keeps its relative name
+    const files = this.moduleNames.map((f) => path.resolve(f).split(path.sep).join("/"));
+    const under = (d: string, c: string) => d === c || d.startsWith(c.endsWith("/") ? c : c + "/");
+    let common = files.length > 0 ? path.posix.dirname(files[0]) : "";
+    for (const f of files) {
+      while (!under(path.posix.dirname(f), common)) {
+        const up = path.posix.dirname(common);
+        if (up === common) break;
+        common = up;
+      }
+    }
+    return files.map((f) => path.posix.relative(common, f));
+  }
+  noteFnModule(fnId: number, fileName: string | undefined = this.curModuleFile): void {
+    if (fileName !== undefined) this.fnModule.set(fnId, this.moduleId(fileName));
+  }
   private templateObjectGlobals = new Map<ts.TaggedTemplateExpression, number>();
   private hasDynamicDelete = false;
   // fnIds whose body has already been lowered, so lowerFunctionLike is idempotent.
@@ -3053,6 +3085,7 @@ class Exporter {
     if (func === undefined) {
       func = this.allocSpecFn();
       this.namespaceGetterFunctions.set(sym, func);
+      this.noteFnModule(func, node.getSourceFile().fileName);
       this.functions.push({
         id: func, name: `__get_export_${name}`, params: [0], ret: 0,
         locals: [{ id: 0, typeId: 0, refKind: "reference" }, { id: 1, typeId: 0, refKind: "reference" }],
@@ -8580,6 +8613,7 @@ class Exporter {
       // (the args>0 poly new is rejected at the gate via noCtorForwardKind).
       this.emitImplicitConstruction(ctx, classId, tid, []);
     }
+    this.noteFnModule(fnId);
     this.functions.push({
       id: fnId, name, params: ctx.params, ret: 0, locals: ctx.locals, body: ctx.body,
       isExported: false, paramClasses: ctx.paramClasses || {}, restParam: restLid,
@@ -12465,6 +12499,8 @@ class Exporter {
     // never holds two same-id entries (which would emit a C redefinition).
     if (this.loweredFnIds.has(fnId)) return;
     this.loweredFnIds.add(fnId);
+    this.curModuleFile = node.getSourceFile().fileName;
+    this.noteFnModule(fnId);
     // A TypeScript explicit `this` parameter (function f(this: T, ...)) is not a
     // real positional argument: it only declares the type of `this`. Treat it like
     // the accessor/method `this` slot (args[0]) so call/apply/bind inject thisArg
@@ -13493,6 +13529,7 @@ class Exporter {
         m.body.statements.forEach((s) => this.lowerStmt(ctx, s));
       }
     }
+    this.noteFnModule(ctx.id);
     this.functions.push({
       id: ctx.id, name: ctx.name, params: [], ret: 0,
       locals: ctx.locals, body: ctx.body, isExported: false,
@@ -14174,6 +14211,8 @@ class Exporter {
       scopes: [],
       bindings: [],
       functions: this.functions,
+      modules: this.relativeModuleNames(),
+      functionModules: Object.fromEntries(this.fnModule),
       exports: this.exports,
       siteMeta: this.siteMeta,
       classes: this.classesOut,

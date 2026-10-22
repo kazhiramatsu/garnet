@@ -143,3 +143,93 @@ parallel emit) once the split works.
 2. Stable numbering, so adding a function or a literal does not renumber
    the program (the header stops changing on additions).
 3. A parallel emit, if the 32 s still dominate.
+
+## Slice 1 as built
+
+Session 352. `tsaot <ir> emit --units <dir>` writes the units and prints
+them in build order, largest first (`cold` marks the `-O0` ones); without
+`--units` stdout keeps the one file. `scripts/lib/units.sh`
+(`tsaot_units_build`) compiles and links them. Both native build scripts
+use it by default (`TSAOT_NATIVE_UNITS=0`: one file), `./garnet --units`
+builds a program this way (`--no-lto`: native objects, no ThinLTO), and
+`TSAOT_CONF_UNITS=1` runs the conformance suite through it.
+
+Where it differs from the design above:
+
+- **The module index.** The exporter records each function's source module
+  (`modules`, `functionModules` in the IR), synthetic functions taking the
+  module being lowered. The paths are resolved, then made relative to the
+  directory that contains every module, so the units do not depend on where
+  the project or the build is (the native build scripts copy the project
+  into each work directory and give the entry relative to it; before the
+  paths were resolved, that one relative name made every path relative to
+  `/`, and an edit moved the modules between the bins).
+- **The partition.** A module above 20,000 lines gets chunks of its own
+  (`m_<stem>_<hash>_<k>.c`, a tail under a quarter of a chunk joining the
+  chunk before it); the smaller modules share 16 bins by a hash of their
+  path (`bin_<k>.c`): 201 of tsc-ts's 210 modules are smaller, and a unit
+  per module would parse the header that many times. tsc-ts: 14 chunks of 9
+  modules, 16 bins, the data unit and 4 cold units, 35 in all. `main` and the
+  functions without a module (the runtime setup the emitter writes) go to
+  `data.c`. Each cold function is a unit of its own (`cold_<name>.c`,
+  `-O0 -fno-global-isel`), so tsc-ts's four compile in parallel; the rule
+  (at least 10,000 lines, or 2,000 for a `create…` function) moved from the
+  build script into the splitter.
+- **The inline copies live in the units that call them**, not in the
+  header: each unit gets the copies its calls reach, transitively. Editing
+  a copied function then recompiles its own unit and its callers' units,
+  not the program, and a unit parses only the copies it uses (tsc-ts's
+  header: 7.9 MB with the copies, 2.5 MB without). Calls within a unit stay
+  direct; the cold units call the originals. Whatever a copy references is
+  extern, its own function too when the copy takes the original's address.
+- **The cache key** is the unit's text, the header as the compiler sees it
+  (preprocessed with its macro definitions, `-E -P -dD`, so a change in
+  `ts_rt.h` or a host header reaches every unit; the first version hashed
+  `prog.h`'s text and reused stale objects after such a change), the
+  compile command, the optimization flags and the compiler's version. A hit
+  refreshes the object's time; objects no build used for seven days are
+  removed (`TSAOT_UNITS_CACHE_DAYS`).
+- **The driver's unit mode is a flag, not a size threshold**: it writes a
+  directory where the one-file mode writes `<name>.c`, which scripts may
+  expect.
+
+Build times, tsc-ts (`cc -O2 -gline-tables-only -fno-omit-frame-pointer`,
+ten cores; seconds; the runtime, host and adapter objects, 3.7 s, are in the
+units column):
+
+| build | export | emit | units | link | total |
+|---|---|---|---|---|---|
+| one file (before) | 13.7 | 32.0 | 154.7 | 0.1 | 201 |
+| units, empty cache | 15.8 | 34.2 | 21.0 | 14.9 | 86.0 |
+| units, nothing changed | 14.4 | 33.8 | 4.6 | 0.3 | 53.2 |
+| units, after a one-line edit | 14.5 | 33.5 | 6.3 | 13.1 | 67.5 |
+
+The edit (`isWhiteSpaceSingleLine`, the design's example) changed one unit
+of 35 and nothing else; the ThinLTO link redoes the modules that import
+from it. The TypeScript compiler (60 units) builds in 103.5 s from an empty
+cache (export 19.8, emit 38.2, units 20.9, link 24.5), against about five
+minutes for one file.
+
+A/B against the one-file builds (`-O2`; the giant cold functions at `-O0`
+in both, `ts_setup_prototypes` too in the units build), eight pairs each,
+outputs identical:
+
+| program | wall | cycles | instructions | peak memory |
+|---|---|---|---|---|
+| tsc-ts | 0.957 | 0.984 | 0.985 | 1.002 |
+| the compiler | 0.989 | 0.990 | 0.991 | 1.001 |
+
+As the prototype measured, ThinLTO with the copies and the unit-local
+`static`s is a little faster than the one-file build.
+
+Tests: the splitter's unit test (`tests/c_units_tests.rs`), the unit
+build gate in the fast CI (`tests/units_build_gate.sh`: outputs against the
+one-file builds with every kind of unit, hidden symbols, module paths, a
+rebuild compiling nothing, an edit recompiling only its units, an included
+header's change recompiling), the conformance suite through units (538/538).
+
+What remains: export and emit are serial and now 48 of a rebuild's 53 to
+68 s (slice 3, and the exporter). An addition (a function, a literal)
+still changes the shared header, so every unit recompiles: slice 2 needs,
+besides stable numbering, declarations that a unit takes only for what it
+uses.

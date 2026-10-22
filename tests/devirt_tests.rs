@@ -56,7 +56,7 @@ fn main(){
       StoreGlobal{gref:GlobalId(0),src:LocalId(1)},  // leak the returned object
   ]);
   let mut prog = Program{version:1,strict_type_optimizations: Default::default(), closed_receivers: Default::default(),types:vec![],fields:vec![],signatures:vec![],globals:vec![],
-    scopes:vec![],bindings:vec![],functions:vec![g,circle_area,square_area,shape_area],exports:vec![],
+    scopes:vec![],bindings:vec![],functions:vec![g,circle_area,square_area,shape_area],modules:vec![],function_modules:Default::default(),exports:vec![],
     site_meta:vec![], classes: base_classes(true,true,true), object_proto_methods: vec![], array_proto_methods: vec![], promise_proto_methods: vec![], map_proto_methods: vec![], set_proto_methods: vec![], weak_map_proto_methods: vec![], weak_set_proto_methods: vec![], headers_proto_methods: vec![], function_proto_methods: vec![], string_proto_methods: vec![], regexp_proto_methods: vec![], number_proto_methods: vec![], boolean_proto_methods: vec![], well_known_symbols: vec![]};
 
   let disp = run_devirt(&mut prog, true);
