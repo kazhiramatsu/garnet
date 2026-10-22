@@ -419,6 +419,15 @@ generic code fails the build check, not a program.
    `obj_map_w`, the collector, `obj_abandon_layout`, header-only instances,
    the emitters and the frozen templates, the registry's base size.
 
+Slice 1 as built (Session 352): `ts_propmap`, the reordered prefix (the
+field names stay, through an anonymous union, for generated code), the two
+accessors, and the 133 accesses rewritten at the positions the compiler
+reported (`obj_map_plain` in the plain-only functions, `obj_map`
+elsewhere); `tests/propmap_access_gate.sh` (in the unit gate) is the
+renamed-copy check, for the plain and the statistics builds. Outputs
+identical; tsc-ts wall 0.994 and instructions 1.000, the compiler wall
+1.003 and instructions 1.000 (twelve and eight pairs).
+
 Gates for each: unit, parity, bundler, selfconf, defaults, GC stress (with
 the cell header gate), conformance plain, strict and at every allocation
 under protect mode; new targeted tests: dynamic properties (data,

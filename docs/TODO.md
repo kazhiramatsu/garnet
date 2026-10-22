@@ -8116,3 +8116,16 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   compiles a renamed copy to keep it so. Slice 1 (no behavior change):
   the reorder, `obj_map`, the conversions and the gate; slice 2: the
   sidecar itself.
+- Cell header H2, slice 1 (no behavior change): the common object prefix
+  reorders to `{h, proto, cls, shape, map}`, the map a `ts_propmap` (the
+  field names stay through an anonymous union, so generated code is
+  unchanged); the runtime reads it only through `obj_map` (any object) and
+  `obj_map_plain` (an object whose map is in place): 133 accesses in 39
+  functions rewritten at the positions the compiler reported for a copy
+  with the fields renamed, and `tests/propmap_access_gate.sh` (unit gate)
+  repeats that check for the plain and statistics builds. A/B against H1
+  commit 2, outputs identical: tsc-ts (twelve pairs) wall 0.994,
+  instructions 1.000; the compiler (eight pairs) wall 1.003, instructions
+  1.000. Gates: unit, parity (379 identical), bundler 43/43, selfconf,
+  defaults (plain and stress), conformance 537/537 plain and strict and
+  534/534 at every allocation under protect mode, GC stress.

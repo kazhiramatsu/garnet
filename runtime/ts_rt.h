@@ -414,13 +414,20 @@ typedef struct { ts_gc_header h; uint32_t sym_id; uint32_t wksym; uint8_t regist
    as their first member and append their own fields. The named-property map
    (props) is lazily allocated: NULL/0 until a named property is actually set, so
    element-only arrays stay light (V8-style fast->dictionary transition). */
+/* A named-property map. A shaped object keeps its values past the in-object
+   slots in `props` (as tsv, `cap` of them) and its keys in the shape; a
+   dictionary keeps ts_prop entries. The map is lazily allocated: NULL/0
+   until a named property is actually set, so element-only arrays stay light
+   (V8-style fast->dictionary transition). Objects with enough named
+   properties get a sparse open-addressing index; small ones keep it NULL
+   and the cache-friendly linear scan. */
+typedef struct ts_propmap {
+  ts_prop* props; uint32_t cap, len;
+  uint32_t* prop_index;          /* capacity in prop_index[0], entries after it */
+} ts_propmap;
 typedef struct ts_obj_common {
   ts_gc_header h;
   tsv proto;                   /* prototype chain handle (object/function or null) */
-  ts_prop* props; uint32_t cap, len;   /* lazily-allocated named-property map */
-  /* Objects with enough named properties get a sparse open-addressing index.
-     Small objects keep this NULL and retain the cache-friendly linear scan. */
-  uint32_t* prop_index;          /* capacity in prop_index[0], entries after it */
   /* A sized class instance's class index plus one: its class's position in
      a depth-first numbering of the class forest, so a class and its
      subclasses are one interval (docs/class_index_dispatch_design.md); 0 for
@@ -430,6 +437,13 @@ typedef struct ts_obj_common {
   /* Low 29 bits are hidden-class identity. The high 3 bits store integrity
      flags (frozen, non-extensible, sealed), keeping the common header compact. */
   uint32_t shape;
+  /* The property map, in place. The runtime reads it through obj_map /
+     obj_map_plain (docs/cell_header_design.md, H2; tests/propmap_access_gate.sh);
+     the field names stay for generated code. */
+  union {
+    ts_propmap map;
+    struct { ts_prop* props; uint32_t cap, len; uint32_t* prop_index; };
+  };
 } ts_obj_common;
 /* The class index word of a class's prototype object: no instance's, so
    intervals and tables reject it, and relinking such an object
@@ -443,6 +457,12 @@ typedef struct ts_obj_common {
 #define TS_CLS_RELINKED 0x80000000u
 /* ts_object is exactly the common header (plain object / class-instance prefix). */
 typedef struct ts_obj_common ts_object;
+/* An object's property map (docs/cell_header_design.md, H2). Any object:
+   obj_map. A shaped object, or one of a kind that never moves its map out
+   (arrays, functions, collections, prototypes): obj_map_plain, which the
+   checked builds verify. */
+static inline ts_propmap* obj_map(const ts_object* o){ return (ts_propmap*)&o->map; }
+static inline ts_propmap* obj_map_plain(const ts_object* o){ return (ts_propmap*)&o->map; }
 static inline uint32_t ts_obj_shape_id(const ts_object* o){ return o->shape & TS_SHAPE_MAX; }
 static inline uint32_t ts_obj_integrity(const ts_object* o){ return o->shape >> 29; }
 static inline void ts_obj_set_shape(ts_object* o, uint32_t shape){
@@ -459,7 +479,7 @@ static inline void ts_obj_add_integrity(ts_object* o, uint32_t flags){
 static inline tsv* ts_obj_inline_vals(ts_object* o){ return (tsv*)((char*)o + sizeof(ts_object)); }
 static inline tsv* ts_obj_slot_ptr(ts_object* o, uint32_t slot){
   uint32_t ic = o->h.inline_cap;
-  return slot < ic ? &ts_obj_inline_vals(o)[slot] : &((tsv*)o->props)[slot - ic];
+  return slot < ic ? &ts_obj_inline_vals(o)[slot] : &((tsv*)obj_map_plain(o)->props)[slot - ic];
 }
 /* A sized class instance (registered struct storage after the header) versus
    a plain object whose cell is the header plus its inline slots: the
@@ -1791,7 +1811,7 @@ static inline void ts_write_barrier_at(tsv owner, ts_gc_header* oh, tsv* p, tsv 
     tsv* iv = ts_obj_inline_vals(o);
     uint32_t slot = (p >= iv && p < iv + oh->inline_cap)
       ? (uint32_t)(p - iv)
-      : (uint32_t)(p - (tsv*)o->props) + oh->inline_cap;
+      : (uint32_t)(p - (tsv*)obj_map_plain(o)->props) + oh->inline_cap;
     ts_gc_remember_slot(oh, slot);
   } else {
     ts_gc_remember(oh);
@@ -1834,7 +1854,7 @@ TS_RT_ALWAYS_INLINE tsv* ts_prop_ic_probe_fixed_inline(
       return ts_obj_slot_ptr(o, e0->slot & TS_PIC_SLOT_MASK);
     }
     uint32_t slot0 = e0->slot & TS_PIC_SLOT_MASK;
-    if (e0->shape != TS_SHAPE_NONE && slot0 < o->len && g_ts_shape_keys[sid][slot0] == key){
+    if (e0->shape != TS_SHAPE_NONE && slot0 < obj_map_plain(o)->len && g_ts_shape_keys[sid][slot0] == key){
       *flags = g_ts_shape_flags[sid][slot0];
       TS_RT_STAT_PIC_KEYVAL();
       return ts_obj_slot_ptr(o, slot0);
@@ -1866,7 +1886,7 @@ TS_RT_ALWAYS_INLINE tsv* ts_prop_ic_probe_fixed_inline(
   for (uint32_t i = 1; i < TS_PROP_IC_SIZE; i++){
     ts_prop_ic_entry* e = &ic->entries[i];
     uint32_t slot = e->slot & TS_PIC_SLOT_MASK;
-    if (e->shape != TS_SHAPE_NONE && slot < o->len && g_ts_shape_keys[sid][slot] == key){
+    if (e->shape != TS_SHAPE_NONE && slot < obj_map_plain(o)->len && g_ts_shape_keys[sid][slot] == key){
       *flags = g_ts_shape_flags[sid][slot];
       TS_RT_STAT_PIC_KEYVAL();
       return ts_obj_slot_ptr(o, slot);
@@ -1906,7 +1926,7 @@ static inline void ts_lit_store(tsv obj, uint32_t i, tsv v){
     *p = v;
     ts_write_barrier_ptr(obj, p, v);
   } else {
-    o->props[i].val = v;
+    obj_map_plain(o)->props[i].val = v;
     ts_write_barrier(obj, v);
   }
 }
@@ -2192,7 +2212,7 @@ TS_RT_ALWAYS_INLINE int ts_ta_try_store_f(tsv v, double d, double x, int elem){
 TS_RT_ALWAYS_INLINE int ts_ta_try_length(tsv v, tsv* out){
   if (!ts_is_obj(v)) return 0;
   ts_typedarray* t = (ts_typedarray*)ts_ptr(v);
-  if (t->o.h.kind != TS_KIND_TYPEDARRAY || t->o.len != 0) return 0;
+  if (t->o.h.kind != TS_KIND_TYPEDARRAY || obj_map_plain(&t->o)->len != 0) return 0;
   *out = ts_num((double)t->length);
   return 1;
 }
