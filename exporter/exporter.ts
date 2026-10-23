@@ -9215,21 +9215,30 @@ class Exporter {
     if (!this.callArgumentsSafe(node.arguments)) return;
     try {
       const t = this.checker.getTypeAtLocation(node);
-      const info = this.classInfos[classId];
-      if (!info) return;
-      const decl = this.classNodeOfId.get(classId);
-      if (decl && !this.classTypeOptimizationSafe(decl)) return;
-      let m = this.instFieldTypes.get(classId);
-      if (!m) { m = new Map(); this.instFieldTypes.set(classId, m); }
-      for (const fname of info.ownFields) {
-        const prop = this.checker.getPropertyOfType(t, fname);
-        let tag = "tsv";
-        if (prop) {
-          const ft = this.checker.getTypeOfSymbolAtLocation(prop, node);
-          tag = this.classify(ft) === "primitive" ? "number" : "tsv";
+      // The instance is an instance of every ancestor too: their own fields
+      // take their types from the same instance type, so a base class that is
+      // constructed only through `super` (tsc-ts's Node, Symbol, Type) gets its
+      // field representation from its subclasses' instantiations. An ancestor
+      // whose body is not optimization-safe ends the walk (its fields stay
+      // boxed, as do those above it).
+      for (let id: number | undefined = classId; id !== undefined; ) {
+        const info: ClassInfo | undefined = this.classInfos[id];
+        if (!info) return;
+        const decl = this.classNodeOfId.get(id);
+        if (decl && !this.classTypeOptimizationSafe(decl)) return;
+        let m = this.instFieldTypes.get(id);
+        if (!m) { m = new Map(); this.instFieldTypes.set(id, m); }
+        for (const fname of info.ownFields) {
+          const prop = this.checker.getPropertyOfType(t, fname);
+          let tag = "tsv";
+          if (prop) {
+            const ft = this.checker.getTypeOfSymbolAtLocation(prop, node);
+            tag = this.classify(ft) === "primitive" ? "number" : "tsv";
+          }
+          if (!m.has(fname)) m.set(fname, new Set());
+          m.get(fname)!.add(tag);
         }
-        if (!m.has(fname)) m.set(fname, new Set());
-        m.get(fname)!.add(tag);
+        id = info.parentId;
       }
     } catch { /* be conservative on any checker hiccup */ }
   }

@@ -8365,3 +8365,24 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   kind-discriminated hierarchy, methods, a downcast, a field store, a Map
   lookup; garnet 3.0x scriptc's instructions) and a fixture
   `classes/base_fields_via_super` for the next slice.
+- Toward scriptc, slice F: field types of base classes. The exporter recorded
+  a class's numeric field types from its own `new` sites only, so the fields a
+  base class declares and its subclasses' constructors fill through `super`
+  (tsc-ts's abstract `Node` with `kind`, `flags`, `pos`, `end`, `id`; `Type`'s
+  `flags`) stayed boxed in every subclass instance.
+  `recordInstantiationFieldTypes` now records the instance type's field types
+  for every ancestor too (an instance of `Identifier` is an instance of
+  `Node`). Kernel `class_nodes`'s `Nd` gets five unboxed fields (6.23 -> 6.08
+  G instructions); tsc-ts one thread 32.97 -> 32.60 G (0.989), cycles flat.
+  Fixture `classes/base_fields_via_super` (a subclass re-declaring a base
+  field, a sibling without the field, reads through the base type,
+  `Object.keys` and JSON of a sized instance); its parity entry: the Rust
+  emitter lists the re-declared field in the class tables where the frozen
+  emitter leaves it out. Gates: parity (380 identical), selfconf, unit,
+  bundler 43/43, conformance 539/539 plain and strict, 536/536 under protect
+  mode, GC stress. Measured ceilings on the way (unsound variants of the
+  generated C and the runtime header, outputs identical): the receivers'
+  object test is 3.7% of the instructions, the class interval test 0.4%, NaN
+  canonicalization 0.4%, the frame-slot reloads after calls 0.3%, the
+  collector 2.6% (a 1 GB nursery and a 4 GB full threshold); the hole check,
+  the barrier and the frame push/pop cannot be removed without crashing.
