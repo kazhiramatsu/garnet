@@ -704,6 +704,9 @@ enum {
   TS_STR_FLAG_VIEW = 1u << 2,
   TS_STR_FLAG_HASHED = 1u << 3,
   TS_STR_FLAG_UTF16 = 1u << 4,
+  /* a flat (non-view) string's `offset` holds its UTF-8 byte length (the
+     host's Buffer.byteLength; a source text is measured a few times) */
+  TS_STR_FLAG_UTF8LEN = 1u << 6,
   /* Internal-only storage owner for appendable prefix views. A BUFFER value
      must never be returned as a JavaScript string; public values are VIEW
      cells whose parent points at this contiguous storage. */

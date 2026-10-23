@@ -8491,3 +8491,17 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   (`scripts/prof_pc.py`, now for any program): the non-inlined call of a small
   helper (prologue and epilogue 17%), the array element load's checks 13%,
   int-to-double conversions of integer results added into a double 10%.
+- Toward scriptc, slice J: the runtime's allocator and the host's byte length.
+  (1) Old cells (the pretenured constructions, 41% of the cells) were
+  allocated among the young cells in the same runs, so once the young cells
+  died the free runs were one- and two-cell holes (1.36 M refills a compile,
+  291 bytes a run, `gc_space_refill` and its `memset` 4% of the time); old
+  cells now take runs from blocks of their own (`g_cclass_old`), the sweeps
+  and the cursor resets covering both sets. (2) `Buffer.byteLength` of a text
+  stored as UTF-16 (any character past U+00FF) walked the text at every call
+  (tsc-ts measures each text a few times: 1.5%); a flat string's unused view
+  `offset` now caches its UTF-8 length (`TS_STR_FLAG_UTF8LEN`). tsc-ts one
+  thread, six interleaved pairs: 27.27 -> 26.88 G instructions (0.985), cycles
+  0.979, wall 1.46 -> 1.43 s, peak memory +9 MB, outputs identical. Gates:
+  parity, selfconf, unit, bundler, conformance 540/540 plain and strict,
+  537/537 under protect mode, GC stress.

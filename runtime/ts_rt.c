@@ -233,6 +233,11 @@ static uint32_t g_payload_epoch = 1;
 static gc_pclass g_pclass[GC_PAYLOAD_NCLASS];
 /* The cell space (G3): cells in blocks of their size class, beside the payload blocks. */
 static gc_pclass g_cclass[GC_PAYLOAD_NCLASS];
+/* Old cells (the pretenured constructions) take their runs from blocks of
+   their own: allocated among the young cells, they left the young runs
+   fragmented into one- and two-cell holes once the young cells died (1.36 M
+   refills a compile, 291 bytes a run; docs/single_thread_vs_scriptc.md). */
+static gc_pclass g_cclass_old[GC_PAYLOAD_NCLASS];
 static uint32_t g_large_cell_head = 0;   /* large cell runs (index + 1) */
 static uint32_t g_pclass_size[GC_PAYLOAD_NCLASS];
 /* Per class: the bytes its cells tile from a block's start, and the cell
@@ -362,6 +367,8 @@ static void gc_alloc_bits_settle(void){
   g_alloc_dirty_len = 0;
   for (int cls = 0; cls < g_pclass_n; cls++){
     gc_pclass* c = &g_cclass[cls];
+    if (c->ptr && c->ptr < c->end) gc_alloc_block_dirty((uint32_t)(((uintptr_t)c->ptr - (uintptr_t)g_cage_base) >> GC_BLOCK_SHIFT));
+    c = &g_cclass_old[cls];
     if (c->ptr && c->ptr < c->end) gc_alloc_block_dirty((uint32_t)(((uintptr_t)c->ptr - (uintptr_t)g_cage_base) >> GC_BLOCK_SHIFT));
   }
 }
@@ -566,11 +573,12 @@ static inline void* gc_cell_alloc(size_t bytes, int old, size_t* cap){
   if (TS_RT_UNLIKELY(bytes > GC_PAYLOAD_SMALL_MAX)){ *cap = bytes; return gc_cell_alloc_large(bytes, old); }
   if (TS_RT_UNLIKELY(!g_cage_base)) gc_cage_init();
   unsigned cls = g_pclass_of[(bytes + 15u) >> 4];
-  gc_pclass* c = &g_cclass[cls];
+  gc_pclass* classes = old ? g_cclass_old : g_cclass;
+  gc_pclass* c = &classes[cls];
   size_t size = g_pclass_size[cls];
   *cap = size;
   char* p = c->ptr;
-  if (TS_RT_UNLIKELY(!p || p + size > c->end)) p = gc_space_refill(g_cclass, GC_BLK_CELL, cls, 0);
+  if (TS_RT_UNLIKELY(!p || p + size > c->end)) p = gc_space_refill(classes, GC_BLK_CELL, cls, 0);
   c->ptr = p + size;
   if (g_conservative_roots) gc_alloc_bit_set(p);
   GC_PAYLOAD_UNPOISON(p, size);
@@ -740,6 +748,8 @@ static void gc_payload_after_collection(int full){
     gc_pclass* c = &g_pclass[cls];
     c->ptr = c->end = NULL; c->scan = c->head;
     gc_pclass* cc = &g_cclass[cls];
+    cc->ptr = cc->end = NULL; cc->scan = cc->head;
+    cc = &g_cclass_old[cls];
     cc->ptr = cc->end = NULL; cc->scan = cc->head;
   }
   uint32_t l = g_large_head;
@@ -5806,7 +5816,8 @@ static void gc_cells_sweep_old(void){
   if (!g_cage_base) return;
   for (int cls = 0; cls < g_pclass_n; cls++){
     uint32_t size = g_pclass_size[cls];
-    for (uint32_t l = g_cclass[cls].head; l; l = g_blocks[l - 1u].next){
+    for (int set = 0; set < 2; set++)
+    for (uint32_t l = (set ? g_cclass_old : g_cclass)[cls].head; l; l = g_blocks[l - 1u].next){
       uint32_t bi = l - 1u;
       uint64_t* bm = gc_block_bitmap(bi);
       char* base = gc_block_base(bi);
@@ -5929,7 +5940,8 @@ static void g0_dump(FILE* out){
   static const char* full_phases[6] = { "mark", "weak", "remset_reset", "old_sweep", "young_sweep", "rewrite_rest" };
   if (g0_fates_on() && g_cage_base){
     for (int cls = 0; cls < g_pclass_n; cls++)
-      for (uint32_t l = g_cclass[cls].head; l; l = g_blocks[l - 1u].next){
+      for (int set = 0; set < 2; set++)
+    for (uint32_t l = (set ? g_cclass_old : g_cclass)[cls].head; l; l = g_blocks[l - 1u].next){
         const uint64_t* bm = gc_block_bitmap(l - 1u);
         for (uint32_t w = 0; w < GC_BLOCK_BITMAP_WORDS; w++)
           for (uint64_t bits = bm[w]; bits; bits &= bits - 1u){

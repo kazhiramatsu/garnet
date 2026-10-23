@@ -232,6 +232,7 @@ neither instructions nor wall.
 | C: conservative roots, no GC frames (`docs/conservative_roots_design.md`) | 28.55 G | 1.50 s |
 | R: no `g_class_relinked` test in a closed program | 28.28 G | 1.49 s |
 | I: enum-typed fields as integers (`docs/int32_fields_design.md`) | 27.28 G | 1.46 s |
+| J: old cells in blocks of their own; a text's UTF-8 length cached | 26.88 G | 1.43 s |
 | scriptc | 18.3 G | 1.05 s |
 
 ## What to do

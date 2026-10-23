@@ -303,13 +303,23 @@ static tsv host_totalmem(tsv* a, int n){
 #endif
 }
 /* the length in bytes of a string's UTF-8 form (lone surrogates 3 bytes, as U+FFFD) */
+static tsv host_utf8_length_walk(ts_strview v);
 static tsv host_utf8_length(tsv* a, int n){
   tsv s = arg(a, n, 0);
   if (!ts_is_str(s)) return ts_num(0);
   ts_strview v = ts_str_view_typed(s);
   /* ASCII: one byte per unit; 8-bit storage: two bytes for each unit past
-     0x7F; UTF-16 storage: the general walk */
+     0x7F; UTF-16 storage: the general walk, its answer cached in the flat
+     cell's unused view offset (a source text is measured a few times) */
   if (v.flags & TS_STR_FLAG_ASCII) return ts_num((double)v.len);
+  ts_string* cell = ts_is_short_str(s) ? NULL : ts_str_ptr_typed(s);
+  if (cell && (cell->flags & TS_STR_FLAG_VIEW)) cell = NULL;
+  if (cell && (cell->flags & TS_STR_FLAG_UTF8LEN)) return ts_num((double)cell->offset);
+  tsv total_v = host_utf8_length_walk(v);
+  if (cell && ts_to_num(total_v) <= 4294967295.0){ cell->offset = (uint32_t)ts_to_num(total_v); cell->flags |= TS_STR_FLAG_UTF8LEN; }
+  return total_v;
+}
+static tsv host_utf8_length_walk(ts_strview v){
   if (v.data && !(v.flags & TS_STR_FLAG_UTF16)){
     const unsigned char* b = (const unsigned char*)v.data;
     uint64_t high = 0; uint32_t i = 0;
