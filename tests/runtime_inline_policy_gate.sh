@@ -97,6 +97,8 @@ while IFS= read -r name; do
     sv0_hash_num | \
     ts_map_probe_num | \
     ts_map_get_num | \
+    ts_array_push_inline | \
+    ts_eq_num | \
     ts_map_has_num) ;;
     *)
       echo "[runtime-inline] FAIL: unexpected always-inline runtime helper $name"

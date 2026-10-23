@@ -1881,6 +1881,13 @@ TS_RT_ALWAYS_INLINE int ts_strict_eq(tsv a, tsv b){
   if (ts_is_str(a) && ts_is_str(b)) return ts_strict_eq_str(a, b);
   return 0;
 }
+/* `x === n` with n an unboxed number: only a number can be equal, and two
+   numbers are strictly equal exactly when their doubles are (NaN differs from
+   everything, -0 equals +0), so the boxed side's tag and payload answer in
+   line with no boxing of n. */
+TS_RT_ALWAYS_INLINE int ts_eq_num(tsv x, double n){
+  return ts_is_num(x) && ts_to_num(x) == n;
+}
 /* `x === "literal"` (a static string of `len` code units): only a string of
    that length can be equal, so other kinds and lengths answer in line and
    only an equal length compares the content (string switch chains test a
@@ -2675,6 +2682,24 @@ static inline void ts_array_set_inline(tsv arr, int64_t i, tsv v){
     }
   }
   ts_array_set_key_i64(arr, i, v);
+}
+/* arr.push(v) with the dense in-capacity case in line: a plain array (not
+   frozen) with room stores the slot at len and remembers the array when it is
+   old; growth, frozen arrays and other receivers take ts_array_push, which has
+   the complete semantics (a typed array or a non-array receiver is ignored
+   there as before). */
+static inline void ts_array_push_inline(tsv arr, tsv v){
+  if (ts_is_indexed_array_fast(arr)){
+    ts_array* a = (ts_array*)ts_ptr(arr);
+    uint32_t u = a->len;
+    if (TS_RT_LIKELY(u < a->cap && !(ts_obj_integrity(&a->o) & 1u))){
+      a->data[u] = v;
+      a->len = u + 1u;
+      if (a->o.h.gen == TS_GEN_OLD) ts_array_remember(a, u, v);
+      return;
+    }
+  }
+  ts_array_push(arr, v);
 }
 static inline void ts_array_set_inline_f64(tsv arr, double d, tsv v){
   uint32_t i;

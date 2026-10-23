@@ -2137,6 +2137,24 @@ impl<'a> Ctx<'a> {
     }
     /// `a === b` with one side a string constant local: (other operand, the
     /// literal's expression, its length) for ts_eq_strlit.
+    /// `x === n` with exactly one side an unboxed number: (the boxed side, the
+    /// number's raw expression). Only a number can be strictly equal to a
+    /// number, so the boxed side needs a tag test and a double compare.
+    fn num_eq_operands(&self, lhs: u32, rhs: u32) -> Option<(u32, String)> {
+        if !eq_num_enabled() {
+            return None;
+        }
+        let lu = self.unboxed.contains(&lhs);
+        let ru = self.unboxed.contains(&rhs);
+        if lu && !ru {
+            Some((rhs, self.numc(lhs)))
+        } else if ru && !lu {
+            Some((lhs, self.numc(rhs)))
+        } else {
+            None
+        }
+    }
+
     fn str_eq_operands(&self, a: u32, b: u32) -> Option<(u32, String, u32)> {
         let (x, (id, len)) = if let Some(c) = self.str_consts.get(&b) {
             (a, *c)
@@ -2296,6 +2314,31 @@ fn map_num_inline_enabled() -> bool {
     *ENABLED.get_or_init(|| {
         !matches!(
             std::env::var("TSAOT_MAP_NUM_INLINE").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
+/// TSAOT_PUSH_INLINE=0 keeps `arr.push(v)` as the out-of-line runtime call (the
+/// parity oracle): on, a push stores into a plain array with room in line.
+fn push_inline_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_PUSH_INLINE").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
+/// TSAOT_EQ_NUM=0 keeps `x === n` with one unboxed side as a generic strict
+/// equality on a boxed n (the parity oracle): on, it is a tag test and a
+/// double compare.
+fn eq_num_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_EQ_NUM").as_deref(),
             Ok("0") | Ok("false") | Ok("no") | Ok("off")
         )
     })
@@ -20670,10 +20713,11 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     // push(a, b, c, ...): append each arg, result is the new length
                     // (a raw double, since this arm is marked numeric).
                     let mut blk = String::from("({ ");
+                    let push_fn = if push_inline_enabled() { "ts_array_push_inline" } else { "ts_array_push" };
                     for a in args.iter() {
                         let _ = std::fmt::write(
                             &mut blk,
-                            format_args!("ts_array_push({}, {}); ", r, ctx.val(a.0)),
+                            format_args!("{}({}, {}); ", push_fn, r, ctx.val(a.0)),
                         );
                     }
                     let _ = std::fmt::write(
@@ -21886,7 +21930,8 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             ));
         }
         Inst::ArrayPush { arr, src } => {
-            let _ = writeln!(s, "  ts_array_push({}, {});", ctx.val(arr.0), ctx.val(src.0));
+            let push_fn = if push_inline_enabled() { "ts_array_push_inline" } else { "ts_array_push" };
+            let _ = writeln!(s, "  {}({}, {});", push_fn, ctx.val(arr.0), ctx.val(src.0));
         }
         // up==0: plain break/continue (innermost). up>=1: labeled multi-level jump
         // -> goto the target loop's end (break) / top (continue) label. The Loop
@@ -22741,6 +22786,8 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         format!("({} == {})", ctx.val(x), t)
                     } else if let Some((x, lit, len)) = ctx.str_eq_operands(lhs.0, rhs.0) {
                         format!("ts_eq_strlit({}, {}, {}u)", ctx.val(x), lit, len)
+                    } else if let Some((x, n)) = ctx.num_eq_operands(lhs.0, rhs.0) {
+                        format!("ts_eq_num({}, {})", ctx.val(x), n)
                     } else {
                         format!("ts_strict_eq({}, {})", ctx.val(lhs.0), ctx.val(rhs.0))
                     }
@@ -22767,6 +22814,8 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         format!("({} != {})", ctx.val(x), t)
                     } else if let Some((x, lit, len)) = ctx.str_eq_operands(lhs.0, rhs.0) {
                         format!("(!ts_eq_strlit({}, {}, {}u))", ctx.val(x), lit, len)
+                    } else if let Some((x, n)) = ctx.num_eq_operands(lhs.0, rhs.0) {
+                        format!("(!ts_eq_num({}, {}))", ctx.val(x), n)
                     } else {
                         format!("(!ts_strict_eq({}, {}))", ctx.val(lhs.0), ctx.val(rhs.0))
                     }

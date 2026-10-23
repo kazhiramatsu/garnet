@@ -8844,3 +8844,22 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   into the runtime and the tag dispatch at the 521 boxed-key sites; a
   statically string-typed key could take an inline probe as the unboxed number
   key does (slice T).
+- Slice AA (emitter + runtime header, `docs/push_eq_inline_design.md`): two
+  call forms the tsc-ts build emits thousands of times went through
+  out-of-line calls whose common case is a few instructions. `arr.push(v)`
+  (2006 sites) was `ts_array_push` calling `ts_array_set`, two prologues per
+  push (2% of the emit phase in `ts_array_set` alone: the printer builds its
+  output by pushes); `ts_array_push_inline` stores into a plain array with
+  room in line and remembers it when old, everything else takes
+  `ts_array_push`. `x === n` with one unboxed side (680 sites: a boxed value,
+  a Map result or an optional number against a number) was `ts_strict_eq(v,
+  ts_num(d))`, boxing and the generic path; `ts_eq_num(v, d)` is a tag test
+  and a double compare (only a number is strictly equal to a number; NaN
+  differs from everything, -0 equals +0). Kernel `array_push_eq` 0.893 ->
+  0.685 G instructions (-23%), cycles flat (store-bound); tsc-ts one checker
+  24.18 -> 23.90 G (-1.2%), cycles flat, outputs identical. Fixtures
+  `arrays/push_fast_paths`, `numbers/eq_num`. Knobs `TSAOT_PUSH_INLINE`,
+  `TSAOT_EQ_NUM`. Found while writing the fixture, left for the next slice: a
+  push or element store that adds to a sealed or non-extensible array succeeds
+  (V8 throws TypeError), and a method call on an Array subclass instance
+  (`class Stack extends Array`) fails with "push is not a function".
