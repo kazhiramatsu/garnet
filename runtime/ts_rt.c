@@ -2470,14 +2470,7 @@ static void struct_field_set(ts_object* o, size_t off, int numeric, tsv v);
    as before the flags field existed. */
 #define TS_PROP_INDEX_MIN 8u
 
-static uint32_t prop_key_hash(ts_key key){
-  uint32_t x = key;
-  x ^= x >> 16;
-  x *= 0x7feb352du;
-  x ^= x >> 15;
-  x *= 0x846ca68bu;
-  return x ^ (x >> 16);
-}
+static uint32_t prop_key_hash(ts_key key){ return ts_prop_key_hash(key); }
 
 /* Hidden-class transition table. A shape identifies the ordered sequence of own
    property keys, so equal shapes have equal dense prop slots. Deletion switches
@@ -11262,15 +11255,13 @@ static ts_class_reg* class_reg_for(ts_object* o){
    prototype read, no hash of the prototype and no size test. Relinked
    instances (the word carries TS_CLS_RELINKED) and words outside the index
    take the prototype-keyed path. */
-typedef struct { uint32_t cls; ts_key key; uint32_t epoch; uint32_t offset; int found, numeric; } ts_class_word_cache_entry;
-#define TS_CLASS_WORD_CACHE_SIZE 1024u
-static ts_class_word_cache_entry g_class_word_cache[TS_CLASS_WORD_CACHE_SIZE];
+ts_class_word_cache_entry g_class_word_cache[TS_CLASS_WORD_CACHE_SIZE];
 static int class_field_lookup_by_proto(ts_object* o, ts_key key, size_t* off, int* numeric);
 static int class_field_lookup(ts_object* o, ts_key key, size_t* off, int* numeric){
   if (!o || !ts_obj_is_sized(o) || !g_class_reg_index_cap) return 0;
   uint32_t w = o->cls;
   if (TS_RT_LIKELY(w != 0u && !(w & TS_CLS_RELINKED) && w != TS_CLS_PROTO)){
-    uint32_t slot = ((w * 0x9E3779B1u) ^ prop_key_hash(key)) & (TS_CLASS_WORD_CACHE_SIZE - 1u);
+    uint32_t slot = ((w * 0x9E3779B1u) ^ ts_prop_key_hash(key)) & (TS_CLASS_WORD_CACHE_SIZE - 1u);
     ts_class_word_cache_entry* e = &g_class_word_cache[slot];
     if (e->cls == w && e->key == key && e->epoch == g_ts_class_layout_epoch){
       if (!e->found) return 0;

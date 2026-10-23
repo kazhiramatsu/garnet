@@ -2212,14 +2212,49 @@ TS_RT_ALWAYS_INLINE const ts_prop_ic_entry* ts_prop_ic_probe_sized_inline(
   }
   return NULL;
 }
+/* The registry's field cache by class word (ts_rt.c class_field_lookup; the
+   hash is prop_key_hash's), read in line at a megamorphic class-typed site
+   (docs/pic_sized_inline_design.md, "The megamorphic site in line"): a site
+   over many classes holds no useful entry of its own, and this table holds
+   one slot per class and key for the run. An entry is valid for the layout
+   epoch it was filled in. */
+typedef struct { uint32_t cls; ts_key key; uint32_t epoch; uint32_t offset; int found, numeric; } ts_class_word_cache_entry;
+#define TS_CLASS_WORD_CACHE_SIZE 1024u
+extern ts_class_word_cache_entry g_class_word_cache[TS_CLASS_WORD_CACHE_SIZE];
+extern uint32_t g_ts_class_layout_epoch;
+TS_RT_ALWAYS_INLINE uint32_t ts_prop_key_hash(ts_key key){
+  uint32_t x = key;
+  x ^= x >> 16;
+  x *= 0x7feb352du;
+  x ^= x >> 15;
+  x *= 0x846ca68bu;
+  return x ^ (x >> 16);
+}
+TS_RT_ALWAYS_INLINE const ts_class_word_cache_entry* ts_class_word_cache_probe(const ts_object* o, ts_key key){
+  if (!ts_obj_is_sized(o)) return NULL;
+  uint32_t w = o->cls;
+  if (w == 0u || (w & TS_CLS_RELINKED) || w == TS_CLS_PROTO) return NULL;
+  const ts_class_word_cache_entry* e = &g_class_word_cache[((w * 0x9E3779B1u) ^ ts_prop_key_hash(key)) & (TS_CLASS_WORD_CACHE_SIZE - 1u)];
+  if (e->cls != w || e->key != key || e->epoch != g_ts_class_layout_epoch || !e->found) return NULL;
+  return e;
+}
 /* A field access whose receiver the program types as a class instance while
    its class dispatches dynamically (docs/pic_sized_inline_design.md, "At a
    class-typed site"): such a receiver is never a shaped object, so the sized
    probe runs in line and the shaped probe not at all; a miss takes the
-   cached read or write (which fills the entry on its struct path). */
+   cached read or write (which fills the entry on its struct path). A
+   megamorphic site reads the registry's cache by class word instead. */
 TS_RT_ALWAYS_INLINE int ts_get_sized_pic_try(tsv obj, ts_key key, const ts_prop_ic* ic, tsv* out){
-  if (!ic || ic->megamorphic || TS_TOP16(obj) != TS_SEL_OBJECT) return 0;
+  if (!ic || TS_TOP16(obj) != TS_SEL_OBJECT) return 0;
   const ts_object* o = (const ts_object*)ts_ptr(obj);
+  if (ic->megamorphic){
+    const ts_class_word_cache_entry* c = ts_class_word_cache_probe(o, key);
+    if (!c) return 0;
+    const char* at = (const char*)o + c->offset;
+    if (c->numeric == 0){ memcpy(out, at, sizeof *out); return 1; }
+    if (c->numeric == 2){ long long n; memcpy(&n, at, sizeof n); *out = ts_num((double)n); return 1; }
+    double d; memcpy(&d, at, sizeof d); *out = ts_num(d); return 1;
+  }
   const ts_prop_ic_entry* e = ts_prop_ic_probe_sized_inline(o, key, ic);
   if (!e) return 0;
   const char* at = (const char*)o + (e->slot & TS_PIC_SLOT_MASK);
@@ -2243,8 +2278,16 @@ TS_RT_ALWAYS_INLINE tsv ts_get_sized_pic_inline_lazy(tsv obj, ts_key key, ts_pro
   return r;
 }
 TS_RT_ALWAYS_INLINE int ts_set_sized_pic_try(tsv obj, ts_key key, tsv value, ts_prop_ic* ic){
-  if (!ic || ic->megamorphic || TS_TOP16(obj) != TS_SEL_OBJECT) return 0;
+  if (!ic || TS_TOP16(obj) != TS_SEL_OBJECT) return 0;
   ts_object* o = (ts_object*)ts_ptr(obj);
+  if (ic->megamorphic){
+    const ts_class_word_cache_entry* c = ts_class_word_cache_probe(o, key);
+    if (!c || ts_obj_integrity(o) != 0u) return 0;
+    char* at = (char*)o + c->offset;
+    if (c->numeric == 0){ memcpy(at, &value, sizeof value); ts_write_barrier(obj, value); return 1; }
+    if (c->numeric == 1 && ts_is_num(value)){ double d = ts_to_num(value); memcpy(at, &d, sizeof d); return 1; }
+    return 0;
+  }
   const ts_prop_ic_entry* e = ts_prop_ic_probe_sized_inline(o, key, ic);
   if (!e || ts_obj_integrity(o) != 0u) return 0;
   char* at = (char*)o + (e->slot & TS_PIC_SLOT_MASK);

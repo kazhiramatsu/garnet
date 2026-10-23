@@ -9079,3 +9079,14 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   outputs identical to the typed build's; the typed one checker 23.62 -> 23.57
   G instructions (-0.2%, the dynamic calls the typed program keeps), cycles
   -0.3%, outputs identical.
+- Slice AO (runtime, the dynamic paths; `docs/pic_sized_inline_design.md` "The
+  megamorphic site in line"): a megamorphic class-typed site read its field
+  through the out-of-line entry and the registry's cache by class word, three
+  calls after the inline scan of its own four entries had missed. The inline
+  read and write now test the megamorphic flag first and probe the registry's
+  cache by class word in line (the table and the key hash moved to the header;
+  one multiply, one xor and a mask per probe), reading or writing the slot as
+  the out-of-line path would; a monomorphic site's first test is the same flag
+  as before. The all-dynamic compile of tsc-ts: 5.57 -> 5.45 s (-2%), outputs
+  identical to the typed build's; the typed one checker 23.55 -> 23.55 G
+  instructions, cycles and wall unchanged, outputs identical.

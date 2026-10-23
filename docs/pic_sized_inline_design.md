@@ -171,3 +171,28 @@ reads (the parity oracle's shape).
 | tsc-ts typed, one checker, instructions | 23.62 G | 23.57 G (-0.2%) |
 
 Outputs identical in both.
+
+## The megamorphic site in line (slice AO)
+
+After slice AN the all-dynamic compile's profile is the megamorphic field
+read itself: the registry's cache by class word (15% of samples), the
+out-of-line read in front of it (10%), and the inline probe's four-entry scan
+in the generated code before them (the one function visiting every node kind
+is 10% of samples with each of its hundreds of sites scanning and missing).
+A megamorphic class-typed site now reads the registry's cache by class word
+in line: the inline read and write test the site's megamorphic flag first
+(the flag the four-entry scan tested anyway) and probe the global table,
+whose slot for a class word and a constant key is one multiply, one xor and a
+mask; a hit reads or writes the slot as the out-of-line path would (a plain
+value, a double, or an integer slot read as a number; a write of a non-number
+to a numeric slot and a frozen receiver take the out-of-line path). The
+table and the key hash move to the header for that; the runtime's lookup
+keeps filling the table on a miss. A monomorphic site is unchanged: its
+first test is the same flag.
+
+| program | before | after |
+|---|---|---|
+| tsc-ts, every class dynamic, wall | 5.57 s | 5.45 s (-2%) |
+| tsc-ts typed, one checker, instructions | 23.55 G | 23.55 G |
+
+Outputs identical in both.
