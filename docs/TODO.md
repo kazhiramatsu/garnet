@@ -8821,3 +8821,26 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   4.07 G instructions (-44%), cycles -44%; tsc-ts one checker 24.61 -> 24.59 G
   (-0.1%, 85 loops hoisted; its scanner reads a `Uint16Array`), cycles -0.7%,
   outputs identical. Knob `TSAOT_STR_HOIST=0`.
+- Slice Z (runtime, Map lookups; `docs/map_entries_design.md`, "A lean lookup
+  path"): a symbol table's lookups (a `Map<string, T>` of identifiers probed
+  with keys of equal content built elsewhere,
+  `benchmarks/patterns/map_symbol_table.ts`) cost 250 instructions each
+  against scriptc's 80; the probe loop is eight instructions an iteration at
+  two probes, the cost was around it. `mapset_probe` inlined SameValueZero for
+  a candidate whose hash bits match but whose bits differ, which forced a
+  fourteen-register prologue and fifteen instructions of tag constants on
+  every call: the compare is out of line (`mapset_key_eq_slow`), and two flat
+  heap strings of one width compare by memcmp there instead of two view
+  materializations and ts_str_region_eq; `map_find` is inline; the hash of an
+  immediate string folds its bytes in line (`ts_str_hash_fast`, the same value
+  as strhash_view) instead of the generic per-unit view loop. Table layout,
+  hash values and iteration order unchanged. Kernels: `map_symbol_table` -24%
+  instructions (-22% with identical key objects, -24% with keys rebuilt flat),
+  `map_object_keys` (a `Map<Node, T>` and a `Set<Node>`) -21%. tsc-ts one
+  checker 24.50 -> 24.14 G instructions (-1.5%), cycles -1.0%, outputs
+  identical. Fixture `maps_sets/map_key_forms` (every string representation as
+  key and probe, deletes, mixed-kind keys, maps below and above the index
+  threshold). The remaining 2.4x gap to scriptc on string keys is the call
+  into the runtime and the tag dispatch at the 521 boxed-key sites; a
+  statically string-typed key could take an inline probe as the unboxed number
+  key does (slice T).

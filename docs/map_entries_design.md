@@ -116,3 +116,50 @@ and small maps' linear scans; the number keys take the fast path, which the
 histogram does not count. The statistics build now splits Map calls by key
 kind, the number fast path's outcomes, and linear against indexed finds
 (`map_keys:`).
+
+## A lean lookup path (session 352, slice Z)
+
+A symbol table's lookups, as a checker does them, cost 250 instructions each
+in garnet against 80 in scriptc (`benchmarks/patterns/map_symbol_table.ts`:
+a `Map<string, number>` of 20k identifiers probed with keys of equal content
+built elsewhere). The probe loop itself is eight instructions an iteration
+and the table averages two probes; the cost was around the loop:
+
+- `mapset_probe` inlined `same_value_zero` for the candidate whose hash bits
+  match but whose bits differ from the key's. That path forced a prologue
+  saving fourteen registers and some fifteen instructions of tag constants
+  before the loop, paid on every call, for a compare that runs once per hit at
+  most. The compare is out of line now (`mapset_key_eq_slow`), and the probe
+  loop keeps no spills.
+- The compare itself went through `ts_strict_eq` to two `ts_strview`
+  materializations and `ts_str_region_eq`. Two flat heap strings of one width
+  and equal length now compare by `memcmp` (after the cached hashes, when both
+  have one); a view, an immediate against a heap string, numbers and objects
+  take SameValueZero as before.
+- `map_find` was a call between `ts_map_get` and the probe; it is inline.
+- The hash of an immediate (short) string was computed through the generic
+  view loop, one `ts_str_cu_at_view` per unit. `ts_str_hash_fast` folds the
+  immediate's bytes in line, the same value as `strhash_view` (a one-byte
+  unit's two FNV-1a steps are one multiply by the prime's square), returns a
+  hashed heap string's cached hash, and leaves the rest to `ts_str_hash_of`,
+  which computes and caches.
+
+Nothing about the table changes: the slot words, the dense arrays, the
+maintenance rule and the hash values are as before, so the index of an existing
+collection is still valid and iteration order is untouched.
+
+| kernel | instructions | cycles |
+|---|---|---|
+| `map_symbol_table` (equal content, distinct objects) | -24% | -23% |
+| `map_symbol_table`, keys rebuilt flat | -24% | -16% |
+| `map_symbol_table`, the identical key objects | -22% | -22% |
+| `map_object_keys` (a `Map<Node, T>` and a `Set<Node>`) | -21% | -21% |
+
+Outputs identical in all four. tsc-ts one checker (the regular LTO build,
+four pairs): 24.50 -> 24.14 G instructions (-1.5%), cycles -1.0%, wall 1.28 ->
+1.27 s, outputs identical. (The same unit objects relinked without LTO against
+the two runtimes agreed: -1.4%.)
+The remaining gap to scriptc on string keys (about 2.4x) is the call into the
+runtime and the generic tag dispatch at every site; a statically string-typed
+key could take an inline probe as the unboxed number key does (slice T), a
+possible later slice.

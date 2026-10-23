@@ -4088,6 +4088,20 @@ uint32_t ts_str_switch_hash(tsv v, uint32_t none){
   if (!ts_is_str(v)) return none;
   return ts_str_hash_of(v);
 }
+/* The hash a collection asks for: an immediate's bytes folded in line (the
+   same value as strhash_view: a one-byte unit's two FNV-1a steps are one
+   multiply by the prime's square), a hashed heap string's cached hash, and
+   the general entry (which computes and caches) for the rest. */
+TS_RT_ALWAYS_INLINE uint32_t ts_str_hash_fast(tsv s){
+  if (ts_is_short_str(s)){
+    uint32_t len = ts_short_str_len(s), h = 2166136261u;
+    for (uint32_t i = 0; i < len; i++) h = (h ^ ts_short_str_byte(s, i)) * 637696617u;
+    return h;
+  }
+  const ts_string* x = ts_str_ptr_typed(s);
+  if (TS_RT_LIKELY(x->flags & TS_STR_FLAG_HASHED)) return x->hash;
+  return ts_str_hash_of(s);
+}
 /* The storage flags of a fresh string: UTF16 as allocated, ASCII when every
    unit is below 0x80. Not HASHED: the hash is computed by ts_str_hash_of when
    a map, an intern or an equality first asks for it, and cached then (most
@@ -7598,7 +7612,7 @@ TS_RT_ALWAYS_INLINE uint32_t sv0_hash(tsv k){
   if (ts_is_num(k)){
     return sv0_hash_num(k);
   } else if (ts_is_str(k)){
-    return ts_str_hash_of(k);
+    return ts_str_hash_fast(k);
   } else if (ts_heap_ref(k)){
     /* identity: the cell's address (cells never move); the high half of
        the product mixes every address bit into the index bits */
@@ -7624,6 +7638,23 @@ TS_RT_ALWAYS_INLINE uint32_t sv0_hash(tsv k){
    slot. Miss: returns -1, *slot_out = preferred insertion slot (first
    tombstone on the probe path, else the terminating empty). The maintenance
    rule keeps at least a quarter of the slots empty, so the walk terminates. */
+/* A candidate whose hash bits match but whose bits differ from the key's:
+   two flat strings of one width compare by memcmp; everything else (a view,
+   an immediate against a heap string, two numbers, objects) takes
+   SameValueZero. Out of line so the probe loop keeps no spills for it. */
+__attribute__((noinline)) static int mapset_key_eq_slow(tsv key, tsv k){
+  if (ts_is_heap_str(key) && ts_is_heap_str(k)){
+    const ts_string* a = ts_str_ptr_typed(key); const ts_string* b = ts_str_ptr_typed(k);
+    if (a->len != b->len) return 0;
+    uint32_t fa = a->flags, fb = b->flags;
+    if ((fa & fb & TS_STR_FLAG_HASHED) && a->hash != b->hash) return 0;
+    if (!((fa | fb) & TS_STR_FLAG_VIEW) && ((fa ^ fb) & TS_STR_FLAG_UTF16) == 0){
+      size_t bytes = (fa & TS_STR_FLAG_UTF16) ? (size_t)a->len * 2u : (size_t)a->len;
+      return memcmp(a->data, b->data, bytes) == 0;
+    }
+  }
+  return same_value_zero(key, k);
+}
 static inline long mapset_probe(const uint32_t* index, uint32_t index_cap, const tsv* keys,
                                 tsv k, uint32_t h, uint32_t* slot_out){
   uint32_t mask = index_cap - 1u;
@@ -7643,7 +7674,7 @@ static inline long mapset_probe(const uint32_t* index, uint32_t index_cap, const
     } else if (((w ^ h) & ~mask) == 0u){
       uint32_t di = (w & mask) - 2u;
       tsv key = keys[di];
-      if (key == k || same_value_zero(key, k)){   /* identical bits are SameValueZero */
+      if (key == k || mapset_key_eq_slow(key, k)){   /* identical bits are SameValueZero */
         if (slot_out) *slot_out = slot;
         RT_STAT_ADD(map_find_probes, probes); RT_STAT_HIST(map_find_hist, probes);
         return (long)di;
@@ -7708,7 +7739,7 @@ static void mapset_index_maintain(const ts_gc_header* owner, tsv* keys, uint32_t
 
 /* find key index in a map, or -1 (holes never match: probe skips them by
    slot state, and the linear fallback compares the sentinel bit-exactly first) */
-static long map_find(ts_map* m, tsv k){
+static inline long map_find(ts_map* m, tsv k){
   RT_STAT_INC(map_find_calls);
   uint32_t h = sv0_hash(k);
   if (m->index){ RT_STAT_INC(map_indexed); return mapset_probe(m->index, m->index_cap, m->keys, k, h, NULL); }
