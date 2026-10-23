@@ -296,6 +296,21 @@ So: fix the documents and the accessor (done with this revision), then 2,
 with 1 as the standing track alongside, and a second benchmark project for
 parallel efficiency.
 
+## Measured: the fork prototype
+
+The `fork` prototype (`docs/fork_workers_design.md`, F1-F3, Session 352)
+ran tsc-ts's shared path with forked checkers, parsing serial: at four
+checkers 1.06 s (1.73x), flat from three on, outputs identical at every
+count, 1.37 GB across the processes. The critical path measured as
+predicted in shape and larger in size: `checker.ts` on a child takes
+420 ms to check (1.93x scriptc's 217 ms; 328 ms when one sibling runs) and
+248 ms to emit (1.56x). With parallel parsing the B-shaped time would be
+about 0.83 s against the projected 0.71 s; the difference is the critical
+path under concurrency. The children's total CPU exceeds one thread's by
+35% (scriptc: 13%). Both are runtime matters to measure next (memory
+traffic, page copies, the young-only collections); the single-thread gap on
+the largest file remains the largest term.
+
 ## Review summary
 
 Findings of the independent review, in the order they changed this

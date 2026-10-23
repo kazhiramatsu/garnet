@@ -29,6 +29,17 @@ export interface GarnetHost {
   utf8Length(text: string): number;
   /** The string's UTF-16LE code units into the view from `offset`, whole units while they fit: the bytes written. */
   writeUtf16le(text: string, view: Uint8Array, offset: number): number;
+  /** Workers by fork (docs/fork_workers_design.md): the entry a forked child runs with its data. */
+  setWorkerEntry(entry: (data: unknown) => void): void;
+  /** Forks a worker that runs the entry with `data` (the same objects): its id. */
+  forkWorker(data: unknown): number;
+  onWorkerMessage(id: number, listener: (value: unknown) => void): void;
+  onWorkerError(id: number, listener: (error: unknown) => void): void;
+  isWorker(): boolean;
+  workerData(): unknown;
+  /** In a worker: a message to the parent (plain data; anything else throws). */
+  postMessage(value: unknown): void;
+  cpus(): number;
   readonly platform: string;
 }
 export const host = (globalThis as unknown as { __garnetHost: GarnetHost }).__garnetHost;

@@ -1069,6 +1069,17 @@ static inline int ts_is_array_buffer(tsv v){
   return ts_is_obj(v) && ((ts_gc_header*)ts_ptr(v))->kind == TS_KIND_ARRAYBUFFER;
 }
 tsv  ts_new_typed_array(int elem, tsv* args, int n);
+tsv  ts_new_shared_array_buffer(uint32_t n);   /* a store in shared memory */
+/* Workers by fork (docs/fork_workers_design.md): the entry a child runs with
+   its workerData, a worker's handlers, the child's postMessage. */
+void ts_worker_set_entry(tsv fn);
+int  ts_worker_fork(tsv data);                 /* the worker's id; the child never returns */
+void ts_worker_on_message(int id, tsv fn);
+void ts_worker_on_error(int id, tsv fn);
+int  ts_worker_is_worker(void);
+tsv  ts_worker_data(void);
+void ts_worker_post(tsv value);
+tsv  ts_message_roundtrip(tsv v);              /* the codec on one value (tests) */
 tsv  ts_new_array_buffer(tsv length, int shared);
 tsv  ts_typed_array_from(int elem, tsv src, tsv mapfn, tsv this_arg);
 tsv  ts_typed_array_of(int elem, tsv* items, int n);

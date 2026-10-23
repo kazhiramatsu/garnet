@@ -91,6 +91,7 @@ static inline void gc_note_payload(size_t bytes){ g_payload_fresh_bytes += bytes
    every payload mark before marking. Pointers outside the cage (a stack
    closure's borrowed environment) are not payloads and are ignored. */
 #include <sys/mman.h>
+static size_t sab_mapped_bytes(uint32_t n);   /* a SharedArrayBuffer's pages (typed arrays) */
 #if defined(TS_ASAN_ENABLED)
 extern void __asan_poison_memory_region(const void *addr, size_t size);
 #define GC_PAYLOAD_POISON(p, n)   __asan_poison_memory_region((p), (n))
@@ -5456,7 +5457,8 @@ static void gc_free_cell_payload(ts_gc_header* h){
   }
   else if (h->kind==TS_KIND_ARRAYBUFFER){
     ts_arraybuffer* ab=(ts_arraybuffer*)h;
-    free(ab->bytes); ab->bytes = NULL; props_release_dead(&ab->o);
+    if (ab->shared) munmap(ab->bytes, sab_mapped_bytes(ab->byte_length)); else free(ab->bytes);
+    ab->bytes = NULL; props_release_dead(&ab->o);
   }
   else if (h->kind==TS_KIND_TYPEDARRAY){ props_release_dead(&((ts_typedarray*)h)->o); }
   else if (h->kind==TS_KIND_PROMISE){ free(((ts_promise*)h)->waiters); }
@@ -13309,6 +13311,11 @@ void ts_ta_set(tsv v, uint32_t i, tsv x){
   ts_typedarray* t = ta_ptr(v);
   if (i < t->length) ta_store(t, i, d);
 }
+/* The pages of a shared store of n bytes (mmap's unit). */
+static size_t sab_mapped_bytes(uint32_t n){
+  size_t page = (size_t)sysconf(_SC_PAGESIZE), len = n ? n : 1;
+  return (len + page - 1) / page * page;
+}
 /* The new cells. */
 /* V8's RangeErrors name the offending number. */
 static void ta_range_error_num(const char* fmt, double d){
@@ -13322,8 +13329,17 @@ static tsv ta_new_buffer(double length, int shared){
     ts_throw_range_error_msg("Array buffer allocation failed");
   ta_protos_init();
   uint32_t n = (uint32_t)length;
-  uint8_t* bytes = (uint8_t*)calloc(n ? n : 1, 1);
-  if (!bytes) ts_throw_range_error_msg("Array buffer allocation failed");
+  uint8_t* bytes;
+  if (shared){
+    /* A SharedArrayBuffer's store is shared memory (docs/fork_workers_design.md,
+       F1): a child process forked after its creation writes the same pages. */
+    void* m = mmap(NULL, sab_mapped_bytes(n), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
+    if (m == MAP_FAILED) ts_throw_range_error_msg("Array buffer allocation failed");
+    bytes = (uint8_t*)m;
+  } else {
+    bytes = (uint8_t*)calloc(n ? n : 1, 1);
+    if (!bytes) ts_throw_range_error_msg("Array buffer allocation failed");
+  }
   /* The bytes pace the collections like the cells: short-lived buffers are
      reclaimed by the young collections their bytes trigger, long-lived ones
      count toward the next full collection. */
@@ -13336,6 +13352,8 @@ static tsv ta_new_buffer(double length, int shared){
   obj_link_fresh_proto(bv, shared ? g_sab_proto : g_arraybuffer_proto);
   return bv;
 }
+/* A SharedArrayBuffer of n bytes (the runtime's tests, the host). */
+tsv ts_new_shared_array_buffer(uint32_t n){ return ta_new_buffer((double)n, 1); }
 static tsv ta_new_view(int elem, tsv buffer, uint32_t byte_offset, uint32_t length){
   ts_gc_root(&buffer);
   ta_protos_init();
@@ -13975,12 +13993,72 @@ static tsv atomics_require(tsv ta){
   if (!ts_is_typed_array(ta) || !atomics_integer_elem(ta_ptr(ta)->elem)) atomics_view_error(ta, "an integer");
   return ta;
 }
+/* The element operations are sequentially consistent atomics on the
+   element's bytes (docs/fork_workers_design.md, F1): a schedule in a
+   SharedArrayBuffer driven from several processes or threads behaves as
+   the specification says. The integer kinds are 1, 2 and 4 bytes wide
+   (views are aligned to their element); a value's bits are its element
+   conversion (ToInt32's low bits), as ts_ta_elem_store writes them. */
+static uint32_t atomics_bits_of(double d){ return (uint32_t)ts_to_int32(d); }
+static double atomics_num_of_bits(uint32_t bits, int elem){
+  switch (elem){
+    case TS_TA_INT8: return (double)(int8_t)(uint8_t)bits;
+    case TS_TA_UINT8: return (double)(uint8_t)bits;
+    case TS_TA_INT16: return (double)(int16_t)(uint16_t)bits;
+    case TS_TA_UINT16: return (double)(uint16_t)bits;
+    case TS_TA_INT32: return (double)(int32_t)bits;
+    default: return (double)bits;
+  }
+}
+#define ATOMICS_ELEM(t, i, width) ((uint##width##_t*)((t)->data + (size_t)(i) * (width / 8)))
+static uint32_t atomics_load_bits(const ts_typedarray* t, uint32_t i){
+  switch (g_ta_size[t->elem]){
+    case 1: return __atomic_load_n(ATOMICS_ELEM(t, i, 8), __ATOMIC_SEQ_CST);
+    case 2: return __atomic_load_n(ATOMICS_ELEM(t, i, 16), __ATOMIC_SEQ_CST);
+    default: return __atomic_load_n(ATOMICS_ELEM(t, i, 32), __ATOMIC_SEQ_CST);
+  }
+}
+static void atomics_store_bits(ts_typedarray* t, uint32_t i, uint32_t bits){
+  switch (g_ta_size[t->elem]){
+    case 1: __atomic_store_n(ATOMICS_ELEM(t, i, 8), (uint8_t)bits, __ATOMIC_SEQ_CST); break;
+    case 2: __atomic_store_n(ATOMICS_ELEM(t, i, 16), (uint16_t)bits, __ATOMIC_SEQ_CST); break;
+    default: __atomic_store_n(ATOMICS_ELEM(t, i, 32), bits, __ATOMIC_SEQ_CST); break;
+  }
+}
+/* op: 0 add, 1 sub, 2 and, 3 or, 4 xor, 5 exchange; the old bits */
+#define ATOMICS_RMW_CASES(ptr, b) \
+  switch (op){ \
+    case 0: return __atomic_fetch_add(ptr, b, __ATOMIC_SEQ_CST); \
+    case 1: return __atomic_fetch_sub(ptr, b, __ATOMIC_SEQ_CST); \
+    case 2: return __atomic_fetch_and(ptr, b, __ATOMIC_SEQ_CST); \
+    case 3: return __atomic_fetch_or(ptr, b, __ATOMIC_SEQ_CST); \
+    case 4: return __atomic_fetch_xor(ptr, b, __ATOMIC_SEQ_CST); \
+    default: return __atomic_exchange_n(ptr, b, __ATOMIC_SEQ_CST); \
+  }
+static uint32_t atomics_rmw_bits(int op, ts_typedarray* t, uint32_t i, uint32_t bits){
+  switch (g_ta_size[t->elem]){
+    case 1: ATOMICS_RMW_CASES(ATOMICS_ELEM(t, i, 8), (uint8_t)bits)
+    case 2: ATOMICS_RMW_CASES(ATOMICS_ELEM(t, i, 16), (uint16_t)bits)
+    default: ATOMICS_RMW_CASES(ATOMICS_ELEM(t, i, 32), bits)
+  }
+}
+#undef ATOMICS_RMW_CASES
+/* the element's bits before the operation, replaced when they were the expected ones */
+static uint32_t atomics_cas_bits(ts_typedarray* t, uint32_t i, uint32_t expected, uint32_t replacement){
+  switch (g_ta_size[t->elem]){
+    case 1: { uint8_t e = (uint8_t)expected; __atomic_compare_exchange_n(ATOMICS_ELEM(t, i, 8), &e, (uint8_t)replacement, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); return e; }
+    case 2: { uint16_t e = (uint16_t)expected; __atomic_compare_exchange_n(ATOMICS_ELEM(t, i, 16), &e, (uint16_t)replacement, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); return e; }
+    default: { uint32_t e = expected; __atomic_compare_exchange_n(ATOMICS_ELEM(t, i, 32), &e, replacement, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); return e; }
+  }
+}
+#undef ATOMICS_ELEM
 tsv ts_atomics_load(tsv ta, tsv index){
   ts_gc_root(&ta);
   atomics_require(ta);
   uint32_t i = atomics_index(ta, index);
   ts_gc_unroot(1);
-  return ts_num(ta_load(ta_ptr(ta), i));
+  ts_typedarray* t = ta_ptr(ta);
+  return ts_num(atomics_num_of_bits(atomics_load_bits(t, i), t->elem));
 }
 tsv ts_atomics_store(tsv ta, tsv index, tsv value){
   ts_gc_root(&ta);
@@ -13988,7 +14066,7 @@ tsv ts_atomics_store(tsv ta, tsv index, tsv value){
   uint32_t i = atomics_index(ta, index);
   double v = atomics_operand(value);
   ts_gc_unroot(1);
-  ta_store(ta_ptr(ta), i, v);
+  atomics_store_bits(ta_ptr(ta), i, atomics_bits_of(v));
   return ts_num(v);
 }
 /* op: 0 add, 1 sub, 2 and, 3 or, 4 xor, 5 exchange */
@@ -13999,18 +14077,7 @@ tsv ts_atomics_rmw(int op, tsv ta, tsv index, tsv value){
   double v = atomics_operand(value);
   ts_gc_unroot(1);
   ts_typedarray* t = ta_ptr(ta);
-  double old = ta_load(t, i);
-  uint32_t a = ts_to_uint32(old), b = ts_to_uint32(v), r;
-  switch (op){
-    case 0: r = a + b; break;
-    case 1: r = a - b; break;
-    case 2: r = a & b; break;
-    case 3: r = a | b; break;
-    case 4: r = a ^ b; break;
-    default: r = b; break;
-  }
-  ta_store(t, i, (double)r);   /* the element conversion keeps the low bits */
-  return ts_num(old);
+  return ts_num(atomics_num_of_bits(atomics_rmw_bits(op, t, i, atomics_bits_of(v)), t->elem));
 }
 tsv ts_atomics_compare_exchange(tsv ta, tsv index, tsv expected, tsv replacement){
   ts_gc_root(&ta); ts_gc_root(&replacement);
@@ -14020,13 +14087,7 @@ tsv ts_atomics_compare_exchange(tsv ta, tsv index, tsv expected, tsv replacement
   double r = atomics_operand(replacement);
   ts_gc_unroot(2);
   ts_typedarray* t = ta_ptr(ta);
-  double old = ta_load(t, i);
-  /* compare the element's bytes with the expected value converted to the
-     element type */
-  uint8_t probe[8];
-  ts_ta_elem_store(probe, 0, e, t->elem);
-  if (memcmp(probe, t->data + (size_t)i * g_ta_size[t->elem], g_ta_size[t->elem]) == 0) ta_store(t, i, r);
-  return ts_num(old);
+  return ts_num(atomics_num_of_bits(atomics_cas_bits(t, i, atomics_bits_of(e), atomics_bits_of(r)), t->elem));
 }
 tsv ts_atomics_is_lock_free(tsv n){
   double d = atomics_operand(n);
@@ -17296,14 +17357,371 @@ static void drain_microtasks(void){
   g_mq_len=0;
 }
 
+
+/* ---------------- Workers by fork (docs/fork_workers_design.md, F2) ----------------
+   The main process forks its workers: a child sees the parent's heap by
+   copy-on-write and shares the SharedArrayBuffer stores (F1). Messages cross
+   a pipe per worker as frames of the codec below, which carries plain data
+   only (undefined, null, booleans, numbers, strings, arrays, plain objects,
+   typed arrays, with aliases and cycles); a value it cannot carry throws a
+   TypeError naming it, so nothing arrives silently changed. The parent's
+   event loop polls the pipes and delivers each frame to the worker's
+   message handler; end of file reaps the child, and a child that died or
+   exited nonzero is reported to the error handler. */
+#include <errno.h>
+#include <poll.h>
+#include <sys/wait.h>
+
+enum { MSG_UNDEF = 0, MSG_NULL, MSG_FALSE, MSG_TRUE, MSG_NUM, MSG_STR8, MSG_STR16, MSG_ARRAY, MSG_OBJECT, MSG_TYPED, MSG_REF };
+
+typedef struct { uint8_t* p; size_t len, cap; const void** seen; size_t nseen, cseen; } msg_enc;
+
+static void msg_put(msg_enc* e, const void* src, size_t n){
+  if (e->len + n > e->cap){
+    size_t c = e->cap ? e->cap * 2 : 256;
+    while (c < e->len + n) c *= 2;
+    uint8_t* q = (uint8_t*)realloc(e->p, c);
+    if (!q) ts_abort_msg("out of memory encoding a worker message");
+    e->p = q; e->cap = c;
+  }
+  memcpy(e->p + e->len, src, n); e->len += n;
+}
+static void msg_put_u8(msg_enc* e, uint8_t v){ msg_put(e, &v, 1); }
+static void msg_put_u32(msg_enc* e, uint32_t v){ msg_put(e, &v, 4); }
+/* a cell met before: its index; otherwise -1, the cell recorded (messages are
+   small: tsc-ts's packed results; a linear table) */
+static long msg_seen(msg_enc* e, const void* cell){
+  for (size_t i = 0; i < e->nseen; i++) if (e->seen[i] == cell) return (long)i;
+  if (e->nseen == e->cseen){
+    size_t c = e->cseen ? e->cseen * 2 : 64;
+    const void** q = (const void**)realloc((void*)e->seen, c * sizeof *q);
+    if (!q) ts_abort_msg("out of memory encoding a worker message");
+    e->seen = q; e->cseen = c;
+  }
+  e->seen[e->nseen++] = cell;
+  return -1;
+}
+static void msg_fail(const char* what){
+  char buf[200];
+  snprintf(buf, sizeof buf, "Cannot post %s: a worker message carries plain data only", what);
+  ts_throw_type_error_msg(buf);
+}
+static void msg_encode(msg_enc* e, tsv v);
+typedef struct { msg_enc* e; uint32_t count; } msg_obj_ctx;
+static void msg_encode_prop(uint32_t key, tsv val, void* ud){
+  msg_obj_ctx* c = (msg_obj_ctx*)ud;
+  const char* n = ts_field_name(key);
+  uint32_t len = ts_field_name_len(key);
+  if (key >= TS_METHOD_KEY_BASE || !n) return;              /* symbol and method keys are not own string names */
+  if (len >= 2 && n[0] == '_' && n[1] == '_') return;       /* the runtime's internal slots */
+  if (ts_is_obj(val) && ((ts_gc_header*)ts_ptr(val))->kind == TS_KIND_ACCESSOR) msg_fail("an accessor property");
+  msg_put_u32(c->e, len); msg_put(c->e, n, len);
+  msg_encode(c->e, val);
+  c->count++;
+}
+static void msg_encode(msg_enc* e, tsv v){
+  if (ts_is_undef(v)){ msg_put_u8(e, MSG_UNDEF); return; }
+  if (ts_is_null(v)){ msg_put_u8(e, MSG_NULL); return; }
+  if (ts_is_bool(v)){ msg_put_u8(e, ts_truthy(v) ? MSG_TRUE : MSG_FALSE); return; }
+  if (ts_is_num(v)){ double d = ts_to_num(v); msg_put_u8(e, MSG_NUM); msg_put(e, &d, 8); return; }
+  if (ts_is_str(v)){
+    ts_strview sv = ts_str_view_typed(v);
+    int wide = (sv.flags & TS_STR_FLAG_UTF16) != 0;
+    msg_put_u8(e, wide ? MSG_STR16 : MSG_STR8); msg_put_u32(e, sv.len);
+    for (uint32_t i = 0; i < sv.len; i++){
+      uint32_t cu = ts_str_cu_at_view(sv, i);
+      if (wide){ uint16_t u = (uint16_t)cu; msg_put(e, &u, 2); } else { uint8_t b = (uint8_t)cu; msg_put(e, &b, 1); }
+    }
+    return;
+  }
+  if (!ts_is_obj(v)) msg_fail("a value of an unknown kind");
+  ts_gc_header* h = (ts_gc_header*)ts_ptr(v);
+  long ref = msg_seen(e, h);
+  if (ref >= 0){ msg_put_u8(e, MSG_REF); msg_put_u32(e, (uint32_t)ref); return; }
+  switch (h->kind){
+    case TS_KIND_ARRAY: {
+      if (!ts_is_indexed_array_fast(v)) msg_fail("a sparse array");
+      uint32_t n = ts_array_len(v);
+      msg_put_u8(e, MSG_ARRAY); msg_put_u32(e, n);
+      for (uint32_t i = 0; i < n; i++) msg_encode(e, ts_array_get(v, i));   /* a hole travels as undefined */
+      return;
+    }
+    case TS_KIND_TYPEDARRAY: {
+      ts_typedarray* t = (ts_typedarray*)h;
+      msg_put_u8(e, MSG_TYPED); msg_put_u8(e, t->elem); msg_put_u32(e, t->length);
+      msg_put(e, t->data, (size_t)t->length * g_ta_size[t->elem]);
+      return;
+    }
+    case TS_KIND_OBJECT: {
+      ts_obj_common* o = (ts_obj_common*)h;
+      if ((h->flags & (TS_HDR_SIZED | TS_HDR_SIDECAR)) || o->cls || o->proto != g_object_proto_v)
+        msg_fail("an object that is not a plain object (a class instance, or one with another prototype)");
+      msg_put_u8(e, MSG_OBJECT);
+      size_t count_at = e->len; msg_put_u32(e, 0);
+      msg_obj_ctx c = { e, 0 };
+      ts_prop_own_enum(v, msg_encode_prop, &c);
+      memcpy(e->p + count_at, &c.count, 4);
+      return;
+    }
+    case TS_KIND_FUNC: msg_fail("a function"); return;
+    case TS_KIND_SYMBOL: msg_fail("a symbol"); return;
+    case TS_KIND_MAP: msg_fail("a Map"); return;
+    case TS_KIND_SET: msg_fail("a Set"); return;
+    case TS_KIND_ARRAYBUFFER: msg_fail("an ArrayBuffer (post a view on it)"); return;
+    case TS_KIND_PROMISE: msg_fail("a Promise"); return;
+    default: msg_fail("an object of this kind"); return;
+  }
+}
+
+typedef struct { const uint8_t* p; size_t len, pos; tsv table; } msg_dec;   /* table: the cells decoded so far, a rooted array */
+static void msg_bad(void){ ts_abort_msg("a malformed worker message"); }
+static void msg_get(msg_dec* d, void* dst, size_t n){ if (d->pos + n > d->len) msg_bad(); memcpy(dst, d->p + d->pos, n); d->pos += n; }
+static uint8_t msg_get_u8(msg_dec* d){ uint8_t v; msg_get(d, &v, 1); return v; }
+static uint32_t msg_get_u32(msg_dec* d){ uint32_t v; msg_get(d, &v, 4); return v; }
+/* the canonical representation: ASCII through ts_new_string (short strings
+   are immediates), Latin-1 as 8-bit storage, the rest 16-bit */
+static tsv msg_decode_string(msg_dec* d, int wide){
+  uint32_t n = msg_get_u32(d);
+  size_t width = wide ? 2u : 1u;
+  if (d->pos + (size_t)n * width > d->len) msg_bad();
+  const uint8_t* q = d->p + d->pos; d->pos += (size_t)n * width;
+  uint32_t max = 0;
+  for (uint32_t i = 0; i < n; i++){ uint32_t cu = wide ? (uint32_t)(q[2 * i] | (q[2 * i + 1] << 8)) : q[i]; if (cu > max) max = cu; }
+  if (max < 0x80u && !wide) return ts_new_string((const char*)q, n);
+  if (max < 0x80u){ char* a = (char*)malloc(n ? n : 1); for (uint32_t i = 0; i < n; i++) a[i] = (char)q[2 * i]; tsv r = ts_new_string(a, n); free(a); return r; }
+  uint32_t flags = max <= 0xFFu ? 0u : TS_STR_FLAG_UTF16;
+  ts_string* str = ts_string_alloc_storage(n, flags);
+  for (uint32_t i = 0; i < n; i++){
+    uint32_t cu = wide ? (uint32_t)(q[2 * i] | (q[2 * i + 1] << 8)) : q[i];
+    if (flags) ts_str_cu_set(str->data, flags, i, (uint16_t)cu); else str->data[i] = (char)cu;
+  }
+  str->flags = strflags_storage(str->data, flags, n);
+  str->hash = strhash_units(str->data, str->flags, n);
+  return ts_str_v(str);
+}
+static tsv msg_decode(msg_dec* d){
+  uint8_t tag = msg_get_u8(d);
+  switch (tag){
+    case MSG_UNDEF: return TS_UNDEFINED;
+    case MSG_NULL: return TS_NULL;
+    case MSG_FALSE: return ts_bool(0);
+    case MSG_TRUE: return ts_bool(1);
+    case MSG_NUM: { double x; msg_get(d, &x, 8); return ts_num(x); }
+    case MSG_STR8: return msg_decode_string(d, 0);
+    case MSG_STR16: return msg_decode_string(d, 1);
+    case MSG_REF: { uint32_t i = msg_get_u32(d); if (i >= ts_array_len(d->table)) msg_bad(); return ts_array_get(d->table, i); }
+    case MSG_ARRAY: {
+      uint32_t n = msg_get_u32(d);
+      tsv arr = ts_new_array(0); ts_array_push(d->table, arr);   /* the table roots it */
+      for (uint32_t i = 0; i < n; i++){ tsv x = msg_decode(d); ts_gc_root(&x); ts_array_push(arr, x); ts_gc_unroot(1); }
+      return arr;
+    }
+    case MSG_OBJECT: {
+      uint32_t n = msg_get_u32(d);
+      tsv obj = ts_new_object(); ts_array_push(d->table, obj);
+      for (uint32_t i = 0; i < n; i++){
+        uint32_t len = msg_get_u32(d);
+        if (d->pos + len > d->len) msg_bad();
+        uint32_t key = ts_intern_field((const char*)d->p + d->pos, len); d->pos += len;
+        tsv x = msg_decode(d); ts_gc_root(&x); ts_set(obj, key, x); ts_gc_unroot(1);
+      }
+      return obj;
+    }
+    case MSG_TYPED: {
+      int elem = msg_get_u8(d);
+      if (elem >= TS_TA_COUNT) msg_bad();
+      uint32_t n = msg_get_u32(d);
+      size_t bytes = (size_t)n * g_ta_size[elem];
+      if (d->pos + bytes > d->len) msg_bad();
+      tsv buf = ta_new_buffer((double)bytes, 0); ts_gc_root(&buf);
+      memcpy(((ts_arraybuffer*)ts_ptr(buf))->bytes, d->p + d->pos, bytes); d->pos += bytes;
+      tsv view = ta_new_view(elem, buf, 0, n); ts_gc_unroot(1);
+      ts_array_push(d->table, view);
+      return view;
+    }
+    default: msg_bad(); return TS_UNDEFINED;
+  }
+}
+static tsv msg_decode_frame(const uint8_t* p, size_t n){
+  msg_dec d = { p, n, 0, TS_UNDEFINED };
+  d.table = ts_new_array(0); ts_gc_root(&d.table);
+  tsv v = msg_decode(&d);
+  ts_gc_unroot(1);
+  return v;
+}
+/* the codec on one value, for the runtime's tests */
+tsv ts_message_roundtrip(tsv v){
+  ts_gc_root(&v);
+  msg_enc e; memset(&e, 0, sizeof e);
+  msg_encode(&e, v);
+  tsv r = msg_decode_frame(e.p, e.len);
+  free(e.p); free((void*)e.seen);
+  ts_gc_unroot(1);
+  return r;
+}
+
+typedef struct ts_watch { int id; pid_t pid; int fd; uint8_t* buf; size_t len, cap; int messages; struct ts_watch* next; } ts_watch;
+static ts_watch* g_watches = NULL;
+static int g_watch_ids = 0;
+static tsv g_watch_handlers = TS_UNDEFINED;     /* [2 id] the message handler, [2 id + 1] the error handler */
+static int g_watch_handlers_rooted = 0;
+static tsv g_worker_entry = TS_UNDEFINED, g_worker_data = TS_UNDEFINED;
+static int g_worker_entry_rooted = 0, g_worker_data_rooted = 0;
+static int g_is_worker = 0, g_worker_fd = -1;
+static msg_enc g_post_enc;                       /* the child's frame buffer, reused across posts */
+
+static tsv watch_handlers(void){
+  if (ts_is_undef(g_watch_handlers)){ g_watch_handlers = ts_new_array(0); ts_root_static_once(&g_watch_handlers, &g_watch_handlers_rooted); }
+  return g_watch_handlers;
+}
+void ts_worker_set_entry(tsv fn){ g_worker_entry = fn; ts_root_static_once(&g_worker_entry, &g_worker_entry_rooted); }
+int ts_worker_is_worker(void){ return g_is_worker; }
+tsv ts_worker_data(void){ return g_worker_data; }
+void ts_worker_on_message(int id, tsv fn){ ts_array_set(watch_handlers(), (uint32_t)id * 2u, fn); }
+void ts_worker_on_error(int id, tsv fn){ ts_array_set(watch_handlers(), (uint32_t)id * 2u + 1u, fn); }
+static void msg_write_all(int fd, const void* p, size_t n){
+  const uint8_t* q = (const uint8_t*)p;
+  while (n){
+    ssize_t w = write(fd, q, n);
+    if (w < 0){ if (errno == EINTR) continue; ts_abort_msg("a worker could not write its message"); }
+    q += w; n -= (size_t)w;
+  }
+}
+/* the child's postMessage: one frame, a 4-byte length and the codec's bytes */
+void ts_worker_post(tsv value){
+  if (!g_is_worker) ts_throw_type_error_msg("postMessage: this is the main thread (parentPort is null)");
+  ts_gc_root(&value);
+  g_post_enc.len = 0; g_post_enc.nseen = 0;
+  msg_encode(&g_post_enc, value);
+  ts_gc_unroot(1);
+  uint32_t len = (uint32_t)g_post_enc.len;
+  msg_write_all(g_worker_fd, &len, 4);
+  msg_write_all(g_worker_fd, g_post_enc.p, g_post_enc.len);
+}
+static void watch_call(tsv fn, tsv arg){
+  if (!ts_is_func(fn)) return;
+  tsv args[1] = { arg };
+  ts_call(fn, args, 1);
+}
+/* the child ended: reap it; a death or a nonzero exit goes to the error handler */
+static void watch_close(ts_watch* w){
+  ts_watch** pp = &g_watches;
+  while (*pp && *pp != w) pp = &(*pp)->next;
+  if (*pp) *pp = w->next;
+  close(w->fd);
+  int status = 0;
+  if (waitpid(w->pid, &status, 0) != w->pid) status = 0;
+  int failed = WIFSIGNALED(status) || (WIFEXITED(status) && WEXITSTATUS(status) != 0);
+  int id = w->id;
+  free(w->buf); free(w);
+  if (failed){
+    char buf[128];
+    if (WIFSIGNALED(status)) snprintf(buf, sizeof buf, "worker %d died of signal %d", id, WTERMSIG(status));
+    else snprintf(buf, sizeof buf, "worker %d exited with status %d", id, WEXITSTATUS(status));
+    tsv msg = ts_new_string(buf, (uint32_t)strlen(buf)); ts_gc_root(&msg);
+    tsv err = ts_new_error(TS_ERR_ERROR, msg); ts_gc_root(&err);
+    watch_call(ts_array_get(watch_handlers(), (uint32_t)id * 2u + 1u), err);
+    ts_gc_unroot(2);
+  }
+}
+static void watch_read(ts_watch* w){
+  uint8_t tmp[65536];
+  ssize_t r = read(w->fd, tmp, sizeof tmp);
+  if (r < 0){ if (errno == EINTR || errno == EAGAIN) return; r = 0; }
+  if (r == 0){ watch_close(w); return; }
+  if (w->len + (size_t)r > w->cap){
+    size_t c = w->cap ? w->cap * 2 : 65536;
+    while (c < w->len + (size_t)r) c *= 2;
+    uint8_t* q = (uint8_t*)realloc(w->buf, c);
+    if (!q) ts_abort_msg("out of memory receiving a worker message");
+    w->buf = q; w->cap = c;
+  }
+  memcpy(w->buf + w->len, tmp, (size_t)r); w->len += (size_t)r;
+  while (w->len >= 4){
+    uint32_t len; memcpy(&len, w->buf, 4);
+    if (w->len < 4u + len) break;
+    tsv v = msg_decode_frame(w->buf + 4, len); ts_gc_root(&v);
+    w->messages++;
+    size_t rest = w->len - 4u - len;
+    memmove(w->buf, w->buf + 4u + len, rest); w->len = rest;
+    watch_call(ts_array_get(watch_handlers(), (uint32_t)w->id * 2u), v);   /* may fork another worker */
+    ts_gc_unroot(1);
+  }
+}
+/* the event loop's turn for the workers: their pipes, with a timeout */
+static void ts_watch_poll(int timeout_ms){
+  int n = 0;
+  for (ts_watch* w = g_watches; w; w = w->next) n++;
+  if (!n) return;
+  struct pollfd* fds = (struct pollfd*)calloc((size_t)n, sizeof *fds);
+  ts_watch** ws = (ts_watch**)calloc((size_t)n, sizeof *ws);
+  if (!fds || !ws) ts_abort_msg("out of memory polling the workers");
+  int i = 0;
+  for (ts_watch* w = g_watches; w; w = w->next){ fds[i].fd = w->fd; fds[i].events = POLLIN; ws[i] = w; i++; }
+  int r = poll(fds, (nfds_t)n, timeout_ms);
+  if (r > 0) for (i = 0; i < n; i++) if (fds[i].revents & (POLLIN | POLLHUP | POLLERR)) watch_read(ws[i]);
+  free(fds); free(ws);
+}
+/* Fork a worker: the child runs the registered entry with `data` (the same
+   cells, at the same addresses) and ends; the parent gets the worker's id. */
+int ts_worker_fork(tsv data){
+  if (!ts_is_func(g_worker_entry)) ts_throw_type_error_msg("Worker: no worker entry is registered");
+  ts_gc_root(&data);
+  fflush(stdout); fflush(stderr);
+  int fds[2];
+  if (pipe(fds) != 0) ts_throw_type_error_msg("Worker: pipe failed");
+  pid_t pid = fork();
+  if (pid < 0){ close(fds[0]); close(fds[1]); ts_throw_type_error_msg("Worker: fork failed"); }
+  if (pid == 0){
+    close(fds[0]);
+    /* the parent's pending work is the parent's: its workers' pipes, its
+       microtasks and I/O tasks */
+    for (ts_watch* w = g_watches; w; w = w->next) close(w->fd);
+    g_watches = NULL;
+    g_mq_len = 0;
+    g_io_head = g_io_tail = g_io_active = NULL;
+    g_is_worker = 1; g_worker_fd = fds[1];
+    g_worker_data = data; ts_root_static_once(&g_worker_data, &g_worker_data_rooted);
+    /* young collections only: a full one would mark every pre-fork cell and
+       copy their pages into this process */
+    g_full_threshold_bytes = SIZE_MAX; g_full_threshold_forced = 1;
+    ts_handler* h = ts_eh_push();
+    if (ts_setjmp(h->buf) != 0){
+      ts_gc_set_root_depth(h->gc_root_len);
+      ts_frame_restore(h->frame_top);
+      ts_eh_pop();
+      tsv text = ts_to_string_v(ts_current_exception());
+      uint32_t n = 0; char* u = ts_string_cstr_copy(text, &n);
+      fflush(stdout);
+      fprintf(stderr, "garnet worker: uncaught exception: %.*s\n", (int)n, u ? u : "");
+      free(u); fflush(stderr);
+      _exit(1);
+    }
+    tsv args[1] = { data };
+    ts_call(g_worker_entry, args, 1);
+    ts_run_event_loop();
+    ts_eh_pop();
+    fflush(stdout); fflush(stderr);
+    _exit(0);
+  }
+  close(fds[1]);
+  ts_gc_unroot(1);
+  ts_watch* w = (ts_watch*)calloc(1, sizeof *w);
+  if (!w) ts_abort_msg("out of memory starting a worker");
+  w->id = ++g_watch_ids; w->pid = pid; w->fd = fds[0]; w->next = g_watches; g_watches = w;
+  return w->id;
+}
+
 void ts_run_event_loop(void){
   for (;;){
     drain_microtasks();
     ts_abort_timers_fire_due();
     ts_io_start_queued();
     if (!g_io_head && !g_io_active && g_mq_len) continue;
-    if (!g_io_head && !g_io_active) break;       /* nothing pending */
+    if (!g_io_head && !g_io_active && !g_watches) break;       /* nothing pending */
     if (g_io_active) (void)ts_io_poll_active();  /* completes ready I/O tasks */
+    /* the workers' pipes: a turn without waiting while I/O is active */
+    if (g_watches) ts_watch_poll(g_io_active || g_mq_len ? 0 : ts_abort_timer_poll_timeout_ms(1000));
     /* loop: drain microtasks triggered by completed I/O */
   }
 }

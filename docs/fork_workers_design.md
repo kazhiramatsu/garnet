@@ -212,3 +212,61 @@ accessor cost or publication; both stay as measured and designed.
 - **F4** (if F3 measures as projected): parse children allocating into a
   shared region at a fixed address, the first form of region-based
   publication.
+
+## F1-F3 as built and measured
+
+Session 352. F1: a `SharedArrayBuffer`'s bytes are `mmap(MAP_SHARED |
+MAP_ANON)` pages (`ta_new_buffer`, unmapped by the finalizer); `Atomics` on
+the integer kinds are `__atomic` operations on the element's bytes
+(`atomics_*_bits` in `ts_rt.c`). Runtime tests: a child's store is seen
+through a shared buffer and not through an `ArrayBuffer`; four processes
+claim 20,000 schedule indices with `compareExchange`, every index once;
+the element conversions. F2: the codec (`msg_encode`, `msg_decode`), the
+watches and `ts_worker_fork` in `ts_rt.c` ("Workers by fork"), the host's
+`setWorkerEntry`, `forkWorker`, `onWorkerMessage`, `onWorkerError`,
+`isWorker`, `workerData`, `postMessage`, `cpus`; `exit` in a child is
+`_exit`. Runtime tests: a plain graph round-trips (a cycle, an alias, a
+hole, a wide string, an `Int32Array`); a function, a Map and an object
+holding a function are rejected; a forked child's two frames arrive in
+order; an uncaught exception in the child reaches the error handler. F3:
+the shims as designed; `main.ts` sets `parallelCheck.writer` and `spawn`
+itself.
+
+tsc-ts on the compiler project, medians of three, outputs identical to one
+checker's and to the Node reference at every count:
+
+| checkers | wall | process-tree peak RSS (sampled) | parent's peak |
+|---|---|---|---|
+| 1 | 1.83 s | 727 MB | 705 MB |
+| 2 | 1.20 s (x1.53) | 1135 MB | 388 MB |
+| 3 | 1.01 s (x1.81) | | |
+| 4 | 1.06 s (x1.73) | 1366 MB | 388 MB |
+| 6 | 1.07 s (x1.71) | | |
+| 8 | 1.06 s (x1.73) | 1714 MB | 388 MB |
+
+The timeline at four checkers: startup 23 ms, parse 265 ms, bind 102 ms,
+publication 1 ms, checkers spawned at 395 ms; c1-c3 finish at 870-875 ms
+with 24-27 files each (CPU 398 ms user, 27 ms system); c0 finishes at
+1,063 ms with `checker.ts` alone: check 420 ms, emit 248 ms (CPU 598 ms).
+At two checkers c0's `checker.ts` check takes 328 ms, at eight 439 ms. The
+children's CPU, 1.79 s, is 35% more than one thread's check and emit
+(1.33 s); scriptc's four checkers do 13% more than its one thread. Under
+GC stress (a young collection every 64 allocations in parent and children)
+the outputs are identical; on a copy of the project with two injected type
+errors, one and four checkers report the same diagnostics, the same as
+scriptc's.
+
+Against the projection (0.71 s with parallel parsing): with serial parsing
+the floor is 0.395 s + 0.668 s = 1.06 s; the serial parse and bind cost
+0.23 s more than the projected parallel parse, and the critical path,
+`checker.ts` on a child, is 0.10 s longer than projected: its check is
+1.93x scriptc's (217 ms) where the single-thread ratio was 1.57x, and it
+slows from 328 to 420 ms as the siblings go from one to three. So garnet's
+B-shaped time on this runtime is about 0.83 s with parallel parsing, not
+0.71; the extra is concurrency (memory traffic, the children's page copies,
+the young-only collections), to measure before it is chased. Memory: 1.37
+GB of resident set across the processes at four checkers, against scriptc's
+472 MB and the 3.2 GB four separate programs would take.
+
+Not done: F4 (parse children), the ASan run, the contention fixture of the
+codec against Node's `structuredClone`.

@@ -8297,3 +8297,22 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   fork, watches, host primitives), F3 (shims, tsc-ts on forked checkers, the
   measurements), F4 (parse children in a shared region, if F3 measures as
   projected).
+- Workers by fork, F1-F3 (`docs/fork_workers_design.md`, "F1-F3 as built and
+  measured"): SharedArrayBuffer stores on MAP_SHARED pages, Atomics as
+  __atomic operations on the element's bytes, a structured-clone codec for
+  plain data (anything else throws a TypeError naming it), `ts_worker_fork`
+  with a pipe per worker, descriptor watches in the event loop, the tsc-ts
+  host's worker primitives and the shims (live bindings,
+  `sharesPublishedGraphs` true, the entry registered by main.ts, no parse
+  threads). Runtime tests for the shared stores across fork, a four-process
+  compareExchange schedule, the codec and a forked worker. tsc-ts on forked
+  checkers, outputs identical to one checker's and to Node's at every count:
+  1.83 s -> 1.20 (2) -> 1.01 (3) -> 1.06 s (4, 6, 8); 1.37 GB across the
+  processes at four. The floor is checker.ts on one child: check 420 ms (1.93x
+  scriptc's 217; 328 ms with one sibling), emit 248 ms; parse and bind stay
+  serial (0.37 s). The children's CPU is 35% more than one thread's (scriptc
+  13%). GC stress and injected type errors: identical outputs and diagnostics.
+  The B-shaped time with parallel parsing would be about 0.83 s against the
+  projected 0.71: concurrency costs on the critical path, to measure next.
+  Gates: unit, conformance 538/538 plain and strict on F1; the GC stress
+  gate passed on F1 and F2.

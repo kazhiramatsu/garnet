@@ -1,4 +1,5 @@
 #include "ts_rt.h"
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <sys/wait.h>
@@ -18,6 +19,86 @@ static int sized_extent_aborts(size_t bytes){
   int status = 0;
   if (waitpid(pid, &status, 0) != pid) return 0;
   return WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT;
+}
+
+/* Shared stores and atomics across processes (docs/fork_workers_design.md,
+   F1): a child forked after a SharedArrayBuffer's creation writes the pages
+   the parent reads; an ArrayBuffer's bytes stay the child's own. */
+static int store_crosses_fork(int shared){
+  tsv view;
+  if (shared){ tsv b = ts_new_shared_array_buffer(16); ts_gc_root(&b); view = ts_new_typed_array(TS_TA_INT32, &b, 1); ts_gc_unroot(1); }
+  else { tsv n = ts_num(4); view = ts_new_typed_array(TS_TA_INT32, &n, 1); }
+  ts_gc_root(&view);
+  fflush(stdout); fflush(stderr);
+  pid_t pid = fork();
+  if (pid < 0){ ts_gc_unroot(1); return -1; }
+  if (pid == 0){ ts_atomics_store(view, ts_num(1), ts_num(42)); _exit(0); }
+  int status = 0;
+  if (waitpid(pid, &status, 0) != pid){ ts_gc_unroot(1); return -1; }
+  int seen = (int)ts_to_num(ts_atomics_load(view, ts_num(1)));
+  ts_gc_unroot(1);
+  return seen;
+}
+/* Four children claim the indices of a schedule with compareExchange, as
+   tsc-ts's checkers do, and mark each claimed slot: every slot once. */
+static int schedule_contention(int children, int n){
+  tsv b = ts_new_shared_array_buffer((uint32_t)(4 * (n + 1))); ts_gc_root(&b);
+  tsv view = ts_new_typed_array(TS_TA_INT32, &b, 1); ts_gc_root(&view);
+  fflush(stdout); fflush(stderr);
+  pid_t pids[16];
+  for (int c = 0; c < children; c++){
+    pids[c] = fork();
+    if (pids[c] < 0){ ts_gc_unroot(2); return 0; }
+    if (pids[c] == 0){
+      for (;;){
+        int cur = (int)ts_to_num(ts_atomics_load(view, ts_num(0)));
+        if (cur >= n) break;
+        if ((int)ts_to_num(ts_atomics_compare_exchange(view, ts_num(0), ts_num(cur), ts_num(cur + 1))) == cur)
+          ts_atomics_rmw(0, view, ts_num(1 + cur), ts_num(1));
+      }
+      _exit(0);
+    }
+  }
+  for (int c = 0; c < children; c++){ int status = 0; waitpid(pids[c], &status, 0); }
+  int ok = (int)ts_to_num(ts_atomics_load(view, ts_num(0))) == n;
+  for (int i = 1; ok && i <= n; i++) ok = (int)ts_to_num(ts_atomics_load(view, ts_num(i))) == 1;
+  ts_gc_unroot(2);
+  return ok;
+}
+
+/* The worker message codec and a forked worker (docs/fork_workers_design.md, F2). */
+static tsv worker_received = TS_UNDEFINED;
+static int worker_errors = 0;
+static tsv test_worker_entry(tsv* a, int n){
+  /* the child: double the number, echo the text, post two frames */
+  tsv data = n > 0 ? a[0] : TS_UNDEFINED;
+  tsv out = ts_new_object(); ts_gc_root(&out);
+  ts_set(out, ts_intern_field("n", 1), ts_num(ts_to_num(ts_get(data, ts_intern_field("n", 1))) * 2));
+  ts_set(out, ts_intern_field("s", 1), ts_get(data, ts_intern_field("s", 1)));
+  ts_worker_post(out);
+  ts_worker_post(ts_num(7));
+  ts_gc_unroot(1);
+  return TS_UNDEFINED;
+}
+static tsv test_worker_throws(tsv* a, int n){ (void)a; (void)n; ts_throw_type_error_msg("the child fails"); return TS_UNDEFINED; }
+static tsv test_worker_on_message(tsv* a, int n){
+  tsv v = n > 0 ? a[0] : TS_UNDEFINED;
+  /* the first frame is the object; the second, the number, lands on it */
+  if (ts_is_num(v)) ts_set(worker_received, ts_intern_field("second", 6), v); else worker_received = v;
+  return TS_UNDEFINED;
+}
+static tsv test_worker_on_error(tsv* a, int n){ (void)a; (void)n; worker_errors++; return TS_UNDEFINED; }
+static int codec_rejects(tsv v){
+  ts_handler* h = ts_eh_push();
+  if (ts_setjmp(h->buf) != 0){
+    ts_gc_set_root_depth(h->gc_root_len);
+    ts_frame_restore(h->frame_top);
+    ts_eh_pop();
+    return 1;
+  }
+  (void)ts_message_roundtrip(v);
+  ts_eh_pop();
+  return 0;
 }
 
 static tsv check_merged_call(tsv* args, int nargs){
@@ -1600,6 +1681,84 @@ int main(){
        sized_extent_aborts(sizeof(ts_gc_header)) &&
        !sized_extent_aborts(sizeof(ts_sized_head) + 65535u * sizeof(tsv)));
     ts_gc_unroot(4);
+  }
+  CK("shared store: a forked child's store is seen", store_crosses_fork(1) == 42);
+  CK("shared store: an ArrayBuffer's bytes stay the child's own", store_crosses_fork(0) == 0);
+  CK("atomics: four processes claim every schedule index once", schedule_contention(4, 20000));
+  {
+    /* the element conversions of the atomic forms, one thread */
+    tsv n8 = ts_num(4); tsv v8 = ts_new_typed_array(TS_TA_INT8, &n8, 1); ts_gc_root(&v8);
+    tsv n16 = ts_num(4); tsv v16 = ts_new_typed_array(TS_TA_UINT16, &n16, 1); ts_gc_root(&v16);
+    int ok = ts_to_num(ts_atomics_store(v8, ts_num(0), ts_num(200))) == 200 && ts_to_num(ts_atomics_load(v8, ts_num(0))) == -56;
+    ok = ok && ts_to_num(ts_atomics_rmw(0, v8, ts_num(0), ts_num(100))) == -56 && ts_to_num(ts_atomics_load(v8, ts_num(0))) == 44;
+    ok = ok && ts_to_num(ts_atomics_compare_exchange(v16, ts_num(1), ts_num(0), ts_num(70000))) == 0 && ts_to_num(ts_atomics_load(v16, ts_num(1))) == 70000 - 65536;
+    ok = ok && ts_to_num(ts_atomics_compare_exchange(v16, ts_num(1), ts_num(1), ts_num(5))) == 70000 - 65536 && ts_to_num(ts_atomics_load(v16, ts_num(1))) == 70000 - 65536;
+    ok = ok && ts_to_num(ts_atomics_rmw(5, v16, ts_num(1), ts_num(-1))) == 70000 - 65536 && ts_to_num(ts_atomics_load(v16, ts_num(1))) == 65535;
+    ts_gc_unroot(2);
+    CK("atomics: element conversions (Int8 wraps, Uint16 wraps, a failed exchange leaves the value)", ok);
+  }
+  {
+    /* the codec: a plain graph with a cycle, an alias, a hole, a wide string, a typed array */
+    tsv o = ts_new_object(); ts_gc_root(&o);
+    tsv inner = ts_new_array(0); ts_gc_root(&inner);
+    ts_array_push(inner, ts_num(1)); ts_array_push_hole(inner); ts_array_push(inner, ts_new_string("x", 1));
+    tsv n3 = ts_num(3); tsv ta = ts_new_typed_array(TS_TA_INT32, &n3, 1); ts_gc_root(&ta);
+    ts_ta_set(ta, 0, ts_num(-5)); ts_ta_set(ta, 2, ts_num(70000));
+    ts_set(o, ts_intern_field("a", 1), ts_num(1.5));
+    ts_set(o, ts_intern_field("b", 1), ts_new_string("h\xc3\xa9llo \xe6\x97\xa5\xe6\x9c\xac", 13));
+    ts_set(o, ts_intern_field("c", 1), inner);
+    ts_set(o, ts_intern_field("c2", 2), inner);
+    ts_set(o, ts_intern_field("d", 1), ta);
+    ts_set(o, ts_intern_field("self", 4), o);
+    ts_set(o, ts_intern_field("t", 1), ts_bool(1));
+    ts_set(o, ts_intern_field("u", 1), TS_UNDEFINED);
+    ts_set(o, ts_intern_field("z", 1), TS_NULL);
+    tsv r = ts_message_roundtrip(o); ts_gc_root(&r);
+    tsv rc = ts_get(r, ts_intern_field("c", 1));
+    tsv rd = ts_get(r, ts_intern_field("d", 1));
+    tsv rb = ts_get(r, ts_intern_field("b", 1));
+    CK("worker codec: a copy, with the number", r != o && ts_is_obj(r) && ts_to_num(ts_get(r, ts_intern_field("a", 1))) == 1.5);
+    CK("worker codec: a wide string's code units", ts_is_str(rb) && ts_str_len_typed(rb) == 8 && ts_str_charcodeat(rb, 1) == 0xe9 && ts_str_charcodeat(rb, 6) == 0x65e5);
+    CK("worker codec: an array with a hole", ts_is_indexed_array_fast(rc) && ts_array_len(rc) == 3 && ts_to_num(ts_array_get(rc, 0)) == 1 && ts_is_undef(ts_array_get(rc, 1)));
+    CK("worker codec: an alias is one array, a cycle closes on the copy", ts_get(r, ts_intern_field("c2", 2)) == rc && ts_get(r, ts_intern_field("self", 4)) == r);
+    CK("worker codec: an Int32Array's elements", ts_is_typed_array(rd) && ts_to_num(ts_ta_get(rd, 0)) == -5 && ts_to_num(ts_ta_get(rd, 2)) == 70000);
+    CK("worker codec: true, undefined and null", ts_truthy(ts_get(r, ts_intern_field("t", 1))) && ts_is_undef(ts_get(r, ts_intern_field("u", 1))) && ts_is_null(ts_get(r, ts_intern_field("z", 1))));
+    tsv fnv = ts_make_fn_t(test_worker_entry, NULL, 0, 0); ts_gc_root(&fnv);
+    tsv mapv = ts_new_map(); ts_gc_root(&mapv);
+    tsv withfn = ts_new_object(); ts_gc_root(&withfn); ts_set(withfn, ts_intern_field("f", 1), fnv);
+    CK("worker codec: a function, a Map and an object holding a function are rejected loudly",
+       codec_rejects(fnv) && codec_rejects(mapv) && codec_rejects(withfn) && !codec_rejects(ts_num(1)));
+    ts_gc_unroot(7);
+  }
+  {
+    /* a forked worker: the entry sees its data, posts two frames, the loop delivers them */
+    tsv entry = ts_make_fn_t(test_worker_entry, NULL, 0, 0); ts_gc_root(&entry);
+    ts_worker_set_entry(entry);
+    tsv data = ts_new_object(); ts_gc_root(&data);
+    ts_set(data, ts_intern_field("n", 1), ts_num(21));
+    ts_set(data, ts_intern_field("s", 1), ts_new_string("from the parent", 15));
+    ts_gc_root(&worker_received);
+    int id = ts_worker_fork(data);
+    tsv onm = ts_make_fn_t(test_worker_on_message, NULL, 0, 0); ts_gc_root(&onm);
+    tsv one = ts_make_fn_t(test_worker_on_error, NULL, 0, 0); ts_gc_root(&one);
+    ts_worker_on_message(id, onm); ts_worker_on_error(id, one);
+    ts_run_event_loop();
+    tsv got_s = ts_is_obj(worker_received) ? ts_get(worker_received, ts_intern_field("s", 1)) : TS_UNDEFINED;
+    int ok = ts_is_obj(worker_received) && ts_to_num(ts_get(worker_received, ts_intern_field("n", 1))) == 42
+      && ts_is_str(got_s) && ts_str_len_typed(got_s) == 15 && ts_to_num(ts_get(worker_received, ts_intern_field("second", 6))) == 7 && worker_errors == 0;
+    CK("worker by fork: the child's two frames arrive in order, no error", ok);
+    /* a child whose entry throws: exit status 1, the error handler, no message */
+    worker_received = TS_UNDEFINED;
+    tsv bad = ts_make_fn_t(test_worker_throws, NULL, 0, 0); ts_gc_root(&bad);
+    ts_worker_set_entry(bad);
+    fflush(stdout); fflush(stderr);
+    int saved = dup(2); int devnull = open("/dev/null", 1); dup2(devnull, 2);   /* the child's report goes to stderr */
+    int id2 = ts_worker_fork(data);
+    ts_worker_on_message(id2, onm); ts_worker_on_error(id2, one);
+    ts_run_event_loop();
+    dup2(saved, 2); close(saved); close(devnull);
+    CK("worker by fork: an uncaught exception in the child reaches the error handler", worker_errors == 1 && ts_is_undef(worker_received));
+    ts_gc_unroot(6);
   }
   printf("\n%s\n", fail==0?"ALL RUNTIME TESTS PASS":"FAILURES");
   return fail?1:0;

@@ -242,7 +242,21 @@ static tsv host_exec_path(tsv* a, int n){
 #endif
   return string(g_argc > 0 ? g_argv[0] : "");
 }
-static tsv host_exit(tsv* a, int n){ fflush(stdout); fflush(stderr); exit(n > 0 && ts_is_num(a[0]) ? (int)ts_to_num(a[0]) : 0); }
+static tsv host_exit(tsv* a, int n){
+  int code = n > 0 && ts_is_num(a[0]) ? (int)ts_to_num(a[0]) : 0;
+  fflush(stdout); fflush(stderr);
+  if (ts_worker_is_worker()) _exit(code);   /* a forked worker: no atexit handlers of the parent's */
+  exit(code);
+}
+/* Workers by fork (docs/fork_workers_design.md): the shims' node:worker_threads. */
+static tsv host_set_worker_entry(tsv* a, int n){ ts_worker_set_entry(arg(a, n, 0)); return TS_UNDEFINED; }
+static tsv host_fork_worker(tsv* a, int n){ return ts_num((double)ts_worker_fork(arg(a, n, 0))); }
+static tsv host_on_worker_message(tsv* a, int n){ ts_worker_on_message((int)ts_to_num(arg(a, n, 0)), arg(a, n, 1)); return TS_UNDEFINED; }
+static tsv host_on_worker_error(tsv* a, int n){ ts_worker_on_error((int)ts_to_num(arg(a, n, 0)), arg(a, n, 1)); return TS_UNDEFINED; }
+static tsv host_is_worker(tsv* a, int n){ (void)a; (void)n; return ts_bool(ts_worker_is_worker()); }
+static tsv host_worker_data(tsv* a, int n){ (void)a; (void)n; return ts_worker_data(); }
+static tsv host_post_message(tsv* a, int n){ ts_worker_post(arg(a, n, 0)); return TS_UNDEFINED; }
+static tsv host_cpus(tsv* a, int n){ (void)a; (void)n; long c = sysconf(_SC_NPROCESSORS_ONLN); return ts_num(c > 0 ? (double)c : 1); }
 static tsv host_isatty(tsv* a, int n){ return ts_bool(isatty((int)ts_to_num(arg(a, n, 0)))); }
 static tsv host_pid(tsv* a, int n){ (void)a; (void)n; return ts_num((double)getpid()); }
 static tsv host_ppid(tsv* a, int n){ (void)a; (void)n; return ts_num((double)getppid()); }
@@ -366,6 +380,14 @@ void garnet_tsc_ts_host_init(int argc, char** argv){
   method(host, "totalmem", host_totalmem, 0);
   method(host, "utf8Length", host_utf8_length, 1);
   method(host, "writeUtf16le", host_write_utf16le, 3);
+  method(host, "setWorkerEntry", host_set_worker_entry, 1);
+  method(host, "forkWorker", host_fork_worker, 1);
+  method(host, "onWorkerMessage", host_on_worker_message, 2);
+  method(host, "onWorkerError", host_on_worker_error, 2);
+  method(host, "isWorker", host_is_worker, 0);
+  method(host, "workerData", host_worker_data, 0);
+  method(host, "postMessage", host_post_message, 1);
+  method(host, "cpus", host_cpus, 0);
 #ifdef __APPLE__
   ts_set_cstr(host, "platform", string("darwin"));
 #else
