@@ -8540,3 +8540,41 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   methods, `keywordKindAt`, `computeLineStarts`), 40% runtime (`td_m_decode`
   5.6%, `gc_mark_visit` 4.8%, `shape_transition_f` 4.1%,
   `ts_str_find_forward_view_slow` 2.1%), 16% system libraries.
+- Decision (Kaz, 2026-10-23): garnet's parallelism follows the Web and Node
+  APIs (`worker_threads`, `SharedArrayBuffer`, `Atomics`, structured clone),
+  not scriptc's `@scriptc/threads` by-reference `publish`, which tsc-ts's
+  parallel parse is written against; recorded in
+  `docs/parallel_parse_fork_design.md`. F4 is not pursued: a parse worker
+  returning bound graphs by reference is scriptc's feature, and in Node
+  semantics a worker's result is a copy, which costs about what parsing does.
+  The checkers' parallelism (plain-data messages and a shared counter) stays
+  within the standard surface and is what garnet generalizes into
+  `worker_threads` (inbound messages, `new Worker(file)` starting fresh,
+  `terminate`, `MessageChannel`); the scriptc-compatible host functions of the
+  benchmark's `host.c` (UTF-8 length, UTF-16LE writes, file reads) correspond
+  to `Buffer.byteLength`, `Buffer.write(s, off, 'utf16le')` and
+  `fs.readFileSync`, to be implemented as those with the tsc-ts shim a thin
+  TypeScript mapping. The fair comparisons are one thread (1.43 against 1.05
+  s) and the checker-parallel part; the serial parse and bind before the fork
+  is a structural handicap of the standard surface, shortened by one-thread
+  speed.
+- Slice M (toward scriptc; the parse path, from the parse-only profile): the
+  TextDecoder's UTF-8 decoder takes ASCII eight bytes at a time (a source text
+  is mostly ASCII; the one-byte state machine was 5.6% of the parse-only run,
+  all under `readFileSync`); the benchmark host's `writeUtf16le` widens
+  one-byte storage directly and copies UTF-16 storage; `Math.imul` is emitted
+  in line as the 32-bit product of two ToInt32s with an int32 fact (the
+  scanner's FNV hash calls it once per character; `TSAOT_IMUL_INLINE=0` keeps
+  the runtime call, set by the parity oracle). Gates all green (parity 381
+  identical / 156 known: `closures/undef_init_paths` added, the Rust emitter
+  giving `whileFirst` a double entry; selfconf 538; conformance 541 plain and
+  strict, 538 protect; GC stress; bundler 43). tsc-ts one checker, outputs
+  identical: 26.89 -> 26.57 G instructions (-1.2%), cycles -1.8%, wall 1.45 ->
+  1.43 s; the parse-only run 4.24 -> 4.01 G (-5.5%), 0.21 -> 0.20 s. Next,
+  from the same profile with callers attributed through the saved return
+  address: shape creation is O(n^2) in a chain (each new shape copies its
+  parent's key vector and rebuilds an index; the 16,967 shapes are mostly enum
+  objects and `Diagnostics` built one key at a time, 4.9% of the parse-only
+  run plus its mallocs and copies), `indexOf('*/')` runs the unit-by-unit
+  search because an immediate short needle's view has no data pointer (2.5%),
+  and the decoded ASCII text still makes a UTF-16 round trip.

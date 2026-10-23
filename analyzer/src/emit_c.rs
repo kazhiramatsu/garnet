@@ -2245,6 +2245,17 @@ fn conservative_roots_enabled() -> bool {
     })
 }
 
+/// TSAOT_IMUL_INLINE=0 keeps `Math.imul` a runtime call (the parity oracle).
+fn imul_inline_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_IMUL_INLINE").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
 fn frame_roots_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -6848,6 +6859,7 @@ fn infer_numeric_analysis(
                 } => {
                     let f = match builtin.as_str() {
                         "json.num.len" | "json.string.len" => NumFact::nonnegative_i64_value(),
+                        "math.imul" if imul_inline_enabled() => NumFact::int32_value(),
                         _ => NumFact::unknown(),
                     };
                     Some((d.0, f))
@@ -19579,6 +19591,17 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 "math.pow" => (n2("pow"), true),
                 "math.atan2" => (n2("atan2"), true),
                 "math.hypot" => (n2("ts_math_hypot2"), true),
+                // ToInt32 of each operand, the 32-bit product as an int32: in line
+                // (the scanner's hashes call it once per character); TSAOT_IMUL_INLINE=0
+                // keeps the runtime call (the parity oracle)
+                "math.imul" if imul_inline_enabled() => (
+                    format!(
+                        "((double)(int32_t)((uint32_t)ts_to_int32({}) * (uint32_t)ts_to_int32({})))",
+                        nc(0),
+                        nc(1)
+                    ),
+                    true,
+                ),
                 "math.imul" => (format!("ts_math_imul({}, {})", nc(0), nc(1)), true),
                 "math.maxArr" => (format!("ts_math_max_arr({})", v(0)), true),
                 "math.minArr" => (format!("ts_math_min_arr({})", v(0)), true),

@@ -14587,6 +14587,15 @@ static uint32_t td_decode_utf8(const uint8_t* b, uint32_t n, uint16_t* u, int fa
   for (uint32_t i = 0; i < n; i++){
     uint32_t x = b[i];
     if (needed == 0){
+      /* a run of ASCII bytes, eight at a time (a source text is mostly one) */
+      while (i + 8u <= n){
+        uint64_t w; memcpy(&w, b + i, 8);
+        if (w & 0x8080808080808080ull) break;
+        for (int k = 0; k < 8; k++) u[o + k] = (uint16_t)(uint8_t)(w >> (8 * k));
+        o += 8; i += 8;
+      }
+      if (i >= n) break;
+      x = b[i];
       if (x <= 0x7Fu){ u[o++] = (uint16_t)x; continue; }
       if (x >= 0xC2u && x <= 0xDFu){ needed = 1; cp = x & 0x1Fu; }
       else if (x >= 0xE0u && x <= 0xEFu){ if (x == 0xE0u) lower = 0xA0u; if (x == 0xEDu) upper = 0x9Fu; needed = 2; cp = x & 0xFu; }

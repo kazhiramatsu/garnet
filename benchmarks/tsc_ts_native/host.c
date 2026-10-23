@@ -366,9 +366,17 @@ static tsv host_write_utf16le(tsv* a, int n){
   uint32_t room = (t->length - (uint32_t)off) / 2u;
   uint32_t units = v.len < room ? v.len : room;
   uint8_t* out = t->data + (size_t)off;
-  for (uint32_t i = 0; i < units; i++){
-    uint16_t cu = ts_str_cu_at_view(v, i);
-    out[2 * i] = (uint8_t)(cu & 0xFFu); out[2 * i + 1] = (uint8_t)(cu >> 8);
+  if (v.data && !(v.flags & TS_STR_FLAG_UTF16)){
+    /* one-byte storage: each byte widens to a little-endian unit */
+    const unsigned char* b = (const unsigned char*)v.data;
+    for (uint32_t i = 0; i < units; i++){ out[2 * i] = b[i]; out[2 * i + 1] = 0; }
+  } else if (v.data){
+    memcpy(out, v.data, (size_t)units * 2u);   /* UTF-16 storage is little-endian units already */
+  } else {
+    for (uint32_t i = 0; i < units; i++){
+      uint16_t cu = ts_str_cu_at_view(v, i);
+      out[2 * i] = (uint8_t)(cu & 0xFFu); out[2 * i + 1] = (uint8_t)(cu >> 8);
+    }
   }
   return ts_num((double)units * 2);
 }

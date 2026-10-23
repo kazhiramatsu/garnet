@@ -76,3 +76,17 @@ shortens the critical path in both, needs no new machinery, and is where
 garnet is still about 2x scriptc per phase. The parse-only profile
 (`--listFilesOnly`) orders that work. F4 comes after it, with the shared
 tables designed first.
+
+## Decision (Kaz, 2026-10-23): standard APIs only
+
+Parallelism in garnet follows the Web and Node APIs (`worker_threads`,
+`SharedArrayBuffer`, `Atomics`, structured clone), not scriptc's
+`@scriptc/threads` `publish`, which shares object graphs by reference and
+which tsc-ts's parallel parse is written against. The checkers' parallelism
+(F3) stays within the standard surface (workers with plain-data messages,
+a shared counter) and is what garnet generalizes: the inbound message
+channel, `new Worker(file)` with Node's start-fresh semantics, `terminate`,
+`MessageChannel`. F4 is not pursued: a parse thread that returns bound
+graphs by reference is scriptc's feature, and the part of the gap it
+explains (the serial parse and bind before the fork) is accepted. The
+one-thread speed of parsing and binding is the lever that remains.
