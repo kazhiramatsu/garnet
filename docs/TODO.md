@@ -8780,3 +8780,24 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   0.72-0.78 s (median 0.76; scriptc 0.43). The session's score: 33.44 -> 25.13
   G (-25%), scriptc 18.3 G; wall 1.74 -> about 1.35 s on a quiet machine
   against 1.05 s.
+- Slice X (runtime, the full collection's pacing;
+  `docs/full_gc_pacing_design.md`, "The factor as the inverse of the garbage
+  fraction"): the compile's third full collection (195 -> 189 MB, 40 ms, in
+  the bind phase) marked the parsed AST, almost all of it live, for 6 MB, and
+  a fixed factor of four after a low-yield collection only delays the next
+  useless one. The next threshold now follows what the collection measured:
+  the growth factor is the inverse of the fraction reclaimed, between 2 (half
+  garbage, as before) and `TSAOT_GC_FULL_FACTOR_MAX` (16; under an eighth
+  reclaimed), at or under an eighth of physical memory unless twice the live
+  heap is more. A policy over measured survival like V8's heap growing factor;
+  it looks at no object kind (Kaz: no object-specific or permanent-generation
+  treatment of the AST). The compile: full collections 3 -> 2 (16.8 -> 13.4
+  MB, 2 ms; 53.6 -> 48.7 MB, 8 ms, 9% reclaimed, next 780 MB), pauses 163 ->
+  118 ms, peak RSS 602 MB both. tsc-ts one checker, outputs identical, four
+  pairs: 25.13 -> 24.59 G instructions (-2.2%), cycles -4.7%, wall 1.45 ->
+  1.36 s. Also measured and dropped: a slot-precise remembered set for sized
+  instances (tsc-ts's classes hold 6-15 fields, so rescanning a remembered
+  node whole costs about 8 visits; at most 0.3%); a lighter young-log death
+  path (the log holds only the finalizable kinds). Gates run at a quiet load
+  from here (Kaz: the fan): `TSAOT_CONF_JOBS=3`, `TSAOT_UNITS_JOBS=3`, nice
+  12.

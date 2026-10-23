@@ -32,6 +32,8 @@ static size_t g_young_threshold=65536;
 static size_t g_heap_bytes = 0;
 static size_t g_old_bytes = 0;
 static size_t g_full_threshold_bytes = (size_t)16u * 1024u * 1024u;
+static size_t g_full_factor_max = 16u;     /* TSAOT_GC_FULL_FACTOR_MAX: the pacing's largest growth factor */
+static size_t g_ram_bytes = 0;             /* physical memory, for the pacing's cap */
 static int g_full_threshold_forced = 0; /* env override pins the trigger (stress knob) */
 static int g_site_pretenure = 1;           /* TSAOT_GC_SITE_PRETENURE=0: every allocation site stays young (docs/site_pretenuring_design.md) */
 static uint32_t g_site_tenure_pct = 90u;   /* TSAOT_GC_SITE_TENURE_PCT: the survival a site needs to allocate old */
@@ -1288,6 +1290,12 @@ static void gc_config_init(void){
   }
   const char* slog = getenv("TSAOT_GC_SITE_LOG");
   if (slog && slog[0] && strcmp(slog, "0") != 0) g_site_log = 1;
+  const char* ffac = getenv("TSAOT_GC_FULL_FACTOR_MAX");
+  if (ffac && ffac[0]){ long v = strtol(ffac, NULL, 10); if (v >= 2 && v <= 64) g_full_factor_max = (size_t)v; }
+  {
+    long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGESIZE);
+    g_ram_bytes = (pages > 0 && page > 0) ? (size_t)pages * (size_t)page : 0;
+  }
   const char* fbytes = getenv("TSAOT_GC_FULL_THRESHOLD_BYTES");
   if (fbytes && fbytes[0]){
     char* end = NULL;
@@ -1439,11 +1447,31 @@ static inline void gc_before_alloc(void){
          last ones marking 250-480 MB of live data for little garbage). */
       size_t live = g_heap_bytes;
       size_t reclaimed = before > live ? before - live : 0;
-      size_t factor = (reclaimed * 4u < before) ? 4u : 2u;
+      /* The growth factor is the inverse of the garbage fraction this
+         collection found, between 2 and TSAOT_GC_FULL_FACTOR_MAX (16): a heap
+         that is 95% live grows by live data, so collecting it again at a
+         small multiple of its size marks it again for little garbage (tsc-ts's
+         third full collection marked 190 MB of AST for 6 MB, 40 ms in the
+         bind phase), while a heap half garbage collects at twice its live
+         size as before. Below an eighth reclaimed the factor is the maximum.
+         The threshold stays at or under an eighth of physical memory unless
+         twice the live heap is more (a long-lived process with little garbage
+         still collects before the machine does). */
+      size_t factor = 2u;
+      if (reclaimed * 2u < before){
+        factor = reclaimed ? (size_t)(before / reclaimed) : g_full_factor_max;
+        if (reclaimed * 8u < before) factor = g_full_factor_max;
+        if (factor < 2u) factor = 2u;
+        if (factor > g_full_factor_max) factor = g_full_factor_max;
+      }
       /* The safety valve of the pretenured constructions: an old generation
          that was mostly garbage means the constructed objects die young. */
       if (reclaimed * 2u > before) g_pretenure_ctors = 0;
       size_t next = live * factor;
+      if (g_ram_bytes){
+        size_t cap = g_ram_bytes / 8u;
+        if (next > cap) next = live * 2u > cap ? live * 2u : cap;
+      }
       size_t with_headroom = live + TS_GC_MIN_FULL_BYTES;
       if (next < with_headroom) next = with_headroom;
       if (next < TS_GC_MIN_FULL_BYTES) next = TS_GC_MIN_FULL_BYTES;

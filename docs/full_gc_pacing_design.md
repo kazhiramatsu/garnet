@@ -51,3 +51,24 @@ Compiler A/B, `x38` against `x37`, two rounds of three alternating runs
 (outputs validated, diagnostics zero): 4.734 vs 4.868 s and 4.752 vs
 4.865 s median wall, all six pairs between -2.0% and -3.1%; peak RSS 811
 -> 821 MB. Node 3.27-3.29 s, so 1.44x Node.
+
+## The factor as the inverse of the garbage fraction (session 352)
+
+With the compiler at three full collections per compile, the third (195 ->
+189 MB, 40 ms) still ran in the bind phase: it marked the parsed AST, almost
+all of it live, for 6 MB. A fixed factor of four after a low-yield collection
+only delays the next useless one. The next threshold now follows what the
+collection measured: the growth factor is the inverse of the fraction
+reclaimed (half garbage: 2x, as before; 20%: 5x; under an eighth: the maximum,
+`TSAOT_GC_FULL_FACTOR_MAX`, 16), so a heap that grows by live data is left
+alone in proportion to how little a collection would reclaim, and the memory
+spent on the deferral is bounded by that garbage fraction. The threshold stays
+at or under an eighth of physical memory unless twice the live heap is more,
+so a long-lived process still collects before the machine does. This is a
+policy over measured survival, like V8's heap growing factor; it looks at no
+object kind.
+
+The compiler: full collections 3 -> 2 (16.8 -> 13.4 MB, 2 ms; 53.6 -> 48.7 MB,
+8 ms, 9% reclaimed, next threshold 780 MB), pauses 163 -> 118 ms. A/B, four
+alternating pairs, outputs identical: 25.13 -> 24.59 G instructions (-2.2%),
+cycles -4.7%, wall 1.45 -> 1.36 s; peak RSS 602 MB both.
