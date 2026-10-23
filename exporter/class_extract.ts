@@ -1204,6 +1204,19 @@ export class ClassExtractor {
       process.stderr.write(`[closed] receivers ${closedReceivers.closed ? "closed" : `open (${this.openCount} sites)`}\n`);
       for (const r of this.openReasons) process.stderr.write(`[closed]   ${r}\n`);
     }
+    // TSAOT_DEBUG_ALL_UNSTABLE=1: every class dispatches dynamically (a
+    // debugging mode that exercises the dynamic paths of a typed program)
+    if (process.env.TSAOT_DEBUG_ALL_UNSTABLE === "1") {
+      for (let id = 0; id < this.classes.length; id++) this.markUnstable(id, "debug-all-unstable");
+    }
+    // TSAOT_DEBUG_UNSTABLE_CLASSES=<regex>: the classes whose names match
+    // dispatch dynamically (bisecting a defect of the dynamic paths)
+    if (process.env.TSAOT_DEBUG_UNSTABLE_CLASSES) {
+      const re = new RegExp(process.env.TSAOT_DEBUG_UNSTABLE_CLASSES);
+      for (let id = 0; id < this.classes.length; id++) {
+        if (re.test(this.classes[id].name ?? "")) this.markUnstable(id, "debug-unstable-classes");
+      }
+    }
     return { classes: this.classes, symbolToId: this.bySymbol, nodeToId: this.byNode, closedReceivers };
   }
 }

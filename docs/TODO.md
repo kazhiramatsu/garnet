@@ -8943,3 +8943,21 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   sampler's caller PC. tsc-ts one checker 23.83 -> 23.62 G instructions
   (-0.9%), cycles -0.35%, wall unchanged, outputs identical. Numbers from here
   on are in this configuration.
+- Slice AH (runtime, correctness; `docs/conformance_fixes.md`, "An integer
+  slot read through the inline cache"): the inline cache's struct-slot read
+  treated every numeric slot as a double, so a class with an enum-typed
+  (int32) field that dispatches dynamically (a prototype mutation, or any
+  instability) read the field as the denormal whose bits are the integer. The
+  descriptor and write paths already distinguished the integer kind; the cache
+  read now does too. Found with a new debugging mode of the class extractor,
+  `TSAOT_DEBUG_ALL_UNSTABLE=1` (every class dynamic;
+  `TSAOT_DEBUG_UNSTABLE_CLASSES=<regex>` for a subset), which compiles a typed
+  program through its dynamic paths: tsc-ts's scanner read its positions as
+  denormals and the parser looped forever; with the scanner alone dynamic the
+  compile aborted storing such a value back into an int32 slot. The whole
+  conformance suite passes in that mode. Fixture
+  `classes/int32_fields_dynamic_class`. With the fix the all-dynamic compile
+  of tsc-ts overflows the 8 MB main stack in the checker's recursion (a finite
+  depth: linked with a 256 MB stack it completes, and its 78 output files are
+  byte-identical to the typed build's), so the dynamic paths' larger frames
+  need a larger main stack: the next slice.

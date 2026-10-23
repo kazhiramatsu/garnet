@@ -15689,6 +15689,9 @@ static void prop_ic_fill_struct(ts_prop_ic* ic, ts_object* o, ts_key key, size_t
     prop_ic_fill_entry(ic, o, key, (uint32_t)offset, TS_PROP_IC_STRUCT, (uint8_t)numeric);
 }
 static tsv ts_prop_ic_struct_read(ts_object* o, const ts_prop_location* e){
+  /* the slot's kind as the class registered it: 2 an integer slot (a long
+     long holding an int32), 1 a double, 0 a boxed value */
+  if (e->numeric == 2){ long long n; memcpy(&n, (char*)o + e->slot, sizeof n); return ts_num((double)n); }
   if (e->numeric){ double value; memcpy(&value, (char*)o + e->slot, sizeof value); return ts_num(value); }
   tsv value; memcpy(&value, (char*)o + e->slot, sizeof value); return value;
 }

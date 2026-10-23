@@ -2415,3 +2415,26 @@ Fixture `classes/instance_method_shadow` (typed and cast shadows; base-typed,
 subclass-typed and `any` calls; deletion restoring the method; a plain object
 literal typed as the class; a single-implementation method shadowed through
 a cast of the instance itself).
+
+## An integer slot read through the inline cache (session 352, slice AH)
+
+A class whose fields have typed slots (an enum-typed field is an int32 slot, a
+`long long`; a number field a double) but whose dispatch is dynamic (its
+prototype was mutated, or the class is unstable for another reason) reads and
+writes every field through the runtime's property path, and that path's inline
+cache read treated every numeric slot as a double: an int32 slot came back as
+the double whose bits are the integer, a denormal such as 1.5e-323. The
+descriptor path (`struct_field_get`, `class_reg_field_value`) and the write
+path (`struct_field_set`) already distinguished the integer kind; only
+`ts_prop_ic_struct_read` did not. Found by compiling tsc-ts with every class
+dynamic (`TSAOT_DEBUG_ALL_UNSTABLE=1`, a debugging switch of the class
+extractor; `TSAOT_DEBUG_UNSTABLE_CLASSES=<regex>` for a subset): the scanner
+read its position fields as denormals and the parser looped forever, and with
+the scanner alone dynamic the compile aborted with "an integer-typed field
+receives 1.33e-322" when such a value was stored back. Fixture
+`classes/int32_fields_dynamic_class` (strict export gives the slots their
+kinds; before the fix it printed 1.5e-323 where V8 prints 3).
+
+The debugging mode is the general way to exercise the dynamic paths with a
+typed program: the whole conformance suite passes in it, and a defect of
+tsc-ts in it is a defect of a dynamic path that an untyped program would hit.
