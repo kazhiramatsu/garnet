@@ -98,6 +98,13 @@ while IFS= read -r name; do
     ts_map_probe_num | \
     ts_map_get_num | \
     ts_array_push_inline | \
+    ts_prop_ic_probe_sized_inline | \
+    ts_get_sized_pic_try | \
+    ts_get_sized_pic_inline | \
+    ts_get_sized_pic_inline_lazy | \
+    ts_set_sized_pic_try | \
+    ts_set_sized_pic_inline | \
+    ts_set_sized_pic_inline_lazy | \
     ts_str_hash_fast | \
     ts_ref_hash | \
     ts_mapset_probe_inline | \

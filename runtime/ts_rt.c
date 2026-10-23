@@ -15672,7 +15672,12 @@ static void prop_ic_fill_entry(ts_prop_ic* ic, ts_object* o, ts_key key,
   }
   if (target == TS_PROP_IC_SIZE){
     target = (uint32_t)(cache->next++ % TS_PROP_IC_SIZE);
-    if (ts_obj_shape_id(o) == TS_SHAPE_NONE && cache->entries[target].key != key){
+    /* evicting a live entry of a sized receiver is polymorphism, whatever
+       its key: a site over many classes reaches the megamorphic state (the
+       generic read, the registry's cache) instead of churning the table
+       (same-key evictions were never counted, so `node.kind` over hundreds
+       of node classes refilled forever) */
+    if (ts_obj_shape_id(o) == TS_SHAPE_NONE && cache->entries[target].kind != 0){
       prop_ic_note_miss(ic);
       if (ic->megamorphic) return;
     }

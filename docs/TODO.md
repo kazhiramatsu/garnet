@@ -9008,3 +9008,20 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   classes with boxed, double and int32 slots, writes of every kind, an
   instance with own dynamic properties, a relinked one, frozen and sealed
   ones, a plain object and null at the same sites).
+- Slice AK (emitter + runtime, the dynamic paths;
+  `docs/pic_sized_inline_design.md`, "At a class-typed site"): a field access
+  whose receiver the program types as a class instance while its class
+  dispatches dynamically went through the shaped inline cache, which such a
+  receiver never hits, so every access was an out-of-line call (18.6% of the
+  all-dynamic compile at the entry alone). The emitter now gives such a site
+  the sized probe in line (`ts_get_sized_pic_inline` /
+  `ts_set_sized_pic_inline`, lazy-frame forms included); a typed program with
+  stable classes never emits them, so its code is unchanged. With it, evicting
+  a live entry of a sized receiver from the location table counts as a miss
+  whatever its key, so a site over many classes (`node.kind` over hundreds of
+  node classes) reaches the megamorphic state and the generic read instead of
+  refilling the table forever. The all-dynamic compile of tsc-ts: 8.9 -> 8.1 s
+  (-9%), outputs identical to the typed build's; the typed one checker 23.61
+  -> 23.61 G instructions, cycles and wall within noise, outputs identical
+  (the generated code of a program with stable classes has no such site). Knob
+  `TSAOT_SIZED_PIC_INLINE`.

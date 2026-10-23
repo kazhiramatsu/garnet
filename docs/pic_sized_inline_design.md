@@ -89,4 +89,28 @@ whatever its key (same-key evictions were never counted, so `node.kind` over
 hundreds of node classes refilled the table forever), and after sixteen the
 site takes the generic read, whose first step is the registry's field cache.
 
-Measurements: see TODO (session 352, slice AK).
+| program | before | after |
+|---|---|---|
+| tsc-ts, every class dynamic, wall | 8.9 s | 8.1 s (-9%) |
+| tsc-ts typed, one checker, instructions | 23.61 G | 23.61 G |
+
+Outputs identical in both. What remains of the dynamic compile's lookups is
+the megamorphic sites' path: the registry's field cache (`class_field_lookup`,
+12%), reached through the slow path and the generic read (11% and 5%); a
+shortcut from the out-of-line entry straight to that cache is the next step.
+
+## The megamorphic site (slice AL)
+
+A site over many classes (`node.kind` over hundreds of node classes) holds no
+useful entry; once megamorphic its reads went out of line to the slow path,
+then to the generic read, then to the registry's field cache: three calls and
+the generic read's dispatch (a proxy test, the kind ladder) for one cached
+offset. The out-of-line read and write now test the megamorphic flag first
+and, for a sized receiver, go straight to `class_field_lookup` and the slot
+(the write refusing a frozen instance as the struct path does). Other
+receivers and a miss in the registry's cache take the paths as before.
+Fixture `classes/megamorphic_field_sites` (twenty-four node classes read and
+written through `any` at the same sites, with a frozen instance, an instance
+with own properties and a plain object in the mix).
+
+Measurements: see TODO (session 352, slice AL).

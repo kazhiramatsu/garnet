@@ -2208,6 +2208,56 @@ TS_RT_ALWAYS_INLINE const ts_prop_ic_entry* ts_prop_ic_probe_sized_inline(
   }
   return NULL;
 }
+/* A field access whose receiver the program types as a class instance while
+   its class dispatches dynamically (docs/pic_sized_inline_design.md, "At a
+   class-typed site"): such a receiver is never a shaped object, so the sized
+   probe runs in line and the shaped probe not at all; a miss takes the
+   cached read or write (which fills the entry on its struct path). */
+TS_RT_ALWAYS_INLINE int ts_get_sized_pic_try(tsv obj, ts_key key, const ts_prop_ic* ic, tsv* out){
+  if (!ic || ic->megamorphic || TS_TOP16(obj) != TS_SEL_OBJECT) return 0;
+  const ts_object* o = (const ts_object*)ts_ptr(obj);
+  const ts_prop_ic_entry* e = ts_prop_ic_probe_sized_inline(o, key, ic);
+  if (!e) return 0;
+  const char* at = (const char*)o + (e->slot & TS_PIC_SLOT_MASK);
+  uint32_t kind = e->slot >> TS_PIC_FLAGS_SHIFT;
+  TS_RT_STAT_PIC_GET_CALL(); TS_RT_STAT_PIC_GET_HIT();
+  if (kind == 0){ memcpy(out, at, sizeof *out); return 1; }
+  if (kind == 1){ double d; memcpy(&d, at, sizeof d); *out = ts_num(d); return 1; }
+  long long n; memcpy(&n, at, sizeof n); *out = ts_num((double)n); return 1;
+}
+TS_RT_ALWAYS_INLINE tsv ts_get_sized_pic_inline(tsv obj, ts_key key, ts_prop_ic* ic){
+  tsv v;
+  if (ts_get_sized_pic_try(obj, key, ic, &v)) return v;
+  return ts_get_pic_checked(obj, key, ic);
+}
+TS_RT_ALWAYS_INLINE tsv ts_get_sized_pic_inline_lazy(tsv obj, ts_key key, ts_prop_ic* ic, ts_frame_hdr* frame, uint32_t nslots){
+  tsv v;
+  if (ts_get_sized_pic_try(obj, key, ic, &v)) return v;
+  ts_frame_push(frame, nslots);
+  tsv r = ts_get_pic_checked(obj, key, ic);
+  ts_frame_pop(frame);
+  return r;
+}
+TS_RT_ALWAYS_INLINE int ts_set_sized_pic_try(tsv obj, ts_key key, tsv value, ts_prop_ic* ic){
+  if (!ic || ic->megamorphic || TS_TOP16(obj) != TS_SEL_OBJECT) return 0;
+  ts_object* o = (ts_object*)ts_ptr(obj);
+  const ts_prop_ic_entry* e = ts_prop_ic_probe_sized_inline(o, key, ic);
+  if (!e || ts_obj_integrity(o) != 0u) return 0;
+  char* at = (char*)o + (e->slot & TS_PIC_SLOT_MASK);
+  uint32_t kind = e->slot >> TS_PIC_FLAGS_SHIFT;
+  if (kind == 0){ TS_RT_STAT_PIC_SET_CALL(); TS_RT_STAT_PIC_SET_HIT(); memcpy(at, &value, sizeof value); ts_write_barrier(obj, value); return 1; }
+  if (kind == 1 && ts_is_num(value)){ TS_RT_STAT_PIC_SET_CALL(); TS_RT_STAT_PIC_SET_HIT(); double d = ts_to_num(value); memcpy(at, &d, sizeof d); return 1; }
+  return 0;
+}
+TS_RT_ALWAYS_INLINE void ts_set_sized_pic_inline(tsv obj, ts_key key, tsv value, ts_prop_ic* ic){
+  if (!ts_set_sized_pic_try(obj, key, value, ic)) ts_set_pic(obj, key, value, ic);
+}
+TS_RT_ALWAYS_INLINE void ts_set_sized_pic_inline_lazy(tsv obj, ts_key key, tsv value, ts_prop_ic* ic, ts_frame_hdr* frame, uint32_t nslots){
+  if (ts_set_sized_pic_try(obj, key, value, ic)) return;
+  ts_frame_push(frame, nslots);
+  ts_set_pic(obj, key, value, ic);
+  ts_frame_pop(frame);
+}
 TS_RT_ALWAYS_INLINE tsv ts_get_pic_checked_inline(
     tsv obj, ts_key key, ts_prop_ic* ic){
   uint8_t flags = 0;

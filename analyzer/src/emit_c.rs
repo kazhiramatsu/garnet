@@ -2342,6 +2342,20 @@ fn shadow_guard_enabled() -> bool {
     })
 }
 
+/// TSAOT_SIZED_PIC_INLINE=0 keeps a field access of a class-typed receiver
+/// whose class dispatches dynamically on the shaped inline cache (the parity
+/// oracle): on, the site probes the sized entry in line (ts_rt.h
+/// ts_get_sized_pic_inline) and skips the shaped probe such a receiver never hits.
+fn sized_pic_inline_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_SIZED_PIC_INLINE").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
 /// TSAOT_MAP_KEY_INLINE=0 keeps `map.get(k)` / `map.has(k)` / `set.has(k)` with
 /// a boxed key as the runtime call (the parity oracle): on, a key the program
 /// types as a string, or as an object, array or function, takes the indexed
@@ -21429,6 +21443,21 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     }
                     return;
                 }
+                // a class the program dispatches dynamically: the receiver is a
+                // sized instance, never a shaped object, so its site probes the
+                // sized entry in line (docs/pic_sized_inline_design.md)
+                if sized_pic_inline_enabled() && prop_pic_enabled() && !ctx.lazy_homes {
+                    let pic = ctx.fresh_label();
+                    let _ = writeln!(s, "  {{ static ts_prop_ic _ts_pic_{} = TS_PROP_IC_INIT;", pic);
+                    let e = if ctx.lazy_frame {
+                        format!("ts_get_sized_pic_inline_lazy({}, {}, &_ts_pic_{}, &F.h, {})", ctx.val(obj.0), field.0, pic, ctx.frame_nslots)
+                    } else {
+                        format!("ts_get_sized_pic_inline({}, {}, &_ts_pic_{})", ctx.val(obj.0), field.0, pic)
+                    };
+                    s.push_str(&ctx.set_val(dst.0, &e));
+                    let _ = writeln!(s, "  }}");
+                    return;
+                }
             }
             // Static-slot hint (docs/static_slots_design.md): the probe checks the
             // predicted in-object slot against the receiver's shape and falls to
@@ -21673,6 +21702,17 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         }
                     }
                     let _ = writeln!(s, "  }}");
+                    return;
+                }
+                // a class the program dispatches dynamically: the sized entry in line
+                if sized_pic_inline_enabled() && prop_pic_enabled() && !ctx.lazy_homes {
+                    let pic = ctx.fresh_label();
+                    let _ = writeln!(s, "  {{ static ts_prop_ic _ts_pic_{} = TS_PROP_IC_INIT;", pic);
+                    if ctx.lazy_frame {
+                        let _ = writeln!(s, "  ts_set_sized_pic_inline_lazy({}, {}, {}, &_ts_pic_{}, &F.h, {}); }}", ctx.val(obj.0), field.0, ctx.val(src.0), pic, ctx.frame_nslots);
+                    } else {
+                        let _ = writeln!(s, "  ts_set_sized_pic_inline({}, {}, {}, &_ts_pic_{}); }}", ctx.val(obj.0), field.0, ctx.val(src.0), pic);
+                    }
                     return;
                 }
             }
