@@ -8417,3 +8417,17 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   unit, bundler 43/43, conformance 539/539 plain and strict, 536/536 under
   protect mode, GC stress. Also `docs/map_entries_design.md`: the next slice,
   the key and its value of a Map entry in one line.
+- Found and fixed: a forced full-collection threshold below the live heap
+  (`TSAOT_GC_FULL_THRESHOLD_BYTES=268435456` on the TypeScript compiler
+  project, 460 MB live) ran a full collection at every allocation from then on
+  and the compile never finished; the forced value is now the first threshold
+  and grows past the live heap after a collection (ci_fast). Measured and not
+  adopted: `docs/map_entries_design.md`, the key and value of a Map entry in
+  one line (instructions 1.0006, cycles 0.9998 on tsc-ts: the maps' arrays are
+  cache-resident, a hit is a chain of L1 hits and the hash); `-O3` on the
+  units (+0.1%); `-mllvm -inline-threshold=600` (-1.8% instructions, about -1%
+  wall, +1.5% code size: recorded, not adopted yet). Next:
+  `docs/conservative_roots_design.md`, generated code without GC frames, the
+  roots found by scanning the native stack against an allocation bitmap (the
+  frame slots and the frame chain are a third of the generated code's time;
+  the slots alone 4% of the instructions).

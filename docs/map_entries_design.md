@@ -83,3 +83,19 @@ compaction, iteration during mutation), conformance (`map`, `set`,
 `weakmap`, `forof` fixtures) plain and strict, the GC stress gate and
 protect mode (the entries are a payload the young and the full collections
 mark), the bundler, the one-thread tsc-ts output compared byte for byte.
+
+## Result (Session 352): not adopted
+
+Built and gated on the collection fixtures (runtime unit tests, `map`,
+`set`, `forof`, `weak`, `iter`, `json` plain and strict), then measured
+against the strings-slice build on tsc-ts, one thread, six interleaved
+pairs: instructions 1.0006, cycles 0.9998, wall 1.70 against 1.70 s. The
+kernels did not move either (`map_string_keys` 1.79 G both ways;
+`map_forof` 0.75 -> 0.70 G once the cursor read a Map's entry in place).
+The maps' arrays are cache-resident on this workload: a hit's cost is the
+dependent chain of L1 hits (the cell, the index word, the key, the value)
+and the hash, about 30 cycles, and removing one 4-cycle link from it is
+below the noise. The change was reverted; what would shorten the chain is
+hoisting the receiver's checks and the index load out of loops, a cheaper
+hash (integer tests for -0 and NaN instead of the float compares), and a
+smaller index-to-entry path, each worth about a percent of the compile.

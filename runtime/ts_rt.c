@@ -1353,6 +1353,12 @@ static inline void gc_before_alloc(void){
         g_rt_full_trace_len++;
       }
 #endif
+    } else if (g_heap_bytes + TS_GC_MIN_FULL_BYTES / 4u >= g_full_threshold_bytes){
+      /* A forced threshold (TSAOT_GC_FULL_THRESHOLD_BYTES) below the live
+         heap would run a full collection at every allocation from here on (a
+         compile with a 256 MB threshold and 460 MB live never finished); the
+         value is the first threshold, then the heap may grow past it. */
+      g_full_threshold_bytes = g_heap_bytes * 2u;
     }
   }
 }
