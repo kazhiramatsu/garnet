@@ -5733,7 +5733,11 @@ static void gc_scan_stack_from_here(int young){
 __attribute__((noinline))
 static void gc_scan_stack_roots(int young){
   if (!g_conservative_roots) return;
-  if (!g_stack_hi) g_stack_hi = (uint64_t)(uintptr_t)pthread_get_stackaddr_np(pthread_self());
+  /* the base of the thread that runs this collection: the program's main runs
+     on its own thread (ts_rt.c main) and an exit-time collection runs on the
+     process's, so a base cached from one would send the other's scan across
+     the gap between the two stacks */
+  g_stack_hi = (uint64_t)(uintptr_t)pthread_get_stackaddr_np(pthread_self());
   jmp_buf regs;   /* the callee-saved registers, spilled where the scan sees them */
   if (setjmp(regs) == 0) gc_scan_stack_from_here(young);
   gc_scan_stack_words((const uint64_t*)&regs, (const uint64_t*)(&regs + 1), young);
@@ -19860,6 +19864,37 @@ tsv ts_asyncgen_return(tsv genobj, tsv val){
 void ts_abort_msg(const char* m){ fflush(stdout); fprintf(stderr, "tsaot: %s\n", m); fflush(stderr); abort(); }
 int ts_handlers_count(void){ int n=0; for(ts_handler* h=g_handlers;h;h=h->prev)n++; return n; }
 
+#if TS_ISO_MODE == 0
+/* The default mode's entry: the generated program's main (renamed
+   ts_user_main by the header) runs on a thread whose stack is
+   TSAOT_MAIN_STACK_MB megabytes (256 unless set; 0 runs it on the process's
+   own thread as before). The collector finds the stack's base through the
+   thread (pthread_get_stackaddr_np), so the scan is the same on either. */
+#include <pthread.h>
+#undef main
+static int ts_user_main_rc, ts_user_argc;
+static char** ts_user_argv;
+/* the entry called with both arguments through a typed pointer (the header
+   declares it without a prototype so a `main(void)` definition compiles too;
+   a `(void)` entry ignores the two registers, as isolate mode's entry does) */
+typedef int (*ts_user_main_fn)(int, char**);
+static int ts_user_main_call(int argc, char** argv){ return ((ts_user_main_fn)ts_user_main)(argc, argv); }
+static void* ts_user_main_thread(void* arg){ (void)arg; ts_user_main_rc = ts_user_main_call(ts_user_argc, ts_user_argv); return NULL; }
+int main(int argc, char** argv){
+  ts_user_argc = argc; ts_user_argv = argv;
+  const char* e = getenv("TSAOT_MAIN_STACK_MB");
+  size_t mb = e ? (size_t)strtoul(e, NULL, 10) : 256u;
+  if (mb == 0) return ts_user_main_call(argc, argv);
+  pthread_attr_t attr;
+  pthread_attr_init(&attr);
+  if (pthread_attr_setstacksize(&attr, mb << 20) != 0){ pthread_attr_destroy(&attr); return ts_user_main_call(argc, argv); }
+  pthread_t thread;
+  if (pthread_create(&thread, &attr, ts_user_main_thread, NULL) != 0){ pthread_attr_destroy(&attr); return ts_user_main_call(argc, argv); }
+  pthread_join(thread, NULL);
+  pthread_attr_destroy(&attr);
+  return ts_user_main_rc;
+}
+#endif
 #if TS_ISO_MODE == 1
 /* The accessor experiment (ts_rt.h): one isolate, reached through a
    thread-local pointer. */

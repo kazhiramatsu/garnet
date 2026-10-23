@@ -66,6 +66,19 @@ typedef uint64_t tsv; /* a tagged Value */
 #ifndef TS_ISO_MODE
 #define TS_ISO_MODE 0
 #endif
+#if TS_ISO_MODE == 0
+/* The program's main runs on a thread with a large stack (ts_rt.c defines
+   main: TSAOT_MAIN_STACK_MB, default 256, 0 for the process's own thread).
+   A deep recursion that fits V8's compact frames overflowed the 8 MB main
+   thread with the runtime's larger frames (the dynamic paths' in particular:
+   tsc-ts with every class dynamic needed more than 8 MB in its checker). */
+#define main ts_user_main
+/* declared without a prototype: a plain program's main is `main(void)`, a
+   hosted program's takes argc and argv, and either definition is compatible
+   with this declaration (the runtime passes both arguments; a `(void)`
+   entry ignores them, as isolate mode's entry does) */
+int ts_user_main();
+#endif
 #if TS_ISO_MODE
 struct ts_frame_hdr;
 typedef struct ts_iso {

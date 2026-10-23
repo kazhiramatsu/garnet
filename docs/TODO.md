@@ -8961,3 +8961,21 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   depth: linked with a 256 MB stack it completes, and its 78 output files are
   byte-identical to the typed build's), so the dynamic paths' larger frames
   need a larger main stack: the next slice.
+- Slice AI (runtime; `docs/conformance_fixes.md`, "The program's main on a
+  large stack"): the generated program's main ran on the process's 8 MB main
+  thread; tsc-ts compiled with every class dynamic overflowed it in the
+  checker's recursion (a finite depth: on a 256 MB stack it completes with
+  output byte-identical to the typed build's), and a recursion V8 completes
+  can overflow it with the runtime's larger frames. As isolate mode already
+  did on a 64 MB stack of its own, the default mode now runs main on a thread
+  whose stack is `TSAOT_MAIN_STACK_MB` megabytes (256 unless set; 0 for the
+  process's thread); the header renames the generated main. Virtual
+  reservation only; the collector now takes the stack base of the thread
+  running each collection (an exit-time collection of the stack-check build
+  runs on the process's thread, and the base cached from the program's thread
+  sent its scan across the gap between the two stacks: a segfault that lost
+  the buffered output, found by the GC stress gate). tsc-ts one checker 23.61
+  -> 23.61 G instructions, cycles and wall unchanged, outputs identical (one
+  thread creation at startup). The all-dynamic compile (every class dynamic)
+  runs 12.5 s against the typed build's 1.26 s: the dynamic paths are the next
+  target. Fixture `control/deep_recursion_dynamic`.

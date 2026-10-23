@@ -2438,3 +2438,26 @@ kinds; before the fix it printed 1.5e-323 where V8 prints 3).
 The debugging mode is the general way to exercise the dynamic paths with a
 typed program: the whole conformance suite passes in it, and a defect of
 tsc-ts in it is a defect of a dynamic path that an untyped program would hit.
+
+## The program's main on a large stack (session 352, slice AI)
+
+The generated program's `main` ran on the process's main thread, 8 MB on
+macOS. A recursion V8 completes with its compact frames can overflow that
+with the runtime's larger frames, and the dynamic paths' frames are larger
+still: tsc-ts compiled with every class dynamic (the debugging mode above)
+overflowed in the checker's recursion, a finite depth that completes on a
+256 MB stack with output byte-identical to the typed build's. Isolate mode
+already ran main on a 64 MB stack of its own; the default mode now does the
+same: the header renames the generated `main` to `ts_user_main`, and the
+runtime's `main` runs it on a thread whose stack is `TSAOT_MAIN_STACK_MB`
+megabytes (256 unless set; 0 runs it on the process's thread as before). The
+reservation is virtual. The collector takes the stack base of the thread
+running each collection rather than caching the first one: the stack-check
+build's exit-time collection runs on the process's thread after the program's
+thread has ended, and a base cached from the program's thread sent that scan
+across the gap between the two stacks (a segfault that lost the buffered
+output; the GC stress gate caught it). Fixture `control/deep_recursion_dynamic` (two thousand
+frames of dynamically dispatched methods: a sanity check that both engines
+finish and that the knob's settings run; V8 itself overflows at about five
+thousand of these frames, so the overflow this fixes, tsc-ts's checker in
+the dynamic mode, cannot be a conformance fixture).
