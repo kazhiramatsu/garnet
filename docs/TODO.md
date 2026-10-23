@@ -8696,3 +8696,33 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   `--noEmit`, `--noEmit --checkers 1`, `--noCheck --noEmit`, `--noCheck
   --outDir` all exit 0 (were 139); the emitting compile's outputs identical,
   instructions +0.06% (noise).
+- Slice T (`Map.get`/`Map.has` with an unboxed number key in line;
+  `docs/map_entries_design.md`): the general entry was 7.4% of the compile's
+  samples at about 25 cycles a call, instruction-bound (a hash, a probe, the
+  key and value loads), and 10.3 M of the 16.2 M get/has calls carry number
+  keys. The header's `ts_map_probe_num` runs the indexed map's probe in line
+  for a key from an unboxed local, found by its very bits or absent at an
+  empty slot; a receiver that is not a Map, a map in linear mode or an equal
+  number with other bits takes the general entry. The 113 get and 7 has sites
+  with an unboxed key cover 97.5% of the dynamic number-key lookups (the
+  general entry's number keys fell from 10.27 M to 0.25 M, the linear-mode
+  maps). Knob `TSAOT_MAP_NUM_INLINE=0`. Gates all green in 15 minutes with the
+  parallel runner (parity 384 identical / 161 known; selfconf 546; conformance
+  549 plain and strict, 546 protect; GC stress 8:41; bundler; unit; runtime
+  tests). tsc-ts one checker, outputs identical, four pairs: 25.84 -> 25.75 G
+  instructions (-0.3%), cycles -1.2%, wall 1.44 -> 1.43 s; class_nodes 4.72 ->
+  4.51 G. Tooling: `TSAOT_CONF_JOBS=N` runs the conformance runner as N shards
+  at once (the exhaustive tier 2:50 -> 1:00, the gate run 32 -> 15 minutes);
+  the GC stress stages print their start times; the profiler's
+  `TSAOT_PROF_PC_RAW` writes timestamped samples and `scripts/prof_window.py`
+  cuts one phase out of them (`docs/agent_workflow.md`). Measured with them,
+  the one-checker run by phase (a profiling build): parse 210, bind 115, check
+  1022, emit 589 ms; the bind window is 69% runtime, 55% of it the collector
+  (the third full collection at 195 MB marks the parsed AST for 6 MB
+  reclaimed, 40 ms; the remembered old nodes the binder writes are rescanned
+  whole by every minor); the check window is 60% generated code (callee-saved
+  register saves and restores 17%, `mov` of tag constants 14% of its samples,
+  `TS_UNDEFINED` alone 4.3%, with sampling skid) and `ts_map_get` 10.9% before
+  this slice. Measured and not adopted: `TSAOT_INLINE_HINT=2` (the hint also
+  for bodies of at most forty instructions with calls, 11,928 functions, +600
+  KB): -0.24% instructions, cycles unchanged.

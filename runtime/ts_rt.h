@@ -2473,6 +2473,57 @@ TS_RT_ALWAYS_INLINE int ts_ta_try_store_f(tsv v, double d, double x, int elem){
 }
 /* `view.length`: any view without own properties (an own `length` would
    shadow the accessor). */
+/* ---- Map and Set number keys (docs/map_entries_design.md) ----
+   The hash of a number key, consistent with SameValueZero: +0 and -0 one
+   value, every NaN one value, then MurmurHash3's fmix64 (a small integer's
+   double has a zero low word; one multiply left the slot-choosing low bits
+   poor). The map code and the inline lookups below share it. */
+#define TS_MAPSET_NEG_ZERO 0x8000000000000000ull
+TS_RT_ALWAYS_INLINE uint32_t sv0_hash_num_d(double d){
+  uint64_t bits;
+  if (d == 0) d = 0;                            /* -0 -> +0 */
+  if (d != d) bits = 0x7FF8000000000000ull;     /* canonical NaN */
+  else memcpy(&bits, &d, sizeof bits);
+  bits ^= bits >> 33; bits *= 0xff51afd7ed558ccdull; bits ^= bits >> 33;
+  bits *= 0xc4ceb9fe1a85ec53ull; bits ^= bits >> 33;
+  return (uint32_t)bits;
+}
+TS_RT_ALWAYS_INLINE uint32_t sv0_hash_num(tsv k){ return sv0_hash_num_d(ts_to_num(k)); }
+/* Map.get / Map.has with a number key from an unboxed local (the checker's
+   id-keyed caches, 10 M of a compile's 16 M lookups): the indexed map's probe
+   in line, the key found by its very bits (a stored number key is canonical:
+   +0, one NaN), or absent at an empty slot. Anything else, a receiver that is
+   not a Map, a map still in linear mode, a slot whose key is an equal number
+   with other bits, takes the general entry. The general entry alone was 7% of
+   a compile's samples at about 25 cycles a call. */
+TS_RT_ALWAYS_INLINE int ts_map_probe_num(tsv mv, double d, long* out){
+  if (TS_RT_UNLIKELY(!ts_is_obj(mv))) return 0;
+  ts_map* m = (ts_map*)ts_ptr(mv);
+  if (TS_RT_UNLIKELY(m->o.h.kind != TS_KIND_MAP || m->weak || !m->index)) return 0;
+  tsv k = ts_num(d == 0 ? 0.0 : d);
+  uint32_t h = sv0_hash_num_d(d);
+  uint32_t mask = m->index_cap - 1u, slot = h & mask;
+  for (;;){
+    uint32_t w = m->index[slot];
+    if (w == 0u){ *out = -1; return 1; }
+    if (w != 1u && ((w ^ h) & ~mask) == 0u){
+      uint32_t di = (w & mask) - 2u;
+      if (m->keys[di] == k){ *out = (long)di; return 1; }
+      return 0;
+    }
+    slot = (slot + 1u) & mask;
+  }
+}
+TS_RT_ALWAYS_INLINE tsv ts_map_get_num(tsv mv, double d){
+  long i;
+  if (TS_RT_LIKELY(ts_map_probe_num(mv, d, &i))) return i >= 0 ? ((ts_map*)ts_ptr(mv))->vals[i] : TS_UNDEFINED;
+  return ts_map_get(mv, ts_num(d));
+}
+TS_RT_ALWAYS_INLINE int ts_map_has_num(tsv mv, double d){
+  long i;
+  if (TS_RT_LIKELY(ts_map_probe_num(mv, d, &i))) return i >= 0;
+  return ts_map_has(mv, ts_num(d));
+}
 TS_RT_ALWAYS_INLINE int ts_ta_try_length(tsv v, tsv* out){
   if (!ts_is_obj(v)) return 0;
   ts_typedarray* t = (ts_typedarray*)ts_ptr(v);

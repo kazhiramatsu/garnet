@@ -484,7 +484,7 @@ fn emit_program_with_string_plans(
             };
             let storage = if force_inline_numeric_func(f) {
                 "TS_AOT_INLINE"
-            } else if inline_hint_enabled() && tiny_leaf_body(f) {
+            } else if hint_body(f) {
                 "TS_AOT_HINT"
             } else {
                 "static"
@@ -504,7 +504,7 @@ fn emit_program_with_string_plans(
             };
             let storage = if force_inline_numeric_func(f) {
                 "TS_AOT_INLINE"
-            } else if inline_hint_enabled() && tiny_leaf_body(f) {
+            } else if hint_body(f) {
                 "TS_AOT_HINT"
             } else {
                 "static"
@@ -2284,6 +2284,18 @@ fn sext32_expr(t: &str) -> String {
     } else {
         format!("({t} >= 0x80000000u) ? (long long){t} - 0x100000000LL : (long long){t}")
     }
+}
+
+/// TSAOT_MAP_NUM_INLINE=0 keeps `Map.get`/`Map.has` with an unboxed number key
+/// a runtime call (the parity oracle); on, the indexed map's probe is in line.
+fn map_num_inline_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_MAP_NUM_INLINE").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
 }
 
 /// TSAOT_TA_HOIST=0 keeps the per-use typed-array receiver test (the parity
@@ -7567,15 +7579,46 @@ fn tiny_inline_enabled() -> bool {
 /// still decides per site (the always-inline rule, `TSAOT_TINY_INLINE`, grew
 /// the code 4% and cost 1.5% in Session 350; docs/tiny_leaf_inline_design.md).
 fn inline_hint_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| matches!(std::env::var("TSAOT_INLINE_HINT").as_deref(), Ok("1")))
+    inline_hint_level() > 0
+}
+/// TSAOT_INLINE_HINT: 0 (default) no hint; 1 tiny leaves (`tiny_leaf_body`);
+/// 2 also small bodies with calls (at most forty instructions, no loop, no
+/// `try`, not a coroutine): the checker's accessors with one call inside.
+fn inline_hint_level() -> u32 {
+    static LEVEL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| match std::env::var("TSAOT_INLINE_HINT").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
+    })
+}
+/// A body of at most forty instructions in all, with calls but no loop, `try`
+/// or coroutine: a candidate for the inline hint at level 2.
+fn small_body_with_calls(f: &Function) -> bool {
+    if f.is_async || f.is_generator {
+        return false;
+    }
+    let mut flat: Vec<&Inst> = Vec::new();
+    flatten_inst(&f.body, &mut flat);
+    if flat.len() > 40 {
+        return false;
+    }
+    !flat.iter().any(|i| matches!(i, Inst::Loop { .. } | Inst::TryCatch { .. }))
+}
+/// The body qualifies for the inline hint at the configured level.
+fn hint_body(f: &Function) -> bool {
+    match inline_hint_level() {
+        0 => false,
+        1 => tiny_leaf_body(f),
+        _ => tiny_leaf_body(f) || small_body_with_calls(f),
+    }
 }
 /// The storage class of a direct entry: forced inline for a tiny leaf under
 /// `TSAOT_TINY_INLINE`, the inline hint under `TSAOT_INLINE_HINT`, else static.
 fn direct_entry_storage(f: &Function) -> &'static str {
     if tiny_leaf_direct(f) {
         "TS_AOT_INLINE"
-    } else if inline_hint_enabled() && tiny_leaf_body(f) {
+    } else if hint_body(f) {
         "TS_AOT_HINT"
     } else {
         "static"
@@ -8005,7 +8048,7 @@ fn emit_i64_function(
     };
     let storage = if force_inline_numeric_func(f) {
         "TS_AOT_INLINE"
-    } else if inline_hint_enabled() && tiny_leaf_body(f) {
+    } else if hint_body(f) {
         "TS_AOT_HINT"
     } else {
         "static"
@@ -8225,7 +8268,7 @@ fn emit_f64_function(
     };
     let storage = if force_inline_numeric_func(f) {
         "TS_AOT_INLINE"
-    } else if inline_hint_enabled() && tiny_leaf_body(f) {
+    } else if hint_body(f) {
         "TS_AOT_HINT"
     } else {
         "static"
@@ -20884,6 +20927,16 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 ),
                 // ---- Map ----
                 "map.set" => (format!("ts_map_set({}, {}, {})", r, v(0), v(1)), false),
+                // a number key from an unboxed local: the indexed map's probe in
+                // line (ts_rt.h ts_map_get_num; TSAOT_MAP_NUM_INLINE=0 keeps the call)
+                "map.get" if map_num_inline_enabled() && args.first().map_or(false, |a| ctx.unboxed.contains(&a.0)) => (
+                    format!("ts_map_get_num({}, {})", r, ctx.numc_double(args[0].0)),
+                    false,
+                ),
+                "map.has" if map_num_inline_enabled() && args.first().map_or(false, |a| ctx.unboxed.contains(&a.0)) => (
+                    format!("ts_bool(ts_map_has_num({}, {}))", r, ctx.numc_double(args[0].0)),
+                    false,
+                ),
                 "map.get" => (format!("ts_map_get({}, {})", r, v(0)), false),
                 "map.has" => (format!("ts_bool(ts_map_has({}, {}))", r, v(0)), false),
                 "map.delete" => (format!("ts_bool(ts_map_delete({}, {}))", r, v(0)), false),

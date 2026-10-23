@@ -108,7 +108,7 @@ static size_t sab_mapped_bytes(uint32_t n);
 #include <mach-o/dyld.h>
 #include <dlfcn.h>
 #include <pthread.h>
-typedef struct { uint64_t pc, lr, lr2; } prof_sample;
+typedef struct { uint64_t pc, lr, lr2; uint64_t t_us; } prof_sample;   /* t_us: microseconds since the sampler started */
 static prof_sample* g_prof_pcs;
 static volatile size_t g_prof_n;
 static size_t g_prof_cap;
@@ -117,12 +117,14 @@ static mach_port_t g_prof_target;
 static pthread_t g_prof_sampler;
 static volatile int g_prof_stop;
 static long g_prof_period_us = 100;
+static uint64_t g_prof_t0_ns;
 static void* prof_pc_sampler(void* arg){
   (void)arg;
   while (!g_prof_stop){
     usleep((useconds_t)g_prof_period_us);
     size_t n = g_prof_n;
     if (n >= g_prof_cap) break;
+    uint64_t now_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     if (thread_suspend(g_prof_target) != KERN_SUCCESS) continue;
     arm_thread_state64_t st; mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
     if (thread_get_state(g_prof_target, ARM_THREAD_STATE64, (thread_state_t)&st, &cnt) == KERN_SUCCESS){
@@ -132,6 +134,7 @@ static void* prof_pc_sampler(void* arg){
       /* the return address saved in the current frame: the caller of a
          function that set up a frame (a frameless leaf's fp is its caller's) */
       g_prof_pcs[n].lr2 = (fp >= g_prof_stack_lo && fp + 16 <= g_prof_stack_hi) ? *(uint64_t*)(uintptr_t)(fp + 8) : 0;
+      g_prof_pcs[n].t_us = (now_ns - g_prof_t0_ns) / 1000u;
       g_prof_n = n + 1;
     }
     thread_resume(g_prof_target);
@@ -152,6 +155,26 @@ static void prof_pc_dump(void){
   FILE* f = fopen(path, "w");
   if (!f) return;
   size_t n = g_prof_n;
+  /* TSAOT_PROF_PC_RAW=<file>: every sample in time order with its time in
+     microseconds since the sampler started, for a profile of one window of
+     the run (scripts/prof_window.py; the timeline's marks give the windows) */
+  const char* rawpath = getenv("TSAOT_PROF_PC_RAW");
+  if (rawpath && rawpath[0]){
+    FILE* rf = fopen(rawpath, "w");
+    if (rf){
+      fprintf(rf, "slide %lx\nsamples %zu\n", (long)_dyld_get_image_vmaddr_slide(0), n);
+      for (size_t i = 0; i < n; i++){
+        Dl_info di; const char* img = ""; const char* sym = ""; unsigned long off = 0;
+        if (dladdr((const void*)(uintptr_t)g_prof_pcs[i].pc, &di) && di.dli_fname){
+          img = strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1 : di.dli_fname;
+          if (di.dli_sname){ sym = di.dli_sname; off = (unsigned long)(g_prof_pcs[i].pc - (uint64_t)(uintptr_t)di.dli_saddr); }
+        }
+        fprintf(rf, "%llu %llx %s %s+%lu %llx %llx\n", (unsigned long long)g_prof_pcs[i].t_us, (unsigned long long)g_prof_pcs[i].pc,
+                img, sym, off, (unsigned long long)g_prof_pcs[i].lr, (unsigned long long)g_prof_pcs[i].lr2);
+      }
+      fclose(rf);
+    }
+  }
   qsort(g_prof_pcs, n, sizeof(prof_sample), prof_pc_cmp);
   fprintf(f, "slide %lx\nsamples %zu\n", (long)_dyld_get_image_vmaddr_slide(0), n);
   for (size_t i = 0; i < n;){
@@ -182,6 +205,7 @@ static void prof_pc_init(void){
   g_prof_stack_hi = (uint64_t)(uintptr_t)pthread_get_stackaddr_np(self);
   g_prof_stack_lo = g_prof_stack_hi - (uint64_t)pthread_get_stacksize_np(self);
   g_prof_target = pthread_mach_thread_np(self);
+  g_prof_t0_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
   if (pthread_create(&g_prof_sampler, NULL, prof_pc_sampler, NULL) != 0){ free(g_prof_pcs); g_prof_pcs = NULL; return; }
   atexit(prof_pc_dump);
 }
@@ -7486,29 +7510,14 @@ tsv ts_new_weakset(void){ return ts_new_set_impl(1); }
 #define TS_MAPSET_LINEAR_MAX 8u
 /* The bits of -0: Map.prototype.set and Set.prototype.add store a -0 key as
    +0 (ECMA-262 24.1.3.9 step 5, 24.2.3.1 step 4), so iteration yields +0. */
-#define TS_MAPSET_NEG_ZERO 0x8000000000000000ull
 
 /* Hash consistent with same_value_zero: sv0(a,b) => hash(a)==hash(b).
    numbers by canonical double value (±0 folded, one NaN), strings by content
    (cached storage hash when present), heap cells by identity — the C0
    identity-hash design: raw stable id (handle id today; the NONHEAP fallback
    is the address, stable because NONHEAP never moves) mixed at the use site. */
-/* sv0_hash of a number: ±0 folded, one NaN, then the finalizer below. */
-TS_RT_ALWAYS_INLINE uint32_t sv0_hash_num(tsv k){
-  double d = ts_to_num(k);
-  uint64_t bits;
-  if (d == 0) d = 0;                            /* -0 → +0 */
-  if (d != d) bits = 0x7FF8000000000000ull;     /* canonical NaN */
-  else memcpy(&bits, &d, sizeof bits);
-  /* The full 64-bit finalizer (MurmurHash3's fmix64). A small integer's double
-     has a zero low word, and one multiply left the low bits of its hash poor:
-     128 keys 0..127 took 37 of 512 slots, 5.8 probes each (the class_nodes
-     kernel spent 40% of its time in Map.get). The second round spreads them
-     (1.2 probes; docs/map_entries_design.md). */
-  bits ^= bits >> 33; bits *= 0xff51afd7ed558ccdull; bits ^= bits >> 33;
-  bits *= 0xc4ceb9fe1a85ec53ull; bits ^= bits >> 33;
-  return (uint32_t)bits;
-}
+/* sv0_hash of a number: the header's sv0_hash_num (shared with the inline
+   lookups ts_map_get_num / ts_map_has_num). */
 TS_RT_ALWAYS_INLINE uint32_t sv0_hash(tsv k){
   uint64_t bits;
   if (ts_is_num(k)){

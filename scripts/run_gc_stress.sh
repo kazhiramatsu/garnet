@@ -28,18 +28,18 @@ rc=0
 echo "=== tsaot GC stress [young threshold=$THRESHOLD] ==="
 
 if [[ "$RUN_BASE" != "0" ]]; then
-  echo ">>> focused conformance (normal O2)"
+  echo ">>> focused conformance (normal O2) ($(date +%H:%M:%S))"
   TSAOT_GC_YOUNG_THRESHOLD="$THRESHOLD" \
     bash "$S/run_conformance.sh" exhaustive "$FILTER" || rc=1
 
   if [[ "$RUN_ASAN" != "0" ]]; then
-    echo ">>> focused conformance (ASan)"
+    echo ">>> focused conformance (ASan) ($(date +%H:%M:%S))"
     TSAOT_GC_YOUNG_THRESHOLD="$THRESHOLD" TSAOT_CC="$ASAN_CC" \
       bash "$S/run_conformance.sh" exhaustive "$FILTER" || rc=1
   fi
 
   if [[ "$RUN_RUNTIME_ASAN" != "0" ]]; then
-    echo ">>> runtime unit tests (ASan)"
+    echo ">>> runtime unit tests (ASan) ($(date +%H:%M:%S))"
     TSAOT_GC_YOUNG_THRESHOLD="$THRESHOLD" TSAOT_CC="$ASAN_CC" \
       bash "$S/run_runtime_tests.sh" || rc=1
   fi
@@ -49,10 +49,10 @@ if [[ "$RUN_PROTECT" != "0" ]]; then
   # Protect mode (docs/gc_v2_design.md §6.8): freed cells are zapped and
   # quarantined instead of reused, and a collection that reaches one reports
   # the dangling reference (a missing root or write barrier).
-  echo ">>> focused conformance (protect mode, normal O2)"
+  echo ">>> focused conformance (protect mode, normal O2) ($(date +%H:%M:%S))"
   TSAOT_GC_YOUNG_THRESHOLD="$THRESHOLD" TSAOT_GC_PROTECT=1 \
     bash "$S/run_conformance.sh" exhaustive "$FILTER" || rc=1
-  echo ">>> runtime unit tests (protect mode)"
+  echo ">>> runtime unit tests (protect mode) ($(date +%H:%M:%S))"
   TSAOT_GC_YOUNG_THRESHOLD="$THRESHOLD" TSAOT_GC_PROTECT=1 \
     bash "$S/run_runtime_tests.sh" || rc=1
 fi
@@ -61,16 +61,16 @@ fi
 # promotes in place at the first survival (docs/gc_v2_design.md §6.8).
 
 if [[ "$RUN_FULL" == "1" ]]; then
-  echo ">>> full exhaustive conformance (normal O2)"
+  echo ">>> full exhaustive conformance (normal O2) ($(date +%H:%M:%S))"
   TSAOT_GC_YOUNG_THRESHOLD="$THRESHOLD" \
     bash "$S/run_conformance.sh" exhaustive || rc=1
 fi
 
 if [[ "$RUN_STRING_SCALE" != "0" ]]; then
   if [[ "$RUN_ASAN" != "0" ]]; then
-    echo ">>> string-builder 64 MiB scale stress (O2 + ASan)"
+    echo ">>> string-builder 64 MiB scale stress (O2 + ASan) ($(date +%H:%M:%S))"
   else
-    echo ">>> string-builder 64 MiB scale stress (O2)"
+    echo ">>> string-builder 64 MiB scale stress (O2) ($(date +%H:%M:%S))"
   fi
   TSAOT_STRING_SCALE_ASAN="$RUN_ASAN" \
     bash "$ROOT/tests/string_builder_scale_gate.sh" || rc=1
@@ -80,7 +80,7 @@ if [[ "$RUN_CELL_HEADER" != "0" ]]; then
   # The cell header's flags byte and sized instances' extents under every knob
   # that changes how instances are made, shaped or rescanned
   # (docs/cell_header_design.md).
-  echo ">>> cell header knobs"
+  echo ">>> cell header knobs ($(date +%H:%M:%S))"
   bash "$ROOT/tests/cell_header_gate.sh" || rc=1
 fi
 

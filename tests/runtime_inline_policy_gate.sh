@@ -92,7 +92,12 @@ while IFS= read -r name; do
     ts_ta_try_load_f | \
     ts_ta_try_store_i | \
     ts_ta_try_store_f | \
-    ts_ta_try_length) ;;
+    ts_ta_try_length | \
+    sv0_hash_num_d | \
+    sv0_hash_num | \
+    ts_map_probe_num | \
+    ts_map_get_num | \
+    ts_map_has_num) ;;
     *)
       echo "[runtime-inline] FAIL: unexpected always-inline runtime helper $name"
       exit 1

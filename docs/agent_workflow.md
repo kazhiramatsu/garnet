@@ -318,6 +318,26 @@ objects (`find build -name ts_regexp_adapter.o -not -path '*/native_s350*'
 is linked silently. A relink that copies a previous build's `regexp/`
 directory needs the same deletion (see `docs/regexp_first_char_prefilter_design.md`).
 
+### The conformance runner in parallel shards
+
+`TSAOT_CONF_JOBS=8 scripts/run_conformance.sh exhaustive` runs eight shards at
+once (each a child with `TSAOT_CONF_SHARD=i/8`) and merges their counts: the
+exhaustive tier in about a minute instead of three, and the GC stress gate,
+whose stages call the runner, in nine minutes instead of seventeen. A full
+gate run (parity, selfconf, unit, bundler, conformance plain, strict and
+protect, GC stress, the tsc-ts build) takes about fifteen minutes with it.
+
+### Profiling one phase of a run
+
+`TSAOT_PROF_PC_RAW=<file>` beside `TSAOT_PROF_PC` writes every sample with its
+time in microseconds since the sampler started; `scripts/prof_window.py <raw>
+<from ms> <to ms> <out pcs>` aggregates one window into the format
+`scripts/prof_pc.py` reads. tsc-ts's own timeline (`TSC_TS_TIMELINE=1`, marks
+on stderr in ms since the process started, the sampler starting a few ms
+later) gives the windows: the loader's walk is the parse, "program built" to
+"syntactic diagnostics" the bind, to "semantic diagnostics" the check, to
+"exit" the emit.
+
 ### Gotcha: a new `TS_RT_ALWAYS_INLINE` helper must be allowlisted
 
 `tests/runtime_inline_policy_gate.sh` enumerates every always-inline

@@ -27,6 +27,33 @@ RT="$ROOT/runtime"
 WORK="$(mktemp -d)"
 fail=0; npass=0; nfail=0
 
+# TSAOT_CONF_JOBS=N (N > 1): the run as N shards at once, each a child of this
+# script with TSAOT_CONF_SHARD=i/N and the same arguments; the per-test lines
+# pass through and the counts are merged into one summary line. The compile and
+# run of each test is the serial part of a run; the machine has the cores.
+if [[ -z "${TSAOT_CONF_SHARD:-}" && "${TSAOT_CONF_JOBS:-1}" -gt 1 ]]; then
+  jobs_n="$TSAOT_CONF_JOBS"; outs=(); pids=()
+  for ((i=1; i<=jobs_n; i++)); do
+    o="$WORK/shard_$i.out"; outs+=("$o")
+    TSAOT_CONF_SHARD="$i/$jobs_n" bash "${BASH_SOURCE[0]}" "$@" > "$o" 2>&1 &
+    pids+=($!)
+  done
+  rc=0; tpass=0; tfail=0; ttotal=0
+  for ((i=0; i<jobs_n; i++)); do
+    wait "${pids[$i]}" || rc=1
+    grep -v '^\[conf:' "${outs[$i]}"
+    line=$(grep -E '^\[conf:[a-z]+\] PASS=' "${outs[$i]}" | tail -1)
+    if [[ -n "$line" ]]; then
+      p=$(sed -E 's/.*PASS=([0-9]+).*/\1/' <<<"$line"); f=$(sed -E 's/.*FAIL=([0-9]+).*/\1/' <<<"$line"); t=$(sed -E 's#.*/ ([0-9]+)$#\1#' <<<"$line")
+      tpass=$((tpass+p)); tfail=$((tfail+f)); ttotal=$((ttotal+t))
+    fi
+  done
+  rm -rf "$WORK"
+  echo "[conf:$TIER] PASS=$tpass FAIL=$tfail / $ttotal"
+  (( tfail > 0 )) && rc=1
+  exit $rc
+fi
+
 [[ -x "$TSAOT" ]] || (cd "$ROOT/analyzer" && cargo build --release --quiet) || { echo "analyzer build FAILED"; exit 1; }
 [[ -f "$EX" ]] || (cd "$ROOT/exporter" && ./node_modules/.bin/tsc exporter.ts class_extract.ts --module commonjs --target es2020 --skipLibCheck --moduleResolution node --esModuleInterop) || { echo "exporter build FAILED"; exit 1; }
 
