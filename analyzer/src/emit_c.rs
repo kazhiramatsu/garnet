@@ -3564,6 +3564,8 @@ const SWITCH_TABLE_MIN_CASES: usize = 4;
 
 struct SwitchCase {
     values: Vec<i64>,
+    /// a string chain's labels: (hash, literal id, length)
+    str_values: Vec<(u32, usize, u32)>,
     body: Vec<Inst>,
     /// else-body indices from the head `If` down to this case's `If`
     path: Vec<usize>,
@@ -3574,6 +3576,29 @@ struct SwitchChain {
     cases: Vec<SwitchCase>,
     default_body: Vec<Inst>,
     default_path: Vec<usize>,
+    /// a switch on string literals (docs/switch_strings_design.md): the
+    /// discriminant's hash selects the case, which verifies its literals
+    string: bool,
+}
+
+/// A case label of a switch chain: an int32, or a string literal by its hash,
+/// literal id and length.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum SwitchKey {
+    Num(i64),
+    Str(u32, usize, u32),
+}
+
+/// TSAOT_STR_SWITCH=0 keeps a switch on string literals a chain of
+/// comparisons (the parity oracle).
+fn str_switch_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_STR_SWITCH").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
 }
 
 #[derive(Default)]
@@ -3598,16 +3623,14 @@ fn match_switch_segment(
     block: &[Inst],
     i: usize,
     disc: Option<u32>,
-    numeric: &BTreeSet<u32>,
+    disc_ok: &dyn Fn(u32) -> bool,
+    key_of: &dyn Fn(&ConstVal) -> Option<SwitchKey>,
     defs: &BTreeMap<u32, u32>,
     uses: &BTreeMap<u32, u32>,
-) -> Option<(u32, Vec<i64>, usize)> {
+) -> Option<(u32, Vec<SwitchKey>, usize)> {
     let single = |id: u32, n_uses: u32| defs.get(&id) == Some(&1) && uses.get(&id) == Some(&n_uses);
     let (c0, v0) = match block.get(i)? {
-        Inst::Const {
-            dst,
-            value: ConstVal::Num { value },
-        } => (dst.0, switch_const_i32(*value)?),
+        Inst::Const { dst, value } => (dst.0, key_of(value)?),
         _ => return None,
     };
     let (eq, d) = match block.get(i + 1)? {
@@ -3619,7 +3642,7 @@ fn match_switch_segment(
             return None;
         }
     }
-    if !numeric.contains(&d) || !single(c0, 1) || d == c0 || d == eq {
+    if !disc_ok(d) || !single(c0, 1) || d == c0 || d == eq {
         return None;
     }
     let mut values = vec![v0];
@@ -3642,10 +3665,7 @@ fn match_switch_segment(
             return None;
         }
         let (ck, vk) = match &then_body[0] {
-            Inst::Const {
-                dst,
-                value: ConstVal::Num { value },
-            } => (dst.0, switch_const_i32(*value)?),
+            Inst::Const { dst, value } => (dst.0, key_of(value)?),
             _ => return None,
         };
         let eqk = match &then_body[1] {
@@ -3675,15 +3695,17 @@ fn match_switch_segment(
     Some((d, values, j))
 }
 
-fn switch_plan_for(f: &Function, unboxed: &BTreeSet<u32>, int_local: &BTreeSet<u32>) -> SwitchPlan {
+fn switch_plan_for(
+    f: &Function,
+    unboxed: &BTreeSet<u32>,
+    int_local: &BTreeSet<u32>,
+    static_strings: &BTreeMap<Vec<u16>, usize>,
+) -> SwitchPlan {
     let mut plan = SwitchPlan::default();
     if !switch_table_enabled() {
         return plan;
     }
     let numeric: BTreeSet<u32> = unboxed.union(int_local).copied().collect();
-    if numeric.is_empty() {
-        return plan;
-    }
     let mut flat: Vec<&Inst> = Vec::new();
     flatten_inst(&f.body, &mut flat);
     let mut defs: BTreeMap<u32, u32> = BTreeMap::new();
@@ -3708,9 +3730,12 @@ fn switch_plan_for(f: &Function, unboxed: &BTreeSet<u32>, int_local: &BTreeSet<u
             }
         }
     }
+    #[allow(clippy::too_many_arguments)]
     fn walk(
         block: &[Inst],
-        numeric: &BTreeSet<u32>,
+        string: bool,
+        disc_ok: &dyn Fn(u32) -> bool,
+        key_of: &dyn Fn(&ConstVal) -> Option<SwitchKey>,
         defs: &BTreeMap<u32, u32>,
         uses: &BTreeMap<u32, u32>,
         plan: &mut SwitchPlan,
@@ -3724,14 +3749,14 @@ fn switch_plan_for(f: &Function, unboxed: &BTreeSet<u32>, int_local: &BTreeSet<u
                     else_body,
                     ..
                 } => {
-                    walk(then_body, numeric, defs, uses, plan);
-                    walk(else_body, numeric, defs, uses, plan);
+                    walk(then_body, string, disc_ok, key_of, defs, uses, plan);
+                    walk(else_body, string, disc_ok, key_of, defs, uses, plan);
                 }
                 Inst::Loop {
                     cond_body, body, ..
                 } => {
-                    walk(cond_body, numeric, defs, uses, plan);
-                    walk(body, numeric, defs, uses, plan);
+                    walk(cond_body, string, disc_ok, key_of, defs, uses, plan);
+                    walk(body, string, disc_ok, key_of, defs, uses, plan);
                 }
                 Inst::TryCatch {
                     try_body,
@@ -3739,17 +3764,20 @@ fn switch_plan_for(f: &Function, unboxed: &BTreeSet<u32>, int_local: &BTreeSet<u
                     finally_body,
                     ..
                 } => {
-                    walk(try_body, numeric, defs, uses, plan);
-                    walk(catch_body, numeric, defs, uses, plan);
-                    walk(finally_body, numeric, defs, uses, plan);
+                    walk(try_body, string, disc_ok, key_of, defs, uses, plan);
+                    walk(catch_body, string, disc_ok, key_of, defs, uses, plan);
+                    walk(finally_body, string, disc_ok, key_of, defs, uses, plan);
                 }
                 _ => {}
             }
             if let Some((disc, values, head_ix)) =
-                match_switch_segment(block, i, None, numeric, defs, uses)
+                match_switch_segment(block, i, None, disc_ok, key_of, defs, uses)
             {
                 let mut cases: Vec<SwitchCase> = Vec::new();
-                let mut seen: BTreeSet<i64> = BTreeSet::new();
+                let mut seen: BTreeSet<SwitchKey> = BTreeSet::new();
+                // a string chain: two different literals with one hash across
+                // cases cannot share a C case label; the chain stays a comparison chain
+                let mut seen_hash: BTreeMap<u32, usize> = BTreeMap::new();
                 let mut ok = true;
                 let mut path: Vec<usize> = Vec::new();
                 let mut cur_values = values;
@@ -3768,14 +3796,30 @@ fn switch_plan_for(f: &Function, unboxed: &BTreeSet<u32>, int_local: &BTreeSet<u
                         if !seen.insert(*v) {
                             ok = false;
                         }
+                        if let SwitchKey::Str(h, id, _) = v {
+                            match seen_hash.get(h) {
+                                Some(other) if *other != *id => ok = false,
+                                _ => {
+                                    seen_hash.insert(*h, *id);
+                                }
+                            }
+                        }
                     }
+                    let taken = std::mem::take(&mut cur_values);
                     cases.push(SwitchCase {
-                        values: std::mem::take(&mut cur_values),
+                        values: taken
+                            .iter()
+                            .filter_map(|k| if let SwitchKey::Num(n) = k { Some(*n) } else { None })
+                            .collect(),
+                        str_values: taken
+                            .iter()
+                            .filter_map(|k| if let SwitchKey::Str(h, id, len) = k { Some((*h, *id, *len)) } else { None })
+                            .collect(),
                         body: then_body.clone(),
                         path: path.clone(),
                     });
                     // a pure chain segment as the whole else-body continues the chain
-                    match match_switch_segment(else_body, 0, Some(disc), numeric, defs, uses) {
+                    match match_switch_segment(else_body, 0, Some(disc), disc_ok, key_of, defs, uses) {
                         Some((_, vals, ix)) if ix + 1 == else_body.len() => {
                             path.push(ix);
                             cur_values = vals;
@@ -3796,6 +3840,7 @@ fn switch_plan_for(f: &Function, unboxed: &BTreeSet<u32>, int_local: &BTreeSet<u
                             cases,
                             default_body,
                             default_path,
+                            string,
                         },
                     );
                 }
@@ -3805,7 +3850,29 @@ fn switch_plan_for(f: &Function, unboxed: &BTreeSet<u32>, int_local: &BTreeSet<u
             i += 1;
         }
     }
-    walk(&f.body, &numeric, &defs, &uses, &mut plan);
+    if !numeric.is_empty() {
+        let num_disc = |d: u32| numeric.contains(&d);
+        let num_key = |v: &ConstVal| match v {
+            ConstVal::Num { value } => switch_const_i32(*value).map(SwitchKey::Num),
+            _ => None,
+        };
+        walk(&f.body, false, &num_disc, &num_key, &defs, &uses, &mut plan);
+    }
+    if str_switch_enabled() && str_eq_const_enabled() {
+        // the discriminant a boxed local (a string compares as one only boxed),
+        // the labels string literals of the static table, by their hash
+        let str_disc = |d: u32| !numeric.contains(&d);
+        let str_key = |v: &ConstVal| -> Option<SwitchKey> {
+            let units: Vec<u16> = match v {
+                ConstVal::Str { value } => str_units(value),
+                ConstVal::Str16 { units } => units.clone(),
+                _ => return None,
+            };
+            let id = *static_strings.get(&units)?;
+            Some(SwitchKey::Str(c_strhash_units(&units), id, units.len() as u32))
+        };
+        walk(&f.body, true, &str_disc, &str_key, &defs, &uses, &mut plan);
+    }
     plan
 }
 
@@ -3823,7 +3890,24 @@ fn switch_no_case_value(chain: &SwitchChain) -> String {
 fn emit_switch_chain(s: &mut String, chain: &SwitchChain, ctx: &Ctx) {
     let l = ctx.fresh_label();
     let is_int = ctx.int_local.contains(&chain.disc);
-    if is_int {
+    if chain.string {
+        // The discriminant's hash (a string's cached storage hash; anything
+        // else a value no case has) selects the case, which verifies its
+        // literals by content before running: a hash collision with another
+        // string or a non-string discriminant reaches the default.
+        let used: BTreeSet<u32> = chain.cases.iter().flat_map(|c| c.str_values.iter().map(|v| v.0)).collect();
+        let mut none: u32 = 0xFFFF_FFFF;
+        while used.contains(&none) {
+            none -= 1;
+        }
+        let _ = writeln!(
+            s,
+            "  {{ uint32_t _sh{l} = ts_str_switch_hash({d}, {none}u); switch (_sh{l}) {{",
+            l = l,
+            d = ctx.val(chain.disc),
+            none = none
+        );
+    } else if is_int {
         let _ = writeln!(s, "  switch (d{}) {{", chain.disc);
     } else {
         // ToInt32 of the double (one instruction on ARMv8.3: ts_to_int32), and
@@ -3853,10 +3937,25 @@ fn emit_switch_chain(s: &mut String, chain: &SwitchChain, ctx: &Ctx) {
         }
     };
     for case in &chain.cases {
-        for v in &case.values {
-            let _ = writeln!(s, "  case {}:", v);
+        if chain.string {
+            let mut labels: BTreeSet<u32> = BTreeSet::new();
+            for (h, _, _) in &case.str_values {
+                if labels.insert(*h) {
+                    let _ = writeln!(s, "  case {}u:", h);
+                }
+            }
+            let tests: Vec<String> = case
+                .str_values
+                .iter()
+                .map(|(_, id, len)| format!("ts_eq_strlit({}, ts_str_v(&TS_STRLIT_{}), {}u)", ctx.val(chain.disc), id, len))
+                .collect();
+            let _ = writeln!(s, "  {{ if (!({})) goto L{}_sw;", tests.join(" || "), l);
+        } else {
+            for v in &case.values {
+                let _ = writeln!(s, "  case {}:", v);
+            }
+            s.push_str("  {\n");
         }
-        s.push_str("  {\n");
         push_path(ctx, &case.path);
         emit_seq(s, &case.body, ctx, PathEdge::IfThen);
         pop_path(ctx, &case.path);
@@ -3868,7 +3967,7 @@ fn emit_switch_chain(s: &mut String, chain: &SwitchChain, ctx: &Ctx) {
     emit_seq(s, &chain.default_body, ctx, PathEdge::IfElse);
     pop_path(ctx, &chain.default_path);
     s.push_str("  break; }\n");
-    if is_int {
+    if is_int && !chain.string {
         s.push_str("  }\n");
     } else {
         s.push_str("  } }\n");
@@ -8152,7 +8251,7 @@ fn emit_i64_function(
     let json_locals: BTreeSet<u32> = BTreeSet::new();
     let json_roots: BTreeSet<u32> = BTreeSet::new();
     let ctx = Ctx {
-        switch_plan: switch_plan_for(f, &unboxed, &int_local),
+        switch_plan: switch_plan_for(f, &unboxed, &int_local, static_strings),
         layouts: layout_plan_for(f),
         lazy_frame,
         lazy_homes,
@@ -8372,7 +8471,7 @@ fn emit_f64_function(
     let json_locals: BTreeSet<u32> = BTreeSet::new();
     let json_roots: BTreeSet<u32> = BTreeSet::new();
     let ctx = Ctx {
-        switch_plan: switch_plan_for(f, &unboxed, &int_local),
+        switch_plan: switch_plan_for(f, &unboxed, &int_local, static_strings),
         layouts: layout_plan_for(f),
         lazy_frame,
         lazy_homes,
@@ -8692,7 +8791,7 @@ fn emit_function(
         .map(|l| l.id.0)
         .collect();
     let typeof_fusion = typeof_fusion_plan(f);
-    let switch_plan = switch_plan_for(f, &unboxed, &int_local);
+    let switch_plan = switch_plan_for(f, &unboxed, &int_local, static_strings);
     let lazy_points = {
         let numeric_all: BTreeSet<u32> = unboxed.union(&int_local).copied().collect();
         let lazy_shape = lazy_frames_enabled() && prop_pic_enabled() && f.rest_param.is_none() && json_roots.is_empty();

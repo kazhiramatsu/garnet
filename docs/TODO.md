@@ -8742,3 +8742,20 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   null layout and the shared word 0 of unindexed classes). tsc-ts one checker,
   outputs identical, four pairs: 25.73 -> 25.49 G instructions (-0.9%), cycles
   -0.7%, wall 1.35 -> 1.34 s on a quiet machine.
+- Slice V (emitter, a switch on string literals dispatched by hash;
+  `docs/switch_strings_design.md`): the exporter lowers a `switch` into a loop
+  of comparisons in source order; for number labels the switch plan emits a C
+  `switch`, for string labels nothing did, so
+  `getCannotFindNameDiagnosticForName` (a hundred string cases, evaluated for
+  every entity name resolved) ran `ts_eq_strlit` once per label, 1.1% of the
+  check phase. The switch plan's second pass recognizes a chain of
+  string-literal labels on a boxed discriminant and emits `switch
+  (ts_str_switch_hash(v, NONE))` on the literals' FNV-1a hashes
+  (`c_strhash_units`, the runtime's `strhash_view`), each case verifying its
+  literals with `ts_eq_strlit` before running and falling to the default
+  otherwise; two labels of one hash across cases keep the comparison chain. 44
+  switches of the compiler dispatched. Knob `TSAOT_STR_SWITCH=0`. Fixture
+  `control/switch_strings`. Gates all green (parity 385 identical / 161 known;
+  selfconf 547; conformance 550 plain and strict, 547 protect; GC stress;
+  bundler; unit). tsc-ts one checker, outputs identical, four pairs: 25.48 ->
+  25.31 G instructions (-0.65%), cycles -0.3%, wall 1.34 -> 1.33 s.
