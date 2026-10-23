@@ -11256,8 +11256,34 @@ static ts_class_reg* class_reg_for(ts_object* o){
   return reg && ts_obj_sized_bytes(o) >= reg->min_size ? reg : NULL;
 }
 /* canonical-path bridge (A-2b): is `key` a struct field of o? give offset+numeric. */
+/* A second cache in front of the prototype-keyed one, keyed by the class
+   word and the key (docs/pic_sized_inline_design.md, "The registry's cache
+   by class word"): a word names one layout for the run, so a hit needs no
+   prototype read, no hash of the prototype and no size test. Relinked
+   instances (the word carries TS_CLS_RELINKED) and words outside the index
+   take the prototype-keyed path. */
+typedef struct { uint32_t cls; ts_key key; uint32_t epoch; uint32_t offset; int found, numeric; } ts_class_word_cache_entry;
+#define TS_CLASS_WORD_CACHE_SIZE 1024u
+static ts_class_word_cache_entry g_class_word_cache[TS_CLASS_WORD_CACHE_SIZE];
+static int class_field_lookup_by_proto(ts_object* o, ts_key key, size_t* off, int* numeric);
 static int class_field_lookup(ts_object* o, ts_key key, size_t* off, int* numeric){
   if (!o || !ts_obj_is_sized(o) || !g_class_reg_index_cap) return 0;
+  uint32_t w = o->cls;
+  if (TS_RT_LIKELY(w != 0u && !(w & TS_CLS_RELINKED) && w != TS_CLS_PROTO)){
+    uint32_t slot = ((w * 0x9E3779B1u) ^ prop_key_hash(key)) & (TS_CLASS_WORD_CACHE_SIZE - 1u);
+    ts_class_word_cache_entry* e = &g_class_word_cache[slot];
+    if (e->cls == w && e->key == key && e->epoch == g_ts_class_layout_epoch){
+      if (!e->found) return 0;
+      *off = e->offset; *numeric = e->numeric; return 1;
+    }
+    int r = class_field_lookup_by_proto(o, key, off, numeric);
+    e->cls = w; e->key = key; e->epoch = g_ts_class_layout_epoch; e->found = r;
+    if (r){ e->offset = (uint32_t)*off; e->numeric = *numeric; }
+    return r;
+  }
+  return class_field_lookup_by_proto(o, key, off, numeric);
+}
+static int class_field_lookup_by_proto(ts_object* o, ts_key key, size_t* off, int* numeric){
   tsv lp = layout_proto_of(o);
   if (!ts_proto_ref(lp)) return 0;
   RT_STAT_INC(class_field_calls);

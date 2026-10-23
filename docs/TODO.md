@@ -9039,3 +9039,14 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   build's; the typed one checker 23.58 -> 23.59 G instructions (+0.07%, the
   flag test at the out-of-line entry), cycles and wall within noise, outputs
   identical. Fixture `classes/megamorphic_field_sites`.
+- Slice AM (runtime, the dynamic paths; `docs/pic_sized_inline_design.md`,
+  "The registry's cache by class word"): the registry's field cache, the
+  megamorphic path's remaining cost (11% of the all-dynamic compile), was
+  keyed by the prototype and the key, so each probe read the receiver's
+  prototype (a relink test, a registry read for relinked words), hashed the
+  pointer and tested the receiver's size. A second cache in front of it is
+  keyed by the class word and the key: a word names one layout for the run, so
+  a hit needs none of that; a relinked instance or a word outside the index
+  takes the prototype-keyed path. The all-dynamic compile of tsc-ts: 7.45 ->
+  7.29 s (-2%), outputs identical to the typed build's; the typed one checker
+  23.61 -> 23.61 G instructions, cycles and wall unchanged, outputs identical.

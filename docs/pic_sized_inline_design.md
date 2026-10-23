@@ -119,3 +119,50 @@ with own properties and a plain object in the mix).
 | tsc-ts typed, one checker, instructions | 23.58 G | 23.59 G (+0.07%) |
 
 Outputs identical in both.
+
+## The registry's cache by class word (slice AM)
+
+`class_field_lookup`, the registry's field cache, was the megamorphic path's
+remaining cost (11% of the all-dynamic compile): keyed by the prototype and the
+key, each probe read the receiver's prototype through `layout_proto_of` (a
+relink test and a registry read for relinked words), hashed it, and tested the
+receiver's size. A second cache in front of it is keyed by the class word and
+the key: a word names one layout for the run, so a hit needs no prototype
+read, no hash of a pointer and no size test, and a relinked instance (its word
+carries the flag) or a word outside the index takes the prototype-keyed path
+as before. The entries carry the layout epoch; a registration invalidates them.
+
+| program | before | after |
+|---|---|---|
+| tsc-ts, every class dynamic, wall | 7.45 s | 7.29 s (-2%) |
+| tsc-ts typed, one checker, instructions | 23.61 G | 23.61 G |
+
+Outputs identical in both. The dynamic compile's remaining cost has moved to
+its method calls: the two cached reads of a dynamic call (the own property,
+then the prototype method), each out of line for a sized receiver, and the
+generic call entry.
+
+## The method of a dynamic call (slice AN)
+
+After slices AJ to AM the all-dynamic compile's remaining cost is its method
+calls. A dynamic call (`CalleeRef::Method` the devirt pass could not resolve)
+read the method value twice through per-site caches: the own property under
+the field key (a function stored in a field, or an object literal's method),
+then the prototype method under the method key, each read a call into the
+runtime for a sized receiver, and a site over many classes ran each read's
+megamorphic path. The runtime now resolves the method of a sized class
+instance in one call, `ts_method_lookup_sized`: the own property through the
+registry's cache by class word (slice AM), the instance's sidecar when it has
+one, then the prototype method through a cache keyed by the class word and
+the method key that remembers the prototype object holding the method, that
+object's shape word and the slot. A hit re-reads the slot, so a method
+replaced in place is followed; a method deleted or redefined changes the
+holder's shape and misses; a relinked instance (its word carries the flag), a
+relinked prototype anywhere in the program (`g_class_relinked`), an accessor
+and a dictionary-mode holder take the full chain lookup. A receiver that is
+not a sized instance takes the two cached reads as before. The emitter uses
+the entry at a call whose receiver the program types as a class instance (not
+the dynamic sentinel class); `TSAOT_METHOD_SIZED_CACHE=0` keeps the two
+reads (the parity oracle's shape).
+
+Measurements: see TODO (session 352, slice AN).
