@@ -793,11 +793,44 @@ static inline int ts_str_unit_eq_at(ts_strview xs, uint32_t xi, ts_strview ns, u
   }
   return ts_str_cu_at_view(xs, xi) == ts_str_cu_at_view(ns, ni);
 }
+/* A needle's units in the haystack's storage width, into `buf` (at least
+   2 * TS_STR_NEEDLE_MAX bytes): a one-byte needle widened for a two-byte
+   haystack, a two-byte needle narrowed for a one-byte one (impossible when a
+   unit is beyond 0xFF: `*found` is 0 and the search is a miss). A needle that
+   is too long or has no data pointer is returned as is. */
+#define TS_STR_NEEDLE_MAX 32u
+static inline ts_strview ts_strview_rewiden(ts_strview ns, ts_strview xs, char* buf, int* found){
+  *found = 1;
+  if (!ns.data || !xs.data || ts_str_same_storage_width(xs, ns) || ns.len > TS_STR_NEEDLE_MAX) return ns;
+  if (xs.flags & TS_STR_FLAG_UTF16){
+    for (uint32_t i = 0; i < ns.len; i++){ uint16_t cu = (uint16_t)(unsigned char)ns.data[i]; memcpy(buf + (size_t)i * 2u, &cu, 2); }
+    ns.data = buf; ns.flags |= TS_STR_FLAG_UTF16;
+    return ns;
+  }
+  for (uint32_t i = 0; i < ns.len; i++){
+    uint16_t cu; memcpy(&cu, ns.data + (size_t)i * 2u, 2);
+    if (cu > 0xFFu){ *found = 0; return ns; }
+    buf[i] = (char)(unsigned char)cu;
+  }
+  ns.data = buf; ns.flags &= ~TS_STR_FLAG_UTF16;
+  return ns;
+}
 static inline int ts_str_region_eq(ts_strview xs, uint32_t xi, ts_strview ns, uint32_t ni, uint32_t len){
   if (len == 0) return 1;
-  if (xs.data && ns.data && ts_str_same_storage_width(xs, ns)){
-    uint32_t w = ts_str_unit_size_flags(xs.flags);
-    return memcmp(xs.data + (size_t)xi * w, ns.data + (size_t)ni * w, (size_t)len * w) == 0;
+  if (xs.data && ns.data){
+    if (ts_str_same_storage_width(xs, ns)){
+      uint32_t w = ts_str_unit_size_flags(xs.flags);
+      return memcmp(xs.data + (size_t)xi * w, ns.data + (size_t)ni * w, (size_t)len * w) == 0;
+    }
+    /* one side two-byte, the other one-byte (a two-byte source text against
+       an interned identifier): the wide unit against the byte, in line */
+    const char* wide = (xs.flags & TS_STR_FLAG_UTF16) ? xs.data + (size_t)xi * 2u : ns.data + (size_t)ni * 2u;
+    const unsigned char* narrow = (const unsigned char*)((xs.flags & TS_STR_FLAG_UTF16) ? ns.data + ni : xs.data + xi);
+    for (uint32_t k = 0; k < len; k++){
+      uint16_t cu; memcpy(&cu, wide + (size_t)k * 2u, 2);
+      if (cu != narrow[k]) return 0;
+    }
+    return 1;
   }
   for (uint32_t k=0;k<len;k++){
     if (ts_str_cu_at_view(xs, xi + k) != ts_str_cu_at_view(ns, ni + k)) return 0;
@@ -812,8 +845,16 @@ static inline long long ts_str_find_unit_view(ts_strview xs, uint16_t wanted, ui
     return hit ? (long long)(hit - xs.data) : -1;
   }
   if (xs.data){
+    if (xs.flags & TS_STR_FLAG_UTF16){
+      const char* p = xs.data;
+      for (uint32_t i=pos;i<pos+len;i++){
+        uint16_t cu; memcpy(&cu, p + (size_t)i * 2u, 2);
+        if (cu == wanted) return (long long)i;
+      }
+      return -1;
+    }
     for (uint32_t i=pos;i<pos+len;i++)
-      if (ts_str_cu_at_contiguous(xs, i) == wanted) return (long long)i;
+      if ((unsigned char)xs.data[i] == wanted) return (long long)i;
     return -1;
   }
   for (uint32_t i=pos;i<pos+len;i++) if (ts_str_cu_at_view(xs, i) == wanted) return (long long)i;
@@ -917,9 +958,14 @@ static inline double ts_str_charcodeat_general(tsv s, double idx){
 TS_RT_ALWAYS_INLINE double ts_str_charcodeat_typed(tsv s, double idx){
   if (TS_RT_LIKELY(ts_is_heap_str(s))){
     const ts_string* x = ts_str_ptr_typed(s);
-    if (TS_RT_LIKELY(!(x->flags & (TS_STR_FLAG_VIEW | TS_STR_FLAG_UTF16))) &&
-        idx >= 0 && idx < (double)x->len)
+    uint32_t fl = x->flags & (TS_STR_FLAG_VIEW | TS_STR_FLAG_UTF16);
+    if (TS_RT_LIKELY(fl == 0) && idx >= 0 && idx < (double)x->len)
       return (double)(unsigned char)x->data[(uint32_t)idx];
+    /* a flat two-byte string (a source text with one character beyond
+       Latin-1 is one): the unit in line as well */
+    if (fl == TS_STR_FLAG_UTF16 && idx >= 0 && idx < (double)x->len){
+      uint16_t cu; memcpy(&cu, x->data + (size_t)(uint32_t)idx * 2u, 2); return (double)cu;
+    }
   }
   return ts_str_charcodeat_general(s, idx);
 }
@@ -931,9 +977,12 @@ static inline long long ts_str_charcodeat_i64_general(tsv s, long long i){
 static inline long long ts_str_charcodeat_i64_typed(tsv s, long long i){
   if (TS_RT_LIKELY(ts_is_heap_str(s))){
     const ts_string* x = ts_str_ptr_typed(s);
-    if (TS_RT_LIKELY(!(x->flags & (TS_STR_FLAG_VIEW | TS_STR_FLAG_UTF16))) &&
-        (unsigned long long)i < (unsigned long long)x->len)
+    uint32_t fl = x->flags & (TS_STR_FLAG_VIEW | TS_STR_FLAG_UTF16);
+    if (TS_RT_LIKELY(fl == 0) && (unsigned long long)i < (unsigned long long)x->len)
       return (long long)(unsigned char)x->data[(uint32_t)i];
+    if (fl == TS_STR_FLAG_UTF16 && (unsigned long long)i < (unsigned long long)x->len){
+      uint16_t cu; memcpy(&cu, x->data + (size_t)(uint32_t)i * 2u, 2); return (long long)cu;
+    }
   }
   return ts_str_charcodeat_i64_general(s, i);
 }

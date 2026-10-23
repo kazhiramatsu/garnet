@@ -8654,3 +8654,26 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   them) hold a character beyond Latin-1, so garnet stores them two bytes a
   unit and every `charCodeAt`, `indexOf` and `startsWith` on them has taken
   the general paths; slice R.
+- Slice R (runtime, two-byte texts): 5 of the compiler's 78 sources (3.6 of
+  10.0 MB, checker.ts among them) hold a character beyond Latin-1, so garnet
+  stores them two bytes a unit and every operation on them took the general
+  paths. Now `charCodeAt` reads a flat two-byte string's unit in line (the
+  one-byte path keeps its single flag test), the forward and backward searches
+  re-widen a one-byte needle to a two-byte haystack (or narrow a two-byte
+  needle; a unit beyond 0xFF is a miss) so the contiguous same-width paths
+  apply, a region comparison across widths runs a direct loop (`startsWith` of
+  an interned identifier against the text), and the single-unit search over
+  two-byte storage is a plain loop. Fixture `strings/two_byte_text` (a benign
+  parity difference recorded: two unused locals). Gates all green (parity 384
+  identical / 160 known; selfconf 545, 499 pass; conformance 548 plain and
+  strict, 545 protect; GC stress; bundler; unit; runtime tests). tsc-ts one
+  checker, outputs identical, four pairs: 26.03 -> 25.81 G instructions
+  (-0.8%), cycles -3.6%, wall 1.54 -> 1.46 s (-5%); the parse-only run
+  unchanged (the scanner reads a Uint16Array). Measured and not adopted:
+  `TSAOT_INLINE_HINT=1`, a `static inline` hint (through the unit header,
+  `TS_AOT_HINT`; a hinted function with inline-cache cells is demoted to a
+  unit function) for the tiny leaves `tiny_leaf_body` accepts: the class_nodes
+  kernel 4.72 -> 4.05 G, tsc-ts -0.07% instructions, cycles and wall
+  unchanged; the knob stays off. A 16 MB nursery: -0.4% instructions, noise;
+  `TSAOT_GC_FULL_THRESHOLD_BYTES` fixes the threshold (no pacing) and is not
+  an initial-threshold knob: +44% instructions at 64 MB.

@@ -448,7 +448,11 @@ fn emit_program_with_string_plans(
     s.push_str("#define TS_AOT_INLINE static inline __attribute__((always_inline))\n");
     s.push_str("#else\n");
     s.push_str("#define TS_AOT_INLINE static inline\n");
-    s.push_str("#endif\n\n");
+    s.push_str("#endif\n");
+    if inline_hint_enabled() {
+        s.push_str("#define TS_AOT_HINT static inline\n");
+    }
+    s.push_str("\n");
 
     emit_static_string_literals(&mut s, &static_strings);
     emit_class_layout(&mut s, &classes);
@@ -460,7 +464,7 @@ fn emit_program_with_string_plans(
     let known_methods = known_method_closures(program);
     for f in &program.functions {
         if let Some(sig) = direct_sigs.get(&f.id.0) {
-            let storage = if tiny_leaf_direct(f) { "TS_AOT_INLINE" } else { "static" };
+            let storage = direct_entry_storage(f);
             let _ = writeln!(s, "{} {} {}_d({});", storage, sig.c_ret(), cname(f), sig.c_params());
         }
     }
@@ -480,6 +484,8 @@ fn emit_program_with_string_plans(
             };
             let storage = if force_inline_numeric_func(f) {
                 "TS_AOT_INLINE"
+            } else if inline_hint_enabled() && tiny_leaf_body(f) {
+                "TS_AOT_HINT"
             } else {
                 "static"
             };
@@ -498,6 +504,8 @@ fn emit_program_with_string_plans(
             };
             let storage = if force_inline_numeric_func(f) {
                 "TS_AOT_INLINE"
+            } else if inline_hint_enabled() && tiny_leaf_body(f) {
+                "TS_AOT_HINT"
             } else {
                 "static"
             };
@@ -7554,8 +7562,32 @@ fn tiny_inline_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| matches!(std::env::var("TSAOT_TINY_INLINE").as_deref(), Ok("1")))
 }
+/// TSAOT_INLINE_HINT=1: a tiny leaf's direct entry is declared `static inline`,
+/// a hint that raises clang's inlining budget for it while its cost model
+/// still decides per site (the always-inline rule, `TSAOT_TINY_INLINE`, grew
+/// the code 4% and cost 1.5% in Session 350; docs/tiny_leaf_inline_design.md).
+fn inline_hint_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| matches!(std::env::var("TSAOT_INLINE_HINT").as_deref(), Ok("1")))
+}
+/// The storage class of a direct entry: forced inline for a tiny leaf under
+/// `TSAOT_TINY_INLINE`, the inline hint under `TSAOT_INLINE_HINT`, else static.
+fn direct_entry_storage(f: &Function) -> &'static str {
+    if tiny_leaf_direct(f) {
+        "TS_AOT_INLINE"
+    } else if inline_hint_enabled() && tiny_leaf_body(f) {
+        "TS_AOT_HINT"
+    } else {
+        "static"
+    }
+}
 fn tiny_leaf_direct(f: &Function) -> bool {
-    if !tiny_inline_enabled() || f.is_async || f.is_generator {
+    tiny_inline_enabled() && tiny_leaf_body(f)
+}
+/// A body of at most twenty constants, copies, arithmetic, field and index
+/// reads and writes, `if`s and returns: no call, allocation, loop or `try`.
+fn tiny_leaf_body(f: &Function) -> bool {
+    if f.is_async || f.is_generator {
         return false;
     }
     fn walk(body: &[Inst], n: &mut usize) -> bool {
@@ -7973,6 +8005,8 @@ fn emit_i64_function(
     };
     let storage = if force_inline_numeric_func(f) {
         "TS_AOT_INLINE"
+    } else if inline_hint_enabled() && tiny_leaf_body(f) {
+        "TS_AOT_HINT"
     } else {
         "static"
     };
@@ -8191,6 +8225,8 @@ fn emit_f64_function(
     };
     let storage = if force_inline_numeric_func(f) {
         "TS_AOT_INLINE"
+    } else if inline_hint_enabled() && tiny_leaf_body(f) {
+        "TS_AOT_HINT"
     } else {
         "static"
     };
@@ -8662,7 +8698,7 @@ fn emit_function(
                 f.id.0
             );
         }
-        let storage = if tiny_leaf_direct(f) { "TS_AOT_INLINE" } else { "static" };
+        let storage = direct_entry_storage(f);
         let _ = writeln!(s, "{} {} {}_d({}){{", storage, sig.c_ret(), cname(f), sig.c_params());
         s.push_str(&method_this_check(f, &format!("_p{}", f.capture_count)));
     } else {

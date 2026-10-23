@@ -3796,6 +3796,9 @@ long long ts_str_find_forward_view_slow(ts_strview xs, ts_strview ns,
   if (start < 0) start = 0;
   if (ns.len == 0) return start > (long long)xs.len ? (long long)xs.len : start;
   if (ns.len > xs.len || start > (long long)xs.len - (long long)ns.len) return -1;
+  char wbuf[2u * TS_STR_NEEDLE_MAX]; int found;
+  ns = ts_strview_rewiden(ns, xs, wbuf, &found);   /* a two-byte text, a one-byte needle */
+  if (!found) return -1;
   if (xs.data && ns.data && ts_str_same_storage_width(xs, ns)){
     uint32_t w = ts_str_unit_size_flags(xs.flags);
     const char* xdata = xs.data;
@@ -3859,6 +3862,9 @@ long long ts_str_find_backward_view_slow(ts_strview xs, ts_strview ns,
                                          long long start){
   char nbuf[TS_SHORTSTR_MAX];
   ns = ts_strview_materialize(ns, nbuf);
+  char wbuf[2u * TS_STR_NEEDLE_MAX]; int found;
+  ns = ts_strview_rewiden(ns, xs, wbuf, &found);
+  if (!found && ns.len) return -1;
   long long maxstart = (long long)xs.len - (long long)ns.len;
   if (ns.len == 0){
     if (start < 0) return 0;

@@ -287,6 +287,7 @@ fn classify(text: String) -> Result<Item, String> {
         || t.starts_with("union ")
         || t.starts_with("enum ")
         || t.starts_with("TS_AOT_INLINE")
+        || t.starts_with("TS_AOT_HINT")
     {
         return Ok(Item::Header(text));
     }
@@ -398,6 +399,48 @@ fn rewrite_calls(body: &str, copied: impl Fn(&str) -> bool) -> (String, BTreeSet
     (out, used)
 }
 
+/// A `TS_AOT_HINT` function whose body has local statics (inline-cache cells)
+/// cannot be a header function, as every unit would get cells of its own: it
+/// and its prototype become an ordinary unit function, the hint dropped.
+fn demote_hinted_with_statics(items: Vec<Item>) -> Result<Vec<Item>, String> {
+    let hinted_name = |text: &str| -> Option<String> {
+        let t = text.trim_start();
+        if !t.starts_with("TS_AOT_HINT") {
+            return None;
+        }
+        let k = body_start(t).unwrap_or(t.len());
+        declared_name(&t[..k])
+    };
+    let mut demote: HashSet<String> = HashSet::new();
+    for it in &items {
+        if let Item::Header(text) = it {
+            let t = text.trim_start();
+            if t.starts_with("TS_AOT_HINT") && body_start(t).is_some() && has_local_static(t) {
+                if let Some(name) = hinted_name(text) {
+                    demote.insert(name);
+                }
+            }
+        }
+    }
+    if demote.is_empty() {
+        return Ok(items);
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for it in items {
+        match it {
+            Item::Header(text) => match hinted_name(&text) {
+                Some(name) if demote.contains(&name) => {
+                    let plain = text.trim_start().replacen("TS_AOT_HINT", "static", 1);
+                    out.push(classify(plain)?);
+                }
+                _ => out.push(Item::Header(text)),
+            },
+            other => out.push(other),
+        }
+    }
+    Ok(out)
+}
+
 fn has_local_static(body: &str) -> bool {
     // TS_ISO_IC: the threads accessor experiment keeps the plain build's copies
     identifiers(body).iter().any(|&(s, e)| &body[s..e] == "static" || &body[s..e] == "TS_ISO_IC")
@@ -421,6 +464,7 @@ pub fn split(
     for t in top_level_items(c) {
         items.push(classify(t)?);
     }
+    let items = demote_hinted_with_statics(items)?;
     // functions: unit assignment
     let mut lines_of: HashMap<String, usize> = HashMap::new();
     let mut is_fn: HashSet<String> = HashSet::new();
@@ -602,7 +646,9 @@ pub fn split(
     for it in &items {
         match it {
             Item::Header(t) => {
-                if t.trim_start().starts_with("TS_AOT_INLINE") && has_local_static(t) {
+                if (t.trim_start().starts_with("TS_AOT_INLINE") || t.trim_start().starts_with("TS_AOT_HINT"))
+                    && has_local_static(t)
+                {
                     return Err(format!("a header function with local statics: {}", first_line(t)));
                 }
                 header.push_str(t);
