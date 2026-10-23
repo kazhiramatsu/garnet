@@ -8515,3 +8515,28 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   assigns a parameter only when the call passed it
   (`functions/arguments_length` read a stale slot: 20 for 13); reverted, the
   fixture `closures/undef_init_paths` kept.
+- Measured and not adopted (slice L): the generated code compiled with `-mllvm
+  -inline-threshold=600` on the current build: 26.87 -> 26.69 G instructions
+  (-0.7%; it was -1.8% before the frames went), wall 1.42 against 1.43 s, code
+  +1.5%. The four-checker configuration re-measured on the current build: 0.94
+  -> 0.77 s (scriptc 0.43 s); its timeline shows main parsing all 249 files
+  before the fork (190 ms), 90 ms of checker creation and publication, then
+  checker.ts's check and emit (~590 + 177 ms under load) as the critical path:
+  the parse of the other files is the structural item left (F4,
+  `docs/fork_workers_design.md`).
+- F4 (parallel parsing on forked workers) analyzed, not started:
+  `docs/parallel_parse_fork_design.md`. The four-checker timeline puts 190 ms
+  of parsing and 90 ms of binding and publication in the main process before
+  the fork; scriptc's tsc-ts parses and binds ahead on threads. A forked parse
+  child would have to publish bound SourceFile graphs, which a fork can only
+  do through a shared region at a fixed address, and the process-local tables
+  are the crux: shape ids and interned key ids are assigned in order of first
+  use, the parse phase creates 16,967 of the compile's 16,982 shapes and 5,785
+  dynamic additions, so the tables themselves would have to be shared across
+  processes (atomic ids, synchronized transitions). Several days; first,
+  parsing and binding faster on one thread, which shortens the serial prefix
+  of both configurations: the parse-only run (`--listFilesOnly`) takes 0.22 s
+  and 4.45 G instructions, its profile 44% generated code (the scanner's
+  methods, `keywordKindAt`, `computeLineStarts`), 40% runtime (`td_m_decode`
+  5.6%, `gc_mark_visit` 4.8%, `shape_transition_f` 4.1%,
+  `ts_str_find_forward_view_slow` 2.1%), 16% system libraries.
