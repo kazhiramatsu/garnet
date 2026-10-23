@@ -2383,3 +2383,35 @@ arguments, the predicates, and the same through `any` and a bracket-named call).
 
 Still open: a method call on an Array subclass instance (`class Stack extends
 Array`; `s.push()` fails with "push is not a function").
+
+## An instance's own property shadowing a class method (session 352, slice AF)
+
+`(x as any).m = f` on a class instance adds an own property that shadows the
+prototype method; a later `x.m()` must call `f`. The class extractor already
+makes a class dispatch dynamically when a method-named property is written
+through a receiver of that class, cast or not (`method-reassign`). Two paths
+still reached the method directly:
+
+- a virtual call through its class table (several implementations): the
+  table path took any instance whose class word was in the interval. It now
+  also requires the instance to carry no own dynamic properties (the sized
+  head's sidecar pointer is NULL), one load and one branch beside the class
+  word it already loads; an instance with own properties takes the prototype
+  lookup, which honors the shadow. Knob `TSAOT_SHADOW_GUARD=0` (the parity
+  oracle has no guard).
+- a direct call to a method with one implementation after a write through a
+  receiver of no known class (`const d = x as any; d.m = f`, an unknown
+  object, `Object.defineProperty(anyObj, "m", ...)`, `anyObj[k] = f`). This
+  stays a known gap. The obvious rule, "a method-named property written
+  through a receiver of no known class makes every class with that method
+  dynamic", was tried and withdrawn: on tsc-ts it fired for `write` (16
+  classes), `kind` (14), `typeParameters`, `diagnostics`, `value`, `length`
+  and nine more, names that plain objects share with class methods, marking
+  47 classes unstable (6 before), and the compile ran seven times slower.
+  That run also produced different compiler output, so the broadly dynamic
+  mode itself has a latent defect worth its own investigation (TODO).
+
+Fixture `classes/instance_method_shadow` (typed and cast shadows; base-typed,
+subclass-typed and `any` calls; deletion restoring the method; a plain object
+literal typed as the class; a single-implementation method shadowed through
+a cast of the instance itself).

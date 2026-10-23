@@ -8899,3 +8899,37 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   threw "incompatible receiver"; it now calls the object's own method
   (`ts_collection_method_dynamic`). Fixture `maps_sets/map_typed_keys`. Knob
   `TSAOT_MAP_KEY_INLINE`.
+- Slice AF (emitter, correctness; `docs/conformance_fixes.md`, "An instance's
+  own property shadowing a class method"): `(x as any).m = f` on a class
+  instance adds an own property that shadows the prototype method, and a later
+  `x.m()` must call it. A write through a receiver of that class, cast or not,
+  already makes the class dispatch dynamically (`method-reassign`); a virtual
+  call through its class table still took any instance whose class word was in
+  the interval. The table path now also requires the instance to carry no own
+  dynamic properties (the sized head's sidecar pointer is NULL: one load and
+  one branch beside the class word it already loads); an instance with own
+  properties takes the prototype lookup. tsc-ts one checker 23.79 -> 23.83 G
+  instructions (+0.17%: the guard's load and branch at the 1232 table sites),
+  cycles and wall unchanged, outputs identical. Known gap: a direct call to a
+  method with one implementation after a write through a receiver of no known
+  class (`const d = x as any; d.m = f`, `anyObj[k] = f`,
+  `Object.defineProperty(anyObj, "m", ...)`) still binds the method. The rule
+  "a method-named property written through a receiver of no known class makes
+  every class with that method dynamic" was tried and withdrawn: on tsc-ts it
+  fired for `write` (16 classes), `kind` (14), `typeParameters`,
+  `diagnostics`, `value`, `length` and nine more, names plain objects share
+  with class methods; 47 classes unstable (6 before), the compile seven times
+  slower, and that run's compiler output differed from the stable build's, so
+  the broadly dynamic mode has a latent defect of its own (open). Fixture
+  `classes/instance_method_shadow`. Knob `TSAOT_SHADOW_GUARD`.
+- Measured and dropped (session 352): (AD) compiling the tsc-ts units without
+  the machine outliner (95 OUTLINED_FUNCTION symbols, 0.7% of the emit-phase
+  samples in one outlined epilogue): neither `-mllvm
+  -enable-machine-outliner=never` at compile time nor `-Wl,-mllvm,...` at the
+  LTO link removed them, and the instruction count was identical, so the
+  outlined epilogues cost nothing beyond the instructions they would execute
+  in place. (AE) filling a virtual call's argument array only on the
+  prototype-lookup path (the table path passes the arguments directly; the
+  compiler cannot sink the stores since the array's address escapes into
+  ts_call_method): -0.1% instructions but +0.2..0.4% cycles on tsc-ts in two
+  runs, reverted.

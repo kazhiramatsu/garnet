@@ -1574,10 +1574,12 @@ fn emit_vtables(
 fn emit_vtable_call(s: &mut String, ctx: &Ctx, plan: &VtPlan, argv: &[u32], dst: &Option<LocalId>) {
     let _ = writeln!(
         s,
-        "    {{ ts_object* _vo = ts_is_obj(_a[0]) ? (ts_object*)ts_ptr(_a[0]) : NULL; uint32_t _vk = _vo ? _vo->cls - {lo}u : UINT32_MAX; void* _vf = (_vk < {span}u{relinked}) ? {t}[_vk] : NULL;",
+        "    {{ ts_object* _vo = ts_is_obj(_a[0]) ? (ts_object*)ts_ptr(_a[0]) : NULL; uint32_t _vk = _vo ? _vo->cls - {lo}u : UINT32_MAX; void* _vf = (_vk < {span}u{relinked}{shadow}) ? {t}[_vk] : NULL;",
         lo = plan.lo,
         span = plan.span,
         relinked = relink_guard(),
+        // an instance with own dynamic properties may shadow the method: the lookup path
+        shadow = if shadow_guard_enabled() { " && !((const ts_sized_head*)_vo)->dyn" } else { "" },
         t = plan.table
     );
     s.push_str("    if (_vf) {
@@ -2321,6 +2323,20 @@ fn map_num_inline_enabled() -> bool {
     *ENABLED.get_or_init(|| {
         !matches!(
             std::env::var("TSAOT_MAP_NUM_INLINE").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
+/// TSAOT_SHADOW_GUARD=0 lets a virtual call through its table take an
+/// instance that carries own dynamic properties (the parity oracle): on, such
+/// an instance takes the prototype lookup, which honors an own property that
+/// shadows the method (`(x as any).m = f` after the fact).
+fn shadow_guard_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_SHADOW_GUARD").as_deref(),
             Ok("0") | Ok("false") | Ok("no") | Ok("off")
         )
     })
