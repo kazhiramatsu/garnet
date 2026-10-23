@@ -1952,6 +1952,18 @@ static inline void ts_write_barrier(tsv owner, tsv value){
   if (oh->gen != TS_GEN_OLD || ((const ts_gc_header*)(uintptr_t)vp)->gen != TS_GEN_YOUNG) return;
   ts_gc_remember(oh);
 }
+/* The barrier for a store into a cell the store already untagged (a typed
+   class field store: `((ClassN*)ts_ptr(obj))->f = v`): the owner's
+   generation first, one byte, since most owners are young and a stack cell
+   is NONHEAP; only an old owner looks at the value. */
+static inline void ts_write_barrier_hdr(ts_gc_header* oh, tsv value){
+  if (TS_RT_LIKELY(oh->gen != TS_GEN_OLD)) return;
+  if (!(ts_is_obj(value)||ts_is_func(value)||ts_is_heap_str(value))) return;
+  uint64_t vp = value & TS_PAYLOAD_MASK;
+  if ((vp & TS_PTR_STACK_TAG) || !vp) return;
+  if (((const ts_gc_header*)(uintptr_t)vp)->gen != TS_GEN_YOUNG) return;
+  ts_gc_remember(oh);
+}
 /* The barrier for a write whose slot is known (docs/remembered_slots_design.md):
    an old plain object remembers a dirty card range in its header's spare
    byte, so the next minor collection scans only those cards. `p` points at
@@ -1973,12 +1985,14 @@ static inline void ts_write_barrier_at(tsv owner, ts_gc_header* oh, tsv* p, tsv 
   (void)owner; (void)value;
 }
 static inline void ts_write_barrier_ptr(tsv owner, tsv* p, tsv value){
+  /* the callers store into a slot of `owner`, an object they probed: its
+     generation first (a stack cell is NONHEAP), the value only for an old one */
+  ts_gc_header* oh = (ts_gc_header*)ts_ptr(owner);
+  if (TS_RT_LIKELY(oh->gen != TS_GEN_OLD)) return;
   if (!(ts_is_obj(value)||ts_is_func(value)||ts_is_heap_str(value))) return;
-  if (!(ts_is_obj(owner)||ts_is_func(owner)||ts_is_heap_str(owner))) return;
-  uint64_t op = owner & TS_PAYLOAD_MASK, vp = value & TS_PAYLOAD_MASK;
-  if (((op | vp) & TS_PTR_STACK_TAG) || !op || !vp) return;
-  ts_gc_header* oh = (ts_gc_header*)(uintptr_t)op;
-  if (oh->gen != TS_GEN_OLD || ((const ts_gc_header*)(uintptr_t)vp)->gen != TS_GEN_YOUNG) return;
+  uint64_t vp = value & TS_PAYLOAD_MASK;
+  if ((vp & TS_PTR_STACK_TAG) || !vp) return;
+  if (((const ts_gc_header*)(uintptr_t)vp)->gen != TS_GEN_YOUNG) return;
   ts_write_barrier_at(owner, oh, p, value);
 }
 /* Ordinary shape hits keep their compact cache and original guard sequence.

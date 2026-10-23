@@ -4237,6 +4237,27 @@ fn emit_direct_forwarder(s: &mut String, f: &Function, sig: &DirectSig, ncap: us
     let _ = writeln!(s, "  return {};\n}}\n", boxed);
 }
 
+/// The write barrier of a typed class field store (docs/single_thread_vs_scriptc.md):
+/// `TSAOT_BARRIER_FAST=0` keeps the generic barrier on every boxed store (the
+/// parity oracle sets it). On, the store's own untagged owner pointer feeds a
+/// barrier that tests the owner's generation first, and a value the emitter
+/// knows is a number, a boolean, undefined or null gets no barrier.
+fn barrier_fast_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_BARRIER_FAST").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
+/// A rendered value that cannot be a heap reference: a boxed number or
+/// boolean, undefined, null.
+fn non_heap_value_expr(e: &str) -> bool {
+    e.starts_with("ts_num(") || e.starts_with("ts_bool(") || e == "TS_UNDEFINED" || e == "TS_NULL"
+}
+
 /// Static-slot hints (docs/static_slots_design.md): `TSAOT_STATIC_SLOTS=0`
 /// ignores the exporter's `slots` on LoadField/StoreField.
 fn static_slots_enabled() -> bool {
@@ -20842,7 +20863,15 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     let _ = writeln!(s, "  if ({}) {{ {} }} else {{", receiver_guard(&obj_name, &hinted, c), slow);
                     let _ = writeln!(s, "    (({}*)ts_ptr({}))->{} = {};", cn, obj_name, off, rhs);
                     if !is_num {
-                        let _ = writeln!(s, "    ts_write_barrier({}, {});", obj_name, rhs);
+                        if barrier_fast_enabled() {
+                            // The owner is untagged by the store itself; a value the
+                            // emitter knows is no heap reference needs no barrier.
+                            if !non_heap_value_expr(&rhs) {
+                                let _ = writeln!(s, "    ts_write_barrier_hdr((ts_gc_header*)ts_ptr({}), {});", obj_name, rhs);
+                            }
+                        } else {
+                            let _ = writeln!(s, "    ts_write_barrier({}, {});", obj_name, rhs);
+                        }
                     }
                     let _ = writeln!(s, "  }}");
                     return;

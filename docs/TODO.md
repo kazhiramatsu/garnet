@@ -8347,3 +8347,21 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   with a null environment register), before the fork work too; the fork
   build's default is forked checkers, so one-thread measurements pass
   --singleThreaded.
+- Toward scriptc, slice A: the write barrier of typed class field stores
+  (`docs/single_thread_vs_scriptc.md`). The class kernel's machine code showed
+  a number stored into `flags` paying a fourteen-instruction barrier (the
+  value's three tag tests, the owner's three, the stack tags, the
+  generations). Now `ts_write_barrier_hdr` takes the owner pointer the store
+  itself untagged and tests its generation first (one byte; most owners are
+  young, a stack cell is NONHEAP), and the emitter emits no barrier at all for
+  a value it renders as `ts_num(...)`, `ts_bool(...)`, `TS_UNDEFINED` or
+  `TS_NULL`; `ts_write_barrier_ptr` (literal stores, the cached stores) tests
+  its object owner first too. Knob `TSAOT_BARRIER_FAST=0` (the parity oracle
+  sets it). Kernel `class_nodes` 6.52 -> 6.23 G instructions; tsc-ts one
+  thread 33.44 -> 32.93 G (0.985), cycles 0.990. Gates: parity (380
+  identical), unit, bundler 43/43, conformance 539/539 plain and strict,
+  536/536 at every allocation under protect mode, GC stress. Also a new kernel
+  `benchmarks/patterns/class_nodes.ts` (tsc-ts's style: classes, a
+  kind-discriminated hierarchy, methods, a downcast, a field store, a Map
+  lookup; garnet 3.0x scriptc's instructions) and a fixture
+  `classes/base_fields_via_super` for the next slice.

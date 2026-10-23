@@ -6,13 +6,15 @@
 # of the two natives (the best of three) and their outputs compared. The
 # instruction ratio is the lever: garnet's time against scriptc's is an
 # instruction-count gap, not a memory one (docs/single_thread_vs_scriptc.md).
-# Usage: SCRIPTC=... scripts/pattern_bench_scriptc.sh [kernel.ts ...]
+# Usage: SCRIPTC=... [STRICT=0] scripts/pattern_bench_scriptc.sh [kernel.ts ...]
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT" || exit 1
 SCRIPTC="${SCRIPTC:?set SCRIPTC to the scriptc executable}"
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 source scripts/difftest.sh > /dev/null 2>&1
+# the kernels are exported as a strict project is (tsc-ts's tsconfig is strict), unless STRICT=0
+[ "${STRICT:-1}" = 0 ] || export DT_EXPORT_FLAGS="--strict"
 measure() { # binary -> "instructions cycles wall", the run with the fewest cycles of three
   local bi=0 bc=0 bw=0 i
   for i in 1 2 3; do
@@ -26,6 +28,7 @@ measure() { # binary -> "instructions cycles wall", the run with the fewest cycl
 printf "%-20s %9s %9s %6s %8s %8s %6s  %s\n" kernel garnet_Gi scriptc_Gi ratio g_ms s_ms ratio outputs
 files=("$@"); [ $# -eq 0 ] && files=("$ROOT"/benchmarks/patterns/*.ts)
 for f in "${files[@]}"; do
+  f="$(cd "$(dirname "$f")" && pwd)/$(basename "$f")"   # absolute: the build runs in $WORK
   n=$(basename "$f" .ts)
   v=$(dt "$n" "$(cat "$f")" 2>&1 | grep -oE "OK|DIFF|REJECT" | head -n1)
   [ "$v" = "OK" ] || { printf "%-20s garnet: %s\n" "$n" "${v:-BUILD_FAIL}"; continue; }

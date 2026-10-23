@@ -111,6 +111,29 @@ instances (sized instances, monomorphized numeric fields,
 `docs/cell_header_design.md`), not for interface-typed literals, which is
 how tsc writes its nodes, symbols and types.
 
+## scriptc's object model, probed
+
+Six small programs built with scriptc and run beside Node (Session 352;
+`scratchpad/crit/kern/probe`). An interface's members are a struct: when
+a literal with extra properties reaches an interface-typed binding
+(`const wide = { flags: 5, id: 7, extra: "e", more: 9 }; const t: T =
+wide;`), scriptc's `Object.keys(t)` is `flags,id` and its `JSON.stringify(t)`
+`{"flags":5,"id":7}`, where Node prints `flags,id,extra,more` and the whole
+object; a property added through an intersection-typed alias of the same
+object (`(o as O & { d?: number }).d = 4`) is seen through the alias and
+not through the original `O`-typed binding (`Object.keys` `a` against
+Node's `a,d`). Structural compatibility between differently declared
+interfaces, unions discriminated by a literal member, optional members,
+`in`, `keyof` indexing and `Record` index signatures behave as in Node;
+`any`-typed fields, accessors satisfying data properties and
+union-shaped values are refused at compile time. So the static type is the
+layout: a field read is one load because nothing else can be there, and
+what the type does not name is dropped from the object's reflection.
+garnet keeps JavaScript's semantics (the extra properties stay, as in
+Node), so it cannot take this model as it is; it can take the result
+where a whole-program proof makes the layout certain, and keep the
+check elsewhere.
+
 ## Found on the way
 
 - `tsc-ts --noEmit` crashes garnet's build (`EXC_BAD_ACCESS` at address

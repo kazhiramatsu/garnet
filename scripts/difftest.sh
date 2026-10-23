@@ -48,7 +48,8 @@ dt() {
   node "$ROOT/build/noderun.js" "$ROOT/build/dt.ts" 2>/dev/null
   nodeout=$(node "$ROOT/build/dt.mjs" 2>&1 | tr '\n' '|')
   local rej
-  rej=$(node "$ROOT/exporter/exporter.js" "$ROOT/build/dt.ts" "$ROOT/build/dt.json" "$ROOT/build/dtl.json" 2>&1 | grep -iE "UNSUPPORTED|member|type error" | head -1)
+  # DT_EXPORT_FLAGS: extra exporter flags, e.g. --strict for the strict type profile a strict project gets
+  rej=$(node "$ROOT/exporter/exporter.js" ${DT_EXPORT_FLAGS:-} "$ROOT/build/dt.ts" "$ROOT/build/dt.json" "$ROOT/build/dtl.json" 2>&1 | grep -iE "UNSUPPORTED|member|type error" | head -1)
   if [ -n "$rej" ]; then printf "%-38s REJECT (node=%s)\n" "$name" "$nodeout"; return; fi
   "$ROOT/analyzer/target/release/tsaot" "$ROOT/build/dt.json" emit > "$ROOT/build/dt.c" 2>/dev/null
   tsaot_prepare_regexp_objs "$ROOT/build/dt.c" "$ROOT/build" || return
