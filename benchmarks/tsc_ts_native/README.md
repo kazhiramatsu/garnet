@@ -40,7 +40,11 @@ in `build/unit-cache`, so a rebuild compiles only the units that changed.
 there `TSAOT_NATIVE_COLD_O0=1` marks the same functions `optnone`.
 
 Run with the lib files of scriptc's TypeScript package (`TSC_TS_LIB_DIR`),
-for example on the TypeScript 6.0.3 compiler project:
+for example on the TypeScript 6.0.3 compiler project. Checker threads are
+forked processes (`docs/fork_workers_design.md`): `--checkers N` forks N-1
+checkers, and without `--checkers` tsc-ts picks its default from
+`availableParallelism()`, so one-thread measurements pass `--singleThreaded`
+(or `--checkers 1`):
 
 ```sh
 TSC_TS_LIB_DIR=/path/to/tsc-ts/node_modules/@scriptc/cli-darwin-arm64/dist/lib/typescript/lib \

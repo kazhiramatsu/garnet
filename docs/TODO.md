@@ -8327,3 +8327,23 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   time with parallel parsing (F4) is the projected 0.7 s, and the remaining
   term is one thread's parse, check and emit of checker.ts, 1.4-1.65x
   scriptc's.
+- One thread against scriptc, the first look
+  (`docs/single_thread_vs_scriptc.md`, Kaz's choice after the fork results):
+  garnet's one-thread compile retires 33.4 G instructions against scriptc's
+  18.3 G (1.82x) at a better IPC (4.35 against 3.98), so the 1.66x of wall
+  time is an instruction-count gap, not memory or pauses; parsing alone 2.5x.
+  Sampling profiles (a build linked without identical-code folding): 61% of
+  the check window in the emitted code, 12.6% in Map lookups, 8.3% in
+  allocation and the collector, 7.3% in strings (Buffer.byteLength from
+  tsc-ts's containsNonASCII 2-3.5% in every window); the hottest leaf 3.7%.
+  `scripts/pattern_bench_scriptc.sh` builds the pattern kernels with both
+  compilers: garnet retires 2-7x the instructions (path_regexps 6.9x,
+  obj_literal_poly 3.6x, map_string_keys 3.0x, string_scan 2.9x, flags_truthy
+  2.85x, strings_build 2.7x, small_calls, tree_recursion and callbacks 2.6x;
+  closures_env 0.6x), with identical outputs; scriptc rejects four kernels its
+  type system does not admit. A field read of an interface-typed literal costs
+  garnet a shape check, a NaN-box decode and two conversions; scriptc a load.
+  Found on the way: `tsc-ts --noEmit` crashes garnet's build (a closure called
+  with a null environment register), before the fork work too; the fork
+  build's default is forked checkers, so one-thread measurements pass
+  --singleThreaded.
