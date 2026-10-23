@@ -383,6 +383,58 @@ static int allocation_gc_regression(void){
   return ok;
 }
 
+/* Conservative roots (docs/conservative_roots_design.md): references held only
+   in C locals and registers survive collections that find them by scanning the
+   stack; cells nothing names lose their allocation bits. A stale word in a
+   live frame (main's, here) names whatever cell its address holds now, so the
+   death check is over many cells: nearly all of them must go. */
+#define CR_DEAD 256
+static uintptr_t g_cr_dead_addr[CR_DEAD];
+__attribute__((noinline)) static void cr_make_dead(void){
+  ts_key kv = ts_intern_field("v", 1);
+  for (int i = 0; i < CR_DEAD; i++){
+    tsv dead = ts_new_object();
+    ts_set(dead, kv, ts_num(i));
+    g_cr_dead_addr[i] = (uintptr_t)(dead & TS_PAYLOAD_MASK);
+  }
+}
+__attribute__((noinline)) static void cr_scrub_stack(void){
+  volatile uint64_t buf[2048];
+  for (size_t i = 0; i < sizeof buf / sizeof buf[0]; i++) buf[i] = 0;
+}
+__attribute__((noinline)) static int cr_sum(tsv arr){
+  int sum = 0;
+  for (uint32_t i = 0; i < ts_array_len_fast(arr); i++) sum += (int)ts_to_num(ts_array_get(arr, i));
+  return sum;
+}
+static int g_cr_results[4];
+__attribute__((noinline)) static void test_conservative_roots(void){
+  g_conservative_roots = 1;
+  ts_key kv = ts_intern_field("v", 1);
+  tsv keep = ts_new_array(0);          /* never rooted: a register or a stack word */
+  tsv other = ts_new_object();
+  for (int i = 0; i < 3000; i++){
+    tsv tmp = ts_new_object();         /* garbage, with collections on the way */
+    ts_set(tmp, kv, ts_num(i));
+    ts_array_push(keep, ts_num(i));
+    if ((i & 255) == 0) ts_gc_collect_young();
+  }
+  ts_set(other, kv, keep);
+  ts_gc_collect_young();
+  ts_gc_collect();
+  g_cr_results[0] = ts_gc_debug_alloc_bit(keep) && ts_gc_debug_alloc_bit(other);
+  g_cr_results[1] = cr_sum(keep) == 3000 * 2999 / 2 && ts_get(other, kv) == keep;
+  cr_make_dead();
+  cr_scrub_stack();
+  ts_gc_collect_young();
+  ts_gc_collect();
+  int cleared = 0;
+  for (int i = 0; i < CR_DEAD; i++) cleared += !ts_gc_debug_alloc_bit(TS_BOX(TS_SEL_OBJECT, g_cr_dead_addr[i]));
+  g_cr_results[2] = cleared >= CR_DEAD - 16;
+  if (!g_cr_results[2]) printf("  [diag] %d of %d dead cells lost their bit\n", cleared, CR_DEAD);
+  g_cr_results[3] = cr_sum(keep) == 3000 * 2999 / 2 && ts_gc_debug_alloc_bit(keep);
+  g_conservative_roots = 0;
+}
 int main(){
   ts_gc_debug_log_young();
   int fail=0;
@@ -1760,6 +1812,11 @@ int main(){
     CK("worker by fork: an uncaught exception in the child reaches the error handler", worker_errors == 1 && ts_is_undef(worker_received));
     ts_gc_unroot(6);
   }
+  test_conservative_roots();
+  CK("conservative roots: the unrooted locals keep their allocation bits", g_cr_results[0]);
+  CK("conservative roots: the unrooted array and object survive two collections", g_cr_results[1]);
+  CK("conservative roots: the cells nothing names lose their allocation bits", g_cr_results[2]);
+  CK("conservative roots: the survivors are intact after the second round", g_cr_results[3]);
   printf("\n%s\n", fail==0?"ALL RUNTIME TESTS PASS":"FAILURES");
   return fail?1:0;
 }

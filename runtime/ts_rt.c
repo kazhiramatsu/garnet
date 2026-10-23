@@ -203,7 +203,7 @@ extern void __asan_poison_memory_region(const void *addr, size_t size);
 #define GC_CAGE_COMMIT_BLOCKS 16u   /* the frontier commits 1 MiB at a time */
 enum { GC_BLK_FREE = 0, GC_BLK_PAYLOAD = 1, GC_BLK_LARGE = 2, GC_BLK_LARGE_CONT = 3, GC_BLK_CELL = 4, GC_BLK_LARGE_CELL = 5 };
 typedef struct gc_block {
-  uint8_t state, cls, mark, spare;
+  uint8_t state, cls, mark, alloc_dirty;   /* alloc_dirty: a cell block allocated into since the last collection */
   uint32_t epoch;      /* the cursor is valid when it equals g_payload_epoch */
   uint32_t cursor;     /* next candidate cell offset */
   uint32_t live;       /* marked bytes (payload blocks) */
@@ -218,6 +218,15 @@ static size_t g_cage_bytes = 0;
 static uint32_t g_cage_blocks = 0, g_cage_frontier = 0, g_cage_committed = 0;
 static gc_block* g_blocks = NULL;
 static uint64_t* g_cage_bitmaps = NULL;
+/* The allocation bitmap of the cell blocks (conservative roots): a set bit
+   at a cell start means the cell is allocated and alive as far as the
+   collector knows; the allocator sets it, a death clears it, and after a
+   collection the bits of the blocks allocated into are intersected with
+   the marks (a dead young cell of a kind without side buffers is never
+   visited otherwise). Only maintained while g_conservative_roots. */
+static uint64_t* g_cage_alloc_bits = NULL;
+static uint32_t* g_alloc_dirty = NULL;     /* cell blocks allocated into since the last collection */
+static size_t g_alloc_dirty_len = 0, g_alloc_dirty_cap = 0;
 static uint32_t g_free_blocks = 0;        /* single free blocks (index + 1) */
 static uint32_t g_large_head = 0;         /* large runs (index + 1) */
 static uint32_t g_payload_epoch = 1;
@@ -280,6 +289,9 @@ static void gc_cage_init(void){
   void* bm = mmap(NULL, sizeof(uint64_t) * GC_BLOCK_BITMAP_WORDS * (size_t)g_cage_blocks, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
   if (bt == MAP_FAILED || bm == MAP_FAILED) ts_abort_msg("cannot reserve the heap cage tables");
   g_blocks = (gc_block*)bt; g_cage_bitmaps = (uint64_t*)bm;
+  void* ab = mmap(NULL, sizeof(uint64_t) * GC_BLOCK_BITMAP_WORDS * (size_t)g_cage_blocks, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+  if (ab == MAP_FAILED) ts_abort_msg("cannot reserve the heap cage tables");
+  g_cage_alloc_bits = (uint64_t*)ab;
   /* size classes: 16-byte steps to 256 B, then about 12.5% (multiples of 16) */
   uint32_t sz = 16u;
   while (g_pclass_n < GC_PAYLOAD_NCLASS){
@@ -305,6 +317,54 @@ static void gc_cage_init(void){
 }
 static inline uint64_t* gc_block_bitmap(uint32_t bi){ return g_cage_bitmaps + (size_t)bi * GC_BLOCK_BITMAP_WORDS; }
 static inline char* gc_block_base(uint32_t bi){ return g_cage_base + ((size_t)bi << GC_BLOCK_SHIFT); }
+/* ---- the allocation bitmap (conservative roots) ---- */
+static inline uint64_t* gc_alloc_bits(uint32_t bi){ return g_cage_alloc_bits + (size_t)bi * GC_BLOCK_BITMAP_WORDS; }
+static inline void gc_alloc_bit_set(const void* p){
+  uintptr_t off = (uintptr_t)p - (uintptr_t)g_cage_base;
+  uint32_t g = (uint32_t)((off & (GC_BLOCK_BYTES - 1u)) >> 4);
+  gc_alloc_bits((uint32_t)(off >> GC_BLOCK_SHIFT))[g >> 6] |= (uint64_t)1u << (g & 63u);
+}
+static inline void gc_alloc_bit_clear(const void* p){
+  uintptr_t off = (uintptr_t)p - (uintptr_t)g_cage_base;
+  uint32_t g = (uint32_t)((off & (GC_BLOCK_BYTES - 1u)) >> 4);
+  gc_alloc_bits((uint32_t)(off >> GC_BLOCK_SHIFT))[g >> 6] &= ~((uint64_t)1u << (g & 63u));
+}
+static inline int gc_alloc_bit_test(uint32_t bi, uint32_t g){
+  return (int)((gc_alloc_bits(bi)[g >> 6] >> (g & 63u)) & 1u);
+}
+/* A cell block the allocator hands a run from: its bits are settled after
+   the next collection (alloc = alloc & marks: the dead young cells go). The
+   list is kept whether or not the bits are (a few words per collection), so
+   that a program switching the roots on finds every block it allocates into
+   tracked; the blocks under the class cursors stay dirty across a
+   collection, since allocation continues in them without a refill. */
+static void gc_alloc_block_dirty(uint32_t bi){
+  gc_block* b = &g_blocks[bi];
+  if (b->alloc_dirty) return;
+  b->alloc_dirty = 1;
+  if (g_alloc_dirty_len == g_alloc_dirty_cap){
+    size_t next = g_alloc_dirty_cap ? g_alloc_dirty_cap * 2 : 256;
+    uint32_t* grown = (uint32_t*)realloc(g_alloc_dirty, sizeof(uint32_t) * next);
+    if (!grown) ts_abort_msg("out of memory growing the allocation bitmap's dirty list");
+    g_alloc_dirty = grown; g_alloc_dirty_cap = next;
+  }
+  g_alloc_dirty[g_alloc_dirty_len++] = bi;
+}
+static void gc_alloc_bits_settle(void){
+  for (size_t i = 0; i < g_alloc_dirty_len; i++){
+    uint32_t bi = g_alloc_dirty[i];
+    gc_block* b = &g_blocks[bi];
+    b->alloc_dirty = 0;
+    if (b->state != GC_BLK_CELL) continue;
+    uint64_t* ab = gc_alloc_bits(bi); const uint64_t* bm = gc_block_bitmap(bi);
+    for (uint32_t w = 0; w < GC_BLOCK_BITMAP_WORDS; w++) ab[w] &= bm[w];
+  }
+  g_alloc_dirty_len = 0;
+  for (int cls = 0; cls < g_pclass_n; cls++){
+    gc_pclass* c = &g_cclass[cls];
+    if (c->ptr && c->ptr < c->end) gc_alloc_block_dirty((uint32_t)(((uintptr_t)c->ptr - (uintptr_t)g_cage_base) >> GC_BLOCK_SHIFT));
+  }
+}
 /* A run of `n` never-used blocks at the frontier, committed on the way. */
 static uint32_t gc_cage_frontier_take(uint32_t n){
   if (!g_cage_base) gc_cage_init();
@@ -368,6 +428,7 @@ static char* gc_space_refill(gc_pclass* classes, uint8_t state, unsigned cls, in
     uint32_t bi = c->scan - 1u;
     if (gc_payload_block_run(bi, cls, &ptr, &end)){
       c->ptr = ptr; c->end = end;
+      if (state == GC_BLK_CELL) gc_alloc_block_dirty(bi);
       if (log_runs) gc_payload_log_run(ptr, end, size);
       if (GC_CELL_RUNS_ZEROED && state == GC_BLK_CELL) memset(ptr, 0, (size_t)(end - ptr));
       return ptr;
@@ -384,6 +445,7 @@ static char* gc_space_refill(gc_pclass* classes, uint8_t state, unsigned cls, in
   uint32_t ncells = (uint32_t)(GC_BLOCK_BYTES / size);
   b->cursor = ncells * size;
   c->ptr = gc_block_base(bi); c->end = c->ptr + (size_t)ncells * size;
+  if (state == GC_BLK_CELL) gc_alloc_block_dirty(bi);
   /* a block from the free list may hold a released run's old bytes */
   if (GC_CELL_RUNS_ZEROED && state == GC_BLK_CELL) memset(c->ptr, 0, (size_t)ncells * size);
   GC_PAYLOAD_POISON(c->ptr, (size_t)ncells * size);
@@ -494,6 +556,7 @@ static void* gc_cell_alloc_large(size_t bytes, int old){
   char* p = gc_block_base(bi);
   GC_PAYLOAD_UNPOISON(p, bytes);
   memset(p, 0, bytes);
+  if (g_conservative_roots) gc_alloc_bit_set(p);
   return p;
 }
 /* A zeroed cell (the calloc contract of the previous allocator): its run
@@ -509,6 +572,7 @@ static inline void* gc_cell_alloc(size_t bytes, int old, size_t* cap){
   char* p = c->ptr;
   if (TS_RT_UNLIKELY(!p || p + size > c->end)) p = gc_space_refill(g_cclass, GC_BLK_CELL, cls, 0);
   c->ptr = p + size;
+  if (g_conservative_roots) gc_alloc_bit_set(p);
   GC_PAYLOAD_UNPOISON(p, size);
   if (!GC_CELL_RUNS_ZEROED) memset(p, 0, bytes);
   if (old){
@@ -542,6 +606,7 @@ static size_t gc_cell_set_old_bit(ts_gc_header* h){
 static void gc_cell_release_large(ts_gc_header* h){
   gc_block* b = gc_cell_block(h);
   if (b->state != GC_BLK_LARGE_CELL) return;
+  if (g_conservative_roots) gc_alloc_bit_clear(h);
   uint32_t bi = (uint32_t)(b - g_blocks);
   if (b->prev) g_blocks[b->prev - 1u].next = b->next; else g_large_cell_head = b->next;
   if (b->next) g_blocks[b->next - 1u].prev = b->prev;
@@ -1589,6 +1654,7 @@ void ts_object_proto_register(ts_key method_key, const char* name, ts_code fn){
 int g_has_proxies = 0;   /* declared in ts_rt.h; see ts_is_proxy there */
 int g_typed_slow = 0;    /* declared in ts_rt.h; see ts_typed_slow there */
 int g_closed_receivers = 0;
+int g_conservative_roots = 0;
 #endif
 /* A foreign receiver can arise from here on. A closed program's typed
    accesses do not test the flag: the exporter's proof missed a route to this
@@ -5397,6 +5463,77 @@ TS_RT_ALWAYS_INLINE void gc_visit_slot(tsv* slot, int young, int depth, int stab
   (void)stable;
   gc_mark_visit(*slot, young, depth);
 }
+/* ---- conservative roots: the native stack (docs/conservative_roots_design.md) ----
+   A word is a root candidate when its low 48 bits fall in the cage: a tagged
+   heap reference, a raw pointer the generated code untagged, or a pointer
+   into a cell; it must name an allocated cell (the allocation bitmap) and
+   then marks as a precise root would. A stack-tagged reference (a cell on
+   the C stack) takes gc_mark_visit's own validation. Nothing moves, so a
+   false candidate only retains. */
+static uint64_t g_stack_hi = 0;   /* the main thread's stack base */
+uintptr_t g_gc_debug_watch = 0;   /* tests: report the stack word that names this cell */
+static const uint64_t* g_scan_cur = NULL;
+static void gc_mark_conservative_word(uint64_t w, int young){
+  uint64_t a = w & TS_PAYLOAD_MASK;
+  /* A stack-tagged word is not followed: a stale one in a live frame may
+     name a dead frame's cell, now other frames' words, whose garbage header
+     can pass the plausibility tests (the protect gate found the scan of such
+     a "cell" reading through its garbage). The cells themselves lie in the
+     scanned region, so their heap references are found as words. */
+  if (TS_RT_UNLIKELY(a & TS_PTR_STACK_TAG)) return;
+  uintptr_t off = (uintptr_t)a - (uintptr_t)g_cage_base;
+  if (off >= g_cage_bytes) return;
+  uint32_t bi = (uint32_t)(off >> GC_BLOCK_SHIFT);
+  gc_block* b = &g_blocks[bi];
+  ts_gc_header* h;
+  if (b->state == GC_BLK_CELL){
+    uint32_t size = g_pclass_size[b->cls];
+    uint32_t inb = (uint32_t)(off & (GC_BLOCK_BYTES - 1u));
+    uint32_t start = inb - inb % size;
+    if (!gc_alloc_bit_test(bi, start >> 4)) return;
+    h = (ts_gc_header*)(gc_block_base(bi) + start);
+  } else if (b->state == GC_BLK_LARGE_CELL || b->state == GC_BLK_LARGE_CONT){
+    while (b->state == GC_BLK_LARGE_CONT && bi){ bi--; b = &g_blocks[bi]; }
+    if (b->state != GC_BLK_LARGE_CELL || !gc_alloc_bit_test(bi, 0)) return;
+    h = (ts_gc_header*)gc_block_base(bi);
+  } else return;
+  if (TS_RT_UNLIKELY(h->gen > TS_GEN_OLD || !gc_kind_valid(h->kind))) return;
+  if (TS_RT_UNLIKELY(g_gc_debug_watch) && (uintptr_t)h == g_gc_debug_watch)
+    fprintf(stderr, "[gc watch] cell %p named by stack word %p (value %llx, %ld bytes below the base)\n",
+            (void*)h, (const void*)g_scan_cur, (unsigned long long)w, (long)(g_stack_hi - (uint64_t)(uintptr_t)g_scan_cur));
+  if (h->mark) return;
+  if (young && h->gen == TS_GEN_OLD) return;
+  gc_mark_visit_slow(h, young, 0);
+}
+__attribute__((noinline, no_sanitize("address")))
+static void gc_scan_stack_words(const uint64_t* lo, const uint64_t* hi, int young){
+  for (const uint64_t* p = lo; p < hi; p++){ g_scan_cur = p; gc_mark_conservative_word(*p, young); }
+}
+__attribute__((noinline, no_sanitize("address")))
+static void gc_scan_stack_from_here(int young){
+  volatile uint64_t anchor = 0;   /* a local of the deepest frame: everything above is live */
+  const uint64_t* lo = (const uint64_t*)(((uintptr_t)&anchor) & ~(uintptr_t)7u);
+  gc_scan_stack_words(lo, (const uint64_t*)(uintptr_t)g_stack_hi, young);
+  (void)anchor;
+}
+__attribute__((noinline))
+static void gc_scan_stack_roots(int young){
+  if (!g_conservative_roots) return;
+  if (!g_stack_hi) g_stack_hi = (uint64_t)(uintptr_t)pthread_get_stackaddr_np(pthread_self());
+  jmp_buf regs;   /* the callee-saved registers, spilled where the scan sees them */
+  if (setjmp(regs) == 0) gc_scan_stack_from_here(young);
+  gc_scan_stack_words((const uint64_t*)&regs, (const uint64_t*)(&regs + 1), young);
+}
+int ts_gc_debug_cell_gen(tsv v){   /* the header's generation byte (tests), -1 for a non-reference */
+  if (!ts_heap_ref(v)) return -1;
+  return (int)((const ts_gc_header*)(uintptr_t)(v & TS_PAYLOAD_MASK))->gen;
+}
+int ts_gc_debug_alloc_bit(tsv v){
+  if (!g_cage_alloc_bits || !ts_heap_ref(v)) return 0;
+  uintptr_t off = (uintptr_t)(v & TS_PAYLOAD_MASK) - (uintptr_t)g_cage_base;
+  if (off >= g_cage_bytes) return 0;
+  return gc_alloc_bit_test((uint32_t)(off >> GC_BLOCK_SHIFT), (uint32_t)((off & (GC_BLOCK_BYTES - 1u)) >> 4));
+}
 /* ts_prop keeps a compact user-Symbol id rather than a tagged heap reference.
    Recover and trace that identity here so `obj[sym]` is a genuine strong edge.
    The weak id table is cleared only after ephemerons reach their fixed point. */
@@ -5625,6 +5762,7 @@ static void gc_cell_quarantine_trim(void){
 /* A dead cell of the cell space: its side buffers go; the memory
    is free because no mark bit covers it (a large run is released). */
 static void gc_cell_die(ts_gc_header* h){
+  if (g_conservative_roots) gc_alloc_bit_clear(h);
   gc_free_cell_payload(h);
   gc_block* b = gc_cell_block(h);
   size_t size = gc_block_cell_capacity(b);
@@ -5864,6 +6002,7 @@ void ts_gc_collect_young(void){
     RT_STAT_ADD(minor_root_slots, frame->count);
     for (uint32_t i = 0; i < frame->count; i++) gc_visit_slot(&slots[i], 1, 0, 1);
   }
+  gc_scan_stack_roots(1);
   size_t old_rem_len = g_rem_len;
   RT_STAT_ADD(minor_remembered_cells, old_rem_len);
   for (size_t i=0;i<old_rem_len;i++){
@@ -5913,6 +6052,7 @@ void ts_gc_collect_young(void){
 #endif
   if (g_gc_protect) gc_cell_quarantine_trim();
   gc_payload_after_collection(0);
+  gc_alloc_bits_settle();
   g_gc_collecting = 0;
   G0_PHASE(g0_minor_ns, 5);
   RT_STAT_GC_T1;
@@ -5942,6 +6082,7 @@ void ts_gc_collect(void){
     tsv* slots = ts_frame_slots(frame);
     for (uint32_t i = 0; i < frame->count; i++) gc_visit_slot(&slots[i], 0, 0, 1);
   }
+  gc_scan_stack_roots(0);
   gc_mark_drain(0);
   G0_PHASE(g0_full_ns, 0);
   gc_weak_fixpoint_and_prune(0);
@@ -5975,6 +6116,7 @@ void ts_gc_collect(void){
   gc_clear_nonheap_marks();
   if (g_gc_protect) gc_cell_quarantine_trim();
   gc_payload_after_collection(1);
+  gc_alloc_bits_settle();
   g_gc_collecting = 0;
   G0_PHASE(g0_full_ns, 5);
   RT_STAT_GC_T1;

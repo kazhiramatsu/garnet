@@ -221,6 +221,17 @@ most of the stack traffic in the table is the C compiler's own spilling of
 two-hundred-local functions. The nursery's size (4, 16, 64 MB) changes
 neither instructions nor wall.
 
+## Where the slices stand
+
+| build | instructions | wall (one thread) |
+|---|---|---|
+| start of the work (fork build) | 33.44 G | 1.74 s |
+| A: the typed store barrier | 32.93 G | |
+| F: base-class field types | 32.60 G | |
+| S: lazy string hashes, direct UTF-8 walks | 31.77 G | 1.66 s |
+| C: conservative roots, no GC frames (`docs/conservative_roots_design.md`) | 28.55 G | 1.50 s |
+| scriptc | 18.3 G | 1.05 s |
+
 ## What to do
 
 The lever is the instruction count of the emitted code and of the

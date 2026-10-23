@@ -8431,3 +8431,31 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   roots found by scanning the native stack against an allocation bitmap (the
   frame slots and the frame chain are a third of the generated code's time;
   the slots alone 4% of the instructions).
+- Toward scriptc, slice C: conservative roots, generated code without GC
+  frames (`docs/conservative_roots_design.md`). The collector finds the roots
+  of the generated code by scanning the native stack (callee-saved registers
+  spilled by setjmp, the words from the collector's frame to the main thread's
+  stack base) against a second per-block bitmap of allocated cell starts (set
+  by the allocator, cleared by a death, and after every collection intersected
+  with the marks for the blocks allocated into since the previous one, the
+  class cursors' blocks staying on that list). A word names a cell when it
+  falls in a cell block and its cell start is allocated (interior pointers
+  rounded down; large cells by their head block); a stack-tagged word is not
+  followed (a stale one in a live frame named a dead frame's cell: the protect
+  gate crashed on its garbage). The emitter emits no frame struct, no push and
+  pop, no spills or reloads and no per-local rooting, except in a function
+  with a try (memory homes across setjmp) or a stack-allocated cell (its
+  off-stack buffers hold references the scan cannot see; the GC stress gate
+  found one): 350 of tsc-ts's 21,020 functions keep a frame.
+  `g_conservative_roots = 1` in main turns the scan on;
+  `TSAOT_CONSERVATIVE_ROOTS=0` keeps the frames (the parity oracle). tsc-ts
+  one thread, six interleaved pairs: instructions 31.77 -> 28.55 G (0.899),
+  cycles 0.900, wall 1.66 -> 1.50 s, peak memory +5 MB, outputs identical.
+  Kernels: class_nodes 6.08 -> 5.40 G, closures_env 6.29 -> 4.77,
+  obj_literal_poly 5.76 -> 4.97, tree_recursion 2.30 -> 2.01. Gates: parity
+  (380 identical), selfconf, unit, bundler 43/43, conformance 539/539 plain
+  and strict, 536/536 under protect mode, GC stress (O2 and ASan), ci_fast,
+  runtime tests with four conservative-roots cases (`g_gc_debug_watch`,
+  `ts_gc_debug_alloc_bit`, `ts_gc_debug_cell_gen` for the tests). Also
+  `docs/int32_fields_design.md`, the next slice: enum-typed class fields as
+  integers.

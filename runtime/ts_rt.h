@@ -670,6 +670,13 @@ void ts_foreign_this_seen(void);
    g_typed_slow, so raising it there stops the program instead. */
 #if !TS_ISO_MODE
 extern int g_closed_receivers;
+/* Conservative roots (docs/conservative_roots_design.md): the generated main
+   sets it when its functions keep no GC frames; the collectors then scan the
+   native stack for references, validated against the allocation bitmap. */
+extern int g_conservative_roots;
+int ts_gc_debug_alloc_bit(tsv v);      /* the allocation bit of a cell (tests) */
+int ts_gc_debug_cell_gen(tsv v);       /* a cell header's generation (tests) */
+extern uintptr_t g_gc_debug_watch;    /* tests: the conservative scan reports the word naming this cell */
 #endif
 static inline int ts_typed_slow(tsv v){
   return !ts_is_obj(v) || !ts_obj_is_sized((const ts_object*)ts_ptr(v));

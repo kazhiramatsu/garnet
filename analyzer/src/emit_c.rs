@@ -1190,6 +1190,11 @@ fn emit_program_with_string_plans(
         // the runtime's raise points stop a closed program (an analysis miss)
         s.push_str("  g_closed_receivers = 1;\n");
     }
+    if conservative_roots_enabled() {
+        // the collectors scan the native stack for the roots the functions no
+        // longer keep in frames (docs/conservative_roots_design.md)
+        s.push_str("  g_conservative_roots = 1;\n");
+    }
     s.push_str("  ts_setup_globals();\n");
     if site_stats_enabled() {
         s.push_str("  ts_site_stats_init((const char**)FN_NAME, (uint32_t)(sizeof(FN_NAME) / sizeof(FN_NAME[0])));\n");
@@ -2213,6 +2218,20 @@ impl<'a> Ctx<'a> {
     }
 }
 
+/// Conservative roots (docs/conservative_roots_design.md): no GC frame, no
+/// per-local rooting; the collector scans the native stack. A function with a
+/// try or a stack-allocated cell keeps its frame. The default;
+/// TSAOT_CONSERVATIVE_ROOTS=0 keeps the frames (the parity oracle).
+fn conservative_roots_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_CONSERVATIVE_ROOTS").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
 fn frame_roots_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -2810,6 +2829,25 @@ fn lazy_calls_enabled() -> bool {
             std::env::var("TSAOT_LAZY_CALLS").as_deref(),
             Ok("0") | Ok("false") | Ok("no") | Ok("off")
         )
+    })
+}
+
+/// Does the body allocate a cell on the C stack (a closure or a class
+/// instance with the `Stack` strategy)? Under conservative roots such a
+/// function keeps its frame: the cell's off-stack buffers (a property map, an
+/// environment) hold references the stack scan cannot see, and a stale
+/// stack-tagged word must not be followed (docs/conservative_roots_design.md).
+fn body_has_stack_cells(body: &[Inst], strat: &BTreeMap<u32, AllocStrategy>) -> bool {
+    if !stack_closures_enabled() {
+        return false;
+    }
+    let mut flat: Vec<&Inst> = Vec::new();
+    flatten_inst(body, &mut flat);
+    flat.iter().any(|inst| match inst {
+        Inst::AllocClosure { site, .. } | Inst::AllocObject { site, class_id: Some(_), .. } => {
+            strat.get(&site.0) == Some(&AllocStrategy::Stack)
+        }
+        _ => false,
     })
 }
 
@@ -7847,7 +7885,8 @@ fn emit_i64_function(
             let _ = elide_frame_locals(f, &mut reflike, &numeric_all, &typeof_fusion, direct_sigs, string_plans, false);
         }
     }
-    let use_frame_roots = frame_roots_enabled() && !reflike.is_empty();
+    let use_frame_roots = frame_roots_enabled() && !reflike.is_empty()
+        && (!conservative_roots_enabled() || body_has_try(&f.body) || body_has_stack_cells(&f.body, strat));
     if use_frame_roots {
         reflike.sort_unstable();
     }
@@ -7911,12 +7950,12 @@ fn emit_i64_function(
     } else if use_frame_roots {
         // lazy: the frame is linked only around slow paths (with register
         // homes it is also filled only there)
-    } else {
+    } else if !conservative_roots_enabled() {
         for id in &reflike {
             let _ = writeln!(s, "  ts_gc_root(&v{});", id);
         }
     }
-    let nroot = if use_frame_roots { 0 } else { reflike.len() };
+    let nroot = if use_frame_roots || conservative_roots_enabled() { 0 } else { reflike.len() };
     let scalar_slices: BTreeMap<u32, ScalarStringSlice> = BTreeMap::new();
     let json_locals: BTreeSet<u32> = BTreeSet::new();
     let json_roots: BTreeSet<u32> = BTreeSet::new();
@@ -8058,7 +8097,8 @@ fn emit_f64_function(
             let _ = elide_frame_locals(f, &mut reflike, &numeric_all, &typeof_fusion, direct_sigs, string_plans, false);
         }
     }
-    let use_frame_roots = frame_roots_enabled() && !reflike.is_empty();
+    let use_frame_roots = frame_roots_enabled() && !reflike.is_empty()
+        && (!conservative_roots_enabled() || body_has_try(&f.body) || body_has_stack_cells(&f.body, strat));
     if use_frame_roots {
         reflike.sort_unstable();
     }
@@ -8122,12 +8162,12 @@ fn emit_f64_function(
     } else if use_frame_roots {
         // lazy: the frame is linked only around slow paths (with register
         // homes it is also filled only there)
-    } else {
+    } else if !conservative_roots_enabled() {
         for id in &reflike {
             let _ = writeln!(s, "  ts_gc_root(&v{});", id);
         }
     }
-    let nroot = if use_frame_roots { 0 } else { reflike.len() };
+    let nroot = if use_frame_roots || conservative_roots_enabled() { 0 } else { reflike.len() };
     let scalar_slices: BTreeMap<u32, ScalarStringSlice> = BTreeMap::new();
     let json_locals: BTreeSet<u32> = BTreeSet::new();
     let json_roots: BTreeSet<u32> = BTreeSet::new();
@@ -8468,7 +8508,8 @@ fn emit_function(
             None
         }
     };
-    let use_frame_roots = frame_roots_enabled() && !reflike.is_empty();
+    let use_frame_roots = frame_roots_enabled() && !reflike.is_empty()
+        && (!conservative_roots_enabled() || body_has_try(&f.body) || body_has_stack_cells(&f.body, strat));
     if use_frame_roots {
         reflike.sort_unstable();
     }
@@ -8617,7 +8658,7 @@ fn emit_function(
     } else if use_frame_roots {
         // lazy: the frame is linked only around slow paths (with register
         // homes it is also filled only there)
-    } else {
+    } else if !conservative_roots_enabled() {
         for id in &reflike {
             let _ = writeln!(s, "  ts_gc_root(&v{});", id);
         }
@@ -8626,7 +8667,7 @@ fn emit_function(
         let _ = writeln!(s, "  ts_gc_root(&ss_base{});", id);
     }
     let nroot = scalar_slice_roots.len()
-        + if use_frame_roots { 0 } else { reflike.len() };
+        + if use_frame_roots || conservative_roots_enabled() { 0 } else { reflike.len() };
 
     // Rest parameter: gather args[restIndex..nargs] into a fresh array. Root the
     // destination first because ts_array_push may allocate and trigger minor GC.
