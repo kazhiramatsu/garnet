@@ -234,3 +234,4 @@ parity-unported	arrays/typed_array_loops	Frozen emitter lacks the typed array bu
 selfconf-unported	arrays/typed_array_loops	Frozen emitter lacks the typed array builtins; native Rust output matches V8.
 parity	strings/two_byte_text	The Rust emitter omits two double locals the frozen emitter declares and never uses; both outputs match V8.
 parity	closures/switch_this_cell	The Rust emitter places the lexical-this cell of one switch case on the stack where the frozen emitter uses the frame arena (an escape-analysis placement difference; the stack-check mode and V8 agree with both outputs).
+parity	classes/field_store_safety	The Rust emitter keeps an enum-typed field value in an integer local where the frozen emitter uses a double (the int32 field facts are Rust-only); both outputs match V8.

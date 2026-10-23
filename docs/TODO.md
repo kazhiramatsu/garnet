@@ -8759,3 +8759,24 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   selfconf 547; conformance 550 plain and strict, 547 protect; GC stress;
   bundler; unit). tsc-ts one checker, outputs identical, four pairs: 25.48 ->
   25.31 G instructions (-0.65%), cycles -0.3%, wall 1.34 -> 1.33 s.
+- Slice W (exporter, field types by store safety;
+  `docs/field_store_safety_design.md`): a class field's scalar representation
+  needed the whole class declaration free of unchecked type syntax, and
+  tsc-ts's `Type` (whose accessors downcast `this`) had every field boxed:
+  `flags` was read through `ts_to_num` and ToInt32 at each flag test. The
+  safety test moves to the stores: `collectUnsafeFieldStores` walks the
+  program once and boxes a field assigned a value with a cast or non-null
+  assertion on its own path (a cast on the receiver of a read, `(x as T).pos`,
+  leaves the value's declared type) or an any/unknown type, a destructuring
+  target, or a deleted field, and keeps every field of a class stored into
+  dynamically (an element store, Object.assign). Classes with typed fields 158
+  -> 208 (Type's flags, objectFlags, id; 19 of Checker's); boxed numeric field
+  reads 2,536 -> 380 sites, mostly module-scope cells. Fixture
+  `classes/field_store_safety` (a benign parity representation difference
+  recorded). Gates all green (parity 385 identical / 162 known; selfconf 547;
+  conformance 551 plain and strict, 548 protect; GC stress; bundler; unit).
+  tsc-ts one checker, outputs identical, six pairs: 25.34 -> 25.13 G
+  instructions (-0.8%), cycles -1.2%, wall 1.42 -> 1.40 s; four checkers
+  0.72-0.78 s (median 0.76; scriptc 0.43). The session's score: 33.44 -> 25.13
+  G (-25%), scriptc 18.3 G; wall 1.74 -> about 1.35 s on a quiet machine
+  against 1.05 s.

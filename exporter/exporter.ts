@@ -8173,6 +8173,115 @@ class Exporter {
   /** Per class: field name -> set of concrete scalar type tags seen across all
    *  `new C<...>()` sites. Used for monomorphization (uniform -> specialize). */
   instFieldTypes = new Map<number, Map<string, Set<string>>>();
+  /** Field declarations (property declarations, parameter properties) stored
+   *  unsafely somewhere in the program, and class declarations stored into
+   *  dynamically (docs/field_store_safety_design.md). A typed field is mis-set
+   *  only by a store, so these decide a field's representation; reads through
+   *  casts (`this as unknown as Sub`) leave it typed. */
+  unsafeFieldDecls = new Set<ts.Node>();
+  unsafeStoreClasses = new Set<ts.Node>();
+  collectUnsafeFieldStores(): void {
+    if (!this.strictTypeOptimizationsEnabled()) return;
+    const unwrap = (e: ts.Expression): ts.Expression => {
+      for (;;) {
+        if (ts.isParenthesizedExpression(e)) e = e.expression;
+        else if (ts.isAsExpression(e) || ts.isTypeAssertionExpression(e) || ts.isNonNullExpression(e)) e = e.expression;
+        else return e;
+      }
+    };
+    const classDeclOfType = (t: ts.Type | undefined): ts.Node | undefined => {
+      const sym = t?.getSymbol?.();
+      for (const d of sym?.declarations ?? []) if (ts.isClassLike(d)) return d;
+      return undefined;
+    };
+    // The stored value is unsafe when a cast or a non-null assertion sits on
+    // its own path (the expression itself, a branch of a conditional, an
+    // operand of `??`, `||`, `&&`, the last of a comma) or its type has any or
+    // unknown. A cast elsewhere in the expression, on the receiver of a
+    // property read (`(x as T).pos`) or in a call's argument, leaves the value's
+    // declared type, which the field's own typing and the callee's signature
+    // vouch for; tsc-ts's parser stores `node.pos = (type as T).pos` constantly.
+    const valueUnsafe = (rhs: ts.Expression): boolean => {
+      let e: ts.Expression = rhs;
+      for (;;) {
+        if (ts.isParenthesizedExpression(e)) { e = e.expression; continue; }
+        if (ts.isAsExpression(e) || ts.isTypeAssertionExpression(e) || ts.isNonNullExpression(e) || ts.isSatisfiesExpression(e)) return true;
+        if (ts.isConditionalExpression(e)) return valueUnsafe(e.whenTrue) || valueUnsafe(e.whenFalse);
+        if (ts.isBinaryExpression(e)) {
+          const k = e.operatorToken.kind;
+          if (k === ts.SyntaxKind.QuestionQuestionToken || k === ts.SyntaxKind.BarBarToken || k === ts.SyntaxKind.AmpersandAmpersandToken) return valueUnsafe(e.left) || valueUnsafe(e.right);
+          if (k === ts.SyntaxKind.CommaToken) { e = e.right; continue; }
+          if (k >= ts.SyntaxKind.FirstAssignment && k <= ts.SyntaxKind.LastAssignment) { e = e.right; continue; }
+        }
+        break;
+      }
+      try { return this.typeHasAnyOrUnknown(this.checker.getTypeAtLocation(e)); } catch { return true; }
+    };
+    const markField = (name: ts.MemberName, force: boolean, rhs: ts.Expression | undefined) => {
+      const sym = this.symbolOf(name);
+      const decls = (sym?.declarations ?? []).filter((d) => ts.isPropertyDeclaration(d) || (ts.isParameter(d) && ts.isConstructorDeclaration(d.parent)));
+      if (decls.length === 0) return;
+      if (force || !rhs || valueUnsafe(rhs)) {
+        for (const d of decls) this.unsafeFieldDecls.add(d);
+        if (process.env.TSAOT_DEBUG_FIELD_SAFETY) {
+          const sf = name.getSourceFile(); const pos = sf.getLineAndCharacterOfPosition(name.getStart());
+          const owner = decls[0].parent && ts.isClassLike(decls[0].parent) ? (decls[0].parent.name?.text ?? "?") : (ts.isConstructorDeclaration(decls[0].parent) ? (decls[0].parent.parent as ts.ClassLikeDeclaration).name?.text ?? "?" : "?");
+          console.error(`[field-safety] ${owner}.${name.getText()} unsafe at ${sf.fileName}:${pos.line + 1} ${force ? "(forced)" : rhs ? rhs.getText().slice(0, 60) : ""}`);
+        }
+      }
+    };
+    const markObjectDynamic = (obj: ts.Expression) => {
+      // the receiver's class before any cast: `(x as any)[k] = v` stores into x's class
+      let t: ts.Type | undefined;
+      try { t = this.checker.getTypeAtLocation(unwrap(obj)); } catch { t = undefined; }
+      const d = classDeclOfType(t);
+      if (d) {
+        this.unsafeStoreClasses.add(d);
+        if (process.env.TSAOT_DEBUG_FIELD_SAFETY) console.error(`[field-safety] class ${(d as ts.ClassLikeDeclaration).name?.text ?? "?"} stored dynamically at ${obj.getSourceFile().fileName}:${obj.getSourceFile().getLineAndCharacterOfPosition(obj.getStart()).line + 1}`);
+      }
+    };
+    const markTarget = (target: ts.Expression, rhs: ts.Expression | undefined, force: boolean) => {
+      const t = unwrap(target);
+      if (ts.isPropertyAccessExpression(t)) markField(t.name, force, rhs);
+      else if (ts.isElementAccessExpression(t)) markObjectDynamic(t.expression);
+      else if (ts.isObjectLiteralExpression(t)) {
+        // a destructuring target: the values come from a shape the checker does
+        // not relate to the fields; every field target is unsafe
+        for (const p of t.properties) {
+          if (ts.isPropertyAssignment(p)) markTarget(p.initializer, undefined, true);
+          else if (ts.isShorthandPropertyAssignment(p) && p.objectAssignmentInitializer) markTarget(p.objectAssignmentInitializer, undefined, true);
+          else if (ts.isSpreadAssignment(p)) markTarget(p.expression, undefined, true);
+        }
+      } else if (ts.isArrayLiteralExpression(t)) {
+        for (const e of t.elements) {
+          if (ts.isOmittedExpression(e)) continue;
+          if (ts.isSpreadElement(e)) markTarget(e.expression, undefined, true);
+          else if (ts.isBinaryExpression(e) && e.operatorToken.kind === ts.SyntaxKind.EqualsToken) markTarget(e.left, undefined, true);
+          else markTarget(e, undefined, true);
+        }
+      }
+    };
+    const visit = (n: ts.Node) => {
+      if (ts.isBinaryExpression(n)) {
+        const k = n.operatorToken.kind;
+        if (k >= ts.SyntaxKind.FirstAssignment && k <= ts.SyntaxKind.LastAssignment) markTarget(n.left, n.right, false);
+      } else if (ts.isDeleteExpression(n)) {
+        markTarget(n.expression, undefined, true);
+      } else if (ts.isCallExpression(n)) {
+        // Object.assign(x, ...): x's class stored into dynamically
+        const callee = n.expression;
+        if (ts.isPropertyAccessExpression(callee) && ts.isIdentifier(callee.expression) && callee.expression.text === "Object" && callee.name.text === "assign" && n.arguments.length > 0)
+          markObjectDynamic(n.arguments[0]);
+      } else if (ts.isForInStatement(n) || ts.isForOfStatement(n)) {
+        if (!ts.isVariableDeclarationList(n.initializer)) markTarget(n.initializer, undefined, true);
+      }
+      ts.forEachChild(n, visit);
+    };
+    for (const sf of this.program.getSourceFiles()) {
+      if (sf.isDeclarationFile) continue;
+      visit(sf);
+    }
+  }
   /** Active type-parameter substitution while lowering/scanning a specialized
    *  generic body: type-param name -> concrete TypeSpec. */
   typeSubst: Map<string, TypeSpec> | undefined = undefined;
@@ -9227,13 +9336,18 @@ class Exporter {
         const info: ClassInfo | undefined = this.classInfos[id];
         if (!info) return;
         const decl = this.classNodeOfId.get(id);
-        if (decl && !this.classTypeOptimizationSafe(decl)) return;
+        // A class stored into dynamically (an element store, Object.assign)
+        // keeps every field boxed, and so do the classes above it; otherwise a
+        // field is typed unless some store to it is unsafe
+        // (collectUnsafeFieldStores): casts in the class body no longer box
+        // every field of tsc-ts's Type, whose accessors downcast `this`.
+        if (decl && this.unsafeStoreClasses.has(decl)) return;
         let m = this.instFieldTypes.get(id);
         if (!m) { m = new Map(); this.instFieldTypes.set(id, m); }
         for (const fname of info.ownFields) {
           const prop = this.checker.getPropertyOfType(t, fname);
           let tag = "tsv";
-          if (prop) {
+          if (prop && !(prop.declarations ?? []).some((d) => this.unsafeFieldDecls.has(d))) {
             const ft = this.checker.getTypeOfSymbolAtLocation(prop, node);
             tag = this.classify(ft) === "primitive" ? (this.isInt32ValuedType(ft) ? "int32" : "number") : "tsv";
           }
@@ -13837,6 +13951,7 @@ class Exporter {
       }
     }
     for (const m of this.modules) this.collectMutatedGlobalRefs(m);
+    this.collectUnsafeFieldStores();
 
     // Step C: synthesize __module_init from top-level non-declaration statements.
     // The statements keep their original parent chain (SourceFile), so the TS
