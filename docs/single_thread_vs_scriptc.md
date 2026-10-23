@@ -237,16 +237,28 @@ neither instructions nor wall.
 
 ## What to do
 
-The lever is the instruction count of the emitted code and of the
-runtime's hot operations, and the kernels order the work: regular
-expressions (6.9x: the engine, QuickJS's, runs without a first-character
-prefilter and the adapter boxes every match), interface-typed literals
-(3.6x: the tsc node pattern, the checker's whole data model), maps with
-string keys (3.0x), string scanning and building (2.9x, 2.7x), flag tests
-and truthiness over unions (2.85x), small calls with boxed arguments
-(2.6x), callbacks (2.6x). Each is measured by its kernel's instruction
-ratio, which `scripts/pattern_bench_scriptc.sh` prints, and the whole by
-the one-thread compile's instruction count (33.4 G today). The runtime's
-side, with its own measurements: `Map` lookups (12% of check), the
-collector (8%), `containsNonASCII` (2-3%: keep the ASCII flag on every
-string that has it, including the builder's and concatenation's results).
+The slices above took the one-thread compile from 1.74 to 1.43 s against
+scriptc's 1.05 s (1.36x; the instruction count from 33.4 to 26.9 G against
+18.3 G). The profile after them (`scripts/prof_pc.py` on the slice-I
+build): generated code 53%, the runtime 40%, system libraries 6%. In the
+runtime: the maps 12% (`ts_map_get` 6.5%, `mapset_probe` 2.6%, `map_find`
+1.5%: a hit is a chain of L1 hits, the cell, the index word, the key, the
+value, about 30 cycles; the arrays are cache-resident, so a layout change
+gave nothing), the collector 11% (`gc_mark_visit` 3.4%, the refills 2.3%
+before slice J, `gc_alloc` 1.5%, `gc_scan_cell` 1.3%, the stack scan 0.9%),
+strings 4%, arrays 2%. In the generated code: loads of globals and runtime
+structures 16%, prologues and epilogues 15%, integer arithmetic 14%, field
+loads 10%, compares 9%, tag constants 7%, branches 6%, boxing moves 4.5%.
+
+Next, in order: the tag-constant initializations of boxed locals that are
+always assigned before they are read (201,649 of tsc-ts's 201,920 boxed
+locals; slice K); the C compiler's inlining threshold for the generated
+code (`-mllvm -inline-threshold=600`: -1.8% instructions measured, the
+small helpers of a call-heavy program); the marking and allocation paths
+of the collector; `number` fields whose every store is an int32 (`pos`,
+`end`, `id`), by a whole-program store analysis, as integers; the map
+lookup's receiver test and hash under closed receivers; array capacity
+hints per allocation site. The kernels order the rest: `path_regexps`
+(6.9x), `obj_literal_poly` (3.1x), `map_string_keys` (3.0x),
+`string_scan`/`strings_build` (2.7x), `small_calls` (2.6x), `callbacks`
+(2.5x), `class_nodes` (2.5x), `tree_recursion` (2.3x).

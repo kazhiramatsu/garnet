@@ -8505,3 +8505,13 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   0.979, wall 1.46 -> 1.43 s, peak memory +9 MB, outputs identical. Gates:
   parity, selfconf, unit, bundler, conformance 540/540 plain and strict,
   537/537 under protect mode, GC stress.
+- Measured and not adopted (slice K): initializing only the boxed locals that
+  some path reads before assigning (a definitely-assigned walk over the
+  structured body; 176k of tsc-ts's 202k boxed locals lost their `=
+  TS_UNDEFINED`). tsc-ts one thread: instructions 1.0000, cycles 0.997, wall
+  1.000 in six pairs: the C compiler already drops the dead initializations,
+  and the tag constants in the profile are live compares and stores. The first
+  version counted parameters as assigned at entry and the generic entry
+  assigns a parameter only when the call passed it
+  (`functions/arguments_length` read a stale slot: 20 for 13); reverted, the
+  fixture `closures/undef_init_paths` kept.
