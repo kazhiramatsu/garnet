@@ -4100,20 +4100,9 @@ uint32_t ts_str_switch_hash(tsv v, uint32_t none){
   if (!ts_is_str(v)) return none;
   return ts_str_hash_of(v);
 }
-/* The hash a collection asks for: an immediate's bytes folded in line (the
-   same value as strhash_view: a one-byte unit's two FNV-1a steps are one
-   multiply by the prime's square), a hashed heap string's cached hash, and
-   the general entry (which computes and caches) for the rest. */
-TS_RT_ALWAYS_INLINE uint32_t ts_str_hash_fast(tsv s){
-  if (ts_is_short_str(s)){
-    uint32_t len = ts_short_str_len(s), h = 2166136261u;
-    for (uint32_t i = 0; i < len; i++) h = (h ^ ts_short_str_byte(s, i)) * 637696617u;
-    return h;
-  }
-  const ts_string* x = ts_str_ptr_typed(s);
-  if (TS_RT_LIKELY(x->flags & TS_STR_FLAG_HASHED)) return x->hash;
-  return ts_str_hash_of(s);
-}
+/* The general string hash for the header's ts_str_hash_fast: computes and
+   caches (ts_str_hash_of). */
+uint32_t ts_str_hash_cached(tsv s){ return ts_str_hash_of(s); }
 /* The storage flags of a fresh string: UTF16 as allocated, ASCII when every
    unit is below 0x80. Not HASHED: the hash is computed by ts_str_hash_of when
    a map, an intern or an equality first asks for it, and cached then (most
@@ -7654,7 +7643,7 @@ TS_RT_ALWAYS_INLINE uint32_t sv0_hash(tsv k){
    two flat strings of one width compare by memcmp; everything else (a view,
    an immediate against a heap string, two numbers, objects) takes
    SameValueZero. Out of line so the probe loop keeps no spills for it. */
-__attribute__((noinline)) static int mapset_key_eq_slow(tsv key, tsv k){
+int ts_mapset_key_eq_slow(tsv key, tsv k){
   if (ts_is_heap_str(key) && ts_is_heap_str(k)){
     const ts_string* a = ts_str_ptr_typed(key); const ts_string* b = ts_str_ptr_typed(k);
     if (a->len != b->len) return 0;
@@ -7686,7 +7675,7 @@ static inline long mapset_probe(const uint32_t* index, uint32_t index_cap, const
     } else if (((w ^ h) & ~mask) == 0u){
       uint32_t di = (w & mask) - 2u;
       tsv key = keys[di];
-      if (key == k || mapset_key_eq_slow(key, k)){   /* identical bits are SameValueZero */
+      if (key == k || ts_mapset_key_eq_slow(key, k)){   /* identical bits are SameValueZero */
         if (slot_out) *slot_out = slot;
         RT_STAT_ADD(map_find_probes, probes); RT_STAT_HIST(map_find_hist, probes);
         return (long)di;
@@ -7821,7 +7810,7 @@ static tsv map_set_unchecked(tsv mv, tsv k, tsv v){
   return mv;
 }
 tsv ts_map_set(tsv mv, tsv k, tsv v){
-  if (!ts_is_map(mv)) ts_throw_type_error_msg("Method Map.prototype.set called on incompatible receiver");
+  if (TS_RT_UNLIKELY(!ts_is_map(mv))){ tsv a[2] = { k, v }; return ts_collection_method_dynamic(mv, "set", a, 2); }
   return map_set_unchecked(mv, k, v);
 }
 /* The common lookup, without a call: an indexed map and a number key, found
@@ -7852,7 +7841,7 @@ static void map_stat_key(tsv k, long fast){
 #define MAP_STAT_KEY(k, fast) ((void)0)
 #endif
 tsv ts_map_get(tsv mv, tsv k){
-  if (!ts_is_map(mv)){ ts_throw_type_error_msg("Method Map.prototype.get called on incompatible receiver"); return TS_UNDEFINED; }
+  if (TS_RT_UNLIKELY(!ts_is_map(mv))) return ts_collection_method_dynamic(mv, "get", &k, 1);
   ts_map* m = ts_ptr(mv);
   long i = map_find_num_fast(m, k);
   MAP_STAT_KEY(k, i);
@@ -7860,7 +7849,7 @@ tsv ts_map_get(tsv mv, tsv k){
   return i>=0 ? m->vals[i] : TS_UNDEFINED;
 }
 int ts_map_has(tsv mv, tsv k){
-  if (!ts_is_map(mv)){ ts_throw_type_error_msg("Method Map.prototype.has called on incompatible receiver"); return 0; }
+  if (TS_RT_UNLIKELY(!ts_is_map(mv))) return ts_truthy(ts_collection_method_dynamic(mv, "has", &k, 1));
   ts_map* m = ts_ptr(mv);
   long i = map_find_num_fast(m, k);
   MAP_STAT_KEY(k, i);
@@ -8272,11 +8261,11 @@ static tsv set_add_unchecked(tsv sv, tsv v){
   ts_write_barrier(sv, v); return sv;
 }
 tsv ts_set_add(tsv sv, tsv v){
-  if (!ts_is_set(sv)) ts_throw_type_error_msg("Method Set.prototype.add called on incompatible receiver");
+  if (TS_RT_UNLIKELY(!ts_is_set(sv))) return ts_collection_method_dynamic(sv, "add", &v, 1);
   return set_add_unchecked(sv, v);
 }
 int ts_set_has(tsv sv, tsv v){
-  if (!ts_is_set(sv)){ ts_throw_type_error_msg("Method Set.prototype.has called on incompatible receiver"); return 0; }
+  if (TS_RT_UNLIKELY(!ts_is_set(sv))) return ts_truthy(ts_collection_method_dynamic(sv, "has", &v, 1));
   return set_find(ts_ptr(sv), v) >= 0;
 }
 static int set_delete_unchecked(tsv sv, tsv v){
@@ -15511,6 +15500,29 @@ static tsv ts_throw_cannot_read(tsv obj, const char* prop){
   else      snprintf(buf, sizeof buf, "Cannot read properties of %s", what);
   ts_throw(ts_new_error(TS_ERR_TYPE, ts_new_string(buf, (uint32_t)strlen(buf))));
   return TS_UNDEFINED;
+}
+/* A collection method on a receiver that is not that collection (an `any`
+   value behind a Map or Set type, which the typed entry trusted): null and
+   undefined throw the property-read TypeError, an object's own or inherited
+   method of that name is called with the receiver, as the dynamic call would
+   be, and anything else is "not a function". */
+tsv ts_collection_method_dynamic(tsv recv, const char* name, tsv* args, int nargs){
+  if (ts_is_undef(recv) || ts_is_null(recv)) ts_throw_cannot_read(recv, name);
+  tsv fn = TS_UNDEFINED;
+  if (ts_is_obj(recv) || ts_is_func(recv)){
+    ts_gc_root(&recv);
+    fn = ts_get(recv, ts_intern_field(name, (uint32_t)strlen(name)));
+    ts_gc_unroot(1);
+  }
+  if (!ts_is_func(fn)) ts_throw_not_a_function(name);
+  tsv argv[3];
+  argv[0] = recv;
+  for (int i = 0; i < nargs && i < 2; i++) argv[i + 1] = args[i];
+  for (int i = 0; i <= nargs && i < 3; i++) ts_gc_root(&argv[i]);
+  ts_gc_root(&fn);
+  tsv r = ts_call_method(fn, argv, nargs + 1);
+  ts_gc_unroot(nargs + 2);
+  return r;
 }
 /* charCodeAt on a receiver that is not a string (an `any` value behind a
    string type, which the typed entry trusted): null and undefined throw the

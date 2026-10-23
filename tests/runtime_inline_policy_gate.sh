@@ -98,6 +98,19 @@ while IFS= read -r name; do
     ts_map_probe_num | \
     ts_map_get_num | \
     ts_array_push_inline | \
+    ts_str_hash_fast | \
+    ts_ref_hash | \
+    ts_mapset_probe_inline | \
+    ts_map_probe_str | \
+    ts_map_probe_ref | \
+    ts_map_get_str | \
+    ts_map_has_str | \
+    ts_map_get_ref | \
+    ts_map_has_ref | \
+    ts_set_probe_str | \
+    ts_set_probe_ref | \
+    ts_set_has_str | \
+    ts_set_has_ref | \
     ts_eq_num | \
     ts_map_has_num) ;;
     *)

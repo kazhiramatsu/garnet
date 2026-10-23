@@ -163,3 +163,47 @@ The remaining gap to scriptc on string keys (about 2.4x) is the call into the
 runtime and the generic tag dispatch at every site; a statically string-typed
 key could take an inline probe as the unboxed number key does (slice T), a
 possible later slice.
+
+## Typed key probes in line (session 352, slice AC)
+
+Slice T gave `map.get(k)` with an unboxed number key an inline probe; the 521
+`ts_map_get` sites of the tsc-ts build with a boxed key still paid the call,
+the receiver test and the tag dispatch, and the compile's generic lookups are
+64% string keys and 32% object keys (`map_keys` statistics). The checker names
+the key: the exporter puts the key kind on the key local (`Local.tyKind`:
+"string" for string types, "reference" for object, array and function types,
+null and undefined members set aside) where it lowers a `map.get`, `map.has` or
+`set.has`; the IR's type table is not populated by the exporter, so the hint
+rides on the local. A union with other members, `any`, `unknown` or a type
+parameter names neither.
+
+- `ts_map_get_str` / `ts_map_has_str` / `ts_set_has_str`: the indexed
+  collection's probe in line with `ts_str_hash_fast` (now in the header), the
+  identity test, and `ts_mapset_key_eq_slow` out of line for a candidate whose
+  hash bits match but whose bits differ (equal content in another object: the
+  checker's case).
+- `ts_map_get_ref` / `ts_map_has_ref` / `ts_set_has_ref`: an identity probe
+  with the address hash (`ts_ref_hash`, the value `sv0_hash` gives a heap
+  reference); SameValueZero on references is identity, so no slow compare.
+
+Every probe bails to the general entry when the receiver is not a Map or Set,
+is weak, is still in linear mode, or when the key is not what the type said
+(a number behind `string`, null or undefined behind an object type): the type
+is a hint for the fast path, never trusted for the result. The probe loop is
+`ts_mapset_probe_inline`, shared by the six entries. Knob:
+`TSAOT_MAP_KEY_INLINE=0` keeps the calls (the parity oracle's output).
+Fixture `maps_sets/map_typed_keys`.
+
+With it, the receiver the type lied about: a `map.get` / `map.has` /
+`map.set` / `set.has` / `set.add` on a value that is not that collection (an
+object with its own `get` behind a `Map` type) threw "called on incompatible
+receiver"; it now calls the object's own method, as the dynamic call would,
+through `ts_collection_method_dynamic` (null and undefined throw V8's
+property-read TypeError; anything else "is not a function").
+
+| kernel | instructions | cycles |
+|---|---|---|
+| `map_symbol_table` (string keys) | -19% | -8% |
+| `map_object_keys` (a `Map<Node, T>` and a `Set<Node>`) | -40% | -50% |
+
+tsc-ts: see TODO (session 352, slice AC).

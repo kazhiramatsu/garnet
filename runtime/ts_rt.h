@@ -948,6 +948,9 @@ static inline double ts_str_charcodeat_fast(tsv s, double idx){
 /* charCodeAt on a receiver that is not a string: an object's `charCodeAt`
    called, or the TypeError V8 throws (ts_rt.c). */
 double ts_str_charcodeat_dynamic(tsv recv, double idx);
+/* A Map or Set method on a receiver that is not that collection: the object's
+   own method called, or the TypeError V8 throws (ts_rt.c). */
+tsv ts_collection_method_dynamic(tsv recv, const char* name, tsv* args, int nargs);
 static inline double ts_str_charcodeat_general(tsv s, double idx){
   if (TS_RT_UNLIKELY(!ts_is_str(s))) return ts_str_charcodeat_dynamic(s, idx);
   ts_strview x = ts_str_view_typed(s);
@@ -2509,6 +2512,119 @@ TS_RT_ALWAYS_INLINE uint32_t sv0_hash_num(tsv k){ return sv0_hash_num_d(ts_to_nu
    not a Map, a map still in linear mode, a slot whose key is an equal number
    with other bits, takes the general entry. The general entry alone was 7% of
    a compile's samples at about 25 cycles a call. */
+/* The hash a collection asks for: an immediate's bytes folded in line (the
+   same value as the runtime's strhash_view: a one-byte unit's two FNV-1a steps
+   are one multiply by the prime's square), a hashed heap string's cached hash,
+   and the general entry (which computes and caches) for the rest. */
+uint32_t ts_str_hash_cached(tsv s);
+TS_RT_ALWAYS_INLINE uint32_t ts_str_hash_fast(tsv s){
+  if (ts_is_short_str(s)){
+    uint32_t len = ts_short_str_len(s), h = 2166136261u;
+    for (uint32_t i = 0; i < len; i++) h = (h ^ ts_short_str_byte(s, i)) * 637696617u;
+    return h;
+  }
+  const ts_string* x = ts_str_ptr_typed(s);
+  if (TS_RT_LIKELY(x->flags & TS_STR_FLAG_HASHED)) return x->hash;
+  return ts_str_hash_cached(s);
+}
+/* A reference key's hash: the cell's address (cells never move), the high
+   half of the product mixing every address bit into the index bits; the same
+   value the runtime's sv0_hash gives a heap reference. */
+TS_RT_ALWAYS_INLINE uint32_t ts_ref_hash(tsv k){
+  uint64_t x = ((k & TS_PAYLOAD_MASK) >> 4) * 0x9E3779B97F4A7C15ull;
+  return (uint32_t)(x >> 32);
+}
+/* The candidate whose hash bits match but whose bits differ: SameValueZero,
+   with flat strings by memcmp (ts_rt.c). */
+int ts_mapset_key_eq_slow(tsv key, tsv k);
+/* The probe of an indexed collection's slot table for a key hashed to h, the
+   shared loop of the typed probes below: *out = the dense index or -1. The
+   receiver's index and keys are the caller's (a Map's or a Set's). */
+TS_RT_ALWAYS_INLINE void ts_mapset_probe_inline(const uint32_t* index, uint32_t index_cap, const tsv* keys, tsv k, uint32_t h, int identity_only, long* out){
+  uint32_t mask = index_cap - 1u, slot = h & mask;
+  for (;;){
+    uint32_t w = index[slot];
+    if (w == 0u){ *out = -1; return; }
+    if (w != 1u && ((w ^ h) & ~mask) == 0u){
+      uint32_t di = (w & mask) - 2u;
+      tsv key = keys[di];
+      if (key == k || (!identity_only && ts_mapset_key_eq_slow(key, k))){ *out = (long)di; return; }
+    }
+    slot = (slot + 1u) & mask;
+  }
+}
+/* Map.get / Map.has with a key the program types as a string: the indexed
+   map's probe in line with the string hash; a receiver that is not a Map, a
+   map still in linear mode or a WeakMap, or a key that is not a string after
+   all, takes the general entry. */
+TS_RT_ALWAYS_INLINE int ts_map_probe_str(tsv mv, tsv k, long* out){
+  if (TS_RT_UNLIKELY(!ts_is_obj(mv))) return 0;
+  ts_map* m = (ts_map*)ts_ptr(mv);
+  if (TS_RT_UNLIKELY(m->o.h.kind != TS_KIND_MAP || m->weak || !m->index)) return 0;
+  if (TS_RT_UNLIKELY(!ts_is_str(k))) return 0;
+  ts_mapset_probe_inline(m->index, m->index_cap, m->keys, k, ts_str_hash_fast(k), 0, out);
+  return 1;
+}
+/* The same with a key the program types as an object, array or function: an
+   identity probe (SameValueZero on references is identity). A key that is not
+   a heap reference (null, undefined, a primitive behind the type) takes the
+   general entry. */
+TS_RT_ALWAYS_INLINE int ts_map_probe_ref(tsv mv, tsv k, long* out){
+  if (TS_RT_UNLIKELY(!ts_is_obj(mv))) return 0;
+  ts_map* m = (ts_map*)ts_ptr(mv);
+  if (TS_RT_UNLIKELY(m->o.h.kind != TS_KIND_MAP || m->weak || !m->index)) return 0;
+  if (TS_RT_UNLIKELY(!(ts_is_obj(k) || ts_is_func(k)))) return 0;
+  ts_mapset_probe_inline(m->index, m->index_cap, m->keys, k, ts_ref_hash(k), 1, out);
+  return 1;
+}
+TS_RT_ALWAYS_INLINE tsv ts_map_get_str(tsv mv, tsv k){
+  long i;
+  if (TS_RT_LIKELY(ts_map_probe_str(mv, k, &i))) return i >= 0 ? ((ts_map*)ts_ptr(mv))->vals[i] : TS_UNDEFINED;
+  return ts_map_get(mv, k);
+}
+TS_RT_ALWAYS_INLINE int ts_map_has_str(tsv mv, tsv k){
+  long i;
+  if (TS_RT_LIKELY(ts_map_probe_str(mv, k, &i))) return i >= 0;
+  return ts_map_has(mv, k);
+}
+TS_RT_ALWAYS_INLINE tsv ts_map_get_ref(tsv mv, tsv k){
+  long i;
+  if (TS_RT_LIKELY(ts_map_probe_ref(mv, k, &i))) return i >= 0 ? ((ts_map*)ts_ptr(mv))->vals[i] : TS_UNDEFINED;
+  return ts_map_get(mv, k);
+}
+TS_RT_ALWAYS_INLINE int ts_map_has_ref(tsv mv, tsv k){
+  long i;
+  if (TS_RT_LIKELY(ts_map_probe_ref(mv, k, &i))) return i >= 0;
+  return ts_map_has(mv, k);
+}
+/* Set.has with a key the program types as a string or as a reference: the
+   indexed set's probe in line, as for Maps. */
+TS_RT_ALWAYS_INLINE int ts_set_probe_str(tsv sv, tsv k, long* out){
+  if (TS_RT_UNLIKELY(!ts_is_obj(sv))) return 0;
+  ts_set_t* s = (ts_set_t*)ts_ptr(sv);
+  if (TS_RT_UNLIKELY(s->o.h.kind != TS_KIND_SET || s->weak || !s->index)) return 0;
+  if (TS_RT_UNLIKELY(!ts_is_str(k))) return 0;
+  ts_mapset_probe_inline(s->index, s->index_cap, s->elems, k, ts_str_hash_fast(k), 0, out);
+  return 1;
+}
+TS_RT_ALWAYS_INLINE int ts_set_probe_ref(tsv sv, tsv k, long* out){
+  if (TS_RT_UNLIKELY(!ts_is_obj(sv))) return 0;
+  ts_set_t* s = (ts_set_t*)ts_ptr(sv);
+  if (TS_RT_UNLIKELY(s->o.h.kind != TS_KIND_SET || s->weak || !s->index)) return 0;
+  if (TS_RT_UNLIKELY(!(ts_is_obj(k) || ts_is_func(k)))) return 0;
+  ts_mapset_probe_inline(s->index, s->index_cap, s->elems, k, ts_ref_hash(k), 1, out);
+  return 1;
+}
+TS_RT_ALWAYS_INLINE int ts_set_has_str(tsv sv, tsv k){
+  long i;
+  if (TS_RT_LIKELY(ts_set_probe_str(sv, k, &i))) return i >= 0;
+  return ts_set_has(sv, k);
+}
+TS_RT_ALWAYS_INLINE int ts_set_has_ref(tsv sv, tsv k){
+  long i;
+  if (TS_RT_LIKELY(ts_set_probe_ref(sv, k, &i))) return i >= 0;
+  return ts_set_has(sv, k);
+}
 TS_RT_ALWAYS_INLINE int ts_map_probe_num(tsv mv, double d, long* out){
   if (TS_RT_UNLIKELY(!ts_is_obj(mv))) return 0;
   ts_map* m = (ts_map*)ts_ptr(mv);

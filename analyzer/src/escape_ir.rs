@@ -537,6 +537,12 @@ pub struct Local {
     /// by unboxing the arithmetic-only ones (flow-sensitive, see emit_c).
     #[serde(default)]
     pub nullable_numeric: bool,
+    /// The kind of key the frontend's checker types this local as where it is
+    /// a collection key: "string" (a string type, nullable or not) or
+    /// "reference" (object, array or function types, nullable or not). A hint
+    /// for an inline probe that verifies the tag anyway; None elsewhere.
+    #[serde(default)]
+    pub ty_kind: Option<String>,
 }
 
 /// One captured variable in a closure. `binding` is the source cell; `cell`

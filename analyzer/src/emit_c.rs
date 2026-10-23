@@ -424,6 +424,7 @@ fn emit_program_with_string_plans(
     let param_facts_by_func = infer_program_param_facts(program, &indirect_funcs);
     let i64_fast = infer_i64_fast_funcs(program, &indirect_funcs, &param_facts_by_func);
     let f64_fast = infer_f64_fast_funcs(program, &indirect_funcs, &i64_fast);
+    let typed_keys_by_func = typed_key_locals(program);
     let static_strings = collect_static_string_literals(program);
     let needs_regexp = program_needs_regexp(program);
     let needs_unicode = program_needs_unicode(program);
@@ -1060,6 +1061,7 @@ fn emit_program_with_string_plans(
                 &static_strings,
                 f_string_metrics,
                 f_string_materializations,
+                typed_keys_by_func.get(&f.id.0),
             );
         }
         if let Some(info) = f64_fast.get(&f.id.0) {
@@ -1080,6 +1082,7 @@ fn emit_program_with_string_plans(
                 &static_strings,
                 f_string_metrics,
                 f_string_materializations,
+                typed_keys_by_func.get(&f.id.0),
             );
         }
         emit_function(
@@ -1099,6 +1102,7 @@ fn emit_program_with_string_plans(
             &static_strings,
             f_string_metrics,
             f_string_materializations,
+            typed_keys_by_func.get(&f.id.0),
         );
     }
 
@@ -1906,6 +1910,9 @@ struct Ctx<'a> {
     /// locals of numeric type in the IR (RefKind::Primitive), whatever their
     /// representation: a maybe-undefined or nullable numeric stays boxed
     prim_kind: BTreeSet<u32>,
+    /// locals whose static type is `string` / a reference type (typed_key_locals)
+    str_typed: BTreeSet<u32>,
+    ref_typed: BTreeSet<u32>,
     f64_mode: bool,
     /// Boxed locals carried by a generated shadow-root frame. Empty for
     /// coroutine emitters and when frame roots are disabled.
@@ -2317,6 +2324,51 @@ fn map_num_inline_enabled() -> bool {
             Ok("0") | Ok("false") | Ok("no") | Ok("off")
         )
     })
+}
+
+/// TSAOT_MAP_KEY_INLINE=0 keeps `map.get(k)` / `map.has(k)` / `set.has(k)` with
+/// a boxed key as the runtime call (the parity oracle): on, a key the program
+/// types as a string, or as an object, array or function, takes the indexed
+/// collection's probe in line (ts_rt.h ts_map_get_str / ts_map_get_ref ...).
+fn map_key_inline_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_MAP_KEY_INLINE").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
+/// A function's locals by the key kind the frontend's checker named for them
+/// (Local.ty_kind, set where a local is a collection key): strings, and
+/// references (object, array or function types). Anything else names neither.
+#[derive(Default, Clone)]
+struct TypedKeyLocals {
+    str_typed: BTreeSet<u32>,
+    ref_typed: BTreeSet<u32>,
+}
+
+fn typed_key_locals(program: &Program) -> BTreeMap<u32, TypedKeyLocals> {
+    let mut out: BTreeMap<u32, TypedKeyLocals> = BTreeMap::new();
+    for f in &program.functions {
+        let mut sets = TypedKeyLocals::default();
+        for l in &f.locals {
+            match l.ty_kind.as_deref() {
+                Some("string") => {
+                    sets.str_typed.insert(l.id.0);
+                }
+                Some("reference") => {
+                    sets.ref_typed.insert(l.id.0);
+                }
+                _ => {}
+            }
+        }
+        if !sets.str_typed.is_empty() || !sets.ref_typed.is_empty() {
+            out.insert(f.id.0, sets);
+        }
+    }
+    out
 }
 
 /// TSAOT_PUSH_INLINE=0 keeps `arr.push(v)` as the out-of-line runtime call (the
@@ -8174,6 +8226,7 @@ fn emit_i64_function(
     static_strings: &BTreeMap<Vec<u16>, usize>,
     string_metric_plan: Option<&FunctionMetricPlan>,
     string_materialization_plan: Option<&FunctionMaterializationPlan>,
+    typed_keys: Option<&TypedKeyLocals>,
 ) {
     let mut local_class = local_class_map(f);
     if let Some(&c) = fclass.get(&f.id.0) {
@@ -8350,6 +8403,8 @@ fn emit_i64_function(
         ret_kind: RetKind::Boxed,
         stack_cells: true,
         prim_kind: prim_kind_locals(f),
+        str_typed: typed_keys.map(|t| t.str_typed.clone()).unwrap_or_default(),
+        ref_typed: typed_keys.map(|t| t.ref_typed.clone()).unwrap_or_default(),
         f64_mode: false,
         frame_locals,
         frame_slot: frame_layout.as_ref().map(|l| l.slot_of.clone()),
@@ -8394,6 +8449,7 @@ fn emit_f64_function(
     static_strings: &BTreeMap<Vec<u16>, usize>,
     string_metric_plan: Option<&FunctionMetricPlan>,
     string_materialization_plan: Option<&FunctionMaterializationPlan>,
+    typed_keys: Option<&TypedKeyLocals>,
 ) {
     let mut local_class = local_class_map(f);
     if let Some(&c) = fclass.get(&f.id.0) {
@@ -8571,6 +8627,8 @@ fn emit_f64_function(
         ret_kind: RetKind::Boxed,
         stack_cells: true,
         prim_kind: prim_kind_locals(f),
+        str_typed: typed_keys.map(|t| t.str_typed.clone()).unwrap_or_default(),
+        ref_typed: typed_keys.map(|t| t.ref_typed.clone()).unwrap_or_default(),
         f64_mode: true,
         frame_locals,
         frame_slot: frame_layout.as_ref().map(|l| l.slot_of.clone()),
@@ -8615,6 +8673,7 @@ fn emit_function(
     static_strings: &BTreeMap<Vec<u16>, usize>,
     string_metric_plan: Option<&FunctionMetricPlan>,
     string_materialization_plan: Option<&FunctionMaterializationPlan>,
+    typed_keys: Option<&TypedKeyLocals>,
 ) {
     let mut local_class = local_class_map(f);
     if let Some(&c) = fclass.get(&f.id.0) {
@@ -8690,6 +8749,8 @@ fn emit_function(
             ret_kind: RetKind::Boxed,
             stack_cells: false,
             prim_kind: prim_kind_locals(f),
+        str_typed: typed_keys.map(|t| t.str_typed.clone()).unwrap_or_default(),
+        ref_typed: typed_keys.map(|t| t.ref_typed.clone()).unwrap_or_default(),
             f64_mode: false,
             frame_locals: BTreeSet::new(),
             frame_slot: None,
@@ -8756,6 +8817,8 @@ fn emit_function(
             ret_kind: RetKind::Boxed,
             stack_cells: false,
             prim_kind: prim_kind_locals(f),
+        str_typed: typed_keys.map(|t| t.str_typed.clone()).unwrap_or_default(),
+        ref_typed: typed_keys.map(|t| t.ref_typed.clone()).unwrap_or_default(),
             f64_mode: false,
             frame_locals: BTreeSet::new(),
             frame_slot: None,
@@ -8822,6 +8885,8 @@ fn emit_function(
             ret_kind: RetKind::Boxed,
             stack_cells: false,
             prim_kind: prim_kind_locals(f),
+        str_typed: typed_keys.map(|t| t.str_typed.clone()).unwrap_or_default(),
+        ref_typed: typed_keys.map(|t| t.ref_typed.clone()).unwrap_or_default(),
             f64_mode: false,
             frame_locals: BTreeSet::new(),
             frame_slot: None,
@@ -9103,6 +9168,8 @@ fn emit_function(
         ret_kind: ret_kind,
         stack_cells: true,
         prim_kind: prim_kind_locals(f),
+        str_typed: typed_keys.map(|t| t.str_typed.clone()).unwrap_or_default(),
+        ref_typed: typed_keys.map(|t| t.ref_typed.clone()).unwrap_or_default(),
         f64_mode: false,
         frame_locals,
         frame_slot: frame_layout.as_ref().map(|l| l.slot_of.clone()),
@@ -21165,6 +21232,25 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     format!("ts_bool(ts_map_has_num({}, {}))", r, ctx.numc_double(args[0].0)),
                     false,
                 ),
+                // a key the program types as a string or as a reference: the
+                // indexed collection's probe in line (ts_rt.h ts_map_get_str ...;
+                // TSAOT_MAP_KEY_INLINE=0 keeps the call)
+                "map.get" if map_key_inline_enabled() && args.first().map_or(false, |a| ctx.str_typed.contains(&a.0)) => (
+                    format!("ts_map_get_str({}, {})", r, v(0)),
+                    false,
+                ),
+                "map.get" if map_key_inline_enabled() && args.first().map_or(false, |a| ctx.ref_typed.contains(&a.0)) => (
+                    format!("ts_map_get_ref({}, {})", r, v(0)),
+                    false,
+                ),
+                "map.has" if map_key_inline_enabled() && args.first().map_or(false, |a| ctx.str_typed.contains(&a.0)) => (
+                    format!("ts_bool(ts_map_has_str({}, {}))", r, v(0)),
+                    false,
+                ),
+                "map.has" if map_key_inline_enabled() && args.first().map_or(false, |a| ctx.ref_typed.contains(&a.0)) => (
+                    format!("ts_bool(ts_map_has_ref({}, {}))", r, v(0)),
+                    false,
+                ),
                 "map.get" => (format!("ts_map_get({}, {})", r, v(0)), false),
                 "map.has" => (format!("ts_bool(ts_map_has({}, {}))", r, v(0)), false),
                 "map.delete" => (format!("ts_bool(ts_map_delete({}, {}))", r, v(0)), false),
@@ -21184,6 +21270,14 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 "weakmap.delete" => (format!("ts_bool(ts_weakmap_delete({}, {}))", r, v(0)), false),
                 // ---- Set ----
                 "set.add" => (format!("ts_set_add({}, {})", r, v(0)), false),
+                "set.has" if map_key_inline_enabled() && args.first().map_or(false, |a| ctx.str_typed.contains(&a.0)) => (
+                    format!("ts_bool(ts_set_has_str({}, {}))", r, v(0)),
+                    false,
+                ),
+                "set.has" if map_key_inline_enabled() && args.first().map_or(false, |a| ctx.ref_typed.contains(&a.0)) => (
+                    format!("ts_bool(ts_set_has_ref({}, {}))", r, v(0)),
+                    false,
+                ),
                 "set.has" => (format!("ts_bool(ts_set_has({}, {}))", r, v(0)), false),
                 "set.delete" => (format!("ts_bool(ts_set_delete({}, {}))", r, v(0)), false),
                 "set.clear" => (format!("({{ ts_set_clear({}); TS_UNDEFINED; }})", r), false),

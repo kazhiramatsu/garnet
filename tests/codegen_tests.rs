@@ -21,7 +21,7 @@ fn alloc_fn(id:u32, name:&str, sites:&[u32]) -> Function {
         id: FunctionId(id), name: Some(name.to_string()), params: vec![], ret: TypeId(0),
         locals: sites.iter().enumerate().map(|(i, _)| Local {
             id: LocalId(i as u32), type_id: TypeId(0), ref_kind: RefKind::Reference,
-            binding: None, name: None, nullable_numeric: false,
+            binding: None, name: None, nullable_numeric: false, ty_kind: None,
         }).collect(),
         body: sites.iter().enumerate().map(|(i, site)| Inst::AllocObject {
             dst: LocalId(i as u32), type_id: TypeId(0), site: SiteId(*site),

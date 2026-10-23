@@ -2,7 +2,7 @@ mod escape_ir; mod call_graph; mod interproc; mod codegen; mod devirt;
 use escape_ir::*;
 use devirt::{run_devirt, Dispatch, ClassTable};
 
-fn refl(n:u32)->Local{Local{id:LocalId(n),type_id:TypeId(0),ref_kind:RefKind::Reference,binding:None,name:None,nullable_numeric:false}}
+fn refl(n:u32)->Local{Local{id:LocalId(n),type_id:TypeId(0),ref_kind:RefKind::Reference,binding:None,name:None,nullable_numeric:false,ty_kind:None}}
 fn func(id:u32,params:Vec<u32>,nl:u32,exp:bool,body:Vec<Inst>)->Function{
   Function{id:FunctionId(id),name:None,params:params.into_iter().map(LocalId).collect(),
     ret:TypeId(0),locals:(0..nl).map(refl).collect(),body,is_exported:exp,param_classes:Default::default(),rest_param:None,is_async:false,is_generator:false, capture_count: 0,takes_this: false, arity: 0,has_prototype:false}}

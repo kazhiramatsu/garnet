@@ -139,6 +139,11 @@ interface Local {
   binding?: number;
   name?: string;
   nullableNumeric?: boolean;
+  /** The kind of key the checker types this local as where it is a Map/Set
+   *  key: "string" (string types, nullable or not) or "reference" (object,
+   *  array or function types, nullable or not). A hint for the emitter's
+   *  inline probe, which verifies the value's tag anyway. */
+  tyKind?: "string" | "reference";
 }
 /** A scope record (capture context): the synthetic class holding one owner
  *  function's record-resident captured bindings. See docs/capture_contexts_design.md. */
@@ -742,6 +747,23 @@ class Exporter {
       if (!elem) return undefined;
       return { kind: "array", key: `array_${elem.key}`, refKind: "reference", elem };
     }
+    return undefined;
+  }
+
+  /** The key kind of a collection key expression by its checker type, null
+   *  and undefined members set aside: every member string-like -> "string",
+   *  every member an object type -> "reference", anything else (any, unknown,
+   *  a number, a mixed union, a type parameter) -> undefined. */
+  keyKindOfExpr(expr: ts.Expression): "string" | "reference" | undefined {
+    let t: ts.Type;
+    try { t = this.checker.getTypeAtLocation(expr); } catch { return undefined; }
+    const F = ts.TypeFlags;
+    if (this.typeHasAnyOrUnknown(t)) return undefined;
+    const members = (t.flags & F.Union) ? (t as ts.UnionType).types : [t];
+    const live = members.filter((m) => !(m.flags & (F.Undefined | F.Null | F.Void)));
+    if (live.length === 0) return undefined;
+    if (live.every((m) => (m.flags & F.StringLike) !== 0)) return "string";
+    if (live.every((m) => (m.flags & F.Object) !== 0)) return "reference";
     return undefined;
   }
 
@@ -5556,6 +5578,13 @@ class Exporter {
               }
               const recvL = this.lowerExpr(ctx, fn.expression);
               const argLs = this.lowerSequenced(ctx, node.arguments);
+              // a collection lookup's key: the checker's kind of the key goes on
+              // the key local as a hint for the emitter's inline probe
+              if ((bname === "map.get" || bname === "map.has" || bname === "set.has") && argLs.length >= 1) {
+                const kk = this.keyKindOfExpr(node.arguments[0]);
+                const kl = ctx.locals[argLs[0]];
+                if (kk !== undefined && kl && kl.tyKind === undefined) kl.tyKind = kk;
+              }
               // Array.concat is variadic: fold each argument through the 2-arg
               // runtime (which spreads array args and appends non-array values).
               // No args -> a shallow copy of the receiver.

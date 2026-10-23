@@ -4,7 +4,7 @@ use escape_ir::*;
 use escape_analysis::analyze;
 
 // ---- tiny builders (analyzer only reads functions, so program tables stay empty) ----
-fn refl(n: u32) -> Local { Local { id: LocalId(n), type_id: TypeId(0), ref_kind: RefKind::Reference, binding: None, name: None, nullable_numeric: false } }
+fn refl(n: u32) -> Local { Local { id: LocalId(n), type_id: TypeId(0), ref_kind: RefKind::Reference, binding: None, name: None, nullable_numeric: false, ty_kind: None } }
 fn func(id: u32, params: Vec<u32>, nlocals: u32, body: Vec<Inst>) -> Function {
     Function {
         id: FunctionId(id), name: None,

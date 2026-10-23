@@ -255,6 +255,7 @@ fn fresh(next: &mut u32, new_locals: &mut Vec<Local>, reference: bool) -> u32 {
         binding: None,
         name: None,
         nullable_numeric: false,
+        ty_kind: None,
     });
     id
 }

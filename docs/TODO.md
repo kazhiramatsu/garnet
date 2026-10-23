@@ -8875,3 +8875,27 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   against zero as before. Fixture `arrays/push_receivers`. Still open: a
   method call on an Array subclass instance (`class Stack extends Array`;
   `s.push()` fails with "push is not a function").
+- Slice AC (exporter + IR + emitter + runtime header;
+  `docs/map_entries_design.md`, "Typed key probes in line"): slice T gave
+  `map.get` with an unboxed number key an inline probe; the 838 boxed-key
+  lookup sites of the tsc-ts build (`map.get`/`map.has`/`set.has`) still paid
+  the call, the receiver test and the tag dispatch, and the compile's generic
+  lookups are 64% string keys and 32% object keys. The exporter puts the
+  checker's key kind on the key local (`Local.tyKind`: "string" for string
+  types, "reference" for object, array and function types, null and undefined
+  members set aside; the IR type table is not populated, so the hint rides on
+  the local), and the emitter takes the indexed collection's probe in line:
+  `ts_map_get_str`/`has_str`/`ts_set_has_str` with the string hash
+  (`ts_str_hash_fast`, moved to the header) and the out-of-line compare for an
+  equal-content candidate, `_ref` with the address hash and identity only.
+  Every probe bails to the general entry when the receiver is not that
+  collection, is weak or linear, or when the key is not what the type said:
+  the type is a hint, never trusted for the result. 759 sites converted.
+  Kernels `map_symbol_table` -19% instructions (-8% cycles), `map_object_keys`
+  -40% (-50% cycles); tsc-ts one checker 23.87 -> 23.79 G (-0.3%), cycles
+  flat, outputs identical (its large tables are bound by their cache misses,
+  not by the call). With it a runtime fix: a `map.get`/`has`/`set` or
+  `set.has`/`add` on a receiver that is not that collection behind the type
+  threw "incompatible receiver"; it now calls the object's own method
+  (`ts_collection_method_dynamic`). Fixture `maps_sets/map_typed_keys`. Knob
+  `TSAOT_MAP_KEY_INLINE`.
