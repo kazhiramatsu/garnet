@@ -15554,6 +15554,65 @@ tsv ts_collection_method_dynamic(tsv recv, const char* name, tsv* args, int narg
   ts_gc_unroot(nargs + 2);
   return r;
 }
+/* The method value of a dynamic call on a sized class instance
+   (docs/pic_sized_inline_design.md, "The method of a dynamic call"): the own
+   property first, as JS reads it (a struct field holding a function, or a
+   property of the instance's sidecar), then the prototype method through a
+   cache keyed by the class word and the method key that remembers the
+   prototype object holding it, that object's shape word and the slot: a hit
+   re-reads the slot, so a method replaced in place is followed, and a deleted
+   or redefined one changes the holder's shape and misses. A relinked
+   instance (its word carries the flag), a relinked prototype anywhere
+   (g_class_relinked), an accessor or a dictionary holder take the full
+   lookup. Anything else (a receiver that is not a sized instance) takes the
+   two cached reads the call made before. */
+static tsv prop_ic_read(tsv receiver, ts_pref p);
+typedef struct { uint32_t cls; ts_key key; uint32_t shape; uint32_t slot; tsv holder; } ts_method_cache_entry;
+#define TS_METHOD_CACHE_SIZE 1024u
+static ts_method_cache_entry g_method_cache[TS_METHOD_CACHE_SIZE];
+tsv ts_method_lookup_sized(tsv recv, ts_key fkey, ts_key mkey, ts_prop_ic* field_ic, ts_prop_ic* proto_ic){
+  if (TS_TOP16(recv) == TS_SEL_OBJECT){
+    ts_object* o = (ts_object*)ts_ptr(recv);
+    uint32_t w = o->cls;
+    if (ts_obj_is_sized(o) && w != 0u && !(w & TS_CLS_RELINKED) && w != TS_CLS_PROTO && !g_class_relinked && !(g_has_proxies && ts_is_proxy(recv))){
+      size_t off; int numeric;
+      if (g_has_class_regs && class_field_lookup(o, fkey, &off, &numeric)){
+        tsv v = struct_field_get(o, off, numeric);
+        if (ts_is_callable(v)) return v;
+      }
+      if (((ts_sized_head*)o)->dyn){
+        ts_pref p = prop_find(o, fkey);
+        if (pref_ok(p)){ tsv v = prop_ic_read(recv, p); if (ts_is_callable(v)) return v; }
+      }
+      uint32_t slot = ((w * 0x9E3779B1u) ^ prop_key_hash(mkey)) & (TS_METHOD_CACHE_SIZE - 1u);
+      ts_method_cache_entry* e = &g_method_cache[slot];
+      if (e->cls == w && e->key == mkey && e->holder){
+        ts_object* h = (ts_object*)ts_ptr(e->holder);
+        if (h->shape == e->shape){
+          tsv v = *ts_obj_slot_ptr(h, e->slot);
+          if (!is_accessor(v)) return v;
+        }
+      }
+      /* the chain, remembering a shaped holder's plain slot */
+      for (ts_object* p = ts_next_proto(o); p; p = ts_next_proto(p)){
+        if (chain_link_exotic(p) || p->h.kind == TS_KIND_FUNC) break;
+        ts_pref q = prop_find(p, mkey);
+        if (pref_ok(q)){
+          if (!pref_is_accessor(q) && ts_obj_shape_id(p) != TS_SHAPE_NONE){
+            e->cls = w; e->key = mkey; e->shape = p->shape; e->slot = q.i; e->holder = ts_obj(p);
+          }
+          return prop_ic_read(recv, q);
+        }
+      }
+      tsv found;
+      if (lookup_prop_chain(recv, ts_next_proto(o), mkey, &found)) return found;
+      return TS_UNDEFINED;
+    }
+  }
+  tsv mv = ts_get_pic_checked_inline(recv, fkey, field_ic);
+  if (!ts_is_callable(mv)) mv = ts_get_pic_checked_inline(recv, mkey, proto_ic);
+  return mv;
+}
 /* charCodeAt on a receiver that is not a string (an `any` value behind a
    string type, which the typed entry trusted): null and undefined throw the
    property-read TypeError, an object's own or inherited `charCodeAt` is

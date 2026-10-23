@@ -2342,6 +2342,20 @@ fn shadow_guard_enabled() -> bool {
     })
 }
 
+/// TSAOT_METHOD_SIZED_CACHE=0 keeps a dynamic method call's two cached reads
+/// (the parity oracle): on, a call whose receiver the program types as a class
+/// instance resolves the method through the runtime's cache by class word
+/// (ts_rt.c ts_method_lookup_sized).
+fn method_sized_cache_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_METHOD_SIZED_CACHE").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
 /// TSAOT_SIZED_PIC_INLINE=0 keeps a field access of a class-typed receiver
 /// whose class dispatches dynamically on the shaped inline cache (the parity
 /// oracle): on, the site probes the sized entry in line (ts_rt.h
@@ -22420,6 +22434,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 // FN_TABLE index (stored as a number on the class prototype), then
                 // call it. This is the faithful JS prototype-lookup path.
                 CalleeRef::Method {
+                    recv_class,
                     method,
                     method_field,
                     ..
@@ -22428,13 +22443,37 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     // order (own field-key first when known, then prototype method-
                     // key), then invoke via ts_call. Handles object-literal methods,
                     // `{g: fn}` properties, own-field shadowing, and prototype methods.
-                    emit_method_value_lookup(
-                        s,
-                        "_a[0]",
-                        method.0,
-                        method_field.map(|f| f.0),
-                        ctx.wksym,
-                    );
+                    // A receiver the program types as a class instance (a real
+                    // class, not the dynamic sentinel) resolves through the runtime's
+                    // method cache by class word (docs/pic_sized_inline_design.md,
+                    // "The method of a dynamic call"); other receivers take the two
+                    // cached reads inside it.
+                    let sized_cache = method_sized_cache_enabled()
+                        && prop_pic_enabled()
+                        && recv.is_some()
+                        && recv_class.0 != u32::MAX
+                        && ctx.classes.contains_key(&recv_class.0);
+                    match (sized_cache, method_field) {
+                        (true, Some(mf)) => {
+                            let _ = writeln!(s, "    ts_check_method_recv(_a[0], {}u);", mf.0);
+                            s.push_str("    static ts_prop_ic _ts_method_field_ic = TS_PROP_IC_INIT;\n");
+                            s.push_str("    static ts_prop_ic _ts_method_proto_ic = TS_PROP_IC_INIT;\n");
+                            let _ = writeln!(
+                                s,
+                                "    tsv _mv = ts_method_lookup_sized(_a[0], {}u, {}, &_ts_method_field_ic, &_ts_method_proto_ic);",
+                                mf.0,
+                                method_key_str(method.0, ctx.wksym)
+                            );
+                            let _ = writeln!(s, "    if (!ts_is_callable(_mv)) ts_dynamic_method_missing({}u);", mf.0);
+                        }
+                        _ => emit_method_value_lookup(
+                            s,
+                            "_a[0]",
+                            method.0,
+                            method_field.map(|f| f.0),
+                            ctx.wksym,
+                        ),
+                    }
                     format!("ts_call_method(_mv, _a, {})", argv.len())
                 }
                 // A Value callee WITH a receiver (recv present) is a member call

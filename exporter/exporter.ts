@@ -1929,6 +1929,23 @@ class Exporter {
         const cn = cid !== undefined ? this.ctorNodeOfClassId(cid) : undefined;
         if (cn && (cn as unknown as ts.Node) !== (F as unknown as ts.Node)) ctorRefs.push(cn);
       }
+      // `super.m` whose static resolution does not stand (a dynamic class on
+      // the path, docs/conformance_fixes.md "super calls through a dynamic
+      // parent"): the body reads its own class value to reach the home
+      // object's prototype, so it captures the class binding. A module-scope
+      // class travels through GLOBALS like any binding a method captures; a
+      // function-local class keeps the static resolution.
+      if (ts.isPropertyAccessExpression(n) && n.expression.kind === ts.SyntaxKind.SuperKeyword) {
+        const csym = this.superHomeClassSymbol(n);
+        if (csym && this.moduleScopeSyms.has(csym) && !decl.has(csym)) {
+          const cid = this.classSymToId.get(csym);
+          const pid = cid !== undefined ? this.parentIdOf(cid) : undefined;
+          if (pid !== undefined && this.superPathIsDynamic(pid, n.name.text)) {
+            const owner = this.symbolOwnerFunction(csym);
+            if (owner && owner !== F) res.add(csym);
+          }
+        }
+      }
       if (ts.isCallExpression(n) && n.expression.kind === ts.SyntaxKind.SuperKeyword) {
         const cn = this.parentCtorNodeOf(F);
         if (cn && (cn as unknown as ts.Node) !== (F as unknown as ts.Node)) ctorRefs.push(cn);
@@ -2060,6 +2077,21 @@ class Exporter {
 
   /** The parent class's constructor (with a body) for a constructor node `F`, or
    *  undefined (no parent, or parent has no explicit ctor). */
+  /** The class whose member body a `super` reference belongs to: the nearest
+   *  enclosing method, accessor or constructor through arrow functions (which
+   *  inherit `super`); undefined for any other function boundary. */
+  superHomeClassSymbol(n: ts.Node): ts.Symbol | undefined {
+    for (let p: ts.Node | undefined = n.parent; p; p = p.parent) {
+      if (ts.isArrowFunction(p)) continue;
+      if (ts.isMethodDeclaration(p) || ts.isGetAccessorDeclaration(p) || ts.isSetAccessorDeclaration(p) || ts.isConstructorDeclaration(p)) {
+        const cls = p.parent;
+        if ((ts.isClassDeclaration(cls) || ts.isClassExpression(cls)) && cls.name) return this.symbolOf(cls.name);
+        return undefined;
+      }
+      if (ts.isFunctionLike(p) || ts.isClassLike(p)) return undefined;
+    }
+    return undefined;
+  }
   parentCtorNodeOf(F: FnLike): ts.ConstructorDeclaration | undefined {
     const cls = (F as unknown as ts.Node).parent;
     if (!cls || !(ts.isClassDeclaration(cls) || ts.isClassExpression(cls)) || !cls.name) return undefined;
@@ -5704,12 +5736,19 @@ class Exporter {
             return dst;
           }
         }
-        // super.m(...) : statically the parent's resolution -> Direct (no devirt)
+        // super.m(...) : statically the parent's resolution -> Direct (no devirt).
+        // A dynamic class on the path from the parent to the declaring class
+        // (its prototype may have been written, relinked or had the method
+        // deleted) makes the lookup a runtime one from the home object's
+        // prototype (docs/conformance_fixes.md, "super calls through a
+        // dynamic parent").
         if (fn.expression.kind === ts.SyntaxKind.SuperKeyword && ctx.currentClass !== undefined) {
           const parent = this.parentIdOf(ctx.currentClass);
           const func = parent !== undefined ? this.resolveMemberFunc(parent, fn.name.text, "method") : undefined;
           if (func !== undefined) {
-            callee = { kind: "Direct", func };
+            const mv = parent !== undefined && this.superPathIsDynamic(parent, fn.name.text)
+              ? this.lowerDynamicSuperMethod(ctx, fn.name.text) : undefined;
+            callee = mv !== undefined ? { kind: "Value", local: mv } : { kind: "Direct", func };
             recv = ctx.thisLocal; // super call runs the parent method on the same `this`
           }
         } else {
@@ -13303,6 +13342,50 @@ class Exporter {
       cur = this.parentIdOf(cur);
     }
     return undefined;
+  }
+  /** `super.m` resolves statically only along stable classes: a dynamic class
+   *  between the parent and the one declaring `m` (inclusive) may have had its
+   *  prototype written or relinked, so the lookup is a runtime one. */
+  superPathIsDynamic(parentId: number, name: string): boolean {
+    const found = this.findMember(parentId, name, "method");
+    let cur: number | undefined = parentId;
+    while (cur !== undefined) {
+      if (!this.classInfos[cur]?.stable) return true;
+      if (found !== undefined && cur === found.classId) return false;
+      cur = this.parentIdOf(cur);
+    }
+    return found === undefined;
+  }
+  /** The method value of `super.m` read as JS reads it: from the home object's
+   *  current prototype, the written property (the field key, which a
+   *  `C.prototype.m = f` stores) first, then the class-body method (the method
+   *  key). undefined when the class value cannot be loaded here (the static
+   *  resolution stands). */
+  lowerDynamicSuperMethod(ctx: FnCtx, name: string): number | undefined {
+    const cid = ctx.currentClass;
+    if (cid === undefined) return undefined;
+    const csym = this.classSymbolOfId(cid);
+    if (!csym) return undefined;
+    const classValue = this.loadBoundClassValue(ctx, csym, this.classInfos[cid]?.name);
+    if (classValue === undefined) return undefined;
+    const home = this.loadClassValuePrototype(ctx, classValue);
+    const proto = this.newLocal(ctx, "reference");
+    ctx.body.push({ kind: "GetProto", dst: proto, obj: home });
+    const own = this.newLocal(ctx, "reference");
+    ctx.body.push({ kind: "LoadField", dst: own, obj: proto, field: this.internField(name) });
+    const ty = this.newLocal(ctx, "reference");
+    ctx.body.push({ kind: "UnOp", dst: ty, op: "typeof", operand: own });
+    const fnStr = this.newLocal(ctx, "reference");
+    ctx.body.push({ kind: "Const", dst: fnStr, value: { kind: "Str", value: "function" } });
+    const isFn = this.newLocal(ctx, "primitive");
+    ctx.body.push({ kind: "BinOp", dst: isFn, op: "===", lhs: ty, rhs: fnStr });
+    const mv = this.newLocal(ctx, "reference");
+    ctx.body.push({
+      kind: "If", cond: isFn,
+      thenBody: [{ kind: "Copy", dst: mv, src: own }],
+      elseBody: [{ kind: "LoadMethodValue", dst: mv, recv: proto, method: this.internName(name) }],
+    });
+    return mv;
   }
   /** FunctionId of a resolved member, searching from classId upward. */
   resolveMemberFunc(classId: number, name: string, kind: "method" | "getter" | "setter"): number | undefined {

@@ -165,4 +165,9 @@ the entry at a call whose receiver the program types as a class instance (not
 the dynamic sentinel class); `TSAOT_METHOD_SIZED_CACHE=0` keeps the two
 reads (the parity oracle's shape).
 
-Measurements: see TODO (session 352, slice AN).
+| program | before | after |
+|---|---|---|
+| tsc-ts, every class dynamic, wall | 7.29 s | 5.57 s (-24%; 12.5 s before slice AJ) |
+| tsc-ts typed, one checker, instructions | 23.62 G | 23.57 G (-0.2%) |
+
+Outputs identical in both.

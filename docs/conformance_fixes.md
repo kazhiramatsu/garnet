@@ -2461,3 +2461,28 @@ frames of dynamically dispatched methods: a sanity check that both engines
 finish and that the knob's settings run; V8 itself overflows at about five
 thousand of these frames, so the overflow this fixes, tsc-ts's checker in
 the dynamic mode, cannot be a conformance fixture).
+
+## super calls through a dynamic parent (session 352, slice AN)
+
+`super.m()` was lowered as a direct call to the method the checker resolves
+along the class chain, whatever the program does to the chain at run time: a
+`Base.prototype.m = f` (a write the extractor sees, which makes `Base` dynamic
+and every ordinary call on its instances a runtime lookup) was followed by
+`sub.m()` but not by the `super.m()` inside the subclass's method, which kept
+calling the class-body method. A relinked prototype
+(`Object.setPrototypeOf(Sub.prototype, Other.prototype)`) was likewise
+ignored. The static resolution now stands only along stable classes: when a
+class between the parent and the one declaring the method is dynamic, the
+exporter reads the method as JS does, from the home object's current
+prototype (`GetProto` of the class value's `prototype`), the written property
+(the field key, where a prototype write lands) first, then the class-body
+method (the method key), and calls the value with the receiver. The method
+body reaches its class value as any method reaches a module-scope binding
+(the free-variable analysis counts such a `super` reference as a use of the
+class binding, which the module init publishes in a global slot).
+Fixtures: `classes/super_dynamic_parent`, `classes/dynamic_method_calls`.
+
+Gaps kept: a class declared inside a function keeps the static resolution (a
+method cannot capture its enclosing function's local, so the home object is
+out of reach), and `super` inside an arrow function is a loud reject as
+before.

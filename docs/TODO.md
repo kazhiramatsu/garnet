@@ -9050,3 +9050,32 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   takes the prototype-keyed path. The all-dynamic compile of tsc-ts: 7.45 ->
   7.29 s (-2%), outputs identical to the typed build's; the typed one checker
   23.61 -> 23.61 G instructions, cycles and wall unchanged, outputs identical.
+- Slice AN (exporter + runtime + emitter, the dynamic paths;
+  `docs/pic_sized_inline_design.md` "The method of a dynamic call",
+  `docs/conformance_fixes.md` "super calls through a dynamic parent"): (1) a
+  dynamic method call on a receiver the program types as a class instance
+  resolves its method in one runtime call, `ts_method_lookup_sized`: the own
+  property through the registry's cache by class word, the sidecar when the
+  instance has one, then the prototype method through a cache keyed by the
+  class word and the method key that remembers the holding prototype, its
+  shape word and the slot (a replaced method is followed, a deleted or
+  redefined one misses on the shape, a relinked instance or prototype, an
+  accessor and a dictionary holder take the full lookup); other receivers take
+  the two cached reads as before; `TSAOT_METHOD_SIZED_CACHE=0` keeps the two
+  reads. (2) A silent miscompile found by the fixture: `super.m()` was a
+  direct call to the statically resolved method whatever the program did to
+  the chain at run time (`Base.prototype.m = f`,
+  `Object.setPrototypeOf(Sub.prototype, ...)`). Along a dynamic class the
+  exporter now reads the method from the home object's current prototype
+  (field key, then method key) and calls it with the receiver; the
+  free-variable analysis counts such a `super` reference as a use of the class
+  binding so the method body reaches its class value. Kept: a function-local
+  class stays static (a method cannot capture its enclosing function's local);
+  `super` inside an arrow function stays a loud reject. Fixtures
+  classes/dynamic_method_calls (24 classes, one call site over many, own/field
+  shadowing, replaced and deleted prototype methods, relink, freeze, null
+  receivers) and classes/super_dynamic_parent. The all-dynamic compile of
+  tsc-ts: 7.29 -> 5.57 s (-24%; 12.5 s before slice AJ, -55% over the five),
+  outputs identical to the typed build's; the typed one checker 23.62 -> 23.57
+  G instructions (-0.2%, the dynamic calls the typed program keeps), cycles
+  -0.3%, outputs identical.

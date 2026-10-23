@@ -981,6 +981,10 @@ double ts_str_charcodeat_dynamic(tsv recv, double idx);
 /* A Map or Set method on a receiver that is not that collection: the object's
    own method called, or the TypeError V8 throws (ts_rt.c). */
 tsv ts_collection_method_dynamic(tsv recv, const char* name, tsv* args, int nargs);
+/* The method value of a dynamic call on a sized class instance, through the
+   method cache by class word (ts_rt.c); other receivers through the two
+   cached reads. */
+tsv ts_method_lookup_sized(tsv recv, ts_key fkey, ts_key mkey, ts_prop_ic* field_ic, ts_prop_ic* proto_ic);
 static inline double ts_str_charcodeat_general(tsv s, double idx){
   if (TS_RT_UNLIKELY(!ts_is_str(s))) return ts_str_charcodeat_dynamic(s, idx);
   ts_strview x = ts_str_view_typed(s);
