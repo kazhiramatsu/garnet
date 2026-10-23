@@ -99,3 +99,20 @@ below the noise. The change was reverted; what would shorten the chain is
 hoisting the receiver's checks and the index load out of loops, a cheaper
 hash (integer tests for -0 and NaN instead of the float compares), and a
 smaller index-to-entry path, each worth about a percent of the compile.
+
+## The number key's hash (slice Q, session 352)
+
+The class_nodes kernel (`benchmarks/patterns/class_nodes.ts`, 2.49x scriptc's
+instructions) spent 40% of its time in `Map.get`: its 128 keys 0, 8, .., 1016
+took 37 of the index's 512 slots, 5.8 probes a lookup. A small integer's
+double has a zero low word, and `sv0_hash_num`'s single multiply left the low
+bits of the hash, which choose the slot, poor. The full fmix64 finalizer (a
+second multiply and shift) spreads them: 1.1 probes on that set and on 0..127,
+and no set tried (ids 1..200000, multiples, negatives, halves, random) above
+1.4 average. The kernel: 5.40 -> 4.72 G instructions, output unchanged. The
+compile's `map_find` histogram does not move (2.22 probes average): those
+lookups are string keys, whose FNV-1a hash distributes well in the low bits,
+and small maps' linear scans; the number keys take the fast path, which the
+histogram does not count. The statistics build now splits Map calls by key
+kind, the number fast path's outcomes, and linear against indexed finds
+(`map_keys:`).

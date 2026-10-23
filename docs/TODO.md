@@ -8632,3 +8632,25 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   on the class_nodes kernel: `-O3` 4.72 -> 3.98 G and `-inline-threshold=600`
   4.22 G (the kernel's small methods get inlined; on tsc-ts both were within
   noise before).
+- Slice Q (runtime, the Map's number-key hash; `docs/map_entries_design.md`,
+  "The number key's hash"): the class_nodes kernel (2.49x scriptc's
+  instructions) spent 40% of its time in `Map.get` because a small integer's
+  double has a zero low word and `sv0_hash_num`'s single multiply left the
+  slot-choosing low bits poor: 128 keys 0, 8, .., 1016 took 37 of 512 slots,
+  5.8 probes a lookup. The full fmix64 finalizer (a second multiply and shift)
+  gives 1.1 probes there and at most 1.4 on every set tried; the kernel 5.40
+  -> 4.72 G (ratio 2.17, wall 150 against 80 ms). The statistics build splits
+  Map calls by key kind (`map_keys:`): the compile's get/has calls are 10.3 M
+  number keys, 3.9 M strings, 2.0 M objects; the number fast path hits 6.8 M,
+  misses 3.2 M, bails 6.1 M; finds 2.0 M linear, 4.2 M indexed; the `map_find`
+  histogram (2.22 probes) does not move, as FNV-1a's low bits distribute
+  strings well (checked on identifier, path and id-list keys). Fixture
+  `maps_sets/map_number_keys`. Gates all green (parity 384 identical / 159
+  known; selfconf 544, 498 pass; conformance 547 plain and strict, 544
+  protect; GC stress; bundler; unit; runtime tests). tsc-ts one checker,
+  outputs identical, four pairs: 25.92 -> 26.00 G instructions (+0.3%, the
+  hash's second round on 10 M keys), cycles -1.0%, wall 1.48 -> 1.44 s. Also
+  found: 5 of the compiler's 78 source files (3.6 of 10.0 MB, checker.ts among
+  them) hold a character beyond Latin-1, so garnet stores them two bytes a
+  unit and every `charCodeAt`, `indexOf` and `startsWith` on them has taken
+  the general paths; slice R.

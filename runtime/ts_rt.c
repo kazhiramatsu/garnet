@@ -841,6 +841,8 @@ static struct {
   unsigned long long sb_extend, sb_fresh, sb_flat, short_string;
   unsigned long long intern_calls, intern_probes;
   unsigned long long map_find_calls, map_find_probes, map_find_hist[9];
+  unsigned long long map_key_num, map_key_str, map_key_other, map_fast_hit, map_fast_miss, map_fast_bail,
+                     map_linear, map_indexed;
   unsigned long long find_prop_calls, find_prop_probes, find_prop_hist[9];
   unsigned long long class_reg_calls, class_reg_probes, class_reg_hist[9];
   unsigned long long class_field_calls, class_field_hits;
@@ -967,6 +969,9 @@ __attribute__((destructor)) static void ts_rt_stats_dump(void){
           g_rt_stats.sb_extend, g_rt_stats.sb_fresh, g_rt_stats.sb_flat,
           g_rt_stats.short_string);
   rt_stats_hist_line(out, "map_find", g_rt_stats.map_find_calls, g_rt_stats.map_find_probes, g_rt_stats.map_find_hist);
+  fprintf(out, "[rt_stats] map_keys: num=%llu str=%llu other=%llu | num_fast hit=%llu miss=%llu bail=%llu | find linear=%llu indexed=%llu\n",
+          g_rt_stats.map_key_num, g_rt_stats.map_key_str, g_rt_stats.map_key_other, g_rt_stats.map_fast_hit,
+          g_rt_stats.map_fast_miss, g_rt_stats.map_fast_bail, g_rt_stats.map_linear, g_rt_stats.map_indexed);
   rt_stats_hist_line(out, "find_prop", g_rt_stats.find_prop_calls, g_rt_stats.find_prop_probes, g_rt_stats.find_prop_hist);
   rt_stats_hist_line(out, "class_reg", g_rt_stats.class_reg_calls, g_rt_stats.class_reg_probes, g_rt_stats.class_reg_hist);
   fprintf(out, "[rt_stats] class_field_cache: calls=%llu hits=%llu\n", g_rt_stats.class_field_calls, g_rt_stats.class_field_hits);
@@ -7489,7 +7494,13 @@ TS_RT_ALWAYS_INLINE uint32_t sv0_hash_num(tsv k){
   if (d == 0) d = 0;                            /* -0 → +0 */
   if (d != d) bits = 0x7FF8000000000000ull;     /* canonical NaN */
   else memcpy(&bits, &d, sizeof bits);
+  /* The full 64-bit finalizer (MurmurHash3's fmix64). A small integer's double
+     has a zero low word, and one multiply left the low bits of its hash poor:
+     128 keys 0..127 took 37 of 512 slots, 5.8 probes each (the class_nodes
+     kernel spent 40% of its time in Map.get). The second round spreads them
+     (1.2 probes; docs/map_entries_design.md). */
   bits ^= bits >> 33; bits *= 0xff51afd7ed558ccdull; bits ^= bits >> 33;
+  bits *= 0xc4ceb9fe1a85ec53ull; bits ^= bits >> 33;
   return (uint32_t)bits;
 }
 TS_RT_ALWAYS_INLINE uint32_t sv0_hash(tsv k){
@@ -7610,7 +7621,8 @@ static void mapset_index_maintain(const ts_gc_header* owner, tsv* keys, uint32_t
 static long map_find(ts_map* m, tsv k){
   RT_STAT_INC(map_find_calls);
   uint32_t h = sv0_hash(k);
-  if (m->index) return mapset_probe(m->index, m->index_cap, m->keys, k, h, NULL);
+  if (m->index){ RT_STAT_INC(map_indexed); return mapset_probe(m->index, m->index_cap, m->keys, k, h, NULL); }
+  RT_STAT_INC(map_linear);
   return mapset_scan(m->keys, m->hashes, m->len, k, h);
 }
 static void map_grow(ts_map* m){
@@ -7697,10 +7709,20 @@ TS_RT_ALWAYS_INLINE long map_find_num_fast(const ts_map* m, tsv k){
     slot = (slot + 1u) & mask;
   }
 }
+#ifdef TSAOT_RT_STATS
+static void map_stat_key(tsv k, long fast){
+  if (ts_is_num(k)) g_rt_stats.map_key_num++; else if (ts_is_str(k)) g_rt_stats.map_key_str++; else g_rt_stats.map_key_other++;
+  if (fast >= 0) g_rt_stats.map_fast_hit++; else if (fast == -1) g_rt_stats.map_fast_miss++; else g_rt_stats.map_fast_bail++;
+}
+#define MAP_STAT_KEY(k, fast) map_stat_key((k), (fast))
+#else
+#define MAP_STAT_KEY(k, fast) ((void)0)
+#endif
 tsv ts_map_get(tsv mv, tsv k){
   if (!ts_is_map(mv)){ ts_throw_type_error_msg("Method Map.prototype.get called on incompatible receiver"); return TS_UNDEFINED; }
   ts_map* m = ts_ptr(mv);
   long i = map_find_num_fast(m, k);
+  MAP_STAT_KEY(k, i);
   if (TS_RT_UNLIKELY(i == -2)) i = map_find(m, k);
   return i>=0 ? m->vals[i] : TS_UNDEFINED;
 }
@@ -7708,6 +7730,7 @@ int ts_map_has(tsv mv, tsv k){
   if (!ts_is_map(mv)){ ts_throw_type_error_msg("Method Map.prototype.has called on incompatible receiver"); return 0; }
   ts_map* m = ts_ptr(mv);
   long i = map_find_num_fast(m, k);
+  MAP_STAT_KEY(k, i);
   if (TS_RT_UNLIKELY(i == -2)) i = map_find(m, k);
   return i >= 0;
 }
