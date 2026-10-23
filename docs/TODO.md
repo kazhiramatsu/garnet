@@ -9090,3 +9090,26 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   as before. The all-dynamic compile of tsc-ts: 5.57 -> 5.45 s (-2%), outputs
   identical to the typed build's; the typed one checker 23.55 -> 23.55 G
   instructions, cycles and wall unchanged, outputs identical.
+- Slice AQ (unit split, measured and not kept): the inlinable copies are
+  chosen by direct calls across units, so a small function called only inside
+  its own unit by a copied function (tsc-ts's paged link table: a two-line
+  `get` whose copies call its private `pageOf` across the unit boundary) stays
+  a call inside every copy of its caller. A transitive selection (every small
+  function a candidate calls in its own unit, to a fixpoint) added 1,250
+  copies (11,442 -> 12,692) and measured neutral on the typed one checker over
+  eight pairs: instructions +0.10%, cycles -0.15%, wall unchanged (ThinLTO
+  already inlines across the units where it pays). Reverted; the profile's
+  `pageOf` entry is most likely the linker's deduplication naming one of
+  several identical boxed-field methods.
+- Slice AR (exporter, switch lowering): the fast if/else-if form of `switch`
+  (session 350; a C `switch` when the discriminant is an integer) requires
+  that no clause falls through, and the fall-through analysis treated a
+  `break` or `continue` statement as completing normally, so a clause body
+  written as a block, `case 47: { ...; continue; }` (tsc-ts's scanner and the
+  visitors brace most multi-statement cases), was taken to fall through and
+  the whole switch took the matched/active form: a C switch computing the
+  clause index, then a walk over every clause with an active flag (the
+  scanner's `collectCommentRanges`, `scan`, `skipTrivia`). A break or continue
+  now completes abnormally, as a return does. The typed one checker: 23.58 ->
+  23.50 G instructions (-0.31%), cycles -0.16%, wall -0.8%, outputs identical;
+  the switch fixtures, loops and the full suite pass in both profiles.

@@ -13066,6 +13066,10 @@ class Exporter {
   }
   statementCompletesNormally(s: ts.Statement): boolean {
     if (ts.isReturnStatement(s) || ts.isThrowStatement(s)) return false;
+    // A break or continue transfers control: nothing after it in its sequence
+    // runs, so a clause body `{ ...; continue; }` does not fall through (the
+    // braces used to hide the transfer and sent the switch to the slow form).
+    if (ts.isBreakStatement(s) || ts.isContinueStatement(s)) return false;
     if (ts.isBlock(s)) return this.statementsCompleteNormally(s.statements);
     if (ts.isIfStatement(s)) {
       return this.statementCompletesNormally(s.thenStatement) ||

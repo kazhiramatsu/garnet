@@ -58,3 +58,20 @@ have dozens of cases.
 `switch_dispatch` kernel (32 cases, 98M dispatches): 829 ms → 537 ms
 (V8 141 ms including startup). The remaining gap is the call, the two
 property reads and the result boxing per dispatch.
+
+## A braced clause body ending in break or continue (session 352, slice AR)
+
+The fast form requires that no clause falls through. The analysis took a
+`break` or `continue` statement to complete normally, so a clause body
+written as a block, `case 47: { ...; continue; }`, was taken to fall into
+the next clause and the switch went to the matched/active form: tsc-ts's
+scanner braces its multi-statement cases (`collectCommentRanges`, `scan`,
+`skipTrivia`) and each character dispatch ran the index switch and then the
+walk over every clause. A break or continue now completes abnormally like a
+return, and such switches take the fast form.
+
+| program | before | after |
+|---|---|---|
+| tsc-ts typed, one checker, instructions | 23.58 G | 23.50 G (-0.31%) |
+
+Outputs identical.
