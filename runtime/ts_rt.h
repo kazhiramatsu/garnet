@@ -2396,6 +2396,23 @@ TS_RT_ALWAYS_INLINE int ts_ta_try_load_f(tsv v, double d, int elem, double* out)
   uint32_t i;
   return ts_num_array_index(d, &i) && ts_ta_try_load_i(v, (int64_t)i, elem, out);
 }
+/* An integer element as ToInt32 of its value (Uint32 wraps), for a destination
+   that holds ToInt32 anyway: no double in between. Integer kinds only. */
+TS_RT_ALWAYS_INLINE int32_t ts_ta_elem_load_i32(const uint8_t* data, uint32_t i, int elem){
+  switch (elem){
+    case TS_TA_INT8: return (int32_t)((const int8_t*)data)[i];
+    case TS_TA_UINT8: case TS_TA_UINT8C: return (int32_t)data[i];
+    case TS_TA_INT16: { int16_t x; memcpy(&x, data + (size_t)i * 2u, 2); return (int32_t)x; }
+    case TS_TA_UINT16: { uint16_t x; memcpy(&x, data + (size_t)i * 2u, 2); return (int32_t)x; }
+    case TS_TA_INT32: { int32_t x; memcpy(&x, data + (size_t)i * 4u, 4); return x; }
+    default: { uint32_t x; memcpy(&x, data + (size_t)i * 4u, 4); return (int32_t)x; }
+  }
+}
+TS_RT_ALWAYS_INLINE int ts_ta_try_load_i32(tsv v, int64_t i, int elem, int32_t* out){
+  ts_typedarray* t = ts_ta_as(v, elem);
+  if (TS_RT_LIKELY(t && (uint64_t)i < t->length)){ *out = ts_ta_elem_load_i32(t->data, (uint32_t)i, elem); return 1; }
+  return 0;
+}
 TS_RT_ALWAYS_INLINE int ts_ta_try_store_i(tsv v, int64_t i, double x, int elem){
   ts_typedarray* t = ts_ta_as(v, elem);
   if (TS_RT_LIKELY(t && (uint64_t)i < t->length)){ ts_ta_elem_store(t->data, (uint32_t)i, x, elem); return 1; }

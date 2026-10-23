@@ -1921,6 +1921,9 @@ struct Ctx<'a> {
     /// Stack of (top_label, end_label, handler_depth) for loops emitted in the plain finally
     /// path, so a break/continue crossing a finally can target the right loop.
     loop_labels: std::cell::RefCell<Vec<(u32, u32, u32)>>,
+    /// typed-array receivers hoisted by the enclosing loops (slice P):
+    /// local -> (element kind, the loop's top label)
+    ta_hoisted: std::cell::RefCell<BTreeMap<u32, (u8, u32)>>,
     /// Active straight-line loop modulo residues. A `%` inside the current loop
     /// can read the residue instead of recomputing `ind % const`; the loop emitter
     /// advances the residue after the induction variable update.
@@ -2178,7 +2181,11 @@ impl<'a> Ctx<'a> {
     }
     fn set_num(&self, id: u32, e: &str) -> String {
         if self.int32_use.contains(&id) {
-            format!("  d{} = (double)ts_to_int32({});\n", id, e)
+            if int32_codegen_enabled() {
+                format!("  d{} = ts_to_int32({});\n", id, e)
+            } else {
+                format!("  d{} = (double)ts_to_int32({});\n", id, e)
+            }
         } else if self.unboxed.contains(&id) {
             format!("  d{} = {};\n", id, e)
         } else {
@@ -2191,7 +2198,11 @@ impl<'a> Ctx<'a> {
         } else if self.int_local.contains(&id) {
             format!("  d{} = (long long)ts_to_num({});\n", id, e)
         } else if self.int32_use.contains(&id) {
-            format!("  d{} = (double)ts_to_int32(ts_to_num({}));\n", id, e)
+            if int32_codegen_enabled() {
+                format!("  d{} = ts_to_int32(ts_to_num({}));\n", id, e)
+            } else {
+                format!("  d{} = (double)ts_to_int32(ts_to_num({}));\n", id, e)
+            }
         } else if self.unboxed.contains(&id) {
             format!("  d{} = ts_to_num({});\n", id, e)
         } else {
@@ -2240,6 +2251,41 @@ fn conservative_roots_enabled() -> bool {
     *ENABLED.get_or_init(|| {
         !matches!(
             std::env::var("TSAOT_CONSERVATIVE_ROOTS").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
+/// TSAOT_INT32_CODEGEN=0 keeps the earlier int32 forms (the parity oracle):
+/// int32-use locals as doubles, the ternary sign extension, typed-array
+/// element loads through a double (docs/int32_codegen_design.md).
+fn int32_codegen_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_INT32_CODEGEN").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+/// A uint32 bit pattern `t` as the signed int32 it holds, widened to long
+/// long: the xor-subtract form folds to one sign-extending move.
+fn sext32_expr(t: &str) -> String {
+    if int32_codegen_enabled() {
+        format!("((long long)({t} ^ 0x80000000u) - 0x80000000LL)")
+    } else {
+        format!("({t} >= 0x80000000u) ? (long long){t} - 0x100000000LL : (long long){t}")
+    }
+}
+
+/// TSAOT_TA_HOIST=0 keeps the per-use typed-array receiver test (the parity
+/// oracle): slice P reads a loop-invariant receiver's test and length once
+/// before the loop (docs/int32_codegen_design.md).
+fn ta_hoist_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_TA_HOIST").as_deref(),
             Ok("0") | Ok("false") | Ok("no") | Ok("off")
         )
     })
@@ -7966,8 +8012,13 @@ fn emit_i64_function(
     };
     let _ = writeln!(s, "{} long long {}({}){{", storage, i64_cname(f), params);
     s.push_str(&method_this_check(f, &format!("_p{}", f.capture_count)));
+    let int32_use_decl = if int32_codegen_enabled() {
+        int32_use_locals(f, &unboxed, &int_local)
+    } else {
+        BTreeSet::new()
+    };
     for l in &f.locals {
-        if int_local.contains(&l.id.0) {
+        if int_local.contains(&l.id.0) || int32_use_decl.contains(&l.id.0) {
             let _ = writeln!(s, "  long long d{} = 0;", l.id.0);
         } else if unboxed.contains(&l.id.0) {
             let _ = writeln!(s, "  double d{} = 0;", l.id.0);
@@ -8074,6 +8125,7 @@ fn emit_i64_function(
         nonnegative_int,
         label_ctr: std::cell::Cell::new(900000),
         loop_labels: std::cell::RefCell::new(Vec::new()),
+        ta_hoisted: std::cell::RefCell::new(BTreeMap::new()),
         loop_mod_residues: std::cell::RefCell::new(Vec::new()),
         fin_stack: std::cell::RefCell::new(Vec::new()),
         fin_value_slots: fin_slots > 0,
@@ -8178,8 +8230,13 @@ fn emit_f64_function(
     };
     let _ = writeln!(s, "{} double {}({}){{", storage, f64_cname(f), params);
     s.push_str(&method_this_check(f, &format!("_p{}", f.capture_count)));
+    let int32_use_decl = if int32_codegen_enabled() {
+        int32_use_locals(f, &unboxed, &int_local)
+    } else {
+        BTreeSet::new()
+    };
     for l in &f.locals {
-        if int_local.contains(&l.id.0) {
+        if int_local.contains(&l.id.0) || int32_use_decl.contains(&l.id.0) {
             let _ = writeln!(s, "  long long d{} = 0;", l.id.0);
         } else if unboxed.contains(&l.id.0) {
             let _ = writeln!(s, "  double d{} = 0;", l.id.0);
@@ -8286,6 +8343,7 @@ fn emit_f64_function(
         nonnegative_int,
         label_ctr: std::cell::Cell::new(900000),
         loop_labels: std::cell::RefCell::new(Vec::new()),
+        ta_hoisted: std::cell::RefCell::new(BTreeMap::new()),
         loop_mod_residues: std::cell::RefCell::new(Vec::new()),
         fin_stack: std::cell::RefCell::new(Vec::new()),
         fin_value_slots: fin_slots > 0,
@@ -8403,6 +8461,7 @@ fn emit_function(
             nonnegative_int,
             label_ctr: std::cell::Cell::new(900000),
             loop_labels: std::cell::RefCell::new(Vec::new()),
+        ta_hoisted: std::cell::RefCell::new(BTreeMap::new()),
             loop_mod_residues: std::cell::RefCell::new(Vec::new()),
             fin_stack: std::cell::RefCell::new(Vec::new()),
             fin_value_slots: false,
@@ -8467,6 +8526,7 @@ fn emit_function(
             nonnegative_int,
             label_ctr: std::cell::Cell::new(900000),
             loop_labels: std::cell::RefCell::new(Vec::new()),
+        ta_hoisted: std::cell::RefCell::new(BTreeMap::new()),
             loop_mod_residues: std::cell::RefCell::new(Vec::new()),
             fin_stack: std::cell::RefCell::new(Vec::new()),
             fin_value_slots: false,
@@ -8531,6 +8591,7 @@ fn emit_function(
             nonnegative_int,
             label_ctr: std::cell::Cell::new(900000),
             loop_labels: std::cell::RefCell::new(Vec::new()),
+        ta_hoisted: std::cell::RefCell::new(BTreeMap::new()),
             loop_mod_residues: std::cell::RefCell::new(Vec::new()),
             fin_stack: std::cell::RefCell::new(Vec::new()),
             fin_value_slots: false,
@@ -8609,8 +8670,13 @@ fn emit_function(
         s.push_str("  (void)nargs;\n");
         s.push_str(&method_this_check(f, &format!("(nargs > {c} ? args[{c}] : TS_UNDEFINED)", c = f.capture_count)));
     }
+    let int32_use_decl = if int32_codegen_enabled() {
+        int32_use_locals(f, &unboxed, &int_local)
+    } else {
+        BTreeSet::new()
+    };
     for l in &f.locals {
-        if int_local.contains(&l.id.0) {
+        if int_local.contains(&l.id.0) || int32_use_decl.contains(&l.id.0) {
             let _ = writeln!(s, "  long long d{} = 0;", l.id.0);
         } else if json_locals.contains(&l.id.0) {
             let _ = writeln!(s, "  tjson_value* j{} = NULL;", l.id.0);
@@ -8805,6 +8871,7 @@ fn emit_function(
         nonnegative_int,
         label_ctr: std::cell::Cell::new(900000),
         loop_labels: std::cell::RefCell::new(Vec::new()),
+        ta_hoisted: std::cell::RefCell::new(BTreeMap::new()),
         loop_mod_residues: std::cell::RefCell::new(Vec::new()),
         fin_stack: std::cell::RefCell::new(Vec::new()),
         fin_value_slots: fin_slots > 0,
@@ -11497,7 +11564,7 @@ fn emit_coro_frame_struct(s: &mut String, f: &Function, ctx: &Ctx, fname: &str) 
     let _ = writeln!(s, "typedef struct {}_frame {{ ts_coro c;", fname);
     let numeric = |id: u32| ctx.int_local.contains(&id) || ctx.unboxed.contains(&id);
     let field = |s: &mut String, id: u32| {
-        if ctx.int_local.contains(&id) {
+        if ctx.int_local.contains(&id) || (int32_codegen_enabled() && ctx.int32_use.contains(&id)) {
             let _ = writeln!(s, "  long long d{};", id);
         } else if ctx.unboxed.contains(&id) {
             let _ = writeln!(s, "  double d{};", id);
@@ -12795,10 +12862,54 @@ fn emit_view_load(s: &mut String, ctx: &Ctx, dst: u32, arr: u32, index: u32, ele
         ("ts_ta_try_load_f", ctx.num(index), "ts_array_get_key_f64")
     };
     let slow = ctx.lazy_linked(&format!("{}({}, {})", slow_fn, a, i));
+    if int_key {
+        let hoisted = ctx.ta_hoisted.borrow().get(&arr).copied();
+        if let Some((helem, top)) = hoisted {
+            if helem == elem {
+                // the receiver's test and length were read before the loop
+                let tah = format!("_tah{}_{}", arr, top);
+                let inb = format!("((uint64_t)d{} < _tal{}_{})", index, arr, top);
+                if int32_codegen_enabled() && elem <= 6 && ctx.int32_use.contains(&dst) {
+                    let _ = writeln!(
+                        s,
+                        "  d{} = {} ? ts_ta_elem_load_i32({}->data, (uint32_t)d{}, {}) : ts_to_int32(ts_number_coerce({}));",
+                        dst, inb, tah, index, elem, slow
+                    );
+                } else if ctx.unboxed.contains(&dst) && !ctx.int_local.contains(&dst) {
+                    let e = format!(
+                        "({} ? ts_ta_elem_load({}->data, (uint32_t)d{}, {}) : ts_number_coerce({}))",
+                        inb, tah, index, elem, slow
+                    );
+                    s.push_str(&ctx.set_num(dst, &e));
+                } else {
+                    let e = format!(
+                        "({} ? ts_num(ts_ta_elem_load({}->data, (uint32_t)d{}, {})) : {})",
+                        inb, tah, index, elem, slow
+                    );
+                    s.push_str(&ctx.set_val(dst, &e));
+                }
+                return;
+            }
+        }
+    }
+    if int32_codegen_enabled() && int_key && elem <= 6 && ctx.int32_use.contains(&dst) {
+        // an integer element kind (Int8 .. Uint32) read into a local that holds
+        // ToInt32 of its value: the element as an int32 (Uint32 wraps), the
+        // slow path converted once
+        let _ = writeln!(
+            s,
+            "  d{} = ({{ int32_t _ti; if (!ts_ta_try_load_i32({}, {}, {}, &_ti)) _ti = ts_to_int32(ts_number_coerce({})); _ti; }});",
+            dst, a, i, elem, slow
+        );
+        return;
+    }
     if ctx.unboxed.contains(&dst) && !ctx.int_local.contains(&dst) {
+        // a non-view receiver's element (an `any` cast) through ToNumber: a
+        // string element reads its number, not its bits
+        let conv = if int32_codegen_enabled() { "ts_number_coerce" } else { "ts_to_num" };
         let e = format!(
-            "({{ double _ta; if (!{}({}, {}, {}, &_ta)) _ta = ts_to_num({}); _ta; }})",
-            try_fn, a, i, elem, slow
+            "({{ double _ta; if (!{}({}, {}, {}, &_ta)) _ta = {}({}); _ta; }})",
+            try_fn, a, i, elem, conv, slow
         );
         s.push_str(&ctx.set_num(dst, &e));
     } else {
@@ -12821,6 +12932,25 @@ fn emit_view_store(s: &mut String, ctx: &Ctx, arr: u32, index: u32, src: u32, el
         ("ts_ta_try_store_f", ctx.num(index), "ts_array_set_key_f64")
     };
     let slow = ctx.lazy_linked_stmt(&format!("{}({}, {}, ts_num(_tx))", slow_fn, a, i));
+    if int_key {
+        let hoisted = ctx.ta_hoisted.borrow().get(&arr).copied();
+        if let Some((helem, top)) = hoisted {
+            if helem == elem {
+                let _ = writeln!(
+                    s,
+                    "  {{ double _tx = {}; if ((uint64_t)d{} < _tal{a}_{t}) ts_ta_elem_store(_tah{a}_{t}->data, (uint32_t)d{}, _tx, {}); else {} }}",
+                    ctx.num(src),
+                    index,
+                    index,
+                    elem,
+                    slow,
+                    a = arr,
+                    t = top
+                );
+                return;
+            }
+        }
+    }
     let _ = writeln!(
         s,
         "  {{ double _tx = {}; if (!{}({}, {}, _tx, {})) {} }}",
@@ -14251,7 +14381,8 @@ fn try_emit_fused_string_concat_loop(
         let _ = writeln!(s, "  d{} += {}LL;", counter, counter_inc);
     });
     if ctx.int32_use.contains(&sum_copy.0) {
-        let _ = writeln!(s, "  d{} = (double)ts_to_int32((double){});", sum_copy.0, acc_var);
+        let cast = if int32_codegen_enabled() { "" } else { "(double)" };
+        let _ = writeln!(s, "  d{} = {}ts_to_int32((double){});", sum_copy.0, cast, acc_var);
     } else if !ctx.int_local.contains(&sum_copy.0) {
         let _ = writeln!(s, "  d{} = (double){};", sum_copy.0, acc_var);
     }
@@ -17290,6 +17421,48 @@ fn try_emit_fused_polymorphic_pattern_split_join_loop(
     Some(())
 }
 
+/// The typed-array receivers of a loop's element reads, writes and length
+/// reads whose local the loop never assigns (slice P): their typed-array test
+/// and length are read once before the loop, and the cell pointer, used every
+/// iteration, keeps the view reachable. The element kind is the first use's;
+/// a receiver used with two kinds keeps the per-use test.
+fn loop_view_receivers(cond_body: &[Inst], body: &[Inst], ctx: &Ctx) -> Vec<(u32, u8)> {
+    let mut flat: Vec<&Inst> = Vec::new();
+    flatten_inst(cond_body, &mut flat);
+    flatten_inst(body, &mut flat);
+    let mut defs: BTreeSet<u32> = flat.iter().filter_map(|i| inst_def_local(i)).collect();
+    for inst in &flat {
+        if let Inst::TryCatch { catch_var: Some(v), .. } = inst {
+            defs.insert(v.0);
+        }
+    }
+    let mut out: Vec<(u32, u8)> = Vec::new();
+    let mut conflicting: BTreeSet<u32> = BTreeSet::new();
+    for inst in &flat {
+        let (arr, elem) = match inst {
+            Inst::LoadIndex { arr, elem, .. } | Inst::StoreIndex { arr, elem, .. } if *elem != 0 => {
+                (arr.0, *elem - 1)
+            }
+            Inst::LoadField { obj, field, elem, .. } if *elem != 0 && is_length_field(field.0) => {
+                (obj.0, *elem - 1)
+            }
+            _ => continue,
+        };
+        if defs.contains(&arr) || ctx.json_locals.contains(&arr) {
+            continue;
+        }
+        match out.iter().find(|(a, _)| *a == arr) {
+            Some((_, e)) if *e != elem => {
+                conflicting.insert(arr);
+            }
+            Some(_) => {}
+            None => out.push((arr, elem)),
+        }
+    }
+    out.retain(|(a, _)| !conflicting.contains(a));
+    out
+}
+
 fn collect_defs(seq: &[Inst]) -> BTreeSet<u32> {
     seq.iter().filter_map(inst_def_local).collect()
 }
@@ -19531,6 +19704,12 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     .map(|a| ctx.numc(a.0))
                     .unwrap_or_else(|| "0.0/0.0".into())
             };
+            // ToInt32 of an operand, a cast for an int or int32-use local
+            let bi = |i: usize| -> String {
+                args.get(i)
+                    .map(|a| ctx.bitwise_operand(a.0))
+                    .unwrap_or_else(|| "0".into())
+            };
             let v = |i: usize| -> String {
                 args.get(i)
                     .map(|a| ctx.val(a.0))
@@ -19596,9 +19775,9 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 // keeps the runtime call (the parity oracle)
                 "math.imul" if imul_inline_enabled() => (
                     format!(
-                        "((double)(int32_t)((uint32_t)ts_to_int32({}) * (uint32_t)ts_to_int32({})))",
-                        nc(0),
-                        nc(1)
+                        "((double)(int32_t)((uint32_t){} * (uint32_t){}))",
+                        bi(0),
+                        bi(1)
                     ),
                     true,
                 ),
@@ -20889,8 +21068,26 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         pic
                     )
                 };
-                // A receiver typed as a view: its length in line (TA2).
-                let get_expr = if *elem != 0 && is_length_field(field.0) {
+                // A receiver typed as a view: its length in line (TA2); from the
+                // enclosing loop's hoisted test and length when it has them.
+                let hoisted_len = if *elem != 0 && is_length_field(field.0) {
+                    ctx.ta_hoisted
+                        .borrow()
+                        .get(&obj.0)
+                        .copied()
+                        .filter(|(e, _)| *e == *elem - 1)
+                        .map(|(_, top)| top)
+                } else {
+                    None
+                };
+                let get_expr = if let Some(top) = hoisted_len {
+                    format!(
+                        "((_tah{a}_{t} && obj_map_plain(&_tah{a}_{t}->o)->len == 0) ? ts_num((double)_tal{a}_{t}) : {g})",
+                        a = obj.0,
+                        t = top,
+                        g = get_expr
+                    )
+                } else if *elem != 0 && is_length_field(field.0) {
                     format!(
                         "({{ tsv _tl; if (!ts_ta_try_length({}, &_tl)) _tl = {}; _tl; }})",
                         ctx.val(obj.0),
@@ -22061,8 +22258,9 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         let cop = op.as_str();
                         let _ = writeln!(
                             s,
-                            "  {{ uint32_t {t} = ((uint32_t)d{l} {op} (uint32_t)d{r}); d{d} = ({t} >= 0x80000000u) ? (long long){t} - 0x100000000LL : (long long){t}; }}",
+                            "  {{ uint32_t {t} = ((uint32_t)d{l} {op} (uint32_t)d{r}); d{d} = {sx}; }}",
                             t = tmp,
+                            sx = sext32_expr(&tmp),
                             l = lhs.0,
                             op = cop,
                             r = rhs.0,
@@ -22072,8 +22270,9 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     "<<" => {
                         let _ = writeln!(
                             s,
-                            "  {{ uint32_t {t} = ((uint32_t)d{l}) << ((uint32_t)d{r} & 31u); d{d} = ({t} >= 0x80000000u) ? (long long){t} - 0x100000000LL : (long long){t}; }}",
+                            "  {{ uint32_t {t} = ((uint32_t)d{l}) << ((uint32_t)d{r} & 31u); d{d} = {sx}; }}",
                             t = tmp,
+                            sx = sext32_expr(&tmp),
                             l = lhs.0,
                             r = rhs.0,
                             d = dst.0
@@ -22082,8 +22281,9 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     ">>" => {
                         let _ = writeln!(
                             s,
-                            "  {{ uint32_t {t}l = (uint32_t)d{l}; uint32_t {t}s = (uint32_t)d{r} & 31u; uint32_t {t} = ({t}l & 0x80000000u) ? ~(~{t}l >> {t}s) : ({t}l >> {t}s); d{d} = ({t} >= 0x80000000u) ? (long long){t} - 0x100000000LL : (long long){t}; }}",
+                            "  {{ uint32_t {t}l = (uint32_t)d{l}; uint32_t {t}s = (uint32_t)d{r} & 31u; uint32_t {t} = ({t}l & 0x80000000u) ? ~(~{t}l >> {t}s) : ({t}l >> {t}s); d{d} = {sx}; }}",
                             t = tmp,
+                            sx = sext32_expr(&tmp),
                             l = lhs.0,
                             r = rhs.0,
                             d = dst.0
@@ -22638,6 +22838,25 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     }
                 }
             }
+            // Typed-array receivers the loop never assigns: the view test and
+            // the length once, here; the element reads index the cell's data.
+            let hoisted: Vec<(u32, u8)> = if ta_hoist_enabled() {
+                loop_view_receivers(cond_body, body, ctx)
+            } else {
+                Vec::new()
+            };
+            let mut hoist_saved: Vec<(u32, Option<(u8, u32)>)> = Vec::new();
+            for (arr, elem) in &hoisted {
+                let _ = writeln!(
+                    s,
+                    "  ts_typedarray* _tah{a}_{t} = ts_ta_as({v}, {e}); uint32_t _tal{a}_{t} = _tah{a}_{t} ? _tah{a}_{t}->length : 0u; (void)_tal{a}_{t};",
+                    a = arr,
+                    t = top,
+                    v = ctx.val(*arr),
+                    e = elem
+                );
+                hoist_saved.push((*arr, ctx.ta_hoisted.borrow_mut().insert(*arr, (*elem, top))));
+            }
             ctx.loop_labels
                 .borrow_mut()
                 .push((top, end, ctx.eh_depth.get()));
@@ -22672,6 +22891,16 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             let _ = writeln!(s, "  L{}: ;", end);
             ctx.loop_mod_residues.borrow_mut().pop();
             ctx.loop_labels.borrow_mut().pop();
+            for (arr, prev) in hoist_saved {
+                match prev {
+                    Some(p) => {
+                        ctx.ta_hoisted.borrow_mut().insert(arr, p);
+                    }
+                    None => {
+                        ctx.ta_hoisted.borrow_mut().remove(&arr);
+                    }
+                }
+            }
         }
         Inst::If {
             cond,

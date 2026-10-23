@@ -228,3 +228,7 @@ parity	classes/base_fields_via_super	The Rust emitter lists a field a subclass r
 parity	closures/undef_init_paths	The Rust emitter gives whileFirst a double-returning entry and roots one local less in the legacy root mode, where the frozen emitter keeps the boxed entry; both outputs match V8.
 parity-unported	stdlib/text_decoder_ascii	Frozen emitter lacks the text codec builtins (textdecoder.new, docs/text_codecs_design.md); the Rust output matches V8.
 selfconf-unported	stdlib/text_decoder_ascii	Frozen emitter lacks the text codec builtins (docs/text_codecs_design.md); native Rust output matches V8.
+parity-unported	numbers/int32_codegen	Frozen emitter lacks the typed array builtins (typedarray.new, docs/typed_arrays_design.md); the Rust output matches V8.
+selfconf-unported	numbers/int32_codegen	Frozen emitter lacks the typed array builtins; native Rust output matches V8.
+parity-unported	arrays/typed_array_loops	Frozen emitter lacks the typed array builtins (typedarray.new, docs/typed_arrays_design.md); the Rust output matches V8.
+selfconf-unported	arrays/typed_array_loops	Frozen emitter lacks the typed array builtins; native Rust output matches V8.

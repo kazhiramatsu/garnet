@@ -8606,3 +8606,29 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   0` as `orr/cmp/csel`, the Uint16 element loaded into an FP register and
   converted back, and the receiver's typed-array test repeated every
   iteration: slices O and P (`docs/int32_codegen_design.md`).
+- Slices O and P (int32 code generation, the typed-array receiver hoisted;
+  `docs/int32_codegen_design.md`): `Math.imul`'s operands taken as the bitwise
+  operators take theirs (a cast for an int or int32-use local, a constant
+  folds; the double round trip and the per-iteration `fjcvtzs` of the constant
+  are gone), the sign extension of a bitwise result written as xor-subtract
+  (one `sxtw` for `orr/cmp/csel`), int32-use locals stored as `long long`, an
+  integer-kind typed-array element read with an int index into an int32-use
+  local as an int32 (`ts_ta_try_load_i32`), and the slow path of a numeric
+  element read through ToNumber (a non-view receiver's string element read its
+  bits before; `arrays/typed_array_loops` found it). Slice P reads a
+  loop-invariant typed-array receiver's view test and length once before the
+  loop; each access is a bounds test and a load through the cell's data
+  pointer (the cell pointer used every iteration keeps the view reachable); an
+  own `length` property still shadows the internal length. Knobs
+  `TSAOT_INT32_CODEGEN=0`, `TSAOT_TA_HOIST=0` (the parity oracle). Fixtures
+  `numbers/int32_codegen`, `arrays/typed_array_loops` (both unported for the
+  frozen oracles, typed arrays). Gates all green (parity 383 identical / 159
+  known; selfconf 543, 497 pass, 46 known; conformance 546 plain and strict,
+  543 protect; GC stress; bundler; unit). The scanner kernel: 1.92 -> 1.44 (O)
+  -> 1.14 G instructions (P) against scriptc's 0.93 G, wall 110 -> 60 -> 40 ms
+  against 50 ms. tsc-ts one checker, outputs identical, six pairs: 26.16 ->
+  25.90 G instructions (-1.0%), cycles -0.8%, wall 1.40 -> 1.38 s; the
+  parse-only run 3.61 -> 3.39 G (-6%), cycles -7%. Not adopted again, measured
+  on the class_nodes kernel: `-O3` 4.72 -> 3.98 G and `-inline-threshold=600`
+  4.22 G (the kernel's small methods get inlined; on tsc-ts both were within
+  noise before).
