@@ -8473,3 +8473,21 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   a plain `enum`, it ran 12.1 G: a plain enum's member read is a property read
   of the enum object through an inline cache at every `case`, which tsc-ts's
   const enums (SyntaxKind, NodeFlags, TypeFlags are const) never pay.
+- Toward scriptc, slice I: enum-typed class fields as integers
+  (`docs/int32_fields_design.md`). The exporter tags a field `int32` when its
+  type at every `new` site is a numeric enum whose members are int32 constants
+  (or a union of int32 literals; `isInt32ValuedType`); the emitter gives it a
+  `long long` slot, reads it into an integer local (the numeric analysis takes
+  the load as an int32 fact: `switch (node.kind)` becomes a C switch on the
+  integer, flag tests integer ands), stores an integer local as it is and
+  checks anything else (`ts_int32_field_value`: a non-integer throws a
+  TypeError, loud, never truncated); the class descriptor's `numeric` is a
+  kind (0 boxed, 1 double, 2 integer) for the generic paths and reflection.
+  `TSAOT_INT_FIELDS=0` keeps doubles. tsc-ts one thread, six interleaved
+  pairs: 28.29 -> 27.28 G instructions (0.9645), cycles 0.978, wall 1.49 ->
+  1.46 s. Kernel class_enum_fields 3.31 -> 3.02 G. Gates: parity (381
+  identical), selfconf, unit, bundler, conformance 540/540 plain and strict,
+  537/537 under protect mode, GC stress. The kernel's profile
+  (`scripts/prof_pc.py`, now for any program): the non-inlined call of a small
+  helper (prologue and epilogue 17%), the array element load's checks 13%,
+  int-to-double conversions of integer results added into a double 10%.

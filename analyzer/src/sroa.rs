@@ -34,7 +34,7 @@ pub fn run_sroa(program: &mut Program, result: &EscapeResult) {
         .flat_map(|c| {
             c.field_types
                 .iter()
-                .filter(|(_, t)| t.as_str() == "number")
+                .filter(|(_, t)| t.as_str() == "number" || t.as_str() == "int32")
                 .filter_map(|(k, _)| k.parse::<u32>().ok().map(|fid| (c.id.0, fid)))
         })
         .collect();

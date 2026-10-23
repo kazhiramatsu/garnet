@@ -230,6 +230,8 @@ neither instructions nor wall.
 | F: base-class field types | 32.60 G | |
 | S: lazy string hashes, direct UTF-8 walks | 31.77 G | 1.66 s |
 | C: conservative roots, no GC frames (`docs/conservative_roots_design.md`) | 28.55 G | 1.50 s |
+| R: no `g_class_relinked` test in a closed program | 28.28 G | 1.49 s |
+| I: enum-typed fields as integers (`docs/int32_fields_design.md`) | 27.28 G | 1.46 s |
 | scriptc | 18.3 G | 1.05 s |
 
 ## What to do

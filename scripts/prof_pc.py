@@ -12,14 +12,15 @@ pcf, binary, units = sys.argv[1], sys.argv[2], sys.argv[3]
 top = int(sys.argv[4]) if len(sys.argv) > 4 else 50
 lines = open(pcf).read().split('\n')
 slide = int(lines[0].split()[1], 16)
+prog = os.path.basename(binary)      # the program's image, as dladdr names it
 cnt = collections.Counter()          # samples by PC (file address) for PCs in this image
 outside = collections.Counter()      # samples outside the image: (image, symbol) -> count
 outside_callers = collections.Counter()   # ... attributed to the nearest return address inside the image
 for l in lines[2:]:
     if not l.strip(): continue
     parts = l.split(); a = int(parts[0], 16) - slide; c = int(parts[1])
-    img = parts[2] if len(parts) > 2 else 'tsc-ts'
-    if img == 'tsc-ts' or not img:
+    img = parts[2] if len(parts) > 2 else prog
+    if img == prog or not img:
         cnt[a] += c; continue
     sym = parts[3].split('+')[0] if len(parts) > 3 else '?'
     outside[(img, sym)] += c

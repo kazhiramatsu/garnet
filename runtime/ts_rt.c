@@ -11038,14 +11038,21 @@ static int class_field_lookup(ts_object* o, ts_key key, size_t* off, int* numeri
   }
   return 0;
 }
+void ts_throw_int32_field(double d){
+  char buf[64]; ts_fmt_num(d, buf, sizeof buf);
+  char msg[128]; snprintf(msg, sizeof msg, "an integer-typed field receives %s", buf);
+  ts_throw_type_error_msg(msg);
+}
 static tsv struct_field_get(ts_object* o, size_t off, int numeric){
   char* base=(char*)o;
+  if (numeric == 2){ long long i; memcpy(&i, base+off, sizeof(long long)); return ts_num((double)i); }
   if (numeric){ double d; memcpy(&d, base+off, sizeof(double)); return ts_num(d); }
   tsv v; memcpy(&v, base+off, sizeof(tsv)); return v;
 }
 static void struct_field_set(ts_object* o, size_t off, int numeric, tsv v){
   char* base=(char*)o;
-  if (numeric){ double d=ts_to_num(v); memcpy(base+off, &d, sizeof(double)); }
+  if (numeric == 2){ long long i = ts_int32_field_value(ts_to_num(v)); memcpy(base+off, &i, sizeof(long long)); }
+  else if (numeric){ double d=ts_to_num(v); memcpy(base+off, &d, sizeof(double)); }
   else { memcpy(base+off, &v, sizeof(tsv)); ts_write_barrier(ts_obj(o), v); }
 }
 /* does object o (a typed class instance) have a struct field named `key`? The
@@ -11060,6 +11067,10 @@ static int class_reg_nfields(ts_class_reg* r){ return r ? r->nfields : 0; }
 static uint32_t class_reg_field_key(ts_class_reg* r, int i){ return r->fields[i].name_id; }
 static tsv class_reg_field_value(ts_class_reg* r, ts_object* o, int i){
   char* base=(char*)o;
+  if (r->fields[i].numeric == 2){
+    long long n; memcpy(&n, base+r->fields[i].offset, sizeof(long long));
+    return ts_num((double)n);
+  }
   if (r->fields[i].numeric){
     double d; memcpy(&d, base+r->fields[i].offset, sizeof(double));
     return ts_num(d);

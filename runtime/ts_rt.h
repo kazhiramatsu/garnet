@@ -1855,7 +1855,18 @@ tsv ts_instanceof_hook(tsv klass, tsv obj);
 tsv ts_instanceof_dyn(tsv obj, tsv ctorv);  /* x instanceof <runtime constructor value> */
 
 /* class field descriptor: lets the inspector render typed class instances. */
+/* numeric: the slot's kind, 0 a boxed tsv, 1 an unboxed double, 2 an integer
+   (`long long` holding an int32: an enum-typed field, docs/int32_fields_design.md) */
 typedef struct { uint32_t name_id; size_t offset; int numeric; } ts_class_field;
+void ts_throw_int32_field(double d);
+/* The value stored into an integer slot: an exact int32, or a TypeError (the
+   field's type says an enum member; a program storing 1.5 through a cast is
+   refused, never truncated silently). */
+static inline long long ts_int32_field_value(double d){
+  long long i = (long long)d;
+  if (TS_RT_UNLIKELY((double)i != d || i != (long long)(int32_t)i)) ts_throw_int32_field(d);
+  return i;
+}
 void ts_register_class(tsv proto, ts_class_field* fields, int nfields);
 /* Class VALUE support (`const K = C; new K()`): register a class's instance size
    and prototype by class id, box a class as a callable value, and construct an

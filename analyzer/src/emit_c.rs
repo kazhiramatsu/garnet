@@ -1618,7 +1618,7 @@ fn emit_class_descriptors(s: &mut String, program: &Program) {
     let classes: BTreeMap<u32, &ClassDef> = program.classes.iter().map(|c| (c.id.0, c)).collect();
     // the struct's members (emit_field_chain): a redeclared field keeps the
     // slot, and the kind, of the ancestor that declares it first
-    fn chain(cid: u32, classes: &BTreeMap<u32, &ClassDef>, out: &mut Vec<(u32, bool)>) {
+    fn chain(cid: u32, classes: &BTreeMap<u32, &ClassDef>, out: &mut Vec<(u32, u8)>) {
         if let Some(c) = classes.get(&cid) {
             if let Some(p) = c.parent {
                 chain(p.0, classes, out);
@@ -1627,16 +1627,17 @@ fn emit_class_descriptors(s: &mut String, program: &Program) {
                 if out.iter().any(|(id, _)| *id == f.0) {
                     continue;
                 }
-                let numeric = c
-                    .field_types
-                    .get(&f.0.to_string())
-                    .map(|t| t == "number")
-                    .unwrap_or(false);
-                out.push((f.0, numeric));
+                // the slot's kind: 0 a boxed tsv, 1 a double, 2 an integer (int32)
+                let kind = match c.field_types.get(&f.0.to_string()).map(|t| t.as_str()) {
+                    Some("int32") if int_fields_enabled() => 2u8,
+                    Some("number") | Some("int32") => 1u8,
+                    _ => 0u8,
+                };
+                out.push((f.0, kind));
             }
         }
     }
-    let mut typed: Vec<(u32, Vec<(u32, bool)>)> = Vec::new();
+    let mut typed: Vec<(u32, Vec<(u32, u8)>)> = Vec::new();
     for c in &program.classes {
         if c.instantiated {
             let mut fields = Vec::new();
@@ -1648,14 +1649,14 @@ fn emit_class_descriptors(s: &mut String, program: &Program) {
     }
     for (cid, fields) in &typed {
         let _ = writeln!(s, "static ts_class_field CLASS_FIELDS_{}[] = {{", cid);
-        for (fid, numeric) in fields {
+        for (fid, kind) in fields {
             let _ = writeln!(
                 s,
                 "  {{ {}u, offsetof(struct {}, f{}), {} }},",
                 fid,
                 struct_name(*cid),
                 fid,
-                if *numeric { 1 } else { 0 }
+                kind
             );
         }
         s.push_str("};\n");
@@ -1756,10 +1757,12 @@ fn emit_field_chain(
             let numeric = c
                 .field_types
                 .get(&f.0.to_string())
-                .map(|t| t == "number")
+                .map(|t| t == "number" || t == "int32")
                 .unwrap_or(false);
             if numeric {
-                let _ = writeln!(s, "  double f{};", f.0);
+                let int32 = int_fields_enabled()
+                    && c.field_types.get(&f.0.to_string()).map(|t| t == "int32").unwrap_or(false);
+                let _ = writeln!(s, "  {} f{};", if int32 { "long long" } else { "double" }, f.0);
             } else {
                 let _ = writeln!(s, "  tsv f{};", f.0);
             }
@@ -2162,6 +2165,15 @@ impl<'a> Ctx<'a> {
                     self.set_val(id, &format!("ts_bool({})", call))
                 }
             }
+        }
+    }
+    /// An integer-valued expression (`long long`) into a local: the integer
+    /// local as it is, a double local widened, a boxed local boxed.
+    fn set_int_or_num(&self, id: u32, e: &str) -> String {
+        if self.int_local.contains(&id) {
+            format!("  d{} = {};\n", id, e)
+        } else {
+            self.set_num(id, &format!("(double)({})", e))
         }
     }
     fn set_num(&self, id: u32, e: &str) -> String {
@@ -4178,6 +4190,7 @@ fn direct_entry_sigs(
     param_facts_by_func: &BTreeMap<u32, BTreeMap<u32, NumFact>>,
     i64_fast: &BTreeMap<u32, I64FuncInfo>,
 ) -> BTreeMap<u32, DirectSig> {
+    let classes: BTreeMap<u32, &ClassDef> = program.classes.iter().map(|c| (c.id.0, c)).collect();
     let mut out = BTreeMap::new();
     if !direct_entry_enabled() {
         return out;
@@ -4204,7 +4217,7 @@ fn direct_entry_sigs(
             }
             let unboxed = unboxed_candidates(f, &local_class);
             let pf = param_facts_by_func.get(&f.id.0).unwrap_or(&empty);
-            let numeric = infer_numeric_analysis(&f.body, &unboxed, pf, &return_facts);
+            let numeric = infer_numeric_analysis(&f.body, &unboxed, pf, &return_facts, &int32_field_loads(&f.body, &classes));
             let kinds = f
                 .params
                 .iter()
@@ -4351,6 +4364,17 @@ struct NumFact {
 }
 
 impl NumFact {
+    /// A value read from an integer slot: an int32.
+    fn int32_value() -> Self {
+        Self {
+            i64_safe: true,
+            nonneg: false,
+            maybe_zero: true,
+            const_i64: None,
+            min_i64: Some(i32::MIN as i64),
+            max_i64: Some(i32::MAX as i64),
+        }
+    }
     fn unknown() -> Self {
         Self {
             i64_safe: false,
@@ -6406,11 +6430,32 @@ fn int32_use_locals(f: &Function, unboxed: &BTreeSet<u32>, int_local: &BTreeSet<
     cands
 }
 
+/// The field loads of a body that read an integer slot (an int32-tagged field
+/// of the receiver's hinted class, the declaring ancestor's tag deciding):
+/// their values are int32 for the numeric analysis.
+fn int32_field_loads(body: &[Inst], classes: &BTreeMap<u32, &ClassDef>) -> BTreeSet<usize> {
+    let mut out = BTreeSet::new();
+    if !int_fields_enabled() {
+        return out;
+    }
+    let mut flat: Vec<&Inst> = Vec::new();
+    flatten_inst(body, &mut flat);
+    for inst in &flat {
+        if let Inst::LoadField { field, cls, .. } = inst {
+            if *cls != 0 && int32_field(*cls - 1, field.0, classes) {
+                out.insert(*inst as *const Inst as usize);
+            }
+        }
+    }
+    out
+}
+
 fn infer_numeric_analysis(
     body: &[Inst],
     unboxed: &BTreeSet<u32>,
     param_facts: &BTreeMap<u32, NumFact>,
     return_facts: &BTreeMap<u32, NumFact>,
+    int32_loads: &BTreeSet<usize>,
 ) -> NumericAnalysis {
     let mut flat: Vec<&Inst> = Vec::new();
     flatten_inst(body, &mut flat);
@@ -6727,6 +6772,9 @@ fn infer_numeric_analysis(
                 Inst::ArrayLen { dst, .. }
                 | Inst::StringLen { dst, .. }
                 | Inst::GenericLen { dst, .. } => Some((dst.0, NumFact::nonnegative_i64_value())),
+                Inst::LoadField { dst, .. } if int32_loads.contains(&(inst as *const Inst as usize)) => {
+                    Some((dst.0, NumFact::int32_value()))
+                }
                 Inst::LoadField { dst, .. }
                 | Inst::LoadElem { dst, .. }
                 | Inst::LoadGlobal { dst, .. }
@@ -7090,6 +7138,7 @@ fn infer_program_param_facts(
     program: &Program,
     indirect: &BTreeSet<u32>,
 ) -> BTreeMap<u32, BTreeMap<u32, NumFact>> {
+    let classes: BTreeMap<u32, &ClassDef> = program.classes.iter().map(|c| (c.id.0, c)).collect();
     let mut by_func: BTreeMap<u32, BTreeMap<u32, NumFact>> = BTreeMap::new();
     for f in &program.functions {
         let mut m = BTreeMap::new();
@@ -7136,7 +7185,7 @@ fn infer_program_param_facts(
             let unboxed = unboxed_candidates(f, &local_class);
             let empty_return_facts: BTreeMap<u32, NumFact> = BTreeMap::new();
             let analysis =
-                infer_numeric_analysis(&f.body, &unboxed, &param_facts, &empty_return_facts);
+                infer_numeric_analysis(&f.body, &unboxed, &param_facts, &empty_return_facts, &int32_field_loads(&f.body, &classes));
             for inst in flat {
                 match inst {
                     Inst::Call {
@@ -7593,6 +7642,7 @@ fn collect_i64_seed_param_facts(
     base_param_facts: &BTreeMap<u32, BTreeMap<u32, NumFact>>,
     return_facts: &BTreeMap<u32, NumFact>,
 ) -> BTreeMap<u32, BTreeMap<u32, NumFact>> {
+    let classes: BTreeMap<u32, &ClassDef> = program.classes.iter().map(|c| (c.id.0, c)).collect();
     let fn_params: BTreeMap<u32, Vec<u32>> = program
         .functions
         .iter()
@@ -7614,7 +7664,7 @@ fn collect_i64_seed_param_facts(
         let unboxed = unboxed_candidates(caller, &local_class);
         let empty = BTreeMap::new();
         let param_facts = base_param_facts.get(&caller.id.0).unwrap_or(&empty);
-        let analysis = infer_numeric_analysis(&caller.body, &unboxed, param_facts, return_facts);
+        let analysis = infer_numeric_analysis(&caller.body, &unboxed, param_facts, return_facts, &int32_field_loads(&caller.body, &classes));
         let caller_numeric_params: Vec<u32> = caller
             .params
             .iter()
@@ -7669,6 +7719,7 @@ fn infer_i64_fast_funcs(
     indirect: &BTreeSet<u32>,
     base_param_facts: &BTreeMap<u32, BTreeMap<u32, NumFact>>,
 ) -> BTreeMap<u32, I64FuncInfo> {
+    let classes: BTreeMap<u32, &ClassDef> = program.classes.iter().map(|c| (c.id.0, c)).collect();
     let mut candidates: BTreeSet<u32> = program
         .functions
         .iter()
@@ -7720,7 +7771,7 @@ fn infer_i64_fast_funcs(
                 if params.iter().any(|p| !unboxed.contains(p)) {
                     continue;
                 }
-                let analysis = infer_numeric_analysis(&f.body, &unboxed, seed, &ret_assumptions);
+                let analysis = infer_numeric_analysis(&f.body, &unboxed, seed, &ret_assumptions, &int32_field_loads(&f.body, &classes));
                 if !validate_i64_direct_calls(&f.body, &analysis, &candidates) {
                     continue;
                 }
@@ -7841,7 +7892,7 @@ fn emit_i64_function(
     }
     let unboxed = unboxed_candidates(f, &local_class);
     let return_facts = i64_return_facts(i64_fast);
-    let numeric = infer_numeric_analysis(&f.body, &unboxed, &info.param_facts, &return_facts);
+    let numeric = infer_numeric_analysis(&f.body, &unboxed, &info.param_facts, &return_facts, &int32_field_loads(&f.body, classes));
     let mut int_local = numeric.int_local;
     for p in &info.params {
         int_local.insert(*p);
@@ -8053,7 +8104,7 @@ fn emit_f64_function(
     let unboxed = unboxed_candidates(f, &local_class);
     let return_facts = i64_return_facts(i64_fast);
     let empty_param_facts: BTreeMap<u32, NumFact> = BTreeMap::new();
-    let numeric = infer_numeric_analysis(&f.body, &unboxed, &empty_param_facts, &return_facts);
+    let numeric = infer_numeric_analysis(&f.body, &unboxed, &empty_param_facts, &return_facts, &int32_field_loads(&f.body, classes));
     let mut int_local = numeric.int_local;
     for p in &info.params {
         int_local.remove(p);
@@ -8268,7 +8319,7 @@ fn emit_function(
 
     let unboxed = unboxed_candidates(f, &local_class);
     let return_facts = i64_return_facts(i64_fast);
-    let numeric = infer_numeric_analysis(&f.body, &unboxed, param_facts, &return_facts);
+    let numeric = infer_numeric_analysis(&f.body, &unboxed, param_facts, &return_facts, &int32_field_loads(&f.body, classes));
     let int_local = numeric.int_local;
     let nonzero_int_const = numeric.nonzero_int_const;
     let nonzero_int = numeric.nonzero_int;
@@ -10059,6 +10110,41 @@ fn collect_non_numeric_consts(body: &[Inst], out: &mut BTreeSet<u32>) {
 /// `field_types` entry decides, not a subclass's that redeclares the field (a
 /// constructor assigning an inherited field): reading that slot by the
 /// subclass's type took a boxed slot for a double.
+/// TSAOT_INT_FIELDS=0 keeps an int32-tagged field a double (A/B; the oracle
+/// never sees the tag: it exports without the strict profile).
+fn int_fields_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_INT_FIELDS").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
+/// Is (class `c`, field `field`) an integer slot (`long long`, holding an
+/// int32: an enum-typed field, docs/int32_fields_design.md)? The declaring
+/// ancestor's tag decides, as for `numeric_field`.
+fn int32_field(c: u32, field: u32, classes: &BTreeMap<u32, &ClassDef>) -> bool {
+    if !int_fields_enabled() {
+        return false;
+    }
+    let mut decision = false;
+    let mut cur = Some(c);
+    while let Some(id) = cur {
+        let Some(cd) = classes.get(&id) else { break };
+        if cd.own_fields.iter().any(|f| f.0 == field) {
+            decision = cd
+                .field_types
+                .get(&field.to_string())
+                .map(|t| t == "int32")
+                .unwrap_or(false);
+        }
+        cur = cd.parent.map(|p| p.0);
+    }
+    decision
+}
+
 fn numeric_field(c: u32, field: u32, classes: &BTreeMap<u32, &ClassDef>) -> bool {
     let mut decision = false;
     let mut cur = Some(c);
@@ -10068,7 +10154,7 @@ fn numeric_field(c: u32, field: u32, classes: &BTreeMap<u32, &ClassDef>) -> bool
             decision = cd
                 .field_types
                 .get(&field.to_string())
-                .map(|t| t == "number")
+                .map(|t| t == "number" || t == "int32")
                 .unwrap_or(false);
         }
         cur = cd.parent.map(|p| p.0);
@@ -20700,7 +20786,12 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     // (the frozen emitter's ts_get under TSAOT_TYPED_SLOW=0)
                     let getter = if hinted.is_some() || typed_slow_enabled() { "ts_get_checked" } else { "ts_get" };
                     let slow = ctx.lazy_linked(&format!("{}({}, {})", getter, obj_name, field.0));
-                    if numeric_field(c, field.0, ctx.classes) {
+                    if int32_field(c, field.0, ctx.classes) {
+                        // an integer slot; the slow path's boxed number is integral
+                        // too (every store of the field checks), so it truncates
+                        let e = format!("(({2}) ? (long long)ts_to_num({0}) : {1})", slow, st, guard);
+                        s.push_str(&ctx.set_int_or_num(dst.0, &e));
+                    } else if numeric_field(c, field.0, ctx.classes) {
                         let e = format!("(({2}) ? ts_to_num({0}) : {1})", slow, st, guard);
                         s.push_str(&ctx.set_num(dst.0, &e));
                     } else {
@@ -20904,8 +20995,19 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 if let Some(off) = struct_direct_offset(c, field.0, ctx.classes) {
                     let cn = struct_name(c);
                     let is_num = numeric_field(c, field.0, ctx.classes);
-                    // numeric field stores a raw double; otherwise a boxed tsv
-                    let rhs = if is_num { ctx.num(src.0) } else { ctx.val(src.0) };
+                    // numeric field stores a raw double (an integer slot an integer, a
+                    // non-integer value refused loudly); otherwise a boxed tsv
+                    let rhs = if int32_field(c, field.0, ctx.classes) {
+                        if ctx.int_local.contains(&src.0) {
+                            format!("d{}", src.0)
+                        } else {
+                            format!("ts_int32_field_value({})", ctx.num(src.0))
+                        }
+                    } else if is_num {
+                        ctx.num(src.0)
+                    } else {
+                        ctx.val(src.0)
+                    };
                     // A receiver that is not a struct of class `c` routes
                     // `this.field = v` through ts_set (see the read above).
                     let obj_name = ctx.vname(obj.0);

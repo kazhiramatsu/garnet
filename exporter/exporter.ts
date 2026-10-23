@@ -9233,7 +9233,7 @@ class Exporter {
           let tag = "tsv";
           if (prop) {
             const ft = this.checker.getTypeOfSymbolAtLocation(prop, node);
-            tag = this.classify(ft) === "primitive" ? "number" : "tsv";
+            tag = this.classify(ft) === "primitive" ? (this.isInt32ValuedType(ft) ? "int32" : "number") : "tsv";
           }
           if (!m.has(fname)) m.set(fname, new Set());
           m.get(fname)!.add(tag);
@@ -9243,6 +9243,34 @@ class Exporter {
     } catch { /* be conservative on any checker hiccup */ }
   }
 
+  /** Is every value of `t` an int32? A numeric enum whose members are all
+   *  int32 constants, a member of one, or a union of int32 literal types
+   *  (docs/int32_fields_design.md). Such a field is stored as an integer. */
+  isInt32ValuedType(t: ts.Type): boolean {
+    const F = ts.TypeFlags;
+    const int32 = (v: unknown): boolean => typeof v === "number" && Number.isInteger(v) && v >= -2147483648 && v <= 2147483647;
+    const literalOk = (m: ts.Type): boolean => {
+      if (m.flags & F.NumberLiteral) return int32((m as ts.NumberLiteralType).value);
+      return false;
+    };
+    try {
+      if (t.flags & F.Union) return (t as ts.UnionType).types.every((m) => literalOk(m) || ((m.flags & F.EnumLiteral) !== 0 && literalOk(m)));
+      if (t.flags & F.EnumLiteral) return literalOk(t);
+      if (t.flags & F.Enum) {
+        const sym = t.getSymbol();
+        if (!sym || !sym.declarations) return false;
+        for (const d of sym.declarations) {
+          if (!ts.isEnumDeclaration(d)) return false;
+          for (const m of d.members) {
+            const v = this.checker.getConstantValue(m);
+            if (!int32(v)) return false;
+          }
+        }
+        return true;
+      }
+    } catch { return false; }
+    return false;
+  }
   /** Resolve uniform (monomorphic) field types for a class: a field gets a
    *  concrete tag only if every instantiation agreed on the same scalar tag. */
   uniformFieldTypes(classId: number): Record<string, string> {
@@ -9252,7 +9280,9 @@ class Exporter {
     for (const [fname, tags] of m) {
       if (tags.size === 1) {
         const tag = [...tags][0];
-        if (tag === "number") out[fname] = "number"; // only specialize true scalars
+        if (tag === "number" || tag === "int32") out[fname] = tag; // only specialize true scalars
+      } else if (tags.size === 2 && tags.has("number") && tags.has("int32")) {
+        out[fname] = "number"; // an int32 at some sites, a number at others: a double
       }
     }
     return out;

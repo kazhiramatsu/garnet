@@ -64,3 +64,37 @@ count; expected a few percent of the compile.
 A monomorphized field reads as 0 before its first assignment (V8:
 undefined); for an int32 field the same (`docs/TODO.md`, the known items
 of Session 350).
+
+## As built (Session 352)
+
+- Exporter: `isInt32ValuedType(t)` (a numeric enum whose members are all
+  int32 constants, a member of one, or a union of int32 literal types) makes
+  the tag `int32` in `recordInstantiationFieldTypes`; `uniformFieldTypes`
+  passes it through, and a field tagged `int32` at some sites and `number`
+  at others is a `number`.
+- Analyzer: `int32_field(c, field, classes)` beside `numeric_field` (which
+  now counts `int32` as numeric: an unboxed slot); the struct member is
+  `long long`; the class descriptor's `numeric` is a kind (0 boxed, 1
+  double, 2 integer); a `LoadField` of an integer slot is an int32 fact for
+  the numeric analysis (`int32_field_loads`, by the receiver's class hint),
+  so the destination becomes an integer local when its uses allow, else the
+  value widens to a double; a `StoreField` from an integer local stores it,
+  from anything else `ts_int32_field_value` checks and converts;
+  `sroa.rs` treats the tag as a scalar. `TSAOT_INT_FIELDS=0` keeps doubles.
+- Runtime: `struct_field_get`/`struct_field_set`/`class_reg_field_value`
+  read and write kind 2 (a non-integer store throws
+  "an integer-typed field receives <value>", `ts_throw_int32_field`); the
+  collector already skipped non-zero kinds; the field initialization and
+  the width rule are unchanged (8-byte slots).
+- Fixture `classes/enum_int_fields` (V8 output identical, plain and
+  strict). Kernel `class_enum_fields`: 3.31 -> 3.02 G instructions (scriptc
+  1.67); `class_nodes` unchanged (its fields are `number`s, as tsc-ts's
+  `pos`, `end`, `id` are).
+
+## Result
+
+tsc-ts, one thread, the TypeScript compiler project, six interleaved pairs
+against the previous build (outputs identical): instructions 28.29 ->
+27.28 G (0.9645), cycles 6.43 -> 6.29 G (0.978), wall 1.49 -> 1.46 s.
+Gates: parity (381 identical), selfconf, unit, bundler 43/43, conformance
+540/540 plain and strict, 537/537 under protect mode, GC stress.
