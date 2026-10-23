@@ -187,6 +187,8 @@ interface FnCtx {
   loopLabels?: (string | undefined)[]; // label of each loop on loopStack (parallel)
   pendingLabel?: string;               // label to attach to the next loop entered
   hoistedFns: Set<ts.Node>;            // function decls already hoisted at prologue (Step D)
+  ownThisCells?: Set<number>;          // lexical-this cells this function made (not an inherited parameter)
+  thisCellOfBody?: Map<any[], number>; // the lexical-this cell made in a block, reused by its later arrows
 }
 
 function isFunctionLike(n: ts.Node): boolean {
@@ -11645,17 +11647,34 @@ class Exporter {
     // activation) and capture it under the lexical-this sentinel, so the arrow's
     // body reads `this` from that threaded cell (see lowerFunctionLike).
     const arrowThis = ts.isArrowFunction(node) && this.arrowUsesThis(node as ts.ArrowFunction);
-    if (arrowThis && !ctx.cellAccess.has(this.lexicalThisSym)) {
-      const cell = this.newLocal(ctx, "reference", "thisCell");
-      const site = this.site++;
-      this.labels[site] = `thisCell@${ctx.name}`;
-      this.recordSite(site, "cell", "once", true, node, true);
-      ctx.body.push({ kind: "AllocObject", dst: cell, typeId: 0, site, classId: this.cellClassId });
-      // lowerUnboundThis: a top-level arrow in SCRIPT mode inherits the global
-      // object as its lexical this (module top level / strict bodies: undefined).
-      const tv = ctx.thisLocal ?? this.lowerUnboundThis(ctx);
-      ctx.body.push({ kind: "StoreField", obj: cell, field: this.VALUE, src: tv });
-      ctx.cellAccess.set(this.lexicalThisSym, cell);
+    if (arrowThis) {
+      // An arrow that uses `this` lexically captures the enclosing function's
+      // `this` through a cell. An arrow body inherits its own lexical-this cell
+      // as a parameter (lowerFunctionLike) and threads it on. A method or
+      // function materializes `this` into a cell where an arrow is created:
+      // one cell per block, as a later arrow may be reached without an earlier
+      // block's path (a `switch` whose cases each create an arrow: tsc-ts's
+      // build-info reader crashed on a cell never made), and `this` never
+      // changes within an activation, so cells of different blocks agree.
+      let cell = ctx.cellAccess.get(this.lexicalThisSym);
+      const inherited = cell !== undefined && !ctx.ownThisCells?.has(cell);
+      if (!inherited) {
+        cell = ctx.thisCellOfBody?.get(ctx.body);
+        if (cell === undefined) {
+          cell = this.newLocal(ctx, "reference", "thisCell");
+          const site = this.site++;
+          this.labels[site] = `thisCell@${ctx.name}`;
+          this.recordSite(site, "cell", this.inLoop(node) ? "many" : "once", true, node, true);
+          ctx.body.push({ kind: "AllocObject", dst: cell, typeId: 0, site, classId: this.cellClassId });
+          // lowerUnboundThis: a top-level arrow in SCRIPT mode inherits the global
+          // object as its lexical this (module top level / strict bodies: undefined).
+          const tv = ctx.thisLocal ?? this.lowerUnboundThis(ctx);
+          ctx.body.push({ kind: "StoreField", obj: cell, field: this.VALUE, src: tv });
+          (ctx.thisCellOfBody ??= new Map()).set(ctx.body, cell);
+          (ctx.ownThisCells ??= new Set()).add(cell);
+        }
+        ctx.cellAccess.set(this.lexicalThisSym, cell);
+      }
     }
     this.lowerFunctionLike(node, fnId, false, thisParam, classId); // lift body; reserve `this` as arg0 for accessors
     // When lowered method-like (classId set, e.g. an installed dynamic class

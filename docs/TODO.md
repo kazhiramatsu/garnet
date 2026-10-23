@@ -8677,3 +8677,22 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   unchanged; the knob stays off. A 16 MB nursery: -0.4% instructions, noise;
   `TSAOT_GC_FULL_THRESHOLD_BYTES` fixes the threshold (no pacing) and is not
   an initial-threshold knob: +44% instructions at 64 MB.
+- Slice S (exporter, a crash fixed): `tsc-ts --noEmit` (and `--noCheck`, any
+  run that reads the project's .tsbuildinfo, which the benchmark runs disable
+  with `--incremental false`) died with SIGSEGV at address 0x20 in a closure
+  trampoline of build-info.ts's reader. The lexical-this cell of an arrow
+  (`this.list(() => this.string())`) was made once per activation at the first
+  arrow's creation site and reused by every later arrow through `cellAccess`;
+  a `switch` whose cases each create an arrow reaches a later case without the
+  first's path, so the later arrow captured a cell never made (undefined,
+  `ts_ptr` 0). Now a method or function makes one lexical-this cell per block
+  (`thisCellOfBody`), reused by the block's later arrows; `this` never changes
+  within an activation, so the blocks' cells agree, and an arrow body's
+  inherited cell parameter is untouched. Fixture `closures/switch_this_cell`
+  (cases, a loop, a nested arrow, an escaping arrow, a plain function's
+  `this`; a benign parity placement difference recorded). Gates all green
+  (parity 384 identical / 161 known; selfconf 546, 500 pass; conformance 549
+  plain and strict, 546 protect; GC stress; bundler; unit). tsc-ts:
+  `--noEmit`, `--noEmit --checkers 1`, `--noCheck --noEmit`, `--noCheck
+  --outDir` all exit 0 (were 139); the emitting compile's outputs identical,
+  instructions +0.06% (noise).
