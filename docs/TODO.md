@@ -8277,3 +8277,23 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   track. The default build is unchanged (preprocessed runtime identical apart
   from blank lines); runtime tests pass; mode 3 programs match the plain
   build.
+- Workers by fork, design (`docs/fork_workers_design.md`): a prototype of
+  scriptc's model (every checker sharing the parsed and bound program) with
+  the operating system doing the sharing: the main process parses, binds and
+  publishes (the identity), then forks its checkers, which see its heap by
+  copy-on-write; tsc-ts's shared path then runs without isolates, a
+  transaction or store guards. Verified against tsc-ts: checkers take the
+  program by reference (the same address in a child), the schedule is a
+  SharedArrayBuffer created before spawning and driven by Atomics, results are
+  packed plain data (numbers, strings, arrays, two Int32Arrays), the checkers
+  write their own files, the main thread waits in its event loop. Runtime:
+  SharedArrayBuffer stores on MAP_SHARED memory, real Atomics, a
+  structured-clone codec for plain data that rejects anything else loudly,
+  fork with a pipe per worker, descriptor watches in the event loop, young
+  collections only in a child. Shims: live bindings in node_worker_threads,
+  sharesPublishedGraphs true, the worker entry registered by main.ts, no parse
+  threads (sharing runs one way: parsing stays serial, 0.36 s to subtract
+  against the projection's 0.14 s). Slices F1 (stores and Atomics), F2 (codec,
+  fork, watches, host primitives), F3 (shims, tsc-ts on forked checkers, the
+  measurements), F4 (parse children in a shared region, if F3 measures as
+  projected).
