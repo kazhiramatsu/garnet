@@ -2362,3 +2362,24 @@ try/finally の中／を跨ぐ多段 break/continue は未対応（loud-reject�
       dt: class name OK、globalThis REJECT。`run_conformance.sh exhaustive` は 187/187、unit は全 suite pass、`ci_par` は conf/basic/bench/perf PASS。
       ただしこの sandbox では `run_fetch_test.sh` のローカル POST echo server bind が `PermissionError: [Errno 1] Operation not permitted` で失敗し、
       `ci_par` 全体は fast gate の fetch 部分のみ FAIL（実装差分とは無関係の環境制約）。
+
+## Sealed and non-extensible arrays (session 352, slice AB)
+
+An element store or `push` that added an element to a sealed or non-extensible
+array (`Object.seal`, `Object.preventExtensions`) succeeded silently: the store
+paths tested only the frozen bit (`ts_obj_integrity & 1`). V8 throws
+`TypeError: Cannot add property N, object is not extensible` for a new element
+and accepts a write to an element the array already has (sealed elements stay
+writable; frozen ones do not).
+
+`ts_array_set` now tests every integrity bit. Frozen throws as before (a read
+only property for a present element, not extensible for a new one); sealed or
+non-extensible stores to a present element and throws for an index past the
+length or into a hole. The inline paths (`ts_array_set_inline`,
+`ts_array_push_inline`) take any integrity bit to the slow path, so the hot
+path's test is one compare against zero. Fixture `arrays/push_receivers`
+(frozen, sealed, non-extensible: push, store, add, far add, a hole, several
+arguments, the predicates, and the same through `any` and a bracket-named call).
+
+Still open: a method call on an Array subclass instance (`class Stack extends
+Array`; `s.push()` fails with "push is not a function").

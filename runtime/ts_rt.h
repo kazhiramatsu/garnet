@@ -2664,8 +2664,8 @@ static inline tsv ts_array_get_inline_f64(tsv arr, double d){
   if (TS_RT_LIKELY(ts_num_array_index(d, &i))) return ts_array_get_inline(arr, (int64_t)i);
   return ts_array_get_key_f64(arr, d);
 }
-/* Element store with the dense in-capacity case in line: a plain array (not
-   frozen) with i below cap stores the slot, extends the length past holes as
+/* Element store with the dense in-capacity case in line: a plain array (no
+   integrity bit: not frozen, sealed or non-extensible) with i below cap stores the slot, extends the length past holes as
    ts_array_set does, and remembers the array when it is old (the young-value
    test and the cards are out of line). Growth, sparse arrays, frozen arrays
    and other receivers (typed arrays among them) take ts_array_set. */
@@ -2673,7 +2673,7 @@ void ts_array_remember(ts_array* a, uint32_t index, tsv value);
 static inline void ts_array_set_inline(tsv arr, int64_t i, tsv v){
   if (ts_is_indexed_array_fast(arr)){
     ts_array* a = (ts_array*)ts_ptr(arr);
-    if (TS_RT_LIKELY((uint64_t)i < a->cap && !(ts_obj_integrity(&a->o) & 1u))){
+    if (TS_RT_LIKELY((uint64_t)i < a->cap && ts_obj_integrity(&a->o) == 0u)){
       uint32_t u = (uint32_t)i;
       a->data[u] = v;
       if (u >= a->len) a->len = u + 1u;
@@ -2692,7 +2692,7 @@ static inline void ts_array_push_inline(tsv arr, tsv v){
   if (ts_is_indexed_array_fast(arr)){
     ts_array* a = (ts_array*)ts_ptr(arr);
     uint32_t u = a->len;
-    if (TS_RT_LIKELY(u < a->cap && !(ts_obj_integrity(&a->o) & 1u))){
+    if (TS_RT_LIKELY(u < a->cap && ts_obj_integrity(&a->o) == 0u)){
       a->data[u] = v;
       a->len = u + 1u;
       if (a->o.h.gen == TS_GEN_OLD) ts_array_remember(a, u, v);

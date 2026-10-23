@@ -2391,11 +2391,23 @@ static void ts_array_set_grow(ts_array* a, uint32_t i, tsv v);
 void ts_array_set(tsv arr, uint32_t i, tsv v){
   if (!ts_is_indexed_array_fast(arr)){ if (ts_is_typed_array(arr)) ts_ta_set(arr, i, v); return; }
   ts_array* a = ts_ptr(arr);
-  if (ts_obj_integrity(&a->o) & 1u){   /* strict: a frozen array's element writes / push throw */
+  uint32_t integ = ts_obj_integrity(&a->o);
+  if (TS_RT_UNLIKELY(integ)){
+    /* strict: a frozen array's element writes throw; a sealed or
+       non-extensible array (Object.seal, Object.preventExtensions) takes a
+       write to an element it has but no new element (past the length, or
+       into a hole), as V8 does */
     char buf[96];
-    if (i < a->len) snprintf(buf, sizeof(buf), "Cannot assign to read only property '%u' of object '[object Array]'", i);
-    else snprintf(buf, sizeof(buf), "Cannot add property %u, object is not extensible", i);
-    ts_throw_type_error_msg(buf); return;
+    int present = i < a->len && (i < a->cap ? !array_is_hole(a->data[i]) : ts_array_has_index(arr, i));
+    if (integ & 1u){
+      if (present) snprintf(buf, sizeof(buf), "Cannot assign to read only property '%u' of object '[object Array]'", i);
+      else snprintf(buf, sizeof(buf), "Cannot add property %u, object is not extensible", i);
+      ts_throw_type_error_msg(buf); return;
+    }
+    if (!present){
+      snprintf(buf, sizeof(buf), "Cannot add property %u, object is not extensible", i);
+      ts_throw_type_error_msg(buf); return;
+    }
   }
   if (__builtin_expect(i < a->cap, 1)){
     /* [len, cap) holds holes, so a store past len needs no fill. */

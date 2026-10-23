@@ -8863,3 +8863,15 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   push or element store that adds to a sealed or non-extensible array succeeds
   (V8 throws TypeError), and a method call on an Array subclass instance
   (`class Stack extends Array`) fails with "push is not a function".
+- Slice AB (runtime, correctness; `docs/conformance_fixes.md`, "Sealed and
+  non-extensible arrays"): an element store or push that added to a sealed or
+  non-extensible array (Object.seal, Object.preventExtensions) succeeded
+  silently; only the frozen bit was tested. ts_array_set now tests every
+  integrity bit: frozen throws as before, and a sealed or non-extensible array
+  takes a write to an element it has but throws V8's "Cannot add property N,
+  object is not extensible" for an index past the length or into a hole. The
+  inline store paths (`ts_array_set_inline`, `ts_array_push_inline`) take any
+  integrity bit to the slow path, so the hot path's test is one compare
+  against zero as before. Fixture `arrays/push_receivers`. Still open: a
+  method call on an Array subclass instance (`class Stack extends Array`;
+  `s.push()` fails with "push is not a function").
