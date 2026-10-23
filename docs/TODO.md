@@ -8726,3 +8726,19 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   this slice. Measured and not adopted: `TSAOT_INLINE_HINT=2` (the hint also
   for bodies of at most forty instructions with calls, 11,928 functions, +600
   KB): -0.24% instructions, cycles unchanged.
+- Slice U (runtime): the UTF-8 copy of a string for output takes contiguous
+  storage directly (an ASCII one-byte string a copy, a one-byte string a byte
+  loop, a two-byte string a unit loop; the printer's multi-megabyte output
+  went through the per-unit view accessor, 1.7% of the emit phase), and the
+  marker finds a sized instance's registered layout through a table indexed by
+  the instance's class word (`class_reg_for_sized`: a word names one class,
+  one prototype, one layout; word 0, a relinked instance and a prototype keep
+  the hash probe; the table is dropped when a class or the class index table
+  is registered), where it probed the registry's hash for every sized object
+  it visited (1.2 M probes a compile, 3.4% of the bind window). Also added,
+  inert until slice V: `ts_str_switch_hash`. Gates all green in 14 minutes
+  (parity 384 identical / 161 known; selfconf 546; conformance 549 plain and
+  strict, 546 protect; GC stress; bundler; unit; runtime tests, which caught a
+  null layout and the shared word 0 of unindexed classes). tsc-ts one checker,
+  outputs identical, four pairs: 25.73 -> 25.49 G instructions (-0.9%), cycles
+  -0.7%, wall 1.35 -> 1.34 s on a quiet machine.

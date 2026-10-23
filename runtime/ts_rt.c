@@ -1812,6 +1812,7 @@ static uint32_t g_class_index_n = 0;
 /* class index word (index + 1) -> class id, for a relinked instance's layout */
 static uint32_t* g_class_of_word = NULL;
 static uint32_t g_class_of_word_n = 0;
+static void class_reg_by_word_reset(void);
 void ts_register_class_indices(const uint32_t* tab, uint32_t n){
   g_class_index_tab = tab; g_class_index_n = n;
   uint32_t top = 0;
@@ -1820,6 +1821,7 @@ void ts_register_class_indices(const uint32_t* tab, uint32_t n){
   g_class_of_word = (uint32_t*)calloc((size_t)top + 1u, sizeof(uint32_t));
   g_class_of_word_n = top + 1u;
   for (uint32_t c = 0; c < n; c++) if (tab[c]) g_class_of_word[tab[c]] = c + 1u;
+  class_reg_by_word_reset();
 }
 tsv ts_set_proto_user(tsv obj, tsv proto){
   /* A sized instance relinked leaves its class's interval; a class's
@@ -4034,6 +4036,9 @@ static uint32_t strhash_view(ts_strview v){
   }
   return h;
 }
+/* A switch on string literals (the emitter's hash dispatch): the string's
+   hash, or `none` (a value no case has) for anything that is not a string. */
+uint32_t ts_str_switch_hash(tsv v, uint32_t none);
 static uint32_t ts_str_hash_of(tsv s){
   if (ts_is_short_str(s)) return strhash_view(ts_str_view_typed(s));
   ts_string* x = ts_str_ptr_typed(s);
@@ -4050,6 +4055,10 @@ static uint32_t ts_str_hash_of(tsv s){
     x->flags |= TS_STR_FLAG_HASHED;
   }
   return h;
+}
+uint32_t ts_str_switch_hash(tsv v, uint32_t none){
+  if (!ts_is_str(v)) return none;
+  return ts_str_hash_of(v);
 }
 /* The storage flags of a fresh string: UTF16 as allocated, ASCII when every
    unit is below 0x80. Not HASHED: the hash is computed by ts_str_hash_of when
@@ -4427,6 +4436,44 @@ static char* ts_str_utf8_copy_view_impl(ts_strview x, uint32_t* out_len, int rep
   size_t n = replace_lone_surrogates ? ts_str_utf8_len_view(x) : ts_str_key_bytes_len_view(x);
   char* out = (char*)malloc(n + 1);
   size_t o = 0;
+  /* Contiguous storage without the per-unit view accessor: an ASCII one-byte
+     string is a copy, a one-byte string a byte loop, a two-byte string a unit
+     loop (the printer's output is one text of a few MB; its UTF-8 copy ran
+     a unit at a time through the accessor, 1.7% of the emit phase). */
+  if (x.data && !(x.flags & TS_STR_FLAG_UTF16)){
+    const unsigned char* b = (const unsigned char*)x.data;
+    if (x.flags & TS_STR_FLAG_ASCII){
+      memcpy(out, b, x.len); o = x.len;
+    } else {
+      for (uint32_t i = 0; i < x.len; i++){
+        uint32_t cp = b[i];
+        if (cp < 0x80u) out[o++] = (char)cp;
+        else { out[o++] = (char)(0xC0u | (cp >> 6)); out[o++] = (char)(0x80u | (cp & 0x3Fu)); }
+      }
+    }
+    out[o] = 0;
+    if (out_len) *out_len = (uint32_t)o;
+    return out;
+  }
+  if (x.data){
+    const char* d = x.data;
+    for (uint32_t i = 0; i < x.len; i++){
+      uint16_t u; memcpy(&u, d + (size_t)i * 2u, 2);
+      uint32_t cp = u;
+      if (cp >= 0xD800u && cp <= 0xDBFFu && i + 1 < x.len){
+        uint16_t lo; memcpy(&lo, d + (size_t)(i + 1) * 2u, 2);
+        if (lo >= 0xDC00u && lo <= 0xDFFFu){ cp = 0x10000u + (((cp - 0xD800u) << 10) | (lo - 0xDC00u)); i++; }
+      }
+      if (replace_lone_surrogates && ts_is_surrogate_code_unit(cp)) cp = 0xFFFDu;
+      if (cp < 0x80u) out[o++] = (char)cp;
+      else if (cp < 0x800u){ out[o++] = (char)(0xC0u | (cp >> 6)); out[o++] = (char)(0x80u | (cp & 0x3Fu)); }
+      else if (cp < 0x10000u){ out[o++] = (char)(0xE0u | (cp >> 12)); out[o++] = (char)(0x80u | ((cp >> 6) & 0x3Fu)); out[o++] = (char)(0x80u | (cp & 0x3Fu)); }
+      else { out[o++] = (char)(0xF0u | (cp >> 18)); out[o++] = (char)(0x80u | ((cp >> 12) & 0x3Fu)); out[o++] = (char)(0x80u | ((cp >> 6) & 0x3Fu)); out[o++] = (char)(0x80u | (cp & 0x3Fu)); }
+    }
+    out[o] = 0;
+    if (out_len) *out_len = (uint32_t)o;
+    return out;
+  }
   for(uint32_t i=0;i<x.len;i++){
     uint32_t cp = ts_str_cu_at_view(x, i);
     if (cp >= 0xD800u && cp <= 0xDBFFu && i+1<x.len){
@@ -10017,6 +10064,7 @@ static tsv enum_resolve_value(tsv receiver, tsv stored){
    fields (which are NOT in the prop map). */
 typedef struct ts_class_reg ts_class_reg;
 static ts_class_reg* class_reg_for(ts_object* o);
+static void class_reg_by_word_reset(void);
 static int class_reg_nfields(ts_class_reg* r);
 static uint32_t class_reg_field_key(ts_class_reg* r, int i);
 /* read field i's value from instance o as a boxed tsv (numeric -> ts_num). */
@@ -10801,6 +10849,7 @@ void ts_register_class(tsv proto, ts_class_field* fields, int nfields){
   class_reg_index_put((uint32_t)g_class_reg_len);
   g_class_reg_len++;
   g_has_class_regs = 1;
+  class_reg_by_word_reset();
   struct_methods_collect(proto);
 }
 
@@ -11207,13 +11256,46 @@ static tsv class_reg_field_value(ts_class_reg* r, ts_object* o, int i){
   tsv fv; memcpy(&fv, base+r->fields[i].offset, sizeof(tsv));
   return fv;
 }
+/* The registered layout of a sized instance's class, by the instance's class
+   word: a word names one class, one prototype, one layout, so the registry's
+   hash probe runs once per class and marking, which asks for every sized
+   object it visits (1.2 M times a compile), reads a table. The table is
+   dropped when a class is registered (the registry may move) or the class
+   index table changes; a relinked instance keeps the probe (its layout is its
+   allocation class's). The instance's size is still tested per object. */
+static ts_class_reg** g_class_reg_by_word = NULL;
+static uint32_t g_class_reg_by_word_n = 0;
+#define CLASS_REG_NONE ((ts_class_reg*)1)
+static void class_reg_by_word_reset(void){
+  free(g_class_reg_by_word); g_class_reg_by_word = NULL; g_class_reg_by_word_n = 0;
+}
+static ts_class_reg* class_reg_for_sized(ts_object* o){
+  uint32_t w = o->cls;
+  /* only an indexed class word names one class: word 0 (a class without an
+     index entry, the tests' instances), a relinked instance and a prototype
+     keep the probe */
+  if (TS_RT_UNLIKELY(w == 0 || (w & TS_CLS_RELINKED) || w >= g_class_of_word_n)) return class_reg_for(o);
+  if (TS_RT_UNLIKELY(!g_class_reg_by_word)){
+    g_class_reg_by_word = (ts_class_reg**)calloc(g_class_of_word_n, sizeof(*g_class_reg_by_word));
+    if (!g_class_reg_by_word) return class_reg_for(o);
+    g_class_reg_by_word_n = g_class_of_word_n;
+  }
+  ts_class_reg* r = g_class_reg_by_word[w];
+  if (!r){
+    r = class_reg_for_proto(layout_proto_of(o));
+    g_class_reg_by_word[w] = r ? r : CLASS_REG_NONE;
+    if (!r) return NULL;
+  }
+  if (r == CLASS_REG_NONE) return NULL;
+  return ts_obj_sized_bytes(o) >= r->min_size ? r : NULL;
+}
 static void gc_mark_class_fields(ts_object* o, int young, int depth, int stable){
   /* Struct fields exist only in sized instances (a registered layout after
      the header); a plain object, even one whose prototype has a registered
      layout, has none. Skipping the registry probe for the unsized majority
      removed 11.6M hash lookups from a compile's collections (Session 350). */
   if (!ts_obj_is_sized(o)) return;
-  ts_class_reg* reg = class_reg_for(o);
+  ts_class_reg* reg = class_reg_for_sized(o);
   if (!reg) return;
   char* base = (char*)o;
   for (int i=0;i<reg->nfields;i++){

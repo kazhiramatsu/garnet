@@ -897,6 +897,7 @@ static inline int ts_str_view(tsv s, ts_strview* out){
 static inline const char* ts_str_data_typed(tsv s){
   return ts_is_heap_str(s) ? ts_str_view_typed(s).data : NULL;
 }
+uint32_t ts_str_switch_hash(tsv v, uint32_t none);
 static inline uint32_t ts_str_hash_typed(tsv s){
   return ts_is_short_str(s) ? 0 : ts_str_view_typed(s).hash;
 }
