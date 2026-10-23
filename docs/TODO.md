@@ -8384,5 +8384,36 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   generated C and the runtime header, outputs identical): the receivers'
   object test is 3.7% of the instructions, the class interval test 0.4%, NaN
   canonicalization 0.4%, the frame-slot reloads after calls 0.3%, the
-  collector 2.6% (a 1 GB nursery and a 4 GB full threshold); the hole check,
-  the barrier and the frame push/pop cannot be removed without crashing.
+  collector 2.6% with the nursery and the full threshold raised (69 of the 98
+  minor collections still ran; 5.5% with every trigger off, measured later in
+  the session); the hole check, the barrier and the frame push/pop cannot be
+  removed without crashing.
+- Toward scriptc, slice S: strings, and a profiler that tells the truth. The
+  profile of one tsc-ts compile was wrong twice before it was right: `sample`
+  truncates the checker's deep recursion (95% of its leaves were mid-stack
+  return addresses) and an interval timer's SIGPROF lands where the thread
+  leaves the kernel (70% of its samples in `bzero`/`memmove`, touching fresh
+  heap pages; two measurement builds, per-cell zeroing and a prefetch of the
+  next free run, moved nothing). `TSAOT_PROF_PC=<file>` (runtime,
+  `prof_pc_init`) is a sampler thread that suspends the main thread every
+  `TSAOT_PROF_PC_US` microseconds and records PC, link register and the
+  frame's saved return address; `scripts/prof_pc.py` prints the shares by
+  symbol, by generated-C line and by machine-instruction class
+  (`docs/agent_workflow.md`, 'Profiling a native build'). The corrected
+  profile (`docs/single_thread_vs_scriptc.md`, 'The profile, corrected'):
+  generated code 57%, runtime 37%, system libraries 6%; maps 10%, the
+  collector 9.5%, strings 7%; in the generated code a third is the shape of a
+  call (stack traffic, prologues), 7% boxing moves. Ceilings with the
+  collector fully off: the collector is 5.5% of the instructions; frame slots
+  turned into plain locals save 4.0% (most stack traffic is the C compiler's
+  own spilling); `-O3` nothing; `-mllvm -inline-threshold=600` 1.8%. The
+  strings slice: a fresh string is no longer hashed when built
+  (`strflags_storage` without HASHED; `ts_str_hash_of` computes and caches on
+  first demand; `strhash_units` gone), the ASCII scan and the UTF-8 length
+  walks (`ts_str_utf8_len_view_impl`, the host's `Buffer.byteLength`) read the
+  storage directly, eight bytes at a time for one-byte strings. tsc-ts one
+  thread 32.55 -> 31.77 G instructions (0.976), cycles 0.965, wall 1.69 ->
+  1.66 s in five interleaved pairs. Gates: parity (380 identical), selfconf,
+  unit, bundler 43/43, conformance 539/539 plain and strict, 536/536 under
+  protect mode, GC stress. Also `docs/map_entries_design.md`: the next slice,
+  the key and its value of a Map entry in one line.

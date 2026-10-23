@@ -259,6 +259,46 @@ When an exporter/analyzer change produces a new IR/optimization pattern, **the f
   like with like in an A/B: a units build (ThinLTO) is 1-4% faster than a one-file build of the
   same source.
 
+### Profiling a native build (where the time goes)
+
+Two tools that look right are wrong on garnet's binaries, and one works:
+
+- **`sample`** (macOS) walks the stack by frame pointers and truncates the
+  checker's deep recursion: 95% of its "leaves" were mid-stack return
+  addresses (`mov x3, x0` after a `bl`), so a `sample` profile of tsc-ts
+  attributes everything to call sites.
+- **An interval timer (`setitimer(ITIMER_PROF)` + SIGPROF)** delivers the
+  signal when the thread next leaves the kernel, so it lands on code that
+  takes page faults and system calls: a first look put 70% of tsc-ts in
+  `bzero`/`memmove` (fresh heap pages being touched), which two variant
+  builds then disproved (inline per-cell zeroing, prefetching the next free
+  run: wall unchanged).
+- **`TSAOT_PROF_PC=<file>`** (runtime/ts_rt.c, `prof_pc_init`): a sampler
+  thread suspends the main thread every `TSAOT_PROF_PC_US` microseconds
+  (default 100), records its PC, link register and the frame's saved return
+  address, and writes a histogram at exit. Wall-clock sampling from another
+  thread has neither bias. `scripts/prof_pc.py <file> <binary> <units dir>`
+  prints the shares by symbol, by generated-C line (with the line's text)
+  and by machine-instruction class (frame-slot loads and stores, prologue,
+  boxing moves, field loads after an untag, ...), and names system-library
+  functions with their nearest caller in the program. The binary needs line
+  tables that survive the link: build the units with `TSAOT_UNITS_LTO=0` and
+  `TSAOT_NATIVE_CC='cc -O2 -gline-tables-only -fno-omit-frame-pointer'`
+  (ThinLTO's line tables stay in temporary objects atos cannot find). The
+  no-LTO build runs about 2% more instructions than the LTO build; the
+  shares are what to read. Example (tsc-ts, one thread, the TypeScript
+  compiler project, Session 352): generated code 57%, runtime 37%, system
+  libraries 6%; in the generated code, stack loads and stores (frame slots
+  and the C compiler's spills) 20%, prologues and epilogues 14%, boxing
+  moves 7%.
+- A **measurement variant** settles what a profile only suggests: build the
+  binary with one mechanism removed (a header copy with a function stubbed,
+  a regex over the generated C, an env knob) and compare instructions and
+  wall with outputs identical; an unsound variant (the GC switched off by a
+  1 GB nursery and a 4 GB full threshold, a check dropped) is fine for a
+  ceiling, never for a commit. `scripts/lib/units.sh`'s cache makes a
+  variant a relink when only the header or the runtime changed.
+
 ## 8. 30-second summary (the shortest single-bug fix)
 
 1. Read the tail of `docs/TODO.md`.

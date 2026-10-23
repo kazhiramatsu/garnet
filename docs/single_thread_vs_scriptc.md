@@ -144,6 +144,83 @@ check elsewhere.
   the core count), so one-thread measurements pass `--singleThreaded` or
   `--checkers 1`.
 
+## The profile, corrected
+
+The sampling profiles above (`sample`, 1 ms) are wrong about the generated
+code: `sample` walks frame pointers and truncates the checker's deep
+recursion, so 95% of its leaves were mid-stack return addresses, and the
+category shares came from the few stacks it walked to the end. A second
+attempt, an interval timer (`ITIMER_PROF`) in the runtime, was wrong the
+other way: its signal is delivered when the thread leaves the kernel, so
+70% of its samples sat in `bzero` and `memmove` (fresh heap pages being
+touched, page fault by page fault), which two measurement builds then
+disproved (per-cell inline zeroing instead of the run `memset`, and the
+next free run prefetched: wall unchanged). The profiler that works is a
+sampler thread (`TSAOT_PROF_PC`, `scripts/prof_pc.py`,
+`docs/agent_workflow.md`): wall-clock sampling of the main thread from
+outside, PC, link register and the frame's saved return address, 13.5k
+samples of one compile (Session 352, after slices A and F):
+
+| | share |
+|---|---|
+| generated code | 57.3% |
+| runtime (`ts_rt.c`, `host.c`) | 36.9% |
+| system libraries (`bzero`, `memmove`, `open`, ...) | 5.6% |
+
+The runtime's share by function: `ts_map_get` 5.6% + `mapset_probe` 2.4% +
+`map_find` 1.1% + `map_set_unchecked` 0.4% + `ts_str_hash_of` 0.5% (the
+checker's caches: 9.4 M lookups a compile, three dependent loads each on a
+large map: index word, key, value); the collector 9.5% (`gc_mark_visit`
+3.6%, `gc_scan_cell` 1.3%, `gc_space_refill` 1.8%, `gc_alloc` 1.2%,
+`gc_alloc_pretenured` 0.6%, `array_write_barrier` 0.6%,
+`ts_new_sized_site` 0.5%: 98 minor and 3 full collections, 165 ms of
+pauses, 7.4 M cells and 740 MB allocated); strings 7% (`strhash_units`
+1.8%: every fresh string was hashed when built; `host_utf8_length` 1.3% +
+`ts_str_utf8_len_view_impl` 0.4%: `Buffer.byteLength` over texts stored as
+UTF-16, one unit at a time through the view accessor; `td_m_decode` 1.0%;
+`ts_str_charcodeat_general` 0.8%; `ts_string_slice_view` 0.5%;
+`ts_array_join` 0.6%); arrays 1% (`ts_array_set`, `ts_array_push`).
+
+The generated code's share by machine-instruction class (the sampled
+instruction, classified by its text and its predecessor):
+
+| class | share of the generated code's samples |
+|---|---|
+| loads from the stack (frame slots `F.sN`, the C compiler's spills) | 11.9% |
+| stores to the stack | 7.8% |
+| prologue and epilogue: callee-saved register pairs | 11.2% |
+| prologue and epilogue: the stack pointer | 1.7% |
+| loads of globals and runtime structures | 13.1% |
+| field and element loads after an untag | 8.5% |
+| integer arithmetic and moves | 10.1% |
+| compares and selects | 7.7% |
+| `fmov` (a number boxed or unboxed) | 6.6% |
+| branches | 5.3% |
+| tag constants materialized | 3.7% |
+| number conversions (`fjcvtzs`, `scvtf`) | 2% |
+
+So a third of the generated code's time is the shape of a call: the frame
+struct's slots written before and read after calls and as arguments
+(`fn(F.s0, F.s2, F.s1, d3)`), the frame linked and unlinked, the slots
+filled with undefined at entry, the register pairs saved and restored
+around functions with two hundred locals; another tenth is numbers moved
+between the integer and the floating-point files (a `kind` stored as a
+double, converted to an int32 at every switch).
+
+Measured ceilings (unsound variant builds, outputs identical, the
+TypeScript compiler project): the receivers' object test is 3.7% of the
+instructions, the class interval test 0.4%, NaN canonicalization 0.4%, the
+frame-slot reloads after calls 0.3%; the collector 5.5% of the
+instructions (every trigger off: a 1 GB nursery, a count threshold and a
+payload budget past the compile, a 4 GB full threshold; a nursery setting
+alone leaves 69 of the 98 minor collections running) and about 9% of the
+time; with the collector off, the frame slots turned into plain locals in
+every function without a try (`F.sN` to `F_sN`: no spills before calls,
+no reloads after, no slot arguments) save 4.0% of the instructions, so
+most of the stack traffic in the table is the C compiler's own spilling of
+two-hundred-local functions. The nursery's size (4, 16, 64 MB) changes
+neither instructions nor wall.
+
 ## What to do
 
 The lever is the instruction count of the emitted code and of the

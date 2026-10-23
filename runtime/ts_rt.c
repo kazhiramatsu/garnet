@@ -91,7 +91,101 @@ static inline void gc_note_payload(size_t bytes){ g_payload_fresh_bytes += bytes
    every payload mark before marking. Pointers outside the cage (a stack
    closure's borrowed environment) are not payloads and are ignored. */
 #include <sys/mman.h>
-static size_t sab_mapped_bytes(uint32_t n);   /* a SharedArrayBuffer's pages (typed arrays) */
+static size_t sab_mapped_bytes(uint32_t n);
+/* A program-counter sampling profiler (TSAOT_PROF_PC=path): a sampler
+   thread suspends the main thread every TSAOT_PROF_PC_US microseconds
+   (default 100), reads its PC, link register and frame pointer, and resumes
+   it; the exit hook writes `slide <hex>`, `samples <n>` and one line per
+   distinct (pc, lr, saved return address) triple: `pc count image symbol+off
+   lr lr2` (file addresses: subtract the slide; scripts/prof_pc.py). Sampling
+   from another thread is on wall time and does not depend on the main
+   thread entering the kernel: an interval timer's SIGPROF is delivered at
+   kernel exits, so it lands on code that takes page faults and system calls
+   (first touches of fresh heap pages took 70% of such a profile of tsc-ts);
+   `sample` truncates the deep recursion of a checker at a few frames. Off
+   unless the variable is set: no cost. */
+#include <mach/mach.h>
+#include <mach-o/dyld.h>
+#include <dlfcn.h>
+#include <pthread.h>
+typedef struct { uint64_t pc, lr, lr2; } prof_sample;
+static prof_sample* g_prof_pcs;
+static volatile size_t g_prof_n;
+static size_t g_prof_cap;
+static uint64_t g_prof_stack_lo, g_prof_stack_hi;   /* the main thread's stack, for the frame read */
+static mach_port_t g_prof_target;
+static pthread_t g_prof_sampler;
+static volatile int g_prof_stop;
+static long g_prof_period_us = 100;
+static void* prof_pc_sampler(void* arg){
+  (void)arg;
+  while (!g_prof_stop){
+    usleep((useconds_t)g_prof_period_us);
+    size_t n = g_prof_n;
+    if (n >= g_prof_cap) break;
+    if (thread_suspend(g_prof_target) != KERN_SUCCESS) continue;
+    arm_thread_state64_t st; mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+    if (thread_get_state(g_prof_target, ARM_THREAD_STATE64, (thread_state_t)&st, &cnt) == KERN_SUCCESS){
+      uint64_t fp = (uint64_t)arm_thread_state64_get_fp(st);
+      g_prof_pcs[n].pc = (uint64_t)arm_thread_state64_get_pc(st);
+      g_prof_pcs[n].lr = (uint64_t)arm_thread_state64_get_lr(st);
+      /* the return address saved in the current frame: the caller of a
+         function that set up a frame (a frameless leaf's fp is its caller's) */
+      g_prof_pcs[n].lr2 = (fp >= g_prof_stack_lo && fp + 16 <= g_prof_stack_hi) ? *(uint64_t*)(uintptr_t)(fp + 8) : 0;
+      g_prof_n = n + 1;
+    }
+    thread_resume(g_prof_target);
+  }
+  return NULL;
+}
+static int prof_pc_cmp(const void* a, const void* b){
+  const prof_sample* x = (const prof_sample*)a; const prof_sample* y = (const prof_sample*)b;
+  if (x->pc != y->pc) return x->pc < y->pc ? -1 : 1;
+  if (x->lr != y->lr) return x->lr < y->lr ? -1 : 1;
+  return x->lr2 < y->lr2 ? -1 : x->lr2 > y->lr2;
+}
+static void prof_pc_dump(void){
+  const char* path = getenv("TSAOT_PROF_PC");
+  if (!path || !g_prof_pcs) return;
+  g_prof_stop = 1;
+  pthread_join(g_prof_sampler, NULL);
+  FILE* f = fopen(path, "w");
+  if (!f) return;
+  size_t n = g_prof_n;
+  qsort(g_prof_pcs, n, sizeof(prof_sample), prof_pc_cmp);
+  fprintf(f, "slide %lx\nsamples %zu\n", (long)_dyld_get_image_vmaddr_slide(0), n);
+  for (size_t i = 0; i < n;){
+    size_t j = i;
+    while (j < n && g_prof_pcs[j].pc == g_prof_pcs[i].pc && g_prof_pcs[j].lr == g_prof_pcs[i].lr && g_prof_pcs[j].lr2 == g_prof_pcs[i].lr2) j++;
+    /* addresses outside this image (the shared cache's libraries) are named
+       by dladdr: image basename, symbol and offset */
+    Dl_info di; const char* img = ""; const char* sym = ""; unsigned long off = 0;
+    if (dladdr((const void*)(uintptr_t)g_prof_pcs[i].pc, &di) && di.dli_fname){
+      img = strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1 : di.dli_fname;
+      if (di.dli_sname){ sym = di.dli_sname; off = (unsigned long)(g_prof_pcs[i].pc - (uint64_t)(uintptr_t)di.dli_saddr); }
+    }
+    fprintf(f, "%llx %zu %s %s+%lu %llx %llx\n", (unsigned long long)g_prof_pcs[i].pc, j - i, img, sym, off,
+            (unsigned long long)g_prof_pcs[i].lr, (unsigned long long)g_prof_pcs[i].lr2);
+    i = j;
+  }
+  fclose(f);
+}
+static void prof_pc_init(void){
+  const char* path = getenv("TSAOT_PROF_PC");
+  if (!path || !path[0]) return;
+  g_prof_cap = (size_t)8u << 20;
+  g_prof_pcs = (prof_sample*)malloc(g_prof_cap * sizeof(prof_sample));
+  if (!g_prof_pcs) return;
+  const char* us = getenv("TSAOT_PROF_PC_US");
+  if (us && us[0]){ long v = atol(us); if (v >= 20) g_prof_period_us = v; }
+  pthread_t self = pthread_self();
+  g_prof_stack_hi = (uint64_t)(uintptr_t)pthread_get_stackaddr_np(self);
+  g_prof_stack_lo = g_prof_stack_hi - (uint64_t)pthread_get_stacksize_np(self);
+  g_prof_target = pthread_mach_thread_np(self);
+  if (pthread_create(&g_prof_sampler, NULL, prof_pc_sampler, NULL) != 0){ free(g_prof_pcs); g_prof_pcs = NULL; return; }
+  atexit(prof_pc_dump);
+}
+   /* a SharedArrayBuffer's pages (typed arrays) */
 #if defined(TS_ASAN_ENABLED)
 extern void __asan_poison_memory_region(const void *addr, size_t size);
 #define GC_PAYLOAD_POISON(p, n)   __asan_poison_memory_region((p), (n))
@@ -1044,6 +1138,7 @@ static int g_gc_config_inited = 0;
 static void gc_config_init(void){
   if (g_gc_config_inited) return;
   g_gc_config_inited = 1;
+  prof_pc_init();
   const char* young = getenv("TSAOT_GC_YOUNG_THRESHOLD");
   if (young && young[0]){
     char* end = NULL;
@@ -3725,16 +3820,6 @@ long long ts_str_split_join_metric3(tsv s, tsv sep, tsv join_sep,
   return (long long)count + joined_len + (long long)part_len;
 }
 
-static uint32_t strhash_units(const char* data, uint32_t flags, uint32_t n){
-  uint32_t h=2166136261u;
-  ts_strview v = { data, n, 0, flags };
-  for(uint32_t i=0;i<n;i++){
-    uint16_t cu = ts_str_cu_at_view(v, i);
-    h ^= (uint8_t)(cu & 0xffu); h *= 16777619u;
-    h ^= (uint8_t)(cu >> 8); h *= 16777619u;
-  }
-  return h;
-}
 static uint32_t strhash_view(ts_strview v){
   uint32_t h=2166136261u;
   /* A flat one-byte string: the generic loop's two FNV-1a steps per code unit
@@ -3770,13 +3855,22 @@ static uint32_t ts_str_hash_of(tsv s){
   }
   return h;
 }
+/* The storage flags of a fresh string: UTF16 as allocated, ASCII when every
+   unit is below 0x80. Not HASHED: the hash is computed by ts_str_hash_of when
+   a map, an intern or an equality first asks for it, and cached then (most
+   fresh strings, a decoded source text or a slice printed once, are never
+   hashed; the eager hash of every fresh string was 1.8% of a compile). */
 static uint32_t strflags_storage(const char* data, uint32_t flags, uint32_t n){
-  uint32_t f = TS_STR_FLAG_HASHED | (flags & TS_STR_FLAG_UTF16);
-  ts_strview v = { data, n, 0, f };
-  int ascii = 1;
-  for(uint32_t i=0;i<n;i++) if(ts_str_cu_at_view(v, i) >= 0x80u){ ascii = 0; break; }
-  if (ascii) f |= TS_STR_FLAG_ASCII;
-  return f;
+  uint32_t f = flags & TS_STR_FLAG_UTF16;
+  if (!(flags & TS_STR_FLAG_UTF16)){
+    const unsigned char* b = (const unsigned char*)data;
+    uint32_t i = 0;
+    for (; i + 8u <= n; i += 8u){ uint64_t w; memcpy(&w, b + i, 8); if (w & 0x8080808080808080ull) return f; }
+    for (; i < n; i++) if (b[i] >= 0x80u) return f;
+    return f | TS_STR_FLAG_ASCII;
+  }
+  for (uint32_t i = 0; i < n; i++){ uint16_t cu; memcpy(&cu, data + (size_t)i * 2u, 2); if (cu >= 0x80u) return f; }
+  return f | TS_STR_FLAG_ASCII;
 }
 static ts_string* ts_string_alloc_storage(uint32_t len, uint32_t flags){
   flags &= TS_STR_FLAG_UTF16;
@@ -3945,7 +4039,6 @@ tsv ts_new_string(const char* s, uint32_t len){
     }
   }
   str->flags = strflags_storage(str->data, flags, units);
-  str->hash = strhash_units(str->data, str->flags, units);
   return ts_str_v(str);
 }
 /* Build a string from bytes the caller already knows are pure ASCII (every byte
@@ -3977,7 +4070,6 @@ static tsv ts_new_string_from_code_units(const uint16_t* units, uint32_t len){
   ts_string* str = ts_string_alloc_storage(len, flags);
   for(uint32_t i=0;i<len;i++) ts_str_cu_set(str->data, flags, i, units[i]);
   str->flags = strflags_storage(str->data, flags, len);
-  str->hash = strhash_units(str->data, str->flags, len);
   return ts_str_v(str);
 }
 uint32_t* ts_string_codepoints_copy(tsv v, uint32_t* out_len){
@@ -4062,7 +4154,6 @@ static tsv ts_string_slice_copy(tsv src, uint32_t start, uint32_t len){
   out->len = len;
   ts_str_copy_units(out->data, flags, 0, x, start, len);
   out->flags = strflags_storage(out->data, flags, len);
-  out->hash = strhash_units(out->data, out->flags, len);
   out->parent = TS_UNDEFINED;
   out->offset = 0;
   ts_gc_unroot(1);
@@ -4104,6 +4195,15 @@ static inline int ts_is_surrogate_code_unit(uint32_t cp){
 }
 static size_t ts_str_utf8_len_view_impl(ts_strview x, int replace_lone_surrogates){
   size_t n = 0;
+  if (x.flags & TS_STR_FLAG_ASCII) return x.len;
+  if (x.data && !(x.flags & TS_STR_FLAG_UTF16)){
+    /* one-byte storage: one byte per unit and one more for each unit past 0x7F */
+    const unsigned char* b = (const unsigned char*)x.data;
+    uint32_t i = 0; size_t high = 0;
+    for (; i + 8u <= x.len; i += 8u){ uint64_t w; memcpy(&w, b + i, 8); high += (size_t)__builtin_popcountll(w & 0x8080808080808080ull); }
+    for (; i < x.len; i++) high += b[i] >> 7;
+    return (size_t)x.len + high;
+  }
   for(uint32_t i=0;i<x.len;i++){
     uint32_t cp = ts_str_cu_at_view(x, i);
     if (cp >= 0xD800u && cp <= 0xDBFFu && i+1<x.len){
@@ -6499,7 +6599,7 @@ tsv ts_str_repeat(tsv s, double count){
   ts_string* y=ts_string_alloc_storage(total, flags);
   xs=ts_str_view_typed(s);
   y->len=total; for(long k=0;k<c;k++) ts_str_copy_units(y->data, flags, (uint32_t)k*xs.len, xs, 0, xs.len);
-  y->flags=strflags_storage(y->data, flags, total); y->hash=strhash_units(y->data,y->flags,total);
+  y->flags=strflags_storage(y->data, flags, total);
   y->parent=TS_UNDEFINED; y->offset=0;
   tsv r = ts_str_v(y);
   ts_gc_unroot(1);
@@ -9271,7 +9371,7 @@ tsv ts_str_padstart(tsv s, double target, tsv pad){
     ts_str_cu_set(y->data, flags, i, cu);
   }
   ts_str_copy_units(y->data, flags, need, xs, 0, xs.len);
-  y->flags=strflags_storage(y->data,flags,(uint32_t)t); y->hash=strhash_units(y->data,y->flags,(uint32_t)t);
+  y->flags=strflags_storage(y->data,flags,(uint32_t)t);
   y->parent=TS_UNDEFINED; y->offset=0;
   tsv r=ts_str_v(y); ts_gc_unroot(2); return r;
 }
@@ -9292,7 +9392,7 @@ tsv ts_str_padend(tsv s, double target, tsv pad){
     uint16_t cu = pad_is_str&&ps.len ? ts_str_cu_at_view(ps, i%pl) : (uint16_t)' ';
     ts_str_cu_set(y->data, flags, xs.len+i, cu);
   }
-  y->flags=strflags_storage(y->data,flags,(uint32_t)t); y->hash=strhash_units(y->data,y->flags,(uint32_t)t);
+  y->flags=strflags_storage(y->data,flags,(uint32_t)t);
   y->parent=TS_UNDEFINED; y->offset=0;
   tsv r=ts_str_v(y); ts_gc_unroot(2); return r;
 }
@@ -9385,7 +9485,6 @@ static tsv ts_str_replace_literal_build(tsv s, tsv pat, tsv rep, int all){
   ts_str_copy_units(out->data, flags, oi, xs, start, xs.len-start); oi += xs.len-start;
   out->len = oi;
   out->flags=strflags_storage(out->data, flags, oi);
-  out->hash=strhash_units(out->data, out->flags, oi);
   out->parent=TS_UNDEFINED; out->offset=0;
   tsv rv = ts_str_v(out);
   ts_gc_unroot(3);
@@ -14175,7 +14274,6 @@ static tsv string_from_units(const uint16_t* u, uint32_t n){
     else ts_str_cu_set(str->data, flags, i, u[i]);
   }
   str->flags = strflags_storage(str->data, flags, n);
-  str->hash = strhash_units(str->data, str->flags, n);
   return ts_str_v(str);
 }
 /* node's description of a bad argument (ERR_INVALID_ARG_TYPE's "Received ..."). */
@@ -17496,7 +17594,6 @@ static tsv msg_decode_string(msg_dec* d, int wide){
     if (flags) ts_str_cu_set(str->data, flags, i, (uint16_t)cu); else str->data[i] = (char)cu;
   }
   str->flags = strflags_storage(str->data, flags, n);
-  str->hash = strhash_units(str->data, str->flags, n);
   return ts_str_v(str);
 }
 static tsv msg_decode(msg_dec* d){

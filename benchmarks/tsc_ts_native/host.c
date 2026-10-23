@@ -312,11 +312,27 @@ static tsv host_utf8_length(tsv* a, int n){
   if (v.flags & TS_STR_FLAG_ASCII) return ts_num((double)v.len);
   if (v.data && !(v.flags & TS_STR_FLAG_UTF16)){
     const unsigned char* b = (const unsigned char*)v.data;
-    uint64_t high = 0;
-    for (uint32_t i = 0; i < v.len; i++) high += b[i] >> 7;
+    uint64_t high = 0; uint32_t i = 0;
+    for (; i + 8u <= v.len; i += 8u){ uint64_t w; memcpy(&w, b + i, 8); high += (uint64_t)__builtin_popcountll(w & 0x8080808080808080ull); }
+    for (; i < v.len; i++) high += b[i] >> 7;
     return ts_num((double)v.len + (double)high);
   }
   double total = 0;
+  if (v.data){
+    /* UTF-16 storage: the units read directly (a source text with one
+       character past U+00FF is stored this way and measured once per text) */
+    const unsigned char* d = (const unsigned char*)v.data;
+    for (uint32_t i = 0; i < v.len; i++){
+      uint32_t cu = (uint32_t)d[2 * i] | ((uint32_t)d[2 * i + 1] << 8);
+      if (cu < 0x80u) total += 1;
+      else if (cu < 0x800u) total += 2;
+      else if (cu >= 0xD800u && cu <= 0xDBFFu && i + 1 < v.len){
+        uint32_t lo = (uint32_t)d[2 * i + 2] | ((uint32_t)d[2 * i + 3] << 8);
+        if (lo >= 0xDC00u && lo <= 0xDFFFu){ total += 4; i++; } else total += 3;
+      } else total += 3;
+    }
+    return ts_num(total);
+  }
   for (uint32_t i = 0; i < v.len; i++){
     uint32_t cu = ts_str_cu_at_view(v, i);
     if (cu < 0x80u) total += 1;
