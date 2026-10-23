@@ -15688,9 +15688,31 @@ static void prop_ic_fill(ts_prop_ic* ic, ts_object* o, ts_key key, ts_pref p){
   if (!ts_obj_is_sized(o)) prop_ic_fill_shape(ic, o, key, slot);
   else prop_ic_fill_entry(ic, o, key, slot, TS_PROP_IC_OWN, 0);
 }
+/* The site's own entry for a sized instance's struct field (ts_rt.h
+   ts_prop_ic_probe_sized_inline): the class word tagged, the offset and the
+   slot's kind. Not for a relinked instance (its layout is its allocation
+   class's, found through the registry). Classes register lazily (a class
+   value's first use), which adds words; a registered word's layout never
+   changes, so an entry keyed by the word stays valid. */
+static void prop_ic_fill_sized_site(ts_prop_ic* ic, ts_object* o, ts_key key, size_t offset, int numeric){
+  if (!ic || ic->megamorphic || (o->cls & TS_CLS_RELINKED) || o->cls == 0u || offset > TS_PIC_SLOT_MASK) return;
+  uint32_t w = o->cls | TS_PIC_SIZED_TAG;
+  uint32_t slot = (uint32_t)offset | ((uint32_t)numeric << TS_PIC_FLAGS_SHIFT);
+  for (uint32_t i = 0; i < TS_PROP_IC_SIZE; i++){
+    ts_prop_ic_entry* e = &ic->entries[i];
+    if (e->shape == w && e->key == key){ e->slot = slot; ic->absent_depth |= TS_PIC_SIZED_FLAG; return; }
+  }
+  uint32_t target = (uint32_t)(ic->next % TS_PROP_IC_SIZE);
+  if (++ic->next == 0) ic->next = TS_PROP_IC_SIZE;
+  ts_prop_ic_entry* e = &ic->entries[target];
+  e->key = key; e->shape = w; e->slot = slot;
+  ic->absent_depth |= TS_PIC_SIZED_FLAG;
+}
 static void prop_ic_fill_struct(ts_prop_ic* ic, ts_object* o, ts_key key, size_t offset, int numeric){
-  if (offset <= UINT32_MAX && offset + sizeof(tsv) <= ts_obj_sized_bytes(o))
+  if (offset <= UINT32_MAX && offset + sizeof(tsv) <= ts_obj_sized_bytes(o)){
     prop_ic_fill_entry(ic, o, key, (uint32_t)offset, TS_PROP_IC_STRUCT, (uint8_t)numeric);
+    prop_ic_fill_sized_site(ic, o, key, offset, numeric);
+  }
 }
 static tsv ts_prop_ic_struct_read(ts_object* o, const ts_prop_location* e){
   /* the slot's kind as the class registered it: 2 an integer slot (a long
@@ -15727,7 +15749,7 @@ static inline int prop_absent_site_hit(tsv obj, ts_key key, const ts_prop_ic* ic
   if (TS_TOP16(obj) != TS_SEL_OBJECT) return 0;
   const ts_object* o = (const ts_object*)ts_ptr(obj);
   if ((o->shape != ic->absent_shape && o->shape != ic->absent_shape2) || o->h.kind != TS_KIND_OBJECT) return 0;
-  for (uint32_t i = 0; i < ic->absent_depth; i++){
+  for (uint32_t i = 0; i < (ic->absent_depth & TS_PIC_ABSENT_DEPTH_MASK); i++){
     tsv link = o->proto;
     if (TS_TOP16(link) != TS_SEL_OBJECT) return 0;
     o = (const ts_object*)ts_ptr(link);
@@ -15739,6 +15761,21 @@ static inline int prop_absent_site_hit(tsv obj, ts_key key, const ts_prop_ic* ic
    no saved registers), then the full lookup. */
 tsv ts_get_pic_checked(tsv obj, ts_key key, ts_prop_ic* ic){
   if (prop_absent_site_hit(obj, key, ic)){ RT_STAT_INC(absent_site_hits); return TS_UNDEFINED; }
+  /* a sized class instance's field the site has cached by class word
+     (docs/pic_sized_inline_design.md): the slot read by its kind. The site's
+     flag first: a plain-object site answers in one load and one branch. */
+  if (ic && (ic->absent_depth & TS_PIC_SIZED_FLAG) && !ic->megamorphic && TS_TOP16(obj) == TS_SEL_OBJECT){
+    const ts_object* o = (const ts_object*)ts_ptr(obj);
+    const ts_prop_ic_entry* e = ts_prop_ic_probe_sized_inline(o, key, ic);
+    if (e){
+      const char* at = (const char*)o + (e->slot & TS_PIC_SLOT_MASK);
+      uint32_t kind = e->slot >> TS_PIC_FLAGS_SHIFT;
+      TS_RT_STAT_PIC_GET_CALL(); TS_RT_STAT_PIC_GET_HIT();
+      if (kind == 0){ tsv v; memcpy(&v, at, sizeof v); return v; }
+      if (kind == 1){ double d; memcpy(&d, at, sizeof d); return ts_num(d); }
+      long long n; memcpy(&n, at, sizeof n); return ts_num((double)n);
+    }
+  }
   return ts_get_pic_checked_slow(obj, key, ic);
 }
 __attribute__((noinline)) static tsv ts_get_pic_checked_slow(tsv obj, ts_key key, ts_prop_ic* ic){
@@ -15928,13 +15965,13 @@ static inline const ts_prop_absent_entry* prop_absent_lookup(const ts_prop_ic* i
 static void prop_absent_site_fill(ts_prop_ic* ic, const ts_object* o, ts_key key, const ts_prop_absent_entry* e){
   if (!g_absent_site || o->h.kind != TS_KIND_OBJECT || !prop_epoch_live()) return;
   if (ic->rec_epoch == g_prop_absent_epoch){
-    if (ic->absent_shape2 != ic->absent_shape || ic->absent_key != key || ic->absent_depth != e->depth) return;
+    if (ic->absent_shape2 != ic->absent_shape || ic->absent_key != key || (ic->absent_depth & TS_PIC_ABSENT_DEPTH_MASK) != e->depth) return;
     for (uint8_t i = 0; i < e->depth; i++) if (ic->absent_proto_shape[i] != e->proto_shape[i]) return;
     ic->absent_shape2 = e->shape;
     return;
   }
   ic->absent_shape = e->shape; ic->absent_shape2 = e->shape;
-  ic->absent_key = key; ic->absent_depth = e->depth;
+  ic->absent_key = key; ic->absent_depth = (uint8_t)(e->depth | (ic->absent_depth & TS_PIC_SIZED_FLAG));
   for (uint8_t i = 0; i < e->depth; i++) ic->absent_proto_shape[i] = e->proto_shape[i];
   ic->rec_epoch = g_prop_absent_epoch;
 }
@@ -16066,6 +16103,19 @@ void ts_array_set_key_f64(tsv arr, double d, tsv v){
 }
 void ts_set_pic(tsv obj, ts_key key, tsv val, ts_prop_ic* ic){
   TS_RT_STAT_PIC_SET_CALL();
+  /* a sized class instance's boxed or double slot the site has cached by
+     class word, on an instance with no integrity bit (an int32 slot's
+     exactness check and everything else take the paths below) */
+  if (ic && (ic->absent_depth & TS_PIC_SIZED_FLAG) && !ic->megamorphic && TS_TOP16(obj) == TS_SEL_OBJECT){
+    ts_object* o = (ts_object*)ts_ptr(obj);
+    const ts_prop_ic_entry* e = ts_prop_ic_probe_sized_inline(o, key, ic);
+    if (e && ts_obj_integrity(o) == 0u){
+      char* at = (char*)o + (e->slot & TS_PIC_SLOT_MASK);
+      uint32_t kind = e->slot >> TS_PIC_FLAGS_SHIFT;
+      if (kind == 0){ TS_RT_STAT_PIC_SET_HIT(); memcpy(at, &val, sizeof val); ts_write_barrier(obj, val); return; }
+      if (kind == 1 && ts_is_num(val)){ TS_RT_STAT_PIC_SET_HIT(); double d = ts_to_num(val); memcpy(at, &d, sizeof d); return; }
+    }
+  }
   if (ic && ic->megamorphic){ ts_set(obj, key, val); return; }
   if (TS_TOP16(obj) == TS_SEL_OBJECT){
     ts_object* o = (ts_object*)ts_ptr(obj);

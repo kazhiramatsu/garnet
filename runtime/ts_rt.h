@@ -418,6 +418,18 @@ extern ts_key* g_ts_probe_wkeys;
    without consulting the shape. */
 #define TS_PIC_SLOT_MASK 0x00FFFFFFu
 #define TS_PIC_FLAGS_SHIFT 24u
+/* A sized class instance's entry (docs/pic_sized_inline_design.md): `shape`
+   holds the instance's class word tagged with this bit (a shape id never
+   has it: shape ids stay under 2^29, and the top three bits of an object's
+   shape word are its integrity flags, which the probe masks off), `slot`
+   the struct offset under TS_PIC_SLOT_MASK and the slot's kind above it
+   (0 a boxed value, 1 a double, 2 an int32 in a long long). A class word
+   names one layout for the program's run (layouts are registered before
+   main), and an instance relinked by the program carries TS_CLS_RELINKED,
+   which never matches a stored word. */
+#define TS_PIC_SIZED_TAG 0x80000000u
+#define TS_PIC_SIZED_FLAG 0x80u
+#define TS_PIC_ABSENT_DEPTH_MASK 0x7fu
 typedef struct {
   ts_key key;
   uint32_t shape;
@@ -433,6 +445,11 @@ typedef struct {
   uint8_t next;
   uint8_t misses;
   uint8_t megamorphic;
+  /* the low bits: the absent record's chain depth (at most 3); the top bit
+     (TS_PIC_SIZED_FLAG): the site holds an entry for a sized class instance
+     (prop_ic_fill_sized_site), so the inline probe for such receivers runs
+     only then and a site that only ever sees plain objects pays one byte
+     test on its misses */
   uint8_t absent_depth;
   /* The site's record: for a store, the addition it last performed
      (docs/site_add_transition_design.md); for a read, the absent property it
@@ -2167,6 +2184,27 @@ TS_RT_ALWAYS_INLINE tsv* ts_prop_ic_probe_fixed_inline(
       TS_RT_STAT_PIC_KEYVAL();
       return ts_obj_slot_ptr(o, slot);
     }
+  }
+  return NULL;
+}
+/* The per-site entry of a sized class instance's struct field, when the
+   receiver is a sized instance of the class the entry was filled from: the
+   entry, or NULL (the out-of-line read or write fills one on its struct
+   path; a relinked instance never matches). Probed at the head of the
+   out-of-line read and write, not in line: the inline functions stay as they
+   are, so a typed program's thousands of plain-object sites pay nothing. */
+TS_RT_ALWAYS_INLINE const ts_prop_ic_entry* ts_prop_ic_probe_sized_inline(
+    const ts_object* o, ts_key key, const ts_prop_ic* ic){
+  if (!(ic->absent_depth & TS_PIC_SIZED_FLAG) || !ts_obj_is_sized(o)) return NULL;
+  uint32_t w = o->cls | TS_PIC_SIZED_TAG;
+#if defined(__clang__)
+#pragma clang loop unroll(disable)
+#elif defined(__GNUC__)
+#pragma GCC unroll 1
+#endif
+  for (uint32_t i = 0; i < TS_PROP_IC_SIZE; i++){
+    const ts_prop_ic_entry* e = &ic->entries[i];
+    if (e->shape == w && e->key == key) return e;
   }
   return NULL;
 }

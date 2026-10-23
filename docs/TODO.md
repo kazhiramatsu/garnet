@@ -8979,3 +8979,32 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   thread creation at startup). The all-dynamic compile (every class dynamic)
   runs 12.5 s against the typed build's 1.26 s: the dynamic paths are the next
   target. Fixture `control/deep_recursion_dynamic`.
+- Slice AJ (runtime, the dynamic paths; `docs/pic_sized_inline_design.md`): a
+  property read or write through a dynamic site (`x.kind` with `x: any`, every
+  field access of a class that dispatches dynamically) left the inline path
+  for every sized class instance, since the per-site cache keys on shape words
+  and a sized instance has none: the out-of-line read's absent record,
+  negative cache, own-slot probe, the global struct-location table keyed by
+  the site, the registry's field cache and the fill. tsc-ts compiled with
+  every class dynamic (`TSAOT_DEBUG_ALL_UNSTABLE=1`) spent 60% of its 12.5 s
+  there. A per-site entry now holds the instance's class word tagged with
+  `TS_PIC_SIZED_TAG` and the struct offset with the slot's kind; the
+  out-of-line read probes it first and reads the slot by kind, the out-of-line
+  write stores a boxed or double slot of an instance with no integrity bit,
+  and both fill it where they fill the location table. The probe is not in the
+  inline functions: probing there cost the typed tsc-ts 0.6% of its
+  instructions at thousands of plain-object sites (a per-site flag that
+  skipped the loop did not recover it), so the typed program's code is exactly
+  what it was, and a site that holds no sized entry (a flag in the top bit of
+  its absent-depth byte) skips the four compares. A class word names one
+  layout for the run (classes register lazily, which adds words; a registered
+  word's layout never changes), a relinked instance's word never matches, and
+  the added properties of an instance live in its sidecar, so the struct slots
+  stay where the entry says. The all-dynamic compile of tsc-ts: 12.5 -> 8.9 s
+  (-29%), its 78 output files byte-identical to the typed build's; the typed
+  one checker 23.65 -> 23.62 G instructions (-0.1%), cycles +0.3% (within the
+  run-to-run band), wall unchanged, outputs identical. Fixture
+  `classes/dynamic_field_sites` (monomorphic and polymorphic sites over
+  classes with boxed, double and int32 slots, writes of every kind, an
+  instance with own dynamic properties, a relinked one, frozen and sealed
+  ones, a plain object and null at the same sites).
