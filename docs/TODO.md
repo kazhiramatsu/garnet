@@ -8316,3 +8316,14 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   projected 0.71: concurrency costs on the critical path, to measure next.
   Gates: unit, conformance 538/538 plain and strict on F1; the GC stress
   gate passed on F1 and F2.
+- Workers by fork, the measurements redone on a quiet machine (the first set
+  ran beside the GC stress gate and read 5-20% slow, which the previous entry
+  misread as concurrency costs on garnet's side): 1.73 s -> 1.14 (2) -> 0.94
+  (3, 4) -> 1.02 s (8); at four checkers c0's checker.ts takes 564 ms (check
+  357, emit 225), 1.44x scriptc's 392 ms on the same run and within 3% of the
+  projection; the other checkers 376 ms against scriptc's 253 (1.49x); from
+  four to eight checkers c0 slows 12% in garnet and 14% in scriptc; the
+  children's CPU is 20% more than one thread's (scriptc 12%). So the B-shaped
+  time with parallel parsing (F4) is the projected 0.7 s, and the remaining
+  term is one thread's parse, check and emit of checker.ts, 1.4-1.65x
+  scriptc's.

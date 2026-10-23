@@ -232,40 +232,43 @@ order; an uncaught exception in the child reaches the error handler. F3:
 the shims as designed; `main.ts` sets `parallelCheck.writer` and `spawn`
 itself.
 
-tsc-ts on the compiler project, medians of three, outputs identical to one
-checker's and to the Node reference at every count:
+tsc-ts on the compiler project, medians of three on a quiet machine (a
+first set of numbers, taken while the GC stress gate ran, was 5-20% slower
+and misread as concurrency costs), outputs identical to one checker's and
+to the Node reference at every count:
 
 | checkers | wall | process-tree peak RSS (sampled) | parent's peak |
 |---|---|---|---|
-| 1 | 1.83 s | 727 MB | 705 MB |
-| 2 | 1.20 s (x1.53) | 1135 MB | 388 MB |
-| 3 | 1.01 s (x1.81) | | |
-| 4 | 1.06 s (x1.73) | 1366 MB | 388 MB |
-| 6 | 1.07 s (x1.71) | | |
-| 8 | 1.06 s (x1.73) | 1714 MB | 388 MB |
+| 1 | 1.73 s | 727 MB | 705 MB |
+| 2 | 1.14 s (x1.52) | 1135 MB | 388 MB |
+| 3 | 0.94 s (x1.84) | | |
+| 4 | 0.94 s (x1.84) | 1366 MB | 388 MB |
+| 8 | 1.02 s (x1.70) | 1714 MB | 388 MB |
 
-The timeline at four checkers: startup 23 ms, parse 265 ms, bind 102 ms,
-publication 1 ms, checkers spawned at 395 ms; c1-c3 finish at 870-875 ms
-with 24-27 files each (CPU 398 ms user, 27 ms system); c0 finishes at
-1,063 ms with `checker.ts` alone: check 420 ms, emit 248 ms (CPU 598 ms).
-At two checkers c0's `checker.ts` check takes 328 ms, at eight 439 ms. The
-children's CPU, 1.79 s, is 35% more than one thread's check and emit
-(1.33 s); scriptc's four checkers do 13% more than its one thread. Under
-GC stress (a young collection every 64 allocations in parent and children)
-the outputs are identical; on a copy of the project with two injected type
-errors, one and four checkers report the same diagnostics, the same as
-scriptc's.
+The timeline at four checkers: startup 23 ms, parse to 282 ms, bind to
+395 ms, publication 1 ms, checkers spawned at 400 ms; c1-c3 finish in
+375-378 ms with 20-31 files each (CPU 351 ms user, 25 ms system); c0
+finishes at 982 ms with `checker.ts` alone: check 357 ms, emit 225 ms
+(564 ms, CPU 539 ms user). scriptc's four checkers on the same run: c1-c3
+251-254 ms, c0 392 ms (check 217, emit 159). So on a child garnet's
+critical path is 1.44x scriptc's and the other checkers' work 1.49x, the
+single-thread ratios (check 1.57x, emit 1.41x); concurrency costs both the
+same (scriptc's c0 goes from 375 to 426 ms from four to eight checkers,
+garnet's from 564 to 631). The children's CPU, 1.59 s, is 20% more than
+one thread's check and emit (1.33 s); scriptc's 1.11 s is 12% more than
+its one thread's. Under GC stress (a young collection every 64 allocations
+in parent and children) the outputs are identical; on a copy of the
+project with two injected type errors, one and four checkers report the
+same diagnostics, the same as scriptc's.
 
 Against the projection (0.71 s with parallel parsing): with serial parsing
-the floor is 0.395 s + 0.668 s = 1.06 s; the serial parse and bind cost
-0.23 s more than the projected parallel parse, and the critical path,
-`checker.ts` on a child, is 0.10 s longer than projected: its check is
-1.93x scriptc's (217 ms) where the single-thread ratio was 1.57x, and it
-slows from 328 to 420 ms as the siblings go from one to three. So garnet's
-B-shaped time on this runtime is about 0.83 s with parallel parsing, not
-0.71; the extra is concurrency (memory traffic, the children's page copies,
-the young-only collections), to measure before it is chased. Memory: 1.37
-GB of resident set across the processes at four checkers, against scriptc's
+the floor is 0.40 s + 0.58 s = 0.98 s (measured 0.94-0.98); the serial
+parse and bind cost 0.26 s more than the projected parallel parse, and the
+critical path, `checker.ts` on a child, is within 3% of the projected
+564 ms. So garnet's B-shaped time on this runtime is the projected 0.7 s
+once parsing is parallel (F4), and the floor is one thread's parse, check
+and emit of `checker.ts`: 1.44-1.65x scriptc's today. Memory: 1.37 GB of
+resident set across the processes at four checkers, against scriptc's
 472 MB and the 3.2 GB four separate programs would take.
 
 Not done: F4 (parse children), the ASan run, the contention fixture of the
