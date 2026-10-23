@@ -8933,3 +8933,13 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   compiler cannot sink the stores since the array's address escapes into
   ts_call_method): -0.1% instructions but +0.2..0.4% cycles on tsc-ts in two
   runs, reverted.
+- Slice AG (build configuration; `docs/agent_workflow.md`, "The measured build
+  of tsc-ts"): the measured build omits the frame pointer (`cc -O2
+  -gline-tables-only -fomit-frame-pointer`, replacing
+  `-fno-omit-frame-pointer`): the generated code is thousands of small
+  functions, the runtime and the collector never read frame pointers (the
+  collector scans the stack by words), and crash backtraces still have the
+  compact unwind info; only the profiling build keeps frame pointers for the
+  sampler's caller PC. tsc-ts one checker 23.83 -> 23.62 G instructions
+  (-0.9%), cycles -0.35%, wall unchanged, outputs identical. Numbers from here
+  on are in this configuration.

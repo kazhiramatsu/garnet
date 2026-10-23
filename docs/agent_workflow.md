@@ -273,6 +273,13 @@ Two tools that look right are wrong on garnet's binaries, and one works:
   `bzero`/`memmove` (fresh heap pages being touched), which two variant
   builds then disproved (inline per-cell zeroing, prefetching the next free
   run: wall unchanged).
+- **The measured build of tsc-ts** (session 352, slice AG): `TSAOT_NATIVE_CC='cc -O2
+  -gline-tables-only -fomit-frame-pointer'` with `TSAOT_UNITS_JOBS=3` on a shared
+  machine. Omitting the frame pointer is worth 0.9% of the instructions (the
+  generated code is thousands of small functions; the runtime and the collector
+  never read frame pointers, the collector scans the stack by words, and crash
+  backtraces still have the compact unwind info). Only the profiling build keeps
+  `-fno-omit-frame-pointer`: the sampler reads the caller's PC through it.
 - **`TSAOT_PROF_PC=<file>`** (runtime/ts_rt.c, `prof_pc_init`): a sampler
   thread suspends the main thread every `TSAOT_PROF_PC_US` microseconds
   (default 100), records its PC, link register and the frame's saved return
