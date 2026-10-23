@@ -15766,6 +15766,15 @@ static inline int prop_absent_site_hit(tsv obj, ts_key key, const ts_prop_ic* ic
    no saved registers), then the full lookup. */
 tsv ts_get_pic_checked(tsv obj, ts_key key, ts_prop_ic* ic){
   if (prop_absent_site_hit(obj, key, ic)){ RT_STAT_INC(absent_site_hits); return TS_UNDEFINED; }
+  /* a megamorphic site (many classes at one access): a sized receiver's
+     field straight from the registry's cache, past the slow path's probes
+     and the generic read's dispatch (docs/pic_sized_inline_design.md, "The
+     megamorphic site") */
+  if (ic && ic->megamorphic && TS_TOP16(obj) == TS_SEL_OBJECT && g_has_class_regs){
+    ts_object* o = (ts_object*)ts_ptr(obj);
+    size_t off; int numeric;
+    if (ts_obj_is_sized(o) && class_field_lookup(o, key, &off, &numeric)) return struct_field_get(o, off, numeric);
+  }
   /* a sized class instance's field the site has cached by class word
      (docs/pic_sized_inline_design.md): the slot read by its kind. The site's
      flag first: a plain-object site answers in one load and one branch. */
@@ -16108,6 +16117,16 @@ void ts_array_set_key_f64(tsv arr, double d, tsv v){
 }
 void ts_set_pic(tsv obj, ts_key key, tsv val, ts_prop_ic* ic){
   TS_RT_STAT_PIC_SET_CALL();
+  /* a megamorphic site: a sized receiver's slot through the registry's cache
+     (the frozen bit refused as the struct path refuses it) */
+  if (ic && ic->megamorphic && TS_TOP16(obj) == TS_SEL_OBJECT && g_has_class_regs){
+    ts_object* o = (ts_object*)ts_ptr(obj);
+    size_t off; int numeric;
+    if (ts_obj_is_sized(o) && class_field_lookup(o, key, &off, &numeric)){
+      if (ts_obj_integrity(o) & 1u){ ts_throw_readonly_write(key); return; }
+      struct_field_set(o, off, numeric, val); return;
+    }
+  }
   /* a sized class instance's boxed or double slot the site has cached by
      class word, on an instance with no integrity bit (an int32 slot's
      exactness check and everything else take the paths below) */

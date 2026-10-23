@@ -113,4 +113,9 @@ Fixture `classes/megamorphic_field_sites` (twenty-four node classes read and
 written through `any` at the same sites, with a frozen instance, an instance
 with own properties and a plain object in the mix).
 
-Measurements: see TODO (session 352, slice AL).
+| program | before | after |
+|---|---|---|
+| tsc-ts, every class dynamic, wall | 8.1 s | 7.45 s (-8%; 12.5 s before slice AJ) |
+| tsc-ts typed, one checker, instructions | 23.58 G | 23.59 G (+0.07%) |
+
+Outputs identical in both.

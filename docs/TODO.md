@@ -9025,3 +9025,17 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   -> 23.61 G instructions, cycles and wall within noise, outputs identical
   (the generated code of a program with stable classes has no such site). Knob
   `TSAOT_SIZED_PIC_INLINE`.
+- Slice AL (runtime, the dynamic paths; `docs/pic_sized_inline_design.md`,
+  "The megamorphic site"): a site over many classes (`node.kind` over hundreds
+  of node classes) holds no useful entry; once megamorphic its reads went out
+  of line to the slow path, then to the generic read, then to the registry's
+  field cache: three calls and the generic read's dispatch for one cached
+  offset (`class_field_lookup` 12%, the slow path 11% and the generic read 5%
+  of the all-dynamic compile). The out-of-line read and write now test the
+  megamorphic flag first and, for a sized receiver, go straight to the
+  registry's cache and the slot (the write refusing a frozen instance as the
+  struct path does). The all-dynamic compile of tsc-ts: 8.1 -> 7.45 s (-8%;
+  12.5 s before slice AJ, -40% over the three), outputs identical to the typed
+  build's; the typed one checker 23.58 -> 23.59 G instructions (+0.07%, the
+  flag test at the out-of-line entry), cycles and wall within noise, outputs
+  identical. Fixture `classes/megamorphic_field_sites`.
