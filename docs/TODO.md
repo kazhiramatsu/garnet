@@ -8801,3 +8801,23 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   path (the log holds only the finalizable kinds). Gates run at a quiet load
   from here (Kaz: the fan): `TSAOT_CONF_JOBS=3`, `TSAOT_UNITS_JOBS=3`, nice
   12.
+- Slice Y (emitter, `docs/string_view_hoist_design.md`): a loop's `charCodeAt`
+  calls on a string local the loop never assigns read the string's view once
+  before the loop, as three scalars (data pointer, length, width), and each
+  call is a bounds test and a unit load; an immediate, an index out of range
+  or a receiver that is not a string takes the general path. Captured
+  variables are never hoisted (their reads are cell loads into fresh locals).
+  A cost gate: only a loop without calls, or one reading the receiver more
+  than once per iteration (the unconditional hoist cost tsc-ts 0.12% at its
+  per-token loops of one read and one call). The first version kept a 24-byte
+  view struct per read and lost 0.14% on tsc-ts (spilled in large functions);
+  the scalars are flat. With it a runtime fix: the typed `charCodeAt` entry
+  trusted the `string` annotation, and an `any` value behind it that was a
+  number, `undefined`, `null` or an object crashed in ts_str_view_typed; both
+  general helpers now route a non-string receiver to
+  `ts_str_charcodeat_dynamic` (V8's property-read TypeError for
+  null/undefined, an object's own `charCodeAt` called, "not a function"
+  otherwise). Fixture `strings/charcode_loops`. `string_scan` kernel 7.26 ->
+  4.07 G instructions (-44%), cycles -44%; tsc-ts one checker 24.61 -> 24.59 G
+  (-0.1%, 85 loops hoisted; its scanner reads a `Uint16Array`), cycles -0.7%,
+  outputs identical. Knob `TSAOT_STR_HOIST=0`.

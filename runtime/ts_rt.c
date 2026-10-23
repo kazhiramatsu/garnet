@@ -15469,6 +15469,27 @@ static tsv ts_throw_cannot_read(tsv obj, const char* prop){
   ts_throw(ts_new_error(TS_ERR_TYPE, ts_new_string(buf, (uint32_t)strlen(buf))));
   return TS_UNDEFINED;
 }
+/* charCodeAt on a receiver that is not a string (an `any` value behind a
+   string type, which the typed entry trusted): null and undefined throw the
+   property-read TypeError, an object's own or inherited `charCodeAt` is
+   called with the receiver, as the dynamic call would be, and anything else
+   is "not a function". The typed fast path used to pass such a receiver to
+   ts_str_view_typed and crash (`strings/charcode_loops`). */
+double ts_str_charcodeat_dynamic(tsv recv, double idx){
+  if (ts_is_undef(recv) || ts_is_null(recv)) ts_throw_cannot_read(recv, "charCodeAt");
+  tsv fn = TS_UNDEFINED;
+  if (ts_is_obj(recv)){
+    ts_gc_root(&recv);
+    fn = ts_get(recv, ts_intern_field("charCodeAt", 10));
+    ts_gc_unroot(1);
+  }
+  if (!ts_is_func(fn)) ts_throw_not_a_function("charCodeAt");
+  tsv args[2] = { recv, ts_num(idx) };
+  ts_gc_root(&args[0]); ts_gc_root(&fn);
+  tsv r = ts_call_method(fn, args, 2);
+  ts_gc_unroot(2);
+  return ts_number_coerce(r);
+}
 tsv ts_get_checked(tsv obj, ts_key key){
   if (ts_is_null(obj) || ts_is_undef(obj)) return ts_throw_cannot_read(obj, ts_field_name(key));
   return ts_get(obj, key);

@@ -945,7 +945,11 @@ static inline double ts_str_charcodeat_fast(tsv s, double idx){
   long i = (long)idx;
   return (double)ts_str_cu_at_view(x, (uint32_t)i);
 }
+/* charCodeAt on a receiver that is not a string: an object's `charCodeAt`
+   called, or the TypeError V8 throws (ts_rt.c). */
+double ts_str_charcodeat_dynamic(tsv recv, double idx);
 static inline double ts_str_charcodeat_general(tsv s, double idx){
+  if (TS_RT_UNLIKELY(!ts_is_str(s))) return ts_str_charcodeat_dynamic(s, idx);
   ts_strview x = ts_str_view_typed(s);
   if (isnan(idx)) idx = 0;
   if (!x.len || idx <= -1 || idx >= (double)x.len) return NAN;
@@ -971,6 +975,7 @@ TS_RT_ALWAYS_INLINE double ts_str_charcodeat_typed(tsv s, double idx){
   return ts_str_charcodeat_general(s, idx);
 }
 static inline long long ts_str_charcodeat_i64_general(tsv s, long long i){
+  if (TS_RT_UNLIKELY(!ts_is_str(s))) return (long long)ts_to_int32(ts_str_charcodeat_dynamic(s, (double)i));
   ts_strview x = ts_str_view_typed(s);
   if (i < 0 || i >= (long long)x.len) return 0;
   return (long long)ts_str_cu_at_view(x, (uint32_t)i);

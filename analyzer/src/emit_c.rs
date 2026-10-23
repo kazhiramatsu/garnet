@@ -1932,6 +1932,9 @@ struct Ctx<'a> {
     /// typed-array receivers hoisted by the enclosing loops (slice P):
     /// local -> (element kind, the loop's top label)
     ta_hoisted: std::cell::RefCell<BTreeMap<u32, (u8, u32)>>,
+    /// string receivers of `charCodeAt` whose view the enclosing loop read once:
+    /// local -> the loop's top label
+    sv_hoisted: std::cell::RefCell<BTreeMap<u32, u32>>,
     /// Active straight-line loop modulo residues. A `%` inside the current loop
     /// can read the residue instead of recomputing `ind % const`; the loop emitter
     /// advances the residue after the induction variable update.
@@ -2293,6 +2296,19 @@ fn map_num_inline_enabled() -> bool {
     *ENABLED.get_or_init(|| {
         !matches!(
             std::env::var("TSAOT_MAP_NUM_INLINE").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
+/// TSAOT_STR_HOIST=0 keeps the per-use string view for `charCodeAt` (the parity
+/// oracle): on, a loop reads a loop-invariant string receiver's view once
+/// before the loop and each `charCodeAt` is a bounds test and a unit load.
+fn str_hoist_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_STR_HOIST").as_deref(),
             Ok("0") | Ok("false") | Ok("no") | Ok("off")
         )
     })
@@ -8302,6 +8318,7 @@ fn emit_i64_function(
         label_ctr: std::cell::Cell::new(900000),
         loop_labels: std::cell::RefCell::new(Vec::new()),
         ta_hoisted: std::cell::RefCell::new(BTreeMap::new()),
+        sv_hoisted: std::cell::RefCell::new(BTreeMap::new()),
         loop_mod_residues: std::cell::RefCell::new(Vec::new()),
         fin_stack: std::cell::RefCell::new(Vec::new()),
         fin_value_slots: fin_slots > 0,
@@ -8522,6 +8539,7 @@ fn emit_f64_function(
         label_ctr: std::cell::Cell::new(900000),
         loop_labels: std::cell::RefCell::new(Vec::new()),
         ta_hoisted: std::cell::RefCell::new(BTreeMap::new()),
+        sv_hoisted: std::cell::RefCell::new(BTreeMap::new()),
         loop_mod_residues: std::cell::RefCell::new(Vec::new()),
         fin_stack: std::cell::RefCell::new(Vec::new()),
         fin_value_slots: fin_slots > 0,
@@ -8640,6 +8658,7 @@ fn emit_function(
             label_ctr: std::cell::Cell::new(900000),
             loop_labels: std::cell::RefCell::new(Vec::new()),
         ta_hoisted: std::cell::RefCell::new(BTreeMap::new()),
+        sv_hoisted: std::cell::RefCell::new(BTreeMap::new()),
             loop_mod_residues: std::cell::RefCell::new(Vec::new()),
             fin_stack: std::cell::RefCell::new(Vec::new()),
             fin_value_slots: false,
@@ -8705,6 +8724,7 @@ fn emit_function(
             label_ctr: std::cell::Cell::new(900000),
             loop_labels: std::cell::RefCell::new(Vec::new()),
         ta_hoisted: std::cell::RefCell::new(BTreeMap::new()),
+        sv_hoisted: std::cell::RefCell::new(BTreeMap::new()),
             loop_mod_residues: std::cell::RefCell::new(Vec::new()),
             fin_stack: std::cell::RefCell::new(Vec::new()),
             fin_value_slots: false,
@@ -8770,6 +8790,7 @@ fn emit_function(
             label_ctr: std::cell::Cell::new(900000),
             loop_labels: std::cell::RefCell::new(Vec::new()),
         ta_hoisted: std::cell::RefCell::new(BTreeMap::new()),
+        sv_hoisted: std::cell::RefCell::new(BTreeMap::new()),
             loop_mod_residues: std::cell::RefCell::new(Vec::new()),
             fin_stack: std::cell::RefCell::new(Vec::new()),
             fin_value_slots: false,
@@ -9050,6 +9071,7 @@ fn emit_function(
         label_ctr: std::cell::Cell::new(900000),
         loop_labels: std::cell::RefCell::new(Vec::new()),
         ta_hoisted: std::cell::RefCell::new(BTreeMap::new()),
+        sv_hoisted: std::cell::RefCell::new(BTreeMap::new()),
         loop_mod_residues: std::cell::RefCell::new(Vec::new()),
         fin_stack: std::cell::RefCell::new(Vec::new()),
         fin_value_slots: fin_slots > 0,
@@ -17641,6 +17663,55 @@ fn loop_view_receivers(cond_body: &[Inst], body: &[Inst], ctx: &Ctx) -> Vec<(u32
     out
 }
 
+/// The string receivers of a loop's `charCodeAt` calls whose local the loop
+/// never assigns: their view (data, length, width) is read once before the
+/// loop; a string never changes, and the local, used every iteration, keeps
+/// the cell reachable. A receiver that is unboxed or a JSON local is left to
+/// the per-use path.
+fn loop_string_receivers(cond_body: &[Inst], body: &[Inst], ctx: &Ctx) -> Vec<u32> {
+    let mut flat: Vec<&Inst> = Vec::new();
+    flatten_inst(cond_body, &mut flat);
+    flatten_inst(body, &mut flat);
+    let mut defs: BTreeSet<u32> = flat.iter().filter_map(|i| inst_def_local(i)).collect();
+    for inst in &flat {
+        if let Inst::TryCatch { catch_var: Some(v), .. } = inst {
+            defs.insert(v.0);
+        }
+    }
+    // The view read at loop entry costs about as much as one read through the
+    // per-use path, so a loop pays for it only when its iterations are cheap
+    // (no calls: the unit reads are the loop) or when it reads the receiver
+    // more than once per iteration (tsc-ts: a per-token loop of one read and a
+    // call, entered millions of times, lost 0.1% with the view read unconditional).
+    let tight = !flat.iter().any(|inst| {
+        matches!(
+            inst,
+            Inst::Call { .. } | Inst::CallSpread { .. } | Inst::NewDynamic { .. } | Inst::Yield { .. } | Inst::Await { .. }
+        )
+    });
+    let mut reads: BTreeMap<u32, u32> = BTreeMap::new();
+    let mut out: Vec<u32> = Vec::new();
+    for inst in &flat {
+        if let Inst::CallBuiltin { builtin, recv, .. } = inst {
+            if builtin != "string.charCodeAt" {
+                continue;
+            }
+            let r = recv.0;
+            if defs.contains(&r) || ctx.json_locals.contains(&r) || ctx.unboxed.contains(&r) || ctx.int_local.contains(&r) {
+                continue;
+            }
+            *reads.entry(r).or_insert(0) += 1;
+            if !out.contains(&r) {
+                out.push(r);
+            }
+        }
+    }
+    if !tight {
+        out.retain(|r| reads.get(r).copied().unwrap_or(0) >= 2);
+    }
+    out
+}
+
 fn collect_defs(seq: &[Inst]) -> BTreeSet<u32> {
     seq.iter().filter_map(inst_def_local).collect()
 }
@@ -20501,7 +20572,21 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 "string.charAt" => (format!("ts_str_charat({}, {})", r, n(0)), false),
                 "string.charCodeAt" => {
                     let index = args.first().map(|a| ctx.numc(a.0)).unwrap_or_else(|| "0".into());
-                    let expr = format!("ts_str_charcodeat_typed({}, {})", r, index);
+                    let hoisted = ctx.sv_hoisted.borrow().get(&recv.0).copied();
+                    let expr = if let Some(top) = hoisted {
+                        // the scalars read before the loop: a bounds test and a unit
+                        // load (an immediate has no data and takes the general path,
+                        // as do NaN and an index out of range)
+                        format!(
+                            "({{ double _ci = {idx}; (_sd{r}_{t} && _ci >= 0 && _ci < (double)_sn{r}_{t}) ? ({{ uint32_t _cu; if (_sw{r}_{t}) {{ uint16_t _u2; memcpy(&_u2, _sd{r}_{t} + ((size_t)(uint32_t)_ci * 2u), 2); _cu = _u2; }} else _cu = (unsigned char)_sd{r}_{t}[(uint32_t)_ci]; (double)_cu; }}) : ts_str_charcodeat_general({v}, _ci); }})",
+                            idx = index,
+                            r = recv.0,
+                            t = top,
+                            v = r
+                        )
+                    } else {
+                        format!("ts_str_charcodeat_typed({}, {})", r, index)
+                    };
                     (expr, true)
                 }
                 "string.concat" => (format!("ts_str_concat({}, {})", r, v(0)), false),
@@ -23033,6 +23118,27 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             } else {
                 Vec::new()
             };
+            let sv_hoisted: Vec<u32> = if str_hoist_enabled() {
+                loop_string_receivers(cond_body, body, ctx)
+            } else {
+                Vec::new()
+            };
+            let mut sv_saved: Vec<(u32, Option<u32>)> = Vec::new();
+            for r in &sv_hoisted {
+                // three scalars (they stay in registers where a view struct would
+                // be spilled): the data pointer, NULL unless a heap string (an
+                // immediate has no data); the length; the width. A receiver that
+                // is not a string keeps NULL: every read falls to the general path,
+                // which converts or throws as the per-use path would.
+                let _ = writeln!(
+                    s,
+                    "  const char* _sd{r}_{t} = NULL; uint32_t _sn{r}_{t} = 0u, _sw{r}_{t} = 0u; if (ts_is_str({v})) {{ ts_strview _hv = ts_str_view_typed({v}); _sd{r}_{t} = _hv.data; _sn{r}_{t} = _hv.len; _sw{r}_{t} = (_hv.flags & TS_STR_FLAG_UTF16) ? 1u : 0u; }} (void)_sd{r}_{t}; (void)_sn{r}_{t}; (void)_sw{r}_{t};",
+                    r = r,
+                    t = top,
+                    v = ctx.val(*r)
+                );
+                sv_saved.push((*r, ctx.sv_hoisted.borrow_mut().insert(*r, top)));
+            }
             let mut hoist_saved: Vec<(u32, Option<(u8, u32)>)> = Vec::new();
             for (arr, elem) in &hoisted {
                 let _ = writeln!(
@@ -23086,6 +23192,16 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     }
                     None => {
                         ctx.ta_hoisted.borrow_mut().remove(&arr);
+                    }
+                }
+            }
+            for (r, prev) in sv_saved {
+                match prev {
+                    Some(p) => {
+                        ctx.sv_hoisted.borrow_mut().insert(r, p);
+                    }
+                    None => {
+                        ctx.sv_hoisted.borrow_mut().remove(&r);
                     }
                 }
             }
