@@ -1562,9 +1562,10 @@ fn emit_vtables(
 fn emit_vtable_call(s: &mut String, ctx: &Ctx, plan: &VtPlan, argv: &[u32], dst: &Option<LocalId>) {
     let _ = writeln!(
         s,
-        "    {{ ts_object* _vo = ts_is_obj(_a[0]) ? (ts_object*)ts_ptr(_a[0]) : NULL; uint32_t _vk = _vo ? _vo->cls - {lo}u : UINT32_MAX; void* _vf = (_vk < {span}u && !g_class_relinked) ? {t}[_vk] : NULL;",
+        "    {{ ts_object* _vo = ts_is_obj(_a[0]) ? (ts_object*)ts_ptr(_a[0]) : NULL; uint32_t _vk = _vo ? _vo->cls - {lo}u : UINT32_MAX; void* _vf = (_vk < {span}u{relinked}) ? {t}[_vk] : NULL;",
         lo = plan.lo,
         span = plan.span,
+        relinked = relink_guard(),
         t = plan.table
     );
     s.push_str("    if (_vf) {
@@ -9656,6 +9657,13 @@ fn set_closed_receivers(closed: bool) {
         Ok("0") | Ok("false") | Ok("no") | Ok("off")
     );
     CLOSED_RECEIVERS.with(|c| c.set(closed && !off));
+}
+
+/// The test of `g_class_relinked` a class-interval dispatch adds (" && !g_class_relinked"),
+/// or nothing in a closed program, which never relinks a prototype
+/// (docs/closed_receivers_design.md): one global load less per kind test.
+fn relink_guard() -> &'static str {
+    if closed_receivers() { "" } else { " && !g_class_relinked" }
 }
 
 fn closed_receivers() -> bool {
@@ -19865,10 +19873,11 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         let walk = ctx.lazy_linked_int(&format!("ts_instanceof({}, CLASS_PROTO[{}])", o, c));
                         (
                             format!(
-                                "ts_bool(ts_is_obj({o}) && ({{ uint32_t _ci = ((ts_object*)ts_ptr({o}))->cls; ((uint32_t)(_ci - 1u) < 0x7FFFFFFFu && !g_class_relinked) ? (uint32_t)(_ci - {lo}u) < {span}u : {walk}; }}))",
+                                "ts_bool(ts_is_obj({o}) && ({{ uint32_t _ci = ((ts_object*)ts_ptr({o}))->cls; ((uint32_t)(_ci - 1u) < 0x7FFFFFFFu{relinked}) ? (uint32_t)(_ci - {lo}u) < {span}u : {walk}; }}))",
                                 o = o,
                                 lo = lo,
                                 span = span,
+                                relinked = relink_guard(),
                                 walk = walk
                             ),
                             false,

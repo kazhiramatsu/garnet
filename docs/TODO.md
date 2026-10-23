@@ -8459,3 +8459,17 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   `ts_gc_debug_alloc_bit`, `ts_gc_debug_cell_gen` for the tests). Also
   `docs/int32_fields_design.md`, the next slice: enum-typed class fields as
   integers.
+- Toward scriptc, slice R: no `g_class_relinked` test in a closed program. The
+  class-interval dispatch (`x instanceof C`, the kind tests, the virtual
+  calls) tested a global flag that only
+  `Object.setPrototypeOf`/`Reflect.setPrototypeOf` on a class prototype can
+  raise; a closed program (`docs/closed_receivers_design.md`) reaches neither,
+  so the emitter omits the load there (`relink_guard()`). tsc-ts one thread
+  28.52 -> 28.28 G instructions (0.9915), cycles 0.998, wall 0.993. Parity
+  (380 identical), conformance 540/540 plain and strict (a new fixture,
+  `classes/enum_int_fields`, for the next slice). Also
+  `benchmarks/patterns/class_enum_fields.ts`: tsc-ts's `kind`/`flags` as
+  const-enum fields (garnet 3.31 G against scriptc 1.67 G); written first with
+  a plain `enum`, it ran 12.1 G: a plain enum's member read is a property read
+  of the enum object through an inline cache at every `case`, which tsc-ts's
+  const enums (SyntaxKind, NodeFlags, TypeFlags are const) never pay.
