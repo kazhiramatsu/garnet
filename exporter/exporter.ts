@@ -754,6 +754,45 @@ class Exporter {
    *  and undefined members set aside: every member string-like -> "string",
    *  every member an object type -> "reference", anything else (any, unknown,
    *  a number, a mixed union, a type parameter) -> undefined. */
+  /** Is the declared type of `e` made of references only: object types (class
+   *  instances, arrays, functions, object literals) and null/undefined, with no
+   *  primitive, any, unknown, type parameter or intersection member? An
+   *  identifier answers for its declaration's type and a property access for
+   *  the property's, not the flow-narrowed type at this site, because the
+   *  local that holds a variable serves all its sites. */
+  declaredReferenceOnly(e: ts.Expression): boolean {
+    let t: ts.Type | undefined;
+    try {
+      let inner: ts.Expression = e;
+      while (ts.isParenthesizedExpression(inner)) inner = inner.expression;
+      if (ts.isIdentifier(inner) || (ts.isPropertyAccessExpression(inner) && ts.isIdentifier(inner.name))) {
+        const sym = this.checker.getSymbolAtLocation(ts.isIdentifier(inner) ? inner : inner.name);
+        const target = sym && (sym.flags & ts.SymbolFlags.Alias) ? this.checker.getAliasedSymbol(sym) : sym;
+        if (!target) return false;
+        const anyChecker = this.checker as unknown as { getTypeOfSymbol?: (s: ts.Symbol) => ts.Type };
+        t = anyChecker.getTypeOfSymbol ? anyChecker.getTypeOfSymbol(target)
+          : (target.valueDeclaration ? this.checker.getTypeOfSymbolAtLocation(target, target.valueDeclaration) : undefined);
+      } else {
+        t = this.checker.getTypeAtLocation(inner);
+      }
+    } catch { return false; }
+    if (!t) return false;
+    const F = ts.TypeFlags;
+    if (this.typeHasAnyOrUnknown(t)) return false;
+    const members = (t.flags & F.Union) ? (t as ts.UnionType).types : [t];
+    let live = 0;
+    for (const m of members) {
+      if (m.flags & (F.Undefined | F.Null | F.Void)) continue;
+      if (!(m.flags & F.Object)) return false;
+      live++;
+    }
+    return live > 0;
+  }
+  /** Mark a local as holding references only (docs/ref_eq_design.md). */
+  markReferenceLocal(ctx: FnCtx, local: number): void {
+    const l = ctx.locals[local] as { tyKind?: "string" | "reference" };
+    if (l && l.tyKind === undefined) l.tyKind = "reference";
+  }
   keyKindOfExpr(expr: ts.Expression): "string" | "reference" | undefined {
     let t: ts.Type;
     try { t = this.checker.getTypeAtLocation(expr); } catch { return undefined; }
@@ -6201,6 +6240,16 @@ class Exporter {
       // sequence-point eval: snapshot a bare-variable lhs if rhs may mutate it.
       const [lhs, rhs] = this.lowerSequenced(ctx, [node.left, node.right]);
       const dst = this.newLocal(ctx, this.refKindOf(node));
+      // `a === b` with both operands declared as references (object types,
+      // null, undefined; no primitive, any, unknown or type parameter): the
+      // operands' locals are marked reference-typed, and the emitter compares
+      // the bits (docs/ref_eq_design.md). The declared types, not the
+      // narrowed ones: a variable's local serves every site of the variable.
+      if ((op === "===" || op === "!==") && this.strictTypeOptimizationsEnabled() &&
+          this.declaredReferenceOnly(node.left) && this.declaredReferenceOnly(node.right)) {
+        this.markReferenceLocal(ctx, lhs);
+        this.markReferenceLocal(ctx, rhs);
+      }
       if (op) ctx.body.push({ kind: "BinOp", dst, op, lhs, rhs });
       else this.unsupported(node, `binary operator ${ts.SyntaxKind[node.operatorToken.kind]}`);
       return dst;

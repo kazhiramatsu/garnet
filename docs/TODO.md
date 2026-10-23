@@ -9113,3 +9113,16 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   now completes abnormally, as a return does. The typed one checker: 23.58 ->
   23.50 G instructions (-0.31%), cycles -0.16%, wall -0.8%, outputs identical;
   the switch fixtures, loops and the full suite pass in both profiles.
+- Slice AS (exporter + emitter; `docs/ref_eq_design.md`): `a === b` compiled
+  to the inline `ts_strict_eq` (identical bits then a NaN test, a number on
+  either side, an object on the left, strings out of line) at every site;
+  tsc-ts has 2,376 of them and the checker's hot ones compare nodes, symbols,
+  types and flow nodes. In the strict profile the exporter marks the operand
+  locals of a `===`/`!==` whose declared types are references only (object
+  types plus null/undefined; the declared type, not the narrowed one, since a
+  variable's local serves every site) as reference-typed, and the emitter
+  compares the bits (`TSAOT_REF_EQ=0` keeps the call). Fixture classes/ref_eq
+  (identity of instances, arrays, functions; unions with a string or number
+  member keep the content or numeric compare). The typed one checker: 23.50 ->
+  22.80 G instructions (-3.0%), cycles -2.5%, wall 1.26 -> 1.23 s, outputs
+  identical; 2,376 -> 394 ts_strict_eq sites in tsc-ts.

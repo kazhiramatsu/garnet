@@ -2164,6 +2164,22 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    /// `a === b` with both operands marked reference-typed by the exporter
+    /// (object types, null, undefined; docs/ref_eq_design.md): a heap cell has
+    /// one reference and null and undefined one encoding each, so the bits
+    /// answer; neither side can be a string or a number.
+    fn ref_eq_operands(&self, a: u32, b: u32) -> bool {
+        ref_eq_enabled()
+            && self.ref_typed.contains(&a)
+            && self.ref_typed.contains(&b)
+            && !self.unboxed.contains(&a)
+            && !self.unboxed.contains(&b)
+            && !self.int_local.contains(&a)
+            && !self.int_local.contains(&b)
+            && !self.json_locals.contains(&a)
+            && !self.json_locals.contains(&b)
+    }
+
     fn str_eq_operands(&self, a: u32, b: u32) -> Option<(u32, String, u32)> {
         let (x, (id, len)) = if let Some(c) = self.str_consts.get(&b) {
             (a, *c)
@@ -2337,6 +2353,19 @@ fn shadow_guard_enabled() -> bool {
     *ENABLED.get_or_init(|| {
         !matches!(
             std::env::var("TSAOT_SHADOW_GUARD").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
+/// TSAOT_REF_EQ=0 keeps `===` of two reference-typed operands a call of
+/// ts_strict_eq (the parity oracle): on, the operands' bits are compared
+/// (docs/ref_eq_design.md).
+fn ref_eq_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_REF_EQ").as_deref(),
             Ok("0") | Ok("false") | Ok("no") | Ok("off")
         )
     })
@@ -22977,6 +23006,9 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         format!("ts_eq_strlit({}, {}, {}u)", ctx.val(x), lit, len)
                     } else if let Some((x, n)) = ctx.num_eq_operands(lhs.0, rhs.0) {
                         format!("ts_eq_num({}, {})", ctx.val(x), n)
+                    } else if ctx.ref_eq_operands(lhs.0, rhs.0) {
+                        // two references (or null/undefined): one encoding each
+                        format!("({} == {})", ctx.val(lhs.0), ctx.val(rhs.0))
                     } else {
                         format!("ts_strict_eq({}, {})", ctx.val(lhs.0), ctx.val(rhs.0))
                     }
@@ -23005,6 +23037,8 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         format!("(!ts_eq_strlit({}, {}, {}u))", ctx.val(x), lit, len)
                     } else if let Some((x, n)) = ctx.num_eq_operands(lhs.0, rhs.0) {
                         format!("(!ts_eq_num({}, {}))", ctx.val(x), n)
+                    } else if ctx.ref_eq_operands(lhs.0, rhs.0) {
+                        format!("({} != {})", ctx.val(lhs.0), ctx.val(rhs.0))
                     } else {
                         format!("(!ts_strict_eq({}, {}))", ctx.val(lhs.0), ctx.val(rhs.0))
                     }
