@@ -435,6 +435,36 @@ __attribute__((noinline)) static void test_conservative_roots(void){
   g_cr_results[3] = cr_sum(keep) == 3000 * 2999 / 2 && ts_gc_debug_alloc_bit(keep);
   g_conservative_roots = 0;
 }
+/* Shape chains (slice N): a dictionary-like object built one key at a time
+   shares its chain's key vectors and index with the shapes of its prefixes;
+   a branch copies; no shape sees a key added beyond its depth. */
+static int g_sc_results[6];
+static void test_shape_chains(void){
+  const ts_key base = 440000u, other = 450000u;
+  tsv o = ts_new_object(); ts_gc_root(&o);
+  tsv b = ts_new_object(); ts_gc_root(&b);
+  tsv p = ts_new_object(); ts_gc_root(&p);
+  for (uint32_t i = 0; i < 600; i++){
+    ts_set(o, base + i, ts_num((double)i));
+    if (i < 300) ts_set(b, base + i, ts_num(1000.0 + i));
+    if (i < 100) ts_set(p, base + i, ts_num(2000.0 + i));
+  }
+  ts_set(b, other, ts_num(-1));
+  int ok = 1;
+  for (uint32_t i = 0; i < 600; i++) ok &= ts_to_num(ts_get(o, base + i)) == (double)i;
+    g_sc_results[0] = (ok);
+  ok = 1;
+  for (uint32_t i = 0; i < 300; i++) ok &= ts_to_num(ts_get(b, base + i)) == 1000.0 + i;
+    g_sc_results[1] = (ok && ts_to_num(ts_get(b, other)) == -1);
+    g_sc_results[2] = (ts_is_undef(ts_get(b, base + 300)) && ts_is_undef(ts_get(b, base + 599)));
+    g_sc_results[3] = (ts_is_undef(ts_get(o, other)));
+    g_sc_results[4] = (ts_is_undef(ts_get(p, base + 100)) && ts_is_undef(ts_get(p, base + 599)) &&
+     ts_to_num(ts_get(p, base + 99)) == 2099.0);
+  ts_set(p, base + 100, ts_num(7));
+    g_sc_results[5] = (ts_to_num(ts_get(p, base + 100)) == 7 && ts_is_undef(ts_get(p, base + 101)) &&
+     ((ts_object*)ts_ptr(p))->shape != ((ts_object*)ts_ptr(o))->shape);
+  ts_gc_unroot(3);
+}
 int main(){
   ts_gc_debug_log_young();
   int fail=0;
@@ -1813,6 +1843,13 @@ int main(){
     ts_gc_unroot(6);
   }
   test_conservative_roots();
+  test_shape_chains();
+  CK("shape chain: every key of a 600-key object reads back", g_sc_results[0]);
+  CK("shape chain: a branch reads its own keys", g_sc_results[1]);
+  CK("shape chain: a branch lacks the chain's later keys", g_sc_results[2]);
+  CK("shape chain: the chain lacks the branch's key", g_sc_results[3]);
+  CK("shape chain: a prefix object lacks the keys added beyond its depth", g_sc_results[4]);
+  CK("shape chain: a prefix object continuing the chain joins it", g_sc_results[5]);
   CK("conservative roots: the unrooted locals keep their allocation bits", g_cr_results[0]);
   CK("conservative roots: the unrooted array and object survive two collections", g_cr_results[1]);
   CK("conservative roots: the cells nothing names lose their allocation bits", g_cr_results[2]);

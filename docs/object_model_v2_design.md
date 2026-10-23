@@ -108,3 +108,29 @@ dependent load from most property reads of small objects, which the Session
   default is 4. A dictionary conversion keeps the inline area allocated but
   never reads it; moving collections copy the cell by its size, so inline
   values travel with it. Fixture `objects/inline_slots`.
+
+## Shape chains (slice N, session 352)
+
+A new shape used to copy its parent's key and flag vectors and rebuild its own
+index, so a dictionary-like object built one key at a time (an enum's forward
+and reverse maps, `Diagnostics` with its ~2000 entries, a keyword table) cost
+O(n^2) in shape creation: tsc-ts's parse-only run created 16,967 shapes almost
+all at module initialization, 4.9% of its samples in `shape_transition_f` plus
+the mallocs, copies and zeroing under it.
+
+Now the shapes along a linear transition chain share one `ts_shape_vec`: one
+growing pair of key and flag vectors and one open-addressing index. A shape's
+entries are `[0, depth)`; entries `[depth, claimed)` belong to its descendants
+on the chain. A child appends in place when its parent is the last shape that
+claimed an entry (`claimed == parent depth`); any other child is a branch and
+copies the parent's prefix into vectors of its own, with room for the chain to
+double. Growing the shared vectors moves them, so the public per-shape pointers
+(`g_ts_shape_keys`, `g_ts_shape_flags`) of every shape on the chain are
+re-pointed by walking the parent links from the appending shape; the static
+slot probe rows stay per shape. The shared index holds every claimed entry, so
+`shape_index_find` accepts an entry only when its slot is below the probing
+shape's depth; keys are unique along a chain, so a key found above the depth is
+absent. Every reader of the vectors indexes below the object's own length, so
+a shared tail is never observed. `runtime/ts_rt_test.c` (`test_shape_chains`)
+and `objects/dictionary_chain` cover the chain, a branch, prefixes and a prefix
+object that later continues the chain.

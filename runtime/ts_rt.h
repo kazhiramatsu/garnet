@@ -767,6 +767,15 @@ static inline uint16_t ts_str_cu_at_view(ts_strview v, uint32_t i){
   }
   return ts_str_cu_at_contiguous(v, i);
 }
+/* An immediate short string's bytes copied into `buf` (TS_SHORTSTR_MAX bytes)
+   and the view re-pointed at them as one-byte storage, so the contiguous
+   paths (memchr, memcmp) apply; any other view is returned as is. */
+static inline ts_strview ts_strview_materialize(ts_strview v, char* buf){
+  if (v.data || !v.len) return v;
+  for (uint32_t i = 0; i < v.len; i++) buf[i] = (char)ts_str_cu_at_view(v, i);
+  v.data = buf; v.flags = TS_STR_FLAG_ASCII; v.hash = 0;
+  return v;
+}
 static inline void ts_str_cu_set(char* data, uint32_t flags, uint32_t i, uint16_t cu){
   if (flags & TS_STR_FLAG_UTF16){
     memcpy(data + ((size_t)i * 2u), &cu, sizeof(cu));

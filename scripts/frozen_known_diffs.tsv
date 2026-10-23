@@ -226,3 +226,5 @@ parity	gc/sized_header_big_record	The Rust emitter roots temporaries of writeRec
 parity	gc/string_slack_growth	Rust keeps a potentially out-of-bounds charCodeAt result as double to preserve NaN, where the frozen emitter reads it as an integer; both outputs match V8.
 parity	classes/base_fields_via_super	The Rust emitter lists a field a subclass re-declares (Odd.kind) in the class field tables, which the frozen emitter leaves out; both outputs match V8.
 parity	closures/undef_init_paths	The Rust emitter gives whileFirst a double-returning entry and roots one local less in the legacy root mode, where the frozen emitter keeps the boxed entry; both outputs match V8.
+parity-unported	stdlib/text_decoder_ascii	Frozen emitter lacks the text codec builtins (textdecoder.new, docs/text_codecs_design.md); the Rust output matches V8.
+selfconf-unported	stdlib/text_decoder_ascii	Frozen emitter lacks the text codec builtins (docs/text_codecs_design.md); native Rust output matches V8.

@@ -2429,18 +2429,28 @@ static tsv ts_iter_result_new(tsv value, int done);   /* defined with the map it
    owns its key sequence and the attribute flags of every property, so the
    flags are part of the transition key. Key/flag vectors are materialized
    lazily from the parent chain. Index TS_SHAPE_EMPTY stays zeroed (depth 0). */
+/* The key and flag vectors of a chain of shapes (slice N, session 352): the
+   shapes along a linear transition chain share one growing vector pair and
+   one index, so a dictionary-like object built one key at a time (an enum's
+   maps, a literal with hundreds of keys) costs O(n) in shape creation rather
+   than O(n^2). A shape's entries are [0, depth); entries [depth, claimed) were
+   added by its descendants. A branch (a second child of a shape on the chain)
+   copies the prefix into vectors of its own. The index is an open-addressing
+   table over [0, claimed), slot + 1 per entry; a lookup accepts an entry only
+   below the shape's depth. */
+typedef struct {
+  ts_key* keys;
+  uint8_t* kflags;
+  uint32_t cap, claimed;
+  uint32_t* index;
+  uint32_t index_cap;
+} ts_shape_vec;
 typedef struct {
   uint32_t parent;
   ts_key key;
   uint8_t flags;
   uint32_t depth;
-  ts_key* keys;      /* depth entries */
-  uint8_t* kflags;   /* depth entries */
-  /* Open-addressing index over `keys` (slot + 1 per entry) for shapes with at
-     least TS_PROP_INDEX_MIN keys, so keyed lookups on large shaped objects
-     stay sub-linear like the dictionary index. */
-  uint32_t* index;
-  uint32_t index_cap;
+  ts_shape_vec* vec;   /* the chain's vectors; entries [0, depth) are this shape's */
 } ts_shape_desc;
 static ts_shape_desc* g_shapes = NULL;
 static uint32_t g_shapes_cap = 0;
@@ -2458,6 +2468,65 @@ static ts_key g_shape_keys_none[TS_STATIC_SLOT_LIMIT] = {
   TS_KEY_NONE, TS_KEY_NONE, TS_KEY_NONE, TS_KEY_NONE, TS_KEY_NONE, TS_KEY_NONE, TS_KEY_NONE, TS_KEY_NONE,
   TS_KEY_NONE, TS_KEY_NONE, TS_KEY_NONE, TS_KEY_NONE, TS_KEY_NONE, TS_KEY_NONE, TS_KEY_NONE, TS_KEY_NONE };
 static uint8_t g_shape_flags_none[TS_STATIC_SLOT_LIMIT];
+/* Vectors for a chain starting at depth `depth`, the parent's prefix of
+   `pdepth` entries copied from `src`: at least TS_STATIC_SLOT_LIMIT entries,
+   room for the chain to double, the tail NONE / zero. */
+static ts_shape_vec* shape_vec_new(const ts_shape_vec* src, uint32_t pdepth, uint32_t depth){
+  ts_shape_vec* v = (ts_shape_vec*)calloc(1, sizeof(ts_shape_vec));
+  uint32_t cap = depth * 2u < TS_STATIC_SLOT_LIMIT ? TS_STATIC_SLOT_LIMIT : depth * 2u;
+  if (!v) ts_abort_msg("out of memory growing the shape tables");
+  v->keys = (ts_key*)malloc(sizeof(ts_key) * cap);
+  v->kflags = (uint8_t*)malloc(cap);
+  if (!v->keys || !v->kflags) ts_abort_msg("out of memory growing the shape tables");
+  if (pdepth){
+    memcpy(v->keys, src->keys, sizeof(ts_key) * pdepth);
+    memcpy(v->kflags, src->kflags, pdepth);
+  }
+  for (uint32_t i = pdepth; i < cap; i++){ v->keys[i] = TS_KEY_NONE; v->kflags[i] = 0; }
+  v->cap = cap; v->claimed = pdepth;
+  return v;
+}
+/* Double a chain's vectors. The shapes sharing them are `last` and its
+   ancestors on the chain; their public key and flag pointers move with the
+   vectors. */
+static void shape_vec_grow(ts_shape_vec* v, uint32_t last){
+  uint32_t cap = v->cap * 2u;
+  ts_key* keys = (ts_key*)malloc(sizeof(ts_key) * cap);
+  uint8_t* kflags = (uint8_t*)malloc(cap);
+  if (!keys || !kflags) ts_abort_msg("out of memory growing the shape tables");
+  memcpy(keys, v->keys, sizeof(ts_key) * v->claimed);
+  memcpy(kflags, v->kflags, v->claimed);
+  for (uint32_t i = v->claimed; i < cap; i++){ keys[i] = TS_KEY_NONE; kflags[i] = 0; }
+  free(v->keys); free(v->kflags);
+  v->keys = keys; v->kflags = kflags; v->cap = cap;
+  for (uint32_t p = last; p > TS_SHAPE_EMPTY && g_shapes[p].vec == v; p = g_shapes[p].parent){
+    g_ts_shape_keys[p] = keys;
+    g_ts_shape_flags[p] = kflags;
+  }
+}
+/* Index the entry at `slot` of a chain's vectors, building the index over the
+   claimed entries when the chain reaches TS_PROP_INDEX_MIN and doubling it at
+   three quarters full. */
+static void shape_vec_index_add(ts_shape_vec* v, uint32_t slot){
+  uint32_t n = v->claimed;
+  if (!v->index || n * 4u >= v->index_cap * 3u){
+    uint32_t cap = v->index_cap ? v->index_cap : 16u;
+    while (n * 4u >= cap * 3u) cap *= 2u;
+    uint32_t* index = (uint32_t*)calloc(cap, sizeof(uint32_t));
+    if (!index) ts_abort_msg("out of memory growing the shape tables");
+    for (uint32_t i = 0; i < n; i++){
+      uint32_t at = prop_key_hash(v->keys[i]) & (cap - 1u);
+      while (index[at]) at = (at + 1u) & (cap - 1u);
+      index[at] = i + 1u;
+    }
+    free(v->index);
+    v->index = index; v->index_cap = cap;
+    return;
+  }
+  uint32_t at = prop_key_hash(v->keys[slot]) & (v->index_cap - 1u);
+  while (v->index[at]) at = (at + 1u) & (v->index_cap - 1u);
+  v->index[at] = slot + 1u;
+}
 static void shape_desc_record(uint32_t id, uint32_t parent, ts_key key, uint8_t flags){
   if (id >= g_shapes_cap){
     uint32_t cap = g_shapes_cap ? g_shapes_cap : 1024u;
@@ -2484,60 +2553,55 @@ static void shape_desc_record(uint32_t id, uint32_t parent, ts_key key, uint8_t 
   d->parent = parent; d->key = key; d->flags = flags;
   uint32_t pdepth = parent < g_shapes_cap ? g_shapes[parent].depth : 0u;
   d->depth = pdepth + 1u;
-  /* Eager vectors: the parent's sequence plus this key. Shaped objects index
-     them on every keyed lookup, so they must exist before the shape is used.
-     At least TS_STATIC_SLOT_LIMIT entries, the tail NONE / zero, so a static
-     slot probe (ts_rt.h) indexes them without a length test. */
-  uint32_t vcap = d->depth < TS_STATIC_SLOT_LIMIT ? TS_STATIC_SLOT_LIMIT : d->depth;
-  d->keys = (ts_key*)malloc(sizeof(ts_key) * vcap);
-  d->kflags = (uint8_t*)malloc(vcap);
-  if (pdepth){
-    memcpy(d->keys, g_shapes[parent].keys, sizeof(ts_key) * pdepth);
-    memcpy(d->kflags, g_shapes[parent].kflags, pdepth);
+  ts_shape_vec* pv = pdepth ? g_shapes[parent].vec : NULL;
+  ts_shape_vec* v;
+  if (pv && pv->claimed == pdepth){
+    /* the chain continues: this shape appends to the parent's vectors */
+    v = pv;
+    if (d->depth > v->cap) shape_vec_grow(v, parent);
+  } else {
+    /* the first shape of a chain, or a branch: vectors of its own, the
+       parent's prefix copied, room for the chain to continue */
+    v = shape_vec_new(pv, pdepth, d->depth);
   }
-  d->keys[pdepth] = key; d->kflags[pdepth] = flags;
-  for (uint32_t i = d->depth; i < vcap; i++){ d->keys[i] = TS_KEY_NONE; d->kflags[i] = 0; }
-  g_ts_shape_keys[id] = d->keys;
-  g_ts_shape_flags[id] = d->kflags;
+  v->keys[pdepth] = key; v->kflags[pdepth] = flags;
+  v->claimed = d->depth;
+  d->vec = v;
+  g_ts_shape_keys[id] = v->keys;
+  g_ts_shape_flags[id] = v->kflags;
   for (uint32_t i = 0; i < TS_STATIC_SLOT_LIMIT; i++){
-    ts_key k = d->keys[i];
-    uint8_t f = d->kflags[i];
+    ts_key k = i < d->depth ? v->keys[i] : TS_KEY_NONE;
+    uint8_t f = i < d->depth ? v->kflags[i] : 0;
     size_t at = (size_t)id * TS_STATIC_SLOT_LIMIT + i;
     g_ts_probe_rkeys[at] = !(f & TS_PROP_ACCESSOR) ? k : TS_KEY_NONE;
     g_ts_probe_wkeys[at] = (f & (TS_PROP_ACCESSOR | TS_PROP_WRITABLE)) == TS_PROP_WRITABLE ? k : TS_KEY_NONE;
   }
-  d->index = NULL; d->index_cap = 0;
-  if (d->depth >= TS_PROP_INDEX_MIN){
-    uint32_t cap = 16u;
-    while (d->depth * 4u >= cap * 3u) cap *= 2u;
-    d->index = (uint32_t*)calloc(cap, sizeof(uint32_t));
-    d->index_cap = cap;
-    for (uint32_t i = 0; i < d->depth; i++){
-      uint32_t slot = prop_key_hash(d->keys[i]) & (cap - 1u);
-      while (d->index[slot]) slot = (slot + 1u) & (cap - 1u);
-      d->index[slot] = i + 1u;
-    }
-  }
+  if (d->depth >= TS_PROP_INDEX_MIN) shape_vec_index_add(v, pdepth);
 }
-/* Slot of `key` in a shape with an index, or -1. */
+/* Slot of `key` in a shape with an index, or -1: an entry of the chain's
+   index counts only below this shape's depth. */
 static inline int32_t shape_index_find(uint32_t sid, ts_key key, uint32_t* probes){
   const ts_shape_desc* d = &g_shapes[sid];
-  uint32_t mask = d->index_cap - 1u, p = 0;
+  const ts_shape_vec* v = d->vec;
+  uint32_t mask = v->index_cap - 1u, p = 0;
   for (uint32_t slot = prop_key_hash(key) & mask; ; slot = (slot + 1u) & mask){
     p++;
-    uint32_t entry = d->index[slot];
+    uint32_t entry = v->index[slot];
     if (!entry){ if (probes) *probes = p; return -1; }
-    if (d->keys[entry - 1u] == key){ if (probes) *probes = p; return (int32_t)(entry - 1u); }
+    if (v->keys[entry - 1u] == key){
+      if (probes) *probes = p;
+      return entry - 1u < d->depth ? (int32_t)(entry - 1u) : -1;
+    }
   }
 }
 static inline uint32_t shape_depth(uint32_t id){
   return (id <= TS_SHAPE_EMPTY || id >= g_shapes_cap) ? 0u : g_shapes[id].depth;
 }
 static inline const ts_key* shape_keys(uint32_t id){
-  return (id <= TS_SHAPE_EMPTY || id >= g_shapes_cap) ? NULL : g_shapes[id].keys;
+  return (id <= TS_SHAPE_EMPTY || id >= g_shapes_cap || !g_shapes[id].vec) ? NULL : g_shapes[id].vec->keys;
 }
 static inline const uint8_t* shape_kflags(uint32_t id){
-  return (id <= TS_SHAPE_EMPTY || id >= g_shapes_cap) ? NULL : g_shapes[id].kflags;
+  return (id <= TS_SHAPE_EMPTY || id >= g_shapes_cap || !g_shapes[id].vec) ? NULL : g_shapes[id].vec->kflags;
 }
 
 static uint32_t shape_edge_hash(uint32_t parent, ts_key key, uint8_t flags){
@@ -2782,7 +2846,7 @@ static ts_pref prop_find(ts_object* o, ts_key key){
   if (obj_shaped(o)){
     uint32_t len = obj_map_plain(o)->len;
     uint32_t sid = ts_obj_shape_id(o);
-    if (len >= TS_PROP_INDEX_MIN && g_shapes[sid].index){
+    if (len >= TS_PROP_INDEX_MIN && g_shapes[sid].vec && g_shapes[sid].vec->index){
       uint32_t probes = 0;
       int32_t found = shape_index_find(sid, key, &probes);
       RT_STAT_ADD(find_prop_probes, probes); RT_STAT_HIST(find_prop_hist, probes);
@@ -3722,6 +3786,8 @@ ts_strview ts_str_view_typed_slow(tsv s){
 
 long long ts_str_find_forward_view_slow(ts_strview xs, ts_strview ns,
                                         long long start){
+  char nbuf[TS_SHORTSTR_MAX];
+  ns = ts_strview_materialize(ns, nbuf);   /* a comment's closing marker, a line break: a short needle */
   if (start < 0) start = 0;
   if (ns.len == 0) return start > (long long)xs.len ? (long long)xs.len : start;
   if (ns.len > xs.len || start > (long long)xs.len - (long long)ns.len) return -1;
@@ -3737,6 +3803,17 @@ long long ts_str_find_forward_view_slow(ts_strview xs, ts_strview ns,
       }
       const char* cur = xdata + start;
       const char* end = xdata + (xs.len - ns.len + 1);
+      if (ns.len == 2){
+        /* a two-unit needle (a comment's closing marker, CR LF): the second unit in line */
+        const char second = ndata[1];
+        while (cur < end){
+          const char* hit = memchr(cur, first, (size_t)(end - cur));
+          if (!hit) return -1;
+          if (hit[1] == second) return (long long)(hit - xdata);
+          cur = hit + 1;
+        }
+        return -1;
+      }
       while (cur < end){
         const char* hit = memchr(cur, first, (size_t)(end - cur));
         if (!hit) return -1;
@@ -3775,6 +3852,8 @@ long long ts_str_find_forward_view_slow(ts_strview xs, ts_strview ns,
 
 long long ts_str_find_backward_view_slow(ts_strview xs, ts_strview ns,
                                          long long start){
+  char nbuf[TS_SHORTSTR_MAX];
+  ns = ts_strview_materialize(ns, nbuf);
   long long maxstart = (long long)xs.len - (long long)ns.len;
   if (ns.len == 0){
     if (start < 0) return 0;
@@ -14664,6 +14743,26 @@ static tsv td_m_decode(tsv* a, int n){
     else if (enc == 2 && len >= 2 && bytes[0] == 0xFEu && bytes[1] == 0xFFu){ bytes += 2; len -= 2; }
   }
   /* the bytes are outside the heap and their buffer is rooted: they stay put */
+  if (enc == 0){
+    /* all ASCII (a source text, mostly): the bytes are the one-byte storage */
+    uint32_t i = 0;
+    for (; i + 8u <= len; i += 8u){ uint64_t w; memcpy(&w, bytes + i, 8); if (w & 0x8080808080808080ull) break; }
+    if (i + 8u > len){
+      for (; i < len; i++) if (bytes[i] >= 0x80u) break;
+      if (i == len){
+        tsv r;
+        if (len <= TS_SHORTSTR_MAX) r = ts_short_str_ascii((const char*)bytes, len);
+        else {
+          ts_string* str = ts_string_alloc_storage(len, 0);
+          memcpy(str->data, bytes, len);
+          str->flags = strflags_storage(str->data, 0, len);
+          r = ts_str_v(str);
+        }
+        ts_gc_unroot(2);
+        return r;
+      }
+    }
+  }
   uint16_t stackbuf[256];
   uint16_t* u = len + 1 <= 256 ? stackbuf : (uint16_t*)malloc(sizeof(uint16_t) * ((size_t)len + 1));
   uint32_t units = enc == 0 ? td_decode_utf8(bytes, len, u, fatal) : td_decode_utf16(bytes, len, u, enc == 2, fatal);

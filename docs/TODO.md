@@ -8578,3 +8578,31 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   run plus its mallocs and copies), `indexOf('*/')` runs the unit-by-unit
   search because an immediate short needle's view has no data pointer (2.5%),
   and the decoded ASCII text still makes a UTF-16 round trip.
+- Slice N (the parse path, runtime only): shape chains, the shapes along a
+  linear transition chain sharing one growing pair of key and flag vectors and
+  one index (`ts_shape_vec`; a branch copies the prefix; a lookup accepts an
+  index entry only below the shape's depth), so a dictionary-like object built
+  one key at a time costs O(n) in shape creation instead of O(n^2)
+  (`docs/object_model_v2_design.md`, "Shape chains"; `test_shape_chains`,
+  `objects/dictionary_chain`); the TextDecoder's all-ASCII UTF-8 input becomes
+  a one-byte string directly, without the UTF-16 round trip
+  (`stdlib/text_decoder_ascii`, recorded as unported for the frozen oracles
+  like `text_codecs`); an immediate short needle is materialized into one-byte
+  storage for the forward and backward searches, so `indexOf('*/')` and
+  `lastIndexOf` take the memchr paths instead of the unit-by-unit loop, and a
+  two-unit needle compares its second unit in line
+  (`strings/short_needle_search`). Gates all green (parity 383 identical / 157
+  known; selfconf 541 total, 497 pass, 44 known; conformance 544 plain and
+  strict, 541 protect; GC stress; bundler 43; runtime tests). tsc-ts one
+  checker, outputs identical: 26.60 -> 26.19 G instructions (-1.5%), cycles
+  -1.0%, wall 1.50 -> 1.48 s under load; the parse-only run 4.01 -> 3.61 G
+  (-10%), 0.20 -> 0.18 s. A kernel for the scanner's identifier loop
+  (`benchmarks/patterns/scanner_ident.ts`: a Uint16Array text, an ASCII
+  predicate, an FNV-1a step per code unit) runs at 2.06x scriptc's
+  instructions (1.92 against 0.93 G) and 1.83x its time; its machine code
+  (about 40 instructions per code unit) shows the operands of `Math.imul`
+  converted through a double (`scvtf` + `fjcvtzs`, the constant too, as
+  `__builtin_arm_jcvt` is not constant-folded), the sign extension of each `|
+  0` as `orr/cmp/csel`, the Uint16 element loaded into an FP register and
+  converted back, and the receiver's typed-array test repeated every
+  iteration: slices O and P (`docs/int32_codegen_design.md`).
