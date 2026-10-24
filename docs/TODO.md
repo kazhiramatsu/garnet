@@ -9214,3 +9214,22 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   into the first, a middle, the 31st, the 32nd and a further field, a
   subclass's field, a dynamic store, a sidecar property, a prototype write and
   a stored method, with collections between the writes and the reads).
+- Slice AX (runtime + emitter, the dynamic paths;
+  `docs/pic_sized_inline_design.md` "The dynamic call's method in a per-site
+  cache"): every dynamic method call on a class instance ran the runtime's
+  lookup (the registry's cache for an own field, the sidecar test, a hash of
+  the class word with the method key, the holder's shape, the slot), 10% of
+  the all-dynamic compile's samples. The call site now keeps a cache of its
+  own (the receiver's class word, the holding prototype, its shape word and
+  the slot), answering in line with the class word, the relink flag, the
+  sidecar pointer and the holder's shape; the lookup fills it on a
+  prototype-method hit for a class with no field of the method's name (a field
+  assigned later must shadow). `TSAOT_METHOD_SITE_IC=0` keeps the lookup
+  alone. Fixture classes/method_site_cache (one site over several classes, a
+  method replaced in place and one deleted after caching, an instance and a
+  class prototype relinked, a sidecar property and an own method added after
+  caching, a subclass's field of the method's name assigned later, a getter).
+  The all-dynamic compile of tsc-ts: 5.07 -> 4.76 s (-6%, paired runs in one
+  session; 12.5 s before slice AJ), outputs identical to the typed build's;
+  the typed one checker 22.52 -> 22.49 G instructions, cycles +0.2%, outputs
+  identical.

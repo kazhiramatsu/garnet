@@ -2371,6 +2371,20 @@ fn ref_eq_enabled() -> bool {
     })
 }
 
+/// TSAOT_METHOD_SITE_IC=0 keeps a dynamic method call's method lookup in the
+/// runtime alone (the parity oracle): on, the call site keeps a cache of its
+/// method keyed by the receiver's class word (docs/pic_sized_inline_design.md,
+/// "The dynamic call's method in a per-site cache").
+fn method_site_ic_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_METHOD_SITE_IC").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
 /// TSAOT_METHOD_SIZED_CACHE=0 keeps a dynamic method call's two cached reads
 /// (the parity oracle): on, a call whose receiver the program types as a class
 /// instance resolves the method through the runtime's cache by class word
@@ -22513,12 +22527,24 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                             let _ = writeln!(s, "    ts_check_method_recv(_a[0], {}u);", mf.0);
                             s.push_str("    static ts_prop_ic _ts_method_field_ic = TS_PROP_IC_INIT;\n");
                             s.push_str("    static ts_prop_ic _ts_method_proto_ic = TS_PROP_IC_INIT;\n");
-                            let _ = writeln!(
-                                s,
-                                "    tsv _mv = ts_method_lookup_sized(_a[0], {}u, {}, &_ts_method_field_ic, &_ts_method_proto_ic);",
-                                mf.0,
-                                method_key_str(method.0, ctx.wksym)
-                            );
+                            if method_site_ic_enabled() {
+                                // the site's own cache of the method (ts_rt.h ts_method_site_ic;
+                                // TSAOT_METHOD_SITE_IC=0 keeps the runtime's lookup alone)
+                                s.push_str("    static ts_method_site_ic _ts_msic = { 0u, 0u, 0u, 0u, 0 };\n");
+                                let _ = writeln!(
+                                    s,
+                                    "    tsv _mv = ts_method_lookup_sized_ic(_a[0], {}u, {}, &_ts_method_field_ic, &_ts_method_proto_ic, &_ts_msic);",
+                                    mf.0,
+                                    method_key_str(method.0, ctx.wksym)
+                                );
+                            } else {
+                                let _ = writeln!(
+                                    s,
+                                    "    tsv _mv = ts_method_lookup_sized(_a[0], {}u, {}, &_ts_method_field_ic, &_ts_method_proto_ic);",
+                                    mf.0,
+                                    method_key_str(method.0, ctx.wksym)
+                                );
+                            }
                             let _ = writeln!(s, "    if (!ts_is_callable(_mv)) ts_dynamic_method_missing({}u);", mf.0);
                         }
                         _ => emit_method_value_lookup(

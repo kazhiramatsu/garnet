@@ -15620,13 +15620,19 @@ typedef struct { uint32_t cls; ts_key key; uint32_t shape; uint32_t slot; tsv ho
 #define TS_METHOD_CACHE_SIZE 1024u
 static ts_method_cache_entry g_method_cache[TS_METHOD_CACHE_SIZE];
 tsv ts_method_lookup_sized(tsv recv, ts_key fkey, ts_key mkey, ts_prop_ic* field_ic, ts_prop_ic* proto_ic){
+  return ts_method_lookup_sized_fill(recv, fkey, mkey, field_ic, proto_ic, NULL);
+}
+/* The same, filling a call site's cache (ts_rt.h ts_method_site_ic) on a
+   prototype-method hit for a class with no field of the method's name. */
+tsv ts_method_lookup_sized_fill(tsv recv, ts_key fkey, ts_key mkey, ts_prop_ic* field_ic, ts_prop_ic* proto_ic, ts_method_site_ic* sic){
   if (TS_TOP16(recv) == TS_SEL_OBJECT){
     ts_object* o = (ts_object*)ts_ptr(recv);
     uint32_t w = o->cls;
     if (ts_obj_is_sized(o) && w != 0u && !(w & TS_CLS_RELINKED) && w != TS_CLS_PROTO && !g_class_relinked && !(g_has_proxies && ts_is_proxy(recv))){
-      size_t off; int numeric;
+      size_t off; int numeric; int has_field = 0;
       const ts_class_word_cache_entry* fe = ts_class_word_cache_entry_for(o, fkey);
       if (fe ? fe->found : (g_has_class_regs && class_field_lookup(o, fkey, &off, &numeric))){
+        has_field = 1;
         if (fe){ off = fe->offset; numeric = fe->numeric; }
         tsv v = struct_field_get(o, off, numeric);
         if (ts_is_callable(v)) return v;
@@ -15635,13 +15641,17 @@ tsv ts_method_lookup_sized(tsv recv, ts_key fkey, ts_key mkey, ts_prop_ic* field
         ts_pref p = prop_find(o, fkey);
         if (pref_ok(p)){ tsv v = prop_ic_read(recv, p); if (ts_is_callable(v)) return v; }
       }
+      if (has_field) sic = NULL;   /* a field of the method's name may shadow later: no site cache */
       uint32_t slot = ((w * 0x9E3779B1u) ^ prop_key_hash(mkey)) & (TS_METHOD_CACHE_SIZE - 1u);
       ts_method_cache_entry* e = &g_method_cache[slot];
       if (e->cls == w && e->key == mkey && e->holder){
         ts_object* h = (ts_object*)ts_ptr(e->holder);
         if (h->shape == e->shape){
           tsv v = *ts_obj_slot_ptr(h, e->slot);
-          if (!is_accessor(v)) return v;
+          if (!is_accessor(v)){
+            if (sic){ sic->cls = w; sic->holder = e->holder; sic->holder_shape = e->shape; sic->slot = e->slot; }
+            return v;
+          }
         }
       }
       /* the chain, remembering a shaped holder's plain slot */
@@ -15651,6 +15661,7 @@ tsv ts_method_lookup_sized(tsv recv, ts_key fkey, ts_key mkey, ts_prop_ic* field
         if (pref_ok(q)){
           if (!pref_is_accessor(q) && ts_obj_shape_id(p) != TS_SHAPE_NONE){
             e->cls = w; e->key = mkey; e->shape = p->shape; e->slot = q.i; e->holder = ts_obj(p);
+            if (sic){ sic->cls = w; sic->holder = ts_obj(p); sic->holder_shape = p->shape; sic->slot = q.i; }
           }
           return prop_ic_read(recv, q);
         }

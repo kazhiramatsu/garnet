@@ -985,6 +985,31 @@ tsv ts_collection_method_dynamic(tsv recv, const char* name, tsv* args, int narg
    method cache by class word (ts_rt.c); other receivers through the two
    cached reads. */
 tsv ts_method_lookup_sized(tsv recv, ts_key fkey, ts_key mkey, ts_prop_ic* field_ic, ts_prop_ic* proto_ic);
+/* A dynamic call site's cache of its method (docs/pic_sized_inline_design.md,
+   "The dynamic call's method in a per-site cache"): the receiver's class
+   word, the prototype holding the method, that holder's shape word and the
+   slot. A hit needs the same class word (an unrelinked instance of one
+   layout, of a class with no field of the method's name: the fill checks
+   that), the same holder shape (a deleted or redefined method changes it; a
+   replaced one keeps it, and the slot is re-read), no relinked prototype
+   anywhere and no sidecar on the instance (an own property could shadow),
+   and a function in the slot (an accessor takes the lookup). */
+extern int g_class_relinked;
+typedef struct { uint32_t cls; uint32_t holder_shape; uint32_t slot; uint32_t pad; tsv holder; } ts_method_site_ic;
+tsv ts_method_lookup_sized_fill(tsv recv, ts_key fkey, ts_key mkey, ts_prop_ic* field_ic, ts_prop_ic* proto_ic, ts_method_site_ic* sic);
+TS_RT_ALWAYS_INLINE tsv ts_method_lookup_sized_ic(tsv recv, ts_key fkey, ts_key mkey, ts_prop_ic* field_ic, ts_prop_ic* proto_ic, ts_method_site_ic* sic){
+  if (TS_TOP16(recv) == TS_SEL_OBJECT){
+    const ts_sized_head* o = (const ts_sized_head*)ts_ptr(recv);
+    if (o->cls == sic->cls && sic->cls != 0u && !g_class_relinked && !o->dyn){
+      ts_object* hd = (ts_object*)ts_ptr(sic->holder);
+      if (hd->shape == sic->holder_shape){
+        tsv v = *ts_obj_slot_ptr(hd, sic->slot);
+        if (ts_is_func(v)) return v;
+      }
+    }
+  }
+  return ts_method_lookup_sized_fill(recv, fkey, mkey, field_ic, proto_ic, sic);
+}
 static inline double ts_str_charcodeat_general(tsv s, double idx){
   if (TS_RT_UNLIKELY(!ts_is_str(s))) return ts_str_charcodeat_dynamic(s, idx);
   ts_strview x = ts_str_view_typed(s);

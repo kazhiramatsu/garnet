@@ -213,3 +213,32 @@ field" in line and call the lookup only when the table holds no entry.
 | tsc-ts typed, one checker, instructions | 22.73 G | 22.72 G |
 
 Outputs identical in both.
+
+## The dynamic call's method in a per-site cache (slice AX)
+
+After slices AN to AP the all-dynamic compile's profile put
+`ts_method_lookup_sized` at 10% of its samples: every dynamic method call on
+a class instance probed the registry's cache for an own field, tested the
+sidecar, hashed the class word with the method key, compared the holding
+prototype's shape and read the slot. A call site is usually monomorphic or
+nearly so in its receiver's class, so the site keeps a cache of its own
+(`ts_method_site_ic`, static in the generated code as the property caches
+are): the receiver's class word, the prototype holding the method, that
+holder's shape word and the slot. The inline path (`ts_method_lookup_sized_ic`)
+compares the class word (an unrelinked instance of one layout), tests
+`g_class_relinked` and the instance's sidecar pointer (an own property could
+shadow), compares the holder's shape (a deleted or redefined method changes
+it; a replaced one keeps it, and the slot is re-read) and takes the slot's
+value when it is a function. The runtime's lookup fills the site on a
+prototype-method hit, and only for a class with no field of the method's
+name (a field assigned later must shadow: such a class keeps the lookup);
+an accessor in the slot, a receiver through a proxy, a dictionary holder and
+every miss take the lookup as before. `TSAOT_METHOD_SITE_IC=0` keeps the
+lookup alone (the parity oracle). Fixture `classes/method_site_cache`.
+
+| program | before | after |
+|---|---|---|
+| tsc-ts, every class dynamic, wall | 5.07 s | 4.76 s (-6%; 12.5 s before slice AJ) |
+| tsc-ts typed, one checker, instructions | 22.52 G | 22.49 G |
+
+Outputs identical in both.
