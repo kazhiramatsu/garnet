@@ -196,3 +196,20 @@ first test is the same flag.
 | tsc-ts typed, one checker, instructions | 23.55 G | 23.55 G |
 
 Outputs identical in both.
+
+## A negative entry answers in line (slice AP)
+
+The registry's cache by class word remembers that a class has no such field
+as well, but only its out-of-line lookup read that answer: a dynamic method
+call's own-property probe (a method is seldom a field) and the out-of-line
+read and write's megamorphic shortcut each paid the call, the size test and
+the hash for a negative entry that was already there. The header's probe now
+returns the valid entry found or not, so those three paths answer "no such
+field" in line and call the lookup only when the table holds no entry.
+
+| program | before | after |
+|---|---|---|
+| tsc-ts, every class dynamic, wall | 5.45 s | 5.34 s (-2%) |
+| tsc-ts typed, one checker, instructions | 22.73 G | 22.72 G |
+
+Outputs identical in both.

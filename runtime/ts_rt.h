@@ -2230,13 +2230,20 @@ TS_RT_ALWAYS_INLINE uint32_t ts_prop_key_hash(ts_key key){
   x *= 0x846ca68bu;
   return x ^ (x >> 16);
 }
-TS_RT_ALWAYS_INLINE const ts_class_word_cache_entry* ts_class_word_cache_probe(const ts_object* o, ts_key key){
+/* The table's valid entry for a sized receiver's class word and a key, found
+   or not (a negative entry says the class has no such field), or NULL when
+   the table holds none (or the receiver is not a plain sized instance). */
+TS_RT_ALWAYS_INLINE const ts_class_word_cache_entry* ts_class_word_cache_entry_for(const ts_object* o, ts_key key){
   if (!ts_obj_is_sized(o)) return NULL;
   uint32_t w = o->cls;
   if (w == 0u || (w & TS_CLS_RELINKED) || w == TS_CLS_PROTO) return NULL;
   const ts_class_word_cache_entry* e = &g_class_word_cache[((w * 0x9E3779B1u) ^ ts_prop_key_hash(key)) & (TS_CLASS_WORD_CACHE_SIZE - 1u)];
-  if (e->cls != w || e->key != key || e->epoch != g_ts_class_layout_epoch || !e->found) return NULL;
+  if (e->cls != w || e->key != key || e->epoch != g_ts_class_layout_epoch) return NULL;
   return e;
+}
+TS_RT_ALWAYS_INLINE const ts_class_word_cache_entry* ts_class_word_cache_probe(const ts_object* o, ts_key key){
+  const ts_class_word_cache_entry* e = ts_class_word_cache_entry_for(o, key);
+  return (e && e->found) ? e : NULL;
 }
 /* A field access whose receiver the program types as a class instance while
    its class dispatches dynamically (docs/pic_sized_inline_design.md, "At a

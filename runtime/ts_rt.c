@@ -15623,7 +15623,9 @@ tsv ts_method_lookup_sized(tsv recv, ts_key fkey, ts_key mkey, ts_prop_ic* field
     uint32_t w = o->cls;
     if (ts_obj_is_sized(o) && w != 0u && !(w & TS_CLS_RELINKED) && w != TS_CLS_PROTO && !g_class_relinked && !(g_has_proxies && ts_is_proxy(recv))){
       size_t off; int numeric;
-      if (g_has_class_regs && class_field_lookup(o, fkey, &off, &numeric)){
+      const ts_class_word_cache_entry* fe = ts_class_word_cache_entry_for(o, fkey);
+      if (fe ? fe->found : (g_has_class_regs && class_field_lookup(o, fkey, &off, &numeric))){
+        if (fe){ off = fe->offset; numeric = fe->numeric; }
         tsv v = struct_field_get(o, off, numeric);
         if (ts_is_callable(v)) return v;
       }
@@ -15905,7 +15907,9 @@ tsv ts_get_pic_checked(tsv obj, ts_key key, ts_prop_ic* ic){
   if (ic && ic->megamorphic && TS_TOP16(obj) == TS_SEL_OBJECT && g_has_class_regs){
     ts_object* o = (ts_object*)ts_ptr(obj);
     size_t off; int numeric;
-    if (ts_obj_is_sized(o) && class_field_lookup(o, key, &off, &numeric)) return struct_field_get(o, off, numeric);
+    const ts_class_word_cache_entry* fe = ts_class_word_cache_entry_for(o, key);
+    if (fe){ if (fe->found) return struct_field_get(o, fe->offset, fe->numeric); }
+    else if (ts_obj_is_sized(o) && class_field_lookup(o, key, &off, &numeric)) return struct_field_get(o, off, numeric);
   }
   /* a sized class instance's field the site has cached by class word
      (docs/pic_sized_inline_design.md): the slot read by its kind. The site's
@@ -16254,7 +16258,9 @@ void ts_set_pic(tsv obj, ts_key key, tsv val, ts_prop_ic* ic){
   if (ic && ic->megamorphic && TS_TOP16(obj) == TS_SEL_OBJECT && g_has_class_regs){
     ts_object* o = (ts_object*)ts_ptr(obj);
     size_t off; int numeric;
-    if (ts_obj_is_sized(o) && class_field_lookup(o, key, &off, &numeric)){
+    const ts_class_word_cache_entry* fe = ts_class_word_cache_entry_for(o, key);
+    if (fe ? fe->found : (ts_obj_is_sized(o) && class_field_lookup(o, key, &off, &numeric))){
+      if (fe){ off = fe->offset; numeric = fe->numeric; }
       if (ts_obj_integrity(o) & 1u){ ts_throw_readonly_write(key); return; }
       struct_field_set(o, off, numeric, val); return;
     }

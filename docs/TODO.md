@@ -9169,3 +9169,15 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   typed one checker over eight pairs: 22.73 -> 22.70 G instructions (-0.10%),
   cycles -0.53%, wall 1.23 -> 1.22 s, outputs identical; the dynamic
   construction path zeroes numeric fields itself now.
+- Slice AP (runtime, the dynamic paths; `docs/pic_sized_inline_design.md` "A
+  negative entry answers in line"): the registry's cache by class word
+  remembers a class's missing field too, but only the out-of-line lookup read
+  that answer; a dynamic method call's own-property probe (a method is seldom
+  a field) and the megamorphic shortcuts of the out-of-line read and write
+  paid the call, the size test and the hash for a negative entry already
+  there. The header's probe returns the valid entry found or not, and those
+  paths answer in line, calling the lookup only when the table holds no entry.
+  The all-dynamic compile of tsc-ts: 5.45 -> 5.34 s (-2%; a paired run under
+  the gates' load gave 5.75 -> 5.34 s), outputs identical to the typed
+  build's; the typed one checker 22.73 -> 22.72 G instructions, cycles and
+  wall unchanged, outputs identical.
