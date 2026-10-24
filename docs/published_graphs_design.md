@@ -196,6 +196,58 @@ mixed instances).
   trained builds' own variation is 0.01% in instructions and 0.2% in
   cycles).
 
+### P3 as built
+
+- `ts_worker_fork_shared(data)`: the parent takes a run of blocks from the
+  cage frontier (`TSAOT_SHARED_REGION_MB`, default 512), maps it
+  `MAP_SHARED | MAP_ANON | MAP_FIXED` at its cage address and marks the run
+  `GC_BLK_REGION`: the collector's conservative scan ignores a word into it
+  (no cell block), nothing allocates there, nothing sweeps it. The child
+  abandons every size class's cursor and block list, the free-block list,
+  the large lists and the dirty-block log (the parent's blocks are the
+  parent's), and `gc_block_take` and `gc_cage_frontier_take` serve from the
+  region only (`gc_region_take`; exhaustion aborts naming the knob). A new
+  property name interned in a shared worker aborts loudly (v1).
+- Shape ids: at the first shared fork the parent's next id becomes the
+  partition base with a headroom of `TSAOT_SHARED_SHAPES` (65,536) ids; the
+  k-th worker gets the k-th range above it. A worker past its range aborts;
+  the parent past its headroom aborts while workers live and jumps past
+  their ranges once they are gone (`shape_limit_reached`). A worker logs
+  every shape it creates (`shape_log_push`) and ships the log with its next
+  frame; the parent installs them at the worker's ids
+  (`shape_install_at`: the edge only when it has no transition for the
+  keys, the descriptor always).
+- `publish` in a shared worker promotes every cell it reaches
+  (`gc_cell_promote`: old, the old bit, not remembered) and sets its mark to
+  1: immortal in the worker, and opaque to the parent's markers, whose
+  per-edge filter takes mark 1 as already marked, so the parent never
+  scans a region cell and never needs its block metadata. A pre-fork cell
+  the graph reached is recorded and shipped with the next frame; the parent
+  freezes it, flags it published and roots it for good (the region refers
+  to it and the parent's marker will not look).
+- The codec: a published cell inside the worker's region encodes as
+  `MSG_SHARED` with its address (a function cell too); the parent's decoder
+  accepts the tag only for a frame from a shared worker, checks the address
+  lies in that worker's region at a cell boundary and names a published
+  cell of a valid kind, and returns it in place. A shared worker's frame
+  starts with `MSG_FRAME_SHARED`, the shape log and the frozen pre-fork
+  cells, then the message; a plain worker's frames are unchanged.
+- The parent runs young collections only while a shared worker lives (the
+  full threshold saved and restored when the last one exits);
+  `TSAOT_PUBLISH_PROTECT=1` maps the region read-only in the parent when
+  the worker exits (a diagnostic: string hashes are cached lazily).
+- The tsc-ts host's `forkWorker(data, shared)` and the shim fork a parse
+  thread (`workerData.kind === 'parse'`) as a shared worker; nothing starts
+  one yet (P5).
+- Runtime tests: a shared worker publishes a graph with a nested array and
+  object, a Map, a string, a function cell, an object of a shape the parent
+  never made and a pre-fork cell, and posts it wrapped and bare: the two
+  frames name one cell, every part reads in place, the Map reads, the new
+  shape's keys read, the pre-fork cell is the parent's own and frozen
+  there, writes and `Map.set` throw in the parent, and the graph survives
+  the parent's young and full collections; a worker past its region and
+  one interning a new name die loudly into the error handler.
+
 ## Sharing by fork: regions
 
 The fork prototype shares the parent's heap with its children by

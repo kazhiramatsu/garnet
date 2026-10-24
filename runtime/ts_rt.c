@@ -229,7 +229,29 @@ extern void __asan_poison_memory_region(const void *addr, size_t size);
 #define GC_PAYLOAD_SMALL_MAX ((size_t)32768u)
 #define GC_PAYLOAD_NCLASS 64
 #define GC_CAGE_COMMIT_BLOCKS 16u   /* the frontier commits 1 MiB at a time */
-enum { GC_BLK_FREE = 0, GC_BLK_PAYLOAD = 1, GC_BLK_LARGE = 2, GC_BLK_LARGE_CONT = 3, GC_BLK_CELL = 4, GC_BLK_LARGE_CELL = 5 };
+enum { GC_BLK_FREE = 0, GC_BLK_PAYLOAD = 1, GC_BLK_LARGE = 2, GC_BLK_LARGE_CONT = 3, GC_BLK_CELL = 4, GC_BLK_LARGE_CELL = 5,
+       GC_BLK_REGION = 6 };   /* a shared worker's region, in the parent: never allocated into, swept or scanned */
+/* ---- Shared regions (docs/published_graphs_design.md, "Sharing by fork") ----
+   A shared worker allocates into a run of blocks the parent mapped
+   MAP_SHARED before the fork; the parent keeps the run as GC_BLK_REGION,
+   immortal and opaque (a published cell carries gen OLD and mark 1, which the
+   markers take as "already marked"). Shape ids are partitioned at the fork;
+   a worker ships its new descriptors with every frame. */
+static int g_region_mode = 0;                                  /* this process is a shared worker */
+static uint32_t g_region_lo = 0, g_region_cur = 0, g_region_hi = 0;   /* its blocks */
+static uint32_t g_shared_workers_alive = 0;                    /* the parent's live shared workers */
+static uint32_t g_shared_forks = 0;                            /* shared workers forked in this partition */
+static uint32_t g_shape_partition_base = 0, g_shape_limit = 0, g_shape_jump_to = 0;
+static size_t g_full_threshold_saved = 0; static int g_full_threshold_forced_saved = 0;
+typedef struct { uint32_t id, parent, key; uint8_t flags; } shape_log_entry;
+static shape_log_entry* g_shape_log = NULL; static size_t g_shape_log_len = 0, g_shape_log_cap = 0;
+static uintptr_t* g_prefork_frozen = NULL; static size_t g_prefork_frozen_len = 0, g_prefork_frozen_cap = 0;
+static tsv g_shared_prefork_roots = TS_UNDEFINED; static int g_shared_prefork_roots_rooted = 0;
+static uint32_t gc_region_take(uint32_t n){
+  if (g_region_cur + n > g_region_hi) ts_abort_msg("a shared worker's region is full (TSAOT_SHARED_REGION_MB)");
+  uint32_t bi = g_region_cur; g_region_cur += n;
+  return bi;
+}
 typedef struct gc_block {
   uint8_t state, cls, mark, alloc_dirty;   /* alloc_dirty: a cell block allocated into since the last collection */
   uint32_t epoch;      /* the cursor is valid when it equals g_payload_epoch */
@@ -409,7 +431,13 @@ static void gc_alloc_bits_settle(void){
   }
 }
 /* A run of `n` never-used blocks at the frontier, committed on the way. */
+static inline int region_holds(const void* p){
+  uintptr_t off = (uintptr_t)p - (uintptr_t)g_cage_base;
+  uint32_t bi = (uint32_t)(off >> GC_BLOCK_SHIFT);
+  return off < g_cage_bytes && bi >= g_region_lo && bi < g_region_hi;
+}
 static uint32_t gc_cage_frontier_take(uint32_t n){
+  if (TS_RT_UNLIKELY(g_region_mode)) return gc_region_take(n);
   if (!g_cage_base) gc_cage_init();
   if ((uint64_t)g_cage_frontier + n > g_cage_blocks) ts_abort_msg("out of memory: the heap cage is full (TSAOT_GC_CAGE_GB)");
   uint32_t bi = g_cage_frontier;
@@ -425,6 +453,7 @@ static uint32_t gc_cage_frontier_take(uint32_t n){
   return bi;
 }
 static uint32_t gc_block_take(void){
+  if (TS_RT_UNLIKELY(g_region_mode)) return gc_region_take(1u);
   if (g_free_blocks){
     uint32_t bi = g_free_blocks - 1u;
     g_free_blocks = g_blocks[bi].next;
@@ -2754,6 +2783,24 @@ static int shape_edges_grow(void){
   g_shape_edge_cap = new_cap;
   return 1;
 }
+static void shape_log_push(uint32_t id, uint32_t parent, ts_key key, uint8_t flags){
+  if (g_shape_log_len == g_shape_log_cap){
+    size_t next = g_shape_log_cap ? g_shape_log_cap * 2u : 256u;
+    shape_log_entry* grown = (shape_log_entry*)realloc(g_shape_log, next * sizeof *grown);
+    if (!grown) ts_abort_msg("out of memory logging a shared worker's shapes");
+    g_shape_log = grown; g_shape_log_cap = next;
+  }
+  g_shape_log[g_shape_log_len++] = (shape_log_entry){ id, parent, key, flags };
+}
+/* The shape ids are partitioned while shared workers run: the parent has a
+   headroom above the partition's base, each worker a range above it. A
+   worker that runs out stops; the parent that runs out stops while workers
+   live and jumps past their ranges once they are gone. */
+static void shape_limit_reached(void){
+  if (g_region_mode) ts_abort_msg("a shared worker created more shapes than its id range (TSAOT_SHARED_SHAPES)");
+  if (g_shared_workers_alive) ts_abort_msg("the parent created more shapes than its headroom while shared workers run (TSAOT_SHARED_SHAPES)");
+  g_next_shape = g_shape_jump_to; g_shape_limit = 0;
+}
 static uint32_t shape_transition_f(uint32_t parent, ts_key key, uint8_t flags){
   if (parent == TS_SHAPE_NONE) return TS_SHAPE_NONE;
   if (!g_shape_edge_cap || (g_shape_edge_len + 1u) * 4u >= g_shape_edge_cap * 3u){
@@ -2766,6 +2813,7 @@ static uint32_t shape_transition_f(uint32_t parent, ts_key key, uint8_t flags){
       return g_shape_edges[slot].next;
     slot = (slot + 1u) & (g_shape_edge_cap - 1u);
   }
+  if (TS_RT_UNLIKELY(g_shape_limit && g_next_shape >= g_shape_limit)) shape_limit_reached();
   if (g_next_shape > TS_SHAPE_MAX) return TS_SHAPE_NONE;
   uint32_t next = g_next_shape++;
   g_shape_edges[slot].parent = parent;
@@ -2774,7 +2822,27 @@ static uint32_t shape_transition_f(uint32_t parent, ts_key key, uint8_t flags){
   g_shape_edges[slot].next = next;
   g_shape_edge_len++;
   shape_desc_record(next, parent, key, flags);
+  if (TS_RT_UNLIKELY(g_region_mode)) shape_log_push(next, parent, key, flags);
   return next;
+}
+/* The parent installs a shared worker's shape at the worker's id: the edge
+   when the parent has no transition for the keys (its own keeps its id; two
+   ids for one layout cost cache misses, not correctness), the descriptor. */
+static void shape_install_at(uint32_t id, uint32_t parent, ts_key key, uint8_t flags){
+  if (!g_shape_edge_cap || (g_shape_edge_len + 1u) * 4u >= g_shape_edge_cap * 3u){
+    if (!shape_edges_grow()) ts_abort_msg("out of memory growing the shape tables");
+  }
+  uint32_t slot = shape_edge_hash(parent, key, flags) & (g_shape_edge_cap - 1u);
+  while (g_shape_edges[slot].next){
+    if (g_shape_edges[slot].parent == parent && g_shape_edges[slot].key == key && g_shape_edges[slot].flags == flags) break;
+    slot = (slot + 1u) & (g_shape_edge_cap - 1u);
+  }
+  if (!g_shape_edges[slot].next){
+    g_shape_edges[slot].parent = parent; g_shape_edges[slot].key = key; g_shape_edges[slot].flags = flags;
+    g_shape_edges[slot].next = id; g_shape_edge_len++;
+  }
+  if (id < g_shapes_cap && g_shapes[id].depth) return;
+  shape_desc_record(id, parent, key, flags);
 }
 /* Ordinary stores add properties with the default attributes. */
 static uint32_t shape_transition(uint32_t parent, ts_key key){
@@ -10166,6 +10234,10 @@ uint32_t ts_intern_field(const char* name, uint32_t len){
   int found = field_index_lookup(name, len, h, &probes);
   RT_STAT_ADD(intern_probes, probes);
   if (found >= 0) return (uint32_t)found;
+  if (TS_RT_UNLIKELY(g_region_mode)){
+    char buf[256]; snprintf(buf, sizeof buf, "a shared worker interned a new property name '%.*s' (docs/published_graphs_design.md: not carried to the parent yet)", (int)(len < 200 ? len : 200), name);
+    ts_abort_msg(buf);
+  }
   /* new field: grow the parallel name/len arrays if needed */
   if (g_field_count==g_field_cap){
     g_field_cap=g_field_cap?g_field_cap*2:16;
@@ -18355,6 +18427,15 @@ static void publish_children(publish_walk* w, ts_gc_header* h){
   }
   /* strings and symbols are immutable; the rejected kinds never get here */
 }
+static void prefork_frozen_push(uintptr_t a){
+  if (g_prefork_frozen_len == g_prefork_frozen_cap){
+    size_t next = g_prefork_frozen_cap ? g_prefork_frozen_cap * 2u : 64u;
+    uintptr_t* grown = (uintptr_t*)realloc(g_prefork_frozen, next * sizeof *grown);
+    if (!grown) ts_abort_msg("out of memory logging a shared worker's frozen cells");
+    g_prefork_frozen = grown; g_prefork_frozen_cap = next;
+  }
+  g_prefork_frozen[g_prefork_frozen_len++] = a;
+}
 tsv ts_publish(tsv v){
   if (!(TS_TOP16(v) == TS_SEL_OBJECT || ts_is_func(v))) return v;    /* primitives: already immutable */
   if (g_has_proxies && ts_is_proxy(v)) ts_throw_type_error_msg("Cannot publish a Proxy");
@@ -18376,6 +18457,14 @@ tsv ts_publish(tsv v){
     if (h->kind == TS_KIND_OBJECT || h->kind == TS_KIND_ARRAY || h->kind == TS_KIND_FUNC || h->kind == TS_KIND_MAP || h->kind == TS_KIND_SET)
       ts_obj_add_integrity((ts_object*)h, 1u);
     h->flags |= TS_HDR_PUBLISHED;
+    if (g_region_mode){
+      /* immortal here (old, never collected) and opaque to the parent's
+         markers (mark 1 reads as already marked); a pre-fork cell goes to
+         the parent with the next frame, which freezes and roots it */
+      if (h->gen == TS_GEN_YOUNG) g_old_bytes += gc_cell_heap_bytes(h, gc_cell_promote(h));
+      h->mark = 1;
+      if (!region_holds(h)) prefork_frozen_push((uintptr_t)h);
+    }
   }
   if (w.len) prop_add_epoch_bump();
   free(w.cells); free(w.seen);
@@ -18399,7 +18488,9 @@ static void ts_garnet_global_init(tsv global){
   ts_set_cstr(global, "__garnet", g);
   ts_gc_unroot(4);
 }
-enum { MSG_UNDEF = 0, MSG_NULL, MSG_FALSE, MSG_TRUE, MSG_NUM, MSG_STR8, MSG_STR16, MSG_ARRAY, MSG_OBJECT, MSG_TYPED, MSG_REF };
+enum { MSG_UNDEF = 0, MSG_NULL, MSG_FALSE, MSG_TRUE, MSG_NUM, MSG_STR8, MSG_STR16, MSG_ARRAY, MSG_OBJECT, MSG_TYPED, MSG_REF,
+       MSG_SHARED };   /* a published cell in a shared worker's region: its address, the parent reads it in place */
+#define MSG_FRAME_SHARED 0xFEu   /* a shared worker's frame: shapes, frozen pre-fork cells, then the message */
 
 typedef struct { uint8_t* p; size_t len, cap; const void** seen; size_t nseen, cseen; } msg_enc;
 
@@ -18461,8 +18552,14 @@ static void msg_encode(msg_enc* e, tsv v){
     }
     return;
   }
+  if (ts_is_func(v) && g_region_mode && (((ts_gc_header*)ts_ptr(v))->flags & TS_HDR_PUBLISHED) && region_holds(ts_ptr(v))){
+    uintptr_t a = (uintptr_t)ts_ptr(v); msg_put_u8(e, MSG_SHARED); msg_put(e, &a, 8); return;
+  }
   if (!ts_is_obj(v)) msg_fail("a value of an unknown kind");
   ts_gc_header* h = (ts_gc_header*)ts_ptr(v);
+  if (g_region_mode && (h->flags & TS_HDR_PUBLISHED) && region_holds(h)){
+    uintptr_t a = (uintptr_t)h; msg_put_u8(e, MSG_SHARED); msg_put(e, &a, 8); return;
+  }
   long ref = msg_seen(e, h);
   if (ref >= 0){ msg_put_u8(e, MSG_REF); msg_put_u32(e, (uint32_t)ref); return; }
   switch (h->kind){
@@ -18500,7 +18597,7 @@ static void msg_encode(msg_enc* e, tsv v){
   }
 }
 
-typedef struct { const uint8_t* p; size_t len, pos; tsv table; } msg_dec;   /* table: the cells decoded so far, a rooted array */
+typedef struct { const uint8_t* p; size_t len, pos; tsv table; uint32_t region_lo, region_hi; } msg_dec;   /* table: the cells decoded so far, a rooted array; region: the sender's blocks (shared worker), else 0 */
 static void msg_bad(void){ ts_abort_msg("a malformed worker message"); }
 static void msg_get(msg_dec* d, void* dst, size_t n){ if (d->pos + n > d->len) msg_bad(); memcpy(dst, d->p + d->pos, n); d->pos += n; }
 static uint8_t msg_get_u8(msg_dec* d){ uint8_t v; msg_get(d, &v, 1); return v; }
@@ -18536,6 +18633,15 @@ static tsv msg_decode(msg_dec* d){
     case MSG_STR8: return msg_decode_string(d, 0);
     case MSG_STR16: return msg_decode_string(d, 1);
     case MSG_REF: { uint32_t i = msg_get_u32(d); if (i >= ts_array_len(d->table)) msg_bad(); return ts_array_get(d->table, i); }
+    case MSG_SHARED: {
+      uintptr_t a; msg_get(d, &a, 8);
+      uintptr_t off = a - (uintptr_t)g_cage_base;
+      uint32_t bi = (uint32_t)(off >> GC_BLOCK_SHIFT);
+      if (!d->region_hi || off >= g_cage_bytes || bi < d->region_lo || bi >= d->region_hi || (a & 15u)) msg_bad();
+      ts_gc_header* h = (ts_gc_header*)a;
+      if (!(h->flags & TS_HDR_PUBLISHED) || !gc_kind_valid(h->kind)) msg_bad();
+      return h->kind == TS_KIND_FUNC ? ts_func_v(h) : ts_obj(h);
+    }
     case MSG_ARRAY: {
       uint32_t n = msg_get_u32(d);
       tsv arr = ts_new_array(0); ts_array_push(d->table, arr);   /* the table roots it */
@@ -18568,13 +18674,14 @@ static tsv msg_decode(msg_dec* d){
     default: msg_bad(); return TS_UNDEFINED;
   }
 }
-static tsv msg_decode_frame(const uint8_t* p, size_t n){
-  msg_dec d = { p, n, 0, TS_UNDEFINED };
+static tsv msg_decode_frame_from(const uint8_t* p, size_t n, uint32_t region_lo, uint32_t region_hi){
+  msg_dec d = { p, n, 0, TS_UNDEFINED, region_lo, region_hi };
   d.table = ts_new_array(0); ts_gc_root(&d.table);
   tsv v = msg_decode(&d);
   ts_gc_unroot(1);
   return v;
 }
+static tsv msg_decode_frame(const uint8_t* p, size_t n){ return msg_decode_frame_from(p, n, 0u, 0u); }
 /* the codec on one value, for the runtime's tests */
 tsv ts_message_roundtrip(tsv v){
   ts_gc_root(&v);
@@ -18586,7 +18693,8 @@ tsv ts_message_roundtrip(tsv v){
   return r;
 }
 
-typedef struct ts_watch { int id; pid_t pid; int fd; uint8_t* buf; size_t len, cap; int messages; struct ts_watch* next; } ts_watch;
+typedef struct ts_watch { int id; pid_t pid; int fd; uint8_t* buf; size_t len, cap; int messages; struct ts_watch* next;
+                          uint32_t region_lo, region_hi; } ts_watch;   /* region: a shared worker's blocks, else 0 */
 static ts_watch* g_watches = NULL;
 static int g_watch_ids = 0;
 static tsv g_watch_handlers = TS_UNDEFINED;     /* [2 id] the message handler, [2 id + 1] the error handler */
@@ -18618,6 +18726,18 @@ void ts_worker_post(tsv value){
   if (!g_is_worker) ts_throw_type_error_msg("postMessage: this is the main thread (parentPort is null)");
   ts_gc_root(&value);
   g_post_enc.len = 0; g_post_enc.nseen = 0;
+  if (g_region_mode){
+    msg_put_u8(&g_post_enc, MSG_FRAME_SHARED);
+    msg_put_u32(&g_post_enc, (uint32_t)g_shape_log_len);
+    for (size_t i = 0; i < g_shape_log_len; i++){
+      msg_put_u32(&g_post_enc, g_shape_log[i].id); msg_put_u32(&g_post_enc, g_shape_log[i].parent);
+      msg_put_u32(&g_post_enc, g_shape_log[i].key); msg_put_u8(&g_post_enc, g_shape_log[i].flags);
+    }
+    g_shape_log_len = 0;
+    msg_put_u32(&g_post_enc, (uint32_t)g_prefork_frozen_len);
+    for (size_t i = 0; i < g_prefork_frozen_len; i++) msg_put(&g_post_enc, &g_prefork_frozen[i], 8);
+    g_prefork_frozen_len = 0;
+  }
   msg_encode(&g_post_enc, value);
   ts_gc_unroot(1);
   uint32_t len = (uint32_t)g_post_enc.len;
@@ -18639,6 +18759,13 @@ static void watch_close(ts_watch* w){
   if (waitpid(w->pid, &status, 0) != w->pid) status = 0;
   int failed = WIFSIGNALED(status) || (WIFEXITED(status) && WEXITSTATUS(status) != 0);
   int id = w->id;
+  if (w->region_hi){
+    if (getenv("TSAOT_PUBLISH_PROTECT") && getenv("TSAOT_PUBLISH_PROTECT")[0] == '1')
+      mprotect(gc_block_base(w->region_lo), (size_t)(w->region_hi - w->region_lo) << GC_BLOCK_SHIFT, PROT_READ);
+    if (g_shared_workers_alive && --g_shared_workers_alive == 0){
+      g_full_threshold_bytes = g_full_threshold_saved; g_full_threshold_forced = g_full_threshold_forced_saved;
+    }
+  }
   free(w->buf); free(w);
   if (failed){
     char buf[128];
@@ -18666,7 +18793,35 @@ static void watch_read(ts_watch* w){
   while (w->len >= 4){
     uint32_t len; memcpy(&len, w->buf, 4);
     if (w->len < 4u + len) break;
-    tsv v = msg_decode_frame(w->buf + 4, len); ts_gc_root(&v);
+    tsv v;
+    if (len && w->buf[4] == MSG_FRAME_SHARED){
+      if (!w->region_hi) ts_abort_msg("a shared frame from a worker without a region");
+      msg_dec d = { w->buf + 5, len - 1u, 0, TS_UNDEFINED, w->region_lo, w->region_hi };
+      uint32_t nshapes = msg_get_u32(&d);
+      for (uint32_t i = 0; i < nshapes; i++){
+        uint32_t id = msg_get_u32(&d), parent = msg_get_u32(&d), key = msg_get_u32(&d); uint8_t flags = msg_get_u8(&d);
+        if (id <= TS_SHAPE_EMPTY || id > TS_SHAPE_MAX || key >= g_field_count) msg_bad();
+        shape_install_at(id, parent, key, flags);
+      }
+      uint32_t nfrozen = msg_get_u32(&d);
+      for (uint32_t i = 0; i < nfrozen; i++){
+        uintptr_t a; msg_get(&d, &a, 8);
+        uintptr_t off = a - (uintptr_t)g_cage_base;
+        if (off >= g_cage_bytes || (a & 15u)) msg_bad();
+        ts_gc_header* h = (ts_gc_header*)a;
+        if (!gc_kind_valid(h->kind) || h->gen > TS_GEN_OLD) msg_bad();
+        if (h->kind == TS_KIND_OBJECT || h->kind == TS_KIND_ARRAY || h->kind == TS_KIND_FUNC || h->kind == TS_KIND_MAP || h->kind == TS_KIND_SET)
+          ts_obj_add_integrity((ts_object*)h, 1u);
+        h->flags |= TS_HDR_PUBLISHED;
+        if (ts_is_undef(g_shared_prefork_roots)){ g_shared_prefork_roots = ts_new_array(0); ts_root_static_once(&g_shared_prefork_roots, &g_shared_prefork_roots_rooted); }
+        ts_array_push(g_shared_prefork_roots, h->kind == TS_KIND_FUNC ? ts_func_v(h) : ts_obj(h));
+      }
+      if (nshapes) prop_add_epoch_bump();
+      v = msg_decode_frame_from(d.p + d.pos, d.len - d.pos, w->region_lo, w->region_hi);
+    } else {
+      v = msg_decode_frame(w->buf + 4, len);
+    }
+    ts_gc_root(&v);
     w->messages++;
     size_t rest = w->len - 4u - len;
     memmove(w->buf, w->buf + 4u + len, rest); w->len = rest;
@@ -18690,16 +18845,64 @@ static void ts_watch_poll(int timeout_ms){
 }
 /* Fork a worker: the child runs the registered entry with `data` (the same
    cells, at the same addresses) and ends; the parent gets the worker's id. */
-int ts_worker_fork(tsv data){
+static uint32_t env_u32(const char* name, uint32_t dflt){
+  const char* s = getenv(name);
+  if (!s || !*s) return dflt;
+  unsigned long v = strtoul(s, NULL, 10);
+  return v ? (uint32_t)v : dflt;
+}
+static int ts_worker_fork_ex(tsv data, int shared);
+int ts_worker_fork(tsv data){ return ts_worker_fork_ex(data, 0); }
+int ts_worker_fork_shared(tsv data){ return ts_worker_fork_ex(data, 1); }
+static int ts_worker_fork_ex(tsv data, int shared){
   if (!ts_is_func(g_worker_entry)) ts_throw_type_error_msg("Worker: no worker entry is registered");
+  if (shared && g_region_mode) ts_throw_type_error_msg("Worker: a shared worker cannot fork a shared worker");
   ts_gc_root(&data);
   fflush(stdout); fflush(stderr);
+  /* the region: a run of blocks mapped shared at its cage address; the
+     parent keeps it as GC_BLK_REGION; the shape ids partitioned */
+  uint32_t region_lo = 0, region_hi = 0, child_shape_lo = 0, child_shape_hi = 0;
+  if (shared){
+    uint32_t mb = env_u32("TSAOT_SHARED_REGION_MB", 512u);
+    uint32_t nblocks = (uint32_t)(((size_t)mb << 20) >> GC_BLOCK_SHIFT);
+    if (!nblocks) nblocks = 1u;
+    region_lo = gc_cage_frontier_take(nblocks); region_hi = region_lo + nblocks;
+    char* base = gc_block_base(region_lo);
+    void* m = mmap(base, (size_t)nblocks << GC_BLOCK_SHIFT, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON | MAP_FIXED, -1, 0);
+    if (m != (void*)base) ts_abort_msg("cannot map a shared worker's region");
+    for (uint32_t i = region_lo; i < region_hi; i++){ memset(&g_blocks[i], 0, sizeof(gc_block)); g_blocks[i].state = GC_BLK_REGION; }
+    uint32_t span = env_u32("TSAOT_SHARED_SHAPES", 65536u);
+    if (!g_shared_workers_alive){
+      g_shape_partition_base = g_next_shape; g_shared_forks = 0;
+      g_shape_limit = g_shape_partition_base + span;
+      g_full_threshold_saved = g_full_threshold_bytes; g_full_threshold_forced_saved = g_full_threshold_forced;
+      g_full_threshold_bytes = SIZE_MAX; g_full_threshold_forced = 1;   /* young collections only while workers live */
+    }
+    g_shared_forks++;
+    child_shape_lo = g_shape_partition_base + g_shared_forks * span; child_shape_hi = child_shape_lo + span;
+    if (child_shape_hi > TS_SHAPE_MAX) ts_abort_msg("too many shared workers for the shape id space (TSAOT_SHARED_SHAPES)");
+    g_shape_jump_to = child_shape_hi;
+    g_shared_workers_alive++;
+  }
   int fds[2];
   if (pipe(fds) != 0) ts_throw_type_error_msg("Worker: pipe failed");
   pid_t pid = fork();
   if (pid < 0){ close(fds[0]); close(fds[1]); ts_throw_type_error_msg("Worker: fork failed"); }
   if (pid == 0){
     close(fds[0]);
+    if (shared){
+      /* region mode: every cursor and list abandoned (the parent's blocks
+         are the parent's), blocks from the region only, the shape ids of
+         this worker's range, no full collection (the plain worker's rule) */
+      g_region_mode = 1; g_region_lo = region_lo; g_region_cur = region_lo; g_region_hi = region_hi;
+      for (int cls = 0; cls < GC_PAYLOAD_NCLASS; cls++){
+        gc_pclass* fam[4] = { &g_pclass[cls], &g_cclass[cls], &g_cclass_old[cls], &g_cclass_sized[cls] };
+        for (int k = 0; k < 4; k++){ fam[k]->ptr = fam[k]->end = NULL; fam[k]->head = 0; fam[k]->scan = 0; }
+      }
+      g_free_blocks = 0; g_large_head = 0; g_large_cell_head = 0; g_alloc_dirty_len = 0;
+      g_next_shape = child_shape_lo; g_shape_limit = child_shape_hi; g_shape_jump_to = 0;
+      g_shared_workers_alive = 0; g_shape_log_len = 0; g_prefork_frozen_len = 0;
+    }
     /* the parent's pending work is the parent's: its workers' pipes, its
        microtasks and I/O tasks */
     for (ts_watch* w = g_watches; w; w = w->next) close(w->fd);
@@ -18735,6 +18938,7 @@ int ts_worker_fork(tsv data){
   ts_watch* w = (ts_watch*)calloc(1, sizeof *w);
   if (!w) ts_abort_msg("out of memory starting a worker");
   w->id = ++g_watch_ids; w->pid = pid; w->fd = fds[0]; w->next = g_watches; g_watches = w;
+  w->region_lo = region_lo; w->region_hi = region_hi;
   return w->id;
 }
 

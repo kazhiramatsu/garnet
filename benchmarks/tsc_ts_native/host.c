@@ -250,7 +250,11 @@ static tsv host_exit(tsv* a, int n){
 }
 /* Workers by fork (docs/fork_workers_design.md): the shims' node:worker_threads. */
 static tsv host_set_worker_entry(tsv* a, int n){ ts_worker_set_entry(arg(a, n, 0)); return TS_UNDEFINED; }
-static tsv host_fork_worker(tsv* a, int n){ return ts_num((double)ts_worker_fork(arg(a, n, 0))); }
+static tsv host_fork_worker(tsv* a, int n){
+  /* shared (docs/published_graphs_design.md): the worker allocates into a region the parent reads */
+  int shared = n > 1 && ts_truthy(a[1]);
+  return ts_num((double)(shared ? ts_worker_fork_shared(arg(a, n, 0)) : ts_worker_fork(arg(a, n, 0))));
+}
 static tsv host_on_worker_message(tsv* a, int n){ ts_worker_on_message((int)ts_to_num(arg(a, n, 0)), arg(a, n, 1)); return TS_UNDEFINED; }
 static tsv host_on_worker_error(tsv* a, int n){ ts_worker_on_error((int)ts_to_num(arg(a, n, 0)), arg(a, n, 1)); return TS_UNDEFINED; }
 static tsv host_is_worker(tsv* a, int n){ (void)a; (void)n; return ts_bool(ts_worker_is_worker()); }
@@ -415,7 +419,7 @@ void garnet_tsc_ts_host_init(int argc, char** argv){
   method(host, "utf8Length", host_utf8_length, 1);
   method(host, "writeUtf16le", host_write_utf16le, 3);
   method(host, "setWorkerEntry", host_set_worker_entry, 1);
-  method(host, "forkWorker", host_fork_worker, 1);
+  method(host, "forkWorker", host_fork_worker, 2);
   method(host, "onWorkerMessage", host_on_worker_message, 2);
   method(host, "onWorkerError", host_on_worker_error, 2);
   method(host, "isWorker", host_is_worker, 0);

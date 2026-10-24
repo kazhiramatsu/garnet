@@ -27,7 +27,10 @@ export function enterWorker(data: unknown): void {
 export class Worker {
   private readonly id: number;
   constructor(_url: unknown, options?: { workerData?: unknown }) {
-    this.id = host.forkWorker(options?.workerData);
+    // a parse thread returns bound source files to the main thread: a shared worker
+    // (docs/published_graphs_design.md); a checker returns plain data
+    const kind = (options?.workerData as { kind?: unknown } | undefined)?.kind;
+    this.id = host.forkWorker(options?.workerData, kind === 'parse');
   }
   on(event: string, listener: (value: unknown) => void): this {
     if (event === 'message') host.onWorkerMessage(this.id, listener);

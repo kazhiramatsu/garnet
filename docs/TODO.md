@@ -9358,3 +9358,25 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   import of the module) against the build before P1: instructions 1.0007,
   cycles 1.0016, outputs identical (the collections' flag test, the global's
   creation).
+- Slice P3 (runtime, tsc-ts host and shim; `docs/published_graphs_design.md`
+  "P3 as built"): shared workers. `ts_worker_fork_shared` maps a run of cage
+  blocks `MAP_SHARED` before the fork (`TSAOT_SHARED_REGION_MB`, 512) and
+  keeps it `GC_BLK_REGION` in the parent (never allocated into, swept or
+  scanned; a conservative word into it is ignored); the child abandons every
+  cursor, list and the free blocks and allocates from the region only
+  (exhaustion and a new interned property name abort loudly). Shape ids are
+  partitioned at the fork (`TSAOT_SHARED_SHAPES`, 65,536 per worker, the
+  parent's headroom first; the parent jumps past the workers' ranges when they
+  are gone) and a worker ships its new descriptors with every frame, installed
+  at its ids. `publish` in a shared worker promotes the cells it reaches and
+  sets their mark to 1: immortal in the worker and opaque to the parent's
+  markers (the per-edge filter reads mark 1 as marked), so no block metadata
+  is shared or merged; a pre-fork cell it reached is shipped, frozen and
+  rooted in the parent. A published cell of the region encodes as `MSG_SHARED`
+  (its address), accepted only from a shared worker's frame after the bounds
+  and header checks; the parent runs young collections only while shared
+  workers live; `TSAOT_PUBLISH_PROTECT=1` maps the region read-only
+  afterwards. Runtime tests cover the reference passing, a Map, a function
+  cell, a new shape, the pre-fork cell, immutability in the parent, the
+  parent's collections, and the two loud deaths. The tsc-ts shim forks a parse
+  thread as a shared worker; none starts yet (P5).

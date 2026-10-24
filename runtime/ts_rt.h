@@ -1806,6 +1806,11 @@ void ts_register_class_names(const char* const* tab, uint32_t n);
    or a cell a publish reached. */
 tsv ts_publish(tsv v);
 int ts_is_published(tsv v);
+/* A shared worker (docs/published_graphs_design.md, "Sharing by fork"): forked
+   like ts_worker_fork, but allocating into a region the parent mapped shared
+   before the fork, so a graph it publishes is passed to the parent by
+   reference. */
+int ts_worker_fork_shared(tsv data);
 tsv ts_object_create(tsv proto);
 tsv ts_object_seal(tsv v);
 tsv ts_object_prevent_extensions(tsv v);

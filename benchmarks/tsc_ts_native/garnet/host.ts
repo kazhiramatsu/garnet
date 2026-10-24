@@ -32,7 +32,8 @@ export interface GarnetHost {
   /** Workers by fork (docs/fork_workers_design.md): the entry a forked child runs with its data. */
   setWorkerEntry(entry: (data: unknown) => void): void;
   /** Forks a worker that runs the entry with `data` (the same objects): its id. */
-  forkWorker(data: unknown): number;
+  /** `shared`: the worker allocates into a region the parent reads; a graph it publishes is passed by reference. */
+  forkWorker(data: unknown, shared?: boolean): number;
   onWorkerMessage(id: number, listener: (value: unknown) => void): void;
   onWorkerError(id: number, listener: (error: unknown) => void): void;
   isWorker(): boolean;

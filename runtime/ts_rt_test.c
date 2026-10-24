@@ -88,6 +88,84 @@ static tsv test_worker_on_message(tsv* a, int n){
   return TS_UNDEFINED;
 }
 static tsv test_worker_on_error(tsv* a, int n){ (void)a; (void)n; worker_errors++; return TS_UNDEFINED; }
+/* A shared worker (docs/published_graphs_design.md, "Sharing by fork"): it
+   allocates into the region, publishes a graph that reaches a pre-fork cell
+   and new shapes, and posts it wrapped and bare; the parent reads it in place. */
+static tsv shared_prefork = TS_UNDEFINED;      /* created before the fork; the child's graph reaches it */
+static tsv shared_got_wrap = TS_UNDEFINED, shared_got_root = TS_UNDEFINED;
+static int shared_frames = 0;
+static tsv test_shared_entry(tsv* a, int n){
+  tsv data = n > 0 ? a[0] : TS_UNDEFINED;
+  tsv root = ts_new_object(); ts_gc_root(&root);
+  tsv inner = ts_new_object(); ts_gc_root(&inner);
+  ts_set(inner, ts_intern_field("deep", 4), ts_num(5));
+  tsv arr = ts_new_array(0); ts_gc_root(&arr);
+  ts_array_push(arr, ts_num(1)); ts_array_push(arr, ts_num(2)); ts_array_push(arr, inner);
+  tsv m = ts_new_map(); ts_gc_root(&m);
+  ts_map_set(m, ts_new_string("k", 1), ts_num(9));
+  /* a shape the parent never made: the keys in the other order */
+  tsv ord = ts_new_object(); ts_gc_root(&ord);
+  ts_set(ord, ts_intern_field("b", 1), ts_num(2)); ts_set(ord, ts_intern_field("a", 1), ts_num(1));
+  tsv fn = ts_make_fn_t(test_worker_on_error, NULL, 0, 0); ts_gc_root(&fn);
+  ts_set(root, ts_intern_field("arr", 3), arr);
+  ts_set(root, ts_intern_field("m", 1), m);
+  ts_set(root, ts_intern_field("text", 4), ts_new_string("shared text", 11));
+  ts_set(root, ts_intern_field("pre", 3), ts_get(data, ts_intern_field("pre", 3)));
+  ts_set(root, ts_intern_field("ord", 3), ord);
+  ts_set(root, ts_intern_field("fn", 2), fn);
+  ts_publish(root);
+  tsv wrap = ts_new_object(); ts_gc_root(&wrap);
+  ts_set(wrap, ts_intern_field("batch", 5), root);
+  ts_worker_post(wrap);
+  ts_worker_post(root);
+  ts_gc_unroot(7);
+  return TS_UNDEFINED;
+}
+static tsv test_shared_on_message(tsv* a, int n){
+  tsv v = n > 0 ? a[0] : TS_UNDEFINED;
+  if (shared_frames++ == 0) shared_got_wrap = v; else shared_got_root = v;
+  return TS_UNDEFINED;
+}
+/* a shared worker that allocates past its region (TSAOT_SHARED_REGION_MB=1 set by the test) */
+static tsv test_shared_overflow_entry(tsv* a, int n){
+  (void)a; (void)n;
+  tsv keep = ts_new_array(0); ts_gc_root(&keep);
+  for (int i = 0; i < 4096; i++){ tsv s = ts_new_array(0); ts_array_push(keep, s); for (int j = 0; j < 64; j++) ts_array_push(s, ts_num(j)); }
+  ts_gc_unroot(1);
+  return TS_UNDEFINED;
+}
+/* a shared worker that interns a property name the parent never saw */
+static tsv test_shared_intern_entry(tsv* a, int n){
+  (void)a; (void)n;
+  tsv o = ts_new_object(); ts_gc_root(&o);
+  ts_set(o, ts_intern_field("never_seen_before_xyz", 21), ts_num(1));
+  ts_gc_unroot(1);
+  return TS_UNDEFINED;
+}
+static int write_throws(tsv obj, ts_key key, tsv val){
+  ts_handler* h = ts_eh_push();
+  if (ts_setjmp(h->buf) != 0){
+    ts_gc_set_root_depth(h->gc_root_len);
+    ts_frame_restore(h->frame_top);
+    ts_eh_pop();
+    return 1;
+  }
+  ts_set(obj, key, val);
+  ts_eh_pop();
+  return 0;
+}
+static int map_set_throws(tsv m){
+  ts_handler* h = ts_eh_push();
+  if (ts_setjmp(h->buf) != 0){
+    ts_gc_set_root_depth(h->gc_root_len);
+    ts_frame_restore(h->frame_top);
+    ts_eh_pop();
+    return 1;
+  }
+  ts_map_set(m, ts_num(1), ts_num(1));
+  ts_eh_pop();
+  return 0;
+}
 static int codec_rejects(tsv v){
   ts_handler* h = ts_eh_push();
   if (ts_setjmp(h->buf) != 0){
@@ -1841,6 +1919,76 @@ int main(){
     dup2(saved, 2); close(saved); close(devnull);
     CK("worker by fork: an uncaught exception in the child reaches the error handler", worker_errors == 1 && ts_is_undef(worker_received));
     ts_gc_unroot(6);
+  }
+  {
+    /* a shared worker: the published graph arrives by reference, readable and immutable in the parent */
+    ts_gc_root(&shared_prefork); ts_gc_root(&shared_got_wrap); ts_gc_root(&shared_got_root);
+    shared_prefork = ts_new_object();
+    ts_set(shared_prefork, ts_intern_field("tag", 3), ts_new_string("pre-fork", 8));
+    /* the names the child uses exist here; the parent's own {a, b} order */
+    tsv ab = ts_new_object(); ts_gc_root(&ab);
+    ts_set(ab, ts_intern_field("a", 1), ts_num(0)); ts_set(ab, ts_intern_field("b", 1), ts_num(0));
+    ts_intern_field("deep", 4); ts_intern_field("arr", 3); ts_intern_field("m", 1); ts_intern_field("text", 4);
+    ts_intern_field("pre", 3); ts_intern_field("ord", 3); ts_intern_field("fn", 2); ts_intern_field("batch", 5); ts_intern_field("k", 1);
+    tsv entry = ts_make_fn_t(test_shared_entry, NULL, 0, 0); ts_gc_root(&entry);
+    ts_worker_set_entry(entry);
+    tsv data = ts_new_object(); ts_gc_root(&data);
+    ts_set(data, ts_intern_field("pre", 3), shared_prefork);
+    tsv onm = ts_make_fn_t(test_shared_on_message, NULL, 0, 0); ts_gc_root(&onm);
+    tsv one = ts_make_fn_t(test_worker_on_error, NULL, 0, 0); ts_gc_root(&one);
+    worker_errors = 0; shared_frames = 0;
+    int id = ts_worker_fork_shared(data);
+    ts_worker_on_message(id, onm); ts_worker_on_error(id, one);
+    ts_run_event_loop();
+    int two = shared_frames == 2 && worker_errors == 0 && ts_is_obj(shared_got_wrap) && ts_is_obj(shared_got_root);
+    CK("shared worker: two frames, no error", two);
+    tsv batch = two ? ts_get(shared_got_wrap, ts_intern_field("batch", 5)) : TS_UNDEFINED;
+    CK("shared worker: the wrapped graph and the bare one are the same cell", two && batch == shared_got_root);
+    if (two){
+      tsv arr = ts_get(batch, ts_intern_field("arr", 3));
+      tsv inner = ts_array_get(arr, 2);
+      tsv m = ts_get(batch, ts_intern_field("m", 1));
+      tsv text = ts_get(batch, ts_intern_field("text", 4));
+      tsv ord = ts_get(batch, ts_intern_field("ord", 3));
+      tsv fn = ts_get(batch, ts_intern_field("fn", 2));
+      CK("shared worker: the array, its nested object and the string read in place",
+         ts_array_len(arr) == 3 && ts_to_num(ts_get(inner, ts_intern_field("deep", 4))) == 5 && ts_is_str(text) && ts_str_len_typed(text) == 11);
+      CK("shared worker: the Map reads in place", ts_is_map(m) && ts_to_num(ts_map_get(m, ts_new_string("k", 1))) == 9);
+      CK("shared worker: a shape the parent never made reads its keys",
+         ts_to_num(ts_get(ord, ts_intern_field("a", 1))) == 1 && ts_to_num(ts_get(ord, ts_intern_field("b", 1))) == 2);
+      CK("shared worker: a function cell arrives by reference", ts_is_func(fn));
+      CK("shared worker: the pre-fork cell the graph reached is the parent's own, frozen here",
+         ts_get(batch, ts_intern_field("pre", 3)) == shared_prefork && ts_truthy(ts_object_is_frozen(shared_prefork)) && ts_is_published(shared_prefork));
+      CK("shared worker: the graph is published and immutable in the parent",
+         ts_is_published(batch) && ts_is_published(inner) && write_throws(batch, ts_intern_field("text", 4), ts_num(1)) && write_throws(inner, ts_intern_field("deep", 4), ts_num(1)) && map_set_throws(m));
+      /* the parent's collections afterwards leave the region readable */
+      for (int i = 0; i < 2000; i++){ tsv junk = ts_new_array(0); ts_array_push(junk, ts_num(i)); }
+      ts_gc_collect_young(); ts_gc_collect(); ts_gc_collect_young();
+      CK("shared worker: the graph survives the parent's young and full collections",
+         ts_to_num(ts_get(ts_array_get(ts_get(batch, ts_intern_field("arr", 3)), 2), ts_intern_field("deep", 4))) == 5 &&
+         ts_to_num(ts_get(ts_get(batch, ts_intern_field("ord", 3)), ts_intern_field("a", 1))) == 1 &&
+         ts_str_len_typed(ts_get(shared_prefork, ts_intern_field("tag", 3))) == 8);
+    }
+    /* a worker past its region, and one interning a new name: loud deaths, the error handler */
+    fflush(stdout); fflush(stderr);
+    int saved = dup(2); int devnull = open("/dev/null", 1); dup2(devnull, 2);
+    setenv("TSAOT_SHARED_REGION_MB", "1", 1);
+    tsv over = ts_make_fn_t(test_shared_overflow_entry, NULL, 0, 0); ts_gc_root(&over);
+    ts_worker_set_entry(over); worker_errors = 0;
+    int id2 = ts_worker_fork_shared(data);
+    ts_worker_on_message(id2, onm); ts_worker_on_error(id2, one);
+    ts_run_event_loop();
+    unsetenv("TSAOT_SHARED_REGION_MB");
+    int overflow_loud = worker_errors == 1;
+    tsv intern = ts_make_fn_t(test_shared_intern_entry, NULL, 0, 0); ts_gc_root(&intern);
+    ts_worker_set_entry(intern); worker_errors = 0;
+    int id3 = ts_worker_fork_shared(data);
+    ts_worker_on_message(id3, onm); ts_worker_on_error(id3, one);
+    ts_run_event_loop();
+    dup2(saved, 2); close(saved); close(devnull);
+    CK("shared worker: a region exhausted is a loud death", overflow_loud);
+    CK("shared worker: a new property name interned is a loud death", worker_errors == 1);
+    ts_gc_unroot(10);
   }
   test_conservative_roots();
   test_shape_chains();
