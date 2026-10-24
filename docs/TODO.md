@@ -9315,3 +9315,26 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   emitting 0.43 -> 0.53 s wall (1.233); one thread emitting peak 394 -> 611
   MB. The win is the emit phase's; the checker, the parallel compile and the
   memory are the remaining gaps.
+- Slice P1 (emitter + runtime; `docs/published_graphs_design.md`
+  "Enforcement", "P1 as built"): a typed direct store to a class instance's
+  declared field tests the receiver's frozen bit and throws as strict JS does;
+  `Object.freeze(p); p.x = 2` had silently succeeded (every dynamic path
+  tested the bit; the typed store was the one unchecked path, and the exporter
+  specializes `any` stores into it). One test per store cost the trained
+  tsc-ts compile +1.8% instructions, so the emitter omits the test for a store
+  whose receiver an earlier direct store of the same straight-line run tested
+  with nothing between them that could run user code or redefine the receiver
+  (a constructor's initialization pays one test; 16,173 static tests -> 9,424,
+  still +1.4%), and, decisively, emits no test at all when the whole program
+  cannot freeze an instance: no `Object.freeze`/`seal`/`preventExtensions` or
+  `Reflect.preventExtensions` call except on a literal of the same function,
+  no dynamic call named like one on an untyped receiver, and `Object`,
+  `Reflect`, `globalThis`, `__garnet` never taken as a value. tsc-ts has none:
+  instructions 1.0002, cycles 0.9995, outputs identical. Fixture
+  classes/frozen_instances_dynamic (an instance frozen through `Object` as an
+  `any` value still throws). `TSAOT_FROZEN_STORES=0` keeps the unchecked store
+  (parity oracle). Also fixed: read-only messages named every receiver
+  `#<Object>`; the emitter registers the class names by class id
+  (`CLASS_NAME_TAB`, `TSAOT_CLASS_NAMES=0`) and messages and `console.log`
+  name the class even when the program never observed the class value (its
+  prototype's `constructor` is lazy). Fixture classes/frozen_instances.

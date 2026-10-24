@@ -107,6 +107,49 @@ read-only in the parent once the worker has exited; a write faults and
 aborts naming the address. Strings cache their hash lazily and the mode
 would see those as writes, so it is a tool, not a gate.
 
+### P1 as built
+
+The dynamic store paths (`ts_set_pic`, `ts_set_sized_pic_try`, `ts_set`) all
+tested the frozen bit already; the typed direct store `hobj->f = v` was the
+one unchecked path (the probe's `any` store had been specialized into a typed
+store by the exporter). It now reads the receiver's shape word, which sits
+beside the class word the store untags anyway, and takes the slow path on the
+frozen bit (`ts_store_frozen`): the slow path throws
+`ts_throw_frozen_field` (the strict TypeError, naming the class) or routes
+the foreign receiver through `ts_set` as before. One test per store cost the
+trained tsc-ts compile +1.8% instructions and +0.7% cycles, so the emitter
+omits the test for a store whose receiver an earlier direct store of the same
+straight-line run has tested, when nothing between them could run user code
+(the only way an instance becomes frozen) or redefine the receiver
+(`frozen_elision_for`: constants, copies, typed direct loads and numeric
+arithmetic keep the run; a nested body, a call, a dynamic access or anything
+else ends it). A constructor's field initialization pays one test instead of
+one per field: 16,173 static tests in tsc-ts became 9,424, but the compile
+still paid +1.4% instructions (the hot stores are single stores in the
+checker and binder). What makes the test free is the whole program: an
+instance can only become frozen through `Object.freeze`, `seal`,
+`preventExtensions` or `Reflect.preventExtensions`, a dynamic call named
+like one of them on an untyped receiver, or `Object`, `Reflect`,
+`globalThis` or `__garnet` taken as a value (a call the emitter cannot see);
+`may_freeze_instances_init` scans every function for them (a freezer whose
+argument is an object or array literal of the same function does not count),
+and a program without one gets no tests at all. tsc-ts has none: its trained
+compile is unchanged (instructions 1.0002, cycles 0.9995, outputs identical).
+Fixture `classes/frozen_instances_dynamic` freezes an instance through
+`Object` taken as an `any` value and checks the tests are still there.
+
+Found on the way and fixed: the read-only message named every receiver
+`#<Object>`; V8 names the class. A class's prototype gets its `constructor`
+property lazily (when the program observes the class value), so the
+runtime cannot always find the name through the prototype chain; the
+emitter now registers the program's class names by class id
+(`CLASS_NAME_TAB`, `ts_register_class_names`, `TSAOT_CLASS_NAMES=0` for the
+parity oracle) and the messages and `console.log`'s prefix read it for a
+sized instance on its allocation class's chain. Fixture
+`classes/frozen_instances` (declared fields of every kind, a subclass, a
+store through `any`, sealed and non-extensible instances, a hot loop over
+mixed instances).
+
 ## Sharing by fork: regions
 
 The fork prototype shares the parent's heap with its children by

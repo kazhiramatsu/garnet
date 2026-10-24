@@ -86,6 +86,7 @@ pub fn emit_program_with_string_metrics(
     result: &EscapeResult,
     string_metric_plan: &StringMetricPlan,
 ) -> String {
+    may_freeze_instances_init(program);
     let string_materialization_plan = crate::string_materialization::analyze_program(program);
     emit_program_with_string_plans(
         program,
@@ -1691,11 +1692,29 @@ fn emit_class_descriptors(s: &mut String, program: &Program) {
         let n = program.classes.iter().map(|c| c.id.0).max().unwrap_or(0) + 1;
         let words: Vec<String> = (0..n).map(|c| format!("{}u", class_index_word(c))).collect();
         let _ = writeln!(s, "static const uint32_t CLASS_INDEX_TAB[{}] = {{{}}};", n, words.join(", "));
+        if class_names_enabled() {
+            let names: Vec<String> = (0..n)
+                .map(|c| {
+                    program
+                        .classes
+                        .iter()
+                        .find(|k| k.id.0 == c)
+                        .and_then(|k| k.name.as_deref())
+                        .filter(|nm| !nm.is_empty() && nm.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '$'))
+                        .map(|nm| format!("\"{}\"", nm))
+                        .unwrap_or_else(|| "NULL".to_string())
+                })
+                .collect();
+            let _ = writeln!(s, "static const char* const CLASS_NAME_TAB[{}] = {{{}}};", n, names.join(", "));
+        }
     }
     s.push_str("static void ts_register_classes(void){\n");
     if index_tab {
         let n = program.classes.iter().map(|c| c.id.0).max().unwrap_or(0) + 1;
         let _ = writeln!(s, "  ts_register_class_indices(CLASS_INDEX_TAB, {}u);", n);
+        if class_names_enabled() {
+            let _ = writeln!(s, "  ts_register_class_names(CLASS_NAME_TAB, {}u);", n);
+        }
     }
     for (cid, fields) in &typed {
         let _ = writeln!(
@@ -1887,6 +1906,8 @@ struct Ctx<'a> {
     str_consts: BTreeMap<u32, (usize, u32)>,
     switch_plan: SwitchPlan,
     layouts: LayoutPlan,
+    /// Typed direct stores whose frozen test is omitted (`frozen_elision_for`).
+    frozen_elide: BTreeSet<usize>,
     /// the root frame is linked only around slow paths (see lazy_frames_enabled)
     lazy_frame: bool,
     /// the lazy frame's locals live in C locals (lazy_homes_enabled); the
@@ -2647,6 +2668,193 @@ fn alloc_site_id(site: u32, st: AllocStrategy) -> Option<u32> {
 /// TSAOT_UNDEF_FIELDS=0 skips the `undefined` initialization of boxed class
 /// fields (the frozen emitter's behavior: unassigned fields read as 0). Parity
 /// oracle only.
+/// A typed direct store tests its receiver's frozen bit and throws as strict
+/// JS does (docs/published_graphs_design.md, "Enforcement"); `TSAOT_FROZEN_STORES=0`
+/// keeps the frozen emitter's unchecked store (parity oracle only).
+fn frozen_stores_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_FROZEN_STORES").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+/// Whether a class instance of the program can ever become frozen: a call of
+/// `Object.freeze`, `seal` or `preventExtensions` or `Reflect.preventExtensions`
+/// whose argument is not an object or array literal of the same function, or
+/// `Object`, `Reflect` or `__garnet` taken as a value (a call the emitter
+/// cannot see). Without one no instance is ever frozen, and no typed store
+/// needs the test (docs/published_graphs_design.md, "Enforcement"). The whole
+/// program is known: that is what makes the test free for most programs.
+static MAY_FREEZE_INSTANCES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+/// `Object`, `Reflect`, `globalThis` or `__garnet` loaded as a value
+/// (`globalobj.X` for the global object itself, `globalref.X` for a
+/// reference to it): a freezer may be called through it dynamically.
+fn global_value_can_freeze(builtin: &str) -> bool {
+    let name = builtin
+        .strip_prefix("globalobj.")
+        .or_else(|| builtin.strip_prefix("globalref."))
+        .unwrap_or("");
+    matches!(name, "Object" | "Reflect" | "globalThis" | "__garnet")
+}
+fn may_freeze_instances_init(program: &Program) {
+    const FREEZERS: [&str; 4] = ["object.freeze", "object.seal", "object.preventExtensions", "reflect.preventExtensions"];
+    fn literal_defs(block: &[Inst], out: &mut BTreeSet<u32>) {
+        for inst in block {
+            match inst {
+                Inst::AllocObject { dst, class_id: None, .. } | Inst::AllocArray { dst, .. } => {
+                    out.insert(dst.0);
+                }
+                Inst::If { then_body, else_body, .. } => {
+                    literal_defs(then_body, out);
+                    literal_defs(else_body, out);
+                }
+                Inst::Loop { cond_body, body, .. } => {
+                    literal_defs(cond_body, out);
+                    literal_defs(body, out);
+                }
+                Inst::TryCatch { try_body, catch_body, finally_body, .. } => {
+                    literal_defs(try_body, out);
+                    literal_defs(catch_body, out);
+                    literal_defs(finally_body, out);
+                }
+                _ => {}
+            }
+        }
+    }
+    fn scan(block: &[Inst], lits: &BTreeSet<u32>, program: &Program) -> bool {
+        for inst in block {
+            match inst {
+                Inst::CallBuiltinStatic { builtin, args, .. } | Inst::CallBuiltin { builtin, args, .. }
+                    if FREEZERS.contains(&builtin.as_str()) =>
+                {
+                    if !args.first().map_or(false, |a| lits.contains(&a.0)) {
+                        return true;
+                    }
+                }
+                Inst::LoadBuiltinFn { builtin, .. } if global_value_can_freeze(builtin) => {
+                    return true;
+                }
+                // a dynamic method call named like a freezer on a receiver the
+                // program does not type (`(o as any).freeze(x)`)
+                Inst::Call { callee: CalleeRef::Method { recv_stable: false, method_field: Some(mf), .. }, .. } => {
+                    let name = program.fields.get(mf.0 as usize).and_then(|fi| fi.name.as_deref()).unwrap_or("");
+                    if matches!(name, "freeze" | "seal" | "preventExtensions") {
+                        return true;
+                    }
+                }
+                Inst::If { then_body, else_body, .. } => {
+                    if scan(then_body, lits, program) || scan(else_body, lits, program) {
+                        return true;
+                    }
+                }
+                Inst::Loop { cond_body, body, .. } => {
+                    if scan(cond_body, lits, program) || scan(body, lits, program) {
+                        return true;
+                    }
+                }
+                Inst::TryCatch { try_body, catch_body, finally_body, .. } => {
+                    if scan(try_body, lits, program) || scan(catch_body, lits, program) || scan(finally_body, lits, program) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+    let may = program.functions.iter().any(|f| {
+        let mut lits = BTreeSet::new();
+        literal_defs(&f.body, &mut lits);
+        scan(&f.body, &lits, program)
+    });
+    let _ = MAY_FREEZE_INSTANCES.set(may);
+}
+fn may_freeze_instances() -> bool {
+    *MAY_FREEZE_INSTANCES.get().unwrap_or(&true)
+}
+/// The typed store's frozen test is emitted when the knob allows it and the
+/// program can freeze an instance at all.
+fn frozen_tests_on() -> bool {
+    frozen_stores_enabled() && may_freeze_instances()
+}
+/// Typed direct stores whose frozen test the emitter omits: a store to a
+/// receiver that an earlier direct store of the same straight-line run has
+/// tested, with nothing between them that could run user code (the only way
+/// an instance becomes frozen) or redefine the receiver. A constructor's
+/// field initialization pays one test instead of one per field.
+fn frozen_elision_for(f: &Function, ctx: &Ctx) -> BTreeSet<usize> {
+    let mut out = BTreeSet::new();
+    if !frozen_tests_on() {
+        return out;
+    }
+    fn direct(ctx: &Ctx, obj: u32, cls: u32, field: u32) -> bool {
+        let (class, _) = receiver_class(ctx, obj, cls, field);
+        class.map_or(false, |c| struct_direct_offset(c, field, ctx.classes).is_some())
+    }
+    fn numeric_operands(inst: &Inst, ctx: &Ctx) -> bool {
+        inst_refs(inst).iter().all(|l| ctx.unboxed.contains(l) || ctx.int_local.contains(l))
+    }
+    fn walk(block: &[Inst], ctx: &Ctx, out: &mut BTreeSet<usize>) {
+        let mut checked: BTreeSet<u32> = BTreeSet::new();
+        for inst in block {
+            match inst {
+                Inst::StoreField { obj, field, cls, .. } if direct(ctx, obj.0, *cls, field.0) => {
+                    if !checked.insert(obj.0) {
+                        out.insert(inst as *const Inst as usize);
+                    }
+                }
+                Inst::LoadField { obj, field, .. } if direct(ctx, obj.0, 0, field.0) => {
+                    if let Some(d) = inst_def(inst) {
+                        checked.remove(&d);
+                    }
+                }
+                Inst::Const { .. } | Inst::Copy { .. } => {
+                    if let Some(d) = inst_def(inst) {
+                        checked.remove(&d);
+                    }
+                }
+                Inst::BinOp { .. } | Inst::UnOp { .. } if numeric_operands(inst, ctx) => {
+                    if let Some(d) = inst_def(inst) {
+                        checked.remove(&d);
+                    }
+                }
+                Inst::If { then_body, else_body, .. } => {
+                    walk(then_body, ctx, out);
+                    walk(else_body, ctx, out);
+                    checked.clear();
+                }
+                Inst::Loop { cond_body, body, .. } => {
+                    walk(cond_body, ctx, out);
+                    walk(body, ctx, out);
+                    checked.clear();
+                }
+                Inst::TryCatch { try_body, catch_body, finally_body, .. } => {
+                    walk(try_body, ctx, out);
+                    walk(catch_body, ctx, out);
+                    walk(finally_body, ctx, out);
+                    checked.clear();
+                }
+                _ => checked.clear(),
+            }
+        }
+    }
+    walk(&f.body, ctx, &mut out);
+    out
+}
+/// The class names the runtime prints in messages (`#<C>`) and `console.log`
+/// prefixes for an instance whose class value the program never observed;
+/// `TSAOT_CLASS_NAMES=0` omits the table (parity oracle only).
+fn class_names_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_CLASS_NAMES").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
 fn undef_fields_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -8489,9 +8697,10 @@ fn emit_i64_function(
     let scalar_slices: BTreeMap<u32, ScalarStringSlice> = BTreeMap::new();
     let json_locals: BTreeSet<u32> = BTreeSet::new();
     let json_roots: BTreeSet<u32> = BTreeSet::new();
-    let ctx = Ctx {
+    let mut ctx = Ctx {
         switch_plan: switch_plan_for(f, &unboxed, &int_local, static_strings),
         layouts: layout_plan_for(f),
+        frozen_elide: BTreeSet::new(),
         lazy_frame,
         lazy_homes,
         lazy_spill: lazy_spill.clone(),
@@ -8550,6 +8759,7 @@ fn emit_i64_function(
         pendv_depth: std::cell::Cell::new(0),
         eh_depth: std::cell::Cell::new(0),
     };
+    ctx.frozen_elide = frozen_elision_for(f, &ctx);
     emit_seq(s, &f.body, &ctx, PathEdge::Function);
     emit_json_cleanup(s, &ctx);
     let cleanup = ctx.root_cleanup();
@@ -8713,9 +8923,10 @@ fn emit_f64_function(
     let scalar_slices: BTreeMap<u32, ScalarStringSlice> = BTreeMap::new();
     let json_locals: BTreeSet<u32> = BTreeSet::new();
     let json_roots: BTreeSet<u32> = BTreeSet::new();
-    let ctx = Ctx {
+    let mut ctx = Ctx {
         switch_plan: switch_plan_for(f, &unboxed, &int_local, static_strings),
         layouts: layout_plan_for(f),
+        frozen_elide: BTreeSet::new(),
         lazy_frame,
         lazy_homes,
         lazy_spill: lazy_spill.clone(),
@@ -8774,6 +8985,7 @@ fn emit_f64_function(
         pendv_depth: std::cell::Cell::new(0),
         eh_depth: std::cell::Cell::new(0),
     };
+    ctx.frozen_elide = frozen_elision_for(f, &ctx);
     emit_seq(s, &f.body, &ctx, PathEdge::Function);
     emit_json_cleanup(s, &ctx);
     let cleanup = ctx.root_cleanup();
@@ -8838,6 +9050,7 @@ fn emit_function(
         let ctx = Ctx {
             switch_plan: SwitchPlan::default(),
             layouts: LayoutPlan::default(),
+            frozen_elide: BTreeSet::new(),
             lazy_frame: false,
             lazy_homes: false,
             lazy_spill: String::new(),
@@ -8906,6 +9119,7 @@ fn emit_function(
         let ctx = Ctx {
             switch_plan: SwitchPlan::default(),
             layouts: LayoutPlan::default(),
+            frozen_elide: BTreeSet::new(),
             lazy_frame: false,
             lazy_homes: false,
             lazy_spill: String::new(),
@@ -8974,6 +9188,7 @@ fn emit_function(
         let ctx = Ctx {
             switch_plan: SwitchPlan::default(),
             layouts: LayoutPlan::default(),
+            frozen_elide: BTreeSet::new(),
             lazy_frame: false,
             lazy_homes: false,
             lazy_spill: String::new(),
@@ -9250,11 +9465,13 @@ fn emit_function(
         );
     }
 
-    let ctx = Ctx {
+    let mut ctx = Ctx {
 
         switch_plan,
 
         layouts: layout_plan_for(f),
+
+        frozen_elide: BTreeSet::new(),
 
         lazy_frame,
         lazy_homes,
@@ -9315,6 +9532,7 @@ fn emit_function(
         pendv_depth: std::cell::Cell::new(0),
         eh_depth: std::cell::Cell::new(0),
     };
+    ctx.frozen_elide = frozen_elision_for(f, &ctx);
     emit_seq(s, &f.body, &ctx, PathEdge::Function);
     emit_json_cleanup(s, &ctx);
     let cleanup = ctx.root_cleanup();
@@ -21794,10 +22012,22 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         ctx.val(src.0)
                     };
                     // A receiver that is not a struct of class `c` routes
-                    // `this.field = v` through ts_set (see the read above).
+                    // `this.field = v` through ts_set (see the read above); a
+                    // frozen instance throws as strict JS does (the dynamic
+                    // paths test the same bit before they store).
                     let obj_name = ctx.vname(obj.0);
-                    let slow = ctx.lazy_linked_stmt(&format!("ts_set({}, {}, {})", obj_name, field.0, ctx.val(src.0)));
-                    let _ = writeln!(s, "  if ({}) {{ {} }} else {{", receiver_guard(&obj_name, &hinted, c), slow);
+                    let guard = receiver_guard(&obj_name, &hinted, c);
+                    let (cond, slow) = if frozen_tests_on() && !ctx.frozen_elide.contains(&addr) {
+                        let frozen = format!("TS_RT_UNLIKELY(ts_store_frozen({}))", obj_name);
+                        let cond = if guard == "0" { frozen } else { format!("({}) || {}", guard, frozen) };
+                        let slow = ctx.lazy_linked_stmt(&format!(
+                            "if (ts_store_frozen({o})) ts_throw_frozen_field({o}, {k}); else ts_set({o}, {k}, {v})",
+                            o = obj_name, k = field.0, v = ctx.val(src.0)));
+                        (cond, slow)
+                    } else {
+                        (guard, ctx.lazy_linked_stmt(&format!("ts_set({}, {}, {})", obj_name, field.0, ctx.val(src.0))))
+                    };
+                    let _ = writeln!(s, "  if ({}) {{ {} }} else {{", cond, slow);
                     let _ = writeln!(s, "    (({}*)ts_ptr({}))->{} = {};", cn, obj_name, off, rhs);
                     if !is_num {
                         if barrier_fast_enabled() {

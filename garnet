@@ -31,6 +31,12 @@
 #                          instead of through the environment register (legacy).
 #   TSAOT_EH_RETURN_POP=0  Leave try handlers unpopped on `return` (the frozen
 #                          emitter's miscompile; parity oracle only).
+#   TSAOT_FROZEN_STORES=0  Typed class-field stores skip the frozen-instance test
+#                          (a write to a frozen instance silently succeeds; parity
+#                          oracle only). The test is emitted only when the program
+#                          can freeze an instance at all.
+#   TSAOT_CLASS_NAMES=0    Omit the class-name table (messages and console.log
+#                          say `Object` for an unobserved class; parity oracle only).
 #   TSAOT_UNDEF_FIELDS=0   Skip the `undefined` initialization of boxed class
 #                          fields (unassigned fields read as 0; parity oracle only).
 #   TSAOT_INLINE_SLOTS=0   Allocate object literals without in-object value

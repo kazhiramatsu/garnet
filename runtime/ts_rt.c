@@ -1878,6 +1878,18 @@ static uint32_t g_class_index_n = 0;
 static uint32_t* g_class_of_word = NULL;
 static uint32_t g_class_of_word_n = 0;
 static void class_reg_by_word_reset(void);
+static const char* const* g_class_name_tab = NULL;
+static uint32_t g_class_name_n = 0;
+void ts_register_class_names(const char* const* tab, uint32_t n){ g_class_name_tab = tab; g_class_name_n = n; }
+/* The registered name of a sized instance's allocation class, or NULL (no
+   table, an anonymous class, a prototype object, an unknown word). */
+static const char* ts_class_name_of_word(uint32_t w){
+  w &= ~TS_CLS_RELINKED;
+  if (!w || w == TS_CLS_PROTO || !g_class_name_tab) return NULL;
+  uint32_t c = w < g_class_of_word_n ? g_class_of_word[w] : 0u;
+  if (!c || c > g_class_name_n) return NULL;
+  return g_class_name_tab[c - 1u];
+}
 void ts_register_class_indices(const uint32_t* tab, uint32_t n){
   g_class_index_tab = tab; g_class_index_n = n;
   uint32_t top = 0;
@@ -3398,10 +3410,34 @@ static void invoke_setter(ts_accessor* ac, tsv obj, ts_key key, tsv val){
    or a non-writable property throws "Cannot assign to read only property ...", and
    a new property on a non-extensible object throws "Cannot add property ...". The
    messages match V8 so a try/catch sees identical e.message. */
-static void ts_throw_readonly_write(ts_key key){
+static const char* ts_obj_ctor_name_for_message(tsv obj);
+static void ts_throw_readonly_write(tsv obj, ts_key key){
   const char* nm = ts_field_name(key);
-  char buf[256];
-  snprintf(buf, sizeof(buf), "Cannot assign to read only property '%s' of object '#<Object>'", nm ? nm : "?");
+  char buf[320];
+  snprintf(buf, sizeof(buf), "Cannot assign to read only property '%s' of object '#<%s>'", nm ? nm : "?",
+           TS_TOP16(obj) == TS_SEL_OBJECT ? ts_obj_ctor_name_for_message(obj) : "Object");
+  ts_throw_type_error_msg(buf);
+}
+/* The receiver's constructor name for a message, as V8 prints it in
+   `#<C>`: its prototype's `constructor`, "Object" for a plain object. */
+static const char* ts_obj_ctor_name_for_message(tsv obj){
+  if (TS_TOP16(obj) != TS_SEL_OBJECT) return "Object";
+  const ts_object* o = (const ts_object*)ts_ptr(obj);
+  /* a sized instance on its allocation class's chain: the registered name
+     (its prototype's `constructor` may not have been realized yet) */
+  if (ts_obj_is_sized(o) && !(o->cls & TS_CLS_RELINKED)){
+    const char* cn = ts_class_name_of_word(o->cls);
+    if (cn) return cn;
+  }
+  tsv ctor = ts_get(obj, ts_intern_field("constructor", 11));   /* as inspect_ctor_prefix reads it */
+  if (!ts_is_func(ctor)) return "Object";
+  const char* nm = ((ts_func*)ts_ptr(ctor))->name;
+  return nm && *nm ? nm : "Object";
+}
+void ts_throw_frozen_field(tsv obj, ts_key key){
+  const char* nm = ts_field_name(key);
+  char buf[320];
+  snprintf(buf, sizeof(buf), "Cannot assign to read only property '%s' of object '#<%s>'", nm ? nm : "?", ts_obj_ctor_name_for_message(obj));
   ts_throw_type_error_msg(buf);
 }
 static void ts_throw_not_extensible(ts_key key){
@@ -3450,7 +3486,7 @@ static ts_pref ts_set_named_prop(tsv obj, ts_object* o, ts_key key, tsv val,
   if (check_struct_fields && g_has_class_regs){
     size_t off; int numeric;
     if (class_field_lookup(o, key, &off, &numeric)){
-      if (frozen){ ts_throw_readonly_write(key); return PREF_NONE; }
+      if (frozen){ ts_throw_readonly_write(obj, key); return PREF_NONE; }
       struct_field_set(o, off, numeric, val);
       return PREF_NONE;
     }
@@ -3467,7 +3503,7 @@ static ts_pref ts_set_named_prop(tsv obj, ts_object* o, ts_key key, tsv val,
       invoke_setter((ts_accessor*)ts_ptr(pref_val(ownp)), obj, key, val);
       return PREF_NONE;
     }
-    if (frozen || !pref_is_writable(ownp)){ ts_throw_readonly_write(key); return PREF_NONE; }
+    if (frozen || !pref_is_writable(ownp)){ ts_throw_readonly_write(obj, key); return PREF_NONE; }
     { tsv* vp = pref_valp(ownp); *vp = val;
       if (obj_shaped(o)) ts_write_barrier_ptr(obj, vp, val); else ts_write_barrier(obj, val); }
     return ownp;
@@ -3484,10 +3520,10 @@ static ts_pref ts_set_named_prop(tsv obj, ts_object* o, ts_key key, tsv val,
       ts_func* lf = (ts_func*)p;
       fn_keys_init();
       if (key == g_fn_key_prototype && fn_has_own_prototype(lf)){
-        if (lf->class_id || (ts_obj_integrity(p) & 1u)){ ts_throw_readonly_write(key); return PREF_NONE; }
+        if (lf->class_id || (ts_obj_integrity(p) & 1u)){ ts_throw_readonly_write(obj, key); return PREF_NONE; }
         break;
       }
-      if (fn_virtual(lf, key)){ ts_throw_readonly_write(key); return PREF_NONE; }
+      if (fn_virtual(lf, key)){ ts_throw_readonly_write(obj, key); return PREF_NONE; }
     }
     if (chain_link_exotic(p)){
       /* a proxy's [[Set]] with this receiver (its set trap decides), or the
@@ -3510,7 +3546,7 @@ static ts_pref ts_set_named_prop(tsv obj, ts_object* o, ts_key key, tsv val,
       }
       ts_pref ip = prop_find(p, key);
       if ((ts_obj_integrity(p) & 1u) || (pref_ok(ip) && !pref_is_writable(ip))){
-        ts_throw_readonly_write(key); return PREF_NONE;
+        ts_throw_readonly_write(obj, key); return PREF_NONE;
       }
       break;   /* inherited writable data property: create an own data prop */
     }
@@ -3553,12 +3589,12 @@ void ts_set(tsv obj, ts_key key, tsv val){
     fn_keys_init();
     if (key == g_fn_key_prototype && fn_has_own_prototype(f)){
       /* a class's prototype is not writable, nor a frozen function's */
-      if (ts_is_class_value(obj) || (ts_obj_integrity(&f->o) & 1u)){ ts_throw_readonly_write(key); return; }
+      if (ts_is_class_value(obj) || (ts_obj_integrity(&f->o) & 1u)){ ts_throw_readonly_write(obj, key); return; }
       f->prototype_prop = val; f->ctor_pending = 0; f->proto_lazy = 0; ts_write_barrier(obj, val);
       return;
     }
     /* `name` and `length` are read-only (docs/function_own_properties_design.md) */
-    if (fn_virtual(f, key)){ ts_throw_readonly_write(key); return; }
+    if (fn_virtual(f, key)){ ts_throw_readonly_write(obj, key); return; }
   }
   ts_object* sc = ts_class_static_container(obj);
   if (sc){ ts_set(ts_obj(sc), key, val); return; }
@@ -11782,9 +11818,14 @@ static void inspect_ctor_prefix(jbuf* b, tsv v){
   if (ts_is_null(proto) || ts_is_undef(proto)){ jb_putz(b, "[Object: null prototype] "); return; }
   static uint32_t k_ctor = 0xFFFFFFFFu;
   if (k_ctor == 0xFFFFFFFFu) k_ctor = ts_intern_field("constructor", 11);
-  tsv ctor = ts_get(v, k_ctor);
-  if (!ts_is_func(ctor)) return;
-  const char* nm = ((ts_func*)ts_ptr(ctor))->name;
+  const char* nm = NULL;
+  const ts_object* o = (const ts_object*)ts_ptr(v);
+  if (ts_obj_is_sized(o) && !(o->cls & TS_CLS_RELINKED)) nm = ts_class_name_of_word(o->cls);
+  if (!nm){
+    tsv ctor = ts_get(v, k_ctor);
+    if (!ts_is_func(ctor)) return;
+    nm = ((ts_func*)ts_ptr(ctor))->name;
+  }
   if (!nm || !*nm || strcmp(nm, "Object") == 0) return;  /* plain object: no prefix */
   jb_puts(b, nm, strlen(nm));
   jb_putc(b, ' ');
@@ -16274,7 +16315,7 @@ void ts_set_pic(tsv obj, ts_key key, tsv val, ts_prop_ic* ic){
     const ts_class_word_cache_entry* fe = ts_class_word_cache_entry_for(o, key);
     if (fe ? fe->found : (ts_obj_is_sized(o) && class_field_lookup(o, key, &off, &numeric))){
       if (fe){ off = fe->offset; numeric = fe->numeric; }
-      if (ts_obj_integrity(o) & 1u){ ts_throw_readonly_write(key); return; }
+      if (ts_obj_integrity(o) & 1u){ ts_throw_readonly_write(obj, key); return; }
       struct_field_set(o, off, numeric, val); return;
     }
   }
@@ -16313,7 +16354,7 @@ void ts_set_pic(tsv obj, ts_key key, tsv val, ts_prop_ic* ic){
       if (pref_ok(own)){
         TS_RT_STAT_PIC_SET_HIT();
         if (pref_is_accessor(own)){ invoke_setter((ts_accessor*)ts_ptr(pref_val(own)), obj, key, val); return; }
-        if ((ts_obj_integrity(o) & 1u) || !pref_is_writable(own)){ ts_throw_readonly_write(key); return; }
+        if ((ts_obj_integrity(o) & 1u) || !pref_is_writable(own)){ ts_throw_readonly_write(obj, key); return; }
         { tsv* vp = pref_valp(own); *vp = val;
           if (obj_shaped(o)) ts_write_barrier_ptr(obj, vp, val); else ts_write_barrier(obj, val); }
         return;
@@ -16322,7 +16363,7 @@ void ts_set_pic(tsv obj, ts_key key, tsv val, ts_prop_ic* ic){
       if (e){
         TS_RT_STAT_PIC_SET_HIT();
         if (e->kind == TS_PROP_IC_STRUCT){
-          if (ts_obj_integrity(o) & 1u){ ts_throw_readonly_write(key); return; }
+          if (ts_obj_integrity(o) & 1u){ ts_throw_readonly_write(obj, key); return; }
           struct_field_set(o, e->slot, e->numeric, val); return;
         }
         ts_pref p = { o, e->slot };
@@ -16331,7 +16372,7 @@ void ts_set_pic(tsv obj, ts_key key, tsv val, ts_prop_ic* ic){
           return;
         }
         if ((ts_obj_integrity(o) & 1u) || !pref_is_writable(p)){
-          ts_throw_readonly_write(key);
+          ts_throw_readonly_write(obj, key);
           return;
         }
         { tsv* vp = pref_valp(p); *vp = val;
@@ -16351,7 +16392,7 @@ void ts_set_pic(tsv obj, ts_key key, tsv val, ts_prop_ic* ic){
       }
       size_t off; int numeric;
       if (g_has_class_regs && class_field_lookup(o, key, &off, &numeric)){
-        if (ts_obj_integrity(o) & 1u){ ts_throw_readonly_write(key); return; }
+        if (ts_obj_integrity(o) & 1u){ ts_throw_readonly_write(obj, key); return; }
         struct_field_set(o, off, numeric, val);
         prop_ic_fill_struct(ic, o, key, off, numeric); return;
       }

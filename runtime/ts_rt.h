@@ -626,6 +626,12 @@ static inline ts_propmap* obj_map_plain(const ts_object* o){
 }
 static inline uint32_t ts_obj_shape_id(const ts_object* o){ return o->shape & TS_SHAPE_MAX; }
 static inline uint32_t ts_obj_integrity(const ts_object* o){ return o->shape >> 29; }
+/* A typed direct store's test of its receiver (docs/published_graphs_design.md,
+   "Enforcement"): the frozen bit of the shape word, read from the tagged
+   value the store untags anyway. Sealed and non-extensible instances keep
+   their declared fields writable, as in JS. */
+#define TS_OBJ_FROZEN_BIT 0x20000000u
+static inline int ts_store_frozen(tsv v){ return (((const ts_object*)ts_ptr(v))->shape & TS_OBJ_FROZEN_BIT) != 0; }
 static inline void ts_obj_set_shape(ts_object* o, uint32_t shape){
   o->shape = (o->shape & ~TS_SHAPE_MAX) | (shape & TS_SHAPE_MAX);
 }
@@ -1785,6 +1791,13 @@ tsv ts_object_get_own_property_names(tsv obj);
 tsv ts_object_get_own_property_symbols(tsv obj);
 tsv ts_object_freeze(tsv v);
 tsv ts_object_is_frozen(tsv v);
+/* A typed direct store on a frozen class instance: the strict-mode TypeError
+   (`Cannot assign to read only property 'x' of object '#<C>'`). */
+void ts_throw_frozen_field(tsv obj, ts_key key);
+/* The program's class names by class id (NULL for an anonymous class), for
+   messages and `console.log` prefixes of instances whose class value the
+   program never observed (the prototype's `constructor` is realized lazily). */
+void ts_register_class_names(const char* const* tab, uint32_t n);
 tsv ts_object_create(tsv proto);
 tsv ts_object_seal(tsv v);
 tsv ts_object_prevent_extensions(tsv v);
