@@ -9264,3 +9264,11 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   gain) and the generic inline property caches probing the registry's cache by
   class word on a megamorphic miss (+0.9% typed instructions at 5,600 sites,
   likewise).
+- PGO measured (not adopted; `docs/gc_v3_plan.md` "The remaining levers,
+  measured"): a profile-guided build of tsc-ts (`-fprofile-generate`, one
+  compile of the compiler project, `-fprofile-use` for the units and the
+  runtime, ThinLTO as always) against the current build over eight pairs,
+  outputs identical: 22.52 -> 18.98 G instructions (-15.7%), cycles -16.2%,
+  wall -16%; within 4% of scriptc's instruction count on its own. The profile
+  came from the same input it is measured on. The decision to adopt (a
+  two-pass native build) is Kaz's: PGO goes last by policy.

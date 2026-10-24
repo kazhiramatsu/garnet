@@ -114,3 +114,27 @@ Quiet, eight pairs each, the current build against itself:
 
 Each slice: outputs identical, the full gates, eight-pair measurements on
 tsc-ts and the TypeScript compiler, and a note here.
+
+## The remaining levers, measured (session 352)
+
+After slices G1 and AR-AY the typed compile stands at 22.4 G instructions,
+5.2 G cycles and 1.21 s against scriptc's 18.3 G and 1.05 s. The collector's
+remaining time (young tracing, promotion) is the design's own, the generated
+code's profile is flat, and the small slices pay 0.3-1% each. A
+profile-guided build was measured as an experiment, not adopted (Kaz: PGO
+goes last): the native build with `-fprofile-generate`, one compile of the
+compiler project for the profile, then `-fprofile-use` (the units and the
+runtime both; ThinLTO as always), against the current build over eight pairs,
+outputs identical:
+
+| | instructions | cycles | wall |
+|---|---|---|---|
+| current build | 22.52 G | 5.56 G | 1.30 s (under load) |
+| profile-guided | 18.98 G | 4.66 G | 1.09 s |
+| ratio | 0.843 | 0.838 | 0.838 |
+
+That is within 4% of scriptc's instruction count on its own, with the profile
+taken from the same input it is measured on (the usual way to tune a
+compiler, and what the benchmark's other side does; a profile from another
+project would test the robustness). Scripts: the scratch `pgo/experiment.sh`
+of this session; a build-script mode would be a two-pass `build_tsc_ts_native.sh`.
