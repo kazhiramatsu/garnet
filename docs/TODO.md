@@ -9470,3 +9470,19 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   before. The parse workers' zeroing (bzero, memset, the refill) went from
   15.0% to 12.4% of their busy samples; the one-checker compile's
   instructions are unchanged (1.0006), its blocks being recycled ones.
+- Slice P7 (exporter; `docs/static_micro_patterns_design.md` 4): logical
+  operators in condition position. `if (a && b)` was lowered as a value of the
+  operands' union kind and then tested: with an object on one side and a
+  number on the other the number was boxed and unboxed again with a tag test
+  per condition. 20.7% of the compiler project's If conditions have this shape.
+  `lowerCond` now lowers `&&` / `||` in `if`, `while`, `for`, `?:` and under
+  `!` as short-circuit control flow over a primitive truth flag (a boxed
+  operand through `!!`, a primitive one copied as the number it is).
+  Fixture expressions/logical_conditions (V8; a known parity diff: the Rust
+  escape analysis frames an object there). Measured: `flags_truthy` kernel
+  8.53 to 8.21 G instructions; tsc-ts one checker 0.9857 instructions, 0.9931
+  cycles, outputs identical, 1/2/4/8 checkers identical. `TSAOT_COND_FLAGS=0`
+  restores the value lowering. Pattern kernels against scriptc after it
+  (instructions): flags_truthy 2.62, small_calls 2.65, callbacks 2.52,
+  tree_recursion 2.26, class_nodes 2.00, switch_dispatch 1.92,
+  class_enum_fields 1.81.

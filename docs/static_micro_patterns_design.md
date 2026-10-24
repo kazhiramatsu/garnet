@@ -1,10 +1,12 @@
-# Three static micro-patterns: tag compares, inline element reads, raw loop flags
+# Static micro-patterns: tag compares, inline element reads, raw loop flags, conditions
 
 Session 350, after the slot-first inline cache. The compiler's profile is
 flat (the hottest generated function, `getObjectFlags`, is 1.2% of samples),
 so the remaining gap to V8 is spread over the per-operation cost of the
 generated C. These three patterns recur in nearly every function of the
 compiler and each is decided from information the emitter already has.
+Section 4 (session 353) adds the exporter's lowering of logical operators in
+condition position.
 
 ## 1. Strict and loose equality against `undefined`, `null` and booleans
 
@@ -55,3 +57,33 @@ constants over time, the compares used as values, loose equality with
 booleans) and `arrays/index_inline` (holes, out-of-range and negative
 indices, strings, nested arrays, growth, truncation, deletion, lazy-frame and
 allocating callers).
+
+## 4. Logical operators in condition position
+
+The exporter lowered `a && b` and `a || b` everywhere as a value: `res = a; if
+(a) res = b`, and an `if (a && b)` then tested `res`, a local of the operands'
+union kind. Where an operand is an object, a string or `undefined` and the
+other a number (`if (node.parent && node.parent.flags & 1)`, the compiler's
+daily idiom), `res` is boxed: the number is wrapped by `ts_num` and the test
+unwraps it again through `ts_truthy_fast`, a tag test and a NaN check per
+condition. 20.7% of the compiler project's `If` conditions (9,550 of 46,229)
+have this shape.
+
+In condition position (`if`, `while`, `for`, `?:`, and under a `!` there)
+the exporter now lowers `&&` and `||` as short-circuit control flow over a
+primitive truth flag (`lowerCond`): `flag = truthy(a); if (flag) flag =
+truthy(b)` for `&&`, the mirror for `||`, `!` negating the flag, and the
+`If` tests the flag. An operand that is itself logical or negated
+contributes its own flag; a value in a primitive local is copied as the
+number it is (the test reads a number as before); a boxed value goes
+through `!!`, two negations the C compiler folds into one truthiness test.
+The flag's final truthiness is the value's (`truthy(a) ? truthy(b) : false`
+for `&&`), so nothing observable changes; `??` and logical operators used as
+values keep the value lowering. Fixture `expressions/logical_conditions`
+(every operand kind including NaN, -0 and "", short-circuit side effects,
+chains, negations, loops, the ternary) against V8.
+
+Measured: the `flags_truthy` kernel 8.53 to 8.21 G instructions (-3.7%,
+one such condition per iteration), the compiler's one-checker compile
+instructions 0.9857 and cycles 0.9931 (trained builds, outputs identical).
+`TSAOT_COND_FLAGS=0` restores the value lowering.

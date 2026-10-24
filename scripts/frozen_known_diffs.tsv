@@ -250,3 +250,4 @@ parity-unported	modules/published_graphs	Frozen emitter lacks LoadBuiltinFn glob
 selfconf-unported	modules/published_graphs	Frozen emitter lacks LoadBuiltinFn globalref.__garnet (the garnet:shared module); native Rust output matches V8.
 parity-unported	stdlib/text_decoder_large	Frozen emitter lacks builtin 'typedarray.new:1' (the fixture builds its inputs with typed arrays); native Rust output matches V8.
 selfconf-unported	stdlib/text_decoder_large	Frozen emitter lacks builtin 'typedarray.new:1' (the fixture builds its inputs with typed arrays); native Rust output matches V8.
+parity	expressions/logical_conditions	Rust escape analysis: site 9 is a FrameArena object with a rooted local where the frozen analyzer heaps it (the lowering of conditions is the same IR for both); native Rust output matches V8.

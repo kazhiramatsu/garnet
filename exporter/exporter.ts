@@ -357,6 +357,8 @@ class Exporter {
   /** nested declaration fn ids whose lowering is deferred to the driver */
   pendingNestedFns = new Set<number>();
   nestedDirect = process.env.TSAOT_NESTED_DIRECT !== "0";
+  /** TSAOT_COND_FLAGS=0: `&&` / `||` in condition position lower as values again (docs/static_micro_patterns_design.md, 4). */
+  condFlags = process.env.TSAOT_COND_FLAGS !== "0";
   // Function declarations in the body of a value namespace registered as
   // direct-call targets (their free variables are module-scope bindings, so
   // calls thread the module cells like calls to top-level functions). A
@@ -6503,7 +6505,7 @@ class Exporter {
     }
     if (ts.isConditionalExpression(node)) {
       // cond ? a : b  ->  res; if (cond) res=a else res=b
-      const cond = this.lowerExpr(ctx, node.condition);
+      const cond = this.lowerCond(ctx, node.condition);
       const res = this.newLocal(ctx, this.refKindOf(node));
       const tb = this.captureBody(ctx, () => {
         const a = this.lowerExpr(ctx, node.whenTrue);
@@ -11969,6 +11971,61 @@ class Exporter {
     return found;
   }
 
+  /** A condition in test position (`if`, `while`, `for`, `?:`, the operand of a
+   *  `!` there): `&&` and `||` lower to short-circuit control flow over a
+   *  primitive truth flag instead of a value local the test then boxes and
+   *  re-examines (`if (a && b)` tested `truthy(ts_num(b & 1))`; 20.7% of the
+   *  compiler project's If conditions have this shape). A `!` negates the
+   *  flag; anything else lowers as a value, whose truthiness the If tests as
+   *  before. The flag's final truthiness equals the value's: for `a && b` it
+   *  is truthy(a) ? truthy(b) : false, for `a || b` truthy(a) ? true : truthy(b). */
+  lowerCond(ctx: FnCtx, node: ts.Expression): number {
+    if (!this.condFlags) return this.lowerExpr(ctx, node);
+    let e: ts.Expression = node;
+    while (ts.isParenthesizedExpression(e)) e = e.expression;
+    if (ts.isBinaryExpression(e) &&
+        (e.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken ||
+         e.operatorToken.kind === ts.SyntaxKind.BarBarToken)) {
+      const isAnd = e.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken;
+      const flag = this.newLocal(ctx, "primitive");
+      const lhs = this.lowerCondFlag(ctx, e.left);
+      ctx.body.push({ kind: "Copy", dst: flag, src: lhs });
+      const rhsBody = this.captureBody(ctx, () => {
+        const rhs = this.lowerCondFlag(ctx, e.right);
+        ctx.body.push({ kind: "Copy", dst: flag, src: rhs });
+      });
+      if (isAnd) ctx.body.push({ kind: "If", cond: flag, thenBody: rhsBody, elseBody: [] });
+      else ctx.body.push({ kind: "If", cond: flag, thenBody: [], elseBody: rhsBody });
+      return flag;
+    }
+    if (ts.isPrefixUnaryExpression(e) && e.operator === ts.SyntaxKind.ExclamationToken) {
+      const inner = this.lowerCond(ctx, e.operand);
+      const dst = this.newLocal(ctx, "primitive");
+      ctx.body.push({ kind: "UnOp", dst, op: "!", operand: inner });
+      return dst;
+    }
+    return this.lowerExpr(ctx, node);
+  }
+  /** A condition operand's truthiness as a primitive: a logical expression or a
+   *  `!` is one already; a value in a primitive local holds a number the test
+   *  reads as before; a boxed value goes through `!!` (two negations the C
+   *  compiler folds into one truthiness test). */
+  lowerCondFlag(ctx: FnCtx, node: ts.Expression): number {
+    let e: ts.Expression = node;
+    while (ts.isParenthesizedExpression(e)) e = e.expression;
+    if ((ts.isBinaryExpression(e) &&
+         (e.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken ||
+          e.operatorToken.kind === ts.SyntaxKind.BarBarToken)) ||
+        (ts.isPrefixUnaryExpression(e) && e.operator === ts.SyntaxKind.ExclamationToken))
+      return this.lowerCond(ctx, node);
+    const v = this.lowerExpr(ctx, node);
+    if (ctx.locals[v] !== undefined && ctx.locals[v].refKind === "primitive") return v;
+    const neg = this.newLocal(ctx, "primitive");
+    ctx.body.push({ kind: "UnOp", dst: neg, op: "!", operand: v });
+    const flag = this.newLocal(ctx, "primitive");
+    ctx.body.push({ kind: "UnOp", dst: flag, op: "!", operand: neg });
+    return flag;
+  }
   captureBody(ctx: FnCtx, fn: () => void): any[] {
     const saved = ctx.body;
     const fresh: any[] = [];
@@ -12087,7 +12144,7 @@ class Exporter {
     } else if (ts.isThrowStatement(stmt)) {
       ctx.body.push({ kind: "Throw", src: this.lowerExpr(ctx, stmt.expression) });
     } else if (ts.isIfStatement(stmt)) {
-      const cond = this.lowerExpr(ctx, stmt.expression);
+      const cond = this.lowerCond(ctx, stmt.expression);
       const thenB = this.captureBody(ctx, () => this.lowerStmt(ctx, stmt.thenStatement));
       const elseB = stmt.elseStatement ? this.captureBody(ctx, () => this.lowerStmt(ctx, stmt.elseStatement!)) : [];
       ctx.body.push({ kind: "If", cond, thenBody: thenB, elseBody: elseB });
@@ -12179,7 +12236,7 @@ class Exporter {
           ctx.body.push({ kind: "Const", dst: falseK, value: { kind: "Bool", value: false } });
           ctx.body.push({ kind: "Copy", dst: firstFlag, src: falseK });
           // condition
-          condLocal = stmt.condition ? this.lowerExpr(ctx, stmt.condition) : this.constBool(ctx, true);
+          condLocal = stmt.condition ? this.lowerCond(ctx, stmt.condition) : this.constBool(ctx, true);
         });
         // continue jumps to cond_body where the update is — so a real C continue
         // is correct. Use the "forc" loop kind we already wired up.
@@ -12221,7 +12278,7 @@ class Exporter {
           ctx.body.push({ kind: "Const", dst: f, value: { kind: "Bool", value: false } });
           ctx.body.push({ kind: "Copy", dst: firstFlag, src: f });
         }
-        condLocal = stmt.condition ? this.lowerExpr(ctx, stmt.condition) : this.constBool(ctx, true);
+        condLocal = stmt.condition ? this.lowerCond(ctx, stmt.condition) : this.constBool(ctx, true);
       });
       // loop kind "forc" => continue is a real C continue (advance is in cond_body).
       const bodyB = this.captureLoopBody(ctx, stmt.incrementor ? "forc" : "for", () => {
@@ -12232,7 +12289,7 @@ class Exporter {
       ctx.body.push({ kind: "Loop", cond: condLocal, condBody, body: bodyB });
     } else if (ts.isWhileStatement(stmt)) {
       let condLocal = -1;
-      const condBody = this.captureBody(ctx, () => { condLocal = this.lowerExpr(ctx, stmt.expression); });
+      const condBody = this.captureBody(ctx, () => { condLocal = this.lowerCond(ctx, stmt.expression); });
       const bodyB = this.captureLoopBody(ctx, "while", () => {
         this.emitPerIterationBodyCells(ctx, stmt.statement);
         this.lowerStmt(ctx, stmt.statement);
