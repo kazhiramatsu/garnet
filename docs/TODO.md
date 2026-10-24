@@ -9126,3 +9126,19 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   member keep the content or numeric compare). The typed one checker: 23.50 ->
   22.80 G instructions (-3.0%), cycles -2.5%, wall 1.26 -> 1.23 s, outputs
   identical; 2,376 -> 394 ts_strict_eq sites in tsc-ts.
+- Slice AT (emitter, measured and not kept): a condition on a boxed local is
+  the general truthiness test (a number test, the tag, two compares for
+  objects and functions, one for a boolean, two for undefined and null, a call
+  for strings), 11,250 sites in tsc-ts after slice AS. An analysis of the
+  locals every definition of which yields a boolean (a boolean constant, a
+  comparison, a logical not, `instanceof`, a direct call whose entry returns a
+  boolean, or a copy of such a local, to a fixpoint; parameters and catch
+  variables excluded) replaced 6,041 of them: `v == ts_bool(1)` measured
+  instructions +0.23% and cycles -0.7% (the 64-bit constant at each test), `v
+  & 1` instructions -0.02% and cycles -0.2%, both within noise over eight
+  pairs. The C compiler already folds the general test of a value it sees
+  boxed by `ts_bool` in the same function; what the analysis adds reaches only
+  merged and loop-carried booleans. Reverted; the fixture control/bool_locals
+  (comparison, not, `&&`/`||` chains with and without objects, instanceof,
+  boolean-returning calls, parameters, any, numbers and strings as conditions)
+  stays.
