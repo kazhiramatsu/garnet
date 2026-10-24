@@ -9423,3 +9423,26 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   cycles; the rest a 1.1% larger program). Next: the parse threads start over
   25 ms (a shared fork maps a region and collects) while the config is read
   in 7 ms.
+- Slice P6 (runtime, host; `docs/published_graphs_design.md` "P6 as built"):
+  the parse tail. The four-checker gap after P5 is the parse phase (garnet
+  0.09 s against scriptc's 0.045 by tsc-ts's clock; the check phase is already
+  ahead, 0.342 against 0.364), and both timelines show the same critical path:
+  the parse thread that takes `checker.ts` (3.15 MB), the last to start. On it
+  garnet lost the start (@33 ms against @2.6), the read (7.0 ms against 0.4),
+  the bind and the publish (23 against 5.6). Done: a large UTF-8 input with
+  some non-ASCII (`checker.ts` has one Bengali character) is decoded straight
+  into its storage instead of through a UTF-16 buffer, a second scan and a
+  copy (7.0 to 1.9 ms; V8-diffed on mixed, invalid, truncated and BOM inputs);
+  the publish walk is one pass that reads a header only when the cell is
+  visited, prefetching ahead, and undoes itself on a rejection (489k cells:
+  27 to 20 ms). Tried and reverted: parse workers without young collections
+  (no faster publish, no faster parse; they reclaim little anyway).
+  Instrumented: `TSAOT_FORK_TRACE=1` (each fork's cost, the child's time to its
+  entry, a region's use, big publishes) and `TSAOT_CPUS=N` on the host. Found
+  but open: the ten spawns take 8 ms of the main thread inside its config read
+  (young collection 0.2-0.5 ms and fork() 0.2-0.6 ms each), the children's
+  first TypeScript mark comes 3-18 ms after their entry (11 processes on 4
+  performance and 6 efficiency cores), and the main thread's startup is 5 ms
+  against scriptc's 1.3; fewer parse threads do not help. Gates green; the
+  machine was under the user's load, so the wall-time A/B against P5 is
+  deferred to a quiet window.

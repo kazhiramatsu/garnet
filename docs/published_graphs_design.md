@@ -341,6 +341,56 @@ mixed instances).
   fewer parse threads, a cheaper shared fork or forking before the heap
   grows are the next step.
 
+### P6 as built: the parse tail
+
+The four-checker gap after P5 (0.47 s against scriptc's 0.44 s) is the parse
+phase alone: by tsc-ts's clock garnet parses in 0.090-0.097 s against
+0.043-0.050 s and checks in 0.342 s against 0.364 s (quiet machine). The
+timelines (`TSC_TS_TIMELINE=1`) of both show the same critical path: the
+parse thread that takes `checker.ts` (3.15 MB) ends the phase, in both the
+last thread to start, and the checker that gets it ends the check phase
+110-120 ms after the others. On that path garnet lost: the thread's start
+(@33 ms against @2.6), the read (7.0 ms against 0.4), the bind (12 against
+7) and the publish (23 ms against 5.6); the parse itself matched (32
+against 31).
+
+- *The read.* `checker.ts` holds one non-ASCII character, so the decoder
+  left its all-ASCII path and went through a UTF-16 buffer, a second scan
+  and a copy: 6 ms of the 7. A large input with some non-ASCII is now
+  decoded straight into its storage, one-byte when every code point fits
+  (only C2/C3 leads), UTF-16 otherwise, the capacity `len` units and the
+  length set after: 1.9 ms. V8-diffed on large mixed, Latin-1, BMP, astral,
+  invalid, truncated and BOM inputs.
+- *The publish.* 489k cells, 1.19M references: the walk 22 ms and a second
+  pass over the cells (freeze, flag, promote) 5 ms. The walk is now one pass
+  that reads a header only when the cell is visited, prefetching the cells
+  ahead, and freezes, flags, promotes and logs the cell as it visits it; a
+  rejection undoes what was done (the previous frozen bit travels in the
+  done list's pointer tags; a cell promoted in region mode stays old, which
+  is only memory): 20 ms. On a cache-friendly synthetic graph of 400k
+  objects the two forms take the same 4.5 ms, so the gain is the pass
+  saved, not the prefetch; 41 ns per cell remain on the real graph.
+- *Collections in the parse workers*, tried and reverted: a worker without
+  young collections (everything old at birth, the walk with nothing to
+  promote) published `checker.ts`'s batch in the same 23.7 ms and parsed it
+  no faster (39 ms against 32 in one noisy sample); the workers reclaim
+  little (regions of 13-61 MB with collections, 16-64 MB without), so the
+  collections cost little too. The default stays.
+- *The start.* `TSAOT_FORK_TRACE=1` prints each fork's cost: the parent's
+  young collection 0.2-0.5 ms, fork() 0.2-0.6 ms (40 MB resident), the child
+  at its entry within a millisecond; the ten spawns take 8 ms of the main
+  thread, inside its config read (@6.6 to @14.5), and a child's first
+  TypeScript mark comes 3-18 ms after its entry: ten workers and the main
+  thread on 4 performance and 6 efficiency cores, the early workers already
+  on the libraries. The root files are queued when the config read ends
+  (@16.9 against @2.7), and `checker.ts` goes to the first worker that
+  asks, the last one started (@34). Fewer parse threads do not help
+  (`TSAOT_CPUS=4/6/8/10`: parse 0.105/0.095/0.095/0.091 s). Open: a cheaper
+  spawn loop (the young collection once per batch, forks of 0.3 ms), and
+  the main thread's own 5 ms before `main` runs against scriptc's 1.3.
+- Knobs: `TSAOT_CPUS=N` (the host's `availableParallelism`),
+  `TSAOT_FORK_TRACE=1`.
+
 ## Sharing by fork: regions
 
 The fork prototype shares the parent's heap with its children by

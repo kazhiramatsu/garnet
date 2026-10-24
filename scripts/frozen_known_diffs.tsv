@@ -248,3 +248,5 @@ parity	classes/method_site_cache	The Rust emitter deletes a prototype property u
 selfconf-unported	classes/instanceof_dynamic_classes	Frozen emitter lacks ConstructResult (a constructor returning another object); native Rust output matches V8.
 parity-unported	modules/published_graphs	Frozen emitter lacks LoadBuiltinFn globalref.__garnet (the garnet:shared module); native Rust output matches V8.
 selfconf-unported	modules/published_graphs	Frozen emitter lacks LoadBuiltinFn globalref.__garnet (the garnet:shared module); native Rust output matches V8.
+parity-unported	stdlib/text_decoder_large	Frozen emitter lacks builtin 'typedarray.new:1' (the fixture builds its inputs with typed arrays); native Rust output matches V8.
+selfconf-unported	stdlib/text_decoder_large	Frozen emitter lacks builtin 'typedarray.new:1' (the fixture builds its inputs with typed arrays); native Rust output matches V8.

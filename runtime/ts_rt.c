@@ -97,6 +97,8 @@ static inline void gc_note_payload(size_t bytes){ g_payload_fresh_bytes += bytes
 #include <sys/mman.h>
 static size_t sab_mapped_bytes(uint32_t n);
 static int publish_protect_on(void);
+static int fork_trace_on(void);
+static double fork_trace_now_ms(void);
 /* A program-counter sampling profiler (TSAOT_PROF_PC=path): a sampler
    thread suspends the main thread every TSAOT_PROF_PC_US microseconds
    (default 100), reads its PC, link register and frame pointer, and resumes
@@ -6368,9 +6370,11 @@ static void g0_dump(FILE* out){
           g_young_log_cap, g0_rem_enroll, g0_proto_materialized, g0_pretenured_bytes);
 }
 #endif
+static uint64_t g_minor_collections = 0;   /* this process's young collections (the fork trace) */
 void ts_gc_collect_young(void){
   g_payload_fresh_bytes = 0;
   if (!g_young_new_since_minor && !g_young_log_len){ g_young_fresh_bytes = 0; return; }
+  g_minor_collections++;
   g_gc_collecting = 1;
   RT_STAT_INC(minor_gc); RT_STAT_GC_T0;
   G0_T0;
@@ -15198,6 +15202,42 @@ static tsv td_m_decode(tsv* a, int n){
         return r;
       }
     }
+    if (len > 256u){
+      /* A large text with some non-ASCII (a source file with one Bengali
+         character in a comment) is decoded straight into its storage: one
+         byte per unit when every code point fits (only valid two-byte
+         sequences with leads C2/C3 beyond ASCII), UTF-16 otherwise. A byte
+         never yields more than one unit, so `len` units of capacity hold
+         the result and the length is set after. The intermediate buffer and
+         its second scan and copy were 6 ms of a 3 MB file's 7 ms read. */
+      int wide = 0;
+      for (uint32_t i = 0; i < len; ){
+        uint32_t x = bytes[i];
+        if (x < 0x80u){ i++; continue; }
+        if ((x == 0xC2u || x == 0xC3u) && i + 1u < len && bytes[i + 1] >= 0x80u && bytes[i + 1] <= 0xBFu){ i += 2u; continue; }
+        wide = 1; break;
+      }
+      ts_string* str = ts_string_alloc_storage(len, wide ? TS_STR_FLAG_UTF16 : 0u);
+      uint32_t units;
+      if (wide) units = td_decode_utf8(bytes, len, (uint16_t*)str->data, fatal);
+      else {
+        uint8_t* out = (uint8_t*)str->data; uint32_t o = 0;
+        for (uint32_t i = 0; i < len; ){
+          while (i + 8u <= len){ uint64_t w; memcpy(&w, bytes + i, 8); if (w & 0x8080808080808080ull) break; memcpy(out + o, bytes + i, 8); o += 8u; i += 8u; }
+          if (i >= len) break;
+          uint32_t x = bytes[i];
+          if (x < 0x80u){ out[o++] = (uint8_t)x; i++; }
+          else { out[o++] = (uint8_t)(((x & 0x1Fu) << 6) | (bytes[i + 1] & 0x3Fu)); i += 2u; }   /* C2/C3 and its continuation, checked above */
+        }
+        units = o;
+      }
+      uint32_t unit = wide ? 2u : 1u;
+      str->len = units;
+      memset(str->data + (size_t)units * unit, 0, unit);
+      str->flags = wide ? TS_STR_FLAG_UTF16 : 0u;   /* non-ASCII is present: the all-ASCII text took the path above */
+      ts_gc_unroot(2);
+      return ts_str_v(str);
+    }
   }
   uint16_t stackbuf[256];
   uint16_t* u = len + 1 <= 256 ? stackbuf : (uint16_t*)malloc(sizeof(uint16_t) * ((size_t)len + 1));
@@ -18381,6 +18421,7 @@ static void drain_microtasks(void){
 #include <errno.h>
 #include <poll.h>
 #include <sys/wait.h>
+#include <sys/resource.h>
 
 /* ---- Published graphs (garnet:shared; docs/published_graphs_design.md) ----
    publish(v) walks the graph reachable from v through own properties, elements,
@@ -18395,10 +18436,13 @@ static void drain_microtasks(void){
    opaque: exactly the cells to stop at). The marks of the cells reached are
    reset afterwards, except in a shared worker, where they stay. */
 typedef struct {
-  ts_gc_header** cells; size_t len, cap;    /* the cells published: frozen, immortal, opaque */
-  ts_gc_header** keep; size_t klen, kcap;   /* region mode: the prototypes reached and what they reach, kept but not frozen */
-  int keeping;                               /* pushes go to `keep` */
+  ts_gc_header** edges; size_t elen, ecap;   /* the cells to visit, as referenced (a cell referenced twice is listed twice); a header is read when the cell is visited */
+  ts_gc_header** done; size_t dlen, dcap;    /* the cells visited, tagged in the pointer's low bits: 1 frozen before this walk, 2 kept (not frozen) */
+  ts_gc_header** keep; size_t klen, kcap;    /* region mode: the prototypes reached and what they reach, visited after the graph */
+  int keeping;                               /* pushes go to `keep`, visits keep rather than freeze */
 } publish_walk;
+#define PUBLISH_DONE_WAS_FROZEN 1u
+#define PUBLISH_DONE_KEPT 2u
 static void publish_append(ts_gc_header*** arr, size_t* len, size_t* cap, ts_gc_header* h){
   if (*len == *cap){
     size_t ncap = *cap ? *cap * 2u : 256u;
@@ -18408,23 +18452,19 @@ static void publish_append(ts_gc_header*** arr, size_t* len, size_t* cap, ts_gc_
   }
   (*arr)[(*len)++] = h;
 }
+/* A reference the walk will visit. Only the tag is read here: the header, a
+   cache miss per cell on a large graph, is read when the cell is visited,
+   with the cells ahead prefetched, and the visit does everything in one pass
+   (a 3 MB source file's 490k cells: 27 ms as two passes, 20 ms this way). */
 static void publish_push(publish_walk* w, tsv v){
   ts_gc_header* h;
   if (TS_TOP16(v) == TS_SEL_OBJECT || ts_is_func(v)) h = (ts_gc_header*)ts_ptr(v);
-  else if (g_region_mode && ts_is_heap_str(v)){
-    /* a string the graph reaches (a key, a name, a view's text) is immutable,
-       but in a region it must outlive the worker's collections like the cells
-       naming it: a young collection never scans the old published cells, so
-       the walk promotes the strings too (their bytes are inline) */
-    h = (ts_gc_header*)ts_ptr(v);
-    if (h->gen != TS_GEN_YOUNG && h->gen != TS_GEN_OLD) return;   /* interned: immortal */
-  } else return;
-  if (h->flags & TS_HDR_PUBLISHED) return;            /* an earlier publish reached it */
-  if (h->mark) return;                                /* reached by this walk (or immortal) */
-  if (w->keeping && !region_holds(h)) return;         /* a pre-fork cell a prototype reaches is the parent's own */
-  h->mark = 1;
-  if (w->keeping) publish_append(&w->keep, &w->klen, &w->kcap, h);
-  else publish_append(&w->cells, &w->len, &w->cap, h);
+  else if (g_region_mode && ts_is_heap_str(v)) h = (ts_gc_header*)ts_ptr(v);   /* promoted with the graph: publish_visit */
+  else return;
+  if (w->keeping){
+    if (!region_holds(h)) return;         /* a pre-fork cell a prototype reaches is the parent's own */
+    publish_append(&w->keep, &w->klen, &w->kcap, h);
+  } else publish_append(&w->edges, &w->elen, &w->ecap, h);
 }
 /* Region mode: a prototype the graph reaches is kept, immortal here and opaque
    to the readers like a published cell (the worker's collector would otherwise
@@ -18538,55 +18578,85 @@ static void prefork_frozen_push(uintptr_t a){
   }
   g_prefork_frozen[g_prefork_frozen_len++] = a;
 }
+/* Visits a cell: nothing for one published before or reached already by this
+   walk, the rejected kind's name for one that cannot be published. Otherwise,
+   in the graph's walk the cell is frozen and flagged published (its previous
+   frozen bit kept for the undo); in region mode it is promoted with its
+   payloads (strings included: a young string referenced only from the old
+   published cells would be freed by the worker's next collection), a pre-fork
+   cell logged for the parent; its mark is set and its children pushed. */
+static const char* publish_visit(publish_walk* w, ts_gc_header* h){
+  if (h->flags & TS_HDR_PUBLISHED) return NULL;            /* an earlier publish reached it */
+  if (h->mark) return NULL;                                /* reached by this walk (or immortal) */
+  if (h->kind == TS_KIND_STRING && h->gen != TS_GEN_YOUNG && h->gen != TS_GEN_OLD) return NULL;   /* interned: immortal */
+  const char* rejected = publish_rejected_kind(h);
+  if (rejected) return rejected;
+  int bag = h->kind == TS_KIND_OBJECT || h->kind == TS_KIND_ARRAY || h->kind == TS_KIND_FUNC || h->kind == TS_KIND_MAP || h->kind == TS_KIND_SET;
+  uintptr_t tag = 0;
+  if (w->keeping) tag = PUBLISH_DONE_KEPT;
+  else {
+    if (bag){
+      if (((ts_object*)h)->shape & TS_OBJ_FROZEN_BIT) tag = PUBLISH_DONE_WAS_FROZEN;
+      ts_obj_add_integrity((ts_object*)h, 1u);
+    }
+    h->flags |= TS_HDR_PUBLISHED;
+    if (g_region_mode && !region_holds(h)) prefork_frozen_push((uintptr_t)h);
+  }
+  publish_append(&w->done, &w->dlen, &w->dcap, (ts_gc_header*)((uintptr_t)h | tag));
+  if (g_region_mode){
+    /* immortal here (old, never collected) and opaque to the parent's markers
+       (mark 1 reads as already marked) */
+    if (h->gen == TS_GEN_YOUNG) g_old_bytes += gc_cell_heap_bytes(h, gc_cell_promote(h));
+    publish_mark_payloads(h);
+  }
+  h->mark = 1;
+  publish_children(w, h);
+  return NULL;
+}
+static inline ts_gc_header* publish_done_cell(ts_gc_header* tagged){ return (ts_gc_header*)((uintptr_t)tagged & ~(uintptr_t)3u); }
 tsv ts_publish(tsv v){
   if (!(TS_TOP16(v) == TS_SEL_OBJECT || ts_is_func(v))) return v;    /* primitives: already immutable */
   if (g_has_proxies && ts_is_proxy(v)) ts_throw_type_error_msg("Cannot publish a Proxy");
-  publish_walk w = { NULL, 0, 0, NULL, 0, 0, 0 };
+  publish_walk w = { NULL, 0, 0, NULL, 0, 0, NULL, 0, 0, 0 };
+  double pt0 = fork_trace_on() ? fork_trace_now_ms() : 0;
   publish_push(&w, v);
   const char* rejected = NULL;
-  for (size_t i = 0; i < w.len && !rejected; i++){
-    rejected = publish_rejected_kind(w.cells[i]);
-    if (!rejected) publish_children(&w, w.cells[i]);
+  for (size_t i = 0; i < w.elen && !rejected; i++){
+    if (i + 8u < w.elen) __builtin_prefetch(w.edges[i + 8u]);
+    rejected = publish_visit(&w, w.edges[i]);
   }
   w.keeping = 1;   /* the prototypes reached (region mode), and what they reach */
   for (size_t i = 0; i < w.klen && !rejected; i++){
-    rejected = publish_rejected_kind(w.keep[i]);
-    if (!rejected) publish_children(&w, w.keep[i]);
+    if (i + 8u < w.klen) __builtin_prefetch(w.keep[i + 8u]);
+    rejected = publish_visit(&w, w.keep[i]);
   }
   w.keeping = 0;
   if (rejected){
-    for (size_t i = 0; i < w.len; i++) w.cells[i]->mark = 0;
-    for (size_t i = 0; i < w.klen; i++) w.keep[i]->mark = 0;
-    free(w.cells); free(w.keep);
+    /* nothing stays published: the flags and frozen bits as they were, the
+       marks clear (a cell promoted in region mode stays old, which is only
+       memory) */
+    for (size_t i = 0; i < w.dlen; i++){
+      ts_gc_header* h = publish_done_cell(w.done[i]);
+      uintptr_t tag = (uintptr_t)w.done[i] & 3u;
+      if (!(tag & PUBLISH_DONE_KEPT)){
+        h->flags &= (uint8_t)~TS_HDR_PUBLISHED;
+        if (!(tag & PUBLISH_DONE_WAS_FROZEN) &&
+            (h->kind == TS_KIND_OBJECT || h->kind == TS_KIND_ARRAY || h->kind == TS_KIND_FUNC || h->kind == TS_KIND_MAP || h->kind == TS_KIND_SET))
+          ((ts_object*)h)->shape &= ~TS_OBJ_FROZEN_BIT;
+      }
+      h->mark = 0;
+    }
+    free(w.edges); free(w.done); free(w.keep);
     char buf[96];
     snprintf(buf, sizeof buf, "Cannot publish %s", rejected);
     ts_throw_type_error_msg(buf);
   }
-  for (size_t i = 0; i < w.len; i++){
-    ts_gc_header* h = w.cells[i];
-    if (h->kind == TS_KIND_OBJECT || h->kind == TS_KIND_ARRAY || h->kind == TS_KIND_FUNC || h->kind == TS_KIND_MAP || h->kind == TS_KIND_SET)
-      ts_obj_add_integrity((ts_object*)h, 1u);
-    h->flags |= TS_HDR_PUBLISHED;
-    if (g_region_mode){
-      /* immortal here (old, never collected) and opaque to the parent's
-         markers (mark 1 reads as already marked); a pre-fork cell goes to
-         the parent with the next frame, which freezes and roots it */
-      if (h->gen == TS_GEN_YOUNG) g_old_bytes += gc_cell_heap_bytes(h, gc_cell_promote(h));
-      publish_mark_payloads(h);
-      h->mark = 1;
-      if (!region_holds(h)) prefork_frozen_push((uintptr_t)h);
-    } else {
-      h->mark = 0;
-    }
-  }
-  for (size_t i = 0; i < w.klen; i++){   /* kept: immortal and opaque here, not frozen */
-    ts_gc_header* h = w.keep[i];
-    if (h->gen == TS_GEN_YOUNG) g_old_bytes += gc_cell_heap_bytes(h, gc_cell_promote(h));
-    publish_mark_payloads(h);
-    h->mark = 1;
-  }
-  if (w.len) prop_add_epoch_bump();
-  free(w.cells); free(w.keep);
+  /* the marks of the cells reached are reset, except in a shared worker, where they stay */
+  if (!g_region_mode) for (size_t i = 0; i < w.dlen; i++) publish_done_cell(w.done[i])->mark = 0;
+  if (w.dlen) prop_add_epoch_bump();
+  if (pt0 && w.dlen >= 50000)
+    fprintf(stderr, "[publish] pid %d: %zu cells (%zu edges, %zu kept): %.2f ms\n", (int)getpid(), w.dlen, w.elen, w.klen, fork_trace_now_ms() - pt0);
+  free(w.edges); free(w.done); free(w.keep);
   return v;
 }
 int ts_is_published(tsv v){
@@ -19046,11 +19116,23 @@ static void region_protect_all(void){
 }
 int ts_worker_fork(tsv data){ return ts_worker_fork_ex(data, 0); }
 int ts_worker_fork_shared(tsv data){ return ts_worker_fork_ex(data, 1); }
+/* TSAOT_FORK_TRACE=1: the cost of each fork on stderr (the parent's young
+   collection, its setup, fork() itself, and the child's time from the fork to
+   its entry), on the system clock both processes share. */
+static int fork_trace_on(void){
+  static int on = -1;
+  if (on < 0){ const char* e = getenv("TSAOT_FORK_TRACE"); on = e && e[0] == '1'; }
+  return on;
+}
+static double fork_trace_now_ms(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6; }
+static double g_fork_trace_forked_at = 0;   /* the parent's clock just before fork(), inherited by the child */
 static int ts_worker_fork_ex(tsv data, int shared){
   if (!ts_is_func(g_worker_entry)) ts_throw_type_error_msg("Worker: no worker entry is registered");
   if (shared && g_region_mode) ts_throw_type_error_msg("Worker: a shared worker cannot fork a shared worker");
   ts_gc_root(&data);
   fflush(stdout); fflush(stderr);
+  int ftrace = fork_trace_on();
+  double ft0 = ftrace ? fork_trace_now_ms() : 0, ft1 = ft0, ft2 = ft0;
   /* the region: a run of blocks mapped shared at its cage address; the
      parent keeps it as GC_BLK_REGION; the shape ids partitioned */
   uint32_t region_lo = 0, region_hi = 0, child_shape_lo = 0, child_shape_hi = 0;
@@ -19060,6 +19142,7 @@ static int ts_worker_fork_ex(tsv data, int shared){
        deferred until the worker's frames have rooted what the graph reached.
        A dead young cell is freed here, before the child could see it. */
     ts_gc_collect_young();
+    if (ftrace) ft1 = fork_trace_now_ms();
     uint32_t mb = env_u32("TSAOT_SHARED_REGION_MB", 512u);
     uint32_t nblocks = (uint32_t)(((size_t)mb << 20) >> GC_BLOCK_SHIFT);
     if (!nblocks) nblocks = 1u;
@@ -19089,8 +19172,14 @@ static int ts_worker_fork_ex(tsv data, int shared){
   int fds[2], in[2];
   if (pipe(fds) != 0) ts_throw_type_error_msg("Worker: pipe failed");
   if (pipe(in) != 0){ close(fds[0]); close(fds[1]); ts_throw_type_error_msg("Worker: pipe failed"); }
+  if (ftrace){ ft2 = fork_trace_now_ms(); g_fork_trace_forked_at = ft2; }
   pid_t pid = fork();
   if (pid < 0){ close(fds[0]); close(fds[1]); close(in[0]); close(in[1]); ts_throw_type_error_msg("Worker: fork failed"); }
+  if (ftrace && pid > 0){
+    struct rusage ru; getrusage(RUSAGE_SELF, &ru);
+    fprintf(stderr, "[fork] child %d: young gc %.2f ms, setup %.2f ms, fork() %.2f ms, parent max rss %ld MB\n", (int)pid,
+            ft1 - ft0, ft2 - ft1, fork_trace_now_ms() - ft2, (long)(ru.ru_maxrss >> 20));
+  }
   if (pid == 0){
     close(fds[0]); close(in[1]);
     g_parent_fd = in[0]; g_parent_watching = 0; g_parent_len = 0;
@@ -19119,6 +19208,7 @@ static int ts_worker_fork_ex(tsv data, int shared){
        copy their pages into this process */
     g_full_threshold_bytes = SIZE_MAX; g_full_threshold_forced = 1;
     if (!shared && g_shared_regions_exist && publish_protect_on()) region_protect_all();
+    if (ftrace) fprintf(stderr, "[fork child] %d: at the entry %.2f ms after the parent's fork()\n", (int)getpid(), fork_trace_now_ms() - g_fork_trace_forked_at);
     ts_handler* h = ts_eh_push();
     if (ts_setjmp(h->buf) != 0){
       ts_gc_set_root_depth(h->gc_root_len);
@@ -19135,6 +19225,9 @@ static int ts_worker_fork_ex(tsv data, int shared){
     ts_call(g_worker_entry, args, 1);
     ts_run_event_loop();
     ts_eh_pop();
+    if (ftrace) fprintf(stderr, "[fork child] %d: exit %.2f ms after the fork, region used %u MB, young collections %llu\n", (int)getpid(),
+                        fork_trace_now_ms() - g_fork_trace_forked_at, g_region_mode ? (unsigned)((((size_t)(g_region_cur - g_region_lo)) << GC_BLOCK_SHIFT) >> 20) : 0u,
+                        (unsigned long long)g_minor_collections);
     fflush(stdout); fflush(stderr);
     _exit(0);
   }

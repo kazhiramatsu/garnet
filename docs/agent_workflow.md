@@ -124,6 +124,9 @@ Principle: **measurement over theory**. Minimal reproduction → a probe that pi
    - `TSAOT_CRASH_TRACE=1` … SIGSEGV/SIGBUS print the faulting address (and whether it lies in a
      shared worker's region), the process (main or worker) and a backtrace; lldb cannot follow
      the forked children, this can.
+   - `TSAOT_FORK_TRACE=1` … each worker fork's cost (the parent's young collection, fork() itself,
+     the child's time to its entry and to its exit, a region's use) and a publish walk of 50k
+     cells or more; with `TSC_TS_TIMELINE=1` (tsc-ts's own marks) the two clocks agree.
    - `TSAOT_UNTYPED=1` … isolate whether type-driven optimization (SROA/unbox) is the cause
    - `garnet --stack-check` … every escape-analysis `Stack` object (class instance, scope record,
      closure) lives in a never-reused quarantine and dies with its activation; a dead one the

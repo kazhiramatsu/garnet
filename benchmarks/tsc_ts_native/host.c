@@ -263,7 +263,14 @@ static tsv host_post_message(tsv* a, int n){ ts_worker_post(arg(a, n, 0)); retur
 static tsv host_send_to_worker(tsv* a, int n){ ts_worker_send((int)ts_to_num(arg(a, n, 0)), arg(a, n, 1)); return TS_UNDEFINED; }
 static tsv host_on_parent_message(tsv* a, int n){ ts_worker_on_parent_message(arg(a, n, 0)); return TS_UNDEFINED; }
 static tsv host_close_parent_port(tsv* a, int n){ (void)a; (void)n; ts_worker_parent_close(); return TS_UNDEFINED; }
-static tsv host_cpus(tsv* a, int n){ (void)a; (void)n; long c = sysconf(_SC_NPROCESSORS_ONLN); return ts_num(c > 0 ? (double)c : 1); }
+/* the CPUs tsc-ts plans its threads with (os.availableParallelism); TSAOT_CPUS=N overrides, for
+   measurements on asymmetric cores */
+static tsv host_cpus(tsv* a, int n){
+  (void)a; (void)n;
+  const char* e = getenv("TSAOT_CPUS");
+  long c = e && e[0] ? strtol(e, NULL, 10) : sysconf(_SC_NPROCESSORS_ONLN);
+  return ts_num(c > 0 ? (double)c : 1);
+}
 static tsv host_isatty(tsv* a, int n){ return ts_bool(isatty((int)ts_to_num(arg(a, n, 0)))); }
 static tsv host_pid(tsv* a, int n){ (void)a; (void)n; return ts_num((double)getpid()); }
 static tsv host_ppid(tsv* a, int n){ (void)a; (void)n; return ts_num((double)getppid()); }

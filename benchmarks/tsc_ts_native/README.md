@@ -54,8 +54,9 @@ checkers, and with two or more checkers tsc-ts also parses and binds on
 shared workers forked before the config is read, which publish the files
 into regions the main thread and the checkers read in place
 (`docs/published_graphs_design.md`). Without `--checkers` tsc-ts picks its
-default from `availableParallelism()`, so one-thread measurements pass
-`--singleThreaded` (or `--checkers 1`):
+default from `availableParallelism()` (`TSAOT_CPUS=N` overrides what the
+host reports, for measurements on asymmetric cores), so one-thread
+measurements pass `--singleThreaded` (or `--checkers 1`):
 
 ```sh
 TSC_TS_LIB_DIR=/path/to/tsc-ts/node_modules/@scriptc/cli-darwin-arm64/dist/lib/typescript/lib \
