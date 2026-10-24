@@ -142,4 +142,15 @@ Against scriptc's native tsc-ts directly (the same checkout's
 pairs): scriptc 18.33 G instructions, 4.50 G cycles, 1.03 s; garnet's trained
 build 18.86 G (1.029), 4.41 G (0.980), 1.01 s (0.981). The first build of the
 session to finish the workload in less time than scriptc; 2.9% more
-instructions, 2% fewer cycles.
+instructions, 2% fewer cycles. The other modes, five pairs each, say where
+the gap remains:
+
+| mode | scriptc | garnet (trained) | garnet / scriptc |
+|---|---|---|---|
+| one thread, emitting | 18.36 G, 4.52 G cycles, 1.01 s, 394 MB | 18.91 G, 4.44 G, 1.00 s, 611 MB | instructions 1.030, cycles 0.980, wall 0.990, memory 1.55 |
+| one thread, `--noEmit` | 11.16 G, 2.86 G, 0.65 s, 299 MB | 12.02 G, 2.94 G, 0.66 s, 423 MB | 1.077, 1.028, 1.015, 1.41 |
+| four checkers, emitting | 0.43 s | 0.53 s | wall 1.233 (the forked checkers' counts are not in the parent's) |
+
+The win is the emit phase's: checking alone garnet is 3% behind in cycles and
+8% in instructions, the four-checker compile 23% behind in wall, and the
+peak memory 1.4-1.55 times scriptc's.

@@ -9309,3 +9309,9 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   (0.980), 1.01 s (0.981). The first garnet build of the session under
   scriptc's wall time; 2.9% more instructions, 2% fewer cycles. Session start:
   33.44 G and 1.74 s against the same 18.3 G.
+- The other modes against scriptc (five pairs each; `docs/pgo_design.md` has
+  the table): one thread `--noEmit` 11.16 -> 12.02 G instructions (1.077),
+  cycles 1.028, wall 0.65 -> 0.66 s, peak 299 -> 423 MB; four checkers
+  emitting 0.43 -> 0.53 s wall (1.233); one thread emitting peak 394 -> 611
+  MB. The win is the emit phase's; the checker, the parallel compile and the
+  memory are the remaining gaps.
