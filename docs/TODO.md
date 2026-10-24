@@ -9142,3 +9142,14 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   (comparison, not, `&&`/`||` chains with and without objects, instanceof,
   boolean-returning calls, parameters, any, numbers and strings as conditions)
   stays.
+- Slice AU (runtime, allocation; `docs/alloc_inline_design.md`): tsc-ts
+  allocates 7.4 M cells for one checker (3.5 M class instances, 2.4 M arrays,
+  0.9 M strings), each through `gc_alloc`, an out-of-line function of a few
+  dozen instructions (the budget test, the size class's bump, the accounting,
+  the header, the young-log test, the counters) at 1.2% of the typed compile's
+  samples with its helpers another 1.2%. `gc_alloc` and `gc_alloc_pretenured`
+  are inline now; the refill, a large cell, the conservative-roots bit and the
+  young log stay calls, and nothing else changes (the same tests in the same
+  order, so collections happen at the same allocations). The typed one checker
+  over eight pairs: 22.77 -> 22.72 G instructions (-0.23%), cycles -0.46%,
+  wall 1.23 -> 1.22 s, outputs identical.

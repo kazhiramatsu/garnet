@@ -1496,11 +1496,17 @@ static inline void gc_before_alloc(void){
 }
 /* The heap counts a cell's capacity (its size class), the measure its
    death subtracts (gc_cell_capacity); the statistics count requests. */
-static void gc_account_alloc(size_t sz, size_t cap){
+static inline void gc_account_alloc(size_t sz, size_t cap){
   RT_STAT_INC(alloc_count); RT_STAT_ADD(alloc_bytes, sz);
   g_heap_bytes += cap;
 }
-static void* gc_alloc(size_t sz, uint8_t kind){
+/* The allocation of a young cell, in line at its twenty callers (the class
+   instance, array, string, closure and map constructors among them): the
+   budget test, the size class's bump, the header and the counters are a few
+   dozen instructions, and a call and its spills were a third of the path
+   (docs/alloc_inline_design.md). The refill, the large cell and the young
+   log stay calls. */
+TS_RT_ALWAYS_INLINE void* gc_alloc(size_t sz, uint8_t kind){
   gc_before_alloc();
   G0_ALLOC(kind, sz);
   RT_STAT_INC(kind_alloc[kind]); RT_STAT_ADD(kind_bytes[kind], sz);
@@ -1519,7 +1525,7 @@ static void* gc_alloc(size_t sz, uint8_t kind){
    use the normal write barrier while initializing any young references in the
    new cell; the public pretenured constructors below enforce that for their
    direct proto/env stores. */
-static void* gc_alloc_pretenured(size_t sz, uint8_t kind){
+static inline void* gc_alloc_pretenured(size_t sz, uint8_t kind){
   gc_before_alloc();
   G0_ALLOC(kind, sz); G0_ADD(g0_pretenured_bytes, sz);
   RT_STAT_INC(kind_alloc[kind]); RT_STAT_ADD(kind_bytes[kind], sz);
