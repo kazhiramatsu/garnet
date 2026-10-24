@@ -298,6 +298,12 @@ Two tools that look right are wrong on garnet's binaries, and one works:
 - **`TSAOT_PROF_PC=<file>`** (runtime/ts_rt.c, `prof_pc_init`): a sampler
   thread suspends the main thread every `TSAOT_PROF_PC_US` microseconds
   (default 100), records its PC, link register and the frame's saved return
+  address. Forked workers (tsc-ts's parse workers and checkers) profile
+  themselves the same way and each writes `<file>.<pid>` at its exit, so a
+  parse worker's bind or a checker's check can be read apart from the main
+  thread's. Sampling as many processes as cores halves the sample rate;
+  proportions hold.
+  It records the PC, link register and the frame's saved return
   address, and writes a histogram at exit. Wall-clock sampling from another
   thread has neither bias. `scripts/prof_pc.py <file> <binary> <units dir>`
   prints the shares by symbol, by generated-C line (with the line's text)

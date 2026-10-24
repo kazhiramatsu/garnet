@@ -363,13 +363,15 @@ against 31).
   invalid, truncated and BOM inputs.
 - *The publish.* 489k cells, 1.19M references: the walk 22 ms and a second
   pass over the cells (freeze, flag, promote) 5 ms. The walk is now one pass
-  that reads a header only when the cell is visited, prefetching the cells
-  ahead, and freezes, flags, promotes and logs the cell as it visits it; a
-  rejection undoes what was done (the previous frozen bit travels in the
-  done list's pointer tags; a cell promoted in region mode stays old, which
-  is only memory): 20 ms. On a cache-friendly synthetic graph of 400k
-  objects the two forms take the same 4.5 ms, so the gain is the pass
-  saved, not the prefetch; 41 ns per cell remain on the real graph.
+  that reads a header only when the cell is visited and freezes, flags,
+  promotes and logs the cell as it visits it; a rejection undoes what was
+  done (the previous frozen bit travels in the done list's pointer tags; a
+  cell promoted in region mode stays old, which is only memory): 20 ms
+  breadth first. Depth first (a stack, the cells just pushed prefetched) the
+  walk follows the allocation order, a cell's children sitting right after
+  it: 16.7 ms; 34 ns per cell remain, cache misses on a 60 MB region. On a
+  cache-friendly synthetic graph of 400k objects every form takes the same
+  4.5 ms.
 - *Collections in the parse workers*, tried and reverted: a worker without
   young collections (everything old at birth, the walk with nothing to
   promote) published `checker.ts`'s batch in the same 23.7 ms and parsed it
@@ -388,8 +390,18 @@ against 31).
   (`TSAOT_CPUS=4/6/8/10`: parse 0.105/0.095/0.095/0.091 s). Open: a cheaper
   spawn loop (the young collection once per batch, forks of 0.3 ms), and
   the main thread's own 5 ms before `main` runs against scriptc's 1.3.
+- *The shape of the phase.* With `TSAOT_PROF_PC` now profiling the forked
+  workers too (each writes `<file>.<pid>`), the ten parse workers spend 76%
+  of their samples in `poll` and the main thread 47% of its parse-phase
+  samples there: the phase is latency-bound, a chain of dependent steps on
+  one worker with idle hardware around it, not throughput-bound. The main
+  thread turns chunks around as fast as scriptc's (the gaps between
+  consecutive receipts have the same distribution), so the remaining gap is
+  the chain itself (the start, the bind, the publish) and not the plumbing.
+  The check phase, 75% of the compile and already ahead of scriptc's, is
+  where the race is decided; the per-checker profiles are the tool for it.
 - Knobs: `TSAOT_CPUS=N` (the host's `availableParallelism`),
-  `TSAOT_FORK_TRACE=1`.
+  `TSAOT_FORK_TRACE=1`, `TSAOT_PROF_PC=<file>` in forked workers.
 
 ## Sharing by fork: regions
 

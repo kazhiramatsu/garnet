@@ -216,6 +216,28 @@ static void prof_pc_init(void){
   if (pthread_create(&g_prof_sampler, NULL, prof_pc_sampler, NULL) != 0){ free(g_prof_pcs); g_prof_pcs = NULL; return; }
   atexit(prof_pc_dump);
 }
+/* A forked worker profiles itself too: the parent's sampler thread did not
+   survive the fork, so a new one targets this thread from its start, and the
+   profile goes to <path>.<pid> at the worker's exit (its _exit skips the
+   atexit hook). Parse workers and checkers can be read with prof_pc.py like
+   the main thread (docs/agent_workflow.md). */
+static void prof_pc_fork_child(void){
+  if (!g_prof_pcs) return;   /* the parent does not profile */
+  g_prof_n = 0; g_prof_stop = 0;
+  pthread_t self = pthread_self();
+  g_prof_stack_hi = (uint64_t)(uintptr_t)pthread_get_stackaddr_np(self);
+  g_prof_stack_lo = g_prof_stack_hi - (uint64_t)pthread_get_stacksize_np(self);
+  g_prof_target = pthread_mach_thread_np(self);
+  g_prof_t0_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+  if (pthread_create(&g_prof_sampler, NULL, prof_pc_sampler, NULL) != 0) g_prof_pcs = NULL;
+}
+static void prof_pc_dump_child(void){
+  const char* base = getenv("TSAOT_PROF_PC");
+  if (!g_prof_pcs || !base || !base[0]) return;
+  char path[1024]; snprintf(path, sizeof path, "%s.%d", base, (int)getpid());
+  setenv("TSAOT_PROF_PC", path, 1); unsetenv("TSAOT_PROF_PC_RAW");   /* this process's copy of the environment */
+  prof_pc_dump();
+}
    /* a SharedArrayBuffer's pages (typed arrays) */
 #if defined(TS_ASAN_ENABLED)
 extern void __asan_poison_memory_region(const void *addr, size_t size);
@@ -18454,8 +18476,10 @@ static void publish_append(ts_gc_header*** arr, size_t* len, size_t* cap, ts_gc_
 }
 /* A reference the walk will visit. Only the tag is read here: the header, a
    cache miss per cell on a large graph, is read when the cell is visited,
-   with the cells ahead prefetched, and the visit does everything in one pass
-   (a 3 MB source file's 490k cells: 27 ms as two passes, 20 ms this way). */
+   with the cells just pushed prefetched, the walk depth first along the
+   allocation order, and the visit does everything in one pass (a 3 MB
+   source file's 490k cells: 27 ms as two passes breadth first, 17 ms this
+   way). */
 static void publish_push(publish_walk* w, tsv v){
   ts_gc_header* h;
   if (TS_TOP16(v) == TS_SEL_OBJECT || ts_is_func(v)) h = (ts_gc_header*)ts_ptr(v);
@@ -18621,14 +18645,18 @@ tsv ts_publish(tsv v){
   double pt0 = fork_trace_on() ? fork_trace_now_ms() : 0;
   publish_push(&w, v);
   const char* rejected = NULL;
-  for (size_t i = 0; i < w.elen && !rejected; i++){
-    if (i + 8u < w.elen) __builtin_prefetch(w.edges[i + 8u]);
-    rejected = publish_visit(&w, w.edges[i]);
+  /* depth first (a stack): a cell's children were allocated right after it,
+     so the walk follows the allocation order and its cache lines; the cells
+     just pushed are prefetched for the visits that follow */
+  while (w.elen && !rejected){
+    ts_gc_header* h = w.edges[--w.elen];
+    for (size_t k = w.elen > 6u ? w.elen - 6u : 0; k < w.elen; k++) __builtin_prefetch(w.edges[k]);
+    rejected = publish_visit(&w, h);
   }
   w.keeping = 1;   /* the prototypes reached (region mode), and what they reach */
-  for (size_t i = 0; i < w.klen && !rejected; i++){
-    if (i + 8u < w.klen) __builtin_prefetch(w.keep[i + 8u]);
-    rejected = publish_visit(&w, w.keep[i]);
+  while (w.klen && !rejected){
+    ts_gc_header* h = w.keep[--w.klen];
+    rejected = publish_visit(&w, h);
   }
   w.keeping = 0;
   if (rejected){
@@ -18655,7 +18683,7 @@ tsv ts_publish(tsv v){
   if (!g_region_mode) for (size_t i = 0; i < w.dlen; i++) publish_done_cell(w.done[i])->mark = 0;
   if (w.dlen) prop_add_epoch_bump();
   if (pt0 && w.dlen >= 50000)
-    fprintf(stderr, "[publish] pid %d: %zu cells (%zu edges, %zu kept): %.2f ms\n", (int)getpid(), w.dlen, w.elen, w.klen, fork_trace_now_ms() - pt0);
+    fprintf(stderr, "[publish] pid %d: %zu cells: %.2f ms\n", (int)getpid(), w.dlen, fork_trace_now_ms() - pt0);
   free(w.edges); free(w.done); free(w.keep);
   return v;
 }
@@ -19203,6 +19231,7 @@ static int ts_worker_fork_ex(tsv data, int shared){
     g_mq_len = 0;
     g_io_head = g_io_tail = g_io_active = NULL;
     g_is_worker = 1; g_worker_fd = fds[1];
+    prof_pc_fork_child();
     g_worker_data = data; ts_root_static_once(&g_worker_data, &g_worker_data_rooted);
     /* young collections only: a full one would mark every pre-fork cell and
        copy their pages into this process */
@@ -19228,6 +19257,7 @@ static int ts_worker_fork_ex(tsv data, int shared){
     if (ftrace) fprintf(stderr, "[fork child] %d: exit %.2f ms after the fork, region used %u MB, young collections %llu\n", (int)getpid(),
                         fork_trace_now_ms() - g_fork_trace_forked_at, g_region_mode ? (unsigned)((((size_t)(g_region_cur - g_region_lo)) << GC_BLOCK_SHIFT) >> 20) : 0u,
                         (unsigned long long)g_minor_collections);
+    prof_pc_dump_child();
     fflush(stdout); fflush(stderr);
     _exit(0);
   }

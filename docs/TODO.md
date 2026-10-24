@@ -9434,8 +9434,8 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   into its storage instead of through a UTF-16 buffer, a second scan and a
   copy (7.0 to 1.9 ms; V8-diffed on mixed, invalid, truncated and BOM inputs);
   the publish walk is one pass that reads a header only when the cell is
-  visited, prefetching ahead, and undoes itself on a rejection (489k cells:
-  27 to 20 ms). Tried and reverted: parse workers without young collections
+  visited, depth first along the allocation order with the cells just pushed
+  prefetched, and undoes itself on a rejection (489k cells: 27 to 16.7 ms). Tried and reverted: parse workers without young collections
   (no faster publish, no faster parse; they reclaim little anyway).
   Instrumented: `TSAOT_FORK_TRACE=1` (each fork's cost, the child's time to its
   entry, a region's use, big publishes) and `TSAOT_CPUS=N` on the host. Found
@@ -9446,3 +9446,14 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   against scriptc's 1.3; fewer parse threads do not help. Gates green; the
   machine was under the user's load, so the wall-time A/B against P5 is
   deferred to a quiet window.
+- Slice P6b (runtime): the publish walk depth first (a stack, the cells just
+  pushed prefetched) follows the allocation order: 489k cells 20 to 16.7 ms.
+  `TSAOT_PROF_PC` profiles forked workers too (each writes `<file>.<pid>`).
+  Finding: the parse workers are 76% idle (`poll`) and the main thread 47%
+  idle during the parse phase, whose chunk turnaround matches scriptc's: the
+  phase is a latency chain on one worker (start, read, parse, bind, publish),
+  not a throughput problem. The check phase (75% of the compile, already 6%
+  ahead of scriptc) decides the race; next slices return to it with the
+  per-checker profiles (top: fn_7504, checkIdentifier, gc_scan_cell,
+  isMatchingReference, getTypeAtFlowNode, map_find, ts_map_set,
+  ts_new_array_impl, ts_new_sized_impl).
