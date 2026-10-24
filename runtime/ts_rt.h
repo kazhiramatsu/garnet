@@ -1560,6 +1560,18 @@ tsv  ts_make_fn(ts_code code, tsv* env, uint32_t envlen); /* boxed callable; env
 tsv  ts_call(tsv fn, tsv* args, int nargs);               /* invoke a callable value */
 tsv  ts_call_value(tsv fn, tsv* args, int nargs);         /* value/callback call (injects undefined this if takes_this) */
 tsv  ts_call_method(tsv fn, tsv* args, int nargs);        /* method dispatch (args[0]=this); drops receiver if callee lacks takes_this */
+/* The dynamic method call with the method value in hand (a function, as the
+   caller tested): a class method takes its receiver as the first argument and
+   carries no environment, so its generic entry is called directly; a bound or
+   environment-carrying function and a proxy take the runtime's call
+   (docs/pic_sized_inline_design.md, "The dynamic call itself in line"). */
+TS_RT_ALWAYS_INLINE tsv ts_call_method_inline(tsv fn, tsv* args, int nargs){
+  if (TS_RT_LIKELY(ts_is_func(fn))){
+    const ts_func* f = (const ts_func*)ts_ptr(fn);
+    if (TS_RT_LIKELY(f->takes_this && !f->envlen)) return ((ts_code)f->code)(args, nargs);
+  }
+  return ts_call_method(fn, args, nargs);
+}
 /* a function value (the method-call fallback tests it on every dynamic call) */
 static inline int ts_is_callable(tsv v){ return ts_is_func(v); }
 tsv  ts_new_sized(size_t size);

@@ -2371,6 +2371,21 @@ fn ref_eq_enabled() -> bool {
     })
 }
 
+/// TSAOT_CALL_METHOD_INLINE=0 keeps a dynamic method call's invocation a call
+/// of ts_call_method (the parity oracle): on, the inline ts_call_method_inline
+/// calls a class method's generic entry directly
+/// (docs/pic_sized_inline_design.md, "The dynamic call itself in line").
+fn call_method_fn() -> &'static str {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_CALL_METHOD_INLINE").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    });
+    if on { "ts_call_method_inline" } else { "ts_call_method" }
+}
+
 /// TSAOT_METHOD_SITE_IC=0 keeps a dynamic method call's method lookup in the
 /// runtime alone (the parity oracle): on, the call site keeps a cache of its
 /// method keyed by the receiver's class word (docs/pic_sized_inline_design.md,
@@ -9845,7 +9860,7 @@ fn emit_known_method_call(
         method_key_str(method_id, ctx.wksym)
     );
     let _ = writeln!(s, "      if (!ts_is_callable(_mv)) ts_dynamic_method_missing({}u);", method_field);
-    let generic = format!("ts_call_method(_mv, _a, {})", argv.len());
+    let generic = format!("{}(_mv, _a, {})", call_method_fn(), argv.len());
     match dst {
         Some(d) => s.push_str(&ctx.set_val(d.0, &generic)),
         None => {
@@ -22440,7 +22455,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     if let Some(plan) = plan {
                         emit_vtable_call(s, ctx, &plan, argv, dst);
                         emit_method_value_lookup(s, "_a[0]", method.0, method_field.map(|f| f.0), ctx.wksym);
-                        let call = format!("ts_call_method(_mv, _a, {})", argv.len());
+                        let call = format!("{}(_mv, _a, {})", call_method_fn(), argv.len());
                         match dst {
                             Some(d) => s.push_str(&ctx.set_val(d.0, &call)),
                             None => {
@@ -22555,7 +22570,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                             ctx.wksym,
                         ),
                     }
-                    format!("ts_call_method(_mv, _a, {})", argv.len())
+                    format!("{}(_mv, _a, {})", call_method_fn(), argv.len())
                 }
                 // A Value callee WITH a receiver (recv present) is a member call
                 // `o[k](...)`: _a[0] is the base object, bind it as `this` via

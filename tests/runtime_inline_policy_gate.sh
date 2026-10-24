@@ -99,6 +99,7 @@ while IFS= read -r name; do
     ts_map_get_num | \
     ts_array_push_inline | \
     ts_method_lookup_sized_ic | \
+    ts_call_method_inline | \
     ts_prop_key_hash | \
     ts_class_word_cache_entry_for | \
     ts_class_word_cache_probe | \

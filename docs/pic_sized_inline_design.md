@@ -242,3 +242,43 @@ lookup alone (the parity oracle). Fixture `classes/method_site_cache`.
 | tsc-ts typed, one checker, instructions | 22.52 G | 22.49 G |
 
 Outputs identical in both.
+
+## The dynamic call itself in line (slice AX2)
+
+With the method in hand, a dynamic call went through `ts_call_method` and
+`ts_call`: a proxy test, a function test, the `takes_this` test, the
+environment test, then the generic entry. For a class method (it takes its
+receiver as the first argument and carries no environment), the inline
+`ts_call_method_inline` reads the two bytes of the function cell and calls
+the generic entry directly; a bound or environment-carrying function, a
+proxy and anything else take the runtime's call as before.
+`TSAOT_CALL_METHOD_INLINE=0` keeps the call (the parity oracle).
+
+| program | before | after |
+|---|---|---|
+| tsc-ts, every class dynamic, wall | 4.80 s | 4.54 s (-5%; 12.5 s before slice AJ) |
+| tsc-ts typed, one checker, instructions | 22.50 G | 22.44 G (-0.3%) |
+
+Outputs identical in both.
+
+## Three costs of the dynamic paths taken in line (slice AY)
+
+After slice AX2 the all-dynamic compile's profile has three runtime entries
+left that an inline test answers: the receiver check of every dynamic method
+call (`ts_check_method_recv`, 1.2%: two tag tests, now in line with the throw
+out of line); the out-of-line property read and write of a megamorphic site
+whose receiver the program does not type as a class instance
+(`ts_get_pic_checked` 6.9%, `ts_set_pic` 2.3%: the generic inline caches now
+try the registry's cache by class word when the site is megamorphic and the
+receiver is a sized instance, as the class-typed sites have since slice AO);
+and `instanceof` against a class that dispatches dynamically
+(`ts_instanceof` 1.6%: the chain walk, because a class's interval was given
+only to a subtree of stable classes). A dynamic class keeps its interval
+when its instability leaves the chain alone (a prototype method replaced, a
+dynamic or computed member, a deleted member, a constructor returning another
+object, the debugging modes); a reassigned prototype object
+(`C.prototype = ...`) or a foreign base keeps the chain walk, and a relinked
+prototype anywhere raises the guard the interval test already carries. The
+vtable dispatch keeps its own, stricter notion (stable classes).
+
+Measurements: see TODO (session 352, slice AY).

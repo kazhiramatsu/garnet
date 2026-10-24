@@ -9233,3 +9233,16 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   session; 12.5 s before slice AJ), outputs identical to the typed build's;
   the typed one checker 22.52 -> 22.49 G instructions, cycles +0.2%, outputs
   identical.
+- Slice AX2 (runtime header + emitter, the dynamic paths;
+  `docs/pic_sized_inline_design.md` "The dynamic call itself in line"): with
+  the method value in hand, a dynamic method call went through
+  `ts_call_method` and `ts_call` (a proxy test, a function test, the
+  `takes_this` and environment tests, then the generic entry), about 6% of the
+  all-dynamic compile's samples. The inline `ts_call_method_inline` reads the
+  function cell's two bytes and calls the generic entry directly for a class
+  method (its receiver first, no environment); bound and environment-carrying
+  functions and proxies take the runtime's call. `TSAOT_CALL_METHOD_INLINE=0`
+  keeps the call. The all-dynamic compile of tsc-ts: 4.80 -> 4.54 s (-5%,
+  paired runs in one session; 12.5 s before slice AJ, 5.34 s before AX),
+  outputs identical to the typed build's; the typed one checker 22.50 -> 22.44
+  G instructions (-0.3%), cycles unchanged, outputs identical.
