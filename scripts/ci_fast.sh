@@ -22,6 +22,7 @@ echo ">>> IR wire conversion"; node "$ROOT/tests/wire_program_tests.js" || rc=1
 echo ">>> production optimization defaults"; bash "$ROOT/tests/default_optimizations_gate.sh" || rc=1
 echo ">>> project compiler options"; bash "$ROOT/tests/project_options_gate.sh" || rc=1
 echo ">>> unit builds"; bash "$ROOT/tests/units_build_gate.sh" || rc=1
+echo ">>> profile-guided builds"; bash "$ROOT/tests/pgo_build_gate.sh" || rc=1
 if [[ "${TSAOT_CI_GC_STRESS:-0}" == "1" ]]; then
   echo ">>> escape-guided pretenuring"; bash "$ROOT/tests/pretenure_aot_gate.sh" || rc=1
 fi

@@ -87,6 +87,7 @@ compiler as one command.
 | `./garnet -p tsconfig.json src/main.ts` | Use project checking and module-resolution options |
 | `./garnet --profile src/main.ts` | Build with symbols and frame pointers for profiling |
 | `./garnet --rt-stats src/main.ts` | Print runtime allocation, GC, and lookup counters at exit |
+| `./garnet --pgo-train '"$TSAOT_PGO_BIN" input.txt' src/main.ts` | Run the program once on an instrumented build and write `default.pgo` next to it; every later build applies the profile (`--pgo off` to skip it) |
 | `./garnet --help` | Show all driver options and environment variables |
 
 The output executable always uses the C output name without its `.c` suffix.

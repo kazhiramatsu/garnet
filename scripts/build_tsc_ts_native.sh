@@ -4,6 +4,11 @@
 #   usage: scripts/build_tsc_ts_native.sh <tsc-ts checkout> [work-directory]
 # The checkout is left unchanged: its packages/tsc-ts/src is copied next to
 # the garnet entry and the Node module shims (benchmarks/tsc_ts_native/garnet).
+# The build is profile-guided (docs/pgo_design.md): an instrumented build is
+# trained on the TypeScript compiler project (build/typescript_603) and the
+# profile, written to <work>/default.pgo, guides the final build. TSAOT_PGO=off
+# builds plain, TSAOT_PGO=<file> applies that profile, TSAOT_PGO_TRAIN='<cmd>'
+# trains with another command (the instrumented executable is $TSAOT_PGO_BIN).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 if [[ $# -lt 1 || $# -gt 2 ]]; then
@@ -78,28 +83,76 @@ TSAOT_USE_MIMALLOC="${TSAOT_USE_MIMALLOC:-1}"
 TSAOT_LDLIBS="${TSAOT_LDLIBS:-}"
 . "$ROOT/scripts/lib/mimalloc_flags.sh"
 . "$ROOT/scripts/lib/regexp_link_flags.sh"
-$CC -c "$ROOT/runtime/ts_rt.c" -I"$ROOT/runtime" -o "$WORK/rt.o"
-$CC -c "$ROOT/benchmarks/tsc_ts_native/host.c" -I"$ROOT/runtime" -o "$WORK/host.o"
-tsaot_prepare_regexp_objs "$MARKERS_C" "$WORK"
-tsaot_prepare_unicode_objs "$MARKERS_C" "$WORK"
-tsaot_prepare_fetch_runtime "$MARKERS_C" "$WORK" "$WORK/rt.o"
+. "$ROOT/scripts/lib/pgo.sh"
 if [[ -n "${TSAOT_MIMALLOC_ACTIVE:-}" ]]; then
   GEN_CC="$GEN_CC -DTSAOT_USE_MIMALLOC -I$ROOT/third_party/mimalloc/include"
 fi
-if [[ "$UNITS" == "1" ]]; then
-  . "$ROOT/scripts/lib/units.sh"
-  TSAOT_UNITS_CC="$GEN_CC" \
-  TSAOT_UNITS_CFLAGS="-include $ROOT/benchmarks/tsc_ts_native/host.h -I$ROOT/runtime" \
-    tsaot_units_build "$WORK/units" "$WORK/tsc-ts" "$WORK/host.o" "$TSAOT_FETCH_RT_OBJ_ARG" \
-      $TSAOT_REGEXP_OBJ_ARGS $TSAOT_UNICODE_OBJ_ARGS -lm $TSAOT_FETCH_LDLIBS $TSAOT_LDLIBS
-else
-  $GEN_CC -c -include "$ROOT/benchmarks/tsc_ts_native/host.h" \
-    "$WORK/tsc-ts.c" -I"$ROOT/runtime" -o "$WORK/tsc-ts.o"
-  $GEN_CC "$WORK/tsc-ts.o" "$WORK/host.o" "$TSAOT_FETCH_RT_OBJ_ARG" \
-    $TSAOT_REGEXP_OBJ_ARGS $TSAOT_UNICODE_OBJ_ARGS -lm $TSAOT_FETCH_LDLIBS $TSAOT_LDLIBS \
-    -o "$WORK/tsc-ts"
-fi
-python3 - "$WORK" "$CHECKOUT" "$CC" "$GEN_CC" "$UNITS" "${TSAOT_UNITS_LTO:-1}" <<'PY'
+# One pass of the native build: the runtime, the host, the optional runtime
+# objects and the program, compiled with the pass's extra flags (none, the
+# instrumentation, or a profile) into the pass's directory.
+native_build() { # <extra cflags> <output executable> <pass directory>
+  local extra="$1" out="$2" pw="$3"
+  local CC="$CC${extra:+ $extra}" GEN_CC="$GEN_CC${extra:+ $extra}"
+  mkdir -p "$pw"
+  # the instrumented objects are keyed by this build's directory: they would
+  # never be reused, so they bypass the shared cache
+  case "$extra" in *-fprofile-generate*) local TSAOT_UNITS_CACHE="$pw/unit-cache" ;; esac
+  $CC -c "$ROOT/runtime/ts_rt.c" -I"$ROOT/runtime" -o "$pw/rt.o"
+  $CC -c "$ROOT/benchmarks/tsc_ts_native/host.c" -I"$ROOT/runtime" -o "$pw/host.o"
+  tsaot_prepare_regexp_objs "$MARKERS_C" "$pw"
+  tsaot_prepare_unicode_objs "$MARKERS_C" "$pw"
+  tsaot_prepare_fetch_runtime "$MARKERS_C" "$pw" "$pw/rt.o"
+  if [[ "$UNITS" == "1" ]]; then
+    . "$ROOT/scripts/lib/units.sh"
+    TSAOT_UNITS_CC="$GEN_CC" \
+    TSAOT_UNITS_CFLAGS="-include $ROOT/benchmarks/tsc_ts_native/host.h -I$ROOT/runtime" \
+      tsaot_units_build "$WORK/units" "$out" "$pw/host.o" "$TSAOT_FETCH_RT_OBJ_ARG" \
+        $TSAOT_REGEXP_OBJ_ARGS $TSAOT_UNICODE_OBJ_ARGS -lm $TSAOT_FETCH_LDLIBS $TSAOT_LDLIBS
+  else
+    $GEN_CC -c -include "$ROOT/benchmarks/tsc_ts_native/host.h" \
+      "$WORK/tsc-ts.c" -I"$ROOT/runtime" -o "$pw/tsc-ts.o"
+    $GEN_CC "$pw/tsc-ts.o" "$pw/host.o" "$TSAOT_FETCH_RT_OBJ_ARG" \
+      $TSAOT_REGEXP_OBJ_ARGS $TSAOT_UNICODE_OBJ_ARGS -lm $TSAOT_FETCH_LDLIBS $TSAOT_LDLIBS \
+      -o "$out"
+  fi
+}
+# The profile-guided build (docs/pgo_design.md): the default trains an
+# instrumented build on the TypeScript compiler project with one checker (the
+# measured workload) and applies the profile; TSAOT_PGO=off builds plain,
+# TSAOT_PGO=<file> applies that profile.
+PGO="${TSAOT_PGO:-train}"
+PGO_PROFILE=""
+PGO_TRAINED_WITH=""
+case "$PGO" in
+  off)
+    native_build "" "$WORK/tsc-ts" "$WORK/pass" ;;
+  train)
+    tsaot_pgo_supported "$CC" || { echo "[pgo] the profile-guided build needs clang (TSAOT_PGO=off builds plain)" >&2; exit 1; }
+    tsaot_pgo_profdata > /dev/null || exit 1
+    TRAIN="${TSAOT_PGO_TRAIN:-}"
+    if [[ -z "$TRAIN" ]]; then
+      TS_SRC="$ROOT/build/typescript_603/source"
+      LIB="${TSC_TS_LIB_DIR:-$(ls -d "$CHECKOUT"/node_modules/@scriptc/cli-*/dist/lib/typescript/lib 2>/dev/null | head -1)}"
+      if [[ ! -f "$TS_SRC/src/compiler/tsconfig.json" || -z "$LIB" ]]; then
+        echo "[pgo] no training workload at hand: the TypeScript compiler project ($TS_SRC/src/compiler) and its lib directory (TSC_TS_LIB_DIR, or the checkout's @scriptc package) are needed; set TSAOT_PGO_TRAIN='<command>' or TSAOT_PGO=off" >&2
+        exit 1
+      fi
+      TRAIN="cd '$TS_SRC' && TSC_TS_LIB_DIR='$LIB' \"\$TSAOT_PGO_BIN\" -p src/compiler/tsconfig.json --composite false --incremental false --declaration false --declarationMap false --emitDeclarationOnly false --isolatedDeclarations false --sourceMap false --pretty false --checkers 1 --outDir '$WORK/pgo/out' > /dev/null"
+    fi
+    native_build "$(tsaot_pgo_gen_flags "$WORK/pgo/raw")" "$WORK/tsc-ts.pgo-gen" "$WORK/pass_gen"
+    echo "[pgo] training run: $TRAIN"
+    tsaot_pgo_train "$TRAIN" "$WORK/tsc-ts.pgo-gen" "$WORK/pgo/raw" "$WORK/default.pgo"
+    rm -rf "$WORK/tsc-ts.pgo-gen" "$WORK/pgo" "$WORK/pass_gen"
+    PGO_PROFILE="$WORK/default.pgo"
+    PGO_TRAINED_WITH="$TRAIN"
+    echo "[pgo] profile $PGO_PROFILE ($(du -k "$PGO_PROFILE" | cut -f1) KB)"
+    native_build "$(tsaot_pgo_use_flags "$PGO_PROFILE")" "$WORK/tsc-ts" "$WORK/pass" ;;
+  *)
+    [[ -f "$PGO" ]] || { echo "[pgo] TSAOT_PGO: no such profile: $PGO" >&2; exit 1; }
+    PGO_PROFILE="$(cd "$(dirname "$PGO")" && pwd)/$(basename "$PGO")"
+    native_build "$(tsaot_pgo_use_flags "$PGO_PROFILE")" "$WORK/tsc-ts" "$WORK/pass" ;;
+esac
+python3 - "$WORK" "$CHECKOUT" "$CC" "$GEN_CC" "$UNITS" "${TSAOT_UNITS_LTO:-1}" "$PGO" "$PGO_PROFILE" "$PGO_TRAINED_WITH" <<'PY'
 import json, pathlib, subprocess, sys
 work, checkout = map(pathlib.Path, sys.argv[1:3])
 commit = subprocess.run(["git", "-C", str(checkout), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
@@ -107,6 +160,7 @@ units = sys.argv[5] == "1"
 metadata = dict(checkout=str(checkout), commit=commit, source=str(work / "source"),
                 runtime_cc=sys.argv[3], generated_cc=sys.argv[4],
                 units=units, thin_lto=units and sys.argv[6] == "1",
+                pgo=dict(mode=sys.argv[7], profile=sys.argv[8] or None, trained_with=sys.argv[9] or None),
                 optimization_exceptions=json.loads((work / "optimization_exceptions.json").read_text()))
 (work / "build.json").write_text(json.dumps(metadata, indent=2) + "\n")
 PY

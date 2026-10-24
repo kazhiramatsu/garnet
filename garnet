@@ -5,6 +5,13 @@
 #   garnet -c foo.ts         Emit foo.c only (no native compile/link).
 #   garnet -o bar.c foo.ts   Use bar.c as the C output name (executable: bar).
 #   garnet -S foo.ts         Write the generated C to stdout (no files).
+#   garnet --pgo-train '"$TSAOT_PGO_BIN" input.txt' foo.ts
+#                            Build an instrumented `foo`, run the command on it,
+#                            write default.pgo next to foo.ts and build `foo`
+#                            again with that profile. A default.pgo next to the
+#                            entry file (or the project's tsconfig) is applied to
+#                            every build, the way Go applies a main package's
+#                            default.pgo (docs/pgo_design.md); --pgo off ignores it.
 #
 # Pipeline: exporter (TS → IR JSON) → analyzer `emit` (IR → C) → cc (C → binary).
 # Reuses the repo's link-flag helpers so optional RegExp / Unicode / fetch runtime
@@ -12,6 +19,8 @@
 #
 # Env:
 #   TSAOT_CC               C compiler+flags (default "cc -O2"; e.g. "gcc -O2").
+#   TSAOT_PGO              auto (default: apply a default.pgo next to the entry
+#                          file or the tsconfig) | off | <profile file>.
 #   TSAOT_ANALYZER         rust (default) | ts (frozen twin) | native.
 #   TSAOT_PROP_PIC=0       Disable production-default property PIC emission.
 #   TSAOT_FRAME_ROOTS=0    Disable production-default batched GC root frames.
@@ -152,9 +161,16 @@ usage: $PROG [-c | -S] [-o <out.c>] [-p <tsconfig>] <input.ts>
                 programs (docs/build_split_design.md; TSAOT_UNITS=1)
   --no-lto      with --units: link native objects without ThinLTO (faster
                 rebuilds, calls between units are not inlined; TSAOT_UNITS_LTO=0)
+  --pgo <auto|off|file>  profile-guided build: auto (default) applies a
+                default.pgo next to the entry file or the project's tsconfig,
+                off ignores it, a file applies that profile (TSAOT_PGO)
+  --pgo-train '<cmd>'  build an instrumented program, run <cmd> on it (the
+                executable is \$TSAOT_PGO_BIN and \$1), write default.pgo next
+                to the entry file and build with it (docs/pgo_design.md)
   -h, --help    show this help
 
 env: TSAOT_CC (default "cc -O2"), TSAOT_ANALYZER=rust|ts|native (default rust),
+     TSAOT_PGO=auto|off|<profile> for the profile-guided build,
      TSAOT_PROP_PIC=0 or TSAOT_FRAME_ROOTS=0 for legacy diagnostic emission,
      TSAOT_PRETENURE=0 to disable escape-guided pretenuring,
      TSAOT_LAZY_PROTO=0 for eager function .prototype allocation,
@@ -199,6 +215,8 @@ units="${TSAOT_UNITS:-0}"   # --units (TSAOT_UNITS=1)
 out_c=""         # -o
 input=""
 project=""
+pgo_opt=""       # --pgo (TSAOT_PGO)
+pgo_train=""     # --pgo-train
 while [ $# -gt 0 ]; do
   case "$1" in
     -c) emit_only=1 ;;
@@ -212,6 +230,10 @@ while [ $# -gt 0 ]; do
     --stack-check) stack_check=1; export TSAOT_STACK_CHECK=1 ;;
     --units) units=1 ;;
     --no-lto) export TSAOT_UNITS_LTO=0 ;;
+    --pgo) shift; [ $# -gt 0 ] || die "--pgo requires an argument (auto, off or a profile file)"; pgo_opt="$1" ;;
+    --pgo=*) pgo_opt="${1#--pgo=}" ;;
+    --pgo-train) shift; [ $# -gt 0 ] || die "--pgo-train requires the training command"; pgo_train="$1" ;;
+    --pgo-train=*) pgo_train="${1#--pgo-train=}" ;;
     -h|--help) usage; exit 0 ;;
     --) shift; break ;;
     -*) die "unknown option: $1 (try $PROG --help)" ;;
@@ -221,6 +243,10 @@ while [ $# -gt 0 ]; do
 done
 [ -n "${input:-}" ] || { [ $# -gt 0 ] && input="$1" || { usage; exit 1; }; }
 [ "$emit_only" -eq 1 ] && [ "$to_stdout" -eq 1 ] && die "-c and -S are mutually exclusive"
+if [ -n "$pgo_train" ]; then
+  [ "$emit_only" -eq 0 ] && [ "$to_stdout" -eq 0 ] || die "--pgo-train needs a native build (not -c or -S)"
+  case "${pgo_opt:-auto}" in auto) ;; *) die "--pgo-train writes default.pgo and applies it; --pgo $pgo_opt conflicts" ;; esac
+fi
 
 # ----- validate input -----
 [ -f "$input" ] || die "no such file: $input"
@@ -313,6 +339,25 @@ else
   fi
 fi
 
+# ----- the profile (docs/pgo_design.md) -----
+# `auto` applies a default.pgo next to the entry file, else next to the
+# project's tsconfig; `off` applies none; a path applies that profile.
+pgo_mode="${pgo_opt:-${TSAOT_PGO:-auto}}"
+pgo_profile=""
+case "$pgo_mode" in
+  off) ;;
+  auto)
+    pgo_dirs=("$(dirname "$input_abs")")
+    if [ -n "$project" ]; then
+      if [ -d "$project" ]; then pgo_dirs+=("$(cd "$project" && pwd)"); else pgo_dirs+=("$(cd "$(dirname "$project")" && pwd)"); fi
+    fi
+    for d in "${pgo_dirs[@]}"; do
+      if [ -f "$d/default.pgo" ]; then pgo_profile="$d/default.pgo"; break; fi
+    done ;;
+  *) [ -f "$pgo_mode" ] || die "--pgo: no such profile: $pgo_mode"
+     pgo_profile="$(cd "$(dirname "$pgo_mode")" && pwd)/$(basename "$pgo_mode")" ;;
+esac
+
 # ----- stage 3: C → native executable -----
 binary="${out_c%.c}"; [ "$binary" = "$out_c" ] && binary="$out_c.out"
 
@@ -331,41 +376,88 @@ if [ "$profile" -eq 1 ]; then CC="$CC -g -fno-omit-frame-pointer"; rt_suffix="${
 export ROOT CC
 . "$ROOT/scripts/lib/mimalloc_flags.sh" || die "failed to load mimalloc flags"
 . "$ROOT/scripts/lib/regexp_link_flags.sh" || die "failed to load regexp link flags"
+. "$ROOT/scripts/lib/pgo.sh" || die "failed to load the profile-guided build helpers"
 if [[ "${TSAOT_MIMALLOC_ACTIVE:-0}" == "1" ]]; then
   rt_suffix="${rt_suffix}_mi"
 fi
-rt_cc_key="$(
-  printf '%s\n' "$CC|$(uname -s)|$(uname -m)" |
-    cksum | awk '{print $1}'
-)"
 
-# Base runtime object (also the default when the program does not need fetch).
-RT_OBJ="$ROOT/build/rt${rt_suffix}_${rt_cc_key}.o"
-mkdir -p "$ROOT/build"
-if [ ! -f "$RT_OBJ" ] ||
-   [ "$ROOT/runtime/ts_rt.c" -nt "$RT_OBJ" ] ||
-   [ "$ROOT/runtime/ts_rt.h" -nt "$RT_OBJ" ]; then
-  $CC -c "$ROOT/runtime/ts_rt.c" -I"$ROOT/runtime" -o "$RT_OBJ" || die "failed to build runtime ($RT_OBJ)"
+# One pass of the native build: the runtime object, the optional runtime
+# objects and the program, compiled with the pass's extra flags (none, a
+# profile, or the instrumentation). The runtime object is cached under build/
+# by its compile command and, when a profile is applied, by the profile's
+# content; an instrumented runtime is compiled into the pass's directory.
+native_build() { # <extra cflags> <output executable> <pass directory>
+  local extra="$1" out="$2" pw="$3"
+  local CC="$CC${extra:+ $extra}"   # the helpers below read it (dynamic scope)
+  mkdir -p "$pw"
+  local rt_obj
+  case "$extra" in
+    *-fprofile-generate*)
+      # an instrumented build is keyed by this run's directory and never reused:
+      # its runtime object and unit objects stay out of the shared caches
+      rt_obj="$pw/rt.o"
+      local TSAOT_UNITS_CACHE="$pw/unit-cache" ;;
+    *)
+      local pgosum=""
+      if [[ "$CC" =~ -fprofile-use=([^[:space:]]+) ]]; then pgosum="$(cksum < "${BASH_REMATCH[1]}")"; fi
+      local rt_cc_key
+      rt_cc_key="$(printf '%s\n' "$CC|$pgosum|$(uname -s)|$(uname -m)" | cksum | awk '{print $1}')"
+      mkdir -p "$ROOT/build"
+      rt_obj="$ROOT/build/rt${rt_suffix}_${rt_cc_key}.o" ;;
+  esac
+  if [ ! -f "$rt_obj" ] ||
+     [ "$ROOT/runtime/ts_rt.c" -nt "$rt_obj" ] ||
+     [ "$ROOT/runtime/ts_rt.h" -nt "$rt_obj" ]; then
+    $CC -c "$ROOT/runtime/ts_rt.c" -I"$ROOT/runtime" -o "$rt_obj" || die "failed to build runtime ($rt_obj)"
+  fi
+  # Optional runtime objects, gated by markers the emitted C declares.
+  tsaot_prepare_regexp_objs "$markers_c" "$pw" || die "failed to prepare RegExp runtime"
+  tsaot_prepare_unicode_objs "$markers_c" "$pw" || die "failed to prepare Unicode runtime"
+  tsaot_prepare_fetch_runtime "$markers_c" "$pw" "$rt_obj" || die "failed to prepare fetch runtime"
+  if [ "$units" = 1 ]; then
+    . "$ROOT/scripts/lib/units.sh" || die "failed to load the unit build"
+    # shellcheck disable=SC2086
+    TSAOT_UNITS_CC="$CC" TSAOT_UNITS_CFLAGS="-I$ROOT/runtime" \
+      tsaot_units_build "$units_dir" "$out" "$TSAOT_FETCH_RT_OBJ_ARG" $TSAOT_REGEXP_OBJ_ARGS $TSAOT_UNICODE_OBJ_ARGS \
+        -lm $TSAOT_FETCH_LDLIBS ${TSAOT_LDLIBS:-} || die "unit build failed"
+  else
+    # shellcheck disable=SC2086  # object/lib arg vars are intentionally word-split
+    $CC "$out_c" "$TSAOT_FETCH_RT_OBJ_ARG" $TSAOT_REGEXP_OBJ_ARGS $TSAOT_UNICODE_OBJ_ARGS \
+      -I"$ROOT/runtime" -lm $TSAOT_FETCH_LDLIBS ${TSAOT_LDLIBS:-} -o "$out" \
+      || die "C compilation failed"
+  fi
+}
+
+# --pgo-train: an instrumented build, the training run, default.pgo written
+# next to the entry file; the final build below applies it, as every later
+# build of the program does.
+if [ -n "$pgo_train" ]; then
+  tsaot_pgo_supported "$CC" || die "--pgo-train needs clang (TSAOT_CC=\"$CC\")"
+  tsaot_pgo_profdata > /dev/null || die "--pgo-train needs llvm-profdata (set TSAOT_LLVM_PROFDATA)"
+  gen_bin="$binary.pgo-gen"
+  native_build "$(tsaot_pgo_gen_flags "$work/pgo")" "$gen_bin" "$work/gen"
+  gen_abs="$(cd "$(dirname "$gen_bin")" && pwd)/$(basename "$gen_bin")"
+  pgo_out="$(dirname "$input_abs")/default.pgo"
+  echo "$PROG: training run: $pgo_train" >&2
+  tsaot_pgo_train "$pgo_train" "$gen_abs" "$work/pgo" "$pgo_out" || { rm -f "$gen_bin"; die "the training run produced no profile"; }
+  rm -f "$gen_bin"
+  pgo_profile="$pgo_out"
+  echo "$PROG: wrote $pgo_out (every later build of $base applies it)" >&2
 fi
-
-# Optional runtime objects, gated by markers the emitted C declares.
-tsaot_prepare_regexp_objs "$markers_c" "$work" || die "failed to prepare RegExp runtime"
-tsaot_prepare_unicode_objs "$markers_c" "$work" || die "failed to prepare Unicode runtime"
-tsaot_prepare_fetch_runtime "$markers_c" "$work" "$RT_OBJ" || die "failed to prepare fetch runtime"
-
+pgo_flags=""
+if [ -n "$pgo_profile" ]; then
+  if tsaot_pgo_supported "$CC"; then
+    pgo_flags="$(tsaot_pgo_use_flags "$pgo_profile")"
+  else
+    echo "$PROG: $pgo_profile ignored: a profile needs clang (TSAOT_CC=\"$CC\")" >&2
+    pgo_profile=""
+  fi
+fi
+native_build "$pgo_flags" "$binary" "$work/use"
+pgo_note=""
+if [ -n "$pgo_profile" ]; then pgo_note=" (profile-guided: $pgo_profile)"; fi
 if [ "$units" = 1 ]; then
-  . "$ROOT/scripts/lib/units.sh" || die "failed to load the unit build"
-  # shellcheck disable=SC2086
-  TSAOT_UNITS_CC="$CC" TSAOT_UNITS_CFLAGS="-I$ROOT/runtime" \
-    tsaot_units_build "$units_dir" "$binary" "$TSAOT_FETCH_RT_OBJ_ARG" $TSAOT_REGEXP_OBJ_ARGS $TSAOT_UNICODE_OBJ_ARGS \
-      -lm $TSAOT_FETCH_LDLIBS ${TSAOT_LDLIBS:-} || die "unit build failed"
-  echo "$PROG: wrote $units_dir and $binary" >&2
-  exit 0
+  echo "$PROG: wrote $units_dir and $binary$pgo_note" >&2
+else
+  echo "$PROG: wrote $out_c and $binary$pgo_note" >&2
 fi
-
-# shellcheck disable=SC2086  # object/lib arg vars are intentionally word-split
-$CC "$out_c" "$TSAOT_FETCH_RT_OBJ_ARG" $TSAOT_REGEXP_OBJ_ARGS $TSAOT_UNICODE_OBJ_ARGS \
-  -I"$ROOT/runtime" -lm $TSAOT_FETCH_LDLIBS ${TSAOT_LDLIBS:-} -o "$binary" \
-  || die "C compilation failed"
-
-echo "$PROG: wrote $out_c and $binary" >&2

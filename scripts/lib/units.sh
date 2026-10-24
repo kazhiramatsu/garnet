@@ -16,6 +16,8 @@
 #   TSAOT_UNITS_JOBS    parallel compiles (default: the CPU count)
 #   TSAOT_UNITS_CACHE   object and LTO cache directory (default build/unit-cache)
 #   TSAOT_UNITS_CACHE_DAYS  cache entries unused this many days are removed (default 7)
+# A `-fprofile-use=<file>` in the compile command keys the objects by the
+# profile's content too (docs/pgo_design.md).
 
 tsaot_units_build() {
   local dir="$1" out="$2"; shift 2
@@ -35,13 +37,17 @@ tsaot_units_build() {
   $cc $cflags -E -P -dD -x c "$dir/prog.h" -o "$dir/.prog.i" || return 1
   local hhash; hhash="$(shasum -a 256 "$dir/.prog.i" | cut -c1-64)"
   rm -f "$dir/.prog.i"
+  local pgohash=""
+  if [[ "$cc $cflags" =~ -fprofile-use=([^[:space:]]+) ]]; then
+    pgohash="$(shasum -a 256 "${BASH_REMATCH[1]}" | cut -c1-64)" || return 1
+  fi
   # one compile script: the cache lookup, the compile, the store
   cat > "$dir/.cc_unit.sh" <<EOF
 #!/usr/bin/env bash
 set -eu
 f="\$1"
 case "\$f" in cold_*) opt="$coldflag";; *) opt="$ltoflag";; esac
-key=\$( { printf '%s\n' "$hhash" "$cc $cflags" "\$opt" "$ccver"; cat "\$f"; } | shasum -a 256 | cut -c1-64)
+key=\$( { printf '%s\n' "$hhash" "$cc $cflags" "\$opt" "$ccver" "$pgohash"; cat "\$f"; } | shasum -a 256 | cut -c1-64)
 obj="$cache/\$key.o"
 if [[ -f "\$obj" ]]; then
   touch "\$obj"

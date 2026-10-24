@@ -136,5 +136,6 @@ outputs identical:
 That is within 4% of scriptc's instruction count on its own, with the profile
 taken from the same input it is measured on (the usual way to tune a
 compiler, and what the benchmark's other side does; a profile from another
-project would test the robustness). Scripts: the scratch `pgo/experiment.sh`
-of this session; a build-script mode would be a two-pass `build_tsc_ts_native.sh`.
+project would test the robustness). Adopted the same day as the `default.pgo`
+convention (docs/pgo_design.md): the benchmark build trains by default, the
+driver applies a profile placed next to the entry file.

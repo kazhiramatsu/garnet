@@ -275,7 +275,11 @@ Two tools that look right are wrong on garnet's binaries, and one works:
   run: wall unchanged).
 - **The measured build of tsc-ts** (session 352, slice AG): `TSAOT_NATIVE_CC='cc -O2
   -gline-tables-only -fomit-frame-pointer'` with `TSAOT_UNITS_JOBS=3` on a shared
-  machine. Omitting the frame pointer is worth 0.9% of the instructions (the
+  machine. Since the `default.pgo` slice the build is profile-guided by default
+  (`docs/pgo_design.md`: two compile passes and a training run, about 55 s more
+  at three jobs); `TSAOT_PGO=off` gives the plain binary, and an A/B of two
+  profile-guided builds resolves no less than the build-to-build variation of
+  the training (recorded there). Omitting the frame pointer is worth 0.9% of the instructions (the
   generated code is thousands of small functions; the runtime and the collector
   never read frame pointers, the collector scans the stack by words, and crash
   backtraces still have the compact unwind info). Only the profiling build keeps

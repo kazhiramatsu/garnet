@@ -31,6 +31,14 @@ TSAOT_NATIVE_CC='cc -O2 -gline-tables-only -fno-omit-frame-pointer' \
 Build it optimized as above: at -O0 the transformer's visitor recursion
 overflows the 8 MB main thread stack on large projects.
 
+The build is profile-guided (`docs/pgo_design.md`): an instrumented build
+compiles the TypeScript compiler project (`build/typescript_603`, with the
+lib directory from `TSC_TS_LIB_DIR` or the checkout's `@scriptc` package)
+once, and the profile, written to `<work>/default.pgo` and recorded in
+`build.json`, guides the final build. `TSAOT_PGO=off` builds plain,
+`TSAOT_PGO=<file>` applies a given profile, `TSAOT_PGO_TRAIN='<cmd>'` trains
+with another command (the instrumented executable is `$TSAOT_PGO_BIN`).
+
 The generated C is built as parallel units (`docs/build_split_design.md`):
 the giant run-once functions (the module initializer, the large `create*`
 factories) are units of their own compiled at -O0, the rest at

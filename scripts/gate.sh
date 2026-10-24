@@ -12,7 +12,7 @@
 #   syntax              TypeScript構文網羅（合法性/AST/V8差分/明示reject）
 #   selfconf [filter]   analyzer_conformance.sh（凍結TS の V8 差分）+ PASS/FAIL 判定
 #   bundler             run_bundler_tests.sh（40 fixture）
-#   unit                run_runtime_tests.sh + run_unit_tests.sh + tests/closed_receivers.sh
+#   unit                run_runtime_tests.sh + run_unit_tests.sh + tests/closed_receivers.sh + tests/pgo_build_gate.sh
 #   gc                  run_gc_stress.sh
 #   bench [filter]      run_benchmarks.sh（correctness + time budget）
 #   bench-correct       ci_bench_correct1.sh + ci_bench_correct2.sh（budget なし全シャード）
@@ -157,6 +157,7 @@ case "$cmd" in
                 bash "$S/run_runtime_tests.sh" || rc=1
                 bash "$S/run_unit_tests.sh" || rc=1
                 bash "$S/../tests/closed_receivers.sh" || rc=1
+                bash "$S/../tests/pgo_build_gate.sh" || rc=1
                 [ $rc -eq 0 ] && echo "[gate] unit PASS" || die "unit FAIL"
                 ;;
   gc)           exec bash "$S/run_gc_stress.sh" ;;

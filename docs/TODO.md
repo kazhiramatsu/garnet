@@ -9272,3 +9272,34 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   wall -16%; within 4% of scriptc's instruction count on its own. The profile
   came from the same input it is measured on. The decision to adopt (a
   two-pass native build) is Kaz's: PGO goes last by policy.
+- Slice PGO (driver, build scripts, `scripts/lib/pgo.sh`,
+  `scripts/lib/units.sh`; `docs/pgo_design.md`): profile-guided builds adopted
+  by convention, Kaz's decision after the measurement above (a user must not
+  have to think about it, and the default build must not get slower). A
+  `default.pgo` next to a program's entry file (or the project's tsconfig) is
+  applied to every build of it, as Go applies a main package's default.pgo:
+  one pass, a few percent longer, the driver's last line names the profile;
+  `--pgo off` ignores it, `--pgo <file>` applies another. `garnet --pgo-train
+  '<cmd>'` creates it once: an instrumented build, the command run on it
+  (`$TSAOT_PGO_BIN`), the merged profile written next to the entry file, the
+  program built again with it. No automatic training (a run the compiler
+  invents records the hot paths as cold and makes the program slower than no
+  profile). Clang only (a profile under another compiler is reported and
+  ignored); the unit cache keys objects by the profile's content; instrumented
+  passes bypass the shared caches. `scripts/build_tsc_ts_native.sh` is
+  profile-guided by default: trained on the TypeScript compiler project with
+  one checker (the lib directory from `TSC_TS_LIB_DIR` or the checkout's
+  `@scriptc` package), the profile in `<work>/default.pgo` and `build.json`;
+  `TSAOT_PGO=off|<file>`, `TSAOT_PGO_TRAIN='<cmd>'`. Build time at three jobs:
+  89 -> 147 s (export and emit once, two compile-and-link passes, a 1.8 s
+  training run). Gate `tests/pgo_build_gate.sh` (unit stage, ci_fast).
+  Measurements, one checker on the compiler project, outputs identical
+  throughout: plain -> trained 22.47 -> 18.85 G instructions (-16.1%), cycles
+  -16.8%, wall 1.23 -> 1.02 s (scriptc 18.3 G, 1.05 s); two trainings of the
+  same code differ as binaries and profiles, instructions within 0.01% and
+  cycles within 0.2% (the floor of an A/B of two trained builds); trained on
+  the frozen TS analyzer's project instead (a different input) 20.47 G: half
+  the gain kept (-8.9% against plain, +8.6% against the in-sample profile).
+  Caveat recorded: generated symbols carry the exporter's sequential id, so an
+  edit early in a program renumbers the functions after it and a stale profile
+  misses them; stable names are a follow-up.
