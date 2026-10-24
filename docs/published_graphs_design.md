@@ -248,6 +248,26 @@ mixed instances).
   the parent's young and full collections; a worker past its region and
   one interning a new name die loudly into the error handler.
 
+### P4 as built
+
+- A second pipe at every fork: the parent keeps its write end in the watch
+  (`out_fd`), the child its read end (`g_parent_fd`). `ts_worker_send(id,
+  value)` encodes with the plain codec (the parent is never in region mode)
+  and writes a frame to a live worker; a worker that has exited throws.
+  `ts_worker_on_parent_message(fn)` registers the worker's listener and
+  opens the port; `ts_worker_parent_close()` closes it. The event loop
+  counts an open port as pending work and polls the parent's descriptor
+  beside the workers' (`ts_watch_poll`); a frame is decoded and delivered
+  to the listener (`parent_read`), an end of file closes the port. A plain
+  worker's loop is unchanged when it registers no listener.
+- The host's `sendToWorker`, `onParentMessage` and `closeParentPort`; the
+  shim's `Worker.postMessage` posts, `parentPort.on('message')` listens,
+  `parentPort.close()` closes, as a tsc-ts parse thread expects (it loads
+  the chunks the main thread posts until `stop`, then closes its port).
+- Runtime tests: a worker doubles three numbers posted to it and ends on
+  the stop message, the replies arriving in order; posting to the exited
+  worker throws.
+
 ## Sharing by fork: regions
 
 The fork prototype shares the parent's heap with its children by

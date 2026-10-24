@@ -40,6 +40,10 @@ export interface GarnetHost {
   workerData(): unknown;
   /** In a worker: a message to the parent (plain data; anything else throws). */
   postMessage(value: unknown): void;
+  /** The parent posts to a live worker; the worker listens on its parent port and closes it when done. */
+  sendToWorker(id: number, value: unknown): void;
+  onParentMessage(listener: (value: unknown) => void): void;
+  closeParentPort(): void;
   cpus(): number;
   readonly platform: string;
 }

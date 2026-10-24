@@ -18694,7 +18694,13 @@ tsv ts_message_roundtrip(tsv v){
 }
 
 typedef struct ts_watch { int id; pid_t pid; int fd; uint8_t* buf; size_t len, cap; int messages; struct ts_watch* next;
-                          uint32_t region_lo, region_hi; } ts_watch;   /* region: a shared worker's blocks, else 0 */
+                          uint32_t region_lo, region_hi;   /* a shared worker's blocks, else 0 */
+                          int out_fd; } ts_watch;           /* the parent's end of the pipe to the worker */
+/* A worker's side of the parent's frames: the read end, the listener, and
+   whether the port is open (a registered listener keeps the loop alive). */
+static int g_parent_fd = -1, g_parent_watching = 0;
+static tsv g_parent_handler = TS_UNDEFINED; static int g_parent_handler_rooted = 0;
+static uint8_t* g_parent_buf = NULL; static size_t g_parent_len = 0, g_parent_cap = 0;
 static ts_watch* g_watches = NULL;
 static int g_watch_ids = 0;
 static tsv g_watch_handlers = TS_UNDEFINED;     /* [2 id] the message handler, [2 id + 1] the error handler */
@@ -18754,7 +18760,7 @@ static void watch_close(ts_watch* w){
   ts_watch** pp = &g_watches;
   while (*pp && *pp != w) pp = &(*pp)->next;
   if (*pp) *pp = w->next;
-  close(w->fd);
+  close(w->fd); close(w->out_fd);
   int status = 0;
   if (waitpid(w->pid, &status, 0) != w->pid) status = 0;
   int failed = WIFSIGNALED(status) || (WIFEXITED(status) && WEXITSTATUS(status) != 0);
@@ -18830,19 +18836,65 @@ static void watch_read(ts_watch* w){
   }
 }
 /* the event loop's turn for the workers: their pipes, with a timeout */
+/* a frame from the parent: decoded with the plain codec, delivered to the listener */
+static void parent_read(void){
+  uint8_t tmp[65536];
+  ssize_t r = read(g_parent_fd, tmp, sizeof tmp);
+  if (r < 0){ if (errno == EINTR || errno == EAGAIN) return; r = 0; }
+  if (r == 0){ g_parent_watching = 0; return; }          /* the parent closed its end */
+  if (g_parent_len + (size_t)r > g_parent_cap){
+    size_t c = g_parent_cap ? g_parent_cap * 2 : 65536;
+    while (c < g_parent_len + (size_t)r) c *= 2;
+    uint8_t* q = (uint8_t*)realloc(g_parent_buf, c);
+    if (!q) ts_abort_msg("out of memory receiving the parent's message");
+    g_parent_buf = q; g_parent_cap = c;
+  }
+  memcpy(g_parent_buf + g_parent_len, tmp, (size_t)r); g_parent_len += (size_t)r;
+  while (g_parent_len >= 4){
+    uint32_t len; memcpy(&len, g_parent_buf, 4);
+    if (g_parent_len < 4u + len) break;
+    tsv v = msg_decode_frame(g_parent_buf + 4, len); ts_gc_root(&v);
+    size_t rest = g_parent_len - 4u - len;
+    memmove(g_parent_buf, g_parent_buf + 4u + len, rest); g_parent_len = rest;
+    if (ts_is_func(g_parent_handler)){ tsv args[1] = { v }; ts_call(g_parent_handler, args, 1); }
+    ts_gc_unroot(1);
+    if (!g_parent_watching) break;                        /* the listener closed the port */
+  }
+}
 static void ts_watch_poll(int timeout_ms){
   int n = 0;
   for (ts_watch* w = g_watches; w; w = w->next) n++;
-  if (!n) return;
-  struct pollfd* fds = (struct pollfd*)calloc((size_t)n, sizeof *fds);
-  ts_watch** ws = (ts_watch**)calloc((size_t)n, sizeof *ws);
+  int parent = g_parent_watching && g_parent_fd >= 0;
+  if (!n && !parent) return;
+  struct pollfd* fds = (struct pollfd*)calloc((size_t)n + 1u, sizeof *fds);
+  ts_watch** ws = (ts_watch**)calloc((size_t)n + 1u, sizeof *ws);
   if (!fds || !ws) ts_abort_msg("out of memory polling the workers");
   int i = 0;
   for (ts_watch* w = g_watches; w; w = w->next){ fds[i].fd = w->fd; fds[i].events = POLLIN; ws[i] = w; i++; }
-  int r = poll(fds, (nfds_t)n, timeout_ms);
-  if (r > 0) for (i = 0; i < n; i++) if (fds[i].revents & (POLLIN | POLLHUP | POLLERR)) watch_read(ws[i]);
+  if (parent){ fds[i].fd = g_parent_fd; fds[i].events = POLLIN; ws[i] = NULL; i++; }
+  int r = poll(fds, (nfds_t)i, timeout_ms);
+  if (r > 0) for (int k = 0; k < i; k++) if (fds[k].revents & (POLLIN | POLLHUP | POLLERR)){ if (ws[k]) watch_read(ws[k]); else parent_read(); }
   free(fds); free(ws);
 }
+void ts_worker_send(int id, tsv value){
+  ts_watch* w = g_watches;
+  while (w && w->id != id) w = w->next;
+  if (!w) ts_throw_type_error_msg("postMessage: the worker has exited");
+  ts_gc_root(&value);
+  msg_enc e; memset(&e, 0, sizeof e);
+  msg_encode(&e, value);
+  ts_gc_unroot(1);
+  uint32_t len = (uint32_t)e.len;
+  msg_write_all(w->out_fd, &len, 4);
+  msg_write_all(w->out_fd, e.p, e.len);
+  free(e.p); free((void*)e.seen);
+}
+void ts_worker_on_parent_message(tsv fn){
+  if (!g_is_worker) ts_throw_type_error_msg("parentPort.on: this is the main thread (parentPort is null)");
+  g_parent_handler = fn; ts_root_static_once(&g_parent_handler, &g_parent_handler_rooted);
+  g_parent_watching = g_parent_fd >= 0;
+}
+void ts_worker_parent_close(void){ g_parent_watching = 0; }
 /* Fork a worker: the child runs the registered entry with `data` (the same
    cells, at the same addresses) and ends; the parent gets the worker's id. */
 static uint32_t env_u32(const char* name, uint32_t dflt){
@@ -18884,12 +18936,14 @@ static int ts_worker_fork_ex(tsv data, int shared){
     g_shape_jump_to = child_shape_hi;
     g_shared_workers_alive++;
   }
-  int fds[2];
+  int fds[2], in[2];
   if (pipe(fds) != 0) ts_throw_type_error_msg("Worker: pipe failed");
+  if (pipe(in) != 0){ close(fds[0]); close(fds[1]); ts_throw_type_error_msg("Worker: pipe failed"); }
   pid_t pid = fork();
-  if (pid < 0){ close(fds[0]); close(fds[1]); ts_throw_type_error_msg("Worker: fork failed"); }
+  if (pid < 0){ close(fds[0]); close(fds[1]); close(in[0]); close(in[1]); ts_throw_type_error_msg("Worker: fork failed"); }
   if (pid == 0){
-    close(fds[0]);
+    close(fds[0]); close(in[1]);
+    g_parent_fd = in[0]; g_parent_watching = 0; g_parent_len = 0;
     if (shared){
       /* region mode: every cursor and list abandoned (the parent's blocks
          are the parent's), blocks from the region only, the shape ids of
@@ -18905,7 +18959,7 @@ static int ts_worker_fork_ex(tsv data, int shared){
     }
     /* the parent's pending work is the parent's: its workers' pipes, its
        microtasks and I/O tasks */
-    for (ts_watch* w = g_watches; w; w = w->next) close(w->fd);
+    for (ts_watch* w = g_watches; w; w = w->next){ close(w->fd); close(w->out_fd); }
     g_watches = NULL;
     g_mq_len = 0;
     g_io_head = g_io_tail = g_io_active = NULL;
@@ -18937,7 +18991,8 @@ static int ts_worker_fork_ex(tsv data, int shared){
   ts_gc_unroot(1);
   ts_watch* w = (ts_watch*)calloc(1, sizeof *w);
   if (!w) ts_abort_msg("out of memory starting a worker");
-  w->id = ++g_watch_ids; w->pid = pid; w->fd = fds[0]; w->next = g_watches; g_watches = w;
+  close(in[0]);
+  w->id = ++g_watch_ids; w->pid = pid; w->fd = fds[0]; w->out_fd = in[1]; w->next = g_watches; g_watches = w;
   w->region_lo = region_lo; w->region_hi = region_hi;
   return w->id;
 }
@@ -18948,10 +19003,10 @@ void ts_run_event_loop(void){
     ts_abort_timers_fire_due();
     ts_io_start_queued();
     if (!g_io_head && !g_io_active && g_mq_len) continue;
-    if (!g_io_head && !g_io_active && !g_watches) break;       /* nothing pending */
+    if (!g_io_head && !g_io_active && !g_watches && !g_parent_watching) break;       /* nothing pending */
     if (g_io_active) (void)ts_io_poll_active();  /* completes ready I/O tasks */
-    /* the workers' pipes: a turn without waiting while I/O is active */
-    if (g_watches) ts_watch_poll(g_io_active || g_mq_len ? 0 : ts_abort_timer_poll_timeout_ms(1000));
+    /* the workers' pipes and the parent's: a turn without waiting while I/O is active */
+    if (g_watches || g_parent_watching) ts_watch_poll(g_io_active || g_mq_len ? 0 : ts_abort_timer_poll_timeout_ms(1000));
     /* loop: drain microtasks triggered by completed I/O */
   }
 }

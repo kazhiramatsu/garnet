@@ -1224,6 +1224,13 @@ void ts_worker_on_error(int id, tsv fn);
 int  ts_worker_is_worker(void);
 tsv  ts_worker_data(void);
 void ts_worker_post(tsv value);
+/* Frames from the parent to a worker (docs/published_graphs_design.md): the
+   parent posts to a live worker; the worker registers its parentPort's
+   message listener and closes the port when it is done (the loop then ends
+   with the rest of its work). */
+void ts_worker_send(int id, tsv value);
+void ts_worker_on_parent_message(tsv fn);
+void ts_worker_parent_close(void);
 tsv  ts_message_roundtrip(tsv v);              /* the codec on one value (tests) */
 tsv  ts_new_array_buffer(tsv length, int shared);
 tsv  ts_typed_array_from(int elem, tsv src, tsv mapfn, tsv this_arg);

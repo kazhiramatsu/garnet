@@ -166,6 +166,34 @@ static int map_set_throws(tsv m){
   ts_eh_pop();
   return 0;
 }
+/* Frames from the parent (P4): the worker doubles each number it is sent and
+   closes its port on `{ stop: true }`; the loop then ends with its work. */
+static tsv test_echo_handler(tsv* a, int n){
+  tsv m = n > 0 ? a[0] : TS_UNDEFINED;
+  if (ts_is_obj(m) && ts_truthy(ts_get(m, ts_intern_field("stop", 4)))){ ts_worker_parent_close(); return TS_UNDEFINED; }
+  ts_worker_post(ts_num(ts_to_num(m) * 2));
+  return TS_UNDEFINED;
+}
+static tsv test_echo_entry(tsv* a, int n){
+  (void)a; (void)n;
+  tsv h = ts_make_fn_t(test_echo_handler, NULL, 0, 0);
+  ts_worker_on_parent_message(h);
+  return TS_UNDEFINED;
+}
+static tsv echo_received = TS_UNDEFINED;
+static tsv test_echo_on_message(tsv* a, int n){ if (n > 0) ts_array_push(echo_received, a[0]); return TS_UNDEFINED; }
+static int send_throws(int id){
+  ts_handler* h = ts_eh_push();
+  if (ts_setjmp(h->buf) != 0){
+    ts_gc_set_root_depth(h->gc_root_len);
+    ts_frame_restore(h->frame_top);
+    ts_eh_pop();
+    return 1;
+  }
+  ts_worker_send(id, ts_num(1));
+  ts_eh_pop();
+  return 0;
+}
 static int codec_rejects(tsv v){
   ts_handler* h = ts_eh_push();
   if (ts_setjmp(h->buf) != 0){
@@ -1989,6 +2017,26 @@ int main(){
     CK("shared worker: a region exhausted is a loud death", overflow_loud);
     CK("shared worker: a new property name interned is a loud death", worker_errors == 1);
     ts_gc_unroot(10);
+  }
+  {
+    /* frames from the parent: three numbers and a stop; the doubled replies arrive in order */
+    echo_received = ts_new_array(0); ts_gc_root(&echo_received);
+    tsv entry = ts_make_fn_t(test_echo_entry, NULL, 0, 0); ts_gc_root(&entry);
+    ts_worker_set_entry(entry);
+    tsv onm = ts_make_fn_t(test_echo_on_message, NULL, 0, 0); ts_gc_root(&onm);
+    tsv one = ts_make_fn_t(test_worker_on_error, NULL, 0, 0); ts_gc_root(&one);
+    worker_errors = 0;
+    int id = ts_worker_fork(TS_UNDEFINED);
+    ts_worker_on_message(id, onm); ts_worker_on_error(id, one);
+    ts_worker_send(id, ts_num(1)); ts_worker_send(id, ts_num(2)); ts_worker_send(id, ts_num(3));
+    tsv stop = ts_new_object(); ts_gc_root(&stop); ts_set(stop, ts_intern_field("stop", 4), ts_bool(1));
+    ts_worker_send(id, stop);
+    ts_run_event_loop();
+    CK("frames to a worker: the replies arrive in order and the worker ends on stop",
+       worker_errors == 0 && ts_array_len(echo_received) == 3 && ts_to_num(ts_array_get(echo_received, 0)) == 2 &&
+       ts_to_num(ts_array_get(echo_received, 1)) == 4 && ts_to_num(ts_array_get(echo_received, 2)) == 6);
+    CK("frames to a worker: posting to an exited worker throws", send_throws(id));
+    ts_gc_unroot(5);
   }
   test_conservative_roots();
   test_shape_chains();

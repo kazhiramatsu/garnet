@@ -9380,3 +9380,14 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   cell, a new shape, the pre-fork cell, immutability in the parent, the
   parent's collections, and the two loud deaths. The tsc-ts shim forks a parse
   thread as a shared worker; none starts yet (P5).
+- Slice P4 (runtime, tsc-ts host and shim; `docs/published_graphs_design.md`
+  "P4 as built"): frames from the parent to a worker. A second pipe at every
+  fork; `ts_worker_send(id, value)` writes a plain-codec frame to a live
+  worker (an exited one throws); a worker registers its parent port's listener
+  (`ts_worker_on_parent_message`) and closes the port when done
+  (`ts_worker_parent_close`); the event loop counts an open port as pending
+  and polls the parent's descriptor beside the workers', delivering each frame
+  to the listener. The shim's `Worker.postMessage`, `parentPort.on('message')`
+  and `parentPort.close()` now work as a tsc-ts parse thread expects. Runtime
+  tests: three numbers doubled in order and the worker ending on stop; posting
+  to an exited worker throws.

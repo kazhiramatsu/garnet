@@ -18,9 +18,8 @@ export function enterWorker(data: unknown): void {
   workerData = data;
   parentPort = {
     postMessage(value: unknown): void { host.postMessage(value); },
-    // Only parse threads listen on their port; this prototype starts none.
-    on(_event: string, _listener: (value: unknown) => void): void {},
-    close(): void {},
+    on(event: string, listener: (value: unknown) => void): void { if (event === 'message') host.onParentMessage(listener); },
+    close(): void { host.closeParentPort(); },
   };
 }
 
@@ -37,8 +36,6 @@ export class Worker {
     else if (event === 'error') host.onWorkerError(this.id, listener);
     return this;
   }
-  postMessage(_value: unknown): void {
-    throw new Error('messages to a forked worker are not supported (parse threads are not started)');
-  }
+  postMessage(value: unknown): void { host.sendToWorker(this.id, value); }
   terminate(): Promise<number> { return Promise.resolve(0); }
 }
