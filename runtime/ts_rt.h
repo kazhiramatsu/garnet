@@ -261,6 +261,9 @@ typedef struct ts_gc_header {
 #define TS_HDR_REMEMBERED 1u
 #define TS_HDR_SIZED 2u
 #define TS_HDR_SIDECAR 4u
+/* A cell a `publish` reached (garnet:shared, docs/published_graphs_design.md):
+   immutable; a Map or Set with the flag rejects set/add/delete/clear. */
+#define TS_HDR_PUBLISHED 8u
 /* 8 bytes (docs/cell_header_design.md; docs/gc_v2_design.md §4.4): a heap
    reference is the address, so the cell carries no handle and no list link,
    and its size is its size class's (or its large run's), so it carries no
@@ -1798,6 +1801,11 @@ void ts_throw_frozen_field(tsv obj, ts_key key);
    messages and `console.log` prefixes of instances whose class value the
    program never observed (the prototype's `constructor` is realized lazily). */
 void ts_register_class_names(const char* const* tab, uint32_t n);
+/* garnet:shared (docs/published_graphs_design.md): a deep freeze of the graph
+   reachable from v (its argument returned), and whether a value is a primitive
+   or a cell a publish reached. */
+tsv ts_publish(tsv v);
+int ts_is_published(tsv v);
 tsv ts_object_create(tsv proto);
 tsv ts_object_seal(tsv v);
 tsv ts_object_prevent_extensions(tsv v);

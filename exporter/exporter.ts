@@ -78,6 +78,12 @@ const STRICT_TYPE_OPTION_NAMES: StrictTypeOptionName[] = [
   "alwaysStrict",
 ];
 
+/** garnet's own modules (`garnet:<name>`, docs/published_graphs_design.md):
+ *  resolved to lib/garnet/<name>.ts beside the exporter; a project's own
+ *  `paths` may still map the scheme. */
+function garnetModulePaths(): ts.MapLike<string[]> {
+  return { "garnet:*": [path.join(__dirname, "..", "lib", "garnet", "*.ts")] };
+}
 function baseCompilerOptions(strict: boolean): ts.CompilerOptions {
   // strictNullChecks is forced ON independently of the `strict` flag so the
   // checker PRESERVES `null`/`undefined` in types (e.g. keeps `number | null` a
@@ -98,6 +104,7 @@ function baseCompilerOptions(strict: boolean): ts.CompilerOptions {
     // resolve to `./b.ts` without extensions, matching how editors/rolldown resolve.
     module: ts.ModuleKind.ESNext,
     moduleResolution: ts.ModuleResolutionKind.Bundler,
+    paths: garnetModulePaths(),
     // Preserve raw JSX nodes for the exporter's AOT lowering. The Node/V8 oracle
     // uses the classic React transform separately; no JavaScript is emitted here.
     jsx: ts.JsxEmit.Preserve,
@@ -14712,6 +14719,7 @@ function main() {
     if (parsed.errors.length) report(parsed.errors);
     rootNames.push(...parsed.fileNames.filter(f => /\.d\.[cm]?ts$/.test(f)));
     compilerOptions = { ...compilerOptions, ...parsed.options };
+    compilerOptions.paths = { ...garnetModulePaths(), ...(compilerOptions.paths ?? {}) };
     if (strictCompiler) compilerOptions.strict = true;
     // Garnet bundles the entry's source graph instead of emitting project
     // references/declarations. Keep resolution, libraries and checking options,

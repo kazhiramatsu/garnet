@@ -9338,3 +9338,23 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   (`CLASS_NAME_TAB`, `TSAOT_CLASS_NAMES=0`) and messages and `console.log`
   name the class even when the program never observed the class value (its
   prototype's `constructor` is lazy). Fixture classes/frozen_instances.
+- Slice P2 (`lib/garnet/shared.ts`, `lib/garnet/shared_node.ts`, exporter,
+  runtime, harnesses; `docs/published_graphs_design.md` "P2 as built"): the
+  `garnet:shared` module. The exporter resolves `garnet:*` to
+  `lib/garnet/*.ts` through TypeScript `paths` (merged under a project's own),
+  so the module is an ordinary part of the whole program; the runtime creates
+  the `__garnet` global (`publish`, `isPublished`, `sharesGraphs`) with
+  `globalThis`; `ts_publish` walks the graph (own properties and the sidecar,
+  class instances' struct fields through the registry, array elements, Map and
+  Set entries, captured cells and `prototype`, accessors; not the prototype
+  chain), checks every kind first (`ArrayBuffer`, typed arrays, `Promise`,
+  generators, `Proxy`, weak collections throw before anything is frozen) and
+  then sets the frozen integrity bit on every property bag and
+  `TS_HDR_PUBLISHED` on every cell; the Map and Set mutators refuse a
+  published receiver. Under Node the same specifier resolves to the polyfill
+  (`shared_node.ts`) through `scripts/garnet_scheme_loader.mjs`, which the
+  difftest and conformance oracles pass to node when a fixture mentions the
+  scheme. Fixture modules/published_graphs. The trained tsc-ts compile (no
+  import of the module) against the build before P1: instructions 1.0007,
+  cycles 1.0016, outputs identical (the collections' flag test, the global's
+  creation).

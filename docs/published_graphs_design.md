@@ -150,6 +150,52 @@ sized instance on its allocation class's chain. Fixture
 store through `any`, sealed and non-extensible instances, a hot loop over
 mixed instances).
 
+### P2 as built
+
+- `lib/garnet/shared.ts` is the garnet binding (`__garnet.publish`,
+  `isPublished`, `sharesGraphs`), `lib/garnet/shared_node.ts` the Node
+  polyfill with the same exports (a deep `Object.freeze` over own keys,
+  entries and elements; `set`/`add`/`delete`/`clear` of a published Map or
+  Set replaced by throwing own properties; the rejected kinds thrown before
+  anything is frozen; a `WeakSet` answering `isPublished`). The exporter
+  maps `garnet:*` to `lib/garnet/*.ts` through TypeScript's `paths` (an
+  absolute pattern beside the exporter; a project's own `paths` are merged
+  over it), so the module is an ordinary part of the whole program. The
+  oracle's node runs `--import scripts/garnet_scheme_loader.mjs` when the
+  transpiled fixture mentions the scheme: its hooks resolve `garnet:<name>`
+  to `lib/garnet/<name>_node.ts` when that exists, else `<name>.ts`, and
+  transpile on the fly.
+- The runtime creates the `__garnet` object when it creates `globalThis`
+  (`ts_garnet_global_init`, no emitter change). `ts_publish` walks the graph
+  with a worklist over own properties (slots or dictionary entries, the
+  sidecar of a sized instance), struct fields of class instances (the class
+  registry's non-numeric offsets), array elements (dense or the sparse
+  table), Map keys and values, Set elements, a function's captured cells and
+  `prototype`, an accessor's getter and setter; not the prototype chain, as
+  a deep `Object.freeze` does not. The first pass collects and checks kinds
+  (`ArrayBuffer`, typed arrays, `Promise`, generators, `Proxy`, weak
+  collections throw `Cannot publish a ...`); the second sets the integrity
+  bit of `Object.freeze` on every property bag and `TS_HDR_PUBLISHED` on
+  every cell, then bumps the property-addition epoch once. `ts_map_set`,
+  `ts_map_delete`, `ts_map_clear`, `ts_set_add`, `ts_set_delete` and
+  `ts_set_clear` test the flag after their kind check (`Cannot modify a
+  published Map`); the collections have no inline mutator fast path to
+  guard. `isPublished` is the flag (a primitive is published).
+- A program that imports the module takes `__garnet` as a value, so the
+  whole-program fact of P1 keeps the typed stores' frozen test for it.
+- Fixture `modules/published_graphs` (the graph of P2's walk, every write
+  kind, reads after publishing, the rejected kinds with nothing frozen after
+  a rejection, a shared node and a cycle, publishing again, primitives).
+  The tsc-ts shim `@scriptc/threads` keeps its identity `publish` until P5,
+  where the main thread's `publish(program)` is measured with the parse
+  workers (a full-graph freeze on the critical path is a cost to measure,
+  not to pay blind).
+- Cost: the trained tsc-ts compile, which does not import the module,
+  against the build before P1: instructions 1.0007, cycles 1.0016, outputs
+  identical (the collections' flag test and the global's creation; the
+  trained builds' own variation is 0.01% in instructions and 0.2% in
+  cycles).
+
 ## Sharing by fork: regions
 
 The fork prototype shares the parent's heap with its children by

@@ -3630,11 +3630,13 @@ void ts_set(tsv obj, ts_key key, tsv val){
   (void)ts_set_named_prop(obj, o, key, val, 0);
 }
 
+static void ts_garnet_global_init(tsv global);
 void ts_global_this_init(void){
   if (g_global_this_v != TS_UNDEFINED) return;
   static int rooted = 0;
   g_global_this_v = ts_new_object();
   ts_root_static_once(&g_global_this_v, &rooted);
+  ts_garnet_global_init(g_global_this_v);
 }
 tsv ts_global_this(void){
   ts_global_this_init();
@@ -7897,8 +7899,15 @@ static tsv map_set_unchecked(tsv mv, tsv k, tsv v){
   map_write_barrier(m, m->len - 1u, k); map_write_barrier(m, m->len - 1u, v);
   return mv;
 }
+static void ts_throw_published_collection(const char* what){
+  char buf[96];
+  snprintf(buf, sizeof buf, "Cannot modify a published %s", what);
+  ts_throw_type_error_msg(buf);
+}
+#define TS_PUBLISHED_CHECK(v, what) do { if (TS_RT_UNLIKELY(((const ts_gc_header*)ts_ptr(v))->flags & TS_HDR_PUBLISHED)) ts_throw_published_collection(what); } while (0)
 tsv ts_map_set(tsv mv, tsv k, tsv v){
   if (TS_RT_UNLIKELY(!ts_is_map(mv))){ tsv a[2] = { k, v }; return ts_collection_method_dynamic(mv, "set", a, 2); }
+  TS_PUBLISHED_CHECK(mv, "Map");
   return map_set_unchecked(mv, k, v);
 }
 /* The common lookup, without a call: an indexed map and a number key, found
@@ -7970,10 +7979,12 @@ static int map_delete_unchecked(tsv mv, tsv k){
 }
 int ts_map_delete(tsv mv, tsv k){
   if (!ts_is_map(mv)) ts_throw_type_error_msg("Method Map.prototype.delete called on incompatible receiver");
+  TS_PUBLISHED_CHECK(mv, "Map");
   return map_delete_unchecked(mv, k);
 }
 void ts_map_clear(tsv mv){
   if (!ts_is_map(mv)) ts_throw_type_error_msg("Method Map.prototype.clear called on incompatible receiver");
+  TS_PUBLISHED_CHECK(mv, "Map");
   if (ts_is_map(mv)){
     ts_map* m=ts_ptr(mv); m->len=0; m->tombs=0;
     if (m->index) memset(m->index, 0, sizeof(uint32_t)*m->index_cap);
@@ -8350,6 +8361,7 @@ static tsv set_add_unchecked(tsv sv, tsv v){
 }
 tsv ts_set_add(tsv sv, tsv v){
   if (TS_RT_UNLIKELY(!ts_is_set(sv))) return ts_collection_method_dynamic(sv, "add", &v, 1);
+  TS_PUBLISHED_CHECK(sv, "Set");
   return set_add_unchecked(sv, v);
 }
 int ts_set_has(tsv sv, tsv v){
@@ -8381,10 +8393,12 @@ static int set_delete_unchecked(tsv sv, tsv v){
 }
 int ts_set_delete(tsv sv, tsv v){
   if (!ts_is_set(sv)) ts_throw_type_error_msg("Method Set.prototype.delete called on incompatible receiver");
+  TS_PUBLISHED_CHECK(sv, "Set");
   return set_delete_unchecked(sv, v);
 }
 void ts_set_clear(tsv sv){
   if (!ts_is_set(sv)) ts_throw_type_error_msg("Method Set.prototype.clear called on incompatible receiver");
+  TS_PUBLISHED_CHECK(sv, "Set");
   if (ts_is_set(sv)){
     ts_set_t* s=ts_ptr(sv); s->len=0; s->tombs=0;
     if (s->index) memset(s->index, 0, sizeof(uint32_t)*s->index_cap);
@@ -18246,6 +18260,145 @@ static void drain_microtasks(void){
 #include <poll.h>
 #include <sys/wait.h>
 
+/* ---- Published graphs (garnet:shared; docs/published_graphs_design.md) ----
+   publish(v) walks the graph reachable from v through own properties, elements,
+   entries and captured variables (not prototypes, as a deep Object.freeze does
+   not), first checking every cell's kind, then marking: the integrity bit of
+   Object.freeze on every property bag and TS_HDR_PUBLISHED on every cell, so a
+   Map or Set rejects mutation and isPublished answers. A rejected kind throws
+   before anything is marked. */
+typedef struct { ts_gc_header** cells; size_t len, cap; uintptr_t* seen; size_t seen_cap, seen_len; } publish_walk;
+static int publish_seen_add(publish_walk* w, ts_gc_header* h){
+  if (!w->seen_cap || (w->seen_len + 1u) * 2u > w->seen_cap){
+    size_t ncap = w->seen_cap ? w->seen_cap * 2u : 256u;
+    uintptr_t* ns = (uintptr_t*)calloc(ncap, sizeof(uintptr_t));
+    if (!ns) ts_abort_msg("out of memory in publish");
+    for (size_t i = 0; i < w->seen_cap; i++) if (w->seen[i]){
+      size_t j = (size_t)((w->seen[i] >> 4) * 0x9E3779B97F4A7C15ull) & (ncap - 1u);
+      while (ns[j]) j = (j + 1u) & (ncap - 1u);
+      ns[j] = w->seen[i];
+    }
+    free(w->seen); w->seen = ns; w->seen_cap = ncap;
+  }
+  uintptr_t key = (uintptr_t)h;
+  size_t j = (size_t)((key >> 4) * 0x9E3779B97F4A7C15ull) & (w->seen_cap - 1u);
+  while (w->seen[j]){ if (w->seen[j] == key) return 0; j = (j + 1u) & (w->seen_cap - 1u); }
+  w->seen[j] = key; w->seen_len++;
+  return 1;
+}
+static void publish_push(publish_walk* w, tsv v){
+  ts_gc_header* h;
+  if (TS_TOP16(v) == TS_SEL_OBJECT || ts_is_func(v)) h = (ts_gc_header*)ts_ptr(v); else return;
+  if (h->flags & TS_HDR_PUBLISHED) return;            /* an earlier publish reached it */
+  if (!publish_seen_add(w, h)) return;
+  if (w->len == w->cap){
+    size_t ncap = w->cap ? w->cap * 2u : 256u;
+    ts_gc_header** nc = (ts_gc_header**)realloc(w->cells, ncap * sizeof *nc);
+    if (!nc) ts_abort_msg("out of memory in publish");
+    w->cells = nc; w->cap = ncap;
+  }
+  w->cells[w->len++] = h;
+}
+static const char* publish_rejected_kind(const ts_gc_header* h){
+  switch (h->kind){
+    case TS_KIND_ARRAYBUFFER: return "an ArrayBuffer";
+    case TS_KIND_TYPEDARRAY: return "a typed array";
+    case TS_KIND_PROMISE: return "a Promise";
+    case TS_KIND_CORO: return "a generator";
+    case TS_KIND_PROXY: return "a Proxy";
+    case TS_KIND_MAP: return ((const ts_map*)h)->weak ? "a WeakMap" : NULL;
+    case TS_KIND_SET: return ((const ts_set_t*)h)->weak ? "a WeakSet" : NULL;
+    default: return NULL;
+  }
+}
+static void publish_common_props(publish_walk* w, ts_object* o){
+  ts_propmap* m = obj_map(o);
+  if (obj_shaped(o)){
+    for (uint32_t i = 0; i < m->len; i++) publish_push(w, *ts_obj_slot_ptr(o, i));
+  } else {
+    for (uint32_t i = 0; i < m->len; i++) publish_push(w, m->props[i].val);
+  }
+}
+static void publish_children(publish_walk* w, ts_gc_header* h){
+  if (h->kind == TS_KIND_OBJECT){
+    ts_object* o = (ts_object*)h;
+    if (ts_obj_is_sized(o)){
+      ts_class_reg* reg = class_reg_for_sized(o);
+      if (reg){ char* base = (char*)o; for (int i = 0; i < reg->nfields; i++) if (!reg->fields[i].numeric) publish_push(w, *(tsv*)(base + reg->fields[i].offset)); }
+    }
+    publish_common_props(w, o);
+  } else if (h->kind == TS_KIND_FUNC){
+    ts_func* f = (ts_func*)h;
+    for (uint32_t i = 0; i < f->envlen; i++) publish_push(w, f->env[i]);
+    publish_push(w, f->prototype_prop);
+    publish_common_props(w, &f->o);
+  } else if (h->kind == TS_KIND_ARRAY){
+    ts_array* a = (ts_array*)h;
+    if (a->sparse){
+      ts_sparse_elems* s = array_sparse_table(a); tsv* vals = sparse_vals(s);
+      for (uint32_t i = 0; i <= s->mask; i++) if (s->keys[i] != ARRAY_SPARSE_EMPTY) publish_push(w, vals[i]);
+    } else {
+      for (uint32_t i = 0; i < a->len; i++) publish_push(w, a->data[i]);
+    }
+    publish_common_props(w, &a->o);
+  } else if (h->kind == TS_KIND_MAP){
+    ts_map* m = (ts_map*)h;
+    for (uint32_t i = 0; i < m->len; i++){ publish_push(w, m->keys[i]); publish_push(w, m->vals[i]); }
+    publish_common_props(w, &m->o);
+  } else if (h->kind == TS_KIND_SET){
+    ts_set_t* st = (ts_set_t*)h;
+    for (uint32_t i = 0; i < st->len; i++) publish_push(w, st->elems[i]);
+    publish_common_props(w, &st->o);
+  } else if (h->kind == TS_KIND_ACCESSOR){
+    ts_accessor* ac = (ts_accessor*)h;
+    publish_push(w, ac->getter); publish_push(w, ac->setter);
+  }
+  /* strings and symbols are immutable; the rejected kinds never get here */
+}
+tsv ts_publish(tsv v){
+  if (!(TS_TOP16(v) == TS_SEL_OBJECT || ts_is_func(v))) return v;    /* primitives: already immutable */
+  if (g_has_proxies && ts_is_proxy(v)) ts_throw_type_error_msg("Cannot publish a Proxy");
+  publish_walk w = { NULL, 0, 0, NULL, 0, 0 };
+  publish_push(&w, v);
+  const char* rejected = NULL;
+  for (size_t i = 0; i < w.len && !rejected; i++){
+    rejected = publish_rejected_kind(w.cells[i]);
+    if (!rejected) publish_children(&w, w.cells[i]);
+  }
+  if (rejected){
+    free(w.cells); free(w.seen);
+    char buf[96];
+    snprintf(buf, sizeof buf, "Cannot publish %s", rejected);
+    ts_throw_type_error_msg(buf);
+  }
+  for (size_t i = 0; i < w.len; i++){
+    ts_gc_header* h = w.cells[i];
+    if (h->kind == TS_KIND_OBJECT || h->kind == TS_KIND_ARRAY || h->kind == TS_KIND_FUNC || h->kind == TS_KIND_MAP || h->kind == TS_KIND_SET)
+      ts_obj_add_integrity((ts_object*)h, 1u);
+    h->flags |= TS_HDR_PUBLISHED;
+  }
+  if (w.len) prop_add_epoch_bump();
+  free(w.cells); free(w.seen);
+  return v;
+}
+int ts_is_published(tsv v){
+  if (!(TS_TOP16(v) == TS_SEL_OBJECT || ts_is_func(v))) return 1;
+  return (((const ts_gc_header*)ts_ptr(v))->flags & TS_HDR_PUBLISHED) != 0;
+}
+static tsv garnet_publish_fn(tsv* a, int n){ return ts_publish(n > 0 ? a[0] : TS_UNDEFINED); }
+static tsv garnet_is_published_fn(tsv* a, int n){ return ts_bool(ts_is_published(n > 0 ? a[0] : TS_UNDEFINED)); }
+/* The `__garnet` global the garnet:shared module calls (lib/garnet/shared.ts). */
+static void ts_garnet_global_init(tsv global){
+  ts_gc_root(&global);
+  tsv g = ts_new_object(); ts_gc_root(&g);
+  tsv f1 = ts_make_fn_t(garnet_publish_fn, NULL, 0, 0); ts_gc_root(&f1);
+  ts_set_fn_meta(f1, 1u, "publish"); ts_set_cstr(g, "publish", f1);
+  tsv f2 = ts_make_fn_t(garnet_is_published_fn, NULL, 0, 0); ts_gc_root(&f2);
+  ts_set_fn_meta(f2, 1u, "isPublished"); ts_set_cstr(g, "isPublished", f2);
+  ts_set_cstr(g, "sharesGraphs", ts_bool(1));
+  ts_set_cstr(global, "__garnet", g);
+  ts_gc_unroot(4);
+}
 enum { MSG_UNDEF = 0, MSG_NULL, MSG_FALSE, MSG_TRUE, MSG_NUM, MSG_STR8, MSG_STR16, MSG_ARRAY, MSG_OBJECT, MSG_TYPED, MSG_REF };
 
 typedef struct { uint8_t* p; size_t len, cap; const void** seen; size_t nseen, cseen; } msg_enc;

@@ -121,7 +121,8 @@ while IFS=$'\t' read -r slug path; do
   fi
   # Default-locale fixtures (Date.toLocale*String without arguments) expect the
   # runtime's fixed en-US subset; pin the oracle so a ja_JP shell does not flip.
-  v8="$(LC_ALL=en_US.UTF-8 node "$jsref" 2>&1 | tr '\n' '|')"
+  nodeflags=""; grep -q "garnet:" "$jsref" && nodeflags="--import $ROOT/scripts/garnet_scheme_loader.mjs"
+  v8="$(LC_ALL=en_US.UTF-8 node $nodeflags "$jsref" 2>&1 | tr '\n' '|')"
   if [[ "$UNITS" == 1 ]]; then
     "$TSAOT" "$prog" emit --units "$WORK/$slug.units" > /dev/null 2>"$WORK/$slug.an.err" || { echo "[conf] FAIL ${slug}: analyze"; cat "$WORK/$slug.an.err"|head -2; nfail=$((nfail+1)); fail=1; continue; }
     CFILE="$WORK/$slug.units/prog.h"

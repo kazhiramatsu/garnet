@@ -46,7 +46,10 @@ dt() {
   rm -f "$ROOT/build/dt.json" "$ROOT/build/dt.c" "$ROOT/build/dt"
   local nodeout
   node "$ROOT/build/noderun.js" "$ROOT/build/dt.ts" 2>/dev/null
-  nodeout=$(node "$ROOT/build/dt.mjs" 2>&1 | tr '\n' '|')
+  # a fixture importing one of garnet's modules (`garnet:<name>`) runs node with the scheme's loader
+  local nodeflags=""
+  grep -q "garnet:" "$ROOT/build/dt.mjs" && nodeflags="--import $ROOT/scripts/garnet_scheme_loader.mjs"
+  nodeout=$(node $nodeflags "$ROOT/build/dt.mjs" 2>&1 | tr '\n' '|')
   local rej
   # DT_EXPORT_FLAGS: extra exporter flags, e.g. --strict for the strict type profile a strict project gets
   rej=$(node "$ROOT/exporter/exporter.js" ${DT_EXPORT_FLAGS:-} "$ROOT/build/dt.ts" "$ROOT/build/dt.json" "$ROOT/build/dtl.json" 2>&1 | grep -iE "UNSUPPORTED|member|type error" | head -1)
