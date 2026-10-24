@@ -261,24 +261,25 @@ proxy and anything else take the runtime's call as before.
 
 Outputs identical in both.
 
-## Three costs of the dynamic paths taken in line (slice AY)
+## A dynamic class keeps its instanceof interval (slice AY)
 
-After slice AX2 the all-dynamic compile's profile has three runtime entries
-left that an inline test answers: the receiver check of every dynamic method
-call (`ts_check_method_recv`, 1.2%: two tag tests, now in line with the throw
-out of line); the out-of-line property read and write of a megamorphic site
-whose receiver the program does not type as a class instance
-(`ts_get_pic_checked` 6.9%, `ts_set_pic` 2.3%: the generic inline caches now
-try the registry's cache by class word when the site is megamorphic and the
-receiver is a sized instance, as the class-typed sites have since slice AO);
-and `instanceof` against a class that dispatches dynamically
-(`ts_instanceof` 1.6%: the chain walk, because a class's interval was given
-only to a subtree of stable classes). A dynamic class keeps its interval
-when its instability leaves the chain alone (a prototype method replaced, a
+`instanceof` against a class that dispatches dynamically took the chain
+walk (`ts_instanceof`, 1.6% of the all-dynamic compile's samples) because a
+class's interval (docs/class_index_dispatch_design.md) was given only to a
+subtree of stable classes. A dynamic class keeps its interval when its
+instability leaves the prototype chain alone: a replaced prototype method, a
 dynamic or computed member, a deleted member, a constructor returning another
-object, the debugging modes); a reassigned prototype object
-(`C.prototype = ...`) or a foreign base keeps the chain walk, and a relinked
-prototype anywhere raises the guard the interval test already carries. The
-vtable dispatch keeps its own, stricter notion (stable classes).
+object, the debugging modes. A reassigned prototype object (`C.prototype =
+...`, an ES5 constructor's) or a foreign base keeps the chain walk, and a
+relinked prototype anywhere raises the guard the interval test already
+carries. The vtable dispatch keeps its own, stricter notion (stable classes),
+and a typed program's generated code is unchanged (its classes are stable).
+Fixture `classes/instanceof_dynamic_classes`.
 
-Measurements: see TODO (session 352, slice AY).
+Two companions were measured and not kept: the receiver check of a dynamic
+method call in line (two tag tests at every site, the throw out of line) cost
+the typed compile +0.2% instructions at its 1,325 sites for a gain inside the
+dynamic measurement's noise; and the generic inline property caches trying
+the registry's cache by class word on a megamorphic miss cost +0.9%
+instructions at 5,600 sites, likewise for no measurable gain. The out-of-line
+entries keep those sites.

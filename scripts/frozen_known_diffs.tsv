@@ -245,3 +245,4 @@ parity	classes/megamorphic_field_sites	The frozen emitter lists a field a subcla
 parity	classes/dynamic_method_calls	The Rust emitter deletes a prototype property under its method key as well (`delete (C.prototype as any).m` of a class-body method), where the frozen emitter deletes the field key only; the Rust output matches V8.
 parity	classes/ref_eq	The frozen emitter places the loop's `new AstNode` on the stack where the Rust emitter's escape analysis keeps it on the heap (the instance is pushed into an array); the Rust output matches V8.
 parity	classes/method_site_cache	The Rust emitter deletes a prototype property under its method key as well (`delete (C.prototype as any).m` of a class-body method), where the frozen emitter deletes the field key only; the Rust output matches V8.
+selfconf-unported	classes/instanceof_dynamic_classes	Frozen emitter lacks ConstructResult (a constructor returning another object); native Rust output matches V8.

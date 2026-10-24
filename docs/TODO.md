@@ -9246,3 +9246,21 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   paired runs in one session; 12.5 s before slice AJ, 5.34 s before AX),
   outputs identical to the typed build's; the typed one checker 22.50 -> 22.44
   G instructions (-0.3%), cycles unchanged, outputs identical.
+- Slice AY (emitter, the dynamic paths; `docs/pic_sized_inline_design.md` "A
+  dynamic class keeps its instanceof interval"): `instanceof` against a
+  dynamic class took the chain walk (1.6% of the all-dynamic samples) because
+  a class's interval was given only to a subtree of stable classes; a class
+  whose instability leaves the prototype chain alone (a replaced prototype
+  method, a dynamic or computed member, a deleted member, a constructor
+  returning another object, the debugging modes) keeps its interval, a
+  reassigned prototype object or a foreign base keeps the walk, the relink
+  guard stays, and the vtable dispatch keeps its stricter notion; a typed
+  program's generated code is unchanged. Fixture
+  classes/instanceof_dynamic_classes (replaced and deleted methods, relinked
+  instance and class prototype, subclass chains, a constructor returning
+  another object, plain objects and primitives, a class in a function).
+  Measured and not kept with it: the receiver check of a dynamic method call
+  in line (+0.2% typed instructions at 1,325 sites, no measurable dynamic
+  gain) and the generic inline property caches probing the registry's cache by
+  class word on a megamorphic miss (+0.9% typed instructions at 5,600 sites,
+  likewise).

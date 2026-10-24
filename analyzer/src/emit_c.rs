@@ -1334,8 +1334,19 @@ fn compute_class_dfs(classes: &[ClassDef]) -> ClassDfs {
     if user_foreign {
         return dfs;
     }
-    // a class is ranged when every class of its subtree is stable and the
-    // hierarchy's root extends nothing unrecorded
+    // a class is ranged when every class of its subtree is stable, or dynamic
+    // for a reason that leaves its prototype chain alone (a replaced prototype
+    // method, a dynamic or computed member, a deleted member, a constructor
+    // returning another object, the debugging modes; a reassigned prototype
+    // object or a foreign base does not), and the hierarchy's root extends
+    // nothing unrecorded. The interval serves `instanceof` (the vtable
+    // dispatch has its own, stricter plan); a relinked prototype anywhere
+    // raises the guard the interval test carries.
+    let chain_preserving = |c: &ClassDef| {
+        c.reasons.iter().all(|r| {
+            r != "prototype-assign" && !r.starts_with("extends-") && !r.starts_with("cyclic-extends")
+        })
+    };
     let mut order: Vec<u32> = dfs.index.keys().copied().collect();
     order.sort_by_key(|c| dfs.index[c]);
     for &c in &order {
@@ -1355,7 +1366,7 @@ fn compute_class_dfs(classes: &[ClassDef]) -> ClassDfs {
                 let i = dfs.index[k];
                 i >= lo && i < lo + span
             })
-            .all(|k| by_id.get(k).map_or(false, |cd| cd.stable && !foreign_base(cd)));
+            .all(|k| by_id.get(k).map_or(false, |cd| (cd.stable || chain_preserving(cd)) && !foreign_base(cd)));
         if root_ok && subtree_ok {
             dfs.ranged.insert(c);
         }
