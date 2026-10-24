@@ -9181,3 +9181,18 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   the gates' load gave 5.75 -> 5.34 s), outputs identical to the typed
   build's; the typed one checker 22.73 -> 22.72 G instructions, cycles and
   wall unchanged, outputs identical.
+- Slice G1 (runtime, the collector; `docs/gc_v3_plan.md`): the collector is
+  the largest remaining bucket (collection about 9% of the typed compile's
+  samples, allocation 4% before slices AU and AW), and the generated code's
+  profile is flat. Site pretenuring (`docs/site_pretenuring_design.md`)
+  already carries 6.5% of the instructions (turning it off: +6.5%
+  instructions, +12.6% wall). Its bar was 90% survival over windows of 100
+  allocations; measured on the current build with the environment knobs, the
+  three variants tried (75%/32, 80%/32, 75%/64) are within a tenth of a
+  percent of each other at about -0.85% instructions, -1.0 to -1.3% cycles and
+  -0.8% wall over eight quiet pairs; 80% over windows of 32 has the best
+  cycles and the least extra memory (+0.4% peak rss). The defaults change to
+  80 and 32 (`TSAOT_GC_SITE_TENURE_PCT`, `TSAOT_GC_SITE_MIN_ALLOCS` keep their
+  override). Not a factor: malloc (about 30 k frees per compile against 7.4 M
+  cell allocations; every cell and owned buffer comes from the cage's size
+  classes).

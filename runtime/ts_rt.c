@@ -36,8 +36,10 @@ static size_t g_full_factor_max = 16u;     /* TSAOT_GC_FULL_FACTOR_MAX: the paci
 static size_t g_ram_bytes = 0;             /* physical memory, for the pacing's cap */
 static int g_full_threshold_forced = 0; /* env override pins the trigger (stress knob) */
 static int g_site_pretenure = 1;           /* TSAOT_GC_SITE_PRETENURE=0: every allocation site stays young (docs/site_pretenuring_design.md) */
-static uint32_t g_site_tenure_pct = 90u;   /* TSAOT_GC_SITE_TENURE_PCT: the survival a site needs to allocate old */
-static uint32_t g_site_min_allocs = 100u;  /* TSAOT_GC_SITE_MIN_ALLOCS: the allocations a decision window needs */
+static uint32_t g_site_tenure_pct = 80u;   /* TSAOT_GC_SITE_TENURE_PCT: the survival a site needs to allocate old
+                                              (90 before docs/gc_v3_plan.md G1: 80 over windows of 32 measured
+                                              -0.8% instructions and -1.3% cycles on tsc-ts, +0.4% peak memory) */
+static uint32_t g_site_min_allocs = 32u;   /* TSAOT_GC_SITE_MIN_ALLOCS: the allocations a decision window needs */
 static int g_site_log = 0;                 /* TSAOT_GC_SITE_LOG=1: each site decision on stderr */
 static int g_pretenure_ctors = 1;       /* TSAOT_PRETENURE_CTORS=0: guarded constructions allocate young (docs/pretenured_construction_design.md) */
 static int g_remembered_slots = 1;      /* TSAOT_REMEMBERED_SLOTS=0: whole-cell rescans */
