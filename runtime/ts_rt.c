@@ -478,13 +478,20 @@ static uint32_t gc_cage_frontier_take(uint32_t n){
   }
   return bi;
 }
+/* Whether the block gc_block_take returned last is fresh: from the cage's
+   frontier or a shared worker's region, pages the kernel hands out zeroed,
+   which the allocator then need not zero again (a free-list block held a
+   released run's bytes and is zeroed). */
+static int g_block_take_fresh = 0;
 static uint32_t gc_block_take(void){
-  if (TS_RT_UNLIKELY(g_region_mode)) return gc_region_take(1u);
+  if (TS_RT_UNLIKELY(g_region_mode)){ g_block_take_fresh = 1; return gc_region_take(1u); }
   if (g_free_blocks){
     uint32_t bi = g_free_blocks - 1u;
     g_free_blocks = g_blocks[bi].next;
+    g_block_take_fresh = 0;
     return bi;
   }
+  g_block_take_fresh = 1;
   return gc_cage_frontier_take(1u);
 }
 /* The next run of unmarked cells of block `bi` at or after its cursor, or 0.
@@ -544,8 +551,10 @@ static char* gc_space_refill_z(gc_pclass* classes, uint8_t state, unsigned cls, 
   b->cursor = ncells * size;
   c->ptr = gc_block_base(bi); c->end = c->ptr + (size_t)ncells * size;
   if (state == GC_BLK_CELL) gc_alloc_block_dirty(bi);
-  /* a block from the free list may hold a released run's old bytes */
-  if (zero && GC_CELL_RUNS_ZEROED && state == GC_BLK_CELL) memset(c->ptr, 0, (size_t)ncells * size);
+  /* a block from the free list may hold a released run's old bytes; a fresh
+     one (the frontier, a region) is zero already (a parse worker spent 16% of
+     its busy time zeroing fresh pages, a checker 3%) */
+  if (zero && GC_CELL_RUNS_ZEROED && state == GC_BLK_CELL && !g_block_take_fresh) memset(c->ptr, 0, (size_t)ncells * size);
   GC_PAYLOAD_POISON(c->ptr, (size_t)ncells * size);
   if (log_runs) gc_payload_log_run(c->ptr, c->end, size);
   return c->ptr;

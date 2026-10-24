@@ -9454,6 +9454,19 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   phase is a latency chain on one worker (start, read, parse, bind, publish),
   not a throughput problem. The check phase (75% of the compile, already 6%
   ahead of scriptc) decides the race; next slices return to it with the
-  per-checker profiles (top: fn_7504, checkIdentifier, gc_scan_cell,
-  isMatchingReference, getTypeAtFlowNode, map_find, ts_map_set,
-  ts_new_array_impl, ts_new_sized_impl).
+  per-checker profiles. A checker's profile is flat (the top function,
+  getResolvedSymbol, 2.7%; the next twenty 0.7-2.2% each), so the lever is
+  systemic, not per function: allocation zeroing (bzero, memset,
+  gc_space_refill_z: 3.5% of a checker, 16% of a parse worker's busy time,
+  much of it on fresh pages the kernel already zeroed), the collector's
+  marking (3%), Map lookups and inserts (2.5%), the array write barrier (1%),
+  and in the generated code itself tag tests (17% of its instructions),
+  prologues (10%), box/unbox moves (6.5%) and tag constants (6.3%). Per
+  checker, the type checking matches scriptc (checker.ts: 212 ms against
+  208) and the emit is ahead (136 against 155).
+- Slice P6c (runtime): the allocator no longer zeroes a fresh block (one from
+  the cage's frontier or a shared worker's region: pages the kernel hands out
+  zeroed); a free-list block, which held a released run's bytes, is zeroed as
+  before. The parse workers' zeroing (bzero, memset, the refill) went from
+  15.0% to 12.4% of their busy samples; the one-checker compile's
+  instructions are unchanged (1.0006), its blocks being recycled ones.
