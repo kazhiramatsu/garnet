@@ -96,6 +96,7 @@ static inline void gc_note_payload(size_t bytes){ g_payload_fresh_bytes += bytes
    closure's borrowed environment) are not payloads and are ignored. */
 #include <sys/mman.h>
 static size_t sab_mapped_bytes(uint32_t n);
+static int publish_protect_on(void);
 /* A program-counter sampling profiler (TSAOT_PROF_PC=path): a sampler
    thread suspends the main thread every TSAOT_PROF_PC_US microseconds
    (default 100), reads its PC, link register and frame pointer, and resumes
@@ -241,7 +242,8 @@ static int g_region_mode = 0;                                  /* this process i
 static uint32_t g_region_lo = 0, g_region_cur = 0, g_region_hi = 0;   /* its blocks */
 static uint32_t g_shared_workers_alive = 0;                    /* the parent's live shared workers */
 static uint32_t g_shared_forks = 0;                            /* shared workers forked in this partition */
-static uint32_t g_shape_partition_base = 0, g_shape_limit = 0, g_shape_jump_to = 0;
+static uint32_t g_shape_limit = 0;        /* the parent's headroom end while workers live (0: none) */
+static uint32_t g_shape_ranges_end = 0;   /* above every range handed to a worker so far */
 static size_t g_full_threshold_saved = 0; static int g_full_threshold_forced_saved = 0;
 typedef struct { uint32_t id, parent, key; uint8_t flags; } shape_log_entry;
 static shape_log_entry* g_shape_log = NULL; static size_t g_shape_log_len = 0, g_shape_log_cap = 0;
@@ -758,8 +760,13 @@ static void gc_payload_free(void* p){
    outside the heap (stack and arena cells: the collector may not see such a
    cell, so it could not mark its payloads). The release functions tell the
    two apart by the cage check. */
+static int g_shared_regions_exist = 0;   /* the parent of a shared worker: region blocks exist */
 static void* gc_owned_alloc(const ts_gc_header* owner, size_t bytes){
   if (owner->gen == TS_GEN_NONHEAP){ gc_note_payload(bytes); return malloc(bytes); }
+  /* a region cell (a shared worker's, read in place): the parent's collector
+     never scans it, so a payload it grows here would be swept at the next
+     full collection; it is malloc'd and lives as long as the region does */
+  if (TS_RT_UNLIKELY(g_shared_regions_exist) && gc_cell_block(owner)->state == GC_BLK_REGION){ gc_note_payload(bytes); return malloc(bytes); }
   return gc_payload_alloc(bytes, owner->gen == TS_GEN_OLD || g_gc_collecting);
 }
 static void gc_owned_free(void* p){
@@ -2799,7 +2806,7 @@ static void shape_log_push(uint32_t id, uint32_t parent, ts_key key, uint8_t fla
 static void shape_limit_reached(void){
   if (g_region_mode) ts_abort_msg("a shared worker created more shapes than its id range (TSAOT_SHARED_SHAPES)");
   if (g_shared_workers_alive) ts_abort_msg("the parent created more shapes than its headroom while shared workers run (TSAOT_SHARED_SHAPES)");
-  g_next_shape = g_shape_jump_to; g_shape_limit = 0;
+  g_next_shape = g_shape_ranges_end; g_shape_limit = 0;   /* above every range ever handed out */
 }
 static uint32_t shape_transition_f(uint32_t parent, ts_key key, uint8_t flags){
   if (parent == TS_SHAPE_NONE) return TS_SHAPE_NONE;
@@ -2841,7 +2848,11 @@ static void shape_install_at(uint32_t id, uint32_t parent, ts_key key, uint8_t f
     g_shape_edges[slot].parent = parent; g_shape_edges[slot].key = key; g_shape_edges[slot].flags = flags;
     g_shape_edges[slot].next = id; g_shape_edge_len++;
   }
-  if (id < g_shapes_cap && g_shapes[id].depth) return;
+  if (id < g_shapes_cap && g_shapes[id].depth){
+    if (g_shapes[id].parent != parent || g_shapes[id].key != key || g_shapes[id].flags != flags)
+      ts_abort_msg("a shared worker's shape id is already another shape's (docs/published_graphs_design.md: the id partition)");
+    return;
+  }
   shape_desc_record(id, parent, key, flags);
 }
 /* Ordinary stores add properties with the default attributes. */
@@ -4244,7 +4255,11 @@ static uint32_t ts_str_hash_of(tsv s){
      their first demanded hash; the view slow path carries the cell's hash and
      flags into the strview. A view of an immediate parent stays uncached (its
      strview's hash field holds the fifth byte), as do pre-hashed literals. */
-  if (!(x->flags & TS_STR_FLAG_STATIC) && v.data != NULL){
+  /* a string of a shared worker's region is not written by its readers (the
+     region may be mapped read-only, TSAOT_PUBLISH_PROTECT): its hash stays
+     uncached here unless the worker cached it */
+  if (!(x->flags & TS_STR_FLAG_STATIC) && v.data != NULL &&
+      !(TS_RT_UNLIKELY(g_shared_regions_exist) && gc_cell_block(&x->h)->state == GC_BLK_REGION)){
     x->hash = h;
     x->flags |= TS_STR_FLAG_HASHED;
   }
@@ -5814,6 +5829,12 @@ static inline void gc_mark_visit(tsv v, int young, int depth){
       if (h->gen == GC_GEN_FREED) gc_freed_reached(h);
       return;
     }
+    /* a shared worker's region (the parent, a checker forked from it): read
+       in place, never marked or scanned here. Its cells reach only region
+       cells and the pre-fork cells the frame rooted
+       (docs/published_graphs_design.md); a mark written here would reach
+       every process mapping the region. (Stack cells above are never in a region.) */
+    if (TS_RT_UNLIKELY(g_shared_regions_exist) && gc_cell_block(h)->state == GC_BLK_REGION) return;
   }
   if (h->mark) return;
   if (young && h->gen == TS_GEN_OLD){
@@ -5869,6 +5890,7 @@ static void gc_mark_conservative_word(uint64_t w, int young){
   if (TS_RT_UNLIKELY(g_gc_debug_watch) && (uintptr_t)h == g_gc_debug_watch)
     fprintf(stderr, "[gc watch] cell %p named by stack word %p (value %llx, %ld bytes below the base)\n",
             (void*)h, (const void*)g_scan_cur, (unsigned long long)w, (long)(g_stack_hi - (uint64_t)(uintptr_t)g_scan_cur));
+  if (TS_RT_UNLIKELY(g_shared_regions_exist) && gc_cell_block(h)->state == GC_BLK_REGION) return;   /* a region: never marked here */
   if (h->mark) return;
   if (young && h->gen == TS_GEN_OLD) return;
   gc_mark_visit_slow(h, young, 0);
@@ -8188,6 +8210,25 @@ static tsv ts_iter_result_new(tsv value, int done){
 }
 static ts_key g_mi_source, g_mi_last, g_mi_kind, g_mi_next, g_mi_value, g_mi_done;
 static tsv ts_map_iterator_identity(tsv* args, int n){ return n ? args[0] : TS_UNDEFINED; }
+/* The iteration order of a published collection. A published cell is never
+   written by a reader (docs/published_graphs_design.md: it may be another
+   process's region, read in place; a pointer stored there would be this
+   process's), and its entries never change, so where no order was stored
+   before the publish the dense index + 1 is the order id: one table of
+   1..n per process, grown to the largest such collection. */
+static uint64_t* g_identity_order = NULL;
+static uint32_t g_identity_order_len = 0;
+static uint64_t* identity_order(uint32_t len){
+  if (TS_RT_UNLIKELY(len > g_identity_order_len)){
+    uint32_t n = g_identity_order_len ? g_identity_order_len : 256u;
+    while (n < len) n *= 2u;
+    uint64_t* tab = (uint64_t*)realloc(g_identity_order, sizeof(uint64_t) * n);
+    if (!tab) ts_abort_msg("out of memory growing the identity order");
+    for (uint32_t i = g_identity_order_len; i < n; i++) tab[i] = i + 1u;
+    g_identity_order = tab; g_identity_order_len = n;
+  }
+  return g_identity_order;
+}
 static tsv ts_map_iterator_next(tsv* args, int n){
   tsv iter = n ? args[0] : TS_UNDEFINED;
   ts_gc_root(&iter);
@@ -8202,6 +8243,7 @@ static tsv ts_map_iterator_next(tsv* args, int n){
     int is_map = ts_is_map(source);
     uint32_t len = is_map ? ((ts_map*)ts_ptr(source))->len : ((ts_set_t*)ts_ptr(source))->len;
     uint64_t* order = is_map ? ((ts_map*)ts_ptr(source))->iteration_order : ((ts_set_t*)ts_ptr(source))->iteration_order;
+    if (!order) order = identity_order(len);   /* a published collection */
     tsv* keys = is_map ? ((ts_map*)ts_ptr(source))->keys : ((ts_set_t*)ts_ptr(source))->elems;
     double last = ts_number_coerce(ts_get_ic(iter, g_mi_last, &ic_last));
     uint32_t low = 0, high = len;
@@ -8263,7 +8305,7 @@ tsv ts_map_iterator(tsv source, int kind){
   uint32_t cap = is_set ? ((ts_set_t*)ts_ptr(source))->cap : ((ts_map*)ts_ptr(source))->cap;
   uint64_t** order = is_set ? &((ts_set_t*)ts_ptr(source))->iteration_order : &((ts_map*)ts_ptr(source))->iteration_order;
   uint64_t* next = is_set ? &((ts_set_t*)ts_ptr(source))->next_iteration_order : &((ts_map*)ts_ptr(source))->next_iteration_order;
-  if (!*order) {
+  if (!*order && !(((const ts_gc_header*)ts_ptr(source))->flags & TS_HDR_PUBLISHED)) {   /* published: identity_order */
     /* a payload of the collection, like mapset_cursor_view's (not malloc:
        the collector frees a young collection without visiting it) */
     const ts_gc_header* owner = is_set ? &((ts_set_t*)ts_ptr(source))->o.h : &((ts_map*)ts_ptr(source))->o.h;
@@ -8293,6 +8335,10 @@ static int mapset_cursor_view(tsv coll, uint32_t* len, tsv** keys, tsv** vals, u
   if (ts_is_map(coll)){
     ts_map* m = (ts_map*)ts_ptr(coll);
     if (!m->iteration_order){
+      if (TS_RT_UNLIKELY(m->o.h.flags & TS_HDR_PUBLISHED)){   /* never written by a reader */
+        *len = m->len; *keys = m->keys; *vals = m->vals; *order = identity_order(m->len);
+        return 1;
+      }
       uint32_t cap = m->cap ? m->cap : 1u;
       m->iteration_order = (uint64_t*)gc_owned_alloc(&m->o.h, sizeof(uint64_t) * cap);
       if (!m->iteration_order) abort();
@@ -8305,6 +8351,10 @@ static int mapset_cursor_view(tsv coll, uint32_t* len, tsv** keys, tsv** vals, u
   if (ts_is_set(coll)){
     ts_set_t* st = (ts_set_t*)ts_ptr(coll);
     if (!st->iteration_order){
+      if (TS_RT_UNLIKELY(st->o.h.flags & TS_HDR_PUBLISHED)){   /* never written by a reader */
+        *len = st->len; *keys = st->elems; *vals = st->elems; *order = identity_order(st->len);
+        return 1;
+      }
       uint32_t cap = st->cap ? st->cap : 1u;
       st->iteration_order = (uint64_t*)gc_owned_alloc(&st->o.h, sizeof(uint64_t) * cap);
       if (!st->iteration_order) abort();
@@ -18339,37 +18389,53 @@ static void drain_microtasks(void){
    Object.freeze on every property bag and TS_HDR_PUBLISHED on every cell, so a
    Map or Set rejects mutation and isPublished answers. A rejected kind throws
    before anything is marked. */
-typedef struct { ts_gc_header** cells; size_t len, cap; uintptr_t* seen; size_t seen_cap, seen_len; } publish_walk;
-static int publish_seen_add(publish_walk* w, ts_gc_header* h){
-  if (!w->seen_cap || (w->seen_len + 1u) * 2u > w->seen_cap){
-    size_t ncap = w->seen_cap ? w->seen_cap * 2u : 256u;
-    uintptr_t* ns = (uintptr_t*)calloc(ncap, sizeof(uintptr_t));
-    if (!ns) ts_abort_msg("out of memory in publish");
-    for (size_t i = 0; i < w->seen_cap; i++) if (w->seen[i]){
-      size_t j = (size_t)((w->seen[i] >> 4) * 0x9E3779B97F4A7C15ull) & (ncap - 1u);
-      while (ns[j]) j = (j + 1u) & (ncap - 1u);
-      ns[j] = w->seen[i];
-    }
-    free(w->seen); w->seen = ns; w->seen_cap = ncap;
+/* The walk's visited set is the mark byte: 0 on every live cell outside a
+   collection (nothing allocates during the walk), 1 on a cell this walk
+   reached, and 1 on a cell a shared worker already published (immortal,
+   opaque: exactly the cells to stop at). The marks of the cells reached are
+   reset afterwards, except in a shared worker, where they stay. */
+typedef struct {
+  ts_gc_header** cells; size_t len, cap;    /* the cells published: frozen, immortal, opaque */
+  ts_gc_header** keep; size_t klen, kcap;   /* region mode: the prototypes reached and what they reach, kept but not frozen */
+  int keeping;                               /* pushes go to `keep` */
+} publish_walk;
+static void publish_append(ts_gc_header*** arr, size_t* len, size_t* cap, ts_gc_header* h){
+  if (*len == *cap){
+    size_t ncap = *cap ? *cap * 2u : 256u;
+    ts_gc_header** nc = (ts_gc_header**)realloc(*arr, ncap * sizeof *nc);
+    if (!nc) ts_abort_msg("out of memory in publish");
+    *arr = nc; *cap = ncap;
   }
-  uintptr_t key = (uintptr_t)h;
-  size_t j = (size_t)((key >> 4) * 0x9E3779B97F4A7C15ull) & (w->seen_cap - 1u);
-  while (w->seen[j]){ if (w->seen[j] == key) return 0; j = (j + 1u) & (w->seen_cap - 1u); }
-  w->seen[j] = key; w->seen_len++;
-  return 1;
+  (*arr)[(*len)++] = h;
 }
 static void publish_push(publish_walk* w, tsv v){
   ts_gc_header* h;
-  if (TS_TOP16(v) == TS_SEL_OBJECT || ts_is_func(v)) h = (ts_gc_header*)ts_ptr(v); else return;
+  if (TS_TOP16(v) == TS_SEL_OBJECT || ts_is_func(v)) h = (ts_gc_header*)ts_ptr(v);
+  else if (g_region_mode && ts_is_heap_str(v)){
+    /* a string the graph reaches (a key, a name, a view's text) is immutable,
+       but in a region it must outlive the worker's collections like the cells
+       naming it: a young collection never scans the old published cells, so
+       the walk promotes the strings too (their bytes are inline) */
+    h = (ts_gc_header*)ts_ptr(v);
+    if (h->gen != TS_GEN_YOUNG && h->gen != TS_GEN_OLD) return;   /* interned: immortal */
+  } else return;
   if (h->flags & TS_HDR_PUBLISHED) return;            /* an earlier publish reached it */
-  if (!publish_seen_add(w, h)) return;
-  if (w->len == w->cap){
-    size_t ncap = w->cap ? w->cap * 2u : 256u;
-    ts_gc_header** nc = (ts_gc_header**)realloc(w->cells, ncap * sizeof *nc);
-    if (!nc) ts_abort_msg("out of memory in publish");
-    w->cells = nc; w->cap = ncap;
-  }
-  w->cells[w->len++] = h;
+  if (h->mark) return;                                /* reached by this walk (or immortal) */
+  if (w->keeping && !region_holds(h)) return;         /* a pre-fork cell a prototype reaches is the parent's own */
+  h->mark = 1;
+  if (w->keeping) publish_append(&w->keep, &w->klen, &w->kcap, h);
+  else publish_append(&w->cells, &w->len, &w->cap, h);
+}
+/* Region mode: a prototype the graph reaches is kept, immortal here and opaque
+   to the readers like a published cell (the worker's collector would otherwise
+   free it under them), but not frozen, as a deep freeze leaves prototypes
+   alone; what it reaches is kept the same way. A prototype the parent made
+   before the fork is the parent's own (a class prototype, Object.prototype). */
+static void publish_keep_proto(publish_walk* w, tsv proto){
+  if (!g_region_mode) return;
+  int saved = w->keeping; w->keeping = 1;
+  publish_push(w, proto);
+  w->keeping = saved;
 }
 static const char* publish_rejected_kind(const ts_gc_header* h){
   switch (h->kind){
@@ -18390,6 +18456,7 @@ static void publish_common_props(publish_walk* w, ts_object* o){
   } else {
     for (uint32_t i = 0; i < m->len; i++) publish_push(w, m->props[i].val);
   }
+  publish_keep_proto(w, o->proto);
 }
 static void publish_children(publish_walk* w, ts_gc_header* h){
   if (h->kind == TS_KIND_OBJECT){
@@ -18424,8 +18491,43 @@ static void publish_children(publish_walk* w, ts_gc_header* h){
   } else if (h->kind == TS_KIND_ACCESSOR){
     ts_accessor* ac = (ts_accessor*)h;
     publish_push(w, ac->getter); publish_push(w, ac->setter);
+  } else if (h->kind == TS_KIND_STRING){
+    ts_string* s = (ts_string*)h;             /* region mode only: a view keeps its text */
+    if (s->flags & TS_STR_FLAG_VIEW) publish_push(w, s->parent);
+  } else if (h->kind == TS_KIND_SYMBOL){
+    publish_push(w, ((ts_symbol*)h)->description);
   }
-  /* strings and symbols are immutable; the rejected kinds never get here */
+  /* the rejected kinds never get here */
+}
+/* The payloads of a cell a shared worker publishes get the old bit, as a
+   young collection would give them had it scanned the owner: the cell is
+   old now and will never be scanned again, and an unmarked payload run is
+   free to the allocator (the parent then reads the Map's keys as whatever
+   was allocated over them). Mirrors gc_scan_cell's payload marks. */
+static void publish_mark_payloads(ts_gc_header* h){
+  if (h->kind == TS_KIND_OBJECT || h->kind == TS_KIND_ARRAY || h->kind == TS_KIND_FUNC || h->kind == TS_KIND_MAP || h->kind == TS_KIND_SET){
+    ts_object* o = (ts_object*)h;
+    ts_propmap* m;
+    if (o->h.flags & TS_HDR_SIDECAR){ m = ((ts_sized_head*)o)->dyn; if (m) gc_payload_mark(m); }
+    else m = obj_map_plain(o);
+    if (m){ if (m->props) gc_payload_mark(m->props); if (m->prop_index) gc_payload_mark(m->prop_index); }
+  }
+  if (h->kind == TS_KIND_ARRAY){
+    ts_array* a = (ts_array*)h;
+    if (a->sparse) gc_payload_mark(array_sparse_table(a));
+    else if (a->data && !array_uses_inline(a)) gc_payload_mark(a->data);
+  } else if (h->kind == TS_KIND_FUNC){
+    ts_func* f = (ts_func*)h;
+    if (f->env) gc_payload_mark(f->env);
+  } else if (h->kind == TS_KIND_MAP){
+    ts_map* m = (ts_map*)h;
+    gc_payload_mark(m->keys); gc_payload_mark(m->vals); gc_payload_mark(m->hashes);
+    gc_payload_mark(m->index); gc_payload_mark(m->iteration_order);
+  } else if (h->kind == TS_KIND_SET){
+    ts_set_t* st = (ts_set_t*)h;
+    gc_payload_mark(st->elems); gc_payload_mark(st->hashes);
+    gc_payload_mark(st->index); gc_payload_mark(st->iteration_order);
+  }
 }
 static void prefork_frozen_push(uintptr_t a){
   if (g_prefork_frozen_len == g_prefork_frozen_cap){
@@ -18439,15 +18541,23 @@ static void prefork_frozen_push(uintptr_t a){
 tsv ts_publish(tsv v){
   if (!(TS_TOP16(v) == TS_SEL_OBJECT || ts_is_func(v))) return v;    /* primitives: already immutable */
   if (g_has_proxies && ts_is_proxy(v)) ts_throw_type_error_msg("Cannot publish a Proxy");
-  publish_walk w = { NULL, 0, 0, NULL, 0, 0 };
+  publish_walk w = { NULL, 0, 0, NULL, 0, 0, 0 };
   publish_push(&w, v);
   const char* rejected = NULL;
   for (size_t i = 0; i < w.len && !rejected; i++){
     rejected = publish_rejected_kind(w.cells[i]);
     if (!rejected) publish_children(&w, w.cells[i]);
   }
+  w.keeping = 1;   /* the prototypes reached (region mode), and what they reach */
+  for (size_t i = 0; i < w.klen && !rejected; i++){
+    rejected = publish_rejected_kind(w.keep[i]);
+    if (!rejected) publish_children(&w, w.keep[i]);
+  }
+  w.keeping = 0;
   if (rejected){
-    free(w.cells); free(w.seen);
+    for (size_t i = 0; i < w.len; i++) w.cells[i]->mark = 0;
+    for (size_t i = 0; i < w.klen; i++) w.keep[i]->mark = 0;
+    free(w.cells); free(w.keep);
     char buf[96];
     snprintf(buf, sizeof buf, "Cannot publish %s", rejected);
     ts_throw_type_error_msg(buf);
@@ -18462,12 +18572,21 @@ tsv ts_publish(tsv v){
          markers (mark 1 reads as already marked); a pre-fork cell goes to
          the parent with the next frame, which freezes and roots it */
       if (h->gen == TS_GEN_YOUNG) g_old_bytes += gc_cell_heap_bytes(h, gc_cell_promote(h));
+      publish_mark_payloads(h);
       h->mark = 1;
       if (!region_holds(h)) prefork_frozen_push((uintptr_t)h);
+    } else {
+      h->mark = 0;
     }
   }
+  for (size_t i = 0; i < w.klen; i++){   /* kept: immortal and opaque here, not frozen */
+    ts_gc_header* h = w.keep[i];
+    if (h->gen == TS_GEN_YOUNG) g_old_bytes += gc_cell_heap_bytes(h, gc_cell_promote(h));
+    publish_mark_payloads(h);
+    h->mark = 1;
+  }
   if (w.len) prop_add_epoch_bump();
-  free(w.cells); free(w.seen);
+  free(w.cells); free(w.keep);
   return v;
 }
 int ts_is_published(tsv v){
@@ -18640,7 +18759,7 @@ static tsv msg_decode(msg_dec* d){
       if (!d->region_hi || off >= g_cage_bytes || bi < d->region_lo || bi >= d->region_hi || (a & 15u)) msg_bad();
       ts_gc_header* h = (ts_gc_header*)a;
       if (!(h->flags & TS_HDR_PUBLISHED) || !gc_kind_valid(h->kind)) msg_bad();
-      return h->kind == TS_KIND_FUNC ? ts_func_v(h) : ts_obj(h);
+      return h->kind == TS_KIND_FUNC ? ts_func_v(h) : h->kind == TS_KIND_STRING ? ts_str_v(h) : ts_obj(h);
     }
     case MSG_ARRAY: {
       uint32_t n = msg_get_u32(d);
@@ -18766,8 +18885,9 @@ static void watch_close(ts_watch* w){
   int failed = WIFSIGNALED(status) || (WIFEXITED(status) && WEXITSTATUS(status) != 0);
   int id = w->id;
   if (w->region_hi){
-    if (getenv("TSAOT_PUBLISH_PROTECT") && getenv("TSAOT_PUBLISH_PROTECT")[0] == '1')
-      mprotect(gc_block_base(w->region_lo), (size_t)(w->region_hi - w->region_lo) << GC_BLOCK_SHIFT, PROT_READ);
+    if (publish_protect_on() &&
+        mprotect(gc_block_base(w->region_lo), (size_t)(w->region_hi - w->region_lo) << GC_BLOCK_SHIFT, PROT_READ) != 0)
+      perror("tsaot: mprotect(region)");
     if (g_shared_workers_alive && --g_shared_workers_alive == 0){
       g_full_threshold_bytes = g_full_threshold_saved; g_full_threshold_forced = g_full_threshold_forced_saved;
     }
@@ -18820,7 +18940,7 @@ static void watch_read(ts_watch* w){
           ts_obj_add_integrity((ts_object*)h, 1u);
         h->flags |= TS_HDR_PUBLISHED;
         if (ts_is_undef(g_shared_prefork_roots)){ g_shared_prefork_roots = ts_new_array(0); ts_root_static_once(&g_shared_prefork_roots, &g_shared_prefork_roots_rooted); }
-        ts_array_push(g_shared_prefork_roots, h->kind == TS_KIND_FUNC ? ts_func_v(h) : ts_obj(h));
+        ts_array_push(g_shared_prefork_roots, h->kind == TS_KIND_FUNC ? ts_func_v(h) : h->kind == TS_KIND_STRING ? ts_str_v(h) : ts_obj(h));
       }
       if (nshapes) prop_add_epoch_bump();
       v = msg_decode_frame_from(d.p + d.pos, d.len - d.pos, w->region_lo, w->region_hi);
@@ -18904,6 +19024,26 @@ static uint32_t env_u32(const char* name, uint32_t dflt){
   return v ? (uint32_t)v : dflt;
 }
 static int ts_worker_fork_ex(tsv data, int shared);
+/* TSAOT_PUBLISH_PROTECT=1 (a check mode): the regions a process only reads
+   are mapped read-only in it, so a write by a reader faults instead of
+   reaching the other processes (the parent at a shared worker's exit, a
+   plain worker such as a checker at its fork). */
+static int publish_protect_on(void){
+  static int on = -1;
+  if (on < 0){ const char* e = getenv("TSAOT_PUBLISH_PROTECT"); on = e && e[0] == '1'; }
+  return on;
+}
+static void region_protect_all(void){
+  if (!g_cage_base) return;
+  uint32_t nblocks = (uint32_t)(g_cage_bytes >> GC_BLOCK_SHIFT);
+  for (uint32_t bi = 0; bi < nblocks; ){
+    if (g_blocks[bi].state != GC_BLK_REGION){ bi++; continue; }
+    uint32_t e = bi;
+    while (e < nblocks && g_blocks[e].state == GC_BLK_REGION) e++;
+    if (mprotect(gc_block_base(bi), (size_t)(e - bi) << GC_BLOCK_SHIFT, PROT_READ) != 0) perror("tsaot: mprotect(region)");
+    bi = e;
+  }
+}
 int ts_worker_fork(tsv data){ return ts_worker_fork_ex(data, 0); }
 int ts_worker_fork_shared(tsv data){ return ts_worker_fork_ex(data, 1); }
 static int ts_worker_fork_ex(tsv data, int shared){
@@ -18915,6 +19055,11 @@ static int ts_worker_fork_ex(tsv data, int shared){
      parent keeps it as GC_BLK_REGION; the shape ids partitioned */
   uint32_t region_lo = 0, region_hi = 0, child_shape_lo = 0, child_shape_hi = 0;
   if (shared){
+    /* Every live pre-fork cell becomes old: the parent's young collections
+       while the worker runs never free it, and its full collections are
+       deferred until the worker's frames have rooted what the graph reached.
+       A dead young cell is freed here, before the child could see it. */
+    ts_gc_collect_young();
     uint32_t mb = env_u32("TSAOT_SHARED_REGION_MB", 512u);
     uint32_t nblocks = (uint32_t)(((size_t)mb << 20) >> GC_BLOCK_SHIFT);
     if (!nblocks) nblocks = 1u;
@@ -18923,17 +19068,22 @@ static int ts_worker_fork_ex(tsv data, int shared){
     void* m = mmap(base, (size_t)nblocks << GC_BLOCK_SHIFT, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON | MAP_FIXED, -1, 0);
     if (m != (void*)base) ts_abort_msg("cannot map a shared worker's region");
     for (uint32_t i = region_lo; i < region_hi; i++){ memset(&g_blocks[i], 0, sizeof(gc_block)); g_blocks[i].state = GC_BLK_REGION; }
+    g_shared_regions_exist = 1;
     uint32_t span = env_u32("TSAOT_SHARED_SHAPES", 65536u);
     if (!g_shared_workers_alive){
-      g_shape_partition_base = g_next_shape; g_shared_forks = 0;
-      g_shape_limit = g_shape_partition_base + span;
       g_full_threshold_saved = g_full_threshold_bytes; g_full_threshold_forced_saved = g_full_threshold_forced;
       g_full_threshold_bytes = SIZE_MAX; g_full_threshold_forced = 1;   /* young collections only while workers live */
     }
-    g_shared_forks++;
-    child_shape_lo = g_shape_partition_base + g_shared_forks * span; child_shape_hi = child_shape_lo + span;
+    /* the parent's headroom: a span above its next id, set once per run of
+       workers; a worker's range: a span above the headroom and above every
+       range handed out before (never reused: the parent keeps installing a
+       worker's shapes at its ids after the worker is gone) */
+    if (!g_shape_limit) g_shape_limit = g_next_shape + span;
+    child_shape_lo = g_shape_ranges_end > g_shape_limit ? g_shape_ranges_end : g_shape_limit;
+    child_shape_hi = child_shape_lo + span;
     if (child_shape_hi > TS_SHAPE_MAX) ts_abort_msg("too many shared workers for the shape id space (TSAOT_SHARED_SHAPES)");
-    g_shape_jump_to = child_shape_hi;
+    g_shape_ranges_end = child_shape_hi;
+    g_shared_forks++;
     g_shared_workers_alive++;
   }
   int fds[2], in[2];
@@ -18954,7 +19104,7 @@ static int ts_worker_fork_ex(tsv data, int shared){
         for (int k = 0; k < 4; k++){ fam[k]->ptr = fam[k]->end = NULL; fam[k]->head = 0; fam[k]->scan = 0; }
       }
       g_free_blocks = 0; g_large_head = 0; g_large_cell_head = 0; g_alloc_dirty_len = 0;
-      g_next_shape = child_shape_lo; g_shape_limit = child_shape_hi; g_shape_jump_to = 0;
+      g_next_shape = child_shape_lo; g_shape_limit = child_shape_hi; g_shape_ranges_end = 0;
       g_shared_workers_alive = 0; g_shape_log_len = 0; g_prefork_frozen_len = 0;
     }
     /* the parent's pending work is the parent's: its workers' pipes, its
@@ -18968,6 +19118,7 @@ static int ts_worker_fork_ex(tsv data, int shared){
     /* young collections only: a full one would mark every pre-fork cell and
        copy their pages into this process */
     g_full_threshold_bytes = SIZE_MAX; g_full_threshold_forced = 1;
+    if (!shared && g_shared_regions_exist && publish_protect_on()) region_protect_all();
     ts_handler* h = ts_eh_push();
     if (ts_setjmp(h->buf) != 0){
       ts_gc_set_root_depth(h->gc_root_len);
@@ -20558,8 +20709,35 @@ static char** ts_user_argv;
 typedef int (*ts_user_main_fn)(int, char**);
 static int ts_user_main_call(int argc, char** argv){ return ((ts_user_main_fn)ts_user_main)(argc, argv); }
 static void* ts_user_main_thread(void* arg){ (void)arg; ts_user_main_rc = ts_user_main_call(ts_user_argc, ts_user_argv); return NULL; }
+/* TSAOT_CRASH_TRACE=1: a fault prints its address, whether it lies in a shared
+   worker's region (docs/published_graphs_design.md, the protect diagnostic),
+   and the native backtrace, then dies as it would have. */
+#include <execinfo.h>
+#include <signal.h>
+static void ts_crash_trace(int sig, siginfo_t* si, void* uc){
+  (void)uc;
+  void* frames[64];
+  int n = backtrace(frames, 64);
+  uintptr_t a = (uintptr_t)si->si_addr;
+  uintptr_t off = a - (uintptr_t)g_cage_base;
+  int region = g_cage_base && off < g_cage_bytes && g_blocks[off >> GC_BLOCK_SHIFT].state == GC_BLK_REGION;
+  char buf[160];
+  int len = snprintf(buf, sizeof buf, "[crash] signal %d at %p%s (pid %d, %s)\n", sig, (void*)a,
+                     region ? " in a shared worker's region" : "", (int)getpid(), g_is_worker ? "a worker" : "the main process");
+  if (len > 0) write(2, buf, (size_t)len);
+  backtrace_symbols_fd(frames, n, 2);
+  signal(sig, SIG_DFL); raise(sig);
+}
+static void ts_crash_trace_install(void){
+  const char* e = getenv("TSAOT_CRASH_TRACE");
+  if (!e || e[0] != '1') return;
+  struct sigaction sa; memset(&sa, 0, sizeof sa);
+  sa.sa_sigaction = ts_crash_trace; sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+  sigaction(SIGSEGV, &sa, NULL); sigaction(SIGBUS, &sa, NULL);
+}
 int main(int argc, char** argv){
   ts_user_argc = argc; ts_user_argv = argv;
+  ts_crash_trace_install();
   const char* e = getenv("TSAOT_MAIN_STACK_MB");
   size_t mb = e ? (size_t)strtoul(e, NULL, 10) : 256u;
   if (mb == 0) return ts_user_main_call(argc, argv);

@@ -1,13 +1,13 @@
 // tsc-ts's src/main.ts for the garnet build: the same command line; the Node
-// modules resolve to the shims beside this file (tsconfig `paths`). Checker
-// threads are forked processes (docs/fork_workers_design.md): a child runs
-// `runThread` with the data the main process gave its Worker. Parse threads
-// are not started (`parallelParse.spawn` stays unset), so parsing is serial.
+// modules resolve to the shims beside this file (tsconfig `paths`). Threads
+// are forked processes (docs/fork_workers_design.md): a child runs `runThread`
+// with the data the main process gave its Worker. Parse threads are shared
+// workers (docs/published_graphs_design.md): the bound files they publish
+// reach the main thread by reference.
 import './prelude.js';
 import { dirname } from 'node:path';
 import { runServer } from '../src/api/server.js';
-import { runThread, type ThreadData, type ThreadDrivers } from '../src/compiler/thread-entry.js';
-import { parallelCheck } from '../src/compiler/parallel-check.js';
+import { runThread, startThreads, type ThreadData, type ThreadDrivers } from '../src/compiler/thread-entry.js';
 import { mark, markMemory, timeline } from '../src/compiler/timeline.js';
 import {
   outputWriterOfThread,
@@ -47,12 +47,8 @@ if (timeline) {
   const hr = process.hrtime();
   mark(`main clock ${hr[0]} ${hr[1]}`);
 }
-if (args[0] !== '--api') {
-  // startThreads would also install parallelParse.spawn (parse threads).
-  parallelCheck.writer = drivers.outputWriter();
-  parallelCheck.spawn = (program, index, counter, order, nodeIds, symbolIds, reserved, emits, emitKinds, checking) =>
-    spawnThread({ kind: 'check', program, args, index, counter, order, nodeIds, symbolIds, reserved, emits, emitKinds, checking });
-}
+// checker, parse and reference threads, as the Node build starts them
+if (args[0] !== '--api') startThreads(spawnThread, drivers, args);
 const status = args[0] === '--api' ? runServer(args.slice(1), defaultLibraryPath) : runTsc(args, defaultLibraryPath);
 // Watch mode and `--checkers` keep running until their callbacks exit.
 if (status !== watching) {

@@ -116,6 +116,14 @@ Principle: **measurement over theory**. Minimal reproduction → a probe that pi
    - `TSAOT_GC_PROTECT=1` … freed cells are zapped and quarantined (up to 64 MiB; `=N` for N MiB)
      instead of reused, and a collection that reaches one aborts naming it: a missing root or
      write barrier (`docs/gc_v2_design.md` §6.8.1)
+   - `TSAOT_PUBLISH_PROTECT=1` … a shared worker's region is mapped read-only in every process
+     that only reads it (the parent once the worker exited, a checker from its fork): a reader
+     writing into a published graph faults instead of reaching the other processes
+     (`docs/published_graphs_design.md`). The first thing to run when tsc-ts with two or more
+     checkers reports diagnostics that one checker does not.
+   - `TSAOT_CRASH_TRACE=1` … SIGSEGV/SIGBUS print the faulting address (and whether it lies in a
+     shared worker's region), the process (main or worker) and a backtrace; lldb cannot follow
+     the forked children, this can.
    - `TSAOT_UNTYPED=1` … isolate whether type-driven optimization (SROA/unbox) is the cause
    - `garnet --stack-check` … every escape-analysis `Stack` object (class instance, scope record,
      closure) lives in a never-reused quarantine and dies with its activation; a dead one the

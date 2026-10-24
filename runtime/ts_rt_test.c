@@ -107,6 +107,12 @@ static tsv test_shared_entry(tsv* a, int n){
   tsv ord = ts_new_object(); ts_gc_root(&ord);
   ts_set(ord, ts_intern_field("b", 1), ts_num(2)); ts_set(ord, ts_intern_field("a", 1), ts_num(1));
   tsv fn = ts_make_fn_t(test_worker_on_error, NULL, 0, 0); ts_gc_root(&fn);
+  /* an object whose prototype this worker made: the prototype must outlive the worker's collections */
+  tsv protoo = ts_new_object(); ts_gc_root(&protoo);
+  ts_set(protoo, ts_intern_field("inh", 3), ts_num(7));
+  tsv child = ts_object_create(protoo); ts_gc_root(&child);
+  ts_set(child, ts_intern_field("own", 3), ts_num(1));
+  ts_set(root, ts_intern_field("child", 5), child);
   ts_set(root, ts_intern_field("arr", 3), arr);
   ts_set(root, ts_intern_field("m", 1), m);
   ts_set(root, ts_intern_field("text", 4), ts_new_string("shared text", 11));
@@ -114,11 +120,18 @@ static tsv test_shared_entry(tsv* a, int n){
   ts_set(root, ts_intern_field("ord", 3), ord);
   ts_set(root, ts_intern_field("fn", 2), fn);
   ts_publish(root);
+  ts_gc_unroot(9);   /* the publish alone keeps the graph (and its prototypes) from here */
+  ts_gc_root(&root);
+  if (!getenv("TSAOT_TEST_NO_GC")){   /* objects of the prototype's size class reuse a freed cell */
+    ts_gc_collect_young();
+    for (int i = 0; i < 20000; i++){ tsv junk = ts_new_object(); ts_set(junk, ts_intern_field("inh", 3), ts_num(i)); if (i % 1000 == 0) ts_gc_collect_young(); }
+    ts_gc_collect_young();
+  }
   tsv wrap = ts_new_object(); ts_gc_root(&wrap);
   ts_set(wrap, ts_intern_field("batch", 5), root);
   ts_worker_post(wrap);
   ts_worker_post(root);
-  ts_gc_unroot(7);
+  ts_gc_unroot(2);
   return TS_UNDEFINED;
 }
 static tsv test_shared_on_message(tsv* a, int n){
@@ -141,6 +154,81 @@ static tsv test_shared_intern_entry(tsv* a, int n){
   ts_set(o, ts_intern_field("never_seen_before_xyz", 21), ts_num(1));
   ts_gc_unroot(1);
   return TS_UNDEFINED;
+}
+/* A shared worker publishes a Map of 3000 string keys of three storages (heap
+   strings, immediates, views of one long string), a Set, and an object of 40
+   properties; the parent looks every key up with strings of its own. */
+static tsv shared_big_got = TS_UNDEFINED;
+static tsv shared_key(int i, tsv longtext){
+  char buf[32]; int n = snprintf(buf, sizeof buf, "k%d_%s", i, i % 3 == 0 ? "" : i % 3 == 1 ? "name_of_member" : "xy");
+  if (i % 3 == 2){ /* a view of the large text: its i-th 7-character token */
+    return ts_str_slice(longtext, (double)(i * 7), (double)(i * 7 + 7), 1);
+  }
+  return ts_new_string(buf, (uint32_t)n);
+}
+/* strings of the key size classes, as a parser makes: freed cells of the same classes get reused */
+static void shared_string_churn(void){
+  for (int i = 0; i < 20000; i++){
+    char b[32]; int n = snprintf(b, sizeof b, "j%d_%s", i, i % 3 == 0 ? "" : i % 3 == 1 ? "name_of_member" : "xy");
+    tsv s = ts_new_string(b, (uint32_t)n); tsv junk = ts_new_array(0); ts_array_push(junk, s);
+    if (i % 1000 == 0) ts_gc_collect_young();
+  }
+}
+static tsv test_shared_big_entry(tsv* a, int n){
+  tsv data = n > 0 ? a[0] : TS_UNDEFINED;
+  /* the text as the worker's own region string (a source file read here): the views' parent */
+  tsv pretext = ts_get(data, ts_intern_field("text", 4));
+  /* a collection first, then the graph: its strings are young when it is published, as a
+     parser's are (a young collection promotes what it reaches, so one before publish would hide
+     a walk that leaves the strings behind) */
+  int gcs = !getenv("TSAOT_TEST_NO_GC");
+  if (gcs){ shared_string_churn(); ts_gc_collect_young(); }
+  ts_strview pv = ts_str_view_typed(pretext);
+  tsv longtext = ts_new_string(pv.data, pv.len); ts_gc_root(&longtext);
+  tsv m = ts_new_map(); ts_gc_root(&m);
+  tsv st = ts_new_set(); ts_gc_root(&st);
+  for (int i = 0; i < 3000; i++){ tsv k = shared_key(i, longtext); ts_gc_root(&k); ts_map_set(m, k, ts_num((double)i)); if (i % 7) ts_set_add(st, k); ts_gc_unroot(1); }
+  for (int i = 0; i < 3000; i += 5){ tsv k = shared_key(i, longtext); ts_gc_root(&k); ts_map_delete(m, k); ts_gc_unroot(1); }   /* tombstones */
+  tsv o = ts_new_object(); ts_gc_root(&o);
+  for (int i = 0; i < 40; i++){ char nm[16]; snprintf(nm, sizeof nm, "p%d", i); ts_set(o, ts_intern_field(nm, (uint32_t)strlen(nm)), ts_num((double)i * 3)); }
+  tsv root = ts_new_object(); ts_gc_root(&root);
+  ts_set(root, ts_intern_field("m", 1), m); ts_set(root, ts_intern_field("s", 1), st); ts_set(root, ts_intern_field("o", 1), o);
+  /* young collections in between, as a parse worker has (TSAOT_TEST_NO_GC=1: none) */
+  ts_publish(root);
+  ts_gc_unroot(5);   /* the graph is kept by the publish alone from here */
+  if (gcs){ ts_gc_collect_young(); shared_string_churn(); ts_gc_collect_young(); }
+  ts_worker_post(root);
+  return TS_UNDEFINED;
+}
+static tsv test_shared_big_on_message(tsv* a, int n){ if (n > 0) shared_big_got = a[0]; return TS_UNDEFINED; }
+/* iteration of a published collection (the cursor protocol of for..of, the iterator protocol) */
+double ts_map_cursor_next(tsv coll, double last, double prev);
+double ts_map_cursor_order(tsv coll, double idx);
+tsv ts_map_cursor_val(tsv coll, double idx);
+tsv ts_map_keys(tsv mv);
+static int shared_iter_count(tsv coll){
+  int n = 0; double last = -1, prev = -1;
+  for (;;){ double i = ts_map_cursor_next(coll, last, prev); if (i < 0) break; n++; last = ts_map_cursor_order(coll, i); prev = i; }
+  return n;
+}
+/* the Map's live entries in insertion order: values ascending, the deleted (i % 5 == 0) absent */
+static int shared_iter_check_map(tsv m){
+  double last = -1, prev = -1, expect = -1; int bad = 0;
+  for (;;){
+    double i = ts_map_cursor_next(m, last, prev); if (i < 0) break;
+    double v = ts_to_num(ts_map_cursor_val(m, i));
+    if (!(v > expect) || ((int)v % 5) == 0) bad++;
+    expect = v; last = ts_map_cursor_order(m, i); prev = i;
+  }
+  return bad;
+}
+static int shared_iter_keys_count(tsv m){
+  tsv it = ts_map_keys(m); ts_gc_root(&it);
+  ts_key nmk = ts_intern_field("next", 4), donek = ts_intern_field("done", 4);
+  int n = 0;
+  for (;;){ tsv r = ts_iter_step(it, TS_UNDEFINED, nmk); if (ts_truthy(ts_get(r, donek))) break; if (++n > 100000) break; }
+  ts_gc_unroot(1);
+  return n;
 }
 static int write_throws(tsv obj, ts_key key, tsv val){
   ts_handler* h = ts_eh_push();
@@ -1958,6 +2046,7 @@ int main(){
     ts_set(ab, ts_intern_field("a", 1), ts_num(0)); ts_set(ab, ts_intern_field("b", 1), ts_num(0));
     ts_intern_field("deep", 4); ts_intern_field("arr", 3); ts_intern_field("m", 1); ts_intern_field("text", 4);
     ts_intern_field("pre", 3); ts_intern_field("ord", 3); ts_intern_field("fn", 2); ts_intern_field("batch", 5); ts_intern_field("k", 1);
+    ts_intern_field("inh", 3); ts_intern_field("own", 3); ts_intern_field("child", 5);
     tsv entry = ts_make_fn_t(test_shared_entry, NULL, 0, 0); ts_gc_root(&entry);
     ts_worker_set_entry(entry);
     tsv data = ts_new_object(); ts_gc_root(&data);
@@ -1985,6 +2074,9 @@ int main(){
       CK("shared worker: a shape the parent never made reads its keys",
          ts_to_num(ts_get(ord, ts_intern_field("a", 1))) == 1 && ts_to_num(ts_get(ord, ts_intern_field("b", 1))) == 2);
       CK("shared worker: a function cell arrives by reference", ts_is_func(fn));
+      tsv child = ts_get(batch, ts_intern_field("child", 5));
+      CK("shared worker: a prototype the worker made is kept through its collections; the object reads its inherited property",
+         ts_is_published(child) && ts_to_num(ts_get(child, ts_intern_field("own", 3))) == 1 && ts_to_num(ts_get(child, ts_intern_field("inh", 3))) == 7);
       CK("shared worker: the pre-fork cell the graph reached is the parent's own, frozen here",
          ts_get(batch, ts_intern_field("pre", 3)) == shared_prefork && ts_truthy(ts_object_is_frozen(shared_prefork)) && ts_is_published(shared_prefork));
       CK("shared worker: the graph is published and immutable in the parent",
@@ -2017,6 +2109,68 @@ int main(){
     CK("shared worker: a region exhausted is a loud death", overflow_loud);
     CK("shared worker: a new property name interned is a loud death", worker_errors == 1);
     ts_gc_unroot(10);
+  }
+  {
+    /* a shared worker's big Map, Set and wide object, with young collections before and after publish */
+    ts_gc_root(&shared_big_got);
+    /* a large text (a source file's size class): 3000 distinct 7-character tokens */
+    char* big = (char*)malloc(3000 * 7 + 1);
+    for (int i = 0; i < 3000; i++) snprintf(big + i * 7, 8, "k%06d", i);
+    tsv longtext = ts_new_string(big, 3000 * 7); ts_gc_root(&longtext); free(big);
+    for (int i = 0; i < 40; i++){ char nm[16]; snprintf(nm, sizeof nm, "p%d", i); ts_intern_field(nm, (uint32_t)strlen(nm)); }
+    ts_intern_field("text", 4); ts_intern_field("o", 1);
+    tsv entry = ts_make_fn_t(test_shared_big_entry, NULL, 0, 0); ts_gc_root(&entry);
+    ts_worker_set_entry(entry);
+    tsv data = ts_new_object(); ts_gc_root(&data);
+    ts_set(data, ts_intern_field("text", 4), longtext);
+    tsv onm = ts_make_fn_t(test_shared_big_on_message, NULL, 0, 0); ts_gc_root(&onm);
+    tsv one = ts_make_fn_t(test_worker_on_error, NULL, 0, 0); ts_gc_root(&one);
+    worker_errors = 0;
+    int id = ts_worker_fork_shared(data);
+    ts_worker_on_message(id, onm); ts_worker_on_error(id, one);
+    ts_run_event_loop();
+    int ok = worker_errors == 0 && ts_is_obj(shared_big_got);
+    int map_miss = 0, map_wrong = 0, set_miss = 0, obj_wrong = 0, tomb_present = 0;
+    if (ok){
+      tsv m = ts_get(shared_big_got, ts_intern_field("m", 1)), st = ts_get(shared_big_got, ts_intern_field("s", 1)), o = ts_get(shared_big_got, ts_intern_field("o", 1));
+      for (int i = 0; i < 3000; i++){
+        tsv k;
+        if (i % 3 == 2){ char tok[8]; snprintf(tok, sizeof tok, "k%06d", i); k = ts_new_string(tok, 7); } else k = shared_key(i, longtext);
+        ts_gc_root(&k);
+        tsv v = ts_map_get(m, k);
+        if (i % 5 == 0){ if (!ts_is_undef(v)) tomb_present++; }
+        else if (ts_is_undef(v)) map_miss++;
+        else if (ts_to_num(v) != (double)i) map_wrong++;
+        if (i % 7 && !ts_set_has(st, k)) set_miss++;
+        ts_gc_unroot(1);
+      }
+      { tsv ks = ts_object_keys(o); if (ts_array_len(ks) != 40) obj_wrong += 1000; }   /* the key count in the parent's view */
+      for (int i = 0; i < 40; i++){ char nm[16]; snprintf(nm, sizeof nm, "p%d", i); tsv v = ts_get(o, ts_intern_field(nm, (uint32_t)strlen(nm))); if (ts_to_num(v) != (double)i * 3) obj_wrong++; }
+    }
+    if (map_miss || map_wrong || set_miss || obj_wrong || tomb_present)
+      printf("    (map misses %d, wrong %d, set misses %d, object wrong %d, deleted present %d)\n", map_miss, map_wrong, set_miss, obj_wrong, tomb_present);
+    CK("shared worker: a 3000-key Map, a Set and a 40-property object read correctly after the worker's collections",
+       ok && !map_miss && !map_wrong && !set_miss && !obj_wrong && !tomb_present);
+    /* iterating the published collections: the identity order, nothing stored into the shared cells;
+       another process (a plain child, as a checker is) iterating first changes nothing here */
+    int iter_bad = 0;
+    if (ok){
+      tsv m = ts_get(shared_big_got, ts_intern_field("m", 1)), st = ts_get(shared_big_got, ts_intern_field("s", 1));
+      fflush(stdout);
+      pid_t child = fork();
+      if (child == 0){ shared_iter_count(m); shared_iter_count(st); shared_iter_keys_count(m); _exit(0); }
+      int status = 0; if (waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0) iter_bad |= 32;
+      for (int round = 0; round < 2; round++){
+        if (shared_iter_count(m) != 2400) iter_bad |= 1;
+        if (shared_iter_count(st) != 2571) iter_bad |= 2;
+        if (shared_iter_check_map(m) != 0) iter_bad |= 4;
+        if (shared_iter_keys_count(m) != 2400) iter_bad |= 8;
+      }
+      if (((ts_map*)ts_ptr(m))->iteration_order || ((ts_set_t*)ts_ptr(st))->iteration_order) iter_bad |= 16;
+    }
+    if (iter_bad) printf("    (iteration flags %d)\n", iter_bad);
+    CK("shared worker: the published Map and Set iterate in the identity order with nothing stored in the shared cells, after another process iterated them", ok && !iter_bad);
+    ts_gc_unroot(6);
   }
   {
     /* frames from the parent: three numbers and a stop; the doubled replies arrive in order */

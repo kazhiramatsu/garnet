@@ -9391,3 +9391,35 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   and `parentPort.close()` now work as a tsc-ts parse thread expects. Runtime
   tests: three numbers doubled in order and the worker ending on stop; posting
   to an exited worker throws.
+- Slice P5 (tsc-ts shims, runtime; `docs/published_graphs_design.md` "P5 as
+  built"): tsc-ts parses on shared workers. The `@scriptc/threads` shim
+  re-exports `garnet:shared`'s `publish` and sets `sharesPublishedGraphs`;
+  `main.ts` starts checker, parse and reference threads with `startThreads`
+  as the Node build does; a parse thread is a shared worker that publishes
+  each batch it binds and posts it, the main thread and the checkers reading
+  the files in place. Bringing it up found three breaches of the invariant
+  "a published cell is never written by anyone and never freed under its
+  readers", each silent (diagnostics one checker does not report, outputs
+  identical) and each a runtime test now: a Map or Set iterated for the first
+  time stored its lazily allocated iteration order into the shared cell (one
+  checker's malloc'd pointer read as order ids by the other), so a published
+  collection iterates in the identity order with nothing stored
+  (`identity_order`); the young collection marked region cells the walk had
+  not promoted (caught by `TSAOT_PUBLISH_PROTECT=1`, now also applied in the
+  checkers at their fork), so the collectors return at a `REGION` cell behind
+  one predictable branch; the walk skipped strings as immutable, and a young
+  string referenced only from old published cells was freed by the worker's
+  next collection and reused (`Cannot find module './_namespaces/ts.js'`), so
+  in region mode the walk promotes the strings it reaches, a view's text, a
+  symbol's description, and keeps the prototypes it reaches unfrozen. Also:
+  payload old bits at publish, a young collection before a shared fork, the
+  mark-byte walk, monotonic shape id ranges across successive workers, no
+  hash caching into region strings, `MSG_SHARED` boxing strings, and
+  `TSAOT_CRASH_TRACE=1` (a fault's address, process and backtrace). Measured:
+  four checkers 0.47 s against scriptc's 0.44 s (1.068; 1.23 before), peak
+  RSS 322 MB against 454 MB; outputs identical at 1, 2, 4 and 8 checkers, GC
+  stress and the protect mode clean. One checker against P2: instructions
+  1.017, cycles 1.008 (the four shared-region tests 0.3% instructions, no
+  cycles; the rest a 1.1% larger program). Next: the parse threads start over
+  25 ms (a shared fork maps a region and collects) while the config is read
+  in 7 ms.

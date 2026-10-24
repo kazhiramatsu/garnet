@@ -102,10 +102,13 @@ get a header flag `TS_HDR_PUBLISHED` tested in `set`/`add`/`delete`/`clear`
 (one test of a byte the kind check already loads). Captured variables live
 in typed cells (sized), so the class-instance fix covers them.
 
-A diagnostic mode, `TSAOT_PUBLISH_PROTECT=1`, maps a worker's region
-read-only in the parent once the worker has exited; a write faults and
-aborts naming the address. Strings cache their hash lazily and the mode
-would see those as writes, so it is a tool, not a gate.
+A check mode, `TSAOT_PUBLISH_PROTECT=1`, maps a worker's region read-only
+in every process that only reads it: in the parent once the worker has
+exited, in a plain worker (a checker) at its fork; a write faults, and with
+`TSAOT_CRASH_TRACE=1` the fault names the address and the writer. Nothing
+writes there since P5 (a string in a region does not cache its hash, a
+published collection iterates without storing an order, the collectors
+never mark a region cell), so a clean run is a gate.
 
 ### P1 as built
 
@@ -268,6 +271,76 @@ mixed instances).
   the stop message, the replies arriving in order; posting to the exited
   worker throws.
 
+### P5 as built: tsc-ts parses on shared workers
+
+- The shim `@scriptc/threads` re-exports `garnet:shared`'s `publish` and
+  sets `sharesPublishedGraphs`; `main.ts` starts the threads as the Node
+  build does (`startThreads`: checkers, parse threads, reference threads).
+  A parse thread is a shared worker (`workerData.kind === 'parse'`); it
+  loads the chunks the main thread posts, publishes each batch and posts
+  it, the main thread reading the bound files in place; `publish(program)`
+  on the main thread before the checkers are forked walks only the
+  program's own cells (a published cell stops the walk) and freezes them;
+  the checkers, forked afterwards, see every published cell at its address.
+- Bringing it up found three ways a reader or the worker's collector broke
+  the invariant behind the design, *a published cell is never written by
+  anyone and never freed under its readers*. Each was silent (type
+  diagnostics one checker does not report, the outputs still identical),
+  each is a runtime test now that fails on the code before it:
+  1. *A reader's lazy cache stored into a shared cell.* A Map or Set
+     iterated for the first time allocated its iteration order and stored
+     the pointer in the cell: one checker stored its own malloc'd pointer
+     into the region, the other read garbage order ids and saw a subset of
+     an interface's members (`Property 'multiLine' does not exist on type
+     'ObjectLiteralExpression'`). A published collection never changes, so
+     its order is the dense index + 1: `identity_order`, one table per
+     process, nothing stored (`mapset_cursor_view`, `ts_map_iterator`).
+     The 372 diagnostics that survived with young collections off were
+     this.
+  2. *The collector marking region cells.* A young collection reached
+     region cells the walk had not promoted (strings, below) and wrote
+     their mark and generation into shared memory; `TSAOT_PUBLISH_PROTECT=1`
+     in the checkers caught it (SIGBUS in `gc_scan_cell`). The per-edge
+     filter and the conservative stack scan now return at a cell in a
+     `REGION` block when shared regions exist: one predictable branch,
+     0.2% instructions and no cycles on the one-checker compile.
+  3. *Strings and prototypes left young.* The walk skipped strings as
+     immutable, but a young string referenced only from the old published
+     cells is freed by the worker's next young collection and its cell
+     reused, so the readers saw other identifiers (`Cannot find module
+     './_namespaces/ts.js'`, members missing). In region mode the walk now
+     promotes the strings it reaches, a view's text and a symbol's
+     description; the prototypes the graph reaches (and what they reach,
+     within the region) are kept the same way, immortal and opaque but not
+     frozen, as a deep freeze leaves prototypes alone (a pre-fork prototype
+     is the parent's own).
+- Also from the first crashes of this slice: a published cell's payloads get
+  the old bit (`publish_mark_payloads`), a young collection runs before a
+  shared fork, the walk uses the mark byte rather than a hash set, a payload
+  grown on a region cell is malloc'd in the reader, a region string never
+  caches its hash, shape id ranges are monotonic across successive workers
+  (an installed id with another layout aborts), `MSG_SHARED` boxes a string
+  as a string, and the crash trace (`TSAOT_CRASH_TRACE=1`).
+- Measurements (the compiler project, trained builds, quiet machine):
+  four checkers 0.47 s wall against scriptc's 0.44 s (1.068; 1.23 before
+  the parse workers), peak RSS 322 MB against 454 MB; by tsc-ts's clock
+  parse 0.124 s, check 0.361 s, total 0.500 s. Outputs identical to one
+  checker's at 1, 2, 4 and 8 checkers; GC stress in the parse workers, the
+  parent and the checkers identical; `TSAOT_PUBLISH_PROTECT=1` clean. One
+  checker (no parse workers), P5 against P2: instructions 1.017, cycles
+  1.008, wall 1.010; of this the four shared-region tests on hot paths
+  (the marker's two, `gc_owned_alloc`, the hash cache) are 0.3%
+  instructions and no cycles, tsc-ts's own shared code path 0.1%; the rest
+  is not in any changed hot path: a build without every added test is
+  still 1.5% instructions and 0.6% cycles above P2 with a text 1.1% larger
+  (`startThreads` links the parse and reference thread code, and the
+  whole-program facts move with the program).
+- What remains of the gap: the ten parse threads start over 25 ms (a
+  shared fork maps a region and runs a young collection) while the main
+  thread reads the config in 7 ms, the last thread starting at 30 ms;
+  fewer parse threads, a cheaper shared fork or forking before the heap
+  grows are the next step.
+
 ## Sharing by fork: regions
 
 The fork prototype shares the parent's heap with its children by
@@ -343,10 +416,11 @@ fork:
 
 `parallelParse.spawn` forks shared workers through the shim; `publish` is
 `garnet:shared`'s; `main.ts` calls `startThreads` as the Node build does
-(the serial path goes). The expected result: parse and bind on N children,
-about 0.05 s instead of 0.16 s, and a four-checker compile of about 0.41 s
-against scriptc's 0.415 s; the checkers' own time is already slightly
-below scriptc's.
+(the serial path goes). The expected result was parse and bind on N
+children, about 0.05 s instead of 0.16 s, and a four-checker compile of
+about 0.41 s against scriptc's 0.415 s. Measured ("P5 as built"): parse
+0.124 s by tsc-ts's clock and 0.47 s against scriptc's 0.44 s; the parse
+threads' start, not their work, is what remains.
 
 ## Gates
 
@@ -358,12 +432,18 @@ below scriptc's.
 - Runtime tests (C): a shared region fork, a published graph read by the
   parent by reference, shape descriptors installed, a pre-fork cell frozen
   in both, the parent's young collections during the worker's life and a
-  full one after it, region exhaustion's abort, a new intern's abort.
+  full one after it, region exhaustion's abort, a new intern's abort; a
+  worker's young strings (views of its own text among them) and a
+  prototype it made surviving its collections after the publish; a
+  published Map and Set iterated by another process first and then here,
+  in the identity order, nothing stored in the shared cells.
 - tsc-ts: outputs identical to one checker's at 1, 2, 4 and 8 checkers with
-  parse workers; the project with two injected errors; GC stress in the
-  parse workers and in the parent during the parse phase
-  (`TSAOT_GC_YOUNG_THRESHOLD=1`); `TSAOT_PUBLISH_PROTECT=1` run clean of
-  anything but string hashes.
+  parse workers; GC stress in the parse workers, the parent and the
+  checkers (`TSAOT_GC_YOUNG_THRESHOLD=1`) identical; `TSAOT_PUBLISH_PROTECT=1`
+  (the regions read-only in the parent after the workers and in the
+  checkers from their fork) clean; no young collections at all
+  (`TSAOT_GC_YOUNG_THRESHOLD` huge) clean, which separates a reader's write
+  from a collector's.
 - Every existing gate unchanged (the runtime changes are behind the shared
   flag and the published bits).
 - Performance: P1's check on tsc-ts's one-checker compile (instructions,

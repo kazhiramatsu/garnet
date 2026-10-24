@@ -1,6 +1,6 @@
-// @scriptc/threads for tsc-ts on forked workers (docs/fork_workers_design.md):
-// a child sees the parent's objects, so graphs are shared by reference and
-// publishing is the identity (the checkers never write the program; a write
-// would land in the child's private copy of the page).
-export function publish<T>(value: T): T { return value; }
+// @scriptc/threads for tsc-ts: garnet's published graphs (docs/published_graphs_design.md).
+// `publish` is garnet:shared's deep freeze; a graph a shared worker (a parse thread) publishes
+// reaches the main thread by reference, and the checkers, forked after the program is published,
+// see it at the same addresses.
+export { publish } from 'garnet:shared';
 export const sharesPublishedGraphs = true;
