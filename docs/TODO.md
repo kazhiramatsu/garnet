@@ -9153,3 +9153,19 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   order, so collections happen at the same allocations). The typed one checker
   over eight pairs: 22.77 -> 22.72 G instructions (-0.23%), cycles -0.46%,
   wall 1.23 -> 1.22 s, outputs identical.
+- Slice AW (runtime + emitter, allocation; `docs/alloc_inline_design.md` "Runs
+  the allocator does not zero"): a run of free cells was zeroed once when a
+  size class took it (855 MB for one checker, `gc_space_refill` 2.2% of the
+  samples), though every byte of a class instance is written before it is
+  read: the allocator writes the whole 32-byte prefix and the generated code
+  every field (undefined into a boxed one; now zero into a numeric one, which
+  relied on the zeroed run). Young class instances (3.5 M, 410 MB) come from a
+  fourth family of size classes whose runs the refill does not zero; no
+  collection can run between the allocation and the stores. Pretenured
+  instances, ASan builds and the other kinds are as before; the full
+  collection's sweep and the conservative-roots cursor bookkeeping walk the
+  fourth family too (the first build missed the sweep: promoted cells in those
+  blocks kept their marks and their children were never traced again). The
+  typed one checker over eight pairs: 22.73 -> 22.70 G instructions (-0.10%),
+  cycles -0.53%, wall 1.23 -> 1.22 s, outputs identical; the dynamic
+  construction path zeroes numeric fields itself now.

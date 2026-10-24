@@ -2550,6 +2550,20 @@ fn lazy_fn_prototype_enabled() -> bool {
 /// Boxed (non-numeric) fields of a sized class instance, parents first, in
 /// struct order. These must start as `undefined`: the instance memory is zeroed
 /// and a zero word is the number 0 under NaN-boxing.
+/// Numeric (unboxed) fields of a sized class instance, parents first, in
+/// struct order: a double or an integer slot, which starts at zero.
+fn class_numeric_fields(cid: u32, classes: &BTreeMap<u32, &ClassDef>, out: &mut Vec<u32>) {
+    if let Some(c) = classes.get(&cid) {
+        if let Some(p) = c.parent {
+            class_numeric_fields(p.0, classes, out);
+        }
+        for f in &c.own_fields {
+            if numeric_field(cid, f.0, classes) {
+                out.push(f.0);
+            }
+        }
+    }
+}
 fn class_boxed_fields(cid: u32, classes: &BTreeMap<u32, &ClassDef>, out: &mut Vec<u32>) {
     if let Some(c) = classes.get(&cid) {
         if let Some(p) = c.parent {
@@ -19296,6 +19310,18 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                                 .iter()
                                 .map(|f| format!("hobj{}->f{} = TS_UNDEFINED;", dst.0, f))
                                 .collect();
+                            let _ = writeln!(s, "  {}", inits.join(" "));
+                        }
+                        // a young heap instance comes from a run the allocator
+                        // did not zero (docs/alloc_inline_design.md): its numeric
+                        // fields start at zero by these stores
+                        let mut numeric = Vec::new();
+                        if undef_fields_enabled() {
+                            class_numeric_fields(c.0, ctx.classes, &mut numeric);
+                        }
+                        if !numeric.is_empty() {
+                            let inits: Vec<String> =
+                                numeric.iter().map(|f| format!("hobj{}->f{} = 0;", dst.0, f)).collect();
                             let _ = writeln!(s, "  {}", inits.join(" "));
                         }
                         if st == AllocStrategy::PretenuredHeap {

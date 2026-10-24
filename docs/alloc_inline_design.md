@@ -43,6 +43,18 @@ fourth family of size classes, `g_cclass_sized`, whose runs the refill does
 not zero. No collection can run between the allocation and the stores (the
 generated code allocates nothing in between), so no scan sees a cell before
 it is written. A pretenured instance, a cell under ASan (where every cell is
-zeroed when handed out) and every other kind are as before.
+zeroed when handed out) and every other kind are as before. Every walk of
+the size classes' block lists covers the fourth family: the full
+collection's sweep (a first build missed it, so promoted cells in those
+blocks kept their marks and their children were never traced again), the
+conservative-roots cursor bookkeeping and the fate statistics; the dynamic
+construction path (`new` through a class value) zeroes numeric fields itself.
 
-Measurements: see TODO (session 352, slice AW).
+| program | before | after |
+|---|---|---|
+| tsc-ts typed, one checker, instructions | 22.73 G | 22.70 G (-0.10%) |
+| cycles | 5.29 G | 5.27 G (-0.53%) |
+| wall | 1.23 s | 1.22 s |
+
+Eight pairs; outputs identical. The zeroing of the other kinds' runs (arrays,
+strings, closures, maps) stays: their constructors rely on it.

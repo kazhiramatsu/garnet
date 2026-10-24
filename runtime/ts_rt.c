@@ -264,6 +264,12 @@ static gc_pclass g_cclass[GC_PAYLOAD_NCLASS];
    fragmented into one- and two-cell holes once the young cells died (1.36 M
    refills a compile, 291 bytes a run; docs/single_thread_vs_scriptc.md). */
 static gc_pclass g_cclass_old[GC_PAYLOAD_NCLASS];
+/* Young class instances (docs/alloc_inline_design.md, "Runs the allocator
+   does not zero"): their runs are not zeroed at refill. The generated code
+   writes every field of a new instance (undefined for a boxed field, zero
+   for a numeric one) and the allocator writes the whole 32-byte prefix, so
+   no byte of such a cell is read before it is written. */
+static gc_pclass g_cclass_sized[GC_PAYLOAD_NCLASS];
 static uint32_t g_large_cell_head = 0;   /* large cell runs (index + 1) */
 static uint32_t g_pclass_size[GC_PAYLOAD_NCLASS];
 /* Per class: the bytes its cells tile from a block's start, and the cell
@@ -396,6 +402,8 @@ static void gc_alloc_bits_settle(void){
     if (c->ptr && c->ptr < c->end) gc_alloc_block_dirty((uint32_t)(((uintptr_t)c->ptr - (uintptr_t)g_cage_base) >> GC_BLOCK_SHIFT));
     c = &g_cclass_old[cls];
     if (c->ptr && c->ptr < c->end) gc_alloc_block_dirty((uint32_t)(((uintptr_t)c->ptr - (uintptr_t)g_cage_base) >> GC_BLOCK_SHIFT));
+    c = &g_cclass_sized[cls];
+    if (c->ptr && c->ptr < c->end) gc_alloc_block_dirty((uint32_t)(((uintptr_t)c->ptr - (uintptr_t)g_cage_base) >> GC_BLOCK_SHIFT));
   }
 }
 /* A run of `n` never-used blocks at the frontier, committed on the way. */
@@ -453,7 +461,7 @@ static void gc_payload_zap_run(char* p, size_t n){
   if (g_gc_zap) memset(p, 0xDD, n);
   GC_PAYLOAD_POISON(p, n);
 }
-static char* gc_space_refill(gc_pclass* classes, uint8_t state, unsigned cls, int log_runs){
+static char* gc_space_refill_z(gc_pclass* classes, uint8_t state, unsigned cls, int log_runs, int zero){
   gc_pclass* c = &classes[cls];
   uint32_t size = g_pclass_size[cls];
   char* ptr; char* end;
@@ -463,7 +471,7 @@ static char* gc_space_refill(gc_pclass* classes, uint8_t state, unsigned cls, in
       c->ptr = ptr; c->end = end;
       if (state == GC_BLK_CELL) gc_alloc_block_dirty(bi);
       if (log_runs) gc_payload_log_run(ptr, end, size);
-      if (GC_CELL_RUNS_ZEROED && state == GC_BLK_CELL) memset(ptr, 0, (size_t)(end - ptr));
+      if (zero && GC_CELL_RUNS_ZEROED && state == GC_BLK_CELL) memset(ptr, 0, (size_t)(end - ptr));
       return ptr;
     }
     c->scan = g_blocks[bi].next;
@@ -480,10 +488,13 @@ static char* gc_space_refill(gc_pclass* classes, uint8_t state, unsigned cls, in
   c->ptr = gc_block_base(bi); c->end = c->ptr + (size_t)ncells * size;
   if (state == GC_BLK_CELL) gc_alloc_block_dirty(bi);
   /* a block from the free list may hold a released run's old bytes */
-  if (GC_CELL_RUNS_ZEROED && state == GC_BLK_CELL) memset(c->ptr, 0, (size_t)ncells * size);
+  if (zero && GC_CELL_RUNS_ZEROED && state == GC_BLK_CELL) memset(c->ptr, 0, (size_t)ncells * size);
   GC_PAYLOAD_POISON(c->ptr, (size_t)ncells * size);
   if (log_runs) gc_payload_log_run(c->ptr, c->end, size);
   return c->ptr;
+}
+static char* gc_space_refill(gc_pclass* classes, uint8_t state, unsigned cls, int log_runs){
+  return gc_space_refill_z(classes, state, cls, log_runs, 1);
 }
 static char* gc_payload_refill(unsigned cls){ return gc_space_refill(g_pclass, GC_BLK_PAYLOAD, cls, GC_PAYLOAD_CHECKED); }
 static inline void gc_payload_mark_small(uint32_t bi, uintptr_t off_in_block){
@@ -613,6 +624,22 @@ static inline void* gc_cell_alloc(size_t bytes, int old, size_t* cap){
     uintptr_t off = (uintptr_t)(p - g_cage_base);
     gc_payload_mark_small((uint32_t)(off >> GC_BLOCK_SHIFT), off & (GC_BLOCK_BYTES - 1u));
   }
+  return p;
+}
+/* A young class instance's cell from the unzeroed runs (GC_CELL_RUNS_ZEROED
+   only; under ASan every cell is zeroed when handed out, as before). */
+static inline void* gc_cell_alloc_sized(size_t bytes, size_t* cap){
+  if (TS_RT_UNLIKELY(!GC_CELL_RUNS_ZEROED || bytes > GC_PAYLOAD_SMALL_MAX)) return gc_cell_alloc(bytes, 0, cap);
+  if (TS_RT_UNLIKELY(!g_cage_base)) gc_cage_init();
+  unsigned cls = g_pclass_of[(bytes + 15u) >> 4];
+  gc_pclass* c = &g_cclass_sized[cls];
+  size_t size = g_pclass_size[cls];
+  *cap = size;
+  char* p = c->ptr;
+  if (TS_RT_UNLIKELY(!p || p + size > c->end)) p = gc_space_refill_z(g_cclass_sized, GC_BLK_CELL, cls, 0, 0);
+  c->ptr = p + size;
+  if (g_conservative_roots) gc_alloc_bit_set(p);
+  GC_PAYLOAD_UNPOISON(p, size);
   return p;
 }
 static inline gc_block* gc_cell_block(const ts_gc_header* h){
@@ -776,6 +803,8 @@ static void gc_payload_after_collection(int full){
     gc_pclass* cc = &g_cclass[cls];
     cc->ptr = cc->end = NULL; cc->scan = cc->head;
     cc = &g_cclass_old[cls];
+    cc->ptr = cc->end = NULL; cc->scan = cc->head;
+    cc = &g_cclass_sized[cls];
     cc->ptr = cc->end = NULL; cc->scan = cc->head;
   }
   uint32_t l = g_large_head;
@@ -2121,9 +2150,27 @@ static tsv ts_new_sized_impl(size_t size, int pretenured){
      the addition cache and the inline caches instead of dictionary entries. */
   if (size == sizeof(ts_sized_head) && g_empty_class_plain)
     return ts_new_object_impl(pretenured, TS_EMPTY_CLASS_SLOTS);
-  ts_object* o = pretenured
-    ? gc_alloc_pretenured(size, TS_KIND_OBJECT)
-    : gc_alloc(size, TS_KIND_OBJECT);
+  if (!pretenured){
+    /* A young instance from the unzeroed runs: every byte of the prefix is
+       written here (the generated code writes every field), the flag and
+       the extent before anything can remember the cell. */
+    gc_before_alloc();
+    G0_ALLOC(TS_KIND_OBJECT, size);
+    RT_STAT_INC(kind_alloc[TS_KIND_OBJECT]); RT_STAT_ADD(kind_bytes[TS_KIND_OBJECT], size);
+    size_t cap;
+    ts_sized_head* sh = (ts_sized_head*)gc_cell_alloc_sized(size, &cap);
+    gc_account_alloc(size, cap);
+    sh->h.kind = TS_KIND_OBJECT; sh->h.mark = 0; sh->h.gen = TS_GEN_YOUNG; sh->h.flags = 0;
+    sh->h.pin_word = 0;
+    ts_hdr_init_sized(&sh->h, size);   /* the flag and the extent, through the helper */
+    sh->proto = TS_UNDEFINED; sh->cls = 0; sh->shape = TS_SHAPE_NONE; sh->dyn = NULL;
+    if (TS_RT_UNLIKELY(((g_young_log_kinds >> TS_KIND_OBJECT) & 1u) || size > GC_PAYLOAD_SMALL_MAX)) gc_young_log_push(&sh->h);
+    g_young_fresh_bytes += size;
+    g_young_new_since_minor++;
+    RT_STAT_INC(young_alloc);
+    return ts_obj((ts_object*)sh);
+  }
+  ts_object* o = gc_alloc_pretenured(size, TS_KIND_OBJECT);
   /* The flag and the extent before anything can remember the cell (the
      site path's prototype barrier). */
   ts_hdr_init_sized(&o->h, size);
@@ -6023,8 +6070,8 @@ static void gc_cells_sweep_old(void){
   if (!g_cage_base) return;
   for (int cls = 0; cls < g_pclass_n; cls++){
     uint32_t size = g_pclass_size[cls];
-    for (int set = 0; set < 2; set++)
-    for (uint32_t l = (set ? g_cclass_old : g_cclass)[cls].head; l; l = g_blocks[l - 1u].next){
+    for (int set = 0; set < 3; set++)   /* the young, old and unzeroed-sized families */
+    for (uint32_t l = (set == 0 ? g_cclass : set == 1 ? g_cclass_old : g_cclass_sized)[cls].head; l; l = g_blocks[l - 1u].next){
       uint32_t bi = l - 1u;
       uint64_t* bm = gc_block_bitmap(bi);
       char* base = gc_block_base(bi);
@@ -6147,8 +6194,8 @@ static void g0_dump(FILE* out){
   static const char* full_phases[6] = { "mark", "weak", "remset_reset", "old_sweep", "young_sweep", "rewrite_rest" };
   if (g0_fates_on() && g_cage_base){
     for (int cls = 0; cls < g_pclass_n; cls++)
-      for (int set = 0; set < 2; set++)
-    for (uint32_t l = (set ? g_cclass_old : g_cclass)[cls].head; l; l = g_blocks[l - 1u].next){
+      for (int set = 0; set < 3; set++)   /* the young, old and unzeroed-sized families */
+    for (uint32_t l = (set == 0 ? g_cclass : set == 1 ? g_cclass_old : g_cclass_sized)[cls].head; l; l = g_blocks[l - 1u].next){
         const uint64_t* bm = gc_block_bitmap(l - 1u);
         for (uint32_t w = 0; w < GC_BLOCK_BITMAP_WORDS; w++)
           for (uint64_t bits = bm[w]; bits; bits &= bits - 1u){
@@ -11091,13 +11138,16 @@ tsv ts_construct(tsv ctorv, tsv* args, int n){
   tsv proto = ((ts_func*)ts_ptr(ctorv))->prototype_prop;
   ((ts_object*)ts_ptr(inst))->proto = ts_is_obj(proto) ? proto : g_class_proto_tab[cid];
   if (cid < g_class_index_n) ((ts_object*)ts_ptr(inst))->cls = g_class_index_tab[cid];
-  /* Boxed fields start as undefined (the zeroed instance memory would read as
-     the number 0); generated allocation sites do the same inline. */
+  /* Boxed fields start as undefined and numeric ones at zero (a young
+     instance's run is not zeroed, docs/alloc_inline_design.md); generated
+     allocation sites do the same inline. */
   if (g_class_fields[cid]){
     ts_class_field* cf = g_class_fields[cid];
     char* base = (char*)ts_ptr(inst);
-    for (int i = 0; i < g_class_nfields[cid]; i++)
+    for (int i = 0; i < g_class_nfields[cid]; i++){
       if (!cf[i].numeric) *(tsv*)(base + cf[i].offset) = TS_UNDEFINED;
+      else memset(base + cf[i].offset, 0, sizeof(tsv));
+    }
   }
   ts_gc_root(&inst);
   int m = n + 1;
