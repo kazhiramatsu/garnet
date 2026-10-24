@@ -9303,3 +9303,9 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   Caveat recorded: generated symbols carry the exporter's sequential id, so an
   edit early in a program renumbers the functions after it and a stale profile
   misses them; stable names are a follow-up.
+- The direct comparison after the slice (scriptc's native tsc-ts against
+  garnet's trained build, both `--singleThreaded`, interleaved, eight pairs):
+  18.33 G instructions, 4.50 G cycles, 1.03 s against 18.86 G (1.029), 4.41 G
+  (0.980), 1.01 s (0.981). The first garnet build of the session under
+  scriptc's wall time; 2.9% more instructions, 2% fewer cycles. Session start:
+  33.44 G and 1.74 s against the same 18.3 G.

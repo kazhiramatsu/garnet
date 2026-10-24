@@ -135,6 +135,11 @@ an A/B of two profile-guided builds resolves a slice of a few tenths of a
 percent. A profile from a different input (tsc-ts compiling the 11.8k-line
 analyzer_ts project, which it does not even type-check cleanly) keeps about
 half the gain: 8.9% fewer instructions than plain, 8.6% more than the
-in-sample profile. scriptc runs the same workload in 18.3 G instructions and
-1.05 s (session 352, measured earlier); the trained build is within 3% of its
-instruction count.
+in-sample profile.
+
+Against scriptc's native tsc-ts directly (the same checkout's
+`packages/tsc-ts/dist/tsc`, both `--singleThreaded`, interleaved, eight
+pairs): scriptc 18.33 G instructions, 4.50 G cycles, 1.03 s; garnet's trained
+build 18.86 G (1.029), 4.41 G (0.980), 1.01 s (0.981). The first build of the
+session to finish the workload in less time than scriptc; 2.9% more
+instructions, 2% fewer cycles.
