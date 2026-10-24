@@ -52,3 +52,33 @@ objects, after deletion, through prototypes, into class instances' fields
 and dynamic properties, with minor collections forced between the writes
 and the reads (`TSAOT_GC_YOUNG_THRESHOLD=1`, a tiny nursery, forced full
 collections), and the GC stress gate.
+
+## Sized instances: a field mask per remembered cell (session 352, GC v3 G3; measured, not kept)
+
+The card byte above belongs to plain objects; a sized class instance keeps
+its struct extent in that byte and is remembered whole, and its fields are
+where tsc-ts writes most of its old-to-young edges: of 833 k enrollments per
+compile, 1.375 M whole-cell marks and 121 precise scans
+(`docs/gc_v3_plan.md`, G2). Two forms of a field mask per remembered sized
+instance were built (a 32-bit mask per remembered-set entry; the typed field
+store's barrier names the field's ordinal in the class's registered table
+and sets one bit; the minor collection rescans only the masked fields):
+
+- with a hash from the cell to its entry so a later store merges its bit;
+- without the hash, a later store appending another entry for the cell.
+
+Both did what they should by the statistics (minor collections 99 -> 94,
+pauses 106.6 -> 85.2 ms, the minor mark 57.0 -> 41.1 ms, 613 k precise
+rescans visiting one slot each, 3 k whole-cell marks left of 1.375 M) and
+neither paid on the clock: against a control binary with the same generated
+code and the whole-cell barrier (eight quiet pairs each), the hash form cost
++1.45% cycles for -0.23% instructions and the append form +0.77% cycles for
++0.46% instructions (its own knob off against on: +2.4% cycles). The
+rescans the statistics count are cheaper than they look (the fields of a
+just-written cell are in cache, and most of their edges are filtered at the
+old boundary), and the barrier's extra work at a million stores costs more
+than the rescans it saves. The fixture `gc/remembered_fields` (young values
+into the first field, a middle one, the 31st, the 32nd and one beyond, a
+subclass's field, a dynamic store into a field, a sidecar property, a
+prototype write and a stored method, with collections between the writes
+and the reads) stays as a test of the whole-cell path.

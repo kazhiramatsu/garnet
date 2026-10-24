@@ -9196,3 +9196,21 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   override). Not a factor: malloc (about 30 k frees per compile against 7.4 M
   cell allocations; every cell and owned buffer comes from the cage's size
   classes).
+- GC v3 slice G3 (measured and not kept; `docs/gc_v3_plan.md`,
+  `docs/remembered_slots_design.md` last section): the minor mark looked like
+  the remembered set (833 k old cells enrolled per compile, rescanned whole:
+  1.375 M whole-cell marks, 121 precise scans), so a 32-bit field mask per
+  remembered sized instance was built in two forms (the typed field store's
+  barrier names the field's ordinal in the class's registered table and sets
+  one bit; the minor collection rescans only the masked fields; a later store
+  either merges its bit through a hash from the cell to its entry, or appends
+  another entry). Both did what they should by the statistics (minor
+  collections 99 -> 94, pauses 106.6 -> 85.2 ms, the minor mark 57.0 -> 41.1
+  ms, 613 k precise rescans of one slot each) and neither paid on the clock
+  against a control binary with the same generated code (eight quiet pairs:
+  +1.45% and +0.77% cycles): the rescans of just-written cells are cheaper
+  than their count suggests, the barrier's bookkeeping at a million stores
+  costs more. Reverted; the fixture gc/remembered_fields stays (young values
+  into the first, a middle, the 31st, the 32nd and a further field, a
+  subclass's field, a dynamic store, a sidecar property, a prototype write and
+  a stored method, with collections between the writes and the reads).

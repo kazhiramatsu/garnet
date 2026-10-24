@@ -97,6 +97,16 @@ Quiet, eight pairs each, the current build against itself:
   masked fields of a remembered sized instance (a 32-bit mask: one bit per
   field for the first 31, the last bit for every field beyond). The generic
   barrier (slot unknown) sets every bit, as today's full mark does.
+  Measured and not kept (session 352): two forms of the field mask (a hash
+  from the cell to its entry, or another entry per later store) both cut the
+  collector's own work as the statistics say (minor collections 99 -> 94,
+  pauses 106.6 -> 85.2 ms, the minor mark 57.0 -> 41.1 ms, 613 k precise
+  rescans of one slot each) and neither paid on the clock against a control
+  binary with the same generated code: +1.45% and +0.77% cycles over eight
+  quiet pairs. The whole-cell rescans of just-written cells are cheaper than
+  their count suggests and the barrier's bookkeeping at a million stores
+  costs more (`docs/remembered_slots_design.md`, the last section). The
+  remembered set is not where the collector's remaining time is.
 - **G4: the minor collection's fixed costs.** The root scan, the frame walk,
   the young log and the sweep per collection; fewer collections (a nursery
   sized by the survival rate) only if G2 shows these dominate.
