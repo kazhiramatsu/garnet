@@ -228,6 +228,17 @@ pub fn run_sroa(program: &mut Program, result: &EscapeResult) {
         }
         let _ = fid;
     }
+    // Session 353: the free-function inlining cascades. A helper that only
+    // became inlinable once its own calls were inlined above (`isRef(t) {
+    // return (getObjectFlags(t) & 4) !== 0 }`) is inlined into its callers in
+    // up to two more rounds over the rewritten bodies (TSAOT_INLINE_IF=0: none).
+    if inline_if_enabled() {
+        for _round in 0..2 {
+            if !inline_free_calls_round(program) {
+                break;
+            }
+        }
+    }
 }
 
 /// A fresh local holding undefined, for a parameter an inlined call does not
@@ -2303,11 +2314,19 @@ fn callee_touches_param0_fields(f: &Function) -> bool {
         Some(p) => p.0,
         None => return false,
     };
-    f.body.iter().any(|inst| match inst {
-        Inst::LoadField { obj, .. } => obj.0 == p0,
-        Inst::StoreField { obj, .. } => obj.0 == p0,
-        _ => false,
-    })
+    fn touches(body: &[Inst], p0: u32) -> bool {
+        body.iter().any(|inst| match inst {
+            Inst::LoadField { obj, .. } => obj.0 == p0,
+            Inst::StoreField { obj, .. } => obj.0 == p0,
+            Inst::If {
+                then_body,
+                else_body,
+                ..
+            } => touches(then_body, p0) || touches(else_body, p0),
+            _ => false,
+        })
+    }
+    touches(&f.body, p0)
 }
 
 fn callee_param_field_only_sroa_safe(
@@ -2320,6 +2339,17 @@ fn callee_param_field_only_sroa_safe(
         None => return false,
     };
     let field_ok = |field: FieldId| class_fields.iter().any(|f| *f == field.0);
+    // a body with control flow or calls (admitted by the inliner since Session
+    // 353) is not scanned here: its nested uses of the parameter are not seen,
+    // so the parameter's object is not scalar-replaced (as before that session)
+    if f.body.iter().any(|i| {
+        matches!(
+            i,
+            Inst::If { .. } | Inst::Loop { .. } | Inst::TryCatch { .. } | Inst::Call { .. } | Inst::CallBuiltin { .. } | Inst::CallBuiltinStatic { .. }
+        )
+    }) {
+        return false;
+    }
     for inst in &f.body {
         match inst {
             Inst::LoadField { dst, obj, field, .. } => {
@@ -2544,8 +2574,8 @@ fn is_inlinable_free_fn(f: &Function) -> bool {
     if f.is_generator || f.is_async || f.rest_param.is_some() {
         return false;
     }
-    const MAX_BODY: usize = 8;
-    if f.body.len() > MAX_BODY {
+    let max_body: usize = if inline_if_enabled() { 10 } else { 8 };
+    if f.body.len() > max_body {
         return false;
     }
     let is_param = |id: u32| f.params.iter().any(|p| p.0 == id);
@@ -2565,16 +2595,216 @@ fn is_inlinable_free_fn(f: &Function) -> bool {
                 }
             }
             Inst::StoreField { .. } => {}
+            // an `if` of the same kinds (a `?:`, `&&` or `||` lowered: the helper
+            // `getObjectFlags(t) { return t.flags & F ? t.objectFlags : 0 }`)
+            Inst::If {
+                then_body,
+                else_body,
+                ..
+            } if inline_if_enabled() => {
+                let mut budget = 24usize;
+                if !inlinable_pure_body(then_body, &|d| is_param(d), &mut budget)
+                    || !inlinable_pure_body(else_body, &|d| is_param(d), &mut budget)
+                {
+                    return false;
+                }
+            }
+            // (A call inside the body was tried in Session 353: a body holding a
+            // method call on an interface-typed parameter miscompiled when
+            // inlined, and the compiler project ran 0.6% more instructions.)
             Inst::Return { .. } => {
                 returns += 1;
                 if i != f.body.len() - 1 {
                     return false;
                 }
             }
-            _ => return false, // any control flow / call / alloc / effect -> not inlinable
+            _ => return false, // any other control flow / call / alloc / effect -> not inlinable
         }
     }
     returns <= 1
+}
+/// One round of free-function inlining over the whole program with the bodies
+/// as they are now: a Direct call without a receiver to a function that
+/// is_inlinable_free_fn admits is replaced by its body. Whether anything was
+/// inlined.
+fn inline_free_calls_round(program: &mut Program) -> bool {
+    let bodies: BTreeMap<u32, Function> = program
+        .functions
+        .iter()
+        .map(|f| (f.id.0, f.clone()))
+        .collect();
+    let mut any = false;
+    for fi in 0..program.functions.len() {
+        let fid = program.functions[fi].id.0;
+        let mut next = program.functions[fi]
+            .locals
+            .iter()
+            .map(|l| l.id.0)
+            .max()
+            .map_or(0, |m| m + 1);
+        let mut new_locals = Vec::new();
+        let body = std::mem::take(&mut program.functions[fi].body);
+        let mut changed = false;
+        let out = inline_free_calls_in(&body, fid, &bodies, &mut next, &mut new_locals, &mut changed);
+        program.functions[fi].body = out;
+        program.functions[fi].locals.extend(new_locals);
+        any |= changed;
+    }
+    any
+}
+fn inline_free_calls_in(
+    body: &[Inst],
+    cur_fn: u32,
+    bodies: &BTreeMap<u32, Function>,
+    next: &mut u32,
+    new_locals: &mut Vec<Local>,
+    changed: &mut bool,
+) -> Vec<Inst> {
+    let mut out = Vec::with_capacity(body.len());
+    for inst in body {
+        match inst {
+            Inst::Call {
+                dst,
+                callee: CalleeRef::Direct { func },
+                recv: None,
+                args,
+                ..
+            } => {
+                if let Some(callee) = bodies.get(&func.0) {
+                    if callee.id.0 != cur_fn
+                        && is_inlinable_free_fn(callee)
+                        && args.len() == callee.params.len()
+                    {
+                        inline_free_fn(callee, args, *dst, next, new_locals, &mut out, None);
+                        *changed = true;
+                        continue;
+                    }
+                }
+                out.push(inst.clone());
+            }
+            Inst::Call {
+                dst,
+                callee: CalleeRef::Direct { func },
+                recv: Some(r),
+                args,
+                ..
+            } => {
+                if let Some(callee) = bodies.get(&func.0) {
+                    if callee.id.0 != cur_fn
+                        && is_inlinable_free_fn(callee)
+                        && !callee_touches_param0_fields(callee)
+                        && !captures_this(callee)
+                        && args.len() + 1 == callee.params.len()
+                    {
+                        let mut eff: Vec<LocalId> = Vec::with_capacity(args.len() + 1);
+                        eff.push(*r);
+                        eff.extend(args.iter().copied());
+                        inline_free_fn(callee, &eff, *dst, next, new_locals, &mut out, None);
+                        *changed = true;
+                        continue;
+                    }
+                }
+                out.push(inst.clone());
+            }
+            Inst::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                let mut r = inst.clone();
+                if let Inst::If {
+                    then_body: t,
+                    else_body: e,
+                    ..
+                } = &mut r
+                {
+                    *t = inline_free_calls_in(then_body, cur_fn, bodies, next, new_locals, changed);
+                    *e = inline_free_calls_in(else_body, cur_fn, bodies, next, new_locals, changed);
+                }
+                out.push(r);
+            }
+            Inst::Loop {
+                cond_body, body: lb, ..
+            } => {
+                let mut r = inst.clone();
+                if let Inst::Loop {
+                    cond_body: c,
+                    body: b,
+                    ..
+                } = &mut r
+                {
+                    *c = inline_free_calls_in(cond_body, cur_fn, bodies, next, new_locals, changed);
+                    *b = inline_free_calls_in(lb, cur_fn, bodies, next, new_locals, changed);
+                }
+                out.push(r);
+            }
+            Inst::TryCatch {
+                try_body,
+                catch_body,
+                finally_body,
+                ..
+            } => {
+                let mut r = inst.clone();
+                if let Inst::TryCatch {
+                    try_body: tb,
+                    catch_body: cb,
+                    finally_body: fb,
+                    ..
+                } = &mut r
+                {
+                    *tb = inline_free_calls_in(try_body, cur_fn, bodies, next, new_locals, changed);
+                    *cb = inline_free_calls_in(catch_body, cur_fn, bodies, next, new_locals, changed);
+                    *fb = inline_free_calls_in(finally_body, cur_fn, bodies, next, new_locals, changed);
+                }
+                out.push(r);
+            }
+            _ => out.push(inst.clone()),
+        }
+    }
+    out
+}
+/// TSAOT_INLINE_IF=0: a free function whose body holds an `if` is not inlined,
+/// as before Session 353 (the parity oracle runs the frozen emitter's rule).
+fn inline_if_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| !matches!(std::env::var("TSAOT_INLINE_IF").as_deref(), Ok("0")))
+}
+/// A nested body an inlinable free function may hold: the straight-line kinds and
+/// `if`s of them, within a budget of instructions in all; no return (a return in a
+/// branch would need the rest of the body skipped), no call, no loop, no
+/// allocation; a write to a parameter is rejected as at the top level.
+fn inlinable_pure_body(body: &[Inst], is_param: &dyn Fn(u32) -> bool, budget: &mut usize) -> bool {
+    for inst in body {
+        if *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+        match inst {
+            Inst::Const { dst, .. }
+            | Inst::BinOp { dst, .. }
+            | Inst::UnOp { dst, .. }
+            | Inst::Copy { dst, .. }
+            | Inst::LoadField { dst, .. } => {
+                if is_param(dst.0) {
+                    return false;
+                }
+            }
+            Inst::StoreField { .. } => {}
+            Inst::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                if !inlinable_pure_body(then_body, is_param, budget)
+                    || !inlinable_pure_body(else_body, is_param, budget)
+                {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Inline a small straight-line free function: params -> args, locals fresh, and
@@ -2606,7 +2836,20 @@ fn inline_free_fn(
         subst.insert(l.id.0, nl);
     }
     let m = |id: LocalId| -> LocalId { LocalId(*subst.get(&id.0).unwrap_or(&id.0)) };
-    for inst in &callee.body {
+    inline_free_splice(&callee.body, &m, scalar_param_fields, dst, out, true);
+}
+/// The callee's instructions remapped into the caller: a trailing Return (top
+/// level only) becomes a Copy into the call's destination; an `if` is remapped
+/// with its bodies spliced the same way.
+fn inline_free_splice(
+    body: &[Inst],
+    m: &dyn Fn(LocalId) -> LocalId,
+    scalar_param_fields: Option<&BTreeMap<u32, BTreeMap<u32, u32>>>,
+    dst: Option<LocalId>,
+    out: &mut Vec<Inst>,
+    top: bool,
+) {
+    for inst in body {
         match inst {
             Inst::Const { dst: d, value } => out.push(Inst::Const {
                 dst: m(*d),
@@ -2677,9 +2920,32 @@ fn inline_free_fn(
                     cls: *cls,
                 });
             }
+            Inst::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                let mut r = remap_inst_operands(inst, m);
+                if let Inst::If {
+                    then_body: t,
+                    else_body: e,
+                    ..
+                } = &mut r
+                {
+                    let mut tb = Vec::new();
+                    inline_free_splice(then_body, m, scalar_param_fields, None, &mut tb, false);
+                    let mut eb = Vec::new();
+                    inline_free_splice(else_body, m, scalar_param_fields, None, &mut eb, false);
+                    *t = tb;
+                    *e = eb;
+                }
+                out.push(r);
+            }
             Inst::Return { src } => {
-                if let (Some(d), Some(s)) = (dst, src) {
-                    out.push(Inst::Copy { dst: d, src: m(*s) });
+                if top {
+                    if let (Some(d), Some(s)) = (dst, src) {
+                        out.push(Inst::Copy { dst: d, src: m(*s) });
+                    }
                 }
             }
             _ => {} // unreachable: is_inlinable_free_fn rejects other kinds

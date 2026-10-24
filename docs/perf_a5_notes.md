@@ -64,6 +64,40 @@ contains `AllocObject`, `Class0 sobj`, or `ts_ptr` field access.
 The benchmark budget is tightened again from 240ms to 140ms so a return to the
 old stack-materialized path is caught.
 
+## Free-function inlining extended: pure ifs, cascading rounds (Session 353)
+
+The inliner took straight-line free functions only (at most eight constants,
+copies, arithmetic, field loads and stores and a trailing return). The tsc
+pattern kernels showed the cost: `small_calls` (`getObjectFlags(t) { return
+t.flags & F ? t.objectFlags : 0 }`, `pick(a, b) { return a.id < b.id ? a :
+b }`) ran 2.65x scriptc's instructions, and inlining its helpers by hand
+took it from 20.6 to 13.3 G. Now:
+
+- A body may hold `if`s whose branches are of the same straight-line kinds
+  (a `?:`, `&&` or `||` lowered), no return inside a branch, within a budget
+  of 24 instructions in all and 10 at the top level (`inlinable_pure_body`);
+  the splice remaps the branches (`inline_free_splice`).
+- The inlining cascades: a helper that only became inlinable once its own
+  calls were inlined (`isRef(t) { return (getObjectFlags(t) & 4) !== 0 }`)
+  is inlined into its callers in up to two more rounds over the rewritten
+  bodies (`inline_free_calls_round`), free functions and methods whose
+  bodies do not touch the receiver's fields alike.
+- The two parameter scans the SROA of argument objects relies on
+  (`callee_param_field_only_sroa_safe`, `callee_touches_param0_fields`) see
+  the nested bodies: the first declines any body with control flow or a call
+  (the parameter's object is not scalar-replaced, as before), the second
+  looks into the branches.
+
+Tried and removed: admitting calls inside an inlined body. The compiler
+project ran 0.6% more instructions, and a body holding a method call on an
+interface-typed parameter (fixture object_methods/interface_dispatch)
+miscompiled when inlined; the cause was not analyzed.
+
+Measured (instructions): `small_calls` 20.63 to 15.83 G (scriptc 7.80),
+`class_nodes` 4.51 to 4.34 G; the compiler's one-checker compile 0.9991
+(neutral). `TSAOT_INLINE_IF=0` keeps the straight-line rule, and the parity
+oracle (`scripts/emitc_diff.sh`) runs with it.
+
 ## Deferred
 - Nothing material remains for typed_field_kernel. Allocation/GC churn work should
   move to array/object churn kernels where the allocations still exist; for

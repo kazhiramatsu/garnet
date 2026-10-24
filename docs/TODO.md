@@ -9486,3 +9486,14 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   (instructions): flags_truthy 2.62, small_calls 2.65, callbacks 2.52,
   tree_recursion 2.26, class_nodes 2.00, switch_dispatch 1.92,
   class_enum_fields 1.81.
+- Slice P8 (analyzer; `docs/perf_a5_notes.md` "Free-function inlining
+  extended"): the IR inliner takes free functions whose bodies hold pure `if`s
+  (a `?:`, `&&` or `||` lowered; no return in a branch; 24 instructions in all),
+  and cascades in up to two more rounds over the rewritten bodies (a helper
+  whose own call was inlined becomes inlinable; methods that do not touch the
+  receiver's fields too). The SROA parameter scans now see nested bodies
+  conservatively. Tried and removed: calls inside an inlined body (+0.6%
+  instructions on tsc-ts and a miscompile of object_methods/interface_dispatch).
+  Measured: `small_calls` 20.63 to 15.83 G instructions, `class_nodes` 4.51 to
+  4.34; tsc-ts one checker 0.9991 (neutral), outputs identical.
+  `TSAOT_INLINE_IF=0` keeps the old rule (the parity oracle runs with it).
