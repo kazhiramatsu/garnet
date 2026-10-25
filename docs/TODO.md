@@ -9663,3 +9663,67 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   script's default `TSAOT_NATIVE_CC` is `-O0` (the README passes the measured
   flags); `src/compiler` is 78 files and 10 MB (249 was the parsed file count
   with the lib declarations).
+- Measured and not adopted (two probes of the fresh checker profile, prof8
+  build of 17de039: generated code 68%, runtime 23%, the top function 2.3%
+  and the top line 1.5%). (1) The hoisted `charCodeAt` read with an integer
+  index local emitted as one unsigned compare instead of the double form:
+  `string_scan` 3.910 -> 3.918 G instructions (clang already folds the double
+  compares of an integer index); reverted. (2) A ceiling for the shaped-object
+  probes (`ts_static_slot_probe`, `ts_prop_ic_probe_fixed_inline`): the probe
+  rows in static arrays (a link-time constant base, no pointer load) and no
+  kind test (unsound for proxies, promises, coroutines, accessors and symbols,
+  whose cells have no shape word). `small_calls` 15.84 -> 13.79 G
+  instructions (-13%), cycles -19%: the kernel's 2x against scriptc is the
+  field read of an interface-typed object literal, about 14 instructions and
+  5 loads (kind, shape, the probe table's base, the key, inline_cap) against a
+  struct load; the helper calls themselves are inlined. tsc-ts one checker:
+  instructions 0.9990, cycles 0.974 (three runs, loaded machine). Not pursued
+  for tsc-ts; the sound form for the kernel class later: `ts_obj_common` as
+  the prefix of every heap kind (then the kind test is implied by the shape),
+  the probe rows as a static table sized for the shape id space (2^24 ids at
+  64 bytes a row is 1 GB of zero-fill BSS per table, or a smaller space with
+  the worker ranges resized), a measurement first.
+- Slice (analyzer, exporter, runtime; `docs/int32_fields_design.md`
+  "Store-proven fields"): `number` class fields whose every static store is an
+  integer become integer slots (kind 3: any integer within 2^53; a dynamic
+  store of a fraction throws a TypeError naming the field, the README's known
+  difference), by an optimistic whole-program fixpoint over the stores
+  (`infer_int_store_fields`: the candidates are the number-tagged fields of
+  stable declaring classes; a store refutes through the receiver local's
+  class and the hint; only live functions refute, the inliner keeping the
+  bodies of inlined callees; constructor `this` resolved by `func_class`).
+  Capture-context fields (`__ctx_*`) are typed `number`/`int32` by the
+  variable's declared type when every store is checker-vouched
+  (`collectUnsafeFieldStores` marks variables too; names carry the variable:
+  `c5337_nextAutoGenerateId`), so module-level and closure counters are
+  unboxed and provable. The parameter-fact solver caches each caller's
+  contributions (tsc-ts's analysis 41 -> 31 s; with the pass 36 s). Found and
+  fixed on the way: the struct layout decided an integer member by the tag
+  while the descriptor followed the proof (a dynamic store wrote integer bits
+  into a double member: `nextAutoGenerateId` read as 4607182418800017400);
+  an unstable class (no struct access) got kind-3 descriptors with no store
+  examined (`PreparedBatch.parseMs` received 0.672 ms in a parse worker);
+  dead inlined bodies refuted fields; `int32_field_loads` resolved only by
+  the hint (now the local's class first, as the emitter). tsc-ts: 262 of 457
+  candidates proven (Node.pos/end/id, Type.id, Signature.id, the scanner's
+  positions, the counters; Symbol.id stays a double: `takeSymbolId`'s
+  conditional return has no i64 fact; constructor parameters have no facts
+  since `new` makes a constructor indirect). One checker, plain builds:
+  instructions 0.9927, cycles 0.9950, outputs identical at one and ten
+  checkers. Kernels: `class_nodes` 4.34 -> 3.80 G instructions,
+  `closures_env` 4.77 -> 4.41, `tree_recursion` and `class_enum_fields`
+  unchanged. Fixture `classes/int_store_fields` (plain and strict; a parity
+  allowlist line: the frozen emitter lists the reassigned inherited field
+  twice, as in classes/redeclared_field_slots). Knobs
+  `TSAOT_INT_STORE_FIELDS=0`, `TSAOT_TYPED_CTX_FIELDS=0`; logs
+  `TSAOT_INT_STORE_FIELDS_LOG=1|2`, `TSAOT_PARAM_FACTS_LOG=1`.
+- Found (not fixed): a generic class's specialization clone (`C$number`) has
+  methods that can run on an instance of the base or of another clone
+  (`new C(f(this.value))` inside the clone's `map` creates the `$U` clone, and
+  the result's static type dispatches the next `.map` to `$number`); a typed
+  slot then reads the other layout. A double slot survives by the NaN-boxing
+  representation of numbers (fixture `types/generic_class_callbacks` passed),
+  an integer slot read 2.0 as its bits, and a string in such a slot would
+  read garbage today. The store-proven pass excludes clones; the real fix is
+  a receiver-class guard on dispatch to a clone's method (or one layout for
+  the base and its clones).

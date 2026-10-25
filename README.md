@@ -494,6 +494,10 @@ wrong, which the TypeScript checker cannot see through an `any`:
   `number` variable, reads as `NaN`; Node.js keeps the value.
 - An integer loop counter that passes 2⁵³ can differ in its last bits, because
   Garnet keeps it as a 64-bit integer where V8 rounds to a double.
+- A `number` class field that every typed store in the program assigns an
+  integer is stored as an integer. A store of a fraction into it through an
+  `any`-typed receiver then throws a TypeError naming the field, where Node.js
+  stores the fraction. `TSAOT_INT_STORE_FIELDS=0` keeps such fields doubles.
 
 Compiling with `--untyped` removes the first three, at a cost in speed.
 

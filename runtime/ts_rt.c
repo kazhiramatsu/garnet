@@ -2598,7 +2598,7 @@ static int g_has_class_regs = 0;
    whether it is an unboxed double via *numeric, and return 1. Else return 0. */
 static int class_field_lookup(ts_object* o, ts_key key, size_t* off, int* numeric);
 static tsv  struct_field_get(ts_object* o, size_t off, int numeric);
-static void struct_field_set(ts_object* o, size_t off, int numeric, tsv v);
+static void struct_field_set(ts_object* o, size_t off, int numeric, tsv v, ts_key key);
 
 /* Find (or create) the ts_prop slot for key. Returns the whole ts_prop* so
    callers can read/set attribute flags. New slots are initialized to
@@ -3628,7 +3628,7 @@ static ts_pref ts_set_named_prop(tsv obj, ts_object* o, ts_key key, tsv val,
     size_t off; int numeric;
     if (class_field_lookup(o, key, &off, &numeric)){
       if (frozen){ ts_throw_readonly_write(obj, key); return PREF_NONE; }
-      struct_field_set(o, off, numeric, val);
+      struct_field_set(o, off, numeric, val, key);
       return PREF_NONE;
     }
   }
@@ -11735,15 +11735,24 @@ void ts_throw_int32_field(double d){
   char msg[128]; snprintf(msg, sizeof msg, "an integer-typed field receives %s", buf);
   ts_throw_type_error_msg(msg);
 }
+void ts_throw_int_field_key(double d, uint32_t key){
+  char buf[64]; ts_fmt_num(d, buf, sizeof buf);
+  const char* nm = ts_field_name(key);
+  char msg[192];
+  if (nm) snprintf(msg, sizeof msg, "the integer-typed field '%s' receives %s", nm, buf);
+  else snprintf(msg, sizeof msg, "an integer-typed field (id %u) receives %s", (unsigned)key, buf);
+  ts_throw_type_error_msg(msg);
+}
 static tsv struct_field_get(ts_object* o, size_t off, int numeric){
   char* base=(char*)o;
-  if (numeric == 2){ long long i; memcpy(&i, base+off, sizeof(long long)); return ts_num((double)i); }
+  if (numeric >= 2){ long long i; memcpy(&i, base+off, sizeof(long long)); return ts_num((double)i); }
   if (numeric){ double d; memcpy(&d, base+off, sizeof(double)); return ts_num(d); }
   tsv v; memcpy(&v, base+off, sizeof(tsv)); return v;
 }
-static void struct_field_set(ts_object* o, size_t off, int numeric, tsv v){
+static void struct_field_set(ts_object* o, size_t off, int numeric, tsv v, ts_key key){
   char* base=(char*)o;
-  if (numeric == 2){ long long i = ts_int32_field_value(ts_to_num(v)); memcpy(base+off, &i, sizeof(long long)); }
+  if (numeric == 2){ long long i = ts_int32_field_value_k(ts_to_num(v), (uint32_t)key); memcpy(base+off, &i, sizeof(long long)); }
+  else if (numeric == 3){ long long i = ts_int_field_value_k(ts_to_num(v), (uint32_t)key); memcpy(base+off, &i, sizeof(long long)); }
   else if (numeric){ double d=ts_to_num(v); memcpy(base+off, &d, sizeof(double)); }
   else { memcpy(base+off, &v, sizeof(tsv)); ts_write_barrier(ts_obj(o), v); }
 }
@@ -11759,7 +11768,7 @@ static int class_reg_nfields(ts_class_reg* r){ return r ? r->nfields : 0; }
 static uint32_t class_reg_field_key(ts_class_reg* r, int i){ return r->fields[i].name_id; }
 static tsv class_reg_field_value(ts_class_reg* r, ts_object* o, int i){
   char* base=(char*)o;
-  if (r->fields[i].numeric == 2){
+  if (r->fields[i].numeric >= 2){
     long long n; memcpy(&n, base+r->fields[i].offset, sizeof(long long));
     return ts_num((double)n);
   }
@@ -16285,7 +16294,7 @@ static void prop_ic_fill_struct(ts_prop_ic* ic, ts_object* o, ts_key key, size_t
 static tsv ts_prop_ic_struct_read(ts_object* o, const ts_prop_location* e){
   /* the slot's kind as the class registered it: 2 an integer slot (a long
      long holding an int32), 1 a double, 0 a boxed value */
-  if (e->numeric == 2){ long long n; memcpy(&n, (char*)o + e->slot, sizeof n); return ts_num((double)n); }
+  if (e->numeric >= 2){ long long n; memcpy(&n, (char*)o + e->slot, sizeof n); return ts_num((double)n); }
   if (e->numeric){ double value; memcpy(&value, (char*)o + e->slot, sizeof value); return ts_num(value); }
   tsv value; memcpy(&value, (char*)o + e->slot, sizeof value); return value;
 }
@@ -16691,7 +16700,7 @@ void ts_set_pic(tsv obj, ts_key key, tsv val, ts_prop_ic* ic){
     if (fe ? fe->found : (ts_obj_is_sized(o) && class_field_lookup(o, key, &off, &numeric))){
       if (fe){ off = fe->offset; numeric = fe->numeric; }
       if (ts_obj_integrity(o) & 1u){ ts_throw_readonly_write(obj, key); return; }
-      struct_field_set(o, off, numeric, val); return;
+      struct_field_set(o, off, numeric, val, key); return;
     }
   }
   /* a sized class instance's boxed or double slot the site has cached by
@@ -16739,7 +16748,7 @@ void ts_set_pic(tsv obj, ts_key key, tsv val, ts_prop_ic* ic){
         TS_RT_STAT_PIC_SET_HIT();
         if (e->kind == TS_PROP_IC_STRUCT){
           if (ts_obj_integrity(o) & 1u){ ts_throw_readonly_write(obj, key); return; }
-          struct_field_set(o, e->slot, e->numeric, val); return;
+          struct_field_set(o, e->slot, e->numeric, val, key); return;
         }
         ts_pref p = { o, e->slot };
         if (pref_is_accessor(p)){
@@ -16768,7 +16777,7 @@ void ts_set_pic(tsv obj, ts_key key, tsv val, ts_prop_ic* ic){
       size_t off; int numeric;
       if (g_has_class_regs && class_field_lookup(o, key, &off, &numeric)){
         if (ts_obj_integrity(o) & 1u){ ts_throw_readonly_write(obj, key); return; }
-        struct_field_set(o, off, numeric, val);
+        struct_field_set(o, off, numeric, val, key);
         prop_ic_fill_struct(ic, o, key, off, numeric); return;
       }
       uint32_t len_before = obj_map(o)->len, shape_before = o->shape;

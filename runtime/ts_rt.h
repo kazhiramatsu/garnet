@@ -2044,12 +2044,27 @@ tsv ts_instanceof_dyn(tsv obj, tsv ctorv);  /* x instanceof <runtime constructor
    (`long long` holding an int32: an enum-typed field, docs/int32_fields_design.md) */
 typedef struct { uint32_t name_id; size_t offset; int numeric; } ts_class_field;
 void ts_throw_int32_field(double d);
+void ts_throw_int_field_key(double d, uint32_t key);   /* names the field */
 /* The value stored into an integer slot: an exact int32, or a TypeError (the
    field's type says an enum member; a program storing 1.5 through a cast is
    refused, never truncated silently). */
 static inline long long ts_int32_field_value(double d){
   long long i = (long long)d;
   if (TS_RT_UNLIKELY((double)i != d || i != (long long)(int32_t)i)) ts_throw_int32_field(d);
+  return i;
+}
+static inline long long ts_int32_field_value_k(double d, uint32_t key){
+  long long i = (long long)d;
+  if (TS_RT_UNLIKELY((double)i != d || i != (long long)(int32_t)i)) ts_throw_int_field_key(d, key);
+  return i;
+}
+/* The value stored into a store-proven integer slot (kind 3): an integer in
+   the safe range, or a TypeError (every static store of the field was proven
+   integral; a dynamic store of a fraction is refused loudly). */
+static inline long long ts_int_field_value_k(double d, uint32_t key){
+  if (TS_RT_UNLIKELY(!(d >= -9007199254740992.0 && d <= 9007199254740992.0))) ts_throw_int_field_key(d, key);
+  long long i = (long long)d;
+  if (TS_RT_UNLIKELY((double)i != d)) ts_throw_int_field_key(d, key);
   return i;
 }
 void ts_register_class(tsv proto, ts_class_field* fields, int nfields);
@@ -2333,7 +2348,7 @@ TS_RT_ALWAYS_INLINE int ts_get_sized_pic_try(tsv obj, ts_key key, const ts_prop_
     if (!c) return 0;
     const char* at = (const char*)o + c->offset;
     if (c->numeric == 0){ memcpy(out, at, sizeof *out); return 1; }
-    if (c->numeric == 2){ long long n; memcpy(&n, at, sizeof n); *out = ts_num((double)n); return 1; }
+    if (c->numeric >= 2){ long long n; memcpy(&n, at, sizeof n); *out = ts_num((double)n); return 1; }
     double d; memcpy(&d, at, sizeof d); *out = ts_num(d); return 1;
   }
   const ts_prop_ic_entry* e = ts_prop_ic_probe_sized_inline(o, key, ic);

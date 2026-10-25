@@ -84,6 +84,11 @@
 #                          instances (legacy IR; the parity corpus uses it).
 #   TSAOT_CAPTURE_CONTEXTS=0  Exporter: one cell per captured variable instead of
 #                          one scope record per activation (legacy IR).
+#   TSAOT_TYPED_CTX_FIELDS=0  Exporter: boxed capture-context fields (a captured
+#                          number variable is an unboxed slot of its record by default)
+#   TSAOT_INT_STORE_FIELDS=0  Analyzer: a number field whose every store is an
+#                          integer stays a double (an integer slot by default;
+#                          TSAOT_INT_STORE_FIELDS_LOG=1 lists the proven fields)
 #   TSAOT_NESTED_DIRECT=0  Exporter: call nested function declarations through
 #                          their closure values instead of directly (legacy IR).
 #   TSAOT_LAZY_FN_DECL=0   Exporter: hoist every function declaration as a

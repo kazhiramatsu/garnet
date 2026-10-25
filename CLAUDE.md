@@ -96,3 +96,7 @@ Rust in §315; selfhost is kept as a performance metric).
 - An `any` value that holds a non-number, assigned to a `number`-typed local, is unboxed in
   typed mode (V8 keeps the value; garnet reads NaN): typed mode trusts the annotation (Session 350
   x53 note).
+- A `number` class field whose every static store is an integer is an integer slot (Session 353,
+  `docs/int32_fields_design.md` "Store-proven fields"); a dynamic store of a fraction into it
+  (`(n as any).pos = 2.5`) throws a TypeError naming the field (V8 stores the fraction).
+  `TSAOT_INT_STORE_FIELDS=0` turns it off.

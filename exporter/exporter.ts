@@ -2378,7 +2378,10 @@ class Exporter {
       const fields = new Map<ts.Symbol, number>();
       const ownFields: string[] = [];
       for (const sym of syms) {
-        const fname = `c${this.bindingIdOf(sym)}`;
+        // the variable's name after the binding id, for diagnostics (the
+        // field name is internal: records are never reflected on)
+        const vname = ((sym as { name?: string }).name ?? "").replace(/[^A-Za-z0-9_$]/g, "");
+        const fname = vname ? `c${this.bindingIdOf(sym)}_${vname}` : `c${this.bindingIdOf(sym)}`;
         ownFields.push(fname);
         fields.set(sym, this.internField(fname));
         this.recordOwnerOf.set(sym, owner);
@@ -2389,6 +2392,26 @@ class Exporter {
         id: classId, name: `__ctx_${ownerName}`, ownMethods: [], ownFields,
         instantiated: true, stable: true, reasons: [],
       });
+      // Typed capture-context fields (docs/int32_fields_design.md): a captured
+      // variable whose declared type is a number (an enum: int32) and whose
+      // every store the checker vouches for (no cast, no any, no destructuring:
+      // collectUnsafeFieldStores) is an unboxed slot of the record, as a class
+      // field of that type is. Only under the strict profile, like class
+      // fields; TSAOT_TYPED_CTX_FIELDS=0 keeps the boxed cells.
+      if (this.strictTypeOptimizationsEnabled() && process.env.TSAOT_TYPED_CTX_FIELDS !== "0") {
+        const m = new Map<string, Set<string>>();
+        for (const sym of syms) {
+          if (this.unsafeVarSyms.has(sym)) continue;
+          const decl = sym.valueDeclaration ?? sym.declarations?.[0];
+          if (!decl) continue;
+          let t: ts.Type;
+          try { t = this.checker.getTypeOfSymbolAtLocation(sym, decl); } catch { continue; }
+          if (this.classify(t) !== "primitive") continue;
+          const vname = ((sym as { name?: string }).name ?? "").replace(/[^A-Za-z0-9_$]/g, "");
+          m.set(vname ? `c${this.bindingIdOf(sym)}_${vname}` : `c${this.bindingIdOf(sym)}`, new Set([this.isInt32ValuedType(t) ? "int32" : "number"]));
+        }
+        if (m.size > 0) this.instFieldTypes.set(classId, m);
+      }
       const sentinel = { name: `<ctx ${ownerName}>`, flags: 0 } as unknown as ts.Symbol;
       this.recordOfOwner.set(owner, { classId, binding: this.bindingIdOf(sentinel), fields, syms });
       if (process.env.TSAOT_DEBUG_RECORDS)
@@ -8306,6 +8329,10 @@ class Exporter {
    *  casts (`this as unknown as Sub`) leave it typed. */
   unsafeFieldDecls = new Set<ts.Node>();
   unsafeStoreClasses = new Set<ts.Node>();
+  /** Variables with a store the checker cannot vouch for (a cast, an `any`,
+   *  a destructuring target): their capture-context fields stay boxed
+   *  (docs/int32_fields_design.md, "Typed capture-context fields"). */
+  unsafeVarSyms = new Set<ts.Symbol>();
   collectUnsafeFieldStores(): void {
     if (!this.strictTypeOptimizationsEnabled()) return;
     const unwrap = (e: ts.Expression): ts.Expression => {
@@ -8366,9 +8393,19 @@ class Exporter {
         if (process.env.TSAOT_DEBUG_FIELD_SAFETY) console.error(`[field-safety] class ${(d as ts.ClassLikeDeclaration).name?.text ?? "?"} stored dynamically at ${obj.getSourceFile().fileName}:${obj.getSourceFile().getLineAndCharacterOfPosition(obj.getStart()).line + 1}`);
       }
     };
+    const markVar = (name: ts.Identifier, force: boolean, rhs: ts.Expression | undefined) => {
+      const sym = this.symbolOf(name);
+      if (!sym) return;
+      if (force || !rhs || valueUnsafe(rhs)) this.unsafeVarSyms.add(sym);
+    };
+    const markPattern = (name: ts.BindingName) => {
+      if (ts.isIdentifier(name)) { const sym = this.symbolOf(name); if (sym) this.unsafeVarSyms.add(sym); return; }
+      for (const el of name.elements) if (ts.isBindingElement(el)) markPattern(el.name);
+    };
     const markTarget = (target: ts.Expression, rhs: ts.Expression | undefined, force: boolean) => {
       const t = unwrap(target);
-      if (ts.isPropertyAccessExpression(t)) markField(t.name, force, rhs);
+      if (ts.isIdentifier(t)) markVar(t, force, rhs);
+      else if (ts.isPropertyAccessExpression(t)) markField(t.name, force, rhs);
       else if (ts.isElementAccessExpression(t)) markObjectDynamic(t.expression);
       else if (ts.isObjectLiteralExpression(t)) {
         // a destructuring target: the values come from a shape the checker does
@@ -8400,6 +8437,13 @@ class Exporter {
           markObjectDynamic(n.arguments[0]);
       } else if (ts.isForInStatement(n) || ts.isForOfStatement(n)) {
         if (!ts.isVariableDeclarationList(n.initializer)) markTarget(n.initializer, undefined, true);
+      } else if (ts.isVariableDeclaration(n)) {
+        // a declaration's initializer is a store too; a destructuring
+        // declaration gives its names values the checker does not relate
+        if (ts.isIdentifier(n.name)) { if (n.initializer) markVar(n.name, false, n.initializer); }
+        else markPattern(n.name);
+      } else if (ts.isParameter(n) && !ts.isIdentifier(n.name)) {
+        markPattern(n.name);
       }
       ts.forEachChild(n, visit);
     };
