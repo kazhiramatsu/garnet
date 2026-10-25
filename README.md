@@ -503,7 +503,9 @@ The `process`, `Buffer` and `performance` globals, the timer functions,
 `URL`, `URLSearchParams`, `queueMicrotask`, `atob`, `btoa` and `global` exist
 once a program names them or imports a `node:` module; without `@types/node`
 they are typed as Node types them (`setTimeout` returns a `Timeout`, not a
-number). `encodeURIComponent`, `decodeURIComponent`, `encodeURI` and
+number). Only the modules behind the globals a program names are compiled
+with it: a program that uses `setTimeout` does not carry the streams behind
+`process.stdout`. `encodeURIComponent`, `decodeURIComponent`, `encodeURI` and
 `decodeURI` are always there. A method a module does
 not have yet is a type error at compile time (the modules are type-checked
 with your program), never a missing value at run time.

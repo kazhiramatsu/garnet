@@ -257,19 +257,11 @@ selfconf-unported	stdlib/typed_array_loops	Frozen emitter lacks builtin typedarr
 parity	modules/typed_json	The Rust emitter types one local of the garnet:json parser as an integer (`long long d15` against the frozen `double d15`: the int-local analysis the frozen twin predates); both outputs match V8.
 selfconf-unported	modules/typed_json	Frozen emitter lacks the host global of garnet:json (LoadBuiltinFn globalref.__garnet_json); native Rust output matches V8.
 parity-unported	node/path	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.
-selfconf-unported	node/path	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.
-parity-unported	node/events	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.
-selfconf-unported	node/events	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.
 parity-unported	node/util	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.
-selfconf-unported	node/util	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.
 parity-unported	node/assert	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.
-selfconf-unported	node/assert	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.
 parity-unported	node/process_os	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.
-selfconf-unported	node/process_os	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.
 parity-unported	node/buffer	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.
-selfconf-unported	node/buffer	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.
 parity-unported	node/fs	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.
-selfconf-unported	node/fs	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.
 parity	classes/extends_same_name_scopes	The coroutine entry reads a missing argument as undefined (`_fr->v = nargs > j ? args[j] : TS_UNDEFINED`) where the frozen emitter leaves the zeroed frame slot, which read as 0 (an async function called without an optional argument saw 0); the Rust output matches V8.
 parity	classes/static_symbol_method	The coroutine entry reads a missing argument as undefined (`_fr->v = nargs > j ? args[j] : TS_UNDEFINED`) where the frozen emitter leaves the zeroed frame slot, which read as 0 (an async function called without an optional argument saw 0); the Rust output matches V8.
 parity	gc/coro_movable_experimental	The coroutine entry reads a missing argument as undefined (`_fr->v = nargs > j ? args[j] : TS_UNDEFINED`) where the frozen emitter leaves the zeroed frame slot, which read as 0 (an async function called without an optional argument saw 0); the Rust output matches V8.
@@ -284,7 +276,6 @@ parity	statements/forof_dynamic	The coroutine entry reads a missing argument as 
 parity	stdlib/json_dom_async_fallback	The coroutine entry reads a missing argument as undefined (`_fr->v = nargs > j ? args[j] : TS_UNDEFINED`) where the frozen emitter leaves the zeroed frame slot, which read as 0 (an async function called without an optional argument saw 0); the Rust output matches V8.
 parity	symbol/symbol_gen_async_method	The coroutine entry reads a missing argument as undefined (`_fr->v = nargs > j ? args[j] : TS_UNDEFINED`) where the frozen emitter leaves the zeroed frame slot, which read as 0 (an async function called without an optional argument saw 0); the Rust output matches V8.
 parity-unported	node/timers	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.
-selfconf-unported	node/timers	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.
 
 parity-unported	arrays/array_interfaces	Frozen emitter lacks the iterator-protocol builtins of Session 353 (iter.acquire: the runtime GetIterator; iter.close: IteratorClose) or the URI functions (global.encodeURIComponent...); native Rust output matches V8. (emitc inst: builtin 'iter.acquire:0')
 parity-unported	classes/static_symbol_method	Frozen emitter lacks the iterator-protocol builtins of Session 353 (iter.acquire: the runtime GetIterator; iter.close: IteratorClose) or the URI functions (global.encodeURIComponent...); native Rust output matches V8. (emitc inst: builtin 'iter.acquire:0')
@@ -305,6 +296,15 @@ parity-unported	symbol/wellknown_iterator	Frozen emitter lacks the iterator-prot
 selfconf-unported	strings/substr_and_value	Frozen typed emitter does not implement string.substr/toString/valueOf; Rust implements them and matches V8 including coercion order and boundary values.
 selfconf-unported	numbers/to_exponential	Frozen emitter lacks the number.toExponential builtin; the Rust output matches V8 (the frozen selfconf route reaches the runtime prototype method and passes).
 selfconf-unported	maps_sets/map_key_forms	Frozen typed emitter does not implement string.toString; Rust implements it and matches V8 (the fixture probes Maps and Sets with every string representation as key).
+selfconf-unported	symbol/wellknown_iterator	Frozen emitter lacks the iterator-protocol builtins of Session 353 (iter.acquire: the runtime GetIterator; iter.close: IteratorClose) or the URI functions (global.encodeURIComponent...); native Rust output matches V8. (emitc inst: builtin 'iter.acquire:0')
+parity	node/events	The Rust emitter keeps two locals of the events fixture as doubles where the frozen emitter types them long long (`double d28 = 0` against `long long d28 = 0`; the typing of int-proven locals diverged after the freeze); native Rust output matches V8.
+selfconf-unported	node/path	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.
+selfconf-unported	node/util	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.
+selfconf-unported	node/assert	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.
+selfconf-unported	node/process_os	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.
+selfconf-unported	node/buffer	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.
+selfconf-unported	node/fs	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.
+selfconf-unported	node/timers	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.
 selfconf-unported	arrays/array_interfaces	Frozen emitter lacks the iterator-protocol builtins of Session 353 (iter.acquire: the runtime GetIterator; iter.close: IteratorClose) or the URI functions (global.encodeURIComponent...); native Rust output matches V8. (emitc inst: builtin 'iter.acquire:0')
 selfconf-unported	classes/static_symbol_method	Frozen emitter lacks the iterator-protocol builtins of Session 353 (iter.acquire: the runtime GetIterator; iter.close: IteratorClose) or the URI functions (global.encodeURIComponent...); native Rust output matches V8. (emitc inst: builtin 'iter.acquire:0')
 selfconf-unported	iteration/custom_iterable	Frozen emitter lacks the iterator-protocol builtins of Session 353 (iter.acquire: the runtime GetIterator; iter.close: IteratorClose) or the URI functions (global.encodeURIComponent...); native Rust output matches V8. (emitc inst: recv builtin 'iter.close:2')
@@ -318,4 +318,4 @@ selfconf-unported	node/fs_streams	Frozen emitter lacks the host global of the No
 selfconf-unported	node/readline	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.
 selfconf-unported	node/stream	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.
 selfconf-unported	node/url	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.
-selfconf-unported	symbol/wellknown_iterator	Frozen emitter lacks the iterator-protocol builtins of Session 353 (iter.acquire: the runtime GetIterator; iter.close: IteratorClose) or the URI functions (global.encodeURIComponent...); native Rust output matches V8. (emitc inst: builtin 'iter.acquire:0')
+selfconf-unported	node/events	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.

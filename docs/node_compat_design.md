@@ -55,7 +55,8 @@ full surface; what it uses must exist in `lib/node` (a missing module export
 is a TS error at the import; a missing method on our class is a TS error at
 the use), so the reject stays at compile time.
 
-The prelude (`lib/node/prelude.ts`) installs `process`, `Buffer`, the timer
+The prelude (generated per program by the exporter into build/prelude/, from the
+globals the program and its lib modules name; see "As built, N4") installs `process`, `Buffer`, the timer
 functions, `queueMicrotask`, `structuredClone` and `performance` on
 `globalThis`. The exporter imports it as the program's first module when the
 program references one of those names as an ambient global or imports a
@@ -340,3 +341,12 @@ stress, bench); the tsc-ts benchmark is unaffected until N5.
   read undefined before), a runtime GetIterator (`iter.acquire:`) for a
   source typed `Iterable<T>` (any runtime representation) and for nested
   patterns, and the URI functions as runtime builtins.
+- The prelude is generated per program (`writeNodePrelude` in the exporter):
+  the lib modules behind the globals the program, or the lib modules it
+  imports, name as free identifiers (`process` → process.ts, the timers →
+  timers.ts, `Buffer`/`atob`/`btoa` → buffer.ts, `performance` → perf_hooks.ts,
+  `URL`/`URLSearchParams` → url.ts; `global` and `queueMicrotask` always). A
+  static prelude importing everything made a program that names `setTimeout`
+  compile the streams behind process.stdout and the URL parser: 607 IR
+  functions and 2 MB of C instead of a few dozen functions. The modules the
+  prelude pulls in are rescanned for further globals until the set is stable.

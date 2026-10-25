@@ -9974,3 +9974,20 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   `return`, so they keep the plain loop; tsc-ts instructions 1.0004 against
   N3. Known: `"xy"[Symbol.iterator]()` (a string's iterator method called
   directly) is a TypeError at run time; `for (const c of "xy")` is the way.
+- The Node prelude is generated per program (exporter `writeNodePrelude`,
+  build/prelude/node_prelude_<parts>.ts): the static lib/node/prelude.ts had
+  imported every global's module, so a program that names `setTimeout`
+  compiled the streams behind process.stdout and the URL parser (607 IR
+  functions, 2 MB of C, export 0.84 s + emit 0.44 s; now 41 functions,
+  165 KB, 0.47 s + 0.02 s); a program naming `process` and `Buffer` still
+  carries tty and stream (447 functions) until dead-function elimination.
+  The globals a program names are collected as free identifiers and as
+  `globalThis.X`/`global.X`/`globalThis["X"]` in its files and in the lib
+  modules it imports (child_process names setTimeout), the modules the
+  prelude pulls in are rescanned until the set is stable, and an included
+  module installs every global it provides. Gates: the full set green
+  (parity 380 identical + 209 known, selfconf 517 + 73 known: the fixtures
+  that stopped carrying the host global moved from unported to identical,
+  node/events to a known int-typing difference; conformance 593/593 ×2 and
+  590/590; bench; tsc-ts identical). Next: dead-function elimination in the
+  analyzer (RTA over the IR) so that an unused lib function costs nothing.
