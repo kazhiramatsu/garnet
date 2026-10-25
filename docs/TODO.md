@@ -9497,3 +9497,21 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   Measured: `small_calls` 20.63 to 15.83 G instructions, `class_nodes` 4.51 to
   4.34; tsc-ts one checker 0.9991 (neutral), outputs identical.
   `TSAOT_INLINE_IF=0` keeps the old rule (the parity oracle runs with it).
+- Slice P9 (runtime; `docs/map_direct_index_design.md`): a Map keyed by small
+  integers indexes by the key. The checker's hottest lines were lookups in its
+  `Map<number, T>` tables of node and symbol ids (resolvedSymbols.get 1.8% of a
+  checker's samples, the nodeLinks cache 1.2%, the hash probes and rebuilds
+  2% more): hash the double, probe, compare the key, load the value. A map
+  whose keys are non-negative integers below 2^26 and dense enough (largest key
+  at most 32 times the entries plus 64) now keeps `direct[key] = dense index +
+  1` in place of the hash index: two loads, no hash, no compare, absence known
+  from the key's shape; it grows with the keys, gives way to the hash index
+  when a key it cannot hold arrives (a string, a negative, a fraction, NaN, a
+  far id), is rebuilt at compaction, zeroed by clear, and is a payload the
+  collector and the publish walk treat like the hash index; the inlined
+  `Map.get`/`Map.has` probe takes it first. Sets keep the hash index. Runtime
+  tests, fixture stdlib/map_int_keys_dense (V8), kernel patterns/map_int_keys
+  (0.91 to 0.80 G instructions, 0.20 to 0.10 G cycles). tsc-ts one checker
+  against the hashed build: instructions 0.9896, cycles 0.9456, wall 0.942;
+  outputs identical at 1/2/4/8 checkers; PROTECT clean. The density factor
+  measured at 4/16/32/64 (docs).

@@ -1003,9 +1003,11 @@ int main(){
     ts_map_set(hash_map,ts_num((double)i),ts_num((double)(i*3)));
     ts_set_add(hash_set,ts_num((double)i));
   }
-  CK("map open-addressing index",
-     ((ts_map*)ts_ptr(hash_map))->index!=NULL &&
-     ((ts_map*)ts_ptr(hash_map))->index_cap>=2048 &&
+  /* small integer keys take the direct table (docs/map_direct_index_design.md) in place of the hash index */
+  CK("map side index (the direct table for these keys)",
+     ((ts_map*)ts_ptr(hash_map))->direct!=NULL &&
+     ((ts_map*)ts_ptr(hash_map))->direct_cap>=2048 &&
+     ((ts_map*)ts_ptr(hash_map))->index==NULL &&
      ts_to_num(ts_map_get(hash_map,ts_num(1777)))==5331);
   CK("set open-addressing index",
      ((ts_set_t*)ts_ptr(hash_set))->index!=NULL &&
@@ -2204,6 +2206,39 @@ int main(){
   CK("conservative roots: the unrooted array and object survive two collections", g_cr_results[1]);
   CK("conservative roots: the cells nothing names lose their allocation bits", g_cr_results[2]);
   CK("conservative roots: the survivors are intact after the second round", g_cr_results[3]);
+  {
+    /* a Map keyed by small integers: the direct index, its growth, deletes past
+       the compaction threshold, a key that makes it give way, the semantics
+       that must not change */
+    tsv m = ts_new_map(); ts_gc_root(&m);
+    for (int i = 0; i < 5000; i++) ts_map_set(m, ts_num((double)(i * 2)), ts_num((double)i));
+    int hits = 0, wrong = 0;
+    for (int i = 0; i < 10000; i++){ tsv v = ts_map_get(m, ts_num((double)i)); if (!ts_is_undef(v)){ hits++; if (ts_to_num(v) != (double)(i / 2) || (i & 1)) wrong++; } }
+    ts_map* mp = (ts_map*)ts_ptr(m);
+    CK("map direct: 5000 even keys found and the odd ones absent, through the direct table", hits == 5000 && !wrong && mp->direct != NULL && mp->index == NULL);
+    CK("map direct: -0 finds +0; a fraction, NaN and a negative are absent",
+       ts_to_num(ts_map_get(m, ts_num(-0.0))) == 0 && ts_is_undef(ts_map_get(m, ts_num(1.5))) && ts_is_undef(ts_map_get(m, ts_num(0.0 / 0.0))) && !ts_map_has(m, ts_num(-2)));
+    for (int i = 0; i < 5000; i++) if (i % 3) ts_map_delete(m, ts_num((double)(i * 2)));
+    int live = 0; for (int i = 0; i < 10000; i++) if (ts_map_has(m, ts_num((double)i))) live++;
+    CK("map direct: deletes past the compaction threshold keep the rest", live == 1667 && (int)ts_map_size(m) == 1667 && ts_to_num(ts_map_get(m, ts_num(6))) == 3 && ts_is_undef(ts_map_get(m, ts_num(8))));
+    ts_map_set(m, ts_new_string("name", 4), ts_num(-1));   /* a string key: the hash index takes over */
+    mp = (ts_map*)ts_ptr(m);
+    CK("map direct: a string key moves the map to the hash index with every entry",
+       mp->direct == NULL && mp->index != NULL && ts_to_num(ts_map_get(m, ts_new_string("name", 4))) == -1 && ts_to_num(ts_map_get(m, ts_num(6))) == 3 && (int)ts_map_size(m) == 1668);
+    tsv sp = ts_new_map(); ts_gc_root(&sp);
+    for (int i = 0; i < 64; i++) ts_map_set(sp, ts_num((double)i * 100003.0), ts_num((double)i));
+    CK("map direct: sparse keys stay hashed", ((ts_map*)ts_ptr(sp))->direct == NULL && ts_to_num(ts_map_get(sp, ts_num(63 * 100003.0))) == 63);
+    tsv g = ts_new_map(); ts_gc_root(&g);
+    for (int i = 0; i < 1000; i++) ts_map_set(g, ts_num((double)i), ts_bool(1));
+    ts_map_set(g, ts_num(3000), ts_bool(1));   /* within the density rule: the table grows */
+    int grew = ((ts_map*)ts_ptr(g))->direct != NULL && ((ts_map*)ts_ptr(g))->direct_cap >= 3001u;
+    ts_map_set(g, ts_num(50000), ts_bool(1));  /* past it: hashed */
+    CK("map direct: a far key within the density rule grows the table, one past it gives it up",
+       grew && ((ts_map*)ts_ptr(g))->direct == NULL && ts_truthy(ts_map_get(g, ts_num(3000))) && ts_truthy(ts_map_get(g, ts_num(50000))) && ts_truthy(ts_map_get(g, ts_num(999))) && ts_is_undef(ts_map_get(g, ts_num(2999))));
+    ts_map_clear(m); ts_map_set(m, ts_num(7), ts_num(1));
+    CK("map direct: clear then reuse", (int)ts_map_size(m) == 1 && ts_to_num(ts_map_get(m, ts_num(7))) == 1 && ts_is_undef(ts_map_get(m, ts_num(6))));
+    ts_gc_unroot(3);
+  }
   printf("\n%s\n", fail==0?"ALL RUNTIME TESTS PASS":"FAILURES");
   return fail?1:0;
 }

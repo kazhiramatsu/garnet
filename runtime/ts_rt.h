@@ -1302,6 +1302,10 @@ typedef struct ts_map {
                         under the mask and hash bits above it (TS_MAPSET_SLOT) */
   uint32_t index_cap; /* power-of-2 slot count (0 = linear mode) */
   uint32_t tombs;    /* HOLE entries in keys/vals below len */
+  uint32_t* direct;  /* small non-negative integer keys only: direct[key] = dense
+                        idx + 1, 0 absent; exclusive with index
+                        (docs/map_direct_index_design.md) */
+  uint32_t direct_cap; /* power-of-2 bound on the keys it holds (0: none) */
   uint8_t weak;      /* WeakMap: keys are weak and values are ephemerons */
   /* Reuse alignment padding for the same dirty-card span as arrays. */
   uint8_t gc_dirty_all;
@@ -2853,7 +2857,17 @@ TS_RT_ALWAYS_INLINE int ts_set_has_ref(tsv sv, tsv k){
 TS_RT_ALWAYS_INLINE int ts_map_probe_num(tsv mv, double d, long* out){
   if (TS_RT_UNLIKELY(!ts_is_obj(mv))) return 0;
   ts_map* m = (ts_map*)ts_ptr(mv);
-  if (TS_RT_UNLIKELY(m->o.h.kind != TS_KIND_MAP || m->weak || !m->index)) return 0;
+  if (TS_RT_UNLIKELY(m->o.h.kind != TS_KIND_MAP || m->weak)) return 0;
+  if (m->direct){
+    /* a map of small integer keys (node and symbol ids): the key's own value
+       indexes it, and any other number is absent (docs/map_direct_index_design.md) */
+    if (d >= 0.0 && d < 4294967296.0){
+      uint32_t u = (uint32_t)d;
+      if ((double)u == d && u < m->direct_cap){ uint32_t di = m->direct[u]; *out = di ? (long)(di - 1u) : -1; return 1; }
+    }
+    *out = -1; return 1;
+  }
+  if (TS_RT_UNLIKELY(!m->index)) return 0;
   tsv k = ts_num(d == 0 ? 0.0 : d);
   uint32_t h = sv0_hash_num_d(d);
   uint32_t mask = m->index_cap - 1u, slot = h & mask;

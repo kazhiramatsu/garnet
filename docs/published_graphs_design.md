@@ -400,6 +400,15 @@ against 31).
   the chain itself (the start, the bind, the publish) and not the plumbing.
   The check phase, 75% of the compile and already ahead of scriptc's, is
   where the race is decided; the per-checker profiles are the tool for it.
+- *At the default checker count* (ten on this machine, both compilers) the
+  timelines after P9 read: scriptc parse done @49.7, checkers spawned @51.8,
+  nine checkers done by @214 and the main thread's own checker, which takes
+  `checker.ts`, done @488.6; garnet parse done @101.8, spawned @115.0, nine
+  done by @267 and the main's checker @498.0. The main's checker is the
+  critical path for both, garnet's taking 383 ms of work to scriptc's 437, so
+  the compile's end is the parse phase's end plus that: the parse phase is
+  the whole remaining gap, and winning it by 50 ms would put garnet 10%
+  ahead at the default.
 - Knobs: `TSAOT_CPUS=N` (the host's `availableParallelism`),
   `TSAOT_FORK_TRACE=1`, `TSAOT_PROF_PC=<file>` in forked workers.
 

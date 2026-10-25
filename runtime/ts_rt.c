@@ -6063,7 +6063,7 @@ static void gc_scan_cell(ts_gc_header* h, int young, int depth){
     gc_visit_slot(&a->o.proto, young, depth, stable);
   } else if (h->kind==TS_KIND_MAP){ ts_map* m=(ts_map*)h;
     gc_payload_mark(m->keys); gc_payload_mark(m->vals); gc_payload_mark(m->hashes);
-    gc_payload_mark(m->index); gc_payload_mark(m->iteration_order);
+    gc_payload_mark(m->index); gc_payload_mark(m->direct); gc_payload_mark(m->iteration_order);
     if (m->weak){
       /* Ephemeron entries are deliberately skipped here. Their values are
          marked after the ordinary transitive closure, iff their keys are live. */
@@ -6121,7 +6121,7 @@ static void gc_free_cell_payload(ts_gc_header* h){
   } else if (h->kind==TS_KIND_FUNC){
     ts_func* f=(ts_func*)h; props_release_dead(&f->o);   /* the environment is a payload */
   } else if (h->kind==TS_KIND_MAP){
-    ts_map* m=(ts_map*)h; gc_owned_release_dead(m->keys); gc_owned_release_dead(m->vals); gc_owned_release_dead(m->hashes); gc_owned_release_dead(m->index); gc_owned_release_dead(m->iteration_order); props_release_dead(&m->o);
+    ts_map* m=(ts_map*)h; gc_owned_release_dead(m->keys); gc_owned_release_dead(m->vals); gc_owned_release_dead(m->hashes); gc_owned_release_dead(m->index); gc_owned_release_dead(m->direct); gc_owned_release_dead(m->iteration_order); props_release_dead(&m->o);
   } else if (h->kind==TS_KIND_SET){
     ts_set_t* s=(ts_set_t*)h; gc_owned_release_dead(s->elems); gc_owned_release_dead(s->hashes); gc_owned_release_dead(s->index); gc_owned_release_dead(s->iteration_order); props_release_dead(&s->o);
   }
@@ -6323,6 +6323,7 @@ static void g0_count_fate(ts_gc_header* h, int fate){
     if (m->vals) b += (unsigned long long)m->cap * sizeof(tsv);
     if (m->hashes) b += (unsigned long long)m->cap * sizeof(uint32_t);
     if (m->index) b += (unsigned long long)m->index_cap * sizeof(uint32_t);
+    if (m->direct) b += (unsigned long long)m->direct_cap * sizeof(uint32_t);
     if (m->iteration_order) b += (unsigned long long)m->cap * sizeof(uint64_t);
     if (b) g0_payload(fate, G0_P_MAP, b, &any);
     common = &m->o;
@@ -7782,6 +7783,7 @@ static tsv ts_new_map_impl(int weak){
     : (ts_proto_ref(g_map_proto_v) ? g_map_proto_v : TS_NULL);
   m->keys=NULL; m->vals=NULL; m->hashes=NULL; m->len=0; m->cap=0;
   m->index=NULL; m->index_cap=0; m->tombs=0;
+  m->direct=NULL; m->direct_cap=0;
   m->weak=(uint8_t)(weak != 0);
   m->iteration_order=NULL; m->next_iteration_order=1;
   return ts_obj(m);
@@ -7953,10 +7955,95 @@ static void mapset_index_maintain(const ts_gc_header* owner, tsv* keys, uint32_t
   gc_owned_free(*index_io); *index_io = nw;
 }
 
+/* ---- The direct index of a Map keyed by small integers (docs/map_direct_index_design.md) ----
+   A Map whose keys are all non-negative integers below TS_MAP_DIRECT_MAX and
+   dense (the largest key + 1 at most TS_MAP_DIRECT_SPARSITY times the live
+   entries plus 64) indexes
+   by the key itself: direct[key] = dense index + 1, 0 for absent. The
+   compiler's maps of node and symbol ids are of this kind, and a lookup is
+   then two loads with no hashing and no key compare. The direct table is
+   decided when the index would be built or rebuilt, grows with the keys
+   within the density rule, and gives way to the hash index when a key
+   outside the rule arrives (a string, a negative, a fraction, NaN, a far
+   id); every entry and the insertion order survive the change. */
+#define TS_MAP_DIRECT_MAX (1u << 26)
+/* the table may be this many times the live entries: a checker's maps of node
+   ids hold a tenth of the id range (4 left them hashed, 16 took them: cycles
+   -4.2% on the compiler's one-checker compile, 32 another -0.65% for 19 MB of
+   its 614 MB peak, 64 another -0.5% for 13 MB more) */
+#define TS_MAP_DIRECT_SPARSITY 32u
+static inline int map_direct_key(tsv k, uint32_t* out){
+  if (!ts_is_num(k)) return 0;
+  double d = ts_to_num(k);
+  if (!(d >= 0.0 && d < (double)TS_MAP_DIRECT_MAX)) return 0;   /* NaN fails too */
+  uint32_t u = (uint32_t)d;
+  if ((double)u != d) return 0;
+  *out = u; return 1;
+}
+static int map_direct_eligible(const ts_map* m, uint32_t* maxk){
+  uint32_t mx = 0; int any = 0;
+  for (uint32_t i = 0; i < m->len; i++){
+    tsv k = m->keys[i];
+    if (k == TS_MAPSET_HOLE) continue;
+    uint32_t u;
+    if (!map_direct_key(k, &u)) return 0;
+    if (u > mx) mx = u;
+    any = 1;
+  }
+  if (!any) return 0;
+  uint32_t live = m->len - m->tombs;
+  if ((uint64_t)mx + 1u > (uint64_t)live * TS_MAP_DIRECT_SPARSITY + 64u) return 0;
+  *maxk = mx; return 1;
+}
+static void map_direct_build(ts_map* m, uint32_t maxk){
+  uint32_t cap = 16u;
+  while (cap < maxk + 1u) cap <<= 1;
+  uint32_t* d = (uint32_t*)gc_owned_alloc(&m->o.h, sizeof(uint32_t) * cap);
+  memset(d, 0, sizeof(uint32_t) * cap);
+  for (uint32_t i = 0; i < m->len; i++){
+    tsv k = m->keys[i];
+    if (k == TS_MAPSET_HOLE) continue;
+    d[(uint32_t)ts_to_num(k)] = i + 1u;
+  }
+  gc_owned_free(m->direct); m->direct = d; m->direct_cap = cap;
+}
+/* the direct table given up: the hash index over the same entries */
+static void map_direct_to_hash(ts_map* m){
+  gc_owned_free(m->direct); m->direct = NULL; m->direct_cap = 0;
+  if (m->len - m->tombs >= TS_MAPSET_LINEAR_MAX){
+    gc_owned_free(m->index);
+    m->index = mapset_index_build(&m->o.h, m->keys, m->hashes, m->len, &m->index_cap);
+  }
+}
+/* the Map's index after an insertion in linear or hash mode: the direct table
+   where the keys allow, else the hash index (Sets keep mapset_index_maintain) */
+static void map_index_maintain(ts_map* m){
+  uint32_t live = m->len - m->tombs;
+  if (!m->index){
+    if (live < TS_MAPSET_LINEAR_MAX) return;
+  } else if ((uint64_t)(m->len + 2u) * 4u <= (uint64_t)m->index_cap * 3u){
+    return;
+  }
+  uint32_t maxk;
+  if (map_direct_eligible(m, &maxk)){
+    map_direct_build(m, maxk);
+    gc_owned_free(m->index); m->index = NULL; m->index_cap = 0;
+    return;
+  }
+  uint32_t* nw = mapset_index_build(&m->o.h, m->keys, m->hashes, m->len, &m->index_cap);
+  gc_owned_free(m->index); m->index = nw;
+}
+static inline long map_direct_find(const ts_map* m, tsv k){
+  uint32_t u;
+  if (!map_direct_key(k, &u) || u >= m->direct_cap) return -1;
+  uint32_t di = m->direct[u];
+  return di ? (long)(di - 1u) : -1;
+}
 /* find key index in a map, or -1 (holes never match: probe skips them by
    slot state, and the linear fallback compares the sentinel bit-exactly first) */
 static inline long map_find(ts_map* m, tsv k){
   RT_STAT_INC(map_find_calls);
+  if (m->direct) return map_direct_find(m, k);
   uint32_t h = sv0_hash(k);
   if (m->index){ RT_STAT_INC(map_indexed); return mapset_probe(m->index, m->index_cap, m->keys, k, h, NULL); }
   RT_STAT_INC(map_linear);
@@ -7985,6 +8072,11 @@ static void map_compact(ts_map* m){
     m->hashes[w] = m->hashes[i]; w++;
   }
   m->len = w; m->tombs = 0;
+  if (m->direct){
+    uint32_t maxk;
+    if (map_direct_eligible(m, &maxk)) map_direct_build(m, maxk); else map_direct_to_hash(m);
+    return;
+  }
   if (m->index){
     uint32_t* nw = mapset_index_build(&m->o.h, m->keys, m->hashes, m->len, &m->index_cap);
     gc_owned_free(m->index); m->index = nw;
@@ -8002,10 +8094,8 @@ static inline void map_write_barrier(ts_map* m, uint32_t index, tsv value){
   }
   gc_remember(&m->o.h);
 }
-static tsv map_set_unchecked(tsv mv, tsv k, tsv v){
-  ts_map* m = ts_ptr(mv);
+static tsv map_set_hashed(ts_map* m, tsv mv, tsv k, tsv v){
   uint32_t slot = 0;
-  if (k == TS_MAPSET_NEG_ZERO) k = ts_num(0);   /* a -0 key is stored as +0 */
   uint32_t h = sv0_hash(k);
   long i;
   if (m->index){ RT_STAT_INC(map_find_calls); i = mapset_probe(m->index, m->index_cap, m->keys, k, h, &slot); }
@@ -8017,12 +8107,42 @@ static tsv map_set_unchecked(tsv mv, tsv k, tsv v){
   if (m->index){
     /* reuse the probe's slot (tomb or empty); maintain slack afterwards */
     m->index[slot] = TS_MAPSET_SLOT(m->len - 1u, h, m->index_cap - 1u);
-    mapset_index_maintain(&m->o.h, m->keys, m->hashes, m->len, m->tombs, &m->index, &m->index_cap);
+    map_index_maintain(m);
   } else {
-    mapset_index_maintain(&m->o.h, m->keys, m->hashes, m->len, m->tombs, &m->index, &m->index_cap);
+    map_index_maintain(m);
   }
   map_write_barrier(m, m->len - 1u, k); map_write_barrier(m, m->len - 1u, v);
   return mv;
+}
+static tsv map_set_unchecked(tsv mv, tsv k, tsv v){
+  ts_map* m = ts_ptr(mv);
+  if (k == TS_MAPSET_NEG_ZERO) k = ts_num(0);   /* a -0 key is stored as +0 */
+  if (m->direct){
+    uint32_t u;
+    if (map_direct_key(k, &u)){
+      if (u < m->direct_cap){
+        uint32_t di = m->direct[u];
+        if (di){ m->vals[di - 1u] = v; map_write_barrier(m, di - 1u, v); return mv; }   /* update, order kept */
+      } else if (u < TS_MAP_DIRECT_MAX && (uint64_t)u + 1u <= (uint64_t)(m->len - m->tombs + 1u) * TS_MAP_DIRECT_SPARSITY + 64u){
+        uint32_t cap = m->direct_cap;
+        while (cap < u + 1u) cap <<= 1;
+        uint32_t* nd = (uint32_t*)gc_owned_realloc(&m->o.h, m->direct, sizeof(uint32_t) * m->direct_cap, sizeof(uint32_t) * cap);
+        memset(nd + m->direct_cap, 0, sizeof(uint32_t) * (cap - m->direct_cap));
+        m->direct = nd; m->direct_cap = cap;
+      } else {
+        map_direct_to_hash(m);
+        return map_set_hashed(m, mv, k, v);
+      }
+      map_grow(m);
+      if (m->iteration_order) m->iteration_order[m->len] = m->next_iteration_order++;
+      m->keys[m->len] = k; m->vals[m->len] = v; m->hashes[m->len] = sv0_hash(k); m->len++;
+      m->direct[u] = m->len;
+      map_write_barrier(m, m->len - 1u, k); map_write_barrier(m, m->len - 1u, v);
+      return mv;
+    }
+    map_direct_to_hash(m);
+  }
+  return map_set_hashed(m, mv, k, v);
 }
 static void ts_throw_published_collection(const char* what){
   char buf[96];
@@ -8040,6 +8160,15 @@ tsv ts_map_set(tsv mv, tsv k, tsv v){
    absent. -2 for anything else (another kind of key, a slot whose key is an
    equal number with other bits): map_find decides. */
 TS_RT_ALWAYS_INLINE long map_find_num_fast(const ts_map* m, tsv k){
+  if (m->direct){
+    if (!ts_is_num(k)) return -1;              /* every key is a small integer */
+    double d = ts_to_num(k);
+    if (d >= 0.0 && d < 4294967296.0){
+      uint32_t u = (uint32_t)d;
+      if ((double)u == d && u < m->direct_cap){ uint32_t di = m->direct[u]; return di ? (long)(di - 1u) : -1; }
+    }
+    return -1;
+  }
   if (!m->index || !ts_is_num(k)) return -2;
   uint32_t h = sv0_hash_num(k);
   uint32_t mask = m->index_cap - 1u, slot = h & mask;
@@ -8082,6 +8211,15 @@ static int map_delete_unchecked(tsv mv, tsv k){
   ts_map* m = ts_ptr(mv);
   uint32_t slot = 0;
   long i;
+  if (m->direct){
+    i = map_direct_find(m, k);
+    if (i < 0) return 0;
+    m->direct[(uint32_t)ts_to_num(m->keys[i])] = 0;
+    m->keys[i] = TS_MAPSET_HOLE; m->vals[i] = TS_UNDEFINED;
+    m->tombs++;
+    if (m->tombs > 64u && m->tombs * 2u >= m->len) map_compact(m);
+    return 1;
+  }
   if (m->index){
     RT_STAT_INC(map_find_calls);
     i = mapset_probe(m->index, m->index_cap, m->keys, k, sv0_hash(k), &slot);
@@ -8113,6 +8251,7 @@ void ts_map_clear(tsv mv){
   if (ts_is_map(mv)){
     ts_map* m=ts_ptr(mv); m->len=0; m->tombs=0;
     if (m->index) memset(m->index, 0, sizeof(uint32_t)*m->index_cap);
+    if (m->direct) memset(m->direct, 0, sizeof(uint32_t)*m->direct_cap);
   }
 }
 double ts_map_size(tsv mv){
@@ -18595,7 +18734,7 @@ static void publish_mark_payloads(ts_gc_header* h){
   } else if (h->kind == TS_KIND_MAP){
     ts_map* m = (ts_map*)h;
     gc_payload_mark(m->keys); gc_payload_mark(m->vals); gc_payload_mark(m->hashes);
-    gc_payload_mark(m->index); gc_payload_mark(m->iteration_order);
+    gc_payload_mark(m->index); gc_payload_mark(m->direct); gc_payload_mark(m->iteration_order);
   } else if (h->kind == TS_KIND_SET){
     ts_set_t* st = (ts_set_t*)h;
     gc_payload_mark(st->elems); gc_payload_mark(st->hashes);
