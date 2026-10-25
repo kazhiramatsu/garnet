@@ -20,7 +20,6 @@ Current intentional legal-syntax rejects are:
 - standard/experimental decorators;
 - `using` and `await using`;
 - class auto-accessors;
-- tagged templates (template object identity and `.raw`);
 - `new.target` and `import.meta`;
 - dynamic `import()`;
 - import/export attributes;

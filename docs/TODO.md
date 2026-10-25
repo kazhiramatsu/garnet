@@ -9592,3 +9592,31 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   the generated `ts_setup_prototypes`, one new shape each), property lookups
   before additions 11%, the chunks' own code 25%; going further means
   building prototypes and literal layouts at build time or a heap snapshot.
+- README (docs): rewritten for users, with the tsc-ts results. A performance
+  section reports tsc-ts on the TypeScript 6.0.3 compiler project against
+  scriptc 0.4.0 (the P10 table: 1, 4 and 10 checkers 0.977, 0.406 and
+  0.455 s against 1.042, 0.429 and 0.476 s) and against tsc-ts's own build on
+  Node (3.27 s at one checker), and states the conditions: an in-sample
+  profile-guided build (plain 1.23 s against trained 1.02 s when last
+  compared), the benchmark's own host and forked checkers, and the
+  counterexample of the unmodified 6.0.3 compiler (4.06 s against Node's
+  3.37 s). New user-facing sections: getting the fastest code (`strict`
+  through `-p`, `--pgo-train` and `default.pgo`, `--units`), what a program
+  can use (checked with probe programs: no API for arguments, environment,
+  files, standard input or timers; DOM globals such as `setTimeout` and
+  `performance` type-check, compile and then throw a ReferenceError; `URL`,
+  `DataView` and `toLocaleString` reject at compile time), and
+  troubleshooting by message. Every command in it was run as written. The
+  measurement conditions also name the build's strict tsconfig:
+  `scripts/build_tsc_ts_native.sh` passes `--project` (as `garnet -p`
+  does), and the IR of the P10 build and of the latest one
+  (`build/tsc_ts_native_p10`, `_p23`) records `strictTypeOptimizations`
+  enabled (all eight strict options, no diagnostics).
+  Corrected: tagged templates work (Session 341); also removed from the
+  reject list in `tests/conformance/KNOWN_GAPS.md`, which now matches
+  `tests/conformance/rejects/`. Found: without `-p` the driver type-checks
+  non-strict, so the quick-start path misses the strict-profile
+  specializations (a generic `Box<number>` keeps a boxed field; with a
+  `"strict": true` tsconfig it becomes a `double`); the not-implemented list
+  of `docs/stdlib_coverage.md` is stale (substr, dynamic RegExp and typed
+  arrays are implemented).
