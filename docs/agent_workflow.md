@@ -336,6 +336,15 @@ Two tools that look right are wrong on garnet's binaries, and one works:
 5. Depending on the kind of change, run `scripts/gate.sh conf all` + unit (+ gc / bundler / selfconf / emitc_diff).
 6. Append a session note to the end of `docs/TODO.md`. Commit on the user's instruction (English, with a `Verified:` line).
 
+### Gotcha: `dt` hangs on a program that reads standard input
+
+`dt` runs node and the native binary with the terminal's stdin. A program
+that reads `process.stdin` (or `readline` over it) waits for end of file
+forever, and the whole `bash -c` pipeline shows nothing until then. Run such
+probes with `< /dev/null` on the `dt` call, then feed the compiled
+`build/dt` a pipe by hand (`printf 'a\n' | ./build/dt`), and compare with
+`printf 'a\n' | node build/dt.mjs`.
+
 ### Gotcha: the regexp adapter object is cached by presence, not by mtime
 
 `tsaot_prepare_regexp_objs` (`scripts/lib/regexp_link_flags.sh`) compiles

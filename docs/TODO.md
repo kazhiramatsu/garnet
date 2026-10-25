@@ -9926,3 +9926,43 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   101 ms against its 100 ms budget right after the GC stress run, 90 ms
   alone: noise, nothing in the slice touches it); tsc-ts output identical to
   the N2 build, instructions 1.0002.
+- Node compatibility N4 (`docs/node_compat_design.md`, "As built, N4"):
+  streams (Node's state machines ported: Readable/Writable/Duplex/Transform/
+  PassThrough, construct, pipe, pipeline, finished, Readable.from, async
+  iteration), the standard streams as tty streams (`process.stdin` read by
+  the loop), fs streams (open/close on a later turn), readline (+promises),
+  child_process (sync through the host's fork/exec with poll; async with
+  SIGCHLD self-pipe reaping and watched pipe fds in the loop), crypto
+  (digests in C, HMAC/PBKDF2 in TS, random), url (WHATWG parser for ASCII
+  hosts, URLSearchParams, file URLs, the legacy API) and querystring; `URL`
+  and `URLSearchParams` as globals (`new URL()` on the lib.dom identifier
+  constructs the prelude's class dynamically). Fixtures `node/{stream,
+  fs_streams, readline, child_process, crypto, url}` (V8 identical, plain and
+  strict).
+  Language fixes found on the way (fixture `iteration/iterator_close`):
+  (1) for-of/for-await/yield* never called a custom iterator's `return()` on
+  break/throw/return (the check looked for `return` on the iterable, not the
+  iterator): a runtime IteratorClose (`iter.close:`) when the iterator's type
+  may have one, and yield* closes the inner iterator when the delegation ends
+  early; (2) for-await over an object literal with `[Symbol.asyncIterator]`
+  was rejected; (3) `const [a, b] = new Set(...)` / a Map / a generator / a
+  class iterable read elements by index: undefined, silently (now the
+  iterator protocol, with IteratorClose when the pattern stops early, holes
+  consuming an element, rest collecting the remainder; assignment patterns
+  too); (4) a for-of over a source typed `Iterable<T>` crashed on an array or
+  a string at run time: `iter.acquire:` (ts_iter_acquire) takes any runtime
+  representation; nested array patterns of a non-array type use it too;
+  (5) `encodeURIComponent`/`decodeURIComponent`/`encodeURI`/`decodeURI` did
+  not exist: runtime builtins (`global.*`, URIError on malformed input);
+  (6) `util.promisify.custom`. Known: a custom iterator whose `next()`
+  throws still has `return()` called (the close runs from the loop's
+  finally; the spec skips it); `encodeURIComponent` as a value (not called)
+  is still unresolved.
+  Harness note: `dt` inherits the terminal's stdin, so a program that reads
+  `process.stdin` hangs under it; redirect `< /dev/null` and test pipes by
+  running the binary directly.
+  Gates: conformance 593/593 plain and strict, GC-protect 590/590; parity 377
+  identical + 212 known (22 fixtures newly unported in the frozen emitter:
+  iter.acquire/iter.close and the Node host global, allowlisted with their
+  reason); selfconf 511 + 79 known; unit; bundler 43/43; GC stress; bench all
+  within budget; tsc-ts output identical to the N3 build, instructions 1.0201.

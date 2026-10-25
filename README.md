@@ -492,26 +492,34 @@ Available so far:
 | `node:fs` and `node:fs/promises` | the synchronous API (`readFileSync` ... `writeSync`, `mkdtempSync`, `rmSync` recursive, `readdirSync` with `withFileTypes` and `recursive`, descriptors), the promise API and the callback API over it, `Stats`, `Dirent`, `constants`; no streams or `watch` yet |
 | `node:string_decoder` | `StringDecoder` across chunk boundaries |
 | `node:timers`, `node:timers/promises` and the timer globals | `setTimeout`, `setInterval`, `setImmediate` and their `clear` functions on Garnet's event loop, returning `Timeout`/`Immediate` objects with `ref`, `unref`, `hasRef` and `refresh`; `process.nextTick` runs before the promise reactions of a turn; the promise forms, `setInterval` as an async iterator, `scheduler.wait`/`yield`; `process.on("beforeExit")` and `"exit"` |
+| `node:stream`, `node:stream/promises` | `Readable`, `Writable`, `Duplex`, `Transform`, `PassThrough` with Node's paused and flowing modes, `highWaterMark` and backpressure, `construct`, `destroy` and `autoDestroy`, `pipe`, `pipeline` (a generator may be a stage), `finished`, `Readable.from`, async iteration, `toArray` |
+| `node:fs` streams, `node:tty` | `createReadStream`/`createWriteStream` (`open`, `ready`, `start`/`end`, `bytesRead`/`bytesWritten`, `pending`), `process.stdin`/`stdout`/`stderr` as streams (`isTTY`, `columns`, `rows`, the cursor methods), `isatty` |
+| `node:readline`, `node:readline/promises` | `createInterface` over any readable (LF, CRLF and CR endings), `'line'`/`'close'`, `question`, `prompt`, `pause`/`resume`, async iteration, the cursor functions; no terminal mode (lines are read whole) |
+| `node:child_process` | `spawnSync`, `execSync`, `execFileSync` (status, signal, `input`, `env`, `cwd`, `timeout`, `stdio`), `spawn`, `exec`, `execFile` over the event loop (`stdin`/`stdout`/`stderr` streams, `'spawn'`, `'exit'`, `'close'`, `'error'`, `kill`), `util.promisify(exec)`; no `fork` |
+| `node:crypto` | `createHash`/`hash` (md5, sha1, sha256, sha512), `createHmac`, `pbkdf2`/`pbkdf2Sync`, `randomBytes`, `randomInt`, `randomUUID`, `randomFill`, `getRandomValues`, `timingSafeEqual`; no ciphers, keys or signatures |
+| `node:url`, `node:querystring` | the WHATWG `URL` and `URLSearchParams` (also as globals), `fileURLToPath`, `pathToFileURL`, `domainToASCII` (ASCII hosts only: no punycode), the legacy `url.parse`/`format`/`resolve`, `querystring.parse`/`stringify`/`escape`/`unescape` |
 
 The `process`, `Buffer` and `performance` globals, the timer functions,
-`queueMicrotask`, `atob`, `btoa` and `global` exist once a program names them
-or imports a `node:` module; without `@types/node` they are typed as Node
-types them (`setTimeout` returns a `Timeout`, not a number). A method a module does
+`URL`, `URLSearchParams`, `queueMicrotask`, `atob`, `btoa` and `global` exist
+once a program names them or imports a `node:` module; without `@types/node`
+they are typed as Node types them (`setTimeout` returns a `Timeout`, not a
+number). `encodeURIComponent`, `decodeURIComponent`, `encodeURI` and
+`decodeURI` are always there. A method a module does
 not have yet is a type error at compile time (the modules are type-checked
 with your program), never a missing value at run time.
 
-Coming next, in this order: `child_process`, `crypto`, `url`, `readline` and
-streams. The file system's promise and callback forms complete a microtask
+Coming next: `worker_threads` generalized from the fork workers, `net` and
+`http`. The file system's promise and callback forms complete a microtask
 after the call, not from the loop's poll phase, so they run before a timer
-due at the same time. Sockets (`net`, `http`) and `fs.watch` are not
+due at the same time; a file stream's open and close complete on a later turn
+(as Node's asynchronous calls do), its reads and writes are synchronous. Sockets (`net`, `http`) and `fs.watch` are not
 planned yet. `util.inspect` ignores its options and `util.format`'s `%o` shows
 no hidden properties.
 
 Watch out for one trap. TypeScript's default declarations include browser
-globals, so code that uses `structuredClone`, `crypto` or `localStorage`
-type-checks and compiles, then stops when it runs, with an error such as
-`ReferenceError: structuredClone is not defined`. Others, such as
-`new URL(...)`, are rejected at compile time.
+globals, so code that uses `structuredClone`, the `crypto` global or
+`localStorage` type-checks and compiles, then stops when it runs, with an
+error such as `ReferenceError: structuredClone is not defined`.
 
 An uncaught exception prints the error to standard error and ends the program
 with a non-zero exit status; so does a promise rejection nothing handles

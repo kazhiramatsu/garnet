@@ -58,8 +58,11 @@ export function format(f?: unknown, ...args: unknown[]): string {
 }
 export function formatWithOptions(_options: InspectOptions, f?: unknown, ...args: unknown[]): string { return format(f, ...args); }
 
-export function promisify<T>(fn: (...args: any[]) => void): (...args: any[]) => Promise<T> {
+const kCustomPromisified: unique symbol = Symbol.for("nodejs.util.promisify.custom") as unknown as typeof kCustomPromisified;
+function promisifyImpl<T>(fn: (...args: any[]) => void): (...args: any[]) => Promise<T> {
   if (typeof fn !== "function") throw invalidArgType("original", "of type function", fn);
+  const custom = (fn as unknown as { [key: symbol]: unknown })[kCustomPromisified];
+  if (typeof custom === "function") return custom as (...args: any[]) => Promise<T>;
   return function (this: unknown, ...args: any[]): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       fn.call(this, ...args, (err: unknown, ...values: unknown[]) => {
@@ -69,6 +72,9 @@ export function promisify<T>(fn: (...args: any[]) => void): (...args: any[]) => 
     });
   };
 }
+/** promisify(fn), and promisify.custom: the symbol under which a function offers its own promise form. */
+export const promisify: typeof promisifyImpl & { custom: typeof kCustomPromisified } = promisifyImpl as typeof promisifyImpl & { custom: typeof kCustomPromisified };
+promisify.custom = kCustomPromisified;
 export function callbackify(fn: (...args: any[]) => Promise<unknown>): (...args: any[]) => void {
   if (typeof fn !== "function") throw invalidArgType("original", "of type function", fn);
   return function (this: unknown, ...args: any[]): void {

@@ -105,7 +105,10 @@ function garnetModulePaths(): ts.MapLike<string[]> {
  *  lib/node/globals.d.ts unless @types/node already types the program. */
 let nodePreludeFile: string | undefined;
 const NODE_PRELUDE_GLOBALS = new Set(["process", "Buffer", "setTimeout", "setInterval", "setImmediate", "clearTimeout",
-  "clearInterval", "clearImmediate", "queueMicrotask", "structuredClone", "performance"]);
+  "clearInterval", "clearImmediate", "queueMicrotask", "structuredClone", "performance", "URL", "URLSearchParams"]);
+/** The constructors among them: lib.dom declares the identifier, the prelude's class is the
+ *  global object's value, and `new URL(...)` constructs through that value. */
+const NODE_PRELUDE_CTORS = new Set(["URL", "URLSearchParams"]);
 function programWithNodeSupport(rootNames: string[], options: ts.CompilerOptions, host: ts.CompilerHost | undefined,
                                 sourceMode: SourceMode): ts.Program {
   nodePreludeFile = undefined;
@@ -206,6 +209,10 @@ type NewTarget =
   | { kind: "reject"; reason: string };
 
 type ClassValueEmit = { local: number; classValue: boolean };
+/** What resolveIterator returns: the iterator local and the emitters of its protocol. */
+type IterDriver = { itLocal: number; srcLocal: number; isAsync: boolean; step: (sentLocal: number) => number; throwStep?: (excLocal: number) => number; returnCall?: () => void };
+/** One element of an array pattern bound from an iterator. */
+type IterPatternElement = { node: ts.Node; omitted: boolean; rest: boolean; bind: (value: number) => void };
 
 interface Local {
   id: number;
@@ -5447,6 +5454,12 @@ class Exporter {
           ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: `global.${fn.text}`, args: argLs });
           return dst;
         }
+        if ((fn.text === "encodeURIComponent" || fn.text === "decodeURIComponent" || fn.text === "encodeURI" || fn.text === "decodeURI") && isBuiltinSym) {
+          const argLs = this.lowerSequenced(ctx, node.arguments);
+          const dst = this.newLocal(ctx, "reference");
+          ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: `global.${fn.text}`, args: argLs });
+          return dst;
+        }
         if ((fn.text === "isNaN" || fn.text === "isFinite") && isBuiltinSym) {
           const argLs = [this.lowerExpr(ctx, node.arguments[0])];
           const dst = this.newLocal(ctx, this.refKindOf(node));
@@ -6406,6 +6419,36 @@ class Exporter {
         this.lowerAssignTarget(ctx, lhs, rhs, pre);
         return rhs;
       }
+      if (ts.isArrayLiteralExpression(lhs)) {
+        // `[a, b = 1, ...rest] = <iterable>`: an iterator source is stepped by the protocol
+        const source = this.iterablePatternSource(ctx, node.right);
+        if (source !== undefined && !("drv" in source)) { this.lowerAssignTarget(ctx, lhs, source.array); return source.source; }
+        if (source !== undefined && "drv" in source) {
+          const drv = source.drv;
+          this.lowerArrayPatternByProtocol(ctx, drv, lhs.elements.map((el): IterPatternElement => ({
+            node: el,
+            omitted: ts.isOmittedExpression(el),
+            rest: ts.isSpreadElement(el),
+            bind: (v: number) => {
+              if (ts.isOmittedExpression(el)) return;
+              if (ts.isSpreadElement(el)) { this.lowerAssignTarget(ctx, el.expression, v); return; }
+              let target: ts.Expression = el;
+              if (ts.isBinaryExpression(el) && el.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+                const isUndef = this.newLocal(ctx, "primitive");
+                ctx.body.push({ kind: "UnOp", dst: isUndef, op: "isundef", operand: v });
+                const thenB = this.captureBody(ctx, () => {
+                  const dv = this.lowerExpr(ctx, el.right);
+                  ctx.body.push({ kind: "Copy", dst: v, src: dv });
+                });
+                ctx.body.push({ kind: "If", cond: isUndef, thenBody: thenB, elseBody: [] });
+                target = el.left;
+              }
+              this.lowerAssignTarget(ctx, target, v);
+            },
+          })));
+          return drv.srcLocal;
+        }
+      }
       const rhs = this.lowerExpr(ctx, node.right);
       this.lowerAssignTarget(ctx, lhs, rhs);
       return rhs;
@@ -6651,6 +6694,14 @@ class Exporter {
         ctx.body.push({ kind: "Const", dst: undef0, value: { kind: "Undef" } });
         ctx.body.push({ kind: "Copy", dst: sent, src: undef0 });
         const rstar = this.newLocal(ctx, "reference");         // {value,done} of inner
+        // The delegation ends abruptly when this generator is returned from or thrown
+        // into (the resumption runs the finally) or the body of a throw-forwarding
+        // step rethrows: then the inner iterator is closed, as for-of closes it.
+        const delegationDone = this.newLocal(ctx, "primitive");
+        const falseD = this.newLocal(ctx, "primitive");
+        ctx.body.push({ kind: "Const", dst: falseD, value: { kind: "Bool", value: false } });
+        ctx.body.push({ kind: "Copy", dst: delegationDone, src: falseD });
+        const delegationBody = this.captureBody(ctx, () => {
         // first step
         { const r = drv.step(sent); ctx.body.push({ kind: "Copy", dst: rstar, src: r }); }
         // loop: while (!r.done) { sent = yield r.value; r = it.next(sent); }
@@ -6703,6 +6754,21 @@ class Exporter {
           ctx.body.push({ kind: "If", cond: threw, thenBody, elseBody });
         });
         ctx.body.push({ kind: "Loop", cond: condLocal, condBody, body: bodyB });
+        const trueD = this.newLocal(ctx, "primitive");
+        ctx.body.push({ kind: "Const", dst: trueD, value: { kind: "Bool", value: true } });
+        ctx.body.push({ kind: "Copy", dst: delegationDone, src: trueD });
+        });
+        if (drv.returnCall) {
+          const finallyBody = this.captureBody(ctx, () => {
+            const abrupt = this.newLocal(ctx, "primitive");
+            ctx.body.push({ kind: "UnOp", dst: abrupt, op: "!", operand: delegationDone });
+            const thenBody = this.captureBody(ctx, () => { drv.returnCall!(); });
+            ctx.body.push({ kind: "If", cond: abrupt, thenBody, elseBody: [] });
+          });
+          ctx.body.push({ kind: "TryCatch", tryBody: delegationBody, catchVar: null, catchBody: [], finallyBody });
+        } else {
+          for (const inst of delegationBody) ctx.body.push(inst);
+        }
         // value of the yield* expression = inner's return value (r.value when done)
         const exprVal = this.newLocal(ctx, "reference");
         ctx.body.push({ kind: "LoadField", dst: exprVal, obj: rstar, field: valueField });
@@ -9543,6 +9609,13 @@ class Exporter {
     // values that slip through (arrows/methods/async/generators) throw V8's
     // catchable TypeError in ts_construct — never a silent construct. Ambient
     // builtins (`new isNaN()`) keep the loud reject below.
+    // A constructor the Node prelude provides (URL, URLSearchParams): the identifier
+    // is lib.dom's ambient declaration, the value is the prelude's class on the
+    // global object, and the instance is constructed through it (ts_construct).
+    if (classId === undefined && nodePreludeFile !== undefined && ts.isIdentifier(node.expression) &&
+        NODE_PRELUDE_CTORS.has(node.expression.text) && this.isAmbientGlobalSymbol(csym)) {
+      return { kind: "functionValue" };
+    }
     if (classId === undefined && !this.isAmbientGlobalSymbol(csym)) {
       let callable = csym !== undefined && this.funcSymbols.has(csym);
       if (!callable) {
@@ -10698,6 +10771,149 @@ class Exporter {
     return res;
   }
 
+  /** The source of an array pattern (`const [a, b] = e`, `[a, b] = e`) when `e` is
+   *  not array-like: a Map or Set is materialized to an array (their iterators have
+   *  no `return`, so nothing observable differs); a class iterable, a generator, an
+   *  iterator object or an object with [Symbol.iterator] is stepped by the
+   *  protocol. undefined for an array, a tuple, a string or `any`: read by index. */
+  private iterablePatternSource(ctx: FnCtx, init: ts.Expression): { array: number; source: number } | { drv: IterDriver } | undefined {
+    const rk = this.builtinReceiverKind(init);
+    if (rk === "array" || rk === "string") return undefined;
+    let t: ts.Type;
+    try { t = this.checker.getTypeAtLocation(init); } catch { return undefined; }
+    if (t.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.StringLike)) return undefined;
+    const arrayLike = (ty: ts.Type): boolean => this.checker.isArrayLikeType(ty) || !!(ty.flags & ts.TypeFlags.StringLike);
+    if (arrayLike(t) || (t.isUnion() && t.types.every(arrayLike))) return undefined;
+    if (rk === "map" || rk === "set") {
+      const recv = this.lowerExpr(ctx, init);
+      const it = this.newLocal(ctx, "reference");
+      ctx.body.push({ kind: "CallBuiltin", dst: it, builtin: rk === "map" ? "map.entries" : "set.values", recv, args: [] });
+      const array = this.newLocal(ctx, "reference");
+      ctx.body.push({ kind: "CallBuiltinStatic", dst: array, builtin: "array.from", args: [it] });
+      return { array, source: recv };
+    }
+    const drv = this.resolveIterator(ctx, init);
+    return drv === undefined ? undefined : { drv };
+  }
+  /** The elements of a binding pattern as the protocol binder takes them. */
+  private bindingPatternElements(ctx: FnCtx, pat: ts.ArrayBindingPattern): IterPatternElement[] {
+    return pat.elements.map((el): IterPatternElement => ({
+      node: el,
+      omitted: ts.isOmittedExpression(el),
+      rest: !ts.isOmittedExpression(el) && el.dotDotDotToken !== undefined,
+      bind: (v: number) => {
+        if (ts.isOmittedExpression(el)) return;
+        this.lowerBindingPattern(ctx, el.name, el.initializer ? this.applyDefault(ctx, v, el.initializer) : v);
+      },
+    }));
+  }
+  /** A pattern bound from a local rather than an expression (nested in another
+   *  pattern, a parameter, a for-of variable): when its declared type is not
+   *  array-like, the value is iterated through the runtime's GetIterator. */
+  private dynamicPatternDriver(ctx: FnCtx, pat: ts.ArrayBindingPattern, src: number): IterDriver | undefined {
+    let t: ts.Type;
+    try { t = this.checker.getTypeAtLocation(pat.parent); } catch { return undefined; }
+    if (t.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.StringLike)) return undefined;
+    const arrayLike = (ty: ts.Type): boolean => this.checker.isArrayLikeType(ty) || !!(ty.flags & (ts.TypeFlags.StringLike | ts.TypeFlags.Any | ts.TypeFlags.Unknown));
+    if (arrayLike(t) || (t.isUnion() && t.types.every(arrayLike))) return undefined;
+    return this.runtimeIterDriver(ctx, src, false);
+  }
+  /** The protocol over an iterator the runtime acquires (ts_iter_acquire): next by
+   *  the generic step, IteratorClose by the generic close. */
+  private runtimeIterDriver(ctx: FnCtx, src: number, async: boolean): IterDriver {
+    const itLocal = this.newLocal(ctx, "reference");
+    ctx.body.push({ kind: "CallBuiltinStatic", dst: itLocal, builtin: `iter.acquire:${async ? 1 : 0}`, args: [src] });
+    const step = (sent: number): number => {
+      const rr = this.emitIterNext(ctx, itLocal, sent);
+      if (!async) return rr;
+      const r = this.newLocal(ctx, "reference");
+      ctx.body.push({ kind: "Await", dst: r, operand: rr });
+      return r;
+    };
+    const returnCall = (): void => {
+      const rr = this.newLocal(ctx, "reference");
+      ctx.body.push({ kind: "CallBuiltin", dst: rr, builtin: `iter.close:${this.internName("return")}`, recv: itLocal, args: [] });
+      if (async) {
+        const undefV = this.newLocal(ctx, "reference");
+        ctx.body.push({ kind: "Const", dst: undefV, value: { kind: "Undef" } });
+        const called = this.newLocal(ctx, "primitive");
+        ctx.body.push({ kind: "BinOp", dst: called, op: "!==", lhs: rr, rhs: undefV });
+        const thenBody = this.captureBody(ctx, () => {
+          const awaited = this.newLocal(ctx, "reference");
+          ctx.body.push({ kind: "Await", dst: awaited, operand: rr });
+        });
+        ctx.body.push({ kind: "If", cond: called, thenBody, elseBody: [] });
+      }
+    };
+    return { itLocal, srcLocal: src, isAsync: async, step, returnCall };
+  }
+  /** Bind an array pattern from an iterator: one step per element (a hole takes one
+   *  too, a step past the end leaves undefined), the rest element collecting what
+   *  remains, and IteratorClose when the pattern ends before the iterator does. */
+  private lowerArrayPatternByProtocol(ctx: FnCtx, drv: IterDriver, elements: IterPatternElement[]): void {
+    const doneField = this.internField("done");
+    const valueField = this.internField("value");
+    const undef0 = this.newLocal(ctx, "reference");
+    ctx.body.push({ kind: "Const", dst: undef0, value: { kind: "Undef" } });
+    const falseC = this.newLocal(ctx, "primitive");
+    ctx.body.push({ kind: "Const", dst: falseC, value: { kind: "Bool", value: false } });
+    const trueC = this.newLocal(ctx, "primitive");
+    ctx.body.push({ kind: "Const", dst: trueC, value: { kind: "Bool", value: true } });
+    const done = this.newLocal(ctx, "primitive");
+    ctx.body.push({ kind: "Copy", dst: done, src: falseC });
+    const notDone = (): number => {
+      const nd = this.newLocal(ctx, "primitive");
+      ctx.body.push({ kind: "UnOp", dst: nd, op: "!", operand: done });
+      return nd;
+    };
+    // r = it.next(); if (r.done) done = true; else <onValue>(r.value)
+    const stepOnce = (onValue: ((value: number) => void) | undefined): void => {
+      const r = drv.step(undef0);
+      const d = this.newLocal(ctx, "reference");
+      ctx.body.push({ kind: "LoadField", dst: d, obj: r, field: doneField });
+      const more = this.newLocal(ctx, "primitive");
+      ctx.body.push({ kind: "UnOp", dst: more, op: "!", operand: d });
+      const thenBody = this.captureBody(ctx, () => {
+        if (onValue !== undefined) {
+          const value = this.newLocal(ctx, "reference");
+          ctx.body.push({ kind: "LoadField", dst: value, obj: r, field: valueField });
+          onValue(value);
+        }
+      });
+      const elseBody = this.captureBody(ctx, () => { ctx.body.push({ kind: "Copy", dst: done, src: trueC }); });
+      ctx.body.push({ kind: "If", cond: more, thenBody, elseBody });
+    };
+    for (const el of elements) {
+      if (el.rest) {
+        const site = this.site++;
+        this.recordSite(site, "array", this.inLoop(el.node) ? "many" : "once", false, el.node);
+        const arr = this.newLocal(ctx, "reference");
+        ctx.body.push({ kind: "AllocArray", dst: arr, elemType: 0, site });
+        let cond = -1;
+        const condBody = this.captureBody(ctx, () => { cond = notDone(); });
+        const body = this.captureLoopBody(ctx, "while", () => {
+          stepOnce((value) => { ctx.body.push({ kind: "ArrayPush", arr, src: value }); });
+        });
+        ctx.body.push({ kind: "Loop", cond, condBody, body });
+        el.bind(arr);
+        continue;
+      }
+      const v = this.newLocal(ctx, "reference");
+      ctx.body.push({ kind: "Const", dst: v, value: { kind: "Undef" } });
+      const pending = notDone();
+      const thenBody = this.captureBody(ctx, () => {
+        stepOnce(el.omitted ? undefined : (value) => { ctx.body.push({ kind: "Copy", dst: v, src: value }); });
+      });
+      ctx.body.push({ kind: "If", cond: pending, thenBody, elseBody: [] });
+      if (!el.omitted) el.bind(v);
+    }
+    if (drv.returnCall) {
+      const open = notDone();
+      const thenBody = this.captureBody(ctx, () => { drv.returnCall!(); });
+      ctx.body.push({ kind: "If", cond: open, thenBody, elseBody: [] });
+    }
+  }
+
   lowerBindingPattern(ctx: FnCtx, pat: ts.BindingName, src: number): void {
     if (ts.isIdentifier(pat)) {
       const sym = this.symbolOf(pat);
@@ -10713,6 +10929,8 @@ class Exporter {
       return;
     }
     if (ts.isArrayBindingPattern(pat)) {
+      const drv = this.dynamicPatternDriver(ctx, pat, src);
+      if (drv !== undefined) { this.lowerArrayPatternByProtocol(ctx, drv, this.bindingPatternElements(ctx, pat)); return; }
       pat.elements.forEach((el, i) => {
         if (ts.isOmittedExpression(el)) return; // hole: const [, b] = ...
         if (el.dotDotDotToken) {
@@ -10963,7 +11181,7 @@ class Exporter {
    *  not a recognized iterable/iterator (caller decides: array fallback or reject). */
   resolveIterator(
     ctx: FnCtx, expr: ts.Expression, opts: { forceAsync?: boolean } = {}
-  ): { itLocal: number; isAsync: boolean; step: (sentLocal: number) => number; throwStep?: (excLocal: number) => number; returnCall?: () => void } | undefined {
+  ): IterDriver | undefined {
     const isOurGen = this.isGeneratorType(expr);
     const isOurAsyncGen = this.isAsyncGeneratorType(expr);
     const ofClass = this.classOfExpr(expr);
@@ -10974,11 +11192,15 @@ class Exporter {
     // A non-class object exposing [Symbol.iterator] (e.g. an object literal with a
     // computed `[Symbol.iterator]()` member). Acquired at runtime via the symbol
     // key, then stepped with the dynamic .next() protocol.
-    const objSymIterable = !isOurGen && !isOurAsyncGen && !isIterable && !isIterator &&
-      this.typeHasSymbolIterator(expr);
+    const plainObject = !isOurGen && !isOurAsyncGen && !isIterable && !isIterator;
+    const objSymSync = plainObject && this.typeHasSymbolIterator(expr, "iterator");
+    const objSymAsync = plainObject && this.typeHasSymbolIterator(expr, "asyncIterator");
+    // for-await takes [Symbol.asyncIterator] when there is one; a sync loop needs [Symbol.iterator]
+    const useAsyncSym = objSymAsync && (!!opts.forceAsync || !objSymSync);
+    const objSymIterable = useAsyncSym || objSymSync;
     if (!isOurGen && !isOurAsyncGen && !isIterable && !isIterator && !objSymIterable) return undefined;
 
-    const isAsync = !!opts.forceAsync || isOurAsyncGen || hasAsyncIter || this.isAsyncIteratorType(expr);
+    const isAsync = !!opts.forceAsync || isOurAsyncGen || hasAsyncIter || useAsyncSym || this.isAsyncIteratorType(expr);
     const src = this.lowerExpr(ctx, expr);
 
     // If the iterable's [Symbol.iterator]/[Symbol.asyncIterator] method is itself a
@@ -10998,14 +11220,11 @@ class Exporter {
         callee: { kind: "Method", recvClass: ofClass!, method: this.internName(iterMethodName), recvStable: false },
       });
     } else if (objSymIterable) {
-      // it = obj[Symbol.iterator]() : fetch the symbol-keyed method, then call it
-      // through a function value (recv = obj so `this` inside the method binds).
-      const wkSingleton = this.newLocal(ctx, "reference");
-      ctx.body.push({ kind: "CallBuiltinStatic", dst: wkSingleton, builtin: "symbol.wksym:0", args: [] });
-      const iterFn = this.newLocal(ctx, "reference");
-      ctx.body.push({ kind: "CallBuiltinStatic", dst: iterFn, builtin: "symbol.get", args: [src, wkSingleton] });
+      // it = GetIterator(obj) at run time: the symbol-keyed method called on the
+      // object, or the runtime's iterator when the value turns out to be an array,
+      // a string or a collection (a parameter typed Iterable<T> takes any of them).
       itLocal = this.newLocal(ctx, "reference");
-      ctx.body.push({ kind: "Call", dst: itLocal, recv: src, args: [], callee: { kind: "Value", local: iterFn } });
+      ctx.body.push({ kind: "CallBuiltinStatic", dst: itLocal, builtin: `iter.acquire:${useAsyncSym ? 1 : 0}`, args: [src] });
     }
 
     const useBuiltin = isOurGen || isOurAsyncGen || iterIsGenerator;
@@ -11077,26 +11296,28 @@ class Exporter {
           ctx.body.push({ kind: "Await", dst: awaited, operand: rr });
         }
       };
-    } else {
-      const itHasReturn = (ofClass !== undefined && this.classHasMethod(ofClass, "return"))
-        || this.typeHasCallable(expr, "return");
-      if (itHasReturn) {
-        returnCall = () => {
-          const undefA = this.newLocal(ctx, "reference");
-          ctx.body.push({ kind: "Const", dst: undefA, value: { kind: "Undef" } });
-          const rr = this.newLocal(ctx, "reference");
-          ctx.body.push({
-            kind: "Call", dst: rr, recv: itLocal, args: [undefA],
-            callee: { kind: "Method", recvClass: 0xffffffff, method: this.internName("return"), recvStable: false },
-          });
-          if (isAsync) {
+    } else if (this.iteratorMayHaveReturn(expr, isIterable || objSymIterable, hasAsyncIter || useAsyncSym)) {
+      // IteratorClose: the iterator's `return`, looked up at run time (a class
+      // iterator's prototype method, an own function, nothing), called without an
+      // argument; a generator object standing in as an iterator is returned from.
+      // AsyncIteratorClose awaits the result only when there was a method to call.
+      returnCall = () => {
+        const rr = this.newLocal(ctx, "reference");
+        ctx.body.push({ kind: "CallBuiltin", dst: rr, builtin: `iter.close:${this.internName("return")}`, recv: itLocal, args: [] });
+        if (isAsync) {
+          const undefV = this.newLocal(ctx, "reference");
+          ctx.body.push({ kind: "Const", dst: undefV, value: { kind: "Undef" } });
+          const called = this.newLocal(ctx, "primitive");
+          ctx.body.push({ kind: "BinOp", dst: called, op: "!==", lhs: rr, rhs: undefV });
+          const thenBody = this.captureBody(ctx, () => {
             const awaited = this.newLocal(ctx, "reference");
             ctx.body.push({ kind: "Await", dst: awaited, operand: rr });
-          }
-        };
-      }
+          });
+          ctx.body.push({ kind: "If", cond: called, thenBody, elseBody: [] });
+        }
+      };
     }
-    return { itLocal, isAsync, step, throwStep, returnCall };
+    return { itLocal, srcLocal: src, isAsync, step, throwStep, returnCall };
   }
 
   /** True if the expression's static type has a callable member `name`. */
@@ -11114,13 +11335,38 @@ class Exporter {
    *  is a non-array, non-class iterable object such as an object literal with a
    *  computed `[Symbol.iterator]()` member)? TS names that member `__@iterator@N`.
    *  Excludes arrays/strings (handled by the index loop) and our generators. */
-  private typeHasSymbolIterator(expr: ts.Expression): boolean {
-    if (this.builtinReceiverKind(expr) === "array" || this.builtinReceiverKind(expr) === "string") return false;
+  private typeHasSymbolIterator(expr: ts.Expression, which: "iterator" | "asyncIterator" = "iterator"): boolean {
+    if (which === "iterator" && (this.builtinReceiverKind(expr) === "array" || this.builtinReceiverKind(expr) === "string")) return false;
     try {
       const t = this.checker.getTypeAtLocation(expr);
       const props = this.checker.getPropertiesOfType(t);
-      return props.some((p) => String(p.escapedName).startsWith("__@iterator"));
+      return props.some((p) => String(p.escapedName).startsWith(`__@${which}@`) || String(p.escapedName) === `__@${which}`);
     } catch { return false; }
+  }
+  /** May the iterator a loop drives have a `return` method (IteratorClose calls it
+   *  on an abrupt exit)? The iterator's static type decides: the result type of the
+   *  iterable's [Symbol.iterator]/[Symbol.asyncIterator] method, or the expression's
+   *  own type for an iterator object. `any`, a union with such a member, or a type
+   *  declaring `return` (lib's `Iterator<T>` declares it optional) may; an object
+   *  literal or class type without one does not, and keeps the plain loop. */
+  private iteratorMayHaveReturn(expr: ts.Expression, viaIterable: boolean, async: boolean): boolean {
+    try {
+      let t: ts.Type = this.checker.getTypeAtLocation(expr);
+      if (viaIterable) {
+        const prefix = async ? "__@asyncIterator" : "__@iterator";
+        const m = this.checker.getPropertiesOfType(t).find((p) => String(p.escapedName).startsWith(prefix));
+        if (!m) return true;
+        const sigs = this.checker.getTypeOfSymbolAtLocation(m, expr).getCallSignatures();
+        if (sigs.length === 0) return true;
+        t = sigs[0].getReturnType();
+      }
+      const may = (ty: ts.Type): boolean => {
+        if (ty.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) return true;
+        if (ty.isUnion() || ty.isIntersection()) return ty.types.some(may);
+        return ty.getProperty("return") !== undefined;
+      };
+      return may(t);
+    } catch { return true; }
   }
 
   /** Collect the closure-captured identifier symbols declared by a loop binding
@@ -12456,6 +12702,15 @@ class Exporter {
         } else if (ts.isArrayBindingPattern(d.name) || ts.isObjectBindingPattern(d.name)) {
           // Destructuring: evaluate the initializer once, then bind each element.
           if (!d.initializer) { this.unsupported(d, "destructuring declaration without initializer"); continue; }
+          if (ts.isArrayBindingPattern(d.name)) {
+            const pat = d.name;
+            const source = this.iterablePatternSource(ctx, d.initializer);
+            if (source !== undefined && !("drv" in source)) { this.lowerBindingPattern(ctx, pat, source.array); continue; }
+            if (source !== undefined && "drv" in source) {
+              this.lowerArrayPatternByProtocol(ctx, source.drv, this.bindingPatternElements(ctx, pat));
+              continue;
+            }
+          }
           const src = this.lowerExpr(ctx, d.initializer);
           this.lowerBindingPattern(ctx, d.name, src);
         } else {

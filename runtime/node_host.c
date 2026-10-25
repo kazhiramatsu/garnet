@@ -13,6 +13,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <poll.h>
+#include <sys/wait.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -142,7 +143,7 @@ static tsv nh_read_file(tsv* a, int n){
 }
 static int nh_write_all(int fd, const uint8_t* data, size_t length){
   size_t done = 0;
-  if (fd == 1) fflush(stdout); else if (fd == 2) fflush(stderr);
+  if (fd == 1 || fd == 2){ fflush(stdout); fflush(stderr); }   /* console output before this write, in order, on both streams */
   while (done < length){
     ssize_t w = write(fd, data + done, length - done);
     if (w < 0){ if (errno == EINTR) continue; nh_last_errno = errno; return -1; }
@@ -219,7 +220,7 @@ static tsv nh_write(tsv* a, int n){
   nh_bytes b = nh_bytes_of(nh_arg(a, n, 1));
   double off = nh_num(a, n, 2, 0), len = nh_num(a, n, 3, (double)b.length - off), pos = nh_num(a, n, 4, -1);
   if (!(off >= 0) || !(len >= 0) || off + len > b.length){ free(b.owned); ts_throw_range_error_msg("The value of \"length\" is out of range"); }
-  if (fd == 1) fflush(stdout); else if (fd == 2) fflush(stderr);
+  if (fd == 1 || fd == 2){ fflush(stdout); fflush(stderr); }   /* console output before this write, in order, on both streams */
   ssize_t w;
   do { w = pos >= 0 ? pwrite(fd, b.data + (size_t)off, (size_t)len, (off_t)pos) : write(fd, b.data + (size_t)off, (size_t)len); } while (w < 0 && errno == EINTR);
   if (w < 0) nh_last_errno = errno;
@@ -735,7 +736,9 @@ static void nh_immediates_run(void){
     } else free(im);
   }
 }
-static int nh_loop_alive(void){ return g_nh_refed_timers > 0 || g_nh_refed_immediates > 0 || g_nh_tick_head != NULL; }
+static int nh_io_alive(void);
+static void nh_mark_io_roots(int young);
+static int nh_loop_alive(void){ return g_nh_refed_timers > 0 || g_nh_refed_immediates > 0 || g_nh_tick_head != NULL || nh_io_alive(); }
 static int nh_immediates_pending(void){ return g_nh_imm_head != NULL; }
 /* milliseconds until the earliest referenced timer, at most `limit` */
 static int nh_next_timer_timeout_ms(int limit){
@@ -750,6 +753,7 @@ static int nh_next_timer_timeout_ms(int limit){
 }
 static void nh_sleep_ms(int ms){ if (ms > 0) poll(NULL, 0, ms); }
 static void nh_mark_loop_roots(int young){
+  nh_mark_io_roots(young);
   for (nh_timer* t = g_nh_timers; t; t = t->next){ gc_visit_slot(&t->cb, young, 0, 1); gc_visit_slot(&t->args, young, 0, 1); }
   for (nh_immediate* im = g_nh_imm_head; im; im = im->next){ gc_visit_slot(&im->cb, young, 0, 1); gc_visit_slot(&im->args, young, 0, 1); }
   for (nh_tick* t = g_nh_tick_head; t; t = t->next){ gc_visit_slot(&t->cb, young, 0, 1); gc_visit_slot(&t->args, young, 0, 1); }
@@ -833,6 +837,461 @@ static tsv nh_next_tick(tsv* a, int n){
   g_nh_tick_tail = t;
   return TS_UNDEFINED;
 }
+/* ---- digests for node:crypto: md5, sha1, sha256, sha512 (RFC 1321, 3174, 6234) ---- */
+static uint32_t nh_rol32(uint32_t x, int n){ return (x << n) | (x >> (32 - n)); }
+static uint32_t nh_ror32(uint32_t x, int n){ return (x >> n) | (x << (32 - n)); }
+static uint64_t nh_ror64(uint64_t x, int n){ return (x >> n) | (x << (64 - n)); }
+static void nh_md5(const uint8_t* msg, size_t len, uint8_t out[16]){
+  static const uint32_t K[64] = {
+    0xd76aa478,0xe8c7b756,0x242070db,0xc1bdceee,0xf57c0faf,0x4787c62a,0xa8304613,0xfd469501,0x698098d8,0x8b44f7af,0xffff5bb1,0x895cd7be,0x6b901122,0xfd987193,0xa679438e,0x49b40821,
+    0xf61e2562,0xc040b340,0x265e5a51,0xe9b6c7aa,0xd62f105d,0x02441453,0xd8a1e681,0xe7d3fbc8,0x21e1cde6,0xc33707d6,0xf4d50d87,0x455a14ed,0xa9e3e905,0xfcefa3f8,0x676f02d9,0x8d2a4c8a,
+    0xfffa3942,0x8771f681,0x6d9d6122,0xfde5380c,0xa4beea44,0x4bdecfa9,0xf6bb4b60,0xbebfbc70,0x289b7ec6,0xeaa127fa,0xd4ef3085,0x04881d05,0xd9d4d039,0xe6db99e5,0x1fa27cf8,0xc4ac5665,
+    0xf4292244,0x432aff97,0xab9423a7,0xfc93a039,0x655b59c3,0x8f0ccc92,0xffeff47d,0x85845dd1,0x6fa87e4f,0xfe2ce6e0,0xa3014314,0x4e0811a1,0xf7537e82,0xbd3af235,0x2ad7d2bb,0xeb86d391 };
+  static const int R[64] = { 7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22, 5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20, 4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23, 6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21 };
+  uint32_t h0 = 0x67452301, h1 = 0xefcdab89, h2 = 0x98badcfe, h3 = 0x10325476;
+  size_t total = ((len + 8) / 64 + 1) * 64;
+  uint8_t* buf = (uint8_t*)calloc(total, 1);
+  memcpy(buf, msg, len); buf[len] = 0x80;
+  uint64_t bits = (uint64_t)len * 8;
+  for (int i = 0; i < 8; i++) buf[total - 8 + i] = (uint8_t)(bits >> (8 * i));
+  for (size_t off = 0; off < total; off += 64){
+    uint32_t M[16];
+    for (int i = 0; i < 16; i++) M[i] = (uint32_t)buf[off + 4*i] | ((uint32_t)buf[off + 4*i + 1] << 8) | ((uint32_t)buf[off + 4*i + 2] << 16) | ((uint32_t)buf[off + 4*i + 3] << 24);
+    uint32_t a = h0, b = h1, c = h2, d = h3;
+    for (int i = 0; i < 64; i++){
+      uint32_t f; int g;
+      if (i < 16){ f = (b & c) | (~b & d); g = i; }
+      else if (i < 32){ f = (d & b) | (~d & c); g = (5 * i + 1) % 16; }
+      else if (i < 48){ f = b ^ c ^ d; g = (3 * i + 5) % 16; }
+      else { f = c ^ (b | ~d); g = (7 * i) % 16; }
+      uint32_t tmp = d; d = c; c = b;
+      b = b + nh_rol32(a + f + K[i] + M[g], R[i]);
+      a = tmp;
+    }
+    h0 += a; h1 += b; h2 += c; h3 += d;
+  }
+  free(buf);
+  uint32_t hs[4] = { h0, h1, h2, h3 };
+  for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) out[4*i + j] = (uint8_t)(hs[i] >> (8 * j));
+}
+static void nh_sha1(const uint8_t* msg, size_t len, uint8_t out[20]){
+  uint32_t h[5] = { 0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0 };
+  size_t total = ((len + 8) / 64 + 1) * 64;
+  uint8_t* buf = (uint8_t*)calloc(total, 1);
+  memcpy(buf, msg, len); buf[len] = 0x80;
+  uint64_t bits = (uint64_t)len * 8;
+  for (int i = 0; i < 8; i++) buf[total - 1 - i] = (uint8_t)(bits >> (8 * i));
+  for (size_t off = 0; off < total; off += 64){
+    uint32_t w[80];
+    for (int i = 0; i < 16; i++) w[i] = ((uint32_t)buf[off + 4*i] << 24) | ((uint32_t)buf[off + 4*i + 1] << 16) | ((uint32_t)buf[off + 4*i + 2] << 8) | (uint32_t)buf[off + 4*i + 3];
+    for (int i = 16; i < 80; i++) w[i] = nh_rol32(w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16], 1);
+    uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
+    for (int i = 0; i < 80; i++){
+      uint32_t f, k;
+      if (i < 20){ f = (b & c) | (~b & d); k = 0x5A827999; }
+      else if (i < 40){ f = b ^ c ^ d; k = 0x6ED9EBA1; }
+      else if (i < 60){ f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
+      else { f = b ^ c ^ d; k = 0xCA62C1D6; }
+      uint32_t tmp = nh_rol32(a, 5) + f + e + k + w[i];
+      e = d; d = c; c = nh_rol32(b, 30); b = a; a = tmp;
+    }
+    h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e;
+  }
+  free(buf);
+  for (int i = 0; i < 5; i++){ out[4*i] = (uint8_t)(h[i] >> 24); out[4*i+1] = (uint8_t)(h[i] >> 16); out[4*i+2] = (uint8_t)(h[i] >> 8); out[4*i+3] = (uint8_t)h[i]; }
+}
+static void nh_sha256(const uint8_t* msg, size_t len, uint8_t out[32]){
+  static const uint32_t K[64] = {
+    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2 };
+  uint32_t h[8] = { 0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19 };
+  size_t total = ((len + 8) / 64 + 1) * 64;
+  uint8_t* buf = (uint8_t*)calloc(total, 1);
+  memcpy(buf, msg, len); buf[len] = 0x80;
+  uint64_t bits = (uint64_t)len * 8;
+  for (int i = 0; i < 8; i++) buf[total - 1 - i] = (uint8_t)(bits >> (8 * i));
+  for (size_t off = 0; off < total; off += 64){
+    uint32_t w[64];
+    for (int i = 0; i < 16; i++) w[i] = ((uint32_t)buf[off + 4*i] << 24) | ((uint32_t)buf[off + 4*i + 1] << 16) | ((uint32_t)buf[off + 4*i + 2] << 8) | (uint32_t)buf[off + 4*i + 3];
+    for (int i = 16; i < 64; i++){
+      uint32_t s0 = nh_ror32(w[i-15], 7) ^ nh_ror32(w[i-15], 18) ^ (w[i-15] >> 3);
+      uint32_t s1 = nh_ror32(w[i-2], 17) ^ nh_ror32(w[i-2], 19) ^ (w[i-2] >> 10);
+      w[i] = w[i-16] + s0 + w[i-7] + s1;
+    }
+    uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
+    for (int i = 0; i < 64; i++){
+      uint32_t S1 = nh_ror32(e, 6) ^ nh_ror32(e, 11) ^ nh_ror32(e, 25);
+      uint32_t ch = (e & f) ^ (~e & g);
+      uint32_t t1 = hh + S1 + ch + K[i] + w[i];
+      uint32_t S0 = nh_ror32(a, 2) ^ nh_ror32(a, 13) ^ nh_ror32(a, 22);
+      uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+      uint32_t t2 = S0 + maj;
+      hh = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
+    }
+    h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+  }
+  free(buf);
+  for (int i = 0; i < 8; i++){ out[4*i] = (uint8_t)(h[i] >> 24); out[4*i+1] = (uint8_t)(h[i] >> 16); out[4*i+2] = (uint8_t)(h[i] >> 8); out[4*i+3] = (uint8_t)h[i]; }
+}
+static void nh_sha512(const uint8_t* msg, size_t len, uint8_t out[64]){
+  static const uint64_t K[80] = {
+    0x428a2f98d728ae22ULL,0x7137449123ef65cdULL,0xb5c0fbcfec4d3b2fULL,0xe9b5dba58189dbbcULL,0x3956c25bf348b538ULL,0x59f111f1b605d019ULL,0x923f82a4af194f9bULL,0xab1c5ed5da6d8118ULL,
+    0xd807aa98a3030242ULL,0x12835b0145706fbeULL,0x243185be4ee4b28cULL,0x550c7dc3d5ffb4e2ULL,0x72be5d74f27b896fULL,0x80deb1fe3b1696b1ULL,0x9bdc06a725c71235ULL,0xc19bf174cf692694ULL,
+    0xe49b69c19ef14ad2ULL,0xefbe4786384f25e3ULL,0x0fc19dc68b8cd5b5ULL,0x240ca1cc77ac9c65ULL,0x2de92c6f592b0275ULL,0x4a7484aa6ea6e483ULL,0x5cb0a9dcbd41fbd4ULL,0x76f988da831153b5ULL,
+    0x983e5152ee66dfabULL,0xa831c66d2db43210ULL,0xb00327c898fb213fULL,0xbf597fc7beef0ee4ULL,0xc6e00bf33da88fc2ULL,0xd5a79147930aa725ULL,0x06ca6351e003826fULL,0x142929670a0e6e70ULL,
+    0x27b70a8546d22ffcULL,0x2e1b21385c26c926ULL,0x4d2c6dfc5ac42aedULL,0x53380d139d95b3dfULL,0x650a73548baf63deULL,0x766a0abb3c77b2a8ULL,0x81c2c92e47edaee6ULL,0x92722c851482353bULL,
+    0xa2bfe8a14cf10364ULL,0xa81a664bbc423001ULL,0xc24b8b70d0f89791ULL,0xc76c51a30654be30ULL,0xd192e819d6ef5218ULL,0xd69906245565a910ULL,0xf40e35855771202aULL,0x106aa07032bbd1b8ULL,
+    0x19a4c116b8d2d0c8ULL,0x1e376c085141ab53ULL,0x2748774cdf8eeb99ULL,0x34b0bcb5e19b48a8ULL,0x391c0cb3c5c95a63ULL,0x4ed8aa4ae3418acbULL,0x5b9cca4f7763e373ULL,0x682e6ff3d6b2b8a3ULL,
+    0x748f82ee5defb2fcULL,0x78a5636f43172f60ULL,0x84c87814a1f0ab72ULL,0x8cc702081a6439ecULL,0x90befffa23631e28ULL,0xa4506cebde82bde9ULL,0xbef9a3f7b2c67915ULL,0xc67178f2e372532bULL,
+    0xca273eceea26619cULL,0xd186b8c721c0c207ULL,0xeada7dd6cde0eb1eULL,0xf57d4f7fee6ed178ULL,0x06f067aa72176fbaULL,0x0a637dc5a2c898a6ULL,0x113f9804bef90daeULL,0x1b710b35131c471bULL,
+    0x28db77f523047d84ULL,0x32caab7b40c72493ULL,0x3c9ebe0a15c9bebcULL,0x431d67c49c100d4cULL,0x4cc5d4becb3e42b6ULL,0x597f299cfc657e2aULL,0x5fcb6fab3ad6faecULL,0x6c44198c4a475817ULL };
+  uint64_t h[8] = { 0x6a09e667f3bcc908ULL,0xbb67ae8584caa73bULL,0x3c6ef372fe94f82bULL,0xa54ff53a5f1d36f1ULL,0x510e527fade682d1ULL,0x9b05688c2b3e6c1fULL,0x1f83d9abfb41bd6bULL,0x5be0cd19137e2179ULL };
+  size_t total = ((len + 16) / 128 + 1) * 128;
+  uint8_t* buf = (uint8_t*)calloc(total, 1);
+  memcpy(buf, msg, len); buf[len] = 0x80;
+  uint64_t bits = (uint64_t)len * 8;
+  for (int i = 0; i < 8; i++) buf[total - 1 - i] = (uint8_t)(bits >> (8 * i));
+  for (size_t off = 0; off < total; off += 128){
+    uint64_t w[80];
+    for (int i = 0; i < 16; i++){ w[i] = 0; for (int j = 0; j < 8; j++) w[i] = (w[i] << 8) | buf[off + 8*i + j]; }
+    for (int i = 16; i < 80; i++){
+      uint64_t s0 = nh_ror64(w[i-15], 1) ^ nh_ror64(w[i-15], 8) ^ (w[i-15] >> 7);
+      uint64_t s1 = nh_ror64(w[i-2], 19) ^ nh_ror64(w[i-2], 61) ^ (w[i-2] >> 6);
+      w[i] = w[i-16] + s0 + w[i-7] + s1;
+    }
+    uint64_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
+    for (int i = 0; i < 80; i++){
+      uint64_t S1 = nh_ror64(e, 14) ^ nh_ror64(e, 18) ^ nh_ror64(e, 41);
+      uint64_t ch = (e & f) ^ (~e & g);
+      uint64_t t1 = hh + S1 + ch + K[i] + w[i];
+      uint64_t S0 = nh_ror64(a, 28) ^ nh_ror64(a, 34) ^ nh_ror64(a, 39);
+      uint64_t maj = (a & b) ^ (a & c) ^ (b & c);
+      uint64_t t2 = S0 + maj;
+      hh = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
+    }
+    h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+  }
+  free(buf);
+  for (int i = 0; i < 8; i++) for (int j = 0; j < 8; j++) out[8*i + j] = (uint8_t)(h[i] >> (56 - 8 * j));
+}
+/* hash(algorithm, data) -> the digest as a Uint8Array; algorithm: "md5", "sha1", "sha256", "sha512" */
+static tsv nh_hash(tsv* a, int n){
+  tsv alg = nh_arg(a, n, 0);
+  if (!ts_is_str(alg)) ts_throw_type_error_msg("The \"algorithm\" argument must be of type string");
+  uint32_t alen; char* name = ts_string_utf8_copy(alg, &alen);
+  nh_bytes b = nh_bytes_of(nh_arg(a, n, 1));
+  uint8_t digest[64]; uint32_t dlen = 0;
+  if (!strcmp(name, "md5")){ nh_md5(b.data, b.length, digest); dlen = 16; }
+  else if (!strcmp(name, "sha1")){ nh_sha1(b.data, b.length, digest); dlen = 20; }
+  else if (!strcmp(name, "sha256")){ nh_sha256(b.data, b.length, digest); dlen = 32; }
+  else if (!strcmp(name, "sha512")){ nh_sha512(b.data, b.length, digest); dlen = 64; }
+  free(name); free(b.owned);
+  if (dlen == 0) return TS_UNDEFINED;
+  tsv len = ts_num((double)dlen);
+  tsv out = ts_new_typed_array(TS_TA_UINT8, &len, 1);
+  memcpy(((ts_typedarray*)ts_ptr(out))->data, digest, dlen);
+  return out;
+}
+/* ---- file descriptors the loop watches (a child's pipes, standard input) and
+   child processes (node:child_process). A watch reads what is ready into a
+   Uint8Array for its onData callback and calls onEnd at end of file; a child
+   is reaped from the loop (SIGCHLD wakes the poll through a self-pipe) and its
+   onExit callback gets the code or the signal's name. ---- */
+typedef struct nh_fdwatch { uint32_t id; int fd; tsv on_data, on_end; int active; struct nh_fdwatch* next; } nh_fdwatch;
+static nh_fdwatch* g_nh_fdwatches = NULL;
+static int g_nh_active_fdwatches = 0;
+typedef struct nh_child { pid_t pid; tsv on_exit; int active; struct nh_child* next; } nh_child;
+static nh_child* g_nh_children = NULL;
+static int g_nh_pending_children = 0;
+static int g_nh_sigchld_pipe[2] = { -1, -1 };
+static void nh_sigchld(int sig){ (void)sig; int e = errno; if (g_nh_sigchld_pipe[1] >= 0){ char c = 1; (void)!write(g_nh_sigchld_pipe[1], &c, 1); } errno = e; }
+static void nh_ensure_sigchld(void){
+  if (g_nh_sigchld_pipe[0] >= 0) return;
+  if (pipe(g_nh_sigchld_pipe)) ts_abort_msg("pipe for SIGCHLD failed");
+  fcntl(g_nh_sigchld_pipe[0], F_SETFL, O_NONBLOCK); fcntl(g_nh_sigchld_pipe[1], F_SETFL, O_NONBLOCK);
+  fcntl(g_nh_sigchld_pipe[0], F_SETFD, FD_CLOEXEC); fcntl(g_nh_sigchld_pipe[1], F_SETFD, FD_CLOEXEC);
+  struct sigaction sa; memset(&sa, 0, sizeof sa);
+  sa.sa_handler = nh_sigchld; sa.sa_flags = SA_RESTART | SA_NOCLDSTOP; sigemptyset(&sa.sa_mask);
+  sigaction(SIGCHLD, &sa, NULL);
+}
+static const char* nh_signal_name(int sig){
+  switch (sig){
+    case SIGHUP: return "SIGHUP"; case SIGINT: return "SIGINT"; case SIGQUIT: return "SIGQUIT"; case SIGILL: return "SIGILL"; case SIGTRAP: return "SIGTRAP";
+    case SIGABRT: return "SIGABRT"; case SIGBUS: return "SIGBUS"; case SIGFPE: return "SIGFPE"; case SIGKILL: return "SIGKILL"; case SIGUSR1: return "SIGUSR1";
+    case SIGSEGV: return "SIGSEGV"; case SIGUSR2: return "SIGUSR2"; case SIGPIPE: return "SIGPIPE"; case SIGALRM: return "SIGALRM"; case SIGTERM: return "SIGTERM";
+    case SIGCHLD: return "SIGCHLD"; case SIGCONT: return "SIGCONT"; case SIGSTOP: return "SIGSTOP"; case SIGTSTP: return "SIGTSTP"; case SIGWINCH: return "SIGWINCH";
+    default: return "SIGUNKNOWN";
+  }
+}
+static int nh_signal_number(tsv v){
+  if (ts_is_num(v)) return (int)ts_to_num(v);
+  if (!ts_is_str(v)) return SIGTERM;
+  uint32_t len; char* name = ts_string_utf8_copy(v, &len);
+  int sig = -1;
+  static const struct { const char* n; int s; } table[] = { {"SIGHUP",SIGHUP},{"SIGINT",SIGINT},{"SIGQUIT",SIGQUIT},{"SIGILL",SIGILL},{"SIGTRAP",SIGTRAP},{"SIGABRT",SIGABRT},{"SIGBUS",SIGBUS},{"SIGFPE",SIGFPE},{"SIGKILL",SIGKILL},{"SIGUSR1",SIGUSR1},{"SIGSEGV",SIGSEGV},{"SIGUSR2",SIGUSR2},{"SIGPIPE",SIGPIPE},{"SIGALRM",SIGALRM},{"SIGTERM",SIGTERM},{"SIGCHLD",SIGCHLD},{"SIGCONT",SIGCONT},{"SIGSTOP",SIGSTOP},{"SIGTSTP",SIGTSTP},{"SIGWINCH",SIGWINCH} };
+  for (size_t i = 0; i < sizeof table / sizeof table[0]; i++) if (!strcmp(name, table[i].n)) sig = table[i].s;
+  free(name);
+  return sig;
+}
+/* the argv / envp arrays of a spawn: NULL-terminated copies of the strings of a TS array */
+static char** nh_string_vector(tsv arr, uint32_t* count){
+  uint32_t n = ts_is_array(arr) ? ts_array_len(arr) : 0;
+  char** out = (char**)calloc((size_t)n + 1, sizeof(char*));
+  for (uint32_t i = 0; i < n; i++){
+    tsv v = ts_array_get(arr, i);
+    if (!ts_is_str(v)) v = ts_to_string_v(v);
+    uint32_t len; out[i] = ts_string_utf8_copy(v, &len);
+  }
+  if (count) *count = n;
+  return out;
+}
+static void nh_free_vector(char** v){ if (!v) return; for (char** p = v; *p; p++) free(*p); free(v); }
+typedef struct { int in[2], out[2], err[2]; } nh_stdio_pipes;
+/* fork and exec `file` with `argv`; mode per stream: 0 pipe, 1 inherit, 2 ignore. Returns the pid or -errno. */
+static pid_t nh_fork_exec(char** argv, const char* cwd, char** envp, int in_mode, int out_mode, int err_mode, nh_stdio_pipes* pp){
+  int modes[3] = { in_mode, out_mode, err_mode };
+  int (*pipes[3])[2] = { &pp->in, &pp->out, &pp->err };
+  for (int i = 0; i < 3; i++){ (*pipes[i])[0] = (*pipes[i])[1] = -1; if (modes[i] == 0 && pipe(*pipes[i])) return -errno; }
+  int errpipe[2]; if (pipe(errpipe)) return -errno;
+  fcntl(errpipe[1], F_SETFD, FD_CLOEXEC);
+  fflush(stdout); fflush(stderr);
+  pid_t pid = fork();
+  if (pid < 0){ int e = errno; close(errpipe[0]); close(errpipe[1]); return -e; }
+  if (pid == 0){
+    /* the child: wire the standard streams, change directory, exec */
+    if (in_mode == 0){ dup2(pp->in[0], 0); } else if (in_mode == 2){ int fd = open("/dev/null", O_RDONLY); if (fd >= 0){ dup2(fd, 0); close(fd); } }
+    if (out_mode == 0){ dup2(pp->out[1], 1); } else if (out_mode == 2){ int fd = open("/dev/null", O_WRONLY); if (fd >= 0){ dup2(fd, 1); close(fd); } }
+    if (err_mode == 0){ dup2(pp->err[1], 2); } else if (err_mode == 2){ int fd = open("/dev/null", O_WRONLY); if (fd >= 0){ dup2(fd, 2); close(fd); } }
+    for (int i = 0; i < 3; i++){ if ((*pipes[i])[0] > 2) close((*pipes[i])[0]); if ((*pipes[i])[1] > 2) close((*pipes[i])[1]); }
+    if (cwd && chdir(cwd)){ int e = errno; (void)!write(errpipe[1], &e, sizeof e); _exit(127); }
+    signal(SIGPIPE, SIG_DFL);
+    if (envp){ extern char** environ; environ = envp; }
+    execvp(argv[0], argv);
+    int e = errno; (void)!write(errpipe[1], &e, sizeof e); _exit(127);
+  }
+  close(errpipe[1]);
+  if (in_mode == 0) close(pp->in[0]);
+  if (out_mode == 0) close(pp->out[1]);
+  if (err_mode == 0) close(pp->err[1]);
+  int child_errno = 0; ssize_t r;
+  do { r = read(errpipe[0], &child_errno, sizeof child_errno); } while (r < 0 && errno == EINTR);
+  close(errpipe[0]);
+  if (r == (ssize_t)sizeof child_errno){
+    int st; waitpid(pid, &st, 0);
+    if (in_mode == 0) close(pp->in[1]);
+    if (out_mode == 0) close(pp->out[0]);
+    if (err_mode == 0) close(pp->err[0]);
+    return -child_errno;
+  }
+  return pid;
+}
+static void nh_append(uint8_t** buf, size_t* len, size_t* cap, const uint8_t* data, size_t n){
+  if (*len + n > *cap){ *cap = (*cap ? *cap * 2 : 65536); while (*cap < *len + n) *cap *= 2; *buf = (uint8_t*)realloc(*buf, *cap); }
+  memcpy(*buf + *len, data, n); *len += n;
+}
+static tsv nh_bytes_value(const uint8_t* data, size_t len){
+  tsv n = ts_num((double)len);
+  tsv out = ts_new_typed_array(TS_TA_UINT8, &n, 1);
+  if (len) memcpy(((ts_typedarray*)ts_ptr(out))->data, data, len);
+  return out;
+}
+/* spawnSync(argv, cwd, env, stdinBytes, timeoutMs, killSignal, stdoutMode, stderrMode)
+   -> [status | null, signal | undefined, stdout, stderr, errorCode | undefined, pid] */
+static tsv nh_spawn_sync(tsv* a, int n){
+  char** argv = nh_string_vector(nh_arg(a, n, 0), NULL);
+  tsv cwdv = nh_arg(a, n, 1); char* cwd = ts_is_str(cwdv) ? nh_path_of(cwdv) : NULL;
+  tsv envv = nh_arg(a, n, 2); char** envp = ts_is_array(envv) ? nh_string_vector(envv, NULL) : NULL;
+  tsv inv = nh_arg(a, n, 3);
+  nh_bytes input = { NULL, 0, NULL };
+  int in_mode = 2;
+  if (ts_is_str(inv) || ts_is_typed_array(inv)){ input = nh_bytes_of(inv); in_mode = 0; }
+  else if (ts_is_num(inv)) in_mode = (int)ts_to_num(inv);   /* 1 inherit, 2 ignore */
+  double timeout_ms = nh_num(a, n, 4, 0);
+  int kill_sig = nh_signal_number(nh_arg(a, n, 5)); if (kill_sig < 0) kill_sig = SIGTERM;
+  int out_mode = (int)nh_num(a, n, 6, 0), err_mode = (int)nh_num(a, n, 7, 0);
+  nh_stdio_pipes pp;
+  pid_t pid = nh_fork_exec(argv, cwd, envp, in_mode, out_mode, err_mode, &pp);
+  nh_free_vector(argv); nh_free_vector(envp); free(cwd);
+  tsv result = ts_new_array(0); ts_gc_root(&result);
+  if (pid < 0){
+    nh_last_errno = -pid;
+    free(input.owned);
+    ts_array_push(result, TS_NULL); ts_array_push(result, TS_UNDEFINED);
+    tsv e1 = nh_bytes_value(NULL, 0); ts_array_push(result, e1);
+    tsv e2 = nh_bytes_value(NULL, 0); ts_array_push(result, e2);
+    tsv code = nh_string(nh_errno_name(-pid)); ts_array_push(result, code);
+    ts_array_push(result, ts_num(0));
+    ts_gc_unroot(1);
+    return result;
+  }
+  uint8_t *obuf = NULL, *ebuf = NULL; size_t olen = 0, ocap = 0, elen = 0, ecap = 0;
+  size_t written = 0;
+  int in_fd = in_mode == 0 ? pp.in[1] : -1, out_fd = out_mode == 0 ? pp.out[0] : -1, err_fd = err_mode == 0 ? pp.err[0] : -1;
+  if (in_fd >= 0){ fcntl(in_fd, F_SETFL, O_NONBLOCK); if (input.length == 0){ close(in_fd); in_fd = -1; } }
+  double deadline = timeout_ms > 0 ? nh_mono_ms() + timeout_ms : 0;
+  int timed_out = 0;
+  uint8_t chunk[65536];
+  signal(SIGPIPE, SIG_IGN);
+  while (in_fd >= 0 || out_fd >= 0 || err_fd >= 0){
+    struct pollfd fds[3]; int k = 0, idx_in = -1, idx_out = -1, idx_err = -1;
+    if (in_fd >= 0){ fds[k].fd = in_fd; fds[k].events = POLLOUT; idx_in = k++; }
+    if (out_fd >= 0){ fds[k].fd = out_fd; fds[k].events = POLLIN; idx_out = k++; }
+    if (err_fd >= 0){ fds[k].fd = err_fd; fds[k].events = POLLIN; idx_err = k++; }
+    int wait = -1;
+    if (deadline > 0){ double remain = deadline - nh_mono_ms(); wait = remain <= 0 ? 0 : (int)(remain + 0.999); }
+    int r = poll(fds, (nfds_t)k, wait);
+    if (r < 0){ if (errno == EINTR) continue; break; }
+    if (r == 0 && deadline > 0 && nh_mono_ms() >= deadline){ timed_out = 1; kill(pid, kill_sig); deadline = 0; continue; }
+    if (idx_in >= 0 && (fds[idx_in].revents & (POLLOUT | POLLERR | POLLHUP))){
+      ssize_t w = write(in_fd, input.data + written, input.length - written);
+      if (w > 0) written += (size_t)w;
+      if (w < 0 && errno != EAGAIN && errno != EINTR){ close(in_fd); in_fd = -1; }
+      else if (written >= input.length){ close(in_fd); in_fd = -1; }
+    }
+    if (idx_out >= 0 && (fds[idx_out].revents & (POLLIN | POLLHUP | POLLERR))){
+      ssize_t got = read(out_fd, chunk, sizeof chunk);
+      if (got > 0) nh_append(&obuf, &olen, &ocap, chunk, (size_t)got); else if (got == 0 || errno != EINTR){ close(out_fd); out_fd = -1; }
+    }
+    if (idx_err >= 0 && (fds[idx_err].revents & (POLLIN | POLLHUP | POLLERR))){
+      ssize_t got = read(err_fd, chunk, sizeof chunk);
+      if (got > 0) nh_append(&ebuf, &elen, &ecap, chunk, (size_t)got); else if (got == 0 || errno != EINTR){ close(err_fd); err_fd = -1; }
+    }
+  }
+  free(input.owned);
+  int status = 0;
+  while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+  if (WIFEXITED(status)){ ts_array_push(result, ts_num((double)WEXITSTATUS(status))); ts_array_push(result, TS_UNDEFINED); }
+  else if (WIFSIGNALED(status)){ ts_array_push(result, TS_NULL); tsv sn = nh_string(nh_signal_name(WTERMSIG(status))); ts_array_push(result, sn); }
+  else { ts_array_push(result, TS_NULL); ts_array_push(result, TS_UNDEFINED); }
+  tsv o = nh_bytes_value(obuf, olen); ts_array_push(result, o);
+  tsv e = nh_bytes_value(ebuf, elen); ts_array_push(result, e);
+  free(obuf); free(ebuf);
+  if (timed_out){ tsv code = nh_string("ETIMEDOUT"); ts_array_push(result, code); } else ts_array_push(result, TS_UNDEFINED);
+  ts_array_push(result, ts_num((double)pid));
+  ts_gc_unroot(1);
+  return result;
+}
+/* spawn(argv, cwd, env, stdinMode, stdoutMode, stderrMode) -> [pid, stdinFd, stdoutFd, stderrFd] | errorCode */
+static tsv nh_spawn(tsv* a, int n){
+  nh_ensure_sigchld();
+  char** argv = nh_string_vector(nh_arg(a, n, 0), NULL);
+  tsv cwdv = nh_arg(a, n, 1); char* cwd = ts_is_str(cwdv) ? nh_path_of(cwdv) : NULL;
+  tsv envv = nh_arg(a, n, 2); char** envp = ts_is_array(envv) ? nh_string_vector(envv, NULL) : NULL;
+  int in_mode = (int)nh_num(a, n, 3, 0), out_mode = (int)nh_num(a, n, 4, 0), err_mode = (int)nh_num(a, n, 5, 0);
+  nh_stdio_pipes pp;
+  pid_t pid = nh_fork_exec(argv, cwd, envp, in_mode, out_mode, err_mode, &pp);
+  nh_free_vector(argv); nh_free_vector(envp); free(cwd);
+  if (pid < 0){ nh_last_errno = -pid; return nh_string(nh_errno_name(-pid)); }
+  int fds[3] = { in_mode == 0 ? pp.in[1] : -1, out_mode == 0 ? pp.out[0] : -1, err_mode == 0 ? pp.err[0] : -1 };
+  for (int i = 0; i < 3; i++) if (fds[i] >= 0) fcntl(fds[i], F_SETFD, FD_CLOEXEC);
+  nh_child* c = (nh_child*)calloc(1, sizeof *c);
+  c->pid = pid; c->on_exit = TS_UNDEFINED; c->active = 1; c->next = g_nh_children; g_nh_children = c;
+  g_nh_pending_children++;
+  tsv out = ts_new_array(0); ts_gc_root(&out);
+  ts_array_push(out, ts_num((double)pid));
+  for (int i = 0; i < 3; i++) ts_array_push(out, ts_num((double)fds[i]));
+  ts_gc_unroot(1);
+  return out;
+}
+/* onChildExit(pid, callback(code | null, signal | null)) */
+static tsv nh_on_child_exit(tsv* a, int n){
+  pid_t pid = (pid_t)nh_num(a, n, 0, 0);
+  for (nh_child* c = g_nh_children; c; c = c->next) if (c->pid == pid){ c->on_exit = nh_arg(a, n, 1); return ts_bool(1); }
+  return ts_bool(0);
+}
+/* the children that exited: their callbacks (called from the loop) */
+static void nh_reap_children(void){
+  if (g_nh_sigchld_pipe[0] >= 0){ char buf[64]; while (read(g_nh_sigchld_pipe[0], buf, sizeof buf) > 0) {} }
+  for (nh_child** pp = &g_nh_children; *pp; ){
+    nh_child* c = *pp;
+    int status = 0;
+    pid_t r = c->active ? waitpid(c->pid, &status, WNOHANG) : 0;
+    if (r == c->pid || (r < 0 && errno == ECHILD)){
+      *pp = c->next;
+      g_nh_pending_children--;
+      tsv cb = c->on_exit;
+      tsv args[2] = { TS_NULL, TS_NULL };
+      if (r == c->pid && WIFEXITED(status)) args[0] = ts_num((double)WEXITSTATUS(status));
+      else if (r == c->pid && WIFSIGNALED(status)) args[1] = nh_string(nh_signal_name(WTERMSIG(status)));
+      else args[0] = ts_num(-1);
+      free(c);
+      if (ts_is_func(cb)){ ts_gc_root(&cb); ts_gc_root(&args[1]); (void)ts_call_value(cb, args, 2); ts_gc_unroot(2); nh_drain_ticks_and_microtasks(); }
+      continue;
+    }
+    pp = &c->next;
+  }
+}
+/* watchFd(fd, onData(bytes), onEnd()) -> id: the loop reads what arrives */
+static tsv nh_watch_fd(tsv* a, int n){
+  nh_fdwatch* w = (nh_fdwatch*)calloc(1, sizeof *w);
+  w->id = g_nh_next_id++; w->fd = (int)nh_num(a, n, 0, -1); w->on_data = nh_arg(a, n, 1); w->on_end = nh_arg(a, n, 2); w->active = 1;
+  fcntl(w->fd, F_SETFL, fcntl(w->fd, F_GETFL) | O_NONBLOCK);
+  w->next = g_nh_fdwatches; g_nh_fdwatches = w;
+  g_nh_active_fdwatches++;
+  return ts_num((double)w->id);
+}
+static void nh_fdwatch_end(nh_fdwatch* w, int close_fd){
+  if (!w->active) return;
+  w->active = 0; g_nh_active_fdwatches--;
+  if (close_fd && w->fd > 2) close(w->fd);
+  tsv cb = w->on_end; w->on_end = TS_UNDEFINED; w->on_data = TS_UNDEFINED;
+  if (ts_is_func(cb)){ ts_gc_root(&cb); (void)ts_call_value(cb, NULL, 0); ts_gc_unroot(1); nh_drain_ticks_and_microtasks(); }
+}
+static tsv nh_unwatch_fd(tsv* a, int n){
+  uint32_t id = (uint32_t)nh_num(a, n, 0, 0);
+  for (nh_fdwatch* w = g_nh_fdwatches; w; w = w->next) if (w->id == id && w->active){ w->active = 0; g_nh_active_fdwatches--; w->on_end = TS_UNDEFINED; w->on_data = TS_UNDEFINED; }
+  return TS_UNDEFINED;
+}
+static void nh_fdwatch_read(nh_fdwatch* w){
+  uint8_t chunk[65536];
+  ssize_t got;
+  do { got = read(w->fd, chunk, sizeof chunk); } while (got < 0 && errno == EINTR);
+  if (got > 0){
+    tsv bytes = nh_bytes_value(chunk, (size_t)got);
+    tsv cb = w->on_data;
+    if (ts_is_func(cb)){ ts_gc_root(&cb); ts_gc_root(&bytes); (void)ts_call_value(cb, &bytes, 1); ts_gc_unroot(2); nh_drain_ticks_and_microtasks(); }
+    return;
+  }
+  if (got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
+  nh_fdwatch_end(w, 1);
+}
+static void nh_fdwatches_prune(void){
+  for (nh_fdwatch** pp = &g_nh_fdwatches; *pp; ){ nh_fdwatch* w = *pp; if (!w->active){ *pp = w->next; free(w); } else pp = &w->next; }
+}
+/* the loop's wait: the workers' pipes, the parent's, the watched fds and the SIGCHLD pipe in one poll */
+static void nh_wait(int timeout_ms){
+  int nw = 0; for (ts_watch* w = g_watches; w; w = w->next) nw++;
+  int parent = g_parent_watching && g_parent_fd >= 0;
+  int nf = 0; for (nh_fdwatch* w = g_nh_fdwatches; w; w = w->next) if (w->active) nf++;
+  int sig = g_nh_sigchld_pipe[0] >= 0 && g_nh_pending_children > 0;
+  int total = nw + parent + nf + sig;
+  if (total == 0){ nh_sleep_ms(timeout_ms); return; }
+  struct pollfd* fds = (struct pollfd*)calloc((size_t)total, sizeof *fds);
+  void** owners = (void**)calloc((size_t)total, sizeof(void*));
+  int* kinds = (int*)calloc((size_t)total, sizeof(int));   /* 0 worker, 1 parent, 2 fdwatch, 3 sigchld */
+  int i = 0;
+  for (ts_watch* w = g_watches; w; w = w->next){ fds[i].fd = w->fd; fds[i].events = POLLIN; owners[i] = w; kinds[i] = 0; i++; }
+  if (parent){ fds[i].fd = g_parent_fd; fds[i].events = POLLIN; kinds[i] = 1; i++; }
+  for (nh_fdwatch* w = g_nh_fdwatches; w; w = w->next) if (w->active){ fds[i].fd = w->fd; fds[i].events = POLLIN; owners[i] = w; kinds[i] = 2; i++; }
+  if (sig){ fds[i].fd = g_nh_sigchld_pipe[0]; fds[i].events = POLLIN; kinds[i] = 3; i++; }
+  int r = poll(fds, (nfds_t)i, timeout_ms);
+  if (r > 0) for (int k = 0; k < i; k++){
+    if (!(fds[k].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+    if (kinds[k] == 0) watch_read((ts_watch*)owners[k]);
+    else if (kinds[k] == 1) parent_read();
+    else if (kinds[k] == 2) nh_fdwatch_read((nh_fdwatch*)owners[k]);
+  }
+  free(fds); free(owners); free(kinds);
+  nh_fdwatches_prune();
+  if (g_nh_pending_children) nh_reap_children();
+}
+static int nh_io_alive(void){ return g_nh_active_fdwatches > 0 || g_nh_pending_children > 0; }
+static void nh_mark_io_roots(int young){
+  for (nh_fdwatch* w = g_nh_fdwatches; w; w = w->next){ gc_visit_slot(&w->on_data, young, 0, 1); gc_visit_slot(&w->on_end, young, 0, 1); }
+  for (nh_child* c = g_nh_children; c; c = c->next) gc_visit_slot(&c->on_exit, young, 0, 1);
+}
 static void nh_method(tsv host, const char* name, ts_code code, int arity){
   ts_gc_root(&host); tsv fn = ts_make_fn_t(code, NULL, 0, 0); ts_gc_root(&fn);
   ts_set_fn_meta(fn, (uint32_t)arity, name); ts_set_cstr(host, name, fn); ts_gc_unroot(2);
@@ -896,6 +1355,7 @@ static void ts_garnet_node_global_init(tsv global){
   nh_method(host, "userInfo", nh_user_info, 0);
   nh_method(host, "utf8Length", nh_utf8_length, 1);
   nh_method(host, "randomBytes", nh_random_bytes, 1);
+  nh_method(host, "hash", nh_hash, 2);
   nh_method(host, "inspect", nh_inspect, 1);
   nh_method(host, "atExit", nh_at_exit, 1);
   nh_method(host, "timerAdd", nh_timer_add, 4);
@@ -908,6 +1368,11 @@ static void ts_garnet_node_global_init(tsv global){
   nh_method(host, "immediateRef", nh_immediate_ref, 2);
   nh_method(host, "immediateHasRef", nh_immediate_has_ref, 1);
   nh_method(host, "nextTick", nh_next_tick, 2);
+  nh_method(host, "spawnSync", nh_spawn_sync, 8);
+  nh_method(host, "spawn", nh_spawn, 6);
+  nh_method(host, "onChildExit", nh_on_child_exit, 2);
+  nh_method(host, "watchFd", nh_watch_fd, 3);
+  nh_method(host, "unwatchFd", nh_unwatch_fd, 1);
 #ifdef __APPLE__
   ts_set_cstr(host, "platform", nh_string("darwin"));
 #else

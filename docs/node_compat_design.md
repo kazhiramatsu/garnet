@@ -276,3 +276,65 @@ stress, bench); the tsc-ts benchmark is unaffected until N5.
 - Known: a `setImmediate` from the main module races 0/1 ms timers in Node
   too (the fixture queues it from a timer); `refresh()` inside a one-shot
   timer's own callback does not re-arm it (the record is gone).
+
+## As built, N4 (Session 353)
+
+- Streams (`lib/node/stream.ts`): Node's lib/internal/streams ported: the
+  ReadableState/WritableState machines (buffer, length, flowing/paused,
+  needReadable/emittedReadable, sync/async push, the drain/finish/prefinish
+  ticks, corking, autoDestroy, errorOrDestroy), `construct` (writes buffer and
+  reads wait until the callback), the shared destroy ('error' then 'close' on
+  the next tick), pipe with backpressure, `finished`, `pipeline` (streams,
+  iterables and generator stages, destroyed together on failure),
+  `Readable.from` (an async generator pulls the iterable), async iteration,
+  `toArray`. The writable half is a set of functions over the state so that
+  Duplex (which extends Readable) shares it; `_read`/`_write`/`_final`/
+  `_destroy` come from the options or a subclass method, not from a property
+  assigned afterwards. Duck typing in the helpers reads properties through an
+  untyped cast: a typed cast would devirtualize a getter the object lacks and
+  throw instead of yielding undefined.
+- The standard streams (`lib/node/tty.ts`): `process.stdout`/`stderr` are
+  Writables whose `_write` is the synchronous host write (strings pass
+  through, `decodeStrings` false); `isTTY` is true on a terminal and absent
+  otherwise; `process.stdin` is created on first use and read by the loop
+  (`watchFd`) while flowing, a pause stops the watch so the process can exit.
+  The host flushes both C stdio buffers before any raw write to fd 1 or 2 so
+  console output and stream writes interleave in order.
+- fs streams: `createReadStream`/`createWriteStream` open through
+  `construct` on a later turn (`host.immediate`: 'open', 'ready', then the
+  buffered writes), read and write synchronously from `_read`/`_write`, and
+  complete the close on a later turn too (Node's asynchronous close). Options
+  are validated before the base constructor runs, which schedules the open.
+- readline: whole-line splitting (LF, CRLF with crlfDelay, lone CR) over any
+  readable's 'data', question/prompt over the output, write() as input,
+  async iteration (a queue of lines, closed when the iterator ends), the
+  cursor functions as escape sequences. No terminal (raw) mode.
+- child_process: the host forks and execs (`nh_fork_exec`: pipes, inherit or
+  /dev/null per stream, cwd, env, an exec failure reported through a
+  close-on-exec pipe). `spawnSync` feeds stdin and collects the pipes with
+  poll, a timeout kills with the signal; the asynchronous `spawn` registers
+  the child with the loop (SIGCHLD wakes the poll through a self-pipe,
+  `waitpid` from the loop) and watches the pipe descriptors (`watchFd`:
+  chunks pushed into Readables, EOF ends them); 'close' follows 'exit' once
+  every pipe ended (an unread pipe is drained after exit, as Node's
+  flushStdio does). `exec`/`execFile` collect the output with maxBuffer and
+  offer the promise form through `util.promisify.custom`. No `fork`.
+- crypto: md5/sha1/sha256/sha512 in C (`host.hash`), HMAC and PBKDF2 over
+  them in TypeScript, random bytes from the host, UUID v4, `timingSafeEqual`.
+- url: the URL Standard's parser for ASCII hosts (schemes, authority, IPv4
+  and IPv6, dot segments, the percent-encode sets, opaque paths, relative
+  references, the setters' rules), URLSearchParams with the live link to its
+  URL, file URL conversions, the legacy API. `new URL(...)` on the global
+  identifier constructs the prelude's class through `ts_construct`
+  (resolveNewTarget's prelude-constructor case); `import { URL } from
+  "node:url"` is the statically typed form. A non-ASCII host is invalid (no
+  IDNA).
+- Language fixes the work needed (in `exporter.ts`, the runtime and the
+  emitter): IteratorClose for custom iterators (`iter.close:` calls `return`
+  when the iterator's type may have one; yield* closes the inner iterator
+  when the delegation ends early), for-await over an object literal with
+  `[Symbol.asyncIterator]`, array patterns bound from a Map, Set, generator,
+  class iterable or iterator by the protocol (`const [a, b] = new Set(...)`
+  read undefined before), a runtime GetIterator (`iter.acquire:`) for a
+  source typed `Iterable<T>` (any runtime representation) and for nested
+  patterns, and the URI functions as runtime builtins.

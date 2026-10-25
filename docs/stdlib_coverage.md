@@ -39,6 +39,7 @@ Math:   sqrt abs floor ceil round trunc sign sin cos tan asin acos atan sinh
 Number: isInteger isFinite isNaN isSafeInteger parseFloat parseInt, Number(x)
         coercion, constants MAX_SAFE_INTEGER MIN_SAFE_INTEGER MAX_VALUE MIN_VALUE
         EPSILON.  Global parseInt / parseFloat / isNaN / isFinite.
+        Global encodeURIComponent / decodeURIComponent / encodeURI / decodeURI (URIError on malformed input).
         Number.prototype toString, toFixed, toPrecision, valueOf.
 String static: fromCharCode, fromCodePoint.
 Date:   new Date(), new Date(epochMs), component constructor, Date.now(),

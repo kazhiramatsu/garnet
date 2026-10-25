@@ -3784,6 +3784,7 @@ static int nh_immediates_pending(void);
 static int nh_next_timer_timeout_ms(int limit);
 static void nh_sleep_ms(int ms);
 static void nh_mark_loop_roots(int young);
+static void nh_wait(int timeout_ms);
 void ts_global_this_init(void){
   if (g_global_this_v != TS_UNDEFINED) return;
   static int rooted = 0;
@@ -9719,6 +9720,7 @@ tsv ts_string_from_code_point(tsv* args, int n){
   free(units);
   return s;
 }
+
 tsv ts_string_from_char_code(tsv* args, int n){
   uint16_t* units = (uint16_t*)malloc(sizeof(uint16_t) * (size_t)(n>0?n:1));
   uint32_t len = 0;
@@ -10094,6 +10096,108 @@ static void ts_throw_syntax_error(const char* msg){
 }
 void ts_throw_type_error_msg(const char* msg){ ts_throw_type_error(msg ? msg : "TypeError"); }
 void ts_throw_syntax_error_msg(const char* msg){ ts_throw_syntax_error(msg ? msg : "SyntaxError"); }
+
+/* ---- the URI functions (ECMA-262 19.2.6): percent-encoding of UTF-8 ----
+   encodeURIComponent keeps the unreserved set, encodeURI also the reserved
+   one and '#'; decodeURI leaves a reserved character's escape as it is. A
+   lone surrogate or a malformed sequence is a URIError. */
+static int uri_unreserved(uint16_t c){
+  return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+    c == '-' || c == '_' || c == '.' || c == '!' || c == '~' || c == '*' || c == '\'' || c == '(' || c == ')';
+}
+static int uri_reserved(uint16_t c){
+  return c == ';' || c == '/' || c == '?' || c == ':' || c == '@' || c == '&' || c == '=' || c == '+' || c == '$' || c == ',' || c == '#';
+}
+static void uri_throw(void* buf){
+  free(buf);
+  ts_throw(ts_new_error(TS_ERR_URI, ts_new_string("URI malformed", 13)));
+}
+static tsv uri_encode(tsv v, int component){
+  tsv s = ts_is_str(v) ? v : ts_to_string_v(v);
+  ts_gc_root(&s);
+  uint32_t len = ts_str_len_typed(s);
+  ts_strview xs = ts_str_view_typed(s);
+  char* out = (char*)malloc((size_t)len * 9 + 1);
+  size_t o = 0;
+  static const char hex[] = "0123456789ABCDEF";
+  for (uint32_t i = 0; i < len; i++){
+    uint16_t cu = ts_str_cu_at_view(xs, i);
+    if (uri_unreserved(cu) || (!component && uri_reserved(cu))){ out[o++] = (char)cu; continue; }
+    uint32_t cp = cu;
+    if (cu >= 0xDC00 && cu <= 0xDFFF) uri_throw(out);
+    if (cu >= 0xD800 && cu <= 0xDBFF){
+      if (i + 1 >= len) uri_throw(out);
+      uint16_t lo = ts_str_cu_at_view(xs, i + 1);
+      if (lo < 0xDC00 || lo > 0xDFFF) uri_throw(out);
+      cp = 0x10000 + ((cu - 0xD800) << 10) + (lo - 0xDC00);
+      i++;
+    }
+    unsigned char b[4]; int n;
+    if (cp < 0x80){ b[0] = (unsigned char)cp; n = 1; }
+    else if (cp < 0x800){ b[0] = 0xC0 | (cp >> 6); b[1] = 0x80 | (cp & 0x3F); n = 2; }
+    else if (cp < 0x10000){ b[0] = 0xE0 | (cp >> 12); b[1] = 0x80 | ((cp >> 6) & 0x3F); b[2] = 0x80 | (cp & 0x3F); n = 3; }
+    else { b[0] = 0xF0 | (cp >> 18); b[1] = 0x80 | ((cp >> 12) & 0x3F); b[2] = 0x80 | ((cp >> 6) & 0x3F); b[3] = 0x80 | (cp & 0x3F); n = 4; }
+    for (int k = 0; k < n; k++){ out[o++] = '%'; out[o++] = hex[b[k] >> 4]; out[o++] = hex[b[k] & 15]; }
+  }
+  tsv r = ts_new_string(out, (uint32_t)o);
+  free(out);
+  ts_gc_unroot(1);
+  return r;
+}
+static int uri_hex(uint16_t c){
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  return -1;
+}
+static tsv uri_decode(tsv v, int component){
+  tsv s = ts_is_str(v) ? v : ts_to_string_v(v);
+  ts_gc_root(&s);
+  uint32_t len = ts_str_len_typed(s);
+  ts_strview xs = ts_str_view_typed(s);
+  uint16_t* out = (uint16_t*)malloc(sizeof(uint16_t) * ((size_t)len + 1));
+  uint32_t o = 0;
+  for (uint32_t i = 0; i < len; i++){
+    uint16_t cu = ts_str_cu_at_view(xs, i);
+    if (cu != '%'){ out[o++] = cu; continue; }
+    uint32_t start = i;
+    if (i + 2 >= len) uri_throw(out);
+    int hi = uri_hex(ts_str_cu_at_view(xs, i + 1)), lo = uri_hex(ts_str_cu_at_view(xs, i + 2));
+    if (hi < 0 || lo < 0) uri_throw(out);
+    unsigned b = (unsigned)(hi * 16 + lo);
+    i += 2;
+    if (b < 0x80){
+      if (!component && uri_reserved((uint16_t)b)){ for (uint32_t k = start; k <= i; k++) out[o++] = ts_str_cu_at_view(xs, k); }
+      else out[o++] = (uint16_t)b;
+      continue;
+    }
+    int n; uint32_t cp, min;
+    if ((b & 0xE0) == 0xC0){ n = 1; cp = b & 0x1F; min = 0x80; }
+    else if ((b & 0xF0) == 0xE0){ n = 2; cp = b & 0x0F; min = 0x800; }
+    else if ((b & 0xF8) == 0xF0){ n = 3; cp = b & 0x07; min = 0x10000; }
+    else uri_throw(out);
+    for (int k = 0; k < n; k++){
+      if (i + 3 > len - 0 || ts_str_cu_at_view(xs, i + 1) != '%') uri_throw(out);
+      int h2 = uri_hex(ts_str_cu_at_view(xs, i + 2)), l2 = uri_hex(ts_str_cu_at_view(xs, i + 3));
+      if (h2 < 0 || l2 < 0) uri_throw(out);
+      unsigned t = (unsigned)(h2 * 16 + l2);
+      if ((t & 0xC0) != 0x80) uri_throw(out);
+      cp = (cp << 6) | (t & 0x3F);
+      i += 3;
+    }
+    if (cp < min || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) uri_throw(out);
+    if (cp < 0x10000) out[o++] = (uint16_t)cp;
+    else { cp -= 0x10000; out[o++] = (uint16_t)(0xD800 + (cp >> 10)); out[o++] = (uint16_t)(0xDC00 + (cp & 0x3FF)); }
+  }
+  tsv r = ts_new_string_from_code_units(out, o);
+  free(out);
+  ts_gc_unroot(1);
+  return r;
+}
+tsv ts_encode_uri_component(tsv v){ return uri_encode(v, 1); }
+tsv ts_encode_uri(tsv v){ return uri_encode(v, 0); }
+tsv ts_decode_uri_component(tsv v){ return uri_decode(v, 1); }
+tsv ts_decode_uri(tsv v){ return uri_decode(v, 0); }
 void ts_throw_range_error_msg(const char* msg){ ts_throw_range_error(msg ? msg : "RangeError"); }
 void ts_throw_not_a_function(const char* name){
   char buf[160];
@@ -19605,8 +19709,7 @@ void ts_run_event_loop(void){
       /* wait for the next event: the earliest timer, else the watches' or the abort timers' turn */
       int timeout = nh_next_timer_timeout_ms(io_pending ? 0 : 1000);
       timeout = ts_abort_timer_poll_timeout_ms(timeout);
-      if (g_watches || g_parent_watching) ts_watch_poll(io_pending ? 0 : timeout);
-      else if (!io_pending) nh_sleep_ms(timeout);
+      nh_wait(io_pending ? 0 : timeout);   /* the workers' pipes, the watched fds, the children, or a sleep */
       continue;
     }
     /* nothing keeps the loop alive: 'beforeExit' may schedule more */
@@ -20962,6 +21065,72 @@ tsv ts_gen_return(tsv genobj, tsv val){
   ts_gc_unroot(1);
   ts_gc_unroot(4);
   return result;
+}
+
+/* GetIterator(v) at run time, for a loop or a pattern whose source the exporter
+   could not classify: the value's [Symbol.asyncIterator] (when `async`) or
+   [Symbol.iterator] method called on it (a class or object iterable, a generator,
+   a collection iterator), else the runtime's own iterators of an array or typed
+   array (values), a Map (entries), a Set (values) or a string (code points); an
+   object with a `next` is taken as the iterator itself. TypeError otherwise. */
+tsv ts_iter_acquire(tsv v, int async){
+  static ts_key knext;
+  if (!knext) knext = ts_intern_field("next", 4);
+  if (ts_is_str(v)){
+    ts_gc_root(&v);
+    tsv arr = ts_new_array(0); ts_gc_root(&arr);
+    ts_array_push_all(arr, v);
+    tsv it = ts_array_iter_new(arr, 0);
+    ts_gc_unroot(2);
+    return it;
+  }
+  if (!ts_object_like(v)) ts_throw_type_error_msg("value is not iterable");
+  ts_gc_root(&v);
+  tsv itf = TS_UNDEFINED;
+  if (async) itf = ts_get(v, TS_KEY_WKSYM(TS_WKSYM_ASYNC_ITERATOR));
+  if (!ts_is_callable(itf)) itf = ts_get(v, TS_KEY_WKSYM(TS_WKSYM_ITERATOR));
+  if (ts_is_callable(itf)){
+    ts_gc_root(&itf);
+    tsv a0 = v;
+    tsv it = ts_call_method(itf, &a0, 1);
+    ts_gc_unroot(2);
+    if (!ts_object_like(it)) ts_throw_type_error_msg("Result of the Symbol.iterator method is not an object");
+    return it;
+  }
+  tsv it;
+  if (as_arr(v) || ts_is_typed_array(v)) it = ts_array_iter_new(v, 0);
+  else if (ts_is_map(v)) it = ts_map_entries(v);
+  else if (ts_is_set(v)) it = ts_set_values(v);
+  else if (ts_is_callable(ts_get(v, knext))) it = v;
+  else { ts_gc_unroot(1); ts_throw_type_error_msg("object is not iterable (cannot read property Symbol(Symbol.iterator))"); }
+  ts_gc_unroot(1);
+  return it;
+}
+/* IteratorClose: the iterator's `return` (an own or prototype field, then the
+   method key), called without an argument when it exists; a generator object
+   without one is returned from (its finally blocks run). The call's result, or
+   undefined when there was nothing to call (an async close awaits only a
+   result). */
+tsv ts_iter_close(tsv iter, ts_key rmk){
+  static ts_key k_return;
+  if (!k_return) k_return = ts_intern_field("return", 6);
+  if (!ts_is_obj(iter)) return TS_UNDEFINED;
+  ts_gc_root(&iter);
+  tsv rf = ts_get(iter, k_return);
+  if (!ts_is_callable(rf)) rf = ts_get(iter, rmk);
+  tsv r = TS_UNDEFINED;
+  if (ts_is_callable(rf)){
+    ts_gc_root(&rf);
+    tsv a[1] = { iter };
+    r = ts_call_method(rf, a, 1);
+    ts_gc_unroot(2);
+    return r;
+  }
+  ensure_gen_fields();
+  tsv cv = ts_get_ic(iter, F_coro, &g_ic_coro);
+  if (ts_is_coro_value(cv)) r = ts_gen_return(iter, TS_UNDEFINED);
+  ts_gc_unroot(1);
+  return r;
 }
 
 /* ---- async generators (async function*) ---- */

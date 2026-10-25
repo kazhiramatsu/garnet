@@ -63,6 +63,21 @@ export interface GarnetNodeHost {
   userInfo(): [string, number, number, string, string];
   utf8Length(text: string): number;
   randomBytes(count: number): Uint8Array;
+  /** The digest of `data` by "md5", "sha1", "sha256" or "sha512"; undefined for another name. */
+  hash(algorithm: string, data: string | Uint8Array): Uint8Array | undefined;
+  /** Runs argv[0] with argv to completion. stdin: bytes to feed, or 1 (inherit) or 2 (ignore);
+   *  stdout/stderr modes: 0 pipe (collected), 1 inherit, 2 ignore. Returns
+   *  [status | null, signal | undefined, stdout, stderr, errorCode | undefined, pid]. */
+  spawnSync(argv: string[], cwd: string | undefined, env: string[] | undefined, stdin: string | Uint8Array | number,
+            timeoutMs: number, killSignal: string | number, stdoutMode: number, stderrMode: number): [number | null, string | undefined, Uint8Array, Uint8Array, string | undefined, number];
+  /** Starts argv[0]; modes 0 pipe, 1 inherit, 2 ignore. Returns [pid, stdinFd, stdoutFd, stderrFd] (-1 for a
+   *  stream not piped) or the error code as a string. */
+  spawn(argv: string[], cwd: string | undefined, env: string[] | undefined, stdinMode: number, stdoutMode: number, stderrMode: number): [number, number, number, number] | string;
+  /** The callback runs from the event loop when the child exits: (code | null, signal | null). */
+  onChildExit(pid: number, callback: (code: number | null, signal: string | null) => void): boolean;
+  /** The loop reads `fd` as data arrives: onData(bytes) per chunk, onEnd() at end of file (the fd is closed). */
+  watchFd(fd: number, onData: (bytes: Uint8Array) => void, onEnd: () => void): number;
+  unwatchFd(id: number): void;
   /** The text console.log prints for a value. */
   inspect(value: unknown): string;
   /** The hook the loop calls when nothing keeps it alive: phase 0 is 'beforeExit' (the hook

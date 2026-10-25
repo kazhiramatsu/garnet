@@ -3388,6 +3388,12 @@ tsv ts_gen_new_v(tsv cv);
 tsv ts_gen_next(tsv genobj, tsv sent);
 tsv ts_asyncgen_next(tsv genobj, tsv sent);
 tsv ts_iter_step(tsv iter, tsv sent, ts_key nmk); /* generic iterator step: field/method `next` or generator fallback */
+tsv ts_iter_close(tsv iter, ts_key rmk);         /* IteratorClose: `return` when present, generator return fallback */
+tsv ts_iter_acquire(tsv v, int async);           /* GetIterator over the runtime's representations */
+tsv ts_encode_uri_component(tsv v);
+tsv ts_encode_uri(tsv v);
+tsv ts_decode_uri_component(tsv v);
+tsv ts_decode_uri(tsv v);
 tsv ts_asyncgen_throw(tsv genobj, tsv exc);
 tsv ts_asyncgen_return(tsv genobj, tsv val);
 tsv ts_gen_throw(tsv genobj, tsv exc);

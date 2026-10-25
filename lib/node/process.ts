@@ -5,47 +5,7 @@
 import { EventEmitter } from "./events";
 import { host } from "./host";
 import { lastError, invalidArgType, validateString } from "./errors";
-
-export interface WriteStream {
-  readonly fd: number;
-  readonly isTTY: boolean;
-  readonly writable: boolean;
-  readonly columns: number | undefined;
-  readonly rows: number | undefined;
-  write(chunk: string | Uint8Array, encodingOrCallback?: string | ((error?: Error) => void), callback?: (error?: Error) => void): boolean;
-  end(chunk?: string | Uint8Array): void;
-  getColorDepth(): number;
-  hasColors(): boolean;
-}
-function makeWriteStream(fd: number): WriteStream {
-  const tty = host.isatty(fd);
-  const size = tty ? host.ttySize(fd) : undefined;
-  return {
-    fd,
-    isTTY: tty,
-    writable: true,
-    columns: size === undefined ? undefined : size[0],
-    rows: size === undefined ? undefined : size[1],
-    write(chunk: string | Uint8Array, encodingOrCallback?: string | ((error?: Error) => void), callback?: (error?: Error) => void): boolean {
-      const cb = typeof encodingOrCallback === "function" ? encodingOrCallback : callback;
-      if (typeof chunk !== "string" && !(chunk instanceof Uint8Array)) throw invalidArgType("chunk", "of type string or an instance of Buffer or Uint8Array", chunk);
-      let error: Error | undefined = undefined;
-      const total = typeof chunk === "string" ? host.utf8Length(chunk) : chunk.length;
-      let offset = 0;
-      while (offset < total) {
-        const written = host.write(fd, chunk, offset, total - offset);
-        if (written < 0) { error = lastError("write"); break; }
-        offset += written;
-      }
-      if (cb !== undefined) Promise.resolve().then(() => cb(error));
-      else if (error !== undefined) throw error;
-      return true;
-    },
-    end(chunk?: string | Uint8Array): void { if (chunk !== undefined) this.write(chunk); },
-    getColorDepth(): number { return tty ? 8 : 1; },
-    hasColors(): boolean { return tty; },
-  };
-}
+import { WriteStream, ReadStream } from "./tty";
 
 export interface MemoryUsage { rss: number; heapTotal: number; heapUsed: number; external: number; arrayBuffers: number }
 export interface CpuUsage { user: number; system: number }
@@ -66,6 +26,12 @@ export class Process extends EventEmitter {
   readonly release: { name: string } = { name: "node" };
   readonly stdout: WriteStream;
   readonly stderr: WriteStream;
+  private _stdin: ReadStream | null = null;
+  /** Standard input as a readable stream, created on first use (reading it keeps the process alive). */
+  get stdin(): ReadStream {
+    if (this._stdin === null) this._stdin = new ReadStream(0);
+    return this._stdin;
+  }
   title: string = "garnet";
   exitCode: number | undefined = undefined;
   private _exiting: boolean = false;
@@ -81,8 +47,8 @@ export class Process extends EventEmitter {
     this.ppid = host.ppid();
     this.platform = host.platform;
     this.arch = host.arch;
-    this.stdout = makeWriteStream(1);
-    this.stderr = makeWriteStream(2);
+    this.stdout = new WriteStream(1);
+    this.stderr = new WriteStream(2);
   }
   cwd(): string {
     const dir = host.cwd();
@@ -165,7 +131,7 @@ export class Process extends EventEmitter {
   hasUncaughtExceptionCaptureCallback(): boolean { return false; }
 }
 const darwin = host.platform === "darwin";
-const SIGNALS: { [name: string]: number } = {
+export const SIGNALS: { [name: string]: number } = {
   SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGILL: 4, SIGTRAP: 5, SIGABRT: 6, SIGBUS: darwin ? 10 : 7, SIGFPE: 8, SIGKILL: 9,
   SIGUSR1: darwin ? 30 : 10, SIGSEGV: 11, SIGUSR2: darwin ? 31 : 12, SIGPIPE: 13, SIGALRM: 14, SIGTERM: 15,
   SIGCHLD: darwin ? 20 : 17, SIGCONT: darwin ? 19 : 18, SIGSTOP: darwin ? 17 : 19, SIGTSTP: darwin ? 18 : 20, SIGWINCH: 28,

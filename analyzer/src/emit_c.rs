@@ -21297,6 +21297,10 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 ),
                 // global parse functions
                 "global.parseFloat" => (format!("ts_parse_float({})", v(0)), true),
+                "global.encodeURIComponent" => (format!("ts_encode_uri_component({})", v(0)), false),
+                "global.decodeURIComponent" => (format!("ts_decode_uri_component({})", v(0)), false),
+                "global.encodeURI" => (format!("ts_encode_uri({})", v(0)), false),
+                "global.decodeURI" => (format!("ts_decode_uri({})", v(0)), false),
                 "global.parseInt" => (
                     if parseint_coerce_enabled()
                         && args.len() > 1
@@ -21438,6 +21442,12 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 "proxy.revocable" => (format!("ts_proxy_revocable({}, {})", v(0), v(1)), false),
                 "symbol.new" => (format!("ts_symbol_new({})", v(0)), false),
                 "symbol.get" => (format!("ts_get_symkey({}, {})", v(0), v(1)), false),
+                // iter.acquire:<0|1> -> GetIterator (1: the async one first) over any
+                // runtime representation. See ts_iter_acquire.
+                _ if builtin.starts_with("iter.acquire:") => {
+                    let async_first: u32 = builtin["iter.acquire:".len()..].parse().unwrap_or(0);
+                    (format!("ts_iter_acquire({}, {})", v(0), async_first), false)
+                }
                 "symbol.description" => (format!("ts_symbol_description({})", v(0)), false),
                 "symbol.for" => (format!("ts_symbol_for({})", v(0)), false),
                 "symbol.keyFor" => (format!("ts_symbol_key_for({})", v(0)), false),
@@ -22114,6 +22124,16 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                             sent,
                             method_key_str(nid, ctx.wksym)
                         ),
+                        false,
+                    )
+                }
+                _ if builtin.starts_with("iter.close:") => {
+                    // iter.close:<return-method-id> -> IteratorClose: the iterator's
+                    // `return` when it has one (field key, then method key), a generator
+                    // object returned from otherwise. See ts_iter_close.
+                    let rid: u32 = builtin["iter.close:".len()..].parse().unwrap_or(0);
+                    (
+                        format!("ts_iter_close({}, {})", r, method_key_str(rid, ctx.wksym)),
                         false,
                     )
                 }
