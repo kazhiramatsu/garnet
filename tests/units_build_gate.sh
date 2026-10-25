@@ -45,12 +45,46 @@ check() { # name input [driver flags...]
 }
 check modules "$P/entry.ts"
 check modules_nolto "$P/entry.ts" --no-lto
+# a module initialization large enough to be split into chunks
+# (docs/startup_design.md, S1): top-level loops, a labeled loop, if/else,
+# a switch, a class, a closure over top-level variables; and one with a
+# top-level try/catch, which keeps it whole (its handler's setjmp)
+I="$W/init"; mkdir -p "$I"
+{
+  echo 'const table: number[] = [];'
+  echo 'for (let i = 0; i < 40; i++) table.push((i * 3) % 7);'
+  echo 'let total = 0; let s = "";'
+  echo 'outer: for (let i = 0; i < 5; i++) { for (let j = 0; j < 5; j++) { if (j === 3) continue outer; total += i * j; } }'
+  echo 'class Point { constructor(public x: number, public y: number) {} norm(): number { return Math.hypot(this.x, this.y); } }'
+  echo 'const p = new Point(3, 4);'
+  echo 'function lazy(): number { return total + table.length; }'
+  for k in $(seq 1 40); do
+    echo "const v$k = table[$k % table.length] + $k; total += v$k * 2;"
+    echo "if (v$k % 2) { s += \"o\"; } else { s += \"e\"; }"
+    echo "switch (v$k % 3) { case 0: total += 1; break; case 1: s += \"$k\"; break; default: total -= 1; }"
+  done
+  echo 'console.log(total, s.length, s.slice(0, 20), p.norm(), lazy());'
+} > "$I/init.ts"
+TSAOT_UNIT_INIT_CHUNK_LINES=40 check init_split "$I/init.ts"
+{ cat "$I/init.ts"; echo 'try { JSON.parse("{bad"); } catch (e) { console.log("caught"); }'; } > "$I/init_try.ts"
+TSAOT_UNIT_INIT_CHUNK_LINES=40 check init_whole "$I/init_try.ts"
+if ls "$W"/init_split/split.units/init_*.c > /dev/null 2>&1 && [[ $(ls "$W"/init_split/split.units/init_*.c | wc -l) -ge 1 ]] &&
+   grep -qs "__part_1(mi__s, " "$W"/init_split/split.units/init_*_0.c; then
+  ok "the module initialization split into chunks"
+else
+  bad "the module initialization was not split"
+fi
+if ls "$W"/init_whole/split.units/cold_*module_init*.c > /dev/null 2>&1 && ! ls "$W"/init_whole/split.units/init_*.c > /dev/null 2>&1; then
+  ok "a top-level try/catch keeps it whole"
+else
+  bad "the module initialization with a try/catch was split"
+fi
 for t in exhaustive/objects/static_slots exhaustive/gc/sized_sidecar_props exhaustive/maps_sets/weak_collections; do
   check "$(basename "$t")" "$ROOT/tests/conformance/$t.ts"
 done
 # every kind of unit occurred
 all="$(ls "$W"/*/split.units/*.c 2>/dev/null | xargs -n 1 basename | sort -u)"
-for k in data.c 'bin_' 'm_' 'cold_'; do
+for k in data.c 'bin_' 'm_' 'cold_' 'init_'; do
   grep -q "^$k" <<< "$all" && ok "a unit of kind $k" || bad "no unit of kind $k"
 done
 grep -qs "static inline tsv fn_" "$W"/*/split.units/*.c && ok "inline copies" || bad "no inline copies"

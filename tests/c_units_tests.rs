@@ -42,7 +42,7 @@ fn program(fn9_body: &str, fn1_body: &str) -> String {
     c
 }
 
-fn opts() -> Options { Options { inline_lines: 5, chunk_lines: 8, bins: 4, cold_lines: 30 } }
+fn opts() -> Options { Options { inline_lines: 5, chunk_lines: 8, bins: 4, cold_lines: 30, split_init: true, init_chunk_lines: 1000 } }
 
 fn modules() -> (Vec<String>, BTreeMap<u32, u32>) {
     let m = vec!["src/a.ts".to_string(), "src/b.ts".to_string()];
@@ -57,6 +57,60 @@ fn dir(tag: &str) -> PathBuf {
 }
 
 fn read(d: &Path, f: &str) -> String { std::fs::read_to_string(d.join(f)).unwrap_or_else(|e| panic!("{}: {}", f, e)) }
+
+// A module initialization of the emitter's shape (docs/startup_design.md, S1):
+// a prologue of plain declarations, the frame, the body, the epilogue. `extra`
+// goes into the body (a fallback case); fn_12_use is a small function it calls.
+fn init_program(extra: &str) -> String {
+    let mut c = String::from("#include \"ts_rt.h\"\ntypedef struct { tsv f0; } Class1;\n");
+    c.push_str("static tsv fn_12_use(tsv a);\nstatic tsv fn_11___module_init_d(void);\n");
+    c.push_str("static tsv fn_12_use(tsv a) { return a; }\n");
+    c.push_str("static tsv fn_11___module_init_d(void){\n");
+    for k in 1..=6 { c.push_str(&format!("  tsv v{} = TS_UNDEFINED;\n", k)); }
+    c.push_str("  long long d7 = 0;\n  double d8 = 0.0;\n  tsv v9 = TS_UNDEFINED;\n  tsv v10 = TS_UNDEFINED;\n  Class1 sobj1;\n");
+    c.push_str("  struct { ts_frame_hdr h; tsv s0; tsv s1; } F;\n  F.s0 = TS_UNDEFINED;\n  F.s1 = TS_UNDEFINED;\n  ts_frame_push(&F.h, 2);\n");
+    c.push_str("  v1 = ts_num(1);\n");                                   // v1: used by every chunk (shared)
+    c.push_str("  F.s0 = fn_12_use(v1);\n");
+    c.push_str("  Class1* hobj0 = (Class1*)ts_ptr(F.s0);\n");             // a mid-body declaration used later (shared)
+    c.push_str("  v2 = ts_num(2);\n  v9 = fn_12_use(ts_num(9)); F.s1 = fn_12_use(v9);\n");   // v9: one line, one chunk's own
+    c.push_str("  if (ts_truthy(v1)) {\n    v3 = v1;\n  }\n  else {\n    v3 = v2;\n  }\n");   // no cut before the else
+    c.push_str("  d7 = 0;\n  L100: ;\n  d7 = d7 + 1;\n  v4 = ts_num((double)d7);\n  v4 = fn_12_use(v4);\n  if (d7 < 3) goto L100;\n");   // the label's span
+    c.push_str("  static const ts_key lk_1[1] = {7u}; static int lit_1 = 3;\n");   // a depth-0 static: one chunk with its uses
+    c.push_str("  v5 = ts_num((double)lk_1[0]);\n  v5 = fn_12_use(v5);\n  v5 = ts_num((double)lit_1);\n");
+    c.push_str("  v6 = fn_12_use(v5);\n  v10 = fn_12_use(v6); ts_gc_root(&v10); ts_gc_unroot(1);\n");   // v10: one line, but its address is taken
+    c.push_str("  memset(&sobj1, 0, sizeof(Class1)); F.s1 = ts_obj(&sobj1);\n");   // a stack object: its address in a frame slot
+    c.push_str("  double _md1 = (double)d7; double _md1b = (double)d8; if (_md1 == _md1b) {\n    v6 = ts_num(_md1);\n  }\n");   // a modulo's operands, then its test
+    c.push_str(extra);
+    c.push_str("  hobj0->f0 = v1;\n  d8 = (double)d7;\n  F.s1 = fn_12_use(v6);\n");
+    for k in 0..12 { c.push_str(&format!("  F.s1 = fn_12_use(v1); /* filler {} */\n", k)); }
+    c.push_str("  ts_frame_pop(&F.h);\n  return TS_UNDEFINED;\n  ts_frame_pop(&F.h);\n  return TS_UNDEFINED;\n}\n");
+    c.push_str("int main(void){\n  fn_11___module_init_d();\n  return 0;\n}\n");
+    c
+}
+
+/// The part functions in the init units, by number: (unit file, definition text).
+fn init_parts(d: &Path) -> BTreeMap<usize, (String, String)> {
+    let mut out = BTreeMap::new();
+    for (f, t) in files(d) {
+        if !f.starts_with("init_") { continue; }
+        let mut rest = t.as_str();
+        while let Some(k) = rest.find("void fn_11___module_init_d__part_") {
+            let after = &rest[k + "void fn_11___module_init_d__part_".len()..];
+            let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+            let n: usize = digits.parse().unwrap();
+            let sig_end = after.find(')').unwrap();
+            if after[sig_end + 1..].starts_with('{') {
+                let body_start = k + "void fn_11___module_init_d__part_".len() + sig_end + 1;
+                let end = rest[body_start..].find("\n}\n").map(|e| body_start + e + 3).unwrap_or(rest.len());
+                out.insert(n, (f.clone(), rest[body_start..end].to_string()));
+                rest = &rest[end..];
+            } else {
+                rest = &after[sig_end..];
+            }
+        }
+    }
+    out
+}
 
 fn files(d: &Path) -> BTreeMap<String, String> {
     std::fs::read_dir(d).unwrap().map(|e| {
@@ -132,13 +186,72 @@ fn main() {
     c.push_str("int main(void) { tsv a[1] = {0}; return (int)fn_1_createScanner(a, 1) + (int)fn_2_createscan(a, 1); }\n");
     let d4 = dir("create");
     let fm4: BTreeMap<u32, u32> = [(1, 0), (2, 0)].into_iter().collect();
-    let u4 = split(&c, &m, &fm4, &d4, &Options { inline_lines: 60, chunk_lines: 20000, bins: 16, cold_lines: 10000 }).expect("split create");
+    let u4 = split(&c, &m, &fm4, &d4, &Options { inline_lines: 60, chunk_lines: 20000, bins: 16, cold_lines: 10000, split_init: true, init_chunk_lines: 1000 }).expect("split create");
     let cold4: Vec<&str> = u4.iter().filter(|u| u.cold).map(|u| u.file.as_str()).collect();
     ck("cold: a 2000-line creator, not a lowercase name", cold4 == vec!["cold_fn_1_createScanner.c"]);
     // loud failures
     let d5 = dir("bad");
     ck("an unclassified item stops the split", split("#include \"ts_rt.h\"\nfoo bar baz;\nint main(void) { return 0; }\n", &m, &fm, &d5, &opts()).is_err());
     ck("a function-pointer object stops the split", split("#include \"ts_rt.h\"\nstatic tsv (*g_fp)(tsv*, int) = 0;\nint main(void) { return 0; }\n", &m, &fm, &d5, &opts()).is_err());
-    for t in ["base", "edit9", "edit1", "create", "bad"] { let _ = std::fs::remove_dir_all(dir(t)); }
+    // the module initialization split (docs/startup_design.md, S1)
+    let iopt = Options { inline_lines: 5, chunk_lines: 30, bins: 4, cold_lines: 20, split_init: true, init_chunk_lines: 4 };
+    let fmi: BTreeMap<u32, u32> = [(11, 0), (12, 0)].into_iter().collect();
+    let d6 = dir("init");
+    let u6 = split(&init_program(""), &m, &fmi, &d6, &iopt).expect("split init");
+    let n6: Vec<&str> = u6.iter().map(|u| u.file.as_str()).collect();
+    ck("init: no cold unit, init units instead, none cold", !n6.iter().any(|f| f.starts_with("cold_")) && n6.iter().filter(|f| f.starts_with("init_fn_11___module_init_d_")).count() >= 2 && u6.iter().all(|u| !u.cold));
+    let parts = init_parts(&d6);
+    let caller_unit = "init_fn_11___module_init_d_0.c";
+    let cu = read(&d6, caller_unit);
+    ck("init: several parts, numbered from 0", parts.len() >= 3 && parts.keys().copied().eq(0..parts.len()));
+    let calls: Vec<usize> = (0..parts.len()).filter_map(|k| cu.find(&format!("  fn_11___module_init_d__part_{}(mi__s, mi__f);", k))).collect();
+    ck("init: the caller calls every part, in order", calls.len() == parts.len() && calls.windows(2).all(|w| w[0] < w[1]));
+    ck("init: the caller keeps the frame and pushes and pops it", cu.contains("  mi__f->s0 = TS_UNDEFINED;") && cu.contains("  ts_frame_push(&mi__f->h, 2);") && cu.contains("  ts_frame_pop(&mi__f->h);\n  return TS_UNDEFINED;\n}"));
+    ck("init: the caller initializes the shared prologue variables", cu.contains("  mi__s->v1 = TS_UNDEFINED;") && !cu.contains("mi__s->v9 ="));
+    let all_parts: String = parts.values().map(|(_, b)| b.as_str()).collect();
+    ck("init: a variable several parts use goes through the struct", all_parts.contains("mi__s->v1 = ts_num(1);") && all_parts.contains("fn_12_use(mi__s->v1)"));
+    ck("init: a mid-body declaration they share becomes an assignment", all_parts.contains("  mi__s->hobj0 = (Class1*)ts_ptr(mi__f->s0);") && all_parts.contains("mi__s->hobj0->f0") && !all_parts.contains("Class1* hobj0"));
+    let part_of = |needle: &str| parts.iter().filter(|(_, (_, b))| b.contains(needle)).map(|(k, _)| *k).collect::<Vec<usize>>();
+    ck("init: a variable one part uses is that part's own", part_of("tsv v9 = TS_UNDEFINED;").len() == 1 && !all_parts.contains("mi__s->v9") && part_of("mi__f->s1 = fn_12_use(v9);") == part_of("tsv v9 = TS_UNDEFINED;"));
+    ck("init: an if and its else stay together", part_of("if (ts_truthy(").len() == 1 && part_of("if (ts_truthy(") == part_of("  else {"));
+    ck("init: a label and its goto stay together", part_of("L100: ;").len() == 1 && part_of("L100: ;") == part_of("goto L100;"));
+    ck("init: a depth-0 static stays with its uses", part_of("static int lit_1 = 3;").len() == 1 && part_of("static int lit_1 = 3;") == part_of("ts_num((double)lit_1)") && part_of("static int lit_1 = 3;") == part_of("ts_num((double)lk_1[0])"));
+    ck("init: a variable whose address is taken lives on the caller's stack", all_parts.contains("ts_gc_root(&mi__s->v10)") && !all_parts.contains("tsv v10 = TS_UNDEFINED;"));
+    ck("init: a stack object lives on the caller's stack", all_parts.contains("F.s1 = ts_obj(&mi__s->sobj1);") || all_parts.contains("mi__f->s1 = ts_obj(&mi__s->sobj1);"));
+    ck("init: its struct type is a field of the shared struct", cu.contains(" Class1 sobj1;") && !all_parts.contains("Class1 sobj1;"));
+    ck("init: declarations sharing a line with a block start stay in one part", part_of("double _md1 = (double)").len() == 1 && part_of("double _md1 = (double)") == part_of("v6 = ts_num(_md1);"));
+    ck("init: the frame through its pointer in the parts", !all_parts.contains("F.s") && all_parts.contains("mi__f->s1"));
+    ck("init: the parts are noinline, hidden, and the struct types are the unit's", parts.values().all(|(f, _)| read(&d6, f).contains("typedef struct { ts_frame_hdr h; tsv s0; tsv s1; } mi__frame_")) && cu.contains("__attribute__((noinline, visibility(\"hidden\"))) void fn_11___module_init_d__part_"));
+    let h6 = read(&d6, "prog.h");
+    ck("init: the header does not declare the parts", !h6.contains("__part_"));
+    let remote: Vec<usize> = parts.iter().filter(|(_, (f, _))| f != caller_unit).map(|(k, _)| *k).collect();
+    ck("init: the caller's unit declares the parts other units define", !remote.is_empty() && remote.iter().all(|k| cu.contains(&format!("void fn_11___module_init_d__part_{}(void* mi__sp, void* mi__fp);", k))));
+    ck("init: the init units call the originals (no copies)", files(&d6).iter().filter(|(f, _)| f.starts_with("init_")).all(|(_, t)| !t.contains("__i(")));
+    // a module initialization without a frame (small programs): the same split, no frame pointer
+    let mut fl = String::from("#include \"ts_rt.h\"\nstatic tsv fn_12_use(tsv a);\nstatic tsv fn_11___module_init_d(void);\nstatic tsv fn_12_use(tsv a) { return a; }\n");
+    fl.push_str("static tsv fn_11___module_init_d(void){\n  tsv v1 = TS_UNDEFINED;\n  tsv v2 = TS_UNDEFINED;\n  long long d3 = 0;\n");
+    fl.push_str("  v1 = fn_12_use(ts_num(1));\n");
+    for k in 0..16 { fl.push_str(&format!("  v2 = fn_12_use(v1); /* {} */\n", k)); }
+    fl.push_str("  d3 = 2;\n  return TS_UNDEFINED;\n  return TS_UNDEFINED;\n}\nint main(void){\n  fn_11___module_init_d();\n  return 0;\n}\n");
+    let d7 = dir("frameless");
+    let u7 = split(&fl, &m, &fmi, &d7, &iopt).expect("split frameless");
+    let c7 = read(&d7, "init_fn_11___module_init_d_0.c");
+    ck("init: a frameless initialization splits, the parts get no frame", u7.iter().any(|u| u.file.starts_with("init_")) && c7.contains("  fn_11___module_init_d__part_1(mi__s, (void*)0);") && !c7.contains("mi__frame_") && !c7.contains("ts_frame_push") && c7.contains("  return TS_UNDEFINED;\n}"));
+    let _ = std::fs::remove_dir_all(&d7);
+    // what keeps the function whole (its cold unit)
+    let whole = |tag: &str, extra: &str, o: &Options| -> bool {
+        let d = dir(tag);
+        let u = split(&init_program(extra), &m, &fmi, &d, o).expect("split whole");
+        let _ = std::fs::remove_dir_all(&d);
+        u.iter().any(|x| x.file == "cold_fn_11___module_init_d.c") && !u.iter().any(|x| x.file.starts_with("init_"))
+    };
+    ck("init: a return in the body keeps it whole", whole("ret", "  if (ts_truthy(v1)) { return v1; }\n", &iopt));
+    ck("init: an automatic array at the top level keeps it whole", whole("arr", "  tsv arr0[2] = {v1, v5};\n  v6 = fn_12_use(arr0[0]);\n", &iopt));
+    ck("init: an address taken of a variable declared with another keeps it whole", whole("pinaddr", "  tsv pa = v1, pb = v2; ts_gc_root(&pa);\n  ts_gc_unroot(1);\n", &iopt));
+    ck("init: a nested declaration of a function-scope name keeps it whole", whole("shadow", "  if (ts_truthy(v1)) {\n    tsv v2 = v1;\n    F.s1 = v2;\n  }\n", &iopt));
+    ck("init: a handler's setjmp keeps it whole", whole("jmp", "  if (ts_setjmp(0) == 0) { v1 = v2; }\n", &iopt));
+    ck("init: the frame named without a field keeps it whole", whole("frame", "  ts_frame_restore(&F);\n", &iopt));
+    ck("init: TSAOT_UNIT_SPLIT_INIT=0 keeps it whole", whole("off", "", &Options { split_init: false, ..iopt }));
+    for t in ["base", "edit9", "edit1", "create", "bad", "init"] { let _ = std::fs::remove_dir_all(dir(t)); }
     println!("[c_units] all checks passed");
 }

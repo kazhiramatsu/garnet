@@ -9544,3 +9544,42 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   -O1 does not finish (5 CPU minutes and 7.5 GB, abandoned); splitting it
   per module, building constant arrays from static tables, and preparing
   large literals' shapes at build time are the levers.
+- Slice S1 (analyzer unit splitter, units build; `docs/startup_design.md`):
+  the module initialization split for optimization. Startup was 4.8 ms to
+  scriptc's 1.3 from the host's init to main.ts's first line: every module's
+  top-level code is one C function (148,648 lines, 30,623 variables) that only
+  compiled at -O0 (-O1: 5 CPU minutes and 7.5 GB, abandoned). The unit
+  splitter now cuts a cold function of that shape at top-level statement
+  boundaries into `noinline` chunks of 1,000 lines (`init_<name>_<k>.c`,
+  native -O1, uninstrumented in a profile-generating build): a variable one
+  chunk uses becomes its own, one several use lives in a struct on the
+  caller's stack, the frame is reached through a pointer; no cut inside a
+  label's span, before an `else`, or between a depth-0 static and its uses; a
+  return, a handler's setjmp, a function-scope automatic array, a nested
+  declaration of a function-scope name or anything unexpected keeps the
+  function whole. A variable whose address is taken, or of a struct type (an
+  object the escape analysis put on the stack), lives on the caller's stack
+  whatever its users: the first version kept such an object in the chunk that
+  made it, and the conformance suite run through units with the split forced
+  (chunks of 8 lines) failed 30 of 575 fixtures, a later chunk reading the
+  object through a frame slot after its chunk had returned (a silent wrong
+  value; tsc-ts's two stack objects happened to stay within their chunks). The init units call
+  the originals (no inline copies) and the chunks' prototypes stay in the
+  caller's unit, so every other unit and the header are byte for byte
+  unchanged; the one-file emit too (parity). tsc-ts: 118 chunks in 8 units,
+  57 shared variables; module initialization 4.73 to 3.56 ms, `--version`
+  8.00 to 6.80 ms (scriptc 5.0), one checker 969 to 954 ms (instructions
+  0.979; every phase 1-2% shorter, not traced), ten checkers within noise;
+  build 144 to 156 s (CPU 500 to 525 s); outputs identical at 1, 4 and 10
+  checkers. The final build: module initialization 4.91 to 3.62 ms (scriptc
+  1.37), one checker instructions 0.977. What remains of startup (profiled):
+  the runtime's property definitions and shape transitions for the class
+  prototypes (`ts_setup_prototypes`, 10,655 method definitions, still a cold
+  -O0 unit) and the top-level literals, about 30%; the chunks' own code about
+  25%; the shape edge table's rehashing 3.7%. ThinLTO with the profile started 0.6 ms sooner for 53 CPU seconds
+  more of build (`TSAOT_UNITS_INIT_OPT=-flto=thin`). Tests: the splitter's
+  checks in tests/c_units_tests.rs, a split and a whole case in
+  tests/units_build_gate.sh, every conformance fixture through units with the
+  split forced (`TSAOT_UNIT_COLD_LINES=60 TSAOT_UNIT_INIT_CHUNK_LINES=8`;
+  any cold `tsv f(void)` of the shape splits, a large `main()` too), plain
+  and under `TSAOT_GC_YOUNG_THRESHOLD=1`.

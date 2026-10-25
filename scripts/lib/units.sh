@@ -5,7 +5,11 @@
 # compiler sees it (preprocessed, with its macros) and the compile command,
 # then one link. Units are ThinLTO bitcode by default, so calls between units
 # are still inlined at link time; the cold units (the giant run-once
-# functions) are native objects at -O0. Source this file.
+# functions) are native objects at -O0. The module initialization's units
+# (`init_*`, docs/startup_design.md) are native objects at -O1: code that runs
+# once gains little from ThinLTO's link-time work or a profile, so a
+# profile-generating build compiles them like the cold units, uninstrumented.
+# Source this file.
 #
 #   tsaot_units_build <unit-dir> <output> [objects or link arguments...]
 #
@@ -16,6 +20,7 @@
 #   TSAOT_UNITS_JOBS    parallel compiles (default: the CPU count)
 #   TSAOT_UNITS_CACHE   object and LTO cache directory (default build/unit-cache)
 #   TSAOT_UNITS_CACHE_DAYS  cache entries unused this many days are removed (default 7)
+#   TSAOT_UNITS_INIT_OPT    the init units' optimization flags (default -O1, native)
 # A `-fprofile-use=<file>` in the compile command keys the objects by the
 # profile's content too (docs/pgo_design.md).
 
@@ -41,12 +46,15 @@ tsaot_units_build() {
   if [[ "$cc $cflags" =~ -fprofile-use=([^[:space:]]+) ]]; then
     pgohash="$(shasum -a 256 "${BASH_REMATCH[1]}" | cut -c1-64)" || return 1
   fi
+  # TSAOT_UNITS_INIT_OPT: the init units' flags (native -O1; "-flto=thin": like the rest)
+  local initflag="${TSAOT_UNITS_INIT_OPT:--O1}"
+  if [[ "$cc $cflags" == *-fprofile-generate* ]]; then initflag="$coldflag -fno-profile-generate"; fi
   # one compile script: the cache lookup, the compile, the store
   cat > "$dir/.cc_unit.sh" <<EOF
 #!/usr/bin/env bash
 set -eu
 f="\$1"
-case "\$f" in cold_*) opt="$coldflag";; *) opt="$ltoflag";; esac
+case "\$f" in cold_*) opt="$coldflag";; init_*) opt="$initflag";; *) opt="$ltoflag";; esac
 key=\$( { printf '%s\n' "$hhash" "$cc $cflags" "\$opt" "$ccver" "$pgohash"; cat "\$f"; } | shasum -a 256 | cut -c1-64)
 obj="$cache/\$key.o"
 if [[ -f "\$obj" ]]; then
