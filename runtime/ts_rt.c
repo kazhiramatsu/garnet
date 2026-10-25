@@ -2831,8 +2831,13 @@ static inline const uint8_t* shape_kflags(uint32_t id){
 static uint32_t shape_edge_hash(uint32_t parent, ts_key key, uint8_t flags){
   return prop_key_hash((key ^ (parent * 0x9e3779b9u)) + (uint32_t)flags * 0x85ebca6bu);
 }
+/* The transition table starts at 16,384 slots (256 KB, zero pages until
+   touched): a large program's startup creates about 11,000 shapes (tsc-ts),
+   and growing to that by doubling from 64 rehashed every edge eight times,
+   3.7% of its startup (docs/startup_design.md, S3). */
+#define TS_SHAPE_EDGES_INITIAL 16384u
 static int shape_edges_grow(void){
-  uint32_t new_cap = g_shape_edge_cap ? g_shape_edge_cap * 2u : 64u;
+  uint32_t new_cap = g_shape_edge_cap ? g_shape_edge_cap * 2u : TS_SHAPE_EDGES_INITIAL;
   ts_shape_edge* edges = (ts_shape_edge*)calloc(new_cap, sizeof(ts_shape_edge));
   if (!edges) return 0;
   for (uint32_t i = 0; i < g_shape_edge_cap; i++){

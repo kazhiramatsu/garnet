@@ -140,6 +140,30 @@ The 30% in property definition, shape creation, interning and class
 registration: precomputed shape chains or intern tables for the large
 top-level objects, measured first.
 
+### S3 as built: the transition table pre-sized
+
+A 20 µs profile of the split build's startup (30 runs merged by file
+address): shape transitions 17% (`props_define`'s lookup or creation 7.9%,
+`lit_layout_shape`'s walk 5.2%, the transition table's rehashing 3.7%), the
+property lookups before an addition 11%, class registration 3.3%,
+interning 2.5%. `props_define` is called almost only from
+`ts_define_data`, and `ts_define_data` almost only from the generated
+`ts_setup_prototypes` (10,655 method definitions, one new shape each, still
+a cold -O0 unit); `ts_set_named_prop` from inline-cache misses (a run-once
+site always misses).
+
+The transition table started at 64 slots and doubled at three quarters
+full, rehashing every edge on the way to 16,384: it now starts at 16,384
+(256 KB of zero pages until touched). Module initialization 3.51 to 3.38
+ms (41 interleaved runs); the one-checker compile neutral (instructions
+1.0004, cycles 1.0015). The intern table was already sized once for the
+compile-time names.
+
+What remains is the work itself: one shape per method definition and per
+literal layout step, and the chunks' own code (25%). Removing it means not
+doing it at startup: prototypes and literal layouts built at build time (a
+static shape table and property maps), or the heap snapshot below.
+
 ## Later: a heap snapshot
 
 Running the initialization at build time and mapping its heap at startup

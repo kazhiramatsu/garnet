@@ -9583,3 +9583,12 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   split forced (`TSAOT_UNIT_COLD_LINES=60 TSAOT_UNIT_INIT_CHUNK_LINES=8`;
   any cold `tsv f(void)` of the shape splits, a large `main()` too), plain
   and under `TSAOT_GC_YOUNG_THRESHOLD=1`.
+- Slice S3 (runtime; `docs/startup_design.md` "S3 as built"): the shape
+  transition table starts at 16,384 slots (256 KB, zero pages until touched)
+  instead of doubling from 64, which rehashed every edge eight times during
+  tsc-ts's startup (3.7% of it). Module initialization 3.51 to 3.38 ms; one
+  checker neutral (instructions 1.0004, cycles 1.0015). The startup profile
+  after S1: shape transitions 17% (most from the 10,655 method definitions of
+  the generated `ts_setup_prototypes`, one new shape each), property lookups
+  before additions 11%, the chunks' own code 25%; going further means
+  building prototypes and literal layouts at build time or a heap snapshot.
