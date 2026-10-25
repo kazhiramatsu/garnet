@@ -55,7 +55,9 @@ JSON:   stringify (primitives/arrays/objects/Map; functions+undefined omitted;
         NaN/Infinity -> null; depth-capped; null/undefined replacer and `space`
         supported), parse with optional reviver (objects/arrays/strings/numbers/
         true/false/null; objects use compile-consistent field ids so dot access
-        works on parsed results)
+        works on parsed results); typed parse through `garnet:json`
+        (`JSON.parse<T>(text)` validated against T, objects in T's layout,
+        a TypeError naming the path; docs/typed_json_design.md)
 Promise: constructor executor, resolve/reject/all/race/allSettled/any,
         then/catch/finally.
 RegExp: literal and constructor objects (a constant or a dynamic pattern and

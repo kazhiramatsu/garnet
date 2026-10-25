@@ -86,6 +86,11 @@
 #                          one scope record per activation (legacy IR).
 #   TSAOT_TYPED_CTX_FIELDS=0  Exporter: boxed capture-context fields (a captured
 #                          number variable is an unboxed slot of its record by default)
+#   TSAOT_MODULE_CONST_FOLD=0  Exporter: a module-scope `const` with a literal
+#                          initializer is read from its module cell instead of
+#                          folding to the constant.
+#   TSAOT_TYPED_JSON_LOG=1 Exporter: print the schema derived for each
+#                          garnet:json `parse<T>` call (docs/typed_json_design.md).
 #   TSAOT_TA_LOOPS=0       Analyzer: no versioned counted loops over typed-array
 #                          views (the element-wise prefix clang vectorizes)
 #   TSAOT_INT_STORE_FIELDS=0  Analyzer: a number field whose every store is an

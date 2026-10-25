@@ -254,3 +254,5 @@ parity	expressions/logical_conditions	Rust escape analysis: site 9 is a FrameAre
 parity	classes/int_store_fields	The frozen emitter lists the inherited field the Pair constructor reassigns (`kind`) a second time in the subclass descriptor where the Rust emitter lists each slot once (as in classes/redeclared_field_slots); both outputs match V8.
 parity-unported	stdlib/typed_array_loops	Frozen emitter lacks builtin typedarray.new:5 (the fixture builds Int32Array/Uint16Array/Uint8ClampedArray views); native Rust output matches V8.
 selfconf-unported	stdlib/typed_array_loops	Frozen emitter lacks builtin typedarray.new:5 (the fixture builds Int32Array/Uint16Array/Uint8ClampedArray views); native Rust output matches V8.
+parity	modules/typed_json	The Rust emitter types one local of the garnet:json parser as an integer (`long long d15` against the frozen `double d15`: the int-local analysis the frozen twin predates); both outputs match V8.
+selfconf-unported	modules/typed_json	Frozen emitter lacks the host global of garnet:json (LoadBuiltinFn globalref.__garnet_json); native Rust output matches V8.

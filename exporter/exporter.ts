@@ -1408,7 +1408,16 @@ class Exporter {
         a = (declaration as unknown as { symbol?: ts.Symbol }).symbol ?? a;
       }
       if (ts.isIdentifier(node) && this.isVarRef(node) && this.isAmbientGlobalSymbol(a)) {
-        return this.moduleTopBindingByName.get(node.text) ?? a;
+        // A module's top-level binding is in scope in its own file only; another
+        // file reaches it through an import, which the checker resolves. A
+        // same-named binding elsewhere (a module exporting `JSON`) must not
+        // capture this file's reference to the global.
+        const top = this.moduleTopBindingByName.get(node.text);
+        if (top === undefined) return a;
+        const declSf = top.declarations?.[0]?.getSourceFile();
+        let useSf: ts.Node | undefined = node;
+        while (useSf && !ts.isSourceFile(useSf)) useSf = useSf.parent;
+        return declSf === undefined || useSf === undefined || declSf === useSf ? top : a;
       }
       return a;
     };
@@ -3063,6 +3072,30 @@ class Exporter {
    *  those as an exponential STRING, which the analyzer parses with Rust's
    *  correctly-rounded std parser (ConstVal::Num accepts number or numeric string).
    *  Normal/safe numbers pass through as JSON numbers (unchanged output). */
+  /** The literal a module-scope `const` is initialized with: a number (or a
+   *  negated one), a string, true or false. Such a binding never changes, so a
+   *  read is the constant (TSAOT_MODULE_CONST_FOLD=0 keeps the cell read). */
+  private moduleConstLiteral(sym: ts.Symbol | undefined):
+    { kind: "Num"; value: number | string } | { kind: "NegZero" } | { kind: "Str"; value: string } | { kind: "Bool"; value: boolean } | undefined {
+    if (!sym || !this.moduleScopeSyms.has(sym) || process.env.TSAOT_MODULE_CONST_FOLD === "0") return undefined;
+    const d = sym.valueDeclaration;
+    if (!d || !ts.isVariableDeclaration(d) || !ts.isIdentifier(d.name) || !d.initializer) return undefined;
+    const list = d.parent;
+    if (!ts.isVariableDeclarationList(list) || !(list.flags & ts.NodeFlags.Const)) return undefined;
+    if (!ts.isVariableStatement(list.parent) || !ts.isSourceFile(list.parent.parent)) return undefined;
+    let init: ts.Expression = d.initializer;
+    while (ts.isParenthesizedExpression(init)) init = init.expression;
+    const num = (lit: ts.NumericLiteral): number => Number(lit.text.replace(/_/g, ""));
+    if (ts.isNumericLiteral(init)) return { kind: "Num", value: this.numWire(num(init)) };
+    if (ts.isPrefixUnaryExpression(init) && init.operator === ts.SyntaxKind.MinusToken && ts.isNumericLiteral(init.operand)) {
+      const v = -num(init.operand);
+      return Object.is(v, -0) ? { kind: "NegZero" } : { kind: "Num", value: this.numWire(v) };
+    }
+    if (ts.isStringLiteral(init) || ts.isNoSubstitutionTemplateLiteral(init)) return { kind: "Str", value: init.text };
+    if (init.kind === ts.SyntaxKind.TrueKeyword) return { kind: "Bool", value: true };
+    if (init.kind === ts.SyntaxKind.FalseKeyword) return { kind: "Bool", value: false };
+    return undefined;
+  }
   private numWire(value: number): number | string {
     if (Number.isFinite(value) && Number.isInteger(value) && Math.abs(value) > Number.MAX_SAFE_INTEGER) {
       return value.toExponential();
@@ -3737,6 +3770,164 @@ class Exporter {
    *  fast path: no namespace-object lookup, property PIC, or indirect call at
    *  each JSX site. The namespace identifier remains available for a semantic
    *  fallback and for loading React.Fragment. */
+  /** Whether `fileName` is garnet's own module `lib/garnet/<name>.ts`. */
+  private isGarnetLibFile(fileName: string, name: string): boolean {
+    return fileName.replace(/\\/g, "/").endsWith("/lib/garnet/" + name + ".ts");
+  }
+
+  /** A one-argument call of garnet:json's `parse` (`parse<T>(s)` or `JSON.parse<T>(s)` on
+   *  the module's `JSON` export): the parse function and the schema of the call's T. */
+  private typedJsonParseCall(node: ts.CallExpression): { func: number; schema: string } | undefined {
+    if (node.arguments.length !== 1 || ts.isSpreadElement(node.arguments[0]) || node.questionDotToken) return undefined;
+    const fn = node.expression;
+    let sym: ts.Symbol | undefined;
+    if (ts.isIdentifier(fn)) {
+      sym = this.symbolOf(fn);                 // the import alias unwrapped: the module's `parse`
+      if (!sym || sym.name !== "parse") return undefined;
+    } else if (ts.isPropertyAccessExpression(fn) && fn.name.text === "parse" && ts.isIdentifier(fn.expression)) {
+      sym = this.symbolOf(fn.expression);      // the module's `JSON` object
+      if (!sym || sym.name !== "JSON") return undefined;
+    } else return undefined;
+    const decl = sym.valueDeclaration ?? sym.declarations?.[0];
+    if (!decl) return undefined;
+    const sf = decl.getSourceFile();
+    if (!this.isGarnetLibFile(sf.fileName, "json")) return undefined;
+    const modSym = this.checker.getSymbolAtLocation(sf) ?? (sf as unknown as { symbol?: ts.Symbol }).symbol;
+    if (!modSym) return undefined;
+    const exported = this.checker.getExportsOfModule(modSym).find((s) => s.name === "parse");
+    const parseSym = exported ? (this.unwrapImportAlias(exported) ?? exported) : undefined;
+    const func = parseSym ? this.funcSymbols.get(parseSym) : undefined;
+    if (func === undefined) return undefined;
+    const t = this.checker.getResolvedSignature(node)?.getReturnType();
+    if (!t) return undefined;
+    const schema = this.typedJsonSchema(t, node);
+    if (schema === undefined) return undefined;
+    if (process.env.TSAOT_TYPED_JSON_LOG === "1") {
+      const at = node.getSourceFile();
+      const pos = at.getLineAndCharacterOfPosition(node.getStart());
+      process.stderr.write(`[typed-json] ${path.basename(at.fileName)}:${pos.line + 1} ${this.checker.typeToString(t)} -> ${schema}\n`);
+    }
+    return { func, schema };
+  }
+
+  /** The schema string of a type (docs/typed_json_design.md), or undefined after a
+   *  loud reject when the type has a part JSON cannot carry. */
+  private typedJsonSchema(root: ts.Type, node: ts.Node): string | undefined {
+    const checker = this.checker;
+    const defs: string[] = [];
+    const defNames = new Map<number, string>();
+    const usedNames = new Set<string>();
+    const visiting = new Set<number>();
+    let failure: string | undefined;
+    const fail = (what: string): string => { if (failure === undefined) failure = what; return '"*"'; };
+    const idOf = (t: ts.Type): number => (t as unknown as { id: number }).id;
+    const nameOf = (t: ts.Type): string => {
+      const own = t.symbol && t.symbol.name !== "__type" && t.symbol.name !== "__object" ? t.symbol.name : undefined;
+      const base = t.aliasSymbol?.name ?? own ?? "T";
+      let name = base;
+      for (let k = 2; usedNames.has(name); k++) name = base + k;
+      usedNames.add(name);
+      return name;
+    };
+    const ref = (id: number): string => `{"k":"ref","n":${JSON.stringify(defNames.get(id))}}`;
+    const lit = (v: string | number | boolean): string => `{"k":"l","v":${JSON.stringify(v)}}`;
+    const isTrue = (t: ts.Type): boolean => (t as unknown as { intrinsicName?: string }).intrinsicName === "true";
+    const schema = (t: ts.Type): string => {
+      const f = t.flags;
+      if (f & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) return '"*"';
+      if (f & ts.TypeFlags.Boolean) return '"b"';
+      if (f & ts.TypeFlags.Number) return '"n"';
+      if (f & ts.TypeFlags.String) return '"s"';
+      if (f & ts.TypeFlags.Null) return '"z"';
+      if (f & ts.TypeFlags.StringLiteral) return lit((t as ts.StringLiteralType).value);
+      if (f & ts.TypeFlags.NumberLiteral) return lit((t as ts.NumberLiteralType).value);
+      if (f & ts.TypeFlags.BooleanLiteral) return lit(isTrue(t));
+      if (f & ts.TypeFlags.Union) {
+        const members = (t as ts.UnionType).types.filter((m) => !(m.flags & ts.TypeFlags.Undefined));
+        const bools = members.filter((m) => m.flags & ts.TypeFlags.BooleanLiteral);
+        const both = bools.length === 2;
+        const parts: string[] = [];
+        let boolDone = false;
+        for (const m of members) {
+          if (both && (m.flags & ts.TypeFlags.BooleanLiteral)) {
+            if (!boolDone) { parts.push('"b"'); boolDone = true; }
+            continue;
+          }
+          parts.push(schema(m));
+        }
+        if (parts.length === 0) return fail("undefined");
+        if (parts.length === 1) return parts[0];
+        return `{"k":"u","m":[${parts.join(",")}]}`;
+      }
+      if (f & ts.TypeFlags.Enum) return '"n"'; // an enum with computed members: its values are numbers
+      if (f & ts.TypeFlags.Object || f & ts.TypeFlags.Intersection) {
+        if (f & ts.TypeFlags.Object) {
+          if (checker.isArrayType(t)) {
+            const args = checker.getTypeArguments(t as ts.TypeReference);
+            return `{"k":"a","e":${args.length ? schema(args[0]) : '"*"'}}`;
+          }
+          if (checker.isTupleType(t)) {
+            const target = (t as ts.TupleTypeReference).target;
+            if (!target.elementFlags.every((e) => e & ts.ElementFlags.Required)) return fail("a tuple with optional or rest elements");
+            return `{"k":"t","e":[${checker.getTypeArguments(t as ts.TypeReference).map(schema).join(",")}]}`;
+          }
+        }
+        if (t.symbol && (t.symbol.flags & ts.SymbolFlags.Class)) return fail(`a class (${t.symbol.name})`);
+        if (checker.getSignaturesOfType(t, ts.SignatureKind.Call).length > 0 ||
+            checker.getSignaturesOfType(t, ts.SignatureKind.Construct).length > 0) return fail("a function type");
+        const id = idOf(t);
+        if (visiting.has(id)) {
+          if (!defNames.has(id)) defNames.set(id, nameOf(t));
+          return ref(id);
+        }
+        if (defNames.has(id)) return ref(id); // defined by an earlier visit
+        visiting.add(id);
+        let body: string;
+        const props = checker.getPropertiesOfType(t);
+        const indexInfos = checker.getIndexInfosOfType(t);
+        if (indexInfos.length > 0) {
+          if (props.length > 0 || indexInfos.length !== 1 || !(indexInfos[0].keyType.flags & ts.TypeFlags.String)) {
+            body = fail("an index signature beside named properties");
+          } else body = `{"k":"r","e":${schema(indexInfos[0].type)}}`;
+        } else {
+          const entries: string[] = [];
+          for (const p of props) {
+            if (p.flags & (ts.SymbolFlags.Method | ts.SymbolFlags.Accessor)) { body = fail(`a method (${p.name})`); break; }
+            if (p.name.startsWith("__@")) { body = fail(`a symbol-keyed property`); break; }
+            const pt = checker.getTypeOfSymbolAtLocation(p, node);
+            const optional = (p.flags & ts.SymbolFlags.Optional) !== 0 ||
+              ((pt.flags & ts.TypeFlags.Union) !== 0 && (pt as ts.UnionType).types.some((m) => (m.flags & ts.TypeFlags.Undefined) !== 0));
+            entries.push(`[${JSON.stringify(p.name)},${schema(pt)},${optional ? 1 : 0}]`);
+          }
+          body = failure !== undefined ? '"*"' : `{"k":"o","p":[${entries.join(",")}]}`;
+        }
+        visiting.delete(id);
+        if (defNames.has(id)) { defs.push(`${JSON.stringify(defNames.get(id))}:${body}`); return ref(id); }
+        return body;
+      }
+      return fail(checker.typeToString(t));
+    };
+    const s = schema(root);
+    if (failure !== undefined) {
+      this.unsupported(node, `typed JSON cannot represent ${failure} in ${checker.typeToString(root)}`);
+      return undefined;
+    }
+    return defs.length ? `{"d":{${defs.join(",")}},"s":${s}}` : `{"s":${s}}`;
+  }
+
+  /** `parse(text, "<schema>")`: a direct call of garnet:json's parse. */
+  private lowerTypedJsonParse(ctx: FnCtx, node: ts.CallExpression, tj: { func: number; schema: string }): number {
+    const text = this.lowerExpr(ctx, node.arguments[0]);
+    const sch = this.newLocal(ctx, "reference", "json.schema");
+    ctx.body.push({ kind: "Const", dst: sch, value: { kind: "Str", value: tj.schema } });
+    const dst = this.newLocal(ctx, this.refKindOf(node));
+    const args = [text, sch];
+    const cells = this.directCallCellArgs(ctx, tj.func);
+    if (cells.length) args.unshift(...cells);
+    ctx.body.push({ kind: "Call", dst, callee: { kind: "Direct", func: tj.func }, args });
+    return dst;
+  }
+
   private jsxFactoryInfo(node: ts.Node): {
     namespaceName: ts.Identifier;
     moduleSymbol: ts.Symbol;
@@ -5130,6 +5321,10 @@ class Exporter {
         ctx.body.push({ kind: "ArrayPush", arr, src: v });
         return arr;
       }
+      // garnet:json `parse<T>(text)` (docs/typed_json_design.md): the schema of T
+      // becomes the second argument of a direct call of the module's parse.
+      const typedJson = this.typedJsonParseCall(node);
+      if (typedJson !== undefined) return this.lowerTypedJsonParse(ctx, node, typedJson);
       let recv: number | undefined;
       let callee: any = { kind: "Unknown" };
       let droppedCallbackArgs: Set<number> | undefined;
@@ -6786,6 +6981,17 @@ class Exporter {
       const dst = this.newLocal(ctx, "reference");
       ctx.body.push({ kind: "Const", dst, value: { kind: "Undef" } });
       return dst;
+    }
+    {
+      // A module-scope `const` holding a literal (`const CH_QUOTE = 34`): the
+      // constant itself, not a read of the module's cell (a TDZ read was
+      // rejected above).
+      const lit = this.moduleConstLiteral(sym);
+      if (lit !== undefined) {
+        const dst = this.newLocal(ctx, lit.kind === "Str" ? "reference" : "primitive", node.text);
+        ctx.body.push({ kind: "Const", dst, value: lit });
+        return dst;
+      }
     }
     if (sym && this.lazyFnValueSyms.has(sym)) {
       const lazy = this.lazyFunctionValue(ctx, sym, node);

@@ -438,6 +438,22 @@ ran 1.7× faster than on Node.js (0.17 s against 0.29 s), where before it ran
 slower (0.32 s). A loop that calls a function or boxes a value takes the
 general path.
 
+Typed JSON: `import { JSON } from "garnet:json"` gives `JSON.parse<T>(text)`,
+which validates the text against `T` while parsing, builds each object in
+the property order of the type and drops undeclared properties. A mismatch
+is a TypeError naming the path (`$.user.tags[2] must be number, received
+string`; `$.id is missing`), and `T` can also come from the contextual type
+(`const u: User = JSON.parse(text)`). Object types, arrays, tuples,
+`Record<string, T>`, unions, literal types, enums, `null` and recursive type
+aliases are supported; a type JSON cannot carry (a class, a `Date`, a `Map`,
+a method) is rejected at compile time. The parser is TypeScript compiled by
+Garnet (`lib/garnet/json_core.ts`): a document of 20,000 records parsed 25
+times took 0.26 s typed, where the untyped `JSON.parse` of the same document
+takes 0.16 s in Garnet's runtime and 0.20 s on Node.js (including Node's
+startup). `parseWithSchema` takes the schema string explicitly, and under
+Node.js the same import resolves to a polyfill (`parse<T>` without the
+compiler's schema is the plain parse there).
+
 Not available yet: `Intl` and the locale methods (`toLocaleString`,
 `localeCompare`), `DataView`, `WeakRef` and `FinalizationRegistry`, the Set
 algebra methods (`union` and the others), `Date` parsing and setters, and the

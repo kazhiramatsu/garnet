@@ -16,7 +16,9 @@ for f in "${files[@]}"; do
   n=$(basename "$f" .ts)
   v=$(dt "$n" "$(cat "$f")" 2>&1 | grep -oE "OK|DIFF|REJECT" | head -n1)
   if [ -x build/dt ] && [ -f build/dt.mjs ] && [ "$v" = "OK" ]; then
-    tn=$(best_of ./build/dt); tv=$(best_of node build/dt.mjs)
+    # a kernel importing one of garnet's modules runs node with the scheme's loader (as dt does)
+    nodeflags=""; grep -q "garnet:" build/dt.mjs && nodeflags="--import $ROOT/scripts/garnet_scheme_loader.mjs"
+    tn=$(best_of ./build/dt); tv=$(best_of node $nodeflags build/dt.mjs)
     ratio=$(python3 -c "print(f'{$tn/max($tv,1):.2f}')")
     printf "%-22s %9s %8s %6s  %s\n" "$n" "$tn" "$tv" "$ratio" "$v"
   else

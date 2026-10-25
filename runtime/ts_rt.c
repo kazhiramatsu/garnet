@@ -3772,12 +3772,14 @@ void ts_set(tsv obj, ts_key key, tsv val){
 }
 
 static void ts_garnet_global_init(tsv global);
+static void ts_garnet_json_global_init(tsv global);
 void ts_global_this_init(void){
   if (g_global_this_v != TS_UNDEFINED) return;
   static int rooted = 0;
   g_global_this_v = ts_new_object();
   ts_root_static_once(&g_global_this_v, &rooted);
   ts_garnet_global_init(g_global_this_v);
+  ts_garnet_json_global_init(g_global_this_v);
 }
 tsv ts_global_this(void){
   ts_global_this_init();
@@ -18890,6 +18892,75 @@ static void ts_garnet_global_init(tsv global){
   ts_set_cstr(g, "sharesGraphs", ts_bool(1));
   ts_set_cstr(global, "__garnet", g);
   ts_gc_unroot(4);
+}
+/* The `__garnet_json` global the garnet:json module calls (lib/garnet/json.ts,
+   docs/typed_json_design.md): `layout(keys)` interns a key sequence as a
+   literal layout and returns its id; `makeObject(id, values)` allocates an
+   object in that layout's shape and fills its slots in order, so a parsed
+   object has the shape of the literal `{k1, k2, ...}`. */
+static ts_lit_layout** g_json_layouts = NULL;
+static uint32_t g_json_layouts_len = 0, g_json_layouts_cap = 0;
+static tsv garnet_json_layout_fn(tsv* a, int n){
+  tsv keys = n > 0 ? a[0] : TS_UNDEFINED;
+  if (!ts_is_array(keys)) ts_throw_type_error_msg("garnet:json: layout expects an array of strings");
+  uint32_t len = ts_array_len(keys);
+  ts_key* ks = (ts_key*)malloc(sizeof(ts_key) * (len ? len : 1u));
+  for (uint32_t i = 0; i < len; i++){
+    tsv k = ts_array_get(keys, i);
+    if (!ts_is_str(k)){ free(ks); ts_throw_type_error_msg("garnet:json: layout expects an array of strings"); }
+    ks[i] = ts_intern_view(ts_str_view_typed(k));
+  }
+  ts_lit_layout* L = (ts_lit_layout*)malloc(sizeof *L);
+  L->shape = 0; L->n = len; L->keys = ks;
+  if (g_json_layouts_len == g_json_layouts_cap){
+    g_json_layouts_cap = g_json_layouts_cap ? g_json_layouts_cap * 2u : 64u;
+    g_json_layouts = (ts_lit_layout**)realloc(g_json_layouts, sizeof(ts_lit_layout*) * g_json_layouts_cap);
+  }
+  g_json_layouts[g_json_layouts_len] = L;
+  return ts_num((double)g_json_layouts_len++);
+}
+static tsv garnet_json_make_object_fn(tsv* a, int n){
+  tsv values = n > 1 ? a[1] : TS_UNDEFINED;
+  double id = n > 0 && ts_is_num(a[0]) ? ts_to_num(a[0]) : -1.0;
+  if (!(id >= 0.0 && id < (double)g_json_layouts_len) || !ts_is_array(values))
+    ts_throw_type_error_msg("garnet:json: makeObject expects a layout id and an array");
+  ts_lit_layout* L = g_json_layouts[(uint32_t)id];
+  if (ts_array_len(values) != L->n) ts_throw_type_error_msg("garnet:json: makeObject received the wrong number of values");
+  ts_gc_root(&values);
+  tsv obj = ts_new_object_layout(L);
+  for (uint32_t i = 0; i < L->n; i++) ts_lit_store(obj, i, ts_array_get(values, i));
+  ts_gc_unroot(1);
+  return obj;
+}
+/* `flat(text)`: a string whose units are its own (a buffer view, the result of
+   a concatenation, reaches its units through its parent on every read: the
+   parser reads the text once per character, so it copies the view once). */
+static tsv garnet_json_flat_fn(tsv* a, int n){
+  tsv s = n > 0 ? a[0] : TS_UNDEFINED;
+  if (!ts_is_heap_str(s)) return s;
+  if (!(ts_str_ptr_typed(s)->flags & TS_STR_FLAG_VIEW)) return s;
+  ts_gc_root(&s);
+  ts_strview v = ts_str_view_typed(s);
+  uint32_t flags = v.flags & TS_STR_FLAG_UTF16;
+  uint32_t len = v.len;
+  ts_string* str = ts_string_alloc_storage(len, flags);
+  v = ts_str_view_typed(s);   /* the allocation may have moved the parent */
+  ts_str_copy_units(str->data, flags, 0, v, 0, len);
+  str->flags = strflags_storage(str->data, flags, len);
+  ts_gc_unroot(1);
+  return ts_str_v(str);
+}
+static void ts_garnet_json_global_init(tsv global){
+  ts_gc_root(&global);
+  tsv g = ts_new_object(); ts_gc_root(&g);
+  tsv f1 = ts_make_fn_t(garnet_json_layout_fn, NULL, 0, 0); ts_gc_root(&f1);
+  ts_set_fn_meta(f1, 1u, "layout"); ts_set_cstr(g, "layout", f1);
+  tsv f2 = ts_make_fn_t(garnet_json_make_object_fn, NULL, 0, 0); ts_gc_root(&f2);
+  ts_set_fn_meta(f2, 2u, "makeObject"); ts_set_cstr(g, "makeObject", f2);
+  tsv f3 = ts_make_fn_t(garnet_json_flat_fn, NULL, 0, 0); ts_gc_root(&f3);
+  ts_set_fn_meta(f3, 1u, "flat"); ts_set_cstr(g, "flat", f3);
+  ts_set_cstr(global, "__garnet_json", g);
+  ts_gc_unroot(5);
 }
 enum { MSG_UNDEF = 0, MSG_NULL, MSG_FALSE, MSG_TRUE, MSG_NUM, MSG_STR8, MSG_STR16, MSG_ARRAY, MSG_OBJECT, MSG_TYPED, MSG_REF,
        MSG_SHARED };   /* a published cell in a shared worker's region: its address, the parent reads it in place */

@@ -9753,3 +9753,50 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   three days): the checkout is now `build/tsc-ts` (commit c002e8e, `npm ci`),
   and the measurement scripts read `TSC_TS_LIB_DIR` from it. Memory note
   written.
+- Typed JSON (`garnet:json`, `docs/typed_json_design.md`): bun's
+  `JSON.parse<T>` idea. `import { JSON } from "garnet:json"`;
+  `JSON.parse<User>(text)` (or `const u: User = JSON.parse(text)`) validates
+  the text against the type while parsing, builds each object in the type's
+  literal layout (the runtime's `__garnet_json.layout/makeObject`), drops
+  undeclared properties and throws a TypeError naming the path on a mismatch.
+  The exporter compiles the call's T to a compact schema string (object types
+  with optional properties, arrays, tuples, `Record<string, T>`, unions,
+  literal types, enums, null, recursive aliases through named definitions;
+  classes, methods, functions, Date/Map, optional/rest tuple elements, mixed
+  index signatures, symbol and bigint are loud compile-time rejects) and
+  passes it as the second argument of a direct call of the module's `parse`;
+  the parser (`lib/garnet/json_core.ts`, shared with the Node polyfill
+  `json_node.ts`) is TypeScript. Two general exporter fixes came out of it: a
+  module's top-level binding was substituted for an ambient name in EVERY
+  file (the module's `export const JSON` captured the parser's own
+  `JSON.parse`, an infinite recursion), now only in its own file; and a
+  module-scope `const` with a literal initializer reads as the constant
+  instead of a module-cell field read (`TSAOT_MODULE_CONST_FOLD=0`). The
+  parser went 937 → 532 → 421 → 261 ms on the kernel `patterns/json_typed`
+  (20,000 records × 25; 47 MB): keys hashed in place and probed in a table of
+  char codes (no allocation per key), numbers of ≤ 15 digits converted
+  exactly from their digits, one path level per container, scratch value
+  arrays, the text flattened once (a concatenation's buffer-view string pays
+  a parent lookup on every read: `__garnet_json.flat`), the host functions
+  cached, the token dispatch and whitespace checks inline. The untyped
+  `JSON.parse` kernel runs 160 ms (Node 204), building the document 28 ms: the
+  typed parse is 1.75× the C parser and about 1.4× V8 while validating.
+  Lessons on the generated code, in the design doc: the string-view hoist
+  wants tight loops (no calls in the body) and single `charCodeAt` reads take
+  the general path. Fixture `modules/typed_json` (V8 identical, plain and
+  strict; the error paths through `parseWithSchema` so both engines run the
+  same core); unit gate `tests/typed_json_schema_gate.sh` (24 derivations and
+  rejections, the const fold); `scripts/pattern_bench.sh` runs Node with the
+  scheme's loader for a kernel importing a garnet module (its Node time for
+  `json_typed`, 333 ms, includes transpiling the module). Parity: one
+  `long long` against `double` local in the parser (the int-local analysis the
+  frozen twin predates), allowlisted. README "Built-in objects" documents the
+  module. Gates: conformance 578/578 plain, strict and GC-protect (exhaustive
+  575/575), parity 397 identical + 177 known, selfconf 523 + 52 known, unit,
+  bundler 43/43, GC stress; tsc-ts output identical, instructions 0.9994
+  (the const fold touches nothing hot there). Found, pre-existing: the bench
+  gate's seven `string_*replace*_kernel` budgets fail (results correct;
+  string_replace_kernel 512 ms against a 60 ms budget, the same at the last
+  commit in a clean worktree, unchanged by the knobs of the last two slices):
+  the fused replace-metric shapes no longer match (no `_fdre_` form in the
+  generated C). To bisect next.

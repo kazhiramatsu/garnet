@@ -46,6 +46,9 @@ Rust in §315; selfhost is kept as a performance metric).
   forbidden; no porting of new features).** Its roles are ① the flagship benchmark (a real-program load
   of 66k instructions) ② the byte-parity oracle during the mechanical-Rust-refactor phase.
 - `runtime/ts_rt.c` … The shared runtime. A primary development target.
+- `lib/garnet/` … garnet's own modules (`garnet:shared`, `garnet:json`): TypeScript compiled with the
+  program (the exporter maps `garnet:*` here); a `<name>_node.ts` beside one is the V8 oracle's polyfill
+  (`scripts/garnet_scheme_loader.mjs`). The runtime side is a `__garnet*` host object in ts_rt.c.
 
 ## Development policy (since session 315: Rust-centric)
 - **Do new development in Rust (analyzer/), the exporter, and the runtime.** Do not port features into
