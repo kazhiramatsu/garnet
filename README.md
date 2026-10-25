@@ -17,14 +17,16 @@ timers or `process` (see [What your program can use](#what-your-program-can-use)
   types allow it, numbers stay unboxed, method calls go straight to their
   target, and short-lived objects never reach the heap.
 - **Loud, not wrong.** If a program has type errors, or uses something Garnet
-  does not implement yet, the build stops and names the file and line. Garnet's
-  rule is to refuse rather than guess; the few known exceptions are listed in
-  [known gaps](tests/conformance/KNOWN_GAPS.md).
+  does not implement yet, the build stops and names the file and line. Garnet
+  refuses rather than guesses. The few places where a compiled program can
+  behave differently from Node.js are listed in
+  [Known differences](#known-differences-from-nodejs).
 - **Proven on a compiler.** Built with Garnet,
-  [tsc-ts](https://github.com/vercel-labs/tsc-ts) (a TypeScript port of the
-  TypeScript 7 compiler) takes 4–6% less time than scriptc's native build of
-  the same source, and runs about 3× faster than the same code on Node.js. See
-  [Performance](#performance-tsc-ts).
+  [tsc-ts](https://github.com/vercel-labs/tsc-ts), a TypeScript port of the
+  TypeScript 7 compiler, type-checks and emits the TypeScript compiler's own
+  sources 5–9% faster than scriptc's native build of the same code, 21–27%
+  faster than tsgo (the Go compiler it was ported from), and 3–7× faster than
+  the same code on Node.js. See [Performance](#performance).
 
 ## Quick start
 
@@ -90,81 +92,198 @@ sum 1..10 = 55
 (`hello`) to the current directory, and prints a few lines of build information
 as it goes.
 
-## Performance: tsc-ts
+## Performance
 
-[tsc-ts](https://github.com/vercel-labs/tsc-ts) is a TypeScript port of tsgo,
-the Go implementation of the TypeScript 7 compiler: 246 files and 11 MB of
-TypeScript, written to be compiled natively by Vercel Labs' scriptc. Garnet
-compiles the same compiler sources without modification, so the two
-ahead-of-time compilers can be compared on one large real program.
+### The benchmark: a TypeScript compiler, compiled four ways
 
-The benchmark type-checks and emits the compiler project of TypeScript 6.0.3
-(`src/compiler`, 78 output files). Both native builds write byte-identical
-output.
+[tsc-ts](https://github.com/vercel-labs/tsc-ts) is a TypeScript port of
+[tsgo](https://github.com/microsoft/typescript-go), the Go implementation of
+the TypeScript 7 compiler: 246 files and 11 MB of strictly typed TypeScript,
+written by Vercel Labs to be compiled natively by their scriptc compiler. The
+same source runs on Node.js, and Garnet compiles it unmodified. That gives one
+large, real program in four executable forms: Garnet's native build, scriptc's
+native build, the JavaScript build on Node.js, and the Go original.
 
-| Checkers (`--checkers N`) | scriptc 0.4.0 | Garnet | Garnet's time vs. scriptc |
-|---|---:|---:|---:|
-| 1 | 1.042 s | **0.977 s** | 0.94× |
-| 4 | 0.429 s | **0.406 s** | 0.95× |
-| 10 (tsc-ts's default on this machine) | 0.476 s | **0.455 s** | 0.96× |
+The task is to type-check the compiler project of TypeScript 6.0.3
+(`src/compiler`: 78 source files and 10 MB of TypeScript, plus the standard
+library's declaration files) and emit its 78 JavaScript files. Every
+configuration below produces 78 files and no diagnostics. Garnet's, scriptc's
+and Node.js's outputs are byte-identical. tsgo's differs in 7 of the 78 files
+by a few lines, because tsgo inlines constant enum members where its
+TypeScript port emits the member access; that is a difference between the port
+and its upstream, not between compilers of the port.
 
-For reference, tsc-ts's own JavaScript build took 3.27 s on Node.js with one
-checker, and 3.05 s with four, on the same machine (measured separately, during
-the same work). With one checker, Garnet's native build is about 3.3× faster.
+### Results
 
-How it was measured:
+Wall-clock time, the median of seven interleaved runs:
 
-- Apple M5 (4 performance and 6 efficiency cores), macOS, October 2026, Garnet
-  commit `0467f35`. Each value is the median wall-clock time of five
-  interleaved runs.
-- Garnet's build passes a tsconfig with `"strict": true` to the front end, as
-  `garnet -p` does, so the [strict-profile optimizations](#turn-on-strict) were
-  on. It compiles the C as parallel units with ThinLTO at `-O2`, as `--units`
-  does.
-- Garnet's tsc-ts is a [profile-guided build](#profile-guided-builds), trained
-  on this same workload. In the last comparison with one checker, Garnet's
-  build without a profile took 1.23 s and the trained build 1.02 s. A profile
-  trained on a different project kept about half of that gain.
-- Outside Node.js, tsc-ts needs a host for `node:fs`, `process` and workers.
-  Garnet's build replaces the entry file and those modules with the shims and
-  C host in [`benchmarks/tsc_ts_native/`](benchmarks/tsc_ts_native/README.md),
-  where each checker is a forked process that shares the parsed program. This
-  host is part of the benchmark; the public `garnet` driver does not include
-  it yet.
+| Configuration | Garnet | Garnet, no profile | scriptc 0.4.0 | tsgo 7.0.2, Go PGO | tsgo 7.0.2 | Node.js 25.2 |
+|---|---:|---:|---:|---:|---:|---:|
+| Default settings | **0.49 s** | 0.56 s | 0.50 s | 0.67 s | 0.67 s | 3.23 s |
+| Four checkers | **0.41 s** | 0.48 s | 0.43 s | – | – | 3.04 s |
+| One thread | **0.97 s** | 1.18 s | 1.07 s | 1.23 s | 1.24 s | 3.22 s |
 
-### Against tsgo
+Total CPU time (user + system, all processes and threads) and peak memory:
 
-tsc-ts is a port of tsgo, so the Go compiler itself is the other natural
-comparison: the same algorithms and data structures, Go's compiler and runtime
-against Garnet's generated C and runtime.
+| Configuration | Garnet | Garnet, no profile | scriptc 0.4.0 | tsgo 7.0.2, Go PGO | tsgo 7.0.2 | Node.js 25.2 |
+|---|---:|---:|---:|---:|---:|---:|
+| CPU time, default settings | **1.61 s** | 1.85 s | 1.85 s | 2.09 s | 2.21 s | 6.80 s |
+| CPU time, one thread | **0.95 s** | 1.17 s | 1.05 s | 1.52 s | 1.58 s | 6.73 s |
+| Peak memory, one thread | 629 MB | 629 MB | **394 MB** | 469 MB | 483 MB | 769 MB |
 
-| Configuration | tsgo 7.0.2 | tsgo 7.0.2 with Go PGO | Garnet | Garnet's time vs. tsgo with PGO |
-|---|---:|---:|---:|---:|
-| Default settings (tsc-ts: 10 checkers) | 0.660 s | 0.640 s | **0.440 s** | 0.69× |
-| Garnet with `--checkers 4` | | | **0.400 s** | 0.63× |
-| One thread (`tsgo --singleThreaded`; Garnet `--checkers 1`) | 1.210 s | 1.190 s | **0.940 s** | 0.79× |
+The rows are:
 
-How it was measured:
+- **Default settings**: each program as it runs out of the box. tsc-ts (under
+  Garnet, scriptc and Node.js) picks its checker count from the machine's
+  parallelism, ten here; tsgo picks its own.
+- **Four checkers**: `--checkers 4`, the best setting for tsc-ts on this
+  machine, where only four of the ten cores are performance cores. tsgo has no
+  equivalent option.
+- **One thread**: `--checkers 1` for tsc-ts under Garnet and scriptc, which run
+  in a single process then; `--singleThreaded` for tsgo and for Node.js (with
+  `--checkers 1`, Node.js still parses on worker threads and took 3.26 s).
 
-- October 25, 2026, the same machine, Garnet commit `17de039` built and trained
-  as above. Each value is the median wall-clock time of nine interleaved runs
-  (`scripts/tsc_ts_compare.sh`); the load average was about 3.
-- tsgo was built from the typescript-go commit that tsc-ts ports (`2bd066d8`,
-  July 7, 2026, reporting `Version 7.0.2`) with Go 1.26.0, plain and with
-  `go build -pgo` on a CPU profile of three runs of this same workload
-  (`--pprofDir`), so both profile-guided builds are in-sample. The npm preview
-  `@typescript/native-preview` 7.0.0-dev.20260707.2 produced identical output
-  and took 0.70 s.
-- All tsgo builds emit identical files. tsc-ts's output differs from tsgo's in
-  7 of the 78 files by a few lines (tsgo inlines constant enum members where
-  tsc-ts emits the member access): a difference between the port and its
-  upstream, not between the compilers of the port.
-- Garnet's build without a profile took 0.52 s at the default settings, still
-  ahead of tsgo with PGO.
-- Total CPU time at the default settings: tsgo 2.2 s, Garnet 1.6 s (1.0 s with
-  four checkers). Peak memory with one thread, where both run in one process:
-  tsgo about 470 MB, Garnet 629 MB. With forked checkers the figure for
-  Garnet's main process alone (143 to 225 MB) leaves out the checkers.
+What the numbers say:
+
+- At a fixed number of checkers, Garnet's build is 5% (four checkers) to 9%
+  (one thread) faster than scriptc's, and uses 10–13% less CPU time. At the
+  default settings the two are within the measurement's noise of each other.
+- Garnet's build is 27% faster than tsgo at the default settings and 21% faster
+  with one thread, with 23–38% less CPU time. Go's profile-guided optimization
+  changed tsgo's time by at most 1% here.
+- Garnet's build is 3.3× faster than Node.js with one thread and 6.6× faster at
+  the default settings.
+- Garnet's profile-guided build is 12–18% faster than its build without a
+  profile. Without a profile, Garnet is still ahead of tsgo but about 10%
+  behind scriptc.
+- Garnet's one-thread build uses the most memory of the three native builds.
+  With several checkers, Garnet's checkers are forked processes, so a
+  per-process peak is not comparable and is not shown.
+
+### Conditions
+
+- Measured on October 25, 2026 on an Apple M5 Mac (4 performance and 6
+  efficiency cores, 32 GB) running macOS 26.5.1, with a load average between
+  3 and 5 from other work. The seventeen configurations were run in rounds,
+  each configuration once per round, seven rounds; each table entry is the
+  median of its seven runs.
+- **Garnet**: commit `17de039`, built as [Reproducing the measurements](#reproducing-the-measurements)
+  shows: the front end given tsc-ts's own tsconfig (`"strict": true`), the C
+  compiled by Apple clang at `-O2` as parallel units with ThinLTO, profile-guided
+  by a training run on this same workload. The "no profile" column is the same
+  build with `TSAOT_PGO=off`. Outside Node.js, tsc-ts needs a host for
+  `node:fs`, `process` and workers; Garnet's build provides it with the shims
+  and the small C host in `benchmarks/tsc_ts_native/`, where each checker is a
+  forked process that shares the parsed program with the main process. That
+  host is part of the benchmark; the `garnet` command does not include it yet.
+- **scriptc**: tsc-ts commit `c002e8e` (October 20, 2026) built by its own
+  `npm run build:native` with scriptc 0.4.0 (`--optimization=speed`).
+- **tsgo**: the typescript-go commit that tsc-ts ports, `2bd066d8` (July 7,
+  2026, reporting `Version 7.0.2`), built with Go 1.26.0, plain and with
+  `go build -pgo` on a CPU profile of three runs of this same workload. The
+  npm preview `@typescript/native-preview` 7.0.0-dev.20260707.2 produced
+  identical output and took 0.70 s at the default settings.
+- **Node.js**: v25.2.1 running tsc-ts's JavaScript build (`tsc` with
+  `--target es2024 --module nodenext`).
+- The compilers were given the same arguments: the project
+  `src/compiler/tsconfig.json`, `--composite false --incremental false
+  --declaration false --declarationMap false --emitDeclarationOnly false
+  --isolatedDeclarations false --sourceMap false --pretty false`, and an
+  `--outDir`.
+
+### Reproducing the measurements
+
+Everything below runs from the Garnet checkout, after [Quick start](#quick-start)
+has built Garnet. The profile-guided build needs Clang and `llvm-profdata`
+(Xcode Command Line Tools on macOS); tsgo needs Go.
+
+1. Get tsc-ts at the measured commit, with its dependencies. They include
+   scriptc 0.4.0 and the TypeScript 7 lib files that every build below reads.
+
+   ```bash
+   git clone https://github.com/vercel-labs/tsc-ts.git
+   git -C tsc-ts checkout c002e8e02f462bea45f87067baaaaf646372f4be
+   (cd tsc-ts && npm ci)
+   ```
+
+2. Get the workload: the TypeScript repository at v6.0.3, with its
+   dependencies, at the path Garnet's scripts expect.
+
+   ```bash
+   git clone --branch v6.0.3 --depth 1 https://github.com/microsoft/TypeScript.git build/typescript_603/source
+   (cd build/typescript_603/source && npm ci)
+   ```
+
+3. Build tsc-ts with Garnet. The script copies the checkout's sources next to
+   the host (the checkout is not modified), exports the program with tsc-ts's
+   tsconfig, writes the C as units, builds an instrumented executable, trains
+   it on the workload from step 2 with one checker, and builds the final
+   executable with that profile. It takes two to three minutes on this machine
+   and writes `build/tsc_ts_native/tsc-ts`. The default C flags are `-O0` for
+   debugging builds, so pass the measured ones:
+
+   ```bash
+   TSAOT_NATIVE_CC='cc -O2 -gline-tables-only -fomit-frame-pointer' \
+     bash scripts/build_tsc_ts_native.sh tsc-ts build/tsc_ts_native
+   # the build without a profile:
+   TSAOT_PGO=off TSAOT_NATIVE_CC='cc -O2 -gline-tables-only -fomit-frame-pointer' \
+     bash scripts/build_tsc_ts_native.sh tsc-ts build/tsc_ts_native_plain
+   ```
+
+4. Run it. The lib files come from scriptc's package inside the tsc-ts
+   checkout.
+
+   ```bash
+   export TSC_TS_LIB_DIR=$PWD/tsc-ts/node_modules/@scriptc/cli-darwin-arm64/dist/lib/typescript/lib
+   cd build/typescript_603/source
+   time ../../tsc_ts_native/tsc-ts -p src/compiler/tsconfig.json \
+     --composite false --incremental false --declaration false --declarationMap false \
+     --emitDeclarationOnly false --isolatedDeclarations false --sourceMap false --pretty false \
+     --outDir /tmp/tsc-ts-out --checkers 4
+   cd ../../..
+   ```
+
+5. Build the others.
+
+   ```bash
+   # scriptc's native build: tsc-ts/packages/tsc-ts/dist/tsc
+   (cd tsc-ts/packages/tsc-ts && npm run build:native)
+
+   # the JavaScript build for Node.js: tsc-ts/packages/tsc-ts/dist-node/tsc-ts/src/main.js
+   (cd tsc-ts/packages/tsc-ts && npx tsc --outDir dist-node --rootDir .. --target es2024 \
+     --module nodenext --moduleResolution nodenext --strict --skipLibCheck --types node src/main.ts)
+
+   # tsgo at the commit tsc-ts ports, plain and profile-guided
+   git clone https://github.com/microsoft/typescript-go.git
+   git -C typescript-go checkout 2bd066d87f5bafd315be9f40889d0a60b9e58e0b
+   (cd typescript-go && go build -o ../tsgo ./cmd/tsgo)
+   (cd build/typescript_603/source && for i in 1 2 3; do
+      ../../../tsgo -p src/compiler/tsconfig.json --composite false --incremental false \
+        --declaration false --declarationMap false --emitDeclarationOnly false \
+        --isolatedDeclarations false --sourceMap false --pretty false \
+        --outDir /tmp/tsgo-out --pprofDir /tmp/tsgo-pprof; done)
+   go tool pprof -proto /tmp/tsgo-pprof/*-cpuprofile.pb.gz > tsgo.pprof
+   (cd typescript-go && go build -pgo=../tsgo.pprof -o ../tsgo-pgo ./cmd/tsgo)
+   ```
+
+6. Compare. `scripts/tsc_ts_compare.sh` runs the given configurations in
+   interleaved rounds on the workload, adds the project and emit options,
+   prints the medians of wall, user and system time and the peak memory, and
+   checks every configuration's output against the first.
+
+   ```bash
+   TSC_TS_LIB_DIR=$PWD/tsc-ts/node_modules/@scriptc/cli-darwin-arm64/dist/lib/typescript/lib \
+   bash scripts/tsc_ts_compare.sh 7 \
+     "garnet=$PWD/build/tsc_ts_native/tsc-ts --checkers 4" \
+     "scriptc=$PWD/tsc-ts/packages/tsc-ts/dist/tsc --checkers 4" \
+     "tsgo=$PWD/tsgo-pgo" \
+     "node=node $PWD/tsc-ts/packages/tsc-ts/dist-node/tsc-ts/src/main.js --checkers 4"
+   ```
+
+   The script changes into the workload's directory, so give it absolute
+   paths, as above.
+
+### Not every program gets faster
 
 Garnet is not faster than V8 on every program. The unmodified TypeScript 6.0.3
 compiler, written for a JIT and full of dynamic patterns, takes 4.06 s for the
@@ -172,13 +291,6 @@ same project as a Garnet executable against 3.37 s on Node.js (measured on
 October 21, 2026). Garnet removes work that it can prove unnecessary, so typed,
 statically structured code gains the most, and highly dynamic or untyped code
 gains the least. Benchmark the program you plan to ship.
-
-To reproduce the tsc-ts numbers, see
-[`benchmarks/tsc_ts_native/README.md`](benchmarks/tsc_ts_native/README.md). The
-measurements and how they evolved are in
-[`docs/published_graphs_design.md`](docs/published_graphs_design.md),
-[`docs/pgo_design.md`](docs/pgo_design.md) and
-[`docs/single_thread_vs_scriptc.md`](docs/single_thread_vs_scriptc.md).
 
 ## Everyday commands
 
@@ -315,15 +427,17 @@ These are rejected at compile time for now:
 ### Built-in objects
 
 String, Array, Map, Set, WeakMap, WeakSet, Math, Number, Object, JSON, RegExp
-(including named groups and Unicode mode), Date (a core subset), Promise,
-Symbol, Proxy, Reflect, typed arrays with ArrayBuffer and SharedArrayBuffer,
-Atomics, and TextEncoder/TextDecoder.
+(including named groups and Unicode mode), Date (construction, getters and
+`toISOString`), Promise, Symbol, Proxy, Reflect, typed arrays with ArrayBuffer
+and SharedArrayBuffer, Atomics, and TextEncoder/TextDecoder.
 
-Not available yet: `Intl` and locale formatting (`toLocaleString`), `DataView`,
-`WeakRef` and `FinalizationRegistry`. Without `-p`, Garnet type-checks against
-the ES2020 library, so newer APIs such as `Set.prototype.union` do not
-type-check. [Standard-library coverage](docs/stdlib_coverage.md) has the
-details.
+Not available yet: `Intl` and the locale methods (`toLocaleString`,
+`localeCompare`), `DataView`, `WeakRef` and `FinalizationRegistry`, the Set
+algebra methods (`union` and the others), `Date` parsing and setters, and the
+replacer argument of `JSON.stringify`. A method Garnet does not implement is
+rejected at compile time with a message that names it; nothing is silently
+skipped. Without `-p`, Garnet type-checks against the ES2020 library, so newer
+APIs do not type-check unless your tsconfig selects a newer `lib`.
 
 ### Input and output
 
@@ -337,8 +451,9 @@ Programs can print and fetch:
 
 There is no API yet for command-line arguments, environment variables, files,
 standard input or timers, and Node.js modules (`process`, `require`, `node:fs`
-and so on) are not available. Node.js compatibility is planned; see
-[its design](docs/node_compat_design.md).
+and so on) are not available. Node.js compatibility is planned: a `node:`
+module layer written in TypeScript and compiled by Garnet itself, on a small C
+core.
 
 Watch out for one trap. TypeScript's default declarations include browser
 globals, so code that uses `setTimeout`, `queueMicrotask`, `performance`,
@@ -361,8 +476,26 @@ garnet -o build/react-ssr.c tests/bundler/react_subset/entry.ts
 ./build/react-ssr
 ```
 
-This is a test fixture for server rendering, not full React compatibility; see
-the [JSX and SSR design](docs/jsx_react_ssr_design.md).
+This is a test fixture for server rendering, not full React compatibility.
+
+### Known differences from Node.js
+
+Garnet's conformance suite compiles several hundred programs and compares
+their output with Node.js, and a difference is treated as a bug. The known
+exceptions are these. The first three only arise when a program's types are
+wrong, which the TypeScript checker cannot see through an `any`:
+
+- A class field declared as `number` and read before its first assignment
+  gives `0`; Node.js gives `undefined`.
+- A `number` parameter that receives no argument, in a call made through an
+  `any`-typed value with fewer arguments, reads as `0`; Node.js gives
+  `undefined`.
+- An `any` value that holds something other than a number, assigned to a
+  `number` variable, reads as `NaN`; Node.js keeps the value.
+- An integer loop counter that passes 2⁵³ can differ in its last bits, because
+  Garnet keeps it as a 64-bit integer where V8 rounds to a double.
+
+Compiling with `--untyped` removes the first three, at a cost in speed.
 
 ## Deploying the executable
 
@@ -442,8 +575,8 @@ TypeScript entry file + its static imports
 | `runtime/` | The native runtime: values, objects, strings, async, garbage collector |
 | `lib/garnet/` | Garnet's own TypeScript modules (`garnet:*`) |
 | `tests/` | Conformance tests against Node.js, plus bundler, runtime and GC tests |
-| `benchmarks/` | Correctness and performance workloads, including tsc-ts |
-| `docs/` | Design notes, coverage, benchmark results, and the progress log (`docs/TODO.md`) |
+| `benchmarks/` | Correctness and performance workloads, including the tsc-ts host |
+| `docs/` | Design notes and the progress log (`docs/TODO.md`) |
 | `analyzer_ts/` | The frozen self-hosted analyzer, kept as a benchmark and parity oracle |
 | `third_party/` | Vendored mimalloc |
 

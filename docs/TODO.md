@@ -9644,3 +9644,22 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   `reduceRight` is a runtime TypeError); `scripts/prof_pc.py` symbolizes in one
   atos call (the 500-address chunks reloaded the debug information each time:
   over eight minutes on tsc-ts, now seconds).
+- README rewritten after the user found it incoherent: one Performance
+  section with every implementation measured in one session (seven interleaved
+  rounds, October 25 2026, load 3-5): wall at default / four checkers / one
+  thread, garnet 0.49 / 0.41 / 0.97 s, garnet without a profile 0.56 / 0.48 /
+  1.18, scriptc 0.4.0 0.50 / 0.43 / 1.07, tsgo 7.0.2 with Go PGO 0.67 / - /
+  1.23, tsgo plain 0.67 / - / 1.24, Node 25.2 3.23 / 3.04 / 3.22
+  (`--singleThreaded`; `--checkers 1` 3.26); CPU time and one-process peak
+  memory tables; the conditions and every build and run command in the text
+  (tsc-ts commit c002e8e with `npm ci`, TypeScript v6.0.3 at
+  `build/typescript_603/source` with `npm ci`, `scripts/build_tsc_ts_native.sh`
+  with the measured `TSAOT_NATIVE_CC`, scriptc's `npm run build:native`, the
+  `tsc` build for Node, tsgo at 2bd066d8 plain and `-pgo`,
+  `scripts/tsc_ts_compare.sh` with absolute paths). Links to design documents
+  removed from the user-facing sections; a "Known differences from Node.js"
+  subsection states the typed-mode deviations (the number field, parameter
+  and `any` cases, the 2^53 counter). Found while writing it: the build
+  script's default `TSAOT_NATIVE_CC` is `-O0` (the README passes the measured
+  flags); `src/compiler` is 78 files and 10 MB (249 was the parsed file count
+  with the lib declarations).
