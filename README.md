@@ -132,6 +132,40 @@ How it was measured:
   host is part of the benchmark; the public `garnet` driver does not include
   it yet.
 
+### Against tsgo
+
+tsc-ts is a port of tsgo, so the Go compiler itself is the other natural
+comparison: the same algorithms and data structures, Go's compiler and runtime
+against Garnet's generated C and runtime.
+
+| Configuration | tsgo 7.0.2 | tsgo 7.0.2 with Go PGO | Garnet | Garnet's time vs. tsgo with PGO |
+|---|---:|---:|---:|---:|
+| Default settings (tsc-ts: 10 checkers) | 0.660 s | 0.640 s | **0.440 s** | 0.69× |
+| Garnet with `--checkers 4` | | | **0.400 s** | 0.63× |
+| One thread (`tsgo --singleThreaded`; Garnet `--checkers 1`) | 1.210 s | 1.190 s | **0.940 s** | 0.79× |
+
+How it was measured:
+
+- October 25, 2026, the same machine, Garnet commit `17de039` built and trained
+  as above. Each value is the median wall-clock time of nine interleaved runs
+  (`scripts/tsc_ts_compare.sh`); the load average was about 3.
+- tsgo was built from the typescript-go commit that tsc-ts ports (`2bd066d8`,
+  July 7, 2026, reporting `Version 7.0.2`) with Go 1.26.0, plain and with
+  `go build -pgo` on a CPU profile of three runs of this same workload
+  (`--pprofDir`), so both profile-guided builds are in-sample. The npm preview
+  `@typescript/native-preview` 7.0.0-dev.20260707.2 produced identical output
+  and took 0.70 s.
+- All tsgo builds emit identical files. tsc-ts's output differs from tsgo's in
+  7 of the 78 files by a few lines (tsgo inlines constant enum members where
+  tsc-ts emits the member access): a difference between the port and its
+  upstream, not between the compilers of the port.
+- Garnet's build without a profile took 0.52 s at the default settings, still
+  ahead of tsgo with PGO.
+- Total CPU time at the default settings: tsgo 2.2 s, Garnet 1.6 s (1.0 s with
+  four checkers). Peak memory with one thread, where both run in one process:
+  tsgo about 470 MB, Garnet 629 MB. With forked checkers the figure for
+  Garnet's main process alone (143 to 225 MB) leaves out the checkers.
+
 Garnet is not faster than V8 on every program. The unmodified TypeScript 6.0.3
 compiler, written for a JIT and full of dynamic patterns, takes 4.06 s for the
 same project as a Garnet executable against 3.37 s on Node.js (measured on

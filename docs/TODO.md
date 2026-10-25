@@ -9620,3 +9620,27 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   `"strict": true` tsconfig it becomes a `double`); the not-implemented list
   of `docs/stdlib_coverage.md` is stale (substr, dynamic RegExp and typed
   arrays are implemented).
+- tsc-ts against tsgo (docs; README "Against tsgo", `scripts/tsc_ts_compare.sh`):
+  the Go compiler that tsc-ts ports, built from the ported commit (`2bd066d8`,
+  July 7 2026, `Version 7.0.2`; Go 1.26.0), plain and with Go PGO (`-pgo` on a
+  CPU profile of three runs of the compiler project through `--pprofDir`).
+  Wall medians of nine interleaved runs on the TypeScript 6.0.3 compiler
+  project (load average about 3): default settings tsgo 0.660 s, tsgo PGO
+  0.640 s, garnet (trained build of 17de039) 0.440 s, garnet `--checkers 4`
+  0.400 s, garnet's plain build 0.520 s; one thread (`--singleThreaded` against
+  `--checkers 1`) 1.210 / 1.190 / 0.940 s. CPU time at the default: tsgo 2.2 s,
+  garnet 1.6 s (1.0 s at four checkers). Peak RSS in one process: tsgo about
+  470 MB, garnet 629 MB. The npm preview 7.0.0-dev.20260707.2 (the same day's
+  build) emits identical files and took 0.70 s. tsc-ts's output differs from
+  tsgo's in 7 of 78 files (constant enum members inlined by tsgo), a port
+  difference. Go PGO is worth about 3% to tsgo. The comparison script takes
+  `name=command` pairs and checks every configuration's output against the
+  first.
+- Docs and tooling: `docs/stdlib_coverage.md` refreshed against probes (substr,
+  dynamic RegExp construction, ArrayBuffer/typed arrays and
+  `POSITIVE_INFINITY` are implemented; DataView, Set algebra, locale methods,
+  Date parsing and setters, JSON replacers, WeakRef, typed-array `at`/
+  `findLast`/`toSorted`/`toReversed`/`with` still reject; a typed array's
+  `reduceRight` is a runtime TypeError); `scripts/prof_pc.py` symbolizes in one
+  atos call (the 500-address chunks reloaded the debug information each time:
+  over eight minutes on tsc-ts, now seconds).
