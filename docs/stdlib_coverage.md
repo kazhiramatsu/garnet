@@ -13,7 +13,7 @@ override), never silently miscompiled. Methods on user classes are unaffected
 
 ## Implemented (verified vs V8, ASan-clean)
 String: toUpperCase, toLowerCase, toLocaleUpperCase, toLocaleLowerCase, slice,
-        substring, indexOf, lastIndexOf, includes, charAt, charCodeAt,
+        substring, substr, indexOf, lastIndexOf, includes, charAt, charCodeAt,
         codePointAt, concat, repeat, trim, split, startsWith, endsWith,
         padStart, padEnd, trimStart, trimEnd, trimLeft, trimRight, at,
         isWellFormed, toWellFormed, normalize, replace, replaceAll
@@ -58,10 +58,19 @@ JSON:   stringify (primitives/arrays/objects/Map; functions+undefined omitted;
         works on parsed results)
 Promise: constructor executor, resolve/reject/all/race/allSettled/any,
         then/catch/finally.
-RegExp: literal/object/const-string constructor objects with optional QuickJS
-        fallback; test/exec/search/match/matchAll/replace/global replaceAll/split,
-        captures, named groups, basic `d` indices, `u`/`v` Unicode mode, extracted
-        test/exec method values.
+RegExp: literal and constructor objects (a constant or a dynamic pattern and
+        flags) with optional QuickJS fallback; test/exec/search/match/matchAll/
+        replace/global replaceAll/split, captures, named groups, basic `d`
+        indices, `u`/`v` Unicode mode, extracted test/exec method values.
+Typed arrays (docs/typed_arrays_design.md): ArrayBuffer (byteLength, slice)
+        and SharedArrayBuffer; Int8/Uint8/Uint8Clamped/Int16/Uint16/Int32/
+        Uint32/Float32/Float64Array from a length, an array-like or iterable,
+        or a buffer with offset and length; `T.from`, `T.of`; element
+        conversion on store; length, byteLength, byteOffset, buffer,
+        BYTES_PER_ELEMENT; subarray, slice, set, fill, copyWithin, indexOf,
+        lastIndexOf, includes, join, toString, reverse, sort, forEach, map,
+        filter, reduce, every, some, find, findIndex, keys, values, entries,
+        iteration, JSON output; Atomics on integer views.
 Fetch/Web subset: optional libcurl-backed fetch, Response.text/json/status/ok/
         headers, simplified Headers, AbortController/AbortSignal.timeout.
 (plus .length for string/array, .size for Map/Set.)
@@ -85,7 +94,7 @@ Callbacks for map/filter/forEach/reduce and Map/Set.forEach are first-class
 closures invoked via ts_call, which prepends the closure's captured environment.
 
 ## NOT yet implemented (rejected loudly)
-- String: substr, localeCompare, toLocaleString, full Intl locale casing beyond
+- String: localeCompare, toLocaleString, full Intl locale casing beyond
   the currently guarded default + Turkish/Azeri `toLocaleUpperCase` /
   `toLocaleLowerCase`, and remaining string-pattern RegExp consumers outside the
   const-pattern paths.
@@ -95,20 +104,19 @@ closures invoked via ts_call, which prepends the closure's captured environment.
 - Object/Symbol reflection: remaining symbol-keyed reflection beyond own-key
   discovery and descriptors.
 - Math: newer proposal methods if targeted.
-- Number: toLocaleString; POSITIVE_INFINITY / NEGATIVE_INFINITY constants are not
-  emitted as JSON constants yet.
+- Number: toLocaleString.
 - Date: string/Date argument parsing, setters, toString/toUTCString/toLocale*
   formatting, and other formatting helpers.
 - JSON.stringify replacer function/array semantics.
-- RegExp: dynamic pattern/flags construction and first-class global
-  `RegExp`/`globalThis.RegExp` value entry remain rejected; non-global
-  `matchAll`/`replaceAll` are rejected at export time instead of becoming a
-  runtime TypeError.
+- RegExp: the constructor as a first-class value (`const R = RegExp`,
+  `globalThis.RegExp`) remains rejected; non-global `matchAll`/`replaceAll` are
+  rejected at export time instead of becoming a runtime TypeError.
 - Web/fetch: streaming request/response bodies, abort events, real DOMException
   objects, and full Web-compatible Headers/Request/Response semantics.
-- WeakRef / FinalizationRegistry,
-  ArrayBuffer / DataView / TypedArray, Intl, and module value import/export
-  linkage are outside the current implemented surface.
+- Typed arrays: at, findLast, findLastIndex, toSorted, toReversed, with
+  (export-time rejects), reduceRight (a TypeError at run time), DataView.
+- WeakRef / FinalizationRegistry and Intl (a runtime ReferenceError) are
+  outside the current implemented surface.
 - BigInt: DEFERRED. Arbitrary-precision integers do not fit the NaN-boxed double
   and need a separate heap bignum representation plus all arithmetic/bitwise/
   comparison/toString ops — a standalone project. Until then BigInt literals

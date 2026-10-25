@@ -31,11 +31,13 @@ for l in lines[2:]:
     else:
         outside_callers[(0, sym)] += c
 total = sum(cnt.values()) + sum(outside.values())
-# symbol + line by atos (file addresses with -l 0x100000000 convention: atos takes load address)
+# symbol + line by atos (file addresses with -l 0x100000000 convention: atos takes load address).
+# One call for as many addresses as fit: every atos call reloads the binary's debug
+# information, so 500-address chunks took over eight minutes on tsc-ts where one call takes seconds.
 addrs = [hex(a) for a in cnt]
 res = {}
-for i in range(0, len(addrs), 500):
-    chunk = addrs[i:i + 500]
+for i in range(0, len(addrs), 10000):
+    chunk = addrs[i:i + 10000]
     out = subprocess.run(['atos', '-o', binary, '-l', '0x100000000'] + chunk, capture_output=True, text=True).stdout.split('\n')
     for a, r in zip(chunk, out): res[int(a, 16)] = r
 by_sym = collections.Counter(); by_line = collections.Counter(); sym_line = {}
