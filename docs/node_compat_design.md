@@ -247,3 +247,32 @@ stress, bench); the tsc-ts benchmark is unaffected until N5.
   the runtime remembers a promise rejected with no reaction, forgets it when
   one is attached, and after each turn's microtasks reports what remains and
   exits with status 1.
+
+## As built, N3 (Session 353)
+
+- The loop (ts_rt.c `ts_run_event_loop`, the queues in node_host.c): the
+  module body's promise reactions first (as Node's ESM evaluation does), then
+  per turn: nextTick callbacks and microtasks until both queues are empty, the
+  timers whose time came (each followed by the drain), the abort timers, the
+  I/O tasks, the workers' pipes, the immediates queued before the turn; it
+  waits for the earliest timer when nothing is runnable (a fetch wait is
+  capped at it too) and ends when no referenced timer or immediate, tick, I/O
+  or watched pipe remains. The exit hook runs in two phases: 'beforeExit' (a
+  listener may schedule more; the loop goes on) and 'exit'.
+- Timer records are malloc'd and sorted by due time then id; their callbacks
+  and arguments are GC roots; a record is unlinked (a repeating one
+  re-inserted) before its callback runs and never touched afterwards, so a
+  callback may clear or refresh timers freely. `unref` drops a timer from the
+  liveness count without clearing it.
+- `lib/node/timers.ts`: `Timeout` and `Immediate` objects as Node returns
+  them (`ref`, `unref`, `hasRef`, `refresh`, `close`, a number as the
+  primitive); Node's delay coercion (not in [1, 2^31-1] -> 1);
+  `clearTimeout` takes the object or its number. `timers/promises`:
+  `setTimeout`, `setImmediate`, `setInterval` as an async generator,
+  `scheduler`. `process.nextTick` goes to the loop's tick queue.
+- `globals.d.ts` declares the timer functions with Node's types; a later
+  declaration's overload is tried before the browser library's, so
+  `setTimeout(...).unref()` type-checks without @types/node.
+- Known: a `setImmediate` from the main module races 0/1 ms timers in Node
+  too (the fixture queues it from a timer); `refresh()` inside a one-shot
+  timer's own callback does not re-arm it (the record is gone).

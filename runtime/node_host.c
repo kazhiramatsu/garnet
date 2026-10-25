@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <poll.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -618,13 +619,219 @@ static tsv nh_at_exit(tsv* a, int n){
   ts_root_static_once(&nh_exit_hook, &rooted);
   return TS_UNDEFINED;
 }
-static void nh_run_exit_hook(void){
-  if (!ts_is_func(nh_exit_hook)) return;
+/* phase 0: 'beforeExit' (the hook may schedule more work; the loop then goes on);
+   phase 1: 'exit' (the hook's number is the status; the hook runs once) */
+static int nh_run_exit_hook_phase(int phase){
+  if (!ts_is_func(nh_exit_hook)) return 0;
   tsv hook = nh_exit_hook;
-  nh_exit_hook = TS_UNDEFINED;
-  tsv r = ts_call_value(hook, NULL, 0);
-  drain_microtasks();
-  if (ts_is_num(r) && (int)ts_to_num(r) != 0){ fflush(stdout); fflush(stderr); exit((int)ts_to_num(r)); }
+  if (phase == 1) nh_exit_hook = TS_UNDEFINED;
+  tsv arg = ts_num((double)phase);
+  tsv r = ts_call_value(hook, &arg, 1);
+  nh_drain_ticks_and_microtasks();
+  if (phase == 1 && ts_is_num(r) && (int)ts_to_num(r) != 0){ fflush(stdout); fflush(stderr); exit((int)ts_to_num(r)); }
+  return 1;
+}
+static void nh_run_exit_hook(void){ nh_run_exit_hook_phase(1); }
+/* ---- the event loop's queues (docs/node_compat_design.md): timers, immediates,
+   nextTick. A timer is a malloc'd record in a list sorted by due time then by
+   id; its callback and arguments are roots (nh_mark_loop_roots). A referenced
+   active timer keeps the loop alive; an unreferenced one does not. ---- */
+typedef struct nh_timer {
+  uint32_t id;
+  double due_ms, repeat_ms;   /* repeat_ms 0: once */
+  tsv cb, args;               /* args: an array or undefined */
+  int refed, active;
+  struct nh_timer* next;
+} nh_timer;
+static nh_timer* g_nh_timers = NULL;
+static uint32_t g_nh_next_id = 1;
+static int g_nh_refed_timers = 0;
+typedef struct nh_immediate { uint32_t id; tsv cb, args; int refed, active; struct nh_immediate* next; } nh_immediate;
+static nh_immediate* g_nh_imm_head = NULL;
+static nh_immediate* g_nh_imm_tail = NULL;
+static int g_nh_refed_immediates = 0;
+typedef struct nh_tick { tsv cb, args; struct nh_tick* next; } nh_tick;
+static nh_tick* g_nh_tick_head = NULL;
+static nh_tick* g_nh_tick_tail = NULL;
+
+static double nh_mono_ms(void){
+  struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+  return (double)t.tv_sec * 1e3 + (double)t.tv_nsec / 1e6;
+}
+static void nh_timer_insert(nh_timer* t){
+  nh_timer** pp = &g_nh_timers;
+  while (*pp && ((*pp)->due_ms < t->due_ms || ((*pp)->due_ms == t->due_ms && (*pp)->id < t->id))) pp = &(*pp)->next;
+  t->next = *pp; *pp = t;
+}
+static nh_timer* nh_timer_find(uint32_t id){ for (nh_timer* t = g_nh_timers; t; t = t->next) if (t->id == id) return t; return NULL; }
+static void nh_timer_free(nh_timer* t){
+  nh_timer** pp = &g_nh_timers;
+  while (*pp && *pp != t) pp = &(*pp)->next;
+  if (*pp) *pp = t->next;
+  if (t->active && t->refed) g_nh_refed_timers--;
+  free(t);
+}
+/* the callback with the arguments array's elements (a stack array up to eight) */
+static void nh_call_with_args(tsv cb, tsv args){
+  tsv stack_args[8]; tsv* argv = stack_args; uint32_t n = 0;
+  ts_gc_root(&cb); ts_gc_root(&args);
+  if (ts_is_array(args)){
+    n = ts_array_len(args);
+    if (n > 8) argv = (tsv*)malloc(sizeof(tsv) * n);
+    for (uint32_t i = 0; i < n; i++) argv[i] = ts_array_get(args, i);
+  }
+  (void)ts_call_value(cb, argv, (int)n);
+  if (argv != stack_args) free(argv);
+  ts_gc_unroot(2);
+}
+/* nextTick callbacks run before the microtasks, and a callback's own ticks before
+   the microtasks it queued, until both queues are empty (Node's order). */
+static void nh_drain_ticks_and_microtasks(void){
+  for (;;){
+    while (g_nh_tick_head){
+      nh_tick* t = g_nh_tick_head;
+      g_nh_tick_head = t->next;
+      if (!g_nh_tick_head) g_nh_tick_tail = NULL;
+      tsv cb = t->cb, args = t->args;
+      free(t);
+      nh_call_with_args(cb, args);
+    }
+    drain_microtasks();
+    if (!g_nh_tick_head && !g_mq_len) return;
+  }
+}
+static void nh_timers_run_due(void){
+  if (!g_nh_timers) return;
+  double now = nh_mono_ms();
+  for (;;){
+    nh_timer* t = g_nh_timers;
+    if (!t || t->due_ms > now) break;
+    /* unlink before the callback, which may clear or refresh timers (this one
+       included: a repeating timer is back in the list, a one-shot is gone), so
+       the record is never touched after the call */
+    g_nh_timers = t->next; t->next = NULL;
+    tsv cb = t->cb, args = t->args;
+    if (t->repeat_ms > 0){ t->due_ms = now + t->repeat_ms; nh_timer_insert(t); }
+    else { if (t->active && t->refed) g_nh_refed_timers--; free(t); }
+    nh_call_with_args(cb, args);
+    nh_drain_ticks_and_microtasks();
+    unhandled_report();
+  }
+}
+static void nh_immediates_run(void){
+  /* the immediates queued before this phase; ones queued by them run next turn */
+  nh_immediate* list = g_nh_imm_head;
+  g_nh_imm_head = g_nh_imm_tail = NULL;
+  while (list){
+    nh_immediate* im = list; list = im->next;
+    if (im->active){
+      if (im->refed) g_nh_refed_immediates--;
+      im->active = 0;
+      tsv cb = im->cb, args = im->args;
+      free(im);
+      nh_call_with_args(cb, args);
+      nh_drain_ticks_and_microtasks();
+      unhandled_report();
+    } else free(im);
+  }
+}
+static int nh_loop_alive(void){ return g_nh_refed_timers > 0 || g_nh_refed_immediates > 0 || g_nh_tick_head != NULL; }
+static int nh_immediates_pending(void){ return g_nh_imm_head != NULL; }
+/* milliseconds until the earliest referenced timer, at most `limit` */
+static int nh_next_timer_timeout_ms(int limit){
+  double now = nh_mono_ms();
+  for (nh_timer* t = g_nh_timers; t; t = t->next){
+    if (!t->active) continue;
+    double remain = t->due_ms - now;
+    if (remain < 0) remain = 0;
+    return remain > (double)limit ? limit : (int)(remain + 0.999);
+  }
+  return limit;
+}
+static void nh_sleep_ms(int ms){ if (ms > 0) poll(NULL, 0, ms); }
+static void nh_mark_loop_roots(int young){
+  for (nh_timer* t = g_nh_timers; t; t = t->next){ gc_visit_slot(&t->cb, young, 0, 1); gc_visit_slot(&t->args, young, 0, 1); }
+  for (nh_immediate* im = g_nh_imm_head; im; im = im->next){ gc_visit_slot(&im->cb, young, 0, 1); gc_visit_slot(&im->args, young, 0, 1); }
+  for (nh_tick* t = g_nh_tick_head; t; t = t->next){ gc_visit_slot(&t->cb, young, 0, 1); gc_visit_slot(&t->args, young, 0, 1); }
+}
+/* timerAdd(cb, args, delayMs, repeatMs) -> id */
+static tsv nh_timer_add(tsv* a, int n){
+  tsv cb = nh_arg(a, n, 0);
+  if (!ts_is_func(cb)) ts_throw_type_error_msg("The \"callback\" argument must be of type function");
+  nh_timer* t = (nh_timer*)calloc(1, sizeof *t);
+  if (!t) ts_abort_msg("out of memory creating a timer");
+  double delay = nh_num(a, n, 2, 1), repeat = nh_num(a, n, 3, 0);
+  t->id = g_nh_next_id++;
+  t->due_ms = nh_mono_ms() + delay;
+  t->repeat_ms = repeat > 0 ? repeat : 0;
+  t->cb = cb; t->args = nh_arg(a, n, 1);
+  t->refed = 1; t->active = 1;
+  g_nh_refed_timers++;
+  nh_timer_insert(t);
+  return ts_num((double)t->id);
+}
+static tsv nh_timer_clear(tsv* a, int n){
+  nh_timer* t = nh_timer_find((uint32_t)nh_num(a, n, 0, 0));
+  if (t) nh_timer_free(t);
+  return TS_UNDEFINED;
+}
+/* timerRef(id, on) -> whether the timer exists */
+static tsv nh_timer_ref(tsv* a, int n){
+  nh_timer* t = nh_timer_find((uint32_t)nh_num(a, n, 0, 0));
+  if (!t) return ts_bool(0);
+  int on = ts_truthy(nh_arg(a, n, 1)) ? 1 : 0;
+  if (t->active && on != t->refed) g_nh_refed_timers += on ? 1 : -1;
+  t->refed = on;
+  return ts_bool(1);
+}
+static tsv nh_timer_has_ref(tsv* a, int n){ nh_timer* t = nh_timer_find((uint32_t)nh_num(a, n, 0, 0)); return ts_bool(t && t->active && t->refed); }
+/* timerRefresh(id, delayMs): the timer runs delayMs from now again */
+static tsv nh_timer_refresh(tsv* a, int n){
+  nh_timer* t = nh_timer_find((uint32_t)nh_num(a, n, 0, 0));
+  if (!t) return ts_bool(0);
+  nh_timer** pp = &g_nh_timers;
+  while (*pp && *pp != t) pp = &(*pp)->next;
+  if (*pp) *pp = t->next;
+  t->due_ms = nh_mono_ms() + nh_num(a, n, 1, 1);
+  if (!t->active){ t->active = 1; if (t->refed) g_nh_refed_timers++; }
+  nh_timer_insert(t);
+  return ts_bool(1);
+}
+static tsv nh_immediate_add(tsv* a, int n){
+  tsv cb = nh_arg(a, n, 0);
+  if (!ts_is_func(cb)) ts_throw_type_error_msg("The \"callback\" argument must be of type function");
+  nh_immediate* im = (nh_immediate*)calloc(1, sizeof *im);
+  if (!im) ts_abort_msg("out of memory creating an immediate");
+  im->id = g_nh_next_id++; im->cb = cb; im->args = nh_arg(a, n, 1); im->refed = 1; im->active = 1;
+  g_nh_refed_immediates++;
+  if (g_nh_imm_tail) g_nh_imm_tail->next = im; else g_nh_imm_head = im;
+  g_nh_imm_tail = im;
+  return ts_num((double)im->id);
+}
+static nh_immediate* nh_immediate_find(uint32_t id){ for (nh_immediate* im = g_nh_imm_head; im; im = im->next) if (im->id == id && im->active) return im; return NULL; }
+static tsv nh_immediate_clear(tsv* a, int n){
+  nh_immediate* im = nh_immediate_find((uint32_t)nh_num(a, n, 0, 0));
+  if (im){ if (im->refed) g_nh_refed_immediates--; im->active = 0; im->cb = TS_UNDEFINED; im->args = TS_UNDEFINED; }
+  return TS_UNDEFINED;
+}
+static tsv nh_immediate_ref(tsv* a, int n){
+  nh_immediate* im = nh_immediate_find((uint32_t)nh_num(a, n, 0, 0));
+  if (!im) return ts_bool(0);
+  int on = ts_truthy(nh_arg(a, n, 1)) ? 1 : 0;
+  if (on != im->refed) g_nh_refed_immediates += on ? 1 : -1;
+  im->refed = on;
+  return ts_bool(1);
+}
+static tsv nh_immediate_has_ref(tsv* a, int n){ nh_immediate* im = nh_immediate_find((uint32_t)nh_num(a, n, 0, 0)); return ts_bool(im && im->refed); }
+static tsv nh_next_tick(tsv* a, int n){
+  tsv cb = nh_arg(a, n, 0);
+  if (!ts_is_func(cb)) ts_throw_type_error_msg("The \"callback\" argument must be of type function");
+  nh_tick* t = (nh_tick*)calloc(1, sizeof *t);
+  if (!t) ts_abort_msg("out of memory queueing a tick");
+  t->cb = cb; t->args = nh_arg(a, n, 1);
+  if (g_nh_tick_tail) g_nh_tick_tail->next = t; else g_nh_tick_head = t;
+  g_nh_tick_tail = t;
+  return TS_UNDEFINED;
 }
 static void nh_method(tsv host, const char* name, ts_code code, int arity){
   ts_gc_root(&host); tsv fn = ts_make_fn_t(code, NULL, 0, 0); ts_gc_root(&fn);
@@ -691,6 +898,16 @@ static void ts_garnet_node_global_init(tsv global){
   nh_method(host, "randomBytes", nh_random_bytes, 1);
   nh_method(host, "inspect", nh_inspect, 1);
   nh_method(host, "atExit", nh_at_exit, 1);
+  nh_method(host, "timerAdd", nh_timer_add, 4);
+  nh_method(host, "timerClear", nh_timer_clear, 1);
+  nh_method(host, "timerRef", nh_timer_ref, 2);
+  nh_method(host, "timerHasRef", nh_timer_has_ref, 1);
+  nh_method(host, "timerRefresh", nh_timer_refresh, 2);
+  nh_method(host, "immediate", nh_immediate_add, 2);
+  nh_method(host, "immediateClear", nh_immediate_clear, 1);
+  nh_method(host, "immediateRef", nh_immediate_ref, 2);
+  nh_method(host, "immediateHasRef", nh_immediate_has_ref, 1);
+  nh_method(host, "nextTick", nh_next_tick, 2);
 #ifdef __APPLE__
   ts_set_cstr(host, "platform", nh_string("darwin"));
 #else

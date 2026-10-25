@@ -104,6 +104,10 @@ export class Process extends EventEmitter {
     }
     return host.exit(this.exitCode === undefined ? c : this.exitCode);
   }
+  /** The loop found nothing to do: 'beforeExit' (a listener may schedule more work). */
+  _beforeExit(): void {
+    if (!this._exiting) this.emit("beforeExit", this.exitCode === undefined ? 0 : this.exitCode);
+  }
   /** The program's natural end (the runtime calls it after the event loop): 'exit' once, the status. */
   _atExit(): number {
     const c = this.exitCode === undefined ? 0 : this.exitCode;
@@ -130,10 +134,10 @@ export class Process extends EventEmitter {
     if (previous === undefined) return { user: u[0], system: u[1] };
     return { user: u[0] - previous.user, system: u[1] - previous.system };
   }
-  /** Runs `callback` before the next macrotask (as a microtask until the loop's own queue arrives, N3). */
+  /** Runs `callback` before the promise reactions of the current turn (the loop's tick queue). */
   nextTick(callback: (...args: any[]) => void, ...args: any[]): void {
     if (typeof callback !== "function") throw invalidArgType("callback", "of type function", callback);
-    Promise.resolve().then(() => { callback(...args); });
+    host.nextTick(callback, args.length === 0 ? undefined : args);
   }
   emitWarning(warning: string | Error, type?: string | { type?: string; code?: string; detail?: string }, code?: string): void {
     let name = "Warning";
@@ -168,5 +172,5 @@ const SIGNALS: { [name: string]: number } = {
 };
 
 const process = new Process();
-host.atExit(() => process._atExit());
+host.atExit((phase: number): number | undefined => { if (phase === 0) { process._beforeExit(); return undefined; } return process._atExit(); });
 export default process;

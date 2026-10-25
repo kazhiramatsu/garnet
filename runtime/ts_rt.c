@@ -3775,6 +3775,15 @@ static void ts_garnet_global_init(tsv global);
 static void ts_garnet_json_global_init(tsv global);
 static void ts_garnet_node_global_init(tsv global);
 static void nh_run_exit_hook(void);
+static int nh_run_exit_hook_phase(int phase);
+static void nh_drain_ticks_and_microtasks(void);
+static void nh_timers_run_due(void);
+static void nh_immediates_run(void);
+static int nh_loop_alive(void);
+static int nh_immediates_pending(void);
+static int nh_next_timer_timeout_ms(int limit);
+static void nh_sleep_ms(int ms);
+static void nh_mark_loop_roots(int young);
 void ts_global_this_init(void){
   if (g_global_this_v != TS_UNDEFINED) return;
   static int rooted = 0;
@@ -19572,18 +19581,38 @@ static int ts_worker_fork_ex(tsv data, int shared){
   return w->id;
 }
 
+/* The event loop (docs/node_compat_design.md): nextTick and microtasks, then
+   the timers whose time came, the abort timers, the I/O tasks (fetch), the
+   workers' pipes, then the immediates; each callback is followed by the
+   nextTick/microtask drain. The loop ends when nothing keeps it alive: no
+   referenced timer or immediate, no tick, no I/O, no watched pipe. Then the
+   'beforeExit' hook may schedule more, and the 'exit' hook runs last. */
 void ts_run_event_loop(void){
+  /* the program's top level ran as a module: as in Node, its promise reactions
+     run before the ticks it queued (the module body is itself a promise job) */
+  drain_microtasks();
   for (;;){
-    drain_microtasks();
+    nh_drain_ticks_and_microtasks();
     unhandled_report();
+    nh_timers_run_due();
     ts_abort_timers_fire_due();
     ts_io_start_queued();
-    if (!g_io_head && !g_io_active && g_mq_len) continue;
-    if (!g_io_head && !g_io_active && !g_watches && !g_parent_watching){ nh_run_exit_hook(); break; }       /* nothing pending: the Node 'exit' hook, then done */
     if (g_io_active) (void)ts_io_poll_active();  /* completes ready I/O tasks */
-    /* the workers' pipes and the parent's: a turn without waiting while I/O is active */
-    if (g_watches || g_parent_watching) ts_watch_poll(g_io_active || g_mq_len ? 0 : ts_abort_timer_poll_timeout_ms(1000));
-    /* loop: drain microtasks triggered by completed I/O */
+    nh_immediates_run();
+    int io_pending = g_io_head || g_io_active;
+    if (nh_loop_alive() || io_pending || g_watches || g_parent_watching || g_mq_len || nh_immediates_pending()){
+      if (g_mq_len || nh_immediates_pending()) continue;   /* runnable work: no waiting */
+      /* wait for the next event: the earliest timer, else the watches' or the abort timers' turn */
+      int timeout = nh_next_timer_timeout_ms(io_pending ? 0 : 1000);
+      timeout = ts_abort_timer_poll_timeout_ms(timeout);
+      if (g_watches || g_parent_watching) ts_watch_poll(io_pending ? 0 : timeout);
+      else if (!io_pending) nh_sleep_ms(timeout);
+      continue;
+    }
+    /* nothing keeps the loop alive: 'beforeExit' may schedule more */
+    if (nh_run_exit_hook_phase(0) && (nh_loop_alive() || g_io_head || g_mq_len || nh_immediates_pending())) continue;
+    nh_run_exit_hook_phase(1);
+    break;
   }
 }
 
@@ -19628,6 +19657,7 @@ static void gc_scan_async_cell(ts_gc_header* h, int young, int depth){
 static void gc_mark_async_roots(void){
   for (int i=0;i<g_mq_len;i++) gc_visit_slot(&g_microq[i], 0, 0, 1);
   for (int i=0;i<g_unhandled_len;i++) gc_visit_slot(&g_unhandled[i], 0, 0, 1);
+  nh_mark_loop_roots(0);
   for (ts_io* t=g_io_head;t;t=t->next){ gc_visit_slot(&t->p, 0, 0, 1); gc_visit_slot(&t->signal, 0, 0, 1); }
   for (ts_io* t=g_io_active;t;t=t->next){ gc_visit_slot(&t->p, 0, 0, 1); gc_visit_slot(&t->signal, 0, 0, 1); }
   gc_mark_abort_timer_roots();
@@ -19635,6 +19665,7 @@ static void gc_mark_async_roots(void){
 static void gc_mark_async_roots_young(void){
   for (int i=0;i<g_mq_len;i++) gc_visit_slot(&g_microq[i], 1, 0, 1);
   for (int i=0;i<g_unhandled_len;i++) gc_visit_slot(&g_unhandled[i], 1, 0, 1);
+  nh_mark_loop_roots(1);
   for (ts_io* t=g_io_head;t;t=t->next){ gc_visit_slot(&t->p, 1, 0, 1); gc_visit_slot(&t->signal, 1, 0, 1); }
   for (ts_io* t=g_io_active;t;t=t->next){ gc_visit_slot(&t->p, 1, 0, 1); gc_visit_slot(&t->signal, 1, 0, 1); }
   gc_mark_abort_timer_roots_young();
@@ -20214,7 +20245,7 @@ static int ts_io_poll_active(void){
   aborted = fetch_cancel_aborted_active();
   if (aborted || !g_io_active) return aborted;
   int nfds = 0;
-  mc = curl_multi_poll(m, NULL, 0, ts_abort_timer_poll_timeout_ms(1000), &nfds);
+  mc = curl_multi_poll(m, NULL, 0, ts_abort_timer_poll_timeout_ms(nh_next_timer_timeout_ms(1000)), &nfds);
   if (mc != CURLM_OK) return fetch_fail_all_active(curl_multi_strerror(mc));
   ts_abort_timers_fire_due();
   aborted = fetch_cancel_aborted_active();

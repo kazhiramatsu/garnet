@@ -65,8 +65,20 @@ export interface GarnetNodeHost {
   randomBytes(count: number): Uint8Array;
   /** The text console.log prints for a value. */
   inspect(value: unknown): string;
-  /** The hook the runtime calls when the event loop ends; its number is the exit status. */
-  atExit(hook: () => number): void;
+  /** The hook the loop calls when nothing keeps it alive: phase 0 is 'beforeExit' (the hook
+   *  may schedule more work), phase 1 is 'exit' (its number is the exit status). */
+  atExit(hook: (phase: number) => number | undefined): void;
+  /** A timer: the callback with the arguments after `delayMs` (again every `repeatMs` when > 0); its id. */
+  timerAdd(callback: (...args: unknown[]) => void, args: unknown[] | undefined, delayMs: number, repeatMs: number): number;
+  timerClear(id: number): void;
+  timerRef(id: number, on: boolean): boolean;
+  timerHasRef(id: number): boolean;
+  timerRefresh(id: number, delayMs: number): boolean;
+  immediate(callback: (...args: unknown[]) => void, args: unknown[] | undefined): number;
+  immediateClear(id: number): void;
+  immediateRef(id: number, on: boolean): boolean;
+  immediateHasRef(id: number): boolean;
+  nextTick(callback: (...args: unknown[]) => void, args: unknown[] | undefined): void;
   readonly platform: string;
   readonly arch: string;
 }

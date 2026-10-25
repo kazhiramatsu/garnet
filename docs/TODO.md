@@ -9902,3 +9902,27 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   identical + 198 known, selfconf 523 + 59 known, unit, bundler 43/43, GC
   stress, bench all within budget; tsc-ts output identical to the N1 build,
   instructions 0.9999.
+- Node compatibility N3 (`docs/node_compat_design.md`, "As built, N3"): the
+  event loop. Timers (`setTimeout`/`setInterval`/`setImmediate` and the
+  clears, `Timeout`/`Immediate` objects with ref/unref/hasRef/refresh),
+  `process.nextTick` as the loop's tick queue drained before the promise
+  reactions of each turn (the module body's reactions first, as Node's ESM
+  evaluation does), `timers/promises` (`setInterval` an async generator),
+  'beforeExit' and 'exit' as two phases of the runtime's exit hook, fetch
+  waits capped at the next timer. Timer records are unlinked (or re-inserted)
+  before their callback and never touched after it: the first version read a
+  cleared interval's record after its callback (a use after free, SIGABRT).
+  `globals.d.ts` declares the timers with Node's types; a later declaration's
+  overload is tried first, so the browser library's `number` loses. Fixture
+  `node/timers` (ordering of ticks, microtasks, timers by due time, intervals,
+  immediates after a turn's timers, an unref'd 60 s timer not keeping the
+  process alive, refresh, the promise forms, beforeExit scheduling once more);
+  a main-level `setImmediate` races 0/1 ms timers in Node itself, so the
+  fixture queues it from a timer (and the interval runs alone: under
+  GC-protect its first tick had raced an immediate). Gates: conformance
+  586/586 plain and strict, GC-protect 583/583, parity 383 identical + 199
+  known, selfconf 523 + 60 known, unit, bundler 43/43, GC stress, bench all
+  within budget on a quiet machine (`string_unicode_search_kernel` measured
+  101 ms against its 100 ms budget right after the GC stress run, 90 ms
+  alone: noise, nothing in the slice touches it); tsc-ts output identical to
+  the N2 build, instructions 1.0002.
