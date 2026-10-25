@@ -3773,6 +3773,8 @@ void ts_set(tsv obj, ts_key key, tsv val){
 
 static void ts_garnet_global_init(tsv global);
 static void ts_garnet_json_global_init(tsv global);
+static void ts_garnet_node_global_init(tsv global);
+static void nh_run_exit_hook(void);
 void ts_global_this_init(void){
   if (g_global_this_v != TS_UNDEFINED) return;
   static int rooted = 0;
@@ -3780,6 +3782,7 @@ void ts_global_this_init(void){
   ts_root_static_once(&g_global_this_v, &rooted);
   ts_garnet_global_init(g_global_this_v);
   ts_garnet_json_global_init(g_global_this_v);
+  ts_garnet_node_global_init(g_global_this_v);
 }
 tsv ts_global_this(void){
   ts_global_this_init();
@@ -11982,11 +11985,14 @@ static void ts_prop_own_enum(tsv obj, ts_prop_enum_cb cb, void* ud){
 /* obj instanceof C: true iff CLASS_PROTO[C] (target_proto) is in obj's prototype
    chain. Subclass protos chain to their parent, so this handles inheritance.
    Mirrors JS semantics (walk [[Prototype]] looking for C.prototype). */
+static tsv chain_exotic_proto(tsv link);
 int ts_instanceof(tsv obj, tsv target_proto){
   if (!ts_is_obj(obj) || !ts_is_obj(target_proto)) return 0;
   ts_object* o = (ts_object*)ts_ptr(obj);
-  /* start from obj's own prototype (an instance is not its own prototype). */
-  for (tsv p = o->proto; ts_proto_ref(p); ){
+  /* start from obj's own prototype (an instance is not its own prototype); a
+     promise has no common header, its prototype is Promise.prototype */
+  tsv first = o->h.kind == TS_KIND_PROMISE ? chain_exotic_proto(obj) : o->proto;
+  for (tsv p = first; ts_proto_ref(p); ){
     if (p == target_proto || ts_same_cell(p, target_proto)) return 1;
     ts_object* link = (ts_object*)ts_ptr(p);
     if (chain_link_exotic(link)){
@@ -19534,7 +19540,7 @@ void ts_run_event_loop(void){
     ts_abort_timers_fire_due();
     ts_io_start_queued();
     if (!g_io_head && !g_io_active && g_mq_len) continue;
-    if (!g_io_head && !g_io_active && !g_watches && !g_parent_watching) break;       /* nothing pending */
+    if (!g_io_head && !g_io_active && !g_watches && !g_parent_watching){ nh_run_exit_hook(); break; }       /* nothing pending: the Node 'exit' hook, then done */
     if (g_io_active) (void)ts_io_poll_active();  /* completes ready I/O tasks */
     /* the workers' pipes and the parent's: a turn without waiting while I/O is active */
     if (g_watches || g_parent_watching) ts_watch_poll(g_io_active || g_mq_len ? 0 : ts_abort_timer_poll_timeout_ms(1000));
@@ -21193,3 +21199,5 @@ int main(int argc, char** argv){
   return ts_iso_rc;
 }
 #endif
+/* The Node modules' host (lib/node, docs/node_compat_design.md): one translation unit with the runtime. */
+#include "node_host.c"

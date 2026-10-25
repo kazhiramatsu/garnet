@@ -81,8 +81,76 @@ const STRICT_TYPE_OPTION_NAMES: StrictTypeOptionName[] = [
 /** garnet's own modules (`garnet:<name>`, docs/published_graphs_design.md):
  *  resolved to lib/garnet/<name>.ts beside the exporter; a project's own
  *  `paths` may still map the scheme. */
+/** The Node modules garnet provides (docs/node_compat_design.md): `node:<name>` and the bare
+ *  builtin names resolve to lib/node/<name>.ts; a project's own `paths` still win. */
+const NODE_BUILTIN_MODULES = ["assert", "assert/strict", "buffer", "child_process", "crypto", "events", "fs",
+  "fs/promises", "os", "path", "path/posix", "perf_hooks", "process", "readline", "stream", "string_decoder",
+  "timers", "timers/promises", "url", "util", "worker_threads"];
+function isNodeBuiltinSpecifier(spec: string): boolean {
+  return spec.startsWith("node:") || NODE_BUILTIN_MODULES.includes(spec);
+}
 function garnetModulePaths(): ts.MapLike<string[]> {
-  return { "garnet:*": [path.join(__dirname, "..", "lib", "garnet", "*.ts")] };
+  const lib = path.join(__dirname, "..", "lib");
+  const paths: ts.MapLike<string[]> = {
+    "garnet:*": [path.join(lib, "garnet", "*.ts")],
+    "node:*": [path.join(lib, "node", "*.ts")],
+  };
+  for (const name of NODE_BUILTIN_MODULES) paths[name] = [path.join(lib, "node", name + ".ts")];
+  return paths;
+}
+/** The Node globals and the prelude (docs/node_compat_design.md). When a module program
+ *  imports a Node builtin or names one of the prelude's globals (`process`, `Buffer`, the
+ *  timers, `queueMicrotask`, `structuredClone`, `performance`) as an ambient name, it is
+ *  recreated with lib/node/prelude.ts, which computeModuleOrder evaluates first, and with
+ *  lib/node/globals.d.ts unless @types/node already types the program. */
+let nodePreludeFile: string | undefined;
+const NODE_PRELUDE_GLOBALS = new Set(["process", "Buffer", "setTimeout", "setInterval", "setImmediate", "clearTimeout",
+  "clearInterval", "clearImmediate", "queueMicrotask", "structuredClone", "performance"]);
+function programWithNodeSupport(rootNames: string[], options: ts.CompilerOptions, host: ts.CompilerHost | undefined,
+                                sourceMode: SourceMode): ts.Program {
+  nodePreludeFile = undefined;
+  const program = ts.createProgram(rootNames, options, host);
+  if (sourceMode === "script" || process.env.TSAOT_NODE_PRELUDE === "0") return program;
+  const libNode = path.join(__dirname, "..", "lib", "node");
+  const files = program.getSourceFiles();
+  const checker = program.getTypeChecker();
+  const isProjectFile = (f: ts.SourceFile): boolean =>
+    !program.isSourceFileDefaultLibrary(f) && !program.isSourceFileFromExternalLibrary(f) && !f.fileName.startsWith(libNode);
+  // A program that declares `process` itself (a host of its own, as the tsc-ts build does)
+  // provides its own globals: neither the prelude nor globals.d.ts.
+  const processSym = checker.resolveName("process", undefined, ts.SymbolFlags.Value, false);
+  const processDecls = processSym?.declarations ?? [];
+  if (processDecls.some((d) => isProjectFile(d.getSourceFile()))) return program;
+  const hasTypesNode = processDecls.length > 0 || files.some((f) => /node_modules[\\/]@types[\\/]node[\\/]/.test(f.fileName));
+  // an import the project's own `paths` map elsewhere is the project's module, not ours
+  const ownMapped = (spec: string): boolean => {
+    const targets = options.paths?.[spec];
+    return targets !== undefined && !targets.some((t) => path.resolve(t).startsWith(libNode));
+  };
+  const userFiles = files.filter((f) => !f.isDeclarationFile && isProjectFile(f));
+  let needs = files.some((f) => !f.isDeclarationFile && f.fileName.startsWith(libNode));
+  for (const f of userFiles) {
+    if (needs) break;
+    const visit = (n: ts.Node): void => {
+      if (needs) return;
+      if (ts.isImportDeclaration(n) && ts.isStringLiteral(n.moduleSpecifier) &&
+          isNodeBuiltinSpecifier(n.moduleSpecifier.text) && !ownMapped(n.moduleSpecifier.text)) { needs = true; return; }
+      if (ts.isIdentifier(n) && NODE_PRELUDE_GLOBALS.has(n.text) &&
+          !((ts.isPropertyAccessExpression(n.parent) || ts.isPropertyAssignment(n.parent) ||
+             ts.isPropertyDeclaration(n.parent) || ts.isMethodDeclaration(n.parent) || ts.isPropertySignature(n.parent) ||
+             ts.isMethodSignature(n.parent)) && n.parent.name === n)) {
+        const sym = checker.getSymbolAtLocation(n);
+        if (!sym || !sym.declarations || sym.declarations.every((d) => d.getSourceFile().isDeclarationFile)) { needs = true; return; }
+      }
+      n.forEachChild(visit);
+    };
+    visit(f);
+  }
+  if (!needs) return program;
+  const extra = hasTypesNode ? [] : [path.join(libNode, "globals.d.ts")];
+  extra.push(path.join(libNode, "prelude.ts"));
+  nodePreludeFile = extra[extra.length - 1];
+  return ts.createProgram([...rootNames, ...extra], options, host);
 }
 function baseCompilerOptions(strict: boolean): ts.CompilerOptions {
   // strictNullChecks is forced ON independently of the `strict` flag so the
@@ -6210,6 +6278,13 @@ class Exporter {
       // no class_id.)
       if (rclass === undefined && ts.isIdentifier(node.right) &&
           this.isBuiltinSymbol(this.checker.getSymbolAtLocation(node.right))) {
+        if (node.right.text === "Date") {
+          // A Date is a plain object carrying the internal `__date_ms` field (the
+          // `new Date` lowering): the field's presence is the instanceof answer.
+          const obj = this.lowerExpr(ctx, node.left);
+          ctx.body.push({ kind: "HasField", dst, obj, field: this.DATE_MS_FIELD });
+          return dst;
+        }
         const ek = this.errorKindIndex(node.right.text);
         const builtinProtoKinds: Record<string, string> = {
           Object: "object",
@@ -6217,6 +6292,7 @@ class Exporter {
           Set: "set",
           WeakMap: "weakmap",
           WeakSet: "weakset",
+          Promise: "promise",
         };
         const taElem = TYPED_ARRAY_ELEMS.get(node.right.text);
         if (taElem !== undefined) builtinProtoKinds[node.right.text] = `typedarray:${taElem}`;
@@ -13811,6 +13887,14 @@ class Exporter {
           if (ext && (reasons.includes("extends-non-identifier(mixin)") || reasons.includes("extends-value(unresolved)"))) {
             this.unsupported(ext, "class extends an expression or a class-valued binding (only a class declaration or a library class is supported as a base)");
           }
+          // A built-in base other than the Error classes (a typed array, Map, Array, Promise):
+          // the instance would be a plain object, not one of the base's kind (silent wrong values).
+          if (ext && ts.isIdentifier(ext) && this.classInfos[classId]?.parentId === undefined && !this.extendsBuiltinError(classId)) {
+            const bsym = this.symbolOf(ext);
+            if (bsym && this.isAmbientGlobalSymbol(bsym)) {
+              this.unsupported(ext, `class extends the built-in ${ext.text} (only the Error classes are supported as a built-in base; an instance would be a plain object, not a ${ext.text})`);
+            }
+          }
           let hasStatic = false;
           for (const m of n.members) {
             const isStatic = this.isStaticMember(m);
@@ -14306,6 +14390,10 @@ class Exporter {
       done.add(sf);
       order.push(sf);
     };
+    if (nodePreludeFile !== undefined) {
+      const prelude = this.program.getSourceFile(nodePreludeFile);
+      if (prelude && prelude !== entry) visit(prelude);   // the Node globals exist before any module runs
+    }
     visit(entry);
     return order;
   }
@@ -14924,7 +15012,7 @@ function batchMain(listPath: string, outDir: string, strictCompiler = false) {
   });
   for (const e of entries) {
     try {
-      const program = ts.createProgram([e.input], opts, host);
+      const program = programWithNodeSupport([e.input], opts, host, "module");
       const r = exportOne(program, e.input, `${outDir}/${e.name}.program.json`, `${outDir}/${e.name}.labels.json`);
       const status = r.ok ? "OK" : "UNSUPPORTED";
       process.stdout.write(`${e.name}\t${status}\t${r.nfns}\n`);
@@ -15039,7 +15127,7 @@ function main() {
     compilerOptions.strictNullChecks = true;
     compilerOptions.jsx = ts.JsxEmit.Preserve;
   }
-  const program = ts.createProgram(rootNames, compilerOptions);
+  const program = programWithNodeSupport(rootNames, compilerOptions, undefined, sourceMode);
   const sf = program.getSourceFile(input)!;
   // Type-error gate: the checker still assigns a type to every node when the
   // program is ill-typed, but those types are unsound — either the error type

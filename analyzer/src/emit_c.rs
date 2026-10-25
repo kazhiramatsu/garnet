@@ -1947,6 +1947,9 @@ struct Ctx<'a> {
     /// locals of numeric type in the IR (RefKind::Primitive), whatever their
     /// representation: a maybe-undefined or nullable numeric stays boxed
     prim_kind: BTreeSet<u32>,
+    /// the returned locals when every return of the body is a boolean (bool_return_locals):
+    /// a boxed entry boxes them as booleans, not numbers
+    bool_returns: BTreeSet<u32>,
     /// locals whose static type is `string` / a reference type (typed_key_locals)
     str_typed: BTreeSet<u32>,
     ref_typed: BTreeSet<u32>,
@@ -2148,6 +2151,15 @@ impl<'a> Ctx<'a> {
             format!("((uint32_t)d{} & 31)", id)
         } else {
             format!("(ts_to_uint32({}) & 31)", self.numc_double(id))
+        }
+    }
+    /// A returned local boxed: an unboxed local that holds a boolean (the body
+    /// returns only booleans) boxes as a boolean, the rest as `val`.
+    fn ret_val(&self, id: u32) -> String {
+        if (self.int_local.contains(&id) || self.unboxed.contains(&id)) && self.bool_returns.contains(&id) {
+            format!("ts_bool(d{} != 0)", id)
+        } else {
+            self.val(id)
         }
     }
     fn val(&self, id: u32) -> String {
@@ -8826,6 +8838,7 @@ fn emit_i64_function(
         ret_kind: RetKind::Boxed,
         stack_cells: true,
         prim_kind: prim_kind_locals(f),
+        bool_returns: bool_return_locals(f),
         str_typed: typed_keys.map(|t| t.str_typed.clone()).unwrap_or_default(),
         ref_typed: typed_keys.map(|t| t.ref_typed.clone()).unwrap_or_default(),
         f64_mode: false,
@@ -9053,6 +9066,7 @@ fn emit_f64_function(
         ret_kind: RetKind::Boxed,
         stack_cells: true,
         prim_kind: prim_kind_locals(f),
+        bool_returns: bool_return_locals(f),
         str_typed: typed_keys.map(|t| t.str_typed.clone()).unwrap_or_default(),
         ref_typed: typed_keys.map(|t| t.ref_typed.clone()).unwrap_or_default(),
         f64_mode: true,
@@ -9178,6 +9192,7 @@ fn emit_function(
             ret_kind: RetKind::Boxed,
             stack_cells: false,
             prim_kind: prim_kind_locals(f),
+        bool_returns: bool_return_locals(f),
         str_typed: typed_keys.map(|t| t.str_typed.clone()).unwrap_or_default(),
         ref_typed: typed_keys.map(|t| t.ref_typed.clone()).unwrap_or_default(),
             f64_mode: false,
@@ -9248,6 +9263,7 @@ fn emit_function(
             ret_kind: RetKind::Boxed,
             stack_cells: false,
             prim_kind: prim_kind_locals(f),
+        bool_returns: bool_return_locals(f),
         str_typed: typed_keys.map(|t| t.str_typed.clone()).unwrap_or_default(),
         ref_typed: typed_keys.map(|t| t.ref_typed.clone()).unwrap_or_default(),
             f64_mode: false,
@@ -9318,6 +9334,7 @@ fn emit_function(
             ret_kind: RetKind::Boxed,
             stack_cells: false,
             prim_kind: prim_kind_locals(f),
+        bool_returns: bool_return_locals(f),
         str_typed: typed_keys.map(|t| t.str_typed.clone()).unwrap_or_default(),
         ref_typed: typed_keys.map(|t| t.ref_typed.clone()).unwrap_or_default(),
             f64_mode: false,
@@ -9604,6 +9621,7 @@ fn emit_function(
         ret_kind: ret_kind,
         stack_cells: true,
         prim_kind: prim_kind_locals(f),
+        bool_returns: bool_return_locals(f),
         str_typed: typed_keys.map(|t| t.str_typed.clone()).unwrap_or_default(),
         ref_typed: typed_keys.map(|t| t.ref_typed.clone()).unwrap_or_default(),
         f64_mode: false,
@@ -12316,7 +12334,7 @@ fn emit_sm_resume_body(s: &mut String, f: &Function, ctx: &Ctx, mode: SmMode) {
                 s.push_str("  ts_eh_pop();\n  _fr->c.eh_top--;\n");
                 let _ = writeln!(s, "  {{ int _f = ts_coro_fin_push_slot(&_fr->c); _fr->c.fin_pending[_f] = {}; _fr->c.fin_tgt[_f] = {};", kind, target);
                 if let Some(v) = value {
-                    let _ = writeln!(s, "    _fr->c.fin_exc[_f] = {};", ctx.val(v.0));
+                    let _ = writeln!(s, "    _fr->c.fin_exc[_f] = {};", ctx.ret_val(v.0));
                 }
                 s.push_str("  }\n");
                 let _ = writeln!(s, "  goto L{};", fin_label);
@@ -12479,7 +12497,7 @@ fn emit_sm_resume_body(s: &mut String, f: &Function, ctx: &Ctx, mode: SmMode) {
             }
             Flat::Ret(src) => {
                 let v = match src {
-                    Some(v) => ctx.val(v.0),
+                    Some(v) => ctx.ret_val(v.0),
                     None => "TS_UNDEFINED".to_string(),
                 };
                 // a return inside active coro tries pops all their handlers first.
@@ -12745,7 +12763,7 @@ fn emit_guarded(s: &mut String, body: &[Inst], ctx: &Ctx, fc: &FinCtx, loop_dept
         match inst {
             Inst::Return { src } => {
                 let v = match src {
-                    Some(v) => ctx.val(v.0),
+                    Some(v) => ctx.ret_val(v.0),
                     None => "TS_UNDEFINED".to_string(),
                 };
                 let pops = ctx.eh_depth.get().saturating_sub(fc.base_eh_depth);
@@ -22529,6 +22547,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     "set" => "ts_set_proto_obj",
                     "weakmap" => "ts_weakmap_proto",
                     "weakset" => "ts_weakset_proto_obj",
+                    "promise" => "ts_promise_proto",
                     "headers" => "ts_headers_proto",
                     "number" => "ts_number_proto",
                     "boolean" => "ts_boolean_proto",
@@ -23508,7 +23527,10 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             } else {
                 match src {
                     Some(v) => {
-                        let rv = ctx.val(v.0);
+                        // An unboxed local holding a boolean returns as a boolean: a
+                        // rest-parameter function has no direct entry, so its `return true`
+                        // leaves through this boxed entry (it printed 1 before).
+                        let rv = ctx.ret_val(v.0);
                         if ctx.json_roots.is_empty() {
                             let _ = writeln!(s, "  return {};", rv);
                         } else {

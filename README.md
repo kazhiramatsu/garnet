@@ -472,17 +472,38 @@ Programs can print and fetch:
 - `fetch` works over HTTP and HTTPS through libcurl, with `Response`, `Headers`,
   `AbortController` and `AbortSignal.timeout`.
 
-There is no API yet for command-line arguments, environment variables, files,
-standard input or timers, and Node.js modules (`process`, `require`, `node:fs`
-and so on) are not available. Node.js compatibility is planned: a `node:`
-module layer written in TypeScript and compiled by Garnet itself, on a small C
-core.
+### Node.js modules
+
+A program written for Node.js imports its modules as usual, with `node:` or
+the bare names, and Garnet compiles its own implementations of them, written
+in TypeScript (`lib/node`) over a small C core, together with the program.
+Available so far:
+
+| Module | What works |
+|---|---|
+| `node:path` | the complete POSIX module (`join`, `resolve`, `relative`, `parse`, `format`, ...) |
+| `node:os` | `platform`, `arch`, `type`, `release`, `hostname`, `homedir`, `tmpdir`, `cpus`, `availableParallelism`, `totalmem`, `freemem`, `loadavg`, `uptime`, `userInfo`, `endianness`, `EOL`, `constants` |
+| `node:process` and the `process` global | `argv` (`argv.slice(2)` is the program's arguments, as in Node), `env`, `cwd`, `chdir`, `exit` and `exitCode` with the `exit` event, `pid`, `platform`, `arch`, `version`, `hrtime`, `uptime`, `memoryUsage`, `cpuUsage`, `nextTick`, `emitWarning`, `kill`, `umask`, `stdout` and `stderr` with `write` |
+| `node:events` | `EventEmitter` with Node's ordering, `once`, `prependListener`, the `error`, `newListener` and `removeListener` behavior, `once()` and `on()` helpers |
+| `node:util` | `format`, `inspect`, `promisify`, `callbackify`, `inherits`, `deprecate`, `debuglog`, `isDeepStrictEqual`, `types`, `stripVTControlCharacters` |
+| `node:assert`, `node:assert/strict` | every assertion, `AssertionError` with `code`, `actual`, `expected`, `operator` and `generatedMessage` |
+| `node:perf_hooks` and `performance` | `performance.now()` and `timeOrigin` |
+
+The `process` and `performance` globals, `queueMicrotask` and `global` exist
+once a program names them or imports a `node:` module. A method a module does
+not have yet is a type error at compile time (the modules are type-checked
+with your program), never a missing value at run time.
+
+Coming next, in this order: `Buffer` and `node:fs`, then timers (`setTimeout`
+and the others) with the event loop, then `child_process`, `crypto`, `url`,
+`readline` and streams. Sockets (`net`, `http`) and `fs.watch` are not
+planned yet. `util.inspect` ignores its options and `util.format`'s `%o` shows
+no hidden properties.
 
 Watch out for one trap. TypeScript's default declarations include browser
-globals, so code that uses `setTimeout`, `queueMicrotask`, `performance`,
-`structuredClone`, `atob`/`btoa` or `crypto` type-checks and compiles, then
-stops when it runs, with an error such as
-`ReferenceError: setTimeout is not defined`. Others, such as `new URL(...)`,
+globals, so code that uses `setTimeout`, `structuredClone`, `atob`/`btoa` or
+`crypto` type-checks and compiles, then stops when it runs, with an error such
+as `ReferenceError: setTimeout is not defined`. Others, such as `new URL(...)`,
 are rejected at compile time.
 
 An uncaught exception prints the error to standard error and ends the program

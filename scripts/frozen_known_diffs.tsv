@@ -256,3 +256,13 @@ parity-unported	stdlib/typed_array_loops	Frozen emitter lacks builtin typedarray
 selfconf-unported	stdlib/typed_array_loops	Frozen emitter lacks builtin typedarray.new:5 (the fixture builds Int32Array/Uint16Array/Uint8ClampedArray views); native Rust output matches V8.
 parity	modules/typed_json	The Rust emitter types one local of the garnet:json parser as an integer (`long long d15` against the frozen `double d15`: the int-local analysis the frozen twin predates); both outputs match V8.
 selfconf-unported	modules/typed_json	Frozen emitter lacks the host global of garnet:json (LoadBuiltinFn globalref.__garnet_json); native Rust output matches V8.
+parity-unported	node/path	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.
+selfconf-unported	node/path	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.
+parity-unported	node/events	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.
+selfconf-unported	node/events	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.
+parity-unported	node/util	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.
+selfconf-unported	node/util	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.
+parity-unported	node/assert	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.
+selfconf-unported	node/assert	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.
+parity-unported	node/process_os	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.
+selfconf-unported	node/process_os	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.

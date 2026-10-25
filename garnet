@@ -86,6 +86,9 @@
 #                          one scope record per activation (legacy IR).
 #   TSAOT_TYPED_CTX_FIELDS=0  Exporter: boxed capture-context fields (a captured
 #                          number variable is an unboxed slot of its record by default)
+#   TSAOT_NODE_PRELUDE=0   Exporter: do not add the Node globals (process,
+#                          performance, queueMicrotask; lib/node/prelude.ts) to a
+#                          program that names them or imports a node: module.
 #   TSAOT_MODULE_CONST_FOLD=0  Exporter: a module-scope `const` with a literal
 #                          initializer is read from its module cell instead of
 #                          folding to the constant.

@@ -9810,3 +9810,53 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   to a string builtin's result, so the property read is the string's length);
   the planners record the `length` field ids first (`string_plan.rs`). The
   seven kernels: 3-18 ms again.
+- Node compatibility N1 (`docs/node_compat_design.md`, the roadmap's last item,
+  "the main attraction"): the architecture and the first modules. `node:<name>`
+  and the bare builtin names resolve to `lib/node/<name>.ts` (TypeScript
+  compiled with the program; a project's `paths` still win); the exporter adds
+  `lib/node/globals.d.ts` (unless @types/node types the program) and evaluates
+  `lib/node/prelude.ts` first when a module program names `process`, `Buffer`,
+  a timer global, `queueMicrotask`, `structuredClone` or `performance` as an
+  ambient name or imports a Node builtin (`TSAOT_NODE_PRELUDE=0` turns it
+  off). The host is `runtime/node_host.c`, included at the end of ts_rt.c as
+  `__garnet_node` (files, the process, the system, clocks, random bytes,
+  `inspect` through the console formatter, `atExit` for the 'exit' event; argv
+  from the loader on macOS and /proc on Linux, since the generated main is
+  `main(void)`). Modules: `path` (Node's POSIX algorithms, complete), `os`,
+  `process` (the global and the module: argv as `[execPath, execPath, ...args]`,
+  env, cwd/chdir, exit and exitCode with 'exit', clocks, memory, stdout/stderr
+  writers, nextTick as a microtask until N3), `events` (EventEmitter with
+  Node's ordering and error semantics, `once`), `util` (format, inspect over
+  the runtime's formatter with util's string quoting, promisify, callbackify,
+  inherits, deprecate, debuglog, isDeepStrictEqual, types), `assert` and
+  `assert/strict` (AssertionError with Node's fields; `assert` and
+  `assert.strict` are distinct function objects), `perf_hooks`. Under the V8
+  oracle a `node:` import is Node itself, so the five fixtures
+  (`tests/conformance/exhaustive/node/`: path, events, util, assert,
+  process_os) are differential tests of the real behavior (plain and strict).
+  Found by them and fixed, all pre-existing silent miscompiles: a function
+  with a rest parameter (and an async function, and a return inside finally)
+  returned `true` as `1` — its only entry is the boxed one, whose Return boxed
+  an integer local as a number; `ret_val` boxes a boolean-returning body's
+  local as a boolean in every return path. `x instanceof Promise` was false
+  (`ts_instanceof` walked from a promise cell's nonexistent common header; it
+  now starts at Promise.prototype, and Promise joins the built-in instanceof
+  table). `x instanceof Date` was false (a Date is a plain object with the
+  internal `__date_ms` field; the instanceof lowers to that field's presence).
+  And `class B extends Uint8Array` compiled to a plain object (`0 NaN false`
+  for the sum, length and instanceof): a built-in base other than the Error
+  classes is now a loud compile-time reject until N2 implements typed-array
+  subclasses for Buffer. Left for the next slices, in the design: Buffer and
+  fs (N2), the event loop with timers, nextTick and unhandled rejections
+  reported as Node does (N3; today a rejected async main exits 0 silently),
+  child_process, crypto, url, readline, streams (N4), tsc-ts on lib/node (N5).
+  README "Node.js modules" lists what works; `util.inspect` ignores its options
+  and `%o` shows no hidden properties; `util.isArray` and the other legacy
+  predicates are not provided (Node 23 removed them). A program that declares
+  `process` itself (the tsc-ts build's host) or maps a `node:` specifier with
+  its own `paths` gets neither the prelude nor our globals (the first tsc-ts
+  build failed on the duplicate declaration). Gates: conformance 583/583
+  plain and strict, GC-protect 580/580, parity 396 identical + 183 known (the
+  five fixtures allowlisted: the frozen twin lacks `globalref.__garnet_node`),
+  selfconf 523 + 57 known, unit, bundler 43/43, GC stress, bench all within
+  budget; tsc-ts output identical to the previous build, instructions 0.9999.
