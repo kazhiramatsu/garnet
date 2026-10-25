@@ -3737,6 +3737,16 @@ fn set_length_fields(program: &Program) {
 fn is_length_field(field: u32) -> bool {
     LENGTH_FIELDS.with(|m| m.borrow().contains(&field))
 }
+/// A read of a string's length in a fused string loop: `GenericLen`, or the
+/// `length` property read the exporter emits when the receiver's type is not
+/// known (an untyped program); the fusions apply it to a string builtin's result.
+fn match_len_read(inst: &Inst) -> Option<(LocalId, LocalId)> {
+    match inst {
+        Inst::GenericLen { dst, src } => Some((*dst, *src)),
+        Inst::LoadField { dst, obj, field, .. } if is_length_field(field.0) => Some((*dst, *obj)),
+        _ => None,
+    }
+}
 /// Object literal sizes for in-object slot allocation (type id -> field count).
 fn set_type_field_counts(program: &Program) {
     TYPE_FIELD_COUNTS.with(|m| {
@@ -16136,10 +16146,7 @@ fn try_emit_fused_replace_metrics_loop(
             dst: replaced,
             src: replaced_src,
         },
-        Inst::GenericLen {
-            dst: replaced_len,
-            src: replaced_len_src,
-        },
+        len_inst,
         Inst::BinOp {
             dst: sum_len_tmp,
             op: sum_len_op,
@@ -16183,6 +16190,7 @@ fn try_emit_fused_replace_metrics_loop(
     else {
         return None;
     };
+    let (replaced_len, replaced_len_src) = match_len_read(len_inst)?;
 
     if replace_builtin != "string.replaceAll"
         || replace_args.len() != 2
@@ -16274,10 +16282,7 @@ fn match_static_replace_escape_shape(body: &[Inst], ctx: &Ctx) -> Option<StaticR
             dst: last,
             src: last_src,
         },
-        Inst::GenericLen {
-            dst: replaced_len,
-            src: replaced_len_src,
-        },
+        len_inst,
         Inst::BinOp {
             dst: sum_len_tmp,
             op: sum_len_op,
@@ -16321,6 +16326,7 @@ fn match_static_replace_escape_shape(body: &[Inst], ctx: &Ctx) -> Option<StaticR
     else {
         return None;
     };
+    let (replaced_len, replaced_len_src) = match_len_read(len_inst)?;
 
     if replace_builtin != "string.replaceAll"
         || replace_args.len() != 2
@@ -17648,10 +17654,7 @@ fn match_dynamic_replace_escape_select_shape(
             dst: last,
             src: last_src,
         },
-        Inst::GenericLen {
-            dst: replaced_len,
-            src: replaced_len_src,
-        },
+        len_inst,
         Inst::BinOp {
             dst: sum_len_tmp,
             op: sum_len_op,
@@ -17719,6 +17722,7 @@ fn match_dynamic_replace_escape_select_shape(
     else {
         return None;
     };
+    let (replaced_len, replaced_len_src) = match_len_read(len_inst)?;
 
     if replace_builtin != "string.replaceAll"
         || replace_recv.0 != select.dst
@@ -18851,10 +18855,7 @@ fn match_dynamic_replace_metric_shape(
             dst: replaced,
             src: replaced_src,
         },
-        Inst::GenericLen {
-            dst: replaced_len,
-            src: replaced_len_src,
-        },
+        len_inst,
         Inst::BinOp {
             dst: sum_len_tmp,
             op: sum_len_op,
@@ -18896,6 +18897,7 @@ fn match_dynamic_replace_metric_shape(
     else {
         return None;
     };
+    let (replaced_len, replaced_len_src) = match_len_read(len_inst)?;
     if replace_builtin != "string.replaceAll"
         || replace_args.len() != 2
         || replaced_res.0 != replaced_src.0

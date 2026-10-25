@@ -9799,4 +9799,14 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   string_replace_kernel 512 ms against a 60 ms budget, the same at the last
   commit in a clean worktree, unchanged by the knobs of the last two slices):
   the fused replace-metric shapes no longer match (no `_fdre_` form in the
-  generated C). To bisect next.
+  generated C). Bisected in a worktree (each point: the commit's exporter and
+  analyzer, 30 s): first bad c7c08bc (2026-10-21, "Read .length as a property
+  unless the receiver is a string or an array"). The bench kernels use
+  `replaceAll`, which the ES2020 library lacks, so the batch export compiles
+  them untyped; their `r.length` became a `LoadField` of the `length` field
+  where the shapes (the four fusions in emit_c.rs, two each in the
+  string-metrics and string-materialization planners) destructured
+  `GenericLen`. Fix: `match_len_read` accepts either form (the shapes apply it
+  to a string builtin's result, so the property read is the string's length);
+  the planners record the `length` field ids first (`string_plan.rs`). The
+  seven kernels: 3-18 ms again.

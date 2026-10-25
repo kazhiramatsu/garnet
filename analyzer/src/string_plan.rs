@@ -256,3 +256,36 @@ fn inst_uses_any(inst: &Inst, ids: &BTreeSet<u32>) -> bool {
 pub(crate) fn locals_used_after(body: &[Inst], from: usize, ids: &BTreeSet<u32>) -> bool {
     body.iter().skip(from).any(|inst| inst_uses_any(inst, ids))
 }
+
+thread_local! {
+    static LENGTH_FIELDS: std::cell::RefCell<std::collections::BTreeSet<u32>> =
+        std::cell::RefCell::new(std::collections::BTreeSet::new());
+}
+/// Record the field ids named `length` (the exporter reads `.length` as a
+/// property when the receiver's type is not known).
+pub fn set_length_fields(program: &Program) {
+    let length = str_units("length");
+    LENGTH_FIELDS.with(|m| {
+        let mut m = m.borrow_mut();
+        m.clear();
+        for f in &program.fields {
+            let units = match &f.name { Some(name) => str_units(name), None => f.name_units.clone() };
+            if units == length {
+                m.insert(f.id.0);
+            }
+        }
+    });
+}
+pub fn is_length_field(field: u32) -> bool {
+    LENGTH_FIELDS.with(|m| m.borrow().contains(&field))
+}
+/// A read of a string's length in a string loop shape: `GenericLen`, or the
+/// `length` property read of an untyped program; the shapes apply it to a
+/// string builtin's result.
+pub fn match_len_read(inst: &Inst) -> Option<(LocalId, LocalId)> {
+    match inst {
+        Inst::GenericLen { dst, src } => Some((*dst, *src)),
+        Inst::LoadField { dst, obj, field, .. } if is_length_field(field.0) => Some((*dst, *obj)),
+        _ => None,
+    }
+}

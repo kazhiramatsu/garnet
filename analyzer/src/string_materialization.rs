@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::escape_ir::*;
 use crate::string_plan::{
+    match_len_read, set_length_fields,
     add_uses, collect_defs, has_control_flow, inst_def_local, locals_used_after, match_const_dst,
     match_const_i64, match_const_str, LoopPath, PathEdge, PathSegment, StaticString,
 };
@@ -100,6 +101,7 @@ pub struct CounterAddTailPlan {
 }
 
 pub fn analyze_program(program: &Program) -> StringMaterializationPlan {
+    set_length_fields(program);
     let mut functions = BTreeMap::new();
     for f in &program.functions {
         let fp = analyze_function(f);
@@ -339,10 +341,7 @@ fn match_static_replace_escape(body: &[Inst]) -> Option<MaterializationOp> {
             dst: last,
             src: last_src,
         },
-        Inst::GenericLen {
-            dst: replaced_len,
-            src: replaced_len_src,
-        },
+        len_inst,
         Inst::BinOp {
             dst: sum_len_tmp,
             op: sum_len_op,
@@ -386,6 +385,7 @@ fn match_static_replace_escape(body: &[Inst]) -> Option<MaterializationOp> {
     else {
         return None;
     };
+    let (replaced_len, replaced_len_src) = match_len_read(len_inst)?;
 
     let (pat_dst, pat) = match_const_str(pat_const)?;
     let (rep_dst, rep) = match_const_str(rep_const)?;
@@ -615,10 +615,7 @@ fn match_dynamic_replace_escape(body: &[Inst]) -> Option<MaterializationOp> {
             dst: last,
             src: last_src,
         },
-        Inst::GenericLen {
-            dst: replaced_len,
-            src: replaced_len_src,
-        },
+        len_inst,
         Inst::BinOp {
             dst: sum_len_tmp,
             op: sum_len_op,
@@ -686,6 +683,7 @@ fn match_dynamic_replace_escape(body: &[Inst]) -> Option<MaterializationOp> {
     else {
         return None;
     };
+    let (replaced_len, replaced_len_src) = match_len_read(len_inst)?;
 
     if replace_builtin != "string.replaceAll"
         || replace_recv.0 != select.dst
