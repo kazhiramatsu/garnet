@@ -10,6 +10,7 @@
 # times include waited-for children.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ORIG="$(pwd)"
 cd "$ROOT/build/typescript_603/source" || { echo "build/typescript_603/source missing (scripts/build_typescript_native.sh fetches it)" >&2; exit 2; }
 [ $# -ge 2 ] || { echo "usage: $0 <rounds> <name>=<command> ..." >&2; exit 2; }
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
@@ -18,6 +19,8 @@ A="-p src/compiler/tsconfig.json --composite false --incremental false --declara
 for r in $(seq 1 "$rounds"); do
   for cfg in "$@"; do
     name=${cfg%%=*}; cmd=${cfg#*=}
+    # a relative executable path resolves against the invocation directory, not the project
+    exe=${cmd%% *}; case "$exe" in /*) ;; */*) [ -x "$ORIG/$exe" ] && cmd="$ORIG/$exe${cmd#"$exe"}" ;; esac
     rm -rf "$W/out_$name"
     /usr/bin/time -l $cmd $A --outDir "$W/out_$name" > "$W/$name.stdout" 2> "$W/t.err"
     rc=$?; files=$(find "$W/out_$name" -type f | wc -l | tr -d ' ')
@@ -28,6 +31,7 @@ first=""
 for cfg in "$@"; do
   name=${cfg%%=*}
   if [ -z "$first" ]; then first=$name; continue; fi
+  if [ ! -d "$W/out_$first" ] || [ ! -d "$W/out_$name" ]; then echo "outputs $name vs $first: NO OUTPUT (a run failed)"; continue; fi
   d=$(diff -rq "$W/out_$first" "$W/out_$name" | wc -l | tr -d ' ')
   echo "outputs $name vs $first: $([ "$d" = 0 ] && echo identical || echo "$d files differ")"
 done
