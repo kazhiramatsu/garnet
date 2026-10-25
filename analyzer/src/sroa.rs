@@ -1066,10 +1066,14 @@ fn find_sroa_targets(
                                     // Allowing such a callee here would drop the alloc but
                                     // keep the call reading the never-assigned receiver
                                     // local (wild pointer loads in the callee).
+                                    // inline_chain_safe: the same test, transitively over the
+                                    // methods the callee calls on its own `this` (the rewrite
+                                    // splices those too; a nested return in any of them would
+                                    // be dropped).
                                     if captures_this(callee_fn)
                                         || returns_receiver(callee_fn)
                                         || needs_materialized_this(callee_fn, bodies, 0)
-                                        || !returns_only_in_tail_position(callee_fn)
+                                        || !inline_chain_safe(callee_fn, bodies, &mut Vec::new(), 0)
                                     {
                                         dq(r.0, alias, disq);
                                     }
@@ -1821,11 +1825,7 @@ fn rewrite_body(
                         // emit_async_function); splicing their body into the caller destroys
                         // the coroutine, so never inline them — keep the Direct call so the
                         // generator/async entry point runs and returns its state object.
-                        if returns_only_in_tail_position(callee)
-                            && !captures_this(callee)
-                            && !callee.is_generator
-                            && !callee.is_async
-                        {
+                        if inline_chain_safe(callee, bodies, &mut Vec::new(), 0) {
                             if let Some(d) = dst {
                                 invalidate_array_tracking_def(
                                     *d,
@@ -2435,6 +2435,66 @@ fn sroa_param_field_maps(
 /// SROA method inliner converts a tail Return into a `Copy` into the call's dst
 /// and drops it; a Return inside an `If`/`Loop`/`TryCatch` would be inlined
 /// verbatim and wrongly exit the CALLER. Reject such bodies for inlining.
+/// Whether `f` and every method it calls on its own `this` (recursively, as the
+/// inliner splices them with the same field map) return only from their last
+/// instruction and keep no closure over `this`. The inliner drops a nested
+/// `return` (it cannot leave the spliced body), so a callee reached through a
+/// `this` call must satisfy the same conditions as the outer one; a method
+/// without a body, a generator or an async method, or a cycle, makes the
+/// chain unsafe and the outer call stays a call.
+fn inline_chain_safe(f: &Function, bodies: &BTreeMap<u32, Function>, visited: &mut Vec<u32>, depth: u32) -> bool {
+    if depth > 16 || visited.contains(&f.id.0) {
+        return false;
+    }
+    if !returns_only_in_tail_position(f) || captures_this(f) || f.is_generator || f.is_async {
+        return false;
+    }
+    let this_local = match f.params.first() {
+        Some(p) => p.0,
+        None => return true,
+    };
+    fn walk(insts: &[Inst], this_local: u32, bodies: &BTreeMap<u32, Function>, visited: &mut Vec<u32>, depth: u32) -> bool {
+        for inst in insts {
+            match inst {
+                Inst::Call { callee: CalleeRef::Direct { func }, recv: Some(r), .. } if r.0 == this_local => {
+                    match bodies.get(&func.0) {
+                        Some(inner) => {
+                            if !inline_chain_safe(inner, bodies, visited, depth + 1) {
+                                return false;
+                            }
+                        }
+                        None => return false,
+                    }
+                }
+                Inst::If { then_body, else_body, .. } => {
+                    if !walk(then_body, this_local, bodies, visited, depth) || !walk(else_body, this_local, bodies, visited, depth) {
+                        return false;
+                    }
+                }
+                Inst::Loop { cond_body, body, .. } => {
+                    if !walk(cond_body, this_local, bodies, visited, depth) || !walk(body, this_local, bodies, visited, depth) {
+                        return false;
+                    }
+                }
+                Inst::TryCatch { try_body, catch_body, finally_body, .. } => {
+                    if !walk(try_body, this_local, bodies, visited, depth)
+                        || !walk(catch_body, this_local, bodies, visited, depth)
+                        || !walk(finally_body, this_local, bodies, visited, depth)
+                    {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        true
+    }
+    visited.push(f.id.0);
+    let ok = walk(&f.body, this_local, bodies, visited, depth);
+    visited.pop();
+    ok
+}
+
 fn returns_only_in_tail_position(f: &Function) -> bool {
     fn nested_has_return(insts: &[Inst]) -> bool {
         for inst in insts {

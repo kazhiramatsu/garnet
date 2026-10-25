@@ -320,6 +320,7 @@ static tsv fetch_header_value_to_string(tsv* a, int n){
   return ts_new_string("via-accessor", 12);
 }
 
+static tsv test_swallow_rejection(tsv* a, int n){ (void)a; (void)n; return TS_UNDEFINED; }
 static tsv fetch_header_getter(tsv* a, int n){
   (void)a; (void)n;
   tsv obj=ts_new_object(); ts_gc_root(&obj);
@@ -1778,6 +1779,8 @@ int main(){
   ts_set_cstr(opts, "headers", headers);
   tsv url=ts_new_string("http://127.0.0.1:1/noop", 23); ts_gc_root(&url);
   tsv fp=ts_fetch(url, opts); ts_gc_root(&fp);
+  /* the connection fails: a handler, or the loop reports the rejection as unhandled and exits */
+  { tsv swallow = ts_make_fn(test_swallow_rejection, NULL, 0); ts_gc_root(&swallow); ts_promise_then(fp, TS_UNDEFINED, swallow); ts_gc_unroot(1); }
   CK("fetch snapshot promise", ts_is_obj(fp));
   ts_gc_collect_young();
   CK("fetch promise survives minor", ts_is_obj(fp));

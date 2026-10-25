@@ -12545,7 +12545,8 @@ fn emit_coroutine_param_copy(s: &mut String, f: &Function, ctx: &Ctx) {
                 j, p.0, j
             );
         } else {
-            let _ = writeln!(s, "  if (nargs > {}) _fr->v{} = args[{}];", j, p.0, j);
+            // a missing argument is undefined (the zeroed frame would read it as 0)
+            let _ = writeln!(s, "  _fr->v{} = nargs > {} ? args[{}] : TS_UNDEFINED;", p.0, j, j);
         }
     }
 }

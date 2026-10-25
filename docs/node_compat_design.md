@@ -217,3 +217,33 @@ stress, bench); the tsc-ts benchmark is unaffected until N5.
   `process.nextTick` runs as a microtask until N3; the legacy `util.is*`
   predicates (removed in Node 23) are not provided; `DataView` does not exist,
   so `util.types.isTypedArray` is `ArrayBuffer.isView`.
+
+## As built, N2 (Session 353)
+
+- `Buffer` is not a class in garnet (typed-array subclasses are still a
+  compile-time reject): `lib/node/buffer.ts` makes a `Uint8Array` view whose
+  prototype is `Buffer.prototype`, an object chained to the typed array's,
+  carrying the methods; `Buffer` itself is a constructor object with
+  `Symbol.hasInstance`, which the exporter now accepts as an `instanceof`
+  right-hand side (the runtime calls the hook). `subarray` and `slice` re-adopt
+  the prototype, so views are Buffers. The encodings are TypeScript; utf8 goes
+  through TextEncoder/TextDecoder. `fromView` adopts the host's bytes without
+  a copy (fs reads).
+- `lib/node/fs.ts`: the synchronous API over the host; `promises` and the
+  callback forms run the synchronous call from a microtask (so they complete
+  after the current turn, as Node's do, though not interleaved with timers
+  until N3). Errors carry Node's `syscall` names (`open`, `read` without a
+  path for EISDIR, `scandir`, `copyfile` with `dest`, `lstat` for
+  `realpathSync` and `rmSync`), and `rmSync` of a directory without
+  `recursive` throws Node's `SystemError` (ERR_FS_EISDIR). `node:fs/promises`
+  re-exports the promise API; `node:string_decoder` keeps partial sequences.
+- Three more pre-existing miscompiles the fixtures found, fixed: the SROA
+  method inliner dropped a `return` nested in a block of a method reached
+  through a `this` call of an inlined method (every call answered the last
+  `return`): the eligibility test is now transitive over `this` calls; an
+  `async` function or method called without an optional argument read it as
+  `0` (the coroutine frame is zeroed; a missing argument is `undefined` now);
+  and a promise rejection nothing handled was silent (the program exited 0):
+  the runtime remembers a promise rejected with no reaction, forgets it when
+  one is attached, and after each turn's microtasks reports what remains and
+  exits with status 1.

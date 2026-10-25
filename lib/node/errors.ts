@@ -17,14 +17,14 @@ const MESSAGES: { [code: string]: string } = {
   ENOTTY: "inappropriate ioctl for device", EDQUOT: "disk quota exceeded",
 };
 
-export interface SystemError extends Error { code: string; errno: number; syscall: string; path?: string; dest?: string }
+export interface ErrnoException extends Error { code: string; errno: number; syscall: string; path?: string; dest?: string }
 /** The error a failed system call throws (`fs.readFileSync("missing")`): a plain Error
  *  carrying Node's properties, as Node's own. */
-export function systemError(code: string, errno: number, syscall: string, path?: string, dest?: string): SystemError {
+export function systemError(code: string, errno: number, syscall: string, path?: string, dest?: string): ErrnoException {
   let message = code + ": " + (MESSAGES[code] ?? "unknown error") + ", " + syscall;
   if (path !== undefined) message += " '" + path + "'";
   if (dest !== undefined) message += " -> '" + dest + "'";
-  const e = new Error(message) as SystemError;
+  const e = new Error(message) as ErrnoException;
   e.errno = errno;
   e.code = code;
   e.syscall = syscall;
@@ -33,7 +33,7 @@ export function systemError(code: string, errno: number, syscall: string, path?:
   return e;
 }
 /** The error of the host's last failed call. */
-export function lastError(syscall: string, path?: string, dest?: string): SystemError {
+export function lastError(syscall: string, path?: string, dest?: string): ErrnoException {
   return systemError(host.lastError(), host.lastErrno(), syscall, path, dest);
 }
 export function uvMessage(code: string): string { return MESSAGES[code] ?? "unknown error"; }
@@ -80,4 +80,22 @@ export function validateFunction(value: unknown, name: string): asserts value is
 }
 export function validateNumber(value: unknown, name: string): asserts value is number {
   if (typeof value !== "number") throw invalidArgType(name, "of type number", value);
+}
+
+/** Node's SystemError (`rmSync` of a directory without `recursive`, ERR_FS_EISDIR). */
+export class SystemError extends Error {
+  code: string;
+  errno: number;
+  syscall: string;
+  path?: string;
+  info: { code: string; message: string; path?: string; syscall: string; errno: number };
+  constructor(code: string, errorCode: string, errno: number, syscall: string, detail: string, path?: string) {
+    super(detail + ": " + syscall + " returned " + errorCode + " (" + uvMessage(errorCode) + ")" + (path !== undefined ? " " + path : ""));
+    this.name = "SystemError";
+    this.code = code;
+    this.errno = errno;
+    this.syscall = syscall;
+    if (path !== undefined) this.path = path;
+    this.info = { code: errorCode, message: uvMessage(errorCode), path, syscall, errno };
+  }
 }

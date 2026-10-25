@@ -2,3 +2,5 @@
 // with the types of lib/node; lib/node/prelude.ts creates them.
 declare var process: import("./process").Process;
 declare var global: typeof globalThis;
+declare var Buffer: import("./buffer").BufferConstructor;
+declare type Buffer = import("./buffer").Buffer;

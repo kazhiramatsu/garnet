@@ -6373,6 +6373,13 @@ class Exporter {
           if (!isCtorVal && !this.isBuiltinSymbol(this.checker.getSymbolAtLocation(node.right))) {
             isCtorVal = rt.getCallSignatures().length > 0 || (rt.flags & ts.TypeFlags.Any) !== 0;
           }
+          // An object with a `[Symbol.hasInstance]` method (a constructor object such as
+          // lib/node's Buffer): the runtime calls the hook.
+          if (!isCtorVal) {
+            const hasHook = (t: ts.Type): boolean =>
+              t.getProperties().some((p) => p.name.startsWith("__@hasInstance")) || (t.isUnion() && t.types.every(hasHook));
+            isCtorVal = hasHook(rt);
+          }
         } catch { /* leave false */ }
         if (isCtorVal) {
           const obj = this.lowerExpr(ctx, node.left);

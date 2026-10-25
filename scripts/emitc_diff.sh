@@ -92,4 +92,4 @@ echo "--- UNPORTED histogram ---"
 sort "$W/unported.txt" | uniq -c | sort -rn | head -15
 echo "--- first-diff samples (work-list) ---"
 sort "$W/firstdiff.txt" | awk -F: '{print $2}' | sort | uniq -c | sort -rn | head -10
-head -5 "$W/firstdiff.txt"
+head -40 "$W/firstdiff.txt"   # every differing fixture, so an allowlist can be written from one run

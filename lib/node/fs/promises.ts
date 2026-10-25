@@ -1,0 +1,25 @@
+// node:fs/promises — the promise API of node:fs.
+import { promises, constants as fsConstants } from "../fs";
+export const constants = fsConstants;
+export const readFile = promises.readFile;
+export const writeFile = promises.writeFile;
+export const appendFile = promises.appendFile;
+export const stat = promises.stat;
+export const lstat = promises.lstat;
+export const readdir = promises.readdir;
+export const mkdir = promises.mkdir;
+export const mkdtemp = promises.mkdtemp;
+export const rm = promises.rm;
+export const rmdir = promises.rmdir;
+export const unlink = promises.unlink;
+export const rename = promises.rename;
+export const copyFile = promises.copyFile;
+export const access = promises.access;
+export const chmod = promises.chmod;
+export const utimes = promises.utimes;
+export const realpath = promises.realpath;
+export const readlink = promises.readlink;
+export const symlink = promises.symlink;
+export const link = promises.link;
+export const truncate = promises.truncate;
+export default promises;

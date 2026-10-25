@@ -9860,3 +9860,45 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   five fixtures allowlisted: the frozen twin lacks `globalref.__garnet_node`),
   selfconf 523 + 57 known, unit, bundler 43/43, GC stress, bench all within
   budget; tsc-ts output identical to the previous build, instructions 0.9999.
+- Node compatibility N2 (`docs/node_compat_design.md`, "As built, N2"):
+  `Buffer` and `node:fs`. A Buffer is a Uint8Array view whose prototype is
+  `Buffer.prototype` (methods over the typed array's; `subarray`/`slice`
+  re-adopt it), made by the factories; `Buffer` is a constructor object with
+  `Symbol.hasInstance`, which the exporter now accepts as an instanceof
+  right-hand side (`class B extends Uint8Array` stays a reject). All of
+  Node's encodings in TypeScript (utf8 through TextEncoder/TextDecoder),
+  the integer and float accessors with Node's range errors, `atob`/`btoa`,
+  `isUtf8`/`isAscii`; `node:string_decoder`. `node:fs`: the synchronous API
+  over the host (`readFileSync` with encodings and flags, `writeFileSync`,
+  `appendFileSync`, `existsSync`, stat/lstat/fstat with `Stats`,
+  `readdirSync` with `withFileTypes` and `recursive`, `mkdirSync` recursive
+  reporting the first directory made, `rmSync` recursive/force,
+  `rename/copyFile/link/symlink/readlink/realpath(.native)`, `chmod`,
+  `utimes`, `truncate`, `mkdtempSync`, descriptors with positions), the
+  promise API and the callback API over it (a microtask apart, so they
+  complete after the current turn), `node:fs/promises`; errors with Node's
+  syscall names and `SystemError` for `rmSync` of a directory. Fixtures
+  `node/buffer` and `node/fs` (the latter in a `mkdtemp` directory, every
+  path printed relative to it), V8 identical, plain and strict. Three more
+  pre-existing silent miscompiles the fixtures found, fixed: the SROA method
+  inliner dropped a `return` nested in a block of a method reached through a
+  `this` call of an inlined method (the receiver was scalar-replaced, so the
+  inner call had to be spliced too, and every call answered the last return:
+  `inline_chain_safe` makes the eligibility transitive); an async function or
+  method called without an optional argument read it as 0 (the zeroed
+  coroutine frame: a missing argument is undefined now); a promise rejection
+  nothing handled was silent and the program exited 0 (the runtime now
+  reports `tsaot: Unhandled promise rejection: <error>` after the turn's
+  microtasks and exits 1, as Node's default does). README "Node.js modules"
+  updated. Known deviation kept: a wrong-typed argument to a number
+  parameter is coerced in typed mode (`buf.readUInt8("1")` throws a
+  RangeError where Node throws ERR_INVALID_ARG_TYPE), the typed-mode item of
+  CLAUDE.md. Parity: the 13 fixtures with a coroutine taking arguments now
+  differ from the frozen emitter at the argument copy (allowlisted with the
+  reason; `emitc_diff.sh` lists up to 40 differing fixtures instead of 5 so
+  one run suffices); the runtime's fetch-snapshot unit test attaches a
+  rejection handler, since the loop now reports an unhandled one. Gates:
+  conformance 585/585 plain and strict, GC-protect 582/582, parity 383
+  identical + 198 known, selfconf 523 + 59 known, unit, bundler 43/43, GC
+  stress, bench all within budget; tsc-ts output identical to the N1 build,
+  instructions 0.9999.

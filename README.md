@@ -488,15 +488,18 @@ Available so far:
 | `node:util` | `format`, `inspect`, `promisify`, `callbackify`, `inherits`, `deprecate`, `debuglog`, `isDeepStrictEqual`, `types`, `stripVTControlCharacters` |
 | `node:assert`, `node:assert/strict` | every assertion, `AssertionError` with `code`, `actual`, `expected`, `operator` and `generatedMessage` |
 | `node:perf_hooks` and `performance` | `performance.now()` and `timeOrigin` |
+| `node:buffer` and the `Buffer` global | `from`, `alloc`, `allocUnsafe`, `concat`, `compare`, `byteLength`, `isBuffer`, `isEncoding`; `toString`, `write`, `slice`/`subarray` (shared memory), `fill`, `copy`, `equals`, `compare`, `indexOf`/`lastIndexOf`/`includes`, the integer and float readers and writers, `swap16/32/64`, `toJSON`; the encodings utf8, utf16le, latin1, ascii, base64, base64url, hex; `atob`, `btoa`, `isUtf8`, `isAscii` |
+| `node:fs` and `node:fs/promises` | the synchronous API (`readFileSync` ... `writeSync`, `mkdtempSync`, `rmSync` recursive, `readdirSync` with `withFileTypes` and `recursive`, descriptors), the promise API and the callback API over it, `Stats`, `Dirent`, `constants`; no streams or `watch` yet |
+| `node:string_decoder` | `StringDecoder` across chunk boundaries |
 
-The `process` and `performance` globals, `queueMicrotask` and `global` exist
-once a program names them or imports a `node:` module. A method a module does
+The `process`, `Buffer` and `performance` globals, `queueMicrotask`, `atob`,
+`btoa` and `global` exist once a program names them or imports a `node:`
+module. A method a module does
 not have yet is a type error at compile time (the modules are type-checked
 with your program), never a missing value at run time.
 
-Coming next, in this order: `Buffer` and `node:fs`, then timers (`setTimeout`
-and the others) with the event loop, then `child_process`, `crypto`, `url`,
-`readline` and streams. Sockets (`net`, `http`) and `fs.watch` are not
+Coming next, in this order: timers (`setTimeout` and the others) with the
+event loop, then `child_process`, `crypto`, `url`, `readline` and streams. Sockets (`net`, `http`) and `fs.watch` are not
 planned yet. `util.inspect` ignores its options and `util.format`'s `%o` shows
 no hidden properties.
 
@@ -507,7 +510,8 @@ as `ReferenceError: setTimeout is not defined`. Others, such as `new URL(...)`,
 are rejected at compile time.
 
 An uncaught exception prints the error to standard error and ends the program
-with a non-zero exit status.
+with a non-zero exit status; so does a promise rejection nothing handles
+(`tsaot: Unhandled promise rejection: ...`), as in Node.js.
 
 ### JSX and server-side rendering (experimental)
 

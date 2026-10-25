@@ -17758,6 +17758,42 @@ static inline void coro_deliver_v(tsv cv, tsv value, int rejected){
   c->result=value; c->rejected=rejected;
   ts_write_barrier(cv, value);
 }
+/* Unhandled rejections, as Node reports them: a promise rejected while nothing
+   waits on it is remembered; a reaction attached later (then, await, the
+   adoption adapter) forgets it; what is still remembered when the microtasks
+   of a turn have drained is reported and ends the program with status 1
+   (Node's default --unhandled-rejections=throw). */
+static int promise_state_value_v(tsv pv, tsv* out);
+static tsv* g_unhandled = NULL;
+static int g_unhandled_len = 0, g_unhandled_cap = 0;
+static void unhandled_add(tsv pv){
+  for (int i = 0; i < g_unhandled_len; i++) if (g_unhandled[i] == pv) return;
+  if (g_unhandled_len == g_unhandled_cap){
+    g_unhandled_cap = g_unhandled_cap ? g_unhandled_cap * 2 : 8;
+    g_unhandled = (tsv*)realloc(g_unhandled, sizeof(tsv) * (size_t)g_unhandled_cap);
+    if (!g_unhandled) ts_abort_msg("out of memory recording a rejection");
+  }
+  g_unhandled[g_unhandled_len++] = pv;
+}
+static void unhandled_remove(tsv pv){
+  for (int i = 0; i < g_unhandled_len; i++){
+    if (g_unhandled[i] == pv){ g_unhandled[i] = g_unhandled[--g_unhandled_len]; return; }
+  }
+}
+static void unhandled_report(void){
+  if (g_unhandled_len == 0) return;
+  tsv pv = g_unhandled[0];
+  tsv value = TS_UNDEFINED;
+  (void)promise_state_value_v(pv, &value);
+  fflush(stdout);
+  fputs("tsaot: Unhandled promise rejection: ", stderr);
+  int color = g_inspect_color; g_inspect_color = 0;
+  ts_print_to(stderr, value);   /* the value as console.log shows it (an Error with its message) */
+  g_inspect_color = color;
+  fputc('\n', stderr);
+  fflush(stderr);
+  exit(1);
+}
 static int promise_begin_settle_v(tsv pv, tsv v, int rejected, int* nwait){
   ts_promise* p = ts_promise_ptr(pv);
   if (!p || p->state!=0) return 0;
@@ -17765,6 +17801,7 @@ static int promise_begin_settle_v(tsv pv, tsv v, int rejected, int* nwait){
   p->value = v;
   ts_write_barrier(pv, v);
   if (nwait) *nwait = p->nwait;
+  if (rejected && p->nwait == 0) unhandled_add(pv);
   return 1;
 }
 static tsv promise_take_waiter_v(tsv pv, int idx){
@@ -18431,6 +18468,7 @@ tsv ts_promise_any(tsv arr){
 void ts_await_register_v(tsv pv, tsv cv){
   if (!ts_is_coro_value(cv)) return;
   ts_gc_root(&pv); ts_gc_root(&cv);
+  if (ts_is_promise(pv)) unhandled_remove(pv);
   if (!ts_is_promise(pv)){
     /* Await uses PromiseResolve, so arbitrary thenables must be assimilated rather
        than delivered as plain objects. Primitives/non-thenable objects become an
@@ -19537,6 +19575,7 @@ static int ts_worker_fork_ex(tsv data, int shared){
 void ts_run_event_loop(void){
   for (;;){
     drain_microtasks();
+    unhandled_report();
     ts_abort_timers_fire_due();
     ts_io_start_queued();
     if (!g_io_head && !g_io_active && g_mq_len) continue;
@@ -19588,12 +19627,14 @@ static void gc_scan_async_cell(ts_gc_header* h, int young, int depth){
 
 static void gc_mark_async_roots(void){
   for (int i=0;i<g_mq_len;i++) gc_visit_slot(&g_microq[i], 0, 0, 1);
+  for (int i=0;i<g_unhandled_len;i++) gc_visit_slot(&g_unhandled[i], 0, 0, 1);
   for (ts_io* t=g_io_head;t;t=t->next){ gc_visit_slot(&t->p, 0, 0, 1); gc_visit_slot(&t->signal, 0, 0, 1); }
   for (ts_io* t=g_io_active;t;t=t->next){ gc_visit_slot(&t->p, 0, 0, 1); gc_visit_slot(&t->signal, 0, 0, 1); }
   gc_mark_abort_timer_roots();
 }
 static void gc_mark_async_roots_young(void){
   for (int i=0;i<g_mq_len;i++) gc_visit_slot(&g_microq[i], 1, 0, 1);
+  for (int i=0;i<g_unhandled_len;i++) gc_visit_slot(&g_unhandled[i], 1, 0, 1);
   for (ts_io* t=g_io_head;t;t=t->next){ gc_visit_slot(&t->p, 1, 0, 1); gc_visit_slot(&t->signal, 1, 0, 1); }
   for (ts_io* t=g_io_active;t;t=t->next){ gc_visit_slot(&t->p, 1, 0, 1); gc_visit_slot(&t->signal, 1, 0, 1); }
   gc_mark_abort_timer_roots_young();
