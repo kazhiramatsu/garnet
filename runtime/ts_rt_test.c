@@ -2,6 +2,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -96,6 +97,10 @@ static tsv shared_got_wrap = TS_UNDEFINED, shared_got_root = TS_UNDEFINED;
 static int shared_frames = 0;
 static tsv test_shared_entry(tsv* a, int n){
   tsv data = n > 0 ? a[0] : TS_UNDEFINED;
+  /* the pages this worker touches up to its first shapes, at the bottom of its
+     id range far above the parent's (the shape tables are reserved, not grown
+     to cover the id; docs/published_graphs_design.md, "P10 as built") */
+  struct rusage r0, r1; getrusage(RUSAGE_SELF, &r0);
   tsv root = ts_new_object(); ts_gc_root(&root);
   tsv inner = ts_new_object(); ts_gc_root(&inner);
   ts_set(inner, ts_intern_field("deep", 4), ts_num(5));
@@ -106,6 +111,8 @@ static tsv test_shared_entry(tsv* a, int n){
   /* a shape the parent never made: the keys in the other order */
   tsv ord = ts_new_object(); ts_gc_root(&ord);
   ts_set(ord, ts_intern_field("b", 1), ts_num(2)); ts_set(ord, ts_intern_field("a", 1), ts_num(1));
+  getrusage(RUSAGE_SELF, &r1);
+  double first_shape_faults = (double)(r1.ru_minflt - r0.ru_minflt);
   tsv fn = ts_make_fn_t(test_worker_on_error, NULL, 0, 0); ts_gc_root(&fn);
   /* an object whose prototype this worker made: the prototype must outlive the worker's collections */
   tsv protoo = ts_new_object(); ts_gc_root(&protoo);
@@ -119,6 +126,7 @@ static tsv test_shared_entry(tsv* a, int n){
   ts_set(root, ts_intern_field("pre", 3), ts_get(data, ts_intern_field("pre", 3)));
   ts_set(root, ts_intern_field("ord", 3), ord);
   ts_set(root, ts_intern_field("fn", 2), fn);
+  ts_set(root, ts_intern_field("faults", 6), ts_num(first_shape_faults));
   ts_publish(root);
   ts_gc_unroot(9);   /* the publish alone keeps the graph (and its prototypes) from here */
   ts_gc_root(&root);
@@ -2048,7 +2056,7 @@ int main(){
     ts_set(ab, ts_intern_field("a", 1), ts_num(0)); ts_set(ab, ts_intern_field("b", 1), ts_num(0));
     ts_intern_field("deep", 4); ts_intern_field("arr", 3); ts_intern_field("m", 1); ts_intern_field("text", 4);
     ts_intern_field("pre", 3); ts_intern_field("ord", 3); ts_intern_field("fn", 2); ts_intern_field("batch", 5); ts_intern_field("k", 1);
-    ts_intern_field("inh", 3); ts_intern_field("own", 3); ts_intern_field("child", 5);
+    ts_intern_field("inh", 3); ts_intern_field("own", 3); ts_intern_field("child", 5); ts_intern_field("faults", 6);
     tsv entry = ts_make_fn_t(test_shared_entry, NULL, 0, 0); ts_gc_root(&entry);
     ts_worker_set_entry(entry);
     tsv data = ts_new_object(); ts_gc_root(&data);
@@ -2076,6 +2084,9 @@ int main(){
       CK("shared worker: a shape the parent never made reads its keys",
          ts_to_num(ts_get(ord, ts_intern_field("a", 1))) == 1 && ts_to_num(ts_get(ord, ts_intern_field("b", 1))) == 2);
       CK("shared worker: a function cell arrives by reference", ts_is_func(fn));
+      double faults = ts_to_num(ts_get(batch, ts_intern_field("faults", 6)));
+      CK("shared worker: its first objects and shapes, far above the parent's ids, touch a few pages (not tables grown to cover the ids)", faults >= 0 && faults < 256);
+      if (!(faults < 256)) fprintf(stderr, "  the worker's first objects and shapes took %.0f page faults\n", faults);
       tsv child = ts_get(batch, ts_intern_field("child", 5));
       CK("shared worker: a prototype the worker made is kept through its collections; the object reads its inherited property",
          ts_is_published(child) && ts_to_num(ts_get(child, ts_intern_field("own", 3))) == 1 && ts_to_num(ts_get(child, ts_intern_field("inh", 3))) == 7);

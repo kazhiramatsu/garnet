@@ -2653,7 +2653,21 @@ typedef struct {
   ts_shape_vec* vec;   /* the chain's vectors; entries [0, depth) are this shape's */
 } ts_shape_desc;
 static ts_shape_desc* g_shapes = NULL;
-static uint32_t g_shapes_cap = 0;
+static uint32_t g_shapes_cap = 0;   /* ids the tables hold: the reservation */
+/* The shape-indexed tables (the descriptors, the public key and flag vector
+   pointers, the static-slot probe rows: 168 bytes an id) are reserved once
+   for TS_SHAPE_TABLE_IDS ids as anonymous memory the kernel zero-fills on
+   first touch, so recording a shape writes its own entries and nothing else.
+   Grown by doubling (a realloc, a copy and a 0xFF fill of the probe rows) they
+   cost a shared worker, whose ids start above the parent's headroom and every
+   earlier worker's range, up to 184 MB of fresh pages before its first line
+   ran, and the parent as much again when it installed the last worker's
+   shapes (docs/published_graphs_design.md, "P10 as built"). An unrecorded
+   id's entries stay zero: depth 0, no vectors, and probe rows no probe reads
+   (an object carries a recorded shape, or 0 or 1, whose rows are NONE). Past
+   the reservation a new layout is a dictionary, as past TS_SHAPE_MAX. */
+#define TS_SHAPE_TABLE_IDS (1u << 24)
+static uint32_t g_shape_ids_limit = TS_SHAPE_TABLE_IDS;   /* lowered if a smaller reservation was all the system gave */
 /* Public key/flag vectors by shape id (ts_rt.h); the header's inline probe and
    the accessors below read them. Index 0 and TS_SHAPE_EMPTY stay NULL. */
 #if !TS_ISO_MODE
@@ -2727,28 +2741,38 @@ static void shape_vec_index_add(ts_shape_vec* v, uint32_t slot){
   while (v->index[at]) at = (at + 1u) & (v->index_cap - 1u);
   v->index[at] = slot + 1u;
 }
-static void shape_desc_record(uint32_t id, uint32_t parent, ts_key key, uint8_t flags){
-  if (id >= g_shapes_cap){
-    uint32_t cap = g_shapes_cap ? g_shapes_cap : 1024u;
-    while (id >= cap) cap *= 2u;
-    g_shapes = (ts_shape_desc*)realloc(g_shapes, sizeof(ts_shape_desc) * cap);
-    memset(g_shapes + g_shapes_cap, 0, sizeof(ts_shape_desc) * (cap - g_shapes_cap));
-    g_ts_shape_keys = (ts_key**)realloc(g_ts_shape_keys, sizeof(ts_key*) * cap);
-    memset(g_ts_shape_keys + g_shapes_cap, 0, sizeof(ts_key*) * (cap - g_shapes_cap));
-    g_ts_shape_flags = (uint8_t**)realloc(g_ts_shape_flags, sizeof(uint8_t*) * cap);
-    memset(g_ts_shape_flags + g_shapes_cap, 0, sizeof(uint8_t*) * (cap - g_shapes_cap));
-    size_t row = sizeof(ts_key) * TS_STATIC_SLOT_LIMIT;
-    g_ts_probe_rkeys = (ts_key*)realloc(g_ts_probe_rkeys, row * cap);
-    g_ts_probe_wkeys = (ts_key*)realloc(g_ts_probe_wkeys, row * cap);
-    if (!g_shapes || !g_ts_shape_keys || !g_ts_shape_flags || !g_ts_probe_rkeys || !g_ts_probe_wkeys)
-      ts_abort_msg("out of memory growing the shape tables");
-    /* TS_KEY_NONE everywhere: shapes 0 and 1 and the rows not yet recorded */
-    memset((char*)g_ts_probe_rkeys + row * g_shapes_cap, 0xFF, row * (cap - g_shapes_cap));
-    memset((char*)g_ts_probe_wkeys + row * g_shapes_cap, 0xFF, row * (cap - g_shapes_cap));
-    g_shapes_cap = cap;
+/* Reserve the shape tables (above): one anonymous mapping carved into the
+   five arrays, halved until the system grants it. */
+static void shape_tables_reserve(void){
+  size_t row = sizeof(ts_key) * TS_STATIC_SLOT_LIMIT;
+  size_t per = sizeof(ts_shape_desc) + sizeof(ts_key*) + sizeof(uint8_t*) + 2u * row;
+#ifdef MAP_NORESERVE
+  int flags = MAP_PRIVATE | MAP_ANON | MAP_NORESERVE;
+#else
+  int flags = MAP_PRIVATE | MAP_ANON;
+#endif
+  for (uint32_t n = TS_SHAPE_TABLE_IDS; n >= (1u << 16); n >>= 1){
+    void* m = mmap(NULL, (size_t)n * per, PROT_READ | PROT_WRITE, flags, -1, 0);
+    if (m == MAP_FAILED) continue;
+    char* base = (char*)m;
+    g_shapes = (ts_shape_desc*)base;    base += (size_t)n * sizeof(ts_shape_desc);
+    g_ts_shape_keys = (ts_key**)base;   base += (size_t)n * sizeof(ts_key*);
+    g_ts_shape_flags = (uint8_t**)base; base += (size_t)n * sizeof(uint8_t*);
+    g_ts_probe_rkeys = (ts_key*)base;   base += (size_t)n * row;
+    g_ts_probe_wkeys = (ts_key*)base;
+    g_shapes_cap = n; g_shape_ids_limit = n;
+    /* shapes 0 (dictionary) and 1 (empty): the NONE vectors and probe rows */
     g_ts_shape_keys[TS_SHAPE_NONE] = g_shape_keys_none; g_ts_shape_flags[TS_SHAPE_NONE] = g_shape_flags_none;
     g_ts_shape_keys[TS_SHAPE_EMPTY] = g_shape_keys_none; g_ts_shape_flags[TS_SHAPE_EMPTY] = g_shape_flags_none;
+    memset(g_ts_probe_rkeys, 0xFF, row * (TS_SHAPE_EMPTY + 1u));
+    memset(g_ts_probe_wkeys, 0xFF, row * (TS_SHAPE_EMPTY + 1u));
+    return;
   }
+  ts_abort_msg("cannot reserve the shape tables");
+}
+static void shape_desc_record(uint32_t id, uint32_t parent, ts_key key, uint8_t flags){
+  if (TS_RT_UNLIKELY(!g_shapes)) shape_tables_reserve();
+  if (TS_RT_UNLIKELY(id >= g_shapes_cap)) ts_abort_msg("a shape id beyond the reserved shape tables");
   ts_shape_desc* d = &g_shapes[id];
   d->parent = parent; d->key = key; d->flags = flags;
   uint32_t pdepth = parent < g_shapes_cap ? g_shapes[parent].depth : 0u;
@@ -2854,7 +2878,7 @@ static uint32_t shape_transition_f(uint32_t parent, ts_key key, uint8_t flags){
     slot = (slot + 1u) & (g_shape_edge_cap - 1u);
   }
   if (TS_RT_UNLIKELY(g_shape_limit && g_next_shape >= g_shape_limit)) shape_limit_reached();
-  if (g_next_shape > TS_SHAPE_MAX) return TS_SHAPE_NONE;
+  if (g_next_shape >= g_shape_ids_limit) return TS_SHAPE_NONE;   /* below TS_SHAPE_MAX */
   uint32_t next = g_next_shape++;
   g_shape_edges[slot].parent = parent;
   g_shape_edges[slot].key = key;
@@ -19172,7 +19196,7 @@ static void watch_read(ts_watch* w){
       uint32_t nshapes = msg_get_u32(&d);
       for (uint32_t i = 0; i < nshapes; i++){
         uint32_t id = msg_get_u32(&d), parent = msg_get_u32(&d), key = msg_get_u32(&d); uint8_t flags = msg_get_u8(&d);
-        if (id <= TS_SHAPE_EMPTY || id > TS_SHAPE_MAX || key >= g_field_count) msg_bad();
+        if (id <= TS_SHAPE_EMPTY || id >= g_shape_ids_limit || key >= g_field_count) msg_bad();
         shape_install_at(id, parent, key, flags);
       }
       uint32_t nfrozen = msg_get_u32(&d);
@@ -19340,7 +19364,7 @@ static int ts_worker_fork_ex(tsv data, int shared){
     if (!g_shape_limit) g_shape_limit = g_next_shape + span;
     child_shape_lo = g_shape_ranges_end > g_shape_limit ? g_shape_ranges_end : g_shape_limit;
     child_shape_hi = child_shape_lo + span;
-    if (child_shape_hi > TS_SHAPE_MAX) ts_abort_msg("too many shared workers for the shape id space (TSAOT_SHARED_SHAPES)");
+    if (child_shape_hi > g_shape_ids_limit) ts_abort_msg("too many shared workers for the shape id space (TSAOT_SHARED_SHAPES)");
     g_shape_ranges_end = child_shape_hi;
     g_shared_forks++;
     g_shared_workers_alive++;

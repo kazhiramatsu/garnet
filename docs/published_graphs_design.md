@@ -412,6 +412,53 @@ against 31).
 - Knobs: `TSAOT_CPUS=N` (the host's `availableParallelism`),
   `TSAOT_FORK_TRACE=1`, `TSAOT_PROF_PC=<file>` in forked workers.
 
+### P10 as built: the shape tables reserved
+
+A parse worker reached its first line of TypeScript 3 to 20 ms after its
+fork, the later workers the later, and the last one matters: the main
+thread's idle list is a stack, so `checker.ts`, the largest file and the
+critical path, goes to p9, spawned last and given no library; it started
+@25-37 ms against scriptc's @2.5. `getrusage` around a worker's entry showed
+the time was the child's own (user and system time matched the wall), and
+almost all of it page faults: 2,160 for the first worker, 3,500 for the next
+two, 6,190 for the four after and 11,570 for the last three. The steps are
+the shape tables doubling. Every table indexed by shape id (the descriptors,
+the public key and flag vector pointers, two static-slot probe rows of
+sixteen keys: 168 bytes an id) grew by realloc, copy and fill (the probe
+rows to 0xFF) to cover the highest id recorded, and a worker's ids start
+above the parent's headroom and every earlier worker's range (65,536 ids
+each), so the k-th worker's first shape grew them to the power of two above
+75,536 + 65,536k ids: 22 MB for the first worker, 184 MB for the last
+three, before any of its code ran. The parent paid the same 184 MB when it
+installed the last worker's descriptors.
+
+The tables are now one anonymous mapping reserved at the first shape for
+2^24 ids (2.8 GB of address space, halved until the system grants it; past
+the reservation a new layout is a dictionary, as past `TS_SHAPE_MAX`). The
+kernel zero-fills a page on its first touch, so recording a shape writes its
+own entries and touches only their pages. An unrecorded id's entries stay
+zero (depth 0, no vectors). Its probe rows are never read: an object carries
+a recorded shape or shape 0 or 1, whose rows are set to NONE when the tables
+are reserved, and a worker's descriptors are installed before the message
+that carries its objects is decoded.
+
+- *Measured* (trained builds of P9 and P10, interleaved, at the default
+  ten checkers): p9's start @27-31 to @11 ms, the parse phase's end @96-98
+  to @78-80, the compile's end @467-479 to @441-465; the main process's peak
+  memory 321 to 137 MB (227 MB at four checkers); the one-checker compile
+  neutral (instructions 1.0012, cycles 1.0049). Against scriptc on the same
+  machine (five interleaved runs each, wall medians, outputs identical):
+
+  | checkers | scriptc | P9 | P10 |
+  |---|---|---|---|
+  | 1 | 1042 ms | 974 ms (0.934) | 977 ms (0.937) |
+  | 4 | 429 ms | 432 ms (1.008) | 406 ms (0.947) |
+  | 10 (default) | 476 ms | 473 ms (0.994) | 455 ms (0.957) |
+
+  Before P10 garnet led only with one checker; it now leads at every count.
+- *Test.* A runtime test counts the page faults of a shared worker's first
+  objects and shapes: 1,469 before, 31 after, the bound 256.
+
 ## Sharing by fork: regions
 
 The fork prototype shares the parent's heap with its children by
@@ -442,7 +489,10 @@ fork:
    created since the last one (id, parent id, key, flags) and the parent
    installs them at those ids before decoding the message (its own
    transition for the same keys, if any, keeps its own id: two ids for one
-   layout cost cache misses, not correctness). Class words are static.
+   layout cost cache misses, not correctness). The shape-indexed tables
+   are reserved for 2^24 ids up front, so a range far above the parent's
+   costs only the pages its shapes touch ("P10 as built"). Class words are
+   static.
    Interning a *new* property name in a shared worker aborts loudly in this
    version (the parent could not map the id); tsc-ts's parse and bind are
    expected not to, and the abort says so if they do.

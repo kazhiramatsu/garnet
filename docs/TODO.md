@@ -9515,3 +9515,32 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   against the hashed build: instructions 0.9896, cycles 0.9456, wall 0.942;
   outputs identical at 1/2/4/8 checkers; PROTECT clean. The density factor
   measured at 4/16/32/64 (docs).
+- Slice P10 (runtime; `docs/published_graphs_design.md` "P10 as built"): the
+  shape tables reserved, not grown. A parse worker reached its first line of
+  TypeScript 3-20 ms after its fork, the later workers the later, and the
+  last one (p9) gets `checker.ts`, the critical path: the main thread's idle
+  list is a stack. `getrusage` around a worker's entry: the time was the
+  child's own, nearly all page faults (2,160 for the first worker, 3,500,
+  6,190, 11,570 for the last three), the shape tables doubling to cover the
+  worker's id range, which starts above the parent's headroom and every
+  earlier worker's 65,536 ids: 168 bytes an id realloc'd, copied and filled
+  (the probe rows to 0xFF), up to 184 MB before the worker's code ran, and as
+  much in the parent when it installed the last worker's shapes. The five
+  tables are now one anonymous mapping reserved at the first shape for 2^24
+  ids (zero-filled on first touch; halved until granted; past it a new
+  layout is a dictionary): recording a shape touches only its own entries'
+  pages; an unrecorded id's probe rows are never read (rows 0 and 1 are set
+  to NONE at the reservation). Runtime test: a shared worker's first objects
+  and shapes take 31 page faults (1,469 before; bound 256). Measured
+  (trained builds, interleaved, ten checkers): p9's start @27-31 to @11 ms,
+  parse end @96-98 to @78-80, compile end @467-479 to @441-465, the main
+  process's peak memory 321 to 137 MB; one checker neutral (instructions
+  1.0012, cycles 1.0049). Against scriptc (wall medians of five interleaved
+  runs, outputs identical): one checker 1042 ms against 977 (0.937), four
+  429 against 406 (0.947; P9 1.008), ten 476 against 455 (0.957; P9 0.994):
+  garnet now ahead at every checker count. Found on the way: startup is
+  4.8 ms to scriptc's 1.3 from the host's init to main.ts's first line, the
+  module initialization, one 149k-line C function compiled at -O0 because
+  -O1 does not finish (5 CPU minutes and 7.5 GB, abandoned); splitting it
+  per module, building constant arrays from static tables, and preparing
+  large literals' shapes at build time are the levers.
