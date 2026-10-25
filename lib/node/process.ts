@@ -5,7 +5,100 @@
 import { EventEmitter } from "./events";
 import { host } from "./host";
 import { lastError, invalidArgType, validateString } from "./errors";
-import { WriteStream, ReadStream } from "./tty";
+import type { ReadStream } from "./tty";
+
+/** process.stdout and process.stderr: the writable half of a tty.WriteStream as a
+ *  structural type, so that the stream (lib/node/tty.ts, compiled when the program names
+ *  stdout, stderr or stdin) and the minimal writer used otherwise both fit. */
+export interface WriteStream {
+  readonly fd: number;
+  readonly isTTY: true | undefined;
+  readonly writable: boolean;
+  columns: number | undefined;
+  rows: number | undefined;
+  write(chunk: string | Uint8Array, encodingOrCallback?: string | ((error?: Error | null) => void) | null, callback?: (error?: Error | null) => void): boolean;
+  end(chunk?: string | Uint8Array | (() => void), encodingOrCallback?: string | (() => void) | null, callback?: () => void): this;
+  on(event: string | symbol, listener: (...args: any[]) => void): this;
+  once(event: string | symbol, listener: (...args: any[]) => void): this;
+  off(event: string | symbol, listener: (...args: any[]) => void): this;
+  addListener(event: string | symbol, listener: (...args: any[]) => void): this;
+  removeListener(event: string | symbol, listener: (...args: any[]) => void): this;
+  emit(event: string | symbol, ...args: any[]): boolean;
+  cork(): void;
+  uncork(): void;
+  destroy(error?: Error | null): this;
+  getColorDepth(env?: object): number;
+  hasColors(count?: number | object, env?: object): boolean;
+  getWindowSize(): [number, number];
+  cursorTo(x: number, y?: number | (() => void), callback?: () => void): boolean;
+  moveCursor(dx: number, dy: number, callback?: () => void): boolean;
+  clearLine(dir: number, callback?: () => void): boolean;
+  clearScreenDown(callback?: () => void): boolean;
+}
+type StdioFactory = (fd: number) => WriteStream | ReadStream;
+let stdioFactory: StdioFactory | null = null;
+/** @internal lib/node/tty.ts registers the standard-stream classes when it loads. */
+export function _setStdioFactory(factory: StdioFactory): void { stdioFactory = factory; }
+/** The standard output streams of a program that never names them: synchronous writes,
+ *  the terminal size, no events (nothing is ever emitted). */
+function minimalWriter(fd: number): WriteStream {
+  const tty = host.isatty(fd);
+  const size = tty ? host.ttySize(fd) : undefined;
+  const self = {
+    fd,
+    isTTY: (tty ? true : undefined) as true | undefined,
+    writable: true,
+    columns: size === undefined ? undefined : size[0],
+    rows: size === undefined ? undefined : size[1],
+    write(chunk: string | Uint8Array, encodingOrCallback?: string | ((error?: Error | null) => void) | null, callback?: (error?: Error | null) => void): boolean {
+      const cb = typeof encodingOrCallback === "function" ? encodingOrCallback : callback;
+      if (typeof chunk !== "string" && !(chunk instanceof Uint8Array)) throw invalidArgType("chunk", "of type string or an instance of Buffer, TypedArray, or DataView", chunk);
+      let error: Error | undefined = undefined;
+      const total = typeof chunk === "string" ? host.utf8Length(chunk) : chunk.length;
+      let offset = 0;
+      while (offset < total) {
+        const written = host.write(fd, chunk, offset, total - offset);
+        if (written < 0) { error = lastError("write"); break; }
+        offset += written;
+      }
+      if (cb !== undefined) host.nextTick(() => cb(error), undefined);
+      else if (error !== undefined) throw error;
+      return true;
+    },
+    end(chunk?: string | Uint8Array | (() => void), encodingOrCallback?: string | (() => void) | null, callback?: () => void): WriteStream {
+      if (typeof chunk === "function") callback = chunk;
+      else if (chunk !== undefined) self.write(chunk);
+      if (typeof encodingOrCallback === "function") callback = encodingOrCallback;
+      if (callback !== undefined) host.nextTick(callback, undefined);
+      return self;
+    },
+    on(): WriteStream { return self; },
+    once(): WriteStream { return self; },
+    off(): WriteStream { return self; },
+    addListener(): WriteStream { return self; },
+    removeListener(): WriteStream { return self; },
+    emit(): boolean { return false; },
+    cork(): void {},
+    uncork(): void {},
+    destroy(): WriteStream { return self; },
+    getColorDepth(): number { return tty ? 8 : 1; },
+    hasColors(count: number | object = 16): boolean { return tty && (typeof count !== "number" || count <= 256); },
+    getWindowSize(): [number, number] { return [self.columns === undefined ? 80 : self.columns, self.rows === undefined ? 24 : self.rows]; },
+    cursorTo(x: number, y?: number | (() => void), callback?: () => void): boolean {
+      if (typeof y === "function") { callback = y; y = undefined; }
+      return self.write(typeof y !== "number" ? `\x1b[${x + 1}G` : `\x1b[${y + 1};${x + 1}H`, callback);
+    },
+    moveCursor(dx: number, dy: number, callback?: () => void): boolean {
+      let seq = "";
+      if (dx < 0) seq += `\x1b[${-dx}D`; else if (dx > 0) seq += `\x1b[${dx}C`;
+      if (dy < 0) seq += `\x1b[${-dy}A`; else if (dy > 0) seq += `\x1b[${dy}B`;
+      return self.write(seq, callback);
+    },
+    clearLine(dir: number, callback?: () => void): boolean { return self.write(dir < 0 ? "\x1b[1K" : dir > 0 ? "\x1b[0K" : "\x1b[2K", callback); },
+    clearScreenDown(callback?: () => void): boolean { return self.write("\x1b[0J", callback); },
+  };
+  return self as unknown as WriteStream;
+}
 
 export interface MemoryUsage { rss: number; heapTotal: number; heapUsed: number; external: number; arrayBuffers: number }
 export interface CpuUsage { user: number; system: number }
@@ -24,12 +117,24 @@ export class Process extends EventEmitter {
   readonly version: string = "v22.12.0";
   readonly versions: { [name: string]: string } = { node: "22.12.0", garnet: "0.1.0" };
   readonly release: { name: string } = { name: "node" };
-  readonly stdout: WriteStream;
-  readonly stderr: WriteStream;
+  private _stdout: WriteStream | null = null;
+  private _stderr: WriteStream | null = null;
   private _stdin: ReadStream | null = null;
+  /** Standard output: the tty stream when the program names stdout/stderr/stdin, else a minimal writer. */
+  get stdout(): WriteStream {
+    if (this._stdout === null) this._stdout = stdioFactory !== null ? (stdioFactory(1) as WriteStream) : minimalWriter(1);
+    return this._stdout;
+  }
+  get stderr(): WriteStream {
+    if (this._stderr === null) this._stderr = stdioFactory !== null ? (stdioFactory(2) as WriteStream) : minimalWriter(2);
+    return this._stderr;
+  }
   /** Standard input as a readable stream, created on first use (reading it keeps the process alive). */
   get stdin(): ReadStream {
-    if (this._stdin === null) this._stdin = new ReadStream(0);
+    if (this._stdin === null) {
+      if (stdioFactory === null) throw new Error("process.stdin is not available: the program does not name it, so lib/node/tty.ts was not compiled (name process.stdin, or import \"node:tty\")");
+      this._stdin = stdioFactory(0) as ReadStream;
+    }
     return this._stdin;
   }
   title: string = "garnet";
@@ -47,8 +152,6 @@ export class Process extends EventEmitter {
     this.ppid = host.ppid();
     this.platform = host.platform;
     this.arch = host.arch;
-    this.stdout = new WriteStream(1);
-    this.stderr = new WriteStream(2);
   }
   cwd(): string {
     const dir = host.cwd();

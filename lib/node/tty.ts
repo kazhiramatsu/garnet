@@ -8,6 +8,7 @@ import { Readable, Writable } from "./stream";
 import { Buffer, fromView } from "./buffer";
 import { host } from "./host";
 import { lastError } from "./errors";
+import { _setStdioFactory } from "./process";
 
 export function isatty(fd: number): boolean {
   return Number.isInteger(fd) && fd >= 0 && fd <= 2147483647 && host.isatty(fd);
@@ -96,6 +97,9 @@ export class ReadStream extends Readable {
   ref(): this { return this; }
   unref(): this { return this; }
 }
+
+// process.stdin/stdout/stderr are these classes once this module is loaded
+_setStdioFactory((fd: number) => (fd === 0 ? new ReadStream(0) : new WriteStream(fd)));
 
 const tty = { isatty, ReadStream, WriteStream };
 export default tty;

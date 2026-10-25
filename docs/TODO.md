@@ -9991,3 +9991,25 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   node/events to a known int-typing difference; conformance 593/593 ×2 and
   590/590; bench; tsc-ts identical). Next: dead-function elimination in the
   analyzer (RTA over the IR) so that an unused lib function costs nothing.
+- On-demand modules behind the prelude generator: the standard streams
+  (lib/node/tty.ts; triggers stdout/stderr/stdin named in the program's own
+  files) and the fs streams (lib/node/fs/streams.ts; triggers
+  createReadStream/createWriteStream) register themselves when loaded;
+  process.stdout/stderr are otherwise a minimal writer typed as an interface
+  (a class type would devirtualize to methods the minimal object lacks),
+  process.stdin and fs.createReadStream throw a message naming the fix.
+  process.ts and fs.ts import the stream modules as types only; the exporter
+  compiles only the modules runtime imports reach (computeModuleOrder filters
+  by `moduleDeps(sf, runtimeOnly)`) but orders by every edge: dropping the
+  type-only edges from the order moved tsc-ts's checker-inference after
+  checker in their cycle and the TDZ check rejected `new InferenceCaches()`.
+  Gates: the full set green (conformance 593/593 ×2 and 590/590, parity 380
+  identical + 209 known, selfconf 517 + 73 known, unit, bundler, GC stress,
+  bench, tsc-ts identical, instructions 1.0003). A `process`+`Buffer`
+  program: 447 → 187 IR functions, 5.7 s → 2.6 s default build; `setTimeout`
+  41 functions, 1.1 s; `fs.readFileSync` 276 functions, 3.0 s. A reachability
+  prototype (scratch reach.py over the IR) showed that a sound RTA without
+  dataflow keeps everything here (class values allocated at module init make
+  every class live; a computed-key read reachable from any validation path
+  makes every member of a live class live), so dead-function elimination
+  needs lazy class values and a called-value dataflow first: deferred.

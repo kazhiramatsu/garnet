@@ -350,3 +350,23 @@ stress, bench); the tsc-ts benchmark is unaffected until N5.
   compile the streams behind process.stdout and the URL parser: 607 IR
   functions and 2 MB of C instead of a few dozen functions. The modules the
   prelude pulls in are rescanned for further globals until the set is stable.
+- On-demand modules (the same generator): a library module that only some
+  programs can observe is compiled when the program's own files name its
+  trigger as a property or identifier, and registers itself when it loads.
+  `lib/node/tty.ts` (the standard streams: triggers `stdout`, `stderr`,
+  `stdin`) registers the stream classes with process.ts, whose
+  `process.stdout`/`stderr` getters otherwise return a minimal writer
+  (synchronous write, the terminal size, no events) and whose `stdin` getter
+  throws a message naming the fix; `lib/node/fs/streams.ts` (triggers
+  `createReadStream`, `createWriteStream`) registers the fs stream classes,
+  and `fs.createReadStream` throws the same kind of message without it.
+  process.ts and fs.ts import those modules as types only: the exporter
+  compiles only the modules runtime imports reach from the entry and the
+  prelude (a type-only import is erased), while the evaluation order still
+  follows every edge, so the order of a program that has type-only imports
+  in a cycle (tsc-ts) does not move. A lib module's own use of a trigger
+  (util.debuglog writes to process.stderr) does not bring the module in: the
+  minimal writer serves it. Costs after this: a program naming `setTimeout`
+  41 IR functions (165 KB of C, a 1.1 s build), `process` and `Buffer` 187
+  (669 KB, 2.6 s; it was 447 and 5.7 s), `fs.readFileSync` 276 (919 KB,
+  3.0 s). Dead-function elimination in the analyzer would take the rest.
