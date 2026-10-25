@@ -2696,6 +2696,75 @@ TS_RT_ALWAYS_INLINE void ts_ta_elem_store(uint8_t* data, uint32_t i, double d, i
     default: memcpy(data + (size_t)i * 8u, &d, 8); break;
   }
 }
+/* The element accesses of a versioned typed-array loop (docs/typed_array_loops_design.md):
+   typed loads and stores the vectorizer takes (the memcpy forms above stay calls at its
+   point and never vectorize). A view's data is element-aligned (the buffer's bytes are
+   malloc-aligned and a view's byteOffset is a multiple of the element size), and the
+   element types may alias (two views of one buffer read the same bytes as different
+   types in one function). */
+typedef int8_t ts_i8_alias __attribute__((__may_alias__));
+typedef uint8_t ts_u8_alias __attribute__((__may_alias__));
+typedef int16_t ts_i16_alias __attribute__((__may_alias__));
+typedef uint16_t ts_u16_alias __attribute__((__may_alias__));
+typedef int32_t ts_i32_alias __attribute__((__may_alias__));
+typedef uint32_t ts_u32_alias __attribute__((__may_alias__));
+typedef float ts_f32_alias __attribute__((__may_alias__));
+typedef double ts_f64_alias __attribute__((__may_alias__));
+TS_RT_ALWAYS_INLINE double ts_ta_elem_load_v(const uint8_t* data, uint32_t i, int elem){
+  switch (elem){
+    case TS_TA_INT8: return (double)((const ts_i8_alias*)data)[i];
+    case TS_TA_UINT8: case TS_TA_UINT8C: return (double)((const ts_u8_alias*)data)[i];
+    case TS_TA_INT16: return (double)((const ts_i16_alias*)data)[i];
+    case TS_TA_UINT16: return (double)((const ts_u16_alias*)data)[i];
+    case TS_TA_INT32: return (double)((const ts_i32_alias*)data)[i];
+    case TS_TA_UINT32: return (double)((const ts_u32_alias*)data)[i];
+    case TS_TA_FLOAT32: return (double)((const ts_f32_alias*)data)[i];
+    default: return ((const ts_f64_alias*)data)[i];
+  }
+}
+TS_RT_ALWAYS_INLINE int32_t ts_ta_elem_load_i32_v(const uint8_t* data, uint32_t i, int elem){
+  switch (elem){
+    case TS_TA_INT8: return (int32_t)((const ts_i8_alias*)data)[i];
+    case TS_TA_UINT8: case TS_TA_UINT8C: return (int32_t)((const ts_u8_alias*)data)[i];
+    case TS_TA_INT16: return (int32_t)((const ts_i16_alias*)data)[i];
+    case TS_TA_UINT16: return (int32_t)((const ts_u16_alias*)data)[i];
+    case TS_TA_INT32: return ((const ts_i32_alias*)data)[i];
+    default: return (int32_t)((const ts_u32_alias*)data)[i];   /* Uint32 wraps, as ToInt32 does */
+  }
+}
+TS_RT_ALWAYS_INLINE void ts_ta_elem_store_v(uint8_t* data, uint32_t i, double d, int elem){
+  switch (elem){
+    case TS_TA_INT8: case TS_TA_UINT8: ((ts_u8_alias*)data)[i] = (uint8_t)(uint32_t)ts_to_int32(d); break;
+    case TS_TA_UINT8C: ((ts_u8_alias*)data)[i] = ts_ta_clamp_u8(d); break;
+    case TS_TA_INT16: case TS_TA_UINT16: ((ts_u16_alias*)data)[i] = (uint16_t)(uint32_t)ts_to_int32(d); break;
+    case TS_TA_INT32: case TS_TA_UINT32: ((ts_u32_alias*)data)[i] = (uint32_t)ts_to_int32(d); break;
+    case TS_TA_FLOAT32: ((ts_f32_alias*)data)[i] = (float)d; break;
+    default: ((ts_f64_alias*)data)[i] = d; break;
+  }
+}
+TS_RT_ALWAYS_INLINE void ts_ta_elem_store_i64_v(uint8_t* data, uint32_t i, long long v, int elem){
+  switch (elem){
+    case TS_TA_INT8: case TS_TA_UINT8: ((ts_u8_alias*)data)[i] = (uint8_t)(uint32_t)v; break;
+    case TS_TA_UINT8C: ((ts_u8_alias*)data)[i] = v < 0 ? 0u : (v > 255 ? 255u : (uint8_t)v); break;
+    case TS_TA_INT16: case TS_TA_UINT16: ((ts_u16_alias*)data)[i] = (uint16_t)(uint32_t)v; break;
+    case TS_TA_INT32: case TS_TA_UINT32: ((ts_u32_alias*)data)[i] = (uint32_t)v; break;
+    case TS_TA_FLOAT32: ((ts_f32_alias*)data)[i] = (float)v; break;
+    default: ((ts_f64_alias*)data)[i] = (double)v; break;
+  }
+}
+/* An integer value into an element: the narrowing cast of its low bits (an
+   int32 local already holds ToInt32 of its value; a wider integer wraps as
+   ToInt32 does), Uint8Clamped clamped, the float kinds converted. */
+TS_RT_ALWAYS_INLINE void ts_ta_elem_store_i64(uint8_t* data, uint32_t i, long long v, int elem){
+  switch (elem){
+    case TS_TA_INT8: case TS_TA_UINT8: data[i] = (uint8_t)(uint32_t)v; break;
+    case TS_TA_UINT8C: data[i] = v < 0 ? 0u : (v > 255 ? 255u : (uint8_t)v); break;
+    case TS_TA_INT16: case TS_TA_UINT16: { uint16_t x = (uint16_t)(uint32_t)v; memcpy(data + (size_t)i * 2u, &x, 2); break; }
+    case TS_TA_INT32: case TS_TA_UINT32: { uint32_t x = (uint32_t)v; memcpy(data + (size_t)i * 4u, &x, 4); break; }
+    case TS_TA_FLOAT32: { float x = (float)v; memcpy(data + (size_t)i * 4u, &x, 4); break; }
+    default: { double x = (double)v; memcpy(data + (size_t)i * 8u, &x, 8); break; }
+  }
+}
 TS_RT_ALWAYS_INLINE int ts_ta_try_load_i(tsv v, int64_t i, int elem, double* out){
   ts_typedarray* t = ts_ta_as(v, elem);
   if (TS_RT_LIKELY(t && (uint64_t)i < t->length)){ *out = ts_ta_elem_load(t->data, (uint32_t)i, elem); return 1; }

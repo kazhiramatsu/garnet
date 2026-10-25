@@ -1976,6 +1976,10 @@ struct Ctx<'a> {
     /// typed-array receivers hoisted by the enclosing loops (slice P):
     /// local -> (element kind, the loop's top label)
     ta_hoisted: std::cell::RefCell<BTreeMap<u32, (u8, u32)>>,
+    /// The versioned typed-array loop being emitted (docs/typed_array_loops_design.md):
+    /// (the loop's top label, its induction local); element accesses of hoisted
+    /// views by that local are direct within it.
+    ta_prefix: std::cell::Cell<Option<(u32, u32)>>,
     /// string receivers of `charCodeAt` whose view the enclosing loop read once:
     /// local -> the loop's top label
     sv_hoisted: std::cell::RefCell<BTreeMap<u32, u32>>,
@@ -8825,6 +8829,7 @@ fn emit_i64_function(
         label_ctr: std::cell::Cell::new(900000),
         loop_labels: std::cell::RefCell::new(Vec::new()),
         ta_hoisted: std::cell::RefCell::new(BTreeMap::new()),
+        ta_prefix: std::cell::Cell::new(None),
         sv_hoisted: std::cell::RefCell::new(BTreeMap::new()),
         loop_mod_residues: std::cell::RefCell::new(Vec::new()),
         fin_stack: std::cell::RefCell::new(Vec::new()),
@@ -9051,6 +9056,7 @@ fn emit_f64_function(
         label_ctr: std::cell::Cell::new(900000),
         loop_labels: std::cell::RefCell::new(Vec::new()),
         ta_hoisted: std::cell::RefCell::new(BTreeMap::new()),
+        ta_prefix: std::cell::Cell::new(None),
         sv_hoisted: std::cell::RefCell::new(BTreeMap::new()),
         loop_mod_residues: std::cell::RefCell::new(Vec::new()),
         fin_stack: std::cell::RefCell::new(Vec::new()),
@@ -9175,6 +9181,7 @@ fn emit_function(
             label_ctr: std::cell::Cell::new(900000),
             loop_labels: std::cell::RefCell::new(Vec::new()),
         ta_hoisted: std::cell::RefCell::new(BTreeMap::new()),
+        ta_prefix: std::cell::Cell::new(None),
         sv_hoisted: std::cell::RefCell::new(BTreeMap::new()),
             loop_mod_residues: std::cell::RefCell::new(Vec::new()),
             fin_stack: std::cell::RefCell::new(Vec::new()),
@@ -9244,6 +9251,7 @@ fn emit_function(
             label_ctr: std::cell::Cell::new(900000),
             loop_labels: std::cell::RefCell::new(Vec::new()),
         ta_hoisted: std::cell::RefCell::new(BTreeMap::new()),
+        ta_prefix: std::cell::Cell::new(None),
         sv_hoisted: std::cell::RefCell::new(BTreeMap::new()),
             loop_mod_residues: std::cell::RefCell::new(Vec::new()),
             fin_stack: std::cell::RefCell::new(Vec::new()),
@@ -9313,6 +9321,7 @@ fn emit_function(
             label_ctr: std::cell::Cell::new(900000),
             loop_labels: std::cell::RefCell::new(Vec::new()),
         ta_hoisted: std::cell::RefCell::new(BTreeMap::new()),
+        ta_prefix: std::cell::Cell::new(None),
         sv_hoisted: std::cell::RefCell::new(BTreeMap::new()),
             loop_mod_residues: std::cell::RefCell::new(Vec::new()),
             fin_stack: std::cell::RefCell::new(Vec::new()),
@@ -9598,6 +9607,7 @@ fn emit_function(
         label_ctr: std::cell::Cell::new(900000),
         loop_labels: std::cell::RefCell::new(Vec::new()),
         ta_hoisted: std::cell::RefCell::new(BTreeMap::new()),
+        ta_prefix: std::cell::Cell::new(None),
         sv_hoisted: std::cell::RefCell::new(BTreeMap::new()),
         loop_mod_residues: std::cell::RefCell::new(Vec::new()),
         fin_stack: std::cell::RefCell::new(Vec::new()),
@@ -13834,6 +13844,21 @@ fn emit_view_load(s: &mut String, ctx: &Ctx, dst: u32, arr: u32, index: u32, ele
     if int_key {
         let hoisted = ctx.ta_hoisted.borrow().get(&arr).copied();
         if let Some((helem, top)) = hoisted {
+            if helem == elem && ctx.ta_prefix.get() == Some((top, index)) {
+                // inside the versioned prefix loop: the index is below every
+                // accessed view's length, the data pointer a local
+                let tad = format!("_tad{}_{}", arr, top);
+                if int32_codegen_enabled() && elem <= 6 && ctx.int32_use.contains(&dst) {
+                    let _ = writeln!(s, "  d{} = ts_ta_elem_load_i32_v({}, (uint32_t)d{}, {});", dst, tad, index, elem);
+                } else if ctx.int_local.contains(&dst) {
+                    let _ = writeln!(s, "  d{} = (long long)ts_ta_elem_load_v({}, (uint32_t)d{}, {});", dst, tad, index, elem);
+                } else if ctx.unboxed.contains(&dst) {
+                    s.push_str(&ctx.set_num(dst, &format!("ts_ta_elem_load_v({}, (uint32_t)d{}, {})", tad, index, elem)));
+                } else {
+                    s.push_str(&ctx.set_val(dst, &format!("ts_num(ts_ta_elem_load_v({}, (uint32_t)d{}, {}))", tad, index, elem)));
+                }
+                return;
+            }
             if helem == elem {
                 // the receiver's test and length were read before the loop
                 let tah = format!("_tah{}_{}", arr, top);
@@ -13904,6 +13929,17 @@ fn emit_view_store(s: &mut String, ctx: &Ctx, arr: u32, index: u32, src: u32, el
     if int_key {
         let hoisted = ctx.ta_hoisted.borrow().get(&arr).copied();
         if let Some((helem, top)) = hoisted {
+            if helem == elem && ctx.ta_prefix.get() == Some((top, index)) {
+                // inside the versioned prefix loop: an integer value into an
+                // integer view is a narrowing cast, anything else the
+                // element conversion
+                if ctx.int_local.contains(&src) {
+                    let _ = writeln!(s, "  ts_ta_elem_store_i64_v(_tad{a}_{t}, (uint32_t)d{}, d{}, {});", index, src, elem, a = arr, t = top);
+                } else {
+                    let _ = writeln!(s, "  ts_ta_elem_store_v(_tad{a}_{t}, (uint32_t)d{}, {}, {});", index, ctx.num(src), elem, a = arr, t = top);
+                }
+                return;
+            }
             if helem == elem {
                 let _ = writeln!(
                     s,
@@ -18395,6 +18431,235 @@ fn try_emit_fused_polymorphic_pattern_split_join_loop(
 /// and length are read once before the loop, and the cell pointer, used every
 /// iteration, keeps the view reachable. The element kind is the first use's;
 /// a receiver used with two kinds keeps the per-use test.
+/// TSAOT_TA_LOOPS=0 keeps the general loop only (docs/typed_array_loops_design.md).
+fn ta_loops_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_TA_LOOPS").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
+/// The bound of a simple typed-array loop's condition `i < bound`.
+enum TaBound {
+    /// a hoisted view's length (the local that holds the view)
+    Len(u32),
+    /// an integer local the loop never assigns
+    IntLocal(u32),
+    /// an integral constant in [0, 2^32)
+    Const(u64),
+}
+
+/// A simple typed-array loop (docs/typed_array_loops_design.md): the
+/// induction local, the bound, and the hoisted views the body indexes.
+struct TaLoopPlan {
+    ind: u32,
+    bound: TaBound,
+    views: Vec<(u32, u8)>,
+}
+
+/// Recognize a `for (let i = ...; i < bound; i++)` loop over hoisted typed-array
+/// views: the exporter lowers the update into `cond_body`'s first instruction
+/// (an `If` on the first-iteration flag whose else arm increments `i`), then
+/// clears the flag and computes the condition. The body may hold only
+/// unboxed arithmetic, element accesses `v[i]` of hoisted views, their
+/// `.length` reads and nested `If`s of the same; nothing may assign `i` or a
+/// view local. None when the loop does not qualify.
+fn ta_loop_plan(cond: u32, cond_body: &[Inst], body: &[Inst], ctx: &Ctx, hoisted: &[(u32, u8)]) -> Option<TaLoopPlan> {
+    if !ta_loops_enabled() || hoisted.is_empty() {
+        return None;
+    }
+    // the update: If { first, then: [], else: [.., t = i + one, i = t] }
+    let Inst::If { then_body, else_body, .. } = cond_body.first()? else { return None };
+    if !then_body.is_empty() || else_body.is_empty() {
+        return None;
+    }
+    let Inst::Copy { dst: ind, src: t } = else_body.last()? else { return None };
+    let ind = ind.0;
+    if !ctx.int_local.contains(&ind) {
+        return None;
+    }
+    let mut ones: BTreeSet<u32> = BTreeSet::new();
+    let mut inc_ok = false;
+    for inst in else_body {
+        match inst {
+            Inst::Const { dst, value: ConstVal::Num { value } } if *value == 1.0 => {
+                ones.insert(dst.0);
+            }
+            Inst::Copy { dst, .. } if dst.0 != ind => {}
+            Inst::Copy { dst, .. } if dst.0 == ind => {}
+            Inst::BinOp { dst, op, lhs, rhs } if dst.0 == t.0 && op == "+" => {
+                inc_ok = (lhs.0 == ind && ones.contains(&rhs.0)) || (rhs.0 == ind && ones.contains(&lhs.0));
+            }
+            _ => return None,
+        }
+    }
+    if !inc_ok {
+        return None;
+    }
+    // the condition: `cond = i < bound`, after the flag is cleared
+    let mut consts: BTreeMap<u32, f64> = BTreeMap::new();
+    let mut lens: BTreeMap<u32, u32> = BTreeMap::new();
+    let mut bound: Option<TaBound> = None;
+    for inst in &cond_body[1..] {
+        match inst {
+            Inst::Const { dst, value: ConstVal::Num { value } } => {
+                consts.insert(dst.0, *value);
+            }
+            // the first-iteration flag cleared
+            Inst::Const { value: ConstVal::Bool { .. }, .. } => {}
+            Inst::Copy { .. } => {}
+            Inst::LoadField { dst, obj, field, elem, .. }
+                if *elem != 0 && is_length_field(field.0) && hoisted.iter().any(|(a, e)| *a == obj.0 && *e == *elem - 1) =>
+            {
+                lens.insert(dst.0, obj.0);
+            }
+            Inst::BinOp { dst, op, lhs, rhs } if dst.0 == cond && op == "<" && lhs.0 == ind => {
+                bound = if let Some(&v) = lens.get(&rhs.0) {
+                    Some(TaBound::Len(v))
+                } else if let Some(&c) = consts.get(&rhs.0) {
+                    if c >= 0.0 && c < 4294967296.0 && c.fract() == 0.0 {
+                        Some(TaBound::Const(c as u64))
+                    } else {
+                        return None;
+                    }
+                } else if ctx.int_local.contains(&rhs.0) {
+                    Some(TaBound::IntLocal(rhs.0))
+                } else {
+                    return None;
+                };
+            }
+            _ => return None,
+        }
+    }
+    let bound = bound?;
+    // nothing in the loop assigns the induction local (outside the update) or
+    // the bound local
+    let mut flat: Vec<&Inst> = Vec::new();
+    flatten_inst(&cond_body[1..], &mut flat);
+    flatten_inst(body, &mut flat);
+    let defs: BTreeSet<u32> = flat.iter().filter_map(|i| inst_def_local(i)).collect();
+    if defs.contains(&ind) {
+        return None;
+    }
+    if let TaBound::IntLocal(b) = bound {
+        if defs.contains(&b) {
+            return None;
+        }
+    }
+    // the body: a whitelist walked structurally
+    let mut views: Vec<(u32, u8)> = Vec::new();
+    fn walk(body: &[Inst], ind: u32, ctx: &Ctx, hoisted: &[(u32, u8)], views: &mut Vec<(u32, u8)>) -> bool {
+        for inst in body {
+            match inst {
+                Inst::Const { dst, value } => {
+                    if !matches!(value, ConstVal::Num { .. } | ConstVal::Bool { .. }) || !ctx.unboxed.contains(&dst.0) {
+                        return false;
+                    }
+                }
+                Inst::Copy { dst, src } => {
+                    if !ctx.unboxed.contains(&dst.0) || !ctx.unboxed.contains(&src.0) {
+                        return false;
+                    }
+                }
+                Inst::BinOp { dst, lhs, rhs, .. } => {
+                    if !ctx.unboxed.contains(&dst.0) || !ctx.unboxed.contains(&lhs.0) || !ctx.unboxed.contains(&rhs.0) {
+                        return false;
+                    }
+                }
+                Inst::UnOp { dst, operand, .. } => {
+                    if !ctx.unboxed.contains(&dst.0) || !ctx.unboxed.contains(&operand.0) {
+                        return false;
+                    }
+                }
+                Inst::LoadIndex { dst, arr, index, elem } => {
+                    if *elem == 0 || index.0 != ind || !ctx.unboxed.contains(&dst.0) {
+                        return false;
+                    }
+                    match hoisted.iter().find(|(a, _)| *a == arr.0) {
+                        Some(&(a, e)) if e == *elem - 1 => {
+                            if !views.iter().any(|(v, _)| *v == a) {
+                                views.push((a, e));
+                            }
+                        }
+                        _ => return false,
+                    }
+                }
+                Inst::StoreIndex { arr, index, src, elem } => {
+                    if *elem == 0 || index.0 != ind || !ctx.unboxed.contains(&src.0) {
+                        return false;
+                    }
+                    match hoisted.iter().find(|(a, _)| *a == arr.0) {
+                        Some(&(a, e)) if e == *elem - 1 => {
+                            if !views.iter().any(|(v, _)| *v == a) {
+                                views.push((a, e));
+                            }
+                        }
+                        _ => return false,
+                    }
+                }
+                Inst::LoadField { dst, obj, field, elem, .. } => {
+                    if *elem == 0 || !is_length_field(field.0) || !ctx.unboxed.contains(&dst.0) {
+                        return false;
+                    }
+                    if !hoisted.iter().any(|(a, e)| *a == obj.0 && *e == *elem - 1) {
+                        return false;
+                    }
+                }
+                Inst::If { cond, then_body, else_body } => {
+                    if !ctx.unboxed.contains(&cond.0) {
+                        return false;
+                    }
+                    if !walk(then_body, ind, ctx, hoisted, views) || !walk(else_body, ind, ctx, hoisted, views) {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+        true
+    }
+    if !walk(body, ind, ctx, hoisted, &mut views) {
+        return None;
+    }
+    if views.is_empty() {
+        return None;
+    }
+    Some(TaLoopPlan { ind, bound, views })
+}
+
+/// The prefix loop of a simple typed-array loop: once the views exist (and the
+/// bound's view has no own property shadowing `length`), the indexes below
+/// the bound and below every accessed view's length run with direct element
+/// access; the general loop then continues from the induction local.
+fn emit_ta_prefix_loop(s: &mut String, plan: &TaLoopPlan, body: &[Inst], ctx: &Ctx, top: u32) {
+    let i = plan.ind;
+    let mut guard: Vec<String> = plan.views.iter().map(|(a, _)| format!("_tah{}_{}", a, top)).collect();
+    let end = match plan.bound {
+        TaBound::Len(a) => {
+            if !plan.views.iter().any(|(v, _)| *v == a) {
+                guard.push(format!("_tah{}_{}", a, top));
+            }
+            guard.push(format!("obj_map_plain(&_tah{a}_{t}->o)->len == 0", a = a, t = top));
+            format!("_tal{}_{}", a, top)
+        }
+        TaBound::IntLocal(b) => format!("(d{b} < 0 ? 0u : (d{b} > 4294967295LL ? 4294967295u : (uint32_t)d{b}))", b = b),
+        TaBound::Const(c) => format!("{}u", c),
+    };
+    let _ = writeln!(s, "  if ({}) {{", guard.join(" && "));
+    let _ = writeln!(s, "    uint32_t _te{} = {};", top, end);
+    for (a, _) in &plan.views {
+        let _ = writeln!(s, "    if (_tal{a}_{t} < _te{t}) _te{t} = _tal{a}_{t};", a = a, t = top);
+    }
+    let _ = writeln!(s, "    for (; (unsigned long long)d{i} < (unsigned long long)_te{t}; d{i}++) {{", i = i, t = top);
+    let prev = ctx.ta_prefix.replace(Some((top, i)));
+    emit_seq(s, body, ctx, PathEdge::LoopBody);
+    ctx.ta_prefix.set(prev);
+    s.push_str("    }\n  }\n");
+}
+
 fn loop_view_receivers(cond_body: &[Inst], body: &[Inst], ctx: &Ctx) -> Vec<(u32, u8)> {
     let mut flat: Vec<&Inst> = Vec::new();
     flatten_inst(cond_body, &mut flat);
@@ -24047,7 +24312,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             for (arr, elem) in &hoisted {
                 let _ = writeln!(
                     s,
-                    "  ts_typedarray* _tah{a}_{t} = ts_ta_as({v}, {e}); uint32_t _tal{a}_{t} = _tah{a}_{t} ? _tah{a}_{t}->length : 0u; (void)_tal{a}_{t};",
+                    "  ts_typedarray* _tah{a}_{t} = ts_ta_as({v}, {e}); uint32_t _tal{a}_{t} = _tah{a}_{t} ? _tah{a}_{t}->length : 0u; (void)_tal{a}_{t}; uint8_t* _tad{a}_{t} = _tah{a}_{t} ? _tah{a}_{t}->data : NULL; (void)_tad{a}_{t};",
                     a = arr,
                     t = top,
                     v = ctx.val(*arr),
@@ -24059,6 +24324,11 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 .borrow_mut()
                 .push((top, end, ctx.eh_depth.get()));
             ctx.loop_mod_residues.borrow_mut().push(residue_map);
+            if residues.is_empty() {
+                if let Some(plan) = ta_loop_plan(cond.0, cond_body, body, ctx, &hoisted) {
+                    emit_ta_prefix_loop(s, &plan, body, ctx, top);
+                }
+            }
             let _ = writeln!(s, "  L{}: ;", top);
             s.push_str("  for (;;) {\n");
             emit_seq(s, cond_body, ctx, PathEdge::LoopCond);

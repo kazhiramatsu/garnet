@@ -431,6 +431,13 @@ String, Array, Map, Set, WeakMap, WeakSet, Math, Number, Object, JSON, RegExp
 `toISOString`), Promise, Symbol, Proxy, Reflect, typed arrays with ArrayBuffer
 and SharedArrayBuffer, Atomics, and TextEncoder/TextDecoder.
 
+Element-wise loops over typed arrays (`for (let i = 0; i < a.length; i++)
+a[i] = ...`) are compiled as counted loops with direct element access, which
+the C compiler vectorizes; a fill-and-transform loop over a million elements
+ran 1.7× faster than on Node.js (0.17 s against 0.29 s), where before it ran
+slower (0.32 s). A loop that calls a function or boxes a value takes the
+general path.
+
 Not available yet: `Intl` and the locale methods (`toLocaleString`,
 `localeCompare`), `DataView`, `WeakRef` and `FinalizationRegistry`, the Set
 algebra methods (`union` and the others), `Date` parsing and setters, and the

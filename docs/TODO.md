@@ -9727,3 +9727,29 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   read garbage today. The store-proven pass excludes clones; the real fix is
   a receiver-class guard on dispatch to a clone's method (or one layout for
   the base and its clones).
+- Slice (emitter, runtime; `docs/typed_array_loops_design.md`): counted loops
+  over typed-array views versioned so that clang vectorizes them. The emitter
+  recognizes `for (let i = ...; i < bound; i++)` over hoisted views with a
+  whitelisted body (unboxed arithmetic, `v[i]` reads and writes, `length`
+  reads, nested ifs) and emits, before the general loop, a prefix loop over
+  the indexes every accessed view covers with direct element access, typed
+  loads and stores through `may_alias` element types (the general helpers'
+  fixed-size memcpy stays a call at the vectorizer's point and never
+  vectorizes), the data pointer hoisted into a local; the general loop
+  finishes the remainder from the induction local. Kernel
+  `patterns/typed_array_loops`: 14.73 -> 9.52 G instructions (-35%), four of
+  its five loops vectorized (copy becomes memcpy); the byte loop stays scalar
+  because `(b[i] + k) & 255` adds a double to an integer local and converts
+  with ts_to_int32 (an int32-analysis extension noted in the design).
+  Against Node (quiet machine): the kernel 302 against 337 ms, the opening
+  fill/sum/bytes probe 0.17 against 0.29 s (0.32 s before the slice; the
+  plain-C ceiling 0.12 s). tsc-ts: no loop qualifies, outputs identical,
+  instructions 0.9999. Fixture `stdlib/typed_array_loops` (V8 identical,
+  plain and strict; the frozen oracle lacks the typed-array constructors:
+  parity-unported); the new always-inline helpers allowlisted in
+  tests/runtime_inline_policy_gate.sh. Knob `TSAOT_TA_LOOPS=0`.
+- Environment: at midnight the daily tmp cleaner removed most of the tsc-ts
+  checkout a session had cloned under /private/tmp (files not accessed for
+  three days): the checkout is now `build/tsc-ts` (commit c002e8e, `npm ci`),
+  and the measurement scripts read `TSC_TS_LIB_DIR` from it. Memory note
+  written.

@@ -87,6 +87,11 @@ while IFS= read -r name; do
     ts_ta_elem_load | \
     ts_ta_elem_store | \
     ts_ta_elem_load_i32 | \
+    ts_ta_elem_store_i64 | \
+    ts_ta_elem_load_v | \
+    ts_ta_elem_load_i32_v | \
+    ts_ta_elem_store_v | \
+    ts_ta_elem_store_i64_v | \
     ts_ta_try_load_i32 | \
     ts_ta_try_load_i | \
     ts_ta_try_load_f | \

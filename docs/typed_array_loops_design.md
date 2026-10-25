@@ -80,3 +80,51 @@ if (_tah_a && _tah_b && obj_map_plain(&_tah_a->o)->len == 0 && ...) {
   byte transform, copy between views, dot product (scalar by semantics).
 - tsc-ts: outputs identical, instructions neutral (its typed-array loops are
   the scanner's `switch` loops, which the rule does not take).
+
+## As built (Session 353)
+
+- Emitter (`ta_loop_plan`, `emit_ta_prefix_loop`, in the `Loop` arm after the
+  view hoists, when the loop has no modulo residues): the recognizer reads the
+  exporter's `for` lowering (the first-iteration `If` whose else arm holds
+  `t = i + 1; i = t`, the flag cleared, the condition `i < bound` last in
+  `cond_body`), requires `i` an integer local assigned nowhere else, the bound
+  a hoisted view's `length` (`LoadField` with the view's element hint), an
+  integral constant below 2^32 or an integer local the loop never assigns,
+  and walks the body against the whitelist (`Const`, `Copy`, `BinOp`, `UnOp`
+  on unboxed locals, `LoadIndex`/`StoreIndex` by `i` on hoisted views,
+  `length` reads of hoisted views, nested `If`). The prefix loop runs while
+  `(unsigned long long)i < _te`, `_te` the bound clamped to every accessed
+  view's length, guarded by the views' handles and, for a `length` bound, the
+  view having no own property; `ctx.ta_prefix` makes `emit_view_load` and
+  `emit_view_store` emit the direct forms inside it.
+- The hoist also keeps the data pointer in a local (`_tad`): a pointer
+  reloaded from the view each iteration through a `uint8_t*` store defeated
+  alias analysis.
+- Runtime (`ts_rt.h`): the direct forms are typed loads and stores through
+  `may_alias` element types (`ts_ta_elem_load_v`, `_load_i32_v`, `_store_v`,
+  `_store_i64_v`): the general helpers' fixed-size `memcpy` stays a call at
+  the vectorizer's point ("call instruction cannot be vectorized", measured on
+  a probe), the typed derefs vectorize; a view's data is element-aligned and
+  the aliasing types let two views of one buffer coexist in one function.
+  `ts_ta_elem_store_i64` (memcpy form) serves the general path's integer
+  stores.
+- Kernel `benchmarks/patterns/typed_array_loops` (fill, axpy, bytes, copy,
+  dot; 2^18 elements, 300 rounds): 14.73 -> 9.52 G instructions (-35%), 1.69
+  -> 1.23 G cycles, outputs identical; clang vectorizes fill, axpy, the init
+  loop and (as an ordered reduction) dot, turns copy into memcpy, and leaves
+  `bytes`: `(b[i] + k) & 255` adds a double (the element load) to an integer
+  local and converts the sum with `ts_to_int32`, which has no vector form;
+  the int32 analysis admits only bitwise uses of a candidate, so an add whose
+  result is consumed by `& 255` stays a double add even though both operands
+  are integers (a later extension: `+`/`-` of integral operands whose result
+  feeds ToInt32 computed in int64 and truncated).
+- Fixture `stdlib/typed_array_loops` (V8 output identical, plain and strict).
+  The new always-inline helpers are listed in
+  `tests/runtime_inline_policy_gate.sh` (the unit and GC gates embed it).
+- Against Node on a quiet machine: the kernel 302 ms against 337 ms (0.90);
+  the fill/sum/bytes probe of the opening (1M elements, 200 rounds) 0.17 s
+  against 0.29 s (it was 0.32 s before the slice; the plain-C ceiling 0.12 s,
+  the sum being the scalar part).
+- tsc-ts: no loop qualifies (its typed-array loops are the scanner's switch
+  loops), outputs identical, instructions 0.9999.
+- `TSAOT_TA_LOOPS=0`; the parity corpus hoists no views.
