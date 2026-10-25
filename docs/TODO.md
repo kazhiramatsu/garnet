@@ -9965,4 +9965,12 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   identical + 212 known (22 fixtures newly unported in the frozen emitter:
   iter.acquire/iter.close and the Node host global, allowlisted with their
   reason); selfconf 511 + 79 known; unit; bundler 43/43; GC stress; bench all
-  within budget; tsc-ts output identical to the N3 build, instructions 1.0201.
+  within budget; tsc-ts output identical to the N3 build, instructions 1.0201:
+  the IteratorClose wrapper (a try/finally per loop entry) had landed on every
+  loop over a Map/Set/array iterator, whose lib types declare an optional
+  `return`. Follow-up: the runtime's own iterators (keys/values/entries of an
+  array, string, Map, Set or Headers; matchAll; the lib's ArrayIterator/
+  MapIterator/SetIterator/StringIterator/RegExpStringIterator types) have no
+  `return`, so they keep the plain loop; tsc-ts instructions 1.0004 against
+  N3. Known: `"xy"[Symbol.iterator]()` (a string's iterator method called
+  directly) is a TypeError at run time; `for (const c of "xy")` is the way.

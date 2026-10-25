@@ -331,8 +331,10 @@ stress, bench); the tsc-ts benchmark is unaffected until N5.
   IDNA).
 - Language fixes the work needed (in `exporter.ts`, the runtime and the
   emitter): IteratorClose for custom iterators (`iter.close:` calls `return`
-  when the iterator's type may have one; yield* closes the inner iterator
-  when the delegation ends early), for-await over an object literal with
+  when the iterator's type may have one; the runtime's own iterators, an
+  array's/Map's/Set's keys/values/entries and the lib's *Iterator types, have
+  none and keep the plain loop; yield* closes the inner iterator when the
+  delegation ends early), for-await over an object literal with
   `[Symbol.asyncIterator]`, array patterns bound from a Map, Set, generator,
   class iterable or iterator by the protocol (`const [a, b] = new Set(...)`
   read undefined before), a runtime GetIterator (`iter.acquire:`) for a

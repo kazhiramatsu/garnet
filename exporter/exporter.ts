@@ -11350,6 +11350,7 @@ class Exporter {
    *  declaring `return` (lib's `Iterator<T>` declares it optional) may; an object
    *  literal or class type without one does not, and keeps the plain loop. */
   private iteratorMayHaveReturn(expr: ts.Expression, viaIterable: boolean, async: boolean): boolean {
+    if (this.isBuiltinIteratorCall(expr)) return false;
     try {
       let t: ts.Type = this.checker.getTypeAtLocation(expr);
       if (viaIterable) {
@@ -11363,10 +11364,31 @@ class Exporter {
       const may = (ty: ts.Type): boolean => {
         if (ty.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) return true;
         if (ty.isUnion() || ty.isIntersection()) return ty.types.some(may);
+        if (this.isBuiltinIteratorType(ty)) return false;
         return ty.getProperty("return") !== undefined;
       };
       return may(t);
     } catch { return true; }
+  }
+  /** The runtime's own iterators (an array's, string's, Map's or Set's keys/values/
+   *  entries, a string's matchAll) have no `return`: a loop over one needs no
+   *  IteratorClose, so its hot path stays a plain loop. By the call shape ... */
+  private isBuiltinIteratorCall(expr: ts.Expression): boolean {
+    let e: ts.Expression = expr;
+    while (ts.isParenthesizedExpression(e) || ts.isAsExpression(e) || ts.isNonNullExpression(e)) e = e.expression;
+    if (!ts.isCallExpression(e) || !ts.isPropertyAccessExpression(e.expression)) return false;
+    const name = e.expression.name.text;
+    if (name !== "keys" && name !== "values" && name !== "entries" && name !== "matchAll") return false;
+    const rk = this.builtinReceiverKind(e.expression.expression);
+    return rk === "array" || rk === "string" || rk === "map" || rk === "set" || rk === "headers";
+  }
+  /** ... and by the lib's iterator interface names (ArrayIterator, MapIterator, ...). */
+  private isBuiltinIteratorType(ty: ts.Type): boolean {
+    const sym = ty.getSymbol ? ty.getSymbol() : undefined;
+    if (!sym) return false;
+    const name = String(sym.escapedName);
+    if (name !== "ArrayIterator" && name !== "MapIterator" && name !== "SetIterator" && name !== "StringIterator" && name !== "RegExpStringIterator") return false;
+    return this.isBuiltinSymbol(sym);
   }
 
   /** Collect the closure-captured identifier symbols declared by a loop binding
