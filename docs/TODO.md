@@ -10549,3 +10549,82 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   reach llama.cpp's 72 on four. Left on eight threads: the wait for the
   slowest worker's last grab (20 us per job, 2.2 ms of a 14 ms token) and
   the per-job preparation (6 us); the products run at the memory ceiling.
+- TinyLlama threads: the smallest row grab is one kernel pass (Session 353,
+  commit 75423e5). `ROW_MIN` 4 instead of 16, measured against 8 and 16 on
+  eight threads within the noise (72-75 tokens/s) with the smallest tail
+  wait (13-20 us per job, about 2 ms of a 14 ms token).
+- `garnet:metal`: Metal compute from TypeScript (Session 353,
+  `docs/metal_design.md`). Kaz asked for the GPU path of the LLM program;
+  the GPU half is a module of its own because nothing in it is about
+  language models. The host `runtime/metal_host.c` (`__garnet_metal`,
+  included at the end of ts_rt.c after node_host.c) is plain C over the
+  Objective-C runtime: Metal.framework is `dlopen`ed on the first use and
+  every method is an `objc_msgSend` through a function pointer cast to the
+  method's signature, so the runtime stays one translation unit, no
+  framework is linked, the build scripts are untouched, a program that
+  never uses it loads nothing, and another platform answers `available()`
+  false. `lib/garnet/metal.ts`: `Library` (MSL source compiled at run time,
+  the compiler's log the Error, fast math off unless asked), `Pipeline`
+  (a kernel by name, its thread limits), `GpuBuffer` (a SharedArrayBuffer's
+  mmap'd pages as the Metal buffer without a copy; a plain ArrayBuffer is a
+  TypeError), `CommandBuffer` (pipeline / buffer / bytes / dispatch mirror
+  the serial compute encoder, one commit, one wait that throws the GPU's
+  error, discard; the pool pushed at begin and popped at wait). Out-of-range
+  arguments are RangeErrors before Metal sees them (a 4 KB argument struct,
+  index 31, an offset past the buffer, zero threadgroups, more threads than
+  the pipeline's maximum). `metal_node.ts` is the oracle's polyfill:
+  `available()` false, the classes throw after the same argument checks.
+  Fixture `modules/metal_compute` (plain, strict, GC protect): two kernels
+  over SharedArrayBuffers on inputs whose float32 results are exact, the
+  same values from the GPU under garnet and from TypeScript under Node,
+  every error path by kind. Measured: 23 ms to load the framework and
+  create the device, 36 ms to compile a kernel, 0.2 us to encode a
+  dispatch, about 5 us of GPU time per trivial dispatch, 0.33 ms per
+  command-buffer round trip, 124 GB/s streaming the 1.17 GB model file.
+  Gates: conformance 610/610 plain and strict, 607/607 under GC protect,
+  unit, bundler 45/45, GC stress; bench (see the next entries' run).
+- `garnet:llama`: the inference code as a garnet module (Session 353,
+  `docs/llm_inference_design.md` "The modules"). Kaz: the llama program
+  belongs in lib/garnet, not under benchmarks. `benchmarks/llama2/
+  llama_core.ts` moved to `lib/garnet/llama.ts` (the reader, the model, the
+  kernels, the pool, the tokenizer, and the sampler from the program),
+  `llama_worker.ts` beside it (named `./llama_worker.ts` at the `new
+  Worker` site, which the exporter and Node's loader resolve to the same
+  file; Node's workers inherit `--import`, verified). `readGguf(path,
+  true)` reads the file into a SharedArrayBuffer in 64 MB reads, so the GPU
+  reads it in place and a Node worker builds its model over the shared bytes
+  (`WorkerData.model`) instead of reading the file; the whole run state is
+  SharedArrayBuffers; `Llama.gpu` is a `Forward` that runs `forward` when
+  set. The program imports `garnet:llama`; `run_gguf.sh` runs Node through
+  the scheme loader. CPU path unchanged: outputs identical to Node with
+  one, four and eight threads, 24.7 / 72.6 tokens/s on one / eight threads
+  (24.0 / 71.9 before the move).
+- `garnet:llama_metal`: TinyLlama on the GPU (Session 353,
+  `docs/llm_inference_design.md` "Milestone 3"). `llama.gpu = new
+  LlamaMetal(llama)`: one command buffer per token, 222 kernels (per
+  layer RMSNorm, the q/k/v products into q and the caches, RoPE, the
+  attention over the heads as a threadgroup per head, the output product
+  added to the residual, RMSNorm, gate and up with SiLU in one kernel, the
+  down product added to the residual; then the final norm and the
+  vocabulary product), the embedding by the CPU before the commit, the
+  sampling after the wait. The product kernels follow llama.cpp's Metal
+  ones: a SIMD group per two rows, a lane per quarter of every eighth
+  block, int8 or nibble weights times the float activation, `simd_sum`;
+  Q8_0, Q4_0, F16 and F32. `--gpu`, `--check-gpu` (the prompt on the CPU
+  then on the GPU: argmax per position, the last logits within 3% of their
+  range, PASS/FAIL), `--fast-math`, `--stats`; `run_gguf.sh gpu` is the
+  differential test. TinyLlama-1.1B-Chat Q8_0 on the quiet M5: 101-106
+  tokens/s generation (10 ms per token: encode 0.05 ms, the GPU 9.9 ms),
+  the prompt 101 tokens/s one token at a time; the CPU path 24.7 on one
+  thread and 72.6 on eight in the same session, llama.cpp's CPU path 72 on
+  four. The check: argmax
+  agrees at 51/51 prompt positions, last logits within 0.25 over a range
+  of 16.6, the same 32 tokens of text as the CPU path's. The products
+  alone run a token's 1.1 GB of weights in 9.4 ms (117 GB/s) against the
+  device's 124 GB/s streaming read, so the kernels are at 94% of the
+  bandwidth; the geometry variants (rows per SIMD group, SIMD groups per
+  threadgroup) measured within the noise. Not measured: llama.cpp's Metal
+  number on this model (no llama.cpp build reachable; `llama-bench` without
+  `-ngl 0` is Kaz's run). Next levers: a batched prefill for the prompt,
+  kernel fusion for the 89 small dispatches (0.6 ms), Q4_0 to halve the
+  bytes.

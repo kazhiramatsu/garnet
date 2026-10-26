@@ -2,7 +2,41 @@
 
 Session 353. Kaz asked whether a transformer could be made fast and then
 whether a llama.cpp model could run; the scope is inference, the target model
-TinyLlama-1.1B-Chat Q8_0. Two milestones, the first done.
+TinyLlama-1.1B-Chat Q8_0. Three milestones, all done: the fp32 llama2.c
+port, the GGUF model on the CPU (one thread, then a thread pool), and the
+same model on the GPU through Metal.
+
+## The modules (2026-10-27)
+
+Kaz asked for the inference code to be a garnet module rather than a
+benchmark. It is three:
+
+- **`garnet:llama`** (`lib/garnet/llama.ts`): the GGUF reader (`readGguf`,
+  `parseGguf`), the `Model` and its `Weight`s, the `Llama` forward pass, the
+  `Tokenizer`, the `Sampler`, and the thread pool (`startPool(n, llama,
+  path)`, `stopPool`, `setPool`, `setSharedModel`, `workerLoop`; the
+  worker's entry is `llama_worker.ts`, named as `./llama_worker.ts` so the
+  exporter and Node's loader resolve the same file). `readGguf(path, true)`
+  reads the file into a `SharedArrayBuffer` (64 MB reads into the mapped
+  pages): the GPU reads it in place, and a Node worker builds its model over
+  the same bytes instead of reading the file again. The run state (the
+  activations, the KV cache, the logits) is `SharedArrayBuffer`s throughout,
+  so the pooled jobs and the GPU share it without copies; `llama.gpu` is the
+  device that runs `forward` when set.
+- **`garnet:metal`** (`docs/metal_design.md`): the general-purpose Metal
+  compute module, nothing in it about language models.
+- **`garnet:llama_metal`** (`lib/garnet/llama_metal.ts`): `new
+  LlamaMetal(llama)`, the forward pass on the GPU, assigned as `llama.gpu`.
+  It does not import `garnet:llama`'s pool and `garnet:llama` does not
+  import it (no module cycle); the program wires the two.
+
+`benchmarks/llama2/llama_gguf.ts` is the program over them (`-j threads`,
+`--gpu`, `--check-gpu`, `--fast-math`, `--stats`), and
+`benchmarks/llama2/run_gguf.sh` the differential test: the CPU path's text
+against Node byte for byte (Node runs the modules through
+`scripts/garnet_scheme_loader.mjs`, its workers included), and with `gpu` as
+the thread count the GPU's logits against the CPU's over the prompt and its
+text against the CPU path's.
 
 ## Milestone 1: llama2.c in TypeScript (done)
 
@@ -114,10 +148,11 @@ the job, `C_DONE` the count of finished workers (`Atomics.add`), `C_STOP`
 and `C_WORKERS`. The quantized activation (`xq`, `xs`), the float activation
 `xf` and the output vector live in shared buffers as well; the main thread
 computes row range 0 itself, each worker its range in blocks of four rows
-(the four-row kernel), and the main spins on `C_DONE`. The program is split
-in three modules for this: `llama_core.ts` (reader, model, kernels, pool),
-`llama_gguf.ts` (the program) and `llama_worker.ts` (the worker entry,
-`new Worker(new URL("./llama_worker.mjs", import.meta.url))`), because the
+(the four-row kernel), and the main spins on `C_DONE`. The program was split
+in three modules for this: the core (reader, model, kernels, pool; since
+the module move `lib/garnet/llama.ts`, "The modules" above), `llama_gguf.ts`
+(the program) and the worker entry (`lib/garnet/llama_worker.ts`, `new
+Worker(new URL("./llama_worker.ts", import.meta.url))`), because the
 exporter rejects a class method that captures an enclosing function's local
 once the program is also a worker module.
 
@@ -245,29 +280,65 @@ and copied); the products themselves run at the memory ceiling. The prompt
 (56 tokens/s, one token at a time) stays an order of magnitude behind
 llama.cpp's batched prefill.
 
-## Milestone 3: the GPU through Metal (planned, Kaz 2026-10-26)
+## Milestone 3: the GPU through Metal (done, 2026-10-27)
 
 llama.cpp's GPU path on macOS is Metal (`ggml-metal`: MSL kernels embedded
 in the binary, the weights shared through unified memory, simdgroup matrix
 products, and on the M5 the Metal 4 tensor API for the GPU's neural
 accelerators); on this machine it generates far beyond the CPU's bandwidth
-ceiling. The plan: a `garnet:metal` module over a host object
-`__garnet_metal` in the runtime (Objective-C, Metal.framework), with the
-device and a command queue, buffers over the model's pages without a copy
-(`newBufferWithBytesNoCopy` on page-aligned memory: the loader aligns the
-tensor data or maps the file), a library of MSL kernels compiled at startup
-(the Q8_0 and Q4_0 matrix-vector products with the block scales, a matrix
-product for the prefill, rmsnorm, softmax and rope so a layer runs without
-a round trip), and an encoder API so the TypeScript side batches a whole
-forward pass into one command buffer (one commit and one wait per token, as
-llama.cpp's graph does). The TypeScript program keeps the model, the KV
-cache and the sampling; only the kernels move. The oracle changes with it:
-the GPU's float accumulation is not in Node's order, so the differential
-test of the GPU path compares the greedy tokens and the logits within a
-tolerance, not bytes, while the CPU path keeps the byte-identical test. The
-target is llama.cpp's Metal numbers on the same model (`llama-bench`
-without `-ngl 0`), after the CPU path reaches its bandwidth ceiling with
-the threads.
+ceiling. garnet's is `garnet:llama_metal` over `garnet:metal`
+(`docs/metal_design.md`): the model's `SharedArrayBuffer` and the run state
+are GPU buffers without a copy, and a token is one command buffer of 222
+kernels (ten per layer, then the final norm and the vocabulary product),
+one commit and one wait, as llama.cpp's graph does. Per layer: RMSNorm; the
+q, k and v products (k and v straight into the caches at the position); RoPE
+on q and k; the attention over the heads (a threadgroup of 256 threads per
+head: the scores, the softmax by two threadgroup reductions, the weighted
+values); the output product added to the residual; RMSNorm; the gate and up
+products with SiLU as one kernel; the down product added to the residual.
+The token's embedding is written by the CPU before the commit and the
+sampling reads the logits after the wait; the TypeScript program keeps the
+model, the KV cache and the sampling, as planned.
+
+The products read the quantized rows as llama.cpp's Metal kernels do: a
+SIMD group per two rows (four SIMD groups per threadgroup), each lane a
+quarter of every eighth block (8 int8 weights and the block's f16 scale),
+the int8 or nibble weights times the float activation (no int8 quantization
+of the activation on the GPU, which is the main difference from the CPU
+path's arithmetic), the block scale per block, `simd_sum` at the end; the
+kernels take the weight's byte offset in the model buffer and an output
+offset as arguments, so one buffer binding serves every product. Fast math
+is off: the kernels' arithmetic is the text's. Measured on the M5 (32
+generated tokens, `--stats`):
+
+| path | tokens/s | per token |
+|---|---|---|
+| CPU, 1 thread | 24.7 | |
+| CPU, 8 threads | 72.6 | |
+| GPU | 101-106 | encode 0.05 ms, wait 9.9-10.0 ms |
+| llama.cpp CPU, 4 threads (Kaz, 2026-10-26) | 72.3 | |
+
+The GPU's 10 ms per token is the weights' 1.1 GB at 117 GB/s: a probe that
+dispatches only a token's 133 products runs them in 9.4 ms (117 GB/s), and a
+plain streaming read of the model file by the GPU reaches 124 GB/s, so the
+product kernels are at 94% of the device's read bandwidth and the other 89
+kernels and the round trip cost 0.6 ms. The threadgroup geometry (2 or 4 rows
+per SIMD group, 2, 4 or 8 SIMD groups per threadgroup) measured within the
+noise. The prompt is still one token at a time (102 tokens/s): a batched
+prefill (a matrix product over the prompt's tokens) is the next lever there.
+The target of a comparison is llama.cpp's own Metal number on this model
+(`llama-bench` without `-ngl 0`), which Kaz runs; this machine has no
+llama.cpp build the session could reach.
+
+The oracle: the GPU's float32 arithmetic is not the CPU's (float32 in the
+GPU's order against int8 activations and double block sums), so the
+differential test of the GPU path is `--check-gpu`: the prompt on the CPU,
+then on the GPU, the argmax compared per position and the last logits
+within a tolerance. TinyLlama's 51-token prompt: the argmax agrees at 51 of
+51 positions, the last logits differ by at most 0.25 over a logit range of
+16.6, the next token is the same, and the 32 generated tokens are the same
+text as the CPU path's. The CPU path keeps its byte-identical test against
+Node.
 
 ## Beyond
 

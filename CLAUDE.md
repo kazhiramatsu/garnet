@@ -46,9 +46,11 @@ Rust in §315; selfhost is kept as a performance metric).
   forbidden; no porting of new features).** Its roles are ① the flagship benchmark (a real-program load
   of 66k instructions) ② the byte-parity oracle during the mechanical-Rust-refactor phase.
 - `runtime/ts_rt.c` … The shared runtime. A primary development target.
-- `lib/garnet/` … garnet's own modules (`garnet:shared`, `garnet:json`): TypeScript compiled with the
-  program (the exporter maps `garnet:*` here); a `<name>_node.ts` beside one is the V8 oracle's polyfill
-  (`scripts/garnet_scheme_loader.mjs`). The runtime side is a `__garnet*` host object in ts_rt.c.
+- `lib/garnet/` … garnet's own modules (`garnet:shared`, `garnet:json`, `garnet:ndarray`, `garnet:metal`,
+  `garnet:llama`, `garnet:llama_metal`): TypeScript compiled with the program (the exporter maps `garnet:*`
+  here); a `<name>_node.ts` beside one is the V8 oracle's polyfill (`scripts/garnet_scheme_loader.mjs`).
+  The runtime side is a `__garnet*` host object in ts_rt.c (`runtime/node_host.c`, `runtime/metal_host.c`
+  are included at its end).
 - `lib/node/` … the Node.js modules (`node:path`, `node:fs`, ...; `docs/node_compat_design.md`): TypeScript
   compiled with the program over `runtime/node_host.c` (`__garnet_node`). Under the V8 oracle a `node:`
   import is Node itself, so every fixture in `tests/conformance/exhaustive/node/` is a differential test.

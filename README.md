@@ -471,6 +471,28 @@ concatenation, reductions, lazy `rows()`/`entries()` generators, and a seeded
 TypeScript compiled with your program, so its loops are the compiled loops of
 the section above; a shape mismatch throws a `DimensionError`.
 
+The GPU: `import { Library, GpuBuffer, CommandBuffer } from "garnet:metal"`
+compiles Metal Shading Language kernels at run time and runs them over the
+program's `SharedArrayBuffer`s without a copy (`docs/metal_design.md`): a
+`CommandBuffer` encodes any number of dispatches for one commit and one wait,
+and the results are in the program's typed arrays when `wait()` returns. The
+runtime loads Metal on the first use, so nothing is linked and a program that
+does not use it pays nothing; under Node.js (or without Metal) `available()`
+is false and the classes throw. Wrong arguments are rejected before any Metal
+call, and a failed command buffer or a kernel that does not compile throws
+with the system's message.
+
+Language models: `garnet:llama` runs a llama-architecture model from a
+llama.cpp GGUF file (`docs/llm_inference_design.md`): the reader, the F32,
+F16, Q8_0 and Q4_0 tensors, the SentencePiece tokenizer in the file, the
+forward pass, a sampler, and a thread pool over `node:worker_threads`;
+`garnet:llama_metal` runs the same model on the GPU through `garnet:metal`,
+one command buffer per token. TinyLlama-1.1B-Chat Q8_0 on an M5 generates
+24 tokens/s on one CPU thread, 72 on eight (llama.cpp's CPU path: 65 and 72)
+and 101-106 on the GPU, from TypeScript (`benchmarks/llama2/llama_gguf.ts`,
+`benchmarks/llama2/run_gguf.sh` compares the CPU path's text with Node.js
+byte for byte and the GPU's logits with the CPU's).
+
 Not available yet: `Intl` and the locale methods (`toLocaleString`,
 `localeCompare`), `DataView`, `WeakRef` and `FinalizationRegistry`, the Set
 algebra methods (`union` and the others), `Date` parsing and setters, and the

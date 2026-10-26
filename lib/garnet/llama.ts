@@ -1,22 +1,25 @@
-// llama_core.ts: inference of a llama-architecture model from a llama.cpp GGUF file, in
-// TypeScript (docs/llm_inference_design.md, milestone 2). Reads GGUF v2/v3 (the metadata, the
-// tensor infos, the data section), the quantizations F32, F16 and Q8_0 (Q4_0 for the weights of
-// the smaller files), the SentencePiece-style BPE of the vocabulary in the file, and runs the
-// llama forward pass with grouped-query attention, RoPE, RMSNorm and SwiGLU, greedy sampling by
-// default. The Q8_0 matrix-vector product quantizes the activation to int8 per block of 32 as
-// llama.cpp does, so a block's dot product is an integer sum of 32 int8 products (`| 0`
-// arithmetic, exact in int32, which the C compiler may vectorize), scaled by the two block
+// garnet:llama — inference of a llama-architecture model from a llama.cpp GGUF file, in
+// TypeScript (docs/llm_inference_design.md). Reads GGUF v2/v3 (the metadata, the tensor infos,
+// the data section), the quantizations F32, F16 and Q8_0 (Q4_0 for the weights of the smaller
+// files), the SentencePiece-style BPE of the vocabulary in the file, and runs the llama forward
+// pass with grouped-query attention, RoPE, RMSNorm and SwiGLU; a Sampler draws the next token
+// (greedy at temperature 0). The Q8_0 matrix-vector product quantizes the activation to int8 per
+// block of 32 as llama.cpp does, so a block's dot product is an integer sum of 32 int8 products
+// (`| 0` arithmetic, exact in int32, which the C compiler vectorizes), scaled by the two block
 // scales. The u64 fields of the format are read as two u32 words into a double (no bigint).
 //
-// The core: llama_gguf.ts is the program, llama_worker.ts the worker's entry (a module of its own,
-// because the module that contains a `new Worker(import.meta.url)` is compiled as the worker's
-// entry function, and the classes here would then capture its locals). With -j N the
-// matrix-vector products are split over N threads: N - 1 workers (node:worker_threads; under
-// garnet a fork of the loaded program, which therefore shares the model's pages and this module's
-// state) take the job from a SharedArrayBuffer protocol (the job's generation, tensor, row cursor
-// and done count read and written with Atomics; the quantized activation and the result in
-// shared arrays), each thread grabbing the next block of rows until none are left.
-import { readFileSync } from "node:fs";
+// Threads: startPool(n, llama, path) splits the matrix-vector products, the attention and the
+// feed-forward over n threads: n - 1 workers (node:worker_threads; under garnet a fork of the
+// loaded program, which shares the model's pages and this module's state; under Node a fresh
+// isolate over the model's SharedArrayBuffer when the file was read into one, else a reader of
+// its own) take the job from a SharedArrayBuffer protocol (the job's generation, tensor, row
+// cursor and done count read and written with Atomics; the quantized activation and the result
+// in shared arrays), each thread grabbing the next block of rows until none are left. The run
+// state (the activations, the KV cache, the logits) lives in SharedArrayBuffers, so the pooled
+// jobs and the GPU path (garnet:llama_metal, llama_metal.ts over garnet:metal, set as `gpu`)
+// read and write it in place. The worker's entry is llama_worker.ts; the program is
+// benchmarks/llama2/llama_gguf.ts.
+import { readFileSync, openSync, readSync, closeSync, fstatSync } from "node:fs";
 import { Worker } from "node:worker_threads";
 import { performance } from "node:perf_hooks";
 /** the main thread's time in the pooled products, for --stats: the preparation (quantizing and
@@ -24,9 +27,11 @@ import { performance } from "node:perf_hooks";
 export const poolStats = { jobs: 0, prep: 0, own: 0, wait: 0, post: 0 };
 
 // ---------------------------------------------------------------- GGUF
-const GGML_F32 = 0, GGML_F16 = 1, GGML_Q4_0 = 2, GGML_Q8_0 = 8;
-interface TensorInfo { name: string; dims: number[]; type: number; offset: number }
-interface Gguf { kv: Map<string, unknown>; tensors: Map<string, TensorInfo>; data: number; bytes: Uint8Array }
+/** the ggml type ids of the tensors read here */
+export const GGML_F32 = 0, GGML_F16 = 1, GGML_Q4_0 = 2, GGML_Q8_0 = 8;
+export interface TensorInfo { name: string; dims: number[]; type: number; offset: number }
+/** the file: its metadata, tensor infos, data offset and bytes (`shared` when they are a SharedArrayBuffer) */
+export interface Gguf { kv: Map<string, unknown>; tensors: Map<string, TensorInfo>; data: number; bytes: Uint8Array; shared: SharedArrayBuffer | null }
 
 class Reader {
   pos = 0;
@@ -68,12 +73,31 @@ class Reader {
     }
   }
 }
-export function readGguf(path: string): Gguf {
-  const file = readFileSync(path);
-  // the file's buffer viewed in place; the tensor data is aligned in the file, so the view's
-  // own offset must keep that alignment (a copy otherwise)
-  let bytes: Uint8Array = file;
-  if (file.byteOffset % 32 !== 0) { bytes = new Uint8Array(file.length); bytes.set(file); }
+/** The file's bytes: in a SharedArrayBuffer when `shared` (the GPU path and Node's workers read
+ *  them in place; 64 MB reads into the mapped pages), else as readFileSync gives them. */
+export function readGguf(path: string, shared: boolean = false): Gguf {
+  let bytes: Uint8Array;
+  if (shared) {
+    const fd = openSync(path, "r");
+    const size = fstatSync(fd).size;
+    bytes = new Uint8Array(new SharedArrayBuffer(size));
+    for (let off = 0; off < size;) {
+      const n = readSync(fd, bytes, off, Math.min(size - off, 64 * 1024 * 1024), off);
+      if (n <= 0) throw new Error(`gguf: short read of ${path}`);
+      off += n;
+    }
+    closeSync(fd);
+  } else {
+    const file = readFileSync(path);
+    // the file's buffer viewed in place; the tensor data is aligned in the file, so the view's
+    // own offset must keep that alignment (a copy otherwise)
+    bytes = file;
+    if (file.byteOffset % 32 !== 0) { bytes = new Uint8Array(file.length); bytes.set(file); }
+  }
+  return parseGguf(bytes);
+}
+/** The GGUF structure of `bytes` (a file's contents, or a worker's view of the shared ones). */
+export function parseGguf(bytes: Uint8Array): Gguf {
   const r = new Reader(bytes);
   const magic = r.u32();
   if (magic !== 0x46554747) throw new Error("not a GGUF file");
@@ -98,7 +122,7 @@ export function readGguf(path: string): Gguf {
   }
   const alignment = (kv.get("general.alignment") as number | undefined) ?? 32;
   const data = Math.ceil(r.pos / alignment) * alignment;
-  return { kv, tensors, data, bytes };
+  return { kv, tensors, data, bytes, shared: bytes.buffer instanceof SharedArrayBuffer ? bytes.buffer : null };
 }
 
 // ---------------------------------------------------------------- the tensors
@@ -117,7 +141,7 @@ for (let i = 0; i < 65536; i++) F16[i] = f16ToF64(i);
  *  tensor's own bytes (a tensor is below 2^31 bytes, so every index into them is an int32, which keeps
  *  the kernels' loads on the inline path; the file offset itself may not be). An interface, not a
  *  class: the worker rewrite keeps interfaces at the module's top level with the other types. */
-interface Weight {
+export interface Weight {
   readonly name: string; readonly type: number; readonly rows: number; readonly cols: number; readonly byteOff: number;
   readonly bytes: Uint8Array; readonly quants: Int8Array; readonly f32: Float32Array;
   /** each block's f16 scale as a float (`rows * (cols >> 5)` entries for the quantized types, one
@@ -414,12 +438,14 @@ function matvecRows(m: Model, w: Weight, lo: number, hi: number, xq: Int8Array, 
   else if (w.type === GGML_Q4_0) matvecQ4Rows(m, w, lo, hi, xq, xs, out, oo);
   else matvecFloatRows(m, w, lo, hi, xf, out, oo);
 }
-export interface WorkerData { ctrl: SharedArrayBuffer; xq: SharedArrayBuffer; xs: SharedArrayBuffer; xf: SharedArrayBuffer; out: SharedArrayBuffer; state: LlamaState; index: number; n: number; path: string }
+/** what a worker starts with: the protocol's buffers, the run state, the model's shared bytes
+ *  (null when the file was not read into a SharedArrayBuffer: a Node worker reads it then) */
+export interface WorkerData { ctrl: SharedArrayBuffer; xq: SharedArrayBuffer; xs: SharedArrayBuffer; xf: SharedArrayBuffer; out: SharedArrayBuffer; state: LlamaState; model: SharedArrayBuffer | null; ctx: number; index: number; n: number; path: string }
 export function workerLoop(data: WorkerData): void {
   const ctrl = new Int32Array(data.ctrl), xq = new Int8Array(data.xq), xs = new Float32Array(data.xs), xf = new Float32Array(data.xf), out = new Float32Array(data.out);
-  if (llamaShared === null) {   // Node: a fresh isolate loads the model itself, over the main thread's run state; garnet's fork has both
-    const g = readGguf(data.path);
-    llamaShared = new Llama(new Model(g), 2048, data.state);
+  if (llamaShared === null) {   // Node: a fresh isolate builds its model over the shared bytes (or reads the file), over the main thread's run state; garnet's fork has both
+    const g = data.model !== null ? parseGguf(new Uint8Array(data.model)) : readGguf(data.path);
+    llamaShared = new Llama(new Model(g), data.ctx, data.state);
   }
   const lm = llamaShared;
   scratch(out.length);
@@ -437,7 +463,9 @@ export function workerLoop(data: WorkerData): void {
     Atomics.add(ctrl, C_DONE, 1);
   }
 }
-export function startPool(n: number, path: string, maxCols: number, maxRows: number, state: LlamaState): Pool {
+/** n - 1 workers over the model `lm` was built from (`path` for a Node worker that must read it). */
+export function startPool(n: number, lm: Llama, path: string): Pool {
+  const maxCols = Math.max(lm.nEmbd, lm.nFf), maxRows = Math.max(lm.vocab, lm.nFf, lm.nEmbd), state = lm.state;
   const ctrl = new Int32Array(new SharedArrayBuffer(16 * 4));
   const xq = new Int8Array(new SharedArrayBuffer(maxCols));
   const xs = new Float32Array(new SharedArrayBuffer((maxCols >> 5) * 4));
@@ -447,8 +475,8 @@ export function startPool(n: number, path: string, maxCols: number, maxRows: num
   Atomics.store(ctrl, C_WORKERS, n - 1);
   const workers: Worker[] = [];
   for (let i = 1; i < n; i++) {
-    const data: WorkerData = { ctrl: ctrl.buffer as SharedArrayBuffer, xq: xq.buffer as SharedArrayBuffer, xs: xs.buffer as SharedArrayBuffer, xf: xf.buffer as SharedArrayBuffer, out: out.buffer as SharedArrayBuffer, state, index: i, n, path };
-    workers.push(new Worker(new URL("./llama_worker.mjs", import.meta.url), { workerData: data }));
+    const data: WorkerData = { ctrl: ctrl.buffer as SharedArrayBuffer, xq: xq.buffer as SharedArrayBuffer, xs: xs.buffer as SharedArrayBuffer, xf: xf.buffer as SharedArrayBuffer, out: out.buffer as SharedArrayBuffer, state, model: lm.m.g.shared, ctx: lm.ctx, index: i, n, path };
+    workers.push(new Worker(new URL("./llama_worker.ts", import.meta.url), { workerData: data }));
   }
   return { ctrl, xq, xs, xf, out, workers, n };
 }
@@ -507,7 +535,7 @@ export function stopPool(p: Pool): void {
 }
 
 // ---------------------------------------------------------------- the model
-interface Layer { attnNorm: Float32Array; wq: Weight; wk: Weight; wv: Weight; wo: Weight; ffnNorm: Float32Array; w1: Weight; w2: Weight; w3: Weight }
+export interface Layer { attnNorm: Float32Array; wq: Weight; wk: Weight; wv: Weight; wo: Weight; ffnNorm: Float32Array; w1: Weight; w2: Weight; w3: Weight }
 /** The run state a pooled attention job reads and writes, in shared memory: a worker under Node
  *  builds its model over the main thread's buffers (garnet's fork inherits them). */
 export interface LlamaState { q: SharedArrayBuffer; att: SharedArrayBuffer; xb: SharedArrayBuffer; keyCache: SharedArrayBuffer; valueCache: SharedArrayBuffer }
@@ -535,8 +563,12 @@ function attentionHeads(lm: Llama, l: number, pos: number, h0: number, h1: numbe
     }
   }
 }
+/** A forward pass on another device (garnet:llama_metal): logits for `token` at `pos`. */
+export interface Forward { forward(token: number, pos: number): Float32Array }
 export class Llama {
   readonly m: Model;
+  /** the device that runs forward() when set (the CPU path otherwise) */
+  gpu: Forward | null = null;
   readonly nEmbd: number; readonly nLayer: number; readonly nFf: number; readonly nHead: number; readonly nHeadKv: number;
   readonly headSize: number; readonly kvDim: number; readonly kvMul: number; readonly ctx: number; readonly vocab: number;
   readonly eps: number; readonly ropeBase: number;
@@ -580,9 +612,9 @@ export class Llama {
     const sab = (n: number): SharedArrayBuffer => new SharedArrayBuffer(n * 4);
     const cache = this.nLayer * this.ctx * this.kvDim;
     this.state = state !== null ? state : { q: sab(d), att: sab(this.nHead * this.ctx), xb: sab(d), keyCache: sab(cache), valueCache: sab(cache) };
-    this.x = new Float32Array(d); this.xb = new Float32Array(this.state.xb); this.xb2 = new Float32Array(d);
-    this.hb = new Float32Array(ff); this.hb2 = new Float32Array(ff);
-    this.q = new Float32Array(this.state.q); this.att = new Float32Array(this.state.att); this.logits = new Float32Array(this.vocab);
+    this.x = new Float32Array(sab(d)); this.xb = new Float32Array(this.state.xb); this.xb2 = new Float32Array(sab(d));
+    this.hb = new Float32Array(sab(ff)); this.hb2 = new Float32Array(sab(ff));
+    this.q = new Float32Array(this.state.q); this.att = new Float32Array(this.state.att); this.logits = new Float32Array(sab(this.vocab));
     this.xq = new Int8Array(d); this.xs = new Float32Array(d >> 5); this.hq = new Int8Array(ff); this.hs = new Float32Array(ff >> 5);
     this.keyCache = new Float32Array(this.state.keyCache);
     this.valueCache = new Float32Array(this.state.valueCache);
@@ -606,6 +638,7 @@ export class Llama {
     else matvecFloat(this.m, w, x, out);
   }
   forward(token: number, pos: number): Float32Array {
+    if (this.gpu !== null) return this.gpu.forward(token, pos);
     const d = this.nEmbd | 0, ff = this.nFf | 0, kvDim = this.kvDim | 0, kvMul = this.kvMul | 0, hs = this.headSize | 0, ctx = this.ctx | 0, nHead = this.nHead | 0;
     const x = this.x, xb = this.xb, xb2 = this.xb2, hb = this.hb, hb2 = this.hb2, q = this.q, kc = this.keyCache, vc = this.valueCache;
     const xq = this.xq, xs = this.xs, hq = this.hq, hsc = this.hs;
@@ -716,3 +749,21 @@ export class Tokenizer {
   }
 }
 
+// ---------------------------------------------------------------- sampling
+/** The next token from the logits: the argmax at temperature 0, else a draw from the softmax of
+ *  the scaled logits with a seeded xorshift generator (the same draws in both engines). */
+export class Sampler {
+  private state: number;
+  constructor(readonly temperature: number, seed: number) { this.state = (seed | 0) || 1; }
+  private next(): number { let s = this.state; s ^= s << 13; s ^= s >>> 17; s ^= s << 5; this.state = s; return (s >>> 0) / 4294967296; }
+  sample(logits: Float32Array): number {
+    const n = logits.length;
+    if (this.temperature === 0) { let best = 0; for (let i = 1; i < n; i++) if (logits[i] > logits[best]) best = i; return best; }
+    for (let i = 0; i < n; i++) logits[i] = logits[i] / this.temperature;
+    softmax(logits, 0, n);
+    const coin = this.next();
+    let cdf = 0;
+    for (let i = 0; i < n; i++) { cdf += logits[i]; if (coin < cdf) return i; }
+    return n - 1;
+  }
+}
