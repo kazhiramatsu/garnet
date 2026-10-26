@@ -147,11 +147,11 @@ class Model {
       for (let i = 0; i < n; i++) out[i] = f[base + i];
     } else if (w.type === GGML_F16) {
       const u = w.bytes;
-      let p = r * n * 2;
+      let p = Math.imul(r, n * 2);
       for (let i = 0; i < n; i++) { out[i] = F16[u[p] | (u[p + 1] << 8)]; p += 2; }
     } else if (w.type === GGML_Q8_0) {
       const u = w.bytes, q = w.quants;
-      let p = r * (n >> 5) * 34;
+      let p = Math.imul(r, (n >> 5) * 34);
       for (let b = 0; b < n; b += 32) {
         const d = F16[u[p] | (u[p + 1] << 8)];
         for (let j = 0; j < 32; j++) out[b + j] = d * q[p + 2 + j];
@@ -159,7 +159,7 @@ class Model {
       }
     } else {
       const u = w.bytes;
-      let p = r * (n >> 5) * 18;
+      let p = Math.imul(r, (n >> 5) * 18);
       for (let b = 0; b < n; b += 32) {
         const d = F16[u[p] | (u[p + 1] << 8)];
         for (let j = 0; j < 16; j++) { const byte = u[p + 2 + j]; out[b + j] = d * ((byte & 15) - 8); out[b + j + 16] = d * ((byte >> 4) - 8); }
@@ -188,7 +188,7 @@ function matvecQ8(m: Model, w: Weight, xq: Int8Array, xs: Float32Array, out: Flo
   const rowBytes = nb * 34;
   for (let r = 0; r < rows; r++) {
     let s = 0;
-    let p = r * rowBytes;
+    let p = Math.imul(r, rowBytes);        // an int32 row offset (a tensor is below 2^31 bytes)
     for (let b = 0; b < nb; b++) {
       const qb = p + 2, xb = b << 5;
       let isum = 0;
@@ -209,7 +209,7 @@ function matvecQ4(m: Model, w: Weight, xq: Int8Array, xs: Float32Array, out: Flo
   const rowBytes = nb * 18;
   for (let r = 0; r < rows; r++) {
     let s = 0;
-    let p = r * rowBytes;
+    let p = Math.imul(r, rowBytes);
     for (let b = 0; b < nb; b++) {
       const qb = p + 2, xb = b << 5;
       let isum = 0;
@@ -230,7 +230,7 @@ function matvecFloat(m: Model, w: Weight, x: Float32Array, out: Float32Array): v
   if (w.type === GGML_F32) {
     const f = w.f32;
     for (let r = 0; r < rows; r++) {
-      const base = r * n;
+      const base = Math.imul(r, n);
       let s0 = 0, s1 = 0, s2 = 0, s3 = 0;
       for (let j = 0; j < n; j += 4) { s0 += f[base + j] * x[j]; s1 += f[base + j + 1] * x[j + 1]; s2 += f[base + j + 2] * x[j + 2]; s3 += f[base + j + 3] * x[j + 3]; }
       out[r] = (s0 + s1) + (s2 + s3);
@@ -238,7 +238,7 @@ function matvecFloat(m: Model, w: Weight, x: Float32Array, out: Float32Array): v
   } else {
     const u = w.bytes;
     for (let r = 0; r < rows; r++) {
-      let p = r * n * 2;
+      let p = Math.imul(r, n * 2);
       let s = 0;
       for (let j = 0; j < n; j++) { s += F16[u[p] | (u[p + 1] << 8)] * x[j]; p += 2; }
       out[r] = s;

@@ -24377,6 +24377,10 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         );
                     }
                     ">>" => {
+                        // the branchless select, not C's `>>` on an int32 (implementation-
+                        // defined, though arithmetic everywhere): measured on the Q8_0 dot
+                        // product of the llama program, clang 21 vectorizes this form
+                        // (and/bic/cmlt per lane) and runs 4.3 tokens/s, the plain shift 2.8
                         let _ = writeln!(
                             s,
                             "  {{ uint32_t {t}l = (uint32_t)d{l}; uint32_t {t}s = (uint32_t)d{r} & 31u; uint32_t {t} = ({t}l & 0x80000000u) ? ~(~{t}l >> {t}s) : ({t}l >> {t}s); d{d} = {sx}; }}",

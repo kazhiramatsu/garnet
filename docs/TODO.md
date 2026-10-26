@@ -10335,3 +10335,18 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   `long long`. Fixture `numbers/small_int_products` (plain, strict, GC
   protect). Next: emit a `| 0`-terminated chain in int32 so the C compiler
   vectorizes it with 32-bit lanes.
+- TinyLlama Q8_0 kernel follow-ups (Session 353): a sampling profile of the
+  native program (98.9% in `matvecQ8`) showed the actual multiply-accumulates
+  (`mla.4s`) at 16% of the samples, the sign-extension's branchless select
+  (`and/bic/cmlt` per lane) at about a quarter, double conversions and the
+  per-block guard setup for the rest. Two experiments, measured as C-level
+  variants of the generated program (a `TSAOT_CC` wrapper rewriting the C):
+  emitting `>>` as C's arithmetic shift on an int32 instead of the select
+  made the loop slower, 4.3 -> 2.8 tokens/s (clang 21 vectorizes the select
+  form better here), so the select stays, with the measurement noted at the
+  emission site; removing the double round trip after `<<` (`(double)(int32)
+  ... << k` assigned to a long long) changed nothing. The kernel's row offsets
+  are `Math.imul(r, rowBytes)` (an int32 by definition, where `r * rowBytes`
+  had no provable bound and stayed a double, sending the f16 scale loads down
+  the slow path): 3.7 -> 4.3 tokens/s on a quiet machine, Node 2.1, outputs
+  identical over 48 generated tokens.
