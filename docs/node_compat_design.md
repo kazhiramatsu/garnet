@@ -400,7 +400,12 @@ stress, bench); the tsc-ts benchmark is unaffected until N5.
   samples: more `publish_visit`, conservative stack-scan and remembered-set
   work, no library function above a few samples); the candidates are the
   14-number array `host.stat` returns per call and the directory listing's
-  arrays. `util.inherits` with a garnet class's prototype is a TypeError.
+  arrays (a per-symbol profile of the shim build against the library build,
+  N5c: the growth is spread over the string runtime, no symbol above 0.05%
+  of the samples; not pursued). `util.inherits` with a garnet class's
+  prototype is a TypeError. `Stats.atime`/`mtime`/`ctime`/`birthtime` are
+  getters making a Date per read (Node caches the Date: `s.mtime === s.mtime`
+  there, not here; a cache would add four slots to every stat).
 
 ## As built, N5b (Session 353): worker_threads over the fork workers
 

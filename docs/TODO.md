@@ -10055,3 +10055,24 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   and `worker_dynamic` (reject). Lesson recorded in agent_workflow: a test
   that forks runs under a process cap and a time limit (a wrong
   `isMainThread` forked 4,000 processes).
+- N5c: two deferred conformance gaps closed, both loud rejects before (a
+  TypeError and a ReferenceError at run time, no silent value).
+  `String.prototype[Symbol.iterator]` is a method now (the code points, as
+  for-of and spread see them; `"ab"[Symbol.iterator]().next()`,
+  `String.prototype[Symbol.iterator].call(s)`), and a symbol-keyed read on a
+  string or number primitive goes through its prototype (`ts_get_symkey`
+  returned undefined for every non-object receiver, so `s[Symbol.iterator]`
+  on a `string`-typed value was undefined even once the method existed).
+  `encodeURIComponent`, `decodeURIComponent`, `encodeURI` and `decodeURI` as
+  values (`.map(encodeURIComponent)`, `typeof`, identity): the emitter sets
+  them up as the global object's functions with their value adapters for a
+  program whose IR names one as a value (`globalref.<name>`; a call lowers
+  directly as before), so other programs' output is unchanged (parity: the
+  frozen emitter never set them up, one allowlist line each for parity and
+  selfconf of the new fixture). Fixtures `stdlib/uri_functions_as_values`,
+  `strings/string_iterator_method` (plain + strict). Measured and not
+  pursued: the 2.1% of tsc-ts instructions on lib/node against the shim
+  build (`prof_diff`, per symbol over the parse and check workers) is spread
+  over the string runtime, no symbol above 0.05% of the samples. Noted:
+  `Stats` dates are getters without a cache (`s.mtime === s.mtime` is false;
+  Node caches), kept for the stat on the compiler's hot path.

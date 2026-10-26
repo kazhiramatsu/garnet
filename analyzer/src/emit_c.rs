@@ -1025,6 +1025,11 @@ fn emit_program_with_string_plans(
             }
             builtins.insert(b);
         }
+        if program_needs_uri_fn_values(program) {
+            for b in ["global.encodeURIComponent", "global.decodeURIComponent", "global.encodeURI", "global.decodeURI"] {
+                builtins.insert(b);
+            }
+        }
         for b in &builtins {
             if let Some(body) = fnval_adapter_body(b) {
                 let _ = writeln!(
@@ -1036,7 +1041,7 @@ fn emit_program_with_string_plans(
             }
         }
     }
-    emit_global_setup(&mut s, needs_fetch, needs_typed_array_globals);
+    emit_global_setup(&mut s, needs_fetch, needs_typed_array_globals, program_needs_uri_fn_values(program));
 
     let empty_param_facts: BTreeMap<u32, NumFact> = BTreeMap::new();
     for f in &program.functions {
@@ -13273,8 +13278,57 @@ fn fnval_adapter_body(builtin: &str) -> Option<String> {
         "symbol.keyFor" => hv(format!("ts_symbol_key_for({})", val(0))),
         // ---- Date statics ----
         "date.now" => Some("return ts_date_now_ms();".to_string()),
+        // ---- the URI functions as values (a program that names one; calls lower directly) ----
+        "global.encodeURIComponent" => hv(format!("ts_encode_uri_component({})", val(0))),
+        "global.decodeURIComponent" => hv(format!("ts_decode_uri_component({})", val(0))),
+        "global.encodeURI" => hv(format!("ts_encode_uri({})", val(0))),
+        "global.decodeURI" => hv(format!("ts_decode_uri({})", val(0))),
         _ => None,
     }
+}
+
+/// The URI functions are set up as global values, with their adapters, only
+/// for a program that names one as a value (`globalref.encodeURIComponent`,
+/// a bare read of the ambient global): a call lowers to the runtime directly,
+/// and a program without the read keeps its output (the parity oracle).
+const URI_FN_VALUE_NAMES: [&str; 4] = ["encodeURIComponent", "decodeURIComponent", "encodeURI", "decodeURI"];
+fn builtin_needs_uri_fn_values(builtin: &str) -> bool {
+    match builtin.split_once('.') {
+        Some((prefix, name)) => prefix != "global" && URI_FN_VALUE_NAMES.contains(&name),
+        None => false,
+    }
+}
+fn body_needs_uri_fn_values(body: &[Inst]) -> bool {
+    body.iter().any(inst_needs_uri_fn_values)
+}
+fn inst_needs_uri_fn_values(inst: &Inst) -> bool {
+    match inst {
+        Inst::LoadBuiltinFn { builtin, .. }
+        | Inst::CallBuiltin { builtin, .. }
+        | Inst::CallBuiltinStatic { builtin, .. } => builtin_needs_uri_fn_values(builtin),
+        Inst::Loop {
+            cond_body, body, ..
+        } => body_needs_uri_fn_values(cond_body) || body_needs_uri_fn_values(body),
+        Inst::If {
+            then_body,
+            else_body,
+            ..
+        } => body_needs_uri_fn_values(then_body) || body_needs_uri_fn_values(else_body),
+        Inst::TryCatch {
+            try_body,
+            catch_body,
+            finally_body,
+            ..
+        } => {
+            body_needs_uri_fn_values(try_body)
+                || body_needs_uri_fn_values(catch_body)
+                || body_needs_uri_fn_values(finally_body)
+        }
+        _ => false,
+    }
+}
+fn program_needs_uri_fn_values(program: &Program) -> bool {
+    program.functions.iter().any(|f| body_needs_uri_fn_values(&f.body))
 }
 
 fn global_fn_value_builtins() -> &'static [&'static str] {
@@ -13393,7 +13447,7 @@ fn global_fn_value_builtins() -> &'static [&'static str] {
     ]
 }
 
-fn emit_global_setup(s: &mut String, needs_fetch: bool, needs_typed_array_globals: bool) {
+fn emit_global_setup(s: &mut String, needs_fetch: bool, needs_typed_array_globals: bool, needs_uri_fn_values: bool) {
     fn cstr(v: &str) -> String {
         format!("{:?}", v)
     }
@@ -13846,6 +13900,11 @@ fn emit_global_setup(s: &mut String, needs_fetch: bool, needs_typed_array_global
         "  ts_global_set(\"isNaN\", ts_make_global_fn(ts_fnval_global_isNaN, 1u, \"isNaN\", 0));\n",
     );
     s.push_str("  ts_global_set(\"isFinite\", ts_make_global_fn(ts_fnval_global_isFinite, 1u, \"isFinite\", 0));\n");
+    if needs_uri_fn_values {
+        for name in URI_FN_VALUE_NAMES {
+            let _ = writeln!(s, "  ts_global_set({:?}, ts_make_global_fn(ts_fnval_global_{}, 1u, {:?}, 0));", name, name, name);
+        }
+    }
     if needs_fetch {
         s.push_str(
             "  ts_global_set(\"fetch\", ts_make_global_fn(ts_fnval_global_fetch, 1u, \"fetch\", 0));\n",

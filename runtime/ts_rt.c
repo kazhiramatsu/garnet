@@ -4919,7 +4919,9 @@ void ts_set_symkey(tsv obj, tsv sym, tsv val){
   ts_set(obj, ts_symbol_key(sym), val);
 }
 tsv ts_get_symkey(tsv obj, tsv sym){
-  if (!ts_is_propbag(obj) || !ts_is_symbol(sym)) return TS_UNDEFINED;
+  if (!ts_is_symbol(sym)) return TS_UNDEFINED;
+  /* a string or number primitive reads through its prototype ("ab"[Symbol.iterator]), as ts_get does */
+  if (!ts_is_propbag(obj) && !ts_is_str(obj) && !ts_is_num(obj)) return TS_UNDEFINED;
   return ts_get(obj, ts_symbol_key(sym));
 }
 
@@ -16055,12 +16057,23 @@ tsv ts_strproto_replace(tsv* a, int n){ return ts_str_replace(a[0], n>1?a[1]:TS_
 tsv ts_strproto_replaceAll(tsv* a, int n){ return ts_str_replace(a[0], n>1?a[1]:TS_UNDEFINED, n>2?a[2]:TS_UNDEFINED, 1); }
 
 tsv ts_string_proto(void){ return ts_proto_ref(g_string_proto_v) ? g_string_proto_v : TS_NULL; }
+/* String.prototype[Symbol.iterator]: the string's code points, as for-of and spread see them
+   (ts_iter_acquire's string case; it does not consult this method, so there is no cycle). */
+static tsv ts_string_iterator(tsv* a, int n){
+  (void)n;
+  if (!ts_is_str(a[0])) ts_throw_type_error_msg("String.prototype[Symbol.iterator] requires that 'this' be a String");
+  return ts_iter_acquire(a[0], 0);
+}
 void ts_string_proto_init(void){
   if (ts_proto_ref(g_string_proto_v)) return;
   static int rooted = 0;
   g_string_proto_v = ts_new_proto();
   ts_root_static_once(&g_string_proto_v, &rooted);
   ((ts_object*)ts_ptr(g_string_proto_v))->proto = g_object_proto_v;  /* chain to Object.prototype */
+  tsv iterator = ts_make_fn_t(ts_string_iterator, NULL, 0, 1); ts_gc_root(&iterator);
+  ts_set_fn_meta(iterator, 0, "[Symbol.iterator]");
+  ts_define_data(g_string_proto_v, TS_KEY_WKSYM(TS_WKSYM_ITERATOR), iterator, 0, 1, 1);
+  ts_gc_unroot(1);
 }
 void ts_string_proto_register(ts_key method_key, const char* name, ts_code fn){
   if (!ts_proto_ref(g_string_proto_v)) ts_string_proto_init();

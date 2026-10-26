@@ -40,6 +40,10 @@ Number: isInteger isFinite isNaN isSafeInteger parseFloat parseInt, Number(x)
         coercion, constants MAX_SAFE_INTEGER MIN_SAFE_INTEGER MAX_VALUE MIN_VALUE
         EPSILON.  Global parseInt / parseFloat / isNaN / isFinite.
         Global encodeURIComponent / decodeURIComponent / encodeURI / decodeURI (URIError on malformed input).
+        The four also as values (`["a b"].map(encodeURIComponent)`, `typeof encodeURIComponent`): the global
+        object's functions, set up for a program that names one as a value (Session 353).
+        String.prototype[Symbol.iterator] as a method (`"ab"[Symbol.iterator]()`, the code points), and a
+        symbol-keyed read on a string or number primitive through its prototype (Session 353).
         Number.prototype toString, toFixed, toPrecision, valueOf.
 String static: fromCharCode, fromCodePoint.
 Date:   new Date(), new Date(epochMs), component constructor, Date.now(),
