@@ -80,6 +80,20 @@ V8 cannot; that is the lever for llama.cpp-class speed without native code.
 Memory: the Q8_0 file is 1.17 GB; `readFileSync` into a Buffer whose
 ArrayBuffer is viewed in place (no copy), later a host `mmap`.
 
+Where the single-thread time goes (a `sample` of the native run): 97% in
+the Q8_0 kernel, the rest in the activation quantization, `exp`, softmax
+and rmsnorm. In the kernel the 17-instruction `sdot` loop (16 weights of
+four rows per iteration) is the smaller part of each block: the prefix
+loop's clamps (five views, four of them at offsets that move 34 bytes per
+block) and the scale code around it are the larger. The scale code shrank
+first: a block's scale was two bytes of the weight (each load bounds-checked)
+and an entry of the 65,536-entry f16 table; the weight now carries `scales`,
+each block's scale as a float, one pass at load (4 bytes per 32 weights,
+137 MB for TinyLlama), and the kernel reads one float per block per row:
+11.7 -> 14.8 tokens/s on one thread. The clamps are next: the inner loop's
+bound checks hoisted out of the block loop through the offsets' induction
+variables, in the emitter.
+
 Sampling greedy for the differential test, temperature and top-p after;
 a key/value cache of `context_length` positions per layer in Float32Array.
 
@@ -113,9 +127,12 @@ run_gguf.sh [threads]`):
 
 | threads | garnet tok/s | Node tok/s |
 |---|---|---|
-| 1 | 11.0 | 3.3 |
-| 2 | 20.1 | 6.2 |
-| 4 | 33.4 | 10.2 |
+| 1 | 14.8 | 3.3 |
+| 2 | 26.2 | 6.4 |
+| 4 | 43.4 | 11.1 |
+
+(With the block scales precomputed as floats; before that 11.0, 20.1 and
+33.4 on one, two and four threads.)
 
 The scaling is bounded by memory bandwidth (the Q8_0 weights are read once
 per token: 1.1 GB per token) and by the synchronization of about 150 jobs per

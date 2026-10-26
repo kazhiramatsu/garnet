@@ -10432,3 +10432,15 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   608/608 plain and strict and 605/605 under GC protect, GC stress, bench
   within budget; tsc-ts output identical, instructions 1.0011 of the previous
   slice.
+- TinyLlama: each block's scale as a float at load (Session 353,
+  `docs/llm_inference_design.md`). A `sample` of the single-thread run puts
+  97% of the time in the Q8_0 kernel; in its block loop the 17-instruction
+  `sdot` loop is the smaller part, the prefix loop's clamps and the scale
+  code (two bounds-checked byte loads and a table entry per row per block)
+  the larger. The weight now carries `scales`, each block's f16 scale as a
+  float (one pass at load, 4 bytes per 32 weights, 137 MB for TinyLlama), and
+  the Q8_0 and Q4_0 kernels read one float per block per row: 11.7 -> 14.8
+  tokens/s on one thread, 26.2 on two, 43.4 on four (Node 3.3 / 6.4 / 11.1),
+  outputs identical. Next in the kernel: the clamps, by hoisting the inner
+  loop's bound checks out of the block loop through the offsets' induction
+  variables (an emitter slice), and more rows per pass.

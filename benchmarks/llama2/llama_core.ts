@@ -116,16 +116,33 @@ for (let i = 0; i < 65536; i++) F16[i] = f16ToF64(i);
 interface Weight {
   readonly name: string; readonly type: number; readonly rows: number; readonly cols: number; readonly byteOff: number;
   readonly bytes: Uint8Array; readonly quants: Int8Array; readonly f32: Float32Array;
+  /** each block's f16 scale as a float, row-major (`rows * (cols >> 5)` entries for the quantized
+   *  types, one pass at load): the kernels read one float per block per row instead of two bytes
+   *  and a table entry (both bounds-checked), 4 bytes per 32 weights of memory */
+  readonly scales: Float32Array;
   readonly index: number;
 }
 function makeWeight(name: string, type: number, rows: number, cols: number, byteOff: number, all: Uint8Array): Weight {
   const rowBytes = type === GGML_F32 ? cols * 4 : type === GGML_F16 ? cols * 2 : type === GGML_Q8_0 ? (cols >> 5) * 34 : (cols >> 5) * 18;
   const n = rows * rowBytes;
+  const bytes = all.subarray(byteOff, byteOff + n);
+  const nb = cols >> 5;
+  const quantized = type === GGML_Q8_0 || type === GGML_Q4_0;
+  const scales = quantized ? new Float32Array(rows * nb) : new Float32Array(0);
+  if (quantized) {
+    const stride = type === GGML_Q8_0 ? 34 : 18;
+    for (let r = 0; r < rows; r++) {
+      let p = Math.imul(r, rowBytes);
+      const sb = Math.imul(r, nb);
+      for (let b = 0; b < nb; b++) { scales[sb + b] = F16[bytes[p] | (bytes[p + 1] << 8)]; p += stride; }
+    }
+  }
   const w: Weight = {
     name, type, rows, cols, byteOff,
-    bytes: all.subarray(byteOff, byteOff + n),
+    bytes,
     quants: new Int8Array(all.buffer, all.byteOffset + byteOff, n),
     f32: type === GGML_F32 ? new Float32Array(all.buffer, all.byteOffset + byteOff, n >> 2) : new Float32Array(0),
+    scales,
     index: weightsList.length,
   };
   weightsList.push(w);
@@ -203,7 +220,7 @@ function matvecQ8(m: Model, w: Weight, xq: Int8Array, xs: Float32Array, out: Flo
   matvecQ8Rows(m, w, 0, w.rows, xq, xs, out);
 }
 function matvecQ8Rows(m: Model, w: Weight, lo: number, hi: number, xq: Int8Array, xs: Float32Array, out: Float32Array): void {
-  const u = w.bytes, q = w.quants;
+  const q = w.quants, sc = w.scales;
   const n = w.cols | 0, rows = hi | 0, nb = n >> 5;
   const rowBytes = nb * 34;
   const rows4 = lo + (((rows - lo) & ~3) | 0);
@@ -211,6 +228,7 @@ function matvecQ8Rows(m: Model, w: Weight, lo: number, hi: number, xq: Int8Array
     let s0 = 0, s1 = 0, s2 = 0, s3 = 0;
     let p0 = Math.imul(r, rowBytes);        // int32 row offsets (a tensor is below 2^31 bytes)
     let p1 = p0 + rowBytes, p2 = p1 + rowBytes, p3 = p2 + rowBytes;
+    const sb0 = Math.imul(r, nb), sb1 = sb0 + nb, sb2 = sb1 + nb, sb3 = sb2 + nb;
     for (let b = 0; b < nb; b++) {
       const xb = b << 5, q0 = p0 + 2, q1 = p1 + 2, q2 = p2 + 2, q3 = p3 + 2;
       let i0 = 0, i1 = 0, i2 = 0, i3 = 0;
@@ -222,10 +240,10 @@ function matvecQ8Rows(m: Model, w: Weight, lo: number, hi: number, xq: Int8Array
         i3 = (i3 + ((q[q3 + j] << 24) >> 24) * x) | 0;
       }
       const sx = xs[b];
-      s0 += F16[u[p0] | (u[p0 + 1] << 8)] * sx * i0;
-      s1 += F16[u[p1] | (u[p1 + 1] << 8)] * sx * i1;
-      s2 += F16[u[p2] | (u[p2 + 1] << 8)] * sx * i2;
-      s3 += F16[u[p3] | (u[p3 + 1] << 8)] * sx * i3;
+      s0 += sc[sb0 + b] * sx * i0;
+      s1 += sc[sb1 + b] * sx * i1;
+      s2 += sc[sb2 + b] * sx * i2;
+      s3 += sc[sb3 + b] * sx * i3;
       p0 += 34; p1 += 34; p2 += 34; p3 += 34;
     }
     out[r] = s0; out[r + 1] = s1; out[r + 2] = s2; out[r + 3] = s3;
@@ -233,11 +251,12 @@ function matvecQ8Rows(m: Model, w: Weight, lo: number, hi: number, xq: Int8Array
   for (let r = rows4; r < rows; r++) {
     let s = 0;
     let p = Math.imul(r, rowBytes);
+    const sb = Math.imul(r, nb);
     for (let b = 0; b < nb; b++) {
       const qb = p + 2, xb = b << 5;
       let isum = 0;
       for (let j = 0; j < 32; j++) { const a = (q[qb + j] << 24) >> 24, x = (xq[xb + j] << 24) >> 24; isum = (isum + a * x) | 0; }
-      s += F16[u[p] | (u[p + 1] << 8)] * xs[b] * isum;
+      s += sc[sb + b] * xs[b] * isum;
       p += 34;
     }
     out[r] = s;
@@ -248,12 +267,13 @@ function matvecQ4(m: Model, w: Weight, xq: Int8Array, xs: Float32Array, out: Flo
   matvecQ4Rows(m, w, 0, w.rows, xq, xs, out);
 }
 function matvecQ4Rows(m: Model, w: Weight, lo: number, hi: number, xq: Int8Array, xs: Float32Array, out: Float32Array): void {
-  const u = w.bytes;
+  const u = w.bytes, sc = w.scales;
   const n = w.cols | 0, rows = hi | 0, nb = n >> 5;
   const rowBytes = nb * 18;
   for (let r = lo | 0; r < rows; r++) {
     let s = 0;
     let p = Math.imul(r, rowBytes);
+    const sb = Math.imul(r, nb);
     for (let b = 0; b < nb; b++) {
       const qb = p + 2, xb = b << 5;
       let isum = 0;
@@ -262,7 +282,7 @@ function matvecQ4Rows(m: Model, w: Weight, lo: number, hi: number, xq: Int8Array
         const lo = (xq[xb + j] << 24) >> 24, hi = (xq[xb + j + 16] << 24) >> 24;
         isum = (isum + ((byte & 15) - 8) * lo + ((byte >> 4) - 8) * hi) | 0;
       }
-      s += F16[u[p] | (u[p + 1] << 8)] * xs[b] * isum;
+      s += sc[sb + b] * xs[b] * isum;
       p += 18;
     }
     out[r] = s;
