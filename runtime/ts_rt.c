@@ -9675,8 +9675,9 @@ tsv ts_number_tofixed(double x, double digits){
 /* A Date is a heap object (TS_KIND_OBJECT) carrying its epoch-ms as a single
    numeric property at key 0. Minimal: now/getTime/valueOf. */
 tsv ts_date_now_ms(void){
+  /* an integral number of milliseconds, as Date.now() and a Date's time value are in JS */
   struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
-  return ts_num((double)ts.tv_sec*1000.0 + (double)ts.tv_nsec/1.0e6);
+  return ts_num((double)ts.tv_sec*1000.0 + (double)(ts.tv_nsec/1000000));
 }
 /* new Date(year, month, day, hours, minutes, seconds, ms) in LOCAL time -> epoch
    ms. mktime interprets the broken-down fields as local time and normalizes

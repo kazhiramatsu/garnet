@@ -10280,3 +10280,40 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   behind `garnet:ndarray`'s `dot`, as `garnet:json` has its host object; the
   model itself (attention, LayerNorm, GELU) is straightforward over the
   module, training would need an autograd tape. Waiting on Kaz for the scope.
+- Constant steps and chained offsets in the typed-array prefix loop, an
+  integral `Date.now()`, and llama2.c in TypeScript (Session 353,
+  `docs/llm_inference_design.md`, `docs/typed_array_loops_design.md` "Constant
+  steps and chained offsets"). Kaz asked whether a llama.cpp model could run;
+  the scope is inference and the target TinyLlama-1.1B-Chat Q8_0 (bigint is
+  not needed: GGUF's u64 fields are read as two u32 words into a double).
+  Milestone 1 is `benchmarks/llama2/llama2.ts`, a port of Karpathy's run.c
+  (the fp32 tinyllamas and tokenizer.bin, argmax sampling, the
+  SentencePiece-style BPE); `benchmarks/llama2/run.sh` fetches stories15M,
+  builds with garnet, transpiles for node and compares: the 200-token story
+  is byte-identical (732 bytes), native 132 tokens/s against Node's 95 with
+  the plain matrix-vector loop. The four-accumulator dot product (`j += 4`,
+  a fixed order of additions) made Node 35% faster and garnet 2.3x slower:
+  the prefix loop took only `i++`, and the exporter lowers `w[row + j + 1]`
+  as `(row + j) + 1`, an offset index plus a constant, which the previous
+  slice's rule did not chain. Both are in now (`i += c`, `TaOff { local,
+  konst }`, `ts_ta_off_add`): native 160 tokens/s against Node's 144; the
+  pattern kernels are unchanged (`lstm_sinwave` 87 ms against Node's 270,
+  `typed_array_loops` 303 against 292). A floating-point reduction is
+  never reassociated (nor may it be, for the bit-exact comparison with V8),
+  so a matrix-vector product's ceiling in pure TypeScript is the
+  latency-hidden scalar chain; the Q8_0 kernel of milestone 2 is an integer
+  reduction, which the C compiler may vectorize. `Date.now()` returned
+  fractional milliseconds (seen in a printed elapsed time); integral now,
+  fixture `stdlib/date_now_integer`. Fixture `arrays/typed_array_loop_steps`
+  (plain, strict, GC protect).
+  Milestone 2 under way in the same commit: `benchmarks/llama2/llama_gguf.ts`
+  reads a GGUF file (metadata, tensor infos, F32/F16/Q8_0/Q4_0; u64 as two
+  u32) and runs TinyLlama-1.1B-Chat Q8_0 (22 layers, 2048 wide, 32/4 heads)
+  with the file's SentencePiece BPE and the chat template: garnet and Node
+  both answer "The capital of France is Paris." at 1.2 GB resident, 0.6
+  tokens/s native against Node's 2.2, because the Q8_0 dot product `(isum
+  + a * b) | 0` is still a double chain: the numeric analysis has no range
+  for a `| 0` result and refuses the product (and a `0 * negative` is -0).
+  `Math.imul` made it worse (boxed arguments, no prefix loop). Next: bounded
+  bitwise results as ranges and products whose negative zero every use
+  absorbs (prepared), then the kernel's int8 loads sign-extended by shifts.

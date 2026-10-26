@@ -18777,13 +18777,14 @@ enum TaBound {
     Const(u64),
 }
 
-/// The offset of an index `i + off` (or `off + i`) in a simple typed-array loop's body.
+/// The offset of an index `i + off` in a simple typed-array loop's body: an unboxed
+/// local the loop never assigns (a double must hold an integer at run time), an
+/// integral constant below 2^32, or both (`(row + i) + 2`, the exporter's lowering
+/// of `w[row + i + 2]`).
 #[derive(Clone, Copy)]
-enum TaOff {
-    /// an unboxed local the loop never assigns; a double must hold an integer at run time
-    Local(u32),
-    /// an integral constant in [0, 2^32)
-    Const(u64),
+struct TaOff {
+    local: Option<u32>,
+    konst: u64,
 }
 
 /// Inside the versioned prefix loop of `top`: the induction local and the index
@@ -18799,6 +18800,8 @@ struct TaPrefix {
 /// induction local, the bound, and the hoisted views the body indexes.
 struct TaLoopPlan {
     ind: u32,
+    /// the loop's step: `i++` is 1, `i += c` a positive integral constant
+    step: u64,
     bound: TaBound,
     views: Vec<(u32, u8)>,
     /// the index locals `i + off` defined at the body's top level, with their offsets
@@ -18829,24 +18832,29 @@ fn ta_loop_plan(cond: u32, cond_body: &[Inst], body: &[Inst], ctx: &Ctx, hoisted
     if !ctx.int_local.contains(&ind) {
         return None;
     }
-    let mut ones: BTreeSet<u32> = BTreeSet::new();
-    let mut inc_ok = false;
+    // the step: `i++`, `i += 1` or `i += c` with a positive integral constant c
+    let mut step_consts: BTreeMap<u32, u64> = BTreeMap::new();
+    let mut step: Option<u64> = None;
     for inst in else_body {
         match inst {
-            Inst::Const { dst, value: ConstVal::Num { value } } if *value == 1.0 => {
-                ones.insert(dst.0);
+            Inst::Const { dst, value: ConstVal::Num { value } } if *value >= 1.0 && *value < 4294967296.0 && value.fract() == 0.0 => {
+                step_consts.insert(dst.0, *value as u64);
             }
             Inst::Copy { dst, .. } if dst.0 != ind => {}
             Inst::Copy { dst, .. } if dst.0 == ind => {}
             Inst::BinOp { dst, op, lhs, rhs } if dst.0 == t.0 && op == "+" => {
-                inc_ok = (lhs.0 == ind && ones.contains(&rhs.0)) || (rhs.0 == ind && ones.contains(&lhs.0));
+                step = if lhs.0 == ind {
+                    step_consts.get(&rhs.0).copied()
+                } else if rhs.0 == ind {
+                    step_consts.get(&lhs.0).copied()
+                } else {
+                    None
+                };
             }
             _ => return None,
         }
     }
-    if !inc_ok {
-        return None;
-    }
+    let step = step?;
     // the condition: `cond = i < bound`, after the flag is cleared
     let mut consts: BTreeMap<u32, f64> = BTreeMap::new();
     let mut lens: BTreeMap<u32, u32> = BTreeMap::new();
@@ -18961,21 +18969,46 @@ fn ta_loop_plan(cond: u32, cond_body: &[Inst], body: &[Inst], ctx: &Ctx, hoisted
                         return false;
                     }
                     if top_level && op == "+" && w.def_counts.get(&dst.0) == Some(&1) && dst.0 != ind {
-                        let other = if lhs.0 == ind && rhs.0 != ind {
-                            Some(rhs.0)
-                        } else if rhs.0 == ind && lhs.0 != ind {
-                            Some(lhs.0)
+                        let konst_of = |l: u32| -> Option<u64> {
+                            w.consts.get(&l).and_then(|&c| if c >= 0.0 && c < 4294967296.0 && c.fract() == 0.0 { Some(c as u64) } else { None })
+                        };
+                        let offset_of = |l: u32| -> Option<TaOff> { w.offsets.iter().find(|(x, _)| *x == l).map(|(_, o)| *o) };
+                        // `i + other`: a constant or an invariant local
+                        let from_ind = |o: u32| -> Option<TaOff> {
+                            if o == ind {
+                                None
+                            } else if let Some(c) = konst_of(o) {
+                                Some(TaOff { local: None, konst: c })
+                            } else if !w.defs.contains(&o) && ctx.unboxed.contains(&o) {
+                                Some(TaOff { local: Some(o), konst: 0 })
+                            } else {
+                                None
+                            }
+                        };
+                        // `t + other` for a recorded offset index t: a constant adds to the constant part,
+                        // an invariant local fills an empty local part
+                        let from_index = |t: TaOff, o: u32| -> Option<TaOff> {
+                            if let Some(c) = konst_of(o) {
+                                if t.konst + c < 4294967296 { Some(TaOff { local: t.local, konst: t.konst + c }) } else { None }
+                            } else if t.local.is_none() && o != ind && !w.defs.contains(&o) && ctx.unboxed.contains(&o) {
+                                Some(TaOff { local: Some(o), konst: t.konst })
+                            } else {
+                                None
+                            }
+                        };
+                        let found = if lhs.0 == ind {
+                            from_ind(rhs.0)
+                        } else if rhs.0 == ind {
+                            from_ind(lhs.0)
+                        } else if let Some(t) = offset_of(lhs.0) {
+                            from_index(t, rhs.0)
+                        } else if let Some(t) = offset_of(rhs.0) {
+                            from_index(t, lhs.0)
                         } else {
                             None
                         };
-                        if let Some(o) = other {
-                            if let Some(&c) = w.consts.get(&o) {
-                                if c >= 0.0 && c < 4294967296.0 && c.fract() == 0.0 {
-                                    w.offsets.push((dst.0, TaOff::Const(c as u64)));
-                                }
-                            } else if !w.defs.contains(&o) {
-                                w.offsets.push((dst.0, TaOff::Local(o)));
-                            }
+                        if let Some(off) = found {
+                            w.offsets.push((dst.0, off));
                         }
                     }
                 }
@@ -19052,7 +19085,7 @@ fn ta_loop_plan(cond: u32, cond_body: &[Inst], body: &[Inst], ctx: &Ctx, hoisted
     }
     // only the offsets of indices that are used
     offsets.retain(|(l, _)| clamps.iter().any(|(_, i)| *i == Some(*l)));
-    Some(TaLoopPlan { ind, bound, views, offsets, clamps })
+    Some(TaLoopPlan { ind, step, bound, views, offsets, clamps })
 }
 
 /// The prefix loop of a simple typed-array loop: once the views exist (and the
@@ -19079,11 +19112,12 @@ fn emit_ta_prefix_loop(s: &mut String, plan: &TaLoopPlan, body: &[Inst], ctx: &C
     // the offsets as unsigned indexes, once per entry (0xFFFFFFFF when not an index
     // offset: the prefix then runs no iteration and the general loop takes over)
     for (l, off) in &plan.offsets {
-        let expr = match off {
-            TaOff::Local(o) if ctx.int_local.contains(o) => format!("ts_ta_off_i64(d{})", o),
-            TaOff::Local(o) => format!("ts_ta_off_f64(d{})", o),
-            TaOff::Const(c) => format!("{}u", c),
+        let base = match off.local {
+            Some(o) if ctx.int_local.contains(&o) => format!("ts_ta_off_i64(d{})", o),
+            Some(o) => format!("ts_ta_off_f64(d{})", o),
+            None => "0u".to_string(),
         };
+        let expr = if off.konst == 0 { base } else if off.local.is_none() { format!("{}u", off.konst) } else { format!("ts_ta_off_add({}, {}u)", base, off.konst) };
         let _ = writeln!(s, "    uint32_t _tao{l}_{t} = {e};", l = l, t = top, e = expr);
     }
     for (a, idx) in &plan.clamps {
@@ -19100,7 +19134,8 @@ fn emit_ta_prefix_loop(s: &mut String, plan: &TaLoopPlan, body: &[Inst], ctx: &C
             }
         }
     }
-    let _ = writeln!(s, "    for (; (unsigned long long)d{i} < (unsigned long long)_te{t}; d{i}++) {{", i = i, t = top);
+    let inc = if plan.step == 1 { format!("d{}++", i) } else { format!("d{} += {}", i, plan.step) };
+    let _ = writeln!(s, "    for (; (unsigned long long)d{i} < (unsigned long long)_te{t}; {inc}) {{", i = i, t = top, inc = inc);
     let prev = ctx.ta_prefix.replace(Some(TaPrefix { top, ind: i, offsets: plan.offsets.iter().map(|(l, _)| *l).collect() }));
     emit_seq(s, body, ctx, PathEdge::LoopBody);
     *ctx.ta_prefix.borrow_mut() = prev;

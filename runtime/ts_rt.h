@@ -2923,6 +2923,9 @@ static inline uint32_t ts_ta_off_f64(double d){
 static inline uint32_t ts_ta_off_i64(long long v){
   return (v >= 0 && v <= 4294967295LL) ? (uint32_t)v : 0xFFFFFFFFu;
 }
+static inline uint32_t ts_ta_off_add(uint32_t o, uint32_t k){
+  return (o == 0xFFFFFFFFu || o > 0xFFFFFFFEu - k) ? 0xFFFFFFFFu : o + k;
+}
 TS_RT_ALWAYS_INLINE double ts_ta_elem_load_v(const uint8_t* data, uint32_t i, int elem){
   switch (elem){
     case TS_TA_INT8: return (double)((const ts_i8_alias*)data)[i];

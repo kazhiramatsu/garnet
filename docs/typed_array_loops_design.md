@@ -173,3 +173,18 @@ be undefined, and the literal must store it as it is), so the loops compared
 against `ts_number_coerce(v)`. The kernels read `a.shape[0] | 0` into integer
 locals for their loops and pass the shape elements to the literal directly;
 `dot` of two 512x512 float64 matrices then runs at 17.8 GFLOP/s (Node 3.4).
+
+## Constant steps and chained offsets (Session 353, third slice)
+
+The llama2 port's dot product with four partial sums (`for (j = 0; j < n4;
+j += 4)`, indexes `row + j`, `row + j + 1`, ..., `x[j + 1]`, ...) exposed two
+more gaps: the step had to be 1, and `w[row + j + 1]` is lowered as
+`(row + j) + 1`, a sum of an already recorded offset index and a constant.
+The recognizer takes `i += c` for a positive integral constant (the prefix
+header increments by `c`; the general loop finishes the tail) and an offset
+that is a local, a constant or both (`TaOff { local, konst }`: `t + k` for a
+recorded index `t` adds to the constant part, `t + m` with an invariant local
+fills an empty local part); the hoisted offset is `ts_ta_off_add(base, k)`,
+0xFFFFFFFF when the sum would not be an index. With the plain loop the port
+ran 132 tokens/s native against Node's 95; the four-accumulator form ran
+58 against 128 before this slice and 160 against 144 after it.
