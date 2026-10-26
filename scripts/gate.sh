@@ -159,6 +159,7 @@ case "$cmd" in
                 bash "$S/../tests/closed_receivers.sh" || rc=1
                 bash "$S/../tests/typed_json_schema_gate.sh" || rc=1
                 bash "$S/../tests/pgo_build_gate.sh" || rc=1
+                bash "$S/../tests/math_v8_parity/run.sh" || rc=1
                 [ $rc -eq 0 ] && echo "[gate] unit PASS" || die "unit FAIL"
                 ;;
   gc)           exec bash "$S/run_gc_stress.sh" ;;

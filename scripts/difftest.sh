@@ -22,7 +22,8 @@ mkdir -p "$ROOT/build"
 RT_OBJ="$ROOT/build/rt.o"
 if [ ! -f "$RT_OBJ" ] ||
    [ "$ROOT/runtime/ts_rt.c" -nt "$RT_OBJ" ] ||
-   [ "$ROOT/runtime/ts_rt.h" -nt "$RT_OBJ" ]; then
+   [ "$ROOT/runtime/ts_rt.h" -nt "$RT_OBJ" ] ||
+   [ "$ROOT/runtime/ts_ieee754.c" -nt "$RT_OBJ" ]; then
   $CC -c "$ROOT/runtime/ts_rt.c" -I"$ROOT/runtime" -o "$RT_OBJ" || return 1
 fi
 

@@ -13257,6 +13257,19 @@ fn fnval_adapter_name(builtin: &str) -> String {
 /// `TSAOT_MATH_COERCE=0` keeps Math's previous argument reads (a raw
 /// reinterpretation of a boxed argument as a double, no ToNumber) for the
 /// parity oracle.
+/// Math's transcendental functions call the runtime's port of V8's implementations
+/// (runtime/ts_ieee754.c, `ts_m_<name>`), so results are bit-identical to Node's;
+/// TSAOT_IEEE754_MATH=0 keeps the libm calls (the parity oracle's environment).
+fn ieee754_math_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_IEEE754_MATH").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
 fn math_coerce_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -13314,15 +13327,18 @@ fn fnval_adapter_body(builtin: &str) -> Option<String> {
     let hv_n = |f: &str| Some(format!("return ts_num({}({}));", f, val(0)));
     // helper taking boxed value(s), returning a boxed tsv
     let hv = |expr: String| Some(format!("return {};", expr));
+    // the transcendental functions: V8's implementations in the runtime (ieee754_math_enabled)
+    let ieee = ieee754_math_enabled();
+    let lm = |f: &str| -> String { if ieee { format!("ts_m_{}", f) } else { f.to_string() } };
     match builtin {
         // ---- Math: libm 1-arg ----
         "math.sqrt" => m1("sqrt"), "math.abs" => m1("fabs"), "math.floor" => m1("floor"),
-        "math.ceil" => m1("ceil"), "math.sin" => m1("sin"), "math.cos" => m1("cos"),
-        "math.tan" => m1("tan"), "math.asin" => m1("asin"), "math.acos" => m1("acos"),
-        "math.atan" => m1("atan"), "math.sinh" => m1("sinh"), "math.cosh" => m1("cosh"),
-        "math.tanh" => m1("tanh"), "math.exp" => m1("exp"), "math.log" => m1("log"),
-        "math.asinh" => m1("asinh"), "math.acosh" => m1("acosh"), "math.atanh" => m1("atanh"),
-        "math.expm1" => m1("expm1"), "math.log1p" => m1("log1p"),
+        "math.ceil" => m1("ceil"), "math.sin" => m1(&lm("sin")), "math.cos" => m1(&lm("cos")),
+        "math.tan" => m1(&lm("tan")), "math.asin" => m1(&lm("asin")), "math.acos" => m1(&lm("acos")),
+        "math.atan" => m1(&lm("atan")), "math.sinh" => m1(&lm("sinh")), "math.cosh" => m1(&lm("cosh")),
+        "math.tanh" => m1(&lm("tanh")), "math.exp" => m1(&lm("exp")), "math.log" => m1(&lm("log")),
+        "math.asinh" => m1(&lm("asinh")), "math.acosh" => m1(&lm("acosh")), "math.atanh" => m1(&lm("atanh")),
+        "math.expm1" => m1(&lm("expm1")), "math.log1p" => m1(&lm("log1p")),
         "math.fround" => hv(format!("ts_num((double)(float)({}))", num(0))),
         "math.f16round" => hv(format!("ts_num(ts_math_f16round(ts_number_coerce({})))", val(0))),
         // ---- Math: runtime helper 1-arg ----
@@ -13333,10 +13349,10 @@ fn fnval_adapter_body(builtin: &str) -> Option<String> {
         // ---- Math: 2-arg ----
         "math.imul" => hv(format!("ts_num(ts_math_imul(ts_number_coerce({}), ts_number_coerce({})))", val(0), val(1))),
         // two arguments, coerced in order
-        "math.pow" if coerce => Some(format!("double x0={}; double x1={}; return ts_num(pow(x0, x1));", num(0), num(1))),
-        "math.atan2" if coerce => Some(format!("double x0={}; double x1={}; return ts_num(atan2(x0, x1));", num(0), num(1))),
-        "math.pow" => hv(format!("ts_num(pow({}, {}))", num(0), num(1))),
-        "math.atan2" => hv(format!("ts_num(atan2({}, {}))", num(0), num(1))),
+        "math.pow" if coerce => Some(format!("double x0={}; double x1={}; return ts_num({}(x0, x1));", num(0), num(1), lm("pow"))),
+        "math.atan2" if coerce => Some(format!("double x0={}; double x1={}; return ts_num({}(x0, x1));", num(0), num(1), lm("atan2"))),
+        "math.pow" => hv(format!("ts_num({}({}, {}))", lm("pow"), num(0), num(1))),
+        "math.atan2" => hv(format!("ts_num({}({}, {}))", lm("atan2"), num(0), num(1))),
         // ---- Math: variadic (NaN propagates) ----
         // every argument is coerced, in order, before the result is known
         "math.max" if coerce => Some("return ts_num(ts_math_max_args(a, n));".to_string()),
@@ -21340,6 +21356,9 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     format!("{}({}, {})", f, n(0), n(1))
                 }
             };
+            // the transcendental functions: V8's implementations in the runtime (ieee754_math_enabled)
+            let ieee = ieee754_math_enabled();
+            let lm = |f: &str| -> String { if ieee { format!("ts_m_{}", f) } else { f.to_string() } };
             let (expr, numeric): (String, bool) = match builtin.as_str() {
                 // Math: single-arg libm functions emitted inline as doubles.
                 "math.sqrt" => (format!("sqrt({})", n(0)), true),
@@ -21349,31 +21368,31 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 "math.round" => (format!("ts_math_round({})", n(0)), true),
                 "math.trunc" => (format!("ts_math_trunc({})", n(0)), true),
                 "math.sign" => (format!("ts_math_sign({})", n(0)), true),
-                "math.sin" => (format!("sin({})", n(0)), true),
-                "math.cos" => (format!("cos({})", n(0)), true),
-                "math.tan" => (format!("tan({})", n(0)), true),
-                "math.asin" => (format!("asin({})", n(0)), true),
-                "math.acos" => (format!("acos({})", n(0)), true),
-                "math.atan" => (format!("atan({})", n(0)), true),
-                "math.sinh" => (format!("sinh({})", n(0)), true),
-                "math.cosh" => (format!("cosh({})", n(0)), true),
-                "math.tanh" => (format!("tanh({})", n(0)), true),
-                "math.exp" => (format!("exp({})", n(0)), true),
-                "math.log" => (format!("log({})", n(0)), true),
+                "math.sin" => (format!("{}({})", lm("sin"), n(0)), true),
+                "math.cos" => (format!("{}({})", lm("cos"), n(0)), true),
+                "math.tan" => (format!("{}({})", lm("tan"), n(0)), true),
+                "math.asin" => (format!("{}({})", lm("asin"), n(0)), true),
+                "math.acos" => (format!("{}({})", lm("acos"), n(0)), true),
+                "math.atan" => (format!("{}({})", lm("atan"), n(0)), true),
+                "math.sinh" => (format!("{}({})", lm("sinh"), n(0)), true),
+                "math.cosh" => (format!("{}({})", lm("cosh"), n(0)), true),
+                "math.tanh" => (format!("{}({})", lm("tanh"), n(0)), true),
+                "math.exp" => (format!("{}({})", lm("exp"), n(0)), true),
+                "math.log" => (format!("{}({})", lm("log"), n(0)), true),
                 "math.log2" => (format!("ts_math_log2({})", n(0)), true),
                 "math.log10" => (format!("ts_math_log10({})", n(0)), true),
                 "math.cbrt" => (format!("ts_math_cbrt({})", n(0)), true),
-                "math.asinh" => (format!("asinh({})", n(0)), true),
-                "math.acosh" => (format!("acosh({})", n(0)), true),
-                "math.atanh" => (format!("atanh({})", n(0)), true),
-                "math.expm1" => (format!("expm1({})", n(0)), true),
-                "math.log1p" => (format!("log1p({})", n(0)), true),
+                "math.asinh" => (format!("{}({})", lm("asinh"), n(0)), true),
+                "math.acosh" => (format!("{}({})", lm("acosh"), n(0)), true),
+                "math.atanh" => (format!("{}({})", lm("atanh"), n(0)), true),
+                "math.expm1" => (format!("{}({})", lm("expm1"), n(0)), true),
+                "math.log1p" => (format!("{}({})", lm("log1p"), n(0)), true),
                 "math.fround" => (format!("((double)(float)({}))", n(0)), true),
                 "math.f16round" => (format!("ts_math_f16round({})", nc(0)), true),
                 "math.clz32" => (format!("ts_math_clz32({})", n(0)), true),
                 // two-arg
-                "math.pow" => (n2("pow"), true),
-                "math.atan2" => (n2("atan2"), true),
+                "math.pow" => (n2(&lm("pow")), true),
+                "math.atan2" => (n2(&lm("atan2")), true),
                 "math.hypot" => (n2("ts_math_hypot2"), true),
                 // ToInt32 of each operand, the 32-bit product as an int32: in line
                 // (the scanner's hashes call it once per character); TSAOT_IMUL_INLINE=0
@@ -24357,7 +24376,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     "((double)((uint32_t){} >> {}))",
                     ctx.bitwise_operand(lhs.0), ctx.shift_count(rhs.0)
                 ),
-                "**" => format!("pow({}, {})", l, r),
+                "**" => format!("{}({}, {})", if ieee754_math_enabled() { "ts_m_pow" } else { "pow" }, l, r),
                 _ => "0".to_string(),
             };
             // comparison/equality results are booleans: when stored boxed, box as

@@ -1707,6 +1707,16 @@ double ts_math_trunc(double x);
 double ts_math_max2(double a, double b);
 double ts_math_min2(double a, double b);
 double ts_math_cbrt(double x);
+/* Math's transcendental functions as V8 computes them (runtime/ts_ieee754.c, a C
+   translation of V8's fdlibm port; ts_m_pow is V8's wrapper over the platform's pow).
+   The generated code calls these where it called libm (TSAOT_IEEE754_MATH). */
+double ts_m_acos(double x); double ts_m_acosh(double x); double ts_m_asin(double x);
+double ts_m_asinh(double x); double ts_m_atan(double x); double ts_m_atan2(double y, double x);
+double ts_m_atanh(double x); double ts_m_cbrt(double x); double ts_m_cos(double x);
+double ts_m_cosh(double x); double ts_m_exp(double x); double ts_m_expm1(double x);
+double ts_m_log(double x); double ts_m_log1p(double x); double ts_m_log2(double x);
+double ts_m_log10(double x); double ts_m_pow(double x, double y); double ts_m_sin(double x);
+double ts_m_sinh(double x); double ts_m_tan(double x); double ts_m_tanh(double x);
 double ts_math_clz32(double x);
 double ts_math_imul(double a, double b);
 double ts_math_f16round(double x);

@@ -2,6 +2,7 @@
 #include <unistd.h>   /* isatty: gate console.log colorization on a TTY (Node parity) */
 #include "ts_rt.h"
 #include "json_core.c"
+#include "ts_ieee754.c"   /* Math's transcendental functions, V8's implementations */
 
 #if defined(TSAOT_ENABLE_FETCH)
 #include <curl/curl.h>
@@ -9010,15 +9011,8 @@ double ts_math_min2(double a, double b){
   if (a==b){ if (a==0.0) return (signbit(a) || signbit(b)) ? -0.0 : 0.0; return a; }
   return a<b?a:b;
 }
-double ts_math_cbrt(double x){
-  /* glibc's cbrt is not correctly rounded (cbrt(27) -> 3.0000000000000004),
-     while V8 returns the correctly-rounded result. One Newton step toward
-     y^3 == x sharpens the libm seed to the V8-matching value. */
-  if (x == 0.0 || !isfinite(x)) return cbrt(x);
-  double y = cbrt(x);
-  y = y - (y*y*y - x) / (3.0 * y * y);
-  return y;
-}
+/* cbrt, log2 and log10 are V8's (ts_ieee754.c); these names stay for the frozen emitter's output */
+double ts_math_cbrt(double x){ return ts_m_cbrt(x); }
 /* Math.clz32: count leading zeros of ToUint32(x). */
 double ts_math_clz32(double x){
   uint32_t u;
@@ -9100,8 +9094,8 @@ static double ts_f16_bits_to_double(uint16_t h){
 double ts_math_f16round(double x){
   return ts_f16_bits_to_double(ts_double_to_f16_bits(x));
 }
-double ts_math_log2(double x){ return log2(x); }
-double ts_math_log10(double x){ return log10(x); }
+double ts_math_log2(double x){ return ts_m_log2(x); }
+double ts_math_log10(double x){ return ts_m_log10(x); }
 /* Math.hypot as V8 computes it (src/builtins/math.tq), so results agree to
    the last bit: an infinite argument wins over NaN, then NaN, then 0; the
    values are normalized by the largest magnitude and summed with Kahan

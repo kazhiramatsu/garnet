@@ -438,6 +438,12 @@ ran 1.7× faster than on Node.js (0.17 s against 0.29 s), where before it ran
 slower (0.32 s). A loop that calls a function or boxes a value takes the
 general path.
 
+Math's transcendental functions (`exp`, `log`, `sin`, `tanh`, `pow` and the
+others) are V8's own implementations, a C translation of V8's fdlibm port
+compiled with the same defaults as Node's V8, so their results agree with
+Node.js on the same platform to the last bit (`tests/math_v8_parity` checks
+every function over 100,000 inputs per range against the installed node).
+
 Typed JSON: `import { JSON } from "garnet:json"` gives `JSON.parse<T>(text)`,
 which validates the text against `T` while parsing, builds each object in
 the property order of the type and drops undeclared properties. A mismatch
@@ -641,7 +647,7 @@ TypeScript entry file + its static imports
 |---|---|
 | `exporter/` | TypeScript front end: type checking and lowering to IR |
 | `analyzer/` | Analysis, optimization and C emission in Rust (the cargo binary is `tsaot`) |
-| `runtime/` | The native runtime: values, objects, strings, async, garbage collector |
+| `runtime/` | The native runtime: values, objects, strings, async, garbage collector; `ts_ieee754.c` is V8's Math (BSD and Sun notices in the file) |
 | `lib/garnet/` | Garnet's own TypeScript modules (`garnet:*`) |
 | `tests/` | Conformance tests against Node.js, plus bundler, runtime and GC tests |
 | `benchmarks/` | Correctness and performance workloads, including the tsc-ts host |

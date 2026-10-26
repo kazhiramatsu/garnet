@@ -35,7 +35,10 @@ WeakSet:add, has, delete (object/function/non-registered-Symbol keys;
 Math:   sqrt abs floor ceil round trunc sign sin cos tan asin acos atan sinh
         cosh tanh exp log log2 log10 cbrt pow atan2 hypot max(2) min(2) random
         asinh acosh atanh expm1 log1p fround f16round clz32 imul
-        + constants PI E LN2 LN10 LOG2E LOG10E SQRT2 SQRT1_2  (C libm backed)
+        + constants PI E LN2 LN10 LOG2E LOG10E SQRT2 SQRT1_2.  The transcendental
+        functions are V8's implementations (runtime/ts_ieee754.c, a C translation of
+        V8's fdlibm port; pow is V8's wrapper over the platform pow), so results agree
+        with Node to the last bit; sqrt/abs/floor/ceil/fround are the exact libm/C ops.
 Number: isInteger isFinite isNaN isSafeInteger parseFloat parseInt, Number(x)
         coercion, constants MAX_SAFE_INTEGER MIN_SAFE_INTEGER MAX_VALUE MIN_VALUE
         EPSILON.  Global parseInt / parseFloat / isNaN / isFinite.
@@ -82,9 +85,10 @@ Fetch/Web subset: optional libcurl-backed fetch, Response.text/json/status/ok/
         headers, simplified Headers, AbortController/AbortSignal.timeout.
 (plus .length for string/array, .size for Map/Set.)
 
-Math single-arg functions are emitted inline as libm calls (sqrt(x), sin(x)...);
-two-arg/JS-specific ones (round half-up, sign, trunc, max/min/hypot) use runtime
-helpers. Link with -lm. JS `/` is always float division and `%` is fmod, EXCEPT
+Math single-arg functions are emitted inline as double calls: sqrt/fabs/floor/ceil
+are libm, the transcendental ones are the runtime's V8 port (ts_m_sin(x)...,
+TSAOT_IEEE754_MATH=0 emits the libm names); two-arg/JS-specific ones (round
+half-up, sign, trunc, max/min/hypot) use runtime helpers. Link with -lm. JS `/` is always float division and `%` is fmod, EXCEPT
 `intLocal % nonzeroIntConstant` which stays integer-fast (no FPE; hot `% C` loops
 keep native speed).
 

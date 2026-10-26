@@ -428,7 +428,8 @@ native_build() { # <extra cflags> <output executable> <pass directory>
   esac
   if [ ! -f "$rt_obj" ] ||
      [ "$ROOT/runtime/ts_rt.c" -nt "$rt_obj" ] ||
-     [ "$ROOT/runtime/ts_rt.h" -nt "$rt_obj" ]; then
+     [ "$ROOT/runtime/ts_rt.h" -nt "$rt_obj" ] ||
+     [ "$ROOT/runtime/ts_ieee754.c" -nt "$rt_obj" ]; then
     $CC -c "$ROOT/runtime/ts_rt.c" -I"$ROOT/runtime" -o "$rt_obj" || die "failed to build runtime ($rt_obj)"
   fi
   # Optional runtime objects, gated by markers the emitted C declares.
