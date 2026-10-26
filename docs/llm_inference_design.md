@@ -134,6 +134,26 @@ run_gguf.sh [threads]`):
 (With the block scales precomputed as floats; before that 11.0, 20.1 and
 33.4 on one, two and four threads.)
 
+Against llama.cpp on the same machine and model (build c6fb3b5, CPU only
+with `-ngl 0`, `llama-bench -t 1,2,4 -p 51 -n 32`; Kaz ran it, 2026-10-26):
+
+| threads | garnet tg | llama.cpp tg | garnet pp | llama.cpp pp |
+|---|---|---|---|---|
+| 1 | 14.8 | 65.3 | 14.5 | 157 |
+| 2 | 26.2 | 72.6 | 25.3 | 312 |
+| 4 | 43.4 | 72.3 | 43.3 | 524 |
+
+Two readings. llama.cpp's generation is bound by memory bandwidth from one
+thread on: 1.1 GB of weights per token at about 75 GB/s is 65-72 tokens/s
+whatever the thread count, and that is the ceiling for Q8_0 on this CPU;
+garnet is compute-bound (the per-block overhead above), 4.4x behind on one
+thread and 1.7x on four. Its prompt processing runs the prompt one token at
+a time, so it equals the generation rate; llama.cpp batches the prompt into
+one matrix product that Accelerate (the AMX units) computes, 10x faster
+still, and a batched prefill in garnet would need the matrix kernel to be
+competitive first. The path to the ceiling: the clamps (the range flags
+below), then the per-row scale math as vector lanes.
+
 The scaling is bounded by memory bandwidth (the Q8_0 weights are read once
 per token: 1.1 GB per token) and by the synchronization of about 150 jobs per
 token; the four performance cores are the useful count.

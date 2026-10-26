@@ -10444,3 +10444,11 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   outputs identical. Next in the kernel: the clamps, by hoisting the inner
   loop's bound checks out of the block loop through the offsets' induction
   variables (an emitter slice), and more rows per pass.
+- llama.cpp measured (Session 353). Kaz built llama.cpp (c6fb3b5) and ran
+  `llama-bench -ngl 0 -t 1,2,4 -p 51 -n 32` on the same TinyLlama Q8_0: token
+  generation 65.3 / 72.6 / 72.3 tokens/s on 1 / 2 / 4 threads (memory-bound
+  from one thread: 1.1 GB per token at ~75 GB/s), prompt processing 157 / 312
+  / 524 (Accelerate's batched matrix product). garnet: 14.8 / 26.2 / 43.4
+  generation and the same for the prompt (one token at a time). The table is
+  in `docs/llm_inference_design.md`; the gap is the kernel's per-block
+  overhead (compute-bound), 4.4x on one thread and 1.7x on four.
