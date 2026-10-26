@@ -3828,6 +3828,7 @@ void ts_set(tsv obj, ts_key key, tsv val){
 static void ts_garnet_global_init(tsv global);
 static void ts_garnet_json_global_init(tsv global);
 static void ts_garnet_node_global_init(tsv global);
+static void ts_garnet_metal_global_init(tsv global);
 static void nh_run_exit_hook(void);
 static int nh_run_exit_hook_phase(int phase);
 static void nh_drain_ticks_and_microtasks(void);
@@ -3848,6 +3849,7 @@ void ts_global_this_init(void){
   ts_garnet_global_init(g_global_this_v);
   ts_garnet_json_global_init(g_global_this_v);
   ts_garnet_node_global_init(g_global_this_v);
+  ts_garnet_metal_global_init(g_global_this_v);
 }
 tsv ts_global_this(void){
   ts_global_this_init();
@@ -21638,3 +21640,5 @@ int main(int argc, char** argv){
 #endif
 /* The Node modules' host (lib/node, docs/node_compat_design.md): one translation unit with the runtime. */
 #include "node_host.c"
+/* garnet:metal's host (lib/garnet/metal.ts, docs/metal_design.md): Metal compute, loaded on first use. */
+#include "metal_host.c"
