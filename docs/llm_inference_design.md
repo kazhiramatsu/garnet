@@ -237,8 +237,10 @@ Node in every configuration:
 | tokens/s | 24.0 | 43.7 | 59.7 | 63.7 | 63.9 | 71.9 | 68.8 | 48.0 |
 
 Eight threads reach llama.cpp's 72 on four. What is left on eight threads
-is the wait for the slowest worker's last grab, 20 us per job (2.2 ms of a
-14 ms token), and the per-job preparation (6 us: the activation quantized
+is the wait for the slowest worker's last grab, 13-20 us per job (about 2 ms
+of a 14 ms token; the smallest grab is now one kernel pass of four rows,
+measured against 8 and 16 within the noise, 72-75 tokens/s, with the
+smallest wait), and the per-job preparation (6 us: the activation quantized
 and copied); the products themselves run at the memory ceiling. The prompt
 (56 tokens/s, one token at a time) stays an order of magnitude behind
 llama.cpp's batched prefill.

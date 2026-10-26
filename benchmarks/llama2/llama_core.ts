@@ -349,8 +349,9 @@ let scratchA: Float32Array = new Float32Array(0), scratchB: Float32Array = new F
 function scratch(rows: number): void {
   if (scratchA.length < rows) { scratchA = new Float32Array(rows); scratchB = new Float32Array(rows); }
 }
-/** the smallest grab from the shared row cursor, a multiple of four (the four-row kernel) */
-const ROW_MIN = 16;
+/** the smallest grab from the shared row cursor, one pass of the four-row kernel: measured on eight
+ *  threads against 8 and 16 within the noise (72-75 tokens/s) with the smallest tail wait */
+const ROW_MIN = 4;
 export interface Pool {
   ctrl: Int32Array;        // the control words (a SharedArrayBuffer)
   xq: Int8Array;           // the quantized activation
