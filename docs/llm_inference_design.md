@@ -154,9 +154,34 @@ still, and a batched prefill in garnet would need the matrix kernel to be
 competitive first. The path to the ceiling: the clamps (the range flags
 below), then the per-row scale math as vector lanes.
 
-The scaling is bounded by memory bandwidth (the Q8_0 weights are read once
-per token: 1.1 GB per token) and by the synchronization of about 150 jobs per
-token; the four performance cores are the useful count.
+Row distribution, second version. The first pool split the rows statically,
+`rows / n` per thread in blocks of four, which falls apart past the four
+performance cores: an efficiency core at a third of the speed holds every
+job (37 tokens/s on six threads, 40 on eight, 22 on ten). The rows now come
+from a shared cursor in the control words with guided grabs: a thread takes
+the remaining rows divided by about twice the thread count, never below 16,
+through `Atomics.compareExchange`, so the first grabs are large and the
+contended grabs few (a fixed block of 16 rows cost 20% on two threads, about
+265 ns per grab: the atomic's cache line moving between cores and the
+kernel's entry) and the last ones small enough that a slow core does not
+hold the others. Measured, 32 generated tokens, outputs identical:
+
+| threads | static | guided |
+|---|---|---|
+| 1 | 22.4 | 22.4 |
+| 2 | 40.2 | 39.8 |
+| 4 | 54.1 | 54.1 |
+| 6 | 37.2 | 50.6 |
+| 8 | 40.0 | 57.1 |
+| 10 | 22.0 | 40.4 |
+
+Eight threads (the four performance and four efficiency cores) are the
+useful count; ten leave no core to the system and to the main thread's
+serial work. Against llama.cpp's 72 on the CPU the remaining levers are the
+kernel's per-block overhead (every thread's rate) and the per-job costs:
+about 155 jobs per token, each with the activation quantized and copied on
+the main thread and a barrier, which fusing the q/k/v and the w1/w3 products
+into one job each would cut by a third.
 
 ## Milestone 3: the GPU through Metal (planned, Kaz 2026-10-26)
 

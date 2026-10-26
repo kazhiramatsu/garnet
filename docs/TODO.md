@@ -10483,3 +10483,18 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   609/609 plain and strict and 606/606 under GC protect, GC stress, bench
   within budget; tsc-ts output identical, instructions 0.9999 of the previous
   slice.
+- TinyLlama threads: guided row grabs (Session 353,
+  `docs/llm_inference_design.md` "Threads"). The static split (`rows / n` per
+  thread in blocks of four) fell apart past the four performance cores (37 /
+  40 / 22 tokens/s on 6 / 8 / 10 threads: an efficiency core holds every
+  job); the rows now come from a shared cursor with guided grabs (the
+  remaining rows divided by about twice the thread count, never below 16, by
+  `Atomics.compareExchange`; fixed 16-row blocks cost 20% on two threads,
+  about 265 ns per contended grab). 1 / 2 / 4 / 6 / 8 / 10 threads: 22.4 /
+  39.8 / 54.1 / 50.6 / 57.1 / 40.4 tokens/s (llama.cpp's CPU path 65 / 73 /
+  72 on 1 / 2 / 4), outputs identical; eight threads are the useful count.
+  Next on the threads: the q/k/v and w1/w3 products fused into one job each
+  (a third fewer barriers) and inline Atomics in the emitter; on the kernel:
+  proven direct accesses and a versioned prefix loop with the constant trip
+  count, the scales interleaved by four rows. Kaz asked for the GPU as well:
+  a Metal path is the program's third milestone (design note).

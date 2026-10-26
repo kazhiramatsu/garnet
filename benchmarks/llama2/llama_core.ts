@@ -13,9 +13,9 @@
 // entry function, and the classes here would then capture its locals). With -j N the
 // matrix-vector products are split over N threads: N - 1 workers (node:worker_threads; under
 // garnet a fork of the loaded program, which therefore shares the model's pages and this module's
-// state) take their row ranges from a SharedArrayBuffer protocol (the job's generation, tensor
+// state) take the job from a SharedArrayBuffer protocol (the job's generation, tensor, row cursor
 // and done count read and written with Atomics; the quantized activation and the result in
-// shared arrays).
+// shared arrays), each thread grabbing the next block of rows until none are left.
 import { readFileSync } from "node:fs";
 import { Worker } from "node:worker_threads";
 
@@ -328,7 +328,9 @@ export function softmax(x: Float32Array, off: number, size: number): void {
 
 // ---------------------------------------------------------------- threads
 // the control words of the shared protocol
-const C_GEN = 0, C_TENSOR = 1, C_ROWS = 2, C_COLS = 3, C_KIND = 4, C_DONE = 5, C_STOP = 6, C_WORKERS = 7;
+const C_GEN = 0, C_TENSOR = 1, C_ROWS = 2, C_COLS = 3, C_KIND = 4, C_DONE = 5, C_STOP = 6, C_WORKERS = 7, C_NEXT = 8;
+/** the smallest grab from the shared row cursor, a multiple of four (the four-row kernel) */
+const ROW_MIN = 16;
 export interface Pool {
   ctrl: Int32Array;        // the control words (a SharedArrayBuffer)
   xq: Int8Array;           // the quantized activation
@@ -344,11 +346,24 @@ let weightsList: Weight[] = [];   // every weight the model uses, in a fixed ord
 let llamaShared: Llama | null = null;   // the loaded model, visible to a forked worker
 export function setSharedModel(l: Llama): void { llamaShared = l; }
 
-function rowRange(rows: number, index: number, n: number): [number, number] {
-  // whole blocks of four rows per thread where possible
-  const per = Math.ceil(rows / n / 4) * 4;
-  const lo = Math.min(rows, index * per), hi = Math.min(rows, lo + per);
-  return [lo, hi];
+/** The rows of the current job from the shared cursor, guided: a grab takes the remaining rows
+ *  divided by about twice the thread count (never below ROW_MIN), so the first grabs are large and
+ *  the contended grabs few, and the last ones small enough that a slow core (an efficiency core, a
+ *  preempted thread) does not hold the others; the grab is a compare-exchange on the cursor. */
+function matvecBlocks(ctrl: Int32Array, n: number, m: Model, w: Weight, rows: number, xq: Int8Array, xs: Float32Array, xf: Float32Array, out: Float32Array): void {
+  const shift = 32 - Math.clz32(n);   // divide by the power of two at or above 2n
+  let lo = Atomics.load(ctrl, C_NEXT);
+  while (lo < rows) {
+    let chunk = ((rows - lo) >> shift) & ~3;
+    if (chunk < ROW_MIN) chunk = ROW_MIN;
+    const seen = Atomics.compareExchange(ctrl, C_NEXT, lo, lo + chunk);
+    if (seen === lo) {
+      matvecRows(m, w, lo, Math.min(lo + chunk, rows), xq, xs, xf, out);
+      lo = Atomics.load(ctrl, C_NEXT);
+    } else {
+      lo = seen;
+    }
+  }
 }
 /** The rows [lo, hi) of out = W x, by the weight's quantization. */
 function matvecRows(m: Model, w: Weight, lo: number, hi: number, xq: Int8Array, xs: Float32Array, xf: Float32Array, out: Float32Array): void {
@@ -371,13 +386,12 @@ export function workerLoop(data: { ctrl: SharedArrayBuffer; xq: SharedArrayBuffe
     seen = g;
     if (Atomics.load(ctrl, C_STOP) !== 0) break;
     const w = weightsList[Atomics.load(ctrl, C_TENSOR)];
-    const [lo, hi] = rowRange(Atomics.load(ctrl, C_ROWS), data.index, data.n);
-    matvecRows(m, w, lo, hi, xq, xs, xf, out);
+    matvecBlocks(ctrl, data.n, m, w, Atomics.load(ctrl, C_ROWS), xq, xs, xf, out);
     Atomics.add(ctrl, C_DONE, 1);
   }
 }
 export function startPool(n: number, path: string, maxCols: number, maxRows: number): Pool {
-  const ctrl = new Int32Array(new SharedArrayBuffer(8 * 4));
+  const ctrl = new Int32Array(new SharedArrayBuffer(16 * 4));
   const xq = new Int8Array(new SharedArrayBuffer(maxCols));
   const xs = new Float32Array(new SharedArrayBuffer((maxCols >> 5) * 4));
   const xf = new Float32Array(new SharedArrayBuffer(maxCols * 4));
@@ -389,7 +403,7 @@ export function startPool(n: number, path: string, maxCols: number, maxRows: num
   }
   return { ctrl, xq, xs, xf, out, workers, n };
 }
-/** out = W x over the pool: the main thread takes range 0 and waits for the workers. */
+/** out = W x over the pool: the main thread takes blocks like a worker, then waits for the rest. */
 function matvecPooled(p: Pool, m: Model, w: Weight, x: Float32Array, xq: Int8Array, xs: Float32Array, quantized: boolean, out: Float32Array): void {
   const id = w.index;
   const cols = w.cols, rows = w.rows;
@@ -400,10 +414,9 @@ function matvecPooled(p: Pool, m: Model, w: Weight, x: Float32Array, xq: Int8Arr
     p.xf.set(x.subarray(0, cols));
   }
   Atomics.store(p.ctrl, C_TENSOR, id); Atomics.store(p.ctrl, C_ROWS, rows); Atomics.store(p.ctrl, C_COLS, cols);
-  Atomics.store(p.ctrl, C_DONE, 0);
+  Atomics.store(p.ctrl, C_DONE, 0); Atomics.store(p.ctrl, C_NEXT, 0);
   Atomics.add(p.ctrl, C_GEN, 1);
-  const [lo, hi] = rowRange(rows, 0, p.n);
-  matvecRows(m, w, lo, hi, p.xq, p.xs, p.xf, p.out);
+  matvecBlocks(p.ctrl, p.n, m, w, rows, p.xq, p.xs, p.xf, p.out);
   while (Atomics.load(p.ctrl, C_DONE) < p.n - 1) { /* spin */ }
   out.set(p.out.subarray(0, rows));
 }
