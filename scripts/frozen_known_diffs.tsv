@@ -325,3 +325,9 @@ parity	stdlib/uri_functions_as_values	The Rust emitter sets up encodeURIComponen
 selfconf-unported	stdlib/uri_functions_as_values	Frozen emitter lacks the URI functions as global values (LoadBuiltinFn 'globalref.encodeURIComponent', Session 353): the Rust emitter sets them up for a program that names one; native Rust output matches V8.
 selfconf-unported	numbers/math_ieee754	Frozen emitter calls libm for Math's transcendental functions; the Rust emitter calls V8's implementations (ts_m_*, runtime/ts_ieee754.c), bit-identical to Node.
 parity-unported	numbers/math_ieee754	Frozen emitter lacks the typed-array-over-a-buffer constructor (builtin typedarray.new, `new Uint32Array(f64.buffer)`, the fixture's bit view); the Rust emitter supports it.
+parity-unported	numbers/shortest_digits	Frozen emitter lacks the typed-array-over-a-buffer constructor (builtin typedarray.new, a Uint32Array over a Float64Array's buffer, the bit view); the Rust emitter supports it.
+selfconf-unported	numbers/shortest_digits	Frozen emitter lacks the typed-array-over-a-buffer constructor (builtin typedarray.new); the Rust emitter supports it, and the native output matches V8.
+parity-unported	modules/ndarray	Frozen emitter lacks the typed-array-over-a-buffer constructor (builtin typedarray.new, a Uint32Array over a Float64Array's buffer, the bit view); the Rust emitter supports it.
+selfconf-unported	modules/ndarray	Frozen emitter lacks the typed-array-over-a-buffer constructor (builtin typedarray.new); the Rust emitter supports it, and the native output matches V8.
+parity-unported	modules/ndarray_models	Frozen emitter lacks the typed-array-over-a-buffer constructor (builtin typedarray.new, a Uint32Array over a Float64Array's buffer, the bit view); the Rust emitter supports it.
+selfconf-unported	modules/ndarray_models	Frozen emitter lacks the typed-array-over-a-buffer constructor (builtin typedarray.new); the Rust emitter supports it, and the native output matches V8.

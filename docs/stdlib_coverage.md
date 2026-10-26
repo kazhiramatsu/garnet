@@ -66,6 +66,13 @@ JSON:   stringify (primitives/arrays/objects/Map; functions+undefined omitted;
         works on parsed results); typed parse through `garnet:json`
         (`JSON.parse<T>(text)` validated against T, objects in T's layout,
         a TypeError naming the path; docs/typed_json_design.md)
+garnet:ndarray: NDArray over typed storage (float64 fast path; float32, int8..uint32,
+        float16, bfloat16 through the dtype), creation (zeros ones full generate
+        fromFunction from tensor arange linspace eye), row views, reshape, astype,
+        add sub mul div map exp log sqrt tanh sigmoid clip maximum minimum, sum mean
+        max min argmax argmin, dot outer transpose, slice concat flatten, equals
+        allclose, rows/entries/values generators, Random (uniform normal integers
+        shuffle stream); docs/ndarray_design.md
 Promise: constructor executor, resolve/reject/all/race/allSettled/any,
         then/catch/finally.
 RegExp: literal and constructor objects (a constant or a dynamic pattern and

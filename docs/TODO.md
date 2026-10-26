@@ -10213,3 +10213,43 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   of two from 2^1023 to 2^-1074 through String and a template literal, the
   forms agreeing with JSON.stringify, hashes of the strings of 20,000 random
   bit patterns and of 20,000 values near powers of two, the classic cases.
+- `garnet:ndarray` (Session 353, `docs/ndarray_design.md`,
+  `lib/garnet/ndarray.ts`): n-dimensional arrays over typed storage, numpy's
+  style, derived from DeepLearningJS by Yusuke Sugomori (MIT) and rewritten
+  for typed storage, dtypes and TypeScript at Kaz's request (a numeric
+  module as a standard module and as a test of the optimization work). The
+  decisions: a contiguous row-major typed buffer with a shape (one allocation
+  per array, every elementwise kernel a flat loop; nested arrays only at the
+  boundary); the rank in the type (`NDArray<R>`, `Vector`/`Matrix`/`Tensor3`
+  inferred from tuple shapes, lowered by `row`, kept by the elementwise
+  functions, `dot` overloaded on it); a dtype descriptor with float64 as the
+  fast path and float32, the integer dtypes, float16 and bfloat16 (bits in a
+  Uint16Array, decoded and encoded by the descriptor) through generic kernels
+  (arithmetic in double, stored through the dtype: integers wrap, narrower
+  floats round, numpy's promotion without int64); one initializer with typed
+  producers (`generate`, `fromFunction`, `from(iterable)`, `tensor`) and ES
+  generators only where lazy makes sense (`rows`, `entries`, `values`,
+  `Random.stream`); `Random` as numpy's Generator over xoshiro128** (int32
+  arithmetic only, so garnet and Node draw the same numbers); loud
+  DimensionErrors, no silent broadcasting beyond a scalar operand; `row` and
+  `reshape` the only views. The original's bugs are fixed (`equals` compared
+  one row, `sub(scalar, tensor)` had its sign reversed, `div(scalar, tensor)`
+  threw, `normal` ignored its parameters, `softmax.grad` was missing, the
+  LSTM's first cell stayed zero). Test programs: `modules/ndarray` (the API,
+  the dtypes, the generators, the errors), `modules/ndarray_models` (an LSTM
+  and an RNN trained by backpropagation through time; the predictions equal
+  Node's bit for bit, which the V8-exact Math made possible: before it, the
+  training diverged in the last bits), and `benchmarks/patterns/lstm_sinwave`
+  (the LSTM at a kernel's size, 16 hidden units, 150 epochs). Measured
+  (`scripts/pattern_bench.sh`, strict): native 97 ms against Node's 256 ms
+  (0.38), the first kernel of the survey where an allocation-heavy small-array
+  workload is far ahead of V8; the full DeepLearningJS program (200 LSTM
+  epochs and 100 RNN epochs) runs in 0.13 s native against 0.11 s under Node,
+  startup included, too small to compare. `scripts/lib/mf.sh` runs node with
+  the garnet scheme loader when a module graph imports `garnet:*`. The
+  dtype-specialized kernels are the compiler task the module motivates: the
+  whole-program analysis sees which storage kinds reach a kernel and can emit
+  a C copy per kind with one dispatch at the call (ahead of time, not at run
+  time). Next for the module: axis arguments for the reductions, general
+  broadcasting, strided views; `garnet:nn` if the activations and the models
+  earn a home.

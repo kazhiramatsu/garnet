@@ -460,6 +460,17 @@ startup). `parseWithSchema` takes the schema string explicitly, and under
 Node.js the same import resolves to a polyfill (`parse<T>` without the
 compiler's schema is the plain parse there).
 
+Numeric arrays: `import * as nd from "garnet:ndarray"` is an n-dimensional
+array module in the style of numpy (`docs/ndarray_design.md`): a contiguous
+typed buffer with a shape, `float64` by default and `float32`, the integer
+dtypes, `float16` and `bfloat16` as alternatives, the rank in the type
+(`zeros([3, 4])` is a `Matrix`, `tensor([1, 2])` a `Vector`), elementwise
+arithmetic with scalar operands, `dot`, `outer`, `transpose`, slicing and
+concatenation, reductions, lazy `rows()`/`entries()` generators, and a seeded
+`Random` (xoshiro128**) whose stream is the same under Node.js. The module is
+TypeScript compiled with your program, so its loops are the compiled loops of
+the section above; a shape mismatch throws a `DimensionError`.
+
 Not available yet: `Intl` and the locale methods (`toLocaleString`,
 `localeCompare`), `DataView`, `WeakRef` and `FinalizationRegistry`, the Set
 algebra methods (`union` and the others), `Date` parsing and setters, and the

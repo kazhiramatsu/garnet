@@ -45,7 +45,10 @@ mf() {
   # node baseline
   node "$ROOT/build/mfnode.js" "$dir" 2>/dev/null
   local nodeout
-  nodeout=$(node "$dir/entry.mjs" 2>&1 | tr '\n' '|')
+  # a program importing one of garnet's modules (`garnet:<name>`) runs node with the scheme's loader
+  local nodeflags=""
+  grep -lq "garnet:" "$dir"/*.mjs 2>/dev/null && nodeflags="--import $ROOT/scripts/garnet_scheme_loader.mjs"
+  nodeout=$(node $nodeflags "$dir/entry.mjs" 2>&1 | tr '\n' '|')
   # tsaot bundle
   local exout
   exout=$(node "$ROOT/exporter/exporter.js" "$entry" "$dir/out.json" "$dir/lbl.json" 2>&1)
