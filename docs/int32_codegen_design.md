@@ -110,3 +110,68 @@ Next: the chain is `long long`; a `| 0`-terminated chain of int32-by-
 definition values could be emitted in `int32_t` with wrapping arithmetic
 (a ring homomorphism, the same final value), which lets the C compiler
 vectorize the dot product with 32-bit lanes.
+
+## int32 locals (Session 353)
+
+The integer locals were all `long long`. The Q8_0 dot product of the llama
+program, an integer chain after the previous section, ran at 6.3 tokens/s
+with 32-bit vector lanes only where the C compiler could prove the narrowing
+itself; a C-level experiment that declared the inner loop's locals `int32_t`
+ran at 10.4. `int32_narrow_locals` now decides, per function, which integer
+locals are stored as `int32_t`:
+
+- **exact**: an int local whose fact's range lies within int32 (its value
+  always fits), and an int32-use local (ToInt32 by definition);
+- **wrap-safe**: an int local whose every use is a bitwise operand, `~`, a
+  copy into another wrap-safe local, or an operand of `+`, `-` or `*` whose
+  result is a narrow local, and whose every definition is `+`, `-`, `*`, a
+  bitwise operator, `~` or a copy of a narrow local. Such a local is observed
+  only modulo 2^32, so holding the low 32 bits is exact for every consumer:
+  `isum + a * b` in `isum = (isum + a * b) | 0` may exceed int32, but only the
+  `| 0` sees it.
+
+Three refinements the first build needed. A `| 0` accumulator's range is
+lost in the loop join (the facts widen a value that changes across
+iterations), so an int local whose every definition is a bitwise operator other than the
+unsigned shift (whose result is a uint32), `~`, an int32 constant or a copy
+of such a local (`int32_by_definition`, the fixpoint the negative-zero rule
+already computed, less the `>>>` results and their copies) counts as exact,
+and every bitwise result carries its int32 range explicitly. A narrow local that meets
+a wide integer (an operand or the result of its `+ - *` or comparison a long
+long local), or that is passed, returned, stored as a value or used by
+anything but the arithmetic, the bitwise operators, a copy, a condition or an
+index, would be widened (`sxtw`) at that use: it stays wide. And among the
+locals merely proven to lie within int32 (a loop counter, a char code) only
+the constants seed the narrow set: outside the bitwise chains int32 storage
+saves nothing and costs the widenings at index uses and conversions. The
+flagship compiler, which narrowed 91% of its integer locals under the first
+rule and ran 0.3% more instructions, narrows 8% under the final one and runs
+the same instructions (1.0002 of the previous build); the kernels' chains,
+all int32-use, int32 by definition or wrap-safe, keep their int32 lanes
+(TinyLlama 11.0 tokens/s either way).
+
+Parameters keep the long long of the direct entries; async and generator
+functions keep every local wide (their frames). The emission: a narrow
+result of `+`, `-` or `*` is `(int32_t)((uint32_t)l op (uint32_t)r)` (the
+residue, exact when the range proved the value fits, which also lets a wide
+operand's low 32 bits stand in); a narrow operand of a long long result is
+widened first (no 32-bit overflow in C); the remainder fast path widens its
+operands; comparisons, bitwise operators, conversions, calls and stores
+take the int32 through C's promotions. `TSAOT_INT32_NARROW=0` keeps every
+integer local a long long (the parity oracle's environment).
+
+Measured: TinyLlama-1.1B-Chat Q8_0 6.3 -> 11.0 tokens/s (prompt 10.6), Node
+2.1, outputs identical; the kernel's inner loop now compiles to `sdot`
+(the int8 dot-product instruction llama.cpp's own kernels use). The pattern
+kernels: `scanner_ident` 71 ms against Node's 132, `lstm_sinwave` 86 against
+262, `typed_array_loops` and `switch_dispatch` unchanged. Fixture
+`numbers/int32_narrow_locals` (plain, strict, GC protect): hashes, sums that
+overflow int32 on the way to a `| 0` beside the same sums observed exactly,
+products at the int32 limits, the negation of the minimum, remainders of
+negatives and of the minimum by -1, copies between narrow and wide locals, a
+narrow local as an index and a bound.
+
+Also in this slice: the `(x << k) >> k` peephole (`shl_const_def`): a
+sign extension of the low 8 or 16 bits emitted as a cast; alone it made the
+long long chain slower (4.0 tokens/s against the select form's 6.3, the
+vectorizer's choice), with the int32 locals it is the form `sdot` wants.

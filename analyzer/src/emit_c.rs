@@ -1886,6 +1886,8 @@ struct Ctx<'a> {
     /// Unboxed doubles whose every use is a bitwise operand (or a copy into
     /// such a local): ToInt32 once at each definition, `(int32_t)` at the uses.
     int32_use: BTreeSet<u32>,
+    /// the integer locals stored as int32_t (int32_narrow_locals)
+    narrow: BTreeSet<u32>,
     local_class: BTreeMap<u32, u32>,
     classes: &'a BTreeMap<u32, &'a ClassDef>,
     strat: &'a BTreeMap<u32, AllocStrategy>,
@@ -1972,6 +1974,9 @@ struct Ctx<'a> {
     nonzero_int: BTreeSet<u32>,
     /// integer constant value per local, when known.
     int_const: BTreeMap<u32, i64>,
+    /// locals defined once by `x << k` with a constant k in 0..31: dst -> (x, k), for the
+    /// sign-extension peephole of `(x << k) >> k`
+    shl_const_def: BTreeMap<u32, (u32, u8)>,
     /// locals known to hold nonnegative integer values.
     nonnegative_int: BTreeSet<u32>,
     /// int locals provably within ±2^53: their +/- results can't cross the
@@ -5341,7 +5346,13 @@ struct NumericAnalysis {
     nonzero_int_const: BTreeSet<u32>,
     nonzero_int: BTreeSet<u32>,
     int_const: BTreeMap<u32, i64>,
+    /// locals defined once by `x << k` with a constant k in 0..31: dst -> (x, k), for the
+    /// sign-extension peephole of `(x << k) >> k`
+    shl_const_def: BTreeMap<u32, (u32, u8)>,
     nonnegative_int: BTreeSet<u32>,
+    /// locals whose every definition is a bitwise operator, `~`, an int32 constant or a copy of
+    /// such a local: an int32 value whatever the loop joins did to its range
+    int32_by_definition: BTreeSet<u32>,
 }
 
 fn safe_i64_num(value: f64) -> Option<i64> {
@@ -7285,6 +7296,152 @@ fn int32_disallowed_use(body: &[Inst], x: u32, cands: &BTreeSet<u32>) -> bool {
         other => inst_uses_any(other, &one),
     })
 }
+/// TSAOT_INT32_NARROW=0 keeps every integer local a long long (the parity oracle).
+fn int32_narrow_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_INT32_NARROW").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+/// The integer locals stored as int32_t (docs/int32_codegen_design.md, "int32 locals"): an
+/// int local whose fact's range lies within int32 (its value always fits, so the storage is
+/// exact), an int32-use local (ToInt32 by definition), and a wrap-safe local: an int local
+/// whose every use is a bitwise operand, `~`, a copy into another wrap-safe local, or an
+/// operand of `+`, `-` or `*` whose result is a narrow local, and whose every definition is
+/// `+`, `-`, `*`, a bitwise operator, `~` or a copy of a narrow local. Such a local is
+/// observed only modulo 2^32, and the wrapping arithmetic on the low 32 bits (a ring
+/// homomorphism) gives every consumer the value it would have seen. Parameters keep the
+/// long long of the direct entries. The C compiler vectorizes an int32 chain with 32-bit
+/// lanes where the long long chain ran at half the speed or less.
+fn int32_narrow_locals(f: &Function, facts: &BTreeMap<u32, NumFact>, int_local: &BTreeSet<u32>, int32_use: &BTreeSet<u32>, int32_by_definition: &BTreeSet<u32>) -> BTreeSet<u32> {
+    if !int32_narrow_enabled() {
+        return BTreeSet::new();
+    }
+    let params: BTreeSet<u32> = f.params.iter().map(|p| p.0).collect();
+    let mut flat: Vec<&Inst> = Vec::new();
+    flatten_inst(&f.body, &mut flat);
+    let mut exact: BTreeSet<u32> = int32_use.iter().filter(|id| !params.contains(id)).copied().collect();
+    // an int local defined only by bitwise operators, int32 constants and copies of such locals
+    // is an int32 whatever the loop joins did to its range (a `| 0` accumulator). The
+    // analysis's set admits the unsigned shift (its negative-zero rule needs an integer only);
+    // `v >>> 0` is a uint32, so the `>>>` results and their copies leave the seed here.
+    let mut by_def: BTreeSet<u32> = int32_by_definition.iter().filter(|id| int_local.contains(id) && !params.contains(id)).copied().collect();
+    loop {
+        let snapshot = by_def.clone();
+        by_def.retain(|&x| {
+            flat.iter().all(|inst| match inst {
+                Inst::BinOp { dst, op, .. } if dst.0 == x => op != ">>>",
+                Inst::Copy { dst, src } if dst.0 == x => snapshot.contains(&src.0),
+                _ => true,
+            })
+        });
+        if by_def.len() == snapshot.len() {
+            break;
+        }
+    }
+    exact.extend(by_def);
+    // an int32 constant is a narrow seed (its storage is folded anyway; it keeps `i + 1` and
+    // `x * 4` narrow); a local merely proven to lie within int32 (a loop counter, a char code)
+    // is not: outside the bitwise chains int32 storage only costs the widenings at its index
+    // uses and conversions
+    for (id, fact) in facts {
+        if int_local.contains(id) && !params.contains(id) && fact.const_i64.map_or(false, |c| (-2147483648..=2147483647).contains(&c)) {
+            exact.insert(*id);
+        }
+    }
+    let mut wrap: BTreeSet<u32> = int_local.iter().filter(|id| !exact.contains(id) && !params.contains(id)).copied().collect();
+    // the definitions a wrap-safe local may have
+    wrap.retain(|&x| {
+        flat.iter().all(|inst| match inst {
+            Inst::BinOp { dst, op, .. } if dst.0 == x => matches!(op.as_str(), "+" | "-" | "*") || is_bitwise_op(op),
+            Inst::UnOp { dst, op, .. } if dst.0 == x => op == "~",
+            Inst::Copy { dst, src } if dst.0 == x => exact.contains(&src.0) || int_local.contains(&src.0),
+            other => inst_def_local(other) != Some(x),
+        })
+    });
+    // the uses, a fixpoint: a copy's target and a sum's or product's result must be narrow too
+    loop {
+        let snapshot = wrap.clone();
+        wrap.retain(|&x| {
+            let one: BTreeSet<u32> = std::iter::once(x).collect();
+            flat.iter().all(|inst| match inst {
+                Inst::BinOp { dst, op, lhs, rhs } if lhs.0 == x || rhs.0 == x => {
+                    is_bitwise_op(op) || (matches!(op.as_str(), "+" | "-" | "*") && (exact.contains(&dst.0) || snapshot.contains(&dst.0)))
+                }
+                Inst::UnOp { operand, op, .. } if operand.0 == x => op == "~",
+                Inst::Copy { dst, src } if src.0 == x => snapshot.contains(&dst.0),
+                Inst::If { cond, .. } | Inst::Loop { cond, .. } => cond.0 != x,
+                Inst::TryCatch { .. } => true,
+                other => !inst_uses_any(other, &one),
+            })
+        });
+        if wrap.len() == snapshot.len() {
+            break;
+        }
+    }
+    // a wrap-safe local copied from a wide int local would need the copy to wrap explicitly;
+    // keep those wide (the copy sources above were allowed for the exact case)
+    let wrap_snapshot = wrap.clone();
+    wrap.retain(|&x| {
+        flat.iter().all(|inst| match inst {
+            Inst::Copy { dst, src } if dst.0 == x => exact.contains(&src.0) || wrap_snapshot.contains(&src.0) || src.0 == x,
+            _ => true,
+        })
+    });
+    // A narrow local that meets a wide integer (an operand or the result of its `+ - *` or
+    // comparison a long long local), that is passed, returned, stored or used by anything but
+    // the arithmetic, the bitwise operators, a copy, a condition or an index would be widened
+    // at that use (an `sxtw` each time); such a local stays wide. With the constants-only
+    // seeding above, the flagship compiler narrows 8% of its integer locals and runs the same
+    // instructions as before (the first rule narrowed 91% and ran 0.3% more); the kernels'
+    // chains, int32-use, int32 by definition or wrap-safe, keep their int32 lanes.
+    let mut narrow: BTreeSet<u32> = exact.union(&wrap).copied().collect();
+    let trace = std::env::var("TSAOT_NUM_TRACE").is_ok();
+    if trace {
+        eprintln!("[narrow] function {:?} exact={:?} wrap={:?}", f.name, exact, wrap);
+    }
+    loop {
+        let before = narrow.len();
+        let snapshot = narrow.clone();
+        let wide_int = |id: u32| int_local.contains(&id) && !snapshot.contains(&id);
+        narrow.retain(|&x| {
+            let one: BTreeSet<u32> = std::iter::once(x).collect();
+            // the first use that would widen the local, if any
+            let culprit = flat.iter().find(|inst| match inst {
+                Inst::BinOp { dst, op, lhs, rhs } if lhs.0 == x || rhs.0 == x => {
+                    let other = if lhs.0 == x { rhs.0 } else { lhs.0 };
+                    let arith_or_cmp = is_bitwise_op(op) || matches!(op.as_str(), "+" | "-" | "*" | "<" | "<=" | ">" | ">=" | "==" | "!=" | "===" | "!==");
+                    !(arith_or_cmp && !wide_int(other) && !wide_int(dst.0))
+                }
+                Inst::BinOp { .. } => false,
+                Inst::UnOp { operand, op, .. } if operand.0 == x => op != "~",
+                Inst::UnOp { .. } => false,
+                Inst::Copy { dst, src } if src.0 == x => !snapshot.contains(&dst.0),
+                Inst::Copy { .. } => false,
+                Inst::Const { .. } => false,
+                Inst::If { .. } | Inst::Loop { .. } | Inst::TryCatch { .. } => false,
+                Inst::LoadIndex { .. } => false,
+                Inst::StoreIndex { index, src, .. } => src.0 == x && index.0 != x,
+                other => inst_uses_any(other, &one),
+            });
+            if let Some(c) = culprit {
+                if trace {
+                    eprintln!("[narrow] drop {}: {}", x, format!("{:?}", c).chars().take(110).collect::<String>());
+                }
+                false
+            } else {
+                true
+            }
+        });
+        if narrow.len() == before {
+            break;
+        }
+    }
+    narrow
+}
 fn int32_use_locals(f: &Function, unboxed: &BTreeSet<u32>, int_local: &BTreeSet<u32>) -> BTreeSet<u32> {
     if !int32_uses_enabled() {
         return BTreeSet::new();
@@ -7526,36 +7683,31 @@ fn infer_numeric_analysis(
                         // `>> k` is [-2^(31-k), 2^(31-k) - 1] and `>>> k` is [0, 2^(32-k) - 1] for
                         // a constant shift in 1..31, and `x | 0` keeps a range of x that lies
                         // within int32 (ToInt32 is the identity on it)
+                        // (every bitwise result is an int32: the range is explicit, so the int32
+                        // storage of locals (int32_narrow_locals) sees it)
                         "&" => {
                             let mask = l.const_i64.filter(|c| (0..=0x7fff_ffff).contains(c)).or_else(|| r.const_i64.filter(|c| (0..=0x7fff_ffff).contains(c)));
                             match mask {
                                 Some(c) => NumFact::range(0, c),
-                                None => NumFact::int32_value(),
+                                None => NumFact::range(-2147483648, 2147483647),
                             }
                         }
                         "|" => {
                             let kept = if l.const_i64 == Some(0) { range_of(&r) } else if r.const_i64 == Some(0) { range_of(&l) } else { None };
                             match kept {
                                 Some((lo, hi)) if lo >= -2147483648 && hi <= 2147483647 => NumFact::range(lo, hi),
-                                _ => NumFact::int32_value(),
+                                _ => NumFact::range(-2147483648, 2147483647),
                             }
                         }
                         ">>" => match r.const_i64 {
                             Some(k) if (1..=31).contains(&k) => NumFact::range(-(1i64 << (31 - k)), (1i64 << (31 - k)) - 1),
-                            _ => NumFact::int32_value(),
+                            _ => NumFact::range(-2147483648, 2147483647),
                         },
                         ">>>" => match r.const_i64 {
                             Some(k) if (1..=31).contains(&k) => NumFact::range(0, (1i64 << (32 - k)) - 1),
-                            _ => NumFact {
-                                i64_safe: true,
-                                nonneg: true,
-                                maybe_zero: true,
-                                const_i64: None,
-                                min_i64: None,
-                                max_i64: None,
-                            },
+                            _ => NumFact::range(0, 4294967295),
                         },
-                        "^" | "<<" => NumFact::int32_value(),
+                        "^" | "<<" => NumFact::range(-2147483648, 2147483647),
                         "+" => {
                             if let (Some(a), Some(b)) = (l.const_i64, r.const_i64) {
                                 checked_safe_i64(a as i128 + b as i128)
@@ -7894,6 +8046,24 @@ fn infer_numeric_analysis(
             }
         })
         .collect();
+    // `x << k` with a constant k, the local defined once: the `>>` emission folds `(x << k) >> k`
+    // into a sign extension
+    let mut shl_const_def: BTreeMap<u32, (u32, u8)> = BTreeMap::new();
+    let mut shl_def_counts: BTreeMap<u32, usize> = BTreeMap::new();
+    for i in flat.iter().filter_map(|i| inst_def_local(i)) {
+        *shl_def_counts.entry(i).or_insert(0) += 1;
+    }
+    for inst in &flat {
+        if let Inst::BinOp { dst, op, lhs, rhs } = inst {
+            if op == "<<" && shl_def_counts.get(&dst.0) == Some(&1) {
+                if let Some(k) = facts.get(&rhs.0).and_then(|f| f.const_i64) {
+                    if (0..=31).contains(&k) {
+                        shl_const_def.insert(dst.0, (lhs.0, k as u8));
+                    }
+                }
+            }
+        }
+    }
     NumericAnalysis {
         facts,
         int_local,
@@ -7901,6 +8071,8 @@ fn infer_numeric_analysis(
         nonzero_int,
         int_const,
         nonnegative_int,
+        shl_const_def,
+        int32_by_definition,
     }
 }
 
@@ -8970,6 +9142,9 @@ fn emit_i64_function(
     let nonzero_int_const = numeric.nonzero_int_const;
     let nonzero_int = numeric.nonzero_int;
     let int_const = numeric.int_const;
+    let shl_const_def = numeric.shl_const_def;
+    let numeric_facts = numeric.facts;
+    let numeric_int32_by_definition = numeric.int32_by_definition;
     let nonnegative_int = numeric.nonnegative_int;
     let numeric_targets = numeric_fast_targets(i64_fast, f64_fast);
     let numeric_value_local = numeric_value_locs(&f.body, &info.params, &numeric_targets);
@@ -9031,8 +9206,15 @@ fn emit_i64_function(
     } else {
         BTreeSet::new()
     };
+    let narrow = if int32_codegen_enabled() && !f.is_async && !f.is_generator {
+        int32_narrow_locals(f, &numeric_facts, &int_local, &int32_use_decl, &numeric_int32_by_definition)
+    } else {
+        BTreeSet::new()
+    };
     for l in &f.locals {
-        if int_local.contains(&l.id.0) || int32_use_decl.contains(&l.id.0) {
+        if narrow.contains(&l.id.0) {
+            let _ = writeln!(s, "  int32_t d{} = 0;", l.id.0);
+        } else if int_local.contains(&l.id.0) || int32_use_decl.contains(&l.id.0) {
             let _ = writeln!(s, "  long long d{} = 0;", l.id.0);
         } else if unboxed.contains(&l.id.0) {
             let _ = writeln!(s, "  double d{} = 0;", l.id.0);
@@ -9101,6 +9283,7 @@ fn emit_i64_function(
         accums: accums.clone(),
         frame_nslots,
         int32_use: int32_use_locals(f, &unboxed, &int_local),
+        narrow: narrow.clone(),
         unboxed,
         int_local,
         local_class,
@@ -9140,6 +9323,7 @@ fn emit_i64_function(
         nonzero_int_const,
         nonzero_int,
         int_const,
+        shl_const_def,
         nonnegative_int,
         label_ctr: std::cell::Cell::new(900000),
         loop_labels: std::cell::RefCell::new(Vec::new()),
@@ -9199,6 +9383,9 @@ fn emit_f64_function(
     let nonzero_int_const = numeric.nonzero_int_const;
     let nonzero_int = numeric.nonzero_int;
     let int_const = numeric.int_const;
+    let shl_const_def = numeric.shl_const_def;
+    let numeric_facts = numeric.facts;
+    let numeric_int32_by_definition = numeric.int32_by_definition;
     let nonnegative_int = numeric.nonnegative_int;
     let numeric_targets = numeric_fast_targets(i64_fast, f64_fast);
     let numeric_value_local = numeric_value_locs(&f.body, &info.params, &numeric_targets);
@@ -9260,8 +9447,15 @@ fn emit_f64_function(
     } else {
         BTreeSet::new()
     };
+    let narrow = if int32_codegen_enabled() && !f.is_async && !f.is_generator {
+        int32_narrow_locals(f, &numeric_facts, &int_local, &int32_use_decl, &numeric_int32_by_definition)
+    } else {
+        BTreeSet::new()
+    };
     for l in &f.locals {
-        if int_local.contains(&l.id.0) || int32_use_decl.contains(&l.id.0) {
+        if narrow.contains(&l.id.0) {
+            let _ = writeln!(s, "  int32_t d{} = 0;", l.id.0);
+        } else if int_local.contains(&l.id.0) || int32_use_decl.contains(&l.id.0) {
             let _ = writeln!(s, "  long long d{} = 0;", l.id.0);
         } else if unboxed.contains(&l.id.0) {
             let _ = writeln!(s, "  double d{} = 0;", l.id.0);
@@ -9330,6 +9524,7 @@ fn emit_f64_function(
         accums: accums.clone(),
         frame_nslots,
         int32_use: int32_use_locals(f, &unboxed, &int_local),
+        narrow: narrow.clone(),
         unboxed,
         int_local,
         local_class,
@@ -9369,6 +9564,7 @@ fn emit_f64_function(
         nonzero_int_const,
         nonzero_int,
         int_const,
+        shl_const_def,
         nonnegative_int,
         label_ctr: std::cell::Cell::new(900000),
         loop_labels: std::cell::RefCell::new(Vec::new()),
@@ -9428,6 +9624,9 @@ fn emit_function(
     let nonzero_int_const = numeric.nonzero_int_const;
     let nonzero_int = numeric.nonzero_int;
     let int_const = numeric.int_const;
+    let shl_const_def = numeric.shl_const_def;
+    let numeric_facts = numeric.facts;
+    let numeric_int32_by_definition = numeric.int32_by_definition;
     let nonnegative_int = numeric.nonnegative_int;
     let numeric_targets = numeric_fast_targets(i64_fast, f64_fast);
     let numeric_params: Vec<u32> = f.params.iter().map(|p| p.0).collect();
@@ -9457,6 +9656,7 @@ fn emit_function(
             accums: Default::default(),
             frame_nslots: 0,
             int32_use: int32_use_locals(f, &unboxed, &int_local),
+            narrow: BTreeSet::new(),
             unboxed,
             int_local,
             local_class,
@@ -9496,6 +9696,7 @@ fn emit_function(
             nonzero_int_const,
             nonzero_int,
             int_const,
+            shl_const_def: BTreeMap::new(),
             nonnegative_int,
             label_ctr: std::cell::Cell::new(900000),
             loop_labels: std::cell::RefCell::new(Vec::new()),
@@ -9529,6 +9730,7 @@ fn emit_function(
             accums: Default::default(),
             frame_nslots: 0,
             int32_use: int32_use_locals(f, &unboxed, &int_local),
+            narrow: BTreeSet::new(),
             unboxed,
             int_local,
             local_class,
@@ -9568,6 +9770,7 @@ fn emit_function(
             nonzero_int_const,
             nonzero_int,
             int_const,
+            shl_const_def: BTreeMap::new(),
             nonnegative_int,
             label_ctr: std::cell::Cell::new(900000),
             loop_labels: std::cell::RefCell::new(Vec::new()),
@@ -9601,6 +9804,7 @@ fn emit_function(
             accums: Default::default(),
             frame_nslots: 0,
             int32_use: int32_use_locals(f, &unboxed, &int_local),
+            narrow: BTreeSet::new(),
             unboxed,
             int_local,
             local_class,
@@ -9640,6 +9844,7 @@ fn emit_function(
             nonzero_int_const,
             nonzero_int,
             int_const,
+            shl_const_def: BTreeMap::new(),
             nonnegative_int,
             label_ctr: std::cell::Cell::new(900000),
             loop_labels: std::cell::RefCell::new(Vec::new()),
@@ -9730,8 +9935,15 @@ fn emit_function(
     } else {
         BTreeSet::new()
     };
+    let narrow = if int32_codegen_enabled() && !f.is_async && !f.is_generator {
+        int32_narrow_locals(f, &numeric_facts, &int_local, &int32_use_decl, &numeric_int32_by_definition)
+    } else {
+        BTreeSet::new()
+    };
     for l in &f.locals {
-        if int_local.contains(&l.id.0) || int32_use_decl.contains(&l.id.0) {
+        if narrow.contains(&l.id.0) {
+            let _ = writeln!(s, "  int32_t d{} = 0;", l.id.0);
+        } else if int_local.contains(&l.id.0) || int32_use_decl.contains(&l.id.0) {
             let _ = writeln!(s, "  long long d{} = 0;", l.id.0);
         } else if json_locals.contains(&l.id.0) {
             let _ = writeln!(s, "  tjson_value* j{} = NULL;", l.id.0);
@@ -9889,6 +10101,7 @@ fn emit_function(
 
         frame_nslots,
         int32_use: int32_use_locals(f, &unboxed, &int_local),
+        narrow: narrow.clone(),
         unboxed,
         int_local,
         local_class,
@@ -9928,6 +10141,7 @@ fn emit_function(
         nonzero_int_const,
         nonzero_int,
         int_const,
+        shl_const_def,
         nonnegative_int,
         label_ctr: std::cell::Cell::new(900000),
         loop_labels: std::cell::RefCell::new(Vec::new()),
@@ -24338,7 +24552,16 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     "!==" => "!=",
                     o => o,
                 };
-                let expr = format!("({} {} {})", l, cop, r);
+                // an int32 result wraps on the low 32 bits (exact when the range proves the
+                // value fits, the residue the consumers want otherwise); an int32 operand of a
+                // long long result is widened first (no 32-bit overflow in C)
+                let expr = if is_i64_arith_fast && ctx.narrow.contains(&dst.0) {
+                    format!("(int32_t)((uint32_t){} {} (uint32_t){})", l, cop, r)
+                } else if is_i64_arith_fast && (ctx.narrow.contains(&lhs.0) || ctx.narrow.contains(&rhs.0)) {
+                    format!("((long long){} {} (long long){})", l, cop, r)
+                } else {
+                    format!("({} {} {})", l, cop, r)
+                };
                 let is_cmp = is_cmp_fast;
                 if ctx.int_local.contains(&dst.0) {
                     s.push_str(&format!("  d{} = {};\n", dst.0, expr));
@@ -24377,6 +24600,17 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         );
                     }
                     ">>" => {
+                        // `(x << k) >> k` with the same constant k (24 or 16) is the sign
+                        // extension of x's low 8 or 16 bits: a cast the C compiler folds into
+                        // the load (the quantized kernels' int8 values), where the select
+                        // below cost a quarter of the Q8_0 dot product's time
+                        if let (true, Some(&k), Some(&(src, ks))) = (int32_narrow_enabled(), ctx.int_const.get(&rhs.0), ctx.shl_const_def.get(&lhs.0)) {
+                            if k == ks as i64 && (k == 24 || k == 16) && (ctx.int_local.contains(&src) || ctx.int32_use.contains(&src)) {
+                                let narrow = if k == 24 { "(int8_t)(uint8_t)" } else { "(int16_t)(uint16_t)" };
+                                let _ = writeln!(s, "  d{} = (long long){}(uint32_t)d{};", dst.0, narrow, src);
+                                return;
+                            }
+                        }
                         // the branchless select, not C's `>>` on an int32 (implementation-
                         // defined, though arithmetic everywhere): measured on the Q8_0 dot
                         // product of the llama program, clang 21 vectorizes this form
@@ -24452,7 +24686,12 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             // cannot trap. The lhs is nonnegative by the destination's int fact, so
             // JS negative-zero remainder is impossible on this path.
             if op == "%" && both_int && dst_int && ctx.nonzero_int.contains(&rhs.0) {
-                let expr = format!("(d{} % d{})", lhs.0, rhs.0);
+                // the operands widened when either may be an int32 local (INT32_MIN % -1)
+                let expr = if ctx.narrow.contains(&lhs.0) || ctx.narrow.contains(&rhs.0) {
+                    format!("((long long)d{} % (long long)d{})", lhs.0, rhs.0)
+                } else {
+                    format!("(d{} % d{})", lhs.0, rhs.0)
+                };
                 s.push_str(&format!("  d{} = {};\n", dst.0, expr));
                 return;
             }

@@ -10356,3 +10356,38 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   accumulators), the remainder rows one at a time: 4.3 -> 6.3 tokens/s native
   (Node 2.1 on the same source, 3.0x), outputs identical over 32 generated
   tokens.
+- int32 locals (Session 353, `docs/int32_codegen_design.md` "int32 locals").
+  A C-level experiment that declared the Q8_0 kernel's inner-loop locals
+  `int32_t` ran 6.3 -> 10.4 tokens/s, so the emitter now stores as `int32_t`
+  the integer locals whose range lies within int32 or that are int32-use, and
+  the wrap-safe ones (every use a bitwise operand, `~`, a copy into a wrap-safe
+  local, or an operand of `+ - *` with a narrow result; every definition
+  arithmetic, bitwise or a copy of a narrow local), observed only modulo 2^32;
+  a narrow result of `+ - *` wraps on the low 32 bits explicitly, a narrow
+  operand of a wide result is widened first, parameters and the coroutine
+  functions stay wide. Three refinements: a `| 0` accumulator loses its range
+  in the loop join, so the int32-by-definition locals count as exact (less
+  the `>>>` results and their copies, a uint32: the first build of that seed
+  stored `v >>> 0` as an int32 and printed -1 for 4294967295, which the
+  conformance fixture `operators/bitwise_int32_edges` caught in all three
+  modes) and every bitwise result carries its int32 range; a narrow local
+  that meets a wide
+  integer, is passed, returned or stored stays wide; and only the constants
+  among the locals merely proven within int32 seed the set (the first rule
+  narrowed 91% of tsc-ts's integer locals and ran 0.3% more instructions from
+  the widenings; the final one narrows 8% and runs the same instructions,
+  1.0002). `TSAOT_INT32_NARROW=0` in the parity oracle. With the
+  `(x << k) >> k` sign-extension peephole the inner loop compiles to `sdot`:
+  TinyLlama-1.1B-Chat Q8_0 11.0 tokens/s native (prompt 10.8), Node 3.3 on the
+  same source measured in the same quiet session, outputs identical; `scanner_ident` 71 ms against Node's 132,
+  `lstm_sinwave` 86 against 262, the other kernels unchanged. Fixture
+  `numbers/int32_narrow_locals` (plain, strict, GC protect). Kaz asked whether
+  this could end up faster than llama.cpp itself: the clone and build of
+  llama.cpp for a measured comparison was refused by the session's permission
+  mode (external code); the estimate for this M5 is llama.cpp CPU 25-35
+  tokens/s on one thread, 60-80 on four, 100+ on Metal; the realistic goal is
+  the single-thread CPU class from pure TypeScript, with fork workers over a
+  SharedArrayBuffer for the threads. Gates: parity 384 identical, selfconf, unit, bundler
+  45/45, conformance 607/607 plain and strict and 604/604 under GC protect,
+  GC stress, bench within budget; tsc-ts output identical, instructions
+  0.9999 of the previous slice.
