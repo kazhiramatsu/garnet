@@ -1991,7 +1991,7 @@ struct Ctx<'a> {
     /// The versioned typed-array loop being emitted (docs/typed_array_loops_design.md):
     /// (the loop's top label, its induction local); element accesses of hoisted
     /// views by that local are direct within it.
-    ta_prefix: std::cell::Cell<Option<(u32, u32)>>,
+    ta_prefix: std::cell::RefCell<Option<TaPrefix>>,
     /// string receivers of `charCodeAt` whose view the enclosing loop read once:
     /// local -> the loop's top label
     sv_hoisted: std::cell::RefCell<BTreeMap<u32, u32>>,
@@ -9065,7 +9065,7 @@ fn emit_i64_function(
         loop_labels: std::cell::RefCell::new(Vec::new()),
         ta_hoisted: std::cell::RefCell::new(BTreeMap::new()),
         layout_open: std::cell::RefCell::new(BTreeMap::new()),
-        ta_prefix: std::cell::Cell::new(None),
+        ta_prefix: std::cell::RefCell::new(None),
         sv_hoisted: std::cell::RefCell::new(BTreeMap::new()),
         loop_mod_residues: std::cell::RefCell::new(Vec::new()),
         fin_stack: std::cell::RefCell::new(Vec::new()),
@@ -9294,7 +9294,7 @@ fn emit_f64_function(
         loop_labels: std::cell::RefCell::new(Vec::new()),
         ta_hoisted: std::cell::RefCell::new(BTreeMap::new()),
         layout_open: std::cell::RefCell::new(BTreeMap::new()),
-        ta_prefix: std::cell::Cell::new(None),
+        ta_prefix: std::cell::RefCell::new(None),
         sv_hoisted: std::cell::RefCell::new(BTreeMap::new()),
         loop_mod_residues: std::cell::RefCell::new(Vec::new()),
         fin_stack: std::cell::RefCell::new(Vec::new()),
@@ -9421,7 +9421,7 @@ fn emit_function(
             loop_labels: std::cell::RefCell::new(Vec::new()),
         ta_hoisted: std::cell::RefCell::new(BTreeMap::new()),
         layout_open: std::cell::RefCell::new(BTreeMap::new()),
-        ta_prefix: std::cell::Cell::new(None),
+        ta_prefix: std::cell::RefCell::new(None),
         sv_hoisted: std::cell::RefCell::new(BTreeMap::new()),
             loop_mod_residues: std::cell::RefCell::new(Vec::new()),
             fin_stack: std::cell::RefCell::new(Vec::new()),
@@ -9493,7 +9493,7 @@ fn emit_function(
             loop_labels: std::cell::RefCell::new(Vec::new()),
         ta_hoisted: std::cell::RefCell::new(BTreeMap::new()),
         layout_open: std::cell::RefCell::new(BTreeMap::new()),
-        ta_prefix: std::cell::Cell::new(None),
+        ta_prefix: std::cell::RefCell::new(None),
         sv_hoisted: std::cell::RefCell::new(BTreeMap::new()),
             loop_mod_residues: std::cell::RefCell::new(Vec::new()),
             fin_stack: std::cell::RefCell::new(Vec::new()),
@@ -9565,7 +9565,7 @@ fn emit_function(
             loop_labels: std::cell::RefCell::new(Vec::new()),
         ta_hoisted: std::cell::RefCell::new(BTreeMap::new()),
         layout_open: std::cell::RefCell::new(BTreeMap::new()),
-        ta_prefix: std::cell::Cell::new(None),
+        ta_prefix: std::cell::RefCell::new(None),
         sv_hoisted: std::cell::RefCell::new(BTreeMap::new()),
             loop_mod_residues: std::cell::RefCell::new(Vec::new()),
             fin_stack: std::cell::RefCell::new(Vec::new()),
@@ -9853,7 +9853,7 @@ fn emit_function(
         loop_labels: std::cell::RefCell::new(Vec::new()),
         ta_hoisted: std::cell::RefCell::new(BTreeMap::new()),
         layout_open: std::cell::RefCell::new(BTreeMap::new()),
-        ta_prefix: std::cell::Cell::new(None),
+        ta_prefix: std::cell::RefCell::new(None),
         sv_hoisted: std::cell::RefCell::new(BTreeMap::new()),
         loop_mod_residues: std::cell::RefCell::new(Vec::new()),
         fin_stack: std::cell::RefCell::new(Vec::new()),
@@ -14158,24 +14158,30 @@ fn emit_view_load(s: &mut String, ctx: &Ctx, dst: u32, arr: u32, index: u32, ele
         ("ts_ta_try_load_f", ctx.num(index), "ts_array_get_key_f64")
     };
     let slow = ctx.lazy_linked(&format!("{}({}, {})", slow_fn, a, i));
+    if ctx.unboxed.contains(&index) {
+        if let Some((helem, top)) = ctx.ta_hoisted.borrow().get(&arr).copied() {
+            if helem == elem {
+                if let Some(ix) = ta_prefix_index(ctx, top, index) {
+                    // inside the versioned prefix loop: the index is below every
+                    // accessed view's length, the data pointer a local
+                    let tad = format!("_tad{}_{}", arr, top);
+                    if int32_codegen_enabled() && elem <= 6 && ctx.int32_use.contains(&dst) {
+                        let _ = writeln!(s, "  d{} = ts_ta_elem_load_i32_v({}, {}, {});", dst, tad, ix, elem);
+                    } else if ctx.int_local.contains(&dst) {
+                        let _ = writeln!(s, "  d{} = (long long)ts_ta_elem_load_v({}, {}, {});", dst, tad, ix, elem);
+                    } else if ctx.unboxed.contains(&dst) {
+                        s.push_str(&ctx.set_num(dst, &format!("ts_ta_elem_load_v({}, {}, {})", tad, ix, elem)));
+                    } else {
+                        s.push_str(&ctx.set_val(dst, &format!("ts_num(ts_ta_elem_load_v({}, {}, {}))", tad, ix, elem)));
+                    }
+                    return;
+                }
+            }
+        }
+    }
     if int_key {
         let hoisted = ctx.ta_hoisted.borrow().get(&arr).copied();
         if let Some((helem, top)) = hoisted {
-            if helem == elem && ctx.ta_prefix.get() == Some((top, index)) {
-                // inside the versioned prefix loop: the index is below every
-                // accessed view's length, the data pointer a local
-                let tad = format!("_tad{}_{}", arr, top);
-                if int32_codegen_enabled() && elem <= 6 && ctx.int32_use.contains(&dst) {
-                    let _ = writeln!(s, "  d{} = ts_ta_elem_load_i32_v({}, (uint32_t)d{}, {});", dst, tad, index, elem);
-                } else if ctx.int_local.contains(&dst) {
-                    let _ = writeln!(s, "  d{} = (long long)ts_ta_elem_load_v({}, (uint32_t)d{}, {});", dst, tad, index, elem);
-                } else if ctx.unboxed.contains(&dst) {
-                    s.push_str(&ctx.set_num(dst, &format!("ts_ta_elem_load_v({}, (uint32_t)d{}, {})", tad, index, elem)));
-                } else {
-                    s.push_str(&ctx.set_val(dst, &format!("ts_num(ts_ta_elem_load_v({}, (uint32_t)d{}, {}))", tad, index, elem)));
-                }
-                return;
-            }
             if helem == elem {
                 // the receiver's test and length were read before the loop
                 let tah = format!("_tah{}_{}", arr, top);
@@ -14243,20 +14249,26 @@ fn emit_view_store(s: &mut String, ctx: &Ctx, arr: u32, index: u32, src: u32, el
         ("ts_ta_try_store_f", ctx.num(index), "ts_array_set_key_f64")
     };
     let slow = ctx.lazy_linked_stmt(&format!("{}({}, {}, ts_num(_tx))", slow_fn, a, i));
+    if ctx.unboxed.contains(&index) {
+        if let Some((helem, top)) = ctx.ta_hoisted.borrow().get(&arr).copied() {
+            if helem == elem {
+                if let Some(ix) = ta_prefix_index(ctx, top, index) {
+                    // inside the versioned prefix loop: an integer value into an
+                    // integer view is a narrowing cast, anything else the
+                    // element conversion
+                    if ctx.int_local.contains(&src) {
+                        let _ = writeln!(s, "  ts_ta_elem_store_i64_v(_tad{a}_{t}, {}, d{}, {});", ix, src, elem, a = arr, t = top);
+                    } else {
+                        let _ = writeln!(s, "  ts_ta_elem_store_v(_tad{a}_{t}, {}, {}, {});", ix, ctx.num(src), elem, a = arr, t = top);
+                    }
+                    return;
+                }
+            }
+        }
+    }
     if int_key {
         let hoisted = ctx.ta_hoisted.borrow().get(&arr).copied();
         if let Some((helem, top)) = hoisted {
-            if helem == elem && ctx.ta_prefix.get() == Some((top, index)) {
-                // inside the versioned prefix loop: an integer value into an
-                // integer view is a narrowing cast, anything else the
-                // element conversion
-                if ctx.int_local.contains(&src) {
-                    let _ = writeln!(s, "  ts_ta_elem_store_i64_v(_tad{a}_{t}, (uint32_t)d{}, d{}, {});", index, src, elem, a = arr, t = top);
-                } else {
-                    let _ = writeln!(s, "  ts_ta_elem_store_v(_tad{a}_{t}, (uint32_t)d{}, {}, {});", index, ctx.num(src), elem, a = arr, t = top);
-                }
-                return;
-            }
             if helem == elem {
                 let _ = writeln!(
                     s,
@@ -18759,8 +18771,28 @@ enum TaBound {
     Len(u32),
     /// an integer local the loop never assigns
     IntLocal(u32),
+    /// a double local the loop never assigns: the prefix runs below ceil(bound)
+    NumLocal(u32),
     /// an integral constant in [0, 2^32)
     Const(u64),
+}
+
+/// The offset of an index `i + off` (or `off + i`) in a simple typed-array loop's body.
+#[derive(Clone, Copy)]
+enum TaOff {
+    /// an unboxed local the loop never assigns; a double must hold an integer at run time
+    Local(u32),
+    /// an integral constant in [0, 2^32)
+    Const(u64),
+}
+
+/// Inside the versioned prefix loop of `top`: the induction local and the index
+/// locals of the form `i + off` whose offsets were hoisted as `_tao<local>_<top>`.
+#[derive(Clone)]
+struct TaPrefix {
+    top: u32,
+    ind: u32,
+    offsets: BTreeSet<u32>,
 }
 
 /// A simple typed-array loop (docs/typed_array_loops_design.md): the
@@ -18769,6 +18801,11 @@ struct TaLoopPlan {
     ind: u32,
     bound: TaBound,
     views: Vec<(u32, u8)>,
+    /// the index locals `i + off` defined at the body's top level, with their offsets
+    offsets: Vec<(u32, TaOff)>,
+    /// every (view, index) pair the body accesses; the prefix bound is clamped per
+    /// pair (None: the index is `i` itself)
+    clamps: Vec<(u32, Option<u32>)>,
 }
 
 /// Recognize a `for (let i = ...; i < bound; i++)` loop over hoisted typed-array
@@ -18838,6 +18875,8 @@ fn ta_loop_plan(cond: u32, cond_body: &[Inst], body: &[Inst], ctx: &Ctx, hoisted
                     }
                 } else if ctx.int_local.contains(&rhs.0) {
                     Some(TaBound::IntLocal(rhs.0))
+                } else if ctx.unboxed.contains(&rhs.0) {
+                    Some(TaBound::NumLocal(rhs.0))
                 } else {
                     return None;
                 };
@@ -18851,33 +18890,93 @@ fn ta_loop_plan(cond: u32, cond_body: &[Inst], body: &[Inst], ctx: &Ctx, hoisted
     let mut flat: Vec<&Inst> = Vec::new();
     flatten_inst(&cond_body[1..], &mut flat);
     flatten_inst(body, &mut flat);
-    let defs: BTreeSet<u32> = flat.iter().filter_map(|i| inst_def_local(i)).collect();
+    let mut def_counts: BTreeMap<u32, usize> = BTreeMap::new();
+    for i in flat.iter().filter_map(|i| inst_def_local(i)) {
+        *def_counts.entry(i).or_insert(0) += 1;
+    }
+    let defs: BTreeSet<u32> = def_counts.keys().copied().collect();
     if defs.contains(&ind) {
         return None;
     }
-    if let TaBound::IntLocal(b) = bound {
+    if let TaBound::IntLocal(b) | TaBound::NumLocal(b) = bound {
         if defs.contains(&b) {
             return None;
         }
     }
-    // the body: a whitelist walked structurally
+    // the body: a whitelist walked structurally. An index may also be `i + off` with
+    // `off` a loop-invariant unboxed local or an integral constant, computed at the
+    // body's top level into a local defined once (the prefix bound is clamped to
+    // `length - off` per view, and the offset is hoisted as an unsigned index).
     let mut views: Vec<(u32, u8)> = Vec::new();
-    fn walk(body: &[Inst], ind: u32, ctx: &Ctx, hoisted: &[(u32, u8)], views: &mut Vec<(u32, u8)>) -> bool {
+    let mut offsets: Vec<(u32, TaOff)> = Vec::new();
+    let mut clamps: Vec<(u32, Option<u32>)> = Vec::new();
+    let mut body_consts: BTreeMap<u32, f64> = BTreeMap::new();
+    struct Walk<'a, 'c> {
+        ind: u32,
+        ctx: &'a Ctx<'c>,
+        hoisted: &'a [(u32, u8)],
+        defs: &'a BTreeSet<u32>,
+        def_counts: &'a BTreeMap<u32, usize>,
+        views: &'a mut Vec<(u32, u8)>,
+        offsets: &'a mut Vec<(u32, TaOff)>,
+        clamps: &'a mut Vec<(u32, Option<u32>)>,
+        consts: &'a mut BTreeMap<u32, f64>,
+    }
+    fn index_ok(w: &Walk, index: u32) -> bool {
+        index == w.ind || w.offsets.iter().any(|(l, _)| *l == index)
+    }
+    fn note_access(w: &mut Walk, view: u32, index: u32) {
+        let key = (view, if index == w.ind { None } else { Some(index) });
+        if !w.clamps.contains(&key) {
+            w.clamps.push(key);
+        }
+    }
+    fn walk(body: &[Inst], w: &mut Walk, top_level: bool) -> bool {
+        let ind = w.ind;
+        let ctx = w.ctx;
+        let hoisted = w.hoisted;
         for inst in body {
             match inst {
                 Inst::Const { dst, value } => {
                     if !matches!(value, ConstVal::Num { .. } | ConstVal::Bool { .. }) || !ctx.unboxed.contains(&dst.0) {
                         return false;
                     }
+                    if let (true, ConstVal::Num { value }) = (top_level, value) {
+                        w.consts.insert(dst.0, *value);
+                    }
                 }
                 Inst::Copy { dst, src } => {
                     if !ctx.unboxed.contains(&dst.0) || !ctx.unboxed.contains(&src.0) {
                         return false;
                     }
+                    // a copy of an offset index is that index (defined once)
+                    if top_level && w.def_counts.get(&dst.0) == Some(&1) {
+                        if let Some(&(_, off)) = w.offsets.iter().find(|(l, _)| *l == src.0) {
+                            w.offsets.push((dst.0, off));
+                        }
+                    }
                 }
-                Inst::BinOp { dst, lhs, rhs, .. } => {
+                Inst::BinOp { dst, op, lhs, rhs } => {
                     if !ctx.unboxed.contains(&dst.0) || !ctx.unboxed.contains(&lhs.0) || !ctx.unboxed.contains(&rhs.0) {
                         return false;
+                    }
+                    if top_level && op == "+" && w.def_counts.get(&dst.0) == Some(&1) && dst.0 != ind {
+                        let other = if lhs.0 == ind && rhs.0 != ind {
+                            Some(rhs.0)
+                        } else if rhs.0 == ind && lhs.0 != ind {
+                            Some(lhs.0)
+                        } else {
+                            None
+                        };
+                        if let Some(o) = other {
+                            if let Some(&c) = w.consts.get(&o) {
+                                if c >= 0.0 && c < 4294967296.0 && c.fract() == 0.0 {
+                                    w.offsets.push((dst.0, TaOff::Const(c as u64)));
+                                }
+                            } else if !w.defs.contains(&o) {
+                                w.offsets.push((dst.0, TaOff::Local(o)));
+                            }
+                        }
                     }
                 }
                 Inst::UnOp { dst, operand, .. } => {
@@ -18886,27 +18985,29 @@ fn ta_loop_plan(cond: u32, cond_body: &[Inst], body: &[Inst], ctx: &Ctx, hoisted
                     }
                 }
                 Inst::LoadIndex { dst, arr, index, elem } => {
-                    if *elem == 0 || index.0 != ind || !ctx.unboxed.contains(&dst.0) {
+                    if *elem == 0 || !index_ok(w, index.0) || !ctx.unboxed.contains(&dst.0) {
                         return false;
                     }
                     match hoisted.iter().find(|(a, _)| *a == arr.0) {
                         Some(&(a, e)) if e == *elem - 1 => {
-                            if !views.iter().any(|(v, _)| *v == a) {
-                                views.push((a, e));
+                            if !w.views.iter().any(|(v, _)| *v == a) {
+                                w.views.push((a, e));
                             }
+                            note_access(w, a, index.0);
                         }
                         _ => return false,
                     }
                 }
                 Inst::StoreIndex { arr, index, src, elem } => {
-                    if *elem == 0 || index.0 != ind || !ctx.unboxed.contains(&src.0) {
+                    if *elem == 0 || !index_ok(w, index.0) || !ctx.unboxed.contains(&src.0) {
                         return false;
                     }
                     match hoisted.iter().find(|(a, _)| *a == arr.0) {
                         Some(&(a, e)) if e == *elem - 1 => {
-                            if !views.iter().any(|(v, _)| *v == a) {
-                                views.push((a, e));
+                            if !w.views.iter().any(|(v, _)| *v == a) {
+                                w.views.push((a, e));
                             }
+                            note_access(w, a, index.0);
                         }
                         _ => return false,
                     }
@@ -18923,7 +19024,7 @@ fn ta_loop_plan(cond: u32, cond_body: &[Inst], body: &[Inst], ctx: &Ctx, hoisted
                     if !ctx.unboxed.contains(&cond.0) {
                         return false;
                     }
-                    if !walk(then_body, ind, ctx, hoisted, views) || !walk(else_body, ind, ctx, hoisted, views) {
+                    if !walk(then_body, w, false) || !walk(else_body, w, false) {
                         return false;
                     }
                 }
@@ -18932,13 +19033,26 @@ fn ta_loop_plan(cond: u32, cond_body: &[Inst], body: &[Inst], ctx: &Ctx, hoisted
         }
         true
     }
-    if !walk(body, ind, ctx, hoisted, &mut views) {
+    let mut w = Walk {
+        ind,
+        ctx,
+        hoisted,
+        defs: &defs,
+        def_counts: &def_counts,
+        views: &mut views,
+        offsets: &mut offsets,
+        clamps: &mut clamps,
+        consts: &mut body_consts,
+    };
+    if !walk(body, &mut w, true) {
         return None;
     }
     if views.is_empty() {
         return None;
     }
-    Some(TaLoopPlan { ind, bound, views })
+    // only the offsets of indices that are used
+    offsets.retain(|(l, _)| clamps.iter().any(|(_, i)| *i == Some(*l)));
+    Some(TaLoopPlan { ind, bound, views, offsets, clamps })
 }
 
 /// The prefix loop of a simple typed-array loop: once the views exist (and the
@@ -18957,18 +19071,58 @@ fn emit_ta_prefix_loop(s: &mut String, plan: &TaLoopPlan, body: &[Inst], ctx: &C
             format!("_tal{}_{}", a, top)
         }
         TaBound::IntLocal(b) => format!("(d{b} < 0 ? 0u : (d{b} > 4294967295LL ? 4294967295u : (uint32_t)d{b}))", b = b),
+        TaBound::NumLocal(b) => format!("ts_ta_bound_u32(d{b})", b = b),
         TaBound::Const(c) => format!("{}u", c),
     };
     let _ = writeln!(s, "  if ({}) {{", guard.join(" && "));
     let _ = writeln!(s, "    uint32_t _te{} = {};", top, end);
-    for (a, _) in &plan.views {
-        let _ = writeln!(s, "    if (_tal{a}_{t} < _te{t}) _te{t} = _tal{a}_{t};", a = a, t = top);
+    // the offsets as unsigned indexes, once per entry (0xFFFFFFFF when not an index
+    // offset: the prefix then runs no iteration and the general loop takes over)
+    for (l, off) in &plan.offsets {
+        let expr = match off {
+            TaOff::Local(o) if ctx.int_local.contains(o) => format!("ts_ta_off_i64(d{})", o),
+            TaOff::Local(o) => format!("ts_ta_off_f64(d{})", o),
+            TaOff::Const(c) => format!("{}u", c),
+        };
+        let _ = writeln!(s, "    uint32_t _tao{l}_{t} = {e};", l = l, t = top, e = expr);
+    }
+    for (a, idx) in &plan.clamps {
+        match idx {
+            None => {
+                let _ = writeln!(s, "    if (_tal{a}_{t} < _te{t}) _te{t} = _tal{a}_{t};", a = a, t = top);
+            }
+            Some(x) => {
+                let _ = writeln!(
+                    s,
+                    "    if (_tal{a}_{t} <= _tao{x}_{t}) _te{t} = 0u; else if (_tal{a}_{t} - _tao{x}_{t} < _te{t}) _te{t} = _tal{a}_{t} - _tao{x}_{t};",
+                    a = a, t = top, x = x
+                );
+            }
+        }
     }
     let _ = writeln!(s, "    for (; (unsigned long long)d{i} < (unsigned long long)_te{t}; d{i}++) {{", i = i, t = top);
-    let prev = ctx.ta_prefix.replace(Some((top, i)));
+    let prev = ctx.ta_prefix.replace(Some(TaPrefix { top, ind: i, offsets: plan.offsets.iter().map(|(l, _)| *l).collect() }));
     emit_seq(s, body, ctx, PathEdge::LoopBody);
-    ctx.ta_prefix.set(prev);
+    *ctx.ta_prefix.borrow_mut() = prev;
     s.push_str("    }\n  }\n");
+}
+
+/// Inside the versioned prefix loop of `top`: the C index expression of `index` when
+/// it is proven below every accessed view's length (the induction local, or an
+/// `i + off` index whose offset was hoisted as `_tao`); None elsewhere.
+fn ta_prefix_index(ctx: &Ctx, top: u32, index: u32) -> Option<String> {
+    let p = ctx.ta_prefix.borrow();
+    let p = p.as_ref()?;
+    if p.top != top {
+        return None;
+    }
+    if index == p.ind {
+        return Some(format!("(uint32_t)d{}", index));
+    }
+    if p.offsets.contains(&index) {
+        return Some(format!("(_tao{}_{} + (uint32_t)d{})", index, top, p.ind));
+    }
+    None
 }
 
 fn loop_view_receivers(cond_body: &[Inst], body: &[Inst], ctx: &Ctx) -> Vec<(u32, u8)> {

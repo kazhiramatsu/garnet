@@ -10253,3 +10253,30 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   time). Next for the module: axis arguments for the reductions, general
   broadcasting, strided views; `garnet:nn` if the activations and the models
   earn a home.
+- Typed-array prefix loops with offset indices and double bounds (Session
+  353, `docs/typed_array_loops_design.md` "Offset indices and double bounds").
+  Asked whether a transformer could be made fast, measured first: the matrix
+  product's inner loop ran at 1.0 GFLOP/s under garnet against 3.4 under Node
+  (512x512, every loop order and dtype), because the versioned prefix loop
+  took only `v[i]` and an integer bound: `o[ro + j] += aip * b[rb + j]` and
+  the module's `n = out.size` bounds all fell to `ts_ta_try_load_f` per
+  element. The rule now takes `i + off` indices (an invariant integer or
+  double local, or a constant; hoisted as an unsigned index with the prefix
+  bound clamped to `length - off` per view, so the access is affine and the
+  C compiler vectorizes it) and double bounds (`ceil`, clamped). Result:
+  1.0 -> 17.6 GFLOP/s float64 (Node 3.4), 13.6 float32; the module's `dot`
+  reordered to i-k-j. Existing typed-array programs compile byte-identically;
+  the LSTM kernel gains 39 prefix loops (`lstm_sinwave` 92 ms against Node's
+  253, 0.36; `typed_array_loops` unchanged). The module's own `dot` needed one
+  more thing: a shape element read into a local that also flows into the
+  result's shape literal stays boxed (a plain array's element may be
+  undefined), and a boxed bound keeps the loop off the prefix; the kernels now
+  read `a.shape[0] | 0` into integer locals for their loops (the module's
+  header explains), and `dot` of two 512x512 float64 matrices runs at 17.8
+  GFLOP/s native against 3.4 under Node. Fixture
+  `arrays/typed_array_loop_offsets` (plain, strict, GC protect). On the
+  transformer: the matrix products now have a C-vectorized floor; BLAS-level
+  speed (Accelerate, OpenBLAS) would come from an optional native kernel
+  behind `garnet:ndarray`'s `dot`, as `garnet:json` has its host object; the
+  model itself (attention, LayerNorm, GELU) is straightforward over the
+  module, training would need an autograd tape. Waiting on Kaz for the scope.

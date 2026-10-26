@@ -128,3 +128,48 @@ if (_tah_a && _tah_b && obj_map_plain(&_tah_a->o)->len == 0 && ...) {
 - tsc-ts: no loop qualifies (its typed-array loops are the scanner's switch
   loops), outputs identical, instructions 0.9999.
 - `TSAOT_TA_LOOPS=0`; the parity corpus hoists no views.
+
+## Offset indices and double bounds (Session 353, second slice)
+
+The rule took only `v[i]`; a matrix product over flat buffers indexes
+`o[ro + j]` and `b[rb + j]` with a row offset that is invariant in the inner
+loop, and the numeric module's kernels run to a bound that is a `number`
+(`n = out.size`), not an integer local, so none of them qualified: each
+element went through `ts_ta_try_load_f` with a double index, about 10 cycles,
+1 GFLOP/s whatever the loop order or the dtype (Node: 3.4). Two extensions:
+
+- **An index `i + off` or `off + i`**, computed at the body's top level into a
+  local defined once (a `Copy` of it is the same index), with `off` an unboxed
+  local the loop never assigns (integer or double) or an integral constant
+  below 2^32. The prefix hoists each offset as an unsigned index
+  (`_tao<local>_<top>`: `ts_ta_off_i64`/`ts_ta_off_f64`, 0xFFFFFFFF when the
+  value is not an integer in [0, 2^32)) and clamps `_te` per (view, index) pair
+  to `length - off` (0 when `off >= length`), so inside the prefix every
+  access is `data[off + i]` with an affine integer index, which the C compiler
+  vectorizes; the body still computes the double index local, unused by the
+  access. A fractional, negative, NaN or too-large offset makes the prefix
+  empty and the general loop keeps the full semantics (a read past the end is
+  `undefined`, a write is dropped).
+- **A double bound** (`TaBound::NumLocal`): the prefix runs below
+  `ts_ta_bound_u32(b)` = ceil(b) clamped to [0, 2^32), 0 for NaN; `i < b` for
+  an integer `i` is exactly `i < ceil(b)`.
+
+Measured (`i-k-j` float64 product, 512x512, strict): 1.0 -> 17.6 GFLOP/s
+native (Node 3.4); float32 13.6 (the loads and stores convert through double).
+The module's `dot` was reordered to `i-k-j` for the 2-d cases (the inner loop
+contiguous over a row of `b` and of the result). The generated C of the
+existing typed-array programs is byte-identical; `lstm_sinwave` gains 39
+prefix loops. Fixture `arrays/typed_array_loop_offsets` (plain, strict, GC
+protect): products in float64 and float32, offsets in range, beyond the end,
+negative, fractional, NaN and huge, integer and constant offsets, stores past
+the end dropped and int8 wrapping, two views of one buffer, an index defined
+twice (not taken), a copied index, the loop variable after the loop,
+fractional, NaN, negative and oversized bounds.
+
+A boxed bound keeps a loop off the prefix: in the module's `dot` the shape
+elements read into `m, k, n` also flowed into the result's shape literal
+`[m, n]`, which keeps those locals boxed (an element read of a plain array may
+be undefined, and the literal must store it as it is), so the loops compared
+against `ts_number_coerce(v)`. The kernels read `a.shape[0] | 0` into integer
+locals for their loops and pass the shape elements to the literal directly;
+`dot` of two 512x512 float64 matrices then runs at 17.8 GFLOP/s (Node 3.4).

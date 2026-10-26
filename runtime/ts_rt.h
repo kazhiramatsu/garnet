@@ -2907,6 +2907,22 @@ typedef int32_t ts_i32_alias __attribute__((__may_alias__));
 typedef uint32_t ts_u32_alias __attribute__((__may_alias__));
 typedef float ts_f32_alias __attribute__((__may_alias__));
 typedef double ts_f64_alias __attribute__((__may_alias__));
+/* The bound and the index offsets of a versioned typed-array loop (emit_ta_prefix_loop):
+   a double bound runs the prefix below ceil(bound) (0 for NaN or a non-positive bound);
+   an offset local becomes an unsigned index offset, 0xFFFFFFFF when it is not an
+   integer in [0, 2^32), and the prefix then runs no iteration (the general loop takes
+   over with the full semantics). */
+static inline uint32_t ts_ta_bound_u32(double b){
+  if (!(b > 0)) return 0u;
+  if (b >= 4294967295.0) return 4294967295u;
+  return (uint32_t)ceil(b);
+}
+static inline uint32_t ts_ta_off_f64(double d){
+  return (d >= 0 && d < 4294967296.0 && d == (double)(uint32_t)d) ? (uint32_t)d : 0xFFFFFFFFu;
+}
+static inline uint32_t ts_ta_off_i64(long long v){
+  return (v >= 0 && v <= 4294967295LL) ? (uint32_t)v : 0xFFFFFFFFu;
+}
 TS_RT_ALWAYS_INLINE double ts_ta_elem_load_v(const uint8_t* data, uint32_t i, int elem){
   switch (elem){
     case TS_TA_INT8: return (double)((const ts_i8_alias*)data)[i];

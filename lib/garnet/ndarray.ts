@@ -22,6 +22,12 @@
 // the shape vocabulary, the operator set and the activation functions; rewritten for
 // typed storage, dtypes and TypeScript.
 
+// A note on bounds: the kernels read a shape element into an integer local (`a.shape[0] | 0`)
+// for their loops, separately from the value that goes into the result's shape literal. A
+// local that also flows into an array literal stays boxed in garnet's generated code (an
+// element read of a plain array may be undefined), and a boxed bound keeps a loop off the
+// vectorized prefix loop (docs/typed_array_loops_design.md).
+
 export type Shape = readonly number[];
 export type Shape1 = readonly [number];
 export type Shape2 = readonly [number, number];
@@ -667,16 +673,16 @@ export function dot(a: NDArray, b: NDArray): NDArray | number {
   const fast = a.dtype === float64 && b.dtype === float64;
   if (ra === 1 && rb === 1) {
     if (a.shape[0] !== b.shape[0]) throw DimensionError.incompatible(a.shape, b.shape, "dot");
-    const n = a.shape[0];
+    const n = a.shape[0] | 0;
     let s = 0;
     if (fast) { const x = a.data as Float64Array, y = b.data as Float64Array; for (let i = 0; i < n; i++) s += x[i] * y[i]; }
     else for (let i = 0; i < n; i++) s += a.item(i) * b.item(i);
     return s;
   }
   if (ra === 2 && rb === 1) {
-    const m = a.shape[0], k = a.shape[1];
-    if (k !== b.shape[0]) throw DimensionError.incompatible(a.shape, b.shape, "dot");
-    const out = new NDArray<1>([m], dt);
+    if (a.shape[1] !== b.shape[0]) throw DimensionError.incompatible(a.shape, b.shape, "dot");
+    const out = new NDArray<1>([a.shape[0]], dt);
+    const m = a.shape[0] | 0, k = a.shape[1] | 0;   // integer locals for the loops (the note on bounds above)
     if (fast) {
       const x = a.data as Float64Array, y = b.data as Float64Array, o = out.data as Float64Array;
       for (let i = 0; i < m; i++) { let s = 0; const base = i * k; for (let j = 0; j < k; j++) s += x[base + j] * y[j]; o[i] = s; }
@@ -684,31 +690,36 @@ export function dot(a: NDArray, b: NDArray): NDArray | number {
     return out;
   }
   if (ra === 1 && rb === 2) {
-    const k = b.shape[0], n = b.shape[1];
-    if (a.shape[0] !== k) throw DimensionError.incompatible(a.shape, b.shape, "dot");
-    const out = new NDArray<1>([n], dt);
+    if (a.shape[0] !== b.shape[0]) throw DimensionError.incompatible(a.shape, b.shape, "dot");
+    const out = new NDArray<1>([b.shape[1]], dt);
+    const k = b.shape[0] | 0, n = b.shape[1] | 0;
+    // row by row of b, the inner loop contiguous (a counted loop the compiler vectorizes)
     if (fast) {
       const x = a.data as Float64Array, y = b.data as Float64Array, o = out.data as Float64Array;
-      for (let j = 0; j < n; j++) { let s = 0; for (let i = 0; i < k; i++) s += x[i] * y[i * n + j]; o[j] = s; }
-    } else for (let j = 0; j < n; j++) { let s = 0; for (let i = 0; i < k; i++) s += a.item(i) * b.item(i * n + j); out.setItem(j, s); }
+      for (let i = 0; i < k; i++) { const xi = x[i], rb = i * n; for (let j = 0; j < n; j++) o[j] += xi * y[rb + j]; }
+    } else for (let i = 0; i < k; i++) { const xi = a.item(i); for (let j = 0; j < n; j++) out.setItem(j, out.item(j) + xi * b.item(i * n + j)); }
     return out;
   }
   if (ra === 2 && rb === 2) {
-    const m = a.shape[0], k = a.shape[1], n = b.shape[1];
-    if (k !== b.shape[0]) throw DimensionError.incompatible(a.shape, b.shape, "dot");
-    const out = new NDArray<2>([m, n], dt);
+    if (a.shape[1] !== b.shape[0]) throw DimensionError.incompatible(a.shape, b.shape, "dot");
+    const out = new NDArray<2>([a.shape[0], b.shape[1]], dt);
+    const m = a.shape[0] | 0, k = a.shape[1] | 0, n = b.shape[1] | 0;
+    // i-k-j: the inner loop walks a row of b and a row of the result contiguously
     if (fast) {
       const x = a.data as Float64Array, y = b.data as Float64Array, o = out.data as Float64Array;
-      for (let i = 0; i < m; i++) for (let j = 0; j < n; j++) { let s = 0; for (let p = 0; p < k; p++) s += x[i * k + p] * y[p * n + j]; o[i * n + j] = s; }
-    } else for (let i = 0; i < m; i++) for (let j = 0; j < n; j++) { let s = 0; for (let p = 0; p < k; p++) s += a.item(i * k + p) * b.item(p * n + j); out.setItem(i * n + j, s); }
+      for (let i = 0; i < m; i++) {
+        const ro = i * n;
+        for (let p = 0; p < k; p++) { const aip = x[i * k + p], rb = p * n; for (let j = 0; j < n; j++) o[ro + j] += aip * y[rb + j]; }
+      }
+    } else for (let i = 0; i < m; i++) for (let p = 0; p < k; p++) { const aip = a.item(i * k + p); for (let j = 0; j < n; j++) out.setItem(i * n + j, out.item(i * n + j) + aip * b.item(p * n + j)); }
     return out;
   }
   throw DimensionError.incompatible(a.shape, b.shape, "dot (ranks 1 and 2 only)");
 }
 export function outer(u: NDArray, v: NDArray): Matrix {
   if (u.shape.length !== 1 || v.shape.length !== 1) throw DimensionError.incompatible(u.shape, v.shape, "outer");
-  const m = u.shape[0], n = v.shape[0];
-  const out = new NDArray<2>([m, n], promote(u.dtype, v.dtype));
+  const out = new NDArray<2>([u.shape[0], v.shape[0]], promote(u.dtype, v.dtype));
+  const m = u.shape[0] | 0, n = v.shape[0] | 0;
   if (out.dtype === float64 && u.dtype === float64 && v.dtype === float64) {
     const x = u.data as Float64Array, y = v.data as Float64Array, o = out.data as Float64Array;
     for (let i = 0; i < m; i++) { const ui = x[i]; for (let j = 0; j < n; j++) o[i * n + j] = ui * y[j]; }
@@ -721,8 +732,8 @@ export function transpose(a: NDArray): NDArray {
   const r = a.shape.length;
   if (r < 2) return a.copy();
   if (r === 2) {
-    const m = a.shape[0], n = a.shape[1];
-    const out = new NDArray([n, m], a.dtype);
+    const out = new NDArray([a.shape[1], a.shape[0]], a.dtype);
+    const m = a.shape[0] | 0, n = a.shape[1] | 0;
     if (a.dtype === float64) { const x = a.data as Float64Array, o = out.data as Float64Array; for (let i = 0; i < m; i++) for (let j = 0; j < n; j++) o[j * m + i] = x[i * n + j]; }
     else for (let i = 0; i < m; i++) for (let j = 0; j < n; j++) out.data[j * m + i] = a.data[i * n + j];
     return out;
