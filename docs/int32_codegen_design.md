@@ -64,3 +64,49 @@ P), against scriptc's 0.93 G; wall 110 -> 60 -> 40 ms against scriptc's 50 ms.
 Semantics are unchanged: every form computes the same ToInt32 value, and the
 fixture `numbers/int32_codegen` covers the integer kinds, Uint32 above 2^31, an
 index out of range, non-numeric `Math.imul` operands and the int32 boundaries.
+
+## Bounded bitwise results and absorbed negative zeros (Session 353)
+
+The Q8_0 dot product of the GGUF llama program (`benchmarks/llama2/
+llama_gguf.ts`), `isum = (isum + a * b) | 0` over int8 values, stayed a
+double chain: the numeric analysis (`infer_numeric_analysis`) gave a
+bitwise result no range, so the product of two `| 0` results was an
+unbounded int32 times an unbounded int32 (2^62, not provably within 2^53)
+and fell to double; and even with ranges, a product of a value that may be
+zero and a value that may be negative is `-0` in JS, which an integer
+cannot hold. Two rules:
+
+- **Ranges from the operator itself** (sound for any operand): `& c` with a
+  non-negative constant mask is [0, c]; `>> k` for a constant k in 1..31 is
+  [-2^(31-k), 2^(31-k) - 1]; `>>> k` is [0, 2^(32-k) - 1]; `x | 0` keeps a
+  range of x that lies within int32 (ToInt32 is the identity on it); `^`,
+  `<<` and the other forms are the int32 fact as before. So `(v << 24) >> 24`
+  is the int8 range, `v & 255` the uint8 range, and the quantized kernels
+  sign-extend their loads by shifts to say so. (A range from the typed
+  array's element kind would need the annotation trusted; the shifts cost
+  nothing and need no trust.)
+- **A product whose negative zero every use absorbs** is an integer: when
+  the ranges make the product exact but a zero times a negative is possible,
+  the product is still i64-safe if each of its uses is `+` or `-` with an
+  int32-by-definition local or an integer constant on the other side (a value
+  that is never -0, so the sum is +0), a bitwise operand (ToInt32(-0) is 0) or
+  a comparison; a copy, a store, a return, a call argument or any other use
+  could observe the sign and keeps the product a double. A local is int32 by
+  definition when each of its definitions is a bitwise operator, `~`, an
+  integer constant within int32 or a copy of such a local (a fixpoint, so the
+  accumulator `let isum = 0; ... isum = (isum + p) | 0` qualifies). The check
+  walks the flattened body and skips the container instructions, whose
+  children it visits on their own.
+
+Measured: TinyLlama-1.1B-Chat Q8_0 under garnet 0.5 -> 4.1 tokens/s
+(Node 2.2); the inner loop is `d80 = d66 * d73; d81 = d54 + d80; d83 =
+ToInt32(d81 | 0)` in `long long`. Fixture `numbers/small_int_products`: int8
+and uint8 dot products, `h * 31 + c` hashes, FNV with `Math.imul`, nibble
+products, the observable negative zero (printed, divided, stringified,
+copied, stored) beside the absorbed one, products past 2^53 that stay
+doubles, shifted and masked products at the int32 limits.
+
+Next: the chain is `long long`; a `| 0`-terminated chain of int32-by-
+definition values could be emitted in `int32_t` with wrapping arithmetic
+(a ring homomorphism, the same final value), which lets the C compiler
+vectorize the dot product with 32-bit lanes.

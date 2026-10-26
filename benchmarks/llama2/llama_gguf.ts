@@ -102,9 +102,20 @@ function f16ToF64(bits: number): number {
 const F16 = new Float32Array(65536);
 for (let i = 0; i < 65536; i++) F16[i] = f16ToF64(i);
 
-/** A weight matrix: `rows` rows of `cols` values at a byte offset into the file, in one quantization. */
+/** A weight matrix: `rows` rows of `cols` values in one quantization; `bytes` and `quants` view the
+ *  tensor's own bytes (a tensor is below 2^31 bytes, so every index into them is an int32, which keeps
+ *  the kernels' loads on the inline path; the file offset itself may not be). */
 class Weight {
-  constructor(readonly name: string, readonly type: number, readonly rows: number, readonly cols: number, readonly byteOff: number) {}
+  readonly bytes: Uint8Array;
+  readonly quants: Int8Array;
+  readonly f32: Float32Array;
+  constructor(readonly name: string, readonly type: number, readonly rows: number, readonly cols: number, readonly byteOff: number, all: Uint8Array) {
+    const rowBytes = type === GGML_F32 ? cols * 4 : type === GGML_F16 ? cols * 2 : type === GGML_Q8_0 ? (cols >> 5) * 34 : (cols >> 5) * 18;
+    const n = rows * rowBytes;
+    this.bytes = all.subarray(byteOff, byteOff + n);
+    this.quants = new Int8Array(all.buffer, all.byteOffset + byteOff, n);
+    this.f32 = type === GGML_F32 ? new Float32Array(all.buffer, all.byteOffset + byteOff, n >> 2) : new Float32Array(0);
+  }
 }
 class Model {
   readonly g: Gguf;
@@ -126,29 +137,29 @@ class Model {
     const cols = t.dims[0], rows = t.dims.length > 1 ? t.dims[1] : 1;
     if (t.type !== GGML_F32 && t.type !== GGML_F16 && t.type !== GGML_Q8_0 && t.type !== GGML_Q4_0) throw new Error(`tensor ${name}: quantization type ${t.type} not supported`);
     if ((t.type === GGML_Q8_0 || t.type === GGML_Q4_0) && cols % 32 !== 0) throw new Error(`tensor ${name}: ${cols} columns is not a multiple of 32`);
-    return new Weight(name, t.type, rows, cols, this.dataStart + t.offset);
+    return new Weight(name, t.type, rows, cols, this.dataStart + t.offset, this.u8);
   }
   /** Row `r` of a weight as doubles into `out` (embeddings, norms). */
   row(w: Weight, r: number, out: Float32Array): void {
-    const n = w.cols;
+    const n = w.cols | 0;
     if (w.type === GGML_F32) {
-      const base = (w.byteOff >> 2) + r * n;
-      for (let i = 0; i < n; i++) out[i] = this.f32[base + i];
+      const f = w.f32, base = r * n;
+      for (let i = 0; i < n; i++) out[i] = f[base + i];
     } else if (w.type === GGML_F16) {
-      const u = this.u8;
-      let p = w.byteOff + r * n * 2;
+      const u = w.bytes;
+      let p = r * n * 2;
       for (let i = 0; i < n; i++) { out[i] = F16[u[p] | (u[p + 1] << 8)]; p += 2; }
     } else if (w.type === GGML_Q8_0) {
-      const u = this.u8, q = this.i8;
-      let p = w.byteOff + r * (n >> 5) * 34;
+      const u = w.bytes, q = w.quants;
+      let p = r * (n >> 5) * 34;
       for (let b = 0; b < n; b += 32) {
         const d = F16[u[p] | (u[p + 1] << 8)];
         for (let j = 0; j < 32; j++) out[b + j] = d * q[p + 2 + j];
         p += 34;
       }
     } else {
-      const u = this.u8;
-      let p = w.byteOff + r * (n >> 5) * 18;
+      const u = w.bytes;
+      let p = r * (n >> 5) * 18;
       for (let b = 0; b < n; b += 32) {
         const d = F16[u[p] | (u[p + 1] << 8)];
         for (let j = 0; j < 16; j++) { const byte = u[p + 2 + j]; out[b + j] = d * ((byte & 15) - 8); out[b + j + 16] = d * ((byte >> 4) - 8); }
@@ -172,18 +183,19 @@ function quantizeQ8(x: Float32Array, n: number, xq: Int8Array, xs: Float32Array)
 }
 /** out = W x for a Q8_0 weight, the activation already quantized (xq, xs). */
 function matvecQ8(m: Model, w: Weight, xq: Int8Array, xs: Float32Array, out: Float32Array): void {
-  const u = m.u8, q = m.i8;
+  const u = w.bytes, q = w.quants;
   const n = w.cols | 0, rows = w.rows | 0, nb = n >> 5;
   const rowBytes = nb * 34;
   for (let r = 0; r < rows; r++) {
     let s = 0;
-    let p = w.byteOff + r * rowBytes;
+    let p = r * rowBytes;
     for (let b = 0; b < nb; b++) {
       const qb = p + 2, xb = b << 5;
       let isum = 0;
-      // the loads as int32 (`| 0`), the products and the sum integers throughout: an integer
-      // reduction the C compiler may vectorize
-      for (let j = 0; j < 32; j++) { const a = q[qb + j] | 0, b = xq[xb + j] | 0; isum = (isum + a * b) | 0; }
+      // the int8 values sign-extended by shifts (the numeric analysis bounds `>> 24` to the int8
+      // range, so the products and the sum are integers throughout, a reduction the C compiler
+      // may vectorize; docs/int32_codegen_design.md "Bounded bitwise results")
+      for (let j = 0; j < 32; j++) { const a = (q[qb + j] << 24) >> 24, b = (xq[xb + j] << 24) >> 24; isum = (isum + a * b) | 0; }
       s += F16[u[p] | (u[p + 1] << 8)] * xs[b] * isum;
       p += 34;
     }
@@ -192,18 +204,18 @@ function matvecQ8(m: Model, w: Weight, xq: Int8Array, xs: Float32Array, out: Flo
 }
 /** out = W x for a Q4_0 weight (the nibbles, minus 8). */
 function matvecQ4(m: Model, w: Weight, xq: Int8Array, xs: Float32Array, out: Float32Array): void {
-  const u = m.u8;
+  const u = w.bytes;
   const n = w.cols | 0, rows = w.rows | 0, nb = n >> 5;
   const rowBytes = nb * 18;
   for (let r = 0; r < rows; r++) {
     let s = 0;
-    let p = w.byteOff + r * rowBytes;
+    let p = r * rowBytes;
     for (let b = 0; b < nb; b++) {
       const qb = p + 2, xb = b << 5;
       let isum = 0;
       for (let j = 0; j < 16; j++) {
         const byte = u[qb + j];
-        const lo = xq[xb + j] | 0, hi = xq[xb + j + 16] | 0;
+        const lo = (xq[xb + j] << 24) >> 24, hi = (xq[xb + j + 16] << 24) >> 24;
         isum = (isum + ((byte & 15) - 8) * lo + ((byte >> 4) - 8) * hi) | 0;
       }
       s += F16[u[p] | (u[p + 1] << 8)] * xs[b] * isum;
@@ -216,17 +228,17 @@ function matvecQ4(m: Model, w: Weight, xq: Int8Array, xs: Float32Array, out: Flo
 function matvecFloat(m: Model, w: Weight, x: Float32Array, out: Float32Array): void {
   const n = w.cols | 0, rows = w.rows | 0;
   if (w.type === GGML_F32) {
-    const f = m.f32, base0 = w.byteOff >> 2;
+    const f = w.f32;
     for (let r = 0; r < rows; r++) {
-      const base = base0 + r * n;
+      const base = r * n;
       let s0 = 0, s1 = 0, s2 = 0, s3 = 0;
       for (let j = 0; j < n; j += 4) { s0 += f[base + j] * x[j]; s1 += f[base + j + 1] * x[j + 1]; s2 += f[base + j + 2] * x[j + 2]; s3 += f[base + j + 3] * x[j + 3]; }
       out[r] = (s0 + s1) + (s2 + s3);
     }
   } else {
-    const u = m.u8;
+    const u = w.bytes;
     for (let r = 0; r < rows; r++) {
-      let p = w.byteOff + r * n * 2;
+      let p = r * n * 2;
       let s = 0;
       for (let j = 0; j < n; j++) { s += F16[u[p] | (u[p + 1] << 8)] * x[j]; p += 2; }
       out[r] = s;

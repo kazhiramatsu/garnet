@@ -7352,6 +7352,66 @@ fn infer_numeric_analysis(
     flatten_inst(body, &mut flat);
     let mut loop_nonneg_subs = BTreeSet::new();
     collect_loop_nonneg_subs(body, &mut loop_nonneg_subs);
+    // the instructions defining each local (a local defined only by bitwise operators holds an
+    // int32 and is never -0), for the negative-zero rule of `*`
+    // a local is int32 by definition when each of its definitions is a bitwise operator, `~`,
+    // an integer constant within int32, or a copy of such a local (a fixpoint over the copies:
+    // an accumulator `let isum = 0; ... isum = (isum + p) | 0` qualifies)
+    let mut int32_by_definition: BTreeSet<u32> = flat.iter().filter_map(|i| inst_def_local(i)).collect();
+    loop {
+        let before = int32_by_definition.len();
+        let snapshot = int32_by_definition.clone();
+        int32_by_definition.retain(|&x| {
+            flat.iter().all(|inst| match inst {
+                Inst::BinOp { dst, op, .. } if dst.0 == x => is_bitwise_op(op),
+                Inst::UnOp { dst, op, .. } if dst.0 == x => op == "~",
+                Inst::Const { dst, value } if dst.0 == x => matches!(value, ConstVal::Num { value } if value.fract() == 0.0 && *value >= -2147483648.0 && *value <= 2147483647.0),
+                Inst::Copy { dst, src } if dst.0 == x => snapshot.contains(&src.0),
+                other => inst_def_local(other) != Some(x),
+            })
+        });
+        if int32_by_definition.len() == before {
+            break;
+        }
+    }
+    // Whether every use of `x` absorbs a negative zero: `+`/`-` with an int32-by-definition
+    // local or an integer constant as the other operand (x + 0 and 0 + x are +0 when x is -0 and
+    // the other side is an integer value, never -0), a bitwise operand (ToInt32(-0) is 0), or a
+    // comparison. A copy, a store, a return, a call argument or any other use could observe the
+    // sign, so the product stays a double.
+    let negzero_absorbed = |x: u32, consts: &BTreeMap<u32, i64>| -> bool {
+        let mut any = false;
+        for inst in &flat {
+            match inst {
+                Inst::BinOp { lhs, rhs, op, .. } if lhs.0 == x || rhs.0 == x => {
+                    any = true;
+                    let other = if lhs.0 == x { rhs.0 } else { lhs.0 };
+                    if is_bitwise_op(op) || matches!(op.as_str(), "<" | "<=" | ">" | ">=" | "==" | "!=" | "===" | "!==") {
+                        continue;
+                    }
+                    if (op == "+" || op == "-") && other != x && (int32_by_definition.contains(&other) || consts.contains_key(&other)) {
+                        continue;
+                    }
+                    return false;
+                }
+                Inst::UnOp { operand, op, .. } if operand.0 == x => { any = true; if op != "~" { return false; } }
+                // the containers' children are in `flat` themselves
+                Inst::Loop { .. } | Inst::If { .. } | Inst::TryCatch { .. } => {}
+                other => {
+                    let one: BTreeSet<u32> = std::iter::once(x).collect();
+                    if inst_uses_any(other, &one) { return false; }
+                }
+            }
+        }
+        any
+    };
+    // the integer constants of the body (operands of the rule above)
+    let mut int_consts: BTreeMap<u32, i64> = BTreeMap::new();
+    for inst in &flat {
+        if let Inst::Const { dst, value: ConstVal::Num { value } } = inst {
+            if value.fract() == 0.0 && value.abs() < 9007199254740992.0 { int_consts.insert(dst.0, *value as i64); }
+        }
+    }
 
     let mut facts: BTreeMap<u32, NumFact> = param_facts.clone();
     let get = |facts: &BTreeMap<u32, NumFact>, id: u32| -> NumFact {
@@ -7460,22 +7520,42 @@ fn infer_numeric_analysis(
                         "<" | "<=" | ">" | ">=" | "==" | "!=" | "===" | "!==" => {
                             NumFact::bool_value()
                         }
-                        "&" | "|" | "^" | "<<" | ">>" => NumFact {
-                            i64_safe: true,
-                            nonneg: false,
-                            maybe_zero: true,
-                            const_i64: None,
-                            min_i64: None,
-                            max_i64: None,
+                        // the bitwise operators give an int32; where the operator itself bounds
+                        // the result the range is kept (a product of two bounded values can then
+                        // stay an integer): `& c` with a non-negative constant mask is [0, c],
+                        // `>> k` is [-2^(31-k), 2^(31-k) - 1] and `>>> k` is [0, 2^(32-k) - 1] for
+                        // a constant shift in 1..31, and `x | 0` keeps a range of x that lies
+                        // within int32 (ToInt32 is the identity on it)
+                        "&" => {
+                            let mask = l.const_i64.filter(|c| (0..=0x7fff_ffff).contains(c)).or_else(|| r.const_i64.filter(|c| (0..=0x7fff_ffff).contains(c)));
+                            match mask {
+                                Some(c) => NumFact::range(0, c),
+                                None => NumFact::int32_value(),
+                            }
+                        }
+                        "|" => {
+                            let kept = if l.const_i64 == Some(0) { range_of(&r) } else if r.const_i64 == Some(0) { range_of(&l) } else { None };
+                            match kept {
+                                Some((lo, hi)) if lo >= -2147483648 && hi <= 2147483647 => NumFact::range(lo, hi),
+                                _ => NumFact::int32_value(),
+                            }
+                        }
+                        ">>" => match r.const_i64 {
+                            Some(k) if (1..=31).contains(&k) => NumFact::range(-(1i64 << (31 - k)), (1i64 << (31 - k)) - 1),
+                            _ => NumFact::int32_value(),
                         },
-                        ">>>" => NumFact {
-                            i64_safe: true,
-                            nonneg: true,
-                            maybe_zero: true,
-                            const_i64: None,
-                            min_i64: None,
-                            max_i64: None,
+                        ">>>" => match r.const_i64 {
+                            Some(k) if (1..=31).contains(&k) => NumFact::range(0, (1i64 << (32 - k)) - 1),
+                            _ => NumFact {
+                                i64_safe: true,
+                                nonneg: true,
+                                maybe_zero: true,
+                                const_i64: None,
+                                min_i64: None,
+                                max_i64: None,
+                            },
                         },
+                        "^" | "<<" => NumFact::int32_value(),
                         "+" => {
                             if let (Some(a), Some(b)) = (l.const_i64, r.const_i64) {
                                 checked_safe_i64(a as i128 + b as i128)
@@ -7561,8 +7641,8 @@ fn infer_numeric_analysis(
                                 }
                             } else if l.i64_safe
                                 && r.i64_safe
-                                && (!l.maybe_zero || r.nonneg)
-                                && (!r.maybe_zero || l.nonneg)
+                                && (((!l.maybe_zero || r.nonneg) && (!r.maybe_zero || l.nonneg))
+                                    || negzero_absorbed(dst.0, &int_consts))
                             {
                                 if let (Some((lmin, lmax)), Some((rmin, rmax))) =
                                     (range_of(&l), range_of(&r))

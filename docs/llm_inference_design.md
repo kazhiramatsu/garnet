@@ -32,7 +32,13 @@ the matrix products of `garnet:ndarray` vectorize (17.8 GFLOP/s) because
 their inner loop is not a reduction. `Date.now()` returned fractional
 milliseconds (a printed elapsed time showed it); fixed.
 
-## Milestone 2: GGUF and the quantized model
+## Milestone 2: GGUF and the quantized model (running)
+
+`benchmarks/llama2/llama_gguf.ts` reads the file and runs TinyLlama-1.1B-Chat
+Q8_0; garnet and Node give the same answer to the same prompt. Speed so far:
+0.6 tokens/s with the double chain, 4.1 after the numeric analysis learned
+the int8 ranges and the absorbed negative zero (Node 2.2); the next step is
+the int32 emission of the chain so the C compiler vectorizes it.
 
 The format (GGUF v3, little endian): magic `GGUF`, u32 version, u64 tensor
 count, u64 key-value count; the key-value pairs (a string key, a u32 type,

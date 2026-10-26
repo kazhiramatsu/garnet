@@ -10317,3 +10317,21 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   `Math.imul` made it worse (boxed arguments, no prefix loop). Next: bounded
   bitwise results as ranges and products whose negative zero every use
   absorbs (prepared), then the kernel's int8 loads sign-extended by shifts.
+- Bounded bitwise results and absorbed negative zeros in the numeric analysis
+  (Session 353, `docs/int32_codegen_design.md` "Bounded bitwise results").
+  The Q8_0 dot product of the GGUF llama program stayed a double chain: a
+  bitwise result had no range (so a product of two `| 0` values was 2^62 and
+  fell to double), and `0 * negative` is -0. Now `& c`, `>> k`, `>>> k` and
+  `x | 0` carry the ranges the operator guarantees (no trust in a typed
+  array's element kind: the kernel sign-extends its int8 loads by shifts),
+  and a product whose negative zero every use absorbs (`+`/`-` with an
+  int32-by-definition local or an integer constant, a bitwise operand, a
+  comparison) is an integer; int32-by-definition is a fixpoint over bitwise
+  definitions, int32 constants and copies, so a `| 0` accumulator qualifies.
+  The check skips the container instructions in the flattened body (their
+  children are visited on their own; a `Loop` "using" the local was the
+  first bug). TinyLlama-1.1B-Chat Q8_0: 0.5 -> 4.1 tokens/s native (prompt
+  3.6), Node 2.2, the same answer; the inner loop is an integer chain in
+  `long long`. Fixture `numbers/small_int_products` (plain, strict, GC
+  protect). Next: emit a `| 0`-terminated chain in int32 so the C compiler
+  vectorizes it with 32-bit lanes.

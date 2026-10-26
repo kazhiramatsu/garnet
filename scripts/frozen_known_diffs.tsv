@@ -335,3 +335,5 @@ parity-unported	arrays/typed_array_loop_offsets	Frozen emitter lacks the typed-a
 selfconf-unported	arrays/typed_array_loop_offsets	Frozen emitter lacks the typed-array-over-a-buffer constructor (builtin typedarray.new); the Rust emitter supports it, and the native output matches V8.
 parity-unported	arrays/typed_array_loop_steps	Frozen emitter lacks a typed-array constructor form the fixture uses (builtin typedarray.new); the Rust emitter supports it.
 selfconf-unported	arrays/typed_array_loop_steps	Frozen emitter lacks a typed-array constructor form the fixture uses (builtin typedarray.new); the Rust emitter supports it, and the native output matches V8.
+parity-unported	numbers/small_int_products	Frozen emitter lacks a typed-array constructor form the fixture uses (builtin typedarray.new); the Rust emitter supports it.
+selfconf-unported	numbers/small_int_products	Frozen emitter lacks a typed-array constructor form the fixture uses (builtin typedarray.new); the Rust emitter supports it, and the native output matches V8.
