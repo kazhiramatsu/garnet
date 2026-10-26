@@ -10076,3 +10076,38 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   over the string runtime, no symbol above 0.05% of the samples. Noted:
   `Stats` dates are getters without a cache (`s.mtime === s.mtime` is false;
   Node caches), kept for the stat on the compiler's hot path.
+- Pattern kernels against V8, both profiles (October 26 2026, `scripts/pattern_bench.sh`,
+  best of three, native / Node ms). Strict (the measured configuration, now the script's
+  default; `PB_PLAIN=1` for the plain profile): links_objects 402/141 (2.85), switch_dispatch
+  380/137 (2.77), path_regexps 253/111 (2.28), small_calls 468/214 (2.19), flags_truthy
+  258/135 (1.91), ctor_functions 154/87 (1.77), callbacks 244/141 (1.73), object_arrays
+  173/104 (1.66), strings_build 1.33, obj_literal_poly 1.23, closures_env 1.16,
+  typed_array_loops 1.03; the other sixteen below 1 (class_enum_fields 102/147 = 0.69,
+  class_nodes 119/192 = 0.62, map_int_keys 0.32, sparse_stores 0.31). Plain: the same
+  except the class kernels (class_enum_fields 467/147 = 3.18, class_nodes 460/196 = 2.35,
+  closures_env 1.39): the class hints and unboxed fields live in the strict profile
+  (README "Turn on strict"), 4.5x on class-heavy code. Why the strict stragglers are
+  slow, measured: `switch_dispatch` is a C switch already; its visit is 85% of the
+  samples and the kernel runs at 16 cycles per iteration whatever the instruction count
+  (force-inlining visit: 8.95 -> 8.28 G instructions, cycles unchanged; raw slot reads
+  and an unchecked array read: 4.0 G, cycles unchanged): the loop-carried chain of
+  `sum = (sum + visit(n)) | 0` is a double add, `fjcvtzs`, and `scvtf` back (about 15
+  cycles on this core; the `jcvt.c` microbenchmark: a dependent double->int32->double
+  round trip is 15 cycles), where V8 keeps `sum` a Smi. `links_objects`: 31% of the
+  samples in `ts_get_pic_checked`: the brand-only class's instances are header-only
+  sized objects whose lazily added properties live in the sidecar, and the inline
+  probes skip sized receivers (prop_ic_probe_own too), so every read of `l.type` goes
+  out of line to the location cache. tsc-ts's own SymbolLinks/NodeLinks are classes
+  with declared fields (struct slots), so this pattern is the kernel's, not the
+  flagship's. The boxed-double fields of interface-typed object literals (`{kind, v}`)
+  cost a `fmov` + `fjcvtzs` (about 10 cycles of latency) per bitwise use; an
+  integer-domain extraction of an int32-valued double's bits is 6 cycles shorter in
+  latency but 12 instructions longer (`toint.c`), not adopted. A shape-first static
+  slot probe (the site's own shape record before the key table) was measured on the
+  switch kernel: +5% instructions, cycles unchanged, dropped. The flagship's share of
+  these paths (a `-DTSAOT_RT_STATS` build of tsc-ts, `--singleThreaded`, the compiler
+  project): 4.70 M property-cache reads (82% inline hits, 841 K out of line), 145 K
+  static-slot reads, 4.5 M Map finds, 1.85 M property finds in a 22 G-instruction
+  compile: about 0.3% of its instructions, so the record-field work above is for
+  pattern parity and general programs, not for tsc-ts, whose hot reads are struct
+  fields.

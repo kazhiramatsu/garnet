@@ -345,6 +345,20 @@ a `dt`/`mf` under `ulimit -u $(( $(ps -u $(id -u) | wc -l) + 150 ))` and
 `perl -e 'alarm 400; exec @ARGV' -- bash -c '...'` (macOS has no `timeout`),
 and `killall -9 dt` after a failure.
 
+### Gotcha: measure the pattern kernels under the strict profile
+
+`scripts/pattern_bench.sh` compiles with `--strict` by default now (`PB_PLAIN=1` for the
+plain profile). The class hints and the unboxed numeric fields are strict-profile
+features: `class_enum_fields` runs 4.5x faster strict than plain, so a plain-mode
+table ranks the wrong kernels first. A kernel's cycles can stay put while its
+instructions halve (`switch_dispatch`, a loop-carried double/int32 round trip):
+judge a latency-bound kernel by cycles (`/usr/bin/time -l`), and test a hypothesis
+by hand-editing the generated C (`build/dt.c`) and relinking against `build/rt.o`.
+The runtime's counters: build with `-DTSAOT_RT_STATS` (both the runtime object and
+the generated units) and run tsc-ts with `--singleThreaded`, or a worker's counters
+are lost at its `_exit`. Parallel shell calls share one working directory: a `cd`
+in one lands the others elsewhere; use absolute paths.
+
 ### Gotcha: measure tsc-ts with `TSAOT_CPUS=1`
 
 Since the benchmark runs on lib/node, `os.availableParallelism()` reports the
