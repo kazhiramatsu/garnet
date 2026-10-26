@@ -211,3 +211,45 @@ offsets `_tao` are the prefix loop's own. A local assigned in the enclosing
 loop (a view rebuilt between the inner loops) has no entry there and the
 inner loop hoists as before. TinyLlama Q8_0 11.0 -> 11.7 tokens/s on one
 thread, outputs identical; fixture `arrays/typed_array_loop_nested`.
+
+## Proven ranges across the enclosing loop (Session 353)
+
+The prefix loop clamps its trip count per (view, index) at every entry: in
+the Q8_0 kernel five clamps per block of 32 weights, four of them for
+offsets that move 34 bytes per block, about 30 instructions beside the
+17-instruction `sdot` loop, and the C compiler keeps a remainder loop for a
+trip count it cannot see. A counted enclosing loop L (`b` from its value at
+entry, `b < B` with B an integer constant or an integer local L never
+assigns, `b += s`) now proves at its entry, once, that an inner prefix
+loop's every access stays within its view for the whole of L, and that
+inner loop skips its clamps: `_tp{L}_{n}` is computed from the trip count
+`_tt{L} = ceil((B - b0) / s)` and the ranges of the locals the inner loop's
+offsets are affine in. Those are the induction local (`[b0, b0 + s(_tt -
+1)]`), the derived induction locals `p += c` with c a positive constant and
+that the only assignment of p in L, at the body's top level (`[p0, p0 + c *
+_tt]`, the increment's position in the iteration left open), the integer
+locals L never assigns, and the locals defined once at the body's top level
+before the inner loop by `+` of those, `* c` and `l << k` (exact only while
+`0 <= l <= (2^31 - 1) >> k`, a condition the proof carries). The inner
+loop's induction local must start at an integer constant set at the top
+level before it, be assigned nowhere else in L, and run below a constant, an
+invariant integer local or a view's `length`; each (view, offset) access of
+the inner plan contributes `offset >= 0`, `min >= 0` and `max < length` to
+the flag. The arithmetic is in doubles: every term is a non-negative
+multiple of an integer, so a rounding error can only occur beyond 2^53,
+where the flag is false regardless, and a trip count of zero makes the flag
+true (the inner loop never runs). An inner loop whose offsets are not of
+that form, whose induction local is initialized conditionally or reused, or
+whose view is not hoisted by L or an enclosing loop keeps its clamps; so do
+the inner loops of a loop that assigns its induction local, whose bound is
+a double or a view's length, or that is not a counted loop. With the clamps
+gone the prefix loop's trip count is the constant the C compiler unrolls
+and vectorizes. `TSAOT_TA_RANGE=0` keeps the clamps. TinyLlama Q8_0: the block loop's flag holds for every
+row group, the inner loop runs its 32 iterations unclamped, 14.8 -> 22.1
+tokens/s on one thread, 26.2 -> 40.2 on two, 43.4 -> 49.8 on four (outputs
+identical; llama.cpp's CPU path 65 / 73 / 72 on the same machine). Fixture
+`arrays/typed_array_loop_ranges`: the Q8 shape with a short view, a
+negative or past-the-end derived local, a wrapping shift, an offset read
+before its definition, a conditional increment, an induction local assigned
+in the body, stepped loops.
+

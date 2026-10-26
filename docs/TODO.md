@@ -10452,3 +10452,34 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   generation and the same for the prompt (one token at a time). The table is
   in `docs/llm_inference_design.md`; the gap is the kernel's per-block
   overhead (compute-bound), 4.4x on one thread and 1.7x on four.
+- Proven ranges across the enclosing loop (Session 353,
+  `docs/typed_array_loops_design.md` "Proven ranges"). The prefix loop
+  clamped its trip count per (view, index) at every entry: five clamps per
+  block of 32 weights in the Q8_0 kernel, about 30 instructions beside the
+  17-instruction `sdot` loop, and a remainder loop for a trip count the C
+  compiler could not see. A counted enclosing loop (`b` from its entry value,
+  `b < B` with B an integer constant or an invariant integer local, `b += s`)
+  now proves at its entry, once, that an inner prefix loop's accesses stay
+  within their views for the whole loop (`_tt` the trip count, `_tp` the
+  flag): the offsets affine in the induction local, the derived induction
+  locals (`p += c`, the only assignment, at the top level), invariant integer
+  locals, and the top-level locals built from those by `+`, `* c` and
+  `l << k` (the shift exact only within `[0, (2^31 - 1) >> k]`, a condition
+  the proof carries); the inner induction local initialized from a constant
+  at the top level and assigned nowhere else; `offset >= 0`, `min >= 0`,
+  `max < length` per access, in doubles (rounding only beyond 2^53, where the
+  flag is false anyway). The inner loop skips its clamps under the flag and
+  its trip count becomes the constant the C compiler unrolls. Not proven,
+  clamps kept: offsets of another form, an inner local initialized
+  conditionally or reused, a view not hoisted by the enclosing loop, an
+  enclosing loop that assigns its induction local or has a double or
+  `length` bound. `TSAOT_TA_RANGE=0`. TinyLlama Q8_0 14.8 -> 22.1 tokens/s on
+  one thread, 26.2 -> 40.2 on two, 43.4 -> 49.8 on four (llama.cpp's CPU
+  path 65 / 73 / 72), outputs identical. Fixture
+  `arrays/typed_array_loop_ranges` (plain, strict, GC protect): the Q8 shape
+  with a short view, a negative or past-the-end derived local, a wrapping
+  shift, an offset read before its definition, a conditional increment, an
+  induction local assigned in the body, stepped loops. Gates: parity 384 identical, selfconf, unit, bundler 45/45, conformance
+  609/609 plain and strict and 606/606 under GC protect, GC stress, bench
+  within budget; tsc-ts output identical, instructions 0.9999 of the previous
+  slice.

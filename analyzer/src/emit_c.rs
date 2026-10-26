@@ -1997,6 +1997,9 @@ struct Ctx<'a> {
     /// (the loop's top label, its induction local); element accesses of hoisted
     /// views by that local are direct within it.
     ta_prefix: std::cell::RefCell<Option<TaPrefix>>,
+    /// the proven-range flags of the inner loops of the counted loops being emitted, by the
+    /// inner Loop instruction's address (docs/typed_array_loops_design.md "Proven ranges")
+    ta_range_flags: std::cell::RefCell<BTreeMap<usize, String>>,
     /// string receivers of `charCodeAt` whose view the enclosing loop read once:
     /// local -> the loop's top label
     sv_hoisted: std::cell::RefCell<BTreeMap<u32, u32>>,
@@ -9330,6 +9333,7 @@ fn emit_i64_function(
         ta_hoisted: std::cell::RefCell::new(BTreeMap::new()),
         layout_open: std::cell::RefCell::new(BTreeMap::new()),
         ta_prefix: std::cell::RefCell::new(None),
+        ta_range_flags: std::cell::RefCell::new(BTreeMap::new()),
         sv_hoisted: std::cell::RefCell::new(BTreeMap::new()),
         loop_mod_residues: std::cell::RefCell::new(Vec::new()),
         fin_stack: std::cell::RefCell::new(Vec::new()),
@@ -9571,6 +9575,7 @@ fn emit_f64_function(
         ta_hoisted: std::cell::RefCell::new(BTreeMap::new()),
         layout_open: std::cell::RefCell::new(BTreeMap::new()),
         ta_prefix: std::cell::RefCell::new(None),
+        ta_range_flags: std::cell::RefCell::new(BTreeMap::new()),
         sv_hoisted: std::cell::RefCell::new(BTreeMap::new()),
         loop_mod_residues: std::cell::RefCell::new(Vec::new()),
         fin_stack: std::cell::RefCell::new(Vec::new()),
@@ -9703,6 +9708,7 @@ fn emit_function(
         ta_hoisted: std::cell::RefCell::new(BTreeMap::new()),
         layout_open: std::cell::RefCell::new(BTreeMap::new()),
         ta_prefix: std::cell::RefCell::new(None),
+        ta_range_flags: std::cell::RefCell::new(BTreeMap::new()),
         sv_hoisted: std::cell::RefCell::new(BTreeMap::new()),
             loop_mod_residues: std::cell::RefCell::new(Vec::new()),
             fin_stack: std::cell::RefCell::new(Vec::new()),
@@ -9777,6 +9783,7 @@ fn emit_function(
         ta_hoisted: std::cell::RefCell::new(BTreeMap::new()),
         layout_open: std::cell::RefCell::new(BTreeMap::new()),
         ta_prefix: std::cell::RefCell::new(None),
+        ta_range_flags: std::cell::RefCell::new(BTreeMap::new()),
         sv_hoisted: std::cell::RefCell::new(BTreeMap::new()),
             loop_mod_residues: std::cell::RefCell::new(Vec::new()),
             fin_stack: std::cell::RefCell::new(Vec::new()),
@@ -9851,6 +9858,7 @@ fn emit_function(
         ta_hoisted: std::cell::RefCell::new(BTreeMap::new()),
         layout_open: std::cell::RefCell::new(BTreeMap::new()),
         ta_prefix: std::cell::RefCell::new(None),
+        ta_range_flags: std::cell::RefCell::new(BTreeMap::new()),
         sv_hoisted: std::cell::RefCell::new(BTreeMap::new()),
             loop_mod_residues: std::cell::RefCell::new(Vec::new()),
             fin_stack: std::cell::RefCell::new(Vec::new()),
@@ -10148,6 +10156,7 @@ fn emit_function(
         ta_hoisted: std::cell::RefCell::new(BTreeMap::new()),
         layout_open: std::cell::RefCell::new(BTreeMap::new()),
         ta_prefix: std::cell::RefCell::new(None),
+        ta_range_flags: std::cell::RefCell::new(BTreeMap::new()),
         sv_hoisted: std::cell::RefCell::new(BTreeMap::new()),
         loop_mod_residues: std::cell::RefCell::new(Vec::new()),
         fin_stack: std::cell::RefCell::new(Vec::new()),
@@ -19048,6 +19057,18 @@ fn try_emit_fused_polymorphic_pattern_split_join_loop(
 /// and length are read once before the loop, and the cell pointer, used every
 /// iteration, keeps the view reachable. The element kind is the first use's;
 /// a receiver used with two kinds keeps the per-use test.
+/// TSAOT_TA_RANGE=0 keeps every prefix loop's clamps (docs/typed_array_loops_design.md
+/// "Proven ranges").
+fn ta_range_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_TA_RANGE").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
 /// TSAOT_TA_LOOPS=0 keeps the general loop only (docs/typed_array_loops_design.md).
 fn ta_loops_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -19105,17 +19126,12 @@ struct TaLoopPlan {
     clamps: Vec<(u32, Option<u32>)>,
 }
 
-/// Recognize a `for (let i = ...; i < bound; i++)` loop over hoisted typed-array
-/// views: the exporter lowers the update into `cond_body`'s first instruction
-/// (an `If` on the first-iteration flag whose else arm increments `i`), then
-/// clears the flag and computes the condition. The body may hold only
-/// unboxed arithmetic, element accesses `v[i]` of hoisted views, their
-/// `.length` reads and nested `If`s of the same; nothing may assign `i` or a
-/// view local. None when the loop does not qualify.
-fn ta_loop_plan(cond: u32, cond_body: &[Inst], body: &[Inst], ctx: &Ctx, hoisted: &[(u32, u8)]) -> Option<TaLoopPlan> {
-    if !ta_loops_enabled() || hoisted.is_empty() {
-        return None;
-    }
+/// The counted-loop shape the typed-array optimizations rely on: the exporter lowers the
+/// update into `cond_body`'s first instruction (an `If` on the first-iteration flag whose
+/// else arm increments `i`), then clears the flag and computes `cond = i < bound`. The
+/// induction local, the step (`i++` is 1, `i += c` a positive integral constant) and the
+/// bound; None for any other loop.
+fn ta_loop_induction(cond: u32, cond_body: &[Inst], ctx: &Ctx, hoisted: &[(u32, u8)]) -> Option<(u32, u64, TaBound)> {
     // the update: If { first, then: [], else: [.., t = i + one, i = t] }
     let Inst::If { then_body, else_body, .. } = cond_body.first()? else { return None };
     if !then_body.is_empty() || else_body.is_empty() {
@@ -19187,6 +19203,21 @@ fn ta_loop_plan(cond: u32, cond_body: &[Inst], body: &[Inst], ctx: &Ctx, hoisted
         }
     }
     let bound = bound?;
+    Some((ind, step, bound))
+}
+
+/// Recognize a `for (let i = ...; i < bound; i++)` loop over hoisted typed-array
+/// views: the exporter lowers the update into `cond_body`'s first instruction
+/// (an `If` on the first-iteration flag whose else arm increments `i`), then
+/// clears the flag and computes the condition. The body may hold only
+/// unboxed arithmetic, element accesses `v[i]` of hoisted views, their
+/// `.length` reads and nested `If`s of the same; nothing may assign `i` or a
+/// view local. None when the loop does not qualify.
+fn ta_loop_plan(cond: u32, cond_body: &[Inst], body: &[Inst], ctx: &Ctx, hoisted: &[(u32, u8)]) -> Option<TaLoopPlan> {
+    if !ta_loops_enabled() || hoisted.is_empty() {
+        return None;
+    }
+    let (ind, step, bound) = ta_loop_induction(cond, cond_body, ctx, hoisted)?;
     // nothing in the loop assigns the induction local (outside the update) or
     // the bound local
     let mut flat: Vec<&Inst> = Vec::new();
@@ -19386,7 +19417,7 @@ fn ta_loop_plan(cond: u32, cond_body: &[Inst], body: &[Inst], ctx: &Ctx, hoisted
 /// bound's view has no own property shadowing `length`), the indexes below
 /// the bound and below every accessed view's length run with direct element
 /// access; the general loop then continues from the induction local.
-fn emit_ta_prefix_loop(s: &mut String, plan: &TaLoopPlan, body: &[Inst], ctx: &Ctx, top: u32) {
+fn emit_ta_prefix_loop(s: &mut String, plan: &TaLoopPlan, body: &[Inst], ctx: &Ctx, top: u32, range_flag: Option<String>) {
     let i = plan.ind;
     // the loop id of each view's hoist (an enclosing loop's when reused)
     let vt = |a: u32| -> u32 { ctx.ta_hoisted.borrow().get(&a).map_or(top, |(_, t)| *t) };
@@ -19416,6 +19447,10 @@ fn emit_ta_prefix_loop(s: &mut String, plan: &TaLoopPlan, body: &[Inst], ctx: &C
         let expr = if off.konst == 0 { base } else if off.local.is_none() { format!("{}u", off.konst) } else { format!("ts_ta_off_add({}, {}u)", base, off.konst) };
         let _ = writeln!(s, "    uint32_t _tao{l}_{t} = {e};", l = l, t = top, e = expr);
     }
+    // the clamps, skipped when the enclosing loop proved every access within its view
+    if let Some(f) = &range_flag {
+        let _ = writeln!(s, "    if (!{}) {{", f);
+    }
     for (a, idx) in &plan.clamps {
         let tal = format!("_tal{}_{}", a, vt(*a));
         match idx {
@@ -19430,6 +19465,9 @@ fn emit_ta_prefix_loop(s: &mut String, plan: &TaLoopPlan, body: &[Inst], ctx: &C
                 );
             }
         }
+    }
+    if range_flag.is_some() {
+        s.push_str("    }\n");
     }
     let inc = if plan.step == 1 { format!("d{}++", i) } else { format!("d{} += {}", i, plan.step) };
     let _ = writeln!(s, "    for (; (unsigned long long)d{i} < (unsigned long long)_te{t}; {inc}) {{", i = i, t = top, inc = inc);
@@ -19454,6 +19492,280 @@ fn ta_prefix_index(ctx: &Ctx, _view_top: u32, index: u32) -> Option<String> {
         return Some(format!("(_tao{}_{} + (uint32_t)d{})", index, p.top, p.ind));
     }
     None
+}
+
+/// An expression affine in a counted loop's induction locals (docs/typed_array_loops_design.md
+/// "Proven ranges"): `terms` maps a local (the induction local, a derived induction local or
+/// an integer local the loop never assigns) to its non-negative coefficient; `shifts` records
+/// the `l << k` terms, exact only while `l` stays within `[0, (2^31 - 1) >> k]`.
+#[derive(Clone, Default)]
+struct TaAffine {
+    terms: BTreeMap<u32, i64>,
+    konst: i64,
+    shifts: Vec<(u32, u8)>,
+}
+
+/// At the entry of a counted loop L (`b` from its value here, `b < B` with B an integer
+/// constant or an integer local L never assigns, `b += s`): for each inner prefix loop whose
+/// offsets are affine in L's induction locals, a flag `_tp{L}_{n}` that every access of the
+/// inner loop stays within its view for the whole of L, from the trip count `_tt{L}` and the
+/// locals' ranges; the inner loop skips its clamps when the flag holds. Returns the keys
+/// (the inner Loop instructions' addresses) registered in `ctx.ta_range_flags`.
+fn ta_range_flags(s: &mut String, cond: u32, cond_body: &[Inst], body: &[Inst], ctx: &Ctx, top: u32) -> Vec<usize> {
+    let mut keys: Vec<usize> = Vec::new();
+    if !body.iter().any(|i| matches!(i, Inst::Loop { .. })) {
+        return keys;
+    }
+    let hoisted_now: Vec<(u32, u8)> = ctx.ta_hoisted.borrow().iter().map(|(a, (e, _))| (*a, *e)).collect();
+    if hoisted_now.is_empty() {
+        return keys;
+    }
+    let Some((ind, step, bound)) = ta_loop_induction(cond, cond_body, ctx, &hoisted_now) else { return keys };
+    let vt = |a: u32| -> u32 { ctx.ta_hoisted.borrow().get(&a).map_or(top, |(_, t)| *t) };
+    let mut flat: Vec<&Inst> = Vec::new();
+    flatten_inst(&cond_body[1..], &mut flat);
+    flatten_inst(body, &mut flat);
+    let mut def_counts: BTreeMap<u32, usize> = BTreeMap::new();
+    for i in flat.iter().filter_map(|i| inst_def_local(i)) {
+        *def_counts.entry(i).or_insert(0) += 1;
+    }
+    if def_counts.contains_key(&ind) {
+        return keys;
+    }
+    // the bound: an integer constant or an integer local L never assigns (a view's length
+    // would need the view to be a typed array for the trip count to mean anything)
+    let bexpr = match bound {
+        TaBound::Const(c) => format!("{}.0", c),
+        TaBound::IntLocal(b) if !def_counts.contains_key(&b) => format!("(double)d{}", b),
+        _ => return keys,
+    };
+    // the integer constants of L, each defined once
+    let mut consts: BTreeMap<u32, i64> = BTreeMap::new();
+    for inst in &flat {
+        if let Inst::Const { dst, value: ConstVal::Num { value } } = inst {
+            if def_counts.get(&dst.0) == Some(&1) && value.fract() == 0.0 && value.abs() < 4294967296.0 {
+                consts.insert(dst.0, *value as i64);
+            }
+        }
+    }
+    // the derived induction locals: `p = p + c` as the local's only definition, at the body's
+    // top level (its position in the iteration left open: the range is `[p0, p0 + c * trips]`)
+    let mut derived: BTreeMap<u32, i64> = BTreeMap::new();
+    for inst in body {
+        if let Inst::Copy { dst: p, src: t } = inst {
+            if p.0 == ind || def_counts.get(&p.0) != Some(&1) || !ctx.int_local.contains(&p.0) {
+                continue;
+            }
+            let inc = body.iter().find_map(|i| match i {
+                Inst::BinOp { dst, op, lhs, rhs } if dst.0 == t.0 && op == "+" && def_counts.get(&dst.0) == Some(&1) => {
+                    if lhs.0 == p.0 {
+                        consts.get(&rhs.0).copied()
+                    } else if rhs.0 == p.0 {
+                        consts.get(&lhs.0).copied()
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            });
+            if let Some(c) = inc.filter(|c| *c > 0) {
+                derived.insert(p.0, c);
+            }
+        }
+    }
+    let tt = format!("_tt{}", top);
+    // the range of a local over L, as C doubles
+    let range_of = |l: u32| -> Option<(String, String)> {
+        if l == ind {
+            Some((format!("(double)d{}", l), format!("((double)d{} + {}.0 * ({} - 1.0))", l, step, tt)))
+        } else if let Some(c) = derived.get(&l) {
+            Some((format!("(double)d{}", l), format!("((double)d{} + {}.0 * {})", l, c, tt)))
+        } else if !def_counts.contains_key(&l) && ctx.int_local.contains(&l) {
+            Some((format!("(double)d{}", l), format!("(double)d{}", l)))
+        } else {
+            None
+        }
+    };
+    // the affine locals, defined once at the body's top level, with their positions
+    let mut aff: BTreeMap<u32, (usize, TaAffine)> = BTreeMap::new();
+    let term_of = |l: u32, pos: usize, aff: &BTreeMap<u32, (usize, TaAffine)>| -> Option<TaAffine> {
+        if let Some(&c) = consts.get(&l) {
+            return Some(TaAffine { konst: c, ..Default::default() });
+        }
+        if l == ind || derived.contains_key(&l) || (!def_counts.contains_key(&l) && ctx.int_local.contains(&l)) {
+            let mut a = TaAffine::default();
+            a.terms.insert(l, 1);
+            return Some(a);
+        }
+        match aff.get(&l) {
+            Some((p, a)) if *p < pos => Some(a.clone()),
+            _ => None,
+        }
+    };
+    for (pos, inst) in body.iter().enumerate() {
+        let (dst, value) = match inst {
+            Inst::BinOp { dst, op, lhs, rhs } if def_counts.get(&dst.0) == Some(&1) && ctx.int_local.contains(&dst.0) && dst.0 != ind => {
+                let v = match op.as_str() {
+                    "+" => match (term_of(lhs.0, pos, &aff), term_of(rhs.0, pos, &aff)) {
+                        (Some(a), Some(b)) => {
+                            let mut r = a;
+                            for (l, c) in &b.terms {
+                                *r.terms.entry(*l).or_insert(0) += c;
+                            }
+                            r.konst += b.konst;
+                            r.shifts.extend(b.shifts.iter().copied());
+                            Some(r)
+                        }
+                        _ => None,
+                    },
+                    "*" => {
+                        let scaled = |a: TaAffine, c: i64| -> Option<TaAffine> {
+                            if c <= 0 || c > 65536 {
+                                return None;
+                            }
+                            let mut r = a;
+                            for v in r.terms.values_mut() {
+                                *v *= c;
+                            }
+                            r.konst *= c;
+                            Some(r)
+                        };
+                        match (consts.get(&rhs.0), consts.get(&lhs.0)) {
+                            (Some(&c), _) => term_of(lhs.0, pos, &aff).and_then(|a| scaled(a, c)),
+                            (_, Some(&c)) => term_of(rhs.0, pos, &aff).and_then(|a| scaled(a, c)),
+                            _ => None,
+                        }
+                    }
+                    "<<" => match (term_of(lhs.0, pos, &aff), consts.get(&rhs.0)) {
+                        (Some(a), Some(&k))
+                            if (0..=30).contains(&k) && a.terms.len() == 1 && a.konst == 0 && a.shifts.is_empty() && a.terms.values().all(|c| *c == 1) =>
+                        {
+                            let l = *a.terms.keys().next().unwrap();
+                            let mut r = TaAffine::default();
+                            r.terms.insert(l, 1i64 << k);
+                            r.shifts.push((l, k as u8));
+                            Some(r)
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                (dst.0, v)
+            }
+            Inst::Copy { dst, src } if def_counts.get(&dst.0) == Some(&1) && ctx.int_local.contains(&dst.0) && dst.0 != ind && !derived.contains_key(&dst.0) => {
+                (dst.0, term_of(src.0, pos, &aff))
+            }
+            _ => continue,
+        };
+        if let Some(a) = value {
+            aff.insert(dst, (pos, a));
+        }
+    }
+    // the lowest and highest value of an affine expression over L, and the conditions of its shifts
+    let eval = |a: &TaAffine| -> Option<(String, String, Vec<String>)> {
+        let mut lo = format!("{}.0", a.konst);
+        let mut hi = lo.clone();
+        for (l, c) in &a.terms {
+            if *c < 0 {
+                return None;
+            }
+            let (l_lo, l_hi) = range_of(*l)?;
+            lo = format!("({} + {}.0 * {})", lo, c, l_lo);
+            hi = format!("({} + {}.0 * {})", hi, c, l_hi);
+        }
+        let mut conds = Vec::new();
+        for (l, k) in &a.shifts {
+            let (l_lo, l_hi) = range_of(*l)?;
+            conds.push(format!("({} >= 0.0 && {} <= {}.0)", l_lo, l_hi, 2147483647i64 >> k));
+        }
+        Some((lo, hi, conds))
+    };
+    let mut emitted_tt = false;
+    let mut n = 0u32;
+    for (pos, inst) in body.iter().enumerate() {
+        let Inst::Loop { cond: ic, cond_body: icb, body: ib } = inst else { continue };
+        let Some(plan) = ta_loop_plan(ic.0, icb, ib, ctx, &hoisted_now) else { continue };
+        let j = plan.ind;
+        // the inner induction local: initialized at L's top level before the loop from an
+        // integer constant, assigned nowhere else in L but the inner loop's own update
+        let mut inner_flat: Vec<&Inst> = Vec::new();
+        flatten_inst(icb, &mut inner_flat);
+        flatten_inst(ib, &mut inner_flat);
+        let inner_defs = inner_flat.iter().filter(|i| inst_def_local(i) == Some(j)).count();
+        if def_counts.get(&j) != Some(&(inner_defs + 1)) {
+            continue;
+        }
+        let j0 = body[..pos].iter().rev().find_map(|i| match i {
+            Inst::Copy { dst, src } if dst.0 == j => Some(consts.get(&src.0).copied()),
+            Inst::Const { dst, value: ConstVal::Num { value } } if dst.0 == j => {
+                Some(if value.fract() == 0.0 && value.abs() < 4294967296.0 { Some(*value as i64) } else { None })
+            }
+            _ => None,
+        });
+        let Some(Some(j0)) = j0 else { continue };
+        if j0 < 0 {
+            continue;
+        }
+        let j_max = match plan.bound {
+            TaBound::Const(c) => format!("{}.0", c as i64 - 1),
+            TaBound::IntLocal(nl) if !def_counts.contains_key(&nl) => format!("((double)d{} - 1.0)", nl),
+            TaBound::Len(a) => format!("((double)_tal{}_{} - 1.0)", a, vt(a)),
+            _ => continue,
+        };
+        let mut conds: Vec<String> = Vec::new();
+        let mut ok = true;
+        for (v, idx) in &plan.clamps {
+            let tal = format!("(double)_tal{}_{}", v, vt(*v));
+            let (lo, hi) = match idx {
+                None => (format!("{}.0", j0), j_max.clone()),
+                Some(l) => {
+                    let Some((_, off)) = plan.offsets.iter().find(|(x, _)| x == l) else {
+                        ok = false;
+                        break;
+                    };
+                    match off.local {
+                        None => (format!("{}.0", j0 + off.konst as i64), format!("({} + {}.0)", j_max, off.konst)),
+                        Some(o) => {
+                            let Some(a) = term_of(o, pos, &aff) else {
+                                ok = false;
+                                break;
+                            };
+                            let Some((o_lo, o_hi, extra)) = eval(&a) else {
+                                ok = false;
+                                break;
+                            };
+                            conds.push(format!("{} >= 0.0", o_lo));
+                            conds.extend(extra);
+                            (format!("({} + {}.0)", o_lo, j0 + off.konst as i64), format!("({} + {} + {}.0)", o_hi, j_max, off.konst))
+                        }
+                    }
+                }
+            };
+            conds.push(format!("{} >= 0.0", lo));
+            conds.push(format!("{} < {}", hi, tal));
+        }
+        if !ok || conds.is_empty() {
+            continue;
+        }
+        if !emitted_tt {
+            let _ = writeln!(
+                s,
+                "  double {tt} = ({b} > (double)d{i}) ? ceil(({b} - (double)d{i}) / {st}.0) : 0.0;",
+                tt = tt,
+                b = bexpr,
+                i = ind,
+                st = step
+            );
+            emitted_tt = true;
+        }
+        let name = format!("_tp{}_{}", top, n);
+        n += 1;
+        let _ = writeln!(s, "  int {} = ({} <= 0.0) || ({});", name, tt, conds.join(" && "));
+        let key = inst as *const Inst as usize;
+        ctx.ta_range_flags.borrow_mut().insert(key, name);
+        keys.push(key);
+    }
+    keys
 }
 
 fn loop_view_receivers(cond_body: &[Inst], body: &[Inst], ctx: &Ctx) -> Vec<(u32, u8)> {
@@ -25238,13 +25550,20 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 );
                 hoist_saved.push((*arr, ctx.ta_hoisted.borrow_mut().insert(*arr, (*elem, top))));
             }
+            // the proven ranges of the inner prefix loops (docs/typed_array_loops_design.md)
+            let range_keys: Vec<usize> = if ta_range_enabled() {
+                ta_range_flags(s, cond.0, cond_body, body, ctx, top)
+            } else {
+                Vec::new()
+            };
             ctx.loop_labels
                 .borrow_mut()
                 .push((top, end, ctx.eh_depth.get()));
             ctx.loop_mod_residues.borrow_mut().push(residue_map);
             if residues.is_empty() {
                 if let Some(plan) = ta_loop_plan(cond.0, cond_body, body, ctx, &hoisted) {
-                    emit_ta_prefix_loop(s, &plan, body, ctx, top);
+                    let range_flag = ctx.ta_range_flags.borrow().get(&(inst as *const Inst as usize)).cloned();
+                    emit_ta_prefix_loop(s, &plan, body, ctx, top, range_flag);
                 }
             }
             let _ = writeln!(s, "  L{}: ;", top);
@@ -25277,6 +25596,9 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             let _ = writeln!(s, "  L{}: ;", end);
             ctx.loop_mod_residues.borrow_mut().pop();
             ctx.loop_labels.borrow_mut().pop();
+            for k in range_keys {
+                ctx.ta_range_flags.borrow_mut().remove(&k);
+            }
             for (arr, prev) in hoist_saved {
                 match prev {
                     Some(p) => {

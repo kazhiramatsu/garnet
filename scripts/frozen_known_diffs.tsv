@@ -341,3 +341,5 @@ parity-unported	numbers/int32_narrow_locals	Frozen emitter lacks a typed-array c
 selfconf-unported	numbers/int32_narrow_locals	Frozen emitter lacks a typed-array constructor form the fixture uses (builtin typedarray.new); the Rust emitter supports it, and the native output matches V8.
 parity-unported	arrays/typed_array_loop_nested	Frozen emitter lacks a typed-array constructor form the fixture uses (builtin typedarray.new, `new Float32Array([..])`); the Rust emitter supports it.
 selfconf-unported	arrays/typed_array_loop_nested	Frozen emitter lacks a typed-array constructor form the fixture uses (builtin typedarray.new); the Rust emitter supports it, and the native output matches V8.
+parity-unported	arrays/typed_array_loop_ranges	Frozen emitter lacks a typed-array constructor form the fixture uses (builtin typedarray.new); the Rust emitter supports it.
+selfconf-unported	arrays/typed_array_loop_ranges	Frozen emitter lacks a typed-array constructor form the fixture uses (builtin typedarray.new); the Rust emitter supports it, and the native output matches V8.
