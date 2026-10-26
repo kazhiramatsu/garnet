@@ -10516,3 +10516,20 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   `string_unicode_search_kernel` at 103 ms against its 100 ms budget, 97-99
   in the previous runs and byte-identical code with the slice off; alone
   and quiet 99, PASS); tsc-ts output identical, instructions 0.9997.
+- TinyLlama: the serial work beside the threads (Session 353,
+  `docs/llm_inference_design.md` "Threads"). `--stats` prints the main
+  thread's time per pooled product: the products reach 79 GB/s on eight
+  threads, the memory ceiling llama.cpp sustains over the whole token, and
+  the rest of the token is the main thread's serial work. Two parts of it
+  are gone: RoPE's angles from tables computed once (doubles, the forward's
+  own expressions, outputs identical; 2048 trigonometric calls per layer and
+  token before), and the feed-forward gate and up products with the SiLU
+  between them as one pooled job (22 fewer barriers per token, no serial
+  pass over the hidden vector). The block scales table is interleaved by
+  four rows (neutral alone; the layout a vector form of the scale arithmetic
+  wants). 1 / 2 / 4 / 8 threads: 24.7 / 42.1 / 55.0 / 61.8 tokens/s (before
+  24.6 / 42.8 / 52.9 / 57.2; llama.cpp's CPU path 65 / 73 / 72 on 1 / 2 /
+  4), outputs identical in every configuration. Smaller minimum grabs and a
+  steeper guided divisor measured worse on eight threads. Next: the main
+  thread's QoS class (a `setThreadQos` in `garnet:shared`, prepared), the
+  attention over the heads as a pooled job, the q/k/v products fused.

@@ -177,11 +177,49 @@ hold the others. Measured, 32 generated tokens, outputs identical:
 
 Eight threads (the four performance and four efficiency cores) are the
 useful count; ten leave no core to the system and to the main thread's
-serial work. Against llama.cpp's 72 on the CPU the remaining levers are the
-kernel's per-block overhead (every thread's rate) and the per-job costs:
-about 155 jobs per token, each with the activation quantized and copied on
-the main thread and a barrier, which fusing the q/k/v and the w1/w3 products
-into one job each would cut by a third.
+serial work.
+
+Where the time goes with the threads (`--stats`: the main thread's time per
+pooled product, 152 products per token, the kernel of the loop-versioning
+slice at 24.6 tokens/s on one thread):
+
+| threads | own share | wait | prep + copy out | in products | tokens/s |
+|---|---|---|---|---|---|
+| 2 | 133.5 us | 0.6 us | 3.5 us | 90% | 42.9 |
+| 4 | 101.9 us | 0.9 us | 3.5 us | 87% | 53.5 |
+| 8 | 77.6 us | 13.4 us | 5.2 us | 79% | 58.5 |
+
+A product moves 7.2 MB of weights: 70 GB/s during the products on four
+threads, 79 GB/s on eight, which is what llama.cpp sustains over the whole
+token (72 tokens/s = 79 GB/s). So the products are at the memory ceiling on
+eight threads; the gap is outside them: the main thread's serial work
+between products (the attention over the cache, the norms, rope, the
+residual adds, the sampling) takes 21% of the time on eight threads where it
+took 3% on one, and the wait for the slowest worker's last grab 13 us per
+product. The next levers, in order: the main thread kept on a performance
+core (a QoS class for the main process, the spinning workers at default
+QoS: the serial work took three times longer beside seven spinning
+processes, plausibly the main thread scheduled onto an efficiency core at
+times; to be verified with the QoS in place); the attention split
+over the heads as a second kind of pooled job; the q/k/v and w1/w3 products
+fused into one job each (a third fewer barriers). Reading fewer bytes per
+token (Q4_0, half the weights) raises the ceiling itself. A one-row kernel
+(one weight stream per thread) measured worse at every thread count (15.8 /
+47.2 / 52.5 on 1 / 4 / 8), so the four-row kernel stays.
+
+Two of the serial parts are gone since. RoPE's angles come from tables
+computed once (doubles, the forward pass's own expressions, so the outputs
+stay identical): 2048 trigonometric calls per layer and token were about a
+millisecond beside the threads. And the feed-forward gate and up products
+with the SiLU between them are one pooled job, `out[r] = silu(w1[r] . x) *
+(w3[r] . x)` per row block from the two products in per-thread scratch: 22
+fewer barriers per token and no serial pass over the 5632-wide hidden
+vector. The block scales table is interleaved by four rows (the four-row
+kernel reads a block's four scales adjacently; neutral alone, the layout a
+vector form of the scale arithmetic wants). 1 / 2 / 4 / 8 threads: 24.7 /
+42.1 / 55.0 / 61.8 tokens/s (before 24.6 / 42.8 / 52.9 / 57.2). Smaller
+minimum grabs (8, 4) and a steeper guided divisor (4n) measured worse on
+eight threads; 16 rows and 2n stay.
 
 ## Milestone 3: the GPU through Metal (planned, Kaz 2026-10-26)
 

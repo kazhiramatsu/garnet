@@ -1,10 +1,11 @@
 // llama_gguf.ts: the program of docs/llm_inference_design.md, milestone 2: a llama.cpp GGUF model
 // (TinyLlama-1.1B-Chat Q8_0) generating text, the model and the kernels in llama_core.ts.
 //
-// Usage: llama_gguf <model.gguf> [-n steps] [-p "prompt"] [-t temperature] [-s seed] [--raw] [-j threads]
+// Usage: llama_gguf <model.gguf> [-n steps] [-p "prompt"] [-t temperature] [-s seed] [--raw] [-j threads] [--stats]
 //   The prompt is wrapped in TinyLlama-Chat's template unless --raw is given; -j N splits the
-//   matrix-vector products over N threads (llama_core.ts).
-import { readGguf, Model, Llama, Tokenizer, softmax, startPool, stopPool, setPool, setSharedModel } from "./llama_core";
+//   matrix-vector products over N threads (llama_core.ts); --stats prints the pool's per-job time
+//   split (the main thread's preparation, its own share, its wait for the workers, the copy out).
+import { readGguf, Model, Llama, Tokenizer, softmax, startPool, stopPool, setPool, setSharedModel, poolStats } from "./llama_core";
 
 class Sampler {
   private state: number;
@@ -32,10 +33,11 @@ function concatBytes(parts: Uint8Array[]): Uint8Array {
 function main(): void {
   const args = process.argv.slice(2);
   if (args.length < 1) { process.stderr.write("usage: llama_gguf <model.gguf> [-n steps] [-p prompt] [-t temperature] [-s seed] [--raw]\n"); process.exit(1); }
-  let steps = 64, prompt = "Tell me a short story about a robot.", temperature = 0, seed = 42, raw = false, threads = 1;
+  let steps = 64, prompt = "Tell me a short story about a robot.", temperature = 0, seed = 42, raw = false, threads = 1, stats = false;
   for (let i = 1; i < args.length; i++) {
     const a = args[i];
     if (a === "--raw") raw = true;
+    else if (a === "--stats") stats = true;
     else if (i + 1 < args.length) {
       const v = args[++i];
       if (a === "-n") steps = parseInt(v, 10); else if (a === "-p") prompt = v; else if (a === "-t") temperature = parseFloat(v); else if (a === "-s") seed = parseInt(v, 10); else if (a === "-j") threads = parseInt(v, 10);
@@ -84,5 +86,9 @@ function main(): void {
   const genMs = Date.now() - start - promptMs;
   process.stderr.write(`prompt ${promptTokens.length} tokens in ${promptMs} ms (${(promptTokens.length / (promptMs / 1000)).toFixed(1)} tok/s), generated ${generated} tokens in ${genMs} ms (${(generated / (genMs / 1000)).toFixed(1)} tok/s)${threads > 1 ? `, ${threads} threads` : ""}\n`);
   if (pool !== null) stopPool(pool);
+  if (stats && pool !== null) {
+    const ps = poolStats, us = (ms: number) => (ms / ps.jobs * 1000).toFixed(1);
+    process.stderr.write(`pool: ${ps.jobs} jobs; per job prep ${us(ps.prep)} us, own ${us(ps.own)} us, wait ${us(ps.wait)} us, post ${us(ps.post)} us; in jobs ${(ps.prep + ps.own + ps.wait + ps.post).toFixed(0)} ms of ${Date.now() - t0} ms\n`);
+  }
 }
 main();
