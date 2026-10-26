@@ -176,3 +176,41 @@ And one loud gap: `{ __proto__: P }` in a literal makes an own property
    method parameter made narrower by an override), needs no interval test.
 5. Reusing a guard: the layout of an object is fixed at its allocation, so
    a guard proven for a local holds until the local is assigned again.
+
+## Slice 3 (Session 353): borrows wait for the method-value pass; library relinks
+
+- A `call`, `apply` or `bind` of a function value that is not syntactically a
+  plain function (a parameter, a property of a record, a field) opened the
+  program on sight. A struct method can only reach such a site as a value,
+  and pass 5 already finds every way a method becomes a value (read, passed,
+  taken by a pattern, a computed key on an instance), so those borrow sites
+  are now deferred (`deferredBorrows`) and open the program only when pass 5
+  found a method value anywhere (`... (the program reads methods as values)`
+  in the reasons). Pass 5 gained the descriptor routes: `Object.
+  getOwnPropertyDescriptor(s)`, `Reflect.getOwnPropertyDescriptor` and
+  `Reflect.get` on a value that may be an instance hand out a method or an
+  accessor as a value. `Reflect.apply` still opens on sight.
+- The Node library's own prototype work goes through host primitives that
+  refuse a class layout instead of `Object.create`/`setPrototypeOf`:
+  `__garnet_node.createObject(proto)` (Buffer's prototype over
+  Uint8Array's) and `relink(obj, proto)` (Buffer adoption, `util.inherits`)
+  throw a TypeError when the chain reaches a registered class with fields or
+  the object is a class instance or prototype, so the typed-slow flag can
+  never be raised through them and the proof has no site to count.
+- Measured: tsc-ts compiled against lib/node (fs, path, os, perf_hooks,
+  child_process; the worker_threads and scriptc shims remain) is closed; the
+  first attempt was open at 32 sites (events' `listener.apply`, stream's
+  `callback.call`, util's `fn.call`, Buffer's relinks, and `chunk.length`
+  read off `any` where some class has a `length` method), each now gone
+  from the library or deferred. Verdict tests: 52.
+- The runtime's borrow check compared the `this`'s chain with the method's
+  home prototype only. A class declared in a function gets a fresh prototype
+  per evaluation (`ts_clone_class_proto`, registered with the class's own
+  field table), so `l.m.call(l)` on such a class raised the flag in a closed
+  program; the on-sight rule had opened every program with a borrow of a
+  non-plain function, which hid it until this slice (`classes/
+  static_members`: a static method bound with `null` and a local class's
+  method bound to its instance). The check now also accepts a chain link
+  registered with the home's field table (`proto_chain_has_class_of`, after
+  the chain test fails, so the common path is unchanged). Fixture
+  `classes/local_class_borrow`.

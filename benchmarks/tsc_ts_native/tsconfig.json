@@ -8,15 +8,10 @@
     "noEmit": true,
     "types": [],
     "paths": {
-      "node:fs": ["./garnet/node_fs.ts"],
-      "node:path": ["./garnet/node_path.ts"],
-      "node:os": ["./garnet/node_os.ts"],
-      "node:perf_hooks": ["./garnet/node_perf_hooks.ts"],
       "node:worker_threads": ["./garnet/node_worker_threads.ts"],
-      "node:child_process": ["./garnet/node_child_process.ts"],
       "@scriptc/threads": ["./garnet/scriptc_threads.ts"],
       "@scriptc/types": ["./garnet/scriptc_types.ts"]
     }
   },
-  "files": ["garnet/main.ts", "garnet/globals.d.ts"]
+  "files": ["garnet/main.ts"]
 }

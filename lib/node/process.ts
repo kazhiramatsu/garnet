@@ -102,6 +102,10 @@ function minimalWriter(fd: number): WriteStream {
 
 export interface MemoryUsage { rss: number; heapTotal: number; heapUsed: number; external: number; arrayBuffers: number }
 export interface CpuUsage { user: number; system: number }
+export interface MemoryUsageFn { (): MemoryUsage; rss(): number }
+function memoryUsageImpl(): MemoryUsage { return { rss: host.rss(), heapTotal: 0, heapUsed: 0, external: 0, arrayBuffers: 0 }; }
+const memoryUsageFn: MemoryUsageFn = memoryUsageImpl as MemoryUsageFn;
+memoryUsageFn.rss = (): number => host.rss();
 export type Signal = string;
 
 export class Process extends EventEmitter {
@@ -197,7 +201,12 @@ export class Process extends EventEmitter {
     return [seconds, nanoseconds];
   }
   uptime(): number { return host.now() / 1000; }
-  memoryUsage(): MemoryUsage { return { rss: host.rss(), heapTotal: 0, heapUsed: 0, external: 0, arrayBuffers: 0 }; }
+  /** process.memoryUsage() and process.memoryUsage.rss(). */
+  readonly memoryUsage: MemoryUsageFn = memoryUsageFn;
+  /** The CPU time of the thread: the process's, there being one. */
+  threadCpuUsage(previous?: CpuUsage): CpuUsage { return this.cpuUsage(previous); }
+  constrainedMemory(): number { return 0; }
+  availableMemory(): number { return host.freemem(); }
   cpuUsage(previous?: CpuUsage): CpuUsage {
     const u = host.cpuUsage();
     if (previous === undefined) return { user: u[0], system: u[1] };

@@ -137,7 +137,7 @@ case "$PGO" in
         echo "[pgo] no training workload at hand: the TypeScript compiler project ($TS_SRC/src/compiler) and its lib directory (TSC_TS_LIB_DIR, or the checkout's @scriptc package) are needed; set TSAOT_PGO_TRAIN='<command>' or TSAOT_PGO=off" >&2
         exit 1
       fi
-      TRAIN="cd '$TS_SRC' && TSC_TS_LIB_DIR='$LIB' \"\$TSAOT_PGO_BIN\" -p src/compiler/tsconfig.json --composite false --incremental false --declaration false --declarationMap false --emitDeclarationOnly false --isolatedDeclarations false --sourceMap false --pretty false --checkers 1 --outDir '$WORK/pgo/out' > /dev/null"
+      TRAIN="cd '$TS_SRC' && TSAOT_CPUS=1 TSC_TS_LIB_DIR='$LIB' \"\$TSAOT_PGO_BIN\" -p src/compiler/tsconfig.json --composite false --incremental false --declaration false --declarationMap false --emitDeclarationOnly false --isolatedDeclarations false --sourceMap false --pretty false --checkers 1 --outDir '$WORK/pgo/out' > /dev/null"
     fi
     native_build "$(tsaot_pgo_gen_flags "$WORK/pgo/raw")" "$WORK/tsc-ts.pgo-gen" "$WORK/pass_gen"
     echo "[pgo] training run: $TRAIN"

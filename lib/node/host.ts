@@ -63,6 +63,13 @@ export interface GarnetNodeHost {
   userInfo(): [string, number, number, string, string];
   utf8Length(text: string): number;
   randomBytes(count: number): Uint8Array;
+  /** The bytes of `text` written into `view` at `offset`, at most `max`: kind 0 UTF-8 (whole characters),
+   *  1 UTF-16LE (whole units), 2 Latin-1 (the low byte of each unit). Returns the count written. */
+  writeString(text: string, view: Uint8Array, offset: number, max: number, kind: number): number;
+  /** Object.create for a library object: a prototype chain that reaches a class with fields is a TypeError. */
+  createObject(proto: object | null): object;
+  /** Object.setPrototypeOf for a library object: a class instance, a class prototype or a chain to a class with fields is a TypeError. */
+  relink(obj: object, proto: object | null): void;
   /** The digest of `data` by "md5", "sha1", "sha256" or "sha512"; undefined for another name. */
   hash(algorithm: string, data: string | Uint8Array): Uint8Array | undefined;
   /** Runs argv[0] with argv to completion. stdin: bytes to feed, or 1 (inherit) or 2 (ignore);

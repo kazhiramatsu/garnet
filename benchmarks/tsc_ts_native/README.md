@@ -8,14 +8,15 @@ AOT compilers can be compared on one program.
 - `garnet/main.ts`: the entry, tsc-ts's `src/main.ts` with one thread (it
   spawns workers from its own URL, `new Worker(new URL(import.meta.url))`,
   which garnet does not build). The compiler's sources are unmodified.
-- `garnet/node_*.ts`, `garnet/scriptc_*.ts`: the Node and scriptc modules
-  tsc-ts imports (`node:fs`, `node:path`, `node:os`, `node:perf_hooks`,
-  `node:worker_threads`, `node:child_process`, `@scriptc/threads`,
-  `@scriptc/types`), mapped by `tsconfig.json`'s `paths`: synchronous file
-  calls, POSIX `dirname`, one available CPU (so the checkers default to
-  one), no workers or child processes, `publish` as the identity.
-- `garnet/prelude.ts`, `garnet/globals.d.ts`: `process` and `Buffer` (the
-  parts tsc-ts uses), imported first by the entry.
+- `garnet/node_worker_threads.ts`, `garnet/scriptc_*.ts`: the modules tsc-ts
+  imports that are not the Node library's (`node:worker_threads`,
+  `@scriptc/threads`, `@scriptc/types`), mapped by `tsconfig.json`'s `paths`:
+  forked workers, `publish` from `garnet:shared`. `node:fs`, `node:path`,
+  `node:os`, `node:perf_hooks` and `node:child_process` are garnet's Node
+  library (`lib/node`), and `process`/`Buffer` the prelude the exporter
+  generates for the program (docs/node_compat_design.md). Measure with
+  `TSAOT_CPUS=1`: the library reports the machine's CPUs otherwise, and
+  tsc-ts starts as many parse threads.
 - `host.c`: the primitives the shims stand on, registered as the global
   `__garnetHost` (file system, arguments, environment, clocks, exit, the
   UTF-8 length and UTF-16LE writes `Buffer` needs).

@@ -130,3 +130,13 @@ source, where it is 1.2x slower on tsc 6.0.3's (the JS-era design), and 8x
 slower than scriptc: tsc-ts is the static subset garnet's type-driven
 lowering is for, so the gap is the pattern work's next input (profile the
 run, take the worst patterns first).
+
+## Update (Session 353): the Node modules are lib/node
+
+Since Node compatibility N5a the build maps only `node:worker_threads` and the
+`@scriptc/*` modules to shims (`benchmarks/tsc_ts_native/garnet/`); `node:fs`,
+`node:path`, `node:os`, `node:perf_hooks` and `node:child_process` are the
+library's (`lib/node`, `docs/node_compat_design.md`), and `process`/`Buffer`
+come from the prelude the exporter generates. `host.c` stays for the worker
+shim. The measured configuration is one CPU (`TSAOT_CPUS=1` in the run and in
+the PGO training command), the shims' former `availableParallelism() === 1`.

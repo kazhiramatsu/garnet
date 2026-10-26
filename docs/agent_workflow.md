@@ -336,6 +336,14 @@ Two tools that look right are wrong on garnet's binaries, and one works:
 5. Depending on the kind of change, run `scripts/gate.sh conf all` + unit (+ gc / bundler / selfconf / emitc_diff).
 6. Append a session note to the end of `docs/TODO.md`. Commit on the user's instruction (English, with a `Verified:` line).
 
+### Gotcha: measure tsc-ts with `TSAOT_CPUS=1`
+
+Since the benchmark runs on lib/node, `os.availableParallelism()` reports the
+machine's CPUs and tsc-ts starts that many parse threads; the recorded A/B
+numbers are one checker on one CPU. `TSAOT_CPUS=1` (read by the host's
+`cpus()`) pins it; the PGO training command in `build_tsc_ts_native.sh` sets
+it too.
+
 ### Gotcha: `dt` hangs on a program that reads standard input
 
 `dt` runs node and the native binary with the terminal's stdin. A program

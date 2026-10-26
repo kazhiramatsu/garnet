@@ -10013,3 +10013,24 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   every class live; a computed-key read reachable from any validation path
   makes every member of a live class live), so dead-function elimination
   needs lazy class values and a called-value dataflow first: deferred.
+- Node compatibility N5a: tsc-ts compiled against lib/node (fs, path, os,
+  perf_hooks, child_process; the worker_threads and scriptc shims remain,
+  the prelude is the generated one). Output identical, instructions 1.021
+  against the shim build on one CPU (`TSAOT_CPUS=1`; the host's `cpus()`
+  honors it; the run and the PGO training set it). On the way: Node's
+  overloads for readFileSync/statSync/lstatSync/readdirSync and
+  spawnSync/execSync/execFileSync, process.memoryUsage.rss()/
+  threadCpuUsage/constrainedMemory, fs.watch as an error; closed receivers
+  slice 3 (borrows of function values wait for the method-value pass,
+  descriptor routes, host `createObject`/`relink` for the library's
+  prototype work: the library had opened tsc-ts at 32 sites, 1.66x; the
+  runtime's borrow check now accepts an instance of a per-evaluation clone
+  of the method's class prototype, a class declared in a function, which the
+  old on-sight rule had hidden: `classes/static_members` caught it, fixture
+  `classes/local_class_borrow`); the host's utf8Length without a copy and
+  cached in the cell (1.36x → 1.27x);
+  Buffer.write and the UTF-16LE/Latin-1 encoders in the host (`writeString`:
+  1.27x → 1.02x); lean readFileSync/options/Stats; the decoders keep a
+  leading BOM as Node does (a silent deviation before). Known: 2.1% remains
+  in the parse workers (publish_visit, stack scan, remembered set; no lib
+  function above a few samples); worker_threads (N5b) is still the shim.

@@ -41,8 +41,11 @@ function modeOf(mode: number | string | undefined, dflt: number): number {
   if (typeof mode === "string") { const v = parseInt(mode, 8); if (v !== v) throw invalidArgType("mode", "of type number or an octal string", mode); return v; }
   return mode;
 }
+const UTF8_OPTIONS = { encoding: "utf8" as string | null };
+const NO_OPTIONS = { encoding: null as string | null };
 function encodingArg(options: unknown, name: string = "options"): { encoding: string | null; flag?: string; mode?: number; withFileTypes?: boolean; recursive?: boolean } {
-  if (options === undefined || options === null) return { encoding: null };
+  if (options === undefined || options === null) return NO_OPTIONS;
+  if (options === "utf8" || options === "utf-8") return UTF8_OPTIONS;   // the common call, no allocation
   if (typeof options === "string") { if (options !== "buffer" && normalizeEncoding(options) === undefined) throw codedTypeError("ERR_INVALID_ARG_VALUE", "The argument '" + name + "' is invalid encoding. Received '" + options + "'"); return { encoding: options === "buffer" ? null : options }; }
   if (typeof options !== "object") throw invalidArgType(name, "one of type string or an instance of Object", options);
   const o = options as { encoding?: string | null; flag?: string; mode?: number | string; withFileTypes?: boolean; recursive?: boolean };
@@ -55,12 +58,15 @@ function encodingArg(options: unknown, name: string = "options"): { encoding: st
 export class Stats {
   dev: number; mode: number; nlink: number; uid: number; gid: number; rdev: number = 0; blksize: number; ino: number; size: number; blocks: number;
   atimeMs: number; mtimeMs: number; ctimeMs: number; birthtimeMs: number;
-  atime: Date; mtime: Date; ctime: Date; birthtime: Date;
   constructor(a: number[]) {
     this.size = a[1]; this.mtimeMs = a[2]; this.mode = a[3]; this.uid = a[4]; this.gid = a[5]; this.atimeMs = a[6]; this.ctimeMs = a[7]; this.birthtimeMs = a[8];
     this.nlink = a[9]; this.dev = a[10]; this.ino = a[11]; this.blksize = a[12]; this.blocks = a[13];
-    this.atime = new Date(this.atimeMs); this.mtime = new Date(this.mtimeMs); this.ctime = new Date(this.ctimeMs); this.birthtime = new Date(this.birthtimeMs);
   }
+  // the Date views are made when read: a stat on the compiler's hot path needs only isFile() and mtimeMs
+  get atime(): Date { return new Date(this.atimeMs); }
+  get mtime(): Date { return new Date(this.mtimeMs); }
+  get ctime(): Date { return new Date(this.ctimeMs); }
+  get birthtime(): Date { return new Date(this.birthtimeMs); }
   isFile(): boolean { return (this.mode & constants.S_IFMT) === constants.S_IFREG; }
   isDirectory(): boolean { return (this.mode & constants.S_IFMT) === constants.S_IFDIR; }
   isSymbolicLink(): boolean { return (this.mode & constants.S_IFMT) === constants.S_IFLNK; }
@@ -83,6 +89,9 @@ export class Dirent {
   isCharacterDevice(): boolean { return this.kind === 6; }
   isBlockDevice(): boolean { return this.kind === 7; }
 }
+export function statSync(p: PathLike, options?: { bigint?: false; throwIfNoEntry?: true }): Stats;
+export function statSync(p: PathLike, options: { bigint?: false; throwIfNoEntry: false }): Stats | undefined;
+export function statSync(p: PathLike, options?: StatOptions): Stats | undefined;
 export function statSync(p: PathLike, options?: StatOptions): Stats | undefined {
   const s = pathOf(p);
   const a = host.stat(s, true);
@@ -92,6 +101,9 @@ export function statSync(p: PathLike, options?: StatOptions): Stats | undefined 
   }
   return new Stats(a);
 }
+export function lstatSync(p: PathLike, options?: { bigint?: false; throwIfNoEntry?: true }): Stats;
+export function lstatSync(p: PathLike, options: { bigint?: false; throwIfNoEntry: false }): Stats | undefined;
+export function lstatSync(p: PathLike, options?: StatOptions): Stats | undefined;
 export function lstatSync(p: PathLike, options?: StatOptions): Stats | undefined {
   const s = pathOf(p);
   const a = host.stat(s, false);
@@ -115,10 +127,15 @@ export function accessSync(p: PathLike, mode: number = 0): void {
 }
 
 // ---- whole files ----
+const utf8Decoder = new TextDecoder("utf-8", { ignoreBOM: true });   // a leading BOM stays in the text, as Node keeps it
 function decodeFile(bytes: Uint8Array, encoding: string | null): Buffer | string {
-  const buf = fromView(bytes);
-  return encoding === null ? buf : buf.toString(encoding);
+  if (encoding === null) return fromView(bytes);
+  if (encoding === "utf8" || encoding === "utf-8") return utf8Decoder.decode(bytes);   // no Buffer on the way to a string
+  return fromView(bytes).toString(encoding);
 }
+export function readFileSync(p: PathLike | number, options?: { encoding?: null; flag?: string } | null): Buffer;
+export function readFileSync(p: PathLike | number, options: string | { encoding: string; flag?: string }): string;
+export function readFileSync(p: PathLike | number, options?: string | ReadOptions | null): Buffer | string;
 export function readFileSync(p: PathLike | number, options?: string | ReadOptions | null): Buffer | string {
   const o = encodingArg(options);
   if (typeof p === "number") {
@@ -168,6 +185,10 @@ export function copyFileSync(src: PathLike, dest: PathLike, mode: number = 0): v
 }
 
 // ---- directories ----
+export function readdirSync(p: PathLike, options?: { encoding?: string | null; withFileTypes?: false; recursive?: boolean } | string | null): string[];
+export function readdirSync(p: PathLike, options: { encoding?: string | null; withFileTypes: true; recursive?: boolean }): Dirent[];
+export function readdirSync(p: PathLike, options: { encoding: "buffer"; withFileTypes?: false; recursive?: boolean } | "buffer"): Buffer[];
+export function readdirSync(p: PathLike, options?: string | ReaddirOptions | null): string[] | Dirent[] | Buffer[];
 export function readdirSync(p: PathLike, options?: string | ReaddirOptions | null): string[] | Dirent[] | Buffer[] {
   const o = encodingArg(options);
   const s = pathOf(p);
@@ -499,3 +520,13 @@ export function createReadStream(p: PathLike, options?: ReadStreamOptions | stri
 export function createWriteStream(p: PathLike, options?: WriteStreamOptions | string): WriteStream {
   return streamFactory === null ? streamsMissing("createWriteStream") : streamFactory.write(p, options);
 }
+
+// ---- watching: not available (no file system events in the runtime, docs/node_compat_design.md) ----
+export interface FSWatcher { close(): void; ref(): FSWatcher; unref(): FSWatcher; on(event: string, listener: (...args: unknown[]) => void): FSWatcher }
+export function watch(_p: PathLike, _options?: unknown, _listener?: unknown): FSWatcher {
+  throw new Error("fs.watch is not available: the runtime has no file system events (docs/node_compat_design.md)");
+}
+export function watchFile(_p: PathLike, _options?: unknown, _listener?: unknown): void {
+  throw new Error("fs.watchFile is not available: the runtime has no file system events (docs/node_compat_design.md)");
+}
+export function unwatchFile(_p: PathLike, _listener?: unknown): void {}

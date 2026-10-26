@@ -172,7 +172,7 @@ What the numbers say:
   compiled by Apple clang at `-O2` as parallel units with ThinLTO, profile-guided
   by a training run on this same workload. The "no profile" column is the same
   build with `TSAOT_PGO=off`. Outside Node.js, tsc-ts needs a host for
-  `node:fs`, `process` and workers; Garnet's build provides it with the shims
+  `node:fs`, `process` and workers; Garnet's build provides it with the Node library (`lib/node`) and shims
   and the small C host in `benchmarks/tsc_ts_native/`, where each checker is a
   forked process that shares the parsed program with the main process. That
   host is part of the benchmark; the `garnet` command does not include it yet.

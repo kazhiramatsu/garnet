@@ -5,7 +5,7 @@
 // 'spawn', 'exit', 'close' and 'error'. fork (an IPC channel) is not available.
 import { EventEmitter } from "./events";
 import { Readable, Writable } from "./stream";
-import { Buffer, fromView } from "./buffer";
+import { Buffer, fromView, BufferEncoding } from "./buffer";
 import { host } from "./host";
 import { codedError, codedTypeError, codedRangeError, invalidArgType, systemError, uvMessage, validateString } from "./errors";
 import process, { SIGNALS } from "./process";
@@ -107,6 +107,11 @@ function normalizeArgs(args: unknown, options: unknown): { args: string[]; optio
 }
 
 // ---- synchronous ----
+export function spawnSync(file: string, args: string[], options: SpawnSyncOptions & { encoding: BufferEncoding }): SpawnSyncReturns<string>;
+export function spawnSync(file: string, options: SpawnSyncOptions & { encoding: BufferEncoding }): SpawnSyncReturns<string>;
+export function spawnSync(file: string, args?: string[], options?: SpawnSyncOptions & { encoding?: "buffer" | null }): SpawnSyncReturns<Buffer>;
+export function spawnSync(file: string, options?: SpawnSyncOptions & { encoding?: "buffer" | null }): SpawnSyncReturns<Buffer>;
+export function spawnSync(file: string, args?: string[] | SpawnSyncOptions, options?: SpawnSyncOptions): SpawnSyncReturns<string | Buffer>;
 export function spawnSync(file: string, args?: string[] | SpawnSyncOptions, options?: SpawnSyncOptions): SpawnSyncReturns<string | Buffer> {
   validateString(file, "file");
   const n = normalizeArgs(args, options);
@@ -164,6 +169,11 @@ function checkExecSyncError(ret: SpawnSyncReturns<string | Buffer>, args: string
   }
   return err;
 }
+export function execFileSync(file: string, args: string[], options: SpawnSyncOptions & { encoding: BufferEncoding }): string;
+export function execFileSync(file: string, options: SpawnSyncOptions & { encoding: BufferEncoding }): string;
+export function execFileSync(file: string, args?: string[], options?: SpawnSyncOptions & { encoding?: "buffer" | null }): Buffer;
+export function execFileSync(file: string, options?: SpawnSyncOptions & { encoding?: "buffer" | null }): Buffer;
+export function execFileSync(file: string, args?: string[] | SpawnSyncOptions, options?: SpawnSyncOptions): string | Buffer;
 export function execFileSync(file: string, args?: string[] | SpawnSyncOptions, options?: SpawnSyncOptions): string | Buffer {
   const n = normalizeArgs(args, options);
   const opts: SpawnSyncOptions = { ...n.options };
@@ -173,6 +183,9 @@ export function execFileSync(file: string, args?: string[] | SpawnSyncOptions, o
   if (err !== undefined) throw err;
   return ret.stdout;
 }
+export function execSync(command: string, options: SpawnSyncOptions & { encoding: BufferEncoding }): string;
+export function execSync(command: string, options?: SpawnSyncOptions & { encoding?: "buffer" | null }): Buffer;
+export function execSync(command: string, options?: SpawnSyncOptions): string | Buffer;
 export function execSync(command: string, options?: SpawnSyncOptions): string | Buffer {
   validateString(command, "command");
   const opts: SpawnSyncOptions = { ...(options === undefined || options === null ? {} : options) };

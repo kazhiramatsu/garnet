@@ -4,7 +4,6 @@
 // with the data the main process gave its Worker. Parse threads are shared
 // workers (docs/published_graphs_design.md): the bound files they publish
 // reach the main thread by reference.
-import './prelude.js';
 import { dirname } from 'node:path';
 import { runServer } from '../src/api/server.js';
 import { runThread, startThreads, type ThreadData, type ThreadDrivers } from '../src/compiler/thread-entry.js';

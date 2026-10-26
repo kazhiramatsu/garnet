@@ -474,7 +474,7 @@ function howMuchToRead(n: number, state: ReadableState): number {
   if (n <= 0 || (state.length === 0 && state.ended)) return 0;
   if (state.objectMode) return 1;
   if (Number.isNaN(n)) {
-    if (state.flowing && state.length) return state.buffer[state.bufferIndex].length;
+    if (state.flowing && state.length) return (state.buffer[state.bufferIndex] as Buffer | string).length;
     return state.length;
   }
   if (n <= state.length) return n;
@@ -497,7 +497,7 @@ function fromList(n: number, state: ReadableState): any {
     state.buffer = [];
   } else {
     // less than the whole buffer
-    const first = buffer[0];
+    const first = buffer[0] as Buffer | string;
     if (n < first.length) {
       ret = first.slice(0, n);
       buffer[0] = first.slice(n);
@@ -507,7 +507,7 @@ function fromList(n: number, state: ReadableState): any {
       const parts: any[] = [];
       let remaining = n;
       while (remaining > 0) {
-        const chunk = buffer[0];
+        const chunk = buffer[0] as Buffer | string;
         if (chunk.length <= remaining) { parts.push(buffer.shift()); remaining -= chunk.length; }
         else { parts.push(chunk.slice(0, remaining)); buffer[0] = chunk.slice(remaining); remaining = 0; }
       }
@@ -534,7 +534,7 @@ function readableAddChunk(stream: Readable, chunk: any, encoding: string | undef
   else if (chunk === null) {
     state.reading = false;
     onEofChunk(stream, state);
-  } else if (state.objectMode || (chunk && chunk.length > 0)) {
+  } else if (state.objectMode || (chunk && (chunk as Buffer | string).length > 0)) {
     if (addToFront) {
       if (state.endEmitted) errorOrDestroy(stream, errStreamUnshiftAfterEnd());
       else if (state.destroyed || state.errored !== null) return false;
@@ -545,7 +545,7 @@ function readableAddChunk(stream: Readable, chunk: any, encoding: string | undef
       state.reading = false;
       if (state.decoder && !encoding) {
         chunk = state.decoder.write(chunk);
-        if (state.objectMode || chunk.length !== 0) addChunk(stream, state, chunk, false);
+        if (state.objectMode || (chunk as string).length !== 0) addChunk(stream, state, chunk, false);
         else maybeReadMore(stream, state);
       } else addChunk(stream, state, chunk, false);
     }
@@ -562,7 +562,7 @@ function addChunk(stream: Readable, state: ReadableState, chunk: any, addToFront
     state.dataEmitted = true;
     stream.emit("data", chunk);
   } else {
-    state.length += state.objectMode ? 1 : chunk.length;
+    state.length += state.objectMode ? 1 : (chunk as Buffer | string).length;
     if (addToFront) bufferedChunks(state).unshift(chunk);
     else state.buffer.push(chunk);
     if (state.needReadable) emitReadable(stream);
@@ -787,7 +787,7 @@ function writableWrite(stream: WritableLike, chunk: any, encoding: string | Call
   return writeOrBuffer(stream, state, chunk, encoding, cb);
 }
 function writeOrBuffer(stream: WritableLike, state: WritableState, chunk: any, encoding: string, callback: Callback): boolean {
-  const len = state.objectMode ? 1 : chunk.length;
+  const len = state.objectMode ? 1 : (chunk as Buffer | string).length;
   state.length += len;
   const ret = state.length < state.highWaterMark;
   if (!ret) state.needDrain = true;
@@ -865,7 +865,7 @@ function errorBuffer(state: WritableState): void {
   if (state.writing) return;
   for (let n = state.bufferedIndex; n < state.buffered.length; ++n) {
     const { chunk, callback } = state.buffered[n];
-    const len = state.objectMode ? 1 : chunk.length;
+    const len = state.objectMode ? 1 : (chunk as Buffer | string).length;
     state.length -= len;
     callback(state.errored !== null ? state.errored : errStreamDestroyed("write"));
   }
@@ -897,7 +897,7 @@ function clearBuffer(stream: WritableLike, state: WritableState): void {
     do {
       const { chunk, encoding, callback } = buffered[i];
       i++;
-      const len = objectMode ? 1 : chunk.length;
+      const len = objectMode ? 1 : (chunk as Buffer | string).length;
       doWrite(stream, state, false, len, chunk, encoding, callback);
     } while (i < buffered.length && !state.writing);
     if (i === buffered.length) resetBuffer(state);
@@ -1423,7 +1423,7 @@ export function pipeline(...args: any[]): Stream {
   let callback: ((error?: Error | null, value?: any) => void) = nop;
   if (args.length > 0 && typeof args[args.length - 1] === "function" && !isNodeStream(args[args.length - 1]) && args.length > 1) {
     // the last function argument is the callback only when the stage before it is a destination
-    const last = args[args.length - 1];
+    const last = args[args.length - 1] as AnyFunction;
     if (last.length <= 2 && !isGeneratorLike(last)) callback = args.pop();
   }
   let streams: PipelineSource[] = args.length === 1 && Array.isArray(args[0]) ? args[0] : args;

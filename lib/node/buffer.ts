@@ -69,13 +69,14 @@ export interface BufferConstructor {
   [Symbol.hasInstance](value: unknown): boolean;
 }
 
-const u8proto = Object.getPrototypeOf(new Uint8Array(0)) as object;
-const proto = Object.create(u8proto) as { [name: string]: unknown };
+// Buffer.prototype: an object over Uint8Array's prototype (host.createObject: never a class chain,
+// so the program's receivers stay closed, docs/closed_receivers_design.md)
+const proto = host.createObject(Uint8Array.prototype) as { [name: string]: unknown };
 const encoder = new TextEncoder();
-const decoder = new TextDecoder();
+const decoder = new TextDecoder("utf-8", { ignoreBOM: true });   // buf.toString() keeps a leading BOM, as Node does
 
 function adopt(view: Uint8Array): Buffer {
-  Object.setPrototypeOf(view, proto);
+  host.relink(view, proto);
   return view as Buffer;
 }
 function isBufferValue(v: unknown): v is Buffer { return v instanceof Uint8Array && Object.getPrototypeOf(v) === proto; }
@@ -83,7 +84,10 @@ function isBufferValue(v: unknown): v is Buffer { return v instanceof Uint8Array
 export function fromView(view: Uint8Array): Buffer { return adopt(view); }
 
 export function normalizeEncoding(enc: string | undefined): Encoding | undefined {
-  if (enc === undefined || enc === null) return "utf8";
+  if (enc === undefined || enc === null || enc === "utf8" || enc === "utf-8") return "utf8";
+  if (enc === "hex") return "hex";
+  if (enc === "latin1" || enc === "binary") return "latin1";
+  if (enc === "base64") return "base64";
   switch (enc.toLowerCase()) {
     case "utf8": case "utf-8": return "utf8";
     case "ucs2": case "ucs-2": case "utf16le": case "utf-16le": return "utf16le";
@@ -113,12 +117,12 @@ function encodeString(s: string, enc: Encoding): Uint8Array {
     case "utf8": return encoder.encode(s);
     case "latin1": case "ascii": {
       const out = new Uint8Array(s.length);
-      for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i) & 255;
+      host.writeString(s, out, 0, out.length, 2);
       return out;
     }
     case "utf16le": {
       const out = new Uint8Array(s.length * 2);
-      for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); out[2 * i] = c & 255; out[2 * i + 1] = c >> 8; }
+      host.writeString(s, out, 0, out.length, 1);
       return out;
     }
     case "hex": {
@@ -252,10 +256,13 @@ defineMethod("write", function (this: Uint8Array, string: string, offset?: numbe
   }
   if (off < 0 || off > this.length) throw codedRangeError("ERR_OUT_OF_RANGE", "The value of \"offset\" is out of range. It must be >= 0 and <= " + this.length + ". Received " + off);
   const e = encodingOf(enc);
+  const room = Math.min(len, this.length - off);
+  // utf8, utf16le and latin1 are written by the host straight into the view (whole characters and units only)
+  if (e === "utf8") return host.writeString(string, this, off, room, 0);
+  if (e === "utf16le") return host.writeString(string, this, off, room, 1);
+  if (e === "latin1" || e === "ascii") return host.writeString(string, this, off, room, 2);
   const bytes = encodeString(string, e);
-  let n = Math.min(bytes.length, len, this.length - off);
-  if (e === "utf8") { while (n > 0 && n < bytes.length && (bytes[n] & 0xC0) === 0x80) n--; }   // whole characters only
-  else if (e === "utf16le") n -= n & 1;
+  const n = Math.min(bytes.length, room);
   for (let i = 0; i < n; i++) this[off + i] = bytes[i];
   return n;
 });

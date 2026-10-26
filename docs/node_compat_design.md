@@ -370,3 +370,92 @@ stress, bench); the tsc-ts benchmark is unaffected until N5.
   41 IR functions (165 KB of C, a 1.1 s build), `process` and `Buffer` 187
   (669 KB, 2.6 s; it was 447 and 5.7 s), `fs.readFileSync` 276 (919 KB,
   3.0 s). Dead-function elimination in the analyzer would take the rest.
+
+## As built, N5a (Session 353): tsc-ts on lib/node
+
+- `benchmarks/tsc_ts_native` maps only `node:worker_threads` and the scriptc
+  modules to shims now; `node:fs`, `node:path`, `node:os`, `node:perf_hooks`
+  and `node:child_process` are lib/node, and the prelude is the generated
+  one (`process`, `Buffer`, the timers, `URL` from the names tsc-ts uses).
+  Output identical to the shim build (78 files); instructions 1.021 against
+  it on one CPU (`TSAOT_CPUS=1`, the measured configuration: the host's
+  `cpus()` honors it, so `os.availableParallelism()` is 1 and tsc-ts starts
+  its four checkers and parse threads as before).
+- What it took: Node's overloads on `fs.readFileSync`/`statSync`/`lstatSync`
+  /`readdirSync` and `child_process.spawnSync`/`execSync`/`execFileSync`
+  (the encoding picks the result type), `process.memoryUsage.rss()`,
+  `threadCpuUsage`, `constrainedMemory`, `fs.watch`/`watchFile` (an error:
+  no file system events), the closed-receivers slice 3 (the library opened
+  the program at 32 sites: 1.66x instructions), the host's `utf8Length`
+  measured without a copy and cached in the string cell as the shims' host
+  did (Buffer.byteLength is on the compiler's hot path: 1.36x → 1.27x),
+  `Buffer.prototype.write` and the UTF-16LE/Latin-1 encoders in the host
+  (`writeString`; the TypeScript byte loops were 4.7% of the parse workers:
+  1.27x → 1.03x → 1.02x with the storage read directly), `readFileSync` to a
+  string without a Buffer on the way, `Stats` dates as getters, the
+  options of `readFileSync(path, "utf8")` without an allocation, and the
+  decoders keeping a leading BOM (Node keeps it; a TextDecoder without
+  `ignoreBOM` dropped it).
+- Known: the remaining 2.1% sits in the parse workers (+10% of their
+  samples: more `publish_visit`, conservative stack-scan and remembered-set
+  work, no library function above a few samples); the candidates are the
+  14-number array `host.stat` returns per call and the directory listing's
+  arrays. `util.inherits` with a garnet class's prototype is a TypeError.
+
+## Design, N5b: worker_threads over the fork workers
+
+Node runs a worker's file in a fresh isolate; garnet's workers are forked
+processes of the initialized program (docs/fork_workers_design.md): fast to
+start, sharing everything copy-on-write, exchanging messages over pipes.
+`node:worker_threads` maps onto them as follows. (tsc-ts's own sources do not
+use worker threads; the benchmark driver `benchmarks/tsc_ts_native/garnet/
+main.ts` does, today through the shim's `enterWorker` and a registered entry;
+with this slice it is written as a Node program would be: the file branches
+on `isMainThread`.)
+
+- `new Worker(spec, { workerData, argv, env })`: `spec` must name a module of
+  the program statically: a string literal, `__filename`, `import.meta.url`,
+  `new URL("./w.ts", import.meta.url)` or `path.join(__dirname, "w.js")`
+  (`.js` resolves to the `.ts`). The exporter adds the module as an entry
+  (its graph is compiled) and lowers the call to the host's `spawnWorker(
+  module index, options)`. Anything else is a compile-time reject.
+- The child: the fork sets `isMainThread` false, `threadId`, `workerData`
+  and `parentPort`, then runs the named module's initializer again (each
+  module's top-level code is a function the emitter can call by index).
+  For the `new Worker(__filename)` pattern that initializer already ran in
+  the parent: running it again in the child is what Node's fresh run of the
+  file observes (the `isMainThread` branch), with module-level state copied
+  from the parent rather than fresh. A program cannot easily tell the two
+  apart; the difference is documented. A module reached only as a worker
+  entry runs no init in the main process.
+- Messages: `postMessage` is the existing structured copy over the pipe
+  (objects, arrays, strings, numbers, booleans, null/undefined, typed
+  arrays, Date, Map, Set, errors by name/message); `transferList` is
+  accepted and ignored (a copy). `SharedArrayBuffer` is not shared across a
+  fork: a message carrying one is a TypeError.
+- Shared workers: a parse thread of tsc-ts publishes bound files to the
+  main thread by reference (`garnet:shared`, docs/published_graphs_design.md),
+  which needs the child forked into a region mapped shared before the fork.
+  Node has no such notion, so it is garnet's option on the constructor:
+  `new Worker(file, { workerData, shared: true })` forks with
+  `ts_worker_fork_shared`; Node ignores the unknown key, so the driver stays
+  runnable under Node. Checkers stay plain forks (a shared fork costs a
+  young collection, a 512 MB region and the parent's full collections
+  deferred while it lives).
+- `parentPort`: `postMessage`, `on/once('message')`, `close`, `ref/unref`
+  (a referenced port keeps the child alive). `MessageChannel`/`MessagePort`
+  exist within one thread (two queues delivering on the loop); transferring
+  a port to a worker is a TypeError.
+- `worker.on('message'|'error'|'exit'|'online')`, `terminate()` (SIGTERM,
+  'exit' with 1), `threadId`, `ref/unref` (an unreferenced worker does not
+  keep the parent alive), `worker.stdout/stderr` inherited (the `stdout:
+  true` option is a TypeError for now). An uncaught exception in the child
+  reaches the parent as 'error' then 'exit' (1); `process.exit(code)` in the
+  child ends the child only, the parent sees 'exit' with the code.
+- `SHARE_ENV`, `setEnvironmentData/getEnvironmentData`, `BroadcastChannel`,
+  `receiveMessageOnPort`, `resourceLimits`, `markAsUntransferable`: later.
+- Done when: the benchmark's worker_threads shim and `host.c`'s worker
+  methods are gone, the driver is a Node-shaped file, output identical and
+  instructions within noise of N5a; fixtures under `node/` for a worker
+  round trip, an error in a worker, `terminate`, and `shared: true` with a
+  published graph.

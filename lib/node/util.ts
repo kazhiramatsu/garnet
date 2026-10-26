@@ -1,3 +1,4 @@
+import { host } from "./host";
 // node:util: format and inspect over the runtime's console formatter, promisify
 // and callbackify, inherits, deprecate, debuglog, the type predicates and the
 // legacy is* functions.
@@ -89,7 +90,7 @@ export function inherits(ctor: Function & { super_?: unknown }, superCtor: Funct
   if (typeof ctor !== "function") throw invalidArgType("ctor", "of type function", ctor);
   if (typeof superCtor !== "function") throw invalidArgType("superCtor", "of type function", superCtor);
   ctor.super_ = superCtor;
-  Object.setPrototypeOf(ctor.prototype as object, superCtor.prototype as object);
+  host.relink(ctor.prototype as object, superCtor.prototype as object);   // a garnet class's prototype is refused (a TypeError)
 }
 const deprecations = new Set<string>();
 export function deprecate<F extends (...args: any[]) => any>(fn: F, msg: string, code?: string): F {

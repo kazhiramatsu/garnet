@@ -11744,15 +11744,32 @@ static int proto_chain_includes(tsv proto, tsv home){
   }
   return 0;
 }
+/* A class declared in a function gets a fresh prototype per evaluation
+   (ts_clone_class_proto), registered with the class's own field table while
+   the method's home stays the template the registration collected: a link
+   registered with the home's table is the home's class or a clone of it. */
+static int proto_chain_has_class_of(tsv proto, tsv home){
+  ts_class_reg* hr = class_reg_for_proto(home);
+  if (!hr) return 0;
+  for (int depth = 0; depth < 256 && ts_proto_ref(proto); depth++){
+    ts_class_reg* r = class_reg_for_proto(proto);
+    if (r && r->fields == hr->fields && r->nfields == hr->nfields) return 1;
+    if (chain_link_exotic((ts_object*)ts_ptr(proto))) return 0;
+    proto = ((ts_object*)ts_ptr(proto))->proto;
+  }
+  return 0;
+}
 /* A struct method called with a `this` that is not a sized, unrelinked
-   instance of its class (one whose chain holds the method's prototype). */
+   instance of its class (one whose chain holds the method's prototype, or
+   a per-evaluation clone of it). */
 static void typed_slow_check_borrow(tsv fn, tsv thisArg){
   if (!g_struct_methods_len || !ts_is_func(fn)) return;
   tsv home = struct_method_home(((ts_func*)ts_ptr(fn))->code);
   if (ts_is_undef(home)) return;
   if (ts_is_obj(thisArg)){
     ts_object* t = (ts_object*)ts_ptr(thisArg);
-    if (ts_obj_is_sized(t) && !(t->cls & TS_CLS_RELINKED) && proto_chain_includes(t->proto, home)) return;
+    if (ts_obj_is_sized(t) && !(t->cls & TS_CLS_RELINKED) &&
+        (proto_chain_includes(t->proto, home) || proto_chain_has_class_of(t->proto, home))) return;
   }
   typed_this_raise("a class method called with a foreign this");
 }

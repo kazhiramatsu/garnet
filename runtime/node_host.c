@@ -575,11 +575,59 @@ static tsv nh_user_info(tsv* a, int n){
   return out;
 }
 /* -- bytes and values -- */
+/* utf8Length(s): the UTF-8 byte length without a copy; an ASCII or 8-bit string is
+   measured by arithmetic, a UTF-16 one by a walk, and a heap string remembers the
+   answer in its cell (as the tsc-ts shims' host did: Buffer.byteLength is on the
+   compiler's hot path). */
+static tsv nh_utf8_length_walk(ts_strview v){
+  if (v.data && !(v.flags & TS_STR_FLAG_UTF16)){
+    const unsigned char* b = (const unsigned char*)v.data;
+    uint64_t high = 0; uint32_t i = 0;
+    for (; i + 8u <= v.len; i += 8u){ uint64_t w; memcpy(&w, b + i, 8); high += (uint64_t)__builtin_popcountll(w & 0x8080808080808080ull); }
+    for (; i < v.len; i++) high += b[i] >> 7;
+    return ts_num((double)v.len + (double)high);
+  }
+  double total = 0;
+  if (v.data){
+    /* UTF-16 storage: the units read directly (a source text with one
+       character past U+00FF is stored this way and measured once per text) */
+    const unsigned char* d = (const unsigned char*)v.data;
+    for (uint32_t i = 0; i < v.len; i++){
+      uint32_t cu = (uint32_t)d[2 * i] | ((uint32_t)d[2 * i + 1] << 8);
+      if (cu < 0x80u) total += 1;
+      else if (cu < 0x800u) total += 2;
+      else if (cu >= 0xD800u && cu <= 0xDBFFu && i + 1 < v.len){
+        uint32_t lo = (uint32_t)d[2 * i + 2] | ((uint32_t)d[2 * i + 3] << 8);
+        if (lo >= 0xDC00u && lo <= 0xDFFFu){ total += 4; i++; } else total += 3;
+      } else total += 3;
+    }
+    return ts_num(total);
+  }
+  for (uint32_t i = 0; i < v.len; i++){
+    uint32_t cu = ts_str_cu_at_view(v, i);
+    if (cu < 0x80u) total += 1;
+    else if (cu < 0x800u) total += 2;
+    else if (cu >= 0xD800u && cu <= 0xDBFFu && i + 1 < v.len){
+      uint32_t lo = ts_str_cu_at_view(v, i + 1);
+      if (lo >= 0xDC00u && lo <= 0xDFFFu){ total += 4; i++; } else total += 3;
+    } else total += 3;
+  }
+  return ts_num(total);
+}
 static tsv nh_utf8_length(tsv* a, int n){
   tsv s = nh_arg(a, n, 0);
   if (!ts_is_str(s)) return ts_num(0);
-  uint32_t length; char* bytes = ts_string_utf8_copy(s, &length); free(bytes);
-  return ts_num((double)length);
+  ts_strview v = ts_str_view_typed(s);
+  /* ASCII: one byte per unit; 8-bit storage: two bytes for each unit past
+     0x7F; UTF-16 storage: the general walk, its answer cached in the flat
+     cell's unused view offset (a source text is measured a few times) */
+  if (v.flags & TS_STR_FLAG_ASCII) return ts_num((double)v.len);
+  ts_string* cell = ts_is_short_str(s) ? NULL : ts_str_ptr_typed(s);
+  if (cell && (cell->flags & TS_STR_FLAG_VIEW)) cell = NULL;
+  if (cell && (cell->flags & TS_STR_FLAG_UTF8LEN)) return ts_num((double)cell->offset);
+  tsv total_v = nh_utf8_length_walk(v);
+  if (cell && ts_to_num(total_v) <= 4294967295.0){ cell->offset = (uint32_t)ts_to_num(total_v); cell->flags |= TS_STR_FLAG_UTF8LEN; }
+  return total_v;
 }
 static tsv nh_random_bytes(tsv* a, int n){
   double count = nh_num(a, n, 0, 0);
@@ -1292,6 +1340,87 @@ static void nh_mark_io_roots(int young){
   for (nh_fdwatch* w = g_nh_fdwatches; w; w = w->next){ gc_visit_slot(&w->on_data, young, 0, 1); gc_visit_slot(&w->on_end, young, 0, 1); }
   for (nh_child* c = g_nh_children; c; c = c->next) gc_visit_slot(&c->on_exit, young, 0, 1);
 }
+/* createObject(proto) and relink(obj, proto): Object.create and Object.setPrototypeOf for
+   the library's own objects (Buffer's prototype over Uint8Array's, util.inherits). A chain
+   that reaches a registered class with struct fields, or an object that is a class instance
+   or a class prototype, is refused (TypeError): the typed-slow flag is never raised, and the
+   closed-receivers proof has no site to count here. */
+static tsv nh_object_create(tsv* a, int n){
+  tsv proto = nh_arg(a, n, 0);
+  if (ts_is_obj(proto) && proto_chain_has_struct_class(proto)) ts_throw_type_error_msg("createObject: the prototype chain reaches a class with fields");
+  return ts_object_create(proto);
+}
+static tsv nh_relink(tsv* a, int n){
+  tsv obj = nh_arg(a, n, 0), proto = nh_arg(a, n, 1);
+  if (!ts_is_obj(obj)) ts_throw_type_error_msg("relink: the object must be an object");
+  ts_object* o = (ts_object*)ts_ptr(obj);
+  if (o->cls != 0) ts_throw_type_error_msg("relink: a class instance or a class prototype keeps its chain");
+  if (ts_is_obj(proto) && proto_chain_has_struct_class(proto)) ts_throw_type_error_msg("relink: the prototype chain reaches a class with fields");
+  if (!ts_is_obj(proto) && !ts_is_null(proto)) ts_throw_type_error_msg("relink: the prototype must be an object or null");
+  ts_set_proto(obj, proto);
+  return obj;
+}
+/* writeString(text, view, offset, max, kind): the bytes of `text` written into the
+   Uint8Array `view` at `offset`, at most `max`, as UTF-8 (kind 0: whole characters only,
+   a lone surrogate as U+FFFD), UTF-16LE (kind 1: whole units) or Latin-1 (kind 2: the low
+   byte of each unit); the number of bytes written. Buffer.prototype.write and Buffer.from
+   stand on it instead of a TypeScript loop over the bytes. */
+static tsv nh_write_string(tsv* a, int n){
+  tsv text = nh_arg(a, n, 0), view = nh_arg(a, n, 1);
+  if (!ts_is_str(text)) ts_throw_type_error_msg("The \"string\" argument must be of type string");
+  if (!ts_is_typed_array(view)) ts_throw_type_error_msg("writeString: the target must be a Uint8Array");
+  ts_typedarray* t = (ts_typedarray*)ts_ptr(view);
+  double offd = nh_num(a, n, 2, 0), maxd = nh_num(a, n, 3, (double)t->length);
+  int kind = (int)nh_num(a, n, 4, 0);
+  if (!(offd >= 0) || offd > (double)t->length) ts_throw_range_error_msg("The value of \"offset\" is out of range");
+  uint32_t off = (uint32_t)offd;
+  uint32_t room = (uint32_t)(maxd < 0 ? 0 : maxd);
+  if (room > t->length - off) room = t->length - off;
+  ts_strview x = ts_str_view_typed(text);
+  uint8_t* out = (uint8_t*)t->data + off;
+  uint32_t w = 0;
+  /* the storage read directly: 8-bit cells hold units below 256, UTF-16 cells the units themselves */
+  const uint8_t* b8 = x.data && !(x.flags & TS_STR_FLAG_UTF16) ? (const uint8_t*)x.data : NULL;
+  const uint8_t* b16 = x.data && (x.flags & TS_STR_FLAG_UTF16) ? (const uint8_t*)x.data : NULL;
+  if (kind == 1){
+    uint32_t units = room / 2u; if (units > x.len) units = x.len;
+    if (b8){ for (uint32_t i = 0; i < units; i++){ out[2*i] = b8[i]; out[2*i + 1] = 0; } }
+    else if (b16){ memcpy(out, b16, (size_t)units * 2u); }
+    else { for (uint32_t i = 0; i < units; i++){ uint16_t cu = ts_str_cu_at_view(x, i); out[2*i] = (uint8_t)cu; out[2*i + 1] = (uint8_t)(cu >> 8); } }
+    w = units * 2u;
+  } else if (kind == 2){
+    uint32_t units = room < x.len ? room : x.len;
+    if (b8){ memcpy(out, b8, units); }
+    else if (b16){ for (uint32_t i = 0; i < units; i++) out[i] = b16[2*i]; }
+    else { for (uint32_t i = 0; i < units; i++) out[i] = (uint8_t)ts_str_cu_at_view(x, i); }
+    w = units;
+  } else if (b8){
+    /* 8-bit storage: one byte per unit below 0x80, two above */
+    for (uint32_t i = 0; i < x.len; i++){
+      uint32_t cp = b8[i];
+      if (cp < 0x80u){ if (w + 1 > room) break; out[w++] = (uint8_t)cp; }
+      else { if (w + 2 > room) break; out[w] = (uint8_t)(0xC0 | (cp >> 6)); out[w + 1] = (uint8_t)(0x80 | (cp & 0x3F)); w += 2; }
+    }
+  } else {
+    for (uint32_t i = 0; i < x.len; i++){
+      uint32_t cp = b16 ? ((uint32_t)b16[2*i] | ((uint32_t)b16[2*i + 1] << 8)) : ts_str_cu_at_view(x, i);
+      uint32_t adv = 1;
+      if (cp >= 0xD800u && cp <= 0xDBFFu && i + 1 < x.len){
+        uint32_t lo = b16 ? ((uint32_t)b16[2*i + 2] | ((uint32_t)b16[2*i + 3] << 8)) : ts_str_cu_at_view(x, i + 1);
+        if (lo >= 0xDC00u && lo <= 0xDFFFu){ cp = 0x10000u + ((cp - 0xD800u) << 10) + (lo - 0xDC00u); adv = 2; }
+        else cp = 0xFFFDu;
+      } else if (cp >= 0xD800u && cp <= 0xDFFFu) cp = 0xFFFDu;
+      uint32_t need = cp < 0x80u ? 1 : cp < 0x800u ? 2 : cp < 0x10000u ? 3 : 4;
+      if (w + need > room) break;
+      if (need == 1) out[w] = (uint8_t)cp;
+      else if (need == 2){ out[w] = (uint8_t)(0xC0 | (cp >> 6)); out[w + 1] = (uint8_t)(0x80 | (cp & 0x3F)); }
+      else if (need == 3){ out[w] = (uint8_t)(0xE0 | (cp >> 12)); out[w + 1] = (uint8_t)(0x80 | ((cp >> 6) & 0x3F)); out[w + 2] = (uint8_t)(0x80 | (cp & 0x3F)); }
+      else { out[w] = (uint8_t)(0xF0 | (cp >> 18)); out[w + 1] = (uint8_t)(0x80 | ((cp >> 12) & 0x3F)); out[w + 2] = (uint8_t)(0x80 | ((cp >> 6) & 0x3F)); out[w + 3] = (uint8_t)(0x80 | (cp & 0x3F)); }
+      w += need; i += adv - 1;
+    }
+  }
+  return ts_num((double)w);
+}
 static void nh_method(tsv host, const char* name, ts_code code, int arity){
   ts_gc_root(&host); tsv fn = ts_make_fn_t(code, NULL, 0, 0); ts_gc_root(&fn);
   ts_set_fn_meta(fn, (uint32_t)arity, name); ts_set_cstr(host, name, fn); ts_gc_unroot(2);
@@ -1356,6 +1485,9 @@ static void ts_garnet_node_global_init(tsv global){
   nh_method(host, "utf8Length", nh_utf8_length, 1);
   nh_method(host, "randomBytes", nh_random_bytes, 1);
   nh_method(host, "hash", nh_hash, 2);
+  nh_method(host, "createObject", nh_object_create, 1);
+  nh_method(host, "writeString", nh_write_string, 5);
+  nh_method(host, "relink", nh_relink, 2);
   nh_method(host, "inspect", nh_inspect, 1);
   nh_method(host, "atExit", nh_at_exit, 1);
   nh_method(host, "timerAdd", nh_timer_add, 4);

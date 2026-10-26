@@ -873,10 +873,17 @@ export class ClassExtractor {
         const call = callOf(n);
         let r: ts.Expression = recv;
         while (ts.isParenthesizedExpression(r)) r = r.expression;
-        const direct = (ts.isPropertyAccessExpression(r) || ts.isElementAccessExpression(r)) &&
-          this.methodClassOf(ts.isPropertyAccessExpression(r) ? checker.getSymbolAtLocation(r.name) : undefined) !== undefined;
-        if (lib === "Reflect.apply" || (!direct && !(this.plainFunction(recv) || (call !== undefined && this.sizedThis(call.arguments[0]))))) {
-          this.openAt(n, lib);
+        const recvSym = ts.isPropertyAccessExpression(r) ? checker.getSymbolAtLocation(r.name)
+          : ts.isElementAccessExpression(r) && ts.isStringLiteralLike(r.argumentExpression)
+            ? checker.getPropertyOfType(checker.getApparentType(checker.getTypeAtLocation(r.expression)), r.argumentExpression.text) : undefined;
+        // (a static method is never a struct method: it lives on the class value, not the
+        // prototype, so borrowing one is a plain function call)
+        const direct = this.methodClassOf(recvSym) !== undefined;
+        if (lib === "Reflect.apply") { this.openAt(n, lib); return; }
+        if (!direct && !(this.plainFunction(recv) || (call !== undefined && this.sizedThis(call.arguments[0])))) {
+          // a function value that is not syntactically a plain function: it can be a struct
+          // method only if the program reads a method as a value somewhere (pass 5 decides)
+          this.deferredBorrows.push({ node: n, what: lib });
         }
         return;
       }
@@ -966,6 +973,9 @@ export class ClassExtractor {
   // which the runtime's borrow check accepts.
   readonly methodEscapes = new Set<ts.Node>();
   private escapeCounts = new Map<string, number>();
+  /** Borrows (`f.call(t)`, `f.apply(t, a)`, `f.bind(t)`) of function values that may be
+   *  methods: they open the program only if pass 5 finds a method read as a value. */
+  private deferredBorrows: { node: ts.Node; what: string }[] = [];
   private escapeAt(n: ts.Node, what: string): void {
     this.methodEscapes.add(n);
     this.openAt(n, what);
@@ -1045,6 +1055,14 @@ export class ClassExtractor {
         if (ts.isElementAccessExpression(n) && !ts.isStringLiteralLike(n.argumentExpression) && !ts.isNumericLiteral(n.argumentExpression) &&
             !callee(n) && maybeInstance(checker.getTypeAtLocation(n.expression))) {
           this.escapeAt(n, "a computed key on a class instance");
+        }
+        // a property descriptor or a reflected read hands out a method or an accessor as a value
+        if (ts.isCallExpression(n) && ts.isPropertyAccessExpression(n.expression) && n.arguments.length > 0) {
+          const m = this.libMemberOf(checker.getSymbolAtLocation(n.expression.name));
+          if ((m === "ObjectConstructor.getOwnPropertyDescriptor" || m === "ObjectConstructor.getOwnPropertyDescriptors" ||
+               m === "Reflect.getOwnPropertyDescriptor" || m === "Reflect.get") && maybeInstance(checker.getTypeAtLocation(n.arguments[0]))) {
+            this.escapeAt(n, "a descriptor of a class instance");
+          }
         }
         if (ts.isBindingElement(n) && n.parent && ts.isObjectBindingPattern(n.parent) && !n.dotDotDotToken) {
           const src = checker.getTypeAtLocation(n.parent);
@@ -1196,6 +1214,9 @@ export class ClassExtractor {
     this.closeStructuralFlows();
     for (const sf of sfs) this.scanClosedReceivers(sf);
     for (const sf of sfs) this.scanMethodEscapes(sf);
+    if (this.methodEscapes.size > 0) {
+      for (const b of this.deferredBorrows) this.openAt(b.node, `${b.what} (the program reads methods as values)`);
+    }
     if (process.env.TSAOT_ESCAPE_LOG === "1") {
       for (const [k, v] of this.escapeCounts) process.stderr.write(`[escape] ${v} ${k}\n`);
     }
