@@ -10530,6 +10530,8 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   wants). 1 / 2 / 4 / 8 threads: 24.7 / 42.1 / 55.0 / 61.8 tokens/s (before
   24.6 / 42.8 / 52.9 / 57.2; llama.cpp's CPU path 65 / 73 / 72 on 1 / 2 /
   4), outputs identical in every configuration. Smaller minimum grabs and a
-  steeper guided divisor measured worse on eight threads. Next: the main
-  thread's QoS class (a `setThreadQos` in `garnet:shared`, prepared), the
+  steeper guided divisor measured worse on eight threads. A QoS class for the
+  main thread (`pthread_set_qos_class_self_np` through a host call, the
+  hypothesis that it ran on an efficiency core beside the spinning workers)
+  measured no change on four or eight threads and is not in. Next: the
   attention over the heads as a pooled job, the q/k/v products fused.

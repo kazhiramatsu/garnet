@@ -196,13 +196,13 @@ eight threads; the gap is outside them: the main thread's serial work
 between products (the attention over the cache, the norms, rope, the
 residual adds, the sampling) takes 21% of the time on eight threads where it
 took 3% on one, and the wait for the slowest worker's last grab 13 us per
-product. The next levers, in order: the main thread kept on a performance
-core (a QoS class for the main process, the spinning workers at default
-QoS: the serial work took three times longer beside seven spinning
-processes, plausibly the main thread scheduled onto an efficiency core at
-times; to be verified with the QoS in place); the attention split
-over the heads as a second kind of pooled job; the q/k/v and w1/w3 products
-fused into one job each (a third fewer barriers). Reading fewer bytes per
+product. The next levers, in order: the attention split over the heads as
+a second kind of pooled job; the q/k/v products fused into one job (the
+w1/w3 pair is, below). A QoS class for the main thread (the hypothesis that
+it was scheduled onto an efficiency core beside seven spinning workers) was
+measured through a `setThreadQos` host call, `pthread_set_qos_class_self_np`,
+and changed nothing (interactive, initiated and none within the noise on
+four and eight threads), so it is not in. Reading fewer bytes per
 token (Q4_0, half the weights) raises the ceiling itself. A one-row kernel
 (one weight stream per thread) measured worse at every thread count (15.8 /
 47.2 / 52.5 on 1 / 4 / 8), so the four-row kernel stays.
