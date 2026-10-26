@@ -10199,3 +10199,17 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   make the generated code's own `a*b+c` sequences deviate from JS on
   Linux/GCC; to be verified on such a machine and pinned for the program's
   translation unit if real.
+- Number formatting: the shortest digits at a power of two (Session 353).
+  `String(2 ** -24)` printed `5.9604644775390625e-8` (the exact 17-digit
+  expansion) where V8 prints `5.960464477539063e-8`: `ts_fmt_num` takes the
+  correctly rounded k-digit decimal for k = 1..17 and keeps the first that
+  reads back, and at a power of two the rounding interval is asymmetric (the
+  gap below is half the gap above), so the correctly rounded 16-digit decimal
+  (`...062`, exactly halfway, rounded to even) lies outside the interval while
+  its neighbour `...063` lies inside. The formatter now also tries the decimal
+  one unit of the last digit above and below (with the carries) when the
+  rounded form fails. Found by the ndarray module's float16 fixture (2^-24 is
+  the smallest half subnormal). Fixture `numbers/shortest_digits`: every power
+  of two from 2^1023 to 2^-1074 through String and a template literal, the
+  forms agreeing with JSON.stringify, hashes of the strings of 20,000 random
+  bit patterns and of 20,000 values near powers of two, the classic cases.

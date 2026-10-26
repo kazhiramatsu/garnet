@@ -4878,6 +4878,38 @@ static int ts_i64_to_str(long long v, char* buf){
    - -6 < n <= 0: "0.", -n zeros, the digits;
    - otherwise the exponential form d[.ddd]e+/-(n-1).
    The digits come from the smallest %.*e precision that round-trips. */
+/* tmp holds "[-]d[.ddd]e[+-]xx" (the correctly rounded form at some precision) that does not
+   read back as d. Tries the decimal one unit of the last digit above and below; on success
+   rewrites tmp with the neighbour that reads back as d and returns 1. */
+static int ts_fmt_num_neighbour(char* tmp, size_t n, double d){
+  char digits[24]; int k = 0; int neg = 0; const char* t = tmp;
+  if (*t == '-'){ neg = 1; t++; }
+  while (*t && *t != 'e' && *t != 'E'){ if (*t != '.') digits[k++] = *t; t++; }
+  if (*t != 'e' && *t != 'E') return 0;
+  int e10 = atoi(t + 1);
+  for (int dir = 1; dir >= -1; dir -= 2){
+    char c[24]; memcpy(c, digits, (size_t)k); int ce = e10;
+    if (dir > 0){
+      int i = k - 1;
+      while (i >= 0 && c[i] == '9'){ c[i] = '0'; i--; }
+      if (i >= 0) c[i]++;
+      else { /* 999.. + 1: one more digit, exponent up, digits 1000.. */ memset(c, '0', (size_t)k); c[0] = '1'; ce++; }
+    } else {
+      int i = k - 1;
+      while (i >= 0 && c[i] == '0'){ c[i] = '9'; i--; }
+      if (i < 0) continue;            /* 000.. cannot go lower */
+      c[i]--;
+      if (c[0] == '0'){ if (k == 1) continue; /* 1 -> 0.9...9: shift to 9..9 with exponent down */ memset(c, '9', (size_t)k); ce--; }
+    }
+    char cand[48]; int o = 0;
+    if (neg) cand[o++] = '-';
+    cand[o++] = c[0];
+    if (k > 1){ cand[o++] = '.'; for (int i = 1; i < k; i++) cand[o++] = c[i]; }
+    o += snprintf(cand + o, sizeof cand - (size_t)o, "e%+03d", ce);
+    if (strtod(cand, 0) == d){ snprintf(tmp, n, "%s", cand); return 1; }
+  }
+  return 0;
+}
 static void ts_fmt_num(double d, char* buf, size_t n){
   if (d != d) { snprintf(buf,n,"NaN"); return; }
   if (d == 1.0/0.0) { snprintf(buf,n,"Infinity"); return; }
@@ -4886,7 +4918,15 @@ static void ts_fmt_num(double d, char* buf, size_t n){
   if (d == (double)(long long)d && d < 9e15 && d > -9e15) { ts_i64_to_str((long long)d, buf); return; }
   char tmp[48];
   int p;
-  for (p = 0; p <= 16; p++){ snprintf(tmp, sizeof tmp, "%.*e", p, d); if (strtod(tmp, 0) == d) break; }
+  for (p = 0; p <= 16; p++){
+    snprintf(tmp, sizeof tmp, "%.*e", p, d);
+    if (strtod(tmp, 0) == d) break;
+    /* The correctly rounded p+1-digit decimal is outside the rounding interval of d; at a
+       power of two the interval is asymmetric (the gap below d is half the gap above), so
+       the neighbouring decimal on the other side may still read back as d: the shortest
+       form is then that neighbour (2^-24 is 5.960464477539063e-8, not ...0625e-8). */
+    if (ts_fmt_num_neighbour(tmp, sizeof tmp, d)) break;
+  }
   if (p > 16) snprintf(tmp, sizeof tmp, "%.16e", d);
   const char* t = tmp;
   char out[64];
