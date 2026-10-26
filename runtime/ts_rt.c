@@ -2797,8 +2797,9 @@ static void shape_desc_record(uint32_t id, uint32_t parent, ts_key key, uint8_t 
     ts_key k = i < d->depth ? v->keys[i] : TS_KEY_NONE;
     uint8_t f = i < d->depth ? v->kflags[i] : 0;
     size_t at = (size_t)id * TS_STATIC_SLOT_LIMIT + i;
-    g_ts_probe_rkeys[at] = !(f & TS_PROP_ACCESSOR) ? k : TS_KEY_NONE;
-    g_ts_probe_wkeys[at] = (f & (TS_PROP_ACCESSOR | TS_PROP_WRITABLE)) == TS_PROP_WRITABLE ? k : TS_KEY_NONE;
+    ts_key kt = (f & TS_PROP_INT32) ? (k | TS_PROBE_INT_TAG) : k;   /* an integer slot answers the tagged key */
+    g_ts_probe_rkeys[at] = !(f & TS_PROP_ACCESSOR) ? kt : TS_KEY_NONE;
+    g_ts_probe_wkeys[at] = (f & (TS_PROP_ACCESSOR | TS_PROP_WRITABLE)) == TS_PROP_WRITABLE ? kt : TS_KEY_NONE;
   }
   if (d->depth >= TS_PROP_INDEX_MIN) shape_vec_index_add(v, pdepth);
 }
@@ -2955,18 +2956,71 @@ static inline tsv* obj_val_at(ts_object* o, uint32_t i){
 static inline uint8_t obj_flags_at(const ts_object* o, uint32_t i){
   return obj_shaped(o) ? g_ts_shape_flags[ts_obj_shape_id(o)][i] : obj_map(o)->props[i].flags;
 }
+/* The value of slot i as the program sees it: an integer slot boxed
+   (docs/record_int_fields_design.md); every generic reader goes through this. */
+static inline tsv obj_val_read(ts_object* o, uint32_t i){
+  tsv w = *obj_val_at(o, i);
+  return (obj_flags_at(o, i) & TS_PROP_INT32) ? ts_int_slot_box(w) : w;
+}
 /* A located own property: the object and its slot index. */
 typedef struct { ts_object* o; uint32_t i; } ts_pref;
 static const ts_pref PREF_NONE = { NULL, 0u };
 static inline int pref_ok(ts_pref r){ return r.o != NULL; }
 static inline ts_key pref_key(ts_pref r){ return obj_key_at(r.o, r.i); }
 static inline tsv* pref_valp(ts_pref r){ return obj_val_at(r.o, r.i); }
-static inline tsv pref_val(ts_pref r){ return *obj_val_at(r.o, r.i); }
+static inline tsv pref_val(ts_pref r){ return obj_val_read(r.o, r.i); }
 static inline uint8_t pref_flags(ts_pref r){ return obj_flags_at(r.o, r.i); }
 static inline int pref_is_accessor(ts_pref r){ return (pref_flags(r) & TS_PROP_ACCESSOR) != 0; }
 static inline int pref_is_writable(ts_pref r){ return (pref_flags(r) & TS_PROP_WRITABLE) != 0; }
 static inline int pref_is_enumerable(ts_pref r){ return (pref_flags(r) & TS_PROP_ENUMERABLE) != 0; }
 static inline int pref_is_configurable(ts_pref r){ return (pref_flags(r) & TS_PROP_CONFIGURABLE) != 0; }
+/* ---- integer slots: generalization and the kind-aware store (docs/record_int_fields_design.md) ---- */
+/* The sibling of shape `sid` with slot `slot` boxed: the chain from the root run
+   again with that transition's TS_PROP_INT32 bit cleared (the other objects of
+   `sid` keep theirs); TS_SHAPE_NONE when the shape table is full. */
+#define TS_SIBLING_CACHE_SIZE 256u
+static struct { uint32_t sid, slot, sibling; } g_sibling_cache[TS_SIBLING_CACHE_SIZE];
+static uint32_t shape_sibling_boxed(uint32_t sid, uint32_t slot){
+  uint32_t hh = ((sid * 0x9E3779B1u) ^ slot) & (TS_SIBLING_CACHE_SIZE - 1u);
+  if (g_sibling_cache[hh].sibling && g_sibling_cache[hh].sid == sid && g_sibling_cache[hh].slot == slot) return g_sibling_cache[hh].sibling;
+  uint32_t depth = g_shapes[sid].depth;
+  if (slot >= depth) return TS_SHAPE_NONE;
+  uint32_t small[64];
+  uint32_t* ids = depth <= 64u ? small : (uint32_t*)malloc(sizeof(uint32_t) * depth);
+  if (!ids) return TS_SHAPE_NONE;
+  uint32_t id = sid;
+  for (uint32_t i = depth; i-- > 0; ){ ids[i] = id; id = g_shapes[id].parent; }
+  uint32_t sh = TS_SHAPE_EMPTY;
+  for (uint32_t i = 0; i < depth && sh != TS_SHAPE_NONE; i++){
+    const ts_shape_desc* d = &g_shapes[ids[i]];
+    uint8_t f = d->flags;
+    if (i == slot) f = (uint8_t)(f & ~TS_PROP_INT32);
+    sh = shape_transition_f(sh, d->key, f);
+  }
+  if (ids != small) free(ids);
+  if (sh != TS_SHAPE_NONE){ g_sibling_cache[hh].sid = sid; g_sibling_cache[hh].slot = slot; g_sibling_cache[hh].sibling = sh; }
+  return sh;
+}
+/* A value that is not an int32 stored into an integer slot: the object moves to the
+   sibling shape where the slot is boxed (its integer boxed first), or becomes a
+   dictionary when the shape table is full (which boxes every slot). */
+static void obj_generalize_slot(ts_object* o, uint32_t slot){
+  uint32_t sib = shape_sibling_boxed(ts_obj_shape_id(o), slot);
+  if (sib == TS_SHAPE_NONE){ obj_to_dictionary(o); return; }
+  tsv* vp = ts_obj_slot_ptr(o, slot);
+  *vp = ts_int_slot_box(*vp);
+  ts_obj_set_shape(o, sib);
+}
+/* The store of a data property through its located slot, by the slot's kind. */
+static inline void pref_store(tsv obj, ts_pref p, tsv val){
+  if (obj_flags_at(p.o, p.i) & TS_PROP_INT32){
+    int32_t iv;
+    if (ts_int32_exact(val, &iv)){ *ts_obj_slot_ptr(p.o, p.i) = ts_int_slot_word(iv); return; }
+    obj_generalize_slot(p.o, p.i);
+  }
+  tsv* vp = pref_valp(p); *vp = val;
+  if (obj_shaped(p.o)) ts_write_barrier_ptr(obj, vp, val); else ts_write_barrier(obj, val);
+}
 
 /* Dictionary index (shape 0 only). */
 /* The index block: its capacity, then the entries. */
@@ -3063,7 +3117,7 @@ static void obj_to_dictionary(ts_object* o){
     else v = (ts_prop*)gc_owned_alloc(&o->h, sizeof(ts_prop) * cap);
     const ts_key* ks = g_ts_shape_keys[sid];
     const uint8_t* fl = g_ts_shape_flags[sid];
-    for (uint32_t i = 0; i < len; i++){ v[i].key = ks[i]; v[i].val = *obj_val_at(o, i); v[i].flags = fl[i]; }
+    for (uint32_t i = 0; i < len; i++){ v[i].key = ks[i]; v[i].val = obj_val_read(o, i); v[i].flags = (uint8_t)(fl[i] & ~TS_PROP_INT32); }
   }
   /* the inline area stays allocated (inline_cap keeps the cell size honest)
      but a dictionary never reads it; the external vector is released. */
@@ -3645,8 +3699,7 @@ static ts_pref ts_set_named_prop(tsv obj, ts_object* o, ts_key key, tsv val,
       return PREF_NONE;
     }
     if (frozen || !pref_is_writable(ownp)){ ts_throw_readonly_write(obj, key); return PREF_NONE; }
-    { tsv* vp = pref_valp(ownp); *vp = val;
-      if (obj_shaped(o)) ts_write_barrier_ptr(obj, vp, val); else ts_write_barrier(obj, val); }
+    pref_store(obj, ownp, val);
     return ownp;
   }
   /* 2) inherited property up the proto chain: an accessor invokes its setter
@@ -8386,10 +8439,10 @@ tsv ts_get_ic(tsv obj, ts_key key, ts_rt_ic* ic){
   if (TS_TOP16(obj) == TS_SEL_OBJECT){
     ts_object* o = (ts_object*)ts_ptr(obj);
     if (o->h.kind == TS_KIND_OBJECT){
-      if (ic->shape != 0 && o->shape == ic->shape) return *ts_obj_slot_ptr(o, ic->slot);
+      if (ic->shape != 0 && o->shape == ic->shape) return obj_val_read(o, ic->slot);
       if (obj_shaped(o)){
         ts_pref p = prop_find(o, key);
-        if (pref_ok(p) && !pref_is_accessor(p)){ ic->shape = o->shape; ic->slot = p.i; return *pref_valp(p); }
+        if (pref_ok(p) && !pref_is_accessor(p)){ ic->shape = o->shape; ic->slot = p.i; return pref_val(p); }
       }
     }
   }
@@ -8400,13 +8453,13 @@ void ts_set_ic(tsv obj, ts_key key, tsv v, ts_rt_ic* ic){
     ts_object* o = (ts_object*)ts_ptr(obj);
     if (o->h.kind == TS_KIND_OBJECT && !(ts_obj_integrity(o) & 1u)){
       if (ic->shape != 0 && o->shape == ic->shape){
-        tsv* p = ts_obj_slot_ptr(o, ic->slot); *p = v; ts_write_barrier_ptr(obj, p, v); return;
+        pref_store(obj, (ts_pref){ o, ic->slot }, v); return;
       }
       if (obj_shaped(o)){
         ts_pref p = prop_find(o, key);
         if (pref_ok(p) && !pref_is_accessor(p) && pref_is_writable(p)){
           ic->shape = o->shape; ic->slot = p.i;
-          tsv* vp = pref_valp(p); *vp = v; ts_write_barrier_ptr(obj, vp, v); return;
+          pref_store(obj, p, v); return;
         }
       }
     }
@@ -11206,7 +11259,7 @@ static int json_emit_prop_map_direct(jbuf* b, tsv obj, int depth, const char* in
     if (i>=obj_map(o)->len) break;
     if (!prop_enum_data_at(o, i)) continue;
     uint32_t k=obj_key_at(o, i);
-    tsv val=(*obj_val_at(o, i));
+    tsv val=(obj_val_read(o, i));
     json_emit_obj_prop(b, obj, k, val, depth, indent, first);
   }
   return 1;
@@ -12022,7 +12075,7 @@ static void ts_prop_own_enum(tsv obj, ts_prop_enum_cb cb, void* ud){
       ts_obj_common* oc = &((ts_typedarray*)ts_ptr(obj))->o;
       if (i >= obj_map(oc)->len) break;
       if (!prop_enum_data_at(oc, i)) continue;
-      cb(obj_key_at(oc, i), *obj_val_at(oc, i), ud);
+      cb(obj_key_at(oc, i), obj_val_read(oc, i), ud);
     }
     ts_gc_unroot(1);
     return;
@@ -12046,7 +12099,7 @@ static void ts_prop_own_enum(tsv obj, ts_prop_enum_cb cb, void* ud){
       if (i>=obj_map(oc)->len) break;
       if (!prop_enum_data_at(oc, i)) continue;
       uint32_t k = obj_key_at(oc, i);
-      tsv v = (*obj_val_at(oc, i));
+      tsv v = (obj_val_read(oc, i));
       cb(k, v, ud);
     }
     return;
@@ -12084,7 +12137,7 @@ static void ts_prop_own_enum(tsv obj, ts_prop_enum_cb cb, void* ud){
         uint32_t idx;
         if (!prop_enum_data_at(o, i) || !prop_key_is_array_index(obj_key_at(o, i),&idx)) continue;
         if (have_prev && idx <= prev_idx) continue;      /* already emitted */
-        if (!found || idx < best){ best=idx; best_key=obj_key_at(o, i); best_val=(*obj_val_at(o, i)); found=1; }
+        if (!found || idx < best){ best=idx; best_key=obj_key_at(o, i); best_val=(obj_val_read(o, i)); found=1; }
       }
       if (!found) break;
       cb(best_key, best_val, ud);
@@ -12100,7 +12153,7 @@ static void ts_prop_own_enum(tsv obj, ts_prop_enum_cb cb, void* ud){
       if (!prop_enum_data_at(o, i)) continue;
       if (prop_key_is_array_index(obj_key_at(o, i),&idx)) continue;
       uint32_t k = obj_key_at(o, i);
-      tsv v = (*obj_val_at(o, i));
+      tsv v = (obj_val_read(o, i));
       cb(k, v, ud);
     }
     return;
@@ -12110,7 +12163,7 @@ static void ts_prop_own_enum(tsv obj, ts_prop_enum_cb cb, void* ud){
     if (i>=obj_map(o)->len) break;
     if (!prop_enum_data_at(o, i)) continue;
     uint32_t k = obj_key_at(o, i);
-    tsv v = (*obj_val_at(o, i));
+    tsv v = (obj_val_read(o, i));
     cb(k, v, ud);
   }
 }
@@ -12257,7 +12310,7 @@ static void inspect_own_sym_props(jbuf* b, tsv v, int depth, int* first){
   for (uint32_t i=0;i<obj_map(o)->len;i++){
     ts_key k = obj_key_at(o, i);
     if (k < TS_WKSYM_KEY_BASE || !(obj_flags_at(o, i) & TS_PROP_ENUMERABLE)) continue;
-    tsv val = (*obj_val_at(o, i));
+    tsv val = (obj_val_read(o, i));
     if (!*first) jb_putz(b, ", "); *first = 0;
     inspect_symbol_key(b, k); jb_putz(b, ": ");
     if (is_accessor(val)){
@@ -13528,7 +13581,7 @@ static int obj_abandon_layout(tsv obj){
   }
   for (uint32_t j = 0; j < ne; j++){
     d[nf + j].key = obj_key_at(o, j);
-    d[nf + j].val = *obj_val_at(o, j);
+    d[nf + j].val = obj_val_read(o, j);
     d[nf + j].flags = obj_flags_at(o, j);
   }
   if (m->props && m->cap) gc_owned_free(m->props);
@@ -16734,7 +16787,8 @@ static void prop_absent_fill(ts_prop_ic* ic, ts_object* o, ts_key key){
 static uint32_t lit_layout_shape(ts_lit_layout* L){
   if (L->shape) return L->shape;
   uint32_t sh = TS_SHAPE_EMPTY;
-  for (uint32_t i = 0; i < L->n && sh != TS_SHAPE_NONE; i++) sh = shape_transition(sh, L->keys[i]);
+  for (uint32_t i = 0; i < L->n && sh != TS_SHAPE_NONE; i++)
+    sh = shape_transition_f(sh, L->keys[i], (uint8_t)(TS_PROP_DEFAULT | ((L->kinds && L->kinds[i]) ? TS_PROP_INT32 : 0)));
   L->shape = sh != TS_SHAPE_NONE ? sh : UINT32_MAX;
   return L->shape;
 }
@@ -16745,7 +16799,7 @@ static tsv new_object_layout_impl(ts_lit_layout* L, int pretenured){
     tsv obj = ts_new_object_impl(pretenured, n);
     ts_object* o = (ts_object*)ts_ptr(obj);
     tsv* slots = ts_obj_inline_vals(o);
-    for (uint32_t i = 0; i < n; i++) slots[i] = TS_UNDEFINED;
+    for (uint32_t i = 0; i < n; i++) slots[i] = (L->kinds && L->kinds[i]) ? ts_int_slot_word(0) : TS_UNDEFINED;
     obj_map_plain(o)->len = n;
     ts_obj_set_shape(o, sh);
     return obj;
@@ -16770,10 +16824,18 @@ int ts_obj_adopt_layout(tsv obj, ts_lit_layout* L){
   uint32_t n = L->n;
   if (sh == UINT32_MAX || n > o->h.inline_cap) return 0;
   tsv* slots = ts_obj_inline_vals(o);
-  for (uint32_t i = 0; i < n; i++) slots[i] = TS_UNDEFINED;
+  for (uint32_t i = 0; i < n; i++) slots[i] = (L->kinds && L->kinds[i]) ? ts_int_slot_word(0) : TS_UNDEFINED;
   obj_map_plain(o)->len = n;
   ts_obj_set_shape(o, sh);
   return 1;
+}
+void ts_lit_store_int_slow(tsv obj, uint32_t i, long long v){
+  ts_object* o = (ts_object*)ts_ptr(obj);
+  if (obj_shaped(o) && (obj_flags_at(o, i) & TS_PROP_INT32)){
+    if (v >= INT32_MIN && v <= INT32_MAX){ *ts_obj_slot_ptr(o, i) = ts_int_slot_word((int32_t)v); return; }
+    obj_generalize_slot(o, i);
+  }
+  ts_lit_store(obj, i, ts_num((double)v));
 }
 /* The linked slow paths of a lazy frame with register homes (ts_rt.h): the
    caller filled the frame; link it, run the generic operation, unlink. */
@@ -16891,8 +16953,7 @@ void ts_set_pic(tsv obj, ts_key key, tsv val, ts_prop_ic* ic){
         TS_RT_STAT_PIC_SET_HIT();
         if (pref_is_accessor(own)){ invoke_setter((ts_accessor*)ts_ptr(pref_val(own)), obj, key, val); return; }
         if ((ts_obj_integrity(o) & 1u) || !pref_is_writable(own)){ ts_throw_readonly_write(obj, key); return; }
-        { tsv* vp = pref_valp(own); *vp = val;
-          if (obj_shaped(o)) ts_write_barrier_ptr(obj, vp, val); else ts_write_barrier(obj, val); }
+        pref_store(obj, own, val);
         return;
       }
       ts_prop_location* e = prop_ic_probe(ic, obj, key);
@@ -16911,8 +16972,7 @@ void ts_set_pic(tsv obj, ts_key key, tsv val, ts_prop_ic* ic){
           ts_throw_readonly_write(obj, key);
           return;
         }
-        { tsv* vp = pref_valp(p); *vp = val;
-          if (obj_shaped(o)) ts_write_barrier_ptr(obj, vp, val); else ts_write_barrier(obj, val); }
+        pref_store(obj, p, val);
         return;
       }
       ts_prop_add_entry* add = prop_add_lookup(ic, o, key);

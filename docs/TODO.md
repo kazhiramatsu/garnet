@@ -10125,3 +10125,30 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   class design's TypeError on dynamic stores under the proof. Slices S1
   (representation), S2 (typing), S3 (single-call-site inlining). Not for
   tsc-ts (0.3% of its instructions in these paths).
+- Integer record slots, S1 (`docs/record_int_fields_design.md`, "S1 as built"):
+  the representation. A shaped object's slot with `TS_PROP_INT32` in its
+  attribute flags holds an int32 zero-extended (a sibling shape of the boxed
+  one; the collector's scan unchanged); the probe vectors tag the key; the
+  generic readers box through `obj_val_read`, the writers store by kind
+  through `pref_store` or generalize the object to the boxed sibling
+  (`shape_sibling_boxed`, a dictionary when the table is full); the inline
+  caches box and store in line; the single-slot static reads test the boxed
+  key first (3-5% fewer instructions than before on the record kernels, from
+  the branch hints) and the integer helpers test the integer slot first.
+  Layouts carry kinds; a layout with integer slots tests the object's shape
+  once and stores its integers directly. The emitter's pre-pass
+  (`infer_int_record_slots`) marks a layout store an integer slot when its
+  key is integer-friendly (bitwise/index consumers, no double consumer) and
+  the stored local is an integer local of the emitter's own analysis; only
+  such keys read through the integer helpers, so a program without them
+  compiles byte-identically. Kernels (strict, knob off → on): flags_truthy
+  7.81 → 7.79 G, object_arrays 5.263 → 5.263, ctor_functions 5.10 → 5.16,
+  obj_literal_poly 4.86 → 4.96, switch_dispatch and small_calls identical (no
+  key qualifies: `v` has double consumers; the literal has a `?:`
+  initializer); cycles flat. Fixture `objects/int_record_slots` (plain,
+  strict, GC-protect; generalization by a fraction, a string, undefined, NaN,
+  -0 and the int32 edges; JSON, keys/values/entries, spread, for-in, delete,
+  defineProperty, freeze, console.log, a mixed literal site, an index and a
+  shift of negative and extreme integers). `TSAOT_INT_RECORD_SLOTS=0` in the
+  parity oracle's environment. The full win (the hand-edited 2.1x) is S2's:
+  the integer typing of the values read.

@@ -425,6 +425,7 @@ fn emit_program_with_string_plans(
     set_int_store_fields(infer_int_store_fields(program, &indirect_funcs));
     let param_facts_by_func = infer_program_param_facts(program, &indirect_funcs);
     let i64_fast = infer_i64_fast_funcs(program, &indirect_funcs, &param_facts_by_func);
+    infer_int_record_slots(program, &param_facts_by_func, &i64_fast);
     let f64_fast = infer_f64_fast_funcs(program, &indirect_funcs, &i64_fast);
     let typed_keys_by_func = typed_key_locals(program);
     let static_strings = collect_static_string_literals(program);
@@ -1984,6 +1985,9 @@ struct Ctx<'a> {
     /// typed-array receivers hoisted by the enclosing loops (slice P):
     /// local -> (element kind, the loop's top label)
     ta_hoisted: std::cell::RefCell<BTreeMap<u32, (u8, u32)>>,
+    /// a layout with integer slots keeps its block open across its stores: the
+    /// store address -> (layout id, whether it is the layout's last store)
+    layout_open: std::cell::RefCell<BTreeMap<usize, (u32, bool)>>,
     /// The versioned typed-array loop being emitted (docs/typed_array_loops_design.md):
     /// (the loop's top label, its induction local); element accesses of hoisted
     /// views by that local are direct within it.
@@ -4598,6 +4602,21 @@ fn body_is_gc_free(body: &[Inst], numeric: &BTreeSet<u32>) -> bool {
    final shape (one transition walk per site at first use) and the values
    are stored by slot, instead of one cached shape transition per property.
    TSAOT_LITERAL_LAYOUT=0 keeps the per-property additions (parity oracle). */
+/// Integer slots for the integer fields of object literals
+/// (docs/record_int_fields_design.md): a literal's key whose stored value is
+/// an integer local is an int32 slot of the literal's shape, read by the
+/// integer helpers where the destination is an integer. TSAOT_INT_RECORD_SLOTS=0
+/// keeps every slot boxed (the parity oracle).
+fn int_record_slots_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_INT_RECORD_SLOTS").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
 fn literal_layout_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -4612,6 +4631,12 @@ fn literal_layout_enabled() -> bool {
 struct LayoutPlan {
     /// AllocObject (by address) -> property keys in store order
     alloc: BTreeMap<usize, Vec<u32>>,
+    /// AllocObject (by address) -> the addresses of its layout's stores, in the keys' order
+    alloc_addrs: BTreeMap<usize, Vec<usize>>,
+    /// first StoreField of a constructor's `this` sequence -> the addresses of its stores
+    ctor_addrs: BTreeMap<usize, Vec<usize>>,
+    /// a layout's StoreField (by address) -> (key, the local stored): the integer-slot pre-pass
+    store_src: BTreeMap<usize, (u32, u32)>,
     /// StoreField (by address) -> (slot, true when guarded by the constructor adopt test)
     store: BTreeMap<usize, (u32, bool)>,
     /// first StoreField of a constructor's `this` sequence -> keys
@@ -4621,9 +4646,10 @@ struct LayoutPlan {
 /// Stores into `obj` that follow `start` in `block` before anything else
 /// touches `obj`: (keys, store addresses). Intervening instructions may not
 /// mention `obj`; when `strict`, they may also not run user code.
-fn collect_layout_stores(block: &[Inst], start: usize, obj: u32, strict: bool) -> (Vec<u32>, Vec<usize>) {
+fn collect_layout_stores(block: &[Inst], start: usize, obj: u32, strict: bool) -> (Vec<u32>, Vec<usize>, Vec<u32>) {
     let mut keys: Vec<u32> = Vec::new();
     let mut addrs: Vec<usize> = Vec::new();
+    let mut srcs: Vec<u32> = Vec::new();
     for inst in &block[start..] {
         match inst {
             Inst::StoreField { obj: o, field, src, .. } if o.0 == obj => {
@@ -4632,6 +4658,7 @@ fn collect_layout_stores(block: &[Inst], start: usize, obj: u32, strict: bool) -
                 }
                 keys.push(field.0);
                 addrs.push(inst as *const Inst as usize);
+                srcs.push(src.0);
             }
             Inst::If { .. } | Inst::Loop { .. } | Inst::TryCatch { .. } => break,
             other => {
@@ -4657,7 +4684,7 @@ fn collect_layout_stores(block: &[Inst], start: usize, obj: u32, strict: bool) -
             }
         }
     }
-    (keys, addrs)
+    (keys, addrs, srcs)
 }
 
 fn layout_plan_for(f: &Function) -> LayoutPlan {
@@ -4674,12 +4701,14 @@ fn layout_plan_for(f: &Function) -> LayoutPlan {
                     proto: None,
                     ..
                 } => {
-                    let (keys, addrs) = collect_layout_stores(block, i + 1, dst.0, false);
+                    let (keys, addrs, srcs) = collect_layout_stores(block, i + 1, dst.0, false);
                     if !keys.is_empty() {
                         for (slot, a) in addrs.iter().enumerate() {
                             plan.store.insert(*a, (slot as u32, false));
+                            plan.store_src.insert(*a, (keys[slot], srcs[slot]));
                         }
                         plan.alloc.insert(inst as *const Inst as usize, keys);
+                        plan.alloc_addrs.insert(inst as *const Inst as usize, addrs);
                     }
                 }
                 Inst::If {
@@ -4725,7 +4754,7 @@ fn layout_plan_for(f: &Function) -> LayoutPlan {
     // (tsc-ts: the Node constructor, `FlowState.reset`).
     if f.takes_this {
         if let Some(this) = f.params.get(f.capture_count as usize) {
-            let (keys, addrs) = collect_layout_stores(&f.body, 0, this.0, true);
+            let (keys, addrs, srcs) = collect_layout_stores(&f.body, 0, this.0, true);
             let hinted = addrs.iter().any(|a| {
                 f.body.iter().any(|inst| {
                     inst as *const Inst as usize == *a && matches!(inst, Inst::StoreField { cls, .. } if *cls != 0)
@@ -4735,6 +4764,10 @@ fn layout_plan_for(f: &Function) -> LayoutPlan {
                 for (slot, a) in addrs.iter().enumerate() {
                     plan.store.insert(*a, (slot as u32, true));
                 }
+                for (slot, a) in addrs.iter().enumerate() {
+                    plan.store_src.insert(*a, (keys[slot], srcs[slot]));
+                }
+                plan.ctor_addrs.insert(addrs[0], addrs.clone());
                 plan.ctor_first.insert(addrs[0], keys);
             }
         }
@@ -4742,8 +4775,21 @@ fn layout_plan_for(f: &Function) -> LayoutPlan {
     plan
 }
 
-fn emit_layout_decl(s: &mut String, id: u32, keys: &[u32]) {
+fn emit_layout_decl(s: &mut String, id: u32, keys: &[u32], kinds: &[u8]) {
     let ks: Vec<String> = keys.iter().map(|k| format!("{}u", k)).collect();
+    if kinds.iter().any(|k| *k != 0) {
+        // the integer slots of the layout (docs/record_int_fields_design.md)
+        let kk: Vec<String> = kinds.iter().map(|k| format!("{}u", k)).collect();
+        let _ = writeln!(
+            s,
+            "  static const ts_key _ts_lk_{0}[{1}] = {{{2}}}; static const uint8_t _ts_lkk_{0}[{1}] = {{{3}}}; static ts_lit_layout _ts_lit_{0} = {{0u, {1}u, _ts_lk_{0}, _ts_lkk_{0}}};",
+            id,
+            keys.len(),
+            ks.join(", "),
+            kk.join(", ")
+        );
+        return;
+    }
     let _ = writeln!(
         s,
         "  static const ts_key _ts_lk_{}[{}] = {{{}}}; static ts_lit_layout _ts_lit_{} = {{0u, {}u, _ts_lk_{}}};",
@@ -4754,6 +4800,167 @@ fn emit_layout_decl(s: &mut String, id: u32, keys: &[u32]) {
         keys.len(),
         id
     );
+}
+
+/// A layout's slot kinds (docs/record_int_fields_design.md): 1 where the
+/// pre-pass marked the slot's store as an integer-slot store, else 0.
+fn layout_kinds(keys: &[u32], addrs: Option<&Vec<usize>>) -> Vec<u8> {
+    let mut kinds = vec![0u8; keys.len()];
+    if let Some(addrs) = addrs {
+        for (i, a) in addrs.iter().enumerate().take(keys.len()) {
+            if int_slot_store(*a) {
+                kinds[i] = 1;
+            }
+        }
+    }
+    kinds
+}
+
+/// The record keys worth an integer slot: a field some load of which feeds an
+/// integer consumer (a bitwise operator, `~`, an array index) and none feeds
+/// arithmetic that wants a double (`+ - * / % **`, an ordering compare, unary
+/// `-`): a double consumer of an integer slot pays an int-to-double
+/// conversion per read, more than the integer consumers save (S2's typing of
+/// the values read refines this).
+static INT_RECORD_KEYS: std::sync::RwLock<BTreeSet<u32>> = std::sync::RwLock::new(BTreeSet::new());
+/// The layout stores (by instruction address) whose slot is an integer slot:
+/// an integer-friendly key stored from an integer local of its function.
+static INT_SLOT_STORES: std::sync::RwLock<BTreeSet<usize>> = std::sync::RwLock::new(BTreeSet::new());
+fn int_record_key(field: u32) -> bool {
+    INT_RECORD_KEYS.read().unwrap().contains(&field)
+}
+fn int_slot_store(addr: usize) -> bool {
+    INT_SLOT_STORES.read().unwrap().contains(&addr)
+}
+/// The pre-pass: the integer-friendly keys (`infer_int_record_keys`), then the
+/// layout stores of such keys whose local the function's numeric analysis
+/// (the one the emitter runs) types as an integer. A key is an integer slot
+/// somewhere only when such a store exists, and only those keys read through
+/// the integer helpers (a key with no integer slot keeps the boxed read).
+fn infer_int_record_slots(program: &Program, param_facts_by_func: &BTreeMap<u32, BTreeMap<u32, NumFact>>, i64_fast: &BTreeMap<u32, I64FuncInfo>) {
+    let friendly = infer_int_record_keys(program);
+    let mut stores: BTreeSet<usize> = BTreeSet::new();
+    let mut keys: BTreeSet<u32> = BTreeSet::new();
+    if !friendly.is_empty() {
+        let classes: BTreeMap<u32, &ClassDef> = program.classes.iter().map(|c| (c.id.0, c)).collect();
+        let fclass = func_class(program);
+        let return_facts = i64_return_facts(i64_fast);
+        let empty: BTreeMap<u32, NumFact> = BTreeMap::new();
+        for f in &program.functions {
+            let plan = layout_plan_for(f);
+            if !plan.store_src.values().any(|(k, _)| friendly.contains(k)) {
+                continue;
+            }
+            let mut local_class = local_class_map(f);
+            if let Some(&c) = fclass.get(&f.id.0) {
+                if let Some(p0) = f.params.first() {
+                    local_class.insert(p0.0, c);
+                }
+            }
+            let unboxed = unboxed_candidates(f, &local_class);
+            let pf = param_facts_by_func.get(&f.id.0).unwrap_or(&empty);
+            let analysis = infer_numeric_analysis(&f.body, &unboxed, pf, &return_facts, &int32_field_loads(&f.body, &local_class, &classes));
+            for (addr, (key, src)) in &plan.store_src {
+                if friendly.contains(key) && analysis.int_local.contains(src) {
+                    stores.insert(*addr);
+                    keys.insert(*key);
+                }
+            }
+        }
+    }
+    *INT_SLOT_STORES.write().unwrap() = stores;
+    *INT_RECORD_KEYS.write().unwrap() = keys;
+}
+fn infer_int_record_keys(program: &Program) -> BTreeSet<u32> {
+    let mut int_uses: BTreeMap<u32, u32> = BTreeMap::new();
+    let mut double_uses: BTreeMap<u32, u32> = BTreeMap::new();
+    if !int_record_slots_enabled() {
+        return BTreeSet::new();
+    }
+    fn collect(body: &[Inst], loads: &mut BTreeMap<u32, u32>) {
+        for inst in body {
+            match inst {
+                Inst::LoadField { dst, field, .. } => {
+                    loads.insert(dst.0, field.0);
+                }
+                Inst::Copy { dst, src } => {
+                    if let Some(f) = loads.get(&src.0).copied() {
+                        loads.insert(dst.0, f);
+                    }
+                }
+                Inst::Loop { cond_body, body, .. } => {
+                    collect(cond_body, loads);
+                    collect(body, loads);
+                }
+                Inst::If { then_body, else_body, .. } => {
+                    collect(then_body, loads);
+                    collect(else_body, loads);
+                }
+                Inst::TryCatch { try_body, catch_body, finally_body, .. } => {
+                    collect(try_body, loads);
+                    collect(catch_body, loads);
+                    collect(finally_body, loads);
+                }
+                _ => {}
+            }
+        }
+    }
+    fn count(body: &[Inst], loads: &BTreeMap<u32, u32>, int_uses: &mut BTreeMap<u32, u32>, double_uses: &mut BTreeMap<u32, u32>) {
+        let bump = |m: &mut BTreeMap<u32, u32>, l: u32, loads: &BTreeMap<u32, u32>| {
+            if let Some(f) = loads.get(&l) {
+                *m.entry(*f).or_insert(0) += 1;
+            }
+        };
+        for inst in body {
+            match inst {
+                Inst::BinOp { op, lhs, rhs, .. } => {
+                    let is_int = matches!(op.as_str(), "&" | "|" | "^" | "<<" | ">>" | ">>>");
+                    let is_double = matches!(op.as_str(), "+" | "-" | "*" | "/" | "%" | "**" | "<" | "<=" | ">" | ">=");
+                    for l in [lhs.0, rhs.0] {
+                        if is_int {
+                            bump(int_uses, l, loads);
+                        } else if is_double {
+                            bump(double_uses, l, loads);
+                        }
+                    }
+                }
+                Inst::UnOp { op, operand, .. } => {
+                    if op == "~" {
+                        bump(int_uses, operand.0, loads);
+                    } else if op == "-" {
+                        bump(double_uses, operand.0, loads);
+                    }
+                }
+                Inst::LoadIndex { index, .. } | Inst::StoreIndex { index, .. } => {
+                    bump(int_uses, index.0, loads);
+                }
+                Inst::Loop { cond_body, body, .. } => {
+                    count(cond_body, loads, int_uses, double_uses);
+                    count(body, loads, int_uses, double_uses);
+                }
+                Inst::If { then_body, else_body, .. } => {
+                    count(then_body, loads, int_uses, double_uses);
+                    count(else_body, loads, int_uses, double_uses);
+                }
+                Inst::TryCatch { try_body, catch_body, finally_body, .. } => {
+                    count(try_body, loads, int_uses, double_uses);
+                    count(catch_body, loads, int_uses, double_uses);
+                    count(finally_body, loads, int_uses, double_uses);
+                }
+                _ => {}
+            }
+        }
+    }
+    for f in &program.functions {
+        let mut loads = BTreeMap::new();
+        collect(&f.body, &mut loads);
+        count(&f.body, &loads, &mut int_uses, &mut double_uses);
+    }
+    int_uses
+        .iter()
+        .filter(|(f, n)| **n >= 1 && *double_uses.get(*f).unwrap_or(&0) == 0)
+        .map(|(f, _)| *f)
+        .collect()
 }
 
 /* Direct-call entry points (docs/direct_entry_design.md). Every eligible
@@ -8857,6 +9064,7 @@ fn emit_i64_function(
         label_ctr: std::cell::Cell::new(900000),
         loop_labels: std::cell::RefCell::new(Vec::new()),
         ta_hoisted: std::cell::RefCell::new(BTreeMap::new()),
+        layout_open: std::cell::RefCell::new(BTreeMap::new()),
         ta_prefix: std::cell::Cell::new(None),
         sv_hoisted: std::cell::RefCell::new(BTreeMap::new()),
         loop_mod_residues: std::cell::RefCell::new(Vec::new()),
@@ -9085,6 +9293,7 @@ fn emit_f64_function(
         label_ctr: std::cell::Cell::new(900000),
         loop_labels: std::cell::RefCell::new(Vec::new()),
         ta_hoisted: std::cell::RefCell::new(BTreeMap::new()),
+        layout_open: std::cell::RefCell::new(BTreeMap::new()),
         ta_prefix: std::cell::Cell::new(None),
         sv_hoisted: std::cell::RefCell::new(BTreeMap::new()),
         loop_mod_residues: std::cell::RefCell::new(Vec::new()),
@@ -9211,6 +9420,7 @@ fn emit_function(
             label_ctr: std::cell::Cell::new(900000),
             loop_labels: std::cell::RefCell::new(Vec::new()),
         ta_hoisted: std::cell::RefCell::new(BTreeMap::new()),
+        layout_open: std::cell::RefCell::new(BTreeMap::new()),
         ta_prefix: std::cell::Cell::new(None),
         sv_hoisted: std::cell::RefCell::new(BTreeMap::new()),
             loop_mod_residues: std::cell::RefCell::new(Vec::new()),
@@ -9282,6 +9492,7 @@ fn emit_function(
             label_ctr: std::cell::Cell::new(900000),
             loop_labels: std::cell::RefCell::new(Vec::new()),
         ta_hoisted: std::cell::RefCell::new(BTreeMap::new()),
+        layout_open: std::cell::RefCell::new(BTreeMap::new()),
         ta_prefix: std::cell::Cell::new(None),
         sv_hoisted: std::cell::RefCell::new(BTreeMap::new()),
             loop_mod_residues: std::cell::RefCell::new(Vec::new()),
@@ -9353,6 +9564,7 @@ fn emit_function(
             label_ctr: std::cell::Cell::new(900000),
             loop_labels: std::cell::RefCell::new(Vec::new()),
         ta_hoisted: std::cell::RefCell::new(BTreeMap::new()),
+        layout_open: std::cell::RefCell::new(BTreeMap::new()),
         ta_prefix: std::cell::Cell::new(None),
         sv_hoisted: std::cell::RefCell::new(BTreeMap::new()),
             loop_mod_residues: std::cell::RefCell::new(Vec::new()),
@@ -9640,6 +9852,7 @@ fn emit_function(
         label_ctr: std::cell::Cell::new(900000),
         loop_labels: std::cell::RefCell::new(Vec::new()),
         ta_hoisted: std::cell::RefCell::new(BTreeMap::new()),
+        layout_open: std::cell::RefCell::new(BTreeMap::new()),
         ta_prefix: std::cell::Cell::new(None),
         sv_hoisted: std::cell::RefCell::new(BTreeMap::new()),
         loop_mod_residues: std::cell::RefCell::new(Vec::new()),
@@ -20254,12 +20467,20 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     if let Some(keys) = ctx.layouts.alloc.get(&(inst as *const Inst as usize)) {
                         let id = ctx.fresh_label();
                         s.push_str("  {\n");
-                        emit_layout_decl(s, id, keys);
+                        let addrs = ctx.layouts.alloc_addrs.get(&(inst as *const Inst as usize));
+                        let kinds = layout_kinds(keys, addrs);
+                        emit_layout_decl(s, id, keys, &kinds);
+                        // a layout with integer slots (docs/record_int_fields_design.md): the block
+                        // stays open across the layout's stores, which test once that the object
+                        // is in the layout's shape (the fallback path makes boxed slots) and store
+                        // their integers directly
+                        let int_layout = kinds.iter().any(|k| *k != 0);
+                        let close = if int_layout { "" } else { "\n  }" };
                         if let Some(sid) = alloc_site_id(site.0, st) {
                             let _ = writeln!(
                                 s,
-                                "  {} = ts_new_object_layout_site(&_ts_lit_{}, {}u); /* site {} {:?} layout */\n  }}",
-                                ctx.vname(dst.0), id, sid, site.0, st
+                                "  {} = ts_new_object_layout_site(&_ts_lit_{}, {}u); /* site {} {:?} layout */{}",
+                                ctx.vname(dst.0), id, sid, site.0, st, close
                             );
                         } else {
                             let alloc = if st == AllocStrategy::PretenuredHeap {
@@ -20269,9 +20490,18 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                             };
                             let _ = writeln!(
                                 s,
-                                "  {} = {}(&_ts_lit_{}); /* site {} {:?} layout */\n  }}",
-                                ctx.vname(dst.0), alloc, id, site.0, st
+                                "  {} = {}(&_ts_lit_{}); /* site {} {:?} layout */{}",
+                                ctx.vname(dst.0), alloc, id, site.0, st, close
                             );
+                        }
+                        if int_layout {
+                            let _ = writeln!(s, "  int _ts_lkok{} = ts_obj_shape_id((ts_object*)ts_ptr({})) == _ts_lit_{}.shape;", id, ctx.vname(dst.0), id);
+                            if let Some(addrs) = addrs {
+                                let mut open = ctx.layout_open.borrow_mut();
+                                for (i, a) in addrs.iter().enumerate() {
+                                    open.insert(*a, (id, i + 1 == addrs.len()));
+                                }
+                            }
                         }
                         if site_stats_enabled() {
                             // diagnostic: object literals report under 4000000002
@@ -22489,6 +22719,27 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         o = ctx.val(obj.0), k = field.0, pic = pic, n = ctx.frame_nslots
                     )
                 };
+                // an integer destination at a single-slot site of an integer-friendly key: the
+                // integer slot's word (docs/record_int_fields_design.md; the helpers test the
+                // integer slot first, so a key that is never an integer slot keeps the boxed
+                // read); a boxed slot converts as set_val would (an integer local truncates,
+                // an int32 use is ToInt32)
+                if int_record_slots_enabled() && s2 == 0 && !ctx.lazy_homes && int_record_key(field.0)
+                    && (ctx.int_local.contains(&dst.0) || ctx.int32_use.contains(&dst.0)) {
+                    let helper = if ctx.int_local.contains(&dst.0) { "ts_get_static_int64_inline" } else { "ts_get_static_int32_inline" };
+                    let call = if ctx.lazy_frame {
+                        format!("{}_lazy({}, {}, {}u, &_ts_pic_{}, &F.h, {})", helper, ctx.val(obj.0), field.0, s1, pic, ctx.frame_nslots)
+                    } else {
+                        format!("{}({}, {}, {}u, &_ts_pic_{})", helper, ctx.val(obj.0), field.0, s1, pic)
+                    };
+                    if ctx.int_local.contains(&dst.0) || int32_codegen_enabled() {
+                        let _ = writeln!(s, "  d{} = {};", dst.0, call);
+                    } else {
+                        let _ = writeln!(s, "  d{} = (double){};", dst.0, call);
+                    }
+                    let _ = writeln!(s, "  }}");
+                    return;
+                }
                 let get_expr = match (s2, s3, ctx.lazy_frame) {
                     (0, _, true) if ctx.lazy_homes => homes_try(format!("ts_get_static_try({}, {}, {}u, &_ts_pic_{}, &_lz)", ctx.val(obj.0), field.0, s1, pic)),
                     (_, 0, true) if ctx.lazy_homes => homes_try(format!("ts_get_static2_try({}, {}, {}u, {}u, &_ts_pic_{}, &_lz)", ctx.val(obj.0), field.0, s1, s2 - 1, pic)),
@@ -22668,16 +22919,38 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             let addr = inst as *const Inst as usize;
             if let Some(keys) = ctx.layouts.ctor_first.get(&addr) {
                 let id = ctx.fresh_label();
-                emit_layout_decl(s, id, keys);
+                let kinds = layout_kinds(keys, ctx.layouts.ctor_addrs.get(&addr));
+                emit_layout_decl(s, id, keys, &kinds);
                 let _ = writeln!(s, "  int _ts_adopt = ts_obj_adopt_layout({}, &_ts_lit_{});", ctx.val(obj.0), id);
             }
             if let Some(&(slot, guarded)) = ctx.layouts.store.get(&addr) {
+                // an integer slot's store (the pre-pass decided it): direct when the object is
+                // known to be in the layout's shape (a constructor's adopted layout, or the
+                // allocation's shape tested once), else through the checked store
+                let open = ctx.layout_open.borrow().get(&addr).copied();
+                let is_int = int_slot_store(addr);
+                let lit_store = if is_int && guarded {
+                    format!("ts_lit_store_int_direct({}, {}u, d{})", ctx.val(obj.0), slot, src.0)
+                } else if is_int {
+                    match open {
+                        Some((id, _)) => format!(
+                            "if (_ts_lkok{}) ts_lit_store_int_direct({}, {}u, d{}); else ts_lit_store_int_slow({}, {}u, d{})",
+                            id, ctx.val(obj.0), slot, src.0, ctx.val(obj.0), slot, src.0
+                        ),
+                        None => format!("ts_lit_store_int({}, {}u, d{})", ctx.val(obj.0), slot, src.0),
+                    }
+                } else {
+                    format!("ts_lit_store({}, {}u, {})", ctx.val(obj.0), slot, ctx.val(src.0))
+                };
                 if guarded {
-                    let _ = writeln!(s, "  if (_ts_adopt) {{ ts_lit_store({}, {}u, {}); }} else {{", ctx.val(obj.0), slot, ctx.val(src.0));
+                    let _ = writeln!(s, "  if (_ts_adopt) {{ {}; }} else {{", lit_store);
                     emit_store_field_generic(s, obj.0, field.0, src.0, ctx);
                     s.push_str("  }\n");
                 } else {
-                    let _ = writeln!(s, "  ts_lit_store({}, {}u, {});", ctx.val(obj.0), slot, ctx.val(src.0));
+                    let _ = writeln!(s, "  {};", lit_store);
+                }
+                if let Some((_, true)) = open {
+                    s.push_str("  }\n");   // the layout's block, opened at its allocation
                 }
                 return;
             }

@@ -66,6 +66,10 @@ while IFS= read -r name; do
     ts_set_static_inline | \
     ts_set_static2_inline | \
     ts_get_static_inline_lazy | \
+    ts_get_static_int32_inline | \
+    ts_get_static_int32_inline_lazy | \
+    ts_get_static_int64_inline | \
+    ts_get_static_int64_inline_lazy | \
     ts_get_static2_inline_lazy | \
     ts_set_static_inline_lazy | \
     ts_set_static2_inline_lazy | \

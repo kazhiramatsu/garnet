@@ -196,3 +196,70 @@ the A/B must show neutral).
 - Under the proof, the TypeError on a dynamic non-integer store is a
   deviation V8 does not have; it is loud, documented and behind a knob, and
   it does not exist for open types.
+
+## S1 as built (Session 353)
+
+- **Runtime.** `TS_PROP_INT32` (16) in the attribute byte; `shape_transition_f`
+  keys on the flags already, so an integer slot is a sibling shape. The slot
+  holds the int32 zero-extended (`ts_int_slot_word`/`ts_int_slot_value`/
+  `ts_int_slot_box`, ts_rt.h). `shape_desc_record` tags an integer slot's key
+  in the probe vectors (`TS_PROBE_INT_TAG`, the top bit, free of every key
+  base). The generic readers go through `obj_val_read` (`pref_val` boxes); the
+  generic writers through `pref_store` (an exact int32 into an integer slot,
+  anything else generalizes first: `obj_generalize_slot` moves the object to
+  `shape_sibling_boxed(sid, slot)`, the chain from the root re-run with the
+  bit cleared, cached by (sid, slot); a full shape table converts to a
+  dictionary, which boxes every slot and drops the bit). The inline caches'
+  fast paths box an integer slot on a read and store an exact int32 on a
+  write (`ts_get_pic_checked_inline` and the set/try variants). The
+  single-slot static reads test the boxed key first (a program without
+  integer slots pays the old sequence; the rewrite with branch hints measured
+  3-5% fewer instructions on the record kernels), then the tagged key; the 2-
+  and 3-slot variants and the static writes take a second probe with the
+  tagged key on a miss. `ts_get_static_int32_inline` / `_int64_inline`
+  (+`_lazy`) read into an int32 use or an integer local, the integer slot
+  tested first. Layouts carry a kinds vector (`ts_lit_layout.kinds`, NULL for
+  the old layouts), integer slots start at 0, `ts_lit_store_int_direct`
+  stores an int32 when the object is known to be in the layout's shape,
+  `ts_lit_store_int` checks the slot's flags, `ts_lit_store_int_slow` boxes or
+  generalizes (a larger integer, a fallback object).
+- **Emitter.** `infer_int_record_slots`, a pre-pass after the parameter facts:
+  the integer-friendly keys (`infer_int_record_keys`: some load feeds a
+  bitwise operator, `~` or an array index, and none feeds `+ - * / % **`, an
+  ordering compare or unary `-`, since a double consumer of an integer slot
+  pays an `scvtf` and an `fmov` per read), then, per function with layout
+  stores of such keys, the emitter's own numeric analysis
+  (`infer_numeric_analysis`) decides each store: an integer local into an
+  integer-friendly key is an integer-slot store (`INT_SLOT_STORES`, by
+  instruction address), and a key with such a store is an integer record key
+  (`INT_RECORD_KEYS`). `layout_kinds` marks the slots from the stores; a
+  layout with an integer slot keeps its allocation's block open across its
+  stores and tests once that the object is in the layout's shape
+  (`_ts_lkok<id>`; a constructor's adopted layout has `_ts_adopt`), so its
+  integer stores are direct; a `LoadField` into an integer local or an int32
+  use at a single-slot static site of an integer record key reads through the
+  integer helpers. Keys with no integer slot anywhere keep the boxed reads:
+  the generated C of a program without such keys is byte-identical.
+  `TSAOT_INT_RECORD_SLOTS=0` keeps every slot boxed (the parity oracle's
+  environment has it).
+- **Measured** (the kernels, strict; instructions / cycles with the knob off
+  and on, the same runtime): `switch_dispatch` 8.66 / 1.59 G both (no key
+  qualifies: `v` has 24 double consumers against 8 bitwise); `small_calls`
+  15.47 / 1.59 both (its literal has a `?:` initializer, so no layout);
+  `flags_truthy` 7.81 → 7.79 / 0.81 → 0.81 (the `flags` key integer);
+  `object_arrays` 5.263 → 5.263 / 0.65 → 0.64; `ctor_functions` 5.10 → 5.16 /
+  0.65 → 0.66 (a constructor layout's integer store); `obj_literal_poly`
+  4.86 → 4.96 / 0.58 → 0.58. Outputs identical. The representation is in and
+  costs nothing where it is not used; the integer reads save the conversion
+  where the consumers are integer, and the full win of the hand-edited
+  experiment (2.1x on `switch_dispatch`) waits for S2: the integer typing of
+  the values read, so that `visit` returns an integer and `sum` stays one.
+- **Found on the way.** The first version tested the boxed key first in the
+  integer helpers and cost 4-6 instructions per integer read; a version that
+  used the integer helpers for every integer destination, including keys that
+  are never integer slots, cost `small_calls` 45% in cycles (the boxed hit
+  behind a failing tagged compare): the helpers are for integer record keys
+  only. `obj_val_read` replacing every `*obj_val_at` reader had to leave the
+  prototype clone's raw copy alone (same shape, same words), and must not
+  replace itself (a stack overflow in every program). A `-fsanitize=address`
+  build is the quick way to a stack of a runtime crash when lldb hangs.
