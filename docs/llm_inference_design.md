@@ -32,7 +32,7 @@ the matrix products of `garnet:ndarray` vectorize (17.8 GFLOP/s) because
 their inner loop is not a reduction. `Date.now()` returned fractional
 milliseconds (a printed elapsed time showed it); fixed.
 
-## Milestone 2: GGUF and the quantized model (running)
+## Milestone 2: GGUF and the quantized model (Q8_0 done)
 
 `benchmarks/llama2/llama_gguf.ts` reads the file and runs TinyLlama-1.1B-Chat
 Q8_0; garnet and Node give the same answer to the same prompt. Speed so far:
@@ -82,6 +82,44 @@ ArrayBuffer is viewed in place (no copy), later a host `mmap`.
 
 Sampling greedy for the differential test, temperature and top-p after;
 a key/value cache of `context_length` positions per layer in Float32Array.
+
+## Threads: fork workers over a SharedArrayBuffer (done)
+
+`llama_gguf.ts -j N` splits every matrix-vector product of a forward pass
+over N threads: the program itself and N-1 `node:worker_threads` workers.
+Under garnet a worker is a fork of the loaded program (`docs/
+node_compat_design.md`), so the model's 1.17 GB buffer is the parent's
+pages, inherited without a copy or a second load; under Node the same
+source starts real worker threads, each loading the model itself
+(`llamaShared === null` in `workerLoop`), so the differential test covers
+the threaded path too. The protocol is a `SharedArrayBuffer` of eight
+control words: `C_GEN`, the job generation the workers spin on with
+`Atomics.load` (no `Atomics.wait` in the runtime, and a spin is what the
+microsecond-scale jobs want), `C_TENSOR`, `C_ROWS`, `C_COLS` and `C_KIND`
+the job, `C_DONE` the count of finished workers (`Atomics.add`), `C_STOP`
+and `C_WORKERS`. The quantized activation (`xq`, `xs`), the float activation
+`xf` and the output vector live in shared buffers as well; the main thread
+computes row range 0 itself, each worker its range in blocks of four rows
+(the four-row kernel), and the main spins on `C_DONE`. The program is split
+in three modules for this: `llama_core.ts` (reader, model, kernels, pool),
+`llama_gguf.ts` (the program) and `llama_worker.ts` (the worker entry,
+`new Worker(new URL("./llama_worker.mjs", import.meta.url))`), because the
+exporter rejects a class method that captures an enclosing function's local
+once the program is also a worker module.
+
+Measured on the quiet M5 (TinyLlama-1.1B-Chat Q8_0, 32 generated tokens,
+outputs identical to Node in every configuration; `benchmarks/llama2/
+run_gguf.sh [threads]`):
+
+| threads | garnet tok/s | Node tok/s |
+|---|---|---|
+| 1 | 11.0 | 3.3 |
+| 2 | 20.1 | 6.2 |
+| 4 | 33.4 | 10.2 |
+
+The scaling is bounded by memory bandwidth (the Q8_0 weights are read once
+per token: 1.1 GB per token) and by the synchronization of about 150 jobs per
+token; the four performance cores are the useful count.
 
 ## Beyond
 

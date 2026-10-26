@@ -10391,3 +10391,24 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   45/45, conformance 607/607 plain and strict and 604/604 under GC protect,
   GC stress, bench within budget; tsc-ts output identical, instructions
   0.9999 of the previous slice.
+- TinyLlama over fork workers, `-j threads` (Session 353,
+  `docs/llm_inference_design.md` "Threads"). The program is split in
+  `llama_core.ts` (reader, model, kernels, pool), `llama_gguf.ts` (the
+  program) and `llama_worker.ts` (the worker entry), because the exporter
+  rejects a class method that captures an enclosing function's local once the
+  program is also a worker module. `-j N` splits every matrix-vector product
+  over N threads: the main program and N-1 `node:worker_threads` workers, a
+  fork of the loaded program under garnet (the model's buffer inherited, no
+  second load) and a fresh isolate that loads the model itself under Node, so
+  the differential test covers the threaded path; a `SharedArrayBuffer` of
+  control words (the job generation the workers spin on with `Atomics.load`,
+  the tensor, rows, columns and kind, the count of finished workers, stop),
+  the activations and the output vector shared, the main computing row range
+  0 and each worker its range in blocks of four rows. Quiet M5, 32 generated
+  tokens, outputs identical to Node in every configuration: 1 thread 11.0
+  tokens/s (Node 3.3), 2 threads 20.1 (6.2), 4 threads 33.4 (10.2); prompt
+  processing 10.8 / 19.8 / 32.3. `benchmarks/llama2/run_gguf.sh [threads]
+  [steps] [prompt]` fetches the model, builds both sides, compares the outputs
+  and prints the rates. Against llama.cpp (not measured here: the clone was
+  refused by the session's permission mode) the estimate for this machine
+  stays 25-35 tokens/s on one thread and 60-80 on four.
