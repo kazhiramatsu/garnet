@@ -188,3 +188,26 @@ fills an empty local part); the hoisted offset is `ts_ta_off_add(base, k)`,
 0xFFFFFFFF when the sum would not be an index. With the plain loop the port
 ran 132 tokens/s native against Node's 95; the four-accumulator form ran
 58 against 128 before this slice and 160 against 144 after it.
+
+## Hoist reuse across nested loops (Session 353)
+
+A loop hoists, at its entry, the handle, the length and the data pointer of
+every typed-array local its body indexes and never assigns
+(`_tah{local}_{loop}`, `_tal`, `_tad`), guarded by the kind test; the prefix
+loop and the generic accesses of the body use them. An inner loop over the
+same local with the same element kind used to hoist its own copies and run
+the test again at every entry: in the Q8_0 kernel, once per block of 32
+weights for each of its views. The inner loop now reuses the enclosing
+loop's hoist. This adds no assumption: the enclosing hoist already requires
+the local to be unassigned anywhere in the enclosing loop, which contains
+the inner one, so the enclosing loop's variables hold through the inner
+loop; a value that is not a typed array at the enclosing loop's entry leaves
+the handle null and every guard, the inner ones included, takes the generic
+path. `ctx.ta_hoisted` maps a local to (element kind, hoisting loop); the
+hoist emission skips a view the map already holds with the same kind, so the
+map keeps the outer entry through the inner loop; the prefix loop's guards,
+clamps and length bound name the hoisting loop's variables, while the
+offsets `_tao` are the prefix loop's own. A local assigned in the enclosing
+loop (a view rebuilt between the inner loops) has no entry there and the
+inner loop hoists as before. TinyLlama Q8_0 11.0 -> 11.7 tokens/s on one
+thread, outputs identical; fixture `arrays/typed_array_loop_nested`.

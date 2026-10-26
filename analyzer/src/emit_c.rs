@@ -19388,14 +19388,16 @@ fn ta_loop_plan(cond: u32, cond_body: &[Inst], body: &[Inst], ctx: &Ctx, hoisted
 /// access; the general loop then continues from the induction local.
 fn emit_ta_prefix_loop(s: &mut String, plan: &TaLoopPlan, body: &[Inst], ctx: &Ctx, top: u32) {
     let i = plan.ind;
-    let mut guard: Vec<String> = plan.views.iter().map(|(a, _)| format!("_tah{}_{}", a, top)).collect();
+    // the loop id of each view's hoist (an enclosing loop's when reused)
+    let vt = |a: u32| -> u32 { ctx.ta_hoisted.borrow().get(&a).map_or(top, |(_, t)| *t) };
+    let mut guard: Vec<String> = plan.views.iter().map(|(a, _)| format!("_tah{}_{}", a, vt(*a))).collect();
     let end = match plan.bound {
         TaBound::Len(a) => {
             if !plan.views.iter().any(|(v, _)| *v == a) {
-                guard.push(format!("_tah{}_{}", a, top));
+                guard.push(format!("_tah{}_{}", a, vt(a)));
             }
-            guard.push(format!("obj_map_plain(&_tah{a}_{t}->o)->len == 0", a = a, t = top));
-            format!("_tal{}_{}", a, top)
+            guard.push(format!("obj_map_plain(&_tah{a}_{t}->o)->len == 0", a = a, t = vt(a)));
+            format!("_tal{}_{}", a, vt(a))
         }
         TaBound::IntLocal(b) => format!("(d{b} < 0 ? 0u : (d{b} > 4294967295LL ? 4294967295u : (uint32_t)d{b}))", b = b),
         TaBound::NumLocal(b) => format!("ts_ta_bound_u32(d{b})", b = b),
@@ -19415,15 +19417,16 @@ fn emit_ta_prefix_loop(s: &mut String, plan: &TaLoopPlan, body: &[Inst], ctx: &C
         let _ = writeln!(s, "    uint32_t _tao{l}_{t} = {e};", l = l, t = top, e = expr);
     }
     for (a, idx) in &plan.clamps {
+        let tal = format!("_tal{}_{}", a, vt(*a));
         match idx {
             None => {
-                let _ = writeln!(s, "    if (_tal{a}_{t} < _te{t}) _te{t} = _tal{a}_{t};", a = a, t = top);
+                let _ = writeln!(s, "    if ({tal} < _te{t}) _te{t} = {tal};", tal = tal, t = top);
             }
             Some(x) => {
                 let _ = writeln!(
                     s,
-                    "    if (_tal{a}_{t} <= _tao{x}_{t}) _te{t} = 0u; else if (_tal{a}_{t} - _tao{x}_{t} < _te{t}) _te{t} = _tal{a}_{t} - _tao{x}_{t};",
-                    a = a, t = top, x = x
+                    "    if ({tal} <= _tao{x}_{t}) _te{t} = 0u; else if ({tal} - _tao{x}_{t} < _te{t}) _te{t} = {tal} - _tao{x}_{t};",
+                    tal = tal, t = top, x = x
                 );
             }
         }
@@ -19439,17 +19442,16 @@ fn emit_ta_prefix_loop(s: &mut String, plan: &TaLoopPlan, body: &[Inst], ctx: &C
 /// Inside the versioned prefix loop of `top`: the C index expression of `index` when
 /// it is proven below every accessed view's length (the induction local, or an
 /// `i + off` index whose offset was hoisted as `_tao`); None elsewhere.
-fn ta_prefix_index(ctx: &Ctx, top: u32, index: u32) -> Option<String> {
+fn ta_prefix_index(ctx: &Ctx, _view_top: u32, index: u32) -> Option<String> {
+    // inside a prefix body every access is to a view of the plan (the body has no nested
+    // loop), whatever loop hoisted that view
     let p = ctx.ta_prefix.borrow();
     let p = p.as_ref()?;
-    if p.top != top {
-        return None;
-    }
     if index == p.ind {
         return Some(format!("(uint32_t)d{}", index));
     }
     if p.offsets.contains(&index) {
-        return Some(format!("(_tao{}_{} + (uint32_t)d{})", index, top, p.ind));
+        return Some(format!("(_tao{}_{} + (uint32_t)d{})", index, p.top, p.ind));
     }
     None
 }
@@ -25218,6 +25220,14 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             }
             let mut hoist_saved: Vec<(u32, Option<(u8, u32)>)> = Vec::new();
             for (arr, elem) in &hoisted {
+                // an enclosing loop's hoist of the same view with the same element kind is
+                // reused: the local is not assigned anywhere in that loop (the hoist's own
+                // condition), so its handle, length and data pointer still hold here, and
+                // the inner loop (a block of a quantized dot product, say) skips the test
+                let reused = ctx.ta_hoisted.borrow().get(arr).map_or(false, |(ev, _)| *ev == *elem);
+                if reused {
+                    continue;
+                }
                 let _ = writeln!(
                     s,
                     "  ts_typedarray* _tah{a}_{t} = ts_ta_as({v}, {e}); uint32_t _tal{a}_{t} = _tah{a}_{t} ? _tah{a}_{t}->length : 0u; (void)_tal{a}_{t}; uint8_t* _tad{a}_{t} = _tah{a}_{t} ? _tah{a}_{t}->data : NULL; (void)_tad{a}_{t};",

@@ -10412,3 +10412,23 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   and prints the rates. Against llama.cpp (not measured here: the clone was
   refused by the session's permission mode) the estimate for this machine
   stays 25-35 tokens/s on one thread and 60-80 on four.
+- Typed-array hoist reuse across nested loops (Session 353,
+  `docs/typed_array_loops_design.md` "Hoist reuse across nested loops"). A
+  loop hoists the handle, length and data pointer of each typed-array local
+  it indexes and does not assign; an inner loop over the same local with the
+  same element kind re-hoisted and re-tested them at every entry, in the
+  Q8_0 kernel once per block of 32. The inner loop now reuses the enclosing
+  loop's hoist (`ctx.ta_hoisted` names the hoisting loop; the prefix loop's
+  guards, clamps and bound name that loop's variables, the prefix index its
+  own loop's offsets); a local assigned in the enclosing loop has no hoist
+  there and the inner loop hoists as before. TinyLlama Q8_0 11.0 -> 11.7
+  tokens/s on one thread (outputs identical), `lstm_sinwave` 82 ms against
+  Node's 255, `typed_array_loops` unchanged (296 against 285: element-wise
+  loops V8 runs as fast). Fixture `arrays/typed_array_loop_nested` (plain,
+  strict, GC protect): a dot product over rows with offset indices, a sweep
+  with reads beyond the length, a local reassigned between the inner loops,
+  an `any` that is a plain array once and a typed array once, three nested
+  levels. Gates: parity 384 identical, selfconf, unit, bundler 45/45, conformance
+  608/608 plain and strict and 605/605 under GC protect, GC stress, bench
+  within budget; tsc-ts output identical, instructions 1.0011 of the previous
+  slice.
