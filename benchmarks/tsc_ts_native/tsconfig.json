@@ -8,7 +8,6 @@
     "noEmit": true,
     "types": [],
     "paths": {
-      "node:worker_threads": ["./garnet/node_worker_threads.ts"],
       "@scriptc/threads": ["./garnet/scriptc_threads.ts"],
       "@scriptc/types": ["./garnet/scriptc_types.ts"]
     }

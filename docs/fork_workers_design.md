@@ -273,3 +273,14 @@ resident set across the processes at four checkers, against scriptc's
 
 Not done: F4 (parse children), the ASan run, the contention fixture of the
 codec against Node's `structuredClone`.
+
+## Update (Session 353): node:worker_threads over these workers
+
+The shims' `node_worker_threads.ts`, the registered entry (`host.setWorkerEntry`)
+and the benchmark's own host (`host.c`) are gone: `lib/node/worker_threads.ts`
+stands on `ts_worker_start(entry, data, shared)`, where the entry is the
+function the exporter makes of the module `new Worker(...)` names
+(docs/node_compat_design.md, "As built, N5b"). The runtime's additions: a
+per-worker entry, the library's start hook, an exit handler with the exit
+code, `terminate()` (SIGTERM), `ref`/`unref`, the uncaught exception as a
+frame to the parent, and the child dropping the parent's pending loop work.

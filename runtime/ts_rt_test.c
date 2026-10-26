@@ -2022,12 +2022,11 @@ int main(){
   {
     /* a forked worker: the entry sees its data, posts two frames, the loop delivers them */
     tsv entry = ts_make_fn_t(test_worker_entry, NULL, 0, 0); ts_gc_root(&entry);
-    ts_worker_set_entry(entry);
     tsv data = ts_new_object(); ts_gc_root(&data);
     ts_set(data, ts_intern_field("n", 1), ts_num(21));
     ts_set(data, ts_intern_field("s", 1), ts_new_string("from the parent", 15));
     ts_gc_root(&worker_received);
-    int id = ts_worker_fork(data);
+    int id = ts_worker_start(entry, data, 0);
     tsv onm = ts_make_fn_t(test_worker_on_message, NULL, 0, 0); ts_gc_root(&onm);
     tsv one = ts_make_fn_t(test_worker_on_error, NULL, 0, 0); ts_gc_root(&one);
     ts_worker_on_message(id, onm); ts_worker_on_error(id, one);
@@ -2036,13 +2035,12 @@ int main(){
     int ok = ts_is_obj(worker_received) && ts_to_num(ts_get(worker_received, ts_intern_field("n", 1))) == 42
       && ts_is_str(got_s) && ts_str_len_typed(got_s) == 15 && ts_to_num(ts_get(worker_received, ts_intern_field("second", 6))) == 7 && worker_errors == 0;
     CK("worker by fork: the child's two frames arrive in order, no error", ok);
-    /* a child whose entry throws: exit status 1, the error handler, no message */
+    /* a child whose entry throws: the exception as a frame, the error handler, no message */
     worker_received = TS_UNDEFINED;
     tsv bad = ts_make_fn_t(test_worker_throws, NULL, 0, 0); ts_gc_root(&bad);
-    ts_worker_set_entry(bad);
     fflush(stdout); fflush(stderr);
     int saved = dup(2); int devnull = open("/dev/null", 1); dup2(devnull, 2);   /* the child's report goes to stderr */
-    int id2 = ts_worker_fork(data);
+    int id2 = ts_worker_start(bad, data, 0);
     ts_worker_on_message(id2, onm); ts_worker_on_error(id2, one);
     ts_run_event_loop();
     dup2(saved, 2); close(saved); close(devnull);
@@ -2061,13 +2059,12 @@ int main(){
     ts_intern_field("pre", 3); ts_intern_field("ord", 3); ts_intern_field("fn", 2); ts_intern_field("batch", 5); ts_intern_field("k", 1);
     ts_intern_field("inh", 3); ts_intern_field("own", 3); ts_intern_field("child", 5); ts_intern_field("faults", 6);
     tsv entry = ts_make_fn_t(test_shared_entry, NULL, 0, 0); ts_gc_root(&entry);
-    ts_worker_set_entry(entry);
     tsv data = ts_new_object(); ts_gc_root(&data);
     ts_set(data, ts_intern_field("pre", 3), shared_prefork);
     tsv onm = ts_make_fn_t(test_shared_on_message, NULL, 0, 0); ts_gc_root(&onm);
     tsv one = ts_make_fn_t(test_worker_on_error, NULL, 0, 0); ts_gc_root(&one);
     worker_errors = 0; shared_frames = 0;
-    int id = ts_worker_fork_shared(data);
+    int id = ts_worker_start(entry, data, 1);
     ts_worker_on_message(id, onm); ts_worker_on_error(id, one);
     ts_run_event_loop();
     int two = shared_frames == 2 && worker_errors == 0 && ts_is_obj(shared_got_wrap) && ts_is_obj(shared_got_root);
@@ -2110,15 +2107,15 @@ int main(){
     int saved = dup(2); int devnull = open("/dev/null", 1); dup2(devnull, 2);
     setenv("TSAOT_SHARED_REGION_MB", "1", 1);
     tsv over = ts_make_fn_t(test_shared_overflow_entry, NULL, 0, 0); ts_gc_root(&over);
-    ts_worker_set_entry(over); worker_errors = 0;
-    int id2 = ts_worker_fork_shared(data);
+    worker_errors = 0;
+    int id2 = ts_worker_start(over, data, 1);
     ts_worker_on_message(id2, onm); ts_worker_on_error(id2, one);
     ts_run_event_loop();
     unsetenv("TSAOT_SHARED_REGION_MB");
     int overflow_loud = worker_errors == 1;
     tsv intern = ts_make_fn_t(test_shared_intern_entry, NULL, 0, 0); ts_gc_root(&intern);
-    ts_worker_set_entry(intern); worker_errors = 0;
-    int id3 = ts_worker_fork_shared(data);
+    worker_errors = 0;
+    int id3 = ts_worker_start(intern, data, 1);
     ts_worker_on_message(id3, onm); ts_worker_on_error(id3, one);
     ts_run_event_loop();
     dup2(saved, 2); close(saved); close(devnull);
@@ -2136,13 +2133,12 @@ int main(){
     for (int i = 0; i < 40; i++){ char nm[16]; snprintf(nm, sizeof nm, "p%d", i); ts_intern_field(nm, (uint32_t)strlen(nm)); }
     ts_intern_field("text", 4); ts_intern_field("o", 1);
     tsv entry = ts_make_fn_t(test_shared_big_entry, NULL, 0, 0); ts_gc_root(&entry);
-    ts_worker_set_entry(entry);
     tsv data = ts_new_object(); ts_gc_root(&data);
     ts_set(data, ts_intern_field("text", 4), longtext);
     tsv onm = ts_make_fn_t(test_shared_big_on_message, NULL, 0, 0); ts_gc_root(&onm);
     tsv one = ts_make_fn_t(test_worker_on_error, NULL, 0, 0); ts_gc_root(&one);
     worker_errors = 0;
-    int id = ts_worker_fork_shared(data);
+    int id = ts_worker_start(entry, data, 1);
     ts_worker_on_message(id, onm); ts_worker_on_error(id, one);
     ts_run_event_loop();
     int ok = worker_errors == 0 && ts_is_obj(shared_big_got);
@@ -2192,11 +2188,10 @@ int main(){
     /* frames from the parent: three numbers and a stop; the doubled replies arrive in order */
     echo_received = ts_new_array(0); ts_gc_root(&echo_received);
     tsv entry = ts_make_fn_t(test_echo_entry, NULL, 0, 0); ts_gc_root(&entry);
-    ts_worker_set_entry(entry);
     tsv onm = ts_make_fn_t(test_echo_on_message, NULL, 0, 0); ts_gc_root(&onm);
     tsv one = ts_make_fn_t(test_worker_on_error, NULL, 0, 0); ts_gc_root(&one);
     worker_errors = 0;
-    int id = ts_worker_fork(TS_UNDEFINED);
+    int id = ts_worker_start(entry, TS_UNDEFINED, 0);
     ts_worker_on_message(id, onm); ts_worker_on_error(id, one);
     ts_worker_send(id, ts_num(1)); ts_worker_send(id, ts_num(2)); ts_worker_send(id, ts_num(3));
     tsv stop = ts_new_object(); ts_gc_root(&stop); ts_set(stop, ts_intern_field("stop", 4), ts_bool(1));

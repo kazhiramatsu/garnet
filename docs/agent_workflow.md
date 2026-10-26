@@ -336,6 +336,15 @@ Two tools that look right are wrong on garnet's binaries, and one works:
 5. Depending on the kind of change, run `scripts/gate.sh conf all` + unit (+ gc / bundler / selfconf / emitc_diff).
 6. Append a session note to the end of `docs/TODO.md`. Commit on the user's instruction (English, with a `Verified:` line).
 
+### Gotcha: a test that forks runs under a process cap and a time limit
+
+A program with workers (`node:worker_threads`, the fork workers) can fork
+without end when a binding is wrong (a child that believes it is the main
+thread starts the program again: 4,000 processes in ten minutes once). Run such
+a `dt`/`mf` under `ulimit -u $(( $(ps -u $(id -u) | wc -l) + 150 ))` and
+`perl -e 'alarm 400; exec @ARGV' -- bash -c '...'` (macOS has no `timeout`),
+and `killall -9 dt` after a failure.
+
 ### Gotcha: measure tsc-ts with `TSAOT_CPUS=1`
 
 Since the benchmark runs on lib/node, `os.availableParallelism()` reports the

@@ -10034,3 +10034,24 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   leading BOM as Node does (a silent deviation before). Known: 2.1% remains
   in the parse workers (publish_visit, stack scan, remembered set; no lib
   function above a few samples); worker_threads (N5b) is still the shim.
+- Node compatibility N5b (`docs/node_compat_design.md`, "As built, N5b"):
+  `node:worker_threads` over the fork workers. `new Worker(spec)` names a
+  module statically (`import.meta.url`, `new URL("./w.js", import.meta.url)`,
+  `fileURLToPath` of those; a path string is a compile-time error naming the
+  forms); the exporter rewrites the named module's source for the compiler
+  (imports and types stay, the rest becomes `export function
+  __garnet_worker_<n>`, called at the module's place when it is in the graph,
+  and the site passes the function); the child runs the library's start hook
+  (live `isMainThread`/`threadId`/`workerData`/`parentPort`) then the entry.
+  Runtime: `ts_worker_start(entry, data, shared)`, an exit handler with the
+  exit code, `terminate()` (SIGTERM, 1), `ref`/`unref`, the uncaught
+  exception as a frame (the parent's 'error' with the error's kind, then
+  'exit' 1; the child prints nothing), the child drops the parent's pending
+  loop work and runs no exit hooks. tsc-ts's driver is a Node program now
+  (`isMainThread` branch, `shared: true` for parse threads: garnet's option);
+  the worker shim, `host.c`/`host.h`/`host.ts` and the build's host injection
+  are gone. Output identical to N5a, instructions 1.0002 (one CPU).
+  Fixtures: `node/worker_threads` (plain + strict), bundler `worker_module`
+  and `worker_dynamic` (reject). Lesson recorded in agent_workflow: a test
+  that forks runs under a process cap and a time limit (a wrong
+  `isMainThread` forked 4,000 processes).

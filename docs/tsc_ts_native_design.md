@@ -140,3 +140,12 @@ library's (`lib/node`, `docs/node_compat_design.md`), and `process`/`Buffer`
 come from the prelude the exporter generates. `host.c` stays for the worker
 shim. The measured configuration is one CPU (`TSAOT_CPUS=1` in the run and in
 the PGO training command), the shims' former `availableParallelism() === 1`.
+
+## Update (Session 353): the driver is a Node program
+
+Since Node compatibility N5b `node:worker_threads` is the library's too: the
+driver `garnet/main.ts` branches on `isMainThread` and starts its threads with
+`new Worker(new URL(import.meta.url), { workerData, shared })`; only the
+`@scriptc/*` modules remain shims, and the build has no host of its own
+(`host.c`, `host.h`, `garnet/host.ts` are gone; the generated `main` is the
+runtime's). Instructions within noise of N5a (1.0002).

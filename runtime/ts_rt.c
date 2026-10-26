@@ -3785,6 +3785,7 @@ static int nh_next_timer_timeout_ms(int limit);
 static void nh_sleep_ms(int ms);
 static void nh_mark_loop_roots(int young);
 static void nh_wait(int timeout_ms);
+static void nh_fork_child_reset(void);
 void ts_global_this_init(void){
   if (g_global_this_v != TS_UNDEFINED) return;
   static int rooted = 0;
@@ -18805,6 +18806,7 @@ static void drain_microtasks(void){
 #include <errno.h>
 #include <poll.h>
 #include <sys/wait.h>
+#include <signal.h>
 #include <sys/resource.h>
 
 /* ---- Published graphs (garnet:shared; docs/published_graphs_design.md) ----
@@ -19343,7 +19345,8 @@ tsv ts_message_roundtrip(tsv v){
 
 typedef struct ts_watch { int id; pid_t pid; int fd; uint8_t* buf; size_t len, cap; int messages; struct ts_watch* next;
                           uint32_t region_lo, region_hi;   /* a shared worker's blocks, else 0 */
-                          int out_fd; } ts_watch;           /* the parent's end of the pipe to the worker */
+                          int out_fd;                       /* the parent's end of the pipe to the worker */
+                          int unref, terminated; } ts_watch; /* unref: not keeping the loop alive; terminated: by terminate() */
 /* A worker's side of the parent's frames: the read end, the listener, and
    whether the port is open (a registered listener keeps the loop alive). */
 static int g_parent_fd = -1, g_parent_watching = 0;
@@ -19351,10 +19354,14 @@ static tsv g_parent_handler = TS_UNDEFINED; static int g_parent_handler_rooted =
 static uint8_t* g_parent_buf = NULL; static size_t g_parent_len = 0, g_parent_cap = 0;
 static ts_watch* g_watches = NULL;
 static int g_watch_ids = 0;
-static tsv g_watch_handlers = TS_UNDEFINED;     /* [2 id] the message handler, [2 id + 1] the error handler */
+static tsv g_watch_handlers = TS_UNDEFINED;     /* [3 id] the message handler, [3 id + 1] the error handler, [3 id + 2] the exit handler */
 static int g_watch_handlers_rooted = 0;
-static tsv g_worker_entry = TS_UNDEFINED, g_worker_data = TS_UNDEFINED;
-static int g_worker_entry_rooted = 0, g_worker_data_rooted = 0;
+static tsv g_worker_data = TS_UNDEFINED;
+static int g_thread_id = 0;                     /* a worker's id in its parent; 0 in the main thread */
+/* the library's start hook: the child calls it with (entry, data, id) instead of the entry, so
+   node:worker_threads makes its bindings the worker's first (set in the parent, inherited) */
+static tsv g_worker_start = TS_UNDEFINED; static int g_worker_start_rooted = 0;
+static int g_worker_data_rooted = 0;
 static int g_is_worker = 0, g_worker_fd = -1;
 static msg_enc g_post_enc;                       /* the child's frame buffer, reused across posts */
 
@@ -19362,11 +19369,19 @@ static tsv watch_handlers(void){
   if (ts_is_undef(g_watch_handlers)){ g_watch_handlers = ts_new_array(0); ts_root_static_once(&g_watch_handlers, &g_watch_handlers_rooted); }
   return g_watch_handlers;
 }
-void ts_worker_set_entry(tsv fn){ g_worker_entry = fn; ts_root_static_once(&g_worker_entry, &g_worker_entry_rooted); }
 int ts_worker_is_worker(void){ return g_is_worker; }
+int ts_worker_thread_id(void){ return g_thread_id; }
+void ts_worker_set_start(tsv fn){ g_worker_start = fn; ts_root_static_once(&g_worker_start, &g_worker_start_rooted); }
 tsv ts_worker_data(void){ return g_worker_data; }
-void ts_worker_on_message(int id, tsv fn){ ts_array_set(watch_handlers(), (uint32_t)id * 2u, fn); }
-void ts_worker_on_error(int id, tsv fn){ ts_array_set(watch_handlers(), (uint32_t)id * 2u + 1u, fn); }
+void ts_worker_on_message(int id, tsv fn){ ts_array_set(watch_handlers(), (uint32_t)id * 3u, fn); }
+void ts_worker_on_error(int id, tsv fn){ ts_array_set(watch_handlers(), (uint32_t)id * 3u + 1u, fn); }
+void ts_worker_on_exit(int id, tsv fn){ ts_array_set(watch_handlers(), (uint32_t)id * 3u + 2u, fn); }
+static ts_watch* watch_by_id(int id){ ts_watch* w = g_watches; while (w && w->id != id) w = w->next; return w; }
+/* terminate(): SIGTERM; the worker's end then reaches the exit handler with code 1 and no error */
+void ts_worker_kill(int id){ ts_watch* w = watch_by_id(id); if (!w) return; w->terminated = 1; kill(w->pid, SIGTERM); }
+void ts_worker_ref(int id, int on){ ts_watch* w = watch_by_id(id); if (w) w->unref = !on; }
+/* a live worker keeps the parent's loop alive unless unref()'d */
+static int ts_watches_refd(void){ for (ts_watch* w = g_watches; w; w = w->next) if (!w->unref) return 1; return 0; }
 static void msg_write_all(int fd, const void* p, size_t n){
   const uint8_t* q = (const uint8_t*)p;
   while (n){
@@ -19403,6 +19418,58 @@ static void watch_call(tsv fn, tsv arg){
   tsv args[1] = { arg };
   ts_call(fn, args, 1);
 }
+/* A worker's uncaught exception goes to the parent as a frame: [1, name, message, stack] for an
+   object with a message (an Error), [0, the value] otherwise; the parent makes the 'error'
+   from it. The plain codec carries it (strings and primitives: no shape or reference). */
+#define MSG_FRAME_ERROR 0xFDu
+static void worker_post_error(tsv exc){
+  if (g_worker_fd < 0) return;
+  ts_gc_root(&exc);
+  tsv arr = ts_new_array(0); ts_gc_root(&arr);
+  tsv msg = ts_is_obj(exc) ? ts_get(exc, ts_intern_field("message", 7)) : TS_UNDEFINED;
+  if (ts_is_obj(exc) && ts_is_str(msg)){
+    ts_array_push(arr, ts_num(1));
+    tsv name = ts_get(exc, ts_intern_field("name", 4));
+    ts_array_push(arr, ts_is_str(name) ? name : TS_UNDEFINED);
+    ts_array_push(arr, msg);
+    tsv stack = ts_get(exc, ts_intern_field("stack", 5));
+    ts_array_push(arr, ts_is_str(stack) ? stack : TS_UNDEFINED);
+  } else {
+    ts_array_push(arr, ts_num(0));
+    ts_array_push(arr, ts_is_obj(exc) || ts_is_func(exc) ? ts_to_string_v(exc) : exc);
+  }
+  msg_enc e; memset(&e, 0, sizeof e);
+  msg_put_u8(&e, MSG_FRAME_ERROR);
+  msg_encode(&e, arr);
+  ts_gc_unroot(2);
+  uint32_t len = (uint32_t)e.len;
+  msg_write_all(g_worker_fd, &len, 4);
+  msg_write_all(g_worker_fd, e.p, e.len);
+  free(e.p); free((void*)e.seen);
+}
+static tsv worker_error_from_frame(const uint8_t* p, uint32_t len){
+  tsv arr = msg_decode_frame(p, len);
+  if (!ts_is_array(arr) || ts_array_len(arr) < 2) return arr;
+  ts_gc_root(&arr);
+  tsv r;
+  if (ts_to_num(ts_array_get(arr, 0)) == 1 && ts_array_len(arr) >= 4){
+    tsv name = ts_array_get(arr, 1), msg = ts_array_get(arr, 2), stack = ts_array_get(arr, 3);
+    int kind = TS_ERR_ERROR, standard = 1;
+    uint32_t n = 0; char* u = ts_is_str(name) ? ts_string_cstr_copy(name, &n) : NULL;
+    if (u && n == 9 && memcmp(u, "TypeError", 9) == 0) kind = TS_ERR_TYPE;
+    else if (u && n == 10 && memcmp(u, "RangeError", 10) == 0) kind = TS_ERR_RANGE;
+    else if (u && n == 11 && memcmp(u, "SyntaxError", 11) == 0) kind = TS_ERR_SYNTAX;
+    else if (u && n == 14 && memcmp(u, "ReferenceError", 14) == 0) kind = TS_ERR_REFERENCE;
+    else if (u && !(n == 5 && memcmp(u, "Error", 5) == 0)) standard = 0;
+    free(u);
+    r = ts_new_error(kind, msg); ts_gc_root(&r);
+    if (!standard) ts_set_cstr(r, "name", name);
+    if (ts_is_str(stack)) ts_set_cstr(r, "stack", stack);
+    ts_gc_unroot(1);
+  } else r = ts_array_get(arr, 1);
+  ts_gc_unroot(1);
+  return r;
+}
 /* the child ended: reap it; a death or a nonzero exit goes to the error handler */
 static void watch_close(ts_watch* w){
   ts_watch** pp = &g_watches;
@@ -19411,7 +19478,8 @@ static void watch_close(ts_watch* w){
   close(w->fd); close(w->out_fd);
   int status = 0;
   if (waitpid(w->pid, &status, 0) != w->pid) status = 0;
-  int failed = WIFSIGNALED(status) || (WIFEXITED(status) && WEXITSTATUS(status) != 0);
+  int code = WIFEXITED(status) ? WEXITSTATUS(status) : 1;   /* a signal death is 1, as a terminate()d worker's in Node */
+  int died = WIFSIGNALED(status) && !w->terminated;
   int id = w->id;
   if (w->region_hi){
     if (publish_protect_on() &&
@@ -19422,15 +19490,15 @@ static void watch_close(ts_watch* w){
     }
   }
   free(w->buf); free(w);
-  if (failed){
+  if (died){
     char buf[128];
-    if (WIFSIGNALED(status)) snprintf(buf, sizeof buf, "worker %d died of signal %d", id, WTERMSIG(status));
-    else snprintf(buf, sizeof buf, "worker %d exited with status %d", id, WEXITSTATUS(status));
+    snprintf(buf, sizeof buf, "worker %d died of signal %d", id, WTERMSIG(status));
     tsv msg = ts_new_string(buf, (uint32_t)strlen(buf)); ts_gc_root(&msg);
     tsv err = ts_new_error(TS_ERR_ERROR, msg); ts_gc_root(&err);
-    watch_call(ts_array_get(watch_handlers(), (uint32_t)id * 2u + 1u), err);
+    watch_call(ts_array_get(watch_handlers(), (uint32_t)id * 3u + 1u), err);
     ts_gc_unroot(2);
   }
+  watch_call(ts_array_get(watch_handlers(), (uint32_t)id * 3u + 2u), ts_num((double)code));
 }
 static void watch_read(ts_watch* w){
   uint8_t tmp[65536];
@@ -19448,8 +19516,11 @@ static void watch_read(ts_watch* w){
   while (w->len >= 4){
     uint32_t len; memcpy(&len, w->buf, 4);
     if (w->len < 4u + len) break;
-    tsv v;
-    if (len && w->buf[4] == MSG_FRAME_SHARED){
+    tsv v; int is_error = 0;
+    if (len && w->buf[4] == MSG_FRAME_ERROR){
+      is_error = 1;
+      v = worker_error_from_frame(w->buf + 5, len - 1u);
+    } else if (len && w->buf[4] == MSG_FRAME_SHARED){
       if (!w->region_hi) ts_abort_msg("a shared frame from a worker without a region");
       msg_dec d = { w->buf + 5, len - 1u, 0, TS_UNDEFINED, w->region_lo, w->region_hi };
       uint32_t nshapes = msg_get_u32(&d);
@@ -19480,7 +19551,7 @@ static void watch_read(ts_watch* w){
     w->messages++;
     size_t rest = w->len - 4u - len;
     memmove(w->buf, w->buf + 4u + len, rest); w->len = rest;
-    watch_call(ts_array_get(watch_handlers(), (uint32_t)w->id * 2u), v);   /* may fork another worker */
+    watch_call(ts_array_get(watch_handlers(), (uint32_t)w->id * 3u + (is_error ? 1u : 0u)), v);   /* may fork another worker */
     ts_gc_unroot(1);
   }
 }
@@ -19552,7 +19623,7 @@ static uint32_t env_u32(const char* name, uint32_t dflt){
   unsigned long v = strtoul(s, NULL, 10);
   return v ? (uint32_t)v : dflt;
 }
-static int ts_worker_fork_ex(tsv data, int shared);
+static int ts_worker_fork_ex(tsv entry, tsv data, int shared);
 /* TSAOT_PUBLISH_PROTECT=1 (a check mode): the regions a process only reads
    are mapped read-only in it, so a write by a reader faults instead of
    reaching the other processes (the parent at a shared worker's exit, a
@@ -19573,8 +19644,7 @@ static void region_protect_all(void){
     bi = e;
   }
 }
-int ts_worker_fork(tsv data){ return ts_worker_fork_ex(data, 0); }
-int ts_worker_fork_shared(tsv data){ return ts_worker_fork_ex(data, 1); }
+int ts_worker_start(tsv entry, tsv data, int shared){ return ts_worker_fork_ex(entry, data, shared); }
 /* TSAOT_FORK_TRACE=1: the cost of each fork on stderr (the parent's young
    collection, its setup, fork() itself, and the child's time from the fork to
    its entry), on the system clock both processes share. */
@@ -19585,10 +19655,10 @@ static int fork_trace_on(void){
 }
 static double fork_trace_now_ms(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6; }
 static double g_fork_trace_forked_at = 0;   /* the parent's clock just before fork(), inherited by the child */
-static int ts_worker_fork_ex(tsv data, int shared){
-  if (!ts_is_func(g_worker_entry)) ts_throw_type_error_msg("Worker: no worker entry is registered");
+static int ts_worker_fork_ex(tsv entry, tsv data, int shared){
+  if (!ts_is_func(entry)) ts_throw_type_error_msg("Worker: the entry is not a function of the program");
   if (shared && g_region_mode) ts_throw_type_error_msg("Worker: a shared worker cannot fork a shared worker");
-  ts_gc_root(&data);
+  ts_gc_root(&data); ts_gc_root(&entry);
   fflush(stdout); fflush(stderr);
   int ftrace = fork_trace_on();
   double ft0 = ftrace ? fork_trace_now_ms() : 0, ft1 = ft0, ft2 = ft0;
@@ -19632,6 +19702,7 @@ static int ts_worker_fork_ex(tsv data, int shared){
   if (pipe(fds) != 0) ts_throw_type_error_msg("Worker: pipe failed");
   if (pipe(in) != 0){ close(fds[0]); close(fds[1]); ts_throw_type_error_msg("Worker: pipe failed"); }
   if (ftrace){ ft2 = fork_trace_now_ms(); g_fork_trace_forked_at = ft2; }
+  int id = ++g_watch_ids;
   pid_t pid = fork();
   if (pid < 0){ close(fds[0]); close(fds[1]); close(in[0]); close(in[1]); ts_throw_type_error_msg("Worker: fork failed"); }
   if (ftrace && pid > 0){
@@ -19661,7 +19732,8 @@ static int ts_worker_fork_ex(tsv data, int shared){
     g_watches = NULL;
     g_mq_len = 0;
     g_io_head = g_io_tail = g_io_active = NULL;
-    g_is_worker = 1; g_worker_fd = fds[1];
+    g_is_worker = 1; g_worker_fd = fds[1]; g_thread_id = id;
+    nh_fork_child_reset();   /* the parent's timers, ticks, immediates, watched fds and children are the parent's */
     prof_pc_fork_child();
     g_worker_data = data; ts_root_static_once(&g_worker_data, &g_worker_data_rooted);
     /* young collections only: a full one would mark every pre-fork cell and
@@ -19674,15 +19746,13 @@ static int ts_worker_fork_ex(tsv data, int shared){
       ts_gc_set_root_depth(h->gc_root_len);
       ts_frame_restore(h->frame_top);
       ts_eh_pop();
-      tsv text = ts_to_string_v(ts_current_exception());
-      uint32_t n = 0; char* u = ts_string_cstr_copy(text, &n);
-      fflush(stdout);
-      fprintf(stderr, "garnet worker: uncaught exception: %.*s\n", (int)n, u ? u : "");
-      free(u); fflush(stderr);
+      /* the parent's 'error' (then its 'exit' with 1), as a Node worker's uncaught exception */
+      worker_post_error(ts_current_exception());
+      fflush(stdout); fflush(stderr);
       _exit(1);
     }
-    tsv args[1] = { data };
-    ts_call(g_worker_entry, args, 1);
+    if (ts_is_func(g_worker_start)){ tsv args[3] = { entry, data, ts_num((double)id) }; ts_call(g_worker_start, args, 3); }
+    else { tsv args[1] = { data }; ts_call(entry, args, 1); }
     ts_run_event_loop();
     ts_eh_pop();
     if (ftrace) fprintf(stderr, "[fork child] %d: exit %.2f ms after the fork, region used %u MB, young collections %llu\n", (int)getpid(),
@@ -19693,11 +19763,11 @@ static int ts_worker_fork_ex(tsv data, int shared){
     _exit(0);
   }
   close(fds[1]);
-  ts_gc_unroot(1);
+  ts_gc_unroot(2);
   ts_watch* w = (ts_watch*)calloc(1, sizeof *w);
   if (!w) ts_abort_msg("out of memory starting a worker");
   close(in[0]);
-  w->id = ++g_watch_ids; w->pid = pid; w->fd = fds[0]; w->out_fd = in[1]; w->next = g_watches; g_watches = w;
+  w->id = id; w->pid = pid; w->fd = fds[0]; w->out_fd = in[1]; w->next = g_watches; g_watches = w;
   w->region_lo = region_lo; w->region_hi = region_hi;
   return w->id;
 }
@@ -19721,7 +19791,7 @@ void ts_run_event_loop(void){
     if (g_io_active) (void)ts_io_poll_active();  /* completes ready I/O tasks */
     nh_immediates_run();
     int io_pending = g_io_head || g_io_active;
-    if (nh_loop_alive() || io_pending || g_watches || g_parent_watching || g_mq_len || nh_immediates_pending()){
+    if (nh_loop_alive() || io_pending || ts_watches_refd() || g_parent_watching || g_mq_len || nh_immediates_pending()){
       if (g_mq_len || nh_immediates_pending()) continue;   /* runnable work: no waiting */
       /* wait for the next event: the earliest timer, else the watches' or the abort timers' turn */
       int timeout = nh_next_timer_timeout_ms(io_pending ? 0 : 1000);
@@ -19730,7 +19800,8 @@ void ts_run_event_loop(void){
       continue;
     }
     /* nothing keeps the loop alive: 'beforeExit' may schedule more */
-    if (nh_run_exit_hook_phase(0) && (nh_loop_alive() || g_io_head || g_mq_len || nh_immediates_pending())) continue;
+    if (g_is_worker) break;   /* a worker's end runs no process exit hooks: the listeners are the parent's copies */
+    if (nh_run_exit_hook_phase(0) && (nh_loop_alive() || g_io_head || g_mq_len || nh_immediates_pending() || ts_watches_refd())) continue;
     nh_run_exit_hook_phase(1);
     break;
   }

@@ -66,7 +66,7 @@ program references one of those names as an ambient global or imports a
 
 Included at the end of `ts_rt.c` (one translation unit, so the build scripts
 are unchanged) and exposed as `__garnet_node`. It is the generalization of
-`benchmarks/tsc_ts_native/host.c`, which stays as the tsc-ts build's host
+`benchmarks/tsc_ts_native/host.c`, which stayed as the tsc-ts build's host until N5b
 until the tsc-ts shims migrate onto `lib/node` (slice N5, the flagship
 validation of this layer). The primitives, by family:
 
@@ -402,60 +402,74 @@ stress, bench); the tsc-ts benchmark is unaffected until N5.
   14-number array `host.stat` returns per call and the directory listing's
   arrays. `util.inherits` with a garnet class's prototype is a TypeError.
 
-## Design, N5b: worker_threads over the fork workers
+## As built, N5b (Session 353): worker_threads over the fork workers
 
 Node runs a worker's file in a fresh isolate; garnet's workers are forked
 processes of the initialized program (docs/fork_workers_design.md): fast to
 start, sharing everything copy-on-write, exchanging messages over pipes.
-`node:worker_threads` maps onto them as follows. (tsc-ts's own sources do not
-use worker threads; the benchmark driver `benchmarks/tsc_ts_native/garnet/
-main.ts` does, today through the shim's `enterWorker` and a registered entry;
-with this slice it is written as a Node program would be: the file branches
-on `isMainThread`.)
+`node:worker_threads` (`lib/node/worker_threads.ts`) maps onto them:
 
-- `new Worker(spec, { workerData, argv, env })`: `spec` must name a module of
-  the program statically: a string literal, `__filename`, `import.meta.url`,
-  `new URL("./w.ts", import.meta.url)` or `path.join(__dirname, "w.js")`
-  (`.js` resolves to the `.ts`). The exporter adds the module as an entry
-  (its graph is compiled) and lowers the call to the host's `spawnWorker(
-  module index, options)`. Anything else is a compile-time reject.
-- The child: the fork sets `isMainThread` false, `threadId`, `workerData`
-  and `parentPort`, then runs the named module's initializer again (each
-  module's top-level code is a function the emitter can call by index).
-  For the `new Worker(__filename)` pattern that initializer already ran in
-  the parent: running it again in the child is what Node's fresh run of the
-  file observes (the `isMainThread` branch), with module-level state copied
-  from the parent rather than fresh. A program cannot easily tell the two
-  apart; the difference is documented. A module reached only as a worker
-  entry runs no init in the main process.
-- Messages: `postMessage` is the existing structured copy over the pipe
-  (objects, arrays, strings, numbers, booleans, null/undefined, typed
-  arrays, Date, Map, Set, errors by name/message); `transferList` is
-  accepted and ignored (a copy). `SharedArrayBuffer` is not shared across a
-  fork: a message carrying one is a TypeError.
-- Shared workers: a parse thread of tsc-ts publishes bound files to the
-  main thread by reference (`garnet:shared`, docs/published_graphs_design.md),
-  which needs the child forked into a region mapped shared before the fork.
-  Node has no such notion, so it is garnet's option on the constructor:
-  `new Worker(file, { workerData, shared: true })` forks with
-  `ts_worker_fork_shared`; Node ignores the unknown key, so the driver stays
-  runnable under Node. Checkers stay plain forks (a shared fork costs a
-  young collection, a 512 MB region and the parent's full collections
-  deferred while it lives).
-- `parentPort`: `postMessage`, `on/once('message')`, `close`, `ref/unref`
-  (a referenced port keeps the child alive). `MessageChannel`/`MessagePort`
-  exist within one thread (two queues delivering on the loop); transferring
-  a port to a worker is a TypeError.
-- `worker.on('message'|'error'|'exit'|'online')`, `terminate()` (SIGTERM,
-  'exit' with 1), `threadId`, `ref/unref` (an unreferenced worker does not
-  keep the parent alive), `worker.stdout/stderr` inherited (the `stdout:
-  true` option is a TypeError for now). An uncaught exception in the child
-  reaches the parent as 'error' then 'exit' (1); `process.exit(code)` in the
-  child ends the child only, the parent sees 'exit' with the code.
-- `SHARE_ENV`, `setEnvironmentData/getEnvironmentData`, `BroadcastChannel`,
-  `receiveMessageOnPort`, `resourceLimits`, `markAsUntransferable`: later.
-- Done when: the benchmark's worker_threads shim and `host.c`'s worker
-  methods are gone, the driver is a Node-shaped file, output identical and
-  instructions within noise of N5a; fixtures under `node/` for a worker
-  round trip, an error in a worker, `terminate`, and `shared: true` with a
-  published graph.
+- `new Worker(spec, options)`: `spec` names a module of the program statically:
+  `import.meta.url`, `new URL(import.meta.url)`, `new URL("./w.js",
+  import.meta.url)` (`.js`/`.mjs` resolve to the `.ts`), or `fileURLToPath` of
+  one of those. A path string is relative to the working directory in Node,
+  which the compiler does not know: a compile-time error names the forms.
+  The exporter (`programWithWorkerEntries`) rewrites the named module's
+  source for the compiler (the checker sees the rewritten text at the same
+  path): its imports and type declarations stay at the top level, its other
+  statements become the body of an exported function `__garnet_worker_<n>`,
+  called once at the module's place when the module is part of the program's
+  graph (a module only a worker runs is not called), and each `new Worker`
+  site passes that function in the file's place (a site in another module
+  imports it). Node's `isMainThread` pattern therefore runs the file's top
+  level again in the child, as Node does, with the module-level state of the
+  parent at the fork rather than fresh (a program cannot easily tell the two
+  apart; `process.pid` is the process's in both, as a Node worker's is). A
+  module run as a worker cannot export values of its own or await at its top
+  level (compile-time errors); its functions are closures of the entry.
+- The child: `ts_worker_start(entry, data, shared)` forks; the child calls the
+  library's start hook (`host.setWorkerStart`), which makes `isMainThread`,
+  `threadId`, `workerData` and `parentPort` the worker's (live `let`
+  bindings: the module's values are the parent's at the fork) and then runs
+  the entry; the event loop follows. The child drops the parent's pending
+  timers, immediates, ticks, watched fds and child processes
+  (`nh_fork_child_reset`), and runs no process exit hooks at its end (the
+  `process` listeners are the parent's copies).
+- Messages: structured copies over the pipe (objects, arrays, strings,
+  numbers, booleans, null/undefined, typed arrays, Date, Map, Set);
+  `transferList` is accepted and ignored. An uncaught exception in the
+  worker is a frame to the parent (`[1, name, message, stack]`, the error
+  rebuilt with its standard kind, so `instanceof RangeError` holds) and the
+  parent's 'error', then 'exit' with 1; nothing is printed by the child, as
+  Node prints nothing when the parent listens. `process.exit(code)` in the
+  worker ends the worker only; the parent sees 'exit' with the code.
+- Events and methods: 'online' (a tick after construction), 'message',
+  'error', 'exit'; `postMessage`, `terminate()` (SIGTERM; 'exit' with 1, no
+  'error'; the promise resolves after the event), `ref`/`unref` (an
+  unreferenced worker does not keep the parent's loop alive), `threadId`.
+  `parentPort`: `on/once('message')` starts delivery and keeps the worker
+  alive until `close()`; `postMessage`; `ref`/`unref` are no-ops.
+- Shared workers: a parse thread of tsc-ts publishes bound files to the main
+  thread by reference (`garnet:shared`), which needs the child forked into a
+  region mapped shared before the fork. Node has no such notion, so it is
+  garnet's option on the constructor: `new Worker(file, { workerData,
+  shared: true })`; Node ignores the key, so the driver stays runnable under
+  Node. Checkers stay plain forks.
+- Not available (a TypeError that says so): `MessageChannel`, `MessagePort`
+  of one's own, `BroadcastChannel`, `receiveMessageOnPort`,
+  `moveMessagePortToContext`, `postMessageToThread`, `eval: true`, piped
+  stdio (`stdout`/`stderr`/`stdin: true`), an `env` or `argv` of the worker's
+  own. `getEnvironmentData`/`setEnvironmentData` are a Map the fork copies.
+- tsc-ts: the benchmark driver (`benchmarks/tsc_ts_native/garnet/main.ts`) is
+  a Node program now (`if (!isMainThread) runThread(workerData, drivers)`,
+  `new Worker(new URL(import.meta.url), { workerData, shared: kind ===
+  'parse' })`); the worker shim, the driver's own host (`host.c`, `host.ts`)
+  and the build's host injection are gone. Output identical to N5a,
+  instructions 1.0002 against it (one CPU; 1.0006 on an earlier build of the same sources). Fixtures `node/worker_threads`
+  (the self pattern: data, replies, an uncaught RangeError as 'error' then
+  'exit' 1, terminate), bundler `worker_module` (a worker in a module of its
+  own with a helper only it imports).
+- Lesson: a defect in the worker's bindings (`isMainThread` inherited as true)
+  made every child run the main program and fork again: 4,000 processes in
+  ten minutes. A test that forks runs under a process cap and a time limit
+  (`ulimit -u`, `perl -e 'alarm N'`; docs/agent_workflow.md).

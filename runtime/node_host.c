@@ -1335,6 +1335,17 @@ static void nh_wait(int timeout_ms){
   nh_fdwatches_prune();
   if (g_nh_pending_children) nh_reap_children();
 }
+/* A forked worker starts with none of the parent's pending work (Node: a fresh isolate):
+   the timers, immediates, ticks, watched fds and child processes are the parent's. The
+   records are the child's copies of the parent's heap, left as they are. */
+static void nh_fork_child_reset(void){
+  g_nh_timers = NULL; g_nh_refed_timers = 0;
+  g_nh_imm_head = g_nh_imm_tail = NULL; g_nh_refed_immediates = 0;
+  g_nh_tick_head = g_nh_tick_tail = NULL;
+  g_nh_fdwatches = NULL; g_nh_active_fdwatches = 0;
+  g_nh_children = NULL; g_nh_pending_children = 0;
+  if (g_nh_sigchld_pipe[0] >= 0){ close(g_nh_sigchld_pipe[0]); close(g_nh_sigchld_pipe[1]); g_nh_sigchld_pipe[0] = g_nh_sigchld_pipe[1] = -1; }
+}
 static int nh_io_alive(void){ return g_nh_active_fdwatches > 0 || g_nh_pending_children > 0; }
 static void nh_mark_io_roots(int young){
   for (nh_fdwatch* w = g_nh_fdwatches; w; w = w->next){ gc_visit_slot(&w->on_data, young, 0, 1); gc_visit_slot(&w->on_end, young, 0, 1); }
@@ -1345,6 +1356,28 @@ static void nh_mark_io_roots(int young){
    that reaches a registered class with struct fields, or an object that is a class instance
    or a class prototype, is refused (TypeError): the typed-slow flag is never raised, and the
    closed-receivers proof has no site to count here. */
+/* node:worker_threads (docs/node_compat_design.md, N5b): the workers are forks of the
+   initialized program running an entry function of it, the one the exporter made of the
+   worker's module (docs/fork_workers_design.md). */
+static tsv nh_set_worker_start(tsv* a, int n){ ts_worker_set_start(nh_arg(a, n, 0)); return TS_UNDEFINED; }
+static tsv nh_is_worker(tsv* a, int n){ (void)a; (void)n; return ts_bool(ts_worker_is_worker()); }
+static tsv nh_thread_id(tsv* a, int n){ (void)a; (void)n; return ts_num((double)ts_worker_thread_id()); }
+static tsv nh_worker_data(tsv* a, int n){ (void)a; (void)n; return ts_worker_data(); }
+static tsv nh_spawn_worker(tsv* a, int n){
+  tsv entry = nh_arg(a, n, 0), data = nh_arg(a, n, 1);
+  int shared = ts_truthy(nh_arg(a, n, 2));
+  int id = ts_worker_start(entry, data, shared);
+  ts_worker_on_message(id, nh_arg(a, n, 3));
+  ts_worker_on_error(id, nh_arg(a, n, 4));
+  ts_worker_on_exit(id, nh_arg(a, n, 5));
+  return ts_num((double)id);
+}
+static tsv nh_send_to_worker(tsv* a, int n){ ts_worker_send((int)nh_num(a, n, 0, 0), nh_arg(a, n, 1)); return TS_UNDEFINED; }
+static tsv nh_kill_worker(tsv* a, int n){ ts_worker_kill((int)nh_num(a, n, 0, 0)); return TS_UNDEFINED; }
+static tsv nh_worker_ref(tsv* a, int n){ ts_worker_ref((int)nh_num(a, n, 0, 0), ts_truthy(nh_arg(a, n, 1))); return TS_UNDEFINED; }
+static tsv nh_post_message(tsv* a, int n){ ts_worker_post(nh_arg(a, n, 0)); return TS_UNDEFINED; }
+static tsv nh_on_parent_message(tsv* a, int n){ ts_worker_on_parent_message(nh_arg(a, n, 0)); return TS_UNDEFINED; }
+static tsv nh_close_parent_port(tsv* a, int n){ (void)a; (void)n; ts_worker_parent_close(); return TS_UNDEFINED; }
 static tsv nh_object_create(tsv* a, int n){
   tsv proto = nh_arg(a, n, 0);
   if (ts_is_obj(proto) && proto_chain_has_struct_class(proto)) ts_throw_type_error_msg("createObject: the prototype chain reaches a class with fields");
@@ -1505,6 +1538,17 @@ static void ts_garnet_node_global_init(tsv global){
   nh_method(host, "onChildExit", nh_on_child_exit, 2);
   nh_method(host, "watchFd", nh_watch_fd, 3);
   nh_method(host, "unwatchFd", nh_unwatch_fd, 1);
+  nh_method(host, "setWorkerStart", nh_set_worker_start, 1);
+  nh_method(host, "isWorker", nh_is_worker, 0);
+  nh_method(host, "threadId", nh_thread_id, 0);
+  nh_method(host, "workerData", nh_worker_data, 0);
+  nh_method(host, "spawnWorker", nh_spawn_worker, 6);
+  nh_method(host, "sendToWorker", nh_send_to_worker, 2);
+  nh_method(host, "killWorker", nh_kill_worker, 1);
+  nh_method(host, "workerRef", nh_worker_ref, 2);
+  nh_method(host, "postMessage", nh_post_message, 1);
+  nh_method(host, "onParentMessage", nh_on_parent_message, 1);
+  nh_method(host, "closeParentPort", nh_close_parent_port, 0);
 #ifdef __APPLE__
   ts_set_cstr(host, "platform", nh_string("darwin"));
 #else

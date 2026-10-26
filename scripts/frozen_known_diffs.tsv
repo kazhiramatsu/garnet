@@ -319,3 +319,5 @@ selfconf-unported	node/readline	Frozen emitter lacks the host global of the Node
 selfconf-unported	node/stream	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.
 selfconf-unported	node/url	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.
 selfconf-unported	node/events	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.
+parity	node/worker_threads	The Rust emitter keeps two locals of the worker_threads fixture (it imports events) as doubles where the frozen emitter types them long long (`double d28 = 0` against `long long d28 = 0`; the typing of int-proven locals diverged after the freeze); native Rust output matches V8.
+selfconf-unported	node/worker_threads	Frozen emitter lacks the host global of the Node modules (LoadBuiltinFn globalref.__garnet_node, lib/node); native Rust output matches V8.

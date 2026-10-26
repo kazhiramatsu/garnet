@@ -1215,13 +1215,20 @@ static inline int ts_is_array_buffer(tsv v){
 }
 tsv  ts_new_typed_array(int elem, tsv* args, int n);
 tsv  ts_new_shared_array_buffer(uint32_t n);   /* a store in shared memory */
-/* Workers by fork (docs/fork_workers_design.md): the entry a child runs with
-   its workerData, a worker's handlers, the child's postMessage. */
-void ts_worker_set_entry(tsv fn);
-int  ts_worker_fork(tsv data);                 /* the worker's id; the child never returns */
+/* Workers by fork (docs/fork_workers_design.md; node:worker_threads in
+   docs/node_compat_design.md): a child runs `entry` with its workerData
+   (`shared`: into a region the parent maps, docs/published_graphs_design.md);
+   a worker's handlers (a message, its uncaught exception, its exit code),
+   terminate() and ref/unref; the child's postMessage. */
+int  ts_worker_start(tsv entry, tsv data, int shared);   /* the worker's id; the child never returns */
+void ts_worker_set_start(tsv fn);              /* the child calls fn(entry, data, id) instead of entry(data) */
 void ts_worker_on_message(int id, tsv fn);
 void ts_worker_on_error(int id, tsv fn);
+void ts_worker_on_exit(int id, tsv fn);
+void ts_worker_kill(int id);
+void ts_worker_ref(int id, int on);
 int  ts_worker_is_worker(void);
+int  ts_worker_thread_id(void);
 tsv  ts_worker_data(void);
 void ts_worker_post(tsv value);
 /* Frames from the parent to a worker (docs/published_graphs_design.md): the
@@ -1817,11 +1824,6 @@ void ts_register_class_names(const char* const* tab, uint32_t n);
    or a cell a publish reached. */
 tsv ts_publish(tsv v);
 int ts_is_published(tsv v);
-/* A shared worker (docs/published_graphs_design.md, "Sharing by fork"): forked
-   like ts_worker_fork, but allocating into a region the parent mapped shared
-   before the fork, so a graph it publishes is passed to the parent by
-   reference. */
-int ts_worker_fork_shared(tsv data);
 tsv ts_object_create(tsv proto);
 tsv ts_object_seal(tsv v);
 tsv ts_object_prevent_extensions(tsv v);

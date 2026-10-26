@@ -101,6 +101,30 @@ export interface GarnetNodeHost {
   immediateRef(id: number, on: boolean): boolean;
   immediateHasRef(id: number): boolean;
   nextTick(callback: (...args: unknown[]) => void, args: unknown[] | undefined): void;
+  /** node:worker_threads over the fork workers (docs/node_compat_design.md, N5b): whether this
+   *  process is a worker, its id (0 in the main thread), and its workerData. */
+  isWorker(): boolean;
+  threadId(): number;
+  workerData(): unknown;
+  /** A forked child calls `start(entry, data, id)` instead of the entry: the library makes its
+   *  bindings the worker's first (the module's state is the parent's at the fork). */
+  setWorkerStart(start: (entry: unknown, data: unknown, id: number) => void): void;
+  /** Forks a worker that runs `entry` (a function of the program the exporter names for the
+   *  worker's module) with `data` as its workerData; `shared` forks it into a region the parent
+   *  reads (garnet:shared). The handlers run from the event loop: a message from the worker, an
+   *  uncaught exception of the worker, and its exit code. The worker's id. */
+  spawnWorker(entry: unknown, data: unknown, shared: boolean, onMessage: (value: unknown) => void,
+              onError: (error: unknown) => void, onExit: (code: number) => void): number;
+  sendToWorker(id: number, value: unknown): void;
+  /** SIGTERM to the worker; its exit handler then runs with code 1. */
+  killWorker(id: number): void;
+  /** Whether the live worker keeps the parent's event loop alive. */
+  workerRef(id: number, on: boolean): void;
+  /** The worker's side: a message to the parent, the parent's messages (registering the
+   *  listener keeps the worker alive until the port is closed), and closing the port. */
+  postMessage(value: unknown): void;
+  onParentMessage(listener: (value: unknown) => void): void;
+  closeParentPort(): void;
   readonly platform: string;
   readonly arch: string;
 }

@@ -165,12 +165,182 @@ function writeNodePrelude(libNode: string, needed: Set<string>): string {
   }
   return file;
 }
+/** node:worker_threads (docs/node_compat_design.md, N5b). A worker is a fork of the
+ *  initialized program (docs/fork_workers_design.md) that runs the top level of the module
+ *  `new Worker(...)` names with `isMainThread` false. The module is named statically:
+ *  `import.meta.url`, `new URL(import.meta.url)`, `new URL("./w.js", import.meta.url)`, or
+ *  `fileURLToPath` of one of those. The named module's source is rewritten for the compiler
+ *  (the checker sees the rewritten text at the same path): its imports and type
+ *  declarations stay at the top level, its other statements become the body of a function
+ *  `__garnet_worker_<n>` (exported), called once at the module's place when the module is part
+ *  of the program's graph (a module only a worker runs is not), and each `new Worker` site
+ *  passes that function in the file's place (a site in another module imports it). A module
+ *  run as a worker cannot export values of its own or await at its top level. The child
+ *  starts through the library's hook (host.setWorkerStart), which makes `isMainThread`,
+ *  `threadId`, `workerData` and `parentPort` the worker's before the entry runs: the module's
+ *  bindings are the parent's at the fork. */
+function programWithWorkerEntries(program: ts.Program, rootNames: string[], options: ts.CompilerOptions,
+                                  host: ts.CompilerHost, libNode: string): { program: ts.Program; host: ts.CompilerHost } {
+  const workerModule = path.join(libNode, "worker_threads.ts");
+  const checker = program.getTypeChecker();
+  type Site = { file: ts.SourceFile; arg: ts.Expression; entry: string };
+  const sites: Site[] = [];
+  const unwrap = (e: ts.Expression): ts.Expression => {
+    for (;;) {
+      if (ts.isParenthesizedExpression(e) || ts.isAsExpression(e) || ts.isSatisfiesExpression(e) ||
+          ts.isNonNullExpression(e) || ts.isTypeAssertionExpression(e)) e = e.expression;
+      else return e;
+    }
+  };
+  const isImportMetaUrl = (e: ts.Expression): boolean =>
+    ts.isPropertyAccessExpression(e) && ts.isMetaProperty(e.expression) &&
+    e.expression.keywordToken === ts.SyntaxKind.ImportKeyword && e.name.text === "url";
+  const calleeName = (e: ts.Expression): string | undefined =>
+    ts.isIdentifier(e) ? e.text : ts.isPropertyAccessExpression(e) ? e.name.text : undefined;
+  // the module a `new Worker` argument names: "." for the file itself, a relative path, or nothing
+  const specOf = (e: ts.Expression): string | undefined => {
+    e = unwrap(e);
+    if (isImportMetaUrl(e)) return ".";
+    if (ts.isNewExpression(e) && calleeName(e.expression) === "URL" && e.arguments) {
+      const args = e.arguments.map(unwrap);
+      if (args.length === 1 && isImportMetaUrl(args[0])) return ".";
+      if (args.length === 2 && ts.isStringLiteralLike(args[0]) && isImportMetaUrl(args[1])) return args[0].text;
+      return undefined;
+    }
+    if (ts.isCallExpression(e) && calleeName(e.expression) === "fileURLToPath" && e.arguments.length === 1) return specOf(e.arguments[0]);
+    return undefined;
+  };
+  const resolveEntry = (from: ts.SourceFile, spec: string): string | undefined => {
+    if (spec === ".") return from.fileName;
+    if (!spec.startsWith("./") && !spec.startsWith("../")) return undefined;
+    const base = path.resolve(path.dirname(from.fileName), spec);
+    const stem = base.replace(/\.(m?[jt]s|tsx|cjs)$/, "");
+    for (const c of [base, stem + ".ts", stem + ".mts", stem + ".tsx"]) if (/\.(ts|mts|tsx)$/.test(c) && fs.existsSync(c)) return c;
+    return undefined;
+  };
+  for (const sf of program.getSourceFiles()) {
+    if (sf.isDeclarationFile || program.isSourceFileDefaultLibrary(sf) || program.isSourceFileFromExternalLibrary(sf) ||
+        sf.fileName.startsWith(libNode)) continue;
+    const visit = (n: ts.Node): void => {
+      if (ts.isNewExpression(n)) {
+        let sym = checker.getSymbolAtLocation(n.expression);
+        if (sym && (sym.flags & ts.SymbolFlags.Alias)) sym = checker.getAliasedSymbol(sym);
+        const decl = sym?.declarations?.[0];
+        if (sym && sym.name === "Worker" && decl && decl.getSourceFile().fileName === workerModule) {
+          const arg = n.arguments?.[0];
+          const where = `${sf.fileName}:${sf.getLineAndCharacterOfPosition((arg ?? n).getStart(sf)).line + 1}`;
+          const spec = arg ? specOf(arg) : undefined;
+          if (arg === undefined || spec === undefined) {
+            throw new Error(`UNSUPPORTED construct: new Worker(...) at ${where}: the worker's module must be named statically: import.meta.url, ` +
+              `new URL(import.meta.url), new URL("./w.js", import.meta.url), or fileURLToPath of one of those (garnet resolves ` +
+              `the module at compile time; a path string is relative to the working directory in Node, which the compiler does not know)`);
+          }
+          const entry = resolveEntry(sf, spec);
+          if (entry === undefined) throw new Error(`UNSUPPORTED construct: new Worker(...) at ${where}: no module ${spec} beside ${sf.fileName}`);
+          sites.push({ file: sf, arg, entry });
+        }
+      }
+      n.forEachChild(visit);
+    };
+    visit(sf);
+  }
+  if (sites.length === 0) return { program, host };
+  const entries = [...new Set(sites.map((s) => s.entry))];
+  const nameOf = (entry: string): string => `__garnet_worker_${entries.indexOf(entry)}`;
+  type Edit = { start: number; end: number; text: string };
+  const edits = new Map<string, Edit[]>();
+  const imports = new Map<string, Set<string>>();
+  for (const site of sites) {
+    const list = edits.get(site.file.fileName) ?? [];
+    edits.set(site.file.fileName, list);
+    list.push({ start: site.arg.getStart(site.file), end: site.arg.end, text: `${nameOf(site.entry)} as unknown as string` });
+    if (site.entry !== site.file.fileName) {
+      let rel = path.relative(path.dirname(site.file.fileName), site.entry).replace(/\\/g, "/").replace(/\.(ts|mts|tsx)$/, ".js");
+      if (!rel.startsWith(".")) rel = "./" + rel;
+      const set = imports.get(site.file.fileName) ?? new Set<string>();
+      imports.set(site.file.fileName, set);
+      set.add(`import { ${nameOf(site.entry)} } from "${rel}";`);
+    }
+  }
+  // the text of [start, end) with the edits inside it applied
+  const slice = (text: string, start: number, end: number, list: Edit[]): string => {
+    let out = "";
+    let pos = start;
+    for (const e of list.filter((e) => e.start >= start && e.end <= end).sort((a, b) => a.start - b.start)) {
+      out += text.slice(pos, e.start) + e.text;
+      pos = e.end;
+    }
+    return out + text.slice(pos, end);
+  };
+  const texts = new Map<string, string>();
+  const inGraph = new Set(program.getSourceFiles().map((f) => f.fileName));
+  for (const file of new Set([...edits.keys(), ...entries])) {
+    const sf = program.getSourceFile(file) ?? ts.createSourceFile(file, fs.readFileSync(file, "utf8"), ts.ScriptTarget.Latest, true);
+    const list = edits.get(file) ?? [];
+    const head = [...(imports.get(file) ?? [])];
+    if (!entries.includes(file)) {
+      texts.set(file, head.map((l) => l + "\n").join("") + slice(sf.text, 0, sf.text.length, list));
+      continue;
+    }
+    const name = nameOf(file);
+    const reject = (n: ts.Node, what: string): never => {
+      throw new Error(`UNSUPPORTED construct: ${file}:${sf.getLineAndCharacterOfPosition(n.getStart(sf)).line + 1}: a module run as a worker ${what} (docs/node_compat_design.md)`);
+    };
+    const modifier = (n: ts.Node, kind: ts.SyntaxKind): boolean =>
+      ts.canHaveModifiers(n) && (ts.getModifiers(n)?.some((m) => m.kind === kind) ?? false);
+    const textOf = (n: ts.Node): string => slice(sf.text, n.getStart(sf), n.end, list);
+    const awaitsAtTop = (n: ts.Node): boolean => {
+      let found = false;
+      const v = (m: ts.Node): void => {
+        if (found || ts.isFunctionLike(m) || ts.isClassLike(m)) return;
+        if (ts.isAwaitExpression(m) || (ts.isForOfStatement(m) && m.awaitModifier !== undefined)) { found = true; return; }
+        m.forEachChild(v);
+      };
+      v(n);
+      return found;
+    };
+    const kept: string[] = head;
+    const moved: string[] = [];
+    for (const st of sf.statements) {
+      if (ts.isImportDeclaration(st) || ts.isImportEqualsDeclaration(st) || ts.isInterfaceDeclaration(st) || ts.isTypeAliasDeclaration(st) ||
+          modifier(st, ts.SyntaxKind.DeclareKeyword) || (ts.isEnumDeclaration(st) && modifier(st, ts.SyntaxKind.ConstKeyword)) ||
+          (ts.isExportDeclaration(st) && st.isTypeOnly)) { kept.push(textOf(st)); continue; }
+      if (ts.isExportDeclaration(st)) {
+        if (st.exportClause && ts.isNamedExports(st.exportClause) && st.exportClause.elements.length === 0 && !st.moduleSpecifier) continue;
+        reject(st, st.moduleSpecifier ? "re-exports a module" : "exports bindings (its top level is the worker's body, which nothing can import)");
+      }
+      if (ts.isExportAssignment(st) || ts.isNamespaceExportDeclaration(st)) reject(st, "has an export assignment");
+      if (ts.isModuleDeclaration(st)) reject(st, "declares a namespace at its top level");
+      if (modifier(st, ts.SyntaxKind.ExportKeyword)) reject(st, "exports a value (its top level is the worker's body, which nothing can import)");
+      if (awaitsAtTop(st)) reject(st, "awaits at its top level");
+      moved.push(textOf(st));
+    }
+    const call = inGraph.has(file) ? `${name}();\n` : "";
+    texts.set(file, `// garnet: the module's top level is the body of ${name}, a worker's entry (docs/node_compat_design.md)\n` +
+      kept.map((l) => l + "\n").join("") + `export function ${name}(): void {\n` + moved.map((l) => l + "\n").join("") + `}\n` + call);
+  }
+  const sub: ts.CompilerHost = Object.assign({}, host, {
+    getSourceFile(fileName: string, languageVersion: ts.ScriptTarget | ts.CreateSourceFileOptions, onError?: (m: string) => void, shouldCreate?: boolean) {
+      const text = texts.get(fileName) ?? texts.get(path.resolve(fileName));
+      if (text !== undefined) return ts.createSourceFile(fileName, text, languageVersion, true);
+      return host.getSourceFile(fileName, languageVersion, onError, shouldCreate);
+    },
+    readFile(fileName: string) { return texts.get(fileName) ?? texts.get(path.resolve(fileName)) ?? host.readFile(fileName); },
+  });
+  return { program: ts.createProgram(rootNames, options, sub), host: sub };
+}
+
 function programWithNodeSupport(rootNames: string[], options: ts.CompilerOptions, host: ts.CompilerHost | undefined,
                                 sourceMode: SourceMode): ts.Program {
   nodePreludeFile = undefined;
-  const program = ts.createProgram(rootNames, options, host);
-  if (sourceMode === "script" || process.env.TSAOT_NODE_PRELUDE === "0") return program;
+  if (sourceMode === "script" || process.env.TSAOT_NODE_PRELUDE === "0") return ts.createProgram(rootNames, options, host);
   const libNode = path.join(__dirname, "..", "lib", "node");
+  // node:worker_threads: the modules `new Worker(...)` names are compiled as entry functions
+  // (programWithWorkerEntries); the host that serves the rewritten sources stays for the rounds below
+  const workers = programWithWorkerEntries(ts.createProgram(rootNames, options, host), rootNames, options,
+                                           host ?? ts.createCompilerHost(options), libNode);
+  const program = workers.program;
+  host = workers.host;
   const files = program.getSourceFiles();
   const checker = program.getTypeChecker();
   const isProjectFile = (f: ts.SourceFile): boolean =>

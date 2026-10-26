@@ -53,11 +53,6 @@ import json, os, pathlib, re, sys
 file = pathlib.Path(sys.argv[1])
 units = sys.argv[2] == "1"
 code = file.read_text()
-assert code.count('int main(void){') == 1
-assert code.count('  ts_setup_globals();') == 1
-code = code.replace('int main(void){', 'int main(int argc, char** argv){')
-code = code.replace('  ts_setup_globals();',
-                    '  ts_setup_globals();\n  garnet_tsc_ts_host_init(argc, argv);')
 exceptions = []
 if units:
     # the cold functions are units of their own, compiled at -O0
@@ -98,20 +93,18 @@ native_build() { # <extra cflags> <output executable> <pass directory>
   # never be reused, so they bypass the shared cache
   case "$extra" in *-fprofile-generate*) local TSAOT_UNITS_CACHE="$pw/unit-cache" ;; esac
   $CC -c "$ROOT/runtime/ts_rt.c" -I"$ROOT/runtime" -o "$pw/rt.o"
-  $CC -c "$ROOT/benchmarks/tsc_ts_native/host.c" -I"$ROOT/runtime" -o "$pw/host.o"
   tsaot_prepare_regexp_objs "$MARKERS_C" "$pw"
   tsaot_prepare_unicode_objs "$MARKERS_C" "$pw"
   tsaot_prepare_fetch_runtime "$MARKERS_C" "$pw" "$pw/rt.o"
   if [[ "$UNITS" == "1" ]]; then
     . "$ROOT/scripts/lib/units.sh"
     TSAOT_UNITS_CC="$GEN_CC" \
-    TSAOT_UNITS_CFLAGS="-include $ROOT/benchmarks/tsc_ts_native/host.h -I$ROOT/runtime" \
-      tsaot_units_build "$WORK/units" "$out" "$pw/host.o" "$TSAOT_FETCH_RT_OBJ_ARG" \
+    TSAOT_UNITS_CFLAGS="-I$ROOT/runtime" \
+      tsaot_units_build "$WORK/units" "$out" "$TSAOT_FETCH_RT_OBJ_ARG" \
         $TSAOT_REGEXP_OBJ_ARGS $TSAOT_UNICODE_OBJ_ARGS -lm $TSAOT_FETCH_LDLIBS $TSAOT_LDLIBS
   else
-    $GEN_CC -c -include "$ROOT/benchmarks/tsc_ts_native/host.h" \
-      "$WORK/tsc-ts.c" -I"$ROOT/runtime" -o "$pw/tsc-ts.o"
-    $GEN_CC "$pw/tsc-ts.o" "$pw/host.o" "$TSAOT_FETCH_RT_OBJ_ARG" \
+    $GEN_CC -c "$WORK/tsc-ts.c" -I"$ROOT/runtime" -o "$pw/tsc-ts.o"
+    $GEN_CC "$pw/tsc-ts.o" "$TSAOT_FETCH_RT_OBJ_ARG" \
       $TSAOT_REGEXP_OBJ_ARGS $TSAOT_UNICODE_OBJ_ARGS -lm $TSAOT_FETCH_LDLIBS $TSAOT_LDLIBS \
       -o "$out"
   fi
