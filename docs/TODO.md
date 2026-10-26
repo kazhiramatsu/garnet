@@ -10111,3 +10111,17 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   compile: about 0.3% of its instructions, so the record-field work above is for
   pattern parity and general programs, not for tsc-ts, whose hot reads are struct
   fields.
+- Design: `docs/record_int_fields_design.md`, integer slots for the numeric
+  fields of records (object literals typed by interfaces), measured first: the
+  generated C of `switch_dispatch` rewritten by hand to integer slots and
+  integer arithmetic runs 8.95 -> 6.03 G instructions and 1.59 -> 0.75 G
+  cycles (V8 0.61 G; with `visit` inlined 0.62 G, V8's level). The kind is a
+  bit of the attribute flags (a sibling shape), the slot holds the int32
+  zero-extended (the collector's scan unchanged), the probe vectors carry a
+  tag so a typed read is the same one load, the generic paths box through one
+  accessor, a non-integer store generalizes the object to the boxed sibling
+  (no deviation), and the integer *typing* of reads, returns and locals needs
+  the closed-records proof (the structural pass over record types), with the
+  class design's TypeError on dynamic stores under the proof. Slices S1
+  (representation), S2 (typing), S3 (single-call-site inlining). Not for
+  tsc-ts (0.3% of its instructions in these paths).
