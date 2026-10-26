@@ -10535,3 +10535,17 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   hypothesis that it ran on an efficiency core beside the spinning workers)
   measured no change on four or eight threads and is not in. Next: the
   attention over the heads as a pooled job, the q/k/v products fused.
+- TinyLlama: the attention over the heads and the q/k/v products as pooled
+  jobs (Session 353, `docs/llm_inference_design.md` "Threads"). The run
+  state the attention reads and writes (q, the key and value caches, att,
+  xb) is in shared memory (`LlamaState`; a Node worker builds its model over
+  the main thread's buffers, garnet's fork inherits them), so a layer's
+  attention is a pooled job over its heads and its q, k and v products one
+  job over their rows end to end (the kernels take an output offset); 110
+  jobs per token instead of 152. 1 / 2 / 4 / 6 / 8 / 10 threads: 24.0 / 43.7
+  / 59.7 / 63.7 / 71.9 / 48.0 tokens/s (before 24.7 / 42.1 / 55.0 / - / 61.8
+  / -), outputs identical to Node in every configuration (the differential
+  script runs Node's workers over the shared state too). Eight threads
+  reach llama.cpp's 72 on four. Left on eight threads: the wait for the
+  slowest worker's last grab (20 us per job, 2.2 ms of a 14 ms token) and
+  the per-job preparation (6 us); the products run at the memory ceiling.

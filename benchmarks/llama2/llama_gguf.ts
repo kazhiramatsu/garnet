@@ -48,7 +48,7 @@ function main(): void {
   const model = new Model(g);
   const llama = new Llama(model, 2048);
   setSharedModel(llama);
-  const pool = threads > 1 ? startPool(threads, args[0], Math.max(llama.nEmbd, llama.nFf), Math.max(llama.vocab, llama.nFf, llama.nEmbd)) : null;
+  const pool = threads > 1 ? startPool(threads, args[0], Math.max(llama.nEmbd, llama.nFf), Math.max(llama.vocab, llama.nFf, llama.nEmbd), llama.state) : null;
   setPool(pool);
   const tok = new Tokenizer(g.kv);
   const sampler = new Sampler(temperature, seed);

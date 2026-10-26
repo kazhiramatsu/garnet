@@ -226,7 +226,7 @@ function quantizeQ8(x: Float32Array, n: number, xq: Int8Array, xs: Float32Array)
 function matvecQ8(m: Model, w: Weight, xq: Int8Array, xs: Float32Array, out: Float32Array): void {
   matvecQ8Rows(m, w, 0, w.rows, xq, xs, out);
 }
-function matvecQ8Rows(m: Model, w: Weight, lo: number, hi: number, xq: Int8Array, xs: Float32Array, out: Float32Array): void {
+function matvecQ8Rows(m: Model, w: Weight, lo: number, hi: number, xq: Int8Array, xs: Float32Array, out: Float32Array, oo: number = 0): void {
   const q = w.quants, sc = w.scales;
   const n = w.cols | 0, rows = hi | 0, nb = n >> 5;
   const rowBytes = nb * 34;
@@ -255,7 +255,7 @@ function matvecQ8Rows(m: Model, w: Weight, lo: number, hi: number, xq: Int8Array
       s3 += sc[sg + 3] * sx * i3;
       p0 += 34; p1 += 34; p2 += 34; p3 += 34; sg += 4;
     }
-    out[r] = s0; out[r + 1] = s1; out[r + 2] = s2; out[r + 3] = s3;
+    out[oo + r] = s0; out[oo + r + 1] = s1; out[oo + r + 2] = s2; out[oo + r + 3] = s3;
   }
   for (let r = rows4; r < rows; r++) {
     let s = 0;
@@ -268,14 +268,14 @@ function matvecQ8Rows(m: Model, w: Weight, lo: number, hi: number, xq: Int8Array
       s += sc[si] * xs[b] * isum;
       p += 34; si += 4;
     }
-    out[r] = s;
+    out[oo + r] = s;
   }
 }
 /** out = W x for a Q4_0 weight (the nibbles, minus 8). */
 function matvecQ4(m: Model, w: Weight, xq: Int8Array, xs: Float32Array, out: Float32Array): void {
   matvecQ4Rows(m, w, 0, w.rows, xq, xs, out);
 }
-function matvecQ4Rows(m: Model, w: Weight, lo: number, hi: number, xq: Int8Array, xs: Float32Array, out: Float32Array): void {
+function matvecQ4Rows(m: Model, w: Weight, lo: number, hi: number, xq: Int8Array, xs: Float32Array, out: Float32Array, oo: number = 0): void {
   const u = w.bytes, sc = w.scales;
   const n = w.cols | 0, rows = hi | 0, nb = n >> 5;
   const rowBytes = nb * 18;
@@ -294,14 +294,14 @@ function matvecQ4Rows(m: Model, w: Weight, lo: number, hi: number, xq: Int8Array
       s += sc[si] * xs[b] * isum; si += 4;
       p += 18;
     }
-    out[r] = s;
+    out[oo + r] = s;
   }
 }
 /** out = W x for an F32 or F16 weight. */
 function matvecFloat(m: Model, w: Weight, x: Float32Array, out: Float32Array): void {
   matvecFloatRows(m, w, 0, w.rows, x, out);
 }
-function matvecFloatRows(m: Model, w: Weight, lo: number, hi: number, x: Float32Array, out: Float32Array): void {
+function matvecFloatRows(m: Model, w: Weight, lo: number, hi: number, x: Float32Array, out: Float32Array, oo: number = 0): void {
   const n = w.cols | 0, rows = hi | 0;
   if (w.type === GGML_F32) {
     const f = w.f32;
@@ -309,7 +309,7 @@ function matvecFloatRows(m: Model, w: Weight, lo: number, hi: number, x: Float32
       const base = Math.imul(r, n);
       let s0 = 0, s1 = 0, s2 = 0, s3 = 0;
       for (let j = 0; j < n; j += 4) { s0 += f[base + j] * x[j]; s1 += f[base + j + 1] * x[j + 1]; s2 += f[base + j + 2] * x[j + 2]; s3 += f[base + j + 3] * x[j + 3]; }
-      out[r] = (s0 + s1) + (s2 + s3);
+      out[oo + r] = (s0 + s1) + (s2 + s3);
     }
   } else {
     const u = w.bytes;
@@ -317,7 +317,7 @@ function matvecFloatRows(m: Model, w: Weight, lo: number, hi: number, x: Float32
       let p = Math.imul(r, n * 2);
       let s = 0;
       for (let j = 0; j < n; j++) { s += F16[u[p] | (u[p + 1] << 8)] * x[j]; p += 2; }
-      out[r] = s;
+      out[oo + r] = s;
     }
   }
 }
@@ -337,11 +337,13 @@ export function softmax(x: Float32Array, off: number, size: number): void {
 
 // ---------------------------------------------------------------- threads
 // the control words of the shared protocol
-const C_GEN = 0, C_TENSOR = 1, C_ROWS = 2, C_COLS = 3, C_KIND = 4, C_DONE = 5, C_STOP = 6, C_WORKERS = 7, C_NEXT = 8, C_TENSOR2 = 9;
-/** job kinds: a matrix-vector product, or the feed-forward gate and up products of the same rows
+const C_GEN = 0, C_TENSOR = 1, C_ROWS = 2, C_COLS = 3, C_KIND = 4, C_DONE = 5, C_STOP = 6, C_WORKERS = 7, C_NEXT = 8, C_TENSOR2 = 9, C_TENSOR3 = 10;
+/** job kinds: a matrix-vector product; the feed-forward gate and up products of the same rows
  *  combined with SiLU on the spot (`out[r] = silu(w1[r] . x) * (w3[r] . x)`), one job and no
- *  serial pass over the hidden vector */
-const K_MATVEC = 0, K_GATE_UP = 1;
+ *  serial pass over the hidden vector; the q, k and v products of one layer as one job over their
+ *  rows laid end to end; the attention of one layer over its heads (the run state is in shared
+ *  memory, LlamaState), C_TENSOR the layer and C_COLS the position */
+const K_MATVEC = 0, K_GATE_UP = 1, K_QKV = 2, K_ATTN = 3;
 /** per-thread scratch for the gate/up job: the two products of a row block */
 let scratchA: Float32Array = new Float32Array(0), scratchB: Float32Array = new Float32Array(0);
 function scratch(rows: number): void {
@@ -364,26 +366,40 @@ let weightsList: Weight[] = [];   // every weight the model uses, in a fixed ord
 let llamaShared: Llama | null = null;   // the loaded model, visible to a forked worker
 export function setSharedModel(l: Llama): void { llamaShared = l; }
 
-/** The rows [lo, hi) of a job: a product, or the gate and up products combined with SiLU. */
-function jobRows(kind: number, m: Model, w: Weight, w2: Weight, lo: number, hi: number, xq: Int8Array, xs: Float32Array, xf: Float32Array, out: Float32Array): void {
-  if (kind === K_MATVEC) { matvecRows(m, w, lo, hi, xq, xs, xf, out); return; }
-  matvecRows(m, w, lo, hi, xq, xs, xf, scratchA);
-  matvecRows(m, w2, lo, hi, xq, xs, xf, scratchB);
-  for (let r = lo; r < hi; r++) { const v = scratchA[r]; out[r] = v * (1 / (1 + Math.exp(-v))) * scratchB[r]; }
+/** The rows [lo, hi) of a job by its kind (the heads, for the attention). */
+function jobRows(kind: number, lm: Llama, w: Weight, w2: Weight, w3: Weight, layer: number, pos: number, lo: number, hi: number, xq: Int8Array, xs: Float32Array, xf: Float32Array, out: Float32Array): void {
+  const m = lm.m;
+  if (kind === K_MATVEC) { matvecRows(m, w, lo, hi, xq, xs, xf, out, 0); return; }
+  if (kind === K_GATE_UP) {
+    matvecRows(m, w, lo, hi, xq, xs, xf, scratchA, 0);
+    matvecRows(m, w2, lo, hi, xq, xs, xf, scratchB, 0);
+    for (let r = lo; r < hi; r++) { const v = scratchA[r]; out[r] = v * (1 / (1 + Math.exp(-v))) * scratchB[r]; }
+    return;
+  }
+  if (kind === K_QKV) {
+    // rows [0, d) are wq's, [d, d + kvDim) wk's and [d + kvDim, d + 2 kvDim) wv's, written at the same offsets
+    const d = w.rows, kvDim = w2.rows;
+    if (lo < d) matvecRows(m, w, lo, Math.min(hi, d), xq, xs, xf, out, 0);
+    if (hi > d && lo < d + kvDim) matvecRows(m, w2, Math.max(lo, d) - d, Math.min(hi, d + kvDim) - d, xq, xs, xf, out, d);
+    if (hi > d + kvDim) matvecRows(m, w3, Math.max(lo, d + kvDim) - d - kvDim, hi - d - kvDim, xq, xs, xf, out, d + kvDim);
+    return;
+  }
+  attentionHeads(lm, layer, pos, lo, hi);
 }
 /** The rows of the current job from the shared cursor, guided: a grab takes the remaining rows
  *  divided by about twice the thread count (never below ROW_MIN), so the first grabs are large and
  *  the contended grabs few, and the last ones small enough that a slow core (an efficiency core, a
  *  preempted thread) does not hold the others; the grab is a compare-exchange on the cursor. */
-function jobBlocks(ctrl: Int32Array, n: number, m: Model, kind: number, w: Weight, w2: Weight, rows: number, xq: Int8Array, xs: Float32Array, xf: Float32Array, out: Float32Array): void {
+function jobBlocks(ctrl: Int32Array, n: number, lm: Llama, kind: number, w: Weight, w2: Weight, w3: Weight, layer: number, pos: number, rows: number, xq: Int8Array, xs: Float32Array, xf: Float32Array, out: Float32Array): void {
   const shift = 32 - Math.clz32(n);   // divide by the power of two at or above 2n
+  const minRows = kind === K_ATTN ? 1 : ROW_MIN, mask = kind === K_ATTN ? -1 : ~3;   // heads one at a time
   let lo = Atomics.load(ctrl, C_NEXT);
   while (lo < rows) {
-    let chunk = ((rows - lo) >> shift) & ~3;
-    if (chunk < ROW_MIN) chunk = ROW_MIN;
+    let chunk = ((rows - lo) >> shift) & mask;
+    if (chunk < minRows) chunk = minRows;
     const seen = Atomics.compareExchange(ctrl, C_NEXT, lo, lo + chunk);
     if (seen === lo) {
-      jobRows(kind, m, w, w2, lo, Math.min(lo + chunk, rows), xq, xs, xf, out);
+      jobRows(kind, lm, w, w2, w3, layer, pos, lo, Math.min(lo + chunk, rows), xq, xs, xf, out);
       lo = Atomics.load(ctrl, C_NEXT);
     } else {
       lo = seen;
@@ -391,19 +407,20 @@ function jobBlocks(ctrl: Int32Array, n: number, m: Model, kind: number, w: Weigh
   }
 }
 /** The rows [lo, hi) of out = W x, by the weight's quantization. */
-function matvecRows(m: Model, w: Weight, lo: number, hi: number, xq: Int8Array, xs: Float32Array, xf: Float32Array, out: Float32Array): void {
+function matvecRows(m: Model, w: Weight, lo: number, hi: number, xq: Int8Array, xs: Float32Array, xf: Float32Array, out: Float32Array, oo: number): void {
   if (lo >= hi) return;
-  if (w.type === GGML_Q8_0) matvecQ8Rows(m, w, lo, hi, xq, xs, out);
-  else if (w.type === GGML_Q4_0) matvecQ4Rows(m, w, lo, hi, xq, xs, out);
-  else matvecFloatRows(m, w, lo, hi, xf, out);
+  if (w.type === GGML_Q8_0) matvecQ8Rows(m, w, lo, hi, xq, xs, out, oo);
+  else if (w.type === GGML_Q4_0) matvecQ4Rows(m, w, lo, hi, xq, xs, out, oo);
+  else matvecFloatRows(m, w, lo, hi, xf, out, oo);
 }
-export function workerLoop(data: { ctrl: SharedArrayBuffer; xq: SharedArrayBuffer; xs: SharedArrayBuffer; xf: SharedArrayBuffer; out: SharedArrayBuffer; index: number; n: number; path: string }): void {
+export interface WorkerData { ctrl: SharedArrayBuffer; xq: SharedArrayBuffer; xs: SharedArrayBuffer; xf: SharedArrayBuffer; out: SharedArrayBuffer; state: LlamaState; index: number; n: number; path: string }
+export function workerLoop(data: WorkerData): void {
   const ctrl = new Int32Array(data.ctrl), xq = new Int8Array(data.xq), xs = new Float32Array(data.xs), xf = new Float32Array(data.xf), out = new Float32Array(data.out);
-  if (llamaShared === null) {   // Node: a fresh isolate loads the model itself; garnet's fork has it
+  if (llamaShared === null) {   // Node: a fresh isolate loads the model itself, over the main thread's run state; garnet's fork has both
     const g = readGguf(data.path);
-    llamaShared = new Llama(new Model(g), 2048);
+    llamaShared = new Llama(new Model(g), 2048, data.state);
   }
-  const m = llamaShared.m;
+  const lm = llamaShared;
   scratch(out.length);
   let seen = 0;
   for (;;) {
@@ -411,14 +428,15 @@ export function workerLoop(data: { ctrl: SharedArrayBuffer; xq: SharedArrayBuffe
     if (g === seen) continue;
     seen = g;
     if (Atomics.load(ctrl, C_STOP) !== 0) break;
-    const kind = Atomics.load(ctrl, C_KIND);
-    const w = weightsList[Atomics.load(ctrl, C_TENSOR)];
-    const w2 = kind === K_GATE_UP ? weightsList[Atomics.load(ctrl, C_TENSOR2)] : w;
-    jobBlocks(ctrl, data.n, m, kind, w, w2, Atomics.load(ctrl, C_ROWS), xq, xs, xf, out);
+    const kind = Atomics.load(ctrl, C_KIND), t1 = Atomics.load(ctrl, C_TENSOR);
+    const w = kind === K_ATTN ? weightsList[0] : weightsList[t1];
+    const w2 = kind === K_GATE_UP || kind === K_QKV ? weightsList[Atomics.load(ctrl, C_TENSOR2)] : w;
+    const w3 = kind === K_QKV ? weightsList[Atomics.load(ctrl, C_TENSOR3)] : w;
+    jobBlocks(ctrl, data.n, lm, kind, w, w2, w3, t1, Atomics.load(ctrl, C_COLS), Atomics.load(ctrl, C_ROWS), xq, xs, xf, out);
     Atomics.add(ctrl, C_DONE, 1);
   }
 }
-export function startPool(n: number, path: string, maxCols: number, maxRows: number): Pool {
+export function startPool(n: number, path: string, maxCols: number, maxRows: number, state: LlamaState): Pool {
   const ctrl = new Int32Array(new SharedArrayBuffer(16 * 4));
   const xq = new Int8Array(new SharedArrayBuffer(maxCols));
   const xs = new Float32Array(new SharedArrayBuffer((maxCols >> 5) * 4));
@@ -428,35 +446,59 @@ export function startPool(n: number, path: string, maxCols: number, maxRows: num
   Atomics.store(ctrl, C_WORKERS, n - 1);
   const workers: Worker[] = [];
   for (let i = 1; i < n; i++) {
-    workers.push(new Worker(new URL("./llama_worker.mjs", import.meta.url), { workerData: { ctrl: ctrl.buffer, xq: xq.buffer, xs: xs.buffer, xf: xf.buffer, out: out.buffer, index: i, n, path } }));
+    const data: WorkerData = { ctrl: ctrl.buffer as SharedArrayBuffer, xq: xq.buffer as SharedArrayBuffer, xs: xs.buffer as SharedArrayBuffer, xf: xf.buffer as SharedArrayBuffer, out: out.buffer as SharedArrayBuffer, state, index: i, n, path };
+    workers.push(new Worker(new URL("./llama_worker.mjs", import.meta.url), { workerData: data }));
   }
   return { ctrl, xq, xs, xf, out, workers, n };
 }
-/** out = W x over the pool (or the fused gate/up job when `w2` is given): the main thread takes
- *  blocks like a worker, then waits for the rest. */
-function matvecPooled(p: Pool, m: Model, w: Weight, x: Float32Array, xq: Int8Array, xs: Float32Array, quantized: boolean, out: Float32Array, w2: Weight | null = null): void {
-  const id = w.index;
-  const cols = w.cols, rows = w.rows;
+/** One pooled job: the control words, the main thread's own blocks, the wait for the workers. */
+function dispatch(p: Pool, lm: Llama, kind: number, t1: number, t2: number, t3: number, rows: number, cols: number, w: Weight, w2: Weight, w3: Weight, layer: number, pos: number): void {
+  Atomics.store(p.ctrl, C_KIND, kind); Atomics.store(p.ctrl, C_TENSOR, t1); Atomics.store(p.ctrl, C_TENSOR2, t2); Atomics.store(p.ctrl, C_TENSOR3, t3);
+  Atomics.store(p.ctrl, C_ROWS, rows); Atomics.store(p.ctrl, C_COLS, cols);
+  Atomics.store(p.ctrl, C_DONE, 0); Atomics.store(p.ctrl, C_NEXT, 0);
+  const t1n = performance.now();
+  Atomics.add(p.ctrl, C_GEN, 1);
+  jobBlocks(p.ctrl, p.n, lm, kind, w, w2, w3, layer, pos, rows, p.xq, p.xs, p.xf, p.out);
+  const t2n = performance.now();
+  while (Atomics.load(p.ctrl, C_DONE) < p.n - 1) { /* spin */ }
+  const t3n = performance.now();
+  poolStats.jobs++; poolStats.own += t2n - t1n; poolStats.wait += t3n - t2n;
+}
+/** The activation into the shared buffers (quantized once per call site). */
+function prepare(p: Pool, w: Weight, x: Float32Array, xq: Int8Array, xs: Float32Array, quantized: boolean): void {
   const t0 = performance.now();
+  const cols = w.cols;
   if (w.type === GGML_Q8_0 || w.type === GGML_Q4_0) {
     if (!quantized) quantizeQ8(x, cols, xq, xs);
     p.xq.set(xq.subarray(0, cols)); p.xs.set(xs.subarray(0, cols >> 5));
   } else {
     p.xf.set(x.subarray(0, cols));
   }
-  const kind = w2 === null ? K_MATVEC : K_GATE_UP;
-  Atomics.store(p.ctrl, C_KIND, kind); Atomics.store(p.ctrl, C_TENSOR, id); Atomics.store(p.ctrl, C_TENSOR2, w2 === null ? id : w2.index);
-  Atomics.store(p.ctrl, C_ROWS, rows); Atomics.store(p.ctrl, C_COLS, cols);
-  Atomics.store(p.ctrl, C_DONE, 0); Atomics.store(p.ctrl, C_NEXT, 0);
-  const t1 = performance.now();
-  Atomics.add(p.ctrl, C_GEN, 1);
-  jobBlocks(p.ctrl, p.n, m, kind, w, w2 === null ? w : w2, rows, p.xq, p.xs, p.xf, p.out);
-  const t2 = performance.now();
-  while (Atomics.load(p.ctrl, C_DONE) < p.n - 1) { /* spin */ }
-  const t3 = performance.now();
+  poolStats.prep += performance.now() - t0;
+}
+/** out = W x over the pool, or the fused gate/up job when `w2` is given. */
+function matvecPooled(p: Pool, lm: Llama, w: Weight, x: Float32Array, xq: Int8Array, xs: Float32Array, quantized: boolean, out: Float32Array, w2: Weight | null = null): void {
+  prepare(p, w, x, xq, xs, quantized);
+  const rows = w.rows;
+  dispatch(p, lm, w2 === null ? K_MATVEC : K_GATE_UP, w.index, w2 === null ? w.index : w2.index, w.index, rows, w.cols, w, w2 === null ? w : w2, w, 0, 0);
+  const t0 = performance.now();
   out.set(p.out.subarray(0, rows));
-  const t4 = performance.now();
-  poolStats.jobs++; poolStats.prep += t1 - t0; poolStats.own += t2 - t1; poolStats.wait += t3 - t2; poolStats.post += t4 - t3;
+  poolStats.post += performance.now() - t0;
+}
+/** q, k and v of one layer as one job; k and v land in the caches at `kOff`. */
+function qkvPooled(p: Pool, lm: Llama, wq: Weight, wk: Weight, wv: Weight, x: Float32Array, xq: Int8Array, xs: Float32Array, kOff: number): void {
+  prepare(p, wq, x, xq, xs, true);
+  const d = wq.rows, kvDim = wk.rows;
+  dispatch(p, lm, K_QKV, wq.index, wk.index, wv.index, d + 2 * kvDim, wq.cols, wq, wk, wv, 0, 0);
+  const t0 = performance.now();
+  lm.q.set(p.out.subarray(0, d));
+  lm.keyCache.set(p.out.subarray(d, d + kvDim), kOff);
+  lm.valueCache.set(p.out.subarray(d + kvDim, d + 2 * kvDim), kOff);
+  poolStats.post += performance.now() - t0;
+}
+/** The attention of one layer over its heads; q, the caches, att and xb are the shared run state. */
+function attentionPooled(p: Pool, lm: Llama, layer: number, pos: number): void {
+  dispatch(p, lm, K_ATTN, layer, 0, 0, lm.nHead, pos, weightsList[0], weightsList[0], weightsList[0], layer, pos);
 }
 export function stopPool(p: Pool): void {
   Atomics.store(p.ctrl, C_STOP, 1);
@@ -465,6 +507,33 @@ export function stopPool(p: Pool): void {
 
 // ---------------------------------------------------------------- the model
 interface Layer { attnNorm: Float32Array; wq: Weight; wk: Weight; wv: Weight; wo: Weight; ffnNorm: Float32Array; w1: Weight; w2: Weight; w3: Weight }
+/** The run state a pooled attention job reads and writes, in shared memory: a worker under Node
+ *  builds its model over the main thread's buffers (garnet's fork inherits them). */
+export interface LlamaState { q: SharedArrayBuffer; att: SharedArrayBuffer; xb: SharedArrayBuffer; keyCache: SharedArrayBuffer; valueCache: SharedArrayBuffer }
+/** The attention of layer `l` at `pos` for the heads [h0, h1): scores against the key cache,
+ *  softmax, the weighted values into xb (the serial path runs it over every head). */
+function attentionHeads(lm: Llama, l: number, pos: number, h0: number, h1: number): void {
+  const hs = lm.headSize | 0, kvDim = lm.kvDim | 0, kvMul = lm.kvMul | 0, ctx = lm.ctx | 0;
+  const q = lm.q, att = lm.att, xb = lm.xb, kc = lm.keyCache, vc = lm.valueCache;
+  const loff = l * ctx * kvDim;
+  const scale = 1 / Math.sqrt(hs);
+  for (let h = h0; h < h1; h++) {
+    const qOff = h * hs, attOff = h * ctx, kvHeadOff = ((h / kvMul) | 0) * hs;
+    for (let t = 0; t <= pos; t++) {
+      const kt = loff + t * kvDim + kvHeadOff;
+      let score = 0;
+      for (let i = 0; i < hs; i++) score += q[qOff + i] * kc[kt + i];
+      att[attOff + t] = score * scale;
+    }
+    softmax(att, attOff, pos + 1);
+    for (let i = 0; i < hs; i++) xb[qOff + i] = 0;
+    for (let t = 0; t <= pos; t++) {
+      const vt = loff + t * kvDim + kvHeadOff;
+      const a = att[attOff + t];
+      for (let i = 0; i < hs; i++) xb[qOff + i] += a * vc[vt + i];
+    }
+  }
+}
 export class Llama {
   readonly m: Model;
   readonly nEmbd: number; readonly nLayer: number; readonly nFf: number; readonly nHead: number; readonly nHeadKv: number;
@@ -478,7 +547,8 @@ export class Llama {
   readonly q: Float32Array; readonly att: Float32Array; readonly logits: Float32Array;
   readonly xq: Int8Array; readonly xs: Float32Array; readonly hq: Int8Array; readonly hs: Float32Array;
   readonly keyCache: Float32Array; readonly valueCache: Float32Array;
-  constructor(m: Model, ctxLimit: number) {
+  readonly state: LlamaState;
+  constructor(m: Model, ctxLimit: number, state: LlamaState | null = null) {
     this.m = m;
     const kv = m.g.kv;
     const arch = kv.get("general.architecture") as string;
@@ -506,12 +576,15 @@ export class Llama {
       });
     }
     const d = this.nEmbd, ff = this.nFf;
-    this.x = new Float32Array(d); this.xb = new Float32Array(d); this.xb2 = new Float32Array(d);
+    const sab = (n: number): SharedArrayBuffer => new SharedArrayBuffer(n * 4);
+    const cache = this.nLayer * this.ctx * this.kvDim;
+    this.state = state !== null ? state : { q: sab(d), att: sab(this.nHead * this.ctx), xb: sab(d), keyCache: sab(cache), valueCache: sab(cache) };
+    this.x = new Float32Array(d); this.xb = new Float32Array(this.state.xb); this.xb2 = new Float32Array(d);
     this.hb = new Float32Array(ff); this.hb2 = new Float32Array(ff);
-    this.q = new Float32Array(d); this.att = new Float32Array(this.nHead * this.ctx); this.logits = new Float32Array(this.vocab);
+    this.q = new Float32Array(this.state.q); this.att = new Float32Array(this.state.att); this.logits = new Float32Array(this.vocab);
     this.xq = new Int8Array(d); this.xs = new Float32Array(d >> 5); this.hq = new Int8Array(ff); this.hs = new Float32Array(ff >> 5);
-    this.keyCache = new Float32Array(this.nLayer * this.ctx * this.kvDim);
-    this.valueCache = new Float32Array(this.nLayer * this.ctx * this.kvDim);
+    this.keyCache = new Float32Array(this.state.keyCache);
+    this.valueCache = new Float32Array(this.state.valueCache);
     // RoPE's cos and sin per (position, pair), the forward pass's own expressions, once: 2048
     // trigonometric calls per layer and token were a serial millisecond beside the threads
     const half = this.headSize >> 1;
@@ -526,14 +599,14 @@ export class Llama {
   }
   /** out = W x, by the weight's quantization; the int8 form of x is computed once per call site. */
   private matvec(w: Weight, x: Float32Array, xq: Int8Array, xs: Float32Array, quantized: boolean, out: Float32Array): void {
-    if (pool !== null) { matvecPooled(pool, this.m, w, x, xq, xs, quantized, out); return; }
+    if (pool !== null) { matvecPooled(pool, this, w, x, xq, xs, quantized, out); return; }
     if (w.type === GGML_Q8_0) { if (!quantized) quantizeQ8(x, w.cols, xq, xs); matvecQ8(this.m, w, xq, xs, out); }
     else if (w.type === GGML_Q4_0) { if (!quantized) quantizeQ8(x, w.cols, xq, xs); matvecQ4(this.m, w, xq, xs, out); }
     else matvecFloat(this.m, w, x, out);
   }
   forward(token: number, pos: number): Float32Array {
     const d = this.nEmbd | 0, ff = this.nFf | 0, kvDim = this.kvDim | 0, kvMul = this.kvMul | 0, hs = this.headSize | 0, ctx = this.ctx | 0, nHead = this.nHead | 0;
-    const x = this.x, xb = this.xb, xb2 = this.xb2, hb = this.hb, hb2 = this.hb2, q = this.q, att = this.att, kc = this.keyCache, vc = this.valueCache;
+    const x = this.x, xb = this.xb, xb2 = this.xb2, hb = this.hb, hb2 = this.hb2, q = this.q, kc = this.keyCache, vc = this.valueCache;
     const xq = this.xq, xs = this.xs, hq = this.hq, hsc = this.hs;
     this.m.row(this.tokEmbd, token, x);
     for (let l = 0; l < this.nLayer; l++) {
@@ -541,11 +614,15 @@ export class Llama {
       rmsnorm(xb, x, L.attnNorm, d, this.eps);
       const loff = l * ctx * kvDim, kOff = loff + pos * kvDim;
       quantizeQ8(xb, d, xq, xs);
-      this.matvec(L.wq, xb, xq, xs, true, q);
-      this.matvec(L.wk, xb, xq, xs, true, xb2);
-      for (let i = 0; i < kvDim; i++) kc[kOff + i] = xb2[i];
-      this.matvec(L.wv, xb, xq, xs, true, xb2);
-      for (let i = 0; i < kvDim; i++) vc[kOff + i] = xb2[i];
+      if (pool !== null) {
+        qkvPooled(pool, this, L.wq, L.wk, L.wv, xb, xq, xs, kOff);   // one job for the three products
+      } else {
+        this.matvec(L.wq, xb, xq, xs, true, q);
+        this.matvec(L.wk, xb, xq, xs, true, xb2);
+        for (let i = 0; i < kvDim; i++) kc[kOff + i] = xb2[i];
+        this.matvec(L.wv, xb, xq, xs, true, xb2);
+        for (let i = 0; i < kvDim; i++) vc[kOff + i] = xb2[i];
+      }
       // RoPE, adjacent pairs (the converter permuted q and k for it), the angles from the tables
       const ropeOff = pos * (hs >> 1);
       for (let i = 0; i < d; i += 2) {
@@ -560,29 +637,13 @@ export class Llama {
           kc[kOff + i + 1] = k0 * fci + k1 * fcr;
         }
       }
-      const scale = 1 / Math.sqrt(hs);
-      for (let h = 0; h < nHead; h++) {
-        const qOff = h * hs, attOff = h * ctx, kvHeadOff = ((h / kvMul) | 0) * hs;
-        for (let t = 0; t <= pos; t++) {
-          const kt = loff + t * kvDim + kvHeadOff;
-          let score = 0;
-          for (let i = 0; i < hs; i++) score += q[qOff + i] * kc[kt + i];
-          att[attOff + t] = score * scale;
-        }
-        softmax(att, attOff, pos + 1);
-        for (let i = 0; i < hs; i++) xb[qOff + i] = 0;
-        for (let t = 0; t <= pos; t++) {
-          const vt = loff + t * kvDim + kvHeadOff;
-          const a = att[attOff + t];
-          for (let i = 0; i < hs; i++) xb[qOff + i] += a * vc[vt + i];
-        }
-      }
+      if (pool !== null) attentionPooled(pool, this, l, pos); else attentionHeads(this, l, pos, 0, nHead);
       this.matvec(L.wo, xb, xq, xs, false, xb2);
       for (let i = 0; i < d; i++) x[i] += xb2[i];
       rmsnorm(xb, x, L.ffnNorm, d, this.eps);
       quantizeQ8(xb, d, xq, xs);
       if (pool !== null) {
-        matvecPooled(pool, this.m, L.w1, xb, xq, xs, true, hb, L.w3);   // gate, up and SiLU in one job
+        matvecPooled(pool, this, L.w1, xb, xq, xs, true, hb, L.w3);   // gate, up and SiLU in one job
       } else {
         this.matvec(L.w1, xb, xq, xs, true, hb);
         this.matvec(L.w3, xb, xq, xs, true, hb2);

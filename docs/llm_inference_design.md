@@ -221,6 +221,28 @@ vector form of the scale arithmetic wants). 1 / 2 / 4 / 8 threads: 24.7 /
 minimum grabs (8, 4) and a steeper guided divisor (4n) measured worse on
 eight threads; 16 rows and 2n stay.
 
+The attention and the q/k/v products followed. The run state the attention
+reads and writes (q, the key and value caches, att, xb) lives in shared
+memory (`LlamaState`, SharedArrayBuffers the model allocates; a Node worker
+builds its model over the main thread's buffers, garnet's fork inherits
+them), so the attention of a layer is a pooled job over its heads (one head
+per grab at the smallest), and the q, k and v products of a layer are one
+job over their rows laid end to end (the kernels take an output offset),
+the main thread copying k and v into the caches at the position. 110 jobs
+per token instead of 152. Native, 32 generated tokens, outputs identical to
+Node in every configuration:
+
+| threads | 1 | 2 | 4 | 6 | 7 | 8 | 9 | 10 |
+|---|---|---|---|---|---|---|---|---|
+| tokens/s | 24.0 | 43.7 | 59.7 | 63.7 | 63.9 | 71.9 | 68.8 | 48.0 |
+
+Eight threads reach llama.cpp's 72 on four. What is left on eight threads
+is the wait for the slowest worker's last grab, 20 us per job (2.2 ms of a
+14 ms token), and the per-job preparation (6 us: the activation quantized
+and copied); the products themselves run at the memory ceiling. The prompt
+(56 tokens/s, one token at a time) stays an order of magnitude behind
+llama.cpp's batched prefill.
+
 ## Milestone 3: the GPU through Metal (planned, Kaz 2026-10-26)
 
 llama.cpp's GPU path on macOS is Metal (`ggml-metal`: MSL kernels embedded
