@@ -85,6 +85,29 @@ function stepped(a: Float32Array, n: number): number {
   }
   return s;
 }
+function directs(x: Float32Array, sc: Float32Array, acc: Float32Array, nb: number): number {
+  // direct accesses in the counted loop's body: x[b] and sc[sb + b] read, acc[b] stored (a store
+  // beyond the length is the no-op of the generic path, a read beyond it undefined)
+  let s = 0;
+  const sb = nb * 2;
+  for (let b = 0; b < nb; b++) {
+    const v = x[b], w = sc[sb + b];
+    acc[b] = v + w;
+    s += v === undefined ? 1000 : v * (w === undefined ? -1 : w);
+  }
+  return s + acc.length;
+}
+function breaks(x: Float32Array, n: number): number {
+  // `continue` and `break` inside a versioned loop (the proven copy and the generic one)
+  let s = 0;
+  for (let i = 0; i < n; i++) {
+    if ((i & 3) === 1) continue;
+    const v = x[i];
+    if (v > 10) break;
+    s += v === undefined ? 50 : v;
+  }
+  return s;
+}
 function main(): void {
   const rows = 6, nb = 4;
   const q = fill(rows * nb * 34 + 2, 7), x = fill(nb * 32, 11);
@@ -106,5 +129,12 @@ function main(): void {
   const f = new Float32Array(30);
   for (let i = 0; i < 30; i++) f[i] = i;
   console.log(stepped(f, 7), stepped(f, 10), stepped(f, 0));
+  const xf = new Float32Array(8), scf = new Float32Array(24), accf = new Float32Array(8);
+  for (let i = 0; i < 8; i++) xf[i] = i + 0.5;
+  for (let i = 0; i < 24; i++) scf[i] = i * 0.25;
+  console.log(directs(xf, scf, accf, 8), accf.join(","), directs(xf, scf.subarray(0, 20), accf, 8), directs(xf.subarray(0, 4), scf, new Float32Array(3), 8));
+  const big = new Float32Array(8);
+  for (let i = 0; i < 8; i++) big[i] = i === 5 ? 11 : i;
+  console.log(breaks(xf, 8), breaks(xf, 12), breaks(big, 8), breaks(big, 3));
 }
 main();

@@ -253,3 +253,23 @@ negative or past-the-end derived local, a wrapping shift, an offset read
 before its definition, a conditional increment, an induction local assigned
 in the body, stepped loops.
 
+Second slice: the direct accesses, by versioning the loop. The flag also
+covers the direct accesses of L's body outside its inner loops (`xs[b]`,
+`sc[sg + k]`): one flag per view, `_tq{L}_{view}`, over every access whose
+index is affine in L's locals, when L is the hot level (every inner loop a
+prefix plan, L itself none). The loop is then emitted twice: under the flags
+a copy whose proven accesses are the plain element load or store, and in
+the else branch the same loop again (fresh labels, its own flags) with the
+checks. Measured on the Q8_0 kernel, binaries timed in alternation: testing
+the flag at each access instead, `(_tq || index < length)`, was 5% slower
+than the compare it replaced (the flag's test and its live register beat a
+predicted branch); versioning only the inner prefix loop under its flag (the
+proven copy running to the constant bound) was neutral; the generated C with
+the five checks removed by hand ran 22.5 -> 26.0 tokens/s, and the emitter's
+versioned loop 24.6, the generic copy's presence costing the rest (the hot
+loop compiles to 380 instructions against 249 with twice the spill traffic,
+not from code size or tail merging, both ruled out: an open question for the
+C compiler's register allocation). `TSAOT_TA_RANGE=0` keeps everything
+checked. Fixture `arrays/typed_array_loop_ranges`: direct accesses proven
+and not (a view too short, a store beyond the length), `break` and
+`continue` inside a versioned loop.

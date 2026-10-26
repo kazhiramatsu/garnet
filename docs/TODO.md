@@ -10498,3 +10498,21 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   proven direct accesses and a versioned prefix loop with the constant trip
   count, the scales interleaved by four rows. Kaz asked for the GPU as well:
   a Metal path is the program's third milestone (design note).
+- Proven ranges, second slice: the direct accesses by loop versioning
+  (Session 353, `docs/typed_array_loops_design.md`). A counted loop whose
+  inner loops are all prefix plans gets one flag per view over the direct
+  accesses whose index is affine in its locals, and is emitted twice: under
+  the flags with those accesses as plain element loads and stores, and
+  generic in the else branch. TinyLlama Q8_0 22.5 -> 24.6 tokens/s on one
+  thread (the generated C with the five checks removed by hand runs 26.0:
+  the generic copy's presence costs the rest, a register-allocation effect
+  still open); 2 / 4 / 8 threads 42.8 / 52.9 / 57.2. Measured and dropped:
+  the flag tested at each access, 5% slower than the compare; the inner
+  prefix loop versioned under its flag, neutral. Fixture
+  `arrays/typed_array_loop_ranges` extended (direct accesses proven and not,
+  `break`/`continue` inside a versioned loop). Gates: parity 384 identical, selfconf, unit, bundler 45/45, conformance
+  609/609 plain and strict and 606/606 under GC protect, GC stress, bench
+  within budget (the run right after the GC stress had
+  `string_unicode_search_kernel` at 103 ms against its 100 ms budget, 97-99
+  in the previous runs and byte-identical code with the slice off; alone
+  and quiet 99, PASS); tsc-ts output identical, instructions 0.9997.

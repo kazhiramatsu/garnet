@@ -2000,6 +2000,11 @@ struct Ctx<'a> {
     /// the proven-range flags of the inner loops of the counted loops being emitted, by the
     /// inner Loop instruction's address (docs/typed_array_loops_design.md "Proven ranges")
     ta_range_flags: std::cell::RefCell<BTreeMap<usize, String>>,
+    /// inside the proven copy of a versioned counted loop: the (view local, index local) pairs
+    /// whose accesses are within the view's length for the whole loop, emitted unchecked
+    ta_range_proven: std::cell::RefCell<BTreeSet<(u32, u32)>>,
+    /// set while the generic copy of a versioned loop is re-emitted (no versioning inside)
+    ta_range_suppress: std::cell::Cell<bool>,
     /// string receivers of `charCodeAt` whose view the enclosing loop read once:
     /// local -> the loop's top label
     sv_hoisted: std::cell::RefCell<BTreeMap<u32, u32>>,
@@ -9334,6 +9339,8 @@ fn emit_i64_function(
         layout_open: std::cell::RefCell::new(BTreeMap::new()),
         ta_prefix: std::cell::RefCell::new(None),
         ta_range_flags: std::cell::RefCell::new(BTreeMap::new()),
+        ta_range_proven: std::cell::RefCell::new(BTreeSet::new()),
+        ta_range_suppress: std::cell::Cell::new(false),
         sv_hoisted: std::cell::RefCell::new(BTreeMap::new()),
         loop_mod_residues: std::cell::RefCell::new(Vec::new()),
         fin_stack: std::cell::RefCell::new(Vec::new()),
@@ -9576,6 +9583,8 @@ fn emit_f64_function(
         layout_open: std::cell::RefCell::new(BTreeMap::new()),
         ta_prefix: std::cell::RefCell::new(None),
         ta_range_flags: std::cell::RefCell::new(BTreeMap::new()),
+        ta_range_proven: std::cell::RefCell::new(BTreeSet::new()),
+        ta_range_suppress: std::cell::Cell::new(false),
         sv_hoisted: std::cell::RefCell::new(BTreeMap::new()),
         loop_mod_residues: std::cell::RefCell::new(Vec::new()),
         fin_stack: std::cell::RefCell::new(Vec::new()),
@@ -9709,6 +9718,8 @@ fn emit_function(
         layout_open: std::cell::RefCell::new(BTreeMap::new()),
         ta_prefix: std::cell::RefCell::new(None),
         ta_range_flags: std::cell::RefCell::new(BTreeMap::new()),
+        ta_range_proven: std::cell::RefCell::new(BTreeSet::new()),
+        ta_range_suppress: std::cell::Cell::new(false),
         sv_hoisted: std::cell::RefCell::new(BTreeMap::new()),
             loop_mod_residues: std::cell::RefCell::new(Vec::new()),
             fin_stack: std::cell::RefCell::new(Vec::new()),
@@ -9784,6 +9795,8 @@ fn emit_function(
         layout_open: std::cell::RefCell::new(BTreeMap::new()),
         ta_prefix: std::cell::RefCell::new(None),
         ta_range_flags: std::cell::RefCell::new(BTreeMap::new()),
+        ta_range_proven: std::cell::RefCell::new(BTreeSet::new()),
+        ta_range_suppress: std::cell::Cell::new(false),
         sv_hoisted: std::cell::RefCell::new(BTreeMap::new()),
             loop_mod_residues: std::cell::RefCell::new(Vec::new()),
             fin_stack: std::cell::RefCell::new(Vec::new()),
@@ -9859,6 +9872,8 @@ fn emit_function(
         layout_open: std::cell::RefCell::new(BTreeMap::new()),
         ta_prefix: std::cell::RefCell::new(None),
         ta_range_flags: std::cell::RefCell::new(BTreeMap::new()),
+        ta_range_proven: std::cell::RefCell::new(BTreeSet::new()),
+        ta_range_suppress: std::cell::Cell::new(false),
         sv_hoisted: std::cell::RefCell::new(BTreeMap::new()),
             loop_mod_residues: std::cell::RefCell::new(Vec::new()),
             fin_stack: std::cell::RefCell::new(Vec::new()),
@@ -10157,6 +10172,8 @@ fn emit_function(
         layout_open: std::cell::RefCell::new(BTreeMap::new()),
         ta_prefix: std::cell::RefCell::new(None),
         ta_range_flags: std::cell::RefCell::new(BTreeMap::new()),
+        ta_range_proven: std::cell::RefCell::new(BTreeSet::new()),
+        ta_range_suppress: std::cell::Cell::new(false),
         sv_hoisted: std::cell::RefCell::new(BTreeMap::new()),
         loop_mod_residues: std::cell::RefCell::new(Vec::new()),
         fin_stack: std::cell::RefCell::new(Vec::new()),
@@ -14488,6 +14505,17 @@ fn emit_view_load(s: &mut String, ctx: &Ctx, dst: u32, arr: u32, index: u32, ele
             if helem == elem {
                 // the receiver's test and length were read before the loop
                 let tah = format!("_tah{}_{}", arr, top);
+                if ctx.ta_range_proven.borrow().contains(&(arr, index)) {
+                    // within the length for the whole enclosing loop (its proven copy)
+                    if int32_codegen_enabled() && elem <= 6 && ctx.int32_use.contains(&dst) {
+                        let _ = writeln!(s, "  d{} = ts_ta_elem_load_i32({}->data, (uint32_t)d{}, {});", dst, tah, index, elem);
+                    } else if ctx.unboxed.contains(&dst) && !ctx.int_local.contains(&dst) {
+                        s.push_str(&ctx.set_num(dst, &format!("ts_ta_elem_load({}->data, (uint32_t)d{}, {})", tah, index, elem)));
+                    } else {
+                        s.push_str(&ctx.set_val(dst, &format!("ts_num(ts_ta_elem_load({}->data, (uint32_t)d{}, {}))", tah, index, elem)));
+                    }
+                    return;
+                }
                 let inb = format!("((uint64_t)d{} < _tal{}_{})", index, arr, top);
                 if int32_codegen_enabled() && elem <= 6 && ctx.int32_use.contains(&dst) {
                     let _ = writeln!(
@@ -14573,6 +14601,10 @@ fn emit_view_store(s: &mut String, ctx: &Ctx, arr: u32, index: u32, src: u32, el
         let hoisted = ctx.ta_hoisted.borrow().get(&arr).copied();
         if let Some((helem, top)) = hoisted {
             if helem == elem {
+                if ctx.ta_range_proven.borrow().contains(&(arr, index)) {
+                    let _ = writeln!(s, "  ts_ta_elem_store(_tah{a}_{t}->data, (uint32_t)d{}, {}, {});", index, ctx.num(src), elem, a = arr, t = top);
+                    return;
+                }
                 let _ = writeln!(
                     s,
                     "  {{ double _tx = {}; if ((uint64_t)d{} < _tal{a}_{t}) ts_ta_elem_store(_tah{a}_{t}->data, (uint32_t)d{}, _tx, {}); else {} }}",
@@ -19511,8 +19543,17 @@ struct TaAffine {
 /// inner loop stays within its view for the whole of L, from the trip count `_tt{L}` and the
 /// locals' ranges; the inner loop skips its clamps when the flag holds. Returns the keys
 /// (the inner Loop instructions' addresses) registered in `ctx.ta_range_flags`.
-fn ta_range_flags(s: &mut String, cond: u32, cond_body: &[Inst], body: &[Inst], ctx: &Ctx, top: u32) -> Vec<usize> {
-    let mut keys: Vec<usize> = Vec::new();
+/// what `ta_range_flags` found: the inner loops' flags registered in the context (by instruction
+/// address) and, when the loop is to be versioned, the proven direct accesses and their flags
+#[derive(Default)]
+struct TaRangeKeys {
+    loops: Vec<usize>,
+    views: Vec<(u32, u32)>,
+    view_flags: Vec<String>,
+}
+
+fn ta_range_flags(s: &mut String, cond: u32, cond_body: &[Inst], body: &[Inst], ctx: &Ctx, top: u32) -> TaRangeKeys {
+    let mut keys = TaRangeKeys::default();
     if !body.iter().any(|i| matches!(i, Inst::Loop { .. })) {
         return keys;
     }
@@ -19682,9 +19723,14 @@ fn ta_range_flags(s: &mut String, cond: u32, cond_body: &[Inst], body: &[Inst], 
     };
     let mut emitted_tt = false;
     let mut n = 0u32;
+    // an inner loop without a prefix plan: the direct accesses of L are not its hot level
+    let mut inner_generic = false;
     for (pos, inst) in body.iter().enumerate() {
         let Inst::Loop { cond: ic, cond_body: icb, body: ib } = inst else { continue };
-        let Some(plan) = ta_loop_plan(ic.0, icb, ib, ctx, &hoisted_now) else { continue };
+        let Some(plan) = ta_loop_plan(ic.0, icb, ib, ctx, &hoisted_now) else {
+            inner_generic = true;
+            continue;
+        };
         let j = plan.ind;
         // the inner induction local: initialized at L's top level before the loop from an
         // integer constant, assigned nowhere else in L but the inner loop's own update
@@ -19763,7 +19809,69 @@ fn ta_range_flags(s: &mut String, cond: u32, cond_body: &[Inst], body: &[Inst], 
         let _ = writeln!(s, "  int {} = ({} <= 0.0) || ({});", name, tt, conds.join(" && "));
         let key = inst as *const Inst as usize;
         ctx.ta_range_flags.borrow_mut().insert(key, name);
-        keys.push(key);
+        keys.loops.push(key);
+    }
+    // The direct accesses of L's body outside its inner loops (`xs[b]`, `sc[sg + k]`), when L is
+    // the hot level (every inner loop a prefix plan, L itself none) and not the generic copy of
+    // a versioned loop: one flag per view over the accesses whose index is affine, and the loop
+    // emitted twice, the copy under the flags with those accesses unchecked. (Testing the flag
+    // at each access instead, `(_tq || index < length)`, measured 5% slower than the compare it
+    // replaced; the unchecked copy measured 16% faster on the Q8_0 kernel.)
+    if inner_generic || ctx.ta_range_suppress.get() || ta_loop_plan(cond, cond_body, body, ctx, &hoisted_now).is_some() {
+        return keys;
+    }
+    fn direct_accesses<'a>(body: &'a [Inst], pos: usize, out: &mut Vec<(usize, &'a Inst)>) {
+        for inst in body {
+            match inst {
+                Inst::LoadIndex { .. } | Inst::StoreIndex { .. } => out.push((pos, inst)),
+                Inst::If { then_body, else_body, .. } => {
+                    direct_accesses(then_body, pos, out);
+                    direct_accesses(else_body, pos, out);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut accesses: Vec<(usize, &Inst)> = Vec::new();
+    for (pos, inst) in body.iter().enumerate() {
+        direct_accesses(std::slice::from_ref(inst), pos, &mut accesses);
+    }
+    let mut view_conds: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+    let mut view_indices: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
+    for (pos, inst) in accesses {
+        let (arr, index, elem) = match inst {
+            Inst::LoadIndex { arr, index, elem, .. } | Inst::StoreIndex { arr, index, elem, .. } => (arr.0, index.0, *elem),
+            _ => continue,
+        };
+        if elem == 0 || !hoisted_now.iter().any(|(a, e)| *a == arr && *e == elem - 1) || !ctx.int_local.contains(&index) {
+            continue;
+        }
+        let Some(a) = term_of(index, pos, &aff) else { continue };
+        let Some((lo, hi, extra)) = eval(&a) else { continue };
+        let conds = view_conds.entry(arr).or_default();
+        conds.push(format!("{} >= 0.0", lo));
+        conds.push(format!("{} < (double)_tal{}_{}", hi, arr, vt(arr)));
+        conds.extend(extra);
+        view_indices.entry(arr).or_default().insert(index);
+    }
+    for (arr, conds) in view_conds {
+        if !emitted_tt {
+            let _ = writeln!(
+                s,
+                "  double {tt} = ({b} > (double)d{i}) ? ceil(({b} - (double)d{i}) / {st}.0) : 0.0;",
+                tt = tt,
+                b = bexpr,
+                i = ind,
+                st = step
+            );
+            emitted_tt = true;
+        }
+        let name = format!("_tq{}_{}", top, arr);
+        let _ = writeln!(s, "  int {} = ({} <= 0.0) || ({});", name, tt, conds.join(" && "));
+        for index in &view_indices[&arr] {
+            keys.views.push((arr, *index));
+        }
+        keys.view_flags.push(name);
     }
     keys
 }
@@ -25550,12 +25658,18 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 );
                 hoist_saved.push((*arr, ctx.ta_hoisted.borrow_mut().insert(*arr, (*elem, top))));
             }
-            // the proven ranges of the inner prefix loops (docs/typed_array_loops_design.md)
-            let range_keys: Vec<usize> = if ta_range_enabled() {
+            // the proven ranges of the inner prefix loops and of the direct accesses
+            // (docs/typed_array_loops_design.md "Proven ranges")
+            let range_keys: TaRangeKeys = if ta_range_enabled() {
                 ta_range_flags(s, cond.0, cond_body, body, ctx, top)
             } else {
-                Vec::new()
+                TaRangeKeys::default()
             };
+            let versioned = !range_keys.view_flags.is_empty();
+            if versioned {
+                let _ = writeln!(s, "  if ({}) {{", range_keys.view_flags.join(" && "));
+                *ctx.ta_range_proven.borrow_mut() = range_keys.views.iter().copied().collect();
+            }
             ctx.loop_labels
                 .borrow_mut()
                 .push((top, end, ctx.eh_depth.get()));
@@ -25596,7 +25710,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             let _ = writeln!(s, "  L{}: ;", end);
             ctx.loop_mod_residues.borrow_mut().pop();
             ctx.loop_labels.borrow_mut().pop();
-            for k in range_keys {
+            for k in range_keys.loops {
                 ctx.ta_range_flags.borrow_mut().remove(&k);
             }
             for (arr, prev) in hoist_saved {
@@ -25618,6 +25732,15 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         ctx.sv_hoisted.borrow_mut().remove(&r);
                     }
                 }
+            }
+            if versioned {
+                // the generic copy: the same loop again (fresh labels and hoists), unversioned
+                ctx.ta_range_proven.borrow_mut().clear();
+                s.push_str("  } else {\n");
+                let prev = ctx.ta_range_suppress.replace(true);
+                emit_inst(s, inst, ctx);
+                ctx.ta_range_suppress.set(prev);
+                s.push_str("  }\n");
             }
         }
         Inst::If {
