@@ -158,8 +158,32 @@ The scaling is bounded by memory bandwidth (the Q8_0 weights are read once
 per token: 1.1 GB per token) and by the synchronization of about 150 jobs per
 token; the four performance cores are the useful count.
 
+## Milestone 3: the GPU through Metal (planned, Kaz 2026-10-26)
+
+llama.cpp's GPU path on macOS is Metal (`ggml-metal`: MSL kernels embedded
+in the binary, the weights shared through unified memory, simdgroup matrix
+products, and on the M5 the Metal 4 tensor API for the GPU's neural
+accelerators); on this machine it generates far beyond the CPU's bandwidth
+ceiling. The plan: a `garnet:metal` module over a host object
+`__garnet_metal` in the runtime (Objective-C, Metal.framework), with the
+device and a command queue, buffers over the model's pages without a copy
+(`newBufferWithBytesNoCopy` on page-aligned memory: the loader aligns the
+tensor data or maps the file), a library of MSL kernels compiled at startup
+(the Q8_0 and Q4_0 matrix-vector products with the block scales, a matrix
+product for the prefill, rmsnorm, softmax and rope so a layer runs without
+a round trip), and an encoder API so the TypeScript side batches a whole
+forward pass into one command buffer (one commit and one wait per token, as
+llama.cpp's graph does). The TypeScript program keeps the model, the KV
+cache and the sampling; only the kernels move. The oracle changes with it:
+the GPU's float accumulation is not in Node's order, so the differential
+test of the GPU path compares the greedy tokens and the logits within a
+tolerance, not bytes, while the CPU path keeps the byte-identical test. The
+target is llama.cpp's Metal numbers on the same model (`llama-bench`
+without `-ngl 0`), after the CPU path reaches its bandwidth ceiling with
+the threads.
+
 ## Beyond
 
 Native kernels (NEON intrinsics, Accelerate) behind a host object as
 `garnet:json` has one, if the vectorized TypeScript kernels stop short of
-llama.cpp; `garnet:nn` once the model code has a stable shape.
+llama.cpp on the CPU; `garnet:nn` once the model code has a stable shape.
