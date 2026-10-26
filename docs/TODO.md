@@ -10350,3 +10350,9 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   had no provable bound and stayed a double, sending the f16 scale loads down
   the slow path): 3.7 -> 4.3 tokens/s on a quiet machine, Node 2.1, outputs
   identical over 48 generated tokens.
+- TinyLlama Q8_0, four rows per pass (Session 353): `matvecQ8` processes four
+  weight rows per pass over the quantized activation (one load of x per four
+  multiply-accumulates, the block loop amortized, four independent integer
+  accumulators), the remainder rows one at a time: 4.3 -> 6.3 tokens/s native
+  (Node 2.1 on the same source, 3.0x), outputs identical over 32 generated
+  tokens.

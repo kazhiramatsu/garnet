@@ -181,21 +181,45 @@ function quantizeQ8(x: Float32Array, n: number, xq: Int8Array, xs: Float32Array)
     for (let j = 0; j < 32; j++) xq[b + j] = Math.round(x[b + j] * id);
   }
 }
-/** out = W x for a Q8_0 weight, the activation already quantized (xq, xs). */
+/** out = W x for a Q8_0 weight, the activation already quantized (xq, xs). Four rows per pass share
+ *  the loads of x and amortize the block loop; the int8 values are sign-extended by shifts (the
+ *  numeric analysis bounds `>> 24` to the int8 range, so the products and the sums are integers
+ *  throughout, reductions the C compiler vectorizes; docs/int32_codegen_design.md). */
 function matvecQ8(m: Model, w: Weight, xq: Int8Array, xs: Float32Array, out: Float32Array): void {
   const u = w.bytes, q = w.quants;
   const n = w.cols | 0, rows = w.rows | 0, nb = n >> 5;
   const rowBytes = nb * 34;
-  for (let r = 0; r < rows; r++) {
+  const rows4 = rows & ~3;
+  for (let r = 0; r < rows4; r += 4) {
+    let s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+    let p0 = Math.imul(r, rowBytes);        // int32 row offsets (a tensor is below 2^31 bytes)
+    let p1 = p0 + rowBytes, p2 = p1 + rowBytes, p3 = p2 + rowBytes;
+    for (let b = 0; b < nb; b++) {
+      const xb = b << 5, q0 = p0 + 2, q1 = p1 + 2, q2 = p2 + 2, q3 = p3 + 2;
+      let i0 = 0, i1 = 0, i2 = 0, i3 = 0;
+      for (let j = 0; j < 32; j++) {
+        const x = (xq[xb + j] << 24) >> 24;
+        i0 = (i0 + ((q[q0 + j] << 24) >> 24) * x) | 0;
+        i1 = (i1 + ((q[q1 + j] << 24) >> 24) * x) | 0;
+        i2 = (i2 + ((q[q2 + j] << 24) >> 24) * x) | 0;
+        i3 = (i3 + ((q[q3 + j] << 24) >> 24) * x) | 0;
+      }
+      const sx = xs[b];
+      s0 += F16[u[p0] | (u[p0 + 1] << 8)] * sx * i0;
+      s1 += F16[u[p1] | (u[p1 + 1] << 8)] * sx * i1;
+      s2 += F16[u[p2] | (u[p2 + 1] << 8)] * sx * i2;
+      s3 += F16[u[p3] | (u[p3 + 1] << 8)] * sx * i3;
+      p0 += 34; p1 += 34; p2 += 34; p3 += 34;
+    }
+    out[r] = s0; out[r + 1] = s1; out[r + 2] = s2; out[r + 3] = s3;
+  }
+  for (let r = rows4; r < rows; r++) {
     let s = 0;
-    let p = Math.imul(r, rowBytes);        // an int32 row offset (a tensor is below 2^31 bytes)
+    let p = Math.imul(r, rowBytes);
     for (let b = 0; b < nb; b++) {
       const qb = p + 2, xb = b << 5;
       let isum = 0;
-      // the int8 values sign-extended by shifts (the numeric analysis bounds `>> 24` to the int8
-      // range, so the products and the sum are integers throughout, a reduction the C compiler
-      // may vectorize; docs/int32_codegen_design.md "Bounded bitwise results")
-      for (let j = 0; j < 32; j++) { const a = (q[qb + j] << 24) >> 24, b = (xq[xb + j] << 24) >> 24; isum = (isum + a * b) | 0; }
+      for (let j = 0; j < 32; j++) { const a = (q[qb + j] << 24) >> 24, x = (xq[xb + j] << 24) >> 24; isum = (isum + a * x) | 0; }
       s += F16[u[p] | (u[p + 1] << 8)] * xs[b] * isum;
       p += 34;
     }
