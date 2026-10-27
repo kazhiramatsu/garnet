@@ -10707,3 +10707,15 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   bandwidth over the batch's activations) and the attention (9.7). Fixture
   `modules/llama_metal_matmul` covers the 128-token tile. Next: SiLU in the
   gate/up products' epilogue, then the attention.
+- GPU batched prefill: the fused gate/up tensor kernel, measured and dropped
+  (Session 353). One dispatch computing silu(w1 x) * (w3 x) through two
+  cooperative accumulators and an elementwise epilogue (correct: the check
+  unchanged) ran slower at every length (512 tokens 122 -> 128 ms, 51
+  tokens 18.4 -> 20.5): only the 32 and 64-token tiles fit two
+  accumulators, the two products lose their overlap as independent
+  dispatches, and two dequantizes sit between the same barriers. Reverted;
+  the design doc keeps the measurement. Gates for the chain of the three
+  lib slices (flash attention, the 128-token tile and 512-token chunks):
+  conformance 611/611 plain and strict, 608/608 under GC protect, unit,
+  bundler 45/45, bench within budget (the runtime is unchanged since the
+  GC stress run of the first slice).

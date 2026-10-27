@@ -528,11 +528,20 @@ identical):
 | 512 | 4178 | 4802 | 0.87 |
 
 What remains at 512 tokens (122 ms against 107): the products are at
-llama.cpp's rate (about 106 ms); the rest is the small kernels (10 ms: the
-gate and up products could carry SiLU in their epilogue through the
-cooperative tensor's elements, removing a pass over 11 MB per layer and the
-up product's buffer) and the attention (9.7 ms; llama.cpp's tensor-API
-flash attention is faster still).
+llama.cpp's rate (about 106 ms); the rest is the small kernels (10 ms) and
+the attention (9.7 ms; llama.cpp's tensor-API flash attention is faster
+still). Measured and dropped: the gate and up products as one tensor
+kernel with two cooperative accumulators and SiLU in the epilogue (the up
+product never written, no SiLU pass): slower at every length (512 tokens
+122 -> 128 ms, 51 tokens 18.4 -> 20.5), because the fused kernel has only
+the 32 and 64-token tiles (two accumulators of a 128-token tile would
+double the registers again), the two products no longer overlap as
+independent dispatches, and the two dequantizes sit between the same
+barriers. Open: the attention on the tensor API (a cooperative tensor is a
+valid operand of `matmul2d`, so P V can take P from registers), and the
+dispatch count for 8 to 16-token prompts (264 dispatches with barriers
+per batch; llama.cpp's small-batch kernels lead there, 724 against 571
+tok/s at 8).
 
 ## Beyond
 
