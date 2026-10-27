@@ -423,6 +423,7 @@ names its phase.
 | the canonical strings pre-hashed, the toString tags as static cells | 1,578 | 758 | 2.1 |
 | direct calls of module-level const functions (`@vue/shared`'s helpers) | 1,569 | 766 | 2.0 |
 | an ordinary enum's members folded to their constants (`ReactiveFlags`, `TrackOpTypes`, the compiler's `NodeTypes`) | 1,342 | 767 | 1.75 |
+| a constant key at a dynamic-key site (`r[ReactiveFlags.IS_REF]`, `target[ReactiveFlags.RAW]`) interned once, the named cache | 1,338 (wall unchanged; 1.7% fewer instructions) | | |
 
 The first run is the correctness milestone. The first tuning round (alternating A/B against the
 previous binary each time) took the reactivity phase from 1,749 to 1,030 ms:
@@ -470,3 +471,16 @@ field load, and a `declare`d enum, whose object comes from outside the program, 
 vue 1,565 -> 1,342 ms alternating (Node 767: 2.0x -> 1.75x); the comparisons became literal
 compares (a short immediate or a static cell against the trap's canonical key string), and the
 numeric switches over `node.type` became C switches.
+
+After the fold, the keys of vue's flag reads (`r[ReactiveFlags.IS_REF]` in `isRef`,
+`target[ReactiveFlags.RAW]` and `[SKIP]` in `createReactiveObject`, `value[ReactiveFlags.IS_READONLY]`)
+are string constants at dynamic-key sites, which the emitter lowered to the dynamic read: the string
+converted to its key on every access (a direct-mapped cache over the literal cells, a hash and a
+compare on a hit, the intern table on a collision), then the same named cache the dot form uses. A
+constant key is now interned once per site (`const_keys_for`, `emit_const_key_open` in emit_c.rs: a
+static holding the id, filled on the site's first execution, a name the program's field table holds
+getting that table's id) and the site takes the named inline cache directly (`ts_get_pic_checked_inline`,
+`ts_set_pic_inline`, `ts_has_prop`), a canonical array index ("0") staying dynamic. vue runs 1.7%
+fewer instructions (39.97 -> 39.28 G) at the same wall and cycles (1,324 -> 1,338 ms alternating,
+within the run-to-run spread); the next step for this phase is the cache misses themselves, not the
+key.

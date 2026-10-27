@@ -1915,6 +1915,8 @@ struct Ctx<'a> {
     tag_consts: BTreeMap<u32, &'static str>,
     /// locals holding one string constant: (static literal id, length in code units)
     str_consts: BTreeMap<u32, (usize, u32, String)>,   /* a local holding one string literal: its id, length and C expression */
+    /// locals holding one string constant that names a property (see const_keys_for): its code units
+    const_keys: BTreeMap<u32, Vec<u16>>,
     switch_plan: SwitchPlan,
     layouts: LayoutPlan,
     /// Typed direct stores whose frozen test is omitted (`frozen_elision_for`).
@@ -9309,6 +9311,7 @@ fn emit_i64_function(
         typeof_fusion,
         tag_consts: tag_consts_for(f),
         str_consts: str_consts_for(f, static_strings),
+        const_keys: const_keys_for(f),
         static_strings,
         string_metric_plan,
         string_materialization_plan,
@@ -9553,6 +9556,7 @@ fn emit_f64_function(
         typeof_fusion,
         tag_consts: tag_consts_for(f),
         str_consts: str_consts_for(f, static_strings),
+        const_keys: const_keys_for(f),
         static_strings,
         string_metric_plan,
         string_materialization_plan,
@@ -9688,6 +9692,7 @@ fn emit_function(
             typeof_fusion: typeof_fusion_plan(f),
             tag_consts: tag_consts_for(f),
             str_consts: str_consts_for(f, static_strings),
+        const_keys: const_keys_for(f),
             static_strings,
             string_metric_plan: None,
             string_materialization_plan: None,
@@ -9765,6 +9770,7 @@ fn emit_function(
             typeof_fusion: typeof_fusion_plan(f),
             tag_consts: tag_consts_for(f),
             str_consts: str_consts_for(f, static_strings),
+        const_keys: const_keys_for(f),
             static_strings,
             string_metric_plan: None,
             string_materialization_plan: None,
@@ -9842,6 +9848,7 @@ fn emit_function(
             typeof_fusion: typeof_fusion_plan(f),
             tag_consts: tag_consts_for(f),
             str_consts: str_consts_for(f, static_strings),
+        const_keys: const_keys_for(f),
             static_strings,
             string_metric_plan: None,
             string_materialization_plan: None,
@@ -10142,6 +10149,7 @@ fn emit_function(
         typeof_fusion,
         tag_consts: tag_consts_for(f),
         str_consts: str_consts_for(f, static_strings),
+        const_keys: const_keys_for(f),
         static_strings,
         string_metric_plan,
         string_materialization_plan,
@@ -10544,6 +10552,96 @@ fn str_consts_for(f: &Function, static_strings: &BTreeMap<Vec<u16>, usize>) -> B
         }
     }
     out
+}
+
+fn const_keys_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_CONST_KEYS").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
+/// Locals holding one string constant used as a property key at a dynamic-key site (`obj["lit"]`,
+/// `obj[E.A]` after the exporter's enum fold, `"lit" in obj`): the key's code units. Such a site
+/// takes the named inline cache with a key interned once (`emit_const_key_open`) instead of the
+/// dynamic path, which converted the string to its key on every access. A canonical array index
+/// ("0", "12") stays dynamic: an array reads its element for it. `TSAOT_CONST_KEYS=0` keeps every
+/// such access on the dynamic path.
+fn const_keys_for(f: &Function) -> BTreeMap<u32, Vec<u16>> {
+    let mut out: BTreeMap<u32, Vec<u16>> = BTreeMap::new();
+    if !const_keys_enabled() {
+        return out;
+    }
+    let mut flat: Vec<&Inst> = Vec::new();
+    flatten_inst(&f.body, &mut flat);
+    let mut seen: BTreeMap<u32, Option<Vec<u16>>> = BTreeMap::new();
+    for inst in &flat {
+        if let Inst::TryCatch { catch_var: Some(c), .. } = inst {
+            seen.insert(c.0, None);
+        }
+        let Some(d) = inst_def(inst) else { continue };
+        let units: Option<Vec<u16>> = match inst {
+            Inst::Const { value: ConstVal::Str { value }, .. } => Some(str_units(value)),
+            Inst::Const { value: ConstVal::Str16 { units }, .. } => Some(units.clone()),
+            _ => None,
+        };
+        match seen.get(&d) {
+            None => {
+                seen.insert(d, units);
+            }
+            Some(prev) => {
+                if *prev != units {
+                    seen.insert(d, None);
+                }
+            }
+        }
+    }
+    for p in &f.params {
+        seen.insert(p.0, None);
+    }
+    for (d, units) in seen {
+        if let Some(u) = units {
+            if !is_array_index_units(&u) {
+                out.insert(d, u);
+            }
+        }
+    }
+    out
+}
+
+/// A canonical array index string: "0", or digits without a leading zero, below 2^32 - 1.
+fn is_array_index_units(u: &[u16]) -> bool {
+    if u.is_empty() || u.len() > 10 || (u.len() > 1 && u[0] == b'0' as u16) {
+        return false;
+    }
+    let mut v: u64 = 0;
+    for &c in u {
+        if !(b'0' as u16..=b'9' as u16).contains(&c) {
+            return false;
+        }
+        v = v * 10 + (c - b'0' as u16) as u64;
+    }
+    v < 4294967295
+}
+
+/// Opens a block holding a constant property key's id: the name is interned on the site's first
+/// execution into a static (a name the program's field table holds gets that table's id), so the
+/// access takes the named inline cache and never converts the string. Returns the key's C expression;
+/// the caller closes the block.
+fn emit_const_key_open(s: &mut String, units: &[u16], ctx: &Ctx) -> String {
+    let n = ctx.fresh_label();
+    let bytes = field_key_bytes_from_units(units);
+    let _ = writeln!(
+        s,
+        "  {{ static uint32_t _ts_key_{n} = 0u; if (TS_RT_UNLIKELY(_ts_key_{n} == 0u)) _ts_key_{n} = ts_intern_field({lit}, {len}u) + 1u;",
+        n = n,
+        lit = c_bytes_lit(&bytes),
+        len = bytes.len()
+    );
+    format!("(_ts_key_{} - 1u)", n)
 }
 
 fn tag_consts_for(f: &Function) -> BTreeMap<u32, &'static str> {
@@ -21499,6 +21597,10 @@ fn try_emit_fused_scalar_slice_loop_body(
 /// The generic property store: inline cache (lazy or eager frame) or the
 /// plain runtime setter when caches are disabled.
 fn emit_store_field_generic(s: &mut String, obj: u32, field: u32, src: u32, ctx: &Ctx) {
+    emit_store_field_generic_key(s, obj, &field.to_string(), src, ctx)
+}
+/// The same with the key as a C expression (a constant key interned at the site, `emit_const_key_open`).
+fn emit_store_field_generic_key(s: &mut String, obj: u32, field: &str, src: u32, ctx: &Ctx) {
     if prop_pic_enabled() {
         let pic = ctx.fresh_label();
         let _ = writeln!(s, "  {{ static ts_prop_ic _ts_pic_{} = TS_PROP_IC_INIT;", pic);
@@ -24540,6 +24642,26 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 return;
             }
             if prop_pic_enabled() {
+                if let Some(units) = ctx.const_keys.get(&key.0) {
+                    // a constant key: the named cache, as `obj.name` on an untyped receiver takes it
+                    let k = emit_const_key_open(s, units, ctx);
+                    let pic = ctx.fresh_label();
+                    let _ = writeln!(s, "  static ts_prop_ic _ts_pic_{} = TS_PROP_IC_INIT;", pic);
+                    let get_expr = if ctx.lazy_homes {
+                        format!(
+                            "({{ tsv _lz; if (!ts_get_pic_try({o}, {k}, &_ts_pic_{pic}, &_lz)) {{ {sp}_lz = ts_get_linked({o}, {k}, &_ts_pic_{pic}, &F.h, {n});{rl} }} _lz; }})",
+                            o = ctx.val(obj.0), k = k, pic = pic, n = ctx.frame_nslots,
+                            sp = ctx.spill_now(), rl = ctx.reload_now()
+                        )
+                    } else if ctx.lazy_frame {
+                        format!("ts_get_pic_checked_inline_lazy({}, {}, &_ts_pic_{}, &F.h, {})", ctx.val(obj.0), k, pic, ctx.frame_nslots)
+                    } else {
+                        format!("ts_get_pic_checked_inline({}, {}, &_ts_pic_{})", ctx.val(obj.0), k, pic)
+                    };
+                    s.push_str(&ctx.set_val(dst.0, &get_expr));
+                    let _ = writeln!(s, "  }}");
+                    return;
+                }
                 let pic = ctx.fresh_label();
                 let _ = writeln!(
                     s,
@@ -24565,6 +24687,12 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
         }
         Inst::StoreFieldDynamic { obj, key, src } => {
             if prop_pic_enabled() {
+                if let Some(units) = ctx.const_keys.get(&key.0) {
+                    let k = emit_const_key_open(s, units, ctx);
+                    emit_store_field_generic_key(s, obj.0, &k, src.0, ctx);
+                    let _ = writeln!(s, "  }}");
+                    return;
+                }
                 let pic = ctx.fresh_label();
                 let _ = writeln!(
                     s,
@@ -24591,6 +24719,12 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             }
         }
         Inst::HasFieldDynamic { dst, obj, key } => {
+            if let Some(units) = ctx.const_keys.get(&key.0) {
+                let k = emit_const_key_open(s, units, ctx);
+                s.push_str(&ctx.set_val(dst.0, &format!("ts_bool(ts_has_prop({}, {}))", ctx.val(obj.0), k)));
+                let _ = writeln!(s, "  }}");
+                return;
+            }
             s.push_str(&ctx.set_val(
                 dst.0,
                 &format!(

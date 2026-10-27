@@ -127,6 +127,8 @@ Rust in §315; selfhost is kept as a performance metric).
   object through `any` (`(E as any).A = 5`) is not seen by those reads, and a read before the enum's
   module has evaluated (an import cycle) gives the constant where V8 throws. The enum object itself
   is intact for `Object.keys(E)`, `E[0]` and a variable key. `TSAOT_ENUM_FOLD=0` keeps the loads.
+- `o.__proto__` and `o["__proto__"]` read undefined (V8: the prototype through the accessor);
+  `Object.getPrototypeOf` / `setPrototypeOf` are the modelled forms (Session 355 note).
 - A typed receiver that is a Proxy (vue's reactive arrays and collections) takes its methods through
   the traps, but a typed `for..of` over one, and a cursor `for..of` over a Proxy of a Map or Set,
   walk a snapshot taken through the iteration protocol at loop entry (elements added during the

@@ -11052,3 +11052,23 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   change (parity: every program differs from the frozen twin at the prelude's
   `ts_fnval_array_isArray`; selfconf: 15 CCFAIL on the frozen emitter's `reject_buf` of the old
   `ts_coro`, 3 DIFF), with the fold on and off alike (`build/gates_s355/`).
+- Constant keys at dynamic-key sites (Session 355, `docs/real_projects.md` vue "The second round").
+  After the fold, `r[ReactiveFlags.IS_REF]` (isRef, on every trap result), `target[ReactiveFlags.RAW]`
+  and `[SKIP]` (createReactiveObject) and `value[ReactiveFlags.IS_READONLY]` are string constants at
+  `LoadFieldDynamic` / `StoreFieldDynamic` / `HasFieldDynamic` sites, lowered to the dynamic read:
+  `ts_key_from_value` on every access (the literal-cell key cache: a hash and a compare, the intern
+  table on a collision; 3.6% of the earlier profile's samples), then the same named cache the dot
+  form uses. The emitter now interns a constant key once per site (`const_keys_for`: a local holding
+  one string constant, as `str_consts_for` finds them, a canonical array index excluded;
+  `emit_const_key_open`: a static holding the id, `ts_intern_field` on the site's first execution,
+  which returns the field table's id for a name the table holds) and emits the named forms
+  (`ts_get_pic_checked_inline` with the lazy-frame variants of the dot form, `emit_store_field_generic_key`,
+  `ts_has_prop`); `TSAOT_CONST_KEYS=0` keeps the dynamic path. vue: 39.97 -> 39.28 G instructions
+  (-1.7%), wall and cycles unchanged (1,323.9 -> 1,338.3 ms alternating, within the spread: judged by
+  the instruction count, as the dev-machine note says). Fixture
+  `objects/const_key_dynamic_access` (enum-member and literal keys on plain objects, arrays, strings,
+  class instances, functions, numbers, null and undefined with V8's messages, a Proxy's traps, a
+  Record's absent key kept undefined, a Map's methods, an accessor; unicode and surrogate-pair
+  keys). The fixture found two pre-existing deviations, both reproduced with the path off: every
+  `__`-prefixed property was hidden from enumeration (the next entry), and `o["__proto__"]` /
+  `o.__proto__` read undefined (V8: the prototype; `Object.getPrototypeOf` is the modelled form). tsc-ts: 22.127 -> 22.121 G instructions (unchanged; outputs identical). Gates: conformance 640/640 plain, 640/640 strict and 637/637 under GC protect (the strict and protect runs also saw the next slice's fixture, written during them, fail as expected), unit, bundler 50/50, bench within budget.
