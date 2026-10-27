@@ -2520,6 +2520,76 @@ TS_RT_ALWAYS_INLINE void ts_set_pic_inline(
   }
   ts_set_pic(obj, key, value, ic);
 }
+/* The inline read and write of a site whose receiver's static type admits a class instance (an
+   interface a class implements, a union, a class without a stable hint: `sized` on the IR's
+   LoadField and StoreField, docs/pic_sized_inline_design.md "The interface-typed site"): the
+   plain-object probe first, then the sized-receiver entries the out-of-line path filled for the
+   site, so a class instance read through its interface (vue's `activeSub.depsTail`, a Subscriber)
+   pays no call. The plain sites keep the functions above: the sized try on every inline miss cost
+   the typed compiler 1.3% of its instructions. */
+TS_RT_ALWAYS_INLINE tsv ts_get_pic_checked_inline_sized(
+    tsv obj, ts_key key, ts_prop_ic* ic){
+  uint8_t flags = 0;
+  tsv* p = ts_prop_ic_probe_fixed_inline(obj, key, ic, &flags);
+  if (p && !(flags & TS_PROP_ACCESSOR)){
+    TS_RT_STAT_PIC_GET_CALL(); TS_RT_STAT_PIC_GET_HIT(); TS_RT_STAT_INLINE_KEY(g_ts_key_inline_get, key);
+    return (flags & TS_PROP_INT32) ? ts_int_slot_box(*p) : *p;
+  }
+  { tsv _sv; if (ts_get_sized_pic_try(obj, key, ic, &_sv)) return _sv; }
+  return ts_get_pic_checked(obj, key, ic);
+}
+TS_RT_ALWAYS_INLINE void ts_set_pic_inline_sized(
+    tsv obj, ts_key key, tsv value, ts_prop_ic* ic){
+  uint8_t flags = 0;
+  tsv* p = ts_prop_ic_probe_fixed_inline(obj, key, ic, &flags);
+  if (p && !(flags & TS_PROP_ACCESSOR) && (flags & TS_PROP_WRITABLE)){
+    ts_object* o = (ts_object*)ts_ptr(obj);
+    if (!(ts_obj_integrity(o) & 1u)){
+      if (!(flags & TS_PROP_INT32)){
+        TS_RT_STAT_PIC_SET_CALL(); TS_RT_STAT_PIC_SET_HIT(); TS_RT_STAT_INLINE_KEY(g_ts_key_inline_set, key);
+        *p = value; ts_write_barrier_ptr(obj, p, value); return;
+      }
+      int32_t _iv;
+      if (ts_int32_exact(value, &_iv)){ TS_RT_STAT_PIC_SET_CALL(); TS_RT_STAT_PIC_SET_HIT(); *p = ts_int_slot_word(_iv); return; }
+    }
+  }
+  if (ts_set_sized_pic_try(obj, key, value, ic)) return;
+  ts_set_pic(obj, key, value, ic);
+}
+TS_RT_ALWAYS_INLINE tsv ts_get_pic_checked_inline_sized_lazy(
+    tsv obj, ts_key key, ts_prop_ic* ic, ts_frame_hdr* frame, uint32_t nslots){
+  uint8_t flags = 0;
+  tsv* p = ts_prop_ic_probe_fixed_inline(obj, key, ic, &flags);
+  if (p && !(flags & TS_PROP_ACCESSOR)){
+    TS_RT_STAT_PIC_GET_CALL(); TS_RT_STAT_PIC_GET_HIT(); TS_RT_STAT_INLINE_KEY(g_ts_key_inline_get, key);
+    return (flags & TS_PROP_INT32) ? ts_int_slot_box(*p) : *p;
+  }
+  { tsv _sv; if (ts_get_sized_pic_try(obj, key, ic, &_sv)) return _sv; }
+  ts_frame_push(frame, nslots);
+  tsv r = ts_get_pic_checked(obj, key, ic);
+  ts_frame_pop(frame);
+  return r;
+}
+TS_RT_ALWAYS_INLINE void ts_set_pic_inline_sized_lazy(
+    tsv obj, ts_key key, tsv value, ts_prop_ic* ic, ts_frame_hdr* frame, uint32_t nslots){
+  uint8_t flags = 0;
+  tsv* p = ts_prop_ic_probe_fixed_inline(obj, key, ic, &flags);
+  if (p && !(flags & TS_PROP_ACCESSOR) && (flags & TS_PROP_WRITABLE)){
+    ts_object* o = (ts_object*)ts_ptr(obj);
+    if (!(ts_obj_integrity(o) & 1u)){
+      if (!(flags & TS_PROP_INT32)){
+        TS_RT_STAT_PIC_SET_CALL(); TS_RT_STAT_PIC_SET_HIT(); TS_RT_STAT_INLINE_KEY(g_ts_key_inline_set, key);
+        *p = value; ts_write_barrier_ptr(obj, p, value); return;
+      }
+      int32_t _iv;
+      if (ts_int32_exact(value, &_iv)){ TS_RT_STAT_PIC_SET_CALL(); TS_RT_STAT_PIC_SET_HIT(); *p = ts_int_slot_word(_iv); return; }
+    }
+  }
+  if (ts_set_sized_pic_try(obj, key, value, ic)) return;
+  ts_frame_push(frame, nslots);
+  ts_set_pic(obj, key, value, ic);
+  ts_frame_pop(frame);
+}
 /* Store property `i` of a layout object (shaped: value slot; dictionary
    fallback: entry in insertion order). */
 static inline void ts_lit_store(tsv obj, uint32_t i, tsv v){

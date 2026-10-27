@@ -58,7 +58,7 @@ fn main() {
     ck("leak-arg", st(&r,100), GlobalEscape);
 
     // store(a,b){ a.f = b } (fn0). Caller: a=alloc100; b=alloc101; store(a,b); return a.
-    let store = func(0, vec![0,1], 2, false, vec![StoreField{obj:LocalId(0), field:FieldId(0), src:LocalId(1), slots: 0, cls: 0}]);
+    let store = func(0, vec![0,1], 2, false, vec![StoreField{obj:LocalId(0), field:FieldId(0), src:LocalId(1), slots: 0, cls: 0, sized: false}]);
     let g = func(1, vec![], 2, false, vec![
         AllocObject {dst:LocalId(0), type_id:TypeId(0), site:SiteId(100), class_id: None, proto: None }, // a
         AllocObject {dst:LocalId(1), type_id:TypeId(0), site:SiteId(101), class_id: None, proto: None }, // b
@@ -130,7 +130,7 @@ fn main() {
     // remains NoEscape at function granularity. The fresh node stores the
     // previous carrier and then replaces it; every iteration remains reachable.
     let link = func(0, vec![0,1], 2, false, vec![
-        StoreField{obj:LocalId(0), field:FieldId(0), src:LocalId(1), slots: 0, cls: 0},
+        StoreField{obj:LocalId(0), field:FieldId(0), src:LocalId(1), slots: 0, cls: 0, sized: false},
     ]);
     let chain = func(1, vec![], 3, false, vec![
         AllocObject {dst:LocalId(0), type_id:TypeId(0), site:SiteId(199), class_id:None, proto:None},

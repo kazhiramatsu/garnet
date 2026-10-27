@@ -33,7 +33,7 @@ fn main() {
     let f = func(1, vec![], 3, false, vec![
         AllocObject {dst:LocalId(0), type_id:TypeId(0), site:SiteId(100), class_id: None, proto: None },
         AllocObject {dst:LocalId(1), type_id:TypeId(0), site:SiteId(101), class_id: None, proto: None },
-        StoreField{obj:LocalId(0), field:FieldId(VALUE), src:LocalId(1), slots: 0, cls: 0},
+        StoreField{obj:LocalId(0), field:FieldId(VALUE), src:LocalId(1), slots: 0, cls: 0, sized: false},
         AllocClosure{dst:LocalId(2), func:FunctionId(0), captures:vec![cap(0,0)], site:SiteId(102)},
         Return{src:Some(LocalId(2))},
     ]);
@@ -46,7 +46,7 @@ fn main() {
     let f = func(1, vec![], 3, false, vec![
         AllocObject {dst:LocalId(0), type_id:TypeId(0), site:SiteId(100), class_id: None, proto: None },
         AllocObject {dst:LocalId(1), type_id:TypeId(0), site:SiteId(101), class_id: None, proto: None },
-        StoreField{obj:LocalId(0), field:FieldId(VALUE), src:LocalId(1), slots: 0, cls: 0},
+        StoreField{obj:LocalId(0), field:FieldId(VALUE), src:LocalId(1), slots: 0, cls: 0, sized: false},
         AllocClosure{dst:LocalId(2), func:FunctionId(0), captures:vec![cap(0,0)], site:SiteId(102)},
         Return{src:None},
     ]);
@@ -57,13 +57,13 @@ fn main() {
 
     // C3: closure body leaks captured value to global; box stays local.
     let arrow_leak = func(0, vec![0], 2, false, vec![
-        LoadField{dst:LocalId(1), obj:LocalId(0), field:FieldId(VALUE), slots: 0, elem: 0, cls: 0},
+        LoadField{dst:LocalId(1), obj:LocalId(0), field:FieldId(VALUE), slots: 0, elem: 0, cls: 0, sized: false},
         StoreGlobal{gref:GlobalId(0), src:LocalId(1)},
     ]);
     let f = func(1, vec![], 3, false, vec![
         AllocObject {dst:LocalId(0), type_id:TypeId(0), site:SiteId(100), class_id: None, proto: None },
         AllocObject {dst:LocalId(1), type_id:TypeId(0), site:SiteId(101), class_id: None, proto: None },
-        StoreField{obj:LocalId(0), field:FieldId(VALUE), src:LocalId(1), slots: 0, cls: 0},
+        StoreField{obj:LocalId(0), field:FieldId(VALUE), src:LocalId(1), slots: 0, cls: 0, sized: false},
         AllocClosure{dst:LocalId(2), func:FunctionId(0), captures:vec![cap(0,0)], site:SiteId(102)},
         Return{src:None},
     ]);

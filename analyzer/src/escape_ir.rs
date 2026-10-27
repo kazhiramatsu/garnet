@@ -617,6 +617,11 @@ pub enum Inst {
         /// docs/receiver_class_hints_design.md); 0 otherwise.
         #[serde(default, skip_serializing_if = "no_class_hint")]
         cls: u32,
+        /// The receiver's static type admits a class instance without naming one stable
+        /// class (an interface a class implements, a union): the site's inline cache probes
+        /// the sized-receiver entries too (docs/pic_sized_inline_design.md).
+        #[serde(default, skip_serializing_if = "is_false")]
+        sized: bool,
     },
     StoreField {
         obj: LocalId,
@@ -627,6 +632,9 @@ pub enum Inst {
         /// As LoadField's.
         #[serde(default, skip_serializing_if = "no_class_hint")]
         cls: u32,
+        /// As LoadField's.
+        #[serde(default, skip_serializing_if = "is_false")]
+        sized: bool,
     },
     /// First-class builtin PROTOTYPE method value: `recv.method` read as a value
     /// (not called). Loads the boxed (unbound) prototype method via ts_get with a

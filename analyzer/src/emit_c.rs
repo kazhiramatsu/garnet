@@ -21596,25 +21596,33 @@ fn try_emit_fused_scalar_slice_loop_body(
 
 /// The generic property store: inline cache (lazy or eager frame) or the
 /// plain runtime setter when caches are disabled.
-fn emit_store_field_generic(s: &mut String, obj: u32, field: u32, src: u32, ctx: &Ctx) {
-    emit_store_field_generic_key(s, obj, &field.to_string(), src, ctx)
+fn emit_store_field_generic(s: &mut String, obj: u32, field: u32, src: u32, ctx: &Ctx, sized: bool) {
+    emit_store_field_generic_key(s, obj, &field.to_string(), src, ctx, sized)
 }
-/// The same with the key as a C expression (a constant key interned at the site, `emit_const_key_open`).
-fn emit_store_field_generic_key(s: &mut String, obj: u32, field: &str, src: u32, ctx: &Ctx) {
+/// The same with the key as a C expression (a constant key interned at the site, `emit_const_key_open`);
+/// `sized` selects the inline write that probes the sized-receiver entries too (LoadField's `sized`).
+fn emit_store_field_generic_key(s: &mut String, obj: u32, field: &str, src: u32, ctx: &Ctx, sized: bool) {
     if prop_pic_enabled() {
         let pic = ctx.fresh_label();
+        let sz = if sized { "_sized" } else { "" };
         let _ = writeln!(s, "  {{ static ts_prop_ic _ts_pic_{} = TS_PROP_IC_INIT;", pic);
         if ctx.lazy_homes {
             let (o, v) = (ctx.val(obj), ctx.val(src));
+            let extra = if sized {
+                format!(" && !ts_set_sized_pic_try({o}, {field}, {v}, &_ts_pic_{pic})", o = o, field = field, v = v, pic = pic)
+            } else {
+                String::new()
+            };
             let _ = writeln!(
                 s,
-                "  if (!ts_set_pic_try({o}, {field}, {v}, &_ts_pic_{pic})) {{ {sp}ts_set_linked({o}, {field}, {v}, &_ts_pic_{pic}, &F.h, {n});{rl} }}",
-                sp = ctx.spill_now(), rl = ctx.reload_now(), n = ctx.frame_nslots
+                "  if (!ts_set_pic_try({o}, {field}, {v}, &_ts_pic_{pic}){extra}) {{ {sp}ts_set_linked({o}, {field}, {v}, &_ts_pic_{pic}, &F.h, {n});{rl} }}",
+                sp = ctx.spill_now(), rl = ctx.reload_now(), n = ctx.frame_nslots, extra = extra
             );
         } else if ctx.lazy_frame {
             let _ = writeln!(
                 s,
-                "  ts_set_pic_inline_lazy({}, {}, {}, &_ts_pic_{}, &F.h, {});",
+                "  ts_set_pic_inline{}_lazy({}, {}, {}, &_ts_pic_{}, &F.h, {});",
+                sz,
                 ctx.val(obj),
                 field,
                 ctx.val(src),
@@ -21624,7 +21632,8 @@ fn emit_store_field_generic_key(s: &mut String, obj: u32, field: &str, src: u32,
         } else {
             let _ = writeln!(
                 s,
-                "  ts_set_pic_inline({}, {}, {}, &_ts_pic_{});",
+                "  ts_set_pic_inline{}({}, {}, {}, &_ts_pic_{});",
+                sz,
                 ctx.val(obj),
                 field,
                 ctx.val(src),
@@ -24018,7 +24027,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 s.push_str(&ctx.set_val(dst.0, &ctx.val(src.0)));
             }
         }
-        Inst::LoadField { dst, obj, field, slots, elem, cls } => {
+        Inst::LoadField { dst, obj, field, slots, elem, cls, sized } => {
             if ctx.json_locals.contains(&obj.0) {
                 if is_length_field(field.0) && !ctx.json_locals.contains(&dst.0) {
                     s.push_str(&ctx.set_val(
@@ -24166,15 +24175,24 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     "  {{ static ts_prop_ic _ts_pic_{} = TS_PROP_IC_INIT;",
                     pic
                 );
+                // a site whose receiver's static type admits a class instance (`sized`): the
+                // inline read that probes the sized-receiver entries after the plain-object one
+                let sz = if *sized { "_sized" } else { "" };
                 let get_expr = if ctx.lazy_homes {
+                    let extra = if *sized {
+                        format!(" && !ts_get_sized_pic_try({o}, {k}, &_ts_pic_{pic}, &_lz)", o = ctx.val(obj.0), k = field.0, pic = pic)
+                    } else {
+                        String::new()
+                    };
                     format!(
-                        "({{ tsv _lz; if (!ts_get_pic_try({o}, {k}, &_ts_pic_{pic}, &_lz)) {{ {sp}_lz = ts_get_linked({o}, {k}, &_ts_pic_{pic}, &F.h, {n});{rl} }} _lz; }})",
+                        "({{ tsv _lz; if (!ts_get_pic_try({o}, {k}, &_ts_pic_{pic}, &_lz){extra}) {{ {sp}_lz = ts_get_linked({o}, {k}, &_ts_pic_{pic}, &F.h, {n});{rl} }} _lz; }})",
                         o = ctx.val(obj.0), k = field.0, pic = pic, n = ctx.frame_nslots,
-                        sp = ctx.spill_now(), rl = ctx.reload_now()
+                        sp = ctx.spill_now(), rl = ctx.reload_now(), extra = extra
                     )
                 } else if ctx.lazy_frame {
                     format!(
-                        "ts_get_pic_checked_inline_lazy({}, {}, &_ts_pic_{}, &F.h, {})",
+                        "ts_get_pic_checked_inline{}_lazy({}, {}, &_ts_pic_{}, &F.h, {})",
+                        sz,
                         ctx.val(obj.0),
                         field.0,
                         pic,
@@ -24182,7 +24200,8 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     )
                 } else {
                     format!(
-                        "ts_get_pic_checked_inline({}, {}, &_ts_pic_{})",
+                        "ts_get_pic_checked_inline{}({}, {}, &_ts_pic_{})",
+                        sz,
                         ctx.val(obj.0),
                         field.0,
                         pic
@@ -24321,7 +24340,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 ),
             ));
         }
-        Inst::StoreField { obj, field, src, slots, cls } => {
+        Inst::StoreField { obj, field, src, slots, cls, sized } => {
             let addr = inst as *const Inst as usize;
             if let Some(keys) = ctx.layouts.ctor_first.get(&addr) {
                 let id = ctx.fresh_label();
@@ -24350,7 +24369,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 };
                 if guarded {
                     let _ = writeln!(s, "  if (_ts_adopt) {{ {}; }} else {{", lit_store);
-                    emit_store_field_generic(s, obj.0, field.0, src.0, ctx);
+                    emit_store_field_generic(s, obj.0, field.0, src.0, ctx, *sized);
                     s.push_str("  }\n");
                 } else {
                     let _ = writeln!(s, "  {};", lit_store);
@@ -24457,7 +24476,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             // ctx.val (not a hardcoded v-name): the receiver local may be numeric-
             // unboxed (`const n: any = 5; n.c = 3`) — rebox it so ts_set sees the
             // primitive and throws V8's "Cannot create property ..." TypeError.
-            emit_store_field_generic(s, obj.0, field.0, src.0, ctx);
+            emit_store_field_generic(s, obj.0, field.0, src.0, ctx, *sized);
         }
         Inst::LoadElem { dst, arr } => {
             s.push_str(&ctx.set_val(dst.0, &format!("ts_get({}, 0)", ctx.val(arr.0))));
@@ -24700,7 +24719,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             if prop_pic_enabled() {
                 if let Some(units) = ctx.const_keys.get(&key.0) {
                     let k = emit_const_key_open(s, units, ctx);
-                    emit_store_field_generic_key(s, obj.0, &k, src.0, ctx);
+                    emit_store_field_generic_key(s, obj.0, &k, src.0, ctx, false);
                     let _ = writeln!(s, "  }}");
                     return;
                 }

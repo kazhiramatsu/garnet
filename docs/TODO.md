@@ -11120,3 +11120,21 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   `object.hasOwn` / `objproto.toStringCall` (`ts_has_own_dyn`, `ts_objproto_tostring_call`). The
   binding is read first and checked (`binding.check`: a ReferenceError in the TDZ, as V8 throws).
   `TSAOT_BUILTIN_ALIAS=0` keeps the value calls. vue: 30 direct `isArray` calls, 6 `hasOwn` and 2 `toTypeString` sites in the program, 39.25 -> 39.11 G instructions (-0.4%), 1,348.5 -> 1,340.2 ms alternating (within the spread); tsc-ts 22.117 -> 22.131 G (unchanged); outputs identical. Fixtures: `functions/builtin_const_aliases` (Array, Object, Math, Number, String and Date aliases called and passed as values, the `.call` forms on every receiver kind and a null receiver, an argument count without a static form, a spread, a shadowing local and parameter, the TDZ), bundler `builtin_alias_import` (the aliases imported by name and through a namespace import). Gates: conformance 644/644 plain and strict, 641/641 under GC protect, unit, bundler 51/51, bench within budget (`string_unicode_search_kernel` 101 ms against its 100 in the run, 98 and 99 re-timed alone: at its budget's edge before this slice too, no alias in it).
+- The interface-typed site probes the sized-receiver entries in line (Session 355,
+  `docs/pic_sized_inline_design.md` "The interface-typed site"). The profile after the aliases put
+  the out-of-line property read first (`ts_get_pic_checked` 8% self, `ts_set_pic` 2.6%, the
+  inherited and registry lookups behind them 3%): vue's `Dep.track`, `prepareDeps`, `cleanupDeps`
+  and `isDirty` read and write `Subscriber` and `Link` nodes through their interfaces, which the
+  class hint (one stable class) cannot cover, so the generic inline cache's plain-object probe
+  missed on every class instance. An experiment (the sized try at every generic site, in the
+  header) gave vue -5.1% instructions and the typed compiler +1.3%, so the site is chosen
+  statically: the exporter marks `LoadField` / `StoreField` `sized` (a new IR field; the sroa
+  reconstructions carry it) when the receiver's static type admits a class instance without
+  naming one stable class (`receiverAdmitsClassInstance`: a class without a hint, or an interface,
+  type literal or union some program class is assignable to, `isTypeAssignableTo` cached by type),
+  and the emitter takes `ts_get_pic_checked_inline_sized` / `ts_set_pic_inline_sized` (+ the lazy
+  forms; the four are in the inline-policy allowlist) there: the plain-object probe, then the sized
+  entries, then the call. `TSAOT_SIZED_SITES=0` marks no site. vue: 196 read and 47 write sites marked (of 2,300 generic ones), 39.108 -> 36.997 G instructions (-5.4%), 1,343.2 -> 1,276.4 ms alternating (-5.0%; Node 761.7: 1.68x); rxjs 379.0 -> 382.8 and yaml 3,541.2 -> 3,537.8 (unchanged); tsc-ts 22.122 -> 22.115 G with 2,304 sites marked (unchanged; the unconditional experiment had cost it 1.3%); outputs identical. Gates: conformance 645/645 plain and strict, 642/642 under GC protect, unit (the three test files' `LoadField` / `StoreField` literals carry the new field), bundler 51/51, bench within budget, GC stress. Fixture
+  `classes/interface_sites_sized` (two classes and a literal behind one interface at one site,
+  reads and writes, an accessor, a method value, a frozen instance, run-time additions, a union of
+  classes, a constrained type parameter).

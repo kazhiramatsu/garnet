@@ -425,6 +425,7 @@ names its phase.
 | an ordinary enum's members folded to their constants (`ReactiveFlags`, `TrackOpTypes`, the compiler's `NodeTypes`) | 1,342 | 767 | 1.75 |
 | a constant key at a dynamic-key site (`r[ReactiveFlags.IS_REF]`, `target[ReactiveFlags.RAW]`) interned once, the named cache | 1,338 (wall unchanged; 1.7% fewer instructions) | | |
 | `@vue/shared`'s builtin aliases (`isArray = Array.isArray`, `hasOwnProperty.call`, `objectToString.call`) called as the builtins | 1,340 (wall unchanged; 0.4% fewer instructions) | | |
+| the interface-typed sites (`Subscriber`, `Link`) probe the sized-receiver entries in line | 1,276 | 762 | 1.68 |
 
 The first run is the correctness milestone. The first tuning round (alternating A/B against the
 previous binary each time) took the reactivity phase from 1,749 to 1,030 ms:
@@ -497,3 +498,14 @@ as `Object.hasOwn`'s runtime, `objectToString.call(v)` as the tag builtin), the 
 shadowing local untouched and the binding still read first for the TDZ. vue: 30 direct `isArray`
 calls in the program, 39.25 -> 39.11 G instructions (-0.4%), wall within the spread (1,348 -> 1,340
 ms alternating).
+
+The profile after the aliases put the out-of-line property read first: vue's `Dep.track`,
+`prepareDeps`, `cleanupDeps` and `isDirty` read and write their subscriber and link nodes through
+interfaces (`activeSub.depsTail`, `link.version`; `Subscriber` is implemented by ReactiveEffect and
+ComputedRefImpl), which the class hint cannot cover, so the generic inline cache's plain-object probe
+missed on every class instance and the access paid a call (`ts_get_pic_checked` 8% of the samples,
+`ts_set_pic` 2.6%, the lookups behind them 3%). A site whose receiver's static type admits a class
+instance now takes the inline read and write that probe the sized-receiver entries after the
+plain-object one (`docs/pic_sized_inline_design.md` "The interface-typed site"; the exporter decides
+from the type, so the typed compiler's plain-object sites are untouched): vue 39.11 -> 37.00 G
+instructions, 1,343 -> 1,276 ms alternating (Node 762: 1.68x), rxjs, yaml and tsc-ts unchanged.

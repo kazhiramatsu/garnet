@@ -12626,7 +12626,52 @@ class Exporter {
   private withClassHint<T extends { kind: string }>(inst: T, receiver: ts.Expression): T {
     const cls = this.receiverClassHint(receiver);
     if (cls !== 0) (inst as unknown as { cls?: number }).cls = cls;
+    else if (this.receiverAdmitsClassInstance(receiver)) (inst as unknown as { sized?: boolean }).sized = true;
     return inst;
+  }
+  /** Whether a value of the receiver's static type can be a class instance without the type naming
+   *  one stable class (docs/pic_sized_inline_design.md, "The interface-typed site"): an interface,
+   *  type literal or union some program class is assignable to (vue's `Subscriber`, implemented by
+   *  ReactiveEffect and ComputedRefImpl), or a class without a hint (unstable, or a union of classes).
+   *  Such a site's inline cache probes the sized-receiver entries after the plain-object one; a site
+   *  whose type admits no instance (`any`, an object literal's own interface, an array) keeps the
+   *  plain-object probe alone, which the typed compiler's sites need (the sized try on every inline
+   *  miss cost it 1.3% of its instructions). `TSAOT_SIZED_SITES=0` marks no site. */
+  private receiverAdmitsClassInstance(e: ts.Expression): boolean {
+    if (process.env.TSAOT_SIZED_SITES === "0" || !this.strictTypeOptimizationProfile().enabled) return false;
+    let r = e;
+    while (ts.isParenthesizedExpression(r)) r = r.expression;
+    let t: ts.Type;
+    try { t = this.checker.getNonNullableType(this.checker.getTypeAtLocation(r)); } catch { return false; }
+    return this.typeAdmitsClassInstance(t, 0);
+  }
+  private admitsClassCache = new Map<ts.Type, boolean>();
+  private typeAdmitsClassInstance(t: ts.Type, depth: number): boolean {
+    if (depth > 2) return false;
+    if (t.flags & ts.TypeFlags.TypeParameter) {
+      let c: ts.Type | undefined;
+      try { c = this.checker.getBaseConstraintOfType(t); } catch { return false; }
+      return c ? this.typeAdmitsClassInstance(this.checker.getNonNullableType(c), depth + 1) : false;
+    }
+    if (t.isUnionOrIntersection()) return t.types.some((m) => this.typeAdmitsClassInstance(m, depth + 1));
+    if (!(t.flags & ts.TypeFlags.Object)) return false;
+    const hit = this.admitsClassCache.get(t);
+    if (hit !== undefined) return hit;
+    let res = false;
+    try {
+      const sym = t.getSymbol();
+      const own = sym ? this.classSymToId.get(sym) : undefined;
+      if (own !== undefined) res = t.getConstructSignatures().length === 0;   // an instance type (not `typeof C`)
+      else if (t.getCallSignatures().length === 0 && t.getConstructSignatures().length === 0) {
+        for (const [csym, cid] of this.classSymToId) {
+          if (!this.classNodeOfId.has(cid)) continue;
+          const inst = this.checker.getDeclaredTypeOfSymbol(csym);
+          if (this.checker.isTypeAssignableTo(inst, t)) { res = true; break; }
+        }
+      }
+    } catch { res = false; }
+    this.admitsClassCache.set(t, res);
+    return res;
   }
   private withViewElem<T extends { kind: string }>(inst: T, receiver: ts.Expression): T {
     const elem = this.viewElemOf(receiver);

@@ -283,3 +283,35 @@ dynamic measurement's noise; and the generic inline property caches trying
 the registry's cache by class word on a megamorphic miss cost +0.9%
 instructions at 5,600 sites, likewise for no measurable gain. The out-of-line
 entries keep those sites.
+
+## The interface-typed site (Session 355)
+
+vue's reactivity core reads and writes its subscriber and link nodes through interfaces
+(`activeSub.depsTail`, `link.version`, `sub.flags`: `Subscriber` is implemented by ReactiveEffect
+and ComputedRefImpl, `Link` is a class), and the exporter's class hint, which needs one stable
+class, does not apply to an interface: those sites took the generic inline read and write, whose
+probe is the plain-object one, so every access of a class instance missed it and paid the
+out-of-line call (`ts_get_pic_checked` 8% of the run's samples, `ts_set_pic` 2.6%, the inherited
+and registry lookups behind them 3%). The experiment of this slice, the sized try after the
+plain-object probe at every generic site, took vue from 39.12 to 37.11 G instructions (-5.1%,
+1,347 -> 1,300 ms) and the typed compiler from 22.19 to 22.48 G (+1.3%, the flag test on each of its
+many inline misses), as "Where the probe runs" measured before.
+
+The site is chosen statically. The exporter marks a `LoadField` / `StoreField` `sized` when the
+receiver's static type (narrowed, without null and undefined; a type parameter by its constraint)
+admits a class instance without naming one stable class: a class type without a hint, or an
+interface, type literal or union that some class of the program is assignable to
+(`receiverAdmitsClassInstance`, `checker.isTypeAssignableTo` over the program's classes, cached by
+type). A marked site takes `ts_get_pic_checked_inline_sized` / `ts_set_pic_inline_sized` (and the
+lazy-frame forms): the plain-object probe first, then `ts_get_sized_pic_try` / `ts_set_sized_pic_try`,
+the entries the out-of-line path filled by class word, then the call. A site whose type admits no
+instance (`any`, an array, an interface only object literals satisfy) is exactly what it was.
+`TSAOT_SIZED_SITES=0` marks no site.
+
+| program | before | after |
+|---|---|---|
+| vue, instructions | 39.11 G | 37.00 G (-5.4%; 196 read and 47 write sites marked of 2,300 generic ones) |
+| vue, wall (alternating, Node 762 ms) | 1,343 ms | 1,276 ms (-5.0%; 1.76x -> 1.68x of Node) |
+| tsc-ts typed, one checker, instructions | 22.122 G | 22.115 G (2,304 sites marked in 21 units: no cost) |
+
+Outputs identical throughout.

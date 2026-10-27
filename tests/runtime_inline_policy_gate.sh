@@ -117,6 +117,10 @@ while IFS= read -r name; do
     ts_get_sized_pic_try | \
     ts_get_sized_pic_inline | \
     ts_get_sized_pic_inline_lazy | \
+    ts_get_pic_checked_inline_sized | \
+    ts_set_pic_inline_sized | \
+    ts_get_pic_checked_inline_sized_lazy | \
+    ts_set_pic_inline_sized_lazy | \
     ts_set_sized_pic_try | \
     ts_set_sized_pic_inline | \
     ts_set_sized_pic_inline_lazy | \
