@@ -32,8 +32,12 @@ indexed by field id (the exporter assigns ids densely from 0). At startup
   lets JSON round-trip, while names the compiler knew keep their compile-time id
   so dot access works.
 - "enumerable" predicate: a key is an own enumerable string property iff
-  `id < METHOD_KEY_BASE` (1_000_000) AND its name is non-NULL AND does not start
-  with "__" (internal: __value, __date_ms, ...).
+  `id < METHOD_KEY_BASE` (1_000_000) AND its name is non-NULL AND it is not one of
+  the runtime's internal slots (`field_is_hidden`: `__value`, `__date_ms`, `__coro`,
+  the regexp and iterator slots, marked by their full names at interning; a user's
+  own `__typename` is ordinary, Session 355).
+- a Date (the object holding `__date_ms`) with no `toJSON` of its own serializes as
+  `Date.prototype.toJSON` would: the ISO string, `null` when invalid (Session 355).
 
 ### 3. Object.keys / values / entries
 Walk `obj->props`; for each enumerable key push name / value / [name,value].

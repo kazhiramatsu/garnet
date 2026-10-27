@@ -11072,3 +11072,34 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   keys). The fixture found two pre-existing deviations, both reproduced with the path off: every
   `__`-prefixed property was hidden from enumeration (the next entry), and `o["__proto__"]` /
   `o.__proto__` read undefined (V8: the prototype; `Object.getPrototypeOf` is the modelled form). tsc-ts: 22.127 -> 22.121 G instructions (unchanged; outputs identical). Gates: conformance 640/640 plain, 640/640 strict and 637/637 under GC protect (the strict and protect runs also saw the next slice's fixture, written during them, fail as expected), unit, bundler 50/50, bench within budget.
+- Enumeration, the prototype literal and a Date's JSON (Session 355). Three silent deviations the
+  constant-key fixture surfaced, each reproduced with the constant-key path off and fixed in the
+  runtime and the exporter:
+  - every property whose name begins with `__` was hidden from `Object.keys`, `for..in`,
+    `JSON.stringify`, `Object.getOwnPropertyNames`, `Object.entries` / `values`, the spread and
+    `Object.assign`, the message encoder: the enumeration predicates tested the prefix to hide the
+    runtime's internal slots (a Date's `__date_ms`, a generator object's `__coro`, a RegExp's
+    `__tsaot_rx_*`, a capture cell's `__value`, the host objects on the global). A user's `__typename`
+    (GraphQL), `__v_skip` (vue), `__dyn` built at run time went missing from every enumeration and
+    serialization. The hidden bit is now per key (`g_field_hidden`, set at `ts_init_fields` and
+    `ts_intern_field` for the runtime's and the compiler's internal names, `field_name_is_internal`:
+    the full names, 32 of them), and the four predicates (`ts_key_is_enumerable_field`,
+    `push_own_name`, `own_name_visible`, `msg_encode_prop`) read it (`field_is_hidden`); the design
+    docs that described the prefix rule say so now.
+  - an object literal's `__proto__: v` member was an own property named `__proto__` (hidden by the
+    rule above; V8 sets the prototype): it sets the prototype now when `v` is an object, a function
+    or null and is ignored otherwise (`object.literalProto`, a static builtin over `ts_set_proto`;
+    the shorthand `{ __proto__ }` and the computed `{ ["__proto__"]: v }` make an own property, as in
+    JS, and so does `JSON.parse`).
+  - `JSON.stringify(new Date(0))` gave `{}`: a Date has no `toJSON` method value in this runtime (its
+    methods are static lowerings), so `json_apply_tojson` found none. A Date serializes through
+    `ts_date_to_json` now (the ISO string, `null` when invalid), `d.toJSON()` compiles
+    (`date.toJSON`), and an invalid date's `toISOString()` throws the catchable RangeError (it
+    aborted the process).
+  Known and kept: `o.__proto__` / `o["__proto__"]` read undefined (CLAUDE.md). Fixtures:
+  `objects/double_underscore_keys` (user `__` keys through every enumeration and copy, the
+  runtime's slots still invisible: a Date, a RegExp, a generator, the iterators, the global),
+  `objects/proto_literal_member` (an object, null, a non-object, the shorthand and computed forms,
+  JSON.parse, a chain, a member after other members), `date/date_to_json` (toJSON, stringify of a
+  Date at every position, an invalid date, a user toJSON beside it, the replacer and indent forms,
+  the RangeError). Cost: none measurable (the hidden bit is one array load in the enumeration predicates; the Date test runs only for an object without a `toJSON`): vue 1,356.7 -> 1,345.7 ms, rxjs 381.6 -> 380.7, yaml 3,543.0 -> 3,534.9 alternating, tsc-ts 22.114 -> 22.114 G instructions, outputs identical. Gates: conformance 643/643 plain and strict, 640/640 under GC protect, unit, bundler 50/50, bench within budget, GC stress.

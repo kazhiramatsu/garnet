@@ -4923,6 +4923,13 @@ class Exporter {
       });
       const emittedAcc = new Set<string>();
       for (const p of node.properties) {
+        if (ts.isPropertyAssignment(p) && (ts.isIdentifier(p.name) || ts.isStringLiteral(p.name)) && p.name.text === "__proto__") {
+          // `{ __proto__: v }` sets the prototype (an object or null; any other value is ignored), as
+          // in JS; the shorthand and computed forms make an own property and take the branches below.
+          const v = this.lowerExpr(ctx, p.initializer);
+          ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "object.literalProto", args: [dst, v] });
+          continue;
+        }
         if (ts.isPropertyAssignment(p) && (ts.isIdentifier(p.name) || ts.isStringLiteral(p.name))) {
           const v = this.lowerExpr(ctx, p.initializer);
           ctx.body.push({ kind: "StoreField", obj: dst, field: this.internField(p.name.text), src: v });
@@ -6222,6 +6229,15 @@ class Exporter {
               ctx.body.push({ kind: "Const", dst: selL, value: { kind: "Num", value: dateComp[fn.name.text] } });
               const dst = this.newLocal(ctx, "primitive");
               ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "date.component", args: [msL, selL] });
+              return dst;
+            }
+            if (fn.name.text === "toJSON") {
+              // Date.prototype.toJSON: the ISO string, null for an invalid date (its key argument is ignored)
+              const recv = this.lowerExpr(ctx, fn.expression);
+              const msL = this.newLocal(ctx, "primitive");
+              ctx.body.push({ kind: "LoadField", dst: msL, obj: recv, field: this.DATE_MS_FIELD });
+              const dst = this.newLocal(ctx, "reference");
+              ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "date.toJSON", args: [msL] });
               return dst;
             }
             if (fn.name.text === "toISOString" || fn.name.text === "toUTCString") {

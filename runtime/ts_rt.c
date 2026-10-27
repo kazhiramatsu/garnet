@@ -10295,7 +10295,7 @@ tsv ts_date_to_locale_time(double ms, tsv locales, tsv options){
 
 /* toISOString: always UTC, "YYYY-MM-DDTHH:mm:ss.sssZ". */
 tsv ts_date_to_iso(double ms){
-  if (ms != ms){ fprintf(stderr,"tsaot: RangeError: Invalid time value\n"); abort(); }
+  if (ms != ms) ts_throw_range_error_msg("Invalid time value");   /* catchable, as V8's */
   time_t secs=(time_t)floor(ms/1000.0); struct tm tm; gmtime_r(&secs,&tm);
   long long m=(long long)floor(ms); long long msec=m%1000; if(msec<0)msec+=1000;
   char buf[40];
@@ -10303,6 +10303,9 @@ tsv ts_date_to_iso(double ms){
     tm.tm_year+1900, tm.tm_mon+1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, msec);
   return ts_new_string(buf,(uint32_t)strlen(buf));
 }
+/* Date.prototype.toJSON: the ISO string, null for an invalid date (the step JSON.stringify takes
+   for a Date, which has no toJSON method value in this runtime: json_apply_tojson). */
+tsv ts_date_to_json(double ms){ return ms != ms ? TS_NULL : ts_date_to_iso(ms); }
 
 /* ---------------- Array: additional methods ---------------- */
 /* callback predicates: find/findIndex/some/every. cb(element, index). */
@@ -11188,6 +11191,30 @@ static uint32_t g_field_cap = 0;
    back through `Reflect.get(target, key)` or used as a Map key costs no allocation, no interning and
    no byte comparison (vue's handlers do all three on every access). */
 static tsv* g_field_strings = NULL;
+/* The runtime's and the compiler's internal slots on user-visible objects (a Date's `__date_ms`, a
+   generator object's `__coro`, a RegExp's `__tsaot_rx_*`, a capture cell's `__value`, the host
+   objects on the global, ...) are hidden from every enumeration, serialization and copy; a user's
+   own `__`-prefixed property (`__typename`, vue's `__v_skip`) is an ordinary property. The bit is
+   decided by the full name when the name is interned, so the enumeration predicates never look at
+   the prefix (every `__` name used to be hidden: a silent omission from `Object.keys`,
+   `JSON.stringify`, `for..in` and the spread). */
+static uint8_t* g_field_hidden = NULL;
+static int field_name_is_internal(const char* n, uint32_t len){
+  static const char* const names[] = {
+    "__value", "__date_ms", "__coro", "__timeoutMs", "__body", "__garnet", "__garnet_json",
+    "__garnet_node", "__garnet_metal", "__promise_resolver_done", "__generator_return_tag",
+    "__generator_return_value", "__text_encoder", "__text_decoder_encoding", "__text_decoder_fatal",
+    "__text_decoder_ignore_bom", "__array_iterator_source", "__array_iterator_index",
+    "__array_iterator_kind", "__map_iterator_source", "__map_iterator_last", "__map_iterator_kind",
+    "__tsaot_rx_prefix", "__tsaot_rx_global", "__tsaot_rx_sticky", "__tsaot_rx_anchor",
+    "__tsaot_rx_flags_mask", "__tsaot_rx_iter_input", "__tsaot_rx_iter_source",
+    "__tsaot_rx_iter_flags", "__tsaot_rx_iter_index", "__tsaot_rx_iter_done" };
+  if (len < 2 || n[0] != '_' || n[1] != '_') return 0;
+  for (size_t i = 0; i < sizeof names / sizeof names[0]; i++)
+    if (strlen(names[i]) == len && memcmp(names[i], n, len) == 0) return 1;
+  return 0;
+}
+static inline int field_is_hidden(uint32_t k){ return k < g_field_count && g_field_hidden && g_field_hidden[k]; }
 /* ---- field-name hash index (P2a: O(1) intern vs O(#fields) memcmp scan) ----
    Maps a field name's FNV-1a hash to its id+1 (0 = empty slot), open-addressed
    with linear probing, power-of-two sized, kept under 3/4 load. The field table
@@ -11250,15 +11277,13 @@ static int field_index_lookup(const char* name, uint32_t len, uint32_t hash, uin
    an enumerable data key", never compare against the base directly. */
 static inline int ts_key_is_method(ts_key k){ return k >= TS_METHOD_KEY_BASE; }
 /* an own enumerable string-data property: a real named field, not a method key,
-   not an internal "__" name. (accessor-ness is checked separately, see
-   prop_enum_data.) */
+   not one of the runtime's hidden internal slots (field_is_hidden). (accessor-ness is checked
+   separately, see prop_enum_data.) */
 static inline int ts_key_is_enumerable_field(ts_key k){
   if (ts_key_is_method(k)) return 0;
   const char* n = ts_field_name(k);
   if (!n) return 0;
-  uint32_t len = ts_field_name_len(k);
-  if (len >= 2 && n[0]=='_' && n[1]=='_') return 0;
-  return 1;
+  return !field_is_hidden(k);
 }
 
 void ts_init_fields(const char* const* names, const uint32_t* lens, uint32_t count){
@@ -11267,9 +11292,11 @@ void ts_init_fields(const char* const* names, const uint32_t* lens, uint32_t cou
   g_field_names = malloc(sizeof(char*)*g_field_cap);
   g_field_lens = malloc(sizeof(uint32_t)*g_field_cap);
   free(g_field_strings); g_field_strings = calloc(g_field_cap, sizeof(tsv));
+  free(g_field_hidden); g_field_hidden = calloc(g_field_cap, 1);
   for (uint32_t i=0;i<count;i++){
     g_field_names[i] = names[i];
     g_field_lens[i] = lens ? lens[i] : (uint32_t)strlen(names[i]);
+    g_field_hidden[i] = (uint8_t)field_name_is_internal(g_field_names[i], g_field_lens[i]);
   }
   g_field_count = count;
   /* build the hash index over the compile-time field table (fresh: this runs once
@@ -11348,6 +11375,8 @@ uint32_t ts_intern_field(const char* name, uint32_t len){
     g_field_lens=realloc(g_field_lens,sizeof(uint32_t)*g_field_cap);
     g_field_strings=realloc(g_field_strings,sizeof(tsv)*g_field_cap);
     memset(g_field_strings + old_cap, 0, sizeof(tsv) * (g_field_cap - old_cap));
+    g_field_hidden=realloc(g_field_hidden,g_field_cap);
+    memset(g_field_hidden + old_cap, 0, g_field_cap - old_cap);
   }
   /* reserve index capacity for one more BEFORE appending, so the rebuild inside
      reserve() (which re-inserts ids [0,g_field_count)) never sees the not-yet-
@@ -11357,6 +11386,7 @@ uint32_t ts_intern_field(const char* name, uint32_t len){
   char* copy=malloc(len+1); memcpy(copy,name,len); copy[len]=0;
   g_field_names[id]=copy;
   g_field_lens[id]=len;
+  if (g_field_hidden) g_field_hidden[id] = (uint8_t)field_name_is_internal(name, len);
   g_field_count = id + 1;
   field_index_put(id);
   return id;
@@ -11452,15 +11482,13 @@ tsv ts_object_keys(tsv obj){
 static void push_own_name(tsv arr, uint32_t key){
   if (key >= TS_METHOD_KEY_BASE) return; /* method/symbol keys are not string names */
   const char* n = ts_field_name(key);
-  uint32_t len = ts_field_name_len(key);
-  if (!n || (len >= 2 && n[0] == '_' && n[1] == '_')) return; /* hide runtime-internal slots */
+  if (!n || field_is_hidden(key)) return; /* the runtime's internal slots */
   ts_array_push_rooted(arr, ts_new_string_from_field_key(key));
 }
 static int own_name_visible(uint32_t key){
   if (key >= TS_METHOD_KEY_BASE) return 0;
   const char* n = ts_field_name(key);
-  uint32_t len = ts_field_name_len(key);
-  return n && !(len >= 2 && n[0] == '_' && n[1] == '_');
+  return n && !field_is_hidden(key);
 }
 static uint32_t propbag_len(tsv owner){
   if (!ts_is_propbag(owner)) return 0;
@@ -11903,7 +11931,17 @@ static tsv json_apply_tojson(tsv v, const char* key, uint32_t keylen){
   if (!ts_is_obj(v)) return v;
   ts_prim_field_init();
   tsv tj = ts_prim_method(v, g_tojson_field, g_tojson_key);
-  if (!ts_is_callable(tj)) return v;
+  if (!ts_is_callable(tj)){
+    /* a Date (the object carrying the time value at the reserved field) serializes as its
+       Date.prototype.toJSON would: the ISO string, null when invalid */
+    static ts_key k_date_ms;
+    if (!k_date_ms) k_date_ms = ts_intern_field("__date_ms", 9);
+    if (((ts_gc_header*)ts_ptr(v))->kind == TS_KIND_OBJECT && ts_has_own(v, k_date_ms)){
+      tsv ms = ts_get(v, k_date_ms);
+      return ts_date_to_json(ts_is_num(ms) ? ts_to_num(ms) : NAN);
+    }
+    return v;
+  }
   ts_gc_root(&v); ts_gc_root(&tj);
   tsv ks = ts_new_string(key ? key : "", key ? keylen : 0);
   ts_gc_root(&ks);
@@ -20455,7 +20493,7 @@ static void msg_encode_prop(uint32_t key, tsv val, void* ud){
   const char* n = ts_field_name(key);
   uint32_t len = ts_field_name_len(key);
   if (key >= TS_METHOD_KEY_BASE || !n) return;              /* symbol and method keys are not own string names */
-  if (len >= 2 && n[0] == '_' && n[1] == '_') return;       /* the runtime's internal slots */
+  if (field_is_hidden(key)) return;                         /* the runtime's internal slots */
   if (ts_is_obj(val) && ((ts_gc_header*)ts_ptr(val))->kind == TS_KIND_ACCESSOR) msg_fail("an accessor property");
   msg_put_u32(c->e, len); msg_put(c->e, n, len);
   msg_encode(c->e, val);

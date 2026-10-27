@@ -22999,6 +22999,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 ),
                 "date.component" => (format!("ts_date_component({}, (int){})", n(0), n(1)), true),
                 "date.toISOString" => (format!("ts_date_to_iso({})", n(0)), false),
+                "date.toJSON" => (format!("ts_date_to_json({})", n(0)), false),
                 "date.toUTCString" => (format!("ts_date_to_utc_string({})", n(0)), false),
                 "date.toLocaleTimeString" => (format!("ts_date_to_locale_time({}, {}, {})", n(0), v(1), v(2)), false),
                 // Object static methods (use the field-name table)
@@ -23039,6 +23040,14 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     false,
                 ),
                 "object.is" => (format!("ts_bool(ts_object_is({}, {}))", v(0), v(1)), false),
+                // an object literal's `__proto__: v` member: the prototype when v is an object or null, else nothing
+                "object.literalProto" => (
+                    format!(
+                        "((ts_is_obj({v}) || ts_is_func({v}) || ts_is_null({v})) ? {f}({o}, {v}) : {o})",
+                        o = v(0), v = v(1), f = user_set_proto_fn()
+                    ),
+                    false,
+                ),
                 "headers.new" => (
                     format!(
                         "ts_headers_new({})",

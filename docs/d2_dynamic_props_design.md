@@ -30,8 +30,9 @@ Special-cased in the exporter so the descriptor literal's shape is inspected:
 
 ## Why accessors were deferred (careful scoping)
 The runtime property model is `ts_prop { uint32_t key; tsv val; }` with NO
-per-property flags; enumerability is derived from the key name (methods / "__"
-prefix are non-enumerable). Supporting accessor properties or per-property
+per-property flags; enumerability is derived from the key (methods, and the
+runtime's internal slots, marked by name at interning since Session 355:
+`field_is_hidden`; a user's `__`-prefixed property is ordinary). Supporting accessor properties or per-property
 enumerable/writable bits via Object.defineProperty would require either growing
 every ts_prop (touches find_slot / ts_get / ts_set) or a side table keyed by
 (object,key) with GC-lifetime handling, plus get/set interception in the hot

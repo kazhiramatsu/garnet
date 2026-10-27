@@ -1795,6 +1795,7 @@ double ts_date_parse_value(tsv v);        /* Date.parse */
 double ts_date_utc(double y, double mo, double d, double h, double mi, double s, double ms);   /* Date.UTC */
 tsv ts_date_to_utc_string(double ms);
 tsv    ts_date_to_iso(double ms);
+tsv    ts_date_to_json(double ms);
 tsv    ts_date_to_locale_time(double ms, tsv locales, tsv options);
 
 /* Array: additional methods */

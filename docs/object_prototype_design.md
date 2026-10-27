@@ -18,7 +18,8 @@ Object.prototype carrying toString / valueOf / hasOwnProperty, so:
 - Two SEPARATE id namespaces: internField (property/field ids) and internName
   (method-name ids). o.m() uses internName; "m" in o / o.m uses internField.
 - class_reg_for(o) matches o->proto pointer against registered CLASS_PROTO[i].
-- field_enumerable excludes METHOD_KEY_BASE+ keys and "__" names.
+- field_enumerable excludes METHOD_KEY_BASE+ keys and the runtime's hidden internal
+  slots (`field_is_hidden`, marked by name at interning; Session 355).
 
 ## Design
 1. Runtime: a single global g_object_proto (ts_object*), created lazily/at setup,
