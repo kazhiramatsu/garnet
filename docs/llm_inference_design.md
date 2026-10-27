@@ -458,13 +458,48 @@ tokens, where llama.cpp's 128-token tile computes a half-empty tile and
 garnet's 64-token tile is full: a configuration fit, not a better kernel.
 Below that llama.cpp's small-batch kernels (`mul_mv_ext`) are leaner, and
 from 128 tokens its kernel reaches about 10.5 TFLOP/s against garnet's 7.7
-at 128 and 5.5 at 512: garnet's 128-token tile measured slower than its
-64-token one (32.8 against 21.8 ms for 51 tokens), so something in the
-kernel's step is less efficient than llama.cpp's; `BATCH_MAX` 128 re-reads
-the weights per chunk (eight reads for 512 tokens: 75 ms of the 199); and
-the attention kernel (64 active threads of 256, serial over the positions)
-grows with the square of the length. Those three are the work to be at
-llama.cpp's rate at every length.
+at 128 and 5.5 at 512.
+
+Where the 199 ms of a 512-token prompt went, each kernel timed alone (one
+warm-up, the best of four): the products 128 ms (four 128-token chunks of 32
+ms; 118 as one chunk), the attention 79 ms (6.1 ms for the first chunk,
+33.6 for the last), the norms, RoPE and SiLU 7 ms. The attention kernel
+was the per-row one: a threadgroup per (head, query row) re-reading the
+whole key and value prefix, about 47 GB over the 22 layers at 512 tokens
+(five times the weights), with 64 of its 256 threads walking the positions
+serially in the value sum; at 51 tokens its 4.3 ms (a fifth of the batch)
+was the launch of 36k small threadgroups.
+
+**Flash attention for the batch** (`attention_batch_64`, `_128`, the shape
+of llama.cpp's `kernel_flash_attn_ext`): a threadgroup of four SIMD groups
+per (kv head, tile of 32 / kvMul rows) holds the 32 queries of those rows'
+heads that share the kv head (scaled, as simdgroup matrices, 8 per SIMD
+group) and walks the cache in blocks of 32 positions (16 for a head size
+of 128) staged once in threadgroup memory for all 32 queries: S = Q K^T by
+simdgroup matrix products (the K block loaded transposed), the online
+softmax per query row (the running max and sum reduced over the row's four
+lanes with `simd_shuffle_xor`, the causal mask as -inf, the factors
+exp(m_old - m_new) written to a diagonal matrix), the output accumulators
+rescaled by that diagonal matrix (`simdgroup_multiply`) and accumulated
+with P V, the rows normalized by 1/l at the end and written through
+threadgroup memory. Float throughout (21 KB of threadgroup memory for a
+head size of 64). The per-row kernel stays for the single-token path and
+for shapes the flash kernel does not take (a head size other than 64 or
+128, a query-head count per kv head that does not divide 32). Measured,
+the same machine and run (the check: 51/51, 0.245, text identical):
+
+| tokens | before (per-row) tok/s | flash attention tok/s | llama.cpp Metal |
+|---|---|---|---|
+| 51 | 2634 | 2706 | 2111 |
+| 128 | 3519 | 3970 | 4466 |
+| 256 | 3142 | 3891 | 4786 |
+| 512 | 2572 | 3759 | 4802 |
+
+What remains at 512 tokens (136 ms): the products' 118 ms against the
+roughly 100 of llama.cpp's whole forward, so the product kernel's step is
+the next target (its 128-token tile is no faster, 113 ms, so it is not the
+tile count: something in the dequantize-barrier-run step), then the
+128-token chunks (about 10 ms of dispatch tails), then the small kernels.
 
 ## Beyond
 

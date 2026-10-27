@@ -10673,3 +10673,22 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   2572 at 512: garnet's 128-token tile is slower than its 64-token one, the
   128-token chunks re-read the weights, the attention kernel grows with the
   square of the length). Next: those three.
+- GPU batched prefill: flash attention (Session 353, `docs/llm_inference_design.md`
+  "Batched prefill"). Kaz asked why longer prompts lose to llama.cpp; timing
+  each kernel alone put 79 of a 512-token prompt's 199 ms in the per-row
+  attention kernel (every (head, row) threadgroup re-read the key and value
+  prefix: about 47 GB over the layers at 512 tokens, five times the
+  weights; 64 of 256 threads serial over the positions), 128 in the
+  products, 7 in the small kernels. The batch now runs `attention_batch_64`
+  / `_128`, llama.cpp's flash attention shape: a threadgroup per (kv head,
+  32 / kvMul rows) with the 32 queries sharing the kv head as simdgroup
+  matrices, the cache in blocks of 32 positions staged once for all of
+  them, S = Q K^T and O += P V as simdgroup matrix products, the online
+  softmax per row with the rescale as a diagonal matrix multiply; the
+  per-row kernel stays for one token and for other shapes. 512 tokens 199
+  -> 136 ms (3759 tok/s; llama.cpp 4802), 256 tokens 3142 -> 3891, 128
+  3519 -> 3970, 51 2634 -> 2706 (llama.cpp 2111); check 51/51 argmax, 0.245
+  max logit difference, text identical. Gates for this lib-only change: the
+  Metal fixtures in the three modes and the GPU differential; the full set
+  runs with the next slice (the product kernel's step efficiency, the
+  128-token chunks).

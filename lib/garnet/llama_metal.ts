@@ -150,7 +150,7 @@ using namespace metal;
 struct MvArgs { uint off; uint off2; uint rows; uint cols; uint flags; uint outOff; };
 struct NormArgs { uint n; float eps; uint wOff; };
 struct RopeArgs { uint d; uint kvDim; uint hs; uint pos0; uint kOff; };
-struct AttnArgs { uint pos0; uint hs; uint kvDim; uint kvMul; uint ctx; uint loff; float scale; uint d; uint nHead; };
+struct AttnArgs { uint pos0; uint hs; uint kvDim; uint kvMul; uint ctx; uint loff; float scale; uint d; uint nHead; uint n; };
 
 // the row's value: flags 2 = silu(v) * v2 (the gate and up products), flags 1 = added to out
 static inline void mv_store(device float* out, constant MvArgs& a, uint row, float v, float v2, uint tiisg) {
@@ -426,6 +426,126 @@ kernel void attention(device const float* q [[buffer(0)]], device const float* k
     xb[qOff + tid] = acc * inv;
   }
 }
+
+// The attention of a batch as llama.cpp's flash attention: a threadgroup per (kv head, tile of TR = 32 / kvMul rows)
+// holds the 32 queries of those rows' heads that share the kv head (8 per SIMD group, scaled, as simdgroup matrices)
+// and walks the cache in blocks of TK positions staged once in threadgroup memory for all 32: S = Q K^T with
+// simdgroup matrices, the online softmax per query row (the running max and sum over the lanes of the row, the
+// causal mask), the output accumulators rescaled by a diagonal matrix of the factors and accumulated with P V; the
+// rows normalized at the end go to xb through threadgroup memory. HS is the head size, TK the block (HS * TK = 2048).
+template<short HS, short TK>
+kernel void attention_batch(device const float* q [[buffer(0)]], device const float* kc [[buffer(1)]],
+                            device const float* vc [[buffer(2)]], device float* xb [[buffer(3)]],
+                            constant AttnArgs& a [[buffer(4)]],
+                            uint2 tg [[threadgroup_position_in_grid]], ushort tiitg [[thread_index_in_threadgroup]],
+                            ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float sk[32 * HS];          // the Q tile [query][i], then the K block [t][i], then the output tile
+  threadgroup float sv[TK * HS];          // the V block [t][i]
+  threadgroup float ss[4 * 8 * TK];       // each SIMD group's scores, then probabilities, [query][t]
+  threadgroup float sm[4 * 64];           // each SIMD group's diagonal matrix of rescale factors
+  const uint kvMul = a.kvMul, TR = 32u / kvMul, g = tg.x, row0 = tg.y * TR, n = a.n, d = a.d;
+  const uint kvHeadOff = g * HS;
+  // query qi (0..31) is row row0 + qi / kvMul (clamped to the batch's last row) of head g * kvMul + qi % kvMul
+  {
+    const uint qi = tiitg >> 2, part = tiitg & 3;
+    const uint row = min(row0 + qi / kvMul, n - 1u), head = g * kvMul + qi % kvMul;
+    device const float4* src = (device const float4*)(q + row * d + head * HS) + part * (HS / 16);
+    threadgroup float4* dst = (threadgroup float4*)(sk + qi * HS) + part * (HS / 16);
+    for (short i = 0; i < HS / 16; i++) dst[i] = src[i] * a.scale;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  simdgroup_float8x8 Q[HS / 8], O[HS / 8];
+  for (short i = 0; i < HS / 8; i++) { simdgroup_load(Q[i], sk + sgitg * 8 * HS + i * 8, HS, 0, false); O[i] = make_filled_simdgroup_matrix<float, 8>(0.0f); }
+  for (uint i = tiitg; i < 4u * 64u; i += 128u) sm[i] = 0.0f;
+  // this lane's query row r of its SIMD group's 8, and its quarter of each block's positions
+  const uint r = tiisg >> 2, jl = tiisg & 3;
+  const uint myPos = a.pos0 + min(row0 + (sgitg * 8u + r) / kvMul, n - 1u);   // positions after it are masked
+  const uint maxPos = a.pos0 + min(row0 + TR - 1u, n - 1u);                    // the furthest position any query here sees
+  float m = -INFINITY, l = 0.0f;
+  threadgroup float* myss = ss + sgitg * 8 * TK;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint t0 = 0; t0 <= maxPos; t0 += TK) {
+    {   // the K and V blocks for positions t0 .. t0 + TK - 1, zero past maxPos: 16 floats of one position per thread
+      const uint TP = 128u / TK, tt = tiitg / TP, part = tiitg % TP, t = t0 + tt;
+      threadgroup float4* kdst = (threadgroup float4*)(sk + tt * HS) + part * 4;
+      threadgroup float4* vdst = (threadgroup float4*)(sv + tt * HS) + part * 4;
+      if (t <= maxPos) {
+        device const float4* ksrc = (device const float4*)(kc + a.loff + t * a.kvDim + kvHeadOff) + part * 4;
+        device const float4* vsrc = (device const float4*)(vc + a.loff + t * a.kvDim + kvHeadOff) + part * 4;
+        for (short i = 0; i < 4; i++) { kdst[i] = ksrc[i]; vdst[i] = vsrc[i]; }
+      } else {
+        for (short i = 0; i < 4; i++) { kdst[i] = float4(0.0f); vdst[i] = float4(0.0f); }
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // S = Q K^T for this SIMD group's 8 queries, TK / 8 blocks of 8 positions
+    for (short j = 0; j < TK / 8; j++) {
+      simdgroup_float8x8 sacc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+      for (short i = 0; i < HS / 8; i++) {
+        simdgroup_float8x8 kt;
+        simdgroup_load(kt, sk + (j * 8) * HS + i * 8, HS, 0, true);   // 8 positions x 8 dims, transposed
+        simdgroup_multiply_accumulate(sacc, Q[i], kt, sacc);
+      }
+      simdgroup_store(sacc, myss + j * 8, TK, 0, false);
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    {   // the online softmax of row r over the block: this lane's TK / 4 positions, the row's max and sum over its 4 lanes
+      const uint tb = t0 + jl * (TK / 4);
+      float v[TK / 4];
+      float rowMax = -INFINITY;
+      for (short k = 0; k < TK / 4; k++) { v[k] = (tb + k <= myPos) ? myss[r * TK + jl * (TK / 4) + k] : -INFINITY; rowMax = max(rowMax, v[k]); }
+      rowMax = max(rowMax, simd_shuffle_xor(rowMax, 1));
+      rowMax = max(rowMax, simd_shuffle_xor(rowMax, 2));
+      const float mNew = max(m, rowMax);
+      const float alpha = (m == -INFINITY) ? 0.0f : exp(m - mNew);
+      float rowSum = 0.0f;
+      for (short k = 0; k < TK / 4; k++) { const float pk = exp(v[k] - mNew); myss[r * TK + jl * (TK / 4) + k] = pk; rowSum += pk; }
+      rowSum += simd_shuffle_xor(rowSum, 1);
+      rowSum += simd_shuffle_xor(rowSum, 2);
+      l = l * alpha + rowSum;
+      m = mNew;
+      if (jl == 0) sm[sgitg * 64 + r * 8 + r] = alpha;
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    {   // O = diag(alpha) O + P V
+      simdgroup_float8x8 D;
+      simdgroup_load(D, sm + sgitg * 64, 8, 0, false);
+      for (short i = 0; i < HS / 8; i++) { simdgroup_float8x8 t; simdgroup_multiply(t, D, O[i]); O[i] = t; }
+      for (short j = 0; j < TK / 8; j++) {
+        simdgroup_float8x8 P;
+        simdgroup_load(P, myss + j * 8, TK, 0, false);
+        for (short i = 0; i < HS / 8; i++) {
+          simdgroup_float8x8 vb;
+          simdgroup_load(vb, sv + (j * 8) * HS + i * 8, HS, 0, false);   // 8 positions x 8 dims
+          simdgroup_multiply_accumulate(O[i], P, vb, O[i]);
+        }
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);   // the next block's K and V overwrite sk and sv
+  }
+  // the rows normalized by 1 / l (a diagonal matrix), staged in sk as [query][i], then to xb
+  if (jl == 0) sm[sgitg * 64 + r * 8 + r] = 1.0f / l;
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+  {
+    simdgroup_float8x8 D;
+    simdgroup_load(D, sm + sgitg * 64, 8, 0, false);
+    for (short i = 0; i < HS / 8; i++) { simdgroup_float8x8 t; simdgroup_multiply(t, D, O[i]); simdgroup_store(t, sk + sgitg * 8 * HS + i * 8, HS, 0, false); }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  {
+    const uint qi = tiitg >> 2, part = tiitg & 3, row = row0 + qi / kvMul;
+    if (row < n) {
+      const uint head = g * kvMul + qi % kvMul;
+      threadgroup const float4* src = (threadgroup const float4*)(sk + qi * HS) + part * (HS / 16);
+      device float4* dst = (device float4*)(xb + row * d + head * HS) + part * (HS / 16);
+      for (short i = 0; i < HS / 16; i++) dst[i] = src[i];
+    }
+  }
+}
+typedef decltype(attention_batch<64, 32>) attention_batch_64_fn;
+template [[host_name("attention_batch_64")]] kernel attention_batch_64_fn attention_batch<64, 32>;
+typedef decltype(attention_batch<128, 16>) attention_batch_128_fn;
+template [[host_name("attention_batch_128")]] kernel attention_batch_128_fn attention_batch<128, 16>;
 `;
 
 /** the arguments of a product: the weight's offset in the model, a second weight's (gate/up),
@@ -464,13 +584,15 @@ interface LayerPlan {
   loff: number;
 }
 /** the batch buffers: `cap` rows of the residual, the normed activation, q, the gate and up products,
- *  a row's attention scores per head, and (for the check) every row's logits */
+ *  a row's attention scores per head (the per-row attention kernel only), and (for the check) every row's logits */
 interface Batch {
   cap: number;
   x: GpuBuffer; xv: Float32Array;
-  xb: GpuBuffer; q: GpuBuffer; hb: GpuBuffer; hb2: GpuBuffer; att: GpuBuffer;
+  xb: GpuBuffer; q: GpuBuffer; hb: GpuBuffer; hb2: GpuBuffer; att: GpuBuffer | null;
   logits: GpuBuffer | null; logitsV: Float32Array;
 }
+/** the flash attention kernel's threads per threadgroup and queries per threadgroup */
+const FA_THREADS = 128, FA_QUERIES = 32;
 
 /** The Metal forward pass of a Llama (its buffers shared with the GPU, its kernels compiled once). */
 export class LlamaMetal {
@@ -488,6 +610,8 @@ export class LlamaMetal {
   private readonly rmsnorm: Pipeline;
   private readonly rope: Pipeline;
   private readonly attention: Pipeline;
+  /** the batch's flash attention (a head size of 64 or 128 and a query-head count per kv head that divides 32), else null: the per-row kernel */
+  private readonly attentionBatch: Pipeline | null;
   private readonly siluMul: Pipeline;
   private readonly model: GpuBuffer;
   private readonly x: GpuBuffer; private readonly xb: GpuBuffer; private readonly q: GpuBuffer; private readonly hb: GpuBuffer;
@@ -515,7 +639,7 @@ export class LlamaMetal {
     this.lm = lm;
     this.device = deviceName();
     this.ropeArgs = new Uint32Array(5);
-    this.attnArgs = new ArrayBuffer(36);
+    this.attnArgs = new ArrayBuffer(40);
     this.attnU = new Uint32Array(this.attnArgs);
     this.attnF = new Float32Array(this.attnArgs);
     this.siluN = new Uint32Array(1);
@@ -546,6 +670,7 @@ export class LlamaMetal {
     this.rmsnorm = this.lib.pipeline("rmsnorm");
     this.rope = this.lib.pipeline("rope");
     this.attention = this.lib.pipeline("attention");
+    this.attentionBatch = (lm.headSize === 64 || lm.headSize === 128) && FA_QUERIES % lm.kvMul === 0 ? this.lib.pipeline(`attention_batch_${lm.headSize}`) : null;
     this.siluMul = this.lib.pipeline("silu_mul");
     const q8 = this.matvecs.get(GGML_Q8_0) as Pipeline;
     if (q8.threadExecutionWidth !== 32) throw new Error(`garnet:llama_metal: the kernels assume a SIMD width of 32 (the device has ${q8.threadExecutionWidth})`);
@@ -696,10 +821,10 @@ export class LlamaMetal {
     const mk = (len: number): GpuBuffer => new GpuBuffer(new SharedArrayBuffer(len * 4));
     let b = this.batch;
     if (b === null || b.cap < n) {
-      if (b !== null) { for (const g of [b.x, b.xb, b.q, b.hb, b.hb2, b.att]) g.release(); if (b.logits !== null) b.logits.release(); }
+      if (b !== null) { for (const g of [b.x, b.xb, b.q, b.hb, b.hb2]) g.release(); if (b.att !== null) b.att.release(); if (b.logits !== null) b.logits.release(); }
       const cap = Math.min(BATCH_MAX, Math.ceil(n / MM_TOKENS) * MM_TOKENS);
       const x = mk(cap * d);
-      b = { cap, x, xv: new Float32Array(x.storage), xb: mk(cap * d), q: mk(cap * d), hb: mk(cap * lm.nFf), hb2: mk(cap * lm.nFf), att: mk(cap * lm.nHead * lm.ctx), logits: null, logitsV: new Float32Array(0) };
+      b = { cap, x, xv: new Float32Array(x.storage), xb: mk(cap * d), q: mk(cap * d), hb: mk(cap * lm.nFf), hb2: mk(cap * lm.nFf), att: this.attentionBatch === null ? mk(cap * lm.nHead * lm.ctx) : null, logits: null, logitsV: new Float32Array(0) };
       this.batch = b;
     }
     if (all && b.logits === null) { const g = mk(b.cap * lm.vocab); b.logits = g; b.logitsV = new Float32Array(g.storage); }
@@ -716,8 +841,9 @@ export class LlamaMetal {
     const cmd = new CommandBuffer({ concurrent: true });   // q, k and v, then gate and up, overlap; a barrier before each dependent group
     const ropeArgs = this.ropeArgs, attnU = this.attnU, siluN = this.siluN;
     ropeArgs[3] = pos0;
-    attnU[0] = pos0;
+    attnU[0] = pos0; attnU[9] = n;
     siluN[0] = n * ff;
+    const faRows = FA_QUERIES / lm.kvMul;   // rows per flash-attention threadgroup
     const ropeGroups = Math.ceil((d >> 1) / NORM_THREADS), siluGroups = Math.ceil((n * ff) / NORM_THREADS);
     for (let l = 0; l < lm.nLayer; l++) {
       const L = this.layers[l], W = lm.layers[l];
@@ -732,7 +858,11 @@ export class LlamaMetal {
       cmd.pipeline(this.rope); cmd.buffer(0, b.q); cmd.buffer(1, this.kc); cmd.buffer(2, this.cosT); cmd.buffer(3, this.sinT); cmd.bytes(4, ropeArgs); cmd.dispatch3(ropeGroups, n, 1, NORM_THREADS, 1, 1);
       cmd.barrier();
       attnU[5] = L.loff;
-      cmd.pipeline(this.attention); cmd.buffer(0, b.q); cmd.buffer(1, this.kc); cmd.buffer(2, this.vc); cmd.buffer(3, b.att); cmd.buffer(4, b.xb); cmd.bytes(5, this.attnArgs); cmd.dispatch3(lm.nHead, n, 1, ATTN_THREADS, 1, 1);
+      if (this.attentionBatch !== null) {
+        cmd.pipeline(this.attentionBatch); cmd.buffer(0, b.q); cmd.buffer(1, this.kc); cmd.buffer(2, this.vc); cmd.buffer(3, b.xb); cmd.bytes(4, this.attnArgs); cmd.dispatch3(lm.nHeadKv, Math.ceil(n / faRows), 1, FA_THREADS, 1, 1);
+      } else {
+        cmd.pipeline(this.attention); cmd.buffer(0, b.q); cmd.buffer(1, this.kc); cmd.buffer(2, this.vc); cmd.buffer(3, b.att as GpuBuffer); cmd.buffer(4, b.xb); cmd.bytes(5, this.attnArgs); cmd.dispatch3(lm.nHead, n, 1, ATTN_THREADS, 1, 1);
+      }
       cmd.barrier();
       this.product(cmd, W.wo, L.mo, n, b.xb, b.x);
       cmd.barrier();
@@ -766,6 +896,6 @@ export class LlamaMetal {
   release(): void {
     for (const b of [this.model, this.x, this.xb, this.q, this.hb, this.logits, this.att, this.kc, this.vc, this.norms, this.cosT, this.sinT, this.touchOut]) b.release();
     const b = this.batch;
-    if (b !== null) { for (const g of [b.x, b.xb, b.q, b.hb, b.hb2, b.att]) g.release(); if (b.logits !== null) b.logits.release(); this.batch = null; }
+    if (b !== null) { for (const g of [b.x, b.xb, b.q, b.hb, b.hb2]) g.release(); if (b.att !== null) b.att.release(); if (b.logits !== null) b.logits.release(); this.batch = null; }
   }
 }
