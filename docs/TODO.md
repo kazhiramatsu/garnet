@@ -11103,3 +11103,20 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   JSON.parse, a chain, a member after other members), `date/date_to_json` (toJSON, stringify of a
   Date at every position, an invalid date, a user toJSON beside it, the replacer and indent forms,
   the RangeError). Cost: none measurable (the hidden bit is one array load in the enumeration predicates; the Date test runs only for an object without a `toJSON`): vue 1,356.7 -> 1,345.7 ms, rxjs 381.6 -> 380.7, yaml 3,543.0 -> 3,534.9 alternating, tsc-ts 22.114 -> 22.114 G instructions, outputs identical. Gates: conformance 643/643 plain and strict, 640/640 under GC protect, unit, bundler 50/50, bench within budget, GC stress.
+- Const aliases of builtin functions (Session 355, `docs/real_projects.md` vue "The second round").
+  Modern libraries bind builtins to module-level constants (`@vue/shared`: `export const isArray =
+  Array.isArray`, `extend = Object.assign`, `const hasOwnProperty = Object.prototype.hasOwnProperty`
+  with `hasOwn = (val, key) => hasOwnProperty.call(val, key)`, `objectToString =
+  Object.prototype.toString` with `toTypeString`; lodash's `nativeKeys`, `objectToString`), and
+  every call through one went through the function value: `isArray(x)` was `ts_call` of
+  `ts_fnval_array_isArray` over an argument vector, `hasOwnProperty.call(val, key)` the
+  `function.call` builtin over the `hasOwnProperty` function value (vue's `get` trap calls both on
+  every access). The exporter records such bindings in the module walk (`constBuiltinAliases`: `const
+  f = NS.member` for Math, Number, Object, Array, String, Date and Reflect, a member the program never
+  reassigns; `constProtoMethodAliases`: `Object.prototype.hasOwnProperty` and `toString`), a call
+  `f(args)` lowers to the builtin's static call as `NS.member(args)` does (`builtinAliasCallName`
+  through `namespaceBuiltin`; an argument count without a static form, a spread, the value forms
+  and a shadowing local keep the value call), and `m.call(x, key)` / `m.call(x)` lower to
+  `object.hasOwn` / `objproto.toStringCall` (`ts_has_own_dyn`, `ts_objproto_tostring_call`). The
+  binding is read first and checked (`binding.check`: a ReferenceError in the TDZ, as V8 throws).
+  `TSAOT_BUILTIN_ALIAS=0` keeps the value calls. vue: 30 direct `isArray` calls, 6 `hasOwn` and 2 `toTypeString` sites in the program, 39.25 -> 39.11 G instructions (-0.4%), 1,348.5 -> 1,340.2 ms alternating (within the spread); tsc-ts 22.117 -> 22.131 G (unchanged); outputs identical. Fixtures: `functions/builtin_const_aliases` (Array, Object, Math, Number, String and Date aliases called and passed as values, the `.call` forms on every receiver kind and a null receiver, an argument count without a static form, a spread, a shadowing local and parameter, the TDZ), bundler `builtin_alias_import` (the aliases imported by name and through a namespace import). Gates: conformance 644/644 plain and strict, 641/641 under GC protect, unit, bundler 51/51, bench within budget (`string_unicode_search_kernel` 101 ms against its 100 in the run, 98 and 99 re-timed alone: at its budget's edge before this slice too, no alias in it).

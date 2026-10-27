@@ -609,6 +609,11 @@ class Exporter {
    *  is read first where the call may run before the declaration, the TDZ). Modern TypeScript
    *  declares most helpers this way (vue's isObject, hasOwn, isRef: a function-value call each). */
   constFnSymbols = new Map<ts.Symbol, number>();
+  /** module-level `const f = NS.member` bindings naming a builtin function value (`isArray = Array.isArray`):
+   *  a call through one is the builtin's static call (builtinAliasCallName) */
+  constBuiltinAliases = new Map<ts.Symbol, { ns: string; member: string }>();
+  /** module-level `const m = Object.prototype.hasOwnProperty | toString`: `m.call(x, ...)` is the runtime's implementation */
+  constProtoMethodAliases = new Map<ts.Symbol, string>();
   scriptGlobalVarSyms = new Set<ts.Symbol>();
   scriptGlobalVarNames = new Set<string>();
   moduleTopBindingByName = new Map<string, ts.Symbol>();
@@ -2219,6 +2224,26 @@ class Exporter {
                 // free variables are not computed here (the capture analysis runs later, and its
                 // cache must not see an early answer)
                 this.constFnSymbols.set(s, fid);
+              }
+            }
+            if (s && isConst && d.initializer && process.env.TSAOT_BUILTIN_ALIAS !== "0") {
+              // `const isArray = Array.isArray`, `const extend = Object.assign` (vue's shared helpers,
+              // lodash's `nativeKeys = Object.keys`): a call through the binding is the builtin's static
+              // call, as `NS.member(args)` lowers; `const hasOwnProperty = Object.prototype.hasOwnProperty`
+              // and `objectToString = Object.prototype.toString` make `m.call(x, ...)` the runtime's
+              // implementation. A namespace member the program may have reassigned keeps the value call.
+              const init = this.unwrapExpr(d.initializer);
+              if (ts.isPropertyAccessExpression(init) && ts.isIdentifier(init.expression) && ts.isIdentifier(init.name) &&
+                  ["Math", "Number", "Object", "Array", "String", "Date", "Reflect"].includes(init.expression.text) &&
+                  this.isBuiltinNamespaceRef(init.expression, init.expression.text) &&
+                  !this.globalMemberMaybeMutated(init.expression.text, init.name.text)) {
+                this.constBuiltinAliases.set(s, { ns: init.expression.text, member: init.name.text });
+              } else if (ts.isPropertyAccessExpression(init) && ts.isIdentifier(init.name) &&
+                  (init.name.text === "hasOwnProperty" || init.name.text === "toString") &&
+                  ts.isPropertyAccessExpression(init.expression) && ts.isIdentifier(init.expression.expression) &&
+                  init.expression.name.text === "prototype" && this.isBuiltinNamespaceRef(init.expression.expression, "Object") &&
+                  !this.globalMemberMaybeMutated("Object", "prototype")) {
+                this.constProtoMethodAliases.set(s, init.name.text);
               }
             }
           }
@@ -5909,6 +5934,7 @@ class Exporter {
         if (fn.text === "Array" && isBuiltinSym) {
           return this.lowerArrayConstruct(ctx, Array.from(node.arguments), node, hint);
         }
+        const aliasBuiltin = sym && !node.arguments.some((a) => ts.isSpreadElement(a)) ? this.builtinAliasCallName(sym, node.arguments.length) : undefined;
         if (sym && this.funcSymbols.has(sym)) {
           // Generic function monomorphization: if the callee is generic and the
           // call has concrete type args, route to a specialized clone whose body
@@ -5937,6 +5963,18 @@ class Exporter {
           // The lexical name of a named function expression denotes this exact
           // lifted function. The regular Direct-call path below threads captures.
           callee = { kind: "Direct", func: ctx.id };
+        } else if (aliasBuiltin !== undefined) {
+          // a module-level `const f = NS.member` naming a builtin (vue's `isArray = Array.isArray`): the
+          // builtin's static call, as `NS.member(args)` lowers; the binding is read first (a
+          // ReferenceError in the TDZ, as V8 throws)
+          const fv = this.lowerExpr(ctx, fn);
+          this.checkClassBindingInitialized(ctx, fn, fv);
+          const argLs = this.lowerSequenced(ctx, node.arguments);
+          const numericResult = aliasBuiltin.startsWith("math.") || aliasBuiltin.endsWith("parseInt")
+            || aliasBuiltin.endsWith("parseFloat") || aliasBuiltin === "number.coerce" || aliasBuiltin === "date.now";
+          const dst = this.newLocal(ctx, numericResult ? "primitive" : "reference");
+          ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: aliasBuiltin, args: argLs });
+          return dst;
         } else if (sym && this.constFnSymbols.has(sym)) {
           // a module-level `const f = (...) => ...` without `this`, `arguments` or captures: its
           // function, called directly; the binding is read first where the call may precede the
@@ -6560,6 +6598,22 @@ class Exporter {
             const s = this.newLocal(ctx, this.refKindOf(fn.expression));
             ctx.body.push({ kind: "Copy", dst: s, src: recv });
             recv = s;
+          }
+          // `m.call(x, ...)` through a module-level `const m = Object.prototype.hasOwnProperty / toString`
+          // (vue's `hasOwn` and `toTypeString`, lodash's `objectToString`): the runtime's implementation,
+          // without the function value and its argument vector
+          if (fn.name.text === "call" && ts.isIdentifier(fn.expression) && !node.arguments.some((a) => ts.isSpreadElement(a))) {
+            const aliasSym = this.symbolOf(fn.expression);
+            const alias = aliasSym ? this.constProtoMethodAliases.get(aliasSym) : undefined;
+            const builtin = alias === "hasOwnProperty" && node.arguments.length === 2 ? "object.hasOwn"
+              : alias === "toString" && node.arguments.length === 1 ? "objproto.toStringCall" : undefined;
+            if (builtin !== undefined && recv !== undefined) {
+              this.checkClassBindingInitialized(ctx, fn.expression, recv);
+              const argLs = this.lowerSequenced(ctx, node.arguments);
+              const dst = this.newLocal(ctx, "reference");
+              ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin, args: argLs });
+              return dst;
+            }
           }
           // `f.call(thisArg, ...args)` / `f.apply(thisArg, arr)` where the receiver's type names
           // Function.prototype's member (a function-typed value: rxjs's `project.call(thisArg, value, index)`
@@ -7826,6 +7880,14 @@ class Exporter {
       builtin: "object.defineData:0:1:1", args: [proto, key, classValue] });
   }
 
+  /** The static builtin a call through a const alias of `NS.member` lowers to (constBuiltinAliases), or
+   *  undefined when the member or this argument count has none: the call then goes through the value. */
+  private builtinAliasCallName(sym: ts.Symbol, argc: number): string | undefined {
+    const a = this.constBuiltinAliases.get(sym);
+    if (!a) return undefined;
+    const sname = this.namespaceBuiltin(a.ns, a.member, argc);
+    return sname === undefined || sname === "__UNSUPPORTED__" ? undefined : sname;
+  }
   /** A class binding read where its declaration may not have run yet (from
    *  another function: the same function's earlier reads are rejected at
    *  compile time) holds undefined until then: reading it is a ReferenceError

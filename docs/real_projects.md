@@ -424,6 +424,7 @@ names its phase.
 | direct calls of module-level const functions (`@vue/shared`'s helpers) | 1,569 | 766 | 2.0 |
 | an ordinary enum's members folded to their constants (`ReactiveFlags`, `TrackOpTypes`, the compiler's `NodeTypes`) | 1,342 | 767 | 1.75 |
 | a constant key at a dynamic-key site (`r[ReactiveFlags.IS_REF]`, `target[ReactiveFlags.RAW]`) interned once, the named cache | 1,338 (wall unchanged; 1.7% fewer instructions) | | |
+| `@vue/shared`'s builtin aliases (`isArray = Array.isArray`, `hasOwnProperty.call`, `objectToString.call`) called as the builtins | 1,340 (wall unchanged; 0.4% fewer instructions) | | |
 
 The first run is the correctness milestone. The first tuning round (alternating A/B against the
 previous binary each time) took the reactivity phase from 1,749 to 1,030 ms:
@@ -484,3 +485,15 @@ getting that table's id) and the site takes the named inline cache directly (`ts
 fewer instructions (39.97 -> 39.28 G) at the same wall and cycles (1,324 -> 1,338 ms alternating,
 within the run-to-run spread); the next step for this phase is the cache misses themselves, not the
 key.
+
+`@vue/shared` binds builtins to module constants (`export const isArray = Array.isArray`,
+`extend = Object.assign`, `hasOwn = (val, key) => hasOwnProperty.call(val, key)` over `const
+hasOwnProperty = Object.prototype.hasOwnProperty`, `toTypeString` over `objectToString =
+Object.prototype.toString`), the idiom of most libraries, and a call through such a binding went
+through the function value: an argument vector, the generic entry, and for `.call` the
+`function.call` builtin over the method's value. The exporter records the bindings in its module walk
+and lowers the calls as the builtins (`isArray(x)` as `Array.isArray(x)`, `hasOwnProperty.call(v, k)`
+as `Object.hasOwn`'s runtime, `objectToString.call(v)` as the tag builtin), the value forms and a
+shadowing local untouched and the binding still read first for the TDZ. vue: 30 direct `isArray`
+calls in the program, 39.25 -> 39.11 G instructions (-0.4%), wall within the spread (1,348 -> 1,340
+ms alternating).

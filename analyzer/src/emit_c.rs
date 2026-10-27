@@ -23040,6 +23040,8 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     false,
                 ),
                 "object.is" => (format!("ts_bool(ts_object_is({}, {}))", v(0), v(1)), false),
+                // `Object.prototype.toString.call(v)` through a const alias of the method
+                "objproto.toStringCall" => (format!("ts_objproto_tostring_call({})", v(0)), false),
                 // an object literal's `__proto__: v` member: the prototype when v is an object or null, else nothing
                 "object.literalProto" => (
                     format!(
