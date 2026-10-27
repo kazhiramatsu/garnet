@@ -10692,3 +10692,18 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   Metal fixtures in the three modes and the GPU differential; the full set
   runs with the next slice (the product kernel's step efficiency, the
   128-token chunks).
+- GPU batched prefill: the 128-token tensor tile and 512-token chunks
+  (Session 353, `docs/llm_inference_design.md` "Batched prefill"). llama.cpp's
+  `test-backend-ops perf` (built in `build/llama.cpp/build`) isolates its
+  Q8_0 product: 9.47 TFLOP/s on 4096 x 14336 x 512; garnet's tensor kernel
+  6.69 with the 64-token tile and 9.07 with a 128-token tile (K steps of 64,
+  32-row tiles, packed int8 loads: no gain; constants in place of the
+  weights: 11.1, so the dequantize is 18% as in llama.cpp). The batch picks
+  the smallest of the 32, 64 and 128-token tiles that holds it, and with
+  the flash attention kernel a chunk is 512 tokens (128 with the per-row
+  kernel). 512 tokens 136 -> 122.5 ms (4178 tok/s; llama.cpp 4802), 256
+  65.8 -> 60.0 (4270), 128 31.8 (4019), 51 18.4 (2778; llama.cpp 2111).
+  The remaining 15 ms at 512: the norms, RoPE and SiLU (10.3 ms of
+  bandwidth over the batch's activations) and the attention (9.7). Fixture
+  `modules/llama_metal_matmul` covers the 128-token tile. Next: SiLU in the
+  gate/up products' epilogue, then the attention.

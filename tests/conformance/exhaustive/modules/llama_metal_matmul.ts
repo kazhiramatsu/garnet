@@ -5,10 +5,10 @@
 // product accumulated onto another. The GPU computes them under garnet; TypeScript computes the same
 // products under Node (or where Metal is absent); the printed values must agree byte for byte. The
 // Metal 4 tensor kernels (where that library compiles: an M5 under macOS 26) run a second Q8_0 weight
-// of small values, since their relaxed precision keeps only small integer sums exact: both token
+// of small values, since their relaxed precision keeps only small integer sums exact: the three token
 // tiles, an output at an offset with a stride, and the accumulating form.
 import { available, Library, GpuBuffer, CommandBuffer } from "garnet:metal";
-import { KERNEL_SOURCE, TENSOR_KERNEL_SOURCE, matmulArgs, MM_ROWS, MM_TOKENS, MM_THREADS, TM_ROWS, TM_TOKENS, TM_TOKENS_SMALL } from "garnet:llama_metal";
+import { KERNEL_SOURCE, TENSOR_KERNEL_SOURCE, matmulArgs, MM_ROWS, MM_TOKENS, MM_THREADS, TM_ROWS, TM_TOKENS, TM_TOKENS_SMALL, TM_TOKENS_LARGE } from "garnet:llama_metal";
 
 const ROWS = 70, COLS = 64, N = 37;   // 64 + 6 rows, 32 + 5 tokens, two blocks of 32 columns
 const Q8_OFF = 0, Q8_ROW = (COLS >> 5) * 34;          // 68 bytes per row
@@ -18,7 +18,7 @@ const F32_OFF = 16352, F32_ROW = COLS * 4;
 const S8_OFF = 34304;                                 // the small-valued Q8_0 weight of the tensor kernels
 const MODEL_BYTES = 40960;
 const OUT_OFF = 5, OUT_STRIDE = ROWS + 3;
-const N2 = 70;                                        // the tensor kernels' tokens: two tiles of 64, three of 32
+const N2 = 70;                                        // the tensor kernels' tokens: two tiles of 64, three of 32, one of 128
 
 /** the f16 bits of a value with at most ten fraction bits in [2^-14, 2^15) (exact) */
 function f16(v: number): number {
@@ -74,26 +74,30 @@ function describe(name: string, out: Float32Array, off: number, stride: number, 
   for (let t = 0; t < n; t++) for (let r = 0; r < ROWS; r++) h = (Math.imul(h, 31) + out[off + t * stride + r] * 4) | 0;
   return `${name}: ${out[off]} ${out[off + 1]} ${out[off + ROWS - 1]} ${out[off + (n - 1) * stride + 17]} ${out[off + (n - 1) * stride + ROWS - 1]} hash ${h}`;
 }
-/** The tensor kernels over the small weight: a plain product per token tile, then the accumulating form at
- *  an offset with a stride; the reference where the library is absent. */
+/** The tensor kernels over the small weight: a plain product per token tile (the large tile holds the 70 tokens
+ *  with room to spare), then the accumulating form at an offset with a stride; the reference where the library
+ *  is absent. */
 function tensorPart(modelSab: SharedArrayBuffer, w: number[], lines: string[]): void {
   const x2 = new Float32Array(new SharedArrayBuffer(N2 * COLS * 4));
   for (let i = 0; i < x2.length; i++) x2[i] = ((((i / COLS) | 0) * 5 + (i % COLS) * 3) % 3) - 1;   // -1, 0, 1
   const outA = new Float32Array(new SharedArrayBuffer(N2 * ROWS * 4));                 // the TM_TOKENS tile
   const outB = new Float32Array(new SharedArrayBuffer(N2 * ROWS * 4));                 // the TM_TOKENS_SMALL tile
+  const outL = new Float32Array(new SharedArrayBuffer(N2 * ROWS * 4));                 // the TM_TOKENS_LARGE tile
   const outC = new Float32Array(new SharedArrayBuffer((OUT_OFF + N2 * OUT_STRIDE) * 4));   // twice the product, accumulated
   let lib: Library | null = null;
   if (available()) { try { lib = new Library(TENSOR_KERNEL_SOURCE, { languageVersion: "4.0" }); } catch (e) { lib = null; } }
   if (lib !== null) {
-    const large = lib.pipeline(`matmul_q8_t${TM_TOKENS}`), small = lib.pipeline(`matmul_q8_t${TM_TOKENS_SMALL}`);
+    const large = lib.pipeline(`matmul_q8_t${TM_TOKENS}`), small = lib.pipeline(`matmul_q8_t${TM_TOKENS_SMALL}`), largest = lib.pipeline(`matmul_q8_t${TM_TOKENS_LARGE}`);
     const model = new GpuBuffer(modelSab), bx = new GpuBuffer(x2.buffer as SharedArrayBuffer);
-    const outs = [outA, outB, outC].map((o) => new GpuBuffer(o.buffer as SharedArrayBuffer));
+    const outs = [outA, outB, outC, outL].map((o) => new GpuBuffer(o.buffer as SharedArrayBuffer));
     const rowGroups = Math.ceil(ROWS / TM_ROWS);
     const cmd = new CommandBuffer();
     cmd.pipeline(large); cmd.buffer(0, model); cmd.buffer(1, bx); cmd.buffer(2, outs[0]);
     cmd.bytes(3, matmulArgs(S8_OFF, ROWS, COLS, Q8_ROW, N2, 0, COLS, 0, ROWS, 0)); cmd.dispatch3(Math.ceil(N2 / TM_TOKENS), rowGroups, 1, MM_THREADS, 1, 1);
     cmd.pipeline(small); cmd.buffer(0, model); cmd.buffer(1, bx); cmd.buffer(2, outs[1]);
     cmd.bytes(3, matmulArgs(S8_OFF, ROWS, COLS, Q8_ROW, N2, 0, COLS, 0, ROWS, 0)); cmd.dispatch3(Math.ceil(N2 / TM_TOKENS_SMALL), rowGroups, 1, MM_THREADS, 1, 1);
+    cmd.pipeline(largest); cmd.buffer(0, model); cmd.buffer(1, bx); cmd.buffer(2, outs[3]);
+    cmd.bytes(3, matmulArgs(S8_OFF, ROWS, COLS, Q8_ROW, N2, 0, COLS, 0, ROWS, 0)); cmd.dispatch3(Math.ceil(N2 / TM_TOKENS_LARGE), rowGroups, 1, MM_THREADS, 1, 1);
     for (let pass = 0; pass < 2; pass++) {
       cmd.pipeline(large); cmd.buffer(0, model); cmd.buffer(1, bx); cmd.buffer(2, outs[2]);
       cmd.bytes(3, matmulArgs(S8_OFF, ROWS, COLS, Q8_ROW, N2, 0, COLS, OUT_OFF, OUT_STRIDE, pass)); cmd.dispatch3(Math.ceil(N2 / TM_TOKENS), rowGroups, 1, MM_THREADS, 1, 1);
@@ -104,10 +108,11 @@ function tensorPart(modelSab: SharedArrayBuffer, w: number[], lines: string[]): 
   } else {
     product(w, x2, outA, 0, ROWS, false, N2);
     product(w, x2, outB, 0, ROWS, false, N2);
+    product(w, x2, outL, 0, ROWS, false, N2);
     product(w, x2, outC, OUT_OFF, OUT_STRIDE, false, N2);
     product(w, x2, outC, OUT_OFF, OUT_STRIDE, true, N2);
   }
-  lines.push(describe("tensor", outA, 0, ROWS, N2), describe("tensor small tile", outB, 0, ROWS, N2), describe("tensor twice", outC, OUT_OFF, OUT_STRIDE, N2));
+  lines.push(describe("tensor", outA, 0, ROWS, N2), describe("tensor small tile", outB, 0, ROWS, N2), describe("tensor large tile", outL, 0, ROWS, N2), describe("tensor twice", outC, OUT_OFF, OUT_STRIDE, N2));
   lines.push("tensor untouched: " + outC[0] + " " + outC[OUT_OFF + ROWS] + " " + outC[OUT_OFF + ROWS + 2]);
 }
 function main(): void {

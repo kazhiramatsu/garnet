@@ -495,11 +495,44 @@ the same machine and run (the check: 51/51, 0.245, text identical):
 | 256 | 3142 | 3891 | 4786 |
 | 512 | 2572 | 3759 | 4802 |
 
-What remains at 512 tokens (136 ms): the products' 118 ms against the
-roughly 100 of llama.cpp's whole forward, so the product kernel's step is
-the next target (its 128-token tile is no faster, 113 ms, so it is not the
-tile count: something in the dequantize-barrier-run step), then the
-128-token chunks (about 10 ms of dispatch tails), then the small kernels.
+The product kernel against llama.cpp's, isolated. llama.cpp's
+`test-backend-ops perf -o MUL_MAT` (built from Kaz's checkout) times one
+Q8_0 x F32 product of 4096 x 14336 by 512 tokens at 6.35 ms, 9.47 TFLOP/s
+(its small-batch kernel at 8 tokens: 1.46 TFLOP/s, 91 GB/s of weights).
+garnet's tensor kernel on the same bytes: the 64-token tile 8.98 ms, 6.69
+TFLOP/s; the 128-token tile 6.63 ms, 9.07 TFLOP/s (sustained over 60 runs:
+the clocks are not the difference); K steps of 64, 32-row tiles and
+llama.cpp's packed int8 loads measured no better; with the weight loads
+replaced by constants the 128-token tile runs 11.1 TFLOP/s, so the
+dequantize costs 18%, as in llama.cpp. On TinyLlama's own products the
+128-token tile had looked only marginally better (113 against 118 ms for
+512 tokens) because its matrices are small (2048 rows: 32 row tiles) and
+short (64 steps): the tile's gain shows on large products. The batch now
+picks the smallest tile that holds it (32, 64 or 128 tokens), and with the
+flash attention kernel a chunk is 512 tokens (`BATCH_MAX`; 128 with the
+per-row kernel, whose scores scratch grows with the chunk).
+
+The other kernels at 512 tokens in one chunk: the flash attention 9.7 ms
+(10.9 as four chunks of 128: 1.1, 2.2, 3.3, 4.4), the norms, RoPE and
+SiLU 10.3 ms (bandwidth: the activations of 512 tokens are 4 to 11 MB per
+pass, about 60 MB per layer). Measured over prompt lengths after the
+128-token tile and the 512-token chunks (the check 51/51, 0.245, text
+identical):
+
+| tokens | garnet tok/s | llama.cpp Metal | ratio |
+|---|---|---|---|
+| 51 | 2778 | 2111 | 1.32 |
+| 64 | 3423 | 2612 | 1.31 |
+| 128 | 4019 | 4466 | 0.90 |
+| 256 | 4270 | 4786 | 0.89 |
+| 512 | 4178 | 4802 | 0.87 |
+
+What remains at 512 tokens (122 ms against 107): the products are at
+llama.cpp's rate (about 106 ms); the rest is the small kernels (10 ms: the
+gate and up products could carry SiLU in their epilogue through the
+cooperative tensor's elements, removing a pass over 11 MB per layer and the
+up product's buffer) and the attention (9.7 ms; llama.cpp's tensor-API
+flash attention is faster still).
 
 ## Beyond
 

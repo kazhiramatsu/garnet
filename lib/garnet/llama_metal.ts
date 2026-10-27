@@ -40,12 +40,14 @@ const NORM_THREADS = 256, ATTN_THREADS = 256;
 /** the batched product's tile: MM_ROWS weight rows by MM_TOKENS tokens per threadgroup of MM_THREADS
  *  threads (four SIMD groups, each 32 rows by 16 tokens), MM_K columns per step (one quantized block) */
 export const MM_ROWS = 64, MM_TOKENS = 32, MM_K = 32, MM_THREADS = 128;
-/** the tensor kernels' tile: TM_ROWS weight rows by TM_TOKENS_SMALL (a batch of at most that many
- *  tokens) or TM_TOKENS tokens per threadgroup of MM_THREADS threads (four SIMD groups), TM_K columns
- *  per step; measured on the M5 over 8 to 200 tokens against tiles of 16 and 128 */
-export const TM_ROWS = 64, TM_TOKENS_SMALL = 32, TM_TOKENS = 64, TM_K = 32;
-/** the most tokens one batched forward pass runs (a longer prompt goes in chunks) */
-export const BATCH_MAX = 128;
+/** the tensor kernels' tiles: TM_ROWS weight rows by TM_TOKENS_SMALL, TM_TOKENS or TM_TOKENS_LARGE tokens
+ *  per threadgroup of MM_THREADS threads (four SIMD groups), the smallest tile that holds the batch; TM_K
+ *  columns per step. Measured on the M5: 32 and 64 for batches up to 64 tokens (a 128-token tile is 1.5x
+ *  slower there), 128 beyond (9.1 against 6.7 TFLOP/s on a 4096 x 14336 product of 512 tokens) */
+export const TM_ROWS = 64, TM_TOKENS_SMALL = 32, TM_TOKENS = 64, TM_TOKENS_LARGE = 128, TM_K = 32;
+/** the most tokens one batched forward pass runs with the flash attention kernel (a longer prompt goes in
+ *  chunks), and with the per-row attention kernel (its scores scratch grows with the chunk) */
+export const BATCH_MAX = 512, BATCH_MAX_PER_ROW = 128;
 
 /** the part of the source both libraries share: the batched product's arguments and the weight rows */
 const ROW_SOURCE = `struct MmArgs { uint off; uint rows; uint cols; uint rowBytes; uint n; uint bOff; uint bStride; uint outOff; uint outStride; uint flags; };
@@ -109,14 +111,16 @@ kernel void matmul_tensor_t(device const char* model [[buffer(0)]], device const
 #pragma clang loop unroll(full)
     for (uint16_t i = 0; i < cT.get_capacity(); ++i) if (cT.is_valid_element(i)) cT[i] = 0.0f;
   }
-  // this thread loads 16 weights of row (tiitg / 2), half (tiitg & 1) of the step; a row past the tile's
-  // valid ones reads the last valid one (its results are outside the stored tile)
-  const int row = tiitg >> 1, chunk = tiitg & 1;
-  device const char* wrow = model + a.off + (uint)(r0 + min(row, tileM - 1)) * a.rowBytes;
+  // the step's weights, 16 per work item (a row and a 16-column chunk), the items over the threads; a row
+  // past the tile's valid ones reads the last valid one (its results are outside the stored tile)
+  device const char* wbase = model + a.off;
   for (int k = 0; k < K; k += TM_K) {
-    half va[16];
-    mm_row16<KIND>(wrow, (uint)(k + chunk * 16), va);
-    for (short i = 0; i < 16; i++) sa[row * TM_K + chunk * 16 + i] = va[i];
+    for (int w = tiitg; w < TM_ROWS * (TM_K / 16); w += 128) {
+      const int row = w / (TM_K / 16), chunk = w % (TM_K / 16);
+      half va[16];
+      mm_row16<KIND>(wbase + (uint)(r0 + min(row, tileM - 1)) * a.rowBytes, (uint)(k + chunk * 16), va);
+      for (short i = 0; i < 16; i++) sa[row * TM_K + chunk * 16 + i] = va[i];
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const int kExt = min((int)TM_K, K - k);
     auto tAv = tensor(sa, dextents<int32_t, 2>(kExt, TM_ROWS), array<int, 2>({1, TM_K}));
@@ -126,6 +130,11 @@ kernel void matmul_tensor_t(device const char* model [[buffer(0)]], device const
   }
   cT.store(tD);
 }
+typedef decltype(matmul_tensor_t<0, ${TM_TOKENS_LARGE}>) matmul_tensor_large_fn;
+template [[host_name("matmul_q8_t${TM_TOKENS_LARGE}")]] kernel matmul_tensor_large_fn matmul_tensor_t<0, ${TM_TOKENS_LARGE}>;
+template [[host_name("matmul_q4_t${TM_TOKENS_LARGE}")]] kernel matmul_tensor_large_fn matmul_tensor_t<1, ${TM_TOKENS_LARGE}>;
+template [[host_name("matmul_f16_t${TM_TOKENS_LARGE}")]] kernel matmul_tensor_large_fn matmul_tensor_t<2, ${TM_TOKENS_LARGE}>;
+template [[host_name("matmul_f32_t${TM_TOKENS_LARGE}")]] kernel matmul_tensor_large_fn matmul_tensor_t<3, ${TM_TOKENS_LARGE}>;
 typedef decltype(matmul_tensor_t<0, ${TM_TOKENS}>) matmul_tensor_fn;
 template [[host_name("matmul_q8_t${TM_TOKENS}")]] kernel matmul_tensor_fn matmul_tensor_t<0, ${TM_TOKENS}>;
 template [[host_name("matmul_q4_t${TM_TOKENS}")]] kernel matmul_tensor_fn matmul_tensor_t<1, ${TM_TOKENS}>;
@@ -607,6 +616,7 @@ export class LlamaMetal {
   private readonly matmuls: Map<number, Pipeline> = new Map();
   private readonly tensorMatmuls: Map<number, Pipeline> = new Map();        // the TM_TOKENS tile
   private readonly tensorMatmulsSmall: Map<number, Pipeline> = new Map();   // the TM_TOKENS_SMALL tile
+  private readonly tensorMatmulsLarge: Map<number, Pipeline> = new Map();   // the TM_TOKENS_LARGE tile
   private readonly rmsnorm: Pipeline;
   private readonly rope: Pipeline;
   private readonly attention: Pipeline;
@@ -659,10 +669,11 @@ export class LlamaMetal {
         for (let i = 0; i < kinds.length; i++) {
           this.tensorMatmuls.set(kinds[i], tlib.pipeline(`matmul_${names[i]}_t${TM_TOKENS}`));
           this.tensorMatmulsSmall.set(kinds[i], tlib.pipeline(`matmul_${names[i]}_t${TM_TOKENS_SMALL}`));
+          this.tensorMatmulsLarge.set(kinds[i], tlib.pipeline(`matmul_${names[i]}_t${TM_TOKENS_LARGE}`));
         }
         tensor = true;
       } catch (e) {
-        this.tensorMatmuls.clear(); this.tensorMatmulsSmall.clear();
+        this.tensorMatmuls.clear(); this.tensorMatmulsSmall.clear(); this.tensorMatmulsLarge.clear();
         tensor = false;
       }
     }
@@ -737,9 +748,9 @@ export class LlamaMetal {
     args[MM_N] = n;
     let p: Pipeline, tokGroups: number;
     if (this.tensor) {
-      const small = n <= TM_TOKENS_SMALL;
-      p = (small ? this.tensorMatmulsSmall : this.tensorMatmuls).get(w.type) as Pipeline;
-      tokGroups = Math.ceil(n / (small ? TM_TOKENS_SMALL : TM_TOKENS));
+      const tok = n <= TM_TOKENS_SMALL ? TM_TOKENS_SMALL : n <= TM_TOKENS ? TM_TOKENS : TM_TOKENS_LARGE;
+      p = (tok === TM_TOKENS_SMALL ? this.tensorMatmulsSmall : tok === TM_TOKENS ? this.tensorMatmuls : this.tensorMatmulsLarge).get(w.type) as Pipeline;
+      tokGroups = Math.ceil(n / tok);
     } else {
       p = this.matmuls.get(w.type) as Pipeline;
       tokGroups = Math.ceil(n / MM_TOKENS);
@@ -803,14 +814,16 @@ export class LlamaMetal {
       for (let i = 0; i < n; i++) lg = this.forward(tokens[i], pos0 + i);
       return lg;
     }
-    for (let c = 0; c < n; c += BATCH_MAX) this.runBatch(tokens, c, Math.min(n - c, BATCH_MAX), pos0 + c, false);
+    const chunk = this.attentionBatch !== null ? BATCH_MAX : BATCH_MAX_PER_ROW;
+    for (let c = 0; c < n; c += chunk) this.runBatch(tokens, c, Math.min(n - c, chunk), pos0 + c, false);
     return this.lm.logits;
   }
   /** Every token's logits, `tokens.length` rows of `vocab` floats (at most BATCH_MAX tokens): the
    *  check of the batched path against the CPU's per position. */
   forwardBatchAll(tokens: number[], pos0: number): Float32Array {
     const n = tokens.length;
-    if (n === 0 || n > BATCH_MAX) throw new RangeError(`garnet:llama_metal: forwardBatchAll takes 1 to ${BATCH_MAX} tokens`);
+    const chunk = this.attentionBatch !== null ? BATCH_MAX : BATCH_MAX_PER_ROW;
+    if (n === 0 || n > chunk) throw new RangeError(`garnet:llama_metal: forwardBatchAll takes 1 to ${chunk} tokens`);
     if (!this.batched) throw new Error("garnet:llama_metal: the model has no batched path (a product's columns are not a multiple of 32)");
     const b = this.runBatch(tokens, 0, n, pos0, true);
     return b.logitsV.subarray(0, n * this.lm.vocab);
@@ -822,7 +835,7 @@ export class LlamaMetal {
     let b = this.batch;
     if (b === null || b.cap < n) {
       if (b !== null) { for (const g of [b.x, b.xb, b.q, b.hb, b.hb2]) g.release(); if (b.att !== null) b.att.release(); if (b.logits !== null) b.logits.release(); }
-      const cap = Math.min(BATCH_MAX, Math.ceil(n / MM_TOKENS) * MM_TOKENS);
+      const cap = Math.min(this.attentionBatch !== null ? BATCH_MAX : BATCH_MAX_PER_ROW, Math.ceil(n / MM_TOKENS) * MM_TOKENS);
       const x = mk(cap * d);
       b = { cap, x, xv: new Float32Array(x.storage), xb: mk(cap * d), q: mk(cap * d), hb: mk(cap * lm.nFf), hb2: mk(cap * lm.nFf), att: this.attentionBatch === null ? mk(cap * lm.nHead * lm.ctx) : null, logits: null, logitsV: new Float32Array(0) };
       this.batch = b;
