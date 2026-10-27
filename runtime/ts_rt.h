@@ -382,6 +382,10 @@ enum { TS_PROP_ENUMERABLE = 1, TS_PROP_WRITABLE = 2, TS_PROP_CONFIGURABLE = 4,
        TS_PROP_ACCESSOR = 8,
        /* a shaped object's slot holding an int32 zero-extended (docs/record_int_fields_design.md) */
        TS_PROP_INT32 = 16,
+       /* a sized instance's record of one struct field's redefined attributes (ts_rt.c
+          sized_field_attr_find): an entry under the field's key with the ordinary bits all clear
+          and the field's effective enumerable and configurable attributes in the high bits */
+       TS_PROP_FIELD_ATTR = 32, TS_PROP_FIELD_ATTR_ENUM = 64, TS_PROP_FIELD_ATTR_CONF = 128,
        TS_PROP_DEFAULT = TS_PROP_ENUMERABLE | TS_PROP_WRITABLE | TS_PROP_CONFIGURABLE };
 static inline int prop_is_enumerable(const ts_prop* p){ return (p->flags & TS_PROP_ENUMERABLE) != 0; }
 static inline int prop_is_writable(const ts_prop* p){ return (p->flags & TS_PROP_WRITABLE) != 0; }
@@ -1370,6 +1374,10 @@ typedef struct ts_func {
      (docs/function_own_properties_design.md). Same byte as proto_lazy. */
   uint8_t name_gone : 1;
   uint8_t length_gone : 1;
+  /* 1: a runtime constructor (an Error kind's value, a derived class over a runtime base):
+     `new fn(...)` calls the code with the arguments alone and takes the object it returns;
+     no instance is allocated for it (ts_construct). */
+  uint8_t native_ctor : 1;
   /* For a CLASS VALUE (a class used as a runtime value, `const K = C`): the
      class id PLUS ONE (0 = ordinary function/closure, not a constructor). `new K()`
      reads this via ts_construct. code holds the constructor cfunc; env holds the
@@ -1753,8 +1761,11 @@ tsv    ts_date_now_ms(void);
 double ts_date_from_components(double y,double mo,double d,double h,double mi,double s,double mil);
 double ts_date_component(double ms, int which);
 double ts_date_value_ms(tsv v);          /* new Date(value): a Date, an ISO or toString-shaped string, else ToNumber */
+tsv ts_error_ctor_value(int kind);     /* an Error kind as a constructor value (one per kind) */
+tsv ts_class_extend_dyn(tsv parent, tsv name);   /* `class D extends <value> {}`: a derived constructor */
 double ts_date_parse_chars(const char* s, uint32_t len);
 double ts_date_parse_value(tsv v);        /* Date.parse */
+double ts_date_utc(double y, double mo, double d, double h, double mi, double s, double ms);   /* Date.UTC */
 tsv ts_date_to_utc_string(double ms);
 tsv    ts_date_to_iso(double ms);
 tsv    ts_date_to_locale_time(double ms, tsv locales, tsv options);

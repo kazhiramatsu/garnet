@@ -1,43 +1,47 @@
-// Inside a static method, `this.X` resolves to the class's STATIC members:
-// a sibling static method call (`this.helper()`), a static method as a value
-// (`const m = this.f`), and a static field read (incl. inherited from a parent).
-// Writing an OWN static field via `this` works; writing an INHERITED one is a JS
-// shadowing-own-property case that is loud-rejected (not tested here).
-class Calc {
-  static base = 10;
-  static factor = 3;
-  static raw() { return this.base + this.factor; }       // this.staticField read
-  static scaled() { return this.raw() * 2; }             // this.staticMethod() call
-  static deep() { return this.scaled() + this.base; }    // nested this.method() + field
-  static viaValue(x: number) { const f = this.identity; return f(x); } // this.method as value
-  static identity(x: number) { return x; }
-  static setBase(v: number) { this.base = v; }           // this.ownStaticField write
+// `this` inside static members is the class value, as in JS: `new this(...)` in a static factory (yaml's
+// `Collection.from`: `new this(schema)`), also when the factory is inherited and called on a subclass or
+// through a variable holding the class; `this.name`, `this === C`, `this.prototype`; a static getter
+// using `this` (the singleton idiom `this._inst ??= new this()`); a static setter; a static block and
+// static field initializers reading `this`; an inherited static counter bumped through `this` writes the
+// subclass's own static (the parent's stays); a static method detached as a callback runs with `this`
+// undefined (`new this` throws a TypeError); `typeof this`.
+class Shape {
+  static count = 0;
+  static registry = new Map<string, typeof Shape>();
+  static tag = "shape:" + this.name;
+  static { this.registry.set(this.name, this); }
+  constructor(public size: number) {}
+  static make(size: number): Shape { return new this(size); }
+  static bump(): number { return ++this.count; }
+  static describe(): string { return this.name + "/" + (this === Shape) + "/" + typeof this + "/" + (typeof this.prototype.area === "function"); }
+  static get instance(): Shape { return (this._inst ??= new this(1)); }
+  static set label(v: string) { this.tag = v + ":" + this.name; }
+  static _inst: Shape | undefined;
+  area(): number { return this.size * this.size; }
 }
-
-class Base { static label = "base"; }
-class Sub extends Base {
-  static who() { return this.label; }                    // inherited static field via this
+class Circle extends Shape {
+  static { this.registry.set("circle", this); }
+  area(): number { return 3 * this.size * this.size; }
 }
-
 function main(): void {
-  console.log(Calc.raw());        // 13
-  console.log(Calc.scaled());     // 26
-  console.log(Calc.deep());       // 36
-  console.log(Calc.viaValue(7));  // 7
-
-  // write an own static field via this, then read it back
-  Calc.setBase(100);
-  console.log(Calc.raw());        // 103
-  console.log(Calc.base);         // 100  (also visible via ClassName)
-
-  // inherited static field read via this
-  console.log(Sub.who());         // base
-
-  // ---- regressions ----
-  console.log(Calc.identity(5));  // 5   (direct static call)
-  const f = Calc.identity;        // static method (no `this`) as a value
-  console.log(f(9));              // 9
-  console.log([1, 2, 3].map(Calc.identity).join(",")); // 1,2,3  (callback)
+  const out: string[] = [];
+  const a = Shape.make(2), c = Circle.make(3);
+  out.push(a.constructor.name, String(a instanceof Shape), c.constructor.name, String(c instanceof Circle), String(c.area()));
+  const M: typeof Shape = Circle;
+  out.push(M.make(4).constructor.name, String(M.make(4) instanceof Circle));
+  out.push(Shape.describe(), Circle.describe());
+  out.push(Shape.instance.constructor.name, String(Shape.instance === Shape.instance), Circle.instance.constructor.name, String(Circle.instance !== Shape.instance), String(Circle.instance.area()));
+  out.push(String(Shape.bump()), String(Circle.bump()), String(Circle.bump()), String(Shape.count), String(Circle.count), String(Object.hasOwn(Circle, "count")));
+  out.push(Shape.tag, Circle.tag);
+  Circle.label = "round";
+  out.push(Shape.tag, Circle.tag);
+  out.push(String(Shape.registry.get("Shape") === Shape), String(Shape.registry.get("circle") === Circle), String(Circle.registry === Shape.registry), String(Shape.registry.size));
+  const detached = Shape.make;
+  let threw = "";
+  try { detached(5); } catch (e) { threw = (e as Error).constructor.name; }
+  out.push(threw);
+  const bound = Shape.make.bind(Circle);
+  out.push(bound(6).constructor.name, (Shape.make.call(Circle, 7) as Shape).constructor.name);
+  console.log(out.join("\n"));
 }
-
 main();

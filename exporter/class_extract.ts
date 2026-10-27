@@ -54,6 +54,27 @@ function isQualifiedName(e: ts.Expression): boolean {
 export type MKind = "method" | "getter" | "setter";
 
 export interface MethodInfo { name: string; kind: MKind; isGenerator?: boolean; }
+/** A class with no members over a base that is a runtime value (`class D extends Parent {}` with
+ *  `Parent` a binding, a call or a member expression): it is not laid out as a class; the exporter
+ *  lowers it to a derived constructor over the value (`ts_class_extend_dyn`). A base naming a class
+ *  declaration or a library class (Error) stays a class. Returns the base expression when it applies. */
+export function dynamicBaseEmptyClass(decl: ts.ClassLikeDeclaration, checker: ts.TypeChecker): ts.Expression | undefined {
+  if (decl.members.length !== 0) return undefined;
+  const ext = decl.heritageClauses?.find((h) => h.token === ts.SyntaxKind.ExtendsKeyword);
+  if (!ext || ext.types.length !== 1) return undefined;
+  const expr = ext.types[0].expression;
+  if (ts.isIdentifier(expr) || (ts.isPropertyAccessExpression(expr) && isQualifiedName(expr))) {
+    let sym = checker.getSymbolAtLocation(ts.isIdentifier(expr) ? expr : expr.name);
+    if (sym && (sym.flags & ts.SymbolFlags.Alias)) sym = checker.getAliasedSymbol(sym);
+    const decls = sym?.getDeclarations() ?? [];
+    if (decls.length === 0) return undefined;   // unresolved: the class path reports it
+    if (decls.some((d) => ts.isClassDeclaration(d) || ts.isClassExpression(d))) return undefined;   // a class
+    if (decls.every((d) => d.getSourceFile().isDeclarationFile)) return undefined;   // a library class
+    return expr;   // a binding that holds a constructor value
+  }
+  return expr;   // a call, an element access, a conditional: a mixin or a runtime value
+}
+
 export interface ClassInfo {
   id: number;
   name: string;
@@ -159,6 +180,7 @@ export class ClassExtractor {
 
   // ----- pass 1: declare classes, own members -----
   private declareClass(decl: ts.ClassLikeDeclaration) {
+    if (dynamicBaseEmptyClass(decl, this.checker)) return;   // a derived constructor over a runtime value, not a class
     const name = decl.name?.text ?? `anonClass${this.classes.length}`;
     const id = this.classes.length;
     const info: ClassInfo = {

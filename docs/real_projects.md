@@ -92,13 +92,103 @@ The remaining profile is flat: array allocation (volume: a trie search allocates
 arrays), the interning of the fresh path segments, the segment strings themselves, and the
 property cache for the null-prototype `children` records.
 
+## What the next three projects taught garnet (session 354)
+
+Constructs, again implemented with conformance fixtures:
+
+- `class D extends Parent {}` with `Parent` a runtime value (zod's `$constructor` idiom): the
+  exporter lowers a member-less class over a non-class base to a derived constructor the
+  runtime builds (`ts_class_extend_dyn`: `new D(args)` constructs the base and gives the instance
+  D's prototype, D's statics chain to the base, `D.name` is the class's). The Error constructors
+  are first-class values (`const E = Error; new E(msg)`, `E(msg)`, `Reflect.construct`, one object
+  per kind, `TypeError.__proto__ === Error`): a `native_ctor` function the runtime constructs
+  through.
+- `this` inside a static member is the class value, as in JS (`new this(schema)` in yaml's
+  `Collection.from`, `this.name`, `this === C`, the singleton getter `this._inst ??= new this()`).
+  It had been the proto-linked static container, which `new` could not construct. The static
+  initializer takes the class value as a parameter and links it to the fresh container before any
+  initializer runs; `C.m()`, `C.getter` and `C.setter = v` through the class name pass the class
+  value; a class without a constructible value keeps the container. A static field read `Sub.x`
+  now loads the subclass's own container (the chain finds an inherited one), so a static written
+  through `this` in an inherited method (`++this.count` run as `Sub.bump()`) shadows the parent's.
+- A class field redefined with non-default attributes on one instance (yaml's
+  `Object.defineProperty(this, 'schema', { enumerable: false, configurable: true, writable: true })`
+  in a constructor): the instance's sidecar map holds a record under the field's key
+  (`TS_PROP_FIELD_ATTR`, its ordinary attribute bits clear so no enumeration or name walk reports
+  it, the effective enumerable and configurable bits in the high bits); the value stays in the
+  struct slot, so the typed accesses are unchanged; `delete` folds the record into the dictionary
+  entry. A field cannot become read-only or an accessor this way (the inline stores would not see
+  it): a TypeError, as before.
+- `Object.assign` onto a function (a callable namespace: `Object.assign(function Buffer() {}, statics)`),
+  a spread of a function's own properties, `Symbol.<unknown>` (`Symbol.observable`) reading as
+  undefined so rxjs's feature test falls back to a string key, `Date.UTC`, `instanceof` with a
+  callable builtin behind `typeof BigInt !== "undefined"` and with a union-typed right-hand side,
+  `node:buffer`'s `Buffer` as a function (`typeof Buffer === "function"`), the named exports of
+  `node:process`, `process.emitWarning` delivered on the next tick with Node's one-time hint.
+- The Node side of a benchmark is now a program emit (`transpile_tree.js` with the project's own
+  compiler options), so a re-export of a type-only name is elided as the project's own build would.
+
+Two deviations noted rather than fixed: the conformance oracle transpiles at ES2020 (legacy
+class-field semantics: a declared field without an initializer is created at its first
+assignment), while garnet lays every declared field out at its declaration position, so the key
+order of such a field differs under that oracle (the fixtures initialize their fields); and a
+static written on a subclass that has no static container of its own lands on the ancestor's
+container (V8: an own property of the subclass).
+
 ## zod
 
-`benchmarks/real/zod/driver.ts` parses a user schema with `parse` and `safeParse`. After the
-constructs above, one reject remains: `class Definition extends Parent {}` in `core.ts`, where
-`Parent` is a runtime value (`Error`, or `Object`); a probe also showed `Error` as a first-class
-constructor value (`const P: any = Error; new P("x")`) throwing "Error is not a constructor".
-Both are needed for zod; they are the next slice.
+`benchmarks/real/zod/driver.ts` parses a user schema with `parse` and `safeParse`. The dynamic
+base class and the Error constructor values compile; the run stops at module initialization:
+`util.ts` builds `BIGINT_FORMAT_RANGES` with `BigInt("-9223372036854775808")` and friends, and
+garnet has no bigint (CLAUDE.md known items: "the whole numeric-type story"). zod's bigint
+schemas are not in the driver, but the constant is evaluated when the module loads, so zod needs
+a bigint value type (a 128-bit integer with a loud overflow would cover zod and the usual feature
+tests): a slice of its own.
+
+## rxjs
+
+`benchmarks/real/rxjs/driver.ts` runs synchronous pipelines over ranges (map, filter, scan,
+mergeMap, take, zip, merge, pairwise, concatMap) and a Subject with three subscribers, 40 rounds;
+the checksum adds the emitted values and the completion counts. Outputs identical. Wall, median
+of 3:
+
+| state | garnet | Node | ratio |
+|---|---|---|---|
+| first run | 709 | 152 | 4.7 |
+| inherited reads of a sized instance through the (class word, key) cache | 534 | 152 | 3.5 |
+
+The first profile put 22% in the chain walk of `destination.next` (an interface-typed subscriber
+reading a prototype method as a value, 13.7 M out-of-line reads): the method cache's (class
+word, key) entry now answers an inherited property read on a sized instance (the holder's shape
+word and slot, re-read on every hit). The receivers with own dynamic properties (an
+`OperatorSubscriber` assigns `this._next = ...`) still take the slow path (2.0 M reads left).
+
+What the second profile shows (`sample`, 300 rounds): `project.call(thisArg, value, index)` in
+map and filter reads `call` through the function's prototype chain on every value (5.9 M
+out-of-line reads, 11.8 M probes, 11% with `invoke_with_this`); `Array.prototype.shift` on the
+mergeMap and concatMap buffers moves the elements (5%); the try/catch of every delivered value
+(`OperatorSubscriber._next`, `ConsumerObserver.next`) costs its setjmp (3%); `errorContext(() =>
+...)` allocates a closure per `next`. Next: `fn.call`/`fn.apply` lowered to the runtime's
+`Function.prototype` implementations without the property read, the inherited-read cache on
+receivers whose dynamic properties lack the key, an O(1) `shift`.
+
+## yaml
+
+`benchmarks/real/yaml/driver.ts` parses a 500-line document of records to plain values,
+stringifies it back and parses it through the Document API, 300 rounds over 16 distinct string
+objects of the text; the checksum adds the parsed fields, the output lengths and a hash of the
+output. Outputs identical. Wall: garnet 5911 ms, Node 1289 (4.6x).
+
+The profile (`sample`): yaml's lexer and parser are generators delegating to generators
+(`yield* this.pushSpaces(true)`), and garnet's generator machinery dominates: every generator
+object's creation allocates a promise (`coro_alloc` -> `ts_promise_new_v`, 13% of the samples;
+only an async generator needs one), every `next()` builds its `{value, done}` result through two
+dynamic property additions (`ts_set_named_prop` -> `props_append_f`, `shape_transition_f`, about
+15%), and the collector's share is 17% (the nursery refills and marks of those objects). Then
+the regular expressions of the scalar lexer (4%), and `===` on one-character strings
+(`isEmpty`'s `ch === ' '`, a content compare: 4%; V8 compares internalized one-character strings
+by identity). Next: the promise only for async generators, the iteration result as a pre-shaped
+object, canonical one-character strings.
 
 ## prisma
 

@@ -1,16 +1,35 @@
 // The Node side of a real-project benchmark (benchmarks/real/run.sh): the TypeScript sources of a tree
-// transpiled to ES modules with the repo's TypeScript (no type check, no bundler), the relative
-// import specifiers rewritten to the emitted files (`./x` -> `./x.mjs`, `./x.js` -> `./x.mjs`,
-// `./dir` -> `./dir/index.mjs`), so Node runs the same source garnet compiles.
+// emitted as ES modules by the repo's TypeScript (a program emit, so a re-export of a type-only name is
+// elided as the project's own build would; no bundler), the relative import specifiers rewritten to the
+// emitted files (`./x` -> `./x.mjs`, `./x.js` and `./x.ts` -> `./x.mjs`, `./dir` -> `./dir/index.mjs`),
+// so Node runs the same source garnet compiles.
 //   node transpile_tree.js <source root> <out root> <entry.ts relative to root> [paths.json]
-// Only the files reachable from the entry are emitted (the import graph through relative specifiers
-// and, with paths.json, a map of bare specifiers to source files, the tsconfig's `paths` of a
-// workspace; other bare specifiers are left as is and reported).
+// The program is the entry's import graph under the project's compiler options (<root>/garnet-tsconfig.json
+// when present, the options garnet compiled with); with paths.json, a map of bare specifiers to source
+// files (the tsconfig's `paths` of a workspace) rewrites those too; other bare specifiers are left as is
+// and reported.
 const ts = require(process.env.ROOT + "/exporter/node_modules/typescript");
 const fs = require("fs"), path = require("path");
 const [root, out, entry] = process.argv.slice(2, 5).map((p, i) => (i < 2 ? path.resolve(p) : p));
 const pathsMap = process.argv[5] ? JSON.parse(fs.readFileSync(process.argv[5], "utf8")) : {};
-const seen = new Set(), bare = new Set();
+const bare = new Set();
+// the project's options: module resolution, paths, target features; the emit settings are ours
+let options = { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext, moduleResolution: ts.ModuleResolutionKind.Bundler, strict: false };
+const cfgPath = path.join(root, "garnet-tsconfig.json");
+if (fs.existsSync(cfgPath)) {
+  const cfg = ts.readConfigFile(cfgPath, ts.sys.readFile);
+  const parsed = ts.parseJsonConfigFileContent(cfg.config, ts.sys, root);
+  options = { ...parsed.options };
+}
+Object.assign(options, {
+  noEmit: false, emitDeclarationOnly: false, declaration: false, declarationMap: false, sourceMap: false, inlineSourceMap: false,
+  incremental: false, composite: false, tsBuildInfoFile: undefined, outDir: out, rootDir: root, module: ts.ModuleKind.ESNext,
+  target: ts.ScriptTarget.ES2022, verbatimModuleSyntax: false, isolatedModules: false, importsNotUsedAsValues: undefined,
+  preserveValueImports: undefined, rewriteRelativeImportExtensions: false, noEmitOnError: false, removeComments: true,
+  allowImportingTsExtensions: true, types: [], plugins: undefined,
+});
+if (options.module !== undefined && options.moduleResolution === undefined) options.moduleResolution = ts.ModuleResolutionKind.Bundler;
+const program = ts.createProgram([path.resolve(root, entry)], options);
 function resolveRel(fromFile, spec) {
   if (!spec.startsWith(".")) {   // a bare specifier of the workspace map
     const mapped = pathsMap[spec];
@@ -24,29 +43,27 @@ function resolveRel(fromFile, spec) {
   return null;
 }
 function emitted(file) { return path.join(out, path.relative(root, file)).replace(/\.(ts|tsx|mts)$/, ".mjs"); }
-function visit(file) {
-  if (seen.has(file)) return;
-  seen.add(file);
-  const src = fs.readFileSync(file, "utf8");
-  const sf = ts.createSourceFile(file, src, ts.ScriptTarget.ES2022, true, file.endsWith("x") ? ts.ScriptKind.TSX : ts.ScriptKind.TS);
-  const js = ts.transpileModule(src, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext, jsx: ts.JsxEmit.React, verbatimModuleSyntax: false, importsNotUsedAsValues: 0 }, fileName: file }).outputText;
-  // rewrite the specifiers of the emitted module: every relative one that resolves in the source tree
-  const outJs = js.replace(/((?:from|import)\s*\(?\s*['"])([^'"]+)(['"])/g, (m, a, spec, b) => {
+let count = 0;
+const result = program.emit(undefined, (fileName, text) => {
+  if (!fileName.endsWith(".js")) return;
+  // the source this output came from: the out-relative path back under the root
+  const rel = path.relative(out, fileName).replace(/\.js$/, "");
+  const source = [rel + ".ts", rel + ".tsx", rel + ".mts"].map((r) => path.join(root, r)).find((f) => fs.existsSync(f));
+  if (!source) return;
+  const outJs = text.replace(/((?:from|import)\s*\(?\s*['"])([^'"]+)(['"])/g, (m, a, spec, b) => {
     if (spec.startsWith("node:") || spec.startsWith("garnet:")) return m;
-    const target = resolveRel(file, spec);
-    if (target === null) return m;
-    visit(target);
-    let rel = path.relative(path.dirname(emitted(file)), emitted(target)).replace(/\\/g, "/");
-    if (!rel.startsWith(".")) rel = "./" + rel;
-    return a + rel + b;
+    const target = resolveRel(source, spec);
+    if (target === null) { if (!spec.startsWith(".")) bare.add(spec); return m; }
+    let r = path.relative(path.dirname(emitted(source)), emitted(target)).replace(/\\/g, "/");
+    if (!r.startsWith(".")) r = "./" + r;
+    return a + r + b;
   });
-  for (const m of js.matchAll(/(?:from|import)\s*\(?\s*['"]([^'".][^'"]*)['"]/g)) if (!pathsMap[m[1]] && !m[1].startsWith("node:")) bare.add(m[1]);
-  const dst = emitted(file);
+  const dst = emitted(source);
   fs.mkdirSync(path.dirname(dst), { recursive: true });
   fs.writeFileSync(dst, outJs);
-  void sf;
-}
-visit(path.resolve(root, entry));
+  count++;
+});
 fs.writeFileSync(path.join(out, "package.json"), '{"type":"module"}\n');
-process.stdout.write(`${seen.size} modules -> ${out}\n`);
+process.stdout.write(`${count} modules -> ${out}\n`);
+if (result.emitSkipped) process.stdout.write("emit skipped\n");
 if (bare.size) process.stdout.write(`bare specifiers left as is: ${[...bare].join(", ")}\n`);

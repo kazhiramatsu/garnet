@@ -1914,6 +1914,12 @@ static void ts_proxy_enum(tsv pv, ts_prop_enum_cb_fwd cb, void* ud);
 /* Object.getPrototypeOf: return the object's prototype (or null). */
 tsv ts_get_proto(tsv obj){
   if (g_has_proxies && ts_is_proxy(obj)) return ts_proxy_get_proto(obj);
+  if (ts_is_func(obj)){
+    /* a function's [[Prototype]]: Function.prototype unless relinked (a class value's base, a derived
+       constructor over a runtime value: `Object.getPrototypeOf(Derived) === Base`) */
+    ts_object* o = ts_ptr(obj);
+    return ts_proto_ref(o->proto) ? o->proto : ts_function_proto();
+  }
   if (!ts_is_obj(obj)) return TS_NULL;
   ts_object* o = ts_ptr(obj);
   return ts_proto_ref(o->proto) ? o->proto : TS_NULL;
@@ -2988,6 +2994,8 @@ static inline int pref_is_accessor(ts_pref r){ return (pref_flags(r) & TS_PROP_A
 static inline int pref_is_writable(ts_pref r){ return (pref_flags(r) & TS_PROP_WRITABLE) != 0; }
 static inline int pref_is_enumerable(ts_pref r){ return (pref_flags(r) & TS_PROP_ENUMERABLE) != 0; }
 static inline int pref_is_configurable(ts_pref r){ return (pref_flags(r) & TS_PROP_CONFIGURABLE) != 0; }
+static int sized_field_enumerable(ts_object* o, ts_key key);     /* a struct field's effective attributes */
+static int sized_field_configurable(ts_object* o, ts_key key);   /* (an instance's record, else the defaults) */
 /* ---- integer slots: generalization and the kind-aware store (docs/record_int_fields_design.md) ---- */
 /* The sibling of shape `sid` with slot `slot` boxed: the chain from the root run
    again with that transition's TS_PROP_INT32 bit cleared (the other objects of
@@ -3470,6 +3478,7 @@ tsv ts_object_is_extensible(tsv v){
 /* Frozen check used by the array mutators (pop/shift/sort/...): a frozen array
    must not be mutated. */
 static inline int ts_arr_frozen(tsv v){ return (ts_obj_integrity(&((ts_array*)ts_ptr(v))->o) & 1u) != 0; }
+static int sized_inherited_get(ts_object* o, ts_key key, tsv receiver, tsv* out);
 tsv ts_get(tsv obj, ts_key key){
   if (g_has_proxies && ts_is_proxy(obj)) return ts_proxy_get_v(obj, ts_key_to_value(key), obj);
   /* JSON and object-literal traffic overwhelmingly lands here. Bypass the
@@ -3482,6 +3491,9 @@ tsv ts_get(tsv obj, ts_key key){
       if (g_has_class_regs && class_field_lookup(fast, key, &off, &numeric))
         return struct_field_get(fast, off, numeric);
       tsv found;
+      /* a class instance without own dynamic properties: its inherited properties through the
+         (class word, key) cache, not a walk of the chain on every read */
+      if (ts_obj_is_sized(fast) && !((ts_sized_head*)fast)->dyn && sized_inherited_get(fast, key, obj, &found)) return found;
       if (lookup_prop_chain(obj, fast, key, &found)) return found;
       return TS_UNDEFINED;
     }
@@ -9856,6 +9868,20 @@ tsv ts_date_to_utc_string(double ms){
   int n = snprintf(buf, sizeof buf, "%s, %02d %s %04d %02d:%02d:%02d GMT", days[tm.tm_wday], tm.tm_mday, months[tm.tm_mon], tm.tm_year + 1900, tm.tm_hour, tm.tm_min, tm.tm_sec);
   return ts_new_string_ascii(buf, (uint32_t)n);
 }
+/* Date.UTC(year, month, day=1, hours=0, minutes=0, seconds=0, ms=0): MakeDay and MakeTime in UTC; a
+   month past December or a day past the month's end rolls over; a year 0..99 is 1900-based; NaN for a
+   non-finite component. */
+double ts_date_utc(double y, double mo, double d, double h, double mi, double s, double ms){
+  if (!isfinite(y) || !isfinite(mo) || !isfinite(d) || !isfinite(h) || !isfinite(mi) || !isfinite(s) || !isfinite(ms)) return NAN;
+  double yi = trunc(y), mi_ = trunc(mo);
+  if (yi >= 0.0 && yi <= 99.0) yi += 1900.0;
+  double ym = yi + floor(mi_ / 12.0);
+  int mn = (int)(mi_ - floor(mi_ / 12.0) * 12.0);
+  double days = date_days_from_civil((long long)ym, mn + 1, 1) + trunc(d) - 1.0;
+  double t = days * 86400000.0 + trunc(h) * 3600000.0 + trunc(mi) * 60000.0 + trunc(s) * 1000.0 + trunc(ms);
+  if (fabs(t) > 8.64e15) return NAN;
+  return t;
+}
 /* new Date(value): a Date's own time value, a string parsed as above, anything else through ToNumber. */
 double ts_date_value_ms(tsv v){
   if (ts_is_num(v)) return ts_to_num(v);
@@ -10330,6 +10356,69 @@ tsv ts_error_proto(int kind){
   ts_setup_error_protos();
   if (kind < 0 || kind >= TS_ERR_KINDS) kind = TS_ERR_ERROR;
   return g_error_protos[kind];
+}
+/* An Error kind as a first-class constructor value (`const E = Error; new E(msg)`, `E(msg)`,
+   `class D extends E {}` with E a value): one function object per kind for the run, constructable
+   through its native constructor, its `prototype` the kind's prototype, its [[Prototype]] the Error
+   value for the subtypes (TypeError.__proto__ === Error). */
+static tsv g_error_ctor_values[TS_ERR_KINDS];
+static tsv ts_error_ctor_thunk(tsv* args, int n){
+  int kind = n > 0 ? (int)ts_to_num(args[0]) : 0;   /* env: the kind */
+  return ts_new_error(kind, n > 1 ? args[1] : TS_UNDEFINED);
+}
+tsv ts_error_ctor_value(int kind){
+  if (kind < 0 || kind >= TS_ERR_KINDS) kind = TS_ERR_ERROR;
+  if (ts_is_func(g_error_ctor_values[kind])) return g_error_ctor_values[kind];
+  static int rooted[TS_ERR_KINDS];
+  tsv env[1] = { ts_num((double)kind) };
+  tsv f = ts_make_fn_t(ts_error_ctor_thunk, env, 1, 0);
+  ts_gc_root(&f);
+  ts_set_fn_meta(f, 1, TS_ERROR_NAMES[kind]);
+  ts_set_fn_prototype(f, ts_error_proto(kind));   /* constructable; `constructor` defined on the first observation */
+  ((ts_func*)ts_ptr(f))->native_ctor = 1;
+  g_error_ctor_values[kind] = f;
+  ts_root_static_once(&g_error_ctor_values[kind], &rooted[kind]);
+  if (kind != TS_ERR_ERROR){ tsv base = ts_error_ctor_value(TS_ERR_ERROR); ts_set_proto(g_error_ctor_values[kind], base); }
+  ts_gc_unroot(1);
+  return g_error_ctor_values[kind];
+}
+/* `class D extends Parent {}` with Parent a runtime value (zod's `$constructor`): the derived default
+   constructor as a native constructor whose environment holds the parent and D's prototype object.
+   `new D(args)` constructs the parent with the arguments and gives the instance D's prototype (an Error
+   parent makes an error, a class parent its instance, a plain function its object); D.prototype's
+   prototype is the parent's, D's own [[Prototype]] is the parent (the statics), D.name the class's.
+   A call without `new` constructs too (a class constructor cannot be called in JS; no program does). */
+static tsv ts_derived_ctor_thunk(tsv* args, int n){
+  tsv parent = n > 0 ? args[0] : TS_UNDEFINED, proto = n > 1 ? args[1] : TS_UNDEFINED;   /* env: parent, prototype */
+  int argc = n > 2 ? n - 2 : 0;
+  ts_gc_root(&proto);
+  tsv inst = ts_construct(parent, argc ? args + 2 : NULL, argc);
+  if (ts_is_obj(inst) && ts_is_obj(proto)) ts_set_proto(inst, proto);
+  ts_gc_unroot(1);
+  return inst;
+}
+tsv ts_class_extend_dyn(tsv parent, tsv name){
+  if (!ts_is_func(parent)) ts_throw_type_error_msg("Class extends value is not a constructor or null");
+  ts_gc_root(&parent); ts_gc_root(&name);
+  static ts_key proto_key = 0xFFFFFFFFu;
+  if (proto_key == 0xFFFFFFFFu) proto_key = ts_intern_field("prototype", 9);
+  tsv pproto = ts_get(parent, proto_key);
+  ts_gc_root(&pproto);
+  tsv proto = ts_new_proto_pretenured();   /* a prototype lives as long as its constructor; the caches record old holders */
+  ts_gc_root(&proto);
+  if (ts_is_obj(pproto) || ts_is_null(pproto)) ts_set_proto(proto, pproto);   /* Object.create(Parent.prototype) */
+  tsv env[2] = { parent, proto };
+  tsv fn = ts_make_fn_t(ts_derived_ctor_thunk, env, 2, 0);
+  ts_gc_root(&fn);
+  if (ts_is_str(name) && ts_str_len_typed(name) > 0){
+    uint32_t len; char* nm = ts_string_utf8_copy(name, &len);   /* kept for the run, as a class's name is */
+    ts_set_fn_meta(fn, 0, nm);
+  } else ts_set_fn_meta(fn, 0, "");
+  ts_set_fn_prototype(fn, proto);
+  ((ts_func*)ts_ptr(fn))->native_ctor = 1;
+  ts_set_proto(fn, parent);
+  ts_gc_unroot(5);
+  return fn;
 }
 /* Construct an Error-family instance with the proper prototype. `msg` undefined
    leaves message inherited (""); otherwise an own `message` is set (ToString). */
@@ -11014,7 +11103,7 @@ static void push_prop_names_js_order(tsv arr, tsv owner, uint32_t skip1, uint32_
   for (uint32_t i=0;i<len;i++){
     ts_pref p = propbag_prop(owner, i); if (!pref_ok(p)) continue;
     uint32_t k = pref_key(p), idx;
-    if (k == skip1 || k == skip2 || k == skip3 || !own_name_visible(k)) continue;
+    if (k == skip1 || k == skip2 || k == skip3 || !own_name_visible(k) || (pref_flags(p) & TS_PROP_FIELD_ATTR)) continue;
     if (prop_key_is_array_index(k, &idx)) total_idx++;
   }
   uint32_t prev_idx = 0, emitted = 0; int have_prev = 0;
@@ -11024,7 +11113,7 @@ static void push_prop_names_js_order(tsv arr, tsv owner, uint32_t skip1, uint32_
     for (uint32_t i=0;i<len;i++){
       ts_pref p = propbag_prop(owner, i); if (!pref_ok(p)) continue;
       uint32_t k = pref_key(p), idx;
-      if (k == skip1 || k == skip2 || k == skip3 || !own_name_visible(k)) continue;
+      if (k == skip1 || k == skip2 || k == skip3 || !own_name_visible(k) || (pref_flags(p) & TS_PROP_FIELD_ATTR)) continue;
       if (!prop_key_is_array_index(k, &idx)) continue;
       if (have_prev && idx <= prev_idx) continue;
       if (!found || idx < best){ best = idx; best_key = k; found = 1; }
@@ -11037,7 +11126,7 @@ static void push_prop_names_js_order(tsv arr, tsv owner, uint32_t skip1, uint32_
   for (uint32_t i=0;i<len;i++){
     ts_pref p = propbag_prop(owner, i); if (!pref_ok(p)) continue;
     uint32_t k = pref_key(p), idx;
-    if (k == skip1 || k == skip2 || k == skip3 || !own_name_visible(k)) continue;
+    if (k == skip1 || k == skip2 || k == skip3 || !own_name_visible(k) || (pref_flags(p) & TS_PROP_FIELD_ATTR)) continue;
     if (prop_key_is_array_index(k, &idx)) continue;
     push_own_name(arr, k);
   }
@@ -11203,7 +11292,9 @@ tsv ts_construct_result(tsv inst, tsv ret){
 tsv ts_object_assign(tsv* args, int n){
   if (n <= 0) return ts_new_object();
   tsv target = args[0];
-  if (!ts_is_obj(target) || ts_is_indexed_array_fast(target) || ts_is_map(target) || ts_is_set(target)) return target;
+  if (ts_is_null(target) || ts_is_undef(target)) ts_throw_type_error_msg("Cannot convert undefined or null to object");
+  /* a function target takes the properties too (a callable namespace); arrays, maps and sets keep their own storage */
+  if (!(ts_is_obj(target) || ts_is_func(target)) || ts_is_indexed_array_fast(target) || ts_is_map(target) || ts_is_set(target)) return target;
   ts_gc_root(&target);
   enum_copy_ctx c; c.target=target;
   for (int si=1; si<n; si++){
@@ -11583,6 +11674,7 @@ static int json_stringify_val(jbuf* b, tsv v, int depth, const char* indent){
     for (int i=0;i<nf;i++){
       reg=class_reg_for((ts_object*)ts_ptr(v));
       uint32_t k=class_reg_field_key(reg, i);
+      if (!sized_field_enumerable((ts_object*)ts_ptr(v), k)) continue;   /* hidden on this instance */
       tsv val=class_reg_field_value(reg, (ts_object*)ts_ptr(v), i);
       json_emit_obj_prop(b, v, k, val, depth, indent, &first);
     }
@@ -11939,6 +12031,13 @@ tsv ts_construct(tsv ctorv, tsv* args, int n){
   if (!ts_is_func(ctorv)) ts_throw_type_error("value is not a constructor");
   uint32_t raw = ((ts_func*)ts_ptr(ctorv))->class_id;
   if (raw == 0){
+    if (TS_RT_UNLIKELY(((ts_func*)ts_ptr(ctorv))->native_ctor)){
+      /* a runtime constructor (an Error kind's value, a derived class over a runtime base): the
+         code builds the instance itself from the arguments */
+      tsv r = ts_call(ctorv, args, n);
+      if (!ts_is_obj(r)) ts_throw_type_error("constructor returned a non-object");
+      return r;
+    }
     /* A plain function used as a constructor (`new fn()`): allocate an ordinary
        object whose prototype is fn.prototype (or Object.prototype), call fn with
        this=object, and yield the object (or the function's object return).
@@ -12265,6 +12364,33 @@ static int class_has_field(ts_object* o, ts_key key){
   size_t off; int numeric;
   return class_field_lookup(o, key, &off, &numeric);
 }
+/* A struct field's attributes redefined on one instance (yaml's Collection: `Object.defineProperty(this,
+   'schema', { value, enumerable: false, configurable: true, writable: true })` in its constructor): the
+   record is an entry of the instance's sidecar map under the field's key, flagged TS_PROP_FIELD_ATTR,
+   with the ordinary attribute bits all clear (no enumeration, name, JSON or inspect walk reports it:
+   they test those bits) and the field's effective enumerable and configurable attributes in the high
+   bits. The value stays in the struct slot, so the typed accesses are unchanged, and every read and
+   write looks the struct fields up before the map, so the record never answers one. A field cannot
+   become read-only or an accessor this way (the inline stores would not see it): a TypeError. The
+   instance's conversion to a dictionary (obj_abandon_layout) folds the record into the field's entry. */
+static ts_pref sized_field_attr_find(ts_object* o, ts_key key){
+  if (!(o->h.flags & TS_HDR_SIDECAR) || !((ts_sized_head*)o)->dyn) return PREF_NONE;
+  ts_pref p = prop_find(o, key);
+  return pref_ok(p) && (pref_flags(p) & TS_PROP_FIELD_ATTR) ? p : PREF_NONE;
+}
+static int sized_field_enumerable(ts_object* o, ts_key key){
+  ts_pref p = sized_field_attr_find(o, key);
+  return pref_ok(p) ? (pref_flags(p) & TS_PROP_FIELD_ATTR_ENUM) != 0 : 1;
+}
+static int sized_field_configurable(ts_object* o, ts_key key){
+  ts_pref p = sized_field_attr_find(o, key);
+  return pref_ok(p) ? (pref_flags(p) & TS_PROP_FIELD_ATTR_CONF) != 0 : 1;
+}
+static void sized_field_attr_set(ts_object* o, ts_key key, int e, int c){
+  uint8_t fl = (uint8_t)(TS_PROP_FIELD_ATTR | (e ? TS_PROP_FIELD_ATTR_ENUM : 0) | (c ? TS_PROP_FIELD_ATTR_CONF : 0));
+  ts_pref p = props_define(o, key, fl);
+  *pref_valp(p) = TS_UNDEFINED;
+}
 /* accessors for Object.keys/values/entries enumeration of class instances. */
 static int class_reg_nfields(ts_class_reg* r){ return r ? r->nfields : 0; }
 static uint32_t class_reg_field_key(ts_class_reg* r, int i){ return r->fields[i].name_id; }
@@ -12420,6 +12546,7 @@ static void ts_prop_own_enum(tsv obj, ts_prop_enum_cb cb, void* ud){
   int nf = class_reg_nfields(reg);
   for (int i=0;i<nf;i++){
     uint32_t k = class_reg_field_key(reg, i);
+    if (!sized_field_enumerable(o, k)) continue;   /* hidden on this instance */
     tsv v = class_reg_field_value(reg, ts_ptr(obj), i);
     cb(k, v, ud);
     /* reg/o may be stale after cb if a GC moved things; re-resolve for next read. */
@@ -13774,7 +13901,8 @@ void ts_object_copy_props(tsv dst, tsv src){
   if (!ts_is_obj(dst)) return;
   /* arrays ARE valid spread sources ({...arr} -> {0:.., 1:..}); the enumerator
      yields their index keys. Only map/set/non-object sources are skipped. */
-  if (ts_is_map(src) || ts_is_set(src) || (!ts_is_obj(src) && !ts_is_class_value(src) && !ts_is_str(src))) return;
+  /* a function source spreads its own enumerable properties as any object does ({ ...fnWithProps }) */
+  if (ts_is_map(src) || ts_is_set(src) || (!ts_is_obj(src) && !ts_is_func(src) && !ts_is_class_value(src) && !ts_is_str(src))) return;
   ts_gc_root(&dst); ts_gc_root(&src);
   enum_copy_ctx c; c.target=dst; c.recv=src;
   ts_prop_own_enum(src, cb_copy_to_target, &c);
@@ -13823,6 +13951,8 @@ int ts_delete_prop_strict(tsv obj, ts_key key){
   if (ts_obj_integrity(o) & (1u|4u)) {        /* frozen / sealed => all own props non-configurable */
     /* (a class instance's struct fields are own properties too) */
     if (pref_ok(prop_find(o, key)) || (g_has_class_regs && class_has_field(o, key))) nonconf = 1;
+  } else if (g_has_class_regs && class_has_field(o, key)){
+    if (!sized_field_configurable(o, key)) nonconf = 1;   /* the instance's record, not the map's entry */
   } else {
     ts_pref p = prop_find(o, key);
     if (pref_ok(p) && !pref_is_configurable(p)) nonconf = 1;
@@ -13879,21 +14009,27 @@ static int obj_abandon_layout(tsv obj){
   ts_object* o = (ts_object*)ts_ptr(obj);
   ts_class_reg* reg = class_reg_for(o);
   if (!reg || !(o->h.flags & TS_HDR_SIDECAR)) return 0;
-  uint32_t nf = (uint32_t)reg->nfields, ne = obj_map(o)->len, n = nf + ne;
+  uint32_t nf = (uint32_t)reg->nfields, ne = obj_map(o)->len, nrec = 0;
+  for (uint32_t j = 0; j < ne; j++) if (obj_flags_at(o, j) & TS_PROP_FIELD_ATTR) nrec++;   /* the fields' attribute records */
+  uint32_t n = nf + ne - nrec;
   ts_gc_root(&obj);
   ts_propmap* m = obj_map_w(o);
   ts_prop* d = n ? (ts_prop*)gc_owned_alloc(&o->h, sizeof(ts_prop) * (n < 4u ? 4u : n)) : NULL;
   o = (ts_object*)ts_ptr(obj);
   reg = class_reg_for(o);
   for (uint32_t i = 0; i < nf; i++){
-    d[i].key = reg->fields[i].name_id;
+    ts_key k = reg->fields[i].name_id;
+    d[i].key = k;
     d[i].val = struct_field_get(o, reg->fields[i].offset, reg->fields[i].numeric);
-    d[i].flags = TS_PROP_WRITABLE | TS_PROP_ENUMERABLE | TS_PROP_CONFIGURABLE;
+    d[i].flags = (uint8_t)(TS_PROP_WRITABLE | (sized_field_enumerable(o, k) ? TS_PROP_ENUMERABLE : 0) |
+                           (sized_field_configurable(o, k) ? TS_PROP_CONFIGURABLE : 0));
   }
-  for (uint32_t j = 0; j < ne; j++){
-    d[nf + j].key = obj_key_at(o, j);
-    d[nf + j].val = obj_val_read(o, j);
-    d[nf + j].flags = obj_flags_at(o, j);
+  for (uint32_t j = 0, w = nf; j < ne; j++){
+    if (obj_flags_at(o, j) & TS_PROP_FIELD_ATTR) continue;   /* folded into its field's entry above */
+    d[w].key = obj_key_at(o, j);
+    d[w].val = obj_val_read(o, j);
+    d[w].flags = obj_flags_at(o, j);
+    w++;
   }
   if (m->props && m->cap) gc_owned_free(m->props);
   if (m->prop_index) gc_owned_free(m->prop_index);
@@ -14075,8 +14211,13 @@ static tsv ts_own_descriptor_by_key(tsv obj, ts_key key){
   }
   ts_object* o = ts_ptr(obj);
   if (o->h.kind == TS_KIND_OBJECT){ size_t off; int numeric;
-    if (class_field_lookup(o, key, &off, &numeric))
-      return build_data_descriptor(struct_field_get(o, off, numeric), 1, 1, 1); }
+    if (class_field_lookup(o, key, &off, &numeric)){
+      /* writable unless frozen; enumerable and configurable as the instance's record says (the defaults
+         without one), configurable also refused by a seal or a freeze */
+      uint32_t integ = ts_obj_integrity(o);
+      return build_data_descriptor(struct_field_get(o, off, numeric), !(integ & 1u), sized_field_enumerable(o, key),
+                                   sized_field_configurable(o, key) && !(integ & (1u|4u)));
+    } }
   return descriptor_from_prop_map(o, key);
 }
 tsv ts_get_own_property_descriptor(tsv obj, tsv keyv){
@@ -14158,6 +14299,7 @@ tsv ts_get_own_property_descriptors(tsv obj){
     }
     o = ts_ptr(obj);
     for (uint32_t i=0;i<obj_map(o)->len;i++){
+      if (obj_flags_at(o, i) & TS_PROP_FIELD_ATTR) continue;   /* a field's attribute record, not a property */
       uint32_t k = obj_key_at(o, i);
       tsv d = ts_own_descriptor_by_key(obj, k);
       if (!ts_is_undef(d)) ts_set(res, k, d);
@@ -14244,7 +14386,8 @@ static int define_own_property(tsv obj, ts_key key, unsigned present, tsv value,
   if (g_has_class_regs && o->h.kind == TS_KIND_OBJECT && class_has_field(o, key)){
     exists = field = 1;
     cur_value = ts_get(obj, key);
-    cur_e = 1; cur_w = !(integ & 1u); cur_c = !(integ & (1u|4u));
+    cur_e = sized_field_enumerable(o, key); cur_w = !(integ & 1u);
+    cur_c = sized_field_configurable(o, key) && !(integ & (1u|4u));
   } else if (kind_has_common_header(o->h.kind)){
     ts_pref cur = prop_find(o, key);
     if (pref_ok(cur)){
@@ -14295,10 +14438,10 @@ static int define_own_property(tsv obj, ts_key key, unsigned present, tsv value,
   int acc_result = exists ? (is_acc || (!is_data && cur_acc)) : is_acc;
   if (field){
     if (acc_result){ ts_gc_unroot(7); define_property_error("Cannot redefine property: %s (a class field stays a data property)", key); return 0; }
-    if (!(ne && nw && nc) && !(ne == cur_e && nw == cur_w && nc == cur_c)){
-      ts_gc_unroot(7); define_property_error("Cannot redefine property: %s (a class field keeps its default attributes)", key); return 0;
-    }
-    /* unchanged attributes (also on a frozen or sealed instance): the value */
+    if (nw != cur_w){ ts_gc_unroot(7); define_property_error("Cannot redefine property: %s (a class field stays writable)", key); return 0; }
+    /* enumerable or configurable redefined: the instance's record of the field's attributes */
+    if (ne != cur_e || nc != cur_c) sized_field_attr_set((ts_object*)ts_ptr(obj), key, ne, nc);
+    /* the value (also on a sealed instance; a frozen one refused above) */
     if ((present & DEF_VALUE) && !ts_object_is(nv, cur_value)) ts_set(obj, key, nv);
   } else if (acc_result){
     int g_this = ts_is_func(ng) ? ((ts_func*)ts_ptr(ng))->takes_this : 0;
@@ -16563,6 +16706,48 @@ static ts_method_cache_entry g_method_cache[TS_METHOD_CACHE_SIZE];
 tsv ts_method_lookup_sized(tsv recv, ts_key fkey, ts_key mkey, ts_prop_ic* field_ic, ts_prop_ic* proto_ic){
   return ts_method_lookup_sized_fill(recv, fkey, mkey, field_ic, proto_ic, NULL);
 }
+/* An inherited property read on a sized class instance (`destination.next` where destination is an
+   interface-typed subscriber: a method read as a value, then called), through the method cache's
+   (class word, key) entry: the holder prototype, its shape word and the slot. A hit re-reads the
+   slot, so a method replaced in place is followed and a redefinition (a shape change) misses. The
+   first read walks the chain and records a plain data slot of a shaped, old-generation holder (a
+   young holder may move; a relinked instance or chain, an accessor, an exotic or function link take
+   the generic walk). The receiver's own properties were looked up before. Returns 0 when the chain
+   holds no such property. */
+/* The cache hit alone (the out-of-line read probes it first): the entry is filled only for a class
+   with no struct field of the key, so a non-relinked instance of the class without own dynamic
+   properties reads the holder's slot. */
+static int sized_inherited_cached(ts_object* o, ts_key key, tsv* out){
+  uint32_t w = o->cls;
+  if (w == 0u || (w & TS_CLS_RELINKED) || w == TS_CLS_PROTO || g_class_relinked) return 0;
+  const ts_method_cache_entry* e = &g_method_cache[((w * 0x9E3779B1u) ^ prop_key_hash(key)) & (TS_METHOD_CACHE_SIZE - 1u)];
+  if (e->cls == w && e->key == key && e->holder){
+    ts_object* h = (ts_object*)ts_ptr(e->holder);
+    if (h->shape == e->shape){
+      tsv v = *ts_obj_slot_ptr(h, e->slot);
+      if (!is_accessor(v)){ *out = v; return 1; }
+    }
+  }
+  return 0;
+}
+static int sized_inherited_get(ts_object* o, ts_key key, tsv receiver, tsv* out){
+  uint32_t w = o->cls;
+  if (!ts_obj_is_sized(o) || w == 0u || (w & TS_CLS_RELINKED) || w == TS_CLS_PROTO || g_class_relinked) return 0;
+  if (sized_inherited_cached(o, key, out)) return 1;
+  ts_method_cache_entry* e = &g_method_cache[((w * 0x9E3779B1u) ^ prop_key_hash(key)) & (TS_METHOD_CACHE_SIZE - 1u)];
+  for (ts_object* p = ts_next_proto(o); p; p = ts_next_proto(p)){
+    if (chain_link_exotic(p) || p->h.kind == TS_KIND_FUNC) return lookup_prop_chain(receiver, p, key, out);
+    ts_pref q = prop_find(p, key);
+    if (pref_ok(q)){
+      if (!pref_is_accessor(q) && ts_obj_shape_id(p) != TS_SHAPE_NONE && p->h.gen == TS_GEN_OLD){
+        e->cls = w; e->key = key; e->shape = p->shape; e->slot = q.i; e->holder = ts_obj(p);
+      }
+      *out = prop_ic_read(receiver, q);
+      return 1;
+    }
+  }
+  return 0;
+}
 /* The same, filling a call site's cache (ts_rt.h ts_method_site_ic) on a
    prototype-method hit for a class with no field of the method's name. */
 tsv ts_method_lookup_sized_fill(tsv recv, ts_key fkey, ts_key mkey, ts_prop_ic* field_ic, ts_prop_ic* proto_ic, ts_method_site_ic* sic){
@@ -16852,8 +17037,17 @@ static inline int prop_absent_site_hit(tsv obj, ts_key key, const ts_prop_ic* ic
 }
 /* The out-of-line read: the site's absent record first, as a leaf (no frame,
    no saved registers), then the full lookup. */
+static int sized_inherited_cached(ts_object* o, ts_key key, tsv* out);
 tsv ts_get_pic_checked(tsv obj, ts_key key, ts_prop_ic* ic){
   if (prop_absent_site_hit(obj, key, ic)){ RT_STAT_INC(absent_site_hits); return TS_UNDEFINED; }
+  /* a class instance's inherited property (a method read as a value, a prototype constant): the
+     (class word, key) entry the slow path filled answers before the own-property probes, which a
+     class with no struct field of the key and an instance with no own dynamic property cannot hit */
+  if (TS_TOP16(obj) == TS_SEL_OBJECT){
+    ts_object* o = (ts_object*)ts_ptr(obj);
+    tsv v;
+    if (ts_obj_is_sized(o) && !((ts_sized_head*)o)->dyn && sized_inherited_cached(o, key, &v)) return v;
+  }
   /* a megamorphic site (many classes at one access): a sized receiver's
      field straight from the registry's cache, past the slow path's probes
      and the generic read's dispatch (docs/pic_sized_inline_design.md, "The
@@ -16921,6 +17115,7 @@ __attribute__((noinline)) static tsv ts_get_pic_checked_slow(tsv obj, ts_key key
         return prop_ic_read(obj, p);
       }
       tsv inherited;
+      if (sized_inherited_get(o, key, obj, &inherited)){ RT_STAT_INC(pic_get_inherited); return inherited; }
       if (lookup_prop_chain(obj, ts_next_proto(o), key, &inherited)){ RT_STAT_INC(pic_get_inherited); return inherited; }
       RT_STAT_INC(pic_get_absent);
       RT_STAT_KEY(g_key_absent, key);

@@ -19,7 +19,7 @@
 import * as ts from "typescript";
 import * as fs from "fs";
 import * as path from "path";
-import { ClassExtractor, ClassInfo, ClosedReceivers, memberKeyName } from "./class_extract";
+import { ClassExtractor, ClassInfo, ClosedReceivers, memberKeyName, dynamicBaseEmptyClass } from "./class_extract";
 import { classifyRegExpLiteral } from "./regexp";
 import { hasUnpairedSurrogate, toWireProgram } from "./wire_program";
 
@@ -5054,12 +5054,20 @@ class Exporter {
             return dst;
           }
         }
-        // Static FIELD or ACCESSOR read: `C.x`/`C.v` -> load the class's static
-        // container and read the property via ts_get. Containers are proto-linked
-        // along the class chain, so inherited statics resolve and a registered
-        // accessor getter is auto-invoked (with this=the loaded container, so it is
-        // subclass-aware).
-        const scid = this.staticFieldClassOf(cid, node.name.text);
+        // Static FIELD read: `C.x` -> load C's own static container (the nearest class with one) and
+        // read the property via ts_get: the containers are proto-linked along the class chain, so an
+        // inherited static resolves, and a subclass's own static written through `this` in an inherited
+        // static method or setter (`++this.count` run as `Sub.bump()`) shadows the parent's, as in JS.
+        // A static getter: a Direct call with the class value as `this` (the generic read below would
+        // run it with the container).
+        const gfn = cid !== undefined ? this.staticAccessorBeforeField(cid, node.name.text, "get") : undefined;
+        if (cid !== undefined && gfn !== undefined && this.staticContainerClassOf(cid) !== undefined) {
+          const recv = this.staticReceiver(ctx, node.expression, cid, this.staticContainerClassOf(cid)!);
+          const dst = this.newLocal(ctx, this.refKindOf(node));
+          ctx.body.push({ kind: "Call", dst, callee: { kind: "Direct", func: gfn }, args: [recv] });
+          return dst;
+        }
+        const scid = this.staticContainerClassOf(cid);
         if (cid !== undefined && scid !== undefined) {
           const gid = this.classStaticGlobal.get(scid)!;
           const cont = this.newLocal(ctx, "reference");
@@ -5254,6 +5262,13 @@ class Exporter {
           ctx.body.push({ kind: "LoadBuiltinFn", dst: nsObj, builtin: `globalobj.${nsName}` });
           const dst = this.newLocal(ctx, "reference");
           ctx.body.push({ kind: "LoadField", dst, obj: nsObj, field: this.internField(node.name.text) });
+          return dst;
+        }
+        // `Symbol.<name>` that is not a well-known symbol the runtime defines (`Symbol.observable`): undefined,
+        // as in V8 without a polyfill (rxjs tests for it and falls back to a string key); a write stays rejected.
+        if (nsName === "Symbol") {
+          const dst = this.newLocal(ctx, "reference");
+          ctx.body.push({ kind: "Const", dst, value: { kind: "Undef" } });
           return dst;
         }
         // A builtin-namespace function we don't represent as a first-class value
@@ -5851,11 +5866,10 @@ class Exporter {
             const sm = this.resolveStaticMethod(cid, fn.name.text);
             const ccid = sm !== undefined ? this.staticContainerClassOf(cid) : undefined;
             if (sm !== undefined && ccid !== undefined) {
-              const cont = this.newLocal(ctx, "reference");
-              ctx.body.push({ kind: "LoadGlobal", dst: cont, gref: this.classStaticGlobal.get(ccid)! });
+              const recv = this.staticReceiver(ctx, fn.expression, cid, ccid);   // the class value as `this`
               const argLs = this.lowerSequenced(ctx, node.arguments);
               const dst = this.newLocal(ctx, "reference");
-              ctx.body.push({ kind: "Call", dst, callee: { kind: "Direct", func: sm.fnId }, args: [cont, ...argLs] });
+              ctx.body.push({ kind: "Call", dst, callee: { kind: "Direct", func: sm.fnId }, args: [recv, ...argLs] });
               return dst;
             }
           }
@@ -6669,8 +6683,14 @@ class Exporter {
           // instanceof.dyn. The runtime walks fn.prototype and throws V8's
           // TypeError for a prototype-less function (arrow/method) or a
           // non-callable value, so a bad RHS is still loud (catchable).
-          if (!isCtorVal && !this.isBuiltinSymbol(this.checker.getSymbolAtLocation(node.right))) {
-            isCtorVal = rt.getCallSignatures().length > 0 || (rt.flags & ts.TypeFlags.Any) !== 0;
+          // (a builtin constructor the static branches above did not take, `BigInt` behind a
+          // `typeof BigInt !== "undefined"` guard, goes the same way: the runtime's check of the value)
+          if (!isCtorVal) {
+            // union-aware too: a conditional's constructor-or-function type (`f ? C : Math.max`)
+            const callable = (t: ts.Type): boolean =>
+              t.getCallSignatures().length > 0 || t.getConstructSignatures().length > 0 || (t.flags & ts.TypeFlags.Any) !== 0 ||
+              (t.isUnion() && t.types.every(callable));
+            isCtorVal = callable(rt);
           }
           // An object with a `[Symbol.hasInstance]` method (a constructor object such as
           // lib/node's Buffer): the runtime calls the hook.
@@ -7516,6 +7536,17 @@ class Exporter {
     return !!decls && decls.length > 0 && decls.every((d) => this.program.isSourceFileDefaultLibrary(d.getSourceFile()));
   }
 
+  /** `class D extends <value> {}` (no members): a derived constructor over the runtime value, made by
+   *  the runtime (`ts_class_extend_dyn`): `new D(...)` constructs the base and gives the instance D's
+   *  prototype (whose prototype is the base's), D's statics chain to the base, D's name is the class's. */
+  private lowerDynamicDerivedClass(ctx: FnCtx, base: ts.Expression, name: string): number {
+    const parent = this.lowerExpr(ctx, base);
+    const nameL = this.newLocal(ctx, "reference");
+    ctx.body.push({ kind: "Const", dst: nameL, value: { kind: "Str", value: name } });
+    const dst = this.newLocal(ctx, "reference", name || undefined);
+    ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "class.extend_dyn", args: [parent, nameL] });
+    return dst;
+  }
   /** Lower a class EXPRESSION (`const C = class { ... }`, named or anonymous) to a
    *  runtime class value — the same machinery a class declaration uses when read as
    *  a value. Dynamic-base (mixin) class expressions stay loud-rejected (their
@@ -7524,6 +7555,8 @@ class Exporter {
   lowerClassExpressionValue(ctx: FnCtx, node: ts.ClassExpression, hint?: string): number {
     const cid = this.classIdByNode.get(node);
     if (cid === undefined) {
+      const base = dynamicBaseEmptyClass(node, this.checker);
+      if (base) return this.lowerDynamicDerivedClass(ctx, base, node.name?.text ?? hint ?? "");
       this.unsupported(node, "class expression (no resolved class id)");
       return this.newLocal(ctx, "reference", hint);
     }
@@ -7543,7 +7576,7 @@ class Exporter {
       const initFnId = this.staticInits.find((s) => s.classId === cid)?.fnId;
       if (initFnId !== undefined) {
         ctx.body.push({ kind: "Call", dst: this.newLocal(ctx, "reference"),
-          callee: { kind: "Direct", func: initFnId }, args: [] });
+          callee: { kind: "Direct", func: initFnId }, args: this.staticInitArgs(ctx, cid, cv) });
       }
     }
     if (cv.classValue) this.linkClassValueStaticContainer(ctx, cv.local, cid);
@@ -10635,6 +10668,7 @@ class Exporter {
     if (ns === "Date") {
       if (member === "now") return "date.now";
       if (member === "parse") return argc === 1 ? "date.parse" : "__UNSUPPORTED__";
+      if (member === "UTC") return argc >= 1 && argc <= 7 ? `date.utc:${argc}` : "__UNSUPPORTED__";
       return "__UNSUPPORTED__";
     }
     if (ns === "Object") {
@@ -12572,6 +12606,13 @@ class Exporter {
           // ts_set auto-invokes a registered setter found up the chain (with
           // this=container, subclass-aware). A getter-only accessor write is ignored
           // by ts_set (sloppy-mode semantics, matching the eval test oracle).
+          // a static setter: a Direct call with the class value as `this`
+          const sfn = this.staticAccessorBeforeField(cid, lhs.name.text, "set");
+          if (sfn !== undefined) {
+            const recv = this.staticReceiver(ctx, lhs.expression, cid, cid);
+            ctx.body.push({ kind: "Call", dst: this.newLocal(ctx, "reference"), callee: { kind: "Direct", func: sfn }, args: [recv, rhs] });
+            return;
+          }
           const gid = this.classStaticGlobal.get(cid)!;
           const cont = this.newLocal(ctx, "reference");
           ctx.body.push({ kind: "LoadGlobal", dst: cont, gref: gid });
@@ -13564,6 +13605,15 @@ class Exporter {
       // the stored binding, preserving constructor identity (`C === C`).
       const csym = stmt.name ? this.symbolOf(stmt.name) : undefined;
       const cid = csym ? this.classSymToId.get(csym) : undefined;
+      if (cid === undefined && stmt.name && csym) {
+        // `class D extends Parent {}` over a runtime value: a derived constructor bound like a const
+        const base = dynamicBaseEmptyClass(stmt, this.checker);
+        if (base) {
+          const v = this.lowerDynamicDerivedClass(ctx, base, stmt.name.text);
+          if (this.hasCaptured(ctx, csym)) this.storeCaptured(ctx, csym, v); else this.ensureLocalAlias(ctx, csym, v);
+          return;
+        }
+      }
       let classValue: ClassValueEmit | undefined;
       if (stmt.name && csym && cid !== undefined) {
         classValue = this.emitClassValue(ctx, cid, stmt.name.text, stmt, false);
@@ -13582,7 +13632,7 @@ class Exporter {
         const initFnId = this.staticInits.find((s) => s.classId === cid)?.fnId;
         if (initFnId !== undefined) {
           ctx.body.push({ kind: "Call", dst: this.newLocal(ctx, "reference"),
-            callee: { kind: "Direct", func: initFnId }, args: [] });
+            callee: { kind: "Direct", func: initFnId }, args: this.staticInitArgs(ctx, cid, classValue) });
         }
       }
       if (cid !== undefined && classValue?.classValue) {
@@ -14660,6 +14710,45 @@ class Exporter {
     for (const m of this.modules) visit(m);
   }
 
+  /** The static initializer takes the class value as its `this` when one can be made (an explicit or a
+   *  synthesized constructor); the declaration and the class expression pass it (staticInitArgs). */
+  staticInitTakesThis(classId: number): boolean {
+    return this.methodFunc.has(`${classId}:ctor`) || this.synthClassValueCtor(classId) !== undefined;
+  }
+  /** The static initializer's argument list: the class value (undefined when the site could not make
+   *  one: the initializer's `this` reads then throw, loudly), nothing for an initializer without `this`. */
+  staticInitArgs(ctx: FnCtx, classId: number, cv: ClassValueEmit | undefined): number[] {
+    if (!this.staticInitTakesThis(classId)) return [];
+    if (cv !== undefined && cv.classValue) return [cv.local];
+    const u = this.newLocal(ctx, "reference");
+    ctx.body.push({ kind: "Const", dst: u, value: { kind: "Undef" } });
+    return [u];
+  }
+  /** The `this` of a static member reached through the class name (`C.make()`, `C.instance`, `C.v = x`):
+   *  the class value, as in JS (`new this()` in a static factory, `this.name`, `this === C` hold inside
+   *  the member); the proto-linked container when the class has no constructible value. A member
+   *  inherited by a subclass reads and writes the subclass's statics either way (ts_get / ts_set on a
+   *  class value go to its container, whose chain mirrors the class chain). */
+  staticReceiver(ctx: FnCtx, classRef: ts.Expression, classId: number, containerClass: number): number {
+    if (this.staticInitTakesThis(classId)) return this.lowerExpr(ctx, classRef);
+    const cont = this.newLocal(ctx, "reference");
+    ctx.body.push({ kind: "LoadGlobal", dst: cont, gref: this.classStaticGlobal.get(containerClass)! });
+    return cont;
+  }
+  /** A static accessor of `name` reached from `classId` up the chain, unless a class below the accessor's
+   *  declares a static data field of the name (its own property shadows the inherited accessor). */
+  staticAccessorBeforeField(classId: number, name: string, which: "get" | "set"): number | undefined {
+    const table = which === "get" ? this.staticGetterFunc : this.staticSetterFunc;
+    let cur: number | undefined = classId;
+    while (cur !== undefined) {
+      const fn = table.get(`${cur}:static:${name}`);
+      if (fn !== undefined) return fn;
+      if (this.staticGetterFunc.has(`${cur}:static:${name}`) || this.staticSetterFunc.has(`${cur}:static:${name}`)) return undefined;   // the other half only
+      if (this.classStaticFieldNames.get(cur)?.has(name)) return undefined;
+      cur = this.parentIdOf(cur);
+    }
+    return undefined;
+  }
   /** Step F: build __static_init_<classId>: alloc the static container, publish
    *  it to the class's global slot, then run static field inits + static blocks
    *  in source order. */
@@ -14677,6 +14766,17 @@ class Exporter {
     this.recordSite(site, "object", "once", true, classNode, false);
     ctx.body.push({ kind: "AllocObject", dst: container, typeId: 0, site });
     ctx.body.push({ kind: "StoreGlobal", gref: gid, src: container });
+    // `this` of the static field initializers and blocks: the class value (JS: the constructor itself,
+    // so `new this()`, `this.name` and `this === C` hold), passed by the declaration (staticInitArgs);
+    // its [[Prototype]] is linked to the fresh container here, before any initializer reads or writes a
+    // static through it. A class without a constructible value keeps the container as `this`.
+    const takesThis = this.staticInitTakesThis(classId);
+    let thisLocal = container;
+    if (takesThis) {
+      thisLocal = this.newLocal(ctx, "reference", "this");
+      ctx.params.push(thisLocal);
+      ctx.body.push({ kind: "SetProto", obj: thisLocal, proto: container });
+    }
     const defineStaticData = (obj: number, key: string, val: number, enumerable: 0 | 1, writable: 0 | 1, configurable: 0 | 1) => {
       const keyLocal = this.newLocal(ctx, "reference");
       ctx.body.push({ kind: "Const", dst: keyLocal, value: { kind: "Str", value: key } });
@@ -14691,10 +14791,10 @@ class Exporter {
     const lengthLocal = this.newLocal(ctx, "primitive", "class.length");
     ctx.body.push({ kind: "Const", dst: lengthLocal, value: { kind: "Num", value: this.jsFunctionArity(ctorNode?.parameters) } });
     defineStaticData(container, "length", lengthLocal, 0, 0, 1);
-    // `this` inside static field initializers and static blocks is the class object
-    // (the container). Bind it as a plain object (no currentClass) so `this.x` reads
-    // and `this.x = v` writes go through generic ts_get/ts_set on the container.
-    ctx.thisLocal = container;
+    // `this` inside static field initializers and static blocks: the class value (above). Bound without a
+    // currentClass, so `this.x` reads and `this.x = v` writes go through generic ts_get/ts_set, which a
+    // class value forwards to its container.
+    ctx.thisLocal = thisLocal;
     // Defining class, so `super.X` inside a static block/initializer resolves to the
     // parent's static member.
     ctx.staticClass = classId;
@@ -14873,9 +14973,9 @@ class Exporter {
     }
     this.noteFnModule(ctx.id);
     this.functions.push({
-      id: ctx.id, name: ctx.name, params: [], ret: 0,
+      id: ctx.id, name: ctx.name, params: ctx.params, ret: 0,
       locals: ctx.locals, body: ctx.body, isExported: false,
-      paramClasses: {}, restParam: null, isAsync: false, isGenerator: false, takesThis: false,
+      paramClasses: {}, restParam: null, isAsync: false, isGenerator: false, takesThis: takesThis,
     });
   }
 

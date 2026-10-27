@@ -13881,6 +13881,12 @@ fn program_needs_uri_fn_values(program: &Program) -> bool {
     program.functions.iter().any(|f| body_needs_uri_fn_values(&f.body))
 }
 
+/// The runtime's error kind of an Error constructor referenced as a value (ts_rt.c TS_ERR_* order).
+fn error_ctor_value_kind(builtin: &str) -> Option<u32> {
+    let kinds = ["global.Error", "global.TypeError", "global.RangeError", "global.SyntaxError",
+                 "global.ReferenceError", "global.EvalError", "global.URIError", "global.AggregateError"];
+    kinds.iter().position(|k| *k == builtin).map(|i| i as u32)
+}
 fn global_fn_value_builtins() -> &'static [&'static str] {
     &[
         "global.parseInt",
@@ -14347,22 +14353,11 @@ fn emit_global_setup(s: &mut String, needs_fetch: bool, needs_typed_array_global
     .iter()
     .enumerate()
     {
-        let _ = writeln!(
-            s,
-            "  tsv _{} = ts_make_global_fn({}, 1u, {}, 0);",
-            name,
-            fnval_adapter_name(&format!("global.{}", name)),
-            cstr(name)
-        );
+        // The runtime's constructor value of the kind (ts_error_ctor_value): constructable (`new E(msg)`
+        // and `E(msg)` make an error of the kind), its `.prototype` the shared Error-family prototype
+        // (chained subtype -> Error -> Object), one object for the run (identity across reads).
+        let _ = writeln!(s, "  tsv _{} = ts_error_ctor_value({});", name, idx);
         root_local(s, &format!("_{}", name));
-        // The constructor's `.prototype` is the shared runtime Error-family
-        // prototype object (chained subtype -> Error -> Object), so `instanceof`
-        // and inherited `name` work against `new Error()` instances.
-        let _ = writeln!(
-            s,
-            "  ts_set_cstr(_{}, \"prototype\", ts_error_proto({}));",
-            name, idx
-        );
         // Wire `<proto>.constructor` back to the constructor value (mirrors
         // Function.prototype.constructor above), so `new TypeError().constructor`
         // is `TypeError` and `.constructor.name` is "TypeError" (not "Object",
@@ -22548,7 +22543,16 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 // Date static
                 "date.now" => ("ts_to_num(ts_date_now_ms())".to_string(), true),
                 "date.value_ms" => (format!("ts_date_value_ms({})", v(0)), true),
+                "class.extend_dyn" => (format!("ts_class_extend_dyn({}, {})", v(0), v(1)), false),
                 "date.parse" => (format!("ts_date_parse_value({})", v(0)), true),
+                b if b.starts_with("date.utc:") => {
+                    // Date.UTC(year, month, day=1, hours=0, minutes=0, seconds=0, ms=0): the missing components' defaults
+                    let argc: usize = b["date.utc:".len()..].parse().unwrap_or(0);
+                    let comp: Vec<String> = (0..7)
+                        .map(|i| if i < argc { n(i) } else if i == 2 { "1.0".to_string() } else { "0.0".to_string() })
+                        .collect();
+                    (format!("ts_date_utc({})", comp.join(", ")), true)
+                }
                 "date.fromComponents" => (
                     format!(
                         "ts_date_from_components({}, {}, {}, {}, {}, {}, {})",
@@ -23827,6 +23831,12 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             if let Some(kind) = builtin.strip_prefix("errorproto.") {
                 let idx: u32 = kind.parse().unwrap_or(0);
                 s.push_str(&ctx.set_val(dst.0, &format!("ts_error_proto({})", idx)));
+                return;
+            }
+            // An Error kind as a value (`const E = Error`): the runtime's one constructor value per
+            // kind (constructable, `prototype` the kind's, identity across reads).
+            if let Some(kind) = error_ctor_value_kind(builtin) {
+                s.push_str(&ctx.set_val(dst.0, &format!("ts_error_ctor_value({})", kind)));
                 return;
             }
             // First-class static builtin function value: box a generated adapter

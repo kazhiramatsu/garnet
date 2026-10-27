@@ -1,0 +1,13 @@
+{
+  "extends": "./src/tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "declaration": false,
+    "types": [],
+    "allowImportingTsExtensions": true,
+    "noUnusedLocals": false,
+    "noUnusedParameters": false
+  },
+  "include": [],
+  "files": ["garnet-driver.ts"]
+}

@@ -53,6 +53,9 @@ export interface Buffer extends Uint8Array<ArrayBuffer> {
   reverse(): this;
 }
 export interface BufferConstructor {
+  /** Node's deprecated call form, `Buffer(value)`: `Buffer.from(value)` (a size allocates); the usual
+   *  feature test is `typeof Buffer === "function"`. */
+  (value: string | number | ArrayLike<number> | Uint8Array | ArrayBuffer | SharedArrayBuffer, encodingOrOffset?: string | number, length?: number): Buffer;
   from(value: string, encoding?: string): Buffer;
   from(value: ArrayLike<number> | Uint8Array | ArrayBuffer | SharedArrayBuffer | { type: "Buffer"; data: number[] }, byteOffsetOrEncoding?: number | string, length?: number): Buffer;
   alloc(size: number, fill?: string | number | Uint8Array, encoding?: string): Buffer;
@@ -66,7 +69,8 @@ export interface BufferConstructor {
   copyBytesFrom(view: ArrayBufferView, offset?: number, length?: number): Buffer;
   poolSize: number;
   readonly prototype: Buffer;
-  [Symbol.hasInstance](value: unknown): boolean;
+  /** A type predicate: TypeScript narrows `x instanceof Buffer` by it (a plain boolean would stop the narrowing). */
+  [Symbol.hasInstance](value: unknown): value is Buffer;
 }
 
 // Buffer.prototype: an object over Uint8Array's prototype (host.createObject: never a class chain,
@@ -501,7 +505,8 @@ function fromValue(value: unknown, byteOffsetOrEncoding?: number | string, lengt
   }
   throw invalidArgType("first argument", "of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object", value);
 }
-export const Buffer: BufferConstructor = {
+/** The statics of the Buffer constructor (assigned onto the function below). */
+const bufferStatics = {
   from: fromValue as BufferConstructor["from"],
   alloc(size: number, fill?: string | number | Uint8Array, encoding?: string): Buffer {
     const b = adopt(new Uint8Array(checkSize(size)));
@@ -550,8 +555,16 @@ export const Buffer: BufferConstructor = {
   },
   poolSize: 8192,
   prototype: proto as unknown as Buffer,
-  [Symbol.hasInstance](value: unknown): boolean { return isBufferValue(value); },
+  [Symbol.hasInstance](value: unknown): value is Buffer { return isBufferValue(value); },
 };
+/** The Buffer constructor is a function, as in Node (`typeof Buffer === "function"`, `Buffer.name`); its
+ *  statics are assigned onto it, and Symbol.hasInstance answers `instanceof` for the adopted views. The
+ *  deprecated call form `Buffer(value)` is `Buffer.from(value)` (a size allocates). */
+export const Buffer: BufferConstructor = Object.assign(function Buffer(value: string | number | ArrayLike<number> | Uint8Array | ArrayBuffer | SharedArrayBuffer, encodingOrOffset?: string | number, length?: number): Buffer {
+  if (typeof value === "number") return bufferStatics.alloc(value);
+  return fromValue(value, encodingOrOffset, length);
+}, bufferStatics);
+Object.defineProperty(Buffer, Symbol.hasInstance, { value: isBufferValue });   // a symbol key: not copied by Object.assign
 export const kMaxLength = 4294967295;
 export const kStringMaxLength = 536870888;
 export const constants = { MAX_LENGTH: kMaxLength, MAX_STRING_LENGTH: kStringMaxLength };

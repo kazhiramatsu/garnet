@@ -108,6 +108,11 @@ Rust in §315; selfhost is kept as a performance metric).
   is typed `number` by the annotation and read unboxed in typed mode: garnet reads NaN and `typeof`
   says "number" where V8 gives undefined. The keyed form (`d[k]`, `d["zz"]`) keeps the value
   (Session 353 real-projects note; lowering `obj["lit"]` as a named access was reverted for this).
+- A declared class field without an initializer is laid out (and enumerated) at its declaration
+  position, the ES2022 `useDefineForClassFields` semantics; under the legacy semantics (the
+  conformance oracle transpiles at ES2020, a project with a lower target) V8 creates it at its first
+  assignment, so its key order differs there (Session 354). A static written through `this` on a
+  subclass that has no static container of its own lands on the ancestor's container.
 - A `number` class field whose every static store is an integer is an integer slot (Session 353,
   `docs/int32_fields_design.md` "Store-proven fields"); a dynamic store of a fraction into it
   (`(n as any).pos = 2.5`) throws a TypeError naming the field (V8 stores the fraction).

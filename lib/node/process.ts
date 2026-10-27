@@ -226,9 +226,14 @@ export class Process extends EventEmitter {
     if (typeof warning !== "string" && name === "Warning") name = warning.name;
     let line = "(node:" + this.pid + ") " + (code !== undefined ? "[" + code + "] " : "") + name + ": " + message + "\n";
     if (detail !== undefined) line += detail + "\n";
-    this.stderr.write(line);
-    this.emit("warning", typeof warning === "string" ? new Error(message) : warning);
+    // Node's shape: the warning is an Error named after its type, delivered on the next tick (the default
+    // listener writes the line, with a one-time hint, before the program's listeners run)
+    if (!this._warnedOnce) { this._warnedOnce = true; line += "(Use `node --trace-warnings ...` to show where the warning was created)\n"; }
+    let err: Error;
+    if (typeof warning === "string") { err = new Error(message); err.name = name; } else err = warning;
+    this.nextTick(() => { this.stderr.write(line); this.emit("warning", err); });
   }
+  private _warnedOnce = false;
   kill(pid: number, signal: string | number = "SIGTERM"): true {
     const signum = typeof signal === "number" ? signal : SIGNALS[signal];
     if (signum === undefined) throw new TypeError("Unknown signal: " + signal);
@@ -252,3 +257,18 @@ export const SIGNALS: { [name: string]: number } = {
 const process = new Process();
 host.atExit((phase: number): number | undefined => { if (phase === 0) { process._beforeExit(); return undefined; } return process._atExit(); });
 export default process;
+// The named exports of `node:process` (`import { env, emitWarning } from "node:process"`): the instance's
+// fields and its methods bound to it. The stdio streams stay behind the instance (they are created on first use).
+export const argv = process.argv, argv0 = process.argv0, execArgv = process.execArgv, execPath = process.execPath;
+export const env = process.env;
+export const pid = process.pid, ppid = process.ppid, platform = process.platform, arch = process.arch;
+export const version = process.version, versions = process.versions, release = process.release;
+export const memoryUsage = process.memoryUsage;
+export function cwd(): string { return process.cwd(); }
+export function chdir(directory: string): void { process.chdir(directory); }
+export function exit(code?: number): never { return process.exit(code); }
+export function nextTick(callback: (...args: any[]) => void, ...args: any[]): void { process.nextTick(callback, ...args); }
+export function emitWarning(warning: string | Error, type?: string | { type?: string; code?: string; detail?: string }, code?: string): void { process.emitWarning(warning, type as string, code); }
+export function hrtime(previous?: [number, number]): [number, number] { return process.hrtime(previous); }
+export function uptime(): number { return process.uptime(); }
+export function cpuUsage(previous?: CpuUsage): CpuUsage { return process.cpuUsage(previous); }

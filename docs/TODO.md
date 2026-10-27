@@ -10800,3 +10800,41 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   pulls `fast-check`. Gates: conformance all plain and strict, GC protect,
   unit, bundler 46/46 (two reject fixtures became positive tests), bench,
   GC stress.
+
+## Session 354 (2026-10-27): real projects, the second round (rxjs and yaml run; zod waits for bigint)
+
+- Real projects: rxjs and yaml run with identical outputs; zod's last blocker is bigint (Session
+  354, `docs/real_projects.md` "What the next three projects taught garnet"). Continuing the
+  previous session's slice from its uncommitted state (the dynamic base class, the Error
+  constructor values, `Symbol.observable`, `Object.assign` onto a function, `Date.UTC`, `Buffer` as
+  a function, the named exports of `node:process`, `transpile_tree.js` as a program emit, the
+  inherited-property cache for sized receivers), the remaining fixtures and projects were run and
+  fixed one at a time:
+  `instanceof` with a union-typed right-hand side (a conditional's constructor-or-function type)
+  goes through the runtime check (the fixture had also expected an uncaught throw where both
+  engines throw: caught now). yaml's `Collection` redefines a declared field with
+  `Object.defineProperty(this, 'schema', { enumerable: false, ... })`: a sized instance records a
+  field's redefined enumerable and configurable attributes in its sidecar map under the field's
+  key (`TS_PROP_FIELD_ATTR`, the ordinary attribute bits clear so no enumeration, name, JSON or
+  inspect walk reports the record, the effective bits in the high bits); the value stays in the
+  struct slot, strict `delete` consults the record, and the conversion to a dictionary folds it
+  into the field's entry; `writable: false` and an accessor stay a TypeError (the inline stores
+  could not honor them). yaml's `Collection.from` runs `new this(schema)`: `this` inside a static
+  member had been the proto-linked static container (`new` could not construct it); it is the
+  class value now: the static initializer takes it as a parameter and links it to the fresh
+  container before any initializer runs, `C.m()`, `C.getter` and `C.setter = v` through the class
+  name pass it, a class without a constructible value keeps the container; and a static field read
+  `Sub.x` loads the subclass's own container (the chain finds an inherited one), so `++this.count`
+  run as `Sub.bump()` shadows the parent's count as in JS (it had read the declaring class's
+  container). Fixtures: `classes/field_redefined`, `classes/static_this`, plus the previous
+  session's seven. Measured: rxjs 709 -> 534 ms against Node's 152 (the inherited-read cache; its
+  profile names `fn.call` read through the prototype chain per call, `shift` moving the elements,
+  the per-value try/catch); yaml 5911 against 1289 (its profile: every generator creation
+  allocates a promise, every `next()` builds its result by dynamic property additions, 17% in the
+  collector, 4% in regular expressions, 4% in `===` on one-character strings). zod stops at
+  `BigInt("...")` in a module-level constant: a bigint value type is the next slice for it.
+  Two deviations noted, not fixed: the conformance oracle transpiles at ES2020 (legacy class-field
+  semantics: a declared field without an initializer is created at its first assignment; garnet
+  lays it out at its declaration), and a static written on a subclass with no static container of
+  its own lands on the ancestor's. Gates: conformance 623/623 plain and strict, 620/620 under GC
+  protect, unit, bundler 46/46, bench within budget, GC stress.
