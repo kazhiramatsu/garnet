@@ -10665,4 +10665,11 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   Gates: conformance 611/611 plain and strict, 608/608 under GC protect,
   unit, bundler 45/45, bench within budget (the sequential runner's bench,
   right after the GC-protect pass, reported a failure; alone and quiet every
-  kernel is correct and within budget), GC stress.
+  kernel is correct and within budget), GC stress. Over prompt lengths
+  (the design doc's table) garnet leads llama.cpp only between 32 and 64
+  tokens, where llama.cpp's 128-token tile is half empty: at 8-16 tokens
+  llama.cpp's small-batch kernels lead (724 against 594 tok/s at 8), from
+  128 tokens its kernel's rate does (4466 against 3519 at 128, 4802 against
+  2572 at 512: garnet's 128-token tile is slower than its 64-token one, the
+  128-token chunks re-read the weights, the attention kernel grows with the
+  square of the length). Next: those three.

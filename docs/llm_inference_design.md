@@ -435,9 +435,36 @@ float arithmetic exact, the small-valued ones for the tensor kernels'
 relaxed precision; the GPU under garnet, TypeScript under Node, identical
 output), and `modules/metal_compute` has the concurrent command buffer.
 
-Next on the GPU: the small kernels of a token (0.6 ms of 10), Q4_0 to halve
-the bytes per token, and the CPU path's prompt (one token at a time, 24.5
-tokens/s on one thread).
+Over prompt lengths the picture is not a win (Kaz doubted a win over
+llama.cpp's tuned kernels, rightly; the same machine and model, llama-bench
+`-p 8,...,512` against a repeated text cut to n tokens, one warm-up batch
+then the best of three):
+
+| tokens | garnet tok/s | llama.cpp Metal tok/s |
+|---|---|---|
+| 8 | 594 | 724 |
+| 16 | 1138 | 1207 |
+| 32 | 2146 | 1392 |
+| 51 | 2634 | 2111 |
+| 64 | 3166 | 2612 |
+| 128 | 3519 | 4466 |
+| 256 | 3142 | 4786 |
+| 512 | 2572 | 4802 |
+
+The hot path is GPU kernel against GPU kernel (the TypeScript-compiled host
+code only encodes commands); garnet's kernel is a transcription of
+llama.cpp's with a different tile parameter. It wins only between 32 and 64
+tokens, where llama.cpp's 128-token tile computes a half-empty tile and
+garnet's 64-token tile is full: a configuration fit, not a better kernel.
+Below that llama.cpp's small-batch kernels (`mul_mv_ext`) are leaner, and
+from 128 tokens its kernel reaches about 10.5 TFLOP/s against garnet's 7.7
+at 128 and 5.5 at 512: garnet's 128-token tile measured slower than its
+64-token one (32.8 against 21.8 ms for 51 tokens), so something in the
+kernel's step is less efficient than llama.cpp's; `BATCH_MAX` 128 re-reads
+the weights per chunk (eight reads for 512 tokens: 75 ms of the 199); and
+the attention kernel (64 active threads of 256, serial over the positions)
+grows with the square of the length. Those three are the work to be at
+llama.cpp's rate at every length.
 
 ## Beyond
 
