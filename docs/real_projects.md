@@ -415,8 +415,31 @@ names its phase.
 | state | garnet | Node | ratio |
 |---|---|---|---|
 | first run (reactivity 4 x 600, compiler 400 rounds) | 2,240 | 762 | 2.9 |
+| a field key's canonical string, the trap invariants' fast exit, the trap names' keys | 1,606 | | |
+| a Proxy receiver's set landing on its target (no descriptor objects) | 1,614 (noise) | | |
+| the canonical strings pre-hashed, the toString tags as static cells | 1,578 | 758 | 2.1 |
 
-The first run is the correctness milestone; the tuning rounds come next (the trap dispatch and the
-dynamic method calls of the reactivity workload are the obvious targets). The other projects did not
+The first run is the correctness milestone. The first tuning round (alternating A/B against the
+previous binary each time) took the reactivity phase from 1,749 to 1,030 ms:
+
+- **A field key's canonical string** (`ts_key_to_value`): a key handed to a Proxy trap as a string
+  was a fresh heap string per access, which vue's handler then read back through
+  `Reflect.get(target, key, receiver)`, `hasOwn(instrumentations, key)` and `depsMap.get(key)`: an
+  interning (hash, probe, byte compare) each, and a Map lookup comparing bytes. Each field key now
+  has one static string cell made on first use, carrying its key id (`TS_STR_FLAG_KEY`) and its
+  hash: string to key and key to string are O(1), and the Map lookups compare identities.
+- **The trap invariants' fast exit** (`proxy_target_may_constrain`): after every get, set and has
+  trap the runtime built the target's own property descriptor (an object with four fields) to check
+  the specification's invariants, which only a non-configurable or read-only property can violate. A
+  plain object or array that is not frozen, sealed or non-extensible and has no attribute records
+  skips the check; a Proxy receiver without `getOwnPropertyDescriptor` and `defineProperty` traps
+  completes a set on its target directly instead of through two descriptor objects.
+- The trap names' keys interned once (`proxy_trap_key`), and `Object.prototype.toString`'s fixed
+  tags as static cells (vue's `toRawType` calls it on every value `reactive()` wraps).
+
+The profile after the round: vue's `get` trap itself (8%), the dynamic property reads inside it
+(`ts_get_pic_checked`, `prop_find`, `lookup_prop_chain`), the Map lookups of `track`, and the calls
+of `@vue/shared`'s helpers, which are module-level `const f = (...) => ...` bindings and so go through
+a function value (the next round's target: a direct call for a const arrow that never moves). The other projects did not
 move: yaml 3,570 -> 3,575 ms and rxjs 383.9 -> 384.0 ms alternating against the previous binaries
 (the new tests sit in the typed entries' non-array branches and at a loop's entry).

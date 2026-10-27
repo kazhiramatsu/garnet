@@ -4054,6 +4054,7 @@ static int ts_key_from_value(tsv keyv, ts_key* out){
         return 1;
       }
     } else if (ts_is_heap_str(keyv) && (ts_str_flags_typed(keyv) & TS_STR_FLAG_STATIC)){
+      if (ts_str_flags_typed(keyv) & TS_STR_FLAG_KEY){ *out = ts_str_ptr_typed(keyv)->offset; return 1; }   /* a canonical key string */
       uint64_t x = (uint64_t)keyv ^ ((uint64_t)keyv >> 17);
       uint32_t slot = (uint32_t)(x >> 3) & (TS_LIT_KEY_CACHE - 1u);
       if (g_lit_key_cache[slot].s == keyv && g_lit_key_cache[slot].key1){ *out = g_lit_key_cache[slot].key1 - 1u; return 1; }
@@ -11182,6 +11183,11 @@ static const char** g_field_names = NULL;
 static uint32_t* g_field_lens = NULL;
 static uint32_t g_field_count = 0;
 static uint32_t g_field_cap = 0;
+/* The canonical string of a field key (`ts_key_to_value`): one static cell per key, made on first
+   use, carrying its key id (TS_STR_FLAG_KEY), so a key handed to a Proxy trap as a string and read
+   back through `Reflect.get(target, key)` or used as a Map key costs no allocation, no interning and
+   no byte comparison (vue's handlers do all three on every access). */
+static tsv* g_field_strings = NULL;
 /* ---- field-name hash index (P2a: O(1) intern vs O(#fields) memcmp scan) ----
    Maps a field name's FNV-1a hash to its id+1 (0 = empty slot), open-addressed
    with linear probing, power-of-two sized, kept under 3/4 load. The field table
@@ -11260,6 +11266,7 @@ void ts_init_fields(const char* const* names, const uint32_t* lens, uint32_t cou
   g_field_cap = count < 16 ? 16 : count*2;
   g_field_names = malloc(sizeof(char*)*g_field_cap);
   g_field_lens = malloc(sizeof(uint32_t)*g_field_cap);
+  free(g_field_strings); g_field_strings = calloc(g_field_cap, sizeof(tsv));
   for (uint32_t i=0;i<count;i++){
     g_field_names[i] = names[i];
     g_field_lens[i] = lens ? lens[i] : (uint32_t)strlen(names[i]);
@@ -11273,6 +11280,36 @@ void ts_init_fields(const char* const* names, const uint32_t* lens, uint32_t cou
 const char* ts_field_name(uint32_t id){
   if (id >= g_field_count) return NULL;
   return g_field_names[id];
+}
+/* The canonical string cell of an ASCII field name (see g_field_strings); 0 when the name is not
+   ASCII or the key is not a field (the caller makes a fresh string). */
+static tsv field_string_canonical(uint32_t id){
+  if (id >= g_field_count || !g_field_strings) return 0;
+  tsv s = g_field_strings[id];
+  if (s) return s;
+  const char* n = g_field_names[id];
+  uint32_t len = g_field_lens[id];
+  if (!n) return 0;
+  for (uint32_t i = 0; i < len; i++) if ((unsigned char)n[i] >= 0x80u) return 0;
+  ts_string* cell = (ts_string*)calloc(1, sizeof(ts_string) + (size_t)len + 1u);
+  if (!cell) abort();
+  cell->h.kind = TS_KIND_STRING;
+  cell->h.gen = TS_GEN_NONHEAP;
+  cell->len = len;
+  cell->flags = TS_STR_FLAG_ASCII | TS_STR_FLAG_STATIC | TS_STR_FLAG_KEY;
+  cell->parent = TS_UNDEFINED;
+  cell->offset = id;            /* the key id a TS_STR_FLAG_KEY string carries */
+  memcpy(cell->data, n, len);
+  cell->data[len] = 0;
+  {   /* hashed once here: a static cell is never written by ts_str_hash_of, and these are Map keys
+         (vue's depsMap) on every access */
+    ts_strview hv = { cell->data, len, 0, cell->flags, 0 };
+    cell->hash = strhash_view(hv);
+    cell->flags |= TS_STR_FLAG_HASHED;
+  }
+  s = ts_str_v(cell);
+  g_field_strings[id] = s;
+  return s;
 }
 uint32_t ts_field_name_len(uint32_t id){
   if (id >= g_field_count || !g_field_names[id]) return 0;
@@ -11305,9 +11342,12 @@ uint32_t ts_intern_field(const char* name, uint32_t len){
   }
   /* new field: grow the parallel name/len arrays if needed */
   if (g_field_count==g_field_cap){
+    uint32_t old_cap = g_field_cap;
     g_field_cap=g_field_cap?g_field_cap*2:16;
     g_field_names=realloc(g_field_names,sizeof(char*)*g_field_cap);
     g_field_lens=realloc(g_field_lens,sizeof(uint32_t)*g_field_cap);
+    g_field_strings=realloc(g_field_strings,sizeof(tsv)*g_field_cap);
+    memset(g_field_strings + old_cap, 0, sizeof(tsv) * (g_field_cap - old_cap));
   }
   /* reserve index capacity for one more BEFORE appending, so the rebuild inside
      reserve() (which re-inserts ids [0,g_field_count)) never sees the not-yet-
@@ -15036,9 +15076,32 @@ static int objproto_tostring_is_error(tsv v){
   }
   return 0;
 }
+#define TS_TAG_STATIC(name, text, n) \
+  static struct { ts_gc_header h; uint32_t len, hash, flags; tsv parent; uint32_t offset; char data[n + 1]; } \
+    name = { { TS_KIND_STRING, 0, TS_GEN_NONHEAP, 0, 0 }, n, 0u, TS_STR_FLAG_ASCII | TS_STR_FLAG_STATIC, TS_UNDEFINED, 0u, text };
+TS_TAG_STATIC(g_tag_undefined, "[object Undefined]", 18)
+TS_TAG_STATIC(g_tag_null, "[object Null]", 13)
+TS_TAG_STATIC(g_tag_regexp, "[object RegExp]", 15)
+TS_TAG_STATIC(g_tag_map, "[object Map]", 12)
+TS_TAG_STATIC(g_tag_set, "[object Set]", 12)
+TS_TAG_STATIC(g_tag_weakmap, "[object WeakMap]", 16)
+TS_TAG_STATIC(g_tag_weakset, "[object WeakSet]", 16)
+TS_TAG_STATIC(g_tag_promise, "[object Promise]", 16)
+TS_TAG_STATIC(g_tag_error, "[object Error]", 14)
+TS_TAG_STATIC(g_tag_date, "[object Date]", 13)
+TS_TAG_STATIC(g_tag_array, "[object Array]", 14)
+TS_TAG_STATIC(g_tag_function, "[object Function]", 17)
+TS_TAG_STATIC(g_tag_symbol, "[object Symbol]", 15)
+TS_TAG_STATIC(g_tag_number, "[object Number]", 15)
+TS_TAG_STATIC(g_tag_string, "[object String]", 15)
+TS_TAG_STATIC(g_tag_boolean, "[object Boolean]", 16)
+TS_TAG_STATIC(g_tag_object, "[object Object]", 15)
+#define TS_TAG(name) ((tsv)ts_str_v((ts_string*)&name))
+/* Object.prototype.toString: the fixed tags are static cells (no allocation per call: vue's toRawType
+   and lodash's type tests call it on every value they classify). */
 tsv ts_objproto_tostring_call(tsv v){
-  if (ts_is_undef(v)) return ts_new_string("[object Undefined]", 18);
-  if (ts_is_null(v))  return ts_new_string("[object Null]", 13);
+  if (ts_is_undef(v)) return TS_TAG(g_tag_undefined);
+  if (ts_is_null(v))  return TS_TAG(g_tag_null);
   /* arrays/plain objects can carry [Symbol.toStringTag]; funcs/primitives don't.
      Keep v/tag rooted and copy tag bytes before the result allocation. */
   if (ts_is_obj(v) && !ts_is_symbol(v)){
@@ -15062,15 +15125,15 @@ tsv ts_objproto_tostring_call(tsv v){
     }
     ts_gc_unroot(1);
   }
-  if (ts_regexp_is_fast_obj(v)) return ts_new_string("[object RegExp]", 15);
+  if (ts_regexp_is_fast_obj(v)) return TS_TAG(g_tag_regexp);
   /* the builtin tags of the collections, promises and errors (ECMA-262's @@toStringTag of their
      prototypes and the builtinTag of [[ErrorData]]): vue's toRawType sorts a Map or Set into its
-     collection handlers by this tag; a Proxy answers for its target's array-ness only */
-  if (ts_is_map(v)) return ts_new_string("[object Map]", 12);
-  if (ts_is_set(v)) return ts_new_string("[object Set]", 12);
-  if (ts_is_weakmap(v)) return ts_new_string("[object WeakMap]", 16);
-  if (ts_is_weakset(v)) return ts_new_string("[object WeakSet]", 16);
-  if (ts_is_promise(v)) return ts_new_string("[object Promise]", 16);
+     collection handlers by this tag; a Proxy answers for its target */
+  if (ts_is_map(v)) return TS_TAG(g_tag_map);
+  if (ts_is_set(v)) return TS_TAG(g_tag_set);
+  if (ts_is_weakmap(v)) return TS_TAG(g_tag_weakmap);
+  if (ts_is_weakset(v)) return TS_TAG(g_tag_weakset);
+  if (ts_is_promise(v)) return TS_TAG(g_tag_promise);
   /* a Proxy: its target's tag (IsArray sees through it; the @@toStringTag of a Map or Set target's
      prototype reaches through the default get trap) */
   if (g_has_proxies && ts_is_proxy(v)){
@@ -15078,11 +15141,11 @@ tsv ts_objproto_tostring_call(tsv v){
     if (px->revoked) ts_throw_type_error_msg("Cannot perform 'Object.prototype.toString' on a proxy that has been revoked");
     return ts_objproto_tostring_call(px->target);
   }
-  if (ts_is_obj(v) && objproto_tostring_is_error(v)) return ts_new_string("[object Error]", 14);
+  if (ts_is_obj(v) && objproto_tostring_is_error(v)) return TS_TAG(g_tag_error);
   {   /* a Date: the object carrying the time value at the reserved field */
     static ts_key k_date_ms;
     if (!k_date_ms) k_date_ms = ts_intern_field("__date_ms", 9);
-    if (TS_TOP16(v) == TS_SEL_OBJECT && ((ts_gc_header*)ts_ptr(v))->kind == TS_KIND_OBJECT && ts_has_own(v, k_date_ms)) return ts_new_string("[object Date]", 13);
+    if (TS_TOP16(v) == TS_SEL_OBJECT && ((ts_gc_header*)ts_ptr(v))->kind == TS_KIND_OBJECT && ts_has_own(v, k_date_ms)) return TS_TAG(g_tag_date);
   }
   if (ts_is_typed_array(v)){
     static const char* const tags[TS_TA_COUNT] = { "[object Int8Array]", "[object Uint8Array]", "[object Uint8ClampedArray]",
@@ -15094,14 +15157,13 @@ tsv ts_objproto_tostring_call(tsv v){
   if (ts_is_array_buffer(v)){
     return ((ts_arraybuffer*)ts_ptr(v))->shared ? ts_new_string("[object SharedArrayBuffer]", 26) : ts_new_string("[object ArrayBuffer]", 20);
   }
-  const char* tag = ts_is_array(v) ? "[object Array]"
-                  : ts_is_func(v)   ? "[object Function]"
-                  : ts_is_symbol(v) ? "[object Symbol]"
-                  : ts_is_num(v)    ? "[object Number]"
-                  : ts_is_str(v)    ? "[object String]"
-                  : ts_is_bool(v)   ? "[object Boolean]"
-                  : "[object Object]";
-  return ts_new_string(tag, (uint32_t)strlen(tag));
+  return ts_is_array(v) ? TS_TAG(g_tag_array)
+       : ts_is_func(v)   ? TS_TAG(g_tag_function)
+       : ts_is_symbol(v) ? TS_TAG(g_tag_symbol)
+       : ts_is_num(v)    ? TS_TAG(g_tag_number)
+       : ts_is_str(v)    ? TS_TAG(g_tag_string)
+       : ts_is_bool(v)   ? TS_TAG(g_tag_boolean)
+       : TS_TAG(g_tag_object);
 }
 /* o.valueOf(): returns the object itself (default Object.prototype.valueOf). */
 tsv ts_objproto_valueOf(tsv* args, int n){ return (n>0) ? args[0] : TS_UNDEFINED; }
@@ -18202,6 +18264,7 @@ tsv ts_reflect_get_recv(tsv t, tsv k, tsv r){
    (an own accessor or read-only property, or a non-extensible receiver,
    fails). Returns the success flag, as Reflect does (no throw). */
 static int proxy_receiver_set(tsv r, ts_key key, tsv v);
+static int receiver_part_set(tsv r, ts_key key, tsv v);
 static int ordinary_set_recv(tsv t, ts_key key, tsv v, tsv r){
   ts_gc_root(&t); ts_gc_root(&v); ts_gc_root(&r);
   int ok = 1;
@@ -18239,22 +18302,30 @@ static int ordinary_set_recv(tsv t, ts_key key, tsv v, tsv r){
   /* the receiver's part */
   if (!ts_is_propbag(r)){ ok = 0; goto done; }
   if (g_has_proxies && ts_is_proxy(r)){ ok = proxy_receiver_set(r, key, v); goto done; }
-  {
-    ts_object* ro = (ts_object*)ts_ptr(r);
-    if (kind_has_common_header(ro->h.kind) && (class_has_field(ro, key) || find_slot(ro, key, 0))){
-      if (!class_has_field(ro, key)){
-        ts_pref own = prop_find(ro, key);
-        if (pref_ok(own) && (pref_is_accessor(own) || !pref_is_writable(own) || (ts_obj_integrity(ro) & 1u))){ ok = 0; goto done; }
-      }
-      ts_set(r, key, v);          /* an own writable data property: no chain walk */
-    } else if (!kind_has_common_header(ro->h.kind) || (ts_obj_integrity(ro) & (1u|2u|4u))){
-      ok = 0;
-    } else {
-      ts_define_data(r, key, v, 1, 1, 1);
-    }
-  }
+  ok = receiver_part_set(r, key, v);
 done:
   ts_gc_unroot(3);
+  return ok;
+}
+/* The receiver's part of OrdinarySet for an ordinary receiver (steps 2.c-2.e): an own writable data
+   property is written, an own accessor or read-only property or a non-extensible receiver fails,
+   otherwise the property is created. */
+static int receiver_part_set(tsv r, ts_key key, tsv v){
+  ts_gc_root(&r); ts_gc_root(&v);
+  int ok = 1;
+  ts_object* ro = (ts_object*)ts_ptr(r);
+  if (kind_has_common_header(ro->h.kind) && (class_has_field(ro, key) || find_slot(ro, key, 0))){
+    if (!class_has_field(ro, key)){
+      ts_pref own = prop_find(ro, key);
+      if (pref_ok(own) && (pref_is_accessor(own) || !pref_is_writable(own) || (ts_obj_integrity(ro) & 1u))){ ts_gc_unroot(2); return 0; }
+    }
+    ts_set(r, key, v);          /* an own writable data property: no chain walk */
+  } else if (!kind_has_common_header(ro->h.kind) || (ts_obj_integrity(ro) & (1u|2u|4u))){
+    ok = 0;
+  } else {
+    ts_define_data(r, key, v, 1, 1, 1);
+  }
+  ts_gc_unroot(2);
   return ok;
 }
 tsv ts_reflect_set_recv(tsv t, tsv k, tsv v, tsv r){
@@ -18381,16 +18452,26 @@ tsv ts_proxy_new(tsv target, tsv handler){
 static tsv ts_key_to_value(ts_key k){
   if (k >= TS_USERSYM_KEY_BASE){ tsv s = sym_value_by_id(k - TS_USERSYM_KEY_BASE); return ts_is_undef(s) ? ts_new_string("",0) : s; }
   if (k >= TS_WKSYM_KEY_BASE) return ts_wksym(k - TS_WKSYM_KEY_BASE);
+  tsv canon = field_string_canonical(k);
+  if (canon) return canon;
   const char* n = ts_field_name(k);
   return n ? ts_new_string(n, ts_field_name_len(k)) : ts_new_string("",0);
 }
 /* Look up a trap on the handler. Throws if the proxy is revoked or the trap is
    present-but-not-callable; returns TS_UNDEFINED when the trap is absent (the
    caller then performs the default operation on the target). */
+static ts_key proxy_trap_key(const char* name){
+  /* the callers pass string literals: their addresses identify the dozen trap names */
+  static const char* names[16]; static ts_key keys[16]; static int n;
+  for (int i = 0; i < n; i++) if (names[i] == name) return keys[i];
+  ts_key k = ts_intern_field(name, (uint32_t)strlen(name));
+  if (n < 16){ names[n] = name; keys[n] = k; n++; }
+  return k;
+}
 static tsv ts_proxy_trap(tsv pv, tsv handler, const char* name){
   ts_proxy* px = ts_ptr(pv);
   if (px->revoked) ts_throw_type_error("Cannot perform operation on a proxy that has been revoked");
-  tsv trap = ts_get(handler, ts_intern_field(name, (uint32_t)strlen(name)));
+  tsv trap = ts_get(handler, proxy_trap_key(name));
   if (ts_is_undef(trap) || ts_is_null(trap)) return TS_UNDEFINED;
   if (!ts_is_callable(trap)) ts_throw_type_error("proxy handler trap is not a function");
   return trap;
@@ -18405,6 +18486,17 @@ static int pd_bool(tsv d, const char* nm){ return ts_truthy(pd_get(d, nm)); }
    Reflect.set(target, key, value, receiver) used to call itself until the
    stack overflowed. */
 static int proxy_receiver_set(tsv r, ts_key key, tsv v){
+  {
+    /* No getOwnPropertyDescriptor and no defineProperty trap on the receiver (vue's handlers have
+       neither): its [[GetOwnProperty]] and [[DefineOwnProperty]] are its target's, so the steps land on
+       the target directly, without the descriptor objects the generic path builds and reads back. */
+    ts_proxy* px = (ts_proxy*)ts_ptr(r);
+    tsv target = px->target;
+    if (!px->revoked && ts_is_propbag(target) && !(g_has_proxies && ts_is_proxy(target)) &&
+        ts_is_undef(ts_proxy_trap(r, px->handler, "getOwnPropertyDescriptor")) &&
+        ts_is_undef(ts_proxy_trap(r, px->handler, "defineProperty")))
+      return receiver_part_set(target, key, v);
+  }
   ts_gc_root(&r); ts_gc_root(&v);
   tsv keyv = ts_key_to_value(key);
   ts_gc_root(&keyv);
@@ -18428,7 +18520,26 @@ static int proxy_receiver_set(tsv r, ts_key key, tsv v){
 }
 
 /* === GET === */
+/* The invariant checks of a trap's result need the target's own property only when that property
+   can be non-configurable or non-writable: a frozen, sealed or non-extensible object, or a property
+   defined with attributes. A plain object or array with none of those (vue's reactive targets) has
+   nothing to check, so no descriptor object is built per trap. */
+static int proxy_target_may_constrain(tsv target, tsv keyv){
+  if (TS_TOP16(target) != TS_SEL_OBJECT) return 1;
+  ts_object* o = (ts_object*)ts_ptr(target);
+  if (o->h.kind == TS_KIND_ARRAY) return ts_obj_integrity(&((ts_array*)o)->o) != 0;
+  if (o->h.kind != TS_KIND_OBJECT) return 1;
+  if (ts_obj_integrity(o) != 0) return 1;
+  if (o->h.flags & TS_HDR_SIDECAR) return 1;          /* a field's attribute records live there */
+  if (o->h.flags & TS_HDR_SIZED) return 0;            /* a class instance's fields: default attributes */
+  ts_key key;
+  if (!ts_key_from_value(keyv, &key)) return 1;
+  ts_pref p = prop_find(o, key);
+  if (!pref_ok(p)) return 0;
+  return (pref_flags(p) & TS_PROP_CONFIGURABLE) == 0 || (!pref_is_accessor(p) && (pref_flags(p) & TS_PROP_WRITABLE) == 0);
+}
 static void proxy_inv_get(tsv target, tsv keyv, tsv result){
+  if (!proxy_target_may_constrain(target, keyv)) return;
   tsv desc = ts_get_own_property_descriptor(target, keyv);
   if (ts_is_undef(desc)) return;
   ts_gc_root(&desc);
@@ -18472,6 +18583,7 @@ static tsv ts_proxy_get_v(tsv pv, tsv keyv, tsv receiver){
 }
 /* === SET === */
 static void proxy_inv_set(tsv target, tsv keyv, tsv value){
+  if (!proxy_target_may_constrain(target, keyv)) return;
   tsv desc = ts_get_own_property_descriptor(target, keyv);
   if (ts_is_undef(desc)) return;
   ts_gc_root(&desc);
@@ -18511,6 +18623,7 @@ static int ts_proxy_set_v(tsv pv, tsv keyv, tsv value, tsv receiver){
 /* === HAS === */
 static void proxy_inv_has(tsv target, tsv keyv, int trapResult){
   if (trapResult) return;
+  if (!proxy_target_may_constrain(target, keyv)) return;
   tsv desc = ts_get_own_property_descriptor(target, keyv);
   if (ts_is_undef(desc)) return;
   ts_gc_root(&desc);

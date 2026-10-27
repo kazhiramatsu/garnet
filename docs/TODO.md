@@ -10989,3 +10989,17 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
     tag (vue's `toRawType` had sorted a reactive Map into the plain-object handlers):
     `object_methods/to_string_tags`.
   yaml and rxjs A/B against the previous binaries: yaml 3,570 -> 3,575 ms and rxjs 383.9 -> 384.0 ms alternating (unchanged; the new tests sit in the entries' non-array branches and at loop entry). Gates: conformance 637/637 plain and strict, 634/634 under GC protect, unit, bundler 48/48, bench within budget, GC stress.
+- Real projects: vue, the first tuning round (Session 354, `docs/real_projects.md` "vue"). vue
+  2,249 -> 1,578 ms alternating (Node 758: 2.9x -> 2.1x; the reactivity phase 1,749 -> 1,030 ms),
+  outputs identical. (1) `ts_key_to_value` returns one static string cell per field key
+  (`g_field_strings`, `field_string_canonical`: `TS_STR_FLAG_KEY` with the key id in `offset`,
+  pre-hashed since `ts_str_hash_of` never writes a static cell), and `ts_key_from_value` reads the
+  id back from it: a Proxy trap's key was a fresh string per access, re-interned by every
+  `Reflect.get` / `hasOwn` / `depsMap.get` in vue's handlers; 2,249 -> 1,606 together with (2) and
+  (3). (2) `proxy_target_may_constrain`: the get/set/has invariant checks built a descriptor object
+  per trap; a plain object or array without integrity bits or attribute records has nothing to
+  check. `proxy_receiver_set` lands a set on the target directly when the receiver Proxy has no
+  getOwnPropertyDescriptor/defineProperty trap (`receiver_part_set`, the ordinary receiver steps
+  extracted; neutral on vue, which writes mostly through arrays). (3) `proxy_trap_key`: the trap
+  names interned once. (4) `Object.prototype.toString`'s fixed tags as static cells (`TS_TAG_STATIC`;
+  vue's `toRawType` on every wrapped value); 1,614 -> 1,578 with the pre-hashing. Gates: conformance 637/637 plain and strict, 634/634 under GC protect (the next slice's two fixtures, written during the run, excluded), unit, bundler 48/48, bench within budget, GC stress.
