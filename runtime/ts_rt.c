@@ -17623,6 +17623,7 @@ static tsv prop_ic_read(tsv receiver, ts_pref p){
 typedef struct ts_prop_absent_entry ts_prop_absent_entry;
 static inline const ts_prop_absent_entry* prop_absent_lookup(const ts_prop_ic* ic, ts_object* o, ts_key key);
 static void prop_absent_fill(ts_prop_ic* ic, ts_object* o, ts_key key);
+static void prop_absent_fill_impl(ts_prop_ic* ic, ts_object* o, ts_key key, int site);
 static void prop_absent_site_fill(ts_prop_ic* ic, const ts_object* o, ts_key key, const ts_prop_absent_entry* e);
 static tsv ts_get_pic_checked_slow(tsv obj, ts_key key, ts_prop_ic* ic);
 static uint32_t g_prop_absent_epoch;   /* g_prop_add_epoch | TS_ABSENT_EPOCH_TAG */
@@ -17643,7 +17644,7 @@ static inline int prop_absent_site_hit(tsv obj, ts_key key, const ts_prop_ic* ic
     tsv link = o->proto;
     if (TS_TOP16(link) != TS_SEL_OBJECT) return 0;
     o = (const ts_object*)ts_ptr(link);
-    if (o->h.kind != TS_KIND_OBJECT || o->shape != ic->absent_proto_shape[i]) return 0;
+    if ((o->h.kind != TS_KIND_OBJECT && o->h.kind != TS_KIND_ARRAY) || o->shape != ic->absent_proto_shape[i]) return 0;
   }
   return !ts_proto_ref(o->proto);
 }
@@ -17737,6 +17738,28 @@ __attribute__((noinline)) static tsv ts_get_pic_checked_slow(tsv obj, ts_key key
       RT_STAT_KEY(g_key_absent, key);
       if (ts_obj_is_sized(o)) sized_absent_fill(o, key); else prop_absent_fill(ic, o, key);
       return TS_UNDEFINED;
+    }
+  }
+  /* A number, a boolean or a string (a key that is not its length or an index) reads through its
+     wrapper prototype's chain; an absent key (a library's `isRef(v)` reads `v.__v_isRef` on every
+     value a trap returns, numbers and strings among them) is answered from the table's entry for
+     that prototype, as a plain receiver of its shape would be, and filled the same way after the
+     walk; the site's own record stays with the site's objects. */
+  if (ic && g_negative_pic && key < TS_USERSYM_KEY_BASE){
+    tsv protov = 0, own;
+    if (ts_is_num(obj)) protov = g_number_proto_v;
+    else if (ts_is_bool(obj)) protov = g_boolean_proto_v;
+    else if (ts_is_str(obj)){ if (ts_string_own_prop(obj, key, &own)) return own; protov = g_string_proto_v; }
+    if (protov && ts_proto_ref(protov)){
+      ts_object* po = ts_proto_ptr(protov);
+      if (po->h.kind == TS_KIND_OBJECT){
+        if (prop_absent_lookup(ic, po, key)){ RT_STAT_INC(pic_absent_hits); return TS_UNDEFINED; }
+        tsv found;
+        if (lookup_prop_chain(obj, po, key, &found)) return found;
+        RT_STAT_INC(pic_get_absent);
+        prop_absent_fill_impl(ic, po, key, 0);
+        return TS_UNDEFINED;
+      }
     }
   }
   return ts_get(obj, key);
@@ -17910,7 +17933,7 @@ static inline const ts_prop_absent_entry* prop_absent_lookup(const ts_prop_ic* i
   ts_object* p = o;
   for (uint8_t i = 0; i < e->depth; i++){
     p = ts_next_proto(p);
-    if (!p || p->h.kind != TS_KIND_OBJECT || p->shape != e->proto_shape[i]) return NULL;
+    if (!p || (p->h.kind != TS_KIND_OBJECT && p->h.kind != TS_KIND_ARRAY) || p->shape != e->proto_shape[i]) return NULL;
   }
   return ts_next_proto(p) == NULL ? e : NULL;
 }
@@ -17934,20 +17957,26 @@ static void prop_absent_site_fill(ts_prop_ic* ic, const ts_object* o, ts_key key
   for (uint8_t i = 0; i < e->depth; i++) ic->absent_proto_shape[i] = e->proto_shape[i];
   ic->rec_epoch = g_prop_absent_epoch;
 }
-static void prop_absent_fill(ts_prop_ic* ic, ts_object* o, ts_key key){
+/* A chain link the absent table can describe by a shape word: a plain object, or an array-kind
+   prototype (Array.prototype is one), whose named properties are shaped like an object's. */
+static inline int absent_chain_link_ok(const ts_object* p){
+  return (p->h.kind == TS_KIND_OBJECT || p->h.kind == TS_KIND_ARRAY) && ts_obj_shape_id(p) != TS_SHAPE_NONE;
+}
+static void prop_absent_fill_impl(ts_prop_ic* ic, ts_object* o, ts_key key, int site){
   if (!ic || !g_negative_pic || key >= TS_USERSYM_KEY_BASE || !prop_epoch_live()) return;
   if (ts_obj_shape_id(o) == TS_SHAPE_NONE || ts_obj_is_sized(o)) return;
   uint32_t chain_shape[3]; uint8_t depth = 0;
   for (ts_object* p = ts_next_proto(o); p; p = ts_next_proto(p)){
     if (depth == 3) return;
-    if (p->h.kind != TS_KIND_OBJECT || ts_obj_shape_id(p) == TS_SHAPE_NONE) return;
+    if (!absent_chain_link_ok(p)) return;
     chain_shape[depth] = p->shape; depth++;
   }
   ts_prop_absent_entry* e = &g_prop_absent_cache[prop_absent_slot(ic, o->shape)];
   e->site = ic; e->shape = o->shape; e->key = key; e->epoch = g_prop_add_epoch; e->depth = depth;
   for (uint8_t i = 0; i < depth; i++) e->proto_shape[i] = chain_shape[i];
-  prop_absent_site_fill(ic, o, key, e);
+  if (site) prop_absent_site_fill(ic, o, key, e);
 }
+static void prop_absent_fill(ts_prop_ic* ic, ts_object* o, ts_key key){ prop_absent_fill_impl(ic, o, key, 1); }
 /* Object literal / constructor layouts: resolve the site's shape once by
    walking the transitions, then allocate directly in that shape. */
 static uint32_t lit_layout_shape(ts_lit_layout* L){

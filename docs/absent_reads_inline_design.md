@@ -138,3 +138,22 @@ the chain walk (seven cases), without the key test (the dynamic site) and
 without the receiver's kind test (the array); removing the epoch test, the
 end-of-chain test or the links' kind test alone is not observable, as a
 relink always moves the epoch (they are kept as defence in depth).
+
+## Arrays and primitives (Session 355)
+
+The table's chain rule admitted plain-object links only, and `Array.prototype` is an
+array-kind object, so a named absent read on an array (`arr.__v_raw` in vue's
+`createReactiveObject`) was never recorded and walked the chain on every access; a number, a
+string or a boolean receiver (vue's `isRef(v)` reads `v.__v_isRef` on every value a trap
+returns) went to the generic read, which walked the wrapper prototype's chain each time. A
+chain link may be an array-kind prototype now (`absent_chain_link_ok`: a plain object or an
+array with a shape word; the array's own keys the shape fixes are its named ones, `length`
+and the indices being outside the table's keys anyway), so an array receiver records and
+hits as a plain one. A primitive receiver reads through its wrapper prototype's entry in the
+slow read: `Number.prototype`, `Boolean.prototype` or `String.prototype` (after the string's
+own `length` and indices) stands in as the receiver whose shape keys the entry, the chain
+above it recorded as usual, and a miss walks the chain and fills the entry without touching
+the site's own record (`prop_absent_fill_impl(.., 0)`), which stays with the site's objects.
+A property added to or deleted from any of those prototypes afterwards changes its shape
+word and misses the entry, as for a plain receiver. vue: 36.996 -> 36.023 G instructions
+(-2.6%), 5.571 -> 5.299 G cycles, 1,277 -> 1,231 ms alternating (Node 756: 1.63x).

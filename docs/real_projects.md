@@ -426,6 +426,7 @@ names its phase.
 | a constant key at a dynamic-key site (`r[ReactiveFlags.IS_REF]`, `target[ReactiveFlags.RAW]`) interned once, the named cache | 1,338 (wall unchanged; 1.7% fewer instructions) | | |
 | `@vue/shared`'s builtin aliases (`isArray = Array.isArray`, `hasOwnProperty.call`, `objectToString.call`) called as the builtins | 1,340 (wall unchanged; 0.4% fewer instructions) | | |
 | the interface-typed sites (`Subscriber`, `Link`) probe the sized-receiver entries in line | 1,276 | 762 | 1.68 |
+| absent reads on arrays and primitives (`isRef(v)` on every value, `target.__v_raw` on arrays) answered from the absent table | 1,231 | 756 | 1.63 |
 
 The first run is the correctness milestone. The first tuning round (alternating A/B against the
 previous binary each time) took the reactivity phase from 1,749 to 1,030 ms:
@@ -509,3 +510,12 @@ instance now takes the inline read and write that probe the sized-receiver entri
 plain-object one (`docs/pic_sized_inline_design.md` "The interface-typed site"; the exporter decides
 from the type, so the typed compiler's plain-object sites are untouched): vue 39.11 -> 37.00 G
 instructions, 1,343 -> 1,276 ms alternating (Node 762: 1.68x), rxjs, yaml and tsc-ts unchanged.
+
+The next profile's first runtime items were the slow property read and the chain walk behind it:
+`isRef(v)` reads `v.__v_isRef` on every value a trap returns, numbers and strings among them, and
+`createReactiveObject` reads `__v_raw` and `__v_skip` on the arrays `reactive()` wraps. The absent
+table admitted plain-object chain links only (`Array.prototype` is array-kind), so an array's absent
+read was never recorded, and a primitive receiver walked its wrapper prototype's chain on every
+read. An array-kind prototype is a valid link now, and a primitive reads through its wrapper
+prototype's entry (`docs/absent_reads_inline_design.md` "Arrays and primitives"): vue 36.996 ->
+36.023 G instructions, 1,277 -> 1,231 ms alternating (Node 756: 1.63x).

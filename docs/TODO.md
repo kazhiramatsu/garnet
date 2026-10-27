@@ -11138,3 +11138,20 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   `classes/interface_sites_sized` (two classes and a literal behind one interface at one site,
   reads and writes, an accessor, a method value, a frozen instance, run-time additions, a union of
   classes, a constrained type parameter).
+- Absent-property reads on arrays and primitives through the absent table (Session 355,
+  `docs/absent_reads_inline_design.md` "Arrays and primitives"). After the sized sites, the profile's
+  first runtime items were the slow property read and the chain walk behind it (`ts_get_pic_checked_slow`
+  4.7% self, `prop_find` 3.7%, `lookup_prop_chain` 3.1%), from `isRef`, `isReadonly` and
+  `createReactiveObject`: `v.__v_isRef` on every value a trap returns, numbers and strings among
+  them, and `target.__v_raw` / `__v_skip` on the arrays `reactive()` wraps. The absent table's chain
+  rule admitted plain-object links only (`Array.prototype` is array-kind), so an array's absent read
+  was never recorded, and a primitive receiver went to the generic read, which walked the wrapper
+  prototype's chain each time. A chain link may be an array-kind prototype now
+  (`absent_chain_link_ok`), and a primitive reads through its wrapper prototype's entry in the slow
+  read (the prototype stands in as the receiver whose shape keys the entry; a miss fills it without
+  the site's own record). vue 36.996 -> 36.023 G instructions (-2.6%), 5.571 -> 5.299 G cycles,
+  1,276.8 -> 1,230.5 ms alternating (-3.6%; Node 756.0: 1.63x). rxjs 383.1 -> 382.7 and yaml 3,536.9 -> 3,535.8 (unchanged), tsc-ts 22.109 -> 22.130 G (unchanged), outputs identical. Gates: conformance 646/646 plain and strict, 643/643 under GC protect, unit, bundler 51/51, bench within budget, GC stress. Fixture
+  `objects/absent_reads_polymorphic` (one site over numbers, strings, booleans, arrays and objects;
+  the key added to and deleted from each wrapper prototype, Array.prototype and Object.prototype
+  afterwards; a replaced array prototype; a getter on Number.prototype reached from a primitive; a
+  string's own length and indices; a frozen prototype).
