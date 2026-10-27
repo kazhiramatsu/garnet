@@ -1,7 +1,8 @@
 // garnet:metal (docs/metal_design.md): kernels compiled from source run over the program's
 // SharedArrayBuffers in place. The values print the same whether the GPU computed them
 // (garnet on macOS) or the CPU did (Node, or a build without Metal): on these inputs the
-// kernels' float32 arithmetic is exact. The argument checks throw the same TypeError on
+// kernels' float32 arithmetic is exact (the command buffer is concurrent: two independent
+// dispatches, a barrier, then one that reads the first's result). The argument checks throw the same TypeError on
 // both sides before any Metal call; the GPU-only failures (the compiler's log, a missing
 // kernel, a released buffer, an oversized argument struct, a second open command buffer,
 // commits and waits out of order) print only their kinds, which the CPU side prints as
@@ -49,17 +50,20 @@ function main(): void {
     out.push("limits:" + (axpb.maxThreadsPerThreadgroup >= 256) + "," + (axpb.threadExecutionWidth >= 4) + "," + axpb.name);
     const bx = new GpuBuffer(x.buffer as SharedArrayBuffer), by = new GpuBuffer(ySab);
     const bm = new GpuBuffer(m.buffer as SharedArrayBuffer), bs = new GpuBuffer(sums.buffer as SharedArrayBuffer);
-    const args = new ArrayBuffer(8);
-    new Uint32Array(args)[0] = n;
-    new Float32Array(args)[1] = 3;
+    const args = new ArrayBuffer(8), args2 = new ArrayBuffer(8);
+    new Uint32Array(args)[0] = n; new Uint32Array(args2)[0] = n;
+    new Float32Array(args)[1] = 3; new Float32Array(args2)[1] = 2;
     const cols = new Uint32Array(1);
     cols[0] = 8;
     const empty = new CommandBuffer();   // opened and dropped: the next one may open
     out.push(attempt("second-open", () => new CommandBuffer()));
     empty.discard();
-    const cmd = new CommandBuffer();
+    const cmd = new CommandBuffer({ concurrent: true });
     cmd.pipeline(axpb); cmd.buffer(0, bx); cmd.buffer(1, by, 256); cmd.bytes(2, args); cmd.dispatch(Math.ceil(n / 256), 256);
     cmd.pipeline(rowSums); cmd.buffer(0, bm); cmd.buffer(1, bs); cmd.bytes(2, cols); cmd.dispatch3(1, 1, 1, 16, 1, 1);
+    cmd.barrier();   // the second axpb reads the first's y
+    cmd.pipeline(axpb); cmd.buffer(0, bx); cmd.buffer(1, by, 256); cmd.bytes(2, args2); cmd.dispatch(Math.ceil(n / 256), 256);
+    out.push("concurrent:" + cmd.concurrent + "," + empty.concurrent);
     out.push(attempt("too-many-threads", () => cmd.dispatch(1, axpb.maxThreadsPerThreadgroup + 1)));
     out.push(attempt("no-threadgroups", () => cmd.dispatch(0, 32)));
     out.push(attempt("big-bytes", () => cmd.bytes(3, new Uint8Array(8192))));
@@ -78,7 +82,8 @@ function main(): void {
   } else {
     for (let i = 0; i < n; i++) y[i] = x[i] * 3 + y[i];
     for (let r = 0; r < 16; r++) { let s = 0; for (let j = 0; j < 8; j++) s += m[r * 8 + j]; sums[r] = s; }
-    out.push("limits:true,true,axpb", "second-open:Error", "too-many-threads:RangeError", "no-threadgroups:RangeError",
+    for (let i = 0; i < n; i++) y[i] = x[i] * 2 + y[i];
+    out.push("limits:true,true,axpb", "second-open:Error", "concurrent:true,false", "too-many-threads:RangeError", "no-threadgroups:RangeError",
              "big-bytes:RangeError", "offset-past-end:RangeError", "index-past-end:RangeError", "wait-before-commit:Error",
              "commit-twice:Error", "wait-twice:Error", "bad-source:Error", "no-kernel:Error", "released:Error");
   }

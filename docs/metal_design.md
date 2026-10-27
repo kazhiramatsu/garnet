@@ -32,12 +32,19 @@ Language kernels and runs them over its own memory.
   text at run time (`newLibraryWithSource:options:error:`); the compiler's
   log is the thrown `Error`'s message. `fastMath` is off unless asked for
   (`MTLMathModeSafe`), so a kernel's arithmetic is not reassociated or
-  contracted behind the program's back. `library.pipeline(name)` is a compute
-  pipeline state; `maxThreadsPerThreadgroup` and `threadExecutionWidth` are
-  read once.
+  contracted behind the program's back; `languageVersion` ("major.minor",
+  the compiler's default when absent) selects the language version, which
+  the Metal 4 tensor headers (`<metal_tensor>`,
+  `MetalPerformancePrimitives`) need at "4.0": a program compiles such a
+  library in a `try` and keeps older kernels where it fails.
+  `library.pipeline(name)` is a compute pipeline state;
+  `maxThreadsPerThreadgroup` and `threadExecutionWidth` are read once.
 - **One command buffer, many dispatches.** `new CommandBuffer()` opens a
   command buffer with a serial compute encoder (each dispatch sees the
-  previous one's writes); `pipeline`, `buffer(index, gpuBuffer, byteOffset)`,
+  previous one's writes); `new CommandBuffer({ concurrent: true })` a
+  concurrent one (`MTLDispatchTypeConcurrent`: independent dispatches may
+  overlap, and `barrier()`, `memoryBarrierWithScope:` over buffers, orders
+  the dependent ones; on a serial encoder `barrier()` does nothing); `pipeline`, `buffer(index, gpuBuffer, byteOffset)`,
   `bytes(index, view)` (an argument struct, at most 4 KB, copied at encode
   time) and `dispatch(threadgroups, threadsPerThreadgroup)` (or `dispatch3`)
   mirror the encoder, so a forward pass of two hundred kernels is encoded in
@@ -79,11 +86,16 @@ GC stress. The fixture is the module's regression test; the LLM program's
 
 ## As built (2026-10-27)
 
-`runtime/metal_host.c` (350 lines of C), `lib/garnet/metal.ts`,
+`runtime/metal_host.c` (380 lines of C), `lib/garnet/metal.ts`,
 `lib/garnet/metal_node.ts`, the fixture
 `tests/conformance/exhaustive/modules/metal_compute.ts` (two kernels over
 SharedArrayBuffers, one bound at a byte offset, an argument struct as an
-ArrayBuffer and as a typed array, `dispatch3`, every error path by kind).
+ArrayBuffer and as a typed array, `dispatch3`, a concurrent command buffer
+with two independent dispatches, a barrier and a dependent one, every error
+path by kind). The `garnet` driver and `scripts/difftest.sh` rebuild their
+cached runtime object when any `runtime/*.c` or `*.h` is newer than it
+(`ts_rt.c` includes `metal_host.c`, `node_host.c`, `json_core.c`; they
+checked three files by name before, and a host change went unbuilt).
 Measured on the M5 (macOS 26.5, Metal 4): the first `available()` loads the
 framework and creates the device in 23 ms; a library of one kernel compiles
 and its pipeline builds in 36 ms; encoding costs 0.2 us per dispatch from

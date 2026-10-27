@@ -7,7 +7,8 @@
 #   bash benchmarks/llama2/run_gguf.sh [threads] [steps] [prompt]
 # With `gpu` as the thread count the native program runs on the Metal device (garnet:llama_metal)
 # after checking its forward pass against the CPU's over the prompt (--check-gpu: the argmax per
-# position and the last logits within a tolerance; a FAIL exits 1), and its text is compared with
+# position and the last logits within a tolerance, one token at a time and as a batch; a FAIL exits
+# 1), and its text is compared with
 # the CPU path's native text: the GPU's float32 arithmetic may pick another token where two logits
 # are within its rounding, so a text difference is reported, not failed.
 #   bash benchmarks/llama2/run_gguf.sh gpu [steps] [prompt]
@@ -22,14 +23,16 @@ cd "$ROOT" || exit 1
 if [ "$threads" = "gpu" ]; then
   "$work/llama_gguf" "$model" -n "$steps" -p "$prompt" --check-gpu --stats > "$work/out_gpu.txt" 2> "$work/err_gpu.txt"
   "$work/llama_gguf" "$model" -n "$steps" -p "$prompt" -j 1 > "$work/out_native.txt" 2> "$work/err_native.txt"
-  echo "gpu:    $(grep '^gpu check' "$work/err_gpu.txt")"
+  grep '^gpu check' "$work/err_gpu.txt" | sed 's/^/gpu:    /'
   echo "gpu:    $(grep '^prompt' "$work/err_gpu.txt")"
-  echo "gpu:    $(grep '^gpu:' "$work/err_gpu.txt")"
+  grep '^gpu:' "$work/err_gpu.txt" | sed 's/^/gpu:    /'
   echo "cpu:    $(grep '^prompt' "$work/err_native.txt")"
   if cmp -s "$work/out_gpu.txt" "$work/out_native.txt"; then echo "[llama_gguf] GPU text identical to the CPU's ($(wc -c < "$work/out_gpu.txt" | tr -d ' ') bytes): $(head -c 100 "$work/out_gpu.txt")"
   else echo "[llama_gguf] GPU text differs from the CPU's (float32 rounding): gpu: $(head -c 100 "$work/out_gpu.txt")"; echo "                                                    cpu: $(head -c 100 "$work/out_native.txt")"; fi
-  grep -q '^gpu check: .*PASS$' "$work/err_gpu.txt" && exit 0
-  echo "[llama_gguf] GPU CHECK FAILED"; exit 1
+  # every check line (the per-token pass and the batch) must PASS
+  checks=$(grep -c '^gpu check' "$work/err_gpu.txt"); passes=$(grep -c '^gpu check.*PASS$' "$work/err_gpu.txt")
+  [ "$checks" -ge 1 ] && [ "$checks" -eq "$passes" ] && exit 0
+  echo "[llama_gguf] GPU CHECK FAILED ($passes of $checks passes)"; tail -3 "$work/err_gpu.txt"; exit 1
 fi
 cp benchmarks/llama2/llama_gguf.ts "$work/src/"
 ROOT="$ROOT" node build/mfnode.js "$work/src" > /dev/null 2>&1

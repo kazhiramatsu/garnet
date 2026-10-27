@@ -427,9 +427,7 @@ native_build() { # <extra cflags> <output executable> <pass directory>
       rt_obj="$ROOT/build/rt${rt_suffix}_${rt_cc_key}.o" ;;
   esac
   if [ ! -f "$rt_obj" ] ||
-     [ "$ROOT/runtime/ts_rt.c" -nt "$rt_obj" ] ||
-     [ "$ROOT/runtime/ts_rt.h" -nt "$rt_obj" ] ||
-     [ "$ROOT/runtime/ts_ieee754.c" -nt "$rt_obj" ]; then
+     [ -n "$(find "$ROOT/runtime" -maxdepth 1 \( -name '*.c' -o -name '*.h' \) -newer "$rt_obj" -print -quit)" ]; then   # ts_rt.c includes the other runtime files
     $CC -c "$ROOT/runtime/ts_rt.c" -I"$ROOT/runtime" -o "$rt_obj" || die "failed to build runtime ($rt_obj)"
   fi
   # Optional runtime objects, gated by markers the emitted C declares.

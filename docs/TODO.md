@@ -10628,3 +10628,41 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   `-ngl 0` is Kaz's run). Next levers: a batched prefill for the prompt,
   kernel fusion for the 89 small dispatches (0.6 ms), Q4_0 to halve the
   bytes.
+- GPU batched prefill (Session 353, `docs/llm_inference_design.md` "Batched
+  prefill"). Kaz measured llama.cpp's Metal path on the M5 (`llama-bench -t
+  6,8,10 -p 51 -n 32`: tg32 103.6, pp51 2092; the build is
+  `build/llama.cpp`, c6fb3b5) and asked for the prompt first: generation
+  was already at llama.cpp's rate (101-106), the prompt 20x behind (one
+  token at a time). `Llama.forwardBatch(tokens, pos0)` (the `Forward`
+  interface too; the CPU path loops forward, so the Node test is unchanged);
+  in `garnet:llama_metal` the batch's activations are rows of batch
+  buffers, the norms, RoPE and attention run per row (the attention grid is
+  heads x rows, causal), k and v land in the caches at their positions, and
+  every product is a matrix product over the weights dequantized to halves
+  in threadgroup memory: `matmul_*` with simdgroup 8x8 matrices (64 rows x
+  32 tokens per threadgroup, llama.cpp's mul_mm shape) on any Apple GPU, and
+  `matmul_*_t32/_t64` through the Metal 4 tensor API
+  (`mpp::tensor_ops::matmul2d`, a second library at language version "4.0",
+  the simdgroup kernels where it does not compile, `--no-tensor` to force
+  them) on the M5; `relaxed_precision` measured 2.2x faster with the logits
+  unchanged. `garnet:metal` gained concurrent command buffers with
+  `barrier()` (q, k, v and the gate/up pair overlap: 48.5 -> 44.6 ms on the
+  simdgroup batch) and `Library`'s `languageVersion`; the constructor
+  touches the model's and the caches' pages so the first token does not map
+  them. Quiet M5, the 51-token prompt, warmed: 505 ms (101 tok/s) -> 20.2 ms
+  (2525 tok/s; simdgroup path 44.6 ms, 1143); llama.cpp's Metal 2098 with
+  the tensor API, 1275 without. The products alone: 21.5 ms of the batch
+  (the floor is the weights read once, 9.4 ms; an 8-token batch runs 489
+  tok/s). Generation unchanged (100-101). `--check-gpu` now checks the
+  per-token and the batched pass (`forwardBatchAll`) against the CPU: 51/51
+  argmax, 0.25 max logit difference each, text identical. Fixtures:
+  `modules/llama_metal_matmul` (new: the four simdgroup kernels, both tensor
+  tiles, the accumulating form, exact synthetic weights in the GGUF
+  layouts; GPU under garnet, TypeScript under Node, identical) and
+  `modules/metal_compute` (a concurrent command buffer). The `garnet` driver
+  and difftest.sh now rebuild the cached runtime object when any
+  `runtime/*.c|h` is newer (a `metal_host.c` change went unbuilt before).
+  Gates: conformance 611/611 plain and strict, 608/608 under GC protect,
+  unit, bundler 45/45, bench within budget (the sequential runner's bench,
+  right after the GC-protect pass, reported a failure; alone and quiet every
+  kernel is correct and within budget), GC stress.

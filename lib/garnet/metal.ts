@@ -7,7 +7,8 @@
 // SharedArrayBuffer the GPU reads and writes in place (unified memory, no copy in either
 // direction: the program's typed arrays over the same buffer hold the results once wait()
 // returns). A CommandBuffer encodes any number of dispatches, serial (each sees the previous
-// one's writes), for one commit and one wait; pipeline, buffer, bytes and dispatch mirror
+// one's writes) or concurrent (independent dispatches may overlap; barrier() orders the
+// dependent ones), for one commit and one wait; pipeline, buffer, bytes and dispatch mirror
 // the compute encoder, so a pass of hundreds of kernels is a loop of host calls with no
 // allocation per dispatch. Wrong argument types are TypeErrors before any Metal call;
 // out-of-range arguments (an argument struct over 4 KB, a buffer index past 30, an offset
@@ -22,13 +23,14 @@ declare global {
   var __garnet_metal: {
     available(): boolean;
     deviceName(): string;
-    compile(source: string, fastMath: boolean): number;
+    compile(source: string, fastMath: boolean, languageVersion: string | undefined): number;
     pipeline(library: number, name: string): number;
     pipelineMaxThreads(pipeline: number): number;
     pipelineSimdWidth(pipeline: number): number;
     buffer(storage: SharedArrayBuffer): number;
     releaseBuffer(buffer: number): void;
-    begin(): void;
+    begin(concurrent: boolean): void;
+    barrier(): void;
     setPipeline(pipeline: number): void;
     setBuffer(index: number, buffer: number, byteOffset: number): void;
     setBytes(index: number, data: ArrayBufferView | ArrayBuffer): void;
@@ -47,6 +49,9 @@ export function deviceName(): string { return host.deviceName(); }
 export interface CompileOptions {
   /** reassociation and contraction allowed in the kernels (off by default) */
   fastMath?: boolean;
+  /** the Metal Shading Language version as "major.minor" (the compiler's default when absent;
+   *  "4.0" for the Metal 4 tensor headers); a malformed one is a RangeError */
+  languageVersion?: string;
 }
 
 /** Kernels compiled from Metal Shading Language source. */
@@ -55,7 +60,7 @@ export class Library {
   readonly handle: number;
   constructor(source: string, options?: CompileOptions) {
     if (typeof source !== "string") throw new TypeError("garnet:metal: the kernel source must be a string");
-    this.handle = host.compile(source, options !== undefined && options.fastMath === true);
+    this.handle = host.compile(source, options !== undefined && options.fastMath === true, options !== undefined ? options.languageVersion : undefined);
   }
   /** The compute pipeline of the kernel function `name`. */
   pipeline(name: string): Pipeline { return new Pipeline(this, name); }
@@ -100,9 +105,22 @@ export class GpuBuffer {
   }
 }
 
+export interface CommandBufferOptions {
+  /** independent dispatches may run at once and barrier() orders the dependent ones (serial by
+   *  default: each dispatch sees the previous one's writes) */
+  concurrent?: boolean;
+}
+
 /** One command buffer: dispatches encoded in order, one commit, one wait. One is open at a time. */
 export class CommandBuffer {
-  constructor() { host.begin(); }
+  /** whether the dispatches may overlap (barrier() separates the dependent ones) */
+  readonly concurrent: boolean;
+  constructor(options?: CommandBufferOptions) {
+    this.concurrent = options !== undefined && options.concurrent === true;
+    host.begin(this.concurrent);
+  }
+  /** On a concurrent command buffer, the dispatches after it see the writes of those before it (nothing on a serial one). */
+  barrier(): void { host.barrier(); }
   /** The kernel of the following dispatches. */
   pipeline(p: Pipeline): void { host.setPipeline(p.handle); }
   /** Binds `b` at `byteOffset` to the kernel's buffer `index`. */

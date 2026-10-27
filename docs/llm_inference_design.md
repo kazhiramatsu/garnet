@@ -317,6 +317,7 @@ generated tokens, `--stats`):
 | CPU, 8 threads | 72.6 | |
 | GPU | 101-106 | encode 0.05 ms, wait 9.9-10.0 ms |
 | llama.cpp CPU, 4 threads (Kaz, 2026-10-26) | 72.3 | |
+| llama.cpp Metal, `llama-bench -t 6,8,10 -p 51 -n 32` (Kaz, 2026-10-27) | 103.6 / 103.3 / 99.0 | |
 
 The GPU's 10 ms per token is the weights' 1.1 GB at 117 GB/s: a probe that
 dispatches only a token's 133 products runs them in 9.4 ms (117 GB/s), and a
@@ -324,11 +325,12 @@ plain streaming read of the model file by the GPU reaches 124 GB/s, so the
 product kernels are at 94% of the device's read bandwidth and the other 89
 kernels and the round trip cost 0.6 ms. The threadgroup geometry (2 or 4 rows
 per SIMD group, 2, 4 or 8 SIMD groups per threadgroup) measured within the
-noise. The prompt is still one token at a time (102 tokens/s): a batched
-prefill (a matrix product over the prompt's tokens) is the next lever there.
-The target of a comparison is llama.cpp's own Metal number on this model
-(`llama-bench` without `-ngl 0`), which Kaz runs; this machine has no
-llama.cpp build the session could reach.
+noise. Generation is at llama.cpp's Metal rate on this model (its `tg32` 103.6
+tokens/s on the same machine, Kaz's run of `build/llama.cpp/build/bin/
+llama-bench`, build c6fb3b5): both read the 1.1 GB of weights per token at
+the device's bandwidth. The prompt was the gap: one token at a time (102
+tokens/s) against llama.cpp's batched `pp51` of 2092; the batched prefill
+below closes it.
 
 The oracle: the GPU's float32 arithmetic is not the CPU's (float32 in the
 GPU's order against int8 activations and double block sums), so the
@@ -339,6 +341,103 @@ within a tolerance. TinyLlama's 51-token prompt: the argmax agrees at 51 of
 16.6, the next token is the same, and the 32 generated tokens are the same
 text as the CPU path's. The CPU path keeps its byte-identical test against
 Node.
+
+## Batched prefill (done, 2026-10-27)
+
+Kaz: "プロンプトをまずは高速化してください". The prompt's tokens now run as one
+batch on the GPU, `Llama.forwardBatch(tokens, pos0)` (the `Forward` device
+interface has it; the CPU path runs the tokens one at a time inside it, the
+same arithmetic as before, so the Node differential test is unchanged). In
+`garnet:llama_metal` the tokens' activations are rows of batch buffers
+(`x`, `xb`, `q` of n x d, the gate and up products of n x ff, a row's
+attention scores per head of n x heads x ctx, grown as needed, at most
+`BATCH_MAX` 128 tokens per command buffer; a longer prompt goes in chunks),
+the norms, RoPE and the attention are the single-token kernels with a row
+index (the attention's grid is heads x rows, each row attending to the
+positions up to its own), the k and v rows land in the caches at their
+positions, SiLU is an elementwise kernel between the gate and up products
+and the down product, and the last token's logits come from the
+single-token norm and vocabulary kernels over its row. Every product is a
+matrix product over the weights dequantized to halves in threadgroup memory,
+so the 1.1 GB of weights is read once per tile of tokens instead of once per
+token. Two kernel families, both the shape of llama.cpp's `mul_mm`:
+
+- **simdgroup matrices** (`matmul_q8/q4/f16/f32`, any Apple GPU): a
+  threadgroup of four SIMD groups computes a tile of 64 weight rows by 32
+  tokens, each step of 32 columns staged as 8x8 half blocks ([k][row] for
+  the weights, [token][k] for the activations, which are converted to half),
+  each SIMD group multiplying its 32 rows by 16 tokens with
+  `simdgroup_multiply_accumulate` into eight float 8x8 accumulators, the
+  result tile staged through the same 8 KB of threadgroup memory and
+  written with the row and token bounds (a row or token past the tile's
+  valid ones reads the last valid one and is never stored).
+- **the Metal 4 tensor API** (`matmul_*_t32`, `matmul_*_t64`; a second
+  library compiled at language version "4.0", so `garnet:metal`'s
+  `Library` takes `languageVersion`; where it does not compile, an older
+  device or OS, the simdgroup kernels stay; `--no-tensor` forces them): the
+  M5's neural accelerators through `mpp::tensor_ops::matmul2d` over a tile
+  of 64 rows by 32 tokens (a batch of at most 32) or 64, the step's weights
+  as halves [row][k] in 4 KB of threadgroup memory, the float activation
+  tile read by the operation itself from device memory, the accumulator a
+  cooperative tensor zeroed per element (or loaded from the output for the
+  residual adds, the `multiply_accumulate` mode) and stored with the tile's
+  bounds. `relaxed_precision` on: measured 2.2x faster than the exact
+  setting on the M5 (48 -> 21.6 ms for the products of 51 tokens), the
+  logits unchanged within the check (llama.cpp's choice too). Measured
+  against tiles of 16 and 128 tokens over 8 to 200 tokens: 32 and 64 are
+  the useful ones (a 128-token tile is 1.5x slower at 51 and 64 tokens).
+
+The command buffers are concurrent (`new CommandBuffer({ concurrent: true })`
+and `barrier()`, new in `garnet:metal`): q, k and v, then the gate and up
+pair, overlap, a barrier precedes each dependent group; 48.5 -> 44.6 ms for
+the simdgroup batch of 51 tokens (the k and v products have four
+threadgroups each and were latency-bound alone), nothing measurable on the
+single-token path. The GPU's first access to a page maps it (the model at
+half the streaming rate), so the constructor touches the model and the
+caches with a kernel (one word per page) instead of the first token paying
+it.
+
+Where the time went before the tensor kernels (a probe of the products
+alone, serial, 51 tokens: 47.4 of the batch's 48.3 ms): the attention
+products 11.7 ms, the feed-forward 33.4, the vocabulary 2.7; compute-bound
+at about 3 TFLOP/s in the large products (a 32-token tile costs 19 ms of
+compute, so 51 tokens cost two tiles), latency-bound in the small ones (the
+k and v products run four threadgroups, the down product 32).
+
+Measured on the quiet M5, TinyLlama-1.1B-Chat Q8_0, the 51-token prompt,
+after the check's warm-up (the GPU's clocks: the same batch runs 30 ms from
+cold, 20 after a second of GPU work; llama-bench warms up too):
+
+| prompt path | ms | tokens/s |
+|---|---|---|
+| one token at a time (before) | 505 | 101 |
+| simdgroup kernels, serial command buffer | 48.5 | 1051 |
+| simdgroup kernels, concurrent | 44.6 | 1143 |
+| tensor API, exact precision | 45.2 | 1129 |
+| tensor API, relaxed precision, 32/64-token tiles | 20.2 | 2525 |
+| llama.cpp Metal, `GGML_METAL_TENSOR_DISABLE=1` (simdgroup) | | 1275 |
+| llama.cpp Metal, tensor API (default on the M5) | | 2098 |
+
+The products alone for 51 tokens take 21.5 ms of the 20-ish ms batch on the
+tensor path (the probe's serial encoder against the batch's concurrent one),
+so the rest of the batch costs nothing measurable; the floor is the weights
+read once (9.4 ms: an 8-token batch runs its products in 16.4 ms, 489
+tokens/s, 4.8x the one-at-a-time path). Generation is unchanged (100-101
+tokens/s). The check (`--check-gpu`, `run_gguf.sh gpu`) now runs the prompt
+on the CPU, on the GPU one token at a time and as a batch (`forwardBatchAll`:
+every token's logits through the batched vocabulary product), each pass
+against the CPU's argmax per position and last logits: 51/51 and 0.25 for
+both, the generated text identical to the CPU path's. The kernels' exact
+test is the conformance fixture `modules/llama_metal_matmul` (the four
+simdgroup kernels, both tensor tiles and the accumulating form over
+synthetic weights in the GGUF block layouts whose values keep the half and
+float arithmetic exact, the small-valued ones for the tensor kernels'
+relaxed precision; the GPU under garnet, TypeScript under Node, identical
+output), and `modules/metal_compute` has the concurrent command buffer.
+
+Next on the GPU: the small kernels of a token (0.6 ms of 10), Q4_0 to halve
+the bytes per token, and the CPU path's prompt (one token at a time, 24.5
+tokens/s on one thread).
 
 ## Beyond
 

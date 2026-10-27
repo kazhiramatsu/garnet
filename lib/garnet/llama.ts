@@ -563,8 +563,9 @@ function attentionHeads(lm: Llama, l: number, pos: number, h0: number, h1: numbe
     }
   }
 }
-/** A forward pass on another device (garnet:llama_metal): logits for `token` at `pos`. */
-export interface Forward { forward(token: number, pos: number): Float32Array }
+/** A forward pass on another device (garnet:llama_metal): logits for `token` at `pos`, and the
+ *  logits of the last of `tokens` placed at pos0, pos0 + 1, ... (the prompt as a batch). */
+export interface Forward { forward(token: number, pos: number): Float32Array; forwardBatch(tokens: number[], pos0: number): Float32Array }
 export class Llama {
   readonly m: Model;
   /** the device that runs forward() when set (the CPU path otherwise) */
@@ -689,6 +690,14 @@ export class Llama {
     rmsnorm(x, x, this.outNorm, d, this.eps);
     this.matvec(this.output, x, xq, xs, false, this.logits);
     return this.logits;
+  }
+  /** The logits of the last of `tokens`, placed at pos0, pos0 + 1, ...: the GPU runs them as one
+   *  batch, the CPU one at a time (the same arithmetic as forward, so the outputs stay identical). */
+  forwardBatch(tokens: number[], pos0: number): Float32Array {
+    if (this.gpu !== null) return this.gpu.forwardBatch(tokens, pos0);
+    let logits = this.logits;
+    for (let i = 0; i < tokens.length; i++) logits = this.forward(tokens[i], pos0 + i);
+    return logits;
   }
 }
 

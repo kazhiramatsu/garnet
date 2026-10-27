@@ -7,8 +7,8 @@
    and a build on another platform answers available() false.
    Objects: the device and the queue live for the process; libraries, pipelines and
    buffers are owned (+1 from their `new...` methods) and sit in tables a small integer
-   handle indexes; a command buffer and its encoder are autoreleased in a pool pushed at
-   begin() and popped at wait() or discard(). A buffer is the store of a SharedArrayBuffer
+   handle indexes; a command buffer and its encoder (serial, or concurrent with explicit
+   barriers) are autoreleased in a pool pushed at begin() and popped at wait() or discard(). A buffer is the store of a SharedArrayBuffer
    (an mmap of whole pages, which newBufferWithBytesNoCopy requires), shared with the GPU
    without a copy; the TypeScript GpuBuffer keeps that SharedArrayBuffer reachable.
    Included at the end of ts_rt.c after node_host.c. */
@@ -38,8 +38,9 @@ static struct {
   mh_buf* bufs; uint32_t nbufs, cbufs;
   void* pool; mh_id cmd, enc;        /* the open command buffer and its compute encoder */
   int cmd_state;                     /* 0 none, 1 encoding, 2 committed */
+  int concurrent;                    /* the open encoder's dispatch type: 1 concurrent, 0 serial */
   int32_t cmd_pipe;                  /* the pipeline set on the open encoder, -1 none */
-  mh_sel s_set_pipeline, s_set_buffer, s_set_bytes, s_dispatch;   /* the per-dispatch selectors, once */
+  mh_sel s_set_pipeline, s_set_buffer, s_set_bytes, s_dispatch, s_barrier;   /* the per-dispatch selectors, once */
 } mh;
 
 static mh_id mh_send(mh_id o, const char* s){ return ((mh_id (*)(mh_id, mh_sel))mh.msg)(o, mh.sel(s)); }
@@ -72,6 +73,7 @@ static int mh_init(void){
   mh.s_set_buffer = mh.sel("setBuffer:offset:atIndex:");
   mh.s_set_bytes = mh.sel("setBytes:length:atIndex:");
   mh.s_dispatch = mh.sel("dispatchThreadgroups:threadsPerThreadgroup:");
+  mh.s_barrier = mh.sel("memoryBarrierWithScope:");
   mh.cmd_pipe = -1;
   mh.state = 1;
 #endif
@@ -140,13 +142,26 @@ static tsv mh_device_name_fn(tsv* a, int n){
   mh.pool_pop(pool);
   return r;
 }
-/* compile(source, fastMath): a library from Metal Shading Language source; the compiler's
-   log is the Error. Fast math is off unless asked for (MTLMathModeSafe on macOS 15 and
-   later, the older fastMathEnabled flag before), so the kernels' arithmetic is the text's. */
+/* compile(source, fastMath, languageVersion): a library from Metal Shading Language source; the
+   compiler's log is the Error. Fast math is off unless asked for (MTLMathModeSafe on macOS 15 and
+   later, the older fastMathEnabled flag before), so the kernels' arithmetic is the text's. The
+   language version is the compiler's default unless given as "major.minor" (the Metal 4 tensor
+   headers need "4.0"); the encoding is MTLLanguageVersion's, major << 16 | minor. */
 static tsv mh_compile_fn(tsv* a, int n){
   tsv src = mh_arg(a, n, 0);
   if (!ts_is_str(src)) ts_throw_type_error_msg("garnet:metal: the kernel source must be a string");
   int fast = ts_truthy(mh_arg(a, n, 1));
+  long lang = 0;
+  tsv lv = mh_arg(a, n, 2);
+  if (!ts_is_undefined(lv)){
+    if (!ts_is_str(lv)) ts_throw_type_error_msg("garnet:metal: the language version must be a string like \"4.0\"");
+    uint32_t llen; char* ltext = ts_string_utf8_copy(lv, &llen);
+    unsigned major = 0, minor = 0; char tail = 0;
+    int got = sscanf(ltext, "%u.%u%c", &major, &minor, &tail);
+    free(ltext);
+    if (got != 2 || major < 1 || major > 99 || minor > 99) mh_throw(2, "garnet:metal: out of range: ", "the language version is \"major.minor\"");
+    lang = (long)((major << 16) | minor);
+  }
   mh_require();
   uint32_t len; char* text = ts_string_utf8_copy(src, &len);
   void* pool = mh.pool_push();
@@ -155,6 +170,7 @@ static tsv mh_compile_fn(tsv* a, int n){
     ((void (*)(mh_id, mh_sel, long))mh.msg)(opts, mh.sel("setMathMode:"), fast ? 2L : 0L);   /* MTLMathModeFast / Safe */
   else
     ((void (*)(mh_id, mh_sel, signed char))mh.msg)(opts, mh.sel("setFastMathEnabled:"), (signed char)(fast ? 1 : 0));
+  if (lang) ((void (*)(mh_id, mh_sel, unsigned long))mh.msg)(opts, mh.sel("setLanguageVersion:"), (unsigned long)lang);
   mh_id err = NULL;
   mh_id lib = ((mh_id (*)(mh_id, mh_sel, mh_id, mh_id, mh_id*))mh.msg)(mh.device, mh.sel("newLibraryWithSource:options:error:"), mh_nsstr(text), opts, &err);
   free(text);
@@ -222,20 +238,34 @@ static tsv mh_release_buffer_fn(tsv* a, int n){
   b->obj = NULL;
   return TS_UNDEFINED;
 }
-/* begin(): a command buffer with a serial compute encoder; one at a time. */
+/* begin(concurrent): a command buffer with a compute encoder, serial (each dispatch sees the
+   previous one's writes) or concurrent (independent dispatches may overlap and barrier() orders
+   the dependent ones); one at a time. */
 static tsv mh_begin_fn(tsv* a, int n){
-  (void)a; (void)n;
+  int concurrent = ts_truthy(mh_arg(a, n, 0));
   mh_require();
   if (mh.cmd_state == 1) mh_throw(0, "garnet:metal: a command buffer is already open (commit or discard it first)", "");
   if (mh.cmd_state == 2) mh_throw(0, "garnet:metal: the previous command buffer was committed and not waited for", "");
   mh.pool = mh.pool_push();
   mh.cmd = mh_send(mh.queue, "commandBuffer");
-  mh.enc = mh.cmd ? mh_send(mh.cmd, "computeCommandEncoder") : NULL;
+  mh.enc = NULL;
+  if (mh.cmd){
+    if (concurrent) mh.enc = ((mh_id (*)(mh_id, mh_sel, unsigned long))mh.msg)(mh.cmd, mh.sel("computeCommandEncoderWithDispatchType:"), 1ul /* MTLDispatchTypeConcurrent */);
+    else mh.enc = mh_send(mh.cmd, "computeCommandEncoder");
+  }
   if (!mh.enc){
     mh.pool_pop(mh.pool); mh.pool = NULL; mh.cmd = NULL;
     mh_throw(0, "garnet:metal: the device gave no command buffer", "");
   }
-  mh.cmd_state = 1; mh.cmd_pipe = -1;
+  mh.cmd_state = 1; mh.cmd_pipe = -1; mh.concurrent = concurrent;
+  return TS_UNDEFINED;
+}
+/* barrier(): on a concurrent encoder, the dispatches encoded after it see the buffer writes of
+   those before it (a serial encoder orders every dispatch already: nothing to do). */
+static tsv mh_barrier_fn(tsv* a, int n){
+  (void)a; (void)n;
+  mh_need_open();
+  if (mh.concurrent) ((void (*)(mh_id, mh_sel, unsigned long))mh.msg)(mh.enc, mh.s_barrier, 1ul /* MTLBarrierScopeBuffers */);
   return TS_UNDEFINED;
 }
 static tsv mh_set_pipeline_fn(tsv* a, int n){
@@ -329,13 +359,14 @@ static void ts_garnet_metal_global_init(tsv global){
   tsv host = ts_new_object(); ts_gc_root(&host);
   nh_method(host, "available", mh_available_fn, 0);
   nh_method(host, "deviceName", mh_device_name_fn, 0);
-  nh_method(host, "compile", mh_compile_fn, 2);
+  nh_method(host, "compile", mh_compile_fn, 3);
   nh_method(host, "pipeline", mh_pipeline_fn, 2);
   nh_method(host, "pipelineMaxThreads", mh_pipeline_max_threads_fn, 1);
   nh_method(host, "pipelineSimdWidth", mh_pipeline_simd_width_fn, 1);
   nh_method(host, "buffer", mh_buffer_fn, 1);
   nh_method(host, "releaseBuffer", mh_release_buffer_fn, 1);
-  nh_method(host, "begin", mh_begin_fn, 0);
+  nh_method(host, "begin", mh_begin_fn, 1);
+  nh_method(host, "barrier", mh_barrier_fn, 0);
   nh_method(host, "setPipeline", mh_set_pipeline_fn, 1);
   nh_method(host, "setBuffer", mh_set_buffer_fn, 3);
   nh_method(host, "setBytes", mh_set_bytes_fn, 2);

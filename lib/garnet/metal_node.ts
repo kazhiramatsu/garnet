@@ -5,7 +5,7 @@
 
 export function available(): boolean { return false; }
 export function deviceName(): string { return ""; }
-export interface CompileOptions { fastMath?: boolean }
+export interface CompileOptions { fastMath?: boolean; languageVersion?: string }
 function unavailable(): Error { return new Error("garnet:metal: Metal is not available"); }
 
 export class Library {
@@ -41,8 +41,11 @@ export class GpuBuffer {
   id(): number { throw unavailable(); }
   release(): void {}
 }
+export interface CommandBufferOptions { concurrent?: boolean }
 export class CommandBuffer {
-  constructor() { throw unavailable(); }
+  readonly concurrent: boolean = false;
+  constructor(options?: CommandBufferOptions) { void options; throw unavailable(); }
+  barrier(): void { throw unavailable(); }
   pipeline(p: Pipeline): void { void p; throw unavailable(); }
   buffer(index: number, b: GpuBuffer, byteOffset: number = 0): void { void index; void b; void byteOffset; throw unavailable(); }
   bytes(index: number, data: ArrayBufferView | ArrayBuffer): void { void index; void data; throw unavailable(); }
