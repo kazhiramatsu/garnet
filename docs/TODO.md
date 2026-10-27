@@ -10734,3 +10734,28 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   gain. The batch is unchanged (512 tokens 122 ms, 51 tokens 18.4). Gates:
   the Metal fixtures in the three modes and the GPU differential (a
   lib-only change; the full set ran with the previous slice).
+- The CPU prompt as a batch (Session 353, `docs/llm_inference_design.md`
+  "The CPU prompt as a batch"). Kaz asked for it and for the llama track to
+  pause after it. `Llama.forwardBatch` on the CPU runs the prompt in chunks
+  of 64 tokens: `matmulQ8Rows` (four rows by four tokens per pass of the
+  weights, each pass four of the single-token kernel's sdot loops), the
+  products pooled with the batch in the protocol (`C_BATCH`; the shared
+  buffers hold a chunk), the attention as one job over the (token, head)
+  pairs with a thread-private scores row, the norms, quantization and RoPE
+  per token; every value in the per-token order, so the outputs are
+  byte-identical to the per-token path's and Node's (differential with 1
+  and 8 threads, the GPU check unchanged). 51 tokens: 1 thread 23.8 -> 31
+  tok/s, 4 threads 57 -> 100, 8 threads 66.5 -> 118 (llama.cpp's Accelerate
+  prompt 524 on 4 threads: the AMX gap stays). Findings: a 16-accumulator
+  inner loop compiled to smlal with spills (28 tok/s), four four-accumulator
+  loops to sdot (31); an inner index `xo + bo + j` with `bo = b << 5` as a
+  separate local lost the proven direct accesses (2.5 tok/s), `xb + j` with
+  `xb = xo + (b << 5)` kept them (a pattern for the analyzer to learn); an
+  eight-token pass +3% on eight threads for twice the code, not in. Gates:
+  conformance 611/611 plain and strict, 608/608 under GC protect, unit,
+  bundler 45/45, bench within budget (the sequential runner's bench again
+  reported a failure right after the other gates; alone and quiet every
+  kernel is correct and within budget, as before); the differential tests
+  with 1 and 8 threads and the GPU check; the generation speed unchanged in
+  an alternating A/B (74 tok/s on eight threads both). The llama track
+  pauses here (Kaz: 本筋から外れるので一旦終わり).

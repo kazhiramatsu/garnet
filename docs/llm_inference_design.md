@@ -583,6 +583,49 @@ with the previous block's arithmetic (a double-buffered half copy of K and
 V in threadgroup memory) or splitting the positions over threadgroups with
 a combining pass; at 512 tokens that is at most 5% of the batch.
 
+## The CPU prompt as a batch (done, 2026-10-27)
+
+Kaz asked for the CPU path's prompt next, and for the llama work to pause
+after it. `Llama.forwardBatch` on the CPU now runs the prompt in chunks of
+`CPU_BATCH` (64) tokens: the products are matrix products over the chunk
+(`matmulQ8Rows`: four rows by four tokens per pass, so a weight is read from
+memory once per four tokens instead of once per token, and each pass is four
+of the single-token kernel's four-row `sdot` loops over the block, the
+weights coming from the cache after the first), pooled over the threads as
+the per-token products are (`C_BATCH` in the protocol; the shared activation
+and result buffers hold a chunk; the gate/up, q/k/v and plain product jobs
+take the batch), the attention of a layer's tokens is one pooled job over the
+(token, head) pairs (`attentionHeadsAt`, the scores in a thread-private row),
+and the norms, the quantization and RoPE run per token with the single-token
+code. Every (row, token) value is computed in the per-token path's order, so
+the outputs are byte-identical to the per-token path's and to Node's (the
+differential test with 1 and 8 threads; the GPU check's CPU reference is the
+per-token forward). Measured, 51 tokens, quiet M5 (`--serial-prompt` is the
+per-token path):
+
+| threads | per token tok/s | batched tok/s | llama.cpp CPU (Kaz, 2026-10-26) |
+|---|---|---|---|
+| 1 | 23.8 | 31 | 157 |
+| 4 | 57 | 100 | 524 |
+| 8 | 66.5 | 118 | |
+
+On one thread the kernel is compute-bound either way (the four-token pass
+loads less per MAC: +30%); on eight threads the per-token path was
+memory-bound (1.1 GB per token) and the batch is compute-bound on the four
+performance and four efficiency cores (about 320 GFLOP/s in the products).
+llama.cpp's prompt runs on Accelerate (the AMX units), an order of magnitude
+above NEON `sdot` from compiled TypeScript; that is the gap left, and the
+reason this track pauses here. Two kernel findings on the way: a 4 x 4 tile
+written as one 16-accumulator inner loop compiled to `smlal` with spills
+(28 tok/s on one thread, barely above the per-token kernel), the same tile
+as four four-accumulator loops to `sdot` (31); and an inner access
+`xq[xo + bo + j]` with `bo = b << 5` a separate local fell off the proven
+direct path (2.5 tok/s, the clamps back in every loop of the function),
+where `xq[xb + j]` with `xb = xo + (b << 5)` stayed on it, so the
+proven-range analysis wants the block offset folded into one local per view
+(a pattern the analyzer could learn). An eight-token pass measured 3% faster
+on eight threads for twice the code and is not in.
+
 ## Beyond
 
 Native kernels (NEON intrinsics, Accelerate) behind a host object as
