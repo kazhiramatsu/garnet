@@ -11023,8 +11023,8 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
 
 - Real projects, vue's second tuning round: the enum members (Session 355, `docs/real_projects.md`
   vue "The second round"). The profile after the direct calls (`sample` on the `--profile` build,
-  `build/real/vue-work/profile.sample`; a flat view by leaf and a caller/callee tree are in the
-  scratchpad's `sample_tree.py`) put 35% of the run inside vue's `get` trap and 6.7% in its own
+  `build/real/vue-work/profile.sample`; a flat view by leaf and a caller/callee tree are in
+  `scripts/sample_tree.py`) put 35% of the run inside vue's `get` trap and 6.7% in its own
   body, which begins with five comparisons of the key against `ReactiveFlags.SKIP`, `IS_REACTIVE`,
   `IS_READONLY`, `IS_SHALLOW` and `RAW`: `ReactiveFlags` is an ordinary enum, and the exporter folded
   only const enum members (`checker.getConstantValue` on an access answers for those alone, the set
