@@ -264,6 +264,12 @@ typedef struct ts_gc_header {
 /* A cell a `publish` reached (garnet:shared, docs/published_graphs_design.md):
    immutable; a Map or Set with the flag rejects set/add/delete/clear. */
 #define TS_HDR_PUBLISHED 8u
+/* The cell is, or has been, some object's [[Prototype]] (set where a link is made: ts_set_proto,
+   obj_link_fresh_proto, Object.create, an ES5 `new`, and at birth for the objects made as prototypes).
+   A read-only data or accessor definition on such a cell can change what an inherited write does, so
+   it moves the addition caches' epoch; on any other object it changes that object alone (yaml defined
+   a read-only property on every node: the epoch moved 45k times per parse). */
+#define TS_HDR_IS_PROTO 16u
 /* 8 bytes (docs/cell_header_design.md; docs/gc_v2_design.md §4.4): a heap
    reference is the address, so the cell carries no handle and no list link,
    and its size is its size class's (or its large run's), so it carries no
@@ -1097,11 +1103,11 @@ static inline long long ts_str_find_forward_view(ts_strview xs, ts_strview ns, l
   if (start < 0) start = 0;
   if (ns.len == 0) return start > (long long)xs.len ? (long long)xs.len : start;
   if (ns.len > xs.len || start > (long long)xs.len - (long long)ns.len) return -1;
-  if (ns.len == 1 && xs.data && ns.data &&
-      ts_str_same_storage_width(xs, ns) &&
-      !(xs.flags & TS_STR_FLAG_UTF16)){
-    const char* hit = memchr(xs.data + start, ns.data[0],
-                             xs.len - (uint32_t)start);
+  /* a one-unit needle in one-byte storage, or an immediate (`s.indexOf(",")`: a short literal has
+     no data pointer, its first unit is the low byte of `immediate`): one memchr over a one-byte text */
+  if (ns.len == 1 && xs.data && !((xs.flags | ns.flags) & TS_STR_FLAG_UTF16)){
+    char c = ns.data ? ns.data[0] : (char)((const unsigned char*)&ns.immediate)[0];
+    const char* hit = memchr(xs.data + start, c, xs.len - (uint32_t)start);
     return hit ? (long long)(hit - xs.data) : -1;
   }
   return ts_str_find_forward_view_slow(xs, ns, start);

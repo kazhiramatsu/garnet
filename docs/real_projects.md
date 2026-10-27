@@ -230,10 +230,11 @@ by identity).
 | the second round (below): the full-collection pacing, the absent-read cache of class instances, the drivers' scratch result, a 176-byte smaller coroutine header | 4618 | 1439 | 3.2 |
 | the third round: a generator's numeric locals in the frame only when live across a suspension | 4244 | 1300 | 3.3 |
 | the boxed locals the same way (the conservative collector scans the native stack) | 3931 | 1304 | 3.0 |
+| the fourth round: a read-only define on a non-prototype keeps the caches' epoch; short ASCII literals as immediates | 3590 | 1291 | 2.8 |
 
 (the second row's A/B ran on a slower machine state, Node included: 5154 against 4618 alternating, a 10%
-gain; the third's: 4430 against 4244, 4%; the fourth's: 4237 against 3931, 7%; each ratio uses its own
-run's Node time.)
+gain; the third's: 4430 against 4244, 4%; the fourth's: 4237 against 3931, 7%; the fifth's: 3913 against
+3798 and then 3790 against 3590, 3% and 5%; each ratio uses its own run's Node time.)
 
 (alternating A/B, five runs each: 5944.9 against 4980.2.) The sync generator entry allocates its
 frame through `ts_coro_alloc_gen_v/_vn` (no `ret` promise: its results are plain objects and an
@@ -293,8 +294,25 @@ at the start of the day -> 5.8 GB, the minor collections 2,000, the pauses 1,369
 which names only some of them: the array of a push, the index of an element store were not uses, so
 a receiver evaluated before an `await` and used after it left the frame; `iteration/iterator_close`
 caught it, the pass now takes every reference of the exhaustive operand remapper less one occurrence
-of the definition.) Next: the addition cache's misses (`prop_pic set` 19.5% hits), the regular
-expressions, and the frame per delegated `yield*` itself (13.6 M frames of 426 bytes on average).
+of the definition.) The fourth round took the two causes the counters named next. yaml defines a read-only property
+on every node (`Object.defineProperty(this, NODE_TYPE, { value })` in the node constructors), and a
+read-only data or accessor definition moved the addition and absent caches' epoch, as it must when
+the object is somebody's prototype (an inherited write changes meaning): 45k times per parse, every
+cached addition and absent record thrown away each time (`prop_add` 4.5 M slow additions, the
+absent cache's hits at 0). An object now records that it became a prototype (`TS_HDR_IS_PROTO`: at
+birth for the objects made as prototypes, and where a link is made: `ts_set_proto`, a fresh
+object's link, `Object.create`, an ES5 `new`), and the epoch moves only for such an object, a class
+prototype or a function: slow additions 4.5 M -> 1.8 M, out-of-line absent reads 4.5 M -> 0.9 M,
+the collector's pauses 614 -> 486 ms, 3,913 -> 3,798 ms alternating. Then the lexer's `ch === ' '`
+(`isEmpty`, a string switch) reached the content compare on every call: a literal of at most five
+ASCII units was a static heap cell while the one-character string read out of the source is the
+runtime's short immediate, so the two never compared by bits. The emitter now packs such a literal
+the way the runtime does (`TS_BOX(TS_SEL_SHORTSTR, ...)`, 1,517 of them in yaml's program) for the
+constant, the literal compares and the switch labels: 3,790 -> 3,590 ms alternating.
+
+Next: the additions that still miss (1.8 M: sites whose receivers come in several shapes, and the
+3.6 M objects that outgrow their four inline slots), the regular expressions, and the frame per
+delegated `yield*` itself (13.6 M frames of 426 bytes on average).
 
 ## prisma
 

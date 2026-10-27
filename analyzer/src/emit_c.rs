@@ -1914,7 +1914,7 @@ struct Ctx<'a> {
     /// locals holding one `undefined`/`null`/boolean constant (see tag_consts_for)
     tag_consts: BTreeMap<u32, &'static str>,
     /// locals holding one string constant: (static literal id, length in code units)
-    str_consts: BTreeMap<u32, (usize, u32)>,
+    str_consts: BTreeMap<u32, (usize, u32, String)>,   /* a local holding one string literal: its id, length and C expression */
     switch_plan: SwitchPlan,
     layouts: LayoutPlan,
     /// Typed direct stores whose frozen test is omitted (`frozen_elision_for`).
@@ -2254,17 +2254,18 @@ impl<'a> Ctx<'a> {
     }
 
     fn str_eq_operands(&self, a: u32, b: u32) -> Option<(u32, String, u32)> {
-        let (x, (id, len)) = if let Some(c) = self.str_consts.get(&b) {
-            (a, *c)
+        let (x, (id, len, lit)) = if let Some(c) = self.str_consts.get(&b) {
+            (a, c.clone())
         } else if let Some(c) = self.str_consts.get(&a) {
-            (b, *c)
+            (b, c.clone())
         } else {
             return None;
         };
+        let _ = id;
         if self.json_locals.contains(&x) || self.unboxed.contains(&x) || self.int_local.contains(&x) {
             return None;
         }
-        Some((x, format!("ts_str_v(&TS_STRLIT_{})", id), len))
+        Some((x, lit, len))
     }
     /// Assignment of a direct entry's result, raw by the callee's return kind.
     fn set_call_result(&self, dst: &Option<LocalId>, call: &str, ret: RetKind) -> String {
@@ -4062,7 +4063,7 @@ const SWITCH_TABLE_MIN_CASES: usize = 4;
 struct SwitchCase {
     values: Vec<i64>,
     /// a string chain's labels: (hash, literal id, length)
-    str_values: Vec<(u32, usize, u32)>,
+    str_values: Vec<(u32, usize, u32, String)>,
     body: Vec<Inst>,
     /// else-body indices from the head `If` down to this case's `If`
     path: Vec<usize>,
@@ -4080,10 +4081,10 @@ struct SwitchChain {
 
 /// A case label of a switch chain: an int32, or a string literal by its hash,
 /// literal id and length.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum SwitchKey {
     Num(i64),
-    Str(u32, usize, u32),
+    Str(u32, usize, u32, String),   /* hash, static id, length, the literal's C expression */
 }
 
 /// TSAOT_STR_SWITCH=0 keeps a switch on string literals a chain of
@@ -4290,10 +4291,10 @@ fn switch_plan_for(
                         _ => unreachable!(),
                     };
                     for v in &cur_values {
-                        if !seen.insert(*v) {
+                        if !seen.insert(v.clone()) {
                             ok = false;
                         }
-                        if let SwitchKey::Str(h, id, _) = v {
+                        if let SwitchKey::Str(h, id, _, _) = v {
                             match seen_hash.get(h) {
                                 Some(other) if *other != *id => ok = false,
                                 _ => {
@@ -4310,7 +4311,7 @@ fn switch_plan_for(
                             .collect(),
                         str_values: taken
                             .iter()
-                            .filter_map(|k| if let SwitchKey::Str(h, id, len) = k { Some((*h, *id, *len)) } else { None })
+                            .filter_map(|k| if let SwitchKey::Str(h, id, len, lit) = k { Some((*h, *id, *len, lit.clone())) } else { None })
                             .collect(),
                         body: then_body.clone(),
                         path: path.clone(),
@@ -4366,7 +4367,7 @@ fn switch_plan_for(
                 _ => return None,
             };
             let id = *static_strings.get(&units)?;
-            Some(SwitchKey::Str(c_strhash_units(&units), id, units.len() as u32))
+            Some(SwitchKey::Str(c_strhash_units(&units), id, units.len() as u32, strlit_expr(&units, id)))
         };
         walk(&f.body, true, &str_disc, &str_key, &defs, &uses, &mut plan);
     }
@@ -4436,7 +4437,7 @@ fn emit_switch_chain(s: &mut String, chain: &SwitchChain, ctx: &Ctx) {
     for case in &chain.cases {
         if chain.string {
             let mut labels: BTreeSet<u32> = BTreeSet::new();
-            for (h, _, _) in &case.str_values {
+            for (h, _, _, _) in &case.str_values {
                 if labels.insert(*h) {
                     let _ = writeln!(s, "  case {}u:", h);
                 }
@@ -4444,7 +4445,7 @@ fn emit_switch_chain(s: &mut String, chain: &SwitchChain, ctx: &Ctx) {
             let tests: Vec<String> = case
                 .str_values
                 .iter()
-                .map(|(_, id, len)| format!("ts_eq_strlit({}, ts_str_v(&TS_STRLIT_{}), {}u)", ctx.val(chain.disc), id, len))
+                .map(|(_, _id, len, lit)| format!("ts_eq_strlit({}, {}, {}u)", ctx.val(chain.disc), lit, len))
                 .collect();
             let _ = writeln!(s, "  {{ if (!({})) goto L{}_sw;", tests.join(" || "), l);
         } else {
@@ -10503,8 +10504,8 @@ fn str_eq_const_enabled() -> bool {
     })
 }
 
-fn str_consts_for(f: &Function, static_strings: &BTreeMap<Vec<u16>, usize>) -> BTreeMap<u32, (usize, u32)> {
-    let mut out: BTreeMap<u32, (usize, u32)> = BTreeMap::new();
+fn str_consts_for(f: &Function, static_strings: &BTreeMap<Vec<u16>, usize>) -> BTreeMap<u32, (usize, u32, String)> {
+    let mut out: BTreeMap<u32, (usize, u32, String)> = BTreeMap::new();
     if !str_eq_const_enabled() {
         return out;
     }
@@ -10538,7 +10539,7 @@ fn str_consts_for(f: &Function, static_strings: &BTreeMap<Vec<u16>, usize>) -> B
     for (d, units) in seen {
         if let Some(u) = units {
             if let Some(id) = static_strings.get(&u) {
-                out.insert(d, (*id, u.len() as u32));
+                out.insert(d, (*id, u.len() as u32, strlit_expr(&u, *id)));
             }
         }
     }
@@ -15745,7 +15746,31 @@ fn static_string_literal_expr(value: &str, ctx: &Ctx) -> Option<String> {
 
 fn static_string_literal_expr_units(units: &[u16], ctx: &Ctx) -> Option<String> {
     let id = ctx.static_strings.get(units).copied()?;
-    Some(format!("ts_str_v(&TS_STRLIT_{})", id))
+    Some(strlit_expr(units, id))
+}
+/// The C expression of a string literal: a static heap cell (`TS_STRLIT_<id>`), or, for at most five
+/// ASCII units, the short immediate the runtime packs such strings into (ts_rt.h ts_short_str_ascii:
+/// the length in bits 40-42, the bytes below), so `x === 'a'`, a string switch's label and the
+/// constant itself compare by bits against a one-character string a lexer reads out of its source.
+/// `TSAOT_SHORT_STRLIT=0` keeps every literal a static cell (the parity oracle).
+fn strlit_expr(units: &[u16], id: usize) -> String {
+    if short_strlit_enabled() && units.len() <= 5 && units.iter().all(|&u| u < 0x80) {
+        let mut payload: u64 = (units.len() as u64) << 40;
+        for (i, &u) in units.iter().enumerate() {
+            payload |= (u as u64) << (8 * i);
+        }
+        return format!("((tsv)TS_BOX(TS_SEL_SHORTSTR, 0x{:x}ULL))", payload);
+    }
+    format!("ts_str_v(&TS_STRLIT_{})", id)
+}
+fn short_strlit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_SHORT_STRLIT").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
 }
 
 fn emit_checked_loop<F>(
@@ -25204,12 +25229,13 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     if ctx.typeof_fusion.skip.contains(&dst.0) {
                         return;
                     }
+                    let units = str_units(value);
                     let id = ctx
                         .static_strings
-                        .get(str_units(value).as_slice())
+                        .get(units.as_slice())
                         .copied()
                         .expect("static string literal collected before codegen");
-                    s.push_str(&ctx.set_val(dst.0, &format!("ts_str_v(&TS_STRLIT_{})", id)));
+                    s.push_str(&ctx.set_val(dst.0, &strlit_expr(&units, id)));
                 }
                 ConstVal::Str16 { units } => {
                     let id = ctx
@@ -25217,7 +25243,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         .get(units.as_slice())
                         .copied()
                         .expect("static string literal collected before codegen");
-                    s.push_str(&ctx.set_val(dst.0, &format!("ts_str_v(&TS_STRLIT_{})", id)));
+                    s.push_str(&ctx.set_val(dst.0, &strlit_expr(units, id)));
                 }
                 ConstVal::Undef => {
                     s.push_str(&ctx.set_val(dst.0, "TS_UNDEFINED"));

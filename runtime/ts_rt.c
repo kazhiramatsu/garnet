@@ -1820,6 +1820,7 @@ static tsv ts_new_proto_impl(int pretenured){
     ? gc_alloc_pretenured(sizeof(ts_object), TS_KIND_OBJECT)
     : gc_alloc(sizeof(ts_object), TS_KIND_OBJECT);
   o->shape = TS_SHAPE_EMPTY;
+  o->h.flags |= TS_HDR_IS_PROTO;   /* made to be a prototype (a class's, a builtin's, a function's) */
   return ts_obj(o);
 }
 tsv ts_new_proto(void){ return ts_new_proto_impl(0); }
@@ -1933,8 +1934,25 @@ tsv ts_get_proto(tsv obj){
 /* Object.setPrototypeOf: relink the object's prototype to `proto` (object or
    null), then return the object. Subsequent dynamic method/field lookups walk
    the new chain via ts_get, matching JS semantics. */
+/* The cell `proto` is about to be some object's [[Prototype]] (ts_rt.h TS_HDR_IS_PROTO); a published
+   cell (a shared worker's region, possibly mapped read-only) is not written. */
+static inline void obj_mark_proto(tsv proto){
+  if (ts_is_obj(proto) || ts_is_func(proto)){
+    ts_gc_header* h = (ts_gc_header*)ts_ptr(proto);
+    if (!(h->flags & (TS_HDR_IS_PROTO | TS_HDR_PUBLISHED))) h->flags |= TS_HDR_IS_PROTO;
+  }
+}
+/* A definition on `obj` that can change what an inherited write or read does somewhere else: obj is
+   (or has been) a prototype, a class prototype, or a function (its chain and static container). */
+static inline int obj_may_be_proto(tsv obj){
+  if (ts_is_func(obj)) return 1;
+  if (!ts_is_obj(obj)) return 0;
+  const ts_object* o = (const ts_object*)ts_ptr(obj);
+  return (o->h.flags & TS_HDR_IS_PROTO) != 0 || o->cls == TS_CLS_PROTO;
+}
 tsv ts_set_proto(tsv obj, tsv proto){
   if (g_has_proxies && ts_is_proxy(obj)) return ts_proxy_set_proto(obj, proto);
+  obj_mark_proto(proto);
   /* Accept any prop-bag value (plain object OR function): both embed ts_obj_common
      first, so the proto pointer is at the same offset. This lets a class VALUE (a
      boxed ts_func) delegate to its static container, so `K.staticX`/`K.m()` and
@@ -1956,6 +1974,7 @@ tsv ts_set_proto(tsv obj, tsv proto){
    the compiler: once per Map iterator and generator object.) */
 static void obj_link_fresh_proto(tsv obj, tsv proto){
   ts_object* o = ts_ptr(obj);
+  obj_mark_proto(proto);
   o->proto = ts_proto_ref(proto) ? proto : TS_NULL;
   ts_write_barrier(obj, proto);
 }
@@ -3481,6 +3500,7 @@ tsv ts_object_create(tsv proto){
      cell lacks — an open hazard noted in docs/TODO.md (Session 350). */
   tsv o = ts_new_proto();                 /* bare object: proto=NULL */
   if (ts_is_propbag(proto)){
+    obj_mark_proto(proto);
     ((ts_object*)ts_ptr(o))->proto = proto;
     if (!(g_typed_slow & TS_TYPED_SLOW_ANY)) typed_slow_check_relink(o, proto);
   }
@@ -4101,7 +4121,8 @@ void ts_define_accessor_attr(tsv obj, ts_key key, tsv getter, tsv setter, int g_
      are valid ECMAScript property targets too (constructor statics and
      Function.prototype itself rely on this path). */
   if (!ts_is_obj(obj) && !ts_is_func(obj)) return;
-  prop_add_epoch_bump();
+  /* an accessor on a prototype changes inherited reads and writes below it; on any other object, its own alone */
+  if (obj_may_be_proto(obj)) prop_add_epoch_bump();
   ts_gc_root(&obj); ts_gc_root(&getter); ts_gc_root(&setter);
   if (ts_is_func(obj)) fn_realize_virtual(obj, key);
   ts_accessor* ac = gc_alloc(sizeof(ts_accessor), TS_KIND_ACCESSOR);
@@ -4161,8 +4182,10 @@ void ts_define_data(tsv obj, ts_key key, tsv value, int e, int w, int c){
   uint8_t flags = (uint8_t)((e?TS_PROP_ENUMERABLE:0) | (w?TS_PROP_WRITABLE:0) | (c?TS_PROP_CONFIGURABLE:0));
   /* A read-only data property rejects inherited writes on every object that
      has this one as a prototype: the addition caches must start over (they
-     validate the receiver's prototype by identity, not by its attributes). */
-  if (!w) prop_add_epoch_bump();
+     validate the receiver's prototype by identity, not by its attributes). On
+     an object that is nobody's prototype (yaml's nodes define one on
+     themselves) nothing cached elsewhere changes. */
+  if (!w && obj_may_be_proto(obj)) prop_add_epoch_bump();
   ts_pref p = props_define(o, key, flags);
   { tsv* vp = pref_valp(p); *vp = value;
     if (obj_shaped(o)) ts_write_barrier_ptr(obj, vp, value); else ts_write_barrier(obj, value); }
@@ -5769,6 +5792,9 @@ tsv ts_str_concat_many(tsv* args, int n){
 /* Out-of-line tail of the header's ts_strict_eq: reached for two distinct
    string values (and kept complete so runtime callers may use it directly). */
 int ts_strict_eq_str(tsv a, tsv b){
+  /* the same value (the inline callers test this first; a direct caller such as the JSON
+     replacer's duplicate check may not: two short literals are one immediate now) */
+  if (a == b) return 1;
   /* two immediate short strings are canonical: different bits, different strings */
   if (ts_is_short_str(a) && ts_is_short_str(b)) return 0;
   /* different lengths: different strings, before any view is built
@@ -7417,7 +7443,10 @@ tsv ts_str_split(tsv s, tsv sep, tsv limit){
   ts_gc_root(&s); ts_gc_root(&sep);
   int sep_is_str=ts_is_str(sep);
   ts_strview xs=ts_str_view_typed(s), ss={0};
-  if(sep_is_str) ss=ts_str_view_typed(sep);
+  char sepbuf[TS_SHORTSTR_MAX];
+  /* a short immediate separator (`split(",")`: a literal of a few units) has no data pointer; its
+     units on the stack keep the one-pass memchr path below (the first loop allocates nothing) */
+  if(sep_is_str) ss=ts_strview_materialize(ts_str_view_typed(sep), sepbuf);
   /* optional limit: truncate the result to ToUint32(limit) substrings. */
   int has_lim = (limit != TS_UNDEFINED);
   /* ToUint32 per spec (so split(sep,-1) -> 4294967295 = effectively no limit);
@@ -17888,6 +17917,7 @@ tsv ts_construct_begin_n(tsv ctorv, uint32_t min_slots){
      generation mostly dead turns this off for the rest of the run. */
   tsv inst = g_pretenure_ctors ? ts_new_object_n_pretenured(est) : ts_new_object_n(est);
   ts_object* io = (ts_object*)ts_ptr(inst);
+  obj_mark_proto(proto);
   io->proto = ts_is_obj(proto) ? proto : ts_object_proto();
   if (g_pretenure_ctors) ts_write_barrier(inst, io->proto);
   ts_gc_unroot(1);

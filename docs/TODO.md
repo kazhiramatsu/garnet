@@ -10916,3 +10916,31 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   (strings, arrays and objects across yields under allocation pressure, a try/catch in a generator,
   nested delegation, an async function, and the operands evaluated before a suspension: a push's
   array, a store's index and object, a concatenation's left side). Gates: conformance 627/627 plain and strict, 624/624 under GC protect, unit, bundler 46/46, bench within budget, GC stress.
+- Real projects, the fourth tuning round: the prototype mark and short literals (Session 354,
+  `docs/real_projects.md` yaml "The fourth round"). A read-only data or accessor definition moved
+  the addition and absent caches' epoch unconditionally; yaml defines one on every node
+  (`Object.defineProperty(this, NODE_TYPE, { value })`), 45k bumps per parse. An object records that
+  it is, or became, a prototype (`TS_HDR_IS_PROTO`, ts_rt.h: set in `ts_new_proto_impl`,
+  `ts_set_proto`, `obj_link_fresh_proto`, `ts_object_create` and the ES5 `new` path; a published
+  cell is not written), and `ts_define_data` / `ts_define_accessor_attr` move the epoch only for
+  such an object, a class prototype or a function (`obj_may_be_proto`). yaml: `prop_add` slow
+  additions 4.48 M -> 1.83 M, out-of-line absent reads 4.5 M -> 0.9 M, pauses 614 -> 486 ms,
+  3,913 -> 3,798 ms alternating. Then the emitter packs a string literal of at most five ASCII units
+  as the runtime's short immediate (`strlit_expr`: `TS_BOX(TS_SEL_SHORTSTR, len << 40 | bytes)`,
+  `TSAOT_SHORT_STRLIT=0` keeps the static cells) for the constant, the literal compares
+  (`str_consts` carries the expression) and the string switch's labels (`SwitchKey::Str` too): the
+  lexer's `ch === ' '` had compared a static cell against a short immediate by content on every
+  call; 1,517 immediates in yaml's program, 3,790 -> 3,590 ms alternating (Node 1,291: 2.8x). The
+  gate caught one consequence: `ts_strict_eq_str` answered "different" for two short immediates
+  without testing identity (its inline callers do; the JSON replacer's duplicate check called it
+  directly and kept a duplicated allowlist name): it tests `a == b` first now. The bench gate caught
+  the other: a one-unit immediate needle has no data pointer, so the inline memchr path of
+  `ts_str_find_forward_view` (and the one-pass path of `ts_str_split`) declined it and every
+  search of a `split(",")` or `indexOf("/")` took the out-of-line worker, which materializes the
+  needle on each call: `string_dynamic_split_join_kernel` 47 -> 96 ms. The inline path takes the
+  unit from the immediate now (`!((xs.flags | ns.flags) & TS_STR_FLAG_UTF16)`) and split
+  materializes its separator once: 48.6 ms against 47.3 with the static cells, alternating.
+  Fixtures: `defineproperty/readonly_proto_define` (a read-only define on a prototype rejects the
+  inherited writes at a warm site: Object.create chains, setPrototypeOf, a class prototype, an ES5
+  constructor's prototype, a getter-only accessor; and the instance case),
+  `strings/short_string_literals`. rxjs: 386.9 -> 388.5 ms alternating (unchanged: no read-only defines, few short compares). Gates: conformance 629/629 plain and strict, 626/626 under GC protect, unit, bundler 46/46, bench within budget (the split/join kernel 48 ms of 90), GC stress.
