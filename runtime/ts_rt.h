@@ -1289,8 +1289,15 @@ static inline double ts_length(tsv v){
   if (ts_is_indexed_array_fast(v)) return (double)((ts_array*)ts_ptr(v))->len;
   return ts_length_slow(v);
 }
+uint32_t ts_array_len_foreign(tsv v);   /* a Proxy's length through its trap; 0 for anything else */
 static inline uint32_t ts_array_len_fast(tsv arr){
-  return ts_is_indexed_array_fast(arr) ? ((ts_array*)ts_ptr(arr))->len : 0;
+  return ts_is_indexed_array_fast(arr) ? ((ts_array*)ts_ptr(arr))->len : ts_array_len_foreign(arr);
+}
+/* Array.isArray: an array, or a Proxy whose target is one (ECMA-262 IsArray). */
+int ts_array_is_array_slow(tsv v);
+static inline int ts_array_is_array(tsv v){
+  if (ts_is_indexed_array_fast(v)) return 1;
+  return TS_RT_UNLIKELY(g_has_proxies) ? ts_array_is_array_slow(v) : 0;
 }
 TS_RT_ALWAYS_INLINE int ts_truthy_fast(tsv v){
   if (ts_is_num(v)){ double d=ts_to_num(v); return d!=0 && !(d!=d); }
@@ -1596,6 +1603,10 @@ tsv ts_arrproto_copyWithin(tsv* args, int n);
 tsv ts_arrproto_find(tsv* args, int n);
 tsv ts_arrproto_findIndex(tsv* args, int n);
 tsv ts_arrproto_findLast(tsv* args, int n);
+tsv ts_arrproto_toSorted(tsv* args, int n);
+tsv ts_arrproto_toReversed(tsv* args, int n);
+tsv ts_arrproto_with(tsv* args, int n);
+tsv ts_arrproto_toSpliced(tsv* args, int n);
 tsv ts_arrproto_findLastIndex(tsv* args, int n);
 tsv ts_arrproto_some(tsv* args, int n);
 tsv ts_arrproto_every(tsv* args, int n);
@@ -1604,6 +1615,13 @@ tsv ts_arrproto_values(tsv* args, int n);
 tsv ts_arrproto_keys(tsv* args, int n);
 tsv ts_arrproto_entries(tsv* args, int n);
 tsv ts_array_iter_new(tsv source, int kind);
+tsv ts_array_iter_typed(tsv arr, int kind);
+double ts_array_push_foreign(tsv arr, const tsv* args, int n);
+double ts_array_unshift_foreign(tsv arr, const tsv* args, int n);
+tsv ts_method_dynamic(tsv recv, const char* name, const tsv* args, int nargs);
+tsv ts_to_string_template(tsv v);
+tsv ts_forof_array_source(tsv v);
+tsv ts_mapset_cursor_source(tsv coll, int is_map);
 
 tsv  ts_make_fn(ts_code code, tsv* env, uint32_t envlen); /* boxed callable; env may be NULL */
 tsv  ts_call(tsv fn, tsv* args, int nargs);               /* invoke a callable value */
@@ -3534,6 +3552,8 @@ void        ts_eh_pop(void);
 void        ts_throw(tsv v);
 void        ts_throw_range_error_msg(const char* msg);
 void        ts_throw_type_error_msg(const char* msg);
+void        ts_throw_eval_error_msg(const char* msg);
+tsv         ts_arguments_array(const tsv* args, uint32_t n);
 tsv         ts_callback_with_this(tsv cb, tsv thisArg); /* arr.forEach(fn, ctx): fn bound to ctx */
 void        ts_throw_syntax_error_msg(const char* msg);
 tsv         ts_current_exception(void);

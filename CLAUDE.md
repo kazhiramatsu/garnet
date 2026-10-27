@@ -117,3 +117,15 @@ Rust in §315; selfhost is kept as a performance metric).
   `docs/int32_fields_design.md` "Store-proven fields"); a dynamic store of a fraction into it
   (`(n as any).pos = 2.5`) throws a TypeError naming the field (V8 stores the fraction).
   `TSAOT_INT_STORE_FIELDS=0` turns it off.
+- The `arguments` object as a value is an Array of the actual arguments (`apply(this, arguments)`,
+  `arguments[i]`, `Array.from(arguments)` and `arguments.length` agree with V8; strict code never
+  maps it). `Array.isArray(arguments)` is true and it has the Array methods, where V8's Arguments
+  object has `Object.prototype` (Session 354 vue note). Not available in arrow functions or
+  coroutines (a compile-time reject).
+- A typed receiver that is a Proxy (vue's reactive arrays and collections) takes its methods through
+  the traps, but a typed `for..of` over one, and a cursor `for..of` over a Proxy of a Map or Set,
+  walk a snapshot taken through the iteration protocol at loop entry (elements added during the
+  loop are not visited; an array's or a Map's are). The array species lookup (`constructor`) is not
+  modelled, and the generic read methods over a Proxy read each element behind a `has` (V8's `join`
+  and `includes` do not): a get trap's sequence differs in those details, the values agree
+  (Session 354 vue note).

@@ -331,3 +331,92 @@ checker garnet embeds). The benchmark targets the latest 3.x release (`effect@3.
 `build/real/effect`); its `index.ts` re-exports every module, and `Schema` imports
 `FastCheck.ts`, a re-export of the npm package `fast-check`, so the driver must import the
 modules it uses directly and avoid `Schema`, or stub `fast-check`.
+
+## What vue taught garnet (session 354)
+
+vue core's reactivity is Proxies around arrays, Maps and Sets, with the typed program calling
+`state.todos.push(x)`, `for (const t of state.todos)`, `m.forEach(f)` and `m.size` on values whose
+static type is the array or the collection. garnet's typed entries for those operations had never met
+a Proxy: `ts_array_push` ignored a receiver that was not an array, `length` read 0, the typed `for..of`
+walked 0 elements, `filter` returned `[]`, `includes` false, a Map's `size` threw. Every one of them
+was a silent miscompile of a correct program. The fix is one rule, implemented where each entry
+already tests its receiver, so an array pays nothing:
+
+- **A typed entry whose receiver is a Proxy takes the method through the traps**
+  (`ts_method_dynamic`: the property of that name read through the receiver, called with it; gated
+  by `g_has_proxies` in the entries' existing non-array branches). `length` reads through the get
+  trap (`ts_array_len_foreign`); a typed `for..of` collects what the receiver's iteration protocol
+  yields and walks that (`forof.arraySource`, a snapshot); a Map/Set typed entry dispatches the same
+  way, `size` through the trap, and the cursor-driven `for..of` walks a Map or Set built from the
+  receiver's protocol (`map.cursorSource`); `push(a, b)` and `unshift` hoist the array test and take
+  one dynamic call with every argument, so vue's instrumented push sees them together as V8's does.
+- **The function-value forms run the generic algorithms over an array-like `this`**
+  (`Array.prototype.push.apply(proxy, args)` is how vue's instrumentation mutates): push, pop,
+  shift, unshift, splice, sort, reverse, fill and copyWithin over properties read and written through
+  the receiver (`arrlike_*`, the specification's order of stores and deletes), the array iterator over
+  an array-like, `concat` and `toString` reading the elements through the traps; the Map and Set
+  prototype function values reject a receiver that is not their collection, as the specification
+  does, which also keeps a Proxy whose trap yields the builtin from re-entering the typed entry's
+  dispatch. `Array.isArray` sees through a Proxy, `JSON.stringify` serializes a Proxy of an array as
+  an array, `Array.from` of a Proxy takes the protocol without probing internal keys, and the
+  change-by-copy methods (`toSorted`, `toReversed`, `with`, `toSpliced`) exist on `Array.prototype`.
+- **A trap receives the canonical string key**, never a number: vue's `isIntegerKey` decides from it
+  whether a store is an element's and which dependencies to trigger; with number keys the array
+  iteration dependencies never fired and a computed stayed stale (the checksum differed by a few
+  effect runs: the silent kind).
+- **`Object.prototype.toString`'s builtin tags**: vue's `toRawType` sorts a value by
+  `Object.prototype.toString.call(v).slice(8, -1)`; garnet said "Object" for a Map, so a reactive
+  Map got the plain-object handlers and the builtin `forEach` ran on the Proxy. Map, Set, WeakMap,
+  WeakSet, Promise, Error (and its subclasses), Date, a Proxy (its target's tag), Math and JSON now
+  carry their tags, and `String(v)` / `v.toString()` of such an object fall back to the same tag.
+
+The rest were constructs and typings vue's sources use: the `arguments` object as a value (an
+array of the actual arguments; the function keeps its generic entry), `new Function(src)` as a
+catchable EvalError at run time (vue's dev-only expression validator and the SSR stringifier are
+never reached in the browser configuration, but the program must compile), an instance field
+initializer reading a cyclic import's class (deferred like a function body, not a top-level TDZ
+hazard), the module evaluation order computed over runtime edges only (a type-only import had
+ordered `ast.ts` after `parser.ts`, whose top level reads an enum of `ast.ts`), `(obj.method as
+any)(x)` and `obj.cb!(x)` keeping their receiver, a generator type test that no longer takes every
+`IterableIterator` for one of garnet's coroutines (vue casts an array iterator to that type and
+wraps its `next`), `String(symbol)` as the descriptive string (a template or `+` with a symbol is
+the TypeError), and compile-time constants (`TSAOT_DEFINE="__DEV__=false,__BROWSER__=true,..."`:
+an ambient identifier folds to the constant and an `if` / `?:` / `&&` / `||` it decides compiles only
+the branch taken, as vue's own bundler does; `transpile_tree.js` substitutes them for Node).
+
+Deviations kept (CLAUDE.md known items): the `arguments` object is an Array; a typed `for..of`
+over a Proxy and a cursor loop over a Proxy of a Map or Set walk a snapshot (elements added during
+the loop are not visited; an array's or a Map's are); the array species lookup (`constructor`) is
+not modelled; the generic read methods read each element behind a `has` (V8's `join` and
+`includes` do not), so a get trap's sequence differs in those details while the values agree.
+
+## vue
+
+`benchmarks/real/vue/` compiles vue core 3.5 (`build/real/vue`, `pnpm` is not needed: the
+workspace packages map to their sources through `paths.js`, the compiler's third-party modules to
+stand-ins in `stubs/` whose types come from the real `@babel/types` and `@babel/parser` typings
+installed under `garnet-types/` from `types.txt`, and `env.sh` sets the production browser build's
+flags). The driver runs two workloads in the production browser configuration:
+
+- **reactivity**: a reactive store (an array of todo objects, a nested object, a Map and a Set,
+  refs, a shallowRef, a readonly view), computed chains over it and effects, mutated in a loop:
+  every read and write is a Proxy trap, tracking links subscriber and dependency nodes, a computed
+  re-evaluates lazily from its dirty flag (4 rounds of 600 mutations);
+- **compiler**: eight templates (a todo app, a data table with slots, a form, a static article,
+  dynamic components with Teleport/KeepAlive/Transition/Suspense, nested v-for/v-if trees, a cart
+  table, a chat view) compiled to render-function source by `@vue/compiler-dom` (the tokenizer and
+  parser, the node and directive transforms, codegen; no babel: a browser does not prefix
+  identifiers), 400 rounds.
+
+The checksum adds the effect run counts, the computed values and a hash of the generated code, and
+the driver prints each round's counts and each template's code length and hash, so a difference
+names its phase.
+
+| state | garnet | Node | ratio |
+|---|---|---|---|
+| first run (reactivity 4 x 600, compiler 400 rounds) | 2,240 | 762 | 2.9 |
+
+The first run is the correctness milestone; the tuning rounds come next (the trap dispatch and the
+dynamic method calls of the reactivity workload are the obvious targets). The other projects did not
+move: yaml 3,570 -> 3,575 ms and rxjs 383.9 -> 384.0 ms alternating against the previous binaries
+(the new tests sit in the typed entries' non-array branches and at a loop's entry).

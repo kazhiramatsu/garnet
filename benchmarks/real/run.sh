@@ -12,8 +12,18 @@ name="${1:?name}"; runs="${2:-3}"
 proj="$ROOT/build/real/$name"; work="$ROOT/build/real/$name-work"
 [ -d "$proj" ] || { echo "no clone at $proj"; exit 1; }
 mkdir -p "$work"
+# a project's compile environment (benchmarks/real/<name>/env.sh: TSAOT_DEFINE, the build-time constants both engines see)
+[ -f "$ROOT/benchmarks/real/$name/env.sh" ] && . "$ROOT/benchmarks/real/$name/env.sh"
 [ -f "$ROOT/benchmarks/real/$name/paths.js" ] && node "$ROOT/benchmarks/real/$name/paths.js" "$proj" "$ROOT/benchmarks/real/$name/tsconfig.json" "$proj/garnet-paths.json" > /dev/null
 cp "$ROOT/benchmarks/real/$name/driver.ts" "$proj/garnet-driver.ts"
+# a project's stand-ins for third-party modules its benchmark configuration never calls (benchmarks/real/<name>/stubs)
+if [ -d "$ROOT/benchmarks/real/$name/stubs" ]; then rm -rf "$proj/garnet-stubs"; cp -R "$ROOT/benchmarks/real/$name/stubs" "$proj/garnet-stubs"; fi
+# the typings of third-party packages the stubs re-export (benchmarks/real/<name>/types.txt, one npm spec per line),
+# installed once under <clone>/garnet-types
+if [ -f "$ROOT/benchmarks/real/$name/types.txt" ] && [ ! -d "$proj/garnet-types/node_modules" ]; then
+  mkdir -p "$proj/garnet-types" && echo '{ "name": "garnet-types", "private": true }' > "$proj/garnet-types/package.json"
+  ( cd "$proj/garnet-types" && npm install --silent --no-package-lock --no-audit --no-fund $(cat "$ROOT/benchmarks/real/$name/types.txt") ) || { echo "[$name] npm install of the typings FAILED"; exit 1; }
+fi
 cp "$ROOT/benchmarks/real/$name/tsconfig.json" "$proj/garnet-tsconfig.json"
 echo "[$name] garnet build"
 ( cd "$ROOT" && "$ROOT/garnet" -p "$proj/garnet-tsconfig.json" -o "$work/driver.c" "$proj/garnet-driver.ts" ) > "$work/build.log" 2>&1 \

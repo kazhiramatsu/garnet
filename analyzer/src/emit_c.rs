@@ -14007,7 +14007,7 @@ fn fnval_adapter_body(builtin: &str) -> Option<String> {
         "objproto.propertyIsEnumerable" => Some("return ts_objproto_propertyIsEnumerable(a, n);".to_string()),
         "objproto.valueOf" => Some("return ts_objproto_valueOf(a, n);".to_string()),
         // ---- Array statics ----
-        "array.isArray" => hv(format!("ts_bool(ts_is_array_fast({}))", val(0))),
+        "array.isArray" => hv(format!("ts_bool(ts_array_is_array({}))", val(0))),
         "array.pushHole" => Some(format!("ts_array_push_hole({}); return TS_UNDEFINED;", val(0))),
         "array.from" => Some(format!("return n>1 ? ts_array_from_mapped({}, {}) : ts_array_from({});", val(0), val(1), val(0))),
         "array.of" => Some("return ts_array_of(a, n);".to_string()),
@@ -14583,6 +14583,8 @@ fn emit_global_setup(s: &mut String, needs_fetch: bool, needs_typed_array_global
     s.push_str("  tsv _Date = ts_make_global_fn(ts_fnval_global_Date, 7u, \"Date\", 0);\n");
     root_local(s, "_Date");
     set_val(s, "_Date", "prototype", "ts_new_object()");
+    // Object.prototype.toString.call(new Date()) is "[object Date]": the builtin tag, as the prototype's @@toStringTag
+    s.push_str("  ts_define_data(ts_get(_Date, ts_intern_field(\"prototype\", 9)), TS_KEY_WKSYM(TS_WKSYM_TO_STRING_TAG), ts_new_string(\"Date\", 4), 0, 0, 1);\n");
     set_fn(s, "_Date", "now", "date.now", 0, "now");
     global_set_rooted(s, "Date", "_Date");
 
@@ -14615,6 +14617,8 @@ fn emit_global_setup(s: &mut String, needs_fetch: bool, needs_typed_array_global
 
     s.push_str("  tsv _Math = ts_new_object();\n");
     root_local(s, "_Math");
+    // Object.prototype.toString.call(Math) is "[object Math]": the namespace's @@toStringTag
+    s.push_str("  ts_define_data(_Math, TS_KEY_WKSYM(TS_WKSYM_TO_STRING_TAG), ts_new_string(\"Math\", 4), 0, 0, 1);\n");
     for (prop, expr) in [
         ("PI", "ts_num(3.14159265358979323846264338327950288)"),
         ("E", "ts_num(2.71828182845904523536028747135266250)"),
@@ -14671,6 +14675,7 @@ fn emit_global_setup(s: &mut String, needs_fetch: bool, needs_typed_array_global
 
     s.push_str("  tsv _JSON = ts_new_object();\n");
     root_local(s, "_JSON");
+    s.push_str("  ts_define_data(_JSON, TS_KEY_WKSYM(TS_WKSYM_TO_STRING_TAG), ts_new_string(\"JSON\", 4), 0, 0, 1);\n");
     set_fn(s, "_JSON", "stringify", "json.stringify", 1, "stringify");
     set_fn(s, "_JSON", "parse", "json.parse", 2, "parse");
     global_set_rooted(s, "JSON", "_JSON");
@@ -22221,6 +22226,21 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 }
                 return;
             }
+            // the array a typed for..of walks: itself, or what a foreign receiver's protocol yields
+            if builtin == "forof.arraySource" {
+                if let Some(d) = dst {
+                    s.push_str(&ctx.set_val(d.0, &format!("ts_forof_array_source({})", ctx.val(args[0].0))));
+                }
+                return;
+            }
+            // the Map or Set a cursor loop walks: itself, or one built from a foreign receiver's protocol
+            if let Some(kind) = builtin.strip_prefix("map.cursorSource:") {
+                if let Some(d) = dst {
+                    let is_map = if kind == "map" { 1 } else { 0 };
+                    s.push_str(&ctx.set_val(d.0, &format!("ts_mapset_cursor_source({}, {})", ctx.val(args[0].0), is_map)));
+                }
+                return;
+            }
             if let Some(name) = builtin.strip_prefix("global.varDecl:") {
                 let _ = writeln!(s, "  ts_global_var_decl({:?});", name);
                 if let Some(d) = dst {
@@ -22473,6 +22493,27 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 }
                 return;
             }
+            // the arguments object as a value: the actual arguments as an array (the body keeps
+            // the generic entry: `body_reads_arguments`)
+            if let Some(offset) = builtin.strip_prefix("arguments.array:") {
+                if let Some(d) = dst {
+                    let offset: u32 = offset.parse().expect("arguments offset");
+                    let offset = (offset as usize).saturating_sub(ctx.cur_capture_count);
+                    s.push_str(&ctx.set_val(
+                        d.0,
+                        &format!("ts_arguments_array(args + {0}, nargs > {0} ? nargs - {0} : 0)", offset),
+                    ));
+                }
+                return;
+            }
+            // `new Function(src)`: code generation from a string, a catchable EvalError at the site
+            if let Some(msg) = builtin.strip_prefix("throw.eval:") {
+                let _ = writeln!(s, "  ts_throw_eval_error_msg({:?});", msg);
+                if let Some(d) = dst {
+                    s.push_str(&ctx.set_val(d.0, "TS_UNDEFINED"));
+                }
+                return;
+            }
             // console.dir(v): structural inspection of a single value.
             if builtin == "console.dir" {
                 let _ = writeln!(
@@ -22628,6 +22669,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 ),
                 "number.coerce" => (format!("ts_number_coerce({})", v(0)), true),
                 "string.coerce" => (format!("ts_to_string_v({})", v(0)), false),
+                "string.coerceTemplate" => (format!("ts_to_string_template({})", v(0)), false),
                 "boolean.coerce" => (format!("ts_bool(ts_truthy_fast({}))", v(0)), false),
                 "regexp.literalTest" => (
                     format!("ts_regexp_litprefix_test_fast({}, {}, 0)", v(0), v(1)),
@@ -23023,7 +23065,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 // x instanceof <runtime constructor value>: Symbol.hasInstance then a
                 // prototype-chain walk against the class value's prototype (returns tsv bool).
                 "instanceof.dyn" => (format!("ts_instanceof_dyn({}, {})", v(0), v(1)), false),
-                "array.isArray" => (format!("ts_bool(ts_is_array_fast({}))", v(0)), false),
+                "array.isArray" => (format!("ts_bool(ts_array_is_array({}))", v(0)), false),
                 "array.pushHole" => (
                     format!("(ts_array_push_hole({}), TS_UNDEFINED)", v(0)),
                     false,
@@ -23257,8 +23299,11 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 "promise.finally" => (format!("ts_promise_finally({}, {})", r, v(0)), false),
                 "array.push" => {
                     // push(a, b, c, ...): append each arg, result is the new length
-                    // (a raw double, since this arm is marked numeric).
-                    let mut blk = String::from("({ ");
+                    // (a raw double, since this arm is marked numeric). The array test is
+                    // hoisted out of the per-argument pushes; a receiver that is not an
+                    // array (a Proxy) takes one dynamic push with every argument.
+                    let mut blk = String::from("({ double _pl; if (TS_RT_LIKELY(ts_is_indexed_array_fast(");
+                    let _ = std::fmt::write(&mut blk, format_args!("{}))) {{ ", r));
                     let push_fn = if push_inline_enabled() { "ts_array_push_inline" } else { "ts_array_push" };
                     for a in args.iter() {
                         let _ = std::fmt::write(
@@ -23268,8 +23313,10 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     }
                     let _ = std::fmt::write(
                         &mut blk,
-                        format_args!("(double)ts_array_len_fast({}); }})", r),
+                        format_args!("_pl = (double)((ts_array*)ts_ptr({}))->len; }} else {{ tsv _pa[{}] = {{ ", r, args.len().max(1)),
                     );
+                    let vals: Vec<String> = args.iter().map(|a| ctx.val(a.0)).collect();
+                    let _ = std::fmt::write(&mut blk, format_args!("{} }}; _pl = ts_array_push_foreign({}, _pa, {}); }} _pl; }})", if vals.is_empty() { "TS_UNDEFINED".to_string() } else { vals.join(", ") }, r, args.len()));
                     (blk, true)
                 }
                 "array.pop" => (format!("ts_array_pop({})", r), false),
@@ -23308,8 +23355,10 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 "array.unshift" => {
                     // unshift(a, b, c, ...): prepend all args (keeping their order),
                     // result is the new length. Prepend in reverse so the final
-                    // order is [a, b, c, ...existing].
-                    let mut blk = String::from("({ ");
+                    // order is [a, b, c, ...existing]. A receiver that is not an array
+                    // (a Proxy) takes one dynamic unshift with every argument.
+                    let mut blk = String::from("({ double _pl; if (TS_RT_LIKELY(ts_is_indexed_array_fast(");
+                    let _ = std::fmt::write(&mut blk, format_args!("{}))) {{ ", r));
                     for a in args.iter().rev() {
                         let _ = std::fmt::write(
                             &mut blk,
@@ -23318,8 +23367,10 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     }
                     let _ = std::fmt::write(
                         &mut blk,
-                        format_args!("(double)ts_array_len_fast({}); }})", r),
+                        format_args!("_pl = (double)ts_array_len_fast({}); }} else {{ tsv _pa[{}] = {{ ", r, args.len().max(1)),
                     );
+                    let vals: Vec<String> = args.iter().map(|a| ctx.val(a.0)).collect();
+                    let _ = std::fmt::write(&mut blk, format_args!("{} }}; _pl = ts_array_unshift_foreign({}, _pa, {}); }} _pl; }})", if vals.is_empty() { "TS_UNDEFINED".to_string() } else { vals.join(", ") }, r, args.len()));
                     (blk, true)
                 }
                 "array.fill" => (
@@ -23785,9 +23836,9 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 "set.keys" => (format!("ts_set_keys({})", r), false),
                 "set.values" => (format!("ts_set_values({})", r), false),
                 "set.entries" => (format!("ts_set_entries({})", r), false),
-                "array.entries" if array_iterators_enabled() => (format!("ts_array_iter_new({}, 2)", r), false),
-                "array.keys" if array_iterators_enabled() => (format!("ts_array_iter_new({}, 1)", r), false),
-                "array.values" if array_iterators_enabled() => (format!("ts_array_iter_new({}, 0)", r), false),
+                "array.entries" if array_iterators_enabled() => (format!("ts_array_iter_typed({}, 2)", r), false),
+                "array.keys" if array_iterators_enabled() => (format!("ts_array_iter_typed({}, 1)", r), false),
+                "array.values" if array_iterators_enabled() => (format!("ts_array_iter_typed({}, 0)", r), false),
                 "array.entries" => (format!("ts_array_entries({})", r), false),
                 "array.keys" => (format!("ts_array_keys_arr({})", r), false),
                 "array.values" => (format!("ts_array_values_arr({})", r), false),

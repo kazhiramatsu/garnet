@@ -12,6 +12,14 @@ const ts = require(process.env.ROOT + "/exporter/node_modules/typescript");
 const fs = require("fs"), path = require("path");
 const [root, out, entry] = process.argv.slice(2, 5).map((p, i) => (i < 2 ? path.resolve(p) : p));
 const pathsMap = process.argv[5] ? JSON.parse(fs.readFileSync(process.argv[5], "utf8")) : {};
+// the program's build-time constants (TSAOT_DEFINE, as garnet folds them: `__DEV__=false,__VERSION__="3.5.0"`),
+// substituted for the bare identifiers in the emitted JavaScript, as the project's own bundler would
+const defines = [];
+for (const part of (process.env.TSAOT_DEFINE || "").split(",").map((p) => p.trim()).filter(Boolean)) {
+  const m = /^([A-Za-z_$][\w$]*)=(.*)$/.exec(part);
+  if (!m) { console.error("transpile_tree: bad TSAOT_DEFINE entry: " + part); process.exit(2); }
+  defines.push([new RegExp("(?<![\\w$.])" + m[1].replace(/\$/g, "\\$") + "(?![\\w$])", "g"), m[2]]);
+}
 const bare = new Set();
 // the project's options: module resolution, paths, target features; the emit settings are ours
 let options = { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext, moduleResolution: ts.ModuleResolutionKind.Bundler, strict: false };
@@ -50,7 +58,9 @@ const result = program.emit(undefined, (fileName, text) => {
   const rel = path.relative(out, fileName).replace(/\.js$/, "");
   const source = [rel + ".ts", rel + ".tsx", rel + ".mts"].map((r) => path.join(root, r)).find((f) => fs.existsSync(f));
   if (!source) return;
-  const outJs = text.replace(/((?:from|import)\s*\(?\s*['"])([^'"]+)(['"])/g, (m, a, spec, b) => {
+  let outJs = text;
+  for (const [re, value] of defines) outJs = outJs.replace(re, value);
+  outJs = outJs.replace(/((?:from|import)\s*\(?\s*['"])([^'"]+)(['"])/g, (m, a, spec, b) => {
     if (spec.startsWith("node:") || spec.startsWith("garnet:")) return m;
     const target = resolveRel(source, spec);
     if (target === null) { if (!spec.startsWith(".")) bare.add(spec); return m; }

@@ -2253,7 +2253,7 @@ fn needs_materialized_this(f: &Function, bodies: &BTreeMap<u32, Function>, depth
     }
     fn scan(body: &[Inst], p0: u32, bodies: &BTreeMap<u32, Function>, depth: u32) -> bool {
         body.iter().any(|inst| match inst {
-            Inst::CallBuiltinStatic { builtin, .. } if builtin.starts_with("arguments.length:") => true,
+            Inst::CallBuiltinStatic { builtin, .. } if builtin.starts_with("arguments.") => true,
             Inst::LoadFieldDynamic { obj, .. }
             | Inst::StoreFieldDynamic { obj, .. }
             | Inst::HasFieldDynamic { obj, .. }

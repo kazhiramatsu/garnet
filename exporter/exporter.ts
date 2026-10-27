@@ -536,6 +536,27 @@ interface FnCtx {
   thisCellOfBody?: Map<any[], number>; // the lexical-this cell made in a block, reused by its later arrows
 }
 
+/** The program's build-time constants (TSAOT_DEFINE="__DEV__=false,__BROWSER__=true,__VERSION__=\"3.5.0\""):
+ *  an ambient identifier so named is the constant, and a condition it decides compiles only the
+ *  branch taken (a bundler's `define`; vue's flags, docs/real_projects.md). A value is true, false, a
+ *  number or a quoted string (no comma inside). */
+function parseDefines(): Map<string, boolean | number | string> {
+  const out = new Map<string, boolean | number | string>();
+  const spec = process.env.TSAOT_DEFINE;
+  if (!spec) return out;
+  for (const part of spec.split(",").map((p) => p.trim()).filter((p) => p.length > 0)) {
+    const m = /^([A-Za-z_$][\w$]*)=(.*)$/.exec(part);
+    if (!m) { console.error(`TSAOT_DEFINE: expected NAME=VALUE, got '${part}'`); process.exit(2); }
+    const name = m[1], raw = m[2];
+    let value: boolean | number | string;
+    if (raw === "true" || raw === "false") value = raw === "true";
+    else if (/^-?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?$/.test(raw)) value = Number(raw);
+    else if (/^(".*"|'.*')$/.test(raw)) value = raw.slice(1, -1);
+    else { console.error(`TSAOT_DEFINE: the value of ${name} must be true, false, a number or a quoted string, got '${raw}'`); process.exit(2); }
+    out.set(name, value);
+  }
+  return out;
+}
 function isFunctionLike(n: ts.Node): boolean {
   return (
     ts.isFunctionDeclaration(n) ||
@@ -615,6 +636,8 @@ class Exporter {
   // ReferenceError when a cyclic module reads another's const/let/class before it
   // is initialized; the bundler's scope-hoisting would just read the unset local).
   cyclicModules: Set<ts.SourceFile> = new Set();
+  /** The build-time constants (TSAOT_DEFINE, `parseDefines`). */
+  defines: Map<string, boolean | number | string> = parseDefines();
   // True when the program has top-level await, so __module_init is lowered as an
   // async coroutine (driven by the event loop) rather than a synchronous function.
   moduleInitIsAsync = false;
@@ -1316,13 +1339,76 @@ class Exporter {
     if (declSf === useSf) return false; // same module: positional check handles it
     // Only module-init (top-level) reads are hazardous; deferred reads inside a
     // function run after both modules finished initializing.
-    if (this.enclosingFunction(node) !== undefined) return false;
+    if (this.enclosingFunction(node) !== undefined || this.inInstanceFieldInitializer(node)) return false;
     const declarationOrder = this.moduleInitializationOrder.get(declSf);
     const useOrder = this.moduleInitializationOrder.get(useSf);
     // A completed dependency has initialized its lexical declarations even when
     // both files belong to the same import cycle.
     if (declarationOrder !== undefined && useOrder !== undefined && declarationOrder < useOrder) return false;
     return this.cyclicModules.has(useSf) && this.cyclicModules.has(declSf);
+  }
+  /** The build-time constant an identifier names (TSAOT_DEFINE), when the name is an ambient
+   *  declaration (`declare var __DEV__: boolean`) and not a binding of the program. */
+  defineValueOf(id: ts.Identifier, sym: ts.Symbol | undefined): boolean | number | string | undefined {
+    if (this.defines.size === 0) return undefined;
+    const v = this.defines.get(id.text);
+    if (v === undefined || !this.isAmbientGlobalSymbol(sym)) return undefined;
+    return v;
+  }
+  defineConst(ctx: FnCtx, id: ts.Identifier, v: boolean | number | string): number {
+    const dst = this.newLocal(ctx, typeof v === "string" ? "reference" : "primitive", id.text);
+    const value = typeof v === "boolean" ? { kind: "Bool", value: v }
+      : typeof v === "number" ? (Object.is(v, -0) ? { kind: "NegZero" } : Number.isNaN(v) ? { kind: "NaN" } : { kind: "Num", value: this.numWire(v) })
+      : { kind: "Str", value: v };
+    ctx.body.push({ kind: "Const", dst, value } as any);
+    return dst;
+  }
+  /** The value of a condition the build-time constants decide (`__DEV__`, `!__BROWSER__`,
+   *  `__DEV__ && x`, `__BROWSER__ || x`, parentheses, `true`/`false`); undefined when it depends on
+   *  a run-time value. The `&&`/`||` cases fold only as JS short-circuits them. */
+  constCondValue(node: ts.Expression): boolean | undefined {
+    if (this.defines.size === 0) return undefined;
+    let e: ts.Expression = node;
+    while (ts.isParenthesizedExpression(e)) e = e.expression;
+    if (e.kind === ts.SyntaxKind.TrueKeyword) return true;
+    if (e.kind === ts.SyntaxKind.FalseKeyword) return false;
+    if (ts.isIdentifier(e)) {
+      const v = this.defineValueOf(e, this.symbolOf(e));
+      if (v === undefined) return undefined;
+      return typeof v === "boolean" ? v : typeof v === "number" ? (v !== 0 && !Number.isNaN(v)) : v !== "";
+    }
+    if (ts.isPrefixUnaryExpression(e) && e.operator === ts.SyntaxKind.ExclamationToken) {
+      const v = this.constCondValue(e.operand);
+      return v === undefined ? undefined : !v;
+    }
+    if (ts.isBinaryExpression(e)) {
+      const k = e.operatorToken.kind;
+      if (k === ts.SyntaxKind.AmpersandAmpersandToken) {
+        const l = this.constCondValue(e.left);
+        return l === false ? false : l === true ? this.constCondValue(e.right) : undefined;
+      }
+      if (k === ts.SyntaxKind.BarBarToken) {
+        const l = this.constCondValue(e.left);
+        return l === true ? true : l === false ? this.constCondValue(e.right) : undefined;
+      }
+    }
+    return undefined;
+  }
+  /** `node` is in the initializer of an instance field: code that runs at construction, after every
+   *  module finished initializing, like a function body (a static field's initializer runs with the
+   *  class definition). */
+  inInstanceFieldInitializer(node: ts.Node): boolean {
+    let child: ts.Node = node;
+    let p: ts.Node | undefined = node.parent;
+    while (p && !ts.isSourceFile(p)) {
+      if (ts.isPropertyDeclaration(p)) {
+        return p.initializer === child &&
+          !(ts.canHaveModifiers(p) && (ts.getModifiers(p) ?? []).some((m) => m.kind === ts.SyntaxKind.StaticKeyword));
+      }
+      child = p;
+      p = p.parent;
+    }
+    return false;
   }
   /** The environment's value an identifier names (an ambient declaration): the
    *  global object's property, a ReferenceError when it is not there, except as
@@ -5375,7 +5461,10 @@ class Exporter {
     }
     if (ts.isCallExpression(node)) {
       // console.log(x) -> Print
-      const fnx = node.expression;
+      // The callee less its parentheses and type casts: `(obj.method as any)(x)` and `obj.cb!(x)`
+      // are method calls with `obj` as the receiver (a parenthesized expression is the same
+      // Reference), not calls of a detached function value.
+      const fnx = this.unwrapExpr(node.expression);
       if (node.arguments.some(a => ts.isSpreadElement(a)) && ts.isPropertyAccessExpression(fnx)) {
         const receiverKind = this.builtinReceiverKind(fnx.expression);
         if (receiverKind && this.builtinMethodName2(receiverKind, fnx.name.text)) {
@@ -5685,7 +5774,7 @@ class Exporter {
       let recv: number | undefined;
       let callee: any = { kind: "Unknown" };
       let droppedCallbackArgs: Set<number> | undefined;
-      const fn = node.expression;
+      const fn = this.unwrapExpr(node.expression);
       const nsTarget = ts.isPropertyAccessExpression(fn) ? this.namespaceMemberCallTarget(fn) : undefined;
       if (nsTarget !== undefined) {
         // `N.f(...)` where `N` names a value namespace and `f` one of its
@@ -6855,6 +6944,14 @@ class Exporter {
          node.operatorToken.kind === ts.SyntaxKind.BarBarToken ||
          node.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken)) {
       const kind = node.operatorToken.kind;
+      if (kind !== ts.SyntaxKind.QuestionQuestionToken) {
+        // a build-time constant on the left (`__DEV__ && warn(...)`): the side JS evaluates
+        const decided = this.constCondValue(node.left);
+        if (decided !== undefined) {
+          const takesRight = kind === ts.SyntaxKind.AmpersandAmpersandToken ? decided : !decided;
+          return this.lowerExpr(ctx, takesRight ? node.right : node.left);
+        }
+      }
       const res = this.newLocal(ctx, this.refKindOf(node));
       const lhs = this.lowerExpr(ctx, node.left);
       ctx.body.push({ kind: "Copy", dst: res, src: lhs });
@@ -7189,6 +7286,8 @@ class Exporter {
       else { this.unsupported(node, `unary operator ${ts.SyntaxKind[op]}`); return this.newLocal(ctx, "unknown"); }
     }
     if (ts.isConditionalExpression(node)) {
+      const decided = this.constCondValue(node.condition);
+      if (decided !== undefined) return this.lowerExpr(ctx, decided ? node.whenTrue : node.whenFalse);
       // cond ? a : b  ->  res; if (cond) res=a else res=b
       const cond = this.lowerCond(ctx, node.condition);
       const res = this.newLocal(ctx, this.refKindOf(node));
@@ -7229,7 +7328,8 @@ class Exporter {
         flushStatic();
         const raw = this.lowerExpr(ctx, span.expression);
         const e = this.newLocal(ctx, "reference");
-        ctx.body.push({ kind: "CallBuiltinStatic", dst: e, builtin: "string.coerce", args: [raw] });
+        // a template's ToString: a Symbol substitution is a TypeError (String(sym) is its description)
+        ctx.body.push({ kind: "CallBuiltinStatic", dst: e, builtin: "string.coerceTemplate", args: [raw] });
         parts.push(e);
         pendingStatic = span.literal.text;
       }
@@ -7386,9 +7486,15 @@ class Exporter {
       sym = target;
     }
     if (node.text === "arguments" && !sym?.declarations?.length) {
-      this.unsupported(node, "arguments object as a value (only arguments.length is implemented)");
-      const dst = this.newLocal(ctx, "reference");
-      ctx.body.push({ kind: "Const", dst, value: { kind: "Undef" } });
+      // the arguments object as a value: the actual arguments as an array (`apply(this, arguments)`,
+      // `arguments[i]`, `Array.from(arguments)`; the function keeps its generic entry for the count)
+      const dst = this.newLocal(ctx, "reference", "arguments");
+      if (ctx.argumentsOffset === undefined || ctx.isAsync || ctx.isGenerator) {
+        this.unsupported(node, "the arguments object in an arrow function or a coroutine");
+        ctx.body.push({ kind: "Const", dst, value: { kind: "Undef" } });
+        return dst;
+      }
+      ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: `arguments.array:${ctx.argumentsOffset}`, args: [] });
       return dst;
     }
     const namespace = sym && this.namespaceBindings.get(sym);
@@ -7529,6 +7635,10 @@ class Exporter {
     // `WeakRef`, ...; a host's `declare var` or `declare global`) is a property
     // of the global object: read it there (undefined when nothing defines it)
     // rather than from a local nothing assigns.
+    {
+      const def = this.defineValueOf(node, sym);
+      if (def !== undefined) return this.defineConst(ctx, node, def);
+    }
     if (sym && (this.isDefaultLibSymbol(sym) || this.isAmbientValueSymbol(sym))) return this.loadEnvironmentValue(ctx, node);
     if (sym) return this.ensureLocal(ctx, sym, this.refKindOf(node), node.text);
     return this.newLocal(ctx, this.refKindOf(node), node.text);
@@ -10004,6 +10114,12 @@ class Exporter {
       // no explicit ctor: run field initializers (and chain to parent ctor)
       // directly on the new object, since there is no ctor body to host them.
       this.emitImplicitConstruction(ctx, classId, dst, args);
+    } else if (calleeName === "Function" && ts.isIdentifier(node.expression) && this.isAmbientGlobalSymbol(this.symbolOf(node.expression))) {
+      // `new Function(src)`: code generation from a string, which a compiled program has no engine
+      // for. A catchable EvalError at the site (V8 under a Content Security Policy throws the same), so
+      // a program whose dynamic path is never taken (a dev-only validator, an eval fallback) compiles.
+      ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), args: [],
+        builtin: "throw.eval:Code generation from strings is not available in a compiled program (new Function)" });
     } else {
       // `new X()` where X is an identifier that does NOT resolve to a known user
       // class and is not a supported built-in (Array/Map/Set/Date/Error...). The
@@ -11431,7 +11547,10 @@ class Exporter {
     try {
       const t = this.checker.getTypeAtLocation(expr);
       const tn = this.checker.typeToString(t);
-      if (/^(Generator|Iterator|IterableIterator)\b/.test(tn)) return true;
+      // Only a Generator is one of our coroutines: an Iterator / IterableIterator may be an array,
+      // Map or Set iterator or a user's object (vue casts an array iterator to IterableIterator and
+      // wraps its next); those step through the dynamic protocol, which also drives a coroutine.
+      if (/^Generator\b/.test(tn)) return true;
       // A type whose string merely CONTAINS "Generator<" — e.g. an object/class
       // with a `[Symbol.iterator](): Generator<...>` member — is an ITERABLE, not a
       // generator itself; it must own a `next` to be driven via the generator
@@ -11445,7 +11564,7 @@ class Exporter {
     try {
       const t = this.checker.getTypeAtLocation(expr);
       const tn = this.checker.typeToString(t);
-      if (/^(AsyncGenerator|AsyncIterator|AsyncIterableIterator)\b/.test(tn)) return true;
+      if (/^AsyncGenerator\b/.test(tn)) return true;
       return /\bAsyncGenerator</.test(tn) && !!(t.getProperty && t.getProperty("next"));
     } catch { return false; }
   }
@@ -12056,8 +12175,20 @@ class Exporter {
    *  are visited, deleted ones skipped), without an iterator object, result
    *  objects or, for a `[k, v]` pattern, the pair arrays. Mirrors
    *  lowerDrivenForLoop's per-iteration capture cells. */
+  /** The array a typed `for..of` walks (`forof.arraySource`): the value when it is an array, otherwise
+   *  the elements its iteration protocol yields (a Proxy around an array takes the loop through its
+   *  [Symbol.iterator] trap: vue's reactive arrays), so the index loop keeps its shape. */
+  private forOfArraySource(ctx: FnCtx, arr: number): number {
+    const dst = this.newLocal(ctx, "reference", "forofArr");
+    ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "forof.arraySource", args: [arr] });
+    return dst;
+  }
   private lowerCursorForLoop(ctx: FnCtx, init: ts.ForInitializer, body: ts.Statement, target: { coll: ts.Expression; mode: "keys" | "values" | "entries" }): void {
-    const coll = this.lowerExpr(ctx, target.coll);
+    // the Map or Set itself, or one built from a foreign receiver's protocol (a Proxy around one)
+    const collKind = this.builtinReceiverKind(target.coll) ?? this.derivedCollectionKind(target.coll);
+    const coll0 = this.lowerExpr(ctx, target.coll);
+    const coll = this.newLocal(ctx, "reference", "cursorColl");
+    ctx.body.push({ kind: "CallBuiltinStatic", dst: coll, builtin: `map.cursorSource:${collKind === "set" ? "set" : "map"}`, args: [coll0] });
     const decl0 = ts.isVariableDeclarationList(init) ? init.declarations[0] : undefined;
     const captureCells = decl0 && (init.flags & (ts.NodeFlags.Let | ts.NodeFlags.Const)) !== 0
       ? this.setupForOfCaptureCells(ctx, decl0.name, decl0) : [];
@@ -12920,6 +13051,10 @@ class Exporter {
    *  before. The flag's final truthiness equals the value's: for `a && b` it
    *  is truthy(a) ? truthy(b) : false, for `a || b` truthy(a) ? true : truthy(b). */
   lowerCond(ctx: FnCtx, node: ts.Expression): number {
+    {
+      const decided = this.constCondValue(node);
+      if (decided !== undefined) return this.constBool(ctx, decided);
+    }
     if (!this.condFlags) return this.lowerExpr(ctx, node);
     let e: ts.Expression = node;
     while (ts.isParenthesizedExpression(e)) e = e.expression;
@@ -13093,10 +13228,17 @@ class Exporter {
     } else if (ts.isThrowStatement(stmt)) {
       ctx.body.push({ kind: "Throw", src: this.lowerExpr(ctx, stmt.expression) });
     } else if (ts.isIfStatement(stmt)) {
-      const cond = this.lowerCond(ctx, stmt.expression);
-      const thenB = this.captureBody(ctx, () => this.lowerStmt(ctx, stmt.thenStatement));
-      const elseB = stmt.elseStatement ? this.captureBody(ctx, () => this.lowerStmt(ctx, stmt.elseStatement!)) : [];
-      ctx.body.push({ kind: "If", cond, thenBody: thenB, elseBody: elseB });
+      const decided = this.constCondValue(stmt.expression);
+      if (decided !== undefined) {
+        // a build-time constant decides it (`if (__DEV__)`): only the branch taken is compiled
+        if (decided) this.lowerStmt(ctx, stmt.thenStatement);
+        else if (stmt.elseStatement) this.lowerStmt(ctx, stmt.elseStatement);
+      } else {
+        const cond = this.lowerCond(ctx, stmt.expression);
+        const thenB = this.captureBody(ctx, () => this.lowerStmt(ctx, stmt.thenStatement));
+        const elseB = stmt.elseStatement ? this.captureBody(ctx, () => this.lowerStmt(ctx, stmt.elseStatement!)) : [];
+        ctx.body.push({ kind: "If", cond, thenBody: thenB, elseBody: elseB });
+      }
     } else if (ts.isForStatement(stmt)) {
       // for (init; cond; update) body
       // To make `continue` correct (C continue would skip an update placed at the
@@ -13518,7 +13660,7 @@ class Exporter {
       // loop, binding the element, the index or the [index, element] pair.
       const arrIter = this.arrayIteratorForOfTarget(stmt.expression);
       if (arrIter) {
-        const arrL = this.lowerExpr(ctx, arrIter.arr);
+        const arrL = this.forOfArraySource(ctx, this.lowerExpr(ctx, arrIter.arr));
         this.lowerArrayIndexForOf(ctx, stmt.initializer, stmt.statement, arrL, false, arrIter.mode);
         return;
       }
@@ -13536,8 +13678,9 @@ class Exporter {
         return;
       }
       // for (const x of arr) body  ->  let i=0; while(i<arr.length){ x=arr[i]; body; i++ }
-      const arr = this.lowerExpr(ctx, stmt.expression);
       const iterIsString = forOfKind === "string";
+      const arr0 = this.lowerExpr(ctx, stmt.expression);
+      const arr = iterIsString ? arr0 : this.forOfArraySource(ctx, arr0);
       this.lowerArrayIndexForOf(ctx, stmt.initializer, stmt.statement, arr, iterIsString);
     } else if (ts.isForInStatement(stmt)) {
       // Snapshot enumerable string keys across the full prototype chain,
@@ -15074,8 +15217,10 @@ class Exporter {
   /** The user modules `sf` statically imports / re-exports from (string-literal
    *  specifiers only; ambient/lib excluded). */
   /** The modules `sf` imports. With `runtimeOnly`, a type-only import (erased: it neither
-   *  evaluates nor links the module) is left out; the evaluation order keeps every edge, so
-   *  the order a program had before a type-only import existed does not change. */
+   *  evaluates nor links the module) is left out. The evaluation order is computed over the
+   *  runtime edges only: an erased import does not order modules under the emitted program
+   *  either (vue's `ast.ts` reached first through type-only imports, with its subtree holding the
+   *  parser that reads its enum at the top level, ran after the parser). */
   private moduleDeps(sf: ts.SourceFile, runtimeOnly: boolean = false): ts.SourceFile[] {
     const out: ts.SourceFile[] = [];
     const seen = new Set<ts.SourceFile>();
@@ -15116,7 +15261,7 @@ class Exporter {
       }
       onStack.add(sf);
       stack.push(sf);
-      for (const d of this.moduleDeps(sf)) visit(d);
+      for (const d of this.moduleDeps(sf, true)) visit(d);
       stack.pop();
       onStack.delete(sf);
       done.add(sf);
@@ -15575,6 +15720,7 @@ class Exporter {
       ["findLast","ts_arrproto_findLast"],["findLastIndex","ts_arrproto_findLastIndex"],
       ["some","ts_arrproto_some"],["every","ts_arrproto_every"],["flatMap","ts_arrproto_flatMap"],
       ["keys","ts_arrproto_keys"],["values","ts_arrproto_values"],["entries","ts_arrproto_entries"],
+      ["toSorted","ts_arrproto_toSorted"],["toReversed","ts_arrproto_toReversed"],["with","ts_arrproto_with"],["toSpliced","ts_arrproto_toSpliced"],
     ];
     const arrayProtoMethods = arrayProtoSpec.map(([name, runtime]) => ({
       name, runtime, methodId: this.internName(name),

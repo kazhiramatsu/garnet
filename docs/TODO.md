@@ -10944,3 +10944,48 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   inherited writes at a warm site: Object.create chains, setPrototypeOf, a class prototype, an ES5
   constructor's prototype, a getter-only accessor; and the instance case),
   `strings/short_string_literals`. rxjs: 386.9 -> 388.5 ms alternating (unchanged: no read-only defines, few short compares). Gates: conformance 629/629 plain and strict, 626/626 under GC protect, unit, bundler 46/46, bench within budget (the split/join kernel 48 ms of 90), GC stress.
+- Real projects: vue core 3.5 runs (Session 354, `docs/real_projects.md` "What vue taught garnet" and
+  "vue"). `benchmarks/real/vue/` (driver: a reactivity workload over Proxies around arrays, Maps and
+  Sets, and `@vue/compiler-dom` compiling eight templates; `paths.js` for the workspace, `stubs/` for
+  the compiler's third-party modules with the real babel typings installed from `types.txt`, `env.sh`
+  for the build flags). First run: garnet 2,240 ms, Node 762 ms (2.9x), outputs identical. What it
+  took, each a general fix with a fixture:
+  - the `arguments` object as a value (`arguments.array:` builtin, `ts_arguments_array`; the function
+    keeps its generic entry; an Array, CLAUDE.md known items): `functions/arguments_object`;
+  - `new Function(src)` compiles to a catchable EvalError at the site (`throw.eval:` builtin,
+    `ts_throw_eval_error_msg`): `functions/new_function_dynamic_path`;
+  - the cross-module TDZ check treats an instance field initializer as deferred code
+    (`inInstanceFieldInitializer`): bundler `cycle_field_init`;
+  - the module evaluation order is computed over runtime edges only (`computeModuleOrder` with
+    `moduleDeps(sf, true)`): a type-only import had ordered vue's `ast.ts` after `parser.ts`, whose
+    top level reads `Namespaces.HTML`: bundler `type_import_order`;
+  - a call's callee is unwrapped of parentheses and casts (`(obj.method as any)(x)`, `obj.cb!(x)`
+    keep the receiver; the fixture's `(lg.log as any)("err", true)` had called with `this` undefined);
+  - `TSAOT_DEFINE="NAME=value,..."`: an ambient identifier folds to the constant (`defineValueOf`),
+    a condition it decides compiles only the branch taken (`constCondValue` in `if`, `?:`, `&&`,
+    `||`, `lowerCond`); `transpile_tree.js` substitutes the same constants for Node; vue's 14 flags
+    fold away (140 `__DEV__` reads were global property lookups);
+  - `isGeneratorType` matches `Generator` only (an `IterableIterator`-typed array iterator wrapped
+    by vue's `iterator()` was stepped as a coroutine): `iteration/wrapped_array_iterator`;
+  - typed receivers through a Proxy (the slice's core): a typed array, Map or Set entry whose
+    receiver is a Proxy dispatches through the traps (`ts_method_dynamic`, `TS_ARRAY_PROXY` in the
+    entries' non-array branches, `ts_array_len_foreign`, `forof.arraySource` /
+    `ts_forof_array_source`, `map.cursorSource` / `ts_mapset_cursor_source`, `ts_array_iter_typed`,
+    one dynamic `push`/`unshift` with every argument); the function-value forms run the generic
+    algorithms over an array-like `this` (`arrlike_push/pop/shift/unshift/splice/sort/reverse/
+    fill/copy_within`, the array iterator over an array-like, `concat`/`toString` through the
+    traps); the Map/Set prototype function values are strict about their receiver;
+    `Array.isArray` sees through a Proxy (`ts_array_is_array`); `JSON.stringify` of a Proxy of an
+    array; `Array.from` of a Proxy without probing internal keys; `toSorted`/`toReversed`/`with`/
+    `toSpliced` on `Array.prototype`; a trap's numeric key is the canonical string
+    (`proxy_key_canonical`: vue's `isIntegerKey` had never seen an element store, so the array
+    iteration dependencies never fired and a computed stayed stale, 1,071 effect runs short):
+    `proxy/typed_array_receiver`, `proxy/typed_collection_receiver`,
+    `arrays/generic_mutators_arraylike`;
+  - `String(symbol)` is the descriptive string, `+` and a template with a symbol the TypeError
+    (`string.coerceTemplate` / `ts_to_string_template`): `symbol/string_of_symbol`;
+  - `Object.prototype.toString`'s builtin tags (Map, Set, WeakMap, WeakSet, Promise, Error, Date, a
+    Proxy's target, Math, JSON), and `String(v)` / `v.toString()` of such an object through the same
+    tag (vue's `toRawType` had sorted a reactive Map into the plain-object handlers):
+    `object_methods/to_string_tags`.
+  yaml and rxjs A/B against the previous binaries: yaml 3,570 -> 3,575 ms and rxjs 383.9 -> 384.0 ms alternating (unchanged; the new tests sit in the entries' non-array branches and at loop entry). Gates: conformance 637/637 plain and strict, 634/634 under GC protect, unit, bundler 48/48, bench within budget, GC stress.
