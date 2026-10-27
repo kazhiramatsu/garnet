@@ -13132,15 +13132,19 @@ fn coro_stack_numerics(f: &Function, ctx: &Ctx) -> BTreeSet<u32> {
         return out;
     }
     let params: BTreeSet<u32> = f.params.iter().map(|p| p.0).collect();
+    // with conservative roots (the default) the collector scans the native stack, so a boxed local
+    // may live there too; with frames as the roots only the numerics may
+    let boxed_too = conservative_roots_enabled();
     let candidates: Vec<u32> = f
         .locals
         .iter()
         .map(|l| l.id.0)
-        .filter(|id| (ctx.int_local.contains(id) || ctx.unboxed.contains(id)) && !params.contains(id))
+        .filter(|id| (boxed_too || ctx.int_local.contains(id) || ctx.unboxed.contains(id)) && !params.contains(id))
         .collect();
     if candidates.is_empty() {
         return out;
     }
+    let cand_set: BTreeSet<u32> = candidates.iter().copied().collect();
     let n = flat.len();
     // the jump targets: `L<id>` labels (plain, after-try, finally) and `LC<id>` landing pads
     let mut label_at: BTreeMap<u32, usize> = BTreeMap::new();
@@ -13179,13 +13183,20 @@ fn coro_stack_numerics(f: &Function, ctx: &Ctx) -> BTreeSet<u32> {
         }
         match fl {
             Flat::Inst(inst) | Flat::Suspend(inst) => {
-                for &c in &candidates {
-                    let one: BTreeSet<u32> = [c].into_iter().collect();
-                    if inst_uses_any(inst, &one) {
-                        uses[i].insert(c);
+                // every operand is a use: the exhaustive remapper's references less one occurrence of
+                // the definition (`v = v + 1` reads v; inst_uses_any names only some operands)
+                let d = inst_def(inst);
+                let mut def_seen = false;
+                for r in inst_refs(inst) {
+                    if Some(r) == d && !def_seen {
+                        def_seen = true;
+                        continue;
+                    }
+                    if cand_set.contains(&r) {
+                        uses[i].insert(r);
                     }
                 }
-                defs[i] = inst_def(inst);
+                defs[i] = d;
                 if let Some(nx) = next {
                     succs[i].push(nx);
                 }
@@ -13348,7 +13359,7 @@ fn emit_coro_frame_struct(s: &mut String, f: &Function, ctx: &Ctx, fname: &str, 
     };
     let nvals = if coro_precise_enabled() {
         let mut n = 0usize;
-        for l in f.locals.iter().filter(|l| !numeric(l.id.0)) {
+        for l in f.locals.iter().filter(|l| !numeric(l.id.0) && !stack.contains(&l.id.0)) {
             field(s, l.id.0);
             n += 1;
         }
@@ -13365,8 +13376,9 @@ fn emit_coro_frame_struct(s: &mut String, f: &Function, ctx: &Ctx, fname: &str, 
     let _ = writeln!(s, "}} {}_frame;", fname);
     nvals
 }
-/// The resume function's view of the locals: a frame slot behind a macro, or, for a numeric that
-/// never survives a suspension, a C local (zero, as the zeroed frame slot read).
+/// The resume function's view of the locals: a frame slot behind a macro, or, for a local that
+/// never survives a suspension, a C local (zero or undefined, as the fresh frame slot read; a boxed
+/// one is a root through the native stack scan of the conservative collector).
 fn emit_coro_local_defines(s: &mut String, f: &Function, ctx: &Ctx, stack: &BTreeSet<u32>) {
     for l in &f.locals {
         let id = l.id.0;
@@ -13380,6 +13392,8 @@ fn emit_coro_local_defines(s: &mut String, f: &Function, ctx: &Ctx, stack: &BTre
             } else {
                 let _ = writeln!(s, "#define d{} (_fr->d{})", id, id);
             }
+        } else if stack.contains(&id) {
+            let _ = writeln!(s, "  tsv v{} = TS_UNDEFINED;", id);
         } else {
             let _ = writeln!(s, "#define v{} (_fr->v{})", id, id);
         }
@@ -13388,10 +13402,11 @@ fn emit_coro_local_defines(s: &mut String, f: &Function, ctx: &Ctx, stack: &BTre
 fn emit_coro_local_undefs(s: &mut String, f: &Function, ctx: &Ctx, stack: &BTreeSet<u32>) {
     for l in &f.locals {
         let id = l.id.0;
+        if stack.contains(&id) {
+            continue;
+        }
         if ctx.int_local.contains(&id) || ctx.unboxed.contains(&id) {
-            if !stack.contains(&id) {
-                let _ = writeln!(s, "#undef d{}", id);
-            }
+            let _ = writeln!(s, "#undef d{}", id);
         } else {
             let _ = writeln!(s, "#undef v{}", id);
         }

@@ -8,6 +8,9 @@ driver and its tsconfig live in `benchmarks/real/<name>/` and are copied into th
 
     bash benchmarks/real/run.sh hono 3      # <name> [runs]; median wall time of each engine
 
+`benchmarks/real/ab.sh binA binB [runs]`, run inside the clone, alternates two builds of a driver and
+prints each run's time and the medians: the form every tuning change here is measured in.
+
 `run.sh` builds the native binary, transpiles the import graph for Node with the repository's
 TypeScript (`benchmarks/real/transpile_tree.js`: `.ts` to `.mjs`, specifiers rewritten, a bare
 specifier through `garnet-paths.json` when the project maps workspace packages), runs both inside
@@ -226,9 +229,11 @@ by identity).
 | a sync generator's frame without a promise; the generator object and the iteration result in their layouts | 4980 | 1327 | 3.75 |
 | the second round (below): the full-collection pacing, the absent-read cache of class instances, the drivers' scratch result, a 176-byte smaller coroutine header | 4618 | 1439 | 3.2 |
 | the third round: a generator's numeric locals in the frame only when live across a suspension | 4244 | 1300 | 3.3 |
+| the boxed locals the same way (the conservative collector scans the native stack) | 3931 | 1304 | 3.0 |
 
 (the second row's A/B ran on a slower machine state, Node included: 5154 against 4618 alternating, a 10%
-gain; the third's: 4430 against 4244, 4%; each ratio uses its own run's Node time.)
+gain; the third's: 4430 against 4244, 4%; the fourth's: 4237 against 3931, 7%; each ratio uses its own
+run's Node time.)
 
 (alternating A/B, five runs each: 5944.9 against 4980.2.) The sync generator entry allocates its
 frame through `ts_coro_alloc_gen_v/_vn` (no `ret` promise: its results are plain objects and an
@@ -279,9 +284,17 @@ mostly `long long` temporaries of a few instructions' life). A liveness pass ove
 lowering emits around every delegation step) keeps in the frame only the numerics live at a resume
 point; the others are C locals of the resume function, zero at entry as the zeroed slot read. yaml's
 numeric frame slots 2,292 -> 235, the frames 23.1 -> 15.6 GB, the minor collections 6,075 -> 4,295;
-4,430 -> 4,244 ms alternating. The `tsv` slots (3,022) remain: a boxed temporary on the C stack
-needs the collector to see it across calls (the precise frame of an ordinary function), the next step
-of this line. Then the addition cache's misses and the regular expressions.
+4,430 -> 4,244 ms alternating. The boxed locals followed by the same rule: the conservative
+collector (the default; `TSAOT_CONSERVATIVE_ROOTS=0` keeps the frames as the roots and then only the
+numerics leave) scans the native stack, so a `tsv` C local of the resume function is a root like any
+ordinary function's. yaml's frame slots 5,314 -> 691 in all (`tsv` 3,022 -> 456), the frames 30.3 GB
+at the start of the day -> 5.8 GB, the minor collections 2,000, the pauses 1,369 -> 614 ms; 4,237 ->
+3,931 ms alternating. (The first version counted an instruction's operands with `inst_uses_any`,
+which names only some of them: the array of a push, the index of an element store were not uses, so
+a receiver evaluated before an `await` and used after it left the frame; `iteration/iterator_close`
+caught it, the pass now takes every reference of the exhaustive operand remapper less one occurrence
+of the definition.) Next: the addition cache's misses (`prop_pic set` 19.5% hits), the regular
+expressions, and the frame per delegated `yield*` itself (13.6 M frames of 426 bytes on average).
 
 ## prisma
 

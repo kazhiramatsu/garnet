@@ -10900,3 +10900,19 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   `iteration/numeric_locals_across_yield`. The frames' `tsv` slots (3,022) are the next step of
   this line (a boxed temporary on the C stack needs the collector to see it across calls).
   Gates: conformance 626/626 plain and strict, 623/623 under GC protect, unit, bundler 46/46, bench within budget, GC stress.
+- Coroutine frames, the boxed locals too (Session 354, `docs/real_projects.md` yaml "The third
+  round"). With conservative roots (the default: the collector scans the native stack; a function's
+  own frame slots exist only under `TSAOT_CONSERVATIVE_ROOTS=0`) a boxed local of a generator or
+  async function that is not live at any resume point is a C local of the resume function
+  (`tsv v = TS_UNDEFINED`), by the same liveness pass as the numerics; under frame roots only the
+  numerics leave. yaml's frame slots 5,314 -> 691 (`tsv` 3,022 -> 456), coroutine frames 15.6 ->
+  5.8 GB (30.3 at the start of the day), minor collections 4,295 -> 2,000, pauses 858 -> 614 ms;
+  4,237 -> 3,931 ms alternating (-7%; Node 1,304: 3.0x). The previous commit's pass counted an
+  instruction's operands with `inst_uses_any`, which names only some of them (not the array of a
+  push, not the index of an element store), so a receiver evaluated before an `await` and used after
+  it left the frame: `iteration/iterator_close` lost a log line (the push went to an undefined
+  receiver, silently). The pass now takes every reference of `inst_refs` (the exhaustive operand
+  remapper) less one occurrence of the definition. Fixture `iteration/boxed_locals_across_yield`
+  (strings, arrays and objects across yields under allocation pressure, a try/catch in a generator,
+  nested delegation, an async function, and the operands evaluated before a suspension: a push's
+  array, a store's index and object, a concatenation's left side). Gates: conformance 627/627 plain and strict, 624/624 under GC protect, unit, bundler 46/46, bench within budget, GC stress.
