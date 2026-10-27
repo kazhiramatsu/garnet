@@ -189,7 +189,11 @@ mergeMap and concatMap buffers moved the elements (5%); the try/catch of every d
   `unshift` reuses the slack): amortized O(1), as V8's left-trim; a short array still moves its
   elements.
 
-After them (3132 ms for 300 rounds, from 5089): the generated subscriber chain itself leads
+The second round's changes were within the noise for rxjs (391 -> 385 ms alternating): no full
+collections to pace, few absent reads, and the null check and the borrowed-method lookup were a
+small part of a call.
+
+After the first round (3132 ms for 300 rounds, from 5089): the generated subscriber chain itself leads
 (`OperatorSubscriber._next`, `Subscriber.next`, the operator closures), then `ts_call` (7%: the
 closures called through the generic entry), `invoke_with_this` with the receiver check (6%: the
 `this._next(value)` call of an own function-valued property), the try/catch (5.5%), the
@@ -220,6 +224,10 @@ by identity).
 | first run | 5911 | 1289 | 4.6 |
 | the rxjs changes (unchanged, as expected) | 5945 | 1327 | 4.5 |
 | a sync generator's frame without a promise; the generator object and the iteration result in their layouts | 4980 | 1327 | 3.75 |
+| the second round (below): the full-collection pacing, the absent-read cache of class instances, the drivers' scratch result, a 176-byte smaller coroutine header | 4618 | 1439 | 3.2 |
+
+(the last row's A/B ran on a slower machine state, Node included: 5154 against 4618 alternating, a 10%
+gain; the ratio uses that run's Node time.)
 
 (alternating A/B, five runs each: 5944.9 against 4980.2.) The sync generator entry allocates its
 frame through `ts_coro_alloc_gen_v/_vn` (no `ret` promise: its results are plain objects and an
@@ -234,9 +242,37 @@ frame per delegated `yield*`), then property reads (`prop_find` 290: the regexp 
 reads per `test`, the chain walks of `composeScalar` and `createNode`), the regular expressions
 (4%), `===` on one-character strings (3%), and the generator protocol itself (`ts_gen_next`,
 `coro_alloc`, `ts_coro_resume_v`, the setjmp of a resume, `ensure_gen_fields` on every step).
-Next: a `for...of` and a `yield*` over a native generator object stepping the coroutine without
-materializing the result object (unobservable while `next` is the prototype's), canonical
-one-character strings, and the collector's share by counters.
+The second round went by the counters (`--rt-stats`), which named the collector's cause: 13.6 M
+coroutine frames of 848 to 1,872 bytes (30 GB in a 6-second run; `ts_coro` alone was 752 bytes,
+384 of them two `jmp_buf`s) and, after the first full collection left 2 MB live, a full-collection
+threshold within one nursery of the live heap, so every nursery fill elected a full collection:
+8,472 full collections and 125 minor ones. The changes:
+
+- The full-collection headroom covers a full nursery (`live + 4 MiB + the nursery's byte cap`): the
+  young cycle alone never elects a full collection; promotions do. yaml: 150 full and 6,075 minor
+  collections, the pauses 1,369 -> 900 ms.
+- A (class word, key) record of an absent read on a sized receiver, validated by the chain's shape
+  words and the addition epoch as the plain-object records are (yaml's nodes read their `declare`d
+  optional properties, which are no struct fields, on every visit): 11.2 M hits, 8.5 M -> 4.5 M
+  out-of-line absent reads, `find_prop` 152 M -> 129 M calls.
+- The iteration drivers (`for...of`, `yield*`, spread) step a known generator through
+  `generator.step`, the coroutine's own `{value, done}` rewritten each step (the drivers read both
+  slots at once and never keep the object; `gen.next()` in the program stays fresh); the same path
+  serves a native generator object a dynamic step resolves.
+- The two landing pads of a resume (`eh_buf`, the async `reject_buf`) are `jmp_buf`s on the resume
+  function's stack (armed on every entry, popped before every suspension), and the in-frame handler
+  slots are two instead of eight: `ts_coro` 752 -> 176 bytes, the frames 23 GB. The frozen
+  emitter's output names the old fields, so the byte-parity oracle diverges on coroutine programs.
+- Also in the round, within the noise: the method receiver's null check in line, the borrowed-method
+  lookup skipped for a function that takes no `this`, two hashed heap strings compared by hash
+  before any view.
+
+After it (4,799 ms for 300 rounds, 5,205 before): the collector 12% (the frames still 23 GB: a
+generator's every local has a frame slot, dozens of `long long` slots in the lexer's methods), the
+regular expressions 4%, property reads 5%, `===` on strings 2%, the generator protocol itself 6%,
+and property additions that miss their cache (`prop_pic set` 19.5% hits, 7.8 M slow additions).
+Next: frame slots only for the locals live across a suspension (the others as C locals of the
+resume function), then the addition cache's misses and the regular expressions.
 
 ## prisma
 

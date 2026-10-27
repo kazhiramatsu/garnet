@@ -11557,7 +11557,9 @@ class Exporter {
     }
 
     const useBuiltin = isOurGen || isOurAsyncGen || iterIsGenerator;
-    const nextBuiltin = (isOurAsyncGen || (iterIsGenerator && isAsync)) ? "asyncgen.next" : "generator.next";
+    // a sync generator stepped by a driver: generator.step reuses the coroutine's result object (the
+    // drivers read done and value at once and never keep it; gen.next() in the program stays fresh)
+    const nextBuiltin = (isOurAsyncGen || (iterIsGenerator && isAsync)) ? "asyncgen.next" : "generator.step";
     const step = (sentLocal: number): number => {
       const r = this.newLocal(ctx, "reference");
       if (useBuiltin) {

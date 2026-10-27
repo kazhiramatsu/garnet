@@ -2066,7 +2066,12 @@ tsv  ts_to_string_v(tsv v);
 tsv  ts_typeof(tsv v);
 tsv  ts_dynamic_method_unsupported(void); /* traps: truly-unknown callee */
 void ts_dynamic_method_missing(uint32_t name_field); /* throws TypeError: <name> is not a function */
-void ts_check_method_recv(tsv recv, uint32_t name_field); /* throws if recv is null/undefined */
+void ts_check_method_recv_slow(tsv recv, uint32_t name_field);   /* the TypeError of a null/undefined receiver */
+/* Reading `recv.method` off null or undefined is a property-read TypeError, thrown before any call:
+   the test in line at the head of every dynamic method call, the throw out of line. */
+static inline void ts_check_method_recv(tsv recv, uint32_t name_field){
+  if (TS_RT_UNLIKELY(ts_is_null(recv) || ts_is_undef(recv))) ts_check_method_recv_slow(recv, name_field);
+}
 void ts_throw_not_a_function(const char* name); /* throws TypeError: <name>/value is not a function */
 /* diagnostic per-site allocation counters (TSAOT_SITE_STATS=1 builds only) */
 void ts_site_note(uint32_t site, uint32_t func);
@@ -3564,7 +3569,7 @@ enum {
   TS_GEN_EXECUTING = 2,
   TS_GEN_COMPLETED = 3
 };
-#define TS_CORO_EH_INLINE 8
+#define TS_CORO_EH_INLINE 2   /* the in-frame handler and finally slots; deeper nesting grows them (ts_coro_eh_push_slot) */
 typedef struct ts_coro {
   ts_gc_header h;
   int state;
@@ -3576,13 +3581,17 @@ typedef struct ts_coro {
   int nvals;                 /* tsv locals leading the frame, scanned precisely;
                                 -1 = scan the frame conservatively (ts_coro_alloc_v) */
   tsv yielded;               /* generator: value produced by the current yield */
+  tsv iter_result;           /* generator: the {value, done} the iteration drivers reuse (ts_iter_step) */
   int done;                  /* generator: 1 when the body has completed */
   int gen_status;            /* generator protocol lifecycle (TS_GEN_*) */
   int is_asyncgen;
   int ag_running;
   ts_asyncgen_req* ag_head;
   ts_asyncgen_req* ag_tail;
-  jmp_buf eh_buf;            /* shared landing pad; re-armed each resume */
+  /* The landing pads of a resume (the shared try buffer, the async catch-all) are jmp_bufs on the
+     resume function's own stack, armed on every entry and popped before every suspension (emit_c
+     emit_sm_resume_body); they had been two 192-byte fields of every frame (yaml's lexer creates a
+     generator per delegated yield*: 13.6 M frames, 30 GB). */
   int eh_top;                /* number of active coroutine try handlers */
   int eh_capacity;
   int* eh_catch_state;        /* catch-label id per handler (innermost = top-1) */
@@ -3597,7 +3606,6 @@ typedef struct ts_coro {
   tsv fin_exc_inline[TS_CORO_EH_INLINE];
   int fin_tgt_inline[TS_CORO_EH_INLINE];
   int fin_top;               /* active finally-pending slots */
-  jmp_buf reject_buf;        /* async catch-all: uncaught throw rejects ret */
 } ts_coro;
 int         ts_coro_eh_push_slot(ts_coro* c);
 int         ts_coro_fin_push_slot(ts_coro* c);
@@ -3653,6 +3661,7 @@ tsv ts_abortcontrollerproto_abort(tsv* a, int n);
 /* generators */
 tsv ts_gen_new_v(tsv cv);
 tsv ts_gen_next(tsv genobj, tsv sent);
+tsv ts_gen_step(tsv genobj, tsv sent);   /* a driver's step: the coroutine's own result object (emit_c generator.step) */
 tsv ts_asyncgen_next(tsv genobj, tsv sent);
 tsv ts_iter_step(tsv iter, tsv sent, ts_key nmk); /* generic iterator step: field/method `next` or generator fallback */
 tsv ts_iter_close(tsv iter, ts_key rmk);         /* IteratorClose: `return` when present, generator return fallback */

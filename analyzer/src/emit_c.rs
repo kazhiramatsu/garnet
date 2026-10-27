@@ -12700,8 +12700,17 @@ fn emit_sm_resume_body(s: &mut String, f: &Function, ctx: &Ctx, mode: SmMode) {
     // For async: an outermost catch-all so a throw not caught by any user handler
     // rejects the function's promise (instead of aborting). Pushed first (bottom of
     // the handler stack), re-armed on every resume entry.
+    // The landing pads live on this resume's stack: a throw lands in the resume call that armed them
+    // (the handlers are popped before every suspension and re-armed on every entry), so the frame
+    // carries neither buffer (ts_rt.h ts_coro).
     if mode.is_promise_backed() {
-        let _ = writeln!(s, "  if ({}(_fr->c.reject_buf) != 0) {{", exception_setjmp_name());
+        s.push_str("  jmp_buf _reject_buf;\n");
+    }
+    if has_coro_try {
+        s.push_str("  jmp_buf _eh_buf;\n");
+    }
+    if mode.is_promise_backed() {
+        let _ = writeln!(s, "  if ({}(_reject_buf) != 0) {{", exception_setjmp_name());
         if mode == SmMode::AsyncGenerator {
             s.push_str("    _fr->c.done = 1;\n");
             s.push_str("    if (ts_is_gen_return_completion(ts_current_exception())) {\n");
@@ -12713,7 +12722,7 @@ fn emit_sm_resume_body(s: &mut String, f: &Function, ctx: &Ctx, mode: SmMode) {
         s.push_str("    ts_promise_reject_v(_fr->c.ret, ts_current_exception());\n");
         s.push_str("    return TS_UNDEFINED;\n");
         s.push_str("  }\n");
-        s.push_str("  ts_eh_push_coro(&_fr->c.reject_buf);\n");
+        s.push_str("  ts_eh_push_coro(&_reject_buf);\n");
     }
 
     // Top-of-resume re-arm: if we re-enter while inside one or more coroutine
@@ -12722,7 +12731,7 @@ fn emit_sm_resume_body(s: &mut String, f: &Function, ctx: &Ctx, mode: SmMode) {
     // function throws come back here.
     if has_coro_try {
         s.push_str("  if (_fr->c.eh_top > 0) {\n");
-        let _ = writeln!(s, "    if ({}(_fr->c.eh_buf) != 0) {{", exception_setjmp_name());
+        let _ = writeln!(s, "    if ({}(_eh_buf) != 0) {{", exception_setjmp_name());
         s.push_str("      int _t = --_fr->c.eh_top;\n");
         s.push_str("      ts_gc_set_root_depth(_fr->c.eh_gc_depth[_t]);\n");
         s.push_str("      ts_eh_pop();\n");
@@ -12733,7 +12742,7 @@ fn emit_sm_resume_body(s: &mut String, f: &Function, ctx: &Ctx, mode: SmMode) {
         s.push_str("        default: ;\n      }\n");
         s.push_str("    }\n");
         s.push_str(
-            "    for (int _i = 0; _i < _fr->c.eh_top; _i++) ts_eh_push_coro(&_fr->c.eh_buf);\n",
+            "    for (int _i = 0; _i < _fr->c.eh_top; _i++) ts_eh_push_coro(&_eh_buf);\n",
         );
         s.push_str("  }\n");
     }
@@ -12773,13 +12782,13 @@ fn emit_sm_resume_body(s: &mut String, f: &Function, ctx: &Ctx, mode: SmMode) {
                 s.push_str("    _fr->c.eh_gc_depth[_t] = ts_gc_root_depth();\n");
                 let _ = writeln!(s, "    _fr->c.eh_catch_state[_t] = {};", catch_label);
                 s.push_str("  }\n");
-                let _ = writeln!(s, "  if ({}(_fr->c.eh_buf) != 0) {{", exception_setjmp_name());
+                let _ = writeln!(s, "  if ({}(_eh_buf) != 0) {{", exception_setjmp_name());
                 s.push_str("    int _t = --_fr->c.eh_top;\n");
                 s.push_str("    ts_gc_set_root_depth(_fr->c.eh_gc_depth[_t]);\n");
                 s.push_str("    ts_eh_pop();\n");
                 let _ = writeln!(s, "    goto LC{};", catch_label);
                 s.push_str("  }\n");
-                s.push_str("  ts_eh_push_coro(&_fr->c.eh_buf);\n");
+                s.push_str("  ts_eh_push_coro(&_eh_buf);\n");
             }
             Flat::TryNormalExit { after_label } => {
                 // try body completed without throwing: pop the innermost handler.
@@ -12823,13 +12832,13 @@ fn emit_sm_resume_body(s: &mut String, f: &Function, ctx: &Ctx, mode: SmMode) {
                 s.push_str("    _fr->c.eh_gc_depth[_t] = ts_gc_root_depth();\n");
                 let _ = writeln!(s, "    _fr->c.eh_catch_state[_t] = {};", fin_catch_label);
                 s.push_str("  }\n");
-                let _ = writeln!(s, "  if ({}(_fr->c.eh_buf) != 0) {{", exception_setjmp_name());
+                let _ = writeln!(s, "  if ({}(_eh_buf) != 0) {{", exception_setjmp_name());
                 s.push_str("    int _t = --_fr->c.eh_top;\n");
                 s.push_str("    ts_gc_set_root_depth(_fr->c.eh_gc_depth[_t]);\n");
                 s.push_str("    ts_eh_pop();\n");
                 let _ = writeln!(s, "    goto LC{};", fin_catch_label);
                 s.push_str("  }\n");
-                s.push_str("  ts_eh_push_coro(&_fr->c.eh_buf);\n");
+                s.push_str("  ts_eh_push_coro(&_eh_buf);\n");
             }
             Flat::FinallyGotoNormal { fin_label } => {
                 // normal completion of try/catch: pop the finally handler, mark this
@@ -23320,6 +23329,18 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 "headers.delete" => (
                     format!(
                         "ts_headers_delete({}, {})",
+                        r,
+                        if args.is_empty() {
+                            "TS_UNDEFINED".to_string()
+                        } else {
+                            v(0)
+                        }
+                    ),
+                    false,
+                ),
+                "generator.step" => (
+                    format!(
+                        "ts_gen_step({}, {})",
                         r,
                         if args.is_empty() {
                             "TS_UNDEFINED".to_string()

@@ -960,6 +960,7 @@ static struct {
   unsigned long long small_props_fresh, small_props_reused;
   unsigned long long prop_add_hits, prop_add_fills, prop_add_site_hits;   /* additions: global cache hits, slow fills, per-site entry hits */
   unsigned long long pic_get_absent, pic_get_inherited, pic_absent_hits, absent_site_hits;
+  unsigned long long iter_step_scratch, iter_step_generic;   /* for...of / yield* steps: a native generator through its scratch result / the generic next() */
   unsigned long long array_sparse_convert, array_sparse_put, array_densify;   /* far stores: dense->sparse switches, side-table stores, sparse->dense */   /* out-of-line reads resolved on the chain / missing / answered by the absent cache */
   unsigned long long young_alloc;
   unsigned long long call_env_malloc, construct_malloc;
@@ -1037,6 +1038,7 @@ __attribute__((destructor)) static void ts_rt_stats_dump(void){
           g_rt_stats.prop_add_site_hits, g_rt_stats.prop_add_hits, g_rt_stats.prop_add_fills);
   fprintf(out, "[rt_stats] pic_ool_get: inherited=%llu absent=%llu absent_cache_hits=%llu\n",
           g_rt_stats.pic_get_inherited, g_rt_stats.pic_get_absent, g_rt_stats.pic_absent_hits);
+  fprintf(out, "[rt_stats] iter_step: scratch=%llu generic=%llu\n", g_rt_stats.iter_step_scratch, g_rt_stats.iter_step_generic);
   fprintf(out, "[rt_stats] absent_site: hits=%llu\n", g_rt_stats.absent_site_hits);
   fprintf(out, "[rt_stats] root_frames: frame_push=%llu\n",
           g_ts_frame_push_count);
@@ -1576,7 +1578,11 @@ __attribute__((noinline)) static void gc_before_alloc_slow(void){
         size_t cap = g_ram_bytes / 8u;
         if (next > cap) next = live * 2u > cap ? live * 2u : cap;
       }
-      size_t with_headroom = live + TS_GC_MIN_FULL_BYTES;
+      /* The headroom covers a full nursery: the heap count adds the cycle's young bytes, so a
+         threshold within one nursery of the live heap elected a full collection at every nursery
+         fill (yaml, 2 MB live after its first full collection: 8,472 full collections and 125 minor
+         ones, 23% of the run marking the same live data). */
+      size_t with_headroom = live + TS_GC_MIN_FULL_BYTES + g_young_cap_bytes;
       if (next < with_headroom) next = with_headroom;
       if (next < TS_GC_MIN_FULL_BYTES) next = TS_GC_MIN_FULL_BYTES;
       g_full_threshold_bytes = next;
@@ -3495,6 +3501,8 @@ tsv ts_object_is_extensible(tsv v){
    must not be mutated. */
 static inline int ts_arr_frozen(tsv v){ return (ts_obj_integrity(&((ts_array*)ts_ptr(v))->o) & 1u) != 0; }
 static int sized_inherited_get(ts_object* o, ts_key key, tsv receiver, tsv* out);
+static int sized_absent_cached(ts_object* o, ts_key key);     /* the absent-read cache of sized receivers (defined with the addition cache) */
+static void sized_absent_fill(ts_object* o, ts_key key);
 tsv ts_get(tsv obj, ts_key key){
   if (g_has_proxies && ts_is_proxy(obj)) return ts_proxy_get_v(obj, ts_key_to_value(key), obj);
   /* JSON and object-literal traffic overwhelmingly lands here. Bypass the
@@ -3510,8 +3518,13 @@ tsv ts_get(tsv obj, ts_key key){
       /* a class instance's inherited property through the (class word, key) cache, not a walk of
          the chain on every read; an instance with own dynamic properties (rxjs's OperatorSubscriber
          assigns `this._next = ...`) first shows its map lacks the key */
-      if (ts_obj_is_sized(fast) && (!((ts_sized_head*)fast)->dyn || !pref_ok(prop_find(fast, key))) &&
-          sized_inherited_get(fast, key, obj, &found)) return found;
+      if (ts_obj_is_sized(fast)){
+        if ((!((ts_sized_head*)fast)->dyn || !pref_ok(prop_find(fast, key))) && sized_inherited_get(fast, key, obj, &found)) return found;
+        if (sized_absent_cached(fast, key)) return TS_UNDEFINED;
+        if (lookup_prop_chain(obj, fast, key, &found)) return found;
+        sized_absent_fill(fast, key);
+        return TS_UNDEFINED;
+      }
       if (lookup_prop_chain(obj, fast, key, &found)) return found;
       return TS_UNDEFINED;
     }
@@ -5763,6 +5776,13 @@ int ts_strict_eq_str(tsv a, tsv b){
   uint32_t la = ts_is_short_str(a) ? ts_short_str_len(a) : ts_str_ptr_typed(a)->len;
   uint32_t lb = ts_is_short_str(b) ? ts_short_str_len(b) : ts_str_ptr_typed(b)->len;
   if (la != lb) return 0;
+  /* two hashed heap strings (the program's literals are hashed at build time, a compared string after
+     its first hash): different hashes, different strings, before any view is built (yaml's token
+     type switches test one string against every label) */
+  if (!ts_is_short_str(a) && !ts_is_short_str(b)){
+    const ts_string* x = ts_str_ptr_typed(a); const ts_string* y = ts_str_ptr_typed(b);
+    if ((x->flags & y->flags & TS_STR_FLAG_HASHED) && x->hash != y->hash) return 0;
+  }
   return ts_strict_eq_slow(a, b);
 }
 int32_t ts_to_int32_slow(double d){
@@ -6768,11 +6788,10 @@ void ts_dynamic_method_missing(uint32_t name_field){
   ts_throw_not_a_function(name_field ? ts_field_name(name_field) : NULL);
 }
 /* Reading `recv.method` off null/undefined is a property-read TypeError ("Cannot
-   read properties of null (reading 'name')"), thrown before any call. Emitted at
-   the head of the dynamic method-dispatch sequence. */
-void ts_check_method_recv(tsv recv, uint32_t name_field){
-  if (ts_is_null(recv) || ts_is_undef(recv))
-    ts_throw_cannot_read(recv, name_field ? ts_field_name(name_field) : NULL);
+   read properties of null (reading 'name')"), thrown before any call (ts_rt.h
+   ts_check_method_recv tests in line at the head of the dynamic method-dispatch sequence). */
+void ts_check_method_recv_slow(tsv recv, uint32_t name_field){
+  ts_throw_cannot_read(recv, name_field ? ts_field_name(name_field) : NULL);
 }
 
 /* ---------------- standard library: String methods ---------------- */
@@ -12263,6 +12282,7 @@ static int proto_chain_has_class_of(tsv proto, tsv home){
    a per-evaluation clone of it). */
 static void typed_slow_check_borrow(tsv fn, tsv thisArg){
   if (!g_struct_methods_len || !ts_is_func(fn)) return;
+  if (!((ts_func*)ts_ptr(fn))->takes_this) return;   /* a struct method reads its this: a function without one is no method (rxjs's project.call) */
   tsv home = struct_method_home(((ts_func*)ts_ptr(fn))->code);
   if (ts_is_undef(home)) return;
   if (ts_is_obj(thisArg)){
@@ -17096,7 +17116,10 @@ tsv ts_get_pic_checked(tsv obj, ts_key key, ts_prop_ic* ic){
   if (TS_TOP16(obj) == TS_SEL_OBJECT){
     ts_object* o = (ts_object*)ts_ptr(obj);
     tsv v;
-    if (ts_obj_is_sized(o) && sized_inherited_cached(o, key, &v) && (!((ts_sized_head*)o)->dyn || !pref_ok(prop_find(o, key)))) return v;
+    if (ts_obj_is_sized(o)){
+      if (sized_inherited_cached(o, key, &v) && (!((ts_sized_head*)o)->dyn || !pref_ok(prop_find(o, key)))) return v;
+      if (sized_absent_cached(o, key)){ RT_STAT_INC(absent_site_hits); return TS_UNDEFINED; }
+    }
   }
   /* a megamorphic site (many classes at one access): a sized receiver's
      field straight from the registry's cache, past the slow path's probes
@@ -17169,7 +17192,7 @@ __attribute__((noinline)) static tsv ts_get_pic_checked_slow(tsv obj, ts_key key
       if (lookup_prop_chain(obj, ts_next_proto(o), key, &inherited)){ RT_STAT_INC(pic_get_inherited); return inherited; }
       RT_STAT_INC(pic_get_absent);
       RT_STAT_KEY(g_key_absent, key);
-      prop_absent_fill(ic, o, key);
+      if (ts_obj_is_sized(o)) sized_absent_fill(o, key); else prop_absent_fill(ic, o, key);
       return TS_UNDEFINED;
     }
   }
@@ -17214,6 +17237,50 @@ static void prop_add_epoch_bump(void){
   g_prop_absent_epoch = g_prop_add_epoch | TS_ABSENT_EPOCH_TAG;
 }
 static inline int prop_epoch_live(void){ return g_prop_add_epoch != TS_PROP_EPOCH_EXHAUSTED; }
+/* An absent read on a sized receiver (yaml's nodes read their `declare`d optional properties, which
+   are no struct fields, on every visit: 8.5 M reads of the parse walked the chain): a (class word,
+   key) record of the chain's shape words, valid while the addition epoch stands (an accessor
+   definition, a relink, a class registration or a full collection moves it), each prototype of the
+   chain is a plain object in its recorded shape (an addition to one changes its shape) and the chain
+   ends after the last one; a receiver with own dynamic properties first shows its map lacks the key.
+   The receiver's own key set is its class word (the plain-object records key their shape, which a
+   sized instance lacks). */
+typedef struct { uint32_t cls; ts_key key; uint32_t epoch; uint32_t depth; uint32_t proto_shape[3]; } ts_sized_absent_entry;
+#define TS_SIZED_ABSENT_SIZE 1024u
+static ts_sized_absent_entry g_sized_absent[TS_SIZED_ABSENT_SIZE];
+static inline ts_sized_absent_entry* sized_absent_slot(uint32_t w, ts_key key){
+  return &g_sized_absent[((w * 0x9E3779B1u) ^ (key * 0x85EBCA6Bu)) >> 22];
+}
+static int sized_absent_cached(ts_object* o, ts_key key){
+  uint32_t w = o->cls;
+  if (w == 0u || (w & TS_CLS_RELINKED) || w == TS_CLS_PROTO || g_class_relinked) return 0;
+  const ts_sized_absent_entry* e = sized_absent_slot(w, key);
+  if (e->cls != w || e->key != key || e->epoch != g_prop_add_epoch) return 0;
+  const ts_object* p = o;
+  for (uint32_t i = 0; i < e->depth; i++){
+    tsv link = p->proto;
+    if (TS_TOP16(link) != TS_SEL_OBJECT) return 0;
+    p = (const ts_object*)ts_ptr(link);
+    if (p->h.kind != TS_KIND_OBJECT || p->shape != e->proto_shape[i]) return 0;
+  }
+  if (ts_proto_ref(p->proto)) return 0;
+  if (((const ts_sized_head*)o)->dyn && pref_ok(prop_find(o, key))) return 0;
+  return 1;
+}
+static void sized_absent_fill(ts_object* o, ts_key key){
+  uint32_t w = o->cls;
+  if (w == 0u || (w & TS_CLS_RELINKED) || w == TS_CLS_PROTO || g_class_relinked) return;
+  if (!g_negative_pic || key >= TS_USERSYM_KEY_BASE || !prop_epoch_live()) return;
+  uint32_t chain_shape[3]; uint32_t depth = 0;
+  for (ts_object* p = ts_next_proto(o); p; p = ts_next_proto(p)){
+    if (depth == 3) return;
+    if (p->h.kind != TS_KIND_OBJECT || ts_obj_shape_id(p) == TS_SHAPE_NONE) return;
+    chain_shape[depth] = p->shape; depth++;
+  }
+  ts_sized_absent_entry* e = sized_absent_slot(w, key);
+  e->cls = w; e->key = key; e->epoch = g_prop_add_epoch; e->depth = depth;
+  for (uint32_t i = 0; i < depth; i++) e->proto_shape[i] = chain_shape[i];
+}
 static inline uint32_t prop_add_slot(const ts_prop_ic* ic, uint32_t shape){
   uintptr_t h = (uintptr_t)ic >> 2;
   h ^= h >> 16;
@@ -19245,7 +19312,7 @@ void ts_await_register_v(tsv pv, tsv cv){
 
 static void coro_init(ts_coro* c, size_t size, tsv (*resume)(tsv)){
   c->state=0; c->resume=resume; c->result=TS_UNDEFINED; c->rejected=0;
-  c->nvals=-1; c->frame_size=size; c->ret=TS_UNDEFINED;
+  c->nvals=-1; c->frame_size=size; c->ret=TS_UNDEFINED; c->iter_result=TS_UNDEFINED;
   c->gen_status=TS_GEN_SUSPENDED_START;
   c->eh_capacity=TS_CORO_EH_INLINE;
   c->eh_catch_state=c->eh_catch_inline;
@@ -20458,6 +20525,7 @@ static void gc_scan_async_cell(ts_gc_header* h, int young, int depth){
     ts_coro* c=(ts_coro*)h;
     gc_visit_slot(&c->result, young, depth, stable);
     gc_visit_slot(&c->yielded, young, depth, stable);
+    gc_visit_slot(&c->iter_result, young, depth, stable);
     for (int i=0;i<c->fin_top;i++) gc_visit_slot(&c->fin_exc[i], young, depth, stable);
     gc_visit_slot(&c->ret, young, depth, stable);
     for (ts_asyncgen_req* r=c->ag_head;r;r=r->next){
@@ -21468,7 +21536,13 @@ static tsv g_gen_return_tag=TS_UNDEFINED;
 static ts_key g_gen_keys[1], g_iter_keys[2];
 static ts_lit_layout g_gen_layout = { 0u, 1u, g_gen_keys, NULL };
 static ts_lit_layout g_iter_layout = { 0u, 2u, g_iter_keys, NULL };
-static void ensure_gen_fields(void){
+static void ensure_gen_fields_slow(void);
+/* the generator fields' keys and the return tag, once: the test in line (every step calls it) */
+static inline void ensure_gen_fields(void){
+  if (TS_RT_LIKELY(F_coro != 0 && !ts_is_undef(g_gen_return_tag))) return;
+  ensure_gen_fields_slow();
+}
+static void ensure_gen_fields_slow(void){
   if (!F_coro){
     F_coro=ts_intern_field("__coro",6);
     F_value=ts_intern_field("value",5);
@@ -21584,6 +21658,8 @@ tsv ts_gen_new_v(tsv cv){
    generator `[Symbol.iterator]()`), so drive it with the generator.next builtin.
    This makes `for...of`/`yield*` over a generator iterator work like spread, without
    regressing class iterators whose `next` lives under a method key. */
+static tsv gen_next_into(tsv genobj, tsv sent, tsv result);   /* the generator step below */
+tsv ts_gen_step(tsv genobj, tsv sent);
 tsv ts_iter_step(tsv iter, tsv sent, ts_key nmk){
   /* The `next` lookups through a four-entry cache (own slot, prototype slot
      or absent, by receiver shape): the Map/Set and array iterators and the
@@ -21634,6 +21710,18 @@ tsv ts_iter_step(tsv iter, tsv sent, ts_key nmk){
   }
   ts_gc_root(&nf);
   tsv r;
+  /* a native generator object stepped by a for...of / yield* / spread driver (its `next` is the
+     prototype's own): the coroutine's scratch result instead of a fresh {value, done} per step. The
+     drivers read done and value at once and never keep the object; gen.next() called by the program
+     (the prototype method) still gets a fresh one. yaml's lexer and parser step a generator per
+     token: the result objects were the minor collections' trigger. */
+  if (ts_is_heap_func(nf) && ((ts_func*)ts_ptr(nf))->code == (ts_code)ts_genproto_next && ts_is_obj(iter)){
+    RT_STAT_INC(iter_step_scratch);
+    r = ts_gen_step(iter, sent);
+    ts_gc_unroot(3);
+    return r;
+  }
+  RT_STAT_INC(iter_step_generic);
   if (ts_is_callable(nf)){
     tsv a[2] = { iter, sent };
     r = ts_call_method(nf, a, 2);
@@ -21645,10 +21733,10 @@ tsv ts_iter_step(tsv iter, tsv sent, ts_key nmk){
 }
 
 /* gen.next(sent) -> { value, done } */
-tsv ts_gen_next(tsv genobj, tsv sent){
-  ensure_gen_fields();
+/* The step shared by gen.next() (a fresh result) and the iteration drivers (the coroutine's scratch
+   result, ts_iter_step): both slots of `result` are written on every path. */
+static tsv gen_next_into(tsv genobj, tsv sent, tsv result){
   ts_gc_root(&genobj); ts_gc_root(&sent);
-  tsv result = gen_result_new();
   ts_gc_root(&result);
   if (!ts_is_obj(genobj)){ ts_lit_store(result, 0, TS_UNDEFINED); ts_lit_store(result, 1, ts_bool(1)); ts_gc_unroot(3); return result; }
   tsv cv = ts_get_ic(genobj, F_coro, &g_ic_coro);
@@ -21695,6 +21783,33 @@ tsv ts_gen_next(tsv genobj, tsv sent){
   }
   ts_gc_unroot(4);
   return result;
+}
+tsv ts_gen_next(tsv genobj, tsv sent){
+  ensure_gen_fields();
+  ts_gc_root(&genobj); ts_gc_root(&sent);
+  tsv result = gen_result_new();
+  ts_gc_unroot(2);
+  return gen_next_into(genobj, sent, result);
+}
+/* A driver's step of a generator object (the for...of, yield* and spread lowerings; emit_c
+   generator.step): the coroutine's own result object, its two slots rewritten each step. The drivers
+   read done and value at once and never keep the object; a generator object that is not one of ours
+   (the type said generator, the value is a custom iterator) steps through its next() as gen.next does. */
+tsv ts_gen_step(tsv genobj, tsv sent){
+  ensure_gen_fields();
+  if (!ts_is_obj(genobj)) return ts_gen_next(genobj, sent);
+  ts_gc_root(&genobj); ts_gc_root(&sent);
+  tsv cv = ts_get_ic(genobj, F_coro, &g_ic_coro);
+  if (!ts_is_coro_value(cv)){ ts_gc_unroot(2); return ts_gen_next(genobj, sent); }
+  ts_gc_root(&cv);
+  if (ts_is_undef(((ts_coro*)ts_ptr(cv))->iter_result)){
+    tsv sr = gen_result_new();
+    ((ts_coro*)ts_ptr(cv))->iter_result = sr;
+    ts_write_barrier(cv, sr);
+  }
+  tsv r = gen_next_into(genobj, sent, ((ts_coro*)ts_ptr(cv))->iter_result);
+  ts_gc_unroot(3);
+  return r;
 }
 
 /* .throw(e) on a (sync) generator: raise e at the paused yield point. If the body

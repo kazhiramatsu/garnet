@@ -10863,3 +10863,26 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   receiver check and the borrowed-method lookup of a call through a function value in line, two
   static strings compared by identity (the literals are shared per program). Clang on this
   platform has no `__builtin_setjmp`, so the try region's setjmp stays. Gates: conformance 625/625 plain and strict, 622/622 under GC protect, unit, bundler 46/46, bench within budget, GC stress.
+- Real projects: the second tuning round, by the counters (Session 354, `docs/real_projects.md`
+  yaml "The second round"). `--rt-stats` on yaml named what the profile only hinted: 13.6 M
+  coroutine frames of 0.8-1.9 KB (30 GB in 6 s; `ts_coro` was 752 bytes, 384 of them two jmp_bufs)
+  and a full-collection threshold that, after the first full collection left 2 MB live, sat within
+  one nursery of the live heap, so every nursery fill ran a full collection (8,472 full, 125 minor,
+  23% of the run). Changes, all A/B'd: the full-collection headroom covers a full nursery
+  (`live + TS_GC_MIN_FULL_BYTES + g_young_cap_bytes`: 150 full / 6,075 minor, pauses 1,369 -> 900
+  ms); an absent-read cache for sized receivers keyed by (class word, key) and validated by the
+  chain's shape words and the addition epoch (yaml reads its `declare`d optional node properties
+  on every visit: 11.2 M hits); the iteration drivers step a known generator through
+  `generator.step` (`ts_gen_step`: the coroutine's own result object, `iter_result`, rewritten
+  each step; `gen.next()` stays fresh; the exporter's `resolveIterator` emits it for sync
+  generators, `ts_iter_step` takes it for a native generator object a dynamic step resolves); the
+  resume function's landing pads are jmp_bufs on its own stack and `TS_CORO_EH_INLINE` is 2:
+  `ts_coro` 752 -> 176 bytes (the frozen emitter names the old fields: the parity oracle diverges
+  on coroutine programs). Within the noise but kept: `ts_check_method_recv` in line,
+  `typed_slow_check_borrow` skipped for a function without `this`, two hashed heap strings
+  compared by hash before any view, `ensure_gen_fields` in line. yaml 5154 -> 4618 ms alternating
+  (-10%; the earlier part of the round measured within the noise, 5382 -> 5410), rxjs 391 -> 385
+  (noise). Counters after: `absent_site hits=11.2 M`, `find_prop` 152 M -> 129 M, frames 23 GB,
+  `prop_pic set` hits still 19.5% (7.8 M slow additions). Next: frame slots only for locals live
+  across a suspension, the addition cache's misses, the regular expressions; and bigint for zod.
+  Gates: conformance 625/625 plain and strict, 622/622 under GC protect, unit, bundler 46/46, bench within budget, GC stress.
