@@ -10886,3 +10886,17 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   `prop_pic set` hits still 19.5% (7.8 M slow additions). Next: frame slots only for locals live
   across a suspension, the addition cache's misses, the regular expressions; and bigint for zod.
   Gates: conformance 625/625 plain and strict, 622/622 under GC protect, unit, bundler 46/46, bench within budget, GC stress.
+- Real projects: the third tuning round, a generator's numeric locals by liveness (Session 354,
+  `docs/real_projects.md` yaml "The third round"). The emitter gave every local of a coroutine a
+  frame slot; yaml's lexer methods carried up to 245 numeric slots per frame, temporaries of a few
+  instructions' life, in 13.6 M frames. `coro_stack_numerics` (emit_c.rs) runs a liveness pass
+  over the flattened body (labels, gotos, suspensions, and the exception edges of the try and
+  finally regions: every node of a region to its landing pad, the finally dispatch to its after
+  label, the outer finally and the abrupt completions' loop labels) and keeps in the frame only the
+  numerics live at a resume point and the parameters; the others are C locals of the resume
+  function (`long long d = 0`, zero as the zeroed slot read; `TSAOT_CORO_STACK_LOCALS=0` keeps
+  every local in the frame). yaml: numeric slots 2,292 -> 235, frames 23.1 -> 15.6 GB, minor
+  collections 6,075 -> 4,295, 4,430 -> 4,244 ms alternating (-4%). Fixture
+  `iteration/numeric_locals_across_yield`. The frames' `tsv` slots (3,022) are the next step of
+  this line (a boxed temporary on the C stack needs the collector to see it across calls).
+  Gates: conformance 626/626 plain and strict, 623/623 under GC protect, unit, bundler 46/46, bench within budget, GC stress.

@@ -13110,12 +13110,231 @@ fn coro_precise_enabled() -> bool {
     })
 }
 
+/// A coroutine's numeric locals (unboxed numbers and integers) whose value never has to survive a
+/// suspension: not live at any resume point (the instruction after a yield or await), so they can be
+/// C locals of the resume function instead of frame slots. The frame then holds the header, the
+/// `tsv` locals and the numerics live across a suspension (yaml's lexer methods carried dozens of
+/// integer temporaries per frame, 13.6 M frames in a parse). A liveness pass over the flattened
+/// body with the exception edges of its try and finally regions (a value read on an exception path
+/// is live at the region's landing pad, which a longjmp reaches: it stays in the frame); the
+/// parameters stay in the frame (the entry copies them there); `TSAOT_CORO_STACK_LOCALS=0` keeps
+/// every local in the frame.
+fn coro_stack_numerics(f: &Function, ctx: &Ctx) -> BTreeSet<u32> {
+    let mut out = BTreeSet::new();
+    if matches!(std::env::var("TSAOT_CORO_STACK_LOCALS").as_deref(), Ok("0") | Ok("false") | Ok("no") | Ok("off")) {
+        return out;
+    }
+    let mut flat: Vec<Flat> = Vec::new();
+    let mut loops: Vec<(u32, u32, u32)> = Vec::new();
+    let mut fins: Vec<FinFrame> = Vec::new();
+    let mut next_label = 0u32;
+    if flatten_cf(&f.body, &mut flat, &mut loops, &mut fins, &mut next_label, 0).is_err() {
+        return out;
+    }
+    let params: BTreeSet<u32> = f.params.iter().map(|p| p.0).collect();
+    let candidates: Vec<u32> = f
+        .locals
+        .iter()
+        .map(|l| l.id.0)
+        .filter(|id| (ctx.int_local.contains(id) || ctx.unboxed.contains(id)) && !params.contains(id))
+        .collect();
+    if candidates.is_empty() {
+        return out;
+    }
+    let n = flat.len();
+    // the jump targets: `L<id>` labels (plain, after-try, finally) and `LC<id>` landing pads
+    let mut label_at: BTreeMap<u32, usize> = BTreeMap::new();
+    let mut catch_at: BTreeMap<u32, usize> = BTreeMap::new();
+    let mut abrupt_targets: Vec<u32> = Vec::new();
+    for (i, fl) in flat.iter().enumerate() {
+        match fl {
+            Flat::Label(l) => { label_at.insert(*l, i); }
+            Flat::AfterLabel { after_label } => { label_at.insert(*after_label, i); }
+            Flat::FinallyLabel { fin_label } => { label_at.insert(*fin_label, i); }
+            Flat::CatchLabel { catch_label, .. } => { catch_at.insert(*catch_label, i); }
+            Flat::FinallyCatchLabel { fin_catch_label, .. } => { catch_at.insert(*fin_catch_label, i); }
+            Flat::FinallyAbrupt { kind, target, .. } if *kind == 3 || *kind == 4 => { abrupt_targets.push(*target); }
+            _ => {}
+        }
+    }
+    // uses and defs per node, over the candidates only; the successors, with the exception edges: every
+    // node inside a try or finally region (from its entry to its landing pad) may throw to the pad, so a
+    // value read on the exception path counts as live there (a C local written after the region's
+    // setjmp would be indeterminate after the longjmp: it stays in the frame by this rule)
+    let mut uses: Vec<BTreeSet<u32>> = vec![BTreeSet::new(); n];
+    let mut defs: Vec<Option<u32>> = vec![None; n];
+    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut open_regions: Vec<u32> = Vec::new();   // the landing pads of the enclosing regions
+    for (i, fl) in flat.iter().enumerate() {
+        let next = if i + 1 < n { Some(i + 1) } else { None };
+        match fl {
+            Flat::CatchLabel { catch_label, .. } => { open_regions.retain(|c| c != catch_label); }
+            Flat::FinallyCatchLabel { fin_catch_label, .. } => { open_regions.retain(|c| c != fin_catch_label); }
+            _ => {}
+        }
+        for c in &open_regions {
+            if let Some(&t) = catch_at.get(c) {
+                succs[i].push(t);
+            }
+        }
+        match fl {
+            Flat::Inst(inst) | Flat::Suspend(inst) => {
+                for &c in &candidates {
+                    let one: BTreeSet<u32> = [c].into_iter().collect();
+                    if inst_uses_any(inst, &one) {
+                        uses[i].insert(c);
+                    }
+                }
+                defs[i] = inst_def(inst);
+                if let Some(nx) = next {
+                    succs[i].push(nx);
+                }
+            }
+            Flat::Ret(src) => {
+                if let Some(sv) = src {
+                    if candidates.contains(&sv.0) {
+                        uses[i].insert(sv.0);
+                    }
+                }
+            }
+            Flat::Goto(l) => {
+                if let Some(&t) = label_at.get(l) {
+                    succs[i].push(t);
+                }
+            }
+            Flat::GotoIfFalse(c, l) => {
+                if candidates.contains(c) {
+                    uses[i].insert(*c);
+                }
+                if let Some(nx) = next {
+                    succs[i].push(nx);
+                }
+                if let Some(&t) = label_at.get(l) {
+                    succs[i].push(t);
+                }
+            }
+            Flat::TryEnter { catch_label } => {
+                open_regions.push(*catch_label);
+                if let Some(&t) = catch_at.get(catch_label) {
+                    succs[i].push(t);
+                }
+                if let Some(nx) = next {
+                    succs[i].push(nx);
+                }
+            }
+            Flat::FinallyEnterTry { fin_catch_label } => {
+                open_regions.push(*fin_catch_label);
+                if let Some(&t) = catch_at.get(fin_catch_label) {
+                    succs[i].push(t);
+                }
+                if let Some(nx) = next {
+                    succs[i].push(nx);
+                }
+            }
+            Flat::TryNormalExit { after_label } => {
+                if let Some(&t) = label_at.get(after_label) {
+                    succs[i].push(t);
+                }
+            }
+            Flat::InCoroThrow { src } => {
+                if candidates.contains(&src.0) {
+                    uses[i].insert(src.0);
+                }
+            }
+            Flat::FinallyGotoNormal { fin_label } => {
+                if let Some(&t) = label_at.get(fin_label) {
+                    succs[i].push(t);
+                }
+            }
+            Flat::FinallyCatchLabel { fin_label, .. } => {
+                if let Some(&t) = label_at.get(fin_label) {
+                    succs[i].push(t);
+                }
+            }
+            Flat::FinallyAbrupt { value, fin_label, .. } => {
+                if let Some(v) = value {
+                    if candidates.contains(&v.0) {
+                        uses[i].insert(v.0);
+                    }
+                }
+                if let Some(&t) = label_at.get(fin_label) {
+                    succs[i].push(t);
+                }
+            }
+            Flat::FinallyDispatch { after_label, outer_fin } => {
+                // normal completion to after; a pending abrupt completion to the outer finally or to
+                // the loop label it names; a pending throw to the enclosing landing pads (added above)
+                if let Some(&t) = label_at.get(after_label) {
+                    succs[i].push(t);
+                }
+                if let Some(of) = outer_fin {
+                    if let Some(&t) = label_at.get(of) {
+                        succs[i].push(t);
+                    }
+                }
+                for tgt in &abrupt_targets {
+                    if let Some(&t) = label_at.get(tgt) {
+                        succs[i].push(t);
+                    }
+                }
+            }
+            _ => {
+                // Label, AfterLabel, FinallyLabel, CatchLabel, TryLeave: fall through
+                if let Some(nx) = next {
+                    succs[i].push(nx);
+                }
+            }
+        }
+    }
+    // backward liveness to a fixpoint
+    let mut live_in: Vec<BTreeSet<u32>> = vec![BTreeSet::new(); n];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for i in (0..n).rev() {
+            let mut out_set: BTreeSet<u32> = BTreeSet::new();
+            for &sidx in &succs[i] {
+                out_set.extend(live_in[sidx].iter().copied());
+            }
+            if let Some(d) = defs[i] {
+                out_set.remove(&d);
+            }
+            out_set.extend(uses[i].iter().copied());
+            if out_set != live_in[i] {
+                live_in[i] = out_set;
+                changed = true;
+            }
+        }
+    }
+    // a candidate live at a resume point (the node after a suspension, less the value the resume
+    // itself defines) must stay in the frame
+    let mut frame_bound: BTreeSet<u32> = BTreeSet::new();
+    for (i, fl) in flat.iter().enumerate() {
+        if let Flat::Suspend(inst) = fl {
+            if i + 1 < n {
+                for &c in &live_in[i + 1] {
+                    if inst_def(inst) != Some(c) {
+                        frame_bound.insert(c);
+                    }
+                }
+            }
+        }
+    }
+    for c in candidates {
+        if !frame_bound.contains(&c) {
+            out.insert(c);
+        }
+    }
+    out
+}
+
 /// The frame struct of a coroutine: the `ts_coro` header, then the locals.
 /// With the frame map the `tsv` locals come first and their count is returned
 /// for the allocator, so the collector visits exactly those words
 /// (docs/gc_v2_design.md §6.5 step 2b); without it (`None`) the locals keep
-/// their declaration order and the frame is scanned conservatively.
-fn emit_coro_frame_struct(s: &mut String, f: &Function, ctx: &Ctx, fname: &str) -> Option<usize> {
+/// their declaration order and the frame is scanned conservatively. The
+/// numerics in `stack` (coro_stack_numerics) are the resume function's own.
+fn emit_coro_frame_struct(s: &mut String, f: &Function, ctx: &Ctx, fname: &str, stack: &BTreeSet<u32>) -> Option<usize> {
     let _ = writeln!(s, "typedef struct {}_frame {{ ts_coro c;", fname);
     let numeric = |id: u32| ctx.int_local.contains(&id) || ctx.unboxed.contains(&id);
     let field = |s: &mut String, id: u32| {
@@ -13133,18 +13352,50 @@ fn emit_coro_frame_struct(s: &mut String, f: &Function, ctx: &Ctx, fname: &str) 
             field(s, l.id.0);
             n += 1;
         }
-        for l in f.locals.iter().filter(|l| numeric(l.id.0)) {
+        for l in f.locals.iter().filter(|l| numeric(l.id.0) && !stack.contains(&l.id.0)) {
             field(s, l.id.0);
         }
         Some(n)
     } else {
-        for l in &f.locals {
+        for l in f.locals.iter().filter(|l| !stack.contains(&l.id.0)) {
             field(s, l.id.0);
         }
         None
     };
     let _ = writeln!(s, "}} {}_frame;", fname);
     nvals
+}
+/// The resume function's view of the locals: a frame slot behind a macro, or, for a numeric that
+/// never survives a suspension, a C local (zero, as the zeroed frame slot read).
+fn emit_coro_local_defines(s: &mut String, f: &Function, ctx: &Ctx, stack: &BTreeSet<u32>) {
+    for l in &f.locals {
+        let id = l.id.0;
+        if ctx.int_local.contains(&id) || ctx.unboxed.contains(&id) {
+            if stack.contains(&id) {
+                if ctx.int_local.contains(&id) || (int32_codegen_enabled() && ctx.int32_use.contains(&id)) {
+                    let _ = writeln!(s, "  long long d{} = 0;", id);
+                } else {
+                    let _ = writeln!(s, "  double d{} = 0;", id);
+                }
+            } else {
+                let _ = writeln!(s, "#define d{} (_fr->d{})", id, id);
+            }
+        } else {
+            let _ = writeln!(s, "#define v{} (_fr->v{})", id, id);
+        }
+    }
+}
+fn emit_coro_local_undefs(s: &mut String, f: &Function, ctx: &Ctx, stack: &BTreeSet<u32>) {
+    for l in &f.locals {
+        let id = l.id.0;
+        if ctx.int_local.contains(&id) || ctx.unboxed.contains(&id) {
+            if !stack.contains(&id) {
+                let _ = writeln!(s, "#undef d{}", id);
+            }
+        } else {
+            let _ = writeln!(s, "#undef v{}", id);
+        }
+    }
 }
 
 /// The coroutine frame; a promise-backed mode (an async function, an async generator) takes the
@@ -13173,28 +13424,17 @@ fn emit_async_function(s: &mut String, f: &Function, ctx: &Ctx) {
     let fname = cname(f);
     // Frame struct: header (ts_coro) + all locals as named fields (the tsv
     // locals first, with the frame map).
-    let nvals = emit_coro_frame_struct(s, f, ctx, &fname);
+    let stack = coro_stack_numerics(f, ctx);
+    let nvals = emit_coro_frame_struct(s, f, ctx, &fname, &stack);
 
     // resume function
     let _ = writeln!(s, "static tsv {}_resume(tsv _cv){{", fname);
     let _ = writeln!(s, "  {}_frame* _fr = ({}_frame*)ts_ptr(_cv);", fname, fname);
     // #define each local to the frame field, so emit_inst output is unchanged.
-    for l in &f.locals {
-        if ctx.int_local.contains(&l.id.0) || ctx.unboxed.contains(&l.id.0) {
-            let _ = writeln!(s, "#define d{} (_fr->d{})", l.id.0, l.id.0);
-        } else {
-            let _ = writeln!(s, "#define v{} (_fr->v{})", l.id.0, l.id.0);
-        }
-    }
+    emit_coro_local_defines(s, f, ctx, &stack);
     emit_sm_resume_body(s, f, ctx, SmMode::Async);
     // undef the local macros
-    for l in &f.locals {
-        if ctx.int_local.contains(&l.id.0) || ctx.unboxed.contains(&l.id.0) {
-            let _ = writeln!(s, "#undef d{}", l.id.0);
-        } else {
-            let _ = writeln!(s, "#undef v{}", l.id.0);
-        }
-    }
+    emit_coro_local_undefs(s, f, ctx, &stack);
     s.push_str("}\n");
 
     // public entry: allocate frame, copy args into param fields, run resume once,
@@ -13219,25 +13459,14 @@ fn emit_async_function(s: &mut String, f: &Function, ctx: &Ctx) {
 fn emit_generator_function(s: &mut String, f: &Function, ctx: &Ctx) {
     let fname = cname(f);
     // Frame struct (identical layout to async).
-    let nvals = emit_coro_frame_struct(s, f, ctx, &fname);
+    let stack = coro_stack_numerics(f, ctx);
+    let nvals = emit_coro_frame_struct(s, f, ctx, &fname, &stack);
 
     let _ = writeln!(s, "static tsv {}_resume(tsv _cv){{", fname);
     let _ = writeln!(s, "  {}_frame* _fr = ({}_frame*)ts_ptr(_cv);", fname, fname);
-    for l in &f.locals {
-        if ctx.int_local.contains(&l.id.0) || ctx.unboxed.contains(&l.id.0) {
-            let _ = writeln!(s, "#define d{} (_fr->d{})", l.id.0, l.id.0);
-        } else {
-            let _ = writeln!(s, "#define v{} (_fr->v{})", l.id.0, l.id.0);
-        }
-    }
+    emit_coro_local_defines(s, f, ctx, &stack);
     emit_sm_resume_body(s, f, ctx, SmMode::Generator);
-    for l in &f.locals {
-        if ctx.int_local.contains(&l.id.0) || ctx.unboxed.contains(&l.id.0) {
-            let _ = writeln!(s, "#undef d{}", l.id.0);
-        } else {
-            let _ = writeln!(s, "#undef v{}", l.id.0);
-        }
-    }
+    emit_coro_local_undefs(s, f, ctx, &stack);
     s.push_str("}\n");
 
     // public entry: allocate frame, copy args, return a generator object WITHOUT
@@ -13256,25 +13485,14 @@ fn emit_generator_function(s: &mut String, f: &Function, ctx: &Ctx) {
 fn emit_asyncgen_function(s: &mut String, f: &Function, ctx: &Ctx) {
     let fname = cname(f);
     // Frame struct (identical layout to async/generator).
-    let nvals = emit_coro_frame_struct(s, f, ctx, &fname);
+    let stack = coro_stack_numerics(f, ctx);
+    let nvals = emit_coro_frame_struct(s, f, ctx, &fname, &stack);
 
     let _ = writeln!(s, "static tsv {}_resume(tsv _cv){{", fname);
     let _ = writeln!(s, "  {}_frame* _fr = ({}_frame*)ts_ptr(_cv);", fname, fname);
-    for l in &f.locals {
-        if ctx.int_local.contains(&l.id.0) || ctx.unboxed.contains(&l.id.0) {
-            let _ = writeln!(s, "#define d{} (_fr->d{})", l.id.0, l.id.0);
-        } else {
-            let _ = writeln!(s, "#define v{} (_fr->v{})", l.id.0, l.id.0);
-        }
-    }
+    emit_coro_local_defines(s, f, ctx, &stack);
     emit_sm_resume_body(s, f, ctx, SmMode::AsyncGenerator);
-    for l in &f.locals {
-        if ctx.int_local.contains(&l.id.0) || ctx.unboxed.contains(&l.id.0) {
-            let _ = writeln!(s, "#undef d{}", l.id.0);
-        } else {
-            let _ = writeln!(s, "#undef v{}", l.id.0);
-        }
-    }
+    emit_coro_local_undefs(s, f, ctx, &stack);
     s.push_str("}\n");
 
     // public entry: lazy — allocate frame, copy args, return an async-generator

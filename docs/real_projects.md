@@ -225,9 +225,10 @@ by identity).
 | the rxjs changes (unchanged, as expected) | 5945 | 1327 | 4.5 |
 | a sync generator's frame without a promise; the generator object and the iteration result in their layouts | 4980 | 1327 | 3.75 |
 | the second round (below): the full-collection pacing, the absent-read cache of class instances, the drivers' scratch result, a 176-byte smaller coroutine header | 4618 | 1439 | 3.2 |
+| the third round: a generator's numeric locals in the frame only when live across a suspension | 4244 | 1300 | 3.3 |
 
-(the last row's A/B ran on a slower machine state, Node included: 5154 against 4618 alternating, a 10%
-gain; the ratio uses that run's Node time.)
+(the second row's A/B ran on a slower machine state, Node included: 5154 against 4618 alternating, a 10%
+gain; the third's: 4430 against 4244, 4%; each ratio uses its own run's Node time.)
 
 (alternating A/B, five runs each: 5944.9 against 4980.2.) The sync generator entry allocates its
 frame through `ts_coro_alloc_gen_v/_vn` (no `ret` promise: its results are plain objects and an
@@ -271,8 +272,16 @@ After it (4,799 ms for 300 rounds, 5,205 before): the collector 12% (the frames 
 generator's every local has a frame slot, dozens of `long long` slots in the lexer's methods), the
 regular expressions 4%, property reads 5%, `===` on strings 2%, the generator protocol itself 6%,
 and property additions that miss their cache (`prop_pic set` 19.5% hits, 7.8 M slow additions).
-Next: frame slots only for the locals live across a suspension (the others as C locals of the
-resume function), then the addition cache's misses and the regular expressions.
+The third round took the frames' numeric slots: the emitter had given every local of a generator or
+async function a frame slot (the lexer's methods: 245, 168, 163 numeric slots in one frame each,
+mostly `long long` temporaries of a few instructions' life). A liveness pass over the flattened body
+(`coro_stack_numerics`, with the exception edges of the try and finally regions the `yield*`
+lowering emits around every delegation step) keeps in the frame only the numerics live at a resume
+point; the others are C locals of the resume function, zero at entry as the zeroed slot read. yaml's
+numeric frame slots 2,292 -> 235, the frames 23.1 -> 15.6 GB, the minor collections 6,075 -> 4,295;
+4,430 -> 4,244 ms alternating. The `tsv` slots (3,022) remain: a boxed temporary on the C stack
+needs the collector to see it across calls (the precise frame of an ordinary function), the next step
+of this line. Then the addition cache's misses and the regular expressions.
 
 ## prisma
 
