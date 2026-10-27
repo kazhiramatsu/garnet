@@ -22,6 +22,12 @@
 #   TSAOT_PGO              auto (default: apply a default.pgo next to the entry
 #                          file or the tsconfig) | off | <profile file>.
 #   TSAOT_ANALYZER         rust (default) | ts (frozen twin) | native.
+#   TSAOT_DEFINE           "NAME=value,..." build-time constants (true/false, a number,
+#                          a quoted string): an ambient identifier so named folds to the
+#                          constant and a condition it decides compiles only the branch
+#                          taken (a bundler's define; vue's __DEV__ and __BROWSER__).
+#   TSAOT_CONST_FN_DIRECT=0  Call a module-level `const f = () => ...` through its
+#                          value instead of directly.
 #   TSAOT_PROP_PIC=0       Disable production-default property PIC emission.
 #   TSAOT_FRAME_ROOTS=0    Disable production-default batched GC root frames.
 #   TSAOT_PRETENURE=0      Disable escape-guided old-generation allocation.

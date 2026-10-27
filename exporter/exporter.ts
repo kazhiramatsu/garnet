@@ -604,6 +604,11 @@ class Exporter {
   /// reads args[0] as this). Direct calls to these must prepend an undefined this.
   funcTakesThisIds = new Set<number>();
   moduleVars = new Set<ts.Symbol>();
+  /** A module-level `const f = (...) => ...` (or function expression) that reads neither `this` nor
+   *  `arguments` and captures nothing: a call of `f` is a direct call of its function (the binding
+   *  is read first where the call may run before the declaration, the TDZ). Modern TypeScript
+   *  declares most helpers this way (vue's isObject, hasOwn, isRef: a function-value call each). */
+  constFnSymbols = new Map<ts.Symbol, number>();
   scriptGlobalVarSyms = new Set<ts.Symbol>();
   scriptGlobalVarNames = new Set<string>();
   moduleTopBindingByName = new Map<string, ts.Symbol>();
@@ -2196,10 +2201,26 @@ class Exporter {
     walk(sf);
     for (const stmt of sf.statements) {
       if (ts.isVariableStatement(stmt) && !(stmt.flags & AMBIENT_NODE_FLAG)) {
+        const isConst = (stmt.declarationList.flags & ts.NodeFlags.Const) !== 0;
         for (const d of stmt.declarationList.declarations) {
           if (ts.isIdentifier(d.name)) {
             const s = this.symbolOf(d.name);
             if (s) this.moduleVars.add(s);
+            if (s && isConst && d.initializer && process.env.TSAOT_CONST_FN_DIRECT !== "0") {
+              const init = this.unwrapExpr(d.initializer);
+              const fid = this.fnId.get(init);
+              if (fid !== undefined && (ts.isArrowFunction(init) || ts.isFunctionExpression(init)) &&
+                  !init.asteriskToken && !(ts.getCombinedModifierFlags(init) & ts.ModifierFlags.Async) &&
+                  !(ts.isFunctionExpression(init) && init.name) &&
+                  !(ts.isArrowFunction(init) ? this.arrowUsesThis(init) : this.fnUsesOwnThis(init)) &&
+                  !(init.body && this.bodyUsesArguments(init.body))) {
+                // its only possible capture is the module's scope record (a module-level binding lives
+                // there), which the direct call threads as it does for a function declaration; the
+                // free variables are not computed here (the capture analysis runs later, and its
+                // cache must not see an early answer)
+                this.constFnSymbols.set(s, fid);
+              }
+            }
           }
         }
       }
@@ -5889,6 +5910,13 @@ class Exporter {
           // The lexical name of a named function expression denotes this exact
           // lifted function. The regular Direct-call path below threads captures.
           callee = { kind: "Direct", func: ctx.id };
+        } else if (sym && this.constFnSymbols.has(sym)) {
+          // a module-level `const f = (...) => ...` without `this`, `arguments` or captures: its
+          // function, called directly; the binding is read first where the call may precede the
+          // declaration (a ReferenceError then, as V8 throws in the TDZ)
+          const fv = this.lowerExpr(ctx, fn);
+          this.checkClassBindingInitialized(ctx, fn, fv);
+          callee = { kind: "Direct", func: this.constFnSymbols.get(sym)! };
         } else {
           // An identifier that is NOT a known top-level function: it may be a
           // local/param holding a first-class function value (a closure). Lower

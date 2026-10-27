@@ -11003,3 +11003,18 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   extracted; neutral on vue, which writes mostly through arrays). (3) `proxy_trap_key`: the trap
   names interned once. (4) `Object.prototype.toString`'s fixed tags as static cells (`TS_TAG_STATIC`;
   vue's `toRawType` on every wrapped value); 1,614 -> 1,578 with the pre-hashing. Gates: conformance 637/637 plain and strict, 634/634 under GC protect (the next slice's two fixtures, written during the run, excluded), unit, bundler 48/48, bench within budget, GC stress.
+- Direct calls of module-level const functions (Session 354, `docs/real_projects.md` "vue"). A
+  module-level `const f = (...) => ...` (or a function expression) that reads neither `this` nor
+  `arguments`, is not async or a generator and is not reassigned (a `const`) is a direct callee
+  (`constFnSymbols`, filled by the module walk; the call lowering emits `Direct` with the function's
+  id, threading the module scope record as it does for a function declaration). Modern TypeScript
+  declares most helpers this way (vue's `@vue/shared`: `isObject`, `hasOwn`, `isRef`...), and each
+  call had gone through the function value (the closure's generic entry, boxed arguments). The TDZ
+  is kept: the binding is read and checked (`binding.check`, a ReferenceError before the declaration
+  ran, as V8 throws) unless the declaration precedes the call in the same scope. The first version
+  computed the callee's free variables during the module walk, before the capture analysis, and
+  poisoned its cache (the arrow lost its module record: `fact` recursing read undefined); the walk
+  records candidates only. `TSAOT_CONST_FN_DIRECT=0` keeps the value calls. A/B: vue 1,617 -> 1,569 ms, yaml 3,585 -> 3,546 ms, rxjs 381.7 -> 381.5 ms alternating against the previous binaries (outputs identical).
+  Fixtures: `functions/const_arrow_direct_call` (the TDZ, recursion, a function expression, the
+  binding as a value and in a table, arrows that read `this` or capture a local), bundler
+  `const_arrow_import` (helpers imported and re-exported, a TDZ inside a module's init). Gates: conformance 638/638 plain and strict, 635/635 under GC protect, unit, bundler 49/49, bench within budget, GC stress.

@@ -15,7 +15,10 @@ prints each run's time and the medians: the form every tuning change here is mea
 TypeScript (`benchmarks/real/transpile_tree.js`: `.ts` to `.mjs`, specifiers rewritten, a bare
 specifier through `garnet-paths.json` when the project maps workspace packages), runs both inside
 the clone, compares their stdout (the driver prints a checksum of its results) and prints the
-median of `runs` timings each driver reports on stderr.
+median of `runs` timings each driver reports on stderr. A project may add `env.sh` (sourced first:
+`TSAOT_DEFINE`, the build-time constants both engines see), `stubs/` (stand-ins for third-party
+modules the benchmark configuration never calls, copied into the clone as `garnet-stubs/`) and
+`types.txt` (npm typings the stubs re-export, installed once under the clone's `garnet-types/`).
 
 ## What the projects taught garnet (session 353)
 
@@ -418,6 +421,7 @@ names its phase.
 | a field key's canonical string, the trap invariants' fast exit, the trap names' keys | 1,606 | | |
 | a Proxy receiver's set landing on its target (no descriptor objects) | 1,614 (noise) | | |
 | the canonical strings pre-hashed, the toString tags as static cells | 1,578 | 758 | 2.1 |
+| direct calls of module-level const functions (`@vue/shared`'s helpers) | 1,569 | 766 | 2.0 |
 
 The first run is the correctness milestone. The first tuning round (alternating A/B against the
 previous binary each time) took the reactivity phase from 1,749 to 1,030 ms:
@@ -439,7 +443,10 @@ previous binary each time) took the reactivity phase from 1,749 to 1,030 ms:
 
 The profile after the round: vue's `get` trap itself (8%), the dynamic property reads inside it
 (`ts_get_pic_checked`, `prop_find`, `lookup_prop_chain`), the Map lookups of `track`, and the calls
-of `@vue/shared`'s helpers, which are module-level `const f = (...) => ...` bindings and so go through
-a function value (the next round's target: a direct call for a const arrow that never moves). The other projects did not
+of `@vue/shared`'s helpers, which were module-level `const f = (...) => ...` bindings called through a
+function value. Those are direct calls now (a const function that reads neither `this` nor
+`arguments` is called like a function declaration, its TDZ kept by a binding check): vue 1,617 ->
+1,569 ms, yaml 3,585 -> 3,546 ms, rxjs unchanged. The remaining gap is the trap dispatch itself: the
+`get` trap's body, the dynamic property reads inside it and the Map lookups of `track` / `trigger`. The other projects did not
 move: yaml 3,570 -> 3,575 ms and rxjs 383.9 -> 384.0 ms alternating against the previous binaries
 (the new tests sit in the typed entries' non-array branches and at a loop's entry).
