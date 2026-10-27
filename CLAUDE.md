@@ -122,6 +122,11 @@ Rust in §315; selfhost is kept as a performance metric).
   maps it). `Array.isArray(arguments)` is true and it has the Array methods, where V8's Arguments
   object has `Object.prototype` (Session 354 vue note). Not available in arrow functions or
   coroutines (a compile-time reject).
+- An ordinary (non-const) enum's member with a constant value is read as that constant at every
+  `E.A` / `E["A"]` site (Session 355), as TypeScript inlines const enum members: a write to the enum
+  object through `any` (`(E as any).A = 5`) is not seen by those reads, and a read before the enum's
+  module has evaluated (an import cycle) gives the constant where V8 throws. The enum object itself
+  is intact for `Object.keys(E)`, `E[0]` and a variable key. `TSAOT_ENUM_FOLD=0` keeps the loads.
 - A typed receiver that is a Proxy (vue's reactive arrays and collections) takes its methods through
   the traps, but a typed `for..of` over one, and a cursor `for..of` over a Proxy of a Map or Set,
   walk a snapshot taken through the iteration protocol at loop entry (elements added during the

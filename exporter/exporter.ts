@@ -3546,11 +3546,6 @@ class Exporter {
     }
     return value;
   }
-  /** `E.A` / `E["A"]` on a `const enum` folds to the checker's constant. This is
-   *  exactly the set TypeScript's own emit inlines (`getConstantValue` answers
-   *  only for const enum members), so the member object is never observed and
-   *  the receiver, an entity name, has no side effects to preserve. Non-const
-   *  enums keep their runtime object and the ordinary field load. */
   /** A parameter that receives a captured-variable cell is typed with the
    *  synthetic cell class so its `__value` accesses use the struct layout. */
   private markCellParam(ctx: FnCtx, lid: number): void {
@@ -3558,13 +3553,38 @@ class Exporter {
     (ctx.paramClasses ??= {})[lid] = this.cellClassId;
   }
 
+  /** `E.A` / `E["A"]` on an enum member with a constant value folds to that constant. TypeScript's
+   *  own emit inlines const enum members only (`getConstantValue` on the access answers for those
+   *  alone); garnet folds an ordinary enum's literal members the same way: the program is typed, so
+   *  the member is read-only in it and the enum object's property can only ever hold the declared
+   *  value, and the receiver, an entity name, has no side effects to preserve. The enum object itself
+   *  stays for the reflective uses (`Object.keys(E)`, `E[0]`). A computed member keeps its field
+   *  load, and so does a member of an ambient (`declare`) enum, whose object comes from outside the
+   *  program. `TSAOT_ENUM_FOLD=0` keeps the field loads of the ordinary enums. */
   private constEnumMemberValue(node: ts.PropertyAccessExpression | ts.ElementAccessExpression): number | string | undefined {
     if (ts.isOptionalChain(node)) return undefined;
     let value: string | number | undefined;
     try { value = this.checker.getConstantValue(node); } catch { return undefined; }
+    if (value === undefined && process.env.TSAOT_ENUM_FOLD !== "0") value = this.plainEnumMemberValue(node);
     if (typeof value === "string") return value;
     if (typeof value === "number" && Number.isFinite(value) && !Object.is(value, -0)) return value;
     return undefined;
+  }
+  /** The constant of an ordinary enum's member named by `E.A` or `E["A"]` (undefined when the
+   *  member is computed, the enum ambient, or the node not such an access). */
+  private plainEnumMemberValue(node: ts.PropertyAccessExpression | ts.ElementAccessExpression): number | string | undefined {
+    const isEntityName = (e: ts.Expression): boolean =>
+      ts.isIdentifier(e) || (ts.isPropertyAccessExpression(e) && ts.isIdentifier(e.name) && isEntityName(e.expression));
+    if (!isEntityName(node.expression)) return undefined;
+    const nameNode = ts.isPropertyAccessExpression(node) ? node.name : node.argumentExpression;
+    if (!ts.isPropertyAccessExpression(node) && !ts.isStringLiteralLike(nameNode)) return undefined;
+    let sym: ts.Symbol | undefined;
+    try { sym = this.checker.getSymbolAtLocation(nameNode); } catch { return undefined; }
+    if (!sym || !(sym.flags & ts.SymbolFlags.EnumMember)) return undefined;
+    const decl = sym.valueDeclaration;
+    if (!decl || !ts.isEnumMember(decl) || !ts.isEnumDeclaration(decl.parent)) return undefined;
+    if (ts.getCombinedModifierFlags(decl.parent) & ts.ModifierFlags.Ambient) return undefined;
+    try { return this.checker.getConstantValue(decl); } catch { return undefined; }
   }
 
   private lowerEnumConstant(ctx: FnCtx, value: number | string, hint?: string): number {

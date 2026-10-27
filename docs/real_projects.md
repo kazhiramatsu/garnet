@@ -422,6 +422,7 @@ names its phase.
 | a Proxy receiver's set landing on its target (no descriptor objects) | 1,614 (noise) | | |
 | the canonical strings pre-hashed, the toString tags as static cells | 1,578 | 758 | 2.1 |
 | direct calls of module-level const functions (`@vue/shared`'s helpers) | 1,569 | 766 | 2.0 |
+| an ordinary enum's members folded to their constants (`ReactiveFlags`, `TrackOpTypes`, the compiler's `NodeTypes`) | 1,342 | 767 | 1.75 |
 
 The first run is the correctness milestone. The first tuning round (alternating A/B against the
 previous binary each time) took the reactivity phase from 1,749 to 1,030 ms:
@@ -450,3 +451,22 @@ function value. Those are direct calls now (a const function that reads neither 
 `get` trap's body, the dynamic property reads inside it and the Map lookups of `track` / `trigger`. The other projects did not
 move: yaml 3,570 -> 3,575 ms and rxjs 383.9 -> 384.0 ms alternating against the previous binaries
 (the new tests sit in the typed entries' non-array branches and at a loop's entry).
+
+### The second round: the enum members
+
+The profile after the direct calls (`sample` over the production build) put 35% of the run inside
+vue's `get` trap, and the trap's own body (6.7% self) began with five comparisons of the key
+against `ReactiveFlags.SKIP`, `IS_REACTIVE`, `IS_READONLY`, `IS_SHALLOW` and `RAW`. `ReactiveFlags`
+is an ordinary (non-const) `enum`, and garnet folded only const enum members, exactly the set
+TypeScript's own emit inlines: each comparison loaded the constants module's scope record, read the
+enum object out of it, read the member through a property cache and compared two strings by
+content. The whole compiler phase does the same with `NodeTypes.ELEMENT`, `ElementTypes`,
+`ConstantTypes` and `PatchFlags` on every node it visits, and every `track()` passes
+`TrackOpTypes.GET` the same way. An ordinary enum's literal members fold now
+(`plainEnumMemberValue`, exporter.ts): the program is typed, so a member is read-only in it and
+the enum object's property can only ever hold the declared value; the object itself stays for the
+reflective uses (`Object.keys(E)`, `E[0]`, `E[k]` with a variable key), a computed member keeps its
+field load, and a `declare`d enum, whose object comes from outside the program, is left alone.
+vue 1,565 -> 1,342 ms alternating (Node 767: 2.0x -> 1.75x); the comparisons became literal
+compares (a short immediate or a static cell against the trap's canonical key string), and the
+numeric switches over `node.type` became C switches.

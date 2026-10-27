@@ -11018,3 +11018,37 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   Fixtures: `functions/const_arrow_direct_call` (the TDZ, recursion, a function expression, the
   binding as a value and in a table, arrows that read `this` or capture a local), bundler
   `const_arrow_import` (helpers imported and re-exported, a TDZ inside a module's init). Gates: conformance 638/638 plain and strict, 635/635 under GC protect, unit, bundler 49/49, bench within budget, GC stress.
+
+## Session 355 (2026-10-28): real projects, vue's second round (the enum members, the constant keys)
+
+- Real projects, vue's second tuning round: the enum members (Session 355, `docs/real_projects.md`
+  vue "The second round"). The profile after the direct calls (`sample` on the `--profile` build,
+  `build/real/vue-work/profile.sample`; a flat view by leaf and a caller/callee tree are in the
+  scratchpad's `sample_tree.py`) put 35% of the run inside vue's `get` trap and 6.7% in its own
+  body, which begins with five comparisons of the key against `ReactiveFlags.SKIP`, `IS_REACTIVE`,
+  `IS_READONLY`, `IS_SHALLOW` and `RAW`: `ReactiveFlags` is an ordinary enum, and the exporter folded
+  only const enum members (`checker.getConstantValue` on an access answers for those alone, the set
+  tsc inlines), so each comparison loaded the constants module's scope record, the enum object out
+  of it, the member through a property cache, and compared two strings by content. The compiler
+  phase does the same on every node (`NodeTypes.ELEMENT`, `ElementTypes`, `ConstantTypes`,
+  `PatchFlags`), and each `track()` passes `TrackOpTypes.GET` the same way. An ordinary enum's
+  literal members fold now (`plainEnumMemberValue`, exporter.ts: the member symbol of `E.A` /
+  `E["A"]` on an entity-name receiver, its declaration's `getConstantValue`; a computed member keeps
+  its field load, an ambient `declare enum` is left alone, `TSAOT_ENUM_FOLD=0` keeps the loads). The
+  enum object stays for `Object.keys(E)`, `E[0]` and a variable key. Deviation (CLAUDE.md known
+  items): a write to the enum object through `any` is not seen by the folded reads, and a read
+  before the enum's module evaluated (an import cycle) gives the constant where V8 throws. vue
+  1,565.5 -> 1,342.4 ms alternating (Node 766.8: 2.0x -> 1.75x; the key comparisons are literal
+  compares, the numeric switches over `node.type` C switches), rxjs 384.5 -> 385.8 and yaml 3,579.6
+  -> 3,581.8 (unchanged: rxjs has one enum in a cold path, yaml none), outputs identical. tsc-ts
+  (35 ordinary enums, `ScriptTarget`, `ModuleKind`, ...): 22.150 -> 22.111 G instructions (-0.18%), cycles -0.4%, wall 1.16 s both, outputs identical (three alternating rounds of two plain builds, `TSAOT_PGO=off`; the A/B needs `--singleThreaded`, a forked checker's instructions are not in the parent's rusage). Fixtures:
+  `types/enum_member_fold` (string and numeric members, a computed member, a namespace's enum, the
+  reflective reads, computed property names, template and arithmetic uses), bundler
+  `enum_member_cross` (members imported by name and through a namespace import). `scripts/tsc_ts_insn_ab.sh`
+  is the instruction-count A/B of two tsc-ts builds (the lost scratchpad script, kept in the repo
+  now: `/usr/bin/time -l`'s "instructions retired" and "cycles elapsed", alternating, outputs
+  compared). Gates: conformance 639/639 plain and strict, 636/636 under GC protect, unit, bundler
+  50/50, bench within budget. selfconf and parity were run too: both fail at HEAD as before the
+  change (parity: every program differs from the frozen twin at the prelude's
+  `ts_fnval_array_isArray`; selfconf: 15 CCFAIL on the frozen emitter's `reject_buf` of the old
+  `ts_coro`, 3 DIFF), with the fold on and off alike (`build/gates_s355/`).
