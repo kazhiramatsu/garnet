@@ -4,7 +4,8 @@
 // hosts, default ports, live searchParams), file URL conversions, and the
 // legacy url.parse/format/resolve. A host with non-ASCII characters is not
 // converted to punycode: such a URL is invalid here.
-import { parse as parseQueryString, stringify as stringifyQuery, ParsedUrlQuery } from "./querystring";
+import { parse as parseQueryString, stringify as stringifyQuery } from "./querystring";
+import type { ParsedUrlQuery } from "./querystring";
 import { resolve as resolvePath } from "./path";
 import { host as nodeHost } from "./host";
 import { codedTypeError, invalidArgType } from "./errors";

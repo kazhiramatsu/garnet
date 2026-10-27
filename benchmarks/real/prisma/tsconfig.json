@@ -1,0 +1,1055 @@
+{
+  "extends": "./packages/0-config/tsconfig/base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": [],
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false,
+    "noUnusedLocals": false,
+    "noUnusedParameters": false,
+    "noUncheckedIndexedAccess": false,
+    "noPropertyAccessFromIndexSignature": false,
+    "baseUrl": ".",
+    "paths": {
+      "@internal/publish-surface/import-roots": [
+        "packages/0-shared/publish-surface/src/import-roots.ts"
+      ],
+      "@internal/publish-surface/shells": [
+        "packages/0-shared/publish-surface/src/shells.ts"
+      ],
+      "@internal/contract/apply-specifier-default-control-policy": [
+        "packages/1-framework/0-foundation/contract/src/exports/apply-specifier-default-control-policy.ts"
+      ],
+      "@internal/contract/contract-validation-error": [
+        "packages/1-framework/0-foundation/contract/src/exports/contract-validation-error.ts"
+      ],
+      "@internal/contract/default-namespace": [
+        "packages/1-framework/0-foundation/contract/src/exports/default-namespace.ts"
+      ],
+      "@internal/contract/enum-accessor": [
+        "packages/1-framework/0-foundation/contract/src/exports/enum-accessor.ts"
+      ],
+      "@internal/contract/hashing": [
+        "packages/1-framework/0-foundation/contract/src/exports/hashing.ts"
+      ],
+      "@internal/contract/hashing-utils": [
+        "packages/1-framework/0-foundation/contract/src/exports/hashing-utils.ts"
+      ],
+      "@internal/contract/is-plain-record": [
+        "packages/1-framework/0-foundation/contract/src/exports/is-plain-record.ts"
+      ],
+      "@internal/contract/resolve-domain-model": [
+        "packages/1-framework/0-foundation/contract/src/exports/resolve-domain-model.ts"
+      ],
+      "@internal/contract/types": [
+        "packages/1-framework/0-foundation/contract/src/exports/types.ts"
+      ],
+      "@internal/contract/validate-domain": [
+        "packages/1-framework/0-foundation/contract/src/exports/validate-domain.ts"
+      ],
+      "@internal/contract/validate-once": [
+        "packages/1-framework/0-foundation/contract/src/exports/validate-once.ts"
+      ],
+      "@internal/utils/abortable": [
+        "packages/1-framework/0-foundation/utils/src/exports/abortable.ts"
+      ],
+      "@internal/utils/array-equal": [
+        "packages/1-framework/0-foundation/utils/src/exports/array-equal.ts"
+      ],
+      "@internal/utils/assertions": [
+        "packages/1-framework/0-foundation/utils/src/exports/assertions.ts"
+      ],
+      "@internal/utils/canonical-stringify": [
+        "packages/1-framework/0-foundation/utils/src/exports/canonical-stringify.ts"
+      ],
+      "@internal/utils/casts": [
+        "packages/1-framework/0-foundation/utils/src/exports/casts.ts"
+      ],
+      "@internal/utils/defined": [
+        "packages/1-framework/0-foundation/utils/src/exports/defined.ts"
+      ],
+      "@internal/utils/hash-content": [
+        "packages/1-framework/0-foundation/utils/src/exports/hash-content.ts"
+      ],
+      "@internal/utils/internal-error": [
+        "packages/1-framework/0-foundation/utils/src/exports/internal-error.ts"
+      ],
+      "@internal/utils/json": [
+        "packages/1-framework/0-foundation/utils/src/exports/json.ts"
+      ],
+      "@internal/utils/promise": [
+        "packages/1-framework/0-foundation/utils/src/exports/promise.ts"
+      ],
+      "@internal/utils/redact-db-url": [
+        "packages/1-framework/0-foundation/utils/src/exports/redact-db-url.ts"
+      ],
+      "@internal/utils/result": [
+        "packages/1-framework/0-foundation/utils/src/exports/result.ts"
+      ],
+      "@internal/utils/simplify-deep": [
+        "packages/1-framework/0-foundation/utils/src/exports/simplify-deep.ts"
+      ],
+      "@internal/utils/structured-error": [
+        "packages/1-framework/0-foundation/utils/src/exports/structured-error.ts"
+      ],
+      "@internal/utils/suppress-idle-connection-errors": [
+        "packages/1-framework/0-foundation/utils/src/exports/suppress-idle-connection-errors.ts"
+      ],
+      "@internal/utils/text": [
+        "packages/1-framework/0-foundation/utils/src/exports/text.ts"
+      ],
+      "@internal/utils/types": [
+        "packages/1-framework/0-foundation/utils/src/exports/types.ts"
+      ],
+      "@internal/config/config-types": [
+        "packages/1-framework/1-core/config/src/exports/config-types.ts"
+      ],
+      "@internal/errors/control": [
+        "packages/1-framework/1-core/errors/src/exports/control.ts"
+      ],
+      "@internal/errors/execution": [
+        "packages/1-framework/1-core/errors/src/exports/execution.ts"
+      ],
+      "@internal/errors/migration": [
+        "packages/1-framework/1-core/errors/src/exports/migration.ts"
+      ],
+      "@internal/framework-components/authoring": [
+        "packages/1-framework/1-core/framework-components/src/exports/authoring.ts"
+      ],
+      "@internal/framework-components/codec": [
+        "packages/1-framework/1-core/framework-components/src/exports/codec.ts"
+      ],
+      "@internal/framework-components/components": [
+        "packages/1-framework/1-core/framework-components/src/exports/components.ts"
+      ],
+      "@internal/framework-components/control": [
+        "packages/1-framework/1-core/framework-components/src/exports/control.ts"
+      ],
+      "@internal/framework-components/emission": [
+        "packages/1-framework/1-core/framework-components/src/exports/emission.ts"
+      ],
+      "@internal/framework-components/execution": [
+        "packages/1-framework/1-core/framework-components/src/exports/execution.ts"
+      ],
+      "@internal/framework-components/ir": [
+        "packages/1-framework/1-core/framework-components/src/exports/ir.ts"
+      ],
+      "@internal/framework-components/psl-ast": [
+        "packages/1-framework/1-core/framework-components/src/exports/psl-ast.ts"
+      ],
+      "@internal/framework-components/runtime": [
+        "packages/1-framework/1-core/framework-components/src/exports/runtime.ts"
+      ],
+      "@internal/framework-components/utils": [
+        "packages/1-framework/1-core/framework-components/src/exports/utils.ts"
+      ],
+      "@internal/operations": [
+        "packages/1-framework/1-core/operations/src/index.ts"
+      ],
+      "@internal/ts-render": [
+        "packages/1-framework/1-core/ts-render/src/index.ts"
+      ],
+      "@internal/contract-authoring": [
+        "packages/1-framework/2-authoring/contract/src/index.ts"
+      ],
+      "@internal/ids": [
+        "packages/1-framework/2-authoring/ids/src/index.ts"
+      ],
+      "@internal/ids/runtime": [
+        "packages/1-framework/2-authoring/ids/src/runtime.ts"
+      ],
+      "@internal/psl-parser": [
+        "packages/1-framework/2-authoring/psl-parser/src/exports/index.ts"
+      ],
+      "@internal/psl-parser/format": [
+        "packages/1-framework/2-authoring/psl-parser/src/exports/format.ts"
+      ],
+      "@internal/psl-parser/interpret": [
+        "packages/1-framework/2-authoring/psl-parser/src/exports/interpret.ts"
+      ],
+      "@internal/psl-parser/syntax": [
+        "packages/1-framework/2-authoring/psl-parser/src/exports/syntax.ts"
+      ],
+      "@internal/psl-parser/test": [
+        "packages/1-framework/2-authoring/psl-parser/src/exports/test.ts"
+      ],
+      "@internal/psl-parser/tokenizer": [
+        "packages/1-framework/2-authoring/psl-parser/src/exports/tokenizer.ts"
+      ],
+      "@internal/psl-printer": [
+        "packages/1-framework/2-authoring/psl-printer/src/exports/index.ts"
+      ],
+      "@internal/cli": [
+        "packages/1-framework/3-tooling/cli/src/exports/index.ts"
+      ],
+      "@internal/cli/config-types": [
+        "packages/1-framework/3-tooling/cli/src/exports/config-types.ts"
+      ],
+      "@internal/cli/init-output": [
+        "packages/1-framework/3-tooling/cli/src/exports/init-output.ts"
+      ],
+      "@internal/cli/migration-cli": [
+        "packages/1-framework/3-tooling/cli/src/migration-cli.ts"
+      ],
+      "@internal/cli/control-api": [
+        "packages/1-framework/3-tooling/cli/src/exports/control-api.ts"
+      ],
+      "@internal/cli/control-api/testing": [
+        "packages/1-framework/3-tooling/cli/src/exports/control-api-testing.ts"
+      ],
+      "@internal/cli-telemetry": [
+        "packages/1-framework/3-tooling/cli-telemetry/src/exports/index.ts"
+      ],
+      "@internal/cli-telemetry/sender": [
+        "packages/1-framework/3-tooling/cli-telemetry/src/sender.ts"
+      ],
+      "@internal/config-loader": [
+        "packages/1-framework/3-tooling/config-loader/src/exports/index.ts"
+      ],
+      "@internal/emitter": [
+        "packages/1-framework/3-tooling/emitter/src/exports/index.ts"
+      ],
+      "@internal/emitter/domain-type-generation": [
+        "packages/1-framework/3-tooling/emitter/src/domain-type-generation.ts"
+      ],
+      "@internal/emitter/type-expression-safety": [
+        "packages/1-framework/3-tooling/emitter/src/type-expression-safety.ts"
+      ],
+      "@internal/language-server": [
+        "packages/1-framework/3-tooling/language-server/src/exports/index.ts"
+      ],
+      "@internal/migration-tools/metadata": [
+        "packages/1-framework/3-tooling/migration/src/exports/metadata.ts"
+      ],
+      "@internal/migration-tools/package": [
+        "packages/1-framework/3-tooling/migration/src/exports/package.ts"
+      ],
+      "@internal/migration-tools/graph": [
+        "packages/1-framework/3-tooling/migration/src/exports/graph.ts"
+      ],
+      "@internal/migration-tools/errors": [
+        "packages/1-framework/3-tooling/migration/src/exports/errors.ts"
+      ],
+      "@internal/migration-tools/io": [
+        "packages/1-framework/3-tooling/migration/src/exports/io.ts"
+      ],
+      "@internal/migration-tools/contract-snapshot-store": [
+        "packages/1-framework/3-tooling/migration/src/exports/contract-snapshot-store.ts"
+      ],
+      "@internal/migration-tools/hash": [
+        "packages/1-framework/3-tooling/migration/src/exports/hash.ts"
+      ],
+      "@internal/migration-tools/invariants": [
+        "packages/1-framework/3-tooling/migration/src/exports/invariants.ts"
+      ],
+      "@internal/migration-tools/migration-graph": [
+        "packages/1-framework/3-tooling/migration/src/exports/migration-graph.ts"
+      ],
+      "@internal/migration-tools/refs": [
+        "packages/1-framework/3-tooling/migration/src/exports/refs.ts"
+      ],
+      "@internal/migration-tools/ref-resolution": [
+        "packages/1-framework/3-tooling/migration/src/exports/ref-resolution.ts"
+      ],
+      "@internal/migration-tools/constants": [
+        "packages/1-framework/3-tooling/migration/src/exports/constants.ts"
+      ],
+      "@internal/migration-tools/ledger-origin": [
+        "packages/1-framework/3-tooling/migration/src/exports/ledger-origin.ts"
+      ],
+      "@internal/migration-tools/migration-ts": [
+        "packages/1-framework/3-tooling/migration/src/exports/migration-ts.ts"
+      ],
+      "@internal/migration-tools/migration": [
+        "packages/1-framework/3-tooling/migration/src/exports/migration.ts"
+      ],
+      "@internal/migration-tools/spaces": [
+        "packages/1-framework/3-tooling/migration/src/exports/spaces.ts"
+      ],
+      "@internal/migration-tools/aggregate": [
+        "packages/1-framework/3-tooling/migration/src/exports/aggregate.ts"
+      ],
+      "@internal/vite-plugin-contract-emit": [
+        "packages/1-framework/3-tooling/vite-plugin-contract-emit/src/exports/index.ts"
+      ],
+      "@internal/mongo-codec": [
+        "packages/2-mongo-family/1-foundation/mongo-codec/src/exports/index.ts"
+      ],
+      "@internal/mongo-contract": [
+        "packages/2-mongo-family/1-foundation/mongo-contract/src/exports/index.ts"
+      ],
+      "@internal/mongo-contract/canonicalization-hooks": [
+        "packages/2-mongo-family/1-foundation/mongo-contract/src/exports/canonicalization-hooks.ts"
+      ],
+      "@internal/mongo-contract/data-type": [
+        "packages/2-mongo-family/1-foundation/mongo-contract/src/exports/data-type.ts"
+      ],
+      "@internal/mongo-contract/entity-kinds": [
+        "packages/2-mongo-family/1-foundation/mongo-contract/src/exports/entity-kinds.ts"
+      ],
+      "@internal/mongo-contract/test": [
+        "packages/2-mongo-family/1-foundation/mongo-contract/src/exports/test.ts"
+      ],
+      "@internal/mongo-value": [
+        "packages/2-mongo-family/1-foundation/mongo-value/src/exports/index.ts"
+      ],
+      "@internal/mongo-value/mongodb-types": [
+        "packages/2-mongo-family/1-foundation/mongo-value/src/exports/mongodb-types.ts"
+      ],
+      "@internal/mongo-contract-prisma6/provider": [
+        "packages/2-mongo-family/2-authoring/contract-prisma6/src/exports/provider.ts"
+      ],
+      "@internal/mongo-contract-psl": [
+        "packages/2-mongo-family/2-authoring/contract-psl/src/exports/index.ts"
+      ],
+      "@internal/mongo-contract-psl/provider": [
+        "packages/2-mongo-family/2-authoring/contract-psl/src/exports/provider.ts"
+      ],
+      "@internal/mongo-contract-psl/test": [
+        "packages/2-mongo-family/2-authoring/contract-psl/src/exports/test.ts"
+      ],
+      "@internal/mongo-contract-ts/config-types": [
+        "packages/2-mongo-family/2-authoring/contract-ts/src/exports/config-types.ts"
+      ],
+      "@internal/mongo-contract-ts/contract-builder": [
+        "packages/2-mongo-family/2-authoring/contract-ts/src/exports/contract-builder.ts"
+      ],
+      "@internal/mongo-emitter": [
+        "packages/2-mongo-family/3-tooling/emitter/src/exports/index.ts"
+      ],
+      "@internal/mongo-schema-ir": [
+        "packages/2-mongo-family/3-tooling/mongo-schema-ir/src/exports/index.ts"
+      ],
+      "@internal/mongo-query-ast/execution": [
+        "packages/2-mongo-family/4-query/query-ast/src/exports/execution.ts"
+      ],
+      "@internal/mongo-query-ast/control": [
+        "packages/2-mongo-family/4-query/query-ast/src/exports/control.ts"
+      ],
+      "@internal/mongo-orm": [
+        "packages/2-mongo-family/5-query-builders/orm/src/exports/index.ts"
+      ],
+      "@internal/mongo-query-builder": [
+        "packages/2-mongo-family/5-query-builders/query-builder/src/exports/index.ts"
+      ],
+      "@internal/mongo-query-builder/contract-free": [
+        "packages/2-mongo-family/5-query-builders/query-builder/src/exports/contract-free.ts"
+      ],
+      "@internal/mongo-lowering": [
+        "packages/2-mongo-family/6-transport/mongo-lowering/src/exports/index.ts"
+      ],
+      "@internal/mongo-wire": [
+        "packages/2-mongo-family/6-transport/mongo-wire/src/exports/index.ts"
+      ],
+      "@internal/mongo-runtime": [
+        "packages/2-mongo-family/7-runtime/src/exports/index.ts"
+      ],
+      "@internal/family-mongo/control": [
+        "packages/2-mongo-family/9-family/src/exports/control.ts"
+      ],
+      "@internal/family-mongo/control-adapter": [
+        "packages/2-mongo-family/9-family/src/exports/control-adapter.ts"
+      ],
+      "@internal/family-mongo/ir": [
+        "packages/2-mongo-family/9-family/src/exports/ir.ts"
+      ],
+      "@internal/family-mongo/migration": [
+        "packages/2-mongo-family/9-family/src/exports/migration.ts"
+      ],
+      "@internal/family-mongo/pack": [
+        "packages/2-mongo-family/9-family/src/exports/pack.ts"
+      ],
+      "@internal/family-mongo/runtime": [
+        "packages/2-mongo-family/9-family/src/exports/runtime.ts"
+      ],
+      "@internal/family-mongo/schema-verify": [
+        "packages/2-mongo-family/9-family/src/exports/schema-verify.ts"
+      ],
+      "@internal/sql-contract/authored-check-naming": [
+        "packages/2-sql-family/1-core/contract/src/exports/authored-check-naming.ts"
+      ],
+      "@internal/sql-contract/canonicalization-hooks": [
+        "packages/2-sql-family/1-core/contract/src/exports/canonicalization-hooks.ts"
+      ],
+      "@internal/sql-contract/contract-view": [
+        "packages/2-sql-family/1-core/contract/src/exports/contract-view.ts"
+      ],
+      "@internal/sql-contract/data-type": [
+        "packages/2-sql-family/1-core/contract/src/exports/data-type.ts"
+      ],
+      "@internal/sql-contract/data-type-support": [
+        "packages/2-sql-family/1-core/contract/src/exports/data-type-support.ts"
+      ],
+      "@internal/sql-contract/entity-handle-lowering-hook": [
+        "packages/2-sql-family/1-core/contract/src/exports/entity-handle-lowering-hook.ts"
+      ],
+      "@internal/sql-contract/entity-kinds": [
+        "packages/2-sql-family/1-core/contract/src/exports/entity-kinds.ts"
+      ],
+      "@internal/sql-contract/factories": [
+        "packages/2-sql-family/1-core/contract/src/exports/factories.ts"
+      ],
+      "@internal/sql-contract/foreign-key-materialization": [
+        "packages/2-sql-family/1-core/contract/src/exports/foreign-key-materialization.ts"
+      ],
+      "@internal/sql-contract/index-naming": [
+        "packages/2-sql-family/1-core/contract/src/exports/index-naming.ts"
+      ],
+      "@internal/sql-contract/index-type-validation": [
+        "packages/2-sql-family/1-core/contract/src/exports/index-type-validation.ts"
+      ],
+      "@internal/sql-contract/index-types": [
+        "packages/2-sql-family/1-core/contract/src/exports/index-types.ts"
+      ],
+      "@internal/sql-contract/referential-action-sql": [
+        "packages/2-sql-family/1-core/contract/src/exports/referential-action-sql.ts"
+      ],
+      "@internal/sql-contract/resolve-storage-table": [
+        "packages/2-sql-family/1-core/contract/src/exports/resolve-storage-table.ts"
+      ],
+      "@internal/sql-contract/sql-expression": [
+        "packages/2-sql-family/1-core/contract/src/exports/sql-expression.ts"
+      ],
+      "@internal/sql-contract/types": [
+        "packages/2-sql-family/1-core/contract/src/exports/types.ts"
+      ],
+      "@internal/sql-contract/validators": [
+        "packages/2-sql-family/1-core/contract/src/exports/validators.ts"
+      ],
+      "@internal/sql-contract/value-set-derivation-hook": [
+        "packages/2-sql-family/1-core/contract/src/exports/value-set-derivation-hook.ts"
+      ],
+      "@internal/sql-errors": [
+        "packages/2-sql-family/1-core/errors/src/exports/index.ts"
+      ],
+      "@internal/sql-operations": [
+        "packages/2-sql-family/1-core/operations/src/index.ts"
+      ],
+      "@internal/sql-schema-ir": [
+        "packages/2-sql-family/1-core/schema-ir/src/index.ts"
+      ],
+      "@internal/sql-schema-ir/naming": [
+        "packages/2-sql-family/1-core/schema-ir/src/exports/naming.ts"
+      ],
+      "@internal/sql-schema-ir/types": [
+        "packages/2-sql-family/1-core/schema-ir/src/exports/types.ts"
+      ],
+      "@internal/sql-contract-prisma7/provider": [
+        "packages/2-sql-family/2-authoring/contract-prisma7/src/exports/provider.ts"
+      ],
+      "@internal/sql-contract-psl": [
+        "packages/2-sql-family/2-authoring/contract-psl/src/exports/index.ts"
+      ],
+      "@internal/sql-contract-psl/attribute-specs": [
+        "packages/2-sql-family/2-authoring/contract-psl/src/exports/attribute-specs.ts"
+      ],
+      "@internal/sql-contract-psl/default-table-name": [
+        "packages/2-sql-family/2-authoring/contract-psl/src/exports/default-table-name.ts"
+      ],
+      "@internal/sql-contract-psl/diagnostics": [
+        "packages/2-sql-family/2-authoring/contract-psl/src/exports/diagnostics.ts"
+      ],
+      "@internal/sql-contract-psl/map-names": [
+        "packages/2-sql-family/2-authoring/contract-psl/src/exports/map-names.ts"
+      ],
+      "@internal/sql-contract-psl/provider": [
+        "packages/2-sql-family/2-authoring/contract-psl/src/exports/provider.ts"
+      ],
+      "@internal/sql-contract-psl/resolution": [
+        "packages/2-sql-family/2-authoring/contract-psl/src/exports/resolution.ts"
+      ],
+      "@internal/sql-contract-psl/test": [
+        "packages/2-sql-family/2-authoring/contract-psl/src/exports/test.ts"
+      ],
+      "@internal/sql-contract-ts/config-types": [
+        "packages/2-sql-family/2-authoring/contract-ts/src/exports/config-types.ts"
+      ],
+      "@internal/sql-contract-ts/contract-builder": [
+        "packages/2-sql-family/2-authoring/contract-ts/src/exports/contract-builder.ts"
+      ],
+      "@internal/sql-contract-emitter": [
+        "packages/2-sql-family/3-tooling/emitter/src/index.ts"
+      ],
+      "@internal/sql-relational-core": [
+        "packages/2-sql-family/4-lanes/relational-core/src/index.ts"
+      ],
+      "@internal/sql-relational-core/aggregate-descriptor-registry": [
+        "packages/2-sql-family/4-lanes/relational-core/src/exports/aggregate-descriptor-registry.ts"
+      ],
+      "@internal/sql-relational-core/ast": [
+        "packages/2-sql-family/4-lanes/relational-core/src/exports/ast.ts"
+      ],
+      "@internal/sql-relational-core/codec-descriptor-registry": [
+        "packages/2-sql-family/4-lanes/relational-core/src/exports/codec-descriptor-registry.ts"
+      ],
+      "@internal/sql-relational-core/collection-methods": [
+        "packages/2-sql-family/4-lanes/relational-core/src/exports/collection-methods.ts"
+      ],
+      "@internal/sql-relational-core/contract-free": [
+        "packages/2-sql-family/4-lanes/relational-core/src/exports/contract-free.ts"
+      ],
+      "@internal/sql-relational-core/expression": [
+        "packages/2-sql-family/4-lanes/relational-core/src/exports/expression.ts"
+      ],
+      "@internal/sql-relational-core/functions": [
+        "packages/2-sql-family/4-lanes/relational-core/src/exports/functions.ts"
+      ],
+      "@internal/sql-relational-core/index-reference": [
+        "packages/2-sql-family/4-lanes/relational-core/src/exports/index-reference.ts"
+      ],
+      "@internal/sql-relational-core/middleware": [
+        "packages/2-sql-family/4-lanes/relational-core/src/exports/middleware.ts"
+      ],
+      "@internal/sql-relational-core/plan": [
+        "packages/2-sql-family/4-lanes/relational-core/src/exports/plan.ts"
+      ],
+      "@internal/sql-relational-core/query-lane-context": [
+        "packages/2-sql-family/4-lanes/relational-core/src/exports/query-lane-context.ts"
+      ],
+      "@internal/sql-relational-core/types": [
+        "packages/2-sql-family/4-lanes/relational-core/src/exports/types.ts"
+      ],
+      "@internal/sql-builder": [
+        "packages/2-sql-family/4-lanes/sql-builder/src/index.ts"
+      ],
+      "@internal/sql-builder/types": [
+        "packages/2-sql-family/4-lanes/sql-builder/src/exports/types.ts"
+      ],
+      "@internal/sql-builder/runtime": [
+        "packages/2-sql-family/4-lanes/sql-builder/src/index.ts"
+      ],
+      "@internal/sql-runtime": [
+        "packages/2-sql-family/5-runtime/src/exports/index.ts"
+      ],
+      "@internal/family-sql/control": [
+        "packages/2-sql-family/9-family/src/exports/control.ts"
+      ],
+      "@internal/family-sql/control-adapter": [
+        "packages/2-sql-family/9-family/src/exports/control-adapter.ts"
+      ],
+      "@internal/family-sql/diff": [
+        "packages/2-sql-family/9-family/src/exports/diff.ts"
+      ],
+      "@internal/family-sql/ir": [
+        "packages/2-sql-family/9-family/src/exports/ir.ts"
+      ],
+      "@internal/family-sql/migration": [
+        "packages/2-sql-family/9-family/src/exports/migration.ts"
+      ],
+      "@internal/family-sql/pack": [
+        "packages/2-sql-family/9-family/src/exports/pack.ts"
+      ],
+      "@internal/family-sql/psl-build": [
+        "packages/2-sql-family/9-family/src/exports/psl-build.ts"
+      ],
+      "@internal/family-sql/psl-infer": [
+        "packages/2-sql-family/9-family/src/exports/psl-infer.ts"
+      ],
+      "@internal/family-sql/runtime": [
+        "packages/2-sql-family/9-family/src/exports/runtime.ts"
+      ],
+      "@internal/family-sql/verify": [
+        "packages/2-sql-family/9-family/src/exports/verify.ts"
+      ],
+      "@internal/extension-arktype-json/codec-types": [
+        "packages/3-extensions/arktype-json/src/exports/codec-types.ts"
+      ],
+      "@internal/extension-arktype-json/codecs": [
+        "packages/3-extensions/arktype-json/src/exports/codecs.ts"
+      ],
+      "@internal/extension-arktype-json/column-types": [
+        "packages/3-extensions/arktype-json/src/exports/column-types.ts"
+      ],
+      "@internal/extension-arktype-json/control": [
+        "packages/3-extensions/arktype-json/src/exports/control.ts"
+      ],
+      "@internal/extension-arktype-json/pack": [
+        "packages/3-extensions/arktype-json/src/exports/pack.ts"
+      ],
+      "@internal/extension-arktype-json/runtime": [
+        "packages/3-extensions/arktype-json/src/exports/runtime.ts"
+      ],
+      "@internal/middleware-cache": [
+        "packages/3-extensions/middleware-cache/src/exports/index.ts"
+      ],
+      "@internal/extension-paradedb/control": [
+        "packages/3-extensions/paradedb/src/exports/control.ts"
+      ],
+      "@internal/extension-paradedb/index-types": [
+        "packages/3-extensions/paradedb/src/exports/index-types.ts"
+      ],
+      "@internal/extension-paradedb/operation-types": [
+        "packages/3-extensions/paradedb/src/exports/operation-types.ts"
+      ],
+      "@internal/extension-paradedb/pack": [
+        "packages/3-extensions/paradedb/src/exports/pack.ts"
+      ],
+      "@internal/extension-paradedb/runtime": [
+        "packages/3-extensions/paradedb/src/exports/runtime.ts"
+      ],
+      "@internal/extension-pgvector/codec-types": [
+        "packages/3-extensions/pgvector/src/exports/codec-types.ts"
+      ],
+      "@internal/extension-pgvector/column-types": [
+        "packages/3-extensions/pgvector/src/exports/column-types.ts"
+      ],
+      "@internal/extension-pgvector/control": [
+        "packages/3-extensions/pgvector/src/exports/control.ts"
+      ],
+      "@internal/extension-pgvector/operation-types": [
+        "packages/3-extensions/pgvector/src/exports/operation-types.ts"
+      ],
+      "@internal/extension-pgvector/pack": [
+        "packages/3-extensions/pgvector/src/exports/pack.ts"
+      ],
+      "@internal/extension-pgvector/runtime": [
+        "packages/3-extensions/pgvector/src/exports/runtime.ts"
+      ],
+      "@internal/extension-postgis/codec-types": [
+        "packages/3-extensions/postgis/src/exports/codec-types.ts"
+      ],
+      "@internal/extension-postgis/column-types": [
+        "packages/3-extensions/postgis/src/exports/column-types.ts"
+      ],
+      "@internal/extension-postgis/control": [
+        "packages/3-extensions/postgis/src/exports/control.ts"
+      ],
+      "@internal/extension-postgis/geojson": [
+        "packages/3-extensions/postgis/src/exports/geojson.ts"
+      ],
+      "@internal/extension-postgis/operation-types": [
+        "packages/3-extensions/postgis/src/exports/operation-types.ts"
+      ],
+      "@internal/extension-postgis/pack": [
+        "packages/3-extensions/postgis/src/exports/pack.ts"
+      ],
+      "@internal/extension-postgis/runtime": [
+        "packages/3-extensions/postgis/src/exports/runtime.ts"
+      ],
+      "@internal/sql-orm-client": [
+        "packages/3-extensions/sql-orm-client/src/exports/index.ts"
+      ],
+      "@internal/extension-supabase/pack": [
+        "packages/3-extensions/supabase/src/exports/pack.ts"
+      ],
+      "@internal/extension-supabase/runtime": [
+        "packages/3-extensions/supabase/src/exports/runtime.ts"
+      ],
+      "@internal/extension-supabase/contract": [
+        "packages/3-extensions/supabase/src/exports/contract.ts"
+      ],
+      "@internal/target-mongo/codec-ids": [
+        "packages/3-targets/mongo/1-target/src/exports/codec-ids.ts"
+      ],
+      "@internal/target-mongo/codec-types": [
+        "packages/3-targets/mongo/1-target/src/exports/codec-types.ts"
+      ],
+      "@internal/target-mongo/codecs": [
+        "packages/3-targets/mongo/1-target/src/exports/codecs.ts"
+      ],
+      "@internal/target-mongo/control": [
+        "packages/3-targets/mongo/1-target/src/exports/control.ts"
+      ],
+      "@internal/target-mongo/data-types": [
+        "packages/3-targets/mongo/1-target/src/exports/data-types.ts"
+      ],
+      "@internal/target-mongo/migration": [
+        "packages/3-targets/mongo/1-target/src/exports/migration.ts"
+      ],
+      "@internal/target-mongo/pack": [
+        "packages/3-targets/mongo/1-target/src/exports/pack.ts"
+      ],
+      "@internal/target-mongo/prisma6-binding": [
+        "packages/3-targets/mongo/1-target/src/exports/prisma6-binding.ts"
+      ],
+      "@internal/target-mongo/runtime": [
+        "packages/3-targets/mongo/1-target/src/exports/runtime.ts"
+      ],
+      "@internal/adapter-mongo": [
+        "packages/3-targets/mongo/2-adapter/src/exports/index.ts"
+      ],
+      "@internal/adapter-mongo/control": [
+        "packages/3-targets/mongo/2-adapter/src/exports/control.ts"
+      ],
+      "@internal/adapter-mongo/runtime": [
+        "packages/3-targets/mongo/2-adapter/src/exports/runtime.ts"
+      ],
+      "@internal/driver-mongo": [
+        "packages/3-targets/mongo/3-driver/src/exports/index.ts"
+      ],
+      "@internal/driver-mongo/control": [
+        "packages/3-targets/mongo/3-driver/src/exports/control.ts"
+      ],
+      "@internal/mongo/bson": [
+        "packages/3-targets/mongo/9-facade/src/exports/bson.ts"
+      ],
+      "@internal/mongo/config": [
+        "packages/3-targets/mongo/9-facade/src/exports/config.ts"
+      ],
+      "@internal/mongo/contract-builder": [
+        "packages/3-targets/mongo/9-facade/src/exports/contract-builder.ts"
+      ],
+      "@internal/mongo/control": [
+        "packages/3-targets/mongo/9-facade/src/exports/control.ts"
+      ],
+      "@internal/mongo/family": [
+        "packages/3-targets/mongo/9-facade/src/exports/family.ts"
+      ],
+      "@internal/mongo/runtime": [
+        "packages/3-targets/mongo/9-facade/src/exports/runtime.ts"
+      ],
+      "@internal/mongo/static": [
+        "packages/3-targets/mongo/9-facade/src/exports/static.ts"
+      ],
+      "@internal/mongo/target": [
+        "packages/3-targets/mongo/9-facade/src/exports/target.ts"
+      ],
+      "@internal/target-mysql/codec-descriptor": [
+        "packages/3-targets/mysql/1-target/src/exports/codec-descriptor.ts"
+      ],
+      "@internal/target-mysql/codec-ids": [
+        "packages/3-targets/mysql/1-target/src/exports/codec-ids.ts"
+      ],
+      "@internal/target-mysql/codec-types": [
+        "packages/3-targets/mysql/1-target/src/exports/codec-types.ts"
+      ],
+      "@internal/target-mysql/codecs": [
+        "packages/3-targets/mysql/1-target/src/exports/codecs.ts"
+      ],
+      "@internal/target-mysql/contract-free": [
+        "packages/3-targets/mysql/1-target/src/exports/contract-free.ts"
+      ],
+      "@internal/target-mysql/control": [
+        "packages/3-targets/mysql/1-target/src/exports/control.ts"
+      ],
+      "@internal/target-mysql/control-tables": [
+        "packages/3-targets/mysql/1-target/src/exports/control-tables.ts"
+      ],
+      "@internal/target-mysql/data-types": [
+        "packages/3-targets/mysql/1-target/src/exports/data-types.ts"
+      ],
+      "@internal/target-mysql/ddl": [
+        "packages/3-targets/mysql/1-target/src/exports/ddl.ts"
+      ],
+      "@internal/target-mysql/default-normalizer": [
+        "packages/3-targets/mysql/1-target/src/exports/default-normalizer.ts"
+      ],
+      "@internal/target-mysql/errors": [
+        "packages/3-targets/mysql/1-target/src/exports/errors.ts"
+      ],
+      "@internal/target-mysql/marker-lock": [
+        "packages/3-targets/mysql/1-target/src/exports/marker-lock.ts"
+      ],
+      "@internal/target-mysql/migration": [
+        "packages/3-targets/mysql/1-target/src/exports/migration.ts"
+      ],
+      "@internal/target-mysql/pack": [
+        "packages/3-targets/mysql/1-target/src/exports/pack.ts"
+      ],
+      "@internal/target-mysql/sql-utils": [
+        "packages/3-targets/mysql/1-target/src/exports/sql-utils.ts"
+      ],
+      "@internal/adapter-mysql/adapter": [
+        "packages/3-targets/mysql/2-adapter/src/exports/adapter.ts"
+      ],
+      "@internal/adapter-mysql/codec-types": [
+        "packages/3-targets/mysql/2-adapter/src/exports/codec-types.ts"
+      ],
+      "@internal/adapter-mysql/control": [
+        "packages/3-targets/mysql/2-adapter/src/exports/control.ts"
+      ],
+      "@internal/driver-mysql/control": [
+        "packages/3-targets/mysql/3-driver/src/exports/control.ts"
+      ],
+      "@internal/mysql/config": [
+        "packages/3-targets/mysql/9-facade/src/exports/config.ts"
+      ],
+      "@internal/mysql/contract-builder": [
+        "packages/3-targets/mysql/9-facade/src/exports/contract-builder.ts"
+      ],
+      "@internal/mysql/control": [
+        "packages/3-targets/mysql/9-facade/src/exports/control.ts"
+      ],
+      "@internal/mysql/migration": [
+        "packages/3-targets/mysql/9-facade/src/exports/migration.ts"
+      ],
+      "@internal/target-postgres/aggregates": [
+        "packages/3-targets/postgres/1-target/src/exports/aggregates.ts"
+      ],
+      "@internal/target-postgres/codec-descriptor": [
+        "packages/3-targets/postgres/1-target/src/exports/codec-descriptor.ts"
+      ],
+      "@internal/target-postgres/codec-ids": [
+        "packages/3-targets/postgres/1-target/src/exports/codec-ids.ts"
+      ],
+      "@internal/target-postgres/codec-types": [
+        "packages/3-targets/postgres/1-target/src/exports/codec-types.ts"
+      ],
+      "@internal/target-postgres/codecs": [
+        "packages/3-targets/postgres/1-target/src/exports/codecs.ts"
+      ],
+      "@internal/target-postgres/contract-free": [
+        "packages/3-targets/postgres/1-target/src/exports/contract-free.ts"
+      ],
+      "@internal/target-postgres/control": [
+        "packages/3-targets/postgres/1-target/src/exports/control.ts"
+      ],
+      "@internal/target-postgres/data-transform": [
+        "packages/3-targets/postgres/1-target/src/exports/data-transform.ts"
+      ],
+      "@internal/target-postgres/data-types": [
+        "packages/3-targets/postgres/1-target/src/exports/data-types.ts"
+      ],
+      "@internal/target-postgres/ddl": [
+        "packages/3-targets/postgres/1-target/src/exports/ddl.ts"
+      ],
+      "@internal/target-postgres/default-normalizer": [
+        "packages/3-targets/postgres/1-target/src/exports/default-normalizer.ts"
+      ],
+      "@internal/target-postgres/diff-database-schema": [
+        "packages/3-targets/postgres/1-target/src/exports/diff-database-schema.ts"
+      ],
+      "@internal/target-postgres/errors": [
+        "packages/3-targets/postgres/1-target/src/exports/errors.ts"
+      ],
+      "@internal/target-postgres/full-text": [
+        "packages/3-targets/postgres/1-target/src/exports/full-text.ts"
+      ],
+      "@internal/target-postgres/full-text-index-authoring": [
+        "packages/3-targets/postgres/1-target/src/exports/full-text-index-authoring.ts"
+      ],
+      "@internal/target-postgres/issue-planner": [
+        "packages/3-targets/postgres/1-target/src/exports/issue-planner.ts"
+      ],
+      "@internal/target-postgres/marker-lock": [
+        "packages/3-targets/postgres/1-target/src/exports/marker-lock.ts"
+      ],
+      "@internal/target-postgres/migration": [
+        "packages/3-targets/postgres/1-target/src/exports/migration.ts"
+      ],
+      "@internal/target-postgres/native-type-normalizer": [
+        "packages/3-targets/postgres/1-target/src/exports/native-type-normalizer.ts"
+      ],
+      "@internal/target-postgres/op-factory-call": [
+        "packages/3-targets/postgres/1-target/src/exports/op-factory-call.ts"
+      ],
+      "@internal/target-postgres/operation-types": [
+        "packages/3-targets/postgres/1-target/src/exports/operation-types.ts"
+      ],
+      "@internal/target-postgres/pack": [
+        "packages/3-targets/postgres/1-target/src/exports/pack.ts"
+      ],
+      "@internal/target-postgres/planner": [
+        "packages/3-targets/postgres/1-target/src/exports/planner.ts"
+      ],
+      "@internal/target-postgres/planner-ddl-builders": [
+        "packages/3-targets/postgres/1-target/src/exports/planner-ddl-builders.ts"
+      ],
+      "@internal/target-postgres/planner-identity-values": [
+        "packages/3-targets/postgres/1-target/src/exports/planner-identity-values.ts"
+      ],
+      "@internal/target-postgres/planner-produced-postgres-migration": [
+        "packages/3-targets/postgres/1-target/src/exports/planner-produced-postgres-migration.ts"
+      ],
+      "@internal/target-postgres/planner-schema-lookup": [
+        "packages/3-targets/postgres/1-target/src/exports/planner-schema-lookup.ts"
+      ],
+      "@internal/target-postgres/planner-sql-checks": [
+        "packages/3-targets/postgres/1-target/src/exports/planner-sql-checks.ts"
+      ],
+      "@internal/target-postgres/planner-target-details": [
+        "packages/3-targets/postgres/1-target/src/exports/planner-target-details.ts"
+      ],
+      "@internal/target-postgres/prisma7-binding": [
+        "packages/3-targets/postgres/1-target/src/exports/prisma7-binding.ts"
+      ],
+      "@internal/target-postgres/render-ops": [
+        "packages/3-targets/postgres/1-target/src/exports/render-ops.ts"
+      ],
+      "@internal/target-postgres/render-typescript": [
+        "packages/3-targets/postgres/1-target/src/exports/render-typescript.ts"
+      ],
+      "@internal/target-postgres/rls-canonicalize": [
+        "packages/3-targets/postgres/1-target/src/exports/rls-canonicalize.ts"
+      ],
+      "@internal/target-postgres/runtime": [
+        "packages/3-targets/postgres/1-target/src/exports/runtime.ts"
+      ],
+      "@internal/target-postgres/schema-ir-annotations": [
+        "packages/3-targets/postgres/1-target/src/exports/schema-ir-annotations.ts"
+      ],
+      "@internal/target-postgres/sql-utils": [
+        "packages/3-targets/postgres/1-target/src/exports/sql-utils.ts"
+      ],
+      "@internal/target-postgres/types": [
+        "packages/3-targets/postgres/1-target/src/exports/types.ts"
+      ],
+      "@internal/adapter-postgres/adapter": [
+        "packages/3-targets/postgres/2-adapter/src/exports/adapter.ts"
+      ],
+      "@internal/adapter-postgres/column-types": [
+        "packages/3-targets/postgres/2-adapter/src/exports/column-types.ts"
+      ],
+      "@internal/adapter-postgres/control": [
+        "packages/3-targets/postgres/2-adapter/src/exports/control.ts"
+      ],
+      "@internal/adapter-postgres/runtime": [
+        "packages/3-targets/postgres/2-adapter/src/exports/runtime.ts"
+      ],
+      "@internal/adapter-postgres/sql-renderer": [
+        "packages/3-targets/postgres/2-adapter/src/exports/sql-renderer.ts"
+      ],
+      "@internal/adapter-postgres/types": [
+        "packages/3-targets/postgres/2-adapter/src/exports/types.ts"
+      ],
+      "@internal/driver-postgres/control": [
+        "packages/3-targets/postgres/3-driver/src/exports/control.ts"
+      ],
+      "@internal/driver-postgres/runtime": [
+        "packages/3-targets/postgres/3-driver/src/exports/runtime.ts"
+      ],
+      "@internal/postgres-codec-testkit": [
+        "packages/3-targets/postgres/4-codec-testkit/src/index.ts"
+      ],
+      "@internal/postgres/config": [
+        "packages/3-targets/postgres/9-facade/src/exports/config.ts"
+      ],
+      "@internal/postgres/contract-builder": [
+        "packages/3-targets/postgres/9-facade/src/exports/contract-builder.ts"
+      ],
+      "@internal/postgres/control": [
+        "packages/3-targets/postgres/9-facade/src/exports/control.ts"
+      ],
+      "@internal/postgres/family": [
+        "packages/3-targets/postgres/9-facade/src/exports/family.ts"
+      ],
+      "@internal/postgres/migration": [
+        "packages/3-targets/postgres/9-facade/src/exports/migration.ts"
+      ],
+      "@internal/postgres/runtime": [
+        "packages/3-targets/postgres/9-facade/src/exports/runtime.ts"
+      ],
+      "@internal/postgres/serverless": [
+        "packages/3-targets/postgres/9-facade/src/exports/serverless.ts"
+      ],
+      "@internal/postgres/static": [
+        "packages/3-targets/postgres/9-facade/src/exports/static.ts"
+      ],
+      "@internal/postgres/target": [
+        "packages/3-targets/postgres/9-facade/src/exports/target.ts"
+      ],
+      "@internal/target-sqlite/aggregates": [
+        "packages/3-targets/sqlite/1-target/src/exports/aggregates.ts"
+      ],
+      "@internal/target-sqlite/codec-descriptor": [
+        "packages/3-targets/sqlite/1-target/src/exports/codec-descriptor.ts"
+      ],
+      "@internal/target-sqlite/codec-ids": [
+        "packages/3-targets/sqlite/1-target/src/exports/codec-ids.ts"
+      ],
+      "@internal/target-sqlite/codec-types": [
+        "packages/3-targets/sqlite/1-target/src/exports/codec-types.ts"
+      ],
+      "@internal/target-sqlite/codecs": [
+        "packages/3-targets/sqlite/1-target/src/exports/codecs.ts"
+      ],
+      "@internal/target-sqlite/contract-free": [
+        "packages/3-targets/sqlite/1-target/src/exports/contract-free.ts"
+      ],
+      "@internal/target-sqlite/control": [
+        "packages/3-targets/sqlite/1-target/src/exports/control.ts"
+      ],
+      "@internal/target-sqlite/control-tables": [
+        "packages/3-targets/sqlite/1-target/src/exports/control-tables.ts"
+      ],
+      "@internal/target-sqlite/data-types": [
+        "packages/3-targets/sqlite/1-target/src/exports/data-types.ts"
+      ],
+      "@internal/target-sqlite/ddl": [
+        "packages/3-targets/sqlite/1-target/src/exports/ddl.ts"
+      ],
+      "@internal/target-sqlite/default-normalizer": [
+        "packages/3-targets/sqlite/1-target/src/exports/default-normalizer.ts"
+      ],
+      "@internal/target-sqlite/migration": [
+        "packages/3-targets/sqlite/1-target/src/exports/migration.ts"
+      ],
+      "@internal/target-sqlite/op-factory-call": [
+        "packages/3-targets/sqlite/1-target/src/exports/op-factory-call.ts"
+      ],
+      "@internal/target-sqlite/pack": [
+        "packages/3-targets/sqlite/1-target/src/exports/pack.ts"
+      ],
+      "@internal/target-sqlite/planner": [
+        "packages/3-targets/sqlite/1-target/src/exports/planner.ts"
+      ],
+      "@internal/target-sqlite/planner-produced-sqlite-migration": [
+        "packages/3-targets/sqlite/1-target/src/exports/planner-produced-sqlite-migration.ts"
+      ],
+      "@internal/target-sqlite/planner-target-details": [
+        "packages/3-targets/sqlite/1-target/src/exports/planner-target-details.ts"
+      ],
+      "@internal/target-sqlite/render-ops": [
+        "packages/3-targets/sqlite/1-target/src/exports/render-ops.ts"
+      ],
+      "@internal/target-sqlite/runtime": [
+        "packages/3-targets/sqlite/1-target/src/exports/runtime.ts"
+      ],
+      "@internal/target-sqlite/sql-utils": [
+        "packages/3-targets/sqlite/1-target/src/exports/sql-utils.ts"
+      ],
+      "@internal/adapter-sqlite/adapter": [
+        "packages/3-targets/sqlite/2-adapter/src/exports/adapter.ts"
+      ],
+      "@internal/adapter-sqlite/codec-types": [
+        "packages/3-targets/sqlite/2-adapter/src/exports/codec-types.ts"
+      ],
+      "@internal/adapter-sqlite/column-types": [
+        "packages/3-targets/sqlite/2-adapter/src/exports/column-types.ts"
+      ],
+      "@internal/adapter-sqlite/control": [
+        "packages/3-targets/sqlite/2-adapter/src/exports/control.ts"
+      ],
+      "@internal/adapter-sqlite/runtime": [
+        "packages/3-targets/sqlite/2-adapter/src/exports/runtime.ts"
+      ],
+      "@internal/adapter-sqlite/sql-renderer": [
+        "packages/3-targets/sqlite/2-adapter/src/exports/sql-renderer.ts"
+      ],
+      "@internal/adapter-sqlite/types": [
+        "packages/3-targets/sqlite/2-adapter/src/exports/types.ts"
+      ],
+      "@internal/driver-sqlite/control": [
+        "packages/3-targets/sqlite/3-driver/src/exports/control.ts"
+      ],
+      "@internal/driver-sqlite/runtime": [
+        "packages/3-targets/sqlite/3-driver/src/exports/runtime.ts"
+      ],
+      "@internal/sqlite-codec-testkit": [
+        "packages/3-targets/sqlite/4-codec-testkit/src/index.ts"
+      ],
+      "@internal/sqlite/config": [
+        "packages/3-targets/sqlite/9-facade/src/exports/config.ts"
+      ],
+      "@internal/sqlite/contract-builder": [
+        "packages/3-targets/sqlite/9-facade/src/exports/contract-builder.ts"
+      ],
+      "@internal/sqlite/control": [
+        "packages/3-targets/sqlite/9-facade/src/exports/control.ts"
+      ],
+      "@internal/sqlite/migration": [
+        "packages/3-targets/sqlite/9-facade/src/exports/migration.ts"
+      ],
+      "@internal/sqlite/runtime": [
+        "packages/3-targets/sqlite/9-facade/src/exports/runtime.ts"
+      ],
+      "@internal/sqlite/static": [
+        "packages/3-targets/sqlite/9-facade/src/exports/static.ts"
+      ]
+    }
+  },
+  "files": [
+    "garnet-driver.ts"
+  ]
+}

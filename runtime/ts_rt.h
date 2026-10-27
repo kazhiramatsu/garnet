@@ -748,6 +748,9 @@ enum {
   /* a flat (non-view) string's `offset` holds its UTF-8 byte length (the
      host's Buffer.byteLength; a source text is measured a few times) */
   TS_STR_FLAG_UTF8LEN = 1u << 6,
+  /* a flat (non-view) string's `offset` holds its interned property-key id: a string used as a
+     dynamic key (`children[part]`, `params[name] = v`) is interned once (exclusive with UTF8LEN) */
+  TS_STR_FLAG_KEY = 1u << 7,
   /* Internal-only storage owner for appendable prefix views. A BUFFER value
      must never be returned as a JavaScript string; public values are VIEW
      cells whose parent points at this contiguous storage. */
@@ -1749,6 +1752,10 @@ tsv    ts_number_tofixed(double x, double digits);
 tsv    ts_date_now_ms(void);
 double ts_date_from_components(double y,double mo,double d,double h,double mi,double s,double mil);
 double ts_date_component(double ms, int which);
+double ts_date_value_ms(tsv v);          /* new Date(value): a Date, an ISO or toString-shaped string, else ToNumber */
+double ts_date_parse_chars(const char* s, uint32_t len);
+double ts_date_parse_value(tsv v);        /* Date.parse */
+tsv ts_date_to_utc_string(double ms);
 tsv    ts_date_to_iso(double ms);
 tsv    ts_date_to_locale_time(double ms, tsv locales, tsv options);
 
@@ -1854,6 +1861,7 @@ tsv ts_object_from_entries(tsv entries);
 /* JSON */
 tsv ts_json_stringify(tsv v);
 tsv ts_json_stringify_indent(tsv v, tsv space);
+tsv ts_json_stringify_replacer(tsv v, tsv replacer, tsv space);
 double ts_json_stringify_len(tsv v);
 double ts_json_stringify_indent_len(tsv v, tsv space);
 double ts_json_num_len(double d);

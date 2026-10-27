@@ -2151,9 +2151,13 @@ class Exporter {
     for (const p of F.parameters) bind(p.name);
     const visitOwn = (n: ts.Node) => {
       if (ts.isVariableDeclaration(n)) bind(n.name);
-      if (ts.isImportDeclaration(n) && this.isNamespaceImportStmt(n)) {
-        const name = (n.importClause!.namedBindings as ts.NamespaceImport).name;
-        const sym = this.symbolOf(name);
+      const nsName = this.namespaceBindingName(n);
+      if (nsName) {
+        const sym = this.symbolOf(nsName);
+        if (sym) decl.add(sym);
+      }
+      if (this.isValueDefaultExport(n)) {
+        const sym = this.defaultExportSymbolOf(n);
         if (sym) decl.add(sym);
       }
       if (ts.isFunctionDeclaration(n) && n.name) {
@@ -3601,13 +3605,18 @@ class Exporter {
    *  and reexported bindings. Repeated imports share one namespace object. */
   private lowerNamespaceImport(ctx: FnCtx, stmt: ts.ImportDeclaration): void {
     const nb = stmt.importClause!.namedBindings as ts.NamespaceImport;
-    const target = this.resolveModuleSf(stmt.moduleSpecifier);
+    this.materializeNamespace(ctx, stmt.moduleSpecifier, nb.name, stmt);
+  }
+  /** The namespace object of the module `moduleSpecifier` names, bound as `name` (`import * as name` and
+   *  `export * as name from`): the module's exports as fields (getters for the exports that live in cells). */
+  private materializeNamespace(ctx: FnCtx, moduleSpecifier: ts.Expression, name: ts.Identifier, stmt: ts.Statement): void {
+    const target = this.resolveModuleSf(moduleSpecifier);
     if (!target) return;
     const modSym = this.checker.getSymbolAtLocation(target) ?? (target as unknown as { symbol?: ts.Symbol }).symbol;
     if (!modSym) return;
     if (this.moduleNamespaceLocals.has(modSym)) return;
     const site = this.site++;
-    const obj = this.newLocal(ctx, "reference", nb.name.text);
+    const obj = this.newLocal(ctx, "reference", name.text);
     this.recordSite(site, "object", "once", false, stmt);
     ctx.body.push({ kind: "AllocObject", dst: obj, typeId: 0, site });
     this.moduleNamespaceLocals.set(modSym, obj);
@@ -3615,7 +3624,7 @@ class Exporter {
     // bind the alias symbol itself defensively.
     if (this.hasCaptured(ctx, modSym)) this.storeCaptured(ctx, modSym, obj);
     else this.ensureLocalAlias(ctx, modSym, obj);
-    const aliasSym = this.checker.getSymbolAtLocation(nb.name);
+    const aliasSym = this.checker.getSymbolAtLocation(name);
     if (aliasSym && aliasSym !== modSym) this.ensureLocalAlias(ctx, aliasSym, obj);
     const nullValue = this.newLocal(ctx, "reference");
     ctx.body.push({ kind: "Const", dst: nullValue, value: { kind: "Null" } });
@@ -5897,6 +5906,17 @@ class Exporter {
             this.lowerDefineOneProperty(ctx, node, obj, key, desc);
             return obj;   // Object.defineProperty returns the object
           }
+          // Object.create(proto, descriptors): the object with the prototype, then the
+          // descriptors defined on it as Object.defineProperties does at run time.
+          if (ns === "Object" && fn.name.text === "create" && node.arguments.length === 2) {
+            const proto = this.lowerExpr(ctx, node.arguments[0]);
+            const obj = this.newLocal(ctx, "reference");
+            ctx.body.push({ kind: "CallBuiltinStatic", dst: obj, builtin: "object.create", args: [proto] });
+            const descsLocal = this.lowerExpr(ctx, node.arguments[1]);
+            ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"),
+              builtin: "object.definePropertiesDyn", args: [obj, descsLocal] });
+            return obj;
+          }
           // Object.defineProperties(obj, { k1: desc1, ... }) — expand statically
           // when the map and each descriptor are literals; otherwise fall back to
           // the runtime form (which iterates the descriptor map at run time).
@@ -5971,17 +5991,24 @@ class Exporter {
             }
             return acc;
           }
-          // JSON.stringify(value, replacer?, space?): support the common
-          // pretty-printing form. A function/array replacer changes the output, so
-          // accept only a null/undefined replacer (else loud-reject). With a space
-          // argument, route to the indenting runtime; otherwise the compact form.
+          // JSON.stringify(value, replacer?, space?): a null/undefined replacer routes to the
+          // indenting runtime (a space argument) or the compact form; any other replacer (a
+          // function, an array of names, or a value the runtime ignores as the spec does) goes to
+          // the general form with the three arguments.
           if (ns === "JSON" && fn.name.text === "stringify" && node.arguments.length >= 2) {
             const replacer = node.arguments[1];
             const replacerIsNullish =
               replacer.kind === ts.SyntaxKind.NullKeyword ||
               (ts.isIdentifier(replacer) && replacer.text === "undefined");
             if (!replacerIsNullish) {
-              this.unsupported(node, "JSON.stringify replacer (function/array) not supported");
+              const valLocal = this.lowerExpr(ctx, node.arguments[0]);
+              const repLocal = this.lowerExpr(ctx, replacer);
+              let spaceLocal: number;
+              if (node.arguments.length >= 3) spaceLocal = this.lowerExpr(ctx, node.arguments[2]);
+              else { spaceLocal = this.newLocal(ctx, "primitive"); ctx.body.push({ kind: "Const", dst: spaceLocal, value: { kind: "Undef" } }); }
+              const dst = this.newLocal(ctx, "reference");
+              ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "json.stringify.replacer", args: [valLocal, repLocal, spaceLocal] });
+              return dst;
             }
             const valLocal = this.lowerExpr(ctx, node.arguments[0]);
             const dst = this.newLocal(ctx, "reference");
@@ -6036,7 +6063,7 @@ class Exporter {
               getUTCFullYear: 16, getUTCMonth: 17, getUTCDate: 18, getUTCDay: 19,
               getUTCHours: 20, getUTCMinutes: 21, getUTCSeconds: 22, getUTCMilliseconds: 23,
             };
-            if (fn.name.text in dateComp) {
+            if (Object.prototype.hasOwnProperty.call(dateComp, fn.name.text)) {
               const recv = this.lowerExpr(ctx, fn.expression);
               const msL = this.newLocal(ctx, "primitive");
               ctx.body.push({ kind: "LoadField", dst: msL, obj: recv, field: this.DATE_MS_FIELD });
@@ -6046,12 +6073,12 @@ class Exporter {
               ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "date.component", args: [msL, selL] });
               return dst;
             }
-            if (fn.name.text === "toISOString") {
+            if (fn.name.text === "toISOString" || fn.name.text === "toUTCString") {
               const recv = this.lowerExpr(ctx, fn.expression);
               const msL = this.newLocal(ctx, "primitive");
               ctx.body.push({ kind: "LoadField", dst: msL, obj: recv, field: this.DATE_MS_FIELD });
               const dst = this.newLocal(ctx, "reference");
-              ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "date.toISOString", args: [msL] });
+              ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: fn.name.text === "toISOString" ? "date.toISOString" : "date.toUTCString", args: [msL] });
               return dst;
             }
             if (fn.name.text === "toLocaleTimeString") {
@@ -6559,6 +6586,7 @@ class Exporter {
         const ek = this.errorKindIndex(node.right.text);
         const builtinProtoKinds: Record<string, string> = {
           Object: "object",
+          RegExp: "regexp",
           Map: "map",
           Set: "set",
           WeakMap: "weakmap",
@@ -7271,8 +7299,8 @@ class Exporter {
       // runtime (silent miscompile). Loud-reject until the namespace object is
       // materialized at this export site.
       if (named && ts.isNamespaceExport(named)) {
-        this.unsupported(stmt, "`export * as ns from \"m\"` (namespace re-export) not supported in v1 (use `import * as ns from \"m\"; export { ns }`)");
-        return true;
+        if (!ts.isIdentifier(named.name)) this.unsupported(stmt, "`export * as \"string name\"` (a string export name) is not supported");
+        return true;   // the identifier form is lowered by materializeNamespace (lowerStatement)
       }
       // `export {x}` / `export {x} from "m"` / `export * from "m"`: re-exports are
       // resolved by the alias chain at the importing site — no runtime code. A
@@ -7289,11 +7317,8 @@ class Exporter {
         return true;
       }
       // `export default <name>` aliases the binding (resolved on import — erase).
-      // `export default function|class` are declarations (handled normally). Other
-      // `export default <expression>` needs a synthesized default binding — deferred.
-      if (!ts.isIdentifier(stmt.expression)) {
-        this.unsupported(stmt, "export default <expression> not supported in v1 (use `export default <name>` or `export default function|class`)");
-      }
+      // `export default function|class` are declarations (handled normally); any other
+      // `export default <expression>` is lowered by lowerStatement (bindDefaultExport).
       return true;
     }
     // import X = require("...") / import X = NS  (TS/CJS style)
@@ -9708,11 +9733,9 @@ class Exporter {
           const t = this.checker.getTypeAtLocation(args[0]);
           isNumeric = (t.flags & (ts.TypeFlags.Number | ts.TypeFlags.NumberLiteral)) !== 0;
         } catch { /* leave isNumeric false */ }
-        if (!isNumeric) {
-          this.unsupported(node, "new Date(string|Date) not supported (numeric epoch-ms or the component form only)");
-        }
         const v = this.lowerExpr(ctx, args[0]);
-        ctx.body.push({ kind: "Copy", dst: ms, src: v });
+        if (isNumeric) ctx.body.push({ kind: "Copy", dst: ms, src: v });
+        else ctx.body.push({ kind: "CallBuiltinStatic", dst: ms, builtin: "date.value_ms", args: [v] });   // a Date's time, a string parsed, else ToNumber
       } else {
         // new Date(year, month, day=1, hours=0, minutes=0, seconds=0, ms=0) — local time.
         const a = args.map((x) => this.lowerExpr(ctx, x));
@@ -10611,6 +10634,7 @@ class Exporter {
     }
     if (ns === "Date") {
       if (member === "now") return "date.now";
+      if (member === "parse") return argc === 1 ? "date.parse" : "__UNSUPPORTED__";
       return "__UNSUPPORTED__";
     }
     if (ns === "Object") {
@@ -10960,6 +10984,7 @@ class Exporter {
     if (ns === "AbortSignal" && member === "timeout") return "abortsignal.timeout";
     if (ns === "Symbol" && (member === "for" || member === "keyFor")) return `symbol.${member}`;
     if (ns === "Date" && member === "now") return "date.now";
+    if (ns === "Date" && member === "parse") return "date.parse";
     if (ns === "console") {
       if (member === "log" || member === "info" || member === "debug") return "console.log";
       if (member === "error" || member === "warn") return "console.error";
@@ -12285,8 +12310,9 @@ class Exporter {
       const sym = t.getSymbol();
       const cid = sym ? this.classSymToId.get(sym) : undefined;
       if (cid === undefined || !this.classInfos[cid]?.stable) return 0;
-      const decl = this.classNodeOfId.get(cid);
-      if (!decl || (decl.typeParameters && decl.typeParameters.length > 0)) return 0;
+      // A generic class takes the hint too: its layout is one per class, not per instantiation (a field
+      // typed by a type parameter is a boxed slot), and the hint names the class, not the arguments.
+      if (!this.classNodeOfId.has(cid)) return 0;
       return cid + 1;
     } catch {
       return 0;
@@ -13510,6 +13536,18 @@ class Exporter {
     } else if (ts.isFunctionDeclaration(stmt) && !stmt.body) {
       // Overload signatures and ambient declarations are erased. Only the
       // implementation owns code, a function value, and capture parameters.
+    } else if (ts.isFunctionDeclaration(stmt) && stmt.body && !stmt.name) {
+      // `export default function () {...}`: the anonymous declaration is the module's default export,
+      // its closure bound to the export's symbol (an importer's `import f from "./m"` resolves to it)
+      const v = this.lowerClosure(ctx, stmt as unknown as ts.FunctionExpression, undefined);
+      this.bindDefaultExport(ctx, stmt, v);
+    } else if (ts.isExportAssignment(stmt) && !stmt.isExportEquals && !ts.isIdentifier(stmt.expression)) {
+      // `export default <expression>`: the value bound to the default export's symbol in __module_init
+      const v = this.lowerExpr(ctx, stmt.expression);
+      this.bindDefaultExport(ctx, stmt, v);
+    } else if (ts.isExportDeclaration(stmt) && stmt.exportClause !== undefined && ts.isNamespaceExport(stmt.exportClause) && stmt.moduleSpecifier !== undefined && ts.isIdentifier(stmt.exportClause.name)) {
+      // `export * as ns from "m"`: the namespace object of m, bound as this module's `ns` (as `import * as ns` is)
+      this.materializeNamespace(ctx, stmt.moduleSpecifier, stmt.exportClause.name, stmt);
     } else if (ts.isFunctionDeclaration(stmt) && stmt.body && stmt.name) {
       // Step D: if this function was hoisted at the prologue (the common case
       // for any function declaration in a block), the binding already exists —
@@ -13579,6 +13617,33 @@ class Exporter {
   ensureLocalAlias(ctx: FnCtx, sym: ts.Symbol, local: number) {
     ctx.localOfSymbol.set(sym, local);
     (ctx.storageLocals ??= new Set()).add(local);
+  }
+  /** The `default` export symbol of the module a declaration is in (a default export that is a value). */
+  private defaultExportSymbolOf(decl: ts.Node): ts.Symbol | undefined {
+    const sf = decl.getSourceFile();
+    const modSym = this.checker.getSymbolAtLocation(sf) ?? (sf as unknown as { symbol?: ts.Symbol }).symbol;
+    if (!modSym) return undefined;
+    for (const e of this.checker.getExportsOfModule(modSym)) if (e.name === "default") return e;
+    return undefined;
+  }
+  /** Whether a statement is a default export carrying a value: `export default <expression>` (not a bare
+   *  name, which aliases a binding) or an anonymous `export default function`. */
+  private isValueDefaultExport(stmt: ts.Node): boolean {
+    return (ts.isExportAssignment(stmt) && !stmt.isExportEquals && !ts.isIdentifier(stmt.expression)) ||
+      (ts.isFunctionDeclaration(stmt) && stmt.body !== undefined && stmt.name === undefined);
+  }
+  /** The binding of a namespace statement (`import * as name from` or `export * as name from`), else undefined. */
+  private namespaceBindingName(stmt: ts.Node): ts.Identifier | undefined {
+    if (ts.isImportDeclaration(stmt) && this.isNamespaceImportStmt(stmt)) return (stmt.importClause!.namedBindings as ts.NamespaceImport).name;
+    if (ts.isExportDeclaration(stmt) && stmt.exportClause !== undefined && ts.isNamespaceExport(stmt.exportClause) && stmt.moduleSpecifier !== undefined && ts.isIdentifier(stmt.exportClause.name)) return stmt.exportClause.name;
+    return undefined;
+  }
+  /** Binds a default export's value to its symbol in __module_init (a cell when importers capture it). */
+  private bindDefaultExport(ctx: FnCtx, decl: ts.Node, v: number): void {
+    const sym = this.defaultExportSymbolOf(decl);
+    if (!sym) { this.unsupported(decl, "export default: the module's default export symbol was not found"); return; }
+    if (this.hasCaptured(ctx, sym)) this.storeCaptured(ctx, sym, v);
+    else this.ensureLocalAlias(ctx, sym, v);
   }
 
   // Step D: hoist `function` and `var` declarations to the function prologue.
@@ -15032,6 +15097,9 @@ class Exporter {
             }
           }
         }
+      } else if (this.isValueDefaultExport(stmt)) {
+        const s = this.defaultExportSymbolOf(stmt);
+        if (s) this.moduleScopeSyms.add(s);
       } else if (ts.isFunctionDeclaration(stmt) && stmt.name) {
         const s = this.symbolOf(stmt.name);
         if (s) {
@@ -15067,8 +15135,8 @@ class Exporter {
     // Namespace getters need owned export cells even when no ordinary function
     // refers to a binding. The namespace binding itself can escape into closures.
     for (const module of this.modules) for (const stmt of module.statements) {
-      if (!this.isNamespaceImportStmt(stmt)) continue;
-      const name = (stmt.importClause!.namedBindings as ts.NamespaceImport).name;
+      const name = this.namespaceBindingName(stmt);
+      if (!name) continue;
       const modSym = this.symbolOf(name);
       if (!modSym) continue;
       this.moduleScopeSyms.add(modSym);
@@ -15099,8 +15167,9 @@ class Exporter {
       if (ts.isEnumDeclaration(stmt)) return true; // builds a runtime object binding
       if (ts.isModuleDeclaration(stmt)) return ts.isIdentifier(stmt.name) && this.isValueNamespace(stmt); // value namespace -> runtime object
       if (ts.isImportDeclaration(stmt)) return this.isNamespaceImportStmt(stmt); // import * as ns -> object
-      if (ts.isExportDeclaration(stmt)) return false;
-      if (ts.isImportEqualsDeclaration(stmt) || ts.isExportAssignment(stmt)) return false;
+      if (ts.isExportDeclaration(stmt)) return this.namespaceBindingName(stmt) !== undefined; // export * as ns -> object
+      if (ts.isExportAssignment(stmt)) return this.isValueDefaultExport(stmt); // export default <expression> -> a binding
+      if (ts.isImportEqualsDeclaration(stmt)) return false;
       if (stmt.kind === ts.SyntaxKind.EmptyStatement) return false;
       return true;
     };
@@ -15127,8 +15196,9 @@ class Exporter {
       if (ts.isEnumDeclaration(stmt)) { moduleStmts.push(stmt); continue; }
       if (ts.isModuleDeclaration(stmt)) { if (ts.isIdentifier(stmt.name) && this.isValueNamespace(stmt)) moduleStmts.push(stmt); continue; }
       if (ts.isImportDeclaration(stmt)) { if (this.isNamespaceImportStmt(stmt)) moduleStmts.push(stmt); continue; }
-      if (ts.isExportDeclaration(stmt)) continue;
-      if (ts.isImportEqualsDeclaration(stmt) || ts.isExportAssignment(stmt)) continue;
+      if (ts.isExportDeclaration(stmt)) { if (this.namespaceBindingName(stmt) !== undefined) moduleStmts.push(stmt); continue; }
+      if (ts.isExportAssignment(stmt)) { if (this.isValueDefaultExport(stmt)) moduleStmts.push(stmt); continue; }
+      if (ts.isImportEqualsDeclaration(stmt)) continue;
       if (stmt.kind === ts.SyntaxKind.EmptyStatement) continue;
       moduleStmts.push(stmt);
     }
@@ -15675,7 +15745,19 @@ function main() {
     if (parsed.errors.length) report(parsed.errors);
     rootNames.push(...parsed.fileNames.filter(f => /\.d\.[cm]?ts$/.test(f)));
     compilerOptions = { ...compilerOptions, ...parsed.options };
+    // garnet compiles every program as ES modules bundled whole: a project's Node module kinds
+    // (Node16/NodeNext, whose CommonJS detection by package.json would make garnet's own library
+    // files CommonJS and reject their ESM syntax under verbatimModuleSyntax) are compiled as ESNext
+    // with Bundler resolution, which resolves the same `.js` -> `.ts` specifiers, package `exports`
+    // and custom conditions
+    if (compilerOptions.module !== undefined && (ts.ModuleKind[compilerOptions.module] ?? "").startsWith("Node")) {
+      compilerOptions.module = ts.ModuleKind.ESNext;
+      compilerOptions.moduleResolution = ts.ModuleResolutionKind.Bundler;
+    }
     compilerOptions.paths = { ...garnetModulePaths(), ...(compilerOptions.paths ?? {}) };
+    // the globals garnet's runtime provides (console, TextEncoder, setTimeout, ...) are typed by lib.dom:
+    // a project that lists its libs without it gets it added (the default libs of a target include it)
+    if (compilerOptions.lib !== undefined && !compilerOptions.lib.some((l) => /dom/i.test(l))) compilerOptions.lib = [...compilerOptions.lib, "lib.dom.d.ts"];
     if (strictCompiler) compilerOptions.strict = true;
     // Garnet bundles the entry's source graph instead of emitting project
     // references/declarations. Keep resolution, libraries and checking options,
@@ -15704,12 +15786,17 @@ function main() {
       !f.isDeclarationFile &&
       !program.isSourceFileDefaultLibrary(f) &&
       !program.isSourceFileFromExternalLibrary(f));
+    // garnet's own library files (lib/node, lib/garnet) are checked with the project's options; the
+    // lint-only diagnostics a stricter project enables (unused names, override modifiers, the form of
+    // type-only imports) are not type errors and do not block the compile; type errors in them do
+    const libDir = path.resolve(__dirname, "..", "lib") + path.sep;
+    const lintOnly = new Set([6133, 6138, 6192, 6196, 6198, 6199, 6205, 4114, 1484, 7027]);
     const diagnostics: ts.Diagnostic[] = [
       ...userFiles.flatMap((f) => program.getSyntacticDiagnostics(f)),
       ...userFiles.flatMap((f) => program.getSemanticDiagnostics(f)),
       ...program.getGlobalDiagnostics(),
       ...program.getOptionsDiagnostics(),
-    ];
+    ].filter((d) => !(d.file !== undefined && path.resolve(d.file.fileName).startsWith(libDir) && lintOnly.has(d.code)));
     if (diagnostics.length > 0) {
       const fmtHost: ts.FormatDiagnosticsHost = {
         getCanonicalFileName: (f) => f,

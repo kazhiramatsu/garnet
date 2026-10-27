@@ -1,0 +1,13 @@
+{
+  "extends": "./.configs/tsconfig.base.json",
+  "compilerOptions": {
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "customConditions": ["@zod/source"],
+    "noEmit": true,
+    "types": [],
+    "noUnusedLocals": false,
+    "noUnusedParameters": false
+  },
+  "files": ["garnet-driver.ts"]
+}

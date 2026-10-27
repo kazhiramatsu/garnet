@@ -10759,3 +10759,44 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   with 1 and 8 threads and the GPU check; the generation speed unchanged in
   an alternating A/B (74 tok/s on eight threads both). The llama track
   pauses here (Kaz: 本筋から外れるので一旦終わり).
+- Real projects: hono, zod, prisma, effect (Session 353, `docs/real_projects.md`).
+  Kaz asked for real TypeScript projects compiled with garnet and measured
+  against Node. `benchmarks/real/run.sh <name>` builds a driver against a
+  clone under `build/real/<name>` with the project's own tsconfig (`-p`),
+  transpiles the import graph for Node with the repository's TypeScript,
+  compares the outputs and reports the median wall times. The projects'
+  compiler options exposed strictness gaps in garnet's library (`override`,
+  `exactOptionalPropertyTypes`, a `lib` without DOM, NodeNext module kinds,
+  lint-only diagnostics in library files) and constructs garnet lacked, all
+  implemented with fixtures: `export default <expression>` and the anonymous
+  `export default function` (the module init had skipped both statements:
+  the bundler fixture default_values caught the silent undefined before any
+  project ran), `export * as ns from "m"`, `new Date(value)` (a Date, an
+  ISO or toString-shaped string, else ToNumber; MakeDay arithmetic for UTC),
+  `Date.parse`, `toUTCString`, `JSON.stringify` with a replacer,
+  `Object.create(proto, descriptors)`, `instanceof RegExp`; the Date method
+  table's `in` test matched `toString` through Object.prototype (fixed to
+  an own-property test). hono's TrieRouter is the measured benchmark (Kaz:
+  the regexp routers are a separate concern, the adapter recompiles by
+  pattern text on every match). Two findings: V8's StringSplitCache served
+  the driver's identical path objects (Node 124 ms, garnet 365: 2.9x); with
+  64 distinct string objects per request (a server's paths are fresh) Node
+  takes 251 ms. Then, each change A/B'd by alternating binaries: the
+  pre-allocation GC check in line (its pacing logic had kept it out of line:
+  a call per allocation), a `[]` literal's inline slots as four stores (a
+  memset_pattern16 call), substrings under 13 units flat (views paid the
+  parent on every use), a flat string caching its key id in its offset word
+  (`TS_STR_FLAG_KEY`, interning once per string object), `split` by one
+  character in one memchr pass (`obj["lit"]` as a named access measured
+  neutral and was reverted: the named path reads a `number`-typed property
+  unboxed, so an absent Record key read NaN in gc/payload_props), and
+  receiver class hints for generic classes (`Node<T>`'s field reads had
+  gone through the property cache out of line, 13% of the profile): garnet
+  338 -> 295 ms against Node's 251 (1.35x -> 1.18x). zod: one reject left
+  (`class Definition extends Parent {}` with a runtime `Parent`; and `Error`
+  as a constructor value is not constructable), the next slice. prisma: the
+  PSL parser's value imports reach npm packages (arktype) that have no
+  sources in the clone. effect: main needs TypeScript 7; 3.22.4's `Schema`
+  pulls `fast-check`. Gates: conformance all plain and strict, GC protect,
+  unit, bundler 46/46 (two reject fixtures became positive tests), bench,
+  GC stress.

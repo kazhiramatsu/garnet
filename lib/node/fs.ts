@@ -10,11 +10,12 @@ import { join, dirname, resolve } from "./path";
 export type PathLike = string | Buffer;
 export type BufferEncoding = string;
 export interface ReadOptions { encoding?: string | null; flag?: string }
-export interface WriteOptions { encoding?: string | null; mode?: number; flag?: string }
-export interface ReaddirOptions { encoding?: string | null; withFileTypes?: boolean; recursive?: boolean }
-export interface MkdirOptions { recursive?: boolean; mode?: number | string }
-export interface RmOptions { recursive?: boolean; force?: boolean; maxRetries?: number; retryDelay?: number }
-export interface StatOptions { throwIfNoEntry?: boolean; bigint?: false }
+// the optional fields admit an explicit undefined (a project compiled with exactOptionalPropertyTypes passes them so)
+export interface WriteOptions { encoding?: string | null | undefined; mode?: number | undefined; flag?: string | undefined }
+export interface ReaddirOptions { encoding?: string | null | undefined; withFileTypes?: boolean | undefined; recursive?: boolean | undefined }
+export interface MkdirOptions { recursive?: boolean | undefined; mode?: number | string | undefined }
+export interface RmOptions { recursive?: boolean | undefined; force?: boolean | undefined; maxRetries?: number | undefined; retryDelay?: number | undefined }
+export interface StatOptions { throwIfNoEntry?: boolean | undefined; bigint?: false | undefined }
 type Callback<T> = (err: NodeJS_ErrnoException | null, value: T) => void;
 type NodeJS_ErrnoException = Error & { code?: string; errno?: number; syscall?: string; path?: string };
 
@@ -43,7 +44,7 @@ function modeOf(mode: number | string | undefined, dflt: number): number {
 }
 const UTF8_OPTIONS = { encoding: "utf8" as string | null };
 const NO_OPTIONS = { encoding: null as string | null };
-function encodingArg(options: unknown, name: string = "options"): { encoding: string | null; flag?: string; mode?: number; withFileTypes?: boolean; recursive?: boolean } {
+function encodingArg(options: unknown, name: string = "options"): { encoding: string | null; flag?: string | undefined; mode?: number | undefined; withFileTypes?: boolean | undefined; recursive?: boolean | undefined } {
   if (options === undefined || options === null) return NO_OPTIONS;
   if (options === "utf8" || options === "utf-8") return UTF8_OPTIONS;   // the common call, no allocation
   if (typeof options === "string") { if (options !== "buffer" && normalizeEncoding(options) === undefined) throw codedTypeError("ERR_INVALID_ARG_VALUE", "The argument '" + name + "' is invalid encoding. Received '" + options + "'"); return { encoding: options === "buffer" ? null : options }; }

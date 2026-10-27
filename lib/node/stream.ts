@@ -50,40 +50,41 @@ function highWaterMarkFrom(options: { highWaterMark?: number; objectMode?: boole
 function defaultHighWaterMark(objectMode: boolean): number { return objectMode ? 16 : 65536; }
 
 // ---- options ----
+// the option members admit an explicit undefined (a project compiled with exactOptionalPropertyTypes passes them so)
 export interface StreamOptions {
-  highWaterMark?: number;
-  objectMode?: boolean;
-  emitClose?: boolean;
-  autoDestroy?: boolean;
-  destroy?: (this: Stream, error: Error | null, callback: (error?: Error | null) => void) => void;
+  highWaterMark?: number | undefined;
+  objectMode?: boolean | undefined;
+  emitClose?: boolean | undefined;
+  autoDestroy?: boolean | undefined;
+  destroy?: ((this: Stream, error: Error | null, callback: (error?: Error | null) => void) => void) | undefined;
   /** Asynchronous setup (opening a file): writes buffer and reads wait until the callback. */
-  construct?: (this: Stream, callback: (error?: Error | null) => void) => void;
-  signal?: unknown;
+  construct?: ((this: Stream, callback: (error?: Error | null) => void) => void) | undefined;
+  signal?: unknown | undefined;
 }
 export interface ReadableOptions extends StreamOptions {
-  encoding?: string;
-  readable?: boolean;
-  read?: (this: Readable, size: number) => void;
-  readableObjectMode?: boolean;
-  readableHighWaterMark?: number;
+  encoding?: string | undefined;
+  readable?: boolean | undefined;
+  read?: ((this: Readable, size: number) => void) | undefined;
+  readableObjectMode?: boolean | undefined;
+  readableHighWaterMark?: number | undefined;
 }
 export interface WritableOptions extends StreamOptions {
-  decodeStrings?: boolean;
-  defaultEncoding?: string;
-  write?: (this: Writable, chunk: any, encoding: string, callback: (error?: Error | null) => void) => void;
-  writev?: (this: Writable, chunks: { chunk: any; encoding: string }[], callback: (error?: Error | null) => void) => void;
-  final?: (this: Writable, callback: (error?: Error | null) => void) => void;
-  writableObjectMode?: boolean;
-  writableHighWaterMark?: number;
+  decodeStrings?: boolean | undefined;
+  defaultEncoding?: string | undefined;
+  write?: ((this: Writable, chunk: any, encoding: string, callback: (error?: Error | null) => void) => void) | undefined;
+  writev?: ((this: Writable, chunks: { chunk: any; encoding: string }[], callback: (error?: Error | null) => void) => void) | undefined;
+  final?: ((this: Writable, callback: (error?: Error | null) => void) => void) | undefined;
+  writableObjectMode?: boolean | undefined;
+  writableHighWaterMark?: number | undefined;
 }
 export interface DuplexOptions extends ReadableOptions, WritableOptions {
-  allowHalfOpen?: boolean;
-  readable?: boolean;
-  writable?: boolean;
+  allowHalfOpen?: boolean | undefined;
+  readable?: boolean | undefined;
+  writable?: boolean | undefined;
 }
 export interface TransformOptions extends DuplexOptions {
-  transform?: (this: Transform, chunk: any, encoding: string, callback: (error?: Error | null, data?: any) => void) => void;
-  flush?: (this: Transform, callback: (error?: Error | null, data?: any) => void) => void;
+  transform?: ((this: Transform, chunk: any, encoding: string, callback: (error?: Error | null, data?: any) => void) => void) | undefined;
+  flush?: ((this: Transform, callback: (error?: Error | null, data?: any) => void) => void) | undefined;
 }
 
 // ---- the legacy base: an EventEmitter with pipe ----
@@ -154,7 +155,7 @@ export class ReadableState {
 }
 
 export class Readable extends Stream {
-  _readableState: ReadableState;
+  override _readableState: ReadableState;
   private readImpl: ((this: Readable, size: number) => void) | undefined;
   private destroyImpl: ((this: Stream, error: Error | null, callback: (error?: Error | null) => void) => void) | undefined;
   /** Duplex: the writable half ends when the readable half does (allowHalfOpen false). */
@@ -250,7 +251,7 @@ export class Readable extends Stream {
     }
     return ret;
   }
-  on(event: string | symbol, listener: (...args: any[]) => void): this {
+  override on(event: string | symbol, listener: (...args: any[]) => void): this {
     super.on(event, listener);
     const state = this._readableState;
     if (event === "data") {
@@ -267,14 +268,14 @@ export class Readable extends Stream {
     }
     return this;
   }
-  addListener(event: string | symbol, listener: (...args: any[]) => void): this { return this.on(event, listener); }
-  removeListener(event: string | symbol, listener: (...args: any[]) => void): this {
+  override addListener(event: string | symbol, listener: (...args: any[]) => void): this { return this.on(event, listener); }
+  override removeListener(event: string | symbol, listener: (...args: any[]) => void): this {
     super.removeListener(event, listener);
     if (event === "readable") nextTick(() => updateReadableListening(this));
     return this;
   }
-  off(event: string | symbol, listener: (...args: any[]) => void): this { return this.removeListener(event, listener); }
-  removeAllListeners(event?: string | symbol): this {
+  override off(event: string | symbol, listener: (...args: any[]) => void): this { return this.removeListener(event, listener); }
+  override removeAllListeners(event?: string | symbol): this {
     super.removeAllListeners(event);
     if (event === "readable" || event === undefined) nextTick(() => updateReadableListening(this));
     return this;
@@ -306,7 +307,7 @@ export class Readable extends Stream {
     state.paused = true;
     return this;
   }
-  pipe<T extends Sink>(dest: T, pipeOpts?: { end?: boolean }): T {
+  override pipe<T extends Sink>(dest: T, pipeOpts?: { end?: boolean }): T {
     const src = this;
     const state = this._readableState;
     state.pipes.push(dest);
@@ -1003,7 +1004,7 @@ function finish(stream: WritableLike, state: WritableState): void {
 }
 
 export class Writable extends Stream {
-  _writableState: WritableState;
+  override _writableState: WritableState;
   _writev: ((chunks: { chunk: any; encoding: string }[], callback: Callback) => void) | null = null;
   _final: ((callback: Callback) => void) | null = null;
   private writeImpl: ((this: Writable, chunk: any, encoding: string, callback: Callback) => void) | undefined;
@@ -1066,7 +1067,7 @@ export class Writable extends Stream {
 
 // ======================= Duplex =======================
 export class Duplex extends Readable {
-  _writableState: WritableState;
+  override _writableState: WritableState;
   _writev: ((chunks: { chunk: any; encoding: string }[], callback: Callback) => void) | null = null;
   _final: ((callback: Callback) => void) | null = null;
   private writeImpl: ((this: Writable, chunk: any, encoding: string, callback: Callback) => void) | undefined;
@@ -1109,10 +1110,10 @@ export class Duplex extends Readable {
   get writableObjectMode(): boolean { return this._writableState.objectMode; }
   get writableCorked(): number { return this._writableState.corked; }
   get writableNeedDrain(): boolean { const w = this._writableState; return !w.destroyed && !w.ending && w.needDrain; }
-  get destroyed(): boolean { return this._readableState.destroyed || this._writableState.destroyed; }
-  set destroyed(value: boolean) { this._readableState.destroyed = value; this._writableState.destroyed = value; }
-  get errored(): Error | null { return this._writableState.errored !== null ? this._writableState.errored : this._readableState.errored; }
-  get closed(): boolean { return this._writableState.closed && this._readableState.closed; }
+  override get destroyed(): boolean { return this._readableState.destroyed || this._writableState.destroyed; }
+  override set destroyed(value: boolean) { this._readableState.destroyed = value; this._writableState.destroyed = value; }
+  override get errored(): Error | null { return this._writableState.errored !== null ? this._writableState.errored : this._readableState.errored; }
+  override get closed(): boolean { return this._writableState.closed && this._readableState.closed; }
 }
 
 // ======================= Transform / PassThrough =======================
@@ -1154,7 +1155,7 @@ export class Transform extends Duplex {
     if (this.flushImpl !== undefined) { this.flushImpl.call(this, callback); return; }
     callback();
   }
-  _write(chunk: any, encoding: string, callback: Callback): void {
+  override _write(chunk: any, encoding: string, callback: Callback): void {
     const rState = this._readableState;
     const wState = this._writableState;
     const length = rState.length;
@@ -1165,7 +1166,7 @@ export class Transform extends Duplex {
       else this.pendingCallback = callback;
     });
   }
-  _read(_size: number): void {
+  override _read(_size: number): void {
     if (this.pendingCallback !== null) {
       const callback = this.pendingCallback;
       this.pendingCallback = null;
@@ -1174,7 +1175,7 @@ export class Transform extends Duplex {
   }
 }
 export class PassThrough extends Transform {
-  _transform(chunk: any, _encoding: string, callback: (error?: Error | null, data?: any) => void): void { callback(null, chunk); }
+  override _transform(chunk: any, _encoding: string, callback: (error?: Error | null, data?: any) => void): void { callback(null, chunk); }
 }
 
 // ======================= construct =======================

@@ -29,7 +29,7 @@ export class WriteStream extends Writable {
     this.rows = size === undefined ? undefined : size[1];
     this.isStdio = fd === 1 || fd === 2;
   }
-  _write(chunk: string | Uint8Array, encoding: string, callback: (error?: Error | null) => void): void {
+  override _write(chunk: string | Uint8Array, encoding: string, callback: (error?: Error | null) => void): void {
     let data: string | Uint8Array = chunk;
     if (typeof chunk === "string" && encoding !== "utf8" && encoding !== "utf-8" && encoding !== "buffer") data = Buffer.from(chunk, encoding);
     const total = typeof data === "string" ? host.utf8Length(data) : data.length;
@@ -42,7 +42,7 @@ export class WriteStream extends Writable {
     }
     callback(error);
   }
-  _destroy(error: Error | null, callback: (error?: Error | null) => void): void { callback(error); }
+  override _destroy(error: Error | null, callback: (error?: Error | null) => void): void { callback(error); }
   getColorDepth(_env?: object): number { return this.isTTY === true ? 8 : 1; }
   hasColors(count: number | object = 16, _env?: object): boolean {
     if (typeof count !== "number") count = 16;
@@ -75,7 +75,7 @@ export class ReadStream extends Readable {
     this.fd = fd;
     this.isTTY = host.isatty(fd) ? true : undefined;
   }
-  _read(_size: number): void {
+  override _read(_size: number): void {
     if (this.watchId !== null) return;
     this.watchId = host.watchFd(this.fd,
       (bytes) => { if (!this.push(fromView(bytes))) this.stopWatching(); },
@@ -84,12 +84,12 @@ export class ReadStream extends Readable {
   private stopWatching(): void {
     if (this.watchId !== null) { host.unwatchFd(this.watchId); this.watchId = null; }
   }
-  pause(): this {
+  override pause(): this {
     super.pause();
     this.stopWatching();
     return this;
   }
-  _destroy(error: Error | null, callback: (error?: Error | null) => void): void {
+  override _destroy(error: Error | null, callback: (error?: Error | null) => void): void {
     this.stopWatching();
     callback(error);
   }

@@ -13722,7 +13722,8 @@ fn fnval_adapter_body(builtin: &str) -> Option<String> {
         "console.error" => Some("ts_console_err(a, n); return TS_UNDEFINED;".to_string()),
         "console.dir" => Some("ts_console_dir(n>0?a[0]:TS_UNDEFINED); return TS_UNDEFINED;".to_string()),
         // ---- JSON ----
-        "json.stringify" => hv(format!("ts_json_stringify({})", val(0))),
+        // the function value takes the replacer and space arguments as the call does
+        "json.stringify" => hv(format!("ts_json_stringify_replacer({}, {}, {})", val(0), val(1), val(2))),
         "json.stringify.len" => hv(format!("ts_num(ts_json_stringify_len({}))", val(0))),
         "json.stringify.indent.len" => hv(format!("ts_num(ts_json_stringify_indent_len({}, {}))", val(0), val(1))),
         "json.num.len" => hv(format!("ts_num(ts_json_num_len(ts_number_coerce({})))", val(0))),
@@ -22546,6 +22547,8 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 "abortsignal.timeout" => (format!("ts_abort_signal_timeout({})", v(0)), false),
                 // Date static
                 "date.now" => ("ts_to_num(ts_date_now_ms())".to_string(), true),
+                "date.value_ms" => (format!("ts_date_value_ms({})", v(0)), true),
+                "date.parse" => (format!("ts_date_parse_value({})", v(0)), true),
                 "date.fromComponents" => (
                     format!(
                         "ts_date_from_components({}, {}, {}, {}, {}, {}, {})",
@@ -22561,6 +22564,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 ),
                 "date.component" => (format!("ts_date_component({}, (int){})", n(0), n(1)), true),
                 "date.toISOString" => (format!("ts_date_to_iso({})", n(0)), false),
+                "date.toUTCString" => (format!("ts_date_to_utc_string({})", n(0)), false),
                 "date.toLocaleTimeString" => (format!("ts_date_to_locale_time({}, {}, {})", n(0), v(1), v(2)), false),
                 // Object static methods (use the field-name table)
                 "object.keys" => (format!("ts_object_keys({})", v(0)), false),
@@ -22749,6 +22753,10 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 "json.string.len" => (format!("ts_json_string_len_fast({})", v(0)), true),
                 "json.stringify.indent" => (
                     format!("ts_json_stringify_indent({}, {})", v(0), v(1)),
+                    false,
+                ),
+                "json.stringify.replacer" => (
+                    format!("ts_json_stringify_replacer({}, {}, {})", v(0), v(1), v(2)),
                     false,
                 ),
                 "json.stringify.indent.len" => (
@@ -23796,6 +23804,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 }
                 let acc = match kind {
                     "object" => "ts_object_proto",
+                    "regexp" => "ts_regexp_proto",
                     "array" => "ts_array_proto",
                     "string" => "ts_string_proto",
                     "map" => "ts_map_proto",

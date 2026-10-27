@@ -626,7 +626,7 @@ static tsv nh_utf8_length(tsv* a, int n){
   if (cell && (cell->flags & TS_STR_FLAG_VIEW)) cell = NULL;
   if (cell && (cell->flags & TS_STR_FLAG_UTF8LEN)) return ts_num((double)cell->offset);
   tsv total_v = nh_utf8_length_walk(v);
-  if (cell && ts_to_num(total_v) <= 4294967295.0){ cell->offset = (uint32_t)ts_to_num(total_v); cell->flags |= TS_STR_FLAG_UTF8LEN; }
+  if (cell && !(cell->flags & TS_STR_FLAG_KEY) && ts_to_num(total_v) <= 4294967295.0){ cell->offset = (uint32_t)ts_to_num(total_v); cell->flags |= TS_STR_FLAG_UTF8LEN; }   /* the offset word may already cache the key id */
   return total_v;
 }
 static tsv nh_random_bytes(tsv* a, int n){

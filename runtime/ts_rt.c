@@ -1522,7 +1522,10 @@ void ts_gc_set_root_depth(int n){
 }
 void ts_frame_restore(ts_frame_hdr* frame){ g_ts_frame_top = frame; }
 
-static inline void gc_before_alloc(void){
+/* The pre-allocation checks' slow path: the young collection when the nursery is full, the full
+   collection and its pacing when the heap crossed its threshold. gc_before_alloc, the inline part,
+   is the comparisons alone: an allocation-heavy loop pays a few loads and no call. */
+__attribute__((noinline)) static void gc_before_alloc_slow(void){
   if (TS_RT_UNLIKELY(!g_gc_config_inited)) gc_config_init();
   if (g_young_new_since_minor>=g_young_threshold || g_young_fresh_bytes>=g_young_cap_bytes ||
       g_payload_fresh_bytes>=g_payload_budget_bytes)
@@ -1594,6 +1597,15 @@ static inline void gc_before_alloc(void){
       g_full_threshold_bytes = g_heap_bytes * 2u;
     }
   }
+}
+static inline void gc_before_alloc(void){
+  if (TS_RT_UNLIKELY(!g_gc_config_inited ||
+      g_young_new_since_minor >= g_young_threshold || g_young_fresh_bytes >= g_young_cap_bytes ||
+      g_payload_fresh_bytes >= g_payload_budget_bytes || g_heap_bytes >= g_full_threshold_bytes
+#ifdef TSAOT_STACK_CHECK
+      || (g_sc_full_every && g_sc_minors_since_full >= g_sc_full_every)
+#endif
+      )) gc_before_alloc_slow();
 }
 /* The heap counts a cell's capacity (its size class), the measure its
    death subtracts (gc_cell_capacity); the statistics count requests. */
@@ -2439,7 +2451,8 @@ static void array_init_storage(ts_array* a, uint32_t len){
   a->len = len;
   a->cap = len < 4 ? 4 : len;
   a->data = (a->cap <= 4) ? a->inline_data : (tsv*)gc_owned_alloc(&a->o.h, sizeof(tsv) * a->cap);
-  for (uint32_t i=0;i<a->cap;i++) a->data[i] = TS_ARRAY_HOLE;   /* [len, cap) holes too (invariant) */
+  if (a->cap <= 4u){ tsv* d = a->data; d[0] = TS_ARRAY_HOLE; d[1] = TS_ARRAY_HOLE; d[2] = TS_ARRAY_HOLE; d[3] = TS_ARRAY_HOLE; }   /* the inline slots: four stores, not a fill call */
+  else for (uint32_t i=0;i<a->cap;i++) a->data[i] = TS_ARRAY_HOLE;   /* [len, cap) holes too (invariant) */
 }
 static void array_ensure_cap(ts_array* a, uint32_t need){
   if (need <= a->cap) return;
@@ -3976,6 +3989,18 @@ static int ts_key_from_value(tsv keyv, ts_key* out){
       g_lit_key_cache[slot].s = keyv; g_lit_key_cache[slot].key1 = k + 1u;
       *out = k;
       return 1;
+    } else if (ts_is_heap_str(keyv) && TS_RT_LIKELY(!g_region_mode)){
+      /* A flat heap string's offset word caches its key id (TS_STR_FLAG_KEY): the next lookup through
+         the same string (a route's parameter name, the method name a request object holds) skips the
+         intern table. Views and buffers use their offset; a shared worker's heap is not written. */
+      ts_string* x = ts_str_ptr_typed(keyv);
+      if (!(x->flags & (TS_STR_FLAG_VIEW | TS_STR_FLAG_UTF8LEN | TS_STR_FLAG_BUFFER))){
+        if (x->flags & TS_STR_FLAG_KEY){ *out = x->offset; return 1; }
+        ts_key k = ts_intern_string_value(keyv);
+        x->offset = k; x->flags |= TS_STR_FLAG_KEY;
+        *out = k;
+        return 1;
+      }
     }
   }
   tsv ks = keyv;
@@ -4725,6 +4750,7 @@ static tsv ts_string_slice_view(tsv src, uint32_t start, uint32_t len){
     return short_result;
   }
   if (start == 0 && len == x.len){ ts_gc_unroot(1); return src; }
+  if (len < 13u){ ts_gc_unroot(1); return ts_string_slice_copy(src, start, len); }   /* a short substring is flat (V8's sliced-string threshold): read in line, no parent kept */
   if (x.len > 65536u && len * 8u < x.len){
     ts_gc_unroot(1);
     return ts_string_slice_copy(src, start, len);
@@ -7372,6 +7398,30 @@ tsv ts_str_split(tsv s, tsv sep, tsv limit){
     ts_gc_unroot(3);
     return arr;
   }
+  /* A one-unit separator in one-byte storage and no limit (`path.split('/')`): one memchr pass
+     with the cut offsets on the stack, then the parts; the text is scanned once, not twice. */
+  if(ss.len==1 && xs.data && ss.data && ts_str_same_storage_width(xs, ss) && !(xs.flags & TS_STR_FLAG_UTF16) && !has_lim){
+    uint32_t cuts[64]; uint32_t ncut=0;
+    const char* base=xs.data; const char* p=base; const char* end=base+xs.len; char c=ss.data[0];
+    while(ncut<64u){
+      const char* hit=memchr(p, c, (size_t)(end-p));
+      if(!hit) break;
+      cuts[ncut++]=(uint32_t)(hit-base);
+      p=hit+1;
+    }
+    if(ncut<64u){
+      tsv arr=ts_new_array(ncut+1); ts_gc_root(&arr);
+      uint32_t start=0;
+      for(uint32_t i=0;i<=ncut;i++){
+        uint32_t stop = i<ncut ? cuts[i] : xs.len;
+        tsv part=ts_string_slice_view(s, start, stop-start);   /* s is rooted: a collection here moves it, the offsets stay */
+        ts_array_store_existing(arr, i, part);
+        start=stop+1;
+      }
+      ts_gc_unroot(3);
+      return arr;
+    }
+  }
   uint32_t count=0;
   for(uint32_t i=0;;){
     long long hit=ts_str_find_forward_view(xs, ss, i);
@@ -9698,6 +9748,131 @@ double ts_date_from_components(double y,double mo,double d,double h,double mi,do
   time_t t = mktime(&tm);
   return (double)t*1000.0 + mil;
 }
+/* The ISO format of the spec (Date Time String Format): YYYY or ±YYYYYY, optional -MM and -DD, an
+   optional time THH:mm[:ss[.sss...]] (a space for the T too) with Z or ±HH:mm, or none (date-only forms
+   are UTC, date-time forms local time); then this runtime's toString and toUTCString shapes
+   ("Www Mmm DD YYYY HH:MM:SS GMT±hhmm", "Www, DD Mmm YYYY HH:MM:SS GMT"); NaN for anything else. */
+static int date_digits(const char* s, uint32_t len, uint32_t* i, int n, int* out){
+  if (*i + (uint32_t)n > len) return 0;
+  int v = 0;
+  for (int k = 0; k < n; k++){ char c = s[*i + k]; if (c < '0' || c > '9') return 0; v = v * 10 + (c - '0'); }
+  *i += (uint32_t)n; *out = v; return 1;
+}
+static int date_month_name(const char* s, uint32_t len, uint32_t i, int* mon){
+  static const char* names[12] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+  if (i + 3 > len) return 0;
+  for (int m = 0; m < 12; m++) if (strncmp(s + i, names[m], 3) == 0){ *mon = m; return 1; }
+  return 0;
+}
+/* ECMAScript MakeDay: the days from the epoch to a civil date (proleptic Gregorian, any year; a day past
+   the month's end rolls over, as V8's parser lets it). */
+static double date_days_from_civil(long long y, int m, int d){
+  y -= m <= 2;
+  long long era = (y >= 0 ? y : y - 399) / 400;
+  unsigned yoe = (unsigned)(y - era * 400);
+  unsigned doy = (153u * (unsigned)(m + (m > 2 ? -3 : 9)) + 2u) / 5u + (unsigned)d - 1u;
+  unsigned doe = yoe * 365u + yoe / 4u - yoe / 100u + doy;
+  return (double)(era * 146097LL + (long long)doe - 719468LL);
+}
+static double date_from_fields(int y, int mo, int d, int h, int mi, int sec, double ms, int utc, int offsetMin){
+  if (mo < 1 || mo > 12 || d < 1 || d > 31 || h > 24 || mi > 59 || sec > 59) return NAN;
+  if (h == 24 && (mi || sec || ms != 0.0)) return NAN;   /* 24:00 is the end of the day */
+  double t;
+  if (utc){
+    t = date_days_from_civil(y, mo, d) * 86400000.0 + h * 3600000.0 + mi * 60000.0 + sec * 1000.0 + ms - (double)offsetMin * 60000.0;
+  } else {
+    struct tm tm; memset(&tm, 0, sizeof tm);   /* the host's local time, as the Date methods use it */
+    tm.tm_year = y - 1900; tm.tm_mon = mo - 1; tm.tm_mday = d; tm.tm_hour = h; tm.tm_min = mi; tm.tm_sec = sec; tm.tm_isdst = -1;
+    t = (double)mktime(&tm) * 1000.0 + ms;
+  }
+  if (fabs(t) > 8.64e15) return NAN;   /* the time value range */
+  return t;
+}
+double ts_date_parse_chars(const char* s, uint32_t len){
+  uint32_t i = 0;
+  int y = 0, mo = 1, d = 1, h = 0, mi = 0, sec = 0; double ms = 0.0;
+  /* the ISO form */
+  int sign = 1, ok = 0;
+  if (len > 0 && (s[0] == '+' || s[0] == '-')){ sign = s[0] == '-' ? -1 : 1; i = 1; ok = date_digits(s, len, &i, 6, &y); y *= sign; if (ok && sign < 0 && y == 0) ok = 0; }
+  else ok = date_digits(s, len, &i, 4, &y);
+  if (ok){
+    int hasTime = 0, utc = 1, offsetMin = 0;
+    if (i < len && s[i] == '-'){ i++; ok = date_digits(s, len, &i, 2, &mo); if (ok && i < len && s[i] == '-'){ i++; ok = date_digits(s, len, &i, 2, &d); } }
+    if (ok && i < len && (s[i] == 'T' || s[i] == 't' || s[i] == ' ')){
+      i++; hasTime = 1; utc = 0;
+      ok = date_digits(s, len, &i, 2, &h) && i < len && s[i] == ':' && (i++, date_digits(s, len, &i, 2, &mi));
+      if (ok && i < len && s[i] == ':'){ i++; ok = date_digits(s, len, &i, 2, &sec);
+        if (ok && i < len && (s[i] == '.' || s[i] == ',')){ i++; int nd = 0; double frac = 0.0, scale = 100.0;
+          while (i < len && s[i] >= '0' && s[i] <= '9'){ if (nd < 3) frac += (s[i] - '0') * scale; scale /= 10.0; nd++; i++; }
+          if (nd == 0) ok = 0; ms = frac; } }
+      if (ok && i < len){
+        if (s[i] == 'Z' || s[i] == 'z'){ utc = 1; i++; }
+        else if (s[i] == '+' || s[i] == '-'){ int osign = s[i] == '-' ? -1 : 1, oh = 0, om = 0; i++;
+          ok = date_digits(s, len, &i, 2, &oh) && i < len && s[i] == ':' && (i++, date_digits(s, len, &i, 2, &om));
+          utc = 1; offsetMin = osign * (oh * 60 + om); }
+      }
+    }
+    if (ok && i == len) return date_from_fields(y, mo, d, h, mi, sec, ms, utc, offsetMin);
+  }
+  /* "Www Mmm DD YYYY HH:MM:SS GMT±hhmm (...)" and "Www, DD Mmm YYYY HH:MM:SS GMT" */
+  i = 0;
+  if (len >= 24 && s[3] == ' ' && date_month_name(s, len, 4, &mo)){
+    i = 8; mo += 1;
+    if (date_digits(s, len, &i, 2, &d) && i < len && s[i] == ' ' && (i++, date_digits(s, len, &i, 4, &y)) && i < len && s[i] == ' ' &&
+        (i++, date_digits(s, len, &i, 2, &h)) && i < len && s[i] == ':' && (i++, date_digits(s, len, &i, 2, &mi)) && i < len && s[i] == ':' && (i++, date_digits(s, len, &i, 2, &sec)) &&
+        i + 4 <= len && strncmp(s + i, " GMT", 4) == 0){
+      i += 4; int offsetMin = 0;
+      if (i < len && (s[i] == '+' || s[i] == '-')){ int osign = s[i] == '-' ? -1 : 1, oh = 0, om = 0; i++; if (!date_digits(s, len, &i, 2, &oh) || !date_digits(s, len, &i, 2, &om)) return NAN; offsetMin = osign * (oh * 60 + om); }
+      return date_from_fields(y, mo, d, h, mi, sec, 0.0, 1, offsetMin);
+    }
+  }
+  if (len >= 29 && s[3] == ',' && s[4] == ' ' && date_month_name(s, len, 8, &mo)){
+    i = 5; mo += 1;
+    if (date_digits(s, len, &i, 2, &d) && (i = 12, date_digits(s, len, &i, 4, &y)) && i < len && s[i] == ' ' &&
+        (i++, date_digits(s, len, &i, 2, &h)) && i < len && s[i] == ':' && (i++, date_digits(s, len, &i, 2, &mi)) && i < len && s[i] == ':' && (i++, date_digits(s, len, &i, 2, &sec)) &&
+        i + 4 == len && strncmp(s + i, " GMT", 4) == 0)
+      return date_from_fields(y, mo, d, h, mi, sec, 0.0, 1, 0);
+  }
+  return NAN;
+}
+/* Date.parse(value): ToString, then the formats above. */
+double ts_date_parse_value(tsv v){
+  tsv s = ts_is_str(v) ? v : ts_to_string_v(v);
+  ts_gc_root(&s);
+  uint32_t len; char* text = ts_string_utf8_copy(s, &len);
+  double r = ts_date_parse_chars(text, len);
+  free(text);
+  ts_gc_unroot(1);
+  return r;
+}
+/* Date.prototype.toUTCString: "Www, DD Mmm YYYY HH:MM:SS GMT", "Invalid Date" for NaN. */
+tsv ts_date_to_utc_string(double ms){
+  if (ms != ms) return ts_new_string_ascii("Invalid Date", 12);
+  static const char* days[7] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+  static const char* months[12] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+  time_t secs = (time_t)floor(ms / 1000.0);
+  struct tm tm; gmtime_r(&secs, &tm);
+  char buf[64];
+  int n = snprintf(buf, sizeof buf, "%s, %02d %s %04d %02d:%02d:%02d GMT", days[tm.tm_wday], tm.tm_mday, months[tm.tm_mon], tm.tm_year + 1900, tm.tm_hour, tm.tm_min, tm.tm_sec);
+  return ts_new_string_ascii(buf, (uint32_t)n);
+}
+/* new Date(value): a Date's own time value, a string parsed as above, anything else through ToNumber. */
+double ts_date_value_ms(tsv v){
+  if (ts_is_num(v)) return ts_to_num(v);
+  if (ts_is_str(v)){
+    uint32_t len; char* text = ts_string_utf8_copy(v, &len);
+    double r = ts_date_parse_chars(text, len);
+    free(text);
+    return r;
+  }
+  if (ts_is_obj(v)){
+    static uint32_t key = 0;
+    if (!key) key = ts_intern_field("__date_ms", 9);
+    tsv ms = ts_get(v, key);
+    if (ts_is_num(ms)) return ts_to_num(ms);
+  }
+  return ts_number_coerce(v);
+}
 /* Extract a Date component from epoch-ms. `which` low nibble selects the field;
    bit 4 (|16) selects the UTC variant. 8 = getTimezoneOffset (minutes). */
 double ts_date_component(double ms, int which){
@@ -11083,8 +11258,13 @@ tsv ts_object_from_entries(tsv entries){
    current): the cycle test. Frames live on the C stack, so a throw that
    leaves a stringify call leaves nothing behind. */
 typedef struct json_path { tsv* slot; struct json_path* up; } json_path;
-typedef struct { char* p; size_t len, cap; int heap; int nonascii; json_path* path; char small[256]; } jbuf;
-static void jb_init(jbuf* b){ b->p=b->small; b->len=0; b->cap=sizeof(b->small); b->heap=0; b->nonascii=0; b->path=NULL; }
+/* JSON.stringify's replacer: `fn` a function called as fn.call(holder, key, value) at the root
+   (holder {"": value}) and at every property and element after toJSON, its result serialized;
+   `allow` an array of property names, the properties every object serializes, in that order
+   (arrays are not filtered). Either is undefined when absent; `rep` is NULL without a replacer. */
+typedef struct json_replacer { tsv fn; tsv allow; tsv root_holder; } json_replacer;
+typedef struct { char* p; size_t len, cap; int heap; int nonascii; json_path* path; json_replacer* rep; char small[256]; } jbuf;
+static void jb_init(jbuf* b){ b->p=b->small; b->len=0; b->cap=sizeof(b->small); b->heap=0; b->nonascii=0; b->path=NULL; b->rep=NULL; }
 static void jb_grow(jbuf* b, size_t need){
   size_t nc=b->cap;
   while(need>nc) nc*=2;
@@ -11260,7 +11440,18 @@ static tsv json_apply_tojson(tsv v, const char* key, uint32_t keylen){
   tsv ks = ts_new_string(key ? key : "", key ? keylen : 0);
   ts_gc_root(&ks);
   tsv args[2] = { v, ks };
-  tsv r = ts_call(tj, args, 2);   /* this = v, arg0 = key */
+  tsv r = ts_call_method(tj, args, 2);   /* this = v, arg0 = key (dropped for an arrow or a plain function value) */
+  ts_gc_unroot(3);
+  return r;
+}
+/* SerializeJSONProperty step 3: the replacer function on (holder, key, value), after toJSON. */
+static tsv json_apply_replacer(jbuf* b, tsv holder, const char* key, uint32_t keylen, tsv val){
+  if (!b->rep || ts_is_undef(b->rep->fn)) return val;
+  ts_gc_root(&holder); ts_gc_root(&val);
+  tsv ks = ts_new_string(key, keylen);
+  ts_gc_root(&ks);
+  tsv args[3] = { holder, ks, val };
+  tsv r = ts_call_method(b->rep->fn, args, 3);   /* this = holder, arg0 = key, arg1 = value (the receiver dropped for an arrow) */
   ts_gc_unroot(3);
   return r;
 }
@@ -11271,6 +11462,7 @@ static int json_emit_obj_prop(jbuf* b, tsv recv, uint32_t key, tsv val, int dept
   const char* n=ts_field_name(key);
   if (!n) return 0;
   val = json_apply_tojson(val, n, ts_field_name_len(key)); /* toJSON before omit */
+  val = json_apply_replacer(b, recv, n, ts_field_name_len(key), val);
   if (ts_is_undef(val)||ts_is_func(val)) return 0;          /* omit in objects */
   ts_gc_root(&val);
   if (!*first) jb_putc(b,','); *first=0;
@@ -11318,6 +11510,7 @@ static int json_stringify_val(jbuf* b, tsv v, int depth, const char* indent){
   /* top-level toJSON (key ""): children get toJSON applied by their property /
      element / map emitters, so depth>0 never re-applies it to the same value. */
   if (depth == 0 && ts_is_obj(v)) v = json_apply_tojson(v, "", 0);
+  if (depth == 0 && b->rep) v = json_apply_replacer(b, b->rep->root_holder, "", 0, v);
   if (ts_is_undef(v) || ts_is_func(v)) return 0;          /* caller decides null vs omit */
   if (ts_is_null(v)){ jb_putz(b,"null"); return 1; }
   if (ts_is_bool(v)){ jb_putz(b,(v&1)?"true":"false"); return 1; }
@@ -11330,11 +11523,33 @@ static int json_stringify_val(jbuf* b, tsv v, int depth, const char* indent){
     for (uint32_t i=0;i<len;i++){ a=ts_ptr(v); if(i) jb_putc(b,',');
       jb_indent(b, indent, depth+1);
       tsv elem = ts_array_get(v, i);
-      if (ts_is_obj(elem)){ char ib[24]; int il=snprintf(ib,sizeof ib,"%u",i); elem=json_apply_tojson(elem, ib, (uint32_t)il); }
+      if (ts_is_obj(elem) || b->rep){
+        char ib[24]; int il=snprintf(ib,sizeof ib,"%u",i);
+        if (ts_is_obj(elem)) elem=json_apply_tojson(elem, ib, (uint32_t)il);
+        elem = json_apply_replacer(b, v, ib, (uint32_t)il, elem);
+      }
       if (!json_stringify_val(b, elem, depth+1, indent)) jb_putz(b,"null"); /* holes/undef -> null */ }
     if (len) jb_indent(b, indent, depth);
     json_leave(b, &node);
     jb_putc(b,']'); ts_gc_unroot(1); return 1;
+  }
+  if (b->rep && !ts_is_undef(b->rep->allow) && ts_is_obj(v)){   /* an array replacer: its names, in its order */
+    jb_putc(b,'{');
+    ts_gc_root(&v);
+    json_path node; json_enter(b, &node, &v, depth);
+    int first=1;
+    for (uint32_t i=0;;i++){
+      ts_array* al=ts_ptr(b->rep->allow);
+      if (i>=al->len) break;
+      tsv name = ts_array_get(b->rep->allow, i);
+      uint32_t key = ts_intern_view(ts_str_view_typed(name));
+      tsv val = ts_get(v, key);
+      json_emit_obj_prop(b, v, key, val, depth, indent, &first);
+    }
+    json_leave(b, &node);
+    ts_gc_unroot(1);
+    if (!first) jb_indent(b, indent, depth);
+    jb_putc(b,'}'); return 1;
   }
   /* a Map's entries are not properties: it stringifies as the object it is
      (its own enumerable properties, V8's {} for a bare Map) */
@@ -11406,6 +11621,65 @@ double ts_json_stringify_len(tsv v){
   ts_gc_unroot(1);
   jb_free(&b);
   return n;
+}
+/* JSON.stringify(value, replacer, space): the general form. A callable replacer or an array of
+   property names (strings and numbers, as the spec's PropertyList: others skipped, duplicates
+   once); anything else is no replacer, and without a space either the compact form. */
+tsv ts_json_stringify_replacer(tsv v, tsv replacer, tsv space){
+  json_replacer rep; rep.fn = TS_UNDEFINED; rep.allow = TS_UNDEFINED; rep.root_holder = TS_UNDEFINED;
+  ts_gc_root(&v); ts_gc_root(&replacer); ts_gc_root(&space);
+  ts_gc_root(&rep.fn); ts_gc_root(&rep.allow); ts_gc_root(&rep.root_holder);
+  if (ts_is_callable(replacer)) rep.fn = replacer;
+  else if (ts_is_array(replacer)){
+    rep.allow = ts_new_array(0);
+    for (uint32_t i=0;;i++){
+      ts_array* src=ts_ptr(replacer);
+      if (i>=src->len) break;
+      tsv e = ts_array_get(replacer, i);
+      tsv name;
+      if (ts_is_str(e)) name = e;
+      else if (ts_is_num(e)) name = ts_number_to_string_radix_d(e, 10.0);
+      else continue;
+      ts_gc_root(&name);
+      int dup = 0;
+      ts_array* al=ts_ptr(rep.allow);
+      for (uint32_t k=0;k<al->len;k++) if (ts_strict_eq_str(ts_array_get(rep.allow, k), name)){ dup=1; break; }
+      if (!dup) ts_array_push(rep.allow, name);
+      ts_gc_unroot(1);
+    }
+  }
+  tsv r;
+  if (ts_is_undef(rep.fn) && ts_is_undef(rep.allow)){
+    r = (ts_is_num(space) || ts_is_str(space)) ? ts_json_stringify_indent(v, space) : ts_json_stringify(v);
+    ts_gc_unroot(6);
+    return r;
+  }
+  rep.root_holder = ts_new_object();
+  ts_set_cstr(rep.root_holder, "", v);
+  char unit[64]; int ui = 0;
+  if (ts_is_num(space)){
+    int sp = (int)ts_to_num(space);
+    if (sp > 10) sp = 10;
+    for (int i=0;i<sp;i++) unit[ui++] = ' ';
+  } else if (ts_is_str(space)){
+    ts_strview s = ts_str_view_typed(space);
+    uint32_t n = s.len > 10 ? 10 : s.len;
+    for (uint32_t i=0;i<n;i++){
+      uint32_t before = i;
+      uint32_t cp = ts_str_cp_at_view(s, &i);
+      if (i >= n && i != before) break;
+      char tmp[4]; jbuf jb = { tmp, 0, sizeof(tmp) };
+      jb_put_utf8_cp(&jb, cp);
+      for(size_t k=0;k<jb.len && ui < (int)sizeof(unit)-1;k++) unit[ui++] = tmp[k];
+    }
+  }
+  unit[ui] = 0;
+  jbuf b; jb_init(&b); b.rep = &rep;
+  int ok = json_stringify_val(&b, v, 0, ui ? unit : NULL);
+  ts_gc_unroot(6);
+  if (!ok){ jb_free(&b); return TS_UNDEFINED; }
+  r = b.nonascii ? ts_new_string(b.p, (uint32_t)b.len) : ts_new_string_ascii(b.p, (uint32_t)b.len);
+  jb_free(&b); return r;
 }
 /* JSON.stringify(value, null, space): pretty-print. `space` is a number (that
    many spaces, clamped to 10) or a string (used directly, first 10 chars). A

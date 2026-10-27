@@ -96,6 +96,9 @@ export class SystemError extends Error {
     this.errno = errno;
     this.syscall = syscall;
     if (path !== undefined) this.path = path;
-    this.info = { code: errorCode, message: uvMessage(errorCode), path, syscall, errno };
+    // the optional field is present only when there is a path (a project's exactOptionalPropertyTypes)
+    const info: { code: string; message: string; path?: string; syscall: string; errno: number } = { code: errorCode, message: uvMessage(errorCode), syscall, errno };
+    if (path !== undefined) info.path = path;
+    this.info = info;
   }
 }
