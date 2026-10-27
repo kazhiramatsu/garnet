@@ -10719,3 +10719,18 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   conformance 611/611 plain and strict, 608/608 under GC protect, unit,
   bundler 45/45, bench within budget (the runtime is unchanged since the
   GC stress run of the first slice).
+- GPU batched prefill: the attention on the tensor API (Session 353,
+  `docs/llm_inference_design.md` "Batched prefill"). Kaz chose it as the
+  next step. `attention_tensor_64/_128` in the tensor library, llama.cpp's
+  `kernel_flash_attn_ext_tensor` shape (S = Q K^T by matmul2d into a
+  threadgroup float tensor, the online softmax a SIMD group per four rows
+  with the lazy rescale of flash attention 2, P as halves, O += P V into a
+  cooperative tensor rescaled through its elements, one barrier fewer per
+  block); the batch's attention where the tensor library compiled, the
+  simdgroup flash kernel the fallback. Correct (the check 51/51, 0.243,
+  text identical) but the attention is latency-bound at these lengths:
+  alone, 9.7 ms at 512 tokens for both kernels, 124 against 138 ms at
+  2048, 0.55 against 1.1 at 51; 16 queries per threadgroup measured no
+  gain. The batch is unchanged (512 tokens 122 ms, 51 tokens 18.4). Gates:
+  the Metal fixtures in the three modes and the GPU differential (a
+  lib-only change; the full set ran with the previous slice).

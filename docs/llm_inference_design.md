@@ -537,11 +537,51 @@ product never written, no SiLU pass): slower at every length (512 tokens
 the 32 and 64-token tiles (two accumulators of a 128-token tile would
 double the registers again), the two products no longer overlap as
 independent dispatches, and the two dequantizes sit between the same
-barriers. Open: the attention on the tensor API (a cooperative tensor is a
-valid operand of `matmul2d`, so P V can take P from registers), and the
-dispatch count for 8 to 16-token prompts (264 dispatches with barriers
-per batch; llama.cpp's small-batch kernels lead there, 724 against 571
-tok/s at 8).
+barriers. Open: the dispatch count for 8 to 16-token prompts (264 dispatches with
+barriers per batch; llama.cpp's small-batch kernels lead there, 724 against
+571 tok/s at 8).
+
+**The attention on the tensor API** (`attention_tensor_64`, `_128`, in the
+tensor library; Kaz chose it as the next step). The shape of llama.cpp's
+`kernel_flash_attn_ext_tensor`: a threadgroup of eight SIMD groups per (kv
+head, 32 / kvMul rows) holds the 32 queries as halves in threadgroup memory
+(scaled) and walks the cache in blocks of 64 positions that the operations
+read themselves from the float caches (the context length is a multiple of
+64, so a block never leaves the layer's cache; the positions past the batch
+are masked): S = Q K^T by `matmul2d` into a threadgroup float tensor; the
+online softmax per row with a SIMD group per four rows and two columns per
+lane (`simd_max`, `simd_sum`), the causal mask as -inf, the running max
+moved only when it grows by more than 8 (so exp(s - M) stays within half
+and O is rescaled rarely, a threadgroup flag saying when), P as halves; O
++= P V into a cooperative tensor, rescaled through its elements
+(`get_multidimensional_index(i)[1]` is the query row); the rows normalized
+by 1/S and written to xb through threadgroup memory. The barrier after P V
+is dropped (the next Q K^T writes the scores, not the probabilities, and
+every SIMD group enters it after its own P V). It is the batch's attention
+where the tensor library compiled; the simdgroup flash kernel stays as the
+fallback. The check: 51/51, 0.243 (0.245 with the simdgroup kernel).
+
+Measured alone (22 layers, one chunk, the best of four after a warm-up):
+
+| tokens | simdgroup flash ms | tensor flash ms |
+|---|---|---|
+| 51 | 1.1 | 0.55 |
+| 128 | 1.1 | 1.25 |
+| 512 | 9.7 | 9.7 |
+| 1024 | 35.8 | 33.2 |
+| 2048 | 138 | 124 |
+
+So the tensor operations do not change the picture at 512 tokens: the
+attention is latency-bound, not compute-bound (a layer's 64 threadgroups
+each walk their blocks serially through three phases and barriers; the
+matrix products of a block are microseconds). Measured and dropped: 16
+queries per threadgroup (twice the threadgroups: no faster, 3% slower at
+2048), and the barrier count was the only knob that moved it (1-2%). The
+batch at 512 tokens stays at 122 ms (4197 tok/s); at 51 tokens 18.4
+(2773). What would move the attention is overlapping a block's cache reads
+with the previous block's arithmetic (a double-buffered half copy of K and
+V in threadgroup memory) or splitting the positions over threadgroups with
+a combining pass; at 512 tokens that is at most 5% of the batch.
 
 ## Beyond
 

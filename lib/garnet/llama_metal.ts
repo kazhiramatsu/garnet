@@ -51,6 +51,7 @@ export const BATCH_MAX = 512, BATCH_MAX_PER_ROW = 128;
 
 /** the part of the source both libraries share: the batched product's arguments and the weight rows */
 const ROW_SOURCE = `struct MmArgs { uint off; uint rows; uint cols; uint rowBytes; uint n; uint bOff; uint bStride; uint outOff; uint outStride; uint flags; };
+struct AttnArgs { uint pos0; uint hs; uint kvDim; uint kvMul; uint ctx; uint loff; float scale; uint d; uint nHead; uint n; };
 // 16 weights of a row from column k0 (a multiple of 16) as halves, by the quantization: 0 Q8_0, 1 Q4_0, 2 F16, 3 F32
 template<short KIND> inline void mm_row16(device const char* row, uint k0, thread half* v) {
   if (KIND == 0) {
@@ -145,6 +146,101 @@ template [[host_name("matmul_q8_t${TM_TOKENS_SMALL}")]] kernel matmul_tensor_sma
 template [[host_name("matmul_q4_t${TM_TOKENS_SMALL}")]] kernel matmul_tensor_small_fn matmul_tensor_t<1, ${TM_TOKENS_SMALL}>;
 template [[host_name("matmul_f16_t${TM_TOKENS_SMALL}")]] kernel matmul_tensor_small_fn matmul_tensor_t<2, ${TM_TOKENS_SMALL}>;
 template [[host_name("matmul_f32_t${TM_TOKENS_SMALL}")]] kernel matmul_tensor_small_fn matmul_tensor_t<3, ${TM_TOKENS_SMALL}>;
+
+// The batch's attention on the tensor API, the shape of llama.cpp's kernel_flash_attn_ext_tensor: a threadgroup of
+// eight SIMD groups per (kv head, 32 / kvMul rows) holds the 32 queries sharing the kv head as halves in threadgroup
+// memory (scaled) and walks the cache in blocks of 64 positions that the operations read themselves: S = Q K^T
+// into threadgroup memory; the online softmax per row (a SIMD group per four rows, two columns per lane, the causal
+// mask as -inf; the running max moves only when it grows by more than 8, so the probabilities stay within half and
+// O is rescaled rarely); P as halves; O += P V into a cooperative tensor, rescaled through its elements; the rows
+// normalized and written to xb through threadgroup memory. HS is the head size; the context length is a multiple
+// of 64, so a block never leaves the layer's cache.
+template<short HS>
+kernel void attention_tensor(device const float* q [[buffer(0)]], device const float* kc [[buffer(1)]],
+                             device const float* vc [[buffer(2)]], device float* xb [[buffer(3)]],
+                             constant AttnArgs& a [[buffer(4)]],
+                             uint2 tg [[threadgroup_position_in_grid]], ushort tiitg [[thread_index_in_threadgroup]],
+                             ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+  constexpr short FQ = 32, FC = 64, NSG = 8, NQ = FQ / NSG, NC = FC / 32;
+  threadgroup char shmem[FQ * HS * 2 + FQ * FC * 4 + FQ * FC * 2 + FQ * 4 + 16];
+  threadgroup half* sq = (threadgroup half*)shmem;                                     // [FQ][HS] the queries, scaled
+  threadgroup float* ss = (threadgroup float*)(shmem + FQ * HS * 2);                   // [FQ][FC] the scores
+  threadgroup half* sp = (threadgroup half*)(shmem + FQ * HS * 2 + FQ * FC * 4);       // [FQ][FC] the probabilities
+  threadgroup float* sr = (threadgroup float*)(shmem + FQ * HS * 2 + FQ * FC * 6);     // [FQ] the rows' rescale factors
+  threadgroup int* sf = (threadgroup int*)(shmem + FQ * HS * 2 + FQ * FC * 6 + FQ * 4); // the block that last rescaled O
+  const uint kvMul = a.kvMul, TR = FQ / kvMul, g = tg.x, row0 = tg.y * TR, n = a.n, d = a.d;
+  const uint kvHeadOff = g * HS;
+  // query qi is row row0 + qi / kvMul (clamped to the batch's last row) of head g * kvMul + qi % kvMul
+  for (uint i = tiitg; i < FQ * HS / 4; i += 256u) {
+    const uint qi = i / (HS / 4), part = i % (HS / 4);
+    const uint row = min(row0 + qi / kvMul, n - 1u), head = g * kvMul + qi % kvMul;
+    ((threadgroup half4*)sq)[i] = (half4)(((device const float4*)(q + row * d + head * HS))[part] * a.scale);
+  }
+  const uint maxPos = a.pos0 + min(row0 + TR - 1u, n - 1u);   // the furthest position any query here sees
+  float M[NQ], S[NQ];
+  uint posOf[NQ];   // this SIMD group's rows j = jj * NSG + sgitg and their positions (the causal mask)
+  for (short jj = 0; jj < NQ; jj++) { M[jj] = -FLT_MAX / 2; S[jj] = 0.0f; posOf[jj] = a.pos0 + min(row0 + (uint)(jj * NSG + sgitg) / kvMul, n - 1u); }
+  const int kvStride = (int)a.kvDim;
+  auto tq = tensor(sq, dextents<int32_t, 2>(HS, FQ));
+  auto ts = tensor(ss, dextents<int32_t, 2>(FC, FQ));
+  auto tp = tensor(sp, dextents<int32_t, 2>(FC, FQ));
+  matmul2d<matmul2d_descriptor(FQ, FC, HS, false, true, false, matmul2d_descriptor::mode::multiply), execution_simdgroups<NSG>> mmQK;
+  matmul2d<matmul2d_descriptor(FQ, HS, FC, false, false, false, matmul2d_descriptor::mode::multiply_accumulate), execution_simdgroups<NSG>> mmPV;
+  auto tv0 = tensor((device float*)(vc + a.loff + kvHeadOff), dextents<int32_t, 2>(HS, FC), array<int, 2>({1, kvStride}));
+  auto co = mmPV.template get_destination_cooperative_tensor<decltype(tp), decltype(tv0), float>();
+#pragma clang loop unroll(full)
+  for (uint16_t i = 0; i < co.get_capacity(); ++i) if (co.is_valid_element(i)) co[i] = 0.0f;
+  if (tiitg == 0) sf[0] = 0;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int blk = 0, t0 = 0; t0 <= (int)maxPos; blk++, t0 += FC) {
+    {   // S = Q K^T over the block (the positions past maxPos read stale cache values and are masked below)
+      auto tk = tensor((device float*)(kc + a.loff + (uint)t0 * a.kvDim + kvHeadOff), dextents<int32_t, 2>(HS, FC), array<int, 2>({1, kvStride}));
+      mmQK.run(tq, tk, ts);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (short jj = 0; jj < NQ; jj++) {
+      const short j = jj * NSG + sgitg;
+      float sv[NC];
+      for (short ii = 0; ii < NC; ii++) { const uint t = (uint)t0 + ii * 32 + tiisg; sv[ii] = (t <= posOf[jj]) ? ss[j * FC + ii * 32 + tiisg] : -INFINITY; }
+      float m = M[jj];
+      for (short ii = 0; ii < NC; ii++) m = max(m, sv[ii]);
+      m = simd_max(m);
+      float ms = 1.0f;
+      if (m > M[jj] + 8.0f) { ms = exp(M[jj] - m); M[jj] = m; if (tiisg == 0) sf[0] = blk + 1; }
+      float sum = 0.0f;
+      for (short ii = 0; ii < NC; ii++) { const half pv = (half)exp(sv[ii] - M[jj]); sp[j * FC + ii * 32 + tiisg] = pv; sum += (float)pv; }
+      S[jj] = S[jj] * ms + simd_sum(sum);
+      if (tiisg == 0) sr[j] = ms;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sf[0] == blk + 1) {   // some row's max moved: O = diag(ms) O
+#pragma clang loop unroll(full)
+      for (uint16_t i = 0; i < co.get_capacity(); ++i) if (co.is_valid_element(i)) co[i] *= sr[co.get_multidimensional_index(i)[1]];
+    }
+    {   // O += P V; no barrier after it: the next block's Q K^T writes the scores, not the probabilities, and every
+        // SIMD group enters that operation only after its own P V, so the next softmax's writes to sp follow all reads
+      auto tv = tensor((device float*)(vc + a.loff + (uint)t0 * a.kvDim + kvHeadOff), dextents<int32_t, 2>(HS, FC), array<int, 2>({1, kvStride}));
+      mmPV.run(tp, tv, co);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (short jj = 0; jj < NQ; jj++) if (tiisg == 0) sr[jj * NSG + sgitg] = S[jj] == 0.0f ? 0.0f : 1.0f / S[jj];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma clang loop unroll(full)
+  for (uint16_t i = 0; i < co.get_capacity(); ++i) if (co.is_valid_element(i)) co[i] *= sr[co.get_multidimensional_index(i)[1]];
+  // the rows to xb through threadgroup memory ([FQ][HS] floats over the queries' and scores' space)
+  threadgroup float* so = (threadgroup float*)shmem;
+  auto to = tensor(so, dextents<int32_t, 2>(HS, FQ));
+  co.store(to);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint i = tiitg; i < FQ * HS / 4; i += 256u) {
+    const uint qi = i / (HS / 4), part = i % (HS / 4), row = row0 + qi / kvMul;
+    if (row < n) ((device float4*)(xb + row * d + (g * kvMul + qi % kvMul) * HS))[part] = ((threadgroup float4*)so)[i];
+  }
+}
+typedef decltype(attention_tensor<64>) attention_tensor_fn;
+template [[host_name("attention_tensor_64")]] kernel attention_tensor_fn attention_tensor<64>;
+template [[host_name("attention_tensor_128")]] kernel attention_tensor_fn attention_tensor<128>;
 `;
 
 /** the kernels' source (exported for probes and tests) */
@@ -159,7 +255,6 @@ using namespace metal;
 struct MvArgs { uint off; uint off2; uint rows; uint cols; uint flags; uint outOff; };
 struct NormArgs { uint n; float eps; uint wOff; };
 struct RopeArgs { uint d; uint kvDim; uint hs; uint pos0; uint kOff; };
-struct AttnArgs { uint pos0; uint hs; uint kvDim; uint kvMul; uint ctx; uint loff; float scale; uint d; uint nHead; uint n; };
 
 // the row's value: flags 2 = silu(v) * v2 (the gate and up products), flags 1 = added to out
 static inline void mv_store(device float* out, constant MvArgs& a, uint row, float v, float v2, uint tiisg) {
@@ -600,8 +695,8 @@ interface Batch {
   xb: GpuBuffer; q: GpuBuffer; hb: GpuBuffer; hb2: GpuBuffer; att: GpuBuffer | null;
   logits: GpuBuffer | null; logitsV: Float32Array;
 }
-/** the flash attention kernel's threads per threadgroup and queries per threadgroup */
-const FA_THREADS = 128, FA_QUERIES = 32;
+/** the flash attention kernels' queries per threadgroup, and the threads of the simdgroup and the tensor versions */
+const FA_QUERIES = 32, FA_THREADS = 128, FA_TENSOR_THREADS = 256;
 
 /** The Metal forward pass of a Llama (its buffers shared with the GPU, its kernels compiled once). */
 export class LlamaMetal {
@@ -622,6 +717,8 @@ export class LlamaMetal {
   private readonly attention: Pipeline;
   /** the batch's flash attention (a head size of 64 or 128 and a query-head count per kv head that divides 32), else null: the per-row kernel */
   private readonly attentionBatch: Pipeline | null;
+  /** its threads per threadgroup: the tensor version (where the tensor library compiled and the context is a multiple of 64) or the simdgroup one */
+  private readonly attentionThreads: number;
   private readonly siluMul: Pipeline;
   private readonly model: GpuBuffer;
   private readonly x: GpuBuffer; private readonly xb: GpuBuffer; private readonly q: GpuBuffer; private readonly hb: GpuBuffer;
@@ -663,9 +760,10 @@ export class LlamaMetal {
     // the tensor API's library: a device or an OS without it fails the compile (an Error), and the
     // simdgroup kernels stay
     let tensor = false;
+    let tlib: Library | null = null;
     if (options.tensor !== false) {
       try {
-        const tlib = new Library(TENSOR_KERNEL_SOURCE, { fastMath, languageVersion: "4.0" });
+        tlib = new Library(TENSOR_KERNEL_SOURCE, { fastMath, languageVersion: "4.0" });
         for (let i = 0; i < kinds.length; i++) {
           this.tensorMatmuls.set(kinds[i], tlib.pipeline(`matmul_${names[i]}_t${TM_TOKENS}`));
           this.tensorMatmulsSmall.set(kinds[i], tlib.pipeline(`matmul_${names[i]}_t${TM_TOKENS_SMALL}`));
@@ -674,14 +772,19 @@ export class LlamaMetal {
         tensor = true;
       } catch (e) {
         this.tensorMatmuls.clear(); this.tensorMatmulsSmall.clear(); this.tensorMatmulsLarge.clear();
-        tensor = false;
+        tensor = false; tlib = null;
       }
     }
     this.tensor = tensor;
     this.rmsnorm = this.lib.pipeline("rmsnorm");
     this.rope = this.lib.pipeline("rope");
     this.attention = this.lib.pipeline("attention");
-    this.attentionBatch = (lm.headSize === 64 || lm.headSize === 128) && FA_QUERIES % lm.kvMul === 0 ? this.lib.pipeline(`attention_batch_${lm.headSize}`) : null;
+    let attentionBatch: Pipeline | null = null, attentionThreads = FA_THREADS;
+    if ((lm.headSize === 64 || lm.headSize === 128) && FA_QUERIES % lm.kvMul === 0) {
+      attentionBatch = this.lib.pipeline(`attention_batch_${lm.headSize}`);
+      if (tlib !== null && lm.ctx % 64 === 0) { attentionBatch = tlib.pipeline(`attention_tensor_${lm.headSize}`); attentionThreads = FA_TENSOR_THREADS; }
+    }
+    this.attentionBatch = attentionBatch; this.attentionThreads = attentionThreads;
     this.siluMul = this.lib.pipeline("silu_mul");
     const q8 = this.matvecs.get(GGML_Q8_0) as Pipeline;
     if (q8.threadExecutionWidth !== 32) throw new Error(`garnet:llama_metal: the kernels assume a SIMD width of 32 (the device has ${q8.threadExecutionWidth})`);
@@ -872,7 +975,7 @@ export class LlamaMetal {
       cmd.barrier();
       attnU[5] = L.loff;
       if (this.attentionBatch !== null) {
-        cmd.pipeline(this.attentionBatch); cmd.buffer(0, b.q); cmd.buffer(1, this.kc); cmd.buffer(2, this.vc); cmd.buffer(3, b.xb); cmd.bytes(4, this.attnArgs); cmd.dispatch3(lm.nHeadKv, Math.ceil(n / faRows), 1, FA_THREADS, 1, 1);
+        cmd.pipeline(this.attentionBatch); cmd.buffer(0, b.q); cmd.buffer(1, this.kc); cmd.buffer(2, this.vc); cmd.buffer(3, b.xb); cmd.bytes(4, this.attnArgs); cmd.dispatch3(lm.nHeadKv, Math.ceil(n / faRows), 1, this.attentionThreads, 1, 1);
       } else {
         cmd.pipeline(this.attention); cmd.buffer(0, b.q); cmd.buffer(1, this.kc); cmd.buffer(2, this.vc); cmd.buffer(3, b.att as GpuBuffer); cmd.buffer(4, b.xb); cmd.bytes(5, this.attnArgs); cmd.dispatch3(lm.nHead, n, 1, ATTN_THREADS, 1, 1);
       }
