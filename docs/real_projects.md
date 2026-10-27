@@ -127,6 +127,9 @@ Constructs, again implemented with conformance fixtures:
   `node:process`, `process.emitWarning` delivered on the next tick with Node's one-time hint.
 - The Node side of a benchmark is now a program emit (`transpile_tree.js` with the project's own
   compiler options), so a re-export of a type-only name is elided as the project's own build would.
+- `fn.apply(thisArg, arrayLike)` with an array-like argument list (`{ length: 2, 0: a, 1: b }`,
+  `arguments`, a view) passes the elements by index; the runtime had called with no arguments for
+  any non-array (the call/apply fixture of the tuning round caught the silent miscompile).
 
 Two deviations noted rather than fixed: the conformance oracle transpiles at ES2020 (legacy
 class-field semantics: a declared field without an initializer is created at its first
@@ -156,6 +159,9 @@ of 3:
 |---|---|---|---|
 | first run | 709 | 152 | 4.7 |
 | inherited reads of a sized instance through the (class word, key) cache | 534 | 152 | 3.5 |
+| `fn.call` / `fn.apply` lowered to the runtime's implementations, the cache on receivers with dynamic properties, an O(1) `shift` | 399 | 149 | 2.7 |
+
+(the last row is an alternating A/B of the two binaries, five runs each: 525.3 against 398.9.)
 
 The first profile put 22% in the chain walk of `destination.next` (an interface-typed subscriber
 reading a prototype method as a value, 13.7 M out-of-line reads): the method cache's (class
@@ -163,14 +169,34 @@ word, key) entry now answers an inherited property read on a sized instance (the
 word and slot, re-read on every hit). The receivers with own dynamic properties (an
 `OperatorSubscriber` assigns `this._next = ...`) still take the slow path (2.0 M reads left).
 
-What the second profile shows (`sample`, 300 rounds): `project.call(thisArg, value, index)` in
-map and filter reads `call` through the function's prototype chain on every value (5.9 M
+What the second profile showed (`sample`, 300 rounds): `project.call(thisArg, value, index)` in
+map and filter read `call` through the function's prototype chain on every value (5.9 M
 out-of-line reads, 11.8 M probes, 11% with `invoke_with_this`); `Array.prototype.shift` on the
-mergeMap and concatMap buffers moves the elements (5%); the try/catch of every delivered value
+mergeMap and concatMap buffers moved the elements (5%); the try/catch of every delivered value
 (`OperatorSubscriber._next`, `ConsumerObserver.next`) costs its setjmp (3%); `errorContext(() =>
-...)` allocates a closure per `next`. Next: `fn.call`/`fn.apply` lowered to the runtime's
-`Function.prototype` implementations without the property read, the inherited-read cache on
-receivers whose dynamic properties lack the key, an O(1) `shift`.
+...)` allocates a closure per `next`. The third row's three changes:
+
+- `f.call(thisArg, ...args)` and `f.apply(thisArg, arr)` whose receiver type names
+  Function.prototype's member (a function-typed value; the default library's `Function`,
+  `CallableFunction` and `NewableFunction` interfaces) are lowered to the runtime's
+  `ts_funcproto_call` / `ts_funcproto_apply` over the argument vector, without the `call` read;
+  a spread argument keeps the generic path.
+- The (class word, key) cache also answers an inherited read on a sized receiver with own dynamic
+  properties (an `OperatorSubscriber` assigns `this._next = ...`) once its map shows it lacks the
+  key (2.0 M reads had still walked the chain).
+- `shift` on an array of more than 16 elements moves `data` up one slot over the same buffer (the
+  buffer's base is `data - front`; `front` is a byte, folded back at 255 or when the buffer grows;
+  `unshift` reuses the slack): amortized O(1), as V8's left-trim; a short array still moves its
+  elements.
+
+After them (3132 ms for 300 rounds, from 5089): the generated subscriber chain itself leads
+(`OperatorSubscriber._next`, `Subscriber.next`, the operator closures), then `ts_call` (7%: the
+closures called through the generic entry), `invoke_with_this` with the receiver check (6%: the
+`this._next(value)` call of an own function-valued property), the try/catch (5.5%), the
+out-of-line reads that remain (7%), and the closure `errorContext` allocates per `next`. Next:
+the setjmp of a try region, the receiver check and the argument copy of a call through a
+function-valued own property, and whether a closure passed to a callee that only calls it can
+live on the stack.
 
 ## yaml
 
@@ -179,16 +205,38 @@ stringifies it back and parses it through the Document API, 300 rounds over 16 d
 objects of the text; the checksum adds the parsed fields, the output lengths and a hash of the
 output. Outputs identical. Wall: garnet 5911 ms, Node 1289 (4.6x).
 
-The profile (`sample`): yaml's lexer and parser are generators delegating to generators
-(`yield* this.pushSpaces(true)`), and garnet's generator machinery dominates: every generator
-object's creation allocates a promise (`coro_alloc` -> `ts_promise_new_v`, 13% of the samples;
-only an async generator needs one), every `next()` builds its `{value, done}` result through two
+The first profile (`sample`): yaml's lexer and parser are generators delegating to generators
+(`yield* this.pushSpaces(true)`), and garnet's generator machinery dominated: every generator
+object's creation allocated a promise (`coro_alloc` -> `ts_promise_new_v`, 13% of the samples;
+only an async generator needs one), every `next()` built its `{value, done}` result through two
 dynamic property additions (`ts_set_named_prop` -> `props_append_f`, `shape_transition_f`, about
-15%), and the collector's share is 17% (the nursery refills and marks of those objects). Then
+15%), and the collector's share was 17% (the nursery refills and marks of those objects). Then
 the regular expressions of the scalar lexer (4%), and `===` on one-character strings
 (`isEmpty`'s `ch === ' '`, a content compare: 4%; V8 compares internalized one-character strings
-by identity). Next: the promise only for async generators, the iteration result as a pre-shaped
-object, canonical one-character strings.
+by identity).
+
+| state | garnet | Node | ratio |
+|---|---|---|---|
+| first run | 5911 | 1289 | 4.6 |
+| the rxjs changes (unchanged, as expected) | 5945 | 1327 | 4.5 |
+| a sync generator's frame without a promise; the generator object and the iteration result in their layouts | 4980 | 1327 | 3.75 |
+
+(alternating A/B, five runs each: 5944.9 against 4980.2.) The sync generator entry allocates its
+frame through `ts_coro_alloc_gen_v/_vn` (no `ret` promise: its results are plain objects and an
+uncaught throw reaches the caller); `ts_gen_new_v` and the three result builders (`next`,
+`throw`, `return`, and `ts_iter_result`) allocate their objects in a `ts_lit_layout` with slot
+stores, as a literal does.
+
+After them (5205 ms for 300 rounds): the collector is 20% of the samples (the minor collections
+mark the document under construction; they are triggered by the allocation of a `{value, done}`
+per `next()`, 924 inclusive samples under the resume functions, and of a generator object and
+frame per delegated `yield*`), then property reads (`prop_find` 290: the regexp adapter's object
+reads per `test`, the chain walks of `composeScalar` and `createNode`), the regular expressions
+(4%), `===` on one-character strings (3%), and the generator protocol itself (`ts_gen_next`,
+`coro_alloc`, `ts_coro_resume_v`, the setjmp of a resume, `ensure_gen_fields` on every step).
+Next: a `for...of` and a `yield*` over a native generator object stepping the coroutine without
+materializing the result object (unobservable while `next` is the prototype's), canonical
+one-character strings, and the collector's share by counters.
 
 ## prisma
 

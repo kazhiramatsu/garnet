@@ -777,6 +777,13 @@ export class ClassExtractor {
     }
     return undefined;
   }
+  /** `call` or `apply` as the default library declares it on its Function interfaces: the member a
+   *  function-typed receiver names (the exporter lowers `f.call(t, ...)` to the runtime's implementation). */
+  isFunctionProtoCallOrApply(sym: ts.Symbol | undefined): boolean {
+    const m = this.libMemberOf(sym);
+    return m === "Function.call" || m === "Function.apply" || m === "CallableFunction.call" || m === "CallableFunction.apply" ||
+      m === "NewableFunction.call" || m === "NewableFunction.apply";
+  }
   /** A value the default library declares under `name` (`declare var Proxy`). */
   private libValue(sym: ts.Symbol | undefined, name: string): boolean {
     return !!sym && sym.name === name && (sym.flags & ts.SymbolFlags.Value) !== 0 && this.fromDefaultLib(sym);

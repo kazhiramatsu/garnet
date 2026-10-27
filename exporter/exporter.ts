@@ -6408,6 +6408,18 @@ class Exporter {
             ctx.body.push({ kind: "Copy", dst: s, src: recv });
             recv = s;
           }
+          // `f.call(thisArg, ...args)` / `f.apply(thisArg, arr)` where the receiver's type names
+          // Function.prototype's member (a function-typed value: rxjs's `project.call(thisArg, value, index)`
+          // in map and filter): the runtime's implementations directly. The generic path read `call`
+          // through the function's prototype chain on every call (5.9 M out-of-line reads in the rxjs
+          // driver). A spread argument keeps the generic path.
+          if ((fn.name.text === "call" || fn.name.text === "apply") && !node.arguments.some((a) => ts.isSpreadElement(a)) &&
+              this.classExtractor.isFunctionProtoCallOrApply(this.checker.getSymbolAtLocation(fn.name))) {
+            const argLs = this.lowerSequenced(ctx, node.arguments);
+            const dst = this.newLocal(ctx, "reference");
+            ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: `function.${fn.name.text}`, args: [recv as number, ...argLs] });
+            return dst;
+          }
           // If the receiver's static type is a known class and the member is one
           // of its methods, emit a Method callee for the devirt pass to resolve.
           // EXCEPTION: if the class (or an ancestor) also declares an INSTANCE

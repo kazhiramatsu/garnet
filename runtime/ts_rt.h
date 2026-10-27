@@ -1188,7 +1188,10 @@ typedef struct ts_array {
   /* Sparse element storage (far stores): nonzero means data is NULL, cap is 0
      and inline_data[0] holds the index -> value side table (ts_rt.c). Dense
      arrays keep every slot in [len, cap) a hole, so readers bound by cap. */
-  uint8_t sparse, arr_spare;
+  uint8_t sparse;
+  /* Elements shift() consumed before data: the buffer's base is data - front and cap counts the
+     slots from data (an O(1) shift; the prefix is folded back at 255 or when the buffer grows). */
+  uint8_t front;
   tsv inline_data[4];             /* avoids a second malloc for small arrays */
 } ts_array;
 
@@ -3619,6 +3622,8 @@ tsv         ts_coro_alloc_v(size_t size, tsv (*resume)(tsv));
 /* The frame's first nvals words after the header are its tsv locals, and the
    rest holds no reference (docs/gc_v2_design.md §6.5 step 2b). */
 tsv         ts_coro_alloc_vn(size_t size, tsv (*resume)(tsv), uint32_t nvals);
+tsv         ts_coro_alloc_gen_v(size_t size, tsv (*resume)(tsv));            /* a sync generator's frame: no promise */
+tsv         ts_coro_alloc_gen_vn(size_t size, tsv (*resume)(tsv), uint32_t nvals);
 void        ts_coro_resume_v(tsv cv);
 void        ts_run_event_loop(void);
 

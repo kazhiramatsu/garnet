@@ -2305,6 +2305,20 @@ tsv ts_new_sized_site(size_t size, uint32_t site, tsv proto){
 /* ---------------- arrays / sparse-hole representation ---------------- */
 /* TS_ARRAY_HOLE and array_is_hole live in ts_rt.h (the inline element reader tests them). */
 static inline int array_uses_inline(ts_array* a){ return a->data == a->inline_data; }
+/* The element buffer's base: data less the prefix shift() consumed (ts_rt.h `front`). */
+static inline tsv* array_base(ts_array* a){ return a->data - a->front; }
+static inline void array_invalidate_dirty(ts_array* a);
+/* The shifted-off prefix folded back: the live run moves to the buffer's base, the stale copies
+   behind it become holes, and the capacity regains the prefix. */
+static void array_compact_front(ts_array* a){
+  if (!a->front) return;
+  tsv* base = array_base(a);
+  uint32_t f = a->front;
+  memmove(base, a->data, sizeof(tsv) * a->len);
+  for (uint32_t i = a->len; i < a->len + f; i++) base[i] = TS_ARRAY_HOLE;
+  a->data = base; a->cap += f; a->front = 0;
+  array_invalidate_dirty(a);
+}
 #define GC_CONTAINER_CARD_SHIFT 6u
 /* A heap value still in the young generation: the only stores an old
    container must remember. */
@@ -2386,12 +2400,13 @@ static ts_sparse_elems* sparse_put(const ts_gc_header* owner, ts_sparse_elems* s
 }
 static void array_free_data(ts_array* a){
   if (a->sparse){ gc_owned_free(array_sparse_table(a)); a->inline_data[0] = TS_UNDEFINED; a->sparse = 0; return; }
-  if (a->data && !array_uses_inline(a)) gc_owned_free(a->data);
+  if (a->data && !array_uses_inline(a)) gc_owned_free(array_base(a));
+  a->front = 0;
 }
 /* A dying array: its buffers are payloads, released by not being marked. */
 static void array_release_dead(ts_array* a){
   if (a->sparse) gc_owned_release_dead(array_sparse_table(a));
-  else if (a->data && !array_uses_inline(a)) gc_owned_release_dead(a->data);
+  else if (a->data && !array_uses_inline(a)) gc_owned_release_dead(array_base(a));
 }
 /* A store at i on a dense array goes sparse when the dense buffer would have
    to more than double by at least ARRAY_SPARSE_MIN_GAP slots (V8's
@@ -2407,7 +2422,7 @@ static void array_make_sparse(ts_array* a){
   ts_sparse_elems* s = sparse_alloc(&a->o.h, size);
   for (uint32_t i = 0; i < n; i++) if (!array_is_hole(a->data[i])) sparse_insert_new(s, i, a->data[i]);
   array_free_data(a);
-  a->data = NULL; a->cap = 0; a->sparse = 1;
+  a->data = NULL; a->cap = 0; a->sparse = 1; a->front = 0;
   array_set_sparse_table(a, s);
   array_invalidate_dirty(a);
 }
@@ -2426,7 +2441,7 @@ static void array_densify(ts_array* a, uint32_t need){
     if (k != ARRAY_SPARSE_EMPTY && k < nc) nd[k] = vals[h];
   }
   gc_owned_free(s);
-  a->data = nd; a->cap = nc; a->sparse = 0;
+  a->data = nd; a->cap = nc; a->sparse = 0; a->front = 0;
   array_invalidate_dirty(a);
 }
 static inline ts_array* arr_dense(tsv arr){   /* arr is an array: its dense form */
@@ -2463,6 +2478,7 @@ static void array_init_storage(ts_array* a, uint32_t len){
 static void array_ensure_cap(ts_array* a, uint32_t need){
   if (need <= a->cap) return;
   if (__builtin_expect(a->sparse, 0)){ array_densify(a, need); return; }
+  if (a->front) array_compact_front(a);   /* the buffer grows from its base */
   uint32_t old = a->cap;
   uint32_t nc = old ? old * 2 : 4;
   while (nc < need) nc *= 2;
@@ -3491,9 +3507,11 @@ tsv ts_get(tsv obj, ts_key key){
       if (g_has_class_regs && class_field_lookup(fast, key, &off, &numeric))
         return struct_field_get(fast, off, numeric);
       tsv found;
-      /* a class instance without own dynamic properties: its inherited properties through the
-         (class word, key) cache, not a walk of the chain on every read */
-      if (ts_obj_is_sized(fast) && !((ts_sized_head*)fast)->dyn && sized_inherited_get(fast, key, obj, &found)) return found;
+      /* a class instance's inherited property through the (class word, key) cache, not a walk of
+         the chain on every read; an instance with own dynamic properties (rxjs's OperatorSubscriber
+         assigns `this._next = ...`) first shows its map lacks the key */
+      if (ts_obj_is_sized(fast) && (!((ts_sized_head*)fast)->dyn || !pref_ok(prop_find(fast, key))) &&
+          sized_inherited_get(fast, key, obj, &found)) return found;
       if (lookup_prop_chain(obj, fast, key, &found)) return found;
       return TS_UNDEFINED;
     }
@@ -6223,7 +6241,7 @@ static void gc_scan_cell(ts_gc_header* h, int young, int depth){
     gc_visit_slot(&f->o.proto, young, depth, stable);
   } else if (h->kind==TS_KIND_ARRAY){ ts_array* a=(ts_array*)h;
     if (a->sparse) gc_payload_mark(array_sparse_table(a));
-    else if (a->data && !array_uses_inline(a)) gc_payload_mark(a->data);
+    else if (a->data && !array_uses_inline(a)) gc_payload_mark(array_base(a));
     if (a->sparse){
       /* side table (far stores): every entry; a sparse store dirties the whole cell */
       ts_sparse_elems* s = array_sparse_table(a); tsv* vals = sparse_vals(s);
@@ -6491,7 +6509,7 @@ static void g0_count_fate(ts_gc_header* h, int fate){
     if (a->sparse){
       ts_sparse_elems* sp = array_sparse_table(a);
       if (sp) g0_payload(fate, G0_P_SPARSE, sizeof(ts_sparse_elems) + (unsigned long long)(sp->mask + 1u) * (sizeof(uint32_t) + sizeof(tsv)), &any);
-    } else if (a->data && !array_uses_inline(a)) g0_payload(fate, G0_P_ELEMS, (unsigned long long)a->cap * sizeof(tsv), &any);
+    } else if (a->data && !array_uses_inline(a)) g0_payload(fate, G0_P_ELEMS, (unsigned long long)(a->cap + a->front) * sizeof(tsv), &any);
     common = &a->o;
   } else if (kind == TS_KIND_FUNC){
     ts_func* f = (ts_func*)h;
@@ -7784,7 +7802,7 @@ static tsv ts_array_splice_impl(tsv arr, double start, double dc, int has_dc, ts
   for(long i=0;i<s;i++) nd[w++]=a->data[i];
   it=as_arr(items); for(long i=0;i<ni;i++) nd[w++]=it->data[i];
   a=as_arr(arr); for(long i=s+del;i<n;i++) nd[w++]=a->data[i];
-  array_free_data(a);
+  array_free_data(a);   /* (front reset there) */
   if (newlen <= 4) {
     a->data = a->inline_data;
     a->cap = 4;
@@ -10176,6 +10194,16 @@ tsv ts_array_shift(tsv arr){
   if (ts_arr_frozen(arr)) return TS_UNDEFINED;   /* frozen: no mutation */
   array_invalidate_dirty(a);
   tsv v=a->data[0];
+  if (a->len > 16u && !array_uses_inline(a)){
+    /* a queue (rxjs's mergeMap buffer, a breadth-first search): the first slot leaves the view, data
+       moves up one over the same buffer (its base stays data - front), the prefix folded back at 255
+       slots: amortized O(1), as V8's left-trim; the slot holds a hole so the dead prefix refers to
+       nothing. A short array moves its elements (below). */
+    if (a->front == 255u) array_compact_front(a);
+    a->data[0] = TS_ARRAY_HOLE;
+    a->data++; a->front++; a->cap--; a->len--;
+    return array_is_hole(v) ? TS_UNDEFINED : v;
+  }
   for(uint32_t i=0;i+1<a->len;i++) a->data[i]=a->data[i+1];
   a->data[a->len-1]=TS_ARRAY_HOLE;   /* keep [len, cap) holes */
   a->len--; return array_is_hole(v) ? TS_UNDEFINED : v;
@@ -10183,6 +10211,11 @@ tsv ts_array_shift(tsv arr){
 double ts_array_unshift(tsv arr, tsv v){
   ts_array* a=as_arr(arr); if(!a) return 0;
   if (ts_arr_frozen(arr)) return (double)a->len;   /* frozen: no mutation */
+  if (a->front){   /* a slot shift() left before data: the element goes there */
+    array_invalidate_dirty(a);
+    a->data--; a->front--; a->cap++;
+    a->data[0]=v; a->len++; ts_write_barrier(arr, v); return (double)a->len;
+  }
   ts_array_push(arr, TS_UNDEFINED);           /* grow by one */
   array_invalidate_dirty(a);
   for(long i=(long)a->len-1;i>0;i--) a->data[i]=a->data[i-1];
@@ -16471,7 +16504,23 @@ tsv ts_funcproto_apply(tsv* args, int n){
     ts_gc_unroot(3);
     return r;
   }
-  return invoke_with_this(fn, thisArg, NULL, 0);   /* null/undefined argsArray -> no args */
+  if (ts_is_null(arr) || ts_is_undef(arr)) return invoke_with_this(fn, thisArg, NULL, 0);   /* no argument list */
+  if (!ts_is_propbag(arr)) ts_throw_type_error_msg("CreateListFromArrayLike called on non-object");
+  /* an array-like object (`{ length: 2, 0: a, 1: b }`, `arguments`, a view): length, then the elements by index */
+  ts_gc_root(&fn); ts_gc_root(&thisArg); ts_gc_root(&arr);
+  double dlen = ts_number_coerce(ts_get(arr, ts_intern_field("length", 6)));
+  int argc = (dlen > 0 && dlen == dlen) ? (dlen > 65536.0 ? 65536 : (int)dlen) : 0;
+  tsv stackbuf[TS_CALL_MERGE_STACK];
+  tsv* argv = argc <= TS_CALL_MERGE_STACK ? stackbuf : (tsv*)malloc(sizeof(tsv)*(size_t)argc);
+  for (int i=0;i<argc;i++){
+    if (ts_is_typed_array(arr)) argv[i] = ts_ta_get(arr, (uint32_t)i);
+    else { char b[16]; int bn = snprintf(b, sizeof b, "%d", i); argv[i] = ts_get(arr, ts_intern_field(b, (uint32_t)bn)); }
+    ts_gc_root(&argv[i]);
+  }
+  tsv r = invoke_with_this(fn, thisArg, argv, argc);
+  ts_gc_unroot(argc + 3);
+  if (argv != stackbuf) free(argv);
+  return r;
 }
 /* The thunk backing a bound function. Its env is [target, thisArg, partial...].
    ts_call prepends env to the live call args, so this thunk receives
@@ -17042,11 +17091,12 @@ tsv ts_get_pic_checked(tsv obj, ts_key key, ts_prop_ic* ic){
   if (prop_absent_site_hit(obj, key, ic)){ RT_STAT_INC(absent_site_hits); return TS_UNDEFINED; }
   /* a class instance's inherited property (a method read as a value, a prototype constant): the
      (class word, key) entry the slow path filled answers before the own-property probes, which a
-     class with no struct field of the key and an instance with no own dynamic property cannot hit */
+     class with no struct field of the key cannot hit; an instance with own dynamic properties
+     first shows its map lacks the key */
   if (TS_TOP16(obj) == TS_SEL_OBJECT){
     ts_object* o = (ts_object*)ts_ptr(obj);
     tsv v;
-    if (ts_obj_is_sized(o) && !((ts_sized_head*)o)->dyn && sized_inherited_cached(o, key, &v)) return v;
+    if (ts_obj_is_sized(o) && sized_inherited_cached(o, key, &v) && (!((ts_sized_head*)o)->dyn || !pref_ok(prop_find(o, key)))) return v;
   }
   /* a megamorphic site (many classes at one access): a sized receiver's
      field straight from the registry's cache, past the slow path's probes
@@ -19249,7 +19299,7 @@ int ts_coro_fin_push_slot(ts_coro* c){
 }
 /* allocate a coroutine frame of `size` bytes (>= sizeof(ts_coro)); the embedded
    ts_coro is at offset 0. Extra frame fields are zeroed (calloc). */
-static tsv coro_alloc(size_t size, tsv (*resume)(tsv), int nvals){
+static tsv coro_alloc(size_t size, tsv (*resume)(tsv), int nvals, int promise){
   if (size < sizeof(ts_coro)) size = sizeof(ts_coro);
   ts_coro* c=(ts_coro*)gc_alloc(size, TS_KIND_CORO);
   coro_init(c, size, resume);
@@ -19258,10 +19308,15 @@ static tsv coro_alloc(size_t size, tsv (*resume)(tsv), int nvals){
       ts_abort_msg("coroutine frame map is larger than the frame");
     c->nvals = nvals;
   }
+  tsv cv=ts_obj(c);
+  /* a sync generator's frame has no promise: its results are plain objects (ts_gen_next) and an
+     uncaught throw reaches the caller; ret stays undefined (yaml's lexer and parser create a
+     generator per delegated `yield*`: the promise was 13% of its parse) */
+  if (!promise) return cv;
   /* set frame_size (so a GC scan of the still-zeroed frame is bounded/harmless)
      and root cv BEFORE allocating c->ret — that alloc may trigger GC, which would
      otherwise collect or move this not-yet-referenced coro. */
-  tsv cv=ts_obj(c); ts_gc_root(&cv);
+  ts_gc_root(&cv);
   tsv ret = ts_promise_new_v();
   c=(ts_coro*)ts_ptr(cv);
   c->ret=ret;
@@ -19269,9 +19324,14 @@ static tsv coro_alloc(size_t size, tsv (*resume)(tsv), int nvals){
   ts_gc_unroot(1);
   return cv;
 }
-tsv ts_coro_alloc_v(size_t size, tsv (*resume)(tsv)){ return coro_alloc(size, resume, -1); }
+tsv ts_coro_alloc_v(size_t size, tsv (*resume)(tsv)){ return coro_alloc(size, resume, -1, 1); }
 tsv ts_coro_alloc_vn(size_t size, tsv (*resume)(tsv), uint32_t nvals){
-  return coro_alloc(size, resume, nvals > (uint32_t)INT32_MAX ? INT32_MAX : (int)nvals);
+  return coro_alloc(size, resume, nvals > (uint32_t)INT32_MAX ? INT32_MAX : (int)nvals, 1);
+}
+/* the sync generator's frame (emit_c emit_generator_function): the same without the promise */
+tsv ts_coro_alloc_gen_v(size_t size, tsv (*resume)(tsv)){ return coro_alloc(size, resume, -1, 0); }
+tsv ts_coro_alloc_gen_vn(size_t size, tsv (*resume)(tsv), uint32_t nvals){
+  return coro_alloc(size, resume, nvals > (uint32_t)INT32_MAX ? INT32_MAX : (int)nvals, 0);
 }
 tsv ts_coro_new_v(tsv (*resume)(tsv)){
   return ts_coro_alloc_v(sizeof(ts_coro), resume);
@@ -19522,7 +19582,7 @@ static void publish_mark_payloads(ts_gc_header* h){
   if (h->kind == TS_KIND_ARRAY){
     ts_array* a = (ts_array*)h;
     if (a->sparse) gc_payload_mark(array_sparse_table(a));
-    else if (a->data && !array_uses_inline(a)) gc_payload_mark(a->data);
+    else if (a->data && !array_uses_inline(a)) gc_payload_mark(array_base(a));
   } else if (h->kind == TS_KIND_FUNC){
     ts_func* f = (ts_func*)h;
     if (f->env) gc_payload_mark(f->env);
@@ -21401,6 +21461,13 @@ double ts_length_slow(tsv v){
 static uint32_t F_coro=0, F_value=0, F_done=0, F_gen_return_tag=0, F_gen_return_value=0;
 static ts_rt_ic g_ic_coro;
 static tsv g_gen_return_tag=TS_UNDEFINED;
+/* The layouts of the generator machinery's objects: a generator object `{__coro}` and an iteration
+   result `{value, done}`, allocated in their shape with slot stores (the generic path added the
+   properties one by one: a shape transition lookup and an append per property on every `next()`,
+   15% of yaml's parse). The keys are filled when the fields are interned (ensure_gen_fields). */
+static ts_key g_gen_keys[1], g_iter_keys[2];
+static ts_lit_layout g_gen_layout = { 0u, 1u, g_gen_keys, NULL };
+static ts_lit_layout g_iter_layout = { 0u, 2u, g_iter_keys, NULL };
 static void ensure_gen_fields(void){
   if (!F_coro){
     F_coro=ts_intern_field("__coro",6);
@@ -21408,6 +21475,7 @@ static void ensure_gen_fields(void){
     F_done=ts_intern_field("done",4);
     F_gen_return_tag=ts_intern_field("__generator_return_tag",22);
     F_gen_return_value=ts_intern_field("__generator_return_value",24);
+    g_gen_keys[0]=F_coro; g_iter_keys[0]=F_value; g_iter_keys[1]=F_done;
   }
   if (ts_is_undef(g_gen_return_tag)){
     g_gen_return_tag=ts_new_object();
@@ -21415,6 +21483,8 @@ static void ensure_gen_fields(void){
     ts_root_static_once(&g_gen_return_tag, &rooted);
   }
 }
+/* a fresh {value, done} in the iteration result's layout */
+static tsv gen_result_new(void){ ensure_gen_fields(); return ts_new_object_layout(&g_iter_layout); }
 static tsv ts_gen_return_completion(tsv value){
   ensure_gen_fields();
   ts_gc_root(&value);
@@ -21498,10 +21568,10 @@ tsv ts_gen_new_v(tsv cv){
   ts_gc_root(&cv);
   ensure_gen_fields();
   ts_generator_proto_init(0);
-  tsv g = ts_new_object();
+  tsv g = ts_new_object_layout(&g_gen_layout);
   ts_gc_root(&g);
   obj_link_fresh_proto(g, g_generator_protos[0]);
-  ts_set(g, F_coro, cv);   /* coro is OBJECT-tagged (kind CORO) */
+  ts_lit_store(g, 0, cv);   /* __coro: the coroutine (OBJECT-tagged, kind CORO) */
   ts_gc_unroot(2);
   return g;
 }
@@ -21578,9 +21648,9 @@ tsv ts_iter_step(tsv iter, tsv sent, ts_key nmk){
 tsv ts_gen_next(tsv genobj, tsv sent){
   ensure_gen_fields();
   ts_gc_root(&genobj); ts_gc_root(&sent);
-  tsv result = ts_new_object();
+  tsv result = gen_result_new();
   ts_gc_root(&result);
-  if (!ts_is_obj(genobj)){ ts_set(result, F_value, TS_UNDEFINED); ts_set(result, F_done, ts_bool(1)); ts_gc_unroot(3); return result; }
+  if (!ts_is_obj(genobj)){ ts_lit_store(result, 0, TS_UNDEFINED); ts_lit_store(result, 1, ts_bool(1)); ts_gc_unroot(3); return result; }
   tsv cv = ts_get_ic(genobj, F_coro, &g_ic_coro);
   ts_gc_root(&cv);
   if (!ts_is_coro_value(cv)){
@@ -21591,8 +21661,8 @@ tsv ts_gen_next(tsv genobj, tsv sent){
   if (c->gen_status==TS_GEN_EXECUTING) gen_throw_busy();
   if (c->done || c->gen_status==TS_GEN_COMPLETED){
     c->done=1; c->gen_status=TS_GEN_COMPLETED;
-    ts_set(result, F_value, TS_UNDEFINED);
-    ts_set(result, F_done, ts_bool(1));
+    ts_lit_store(result, 0, TS_UNDEFINED);
+    ts_lit_store(result, 1, ts_bool(1));
     ts_gc_unroot(4);
     return result;
   }
@@ -21616,12 +21686,12 @@ tsv ts_gen_next(tsv genobj, tsv sent){
   if (c->done){
     c->gen_status=TS_GEN_COMPLETED;
     /* on completion, c->yielded holds the return value (set by Return) */
-    ts_set(result, F_value, c->yielded);
-    ts_set(result, F_done, ts_bool(1));
+    ts_lit_store(result, 0, c->yielded);
+    ts_lit_store(result, 1, ts_bool(1));
   } else {
     c->gen_status=TS_GEN_SUSPENDED_YIELD;
-    ts_set(result, F_value, c->yielded);
-    ts_set(result, F_done, ts_bool(0));
+    ts_lit_store(result, 0, c->yielded);
+    ts_lit_store(result, 1, ts_bool(0));
   }
   ts_gc_unroot(4);
   return result;
@@ -21634,7 +21704,7 @@ tsv ts_gen_next(tsv genobj, tsv sent){
 tsv ts_gen_throw(tsv genobj, tsv exc){
   ensure_gen_fields();
   ts_gc_root(&genobj); ts_gc_root(&exc);
-  tsv result = ts_new_object();
+  tsv result = gen_result_new();
   ts_gc_root(&result);
   if (!ts_is_obj(genobj)) ts_throw(exc);
   tsv cv = ts_get_ic(genobj, F_coro, &g_ic_coro);
@@ -21667,12 +21737,12 @@ tsv ts_gen_throw(tsv genobj, tsv exc){
   }
   if (c->done){
     c->gen_status=TS_GEN_COMPLETED;
-    ts_set(result, F_value, c->yielded);
-    ts_set(result, F_done, ts_bool(1));
+    ts_lit_store(result, 0, c->yielded);
+    ts_lit_store(result, 1, ts_bool(1));
   } else {
     c->gen_status=TS_GEN_SUSPENDED_YIELD;
-    ts_set(result, F_value, c->yielded);
-    ts_set(result, F_done, ts_bool(0));
+    ts_lit_store(result, 0, c->yielded);
+    ts_lit_store(result, 1, ts_bool(0));
   }
   ts_gc_unroot(4);
   return result;
@@ -21684,10 +21754,10 @@ tsv ts_gen_throw(tsv genobj, tsv exc){
 tsv ts_gen_return(tsv genobj, tsv val){
   ensure_gen_fields();
   ts_gc_root(&genobj); ts_gc_root(&val);
-  tsv result = ts_new_object();
+  tsv result = gen_result_new();
   ts_gc_root(&result);
   if (!ts_is_obj(genobj)){
-    ts_set(result, F_value, val); ts_set(result, F_done, ts_bool(1)); ts_gc_unroot(3); return result;
+    ts_lit_store(result, 0, val); ts_lit_store(result, 1, ts_bool(1)); ts_gc_unroot(3); return result;
   }
   tsv cv = ts_get_ic(genobj, F_coro, &g_ic_coro);
   ts_gc_root(&cv);
@@ -21805,10 +21875,10 @@ tsv ts_iter_close(tsv iter, ts_key rmk){
 tsv ts_iter_result(tsv value, int done){
   ensure_gen_fields();
   ts_gc_root(&value);
-  tsv r = ts_new_object();
+  tsv r = gen_result_new();
   ts_gc_root(&r);
-  ts_set(r, F_value, value);
-  ts_set(r, F_done, ts_bool(done));
+  ts_lit_store(r, 0, value);
+  ts_lit_store(r, 1, ts_bool(done));
   ts_gc_unroot(2);
   return r;
 }

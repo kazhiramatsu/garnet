@@ -13138,20 +13138,23 @@ fn emit_coro_frame_struct(s: &mut String, f: &Function, ctx: &Ctx, fname: &str) 
     nvals
 }
 
-fn emit_coro_alloc(s: &mut String, fname: &str, nvals: Option<usize>) {
+/// The coroutine frame; a promise-backed mode (an async function, an async generator) takes the
+/// frame with its promise, a sync generator the frame alone (its results are plain objects).
+fn emit_coro_alloc(s: &mut String, fname: &str, nvals: Option<usize>, promise: bool) {
+    let alloc = if promise { "ts_coro_alloc" } else { "ts_coro_alloc_gen" };
     match nvals {
         Some(n) => {
             let _ = writeln!(
                 s,
-                "  tsv _cv = ts_coro_alloc_vn(sizeof({}_frame), {}_resume, {}u);",
-                fname, fname, n
+                "  tsv _cv = {}_vn(sizeof({}_frame), {}_resume, {}u);",
+                alloc, fname, fname, n
             );
         }
         None => {
             let _ = writeln!(
                 s,
-                "  tsv _cv = ts_coro_alloc_v(sizeof({}_frame), {}_resume);",
-                fname, fname
+                "  tsv _cv = {}_v(sizeof({}_frame), {}_resume);",
+                alloc, fname, fname
             );
         }
     }
@@ -13189,7 +13192,7 @@ fn emit_async_function(s: &mut String, f: &Function, ctx: &Ctx) {
     // return the result promise.
     let _ = writeln!(s, "static tsv {}(tsv* args, int nargs){{", fname);
     s.push_str("  (void)nargs;\n");
-    emit_coro_alloc(s, &fname, nvals);
+    emit_coro_alloc(s, &fname, nvals, true);
     s.push_str("  ts_gc_root(&_cv);\n");
     let _ = writeln!(s, "  {}_frame* _fr = ({}_frame*)ts_ptr(_cv);", fname, fname);
     // copy params into frame fields
@@ -13232,7 +13235,7 @@ fn emit_generator_function(s: &mut String, f: &Function, ctx: &Ctx) {
     // running the body (generators are lazy).
     let _ = writeln!(s, "static tsv {}(tsv* args, int nargs){{", fname);
     s.push_str("  (void)nargs;\n");
-    emit_coro_alloc(s, &fname, nvals);
+    emit_coro_alloc(s, &fname, nvals, false);
     s.push_str("  ts_gc_root(&_cv);\n");
     let _ = writeln!(s, "  {}_frame* _fr = ({}_frame*)ts_ptr(_cv);", fname, fname);
     emit_coroutine_param_copy(s, f, ctx);
@@ -13269,7 +13272,7 @@ fn emit_asyncgen_function(s: &mut String, f: &Function, ctx: &Ctx) {
     // object WITHOUT running the body (driven by .next()).
     let _ = writeln!(s, "static tsv {}(tsv* args, int nargs){{", fname);
     s.push_str("  (void)nargs;\n");
-    emit_coro_alloc(s, &fname, nvals);
+    emit_coro_alloc(s, &fname, nvals, true);
     s.push_str("  ts_gc_root(&_cv);\n");
     let _ = writeln!(s, "  {}_frame* _fr = ({}_frame*)ts_ptr(_cv);", fname, fname);
     emit_coroutine_param_copy(s, f, ctx);
@@ -21758,6 +21761,23 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             s.push_str(&ctx.set_val(dst.0, "ts_new_set()"));
         }
         Inst::CallBuiltinStatic { dst, builtin, args } => {
+            // f.call(thisArg, ...args) / f.apply(thisArg, arr): the Function.prototype implementations over
+            // the argument vector [f, thisArg, ...] (the exporter lowers the call without the `call` read)
+            if builtin == "function.call" || builtin == "function.apply" {
+                let rt = if builtin == "function.call" { "ts_funcproto_call" } else { "ts_funcproto_apply" };
+                let _ = writeln!(s, "  {{ tsv _fa[{}];", args.len().max(1));
+                for (i, a) in args.iter().enumerate() {
+                    let _ = writeln!(s, "    _fa[{}] = {};", i, ctx.val(a.0));
+                }
+                let tmp = format!("_far{}", dst.map(|d| d.0).unwrap_or(0));
+                let _ = writeln!(s, "    tsv {} = {}(_fa, {});", tmp, rt, args.len());
+                if let Some(d) = dst {
+                    let _ = writeln!(s, "  {} }}", ctx.set_val(d.0, &tmp).trim_end());
+                } else {
+                    s.push_str("  }\n");
+                }
+                return;
+            }
             // Object.assign(target, ...sources): variadic, copies own enumerable
             // props of each source into target (mutates + returns target).
             if builtin == "object.assign" {

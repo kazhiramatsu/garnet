@@ -10838,3 +10838,28 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   lays it out at its declaration), and a static written on a subclass with no static container of
   its own lands on the ancestor's. Gates: conformance 623/623 plain and strict, 620/620 under GC
   protect, unit, bundler 46/46, bench within budget, GC stress.
+- Real projects: the first tuning round (Session 354, `docs/real_projects.md` rxjs and yaml).
+  Each change measured by an alternating A/B of the two binaries (five runs each), gates for the
+  set. rxjs 525.3 -> 398.9 ms against Node's 149.2 (3.5x -> 2.7x): `f.call(thisArg, ...)` and
+  `f.apply(thisArg, arr)` whose receiver type names Function.prototype's member are lowered to
+  the runtime's implementations over the argument vector (`CallBuiltinStatic function.call /
+  function.apply`; the generic path had read `call` through the function's chain on every value,
+  5.9 M out-of-line reads), the (class word, key) inherited-read cache answers on a sized
+  receiver with own dynamic properties once its map lacks the key, and `shift` on an array of
+  more than 16 elements is amortized O(1) (`ts_array.front`: `data` moves up over the same
+  buffer, the base is `data - front`, folded back at 255 or on growth; `unshift` reuses the
+  slack; the GC marks and frees the base). `fn.apply` with an array-like argument list passes
+  the elements by index (it had called with no arguments: a silent miscompile the new fixture
+  caught). yaml 5944.9 -> 4980.2 against 1326.6 (4.5x -> 3.75x): a sync generator's frame is
+  allocated without a promise (`ts_coro_alloc_gen_v/_vn`, emitted for SmMode::Generator; the
+  promise was 13% of the parse), and the generator object `{__coro}` and the iteration results
+  `{value, done}` of `next`, `throw`, `return` and `ts_iter_result` are allocated in
+  `ts_lit_layout`s with slot stores (the generic path transitioned the shape per property on
+  every step). Fixtures: `arrays/shift_queue`, `functions/call_apply_direct`. Remaining profiles:
+  rxjs's generated subscriber chain, `ts_call`, `invoke_with_this` with the receiver check, the
+  try/catch setjmp; yaml's collector at 20% (minor collections marking the document under
+  construction, triggered by the per-step result objects), regexps, one-character `===`. Next:
+  stepping a native generator in `for...of` / `yield*` without the result object, the
+  receiver check and the borrowed-method lookup of a call through a function value in line, two
+  static strings compared by identity (the literals are shared per program). Clang on this
+  platform has no `__builtin_setjmp`, so the try region's setjmp stays. Gates: conformance 625/625 plain and strict, 622/622 under GC protect, unit, bundler 46/46, bench within budget, GC stress.
