@@ -87,6 +87,7 @@ enum {
   RX_OP_CLASS, RX_OP_NCLASS, RX_OP_CLASS_I, RX_OP_NCLASS_I, RX_OP_STRINGS,
   /* loops over a one-character matcher: matcher arg min max */
   RX_OP_LOOP_GREEDY, RX_OP_LOOP_LAZY,
+  RX_OP_SAVE_NR,      /* reg: reg = pos without a restore entry (the match bounds: before any choice point, after the last) */
   RX_OP__COUNT
 };
 /* flag bits on the opcode word */
@@ -115,9 +116,11 @@ struct rx_program {
   uint8_t first_valid;        /* first_bits / first_wide describe the first character of a match */
   uint8_t first_wide;         /* a first character >= 256 is possible */
   uint8_t first_bits[32];
+  uint8_t first_tab[256];     /* the same set as a byte table for the Latin-1 scan */
   uint16_t* prefix; uint32_t prefix_len;   /* a literal prefix (code units), case-sensitive patterns */
   uint8_t prefix_whole;       /* the pattern is exactly the prefix (no captures, no assertions) */
   void* owned;                /* one malloc holding code, sets, ranges, names, prefix */
+  void* user; void (*user_free)(void*);   /* the embedder's data (rx_set_user) */
 };
 
 /* parser (rx_parse.c): returns the AST or longjmps on error with err filled */

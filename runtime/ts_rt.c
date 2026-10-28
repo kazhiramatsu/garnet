@@ -1778,6 +1778,7 @@ static int ts_is_promise(tsv v); /* defined below; used by ts_get's promise meth
 static inline int ts_proto_ref(tsv v){ return ts_is_obj(v) || ts_is_func(v); }
 static inline ts_object* ts_proto_ptr(tsv v){ return ts_proto_ref(v) ? (ts_object*)ts_ptr(v) : NULL; }
 static inline ts_object* ts_next_proto(ts_object* o){ return o ? ts_proto_ptr(o->proto) : NULL; }
+void ts_gc_root_static(tsv* slot, int* rooted);
 static void ts_root_static_once(tsv* slot, int* rooted){
   if (*rooted) return;
   /* Lazy runtime caches must not enter the caller's LIFO root stack. */
@@ -1788,6 +1789,7 @@ static void ts_root_static_once(tsv* slot, int* rooted){
   g_static_roots[g_static_root_len++] = slot;
   *rooted = 1;
 }
+void ts_gc_root_static(tsv* slot, int* rooted){ ts_root_static_once(slot, rooted); }
 static void ts_proto_register_method(tsv proto, ts_key method_key, const char* name, ts_code fn);
 /* A fresh plain object's in-object slot count (its cell is zeroed: no
    flag, no card range). */
@@ -5319,8 +5321,22 @@ tsv ts_regexp_alloc(void){
   if (!ts_proto_ref(g_regexp_proto_v)) ts_regexp_proto_init();
   ts_regexp* r = gc_alloc(sizeof(ts_regexp), TS_KIND_REGEXP);
   r->o.proto = g_regexp_proto_v;
-  r->prog = NULL; r->source = TS_UNDEFINED; r->flags = 0;
+  r->prog = NULL; r->source = TS_UNDEFINED; r->flags = 0; r->ncaps = 2;
   return ts_obj(r);
+}
+static ts_key g_regexp_last_index_key = 0xFFFFFFFFu;
+/* a RegExp cell carries no sidecar: its map is in place, lastIndex its first entry */
+static inline tsv* regexp_last_index_slot(ts_object* o, ts_key key, int for_write){
+  ts_propmap* m = obj_map_plain(o);
+  if (m->len == 0 || m->props[0].key != key) return NULL;
+  uint8_t fl = m->props[0].flags;
+  if ((fl & TS_PROP_ACCESSOR) || (for_write && (!(fl & TS_PROP_WRITABLE) || (ts_obj_integrity(o) & 1u)))) return NULL;
+  return &m->props[0].val;
+}
+tsv* ts_regexp_last_index_slot(tsv re, int for_write){
+  if (!ts_is_regexp(re)) return NULL;
+  if (g_regexp_last_index_key == 0xFFFFFFFFu) g_regexp_last_index_key = ts_intern_field("lastIndex", 9);
+  return regexp_last_index_slot((ts_object*)ts_ptr(re), g_regexp_last_index_key, for_write);
 }
 /* ToPrimitive 用に callable な valueOf/toString を取得。own のデータプロパティ
    （FIELD キー）が prototype/ビルトインのメソッド（METHOD キー）をシャドウする。 */
@@ -17568,6 +17584,11 @@ __attribute__((noinline)) static tsv ts_get_pic_sized(tsv obj, ts_key key, ts_pr
    arrays `reactive()` wraps read `__v_raw`), a function or another kind: the slow read */
 __attribute__((noinline)) static tsv ts_get_pic_other(tsv obj, ts_key key, ts_prop_ic* ic){
   ts_object* o = (ts_object*)ts_ptr(obj);
+  /* a RegExp's lastIndex (a tokenizer reads it after every sticky test): its map's first slot */
+  if (o->h.kind == TS_KIND_REGEXP && key == g_regexp_last_index_key){
+    tsv* slot = regexp_last_index_slot(o, key, 0);
+    if (slot) return *slot;
+  }
   if (o->h.kind == TS_KIND_ARRAY && ic && (ic->rec_epoch & TS_ABSENT_EPOCH_TAG) && g_negative_pic &&
       prop_cache_receiver(o, key) && prop_absent_lookup(ic, o, key)){
     RT_STAT_INC(pic_absent_hits); return TS_UNDEFINED;
@@ -18071,6 +18092,11 @@ void ts_set_pic(tsv obj, ts_key key, tsv val, ts_prop_ic* ic){
   if (ic && ic->megamorphic){ ts_set(obj, key, val); return; }
   if (TS_TOP16(obj) == TS_SEL_OBJECT){
     ts_object* o = (ts_object*)ts_ptr(obj);
+    /* a RegExp's lastIndex (`re.lastIndex = pos` before every sticky test): its map's first slot */
+    if (o->h.kind == TS_KIND_REGEXP && key == g_regexp_last_index_key){
+      tsv* slot = regexp_last_index_slot(o, key, 1);
+      if (slot){ *slot = val; ts_write_barrier(obj, val); return; }
+    }
     if (prop_cache_receiver(o, key)){
       /* The addition this site cached, before any probe for an existing key
          (a constructor initializing a fresh object): the same conditions as

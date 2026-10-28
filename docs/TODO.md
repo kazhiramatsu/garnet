@@ -11414,3 +11414,38 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   at three jobs). The prefilter rule came after the gate set: re-verified by the engine diff
   (44,593 cases, 0 differ) and the 41 regexp-related fixtures (the 23 regexp fixtures, the nine
   of the corpus, the nine others that use RegExps).
+- R2a of the regexp VM: the adapter's and the engine's per-call costs (the R2 kernels
+  `benchmarks/patterns/regexp_{tokenizer,validate,logs,search}.ts`: a sticky-regexp lexer,
+  anchored validation patterns, named-group log parsing with a function replacer and a split,
+  searches with a case-insensitive alternation, Unicode properties under matchAll and a
+  backtracking alternation; scaled so the work dominates Node's ~60 ms startup). The profiles
+  (`TSAOT_PROF_PC` on `garnet --profile` builds): the tokenizer spent half its time in the generic
+  property paths of `lastIndex` (the generated `re.lastIndex = pos` and the adapter's reads and
+  writes), 7-9% in `ts_gc_root`, and a third in the interpreter; the validate kernel 60% in the
+  interpreter with `match1_8` out of line; the logs kernel a third in slices, builders and the
+  groups object (the names interned per exec). (1) `lastIndex` is read and written through the
+  cell's map slot (`ts_regexp_last_index_slot`: the first entry of a RegExp's map, defined at
+  creation and never deleted; `ts_get_pic_other` and `ts_set_pic` answer the generated sites,
+  the adapter its own reads and writes; an accessor over it or a read-only redefinition keeps
+  the generic paths). (2) An exec with a string input and a numeric lastIndex runs no user code,
+  so `builtin_exec` neither roots nor reads the string's view twice; `test` with a string input
+  skips the coercion; the exporter no longer emits `string.coerce` before the regexp calls (the
+  adapter coerces). (3) The engine: the simple loops of the Latin-1 body are tight scans
+  (`[^...]+`, `\s*`, `a+`, `.*`: one unit per character, the backtrack entry as before), `match1`
+  is always inline, runs of case-sensitive characters are one CHARS op (a lookbehind body's run
+  keeps its source order), the match bounds are stored without restore entries (SAVE_NR), the
+  first-character set is a byte table, one thread-local fetch per exec, no table init per exec.
+  (4) The results: each capture sliced once (the `groups` values read back from the array), the
+  `groups` object from a per-program layout whose keys are interned once (`rx_set_user`: the
+  adapter's data on the program, freed with it), the replace pieces appended without redundant
+  roots, `split` on the regexp's own program unless sticky, the matchAll iterator one layout
+  allocation on a shared prototype holding `next` and [Symbol.iterator]. Kernels (native ms
+  against Node's, Node including ~60 ms of startup): tokenizer 399 -> 160 (Node 121), validate
+  163 -> 124 (89), logs 218 -> 138 (118), search 199 -> 148 (114), path_regexps 162 -> 134
+  (115). Gates: conformance 662/662 plain and strict, 659/659 under GC protect, unit (the
+  propmap access gate caught a direct `o->map` read in the slot helper: `obj_map_plain` now),
+  bundler 51/51, bench 102/102 within budget, GC stress PASSED (rerun alone after the fix), the
+  regexp AOT and link gates, the engine diff 43,593 cases 0 differ. vue 1,080.7 -> 1,068.1 ms (seven
+  alternating rounds each, medians; outputs identical; Node 770), tsc-ts 22.212 -> 22.214 G
+  instructions (unchanged; wall 1.19 -> 1.20 s; outputs identical). Not in this slice:
+  `runtime/regexp/rx_native.h` and `rx_emit.c` are the native tier's first files (R3, next).

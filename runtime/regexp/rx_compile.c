@@ -333,10 +333,33 @@ static void compile_node(cstate* c, rx_node* n){
     case RX_N_CHAR: emit_char(c, n); return;
     case RX_N_DOT: emit(c, ((n->mflags & RX_M_S) ? RX_OP_ANY_ALL : RX_OP_ANY) | text_flags(c)); return;
     case RX_N_CLASS: if (n->strs.n) emit_class_strings(c, n); else emit_class(c, n); return;
-    case RX_N_SEQ:
-      if (c->bw){ for (uint32_t i = n->nkids; i > 0; i--) compile_node(c, n->kids[i-1]); }
-      else { for (uint32_t i = 0; i < n->nkids; i++) compile_node(c, n->kids[i]); }
+    case RX_N_SEQ: {
+      /* runs of case-sensitive single-unit characters become one CHARS op (no dispatch per
+         unit); a lookbehind body is emitted in reverse, a run's units stay in source order (the
+         backward CHARS compares the units ending at the position) */
+      #define CHARS_OK(k) ((k)->kind == RX_N_CHAR && !((k)->mflags & RX_M_I) && (k)->cp < 0x10000u && \
+                           !(c->u && (k)->cp >= 0xD800u && (k)->cp <= 0xDFFFu))
+      uint32_t nk = n->nkids;
+      if (!c->bw){
+        uint32_t i = 0;
+        while (i < nk){
+          uint32_t j = i;
+          while (j < nk && CHARS_OK(n->kids[j])) j++;
+          if (j - i >= 2){ emit(c, RX_OP_CHARS); emit(c, j - i); for (uint32_t k = i; k < j; k++) emit(c, n->kids[k]->cp); i = j; }
+          else { compile_node(c, n->kids[i]); i++; }
+        }
+      } else {
+        uint32_t i = nk;
+        while (i > 0){
+          uint32_t j = i;
+          while (j > 0 && CHARS_OK(n->kids[j-1])) j--;
+          if (i - j >= 2){ emit(c, RX_OP_CHARS | RX_OP_BW); emit(c, i - j); for (uint32_t k = j; k < i; k++) emit(c, n->kids[k]->cp); i = j; }
+          else { compile_node(c, n->kids[i-1]); i--; }
+        }
+      }
+      #undef CHARS_OK
       return;
+    }
     case RX_N_ALT: {
       uint32_t* ends = (uint32_t*)rx_arena_alloc(c->a, sizeof(uint32_t) * n->nkids); uint32_t nends = 0;
       for (uint32_t i = 0; i < n->nkids; i++){
@@ -408,9 +431,9 @@ rx_program* rx_compile_ast(rx_arena* arena, rx_node* root, uint32_t flags, uint3
   cstate* c = &st;
   c->a = arena; c->flags = flags; c->u = (flags & RX_F_EITHER_UNICODE) != 0;
   c->ngroups = ngroups; c->ncap_regs = 2 * (ngroups + 1); c->nregs = c->ncap_regs;
-  emit_save(c, 0);
+  emit(c, RX_OP_SAVE_NR); emit(c, 0);   /* before any choice point: nothing to restore */
   compile_node(c, root);
-  emit_save(c, 1);
+  emit(c, RX_OP_SAVE_NR); emit(c, 1);   /* after the last: never backtracked past */
   emit(c, RX_OP_ACCEPT);
 
   rx_program* p = (rx_program*)calloc(1, sizeof(rx_program));
@@ -439,7 +462,10 @@ rx_program* rx_compile_ast(rx_arena* arena, rx_node* root, uint32_t flags, uint3
     /* a selective set, or one without the lower-case letters (tsc's `[^...a-z0-9...]+` over paths:
        on identifiers and paths a set with them makes nearly every position a candidate, and the
        scan costs more than it saves; without them the scan skips most of the input) */
-    if (pop <= 48 || !has_lower){ p->first_valid = 1; p->first_wide = (uint8_t)f.wide; memcpy(p->first_bits, f.bits, 32); }
+    if (pop <= 48 || !has_lower){
+      p->first_valid = 1; p->first_wide = (uint8_t)f.wide; memcpy(p->first_bits, f.bits, 32);
+      for (uint32_t u = 0; u < 256u; u++) p->first_tab[u] = (uint8_t)((f.bits[u >> 3] >> (u & 7u)) & 1u);
+    }
   }
   int whole; literal_prefix(c, root, &p->prefix, &p->prefix_len, &whole);
   p->prefix_whole = (uint8_t)(whole && ngroups == 0);
@@ -455,8 +481,11 @@ const uint16_t* rx_group_name(const rx_program* p, uint32_t i, uint32_t* len){
 int rx_has_named_groups(const rx_program* p){ return p->nnamed > 0; }
 int rx_anchored_at_start(const rx_program* p){ return p->anchored_start; }
 void rx_retain(rx_program* p){ p->refs++; }
+void* rx_user(const rx_program* p){ return p->user; }
+void rx_set_user(rx_program* p, void* data, void (*free_fn)(void*)){ p->user = data; p->user_free = free_fn; }
 void rx_release(rx_program* p){
   if (!p || --p->refs) return;
+  if (p->user && p->user_free) p->user_free(p->user);
   free(p->code);
   for (uint32_t i = 0; i < p->nsets; i++) free(p->sets[i].base);
   free(p->sets);

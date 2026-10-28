@@ -1320,6 +1320,7 @@ typedef struct ts_regexp {
   rx_program* prog;
   tsv source;
   uint32_t flags;
+  uint32_t ncaps;      /* 2 * (capturing groups + 1): the capture slots an exec fills */
 } ts_regexp;
 
 /* JS Set: insertion-ordered element array, SameValueZero membership; same
@@ -1489,6 +1490,10 @@ void ts_regexp_proto_register(ts_key method_key, const char* name, ts_code fn);
 int  ts_regexp_is_object(tsv re);
 /* a fresh TS_KIND_REGEXP cell (prototype RegExp.prototype), its fields set by the adapter */
 tsv  ts_regexp_alloc(void);
+/* the `lastIndex` slot of a RegExp: the first entry of its map, defined at creation and never
+   deleted (non-configurable); NULL when it is not a plain data property (an accessor defined
+   over it), or, for a write, not writable: the generic paths then apply */
+tsv* ts_regexp_last_index_slot(tsv re, int for_write);
 /* the adapter's entry points the core runtime calls when the program links RegExps
    (runtime/regexp/ts_regexp_adapter.c installs them): toString, the String methods with a
    RegExp argument, a RegExp from a string pattern, the program's release on sweep */
@@ -1503,6 +1508,8 @@ typedef struct ts_regexp_hooks {
   void (*release)(rx_program* p);
 } ts_regexp_hooks;
 void ts_regexp_hooks_install(const ts_regexp_hooks* h);
+/* register a static cell holding a tsv as a permanent root (idempotent through *rooted) */
+void ts_gc_root_static(tsv* slot, int* rooted);
 /* a string from UTF-16 code units */
 tsv   ts_string_from_code_units(const uint16_t* units, uint32_t len);
 tsv ts_strproto_toUpperCase(tsv* a, int n);

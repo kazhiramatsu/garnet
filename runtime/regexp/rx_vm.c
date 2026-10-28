@@ -18,7 +18,8 @@ typedef struct rx_ctx {
 } rx_ctx;
 
 /* the per-thread scratch: the backtrack stack and the register file */
-static _Thread_local struct { int32_t* regs; uint32_t regs_cap; uint32_t* bt; uint32_t bt_cap; } g_scratch;
+typedef struct rx_scratch { int32_t* regs; uint32_t regs_cap; uint32_t* bt; uint32_t bt_cap; } rx_scratch;
+static _Thread_local rx_scratch g_scratch;
 
 static int bt_grow(rx_ctx* c){
   uint32_t cap = c->bt_cap ? c->bt_cap * 2 : 4096;
@@ -88,16 +89,16 @@ static uint32_t find_prefix(const rx_ctx* c, int wide, uint32_t from){
 }
 
 int rx_exec(const rx_program* p, const void* input, uint32_t len, int wide, uint32_t start, int32_t* caps){
-  rx_unicode_init();
-  rx_ctx c;
+  rx_ctx c;   /* the case tables were built by the compile */
   c.p = p; c.in8 = (const uint8_t*)input; c.in16 = (const uint16_t*)input; c.len = len;
-  if (g_scratch.regs_cap < p->nregs){
+  rx_scratch* S = &g_scratch;   /* one thread-local fetch */
+  if (S->regs_cap < p->nregs){
     uint32_t cap = p->nregs < 64 ? 64 : p->nregs;
-    int32_t* r = (int32_t*)realloc(g_scratch.regs, sizeof(int32_t) * cap);
+    int32_t* r = (int32_t*)realloc(S->regs, sizeof(int32_t) * cap);
     if (!r) return RX_EXEC_OVERFLOW;
-    g_scratch.regs = r; g_scratch.regs_cap = cap;
+    S->regs = r; S->regs_cap = cap;
   }
-  c.regs = g_scratch.regs; c.bt = g_scratch.bt; c.bt_cap = g_scratch.bt_cap; c.bt_sp = 0;
+  c.regs = S->regs; c.bt = S->bt; c.bt_cap = S->bt_cap; c.bt_sp = 0;
   if (start > len) return 0;
   int cp_mode = (p->flags & RX_F_EITHER_UNICODE) != 0;
   int sticky = (p->flags & RX_F_STICKY) != 0;
@@ -125,7 +126,8 @@ int rx_exec(const rx_program* p, const void* input, uint32_t len, int wide, uint
       pos = hit;
     } else if (p->first_valid){
       if (!wide){
-        while (pos <= last && !((p->first_bits[c.in8[pos] >> 3] >> (c.in8[pos] & 7u)) & 1u)) pos++;
+        const uint8_t* tab = p->first_tab;
+        while (pos <= last && !tab[c.in8[pos]]) pos++;
       } else {
         while (pos <= last){
           uint32_t u = c.in16[pos];
@@ -148,13 +150,13 @@ static const char* op_name(uint32_t op){
     "FAIL", "ACCEPT", "LOOK_END", "JMP", "PUSH_BT", "SAVE", "CLEAR", "CNT_INIT", "CNT_INC_JL", "CNT_JGE",
     "EMPTY_START", "EMPTY_CHECK", "EMPTY_CHECK_OPT", "LOOK", "BACKREF", "BACKREF_LIST", "BOL", "EOL", "BOL_M", "EOL_M",
     "WORDB", "NWORDB", "CHAR", "CHAR_I", "CHAR2", "CHARS", "ANY", "ANY_ALL", "CLASS", "NCLASS", "CLASS_I", "NCLASS_I",
-    "STRINGS", "LOOP_GREEDY", "LOOP_LAZY" };
+    "STRINGS", "LOOP_GREEDY", "LOOP_LAZY", "SAVE_NR" };
   return op < RX_OP__COUNT ? names[op] : "?";
 }
 static uint32_t op_len(const uint32_t* code, uint32_t pc){
   uint32_t op = code[pc] & RX_OP_MASK;
   switch (op){
-    case RX_OP_JMP: case RX_OP_PUSH_BT: case RX_OP_SAVE: case RX_OP_CNT_INIT: case RX_OP_EMPTY_START: case RX_OP_EMPTY_CHECK:
+    case RX_OP_JMP: case RX_OP_PUSH_BT: case RX_OP_SAVE: case RX_OP_SAVE_NR: case RX_OP_CNT_INIT: case RX_OP_EMPTY_START: case RX_OP_EMPTY_CHECK:
     case RX_OP_BACKREF: case RX_OP_CHAR: case RX_OP_CHAR_I: case RX_OP_CLASS: case RX_OP_NCLASS: case RX_OP_CLASS_I: case RX_OP_NCLASS_I: case RX_OP_STRINGS:
       return 2;
     case RX_OP_CLEAR: case RX_OP_CHAR2: case RX_OP_LOOK: return 3;

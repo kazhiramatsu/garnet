@@ -57,6 +57,11 @@ uint32_t rx_fold_u(uint32_t cp);
    needed length. */
 uint32_t rx_escape_source(const uint16_t* pattern, uint32_t len, uint16_t* out, uint32_t cap);
 
+/* An opaque slot for the embedder's per-program data (the adapter's interned group keys and
+   result layouts), freed with the program. */
+void* rx_user(const rx_program* p);
+void rx_set_user(rx_program* p, void* data, void (*free_fn)(void*));
+
 /* Debugging aid: a textual disassembly of the program (malloc'd, caller frees). */
 char* rx_disassemble(const rx_program* p);
 

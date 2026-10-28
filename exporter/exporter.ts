@@ -3982,8 +3982,7 @@ class Exporter {
       ctx.body.push({ kind: "Const", dst: u, value: { kind: "Undef" } });
       return u;
     })();
-    const src = this.newLocal(ctx, "reference");
-    ctx.body.push({ kind: "CallBuiltinStatic", dst: src, builtin: "string.coerce", args: [rawArg] });
+    const src = rawArg;   // the adapter applies ToString
     const pat = this.constString(ctx, rx.source, "rxSource");
     const flags = this.constNumber(ctx, mask, "rxFlags");
     const dst = this.newLocal(ctx, "reference");
@@ -4001,8 +4000,7 @@ class Exporter {
       ctx.body.push({ kind: "Const", dst: u, value: { kind: "Undef" } });
       return u;
     })();
-    const src = this.newLocal(ctx, "reference");
-    ctx.body.push({ kind: "CallBuiltinStatic", dst: src, builtin: "string.coerce", args: [rawArg] });
+    const src = rawArg;   // the adapter applies ToString
     const pat = this.constString(ctx, rx.source, "rxSource");
     const flags = this.constNumber(ctx, mask, "rxFlags");
     const dst = this.newLocal(ctx, "reference");
@@ -4098,8 +4096,7 @@ class Exporter {
       ctx.body.push({ kind: "Const", dst: u, value: { kind: "Undef" } });
       return u;
     })();
-    const src = this.newLocal(ctx, "reference");
-    ctx.body.push({ kind: "CallBuiltinStatic", dst: src, builtin: "string.coerce", args: [rawArg] });
+    const src = rawArg;   // the adapter applies ToString
     const dst = this.newLocal(ctx, "reference");
     ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "regexp.objectTest", args: [recv, src] });
     return dst;
@@ -4113,8 +4110,7 @@ class Exporter {
       ctx.body.push({ kind: "Const", dst: u, value: { kind: "Undef" } });
       return u;
     })();
-    const src = this.newLocal(ctx, "reference");
-    ctx.body.push({ kind: "CallBuiltinStatic", dst: src, builtin: "string.coerce", args: [rawArg] });
+    const src = rawArg;   // the adapter applies ToString
     const dst = this.newLocal(ctx, "reference");
     ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "regexp.objectExec", args: [recv, src] });
     return dst;

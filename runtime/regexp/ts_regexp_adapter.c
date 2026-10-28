@@ -133,7 +133,7 @@ static tsv regexp_make(rx_program* p, tsv source, uint32_t flags){
   tsv re = ts_regexp_alloc();
   ts_gc_root(&re);
   ts_regexp* r = as_re(re);
-  r->prog = p; r->flags = flags; r->source = source;
+  r->prog = p; r->flags = flags; r->source = source; r->ncaps = 2u * (rx_group_count(p) + 1u);
   ts_write_barrier(re, source);
   ts_define_data(re, k_lastIndex, ts_num(0), 0, 1, 0);
   ts_gc_unroot(2);
@@ -147,15 +147,24 @@ tsv ts_regexp_new_literal(tsv source, uint32_t flags){
 }
 static void release_program(rx_program* p){ if (p) rx_release(p); }
 
-/* lastIndex: ToLength of the property; the writes through the generic path */
+/* lastIndex: ToLength of the property, read and written through the cell's slot (the generic
+   paths when an accessor was defined over it or it was made read-only) */
 static ts_rt_ic g_ic_last;
-static uint32_t last_index_get(tsv re){
-  double d = ts_number_coerce(ts_get_ic(re, k_lastIndex, &g_ic_last));
+static inline double last_index_raw(tsv re){
+  tsv* slot = ts_regexp_last_index_slot(re, 0);
+  tsv v = slot ? *slot : ts_get_ic(re, k_lastIndex, &g_ic_last);
+  return ts_is_num(v) ? ts_to_num(v) : ts_number_coerce(v);
+}
+static inline uint32_t to_length_u32(double d){
   if (!(d > 0.0) || !isfinite(d)) return 0;
   if (d > 4294967295.0) return 4294967295u;
   return (uint32_t)floor(d);
 }
-static void last_index_set(tsv re, uint32_t v){ ts_set_ic(re, k_lastIndex, ts_num((double)v), &g_ic_last); }
+static uint32_t last_index_get(tsv re){ return to_length_u32(last_index_raw(re)); }
+static void last_index_set(tsv re, uint32_t v){
+  tsv* slot = ts_regexp_last_index_slot(re, 1);
+  if (slot) *slot = ts_num((double)v); else ts_set_ic(re, k_lastIndex, ts_num((double)v), &g_ic_last);
+}
 
 /* ---- running the engine over a string ---- */
 static int exec_string(rx_program* p, tsv s, uint32_t start, int32_t* caps){
@@ -169,11 +178,11 @@ static int exec_string(rx_program* p, tsv s, uint32_t start, int32_t* caps){
 }
 #define CAPS_STACK 64u
 typedef struct capsbuf { int32_t* v; int32_t small[CAPS_STACK]; } capsbuf;
-static void caps_init(capsbuf* c, rx_program* p){
-  uint32_t n = 2u * (rx_group_count(p) + 1u);
+static inline void caps_init_n(capsbuf* c, uint32_t n){
   c->v = n <= CAPS_STACK ? c->small : (int32_t*)malloc(sizeof(int32_t) * n);
   if (!c->v) abort();
 }
+static void caps_init(capsbuf* c, rx_program* p){ caps_init_n(c, 2u * (rx_group_count(p) + 1u)); }
 static void caps_free(capsbuf* c){ if (c->v != c->small) free(c->v); }
 
 static uint32_t advance_index(tsv s, uint32_t i, int unicode){
@@ -184,11 +193,29 @@ static uint32_t advance_index(tsv s, uint32_t i, int unicode){
   return i + 1u;
 }
 
-/* RegExpBuiltinExec: lastIndex read for g / y, the match, lastIndex written; caps filled */
+/* RegExpBuiltinExec: lastIndex read for g / y, the match, lastIndex written; caps filled.
+   The plain case (the input a string, lastIndex a number in its slot) runs no user code, so it
+   neither roots (a handle only moves at a collection, which only an allocation triggers) nor
+   reads the string's view twice. */
 static int builtin_exec(tsv re, tsv s, int32_t* caps){
   ts_regexp* r = as_re(re);
   uint32_t flags = r->flags;
   int gy = (flags & (TSAOT_REGEXP_FLAG_GLOBAL | TSAOT_REGEXP_FLAG_STICKY)) != 0;
+  tsv* slot = ts_regexp_last_index_slot(re, 1);
+  if (slot && ts_is_num(*slot) && ts_is_str(s)){
+    ts_strview sv = ts_str_view_typed(s);
+    char buf[TS_SHORTSTR_MAX];
+    const char* data = ts_str_view_data(&sv, buf);
+    uint32_t start = 0;
+    if (gy){
+      start = to_length_u32(ts_to_num(*slot));
+      if (start > sv.len){ *slot = ts_num(0); return 0; }
+    }
+    int m = rx_exec(r->prog, data, sv.len, (sv.flags & TS_STR_FLAG_UTF16) != 0, start, caps);
+    if (m == RX_EXEC_OVERFLOW){ ts_throw_range_error_msg("Maximum call stack size exceeded"); return 0; }
+    if (gy) *slot = ts_num(m ? (double)caps[1] : 0.0);
+    return m;
+  }
   uint32_t start = 0;
   ts_gc_root(&re); ts_gc_root(&s);
   if (gy){
@@ -205,34 +232,52 @@ static int builtin_exec(tsv re, tsv s, int32_t* caps){
 /* ---- results ---- */
 static tsv slice(tsv s, int32_t a, int32_t b){ return ts_str_slice(s, (double)a, (double)b, 1); }
 static tsv substr(tsv s, uint32_t start, uint32_t len){ return ts_str_slice(s, (double)start, (double)(start + len), 1); }
-static tsv key_string_of_name(const uint16_t* name, uint32_t len){ return ts_string_from_code_units(name, len); }
-/* the `groups` object (null prototype): each distinct name, the participating group's value */
-static tsv build_groups(tsv s, const int32_t* caps, rx_program* p, int as_indices){
+/* the program's named groups as the runtime sees them, made once per program and freed with it:
+   the interned key of each distinct name in group order (the `groups` object's layout) and
+   each group's slot in it (-1 for an unnamed group; duplicate names share a slot) */
+typedef struct prog_meta { ts_key* keys; uint32_t nkeys; int32_t* name_slot; ts_lit_layout layout; } prog_meta;
+static void meta_free(void* d){ prog_meta* m = (prog_meta*)d; free(m->keys); free(m->name_slot); free(m); }
+static prog_meta* meta_of(rx_program* p){
+  prog_meta* m = (prog_meta*)rx_user(p);
+  if (m) return m;
   uint32_t ng = rx_group_count(p);
-  ts_gc_root(&s);
-  tsv obj = ts_object_create(TS_NULL);
-  ts_gc_root(&obj);
+  m = (prog_meta*)calloc(1, sizeof *m);
+  m->keys = (ts_key*)malloc(sizeof(ts_key) * (ng ? ng : 1));
+  m->name_slot = (int32_t*)malloc(sizeof(int32_t) * (ng + 1));
+  if (!m || !m->keys || !m->name_slot) abort();
+  m->name_slot[0] = -1;
   for (uint32_t g = 1; g <= ng; g++){
     uint32_t nl; const uint16_t* name = rx_group_name(p, g, &nl);
-    if (!name) continue;
-    int seen = 0;
-    for (uint32_t h = 1; h < g; h++){ uint32_t hl; const uint16_t* hn = rx_group_name(p, h, &hl); if (hn && hl == nl && memcmp(hn, name, sizeof(uint16_t) * nl) == 0){ seen = 1; break; } }
-    if (seen) continue;
-    uint32_t chosen = 0;
-    for (uint32_t h = g; h <= ng; h++){
+    if (!name){ m->name_slot[g] = -1; continue; }
+    int32_t slot = -1;
+    for (uint32_t h = 1; h < g; h++){
       uint32_t hl; const uint16_t* hn = rx_group_name(p, h, &hl);
-      if (hn && hl == nl && memcmp(hn, name, sizeof(uint16_t) * nl) == 0 && caps[2*h] >= 0){ chosen = h; break; }
+      if (hn && hl == nl && memcmp(hn, name, sizeof(uint16_t) * nl) == 0){ slot = m->name_slot[h]; break; }
     }
-    tsv value = TS_UNDEFINED;
-    if (chosen){
-      if (as_indices){ value = ts_new_array(0); ts_gc_root(&value); ts_array_push(value, ts_num(caps[2*chosen])); ts_array_push(value, ts_num(caps[2*chosen+1])); ts_gc_unroot(1); }
-      else value = slice(s, caps[2*chosen], caps[2*chosen+1]);
+    if (slot < 0){
+      size_t ulen; char* u8 = utf16_to_utf8(name, nl, &ulen);
+      m->keys[m->nkeys] = ts_intern_field(u8, (uint32_t)ulen);
+      free(u8);
+      slot = (int32_t)m->nkeys++;
     }
-    ts_gc_root(&value);
-    tsv keyv = key_string_of_name(name, nl);
-    ts_gc_root(&keyv);
-    ts_set_dyn(obj, keyv, value);
-    ts_gc_unroot(2);
+    m->name_slot[g] = slot;
+  }
+  m->layout.shape = 0; m->layout.n = m->nkeys; m->layout.keys = m->keys; m->layout.kinds = NULL;
+  rx_set_user(p, m, meta_free);
+  return m;
+}
+/* the `groups` object (null prototype) from the program's layout: each name's slot takes the
+   participating group's value out of `values` (the result array, or the indices array) */
+static tsv build_groups(tsv values, const int32_t* caps, rx_program* p){
+  prog_meta* m = meta_of(p);
+  uint32_t ng = rx_group_count(p);
+  ts_gc_root(&values);
+  tsv obj = ts_new_object_layout(&m->layout);
+  ((ts_object*)ts_ptr(obj))->proto = TS_NULL;
+  ts_gc_root(&obj);
+  for (uint32_t g = 1; g <= ng; g++){
+    if (m->name_slot[g] < 0 || caps[2*g] < 0) continue;
+    ts_lit_store(obj, (uint32_t)m->name_slot[g], ts_array_get(values, g));
   }
   ts_gc_unroot(2);
   return obj;
@@ -249,7 +294,7 @@ static tsv build_indices(tsv s, const int32_t* caps, rx_program* p){
     ts_array_push(arr, pair);
     ts_gc_unroot(1);
   }
-  tsv groups = rx_has_named_groups(p) ? build_groups(s, caps, p, 1) : TS_UNDEFINED;
+  tsv groups = rx_has_named_groups(p) ? build_groups(arr, caps, p) : TS_UNDEFINED;
   ts_gc_root(&groups);
   ts_set(arr, k_groups, groups);
   ts_gc_unroot(3);
@@ -263,13 +308,11 @@ static tsv build_result(tsv s, const int32_t* caps, rx_program* p){
   ts_gc_root(&arr);
   for (uint32_t g = 0; g <= ng; g++){
     tsv part = caps[2*g] >= 0 ? slice(s, caps[2*g], caps[2*g+1]) : TS_UNDEFINED;
-    ts_gc_root(&part);
-    ts_array_push(arr, part);
-    ts_gc_unroot(1);
+    ts_array_push(arr, part);   /* push roots its argument */
   }
   ts_set(arr, k_index, ts_num(caps[0]));
   ts_set(arr, k_input, s);
-  tsv groups = rx_has_named_groups(p) ? build_groups(s, caps, p, 0) : TS_UNDEFINED;
+  tsv groups = rx_has_named_groups(p) ? build_groups(arr, caps, p) : TS_UNDEFINED;
   ts_gc_root(&groups);
   ts_set(arr, k_groups, groups);
   ts_gc_unroot(1);
@@ -286,6 +329,13 @@ static tsv build_result(tsv s, const int32_t* caps, rx_program* p){
 /* ---- the literal entry points (no RegExp object) ---- */
 static tsv to_str(tsv v){ return ts_is_str(v) ? v : ts_to_string_v(v); }
 tsv ts_regexp_adapter_test_tsv(tsv pattern, uint32_t flags, tsv input){
+  if (ts_is_str(input)){
+    rx_program* p = compile_pattern(pattern, flags);
+    capsbuf cb; caps_init(&cb, p);
+    int m = exec_string(p, input, 0, cb.v);
+    caps_free(&cb);
+    return ts_bool(m);
+  }
   ts_gc_root(&input); ts_gc_root(&pattern);
   tsv s = to_str(input); ts_gc_root(&s);
   rx_program* p = compile_pattern(pattern, flags);
@@ -354,17 +404,22 @@ tsv ts_regexp_adapter_split_tsv(tsv input, tsv pattern, uint32_t flags, tsv limi
 }
 
 /* ---- the object entry points ---- */
-static void require_regexp(tsv re, const char* what){
-  if (!ts_is_regexp(re)){
-    char msg[160]; snprintf(msg, sizeof msg, "%s called on incompatible receiver", what);
-    ts_throw_type_error_msg(msg);
-  }
+static void require_regexp_fail(const char* what){
+  char msg[160]; snprintf(msg, sizeof msg, "%s called on incompatible receiver", what);
+  ts_throw_type_error_msg(msg);
 }
+static inline void require_regexp(tsv re, const char* what){ if (TS_RT_UNLIKELY(!ts_is_regexp(re))) require_regexp_fail(what); }
 tsv ts_regexp_adapter_object_test_tsv(tsv re, tsv input){
   require_regexp(re, "RegExp.prototype.test");
+  if (ts_is_str(input)){
+    capsbuf cb; caps_init_n(&cb, as_re(re)->ncaps);
+    int m = builtin_exec(re, input, cb.v);
+    caps_free(&cb);
+    return ts_bool(m);
+  }
   ts_gc_root(&re); ts_gc_root(&input);
   tsv s = to_str(input); ts_gc_root(&s);
-  capsbuf cb; caps_init(&cb, as_re(re)->prog);
+  capsbuf cb; caps_init_n(&cb, as_re(re)->ncaps);
   int m = builtin_exec(re, s, cb.v);
   caps_free(&cb);
   ts_gc_unroot(3);
@@ -374,7 +429,7 @@ tsv ts_regexp_adapter_object_exec_tsv(tsv re, tsv input){
   require_regexp(re, "RegExp.prototype.exec");
   ts_gc_root(&re); ts_gc_root(&input);
   tsv s = to_str(input); ts_gc_root(&s);
-  capsbuf cb; caps_init(&cb, as_re(re)->prog);
+  capsbuf cb; caps_init_n(&cb, as_re(re)->ncaps);
   int m = builtin_exec(re, s, cb.v);
   tsv r = m ? build_result(s, cb.v, as_re(re)->prog) : TS_NULL;
   caps_free(&cb);
@@ -453,26 +508,42 @@ static tsv match_all_next(tsv* args, int nargs){
   return r;
 }
 static tsv match_all_self(tsv* args, int nargs){ return nargs > 0 ? args[0] : TS_UNDEFINED; }
+/* %RegExpStringIteratorPrototype%: `next` and [Symbol.iterator] once, on a shared prototype;
+   an iterator is one layout allocation holding the clone, the input and the done flag */
+static tsv g_iter_proto = 0; static int g_iter_proto_rooted;
+static ts_key g_iter_keys[3];
+static ts_lit_layout g_iter_layout = { 0, 3, g_iter_keys, NULL };
+static void iter_proto_init(void){
+  if (g_iter_proto) return;
+  keys_init();
+  g_iter_keys[0] = k_iter_re; g_iter_keys[1] = k_iter_input; g_iter_keys[2] = k_iter_done;
+  tsv proto = ts_new_object(); ts_gc_root(&proto);
+  tsv next_fn = ts_make_fn_t(match_all_next, NULL, 0, 1); ts_gc_root(&next_fn);
+  ts_set_fn_meta(next_fn, 0, "next");
+  tsv self_fn = ts_make_fn_t(match_all_self, NULL, 0, 1); ts_gc_root(&self_fn);
+  ts_set_fn_meta(self_fn, 0, "[Symbol.iterator]");
+  ts_set(proto, k_next, next_fn);
+  ts_set(proto, TS_KEY_WKSYM(TS_WKSYM_ITERATOR), self_fn);
+  ts_gc_unroot(3);
+  g_iter_proto = proto;
+  ts_gc_root_static(&g_iter_proto, &g_iter_proto_rooted);
+}
 tsv ts_regexp_adapter_object_match_all_tsv(tsv input, tsv re){
   keys_init();
   require_regexp(re, "RegExp.prototype[Symbol.matchAll]");
   if (!(as_re(re)->flags & TSAOT_REGEXP_FLAG_GLOBAL)) ts_throw_type_error_msg("String.prototype.matchAll called with a non-global RegExp argument");
+  iter_proto_init();
   ts_gc_root(&re); ts_gc_root(&input);
   tsv s = to_str(input); ts_gc_root(&s);
   ts_regexp* r = as_re(re);
   tsv clone = regexp_make(r->prog, r->source, r->flags); ts_gc_root(&clone);
   last_index_set(clone, last_index_get(re));
-  tsv iter = ts_new_object(); ts_gc_root(&iter);
-  tsv next_fn = ts_make_fn_t(match_all_next, NULL, 0, 1); ts_gc_root(&next_fn);
-  ts_set_fn_meta(next_fn, 0, "next");
-  tsv self_fn = ts_make_fn_t(match_all_self, NULL, 0, 1); ts_gc_root(&self_fn);
-  ts_set_fn_meta(self_fn, 0, "[Symbol.iterator]");
-  ts_set(iter, k_iter_re, clone);
-  ts_set(iter, k_iter_input, s);
-  ts_set(iter, k_iter_done, ts_bool(0));
-  ts_set(iter, k_next, next_fn);
-  ts_set(iter, TS_KEY_WKSYM(TS_WKSYM_ITERATOR), self_fn);
-  ts_gc_unroot(7);
+  tsv iter = ts_new_object_layout(&g_iter_layout); ts_gc_root(&iter);
+  ((ts_object*)ts_ptr(iter))->proto = g_iter_proto;
+  ts_lit_store(iter, 0, clone);
+  ts_lit_store(iter, 1, s);
+  ts_lit_store(iter, 2, ts_bool(0));
+  ts_gc_unroot(5);
   return iter;
 }
 
@@ -483,8 +554,9 @@ static tsv expand_template(tsv out, tsv s, tsv rep, const int32_t* caps, rx_prog
   ts_gc_root(&s); ts_gc_root(&rep); ts_gc_root(&out);
   ts_strview rv = ts_str_view_typed(rep);
   uint32_t n = rv.len, i = 0, lit_start = 0;
-  #define FLUSH(to) do { if ((to) > lit_start){ tsv piece_ = substr(rep, lit_start, (to) - lit_start); ts_gc_root(&piece_); out = ts_sb_append(out, piece_); ts_gc_unroot(1); rv = ts_str_view_typed(rep); } } while (0)
-  #define APPEND(v) do { tsv piece_ = (v); ts_gc_root(&piece_); out = ts_sb_append(out, piece_); ts_gc_unroot(1); rv = ts_str_view_typed(rep); } while (0)
+  /* ts_sb_append roots its arguments; the replacement's view is re-read after each (it may move) */
+  #define FLUSH(to) do { if ((to) > lit_start){ out = ts_sb_append(out, substr(rep, lit_start, (to) - lit_start)); rv = ts_str_view_typed(rep); } } while (0)
+  #define APPEND(v) do { out = ts_sb_append(out, (v)); rv = ts_str_view_typed(rep); } while (0)
   while (i < n){
     uint16_t c = ts_str_cu_at_view(rv, i);
     if (c != '$' || i + 1 >= n){ i++; continue; }
@@ -543,7 +615,13 @@ static tsv call_replacer(tsv s, tsv fn, const int32_t* caps, rx_program* p){
   for (uint32_t g = 0; g <= ng; g++) args[g] = caps[2*g] >= 0 ? slice(s, caps[2*g], caps[2*g+1]) : TS_UNDEFINED;
   args[ng + 1] = ts_num(caps[0]);
   args[ng + 2] = s;
-  if (named) args[ng + 3] = build_groups(s, caps, p, 0);
+  if (named){
+    /* the groups object from the captures already sliced: a temporary array holds them */
+    tsv tmp = ts_new_array(0); ts_gc_root(&tmp);
+    for (uint32_t g = 0; g <= ng; g++) ts_array_push(tmp, args[g]);
+    args[ng + 3] = build_groups(tmp, caps, p);
+    ts_gc_unroot(1);
+  }
   tsv r = ts_call_value(fn, args, (int)nargs);
   ts_gc_root(&r);
   tsv rs = to_str(r);
@@ -571,9 +649,8 @@ tsv ts_regexp_adapter_object_replace_tsv(tsv input, tsv re, tsv replacement, int
     if (!any){ out = ts_sb_new(ts_new_string("", 0)); any = 1; }
     uint32_t ms = (uint32_t)cb.v[0], me = (uint32_t)cb.v[1];
     if (ms >= next_source){
-      if (ms > next_source){ tsv piece = substr(s, next_source, ms - next_source); ts_gc_root(&piece); out = ts_sb_append(out, piece); ts_gc_unroot(1); }
-      tsv r = fn_rep ? call_replacer(s, rep, cb.v, p) : TS_UNDEFINED;
-      if (fn_rep){ ts_gc_root(&r); out = ts_sb_append(out, r); ts_gc_unroot(1); }
+      if (ms > next_source) out = ts_sb_append(out, substr(s, next_source, ms - next_source));
+      if (fn_rep) out = ts_sb_append(out, call_replacer(s, rep, cb.v, p));
       else out = expand_template(out, s, rep, cb.v, p);
       next_source = me;
     }
@@ -583,7 +660,7 @@ tsv ts_regexp_adapter_object_replace_tsv(tsv input, tsv re, tsv replacement, int
   caps_free(&cb);
   if (!any){ ts_gc_unroot(6); return s; }
   uint32_t len = ts_str_len_typed(s);
-  if (next_source < len){ tsv piece = substr(s, next_source, len - next_source); ts_gc_root(&piece); out = ts_sb_append(out, piece); ts_gc_unroot(1); }
+  if (next_source < len) out = ts_sb_append(out, substr(s, next_source, len - next_source));
   tsv result = ts_sb_finish(out);
   ts_gc_unroot(6);
   return result;
@@ -603,7 +680,9 @@ tsv ts_regexp_adapter_object_split_tsv(tsv input, tsv re, tsv limit){
   ts_regexp* r = as_re(re);
   uint32_t flags = r->flags & ~(uint32_t)(TSAOT_REGEXP_FLAG_STICKY | TSAOT_REGEXP_FLAG_GLOBAL);
   int unicode = (flags & (TSAOT_REGEXP_FLAG_UNICODE | TSAOT_REGEXP_FLAG_UNICODE_SETS)) != 0;
-  rx_program* p = compile_pattern(r->source, flags);
+  /* the regexp's own program searches (the global flag does not reach the engine); a sticky one
+     needs the search form compiled */
+  rx_program* p = (r->flags & TSAOT_REGEXP_FLAG_STICKY) ? compile_pattern(r->source, flags) : r->prog;
   rx_retain(p);
   uint32_t ng = rx_group_count(p);
   capsbuf cb; caps_init(&cb, p);

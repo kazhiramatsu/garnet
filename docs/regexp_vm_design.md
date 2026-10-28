@@ -204,14 +204,45 @@ greedy loops and the prefilters running as C loops instead of per-character byte
 
 ### The native tier (R3)
 
-garnet compiles ahead of time, so a regexp literal can be compiled to C at build time: `rx_emit_c`
-turns a program into a C function (`static int rx_fn_<id>(const uint8_t* s, uint32_t len, uint32_t
-start, int32_t* caps, rx_scratch* st)`, one per input width) with the same backtrack-stack
-protocol, the ops inlined as straight-line C that clang optimizes across the pattern: V8's native
-Irregexp tier, without a JIT. The emitter (Rust) obtains the C text through a C library built
-from `runtime/regexp/rx_*.c` by `analyzer/build.rs` (the `cc` crate), so the parser, compiler and
-analysis exist once; dynamic patterns stay on the VM. The generated call sites bind the function
-into the site's program cell (`prog->native[wide]`), and `rx_exec` calls it when present.
+garnet compiles ahead of time, so a regexp literal can be compiled to C at build time: V8's
+native Irregexp tier, without a JIT. The design, so that the engine stays one implementation:
+
+- **What is generated.** `rx_emit_c(program, id)` (in `rx_emit.c`, over the bytecode and the
+  analysis) writes two C functions, `rx_native_<id>_8` and `rx_native_<id>_16` (Latin-1 and
+  UTF-16 input), each with the interpreter run's contract: `int fn(rx_ctx* c, uint32_t pos,
+  uint32_t base, uint32_t* out_pos)`, 1 on ACCEPT, 0 when the backtrack stack unwinds to `base`,
+  RX_EXEC_OVERFLOW past the limit. The search loop (`rx_exec`: the prefilters, sticky and
+  anchored starts, the unit-wise scan) stays in the engine and calls the native function instead
+  of `rx_run_*` when the program carries one (`prog->native[wide]`), so every search-side fact
+  lives in one place and a native function is small.
+- **Code shape.** A goto-based state machine: each text op becomes straight-line C (`if (pos >=
+  len || in[pos] != 'a') goto fail; pos++;`), a class a bitmap test against a `static const`
+  table emitted with the function (the ranges above 256 likewise), a simple loop a tight C loop
+  with the GREEDY/LAZY backtrack entry, a choice point a push of a *label id*; the `fail` block
+  pops entries and resumes through a `switch` over the label ids (the backtrack trampoline), the
+  GREEDY and LAZY entries resuming into per-loop cases that step back or forward. Registers
+  (captures, counters, empty checks) are a local `int32_t regs[n]` as in the interpreter; the
+  backtrack stack is the context's. Lookaround bodies are emitted as nested static functions
+  with the same contract and called as the LOOK op calls the sub-run (a positive lookahead
+  keeps only the RESTORE entries, a negative one unwinds them); backreferences and the case
+  tables go through helpers exported in `rx_native.h` (the context, the push and set helpers as
+  static inlines, the canonicalization tables).
+- **Where it runs.** The analyzer links the engine (`analyzer/build.rs` compiles
+  `runtime/regexp/rx_engine.c` with the `cc` crate) and calls `rx_emit_c` through FFI for each
+  regexp literal with a constant source and valid flags; the emitted C goes into the program's
+  unit beside the site, and the site binds it: `ts_regexp_new_literal_native(source, flags,
+  rx_native_<id>_8, rx_native_<id>_16)` sets the program's `native[]` when the program is first
+  compiled through the cache (the program of a literal is shared by every object the literal
+  creates, so one binding serves them all); the literal call sites (`regexp.quickTest` and the
+  others) take the same functions. A pattern that cannot be emitted (none is expected: the
+  emitter covers the whole opcode set, with the `v`-mode strings expanded as the interpreter
+  sees them) leaves the program on the interpreter. `TSAOT_REGEXP_NATIVE=0` (an exporter knob)
+  emits no native functions, for the A/B.
+- **Expected gain.** The dispatch and operand decoding vanish and clang optimizes across the
+  pattern: the per-character cost of the validate / search kernels (the interpreter is 40-50% of
+  their time) should fall by 2-3x, which is what separates them from Node; the tokenizer-style
+  sticky tests keep their per-call costs (the adapter's exec, the lastIndex slot), which R2
+  trimmed.
 
 ## Verification
 
@@ -299,6 +330,15 @@ Each slice: the fixtures above, the A/Bs, the gates, a `docs/TODO.md` entry; the
 - R1's numbers: `path_regexps` 162 ms against Node's 113 (the old engine 238), vue -1.5%, tsc-ts
   unchanged; the first-character prefilter admits a selective set or one without the lower-case
   letters (tsc's negated path class), as the old adapter's prefilter did.
+- **R2a built (Session 357).** The per-call costs: `lastIndex` through the cell's map slot
+  (`ts_regexp_last_index_slot`, answered by `ts_get_pic_other` / `ts_set_pic` at the generated
+  sites), a root-free exec for a string input with a numeric `lastIndex`, no `string.coerce`
+  before the regexp calls, tight Latin-1 scans for the simple loops, `match1` inline, CHARS runs,
+  SAVE_NR for the match bounds, the first-character byte table, one thread-local fetch per exec,
+  the results from a per-program layout with interned group keys (`rx_set_user`), each capture
+  sliced once, `split` on the regexp's own program, the matchAll iterator on a shared prototype.
+  Kernels (native / Node ms): tokenizer 160 / 121, validate 124 / 89, logs 138 / 118, search
+  148 / 114, path_regexps 134 / 115; vue -1.2%, tsc-ts unchanged.
 - Not yet (R3): the `v`-mode properties of strings (`\p{RGI_Emoji}` and the other six; the emoji
   sequence data is in `build/ucd/17.0.0/emoji-seq/`, emoji 16.0 at the time of writing), the
   native tier (`rx_emit_c`), the per-site program cells and the fixed result layouts (R2).
