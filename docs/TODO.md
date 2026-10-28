@@ -11325,3 +11325,36 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   51/51, bench 102/102 within budget. Session 356's dynamic-path slices together: vue 1,231 ->
   1,095.5 ms (36.02 -> 31.35 G instructions, -13%; Node 778: 1.63x -> 1.41x), rxjs 385 -> 367,
   yaml 3,590 -> 3,562, tsc-ts unchanged. GC stress for the runtime slices still to run.
+
+## Session 357 (2026-10-28): the GC stress gate, vue's fourth profile, the regexp VM rewrite begins
+
+- The GC stress gate deferred by Session 356's runtime slices (the trap cache and direct trap
+  calls, the leaf's absent answers, the frameless leaf, the Proxy frames, the trap index per
+  site) ran in a quiet window: GC-STRESS PASSED (the focused conformance under O2, ASan and
+  protect mode, the runtime unit tests under ASan and protect mode, the cell-header knobs).
+- vue's profile after the Session 356 slices (`profile7`, the annotated sampler and the PC
+  profile split by phase with `TSAOT_PROF_PC_RAW` + `scripts/prof_window.py`): the run 1,100 ms
+  against Node's 750 (1.47x), the reactivity phase 679 against 519 (1.31x), the compiler phase
+  421 against 231 (1.82x). Reactivity: `Dep.track` 9.3% self (the `activeSub.*` reads through
+  the interface-typed sized probes), the `get` trap body 8.3%, `ts_get_pic_checked` 6.1%,
+  `map_find` 5.9% (13 M lookups per run: `targetMap`, `depsMap`, `proxyMap`), `isRef` 3.6%,
+  `createReactiveObject` 3.6%, `prop_find` 3.4% + `lookup_prop_chain` 2.7% (`Reflect.get`'s
+  chain walk and `proxy_target_may_constrain`'s own-property probe on every trap: 26 M
+  `prop_find` calls per run). Compiler: strings 14% (`ts_add` 3.7%, `ts_str_concat_many` 2.6%,
+  the slice views and allocations), object literals 8% (`getLoc`'s `{start, end, source}` is
+  laid out with one key and adds `end` and `source` through the set cache: 483 k property adds
+  and 1.07 M small property vectors per run), regexps 3% plus 1.29 M `__tsaot_rx_prefix` property
+  reads by the adapter, `prop_find`/`intern` 3% (`Object.assign` of the parser options, the
+  `for..in` over them building a descriptor per key). None of these was taken in this session:
+  the regexp engine became the next work.
+- Kaz's direction (2026-10-28): 「正規表現はVM型にしてフルスクラッチで書き直してください。v8と同レベルまでの
+  速度を出したいです。ただし大きめの作業なので別スライスで。」 `docs/regexp_vm_design.md` is the design:
+  the QuickJS libregexp adapter is replaced by a from-scratch engine (`rx_parse.c`, `rx_compile.c`,
+  `rx_vm.c`, `rx_unicode.c` with tables generated from Unicode 17 under `runtime/regexp/`), a
+  bytecode VM with an explicit backtrack stack instantiated for Latin-1 and UTF-16 input, the
+  prefilters and greedy loops as C loops, a `TS_KIND_REGEXP` object with `lastIndex` in its
+  property map and the program in the struct, ES2025 semantics with Annex B against Node 25
+  (V8 14.1, Unicode 17), a generated differential corpus as the oracle, and a native tier that
+  compiles literal patterns to C at build time (R3). Slices: R1 the engine and the object model,
+  R2 speed against Node on pattern kernels and hono's RegExpRouter, R3 the native tier and the
+  long tail.
