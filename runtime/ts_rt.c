@@ -4028,7 +4028,18 @@ static struct { tsv s; uint32_t key1; } g_lit_key_cache[TS_LIT_KEY_CACHE];
    symbols stay symbol keys; everything else is ToString + string interning.
    Callers that need other live values preserved across ToString must root those
    values around this helper; the key itself and produced string are protected here. */
-static int ts_key_from_value(tsv keyv, ts_key* out){
+static int ts_key_from_value_slow(tsv keyv, ts_key* out);
+/* ToPropertyKey of a value: a canonical key string (TS_STR_FLAG_KEY: the string a key id
+   reconstructs to, which a Proxy trap receives and hands to Reflect.get, `in` and the invariant
+   checks) in line; a number, a symbol, a literal or a computed string out of line. */
+static inline int ts_key_from_value(tsv keyv, ts_key* out){
+  if (g_key_caches && ts_is_heap_str(keyv)){
+    uint32_t f = ts_str_flags_typed(keyv);
+    if ((f & (TS_STR_FLAG_STATIC | TS_STR_FLAG_KEY)) == (TS_STR_FLAG_STATIC | TS_STR_FLAG_KEY)){ *out = ts_str_ptr_typed(keyv)->offset; return 1; }
+  }
+  return ts_key_from_value_slow(keyv, out);
+}
+static int ts_key_from_value_slow(tsv keyv, ts_key* out){
   if (ts_is_symbol(keyv)){
     *out = ts_symbol_key(keyv);
     return 1;
@@ -17651,46 +17662,118 @@ static inline int prop_absent_site_hit(tsv obj, ts_key key, const ts_prop_ic* ic
 /* The out-of-line read: the site's absent record first, as a leaf (no frame,
    no saved registers), then the full lookup. */
 static int sized_inherited_cached(ts_object* o, ts_key key, tsv* out);
-tsv ts_get_pic_checked(tsv obj, ts_key key, ts_prop_ic* ic){
-  if (prop_absent_site_hit(obj, key, ic)){ RT_STAT_INC(absent_site_hits); return TS_UNDEFINED; }
-  /* a class instance's inherited property (a method read as a value, a prototype constant): the
-     (class word, key) entry the slow path filled answers before the own-property probes, which a
-     class with no struct field of the key cannot hit; an instance with own dynamic properties
-     first shows its map lacks the key */
-  if (TS_TOP16(obj) == TS_SEL_OBJECT){
-    ts_object* o = (ts_object*)ts_ptr(obj);
-    tsv v;
-    if (ts_obj_is_sized(o)){
-      if (sized_inherited_cached(o, key, &v) && (!((ts_sized_head*)o)->dyn || !pref_ok(prop_find(o, key)))) return v;
-      if (sized_absent_cached(o, key)){ RT_STAT_INC(absent_site_hits); return TS_UNDEFINED; }
-    }
+static inline int sized_absent_cached_core(const ts_object* o, ts_key key);
+/* A Proxy's [[Get]] of a named key (the receiver is the proxy): out of line so the leaf read
+   below tail-calls it without a frame of its own. */
+__attribute__((noinline)) static tsv ts_get_proxy_keyed(tsv pv, ts_key key){
+  return ts_proxy_get_v(pv, ts_key_to_value(key), pv);
+}
+/* A primitive receiver's read at a site with an absent record: the wrapper prototype's absent entry
+   (the prototype stands in as the receiver, as the slow read fills it), a string's own property
+   first; else the slow read. Out of line so the leaf stays frame-less. */
+__attribute__((noinline)) static tsv ts_get_pic_primitive(tsv obj, ts_key key, ts_prop_ic* ic){
+  tsv protov = 0, own;
+  if (ts_is_num(obj)) protov = g_number_proto_v;
+  else if (ts_is_str(obj)){ if (ts_string_own_prop(obj, key, &own)) return own; protov = g_string_proto_v; }
+  else if (ts_is_bool(obj)) protov = g_boolean_proto_v;
+  if (protov && ts_proto_ref(protov)){
+    ts_object* po = ts_proto_ptr(protov);
+    if (po->h.kind == TS_KIND_OBJECT && prop_absent_lookup(ic, po, key)){ RT_STAT_INC(pic_absent_hits); return TS_UNDEFINED; }
   }
-  /* a megamorphic site (many classes at one access): a sized receiver's
-     field straight from the registry's cache, past the slow path's probes
-     and the generic read's dispatch (docs/pic_sized_inline_design.md, "The
-     megamorphic site") */
-  if (ic && ic->megamorphic && TS_TOP16(obj) == TS_SEL_OBJECT && g_has_class_regs){
-    ts_object* o = (ts_object*)ts_ptr(obj);
+  return ts_get_pic_checked_slow(obj, key, ic);
+}
+/* The leaf read's out-of-line parts, each called in tail position, so the leaf itself keeps no
+   frame: with any plain call in it the compiler gave it a prologue and an epilogue that every
+   inline miss paid (13% of vue's samples were prologues, the leaf's the first among them). */
+/* a sized class instance: the inherited and absent caches, a megamorphic site's registry probe,
+   the site's sized entries, then the slow read */
+__attribute__((noinline)) static tsv ts_get_pic_sized(tsv obj, ts_key key, ts_prop_ic* ic){
+  ts_object* o = (ts_object*)ts_ptr(obj);
+  tsv v;
+  if (sized_inherited_cached(o, key, &v) && (!((ts_sized_head*)o)->dyn || !pref_ok(prop_find(o, key)))) return v;
+  if (sized_absent_cached(o, key)){ RT_STAT_INC(absent_site_hits); return TS_UNDEFINED; }
+  /* a megamorphic site (many classes at one access): the field straight from the registry's
+     cache, past the slow path's probes (docs/pic_sized_inline_design.md, "The megamorphic site") */
+  if (ic && ic->megamorphic && g_has_class_regs){
     size_t off; int numeric;
     const ts_class_word_cache_entry* fe = ts_class_word_cache_entry_for(o, key);
     if (fe){ if (fe->found) return struct_field_get(o, fe->offset, fe->numeric); }
-    else if (ts_obj_is_sized(o) && class_field_lookup(o, key, &off, &numeric)) return struct_field_get(o, off, numeric);
+    else if (class_field_lookup(o, key, &off, &numeric)) return struct_field_get(o, off, numeric);
   }
-  /* a sized class instance's field the site has cached by class word
-     (docs/pic_sized_inline_design.md): the slot read by its kind. The site's
-     flag first: a plain-object site answers in one load and one branch. */
-  if (ic && (ic->absent_depth & TS_PIC_SIZED_FLAG) && !ic->megamorphic && TS_TOP16(obj) == TS_SEL_OBJECT){
-    const ts_object* o = (const ts_object*)ts_ptr(obj);
+  /* the field the site has cached by class word: the slot read by its kind */
+  if (ic && (ic->absent_depth & TS_PIC_SIZED_FLAG) && !ic->megamorphic){
     const ts_prop_ic_entry* e = ts_prop_ic_probe_sized_inline(o, key, ic);
     if (e){
       const char* at = (const char*)o + (e->slot & TS_PIC_SLOT_MASK);
       uint32_t kind = e->slot >> TS_PIC_FLAGS_SHIFT;
       TS_RT_STAT_PIC_GET_CALL(); TS_RT_STAT_PIC_GET_HIT();
-      if (kind == 0){ tsv v; memcpy(&v, at, sizeof v); return v; }
+      if (kind == 0){ memcpy(&v, at, sizeof v); return v; }
       if (kind == 1){ double d; memcpy(&d, at, sizeof d); return ts_num(d); }
       long long n; memcpy(&n, at, sizeof n); return ts_num((double)n);
     }
   }
+  return ts_get_pic_checked_slow(obj, key, ic);
+}
+/* an array (a named absent read at a site with an absent record: the absent table's entry, the
+   arrays `reactive()` wraps read `__v_raw`), a function or another kind: the slow read */
+__attribute__((noinline)) static tsv ts_get_pic_other(tsv obj, ts_key key, ts_prop_ic* ic){
+  ts_object* o = (ts_object*)ts_ptr(obj);
+  if (o->h.kind == TS_KIND_ARRAY && ic && (ic->rec_epoch & TS_ABSENT_EPOCH_TAG) && g_negative_pic &&
+      prop_cache_receiver(o, key) && prop_absent_lookup(ic, o, key)){
+    RT_STAT_INC(pic_absent_hits); return TS_UNDEFINED;
+  }
+  return ts_get_pic_checked_slow(obj, key, ic);
+}
+/* a sized instance's field read by its kind, in line (struct_field_get is a call) */
+static inline tsv sized_field_read(const ts_object* o, uint32_t off, uint32_t kind){
+  const char* at = (const char*)o + off;
+  if (kind == 0){ tsv v; memcpy(&v, at, sizeof v); return v; }
+  if (kind == 1){ double d; memcpy(&d, at, sizeof d); return ts_num(d); }
+  long long n; memcpy(&n, at, sizeof n); return ts_num((double)n);
+}
+tsv ts_get_pic_checked(tsv obj, ts_key key, ts_prop_ic* ic){
+  if (prop_absent_site_hit(obj, key, ic)){ RT_STAT_INC(absent_site_hits); return TS_UNDEFINED; }
+  if (TS_TOP16(obj) == TS_SEL_OBJECT){
+    ts_object* o = (ts_object*)ts_ptr(obj);
+    if (o->h.kind == TS_KIND_OBJECT){
+      if (ts_obj_is_sized(o)){
+        /* a class instance's call-free answers (rxjs's `destination.next`, an inherited read on
+           every subscriber): the inherited and absent caches of an instance without own dynamic
+           properties, a megamorphic site's registry entry, the site's sized entries; the rest
+           (an instance with dynamic properties, the registry's miss, the slow read) out of line */
+        tsv v;
+        if (!((ts_sized_head*)o)->dyn){
+          if (sized_inherited_cached(o, key, &v)) return v;
+          if (sized_absent_cached_core(o, key)){ RT_STAT_INC(absent_site_hits); return TS_UNDEFINED; }
+        }
+        if (ic && ic->megamorphic){
+          const ts_class_word_cache_entry* fe = g_has_class_regs ? ts_class_word_cache_entry_for(o, key) : NULL;
+          if (fe && fe->found) return sized_field_read(o, fe->offset, fe->numeric);
+        } else if (ic && (ic->absent_depth & TS_PIC_SIZED_FLAG)){
+          const ts_prop_ic_entry* e = ts_prop_ic_probe_sized_inline(o, key, ic);
+          if (e){ TS_RT_STAT_PIC_GET_CALL(); TS_RT_STAT_PIC_GET_HIT(); return sized_field_read(o, e->slot & TS_PIC_SLOT_MASK, e->slot >> TS_PIC_FLAGS_SHIFT); }
+        }
+        return ts_get_pic_sized(obj, key, ic);
+      }
+      /* a plain object at a site that has recorded an absent read (its record's tag; such a
+         site's entries never fill, so it never counts as megamorphic) and has another shape
+         (vue's `isRef(v)` and `isReadonly(v)` read `v.__v_isRef` and `v.__v_raw` on every shape
+         the traps return): the global absent table's entry, as the slow path answered after its
+         probes and its own frame */
+      if (ic && (ic->rec_epoch & TS_ABSENT_EPOCH_TAG) && g_negative_pic && prop_absent_lookup(ic, o, key)){
+        RT_STAT_INC(pic_absent_hits); return TS_UNDEFINED;
+      }
+      return ts_get_pic_checked_slow(obj, key, ic);
+    }
+    /* a Proxy receiver (vue's reactive objects, at every site that reads them): its [[Get]] at
+       once; none of the probes, nor the slow path's, can serve it */
+    if (g_has_proxies && o->h.kind == TS_KIND_PROXY) return ts_get_proxy_keyed(obj, key);
+    return ts_get_pic_other(obj, key, ic);
+  }
+  /* a primitive at such a site (`isRef(5)`, `isRef("s")`): its wrapper prototype's entry, out of
+     line (the string's own properties come first there); null and undefined throw in the slow read */
+  if (ic && (ic->rec_epoch & TS_ABSENT_EPOCH_TAG) && g_negative_pic && key < TS_USERSYM_KEY_BASE && !ts_is_null(obj) && !ts_is_undef(obj))
+    return ts_get_pic_primitive(obj, key, ic);
   return ts_get_pic_checked_slow(obj, key, ic);
 }
 __attribute__((noinline)) static tsv ts_get_pic_checked_slow(tsv obj, ts_key key, ts_prop_ic* ic){
@@ -17817,7 +17900,9 @@ static ts_sized_absent_entry g_sized_absent[TS_SIZED_ABSENT_SIZE];
 static inline ts_sized_absent_entry* sized_absent_slot(uint32_t w, ts_key key){
   return &g_sized_absent[((w * 0x9E3779B1u) ^ (key * 0x85EBCA6Bu)) >> 22];
 }
-static int sized_absent_cached(ts_object* o, ts_key key){
+/* the entry's check without the own-dynamic-property test (call-free: the leaf read keeps it in
+   line for an instance without dynamic properties) */
+static inline int sized_absent_cached_core(const ts_object* o, ts_key key){
   uint32_t w = o->cls;
   if (w == 0u || (w & TS_CLS_RELINKED) || w == TS_CLS_PROTO || g_class_relinked) return 0;
   const ts_sized_absent_entry* e = sized_absent_slot(w, key);
@@ -17830,6 +17915,10 @@ static int sized_absent_cached(ts_object* o, ts_key key){
     if (p->h.kind != TS_KIND_OBJECT || p->shape != e->proto_shape[i]) return 0;
   }
   if (ts_proto_ref(p->proto)) return 0;
+  return 1;
+}
+static int sized_absent_cached(ts_object* o, ts_key key){
+  if (!sized_absent_cached_core(o, key)) return 0;
   if (((const ts_sized_head*)o)->dyn && pref_ok(prop_find(o, key))) return 0;
   return 1;
 }
@@ -18100,6 +18189,10 @@ void ts_array_set_key_f64(tsv arr, double d, tsv v){
 }
 void ts_set_pic(tsv obj, ts_key key, tsv val, ts_prop_ic* ic){
   TS_RT_STAT_PIC_SET_CALL();
+  /* a Proxy receiver: its [[Set]] at once (as ts_set performs it) */
+  if (g_has_proxies && TS_TOP16(obj) == TS_SEL_OBJECT && ((ts_gc_header*)ts_ptr(obj))->kind == TS_KIND_PROXY){
+    ts_proxy_set_v(obj, ts_key_to_value(key), val, obj); return;
+  }
   /* a megamorphic site: a sized receiver's slot through the registry's cache
      (the frozen bit refused as the struct path refuses it) */
   if (ic && ic->megamorphic && TS_TOP16(obj) == TS_SEL_OBJECT && g_has_class_regs){
@@ -18527,21 +18620,101 @@ static tsv ts_key_to_value(ts_key k){
 /* Look up a trap on the handler. Throws if the proxy is revoked or the trap is
    present-but-not-callable; returns TS_UNDEFINED when the trap is absent (the
    caller then performs the default operation on the target). */
-static ts_key proxy_trap_key(const char* name){
-  /* the callers pass string literals: their addresses identify the dozen trap names */
-  static const char* names[16]; static ts_key keys[16]; static int n;
-  for (int i = 0; i < n; i++) if (names[i] == name) return keys[i];
+/* The trap names: the callers pass string literals, whose addresses identify the dozen names;
+   each has a key and a cache entry (below). */
+#define TS_PROXY_TRAPS 16
+static const char* g_trap_names[TS_PROXY_TRAPS]; static ts_key g_trap_keys[TS_PROXY_TRAPS]; static int g_trap_count;
+static int proxy_trap_index(const char* name){
+  for (int i = 0; i < g_trap_count; i++) if (g_trap_names[i] == name) return i;
   ts_key k = ts_intern_field(name, (uint32_t)strlen(name));
-  if (n < 16){ names[n] = name; keys[n] = k; n++; }
-  return k;
+  if (g_trap_count < TS_PROXY_TRAPS){ g_trap_names[g_trap_count] = name; g_trap_keys[g_trap_count] = k; return g_trap_count++; }
+  return -1;
 }
-static tsv ts_proxy_trap(tsv pv, tsv handler, const char* name){
+/* A trap's cache entry (one per trap name): the handler cell it was read from and where the trap
+   sits, so a proxied operation does not resolve its trap through the generic read's registry miss
+   and inherited-property cache each time (vue's handlers are class instances whose traps are
+   prototype methods; its reactive objects take every read and write through them). A sized
+   handler's entry keeps its class word, the holder prototype and the holder's shape word and slot;
+   a plain shaped handler's entry its shape word and the own slot (holder 0). A hit checks the
+   handler cell's identity, the class or shape word (a relinked instance or a dictionary handler
+   never matches), the handler's dyn flag (an own property added after the fill shadows the
+   prototype's trap) and the holder's shape (an addition, deletion or redefinition on the holder
+   changes it; a replaced value in the same slot is read as it is now). The handler's identity is
+   the cell's bits: a dead handler whose cell another object of the same class took reads the
+   trap that class's chain holds, which is that object's trap too. The holder is an
+   old-generation class prototype (the fill takes no other), so it never moves. */
+typedef struct { tsv handler; tsv holder; uint32_t word; uint32_t holder_shape; uint32_t slot; } ts_trap_cache_entry;
+static ts_trap_cache_entry g_trap_cache[TS_PROXY_TRAPS];
+static ts_key proxy_trap_key(const char* name){
+  int i = proxy_trap_index(name);
+  return i >= 0 ? g_trap_keys[i] : ts_intern_field(name, (uint32_t)strlen(name));
+}
+static tsv proxy_trap_cached(tsv handler, int ti){
+  if (ti < 0 || g_class_relinked) return TS_UNDEFINED;
+  const ts_trap_cache_entry* e = &g_trap_cache[ti];
+  if (e->handler != handler) return TS_UNDEFINED;
+  ts_object* h = (ts_object*)ts_ptr(handler);
+  tsv trap;
+  if (e->holder){
+    if (h->h.kind != TS_KIND_OBJECT || !ts_obj_is_sized(h) || h->cls != e->word || ((ts_sized_head*)h)->dyn) return TS_UNDEFINED;
+    ts_object* ho = (ts_object*)ts_ptr(e->holder);
+    if (ho->shape != e->holder_shape) return TS_UNDEFINED;
+    trap = *ts_obj_slot_ptr(ho, e->slot);
+  } else {
+    if (h->h.kind != TS_KIND_OBJECT || ts_obj_is_sized(h) || h->shape != e->word) return TS_UNDEFINED;
+    trap = *ts_obj_slot_ptr(h, e->slot);
+  }
+  return (ts_is_func(trap) && !is_accessor(trap)) ? trap : TS_UNDEFINED;
+}
+static void proxy_trap_fill(tsv handler, int ti, ts_key key){
+  if (ti < 0 || g_class_relinked || TS_TOP16(handler) != TS_SEL_OBJECT) return;
+  ts_object* h = (ts_object*)ts_ptr(handler);
+  if (h->h.kind != TS_KIND_OBJECT) return;
+  ts_trap_cache_entry* e = &g_trap_cache[ti];
+  if (ts_obj_is_sized(h)){
+    uint32_t w = h->cls;
+    if (w == 0u || (w & TS_CLS_RELINKED) || w == TS_CLS_PROTO || ((ts_sized_head*)h)->dyn) return;
+    for (ts_object* p = ts_next_proto(h); p; p = ts_next_proto(p)){
+      if (chain_link_exotic(p) || p->h.kind != TS_KIND_OBJECT) return;
+      ts_pref q = prop_find(p, key);
+      if (pref_ok(q)){
+        if (pref_is_accessor(q) || ts_obj_shape_id(p) == TS_SHAPE_NONE || p->h.gen != TS_GEN_OLD) return;
+        e->handler = handler; e->holder = ts_obj(p); e->word = w; e->holder_shape = p->shape; e->slot = q.i;
+        return;
+      }
+    }
+    return;
+  }
+  if (!obj_shaped(h)) return;
+  ts_pref q = prop_find(h, key);
+  if (!pref_ok(q) || pref_is_accessor(q)) return;
+  e->handler = handler; e->holder = 0; e->word = h->shape; e->holder_shape = 0; e->slot = q.i;
+}
+/* The trap lookup: `ts_proxy_trap(pv, handler, "get")` at a call site resolves the name's index once
+   (a static per site; the names are literals), so the lookup is the cache probe alone. */
+#define ts_proxy_trap(pv, handler, name) ({ static int _ti = -1; if (TS_RT_UNLIKELY(_ti < 0)) _ti = proxy_trap_index(name); ts_proxy_trap_at((pv), (handler), _ti, (name)); })
+static tsv ts_proxy_trap_at(tsv pv, tsv handler, int ti, const char* name){
   ts_proxy* px = ts_ptr(pv);
   if (px->revoked) ts_throw_type_error("Cannot perform operation on a proxy that has been revoked");
-  tsv trap = ts_get(handler, proxy_trap_key(name));
+  tsv trap = proxy_trap_cached(handler, ti);
+  if (!ts_is_undef(trap)) return trap;
+  trap = ts_get(handler, ti >= 0 ? g_trap_keys[ti] : proxy_trap_key(name));
   if (ts_is_undef(trap) || ts_is_null(trap)) return TS_UNDEFINED;
   if (!ts_is_callable(trap)) ts_throw_type_error("proxy handler trap is not a function");
+  if (ts_is_func(trap)) proxy_trap_fill(handler, ti, g_trap_keys[ti]);
   return trap;
+}
+/* A trap call. The operation's locals (the proxy, its target and handler, the key, the value, the
+   receiver) are rooted by the caller, so the receiver slot is prepended without rooting each copy
+   again (invoke_with_this does, for callers that hold unrooted values). */
+static tsv proxy_call_trap(tsv trap, tsv handler, tsv* argv, int n){
+  if (TS_RT_UNLIKELY(!ts_is_func(trap))) return invoke_with_this(trap, handler, argv, n);
+  ts_func* f = ts_ptr(trap);
+  if (!g_typed_slow) typed_slow_check_borrow(trap, handler);
+  if (!f->takes_this) return ts_call(trap, argv, n);
+  tsv a[5]; a[0] = handler;
+  for (int i = 0; i < n; i++) a[1 + i] = argv[i];
+  return ts_call(trap, a, n + 1);
 }
 /* descriptor field helpers (descriptor is a fresh data/accessor object) */
 static int pd_has(tsv d, const char* nm){ return ts_is_obj(d) && ts_has_prop(d, ts_intern_field(nm,(uint32_t)strlen(nm))); }
@@ -18628,24 +18801,32 @@ static void proxy_inv_get(tsv target, tsv keyv, tsv result){
 static tsv proxy_key_canonical(tsv keyv){
   return ts_is_num(keyv) ? ts_to_string_v(keyv) : keyv;
 }
-static tsv ts_proxy_get_v(tsv pv, tsv keyv, tsv receiver){
-  keyv = proxy_key_canonical(keyv);
-  ts_gc_root(&pv); ts_gc_root(&keyv); ts_gc_root(&receiver);
+/* The proxy operations root their values in one shadow frame (ts_frame_push, as a generated
+   function roots its locals) instead of a root push per value: a proxied read paid seven pushes
+   and a pop. The frame's slots are read back after every call (a young cell may move). */
+enum { PX_PV = 0, PX_KEY = 1, PX_RECV = 2, PX_TARGET = 3, PX_HANDLER = 4, PX_TRAP = 5, PX_VALUE = 6, PX_RESULT = 7 };
+typedef struct { ts_frame_hdr h; tsv s[8]; } ts_proxy_frame;
+static inline void proxy_frame_open(ts_proxy_frame* F, tsv pv, tsv keyv, tsv receiver, tsv value){
   ts_proxy* px = ts_ptr(pv);
-  tsv target = px->target, handler = px->handler;
-  ts_gc_root(&target); ts_gc_root(&handler);
-  tsv trap = ts_proxy_trap(pv, handler, "get");
+  F->s[PX_PV] = pv; F->s[PX_KEY] = keyv; F->s[PX_RECV] = receiver; F->s[PX_TARGET] = px->target;
+  F->s[PX_HANDLER] = px->handler; F->s[PX_TRAP] = TS_UNDEFINED; F->s[PX_VALUE] = value; F->s[PX_RESULT] = TS_UNDEFINED;
+  ts_frame_push(&F->h, 8);
+}
+static tsv ts_proxy_get_v(tsv pv, tsv keyv, tsv receiver){
+  ts_proxy_frame F;
+  proxy_frame_open(&F, pv, proxy_key_canonical(keyv), receiver, TS_UNDEFINED);
+  tsv trap = ts_proxy_trap(F.s[PX_PV], F.s[PX_HANDLER], "get");
   if (ts_is_undef(trap)){
     /* the target's [[Get]] with the receiver (a getter there sees it) */
-    tsv r = (receiver == pv) ? ts_get_dyn(target, keyv) : ts_reflect_get_recv(target, keyv, receiver);
-    ts_gc_unroot(5); return r;
+    tsv r = (F.s[PX_RECV] == F.s[PX_PV]) ? ts_get_dyn(F.s[PX_TARGET], F.s[PX_KEY]) : ts_reflect_get_recv(F.s[PX_TARGET], F.s[PX_KEY], F.s[PX_RECV]);
+    ts_frame_pop(&F.h); return r;
   }
-  ts_gc_root(&trap);
-  tsv argv[3] = { target, keyv, receiver };
-  tsv result = invoke_with_this(trap, handler, argv, 3);
-  ts_gc_root(&result);
-  proxy_inv_get(target, keyv, result);
-  ts_gc_unroot(7);
+  F.s[PX_TRAP] = trap;
+  tsv argv[3] = { F.s[PX_TARGET], F.s[PX_KEY], F.s[PX_RECV] };
+  F.s[PX_RESULT] = proxy_call_trap(F.s[PX_TRAP], F.s[PX_HANDLER], argv, 3);
+  proxy_inv_get(F.s[PX_TARGET], F.s[PX_KEY], F.s[PX_RESULT]);
+  tsv result = F.s[PX_RESULT];
+  ts_frame_pop(&F.h);
   return result;
 }
 /* === SET === */
@@ -18665,26 +18846,23 @@ static void proxy_inv_set(tsv target, tsv keyv, tsv value){
   ts_gc_unroot(1);
 }
 static int ts_proxy_set_v(tsv pv, tsv keyv, tsv value, tsv receiver){
-  keyv = proxy_key_canonical(keyv);
-  ts_gc_root(&pv); ts_gc_root(&keyv); ts_gc_root(&value); ts_gc_root(&receiver);
-  ts_proxy* px = ts_ptr(pv);
-  tsv target = px->target, handler = px->handler;
-  ts_gc_root(&target); ts_gc_root(&handler);
-  tsv trap = ts_proxy_trap(pv, handler, "set");
+  ts_proxy_frame F;
+  proxy_frame_open(&F, pv, proxy_key_canonical(keyv), receiver, value);
+  tsv trap = ts_proxy_trap(F.s[PX_PV], F.s[PX_HANDLER], "set");
   if (ts_is_undef(trap)){
     /* the target's [[Set]] with the receiver: a write through the proxy
        itself lands on the target, a foreign receiver takes its own property */
     int ok = 1;
-    if (receiver == pv) ts_set_dyn(target, keyv, value);
-    else ok = ts_truthy(ts_reflect_set_recv(target, keyv, value, receiver));
-    ts_gc_unroot(6); return ok;
+    if (F.s[PX_RECV] == F.s[PX_PV]) ts_set_dyn(F.s[PX_TARGET], F.s[PX_KEY], F.s[PX_VALUE]);
+    else ok = ts_truthy(ts_reflect_set_recv(F.s[PX_TARGET], F.s[PX_KEY], F.s[PX_VALUE], F.s[PX_RECV]));
+    ts_frame_pop(&F.h); return ok;
   }
-  ts_gc_root(&trap);
-  tsv argv[4] = { target, keyv, value, receiver };
-  tsv res = invoke_with_this(trap, handler, argv, 4);
+  F.s[PX_TRAP] = trap;
+  tsv argv[4] = { F.s[PX_TARGET], F.s[PX_KEY], F.s[PX_VALUE], F.s[PX_RECV] };
+  tsv res = proxy_call_trap(F.s[PX_TRAP], F.s[PX_HANDLER], argv, 4);
   int ok = ts_truthy(res);
-  if (ok) proxy_inv_set(target, keyv, value);
-  ts_gc_unroot(7);
+  if (ok) proxy_inv_set(F.s[PX_TARGET], F.s[PX_KEY], F.s[PX_VALUE]);
+  ts_frame_pop(&F.h);
   return ok;
 }
 /* === HAS === */
@@ -18701,18 +18879,15 @@ static void proxy_inv_has(tsv target, tsv keyv, int trapResult){
   ts_gc_unroot(1);
 }
 static int ts_proxy_has_v(tsv pv, tsv keyv){
-  keyv = proxy_key_canonical(keyv);
-  ts_gc_root(&pv); ts_gc_root(&keyv);
-  ts_proxy* px = ts_ptr(pv);
-  tsv target = px->target, handler = px->handler;
-  ts_gc_root(&target); ts_gc_root(&handler);
-  tsv trap = ts_proxy_trap(pv, handler, "has");
-  if (ts_is_undef(trap)){ int r = ts_has_prop_dyn(target, keyv); ts_gc_unroot(4); return r; }
-  ts_gc_root(&trap);
-  tsv argv[2] = { target, keyv };
-  int r = ts_truthy(invoke_with_this(trap, handler, argv, 2));
-  proxy_inv_has(target, keyv, r);
-  ts_gc_unroot(5);
+  ts_proxy_frame F;
+  proxy_frame_open(&F, pv, proxy_key_canonical(keyv), TS_UNDEFINED, TS_UNDEFINED);
+  tsv trap = ts_proxy_trap(F.s[PX_PV], F.s[PX_HANDLER], "has");
+  if (ts_is_undef(trap)){ int r = ts_has_prop_dyn(F.s[PX_TARGET], F.s[PX_KEY]); ts_frame_pop(&F.h); return r; }
+  F.s[PX_TRAP] = trap;
+  tsv argv[2] = { F.s[PX_TARGET], F.s[PX_KEY] };
+  int r = ts_truthy(proxy_call_trap(F.s[PX_TRAP], F.s[PX_HANDLER], argv, 2));
+  proxy_inv_has(F.s[PX_TARGET], F.s[PX_KEY], r);
+  ts_frame_pop(&F.h);
   return r;
 }
 /* === DELETE === */
@@ -18788,7 +18963,7 @@ static int chain_exotic_get(ts_object* p, ts_key key, tsv receiver, tsv* out, ts
   tsv keyv = ts_key_to_value(key); ts_gc_root(&keyv);
   tsv target = ((ts_proxy*)ts_ptr(pv))->target; ts_gc_root(&target);
   tsv argv[3] = { target, keyv, receiver };
-  tsv result = invoke_with_this(trap, handler, argv, 3);
+  tsv result = proxy_call_trap(trap, handler, argv, 3);
   ts_gc_root(&result);
   proxy_inv_get(target, keyv, result);
   *out = result;
