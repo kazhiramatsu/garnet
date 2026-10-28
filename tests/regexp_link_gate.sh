@@ -54,12 +54,12 @@ int main(void) {
   ts_regexp_adapter_init();
   tsv emoji_pat = ts_new_string("\360\237\230\200+", 5); ts_gc_root(&emoji_pat);
   tsv emoji_input = ts_new_string("x\360\237\230\200\360\237\230\200y", 10); ts_gc_root(&emoji_input);
-  if (!ts_truthy(ts_regexp_adapter_test_tsv(emoji_pat, 0, emoji_input))) return 11;
+  if (!ts_truthy(ts_regexp_adapter_test_tsv(emoji_pat, 0, emoji_input, NULL, NULL))) return 11;
   tsv dot_pat = ts_new_string("^.$", 3); ts_gc_root(&dot_pat);
   tsv emoji_single = ts_new_string("\360\237\230\200", 4); ts_gc_root(&emoji_single);
-  if (ts_truthy(ts_regexp_adapter_test_tsv(dot_pat, 0, emoji_single))) return 12;
-  if (!ts_truthy(ts_regexp_adapter_test_tsv(dot_pat, TSAOT_REGEXP_FLAG_UNICODE, emoji_single))) return 13;
-  tsv obj = ts_regexp_new_literal(ts_new_string("(\\d+)-(\\d+)", 11), TSAOT_REGEXP_FLAG_GLOBAL); ts_gc_root(&obj);
+  if (ts_truthy(ts_regexp_adapter_test_tsv(dot_pat, 0, emoji_single, NULL, NULL))) return 12;
+  if (!ts_truthy(ts_regexp_adapter_test_tsv(dot_pat, TSAOT_REGEXP_FLAG_UNICODE, emoji_single, NULL, NULL))) return 13;
+  tsv obj = ts_regexp_new_literal(ts_new_string("(\\d+)-(\\d+)", 11), TSAOT_REGEXP_FLAG_GLOBAL, NULL, NULL); ts_gc_root(&obj);
   if (!ts_is_regexp(obj)) return 14;
   tsv s = ts_new_string("a 12-34 b 5-6", 13); ts_gc_root(&s);
   tsv m = ts_regexp_adapter_object_exec_tsv(obj, s);

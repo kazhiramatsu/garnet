@@ -4,14 +4,14 @@
 #if RX_WIDE
 #define RUN_NAME rx_run_16
 #define MATCH1 match1_16
-#define UNSTEP unstep_16
-#define BACKREF_CMP backref_cmp_16
+#define UNSTEP rx_unstep_16
+#define BACKREF_CMP rx_backref_cmp_16
 #define CU(i) ((uint32_t)c->in16[i])
 #else
 #define RUN_NAME rx_run_8
 #define MATCH1 match1_8
-#define UNSTEP unstep_8
-#define BACKREF_CMP backref_cmp_8
+#define UNSTEP rx_unstep_8
+#define BACKREF_CMP rx_backref_cmp_8
 #define CU(i) ((uint32_t)c->in8[i])
 #endif
 
@@ -37,8 +37,8 @@
 #define CANON(w, ch) (((w) & RX_OP_CP) ? rx_fold_u_fast(ch) : rx_canon_nonu_fast(ch))
 
 #define PUSH(a, b, cc, d) do { \
-  if (c->bt_sp + BT_WORDS > c->bt_cap && !bt_grow(c)) return RX_EXEC_OVERFLOW; \
-  uint32_t* e_ = c->bt + c->bt_sp; e_[0] = (a); e_[1] = (b); e_[2] = (cc); e_[3] = (d); c->bt_sp += BT_WORDS; } while (0)
+  if (c->bt_sp + RX_BT_WORDS > c->bt_cap && !rx_bt_grow(c)) return RX_EXEC_OVERFLOW; \
+  uint32_t* e_ = c->bt + c->bt_sp; e_[0] = (a); e_[1] = (b); e_[2] = (cc); e_[3] = (d); c->bt_sp += RX_BT_WORDS; } while (0)
 
 /* one character of a simple loop: returns 1 and advances pos on a match */
 static inline __attribute__((always_inline)) int MATCH1(const rx_ctx* c, uint32_t w, uint32_t a0, uint32_t a1, uint32_t* ppos){
@@ -63,7 +63,7 @@ static inline __attribute__((always_inline)) int MATCH1(const rx_ctx* c, uint32_
     case RX_OP_CHAR: ok = ch == a0; break;
     case RX_OP_CHAR_I: ok = CANON(w, ch) == a0; break;
     case RX_OP_CHAR2: ok = ch == a0 || ch == a1; break;
-    case RX_OP_ANY: ok = !is_lt(ch); break;
+    case RX_OP_ANY: ok = !rx_is_lt(ch); break;
     case RX_OP_ANY_ALL: ok = 1; break;
     case RX_OP_CLASS: ok = set_has(&c->p->sets[a0], ch); break;
     case RX_OP_NCLASS: ok = !set_has(&c->p->sets[a0], ch); break;
@@ -75,7 +75,7 @@ static inline __attribute__((always_inline)) int MATCH1(const rx_ctx* c, uint32_
   return ok;
 }
 /* step back over one character matched by a simple loop (the loop's direction) */
-static inline uint32_t UNSTEP(const rx_ctx* c, uint32_t w, uint32_t pos){
+uint32_t UNSTEP(const rx_ctx* c, uint32_t w, uint32_t pos){
   if (w & RX_OP_BW){
     /* the loop moved left; stepping back moves right */
     uint32_t ch = CU(pos);
@@ -88,7 +88,7 @@ static inline uint32_t UNSTEP(const rx_ctx* c, uint32_t w, uint32_t pos){
 }
 /* compare the captured text [s, e) against the input at pos, forward (ending at pos when
    backward); returns the new position or UINT32_MAX */
-static uint32_t BACKREF_CMP(const rx_ctx* c, uint32_t w, uint32_t s, uint32_t e, uint32_t pos){
+uint32_t BACKREF_CMP(const rx_ctx* c, uint32_t w, uint32_t s, uint32_t e, uint32_t pos){
   uint32_t n = e - s, len = c->len;
   uint32_t q;
   if (w & RX_OP_BW){ if (pos < n) return UINT32_MAX; q = pos - n; }
@@ -145,25 +145,25 @@ static int RUN_NAME(rx_ctx* c, uint32_t pc, uint32_t pos, uint32_t base, uint32_
   fail:
     for (;;){
       if (c->bt_sp == base) return 0;
-      uint32_t* e = c->bt + (c->bt_sp - BT_WORDS);
-      c->bt_sp -= BT_WORDS;
+      uint32_t* e = c->bt + (c->bt_sp - RX_BT_WORDS);
+      c->bt_sp -= RX_BT_WORDS;
       switch (e[0]){
-        case BT_RESTORE: regs[e[1]] = (int32_t)e[2]; continue;
-        case BT_RESUME: pc = e[1]; pos = e[2]; DISPATCH();
-        case BT_GREEDY: {
+        case RX_BT_RESTORE: regs[e[1]] = (int32_t)e[2]; continue;
+        case RX_BT_RESUME: pc = e[1]; pos = e[2]; DISPATCH();
+        case RX_BT_GREEDY: {
           if (e[3] == e[2]) continue;              /* back at the minimum: no shorter match */
           uint32_t lpc = e[1]; uint32_t lw = code[lpc + 1];
           uint32_t npos = UNSTEP(c, lw, e[3]);
-          e[3] = npos; c->bt_sp += BT_WORDS;
+          e[3] = npos; c->bt_sp += RX_BT_WORDS;
           pc = lpc + 6; pos = npos;
           DISPATCH();
         }
-        case BT_LAZY: {
+        case RX_BT_LAZY: {
           uint32_t lpc = e[1]; uint32_t lw = code[lpc + 1], la0 = code[lpc + 2], la1 = code[lpc + 3], lmax = code[lpc + 5];
           uint32_t npos = e[2]; uint32_t count = e[3];
           if (count >= lmax) continue;
           if (!MATCH1(c, lw, la0, la1, &npos)) continue;
-          e[2] = npos; e[3] = count + 1; c->bt_sp += BT_WORDS;
+          e[2] = npos; e[3] = count + 1; c->bt_sp += RX_BT_WORDS;
           pc = lpc + 6; pos = npos;
           DISPATCH();
         }
@@ -174,28 +174,28 @@ static int RUN_NAME(rx_ctx* c, uint32_t pc, uint32_t pos, uint32_t base, uint32_
   CASE(LOOK_END):
     *out_pos = pos; return 1;
   CASE(JMP): pc = code[pc + 1]; DISPATCH();
-  CASE(PUSH_BT): PUSH(BT_RESUME, code[pc + 1], pos, 0); pc += 2; DISPATCH();
-  CASE(SAVE): { uint32_t r = code[pc + 1]; PUSH(BT_RESTORE, r, (uint32_t)regs[r], 0); regs[r] = (int32_t)pos; pc += 2; DISPATCH(); }
+  CASE(PUSH_BT): PUSH(RX_BT_RESUME, code[pc + 1], pos, 0); pc += 2; DISPATCH();
+  CASE(SAVE): { uint32_t r = code[pc + 1]; PUSH(RX_BT_RESTORE, r, (uint32_t)regs[r], 0); regs[r] = (int32_t)pos; pc += 2; DISPATCH(); }
   CASE(SAVE_NR): regs[code[pc + 1]] = (int32_t)pos; pc += 2; DISPATCH();
   CASE(CLEAR): {
     uint32_t lo = code[pc + 1], hi = code[pc + 2];
     for (uint32_t g = lo; g <= hi; g++){
       for (uint32_t k = 2 * g; k <= 2 * g + 1; k++){
-        if (regs[k] != -1){ PUSH(BT_RESTORE, k, (uint32_t)regs[k], 0); regs[k] = -1; }
+        if (regs[k] != -1){ PUSH(RX_BT_RESTORE, k, (uint32_t)regs[k], 0); regs[k] = -1; }
       }
     }
     pc += 3; DISPATCH();
   }
-  CASE(CNT_INIT): { uint32_t r = code[pc + 1]; PUSH(BT_RESTORE, r, (uint32_t)regs[r], 0); regs[r] = 0; pc += 2; DISPATCH(); }
+  CASE(CNT_INIT): { uint32_t r = code[pc + 1]; PUSH(RX_BT_RESTORE, r, (uint32_t)regs[r], 0); regs[r] = 0; pc += 2; DISPATCH(); }
   CASE(CNT_INC_JL): {
     uint32_t r = code[pc + 1], n = code[pc + 2], target = code[pc + 3];
-    PUSH(BT_RESTORE, r, (uint32_t)regs[r], 0);
+    PUSH(RX_BT_RESTORE, r, (uint32_t)regs[r], 0);
     regs[r]++;
     if ((uint32_t)regs[r] < n) pc = target; else pc += 4;
     DISPATCH();
   }
   CASE(CNT_JGE): { uint32_t r = code[pc + 1], n = code[pc + 2]; if ((uint32_t)regs[r] >= n) pc = code[pc + 3]; else pc += 4; DISPATCH(); }
-  CASE(EMPTY_START): { uint32_t r = code[pc + 1]; PUSH(BT_RESTORE, r, (uint32_t)regs[r], 0); regs[r] = (int32_t)pos; pc += 2; DISPATCH(); }
+  CASE(EMPTY_START): { uint32_t r = code[pc + 1]; PUSH(RX_BT_RESTORE, r, (uint32_t)regs[r], 0); regs[r] = (int32_t)pos; pc += 2; DISPATCH(); }
   CASE(EMPTY_CHECK): if ((uint32_t)regs[code[pc + 1]] == pos) goto fail; pc += 2; DISPATCH();
   CASE(EMPTY_CHECK_OPT): if ((uint32_t)regs[code[pc + 2]] >= code[pc + 3] && (uint32_t)regs[code[pc + 1]] == pos) goto fail; pc += 4; DISPATCH();
   CASE(LOOK): {
@@ -208,16 +208,16 @@ static int RUN_NAME(rx_ctx* c, uint32_t pc, uint32_t pos, uint32_t base, uint32_
       if (!r) goto fail;
       /* positive: drop the body's choice points, keep its register restores in order */
       uint32_t wr = mark;
-      for (uint32_t rd = mark; rd < c->bt_sp; rd += BT_WORDS){
-        if (c->bt[rd] == BT_RESTORE){ if (wr != rd) memcpy(c->bt + wr, c->bt + rd, sizeof(uint32_t) * BT_WORDS); wr += BT_WORDS; }
+      for (uint32_t rd = mark; rd < c->bt_sp; rd += RX_BT_WORDS){
+        if (c->bt[rd] == RX_BT_RESTORE){ if (wr != rd) memcpy(c->bt + wr, c->bt + rd, sizeof(uint32_t) * RX_BT_WORDS); wr += RX_BT_WORDS; }
       }
       c->bt_sp = wr;
     } else {
       if (r){
         /* negative and the body matched: undo its register writes, then fail */
         while (c->bt_sp > mark){
-          uint32_t* e = c->bt + (c->bt_sp - BT_WORDS); c->bt_sp -= BT_WORDS;
-          if (e[0] == BT_RESTORE) regs[e[1]] = (int32_t)e[2];
+          uint32_t* e = c->bt + (c->bt_sp - RX_BT_WORDS); c->bt_sp -= RX_BT_WORDS;
+          if (e[0] == RX_BT_RESTORE) regs[e[1]] = (int32_t)e[2];
         }
         goto fail;
       }
@@ -249,13 +249,13 @@ static int RUN_NAME(rx_ctx* c, uint32_t pc, uint32_t pos, uint32_t base, uint32_
   }
   CASE(BOL): if (pos != 0) goto fail; pc++; DISPATCH();
   CASE(EOL): if (pos != len) goto fail; pc++; DISPATCH();
-  CASE(BOL_M): if (pos != 0 && !is_lt(CU(pos - 1))) goto fail; pc++; DISPATCH();
-  CASE(EOL_M): if (pos != len && !is_lt(CU(pos))) goto fail; pc++; DISPATCH();
+  CASE(BOL_M): if (pos != 0 && !rx_is_lt(CU(pos - 1))) goto fail; pc++; DISPATCH();
+  CASE(EOL_M): if (pos != len && !rx_is_lt(CU(pos))) goto fail; pc++; DISPATCH();
   CASE(WORDB):
   CASE(NWORDB): {
     int a, b;
-    if (w & RX_OP_IU){ a = pos > 0 && is_word_iu(CU(pos - 1)); b = pos < len && is_word_iu(CU(pos)); }
-    else { a = pos > 0 && is_word(CU(pos - 1)); b = pos < len && is_word(CU(pos)); }
+    if (w & RX_OP_IU){ a = pos > 0 && rx_is_word_iu(CU(pos - 1)); b = pos < len && rx_is_word_iu(CU(pos)); }
+    else { a = pos > 0 && rx_is_word(CU(pos - 1)); b = pos < len && rx_is_word(CU(pos)); }
     int at = a != b;
     if (((w & RX_OP_MASK) == RX_OP_WORDB) ? !at : at) goto fail;
     pc++; DISPATCH();
@@ -276,7 +276,7 @@ static int RUN_NAME(rx_ctx* c, uint32_t pc, uint32_t pos, uint32_t base, uint32_
     }
     pc += 2 + n; DISPATCH();
   }
-  CASE(ANY): NEXT_CHAR(w, ch); if (is_lt(ch)) goto fail; pc++; DISPATCH();
+  CASE(ANY): NEXT_CHAR(w, ch); if (rx_is_lt(ch)) goto fail; pc++; DISPATCH();
   CASE(ANY_ALL): NEXT_CHAR(w, ch); pc++; DISPATCH();
   CASE(CLASS): NEXT_CHAR(w, ch); if (!set_has(&c->p->sets[code[pc + 1]], ch)) goto fail; pc += 2; DISPATCH();
   CASE(NCLASS): NEXT_CHAR(w, ch); if (set_has(&c->p->sets[code[pc + 1]], ch)) goto fail; pc += 2; DISPATCH();
@@ -303,7 +303,7 @@ static int RUN_NAME(rx_ctx* c, uint32_t pc, uint32_t pos, uint32_t base, uint32_
       count = pos - start;
       if (count < min) goto fail;
       pmin = start + min;
-      if (count > min) PUSH(BT_GREEDY, pc, pmin, pos);
+      if (count > min) PUSH(RX_BT_GREEDY, pc, pmin, pos);
       pc += 6; DISPATCH();
     }
   greedy_generic:
@@ -314,14 +314,14 @@ static int RUN_NAME(rx_ctx* c, uint32_t pc, uint32_t pos, uint32_t base, uint32_
       if (count == min) pmin = pos;
     }
     if (count < min) goto fail;
-    if (count > min) PUSH(BT_GREEDY, pc, pmin, pos);
+    if (count > min) PUSH(RX_BT_GREEDY, pc, pmin, pos);
     pc += 6; DISPATCH();
   }
   CASE(LOOP_LAZY): {
     uint32_t lw = code[pc + 1], a0 = code[pc + 2], a1 = code[pc + 3], min = code[pc + 4], max = code[pc + 5];
     uint32_t count = 0;
     while (count < min){ if (!MATCH1(c, lw, a0, a1, &pos)) goto fail; count++; }
-    if (count < max) PUSH(BT_LAZY, pc, pos, count);
+    if (count < max) PUSH(RX_BT_LAZY, pc, pos, count);
     pc += 6; DISPATCH();
   }
 #if !defined(__GNUC__)

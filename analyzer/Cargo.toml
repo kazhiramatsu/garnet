@@ -12,5 +12,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["unbounded_depth", "float_roundtrip"] }
 serde_stacker = "0.1"
 
+[build-dependencies]
+cc = "1"
+
 [profile.release]
 opt-level = 3

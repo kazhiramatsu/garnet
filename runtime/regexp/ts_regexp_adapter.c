@@ -104,24 +104,32 @@ static rx_program* compile_units(const uint16_t* u, uint32_t n, uint32_t flags){
   e->len = n; e->flags = flags; e->prog = p;   /* the cache holds p's first reference */
   return p;
 }
+/* The native tier (docs/regexp_vm_design.md): a literal site passes the matchers the analyzer
+   compiled for its pattern; they are bound to the program on its first use. TSAOT_REGEXP_NATIVE=0
+   in the environment keeps every program on the interpreter (the A/B). */
+static int g_native_off;
+static inline rx_program* bind_native(rx_program* p, rx_native_fn n8, rx_native_fn n16){
+  if (n8 && !g_native_off) rx_set_native(p, n8, n16);
+  return p;
+}
 /* a pattern string: a static literal source goes through the identity cache */
-static rx_program* compile_pattern(tsv pattern, uint32_t flags){
+static rx_program* compile_pattern(tsv pattern, uint32_t flags, rx_native_fn n8, rx_native_fn n16){
   if (ts_is_heap_str(pattern) && (ts_str_flags_typed(pattern) & TS_STR_FLAG_STATIC)){
     uint64_t x = (uint64_t)pattern ^ ((uint64_t)pattern >> 17) ^ ((uint64_t)flags * 0x9E3779B1u);
     id_entry* e = &g_id_cache[(uint32_t)(x >> 3) & (ID_SLOTS - 1u)];
-    if (e->prog && e->pattern == pattern && e->flags == flags) return e->prog;
+    if (e->prog && e->pattern == pattern && e->flags == flags) return bind_native(e->prog, n8, n16);
     units un; units_of(pattern, &un);
     rx_program* p = compile_units(un.u, un.n, flags);
     units_free(&un);
     if (e->prog) rx_release(e->prog);
     rx_retain(p);
     e->pattern = pattern; e->flags = flags; e->prog = p;
-    return p;
+    return bind_native(p, n8, n16);
   }
   units un; units_of(pattern, &un);
   rx_program* p = compile_units(un.u, un.n, flags);
   units_free(&un);
-  return p;
+  return bind_native(p, n8, n16);
 }
 
 /* ---- the RegExp object ---- */
@@ -139,9 +147,9 @@ static tsv regexp_make(rx_program* p, tsv source, uint32_t flags){
   ts_gc_unroot(2);
   return re;
 }
-tsv ts_regexp_new_literal(tsv source, uint32_t flags){
+tsv ts_regexp_new_literal(tsv source, uint32_t flags, rx_native_fn n8, rx_native_fn n16){
   ts_gc_root(&source);
-  rx_program* p = compile_pattern(source, flags);
+  rx_program* p = compile_pattern(source, flags, n8, n16);
   ts_gc_unroot(1);
   return regexp_make(p, source, flags);
 }
@@ -328,9 +336,9 @@ static tsv build_result(tsv s, const int32_t* caps, rx_program* p){
 
 /* ---- the literal entry points (no RegExp object) ---- */
 static tsv to_str(tsv v){ return ts_is_str(v) ? v : ts_to_string_v(v); }
-tsv ts_regexp_adapter_test_tsv(tsv pattern, uint32_t flags, tsv input){
+tsv ts_regexp_adapter_test_tsv(tsv pattern, uint32_t flags, tsv input, rx_native_fn n8, rx_native_fn n16){
   if (ts_is_str(input)){
-    rx_program* p = compile_pattern(pattern, flags);
+    rx_program* p = compile_pattern(pattern, flags, n8, n16);
     capsbuf cb; caps_init(&cb, p);
     int m = exec_string(p, input, 0, cb.v);
     caps_free(&cb);
@@ -338,17 +346,17 @@ tsv ts_regexp_adapter_test_tsv(tsv pattern, uint32_t flags, tsv input){
   }
   ts_gc_root(&input); ts_gc_root(&pattern);
   tsv s = to_str(input); ts_gc_root(&s);
-  rx_program* p = compile_pattern(pattern, flags);
+  rx_program* p = compile_pattern(pattern, flags, n8, n16);
   capsbuf cb; caps_init(&cb, p);
   int m = exec_string(p, s, 0, cb.v);
   caps_free(&cb);
   ts_gc_unroot(3);
   return ts_bool(m);
 }
-double ts_regexp_adapter_search_tsv(tsv input, tsv pattern, uint32_t flags){
+double ts_regexp_adapter_search_tsv(tsv input, tsv pattern, uint32_t flags, rx_native_fn n8, rx_native_fn n16){
   ts_gc_root(&input); ts_gc_root(&pattern);
   tsv s = to_str(input); ts_gc_root(&s);
-  rx_program* p = compile_pattern(pattern, flags);
+  rx_program* p = compile_pattern(pattern, flags, n8, n16);
   capsbuf cb; caps_init(&cb, p);
   int m = exec_string(p, s, 0, cb.v);
   double r = m ? (double)cb.v[0] : -1.0;
@@ -356,10 +364,10 @@ double ts_regexp_adapter_search_tsv(tsv input, tsv pattern, uint32_t flags){
   ts_gc_unroot(3);
   return r;
 }
-tsv ts_regexp_adapter_exec_tsv(tsv pattern, uint32_t flags, tsv input){
+tsv ts_regexp_adapter_exec_tsv(tsv pattern, uint32_t flags, tsv input, rx_native_fn n8, rx_native_fn n16){
   ts_gc_root(&input); ts_gc_root(&pattern);
   tsv s = to_str(input); ts_gc_root(&s);
-  rx_program* p = compile_pattern(pattern, flags);
+  rx_program* p = compile_pattern(pattern, flags, n8, n16);
   capsbuf cb; caps_init(&cb, p);
   int m = exec_string(p, s, 0, cb.v);
   tsv r = m ? build_result(s, cb.v, p) : TS_NULL;
@@ -368,36 +376,36 @@ tsv ts_regexp_adapter_exec_tsv(tsv pattern, uint32_t flags, tsv input){
   return r;
 }
 /* a temporary RegExp object for the object algorithms (match / matchAll / replace / split) */
-static tsv temp_regexp(tsv pattern, uint32_t flags){
+static tsv temp_regexp(tsv pattern, uint32_t flags, rx_native_fn n8, rx_native_fn n16){
   ts_gc_root(&pattern);
-  rx_program* p = compile_pattern(pattern, flags);
+  rx_program* p = compile_pattern(pattern, flags, n8, n16);
   ts_gc_unroot(1);
   return regexp_make(p, pattern, flags);
 }
-tsv ts_regexp_adapter_match_tsv(tsv input, tsv pattern, uint32_t flags){
+tsv ts_regexp_adapter_match_tsv(tsv input, tsv pattern, uint32_t flags, rx_native_fn n8, rx_native_fn n16){
   ts_gc_root(&input); ts_gc_root(&pattern);
-  tsv re = temp_regexp(pattern, flags); ts_gc_root(&re);
+  tsv re = temp_regexp(pattern, flags, n8, n16); ts_gc_root(&re);
   tsv r = ts_regexp_adapter_object_match_tsv(input, re);
   ts_gc_unroot(3);
   return r;
 }
-tsv ts_regexp_adapter_match_all_tsv(tsv input, tsv pattern, uint32_t flags){
+tsv ts_regexp_adapter_match_all_tsv(tsv input, tsv pattern, uint32_t flags, rx_native_fn n8, rx_native_fn n16){
   ts_gc_root(&input); ts_gc_root(&pattern);
-  tsv re = temp_regexp(pattern, flags); ts_gc_root(&re);
+  tsv re = temp_regexp(pattern, flags, n8, n16); ts_gc_root(&re);
   tsv r = ts_regexp_adapter_object_match_all_tsv(input, re);
   ts_gc_unroot(3);
   return r;
 }
-tsv ts_regexp_adapter_replace_tsv(tsv input, tsv pattern, uint32_t flags, tsv replacement, int replace_all_method){
+tsv ts_regexp_adapter_replace_tsv(tsv input, tsv pattern, uint32_t flags, tsv replacement, int replace_all_method, rx_native_fn n8, rx_native_fn n16){
   ts_gc_root(&input); ts_gc_root(&pattern); ts_gc_root(&replacement);
-  tsv re = temp_regexp(pattern, flags); ts_gc_root(&re);
+  tsv re = temp_regexp(pattern, flags, n8, n16); ts_gc_root(&re);
   tsv r = ts_regexp_adapter_object_replace_tsv(input, re, replacement, replace_all_method);
   ts_gc_unroot(4);
   return r;
 }
-tsv ts_regexp_adapter_split_tsv(tsv input, tsv pattern, uint32_t flags, tsv limit){
+tsv ts_regexp_adapter_split_tsv(tsv input, tsv pattern, uint32_t flags, tsv limit, rx_native_fn n8, rx_native_fn n16){
   ts_gc_root(&input); ts_gc_root(&pattern); ts_gc_root(&limit);
-  tsv re = temp_regexp(pattern, flags); ts_gc_root(&re);
+  tsv re = temp_regexp(pattern, flags, n8, n16); ts_gc_root(&re);
   tsv r = ts_regexp_adapter_object_split_tsv(input, re, limit);
   ts_gc_unroot(4);
   return r;
@@ -682,7 +690,7 @@ tsv ts_regexp_adapter_object_split_tsv(tsv input, tsv re, tsv limit){
   int unicode = (flags & (TSAOT_REGEXP_FLAG_UNICODE | TSAOT_REGEXP_FLAG_UNICODE_SETS)) != 0;
   /* the regexp's own program searches (the global flag does not reach the engine); a sticky one
      needs the search form compiled */
-  rx_program* p = (r->flags & TSAOT_REGEXP_FLAG_STICKY) ? compile_pattern(r->source, flags) : r->prog;
+  rx_program* p = (r->flags & TSAOT_REGEXP_FLAG_STICKY) ? compile_pattern(r->source, flags, NULL, NULL) : r->prog;
   rx_retain(p);
   uint32_t ng = rx_group_count(p);
   capsbuf cb; caps_init(&cb, p);
@@ -698,7 +706,7 @@ tsv ts_regexp_adapter_object_split_tsv(tsv input, tsv re, tsv limit){
   /* a sticky regexp: the specification's walk (a sticky match at every position q, q advancing
      by a character); V8's sticky split never sees the middle of a pair */
   int sticky = (r->flags & TSAOT_REGEXP_FLAG_STICKY) != 0;
-  rx_program* ps = sticky ? compile_pattern(r->source, flags | TSAOT_REGEXP_FLAG_STICKY) : NULL;
+  rx_program* ps = sticky ? compile_pattern(r->source, flags | TSAOT_REGEXP_FLAG_STICKY, NULL, NULL) : NULL;
   if (ps) rx_retain(ps);
   uint32_t last_end = 0, from = 0;
   while (from < size){
@@ -771,7 +779,7 @@ tsv ts_regexp_adapter_construct_tsv(tsv pattern, tsv flags, int as_constructor){
     tsv source = r->source; uint32_t mask = r->flags;
     ts_gc_root(&source);
     if (flags != TS_UNDEFINED){ tsv fs = to_str(flags); ts_gc_root(&fs); mask = parse_flags_or_throw(fs); ts_gc_unroot(1); }
-    tsv re = ts_regexp_new_literal(source, mask);
+    tsv re = ts_regexp_new_literal(source, mask, NULL, NULL);
     ts_gc_unroot(3);
     return re;
   }
@@ -779,7 +787,7 @@ tsv ts_regexp_adapter_construct_tsv(tsv pattern, tsv flags, int as_constructor){
   ts_gc_root(&source);
   uint32_t mask = 0;
   if (flags != TS_UNDEFINED){ tsv fs = to_str(flags); ts_gc_root(&fs); mask = parse_flags_or_throw(fs); ts_gc_unroot(1); }
-  tsv re = ts_regexp_new_literal(source, mask);
+  tsv re = ts_regexp_new_literal(source, mask, NULL, NULL);
   ts_gc_unroot(3);
   return re;
 }
@@ -891,6 +899,8 @@ void ts_regexp_adapter_init(void){
   static int done = 0;
   if (done) return;
   done = 1;
+  const char* nat = getenv("TSAOT_REGEXP_NATIVE");
+  g_native_off = nat && (strcmp(nat, "0") == 0 || strcmp(nat, "false") == 0 || strcmp(nat, "no") == 0 || strcmp(nat, "off") == 0);
   keys_init();
   ts_regexp_proto_init();
   tsv proto = ts_regexp_proto();

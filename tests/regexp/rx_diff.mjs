@@ -3,20 +3,36 @@
 // runtime/regexp/rx_cli from the engine sources, feeds it (pattern, flags, input, start) cases and
 // compares each result with `new RegExp(pattern, flags + "gd").exec(input)` from lastIndex = start
 // (the indices of every group). Usage: node tests/regexp/rx_diff.mjs [--random N] [--seed S] [--show K]
+// [--native]: the native tier instead (rx_cli -E writes the C of every case's matchers, the driver
+// is built again over it and binds each program before the run; docs/regexp_vm_design.md).
 import { spawnSync } from "node:child_process";
-import { existsSync, statSync, readdirSync } from "node:fs";
+import { existsSync, statSync, readdirSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const dir = path.join(root, "runtime/regexp");
 const cli = path.join(root, "build/rx_cli");
-const srcs = ["rx_set.c", "rx_unicode.c", "rx_parse.c", "rx_compile.c", "rx_vm.c", "rx_cli.c"].map((f) => path.join(dir, f));
+const srcs = ["rx_set.c", "rx_unicode.c", "rx_parse.c", "rx_compile.c", "rx_vm.c", "rx_emit.c", "rx_cli.c"].map((f) => path.join(dir, f));
 function build() {
   const newest = Math.max(...readdirSync(dir).map((f) => statSync(path.join(dir, f)).mtimeMs));
   if (existsSync(cli) && statSync(cli).mtimeMs > newest) return;
   const r = spawnSync("cc", ["-std=c11", "-O2", "-Wall", "-Wno-unused-function", "-o", cli, ...srcs], { encoding: "utf8" });
   if (r.status !== 0) { console.error(r.stderr); process.exit(1); }
+}
+// the native driver: the matchers of the cases' patterns as C, compiled in with the table
+function buildNative(lines) {
+  const em = spawnSync(cli, ["-E"], { input: lines, encoding: "utf8", maxBuffer: 1 << 30 });
+  if (em.status !== 0) { console.error("rx_cli -E failed:", em.status, em.stderr); process.exit(1); }
+  const csrc = path.join(root, "build/rx_natives.c");
+  writeFileSync(csrc, em.stdout);
+  const ncli = path.join(root, "build/rx_cli_native");
+  const t0 = Date.now();
+  const r = spawnSync("cc", ["-std=c11", "-O1", "-Wall", "-Wno-unused-function", "-DRX_NATIVE_TABLE", "-I", dir, "-o", ncli, ...srcs, csrc], { encoding: "utf8", maxBuffer: 1 << 28 });
+  if (r.status !== 0) { console.error(r.stderr.slice(0, 4000)); process.exit(1); }
+  if (r.stderr.trim()) console.error(r.stderr.slice(0, 2000));
+  console.log(`native driver: ${(em.stdout.length / 1e6).toFixed(1)} MB of C, built in ${((Date.now() - t0) / 1000).toFixed(1)} s`);
+  return ncli;
 }
 
 const args = process.argv.slice(2);
@@ -94,7 +110,9 @@ const hex = (s) => { let o = ""; for (let i = 0; i < s.length; i++) o += s.charC
 const lines = cases.map(([p, f, i, s]) => `${hex(p)}\t${f}\t${hex(i)}\t${s}`).join("\n") + "\n";
 const dump = opt("--dump", null);
 if (dump) { (await import("node:fs")).writeFileSync(dump, lines); console.log(`${cases.length} cases written`); process.exit(0); }
-const run = spawnSync(cli, [], { input: lines, encoding: "utf8", maxBuffer: 1 << 28 });
+const NATIVE = args.includes("--native");
+const driver = NATIVE ? buildNative(lines) : cli;
+const run = spawnSync(driver, [], { input: lines, encoding: "utf8", maxBuffer: 1 << 28 });
 if (run.status !== 0) { console.error("rx_cli failed:", run.status, run.signal, run.stderr); }
 const got = run.stdout.split("\n");
 const reason = (m) => m.replace(/^Invalid regular expression: \/[\s\S]*\/[a-z]*: /, "");

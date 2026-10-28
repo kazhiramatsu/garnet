@@ -402,8 +402,14 @@ conformance gate and a relink without deleting caches. The engine's own loop
 (no runtime, no node per case): `node tests/regexp/rx_diff.mjs [--random N]
 [--seed S] [--show K]` builds `build/rx_cli` from the engine sources and
 compares tens of thousands of (pattern, flags, input, start) cases with V8's
-capture indices in seconds; `build/rx_cli -d <hex pattern> <flags>` prints a
-program's disassembly. The conformance side is `scripts/gen_regexp_corpus.py`
+capture indices in seconds; `--native` runs the same cases through the native
+tier instead (`rx_cli -E` writes the C of every pattern's matchers, the driver
+is rebuilt over it: the emitter and the interpreter must agree on every case);
+`build/rx_cli -d <hex pattern> <flags>` prints a program's disassembly. The
+analyzer links the engine (`analyzer/build.rs`): a change under
+`runtime/regexp/` rebuilds `tsaot` on the next `cargo build`, and a program's
+matchers are emitted by that binary, so rebuild it after an engine edit before
+reading a `dt` result. The conformance side is `scripts/gen_regexp_corpus.py`
 (the `vm_*` fixtures; regenerate after a change to the generator and commit
 them). The design and the V8 behaviours mirrored on purpose:
 `docs/regexp_vm_design.md`.

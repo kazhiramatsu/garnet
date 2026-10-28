@@ -14,6 +14,7 @@ mod devirt;
 mod emit_c;
 mod escape_ir;
 mod interproc;
+mod rx_native;
 mod sroa;
 mod string_accum;
 mod string_materialization;

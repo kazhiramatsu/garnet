@@ -41,6 +41,8 @@ bash "$ROOT/tests/jsx_aot_gate.sh" || rc=1
 bash "$ROOT/tests/runtime_anymethod_safe.sh" || rc=1
 bash "$ROOT/tests/regexp_aot_gate.sh" || rc=1
 node "$ROOT/tests/regexp/rx_diff.mjs" --random 2000 --show 10 || rc=1
+# the native tier: the emitter and the interpreter must agree on every case (docs/regexp_vm_design.md)
+node "$ROOT/tests/regexp/rx_diff.mjs" --native --random 2000 --show 10 || rc=1
 bash "$ROOT/tests/regexp_link_gate.sh" || rc=1
 bash "$ROOT/tests/unicode_aot_gate.sh" || rc=1
 bash "$ROOT/tests/unicode_link_gate.sh" || rc=1

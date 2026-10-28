@@ -6,6 +6,7 @@
 #define TSAOT_REGEXP_ADAPTER_H
 
 #include <stdint.h>
+#include "rx_native.h"   /* the native tier's function type (a literal site passes its matchers) */
 
 #ifndef TS_RT_H
 typedef uint64_t tsv;
@@ -25,20 +26,22 @@ typedef uint64_t tsv;
 void ts_regexp_adapter_init(void);
 
 /* A RegExp object from a literal's source and flag mask (the program compiled through the
-   cache; a SyntaxError for an invalid pattern) and from the constructor's arguments. */
-tsv ts_regexp_new_literal(tsv source, uint32_t flags);
+   cache; a SyntaxError for an invalid pattern) and from the constructor's arguments. A literal
+   site passes the matchers the analyzer compiled for it (rx_native.h; NULL, NULL: the
+   interpreter), as do the literal call sites below. */
+tsv ts_regexp_new_literal(tsv source, uint32_t flags, rx_native_fn n8, rx_native_fn n16);
 tsv ts_regexp_adapter_construct_tsv(tsv pattern, tsv flags, int as_constructor);
 /* RegExp.escape */
 tsv ts_regexp_escape_tsv(tsv s);
 
 /* Literal call sites: the pattern source and flags, no RegExp object. */
-tsv ts_regexp_adapter_test_tsv(tsv pattern, uint32_t flags, tsv input);
-double ts_regexp_adapter_search_tsv(tsv input, tsv pattern, uint32_t flags);
-tsv ts_regexp_adapter_exec_tsv(tsv pattern, uint32_t flags, tsv input);
-tsv ts_regexp_adapter_match_tsv(tsv input, tsv pattern, uint32_t flags);
-tsv ts_regexp_adapter_match_all_tsv(tsv input, tsv pattern, uint32_t flags);
-tsv ts_regexp_adapter_replace_tsv(tsv input, tsv pattern, uint32_t flags, tsv replacement, int replace_all_method);
-tsv ts_regexp_adapter_split_tsv(tsv input, tsv pattern, uint32_t flags, tsv limit);
+tsv ts_regexp_adapter_test_tsv(tsv pattern, uint32_t flags, tsv input, rx_native_fn n8, rx_native_fn n16);
+double ts_regexp_adapter_search_tsv(tsv input, tsv pattern, uint32_t flags, rx_native_fn n8, rx_native_fn n16);
+tsv ts_regexp_adapter_exec_tsv(tsv pattern, uint32_t flags, tsv input, rx_native_fn n8, rx_native_fn n16);
+tsv ts_regexp_adapter_match_tsv(tsv input, tsv pattern, uint32_t flags, rx_native_fn n8, rx_native_fn n16);
+tsv ts_regexp_adapter_match_all_tsv(tsv input, tsv pattern, uint32_t flags, rx_native_fn n8, rx_native_fn n16);
+tsv ts_regexp_adapter_replace_tsv(tsv input, tsv pattern, uint32_t flags, tsv replacement, int replace_all_method, rx_native_fn n8, rx_native_fn n16);
+tsv ts_regexp_adapter_split_tsv(tsv input, tsv pattern, uint32_t flags, tsv limit, rx_native_fn n8, rx_native_fn n16);
 
 /* RegExp objects (RegExp.prototype.test / exec and the String methods with a RegExp argument). */
 tsv ts_regexp_adapter_object_test_tsv(tsv re, tsv input);

@@ -11449,3 +11449,39 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   alternating rounds each, medians; outputs identical; Node 770), tsc-ts 22.212 -> 22.214 G
   instructions (unchanged; wall 1.19 -> 1.20 s; outputs identical). Not in this slice:
   `runtime/regexp/rx_native.h` and `rx_emit.c` are the native tier's first files (R3, next).
+- R3 of the regexp VM: the native tier (docs/regexp_vm_design.md "The native tier"). A regexp
+  literal is compiled to C at build time: `runtime/regexp/rx_emit.c` writes a program's bytecode
+  as two functions with the interpreter run's contract (Latin-1 and UTF-16 input; a goto state
+  machine over the same registers and backtrack stack, the class tables static, the simple loops
+  tight scans, the choice points pushes of their pc, the fail block a trampoline over the pcs,
+  lookaround bodies nested functions), `rx_native.h` is what the matchers share with the
+  interpreter (`rx_vm.c` runs on it; `rx_bt_grow`, `rx_unstep_*`, `rx_backref_cmp_*` exported),
+  and the search loop (prefilters, sticky and anchored starts, the unit-wise scan) stays in the
+  engine, dispatching on `prog->native[wide]`. The analyzer links the engine (`analyzer/build.rs`
+  with the `cc` crate) and `rx_native.rs` calls `rx_emit_native` through FFI once per distinct
+  (source, flags) of the literal sites with constant arguments (`rx_native_sites_for`:
+  `regexp.newLiteral` and the `regexp.quick*` calls); the C goes into one block after the
+  includes (the data unit in a unit build), the sites pass `rx_native_<id>_8, rx_native_<id>_16`
+  to the adapter, whose literal entry points now take the pair (`NULL, NULL` from the
+  function-value paths and the runtime's own calls), and `compile_pattern` binds them to the
+  program on first use (the first binding sticks; the program is shared through the caches).
+  `TSAOT_REGEXP_NATIVE=0` at the analyzer emits no matchers, at run time the adapter ignores
+  them (the A/B on one binary). Verification: `tests/regexp/rx_diff.mjs --native` (`rx_cli -E`
+  writes the matchers of every distinct pattern of the corpus with a table, the driver is built
+  again over that C and binds each program before the run): 43,593 cases, 0 differ; added to
+  `scripts/ci_fast.sh`. Kernels, the interpreter -> the native tier on one binary (Node):
+  tokenizer 170 -> 149 (118), validate 127 -> 104 (87), logs 140 -> 133 (116), search 157 -> 124
+  (111), path_regexps 141 -> 126 (112). The profiles after it: the matchers are 20% of the
+  tokenizer and the sticky `test` path's per-call costs 60% (`builtin_exec`, the generated
+  `lastIndex` store through `ts_set_pic`, the slot lookup, `rx_exec` and `try_at`); a third of
+  the validate kernel, the adapter's per-call path another third; the search kernel is the
+  backtracking alternation (22%), the search loop's byte scan (17%) and the result objects (12%).
+  The next slice is the per-call path (a typed `lastIndex` access, a slimmer sticky exec, the
+  first-character scan), not the matchers. Gates: conformance 662/662 plain, 661/662 strict (`node/timers`: the ordering of a 0 ms timer
+  with arguments against an immediate queued from a timer, a race under the gate's load that the
+  fixture's own note records; 3/3 alone), 659/659 in units mode and under GC protect, unit,
+  bundler 51/51, bench all within budget, GC stress PASSED, the regexp AOT and link gates, the
+  engine diff 43,593 cases 0 differ in the interpreter and the native mode. vue 1,079.0 ->
+  1,075.3 ms (seven alternating rounds each, medians; outputs identical; Node 779), tsc-ts
+  22.183 -> 22.180 G instructions (unchanged; cycles -0.7%; outputs identical; its unit build
+  carries 40 matchers in the data unit).

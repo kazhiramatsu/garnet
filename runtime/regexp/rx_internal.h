@@ -3,13 +3,12 @@
 #ifndef RX_INTERNAL_H
 #define RX_INTERNAL_H
 #include "rx.h"
+#include "rx_native.h"
 #include <string.h>
 #include <stdlib.h>
 #include <setjmp.h>
 
 #define RX_MAX_CP 0x10FFFFu
-static inline int rx_is_lead(uint32_t c){ return c >= 0xD800u && c <= 0xDBFFu; }
-static inline int rx_is_trail(uint32_t c){ return c >= 0xDC00u && c <= 0xDFFFu; }
 #define RX_INFINITY 0xFFFFFFFFu   /* a quantifier's unbounded maximum */
 
 /* ---- arena: every parse-time allocation, freed at once after the compile ---- */
@@ -121,7 +120,10 @@ struct rx_program {
   uint8_t prefix_whole;       /* the pattern is exactly the prefix (no captures, no assertions) */
   void* owned;                /* one malloc holding code, sets, ranges, names, prefix */
   void* user; void (*user_free)(void*);   /* the embedder's data (rx_set_user) */
+  rx_native_fn native[2];     /* the native tier's matchers (narrow, wide); NULL: the interpreter */
 };
+/* the length in words of the op at pc (rx_vm.c) */
+uint32_t rx_op_len(const uint32_t* code, uint32_t pc);
 
 /* parser (rx_parse.c): returns the AST or longjmps on error with err filled */
 rx_node* rx_parse(rx_arena* arena, const uint16_t* src, uint32_t len, uint32_t flags,
@@ -130,12 +132,9 @@ rx_node* rx_parse(rx_arena* arena, const uint16_t* src, uint32_t len, uint32_t f
 rx_program* rx_compile_ast(rx_arena* arena, rx_node* root, uint32_t flags, uint32_t ngroups,
                            uint16_t** names, uint32_t* name_lens);
 
-/* unicode (rx_unicode.c): the flat BMP tables (mapping + 1, 0 = identity), built by rx_unicode_init */
-extern const uint16_t* rx_g_canon_bmp;
-extern const uint16_t* rx_g_fold_bmp;
+/* unicode (rx_unicode.c): the flat BMP tables (rx_native.h: rx_g_canon_bmp, rx_g_fold_bmp and
+   the fast lookups), built by rx_unicode_init */
 void rx_unicode_init(void);
-static inline uint32_t rx_canon_nonu_fast(uint32_t cu){ uint16_t m = rx_g_canon_bmp[cu]; return m ? (uint32_t)(m - 1u) : cu; }
-static inline uint32_t rx_fold_u_fast(uint32_t cp){ if (cp < 0x10000u){ uint16_t m = rx_g_fold_bmp[cp]; return m ? (uint32_t)(m - 1u) : cp; } return rx_fold_u(cp); }
 const uint32_t* rx_prop_lookup(const char* name, uint32_t name_len, int kind, uint32_t* nranges);
 int rx_is_id_start(uint32_t cp);
 int rx_is_id_continue(uint32_t cp);

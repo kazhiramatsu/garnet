@@ -448,6 +448,9 @@ fn emit_program_with_string_plans(
     if needs_fetch {
         s.push_str("#define TSAOT_NEEDS_FETCH 1\n\n");
     }
+    // the regexp literals' native matchers (rx_native) go here, once the functions have named them
+    crate::rx_native::reset();
+    let rx_native_at = s.len();
     s.push_str("#if defined(__GNUC__) || defined(__clang__)\n");
     s.push_str("#define TS_AOT_INLINE static inline __attribute__((always_inline))\n");
     s.push_str("#else\n");
@@ -1260,6 +1263,10 @@ fn emit_program_with_string_plans(
     // completes before the program exits, like a JS runtime.
     s.push_str("  ts_run_event_loop();\n");
     s.push_str("  if (getenv(\"TSAOT_GC_AT_EXIT\")) ts_gc_collect();\n  return 0;\n}\n");
+    let natives = crate::rx_native::take_texts();
+    if !natives.is_empty() {
+        s.insert_str(rx_native_at, &natives);
+    }
     s
 }
 
@@ -1942,6 +1949,9 @@ struct Ctx<'a> {
     str_consts: BTreeMap<u32, (usize, u32, String)>,   /* a local holding one string literal: its id, length and C expression */
     /// locals holding one string constant that names a property (see const_keys_for): its code units
     const_keys: BTreeMap<u32, Vec<u16>>,
+    /// the regexp literal sites with a native matcher (rx_native_sites_for): the call's destination
+    /// local to the matcher id
+    rx_native: BTreeMap<u32, u32>,
     switch_plan: SwitchPlan,
     layouts: LayoutPlan,
     /// Typed direct stores whose frozen test is omitted (`frozen_elision_for`).
@@ -9343,6 +9353,7 @@ fn emit_i64_function(
         typeof_fusion,
         tag_consts: tag_consts_for(f),
         str_consts: str_consts_for(f, static_strings),
+        rx_native: rx_native_sites_for(f),
         const_keys: const_keys_for(f),
         static_strings,
         string_metric_plan,
@@ -9589,6 +9600,7 @@ fn emit_f64_function(
         typeof_fusion,
         tag_consts: tag_consts_for(f),
         str_consts: str_consts_for(f, static_strings),
+        rx_native: rx_native_sites_for(f),
         const_keys: const_keys_for(f),
         static_strings,
         string_metric_plan,
@@ -9726,6 +9738,7 @@ fn emit_function(
             typeof_fusion: typeof_fusion_plan(f),
             tag_consts: tag_consts_for(f),
             str_consts: str_consts_for(f, static_strings),
+        rx_native: rx_native_sites_for(f),
         const_keys: const_keys_for(f),
             static_strings,
             string_metric_plan: None,
@@ -9805,6 +9818,7 @@ fn emit_function(
             typeof_fusion: typeof_fusion_plan(f),
             tag_consts: tag_consts_for(f),
             str_consts: str_consts_for(f, static_strings),
+        rx_native: rx_native_sites_for(f),
         const_keys: const_keys_for(f),
             static_strings,
             string_metric_plan: None,
@@ -9884,6 +9898,7 @@ fn emit_function(
             typeof_fusion: typeof_fusion_plan(f),
             tag_consts: tag_consts_for(f),
             str_consts: str_consts_for(f, static_strings),
+        rx_native: rx_native_sites_for(f),
         const_keys: const_keys_for(f),
             static_strings,
             string_metric_plan: None,
@@ -10188,6 +10203,7 @@ fn emit_function(
         typeof_fusion,
         tag_consts: tag_consts_for(f),
         str_consts: str_consts_for(f, static_strings),
+        rx_native: rx_native_sites_for(f),
         const_keys: const_keys_for(f),
         static_strings,
         string_metric_plan,
@@ -10588,6 +10604,85 @@ fn str_consts_for(f: &Function, static_strings: &BTreeMap<Vec<u16>, usize>) -> B
             if let Some(id) = static_strings.get(&u) {
                 out.insert(d, (*id, u.len() as u32, strlit_expr(&u, *id)));
             }
+        }
+    }
+    out
+}
+
+/// The regexp literal sites of a function whose pattern and flags are constants (`regexp.newLiteral`
+/// and the `regexp.quick*` calls the exporter lowers a literal to), with the id of their native
+/// matchers (rx_native, docs/regexp_vm_design.md "The native tier"), keyed by the call's
+/// destination local. The site passes `rx_native_<id>_8, rx_native_<id>_16` to the adapter, which
+/// binds them to the pattern's program on first use.
+fn rx_native_sites_for(f: &Function) -> BTreeMap<u32, u32> {
+    let mut out: BTreeMap<u32, u32> = BTreeMap::new();
+    if !crate::rx_native::enabled() {
+        return out;
+    }
+    let mut flat: Vec<&Inst> = Vec::new();
+    flatten_inst(&f.body, &mut flat);
+    if !flat.iter().any(|i| matches!(i, Inst::CallBuiltinStatic { builtin, .. } if builtin.starts_with("regexp."))) {
+        return out;
+    }
+    // the locals defined once, by a string or a number constant
+    let mut strs: BTreeMap<u32, Option<Vec<u16>>> = BTreeMap::new();
+    let mut nums: BTreeMap<u32, Option<f64>> = BTreeMap::new();
+    for inst in &flat {
+        if let Inst::TryCatch { catch_var: Some(c), .. } = inst {
+            strs.insert(c.0, None);
+            nums.insert(c.0, None);
+        }
+        let Some(d) = inst_def(inst) else { continue };
+        let su: Option<Vec<u16>> = match inst {
+            Inst::Const { value: ConstVal::Str { value }, .. } => Some(str_units(value)),
+            Inst::Const { value: ConstVal::Str16 { units }, .. } => Some(units.clone()),
+            _ => None,
+        };
+        let nu: Option<f64> = match inst {
+            Inst::Const { value: ConstVal::Num { value }, .. } => Some(*value),
+            _ => None,
+        };
+        match strs.get(&d) {
+            None => {
+                strs.insert(d, su);
+            }
+            Some(prev) => {
+                if *prev != su {
+                    strs.insert(d, None);
+                }
+            }
+        }
+        match nums.get(&d) {
+            None => {
+                nums.insert(d, nu);
+            }
+            Some(prev) => {
+                if *prev != nu {
+                    nums.insert(d, None);
+                }
+            }
+        }
+    }
+    for p in &f.params {
+        strs.insert(p.0, None);
+        nums.insert(p.0, None);
+    }
+    for inst in &flat {
+        let Inst::CallBuiltinStatic { dst: Some(dst), builtin, args } = inst else { continue };
+        let (pi, fi) = match builtin.as_str() {
+            "regexp.newLiteral" | "regexp.quickTest" | "regexp.quickExec" => (0, 1),
+            "regexp.quickMatch" | "regexp.quickMatchAll" | "regexp.quickReplace" | "regexp.quickSplit"
+            | "regexp.quickSearch" => (1, 2),
+            _ => continue,
+        };
+        let (Some(pat), Some(flags)) = (args.get(pi), args.get(fi)) else { continue };
+        let Some(Some(units)) = strs.get(&pat.0) else { continue };
+        let Some(Some(mask)) = nums.get(&flags.0) else { continue };
+        if !(mask.fract() == 0.0 && *mask >= 0.0 && *mask < 256.0) {
+            continue;
+        }
+        if let Some(id) = crate::rx_native::matcher_id(units, *mask as u32) {
+            out.insert(dst.0, id);
         }
     }
     out
@@ -14220,37 +14315,37 @@ fn fnval_adapter_body(builtin: &str) -> Option<String> {
         "promise.any" => hv(format!("ts_promise_any({})", val(0))),
         // ---- RegExp (runtime/regexp, docs/regexp_vm_design.md) ----
         "regexp.quickTest" => hv(format!(
-            "ts_regexp_adapter_test_tsv({}, (uint32_t)ts_to_num({}), {})",
+            "ts_regexp_adapter_test_tsv({}, (uint32_t)ts_to_num({}), {}, NULL, NULL)",
             val(0),
             val(1),
             val(2)
         )),
         "regexp.quickSearch" => hv(format!(
-            "ts_num(ts_regexp_adapter_search_tsv({}, {}, (uint32_t)ts_to_num({})))",
+            "ts_num(ts_regexp_adapter_search_tsv({}, {}, (uint32_t)ts_to_num({}), NULL, NULL))",
             val(0),
             val(1),
             val(2)
         )),
         "regexp.quickExec" => hv(format!(
-            "ts_regexp_adapter_exec_tsv({}, (uint32_t)ts_to_num({}), {})",
+            "ts_regexp_adapter_exec_tsv({}, (uint32_t)ts_to_num({}), {}, NULL, NULL)",
             val(0),
             val(1),
             val(2)
         )),
         "regexp.quickMatch" => hv(format!(
-            "ts_regexp_adapter_match_tsv({}, {}, (uint32_t)ts_to_num({}))",
+            "ts_regexp_adapter_match_tsv({}, {}, (uint32_t)ts_to_num({}), NULL, NULL)",
             val(0),
             val(1),
             val(2)
         )),
         "regexp.quickMatchAll" => hv(format!(
-            "ts_regexp_adapter_match_all_tsv({}, {}, (uint32_t)ts_to_num({}))",
+            "ts_regexp_adapter_match_all_tsv({}, {}, (uint32_t)ts_to_num({}), NULL, NULL)",
             val(0),
             val(1),
             val(2)
         )),
         "regexp.quickReplace" => hv(format!(
-            "ts_regexp_adapter_replace_tsv({}, {}, (uint32_t)ts_to_num({}), {}, (int)ts_to_num({}))",
+            "ts_regexp_adapter_replace_tsv({}, {}, (uint32_t)ts_to_num({}), {}, (int)ts_to_num({}), NULL, NULL)",
             val(0),
             val(1),
             val(2),
@@ -14258,13 +14353,13 @@ fn fnval_adapter_body(builtin: &str) -> Option<String> {
             val(4)
         )),
         "regexp.quickSplit" => hv(format!(
-            "ts_regexp_adapter_split_tsv({}, {}, (uint32_t)ts_to_num({}), {})",
+            "ts_regexp_adapter_split_tsv({}, {}, (uint32_t)ts_to_num({}), {}, NULL, NULL)",
             val(0),
             val(1),
             val(2),
             val(3)
         )),
-        "regexp.newLiteral" => hv(format!("ts_regexp_new_literal({}, (uint32_t)ts_to_num({}))", val(0), val(1))),
+        "regexp.newLiteral" => hv(format!("ts_regexp_new_literal({}, (uint32_t)ts_to_num({}), NULL, NULL)", val(0), val(1))),
         "regexp.escape" => hv(format!("ts_regexp_escape_tsv({})", val(0))),
         // ---- Symbol statics ----
         "symbol.for" => hv(format!("ts_symbol_for({})", val(0))),
@@ -22775,6 +22870,12 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     .map(|a| ctx.val(a.0))
                     .unwrap_or_else(|| "TS_UNDEFINED".into())
             };
+            // a regexp literal site's native matchers (rx_native_sites_for), or none
+            let nat = || -> String {
+                dst.and_then(|d| ctx.rx_native.get(&d.0).copied())
+                    .map(|id| format!("rx_native_{id}_8, rx_native_{id}_16"))
+                    .unwrap_or_else(|| "NULL, NULL".into())
+            };
             // Math converts its arguments with ToNumber (valueOf, numeric
             // strings), not a reinterpretation of the boxed bits.
             let n = |i: usize| -> String {
@@ -22885,7 +22986,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     format!("ts_regexp_adapter_object_test_tsv({}, {})", v(0), v(1)),
                     false,
                 ),
-                "regexp.newLiteral" => (format!("ts_regexp_new_literal({}, (uint32_t)ts_to_num({}))", v(0), v(1)), false),
+                "regexp.newLiteral" => (format!("ts_regexp_new_literal({}, (uint32_t)ts_to_num({}), {})", v(0), v(1), nat()), false),
                 "regexp.escape" => (format!("ts_regexp_escape_tsv({})", v(0)), false),
                 "regexp.construct" => (format!("ts_regexp_adapter_construct_tsv({}, {}, ts_truthy({}))", v(0), v(1), v(2)), false),
                 "uint16array.new" => (format!("ts_new_uint16_array({})", v(0)), false),
@@ -22964,67 +23065,74 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 ),
                 "regexp.quickTest" => (
                     format!(
-                        "ts_regexp_adapter_test_tsv({}, (uint32_t){}, {})",
+                        "ts_regexp_adapter_test_tsv({}, (uint32_t){}, {}, {})",
                         v(0),
                         n(1),
-                        v(2)
+                        v(2),
+                        nat()
                     ),
                     false,
                 ),
                 "regexp.quickSearch" => (
                     format!(
-                        "ts_regexp_adapter_search_tsv({}, {}, (uint32_t){})",
+                        "ts_regexp_adapter_search_tsv({}, {}, (uint32_t){}, {})",
                         v(0),
                         v(1),
-                        n(2)
+                        n(2),
+                        nat()
                     ),
                     true,
                 ),
                 "regexp.quickExec" => (
                     format!(
-                        "ts_regexp_adapter_exec_tsv({}, (uint32_t){}, {})",
+                        "ts_regexp_adapter_exec_tsv({}, (uint32_t){}, {}, {})",
                         v(0),
                         n(1),
-                        v(2)
+                        v(2),
+                        nat()
                     ),
                     false,
                 ),
                 "regexp.quickMatch" => (
                     format!(
-                        "ts_regexp_adapter_match_tsv({}, {}, (uint32_t){})",
+                        "ts_regexp_adapter_match_tsv({}, {}, (uint32_t){}, {})",
                         v(0),
                         v(1),
-                        n(2)
+                        n(2),
+                        nat()
                     ),
                     false,
                 ),
                 "regexp.quickMatchAll" => (
                     format!(
-                        "ts_regexp_adapter_match_all_tsv({}, {}, (uint32_t){})",
+                        "ts_regexp_adapter_match_all_tsv({}, {}, (uint32_t){}, {})",
                         v(0),
                         v(1),
-                        n(2)
+                        n(2),
+                        nat()
                     ),
                     false,
                 ),
                 "regexp.quickReplace" => (
                     format!(
-                        "ts_regexp_adapter_replace_tsv({}, {}, (uint32_t){}, {}, (int){})",
+                        "ts_regexp_adapter_replace_tsv({}, {}, (uint32_t){}, {}, (int){}, {})",
                         v(0),
                         v(1),
                         n(2),
                         v(3),
-                        n(4)
+                        n(4),
+                        nat()
                     ),
                     false,
                 ),
                 "regexp.quickSplit" => (
                     format!(
-                        "ts_regexp_adapter_split_tsv({}, {}, (uint32_t){}, {})",
+                        "ts_regexp_adapter_split_tsv({}, {}, (uint32_t){}, {}, {})",
                         v(0),
                         v(1),
                         n(2),
-                        v(3)
+                        v(3),
+                        nat()
                     ),
                     false,
                 ),

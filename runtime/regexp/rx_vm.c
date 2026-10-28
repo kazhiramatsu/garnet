@@ -5,23 +5,15 @@
 #include "rx_internal.h"
 #include <stdio.h>
 
-enum { BT_RESUME = 1, BT_RESTORE = 2, BT_GREEDY = 3, BT_LAZY = 4 };
-#define BT_WORDS 4u
+/* the context, the backtrack entries and the character helpers are rx_native.h's: the native
+   tier's matchers (rx_emit.c) share them */
 #define BT_LIMIT_WORDS (RX_BACKTRACK_LIMIT_BYTES / 4u)
-
-typedef struct rx_ctx {
-  const rx_program* p;
-  const uint8_t* in8; const uint16_t* in16;
-  uint32_t len;
-  int32_t* regs;
-  uint32_t* bt; uint32_t bt_sp, bt_cap;
-} rx_ctx;
 
 /* the per-thread scratch: the backtrack stack and the register file */
 typedef struct rx_scratch { int32_t* regs; uint32_t regs_cap; uint32_t* bt; uint32_t bt_cap; } rx_scratch;
 static _Thread_local rx_scratch g_scratch;
 
-static int bt_grow(rx_ctx* c){
+int rx_bt_grow(rx_ctx* c){
   uint32_t cap = c->bt_cap ? c->bt_cap * 2 : 4096;
   if (cap > BT_LIMIT_WORDS){ if (c->bt_cap >= BT_LIMIT_WORDS) return 0; cap = BT_LIMIT_WORDS; }
   uint32_t* n = (uint32_t*)realloc(c->bt, sizeof(uint32_t) * cap);
@@ -31,9 +23,6 @@ static int bt_grow(rx_ctx* c){
   return 1;
 }
 
-static inline int is_lt(uint32_t ch){ return ch == 0x0A || ch == 0x0D || ch == 0x2028 || ch == 0x2029; }
-static inline int is_word(uint32_t ch){ return (ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '_'; }
-static inline int is_word_iu(uint32_t ch){ return is_word(ch) || ch == 0x017Fu || ch == 0x212Au; }
 static inline int set_has(const rx_set* s, uint32_t ch){
   if (ch < 256u) return (s->bits[ch >> 3] >> (ch & 7u)) & 1u;
   return s->nranges ? rx_ranges_has(s->ranges, s->nranges, ch) : 0;
@@ -53,7 +42,8 @@ static int try_at(rx_ctx* c, int wide, uint32_t pos, int32_t* caps){
   reset_caps(c);
   c->bt_sp = 0;
   uint32_t end;
-  int r = wide ? rx_run_16(c, 0, pos, 0, &end) : rx_run_8(c, 0, pos, 0, &end);
+  rx_native_fn nat = c->p->native[wide];
+  int r = nat ? nat(c, pos, 0, &end) : wide ? rx_run_16(c, 0, pos, 0, &end) : rx_run_8(c, 0, pos, 0, &end);
   if (r == 1) memcpy(caps, c->regs, sizeof(int32_t) * c->p->ncap_regs);
   return r;
 }
@@ -144,6 +134,10 @@ int rx_exec(const rx_program* p, const void* input, uint32_t len, int wide, uint
   return 0;
 }
 
+void rx_set_native(rx_program* p, rx_native_fn narrow, rx_native_fn wide){
+  if (!p->native[0] && narrow && wide){ p->native[0] = narrow; p->native[1] = wide; }
+}
+
 /* ---- disassembly ---- */
 static const char* op_name(uint32_t op){
   static const char* names[RX_OP__COUNT] = {
@@ -153,7 +147,7 @@ static const char* op_name(uint32_t op){
     "STRINGS", "LOOP_GREEDY", "LOOP_LAZY", "SAVE_NR" };
   return op < RX_OP__COUNT ? names[op] : "?";
 }
-static uint32_t op_len(const uint32_t* code, uint32_t pc){
+uint32_t rx_op_len(const uint32_t* code, uint32_t pc){
   uint32_t op = code[pc] & RX_OP_MASK;
   switch (op){
     case RX_OP_JMP: case RX_OP_PUSH_BT: case RX_OP_SAVE: case RX_OP_SAVE_NR: case RX_OP_CNT_INIT: case RX_OP_EMPTY_START: case RX_OP_EMPTY_CHECK:
@@ -173,7 +167,7 @@ char* rx_disassemble(const rx_program* p){
   #define APP(...) do { char tmp[256]; int kk_ = snprintf(tmp, sizeof tmp, __VA_ARGS__); if (n + (size_t)kk_ + 1 > cap){ cap = (cap + (size_t)kk_) * 2; out = (char*)realloc(out, cap); if (!out) return NULL; } memcpy(out + n, tmp, (size_t)kk_); n += (size_t)kk_; } while (0)
   APP("groups=%u regs=%u min_len=%u anchored=%d first=%d prefix_len=%u whole=%d\n", p->ngroups, p->nregs, p->min_len, p->anchored_start, p->first_valid, p->prefix_len, p->prefix_whole);
   for (uint32_t pc = 0; pc < p->code_len;){
-    uint32_t w = p->code[pc]; uint32_t l = op_len(p->code, pc);
+    uint32_t w = p->code[pc]; uint32_t l = rx_op_len(p->code, pc);
     APP("%4u: %s%s%s%s%s", pc, op_name(w & RX_OP_MASK), (w & RX_OP_BW) ? " bw" : "", (w & RX_OP_CP) ? " cp" : "", (w & RX_OP_IU) ? " iu" : "", (w & RX_OP_I) ? " i" : "");
     for (uint32_t k = 1; k < l; k++) APP(" %u", p->code[pc + k]);
     APP("\n");
