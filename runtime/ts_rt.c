@@ -4025,6 +4025,13 @@ static ts_key ts_intern_string_value(tsv s){
 #define TS_LIT_KEY_CACHE 1024u
 static uint32_t g_int_key_cache[TS_INT_KEY_CACHE];
 static struct { tsv s; uint32_t key1; } g_lit_key_cache[TS_LIT_KEY_CACHE];
+/* An immediate short string ("GET", "/user", a flag letter: up to TS_SHORTSTR_MAX code units in the
+   value itself) has no cell to cache its key id in (TS_STR_FLAG_KEY): a direct-mapped table keyed
+   by the value's bits, which are immutable and never collected, so an entry is never stale. hono's
+   router read `matchers[method]` with the request's method string on every match, and each read
+   interned the string again (the hash, the probe, the compare). */
+#define TS_SHORT_KEY_CACHE_LOG2 10u
+static struct { tsv s; uint32_t key1; } g_short_key_cache[1u << TS_SHORT_KEY_CACHE_LOG2];
 
 /* Coerce a JS property key value to the runtime key id (ECMAScript ToPropertyKey):
    symbols stay symbol keys; everything else is ToString + string interning.
@@ -4087,6 +4094,13 @@ static int ts_key_from_value_slow(tsv keyv, ts_key* out){
         *out = k;
         return 1;
       }
+    } else if (ts_is_short_str(keyv)){
+      uint32_t slot = (uint32_t)(((uint64_t)keyv * 0x9E3779B97F4A7C15ull) >> (64u - TS_SHORT_KEY_CACHE_LOG2));
+      if (g_short_key_cache[slot].s == keyv && g_short_key_cache[slot].key1){ *out = g_short_key_cache[slot].key1 - 1u; return 1; }
+      ts_key k = ts_intern_string_value(keyv);
+      g_short_key_cache[slot].s = keyv; g_short_key_cache[slot].key1 = k + 1u;
+      *out = k;
+      return 1;
     }
   }
   tsv ks = keyv;
@@ -18010,6 +18024,22 @@ int ts_obj_adopt_layout(tsv obj, ts_lit_layout* L){
   for (uint32_t i = 0; i < n; i++) slots[i] = (L->kinds && L->kinds[i]) ? ts_int_slot_word(0) : TS_UNDEFINED;
   obj_map_plain(o)->len = n;
   ts_obj_set_shape(o, sh);
+  return 1;
+}
+int ts_array_adopt_layout(tsv arr, ts_lit_layout* L){
+  if (!ts_is_indexed_array_fast(arr)) return 0;
+  ts_object* o = (ts_object*)ts_ptr(arr);
+  ts_propmap* m = obj_map_plain(o);   /* an array's map is in its cell */
+  if (o->shape != TS_SHAPE_EMPTY || m->len != 0 || m->cap != 0 || o->h.inline_cap != 0) return 0;
+  uint32_t sh = lit_layout_shape(L);
+  uint32_t n = L->n;
+  if (sh == UINT32_MAX || n == 0 || n > 4u || L->kinds) return 0;
+  /* an array has no inline value slots: the small vector of four holds the layout's */
+  tsv* slots = vals_alloc_small(&o->h);
+  for (uint32_t i = 0; i < n; i++) slots[i] = TS_UNDEFINED;
+  m->props = (ts_prop*)slots; m->cap = 4u; m->len = n;
+  ts_obj_set_shape(o, sh);
+  SHAPE_CHECK(o);
   return 1;
 }
 void ts_lit_store_int_slow(tsv obj, uint32_t i, long long v){

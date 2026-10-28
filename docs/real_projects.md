@@ -38,13 +38,20 @@ ns from "m"`, `new Date(value)` with a Date, an ISO or `toString`-shaped string 
 
 ## hono (routers)
 
-`benchmarks/real/hono/driver.ts` loads the route table of hono's own router benchmark into a
+`benchmarks/real/hono/driver.ts` loads the route table of hono's own router benchmark into each
 router and matches its ten requests many times; the checksum adds the matched handlers and the
-parameter counts. The TrieRouter is the measured router: the RegExpRouter, the PatternRouter and
-the SmartRouter (which picks the RegExpRouter) match through regular expressions, and the regular
-expression engine (QuickJS's backtracking interpreter behind the adapter, against V8's irregexp
-JIT; the adapter also looked its compiled program up by pattern text on every `match`) is a
-separate concern.
+parameter counts. The TrieRouter (object and string code) is the time `run.sh` reports; the driver
+also times the routers that match through regular expressions, since Session 357's engine
+(`docs/regexp_vm_design.md`): the RegExpRouter, which builds one alternation regexp per method whose
+empty captures `$()` mark the routes and finds the route with `match.indexOf("", 1)`, the
+PatternRouter (one regexp per route, `exec` and `groups`), and the SmartRouter, hono's default,
+which picks the RegExpRouter. (Until then the TrieRouter was the only router measured: the regular
+expression engine, QuickJS's backtracking interpreter behind an adapter that looked its compiled
+program up by pattern text on every `match`, was a separate concern.) The RegExpRouter's first
+profile (Session 357, R5) had the matcher at 15%: the rest was the result array's construction, the
+`indexOf` call on it as a dynamic method (lib's `RegExpMatchArray` was not an array receiver to the
+exporter) and the request's method string interned on every `matchers[method]` (a five-character
+immediate string has no cell to cache its key in).
 
 Two measurement lessons:
 

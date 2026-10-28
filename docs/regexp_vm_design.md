@@ -338,8 +338,12 @@ around each call. R4 trims that path without changing what a call means:
 - **R3 — the native tier.** `rx_emit_c` through the Rust emitter.
 - **R4 — the per-call path.** The typed `lastIndex`, the result arrays through inline caches,
   the quick check of the search loop, `s + ""`.
-- **The long tail.** The `v`-mode string properties (the emoji sequence data), hono's
-  RegExpRouter, the remaining divergences the corpus finds.
+- **R5 — hono's RegExpRouter.** The result array and its consumers outside the matcher: lib's
+  `RegExpMatchArray` / `RegExpExecArray` as array receivers in the exporter, the result array's
+  named properties as an adopted layout, a key cache for immediate short strings; the regexp
+  routers back in `benchmarks/real/hono/driver.ts`.
+- **The long tail.** The `v`-mode string properties (the emoji sequence data), the remaining
+  divergences the corpus finds.
 
 Each slice: the fixtures above, the A/Bs, the gates, a `docs/TODO.md` entry; the knob
 `TSAOT_REGEXP_NATIVE=0` (R3; the analyzer emits no matchers, the runtime ignores them) keeps the
@@ -414,7 +418,35 @@ measurement variant.
   matcher, the `lastIndex` write as a call), a choice point per alternative in alternation-heavy
   patterns, `rx_unstep_*` as a call in a narrow matcher's backtracking, the byte-at-a-time scan
   of the search loop: the next slice.
+- **R5 built (Session 357): hono's RegExpRouter.** The router builds one alternation regexp per
+  method whose empty captures `$()` mark the routes, matches with `path.match(re)` and finds the
+  route with `match.indexOf("", 1)`; its first profile (10 M matches) had the matcher (`rx_run_8`,
+  `try_at`) at 15% and the rest around it: the result array's construction 24% (eleven generic
+  element stores with their barrier, three `ts_set_pic` additions growing the property vector,
+  the slices), the `indexOf` call 20% (lib's `RegExpMatchArray` is an ambient interface over
+  `Array<string>`, which the exporter did not take for an array receiver, so the call was a
+  dynamic method lookup that probed each fresh result for an own `indexOf` and filled an
+  absent-cache entry per match), and the dynamic key reads `matchers[method]` / `matcher[2][path]`
+  18% (a string of up to five code units is an immediate value with no cell to cache its key id in,
+  so "GET" and "/user" were interned on every read: the hash, the probe, the compare). (1) The
+  exporter: `RegExpMatchArray` and `RegExpExecArray` (the ambient symbols only) are array
+  receivers (`builtinReceiverKind`, `unionMixesKinds`): methods, element access, `length`, for..of,
+  spread and destructuring take the array paths; the named properties keep the generic reads.
+  (2) The adapter: `build_result` stores the elements with `ts_array_set_inline` (a fresh array:
+  the slot store and the generation test), the named properties are a layout the array adopts at
+  creation (`ts_array_adopt_layout`: the shape the keys `index`, `input`, `groups`, `indices` give
+  from the empty array shape, the four-slot vector allocated once) and each is one `ts_lit_store`;
+  the inline caches remain the fallback when the shape table is exhausted; an empty capture is the
+  empty string without a call. (3) The runtime: `ts_key_from_value_slow` caches an immediate short
+  string's key id in a direct-mapped table keyed by the value's bits (immutable, never collected,
+  so never stale), beside the caches of literal and flat heap strings. Fixture
+  `regexp/match_array_typed`. hono's four routers, five alternating rounds each (medians; Node):
+  TrieRouter 307 -> 269 ms (246; the key cache serves its `children[part]` reads), RegExpRouter
+  146 -> 105 (38), PatternRouter 280 -> 266 (148), SmartRouter 168 -> 129 (41); outputs identical
+  to Node. The regexp kernels are within their run-to-run spread (tokenizer 137 -> 137, validate
+  94 -> 91, logs 129 -> 127, search 113 -> 109, path_regexps 125 -> 125); vue 1,080 -> 1,077 ms
+  (seven alternating rounds, medians; Node 757) and tsc-ts 22.206 -> 22.200 G instructions are
+  unchanged, outputs identical. The RegExpRouter's remaining 2.8x is the next profile's subject.
 - Not yet: the `v`-mode properties of strings (`\p{RGI_Emoji}` and the other six; the emoji
-  sequence data is in `build/ucd/17.0.0/emoji-seq/`, emoji 16.0 at the time of writing), hono's
-  RegExpRouter back in the benchmark.
+  sequence data is in `build/ucd/17.0.0/emoji-seq/`, emoji 16.0 at the time of writing).
 

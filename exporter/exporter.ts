@@ -10992,6 +10992,11 @@ class Exporter {
     try { bases = this.checker.getBaseTypes(target as ts.InterfaceType); } catch { return false; }
     return bases.some((b) => this.isCollectionDerivedType(b, depth + 1, which));
   }
+  /** The library's `RegExpMatchArray` / `RegExpExecArray`: interfaces over Array<string> whose
+   *  instances are the regexp result arrays (lib.es5.d.ts; a user type of the same name is not). */
+  private isRegExpResultSymbol(sym: ts.Symbol): boolean {
+    return (sym.name === "RegExpMatchArray" || sym.name === "RegExpExecArray") && this.isAmbientGlobalSymbol(sym);
+  }
   private isArrayDerivedType(t: ts.Type, depth: number): boolean {
     if (depth > 6 || !(t.flags & ts.TypeFlags.Object)) return false;
     if (this.checker.isArrayType(t)) return true;
@@ -11084,6 +11089,11 @@ class Exporter {
       // extra properties, so for-of, length and the builtin methods take the
       // array paths (the compiler's NodeArray<T>, 174 for-of loops).
       if (sym && !this.isAmbientGlobalSymbol(sym) && this.arrayInterfaces && this.isArrayDerivedType(t, 0)) return "array";
+      // The library's RegExp result types (`RegExpMatchArray` and `RegExpExecArray` extend
+      // Array<string>) are the runtime's result arrays with their named properties: the array
+      // paths too. (A method on one was a dynamic call that probed each fresh result for an own
+      // `indexOf` and filled an absent-cache entry per match: hono's RegExpRouter.)
+      if (sym && this.isRegExpResultSymbol(sym)) return "array";
       // (An interface whose base types reach Map/Set is not a map/set receiver
       // in general: it may add its own methods, as the compiler's MultiMap does.
       // derivedCollectionKind serves the sites that ask about a builtin member.)
@@ -11134,6 +11144,7 @@ class Exporter {
       const sym = m.getSymbol();
       // an interface derived from Array / Map / Set is that kind at run time
       if (sym && !this.isAmbientGlobalSymbol(sym) && this.isArrayDerivedType(m, 0)) { kinds.add("array"); continue; }
+      if (sym && this.isRegExpResultSymbol(sym)) { kinds.add("array"); continue; }
       if (sym && !this.isAmbientGlobalSymbol(sym) && this.isCollectionDerivedType(m, 0, "Map")) { kinds.add("map"); continue; }
       if (sym && !this.isAmbientGlobalSymbol(sym) && this.isCollectionDerivedType(m, 0, "Set")) { kinds.add("set"); continue; }
       if (sym && this.isAmbientGlobalSymbol(sym) && ["Map", "Set", "ReadonlyMap", "ReadonlySet", "WeakMap", "WeakSet", "Headers", "Promise", "Array", "ReadonlyArray"].includes(sym.name)) {

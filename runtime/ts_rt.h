@@ -1679,6 +1679,11 @@ tsv ts_new_array_site(uint32_t len, uint32_t site);
 /* Give a fresh empty object the layout in one step; 1 when its slots now
    follow the layout (store by slot), 0 when the object was not empty. */
 int ts_obj_adopt_layout(tsv obj, ts_lit_layout* layout);
+/* The same for a fresh array (the regexp result arrays: `index`, `input`, `groups`, `indices`):
+   its named properties take the layout's shape and value slots in one step, so each is one
+   ts_lit_store; 1 when the slots follow the layout, 0 when the array already has named
+   properties, the layout has more than four keys or the shape table is exhausted. */
+int ts_array_adopt_layout(tsv arr, ts_lit_layout* layout);
 void ts_array_set(tsv arr, uint32_t i, tsv v);
 void ts_array_push(tsv arr, tsv v);
 void ts_array_push_hole(tsv arr);

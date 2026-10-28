@@ -2,6 +2,9 @@
 // router benchmark (benchmarks/routers/src/tool.mts) in each router, matched over the benchmark's requests many
 // times; the checksum adds the matched handlers and the params, so the native and the Node runs must agree.
 import { TrieRouter } from "./src/router/trie-router/index.ts";
+import { RegExpRouter } from "./src/router/reg-exp-router/index.ts";
+import { PatternRouter } from "./src/router/pattern-router/index.ts";
+import { SmartRouter } from "./src/router/smart-router/index.ts";
 import type { Router } from "./src/router.ts";
 import { performance } from "node:perf_hooks";
 
@@ -71,9 +74,15 @@ function bench(name: string, router: Router<number>, iterations: number): string
 }
 function main(): void {
   const n = 100000;
-  // the TrieRouter only: the RegExpRouter, the PatternRouter and the SmartRouter (which picks the RegExpRouter) match
-  // through regular expressions, whose engine is a separate concern; this benchmark measures the object and string code.
-  const lines = [bench("TrieRouter", new TrieRouter<number>(), n)];
+  // The TrieRouter (object and string code; the time run.sh reports), then the routers that match through regular
+  // expressions: the RegExpRouter (one alternation regexp per method whose empty captures mark the routes), the
+  // PatternRouter (one regexp per route) and the SmartRouter (hono's default: the RegExpRouter when it can take the routes).
+  const lines = [
+    bench("TrieRouter", new TrieRouter<number>(), n),
+    bench("RegExpRouter", new RegExpRouter<number>(), n),
+    bench("PatternRouter", new PatternRouter<number>(), n),
+    bench("SmartRouter", new SmartRouter<number>({ routers: [new RegExpRouter<number>(), new TrieRouter<number>()] }), n),
+  ];
   console.log(lines.join("\n"));
 }
 main();

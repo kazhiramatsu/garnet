@@ -16,12 +16,18 @@
 /* ---- keys ---- */
 static ts_key k_lastIndex, k_index, k_input, k_groups, k_indices, k_next;
 static ts_key k_iter_re, k_iter_input, k_iter_done;
+/* the named properties of a result array in their order (`indices` only under `d`), as the
+   layouts a fresh result adopts (build_result) */
+static ts_key g_result_keys[4];
+static ts_lit_layout g_result_layout = { 0, 3, g_result_keys, NULL };
+static ts_lit_layout g_result_layout_d = { 0, 4, g_result_keys, NULL };
 static int g_keys_ready;
 static void keys_init(void){
   if (g_keys_ready) return;
   k_lastIndex = ts_intern_field("lastIndex", 9); k_index = ts_intern_field("index", 5);
   k_input = ts_intern_field("input", 5); k_groups = ts_intern_field("groups", 6);
   k_indices = ts_intern_field("indices", 7); k_next = ts_intern_field("next", 4);
+  g_result_keys[0] = k_index; g_result_keys[1] = k_input; g_result_keys[2] = k_groups; g_result_keys[3] = k_indices;
   k_iter_re = ts_intern_field("__tsaot_rx_iter_re", 18); k_iter_input = ts_intern_field("__tsaot_rx_iter_input", 21);
   k_iter_done = ts_intern_field("__tsaot_rx_iter_done", 20);
   g_keys_ready = 1;
@@ -238,7 +244,10 @@ static int builtin_exec(tsv re, tsv s, int32_t* caps){
 }
 
 /* ---- results ---- */
-static tsv slice(tsv s, int32_t a, int32_t b){ return ts_str_slice(s, (double)a, (double)b, 1); }
+static tsv slice(tsv s, int32_t a, int32_t b){
+  if (b <= a) return ts_short_str_ascii("", 0);   /* an empty capture (`$()` marks a route in hono's router) */
+  return ts_str_slice(s, (double)a, (double)b, 1);
+}
 static tsv substr(tsv s, uint32_t start, uint32_t len){ return ts_str_slice(s, (double)start, (double)(start + len), 1); }
 /* the program's named groups as the runtime sees them, made once per program and freed with it:
    the interned key of each distinct name in group order (the `groups` object's layout) and
@@ -290,10 +299,13 @@ static tsv build_groups(tsv values, const int32_t* caps, rx_program* p){
   ts_gc_unroot(2);
   return obj;
 }
-/* The result arrays are allocated at their length and their named properties (`index`, `input`,
-   `groups`, `indices`) added through inline caches: every result starts from the empty array
-   shape and adds the same keys in the same order, so each site's addition cache answers the
-   store without the probe of the receiver and its prototype chain that a generic set does. */
+/* The result arrays are allocated at their length, the elements stored in line (a fresh array:
+   the slot store and the generation test), and the named properties (`index`, `input`, `groups`,
+   and `indices` under `d`) are a layout the array adopts at creation (ts_array_adopt_layout), so
+   each is one slot store; the shape is the one the keys added in that order from the empty array
+   shape would give. The inline caches are the fallback when the array cannot adopt the layout
+   (the shape table exhausted): the addition cache answers each store without the probe of the
+   receiver and its prototype chain that a generic set does. */
 static ts_prop_ic g_ic_index, g_ic_input, g_ic_groups, g_ic_indices, g_ic_ind_groups;
 static tsv build_indices(tsv s, const int32_t* caps, rx_program* p){
   uint32_t ng = rx_group_count(p);
@@ -315,24 +327,24 @@ static tsv build_indices(tsv s, const int32_t* caps, rx_program* p){
 static tsv build_result(tsv s, const int32_t* caps, rx_program* p){
   keys_init();
   uint32_t ng = rx_group_count(p);
+  int with_indices = (rx_flags(p) & TSAOT_REGEXP_FLAG_INDICES) != 0;
   ts_gc_root(&s);
   tsv arr = ts_new_array(ng + 1u);
+  int laid = ts_array_adopt_layout(arr, with_indices ? &g_result_layout_d : &g_result_layout);
   ts_gc_root(&arr);
   for (uint32_t g = 0; g <= ng; g++){
     tsv part = caps[2*g] >= 0 ? slice(s, caps[2*g], caps[2*g+1]) : TS_UNDEFINED;   /* arr is rooted; part is stored at once */
-    ts_array_set(arr, g, part);
+    ts_array_set_inline(arr, (int64_t)g, part);
   }
-  ts_set_pic(arr, k_index, ts_num(caps[0]), &g_ic_index);
-  ts_set_pic(arr, k_input, s, &g_ic_input);
+  if (laid){ ts_lit_store(arr, 0, ts_num(caps[0])); ts_lit_store(arr, 1, s); }
+  else { ts_set_pic(arr, k_index, ts_num(caps[0]), &g_ic_index); ts_set_pic(arr, k_input, s, &g_ic_input); }
   tsv groups = rx_has_named_groups(p) ? build_groups(arr, caps, p) : TS_UNDEFINED;
-  ts_gc_root(&groups);
-  ts_set_pic(arr, k_groups, groups, &g_ic_groups);
-  ts_gc_unroot(1);
-  if (rx_flags(p) & TSAOT_REGEXP_FLAG_INDICES){
+  if (laid) ts_lit_store(arr, 2, groups);
+  else { ts_gc_root(&groups); ts_set_pic(arr, k_groups, groups, &g_ic_groups); ts_gc_unroot(1); }
+  if (with_indices){
     tsv ind = build_indices(s, caps, p);
-    ts_gc_root(&ind);
-    ts_set_pic(arr, k_indices, ind, &g_ic_indices);
-    ts_gc_unroot(1);
+    if (laid) ts_lit_store(arr, 3, ind);
+    else { ts_gc_root(&ind); ts_set_pic(arr, k_indices, ind, &g_ic_indices); ts_gc_unroot(1); }
   }
   ts_gc_unroot(2);
   return arr;

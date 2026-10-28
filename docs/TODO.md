@@ -11523,3 +11523,38 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   unstep inlined in a narrow matcher's trampoline, the `test` site's fast path inlined into the
   generated C (one call into the engine instead of three), a wider scan of the first-character
   set.
+- R5 of the regexp VM: hono's RegExpRouter (docs/regexp_vm_design.md "R5 built"). Kaz asked how
+  much the next regexp slice would buy; the answer was little for the real projects (regexps are
+  3% of vue's compiler phase, nothing in rxjs), except hono's RegExpRouter, which the benchmark had
+  left out while the old engine was slow and which is hono's default (the SmartRouter picks it):
+  measured for the first time, 146 ms against Node's 38 (3.9x; the TrieRouter 1.24x). Its profile
+  (a RegExpRouter-only driver, 10 M matches, the PC sampler) put the matcher at 15% and the rest
+  around it: the result array's construction 24%, the `match.indexOf("", 1)` call 20% as a dynamic
+  method (lib's `RegExpMatchArray` is an ambient interface over `Array<string>`, which the exporter
+  did not take for an array receiver, so each call probed the fresh result for an own `indexOf` and
+  filled an absent-cache entry), and the dynamic key reads `matchers[method]` / `matcher[2][path]`
+  18% (a string of up to five code units is an immediate value with no cell to cache its key id in,
+  so "GET" and "/user" were interned on every read). (1) Exporter: `RegExpMatchArray` and
+  `RegExpExecArray` (the ambient symbols) are array receivers in `builtinReceiverKind` and
+  `unionMixesKinds`: the methods, element access, `length`, for..of, spread and destructuring take
+  the array paths, the named properties keep the generic reads. (2) Adapter: `build_result` stores
+  the elements with `ts_array_set_inline`, the named properties (`index`, `input`, `groups`,
+  `indices` under `d`) are a layout the fresh array adopts (`ts_array_adopt_layout` in ts_rt.c: the
+  shape those keys give from the empty array shape, the four-slot vector allocated once) and each is
+  one `ts_lit_store`, the inline caches stay as the fallback; an empty capture is the empty string
+  without a call. (3) Runtime: `ts_key_from_value_slow` caches an immediate short string's key id in
+  a direct-mapped table keyed by the value's bits (immutable and never collected, so never stale),
+  beside the caches for literal and flat heap strings. `benchmarks/real/hono/driver.ts` now times all
+  four routers (run.sh reports the TrieRouter's line). Fixture `regexp/match_array_typed` (the array
+  paths over match / exec / matchAll / global-match results, the property order with and without
+  `indices`, writes and an added property after the layout, the empty-capture route markers, the
+  `any` paths agreeing). hono, five alternating rounds each (medians; Node): TrieRouter 307 -> 269 ms
+  (246; the key cache serves its `children[part]` reads), RegExpRouter 146 -> 105 (38),
+  PatternRouter 280 -> 266 (148), SmartRouter 168 -> 129 (41); outputs identical. The regexp kernels
+  within their spread (tokenizer 137 -> 137, validate 94 -> 91, logs 129 -> 127, search 113 -> 109,
+  path_regexps 125 -> 125). Gates: conformance 664/664 plain and strict (the fixture included), 661/661 in units mode and under GC
+  protect, the 18 regexp fixtures under `TSAOT_GC_YOUNG_THRESHOLD=1` with protect mode, unit (math
+  parity and the PGO build included), bundler 51/51, bench all within budget, the regexp AOT and link
+  gates, GC stress PASSED. vue 1,080.0 -> 1,077.2 ms
+  (seven alternating rounds each, medians; outputs identical; Node 757), tsc-ts 22.206 -> 22.200 G
+  instructions (unchanged; outputs identical; the build 253 s at three jobs, plain).
