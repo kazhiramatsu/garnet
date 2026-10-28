@@ -12614,7 +12614,13 @@ class Exporter {
       if (t.getConstructSignatures().length > 0) return 0;
       const sym = t.getSymbol();
       const cid = sym ? this.classSymToId.get(sym) : undefined;
-      if (cid === undefined || !this.classInfos[cid]?.stable) return 0;
+      if (cid === undefined) return 0;
+      // An unstable class whose instances are still sized structs with the declared layout (its
+      // instability is a value of another kind typed as it, a dynamic member, a replaced method:
+      // not a foreign base or a reassigned prototype) takes the hint too; the emitter guards such
+      // an access by the class interval, so a non-instance reads generically
+      // (docs/hidden_class_design.md S0). TSAOT_UNSTABLE_HINTS=0 keeps the sized cache there.
+      if (!this.classInfos[cid]?.stable && !this.classLayoutPreserved(cid)) return 0;
       // A generic class takes the hint too: its layout is one per class, not per instantiation (a field
       // typed by a type parameter is a boxed slot), and the hint names the class, not the arguments.
       if (!this.classNodeOfId.has(cid)) return 0;
@@ -12625,9 +12631,20 @@ class Exporter {
   }
   private withClassHint<T extends { kind: string }>(inst: T, receiver: ts.Expression): T {
     const cls = this.receiverClassHint(receiver);
-    if (cls !== 0) (inst as unknown as { cls?: number }).cls = cls;
-    else if (this.receiverAdmitsClassInstance(receiver)) (inst as unknown as { sized?: boolean }).sized = true;
+    if (cls !== 0) {
+      (inst as unknown as { cls?: number }).cls = cls;
+      // an unstable class's hint the emitter may decline (no interval): the sized probe then
+      if (!this.classInfos[cls - 1]?.stable) (inst as unknown as { sized?: boolean }).sized = true;
+    } else if (this.receiverAdmitsClassInstance(receiver)) (inst as unknown as { sized?: boolean }).sized = true;
     return inst;
+  }
+  /** An unstable class whose instances keep the declared struct layout and prototype chain (the
+   *  emitter's chain-preserving rule for class intervals): every reason is a static one. */
+  private classLayoutPreserved(cid: number): boolean {
+    if (process.env.TSAOT_UNSTABLE_HINTS === "0") return false;
+    const info = this.classInfos[cid];
+    if (!info || !this.classNodeOfId.has(cid)) return false;
+    return info.reasons.every((r) => r !== "prototype-assign" && !r.startsWith("extends-") && !r.startsWith("cyclic-extends"));
   }
   /** Whether a value of the receiver's static type can be a class instance without the type naming
    *  one stable class (docs/pic_sized_inline_design.md, "The interface-typed site"): an interface,

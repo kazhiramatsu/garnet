@@ -1920,6 +1920,9 @@ struct Ctx<'a> {
     /// Leading cell params of the function being emitted that arrive through
     /// the environment register (0 under the legacy merged convention).
     cur_capture_count: usize,
+    /// the method's `this` local (docs/hidden_class_design.md S0): its declared fields are read
+    /// at their struct offsets whatever the class's stability
+    this_local: Option<u32>,
     /// Direct-call i64 clones. These are optional fast entries; generic tsv entries
     /// remain the public ABI and are used for dynamic/unsafe calls.
     i64_fast: &'a BTreeMap<u32, I64FuncInfo>,
@@ -2855,8 +2858,8 @@ fn frozen_elision_for(f: &Function, ctx: &Ctx) -> BTreeSet<usize> {
         return out;
     }
     fn direct(ctx: &Ctx, obj: u32, cls: u32, field: u32) -> bool {
-        let (class, _) = receiver_class(ctx, obj, cls, field);
-        class.map_or(false, |c| struct_direct_offset(c, field, ctx.classes).is_some())
+        let (class, hinted) = receiver_class(ctx, obj, cls, field);
+        class.map_or(false, |c| struct_offset_for(ctx, obj, c, field, &hinted).is_some())
     }
     fn numeric_operands(inst: &Inst, ctx: &Ctx) -> bool {
         inst_refs(inst).iter().all(|l| ctx.unboxed.contains(l) || ctx.int_local.contains(l))
@@ -7522,6 +7525,11 @@ fn int32_field_loads(body: &[Inst], local_class: &BTreeMap<u32, u32>, classes: &
                 (None, 0) => continue,
                 (None, h) => h - 1,
             };
+            // an unstable class's hinted load may take the generic path (a value of another
+            // kind typed as the class): no integer fact
+            if !classes.get(&class).map_or(false, |cd| cd.stable) {
+                continue;
+            }
             let kind = field_int_kind(class, field.0, classes);
             if kind != 0 {
                 out.insert(*inst as *const Inst as usize, kind);
@@ -9326,6 +9334,7 @@ fn emit_i64_function(
         wksym,
         fn_takes_this,
         cur_capture_count: own_capture_count(f),
+        this_local: this_local_of(f, fclass),
         i64_fast,
         f64_fast,
         direct_sigs,
@@ -9571,6 +9580,7 @@ fn emit_f64_function(
         wksym,
         fn_takes_this,
         cur_capture_count: own_capture_count(f),
+        this_local: this_local_of(f, fclass),
         i64_fast,
         f64_fast,
         direct_sigs,
@@ -9786,6 +9796,7 @@ fn emit_function(
             wksym,
             fn_takes_this,
             cur_capture_count: own_capture_count(f),
+            this_local: this_local_of(f, fclass),
             i64_fast,
             f64_fast,
             direct_sigs,
@@ -9864,6 +9875,7 @@ fn emit_function(
             wksym,
             fn_takes_this,
             cur_capture_count: own_capture_count(f),
+            this_local: this_local_of(f, fclass),
             i64_fast,
             f64_fast,
             direct_sigs,
@@ -9978,9 +9990,11 @@ fn emit_function(
         }
         let storage = direct_entry_storage(f);
         let _ = writeln!(s, "{} {} {}_d({}){{", storage, sig.c_ret(), cname(f), sig.c_params());
+        s.push_str(&src_comment(f));
         s.push_str(&method_this_check(f, &format!("_p{}", f.capture_count)));
     } else {
         let _ = writeln!(s, "static tsv {}(tsv* args, int nargs){{", cname(f));
+        s.push_str(&src_comment(f));
         s.push_str("  (void)nargs;\n");
         s.push_str(&method_this_check(f, &format!("(nargs > {c} ? args[{c}] : TS_UNDEFINED)", c = f.capture_count)));
     }
@@ -12252,6 +12266,43 @@ fn struct_direct_offset(c: u32, field: u32, classes: &BTreeMap<u32, &ClassDef>) 
     }
     field_path(c, field, classes)
 }
+/// A method's `this` local (docs/hidden_class_design.md S0): the receiver of every access through
+/// it is a sized, unrelinked instance of the method's class or a subclass whatever the class's
+/// stability (an instability is a static one: a value of another kind typed as the class), since a
+/// foreign `this` arrives only through a borrow, a relink or an `Object.create` of the prototype,
+/// each of which raises the typed-slow flag that the access's guard tests. So the `this` of an
+/// unstable class with a class interval (its subtree's instances all sized, the chain preserved)
+/// reads its declared fields at their struct offsets, as a stable class's does. TSAOT_THIS_DIRECT=0
+/// keeps the sized inline cache there.
+fn this_local_of(f: &Function, fclass: &BTreeMap<u32, u32>) -> Option<u32> {
+    if f.takes_this && fclass.contains_key(&f.id.0) {
+        f.params.first().map(|p| p.0)
+    } else {
+        None
+    }
+}
+fn this_direct_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| !matches!(std::env::var("TSAOT_THIS_DIRECT").as_deref(), Ok("0") | Ok("false") | Ok("no") | Ok("off")))
+}
+fn class_ranged(c: u32) -> bool {
+    class_index_enabled() && class_dfs().ranged.contains(&c)
+}
+/// The struct offset an access through local `obj`, read as class `c`, takes: a stable class's
+/// field, or a declared field of the method's `this` when the class has an interval.
+fn struct_offset_for(ctx: &Ctx, obj: u32, c: u32, field: u32, hinted: &Option<HintGuard>) -> Option<String> {
+    if let Some(off) = struct_direct_offset(c, field, ctx.classes) {
+        return Some(off);
+    }
+    if ctx.this_local == Some(obj) && this_direct_enabled() && class_ranged(c) {
+        return field_path(c, field, ctx.classes);
+    }
+    // an unstable class's hint under the interval guard (hint_guard admits no other)
+    if matches!(hinted, Some(HintGuard::Range { .. })) && class_ranged(c) {
+        return field_path(c, field, ctx.classes);
+    }
+    None
+}
 
 /// Does this instruction list contain an Await nested inside a control-flow
 /// construct (If/Loop/TryCatch)? v1 only supports top-level awaits, so a nested
@@ -13598,6 +13649,7 @@ fn emit_async_function(s: &mut String, f: &Function, ctx: &Ctx) {
     // public entry: allocate frame, copy args into param fields, run resume once,
     // return the result promise.
     let _ = writeln!(s, "static tsv {}(tsv* args, int nargs){{", fname);
+    s.push_str(&src_comment(f));
     s.push_str("  (void)nargs;\n");
     emit_coro_alloc(s, &fname, nvals, true);
     s.push_str("  ts_gc_root(&_cv);\n");
@@ -13630,6 +13682,7 @@ fn emit_generator_function(s: &mut String, f: &Function, ctx: &Ctx) {
     // public entry: allocate frame, copy args, return a generator object WITHOUT
     // running the body (generators are lazy).
     let _ = writeln!(s, "static tsv {}(tsv* args, int nargs){{", fname);
+    s.push_str(&src_comment(f));
     s.push_str("  (void)nargs;\n");
     emit_coro_alloc(s, &fname, nvals, false);
     s.push_str("  ts_gc_root(&_cv);\n");
@@ -13656,6 +13709,7 @@ fn emit_asyncgen_function(s: &mut String, f: &Function, ctx: &Ctx) {
     // public entry: lazy — allocate frame, copy args, return an async-generator
     // object WITHOUT running the body (driven by .next()).
     let _ = writeln!(s, "static tsv {}(tsv* args, int nargs){{", fname);
+    s.push_str(&src_comment(f));
     s.push_str("  (void)nargs;\n");
     emit_coro_alloc(s, &fname, nvals, true);
     s.push_str("  ts_gc_root(&_cv);\n");
@@ -24102,7 +24156,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             }
             let (class, hinted) = receiver_class(ctx, obj.0, *cls, field.0);
             if let Some(c) = class {
-                if let Some(off) = struct_direct_offset(c, field.0, ctx.classes) {
+                if let Some(off) = struct_offset_for(ctx, obj.0, c, field.0, &hinted) {
                     let cn = struct_name(c);
                     let obj_name = ctx.vname(obj.0);
                     let st = format!("((({}*)ts_ptr({}))->{})", cn, obj_name, off);
@@ -24425,7 +24479,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             }
             let (class, hinted) = receiver_class(ctx, obj.0, *cls, field.0);
             if let Some(c) = class {
-                if let Some(off) = struct_direct_offset(c, field.0, ctx.classes) {
+                if let Some(off) = struct_offset_for(ctx, obj.0, c, field.0, &hinted) {
                     let cn = struct_name(c);
                     let is_num = numeric_field(c, field.0, ctx.classes);
                     // numeric field stores a raw double (an integer slot an integer, a
