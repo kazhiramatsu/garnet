@@ -185,6 +185,20 @@ sorted range table above it (binary search), and under `i` the set of canonical 
 spec's CharacterSetMatcher with Canonicalize on both sides: the input is canonicalized through the
 table and tested against the canonicalized set). `\d \s \w` and their complements are prebuilt.
 
+The alternation's dispatch (R6): an alternative whose first set is known (`first_of`: exact
+below 256, a `wide` bit for anything above; a back reference makes it unknown) and cannot be
+empty is preceded by `ALT_FIRST set target flags` instead of `PUSH_BT target`. The next unit not
+in the set, or the end of the input, skips to the next alternative without a choice point; a
+unit in the set pushes the choice point and enters the body, unless every alternative of the
+alternation has a known non-empty first set and the sets are pairwise disjoint below 256
+(`RX_ALT_DISJOINT`): then no other alternative can match here and nothing is pushed. A unit of
+256 or more (UTF-16 input) enters with a choice point when the set is wide and skips when it is
+not. The last alternative is entered directly, and a lookbehind body (matched backward) keeps
+the plain choice points. hono's route regexp is one alternation of a few disjoint branches: a
+request's match pushes nothing for the routes it cannot take; an ipv4 octet's alternatives
+overlap on their first digit and keep their choice points. The native tier emits the same test
+(`rx_emit.c`), the guard's set as a bitmap-only table.
+
 ### The search loop (prefilters)
 
 `rx_exec` tries positions from `start` to `len - min_len`:
@@ -342,6 +356,9 @@ around each call. R4 trims that path without changing what a call means:
   `RegExpMatchArray` / `RegExpExecArray` as array receivers in the exporter, the result array's
   named properties as an adopted layout, a key cache for immediate short strings; the regexp
   routers back in `benchmarks/real/hono/driver.ts`.
+- **R6 — the RegExpRouter's second round.** The alternation's first-character dispatch
+  (`ALT_FIRST`), a megamorphic answer for dynamic-key sites whose keys vary, a root-free string
+  exec, a union of array types as an array receiver in the exporter.
 - **The long tail.** The `v`-mode string properties (the emoji sequence data), the remaining
   divergences the corpus finds.
 
@@ -447,6 +464,41 @@ measurement variant.
   94 -> 91, logs 129 -> 127, search 113 -> 109, path_regexps 125 -> 125); vue 1,080 -> 1,077 ms
   (seven alternating rounds, medians; Node 757) and tsc-ts 22.206 -> 22.200 G instructions are
   unchanged, outputs identical. The RegExpRouter's remaining 2.8x is the next profile's subject.
+- **R6 built (Session 357): the RegExpRouter's second round.** After R5 the RegExpRouter's
+  profile (10 M matches, 119 ns each against Node's ~40) was the matcher 20%, the result array
+  21%, the dynamic key reads 16% (the static route map `matcher[2][path]` misses for most
+  requests, and the global absent table holds one key per (site, shape): every miss refilled it
+  after the probes), roots 3%, and the driver's own reads of hono's `Result<T>` (a union of two
+  tuple types behind an alias, which the exporter's printed-type checks saw as the alias name) as
+  dynamic property gets with numeric keys. (1) The compiler emits `ALT_FIRST` before an alternative
+  with a known non-empty first set ("The alternation's dispatch" above): the next unit outside the
+  set skips the alternative without a choice point, and disjoint first sets push none at all; the
+  interpreter and the native tier implement it, the engine diff runs 43,593 cases with 0 differ
+  in both. (2) `prop_absent_fill_impl` counts a refill of the same site and shape with another key
+  as a miss of the site (`prop_ic_note_miss`), so such a site turns megamorphic, and
+  `ts_get_dyn_pic_checked` then reads through `ts_get` (the plain lookup) instead of the probes.
+  (3) The adapter's `exec_result`: a string input's exec and non-global match root nothing (the
+  regexp is read before the allocations, `build_result` roots the string). (4) The exporter: a
+  union whose every member is an array (`isArrayKindType`) is an array receiver, so `res[0]` is
+  the element path. Fixture `regexp/alternation_dispatch` (disjoint and overlapping alternatives,
+  empty and optional ones, anchors and lookarounds first, back references, case-insensitive and
+  Unicode first characters over Latin-1 and UTF-16 input, lone surrogates, classes and dots first,
+  alternations inside quantifiers and lookbehinds, global and sticky iteration, split and replace,
+  a dynamic pattern beside the literal). hono, five alternating rounds (medians; Node): TrieRouter
+  273 -> 267 ms (255), RegExpRouter 107 -> 87 (42), PatternRouter 269 -> 243 (163), SmartRouter
+  132 -> 111 (43); outputs identical. The RegExpRouter's profile after it (95 ns a match): the
+  matcher 24% (the interpreter near its floor, about 2 ns an op: hono's regexps are built at run
+  time with `new RegExp`, so the AOT native tier does not apply to them, where V8 compiles them
+  just in time), the result array 23%, the dynamic key reads 20% (two reads a match through the
+  key, the map and the chain, each a few calls), the driver's loop and the call through the
+  `match` function value 14%, `indexOf` 4%. Gates: conformance 665/665 plain, 664/665 strict (`node/timers`, the fixture's own
+  recorded race of a 0 ms timer against an immediate under the gate's load; 3/3 alone), 662/662 in
+  units mode and under GC protect, the regexp fixtures under `TSAOT_GC_YOUNG_THRESHOLD=1` with
+  protect mode, unit, bundler 51/51, bench all within budget, the regexp AOT and link gates, GC
+  stress PASSED, the engine diff 43,593 cases 0 differ in the interpreter and the native mode.
+  vue 1,073.7 -> 1,072.4 ms (seven alternating rounds each,
+  medians; outputs identical; Node 770), tsc-ts 22.200 -> 22.199 G instructions (unchanged; outputs
+  identical).
 - Not yet: the `v`-mode properties of strings (`\p{RGI_Emoji}` and the other six; the emoji
   sequence data is in `build/ucd/17.0.0/emoji-seq/`, emoji 16.0 at the time of writing).
 

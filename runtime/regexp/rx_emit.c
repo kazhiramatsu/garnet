@@ -115,6 +115,7 @@ static void emit_fn(emitter* e, const char* name, uint32_t start, uint32_t end){
     switch (op){
       case RX_OP_JMP: target[code[pc + 1]] = 1; break;
       case RX_OP_PUSH_BT: target[code[pc + 1]] = 1; resumes[nres++] = code[pc + 1]; break;
+      case RX_OP_ALT_FIRST: target[code[pc + 2]] = 1; resumes[nres++] = code[pc + 2]; break;
       case RX_OP_CNT_INC_JL: case RX_OP_CNT_JGE: target[code[pc + 3]] = 1; break;
       case RX_OP_LOOP_GREEDY: greedy[ngreedy++] = pc; target[pc + 6] = 1; break;
       case RX_OP_LOOP_LAZY: lazy[nlazy++] = pc; target[pc + 6] = 1; break;
@@ -135,6 +136,21 @@ static void emit_fn(emitter* e, const char* name, uint32_t start, uint32_t end){
       case RX_OP_ACCEPT: case RX_OP_LOOK_END: put(e->out, "*out_pos = pos; return 1;"); break;
       case RX_OP_JMP: put(e->out, "goto L%u;", code[pc + 1]); break;
       case RX_OP_PUSH_BT: put(e->out, "if (rx_bt_push(c, RX_BT_RESUME, %uu, pos, 0)) return RX_EXEC_OVERFLOW;", code[pc + 1]); break;
+      case RX_OP_ALT_FIRST: {
+        /* the alternative's first-character guard (rx_vm_body.h ALT_FIRST): the narrow matcher's units are
+           always below 256 */
+        uint32_t a0 = code[pc + 1], tgt = code[pc + 2], fl = code[pc + 3];
+        char push[96]; snprintf(push, sizeof push, "if (rx_bt_push(c, RX_BT_RESUME, %uu, pos, 0)) return RX_EXEC_OVERFLOW;", tgt);
+        put(e->out, "if (pos >= len) goto L%u; ch = in[pos]; ", tgt);
+        if (e->wide){
+          char skip[32]; snprintf(skip, sizeof skip, "goto L%u;", tgt);
+          put(e->out, "if (ch < 256u){ if (!((rx_n%u_s%ub[ch >> 3] >> (ch & 7u)) & 1u)) goto L%u; %s } else { %s }",
+              e->id, a0, tgt, (fl & RX_ALT_DISJOINT) ? "" : push, (fl & RX_ALT_WIDE) ? push : skip);
+        } else {
+          put(e->out, "if (!((rx_n%u_s%ub[ch >> 3] >> (ch & 7u)) & 1u)) goto L%u; %s", e->id, a0, tgt, (fl & RX_ALT_DISJOINT) ? "" : push);
+        }
+        break;
+      }
       case RX_OP_SAVE: {
         uint32_t r = code[pc + 1];
         put(e->out, "if (rx_bt_push(c, RX_BT_RESTORE, %uu, (uint32_t)regs[%u], 0)) return RX_EXEC_OVERFLOW; regs[%u] = (int32_t)pos;", r, r, r);
@@ -314,7 +330,7 @@ char* rx_emit_c(const rx_program* p, uint32_t id){
     const rx_set* s = &p->sets[k];
     put(&out, "static const uint8_t rx_n%u_s%ub[32] = {", id, k);
     for (uint32_t i = 0; i < 32; i++) put(&out, "%s%u", i ? "," : "", s->bits[i]);
-    put(&out, "};\nstatic const uint32_t rx_n%u_s%ur[%u] = {", id, k, s->nranges ? 2 * s->nranges : 1);
+    put(&out, "};\nstatic const uint32_t rx_n%u_s%ur[%u] __attribute__((unused)) = {", id, k, s->nranges ? 2 * s->nranges : 1);   /* a guard's set (ALT_FIRST) reads only the bits */
     if (s->nranges) for (uint32_t i = 0; i < 2 * s->nranges; i++) put(&out, "%s%uu", i ? "," : "", s->ranges[i]);
     else put(&out, "0u");
     put(&out, "};\n");

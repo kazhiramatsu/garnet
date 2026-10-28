@@ -87,6 +87,11 @@ enum {
   /* loops over a one-character matcher: matcher arg min max */
   RX_OP_LOOP_GREEDY, RX_OP_LOOP_LAZY,
   RX_OP_SAVE_NR,      /* reg: reg = pos without a restore entry (the match bounds: before any choice point, after the last) */
+  RX_OP_ALT_FIRST,    /* set target flags: an alternative's first-character guard. The next unit decides: not in the
+                         set (its bits below 256; above, RX_ALT_WIDE says whether any unit may match), or the end of
+                         the input: goto target, no choice point; in the set: a choice point resuming at target
+                         unless RX_ALT_DISJOINT (the alternatives' first sets are disjoint below 256: no other
+                         alternative can match here), then the alternative's body follows */
   RX_OP__COUNT
 };
 /* flag bits on the opcode word */
@@ -95,6 +100,9 @@ enum {
 #define RX_OP_IU   0x400u    /* WORDB/NWORDB, BACKREF: the ignoreCase+unicode word set / fold compare */
 #define RX_OP_I    0x800u    /* BACKREF: case-insensitive (non-u canonicalize) */
 #define RX_OP_MASK 0xFFu
+/* RX_OP_ALT_FIRST's flags word */
+#define RX_ALT_DISJOINT 1u
+#define RX_ALT_WIDE     2u
 /* the one-character matchers of LOOP_*: the text opcode (CHAR, CHAR_I, CHAR2 (arg = set of two
    packed? no: CHAR2 uses two words), ANY, ANY_ALL, CLASS, NCLASS, CLASS_I, NCLASS_I) */
 

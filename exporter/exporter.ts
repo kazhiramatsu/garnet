@@ -10997,6 +10997,15 @@ class Exporter {
   private isRegExpResultSymbol(sym: ts.Symbol): boolean {
     return (sym.name === "RegExpMatchArray" || sym.name === "RegExpExecArray") && this.isAmbientGlobalSymbol(sym);
   }
+  /** An array at run time: an array or tuple type, a RegExp result type, or an interface derived
+   *  from Array (the member test of a union of arrays). */
+  private isArrayKindType(m: ts.Type): boolean {
+    if (this.checker.isArrayType(m) || this.checker.isTupleType(m)) return true;
+    const sym = m.getSymbol();
+    if (!sym) return false;
+    if (this.isRegExpResultSymbol(sym)) return true;
+    return !this.isAmbientGlobalSymbol(sym) && this.arrayInterfaces && this.isArrayDerivedType(m, 0);
+  }
   private isArrayDerivedType(t: ts.Type, depth: number): boolean {
     if (depth > 6 || !(t.flags & ts.TypeFlags.Object)) return false;
     if (this.checker.isArrayType(t)) return true;
@@ -11077,6 +11086,10 @@ class Exporter {
       // builtin kind: its printed form would otherwise classify it by its first
       // member. Unions of one kind (with null / undefined) keep the checks below.
       if ((t.flags & F.Union) && this.unionMixesKinds(t as ts.UnionType)) return undefined;
+      // A union whose every member is an array (hono's `Result<T>`: two tuple types behind an
+      // alias, which the printed form below shows as the alias name): an array receiver, so an
+      // element read is the element path and not a dynamic property get with a numeric key.
+      if ((t.flags & F.Union) && (t as ts.UnionType).types.every((m) => this.isArrayKindType(m))) return "array";
       if (t.flags & (F.String | F.StringLiteral)) return "string";
       const sym = t.getSymbol();
       // A user class shadowing a builtin name (`class Map {}`) is NOT a builtin

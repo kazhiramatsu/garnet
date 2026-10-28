@@ -449,14 +449,22 @@ tsv ts_regexp_adapter_object_test_tsv(tsv re, tsv input){
   ts_gc_unroot(3);
   return ts_bool(m);
 }
-tsv ts_regexp_adapter_object_exec_tsv(tsv re, tsv input){
-  require_regexp(re, "RegExp.prototype.exec");
-  ts_gc_root(&re); ts_gc_root(&input);
-  tsv s = to_str(input); ts_gc_root(&s);
+/* exec on a string: RegExpBuiltinExec and the result array. No roots of its own: the regexp is read
+   before the allocations (builtin_exec roots it itself on the path that runs user code), and
+   build_result roots the string while it allocates. */
+static tsv exec_result(tsv re, tsv s){
   capsbuf cb; caps_init_n(&cb, as_re(re)->ncaps);
   int m = builtin_exec(re, s, cb.v);
   tsv r = m ? build_result(s, cb.v, as_re(re)->prog) : TS_NULL;
   caps_free(&cb);
+  return r;
+}
+tsv ts_regexp_adapter_object_exec_tsv(tsv re, tsv input){
+  require_regexp(re, "RegExp.prototype.exec");
+  if (ts_is_str(input)) return exec_result(re, input);
+  ts_gc_root(&re); ts_gc_root(&input);
+  tsv s = to_str(input); ts_gc_root(&s);
+  tsv r = exec_result(re, s);
   ts_gc_unroot(3);
   return r;
 }
@@ -478,11 +486,12 @@ double ts_regexp_adapter_object_search_tsv(tsv input, tsv re){
 /* @@match: one exec, or the array of every match for a global regexp */
 tsv ts_regexp_adapter_object_match_tsv(tsv input, tsv re){
   require_regexp(re, "RegExp.prototype[Symbol.match]");
+  uint32_t flags = as_re(re)->flags;
+  if (!(flags & TSAOT_REGEXP_FLAG_GLOBAL) && ts_is_str(input)) return exec_result(re, input);   /* `path.match(re)`: no roots */
   ts_gc_root(&re); ts_gc_root(&input);
   tsv s = to_str(input); ts_gc_root(&s);
-  uint32_t flags = as_re(re)->flags;
   if (!(flags & TSAOT_REGEXP_FLAG_GLOBAL)){
-    tsv r = ts_regexp_adapter_object_exec_tsv(re, s);
+    tsv r = exec_result(re, s);
     ts_gc_unroot(3);
     return r;
   }

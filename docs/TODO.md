@@ -11558,3 +11558,34 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   gates, GC stress PASSED. vue 1,080.0 -> 1,077.2 ms
   (seven alternating rounds each, medians; outputs identical; Node 757), tsc-ts 22.206 -> 22.200 G
   instructions (unchanged; outputs identical; the build 253 s at three jobs, plain).
+- R6 of the regexp VM: the RegExpRouter's second round (docs/regexp_vm_design.md "R6 built").
+  Kaz asked whether a VM engine should still be this far from V8 (the RegExpRouter at 2.8x after
+  R5); the profile said no: the matcher was 20% of the time and the rest was around it. Four
+  changes. (1) The alternation's first-character dispatch (`RX_OP_ALT_FIRST`, "The alternation's
+  dispatch" in the design doc): an alternative whose first set is known and non-empty is entered
+  only when the next unit is in the set, with no choice point when the alternatives' first sets are
+  disjoint below 256 (hono's route regexp, a scanner's keyword alternation); the interpreter and
+  the native emitter implement it, the engine diff 43,593 cases 0 differ in both modes. (2) A
+  dynamic-key site whose absent keys vary (hono's static route map probed with each request's path)
+  refilled the global absent table's one entry per (site, shape) after the probes on every read:
+  `prop_absent_fill_impl` counts such a refill as a miss of the site, the site turns megamorphic
+  and `ts_get_dyn_pic_checked` reads through the plain lookup. (3) The adapter's `exec_result`: a
+  string input's exec and non-global match root nothing (eight root pushes a match before). (4) The
+  exporter: a union whose every member is an array (hono's `Result<T>`, two tuple types behind an
+  alias; the printed form is the alias name, which the structural checks could not read) is an
+  array receiver, so `res[0]` is the element path, not a dynamic property get with a numeric key.
+  Fixture `regexp/alternation_dispatch`. hono, five alternating rounds (medians; Node): TrieRouter
+  273 -> 267 ms (255), RegExpRouter 107 -> 87 (42), PatternRouter 269 -> 243 (163), SmartRouter
+  132 -> 111 (43); outputs identical. The regexp kernels within their spread (tokenizer 137 -> 142,
+  validate 91 -> 90, logs 127 -> 130, search 109 -> 113, path_regexps 125 -> 129; Node 119 / 87 /
+  116 / 114 / 114 in the same run). The RegExpRouter's profile after R6 (95 ns a match): the matcher
+  24%, about 2 ns an op (hono builds its regexps at run time, so the native tier does not apply;
+  V8 compiles them just in time), the result array 23%, the dynamic key reads 20%, the driver's
+  loop and the call through the `match` function value 14%, `indexOf` 4%. Gates: conformance 665/665 plain, 664/665 strict (`node/timers`, the fixture's own
+  recorded race of a 0 ms timer against an immediate under the gate's load; 3/3 alone), 662/662 in
+  units mode and under GC protect, the regexp fixtures under `TSAOT_GC_YOUNG_THRESHOLD=1` with
+  protect mode, unit, bundler 51/51, bench all within budget, the regexp AOT and link gates, GC
+  stress PASSED, the engine diff 43,593 cases 0 differ in the interpreter and the native mode.
+  vue 1,073.7 -> 1,072.4 ms (seven alternating rounds each,
+  medians; outputs identical; Node 770), tsc-ts 22.200 -> 22.199 G instructions (unchanged; outputs
+  identical).

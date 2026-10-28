@@ -126,7 +126,7 @@ static int RUN_NAME(rx_ctx* c, uint32_t pc, uint32_t pos, uint32_t base, uint32_
     &&L_FAIL, &&L_ACCEPT, &&L_LOOK_END, &&L_JMP, &&L_PUSH_BT, &&L_SAVE, &&L_CLEAR, &&L_CNT_INIT, &&L_CNT_INC_JL, &&L_CNT_JGE,
     &&L_EMPTY_START, &&L_EMPTY_CHECK, &&L_EMPTY_CHECK_OPT, &&L_LOOK, &&L_BACKREF, &&L_BACKREF_LIST, &&L_BOL, &&L_EOL, &&L_BOL_M, &&L_EOL_M,
     &&L_WORDB, &&L_NWORDB, &&L_CHAR, &&L_CHAR_I, &&L_CHAR2, &&L_CHARS, &&L_ANY, &&L_ANY_ALL, &&L_CLASS, &&L_NCLASS, &&L_CLASS_I, &&L_NCLASS_I,
-    &&L_STRINGS, &&L_LOOP_GREEDY, &&L_LOOP_LAZY, &&L_SAVE_NR };
+    &&L_STRINGS, &&L_LOOP_GREEDY, &&L_LOOP_LAZY, &&L_SAVE_NR, &&L_ALT_FIRST };
   #define DISPATCH() do { w = code[pc]; goto *dispatch[w & RX_OP_MASK]; } while (0)
   DISPATCH();
 #else
@@ -175,6 +175,21 @@ static int RUN_NAME(rx_ctx* c, uint32_t pc, uint32_t pos, uint32_t base, uint32_
     *out_pos = pos; return 1;
   CASE(JMP): pc = code[pc + 1]; DISPATCH();
   CASE(PUSH_BT): PUSH(RX_BT_RESUME, code[pc + 1], pos, 0); pc += 2; DISPATCH();
+  CASE(ALT_FIRST): {
+    /* an alternative's first-character guard (rx_compile.c, the alternation): the next unit says whether
+       this alternative can match here and whether the rest of the alternation needs a choice point */
+    uint32_t tgt = code[pc + 2], fl = code[pc + 3];
+    if (pos >= len){ pc = tgt; DISPATCH(); }
+    ch = CU(pos);
+    if (ch < 256u){
+      if (!((c->p->sets[code[pc + 1]].bits[ch >> 3] >> (ch & 7u)) & 1u)){ pc = tgt; DISPATCH(); }
+      if (!(fl & RX_ALT_DISJOINT)) PUSH(RX_BT_RESUME, tgt, pos, 0);
+    } else {
+      if (!(fl & RX_ALT_WIDE)){ pc = tgt; DISPATCH(); }
+      PUSH(RX_BT_RESUME, tgt, pos, 0);
+    }
+    pc += 4; DISPATCH();
+  }
   CASE(SAVE): { uint32_t r = code[pc + 1]; PUSH(RX_BT_RESTORE, r, (uint32_t)regs[r], 0); regs[r] = (int32_t)pos; pc += 2; DISPATCH(); }
   CASE(SAVE_NR): regs[code[pc + 1]] = (int32_t)pos; pc += 2; DISPATCH();
   CASE(CLEAR): {

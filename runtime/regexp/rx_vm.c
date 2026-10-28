@@ -156,7 +156,7 @@ static const char* op_name(uint32_t op){
     "FAIL", "ACCEPT", "LOOK_END", "JMP", "PUSH_BT", "SAVE", "CLEAR", "CNT_INIT", "CNT_INC_JL", "CNT_JGE",
     "EMPTY_START", "EMPTY_CHECK", "EMPTY_CHECK_OPT", "LOOK", "BACKREF", "BACKREF_LIST", "BOL", "EOL", "BOL_M", "EOL_M",
     "WORDB", "NWORDB", "CHAR", "CHAR_I", "CHAR2", "CHARS", "ANY", "ANY_ALL", "CLASS", "NCLASS", "CLASS_I", "NCLASS_I",
-    "STRINGS", "LOOP_GREEDY", "LOOP_LAZY", "SAVE_NR" };
+    "STRINGS", "LOOP_GREEDY", "LOOP_LAZY", "SAVE_NR", "ALT_FIRST" };
   return op < RX_OP__COUNT ? names[op] : "?";
 }
 uint32_t rx_op_len(const uint32_t* code, uint32_t pc){
@@ -166,7 +166,7 @@ uint32_t rx_op_len(const uint32_t* code, uint32_t pc){
     case RX_OP_BACKREF: case RX_OP_CHAR: case RX_OP_CHAR_I: case RX_OP_CLASS: case RX_OP_NCLASS: case RX_OP_CLASS_I: case RX_OP_NCLASS_I: case RX_OP_STRINGS:
       return 2;
     case RX_OP_CLEAR: case RX_OP_CHAR2: case RX_OP_LOOK: return 3;
-    case RX_OP_CNT_INC_JL: case RX_OP_CNT_JGE: case RX_OP_EMPTY_CHECK_OPT: return 4;
+    case RX_OP_CNT_INC_JL: case RX_OP_CNT_JGE: case RX_OP_EMPTY_CHECK_OPT: case RX_OP_ALT_FIRST: return 4;
     case RX_OP_BACKREF_LIST: return 2 + code[pc + 1];
     case RX_OP_CHARS: return 2 + code[pc + 1];
     case RX_OP_LOOP_GREEDY: case RX_OP_LOOP_LAZY: return 6;

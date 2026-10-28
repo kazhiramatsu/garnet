@@ -17974,6 +17974,11 @@ static void prop_absent_fill_impl(ts_prop_ic* ic, ts_object* o, ts_key key, int 
     chain_shape[depth] = p->shape; depth++;
   }
   ts_prop_absent_entry* e = &g_prop_absent_cache[prop_absent_slot(ic, o->shape)];
+  /* the same site and shape with another absent key: a dynamic-key site whose keys vary (hono's
+     static route map probed with each request's path); each such refill is a miss of the site's
+     caches, and after enough of them the site is megamorphic and the dynamic read takes the plain
+     lookup (ts_get_dyn_pic_checked) instead of probing, filling and refilling per read */
+  if (e->site == ic && e->shape == o->shape && e->key != key && e->epoch == g_prop_add_epoch) prop_ic_note_miss(ic);
   e->site = ic; e->shape = o->shape; e->key = key; e->epoch = g_prop_add_epoch; e->depth = depth;
   for (uint8_t i = 0; i < depth; i++) e->proto_shape[i] = chain_shape[i];
   if (site) prop_absent_site_fill(ic, o, key, e);
@@ -18279,7 +18284,9 @@ tsv ts_get_dyn_pic_checked(tsv obj, tsv keyv, ts_prop_ic* ic){
     ts_gc_root(&obj);
     ts_key key;
     int ok = ts_key_from_value(keyv, &key);
-    tsv result = ok ? ts_get_pic_checked(obj, key, ic) : TS_UNDEFINED;
+    /* a megamorphic site (its keys vary: a map keyed by the request's path) reads without the
+       caches, as the slow path would after its probes */
+    tsv result = !ok ? TS_UNDEFINED : (ic && ic->megamorphic) ? ts_get(obj, key) : ts_get_pic_checked(obj, key, ic);
     ts_gc_unroot(1);
     return result;
   }

@@ -84,6 +84,20 @@ static uint32_t add_set(cstate* c, const rx_cpset* s){
   return c->nsets - 1;
 }
 
+/* a set of the units below 256 only (an alternative's first-character guard reads the bits) */
+static uint32_t add_set_bits(cstate* c, const uint8_t* bits){
+  if (c->nsets == c->sets_cap){
+    uint32_t cap = c->sets_cap ? c->sets_cap * 2 : 8;
+    rx_set* n = (rx_set*)realloc(c->sets, sizeof(rx_set) * cap);
+    if (!n) abort();
+    c->sets = n; c->sets_cap = cap;
+  }
+  rx_set* t = &c->sets[c->nsets];
+  memcpy(t->bits, bits, 32); t->ranges = NULL; t->nranges = 0; t->base = NULL;
+  c->nsets++;
+  return c->nsets - 1;
+}
+
 /* ---- analysis ---- */
 static uint32_t cp_units(uint32_t cp){ return cp >= 0x10000u ? 2u : 1u; }
 static uint32_t min_len(cstate* c, rx_node* n){
@@ -453,12 +467,35 @@ static void compile_node(cstate* c, rx_node* n){
     }
     case RX_N_ALT: {
       uint32_t* ends = (uint32_t*)rx_arena_alloc(c->a, sizeof(uint32_t) * n->nkids); uint32_t nends = 0;
+      /* The first-character guards (docs/regexp_vm_design.md "The alternation's dispatch"): an
+         alternative whose first set is known (exact below 256, `wide` above) and cannot be empty is
+         entered only when the next unit is in its set, so an alternative that cannot match here costs
+         one test and no choice point; and when every alternative has such a set and the sets are
+         pairwise disjoint below 256, entering one needs no choice point for the rest (none of them
+         can match here: hono's route alternation, a scanner's keyword alternation). A lookbehind body
+         is matched backward: its alternatives keep the plain choice points. */
+      firstset* fs = (firstset*)rx_arena_alloc(c->a, sizeof(firstset) * n->nkids);
+      int guard_all = !c->bw;
+      for (uint32_t i = 0; i < n->nkids; i++){
+        memset(&fs[i], 0, sizeof fs[i]); fs[i].valid = 1; int nb = 1;
+        if (!c->bw) first_of(c, n->kids[i], &fs[i], &nb);
+        if (c->bw || !fs[i].valid || nb){ fs[i].valid = 0; guard_all = 0; }
+      }
+      int disjoint = guard_all;
+      for (uint32_t i = 0; disjoint && i < n->nkids; i++)
+        for (uint32_t j = i + 1; disjoint && j < n->nkids; j++)
+          for (uint32_t k = 0; k < 32; k++) if (fs[i].bits[k] & fs[j].bits[k]){ disjoint = 0; break; }
       for (uint32_t i = 0; i < n->nkids; i++){
         int last = i + 1 == n->nkids;
-        uint32_t bt = 0;
-        if (!last){ emit(c, RX_OP_PUSH_BT); bt = emit_label(c); }
+        uint32_t next = 0;
+        if (!last){
+          if (fs[i].valid){
+            emit(c, RX_OP_ALT_FIRST); emit(c, add_set_bits(c, fs[i].bits)); next = emit_label(c);
+            emit(c, (disjoint ? RX_ALT_DISJOINT : 0u) | (fs[i].wide ? RX_ALT_WIDE : 0u));
+          } else { emit(c, RX_OP_PUSH_BT); next = emit_label(c); }
+        }
         compile_node(c, n->kids[i]);
-        if (!last){ emit(c, RX_OP_JMP); ends[nends++] = emit_label(c); patch(c, bt, here(c)); }
+        if (!last){ emit(c, RX_OP_JMP); ends[nends++] = emit_label(c); patch(c, next, here(c)); }
       }
       for (uint32_t i = 0; i < nends; i++) patch(c, ends[i], here(c));
       return;
