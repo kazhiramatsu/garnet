@@ -73,7 +73,7 @@ Rust in §315; selfhost is kept as a performance metric).
 - **Whole-program AOT is inherently bundling-oriented.** `ts.Symbol` keying + the checker's alias
   resolution make module linking almost free.
 - **When you add a new field to an IR struct (Local/ClassDef etc.), you must also update the
-  construction sites in `analyzer/.../sroa.rs` and the 4 literal files under `tests/*.rs`.**
+  construction sites in `analyzer/.../sroa.rs` and the literal files under `tests/*.rs` (six build a `Function` literal as of Session 356).**
 - **GC: a function that allocates must root its live tsv arguments** (root/unroot around clone/new).
   Confirm with the GC-stress probe.
 - **When a closure captures a loop variable, writes to the variable must always go through the capture

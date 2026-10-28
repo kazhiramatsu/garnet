@@ -14156,6 +14156,102 @@ class Exporter {
     }
   }
 
+  /** The context-derived name a function's C symbol carries (`fn_<id>_<name>`; docs/agent_workflow.md,
+   *  "Profiling a native build"): a class member is `Dep_track` / `Dep_get_dirty` / `Dep_ctor`, a named
+   *  function its name, and an anonymous function the binding or property it is assigned to, the callee
+   *  it is passed to (`reactivityRound_map`) or its enclosing function (`track_arrow`). The id keeps the
+   *  symbol unique; this only has to read well in a profile or a backtrace. The JS-visible `fn.name`
+   *  is the IR function's `name`, not this. */
+  private debugNames = new Map<ts.Node, string>();
+  debugNameOf(node: ts.Node): string {
+    const cached = this.debugNames.get(node);
+    if (cached !== undefined) return cached;
+    let raw: string;
+    try { raw = this.debugNameRaw(node); } catch { raw = "anon"; }
+    const name = raw.replace(/[^A-Za-z0-9_]+/g, "_").replace(/_+$/, "").slice(0, 64) || "anon";
+    this.debugNames.set(node, name);
+    return name;
+  }
+  /** The static text of a member's key: an identifier, a string or number literal, a private name,
+   *  or a well-known symbol (`[Symbol.iterator]`); undefined for any other computed key. */
+  private memberKeyName(nm: ts.PropertyName | undefined): string | undefined {
+    if (!nm) return undefined;
+    if (ts.isIdentifier(nm) || ts.isPrivateIdentifier(nm) || ts.isStringLiteral(nm) || ts.isNumericLiteral(nm) ||
+        ts.isNoSubstitutionTemplateLiteral(nm)) return nm.text;
+    if (ts.isComputedPropertyName(nm) && ts.isPropertyAccessExpression(nm.expression) &&
+        ts.isIdentifier(nm.expression.expression) && nm.expression.expression.text === "Symbol") {
+      return `[Symbol.${nm.expression.name.text}]`;
+    }
+    return undefined;
+  }
+  private debugNameRaw(node: ts.Node): string {
+    const owner = (): string => {
+      const p = node.parent;
+      if (p && ts.isClassLike(p)) return p.name?.text ?? "class";
+      return this.enclosingDebugName(node);   // an object-literal member: its enclosing function
+    };
+    if (ts.isConstructorDeclaration(node)) return `${owner()}_ctor`;
+    if (ts.isMethodDeclaration(node)) return `${owner()}_${this.memberKeyName(node.name) ?? "method"}`;
+    if (ts.isGetAccessorDeclaration(node)) return `${owner()}_get_${this.memberKeyName(node.name) ?? "key"}`;
+    if (ts.isSetAccessorDeclaration(node)) return `${owner()}_set_${this.memberKeyName(node.name) ?? "key"}`;
+    if ((ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node)) && node.name) return node.name.text;
+    // an anonymous function: the binding, property or callee it is handed to, else its enclosing function
+    const kind = ts.isArrowFunction(node) ? "arrow" : "fn";
+    let p: ts.Node | undefined = node.parent;
+    while (p && (ts.isParenthesizedExpression(p) || ts.isAsExpression(p) || ts.isTypeAssertionExpression(p) ||
+                 ts.isNonNullExpression(p))) p = p.parent;
+    if (p) {
+      if (ts.isVariableDeclaration(p) && ts.isIdentifier(p.name)) return p.name.text;
+      if (ts.isPropertyAssignment(p)) return `${this.enclosingDebugName(node)}_${this.memberKeyName(p.name) ?? kind}`;
+      if (ts.isPropertyDeclaration(p)) {
+        const c = p.parent;
+        return `${(ts.isClassLike(c) && c.name?.text) || "class"}_${this.memberKeyName(p.name) ?? kind}`;
+      }
+      if (ts.isBinaryExpression(p) && p.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+        if (ts.isIdentifier(p.left)) return p.left.text;
+        if (ts.isPropertyAccessExpression(p.left)) return `${this.enclosingDebugName(node)}_${p.left.name.text}`;
+      }
+      if (ts.isCallExpression(p) || ts.isNewExpression(p)) {
+        const callee = p.expression;
+        const cn = ts.isIdentifier(callee) ? callee.text : ts.isPropertyAccessExpression(callee) ? callee.name.text : undefined;
+        if (cn) return `${this.enclosingDebugName(node)}_${cn}`;
+      }
+    }
+    return `${this.enclosingDebugName(node)}_${kind}`;
+  }
+  private enclosingDebugName(node: ts.Node): string {
+    const isBody = (n: ts.Node) => ts.isFunctionDeclaration(n) || ts.isFunctionExpression(n) || ts.isArrowFunction(n) ||
+      ts.isMethodDeclaration(n) || ts.isGetAccessorDeclaration(n) || ts.isSetAccessorDeclaration(n) ||
+      ts.isConstructorDeclaration(n) || ts.isClassStaticBlockDeclaration(n);
+    let p = node.parent;
+    while (p && !isBody(p)) p = p.parent;
+    if (!p) return "top";
+    if (ts.isClassStaticBlockDeclaration(p)) {
+      const c = p.parent;
+      return `${(ts.isClassLike(c) && c.name?.text) || "class"}_static`;
+    }
+    return this.debugNameOf(p);
+  }
+  /** `file:line:col` of a function's source (the file relative to the working directory), carried
+   *  by the IR function and written as a comment at the head of its C body; undefined for a
+   *  synthesized node. */
+  private srcFileNames = new Map<string, string>();
+  srcOf(node: ts.Node): string | undefined {
+    try {
+      const sf = node.getSourceFile();
+      if (!sf || node.pos < 0) return undefined;
+      let rel = this.srcFileNames.get(sf.fileName);
+      if (rel === undefined) {
+        rel = path.relative(process.cwd(), sf.fileName).replace(/\\/g, "/");
+        if (rel.startsWith("..")) rel = sf.fileName;
+        this.srcFileNames.set(sf.fileName, rel);
+      }
+      const lc = sf.getLineAndCharacterOfPosition(node.getStart(sf));
+      return `${rel}:${lc.line + 1}:${lc.character + 1}`;
+    } catch {
+      return undefined;
+    }
+  }
   lowerFunctionLike(node: FnLike, fnId: number, isExported: boolean, thisParam = false, classId?: number, staticThis = false) {
     // Idempotent: each fnId is a distinct function body, lowered exactly once. A
     // node may reach here twice (a field-initializer/installed-method closure that
@@ -14458,6 +14554,15 @@ class Exporter {
       else if (par && ts.isPropertyAssignment(par) && ts.isIdentifier(par.name)) displayName = par.name.text;
       else if (par && ts.isBinaryExpression(par) && par.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isIdentifier(par.left)) displayName = par.left.text;
       else displayName = "";
+    } else if (ts.isMethodDeclaration(node as ts.Node) || ts.isGetAccessorDeclaration(node as ts.Node) ||
+               ts.isSetAccessorDeclaration(node as ts.Node)) {
+      // A class or object-literal member is named after its key, an accessor "get x" / "set x"
+      // (V8); a computed key other than a well-known symbol has no static name here. (The
+      // member's C symbol is the debugName below; this is what `fn.name` reads.)
+      const m = node as unknown as ts.MethodDeclaration | ts.AccessorDeclaration;
+      const key = this.memberKeyName(m.name);
+      displayName = key === undefined ? "" : ts.isGetAccessorDeclaration(m) ? `get ${key}` :
+        ts.isSetAccessorDeclaration(m) ? `set ${key}` : key;
     }
     this.functions.push({
       id: ctx.id,
@@ -14477,6 +14582,8 @@ class Exporter {
       hasPrototype: !name.startsWith("__") &&
         (ts.isFunctionDeclaration(node as ts.Node) || ts.isFunctionExpression(node as ts.Node)) &&
         !isAsync && !isGenerator,
+      debugName: this.debugNameOf(node as ts.Node),
+      src: this.srcOf(node as ts.Node),
     });
     if (isExported) this.exports.push(ctx.id);
   }

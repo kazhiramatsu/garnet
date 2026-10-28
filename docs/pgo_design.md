@@ -101,7 +101,10 @@ and is 64 MB against 41 MB.
   those after it, and a stale profile then misses them all (clang matches by
   name). Reuse across edits is worth what the names are worth; a name derived
   from the module path and the declaration (a hash, with a disambiguator)
-  would let a profile survive unrelated edits. Not done in this slice.
+  would let a profile survive unrelated edits. Not done in this slice. (Since
+  Session 356 the name part is the context-derived debug name, `Dep_track` or
+  `reactivityRound_map`, which does not move with unrelated edits either; the
+  id still does.)
 - **The benchmark profile comes from the workload it is measured on.** That is
   how a compiler is tuned (and what the benchmark's other side does); the
   cross-input measurement below says how much of the gain survives a different

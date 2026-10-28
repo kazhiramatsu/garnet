@@ -517,6 +517,15 @@ pub struct Function {
     /// accessors, builtins, and synthetic functions.
     #[serde(default)]
     pub has_prototype: bool,
+    /// The context-derived name the C symbol carries (`fn_<id>_<debug_name>`: `Dep_track`,
+    /// `Dep_get_dirty`, `reactivityRound_map`, `track_arrow`), for profiles and backtraces.
+    /// `name` stays the JS-visible one (`fn.name`).
+    #[serde(default)]
+    pub debug_name: Option<String>,
+    /// `file:line:col` of the function's source, relative to the exporter's working
+    /// directory; written as a comment at the head of the C body.
+    #[serde(default)]
+    pub src: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

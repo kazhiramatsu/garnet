@@ -2,8 +2,26 @@
 # Reads a macOS `sample` call graph (the profile of a real-project driver built with `garnet --profile`,
 # docs/real_projects.md) and prints the shares a flat view hides: inclusive samples by symbol, the
 # self samples under one subtree by leaf, the callers of a symbol aggregated by chain, its callees,
-# and the tree of a subtree above a sample threshold (Session 355).
-import re, sys, collections
+# and the tree of a subtree above a sample threshold (Session 355). `-c <generated C file or units
+# dir>` before the arguments annotates each generated function with the `/* src: file:line:col */`
+# comment its C body starts with (Session 356).
+import re, sys, collections, os
+srcmap = {}
+if len(sys.argv) > 2 and sys.argv[1] == "-c":
+    cpath = sys.argv[2]; del sys.argv[1:3]
+    FN_SRC = re.compile(r'^[\w ]*?\b(fn_\w+)\([^)]*\)\s*\{\s*\n\s*/\* src: (.*?) \*/', re.M)
+    files = [os.path.join(cpath, n) for n in sorted(os.listdir(cpath)) if n.endswith(".c")] if os.path.isdir(cpath) else [cpath]
+    for cf in files:
+        for m in FN_SRC.finditer(open(cf, errors="replace").read()): srcmap.setdefault(m.group(1), m.group(2))
+def top(counter, n):
+    return sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))[:n]
+def annotate(sym):
+    base = sym
+    while base not in srcmap:
+        m = re.match(r'(.*)(?:_d|_i64|_f64|_resume|__i)$', base)
+        if not m: return sym
+        base = m.group(1)
+    return f"{sym} [{srcmap[base]}]"
 f, mode = sys.argv[1], sys.argv[2]
 lines = open(f).read().split("\n")
 # the call-graph section: lines between "Call graph:" and "Total number in stack"
@@ -48,7 +66,7 @@ if mode == "incl":
         if self_c <= 0: continue
         for sname in set(chain(i)):
             incl[sname] += self_c
-    for sym, c in incl.most_common(n): print(f"{c:6d} {sym}")
+    for sym, c in top(incl, n): print(f"{c:6d} {annotate(sym)}")
 elif mode == "callers":
     target = sys.argv[3]; depth = int(sys.argv[4]) if len(sys.argv) > 4 else 3
     agg = collections.Counter()
@@ -62,7 +80,7 @@ elif mode == "callers":
         ch = chain(i)[1:depth+1]
         agg[" <- ".join(ch)] += c
     tot = 0
-    for k, c in agg.most_common(25): print(f"{c:6d} {target} <- {k}")
+    for k, c in top(agg, 25): print(f"{c:6d} {target} <- {' <- '.join(annotate(x) for x in k.split(' <- '))}")
 elif mode == "callees":
     target = sys.argv[3]; n = int(sys.argv[4]) if len(sys.argv) > 4 else 25
     agg = collections.Counter(); selfc = 0
@@ -73,7 +91,7 @@ elif mode == "callees":
         if p >= 0 and nodes[p][2] == target: agg[sym] += c
         if sym == target: selfc += c - children[i]
     print(f"self {selfc}")
-    for k, c in agg.most_common(n): print(f"{c:6d} {k}")
+    for k, c in top(agg, n): print(f"{c:6d} {annotate(k)}")
 if mode == "tree":
     thr = int(sys.argv[3]) if len(sys.argv) > 3 else 20
     start = sys.argv[4] if len(sys.argv) > 4 else None
@@ -83,7 +101,7 @@ if mode == "tree":
             if sym == start: base = d
             else: continue
         if start and d < base: break
-        if c >= thr: print("  " * ((d - (base or 0)) // 2) + f"{c} {sym}")
+        if c >= thr: print("  " * ((d - (base or 0)) // 2) + f"{c} {annotate(sym)}")
 if mode == "selfcallers":
     targets = sys.argv[3].split(","); depth = int(sys.argv[4]) if len(sys.argv) > 4 else 2
     children = collections.defaultdict(int)
@@ -97,8 +115,8 @@ if mode == "selfcallers":
             if sc <= 0: continue
             tot += sc
             agg[" <- ".join(chain(i)[1:depth+1])] += sc
-        print(f"## {target}: self {tot}")
-        for k, c in agg.most_common(12): print(f"  {c:5d} <- {k}")
+        print(f"## {annotate(target)}: self {tot}")
+        for k, c in top(agg, 12): print(f"  {c:5d} <- {' <- '.join(annotate(x) for x in k.split(' <- '))}")
 if mode == "leaves":
     root = sys.argv[3]; n = int(sys.argv[4]) if len(sys.argv) > 4 else 40
     children = collections.defaultdict(int)
@@ -110,4 +128,4 @@ if mode == "leaves":
         if sc <= 0 or root not in chain(i): continue
         agg[sym] += sc; tot += sc
     print(f"self samples under {root}: {tot}")
-    for k, c in agg.most_common(n): print(f"{c:6d} {k}")
+    for k, c in top(agg, n): print(f"{c:6d} {annotate(k)}")

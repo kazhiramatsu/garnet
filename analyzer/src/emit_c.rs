@@ -923,6 +923,10 @@ fn emit_program_with_string_plans(
                 };
                 let var = format!("_c{}_m{}", c.id.0, idx);
                 let _ = writeln!(s, "  tsv {} = ts_make_fn_t({}, 0, 0, {});", var, fname, tt);
+                // `fn.name` / `fn.length` of the member (V8: the key, "get x" / "set x")
+                if mfn.is_some() {
+                    let _ = writeln!(s, "  ts_set_fn_meta({0}, FN_ARITY[{1}], FN_NAME[{1}]);", var, m.func.0);
+                }
                 let _ = writeln!(
                     s,
                     "  ts_define_data(CLASS_PROTO[{}], {}, {}, 0, 1, 1);",
@@ -1166,7 +1170,7 @@ fn emit_program_with_string_plans(
         entry_fn = program
             .functions
             .iter()
-            .find(|f| f.name.as_deref() == Some("main"))
+            .find(|f| f.name.as_deref() == Some("main") && !f.takes_this)
             .or_else(|| program.functions.first());
     }
     if iso_mode() {
@@ -1258,12 +1262,29 @@ fn emit_program_with_string_plans(
     s
 }
 
+/// The C symbol of a function: `fn_<id>_<name>` with the exporter's context-derived debug
+/// name (`Dep_track`, `reactivityRound_map`), else its JS name, else the id alone.
 fn cname(f: &Function) -> String {
-    match &f.name {
-        Some(n) if !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') => {
-            format!("fn_{}_{}", f.id.0, n)
+    fn usable(n: &Option<String>) -> Option<&str> {
+        match n {
+            Some(n) if !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') => {
+                Some(n.as_str())
+            }
+            _ => None,
         }
-        _ => format!("fn_{}", f.id.0),
+    }
+    match usable(&f.debug_name).or_else(|| usable(&f.name)) {
+        Some(n) => format!("fn_{}_{}", f.id.0, n),
+        None => format!("fn_{}", f.id.0),
+    }
+}
+/// The source-position comment at the head of a function's C body (`/* src: file:line:col */`),
+/// read by scripts/sample_tree.py and scripts/prof_pc.py to annotate a profile; empty when the
+/// exporter gave none (a synthesized function).
+fn src_comment(f: &Function) -> String {
+    match &f.src {
+        Some(src) if !src.contains("*/") => format!("  /* src: {} */\n", src),
+        _ => String::new(),
     }
 }
 fn i64_cname(f: &Function) -> String {
@@ -5131,6 +5152,7 @@ fn param_kind(id: u32, int_local: &BTreeSet<u32>, unboxed: &BTreeSet<u32>) -> Pa
 /// missing argument keeps the value the generic prologue left in place.
 fn emit_direct_forwarder(s: &mut String, f: &Function, sig: &DirectSig, ncap: usize) {
     let _ = writeln!(s, "static tsv {}(tsv* args, int nargs){{", cname(f));
+    s.push_str(&src_comment(f));
     s.push_str("  (void)args; (void)nargs;\n");
     if ncap > 0 {
         s.push_str("  tsv* _env = g_ts_cur_env;\n");
@@ -9685,6 +9707,7 @@ fn emit_function(
             wksym,
             fn_takes_this,
             cur_capture_count: own_capture_count(f),
+            this_local: this_local_of(f, fclass),
             i64_fast,
             f64_fast,
             direct_sigs,
@@ -10142,6 +10165,7 @@ fn emit_function(
         wksym,
         fn_takes_this,
         cur_capture_count: own_capture_count(f),
+        this_local: this_local_of(f, fclass),
         i64_fast,
         f64_fast,
         direct_sigs,
@@ -11059,8 +11083,15 @@ fn receiver_class(ctx: &Ctx, obj: u32, cls: u32, field: u32) -> (Option<u32>, Op
     // the analysis's class is flow-insensitive: a downcast's copy keeps the
     // parameter's class, which may lack the field the hint's class has
     if let Some(c) = known {
-        if struct_direct_offset(c, field, ctx.classes).is_some() {
+        if struct_offset_for(ctx, obj, c, field, &None).is_some() {
             return (Some(c), None);
+        }
+        // a parameter or allocation of an unstable class with a class interval: the interval
+        // guard, as a hinted receiver of such a class takes (docs/hidden_class_design.md S0)
+        if class_hints_enabled() {
+            if let Some(g @ HintGuard::Range { .. }) = hint_guard(c, field, ctx.classes) {
+                return (Some(c), Some(g));
+            }
         }
     }
     if cls != 0 && class_hints_enabled() {
@@ -11113,6 +11144,19 @@ fn hint_guard(c: u32, field: u32, classes: &BTreeMap<u32, &ClassDef>) -> Option<
         cur = cd.parent.map(|p| p.0);
     }
     let d = decl?;
+    // an unstable class (a value of another kind may be typed as it, docs/hidden_class_design.md
+    // S0): the class interval test alone is sound, so no root or leaf guard, and no hint without
+    // an interval (the site keeps its sized probe)
+    let unstable = !classes.get(&c).map_or(false, |cd| cd.stable) || !classes.get(&d).map_or(false, |cd| cd.stable);
+    if unstable {
+        if class_ranged(d) {
+            let dfs = class_dfs();
+            if let (Some(&i), Some(&span)) = (dfs.index.get(&d), dfs.span.get(&d)) {
+                return Some(HintGuard::Range { lo: i + 1, span });
+            }
+        }
+        return None;
+    }
     if classes.get(&d)?.parent.is_none() {
         return Some(HintGuard::Root);
     }

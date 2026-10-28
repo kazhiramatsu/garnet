@@ -295,6 +295,21 @@ Two tools that look right are wrong on garnet's binaries, and one works:
   never read frame pointers, the collector scans the stack by words, and crash
   backtraces still have the compact unwind info). Only the profiling build keeps
   `-fno-omit-frame-pointer`: the sampler reads the caller's PC through it.
+- **Reading the symbols** (Session 356): a generated function's C symbol is
+  `fn_<id>_<debug name>`, the name derived from the source context by the
+  exporter (`debugNameOf`): a class member is `Dep_track`, `Dep_get_dirty`,
+  `Dep_ctor`; a named function keeps its name (`track`); an anonymous function
+  takes the binding or property it is assigned to (`isRef`, `iterator_next`),
+  the callee it is passed to (`reactivityRound_computed`, `makeMap_arrow` for
+  `makeMap`'s returned arrow) or its enclosing function (`track_arrow`). The
+  `_d` / `_i64` / `_f64` suffixes are the direct entries, `_resume` a
+  coroutine's resume function. Every C body starts with
+  `/* src: <file>:<line>:<col> */` (the file relative to the working
+  directory), so `grep -n 'src: .*dep.ts:120' driver.c` finds a function from
+  its source and `scripts/sample_tree.py -c <driver.c or units dir> <sample> <mode>`
+  and `scripts/prof_pc.py` (from the units dir it is given) print each
+  generated function with its source position. The JS-visible `fn.name` is a
+  separate IR field (`name`); the debug name never reaches the program.
 - **`TSAOT_PROF_PC=<file>`** (runtime/ts_rt.c, `prof_pc_init`): a sampler
   thread suspends the main thread every `TSAOT_PROF_PC_US` microseconds
   (default 100), records its PC, link register and the frame's saved return

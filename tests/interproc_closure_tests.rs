@@ -9,7 +9,7 @@ use interproc::analyze_program;
 fn refl(n: u32) -> Local { Local { id: LocalId(n), type_id: TypeId(0), ref_kind: RefKind::Reference, binding: None, name: None, nullable_numeric: false, ty_kind: None } }
 fn func(id: u32, params: Vec<u32>, nlocals: u32, exported: bool, body: Vec<Inst>) -> Function {
     Function { id: FunctionId(id), name: None, params: params.into_iter().map(LocalId).collect(),
-        ret: TypeId(0), locals: (0..nlocals).map(refl).collect(), body, is_exported: exported, param_classes: Default::default(), rest_param: None, is_async: false, is_generator: false, capture_count: 0, takes_this: false, arity: 0, has_prototype: false }
+        ret: TypeId(0), locals: (0..nlocals).map(refl).collect(), body, is_exported: exported, param_classes: Default::default(), rest_param: None, is_async: false, is_generator: false, capture_count: 0, takes_this: false, arity: 0, has_prototype: false, debug_name: None, src: None }
 }
 fn prog(fns: Vec<Function>) -> Program {
     Program { version: 1, strict_type_optimizations: Default::default(), closed_receivers: Default::default(), types: vec![], fields: vec![], signatures: vec![], globals: vec![],

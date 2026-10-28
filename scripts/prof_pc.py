@@ -5,7 +5,9 @@ line and by machine-instruction class (docs/agent_workflow.md, "Profiling a nati
 The binary must carry line tables and keep its symbols: a unit build with TSAOT_UNITS_LTO=0 and
 TSAOT_NATIVE_CC='cc -O2 -gline-tables-only -fno-omit-frame-pointer' (ThinLTO leaves the line tables in
 temporary objects atos cannot find). <units dir> holds the generated C the lines refer to; the runtime's
-lines resolve against runtime/ and the tsc-ts host's against benchmarks/tsc_ts_native/."""
+lines resolve against runtime/ and the tsc-ts host's against benchmarks/tsc_ts_native/. The top-symbols
+table annotates a generated function with the `/* src: file:line:col */` comment at the head of its C
+body (Session 356)."""
 import re, sys, subprocess, collections, os
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 pcf, binary, units = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -112,8 +114,20 @@ for a, c in cnt.items():
     r = res.get(a, ''); m = re.search(r'\(([^:)]+):(\d+)\)', r)
     if m and m.group(1) not in ('ts_rt.c', 'host.c'): hg[cls(a)] += c
 for k, c in hg.most_common(14): print(f"{100*c/gen:5.1f}%  {k}")
+# the source positions of the generated functions, from the C files the samples resolved to
+FN_SRC = re.compile(r'^[\w ]*?\b(fn_\w+)\([^)]*\)\s*\{\s*\n\s*/\* src: (.*?) \*/', re.M)
+srcmap = {}
+for f in {f for (f, ln, s) in by_line if f.endswith('.c') and os.path.exists(os.path.join(units, f))}:
+    for m in FN_SRC.finditer(open(os.path.join(units, f), errors='replace').read()): srcmap.setdefault(m.group(1), m.group(2))
+def annotate(sym):
+    base = sym
+    while base not in srcmap:
+        m = re.match(r'(.*)(?:_d|_i64|_f64|_resume|__i)$', base)
+        if not m: return sym
+        base = m.group(1)
+    return f"{sym} [{srcmap[base]}]"
 print(f"\n== top {top} symbols ==")
-for s, c in by_sym.most_common(top): print(f"{100*c/total:5.2f}%  {s}")
+for s, c in by_sym.most_common(top): print(f"{100*c/total:5.2f}%  {annotate(s)}")
 print(f"\n== top {top} lines ==")
 srcs = {}
 def src_line(f, ln):
