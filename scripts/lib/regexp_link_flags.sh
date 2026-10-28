@@ -25,14 +25,6 @@ tsaot_c_needs_fetch() {
   grep -q '^#define TSAOT_NEEDS_FETCH 1' "$cfile"
 }
 
-tsaot_quickjs_regexp_vendor_available() {
-  local qjs="$ROOT/runtime/regexp/quickjs/upstream"
-  [[ -f "$qjs/libregexp.c" && -f "$qjs/libregexp.h" &&
-     -f "$qjs/libunicode.c" && -f "$qjs/libunicode.h" &&
-     -f "$qjs/libregexp-opcode.h" && -f "$qjs/libunicode-table.h" &&
-     -f "$qjs/cutils.h" && -f "$qjs/list.h" ]]
-}
-
 tsaot_quickjs_unicode_vendor_available() {
   local qjs="$ROOT/runtime/regexp/quickjs/upstream"
   [[ -f "$qjs/libunicode.c" && -f "$qjs/libunicode.h" &&
@@ -49,6 +41,9 @@ tsaot_obj_list_contains() {
 }
 
 tsaot_prepare_regexp_objs() {
+  # The regexp engine (runtime/regexp/rx_engine.c: parser, compiler, VM, Unicode tables) and the
+  # adapter (the RegExp objects and the String / RegExp methods), docs/regexp_vm_design.md. Both
+  # objects are rebuilt when any file under runtime/regexp or the runtime header is newer.
   local cfile="$1"
   local work="$2"
   TSAOT_REGEXP_OBJS=()
@@ -59,44 +54,16 @@ tsaot_prepare_regexp_objs() {
   fi
   local outdir="$work/regexp"
   mkdir -p "$outdir"
-  local obj="$outdir/ts_regexp_adapter.o"
-  if tsaot_quickjs_regexp_vendor_available; then
-    TSAOT_REGEXP_QUICKJS_DIR="$ROOT/runtime/regexp/quickjs/upstream"
+  local src="$ROOT/runtime/regexp"
+  local eng="$outdir/rx_engine.o"
+  local ad="$outdir/ts_regexp_adapter.o"
+  if [[ ! -f "$eng" || -n "$(find "$src" -maxdepth 1 \( -name '*.c' -o -name '*.h' \) -newer "$eng" -print -quit)" ]]; then
+    $CC -c "$src/rx_engine.c" -I"$src" -o "$eng" || return 1
   fi
-  if [[ ! -f "$obj" ]]; then
-    if [[ -n "$TSAOT_REGEXP_QUICKJS_DIR" ]]; then
-      $CC -c "$ROOT/runtime/regexp/ts_regexp_adapter.c" \
-        -DTSAOT_HAS_QUICKJS_REGEXP=1 \
-        -I"$ROOT/runtime" -I"$ROOT/runtime/regexp" -I"$TSAOT_REGEXP_QUICKJS_DIR" -o "$obj" || return 1
-    else
-      $CC -c "$ROOT/runtime/regexp/ts_regexp_adapter.c" \
-        -I"$ROOT/runtime" -I"$ROOT/runtime/regexp" -o "$obj" || return 1
-    fi
+  if [[ ! -f "$ad" || -n "$(find "$src" "$ROOT/runtime/ts_rt.h" -maxdepth 1 \( -name '*.c' -o -name '*.h' \) -newer "$ad" -print -quit)" ]]; then
+    $CC -c "$src/ts_regexp_adapter.c" -I"$ROOT/runtime" -I"$src" -o "$ad" || return 1
   fi
-  TSAOT_REGEXP_OBJS=("$obj")
-  if [[ -n "$TSAOT_REGEXP_QUICKJS_DIR" ]]; then
-    local qjs_outdir="$work/quickjs"
-    mkdir -p "$qjs_outdir"
-    local unicode_obj="$qjs_outdir/libunicode.o"
-    local regexp_obj="$qjs_outdir/libregexp.o"
-    if [[ ! -f "$unicode_obj" ]]; then
-      $CC -c "$TSAOT_REGEXP_QUICKJS_DIR/libunicode.c" \
-        -I"$TSAOT_REGEXP_QUICKJS_DIR" -o "$unicode_obj" || return 1
-    fi
-    if [[ ! -f "$regexp_obj" ]]; then
-      $CC -c "$TSAOT_REGEXP_QUICKJS_DIR/libregexp.c" \
-        -I"$TSAOT_REGEXP_QUICKJS_DIR" -o "$regexp_obj" || return 1
-    fi
-    TSAOT_REGEXP_OBJS+=("$unicode_obj" "$regexp_obj")
-    if [[ -f "$TSAOT_REGEXP_QUICKJS_DIR/cutils.c" ]]; then
-      local cutils_obj="$qjs_outdir/cutils.o"
-      if [[ ! -f "$cutils_obj" ]]; then
-        $CC -c "$TSAOT_REGEXP_QUICKJS_DIR/cutils.c" \
-          -I"$TSAOT_REGEXP_QUICKJS_DIR" -o "$cutils_obj" || return 1
-      fi
-      TSAOT_REGEXP_OBJS+=("$cutils_obj")
-    fi
-  fi
+  TSAOT_REGEXP_OBJS=("$eng" "$ad")
   TSAOT_REGEXP_OBJ_ARGS="${TSAOT_REGEXP_OBJS[*]}"
 }
 

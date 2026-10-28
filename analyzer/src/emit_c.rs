@@ -774,6 +774,7 @@ fn emit_program_with_string_plans(
     if needs_regexp {
         s.push_str("static void ts_setup_regexp_proto(void){\n");
         s.push_str("  ts_regexp_proto_init();\n");
+        s.push_str("  ts_regexp_adapter_init();\n");
         for m in &program.regexp_proto_methods {
             let _ = writeln!(
                 s,
@@ -14217,7 +14218,7 @@ fn fnval_adapter_body(builtin: &str) -> Option<String> {
         "promise.race" => hv(format!("ts_promise_race({})", val(0))),
         "promise.allSettled" => hv(format!("ts_promise_allsettled({})", val(0))),
         "promise.any" => hv(format!("ts_promise_any({})", val(0))),
-        // ---- RegExp optional QuickJS fallback ----
+        // ---- RegExp (runtime/regexp, docs/regexp_vm_design.md) ----
         "regexp.quickTest" => hv(format!(
             "ts_regexp_adapter_test_tsv({}, (uint32_t)ts_to_num({}), {})",
             val(0),
@@ -14263,8 +14264,8 @@ fn fnval_adapter_body(builtin: &str) -> Option<String> {
             val(2),
             val(3)
         )),
-        "regexp.initObject" => hv(format!("ts_regexp_object_init({})", val(0))),
-        "regexp.validateObject" => hv(format!("ts_regexp_adapter_validate_object_tsv({})", val(0))),
+        "regexp.newLiteral" => hv(format!("ts_regexp_new_literal({}, (uint32_t)ts_to_num({}))", val(0), val(1))),
+        "regexp.escape" => hv(format!("ts_regexp_escape_tsv({})", val(0))),
         // ---- Symbol statics ----
         "symbol.for" => hv(format!("ts_symbol_for({})", val(0))),
         "symbol.keyFor" => hv(format!("ts_symbol_key_for({})", val(0))),
@@ -22880,27 +22881,12 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 "string.coerce" => (format!("ts_to_string_v({})", v(0)), false),
                 "string.coerceTemplate" => (format!("ts_to_string_template({})", v(0)), false),
                 "boolean.coerce" => (format!("ts_bool(ts_truthy_fast({}))", v(0)), false),
-                "regexp.literalTest" => (
-                    format!("ts_regexp_litprefix_test_fast({}, {}, 0)", v(0), v(1)),
-                    false,
-                ),
-                "regexp.literalTestSticky" => (
-                    format!("ts_regexp_litprefix_test_fast({}, {}, 1)", v(0), v(1)),
-                    false,
-                ),
-                "regexp.literalSearch" => (
-                    format!("ts_regexp_litprefix_search_fast({}, {}, 0)", v(0), v(1)),
-                    true,
-                ),
-                "regexp.literalSearchSticky" => (
-                    format!("ts_regexp_litprefix_search_fast({}, {}, 1)", v(0), v(1)),
-                    true,
-                ),
                 "regexp.objectTest" => (
                     format!("ts_regexp_adapter_object_test_tsv({}, {})", v(0), v(1)),
                     false,
                 ),
-                "regexp.initObject" => (format!("ts_regexp_object_init({})", v(0)), false),
+                "regexp.newLiteral" => (format!("ts_regexp_new_literal({}, (uint32_t)ts_to_num({}))", v(0), v(1)), false),
+                "regexp.escape" => (format!("ts_regexp_escape_tsv({})", v(0)), false),
                 "regexp.construct" => (format!("ts_regexp_adapter_construct_tsv({}, {}, ts_truthy({}))", v(0), v(1), v(2)), false),
                 "uint16array.new" => (format!("ts_new_uint16_array({})", v(0)), false),
                 "arraybuffer.isView" => (format!("ts_bool(ts_array_buffer_is_view({}))", v(0)), false),

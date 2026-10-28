@@ -20,7 +20,13 @@ import * as ts from "typescript";
 import * as fs from "fs";
 import * as path from "path";
 import { ClassExtractor, ClassInfo, ClosedReceivers, memberKeyName, dynamicBaseEmptyClass } from "./class_extract";
-import { classifyRegExpLiteral } from "./regexp";
+/** A regexp literal's text split into its source and flags (`/src/flags`). */
+function splitRegExpLiteral(raw: string): { source: string; flags: string } | undefined {
+  if (raw.length < 2 || raw[0] !== "/") return undefined;
+  const slash = raw.lastIndexOf("/");
+  if (slash <= 0) return undefined;
+  return { source: raw.slice(1, slash), flags: raw.slice(slash + 1) };
+}
 import { hasUnpairedSurrogate, toWireProgram } from "./wire_program";
 
 type RefKind = "reference" | "primitive" | "unknown";
@@ -3285,13 +3291,6 @@ class Exporter {
     return res;
   }
 
-  private regexpLiteralFastPlan(raw: string) {
-    const rx = classifyRegExpLiteral(raw);
-    if (rx.stoppedAt !== "end") return undefined;
-    if (rx.ignoreCase) return undefined;
-    return rx;
-  }
-
   private regexpFlagsCanonical(flags: string): string {
     const order = "dgimsuvy";
     let out = "";
@@ -3328,11 +3327,14 @@ class Exporter {
     return mask;
   }
 
+  /** A regexp literal's source, flags and mask; undefined for invalid flags (the runtime
+   *  compiles the pattern: an invalid one throws a SyntaxError there). */
   private regexpLiteralFallbackPlan(raw: string) {
-    const rx = classifyRegExpLiteral(raw);
-    const mask = this.regexpFlagMask(rx.flags);
+    const split = splitRegExpLiteral(raw);
+    if (split === undefined) return undefined;
+    const mask = this.regexpFlagMask(split.flags);
     if (mask === undefined) return undefined;
-    return { rx, mask };
+    return { rx: { source: split.source, flags: split.flags, global: split.flags.includes("g") }, mask };
   }
 
   private constIdentifierInitializer(expr: ts.Expression): ts.Expression | undefined {
@@ -3426,8 +3428,8 @@ class Exporter {
         } else {
           const raw = this.regexpRawFromConstExpr(arr[0], depth + 1);
           if (raw === undefined) return undefined;
-          const rx = classifyRegExpLiteral(raw);
-          if (!this.regexpFlagsValid(rx.flags)) return undefined;
+          const rx = splitRegExpLiteral(raw);
+          if (rx === undefined || !this.regexpFlagsValid(rx.flags)) return undefined;
           pattern = rx.source;
           flags = rx.flags;
           patternWasRegExp = true;
@@ -3491,18 +3493,12 @@ class Exporter {
     if (node.arguments) {
       for (let i = 2; i < node.arguments.length; i++) this.lowerExpr(ctx, node.arguments[i]);
     }
-    const obj = this.lowerRegExpLiteralObject(ctx, node, raw, hint);
-    if (obj !== undefined) {
-      ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "regexp.validateObject", args: [obj] });
-    }
-    return obj;
+    return this.lowerRegExpLiteralObject(ctx, node, raw, hint);
   }
 
   private lowerStringSearchStringPattern(ctx: FnCtx, node: ts.CallExpression, recvExpr: ts.Expression): number | undefined {
     const raw = this.regexpRawFromStringPatternArgs(node.arguments);
     if (raw === undefined) return undefined;
-    const fast = this.lowerStringSearchRegExpLiteral(ctx, node, recvExpr, raw);
-    if (fast !== undefined) return fast;
     return this.lowerStringSearchRegExpFallback(ctx, node, recvExpr, raw);
   }
 
@@ -3956,33 +3952,16 @@ class Exporter {
     });
   }
 
+  /** A regexp literal (or a constructor call with constant arguments): one RegExp object
+   *  from the source and the flag mask (`regexp.newLiteral`, docs/regexp_vm_design.md). */
   private lowerRegExpLiteralObject(ctx: FnCtx, node: ts.Expression, raw: string, hint?: string): number | undefined {
     const fallback = this.regexpLiteralFallbackPlan(raw);
     if (fallback === undefined) return undefined;
     const { rx, mask } = fallback;
-    const fast = this.regexpLiteralFastPlan(raw);
-    const site = this.site++;
+    const src = this.constString(ctx, rx.source, "rxSource");
+    const flags = this.constNumber(ctx, mask, "rxFlags");
     const dst = this.newLocal(ctx, "reference", hint ?? "regexp");
-    this.labels[site] = `${hint ?? "regexp"}@${ctx.name}`;
-    this.recordSite(site, "object", this.inLoop(node) ? "many" : "once", false, node);
-    ctx.body.push({ kind: "AllocObject", dst, typeId: 0, site });
-    ctx.body.push({
-      kind: "CallBuiltinStatic",
-      dst: this.newLocal(ctx, "reference"),
-      builtin: "regexp.initObject",
-      args: [dst],
-    });
-
-    this.defineDataField(ctx, dst, "source", this.constString(ctx, rx.source, "source"), 0, 0, 1);
-    this.defineDataField(ctx, dst, "flags", this.constString(ctx, this.regexpFlagsCanonical(rx.flags), "flags"), 0, 0, 1);
-    this.defineDataField(ctx, dst, "lastIndex", this.constNumber(ctx, 0, "lastIndex"), 0, 1, 0);
-    this.defineDataField(ctx, dst, "__tsaot_rx_flags_mask", this.constNumber(ctx, mask, "rxFlags"), 0, 1, 0);
-    if (fast !== undefined) {
-      this.defineDataField(ctx, dst, "__tsaot_rx_prefix", this.constString(ctx, fast.prefix, "rxPrefix"), 0, 1, 0);
-      this.defineDataField(ctx, dst, "__tsaot_rx_global", this.constBoxedBool(ctx, fast.global, "rxGlobal"), 0, 1, 0);
-      this.defineDataField(ctx, dst, "__tsaot_rx_sticky", this.constBoxedBool(ctx, fast.sticky, "rxSticky"), 0, 1, 0);
-      this.defineDataField(ctx, dst, "__tsaot_rx_anchor", this.constBoxedBool(ctx, fast.anchoredStart, "rxAnchor"), 0, 1, 0);
-    }
+    ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "regexp.newLiteral", args: [src, flags] });
     return dst;
   }
 
@@ -3991,34 +3970,6 @@ class Exporter {
     if (u.kind === ts.SyntaxKind.RegularExpressionLiteral) return true;
     if (this.regexpRawFromConstExpr(u) !== undefined) return true;
     return this.typeNameOf(u) === "RegExp";
-  }
-
-  private lowerRegExpPrefixConst(ctx: FnCtx, prefix: string): number {
-    const pat = this.newLocal(ctx, "reference");
-    ctx.body.push({ kind: "Const", dst: pat, value: { kind: "Str", value: prefix } });
-    return pat;
-  }
-
-  private lowerRegExpLiteralTestCall(ctx: FnCtx, node: ts.CallExpression, raw: string): number | undefined {
-    const rx = this.regexpLiteralFastPlan(raw);
-    if (rx === undefined) return undefined;
-    const argLs = this.lowerSequenced(ctx, node.arguments);
-    const rawArg = argLs[0] ?? (() => {
-      const u = this.newLocal(ctx, "reference");
-      ctx.body.push({ kind: "Const", dst: u, value: { kind: "Undef" } });
-      return u;
-    })();
-    const src = this.newLocal(ctx, "reference");
-    ctx.body.push({ kind: "CallBuiltinStatic", dst: src, builtin: "string.coerce", args: [rawArg] });
-    const pat = this.lowerRegExpPrefixConst(ctx, rx.prefix);
-    const dst = this.newLocal(ctx, "reference");
-    ctx.body.push({
-      kind: "CallBuiltinStatic",
-      dst,
-      builtin: (rx.anchoredStart || rx.sticky) ? "regexp.literalTestSticky" : "regexp.literalTest",
-      args: [src, pat],
-    });
-    return dst;
   }
 
   private lowerRegExpLiteralTestFallback(ctx: FnCtx, node: ts.CallExpression, raw: string): number | undefined {
@@ -4076,7 +4027,6 @@ class Exporter {
     const plan = this.regexpLiteralFallbackPlan(raw);
     if (plan === undefined) return undefined;
     const { rx, mask } = plan;
-    if (!rx.global) return undefined;
     const recv = this.lowerExpr(ctx, recvExpr);
     for (let i = 1; i < node.arguments.length; i++) this.lowerExpr(ctx, node.arguments[i]);
     const pat = this.constString(ctx, rx.source, "rxSource");
@@ -4090,7 +4040,6 @@ class Exporter {
     const plan = this.regexpLiteralFallbackPlan(raw);
     if (plan === undefined) return undefined;
     const { rx, mask } = plan;
-    if (replaceAll && !rx.global) return undefined;
     const recv = this.lowerExpr(ctx, recvExpr);
     const replacement = node.arguments[1] !== undefined
       ? this.lowerExpr(ctx, node.arguments[1])
@@ -4125,22 +4074,6 @@ class Exporter {
     const flags = this.constNumber(ctx, mask, "rxFlags");
     const dst = this.newLocal(ctx, "reference");
     ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "regexp.quickSplit", args: [recv, pat, flags, limit] });
-    return dst;
-  }
-
-  private lowerStringSearchRegExpLiteral(ctx: FnCtx, node: ts.CallExpression, recvExpr: ts.Expression, raw: string): number | undefined {
-    const rx = this.regexpLiteralFastPlan(raw);
-    if (rx === undefined) return undefined;
-    const recv = this.lowerExpr(ctx, recvExpr);
-    for (let i = 1; i < node.arguments.length; i++) this.lowerExpr(ctx, node.arguments[i]);
-    const pat = this.lowerRegExpPrefixConst(ctx, rx.prefix);
-    const dst = this.newLocal(ctx, "primitive");
-    ctx.body.push({
-      kind: "CallBuiltinStatic",
-      dst,
-      builtin: (rx.anchoredStart || rx.sticky) ? "regexp.literalSearchSticky" : "regexp.literalSearch",
-      args: [recv, pat],
-    });
     return dst;
   }
 
@@ -4206,11 +4139,6 @@ class Exporter {
   }
 
   private lowerStringMatchAllRegExpObject(ctx: FnCtx, node: ts.CallExpression, recvExpr: ts.Expression, regexpExpr: ts.Expression): number | undefined {
-    const raw = this.regexpRawFromConstExpr(regexpExpr);
-    if (raw !== undefined) {
-      const plan = this.regexpLiteralFallbackPlan(raw);
-      if (!plan?.rx.global) return undefined;
-    }
     const recv = this.lowerExpr(ctx, recvExpr);
     const regexp = this.lowerExpr(ctx, regexpExpr);
     for (let i = 1; i < node.arguments.length; i++) this.lowerExpr(ctx, node.arguments[i]);
@@ -4220,11 +4148,6 @@ class Exporter {
   }
 
   private lowerStringReplaceRegExpObject(ctx: FnCtx, node: ts.CallExpression, recvExpr: ts.Expression, regexpExpr: ts.Expression, replaceAll: boolean): number | undefined {
-    const raw = this.regexpRawFromConstExpr(regexpExpr);
-    if (replaceAll && raw !== undefined) {
-      const plan = this.regexpLiteralFallbackPlan(raw);
-      if (!plan?.rx.global) return undefined;
-    }
     const recv = this.lowerExpr(ctx, recvExpr);
     const regexp = this.lowerExpr(ctx, regexpExpr);
     const replacement = node.arguments[1] !== undefined
@@ -4767,9 +4690,7 @@ class Exporter {
     if (node.kind === ts.SyntaxKind.RegularExpressionLiteral) {
       const lowered = this.lowerRegExpLiteralObject(ctx, node, node.getText(), hint);
       if (lowered !== undefined) return lowered;
-      const rx = classifyRegExpLiteral(node.getText());
-      const prefix = rx.prefix.length > 0 ? `; literal-prefix=${JSON.stringify(rx.prefix)}` : "";
-      this.unsupported(node, `RegExp literal pattern is outside the literal-prefix fast path${prefix}`);
+      this.unsupported(node, "RegExp literal has invalid flags");
       const dst = this.newLocal(ctx, "reference", hint);
       ctx.body.push({ kind: "Const", dst, value: { kind: "Undef" } });
       return dst;
@@ -5558,13 +5479,25 @@ class Exporter {
         }
       }
       if (ts.isPropertyAccessExpression(fnx) &&
+          fnx.name.text === "escape" &&
+          ts.isIdentifier(fnx.expression) && fnx.expression.text === "RegExp" &&
+          this.isAmbientGlobalSymbol(this.symbolOf(fnx.expression))) {
+        const argLs = this.lowerSequenced(ctx, node.arguments);
+        const arg = argLs[0] ?? (() => {
+          const u = this.newLocal(ctx, "reference");
+          ctx.body.push({ kind: "Const", dst: u, value: { kind: "Undef" } });
+          return u;
+        })();
+        const dst = this.newLocal(ctx, "reference");
+        ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "regexp.escape", args: [arg] });
+        return dst;
+      }
+      if (ts.isPropertyAccessExpression(fnx) &&
           fnx.name.text === "test" &&
           fnx.expression.kind === ts.SyntaxKind.RegularExpressionLiteral) {
-        const lowered = this.lowerRegExpLiteralTestCall(ctx, node, fnx.expression.getText());
-        if (lowered !== undefined) return lowered;
         const fallback = this.lowerRegExpLiteralTestFallback(ctx, node, fnx.expression.getText());
         if (fallback !== undefined) return fallback;
-        this.unsupported(node, "RegExp literal .test(...) flags are outside the QuickJS fallback path");
+        this.unsupported(node, "RegExp literal has invalid flags");
         return this.newLocal(ctx, "reference");
       }
       if (ts.isPropertyAccessExpression(fnx) &&
@@ -5577,7 +5510,7 @@ class Exporter {
           fnx.expression.kind === ts.SyntaxKind.RegularExpressionLiteral) {
         const fallback = this.lowerRegExpLiteralExecFallback(ctx, node, fnx.expression.getText());
         if (fallback !== undefined) return fallback;
-        this.unsupported(node, "RegExp literal .exec(...) flags are outside the QuickJS fallback path");
+        this.unsupported(node, "RegExp literal has invalid flags");
         return this.newLocal(ctx, "reference");
       }
       if (ts.isPropertyAccessExpression(fnx) &&
@@ -5590,11 +5523,9 @@ class Exporter {
           node.arguments.length >= 1 &&
           node.arguments[0].kind === ts.SyntaxKind.RegularExpressionLiteral &&
           this.builtinReceiverKind(fnx.expression) === "string") {
-        const lowered = this.lowerStringSearchRegExpLiteral(ctx, node, fnx.expression, node.arguments[0].getText());
-        if (lowered !== undefined) return lowered;
         const fallback = this.lowerStringSearchRegExpFallback(ctx, node, fnx.expression, node.arguments[0].getText());
         if (fallback !== undefined) return fallback;
-        this.unsupported(node, "String.prototype.search(RegExp) flags are outside the QuickJS fallback path");
+        this.unsupported(node, "RegExp literal has invalid flags");
         return this.newLocal(ctx, "primitive");
       }
       if (ts.isPropertyAccessExpression(fnx) &&
@@ -5619,7 +5550,7 @@ class Exporter {
           this.builtinReceiverKind(fnx.expression) === "string") {
         const lowered = this.lowerStringMatchRegExpLiteral(ctx, node, fnx.expression, node.arguments[0].getText());
         if (lowered !== undefined) return lowered;
-        this.unsupported(node, "String.prototype.match(RegExp) flags are outside the QuickJS fallback path");
+        this.unsupported(node, "RegExp literal has invalid flags");
         return this.newLocal(ctx, "reference");
       }
       if (ts.isPropertyAccessExpression(fnx) &&
@@ -5644,7 +5575,7 @@ class Exporter {
           this.builtinReceiverKind(fnx.expression) === "string") {
         const lowered = this.lowerStringMatchAllRegExpLiteral(ctx, node, fnx.expression, node.arguments[0].getText());
         if (lowered !== undefined) return lowered;
-        this.unsupported(node, "String.prototype.matchAll(RegExp) requires a global RegExp");
+        this.unsupported(node, "RegExp literal has invalid flags");
         return this.newLocal(ctx, "reference");
       }
       if (ts.isPropertyAccessExpression(fnx) &&
@@ -5654,7 +5585,7 @@ class Exporter {
           this.builtinReceiverKind(fnx.expression) === "string") {
         const lowered = this.lowerStringMatchAllRegExpObject(ctx, node, fnx.expression, node.arguments[0]);
         if (lowered !== undefined) return lowered;
-        this.unsupported(node, "String.prototype.matchAll(RegExp) requires a global RegExp");
+        this.unsupported(node, "String.prototype.matchAll(RegExp) unsupported");
         return this.newLocal(ctx, "reference");
       }
       if (ts.isPropertyAccessExpression(fnx) &&
@@ -5673,9 +5604,7 @@ class Exporter {
         const replaceAll = fnx.name.text === "replaceAll";
         const lowered = this.lowerStringReplaceRegExpLiteral(ctx, node, fnx.expression, node.arguments[0].getText(), replaceAll);
         if (lowered !== undefined) return lowered;
-        this.unsupported(node, replaceAll
-          ? "String.prototype.replaceAll(RegExp) requires a global RegExp"
-          : "String.prototype.replace(RegExp) unsupported");
+        this.unsupported(node, "RegExp literal has invalid flags");
         return this.newLocal(ctx, "reference");
       }
       if (ts.isPropertyAccessExpression(fnx) &&
@@ -5698,7 +5627,7 @@ class Exporter {
           this.builtinReceiverKind(fnx.expression) === "string") {
         const lowered = this.lowerStringSplitRegExpLiteral(ctx, node, fnx.expression, node.arguments[0].getText());
         if (lowered !== undefined) return lowered;
-        this.unsupported(node, "String.prototype.split(RegExp) flags are outside the QuickJS fallback path");
+        this.unsupported(node, "RegExp literal has invalid flags");
         return this.newLocal(ctx, "reference");
       }
       if (ts.isPropertyAccessExpression(fnx) &&
@@ -16082,6 +16011,7 @@ class Exporter {
       ["trimRight","ts_strproto_trimRight"],["split","ts_strproto_split"],
       ["padStart","ts_strproto_padStart"],["padEnd","ts_strproto_padEnd"],
       ["replace","ts_strproto_replace"],["replaceAll","ts_strproto_replaceAll"],
+      ["match","ts_strproto_match"],["matchAll","ts_strproto_matchAll"],["search","ts_strproto_search"],
     ];
     const stringProtoMethods = stringProtoSpec.map(([name, runtime]) => ({ name, runtime, methodId: this.internName(name) }));
     // Number.prototype methods: same dynamic-dispatch enablement for an any-typed

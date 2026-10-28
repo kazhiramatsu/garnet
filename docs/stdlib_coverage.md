@@ -76,7 +76,7 @@ garnet:ndarray: NDArray over typed storage (float64 fast path; float32, int8..ui
 Promise: constructor executor, resolve/reject/all/race/allSettled/any,
         then/catch/finally.
 RegExp: literal and constructor objects (a constant or a dynamic pattern and
-        flags) with optional QuickJS fallback; test/exec/search/match/matchAll/
+        flags) on garnet's own engine (docs/regexp_vm_design.md); test/exec/search/match/matchAll/
         replace/global replaceAll/split, captures, named groups, basic `d`
         indices, `u`/`v` Unicode mode, extracted test/exec method values.
 Typed arrays (docs/typed_arrays_design.md): ArrayBuffer (byteLength, slice)
@@ -127,8 +127,8 @@ closures invoked via ts_call, which prepends the closure's captured environment.
   formatting, and other formatting helpers.
 - JSON.stringify replacer function/array semantics.
 - RegExp: the constructor as a first-class value (`const R = RegExp`,
-  `globalThis.RegExp`) remains rejected; non-global `matchAll`/`replaceAll` are
-  rejected at export time instead of becoming a runtime TypeError.
+  `globalThis.RegExp`) remains rejected; the `v`-mode properties of strings
+  (`\p{RGI_Emoji}`) are not yet implemented.
 - Web/fetch: streaming request/response bodies, abort events, real DOMException
   objects, and full Web-compatible Headers/Request/Response semantics.
 - Typed arrays: at, findLast, findLastIndex, toSorted, toReversed, with

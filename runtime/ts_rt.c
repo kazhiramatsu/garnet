@@ -3435,7 +3435,7 @@ static int lookup_prop_chain_until(tsv receiver, ts_object* o, ts_object* stop, 
    property-bag receivers) and are guarded out of the prop-map path. */
 static inline int kind_has_common_header(uint8_t k){
   return k==TS_KIND_OBJECT || k==TS_KIND_ARRAY || k==TS_KIND_FUNC || k==TS_KIND_MAP || k==TS_KIND_SET ||
-         k==TS_KIND_ARRAYBUFFER || k==TS_KIND_TYPEDARRAY;
+         k==TS_KIND_ARRAYBUFFER || k==TS_KIND_TYPEDARRAY || k==TS_KIND_REGEXP;
 }
 /* A property-bag receiver: anything carrying the common header. Object/array/map/
    set use the OBJECT NaN-box selector; functions use the FUNC selector. Both are
@@ -4735,6 +4735,7 @@ static tsv ts_new_string_from_code_units(const uint16_t* units, uint32_t len){
   str->flags = strflags_storage(str->data, flags, len);
   return ts_str_v(str);
 }
+tsv ts_string_from_code_units(const uint16_t* units, uint32_t len){ return ts_new_string_from_code_units(units, len); }
 uint32_t* ts_string_codepoints_copy(tsv v, uint32_t* out_len){
   tsv s = ts_to_string_v(v);
   ts_strview xs = ts_str_view_typed(s);
@@ -5294,32 +5295,12 @@ static void ts_prim_field_init(void){
   g_tojson_field   = ts_intern_field("toJSON", 6);
   g_prim_field_ready = 1;
 }
-static uint32_t g_rx_k_source = 0xFFFFFFFFu, g_rx_k_flags = 0xFFFFFFFFu;
-static uint32_t g_rx_k_prefix = 0xFFFFFFFFu, g_rx_k_global = 0xFFFFFFFFu;
-static uint32_t g_rx_k_sticky = 0xFFFFFFFFu, g_rx_k_anchor = 0xFFFFFFFFu;
-static uint32_t g_rx_k_last_index = 0xFFFFFFFFu, g_rx_k_flags_mask = 0xFFFFFFFFu;
-static void ts_regexp_ensure_keys(void){
-  if (g_rx_k_prefix != 0xFFFFFFFFu) return;
-  g_rx_k_source = ts_intern_field("source", 6);
-  g_rx_k_flags = ts_intern_field("flags", 5);
-  g_rx_k_prefix = ts_intern_field("__tsaot_rx_prefix", 17);
-  g_rx_k_global = ts_intern_field("__tsaot_rx_global", 17);
-  g_rx_k_sticky = ts_intern_field("__tsaot_rx_sticky", 17);
-  g_rx_k_anchor = ts_intern_field("__tsaot_rx_anchor", 17);
-  g_rx_k_last_index = ts_intern_field("lastIndex", 9);
-  g_rx_k_flags_mask = ts_intern_field("__tsaot_rx_flags_mask", 21);
-}
-static int ts_regexp_is_fast_obj(tsv re){
-  if (!ts_is_propbag(re)) return 0;
-  ts_regexp_ensure_keys();
-  static ts_rt_ic ic_source, ic_flags, ic_prefix, ic_mask;
-  return ts_is_str(ts_get_ic(re, g_rx_k_source, &ic_source)) &&
-         ts_is_str(ts_get_ic(re, g_rx_k_flags, &ic_flags)) &&
-         (ts_is_str(ts_get_ic(re, g_rx_k_prefix, &ic_prefix)) || ts_is_num(ts_get_ic(re, g_rx_k_flags_mask, &ic_mask)));
-}
-int ts_regexp_is_object(tsv re){
-  return ts_regexp_is_fast_obj(re);
-}
+/* RegExps (docs/regexp_vm_design.md): the kind's cells are made here, the semantics live in
+   runtime/regexp/ts_regexp_adapter.c, reached through the hooks it installs at setup. */
+static const ts_regexp_hooks* g_regexp_hooks = NULL;
+void ts_regexp_hooks_install(const ts_regexp_hooks* h){ g_regexp_hooks = h; }
+int ts_regexp_is_object(tsv re){ return ts_is_regexp(re); }
+static tsv ts_regexp_to_string(tsv re){ return g_regexp_hooks ? g_regexp_hooks->to_string(re) : TS_UNDEFINED; }
 void ts_regexp_proto_init(void){
   if (ts_proto_ref(g_regexp_proto_v)) return;
   static int rooted = 0;
@@ -5334,32 +5315,12 @@ void ts_regexp_proto_register(ts_key method_key, const char* name, ts_code fn){
   if (!ts_proto_ref(g_regexp_proto_v)) ts_regexp_proto_init();
   ts_proto_register_method(g_regexp_proto_v, method_key, name, fn);
 }
-tsv ts_regexp_object_init(tsv re){
-  if (ts_is_propbag(re)){
-    if (!ts_proto_ref(g_regexp_proto_v)) ts_regexp_proto_init();
-    ((ts_object*)ts_ptr(re))->proto = g_regexp_proto_v;
-    ts_write_barrier(re, g_regexp_proto_v);
-  }
-  return re;
-}
-static tsv ts_regexp_to_string_fast(tsv re){
-  if (!ts_is_propbag(re)) return TS_UNDEFINED;
-  ts_gc_root(&re);
-  ts_regexp_ensure_keys();
-  tsv source = ts_get(re, g_rx_k_source);
-  ts_gc_root(&source);
-  tsv flags = ts_get(re, g_rx_k_flags);
-  ts_gc_root(&flags);
-  if (!ts_is_str(source) || !ts_is_str(flags)){
-    ts_gc_unroot(3);
-    return TS_UNDEFINED;
-  }
-  tsv slash = ts_new_string("/", 1);
-  ts_gc_root(&slash);
-  tsv parts[4] = { slash, source, slash, flags };
-  tsv out = ts_str_concat_many(parts, 4);
-  ts_gc_unroot(4);
-  return out;
+tsv ts_regexp_alloc(void){
+  if (!ts_proto_ref(g_regexp_proto_v)) ts_regexp_proto_init();
+  ts_regexp* r = gc_alloc(sizeof(ts_regexp), TS_KIND_REGEXP);
+  r->o.proto = g_regexp_proto_v;
+  r->prog = NULL; r->source = TS_UNDEFINED; r->flags = 0;
+  return ts_obj(r);
 }
 /* ToPrimitive 用に callable な valueOf/toString を取得。own のデータプロパティ
    （FIELD キー）が prototype/ビルトインのメソッド（METHOD キー）をシャドウする。 */
@@ -6369,6 +6330,10 @@ static void gc_scan_cell(ts_gc_header* h, int young, int depth){
     else for (uint32_t i=0;i<st->len;i++) gc_visit_slot(&st->elems[i], young, depth, stable);
     gc_mark_common_props(&st->o, young, depth, stable);
     gc_visit_slot(&st->o.proto, young, depth, stable);
+  } else if (h->kind==TS_KIND_REGEXP){ ts_regexp* r=(ts_regexp*)h;
+    gc_visit_slot(&r->source, young, depth, stable);
+    gc_mark_common_props(&r->o, young, depth, stable);
+    gc_visit_slot(&r->o.proto, young, depth, stable);
   } else if (h->kind==TS_KIND_PROXY){ ts_proxy* px=(ts_proxy*)h;
     gc_visit_slot(&px->target, young, depth, stable); gc_visit_slot(&px->handler, young, depth, stable);
   } else if (h->kind==TS_KIND_TYPEDARRAY){ ts_typedarray* ta=(ts_typedarray*)h;
@@ -6409,6 +6374,7 @@ static void gc_free_cell_payload(ts_gc_header* h){
     ab->bytes = NULL; props_release_dead(&ab->o);
   }
   else if (h->kind==TS_KIND_TYPEDARRAY){ props_release_dead(&((ts_typedarray*)h)->o); }
+  else if (h->kind==TS_KIND_REGEXP){ ts_regexp* r=(ts_regexp*)h; if (g_regexp_hooks && r->prog) g_regexp_hooks->release(r->prog); r->prog=NULL; props_release_dead(&r->o); }
   else if (h->kind==TS_KIND_PROMISE){ free(((ts_promise*)h)->waiters); }
   else if (h->kind==TS_KIND_CORO){
     ts_coro* c=(ts_coro*)h;
@@ -7481,6 +7447,7 @@ tsv ts_arguments_array(const tsv* args, uint32_t n){
   return arr;
 }
 tsv ts_str_split(tsv s, tsv sep, tsv limit){
+  if (g_regexp_hooks && ts_is_regexp(sep)) return g_regexp_hooks->split(ts_is_str(s) ? s : ts_to_string_v(s), sep, limit);
   if(!ts_is_str(s)) return ts_new_array(0);
   ts_gc_root(&s); ts_gc_root(&sep);
   int sep_is_str=ts_is_str(sep);
@@ -9899,158 +9866,6 @@ double ts_parse_int_v(tsv v, tsv radix){
   return js_parse_int_view(ts_str_view_typed(s), r);
 }
 
-static ts_rt_ic g_ic_rx_last_index;
-static long long ts_regexp_last_index_value(tsv re, uint32_t key){
-  double d = ts_number_coerce(key == g_rx_k_last_index ? ts_get_ic(re, key, &g_ic_rx_last_index) : ts_get(re, key));
-  if (!(d > 0.0) || !isfinite(d)) return 0;
-  if (d > 2147483647.0) return 2147483647LL;
-  return (long long)floor(d);
-}
-
-static int ts_regexp_litprefix_exec_obj(tsv re, tsv input, int use_last_index,
-                                        int update_last_index,
-                                        ts_regexp_litprefix_match* out){
-  if (!ts_is_propbag(re) || !ts_is_str(input)) return 0;
-  ts_regexp_ensure_keys();
-  int global = ts_truthy(ts_get(re, g_rx_k_global));
-  int sticky = ts_truthy(ts_get(re, g_rx_k_sticky));
-  int anchor = ts_truthy(ts_get(re, g_rx_k_anchor));
-  long long start = (use_last_index && (global || sticky)) ? ts_regexp_last_index_value(re, g_rx_k_last_index) : 0;
-  tsv prefix = ts_get(re, g_rx_k_prefix);
-  if (!ts_is_str(prefix)) return 0;
-  ts_strview xs = ts_str_view_typed(input);
-  ts_strview ps = ts_str_view_typed(prefix);
-  int matched = 0;
-  ts_regexp_litprefix_match m = {0, 0};
-  if ((global || sticky) && start > (long long)xs.len){
-    matched = 0;
-  } else if (anchor && start != 0){
-    matched = 0;
-  } else {
-    matched = ts_regexp_litprefix_find_view(xs, ps, start, sticky || anchor, &m);
-  }
-  if (update_last_index && (global || sticky)){
-    ts_set_ic(re, g_rx_k_last_index, ts_num(matched ? (double)m.end : 0.0), &g_ic_rx_last_index);
-  }
-  if (matched && out) *out = m;
-  return matched;
-}
-
-static tsv ts_regexp_exec_indices_single(ts_regexp_litprefix_match m){
-  tsv indices = ts_new_array(0);
-  ts_gc_root(&indices);
-  tsv pair = ts_new_array(0);
-  ts_gc_root(&pair);
-  ts_array_push(pair, ts_num((double)m.start));
-  ts_array_push(pair, ts_num((double)m.end));
-  ts_array_push(indices, pair);
-  ts_set(indices, ts_intern_field("groups", 6), TS_UNDEFINED);
-  ts_gc_unroot(2);
-  return indices;
-}
-
-static tsv ts_regexp_exec_result_single(tsv input, ts_regexp_litprefix_match m, int has_indices){
-  ts_gc_root(&input);
-  tsv arr = ts_new_array(0);
-  ts_gc_root(&arr);
-  tsv match = ts_string_slice_view(input, m.start, m.end - m.start);
-  ts_gc_root(&match);
-  ts_array_push(arr, match);
-  ts_set(arr, ts_intern_field("index", 5), ts_num((double)m.start));
-  ts_set(arr, ts_intern_field("input", 5), input);
-  ts_set(arr, ts_intern_field("groups", 6), TS_UNDEFINED);
-  if (has_indices){
-    tsv indices = ts_regexp_exec_indices_single(m);
-    ts_gc_root(&indices);
-    ts_set(arr, ts_intern_field("indices", 7), indices);
-    ts_gc_unroot(1);
-  }
-  ts_gc_unroot(3);
-  return arr;
-}
-
-static uint32_t ts_regexp_advance_string_index_fast(tsv input, uint32_t index, int full_unicode){
-  ts_strview xs = ts_str_view_typed(input);
-  if (!full_unicode || index + 1u >= xs.len) return index + 1u;
-  uint16_t hi = ts_str_cu_at_view(xs, index);
-  if (hi >= 0xD800u && hi <= 0xDBFFu){
-    uint16_t lo = ts_str_cu_at_view(xs, index + 1u);
-    if (lo >= 0xDC00u && lo <= 0xDFFFu) return index + 2u;
-  }
-  return index + 1u;
-}
-
-tsv ts_regexp_object_test_fast(tsv re, tsv input){
-  ts_gc_root(&re);
-  ts_gc_root(&input);
-  int matched = ts_regexp_litprefix_exec_obj(re, input, 1, 1, NULL);
-  ts_gc_unroot(2);
-  return ts_bool(matched);
-}
-
-double ts_regexp_object_search_fast(tsv input, tsv re){
-  ts_gc_root(&input);
-  ts_gc_root(&re);
-  ts_regexp_litprefix_match m = {0, 0};
-  int matched = ts_regexp_litprefix_exec_obj(re, input, 0, 0, &m);
-  ts_gc_unroot(2);
-  return matched ? (double)m.start : -1.0;
-}
-
-tsv ts_regexp_object_exec_fast(tsv re, tsv input){
-  ts_gc_root(&re);
-  ts_gc_root(&input);
-  ts_regexp_litprefix_match m = {0, 0};
-  int matched = ts_regexp_litprefix_exec_obj(re, input, 1, 1, &m);
-  ts_regexp_ensure_keys();
-  tsv flagsv = ts_get(re, g_rx_k_flags_mask);
-  uint32_t flags = ts_is_num(flagsv) ? (uint32_t)ts_to_num(flagsv) : 0u;
-  tsv result = matched ? ts_regexp_exec_result_single(input, m, (flags & (1u << 6)) != 0) : TS_NULL;
-  ts_gc_unroot(2);
-  return result;
-}
-
-tsv ts_regexp_object_match_fast(tsv re, tsv input){
-  ts_gc_root(&re);
-  ts_gc_root(&input);
-  if (!ts_is_str(input)){
-    ts_gc_unroot(2);
-    return TS_NULL;
-  }
-  ts_regexp_ensure_keys();
-  int global = ts_truthy(ts_get(re, g_rx_k_global));
-  if (!global){
-    tsv result = ts_regexp_object_exec_fast(re, input);
-    ts_gc_unroot(2);
-    return result;
-  }
-
-  tsv flagsv = ts_get(re, g_rx_k_flags_mask);
-  uint32_t flags = ts_is_num(flagsv) ? (uint32_t)ts_to_num(flagsv) : 0u;
-  int full_unicode = (flags & ((1u << 4) | (1u << 7))) != 0;
-  ts_set_ic(re, g_rx_k_last_index, ts_num(0.0), &g_ic_rx_last_index);
-  tsv arr = ts_new_array(0);
-  ts_gc_root(&arr);
-  uint32_t count = 0;
-  for (;;){
-    ts_regexp_litprefix_match m = {0, 0};
-    if (!ts_regexp_litprefix_exec_obj(re, input, 1, 1, &m)) break;
-    tsv part = ts_string_slice_view(input, m.start, m.end - m.start);
-    ts_gc_root(&part);
-    ts_array_push(arr, part);
-    ts_gc_unroot(1);
-    count++;
-    if (m.end == m.start){
-      ts_set_ic(re, g_rx_k_last_index,
-             ts_num((double)ts_regexp_advance_string_index_fast(input, m.end, full_unicode)), &g_ic_rx_last_index);
-    }
-  }
-  ts_set_ic(re, g_rx_k_last_index, ts_num(0.0), &g_ic_rx_last_index);
-  tsv result = count ? arr : TS_NULL;
-  ts_gc_unroot(3);
-  return result;
-}
-
 /* number.toFixed(digits) -> string */
 tsv ts_number_tofixed(double x, double digits){
   int d=(int)digits; if (d<0) d=0; if (d>100) d=100;
@@ -11126,6 +10941,7 @@ static tsv ts_str_replace_literal_build(tsv s, tsv pat, tsv rep, int all){
 }
 
 tsv ts_str_replace(tsv s, tsv pat, tsv rep, int all){
+  if (g_regexp_hooks && ts_is_regexp(pat)) return g_regexp_hooks->replace(ts_is_str(s) ? s : ts_to_string_v(s), pat, rep, all);
   int source_is_str=ts_is_str(s), pattern_is_str=ts_is_str(pat);
   /* rep may be a FUNCTION replacer (called per match) instead of a string. */
   int rep_is_fn = ts_is_callable(rep);
@@ -11203,7 +11019,7 @@ static uint32_t g_field_cap = 0;
    no byte comparison (vue's handlers do all three on every access). */
 static tsv* g_field_strings = NULL;
 /* The runtime's and the compiler's internal slots on user-visible objects (a Date's `__date_ms`, a
-   generator object's `__coro`, a RegExp's `__tsaot_rx_*`, a capture cell's `__value`, the host
+   generator object's `__coro`, a RegExp string iterator's `__tsaot_rx_iter_*`, a capture cell's `__value`, the host
    objects on the global, ...) are hidden from every enumeration, serialization and copy; a user's
    own `__`-prefixed property (`__typename`, vue's `__v_skip`) is an ordinary property. The bit is
    decided by the full name when the name is interned, so the enumeration predicates never look at
@@ -11217,9 +11033,7 @@ static int field_name_is_internal(const char* n, uint32_t len){
     "__generator_return_value", "__text_encoder", "__text_decoder_encoding", "__text_decoder_fatal",
     "__text_decoder_ignore_bom", "__array_iterator_source", "__array_iterator_index",
     "__array_iterator_kind", "__map_iterator_source", "__map_iterator_last", "__map_iterator_kind",
-    "__tsaot_rx_prefix", "__tsaot_rx_global", "__tsaot_rx_sticky", "__tsaot_rx_anchor",
-    "__tsaot_rx_flags_mask", "__tsaot_rx_iter_input", "__tsaot_rx_iter_source",
-    "__tsaot_rx_iter_flags", "__tsaot_rx_iter_index", "__tsaot_rx_iter_done" };
+    "__tsaot_rx_iter_re", "__tsaot_rx_iter_input", "__tsaot_rx_iter_done" };
   if (len < 2 || n[0] != '_' || n[1] != '_') return 0;
   for (size_t i = 0; i < sizeof names / sizeof names[0]; i++)
     if (strlen(names[i]) == len && memcmp(names[i], n, len) == 0) return 1;
@@ -13356,8 +13170,8 @@ static void inspect_val(jbuf* b, tsv v, int depth, int top){
     return;
   }
   if (ts_is_obj(v)){
-    if (ts_regexp_is_fast_obj(v)){
-      tsv s = ts_regexp_to_string_fast(v);
+    if (ts_is_regexp(v)){
+      tsv s = ts_regexp_to_string(v);
       if (ts_is_str(s)){
         ts_gc_root(&s);
         ts_strview sv = ts_str_view_typed(s);
@@ -15078,8 +14892,8 @@ int ts_has_own_dyn(tsv obj, tsv keyv){
 tsv ts_objproto_toString(tsv* args, int n){
   tsv self = (n>0) ? args[0] : TS_UNDEFINED;
   if (ts_is_indexed_array_fast(self)) return ts_array_join(self, ts_new_string(",",1));
-  if (ts_regexp_is_fast_obj(self)){
-    tsv r = ts_regexp_to_string_fast(self);
+  if (ts_is_regexp(self)){
+    tsv r = ts_regexp_to_string(self);
     if (ts_is_str(r)) return r;
   }
   /* Symbol.toStringTag: a string-valued [Symbol.toStringTag] replaces the default
@@ -15174,7 +14988,7 @@ tsv ts_objproto_tostring_call(tsv v){
     }
     ts_gc_unroot(1);
   }
-  if (ts_regexp_is_fast_obj(v)) return TS_TAG(g_tag_regexp);
+  if (ts_is_regexp(v)) return TS_TAG(g_tag_regexp);
   /* the builtin tags of the collections, promises and errors (ECMA-262's @@toStringTag of their
      prototypes and the builtinTag of [[ErrorData]]): vue's toRawType sorts a Map or Set into its
      collection handlers by this tag; a Proxy answers for its target */
@@ -17182,6 +16996,42 @@ tsv ts_strproto_split(tsv* a, int n){ return ts_str_split(a[0], n>1?a[1]:TS_UNDE
 tsv ts_strproto_padStart(tsv* a, int n){ return ts_str_padstart(a[0], n>1?ts_to_num(a[1]):0, n>2?a[2]:TS_UNDEFINED); }
 tsv ts_strproto_padEnd(tsv* a, int n){ return ts_str_padend(a[0], n>1?ts_to_num(a[1]):0, n>2?a[2]:TS_UNDEFINED); }
 tsv ts_strproto_replace(tsv* a, int n){ return ts_str_replace(a[0], n>1?a[1]:TS_UNDEFINED, n>2?a[2]:TS_UNDEFINED, 0); }
+/* match / matchAll / search on a dynamic receiver: a RegExp argument through the adapter, a
+   string pattern as a RegExp made from it (matchAll adds the g flag), as the spec's
+   String.prototype methods do */
+static tsv ts_str_regexp_arg(tsv pat, const char* flags){
+  if (ts_is_regexp(pat)) return pat;
+  if (!g_regexp_hooks) ts_throw_type_error_msg("RegExp support is not linked into this program");
+  tsv p = pat == TS_UNDEFINED ? ts_new_string("", 0) : (ts_is_str(pat) ? pat : ts_to_string_v(pat));
+  ts_gc_root(&p);
+  tsv r = g_regexp_hooks->from_string(p, flags ? ts_new_string(flags, (uint32_t)strlen(flags)) : TS_UNDEFINED);
+  ts_gc_unroot(1);
+  return r;
+}
+tsv ts_strproto_match(tsv* a, int n){
+  if (!g_regexp_hooks) ts_throw_type_error_msg("RegExp support is not linked into this program");
+  tsv s = ts_is_str(a[0]) ? a[0] : ts_to_string_v(a[0]); ts_gc_root(&s);
+  tsv re = ts_str_regexp_arg(n>1?a[1]:TS_UNDEFINED, NULL); ts_gc_root(&re);
+  tsv r = g_regexp_hooks->match(s, re);
+  ts_gc_unroot(2);
+  return r;
+}
+tsv ts_strproto_matchAll(tsv* a, int n){
+  if (!g_regexp_hooks) ts_throw_type_error_msg("RegExp support is not linked into this program");
+  tsv s = ts_is_str(a[0]) ? a[0] : ts_to_string_v(a[0]); ts_gc_root(&s);
+  tsv re = ts_str_regexp_arg(n>1?a[1]:TS_UNDEFINED, "g"); ts_gc_root(&re);
+  tsv r = g_regexp_hooks->match_all(s, re);
+  ts_gc_unroot(2);
+  return r;
+}
+tsv ts_strproto_search(tsv* a, int n){
+  if (!g_regexp_hooks) ts_throw_type_error_msg("RegExp support is not linked into this program");
+  tsv s = ts_is_str(a[0]) ? a[0] : ts_to_string_v(a[0]); ts_gc_root(&s);
+  tsv re = ts_str_regexp_arg(n>1?a[1]:TS_UNDEFINED, NULL); ts_gc_root(&re);
+  double r = g_regexp_hooks->search(s, re);
+  ts_gc_unroot(2);
+  return ts_num(r);
+}
 tsv ts_strproto_replaceAll(tsv* a, int n){ return ts_str_replace(a[0], n>1?a[1]:TS_UNDEFINED, n>2?a[2]:TS_UNDEFINED, 1); }
 
 tsv ts_string_proto(void){ return ts_proto_ref(g_string_proto_v) ? g_string_proto_v : TS_NULL; }

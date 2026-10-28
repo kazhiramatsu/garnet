@@ -1582,19 +1582,6 @@ int main(){
   tsv cat=ts_add(s, ts_num(5)); /* "hi"+5 = "hi5" */
   CK("str concat num", ts_is_short_str(cat) &&
      ts_strict_eq(cat,ts_new_string("hi5",3)));
-  tsv rxsrc=ts_new_string("abcabc",6); ts_gc_root(&rxsrc);
-  tsv rxpre=ts_new_string("bc",2); ts_gc_root(&rxpre);
-  ts_regexp_litprefix_match rxm={0,0};
-  CK("regexp litprefix ascii", ts_regexp_litprefix_find_view(ts_str_view_typed(rxsrc), ts_str_view_typed(rxpre), 0, 0, &rxm) && rxm.start==1 && rxm.end==3);
-  CK("regexp litprefix start", ts_regexp_litprefix_find_view(ts_str_view_typed(rxsrc), ts_str_view_typed(rxpre), 2, 0, &rxm) && rxm.start==4 && rxm.end==6);
-  CK("regexp litprefix sticky ok", ts_regexp_litprefix_find_view(ts_str_view_typed(rxsrc), ts_str_view_typed(rxpre), 1, 1, &rxm) && rxm.start==1 && rxm.end==3);
-  CK("regexp litprefix sticky miss", !ts_regexp_litprefix_find_view(ts_str_view_typed(rxsrc), ts_str_view_typed(rxpre), 2, 1, &rxm));
-  tsv rxempty=ts_new_string("",0); ts_gc_root(&rxempty);
-  CK("regexp litprefix empty", ts_regexp_litprefix_find_view(ts_str_view_typed(rxsrc), ts_str_view_typed(rxempty), 99, 0, &rxm) && rxm.start==6 && rxm.end==6);
-  tsv rxbmp=ts_new_string("a\343\201\202b",5); ts_gc_root(&rxbmp);
-  tsv rxbmppre=ts_new_string("\343\201\202b",4); ts_gc_root(&rxbmppre);
-  CK("regexp litprefix utf16", ts_regexp_litprefix_find_view(ts_str_view_typed(rxbmp), ts_str_view_typed(rxbmppre), 0, 0, &rxm) && rxm.start==1 && rxm.end==3);
-  ts_gc_unroot(6);
   int replace_short_ok = replace_unit_metrics_match(ts_new_string("a-+a", 4));
   CK("replace unit metrics short", replace_short_ok);
   int replace_empty_ok = replace_unit_metrics_match(ts_new_string("", 0));

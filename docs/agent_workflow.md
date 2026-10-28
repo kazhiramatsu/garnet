@@ -391,15 +391,22 @@ probes with `< /dev/null` on the `dt` call, then feed the compiled
 `build/dt` a pipe by hand (`printf 'a\n' | ./build/dt`), and compare with
 `printf 'a\n' | node build/dt.mjs`.
 
-### Gotcha: the regexp adapter object is cached by presence, not by mtime
+### The regexp engine's objects and its own differential loop
 
 `tsaot_prepare_regexp_objs` (`scripts/lib/regexp_link_flags.sh`) compiles
-`runtime/regexp/ts_regexp_adapter.c` into `$work/regexp/ts_regexp_adapter.o`
-only when that file is missing. After editing the adapter, delete the cached
-objects (`find build -name ts_regexp_adapter.o -not -path '*/native_s350*'
--delete`) before `dt`, the conformance gate or a relink, or the old adapter
-is linked silently. A relink that copies a previous build's `regexp/`
-directory needs the same deletion (see `docs/regexp_first_char_prefilter_design.md`).
+`runtime/regexp/rx_engine.c` (the engine: parser, compiler, VM, Unicode
+tables) and `runtime/regexp/ts_regexp_adapter.c` into `$work/regexp/`, and
+rebuilds either when a file under `runtime/regexp/` (or `ts_rt.h` for the
+adapter) is newer than the object, so an edit is picked up by `dt`, the
+conformance gate and a relink without deleting caches. The engine's own loop
+(no runtime, no node per case): `node tests/regexp/rx_diff.mjs [--random N]
+[--seed S] [--show K]` builds `build/rx_cli` from the engine sources and
+compares tens of thousands of (pattern, flags, input, start) cases with V8's
+capture indices in seconds; `build/rx_cli -d <hex pattern> <flags>` prints a
+program's disassembly. The conformance side is `scripts/gen_regexp_corpus.py`
+(the `vm_*` fixtures; regenerate after a change to the generator and commit
+them). The design and the V8 behaviours mirrored on purpose:
+`docs/regexp_vm_design.md`.
 
 ### The conformance runner in parallel shards
 

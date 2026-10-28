@@ -234,7 +234,10 @@ int ts_truthy(tsv v);
    (docs/typed_arrays_design.md) sit among them. */
 enum { TS_KIND_OBJECT = 1, TS_KIND_ARRAY = 2, TS_KIND_STRING = 3, TS_KIND_FUNC = 4, TS_KIND_MAP = 5, TS_KIND_SET = 6,
        TS_KIND_ARRAYBUFFER = 7, TS_KIND_TYPEDARRAY = 8,
-       TS_KIND_PROMISE = 9, TS_KIND_CORO = 10, TS_KIND_ACCESSOR = 11, TS_KIND_SYMBOL = 12, TS_KIND_PROXY = 13,
+       /* a RegExp carries the common header (named properties, lastIndex among them) and sits
+          before the exotic kinds: the prototype walk treats every kind from PROMISE on as exotic */
+       TS_KIND_REGEXP = 9,
+       TS_KIND_PROMISE = 10, TS_KIND_CORO = 11, TS_KIND_ACCESSOR = 12, TS_KIND_SYMBOL = 13, TS_KIND_PROXY = 14,
        TS_KIND_LAST = TS_KIND_PROXY };
 typedef struct ts_gc_header {
   uint8_t kind, mark, gen;
@@ -329,6 +332,7 @@ static inline tsv ts_short_str_ascii(const char* data, uint32_t len){
 extern int g_has_proxies;
 #endif
 static inline int ts_is_proxy(tsv v){ return ts_is_obj(v) && ((ts_gc_header*)ts_ptr(v))->kind == TS_KIND_PROXY; }
+static inline int ts_is_regexp(tsv v){ return ts_is_obj(v) && ((ts_gc_header*)ts_ptr(v))->kind == TS_KIND_REGEXP; }
 
 /* ---- property key space (property_model_redesign §3.6) ----
    A property key is currently an opaque 32-bit token. The key space is logically
@@ -1124,45 +1128,6 @@ static inline long long ts_str_find_backward_view(ts_strview xs, ts_strview ns, 
   if (start < 0) return -1;
   return ts_str_find_backward_view_slow(xs, ns, start);
 }
-typedef struct ts_regexp_litprefix_match {
-  uint32_t start;
-  uint32_t end;
-} ts_regexp_litprefix_match;
-
-/* RegExp literal-prefix fast-path substrate. This does not implement RegExp
-   semantics; it is the shared scanner contract for future AOT paths that have
-   already proven a pattern has a literal prefix. Positions are UTF-16 code-unit
-   indices, matching JS string indexing and QuickJS/libregexp integration. */
-static inline int ts_regexp_litprefix_find_view(ts_strview xs, ts_strview prefix,
-                                                long long start, int sticky,
-                                                ts_regexp_litprefix_match* out){
-  if (start < 0) start = 0;
-  if (start > (long long)xs.len) start = (long long)xs.len;
-  long long hit;
-  if (sticky){
-    if (prefix.len > xs.len - (uint32_t)start) return 0;
-    hit = ts_str_region_eq(xs, (uint32_t)start, prefix, 0, prefix.len) ? start : -1;
-  } else {
-    hit = ts_str_find_forward_view(xs, prefix, start);
-  }
-  if (hit < 0) return 0;
-  if (out){
-    out->start = (uint32_t)hit;
-    out->end = (uint32_t)hit + prefix.len;
-  }
-  return 1;
-}
-static inline tsv ts_regexp_litprefix_test_fast(tsv s, tsv prefix, int sticky){
-  if (!ts_is_str(s) || !ts_is_str(prefix)) return ts_bool(0);
-  ts_strview xs = ts_str_view_typed(s), ps = ts_str_view_typed(prefix);
-  return ts_bool(ts_regexp_litprefix_find_view(xs, ps, 0, sticky, NULL));
-}
-static inline double ts_regexp_litprefix_search_fast(tsv s, tsv prefix, int sticky){
-  if (!ts_is_str(s) || !ts_is_str(prefix)) return -1;
-  ts_strview xs = ts_str_view_typed(s), ps = ts_str_view_typed(prefix);
-  ts_regexp_litprefix_match m = {0, 0};
-  return ts_regexp_litprefix_find_view(xs, ps, 0, sticky, &m) ? (double)m.start : -1;
-}
 static inline double ts_str_indexof_fast(tsv s, tsv needle, double from, int has_from){
   if (!ts_is_str(s) || !ts_is_str(needle)) return -1;
   ts_strview xs = ts_str_view_typed(s), ns = ts_str_view_typed(needle);
@@ -1346,6 +1311,17 @@ typedef struct ts_map {
   uint64_t next_iteration_order;
 } ts_map;
 
+/* A RegExp (docs/regexp_vm_design.md): the compiled program of runtime/regexp (a reference,
+   released by the sweep through the adapter's hook), the pattern source, the flag mask
+   (RX_F_* / TSAOT_REGEXP_FLAG_*); `lastIndex` is an own data property in the named-property map. */
+typedef struct rx_program rx_program;
+typedef struct ts_regexp {
+  ts_obj_common o;
+  rx_program* prog;
+  tsv source;
+  uint32_t flags;
+} ts_regexp;
+
 /* JS Set: insertion-ordered element array, SameValueZero membership; same
    dense + side-index scheme as ts_map. */
 typedef struct ts_set_t {
@@ -1510,8 +1486,25 @@ void ts_string_proto_register(ts_key method_key, const char* name, ts_code fn);
 tsv  ts_regexp_proto(void);
 void ts_regexp_proto_init(void);
 void ts_regexp_proto_register(ts_key method_key, const char* name, ts_code fn);
-tsv  ts_regexp_object_init(tsv re);
 int  ts_regexp_is_object(tsv re);
+/* a fresh TS_KIND_REGEXP cell (prototype RegExp.prototype), its fields set by the adapter */
+tsv  ts_regexp_alloc(void);
+/* the adapter's entry points the core runtime calls when the program links RegExps
+   (runtime/regexp/ts_regexp_adapter.c installs them): toString, the String methods with a
+   RegExp argument, a RegExp from a string pattern, the program's release on sweep */
+typedef struct ts_regexp_hooks {
+  tsv (*to_string)(tsv re);
+  tsv (*replace)(tsv s, tsv re, tsv replacement, int all);
+  tsv (*split)(tsv s, tsv re, tsv limit);
+  tsv (*match)(tsv s, tsv re);
+  tsv (*match_all)(tsv s, tsv re);
+  double (*search)(tsv s, tsv re);
+  tsv (*from_string)(tsv pattern, tsv flags);
+  void (*release)(rx_program* p);
+} ts_regexp_hooks;
+void ts_regexp_hooks_install(const ts_regexp_hooks* h);
+/* a string from UTF-16 code units */
+tsv   ts_string_from_code_units(const uint16_t* units, uint32_t len);
 tsv ts_strproto_toUpperCase(tsv* a, int n);
 tsv ts_strproto_toLowerCase(tsv* a, int n);
 tsv ts_strproto_toLocaleUpperCase(tsv* a, int n);
@@ -1543,6 +1536,9 @@ tsv ts_strproto_padStart(tsv* a, int n);
 tsv ts_strproto_padEnd(tsv* a, int n);
 tsv ts_strproto_replace(tsv* a, int n);
 tsv ts_strproto_replaceAll(tsv* a, int n);
+tsv ts_strproto_match(tsv* a, int n);
+tsv ts_strproto_matchAll(tsv* a, int n);
+tsv ts_strproto_search(tsv* a, int n);
 /* Number.prototype setup (any-typed number method dispatch). */
 tsv  ts_number_proto(void);
 void ts_number_proto_init(void);
@@ -1733,10 +1729,6 @@ tsv ts_array_concat(tsv x, tsv y);
 tsv ts_array_join(tsv arr, tsv sep);
 tsv ts_array_pop(tsv arr);
 tsv ts_unsupported_builtin(const char* name);
-tsv ts_regexp_object_test_fast(tsv re, tsv input);
-double ts_regexp_object_search_fast(tsv input, tsv re);
-tsv ts_regexp_object_exec_fast(tsv re, tsv input);
-tsv ts_regexp_object_match_fast(tsv re, tsv input);
 
 /* Math (libm-backed; single-arg ones are emitted inline by codegen) */
 double ts_math_round(double x);

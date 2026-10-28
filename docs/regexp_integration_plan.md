@@ -1,3 +1,7 @@
+> Superseded (Session 357): the QuickJS libregexp fallback this plan integrated is replaced by
+> garnet's own engine, `docs/regexp_vm_design.md`. Kept as the history of the literal-prefix
+> paths and the vendoring; `libunicode` is still vendored for `runtime/unicode`.
+
 # RegExp Integration Plan
 
 RegExp support should not turn tsaot into a general JavaScript VM. The AOT

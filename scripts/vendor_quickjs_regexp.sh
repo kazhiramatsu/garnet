@@ -34,16 +34,14 @@ if [[ -z "$top" ]]; then
   exit 1
 fi
 
+# libunicode only: the regexp engine is garnet's own (runtime/regexp, docs/regexp_vm_design.md);
+# runtime/unicode/ts_unicode_adapter.c (String normalize / case mapping) is what uses it.
 required=(
   LICENSE
   cutils.h
-  libregexp.c
-  libregexp.h
-  libregexp-opcode.h
   libunicode.c
   libunicode.h
   libunicode-table.h
-  list.h
 )
 optional=(
   VERSION

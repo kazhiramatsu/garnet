@@ -11358,3 +11358,59 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   compiles literal patterns to C at build time (R3). Slices: R1 the engine and the object model,
   R2 speed against Node on pattern kernels and hono's RegExpRouter, R3 the native tier and the
   long tail.
+- R1 of the regexp VM (`docs/regexp_vm_design.md` "Status"): the engine and the object model.
+  `runtime/regexp/rx_parse.c` (ES2025 + Annex B, V8's error reasons; two passes, an arena AST,
+  duplicate named groups by their disjunction paths, `v`-mode class set operations with the
+  operands case-folded before `--` / `&&` / complement as V8 and the specification do),
+  `rx_compile.c` (bytecode; `i` characters as CHAR2 pairs or canonical compares, classes as
+  canonicalized sets with bitmaps below 256 and ranges above; `x?`/`x*`/`x+` without counters,
+  `{m,n}` with a counter register, the empty-iteration check only for bodies that can match
+  empty and only on optional iterations; lookarounds as sub-runs, lookbehind bodies emitted
+  backward; the analysis: min length, anchoring, the first-character set, the literal prefix),
+  `rx_vm.c` + `rx_vm_body.h` (the search loop with the prefix / first-character prefilters; the
+  interpreter twice, Latin-1 and UTF-16, computed goto, 4-word backtrack entries RESUME /
+  RESTORE / GREEDY / LAZY, simple single-character loops as tight scans with one backtrack entry,
+  a positive lookahead keeping only its RESTORE entries, a 64 MiB stack limit as V8's RangeError),
+  `rx_unicode.c` + `rx_unicode_tables.h` (`scripts/gen_rx_unicode.py`, Unicode 17.0.0: the
+  non-`u` Canonicalize list, simple case folding, General_Category / Script / Script_Extensions /
+  the ECMA-262 binary properties with their aliases, ID_Start / ID_Continue; 441 tables, 23,045
+  ranges, 867 names). `tests/regexp/rx_diff.mjs` (`build/rx_cli`) compares the engine with V8
+  directly: 43,593 cases (hand-written grammar coverage, Annex B, `v` syntax, case tables,
+  surrogates, plus a seeded grammar walk), 0 differ after the fixes it found (the greedy loop's
+  backtrack floor, an optional empty check emitted as the unconditional op, the unit-wise scan
+  inside surrogate pairs, the v-mode fold order, a range before `&&`). The adapter
+  (`ts_regexp_adapter.c`) rewritten on `rx.h`: `TS_KIND_REGEXP` cells (`ts_regexp`: program,
+  source, flags; `lastIndex` a property of the cell's map; the kind sits before PROMISE so the
+  prototype walk does not treat it as exotic; `kind_has_common_header`, the collector's scan and
+  sweep, the toString / tag / inspect paths), the compile caches (content-keyed, 1,024 slots, and
+  the identity cache of literal sources), RegExpBuiltinExec with ToLength(lastIndex), the exec
+  results (`index`, `input`, a null-prototype `groups`, `indices` under `d`), @@match /
+  @@matchAll (a clone with its own lastIndex) / @@replace (the template expansion and function
+  replacers over the string builder) / @@search / @@split (V8's search loop; the sticky walk for a
+  sticky regexp) / the constructor (V8's flag error), RegExp.prototype's accessors (`source`
+  escaped as V8 escapes it, `flags`, the eight flag getters), `RegExp.escape`, and the hooks
+  (`ts_regexp_hooks`) through which the core runtime reaches toString, the program release on
+  sweep and the dynamic String methods: `match` / `matchAll` / `search` are new
+  `ts_strproto_*` entries, `replace` / `split` take a RegExp argument. Exporter: a literal is one
+  `regexp.newLiteral(source, mask)`, `RegExp.escape(s)` lowers, the literal-prefix classifier
+  (`exporter/regexp.ts`, `tests/regexp_classifier.sh`) and its builtins are gone, the non-global
+  matchAll / replaceAll are the runtime's TypeErrors. Link: `rx_engine.o` + the adapter, rebuilt
+  by mtime (the presence-only cache of the old gotcha is gone); libregexp removed from the
+  vendoring (libunicode stays for runtime/unicode). Fixtures: `scripts/gen_regexp_corpus.py` ->
+  `tests/conformance/exhaustive/regexp/vm_{syntax,quantifiers,assertions,classes,case,unicode,
+  named,methods,random}.ts` (2,819 cases over exec/test/search/match/matchAll/replace/split and
+  the error messages), all identical to Node. Gates: conformance 653/653 plain before the corpus and 662/662 strict with it, 659/659
+  under GC protect, unit (math parity included), bundler 51/51, bench 102/102 within budget,
+  `tests/regexp_aot_gate.sh`, `tests/regexp_link_gate.sh` (rewritten on the new API), GC stress PASSED
+  (the focused conformance under O2, ASan and protect mode, the runtime unit tests, the cell-header
+  knobs).
+  Performance (R2 is the tuning slice; these are the R1 baselines, measured after the gates in a
+  quiet window): `benchmarks/patterns/path_regexps.ts` 262 ms at the first cut against the old
+  engine's 238 (Node 113): the first-character prefilter declined tsc's `[^...a-z0-9...]+` (a
+  negated class is a nearly full set); admitting a set without the lower-case letters, as the old
+  adapter's prefilter did, gives 162 ms (1.43x; the old engine 2.1x). The six string pattern
+  kernels are within budget; vue 1,086.4 -> 1,070.3 ms alternating (-1.5%, Node 751; outputs
+  identical); tsc-ts 22.197 -> 22.182 G instructions (unchanged, outputs identical, the build 248 s
+  at three jobs). The prefilter rule came after the gate set: re-verified by the engine diff
+  (44,593 cases, 0 differ) and the 41 regexp-related fixtures (the 23 regexp fixtures, the nine
+  of the corpus, the nine others that use RegExps).

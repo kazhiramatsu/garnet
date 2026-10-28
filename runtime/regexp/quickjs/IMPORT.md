@@ -7,13 +7,9 @@
 - Imported files:
   - LICENSE
   - cutils.h
-  - libregexp.c
-  - libregexp.h
-  - libregexp-opcode.h
   - libunicode.c
   - libunicode.h
   - libunicode-table.h
-  - list.h
 
-Only the optional RegExp runtime may include these files. Do not include
+Only the optional Unicode runtime (runtime/unicode) may include these files (libregexp was removed in Session 357). Do not include
 QuickJS headers from `runtime/ts_rt.c`.
