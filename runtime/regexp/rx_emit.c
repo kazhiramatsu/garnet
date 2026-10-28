@@ -153,7 +153,7 @@ static void emit_fn(emitter* e, const char* name, uint32_t start, uint32_t end){
       }
       case RX_OP_SAVE: {
         uint32_t r = code[pc + 1];
-        put(e->out, "if (rx_bt_push(c, RX_BT_RESTORE, %uu, (uint32_t)regs[%u], 0)) return RX_EXEC_OVERFLOW; regs[%u] = (int32_t)pos;", r, r, r);
+        put(e->out, "if ((c->bt_sp != 0 || c->look_depth != 0) && rx_bt_push(c, RX_BT_RESTORE, %uu, (uint32_t)regs[%u], 0)) return RX_EXEC_OVERFLOW; regs[%u] = (int32_t)pos;", r, r, r);
         break;
       }
       case RX_OP_SAVE_NR: put(e->out, "regs[%u] = (int32_t)pos;", code[pc + 1]); break;
@@ -184,7 +184,7 @@ static void emit_fn(emitter* e, const char* name, uint32_t start, uint32_t end){
         break;
       case RX_OP_LOOK: {
         uint32_t kind = code[pc + 1], body_end = code[pc + 2];
-        put(e->out, "{ uint32_t mark = c->bt_sp, sub = 0; int r = %s_lk%u(c, pos, mark, &sub); if (r < 0) return r; ", name, pc);
+        put(e->out, "{ uint32_t mark = c->bt_sp, sub = 0; c->look_depth++; int r = %s_lk%u(c, pos, mark, &sub); c->look_depth--; if (r < 0) return r; ", name, pc);
         if (!(kind & 1u)) put(e->out, "if (!r) goto fail; rx_bt_compact(c, mark); }");
         else put(e->out, "if (r){ rx_bt_unwind(c, mark); goto fail; } }");
         put(e->out, "\n");

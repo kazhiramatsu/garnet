@@ -2562,6 +2562,21 @@ static tsv ts_new_array_impl(uint32_t len, int pretenured){
   return arr;
 }
 tsv ts_new_array(uint32_t len){ return ts_new_array_impl(len, 0); }
+/* An array whose elements live in the cell: one allocation for the cell and `len` slots (the regexp
+   result arrays, otherwise a cell plus an element payload each), for lengths above the four inline
+   slots and within the small cells. array_uses_inline holds for it, so growth copies the elements
+   out and the collector marks no payload, as for a four-slot array (shift moves the elements of an
+   inline array); the cell's size is its allocation's, which nothing recomputes from the kind. */
+#define TS_ARRAY_COMPACT_MAX 64u
+tsv ts_new_array_compact(uint32_t len){
+  if (len <= 4u || len > TS_ARRAY_COMPACT_MAX) return ts_new_array(len);
+  ts_array* a = gc_alloc(sizeof(ts_array) + sizeof(tsv) * (size_t)(len - 4u), TS_KIND_ARRAY);
+  a->o.proto = ts_proto_ref(g_array_proto_v) ? g_array_proto_v : TS_NULL;
+  a->o.shape = TS_SHAPE_EMPTY;
+  a->len = len; a->cap = len; a->data = a->inline_data;
+  for (uint32_t i = 0; i < len; i++) a->inline_data[i] = TS_ARRAY_HOLE;
+  return ts_obj(a);
+}
 tsv ts_new_array_pretenured(uint32_t len){ return ts_new_array_impl(len, 1); }
 tsv ts_new_array_site(uint32_t len, uint32_t site){
   return gc_site_note(ts_new_array_impl(len, gc_site_tenured(site)), site);
@@ -4030,8 +4045,7 @@ static struct { tsv s; uint32_t key1; } g_lit_key_cache[TS_LIT_KEY_CACHE];
    by the value's bits, which are immutable and never collected, so an entry is never stale. hono's
    router read `matchers[method]` with the request's method string on every match, and each read
    interned the string again (the hash, the probe, the compare). */
-#define TS_SHORT_KEY_CACHE_LOG2 10u
-static struct { tsv s; uint32_t key1; } g_short_key_cache[1u << TS_SHORT_KEY_CACHE_LOG2];
+struct ts_short_key_entry g_ts_short_key_cache[1u << TS_SHORT_KEY_CACHE_LOG2];   /* read in line by ts_key_of_string_inline */
 
 /* Coerce a JS property key value to the runtime key id (ECMAScript ToPropertyKey):
    symbols stay symbol keys; everything else is ToString + string interning.
@@ -4042,10 +4056,9 @@ static int ts_key_from_value_slow(tsv keyv, ts_key* out);
    reconstructs to, which a Proxy trap receives and hands to Reflect.get, `in` and the invariant
    checks) in line; a number, a symbol, a literal or a computed string out of line. */
 static inline int ts_key_from_value(tsv keyv, ts_key* out){
-  if (g_key_caches && ts_is_heap_str(keyv)){
-    uint32_t f = ts_str_flags_typed(keyv);
-    if ((f & (TS_STR_FLAG_STATIC | TS_STR_FLAG_KEY)) == (TS_STR_FLAG_STATIC | TS_STR_FLAG_KEY)){ *out = ts_str_ptr_typed(keyv)->offset; return 1; }
-  }
+  /* a heap string with its key id cached (a literal's, or a flat string's from its first use as a
+     key): the id in line; the out-of-line path answers the same for it after its tests */
+  if (ts_is_heap_str(keyv) && (ts_str_flags_typed(keyv) & TS_STR_FLAG_KEY)){ *out = ts_str_ptr_typed(keyv)->offset; return 1; }
   return ts_key_from_value_slow(keyv, out);
 }
 static int ts_key_from_value_slow(tsv keyv, ts_key* out){
@@ -4096,9 +4109,9 @@ static int ts_key_from_value_slow(tsv keyv, ts_key* out){
       }
     } else if (ts_is_short_str(keyv)){
       uint32_t slot = (uint32_t)(((uint64_t)keyv * 0x9E3779B97F4A7C15ull) >> (64u - TS_SHORT_KEY_CACHE_LOG2));
-      if (g_short_key_cache[slot].s == keyv && g_short_key_cache[slot].key1){ *out = g_short_key_cache[slot].key1 - 1u; return 1; }
+      if (g_ts_short_key_cache[slot].s == keyv && g_ts_short_key_cache[slot].key1){ *out = g_ts_short_key_cache[slot].key1 - 1u; return 1; }
       ts_key k = ts_intern_string_value(keyv);
-      g_short_key_cache[slot].s = keyv; g_short_key_cache[slot].key1 = k + 1u;
+      g_ts_short_key_cache[slot].s = keyv; g_ts_short_key_cache[slot].key1 = k + 1u;
       *out = k;
       return 1;
     }
@@ -7995,6 +8008,17 @@ double ts_array_indexof(tsv arr, tsv v, double from, int has_from){
   ts_array* a=as_arr(arr); if(!a){ if (TS_ARRAY_PROXY(arr)){ tsv av[2] = { v, ts_num(from) }; return ts_number_coerce(ts_method_dynamic(arr, "indexOf", av, has_from ? 2 : 1)); } return -1; }
   long n=(long)a->len, s = has_from ? (long)from : 0;
   if(s<0){ s+=n; if(s<0) s=0; }
+  if (ts_is_short_str(v)){
+    /* an immediate needle (`match.indexOf("", 1)` over a result's captures, hono's route marker):
+       the same immediate, or a heap string of its length and content; a hole is neither */
+    uint32_t vl = ts_short_str_len(v);
+    for(long i=s;i<n;i++){
+      tsv e = a->data[i];
+      if (e == v) return (double)i;
+      if (ts_is_heap_str(e) && ts_str_ptr_typed(e)->len == vl && ts_strict_eq_str(e, v)) return (double)i;
+    }
+    return -1;
+  }
   for(long i=s;i<n;i++) if(!array_is_hole(a->data[i]) && ts_strict_eq(a->data[i], v)) return (double)i;
   return -1;
 }
@@ -18240,12 +18264,9 @@ tsv ts_get_dyn_checked(tsv obj, tsv keyv){
 tsv ts_get_dyn(tsv obj, tsv keyv){
   if (g_has_proxies && ts_is_proxy(obj)) return ts_proxy_get_v(obj, keyv, obj);
   if (ts_is_str(keyv)){
-    ts_gc_root(&obj);
+    /* a string key reaches its id without an allocation (interning is the table's own memory): no root */
     ts_key key;
-    int ok = ts_key_from_value(keyv, &key);
-    tsv r = ok ? ts_get(obj, key) : TS_UNDEFINED;
-    ts_gc_unroot(1);
-    return r;
+    return ts_key_from_value(keyv, &key) ? ts_get(obj, key) : TS_UNDEFINED;
   }
   /* An index on an array uses the element path; any other number is a
      property key (ToString) below, except on fixed-kind storage, where a
@@ -18281,14 +18302,13 @@ tsv ts_get_dyn_pic_checked(tsv obj, tsv keyv, ts_prop_ic* ic){
   if (g_has_proxies && ts_is_proxy(obj)) return ts_get_dyn(obj, keyv);
   if (ts_is_indexed_array_fast(obj) && ts_is_num(keyv)) return ts_get_dyn(obj, keyv);
   if (ts_is_str(keyv) || ts_is_str(obj) || ts_is_obj(obj)){
-    ts_gc_root(&obj);
     ts_key key;
-    int ok = ts_key_from_value(keyv, &key);
+    int ok;
+    if (ts_is_str(keyv)) ok = ts_key_from_value(keyv, &key);   /* a string key allocates nothing on the way to its id */
+    else { ts_gc_root(&obj); ok = ts_key_from_value(keyv, &key); ts_gc_unroot(1); }
     /* a megamorphic site (its keys vary: a map keyed by the request's path) reads without the
        caches, as the slow path would after its probes */
-    tsv result = !ok ? TS_UNDEFINED : (ic && ic->megamorphic) ? ts_get(obj, key) : ts_get_pic_checked(obj, key, ic);
-    ts_gc_unroot(1);
-    return result;
+    return !ok ? TS_UNDEFINED : (ic && ic->megamorphic) ? ts_get(obj, key) : ts_get_pic_checked(obj, key, ic);
   }
   return TS_UNDEFINED;
 }

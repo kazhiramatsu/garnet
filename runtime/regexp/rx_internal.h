@@ -99,6 +99,9 @@ enum {
 #define RX_OP_CP   0x200u    /* code point mode (u / v): a surrogate pair is one character */
 #define RX_OP_IU   0x400u    /* WORDB/NWORDB, BACKREF: the ignoreCase+unicode word set / fold compare */
 #define RX_OP_I    0x800u    /* BACKREF: case-insensitive (non-u canonicalize) */
+#define RX_OP_PK   0x1000u   /* CHARS (forward, every character below 256): (n + 3) / 4 words of the
+                                characters packed as bytes follow the characters, for the narrow
+                                matcher's word-wise compare */
 #define RX_OP_MASK 0xFFu
 /* RX_OP_ALT_FIRST's flags word */
 #define RX_ALT_DISJOINT 1u

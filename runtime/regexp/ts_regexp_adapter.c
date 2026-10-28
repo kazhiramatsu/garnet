@@ -246,6 +246,12 @@ static int builtin_exec(tsv re, tsv s, int32_t* caps){
 /* ---- results ---- */
 static tsv slice(tsv s, int32_t a, int32_t b){
   if (b <= a) return ts_short_str_ascii("", 0);   /* an empty capture (`$()` marks a route in hono's router) */
+  uint32_t n = (uint32_t)(b - a);
+  if (n <= TS_SHORTSTR_MAX && ts_is_heap_str(s)){
+    /* a short capture of a flat ASCII string (a route parameter): the immediate from the bytes */
+    const ts_string* x = ts_str_ptr_typed(s);
+    if ((x->flags & (TS_STR_FLAG_ASCII | TS_STR_FLAG_VIEW | TS_STR_FLAG_UTF16)) == TS_STR_FLAG_ASCII) return ts_short_str_ascii(x->data + a, n);
+  }
   return ts_str_slice(s, (double)a, (double)b, 1);
 }
 static tsv substr(tsv s, uint32_t start, uint32_t len){ return ts_str_slice(s, (double)start, (double)(start + len), 1); }
@@ -325,16 +331,18 @@ static tsv build_indices(tsv s, const int32_t* caps, rx_program* p){
   return arr;
 }
 static tsv build_result(tsv s, const int32_t* caps, rx_program* p){
-  keys_init();
+  if (!g_keys_ready) keys_init();
   uint32_t ng = rx_group_count(p);
   int with_indices = (rx_flags(p) & TSAOT_REGEXP_FLAG_INDICES) != 0;
   ts_gc_root(&s);
-  tsv arr = ts_new_array(ng + 1u);
+  tsv arr = ts_new_array_compact(ng + 1u);   /* the cell and the elements in one allocation */
   int laid = ts_array_adopt_layout(arr, with_indices ? &g_result_layout_d : &g_result_layout);
   ts_gc_root(&arr);
+  ts_array* a = (ts_array*)ts_ptr(arr);   /* dense at its length, never moves; the slot stores need only the generation test */
   for (uint32_t g = 0; g <= ng; g++){
     tsv part = caps[2*g] >= 0 ? slice(s, caps[2*g], caps[2*g+1]) : TS_UNDEFINED;   /* arr is rooted; part is stored at once */
-    ts_array_set_inline(arr, (int64_t)g, part);
+    a->data[g] = part;
+    if (a->o.h.gen == TS_GEN_OLD) ts_array_remember(a, g, part);
   }
   if (laid){ ts_lit_store(arr, 0, ts_num(caps[0])); ts_lit_store(arr, 1, s); }
   else { ts_set_pic(arr, k_index, ts_num(caps[0]), &g_ic_index); ts_set_pic(arr, k_input, s, &g_ic_input); }

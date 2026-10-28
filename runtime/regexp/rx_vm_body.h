@@ -190,7 +190,14 @@ static int RUN_NAME(rx_ctx* c, uint32_t pc, uint32_t pos, uint32_t base, uint32_
     }
     pc += 4; DISPATCH();
   }
-  CASE(SAVE): { uint32_t r = code[pc + 1]; PUSH(RX_BT_RESTORE, r, (uint32_t)regs[r], 0); regs[r] = (int32_t)pos; pc += 2; DISPATCH(); }
+  CASE(SAVE): {
+    /* the restore entry is for unwinding past this point to an older choice point: with none on the
+       stack (and not inside a lookaround body, whose caller undoes the body's writes from the stack)
+       a failure ends the attempt and the registers are reset for the next one */
+    uint32_t r = code[pc + 1];
+    if (c->bt_sp != 0 || c->look_depth != 0) PUSH(RX_BT_RESTORE, r, (uint32_t)regs[r], 0);
+    regs[r] = (int32_t)pos; pc += 2; DISPATCH();
+  }
   CASE(SAVE_NR): regs[code[pc + 1]] = (int32_t)pos; pc += 2; DISPATCH();
   CASE(CLEAR): {
     uint32_t lo = code[pc + 1], hi = code[pc + 2];
@@ -217,7 +224,9 @@ static int RUN_NAME(rx_ctx* c, uint32_t pc, uint32_t pos, uint32_t base, uint32_
     uint32_t kind = code[pc + 1], end = code[pc + 2];
     uint32_t mark = c->bt_sp;
     uint32_t sub_pos;
+    c->look_depth++;
     int r = RUN_NAME(c, pc + 3, pos, mark, &sub_pos);
+    c->look_depth--;
     if (r < 0) return r;
     if (!(kind & 1u)){
       if (!r) goto fail;
@@ -286,10 +295,19 @@ static int RUN_NAME(rx_ctx* c, uint32_t pc, uint32_t pos, uint32_t base, uint32_
       pos -= n;
     } else {
       if (pos + n > len) goto fail;
-      for (uint32_t i = 0; i < n; i++) if (CU(pos + i) != code[pc + 2 + i]) goto fail;
+      if (!RX_WIDE && (w & RX_OP_PK)){
+        /* the packed bytes against the input, eight and four at a time (a route's `user/lookup/`) */
+        const uint8_t* in = c->in8 + pos; const uint8_t* pat = (const uint8_t*)&code[pc + 2 + n];
+        uint32_t i = 0;
+        for (; i + 8u <= n; i += 8u){ uint64_t x, y; memcpy(&x, in + i, 8); memcpy(&y, pat + i, 8); if (x != y) goto fail; }
+        if (i + 4u <= n){ uint32_t x, y; memcpy(&x, in + i, 4); memcpy(&y, pat + i, 4); if (x != y) goto fail; i += 4u; }
+        for (; i < n; i++) if (in[i] != pat[i]) goto fail;
+      } else {
+        for (uint32_t i = 0; i < n; i++) if (CU(pos + i) != code[pc + 2 + i]) goto fail;
+      }
       pos += n;
     }
-    pc += 2 + n; DISPATCH();
+    pc += 2 + n + ((w & RX_OP_PK) ? (n + 3u) / 4u : 0u); DISPATCH();
   }
   CASE(ANY): NEXT_CHAR(w, ch); if (rx_is_lt(ch)) goto fail; pc++; DISPATCH();
   CASE(ANY_ALL): NEXT_CHAR(w, ch); pc++; DISPATCH();

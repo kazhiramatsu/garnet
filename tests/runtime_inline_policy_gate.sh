@@ -51,6 +51,8 @@ while IFS= read -r name; do
     ts_get_pic_checked_inline | \
     ts_set_pic_inline | \
     ts_get_dyn_pic_checked_inline | \
+    ts_key_of_string_inline | \
+    ts_prop_ic_probe_dyn_inline | \
     ts_set_dyn_pic_inline | \
     ts_get_pic_checked_inline_lazy | \
     ts_set_pic_inline_lazy | \

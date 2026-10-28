@@ -97,7 +97,7 @@ int rx_exec(const rx_program* p, const void* input, uint32_t len, int wide, uint
     if (!r) return RX_EXEC_OVERFLOW;
     S->regs = r; S->regs_cap = cap;
   }
-  c.regs = S->regs; c.bt = S->bt; c.bt_cap = S->bt_cap; c.bt_sp = 0;
+  c.regs = S->regs; c.bt = S->bt; c.bt_cap = S->bt_cap; c.bt_sp = 0; c.look_depth = 0;
   if (start > len) return 0;
   if (!wide && p->narrow_impossible) return 0;
   int cp_mode = (p->flags & RX_F_EITHER_UNICODE) != 0;
@@ -168,7 +168,7 @@ uint32_t rx_op_len(const uint32_t* code, uint32_t pc){
     case RX_OP_CLEAR: case RX_OP_CHAR2: case RX_OP_LOOK: return 3;
     case RX_OP_CNT_INC_JL: case RX_OP_CNT_JGE: case RX_OP_EMPTY_CHECK_OPT: case RX_OP_ALT_FIRST: return 4;
     case RX_OP_BACKREF_LIST: return 2 + code[pc + 1];
-    case RX_OP_CHARS: return 2 + code[pc + 1];
+    case RX_OP_CHARS: return 2 + code[pc + 1] + ((code[pc] & RX_OP_PK) ? (code[pc + 1] + 3u) / 4u : 0u);
     case RX_OP_LOOP_GREEDY: case RX_OP_LOOP_LAZY: return 6;
     default: return 1;
   }

@@ -359,6 +359,10 @@ around each call. R4 trims that path without changing what a call means:
 - **R6 — the RegExpRouter's second round.** The alternation's first-character dispatch
   (`ALT_FIRST`), a megamorphic answer for dynamic-key sites whose keys vary, a root-free string
   exec, a union of array types as an array receiver in the exporter.
+- **R7 — the RegExpRouter's third round.** The dynamic-key read in line (the key id of a string at
+  hand, a key-validating cache probe), the result array in one cell, `CHARS` compared a word at a
+  time, `SAVE` without a restore entry on an empty stack, an immediate needle's `indexOf`, the
+  short captures as immediates.
 - **The long tail.** The `v`-mode string properties (the emoji sequence data), the remaining
   divergences the corpus finds.
 
@@ -499,6 +503,42 @@ measurement variant.
   vue 1,073.7 -> 1,072.4 ms (seven alternating rounds each,
   medians; outputs identical; Node 770), tsc-ts 22.200 -> 22.199 G instructions (unchanged; outputs
   identical).
+- **R7 built (Session 357): the RegExpRouter's third round.** After R6 (95 ns a match against
+  Node's ~40) the profile was the matcher 24%, the result array 23%, the dynamic key reads 20%,
+  the driver's loop and the call through the `match` function value 14%. (1) `ts_rt.h`: a dynamic
+  read `obj[key]` resolves a string key's id in line (`ts_key_of_string_inline`: a heap string's
+  cached id, TS_STR_FLAG_KEY, or the short-key table, now shared with the header) and probes the
+  site's cache in line (`ts_prop_ic_probe_dyn_inline`: an entry answers only for its own key and
+  shape, since the fixed-key probe takes a shape match as the answer for the site's one key, which
+  a site whose keys vary has not: its entry 0 answered another key's read with its slot, a wrong
+  value the first A/B caught, fixture `objects/dynamic_key_site_poly`); a megamorphic site goes to
+  the plain lookup at once; `ts_key_from_value` takes any heap string's cached id in line; a
+  string key needs no root on the way to its id. (2) `ts_new_array_compact`: a result array's
+  cell holds its elements (one allocation instead of a cell and an element payload; `array_uses_inline`
+  holds, so growth copies out and the collector marks no payload), the elements stored directly;
+  a capture of up to five ASCII code units of a flat string is built as an immediate; `keys_init`
+  is a flag test. (3) The compiler packs a forward `CHARS` run of characters below 256 as bytes
+  after the characters (`RX_OP_PK`), and the narrow matcher compares them eight and four at a
+  time (`user/lookup/` was twelve unit compares). (4) `SAVE` pushes its restore entry only when
+  the backtrack stack holds a choice point or a lookaround body is running (`rx_ctx.look_depth`):
+  with neither, a failure ends the attempt and the registers are reset for the next one; the
+  native tier emits the same rule. (5) `Array.prototype.indexOf` with an immediate needle compares
+  identities and only a heap string of the same length by content. Fixture
+  `regexp/result_array_ops` (the array operations over a compact result array: growth, shift and
+  unshift, splice, far stores, truncation, deletion, a result held across collections). The engine
+  diff: 43,593 cases, 0 differ in the interpreter and the native mode. Gates: conformance 667/667 plain and strict, 664/664 in units mode and under GC
+  protect, unit, bundler 51/51, bench within budget, the regexp gates, GC stress PASSED. hono, five
+  alternating rounds (medians; Node): TrieRouter 265 -> 246 ms (264), RegExpRouter 86 -> 71 (38),
+  PatternRouter 239 -> 238 (152), SmartRouter 109 -> 93 (49); outputs identical; the regexp kernels,
+  vue (1,058 -> 1,057 ms) and tsc-ts (22.170 -> 22.176 G) unchanged. The RegExpRouter's profile after R7 (79 ns a match in the profiling build, 71 in the measured
+  one; Node 38): the matcher 28% (the interpreter: sixteen ops and a greedy scan a match, near 1 ns
+  an op), the result array and the exec path 22%, the driver's loop and the call through the `match`
+  function value 17%, the match closure's body with its `[handlers, match]` pair 12%, the dynamic
+  key reads 8%, `indexOf` 4%. What would close the rest: a native matcher for the patterns a
+  program builds at run time (a training run's record of their sources, as the profile-guided build
+  records hot functions; hono's route regexp is the same at training and in production), the method
+  call through an interface-typed receiver with the sized caches (`router.match`), and the
+  allocation path of small arrays (the result and the pair).
 - Not yet: the `v`-mode properties of strings (`\p{RGI_Emoji}` and the other six; the emoji
   sequence data is in `build/ucd/17.0.0/emoji-seq/`, emoji 16.0 at the time of writing).
 

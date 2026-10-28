@@ -19,6 +19,7 @@ typedef struct rx_ctx {
   uint32_t len;
   int32_t* regs;
   uint32_t* bt; uint32_t bt_sp, bt_cap;
+  uint32_t look_depth;   /* lookaround bodies being run: a SAVE inside one keeps its restore entry */
 } rx_ctx;
 
 /* a natively compiled run, the interpreter run's contract: 1 on ACCEPT with *out_pos the match

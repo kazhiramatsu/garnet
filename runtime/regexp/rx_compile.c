@@ -450,7 +450,21 @@ static void compile_node(cstate* c, rx_node* n){
         while (i < nk){
           uint32_t j = i;
           while (j < nk && CHARS_OK(n->kids[j])) j++;
-          if (j - i >= 2){ emit(c, RX_OP_CHARS); emit(c, j - i); for (uint32_t k = i; k < j; k++) emit(c, n->kids[k]->cp); i = j; }
+          if (j - i >= 2){
+            uint32_t at = here(c), m = j - i, all8 = 1;
+            emit(c, RX_OP_CHARS); emit(c, m);
+            for (uint32_t k = i; k < j; k++){ emit(c, n->kids[k]->cp); if (n->kids[k]->cp > 0xFFu) all8 = 0; }
+            if (all8){
+              /* the characters packed as bytes (RX_OP_PK): the narrow matcher compares them a word at a time */
+              c->code[at] |= RX_OP_PK;
+              for (uint32_t k = 0; k < m; k += 4u){
+                uint32_t word = 0;
+                for (uint32_t b = 0; b < 4u && k + b < m; b++) word |= (uint32_t)(n->kids[i + k + b]->cp & 0xFFu) << (8u * b);
+                emit(c, word);
+              }
+            }
+            i = j;
+          }
           else { compile_node(c, n->kids[i]); i++; }
         }
       } else {

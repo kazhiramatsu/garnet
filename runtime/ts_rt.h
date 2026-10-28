@@ -1657,6 +1657,7 @@ tsv  ts_new_sized_pretenured(size_t size);
 tsv  ts_new_sized_site(size_t size, uint32_t site, tsv proto);
 /* arrays (contiguous storage with an internal sparse-hole sentinel) */
 tsv  ts_new_array(uint32_t len);    /* length-len sparse array (all slots holes) */
+tsv  ts_new_array_compact(uint32_t len);   /* the same with the elements in the cell (one allocation; above four, within the small cells) */
 tsv  ts_new_uint16_array(tsv input);
 tsv  ts_new_array_pretenured(uint32_t len);
 tsv  ts_array_get(tsv arr, uint32_t i);
@@ -3580,11 +3581,58 @@ static inline tsv ts_array_get_inline_lazy_f64(tsv arr, double d, ts_frame_hdr* 
   ts_frame_pop(frame);
   return r;
 }
+/* The key id of a string value in line: a heap string that cached it (TS_STR_FLAG_KEY: a flat
+   string's offset word, set by the out-of-line path on its first use as a key) or an immediate
+   short string in the short-key table (ts_rt.c ts_key_from_value_slow fills it); 0 when the
+   out-of-line path must intern. */
+#define TS_SHORT_KEY_CACHE_LOG2 10u
+struct ts_short_key_entry { tsv s; uint32_t key1; };
+extern struct ts_short_key_entry g_ts_short_key_cache[1u << TS_SHORT_KEY_CACHE_LOG2];
+TS_RT_ALWAYS_INLINE int ts_key_of_string_inline(tsv keyv, ts_key* out){
+  if (ts_is_heap_str(keyv)){
+    const ts_string* x = ts_str_ptr_typed(keyv);
+    if (x->flags & TS_STR_FLAG_KEY){ *out = x->offset; return 1; }
+    return 0;
+  }
+  if (ts_is_short_str(keyv)){
+    const struct ts_short_key_entry* e = &g_ts_short_key_cache[(uint32_t)(((uint64_t)keyv * 0x9E3779B97F4A7C15ull) >> (64u - TS_SHORT_KEY_CACHE_LOG2))];
+    if (e->s == keyv && e->key1){ *out = e->key1 - 1u; return 1; }
+  }
+  return 0;
+}
+/* The probe of a dynamic-key site (`obj[key]`, the key a value): an entry answers only for its own
+   key and shape. The fixed probe above takes a shape match as the answer for the site's one key,
+   which a site whose keys vary (hono's `matchers[method]`, a trie's `children[part]`) has not:
+   entry 0 filled for one key would answer another key's read with its slot. */
+TS_RT_ALWAYS_INLINE tsv* ts_prop_ic_probe_dyn_inline(tsv obj, ts_key key, ts_prop_ic* ic, uint8_t* flags){
+  if (!ic || ic->megamorphic) return NULL;
+  ts_object* o = (ts_object*)ts_ptr(obj);
+  if (o->h.kind > TS_KIND_ARRAY || ts_obj_is_sized(o) || ts_obj_shape_id(o) == TS_SHAPE_NONE) return NULL;
+  for (uint32_t i = 0; i < TS_PROP_IC_SIZE; i++){
+    const ts_prop_ic_entry* e = &ic->entries[i];
+    if (e->key == key && e->shape == o->shape){ *flags = (uint8_t)(e->slot >> TS_PIC_FLAGS_SHIFT); return ts_obj_slot_ptr(o, e->slot & TS_PIC_SLOT_MASK); }
+  }
+  return NULL;
+}
+/* obj[key] at a site with an inline cache: a megamorphic site reads without the caches; an object
+   receiver with a string key whose id is at hand (a request's method or path: hono's
+   `matchers[method]`) is the static-key inline read with the site's cache, as the out-of-line
+   path would resolve it; the rest (numbers, symbols, strings to intern, primitives, null) out of
+   line. */
 TS_RT_ALWAYS_INLINE tsv ts_get_dyn_pic_checked_inline(
     tsv obj, tsv key, ts_prop_ic* ic){
+  ts_key k;
   if (ic && ic->megamorphic){
     TS_RT_STAT_PIC_GET_CALL();
+    /* the plain lookup at once for an object and a string key at hand (the route map's miss) */
+    if (TS_TOP16(obj) == TS_SEL_OBJECT && ts_key_of_string_inline(key, &k)) return ts_get(obj, k);
     return ts_get_dyn_checked(obj, key);
+  }
+  if (TS_TOP16(obj) == TS_SEL_OBJECT && ts_key_of_string_inline(key, &k)){
+    uint8_t flags = 0;
+    tsv* p = ts_prop_ic_probe_dyn_inline(obj, k, ic, &flags);
+    if (p && !(flags & TS_PROP_ACCESSOR)) return (flags & TS_PROP_INT32) ? ts_int_slot_box(*p) : *p;
+    return ts_get_pic_checked(obj, k, ic);
   }
   return ts_get_dyn_pic_checked(obj, key, ic);
 }

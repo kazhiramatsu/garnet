@@ -11589,3 +11589,41 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   vue 1,073.7 -> 1,072.4 ms (seven alternating rounds each,
   medians; outputs identical; Node 770), tsc-ts 22.200 -> 22.199 G instructions (unchanged; outputs
   identical).
+- R7 of the regexp VM: the RegExpRouter's third round (docs/regexp_vm_design.md "R7 built"). Kaz
+  asked for hono's RegExpRouter at V8's level. After R6 a match took 95 ns against Node's ~40: the
+  matcher 24%, the result array 23%, the dynamic key reads 20%, the driver's loop and the call
+  through the `match` function value 14%. (1) A dynamic read `obj[key]` resolves a string key's id
+  in line (`ts_key_of_string_inline`: the heap string's cached id or the short-key table, now shared
+  with the header) and probes the site's cache in line with a key-validating probe
+  (`ts_prop_ic_probe_dyn_inline`); the fixed-key probe's shape-match shortcut answered another key's
+  read with its slot at a site whose keys vary (the first A/B's outputs differed: hono's
+  `matchers[method]`, the trie's `children[part]`; fixture `objects/dynamic_key_site_poly`). A
+  megamorphic site takes the plain lookup at once, `ts_key_from_value` takes any heap string's
+  cached id in line, and a string key needs no root on the way to its id. (2) `ts_new_array_compact`:
+  a result array's cell holds its elements (one allocation, not a cell and a payload); the elements
+  are stored directly; a capture of up to five ASCII units of a flat string is an immediate.
+  (3) The compiler packs a forward `CHARS` run of characters below 256 as bytes (`RX_OP_PK`) and the
+  narrow matcher compares eight and four at a time. (4) `SAVE` pushes its restore entry only when a
+  choice point is on the stack or a lookaround body is running (`rx_ctx.look_depth`); the native
+  tier emits the same rule. (5) `indexOf` with an immediate needle compares identities and only a
+  heap string of the same length by content. Fixtures `regexp/result_array_ops`,
+  `objects/dynamic_key_site_poly`. The engine diff 43,593 cases 0 differ in both modes. hono, five
+  alternating rounds (medians; Node): TrieRouter 265 -> 246 ms (264: below Node), RegExpRouter
+  86 -> 71 (38), PatternRouter 239 -> 238 (152), SmartRouter 109 -> 93 (49); outputs identical.
+  The regexp kernels within their spread (tokenizer 141 -> 140, validate 90 -> 87, logs 130 -> 123,
+  search 113 -> 111, path_regexps 129 -> 127; Node 117 / 87 / 115 / 110 / 113). Gates: conformance 667/667 plain and strict (the fixtures included), 664/664 in units mode
+  and under GC protect, the regexp fixtures under `TSAOT_GC_YOUNG_THRESHOLD=1` with protect mode,
+  unit (the inline policy gate's allowlist takes the two bounded helpers), bundler 51/51, bench all
+  within budget, the regexp AOT and link gates, GC stress PASSED (rerun after the allowlist), the engine diff
+  43,593 cases 0 differ in both modes. vue 1,057.7 -> 1,057.0 ms (seven alternating rounds each,
+  medians; outputs identical; Node 747), tsc-ts 22.170 -> 22.176 G instructions (unchanged; outputs
+  identical).
+  The RegExpRouter's profile after R7 (79 ns a match in the profiling build, 71 in the measured
+  one; Node 38): the matcher 28% (the interpreter: sixteen ops and a greedy scan a match, near 1 ns
+  an op), the result array and the exec path 22%, the driver's loop and the call through the `match`
+  function value 17%, the match closure's body with its `[handlers, match]` pair 12%, the dynamic
+  key reads 8%, `indexOf` 4%. What would close the rest: a native matcher for the patterns a
+  program builds at run time (a training run's record of their sources, as the profile-guided build
+  records hot functions; hono's route regexp is the same at training and in production), the method
+  call through an interface-typed receiver with the sized caches (`router.match`), and the
+  allocation path of small arrays (the result and the pair).
