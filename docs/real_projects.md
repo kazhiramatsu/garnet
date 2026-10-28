@@ -519,3 +519,72 @@ read was never recorded, and a primitive receiver walked its wrapper prototype's
 read. An array-kind prototype is a valid link now, and a primitive reads through its wrapper
 prototype's entry (`docs/absent_reads_inline_design.md` "Arrays and primitives"): vue 36.996 ->
 36.023 G instructions, 1,277 -> 1,231 ms alternating (Node 756: 1.63x).
+
+### The third round: the function map, then the dynamic paths
+
+Reading the profiles above meant mapping `fn_1113_fn1113_d`, `fn_1117_fn1117` and `fn_316` to
+`Dep.track`, the `get` trap and `makeMap`'s closure by hand from the C bodies (the exporter named a
+class member `fn<id>`). A generated function's C symbol now carries its source context
+(`fn_1113_Dep_track`, `fn_1117_BaseReactiveHandler_get`, `fn_316_makeMap_arrow`,
+`fn_915_reactivityRound_computed`, `fn_449_iterator_next`; `docs/agent_workflow.md` "Reading the
+symbols"), every C body starts with `/* src: <file>:<line>:<col> */`, and `scripts/sample_tree.py -c
+<driver.c>` and `scripts/prof_pc.py` print each generated function with its source position. (The
+same slice gave a class member its JS `fn.name` and `fn.length`: `Dep.prototype.track.name` read `""`.)
+
+The annotated profile (PC samples, one run): `Dep.track` 6.2% self, the out-of-line property read
+8.7% (`ts_get_pic_checked` 4.0% + its slow path 4.6%, called from `isRef`, `isReadonly` and
+`createReactiveObject`: absent reads on megamorphic sites, and every read of a reactive object,
+whose receiver is a Proxy, went through the same probes before reaching `ts_get`'s proxy gate), the
+`get` trap's body 4.4%, `map_find` 3.6% (`targetMap.get(target)`, `depsMap.get(key)`,
+`proxyMap.get(target)`), `prop_find` 3.0% (`Reflect.get`'s chain walk), the trap call 4.2%
+(`invoke_with_this` 2.3% + `ts_call` 1.9%), the trap lookup 3% (`ts_get` on the handler through
+`class_field_lookup` and `sized_inherited_get`); 41% of the run is under `ts_proxy_get_v`. The
+direction from here (Kaz, 2026-10-28): the dynamic paths to V8's level, and no construct a real
+project uses left uncompiled or wrong.
+
+The first dynamic-path slice (runtime only):
+
+- **The leaf answers a Proxy receiver and a megamorphic site's absent read.** `ts_get_pic_checked`
+  takes a Proxy receiver to its `[[Get]]` at once (`ts_set_pic` likewise to `[[Set]]`), and on a
+  megamorphic site probes the global absent table itself (`prop_absent_lookup`) instead of after the
+  sized-receiver probes and the slow path's frame.
+- **The trap cache** (`ts_proxy_trap`): one entry per trap name holding the handler cell, its class
+  word (a plain handler: its shape word), the holder prototype and the holder's shape word and slot,
+  checked on identity, word, the handler's dyn flag and the holder's shape, the slot's current value
+  read (a trap replaced in place is followed; an own addition, a deletion, a redefinition, a relink
+  or a dictionary handler misses). vue's handlers are class instances whose traps are prototype
+  methods: each proxied read resolved `get` through the registry's miss and the inherited-property
+  cache.
+- **The hot traps are called directly** (`proxy_call_trap` for get, set and has): the operation's
+  locals are rooted already, so the receiver slot is prepended without rooting every copy again.
+
+Fixtures `proxy/trap_cache_mutations` (every way a trap changes after the cache filled) and
+`objects/absent_reads_megamorphic` (one site over 30 shapes with arrays, primitives and a Proxy, the
+prototypes changed between reads). The leaf's absent-table probe is taken only by a site that has
+recorded an absent read (its record's tag): without that condition the typed compiler's
+megamorphic present reads paid the probe (tsc-ts +0.1%). vue 1,258.4 -> 1,161.5 ms alternating
+(-7.7%; Node 778: 1.49x), 36.014 -> 33.770 G instructions (-6.2%); rxjs 385.2 -> 384.8 and yaml
+3,593.8 -> 3,588.0 (unchanged); tsc-ts 22.243 -> 22.236 G (unchanged); outputs identical.
+
+The hidden-class plan (`docs/hidden_class_design.md`) began after that slice. S0: a method's
+`this` of an unstable class (vue's `Dep`, `ReactiveEffect`, `ComputedRefImpl`: an `any` from
+`new Map()` typed as `Dep`, `as Subscriber` casts) reads its declared fields at their struct
+offsets, and any other receiver typed as such a class reads them under the interval guard (one
+compare, one load): vue 1,161.5 -> 1,140.0 ms (33.770 -> 33.019 G), rxjs 386.8 -> 365.7 ms (its
+subscriber classes are unstable too). S1, the global (map, key) stub cache, was built and
+withdrawn: redundant with the shape index, the absent table and the sized caches, it cost vue
+1.3% with the cache on and 1.9% in code shape with it off. Its measurement found the real defect:
+the `isRef(v)` site never counts as megamorphic (an absent read fills the site's record, not its
+entries), so 16.7 M reads per run went through the slow path to the absent table; the leaf now
+answers them (and a primitive's through its wrapper prototype): vue 33.019 -> 32.552 G, 1,138.3 ->
+1,119.9 ms alternating (Node 778: 1.44x).
+
+Slice 3 took the paths the S1 measurement pointed at: the leaf read without a frame (every inline
+miss paid its prologue), ToPropertyKey in line for a canonical key string, the Proxy operations
+rooting in one shadow frame instead of seven root pushes: vue 32.552 -> 31.386 G instructions,
+1,119.9 -> 1,098.7 ms alternating (Node 778: 1.41x); rxjs 366.6 -> 362.8 and yaml 3,564.1 ->
+3,527.5 ms (-1.0% each).
+Slice 4 kept the trap name's index per call site (vue 1,102.6 -> 1,095.5 ms) and reverted a
+sized-first probe order at interface-typed sites (a wash: vue -0.25%, rxjs +0.3%). The day's
+dynamic-path slices together: vue 1,231 -> 1,095.5 ms (Node 778: 1.63x -> 1.41x), rxjs 385 ->
+367, yaml 3,590 -> 3,562; tsc-ts unchanged throughout.

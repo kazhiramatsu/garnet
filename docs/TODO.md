@@ -11155,3 +11155,173 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   the key added to and deleted from each wrapper prototype, Array.prototype and Object.prototype
   afterwards; a replaced array prototype; a getter on Number.prototype reached from a primitive; a
   string's own length and indices; a frozen prototype).
+
+## Session 356 (2026-10-28): real projects, vue's third round (the function map)
+
+- The function map: a generated function's C symbol names its source context (Session 356,
+  `docs/agent_workflow.md` "Reading the symbols"). Reading vue's profile meant mapping
+  `fn_1113_fn1113_d`, `fn_1117_fn1117`, `fn_316`, `fn_915` and `fn_449` to `Dep.track`, the
+  `get` trap, `makeMap`'s closure, the driver's `computed` getter and the instrumented iterator's
+  `next` by hand from the C bodies: the exporter named a method `fn<id>` (a `MethodDeclaration` is
+  not a function declaration or expression) and an anonymous function `arrow<id>` / `fn<id>`. The
+  IR function carries two new fields (serde defaults; the six `tests/*.rs` literals carry them):
+  `debugName`, the name the C symbol takes (`fn_<id>_<debugName>` in `cname`), derived by
+  `debugNameOf` from the node and memoized: a class member `Dep_track` / `Dep_get_dirty` /
+  `Dep_set_dirty` / `Dep_ctor` (an object-literal member under its enclosing function), a named
+  function its name, an anonymous function the binding it initializes (`isRef`), the property it
+  is assigned to (`iterator_next` for `iter.next = () => ...`, a class field likewise), the callee
+  it is passed to (`reactivityRound_computed`, `makeMap_arrow` is `makeMap`'s returned arrow) or
+  else its enclosing function (`track_arrow`); non-identifier characters fold to `_`, 64 characters
+  at most, the id keeps the symbol unique. `src`, `file:line:col` of the function (the file relative
+  to the working directory), which the emitter writes as `/* src: ... */` on the first line of every
+  C body (the generic entry, the direct entry, the coroutine entries), so `grep -n 'src: .*dep.ts:108'`
+  finds a function from its source and the profile tools annotate: `scripts/sample_tree.py -c <C
+  file or units dir> <sample> <mode>` and `scripts/prof_pc.py` (from its units dir) print
+  `fn_1113_Dep_track_d [build/real/vue/packages/reactivity/src/dep.ts:108:3]` (sample_tree's ties
+  are ordered by name now: a set walk had ordered them per process). vue's driver: 2,301 bodies
+  annotated; the profiled functions read `fn_1113_Dep_track`, `fn_1117_BaseReactiveHandler_get`,
+  `fn_1111_Link_ctor`, `fn_1106_ReactiveEffect_run`, `fn_316_makeMap_arrow`,
+  `fn_915_reactivityRound_computed`, `fn_449_iterator_next`. Named functions keep their symbols
+  (`fn_404_track_d`), so `scripts/build_tsc_ts_native.sh`'s `_create[A-Z]` rule and the O0 lists
+  are unaffected; `c_units.rs` reads the id after `fn_`. A PGO profile is keyed by these names
+  (`docs/pgo_design.md`, the caveat updated): none is committed, the tsc-ts build trains its own.
+- `fn.name` and `fn.length` of a class or object-literal member (the same slice). The member's
+  IR `name` was `fn<id>`, and a method boxed onto its class prototype (`ts_make_fn_t` in the
+  prototype setup) never received its metadata: `Dep.prototype.track.name` read `""`, a static
+  method's `"fn4"`, an accessor's `""` (V8: `"track"`, `"s"`, `"get dirty"`), and their `length`
+  0. The exporter names a method after its key, an accessor `get x` / `set x`, a well-known-symbol
+  key `[Symbol.iterator]` (another computed key has no static name: `""`), and the prototype setup
+  calls `ts_set_fn_meta(fn, FN_ARITY[id], FN_NAME[id])` after boxing each member. The emitter's
+  legacy entry fallback (`main` when no `__module_init` exists) now skips a member named `main`
+  (`takes_this`). Fixture `classes/member_fn_name` (methods, accessors, a static with a default
+  parameter, a symbol and a quoted key, object-literal members, a value read off an instance).
+- Gates: conformance 647/647 plain and strict, 644/644 under GC protect, unit (math parity
+  included), bundler 51/51, bench 102/102 within budget, `tests/units_build_gate.sh` 21 checks;
+  tsc-ts 22.214 -> 22.208 G instructions (unchanged; outputs identical; the build 248 s at three
+  jobs); vue outputs identical, 1,237.0 ms (one run; Node 759.1). No runtime hot path changed
+  (one init-time call per prototype method), so no GC stress run.
+- The dynamic paths, slice 1 (runtime; Session 356, `docs/real_projects.md` vue "The third round",
+  `docs/hidden_class_design.md` for the plan). Kaz's direction: real projects spend their time in
+  the dynamic paths, which should reach V8's level; and no construct a real project uses may stay
+  uncompiled or wrong. vue's annotated profile: 41% of the run under `ts_proxy_get_v`, the
+  out-of-line property read 8.7% (absent reads on megamorphic sites, Proxy receivers), the trap
+  lookup 3%, the trap call 4.2%. (1) `ts_get_pic_checked` takes a Proxy receiver to its `[[Get]]`
+  at once (`ts_get_proxy_keyed`; `ts_set_pic` to `[[Set]]`) instead of after the sized probes and
+  the slow path's frame, and on a megamorphic site that has recorded an absent read (its record's
+  `TS_ABSENT_EPOCH_TAG`) probes the global absent table in the leaf (`prop_absent_lookup`); the
+  tag condition keeps the typed compiler's megamorphic present reads off the probe (+0.1%
+  without it). (2) `ts_proxy_trap` resolves a trap through a per-name cache (`g_trap_cache`: the
+  handler cell, its class word or shape word, the holder prototype and its shape word and slot;
+  checked on identity, word, the handler's dyn flag and the holder's shape, the slot's current
+  value read; filled for a sized handler's prototype trap on an old-generation shaped holder or
+  a plain handler's own slot). (3) The get, set and has traps are called by `proxy_call_trap`,
+  which prepends the receiver slot without rooting every copy (the operation's locals are
+  rooted). Fixtures `proxy/trap_cache_mutations` (a prototype trap replaced in place, an
+  intermediate prototype gaining it, an own property shadowing it and deleted, the trap set to
+  undefined, an accessor trap, a relinked handler, a plain handler's trap reassigned, deleted and
+  made non-callable, a handler behind two proxies, a revoked proxy) and
+  `objects/absent_reads_megamorphic` (one site over 30 shapes with arrays, primitives and a Proxy,
+  the key added to and removed from `Object.prototype`, an own prototype, an intermediate one,
+  `Array.prototype`, a receiver, a relink). vue 1,258.4 -> 1,161.5 ms alternating (-7.7%; Node
+  778: 1.49x), 36.014 -> 33.770 G instructions (-6.2%); rxjs 385.2 -> 384.8 and yaml 3,593.8 ->
+  3,588.0 ms (unchanged); tsc-ts 22.243 -> 22.236 G (unchanged); outputs identical. Gates:
+  conformance 649/649 plain (after the tag condition; 649/649 plain and strict, 646/646 under GC
+  protect before it), unit, bundler 51/51, bench 102/102 within budget. GC stress not yet run
+  (a runtime change: to run in the next quiet window).
+- S0 of the hidden-class plan (`docs/hidden_class_design.md`, Session 356): `this` and the
+  receivers of an unstable class. vue's `Dep`, `ReactiveEffect` and `ComputedRefImpl` are unstable
+  in the structural flow pass (an `any` from `new Map()` typed as `Dep`, `as Subscriber` casts),
+  and an unstable class took no class hint and no struct-direct access, so `Dep.track` read every
+  `this.*` through the sized inline cache. The instability is static (a value of another kind may
+  be typed as the class); the instances keep the declared layout. (a) A method's `this` of a
+  class with a class interval reads its declared fields at their struct offsets with the guard a
+  stable class's `this` has (the typed-slow flag's interval test; a foreign `this` arrives only
+  through a borrow, a relink or an `Object.create` of the prototype, each of which raises the
+  flag): `this_local` in the emitter's context, `struct_offset_for`; `TSAOT_THIS_DIRECT=0`. (b) Any
+  other receiver typed as such a class (a parameter through `paramClasses`, a hinted expression)
+  reads the struct slot under the always-on interval guard (`!ts_is_obj(o) || cls - lo >= span`:
+  one compare and one load, a monomorphic map check), a value of another kind taking the generic
+  read: the exporter hints an unstable class whose reasons are all static (`classLayoutPreserved`:
+  no foreign base, no reassigned prototype) and marks the site `sized` too for an emitter without
+  an interval; `hint_guard` admits only the interval guard for an unstable class (the root and leaf
+  guards rest on the structural proof the class lacks); the `known` path takes the same guard; the
+  integer-slot facts of a hinted load stay with stable classes. `TSAOT_UNSTABLE_HINTS=0`. Fixtures
+  `classes/unstable_this_direct` (borrowed methods on another class's instance and a plain object,
+  an `Object.create(C.prototype)` receiver, a plain object typed as the class running its own
+  methods, a relinked instance, a subclass) and `classes/unstable_hint_range` (instances, a
+  subclass, another class, plain objects with and without the fields, a relinked instance, a
+  frozen instance's write, null and undefined, an own dynamic property). The first fixture's draft
+  showed the documented typed-mode trust (a plain object's own method returning a string where the
+  class's is typed `number` reads NaN) and the loud reject of `defineProperty` of an accessor over
+  a class field: both are known items, the fixtures avoid them. vue 1,161.5 -> 1,140.0 ms
+  alternating (-1.9%; Node 778: 1.47x), 33.770 -> 33.019 G instructions (-2.2%); rxjs 386.8 ->
+  365.7 ms (-5.5%: its subscriber classes are unstable); yaml 3,550.7 -> 3,565.3 (within the
+  spread); tsc-ts 22.220 -> 22.224 G (unchanged); outputs identical. Gates: conformance 651/651
+  plain, 652/652 strict, 649/649 under GC protect, unit, bundler 51/51, bench 102/102 within
+  budget.
+- S1 of the hidden-class plan, tried and reduced (Session 356, `docs/hidden_class_design.md` S1).
+  The global (map word, key) stub cache was built as designed (`g_stub_cache`: OWN slot, STRUCT
+  field, PROTO holder slot, ABSENT chain snapshot; probed by the leaf read of a megamorphic or
+  absent-recording site, the generic read, `Reflect.get` and `in`, filled by the slow paths) and
+  measured with `--rt-stats` on vue: 26 M hits, 0.8 M misses, 11 k fills, and the run +1.3%
+  instructions with the cache on against off, +1.9% off against the runtime before it (the code
+  the probes put into the leaf and the generic read). It is redundant with the shape index, the
+  absent table and the sized caches: each probe replaced a lookup of the same cost. Withdrawn
+  (`TSAOT_STUB_CACHE` never shipped). Its measurement found the defect that stayed fixed: the
+  `isRef(v)` site never counts as megamorphic (an absent read fills the site's absent record, not
+  its entries, whose misses make a site megamorphic), so every receiver of another shape went
+  inline miss -> leaf -> slow path -> absent table, 16.7 M times per vue run. The leaf now
+  answers a receiver of another shape at a site with an absent record (`rec_epoch`'s
+  TS_ABSENT_EPOCH_TAG) from the absent table (a plain object or array), and a primitive through
+  its wrapper prototype's entry out of line (`ts_get_pic_primitive`). The lesson for the plan: on
+  garnet a cache pays only where it removes a path, not where it replaces a lookup of the same
+  cost; S2 (prototype validity cells) shortens a chain compare of at most three links and is
+  deferred behind the path trims. Fixture `objects/megamorphic_site_mutations` (one site over 24
+  shapes behind a prototype: the holder's value replaced, an own key shadowing and deleted, the
+  holder losing and regaining the key, a relink, a dictionary-mode receiver, an accessor on the
+  holder, a frozen receiver, `Reflect.get` with a foreign receiver, the key on `Object.prototype`).
+  vue 33.019 -> 32.552 G instructions (-1.4%), 1,138.3 -> 1,119.9 ms alternating (-1.6%; Node
+  778: 1.44x); rxjs 364.9 -> 365.0 ms and yaml 3,536.7 -> 3,551.7 (both within the spread,
+  12.846 -> 12.845 G and 90.002 -> 89.976 G); tsc-ts 22.197 -> 22.202 G (unchanged); outputs
+  identical. Gates: conformance 652/652 plain and strict, 649/649 under GC protect, unit, bundler
+  51/51, bench 102/102 within budget.
+- Slice 3 of the dynamic paths: the path trims the S1 measurement pointed at (Session 356,
+  `docs/hidden_class_design.md` S1b). (1) The leaf read keeps no frame: `ts_get_pic_checked` had a
+  prologue and an epilogue (callee-saved registers, a 0x50-byte frame) because of the plain calls
+  inside it, paid by every inline miss (13% of vue's samples were prologues); its out-of-line
+  parts are tail calls now (`ts_get_pic_sized`, `ts_get_pic_other`, `ts_get_proxy_keyed`,
+  `ts_get_pic_primitive`, the slow read) and what stays in line is call-free: the site record, a
+  plain object's absent-table probe, a class instance's inherited and absent cache hits when it
+  has no own dynamic properties (`sized_absent_cached_core`; the dynamic-property test calls
+  `prop_find`), the megamorphic registry entry and the site's sized entries read by kind
+  (`sized_field_read`). The first cut sent every sized receiver out of line and cost rxjs 1.1%
+  (`destination.next`, an inherited read on every subscriber); with the hits in line rxjs gains.
+  (2) ToPropertyKey in line for a canonical key string (`ts_key_from_value`: the string a key id
+  reconstructs to carries TS_STR_FLAG_KEY, which is what a Proxy trap receives and hands to
+  `Reflect.get`, `in` and the invariant check); the rest in `ts_key_from_value_slow`. (3) The
+  Proxy get, set and has operations root their values in one shadow frame (`ts_proxy_frame`,
+  `ts_frame_push` as a generated function roots its locals) instead of seven root pushes and a
+  pop; the slots are read back after every call (a young cell may move), a throw through a trap
+  restores the frame top at the handler. Fixture `proxy/trap_gc_frames` (traps that allocate
+  through many collections with every value alive across the trap, a proxied read inside a trap,
+  a throw through the frame, a trap replaced from inside a trap). vue 32.552 -> 31.386 G
+  instructions (-3.6%; the leaf -2.5%, the frames -1.2%), 1,119.9 -> 1,098.7 ms alternating
+  (-1.9%; Node 778: 1.41x); rxjs 12.845 -> 12.802 G, 366.6 -> 362.8 ms (-1.0%); yaml 89.979 ->
+  89.806 G, 3,564.1 -> 3,527.5 ms (-1.0%); tsc-ts 22.158 -> 22.145 G (unchanged); outputs
+  identical. Gates: conformance 653/653 plain and strict, 650/650 under GC protect, unit, bundler
+  51/51, bench 102/102 within budget. GC stress for the session's runtime slices (the trap cache
+  and direct trap calls, the leaf's absent answers, the Proxy frames) still to run in a quiet
+  window.
+- Slice 4: the trap name's index per call site (Session 356, `docs/hidden_class_design.md` S1c).
+  `ts_proxy_trap(pv, handler, "get")` scanned the registered names on every lookup; the macro keeps
+  the index in a static per site (the names are literals), so the lookup is the cache probe
+  alone. A second trim, the sized probe first at an interface-typed site whose first entry is a
+  sized receiver's, was tried and reverted: vue -0.25% instructions but rxjs +0.3% (its
+  interface-typed reads are inherited methods the sized entries never hold), a wash that put a
+  test into thousands of inline sites. vue 31.384 -> 31.347 G instructions, 1,102.6 -> 1,095.5 ms
+  alternating (Node 778: 1.41x); rxjs 12.804 -> 12.803 G and yaml 89.81 -> 89.85 G (unchanged,
+  369.6 -> 367.4 and 3,562.2 -> 3,561.8 ms); tsc-ts 22.218 -> 22.219 G (unchanged); outputs
+  identical. Gates: conformance 653/653 plain and strict, 650/650 under GC protect, unit, bundler
+  51/51, bench 102/102 within budget. Session 356's dynamic-path slices together: vue 1,231 ->
+  1,095.5 ms (36.02 -> 31.35 G instructions, -13%; Node 778: 1.63x -> 1.41x), rxjs 385 -> 367,
+  yaml 3,590 -> 3,562, tsc-ts unchanged. GC stress for the runtime slices still to run.
