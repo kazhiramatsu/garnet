@@ -290,21 +290,25 @@ static tsv build_groups(tsv values, const int32_t* caps, rx_program* p){
   ts_gc_unroot(2);
   return obj;
 }
+/* The result arrays are allocated at their length and their named properties (`index`, `input`,
+   `groups`, `indices`) added through inline caches: every result starts from the empty array
+   shape and adds the same keys in the same order, so each site's addition cache answers the
+   store without the probe of the receiver and its prototype chain that a generic set does. */
+static ts_prop_ic g_ic_index, g_ic_input, g_ic_groups, g_ic_indices, g_ic_ind_groups;
 static tsv build_indices(tsv s, const int32_t* caps, rx_program* p){
   uint32_t ng = rx_group_count(p);
   ts_gc_root(&s);
-  tsv arr = ts_new_array(0);
+  tsv arr = ts_new_array(ng + 1u);
   ts_gc_root(&arr);
   for (uint32_t g = 0; g <= ng; g++){
-    if (caps[2*g] < 0){ ts_array_push(arr, TS_UNDEFINED); continue; }
-    tsv pair = ts_new_array(0); ts_gc_root(&pair);
-    ts_array_push(pair, ts_num(caps[2*g])); ts_array_push(pair, ts_num(caps[2*g+1]));
-    ts_array_push(arr, pair);
-    ts_gc_unroot(1);
+    if (caps[2*g] < 0){ ts_array_set(arr, g, TS_UNDEFINED); continue; }
+    tsv pair = ts_new_array(2);   /* arr is rooted: the allocation may move it */
+    ts_array_set(pair, 0, ts_num(caps[2*g])); ts_array_set(pair, 1, ts_num(caps[2*g+1]));
+    ts_array_set(arr, g, pair);
   }
   tsv groups = rx_has_named_groups(p) ? build_groups(arr, caps, p) : TS_UNDEFINED;
   ts_gc_root(&groups);
-  ts_set(arr, k_groups, groups);
+  ts_set_pic(arr, k_groups, groups, &g_ic_ind_groups);
   ts_gc_unroot(3);
   return arr;
 }
@@ -312,22 +316,22 @@ static tsv build_result(tsv s, const int32_t* caps, rx_program* p){
   keys_init();
   uint32_t ng = rx_group_count(p);
   ts_gc_root(&s);
-  tsv arr = ts_new_array(0);
+  tsv arr = ts_new_array(ng + 1u);
   ts_gc_root(&arr);
   for (uint32_t g = 0; g <= ng; g++){
-    tsv part = caps[2*g] >= 0 ? slice(s, caps[2*g], caps[2*g+1]) : TS_UNDEFINED;
-    ts_array_push(arr, part);   /* push roots its argument */
+    tsv part = caps[2*g] >= 0 ? slice(s, caps[2*g], caps[2*g+1]) : TS_UNDEFINED;   /* arr is rooted; part is stored at once */
+    ts_array_set(arr, g, part);
   }
-  ts_set(arr, k_index, ts_num(caps[0]));
-  ts_set(arr, k_input, s);
+  ts_set_pic(arr, k_index, ts_num(caps[0]), &g_ic_index);
+  ts_set_pic(arr, k_input, s, &g_ic_input);
   tsv groups = rx_has_named_groups(p) ? build_groups(arr, caps, p) : TS_UNDEFINED;
   ts_gc_root(&groups);
-  ts_set(arr, k_groups, groups);
+  ts_set_pic(arr, k_groups, groups, &g_ic_groups);
   ts_gc_unroot(1);
   if (rx_flags(p) & TSAOT_REGEXP_FLAG_INDICES){
     tsv ind = build_indices(s, caps, p);
     ts_gc_root(&ind);
-    ts_set(arr, k_indices, ind);
+    ts_set_pic(arr, k_indices, ind, &g_ic_indices);
     ts_gc_unroot(1);
   }
   ts_gc_unroot(2);

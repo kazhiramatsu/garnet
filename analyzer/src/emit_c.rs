@@ -14360,6 +14360,8 @@ fn fnval_adapter_body(builtin: &str) -> Option<String> {
             val(3)
         )),
         "regexp.newLiteral" => hv(format!("ts_regexp_new_literal({}, (uint32_t)ts_to_num({}), NULL, NULL)", val(0), val(1))),
+        "regexp.getLastIndex" => hv(format!("ts_regexp_last_index_read({})", val(0))),
+        "regexp.setLastIndex" => hv(format!("ts_regexp_last_index_write({}, {})", val(0), val(1))),
         "regexp.escape" => hv(format!("ts_regexp_escape_tsv({})", val(0))),
         // ---- Symbol statics ----
         "symbol.for" => hv(format!("ts_symbol_for({})", val(0))),
@@ -22986,6 +22988,9 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     format!("ts_regexp_adapter_object_test_tsv({}, {})", v(0), v(1)),
                     false,
                 ),
+                // the typed `lastIndex` access (docs/regexp_vm_design.md "The per-call path")
+                "regexp.getLastIndex" => (format!("ts_regexp_last_index_read({})", v(0)), false),
+                "regexp.setLastIndex" => (format!("ts_regexp_last_index_write({}, {})", v(0), v(1)), false),
                 "regexp.newLiteral" => (format!("ts_regexp_new_literal({}, (uint32_t)ts_to_num({}), {})", v(0), v(1), nat()), false),
                 "regexp.escape" => (format!("ts_regexp_escape_tsv({})", v(0)), false),
                 "regexp.construct" => (format!("ts_regexp_adapter_construct_tsv({}, {}, ts_truthy({}))", v(0), v(1), v(2)), false),

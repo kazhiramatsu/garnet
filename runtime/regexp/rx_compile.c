@@ -185,6 +185,97 @@ static void first_of(cstate* c, rx_node* n, firstset* f, int* nullable){
   }
 }
 
+/* ---- the quick check: the byte sets of a match's first positions ----
+   For a node: the sets of the first `fixed` positions of whatever it matches (exact: every
+   match has a byte of the set there; an unknown position inside the range is the full set),
+   and its length in code units, min and max (LEN_UNB: unbounded or unknown). A position is
+   exact only while every earlier part has one possible length. Zero-width nodes contribute
+   nothing (a superset: a lookaround's constraint is ignored). */
+#define QC_K 4u
+#define LEN_UNB 0xFFFFFFFFu
+typedef struct { uint8_t sets[QC_K][32]; uint32_t fixed; uint32_t min, max; } qcset;
+static void qc_or(uint8_t* d, const uint8_t* s){ for (uint32_t i = 0; i < 32; i++) d[i] |= s[i]; }
+static uint32_t len_add(uint32_t a, uint32_t b){ if (a == LEN_UNB || b == LEN_UNB) return LEN_UNB; uint64_t s = (uint64_t)a + b; return s > 0x7FFFFFFFu ? LEN_UNB : (uint32_t)s; }
+static uint32_t len_mul(uint32_t a, uint32_t b){ if (a == 0 || b == 0) return 0; if (a == LEN_UNB || b == LEN_UNB) return LEN_UNB; uint64_t s = (uint64_t)a * b; return s > 0x7FFFFFFFu ? LEN_UNB : (uint32_t)s; }
+static void qc_of(cstate* c, rx_node* n, qcset* q){
+  memset(q, 0, sizeof *q);
+  switch (n->kind){
+    case RX_N_EMPTY: case RX_N_BOL: case RX_N_EOL: case RX_N_WORDB: case RX_N_NWORDB: case RX_N_LOOK: return;
+    case RX_N_BACKREF: q->max = LEN_UNB; return;
+    case RX_N_CHAR: case RX_N_DOT: case RX_N_CLASS: {
+      firstset f; memset(&f, 0, sizeof f); f.valid = 1; int nb;
+      first_of(c, n, &f, &nb);
+      memcpy(q->sets[0], f.bits, 32);
+      if (n->kind == RX_N_CHAR){ uint32_t L = n->cp >= 0x10000u ? 2u : 1u; q->min = q->max = L; q->fixed = 1; return; }
+      /* a class or dot: one unit, or two for a supplementary character in code point mode; a
+         v-mode class's strings have their own lengths */
+      int single = n->kind == RX_N_DOT || n->set.n > 0 || n->negate;
+      uint32_t min = single ? 1u : LEN_UNB, max = single ? 1u : 0u;
+      if (single && c->u){
+        if (n->kind == RX_N_DOT || n->negate) max = 2;
+        else for (uint32_t i = 0; i < n->set.n; i++) if (n->set.r[2*i+1] >= 0x10000u){ max = 2; break; }
+      }
+      for (uint32_t i = 0; i < n->strs.n; i++){
+        uint32_t L = 0; for (uint32_t k = 0; k < n->strs.s[i].n; k++) L += n->strs.s[i].cps[k] >= 0x10000u ? 2u : 1u;
+        if (L < min) min = L; if (L > max) max = L;
+      }
+      if (min == LEN_UNB) min = 0;
+      q->min = min; q->max = max; q->fixed = min >= 1 ? 1 : 0;
+      return;
+    }
+    case RX_N_GROUP: qc_of(c, n->body, q); return;
+    case RX_N_SEQ: {
+      uint32_t off = 0; int exact = 1;
+      for (uint32_t i = 0; i < n->nkids; i++){
+        qcset s; qc_of(c, n->kids[i], &s);
+        if (exact){
+          for (uint32_t k = 0; k < s.fixed && off + k < QC_K; k++) qc_or(q->sets[off + k], s.sets[k]);
+          uint32_t covered = off + s.fixed; if (covered > QC_K) covered = QC_K;
+          if (covered > q->fixed) q->fixed = covered;
+          if (s.min != s.max || s.max == LEN_UNB) exact = 0;
+          else {
+            /* the part's positions beyond its exact ones are unknown: the full set, so that a
+               later part's exact positions can count */
+            for (uint32_t k = s.fixed; k < s.min && off + k < QC_K; k++) memset(q->sets[off + k], 0xFF, 32);
+            off += s.min;
+          }
+        }
+        q->min = len_add(q->min, s.min); q->max = len_add(q->max, s.max);
+      }
+      return;
+    }
+    case RX_N_ALT: {
+      uint32_t fixed = UINT32_MAX; uint32_t min = LEN_UNB, max = 0;
+      for (uint32_t i = 0; i < n->nkids; i++){
+        qcset s; qc_of(c, n->kids[i], &s);
+        for (uint32_t k = 0; k < s.fixed; k++) qc_or(q->sets[k], s.sets[k]);
+        if (s.fixed < fixed) fixed = s.fixed;
+        if (s.min < min) min = s.min;
+        max = (max == LEN_UNB || s.max == LEN_UNB) ? LEN_UNB : (s.max > max ? s.max : max);
+      }
+      q->fixed = n->nkids ? fixed : 0; q->min = n->nkids ? min : 0; q->max = max;
+      return;
+    }
+    case RX_N_QUANT: {
+      qcset b; qc_of(c, n->body, &b);
+      q->min = len_mul(b.min, n->min);
+      q->max = n->max == RX_INFINITY ? (b.max == 0 ? 0 : LEN_UNB) : len_mul(b.max, n->max);
+      if (n->min == 0) return;   /* the body may not occur: nothing is exact */
+      uint32_t L = (b.min == b.max && b.max != LEN_UNB) ? b.min : LEN_UNB;
+      if (L != LEN_UNB && L > 0 && b.fixed == L){
+        /* a fully known body of one length: the first min repetitions are exact */
+        uint32_t total = len_mul(L, n->min); if (total > QC_K) total = QC_K;
+        for (uint32_t k = 0; k < total; k++) memcpy(q->sets[k], b.sets[k % L], 32);
+        q->fixed = total;
+      } else {
+        for (uint32_t k = 0; k < b.fixed; k++) memcpy(q->sets[k], b.sets[k], 32);
+        q->fixed = b.fixed;   /* the first repetition's exact positions */
+      }
+      return;
+    }
+  }
+}
+
 /* ---- emission ---- */
 static void compile_node(cstate* c, rx_node* n);
 
@@ -469,6 +560,22 @@ rx_program* rx_compile_ast(rx_arena* arena, rx_node* root, uint32_t flags, uint3
   }
   int whole; literal_prefix(c, root, &p->prefix, &p->prefix_len, &whole);
   p->prefix_whole = (uint8_t)(whole && ngroups == 0);
+  /* the quick check over the first positions every match has (at most QC_K, within min_len so
+     that a candidate position has them): per position the bits every possible byte shares */
+  {
+    qcset q; qc_of(c, root, &q);
+    uint32_t qlen = q.fixed; if (qlen > QC_K) qlen = QC_K; if (qlen > p->min_len) qlen = p->min_len;
+    uint32_t mask = 0, value = 0; int impossible = 0;
+    for (uint32_t k = 0; k < qlen; k++){
+      uint32_t and_ = 0xFFu, or_ = 0, any = 0;
+      for (uint32_t u = 0; u < 256u; u++) if ((q.sets[k][u >> 3] >> (u & 7u)) & 1u){ and_ &= u; or_ |= u; any = 1; }
+      if (!any){ impossible = 1; break; }
+      uint32_t m = (~(and_ ^ or_)) & 0xFFu;
+      mask |= m << (8u * k); value |= (and_ & m) << (8u * k);
+    }
+    p->narrow_impossible = (uint8_t)impossible;
+    if (!impossible && mask){ p->qc_len = qlen; p->qc_mask = mask; p->qc_value = value; }
+  }
   return p;
 }
 

@@ -118,6 +118,12 @@ struct rx_program {
   uint8_t first_tab[256];     /* the same set as a byte table for the Latin-1 scan */
   uint16_t* prefix; uint32_t prefix_len;   /* a literal prefix (code units), case-sensitive patterns */
   uint8_t prefix_whole;       /* the pattern is exactly the prefix (no captures, no assertions) */
+  /* the quick check (rx_compile.c qc_of, docs/regexp_vm_design.md "The search loop"): the bytes
+     every match has at its first qc_len positions as one mask and value over the little-endian
+     word of those bytes; a candidate position of a Latin-1 input is attempted only when
+     (word & qc_mask) == qc_value. qc_len 0: no check. */
+  uint32_t qc_len, qc_mask, qc_value;
+  uint8_t narrow_impossible;  /* no Latin-1 input can match (a guaranteed position has no byte) */
   void* owned;                /* one malloc holding code, sets, ranges, names, prefix */
   void* user; void (*user_free)(void*);   /* the embedder's data (rx_set_user) */
   rx_native_fn native[2];     /* the native tier's matchers (narrow, wide); NULL: the interpreter */

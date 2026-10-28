@@ -78,6 +78,15 @@ static uint32_t find_prefix(const rx_ctx* c, int wide, uint32_t from){
   return UINT32_MAX;
 }
 
+/* the first qc_len bytes at s as a little-endian word (the quick check's operand) */
+static inline uint32_t qc_word(const uint8_t* s, uint32_t n){
+  uint32_t w = s[0];
+  if (n > 1) w |= (uint32_t)s[1] << 8;
+  if (n > 2) w |= (uint32_t)s[2] << 16;
+  if (n > 3) w |= (uint32_t)s[3] << 24;
+  return w;
+}
+
 int rx_exec(const rx_program* p, const void* input, uint32_t len, int wide, uint32_t start, int32_t* caps){
   rx_ctx c;   /* the case tables were built by the compile */
   c.p = p; c.in8 = (const uint8_t*)input; c.in16 = (const uint16_t*)input; c.len = len;
@@ -90,6 +99,7 @@ int rx_exec(const rx_program* p, const void* input, uint32_t len, int wide, uint
   }
   c.regs = S->regs; c.bt = S->bt; c.bt_cap = S->bt_cap; c.bt_sp = 0;
   if (start > len) return 0;
+  if (!wide && p->narrow_impossible) return 0;
   int cp_mode = (p->flags & RX_F_EITHER_UNICODE) != 0;
   int sticky = (p->flags & RX_F_STICKY) != 0;
   /* a start inside a surrogate pair moves to the pair (the code point containing lastIndex) */
@@ -102,6 +112,7 @@ int rx_exec(const rx_program* p, const void* input, uint32_t len, int wide, uint
   if (p->min_len > len) return 0;
   uint32_t last = len - p->min_len;
   uint32_t pos = start;
+  uint32_t qc_len = wide ? 0 : p->qc_len;   /* the quick check: Latin-1 input, within min_len */
   if (p->prefix_whole){
     uint32_t hit = find_prefix(&c, wide, pos);
     if (hit == UINT32_MAX) return 0;
@@ -127,6 +138,7 @@ int rx_exec(const rx_program* p, const void* input, uint32_t len, int wide, uint
       }
       if (pos > last) return 0;
     }
+    if (qc_len && (qc_word(c.in8 + pos, qc_len) & p->qc_mask) != p->qc_value){ pos++; continue; }
     int r = try_at(&c, wide, pos, caps);
     if (r) return r;
     pos++;   /* every code unit, as V8 does in unicode mode too (a zero-width match inside a pair) */

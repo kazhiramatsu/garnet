@@ -5010,6 +5010,14 @@ class Exporter {
     if (ts.isPropertyAccessExpression(node)) {
       const enumValue = this.constEnumMemberValue(node);
       if (enumValue !== undefined) return this.lowerEnumConstant(ctx, enumValue, hint);
+      // `re.lastIndex` on a receiver typed RegExp: the slot read (`regexp.getLastIndex`; the
+      // runtime takes the generic path when the value is not a RegExp with a plain lastIndex)
+      if (node.name.text === "lastIndex" && this.isRegExpExpr(node.expression)) {
+        const recv = this.lowerExpr(ctx, node.expression);
+        const dst = this.newLocal(ctx, "reference");
+        ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "regexp.getLastIndex", args: [recv] });
+        return dst;
+      }
       if (node.name.text === "length" && ts.isIdentifier(node.expression) &&
           node.expression.text === "arguments" &&
           !this.symbolOf(node.expression)?.declarations?.length) {
@@ -6862,6 +6870,14 @@ class Exporter {
       // may mutate them — fixes `a[i]=i++`, `a[key()]=i`, `o.x=(o=…)`. Other
       // targets (identifier / static field / prototype / setter) are eval-order
       // insensitive, so keep the simple rhs-first path.
+      // `re.lastIndex = v` on a receiver typed RegExp: the receiver first, then the value,
+      // then the slot write (`regexp.setLastIndex`)
+      if (ts.isPropertyAccessExpression(lhs) && lhs.name.text === "lastIndex" && this.isRegExpExpr(lhs.expression)) {
+        const recv = this.lowerExpr(ctx, lhs.expression);
+        const rhs = this.lowerExpr(ctx, node.right);
+        ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "regexp.setLastIndex", args: [recv, rhs] });
+        return rhs;
+      }
       if (ts.isElementAccessExpression(lhs) ||
           (ts.isPropertyAccessExpression(lhs) && this.isPlainFieldStoreTarget(lhs))) {
         const pre = this.lowerAssignRefPre(ctx, lhs, this.mayHaveSideEffect(node.right));
@@ -12787,6 +12803,12 @@ class Exporter {
         ctx.body.push({ kind: "Copy", dst: lid, src: rhs });
       }
     } else if (ts.isPropertyAccessExpression(lhs)) {
+      // `re.lastIndex op= v` and the update forms on a receiver typed RegExp: the slot write
+      if (lhs.name.text === "lastIndex" && this.isRegExpExpr(lhs.expression)) {
+        const recv = this.lowerExpr(ctx, lhs.expression);
+        ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "regexp.setLastIndex", args: [recv, rhs] });
+        return;
+      }
       // `super.x = v`: resolve a setter from the PARENT (call it with this=receiver),
       // else write an own data property on the receiver — skipping the current class's
       // own setter, per JS super semantics. Mirrors the §72 super READ resolution.

@@ -11485,3 +11485,41 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   1,075.3 ms (seven alternating rounds each, medians; outputs identical; Node 779), tsc-ts
   22.183 -> 22.180 G instructions (unchanged; cycles -0.7%; outputs identical; its unit build
   carries 40 matchers in the data unit).
+- R4 of the regexp VM: the per-call path (docs/regexp_vm_design.md "The per-call path"). (1) A
+  typed `lastIndex`: the exporter lowers `re.lastIndex` reads and writes (the compound and update
+  forms too) on a receiver typed RegExp to `regexp.getLastIndex` / `regexp.setLastIndex`;
+  `ts_regexp_last_index_read` / `_write` take the map's first slot for a RegExp with a plain
+  writable `lastIndex` and otherwise the untyped site's generic paths with a static inline cache
+  (a plain object or null behind the annotation, a read-only `lastIndex`, a frozen RegExp keep
+  their semantics and errors). (2) The result arrays: allocated at their length and filled by
+  index, the named properties (`index`, `input`, `groups`, `indices`) stored through the
+  adapter's inline caches (the addition cache answers each store; a generic set probed the
+  receiver and its prototype chain for every key). (3) `s + ""` and `"" + s` return the other
+  string itself (V8 does), no copy. (4) The quick check of the search loop (V8's Irregexp
+  technique): `qc_of` in the compiler derives, for the first positions every match has (at most
+  four, within `min_len`, exact while every earlier part has one possible length), the set of
+  bytes possible there and the bits they share; `rx_exec` tests `(word & mask) == value` on a
+  Latin-1 input after the prefilter and before `try_at`, and a position with an empty set makes
+  the pattern impossible on Latin-1 input (`narrow_impossible`). Fixture
+  `tests/conformance/exhaustive/regexp/last_index_typed.ts` (the typed access on RegExps and on
+  values that are not one, the result array's shape, `s + ""`, the quick check on alternations,
+  case-insensitive patterns, quantified classes and impossible patterns). Kernels, R3 -> R4 (one binary each, alternating; Node): tokenizer 151 -> 141 (121), validate
+  104 -> 96 (87), logs 134 -> 134 (116), search 124 -> 116 (114), path_regexps 126 -> 128 (113;
+  within the run-to-run spread). Gates: conformance 663/663 plain and
+  strict (the fixture included), 660/660 in units mode and under GC protect, unit, bundler
+  51/51, bench: `string_unicode_search_kernel` over its 100 ms budget in the gate run (no regexp
+  in it; at the budget's edge in earlier sessions too, 99 ms re-timed alone twice, every other
+  benchmark within budget), GC stress PASSED, the regexp AOT and link gates, the engine diff
+  43,593 cases 0 differ in the interpreter and the native mode.
+  vue 1,084.5 -> 1,085.4 ms (seven alternating rounds each, medians; outputs identical; Node
+  759), tsc-ts 22.193 -> 22.174 G instructions (-0.1%; outputs identical). The profiles after
+  R4: the tokenizer's remaining time is the call structure of a sticky `test` (`builtin_exec`
+  19%, `rx_exec` 15%, the `lastIndex` write call 11%, `object_test` 8%, the slot lookup 6%,
+  `try_at` 6%; the matchers 18%); the validate kernel is its alternation-heavy ipv4 matcher
+  (15%, a choice point per alternative) and the greedy backtracking of the email pattern with
+  `rx_unstep_8` as a call; the search kernel the backtracking alternation (22%) and the byte
+  scan of the search loop (17%). The next slice: a first-character dispatch over the alternatives
+  in the compiler (no choice point for an alternative whose first character cannot match), the
+  unstep inlined in a narrow matcher's trampoline, the `test` site's fast path inlined into the
+  generated C (one call into the engine instead of three), a wider scan of the first-character
+  set.

@@ -251,6 +251,43 @@ Irregexp tier, without a JIT. The design keeps the engine one implementation:
   compared with V8's as in the interpreter mode; the conformance fixtures run every literal
   through the native tier.
 
+### The per-call path (R4)
+
+After the native tier the matchers are a minority of a regexp-heavy kernel's time (R3's
+profiles: 20% of the tokenizer, a third of the validate kernel); the rest is what happens
+around each call. R4 trims that path without changing what a call means:
+
+- **A typed `lastIndex`.** The exporter lowers `re.lastIndex` reads and `re.lastIndex = v`
+  writes (the compound and update forms through `lowerAssignTarget`) on a receiver typed RegExp
+  to `regexp.getLastIndex` / `regexp.setLastIndex`; the runtime's `ts_regexp_last_index_read` /
+  `_write` take the map's first slot when the value is a RegExp whose `lastIndex` is a plain
+  writable data property, and otherwise run the untyped site's generic paths with a static inline
+  cache (`ts_get_pic_checked` / `ts_set_pic`: a plain object or null behind the annotation, a
+  read-only `lastIndex`, a frozen RegExp keep their errors and semantics). The generic
+  `ts_set_pic` preamble that the generated store paid before (the kind and cache checks ahead of
+  the RegExp case) is gone from a tokenizer's inner loop.
+- **The result arrays.** `exec`'s array (and `indices`) is allocated at its length and filled by
+  index, and its named properties (`index`, `input`, `groups`, `indices`) are stored through
+  inline caches held by the adapter: every result starts from the empty array shape and adds the
+  same keys in the same order, so the addition cache answers each store without the probe of the
+  receiver and its prototype chain that a generic set does (the `lookup_prop_chain` / `prop_find`
+  share of the search kernel's profile).
+- **An empty operand of `+`.** `s + ""` and `"" + s` return the other string itself (as V8 does)
+  instead of copying it: the validate kernel's `samples[i] + ""` spent a seventh of its time in
+  the copy.
+- **The quick check.** V8's Irregexp tests the first few characters of a candidate position
+  against a mask and value before entering the matcher; the compiler now derives the same
+  (`qc_of`): for the first positions every match has (at most four, within `min_len`) the set of
+  bytes possible there, exact while every earlier part of the pattern has one possible length
+  (a varying quantifier, an alternation of different lengths or a backreference ends the
+  exactness; a lookaround or an anchor contributes nothing, a superset), and from each set the
+  bits all its members share (`mask = ~(and ^ or)`, `value = and & mask`). The search loop tests
+  `(word & mask) == value` over the little-endian word of those bytes after the prefilter and
+  before `try_at`, on Latin-1 input (a UTF-16 input skips it). A position whose set is empty
+  means no Latin-1 input can match (`narrow_impossible`: the exec returns no match at once).
+  `/error|warning|fatal/i` gets four positions ({e,E,w,W,f,F}, {r,R,a,A}, ...), `[aeiou]{2,}`
+  two; an anchored or sticky pattern has no search loop and no check.
+
 ## Verification
 
 - Conformance (the oracle is Node): the 23 regexp fixtures and the 29 others that use RegExps,
@@ -298,9 +335,11 @@ Irregexp tier, without a JIT. The design keeps the engine one implementation:
   pattern by pattern, result objects from fixed layouts, the replace/split builders without
   intermediate strings, the `lastIndex` fast slot; the new kernels and hono's RegExpRouter
   against Node; vue and tsc-ts A/B.
-- **R3 — the native tier and the long tail.** `rx_emit_c` through the Rust emitter, the
-  `v`-mode string properties (the emoji sequence data), `RegExp.escape` if not in R1, the
-  remaining divergences the corpus finds.
+- **R3 — the native tier.** `rx_emit_c` through the Rust emitter.
+- **R4 — the per-call path.** The typed `lastIndex`, the result arrays through inline caches,
+  the quick check of the search loop, `s + ""`.
+- **The long tail.** The `v`-mode string properties (the emoji sequence data), hono's
+  RegExpRouter, the remaining divergences the corpus finds.
 
 Each slice: the fixtures above, the A/Bs, the gates, a `docs/TODO.md` entry; the knob
 `TSAOT_REGEXP_NATIVE=0` (R3; the analyzer emits no matchers, the runtime ignores them) keeps the
@@ -365,6 +404,16 @@ measurement variant.
   search kernel with the search loop's byte scan 17% and the result objects 12%: the next slice
   is the per-call path (a typed `lastIndex` access, a slimmer sticky exec, the first-character
   scan), not the matchers.
+- **R4 built (Session 357): the per-call path.** The typed `lastIndex` (`regexp.getLastIndex` /
+  `setLastIndex`, `ts_regexp_last_index_read` / `_write`), the result arrays through the
+  adapter's inline caches, `s + ""` without a copy, the quick check of the search loop (`qc_of`,
+  `narrow_impossible`); fixture `regexp/last_index_typed`. Kernels R3 -> R4 (Node): tokenizer
+  151 -> 141 (121), validate 104 -> 96 (87), logs 134 -> 134 (116), search 124 -> 116 (114),
+  path_regexps 126 -> 128 (113, within the spread); vue and tsc-ts unchanged. What remains
+  (the profiles): the call structure of a sticky `test` (three calls from the site to the
+  matcher, the `lastIndex` write as a call), a choice point per alternative in alternation-heavy
+  patterns, `rx_unstep_*` as a call in a narrow matcher's backtracking, the byte-at-a-time scan
+  of the search loop: the next slice.
 - Not yet: the `v`-mode properties of strings (`\p{RGI_Emoji}` and the other six; the emoji
   sequence data is in `build/ucd/17.0.0/emoji-seq/`, emoji 16.0 at the time of writing), hono's
   RegExpRouter back in the benchmark.

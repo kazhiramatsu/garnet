@@ -1494,6 +1494,9 @@ tsv  ts_regexp_alloc(void);
    deleted (non-configurable); NULL when it is not a plain data property (an accessor defined
    over it), or, for a write, not writable: the generic paths then apply */
 tsv* ts_regexp_last_index_slot(tsv re, int for_write);
+/* the generated code's typed `re.lastIndex` read and write (regexp.getLastIndex / setLastIndex) */
+tsv ts_regexp_last_index_read(tsv re);
+tsv ts_regexp_last_index_write(tsv re, tsv v);
 /* the adapter's entry points the core runtime calls when the program links RegExps
    (runtime/regexp/ts_regexp_adapter.c installs them): toString, the String methods with a
    RegExp argument, a RegExp from a string pattern, the program's release on sweep */

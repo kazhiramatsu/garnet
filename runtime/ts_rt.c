@@ -5338,6 +5338,31 @@ tsv* ts_regexp_last_index_slot(tsv re, int for_write){
   if (g_regexp_last_index_key == 0xFFFFFFFFu) g_regexp_last_index_key = ts_intern_field("lastIndex", 9);
   return regexp_last_index_slot((ts_object*)ts_ptr(re), g_regexp_last_index_key, for_write);
 }
+/* The generated code's `re.lastIndex` on a receiver typed RegExp (the exporter's
+   regexp.getLastIndex / regexp.setLastIndex, docs/regexp_vm_design.md "The per-call path"):
+   the map's first slot when the receiver is a RegExp whose lastIndex is a plain data property,
+   else the generic property paths of an untyped site (the annotation may lie through `any`: a
+   plain object, null, an accessor defined over lastIndex, a frozen RegExp). The write returns
+   the value, as the assignment expression does. */
+tsv ts_regexp_last_index_read(tsv re){
+  if (g_regexp_last_index_key == 0xFFFFFFFFu) g_regexp_last_index_key = ts_intern_field("lastIndex", 9);
+  if (ts_is_regexp(re)){
+    tsv* slot = regexp_last_index_slot((ts_object*)ts_ptr(re), g_regexp_last_index_key, 0);
+    if (slot) return *slot;
+  }
+  static ts_prop_ic ic;
+  return ts_get_pic_checked(re, g_regexp_last_index_key, &ic);
+}
+tsv ts_regexp_last_index_write(tsv re, tsv v){
+  if (g_regexp_last_index_key == 0xFFFFFFFFu) g_regexp_last_index_key = ts_intern_field("lastIndex", 9);
+  if (ts_is_regexp(re)){
+    tsv* slot = regexp_last_index_slot((ts_object*)ts_ptr(re), g_regexp_last_index_key, 1);
+    if (slot){ *slot = v; ts_write_barrier(re, v); return v; }
+  }
+  static ts_prop_ic ic;
+  ts_set_pic(re, g_regexp_last_index_key, v, &ic);
+  return v;
+}
 /* ToPrimitive 用に callable な valueOf/toString を取得。own のデータプロパティ
    （FIELD キー）が prototype/ビルトインのメソッド（METHOD キー）をシャドウする。 */
 static tsv ts_prim_method(tsv v, uint32_t field_key, uint32_t method_key){
@@ -5565,6 +5590,9 @@ tsv ts_add(tsv a, tsv b){
     tsv sb=ts_to_string_v(b);
     ts_gc_root(&sb);
     ts_strview x=ts_str_view_typed(sa), y=ts_str_view_typed(sb);
+    /* an empty operand: the other string itself (`s + ""`, as V8 returns the operand) */
+    if (y.len == 0){ ts_gc_unroot(4); return sa; }
+    if (x.len == 0){ ts_gc_unroot(4); return sb; }
     uint64_t n64=(uint64_t)x.len+(uint64_t)y.len;
     if (n64 > UINT32_MAX){
       ts_gc_unroot(4);
