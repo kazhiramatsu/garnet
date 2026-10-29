@@ -12087,3 +12087,24 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   awaits resumed from another context. The survey's context_storage driver agrees with Node: 41 of
   43 (compress waits for CompressionStream, ip_restriction for BigInt).
 - Gates: the full gate set green: unit, bundler 53/53, conformance plain and strict 696/696, protect and units 693/693, bench (every benchmark correct and within its budget), the GC suite incl. ASan and GC stress, the `ci` gate with the microtask gate, the fetch run gate, the regexp engine diff 43,593 cases 0 differ; ir-parity identical (4,328 files; the new fixture's 6 added to the snapshot). tsc-ts r17 -> r18 instructions 0.9998 (21.950 G -> 21.945 G), cycles 1.003, wall 1.008; vue medians of 7: 1065.8 -> 1065.4 ms; hono routers medians of 5: TrieRouter 251.8 -> 252.5, RegExpRouter 64.4 -> 63.2, PatternRouter 242.2 -> 241.5, SmartRouter 74.7 -> 72.3 ms; hono_app garnet 182.7 ms, Node 179.5 (medians of 3; Node's own runs 171.6-185.0 under the load).
+- Where hono stands at the session's end, and the agreed order (Kaz, 2026-10-30:
+  「ひとまずhonoが完成してからにします」):
+  - Runs unchanged: the four routers; hono_app (19 request kinds, the JSX pages included): garnet
+    180 ms against Node's 154, max RSS 19.5 MB against 78 (an empty program: 3.1 against 43.9),
+    peak footprint 12.8 MB against 42.6; 41 of 43 survey drivers identical to Node.
+  - Next, to finish hono: CompressionStream / DecompressionStream (the compress middleware: gzip,
+    deflate, deflate-raw over zlib, linked only into a program that uses it, as the fetch runtime's
+    libcurl is through a marker the emitter writes). Node bundles its own zlib, so a compressed
+    size may differ from the system zlib's: compare the decompressed bytes. BigInt (ip-restriction)
+    stays unsupported by design.
+  - After hono: peak-memory tuning. Measured on hono_app: the nursery is the largest knob (4 MB by
+    default: RSS 19.5 MB; 2 MB: 17.7 MB at +1% time; 1 MB promotes more: 18.1 MB and +5% time); the
+    full-collection threshold does not bind (the old generation stays under its 16 MB). The rest,
+    about 11 MB of footprint, is the old generation's live data, mimalloc's retained pages, the
+    binary's code and the runtime's tables: first a breakdown by category, then an adaptive nursery
+    and smaller reaction records (a promise is 104 bytes, a then's reaction a 224-byte coroutine; a
+    record of its own would save time too).
+  - Recorded for the dynamic paths (Kaz asked whether only a JIT makes dynamic method calls fast): a
+    receiver record per dynamic call site taken by the one PGO training run (every site at once, as
+    V8's feedback vectors), feeding guarded inlining; no per-site or per-program work. The collector
+    stays a tracing collector (without collections hono_app and vue are slower, tsc-ts 6% faster).
