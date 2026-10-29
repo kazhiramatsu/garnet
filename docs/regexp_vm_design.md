@@ -663,7 +663,7 @@ measurement variant.
   which V8 inlines into the loop. `tests/pgo_build_gate.sh` covers the record, the file, the
   binding (the trace) and the `--regexps off` and `--pgo off` builds; the engine diff
   43,593 cases, 0 differ in the interpreter and the native mode. Gates: conformance 670/670 plain and strict, 667/667 in units mode and under GC protect, unit (the pgo build gate with the regexps cases), bundler 51/51, bench all within budget, GC stress PASSED, the regexp AOT and link gates. tsc-ts
-  22.190 -> 22.182 G instructions (unchanged; outputs identical); the benchmark's own training run records no run-time regexp (the measured compile builds none: its patterns are literals, and the project's file list needs no glob), so the trained build links no table (18.635 G instructions, as before); vue 1,061.7 -> 1,060.0 ms (seven alternating rounds each, medians; outputs identical; Node 773).
+  22.190 -> 22.182 G instructions (unchanged; outputs identical); the benchmark's own training run records no run-time regexp (tsc-ts's own code builds one only in its timeline tool, which the measured compile never runs, and its file matching, `vfs-match.ts`, uses no RegExp), so the trained build links no table (18.635 G instructions, as before); vue 1,061.7 -> 1,060.0 ms (seven alternating rounds each, medians; outputs identical; Node 773).
 - Not yet: the `v`-mode properties of strings (`\p{RGI_Emoji}` and the other six; the emoji
   sequence data is in `build/ucd/17.0.0/emoji-seq/`, emoji 16.0 at the time of writing).
 
