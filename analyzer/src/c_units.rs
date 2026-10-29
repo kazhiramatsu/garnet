@@ -326,10 +326,16 @@ fn classify(text: String) -> Result<Item, String> {
                 defn: format!("struct {name}__t {name} {init}\n"),
             });
         }
-        // `static T NAME[DIMS] = INIT;` or `static T NAME;`
+        // `static T NAME[DIMS] = INIT;` or `static T NAME;`, with an optional attribute after
+        // the declarator (a matcher's range table is `__attribute__((unused))`: the declaration
+        // keeps the type and the name, the definition keeps the attribute)
         let decl_end = top_level_eq(trimmed).unwrap_or(trimmed.len() - 1);
         let declarator = trimmed[..decl_end].trim_end();
         let declarator = declarator.strip_prefix("static ").unwrap_or(declarator);
+        let declarator = match declarator.find("__attribute__((") {
+            Some(a) if declarator.ends_with("))") => declarator[..a].trim_end(),
+            _ => declarator,
+        };
         if declarator.contains('(') {
             return Err(format!("unsupported declarator: {}", first_line(t)));
         }

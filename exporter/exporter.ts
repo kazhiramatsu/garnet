@@ -9374,6 +9374,14 @@ class Exporter {
     // no capture-based reject is needed here.
     const savedThis = ctx.thisLocal;
     ctx.thisLocal = dst;
+    // The initializers' `this` is the new instance, not the enclosing activation's: an arrow
+    // among them (`handler = () => this.x`) captures it through a cell of its own, never the
+    // enclosing function's lexical-this cell nor the cell an earlier `new` of the same block
+    // made (two `new C()` in one block gave the second instance's arrows the first instance).
+    const savedThisCell = ctx.cellAccess.get(this.lexicalThisSym);
+    const savedBodyCell = ctx.thisCellOfBody?.get(ctx.body);
+    ctx.cellAccess.delete(this.lexicalThisSym);
+    ctx.thisCellOfBody?.delete(ctx.body);
     try {
       // Pre-pass: dynamic/symbol-keyed INSTANCE accessors (`get [Symbol.x]()` /
       // `set [k]()`) install as real accessor descriptors. Grouped by key-expression
@@ -9421,6 +9429,12 @@ class Exporter {
       }
     } finally {
       ctx.thisLocal = savedThis;
+      if (savedThisCell !== undefined) ctx.cellAccess.set(this.lexicalThisSym, savedThisCell);
+      else ctx.cellAccess.delete(this.lexicalThisSym);
+      if (ctx.thisCellOfBody) {
+        if (savedBodyCell !== undefined) ctx.thisCellOfBody.set(ctx.body, savedBodyCell);
+        else ctx.thisCellOfBody.delete(ctx.body);
+      }
     }
   }
 

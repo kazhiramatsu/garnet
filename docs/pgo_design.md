@@ -37,6 +37,14 @@ arguments, say) records the real hot paths as cold, and a profile that says
 the wrong thing produces a slower program than no profile. Someone who knows
 the program names a representative run once.
 
+The same training run leaves a second file, `default.regexps`: the regular
+expressions the program built at run time (`new RegExp(src)`), one per line,
+for which the build then compiles native matchers into a small object on the
+link line and the runtime binds by content (docs/regexp_vm_design.md "The
+native tier for run-time patterns"). It is found where `default.pgo` is,
+`--regexps <auto|off|file>` (`TSAOT_REGEXPS`) chooses, and `--pgo off` turns
+both off.
+
 ## The benchmark build
 
 `scripts/build_tsc_ts_native.sh` is profile-guided by default: the

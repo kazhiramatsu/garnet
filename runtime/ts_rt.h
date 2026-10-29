@@ -1015,27 +1015,44 @@ tsv ts_collection_method_dynamic(tsv recv, const char* name, tsv* args, int narg
 tsv ts_method_lookup_sized(tsv recv, ts_key fkey, ts_key mkey, ts_prop_ic* field_ic, ts_prop_ic* proto_ic);
 /* A dynamic call site's cache of its method (docs/pic_sized_inline_design.md,
    "The dynamic call's method in a per-site cache"): the receiver's class
-   word, the prototype holding the method, that holder's shape word and the
-   slot. A hit needs the same class word (an unrelinked instance of one
-   layout, of a class with no field of the method's name: the fill checks
-   that), the same holder shape (a deleted or redefined method changes it; a
-   replaced one keeps it, and the slot is re-read), no relinked prototype
-   anywhere and no sidecar on the instance (an own property could shadow),
-   and a function in the slot (an accessor takes the lookup). */
+   word and either the prototype holding the method, that holder's shape word
+   and the slot, or (kind TS_MSIC_FIELD; docs/regexp_vm_design.md "R8") the
+   byte offset of the receiver's own struct field that holds the function
+   (hono's `router.match`, a field each instance reassigns). A prototype hit
+   needs the same class word (an unrelinked instance of one layout, of a class
+   with no field of the method's name: the fill checks that), the same holder
+   shape (a deleted or redefined method changes it; a replaced one keeps it,
+   and the slot is re-read), no relinked prototype anywhere and no sidecar on
+   the instance (an own property could shadow), and a function in the slot (an
+   accessor takes the lookup). A field hit needs the same class word (the
+   layout, so the offset; an instance that abandons its layout clears the
+   word) and a function in the slot: nothing in the sidecar shadows a struct
+   field, and a field becomes neither read-only nor an accessor. */
 extern int g_class_relinked;
-typedef struct { uint32_t cls; uint32_t holder_shape; uint32_t slot; uint32_t pad; tsv holder; } ts_method_site_ic;
+#define TS_MSIC_FIELD 1u
+typedef struct { uint32_t cls; uint32_t holder_shape; uint32_t slot; uint32_t kind; tsv holder; } ts_method_site_ic;
 tsv ts_method_lookup_sized_fill(tsv recv, ts_key fkey, ts_key mkey, ts_prop_ic* field_ic, ts_prop_ic* proto_ic, ts_method_site_ic* sic);
-TS_RT_ALWAYS_INLINE tsv ts_method_lookup_sized_ic(tsv recv, ts_key fkey, ts_key mkey, ts_prop_ic* field_ic, ts_prop_ic* proto_ic, ts_method_site_ic* sic){
+/* The site's cached method for `recv` (1, in *out), or 0. */
+TS_RT_ALWAYS_INLINE int ts_method_site_hit(tsv recv, const ts_method_site_ic* sic, tsv* out){
   if (TS_TOP16(recv) == TS_SEL_OBJECT){
     const ts_sized_head* o = (const ts_sized_head*)ts_ptr(recv);
-    if (o->cls == sic->cls && sic->cls != 0u && !g_class_relinked && !o->dyn){
-      ts_object* hd = (ts_object*)ts_ptr(sic->holder);
-      if (hd->shape == sic->holder_shape){
-        tsv v = *ts_obj_slot_ptr(hd, sic->slot);
-        if (ts_is_func(v)) return v;
-      }
+    if (o->cls == sic->cls && sic->cls != 0u && ts_obj_is_sized((const ts_object*)o)){
+      tsv v;
+      if (sic->kind == TS_MSIC_FIELD){
+        memcpy(&v, (const char*)o + sic->slot, sizeof v);
+      } else if (!g_class_relinked && !o->dyn){
+        const ts_object* hd = (const ts_object*)ts_ptr(sic->holder);
+        if (hd->shape != sic->holder_shape) return 0;
+        v = *ts_obj_slot_ptr((ts_object*)hd, sic->slot);
+      } else return 0;
+      if (ts_is_func(v)){ *out = v; return 1; }
     }
   }
+  return 0;
+}
+TS_RT_ALWAYS_INLINE tsv ts_method_lookup_sized_ic(tsv recv, ts_key fkey, ts_key mkey, ts_prop_ic* field_ic, ts_prop_ic* proto_ic, ts_method_site_ic* sic){
+  tsv v;
+  if (ts_method_site_hit(recv, sic, &v)) return v;
   return ts_method_lookup_sized_fill(recv, fkey, mkey, field_ic, proto_ic, sic);
 }
 static inline double ts_str_charcodeat_general(tsv s, double idx){
@@ -2510,6 +2527,28 @@ TS_RT_ALWAYS_INLINE tsv ts_get_pic_checked_inline(
     return (flags & TS_PROP_INT32) ? ts_int_slot_box(*p) : *p;
   }
   return ts_get_pic_checked(obj, key, ic);
+}
+/* The method of a dynamic call whose receiver the program does not type as a
+   class (an interface, `any`; docs/regexp_vm_design.md "R8"): the plain-object
+   probe of the own key in line as before (an object literal's method); a
+   sized receiver (a class instance) then takes the site's cache and the lookup
+   out of line (ts_method_lookup_dyn_fill), every other receiver the two cached
+   reads as before (a dictionary-mode object literal such as tsc-ts's checker
+   pays the sized test alone: an extra call there cost 0.2% of its
+   instructions). The lookup's answers are those of the two cached reads. */
+tsv ts_method_lookup_dyn_fill(tsv recv, ts_key fkey, ts_key mkey, ts_prop_ic* field_ic, ts_prop_ic* proto_ic, ts_method_site_ic* sic);
+TS_RT_ALWAYS_INLINE tsv ts_method_lookup_dyn_ic(tsv recv, ts_key fkey, ts_key mkey, ts_prop_ic* field_ic, ts_prop_ic* proto_ic, ts_method_site_ic* sic){
+  uint8_t flags = 0;
+  tsv* p = ts_prop_ic_probe_fixed_inline(recv, fkey, field_ic, &flags);
+  if (p && !(flags & TS_PROP_ACCESSOR)){
+    tsv v = (flags & TS_PROP_INT32) ? ts_int_slot_box(*p) : *p;
+    if (ts_is_callable(v)) return v;
+  }
+  if (TS_TOP16(recv) == TS_SEL_OBJECT && ts_obj_is_sized((const ts_object*)ts_ptr(recv)))
+    return ts_method_lookup_dyn_fill(recv, fkey, mkey, field_ic, proto_ic, sic);
+  tsv mv = ts_get_pic_checked(recv, fkey, field_ic);
+  if (!ts_is_callable(mv)) mv = ts_get_pic_checked_inline(recv, mkey, proto_ic);
+  return mv;
 }
 TS_RT_ALWAYS_INLINE void ts_set_pic_inline(
     tsv obj, ts_key key, tsv value, ts_prop_ic* ic){

@@ -11627,3 +11627,62 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   records hot functions; hono's route regexp is the same at training and in production), the method
   call through an interface-typed receiver with the sized caches (`router.match`), and the
   allocation path of small arrays (the result and the pair).
+
+## Session 358 (2026-10-29): the RegExpRouter's fourth round (R8: interface-typed method calls), a field-initializer arrow's `this`, the unit splitter's attribute
+
+- Kaz's paste at the session start (the previous session's closing summary): three means left to
+  V8's level on hono's RegExpRouter, in order of expected effect: (1) a native matcher for the
+  patterns a program builds at run time, through a training run's record of their sources (a new
+  build convention: a design doc first), (2) the method call through an interface-typed receiver
+  on the sized caches (`router.match`), (3) the allocation path of small arrays (the result array
+  and the `[handlers, match]` pair). (2) and (3) need no decision; (1) was left for Kaz's word,
+  and the paste came back without one: taken as "go on", with the design doc written first
+  (docs/regexp_vm_design.md "The native tier for run-time patterns (R9)", docs/pgo_design.md).
+- R8 of the regexp VM: the method call through an interface-typed receiver
+  (docs/regexp_vm_design.md "R8 built", docs/pic_sized_inline_design.md "The site cache at an
+  interface-typed call"). The driver's `router.match(method, path)` goes through hono's
+  `Router<T>` interface: no class for the receiver, so the site took the two cached reads, the
+  plain-object probe in line and `ts_get_pic_checked` out of line for the sized instance (two
+  hash probes before the site's sized entry; twice for a prototype method). (1) Such a site holds
+  a `ts_method_site_ic` as well: `ts_method_lookup_dyn_ic` keeps the plain-object probe in line
+  and sends a sized receiver to the cache and the lookup out of line (`ts_method_lookup_dyn_fill`),
+  every other receiver to the two cached reads as before. The first cut sent every receiver
+  through the out-of-line entry and cost tsc-ts +0.24% instructions (22.164 -> 22.216 G): its
+  checker is a dictionary-mode object literal whose methods the inline probe never serves, so
+  each `checker.x()` paid an extra call; the sized test in line ahead of the call keeps those
+  sites as they were. (2) The cache's second kind, `TS_MSIC_FIELD`: the receiver's own
+  struct field holding the function, by class word and byte offset (hono's `match` is a field
+  each router reassigns with its closure; before, a class with a field of the method's name kept
+  the lookup on every call). Probing the site's cache in line as well, ahead of the plain-object
+  probe, was tried and not kept (RegExpRouter 67.8 -> 66.9, SmartRouter 81.4 -> 82.8: noise, for
+  code at every dynamic site). (3) The lookup's
+  prototype walk tries the field key before the method key at each link, as one JS namespace
+  resolves closest first: it walked the method key alone, so a getter in the method position
+  through an `any` receiver threw "g is not a function" (`classes/dynamic_method_calls`, caught
+  by the gate on the first cut) and a subclass's getter over a base method at a base-typed site
+  called the base's method (a latent miss of the class-typed cache). Fixture
+  `classes/method_site_cache_dyn` (classes, a reassigned field, a plain literal, a Proxy, a
+  replaced and a deleted prototype method, a sidecar shadow, a relinked instance, a non-function
+  field, a bound function, getters installed over methods, a prototype assignment against a
+  nearer method, a null receiver). hono, five alternating rounds (medians; Node): TrieRouter 248.2 -> 246.1 ms (260), RegExpRouter 72.1 -> 68.1 (39), PatternRouter 241.5 -> 241.9 (153), SmartRouter 94.8 -> 81.8 (42); outputs identical.
+- A silent miscompile found by the fixture's first run: a class without a constructor runs its
+  field initializers at each `new` site, in the caller's scope, and an arrow initializer that
+  uses `this` (`handler = () => this.x`) took the lexical-this cell of an earlier `new` in the
+  same block (commit 49baa73's per-block cell cache, 2026-10-23: one cell per block, reused by the
+  block's later arrows, on the premise that `this` never changes within an activation, which an
+  inlined initializer breaks): `const a = new C(), b = new C()` gave b's arrows a's `this`
+  (`a.f(), b.f()` printed `1 1`). `emitFieldInitializers` now clears the lexical-this bookkeeping
+  for the initializers and restores it after, so each `new` site's arrows get a cell holding
+  that instance, and the enclosing function's later arrows their own. A loop was never affected
+  (its body's cell is made per iteration); two or more `new` of such a class in one block were.
+  Fixture `classes/field_arrow_this_per_new` (a method, an arrow, module level, a loop, nested
+  in an expression, a class with a constructor, the enclosing method's own arrow after the sites).
+- The unit splitter (`analyzer/src/c_units.rs`) rejected `static const uint32_t rx_n0_s0r[1]
+  __attribute__((unused)) = {0u};`, a matcher's range table since R6 marked it unused for a set
+  without ranges: every `--units` build of a program with such a regexp literal failed ("the
+  unit split failed: unsupported declarator"), and `tests/pgo_build_gate.sh`'s `--units
+  --pgo-train` case with it, unnoticed since R6 (the gate's one FAIL line among the unit
+  suites' PASS lines; the verdict is the text, not the count of suites). The splitter now strips
+  a trailing attribute from the
+  declarator it declares `extern` and keeps it on the definition. Gates: conformance 669/669 plain and strict (the new fixtures included), 666/666 in units mode and under GC protect, unit (the pgo build gate's `--units` case passing again), bundler 51/51, bench all within budget, GC stress PASSED, the regexp AOT and link gates (the inline path's final shape, which touches no allocation, re-ran conformance plain and strict 669/669, unit and bench). vue 1,056.4 -> 1,055.0 ms (seven alternating rounds each, medians; outputs identical; Node 773);
+  tsc-ts 22.183 -> 22.182 G instructions (unchanged; outputs identical).

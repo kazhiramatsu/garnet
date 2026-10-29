@@ -25420,6 +25420,28 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                             }
                             let _ = writeln!(s, "    if (!ts_is_callable(_mv)) ts_dynamic_method_missing({}u);", mf.0);
                         }
+                        (false, Some(mf))
+                            if method_site_ic_enabled()
+                                && method_sized_cache_enabled()
+                                && prop_pic_enabled()
+                                && recv.is_some() =>
+                        {
+                            // a receiver the program does not type as a class (an interface,
+                            // `any`): the plain-object probe in line as before, the site's cache
+                            // for a sized receiver out of line (ts_rt.h ts_method_lookup_dyn_ic;
+                            // docs/regexp_vm_design.md "R8")
+                            let _ = writeln!(s, "    ts_check_method_recv(_a[0], {}u);", mf.0);
+                            s.push_str("    static ts_prop_ic _ts_method_field_ic = TS_PROP_IC_INIT;\n");
+                            s.push_str("    static ts_prop_ic _ts_method_proto_ic = TS_PROP_IC_INIT;\n");
+                            s.push_str("    static ts_method_site_ic _ts_msic = { 0u, 0u, 0u, 0u, 0 };\n");
+                            let _ = writeln!(
+                                s,
+                                "    tsv _mv = ts_method_lookup_dyn_ic(_a[0], {}u, {}, &_ts_method_field_ic, &_ts_method_proto_ic, &_ts_msic);",
+                                mf.0,
+                                method_key_str(method.0, ctx.wksym)
+                            );
+                            let _ = writeln!(s, "    if (!ts_is_callable(_mv)) ts_dynamic_method_missing({}u);", mf.0);
+                        }
                         _ => emit_method_value_lookup(
                             s,
                             "_a[0]",

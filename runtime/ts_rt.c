@@ -17316,7 +17316,11 @@ tsv ts_method_lookup_sized_fill(tsv recv, ts_key fkey, ts_key mkey, ts_prop_ic* 
         has_field = 1;
         if (fe){ off = fe->offset; numeric = fe->numeric; }
         tsv v = struct_field_get(o, off, numeric);
-        if (ts_is_callable(v)) return v;
+        if (ts_is_callable(v)){
+          /* the site remembers the field's offset under this class word: a later call reads the slot in line */
+          if (sic && !numeric){ sic->cls = w; sic->kind = TS_MSIC_FIELD; sic->slot = (uint32_t)off; sic->holder_shape = 0u; sic->holder = 0; }
+          return v;
+        }
       }
       if (((ts_sized_head*)o)->dyn){
         ts_pref p = prop_find(o, fkey);
@@ -17330,24 +17334,28 @@ tsv ts_method_lookup_sized_fill(tsv recv, ts_key fkey, ts_key mkey, ts_prop_ic* 
         if (h->shape == e->shape){
           tsv v = *ts_obj_slot_ptr(h, e->slot);
           if (!is_accessor(v)){
-            if (sic){ sic->cls = w; sic->holder = e->holder; sic->holder_shape = e->shape; sic->slot = e->slot; }
+            if (sic){ sic->cls = w; sic->kind = 0u; sic->holder = e->holder; sic->holder_shape = e->shape; sic->slot = e->slot; }
             return v;
           }
         }
       }
-      /* the chain, remembering a shaped holder's plain slot */
+      /* the chain, remembering a shaped holder's plain slot; at each link the field key first (an
+         accessor, a property assigned to the prototype) and then the method key (the class's
+         method, replaced in place by an assignment), as one JS namespace resolves closest first */
       for (ts_object* p = ts_next_proto(o); p; p = ts_next_proto(p)){
         if (chain_link_exotic(p) || p->h.kind == TS_KIND_FUNC) break;
-        ts_pref q = prop_find(p, mkey);
+        ts_pref q = prop_find(p, fkey);
+        if (!pref_ok(q)) q = prop_find(p, mkey);
         if (pref_ok(q)){
           if (!pref_is_accessor(q) && ts_obj_shape_id(p) != TS_SHAPE_NONE){
             e->cls = w; e->key = mkey; e->shape = p->shape; e->slot = q.i; e->holder = ts_obj(p);
-            if (sic){ sic->cls = w; sic->holder = ts_obj(p); sic->holder_shape = p->shape; sic->slot = q.i; }
+            if (sic){ sic->cls = w; sic->kind = 0u; sic->holder = ts_obj(p); sic->holder_shape = p->shape; sic->slot = q.i; }
           }
           return prop_ic_read(recv, q);
         }
       }
       tsv found;
+      if (lookup_prop_chain(recv, ts_next_proto(o), fkey, &found)) return found;
       if (lookup_prop_chain(recv, ts_next_proto(o), mkey, &found)) return found;
       return TS_UNDEFINED;
     }
@@ -17355,6 +17363,14 @@ tsv ts_method_lookup_sized_fill(tsv recv, ts_key fkey, ts_key mkey, ts_prop_ic* 
   tsv mv = ts_get_pic_checked_inline(recv, fkey, field_ic);
   if (!ts_is_callable(mv)) mv = ts_get_pic_checked_inline(recv, mkey, proto_ic);
   return mv;
+}
+/* The out-of-line half of ts_method_lookup_dyn_ic (ts_rt.h) for a sized receiver: the site's
+   cache, then the lookup, which fills the cache with a prototype method or the receiver's own
+   struct field (and answers any receiver the caller sends it). */
+tsv ts_method_lookup_dyn_fill(tsv recv, ts_key fkey, ts_key mkey, ts_prop_ic* field_ic, ts_prop_ic* proto_ic, ts_method_site_ic* sic){
+  tsv v;
+  if (ts_method_site_hit(recv, sic, &v)) return v;
+  return ts_method_lookup_sized_fill(recv, fkey, mkey, field_ic, proto_ic, sic);
 }
 /* charCodeAt on a receiver that is not a string (an `any` value behind a
    string type, which the typed entry trusted): null and undefined throw the

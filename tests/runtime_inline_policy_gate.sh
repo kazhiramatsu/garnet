@@ -110,6 +110,8 @@ while IFS= read -r name; do
     ts_map_get_num | \
     ts_array_push_inline | \
     ts_method_lookup_sized_ic | \
+    ts_method_site_hit | \
+    ts_method_lookup_dyn_ic | \
     ts_call_method_inline | \
     ts_store_frozen | \
     ts_prop_key_hash | \

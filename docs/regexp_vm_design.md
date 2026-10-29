@@ -302,6 +302,56 @@ around each call. R4 trims that path without changing what a call means:
   `/error|warning|fatal/i` gets four positions ({e,E,w,W,f,F}, {r,R,a,A}, ...), `[aeiou]{2,}`
   two; an anchored or sticky pattern has no search loop and no check.
 
+### The native tier for run-time patterns (R9)
+
+A pattern the program builds at run time (`new RegExp(src)`: hono's route regexps, assembled
+from the route table at start-up; a tokenizer's keyword alternation joined from a list) runs on
+the interpreter, since the native tier needs the pattern at build time, while V8 compiles it just
+in time. garnet's answer is the one it has for hot functions (docs/pgo_design.md): a training run
+records what the program did, and the build uses the record.
+
+- **The record.** Under `TSAOT_REGEXP_RECORD=<file>` the adapter appends a line for every
+  pattern it compiles without matchers from its site (the constructor, a string pattern given to
+  `split` or `replace`; a literal's site passes matchers and is not recorded): `<flags>`, a tab,
+  the pattern as hex UTF-16 code units (the format of `rx_cli` and the engine diff), a tab, the
+  source in UTF-8 (informational; a reader ignores it). The training run of `garnet --pgo-train`
+  and of `build_tsc_ts_native.sh` sets the variable (`tsaot_pgo_train`, with the raw profiles'
+  directory), and the merge sorts and dedups the lines into `default.regexps` next to the entry
+  file, beside `default.pgo` (written when the record has lines; an empty record removes a stale
+  file and says so). A forked worker's compiles land in the same file (append).
+- **The build.** `default.regexps` is looked for where `default.pgo` is (the entry file's
+  directory, then the project's tsconfig directory); `--regexps <auto|off|file>`
+  (`TSAOT_REGEXPS`) chooses, and `--pgo off` turns it off as well: a plain build is plain. The
+  driver runs `tsaot regexps <file>`, which writes `rx_table.c`: the matchers of every distinct
+  (source, flags) of the file, emitted as for a literal (`rx_emit.c`; a line that does not parse
+  or compile is skipped with a note), `static` in that unit, a table of `{ units, length,
+  flags, narrow, wide }` and a constructor function that installs the table in the engine
+  (`rx_native_table_install`). The file is compiled with the pass's flags into one object on the
+  link line next to the engine's objects. The program's own C is unchanged: no second export or
+  emission, the unit cache untouched, and a changed `default.regexps` recompiles one small file.
+  `TSAOT_REGEXP_NATIVE=0` at the build emits no table.
+- **The binding.** `compile_units`, on a content-cache miss after `rx_compile`, looks the pattern
+  up in the installed table (`rx_native_table_find`: the length and flags first, then the units)
+  and binds the matchers to the program (`rx_set_native`; `TSAOT_REGEXP_NATIVE=0` at run time
+  ignores the table as it ignores a literal's matchers). The lookup runs once per distinct
+  pattern, since the content cache holds the program afterwards: the per-call path is untouched.
+  A pattern recorded at training and built from another string at run time binds by content; a
+  pattern the program no longer builds costs the object's size and nothing else; a pattern the
+  training did not reach stays on the interpreter, correct as before.
+- **Why a separate object.** The record exists only after the instrumented program ran, so
+  emitting the table into the program's C would mean a second export and emission and a second
+  round through the unit cache. The subcommand takes milliseconds and the object is small.
+- **Verification.** The matchers come from the emitter the engine diff checks in its `--native`
+  mode (43,593 cases). `tests/pgo_build_gate.sh` trains a program that builds a pattern from a
+  string at run time: `default.regexps` holds the pattern, the trained build prints what the
+  plain one prints, `TSAOT_REGEXP_TRACE=1` reports the binding, and `--regexps off` and `--pgo
+  off` leave the pattern on the interpreter.
+- **Benchmarks.** `benchmarks/real/run.sh` takes `TSAOT_REAL_PGO=train|auto|off`: `train` runs
+  `--pgo-train` with the driver's own workload inside the clone (the files land next to
+  `garnet-driver.ts` there), `auto` applies what an earlier training left, `off` is the plain
+  build that the earlier sessions' numbers come from. `build_tsc_ts_native.sh`'s training records
+  as well, and `build.json` names the file (`pgo.regexps`).
+
 ## Verification
 
 - Conformance (the oracle is Node): the 23 regexp fixtures and the 29 others that use RegExps,
@@ -539,6 +589,36 @@ measurement variant.
   records hot functions; hono's route regexp is the same at training and in production), the method
   call through an interface-typed receiver with the sized caches (`router.match`), and the
   allocation path of small arrays (the result and the pair).
+- **R8 built (Session 358): the RegExpRouter's fourth round, the method call through an
+  interface-typed receiver.** The driver's `router.match(method, path)` goes through hono's
+  `Router<T>` interface, so the exporter has no class for the receiver and the site took the
+  dynamic path: the plain-object probe in line, then `ts_get_pic_checked` out of line for the sized
+  instance (two hash probes before the site's sized entry), twice for a prototype method. The
+  site cache of a dynamic call (`ts_method_site_ic`, docs/pic_sized_inline_design.md) now serves
+  those sites too (`ts_method_lookup_dyn_ic`: the plain-object probe in line as before; a sized
+  receiver then takes the site's cache and the lookup out of line, `ts_method_lookup_dyn_fill`,
+  and any other receiver the two cached reads as before: a first cut sent every receiver through
+  the out-of-line entry, and the extra call on tsc-ts's dictionary-mode checker object cost 0.2%
+  of its instructions), and has a second kind: the
+  receiver's own struct field holding the function (`TS_MSIC_FIELD`, the byte offset under the
+  class word; hono's `match` is a field each router reassigns with its closure), where before a
+  class with a field of the method's name kept the lookup. Probing the site's cache in line as well
+  (ahead of the plain-object probe) was tried and not kept (RegExpRouter 67.8 -> 66.9 ms,
+  SmartRouter 81.4 -> 82.8: noise, for code at every dynamic site). The lookup's prototype walk (`ts_method_lookup_sized_fill`) now tries
+  the field key before the method key at each link (an accessor or an assigned property at a
+  nearer link, the class's method otherwise: one JS namespace, closest first), where it walked the
+  method key alone: a getter in the method position through an `any` receiver threw "is not a
+  function" (`classes/dynamic_method_calls`), and a subclass's getter over a base method at a
+  base-typed site called the base's method. Two findings on the way: a class without a
+  constructor runs its field initializers at each `new` site in the caller's scope, and an arrow
+  initializer using `this` took the lexical-this cell of an earlier `new` in the same block (the
+  per-block cell cache of commit 49baa73), so `const a = new C(), b = new C()` gave b's arrows a's
+  `this` (fixture `classes/field_arrow_this_per_new`; `emitFieldInitializers` scopes the cell);
+  and the unit splitter rejected a matcher's `__attribute__((unused))` range table since R6, so
+  `--units` failed for any program with a regexp literal whose class has no ranges (the pgo build
+  gate had been failing on it). Fixtures `classes/method_site_cache_dyn`,
+  `classes/field_arrow_this_per_new`. hono, five alternating rounds (medians; Node): TrieRouter 248.2 -> 246.1 ms (260), RegExpRouter 72.1 -> 68.1 (39), PatternRouter 241.5 -> 241.9 (153), SmartRouter 94.8 -> 81.8 (42); outputs identical.
+  Gates: conformance 669/669 plain and strict (the new fixtures included), 666/666 in units mode and under GC protect, unit (the pgo build gate's `--units` case passing again), bundler 51/51, bench all within budget, GC stress PASSED, the regexp AOT and link gates. vue 1,056.4 -> 1,055.0 ms (seven alternating rounds each, medians; outputs identical; Node 773); tsc-ts 22.183 -> 22.182 G instructions (unchanged; outputs identical).
 - Not yet: the `v`-mode properties of strings (`\p{RGI_Emoji}` and the other six; the emoji
   sequence data is in `build/ucd/17.0.0/emoji-seq/`, emoji 16.0 at the time of writing).
 

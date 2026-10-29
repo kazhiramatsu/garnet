@@ -315,3 +315,35 @@ instance (`any`, an array, an interface only object literals satisfy) is exactly
 | tsc-ts typed, one checker, instructions | 22.122 G | 22.115 G (2,304 sites marked in 21 units: no cost) |
 
 Outputs identical throughout.
+
+## The site cache at an interface-typed call, and a field-held method (Session 358)
+
+A dynamic call whose receiver the program types as an interface or `any`
+(hono's `router.match` through `Router<T>`, SmartRouter's delegation) took
+the two cached reads (`emit_method_value_lookup`): the plain-object probe in
+line, then `ts_get_pic_checked` out of line for a sized instance, where the
+inherited and absent caches are hashed before the site's sized entry is
+read, and twice for a prototype method. Such a site now holds a
+`ts_method_site_ic` as well (`ts_method_lookup_dyn_ic`: the plain-object
+probe in line as before; a sized receiver then takes
+`ts_method_lookup_dyn_fill` out of line, the cache first and the lookup
+after, and any other receiver the two cached reads as before. A first cut
+sent every receiver through the out-of-line entry: tsc-ts's checker is a
+dictionary-mode object literal whose methods the inline probe never serves,
+and the extra call at its sites cost 0.2% of the compile's instructions.)
+The cache's second kind, `TS_MSIC_FIELD`, is the
+receiver's own struct field holding the function: the class word (the
+layout, so the offset; an instance that abandons its layout clears the word)
+and the byte offset, and a function in the slot. Nothing in the sidecar can
+shadow a struct field and a field becomes neither read-only nor an accessor,
+so the hit needs no sidecar test. The lookup fills it when the field's value
+is callable (hono's `match`, a field each router reassigns with its closure),
+where before a class with a field of the method's name kept the lookup on
+every call. The lookup's prototype walk tries the field key before the method
+key at each link (an accessor or an assigned property at a nearer link, the
+class's method otherwise), as one JS namespace resolves closest first; it
+walked the method key alone, which missed a getter in the method position
+through an `any` receiver and a subclass's getter over a base method.
+`TSAOT_METHOD_SITE_IC=0` keeps the two reads (the parity oracle). Fixture
+`classes/method_site_cache_dyn`. hono's RegExpRouter 72.1 -> 68.1 ms and
+SmartRouter 94.8 -> 81.8 (Node 39 / 42); vue 1,056.4 -> 1,055.0 ms (seven alternating rounds each, medians; outputs identical; Node 773); tsc-ts 22.183 -> 22.182 G instructions (unchanged; outputs identical).
