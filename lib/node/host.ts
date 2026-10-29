@@ -101,6 +101,9 @@ export interface GarnetNodeHost {
   immediateRef(id: number, on: boolean): boolean;
   immediateHasRef(id: number): boolean;
   nextTick(callback: (...args: unknown[]) => void, args: unknown[] | undefined): void;
+  /** the current asynchronous context (docs/async_context_design.md): AsyncLocalStorage's frames, carried across continuations */
+  asyncContext(): unknown;
+  setAsyncContext(ctx: unknown): void;
   /** a microtask of its own: a throw from the callback is an uncaught exception */
   queueMicrotask(callback: () => void): void;
   /** node:worker_threads over the fork workers (docs/node_compat_design.md, N5b): whether this

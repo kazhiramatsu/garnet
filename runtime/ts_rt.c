@@ -19665,6 +19665,25 @@ static tsv ts_get_catching(tsv obj, ts_key key, int* threw){
    of the benchmark 0.4 s). */
 static tsv* g_microq=NULL; static int g_mq_head=0, g_mq_len=0, g_mq_cap=0;
 static inline int microq_pending(void){ return g_mq_len > g_mq_head; }
+/* The current asynchronous context (docs/async_context_design.md): the frame chain
+   AsyncLocalStorage keeps, carried by every continuation registered while it is set (a
+   coroutine's slot, a timer's, an immediate's, a tick's). Nothing until the first
+   setAsyncContext: the capture and restore sites are one predictable branch each. */
+static tsv g_async_ctx = TS_UNDEFINED;
+static int g_async_ctx_used = 0;
+/* the contexts saved around a switch (a resume, a timer's callback), a stack the collector marks:
+   a saved context held in a C local would go stale when a collection moves it */
+static tsv* g_ctx_saves = NULL; static int g_ctx_saves_len = 0, g_ctx_saves_cap = 0;
+static void ctx_switch_to(tsv ctx){
+  if (g_ctx_saves_len == g_ctx_saves_cap){
+    g_ctx_saves_cap = g_ctx_saves_cap ? g_ctx_saves_cap * 2 : 16;
+    g_ctx_saves = (tsv*)realloc(g_ctx_saves, sizeof(tsv) * (size_t)g_ctx_saves_cap);
+    if (!g_ctx_saves) ts_abort_msg("out of memory saving an asynchronous context");
+  }
+  g_ctx_saves[g_ctx_saves_len++] = g_async_ctx;
+  g_async_ctx = ctx;
+}
+static void ctx_switch_back(void){ g_async_ctx = g_ctx_saves[--g_ctx_saves_len]; }
 static void microq_push_v(tsv cv){
   if (!ts_is_coro_value(cv)) return;
   if (g_mq_len==g_mq_cap){
@@ -20192,6 +20211,11 @@ static void ts_queue_microtask(tsv cb){
   tsv wv = ts_coro_alloc_adapter_v(sizeof(ts_qm_job), qm_job_resume);
   ((ts_qm_job*)ts_ptr(wv))->cb = cb;
   ts_write_barrier(wv, cb);
+  if (g_async_ctx_used){   /* the job runs in the context queueMicrotask was called in, as Node's */
+    ts_coro* rc = (ts_coro*)ts_ptr(wv);
+    rc->async_ctx = g_async_ctx; rc->ctx_captured = 1;
+    ts_write_barrier(wv, g_async_ctx);
+  }
   microq_push_v(wv);
   ts_gc_unroot(1);
 }
@@ -20352,6 +20376,11 @@ tsv ts_promise_any(tsv arr){
 void ts_await_register_v(tsv pv, tsv cv){
   if (!ts_is_coro_value(cv)) return;
   ts_gc_root(&pv); ts_gc_root(&cv);
+  if (g_async_ctx_used){   /* the continuation carries the context it is registered under, for one resume */
+    ts_coro* rc = (ts_coro*)ts_ptr(cv);
+    rc->async_ctx = g_async_ctx; rc->ctx_captured = 1;
+    ts_write_barrier(cv, g_async_ctx);
+  }
   if (ts_is_promise(pv)) unhandled_remove(pv);
   if (!ts_is_promise(pv)){
     /* Await uses PromiseResolve, so arbitrary thenables must be assimilated rather
@@ -20368,7 +20397,7 @@ void ts_await_register_v(tsv pv, tsv cv){
 }
 
 static void coro_init(ts_coro* c, size_t size, tsv (*resume)(tsv)){
-  c->state=0; c->resume=resume; c->result=TS_UNDEFINED; c->rejected=0;
+  c->state=0; c->resume=resume; c->result=TS_UNDEFINED; c->rejected=0; c->async_ctx=TS_UNDEFINED; c->ctx_captured=0;
   c->nvals=-1; c->frame_size=size; c->ret=TS_UNDEFINED; c->iter_result=TS_UNDEFINED;
   c->gen_status=TS_GEN_SUSPENDED_START;
   c->eh_capacity=TS_CORO_EH_INLINE;
@@ -20482,12 +20511,20 @@ static int asyncgen_after_resume_v(tsv cv){
 void ts_coro_resume_v(tsv cv){
   if (!ts_is_coro_value(cv)) return;
   ts_gc_root(&cv);
+  /* a continuation registered under a context runs in it, the resumer's back after it ran or
+     threw; `switched` is set before the setjmp and never after (its value survives the longjmp) */
+  int switched = 0;
+  if (TS_RT_UNLIKELY(g_async_ctx_used)){
+    ts_coro* rc = (ts_coro*)ts_ptr(cv);
+    if (rc->ctx_captured){ tsv ctx = rc->async_ctx; rc->ctx_captured = 0; rc->async_ctx = TS_UNDEFINED; ctx_switch_to(ctx); switched = 1; }
+  }
   ts_handler* h = ts_eh_push();
   if (ts_setjmp(h->buf) != 0){
     tsv exc = ts_current_exception();
     ts_gc_set_root_depth(h->gc_root_len);
     ts_frame_restore(h->frame_top);
     ts_eh_pop_until(h);
+    if (switched) ctx_switch_back();
     cv = exc;  /* keep the exception rooted while rethrowing past this cleanup frame */
     ts_throw(exc);
   }
@@ -20495,6 +20532,7 @@ void ts_coro_resume_v(tsv cv){
   if (c->resume) c->resume(cv);
   int kick_next=asyncgen_after_resume_v(cv);
   ts_eh_pop_until(h);
+  if (switched) ctx_switch_back();
   ts_gc_unroot(1);
   if (kick_next) asyncgen_start_next_v(cv);
 }
@@ -21590,6 +21628,7 @@ static void gc_scan_async_cell(ts_gc_header* h, int young, int depth){
     gc_visit_slot(&c->iter_result, young, depth, stable);
     for (int i=0;i<c->fin_top;i++) gc_visit_slot(&c->fin_exc[i], young, depth, stable);
     gc_visit_slot(&c->ret, young, depth, stable);
+    gc_visit_slot(&c->async_ctx, young, depth, stable);
     for (ts_asyncgen_req* r=c->ag_head;r;r=r->next){
       gc_visit_slot(&r->promise, young, depth, stable);
       gc_visit_slot(&r->value, young, depth, stable);
@@ -21617,6 +21656,8 @@ static void gc_scan_async_cell(ts_gc_header* h, int young, int depth){
 static void gc_mark_async_roots(void){
   for (int i=g_mq_head;i<g_mq_len;i++) gc_visit_slot(&g_microq[i], 0, 0, 1);   /* the pending entries only */
   for (int i=0;i<g_unhandled_len;i++) gc_visit_slot(&g_unhandled[i], 0, 0, 1);
+  gc_visit_slot(&g_async_ctx, 0, 0, 1);
+  for (int i=0;i<g_ctx_saves_len;i++) gc_visit_slot(&g_ctx_saves[i], 0, 0, 1);
   nh_mark_loop_roots(0);
   for (ts_io* t=g_io_head;t;t=t->next){ gc_visit_slot(&t->p, 0, 0, 1); gc_visit_slot(&t->signal, 0, 0, 1); }
   for (ts_io* t=g_io_active;t;t=t->next){ gc_visit_slot(&t->p, 0, 0, 1); gc_visit_slot(&t->signal, 0, 0, 1); }
@@ -21625,6 +21666,8 @@ static void gc_mark_async_roots(void){
 static void gc_mark_async_roots_young(void){
   for (int i=g_mq_head;i<g_mq_len;i++) gc_visit_slot(&g_microq[i], 1, 0, 1);
   for (int i=0;i<g_unhandled_len;i++) gc_visit_slot(&g_unhandled[i], 1, 0, 1);
+  gc_visit_slot(&g_async_ctx, 1, 0, 1);
+  for (int i=0;i<g_ctx_saves_len;i++) gc_visit_slot(&g_ctx_saves[i], 1, 0, 1);
   nh_mark_loop_roots(1);
   for (ts_io* t=g_io_head;t;t=t->next){ gc_visit_slot(&t->p, 1, 0, 1); gc_visit_slot(&t->signal, 1, 0, 1); }
   for (ts_io* t=g_io_active;t;t=t->next){ gc_visit_slot(&t->p, 1, 0, 1); gc_visit_slot(&t->signal, 1, 0, 1); }

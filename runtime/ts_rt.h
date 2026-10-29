@@ -3792,6 +3792,8 @@ typedef struct ts_coro {
   tsv result;                /* awaited value (async) / value sent into .next() (gen) */
   int rejected;
   tsv ret;
+  tsv async_ctx;             /* the asynchronous context captured when this continuation was registered on a promise (docs/async_context_design.md) */
+  int ctx_captured;          /* async_ctx holds a capture for the next resume (one-shot): a resume nobody registered, a generator's next(), keeps the caller's context */
   size_t frame_size;         /* total bytes of the enclosing frame (for GC scan) */
   int nvals;                 /* tsv locals leading the frame, scanned precisely;
                                 -1 = scan the frame conservatively (ts_coro_alloc_v) */

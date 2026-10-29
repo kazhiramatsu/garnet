@@ -689,17 +689,18 @@ typedef struct nh_timer {
   uint32_t id;
   double due_ms, repeat_ms;   /* repeat_ms 0: once */
   tsv cb, args;               /* args: an array or undefined */
+  tsv ctx;                    /* the asynchronous context the timer was made under (docs/async_context_design.md) */
   int refed, active;
   struct nh_timer* next;
 } nh_timer;
 static nh_timer* g_nh_timers = NULL;
 static uint32_t g_nh_next_id = 1;
 static int g_nh_refed_timers = 0;
-typedef struct nh_immediate { uint32_t id; tsv cb, args; int refed, active; struct nh_immediate* next; } nh_immediate;
+typedef struct nh_immediate { uint32_t id; tsv cb, args, ctx; int refed, active; struct nh_immediate* next; } nh_immediate;
 static nh_immediate* g_nh_imm_head = NULL;
 static nh_immediate* g_nh_imm_tail = NULL;
 static int g_nh_refed_immediates = 0;
-typedef struct nh_tick { tsv cb, args; struct nh_tick* next; } nh_tick;
+typedef struct nh_tick { tsv cb, args, ctx; struct nh_tick* next; } nh_tick;
 static nh_tick* g_nh_tick_head = NULL;
 static nh_tick* g_nh_tick_tail = NULL;
 
@@ -733,6 +734,15 @@ static void nh_call_with_args(tsv cb, tsv args){
   if (argv != stack_args) free(argv);
   ts_gc_unroot(2);
 }
+/* the callback under the asynchronous context its record captured (an uncaught throw leaves the
+   program, so nothing to restore then) */
+static void nh_call_in_ctx(tsv cb, tsv args, tsv ctx){
+  if (!g_async_ctx_used){ nh_call_with_args(cb, args); return; }
+  ctx_switch_to(ctx);
+  nh_call_with_args(cb, args);
+  ctx_switch_back();
+}
+static tsv nh_ctx_now(void){ return g_async_ctx_used ? g_async_ctx : TS_UNDEFINED; }
 /* nextTick callbacks run before the microtasks, and a callback's own ticks before
    the microtasks it queued, until both queues are empty (Node's order). */
 static void nh_drain_ticks_and_microtasks(void){
@@ -741,9 +751,9 @@ static void nh_drain_ticks_and_microtasks(void){
       nh_tick* t = g_nh_tick_head;
       g_nh_tick_head = t->next;
       if (!g_nh_tick_head) g_nh_tick_tail = NULL;
-      tsv cb = t->cb, args = t->args;
+      tsv cb = t->cb, args = t->args, ctx = t->ctx;
       free(t);
-      nh_call_with_args(cb, args);
+      nh_call_in_ctx(cb, args, ctx);
     }
     drain_microtasks();
     if (!g_nh_tick_head && !microq_pending()) return;
@@ -759,10 +769,10 @@ static void nh_timers_run_due(void){
        included: a repeating timer is back in the list, a one-shot is gone), so
        the record is never touched after the call */
     g_nh_timers = t->next; t->next = NULL;
-    tsv cb = t->cb, args = t->args;
+    tsv cb = t->cb, args = t->args, ctx = t->ctx;
     if (t->repeat_ms > 0){ t->due_ms = now + t->repeat_ms; nh_timer_insert(t); }
     else { if (t->active && t->refed) g_nh_refed_timers--; free(t); }
-    nh_call_with_args(cb, args);
+    nh_call_in_ctx(cb, args, ctx);
     nh_drain_ticks_and_microtasks();
     unhandled_report();
   }
@@ -776,9 +786,9 @@ static void nh_immediates_run(void){
     if (im->active){
       if (im->refed) g_nh_refed_immediates--;
       im->active = 0;
-      tsv cb = im->cb, args = im->args;
+      tsv cb = im->cb, args = im->args, ctx = im->ctx;
       free(im);
-      nh_call_with_args(cb, args);
+      nh_call_in_ctx(cb, args, ctx);
       nh_drain_ticks_and_microtasks();
       unhandled_report();
     } else free(im);
@@ -802,9 +812,9 @@ static int nh_next_timer_timeout_ms(int limit){
 static void nh_sleep_ms(int ms){ if (ms > 0) poll(NULL, 0, ms); }
 static void nh_mark_loop_roots(int young){
   nh_mark_io_roots(young);
-  for (nh_timer* t = g_nh_timers; t; t = t->next){ gc_visit_slot(&t->cb, young, 0, 1); gc_visit_slot(&t->args, young, 0, 1); }
-  for (nh_immediate* im = g_nh_imm_head; im; im = im->next){ gc_visit_slot(&im->cb, young, 0, 1); gc_visit_slot(&im->args, young, 0, 1); }
-  for (nh_tick* t = g_nh_tick_head; t; t = t->next){ gc_visit_slot(&t->cb, young, 0, 1); gc_visit_slot(&t->args, young, 0, 1); }
+  for (nh_timer* t = g_nh_timers; t; t = t->next){ gc_visit_slot(&t->cb, young, 0, 1); gc_visit_slot(&t->args, young, 0, 1); gc_visit_slot(&t->ctx, young, 0, 1); }
+  for (nh_immediate* im = g_nh_imm_head; im; im = im->next){ gc_visit_slot(&im->cb, young, 0, 1); gc_visit_slot(&im->args, young, 0, 1); gc_visit_slot(&im->ctx, young, 0, 1); }
+  for (nh_tick* t = g_nh_tick_head; t; t = t->next){ gc_visit_slot(&t->cb, young, 0, 1); gc_visit_slot(&t->args, young, 0, 1); gc_visit_slot(&t->ctx, young, 0, 1); }
 }
 /* timerAdd(cb, args, delayMs, repeatMs) -> id */
 static tsv nh_timer_add(tsv* a, int n){
@@ -816,7 +826,7 @@ static tsv nh_timer_add(tsv* a, int n){
   t->id = g_nh_next_id++;
   t->due_ms = nh_mono_ms() + delay;
   t->repeat_ms = repeat > 0 ? repeat : 0;
-  t->cb = cb; t->args = nh_arg(a, n, 1);
+  t->cb = cb; t->args = nh_arg(a, n, 1); t->ctx = nh_ctx_now();
   t->refed = 1; t->active = 1;
   g_nh_refed_timers++;
   nh_timer_insert(t);
@@ -854,7 +864,7 @@ static tsv nh_immediate_add(tsv* a, int n){
   if (!ts_is_func(cb)) ts_throw_type_error_msg("The \"callback\" argument must be of type function");
   nh_immediate* im = (nh_immediate*)calloc(1, sizeof *im);
   if (!im) ts_abort_msg("out of memory creating an immediate");
-  im->id = g_nh_next_id++; im->cb = cb; im->args = nh_arg(a, n, 1); im->refed = 1; im->active = 1;
+  im->id = g_nh_next_id++; im->cb = cb; im->args = nh_arg(a, n, 1); im->ctx = nh_ctx_now(); im->refed = 1; im->active = 1;
   g_nh_refed_immediates++;
   if (g_nh_imm_tail) g_nh_imm_tail->next = im; else g_nh_imm_head = im;
   g_nh_imm_tail = im;
@@ -887,11 +897,15 @@ static tsv nh_next_tick(tsv* a, int n){
   if (!ts_is_func(cb)) ts_throw_type_error_msg("The \"callback\" argument must be of type function");
   nh_tick* t = (nh_tick*)calloc(1, sizeof *t);
   if (!t) ts_abort_msg("out of memory queueing a tick");
-  t->cb = cb; t->args = nh_arg(a, n, 1);
+  t->cb = cb; t->args = nh_arg(a, n, 1); t->ctx = nh_ctx_now();
   if (g_nh_tick_tail) g_nh_tick_tail->next = t; else g_nh_tick_head = t;
   g_nh_tick_tail = t;
   return TS_UNDEFINED;
 }
+/* asyncContext() / setAsyncContext(v): the current asynchronous context, what node:async_hooks's
+   AsyncLocalStorage keeps (docs/async_context_design.md); the first write turns the carrying on */
+static tsv nh_async_context(tsv* a, int n){ (void)a; (void)n; return g_async_ctx; }
+static tsv nh_set_async_context(tsv* a, int n){ g_async_ctx = nh_arg(a, n, 0); g_async_ctx_used = 1; return TS_UNDEFINED; }
 /* ---- digests for node:crypto: md5, sha1, sha256, sha512 (RFC 1321, 3174, 6234) ---- */
 static uint32_t nh_rol32(uint32_t x, int n){ return (x << n) | (x >> (32 - n)); }
 static uint32_t nh_ror32(uint32_t x, int n){ return (x >> n) | (x << (32 - n)); }
@@ -1550,6 +1564,8 @@ static void ts_garnet_node_global_init(tsv global){
   nh_method(host, "immediateRef", nh_immediate_ref, 2);
   nh_method(host, "immediateHasRef", nh_immediate_has_ref, 1);
   nh_method(host, "nextTick", nh_next_tick, 2);
+  nh_method(host, "asyncContext", nh_async_context, 0);
+  nh_method(host, "setAsyncContext", nh_set_async_context, 1);
   nh_method(host, "queueMicrotask", nh_queue_microtask, 1);
   nh_method(host, "spawnSync", nh_spawn_sync, 8);
   nh_method(host, "spawn", nh_spawn, 6);

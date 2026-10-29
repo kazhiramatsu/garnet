@@ -158,6 +158,9 @@ Rust in §315; selfhost is kept as a performance metric).
 - `Promise.prototype.finally` called on a thenable that is not a promise is a garnet TypeError (V8
   builds its thenFinally / catchFinally for any receiver); then and catch on other receivers follow V8
   (Session 358).
+- `node:async_hooks` provides `AsyncLocalStorage` and `AsyncResource` (docs/async_context_design.md):
+  `createHook`, `executionAsyncId` and the other tracing ids are not provided (an import of them is a
+  compile-time error), and an EventEmitter's listeners run in the emitting caller's context.
 - `o.__proto__` and `o["__proto__"]` read undefined (V8: the prototype through the accessor);
   `Object.getPrototypeOf` / `setPrototypeOf` are the modelled forms (Session 355 note).
 - A typed receiver that is a Proxy (vue's reactive arrays and collections) takes its methods through

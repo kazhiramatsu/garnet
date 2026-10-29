@@ -101,7 +101,7 @@ the fixes:
 | client | OK |  |
 | combine | OK |  |
 | compress | DIFF | `CompressionStream` |
-| context_storage | TYPE-ERR | `node:async_hooks` AsyncLocalStorage |
+| context_storage | OK |  |
 | cookie_signed | OK |  |
 | cookie | OK |  |
 | cors | OK |  |
@@ -136,7 +136,7 @@ the fixes:
 | css | OK |  |
 | jsx_renderer | OK |  |
 
-40 of 43 identical to Node's output (26 after the survey's own fixes; Web Crypto, docs/web_crypto_design.md, took eight more; streams, Blob / File and the client's two fixes, docs/web_streams_design.md, six more).
+41 of 43 identical to Node's output (26 after the survey's own fixes; Web Crypto, docs/web_crypto_design.md, took eight more; streams, Blob / File and the client's two fixes, docs/web_streams_design.md, six more; AsyncLocalStorage, docs/async_context_design.md, one more).
 
 What remains, by the number of drivers it blocks:
 
@@ -148,8 +148,8 @@ What remains, by the number of drivers it blocks:
 3. ~~Blob / File~~ and multipart file parts: `lib/node/web/blob.ts` since the same session; the
    request-body driver runs (`parseBody` with a file, `c.req.blob()`).
 4. `CompressionStream` (the compress middleware: gzip / deflate / brotli over streams; Node has it).
-5. `node:async_hooks`'s `AsyncLocalStorage` (context-storage; hono's JSX context uses it when
-   present): asynchronous context propagation through the event loop's continuations.
+5. ~~`node:async_hooks`'s `AsyncLocalStorage`~~: `lib/node/async_hooks.ts` over the runtime's
+   asynchronous context (docs/async_context_design.md) since the same session; context-storage runs.
 6. BigInt (ip-restriction's IPv6 arithmetic): unsupported by design.
 7. ~~The client `hc` and `testClient`~~: `new WebSocket(...args)` (a spread into an ambient
    constructor the runtime lacks) compiles to a run-time ReferenceError now, and a Proxy of a

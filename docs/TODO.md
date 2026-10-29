@@ -12068,3 +12068,22 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   handled together within 10 s.
 - Gates: the full gate set green: unit, bundler 53/53, conformance plain and strict 695/695, protect and units 692/692, bench (every benchmark correct and within its budget), the GC suite incl. ASan and GC stress, the `ci` gate with the extended microtask gate, the fetch run gate, the regexp engine diff 43,593 cases 0 differ; the ir-parity snapshot refreshed (243 programs' IR changed by the prelude alone: queueMicrotask's arrow left the base prelude, which renumbers the functions after it; a comparison of one with the numbers normalized finds the arrow and the prelude's one assignment the only change). tsc-ts r16 -> r17 instructions 0.9999 (21.951 G -> 21.949 G), cycles 0.989, wall 0.983; vue medians of 7: 1077.7 -> 1068.6 ms; hono routers medians of 5: TrieRouter 247.7 -> 250.9, RegExpRouter 65.0 -> 64.4, PatternRouter 241.8 -> 240.3, SmartRouter 73.0 -> 73.4 ms; hono_app
   garnet 181.5 ms, Node 158.8 (medians of 3); interleaved medians of 9 against the leak fix's build 181.8 -> 180.8 ms, instructions 4.482 G -> 4.468 G.
+- `node:async_hooks`'s `AsyncLocalStorage`, the survey's last library gap (Kaz:
+  「AsyncLocalStorage も続けて進めて」): `lib/node/async_hooks.ts` (docs/async_context_design.md):
+  `AsyncLocalStorage` (`run`, `getStore`, `exit`, `enterWith`, `disable`, `bind`, `snapshot`) and
+  `AsyncResource` (`runInAsyncScope`, `bind`) over a chain of frames the runtime carries as the
+  current asynchronous context (`g_async_ctx`, read and written through two host methods). A
+  coroutine registered on a promise captures it (`ts_await_register_v`: an await, a then, an
+  adoption) for that one resume (`ctx_captured`), so a generator's `next()` keeps its caller's
+  context, as a generator body runs in its caller's; a queueMicrotask job captures it when queued;
+  a timer, an immediate and a tick capture it when made. A resume or a callback switches to the
+  captured context and back, the saved contexts on a small stack the collector marks (a saved
+  context in a C local went stale under a moving collection in the first draft's dry run). Until a
+  program sets a context, each capture and switch is one predictable branch. Fixture
+  `node/async_local_storage` (both profiles; Node's own module is the oracle; also under a young
+  collection at every allocation): runs nested and side by side, the store after awaits, in a then,
+  a timer, an immediate, a tick, a queued microtask and a for await, two storages, exit,
+  enterWith, disable, bind, snapshot, AsyncResource, a generator's body, an async function across
+  awaits resumed from another context. The survey's context_storage driver agrees with Node: 41 of
+  43 (compress waits for CompressionStream, ip_restriction for BigInt).
+- Gates: the full gate set green: unit, bundler 53/53, conformance plain and strict 696/696, protect and units 693/693, bench (every benchmark correct and within its budget), the GC suite incl. ASan and GC stress, the `ci` gate with the microtask gate, the fetch run gate, the regexp engine diff 43,593 cases 0 differ; ir-parity identical (4,328 files; the new fixture's 6 added to the snapshot). tsc-ts r17 -> r18 instructions 0.9998 (21.950 G -> 21.945 G), cycles 1.003, wall 1.008; vue medians of 7: 1065.8 -> 1065.4 ms; hono routers medians of 5: TrieRouter 251.8 -> 252.5, RegExpRouter 64.4 -> 63.2, PatternRouter 242.2 -> 241.5, SmartRouter 74.7 -> 72.3 ms; hono_app garnet 182.7 ms, Node 179.5 (medians of 3; Node's own runs 171.6-185.0 under the load).

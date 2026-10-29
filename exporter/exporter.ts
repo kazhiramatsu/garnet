@@ -90,7 +90,7 @@ const STRICT_TYPE_OPTION_NAMES: StrictTypeOptionName[] = [
  *  `paths` may still map the scheme. */
 /** The Node modules garnet provides (docs/node_compat_design.md): `node:<name>` and the bare
  *  builtin names resolve to lib/node/<name>.ts; a project's own `paths` still win. */
-const NODE_BUILTIN_MODULES = ["assert", "assert/strict", "buffer", "child_process", "crypto", "events", "fs",
+const NODE_BUILTIN_MODULES = ["assert", "assert/strict", "async_hooks", "buffer", "child_process", "crypto", "events", "fs",
   "fs/promises", "os", "path", "path/posix", "perf_hooks", "process", "readline", "stream", "string_decoder",
   "timers", "timers/promises", "url", "util", "worker_threads"];
 function isNodeBuiltinSpecifier(spec: string): boolean {

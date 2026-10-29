@@ -179,6 +179,10 @@ is the program's arguments, as in Node.
 - **N5**: tsc-ts compiled against `lib/node` instead of its own shims (output
   identical, instructions within noise), `worker_threads` generalized from the
   fork workers.
+- `async_hooks` (Session 358, docs/async_context_design.md): `AsyncLocalStorage` and
+  `AsyncResource` over the runtime's asynchronous context, carried by every continuation (an
+  await, a then, a queueMicrotask job, a timer, an immediate, a tick); `createHook` and the async
+  ids are not provided.
 - Later, when a program needs them: `net`/`http`/`https` (sockets, TLS),
   `fs.watch`, `dns`, `zlib`, Windows.
 
