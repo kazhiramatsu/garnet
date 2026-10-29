@@ -4969,9 +4969,25 @@ class Exporter {
       const dst = this.newLocal(ctx, "reference", hint);
       this.labels[site] = `${hint ?? "arr"}@${ctx.name}`;
       this.recordSite(site, "array", this.inLoop(node) ? "many" : "once", false, node);
-      ctx.body.push({ kind: "AllocArray", dst, elemType: 0, site });
       let contiguous = true;
       for (const el of node.elements) if (ts.isSpreadElement(el)) contiguous = false;
+      const holes = node.elements.some((el) => ts.isOmittedExpression(el));
+      if (contiguous && !holes && node.elements.length > 0 && process.env.TSAOT_ARRAY_LIT !== "0") {
+        // The elements first (left to right, as before), then the array and its stores by index:
+        // the emitter fuses `AllocArray; (Const i; StoreIndex)*` into one allocation filled from
+        // the elements (emit_c.rs array_lits_for). Where the array is allocated is unobservable;
+        // the elements' evaluation order is what the program sees. TSAOT_ARRAY_LIT=0 keeps the
+        // old order (and the emitter its separate stores).
+        const vals = node.elements.map((el) => this.lowerExpr(ctx, el as ts.Expression));
+        ctx.body.push({ kind: "AllocArray", dst, elemType: 0, site });
+        vals.forEach((v, i) => {
+          const idx = this.newLocal(ctx, "primitive");
+          ctx.body.push({ kind: "Const", dst: idx, value: { kind: "Num", value: i } });
+          ctx.body.push({ kind: "StoreIndex", arr: dst, index: idx, src: v });
+        });
+        return dst;
+      }
+      ctx.body.push({ kind: "AllocArray", dst, elemType: 0, site });
       if (contiguous) {
         // fast path: no spread, assign by static index
         node.elements.forEach((el, i) => {

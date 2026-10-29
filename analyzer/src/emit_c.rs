@@ -1952,6 +1952,8 @@ struct Ctx<'a> {
     /// the regexp literal sites with a native matcher (rx_native_sites_for): the call's destination
     /// local to the matcher id
     rx_native: BTreeMap<u32, u32>,
+    /// the array literals whose stores the allocation absorbs (array_lits_for)
+    array_lits: ArrayLits,
     switch_plan: SwitchPlan,
     layouts: LayoutPlan,
     /// Typed direct stores whose frozen test is omitted (`frozen_elision_for`).
@@ -2586,6 +2588,81 @@ fn typed_key_locals(program: &Program) -> BTreeMap<u32, TypedKeyLocals> {
 
 /// TSAOT_PUSH_INLINE=0 keeps `arr.push(v)` as the out-of-line runtime call (the
 /// parity oracle): on, a push stores into a plain array with room in line.
+/// An array literal's elements stored by the allocation itself (`ts_new_array_lit*`; the
+/// exporter lowers the elements before the array): `TSAOT_ARRAY_LIT=0` keeps the separate
+/// stores (the parity oracle).
+fn array_lit_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_ARRAY_LIT").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
+/// The array literals of a function whose stores the allocation absorbs
+/// (docs/regexp_vm_design.md "R8"): an `AllocArray` followed in its block by `Const i; StoreIndex`
+/// pairs for i = 0, 1, ... (the exporter's order for a literal without holes or spreads), keyed by
+/// the allocation's address, with the addresses of the stores the emitter then skips. The index
+/// constants are emitted as they are (dead stores the C compiler drops). Up to 64 elements, the
+/// compact cell's limit.
+#[derive(Default)]
+struct ArrayLits {
+    lits: BTreeMap<usize, Vec<u32>>,
+    skip: BTreeSet<usize>,
+}
+fn array_lits_for(f: &Function) -> ArrayLits {
+    let mut out = ArrayLits::default();
+    if !array_lit_enabled() {
+        return out;
+    }
+    fn walk(body: &[Inst], out: &mut ArrayLits) {
+        let mut i = 0;
+        while i < body.len() {
+            match &body[i] {
+                Inst::AllocArray { dst, .. } => {
+                    let mut elems: Vec<u32> = Vec::new();
+                    let mut skip: Vec<usize> = Vec::new();
+                    let mut j = i + 1;
+                    while j + 1 < body.len() && elems.len() < 64 {
+                        let (Inst::Const { dst: c, value: ConstVal::Num { value } }, Inst::StoreIndex { arr, index, src, elem }) = (&body[j], &body[j + 1]) else { break };
+                        if *value != elems.len() as f64 || arr.0 != dst.0 || index.0 != c.0 || src.0 == dst.0 || *elem != 0 {
+                            break;
+                        }
+                        elems.push(src.0);
+                        skip.push(&body[j + 1] as *const Inst as usize);
+                        j += 2;
+                    }
+                    if !elems.is_empty() {
+                        out.lits.insert(&body[i] as *const Inst as usize, elems);
+                        out.skip.extend(skip);
+                        i = j;
+                        continue;
+                    }
+                }
+                Inst::Loop { cond_body, body: b, .. } => {
+                    walk(cond_body, out);
+                    walk(b, out);
+                }
+                Inst::If { then_body, else_body, .. } => {
+                    walk(then_body, out);
+                    walk(else_body, out);
+                }
+                Inst::TryCatch { try_body, catch_body, finally_body, .. } => {
+                    walk(try_body, out);
+                    walk(catch_body, out);
+                    walk(finally_body, out);
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+    walk(&f.body, &mut out);
+    out
+}
+
 fn push_inline_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -9354,6 +9431,7 @@ fn emit_i64_function(
         tag_consts: tag_consts_for(f),
         str_consts: str_consts_for(f, static_strings),
         rx_native: rx_native_sites_for(f),
+        array_lits: array_lits_for(f),
         const_keys: const_keys_for(f),
         static_strings,
         string_metric_plan,
@@ -9601,6 +9679,7 @@ fn emit_f64_function(
         tag_consts: tag_consts_for(f),
         str_consts: str_consts_for(f, static_strings),
         rx_native: rx_native_sites_for(f),
+        array_lits: array_lits_for(f),
         const_keys: const_keys_for(f),
         static_strings,
         string_metric_plan,
@@ -9739,6 +9818,7 @@ fn emit_function(
             tag_consts: tag_consts_for(f),
             str_consts: str_consts_for(f, static_strings),
         rx_native: rx_native_sites_for(f),
+        array_lits: array_lits_for(f),
         const_keys: const_keys_for(f),
             static_strings,
             string_metric_plan: None,
@@ -9819,6 +9899,7 @@ fn emit_function(
             tag_consts: tag_consts_for(f),
             str_consts: str_consts_for(f, static_strings),
         rx_native: rx_native_sites_for(f),
+        array_lits: array_lits_for(f),
         const_keys: const_keys_for(f),
             static_strings,
             string_metric_plan: None,
@@ -9899,6 +9980,7 @@ fn emit_function(
             tag_consts: tag_consts_for(f),
             str_consts: str_consts_for(f, static_strings),
         rx_native: rx_native_sites_for(f),
+        array_lits: array_lits_for(f),
         const_keys: const_keys_for(f),
             static_strings,
             string_metric_plan: None,
@@ -10204,6 +10286,7 @@ fn emit_function(
         tag_consts: tag_consts_for(f),
         str_consts: str_consts_for(f, static_strings),
         rx_native: rx_native_sites_for(f),
+        array_lits: array_lits_for(f),
         const_keys: const_keys_for(f),
         static_strings,
         string_metric_plan,
@@ -21844,6 +21927,10 @@ fn emit_store_field_generic_key(s: &mut String, obj: u32, field: &str, src: u32,
 
 fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
     ctx.cur_inst.set(inst as *const Inst as usize);
+    // an array literal's element store, done by the allocation (array_lits_for)
+    if !ctx.array_lits.skip.is_empty() && ctx.array_lits.skip.contains(&(inst as *const Inst as usize)) {
+        return;
+    }
     match inst {
         Inst::AllocObject {
             dst,
@@ -22073,6 +22160,49 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 .get(&site.0)
                 .copied()
                 .unwrap_or(AllocStrategy::Heap);
+            if let Some(elems) = ctx.array_lits.lits.get(&(inst as *const Inst as usize)) {
+                // the literal's elements stored by the allocation (one call; the elements are
+                // evaluated already, and the collector finds them on the native stack)
+                let n = elems.len();
+                let vals: Vec<String> = elems.iter().map(|e| ctx.val(*e)).collect();
+                if n <= 4 {
+                    // the inline slots: the elements in registers, holes past them
+                    let mut regs = vals.clone();
+                    while regs.len() < 4 {
+                        regs.push("TS_ARRAY_HOLE".to_string());
+                    }
+                    let call = match alloc_site_id(site.0, st) {
+                        Some(sid) => format!("ts_new_array_lit4_site({}u, {}, {}u)", n, regs.join(", "), sid),
+                        None if st == AllocStrategy::PretenuredHeap => format!("ts_new_array_lit4_pretenured({}u, {})", n, regs.join(", ")),
+                        None => format!("ts_new_array_lit4({}u, {})", n, regs.join(", ")),
+                    };
+                    let _ = writeln!(s, "  {} = {}; /* site {} {:?}: the literal's {} elements */", ctx.vname(dst.0), call, site.0, st, n);
+                    if site_stats_enabled() {
+                        let _ = writeln!(s, "  ts_site_note({}, 4000000001u);", site.0);
+                    }
+                    return;
+                }
+                let call = match alloc_site_id(site.0, st) {
+                    Some(sid) => format!("ts_new_array_lit_site({}u, _al, {}u)", n, sid),
+                    None if st == AllocStrategy::PretenuredHeap => format!("ts_new_array_lit_pretenured({}u, _al)", n),
+                    None => format!("ts_new_array_lit({}u, _al)", n),
+                };
+                let _ = writeln!(
+                    s,
+                    "  {{ tsv _al[{}] = {{ {} }}; {} = {}; }} /* site {} {:?}: the literal's {} elements */",
+                    n,
+                    vals.join(", "),
+                    ctx.vname(dst.0),
+                    call,
+                    site.0,
+                    st,
+                    n
+                );
+                if site_stats_enabled() {
+                    let _ = writeln!(s, "  ts_site_note({}, 4000000001u);", site.0);
+                }
+                return;
+            }
             if let Some(sid) = alloc_site_id(site.0, st) {
                 let _ = writeln!(
                     s,

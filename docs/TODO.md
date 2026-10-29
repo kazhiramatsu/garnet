@@ -11686,3 +11686,23 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   a trailing attribute from the
   declarator it declares `extern` and keeps it on the definition. Gates: conformance 669/669 plain and strict (the new fixtures included), 666/666 in units mode and under GC protect, unit (the pgo build gate's `--units` case passing again), bundler 51/51, bench all within budget, GC stress PASSED, the regexp AOT and link gates (the inline path's final shape, which touches no allocation, re-ran conformance plain and strict 669/669, unit and bench). vue 1,056.4 -> 1,055.0 ms (seven alternating rounds each, medians; outputs identical; Node 773);
   tsc-ts 22.183 -> 22.182 G instructions (unchanged; outputs identical).
+- R8b of the regexp VM: the array literal's allocation (docs/regexp_vm_design.md "R8b built").
+  The match closure's `[matcher[1][index], match]` and the routers' other small literals were an
+  empty allocation (`ts_new_array_site(0)`) and a checked store per element (`ts_array_set_inline`:
+  the tag, capacity, integrity and generation tests each time). (1) Exporter: a literal without
+  holes or spreads lowers its elements first (left to right, as before) and then the array and
+  its stores by index; where the array is allocated is unobservable. (2) Emitter: `array_lits_for`
+  recognizes `AllocArray; (Const i; StoreIndex)*` (keyed by the instructions' addresses, as the
+  frozen-test elision is) and emits one allocation that stores the elements, skipping the stores:
+  up to four elements in registers with `TS_ARRAY_HOLE` for the slots past the length
+  (`ts_new_array_lit4_site`: four plain stores into the inline slots), five to 64 through a stack
+  array into a compact cell (`ts_new_array_lit_site`, one allocation where a cell and a payload
+  were), beyond that an element payload. A first cut took every length through the stack array and
+  a loop over the length: more instructions than the allocation and the stores it replaced (hono
+  +1.0% instructions, the TrieRouter +3% wall), so the register form came in for the common sizes.
+  The collector finds the evaluated elements on the native stack (conservative roots) or in the
+  frame; a pretenured literal remembers its young elements. `TSAOT_ARRAY_LIT=0` keeps the old
+  order and the separate stores (in the parity oracle's lists). Fixture `arrays/literal_fused`.
+  hono, five alternating rounds on one toolchain (the knob off against on; medians; Node):
+  TrieRouter 250.7 -> 245.3 ms (260), RegExpRouter 69.0 -> 69.3 (39), PatternRouter 239.1 -> 240.1 (153), SmartRouter 82.6 -> 82.5 (42); outputs identical; the whole run 18.99 -> 18.71 G instructions (-1.5%). Gates: conformance 670/670 plain and strict (the fixture included), 667/667 in units mode and under GC protect, unit, bundler 51/51, bench all within budget, GC stress PASSED, the regexp AOT and link gates. vue 1,053.5 -> 1,047.8 ms (seven alternating rounds each, medians; outputs identical; Node 773);
+  tsc-ts 22.183 -> 22.177 G instructions (unchanged; outputs identical).

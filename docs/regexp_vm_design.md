@@ -619,6 +619,27 @@ measurement variant.
   gate had been failing on it). Fixtures `classes/method_site_cache_dyn`,
   `classes/field_arrow_this_per_new`. hono, five alternating rounds (medians; Node): TrieRouter 248.2 -> 246.1 ms (260), RegExpRouter 72.1 -> 68.1 (39), PatternRouter 241.5 -> 241.9 (153), SmartRouter 94.8 -> 81.8 (42); outputs identical.
   Gates: conformance 669/669 plain and strict (the new fixtures included), 666/666 in units mode and under GC protect, unit (the pgo build gate's `--units` case passing again), bundler 51/51, bench all within budget, GC stress PASSED, the regexp AOT and link gates. vue 1,056.4 -> 1,055.0 ms (seven alternating rounds each, medians; outputs identical; Node 773); tsc-ts 22.183 -> 22.182 G instructions (unchanged; outputs identical).
+- **R8b built (Session 358): the array literal's allocation.** The match closure's
+  `[matcher[1][index], match]` (and `[[], emptyParam]`, the trie's `[curNode]`, every small
+  literal of the routers) was an empty allocation and a checked store per element
+  (`ts_new_array_site(0)`, `ts_array_set_inline` with its tag, capacity, integrity and generation
+  tests). The exporter now lowers a literal without holes or spreads as its elements first (left
+  to right, as before) and then the array with its stores by index, and the emitter fuses
+  `AllocArray; (Const i; StoreIndex)*` (`array_lits_for`, keyed by the instructions' addresses)
+  into one allocation that stores the elements: up to four in registers with holes for the slots
+  past the length (`ts_new_array_lit4_site`, four plain stores into the inline slots), five to 64
+  in the cell as a compact array through a stack array (`ts_new_array_lit_site`), more than 64
+  with an element payload. A first cut took every length through the stack array and a loop over
+  the length, and ran more instructions than the allocation and the stores it replaced (hono +1%
+  instructions, the TrieRouter +3% wall): the register form for the common sizes is what pays.
+  Where the array is allocated is unobservable; the elements' evaluation order is what the
+  program sees, and the collector finds the evaluated elements on the native stack (conservative
+  roots) or in the frame. `TSAOT_ARRAY_LIT=0` keeps the old order and the separate stores (the
+  parity oracle). Fixture `arrays/literal_fused` (every size class, the evaluation order, an
+  element that throws, literals in a loop, growth and mutation after the literal in each size
+  class, nested literals, holes and spreads untouched). hono, five alternating rounds on one
+  toolchain (the knob off against on; medians; Node): TrieRouter 250.7 -> 245.3 ms (260), RegExpRouter 69.0 -> 69.3 (39), PatternRouter 239.1 -> 240.1 (153), SmartRouter 82.6 -> 82.5 (42); outputs identical; the whole run 18.99 -> 18.71 G
+  instructions. Gates: conformance 670/670 plain and strict (the fixture included), 667/667 in units mode and under GC protect, unit, bundler 51/51, bench all within budget, GC stress PASSED, the regexp AOT and link gates. vue 1,053.5 -> 1,047.8 ms (seven alternating rounds each, medians; outputs identical; Node 773); tsc-ts 22.183 -> 22.177 G instructions (unchanged; outputs identical).
 - Not yet: the `v`-mode properties of strings (`\p{RGI_Emoji}` and the other six; the emoji
   sequence data is in `build/ucd/17.0.0/emoji-seq/`, emoji 16.0 at the time of writing).
 

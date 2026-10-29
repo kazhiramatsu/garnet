@@ -1675,6 +1675,17 @@ tsv  ts_new_sized_site(size_t size, uint32_t site, tsv proto);
 /* arrays (contiguous storage with an internal sparse-hole sentinel) */
 tsv  ts_new_array(uint32_t len);    /* length-len sparse array (all slots holes) */
 tsv  ts_new_array_compact(uint32_t len);   /* the same with the elements in the cell (one allocation; above four, within the small cells) */
+/* An array literal's array (the emitter's fused `[a, b, c]`; docs/regexp_vm_design.md "R8"):
+   allocated at its length and filled from vals, the cell holding up to TS_ARRAY_COMPACT_MAX
+   elements; the site form takes the allocation site's tenure decision and notes the site. */
+tsv  ts_new_array_lit(uint32_t n, const tsv* vals);
+tsv  ts_new_array_lit_pretenured(uint32_t n, const tsv* vals);
+tsv  ts_new_array_lit_site(uint32_t n, const tsv* vals, uint32_t site);
+/* The same for up to four elements, passed in registers with TS_ARRAY_HOLE for the slots past n
+   (the cell's four inline slots are stored straight, no loop and no stack array). */
+tsv  ts_new_array_lit4(uint32_t n, tsv a, tsv b, tsv c, tsv d);
+tsv  ts_new_array_lit4_pretenured(uint32_t n, tsv a, tsv b, tsv c, tsv d);
+tsv  ts_new_array_lit4_site(uint32_t n, tsv a, tsv b, tsv c, tsv d, uint32_t site);
 tsv  ts_new_uint16_array(tsv input);
 tsv  ts_new_array_pretenured(uint32_t len);
 tsv  ts_array_get(tsv arr, uint32_t i);

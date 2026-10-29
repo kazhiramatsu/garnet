@@ -2578,6 +2578,65 @@ tsv ts_new_array_compact(uint32_t len){
   return ts_obj(a);
 }
 tsv ts_new_array_pretenured(uint32_t len){ return ts_new_array_impl(len, 1); }
+/* An array literal's array (ts_rt.h): the elements stored by the allocation, one call where a
+   literal paid an allocation and a checked store per element. Up to four elements in the cell's
+   inline slots (the capacity four, as an empty array's), up to TS_ARRAY_COMPACT_MAX in the cell as
+   ts_new_array_compact lays them out, beyond that an element payload. A pretenured (old) array
+   remembers its young elements; a young one stores them plainly. */
+static tsv new_array_lit_impl(uint32_t n, const tsv* vals, int pretenured){
+  ts_array* a;
+  if (n <= 4u){
+    a = pretenured ? gc_alloc_pretenured(sizeof(ts_array), TS_KIND_ARRAY) : gc_alloc(sizeof(ts_array), TS_KIND_ARRAY);
+    a->data = a->inline_data; a->cap = 4u;
+    uint32_t i = 0;
+    for (; i < n; i++) a->inline_data[i] = vals[i];
+    for (; i < 4u; i++) a->inline_data[i] = TS_ARRAY_HOLE;
+  } else if (n <= TS_ARRAY_COMPACT_MAX){
+    size_t sz = sizeof(ts_array) + sizeof(tsv) * (size_t)(n - 4u);
+    a = pretenured ? gc_alloc_pretenured(sz, TS_KIND_ARRAY) : gc_alloc(sz, TS_KIND_ARRAY);
+    a->data = a->inline_data; a->cap = n;
+    for (uint32_t i = 0; i < n; i++) a->inline_data[i] = vals[i];
+  } else {
+    a = pretenured ? gc_alloc_pretenured(sizeof(ts_array), TS_KIND_ARRAY) : gc_alloc(sizeof(ts_array), TS_KIND_ARRAY);
+    array_init_storage(a, n);
+    for (uint32_t i = 0; i < n; i++) a->data[i] = vals[i];
+  }
+  a->o.proto = ts_proto_ref(g_array_proto_v) ? g_array_proto_v : TS_NULL;
+  a->o.shape = TS_SHAPE_EMPTY;
+  a->len = n;
+  tsv arr = ts_obj(a);
+  if (pretenured){
+    ts_write_barrier(arr, a->o.proto);
+    for (uint32_t i = 0; i < n; i++) ts_array_remember(a, i, vals[i]);
+  }
+  return arr;
+}
+/* Up to four elements in registers, the holes passed for the slots past n: four plain stores into
+   the inline slots (the first cut's loops over n and its stack array ran more instructions than the
+   allocation and the checked stores it replaced). */
+static inline tsv new_array_lit4_impl(uint32_t n, tsv a, tsv b, tsv c, tsv d, int pretenured){
+  ts_array* arr = pretenured ? gc_alloc_pretenured(sizeof(ts_array), TS_KIND_ARRAY) : gc_alloc(sizeof(ts_array), TS_KIND_ARRAY);
+  arr->o.proto = ts_proto_ref(g_array_proto_v) ? g_array_proto_v : TS_NULL;
+  arr->o.shape = TS_SHAPE_EMPTY;
+  arr->len = n; arr->cap = 4u; arr->data = arr->inline_data;
+  arr->inline_data[0] = a; arr->inline_data[1] = b; arr->inline_data[2] = c; arr->inline_data[3] = d;
+  tsv v = ts_obj(arr);
+  if (TS_RT_UNLIKELY(pretenured)){
+    ts_write_barrier(v, arr->o.proto);
+    ts_array_remember(arr, 0, a); ts_array_remember(arr, 1, b); ts_array_remember(arr, 2, c); ts_array_remember(arr, 3, d);
+  }
+  return v;
+}
+tsv ts_new_array_lit4(uint32_t n, tsv a, tsv b, tsv c, tsv d){ return new_array_lit4_impl(n, a, b, c, d, 0); }
+tsv ts_new_array_lit4_pretenured(uint32_t n, tsv a, tsv b, tsv c, tsv d){ return new_array_lit4_impl(n, a, b, c, d, 1); }
+tsv ts_new_array_lit4_site(uint32_t n, tsv a, tsv b, tsv c, tsv d, uint32_t site){
+  return gc_site_note(new_array_lit4_impl(n, a, b, c, d, gc_site_tenured(site)), site);
+}
+tsv ts_new_array_lit(uint32_t n, const tsv* vals){ return new_array_lit_impl(n, vals, 0); }
+tsv ts_new_array_lit_pretenured(uint32_t n, const tsv* vals){ return new_array_lit_impl(n, vals, 1); }
+tsv ts_new_array_lit_site(uint32_t n, const tsv* vals, uint32_t site){
+  return gc_site_note(new_array_lit_impl(n, vals, gc_site_tenured(site)), site);
+}
 tsv ts_new_array_site(uint32_t len, uint32_t site){
   return gc_site_note(ts_new_array_impl(len, gc_site_tenured(site)), site);
 }
