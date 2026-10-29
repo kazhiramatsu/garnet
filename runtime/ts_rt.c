@@ -1847,6 +1847,9 @@ void ts_object_proto_register(ts_key method_key, const char* name, ts_code fn){
    (keyv) entry points; ts_key_to_value reconstructs the value from a ts_key. */
 #if !TS_ISO_MODE
 int g_has_proxies = 0;   /* declared in ts_rt.h; see ts_is_proxy there */
+/* A Proxy of a callable target exists: until then `typeof x === "object"` and the callable tests
+   never read a header for it (vue's reactive Proxies wrap plain objects: one predictable branch) */
+int g_has_callable_proxies = 0;
 /* A typed array entry (`arr.push(x)`, `arr.filter(f)`: the receiver's static type is an array) on a
    receiver that is a Proxy (vue's reactive arrays): the method is read through the Proxy's traps and
    called with the receiver, as the dynamic call would be (`ts_method_dynamic`). The test sits in the
@@ -4041,7 +4044,7 @@ void ts_global_set(const char* name, tsv val){
    declaration) resolves to the global object's property: reading or (strict)
    assigning one that is not there is a ReferenceError, as for any
    unresolvable reference. */
-static void ts_throw_not_defined(const char* name);
+void ts_throw_not_defined(const char* name);
 tsv ts_global_get_ref(const char* name){
   ts_global_this_init();
   ts_key key = ts_intern_field(name, (uint32_t)strlen(name));
@@ -5364,6 +5367,7 @@ tsv ts_typeof(tsv v){
   if (ts_is_undef(v))return ts_str_v(&g_typeof_undefined);
   if (ts_is_func(v)) return ts_str_v(&g_typeof_function);
   if (ts_is_symbol(v)) return ts_str_v(&g_typeof_symbol);
+  if (ts_is_callable_proxy(v)) return ts_str_v(&g_typeof_function);   /* a Proxy of a function */
   return ts_str_v(&g_typeof_object); /* objects, arrays, null */
 }
 /* The method key (METHOD_KEY_BASE + name-id) for "toString", learned from the
@@ -10644,7 +10648,7 @@ static tsv ts_error_proto_tostring(tsv* args, int n){
 }
 enum { TS_ERR_ERROR=0, TS_ERR_TYPE, TS_ERR_RANGE, TS_ERR_SYNTAX, TS_ERR_REFERENCE,
        TS_ERR_EVAL, TS_ERR_URI, TS_ERR_AGGREGATE, TS_ERR_KINDS };
-static void ts_throw_not_defined(const char* name){
+void ts_throw_not_defined(const char* name){
   char buf[200]; snprintf(buf, sizeof buf, "%s is not defined", name);
   ts_throw(ts_new_error(TS_ERR_REFERENCE, ts_new_string(buf, (uint32_t)strlen(buf))));
 }
@@ -18723,6 +18727,7 @@ tsv ts_proxy_new(tsv target, tsv handler){
   ts_write_barrier(pv, target); ts_write_barrier(pv, handler);
   typed_slow_raise("a Proxy");
   g_has_proxies = 1;
+  if (ts_is_func(target) || (ts_is_proxy(target) && ts_proxy_is_callable(target))) g_has_callable_proxies = 1;
   ts_gc_unroot(2);
   return pv;
 }
@@ -19217,6 +19222,13 @@ static void ts_proxy_define_property(tsv pv, tsv keyv, tsv desc){
   ts_gc_unroot(6);
 }
 /* === apply / construct === */
+/* [[Call]] of a Proxy exists when its target's does (ECMA-262 10.5.12): a method read through a
+   get trap that answers another Proxy of a function (hono's client) is callable. */
+int ts_proxy_is_callable(tsv v){
+  ts_proxy* px = ts_ptr(v);
+  tsv t = px->target;
+  return ts_is_func(t) || (ts_is_proxy(t) && ts_proxy_is_callable(t));
+}
 static tsv ts_proxy_apply(tsv pv, tsv thisArg, tsv* args, int nargs){
   ts_gc_root(&pv); ts_gc_root(&thisArg);
   ts_proxy* px = ts_ptr(pv);

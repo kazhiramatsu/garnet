@@ -11933,3 +11933,57 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   34 of 43; etag waits for streams (its body digest reads the response's stream).
 - Gates: the full gate set green: unit, bundler 53/53, conformance plain and strict 686/686, protect and units 683/683, bench (every benchmark correct; `string_unicode_search_kernel` 102 ms against its 100 ms budget under the external load again, its C unchanged), the GC suite incl. ASan and GC stress, the `ci` gate (the negative tests, the JSX / fetch / regexp / unicode link gates, the engine diff 43,593 cases 0 differ); the ir-parity snapshot refreshed (the node/crypto fixture's IR changed: a program naming `crypto` carries the Web Crypto part now). tsc-ts r13 -> r14 instructions 0.9999 (21.907 G -> 21.906 G), cycles 1.004, wall 1.008; vue quiet medians of 7: 1055.5 -> 1053.5 ms; hono routers quiet medians of 5: TrieRouter 248.3 -> 248.9, RegExpRouter 64.0 -> 64.4, PatternRouter 240.8 -> 240.7, SmartRouter 72.2 -> 72.8 ms; hono_app
   garnet 410.9 ms (medians of 3; 389 in the survey slice's run, the machine under the same external load), Node 156.6.
+- Streams, Blob / File and the bodies, the survey's second and third gaps: `lib/node/web/streams.ts`
+  (docs/web_streams_design.md): ReadableStream (default readers, `tee`, `pipeTo` / `pipeThrough`,
+  async iteration, `from`), WritableStream (writers, backpressure, `abort`), TransformStream
+  (`terminate`, errors crossing both sides), TextEncoderStream / TextDecoderStream and the two
+  queuing strategies, in TypeScript over promises, with Node's error messages; byte streams are
+  not provided (a TypeError). The bodies of lib/node/web/fetch.ts take a stream (`new
+  Response(stream)`, a Request's with `duplex`), `body` of a text or bytes body is a stream of its
+  chunks as Node hands them (one for text; a Blob's parts; a multipart body's pieces), `bodyUsed`
+  follows the stream, `clone()` tees, a Request made from a Request takes the input's body as a
+  proxy (piped, the input used at once; an init body replaces it even for a used input, which
+  hono's body-limit relies on), a consumed body's stream stays locked. `lib/node/web/blob.ts`:
+  Blob in Node's parts model (`stream()` and a body hand out one chunk per part, `slice` keeps the
+  boundaries, the type normalized) and File; a Blob as a body, `blob()`, FormData with files
+  (entries `string | File`), a multipart body serialized over bytes with its file parts and parsed
+  back to Files (`text/plain` for a part without a Content-Type, as the HTML standard says).
+  Fixtures web/streams, web/body_streams, web/blob (both profiles; Node's own are the oracle).
+  The survey's body_limit, streaming (`stream`, `streamText`, `streamSSE`), etag and request_body
+  drivers agree with Node.
+- The first measurement found hono_app 1.8x slower (750 ms against 410). hono rebuilds every
+  response it adds a header to as `new Response(res.body, res)` (`c.header()` after the handler,
+  the `c.res` setter), and `body` had become a real stream of the text encoded and copied, which the
+  new response read back through a reader. An A/B per component (the committed exporter, runtime and
+  fetch module each swapped in) put all of it in the fetch module. A body's stream is lazy now
+  (streams.ts `__lazyOf`): its chunks and its controller are made when a reader or a cancel first
+  needs them, and a body given the stream takes the data back whole when it reads it
+  (`__takeSource`, leaving the stream locked, disturbed and closed as Node's read to the end does);
+  the readers are one async function each (a shared async helper awaited from each was a second
+  coroutine and a microtask hop per read). The fixture covers the lazy paths against Node: the
+  stream after a read, a clone of a response over another's body, an empty body, a cancel, a released
+  reader. hono_app interleaved medians of 9: the committed fetch module 416.6 ms, the slice 402.0.
+- Three defects the slice met in general constructs, two of them silent miscompiles:
+  - A derived class with an explicit constructor ran its field initializers and parameter
+    properties at the top of the constructor, before `super()`: a field the base constructor sets
+    (`x = 2` over a base `this.x = 1`) read the base's value, an initializer reading a field the
+    base constructor sets (`w = this.x + 10`) read NaN, a method the base constructor calls saw
+    the derived fields initialized, and a derived `get [Symbol.toStringTag]` (installed per
+    instance) was replaced by the base's (a File printed `[object Blob]`). They follow the
+    statement that calls `super()` now (each such statement; a constructor whose `super()` is not
+    a statement of its own body is a loud reject) (`classes/derived_ctor_inits_after_super`).
+  - A Proxy of a function was not callable through a method read: hono's client is a Proxy of a
+    function at every path step (`client.api.items[":id"].$get()` was "$get is not a function").
+    `ts_is_callable`, `typeof` and its fused tests see a Proxy whose target is callable
+    (`objects/proxy_callable`); the client and testing drivers run. The test is behind a flag set
+    when a Proxy of a callable target is made (vue's reactive Proxies wrap objects: its typeof tests
+    read no header). vue's instructions: 30.535 G -> 30.655 G (+0.4%, the flag's branch in the typeof
+    tests 0.27%, in the callable test 0.07%; cycles within the noise); kept, Kaz: a short-term
+    instruction increase is fine where the end result is faster and right.
+  - `new X(...args)` of a constructor the environment declares but the runtime lacks (hono's
+    client: `new WebSocket(...args)`) was a compile-time reject: the arguments are gathered into an
+    array and the global's value constructed over it; the ReferenceError says "X is not defined"
+    (a `global.check` builtin; the TDZ message was borrowed before)
+    (`classes/ambient_global_ctor_spread`).
+- Gates: the full gate set green after the lazy streams and the callable-Proxy flag: unit, bundler 53/53, conformance plain and strict 692/692, protect and units 689/689, bench (every benchmark correct and within its budget), the GC suite incl. ASan and GC stress, the `ci` gate (the negative tests, the JSX / fetch / regexp / unicode link gates), the fetch run gate, the regexp engine diff 43,593 cases 0 differ; the ir-parity snapshot refreshed (the fixtures that name the Web objects carry the streams part). tsc-ts r14 -> r15 instructions 1.0025 (21.907 G -> 21.961 G: the callable-Proxy flag's branch in the typeof tests and the method fallback), cycles 0.986, wall 0.992; vue medians of 7 under the external load (Node 815 ms): 1126.1 -> 1139.1 ms; instructions 30.54 G -> 30.66 G (+0.4%, the same branch; a per-variant count put 0.27% in the typeof tests and 0.07% in the callable test); hono routers medians of 5: TrieRouter 263.4 -> 268.4, RegExpRouter 70.3 -> 69.1, PatternRouter 255.7 -> 252.1, SmartRouter 75.9 -> 76.3 ms (the machine loaded); hono_app
+  garnet 397.7 ms, Node 161.2 (medians of 3). The survey: 40 of 43 drivers agree with Node.

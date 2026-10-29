@@ -121,11 +121,14 @@ const NODE_PRELUDE_GLOBALS = new Set(["process", "Buffer", "atob", "btoa", "setT
   // the Web standard objects (docs/web_fetch_api_design.md); `__garnet_StringObject` is named by a `new String(...)`
   "Headers", "Request", "Response", "FormData", "fetch", "DataView", "__garnet_StringObject",
   // Web Crypto (docs/web_crypto_design.md)
-  "crypto", "Crypto", "SubtleCrypto", "CryptoKey"]);
+  "crypto", "Crypto", "SubtleCrypto", "CryptoKey",
+  // streams (docs/web_streams_design.md)
+  "ReadableStream", "WritableStream", "TransformStream", "ReadableStreamDefaultReader", "WritableStreamDefaultWriter", "ReadableStreamDefaultController", "WritableStreamDefaultController", "TransformStreamDefaultController", "TextEncoderStream", "TextDecoderStream", "CountQueuingStrategy", "ByteLengthQueuingStrategy", "Blob", "File"]);
 /** The constructors among them: lib.dom declares the identifier, the prelude's class is the
  *  global object's value, and `new URL(...)` constructs through that value. */
 const NODE_PRELUDE_CTORS = new Set(["URL", "URLSearchParams", "Headers", "Request", "Response", "FormData", "DataView", "__garnet_StringObject",
-  "Crypto", "SubtleCrypto", "CryptoKey"]);
+  "Crypto", "SubtleCrypto", "CryptoKey",
+  "ReadableStream", "WritableStream", "TransformStream", "ReadableStreamDefaultReader", "WritableStreamDefaultWriter", "ReadableStreamDefaultController", "WritableStreamDefaultController", "TransformStreamDefaultController", "TextEncoderStream", "TextDecoderStream", "CountQueuingStrategy", "ByteLengthQueuingStrategy", "Blob", "File"]);
 /** The lib modules behind the globals: a program's prelude imports only the parts it names,
  *  so a program that uses setTimeout does not compile the streams behind process.stdout. */
 const NODE_PRELUDE_PARTS: { file: string; names: string[]; defaultImport?: string; triggers?: string[] }[] = [
@@ -142,6 +145,9 @@ const NODE_PRELUDE_PARTS: { file: string; names: string[]; defaultImport?: strin
   { file: "web/string_object", names: ["__garnet_StringObject"] },
   // Web Crypto (docs/web_crypto_design.md): the `crypto` global over node:crypto's digests and HMAC
   { file: "web/crypto", names: ["crypto", "Crypto", "SubtleCrypto", "CryptoKey"] },
+  // WHATWG streams (docs/web_streams_design.md); the fetch part's bodies stream through them
+  { file: "web/streams", names: ["ReadableStream", "WritableStream", "TransformStream", "ReadableStreamDefaultReader", "WritableStreamDefaultWriter", "ReadableStreamDefaultController", "WritableStreamDefaultController", "TransformStreamDefaultController", "TextEncoderStream", "TextDecoderStream", "CountQueuingStrategy", "ByteLengthQueuingStrategy"] },
+  { file: "web/blob", names: ["Blob", "File"] },
   // on demand: fs.createReadStream / fs.createWriteStream (node:fs itself does not carry node:stream)
   { file: "fs/streams", names: [], triggers: ["createReadStream", "createWriteStream"] },
 ];
@@ -646,6 +652,10 @@ interface FnCtx {
   thisLocal?: number; // for methods: the local holding `this` (param 0)
   currentClass?: number; // for methods: the defining class id (for super.m())
   staticClass?: number; // for STATIC bodies: the defining class id, used only to resolve `super.X`
+  // A derived class's constructor: its parameter properties and field initializers wait for the
+  // statement that calls super() (lowerStmt), as JS runs them when super() returns.
+  deferredCtorInits?: { classId: number; thisLocal: number; ctor: ts.ConstructorDeclaration; emitted: boolean };
+  superCallLowered?: boolean; // a super(...) call was lowered since the last statement boundary
   paramClasses?: Record<string, number>; // param local id -> class id (typed-field codegen)
   restParam?: number; // local id of a rest parameter (...args), if any
   argumentsOffset?: number; // captured cells and receiver preceding JS arguments
@@ -6328,6 +6338,7 @@ class Exporter {
         }
       } else if (fn.kind === ts.SyntaxKind.SuperKeyword && ctx.currentClass !== undefined) {
         // super(...) constructor call -> Direct to the parent's constructor.
+        ctx.superCallLowered = true;   // the derived class's inits follow this statement (lowerStmt)
         const parent = this.parentIdOf(ctx.currentClass);
         const cfunc = parent !== undefined ? this.methodFunc.get(`${parent}:ctor`) : undefined;
         if (cfunc !== undefined) {
@@ -10532,6 +10543,27 @@ class Exporter {
     // in the ctor body (see lowerFunctionLike 3b). When a class has field
     // initializers but no explicit ctor, a synthetic ctor is created so they run.
     const cfunc = classId !== undefined ? this.methodFunc.get(`${classId}:ctor`) : undefined;
+    if (classId === undefined && ts.isIdentifier(node.expression) && (node.arguments ?? []).some((a) => ts.isSpreadElement(a)) &&
+        this.isAmbientGlobalSymbol(this.symbolOf(node.expression))) {
+      // `new X(...spread)` of a constructor the environment declares but the runtime lacks (hono's
+      // client: `new WebSocket(...args)`): the global object's value constructed dynamically over
+      // an argument array, as the positional form below is; a ReferenceError where it is reached
+      const g = this.newLocal(ctx, "reference");
+      ctx.body.push({ kind: "LoadBuiltinFn", dst: g, builtin: "globalThis" });
+      const callee = this.newLocal(ctx, "reference", calleeName);
+      ctx.body.push({ kind: "LoadField", dst: callee, obj: g, field: this.internField(calleeName) });
+      ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: `global.check:${calleeName}`, args: [callee] });
+      const arrSite = this.site++;
+      this.recordSite(arrSite, "array", this.inLoop(node) ? "many" : "once", false, node);
+      const arrL = this.newLocal(ctx, "reference");
+      ctx.body.push({ kind: "AllocArray", dst: arrL, elemType: 0, site: arrSite });
+      for (const a of node.arguments ?? []) {
+        if (ts.isSpreadElement(a)) ctx.body.push({ kind: "ArrayPushAll", arr: arrL, src: this.lowerExpr(ctx, a.expression) });
+        else ctx.body.push({ kind: "ArrayPush", arr: arrL, src: this.lowerExpr(ctx, a) });
+      }
+      ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "reflect.construct", args: [callee, arrL] });
+      return dst;
+    }
     const args = this.lowerSequenced(ctx, node.arguments ?? []);
     // new operator step 4 (ECMA-262 11.2.2 / 13.2.2, see unified_object_model
     // §10): if the constructor RETURNS AN OBJECT, `new C()` evaluates to that
@@ -10571,7 +10603,7 @@ class Exporter {
       ctx.body.push({ kind: "LoadBuiltinFn", dst: g, builtin: "globalThis" });
       const callee = this.newLocal(ctx, "reference", calleeName);
       ctx.body.push({ kind: "LoadField", dst: callee, obj: g, field: this.internField(calleeName) });
-      ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: `binding.check:${calleeName}`, args: [callee] });
+      ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: `global.check:${calleeName}`, args: [callee] });
       this.emitNewMaybeGuarded(ctx, node, dst, callee, args);
     } else {
       // `new X()` where X is an identifier that does NOT resolve to a known user
@@ -13703,6 +13735,52 @@ class Exporter {
   }
 
   lowerStmt(ctx: FnCtx, stmt: ts.Statement) {
+    this.lowerStmtInner(ctx, stmt);
+    // a derived class's constructor: the parameter properties and field initializers follow the
+    // statement that called super() (each such statement: `if (c) super(a); else super(b);`)
+    if (ctx.superCallLowered && ctx.deferredCtorInits !== undefined) {
+      ctx.superCallLowered = false;
+      this.emitDeferredCtorInits(ctx);
+    }
+  }
+  /** `class C extends B`: a user class, a mixin call, a builtin; its constructor's inits follow super() */
+  classIsDerived(classId: number): boolean {
+    const cnode = this.classNodeOfId.get(classId);
+    return cnode !== undefined && (cnode.heritageClauses ?? []).some((h) => h.token === ts.SyntaxKind.ExtendsKeyword);
+  }
+  /** Does the constructor have parameter properties, or the class instance members to initialize
+   *  (an initialized field, a dynamic or symbol-keyed member)? */
+  ctorHasInits(classId: number, ctor: ts.ConstructorDeclaration): boolean {
+    if (ctor.parameters.some((p) => ts.isIdentifier(p.name) && this.isParameterProperty(p))) return true;
+    const cnode = this.classNodeOfId.get(classId);
+    if (cnode === undefined) return false;
+    return cnode.members.some((m) => !this.isStaticMember(m) &&
+      ((ts.isPropertyDeclaration(m) && m.initializer !== undefined) || this.isDynComputedMember(m)));
+  }
+  isParameterProperty(p: ts.ParameterDeclaration): boolean {
+    return p.modifiers?.some((mod) =>
+      mod.kind === ts.SyntaxKind.PublicKeyword || mod.kind === ts.SyntaxKind.PrivateKeyword ||
+      mod.kind === ts.SyntaxKind.ProtectedKeyword || mod.kind === ts.SyntaxKind.ReadonlyKeyword) ?? false;
+  }
+  /** `constructor(public x)` implies `this.x = x` */
+  emitParameterProperties(ctx: FnCtx, ctor: ts.ConstructorDeclaration, thisLocal: number): void {
+    for (const p of ctor.parameters) {
+      if (!ts.isIdentifier(p.name) || !this.isParameterProperty(p)) continue;
+      const psym = this.symbolOf(p.name);
+      const src = psym ? this.ensureLocal(ctx, psym, this.refKindOf(p.name), p.name.text)
+                       : this.newLocal(ctx, this.refKindOf(p.name), p.name.text);
+      ctx.body.push({ kind: "StoreField", obj: thisLocal, field: this.internField(p.name.text), src });
+    }
+  }
+  /** A derived class's pending parameter properties and field initializers, once super() returned. */
+  emitDeferredCtorInits(ctx: FnCtx): void {
+    const d = ctx.deferredCtorInits;
+    if (d === undefined) return;
+    d.emitted = true;
+    this.emitParameterProperties(ctx, d.ctor, d.thisLocal);
+    this.emitFieldInitializers(ctx, d.classId, d.thisLocal);
+  }
+  lowerStmtInner(ctx: FnCtx, stmt: ts.Statement) {
     if (ts.isBlock(stmt)) {
       // The body block of a loop instantiates its function declarations on
       // every entry (block-scoped declarations in strict code).
@@ -14850,25 +14928,22 @@ class Exporter {
         if (psym && this.hasCaptured(ctx, psym)) this.storeCaptured(ctx, psym, binding.local);
       }
     }
-    // 3b. parameter properties: `constructor(public x)` implies `this.x = x`
+    // 3b. parameter properties (`constructor(public x)` implies `this.x = x`) and
+    // 3c. field initializers (§3.5): `class C { a = <expr> }` (the OWN class's; the
+    // parent's run when super() invokes the parent ctor). thisLocal is already bound
+    // here. A base class runs them at the top of its constructor; a derived class
+    // when its super(...) call returns (lowerStmt emits them after the statement
+    // that lowered the call): the base constructor sees the derived fields
+    // uninitialized, and a field the base constructor sets is overwritten by the
+    // derived initializer, not the other way round (a derived `get [Symbol.toStringTag]`
+    // installed before super() was replaced by the base's).
     if (ts.isConstructorDeclaration(node as ts.Node) && ctx.thisLocal !== undefined) {
-      for (const p of node.parameters) {
-        if (!ts.isIdentifier(p.name)) continue;
-        const isParamProp = p.modifiers?.some((mod) =>
-          mod.kind === ts.SyntaxKind.PublicKeyword || mod.kind === ts.SyntaxKind.PrivateKeyword ||
-          mod.kind === ts.SyntaxKind.ProtectedKeyword || mod.kind === ts.SyntaxKind.ReadonlyKeyword);
-        if (isParamProp) {
-          const psym = this.symbolOf(p.name);
-          const src = psym ? this.ensureLocal(ctx, psym, this.refKindOf(p.name), p.name.text)
-                           : this.newLocal(ctx, this.refKindOf(p.name), p.name.text);
-          ctx.body.push({ kind: "StoreField", obj: ctx.thisLocal, field: this.internField(p.name.text), src });
-        }
-      }
-      // 3c. field initializers (§3.5): `class C { a = <expr> }` run at the top of
-      // the constructor (this runs the OWN class's inits; the parent's inits run
-      // when super() invokes the parent ctor). thisLocal is already bound here.
-      if (ctx.currentClass !== undefined) {
-        this.emitFieldInitializers(ctx, ctx.currentClass, ctx.thisLocal);
+      const ctor = node as unknown as ts.ConstructorDeclaration;
+      if (ctx.currentClass !== undefined && this.classIsDerived(ctx.currentClass) && this.ctorHasInits(ctx.currentClass, ctor)) {
+        ctx.deferredCtorInits = { classId: ctx.currentClass, thisLocal: ctx.thisLocal, ctor, emitted: false };
+      } else {
+        this.emitParameterProperties(ctx, ctor, ctx.thisLocal);
+        if (ctx.currentClass !== undefined) this.emitFieldInitializers(ctx, ctx.currentClass, ctx.thisLocal);
       }
     }
     // 3d. HOISTING (Step D, scope_resolution.md §6). JS hoists `var` and
@@ -14899,6 +14974,9 @@ class Exporter {
       // driving loop in lowerExpr; no rejection here.
       if (ts.isBlock(node.body)) {
         this.lowerStmt(ctx, node.body);
+        if (ctx.deferredCtorInits !== undefined && !ctx.deferredCtorInits.emitted) {
+          this.unsupported(node, "a derived class's constructor whose super() call is not a statement of its own body (its field initializers and parameter properties run when super() returns)");
+        }
         // A reachable end of the body is an implicit `return undefined`. Make
         // it explicit so the analyzer sees the undefined result: a function
         // whose explicit returns are all numeric but whose end is reachable

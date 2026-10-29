@@ -93,9 +93,9 @@ the fixes:
 | adapter | OK |  |
 | basic_auth | OK |  |
 | bearer_auth | OK |  |
-| body_limit | DIFF | streams (`ReadableStream` reader) |
+| body_limit | OK |  |
 | cache | OK |  |
-| client | REJECT | `options.webSocket(...args)`: a spread reject to find |
+| client | OK |  |
 | combine | OK |  |
 | compress | DIFF | `CompressionStream` |
 | context_storage | TYPE-ERR | `node:async_hooks` AsyncLocalStorage |
@@ -105,7 +105,7 @@ the fixes:
 | crypto | OK |  |
 | csrf | OK |  |
 | dev | OK |  |
-| etag | DIFF | streams (the body read through a `ReadableStream` reader) |
+| etag | OK |  |
 | factory | OK |  |
 | html | OK |  |
 | ip_restriction | REJECT | BigInt (IPv6) |
@@ -117,14 +117,14 @@ the fixes:
 | mount | OK |  |
 | powered_by | OK |  |
 | pretty_json | OK |  |
-| request_body | DIFF | Blob / File, multipart file parts |
+| request_body | OK |  |
 | request_id | OK |  |
 | route | OK |  |
 | secure_headers | OK |  |
 | serve_static | OK |  |
 | ssg | OK |  |
-| streaming | DIFF | streams (`ReadableStream`, `TransformStream`) |
-| testing | REJECT | the client's reject |
+| streaming | OK |  |
+| testing | OK |  |
 | timeout | OK |  |
 | timing | OK |  |
 | trailing_slash | OK |  |
@@ -133,25 +133,24 @@ the fixes:
 | css | OK |  |
 | jsx_renderer | OK |  |
 
-34 of 43 identical to Node's output (26 after the survey's own fixes; Web Crypto, docs/web_crypto_design.md, took eight more).
+40 of 43 identical to Node's output (26 after the survey's own fixes; Web Crypto, docs/web_crypto_design.md, took eight more; streams, Blob / File and the client's two fixes, docs/web_streams_design.md, six more).
 
 What remains, by the number of drivers it blocks:
 
 1. ~~Web Crypto~~: `lib/node/web/crypto.ts` (docs/web_crypto_design.md) since the same session: digests,
    HMAC keys, randomUUID, getRandomValues; the jwt algorithms beyond HMAC (RSA, ECDSA) stay out.
-2. **Streams** (`ReadableStream`, `TransformStream`, `WritableStream`, `TextEncoderStream`, a
-   Request / Response body as a stream): body-limit, the streaming helpers (`stream`, `streamText`,
-   `streamSSE`), the JSX streaming renderer, `c.body(stream)`, etag (the body digest reads the
-   response's stream). A `lib/node/web/streams.ts` over the event loop, with the bodies reworked: a
-   slice of its own.
-3. **Blob / File** and multipart file parts (`c.req.blob()`, `parseBody` with a file: `File` is not
-   defined; `FormData` holds text fields only): the request-body driver.
+2. ~~Streams~~: `lib/node/web/streams.ts` (docs/web_streams_design.md) since the same session:
+   ReadableStream, WritableStream, TransformStream, the text streams, and a Request / Response
+   body as a stream; body-limit, the streaming helpers, etag and the JSX streaming renderer run.
+3. ~~Blob / File~~ and multipart file parts: `lib/node/web/blob.ts` since the same session; the
+   request-body driver runs (`parseBody` with a file, `c.req.blob()`).
 4. `CompressionStream` (the compress middleware: gzip / deflate / brotli over streams; Node has it).
 5. `node:async_hooks`'s `AsyncLocalStorage` (context-storage; hono's JSX context uses it when
    present): asynchronous context propagation through the event loop's continuations.
 6. BigInt (ip-restriction's IPv6 arithmetic): unsupported by design.
-7. The client `hc` and `testClient`: `options.webSocket(...args)` in `src/client/client.ts:225` is
-   rejected as a spread expression although the same call compiles in a small program: to find.
+7. ~~The client `hc` and `testClient`~~: `new WebSocket(...args)` (a spread into an ambient
+   constructor the runtime lacks) compiles to a run-time ReferenceError now, and a Proxy of a
+   function is callable through a method read (the client is one at every path step): both run.
 8. `console.log` of a String wrapper prints `StringObject { ... }` where Node prints
    `[String: 'x'] { ... }` (the utils driver prints the primitive): the inspector's form only.
 9. A middleware's `declare module '../..'` augmentation (request-id, secure-headers, timing,

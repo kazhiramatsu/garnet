@@ -330,8 +330,11 @@ static inline tsv ts_short_str_ascii(const char* data, uint32_t len){
    (not file-static) so emitted C can inline `this.field` proxy guards. */
 #if !TS_ISO_MODE
 extern int g_has_proxies;
+extern int g_has_callable_proxies;   /* a Proxy whose target is callable was made (ts_proxy_new): typeof and the callable tests look for one only then */
 #endif
 static inline int ts_is_proxy(tsv v){ return ts_is_obj(v) && ((ts_gc_header*)ts_ptr(v))->kind == TS_KIND_PROXY; }
+int ts_proxy_is_callable(tsv v);   /* a Proxy whose target is callable: typeof "function", callable (hono's client is a Proxy of a function at every path step) */
+static inline int ts_is_callable_proxy(tsv v){ return g_has_callable_proxies && ts_is_proxy(v) && ts_proxy_is_callable(v); }
 static inline int ts_is_regexp(tsv v){ return ts_is_obj(v) && ((ts_gc_header*)ts_ptr(v))->kind == TS_KIND_REGEXP; }
 
 /* ---- property key space (property_model_redesign §3.6) ----
@@ -1297,9 +1300,9 @@ static inline int ts_typeof_is_number(tsv v){ return ts_is_num(v); }
 static inline int ts_typeof_is_string(tsv v){ return !ts_is_num(v) && ts_is_str(v); }
 static inline int ts_typeof_is_boolean(tsv v){ return !ts_is_num(v) && !ts_is_str(v) && ts_is_bool(v); }
 static inline int ts_typeof_is_undefined(tsv v){ return !ts_is_num(v) && !ts_is_str(v) && !ts_is_bool(v) && ts_is_undef(v); }
-static inline int ts_typeof_is_function(tsv v){ return !ts_is_num(v) && !ts_is_str(v) && !ts_is_bool(v) && !ts_is_undef(v) && ts_is_func(v); }
+static inline int ts_typeof_is_function(tsv v){ return !ts_is_num(v) && !ts_is_str(v) && !ts_is_bool(v) && !ts_is_undef(v) && (ts_is_func(v) || ts_is_callable_proxy(v)); }
 static inline int ts_typeof_is_symbol(tsv v){ return !ts_is_num(v) && !ts_is_str(v) && !ts_is_bool(v) && !ts_is_undef(v) && !ts_is_func(v) && ts_is_symbol(v); }
-static inline int ts_typeof_is_object(tsv v){ return !ts_is_num(v) && !ts_is_str(v) && !ts_is_bool(v) && !ts_is_undef(v) && !ts_is_func(v) && !ts_is_symbol(v); }
+static inline int ts_typeof_is_object(tsv v){ return !ts_is_num(v) && !ts_is_str(v) && !ts_is_bool(v) && !ts_is_undef(v) && !ts_is_func(v) && !ts_is_symbol(v) && !ts_is_callable_proxy(v); }
 static inline int ts_is_undefined_fast(tsv v){ return ts_is_undef(v); }
 
 /* JS Map: parallel key/value arrays preserving insertion order, plus a side
@@ -1667,7 +1670,7 @@ TS_RT_ALWAYS_INLINE tsv ts_call_method_inline(tsv fn, tsv* args, int nargs){
   return ts_call_method(fn, args, nargs);
 }
 /* a function value (the method-call fallback tests it on every dynamic call) */
-static inline int ts_is_callable(tsv v){ return ts_is_func(v); }
+static inline int ts_is_callable(tsv v){ return ts_is_func(v) || ts_is_callable_proxy(v); }
 tsv  ts_new_sized(size_t size);
 tsv  ts_new_sized_pretenured(size_t size);
 /* Allocation-site pretenuring (docs/site_pretenuring_design.md): a generated
@@ -2195,6 +2198,7 @@ extern int g_class_relinked;
 #endif
 tsv  ts_make_class_value_once(uint32_t class_id, ts_code ctor, tsv* env, uint32_t envlen);
 void ts_throw_uninitialized(const char* name);
+void ts_throw_not_defined(const char* name);   /* V8's "X is not defined" ReferenceError */
 tsv  ts_construct(tsv ctorv, tsv* args, int n);
 /* guarded direct construction (ts_rt.c): the predicted constructor's code,
    the instance before the direct body call, the result after it */

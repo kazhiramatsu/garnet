@@ -4698,7 +4698,7 @@ fn body_is_gc_free(body: &[Inst], numeric: &BTreeSet<u32>) -> bool {
         // `x instanceof C` links around its chain walk; a class binding's
         // check only throws, leaving the function (a lazy body has no try)
         Inst::CallBuiltinStatic { builtin, .. }
-            if builtin.starts_with("instanceof.class:") || builtin.starts_with("binding.check:") =>
+            if builtin.starts_with("instanceof.class:") || builtin.starts_with("binding.check:") || builtin.starts_with("global.check:") =>
         {
             true
         }
@@ -23526,6 +23526,17 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         "(ts_is_undef({v}) ? (ts_throw_uninitialized({n}), TS_UNDEFINED) : TS_UNDEFINED)",
                         v = v(0),
                         n = c_string_lit(&b["binding.check:".len()..])
+                    ),
+                    false,
+                ),
+                // A global the environment declares but the runtime may lack (a
+                // constructor of lib.dom), read from the global object: undefined
+                // is V8's "X is not defined" ReferenceError.
+                b if b.starts_with("global.check:") => (
+                    format!(
+                        "(ts_is_undef({v}) ? (ts_throw_not_defined({n}), TS_UNDEFINED) : TS_UNDEFINED)",
+                        v = v(0),
+                        n = c_string_lit(&b["global.check:".len()..])
                     ),
                     false,
                 ),

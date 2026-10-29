@@ -3,6 +3,8 @@
 // globals when the program names them; under the V8 oracle the globals are Node's own (undici),
 // whose behaviour these follow.
 import { URL, URLSearchParams } from "../url";
+import { ReadableStream, TransformStream } from "./streams";
+import { Blob, File, concatParts } from "./blob";
 
 declare global {
   /** The runtime's transport (ts_rt.c ts_fetch over libcurl): the exporter lowers a call of this
@@ -113,9 +115,17 @@ export class Headers {
 
 // ---- bodies ----
 
-type BodyKind = "null" | "string" | "bytes";
-interface BodyData { kind: BodyKind; str: string; bytes: Uint8Array | null; type: string | null }
-const NO_BODY: BodyData = { kind: "null", str: "", bytes: null, type: null };
+type BodyKind = "null" | "string" | "bytes" | "stream";
+/** A body: text, bytes, or a ReadableStream of Uint8Array chunks (docs/web_streams_design.md). */
+interface BodyData {
+  kind: BodyKind; str: string; bytes: Uint8Array | null; type: string | null; stream: ReadableStream<Uint8Array> | null;
+  /** a bytes body's chunks as `body` hands them out (a Blob's parts, a multipart body's pieces); null: one chunk */
+  chunks: Uint8Array[] | null;
+}
+const NO_BODY: BodyData = { kind: "null", str: "", bytes: null, type: null, stream: null, chunks: null };
+const textBody = (str: string, type: string | null): BodyData => ({ kind: "string", str, bytes: null, type, stream: null, chunks: null });
+const bytesBody = (bytes: Uint8Array, type: string | null, chunks: Uint8Array[] | null = null): BodyData => ({ kind: "bytes", str: "", bytes, type, stream: null, chunks });
+const streamBody = (stream: ReadableStream<Uint8Array>, type: string | null): BodyData => ({ kind: "stream", str: "", bytes: null, type, stream, chunks: null });
 
 /** A body and its state. A Request made from a Request, or a Response made from another's
  *  `body`, reads through the source (Node pipes the source's stream through a proxy): the source
@@ -126,8 +136,14 @@ class BodyCell {
   used = false;
   locked = false;
   source: BodyCell | null = null;
+  /** the stream `body` made for a text or bytes body (lazy, `lazyBodyStream`; the same object each time) */
+  stream: ReadableStream<Uint8Array> | null = null;
   constructor(data: BodyData, source: BodyCell | null = null) { this.data = data; this.source = source; }
-  get unusable(): boolean { return this.used || this.locked; }
+  /** the stream behind `body`, when there is one: the body's own, or the materialized one */
+  get bodyStream(): ReadableStream<Uint8Array> | null { return this.data.kind === "stream" ? this.data.stream : this.stream; }
+  /** disturbed: read (through this cell or a proxy of it), or its stream read or cancelled */
+  get disturbed(): boolean { const st = this.bodyStream; return this.used || (st !== null && st.__disturbed); }
+  get unusable(): boolean { const st = this.bodyStream; return this.disturbed || this.locked || (st !== null && st.locked); }
   /** a proxy of this cell for another object: this one is locked when it has a body, and a
    *  Request made from a Request reports the source used at once (Node's pipe disturbs its
    *  stream); a stream handed to another Response is only locked until that one is read */
@@ -135,20 +151,74 @@ class BodyCell {
     if (this.data.kind === "null") return new BodyCell(NO_BODY);
     this.locked = true;
     if (markUsed) this.used = true;
+    // Node pipes the stream into the new body: a stream body's is locked and read into the proxy's
+    // own stream (a lazy one's data taken whole into a lazy stream of the proxy's); the stream `body`
+    // made for a text or bytes body is locked and disturbed (its chunks are the data the proxy holds)
+    if (this.data.kind === "stream") {
+      const src = this.data.stream!.__takeSource();
+      const st = src !== undefined ? lazyBodyStream(src as BodyData) : this.data.stream!.pipeThrough(new TransformStream<Uint8Array, Uint8Array>());
+      return new BodyCell(streamBody(st, this.data.type), this);
+    }
+    const st = this.stream;
+    if (st !== null && st.__takeSource() === undefined && !st.locked) { st.getReader(); st.__disturbed = true; }
     return new BodyCell(this.data, this);
   }
   markUsed(): void {
     for (let c: BodyCell | null = this; c !== null; c = c.source) c.used = true;
   }
+  /** the data for a clone: a stream body torn into two branches (this cell keeps one), text or bytes copied */
+  teeOrCopy(): BodyData {
+    if (this.data.kind === "stream") {
+      const src = this.data.stream!.__takeSource();
+      if (src !== undefined) {   // a lazy stream: a fresh lazy stream over its data for each side
+        const type = this.data.type;
+        this.data = streamBody(lazyBodyStream(src as BodyData), type);
+        return streamBody(lazyBodyStream(src as BodyData), type);
+      }
+      const [mine, theirs] = this.data.stream!.tee();
+      this.data = streamBody(mine, this.data.type);
+      return streamBody(theirs, this.data.type);
+    }
+    return copyBody(this.data);
+  }
 }
-/** An opaque stand-in for a body's ReadableStream (streams are a later slice): another Request
- *  or Response takes the cell; a reader is not available. */
-export class BodyStream {
-  __cell: BodyCell;
-  constructor(cell: BodyCell) { this.__cell = cell; }
-  get locked(): boolean { return false; }
-  getReader(): never { throw new TypeError("ReadableStream readers are not supported yet"); }
-  get [Symbol.toStringTag](): string { return "ReadableStream"; }
+/** A text or bytes body seen as `body`: a lazy stream (streams.ts `__lazyOf`) of its chunks as Node
+ *  hands them (one for text and plain bytes; a Blob's parts; a multipart body's pieces; each copied,
+ *  an empty one dropped), made when a reader first reads; a body given the stream that reads it
+ *  takes `d` back whole instead. */
+function lazyBodyStream(d: BodyData): ReadableStream<Uint8Array> {
+  return ReadableStream.__lazyOf<Uint8Array>(d, () => {
+    const out: Uint8Array[] = [];
+    if (d.kind === "string") { const b = new TextEncoder().encode(d.str); if (b.length > 0) out.push(b); }
+    else for (const c of d.chunks !== null ? d.chunks : [d.bytes!]) if (c.length > 0) out.push(c.slice());
+    return out;
+  });
+}
+/** the data behind a stream body that is a lazy stream nobody has read (taken whole), or null: a
+ *  stream to read through a reader */
+function takeLazy(d: BodyData): BodyData | null {
+  const src = d.stream!.__takeSource();
+  return src === undefined ? null : src as BodyData;
+}
+/** Every chunk of a stream, as one byte array. */
+async function readStream(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+  const reader = stream.getReader();
+  const parts: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const r = await reader.read();
+    if (r.done) break;
+    const chunk = r.value as Uint8Array;
+    if (!(chunk instanceof Uint8Array)) throw new TypeError("Received non-Uint8Array chunk");
+    parts.push(chunk);
+    total += chunk.length;
+  }
+  // the reader is kept: a consumed body's stream stays locked, as Node's does
+  if (parts.length === 1) return parts[0];
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const part of parts) { out.set(part, at); at += part.length; }
+  return out;
 }
 
 function bytesOf(view: ArrayBufferView): Uint8Array {
@@ -158,24 +228,81 @@ function bytesOf(view: ArrayBufferView): Uint8Array {
   return out;
 }
 let boundaryCounter = 0;
+const escapeFormName = (s: string): string => s.replace(/\r/g, "%0D").replace(/\n/g, "%0A").replace(/"/g, "%22");
+/** A FormData as a multipart body: text fields, and files with their name and type and their bytes. */
 function multipartOf(form: FormData): BodyData {
   const boundary = "----formdata-garnet-" + String(1e12 + (Date.now() % 1e12)) + String(++boundaryCounter);
-  let s = "";
+  // the pieces are the chunks `body` hands out, as Node's: a text field with its header as one, a
+  // file's header, then each of its parts, then its line end, and the closing delimiter
+  const enc = new TextEncoder();
+  const parts: Uint8Array[] = [];
   for (const [name, value] of form) {
-    s += `--${boundary}\r\nContent-Disposition: form-data; name="${name.replace(/\r/g, "%0D").replace(/\n/g, "%0A").replace(/"/g, "%22")}"\r\n\r\n${value}\r\n`;
+    if (typeof value === "string") {
+      parts.push(enc.encode(`--${boundary}\r\nContent-Disposition: form-data; name="${escapeFormName(name)}"\r\n\r\n${value}\r\n`));
+    } else {
+      const type = value.type === "" ? "application/octet-stream" : value.type;
+      parts.push(enc.encode(`--${boundary}\r\nContent-Disposition: form-data; name="${escapeFormName(name)}"; filename="${escapeFormName(value.name)}"\r\nContent-Type: ${type}\r\n\r\n`));
+      for (const part of Blob.__parts(value)) parts.push(part);
+      parts.push(enc.encode("\r\n"));
+    }
   }
-  s += `--${boundary}--\r\n`;
-  return { kind: "string", str: s, bytes: null, type: `multipart/form-data; boundary=${boundary}` };
+  parts.push(enc.encode(`--${boundary}--\r\n`));
+  return bytesBody(concatParts(parts), `multipart/form-data; boundary=${boundary}`, parts);
+}
+/** the position of `needle` in `hay` at or after `from`, or -1 */
+function indexOfBytes(hay: Uint8Array, needle: Uint8Array, from: number): number {
+  const n = hay.length - needle.length;
+  outer: for (let i = from; i <= n; i++) {
+    for (let j = 0; j < needle.length; j++) if (hay[i + j] !== needle[j]) continue outer;
+    return i;
+  }
+  return -1;
+}
+/** The parts of a multipart body: text fields decoded as UTF-8, a part with a filename a File of its
+ *  Content-Type (text/plain when the part has none, as the HTML standard's parsing says) over its bytes. */
+function parseMultipart(bytes: Uint8Array, boundary: string, form: FormData): void {
+  const enc = new TextEncoder();
+  const dec = new TextDecoder();
+  const delimiter = enc.encode("--" + boundary);
+  const headersEnd = enc.encode("\r\n\r\n");
+  let pos = indexOfBytes(bytes, delimiter, 0);
+  while (pos >= 0) {
+    let at = pos + delimiter.length;
+    if (bytes[at] === 0x2d && bytes[at + 1] === 0x2d) break;   // the closing delimiter
+    if (bytes[at] === 0x0d && bytes[at + 1] === 0x0a) at += 2;
+    const he = indexOfBytes(bytes, headersEnd, at);
+    if (he < 0) break;
+    const head = dec.decode(bytes.subarray(at, he));
+    const bodyStart = he + 4;
+    const next = indexOfBytes(bytes, delimiter, bodyStart);
+    if (next < 0) break;
+    let bodyEnd = next;
+    if (bodyEnd >= 2 && bytes[bodyEnd - 2] === 0x0d && bytes[bodyEnd - 1] === 0x0a) bodyEnd -= 2;
+    const body = bytes.subarray(bodyStart, bodyEnd);
+    const nm = /name="([^"]*)"/i.exec(head);
+    if (nm !== null) {
+      const fn = /filename="([^"]*)"/i.exec(head);
+      if (fn !== null) {
+        const ct = /^content-type:\s*([^\r\n]*)/im.exec(head);
+        form.append(nm[1], File.__of(body.slice(), ct === null ? "text/plain" : ct[1].trim(), fn[1]));
+      } else form.append(nm[1], dec.decode(body));
+    }
+    pos = next;
+  }
 }
 function extractBody(init: unknown): BodyData {
   if (init === null || init === undefined) return NO_BODY;
-  if (typeof init === "string") return { kind: "string", str: init, bytes: null, type: "text/plain;charset=UTF-8" };
-  if (init instanceof BodyStream) return init.__cell.data;
-  if (init instanceof URLSearchParams) return { kind: "string", str: init.toString(), bytes: null, type: "application/x-www-form-urlencoded;charset=UTF-8" };
+  if (typeof init === "string") return textBody(init, "text/plain;charset=UTF-8");
+  if (init instanceof ReadableStream) {
+    if (init.locked || init.__disturbed) throw new TypeError("Response body object should not be disturbed or locked");
+    return streamBody(init as ReadableStream<Uint8Array>, null);
+  }
+  if (init instanceof URLSearchParams) return textBody(init.toString(), "application/x-www-form-urlencoded;charset=UTF-8");
   if (init instanceof FormData) return multipartOf(init);
-  if (init instanceof ArrayBuffer) return { kind: "bytes", str: "", bytes: bytesOf(new Uint8Array(init)), type: null };
-  if (ArrayBuffer.isView(init)) return { kind: "bytes", str: "", bytes: bytesOf(init), type: null };
-  return { kind: "string", str: String(init), bytes: null, type: "text/plain;charset=UTF-8" };
+  if (init instanceof Blob) return bytesBody(Blob.__bytes(init), init.type === "" ? null : init.type, Blob.__parts(init));   // a blob's parts never change
+  if (init instanceof ArrayBuffer) return bytesBody(bytesOf(new Uint8Array(init)), null);
+  if (ArrayBuffer.isView(init)) return bytesBody(bytesOf(init), null);
+  return textBody(String(init), "text/plain;charset=UTF-8");
 }
 function bodyText(d: BodyData): string {
   if (d.kind === "bytes") return new TextDecoder().decode(d.bytes!);
@@ -186,7 +313,7 @@ function bodyBytes(d: BodyData): Uint8Array {
   return new TextEncoder().encode(d.str);
 }
 function copyBody(d: BodyData): BodyData {
-  if (d.kind === "bytes") return { kind: "bytes", str: "", bytes: bodyBytes(d), type: d.type };
+  if (d.kind === "bytes") return bytesBody(bodyBytes(d), d.type, d.chunks);
   return d;
 }
 /** The common body state of a Request and a Response. */
@@ -195,85 +322,125 @@ class BodyMixin {
   __headers!: Headers;
   get __body(): BodyData { return this.__cell.data; }
   get __used(): boolean { return this.__cell.used; }
-  get bodyUsed(): boolean { return this.__cell.used; }
-  get body(): BodyStream | null { return this.__cell.data.kind === "null" ? null : new BodyStream(this.__cell); }
+  get bodyUsed(): boolean { return this.__cell.disturbed; }
+  /** the body as a stream: its own, or the lazy stream of a text or bytes body (made once; a body
+   *  already read hands out the stream it was read through: locked and disturbed) */
+  get body(): ReadableStream<Uint8Array> | null {
+    const d = this.__cell.data;
+    if (d.kind === "null") return null;
+    if (d.kind === "stream") return d.stream;
+    if (this.__cell.stream === null) {
+      const st = lazyBodyStream(d);
+      if (this.__cell.used) st.__takeSource();
+      this.__cell.stream = st;
+    }
+    return this.__cell.stream;
+  }
   get __locked(): boolean { return this.__cell.locked; }
   __consume(): BodyData {
     if (this.__cell.unusable) throw new TypeError("Body is unusable: Body has already been read");
     if (this.__cell.data.kind !== "null") this.__cell.markUsed();
+    // the stream `body` handed out is the one this read goes through, as Node's: locked, disturbed, closed
+    const st = this.__cell.stream;
+    if (st !== null && st.__takeSource() === undefined) { st.getReader(); st.__disturbed = true; st.__close(); }
     return this.__cell.data;
   }
-  async text(): Promise<string> { return bodyText(this.__consume()); }
-  async json(): Promise<unknown> { return JSON.parse(bodyText(this.__consume())); }
+  // Each reader is one async function: a stream body awaits its chunks, a text or bytes body
+  // completes without a suspension (a shared async helper awaited from here was a second
+  // coroutine and a microtask hop per read: hono_app's `res.text()` ran 1.8x slower). A stream
+  // body that is another body's lazy stream nobody read takes that body's data whole (`takeLazy`).
+  async text(): Promise<string> {
+    const d = this.__consume();
+    const now = d.kind === "stream" ? takeLazy(d) : d;
+    return now !== null ? bodyText(now) : new TextDecoder().decode(await readStream(d.stream!));
+  }
+  async json(): Promise<unknown> {
+    const d = this.__consume();
+    const now = d.kind === "stream" ? takeLazy(d) : d;
+    return JSON.parse(now !== null ? bodyText(now) : new TextDecoder().decode(await readStream(d.stream!)));
+  }
   async arrayBuffer(): Promise<ArrayBuffer> {
-    const b = bodyBytes(this.__consume());
+    const d = this.__consume();
+    const now = d.kind === "stream" ? takeLazy(d) : d;
+    const b = now !== null ? bodyBytes(now) : await readStream(d.stream!);
     const out = new ArrayBuffer(b.length);
     new Uint8Array(out).set(b);
     return out;
   }
-  async bytes(): Promise<Uint8Array> { return bodyBytes(this.__consume()); }
+  async bytes(): Promise<Uint8Array> {
+    const d = this.__consume();
+    const now = d.kind === "stream" ? takeLazy(d) : d;
+    return now !== null ? bodyBytes(now) : await readStream(d.stream!);
+  }
+  /** the body as a Blob whose type is the content-type */
+  async blob(): Promise<Blob> {
+    const d = this.__consume();
+    const now = d.kind === "stream" ? takeLazy(d) : d;
+    const bytes = now !== null ? bodyBytes(now) : await readStream(d.stream!);
+    return Blob.__fromBytes(bytes, (this.__headers.get("content-type") ?? "").toLowerCase());
+  }
   async formData(): Promise<FormData> {
     const type = this.__headers.get("content-type") ?? "";
-    const text = bodyText(this.__consume());
+    const d = this.__consume();
+    const now = d.kind === "stream" ? takeLazy(d) : d;
+    const bytes = now !== null ? bodyBytes(now) : await readStream(d.stream!);
     const lower = type.toLowerCase();
     const form = new FormData();
     if (lower.startsWith("application/x-www-form-urlencoded")) {
-      for (const [k, v] of new URLSearchParams(text)) form.append(k, v);
+      for (const [k, v] of new URLSearchParams(new TextDecoder().decode(bytes))) form.append(k, v);
       return form;
     }
     const m = /boundary=("?)([^";]+)\1/i.exec(type);
     if (lower.startsWith("multipart/form-data") && m !== null) {
-      const boundary = "--" + m[2];
-      const parts = text.split(boundary);
-      for (let i = 1; i < parts.length; i++) {
-        let part = parts[i];
-        if (part.startsWith("--")) break;
-        if (part.startsWith("\r\n")) part = part.slice(2);
-        const sep = part.indexOf("\r\n\r\n");
-        if (sep < 0) continue;
-        const head = part.slice(0, sep), body = part.slice(sep + 4, part.endsWith("\r\n") ? part.length - 2 : part.length);
-        const nm = /name="([^"]*)"/i.exec(head);
-        if (nm === null) continue;
-        form.append(nm[1], body);
-      }
+      parseMultipart(bytes, m[2], form);
       return form;
     }
     throw new TypeError("Could not parse content as FormData.");
   }
 }
 
-// ---- FormData (text fields) ----
+// ---- FormData (text fields and files) ----
 
+export type FormDataEntryValue = string | File;
+/** a FormData value: a string, or a Blob as a File named by `filename` (a Blob that is not a File is "blob") */
+function formValue(value: unknown, filename: string | undefined): FormDataEntryValue {
+  if (value instanceof Blob) {
+    if (value instanceof File && filename === undefined) return value;
+    return new File([value], filename === undefined ? "blob" : String(filename), { type: value.type });
+  }
+  if (filename !== undefined) throw new TypeError("Failed to execute 'append' on 'FormData': parameter 2 is not of type 'Blob'.");
+  return String(value);
+}
 export class FormData {
-  #entries: [string, string][] = [];
-  append(name: string, value: unknown): void { this.#entries.push([String(name), String(value)]); }
-  set(name: string, value: unknown): void {
-    const n = String(name), v = String(value);
+  #entries: [string, FormDataEntryValue][] = [];
+  append(name: string, value: unknown, filename?: string): void { this.#entries.push([String(name), formValue(value, filename)]); }
+  set(name: string, value: unknown, filename?: string): void {
+    const n = String(name), v = formValue(value, filename);
     const i = this.#entries.findIndex((e) => e[0] === n);
     if (i < 0) { this.#entries.push([n, v]); return; }
     this.#entries[i] = [n, v];
     this.#entries = this.#entries.filter((e, j) => j <= i || e[0] !== n);
   }
-  get(name: string): string | null {
+  get(name: string): FormDataEntryValue | null {
     const n = String(name);
     for (const e of this.#entries) if (e[0] === n) return e[1];
     return null;
   }
-  getAll(name: string): string[] {
+  getAll(name: string): FormDataEntryValue[] {
     const n = String(name);
-    const out: string[] = [];
+    const out: FormDataEntryValue[] = [];
     for (const e of this.#entries) if (e[0] === n) out.push(e[1]);
     return out;
   }
   has(name: string): boolean { const n = String(name); return this.#entries.some((e) => e[0] === n); }
   delete(name: string): void { const n = String(name); this.#entries = this.#entries.filter((e) => e[0] !== n); }
-  *entries(): IterableIterator<[string, string]> { for (const e of this.#entries) yield [e[0], e[1]]; }
+  *entries(): IterableIterator<[string, FormDataEntryValue]> { for (const e of this.#entries) yield [e[0], e[1]]; }
   *keys(): IterableIterator<string> { for (const e of this.#entries) yield e[0]; }
-  *values(): IterableIterator<string> { for (const e of this.#entries) yield e[1]; }
-  forEach(callback: (value: string, key: string, parent: FormData) => void, thisArg?: unknown): void {
+  *values(): IterableIterator<FormDataEntryValue> { for (const e of this.#entries) yield e[1]; }
+  forEach(callback: (value: FormDataEntryValue, key: string, parent: FormData) => void, thisArg?: unknown): void {
     for (const e of this.#entries) callback.call(thisArg, e[1], e[0], this);
   }
-  [Symbol.iterator](): IterableIterator<[string, string]> { return this.entries(); }
+  [Symbol.iterator](): IterableIterator<[string, FormDataEntryValue]> { return this.entries(); }
   get [Symbol.toStringTag](): string { return "FormData"; }
 }
 
@@ -323,12 +490,16 @@ export class Request extends BodyMixin {
     let headers: Headers | undefined;
     let cell: BodyCell = new BodyCell(NO_BODY);
     let signal: unknown = undefined;
+    const givesBody = opts.body !== undefined && opts.body !== null;
     if (input instanceof Request) {
-      if (input.__cell.unusable) throw new TypeError("Cannot construct a Request with a Request object that has already been used.");
+      // the input's body is this one's (a proxy: the input is used at once; `body: null` in the init
+      // keeps it) unless the init gives a body, when a used input is no error (hono's body-limit
+      // rebuilds a read request over a stream of what it read)
+      if (!givesBody && input.__cell.unusable) throw new TypeError("Cannot construct a Request with a Request object that has already been used.");
       this.#url = input.#url;
       method = input.#method;
       headers = new Headers(input.__headers);
-      cell = opts.body === undefined ? input.__cell.proxy(true) : input.__cell;
+      cell = givesBody ? new BodyCell(NO_BODY) : input.__cell.proxy(true);
       signal = input.#signal;
       this.#cache = input.#cache; this.#credentials = input.#credentials; this.#mode = input.#mode; this.#redirect = input.#redirect;
       this.#referrer = input.#referrer; this.#referrerPolicy = input.#referrerPolicy; this.#integrity = input.#integrity;
@@ -341,11 +512,10 @@ export class Request extends BodyMixin {
     if (headers === undefined) headers = new Headers();
     if (opts.body !== undefined && opts.body !== null) {
       if (method === "GET" || method === "HEAD") throw new TypeError("Request with GET/HEAD method cannot have body.");
+      if (opts.body instanceof ReadableStream && opts.duplex === undefined) throw new TypeError("RequestInit: duplex option is required when sending a body.");
       const body = extractBody(opts.body);
       if (body.type !== null && !headers.has("content-type")) headers.append("content-type", body.type);
-      cell = opts.body instanceof BodyStream ? opts.body.__cell.proxy(false) : new BodyCell(body);
-    } else if (opts.body === null) {
-      cell = new BodyCell(NO_BODY);
+      cell = new BodyCell(body);
     }
     if (opts.signal !== undefined) {
       if (opts.signal !== null && (typeof opts.signal !== "object" || !("aborted" in (opts.signal as object)))) throw new TypeError("Failed to construct 'Request': member signal is not of type AbortSignal.");
@@ -383,8 +553,13 @@ export class Request extends BodyMixin {
   get __timeoutMs(): number | undefined { return this.#timeoutMs; }
   clone(): Request {
     if (this.__cell.unusable) throw new TypeError("Request.clone: Body has already been consumed.");
-    const r = new Request(this, { body: null });   // the fields copied, the body not proxied (Node tees the stream)
-    r.__cell = new BodyCell(copyBody(this.__body));
+    // the fields copied one by one (a Request made from this one would take its body as a proxy)
+    const r = new Request(this.#url, {
+      method: this.#method, headers: this.__headers, signal: this.#signal, cache: this.#cache, credentials: this.#credentials,
+      mode: this.#mode, redirect: this.#redirect, referrer: this.#referrer, referrerPolicy: this.#referrerPolicy,
+      integrity: this.#integrity, keepalive: this.#keepalive, duplex: this.#duplex, timeoutMs: this.#timeoutMs,
+    });
+    r.__cell = new BodyCell(this.__cell.teeOrCopy());
     return r;
   }
   get [Symbol.toStringTag](): string { return "Request"; }
@@ -431,7 +606,7 @@ export class Response extends BodyMixin {
     this.#status = status;
     this.#statusText = statusText;
     this.__headers = headers;
-    this.__cell = body instanceof BodyStream ? body.__cell.proxy(false) : new BodyCell(data);
+    this.__cell = new BodyCell(data);
   }
   static json(data: unknown, init?: ResponseInit): Response {
     const text = JSON.stringify(data);
@@ -462,7 +637,7 @@ export class Response extends BodyMixin {
     r.#status = status;
     r.#url = url;
     r.__headers = headers;
-    r.__cell = new BodyCell(body.length === 0 && (status === 204 || status === 304) ? NO_BODY : { kind: "string", str: body, bytes: null, type: null });
+    r.__cell = new BodyCell(body.length === 0 && (status === 204 || status === 304) ? NO_BODY : textBody(body, null));
     Headers.__setImmutable(headers);
     return r;
   }
@@ -478,7 +653,7 @@ export class Response extends BodyMixin {
     const r = new Response(null);
     r.#status = this.#status; r.#statusText = this.#statusText; r.#type = this.#type; r.#url = this.#url; r.#redirected = this.#redirected;
     r.__headers = new Headers(this.__headers);
-    r.__cell = new BodyCell(copyBody(this.__body));
+    r.__cell = new BodyCell(this.__cell.teeOrCopy());
     return r;
   }
   get [Symbol.toStringTag](): string { return "Response"; }
@@ -491,7 +666,7 @@ export async function fetch(input: string | URL | Request, init?: RequestInit): 
   const headers: Record<string, string> = {};
   for (const [k, v] of req.headers) headers[k] = v;
   const raw: RawFetchInit = { method: req.method, headers, signal: req.signal };
-  if (req.__body.kind !== "null") raw.body = bodyText(req.__body);
+  if (req.__body.kind !== "null") raw.body = await req.text();
   if (req.__timeoutMs !== undefined) raw.timeoutMs = req.__timeoutMs;
   const res = await __garnet_fetch(req.url, raw);
   const h = new Headers();
