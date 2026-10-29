@@ -62,7 +62,10 @@ a list with keys, a fragment, escaped text. The checksum is every response's sta
 body, so the Web standard objects of `lib/node/web/` (docs/web_fetch_api_design.md) and the JSX
 rendering are compared with Node's own on hono's real code, and the loop over 20,000 requests is
 the dispatch benchmark (no socket). Session 358's numbers: 17 kinds garnet 337 ms, Node 142 (2.4x);
-with the two JSX pages 19 kinds with the two JSX pages: garnet 389 ms, Node 155 (2.5x) on a quiet machine; 438 vs 164 under the external load.
+with the two JSX pages 19 kinds with the two JSX pages: garnet 389 ms, Node 155 (2.5x) on a quiet machine; 438 vs 164 under the external load. The microtask queue's leak fixed (the
+queue had kept every coroutine it resumed alive, and a program that is promises only runs inside
+one drain from start to end): garnet 184 ms, Node 156 (1.18x), max RSS 234 -> 19 MB; 200,000
+requests 30.3 s -> 2.1 s.
 
 ## hono: the middleware survey
 

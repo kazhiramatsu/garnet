@@ -11987,3 +11987,54 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
     (`classes/ambient_global_ctor_spread`).
 - Gates: the full gate set green after the lazy streams and the callable-Proxy flag: unit, bundler 53/53, conformance plain and strict 692/692, protect and units 689/689, bench (every benchmark correct and within its budget), the GC suite incl. ASan and GC stress, the `ci` gate (the negative tests, the JSX / fetch / regexp / unicode link gates), the fetch run gate, the regexp engine diff 43,593 cases 0 differ; the ir-parity snapshot refreshed (the fixtures that name the Web objects carry the streams part). tsc-ts r14 -> r15 instructions 1.0025 (21.907 G -> 21.961 G: the callable-Proxy flag's branch in the typeof tests and the method fallback), cycles 0.986, wall 0.992; vue medians of 7 under the external load (Node 815 ms): 1126.1 -> 1139.1 ms; instructions 30.54 G -> 30.66 G (+0.4%, the same branch; a per-variant count put 0.27% in the typeof tests and 0.07% in the callable test); hono routers medians of 5: TrieRouter 263.4 -> 268.4, RegExpRouter 70.3 -> 69.1, PatternRouter 255.7 -> 252.1, SmartRouter 75.9 -> 76.3 ms (the machine loaded); hono_app
   garnet 397.7 ms, Node 161.2 (medians of 3). The survey: 40 of 43 drivers agree with Node.
+- The microtask queue kept every coroutine it had resumed alive (Kaz: 「リーク修正を入れてください」,
+  after asking whether the collector should give way to reference counting with a cycle collector,
+  as scriptc has). A sampling profile of hono_app's driver at ten times its requests (200,000) put
+  89% of the main thread in the collector, and a request took 7.5 times as long as in the
+  benchmark's 20,000: `drain_microtasks` walked the queue with a local index and emptied it only at
+  its end, and the collector marked the whole array as roots. A program that is promises only
+  (hono_app: no timer, no I/O) runs inside one drain from start to end, so every coroutine it had
+  resumed stayed alive and was marked again on every collection: the memory and each collection
+  grew with the requests served, a server's leak. The drain advances a shared head now, the
+  collector marks the pending entries only, a push to a full queue slides the pending part to the
+  front once half of it has run, and a fork resets both; the event loop's and the ticks' pending
+  tests read `microq_pending()`. Gate `tests/microtask_queue_gate.sh` (the `ci` gate): 2,000,000
+  awaits in one drain under 96 MB and 60 s; the committed runtime fails it at 727 MB, the fix holds
+  7 MB. hono_app interleaved medians of 9: 409.7 -> 184.1 ms, max RSS 234 -> 19 MB (Node 156.0 ms:
+  2.6x -> 1.18x); 200,000 requests 30.3 s -> 2.1 s.
+- The collector itself, against runs with collections disabled (the 2026-10-20 recipe: the young
+  threshold, the nursery and the full threshold set huge), each pair under the same conditions:
+  hono_app (with the fix) 228 ms against 257 ms without collections; vue 1,117 against 1,317-1,454
+  ms; tsc-ts 1.26 s against 1.19 s (instructions 21.88 G against 20.39 G). The first two are slower
+  without collections (fresh pages and lost locality cost more than the nursery's collections);
+  tsc-ts pays about 6%, its old generation's marking of a 646 MB heap. The collector is not these
+  programs' bottleneck, so it stays: reference counting would buy at most tsc-ts's 6% and pay an
+  increment and a decrement on every pointer copy and store, where the nursery makes the objects
+  that die young free.
+- Gates: the full gate set green: unit, bundler 53/53, conformance plain and strict 692/692, protect and units 689/689, the GC suite incl. ASan and GC stress, the `ci` gate with the new microtask gate (2,000,000 awaits, 7 MB), the fetch run gate, the regexp engine diff 43,593 cases 0 differ, ir-parity identical (4,310 files); bench: every benchmark correct, `string_unicode_search_kernel` 106 ms against its 100 ms budget under the external load, and an interleaved A/B of that kernel against the committed runtime 104 -> 101 ms (medians of 9: the same within the noise). tsc-ts r15 -> r16 instructions 0.9995 (21.958 G -> 21.946 G), cycles 1.000, wall 1.009; vue medians of 7: 1063.0 -> 1069.3 ms; hono routers medians of 5: TrieRouter 250.5 -> 246.3, RegExpRouter 64.9 -> 64.9, PatternRouter 242.9 -> 242.3, SmartRouter 73.4 -> 73.3 ms; hono_app
+  garnet 181.8 ms, Node 157.7 (medians of 3).
+- Fix candidates from a review of the microtask queue and the promise machinery (Kaz:
+  「マイクロタスクキューは初期に実装してあまり手を入れていませんが処理に問題があるかもしれません。改めてレビューしてもらっていいですか」,
+  「これらも修正候補に入れてください」). The ordering of the common forms agrees with V8 (await and then,
+  thenables, resolve with a promise, an async function returning one, the combinators, nextTick,
+  timers and immediates, async generators, a catch attached within the same drain); each item
+  below was found by one program under Node and garnet:
+  1. `finally`'s continuation settles one tick early on both paths: onFinally's result should
+     become `PromiseResolve(r).then(valueThunk)`, a promise the derived promise adopts.
+  2. `queueMicrotask` is `Promise.resolve().then(cb)`: a throwing callback becomes an unhandled
+     rejection reported after the remaining microtasks ran (Node: an uncaught exception, nothing
+     after it runs), and a non-function argument is ignored (Node: ERR_INVALID_ARG_TYPE).
+  3. `new Promise(nonCallable)` returns a rejected promise (Node: a synchronous TypeError "Promise
+     resolver 123 is not a function"), which then ends the program as an unhandled rejection.
+  4. `then` / `catch` / `finally` on a receiver that is not a promise answer undefined (Node:
+     "Method Promise.prototype.then called on incompatible receiver #<Object>", ...).
+  5. The unhandled-rejection report prints `TypeError {}` without the message (the survey's
+     failures said only that).
+  6. An uncaught exception ends the process with abort() (status 134, a crash report), where
+     Node exits with 1.
+  7. The unhandled-rejection list is quadratic (a linear duplicate test on add, a linear remove):
+     40,000 outstanding rejections handled together 366 ms, Node 30.
+  8. A reaction (then, finally, an adoption, a combinator's element) is a full coroutine frame
+     (224 bytes) plus a result promise nobody reads (96 bytes), besides its own output promise:
+     about 440 bytes a `then`.
+  9. A promise's first waiter mallocs a four-entry array (most promises have one waiter).

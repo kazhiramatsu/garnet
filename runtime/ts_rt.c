@@ -19636,11 +19636,28 @@ static tsv ts_get_catching(tsv obj, ts_key key, int* threw){
   return r;
 }
 
-/* microtask queue: each entry is a coroutine frame to resume */
-static tsv* g_microq=NULL; static int g_mq_len=0, g_mq_cap=0;
+/* microtask queue: each entry is a coroutine frame to resume. The entries before g_mq_head have
+   run: a drain advances the shared head, the collector marks only [g_mq_head, g_mq_len), and a push
+   to a full queue slides the pending part to the front once half of it has run. A program that
+   is promises only (hono_app: no timer, no I/O) runs inside one drain from start to end; the
+   queue had kept every coroutine it ever resumed alive and marked them on every collection, so
+   the heap and each collection grew with the requests served (200,000 requests: 30 s, the 20,000
+   of the benchmark 0.4 s). */
+static tsv* g_microq=NULL; static int g_mq_head=0, g_mq_len=0, g_mq_cap=0;
+static inline int microq_pending(void){ return g_mq_len > g_mq_head; }
 static void microq_push_v(tsv cv){
   if (!ts_is_coro_value(cv)) return;
-  if (g_mq_len==g_mq_cap){ g_mq_cap=g_mq_cap?g_mq_cap*2:32; g_microq=realloc(g_microq,sizeof(tsv)*g_mq_cap); }
+  if (g_mq_len==g_mq_cap){
+    if (g_mq_head > 0 && g_mq_head >= g_mq_len/2){
+      int live = g_mq_len - g_mq_head;
+      memmove(g_microq, g_microq + g_mq_head, sizeof(tsv)*(size_t)live);
+      g_mq_head = 0; g_mq_len = live;
+    } else {
+      g_mq_cap=g_mq_cap?g_mq_cap*2:32;
+      g_microq=realloc(g_microq,sizeof(tsv)*(size_t)g_mq_cap);
+      if (!g_microq) ts_abort_msg("out of memory growing the microtask queue");
+    }
+  }
   g_microq[g_mq_len++]=cv;
 }
 
@@ -20432,12 +20449,11 @@ static void gc_mark_abort_timer_roots(void);
 static void gc_mark_abort_timer_roots_young(void);
 
 static void drain_microtasks(void){
-  int i=0;
-  while (i<g_mq_len){
-    tsv cv=g_microq[i++];
-    ts_coro_resume_v(cv);  /* may push more microtasks */
+  while (g_mq_head<g_mq_len){
+    tsv cv=g_microq[g_mq_head++];
+    ts_coro_resume_v(cv);  /* may push more microtasks (a push may slide the queue: the head is re-read) */
   }
-  g_mq_len=0;
+  g_mq_head=g_mq_len=0;
 }
 
 
@@ -21378,7 +21394,7 @@ static int ts_worker_fork_ex(tsv entry, tsv data, int shared){
        microtasks and I/O tasks */
     for (ts_watch* w = g_watches; w; w = w->next){ close(w->fd); close(w->out_fd); }
     g_watches = NULL;
-    g_mq_len = 0;
+    g_mq_head = g_mq_len = 0;
     g_io_head = g_io_tail = g_io_active = NULL;
     g_is_worker = 1; g_worker_fd = fds[1]; g_thread_id = id;
     nh_fork_child_reset();   /* the parent's timers, ticks, immediates, watched fds and children are the parent's */
@@ -21439,8 +21455,8 @@ void ts_run_event_loop(void){
     if (g_io_active) (void)ts_io_poll_active();  /* completes ready I/O tasks */
     nh_immediates_run();
     int io_pending = g_io_head || g_io_active;
-    if (nh_loop_alive() || io_pending || ts_watches_refd() || g_parent_watching || g_mq_len || nh_immediates_pending()){
-      if (g_mq_len || nh_immediates_pending()) continue;   /* runnable work: no waiting */
+    if (nh_loop_alive() || io_pending || ts_watches_refd() || g_parent_watching || microq_pending() || nh_immediates_pending()){
+      if (microq_pending() || nh_immediates_pending()) continue;   /* runnable work: no waiting */
       /* wait for the next event: the earliest timer, else the watches' or the abort timers' turn */
       int timeout = nh_next_timer_timeout_ms(io_pending ? 0 : 1000);
       timeout = ts_abort_timer_poll_timeout_ms(timeout);
@@ -21449,7 +21465,7 @@ void ts_run_event_loop(void){
     }
     /* nothing keeps the loop alive: 'beforeExit' may schedule more */
     if (g_is_worker) break;   /* a worker's end runs no process exit hooks: the listeners are the parent's copies */
-    if (nh_run_exit_hook_phase(0) && (nh_loop_alive() || g_io_head || g_mq_len || nh_immediates_pending() || ts_watches_refd())) continue;
+    if (nh_run_exit_hook_phase(0) && (nh_loop_alive() || g_io_head || microq_pending() || nh_immediates_pending() || ts_watches_refd())) continue;
     nh_run_exit_hook_phase(1);
     break;
   }
@@ -21497,7 +21513,7 @@ static void gc_scan_async_cell(ts_gc_header* h, int young, int depth){
 }
 
 static void gc_mark_async_roots(void){
-  for (int i=0;i<g_mq_len;i++) gc_visit_slot(&g_microq[i], 0, 0, 1);
+  for (int i=g_mq_head;i<g_mq_len;i++) gc_visit_slot(&g_microq[i], 0, 0, 1);   /* the pending entries only */
   for (int i=0;i<g_unhandled_len;i++) gc_visit_slot(&g_unhandled[i], 0, 0, 1);
   nh_mark_loop_roots(0);
   for (ts_io* t=g_io_head;t;t=t->next){ gc_visit_slot(&t->p, 0, 0, 1); gc_visit_slot(&t->signal, 0, 0, 1); }
@@ -21505,7 +21521,7 @@ static void gc_mark_async_roots(void){
   gc_mark_abort_timer_roots();
 }
 static void gc_mark_async_roots_young(void){
-  for (int i=0;i<g_mq_len;i++) gc_visit_slot(&g_microq[i], 1, 0, 1);
+  for (int i=g_mq_head;i<g_mq_len;i++) gc_visit_slot(&g_microq[i], 1, 0, 1);
   for (int i=0;i<g_unhandled_len;i++) gc_visit_slot(&g_unhandled[i], 1, 0, 1);
   nh_mark_loop_roots(1);
   for (ts_io* t=g_io_head;t;t=t->next){ gc_visit_slot(&t->p, 1, 0, 1); gc_visit_slot(&t->signal, 1, 0, 1); }

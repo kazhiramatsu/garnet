@@ -78,6 +78,10 @@ Rust in §315; selfhost is kept as a performance metric).
   construction sites in `analyzer/.../sroa.rs` and the literal files under `tests/*.rs` (six build a `Function` literal as of Session 356).**
 - **GC: a function that allocates must root its live tsv arguments** (root/unroot around clone/new).
   Confirm with the GC-stress probe.
+- **A runtime array the collector marks as roots must shrink as it is consumed.** The microtask
+  queue was drained by a local index and marked from 0: a promise-only program (one drain from start
+  to end) kept every coroutine it had resumed alive (Session 358: hono_app 2.2x, 234 -> 19 MB). Mark
+  the pending range only.
 - **When a closure captures a loop variable, writes to the variable must always go through the capture
   cell (StoreField VALUE).** A raw direct write to the local bypasses the cell and yields undefined.
 - **Type-driven optimizations (unbox/SROA) tend to drop values.** Watch out for `never`/conditional

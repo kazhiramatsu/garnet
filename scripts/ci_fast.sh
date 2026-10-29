@@ -39,6 +39,7 @@ bash "$ROOT/tests/known_neg_zero.sh" || rc=1
 bash "$ROOT/tests/string_concat_aot_gate.sh" || rc=1
 bash "$ROOT/tests/jsx_aot_gate.sh" || rc=1
 bash "$ROOT/tests/runtime_anymethod_safe.sh" || rc=1
+bash "$ROOT/tests/microtask_queue_gate.sh" || rc=1
 bash "$ROOT/tests/regexp_aot_gate.sh" || rc=1
 node "$ROOT/tests/regexp/rx_diff.mjs" --random 2000 --show 10 || rc=1
 # the native tier: the emitter and the interpreter must agree on every case (docs/regexp_vm_design.md)

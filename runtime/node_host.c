@@ -746,7 +746,7 @@ static void nh_drain_ticks_and_microtasks(void){
       nh_call_with_args(cb, args);
     }
     drain_microtasks();
-    if (!g_nh_tick_head && !g_mq_len) return;
+    if (!g_nh_tick_head && !microq_pending()) return;
   }
 }
 static void nh_timers_run_due(void){
