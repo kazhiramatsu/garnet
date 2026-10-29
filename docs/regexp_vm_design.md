@@ -664,6 +664,24 @@ measurement variant.
   binding (the trace) and the `--regexps off` and `--pgo off` builds; the engine diff
   43,593 cases, 0 differ in the interpreter and the native mode. Gates: conformance 670/670 plain and strict, 667/667 in units mode and under GC protect, unit (the pgo build gate with the regexps cases), bundler 51/51, bench all within budget, GC stress PASSED, the regexp AOT and link gates. tsc-ts
   22.190 -> 22.182 G instructions (unchanged; outputs identical); the benchmark's own training run records no run-time regexp (tsc-ts's own code builds one only in its timeline tool, which the measured compile never runs, and its file matching, `vfs-match.ts`, uses no RegExp), so the trained build links no table (18.635 G instructions, as before); vue 1,061.7 -> 1,060.0 ms (seven alternating rounds each, medians; outputs identical; Node 773).
+- **R10 built (Session 358): the call through the `match` function value.** The known-method
+  guess of a dynamic call (docs/pic_sized_inline_design.md "The known callees of a dynamic call")
+  is a set now: every function the program stores under the key (hono's `match`: the module
+  function through the field initializer, the closure the first call makes), compared by code
+  pointer at the site and taken through the direct entry with the closure's cells; a bound
+  function of a candidate (SmartRouter's `router.match.bind(router)`) is unwrapped to the
+  target's direct entry with the bound this. hono, five alternating rounds (medians; Node):
+  plain: TrieRouter 244.5 -> 244.6 ms (260), RegExpRouter 68.6 -> 64.2 (39), PatternRouter 245.2 -> 241.5 (153), SmartRouter 81.4 -> 72.0 (42); trained (each side's own training): TrieRouter 179.2 -> 178.5, RegExpRouter 47.1 -> 46.5, PatternRouter 149.0 -> 146.1, SmartRouter 55.2 -> 50.1; outputs identical. The trained RegExpRouter's profile after it (a RegExpRouter-only driver, 10 M
+  matches, the PC sampler on the profiling build): the result array's construction 27%
+  (`build_result` 9.8%, `ts_new_array_compact` 4.0%, `ts_array_adopt_layout` 3.7%, the capture
+  slices 5.2%, the cell's zeroing and the hole fill 4.4%: a sixteen-element array, most of them
+  unmatched groups, plus the four named properties' vector), the driver's loop 14.7%, `rx_exec`
+  around the native matcher 11.8% (the context, the capture registers' reset, the copy out),
+  the closure's body 9.0%, the matcher 8.4%, a plain `ts_get` 6.0% (the static map probed with
+  each request's path, a megamorphic key), the pair 4.9%, `indexOf` 4.5%. The next step is the
+  result array: the elements stored once without the hole fill, the named properties in the
+  cell instead of a vector of their own, and the capture registers reset only as far as the
+  program's groups. Gates: conformance 671/671 plain and strict (the fixture included), 668/668 in units mode and under GC protect, unit, bundler 51/51, bench all within budget, GC stress PASSED, the regexp AOT and link gates. tsc-ts 22.180 -> 22.181 G instructions (unchanged; outputs identical; 660 sites carry guards); vue 1,048.7 -> 1,051.1 ms (seven alternating rounds each, medians; outputs identical; Node 773; 702 sites carry guards).
 - Not yet: the `v`-mode properties of strings (`\p{RGI_Emoji}` and the other six; the emoji
   sequence data is in `build/ucd/17.0.0/emoji-seq/`, emoji 16.0 at the time of writing).
 

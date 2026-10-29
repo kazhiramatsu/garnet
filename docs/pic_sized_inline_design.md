@@ -347,3 +347,33 @@ through an `any` receiver and a subclass's getter over a base method.
 `TSAOT_METHOD_SITE_IC=0` keeps the two reads (the parity oracle). Fixture
 `classes/method_site_cache_dyn`. hono's RegExpRouter 72.1 -> 68.1 ms and
 SmartRouter 94.8 -> 81.8 (Node 39 / 42); vue 1,056.4 -> 1,055.0 ms (seven alternating rounds each, medians; outputs identical; Node 773); tsc-ts 22.183 -> 22.182 G instructions (unchanged; outputs identical).
+
+## The known callees of a dynamic call (Session 358)
+
+`known_method_closures` guessed one callee for a dynamic method call: the
+field keys under which the program stores exactly one closure, verified at
+the site by the function cell's code pointer and taken through the direct
+entry with the closure's cells. hono's `router.match` stores three kinds under
+`match` (the module function through the field initializer, the closure the
+first call makes, SmartRouter's bound function), so the key was poisoned and
+the driver's site took `ts_call_method` -> `ts_call` -> the generic entry ->
+the direct entry on every call: the paste's "call through the `match` function
+value", which V8 inlines into the loop. The guess is now a set
+(`known_method_candidates`, `KnownCallees`): every function the program stores
+under the key, through copies and through a load from a module binding's cell
+that holds one closure (the field initializer's `match = match`), up to
+KNOWN_CALLEE_MAX (4); a key with more is megamorphic and gets none. The site
+fetches the method value as before (the sized or the dynamic site cache), then
+compares the code pointer with each candidate's (`emit_known_callee_guards`)
+and takes the direct entry; a bound function of a candidate with no partial
+arguments (`ts_bound_thunk` with a two-entry env: SmartRouter's
+`router.match.bind(router)`) is unwrapped the same way, the target's cells and
+the bound this; any other value takes the runtime's call. Correctness never
+depends on the set's completeness. The classes' methods of the name were tried
+as candidates too and not kept: `ts_call_method_inline` already enters an
+environment-free method's generic entry directly, and the direct call let the
+C compiler inline hono's PatternRouter.match into the driver's loop (8%
+slower). `TSAOT_KNOWN_METHOD=0` keeps the lookup alone (the parity oracle);
+`TSAOT_KNOWN_CALLEE_DEBUG=1` prints the sets at emission. Fixture
+`classes/known_callee_guards`. hono, five alternating rounds (medians; Node):
+plain: TrieRouter 244.5 -> 244.6 ms (260), RegExpRouter 68.6 -> 64.2 (39), PatternRouter 245.2 -> 241.5 (153), SmartRouter 81.4 -> 72.0 (42); trained (each side's own training): TrieRouter 179.2 -> 178.5, RegExpRouter 47.1 -> 46.5, PatternRouter 149.0 -> 146.1, SmartRouter 55.2 -> 50.1; outputs identical. tsc-ts 22.180 -> 22.181 G instructions (unchanged; outputs identical; 660 sites carry guards); vue 1,048.7 -> 1,051.1 ms (seven alternating rounds each, medians; outputs identical; Node 773; 702 sites carry guards).

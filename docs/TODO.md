@@ -11738,3 +11738,41 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   body, which V8's JIT inlines into the loop. Gates: `tests/pgo_build_gate.sh` (the record, the
   file, the binding's trace, `--regexps off`, `--pgo off`, the units build), the engine diff
   43,593 cases 0 differ in both modes, conformance 670/670 plain and strict, 667/667 in units mode and under GC protect, unit (the pgo build gate with the regexps cases), bundler 51/51, bench all within budget, GC stress PASSED, the regexp AOT and link gates. tsc-ts 22.190 -> 22.182 G instructions (unchanged; outputs identical); the benchmark's own training run records no run-time regexp (tsc-ts's own code builds one only in its timeline tool, which the measured compile never runs, and its file matching, `vfs-match.ts`, uses no RegExp), so the trained build links no table (18.635 G instructions, as before); vue 1,061.7 -> 1,060.0 ms (seven alternating rounds each, medians; outputs identical; Node 773).
+- Kaz asked how the driver loop's call through the `match` function value and the closure's
+  body would be handled; the answer was the known-method guard extended to candidate sets (the
+  main lever), the closure's body inlined at the guarded site (small, later), and the body's
+  remaining reads after a profile; Kaz: 「進めてください」.
+- R10 of the regexp VM: the call through the `match` function value (docs/regexp_vm_design.md
+  "R10 built", docs/pic_sized_inline_design.md "The known callees of a dynamic call"). The
+  driver's `router.match(...)` fetched the closure from the site cache and then took
+  `ts_call_method` -> `ts_call` -> the generic entry -> the direct entry (the closure carries an
+  environment, which `ts_call_method_inline` sends to the runtime). `known_method_closures`
+  guessed one callee per field key and was poisoned by hono's three stores under `match`.
+  (1) `known_method_candidates`: every function stored under the key, through copies and through
+  a load from a module binding's cell holding one closure (`match = match`), up to
+  KNOWN_CALLEE_MAX (4); the site compares the code pointer with each candidate and takes the
+  direct entry with the closure's cells (`emit_known_callee_guards`, after the sized or dynamic
+  site cache's fetch, which the old guess bypassed). (2) A bound function of a candidate with no
+  partial arguments (`ts_bound_thunk`, now declared in ts_rt.h; SmartRouter's
+  `router.match.bind(router)`) is unwrapped: the target's cells, the bound this. (3) The
+  classes' methods of the name were candidates in a first cut and are not: `ts_call_method_inline`
+  already enters an environment-free method's generic entry directly, and the direct call let
+  the C compiler inline PatternRouter.match into the driver's loop (PatternRouter 150.6 -> 162.1
+  ms with its own training). A stale profile is a trap here: the trained build with the old
+  `default.pgo` lost `bench`'s profile (its control flow changed) and ran PatternRouter 14%
+  slower; the A/B is between two trainings. Fixture `classes/known_callee_guards` (a class
+  whose field holds the module function and then its closure, prototype methods, a literal's
+  closure, bound functions of a candidate with and without a partial argument, the module
+  function bound to a plain object, a replaced prototype method, a Proxy, method values moved
+  onto plain objects, a non-function, a missing method, a getter). hono, five alternating
+  rounds (medians; Node): plain: TrieRouter 244.5 -> 244.6 ms (260), RegExpRouter 68.6 -> 64.2 (39), PatternRouter 245.2 -> 241.5 (153), SmartRouter 81.4 -> 72.0 (42); trained (each side's own training): TrieRouter 179.2 -> 178.5, RegExpRouter 47.1 -> 46.5, PatternRouter 149.0 -> 146.1, SmartRouter 55.2 -> 50.1; outputs identical. The trained RegExpRouter's profile after it (a
+  RegExpRouter-only driver, 10 M matches, the PC sampler): the result array's construction
+  27% (`build_result` 9.8%, `ts_new_array_compact` 4.0%, `ts_array_adopt_layout` 3.7%, the
+  capture slices 5.2%, the cell's zeroing and the hole fill 4.4%), the driver's loop 14.7%,
+  `rx_exec` around the native matcher 11.8%, the closure's body 9.0%, the matcher 8.4%, a plain
+  `ts_get` 6.0% (the static map probed with each request's path), the pair 4.9%, `indexOf`
+  4.5%. Next: the result array (the elements stored once without the hole fill, the named
+  properties in the cell, the capture registers reset only as far as the program's groups).
+  `scripts/prof_pc.py` hung in `atos` on the profiling build (atos itself answers at once); the
+  shares above are the sample file's own symbols aggregated by hand. Gates: conformance 671/671 plain and strict (the fixture included), 668/668 in units mode and under GC protect, unit, bundler 51/51, bench all within budget, GC stress PASSED, the regexp AOT and link gates. tsc-ts
+  22.180 -> 22.181 G instructions (unchanged; outputs identical; 660 sites carry guards); vue 1,048.7 -> 1,051.1 ms (seven alternating rounds each, medians; outputs identical; Node 773; 702 sites carry guards).

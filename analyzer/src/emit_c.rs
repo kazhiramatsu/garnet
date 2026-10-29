@@ -468,7 +468,7 @@ fn emit_program_with_string_plans(
         let _ = writeln!(s, "static tsv {}(tsv* args, int nargs);", cname(f));
     }
     let direct_sigs = direct_entry_sigs(program, &fclass, &param_facts_by_func, &i64_fast);
-    let known_methods = known_method_closures(program);
+    let known_methods = known_method_candidates(program);
     for f in &program.functions {
         if let Some(sig) = direct_sigs.get(&f.id.0) {
             let storage = direct_entry_storage(f);
@@ -1941,7 +1941,7 @@ struct Ctx<'a> {
     /// Direct entry signatures of every eligible function (empty when disabled).
     direct_sigs: &'a BTreeMap<u32, DirectSig>,
     /// method keys stored exactly one closure function program-wide (known_method_closures)
-    known_methods: &'a BTreeMap<u32, u32>,
+    known_methods: &'a KnownCallees,
     typeof_fusion: TypeofFusion,
     /// locals holding one `undefined`/`null`/boolean constant (see tag_consts_for)
     tag_consts: BTreeMap<u32, &'static str>,
@@ -9249,7 +9249,7 @@ fn emit_i64_function(
     i64_fast: &BTreeMap<u32, I64FuncInfo>,
     f64_fast: &BTreeMap<u32, F64FuncInfo>,
     direct_sigs: &BTreeMap<u32, DirectSig>,
-    known_methods: &BTreeMap<u32, u32>,
+    known_methods: &KnownCallees,
     static_strings: &BTreeMap<Vec<u16>, usize>,
     string_metric_plan: Option<&FunctionMetricPlan>,
     string_materialization_plan: Option<&FunctionMaterializationPlan>,
@@ -9496,7 +9496,7 @@ fn emit_f64_function(
     i64_fast: &BTreeMap<u32, I64FuncInfo>,
     f64_fast: &BTreeMap<u32, F64FuncInfo>,
     direct_sigs: &BTreeMap<u32, DirectSig>,
-    known_methods: &BTreeMap<u32, u32>,
+    known_methods: &KnownCallees,
     static_strings: &BTreeMap<Vec<u16>, usize>,
     string_metric_plan: Option<&FunctionMetricPlan>,
     string_materialization_plan: Option<&FunctionMaterializationPlan>,
@@ -9744,7 +9744,7 @@ fn emit_function(
     i64_fast: &BTreeMap<u32, I64FuncInfo>,
     f64_fast: &BTreeMap<u32, F64FuncInfo>,
     direct_sigs: &BTreeMap<u32, DirectSig>,
-    known_methods: &BTreeMap<u32, u32>,
+    known_methods: &KnownCallees,
     static_strings: &BTreeMap<Vec<u16>, usize>,
     string_metric_plan: Option<&FunctionMetricPlan>,
     string_materialization_plan: Option<&FunctionMaterializationPlan>,
@@ -10924,145 +10924,203 @@ fn known_method_enabled() -> bool {
     })
 }
 
-/// Field keys under which the program stores exactly one closure function
-/// (every `StoreField` of the key stores a single-definition `AllocClosure`
-/// local of that function), mapped to the function. A guess for the dynamic
-/// method call sites, verified at run time by the closure's code pointer
-/// (see the call emission); any other store poisons the key.
-fn known_method_closures(program: &Program) -> BTreeMap<u32, u32> {
-    let mut out: BTreeMap<u32, u32> = BTreeMap::new();
+/// The callees a dynamic method call site may guess (docs/pic_sized_inline_design.md, "The
+/// known callees of a dynamic call"): by field key, the functions the program stores under the
+/// key (a closure, or a function value loaded from a module binding's cell that holds one
+/// closure, through copies). A site compares the method value's code pointer with each
+/// candidate's and takes the direct entry (a closure's cells from the function cell, the
+/// receiver as `this`); a value matching none takes the runtime's call. The guess is verified
+/// at run time, so completeness only sets the hit rate; a key with more than KNOWN_CALLEE_MAX
+/// candidates is megamorphic and gets none. The classes' methods of the name are not guessed:
+/// `ts_call_method_inline` already enters an environment-free method's generic entry directly,
+/// and a direct call let the C compiler inline hono's PatternRouter.match into the driver's
+/// loop, 8% slower.
+#[derive(Default)]
+struct KnownCallees {
+    by_field: BTreeMap<u32, Vec<u32>>,
+}
+const KNOWN_CALLEE_MAX: usize = 4;
+
+fn known_method_candidates(program: &Program) -> KnownCallees {
+    let mut out = KnownCallees::default();
     if !known_method_enabled() || !prop_pic_enabled() {
         return out;
     }
-    // Some(func): exactly one closure function so far; None: poisoned
-    let mut stored: BTreeMap<u32, Option<u32>> = BTreeMap::new();
+    // the fields written with exactly one closure and nothing else, program-wide: a module
+    // binding's cell holding a function declaration's value (`__module_init` stores it once)
+    let mut single: BTreeMap<u32, Option<u32>> = BTreeMap::new();
+    let mut per_fn: Vec<(Vec<&Inst>, BTreeMap<u32, u32>, BTreeMap<u32, &Inst>)> = Vec::new();
     for f in &program.functions {
         let mut flat: Vec<&Inst> = Vec::new();
         flatten_inst(&f.body, &mut flat);
         let mut ndefs: BTreeMap<u32, u32> = BTreeMap::new();
-        let mut closure_of: BTreeMap<u32, u32> = BTreeMap::new();
+        let mut def_of: BTreeMap<u32, &Inst> = BTreeMap::new();
         for inst in &flat {
             if let Some(d) = inst_def(inst) {
                 *ndefs.entry(d).or_insert(0) += 1;
+                def_of.insert(d, inst);
             }
-            if let Inst::AllocClosure { dst, func, .. } = inst {
-                closure_of.insert(dst.0, func.0);
-            }
+        }
+        for prm in &f.params {
+            ndefs.insert(prm.0, 2); // defined from outside
         }
         for inst in &flat {
             if let Inst::StoreField { field, src, .. } = inst {
-                let k = match closure_of.get(&src.0) {
-                    Some(fid) if ndefs.get(&src.0) == Some(&1) => Some(*fid),
+                let k = match def_of.get(&src.0) {
+                    Some(Inst::AllocClosure { func, .. }) if ndefs.get(&src.0) == Some(&1) => Some(func.0),
                     _ => None,
                 };
-                match stored.get(&field.0) {
+                match single.get(&field.0) {
                     None => {
-                        stored.insert(field.0, k);
+                        single.insert(field.0, k);
                     }
                     Some(prev) => {
                         if *prev != k {
-                            stored.insert(field.0, None);
+                            single.insert(field.0, None);
+                        }
+                    }
+                }
+            }
+        }
+        per_fn.push((flat, ndefs, def_of));
+    }
+    fn resolve(local: u32, ndefs: &BTreeMap<u32, u32>, def_of: &BTreeMap<u32, &Inst>, single: &BTreeMap<u32, Option<u32>>, depth: u32) -> Option<u32> {
+        if depth > 8 || ndefs.get(&local) != Some(&1) {
+            return None;
+        }
+        match def_of.get(&local) {
+            Some(Inst::AllocClosure { func, .. }) => Some(func.0),
+            Some(Inst::LoadField { field, .. }) => single.get(&field.0).copied().flatten(),
+            Some(Inst::Copy { src, .. }) => resolve(src.0, ndefs, def_of, single, depth + 1),
+            _ => None,
+        }
+    }
+    let mut over: BTreeSet<u32> = BTreeSet::new();
+    for (flat, ndefs, def_of) in &per_fn {
+        for inst in flat {
+            if let Inst::StoreField { field, src, .. } = inst {
+                if let Some(fid) = resolve(src.0, ndefs, def_of, &single, 0) {
+                    let v = out.by_field.entry(field.0).or_default();
+                    if !v.contains(&fid) {
+                        v.push(fid);
+                        if v.len() > KNOWN_CALLEE_MAX {
+                            over.insert(field.0);
                         }
                     }
                 }
             }
         }
     }
-    for (field, k) in stored {
-        if let Some(k) = k {
-            out.insert(field, k);
+    for k in over {
+        out.by_field.remove(&k);
+    }
+    if std::env::var("TSAOT_KNOWN_CALLEE_DEBUG").is_ok() {
+        for (k, v) in &out.by_field {
+            eprintln!("[known-callee] field {} -> {:?}", k, v);
         }
     }
     out
 }
 
-/// A dynamic method call whose key is one known closure program-wide: the
-/// own-property lookup as today, then the guess verified by the closure's
-/// code pointer and taken through the function's direct entry with the
-/// closure's cells; the prototype lookup and `ts_call_method` otherwise.
-/// `argv` is [receiver, args...] (already copied into `_a`). Returns false
-/// when the site is left to the generic emission.
-fn emit_known_method_call(
+/// The guards of a dynamic method call's known callees (known_method_candidates), with `_mv`
+/// fetched and callable: each candidate's code pointer against the function cell's, and on a
+/// match the direct entry with the closure's cells and the arguments; a value matching none
+/// takes `generic` (the runtime's call). Returns false, emitting nothing, when the site has no
+/// usable candidate (the caller emits the generic call). `argv` is [receiver, args...] (already
+/// copied into `_a`).
+fn emit_known_callee_guards(
     s: &mut String,
     ctx: &Ctx,
     method_id: u32,
     method_field: u32,
     argv: &[u32],
     dst: &Option<LocalId>,
+    generic: &str,
 ) -> bool {
-    let Some(&k) = ctx.known_methods.get(&method_field) else { return false };
-    let Some(sig) = ctx.direct_sigs.get(&k) else { return false };
     if argv.is_empty() {
         return false;
     }
-    let ncap = callee_capture_count(k);
-    let takes_this = *ctx.fn_takes_this.get(&k).unwrap_or(&false);
-    let lead = ncap + usize::from(takes_this);
-    if sig.kinds.len() < lead || sig.kinds[..lead].iter().any(|kd| !matches!(kd, ParamKind::Boxed)) {
+    let _ = method_id;
+    let Some(cands) = ctx.known_methods.by_field.get(&method_field) else { return false };
+    if cands.is_empty() || cands.len() > KNOWN_CALLEE_MAX {
         return false;
     }
-    let mut parts: Vec<String> = (0..ncap).map(|i| format!("_kf->env[{}]", i)).collect();
-    if takes_this {
-        parts.push(ctx.val(argv[0]));
-    }
-    for (i, kind) in sig.kinds.iter().enumerate().skip(lead) {
-        let a = argv.get(1 + i - lead);
-        parts.push(match a {
-            Some(a) => match kind {
-                ParamKind::Boxed => ctx.val(*a),
-                ParamKind::F64 => ctx.num(*a),
-                ParamKind::I64 => {
-                    if ctx.int_local.contains(a) {
-                        format!("d{}", a)
-                    } else {
-                        format!("(long long)({})", ctx.num(*a))
-                    }
-                }
-            },
-            None => match kind {
-                ParamKind::Boxed => "TS_UNDEFINED".to_string(),
-                ParamKind::F64 => "0.0".to_string(),
-                ParamKind::I64 => "0".to_string(),
-            },
-        });
-    }
-    let fname = ctx.fn_name_of(k);
-    let _ = writeln!(s, "    ts_check_method_recv(_a[0], {}u);", method_field);
-    s.push_str("    static ts_prop_ic _ts_method_field_ic = TS_PROP_IC_INIT;
-");
-    s.push_str("    static ts_prop_ic _ts_method_proto_ic = TS_PROP_IC_INIT;
-");
-    let _ = writeln!(
-        s,
-        "    tsv _mv = ts_get_pic_checked_inline(_a[0], {}u, &_ts_method_field_ic);",
-        method_field
-    );
-    let _ = writeln!(
-        s,
-        "    if (ts_is_func(_mv) && ((ts_func*)ts_ptr(_mv))->code == (void*){}) {{",
-        fname
-    );
-    s.push_str("      ts_func* _kf = (ts_func*)ts_ptr(_mv); (void)_kf;
-");
-    let direct = format!("{}_d({})", fname, parts.join(", "));
-    s.push_str(&ctx.set_call_result(dst, &direct, sig.ret));
-    s.push_str("    } else {
-");
-    let _ = writeln!(
-        s,
-        "      if (!ts_is_callable(_mv)) _mv = ts_get_pic_checked_inline(_a[0], {}, &_ts_method_proto_ic);",
-        method_key_str(method_id, ctx.wksym)
-    );
-    let _ = writeln!(s, "      if (!ts_is_callable(_mv)) ts_dynamic_method_missing({}u);", method_field);
-    let generic = format!("{}(_mv, _a, {})", call_method_fn(), argv.len());
-    match dst {
-        Some(d) => s.push_str(&ctx.set_val(d.0, &generic)),
-        None => {
-            let _ = writeln!(s, "      {};", generic);
+    let cands: Vec<u32> = cands.clone();
+    // (symbol, the direct call with the cells from `cells` and `this_expr` as this)
+    let arm = |k: u32, cells: &str, this_expr: &str| -> Option<(String, String)> {
+        let sig = ctx.direct_sigs.get(&k)?;
+        let ncap = callee_capture_count(k);
+        let takes_this = *ctx.fn_takes_this.get(&k).unwrap_or(&false);
+        let lead = ncap + usize::from(takes_this);
+        if sig.kinds.len() < lead || sig.kinds[..lead].iter().any(|kd| !matches!(kd, ParamKind::Boxed)) {
+            return None;
         }
+        let mut parts: Vec<String> = (0..ncap).map(|i| format!("{}[{}]", cells, i)).collect();
+        if takes_this {
+            parts.push(this_expr.to_string());
+        }
+        for (i, kind) in sig.kinds.iter().enumerate().skip(lead) {
+            let a = argv.get(1 + i - lead);
+            parts.push(match a {
+                Some(a) => match kind {
+                    ParamKind::Boxed => ctx.val(*a),
+                    ParamKind::F64 => ctx.num(*a),
+                    ParamKind::I64 => {
+                        if ctx.int_local.contains(a) {
+                            format!("d{}", a)
+                        } else {
+                            format!("(long long)({})", ctx.num(*a))
+                        }
+                    }
+                },
+                None => match kind {
+                    ParamKind::Boxed => "TS_UNDEFINED".to_string(),
+                    ParamKind::F64 => "0.0".to_string(),
+                    ParamKind::I64 => "0".to_string(),
+                },
+            });
+        }
+        let fname = ctx.fn_name_of(k);
+        let direct = format!("{}_d({})", fname, parts.join(", "));
+        Some((fname, ctx.set_call_result(dst, &direct, sig.ret)))
+    };
+    let recv_expr = ctx.val(argv[0]);
+    let arms: Vec<(String, String)> = cands.iter().filter_map(|k| arm(*k, "_kf->env", &recv_expr)).collect();
+    if arms.is_empty() {
+        return false;
     }
-    s.push_str("    }
-");
+    // the same candidates behind a bound function with no partial arguments (SmartRouter's
+    // `router.match.bind(router)`): the target's cells, the bound this
+    let bound: Vec<(String, String)> = cands.iter().filter_map(|k| arm(*k, "_kb->env", "_kf->env[1]")).collect();
+    let fallback = |s: &mut String, indent: &str| {
+        match dst {
+            Some(d) => s.push_str(&ctx.set_val(d.0, generic)),
+            None => {
+                let _ = writeln!(s, "{}{};", indent, generic);
+            }
+        }
+    };
+    s.push_str("    { ts_func* _kf = (ts_func*)ts_ptr(_mv); void* _kc = (void*)_kf->code; (void)_kf;\n");
+    for (i, (fname, body)) in arms.iter().enumerate() {
+        let _ = writeln!(s, "      {}if (_kc == (void*){}) {{", if i == 0 { "" } else { "else " }, fname);
+        s.push_str(body);
+        s.push_str("      }\n");
+    }
+    if !bound.is_empty() {
+        s.push_str("      else if (_kc == (void*)ts_bound_thunk && _kf->envlen == 2u && ts_is_func(_kf->env[0])) {\n");
+        s.push_str("        ts_func* _kb = (ts_func*)ts_ptr(_kf->env[0]); void* _kbc = (void*)_kb->code; (void)_kb;\n");
+        for (i, (fname, body)) in bound.iter().enumerate() {
+            let _ = writeln!(s, "        {}if (_kbc == (void*){}) {{", if i == 0 { "" } else { "else " }, fname);
+            s.push_str(body);
+            s.push_str("        }\n");
+        }
+        s.push_str("        else {\n");
+        fallback(s, "        ");
+        s.push_str("        }\n      }\n");
+    }
+    s.push_str("      else {\n");
+    fallback(s, "      ");
+    s.push_str("      }\n    }\n");
     true
 }
 
@@ -25455,17 +25513,6 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     }
                 }
             }
-            if let CalleeRef::Method {
-                method,
-                method_field: Some(mf),
-                ..
-            } = callee
-            {
-                if recv.is_some() && emit_known_method_call(s, ctx, method.0, mf.0, argv, dst) {
-                    s.push_str("  }\n");
-                    return;
-                }
-            }
             if let CalleeRef::Value { local } = callee {
                 if recv.is_none() && value_call_fast_enabled() {
                     // A call through a function value: the common closure (no
@@ -25580,7 +25627,13 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                             ctx.wksym,
                         ),
                     }
-                    format!("{}(_mv, _a, {})", call_method_fn(), argv.len())
+                    // the site's known callees: the guards and the direct entries, the
+                    // runtime's call for any other value (emit_known_callee_guards)
+                    let generic = format!("{}(_mv, _a, {})", call_method_fn(), argv.len());
+                    match method_field {
+                        Some(mf) if recv.is_some() && emit_known_callee_guards(s, ctx, method.0, mf.0, argv, dst, &generic) => String::new(),
+                        _ => generic,
+                    }
                 }
                 // A Value callee WITH a receiver (recv present) is a member call
                 // `o[k](...)`: _a[0] is the base object, bind it as `this` via
@@ -25596,10 +25649,13 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 // No method name available (truly unknown callee): still a gap.
                 CalleeRef::Unknown => "ts_dynamic_method_unsupported()".to_string(),
             };
-            match dst {
-                Some(d) => s.push_str(&ctx.set_val(d.0, &call)),
-                None => {
-                    let _ = writeln!(s, "    {};", call);
+            // an empty call: the guards above emitted the call and its fallback
+            if !call.is_empty() {
+                match dst {
+                    Some(d) => s.push_str(&ctx.set_val(d.0, &call)),
+                    None => {
+                        let _ = writeln!(s, "    {};", call);
+                    }
                 }
             }
             s.push_str("  }\n");

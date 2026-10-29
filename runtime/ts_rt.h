@@ -1489,6 +1489,10 @@ void ts_headers_proto_register(ts_key method_key, const char* name, ts_code fn);
 tsv  ts_function_proto(void);
 void ts_function_proto_init(void);
 void ts_function_proto_register(ts_key method_key, const char* name, ts_code fn);
+/* The thunk behind a bound function (ts_rt.c ts_funcproto_bind): its cell's env is [target,
+   thisArg, partial...]; a dynamic call site's known-callee guard recognizes it and, with no
+   partial arguments, calls the target's direct entry with the bound this (emit_c.rs). */
+tsv  ts_bound_thunk(tsv* args, int n);
 tsv  ts_make_fn_t(ts_code code, tsv* env, uint32_t envlen, int takes_this);
 tsv  ts_make_fn_t_pretenured(ts_code code, tsv* env, uint32_t envlen, int takes_this);
 tsv ts_funcproto_call(tsv* args, int n);
