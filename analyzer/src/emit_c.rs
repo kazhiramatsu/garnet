@@ -14386,7 +14386,7 @@ fn fnval_adapter_body(builtin: &str) -> Option<String> {
             val(0), val(0)
         )),
         "global.Object" => Some("if(n==0 || a[0]==TS_UNDEFINED || a[0]==TS_NULL) return ts_new_object(); return a[0];".to_string()),
-        "global.Promise" => Some("if(n>0) return ts_promise_new_executor(a[0]); ts_unsupported_builtin(\"Promise constructor requires executor\"); return TS_UNDEFINED;".to_string()),
+        "global.Promise" => Some("return ts_promise_new_executor(n>0 ? a[0] : TS_UNDEFINED);".to_string()),
         "global.Map" => Some("ts_unsupported_builtin(\"Map constructor called without supported new lowering\"); return TS_UNDEFINED;".to_string()),
         "global.Set" => Some("ts_unsupported_builtin(\"Set constructor called without supported new lowering\"); return TS_UNDEFINED;".to_string()),
         "global.WeakMap" => Some("ts_unsupported_builtin(\"WeakMap constructor called without supported new lowering\"); return TS_UNDEFINED;".to_string()),

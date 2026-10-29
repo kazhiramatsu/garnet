@@ -12038,3 +12038,33 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
      (224 bytes) plus a result promise nobody reads (96 bytes), besides its own output promise:
      about 440 bytes a `then`.
   9. A promise's first waiter mallocs a four-entry array (most promises have one waiter).
+- The nine candidates fixed (Kaz: 「9件の修正候補を全て完成させよ」), each checked by the review's
+  programs under Node and garnet, again with a young collection at every allocation:
+  1. finally: onFinally's result becomes `PromiseResolve(r).then(valueThunk | thrower)`, a promise the
+     derived promise adopts, so the continuation runs two jobs after the cleanup on every path
+     (`closures/promise_finally_ticks`).
+  2. queueMicrotask: lib/node/timers.ts validates the callback (Node's ERR_INVALID_ARG_TYPE) and the
+     host queues a job of its own (`ts_queue_microtask`) that calls it with no handler, so a throw is
+     an uncaught exception that ends the program before the next job (`closures/queue_microtask`, the
+     gate below). The Node prelude installs it from the timers part.
+  3. `new Promise(nonCallable)`, and the constructor as a value with no executor (an
+     unsupported-builtin abort), throw V8's TypeError at once: "Promise resolver #<Foo> is not a
+     function", the value in V8's text.
+  4. The method values on another receiver: then is "Method Promise.prototype.then called on
+     incompatible receiver ...", catch invokes the receiver's then (a thenable's runs), finally on a
+     primitive is "Promise.prototype.finally called on non-object" (on a thenable that is not a
+     promise, a loud garnet TypeError); a call site typed Promise whose receiver is not one calls the
+     receiver's own method (`closures/promise_receivers`).
+  5. The unhandled-rejection report names an Error by its string ("TypeError: the reason").
+  6. An uncaught exception exits with status 1 (a forked worker with `_exit`), as Node's does;
+     abort() gave 134 and a crash report.
+  7. The unhandled-rejection list keeps each promise's slot: add and remove in constant time (40,000
+     handled together 366 -> 8 ms, Node 22).
+  8. The runtime's eleven adapters (then, finally, an adoption, a thenable job, the combinators'
+     elements, an async generator's return wait) are allocated without the result promise nobody read.
+  9. A promise's first waiter is in the cell (104 bytes, was 96 and a malloc'd four-entry array).
+  `tests/microtask_queue_gate.sh` gains the ends a fixture cannot compare: a throwing queueMicrotask
+  callback (status 1, the next job never runs), the rejection report's text, 300,000 rejections
+  handled together within 10 s.
+- Gates: the full gate set green: unit, bundler 53/53, conformance plain and strict 695/695, protect and units 692/692, bench (every benchmark correct and within its budget), the GC suite incl. ASan and GC stress, the `ci` gate with the extended microtask gate, the fetch run gate, the regexp engine diff 43,593 cases 0 differ; the ir-parity snapshot refreshed (243 programs' IR changed by the prelude alone: queueMicrotask's arrow left the base prelude, which renumbers the functions after it; a comparison of one with the numbers normalized finds the arrow and the prelude's one assignment the only change). tsc-ts r16 -> r17 instructions 0.9999 (21.951 G -> 21.949 G), cycles 0.989, wall 0.983; vue medians of 7: 1077.7 -> 1068.6 ms; hono routers medians of 5: TrieRouter 247.7 -> 250.9, RegExpRouter 65.0 -> 64.4, PatternRouter 241.8 -> 240.3, SmartRouter 73.0 -> 73.4 ms; hono_app
+  garnet 181.5 ms, Node 158.8 (medians of 3); interleaved medians of 9 against the leak fix's build 181.8 -> 180.8 ms, instructions 4.482 G -> 4.468 G.

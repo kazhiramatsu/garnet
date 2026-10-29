@@ -19457,6 +19457,7 @@ static void ts_eh_pop_until(ts_handler* target){
   while (g_handlers && g_handlers != target) ts_eh_pop();
   if (g_handlers == target) ts_eh_pop();
 }
+static int g_is_worker;   /* defined with the workers (a forked child) */
 void ts_throw(tsv v){
   if (!g_handlers){
     fflush(stdout);
@@ -19465,7 +19466,10 @@ void ts_throw(tsv v){
     fprintf(stderr, "tsaot: Uncaught exception: %.*s\n", (int)n, u);
     free(u);
     fflush(stderr);
-    abort();
+    /* Node's status for an uncaught exception (abort() made it 134 and a crash report); a forked
+       worker leaves as its normal end does, without the parent's exit handlers */
+    if (g_is_worker) _exit(1);
+    exit(1);
   }
   g_exception = v;
   ts_handler* h = g_handlers;        /* longjmp target; catch-side pops it */
@@ -19489,8 +19493,8 @@ static void promise_init(ts_promise* p){
      obj_map; a fresh cell's map fields are zero, as a plain object's and an array's are) */
   p->o.proto = ts_proto_ref(g_promise_proto_v) ? g_promise_proto_v : TS_NULL;
   p->o.shape = TS_SHAPE_EMPTY;
-  p->state=0; p->value=TS_UNDEFINED; p->waiters=NULL; p->nwait=0; p->capwait=0;
-  p->comb_remaining=0; p->comb_results=TS_UNDEFINED;
+  p->state=0; p->value=TS_UNDEFINED; p->waiter0=TS_UNDEFINED; p->waiters=NULL; p->nwait=0; p->capwait=0;
+  p->comb_remaining=0; p->comb_results=TS_UNDEFINED; p->unhandled_slot=0;
 }
 tsv ts_promise_new_v(void){
   ts_promise* p=(ts_promise*)gc_alloc(sizeof(ts_promise), TS_KIND_PROMISE);
@@ -19536,18 +19540,25 @@ static int promise_state_value_v(tsv pv, tsv* out);
 static tsv* g_unhandled = NULL;
 static int g_unhandled_len = 0, g_unhandled_cap = 0;
 static void unhandled_add(tsv pv){
-  for (int i = 0; i < g_unhandled_len; i++) if (g_unhandled[i] == pv) return;
+  ts_promise* p = ts_promise_ptr(pv);
+  if (!p || p->unhandled_slot) return;
   if (g_unhandled_len == g_unhandled_cap){
     g_unhandled_cap = g_unhandled_cap ? g_unhandled_cap * 2 : 8;
     g_unhandled = (tsv*)realloc(g_unhandled, sizeof(tsv) * (size_t)g_unhandled_cap);
     if (!g_unhandled) ts_abort_msg("out of memory recording a rejection");
   }
   g_unhandled[g_unhandled_len++] = pv;
+  p->unhandled_slot = g_unhandled_len;
 }
+/* constant time: the promise's slot, the last entry moved into it (40,000 outstanding rejections
+   handled together took 366 ms with the scans, Node 30) */
 static void unhandled_remove(tsv pv){
-  for (int i = 0; i < g_unhandled_len; i++){
-    if (g_unhandled[i] == pv){ g_unhandled[i] = g_unhandled[--g_unhandled_len]; return; }
-  }
+  ts_promise* p = ts_promise_ptr(pv);
+  if (!p || !p->unhandled_slot) return;
+  int i = p->unhandled_slot - 1;
+  p->unhandled_slot = 0;
+  tsv last = g_unhandled[--g_unhandled_len];
+  if (i < g_unhandled_len){ g_unhandled[i] = last; ts_promise_ptr(last)->unhandled_slot = i + 1; }
 }
 static void unhandled_report(void){
   if (g_unhandled_len == 0) return;
@@ -19556,9 +19567,16 @@ static void unhandled_report(void){
   (void)promise_state_value_v(pv, &value);
   fflush(stdout);
   fputs("tsaot: Unhandled promise rejection: ", stderr);
-  int color = g_inspect_color; g_inspect_color = 0;
-  ts_print_to(stderr, value);   /* the value as console.log shows it (an Error with its message) */
-  g_inspect_color = color;
+  if (objproto_tostring_is_error(value)){   /* "TypeError: message", as an uncaught exception prints (inspect printed "TypeError {}") */
+    tsv text = ts_to_string_v(value);
+    uint32_t n = 0; char* u = ts_string_cstr_copy(text, &n);
+    fwrite(u, 1, n, stderr);
+    free(u);
+  } else {
+    int color = g_inspect_color; g_inspect_color = 0;
+    ts_print_to(stderr, value);   /* any other value as console.log shows it */
+    g_inspect_color = color;
+  }
   fputc('\n', stderr);
   fflush(stderr);
   exit(1);
@@ -19576,14 +19594,16 @@ static int promise_begin_settle_v(tsv pv, tsv v, int rejected, int* nwait){
 static tsv promise_take_waiter_v(tsv pv, int idx){
   ts_promise* p = ts_promise_ptr(pv);
   if (!p || idx < 0 || idx >= p->nwait) return TS_UNDEFINED;
-  tsv cv = p->waiters[idx];
-  p->waiters[idx] = TS_UNDEFINED;
+  if (idx == 0){ tsv cv = p->waiter0; p->waiter0 = TS_UNDEFINED; return cv; }
+  tsv cv = p->waiters[idx - 1];
+  p->waiters[idx - 1] = TS_UNDEFINED;
   return cv;
 }
 static void promise_finish_waiter_drain_v(tsv pv){
   ts_promise* p = ts_promise_ptr(pv);
   if (!p) return;
   tsv* waiters = p->waiters;
+  p->waiter0 = TS_UNDEFINED;
   p->waiters = NULL;
   p->nwait = 0;
   p->capwait = 0;
@@ -19665,7 +19685,8 @@ static void promise_add_waiter_v(tsv pv, tsv cv){
   ts_gc_root(&pv); ts_gc_root(&cv);
   ts_promise* p = ts_promise_ptr(pv);
   if (!p || p->state != 0 || !ts_is_coro_value(cv)){ ts_gc_unroot(2); return; }
-  if (p->nwait==p->capwait){
+  if (p->nwait == 0){ p->waiter0 = cv; p->nwait = 1; ts_write_barrier(pv, cv); ts_gc_unroot(2); return; }
+  if (p->nwait - 1 == p->capwait){
     int newcap = p->capwait ? p->capwait*2 : 4;
     tsv* waiters = realloc(p->waiters, sizeof(tsv)*newcap);
     if (!waiters) ts_abort_msg("out of memory growing promise waiters");
@@ -19674,7 +19695,8 @@ static void promise_add_waiter_v(tsv pv, tsv cv){
     p->waiters = waiters;
     p->capwait = newcap;
   }
-  p->waiters[p->nwait++]=cv;
+  p->waiters[p->nwait - 1] = cv;
+  p->nwait++;
   ts_write_barrier(pv, cv);
   ts_gc_unroot(2);
 }
@@ -19694,6 +19716,8 @@ void ts_promise_settle_v(tsv pv, tsv v, int rejected){
   promise_finish_waiter_drain_v(pv);
   ts_gc_unroot(2);
 }
+/* the runtime's adapter coroutines (defined with coro_alloc below): no result promise of their own */
+static tsv ts_coro_alloc_adapter_v(size_t size, tsv (*resume)(tsv));
 /* Promise adoption adapter: when a promise is resolved WITH another promise, an
    adapter coro is registered on the inner promise; it fires as a microtask when
    inner settles and forwards the state to the outer promise `out_v`. This gives
@@ -19793,7 +19817,7 @@ void ts_promise_resolve_v(tsv pv, tsv v){
        eventual state. This preserves ordering when the inner settles between
        resolve(inner) and the first microtask checkpoint. */
     ts_gc_root(&pv); ts_gc_root(&v);
-    tsv wv = ts_coro_alloc_v(sizeof(ts_adopt), adopt_resume);
+    tsv wv = ts_coro_alloc_adapter_v(sizeof(ts_adopt),adopt_resume);
     ts_gc_root(&wv);
     ts_adopt* w=(ts_adopt*)ts_ptr(wv);
     w->out_v=pv; w->inner_v=v; w->registered=0;
@@ -19817,7 +19841,7 @@ void ts_promise_resolve_v(tsv pv, tsv v){
       return;
     }
     if (ts_is_callable(then_fn)){
-      tsv wv=ts_coro_alloc_v(sizeof(ts_thenable_job),thenable_job_resume);
+      tsv wv=ts_coro_alloc_adapter_v(sizeof(ts_thenable_job),thenable_job_resume);
       ts_gc_root(&wv);
       ts_thenable_job* w=(ts_thenable_job*)ts_ptr(wv);
       w->out_v=pv; w->thenable=v; w->then_fn=then_fn;
@@ -19947,7 +19971,7 @@ tsv ts_promise_all(tsv arr){
   if (n==0){ ts_promise_resolve_v(outv, results); ts_gc_unroot(4); return outv; }
   for (uint32_t i=0;i<n;i++){
     tsv input = ts_array_get(arrv, i);
-    tsv wv = ts_coro_alloc_v(sizeof(ts_comb), comb_all_resume);
+    tsv wv = ts_coro_alloc_adapter_v(sizeof(ts_comb),comb_all_resume);
     ts_gc_root(&wv);
     ts_comb* w = (ts_comb*)ts_ptr(wv);
     w->out_v = outv; ts_write_barrier(wv, outv); w->idx = (double)i;
@@ -19969,7 +19993,7 @@ tsv ts_promise_race(tsv arr){
   uint32_t n = ts_array_len(arrv);
   for (uint32_t i=0;i<n;i++){           /* empty array -> stays pending forever (spec) */
     tsv input = ts_array_get(arrv, i);
-    tsv wv = ts_coro_alloc_v(sizeof(ts_comb), comb_race_resume);
+    tsv wv = ts_coro_alloc_adapter_v(sizeof(ts_comb),comb_race_resume);
     ts_gc_root(&wv);
     ts_comb* w = (ts_comb*)ts_ptr(wv);
     w->out_v = outv; ts_write_barrier(wv, outv); w->idx = (double)i;
@@ -20047,13 +20071,18 @@ static tsv finally_resume(tsv cv){
     int threw; tsv r = ts_call_catching(cb, NULL, 0, &threw);
     if (threw){ ts_promise_reject_v(outv, r); ts_gc_unroot(3); return TS_UNDEFINED; }
     ts_gc_root(&r);
-    tsv av=ts_coro_alloc_v(sizeof(ts_finally_after),finally_after_resume);
+    /* thenFinally / catchFinally return PromiseResolve(r).then(valueThunk | thrower): p2 below,
+       which the derived promise adopts (two jobs after this one, as V8 orders them) */
+    tsv p2=ts_promise_new_v();
+    ts_gc_root(&p2);
+    tsv av=ts_coro_alloc_adapter_v(sizeof(ts_finally_after),finally_after_resume);
     ts_gc_root(&av);
     ts_finally_after* a=(ts_finally_after*)ts_ptr(av);
-    a->out_v=outv; a->original=result; a->original_rejected=rejected;
-    ts_write_barrier(av,outv); ts_write_barrier(av,result);
+    a->out_v=p2; a->original=result; a->original_rejected=rejected;
+    ts_write_barrier(av,p2); ts_write_barrier(av,result);
     ts_await_register_v(r,av);
-    ts_gc_unroot(2);
+    ts_promise_resolve_v(outv,p2);
+    ts_gc_unroot(3);
     ts_gc_unroot(3);
     return TS_UNDEFINED;
   }
@@ -20061,11 +20090,37 @@ static tsv finally_resume(tsv cv){
   ts_gc_unroot(3);
   return TS_UNDEFINED;
 }
+/* V8's text for a value named in a promise TypeError: "123", "abc", "undefined", "null", "true",
+   "Symbol(s)", "[object Array]", "#<Object>", "#<Foo>" */
+static void promise_value_text(tsv v, char* out, size_t cap){
+  if (ts_is_symbol(v)){
+    tsv s = ts_symbol_tostring(v);
+    uint32_t n = 0; char* u = ts_string_cstr_copy(s, &n);
+    snprintf(out, cap, "%.*s", (int)n, u);
+    free(u);
+    return;
+  }
+  if (TS_TOP16(v) == TS_SEL_OBJECT && !ts_is_indexed_array_fast(v)){ snprintf(out, cap, "#<%s>", ts_obj_ctor_name_for_message(v)); return; }
+  ta_value_text(v, 0, out, cap);
+}
+static void promise_throw_with_value(const char* fmt, tsv v){
+  char txt[128], buf[256];
+  promise_value_text(v, txt, sizeof txt);
+  snprintf(buf, sizeof buf, fmt, txt);
+  ts_throw_type_error_msg(buf);
+}
+/* then / catch / finally at a call site typed Promise whose receiver is not one (a thenable, a
+   value through any): the receiver's own method, as JS calls it */
+static tsv promise_method_of_value(tsv recv, const char* name, tsv a0, tsv a1, int nargs){
+  tsv args[2] = { a0, a1 };
+  return ts_method_dynamic(recv, name, args, nargs);
+}
 tsv ts_promise_then(tsv pv, tsv on_f, tsv on_r){
+  if (TS_RT_UNLIKELY(!ts_is_promise(pv))) return promise_method_of_value(pv, "then", on_f, on_r, 2);
   ts_gc_root(&pv); ts_gc_root(&on_f); ts_gc_root(&on_r);
   tsv outv=ts_promise_new_v();
   ts_gc_root(&outv);
-  tsv wv=ts_coro_alloc_v(sizeof(ts_then), then_resume);
+  tsv wv=ts_coro_alloc_adapter_v(sizeof(ts_then),then_resume);
   ts_gc_root(&wv);
   ts_then* w=(ts_then*)ts_ptr(wv);
   w->out_v=outv; w->cb0=on_f; w->cb1=on_r;
@@ -20088,6 +20143,7 @@ static tsv ts_reject_thunk(tsv* a, int n){
   return TS_UNDEFINED;
 }
 tsv ts_promise_new_executor(tsv executor){
+  if (!ts_is_callable(executor)) promise_throw_with_value("Promise resolver %s is not a function", executor);
   ts_gc_root(&executor);
   tsv pv = ts_promise_new_v();
   ts_gc_root(&pv);
@@ -20100,12 +20156,16 @@ tsv ts_promise_new_executor(tsv executor){
   ts_gc_unroot(5);
   return pv;
 }
-tsv ts_promise_catch(tsv pv, tsv on_r){ return ts_promise_then(pv, TS_UNDEFINED, on_r); }
+tsv ts_promise_catch(tsv pv, tsv on_r){
+  if (TS_RT_UNLIKELY(!ts_is_promise(pv))) return promise_method_of_value(pv, "catch", on_r, TS_UNDEFINED, 1);
+  return ts_promise_then(pv, TS_UNDEFINED, on_r);
+}
 tsv ts_promise_finally(tsv pv, tsv on_fin){
+  if (TS_RT_UNLIKELY(!ts_is_promise(pv))) return promise_method_of_value(pv, "finally", on_fin, TS_UNDEFINED, 1);
   ts_gc_root(&pv); ts_gc_root(&on_fin);
   tsv outv=ts_promise_new_v();
   ts_gc_root(&outv);
-  tsv wv=ts_coro_alloc_v(sizeof(ts_then), finally_resume);
+  tsv wv=ts_coro_alloc_adapter_v(sizeof(ts_then),finally_resume);
   ts_gc_root(&wv);
   ts_then* w=(ts_then*)ts_ptr(wv);
   w->out_v=outv; w->cb0=on_fin; w->cb1=TS_UNDEFINED;
@@ -20115,6 +20175,26 @@ tsv ts_promise_finally(tsv pv, tsv on_fin){
   return outv;
 }
 
+/* queueMicrotask(cb) (lib/node/timers.ts through the host): a job of its own on the queue, the
+   callback called with no handler around it, so a throw is an uncaught exception that ends the
+   program before the next job runs, as Node's does. It had been Promise.resolve().then(cb): the
+   throw became a rejection, reported after the remaining jobs ran. */
+typedef struct { ts_coro c; tsv cb; } ts_qm_job;
+static tsv qm_job_resume(tsv cv){
+  tsv cb = ((ts_qm_job*)ts_ptr(cv))->cb;
+  ts_gc_root(&cb);
+  (void)ts_call_value(cb, NULL, 0);
+  ts_gc_unroot(1);
+  return TS_UNDEFINED;
+}
+static void ts_queue_microtask(tsv cb){
+  ts_gc_root(&cb);
+  tsv wv = ts_coro_alloc_adapter_v(sizeof(ts_qm_job), qm_job_resume);
+  ((ts_qm_job*)ts_ptr(wv))->cb = cb;
+  ts_write_barrier(wv, cb);
+  microq_push_v(wv);
+  ts_gc_unroot(1);
+}
 /* Promise.prototype.{then,catch,finally} as boxed methods (takes_this=1, so
    args[0] is the receiver promise). These back the first-class method VALUE
    (`const f = p.then` / `typeof p.then`); the common `p.then(cb)` call site uses
@@ -20122,16 +20202,34 @@ tsv ts_promise_finally(tsv pv, tsv on_fin){
    (or a non-Promise) receiver is a TypeError in JS; we no-op safely rather than
    crash (matches the permissive treatment of other detached method values). */
 tsv ts_promiseproto_then(tsv* a, int n){
-  if (n<1 || !ts_is_promise(a[0])) return TS_UNDEFINED;
-  return ts_promise_then(a[0], n>1?a[1]:TS_UNDEFINED, n>2?a[2]:TS_UNDEFINED);
+  tsv recv = n>0 ? a[0] : TS_UNDEFINED;
+  if (!ts_is_promise(recv)) promise_throw_with_value("Method Promise.prototype.then called on incompatible receiver %s", recv);
+  return ts_promise_then(recv, n>1?a[1]:TS_UNDEFINED, n>2?a[2]:TS_UNDEFINED);
 }
+/* catch is Invoke(this, "then", undefined, onRejected): another receiver's own then is called */
 tsv ts_promiseproto_catch(tsv* a, int n){
-  if (n<1 || !ts_is_promise(a[0])) return TS_UNDEFINED;
-  return ts_promise_catch(a[0], n>1?a[1]:TS_UNDEFINED);
+  tsv recv = n>0 ? a[0] : TS_UNDEFINED;
+  tsv on_r = n>1 ? a[1] : TS_UNDEFINED;
+  if (ts_is_promise(recv)) return ts_promise_catch(recv, on_r);
+  ts_gc_root(&recv); ts_gc_root(&on_r);
+  if (ts_is_undef(recv) || ts_is_null(recv)) ts_throw_cannot_read(recv, "then");
+  tsv thenv = ts_get(recv, ts_intern_field("then", 4));
+  if (!ts_is_callable(thenv)) promise_throw_with_value("%s is not a function", thenv);
+  ts_gc_root(&thenv);
+  tsv args[3] = { recv, TS_UNDEFINED, on_r };
+  tsv r = ts_call_method(thenv, args, 3);
+  ts_gc_unroot(3);
+  return r;
 }
 tsv ts_promiseproto_finally(tsv* a, int n){
-  if (n<1 || !ts_is_promise(a[0])) return TS_UNDEFINED;
-  return ts_promise_finally(a[0], n>1?a[1]:TS_UNDEFINED);
+  tsv recv = n>0 ? a[0] : TS_UNDEFINED;
+  if (!ts_is_promise(recv)){
+    if (!ts_object_like(recv) && !ts_is_func(recv)) ts_throw_type_error_msg("Promise.prototype.finally called on non-object");
+    tsv thenv = ts_get(recv, ts_intern_field("then", 4));
+    if (!ts_is_callable(thenv)) promise_throw_with_value("%s is not a function", thenv);
+    ts_throw_type_error_msg("garnet: Promise.prototype.finally on a thenable that is not a promise is not supported");
+  }
+  return ts_promise_finally(recv, n>1?a[1]:TS_UNDEFINED);
 }
 /* Shared Promise prototype (globals declared with the other g_*_proto near the
    top). Unlike array/object protos, NOTHING references this (a ts_promise carries
@@ -20205,7 +20303,7 @@ tsv ts_promise_allsettled(tsv arr){
   if (n==0){ ts_promise_resolve_v(outv, results); ts_gc_unroot(4); return outv; }
   for (uint32_t i=0;i<n;i++){
     tsv input = ts_array_get(arrv, i);
-    tsv wv = ts_coro_alloc_v(sizeof(ts_comb), comb_allsettled_resume);
+    tsv wv = ts_coro_alloc_adapter_v(sizeof(ts_comb),comb_allsettled_resume);
     ts_gc_root(&wv);
     ts_comb* w = (ts_comb*)ts_ptr(wv);
     w->out_v = outv; ts_write_barrier(wv, outv); w->idx = (double)i;
@@ -20237,7 +20335,7 @@ tsv ts_promise_any(tsv arr){
   }
   for (uint32_t i=0;i<n;i++){
     tsv input = ts_array_get(arrv, i);
-    tsv wv = ts_coro_alloc_v(sizeof(ts_comb), comb_any_resume);
+    tsv wv = ts_coro_alloc_adapter_v(sizeof(ts_comb),comb_any_resume);
     ts_gc_root(&wv);
     ts_comb* w = (ts_comb*)ts_ptr(wv);
     w->out_v = outv; ts_write_barrier(wv, outv); w->idx = (double)i;
@@ -20351,6 +20449,9 @@ static tsv coro_alloc(size_t size, tsv (*resume)(tsv), int nvals, int promise){
   return cv;
 }
 tsv ts_coro_alloc_v(size_t size, tsv (*resume)(tsv)){ return coro_alloc(size, resume, -1, 1); }
+/* an adapter of the runtime's own (then, finally, an adoption, a combinator's element): its resume
+   settles the promise it holds, so the frame needs no result promise (one was made and never read) */
+static tsv ts_coro_alloc_adapter_v(size_t size, tsv (*resume)(tsv)){ return coro_alloc(size, resume, -1, 0); }
 tsv ts_coro_alloc_vn(size_t size, tsv (*resume)(tsv), uint32_t nvals){
   return coro_alloc(size, resume, nvals > (uint32_t)INT32_MAX ? INT32_MAX : (int)nvals, 1);
 }
@@ -21478,7 +21579,8 @@ static void gc_scan_async_cell(ts_gc_header* h, int young, int depth){
     ts_promise* p=(ts_promise*)h;
     gc_visit_slot(&p->value, young, depth, stable);
     gc_visit_slot(&p->comb_results, young, depth, stable);
-    for (int i=0;i<p->nwait;i++) gc_visit_slot(&p->waiters[i], young, depth, stable);
+    gc_visit_slot(&p->waiter0, young, depth, stable);
+    for (int i=1;i<p->nwait;i++) gc_visit_slot(&p->waiters[i-1], young, depth, stable);
     gc_mark_common_props(&p->o, young, depth, stable);   /* its properties and prototype, as any object's */
     gc_visit_slot(&p->o.proto, young, depth, stable);
   } else if (h->kind==TS_KIND_CORO){
@@ -23037,7 +23139,7 @@ static void asyncgen_start_next_v(tsv cv){
          overtake it. */
       if (r->kind==2){
         c->ag_running=1;
-        tsv av=ts_coro_alloc_v(sizeof(ts_asyncgen_return_wait),asyncgen_return_wait_resume);
+        tsv av=ts_coro_alloc_adapter_v(sizeof(ts_asyncgen_return_wait),asyncgen_return_wait_resume);
         ts_gc_root(&av);
         ts_asyncgen_return_wait* w=(ts_asyncgen_return_wait*)ts_ptr(av);
         w->gen_v=cv; w->resume_generator=0; ts_write_barrier(av,cv);
@@ -23058,7 +23160,7 @@ static void asyncgen_start_next_v(tsv cv){
          allowing user catch/finally code to observe the rejection. */
       c->ag_running=1;
       c->gen_status=TS_GEN_EXECUTING;
-      tsv av=ts_coro_alloc_v(sizeof(ts_asyncgen_return_wait),asyncgen_return_wait_resume);
+      tsv av=ts_coro_alloc_adapter_v(sizeof(ts_asyncgen_return_wait),asyncgen_return_wait_resume);
       ts_gc_root(&av);
       ts_asyncgen_return_wait* w=(ts_asyncgen_return_wait*)ts_ptr(av);
       w->gen_v=cv; w->resume_generator=1; ts_write_barrier(av,cv);

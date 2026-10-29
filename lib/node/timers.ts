@@ -64,3 +64,10 @@ export function clearImmediate(immediate: Immediate | undefined | null): void {
 }
 const timers = { setTimeout, setInterval, setImmediate, clearTimeout, clearInterval, clearImmediate, Timeout, Immediate };
 export default timers;
+
+/** queueMicrotask(callback), the global (the Node prelude installs it from here): the callback as a
+ *  microtask of its own, so a throw from it is an uncaught exception, as Node's is */
+export function queueMicrotask(callback: () => void): void {
+  if (typeof callback !== "function") throw invalidArgType("callback", "of type function", callback);
+  host.queueMicrotask(callback);
+}

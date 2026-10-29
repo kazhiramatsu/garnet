@@ -101,6 +101,8 @@ export interface GarnetNodeHost {
   immediateRef(id: number, on: boolean): boolean;
   immediateHasRef(id: number): boolean;
   nextTick(callback: (...args: unknown[]) => void, args: unknown[] | undefined): void;
+  /** a microtask of its own: a throw from the callback is an uncaught exception */
+  queueMicrotask(callback: () => void): void;
   /** node:worker_threads over the fork workers (docs/node_compat_design.md, N5b): whether this
    *  process is a worker, its id (0 in the main thread), and its workerData. */
   isWorker(): boolean;

@@ -155,6 +155,9 @@ Rust in §315; selfhost is kept as a performance metric).
   compile-time reject (Session 358). `new X()` of a constructor the environment declares but the runtime lacks
   (ReadableStream, CustomEvent, WebSocket) is a ReferenceError where it is reached (Node without the
   global throws there too); `console.trace` as a value is the error writer (no stack).
+- `Promise.prototype.finally` called on a thenable that is not a promise is a garnet TypeError (V8
+  builds its thenFinally / catchFinally for any receiver); then and catch on other receivers follow V8
+  (Session 358).
 - `o.__proto__` and `o["__proto__"]` read undefined (V8: the prototype through the accessor);
   `Object.getPrototypeOf` / `setPrototypeOf` are the modelled forms (Session 355 note).
 - A typed receiver that is a Proxy (vue's reactive arrays and collections) takes its methods through

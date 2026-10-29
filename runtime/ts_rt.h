@@ -3764,9 +3764,11 @@ typedef struct ts_promise {
                                 promisified exec's `.child`, hono's css helper) and has Promise.prototype */
   int state;                 /* 0 pending, 1 fulfilled, 2 rejected */
   tsv value;
-  tsv* waiters;
-  int nwait, capwait;
+  tsv waiter0;               /* the first waiter, in the cell (most promises have one) */
+  tsv* waiters;              /* the second and later: waiters[i - 1] is waiter i (malloc'd) */
+  int nwait, capwait;        /* nwait counts waiter0 too; capwait is the array's */
   int comb_remaining;        /* Promise.all: inputs not yet fulfilled (0 otherwise) */
+  int unhandled_slot;        /* its index + 1 in the unhandled-rejection list, 0 when not listed */
   tsv comb_results;          /* Promise.all: the results array (TS_UNDEFINED otherwise) */
 } ts_promise;
 typedef struct ts_asyncgen_req {

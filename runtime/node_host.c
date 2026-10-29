@@ -875,6 +875,13 @@ static tsv nh_immediate_ref(tsv* a, int n){
   return ts_bool(1);
 }
 static tsv nh_immediate_has_ref(tsv* a, int n){ nh_immediate* im = nh_immediate_find((uint32_t)nh_num(a, n, 0, 0)); return ts_bool(im && im->refed); }
+/* queueMicrotask(callback): lib/node/timers.ts validated the callback */
+static tsv nh_queue_microtask(tsv* a, int n){
+  tsv cb = nh_arg(a, n, 0);
+  if (!ts_is_callable(cb)) ts_throw_type_error_msg("The \"callback\" argument must be of type function");
+  ts_queue_microtask(cb);
+  return TS_UNDEFINED;
+}
 static tsv nh_next_tick(tsv* a, int n){
   tsv cb = nh_arg(a, n, 0);
   if (!ts_is_func(cb)) ts_throw_type_error_msg("The \"callback\" argument must be of type function");
@@ -1543,6 +1550,7 @@ static void ts_garnet_node_global_init(tsv global){
   nh_method(host, "immediateRef", nh_immediate_ref, 2);
   nh_method(host, "immediateHasRef", nh_immediate_has_ref, 1);
   nh_method(host, "nextTick", nh_next_tick, 2);
+  nh_method(host, "queueMicrotask", nh_queue_microtask, 1);
   nh_method(host, "spawnSync", nh_spawn_sync, 8);
   nh_method(host, "spawn", nh_spawn, 6);
   nh_method(host, "onChildExit", nh_on_child_exit, 2);
