@@ -64,6 +64,103 @@ rendering are compared with Node's own on hono's real code, and the loop over 20
 the dispatch benchmark (no socket). Session 358's numbers: 17 kinds garnet 337 ms, Node 142 (2.4x);
 with the two JSX pages 19 kinds with the two JSX pages: garnet 389 ms, Node 155 (2.5x) on a quiet machine; 438 vs 164 under the external load.
 
+## hono: the middleware survey
+
+`benchmarks/real/hono_survey/run.sh` compiles one driver per hono middleware, helper and API surface
+(`drivers/*.ts`, 43 of them: every `src/middleware/*`, the helpers accepts / adapter / cookie / css /
+dev / factory / html / route / ssg / streaming / testing, the validator, the client `hc`, the
+request and response surface, the url / mime / encode / cookie / filepath / accept / html utils, the
+crypto utils) into the clone as `garnet-survey-<name>.ts`, runs it under Node (transpile_tree.js)
+and under garnet, and prints a verdict per driver: OK (identical output), DIFF, REJECT (the
+exporter's unsupported construct), TYPE-ERR, BUILD-FAIL, THROW. Outputs stay in
+`build/real/hono_survey-work/<name>.*`. A filter regex re-runs a subset. Kaz's direction
+(2026-10-29): find what remains unsupported by compiling hono's middleware.
+
+The first run (Session 358) found nine defects in garnet, all fixed in the slice: a sort comparator's
+fractional result truncated to an int (nothing sorted: hono's Accept parser), `Object.assign` and an
+object spread dropping symbol-keyed properties (the css helper), a C redefinition of a hoisted
+pointer when one local is allocated at two sites of a function (the ssg helper), the fields of a
+mixin's instance invisible to enumeration, an optional chain's array of promises classified as a
+promise, `console.trace` as a value, a module rejected at compile time for a `new ReadableStream`
+on a path never taken, and a `import("cloudflare:workers")` probe inside a try/catch; a promise could
+not carry properties (a write was a silent no-op: hono's css helper keeps its data on one, as Node's
+promisified `exec` keeps its `.child`): a promise has the common object header now. The table after
+the fixes:
+
+| driver | verdict | cause |
+|---|---|---|
+| accepts | OK |  |
+| adapter | OK |  |
+| basic_auth | DIFF | Web Crypto (`timingSafeEqual` hashes with `crypto.subtle`) |
+| bearer_auth | DIFF | Web Crypto |
+| body_limit | DIFF | streams (`ReadableStream` reader) |
+| cache | OK |  |
+| client | REJECT | `options.webSocket(...args)`: a spread reject to find |
+| combine | DIFF | Web Crypto (its auth middleware) |
+| compress | DIFF | `CompressionStream` |
+| context_storage | TYPE-ERR | `node:async_hooks` AsyncLocalStorage |
+| cookie_signed | DIFF | Web Crypto (HMAC) |
+| cookie | OK |  |
+| cors | OK |  |
+| crypto | THROW | Web Crypto |
+| csrf | OK |  |
+| dev | OK |  |
+| etag | THROW | Web Crypto (SHA-1) |
+| factory | OK |  |
+| html | OK |  |
+| ip_restriction | REJECT | BigInt (IPv6) |
+| jwt | THROW | Web Crypto (HMAC) |
+| language | OK |  |
+| logger | OK |  |
+| method_not_allowed | OK |  |
+| method_override | OK |  |
+| mount | OK |  |
+| powered_by | OK |  |
+| pretty_json | OK |  |
+| request_body | DIFF | Blob / File, multipart file parts |
+| request_id | DIFF | Web Crypto (`crypto.randomUUID`) |
+| route | OK |  |
+| secure_headers | DIFF | Web Crypto (the nonce: `getRandomValues`) |
+| serve_static | OK |  |
+| ssg | OK |  |
+| streaming | DIFF | streams (`ReadableStream`, `TransformStream`) |
+| testing | REJECT | the client's reject |
+| timeout | OK |  |
+| timing | OK |  |
+| trailing_slash | OK |  |
+| utils | OK |  |
+| validator | OK |  |
+| css | OK |  |
+| jsx_renderer | OK |  |
+
+26 of 43 identical to Node's output.
+
+What remains, by the number of drivers it blocks:
+
+1. **Web Crypto** (`crypto.subtle.digest` SHA-1/256/384/512, `importKey` / `sign` / `verify` HMAC,
+   `crypto.randomUUID`, `crypto.getRandomValues`): basic-auth and bearer-auth (through
+   `timingSafeEqual`'s sha256), combine (through them), signed cookies, etag, jwt and jwk, request-id,
+   secure-headers' nonce, the crypto utils: nine drivers. `lib/node/crypto.ts` has the primitives
+   (the hashes, HMAC, random bytes, randomUUID, getRandomValues); a `lib/node/web/crypto.ts` global
+   over them is the next slice. The jwt algorithms beyond HMAC (RSA, ECDSA) are out of its scope.
+2. **Streams** (`ReadableStream`, `TransformStream`, `WritableStream`, `TextEncoderStream`, a
+   Request / Response body as a stream): body-limit, the streaming helpers (`stream`, `streamText`,
+   `streamSSE`), the JSX streaming renderer, `c.body(stream)`. A `lib/node/web/streams.ts` over the
+   event loop, with the bodies reworked: a slice of its own.
+3. **Blob / File** and multipart file parts (`c.req.blob()`, `parseBody` with a file: `File` is not
+   defined; `FormData` holds text fields only): the request-body driver.
+4. `CompressionStream` (the compress middleware: gzip / deflate / brotli over streams; Node has it).
+5. `node:async_hooks`'s `AsyncLocalStorage` (context-storage; hono's JSX context uses it when
+   present): asynchronous context propagation through the event loop's continuations.
+6. BigInt (ip-restriction's IPv6 arithmetic): unsupported by design.
+7. The client `hc` and `testClient`: `options.webSocket(...args)` in `src/client/client.ts:225` is
+   rejected as a spread expression although the same call compiles in a small program: to find.
+8. `console.log` of a String wrapper prints `StringObject { ... }` where Node prints
+   `[String: 'x'] { ... }` (the utils driver prints the primitive): the inspector's form only.
+9. A middleware's `declare module '../..'` augmentation (request-id, secure-headers, timing,
+   language) is a type error when the package root is not in the program (a deep import only); an
+   application importing `hono` has it. The drivers import the root's types for it.
+
 ## hono (routers)
 
 `benchmarks/real/hono/driver.ts` loads the route table of hono's own router benchmark into each

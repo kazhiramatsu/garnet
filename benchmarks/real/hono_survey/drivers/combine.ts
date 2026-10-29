@@ -1,0 +1,31 @@
+import { Hono } from "./src/hono.ts";
+import { some, every, except } from "./src/middleware/combine/index.ts";
+import { bearerAuth } from "./src/middleware/bearer-auth/index.ts";
+import { basicAuth } from "./src/middleware/basic-auth/index.ts";
+import { poweredBy } from "./src/middleware/powered-by/index.ts";
+import type { Context } from "./src/context.ts";
+import { show, section } from "./garnet-survey-_lib.ts";
+const app = new Hono();
+app.use("/some/*", some(bearerAuth({ token: "tok" }), basicAuth({ username: "u", password: "p" })));
+app.use("/every/*", every(poweredBy(), bearerAuth({ token: "tok" })));
+app.use("/ex/*", except("/ex/open", bearerAuth({ token: "tok" })));
+app.use("/cond/*", some((c: Context) => c.req.query("skip") === "1", bearerAuth({ token: "tok" })));
+app.get("/some/x", (c) => c.text("some"));
+app.get("/every/x", (c) => c.text("every"));
+app.get("/ex/open", (c) => c.text("open"));
+app.get("/ex/closed", (c) => c.text("closed"));
+app.get("/cond/x", (c) => c.text("cond"));
+async function main(): Promise<void> {
+  section("combine");
+  await show(app, "GET", "/some/x", { headers: { authorization: "Bearer tok" } });
+  await show(app, "GET", "/some/x", { headers: { authorization: "Basic " + btoa("u:p") } });
+  await show(app, "GET", "/some/x", { headers: { authorization: "Basic " + btoa("u:x") } }, ["www-authenticate"]);
+  await show(app, "GET", "/every/x", { headers: { authorization: "Bearer tok" } }, ["x-powered-by"]);
+  await show(app, "GET", "/every/x", undefined, ["x-powered-by"]);
+  await show(app, "GET", "/ex/open");
+  await show(app, "GET", "/ex/closed");
+  await show(app, "GET", "/ex/closed", { headers: { authorization: "Bearer tok" } });
+  await show(app, "GET", "/cond/x?skip=1");
+  await show(app, "GET", "/cond/x");
+}
+main();

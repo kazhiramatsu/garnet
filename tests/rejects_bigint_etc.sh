@@ -10,9 +10,8 @@ check() { # $1 = description, $2 = ts source
   fi
 }
 check "BigInt literal"        'function main(): void { const x = 123n; console.log(x > 0n ? 1 : 0); }'
-# new Date(number) and the component form + get*/getUTC*/toISOString are now
-# implemented; string parsing and locale-formatting methods remain unsupported.
-check "new Date(string)"      'function main(): void { const d = new Date("2020-01-01"); console.log(d.getTime()); }'
+# new Date(number), the component form, get*/getUTC*/toISOString and the string parse are
+# implemented (`new Date("2020-01-01")` agrees with V8); locale-formatting methods remain unsupported.
 check "unsupported Date method" 'function main(): void { const d = new Date(2020,0,1); console.log(d.toLocaleDateString()); }'
 check "unsupported Math fn"   'function main(): void { console.log(Math.sumPrecise([1, 2])); }'
 # Note: all Object.defineProperty descriptor forms we model — data attributes

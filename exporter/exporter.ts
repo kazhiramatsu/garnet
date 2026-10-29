@@ -4891,6 +4891,33 @@ class Exporter {
     return this.emitJsxCall(ctx, site.call, [{ kind: "single", local: type }, { kind: "single", local: props }, ...children]);
   }
 
+  /** `import(spec)` of a module the program does not bundle (hono's `await import("cloudflare:workers")`
+   *  behind a runtime check, in a try/catch): a promise rejected with an Error naming the module, as Node
+   *  rejects a module it cannot load, so the program compiles and the catch runs. The specifier must have
+   *  a string literal type (a literal, or a const of one); one that resolves to a module stays a
+   *  compile-time reject (the module would be bundled and evaluated at startup, not loaded lazily). */
+  private lowerDynamicImport(ctx: FnCtx, node: ts.CallExpression): number {
+    const arg = node.arguments[0];
+    const t = arg ? this.checker.getTypeAtLocation(arg) : undefined;
+    const spec = t && (t.flags & ts.TypeFlags.StringLiteral) ? (t as ts.StringLiteralType).value : undefined;
+    const dst = this.newLocal(ctx, "reference", "import");
+    if (spec === undefined) {
+      this.unsupported(node, "a dynamic import() whose specifier is not a string literal (or a const of one)");
+      return dst;
+    }
+    const resolved = ts.resolveModuleName(spec, node.getSourceFile().fileName, this.program.getCompilerOptions(), ts.sys).resolvedModule;
+    if (resolved) {
+      this.unsupported(node, `a dynamic import() of a module the program bundles (${spec}): a static import is its compiled form`);
+      return dst;
+    }
+    if (arg) this.lowerExpr(ctx, arg);   // the specifier expression's own effects
+    const msg = this.constString(ctx, `Cannot find module '${spec}': a dynamic import of a module the program does not bundle`);
+    const err = this.newLocal(ctx, "reference");
+    ctx.body.push({ kind: "CallBuiltinStatic", dst: err, builtin: `error.new:${this.errorKindIndex("Error")}`, args: [msg] });
+    ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "promise.reject", args: [err] });
+    return dst;
+  }
+
   private lowerJsxFragment(ctx: FnCtx, node: ts.JsxFragment): number {
     const site = this.jsxSiteCallees(node);
     const type = this.jsxCalleeValue(ctx, site.value);
@@ -5026,6 +5053,7 @@ class Exporter {
     if ((ts as any).isSatisfiesExpression?.(node)) return this.lowerExpr(ctx, (node as any).expression, hint);
     if (ts.isJsxElement(node) || ts.isJsxSelfClosingElement(node)) return this.lowerJsxElement(ctx, node);
     if (ts.isJsxFragment(node)) return this.lowerJsxFragment(ctx, node);
+    if (ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword) return this.lowerDynamicImport(ctx, node);
     if (node.kind === ts.SyntaxKind.RegularExpressionLiteral) {
       const lowered = this.lowerRegExpLiteralObject(ctx, node, node.getText(), hint);
       if (lowered !== undefined) return lowered;
@@ -10528,6 +10556,18 @@ class Exporter {
       // a program whose dynamic path is never taken (a dev-only validator, an eval fallback) compiles.
       ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), args: [],
         builtin: "throw.eval:Code generation from strings is not available in a compiled program (new Function)" });
+    } else if (ts.isIdentifier(node.expression) && this.isAmbientGlobalSymbol(this.symbolOf(node.expression))) {
+      // A constructor the environment declares (lib.dom's ReadableStream, CustomEvent, WebSocket) that
+      // the runtime does not provide: the construct goes through the global object at run time, a
+      // ReferenceError where it is reached (as Node throws for a global it lacks), so a program whose
+      // such path is never taken (hono's streaming renderer, its WebSocket client) compiles. A class
+      // value held in a variable stays a compile-time reject below (its environment is not a value).
+      const g = this.newLocal(ctx, "reference");
+      ctx.body.push({ kind: "LoadBuiltinFn", dst: g, builtin: "globalThis" });
+      const callee = this.newLocal(ctx, "reference", calleeName);
+      ctx.body.push({ kind: "LoadField", dst: callee, obj: g, field: this.internField(calleeName) });
+      ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: `binding.check:${calleeName}`, args: [callee] });
+      this.emitNewMaybeGuarded(ctx, node, dst, callee, args);
     } else {
       // `new X()` where X is an identifier that does NOT resolve to a known user
       // class and is not a supported built-in (Array/Map/Set/Date/Error...). The
@@ -11416,7 +11456,7 @@ class Exporter {
     if (spec?.kind === "string") return "string";
     if (spec?.kind === "array") return "array";
     try {
-      const t = this.checker.getTypeAtLocation(recvExpr);
+      let t = this.checker.getTypeAtLocation(recvExpr);
       const F = ts.TypeFlags;
       // A callable value is never a string/array/map/set/number receiver. A stored
       // prototype method (`const f = Array.prototype.slice`) has type `(...) => any[]`,
@@ -11431,6 +11471,13 @@ class Exporter {
       // alias, which the printed form below shows as the alias name): an array receiver, so an
       // element read is the element path and not a dynamic property get with a numeric key.
       if ((t.flags & F.Union) && (t as ts.UnionType).types.every((m) => this.isArrayKindType(m))) return "array";
+      // A union with null / undefined only (an optional chain's result, `xs?.map(..).filter(..)`): the
+      // kind of its other member. The printed form "Promise<string>[] | undefined" classified the
+      // receiver by its element type as a promise (hono's streaming renderer).
+      if (t.flags & F.Union) {
+        const members = (t as ts.UnionType).types.filter((m) => !(m.flags & (F.Undefined | F.Null | F.Void)));
+        if (members.length === 1) t = members[0];
+      }
       if (t.flags & (F.String | F.StringLiteral)) return "string";
       const sym = t.getSymbol();
       // A user class shadowing a builtin name (`class Map {}`) is NOT a builtin
@@ -11577,7 +11624,8 @@ class Exporter {
     if (ns === "Date" && member === "parse") return "date.parse";
     if (ns === "console") {
       if (member === "log" || member === "info" || member === "debug") return "console.log";
-      if (member === "error" || member === "warn") return "console.error";
+      // `trace` as a value (hono's `onError = console.trace` default): the error writer; the stack lines are not modelled
+      if (member === "error" || member === "warn" || member === "trace") return "console.error";
       if (member === "dir") return "console.dir";
     }
     return undefined;

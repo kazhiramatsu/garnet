@@ -215,7 +215,7 @@ When an exporter/analyzer change produces a new IR/optimization pattern, **the f
 
 ### Completion criteria (CLAUDE.md)
 
-**All conformance green + unit + bench (perf budget) + all bundler green**, plus gate gc if you touched GC, and selfconf/emitc_diff if you touched the exporter.
+**All conformance green + unit + bench (perf budget) + all bundler green + `gate.sh ci`** (the negative tests and the link gates; it had gone unrun for sessions until 358), plus gate gc if you touched GC, and selfconf/emitc_diff if you touched the exporter.
 **Zero perf regression** (if you add a branch to the hot path, gate it behind a single predictable branch).
 
 ---

@@ -61,12 +61,14 @@ cat > "$tmp/both.c" <<'C'
 #define TSAOT_NEEDS_UNICODE 1
 #include "unicode/ts_unicode_adapter.h"
 int main(void) {
-  return ts_regexp_adapter_available() || ts_unicode_adapter_available() ? 0 : 0;
+  ts_regexp_adapter_init();   /* garnet's engine (Session 357) has no availability probe: its init links the adapter */
+  return ts_unicode_adapter_available() ? 0 : 0;
 }
 C
 tsaot_prepare_regexp_objs "$tmp/both.c" "$tmp"
 tsaot_prepare_unicode_objs "$tmp/both.c" "$tmp"
-if tsaot_quickjs_regexp_vendor_available && tsaot_quickjs_unicode_vendor_available; then
+# the regexp engine is garnet's own since Session 357 (no vendored regexp objects): the shared libunicode object is the Unicode adapter's alone
+if tsaot_quickjs_unicode_vendor_available; then
   n_unicode="$(printf '%s\n' "${TSAOT_REGEXP_OBJS[@]}" "${TSAOT_UNICODE_OBJS[@]}" | grep -c '/libunicode\.o$')"
   if [[ "$n_unicode" != "1" ]]; then
     echo "[unicode-link] FAIL: shared libunicode object linked $n_unicode times"
@@ -74,7 +76,8 @@ if tsaot_quickjs_regexp_vendor_available && tsaot_quickjs_unicode_vendor_availab
     exit 1
   fi
 fi
-$CC "$tmp/both.c" "$tmp/rt.o" "${TSAOT_REGEXP_OBJS[@]}" "${TSAOT_UNICODE_OBJS[@]}" -Iruntime -lm $TSAOT_LDLIBS -o "$tmp/both" 2>"$tmp/both.link.err"
+$CC "$tmp/both.c" "$tmp/rt.o" "${TSAOT_REGEXP_OBJS[@]}" "${TSAOT_UNICODE_OBJS[@]}" -Iruntime -lm $TSAOT_LDLIBS -o "$tmp/both" 2>"$tmp/both.link.err" || {
+  echo "[unicode-link] FAIL: the program with both adapters did not link"; head -20 "$tmp/both.link.err"; exit 1; }
 "$tmp/both"
 
 echo "[unicode-link] PASS: marker controls optional Unicode object linkage"

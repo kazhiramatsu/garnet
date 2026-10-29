@@ -1902,10 +1902,11 @@ static tsv ts_proxy_own_keys_arr(tsv pv);
 static tsv ts_proxy_get_proto(tsv pv);
 static tsv ts_proxy_set_proto(tsv pv, tsv proto);
 /* Exotic links on a prototype chain (docs/proxy_prototype_chain_design.md):
-   promise, coroutine and proxy cells do not begin with the common object
-   header, so a chain walk tests a link's kind once and hands such a link to
-   these instead of reading it as an object. */
-#define chain_link_exotic(p) TS_RT_UNLIKELY((p)->h.kind >= TS_KIND_PROMISE)
+   coroutine and proxy cells do not begin with the common object header, so a
+   chain walk tests a link's kind once and hands such a link to these instead
+   of reading it as an object. (A promise carries the header since Session
+   358: its own properties and Promise.prototype take the ordinary walk.) */
+#define chain_link_exotic(p) TS_RT_UNLIKELY((p)->h.kind > TS_KIND_PROMISE)
 static int chain_exotic_get(ts_object* p, ts_key key, tsv receiver, tsv* out, ts_object** next);
 /* typed arrays (docs/typed_arrays_design.md), defined after the array methods */
 static const uint8_t g_ta_size[TS_TA_COUNT] = { 1, 1, 1, 2, 2, 4, 4, 4, 8 };
@@ -3512,7 +3513,7 @@ static int lookup_prop_chain_until(tsv receiver, ts_object* o, ts_object* stop, 
    property-bag receivers) and are guarded out of the prop-map path. */
 static inline int kind_has_common_header(uint8_t k){
   return k==TS_KIND_OBJECT || k==TS_KIND_ARRAY || k==TS_KIND_FUNC || k==TS_KIND_MAP || k==TS_KIND_SET ||
-         k==TS_KIND_ARRAYBUFFER || k==TS_KIND_TYPEDARRAY || k==TS_KIND_REGEXP;
+         k==TS_KIND_ARRAYBUFFER || k==TS_KIND_TYPEDARRAY || k==TS_KIND_REGEXP || k==TS_KIND_PROMISE;
 }
 /* A property-bag receiver: anything carrying the common header. Object/array/map/
    set use the OBJECT NaN-box selector; functions use the FUNC selector. Both are
@@ -3681,16 +3682,9 @@ tsv ts_get(tsv obj, ts_key key){
       if (lookup_prop_chain(obj, ts_proto_ptr(g_function_proto_v), key, &found)) return found;
     }
   }
-  /* Promises resolve their (method) properties via the shared Promise.prototype —
-     this is what makes `p.then`/`.catch`/`.finally` a first-class function VALUE
-     (the call form `p.then(cb)` uses a direct builtin instead). A promise carries
-     no common header / proto field, so it is dispatched here by kind, like a
-     primitive string/number. No own data properties exist on a promise. */
-  if (ts_is_promise(obj)){
-    tsv found;
-    if (lookup_prop_chain(obj, ts_proto_ptr(g_promise_proto_v), key, &found)) return found;
-    return TS_UNDEFINED;
-  }
+  /* (A promise carries the common header since Session 358: its own properties and then
+     Promise.prototype, where `p.then` / `.catch` / `.finally` are first-class values, take the
+     ordinary path below.) */
   if (!ts_is_propbag(obj)) return TS_UNDEFINED;
   ts_object* o=ts_ptr(obj);
   /* Unified object model (docs/unified_object_model.md): TS_KIND_OBJECT and
@@ -3961,7 +3955,16 @@ void ts_set(tsv obj, ts_key key, tsv val){
      -> writes are safe no-ops. Arrays gain named props lazily (props=NULL until
      the first ts_set), matching V8's fast->dictionary transition; their indexed
      elements still use the ts_array_set fast path. */
-  if (!kind_has_common_header(o->h.kind)) return;
+  if (!kind_has_common_header(o->h.kind)){
+    /* a promise (a generator object, an accessor) carries no property map: a write was a silent no-op,
+       a miscompile (hono's css helper keeps a class name's data on a Promise); a TypeError names it */
+    const char* nm = ts_field_name(key);
+    char buf[192];
+    snprintf(buf, sizeof buf, "Cannot set property '%s' of %s (its properties are not modelled)", nm ? nm : "?",
+             o->h.kind == TS_KIND_PROMISE ? "a Promise" : o->h.kind == TS_KIND_CORO ? "a generator object" : "this object");
+    ts_throw_type_error_msg(buf);
+    return;
+  }
   const int frozen = (ts_obj_integrity(o) & 1u) != 0;   /* Object.freeze */
   if (ts_is_indexed_array_fast(obj)){
     uint32_t idx;
@@ -6533,7 +6536,7 @@ static void gc_free_cell_payload(ts_gc_header* h){
   }
   else if (h->kind==TS_KIND_TYPEDARRAY){ props_release_dead(&((ts_typedarray*)h)->o); }
   else if (h->kind==TS_KIND_REGEXP){ ts_regexp* r=(ts_regexp*)h; if (g_regexp_hooks && r->prog) g_regexp_hooks->release(r->prog); r->prog=NULL; props_release_dead(&r->o); }
-  else if (h->kind==TS_KIND_PROMISE){ free(((ts_promise*)h)->waiters); }
+  else if (h->kind==TS_KIND_PROMISE){ free(((ts_promise*)h)->waiters); props_release_dead(&((ts_promise*)h)->o); }
   else if (h->kind==TS_KIND_CORO){
     ts_coro* c=(ts_coro*)h;
     if (c->eh_catch_state && c->eh_catch_state!=c->eh_catch_inline) free(c->eh_catch_state);
@@ -6741,6 +6744,7 @@ static void g0_count_fate(ts_gc_header* h, int fate){
   } else if (kind == TS_KIND_PROMISE){
     ts_promise* pr = (ts_promise*)h;
     if (pr->waiters) g0_payload(fate, G0_P_OTHER, (unsigned long long)pr->capwait * sizeof(tsv), &any);
+    common = &pr->o;
   } else if (kind == TS_KIND_CORO){
     g0_payload(fate, G0_P_OTHER, 0, &any);
   }
@@ -10573,8 +10577,10 @@ tsv ts_array_sort(tsv arr, tsv cb){
         cmp = default_cmp(left, key);
       } else if(has_cb){
         tsv args[2]={left,key};
-        cmp = (int)ts_to_num(ts_call_value(cb,args,2));
-        cmp = cmp>0?1:(cmp<0?-1:0);
+        /* ToNumber of the comparator's result, its sign decides (a fraction such as `b.q - a.q` = 0.5 is
+           not 0; NaN, a boolean or a string coerce as the spec's SortCompare does) */
+        double d = ts_number_coerce(ts_call_value(cb,args,2));
+        cmp = d>0?1:(d<0?-1:0);
       } else cmp = default_cmp(left, key);
       a=as_arr(arr);
       if(cmp>0 && a && (uint32_t)(j+1)<a->cap){
@@ -10721,7 +10727,16 @@ static tsv ts_derived_ctor_thunk(tsv* args, int n){
   int argc = n > 2 ? n - 2 : 0;
   ts_gc_root(&proto);
   tsv inst = ts_construct(parent, argc ? args + 2 : NULL, argc);
-  if (ts_is_obj(inst) && ts_is_obj(proto)) ts_set_proto(inst, proto);
+  if (ts_is_obj(inst) && ts_is_obj(proto)){
+    ts_set_proto(inst, proto);
+    /* a sized instance of a class parent now sits behind the derived prototype: its layout's
+       registration is found through its allocation class (the relinked word, as a program's own
+       Object.setPrototypeOf marks it), so its fields enumerate (JSON.stringify of a mixin's instance
+       gave `{}`). The typed-slow machinery is not raised: the typed code's direct accesses stay valid,
+       the instance is the parent's layout (docs/class_index_dispatch_design.md). */
+    ts_object* io = (ts_object*)ts_ptr(inst);
+    if (ts_obj_is_sized(io) && io->cls && io->cls != TS_CLS_PROTO) io->cls |= TS_CLS_RELINKED;
+  }
   ts_gc_unroot(1);
   return inst;
 }
@@ -11436,6 +11451,9 @@ static tsv class_reg_field_value(ts_class_reg* r, ts_object* o, int i);
 typedef void (*ts_prop_enum_cb)(uint32_t key, tsv val, void* ud);
 static void ts_prop_own_enum(tsv obj, ts_prop_enum_cb cb, void* ud);
 static int prop_key_is_array_index(uint32_t key, uint32_t* idx);
+static ts_pref propbag_prop(tsv owner, uint32_t i);
+static uint32_t propbag_len(tsv owner);
+static tsv symbol_value_from_prop_key(ts_key key);
 
 /* ---------------- Object static methods ---------------- */
 /* callback contexts for the canonical enumerator. arr is GC-rooted by the caller. */
@@ -11684,6 +11702,24 @@ static void cb_copy_to_target(uint32_t key, tsv val, void* ud){
   ts_set(c->target, key, resolved);
   ts_gc_unroot(1);
 }
+/* The own enumerable symbol-keyed properties of a source, visited after its string keys: Object.assign
+   and an object spread copy them as V8 does (hono's css helper keeps a class name's selectors under
+   symbols; they were dropped, a silent miscompile). A class value's statics are its container's, as
+   the string-key enumerator takes them. */
+static void ts_prop_own_enum_symbols(tsv owner, ts_prop_enum_cb cb, void* ud){
+  if (!ts_is_propbag(owner) || ts_is_str(owner)) return;
+  ts_object* sc = ts_class_static_container(owner);
+  if (sc) owner = ts_obj(sc);
+  ts_gc_root(&owner);
+  uint32_t len = propbag_len(owner);
+  for (uint32_t i=0;i<len;i++){
+    ts_pref p = propbag_prop(owner, i); if (!pref_ok(p)) continue;
+    if (ts_is_undef(symbol_value_from_prop_key(pref_key(p))) || !pref_is_enumerable(p)) continue;
+    cb(pref_key(p), pref_val(p), ud);
+    len = propbag_len(owner);
+  }
+  ts_gc_unroot(1);
+}
 /* new operator step 4 (unified_object_model §10, ECMA-262 11.2.2/13.2.2): if the
    constructor returned an OBJECT, `new C()` evaluates to that object; otherwise
    (primitive / undefined / null return) to the freshly-allocated instance.
@@ -11709,6 +11745,7 @@ tsv ts_object_assign(tsv* args, int n){
     ts_gc_root(&src);
     c.recv = src;   /* accessor getters run with this=src */
     ts_prop_own_enum(src, cb_copy_to_target, &c);
+    ts_prop_own_enum_symbols(src, cb_copy_to_target, &c);
     ts_gc_unroot(1);
   }
   ts_gc_unroot(1);
@@ -14352,6 +14389,7 @@ void ts_object_copy_props(tsv dst, tsv src){
   ts_gc_root(&dst); ts_gc_root(&src);
   enum_copy_ctx c; c.target=dst; c.recv=src;
   ts_prop_own_enum(src, cb_copy_to_target, &c);
+  ts_prop_own_enum_symbols(src, cb_copy_to_target, &c);
   ts_gc_unroot(2);
 }
 
@@ -18521,7 +18559,7 @@ static int ordinary_set_recv(tsv t, ts_key key, tsv v, tsv r){
           ts_gc_unroot(1);
           goto done;
         }
-        p = p->h.kind == TS_KIND_PROMISE ? ts_proto_ptr(g_promise_proto_v) : NULL;
+        p = NULL;
         continue;
       }
       tsv* s = find_slot(p, key, 0);
@@ -19027,9 +19065,8 @@ static tsv ts_proxy_get_proto(tsv pv){
 /* [[Get]] reaching the exotic link `p` of `receiver`'s chain: 1 when the link
    answered (*out: the get trap with the original receiver); 0 to go on at
    *next: a proxy without a get trap continues on its target (a getter there
-   sees the receiver), a promise on Promise.prototype, anything else ends. */
+   sees the receiver), anything else ends. */
 static int chain_exotic_get(ts_object* p, ts_key key, tsv receiver, tsv* out, ts_object** next){
-  if (p->h.kind == TS_KIND_PROMISE){ *next = ts_proto_ptr(g_promise_proto_v); return 0; }
   if (p->h.kind != TS_KIND_PROXY){ *next = NULL; return 0; }
   tsv pv = ts_obj(p);
   tsv handler = ((ts_proxy*)p)->handler;
@@ -19054,7 +19091,6 @@ static int chain_exotic_get(ts_object* p, ts_key key, tsv receiver, tsv* out, ts
 /* [[HasProperty]] at an exotic link: 1 when decided (*res: the has trap, or
    the target's own chain), 0 to go on at *next. */
 static int chain_exotic_has(ts_object* p, ts_key key, int* res, ts_object** next){
-  if (p->h.kind == TS_KIND_PROMISE){ *next = ts_proto_ptr(g_promise_proto_v); return 0; }
   if (p->h.kind != TS_KIND_PROXY){ *next = NULL; return 0; }
   tsv pv = ts_obj(p);
   ts_gc_root(&pv);
@@ -19069,7 +19105,6 @@ static int chain_exotic_has(ts_object* p, ts_key key, int* res, ts_object** next
    ordinary set on its target (which ends in a setter called on the receiver,
    a read-only rejection, or an own property of the receiver). */
 static int chain_exotic_set(ts_object* p, ts_key key, tsv receiver, tsv val, ts_object** next){
-  if (p->h.kind == TS_KIND_PROMISE){ *next = ts_proto_ptr(g_promise_proto_v); return 0; }
   if (p->h.kind != TS_KIND_PROXY){ *next = NULL; return 0; }
   tsv pv = ts_obj(p);
   tsv handler = ((ts_proxy*)p)->handler;
@@ -19438,6 +19473,10 @@ static int ts_is_promise(tsv v){ return ts_is_obj(v) && ((ts_gc_header*)ts_ptr(v
 static int ts_is_coro_value(tsv v){ return ts_is_obj(v) && ((ts_gc_header*)ts_ptr(v))->kind==TS_KIND_CORO; }
 
 static void promise_init(ts_promise* p){
+  /* the common header: Promise.prototype as the chain, the empty shape (the map is read through
+     obj_map; a fresh cell's map fields are zero, as a plain object's and an array's are) */
+  p->o.proto = ts_proto_ref(g_promise_proto_v) ? g_promise_proto_v : TS_NULL;
+  p->o.shape = TS_SHAPE_EMPTY;
   p->state=0; p->value=TS_UNDEFINED; p->waiters=NULL; p->nwait=0; p->capwait=0;
   p->comb_remaining=0; p->comb_results=TS_UNDEFINED;
 }
@@ -21412,6 +21451,8 @@ static void gc_scan_async_cell(ts_gc_header* h, int young, int depth){
     gc_visit_slot(&p->value, young, depth, stable);
     gc_visit_slot(&p->comb_results, young, depth, stable);
     for (int i=0;i<p->nwait;i++) gc_visit_slot(&p->waiters[i], young, depth, stable);
+    gc_mark_common_props(&p->o, young, depth, stable);   /* its properties and prototype, as any object's */
+    gc_visit_slot(&p->o.proto, young, depth, stable);
   } else if (h->kind==TS_KIND_CORO){
     ts_coro* c=(ts_coro*)h;
     gc_visit_slot(&c->result, young, depth, stable);

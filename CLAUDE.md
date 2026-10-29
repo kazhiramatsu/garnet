@@ -140,6 +140,11 @@ Rust in §315; selfhost is kept as a performance metric).
   (`jsx` / `jsxs` of `jsx-runtime`, no source positions); `jsxImportSource` is resolved from each
   JSX file as TypeScript resolves the synthetic import. A typed `.toString()` / `.valueOf()` on a
   receiver that is not a string (a cast lied, a String wrapper) takes the receiver's own method.
+- A dynamic `import()` of a module the program does not bundle (a const of a literal type, hono's
+  `cloudflare:workers` probe) rejects at run time with an Error; of a bundled module it is a
+  compile-time reject (Session 358). `new X()` of a constructor the environment declares but the runtime lacks
+  (ReadableStream, CustomEvent, WebSocket) is a ReferenceError where it is reached (Node without the
+  global throws there too); `console.trace` as a value is the error writer (no stack).
 - `o.__proto__` and `o["__proto__"]` read undefined (V8: the prototype through the accessor);
   `Object.getPrototypeOf` / `setPrototypeOf` are the modelled forms (Session 355 note).
 - A typed receiver that is a Proxy (vue's reactive arrays and collections) takes its methods through

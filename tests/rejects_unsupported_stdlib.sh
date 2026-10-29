@@ -83,11 +83,7 @@ TS
 if node exporter/exporter.js "$tmp/p.ts" "$tmp/p.json" "$tmp/pl.json" 2>/dev/null; then
   echo "[reject-stdlib] FAIL: RegExp object non-global replaceAll accepted"; fail=1
 fi
-cat > "$tmp/r.ts" <<'TS'
-function main(): void { const r = /😀+/; console.log("x😀".matchAll(r)); }
-TS
-if node exporter/exporter.js "$tmp/r.ts" "$tmp/r.json" "$tmp/rl.json" 2>/dev/null; then
-  echo "[reject-stdlib] FAIL: RegExp object non-global matchAll accepted"; fail=1
-fi
+# (matchAll with a non-global RegExp object compiles and throws V8's TypeError at the call, Session 358:
+# a catchable throw, not a compile-time reject.)
 [ $fail -eq 0 ] && echo "[reject-stdlib] PASS: unsupported stdlib methods rejected"
 exit $fail

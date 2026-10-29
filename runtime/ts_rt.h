@@ -3756,7 +3756,8 @@ tsv ts_proxy_revocable(tsv target, tsv handler);
 tsv ts_proxy_revoke_thunk(tsv* args, int n);
 /* Promise + coroutine frame (async/await) */
 typedef struct ts_promise {
-  ts_gc_header h;
+  ts_obj_common o;           /* the common header: a promise takes properties as any object (Node's
+                                promisified exec's `.child`, hono's css helper) and has Promise.prototype */
   int state;                 /* 0 pending, 1 fulfilled, 2 rejected */
   tsv value;
   tsv* waiters;

@@ -1,0 +1,30 @@
+import { Hono } from "./src/hono.ts";
+import { show, section } from "./garnet-survey-_lib.ts";
+const app = new Hono();
+app.post("/parse", async (c) => { const b = await c.req.parseBody({ all: true, dot: true }); return c.json(Object.fromEntries(Object.entries(b).map(([k, v]) => [k, Array.isArray(v) ? v : typeof v === "string" ? v : "<file>"]))); });
+app.post("/multipart", async (c) => { const b = await c.req.parseBody(); const f = b["file"]; return c.json({ keys: Object.keys(b).sort(), text: b["text"], file: typeof f === "string" ? f : f instanceof Blob ? { name: (f as File).name, size: f.size, type: f.type, body: await f.text() } : String(f) }); });
+app.post("/bytes", async (c) => { const ab = await c.req.arrayBuffer(); const u8 = new Uint8Array(ab); return c.json({ len: u8.length, first: u8[0], blob: (await c.req.blob()).size }); });
+app.post("/formdata", async (c) => { const fd = await c.req.formData(); return c.json({ a: fd.get("a"), all: fd.getAll("x") }); });
+app.get("/headers", (c) => c.json({ all: c.req.header(), one: c.req.header("x-one"), queries: c.req.queries(), q: c.req.query() }));
+app.post("/raw", async (c) => c.json({ method: c.req.raw.method, url: c.req.raw.url, hasBody: c.req.raw.body !== null, used: c.req.raw.bodyUsed, text: await c.req.raw.text() }));
+app.get("/resp", (c) => { c.status(201); c.header("x-a", "1"); c.header("x-a", "2", { append: true }); return c.body(new Uint8Array([104, 105]), 201, { "content-type": "application/octet-stream" }); });
+app.get("/new", (c) => c.newResponse("nr", 202, { "x-n": "y" }));
+app.get("/redir", (c) => c.redirect("/elsewhere", 302));
+app.get("/notfound", (c) => c.notFound());
+async function main(): Promise<void> {
+  section("request / response surface");
+  const form = { "content-type": "application/x-www-form-urlencoded" };
+  await show(app, "POST", "/parse", { body: "a=1&b[]=2&b[]=3&c.d=4&c.e=5", headers: form });
+  const boundary = "----survey";
+  const mp = `--${boundary}\r\nContent-Disposition: form-data; name="text"\r\n\r\nhello\r\n--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="a.txt"\r\nContent-Type: text/plain\r\n\r\nfile body\r\n--${boundary}--\r\n`;
+  await show(app, "POST", "/multipart", { body: mp, headers: { "content-type": "multipart/form-data; boundary=" + boundary } });
+  await show(app, "POST", "/bytes", { body: "ABC" });
+  await show(app, "POST", "/formdata", { body: "a=1&x=2&x=3", headers: form });
+  await show(app, "GET", "/headers?x=1&x=2&y=3", { headers: { "x-one": "1", "X-Two": "2" } });
+  await show(app, "POST", "/raw", { body: "raw body" });
+  await show(app, "GET", "/resp", undefined, ["content-type", "x-a"]);
+  await show(app, "GET", "/new", undefined, ["x-n"]);
+  await show(app, "GET", "/redir", undefined, ["location"]);
+  await show(app, "GET", "/notfound");
+}
+main();

@@ -46,7 +46,9 @@ if [[ "$TSAOT_FETCH_RT_OBJ_ARG" != "$RT_OBJ" || -n "$TSAOT_FETCH_LDLIBS" ]]; the
   echo "[fetch-aot] FAIL: no-fetch program switched runtime/link flags"
   exit 1
 fi
-$CC "$tmp/nofetch.c" "$TSAOT_FETCH_RT_OBJ_ARG" -Iruntime -lm $TSAOT_LDLIBS -o "$tmp/nofetch"
+tsaot_prepare_regexp_objs "$tmp/nofetch.c" "$tmp"
+tsaot_prepare_unicode_objs "$tmp/nofetch.c" "$tmp"
+$CC "$tmp/nofetch.c" "$TSAOT_FETCH_RT_OBJ_ARG" $TSAOT_REGEXP_OBJ_ARGS $TSAOT_UNICODE_OBJ_ARGS -Iruntime -lm $TSAOT_LDLIBS -o "$tmp/nofetch"
 
 cat > "$tmp/fetch.ts" <<'TS'
 async function main(): Promise<void> {
@@ -72,7 +74,9 @@ if ! nm -u "$TSAOT_FETCH_RT_OBJ_ARG" 2>/dev/null | grep -q 'curl_'; then
   echo "[fetch-aot] FAIL: fetch runtime object does not reference curl"
   exit 1
 fi
-$CC "$tmp/fetch.c" "$TSAOT_FETCH_RT_OBJ_ARG" -Iruntime -lm $TSAOT_FETCH_LDLIBS $TSAOT_LDLIBS -o "$tmp/fetch.bin"
+tsaot_prepare_regexp_objs "$tmp/fetch.c" "$tmp"
+tsaot_prepare_unicode_objs "$tmp/fetch.c" "$tmp"
+$CC "$tmp/fetch.c" "$TSAOT_FETCH_RT_OBJ_ARG" $TSAOT_REGEXP_OBJ_ARGS $TSAOT_UNICODE_OBJ_ARGS -Iruntime -lm $TSAOT_FETCH_LDLIBS $TSAOT_LDLIBS -o "$tmp/fetch.bin"
 
 cat > "$tmp/fetch_value.ts" <<'TS'
 const f = globalThis["fetch"];

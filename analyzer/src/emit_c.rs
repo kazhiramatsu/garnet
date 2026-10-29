@@ -15122,6 +15122,8 @@ fn emit_global_setup(s: &mut String, needs_fetch: bool, needs_typed_array_global
     set_fn(s, "_console", "debug", "console.log", 0, "debug");
     set_fn(s, "_console", "warn", "console.error", 0, "warn");
     set_fn(s, "_console", "error", "console.error", 0, "error");
+    // `trace` as a value (hono's `onError = console.trace` default): the error writer; the stack lines are not modelled
+    set_fn(s, "_console", "trace", "console.error", 0, "trace");
     set_fn(s, "_console", "dir", "console.dir", 1, "dir");
     global_set_rooted(s, "console", "_console");
 
@@ -22065,7 +22067,10 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                             // runtime stores the prototype with the barrier an
                             // old cell needs
                             let _ = writeln!(s, "  {} = ts_new_sized_site(sizeof({}), {}u, {});", dst_name, cn, id, proto_expr);
-                            let _ = writeln!(s, "  {}* hobj{} = ({}*)ts_ptr({});", cn, dst.0, cn, dst_name);
+                            // the typed pointer lives in a block of its own: a local allocated at two
+                            // sites of one function (hono's ssg, an async body resumed) would declare
+                            // it twice in one C scope
+                            let _ = writeln!(s, "  {{ {}* hobj{} = ({}*)ts_ptr({});", cn, dst.0, cn, dst_name);
                         } else {
                             let alloc = if st == AllocStrategy::PretenuredHeap {
                                 "ts_new_sized_pretenured"
@@ -22073,7 +22078,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                                 "ts_new_sized"
                             };
                             let _ = writeln!(s, "  {} = {}(sizeof({}));", dst_name, alloc, cn);
-                            let _ = writeln!(s, "  {}* hobj{} = ({}*)ts_ptr({});", cn, dst.0, cn, dst_name);
+                            let _ = writeln!(s, "  {{ {}* hobj{} = ({}*)ts_ptr({});", cn, dst.0, cn, dst_name);
                             let _ = writeln!(s, "  hobj{}->header.proto={};", dst.0, proto_expr);
                         }
                         if class_index_enabled() {
@@ -22098,6 +22103,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                                 numeric.iter().map(|f| format!("hobj{}->f{} = 0;", dst.0, f)).collect();
                             let _ = writeln!(s, "  {}", inits.join(" "));
                         }
+                        let _ = writeln!(s, "  }}");
                         if st == AllocStrategy::PretenuredHeap {
                             let _ = writeln!(s, "  ts_write_barrier({}, {});", dst_name, proto_expr);
                         }

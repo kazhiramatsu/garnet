@@ -11863,3 +11863,59 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   export compared: identical; the ir-parity corpus: identical but the React subset's `null` props
   and the two new fixtures). Gates: the full gate set (unit, bundler 53/53, conformance plain and strict 678/678, protect and units 675/675, the GC gate suite incl. ASan and GC stress; bench: every benchmark correct, `string_unicode_search_kernel` 104 ms against its 100 ms budget under an external load, a VM at 120% CPU and a Chrome video, where it was 99 ms in the quiet run before this slice; its C has no typed-toString site, and an interleaved A/B of its binary against the committed runtime's object gave 108 vs 110 ms, no difference), the JSX plan gate, the fetch gates, the regexp AOT and link gates, the engine diff (43,593 cases, 0 differ); the ir-parity snapshot refreshed (4,226 files). tsc-ts r11 -> r12 instructions 0.9999 (22.218 G -> 22.216 G; the IR identical, the emitted C differs only at typed toString sites, none in tsc-ts), cycles 1.010 and wall 1.008 under the external load; vue quiet medians of 7: 1084.2 -> 1085.8 ms; hono routers quiet medians of 5: TrieRouter 256.2 -> 255.5, RegExpRouter 64.9 -> 65.3, PatternRouter 249.2 -> 244.4, SmartRouter 73.3 -> 73.2 ms (the routers' C is unchanged);
   hono_app 19 kinds with the two JSX pages: garnet 389 ms, Node 155 (2.5x) on a quiet machine; 438 vs 164 under the external load.
+- hono's middleware survey (Kaz: 「hono のミドルウェア群（jsx-renderer、cors、logger、validator 等）
+  の試験コンパイルで残る非対応を洗い出す」): `benchmarks/real/hono_survey/run.sh`, one driver per
+  middleware, helper and API surface (43), each run under Node and garnet and compared
+  (docs/real_projects.md "hono: the middleware survey"). The first run: 17 of 43 identical. It found
+  nine defects, fixed here, each with a conformance fixture in both profiles:
+  - `Array.prototype.sort`'s comparator result was truncated to an int before its sign was read:
+    a fractional result (`b.q - a.q` over quality values, hono's Accept parser) sorted nothing, a
+    silent miscompile in every program sorting by a non-integer key (`arrays/sort_comparator_results`).
+  - `Object.assign` and an object spread copied string keys only: the own enumerable symbol-keyed
+    properties were dropped (hono's css helper keeps a class name's selectors under symbols:
+    "Value is not iterable") (`objects/assign_spread_symbols`).
+  - The emitter declared the hoisted typed pointer of a sized allocation (`Class32* hobj6`) in the
+    function's scope: a local allocated at two sites of one C function (an async body resumed, the
+    ssg helper) was a C redefinition error. The pointer lives in a block of its own now.
+  - A member-less class over a runtime value (a mixin's `class extends b {}`, an `any` alias of a
+    class, a call returning one) built the parent's instance and relinked its prototype with the raw
+    setter: its fields read but did not enumerate (JSON.stringify gave `{}`). The derived constructor
+    marks the instance's class word relinked, as a program's own Object.setPrototypeOf does, without
+    raising the typed-slow mode (the closed-receivers check aborted on the user-level setter), so the
+    layout's registration is found through its allocation class (`classes/dynamic_base_sized_fields`).
+    `tests/rejects_syntax.sh` still expected these two forms rejected (supported since the rxjs
+    session, never updated; the gate is in `gate.sh ci`, which the recent slices did not run): updated.
+  - The receiver kind of `T | undefined` (an optional chain's result) was classified by the printed
+    form: `Promise<string>[] | undefined` became a promise receiver (hono's streaming renderer, a
+    compile-time reject). The union's one member without undefined decides
+    (`arrays/optional_chain_receiver_kind`).
+  - `console.trace` as a value (hono's streaming renderer's `onError` default): the error writer, as
+    `console.error` is; the runtime console object has the member.
+  - `new X()` of a constructor the environment declares but the runtime lacks (ReadableStream,
+    CustomEvent, WebSocket) rejected the whole module at compile time (jsx-renderer, body-limit, the
+    streaming helpers, the client): the construct goes through the global object at run time, a
+    ReferenceError where it is reached, as Node throws for a global it lacks
+    (`classes/ambient_global_ctor_runtime`).
+  - `import(spec)` of a module the program does not bundle, the specifier a const of a literal type
+    (hono's color helper probes `cloudflare:workers` inside a try/catch; logger and showRoutes
+    rejected at compile time): a promise rejected with an Error naming it; a bundled module stays a
+    compile-time reject (`modules/dynamic_import_unbundled`).
+  - A write to a Promise's property was a silent no-op: a promise cell had no property map, and
+    the prototype-chain walk treated it as an exotic link that jumps to Promise.prototype. hono's
+    css helper keeps a class name's data on the promise it returns, and our own
+    lib/node/child_process's promisified `exec` sets `promise.child` (undefined under garnet until
+    now). A promise carries the common object header now (`ts_promise.o`: Promise.prototype as its
+    chain, a property map the collector marks and the sweep releases, an ordinary link of the chain
+    walk), so `promise.child`, `Object.assign(promise, data)`, a spread, enumeration, `in` and
+    delete behave as V8's (`objects/promise_properties`); a cell grows by the header's size.
+  - `tests/rejects_bigint_etc.sh` and `tests/rejects_unsupported_stdlib.sh` (the `ci` gate) still
+    expected `new Date(string)` and `matchAll` with a non-global RegExp rejected: both agree with V8
+    now (the latter a catchable TypeError); updated.
+  After the fixes: 26 of 43 identical; the rest is a short list of platform features,
+  documented with the drivers they block, in order: Web Crypto (nine drivers; the next slice, over
+  the primitives lib/node/crypto.ts has), streams (body-limit, the streaming helpers, JSX streaming),
+  Blob / File and multipart files, CompressionStream, AsyncLocalStorage, BigInt (ip-restriction),
+  and one client reject to find (`options.webSocket(...args)` at
+  client.ts:225, a spread the same call compiles in a small program).
+- Gates: the full gate set (unit, bundler 53/53, conformance plain 685/685 and strict, protect and units all green, bench: every benchmark correct, `string_unicode_search_kernel` 101-102 ms against its 100 ms budget under the external load again (its C unchanged), the GC gate suite incl. ASan and GC stress), the `ci` gate (`gate.sh ci`: the negative tests, the JSX / fetch / regexp / unicode link gates, golden iterations, PGO and unit builds), green after three stale gates were repaired: tests/fetch_aot_gate.sh links its programs' regexp and unicode objects (the Web objects slice's lib code takes case mappings), tests/unicode_link_gate.sh called the QuickJS-era regexp probe, and the reject tests above; the regexp AOT and link gates, the engine diff (43,593 cases, 0 differ); the ir-parity snapshot refreshed. The `ci` gate had not been run for several sessions: it belongs in every slice's set from here on. tsc-ts r12 -> r13 instructions 0.9857 (22.191 G -> 21.873 G, a 1.4% reduction from the hoisted pointer's block scope, two builds agree), cycles 0.996, wall 1.000; vue quiet medians of 7: 1053.1 -> 1054.6 ms; hono routers quiet medians of 5: TrieRouter 248.5 -> 247.2, RegExpRouter 63.3 -> 63.2, PatternRouter 240.6 -> 241.5, SmartRouter 71.5 -> 71.8 ms; hono_app
+  garnet 389 ms, Node 157 (2.5x).

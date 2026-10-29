@@ -13,8 +13,9 @@ chk "mutually-cyclic class extends" 'class A extends B {} class B extends A {} f
 # A base that is not a class declaration (a mixin call, a class-valued binding)
 # was neither laid out nor linked: the instance lacked the base's fields and
 # methods (silent wrong values before). `extends ns.Base` is a class name.
-chk "class extending a mixin call" 'class A { a = 1; } function mix<B extends new (...a: any[]) => object>(b: B) { return class extends b {}; } class M extends mix(A) {} console.log(new M());'
-chk "class extending a class-valued constant" 'const K = class { k = 1; }; class D extends K {} console.log(new D().k);'
+# (A member-less class over a mixin call or a class-valued binding is SUPPORTED since the rxjs
+# session: a derived constructor over the value, tests/conformance/exhaustive/classes/dynamic_base_empty.ts
+# and dynamic_base_sized_fields.ts.)
 chk "value import linkage" 'import { value } from "./dep"; console.log(value);'
 chk "lexical TDZ read" 'console.log(x); let x = 1;'
 chk "lexical TDZ self read" 'let x = x; console.log(x);'
