@@ -1,5 +1,9 @@
 # fetch HTTPS transport (libcurl)
 
+> Session 358: the simplified `Headers` and `Response` objects described below were replaced by
+> the Web standard classes of `lib/node/web/fetch.ts` (docs/web_fetch_api_design.md); the transport,
+> its options and the error and abort behaviour of this document stand, behind the library's `fetch`.
+
 ## Decision
 fetch's HTTPS support uses libcurl as the transport rather than a hand-rolled
 TLS stack or a directly-embedded TLS library (BearSSL / Mbed TLS / wolfSSL).

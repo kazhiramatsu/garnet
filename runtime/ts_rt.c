@@ -3121,6 +3121,7 @@ static inline int pref_is_writable(ts_pref r){ return (pref_flags(r) & TS_PROP_W
 static inline int pref_is_enumerable(ts_pref r){ return (pref_flags(r) & TS_PROP_ENUMERABLE) != 0; }
 static inline int pref_is_configurable(ts_pref r){ return (pref_flags(r) & TS_PROP_CONFIGURABLE) != 0; }
 static int sized_field_enumerable(ts_object* o, ts_key key);     /* a struct field's effective attributes */
+static inline int class_field_is_private(ts_key key);           /* a class's `#x` field: hidden from reflection */
 static int sized_field_configurable(ts_object* o, ts_key key);   /* (an instance's record, else the defaults) */
 /* ---- integer slots: generalization and the kind-aware store (docs/record_int_fields_design.md) ---- */
 /* The sibling of shape `sid` with slot `slot` boxed: the chain from the root run
@@ -5218,6 +5219,7 @@ void ts_set_symkey(tsv obj, tsv sym, tsv val){
 }
 tsv ts_get_symkey(tsv obj, tsv sym){
   if (!ts_is_symbol(sym)) return TS_UNDEFINED;
+  if (ts_is_null(obj) || ts_is_undef(obj)) return ts_throw_cannot_read(obj, NULL);   /* V8's TypeError (a silent undefined was a miscompile) */
   /* a string or number primitive reads through its prototype ("ab"[Symbol.iterator]), as ts_get does */
   if (!ts_is_propbag(obj) && !ts_is_str(obj) && !ts_is_num(obj)) return TS_UNDEFINED;
   return ts_get(obj, ts_symbol_key(sym));
@@ -11438,7 +11440,12 @@ static void cb_push_entry(uint32_t key, tsv val, void* ud){
   ts_array_push_rooted(c->arr, pair);
   ts_gc_unroot(2);
 }
+/* Object.keys / values / entries of null or undefined: V8's TypeError (a silent [] was a miscompile). */
+static void object_enum_check(tsv obj){
+  if (ts_is_null(obj) || ts_is_undef(obj)) ts_throw_type_error_msg("Cannot convert undefined or null to object");
+}
 tsv ts_object_keys(tsv obj){
+  object_enum_check(obj);
   ts_gc_root(&obj);
   enum_arr_ctx c; c.arr=ts_new_array(0); c.recv=obj; ts_gc_root(&c.arr);
   ts_prop_own_enum(obj, cb_push_key, &c);
@@ -11587,7 +11594,7 @@ tsv ts_object_get_own_property_names(tsv obj){
   ts_object* o = ts_ptr(obj);
   ts_class_reg* reg = class_reg_for(o);
   int nf = class_reg_nfields(reg);
-  for (int i=0;i<nf;i++) push_own_name(arr, class_reg_field_key(reg, i));
+  for (int i=0;i<nf;i++){ uint32_t k = class_reg_field_key(reg, i); if (!class_field_is_private(k)) push_own_name(arr, k); }
   o = ts_ptr(obj);
   push_prop_names_js_order(arr, obj, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu);
   ts_gc_unroot(2);
@@ -11620,6 +11627,7 @@ tsv ts_object_get_own_property_symbols(tsv obj){
   return arr;
 }
 tsv ts_object_values(tsv obj){
+  object_enum_check(obj);
   ts_gc_root(&obj);
   enum_arr_ctx c; c.arr=ts_new_array(0); c.recv=obj; ts_gc_root(&c.arr);
   ts_prop_own_enum(obj, cb_push_val, &c);
@@ -11629,6 +11637,7 @@ tsv ts_object_values(tsv obj){
 /* Object.entries(o): array of [key, value] pairs (own enumerable string-keyed
    props + typed class instance struct fields), in JS order. */
 tsv ts_object_entries(tsv obj){
+  object_enum_check(obj);
   ts_gc_root(&obj);
   enum_arr_ctx c; c.arr=ts_new_array(0); c.recv=obj; ts_gc_root(&c.arr);
   ts_prop_own_enum(obj, cb_push_entry, &c);
@@ -12777,7 +12786,15 @@ static ts_pref sized_field_attr_find(ts_object* o, ts_key key){
   ts_pref p = prop_find(o, key);
   return pref_ok(p) && (pref_flags(p) & TS_PROP_FIELD_ATTR) ? p : PREF_NONE;
 }
+/* A class's private field (`#x`): the exporter lays it out as a struct field named with the
+   hash, and no reflection sees it (Object.keys, for..in, JSON.stringify, spread, the own names
+   and descriptors), as V8's private names are not properties. */
+static inline int class_field_is_private(ts_key key){
+  const char* nm = ts_field_name(key);
+  return nm != NULL && nm[0] == '#';
+}
 static int sized_field_enumerable(ts_object* o, ts_key key){
+  if (class_field_is_private(key)) return 0;
   ts_pref p = sized_field_attr_find(o, key);
   return pref_ok(p) ? (pref_flags(p) & TS_PROP_FIELD_ATTR_ENUM) != 0 : 1;
 }
@@ -14695,6 +14712,7 @@ tsv ts_get_own_property_descriptors(tsv obj){
       int nf = class_reg_nfields(reg);
       for (int i=0;i<nf;i++){
         uint32_t k = class_reg_field_key(reg,i);
+        if (class_field_is_private(k)) continue;
         tsv d = ts_own_descriptor_by_key(obj, k);
         if (!ts_is_undef(d)) ts_set(res, k, d);
         o = ts_ptr(obj);   /* re-resolve after possible GC */
@@ -18337,6 +18355,7 @@ tsv ts_get_dyn_checked(tsv obj, tsv keyv){
   return ts_get_dyn(obj, keyv);
 }
 tsv ts_get_dyn(tsv obj, tsv keyv){
+  if (ts_is_null(obj) || ts_is_undef(obj)) return ts_get_dyn_checked(obj, keyv);   /* V8's TypeError (a symbol key read undefined) */
   if (g_has_proxies && ts_is_proxy(obj)) return ts_proxy_get_v(obj, keyv, obj);
   if (ts_is_str(keyv)){
     /* a string key reaches its id without an allocation (interning is the table's own memory): no root */

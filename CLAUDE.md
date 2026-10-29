@@ -129,6 +129,11 @@ Rust in §315; selfhost is kept as a performance metric).
   object through `any` (`(E as any).A = 5`) is not seen by those reads, and a read before the enum's
   module has evaluated (an import cycle) gives the constant where V8 throws. The enum object itself
   is intact for `Object.keys(E)`, `E[0]` and a variable key. `TSAOT_ENUM_FOLD=0` keeps the loads.
+- A class's private field (`#x`) is hidden from enumeration and reflection (Session 358), but
+  `o.hasOwnProperty("#x")` and `"#x" in o` still see it, and `(o as any)["#x"]` reads it (V8: a
+  private name is not a property).
+- `Request.signal` is the init's signal itself (Node: a fresh signal following it), and
+  `ArrayBuffer.isView` does not recognize the library's `DataView` (docs/web_fetch_api_design.md).
 - `o.__proto__` and `o["__proto__"]` read undefined (V8: the prototype through the accessor);
   `Object.getPrototypeOf` / `setPrototypeOf` are the modelled forms (Session 355 note).
 - A typed receiver that is a Proxy (vue's reactive arrays and collections) takes its methods through

@@ -22,6 +22,8 @@
  * Unknowns default to UNSTABLE. We only claim stability we can see.
  */
 import * as ts from "typescript";
+/** The globals the Node prelude provides as classes of lib/node (exporter.ts NODE_PRELUDE_CTORS). */
+const PRELUDE_CLASS_NAMES = new Set(["Headers", "Request", "Response", "FormData", "DataView", "URL", "URLSearchParams"]);
 
 /**
  * Resolve a class/object member name to its compile-time string key, or
@@ -1011,9 +1013,23 @@ export class ClassExtractor {
     this.escapeCounts.set(what, (this.escapeCounts.get(what) ?? 0) + 1);
   }
   /** The user class declaring an instance method symbol, if it is one. */
+  /** The library's class behind a Web or URL global the Node prelude provides
+   *  (docs/web_fetch_api_design.md), by the global's name. */
+  private preludeClassByName(name: string): number | undefined {
+    for (const [node, id] of this.byNode) {
+      if (ts.isClassLike(node) && node.name !== undefined && node.name.text === name && node.getSourceFile().fileName.includes("/lib/node/")) return id;
+    }
+    return undefined;
+  }
   private methodClassOf(sym: ts.Symbol | undefined): number | undefined {
     if (!sym || !(sym.flags & ts.SymbolFlags.Method)) return undefined;
     const d = sym.valueDeclaration ?? sym.declarations?.[0];
+    // a method of a Web or URL class the Node prelude provides: the identifier's type is
+    // lib.dom's interface, the value the library's class, whose method escapes as a value here
+    if (d && ts.isMethodSignature(d) && d.parent && ts.isInterfaceDeclaration(d.parent) &&
+        PRELUDE_CLASS_NAMES.has(d.parent.name.text) && this.program.isSourceFileDefaultLibrary(d.getSourceFile())) {
+      return this.preludeClassByName(d.parent.name.text);
+    }
     if (!d || !ts.isMethodDeclaration(d) || !d.parent || !ts.isClassLike(d.parent)) return undefined;
     if (d.modifiers?.some((m) => m.kind === ts.SyntaxKind.StaticKeyword)) return undefined;
     return this.byNode.get(d.parent);

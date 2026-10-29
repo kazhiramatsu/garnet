@@ -56,7 +56,7 @@ async function main(): Promise<void> {
     if (typeof k !== "string" || typeof v !== "string") entriesOk = false;
   }
   console.log(entriesOk);
-  console.log(Object.isFrozen(r.headers as any));
+  console.log(!Object.isFrozen(r.headers as any));   // Node's response headers are not a frozen object (the guard is the class's)
   try {
     r.headers.set("x-tsaot-mut", "one");
     console.log(false);
@@ -90,6 +90,7 @@ async function main(): Promise<void> {
   const t = await r.text();
   console.log(typeof t === "string");
 }
+main();
 TS
 
 # 1. compile + link (always): proves the libcurl transport builds & links.
@@ -144,6 +145,7 @@ function main(): void {
   }
   console.log(entryOk);
 }
+main();
 TS
 if ! (cd exporter && node exporter.js "$tmp/headers_methods.ts" "$tmp/hm.json" "$tmp/hml.json") 2>"$tmp/hmexp.err"; then
   echo "[fetch] FAIL: Headers method-value export error"; cat "$tmp/hmexp.err"; exit 1
@@ -163,7 +165,7 @@ fi
 cat > "$tmp/fetch_error.ts" <<'TS'
 async function main(): Promise<void> {
   try {
-    await fetch("http://", { timeoutMs: 1 } as any);
+    await fetch("http://nonexistent.invalid./", { timeoutMs: 1 } as any);   // a transport failure (the resolve), not a URL parse error
     console.log(false);
   } catch (e: any) {
     console.log(e.name === "TypeError");
@@ -171,6 +173,7 @@ async function main(): Promise<void> {
     console.log(e.message.indexOf("fetch failed") >= 0);
   }
 }
+main();
 TS
 if ! (cd exporter && node exporter.js "$tmp/fetch_error.ts" "$tmp/fe.json" "$tmp/fel.json") 2>"$tmp/feexp.err"; then
   echo "[fetch] FAIL: fetch error export error"; cat "$tmp/feexp.err"; exit 1
@@ -235,6 +238,7 @@ async function main(): Promise<void> {
     console.log(e.message === "signal timed out");
   }
 }
+main();
 TS
 if ! (cd exporter && node exporter.js "$tmp/fetch_abort.ts" "$tmp/fa.json" "$tmp/fal.json") 2>"$tmp/faexp.err"; then
   echo "[fetch] FAIL: fetch abort export error"; cat "$tmp/faexp.err"; exit 1

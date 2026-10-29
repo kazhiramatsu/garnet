@@ -49,6 +49,17 @@ ns from "m"`, `new Date(value)` with a Date, an ISO or `toString`-shaped string 
 `Date.parse`, `toUTCString`, `JSON.stringify` with a replacer (function or allowlist),
 `Object.create(proto, descriptors)` and `x instanceof RegExp`.
 
+## hono_app (the application through `app.fetch`)
+
+`benchmarks/real/hono_app/driver.ts` (`build/real/hono_app` is a symbolic link to the hono clone)
+builds a hono application and drives it through `app.fetch(new Request(...))` over 17 request
+kinds: routing with params and wildcards, queries, middleware, JSON and form bodies, html, a
+redirect, a status, headers echoed, an HTTPException, `onError`, `notFound`, a sub-application
+with `route`, `all`, HEAD. The checksum is every response's status, headers and body, so the
+Web standard objects of `lib/node/web/` (docs/web_fetch_api_design.md) are compared with Node's
+own on hono's real code, and the loop over 20,000 requests is the dispatch benchmark (no socket).
+Session 358's first number: garnet 338 ms, Node 148 (2.3x).
+
 ## hono (routers)
 
 `benchmarks/real/hono/driver.ts` loads the route table of hono's own router benchmark into each

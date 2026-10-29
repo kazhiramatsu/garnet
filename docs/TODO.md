@@ -11776,3 +11776,45 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   `scripts/prof_pc.py` hung in `atos` on the profiling build (atos itself answers at once); the
   shares above are the sample file's own symbols aggregated by hand. Gates: conformance 671/671 plain and strict (the fixture included), 668/668 in units mode and under GC protect, unit, bundler 51/51, bench all within budget, GC stress PASSED, the regexp AOT and link gates. tsc-ts
   22.180 -> 22.181 G instructions (unchanged; outputs identical; 660 sites carry guards); vue 1,048.7 -> 1,051.1 ms (seven alternating rounds each, medians; outputs identical; Node 773; 702 sites carry guards).
+- Kaz: 「一区切りしましょう。garnet向けの高速Routerを作れたりしませんか？」, then 「なんならhonoのAOTに効く版を書いて
+  もいいかも？tsc-tsのように」. A trial compile of a minimal hono application against hono's own sources
+  (hono-base, context, request, compose, the routers) left 20 unsupported constructs, all missing
+  Web objects (`new Request`, `new Response`, `Headers.forEach` / `getSetCookie`, `DataView`,
+  `new String`): no port is needed, the standards are. Kaz: 「fetchはすでに実装していますが、Web標準を全て
+  実装する方針ですね。ひとまずそれで実装してください」, and on JSX (classic subset only; hono's JSX is the
+  automatic runtime): 「不足分も実装に追加してください. honoが動くように実装してください」.
+- The Web standard objects (docs/web_fetch_api_design.md): `Headers`, `Request`, `Response`,
+  `FormData` (text fields) and `fetch` in `lib/node/web/fetch.ts`, `DataView` in
+  `lib/node/web/dataview.ts`, `new String(v)` through `lib/node/web/string_object.ts`
+  (`__garnet_StringObject`, chained to `String.prototype`), all TypeScript compiled with the
+  program and installed by the Node prelude when the program names them (NODE_PRELUDE_PARTS /
+  GLOBALS / CTORS; a `new String(` names the wrapper). `fetch` is the library's function through
+  the global object, wrapping the runtime's transport as `__garnet_fetch` (a lib module's own
+  ambient declaration, lowered to the `global.fetch` builtin, which links libcurl as before); the
+  raw record stays (`status`, `ok`, `headers` plain, `__body`). The exporter's simplified `Headers`
+  / `Response` of the fetch slice (the `headers` receiver kind and method table, the namespace and
+  prototype tables, `new Headers`, `for..of` over headers, `response.text` / `json`) is gone. The
+  semantics follow Node 25 (undici): the Headers name and value validation, the sorted combined
+  iteration with `set-cookie` apart, the immutable guard of a fetch response; the bodies (string,
+  URLSearchParams, bytes, FormData as multipart, another object's `body`), `text` / `json` /
+  `arrayBuffer` / `bytes` / `formData` (urlencoded and multipart text fields), `bodyUsed`, `clone`;
+  a Request made from a Request pipes the body (the source locked and used at once), a Response
+  made from another's `body` locks the source; the Request options and their defaults; the
+  Response status range and null-body statuses, a Response as the init (hono's form),
+  `Response.json` / `redirect` / `error`. Fixtures `web/headers`, `web/request`, `web/response`,
+  `web/formdata`, `web/dataview`, `web/string_object` (Node's own objects are the oracle; all agree
+  in both profiles). The fetch gate's programs run as module programs now (they call `main()`; a
+  transport failure is a resolve failure; a response's headers are not frozen).
+- Found on the way, fixed: a class's private field (`#x`) was enumerable (JSON.stringify,
+  Object.keys, for..in, spread, the own names and descriptors listed it: a silent miscompile for
+  every class with one, hono's have dozens): the runtime hides a field named with `#`
+  (`class_field_is_private`; `hasOwnProperty` and `in` still see it, a known item in CLAUDE.md).
+  `Object.keys` / `values` / `entries` of null or undefined and a symbol-keyed read of null
+  returned empty results where V8 throws: TypeErrors now. A method of a prelude class read as a
+  value (`Headers.prototype.get.call({}, ..)`) was not an escape (lib.dom's interface, not the
+  library's class), so the borrowed call with a foreign `this` hit the closed-receivers abort:
+  `class_extract` maps the interface's method to the library's class.
+- `benchmarks/real/hono_app`: a hono application driven through `app.fetch(new Request)` over 17
+  request kinds (docs/real_projects.md), output identical to Node's; the dispatch loop over
+  20,000 requests: garnet 337 ms, Node 142 (2.4x), the next slice's subject after the JSX
+  automatic runtime. Gates: the full gate set (unit, bundler 51/51, conformance plain and strict 677/677, protect and units 674/674, bench, the GC gate suite: focused conformance under O2 / ASan / protect, the runtime unit tests, the cell-header knobs, GC stress), the fetch gate, the regexp AOT and link gates, the engine diff (43,593 cases, 0 differ); the ir-parity snapshot refreshed. tsc-ts r10 -> r11 instructions 1.0008 (22.198 G -> 22.215 G), cycles 0.996, wall 0.992; vue 1067.0 -> 1060.4 ms (medians of 7); hono routers quiet medians of 5: TrieRouter 244.1 -> 247.0, RegExpRouter 64.1 -> 63.3, PatternRouter 239.6 -> 243.2, SmartRouter 72.6 -> 71.4 ms (within noise).

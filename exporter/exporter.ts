@@ -112,11 +112,16 @@ function garnetModulePaths(): ts.MapLike<string[]> {
  *  computeModuleOrder evaluates first, and with lib/node/globals.d.ts unless @types/node
  *  already types the program. */
 let nodePreludeFile: string | undefined;
+/** lib/node's directory once the prelude is in use: a lib module's own ambient primitive
+ *  (`__garnet_fetch`) is recognized by its declaration's file. */
+let nodeLibDir: string | undefined;
 const NODE_PRELUDE_GLOBALS = new Set(["process", "Buffer", "atob", "btoa", "setTimeout", "setInterval", "setImmediate", "clearTimeout",
-  "clearInterval", "clearImmediate", "queueMicrotask", "structuredClone", "performance", "URL", "URLSearchParams", "global"]);
+  "clearInterval", "clearImmediate", "queueMicrotask", "structuredClone", "performance", "URL", "URLSearchParams", "global",
+  // the Web standard objects (docs/web_fetch_api_design.md); `__garnet_StringObject` is named by a `new String(...)`
+  "Headers", "Request", "Response", "FormData", "fetch", "DataView", "__garnet_StringObject"]);
 /** The constructors among them: lib.dom declares the identifier, the prelude's class is the
  *  global object's value, and `new URL(...)` constructs through that value. */
-const NODE_PRELUDE_CTORS = new Set(["URL", "URLSearchParams"]);
+const NODE_PRELUDE_CTORS = new Set(["URL", "URLSearchParams", "Headers", "Request", "Response", "FormData", "DataView", "__garnet_StringObject"]);
 /** The lib modules behind the globals: a program's prelude imports only the parts it names,
  *  so a program that uses setTimeout does not compile the streams behind process.stdout. */
 const NODE_PRELUDE_PARTS: { file: string; names: string[]; defaultImport?: string; triggers?: string[] }[] = [
@@ -127,6 +132,10 @@ const NODE_PRELUDE_PARTS: { file: string; names: string[]; defaultImport?: strin
   { file: "buffer", names: ["Buffer", "atob", "btoa"] },
   { file: "timers", names: ["setTimeout", "setInterval", "setImmediate", "clearTimeout", "clearInterval", "clearImmediate"] },
   { file: "url", names: ["URL", "URLSearchParams"] },
+  // the Web standard objects (docs/web_fetch_api_design.md)
+  { file: "web/fetch", names: ["Headers", "Request", "Response", "FormData", "fetch"] },
+  { file: "web/dataview", names: ["DataView"] },
+  { file: "web/string_object", names: ["__garnet_StringObject"] },
   // on demand: fs.createReadStream / fs.createWriteStream (node:fs itself does not carry node:stream)
   { file: "fs/streams", names: [], triggers: ["createReadStream", "createWriteStream"] },
 ];
@@ -386,6 +395,11 @@ function programWithNodeSupport(rootNames: string[], options: ts.CompilerOptions
           const sym = ck.getSymbolAtLocation(n);
           if (!sym || !sym.declarations || sym.declarations.every((d) => d.getSourceFile().isDeclarationFile)) found.add(n.text);
         }
+        // `new String(v)` constructs the prelude's wrapper class (docs/web_fetch_api_design.md)
+        if (ts.isNewExpression(n) && ts.isIdentifier(n.expression) && n.expression.text === "String" && !found.has("__garnet_StringObject")) {
+          const sym = ck.getSymbolAtLocation(n.expression);
+          if (!sym || !sym.declarations || sym.declarations.every((d) => d.getSourceFile().isDeclarationFile)) found.add("__garnet_StringObject");
+        }
         n.forEachChild(visit);
       };
       visit(f);
@@ -412,6 +426,7 @@ function programWithNodeSupport(rootNames: string[], options: ts.CompilerOptions
   for (let round = 0; round < 4; round++) {
     const preludePath = writeNodePrelude(libNode, needed);
     nodePreludeFile = preludePath;
+    nodeLibDir = libNode;
     current = ts.createProgram([...rootNames, ...typeRoots, preludePath], options, host);
     let grew = false;
     for (const n of namedGlobals(current, preludePath)) if (!needed.has(n)) { needed.add(n); grew = true; }
@@ -1903,6 +1918,12 @@ class Exporter {
     }
     return true;
   }
+  /** A symbol declared in lib/node's own files (the library's ambient primitives). */
+  isLibNodeSymbol(sym: ts.Symbol | undefined): boolean {
+    if (!sym || nodeLibDir === undefined) return false;
+    const dir = nodeLibDir;
+    return !!sym.declarations && sym.declarations.length > 0 && sym.declarations.every((d) => d.getSourceFile().fileName.startsWith(dir));
+  }
   isAmbientGlobalSymbol(sym: ts.Symbol | undefined): boolean {
     if (!sym) return true;
     let s = sym;
@@ -1925,7 +1946,7 @@ class Exporter {
   }
   isKnownBuiltinNamespaceRef(expr: ts.Expression): boolean {
     if (!ts.isIdentifier(expr)) return false;
-    const namespaces = new Set(["Math", "Number", "Object", "JSON", "String", "Array", "console", "Symbol", "Date", "Promise", "Headers", "Reflect"]);
+    const namespaces = new Set(["Math", "Number", "Object", "JSON", "String", "Array", "console", "Symbol", "Date", "Promise", "Reflect"]);
     return namespaces.has(expr.text) && this.isBuiltinNamespaceRef(expr, expr.text);
   }
   /** Evaluate a fully-constant NUMERIC expression in native JS (exact JS semantics,
@@ -2095,7 +2116,7 @@ class Exporter {
     }
     const kinds: [string, "string" | "array" | "map" | "set" | "weakmap" | "weakset" | "headers" | "number" | "boolean"][] =
       [["Array", "array"], ["String", "string"], ["Map", "map"], ["Set", "set"],
-       ["WeakMap", "weakmap"], ["WeakSet", "weakset"], ["Headers", "headers"],
+       ["WeakMap", "weakmap"], ["WeakSet", "weakset"],
        ["Number", "number"], ["Boolean", "boolean"]];
     for (const [name, kind] of kinds) {
       if (this.isBuiltinNamespaceRef(ns, name) && this.builtinMethodName2(kind, method) !== undefined) {
@@ -2120,7 +2141,7 @@ class Exporter {
     const kinds: [string, "object" | "string" | "array" | "map" | "set" | "weakmap" | "weakset" | "headers" | "number" | "boolean" | "function"][] =
       [["Object", "object"], ["Array", "array"], ["String", "string"], ["Map", "map"],
        ["Set", "set"], ["WeakMap", "weakmap"], ["WeakSet", "weakset"],
-       ["Headers", "headers"], ["Number", "number"], ["Boolean", "boolean"],
+       ["Number", "number"], ["Boolean", "boolean"],
        ["Function", "function"]];
     for (const [name, kind] of kinds) {
       if (this.isBuiltinNamespaceRef(ns, name)) return kind;
@@ -4787,7 +4808,12 @@ class Exporter {
         // the static classId equals the runtime class, so downstream
         // devirtualization agrees. functionValue: an ES5 function constructor —
         // ts_construct's class_id==0 arm builds the instance on fn.prototype.
-        const callee = this.lowerExpr(ctx, node.expression);
+        // `new String(v)`: the prelude's wrapper class (docs/web_fetch_api_design.md), not the
+        // String function the identifier names as a value
+        const callee = target.kind === "functionValue" && nodePreludeFile !== undefined && ts.isIdentifier(node.expression) &&
+            node.expression.text === "String" && this.isAmbientGlobalSymbol(this.symbolOf(node.expression))
+          ? this.loadGlobalObjectProperty(ctx, "__garnet_StringObject")
+          : this.lowerExpr(ctx, node.expression);
         const dargs = this.lowerSequenced(ctx, node.arguments ?? []);
         const ddst = this.newLocal(ctx, "reference", hint);
         this.emitNewMaybeGuarded(ctx, node, ddst, callee, dargs);
@@ -5827,8 +5853,13 @@ class Exporter {
           this.unsupported(node, "RegExp(...) requires a const string pattern and const string flags");
           return this.newLocal(ctx, "reference", hint);
         }
-        // Global builtins: parseInt / parseFloat / Number(x) coercion / fetch.
-        if (fn.text === "fetch" && isBuiltinSym) {
+        // `fetch(...)`: the prelude's function (lib/node/web/fetch.ts) through the global object
+        // (docs/web_fetch_api_design.md); the library reaches the runtime's transport as
+        // `__garnet_fetch`, lowered to the builtin, which also links the fetch runtime
+        if (fn.text === "fetch" && isBuiltinSym && nodePreludeFile !== undefined) {
+          return this.lowerGlobalIdentifierDynamicCall(ctx, "fetch", node.arguments, this.refKindOf(node));
+        }
+        if ((fn.text === "fetch" && isBuiltinSym) || (fn.text === "__garnet_fetch" && this.isLibNodeSymbol(sym))) {
           const argLs = this.lowerSequenced(ctx, node.arguments);
           const dst = this.newLocal(ctx, "reference");
           ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "global.fetch", args: argLs });
@@ -6245,39 +6276,6 @@ class Exporter {
               return dst;
             }
             this.unsupported(node, `Date method '${fn.name.text}' (not implemented)`);
-          }
-          if (rt === "Response") {
-            if (fn.name.text === "text" || fn.name.text === "json") {
-              const recv = this.lowerExpr(ctx, fn.expression);
-              const dst = this.newLocal(ctx, "reference");
-              ctx.body.push({ kind: "CallBuiltin", dst, builtin: `response.${fn.name.text}`, recv, args: [] });
-              return dst;
-            }
-          }
-          if (rt === "Headers") {
-            if (fn.name.text === "get" || fn.name.text === "has" ||
-                fn.name.text === "keys" || fn.name.text === "values" || fn.name.text === "entries" ||
-                fn.name.text === "append" || fn.name.text === "set" || fn.name.text === "delete") {
-              const recv = this.lowerExpr(ctx, fn.expression);
-              const argLs = this.lowerSequenced(ctx, node.arguments);
-              const needsName = fn.name.text === "get" || fn.name.text === "has" ||
-                fn.name.text === "append" || fn.name.text === "set" || fn.name.text === "delete";
-              const needsValue = fn.name.text === "append" || fn.name.text === "set";
-              const nameArg = needsName ? (argLs[0] ?? (() => {
-                  const u = this.newLocal(ctx, "reference");
-                  ctx.body.push({ kind: "Const", dst: u, value: { kind: "Undef" } });
-                  return u;
-                })()) : undefined;
-              const valueArg = needsValue ? (argLs[1] ?? (() => {
-                  const u = this.newLocal(ctx, "reference");
-                  ctx.body.push({ kind: "Const", dst: u, value: { kind: "Undef" } });
-                  return u;
-                })()) : undefined;
-              const dst = this.newLocal(ctx, fn.name.text === "has" ? "primitive" : "reference");
-              ctx.body.push({ kind: "CallBuiltin", dst, builtin: `headers.${fn.name.text}`, recv,
-                args: valueArg !== undefined ? [nameArg!, valueArg] : (nameArg !== undefined ? [nameArg] : []) });
-              return dst;
-            }
           }
           // (asyncgen).next() -> ts_asyncgen_next, returns a Promise<{value,done}>.
           if (fn.name.text === "next" && this.isAsyncGeneratorType(fn.expression)) {
@@ -9926,15 +9924,6 @@ class Exporter {
       }
       return dst;
     }
-    // new Headers(init) -> the runtime's simplified plain headers object. The
-    // helper accepts undefined/null, record-like objects, or arrays/iterables of
-    // [name,value] pairs, and stores lowercase normalized names.
-    if (ctorName === "Headers") {
-      const dst = this.newLocal(ctx, "reference");
-      const argLs = this.lowerSequenced(ctx, node.arguments ? Array.from(node.arguments) : []);
-      ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "headers.new", args: argLs.length > 0 ? [argLs[0]] : [] });
-      return dst;
-    }
     if (ctorName === "AbortController") {
       const dst = this.newLocal(ctx, "reference");
       const argLs = this.lowerSequenced(ctx, node.arguments ? Array.from(node.arguments) : []);
@@ -10146,7 +10135,7 @@ class Exporter {
     // is lib.dom's ambient declaration, the value is the prelude's class on the
     // global object, and the instance is constructed through it (ts_construct).
     if (classId === undefined && nodePreludeFile !== undefined && ts.isIdentifier(node.expression) &&
-        NODE_PRELUDE_CTORS.has(node.expression.text) && this.isAmbientGlobalSymbol(csym)) {
+        (NODE_PRELUDE_CTORS.has(node.expression.text) || node.expression.text === "String") && this.isAmbientGlobalSymbol(csym)) {
       return { kind: "functionValue" };
     }
     if (classId === undefined && !this.isAmbientGlobalSymbol(csym)) {
@@ -11149,12 +11138,10 @@ class Exporter {
       if (sym && sym.name === "Set") return "set";
       if (sym && sym.name === "WeakMap") return "weakmap";
       if (sym && sym.name === "WeakSet") return "weakset";
-      if (sym && sym.name === "Headers") return "headers";
       if (/^Map<|^ReadonlyMap</.test(tn)) return "map";
       if (/^Set<|^ReadonlySet</.test(tn)) return "set";
       if (/^WeakMap</.test(tn)) return "weakmap";
       if (/^WeakSet</.test(tn)) return "weakset";
-      if (/^Headers\b/.test(tn)) return "headers";
       if (sym && sym.name === "Array") return "array";
       if (/\[\]$/.test(tn) || /^(readonly )?Array<|^readonly /.test(tn)) return "array";
       // Tuple types (e.g. `[number, number]`, `[number, ...number[]]`) are arrays
@@ -11190,7 +11177,7 @@ class Exporter {
       if (sym && this.isRegExpResultSymbol(sym)) { kinds.add("array"); continue; }
       if (sym && !this.isAmbientGlobalSymbol(sym) && this.isCollectionDerivedType(m, 0, "Map")) { kinds.add("map"); continue; }
       if (sym && !this.isAmbientGlobalSymbol(sym) && this.isCollectionDerivedType(m, 0, "Set")) { kinds.add("set"); continue; }
-      if (sym && this.isAmbientGlobalSymbol(sym) && ["Map", "Set", "ReadonlyMap", "ReadonlySet", "WeakMap", "WeakSet", "Headers", "Promise", "Array", "ReadonlyArray"].includes(sym.name)) {
+      if (sym && this.isAmbientGlobalSymbol(sym) && ["Map", "Set", "ReadonlyMap", "ReadonlySet", "WeakMap", "WeakSet", "Promise", "Array", "ReadonlyArray"].includes(sym.name)) {
         kinds.add(sym.name.replace(/^Readonly/, "").toLowerCase());
         continue;
       }
@@ -11222,7 +11209,6 @@ class Exporter {
     const setMethods = new Set(["add","has","delete","clear","keys","values","entries","forEach"]);
     const weakMapMethods = new Set(["set","get","has","delete"]);
     const weakSetMethods = new Set(["add","has","delete"]);
-    const headersMethods = new Set(["get","has","keys","values","entries","append","set","delete"]);
     const numberMethods = new Set(["toFixed","toString","toPrecision","toExponential","valueOf"]);
     const booleanMethods = new Set(["toString","valueOf"]);
     const promiseMethods = new Set(["then","catch","finally"]);
@@ -11232,7 +11218,6 @@ class Exporter {
     if (kind === "set" && setMethods.has(method)) return `set.${method}`;
     if (kind === "weakmap" && weakMapMethods.has(method)) return `weakmap.${method}`;
     if (kind === "weakset" && weakSetMethods.has(method)) return `weakset.${method}`;
-    if (kind === "headers" && headersMethods.has(method)) return `headers.${method}`;
     if (kind === "number" && numberMethods.has(method)) return `number.${method}`;
     if (kind === "boolean" && booleanMethods.has(method)) return `boolean.${method}`;
     if (kind === "promise" && promiseMethods.has(method)) return `promise.${method}`;
@@ -13833,14 +13818,6 @@ class Exporter {
           ctx.body.push({ kind: "Call", dst, recv: iterator, callee: { kind: "Method", recvClass: 0xffffffff, method, methodField, recvStable: false }, args: [] });
           return dst;
         } });
-        return;
-      }
-      if (rkForOf === "headers") {
-        const recvL = this.lowerExpr(ctx, stmt.expression);
-        const arrL = this.newLocal(ctx, "reference");
-        ctx.body.push({ kind: "CallBuiltin", dst: arrL,
-          builtin: "headers.entries", recv: recvL, args: [] });
-        this.lowerArrayIndexForOf(ctx, stmt.initializer, stmt.statement, arrL, false);
         return;
       }
       // `for (... of arr.values() / arr.keys() / arr.entries())` over a built-in
