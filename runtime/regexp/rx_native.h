@@ -30,6 +30,14 @@ typedef int (*rx_native_fn)(rx_ctx* c, uint32_t pos, uint32_t base, uint32_t* ou
    instead of the interpreter); the first binding sticks, as the program is shared by every site
    of the pattern, and NULL leaves the interpreter */
 void rx_set_native(rx_program* p, rx_native_fn narrow, rx_native_fn wide);
+int rx_has_native(const rx_program* p);
+/* The native matchers of the patterns a training run saw the program build at run time
+   (docs/regexp_vm_design.md "The native tier for run-time patterns"): a table the object that
+   `tsaot regexps` writes installs from its constructor, looked up by content (the length and the
+   flags first, then the code units) when a pattern is compiled; 1 with the matchers when found. */
+typedef struct rx_native_table_entry { const uint16_t* src; uint32_t len; uint32_t flags; rx_native_fn narrow, wide; } rx_native_table_entry;
+void rx_native_table_install(const rx_native_table_entry* entries, uint32_t n);
+int rx_native_table_find(const uint16_t* src, uint32_t len, uint32_t flags, rx_native_fn* narrow, rx_native_fn* wide);
 
 /* the backtrack stack grows up to the limit (0 at the limit) */
 int rx_bt_grow(rx_ctx* c);

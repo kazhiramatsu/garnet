@@ -40,6 +40,16 @@ fn report_phase(enabled: bool, started: &mut Instant, phase: &str) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // `tsaot regexps <record>`: the C of the native matchers of a training run's regexps
+    // (rx_native.rs emit_table; docs/regexp_vm_design.md "The native tier for run-time patterns")
+    if args.get(1).map(|s| s.as_str()) == Some("regexps") {
+        let Some(record) = args.get(2) else {
+            eprintln!("usage: tsaot regexps <default.regexps>");
+            std::process::exit(2);
+        };
+        print!("{}", rx_native::emit_table(record));
+        return;
+    }
     let path = match args.get(1) {
         Some(p) => p,
         None => {

@@ -94,6 +94,12 @@ native_build() { # <extra cflags> <output executable> <pass directory>
   case "$extra" in *-fprofile-generate*) local TSAOT_UNITS_CACHE="$pw/unit-cache" ;; esac
   $CC -c "$ROOT/runtime/ts_rt.c" -I"$ROOT/runtime" -o "$pw/rt.o"
   tsaot_prepare_regexp_objs "$MARKERS_C" "$pw"
+  # the native matchers of the regexps the training run recorded (docs/regexp_vm_design.md)
+  if [[ -n "${RX_PROFILE:-}" && -n "$TSAOT_REGEXP_OBJ_ARGS" ]]; then
+    local rx_table_obj
+    tsaot_regexps_table "$ROOT/analyzer/target/release/tsaot" "$RX_PROFILE" "$CC" "$pw" rx_table_obj
+    [[ -n "$rx_table_obj" ]] && TSAOT_REGEXP_OBJ_ARGS="$TSAOT_REGEXP_OBJ_ARGS $rx_table_obj"
+  fi
   tsaot_prepare_unicode_objs "$MARKERS_C" "$pw"
   tsaot_prepare_fetch_runtime "$MARKERS_C" "$pw" "$pw/rt.o"
   if [[ "$UNITS" == "1" ]]; then
@@ -116,6 +122,9 @@ native_build() { # <extra cflags> <output executable> <pass directory>
 PGO="${TSAOT_PGO:-train}"
 PGO_PROFILE=""
 PGO_TRAINED_WITH=""
+# the regexps the training run records (default.regexps, docs/regexp_vm_design.md); TSAOT_REGEXPS=<file>
+# applies a given record with a given profile
+RX_PROFILE="${TSAOT_REGEXPS:-}"
 case "$PGO" in
   off)
     native_build "" "$WORK/tsc-ts" "$WORK/pass" ;;
@@ -135,6 +144,7 @@ case "$PGO" in
     native_build "$(tsaot_pgo_gen_flags "$WORK/pgo/raw")" "$WORK/tsc-ts.pgo-gen" "$WORK/pass_gen"
     echo "[pgo] training run: $TRAIN"
     tsaot_pgo_train "$TRAIN" "$WORK/tsc-ts.pgo-gen" "$WORK/pgo/raw" "$WORK/default.pgo"
+    if tsaot_regexps_write "$WORK/pgo/raw" "$WORK/default.regexps"; then RX_PROFILE="$WORK/default.regexps"; echo "[pgo] regexps $RX_PROFILE ($(grep -vc '^#' "$RX_PROFILE") built at run time)"; fi
     rm -rf "$WORK/tsc-ts.pgo-gen" "$WORK/pgo" "$WORK/pass_gen"
     PGO_PROFILE="$WORK/default.pgo"
     PGO_TRAINED_WITH="$TRAIN"
@@ -145,7 +155,7 @@ case "$PGO" in
     PGO_PROFILE="$(cd "$(dirname "$PGO")" && pwd)/$(basename "$PGO")"
     native_build "$(tsaot_pgo_use_flags "$PGO_PROFILE")" "$WORK/tsc-ts" "$WORK/pass" ;;
 esac
-python3 - "$WORK" "$CHECKOUT" "$CC" "$GEN_CC" "$UNITS" "${TSAOT_UNITS_LTO:-1}" "$PGO" "$PGO_PROFILE" "$PGO_TRAINED_WITH" <<'PY'
+python3 - "$WORK" "$CHECKOUT" "$CC" "$GEN_CC" "$UNITS" "${TSAOT_UNITS_LTO:-1}" "$PGO" "$PGO_PROFILE" "$PGO_TRAINED_WITH" "$RX_PROFILE" <<'PY'
 import json, pathlib, subprocess, sys
 work, checkout = map(pathlib.Path, sys.argv[1:3])
 commit = subprocess.run(["git", "-C", str(checkout), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
@@ -153,7 +163,7 @@ units = sys.argv[5] == "1"
 metadata = dict(checkout=str(checkout), commit=commit, source=str(work / "source"),
                 runtime_cc=sys.argv[3], generated_cc=sys.argv[4],
                 units=units, thin_lto=units and sys.argv[6] == "1",
-                pgo=dict(mode=sys.argv[7], profile=sys.argv[8] or None, trained_with=sys.argv[9] or None),
+                pgo=dict(mode=sys.argv[7], profile=sys.argv[8] or None, trained_with=sys.argv[9] or None, regexps=sys.argv[10] or None),
                 optimization_exceptions=json.loads((work / "optimization_exceptions.json").read_text()))
 (work / "build.json").write_text(json.dumps(metadata, indent=2) + "\n")
 PY

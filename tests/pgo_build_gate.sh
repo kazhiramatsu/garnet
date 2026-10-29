@@ -24,7 +24,8 @@ function main(): void {
   const acc = new Acc();
   const words: string[] = [];
   for (let i = 0; i < 20000; i++) { acc.add(i % 7); if (i % 1000 === 0) words.push("w" + i); }
-  console.log(acc.total, acc.odd, fib(20), words.join(","), /w(\d+)/.exec(words[3])![1]);
+  const built = new RegExp("w(" + "\\d+)");   // a pattern built at run time: the training run records it
+  console.log(acc.total, acc.odd, fib(20), words.join(","), /w(\d+)/.exec(words[3])![1], built.exec(words[2])![1]);
 }
 main();
 TS
@@ -45,11 +46,17 @@ if build pgo --pgo-train '"$TSAOT_PGO_BIN" > /dev/null'; then
   [[ -f "$P/default.pgo" ]] && ok "default.pgo written next to the entry file" || bad "no $P/default.pgo"
   grep -q "profile-guided: $P/default.pgo" "$W/pgo.err" && ok "the trained build applies the profile" || { bad "the trained build does not say it applies the profile"; tail -3 "$W/pgo.err"; }
   expect_output pgo
+  # the run-time regexp: recorded, compiled to a matcher, bound by content (docs/regexp_vm_design.md)
+  if [[ -f "$P/default.regexps" ]] && grep -q "00770028005c0064002b0029" "$P/default.regexps"; then ok "default.regexps holds the pattern built at run time"; else bad "default.regexps: $(cat "$P/default.regexps" 2>&1 | head -3)"; fi
+  grep -q "regexps: $P/default.regexps" "$W/pgo.err" && ok "the trained build applies the regexps" || bad "the trained build does not say it applies the regexps"
+  if TSAOT_REGEXP_TRACE=1 "$W/pgo/work" 2>&1 >/dev/null | grep -q 'native table: bound'; then ok "the run-time pattern binds its native matcher"; else bad "no table binding reported"; fi
+  if build rxoff --regexps off && ! grep -q "regexps:" "$W/rxoff.err" && ! (TSAOT_REGEXP_TRACE=1 "$W/rxoff/work" 2>&1 >/dev/null | grep -q 'native table'); then ok "--regexps off leaves the pattern on the interpreter"; else bad "--regexps off"; fi
+  expect_output rxoff
 else bad "--pgo-train"; head -5 "$W/pgo.err"; fi
 # a later plain build picks it up; --pgo off ignores it
 build auto && grep -q "profile-guided: $P/default.pgo" "$W/auto.err" && ok "a later build applies default.pgo" || bad "a later build does not apply default.pgo"
 expect_output auto
-build off --pgo off && ! grep -q "profile-guided" "$W/off.err" && ok "--pgo off ignores it" || bad "--pgo off"
+build off --pgo off && ! grep -q "profile-guided\|regexps:" "$W/off.err" && ok "--pgo off ignores it (and the regexps)" || bad "--pgo off"
 # units: the cache keys objects by the profile's content
 if build u1 --units --pgo-train '"$TSAOT_PGO_BIN" > /dev/null; "$TSAOT_PGO_BIN" > /dev/null'; then
   expect_output u1

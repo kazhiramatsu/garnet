@@ -149,6 +149,19 @@ int rx_exec(const rx_program* p, const void* input, uint32_t len, int wide, uint
 void rx_set_native(rx_program* p, rx_native_fn narrow, rx_native_fn wide){
   if (!p->native[0] && narrow && wide){ p->native[0] = narrow; p->native[1] = wide; }
 }
+int rx_has_native(const rx_program* p){ return p->native[0] != NULL; }
+static const rx_native_table_entry* g_native_table;
+static uint32_t g_native_table_n;
+void rx_native_table_install(const rx_native_table_entry* entries, uint32_t n){ g_native_table = entries; g_native_table_n = n; }
+int rx_native_table_find(const uint16_t* src, uint32_t len, uint32_t flags, rx_native_fn* narrow, rx_native_fn* wide){
+  for (uint32_t i = 0; i < g_native_table_n; i++){
+    const rx_native_table_entry* e = &g_native_table[i];
+    if (e->len == len && e->flags == flags && (len == 0 || memcmp(e->src, src, sizeof(uint16_t) * len) == 0)){
+      *narrow = e->narrow; *wide = e->wide; return 1;
+    }
+  }
+  return 0;
+}
 
 /* ---- disassembly ---- */
 static const char* op_name(uint32_t op){

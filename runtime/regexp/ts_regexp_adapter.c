@@ -95,7 +95,37 @@ static void throw_syntax(const uint16_t* u, uint32_t n, uint32_t flags, const ch
   free(src);
   ts_throw_syntax_error_msg(msg);
 }
-/* compile (or find) the program of a pattern; throws a SyntaxError */
+/* The native tier (docs/regexp_vm_design.md): a literal site passes the matchers the analyzer
+   compiled for its pattern; they are bound to the program on its first use. TSAOT_REGEXP_NATIVE=0
+   in the environment keeps every program on the interpreter (the A/B). The patterns a program
+   builds at run time ("The native tier for run-time patterns"): under TSAOT_REGEXP_RECORD=<file>
+   every pattern compiled without matchers from its site is appended to the file (the training
+   run's record, merged into default.regexps), and a table of matchers built from such a record
+   (the object `tsaot regexps` writes) is looked up by content when a pattern is compiled;
+   TSAOT_REGEXP_TRACE=1 reports each table binding on stderr. */
+static int g_native_off;
+static FILE* g_record;
+static int g_trace;
+static void write_pattern_line(FILE* f, const uint16_t* u, uint32_t n, uint32_t flags){
+  char fl[9]; flags_text(flags, fl);
+  size_t ulen; char* src = utf16_to_utf8(u, n, &ulen);
+  fputs(fl, f); fputc('\t', f);
+  for (uint32_t i = 0; i < n; i++) fprintf(f, "%04x", (unsigned)u[i]);
+  fputc('\t', f);
+  for (size_t i = 0; i < ulen; i++){
+    unsigned char c = (unsigned char)src[i];
+    if (c == '\\') fputs("\\\\", f); else if (c == '\t') fputs("\\t", f); else if (c == '\n') fputs("\\n", f); else if (c == '\r') fputs("\\r", f); else fputc(c, f);
+  }
+  fputc('\n', f);
+  free(src);
+}
+static void record_pattern(const uint16_t* u, uint32_t n, uint32_t flags){
+  if (!g_record) return;
+  write_pattern_line(g_record, u, n, flags);
+  fflush(g_record);
+}
+/* compile (or find) the program of a pattern; throws a SyntaxError. A pattern compiled for the
+   first time takes the matchers of the installed table when it holds the pattern. */
 static rx_program* compile_units(const uint16_t* u, uint32_t n, uint32_t flags){
   uint32_t h = hash_units(u, n, flags);
   cache_entry* e = &g_cache[h & (CACHE_SLOTS - 1u)];
@@ -103,6 +133,13 @@ static rx_program* compile_units(const uint16_t* u, uint32_t n, uint32_t flags){
   rx_error err;
   rx_program* p = rx_compile(u, n, flags, &err);
   if (!p){ throw_syntax(u, n, flags, err.msg ? err.msg : "Invalid regular expression"); return NULL; }
+  if (!g_native_off){
+    rx_native_fn n8, n16;
+    if (rx_native_table_find(u, n, flags, &n8, &n16)){
+      rx_set_native(p, n8, n16);
+      if (g_trace){ fputs("[regexp] native table: bound ", stderr); write_pattern_line(stderr, u, n, flags); }
+    }
+  }
   if (e->prog){ rx_release(e->prog); free(e->src); }
   e->src = (uint16_t*)malloc(sizeof(uint16_t) * (n ? n : 1));
   if (!e->src) abort();
@@ -110,21 +147,19 @@ static rx_program* compile_units(const uint16_t* u, uint32_t n, uint32_t flags){
   e->len = n; e->flags = flags; e->prog = p;   /* the cache holds p's first reference */
   return p;
 }
-/* The native tier (docs/regexp_vm_design.md): a literal site passes the matchers the analyzer
-   compiled for its pattern; they are bound to the program on its first use. TSAOT_REGEXP_NATIVE=0
-   in the environment keeps every program on the interpreter (the A/B). */
-static int g_native_off;
 static inline rx_program* bind_native(rx_program* p, rx_native_fn n8, rx_native_fn n16){
   if (n8 && !g_native_off) rx_set_native(p, n8, n16);
   return p;
 }
-/* a pattern string: a static literal source goes through the identity cache */
+/* a pattern string: a static literal source goes through the identity cache; a pattern whose
+   site passes no matchers (built at run time) goes to the record on its first compile */
 static rx_program* compile_pattern(tsv pattern, uint32_t flags, rx_native_fn n8, rx_native_fn n16){
   if (ts_is_heap_str(pattern) && (ts_str_flags_typed(pattern) & TS_STR_FLAG_STATIC)){
     uint64_t x = (uint64_t)pattern ^ ((uint64_t)pattern >> 17) ^ ((uint64_t)flags * 0x9E3779B1u);
     id_entry* e = &g_id_cache[(uint32_t)(x >> 3) & (ID_SLOTS - 1u)];
     if (e->prog && e->pattern == pattern && e->flags == flags) return bind_native(e->prog, n8, n16);
     units un; units_of(pattern, &un);
+    if (!n8) record_pattern(un.u, un.n, flags);
     rx_program* p = compile_units(un.u, un.n, flags);
     units_free(&un);
     if (e->prog) rx_release(e->prog);
@@ -133,6 +168,7 @@ static rx_program* compile_pattern(tsv pattern, uint32_t flags, rx_native_fn n8,
     return bind_native(p, n8, n16);
   }
   units un; units_of(pattern, &un);
+  if (!n8) record_pattern(un.u, un.n, flags);
   rx_program* p = compile_units(un.u, un.n, flags);
   units_free(&un);
   return bind_native(p, n8, n16);
@@ -934,6 +970,9 @@ void ts_regexp_adapter_init(void){
   done = 1;
   const char* nat = getenv("TSAOT_REGEXP_NATIVE");
   g_native_off = nat && (strcmp(nat, "0") == 0 || strcmp(nat, "false") == 0 || strcmp(nat, "no") == 0 || strcmp(nat, "off") == 0);
+  const char* rec = getenv("TSAOT_REGEXP_RECORD");
+  if (rec && *rec) g_record = fopen(rec, "a");
+  g_trace = getenv("TSAOT_REGEXP_TRACE") != NULL;
   keys_init();
   ts_regexp_proto_init();
   tsv proto = ts_regexp_proto();

@@ -12,6 +12,11 @@
 #                            entry file (or the project's tsconfig) is applied to
 #                            every build, the way Go applies a main package's
 #                            default.pgo (docs/pgo_design.md); --pgo off ignores it.
+#                            The training run also records the regular expressions
+#                            the program built at run time into default.regexps
+#                            next to the entry file, and every later build compiles
+#                            native matchers for them (docs/regexp_vm_design.md);
+#                            --regexps off ignores that file.
 #
 # Pipeline: exporter (TS → IR JSON) → analyzer `emit` (IR → C) → cc (C → binary).
 # Reuses the repo's link-flag helpers so optional RegExp / Unicode / fetch runtime
@@ -21,6 +26,8 @@
 #   TSAOT_CC               C compiler+flags (default "cc -O2"; e.g. "gcc -O2").
 #   TSAOT_PGO              auto (default: apply a default.pgo next to the entry
 #                          file or the tsconfig) | off | <profile file>.
+#   TSAOT_REGEXPS          auto (default: apply a default.regexps found as above)
+#                          | off | <regexps file>; off with --pgo off.
 #   TSAOT_ANALYZER         rust (default) | ts (frozen twin) | native.
 #   TSAOT_DEFINE           "NAME=value,..." build-time constants (true/false, a number,
 #                          a quoted string): an ambient identifier so named folds to the
@@ -192,8 +199,13 @@ usage: $PROG [-c | -S] [-o <out.c>] [-p <tsconfig>] <input.ts>
                 default.pgo next to the entry file or the project's tsconfig,
                 off ignores it, a file applies that profile (TSAOT_PGO)
   --pgo-train '<cmd>'  build an instrumented program, run <cmd> on it (the
-                executable is \$TSAOT_PGO_BIN and \$1), write default.pgo next
-                to the entry file and build with it (docs/pgo_design.md)
+                executable is \$TSAOT_PGO_BIN and \$1), write default.pgo and
+                default.regexps (the regexps the run built at run time) next
+                to the entry file and build with them (docs/pgo_design.md)
+  --regexps <auto|off|file>  native matchers for the regexps a training run
+                recorded: auto (default) applies a default.regexps found as
+                default.pgo is, off applies none, a file applies that record
+                (TSAOT_REGEXPS; docs/regexp_vm_design.md)
   -h, --help    show this help
 
 env: TSAOT_CC (default "cc -O2"), TSAOT_ANALYZER=rust|ts|native (default rust),
@@ -244,6 +256,7 @@ input=""
 project=""
 pgo_opt=""       # --pgo (TSAOT_PGO)
 pgo_train=""     # --pgo-train
+regexps_opt=""   # --regexps (TSAOT_REGEXPS)
 while [ $# -gt 0 ]; do
   case "$1" in
     -c) emit_only=1 ;;
@@ -261,6 +274,8 @@ while [ $# -gt 0 ]; do
     --pgo=*) pgo_opt="${1#--pgo=}" ;;
     --pgo-train) shift; [ $# -gt 0 ] || die "--pgo-train requires the training command"; pgo_train="$1" ;;
     --pgo-train=*) pgo_train="${1#--pgo-train=}" ;;
+    --regexps) shift; [ $# -gt 0 ] || die "--regexps requires an argument (auto, off or a regexps file)"; regexps_opt="$1" ;;
+    --regexps=*) regexps_opt="${1#--regexps=}" ;;
     -h|--help) usage; exit 0 ;;
     --) shift; break ;;
     -*) die "unknown option: $1 (try $PROG --help)" ;;
@@ -371,18 +386,32 @@ fi
 # project's tsconfig; `off` applies none; a path applies that profile.
 pgo_mode="${pgo_opt:-${TSAOT_PGO:-auto}}"
 pgo_profile=""
+pgo_dirs=("$(dirname "$input_abs")")
+if [ -n "$project" ]; then
+  if [ -d "$project" ]; then pgo_dirs+=("$(cd "$project" && pwd)"); else pgo_dirs+=("$(cd "$(dirname "$project")" && pwd)"); fi
+fi
 case "$pgo_mode" in
   off) ;;
   auto)
-    pgo_dirs=("$(dirname "$input_abs")")
-    if [ -n "$project" ]; then
-      if [ -d "$project" ]; then pgo_dirs+=("$(cd "$project" && pwd)"); else pgo_dirs+=("$(cd "$(dirname "$project")" && pwd)"); fi
-    fi
     for d in "${pgo_dirs[@]}"; do
       if [ -f "$d/default.pgo" ]; then pgo_profile="$d/default.pgo"; break; fi
     done ;;
   *) [ -f "$pgo_mode" ] || die "--pgo: no such profile: $pgo_mode"
      pgo_profile="$(cd "$(dirname "$pgo_mode")" && pwd)/$(basename "$pgo_mode")" ;;
+esac
+# the regexps a training run recorded (docs/regexp_vm_design.md "The native tier for run-time
+# patterns"): default.regexps found as default.pgo is; `--pgo off` is a plain build
+rx_mode="${regexps_opt:-${TSAOT_REGEXPS:-auto}}"
+[ "$pgo_mode" = off ] && [ -z "${regexps_opt:-${TSAOT_REGEXPS:-}}" ] && rx_mode=off
+rx_profile=""
+case "$rx_mode" in
+  off) ;;
+  auto)
+    for d in "${pgo_dirs[@]}"; do
+      if [ -f "$d/default.regexps" ]; then rx_profile="$d/default.regexps"; break; fi
+    done ;;
+  *) [ -f "$rx_mode" ] || die "--regexps: no such file: $rx_mode"
+     rx_profile="$(cd "$(dirname "$rx_mode")" && pwd)/$(basename "$rx_mode")" ;;
 esac
 
 # ----- stage 3: C → native executable -----
@@ -438,6 +467,12 @@ native_build() { # <extra cflags> <output executable> <pass directory>
   fi
   # Optional runtime objects, gated by markers the emitted C declares.
   tsaot_prepare_regexp_objs "$markers_c" "$pw" || die "failed to prepare RegExp runtime"
+  # the native matchers of the regexps a training run recorded, one object beside the engine's
+  if [ -n "$rx_profile" ] && [ -n "$TSAOT_REGEXP_OBJ_ARGS" ] && [ "${TSAOT_ANALYZER:-rust}" = rust ]; then
+    local rx_table_obj
+    tsaot_regexps_table "$ANALYZER" "$rx_profile" "$CC" "$pw" rx_table_obj || die "failed to build the regexp matcher table"
+    [ -n "$rx_table_obj" ] && TSAOT_REGEXP_OBJ_ARGS="$TSAOT_REGEXP_OBJ_ARGS $rx_table_obj"
+  fi
   tsaot_prepare_unicode_objs "$markers_c" "$pw" || die "failed to prepare Unicode runtime"
   tsaot_prepare_fetch_runtime "$markers_c" "$pw" "$rt_obj" || die "failed to prepare fetch runtime"
   if [ "$units" = 1 ]; then
@@ -469,6 +504,13 @@ if [ -n "$pgo_train" ]; then
   rm -f "$gen_bin"
   pgo_profile="$pgo_out"
   echo "$PROG: wrote $pgo_out (every later build of $base applies it)" >&2
+  rx_out="$(dirname "$input_abs")/default.regexps"
+  if tsaot_regexps_write "$work/pgo" "$rx_out"; then
+    rx_profile="$rx_out"
+    echo "$PROG: wrote $rx_out ($(grep -vc '^#' "$rx_out") regexp(s) built at run time; native matchers from now on)" >&2
+  else
+    rx_profile=""
+  fi
 fi
 pgo_flags=""
 if [ -n "$pgo_profile" ]; then
@@ -482,6 +524,7 @@ fi
 native_build "$pgo_flags" "$binary" "$work/use"
 pgo_note=""
 if [ -n "$pgo_profile" ]; then pgo_note=" (profile-guided: $pgo_profile)"; fi
+if [ -n "$rx_profile" ]; then pgo_note="$pgo_note (regexps: $rx_profile)"; fi
 if [ "$units" = 1 ]; then
   echo "$PROG: wrote $units_dir and $binary$pgo_note" >&2
 else

@@ -6,6 +6,10 @@
 # and the same sources are transpiled for Node (transpile_tree.js); both run `runs` times, the
 # checksums must agree, and the median times are printed.
 #   bash benchmarks/real/run.sh <name> [runs]
+# TSAOT_REAL_PGO=auto|off|train (docs/pgo_design.md): `auto` (the default) applies a default.pgo and
+# default.regexps an earlier training left next to garnet-driver.ts in the clone, `off` is the plain
+# build (the earlier sessions' numbers), `train` runs the driver's own workload as the training run
+# inside the clone and builds with its profile and its run-time regexps' native matchers.
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 name="${1:?name}"; runs="${2:-3}"
@@ -25,9 +29,18 @@ if [ -f "$ROOT/benchmarks/real/$name/types.txt" ] && [ ! -d "$proj/garnet-types/
   ( cd "$proj/garnet-types" && npm install --silent --no-package-lock --no-audit --no-fund $(cat "$ROOT/benchmarks/real/$name/types.txt") ) || { echo "[$name] npm install of the typings FAILED"; exit 1; }
 fi
 cp "$ROOT/benchmarks/real/$name/tsconfig.json" "$proj/garnet-tsconfig.json"
-echo "[$name] garnet build"
-( cd "$ROOT" && "$ROOT/garnet" -p "$proj/garnet-tsconfig.json" -o "$work/driver.c" "$proj/garnet-driver.ts" ) > "$work/build.log" 2>&1 \
+pgo_mode="${TSAOT_REAL_PGO:-auto}"
+pgo_args=()
+case "$pgo_mode" in
+  off) pgo_args=(--pgo off) ;;
+  train) pgo_args=(--pgo-train "cd '$proj' && \"\$TSAOT_PGO_BIN\" > /dev/null 2>&1") ;;
+  auto) ;;
+  *) echo "[$name] TSAOT_REAL_PGO must be auto, off or train (got $pgo_mode)"; exit 1 ;;
+esac
+echo "[$name] garnet build (pgo: $pgo_mode)"
+( cd "$ROOT" && "$ROOT/garnet" "${pgo_args[@]}" -p "$proj/garnet-tsconfig.json" -o "$work/driver.c" "$proj/garnet-driver.ts" ) > "$work/build.log" 2>&1 \
   || { echo "[$name] garnet build FAILED:"; grep -v "^\s*$" "$work/build.log" | tail -25; exit 1; }
+grep -o "(profile-guided: [^)]*)\|(regexps: [^)]*)" "$work/build.log" | sed "s/^/[$name] /"
 # a workspace's bare specifiers for the Node side (benchmarks/real/<name>/paths.js writes it)
 pathsArg=""; [ -f "$proj/garnet-paths.json" ] && pathsArg="$proj/garnet-paths.json"
 echo "[$name] node transpile: $(ROOT="$ROOT" node "$ROOT/benchmarks/real/transpile_tree.js" "$proj" "$work/node" garnet-driver.ts $pathsArg 2>&1 | tr '\n' ' ')"

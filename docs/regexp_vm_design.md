@@ -640,6 +640,30 @@ measurement variant.
   class, nested literals, holes and spreads untouched). hono, five alternating rounds on one
   toolchain (the knob off against on; medians; Node): TrieRouter 250.7 -> 245.3 ms (260), RegExpRouter 69.0 -> 69.3 (39), PatternRouter 239.1 -> 240.1 (153), SmartRouter 82.6 -> 82.5 (42); outputs identical; the whole run 18.99 -> 18.71 G
   instructions. Gates: conformance 670/670 plain and strict (the fixture included), 667/667 in units mode and under GC protect, unit, bundler 51/51, bench all within budget, GC stress PASSED, the regexp AOT and link gates. vue 1,053.5 -> 1,047.8 ms (seven alternating rounds each, medians; outputs identical; Node 773); tsc-ts 22.183 -> 22.177 G instructions (unchanged; outputs identical).
+- **R9 built (Session 358): the native tier for run-time patterns.** The design above, as
+  written: the adapter records every pattern compiled without matchers from its site under
+  `TSAOT_REGEXP_RECORD` (the training run's variable, set by `tsaot_pgo_train`), the merge writes
+  `default.regexps` next to `default.pgo` (`tsaot_regexps_write`), the driver finds it as it
+  finds the profile (`--regexps <auto|off|file>`, `TSAOT_REGEXPS`; `--pgo off` is a plain build
+  unless the regexps are chosen explicitly), `tsaot regexps <file>` writes the matchers and the
+  table (`rx_native.rs emit_table`, the functions `static` in that unit), `tsaot_regexps_table`
+  compiles it into `rx_table.o` on the link line next to the engine's objects in every pass, and
+  `compile_units` binds a pattern by content on its first compile (`rx_native_table_find`: the
+  length and flags, then the units; `TSAOT_REGEXP_TRACE=1` reports each binding).
+  `build_tsc_ts_native.sh`'s training records as well (`build.json` `pgo.regexps`), and
+  `benchmarks/real/run.sh` takes `TSAOT_REAL_PGO=train|auto|off` (docs/real_projects.md). hono's
+  training run records 15 patterns: the RegExpRouter's alternation per method, the
+  PatternRouter's regexp per route, the wildcard forms. hono, five alternating rounds on one
+  toolchain (medians; Node): the regexps alone (the plain clang build with the table) RegExpRouter
+  68.1 -> 60.0 ms (39), PatternRouter 241.9 -> 214.7 (153), SmartRouter 81.9 -> 76.0 (42), the
+  TrieRouter unchanged; the trained build (the profile and the regexps) TrieRouter 246.0 -> 179.8
+  (260), RegExpRouter 68.8 -> 47.0 (39: 1.2x), PatternRouter 243.7 -> 148.3 (153: below Node),
+  SmartRouter 82.0 -> 55.2 (42); outputs identical throughout. What remains of the RegExpRouter's
+  1.2x is the driver loop's call through the `match` function value and the closure's own body,
+  which V8 inlines into the loop. `tests/pgo_build_gate.sh` covers the record, the file, the
+  binding (the trace) and the `--regexps off` and `--pgo off` builds; the engine diff
+  43,593 cases, 0 differ in the interpreter and the native mode. Gates: conformance 670/670 plain and strict, 667/667 in units mode and under GC protect, unit (the pgo build gate with the regexps cases), bundler 51/51, bench all within budget, GC stress PASSED, the regexp AOT and link gates. tsc-ts
+  22.190 -> 22.182 G instructions (unchanged; outputs identical); the benchmark's own training run records no run-time regexp (the measured compile builds none: its patterns are literals, and the project's file list needs no glob), so the trained build links no table (18.635 G instructions, as before); vue 1,061.7 -> 1,060.0 ms (seven alternating rounds each, medians; outputs identical; Node 773).
 - Not yet: the `v`-mode properties of strings (`\p{RGI_Emoji}` and the other six; the emoji
   sequence data is in `build/ucd/17.0.0/emoji-seq/`, emoji 16.0 at the time of writing).
 

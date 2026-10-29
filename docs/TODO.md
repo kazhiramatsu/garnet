@@ -11706,3 +11706,35 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   hono, five alternating rounds on one toolchain (the knob off against on; medians; Node):
   TrieRouter 250.7 -> 245.3 ms (260), RegExpRouter 69.0 -> 69.3 (39), PatternRouter 239.1 -> 240.1 (153), SmartRouter 82.6 -> 82.5 (42); outputs identical; the whole run 18.99 -> 18.71 G instructions (-1.5%). Gates: conformance 670/670 plain and strict (the fixture included), 667/667 in units mode and under GC protect, unit, bundler 51/51, bench all within budget, GC stress PASSED, the regexp AOT and link gates. vue 1,053.5 -> 1,047.8 ms (seven alternating rounds each, medians; outputs identical; Node 773);
   tsc-ts 22.183 -> 22.177 G instructions (unchanged; outputs identical).
+- R9 of the regexp VM: the native tier for run-time patterns (docs/regexp_vm_design.md "The
+  native tier for run-time patterns (R9)" and "R9 built", docs/pgo_design.md, docs/real_projects.md).
+  Kaz's paste left (1) to his word ("進めてよいか指示をください") and came back without one; the
+  design doc was written first (the convention: a second file of the training run, next to
+  `default.pgo`) and the slice built on it. A pattern the program builds at run time (hono's
+  route regexps) ran on the interpreter: the native tier needs the pattern at build time, V8
+  compiles it just in time. Now: the adapter records every pattern compiled without matchers from
+  its site under `TSAOT_REGEXP_RECORD` (`flags`, the hex UTF-16 units, the source), the
+  training run of `garnet --pgo-train` and of `build_tsc_ts_native.sh` sets it
+  (`tsaot_pgo_train`), the merge writes `default.regexps` beside `default.pgo`
+  (`tsaot_regexps_write`), the driver finds it as it finds the profile (`--regexps
+  <auto|off|file>` / `TSAOT_REGEXPS`; `--pgo off` is plain unless the regexps are chosen
+  explicitly), `tsaot regexps <file>` writes the matchers of the distinct patterns with a table
+  (`rx_native.rs emit_table`; the functions `static` in that unit, a constructor installs the table
+  in the engine), `tsaot_regexps_table` compiles it into one object on the link line next to the
+  engine's (the program's C untouched: no second emission, the unit cache unaffected), and
+  `compile_units` binds a pattern by content on its first compile (`rx_native_table_find`;
+  `TSAOT_REGEXP_NATIVE=0` keeps the interpreter, `TSAOT_REGEXP_TRACE=1` reports each binding).
+  `benchmarks/real/run.sh` takes `TSAOT_REAL_PGO=train|auto|off` (`train` runs the driver's own
+  workload in the clone; `auto`, the default, applies what a training left there; `off` is the
+  plain build of the earlier numbers), `ab4.sh` A/Bs hono's four routers. hono's training records
+  15 patterns (the RegExpRouter's alternation per method, the PatternRouter's regexp per route, the
+  wildcard forms), all bound at run time. hono, five alternating rounds on one toolchain (medians;
+  Node): the regexps alone (the plain clang build with the table) RegExpRouter 68.1 -> 60.0 ms
+  (39), PatternRouter 241.9 -> 214.7 (153), SmartRouter 81.9 -> 76.0 (42), the TrieRouter
+  unchanged; the trained build (the profile and the regexps) TrieRouter 246.0 -> 179.8 (260),
+  RegExpRouter 68.8 -> 47.0 (39: 1.2x, the paste's estimate), PatternRouter 243.7 -> 148.3 (153:
+  below Node), SmartRouter 82.0 -> 55.2 (42); outputs identical throughout. The remaining 1.2x of
+  the RegExpRouter is the driver loop's call through the `match` function value and the closure's
+  body, which V8's JIT inlines into the loop. Gates: `tests/pgo_build_gate.sh` (the record, the
+  file, the binding's trace, `--regexps off`, `--pgo off`, the units build), the engine diff
+  43,593 cases 0 differ in both modes, conformance 670/670 plain and strict, 667/667 in units mode and under GC protect, unit (the pgo build gate with the regexps cases), bundler 51/51, bench all within budget, GC stress PASSED, the regexp AOT and link gates. tsc-ts 22.190 -> 22.182 G instructions (unchanged; outputs identical); the benchmark's own training run records no run-time regexp (the measured compile builds none: its patterns are literals, and the project's file list needs no glob), so the trained build links no table (18.635 G instructions, as before); vue 1,061.7 -> 1,060.0 ms (seven alternating rounds each, medians; outputs identical; Node 773).

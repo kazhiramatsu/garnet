@@ -9,7 +9,20 @@ driver and its tsconfig live in `benchmarks/real/<name>/` and are copied into th
     bash benchmarks/real/run.sh hono 3      # <name> [runs]; median wall time of each engine
 
 `benchmarks/real/ab.sh binA binB [runs]`, run inside the clone, alternates two builds of a driver and
-prints each run's time and the medians: the form every tuning change here is measured in.
+prints each run's time and the medians: the form every tuning change here is measured in
+(`ab4.sh` does the same for hono's four routers at once).
+
+`TSAOT_REAL_PGO=train` (Session 358) runs the driver's own workload as a training run inside the
+clone (`garnet --pgo-train`, docs/pgo_design.md): `default.pgo` and `default.regexps` (the
+regular expressions the program built at run time, docs/regexp_vm_design.md "The native tier
+for run-time patterns") land next to `garnet-driver.ts` in the clone, and the build applies
+them. `auto` (the default) applies what an earlier training left there, as the convention does
+for any program; `off` is the plain build, the one the earlier sessions' numbers come from. The
+script prints which it applied. hono, plain against trained (five alternating rounds, medians;
+Node): TrieRouter 246.0 -> 179.8 ms (260), RegExpRouter 68.8 -> 47.0 (39), PatternRouter
+243.7 -> 148.3 (153), SmartRouter 82.0 -> 55.2 (42); the regexps alone (`TSAOT_REAL_PGO=off
+TSAOT_REGEXPS=<file>`): RegExpRouter 68.1 -> 60.0, PatternRouter 241.9 -> 214.7, SmartRouter
+81.9 -> 76.0, the TrieRouter unchanged.
 
 `run.sh` builds the native binary, transpiles the import graph for Node with the repository's
 TypeScript (`benchmarks/real/transpile_tree.js`: `.ts` to `.mjs`, specifiers rewritten, a bare

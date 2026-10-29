@@ -290,7 +290,14 @@ Two tools that look right are wrong on garnet's binaries, and one works:
   (`docs/pgo_design.md`: two compile passes and a training run, about 55 s more
   at three jobs); `TSAOT_PGO=off` gives the plain binary, and an A/B of two
   profile-guided builds resolves no less than the build-to-build variation of
-  the training (recorded there). Omitting the frame pointer is worth 0.9% of the instructions (the
+  the training (recorded there). The same training run records the regular expressions the
+  program built at run time into `default.regexps` beside `default.pgo` (Session 358,
+  `docs/regexp_vm_design.md` "The native tier for run-time patterns"): the build compiles native
+  matchers for them into one object (`tsaot regexps <file>`), the runtime binds them by content,
+  `TSAOT_REGEXP_TRACE=1` prints each binding, and `--regexps off` / `TSAOT_REGEXPS=off` leaves
+  them on the interpreter. The real-project runner trains with `TSAOT_REAL_PGO=train` and
+  applies an earlier training by default (`off` for the plain build the older numbers come
+  from). Omitting the frame pointer is worth 0.9% of the instructions (the
   generated code is thousands of small functions; the runtime and the collector
   never read frame pointers, the collector scans the stack by words, and crash
   backtraces still have the compact unwind info). Only the profiling build keeps
