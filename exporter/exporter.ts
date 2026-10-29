@@ -119,10 +119,13 @@ let nodeLibDir: string | undefined;
 const NODE_PRELUDE_GLOBALS = new Set(["process", "Buffer", "atob", "btoa", "setTimeout", "setInterval", "setImmediate", "clearTimeout",
   "clearInterval", "clearImmediate", "queueMicrotask", "structuredClone", "performance", "URL", "URLSearchParams", "global",
   // the Web standard objects (docs/web_fetch_api_design.md); `__garnet_StringObject` is named by a `new String(...)`
-  "Headers", "Request", "Response", "FormData", "fetch", "DataView", "__garnet_StringObject"]);
+  "Headers", "Request", "Response", "FormData", "fetch", "DataView", "__garnet_StringObject",
+  // Web Crypto (docs/web_crypto_design.md)
+  "crypto", "Crypto", "SubtleCrypto", "CryptoKey"]);
 /** The constructors among them: lib.dom declares the identifier, the prelude's class is the
  *  global object's value, and `new URL(...)` constructs through that value. */
-const NODE_PRELUDE_CTORS = new Set(["URL", "URLSearchParams", "Headers", "Request", "Response", "FormData", "DataView", "__garnet_StringObject"]);
+const NODE_PRELUDE_CTORS = new Set(["URL", "URLSearchParams", "Headers", "Request", "Response", "FormData", "DataView", "__garnet_StringObject",
+  "Crypto", "SubtleCrypto", "CryptoKey"]);
 /** The lib modules behind the globals: a program's prelude imports only the parts it names,
  *  so a program that uses setTimeout does not compile the streams behind process.stdout. */
 const NODE_PRELUDE_PARTS: { file: string; names: string[]; defaultImport?: string; triggers?: string[] }[] = [
@@ -137,6 +140,8 @@ const NODE_PRELUDE_PARTS: { file: string; names: string[]; defaultImport?: strin
   { file: "web/fetch", names: ["Headers", "Request", "Response", "FormData", "fetch"] },
   { file: "web/dataview", names: ["DataView"] },
   { file: "web/string_object", names: ["__garnet_StringObject"] },
+  // Web Crypto (docs/web_crypto_design.md): the `crypto` global over node:crypto's digests and HMAC
+  { file: "web/crypto", names: ["crypto", "Crypto", "SubtleCrypto", "CryptoKey"] },
   // on demand: fs.createReadStream / fs.createWriteStream (node:fs itself does not carry node:stream)
   { file: "fs/streams", names: [], triggers: ["createReadStream", "createWriteStream"] },
 ];

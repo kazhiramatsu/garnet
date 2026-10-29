@@ -11919,3 +11919,17 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   client.ts:225, a spread the same call compiles in a small program).
 - Gates: the full gate set (unit, bundler 53/53, conformance plain 685/685 and strict, protect and units all green, bench: every benchmark correct, `string_unicode_search_kernel` 101-102 ms against its 100 ms budget under the external load again (its C unchanged), the GC gate suite incl. ASan and GC stress), the `ci` gate (`gate.sh ci`: the negative tests, the JSX / fetch / regexp / unicode link gates, golden iterations, PGO and unit builds), green after three stale gates were repaired: tests/fetch_aot_gate.sh links its programs' regexp and unicode objects (the Web objects slice's lib code takes case mappings), tests/unicode_link_gate.sh called the QuickJS-era regexp probe, and the reject tests above; the regexp AOT and link gates, the engine diff (43,593 cases, 0 differ); the ir-parity snapshot refreshed. The `ci` gate had not been run for several sessions: it belongs in every slice's set from here on. tsc-ts r12 -> r13 instructions 0.9857 (22.191 G -> 21.873 G, a 1.4% reduction from the hoisted pointer's block scope, two builds agree), cycles 0.996, wall 1.000; vue quiet medians of 7: 1053.1 -> 1054.6 ms; hono routers quiet medians of 5: TrieRouter 248.5 -> 247.2, RegExpRouter 63.3 -> 63.2, PatternRouter 240.6 -> 241.5, SmartRouter 71.5 -> 71.8 ms; hono_app
   garnet 389 ms, Node 157 (2.5x).
+- Web Crypto, the gap behind nine survey drivers (Kaz: 「ひとまずhonoが動くようにしてください」):
+  `lib/node/web/crypto.ts` (docs/web_crypto_design.md), the globals `crypto`, `Crypto`, `SubtleCrypto`
+  and `CryptoKey` installed by the prelude when named, over node:crypto's primitives: `subtle.digest`
+  (SHA-1 / 256 / 384 / 512; SHA-384 added to the host as SHA-512 over its own initial values),
+  HMAC keys (`importKey` raw and JWK `oct`, `sign`, `verify` in constant time, `exportKey` raw and
+  JWK, `generateKey`), `randomUUID`, `getRandomValues` (integer views only, Node's
+  `TypeMismatchError` and `QuotaExceededError`); RSA, ECDSA and AES are a `NotSupportedError`
+  naming them (CLAUDE.md). Node's error names are followed, including its `InvalidAccessException`
+  for a non-extractable key's export. Fixture `web/crypto` (both profiles; the one case Node differs
+  on, an RSA JWK import Node accepts, is left out). The survey's basic-auth, bearer-auth, combine,
+  signed cookies, crypto utils, jwt, request-id and secure-headers drivers agree with Node now:
+  34 of 43; etag waits for streams (its body digest reads the response's stream).
+- Gates: the full gate set green: unit, bundler 53/53, conformance plain and strict 686/686, protect and units 683/683, bench (every benchmark correct; `string_unicode_search_kernel` 102 ms against its 100 ms budget under the external load again, its C unchanged), the GC suite incl. ASan and GC stress, the `ci` gate (the negative tests, the JSX / fetch / regexp / unicode link gates, the engine diff 43,593 cases 0 differ); the ir-parity snapshot refreshed (the node/crypto fixture's IR changed: a program naming `crypto` carries the Web Crypto part now). tsc-ts r13 -> r14 instructions 0.9999 (21.907 G -> 21.906 G), cycles 1.004, wall 1.008; vue quiet medians of 7: 1055.5 -> 1053.5 ms; hono routers quiet medians of 5: TrieRouter 248.3 -> 248.9, RegExpRouter 64.0 -> 64.4, PatternRouter 240.8 -> 240.7, SmartRouter 72.2 -> 72.8 ms; hono_app
+  garnet 410.9 ms (medians of 3; 389 in the survey slice's run, the machine under the same external load), Node 156.6.

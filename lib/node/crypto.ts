@@ -1,4 +1,4 @@
-// node:crypto (docs/node_compat_design.md): digests (md5, sha1, sha256 and
+// node:crypto (docs/node_compat_design.md): digests (md5, sha1, sha256, sha384 and
 // sha512, computed by the host in C), HMAC and PBKDF2 over them, random bytes,
 // integers and UUIDs, and a constant-time comparison. Ciphers, key objects,
 // signatures and the subtle API do not exist here: a program that names them
@@ -14,6 +14,7 @@ const DIGESTS: { [name: string]: { size: number; block: number } } = {
   md5: { size: 16, block: 64 },
   sha1: { size: 20, block: 64 },
   sha256: { size: 32, block: 64 },
+  sha384: { size: 48, block: 128 },
   sha512: { size: 64, block: 128 },
 };
 /** The host's name of a digest, from Node's spellings ("SHA256", "sha-256", "RSA-SHA256"). */
@@ -129,7 +130,7 @@ export function hash(algorithm: string, data: BinaryLike, outputEncoding: string
   if (name === undefined) unsupportedDigest();
   return encodeOutput(rawDigest(name, toBytes(data, undefined, "data")), outputEncoding);
 }
-export function getHashes(): string[] { return ["md5", "sha1", "sha256", "sha512"]; }
+export function getHashes(): string[] { return ["md5", "sha1", "sha256", "sha384", "sha512"]; }
 
 function validateSize(size: unknown, name: string): asserts size is number {
   if (typeof size !== "number") throw invalidArgType(name, "of type number", size);

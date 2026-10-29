@@ -91,25 +91,25 @@ the fixes:
 |---|---|---|
 | accepts | OK |  |
 | adapter | OK |  |
-| basic_auth | DIFF | Web Crypto (`timingSafeEqual` hashes with `crypto.subtle`) |
-| bearer_auth | DIFF | Web Crypto |
+| basic_auth | OK |  |
+| bearer_auth | OK |  |
 | body_limit | DIFF | streams (`ReadableStream` reader) |
 | cache | OK |  |
 | client | REJECT | `options.webSocket(...args)`: a spread reject to find |
-| combine | DIFF | Web Crypto (its auth middleware) |
+| combine | OK |  |
 | compress | DIFF | `CompressionStream` |
 | context_storage | TYPE-ERR | `node:async_hooks` AsyncLocalStorage |
-| cookie_signed | DIFF | Web Crypto (HMAC) |
+| cookie_signed | OK |  |
 | cookie | OK |  |
 | cors | OK |  |
-| crypto | THROW | Web Crypto |
+| crypto | OK |  |
 | csrf | OK |  |
 | dev | OK |  |
-| etag | THROW | Web Crypto (SHA-1) |
+| etag | DIFF | streams (the body read through a `ReadableStream` reader) |
 | factory | OK |  |
 | html | OK |  |
 | ip_restriction | REJECT | BigInt (IPv6) |
-| jwt | THROW | Web Crypto (HMAC) |
+| jwt | OK |  |
 | language | OK |  |
 | logger | OK |  |
 | method_not_allowed | OK |  |
@@ -118,9 +118,9 @@ the fixes:
 | powered_by | OK |  |
 | pretty_json | OK |  |
 | request_body | DIFF | Blob / File, multipart file parts |
-| request_id | DIFF | Web Crypto (`crypto.randomUUID`) |
+| request_id | OK |  |
 | route | OK |  |
-| secure_headers | DIFF | Web Crypto (the nonce: `getRandomValues`) |
+| secure_headers | OK |  |
 | serve_static | OK |  |
 | ssg | OK |  |
 | streaming | DIFF | streams (`ReadableStream`, `TransformStream`) |
@@ -133,20 +133,17 @@ the fixes:
 | css | OK |  |
 | jsx_renderer | OK |  |
 
-26 of 43 identical to Node's output.
+34 of 43 identical to Node's output (26 after the survey's own fixes; Web Crypto, docs/web_crypto_design.md, took eight more).
 
 What remains, by the number of drivers it blocks:
 
-1. **Web Crypto** (`crypto.subtle.digest` SHA-1/256/384/512, `importKey` / `sign` / `verify` HMAC,
-   `crypto.randomUUID`, `crypto.getRandomValues`): basic-auth and bearer-auth (through
-   `timingSafeEqual`'s sha256), combine (through them), signed cookies, etag, jwt and jwk, request-id,
-   secure-headers' nonce, the crypto utils: nine drivers. `lib/node/crypto.ts` has the primitives
-   (the hashes, HMAC, random bytes, randomUUID, getRandomValues); a `lib/node/web/crypto.ts` global
-   over them is the next slice. The jwt algorithms beyond HMAC (RSA, ECDSA) are out of its scope.
+1. ~~Web Crypto~~: `lib/node/web/crypto.ts` (docs/web_crypto_design.md) since the same session: digests,
+   HMAC keys, randomUUID, getRandomValues; the jwt algorithms beyond HMAC (RSA, ECDSA) stay out.
 2. **Streams** (`ReadableStream`, `TransformStream`, `WritableStream`, `TextEncoderStream`, a
    Request / Response body as a stream): body-limit, the streaming helpers (`stream`, `streamText`,
-   `streamSSE`), the JSX streaming renderer, `c.body(stream)`. A `lib/node/web/streams.ts` over the
-   event loop, with the bodies reworked: a slice of its own.
+   `streamSSE`), the JSX streaming renderer, `c.body(stream)`, etag (the body digest reads the
+   response's stream). A `lib/node/web/streams.ts` over the event loop, with the bodies reworked: a
+   slice of its own.
 3. **Blob / File** and multipart file parts (`c.req.blob()`, `parseBody` with a file: `File` is not
    defined; `FormData` holds text fields only): the request-body driver.
 4. `CompressionStream` (the compress middleware: gzip / deflate / brotli over streams; Node has it).

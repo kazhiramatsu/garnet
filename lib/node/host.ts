@@ -71,7 +71,7 @@ export interface GarnetNodeHost {
   /** Object.setPrototypeOf for a library object: a class instance, a class prototype or a chain to a class with fields is a TypeError. */
   relink(obj: object, proto: object | null): void;
   /** The digest of `data` by "md5", "sha1", "sha256" or "sha512"; undefined for another name. */
-  hash(algorithm: string, data: string | Uint8Array): Uint8Array | undefined;
+  hash(algorithm: string, data: string | Uint8Array): Uint8Array | undefined;   // md5, sha1, sha256, sha384, sha512
   /** Runs argv[0] with argv to completion. stdin: bytes to feed, or 1 (inherit) or 2 (ignore);
    *  stdout/stderr modes: 0 pipe (collected), 1 inherit, 2 ignore. Returns
    *  [status | null, signal | undefined, stdout, stderr, errorCode | undefined, pid]. */

@@ -17,6 +17,7 @@ loop is garnet's own (libuv's vocabulary, not its code); sockets, Windows and
 | `process`, `Buffer` as globals | `lib/node/globals.d.ts` declares them when `@types/node` is not in the program; `lib/node/prelude.ts` creates them over the host and is imported first when the program names them or imports a `node:` module |
 | `setTimeout`, `setInterval`, `setImmediate`, `queueMicrotask`, `performance` | the same prelude; the timers are the runtime's (below) |
 | `Headers`, `Request`, `Response`, `FormData`, `fetch`, `DataView`, `new String(v)` | the same prelude from `lib/node/web/` (docs/web_fetch_api_design.md); `fetch` wraps the runtime's transport |
+| `crypto`, `Crypto`, `SubtleCrypto`, `CryptoKey` | `lib/node/web/crypto.ts` (docs/web_crypto_design.md): digests, HMAC keys, `randomUUID`, `getRandomValues` over node:crypto's primitives |
 | the system: files, the process, clocks, children | `runtime/node_host.c`, the `__garnet_node` host object: thin POSIX primitives, a failing call answers `undefined`/`false`/`-1` and leaves its errno name for `lastError()` |
 | the event loop | the runtime's loop (ts_rt.c), which already drains microtasks and services fetch's I/O tasks, extended with timers, `nextTick`, immediates and a pending-callback queue |
 | `console` | the runtime's (exists) |

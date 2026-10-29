@@ -23,7 +23,7 @@
  */
 import * as ts from "typescript";
 /** The globals the Node prelude provides as classes of lib/node (exporter.ts NODE_PRELUDE_CTORS). */
-const PRELUDE_CLASS_NAMES = new Set(["Headers", "Request", "Response", "FormData", "DataView", "URL", "URLSearchParams"]);
+const PRELUDE_CLASS_NAMES = new Set(["Headers", "Request", "Response", "FormData", "DataView", "URL", "URLSearchParams", "Crypto", "SubtleCrypto", "CryptoKey"]);
 
 /**
  * Resolve a class/object member name to its compile-time string key, or
