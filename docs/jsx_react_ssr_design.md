@@ -32,24 +32,28 @@ following syntax itself:
 - object spread in props;
 - text, expression, nested-element, and fragment children;
 - JSX comments and the normal JSX whitespace normalization rules;
-- numeric character references and the common named entities `amp`, `lt`,
-  `gt`, `quot`, `apos`, and `nbsp`.
+- numeric character references and every named character reference
+  TypeScript's own transform decodes (`exporter/jsx_entities.ts`, generated
+  from its table by `scripts/gen_jsx_entities.py`; an unknown name stays as
+  written, as TypeScript leaves it);
+- namespaced names (`<svg:path xlink:href="#x">`: the tag and the attribute as
+  one string) and spread children (`{...xs}`), since Session 358.
 
-The current AOT contract requires a namespace import named `React` from a
-module included in the bundle:
+Both of TypeScript's transforms are lowered (section 8). The classic one, the
+default, calls the factory: `React.createElement` through a namespace import
+named `React` of a bundled module (a direct call when that module exports a
+function), or the `jsxFactory` / `jsxFragmentFactory` options and the `@jsx` /
+`@jsxFrag` pragmas; the automatic runtime (`jsx: react-jsx`, `jsxImportSource`,
+the `@jsxImportSource` pragma) calls `jsx` / `jsxs` / `Fragment` of
+`<source>/jsx-runtime`, the form hono's JSX uses. Intrinsic names follow
+TypeScript's rule: a name whose first character is ASCII lowercase, or which
+contains `-`, becomes a string tag; other names remain value expressions.
 
-```ts
-import * as React from "./react_subset";
-```
-
-That module must export `createElement` and, when fragments are used,
-`Fragment`. Intrinsic names follow TypeScript's classic transform rule: a name
-whose first character is ASCII lowercase, or which contains `-`, becomes a
-string tag; other names remain value expressions.
-
-Namespaced JSX attributes, spread children, unsupported factories, and unknown
-named entities are rejected loudly. They are not silently emitted with
-different semantics.
+A factory that is not in scope, a fragment under a `jsxFactory` without a
+fragment factory (TypeScript's TS17016), a runtime module that does not export
+what the transform calls, and a `key` after a spread attribute under the
+automatic runtime are rejected loudly. Nothing is emitted with different
+semantics.
 
 ## 3. AOT-specific work
 
@@ -199,3 +203,83 @@ The final validation passed typed and untyped conformance (349/349 each),
 bundler tests (40/40), runtime and analyzer unit tests, O2 and ASan GC stress,
 frozen-emitter parity with no unexpected differences, self-conformance with no
 unexpected differences, all 101 benchmark budgets, and the fast CI gate.
+
+## 8. The automatic runtime and the factory options (Session 358)
+
+hono's JSX (`hono/jsx`, `jsxImportSource: hono/jsx` in a project, the
+`/** @jsxImportSource */` pragma in a file) is the automatic runtime of
+TypeScript 4.1: no `React` in scope, the elements call `jsx` and `jsxs` of
+`<source>/jsx-runtime`, fragments are `Fragment` of it. The exporter lowers
+the preserved JSX nodes to exactly what TypeScript's transform emits, so the
+V8 oracle (the transform, then Node) and garnet agree by construction.
+
+**The program.** Under `jsx: react-jsx` TypeScript adds a synthetic import of
+`<source>/jsx-runtime` to every JSX file (resolved, type-checked against the
+runtime's exported `JSX` namespace, part of the program), and a `.tsx` file
+with a JSX tag is a module. The exporter keeps a project's `react-jsx` (or
+`react-jsxdev`: the production runtime is built either way, there are no
+source positions to pass) instead of forcing `preserve`, and a program whose
+files ask for the automatic runtime by pragma (`@jsxImportSource`,
+`@jsxRuntime automatic`) is re-created under `react-jsx`
+(`programWithJsxRuntime`; a classic program stays under `preserve`, where a
+file-local `declare namespace JSX` still works). The runtime module is the
+file's synthetic import resolved (`jsxRuntimeModuleOf`), and `moduleDeps`
+adds it to every file with a JSX element so the module order evaluates it
+first. `jsxImportSource` is a module specifier resolved from each JSX file, as
+TypeScript resolves it (`./src/jsx` names the directory next to the file; the
+hono_app driver's tsconfig does this).
+
+**The lowering** (`jsxSiteCallees`, `lowerJsxElement`, `lowerJsxFragment`,
+`lowerJsxProps`, `lowerJsxChildren`):
+
+- `<a x="1">c</a>` is `jsx("a", { x: "1", children: "c" })`; with several
+  children, or one spread child, `jsxs("a", { x: "1", children: [..] })`
+  (TypeScript's `isStaticChildren`); without children the props carry no
+  `children`; a fragment is `jsx(Fragment, {..})`. Whitespace-only text and
+  empty `{}` are not children (`getSemanticJsxChildren`).
+- The props object: the attributes in order (`{...p}` copies), `key` left out,
+  then `children` last; the key is the third argument, so it is evaluated after
+  the props and the children, as the transform's call does; a `key` after a
+  spread (`<A {...p} key="k">`) is where TypeScript calls `createElement` of
+  the import source instead, not modelled, a loud reject.
+- The runtime functions resolve once per site to the bundled function behind
+  the export (an alias chain unwrapped: hono's `export { jsxDEV as jsx }`), a
+  direct call when it does not use `this`, else the binding's value; `Fragment`
+  is the binding's value (hono's is an arrow). The free-variable scan treats a
+  JSX site as the call and the reads it stands for (`noteRef`), so the cells
+  the runtime's functions thread are supplied although the source never names
+  them: hono's `Fragment` read inside a conditional was undefined before this.
+- The classic transform generalized: `jsxFactory` / `@jsx` (`h`, `ns.h`:
+  a name in scope resolved at the site, so a parameter shadows the module's
+  `h`, or a namespace import's member) and `jsxFragmentFactory` / `@jsxFrag`;
+  `React.createElement` / `React.Fragment` stay the defaults. An element
+  without attributes passes `null` props, as TypeScript emits (the React
+  subset's `createElement` sees `null` where it saw `{}`: the plan gate's
+  prop-site count counts the elements with attributes).
+- Namespaced names are one string, a spread child is an `ArrayPushAll` into
+  the children array (automatic) or a spread argument of the factory call
+  (classic, a `CallSpread`), the entity table is TypeScript's.
+
+**A typed call on a lie.** hono's `resolveCallback` does
+`(str as string).toString()` on a JSX node: the exporter lowers a `.toString()`
+/ `.valueOf()` on a `string`-typed receiver to the string builtin, which threw
+"requires a string receiver". The builtin (`ts_str_tostring_typed`,
+`ts_str_valueof_typed`) now takes a receiver that is an object through its own
+method, the dynamic call V8 makes (a String wrapper's, a JSX node's, a plain
+object's `Object.prototype` one); null and undefined keep the TypeError.
+`String.prototype.toString.call(obj)` keeps its strict builtin.
+
+**The oracle.** `scripts/lib/mf.sh` and the exporter's `--transpile-batch`
+transpile a `.tsx` under its own name and pick the transform the file asks for
+(the automatic runtime with `@jsxImportSource` / `@jsxRuntime automatic`, the
+classic one otherwise); `benchmarks/real/transpile_tree.js` takes the
+project's options. `./garnet` accepts a `.tsx` entry.
+
+**Verified.** `tests/bundler/jsx_automatic` (a runtime that records the calls:
+jsx against jsxs, the children forms, the key and its evaluation order,
+fragments, spreads, namespaced names, the entities, the whitespace rules, a
+reassigned child), `tests/bundler/jsx_classic_pragma` (`@jsx h` / `@jsxFrag`,
+a namespace member factory, a parameter shadowing the factory, `null` props,
+spread children), the React subset (unchanged), `strings/typed_tostring_object`,
+and `benchmarks/real/hono_app`'s page rendered by hono's own runtime through
+`c.html` (output identical to Node's).

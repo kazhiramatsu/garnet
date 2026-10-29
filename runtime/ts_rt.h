@@ -1730,6 +1730,8 @@ tsv ts_str_slice(tsv s, double start, double end, int has_end);
 tsv ts_str_substring(tsv s, double start, double end, int has_end);
 tsv ts_str_substr(tsv s, tsv start, tsv length);
 tsv ts_str_value(tsv s);
+tsv ts_str_tostring_typed(tsv s);   /* a typed `.toString()`: a non-string receiver's own method */
+tsv ts_str_valueof_typed(tsv s);
 double ts_str_indexof(tsv s, tsv needle, double from, int has_from);
 double ts_str_lastindexof(tsv s, tsv needle, double from, int has_from);
 tsv ts_number_to_fixed(tsv numv, double digits);

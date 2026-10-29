@@ -195,7 +195,7 @@ Commands (single entry point `scripts/gate.sh <cmd>`):
 scripts/gate.sh conf all      # all conformance (V8 differential) ★ main gate
 scripts/gate.sh unit          # runtime unit + analyzer unit
 scripts/gate.sh gc            # GC stress (threshold=1 × O2/ASan/runtime)
-scripts/gate.sh bundler       # module bundling, 39 fixtures
+scripts/gate.sh bundler       # module bundling (multi-file fixtures; a .tsx beside entry.ts tests JSX: mf picks the transform by pragma)
 scripts/gate.sh bench [flt]   # correctness of 99 benchmarks + time budget
 scripts/gate.sh selfconf      # V8 differential of the frozen twin
 scripts/gate.sh parity        # = scripts/emitc_diff.sh (Rust emit vs frozen-TS emitc, byte-wise)

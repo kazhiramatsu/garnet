@@ -6,6 +6,7 @@
 import { Hono } from "./src/hono.ts";
 import { HTTPException } from "./src/http-exception.ts";
 import { performance } from "node:perf_hooks";
+import { renderPage } from "./garnet-view.tsx";
 
 const app = new Hono();
 app.use("*", async (c, next) => {
@@ -32,6 +33,7 @@ api.delete("/items/:id", (c) => c.json({ deleted: c.req.param("id") }));
 app.route("/api", api);
 app.get("/static/*", (c) => c.text("static:" + c.req.path));
 app.all("/any", (c) => c.text("method:" + c.req.method));
+app.get("/page/:id", (c) => c.html(renderPage(c.req.param("id"), ["alpha", "beta <b>", "gamma & delta"], c.req.query("q") ?? null)));
 
 type Req = { method: string; path: string; body?: string; headers?: Record<string, string> };
 const requests: Req[] = [
@@ -52,6 +54,8 @@ const requests: Req[] = [
   { method: "GET", path: "/static/css/app.css" },
   { method: "PUT", path: "/any" },
   { method: "HEAD", path: "/" },
+  { method: "GET", path: "/page/3?q=hello%20world" },
+  { method: "GET", path: "/page/0" },
 ];
 function makeRequest(r: Req): Request {
   return new Request("http://localhost" + r.path, { method: r.method, body: r.body, headers: r.headers });

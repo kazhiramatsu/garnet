@@ -23692,7 +23692,10 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     false,
                 ),
                 "string.substr" => (format!("ts_str_substr({}, {}, {})", r, v(0), v(1)), false),
-                "string.toString" | "string.valueOf" => (format!("ts_str_value({})", r), false),
+                // a receiver the types call a string but that is an object (a String wrapper, hono's cast of a
+                // JSX node) takes its own method: the runtime dispatches (docs/jsx_react_ssr_design.md)
+                "string.toString" => (format!("ts_str_tostring_typed({})", r), false),
+                "string.valueOf" => (format!("ts_str_valueof_typed({})", r), false),
                 "string.indexOf" => (
                     format!("ts_str_indexof_fast({}, {}, {}, {})", r, v(0), n(1), has(1)),
                     true,

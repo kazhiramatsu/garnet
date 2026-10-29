@@ -20,6 +20,8 @@ mkdir -p "$work"
 [ -f "$ROOT/benchmarks/real/$name/env.sh" ] && . "$ROOT/benchmarks/real/$name/env.sh"
 [ -f "$ROOT/benchmarks/real/$name/paths.js" ] && node "$ROOT/benchmarks/real/$name/paths.js" "$proj" "$ROOT/benchmarks/real/$name/tsconfig.json" "$proj/garnet-paths.json" > /dev/null
 cp "$ROOT/benchmarks/real/$name/driver.ts" "$proj/garnet-driver.ts"
+# the driver's companion sources (benchmarks/real/<name>/*.tsx: a JSX view), beside it as garnet-<file>
+for f in "$ROOT/benchmarks/real/$name"/*.tsx; do [ -e "$f" ] && cp "$f" "$proj/garnet-$(basename "$f")"; done
 # a project's stand-ins for third-party modules its benchmark configuration never calls (benchmarks/real/<name>/stubs)
 if [ -d "$ROOT/benchmarks/real/$name/stubs" ]; then rm -rf "$proj/garnet-stubs"; cp -R "$ROOT/benchmarks/real/$name/stubs" "$proj/garnet-stubs"; fi
 # the typings of third-party packages the stubs re-export (benchmarks/real/<name>/types.txt, one npm spec per line),

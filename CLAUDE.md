@@ -134,6 +134,12 @@ Rust in §315; selfhost is kept as a performance metric).
   private name is not a property).
 - `Request.signal` is the init's signal itself (Node: a fresh signal following it), and
   `ArrayBuffer.isView` does not recognize the library's `DataView` (docs/web_fetch_api_design.md).
+- JSX (Session 358, `docs/jsx_react_ssr_design.md` section 8): under the automatic runtime a `key`
+  attribute after a spread attribute (`<A {...p} key="k">`) is a compile-time reject (TypeScript
+  calls the import source's `createElement` there); `react-jsxdev` builds the production runtime
+  (`jsx` / `jsxs` of `jsx-runtime`, no source positions); `jsxImportSource` is resolved from each
+  JSX file as TypeScript resolves the synthetic import. A typed `.toString()` / `.valueOf()` on a
+  receiver that is not a string (a cast lied, a String wrapper) takes the receiver's own method.
 - `o.__proto__` and `o["__proto__"]` read undefined (V8: the prototype through the accessor);
   `Object.getPrototypeOf` / `setPrototypeOf` are the modelled forms (Session 355 note).
 - A typed receiver that is a Proxy (vue's reactive arrays and collections) takes its methods through

@@ -292,7 +292,7 @@ fi
 
 # ----- validate input -----
 [ -f "$input" ] || die "no such file: $input"
-case "$input" in *.ts) ;; *) die "input must be a .ts file: $input" ;; esac
+case "$input" in *.ts|*.tsx) ;; *) die "input must be a .ts or .tsx file: $input" ;; esac
 
 # ----- locate built tools -----
 EXPORTER="$ROOT/exporter/exporter.js"
@@ -334,7 +334,7 @@ esac
 
 # absolute input path (module resolution / output naming are CWD-independent)
 input_abs="$(cd "$(dirname "$input")" && pwd)/$(basename "$input")"
-base="$(basename "$input")"; base="${base%.ts}"
+base="$(basename "$input")"; base="${base%.ts}"; base="${base%.tsx}"
 
 # default C output name (in the current directory, gcc-style)
 [ -n "$out_c" ] || out_c="$base.c"

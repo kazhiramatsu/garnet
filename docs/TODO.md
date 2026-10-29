@@ -11818,3 +11818,48 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   request kinds (docs/real_projects.md), output identical to Node's; the dispatch loop over
   20,000 requests: garnet 337 ms, Node 142 (2.4x), the next slice's subject after the JSX
   automatic runtime. Gates: the full gate set (unit, bundler 51/51, conformance plain and strict 677/677, protect and units 674/674, bench, the GC gate suite: focused conformance under O2 / ASan / protect, the runtime unit tests, the cell-header knobs, GC stress), the fetch gate, the regexp AOT and link gates, the engine diff (43,593 cases, 0 differ); the ir-parity snapshot refreshed. tsc-ts r10 -> r11 instructions 1.0008 (22.198 G -> 22.215 G), cycles 0.996, wall 0.992; vue 1067.0 -> 1060.4 ms (medians of 7); hono routers quiet medians of 5: TrieRouter 244.1 -> 247.0, RegExpRouter 64.1 -> 63.3, PatternRouter 239.6 -> 243.2, SmartRouter 72.6 -> 71.4 ms (within noise).
+- JSX, the automatic runtime and the factory options, so hono's JSX runs (Kaz: 「不足分も実装に
+  追加してください. honoが動くように実装してください」; docs/jsx_react_ssr_design.md section 8).
+  The exporter's JSX was the classic transform through `import * as React` only: hono's JSX is
+  TypeScript's automatic runtime (`jsxImportSource`, `jsx` / `jsxs` / `Fragment` of
+  `<source>/jsx-runtime`). Now: the program is created under `react-jsx` when a project says so
+  or a file asks by pragma (TypeScript adds and resolves the synthetic import of the runtime
+  module; `programWithJsxRuntime`), the runtime module is a dependency of every JSX file, the
+  elements lower to what the transform emits (`jsx` for one child, `jsxs` for several or a spread
+  child, the children in the props after the attributes, the key as the third argument evaluated
+  last, `Fragment` as a fragment's type), the runtime functions resolve once per site to the
+  bundled function behind the export (hono's alias chain `jsxDEV as jsx` unwrapped: a direct
+  call), and the free-variable scan treats a JSX site as the call and the reads it stands for
+  (`noteRef`): without that, hono's `Fragment` read inside a conditional was an unsupplied cell,
+  undefined at run time ("Invalid JSX tag name: undefined"). The classic transform generalized:
+  `jsxFactory` / `jsxFragmentFactory` and the `@jsx` / `@jsxFrag` pragmas (a name in scope
+  resolved at the site, or a namespace import's member), `null` props without attributes as
+  TypeScript emits (the React subset saw `{}`: a silent deviation a custom factory could observe),
+  namespaced names (`<svg:path xlink:href>`), spread children (a `CallSpread` / an `ArrayPushAll`),
+  the full named entity table (`exporter/jsx_entities.ts`, 253 names generated from TypeScript's
+  by `scripts/gen_jsx_entities.py`; an unknown name stays as written, as TypeScript leaves it).
+  Rejected loudly: a `key` after a spread attribute under the automatic runtime (TypeScript's
+  `createElement` fallback), a fragment under a `jsxFactory` without a fragment factory, a runtime
+  module missing an export; `react-jsxdev` builds the production runtime (CLAUDE.md).
+- Found on the way, fixed: hono's `resolveCallback` does `(str as string).toString()` on a JSX
+  node; the exporter lowers a `.toString()` / `.valueOf()` on a `string`-typed receiver to the
+  string builtin, which threw "String.prototype.toString requires a string receiver" (loud, but
+  hono's `c.html(<Page/>)` died on it). The typed builtins (`ts_str_tostring_typed`,
+  `ts_str_valueof_typed`; emit_c's `string.toString` / `string.valueOf`) take a receiver that is
+  an object through its own method, the dynamic call V8 makes; null and undefined keep the
+  TypeError; `String.prototype.toString.call(obj)` keeps the strict builtin. Fixture
+  `strings/typed_tostring_object` (both profiles).
+- The V8 oracles: `scripts/lib/mf.sh` and `--transpile-batch` transpile a `.tsx` under its own
+  name with the transform the file's pragma asks for; `./garnet` accepts a `.tsx` entry;
+  `benchmarks/real/run.sh` copies a driver's `*.tsx` companions into the clone as `garnet-<file>`.
+  Fixtures `tests/bundler/jsx_automatic` (a recording runtime: the call shapes, the key's
+  evaluation order, fragments, spreads, namespaced names, entities, whitespace) and
+  `tests/bundler/jsx_classic_pragma` (`@jsx h` / `@jsxFrag`, `lib.h`, a shadowing parameter,
+  `null` props, spread children); `tests/conformance/rejects/jsx_namespaced_name.tsx` retired
+  (supported now). `benchmarks/real/hono_app` serves a page rendered by hono's own JSX runtime
+  through `c.html` (`view.tsx`, `jsxImportSource: ./src/jsx`): output identical to Node's over
+  the 19 request kinds.
+- The IR of every program without JSX is byte-identical to the previous exporter's (tsc-ts's
+  export compared: identical; the ir-parity corpus: identical but the React subset's `null` props
+  and the two new fixtures). Gates: the full gate set (unit, bundler 53/53, conformance plain and strict 678/678, protect and units 675/675, the GC gate suite incl. ASan and GC stress; bench: every benchmark correct, `string_unicode_search_kernel` 104 ms against its 100 ms budget under an external load, a VM at 120% CPU and a Chrome video, where it was 99 ms in the quiet run before this slice; its C has no typed-toString site, and an interleaved A/B of its binary against the committed runtime's object gave 108 vs 110 ms, no difference), the JSX plan gate, the fetch gates, the regexp AOT and link gates, the engine diff (43,593 cases, 0 differ); the ir-parity snapshot refreshed (4,226 files). tsc-ts r11 -> r12 instructions 0.9999 (22.218 G -> 22.216 G; the IR identical, the emitted C differs only at typed toString sites, none in tsc-ts), cycles 1.010 and wall 1.008 under the external load; vue quiet medians of 7: 1084.2 -> 1085.8 ms; hono routers quiet medians of 5: TrieRouter 256.2 -> 255.5, RegExpRouter 64.9 -> 65.3, PatternRouter 249.2 -> 244.4, SmartRouter 73.3 -> 73.2 ms (the routers' C is unchanged);
+  hono_app 19 kinds with the two JSX pages: garnet 389 ms, Node 155 (2.5x) on a quiet machine; 438 vs 164 under the external load.

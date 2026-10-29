@@ -5499,6 +5499,32 @@ tsv ts_to_primitive(tsv v, int hint){
   return v;  /* no usable conversion; callers handle (NaN / [object Object]) */
 }
 
+/* `s.toString()` / `s.valueOf()` on a receiver the program types as a string: the string itself; a
+   value that is not one (a String wrapper object, an object a cast called a string: hono's
+   `(node as string).toString()`) takes its own method, the dynamic call V8 makes. A receiver with
+   neither (null, undefined, a symbol) is the builtin's TypeError. */
+static tsv ts_str_value_typed(tsv s, int valueof){
+  if (ts_is_str(s)) return s;
+  if (s == ts_string_proto()) return ts_new_string("", 0);
+  if (ts_object_like(s) && !ts_is_symbol(s)) {
+    static int depth = 0;   /* an object whose chain ends in String.prototype's own method would recurse */
+    ts_prim_field_init();
+    tsv m = ts_prim_method(s, valueof ? g_valueof_field : g_tostring_field, valueof ? g_valueof_key : g_tostring_key);
+    if (ts_is_callable(m) && depth < 64) {
+      ts_gc_root(&s); ts_gc_root(&m);
+      depth++;
+      tsv r = ts_call(m, &s, 1);
+      depth--;
+      ts_gc_unroot(2);
+      return r;
+    }
+  }
+  ts_throw_type_error_msg(valueof ? "String.prototype.valueOf requires a string receiver" : "String.prototype.toString requires a string receiver");
+  return TS_UNDEFINED;
+}
+tsv ts_str_tostring_typed(tsv s){ return ts_str_value_typed(s, 0); }
+tsv ts_str_valueof_typed(tsv s){ return ts_str_value_typed(s, 1); }
+
 tsv ts_objproto_tostring_call(tsv v);
 tsv ts_to_string_v(tsv v){
   if (ts_is_str(v)) return v;

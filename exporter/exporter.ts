@@ -20,6 +20,7 @@ import * as ts from "typescript";
 import * as fs from "fs";
 import * as path from "path";
 import { ClassExtractor, ClassInfo, ClosedReceivers, memberKeyName, dynamicBaseEmptyClass } from "./class_extract";
+import { JSX_ENTITIES } from "./jsx_entities";
 /** A regexp literal's text split into its source and flags (`/src/flags`). */
 function splitRegExpLiteral(raw: string): { source: string; flags: string } | undefined {
   if (raw.length < 2 || raw[0] !== "/") return undefined;
@@ -345,6 +346,108 @@ function programWithWorkerEntries(program: ts.Program, rootNames: string[], opti
   return { program: ts.createProgram(rootNames, options, sub), host: sub };
 }
 
+// ---- JSX (docs/jsx_react_ssr_design.md "The automatic runtime") ------------------------------------
+/** The last `@<name>` pragma's factory argument of a file (`@jsx h`, `@jsxFrag F`, `@jsxImportSource x`,
+ *  `@jsxRuntime automatic|classic`), or undefined. */
+function jsxPragmaOf(sf: ts.SourceFile, name: string): string | undefined {
+  type Pragma = { arguments?: { factory?: string } };
+  const pragmas = (sf as unknown as { pragmas?: Map<string, Pragma | Pragma[]> }).pragmas;
+  const p = pragmas?.get(name);
+  const last = Array.isArray(p) ? p[p.length - 1] : p;
+  return last?.arguments?.factory;
+}
+
+/** The import source of the automatic JSX runtime for `sf` (TypeScript's getJSXImplicitImportBase):
+ *  the `@jsxImportSource` pragma, the `jsxImportSource` option, or "react" under `jsx: react-jsx` /
+ *  `@jsxRuntime automatic`; undefined under the classic transform (`@jsxRuntime classic` says so). */
+function jsxImplicitImportBase(options: ts.CompilerOptions, sf: ts.SourceFile): string | undefined {
+  const runtime = jsxPragmaOf(sf, "jsxruntime");
+  if (runtime === "classic") return undefined;
+  const source = jsxPragmaOf(sf, "jsximportsource");
+  if (options.jsx === ts.JsxEmit.ReactJSX || options.jsx === ts.JsxEmit.ReactJSXDev || options.jsxImportSource ||
+      source || runtime === "automatic") return source || options.jsxImportSource || "react";
+  return undefined;
+}
+
+/** The module the automatic runtime's `jsx`, `jsxs` and `Fragment` come from (`<source>/jsx-runtime`:
+ *  the program is created under `jsx: react-jsx`, so the dev runtime's module is never asked for). */
+function jsxRuntimeImportOf(options: ts.CompilerOptions, sf: ts.SourceFile): string | undefined {
+  const base = jsxImplicitImportBase(options, sf);
+  return base === undefined ? undefined : `${base}/jsx-runtime`;
+}
+
+/** The program, re-created under `jsx: react-jsx` when a file of it asks for the automatic runtime by
+ *  pragma (`@jsxImportSource`, `@jsxRuntime automatic`): under that mode TypeScript adds the synthetic
+ *  import of `<source>/jsx-runtime` to each JSX file (resolved, type-checked, part of the program). A
+ *  project option says so directly (the options are then already in that mode). */
+function programWithJsxRuntime(rootNames: string[], options: ts.CompilerOptions, host: ts.CompilerHost | undefined,
+                               sourceMode: SourceMode): ts.Program {
+  const program = programWithNodeSupport(rootNames, options, host, sourceMode);
+  if (options.jsx === ts.JsxEmit.ReactJSX) return program;
+  const automatic = program.getSourceFiles().some((f) => !f.isDeclarationFile && f.languageVariant === ts.LanguageVariant.JSX &&
+    !program.isSourceFileDefaultLibrary(f) && !program.isSourceFileFromExternalLibrary(f) && jsxImplicitImportBase(options, f) !== undefined);
+  if (!automatic) return program;
+  return programWithNodeSupport(rootNames, { ...options, jsx: ts.JsxEmit.ReactJSX }, host, sourceMode);
+}
+
+/** The V8 oracle's JSX transform for a source (the classic one unless the file asks for the automatic
+ *  runtime by pragma; a project's option is not seen here). */
+function oracleJsxEmit(src: string): ts.JsxEmit {
+  return /@jsxImportSource\b|@jsxRuntime\s+automatic\b/.test(src) ? ts.JsxEmit.ReactJSX : ts.JsxEmit.React;
+}
+
+/** A JSX child or factory argument: one value, or an array whose elements spread into the call. */
+type JsxArg = { kind: "single" | "spread"; local: number };
+/** How a JSX factory or runtime function is reached: the bundled function `fn` (called directly when it
+ *  does not use `this`), the binding its declaration `name` names, or the `member` of the namespace
+ *  import `ns` (`React.createElement`; the namespace object is the call's receiver). */
+interface JsxCallee { fn?: number; name?: ts.Identifier; ns?: ts.Identifier; member?: string }
+interface JsxRuntimeExports { jsx?: ts.Symbol; jsxs?: ts.Symbol; fragment?: ts.Symbol }
+/** What a JSX element or fragment calls and reads: `call` (jsx / jsxs, or the classic factory), `value`
+ *  (a fragment's type: Fragment, or the fragment factory), under the automatic `runtime` module. */
+interface JsxSite { runtime?: ts.SourceFile; call?: JsxCallee; value?: JsxCallee }
+
+/** The identifier a symbol's declaration binds (a variable, function, class, parameter, binding element,
+ *  enum, or import binding), or undefined. */
+function declarationNameOf(sym: ts.Symbol): ts.Identifier | undefined {
+  for (const d of sym.declarations ?? []) {
+    if (ts.isVariableDeclaration(d) || ts.isFunctionDeclaration(d) || ts.isClassDeclaration(d) || ts.isParameter(d) ||
+        ts.isBindingElement(d) || ts.isEnumDeclaration(d) || ts.isNamespaceImport(d) || ts.isImportSpecifier(d) || ts.isImportClause(d)) {
+      const name = d.name;
+      if (name && ts.isIdentifier(name)) return name;
+    }
+  }
+  return undefined;
+}
+
+/** TypeScript's getSemanticJsxChildren: a child that is not whitespace-only text or an empty `{}`. */
+function isSemanticJsxChild(c: ts.JsxChild): boolean {
+  if (ts.isJsxExpression(c)) return !!c.expression;
+  if (ts.isJsxText(c)) return !c.containsOnlyTriviaWhiteSpaces;
+  return true;
+}
+
+/** The automatic runtime's `jsxs` form: several children, or one spread child (`{...xs}`). */
+function jsxStaticChildren(children: readonly ts.JsxChild[]): boolean {
+  const s = children.filter(isSemanticJsxChild);
+  return s.length > 1 || (s.length === 1 && ts.isJsxExpression(s[0]) && !!s[0].dotDotDotToken);
+}
+
+/** TypeScript's hasKeyAfterPropsSpread: `<A {...p} key="k">`, where it falls back to createElement. */
+function jsxKeyAfterSpread(node: ts.JsxOpeningLikeElement): boolean {
+  let spread = false;
+  for (const p of node.attributes.properties) {
+    if (ts.isJsxSpreadAttribute(p) && (!ts.isObjectLiteralExpression(p.expression) || p.expression.properties.some(ts.isSpreadAssignment))) spread = true;
+    else if (spread && ts.isJsxAttribute(p) && ts.isIdentifier(p.name) && p.name.text === "key") return true;
+  }
+  return false;
+}
+
+/** The property an attribute sets: `a`, `data-x`, or `xlink:href` (a namespaced name as one string). */
+function jsxAttributeName(attr: ts.JsxAttribute): string {
+  return ts.isJsxNamespacedName(attr.name) ? `${attr.name.namespace.text}:${attr.name.name.text}` : attr.name.text;
+}
+
 function programWithNodeSupport(rootNames: string[], options: ts.CompilerOptions, host: ts.CompilerHost | undefined,
                                 sourceMode: SourceMode): ts.Program {
   nodePreludeFile = undefined;
@@ -650,6 +753,12 @@ class Exporter {
   // Symbols declared at module scope (top-level var/let/const + top-level
   // function/class names). Used to redirect symbolOwnerFunction to moduleInitNode.
   moduleScopeSyms = new Set<ts.Symbol>();
+  /** JSX (docs/jsx_react_ssr_design.md): per file, the automatic runtime's module (undefined under the
+   *  classic transform) and whether it has a JSX element; per runtime module, the exports it calls. */
+  jsxRuntimeModules = new Map<ts.SourceFile, ts.SourceFile | undefined>();
+  jsxFiles = new Map<ts.SourceFile, boolean>();
+  jsxRuntimeExports = new Map<ts.SourceFile, JsxRuntimeExports>();
+  jsxSites = new Map<ts.Node, JsxSite>();
   // value namespaces already materialized (so repeated `namespace N {}` merge).
   materializedNamespaces = new Set<ts.Symbol>();
   private namespaceBindings = new Map<ts.Symbol, { namespace: ts.Identifier; name: string }>();
@@ -2436,6 +2545,27 @@ class Exporter {
     const calledFns: FnLike[] = [];
     const nested: FnLike[] = [];
     const ctorRefs: ts.ConstructorDeclaration[] = []; // ctors Direct-called from F (new/super)
+    /** A value reference to the binding `s` (named `name`; `isCallee` when it is a call's callee). */
+    const noteRef = (s: ts.Symbol | undefined, name: string, isCallee: boolean): void => {
+      if (!s) return;
+      if (this.isScriptGlobalVarSymbol(s, name) || this.isAmbientValueSymbol(s)) {
+        // Script top-level var bindings and the environment's values are
+        // runtime global-object properties, not closure cells. Reads/writes
+        // lower to globalThis.<name>.
+        return;
+      }
+      if (decl.has(s)) return;
+      if (this.funcSymbols.has(s) && !((this.nestedFuncSymbols.has(s) || this.namespaceFuncSymbols.has(s)) && !isCallee)) return;
+      const owner = this.symbolOwnerFunction(s);
+      if (owner && owner !== F) res.add(s); // captured from an outer function (incl. __module_init)
+      // Lazy closure values: the user of a nested declaration's value may
+      // have to create the closure, so it captures what the declaration
+      // captures (the direct-call rule, below, applied to value uses).
+      if (this.lazyFnValues && this.nestedFuncSymbols.has(s) && !isCallee) {
+        const fnode = this.fnNodeById(this.funcSymbols.get(s)!);
+        if (fnode && fnode !== (F as unknown as ts.Node)) calledFns.push(fnode as unknown as FnLike);
+      }
+    };
     const scan = (n: ts.Node) => {
       // Type annotations have no runtime reads. Treating a local interface,
       // type parameter, or callback signature as a value invents capture cells.
@@ -2453,23 +2583,20 @@ class Exporter {
         const symbol = this.symbolOf(n);
         const binding = symbol && this.namespaceBindings.get(symbol);
         const s = binding ? this.symbolOf(binding.namespace) : symbol;
-        if (s && (this.isScriptGlobalVarSymbol(s, n.text) || this.isAmbientValueSymbol(s))) {
-          // Script top-level var bindings and the environment's values are
-          // runtime global-object properties, not closure cells. Reads/writes
-          // lower to globalThis.<name>.
-        } else if (s && !decl.has(s) &&
-                   (!this.funcSymbols.has(s) ||
-                    ((this.nestedFuncSymbols.has(s) || this.namespaceFuncSymbols.has(s)) &&
-                     !(ts.isCallExpression(n.parent) && n.parent.expression === n)))) {
-          const owner = this.symbolOwnerFunction(s);
-          if (owner && owner !== F) res.add(s); // captured from an outer function (incl. __module_init)
-          // Lazy closure values: the user of a nested declaration's value may
-          // have to create the closure, so it captures what the declaration
-          // captures (the direct-call rule, below, applied to value uses).
-          if (this.lazyFnValues && s && this.nestedFuncSymbols.has(s) &&
-              !(ts.isCallExpression(n.parent) && n.parent.expression === n)) {
-            const fnode = this.fnNodeById(this.funcSymbols.get(s)!);
+        noteRef(s, n.text, ts.isCallExpression(n.parent) && n.parent.expression === n);
+      }
+      // JSX: an element calls the runtime's `jsx` / `jsxs` (or the classic factory) and a fragment reads
+      // `Fragment` (or the fragment factory), bindings the source never names: a bundled function is a
+      // direct call (its cells roll up as a call's), a value is a reference to its binding.
+      if (ts.isJsxElement(n) || ts.isJsxSelfClosingElement(n) || ts.isJsxFragment(n)) {
+        const site = this.jsxSiteCallees(n);
+        for (const [callee, isCall] of [[site.call, true], [site.value, false]] as const) {
+          if (!callee) continue;
+          if (isCall && callee.fn !== undefined && !this.funcTakesThisIds.has(callee.fn)) {
+            const fnode = this.fnNodeById(callee.fn);
             if (fnode && fnode !== (F as unknown as ts.Node)) calledFns.push(fnode as unknown as FnLike);
+          } else if (callee.name && !callee.ns) {
+            noteRef(this.symbolOf(callee.name), callee.name.text, isCall);
           }
         }
       }
@@ -4362,12 +4489,105 @@ class Exporter {
     return dst;
   }
 
-  private jsxFactoryInfo(node: ts.Node): {
-    namespaceName: ts.Identifier;
-    moduleSymbol: ts.Symbol;
-    createElementSymbol?: ts.Symbol;
-    createElementFn?: number;
-  } | undefined {
+  // ---- JSX (docs/jsx_react_ssr_design.md) --------------------------------------------------------
+  // The preserved JSX nodes are lowered to what TypeScript's two transforms emit. The classic transform
+  // calls the factory (`React.createElement` through a namespace import, or the `jsxFactory` option /
+  // `@jsx` pragma) with the props (`null` without attributes) and the children as arguments; the
+  // automatic runtime (`jsx: react-jsx`, `jsxImportSource`, the `@jsxImportSource` pragma) calls `jsx`
+  // or `jsxs` of `<source>/jsx-runtime` with the children in the props and the key as the third
+  // argument, and `Fragment` of it as the fragment's type. A bundled factory is called directly.
+
+  /** True if `sf` has a JSX element (its module then depends on the JSX runtime module). */
+  private fileHasJsx(sf: ts.SourceFile): boolean {
+    if (sf.languageVariant !== ts.LanguageVariant.JSX) return false;
+    let has = this.jsxFiles.get(sf);
+    if (has === undefined) {
+      has = false;
+      const visit = (n: ts.Node): void => {
+        if (has) return;
+        if (ts.isJsxElement(n) || ts.isJsxSelfClosingElement(n) || ts.isJsxFragment(n)) { has = true; return; }
+        n.forEachChild(visit);
+      };
+      visit(sf);
+      this.jsxFiles.set(sf, has);
+    }
+    return has;
+  }
+
+  /** The automatic runtime's module for the JSX in `sf`: `<jsxImportSource>/jsx-runtime`, the synthetic
+   *  import the program resolved for the file; undefined under the classic transform. */
+  private jsxRuntimeModuleOf(sf: ts.SourceFile): ts.SourceFile | undefined {
+    if (this.jsxRuntimeModules.has(sf)) return this.jsxRuntimeModules.get(sf);
+    let found: ts.SourceFile | undefined;
+    const spec = jsxRuntimeImportOf(this.program.getCompilerOptions(), sf);
+    if (spec !== undefined) {
+      const imports = (sf as unknown as { imports?: readonly ts.StringLiteralLike[] }).imports ?? [];
+      const lit = imports.find((i) => i.text === spec);
+      found = lit ? this.resolveModuleSf(lit) : undefined;
+      if (!found) this.unsupported(sf, `the JSX runtime module "${spec}" (jsxImportSource) is not in the program`);
+    }
+    this.jsxRuntimeModules.set(sf, found);
+    return found;
+  }
+
+  /** The exports of a runtime module the JSX calls. */
+  private jsxRuntimeExportsOf(rt: ts.SourceFile): JsxRuntimeExports {
+    let ex = this.jsxRuntimeExports.get(rt);
+    if (!ex) {
+      const moduleSymbol = this.checker.getSymbolAtLocation(rt) ?? (rt as unknown as { symbol?: ts.Symbol }).symbol;
+      const exportOf = (name: string) => moduleSymbol && this.checker.getExportsOfModule(moduleSymbol).find((s) => s.name === name);
+      ex = { jsx: exportOf("jsx"), jsxs: exportOf("jsxs"), fragment: exportOf("Fragment") };
+      this.jsxRuntimeExports.set(rt, ex);
+    }
+    return ex;
+  }
+
+  /** The runtime functions a JSX element or fragment uses (resolved once per site: the free-variable
+   *  scan and the lowering agree on them, and a missing one is reported once). */
+  private jsxSiteCallees(node: ts.JsxElement | ts.JsxSelfClosingElement | ts.JsxFragment): JsxSite {
+    let site = this.jsxSites.get(node);
+    if (site) return site;
+    const rt = this.jsxRuntimeModuleOf(node.getSourceFile());
+    if (rt) {
+      const ex = this.jsxRuntimeExportsOf(rt);
+      const isStatic = jsxStaticChildren(ts.isJsxSelfClosingElement(node) ? [] : node.children);
+      site = {
+        runtime: rt,
+        call: this.jsxCalleeOf(isStatic ? ex.jsxs : ex.jsx, node, `${isStatic ? "jsxs" : "jsx"} of the JSX runtime`),
+        value: ts.isJsxFragment(node) ? this.jsxCalleeOf(ex.fragment, node, "Fragment of the JSX runtime") : undefined,
+      };
+    } else {
+      site = { call: this.jsxClassicOf(node, false), value: ts.isJsxFragment(node) ? this.jsxClassicOf(node, true) : undefined };
+    }
+    this.jsxSites.set(node, site);
+    return site;
+  }
+
+  /** A binding as a JSX callee: the function it declares (an import alias unwrapped) and its name. */
+  private jsxCalleeOf(sym: ts.Symbol | undefined, node: ts.Node, what: string): JsxCallee | undefined {
+    const target = sym ? (this.unwrapImportAlias(sym) ?? sym) : undefined;
+    const name = target && declarationNameOf(target);
+    if (target && name) return { fn: this.funcSymbols.get(target), name };
+    this.unsupported(node, `JSX: ${what} is not a bundled function or variable`);
+    return undefined;
+  }
+
+  /** An export of a bundled module as a JSX callee: the function or binding it declares, with the
+   *  namespace object `ns` (the call's receiver) as the fallback: `ns.member`. */
+  private jsxModuleExportCallee(moduleSymbol: ts.Symbol, name: string, ns: ts.Identifier | undefined, node: ts.Node): JsxCallee | undefined {
+    const exported = this.checker.getExportsOfModule(moduleSymbol).find((s) => s.name === name);
+    if (!exported) {
+      if (ns) return { ns, member: name };   // a loud run-time lookup: undefined is not a function
+      this.unsupported(node, `JSX: the runtime module does not export ${name}`);
+      return undefined;
+    }
+    const target = this.unwrapImportAlias(exported) ?? exported;
+    return { fn: this.funcSymbols.get(target), name: declarationNameOf(target), ns, member: name };
+  }
+
+  /** `React.createElement` / `React.Fragment`, the default classic factory: the namespace import named
+   *  React of a bundled module, and that module's export. */
+  private jsxReactCallee(node: ts.Node, name: string): JsxCallee | undefined {
     const sf = node.getSourceFile();
     for (const stmt of sf.statements) {
       if (!ts.isImportDeclaration(stmt)) continue;
@@ -4375,48 +4595,93 @@ class Exporter {
       if (!bindings || !ts.isNamespaceImport(bindings) || bindings.name.text !== "React") continue;
       const target = this.resolveModuleSf(stmt.moduleSpecifier);
       if (!target) continue;
-      const moduleSymbol = this.checker.getSymbolAtLocation(target) ??
-        (target as unknown as { symbol?: ts.Symbol }).symbol;
+      const moduleSymbol = this.checker.getSymbolAtLocation(target) ?? (target as unknown as { symbol?: ts.Symbol }).symbol;
       if (!moduleSymbol) continue;
-      const exported = this.checker.getExportsOfModule(moduleSymbol)
-        .find((s) => s.name === "createElement");
-      const createElementSymbol = exported ? (this.unwrapImportAlias(exported) ?? exported) : undefined;
-      return {
-        namespaceName: bindings.name,
-        moduleSymbol,
-        createElementSymbol,
-        createElementFn: createElementSymbol ? this.funcSymbols.get(createElementSymbol) : undefined,
-      };
+      return this.jsxModuleExportCallee(moduleSymbol, name, bindings.name, node);
     }
-    this.unsupported(node, "JSX requires `import * as React from \"<bundled module>\"` with an exported createElement function");
+    this.unsupported(node, "JSX requires `import * as React from \"<bundled module>\"` with an exported createElement function, " +
+      "a jsxFactory (the @jsx pragma), or the automatic runtime (jsxImportSource)");
     return undefined;
   }
 
-  private jsxExportValue(ctx: FnCtx, node: ts.Node, name: string): number | undefined {
-    const info = this.jsxFactoryInfo(node);
-    if (!info) return undefined;
-    const exported = this.checker.getExportsOfModule(info.moduleSymbol).find((s) => s.name === name);
-    const sym = exported ? (this.unwrapImportAlias(exported) ?? exported) : undefined;
-    const decl = sym?.valueDeclaration ?? sym?.declarations?.find((d) =>
-      ts.isVariableDeclaration(d) || ts.isFunctionDeclaration(d) || ts.isClassDeclaration(d));
-    const declName = decl && (decl as ts.NamedDeclaration).name;
-    if (declName && ts.isIdentifier(declName)) return this.lowerIdentifier(ctx, declName);
-    // Generic namespace fallback: preserve a loud runtime value lookup when the
-    // export exists but its declaration shape is not one of the direct forms.
-    if (exported) {
-      const recv = this.lowerIdentifier(ctx, info.namespaceName);
-      const dst = this.newLocal(ctx, "reference", name);
-      ctx.body.push({ kind: "LoadField", dst, obj: recv, field: this.internField(name) });
+  /** `jsxFactory` / `@jsx` text (`h`, `React.createElement`) resolved at the JSX site: a name in scope,
+   *  or a namespace import's member (the module's export). */
+  private jsxEntityCallee(node: ts.Node, text: string, what: string): JsxCallee | undefined {
+    const parts = text.split(".");
+    const first = this.checker.resolveName(parts[0], node, ts.SymbolFlags.Value, false);
+    if (!first) { this.unsupported(node, `${what} ${text} is not in scope`); return undefined; }
+    if (parts.length === 1) return this.jsxCalleeOf(first, node, `${what} ${text}`);
+    const firstName = declarationNameOf(first);
+    const nsTarget = first.flags & ts.SymbolFlags.Alias ? this.checker.getAliasedSymbol(first) : first;
+    if (parts.length === 2 && firstName && nsTarget && nsTarget.declarations?.some((d) => ts.isSourceFile(d))) {
+      return this.jsxModuleExportCallee(nsTarget, parts[1], firstName, node);
+    }
+    this.unsupported(node, `${what} ${text}: a name in scope or a namespace import's member`);
+    return undefined;
+  }
+
+  /** The classic transform's factory (or, with `fragment`, fragment factory) for the file of `node`:
+   *  the `@jsx` / `@jsxFrag` pragmas, the `jsxFactory` / `jsxFragmentFactory` options, or the defaults
+   *  `React.createElement` / `React.Fragment`. A fragment under a factory without a fragment factory
+   *  is an error, as TypeScript's (TS17016). */
+  private jsxClassicOf(node: ts.Node, fragment: boolean): JsxCallee | undefined {
+    const sf = node.getSourceFile();
+    const options = this.program.getCompilerOptions();
+    const factoryText = jsxPragmaOf(sf, "jsx") ?? options.jsxFactory;
+    const fragmentText = jsxPragmaOf(sf, "jsxfrag") ?? options.jsxFragmentFactory;
+    if (fragment) {
+      if (fragmentText !== undefined) return this.jsxEntityCallee(node, fragmentText, "the JSX fragment factory");
+      if (factoryText === undefined) return this.jsxReactCallee(node, "Fragment");
+      this.unsupported(node, "a JSX fragment under a jsxFactory without a jsxFragmentFactory (the @jsxFrag pragma)");
+      return undefined;
+    }
+    return factoryText !== undefined ? this.jsxEntityCallee(node, factoryText, "the JSX factory") : this.jsxReactCallee(node, "createElement");
+  }
+
+  /** The value of a JSX callee (a fragment's type). */
+  private jsxCalleeValue(ctx: FnCtx, callee: JsxCallee | undefined): number {
+    if (callee?.name) return this.lowerIdentifier(ctx, callee.name);
+    const dst = this.newLocal(ctx, "reference", callee?.member);
+    if (callee?.ns) {
+      const recv = this.lowerIdentifier(ctx, callee.ns);
+      ctx.body.push({ kind: "LoadField", dst, obj: recv, field: this.internField(callee.member!) });
+    } else ctx.body.push({ kind: "Const", dst, value: { kind: "Undef" } });
+    return dst;
+  }
+
+  /** The call of a JSX factory or runtime function: direct when the function is bundled and does not
+   *  use `this`; through the namespace object (its `this`) or the binding's value otherwise. A spread
+   *  child (the classic transform's `...children` arguments) makes it a spread call. */
+  private emitJsxCall(ctx: FnCtx, callee: JsxCallee | undefined, args: JsxArg[]): number {
+    const dst = this.newLocal(ctx, "reference", "jsx");
+    if (!callee) return dst;
+    const spread = args.some((a) => a.kind === "spread");
+    const fn = callee.fn;
+    if (fn !== undefined && !this.funcTakesThisIds.has(fn)) {
+      const cells: JsxArg[] = this.directCallCellArgs(ctx, fn).map((c) => ({ kind: "single", local: c }));
+      if (spread) ctx.body.push({ kind: "CallSpread", dst, callee: { kind: "Direct", func: fn }, argSpecs: [...cells, ...args] });
+      else ctx.body.push({ kind: "Call", dst, callee: { kind: "Direct", func: fn }, args: [...cells, ...args].map((a) => a.local) });
       return dst;
     }
-    this.unsupported(node, `React subset does not export ${name}`);
-    return undefined;
+    let recv: number | undefined;
+    let value: number;
+    if (callee.ns) {
+      recv = this.lowerIdentifier(ctx, callee.ns);
+      value = this.newLocal(ctx, "reference", callee.member);
+      ctx.body.push({ kind: "LoadField", dst: value, obj: recv, field: this.internField(callee.member!) });
+    } else {
+      value = this.lowerIdentifier(ctx, callee.name!);
+    }
+    const inst: any = spread ? { kind: "CallSpread", dst, callee: { kind: "Value", local: value }, argSpecs: args }
+                             : { kind: "Call", dst, callee: { kind: "Value", local: value }, args: args.map((a) => a.local) };
+    if (recv !== undefined) inst.recv = recv;
+    ctx.body.push(inst);
+    return dst;
   }
 
+  /** `&name;` / `&#n;` / `&#xh;` in JSX text and string attributes, decoded as TypeScript does (its
+   *  table of named references; an unknown name stays as written). */
   private decodeJsxEntities(raw: string, node: ts.Node): string {
-    const named: Record<string, string> = {
-      amp: "&", lt: "<", gt: ">", quot: "\"", apos: "'", nbsp: "\u00a0",
-    };
     return raw.replace(/&((#((\d+)|x([\da-fA-F]+)))|(\w+));/g,
       (match, _all: string, _number: string, _digits: string,
        decimal: string, hex: string, word: string) => {
@@ -4426,12 +4691,8 @@ class Exporter {
           this.unsupported(node, `invalid JSX character reference ${match}`);
           return match;
         }
-        if (Object.prototype.hasOwnProperty.call(named, word)) return named[word];
-        // The subset intentionally recognizes the common XML/HTML entities. An
-        // unknown named reference must reject loudly instead of rendering text
-        // differently from TypeScript's classic JSX transform.
-        this.unsupported(node, `JSX named entity ${match} outside the supported React subset`);
-        return match;
+        const cp = Object.prototype.hasOwnProperty.call(JSX_ENTITIES, word) ? JSX_ENTITIES[word] : undefined;
+        return cp === undefined ? match : String.fromCodePoint(cp);
       });
   }
 
@@ -4476,110 +4737,171 @@ class Exporter {
       }
       return this.lowerIdentifier(ctx, tag);
     }
+    if (ts.isJsxNamespacedName(tag)) {   // `<svg:path>`: a string tag
+      const dst = this.newLocal(ctx, "reference", "jsx.tag");
+      ctx.body.push({ kind: "Const", dst, value: { kind: "Str", value: `${tag.namespace.text}:${tag.name.text}` } });
+      return dst;
+    }
     if (ts.isPropertyAccessExpression(tag)) return this.lowerExpr(ctx, tag);
     if (tag.kind === ts.SyntaxKind.ThisKeyword) return this.lowerExpr(ctx, tag as ts.Expression);
-    this.unsupported(tag, `JSX tag ${ts.SyntaxKind[tag.kind]}`);
+    this.unsupported(tag, `JSX tag ${ts.SyntaxKind[(tag as ts.Node).kind]}`);
     const dst = this.newLocal(ctx, "reference");
     ctx.body.push({ kind: "Const", dst, value: { kind: "Undef" } });
     return dst;
   }
 
-  private lowerJsxProps(ctx: FnCtx, node: ts.JsxOpeningLikeElement): number {
+  /** The value of an attribute: present without an initializer is `true`; a string literal decodes its
+   *  entities; `{expr}` is the expression (an empty `{}` is an error); a JSX element as is. */
+  private lowerJsxAttributeValue(ctx: FnCtx, attr: ts.JsxAttribute): number | undefined {
+    if (!attr.initializer) {
+      const value = this.newLocal(ctx, "primitive");
+      ctx.body.push({ kind: "Const", dst: value, value: { kind: "Bool", value: true } });
+      return value;
+    }
+    if (ts.isStringLiteral(attr.initializer)) {
+      const value = this.newLocal(ctx, "reference");
+      ctx.body.push({ kind: "Const", dst: value,
+        value: { kind: "Str", value: this.decodeJsxEntities(attr.initializer.text, attr.initializer) } });
+      return value;
+    }
+    if (ts.isJsxExpression(attr.initializer)) {
+      if (!attr.initializer.expression) { this.unsupported(attr, "empty JSX attribute expression"); return undefined; }
+      return this.lowerExpr(ctx, attr.initializer.expression);
+    }
+    return this.lowerExpr(ctx, attr.initializer as ts.Expression);
+  }
+
+  /** The props object: the attributes in order (`{...spread}` copies, `key` skipped under the automatic
+   *  runtime, where it is the call's third argument), then, with `children` given (the automatic
+   *  runtime), the `children` property: one child as is, several or a spread child as an array. */
+  private lowerJsxProps(ctx: FnCtx, at: ts.Node, node: ts.JsxOpeningLikeElement | undefined, key: ts.JsxAttribute | undefined,
+                        children: readonly ts.JsxChild[] | undefined): number {
     const site = this.site++;
     const dst = this.newLocal(ctx, "reference", "jsx.props");
-    const hasSpread = node.attributes.properties.some((p) => ts.isJsxSpreadAttribute(p));
-    this.labels[site] = `jsx-props@${ctx.name}`;
-    this.recordSite(site, "object", this.inLoop(node) ? "many" : "once", !hasSpread, node);
+    const attrs = node ? node.attributes.properties : [];
+    const hasSpread = attrs.some((p) => ts.isJsxSpreadAttribute(p));
+    this.labels[site] = `${node ? "jsx-props" : "jsx-fragment-props"}@${ctx.name}`;
+    this.recordSite(site, "object", this.inLoop(at) ? "many" : "once", !hasSpread, at);
     ctx.body.push({ kind: "AllocObject", dst, typeId: 0, site });
-    for (const attr of node.attributes.properties) {
+    for (const attr of attrs) {
+      if (attr === key) continue;
       if (ts.isJsxSpreadAttribute(attr)) {
         const src = this.lowerExpr(ctx, attr.expression);
         ctx.body.push({ kind: "ObjectCopyProps", dst, src });
         continue;
       }
-      if (!ts.isIdentifier(attr.name)) {
-        this.unsupported(attr, "JSX namespaced attribute");
-        continue;
+      const value = this.lowerJsxAttributeValue(ctx, attr);
+      if (value === undefined) continue;
+      ctx.body.push({ kind: "StoreField", obj: dst, field: this.internField(jsxAttributeName(attr)), src: value });
+    }
+    if (children !== undefined) {
+      const semantic = children.filter(isSemanticJsxChild);
+      if (semantic.length === 1 && !(ts.isJsxExpression(semantic[0]) && semantic[0].dotDotDotToken)) {
+        const [one] = this.lowerJsxChildren(ctx, semantic);
+        if (one) ctx.body.push({ kind: "StoreField", obj: dst, field: this.internField("children"), src: one.local });
+      } else if (semantic.length > 0) {
+        const arr = this.jsxChildrenArray(ctx, at, this.lowerJsxChildren(ctx, children));
+        ctx.body.push({ kind: "StoreField", obj: dst, field: this.internField("children"), src: arr });
       }
-      let value: number;
-      if (!attr.initializer) {
-        value = this.newLocal(ctx, "primitive");
-        ctx.body.push({ kind: "Const", dst: value, value: { kind: "Bool", value: true } });
-      } else if (ts.isStringLiteral(attr.initializer)) {
-        value = this.newLocal(ctx, "reference");
-        ctx.body.push({ kind: "Const", dst: value,
-          value: { kind: "Str", value: this.decodeJsxEntities(attr.initializer.text, attr.initializer) } });
-      } else if (ts.isJsxExpression(attr.initializer)) {
-        if (!attr.initializer.expression) {
-          this.unsupported(attr, "empty JSX attribute expression");
-          continue;
-        }
-        value = this.lowerExpr(ctx, attr.initializer.expression);
-      } else {
-        value = this.lowerExpr(ctx, attr.initializer as ts.Expression);
-      }
-      ctx.body.push({ kind: "StoreField", obj: dst, field: this.internField(attr.name.text), src: value });
     }
     return dst;
   }
 
-  private lowerJsxChildren(ctx: FnCtx, children: readonly ts.JsxChild[]): number[] {
-    const out: number[] = [];
+  /** The children as an array (the automatic runtime's `children: [...]`). */
+  private jsxChildrenArray(ctx: FnCtx, at: ts.Node, items: JsxArg[]): number {
+    const site = this.site++;
+    this.recordSite(site, "array", this.inLoop(at) ? "many" : "once", false, at);
+    const arr = this.newLocal(ctx, "reference", "jsx.children");
+    ctx.body.push({ kind: "AllocArray", dst: arr, elemType: 0, site });
+    for (const item of items) {
+      if (item.kind === "spread") ctx.body.push({ kind: "ArrayPushAll", arr, src: item.local });
+      else ctx.body.push({ kind: "ArrayPush", arr, src: item.local });
+    }
+    return arr;
+  }
+
+  /** The children in order: text (whitespace-normalized, entities decoded; whitespace-only text and
+   *  empty `{}` dropped), expressions, elements; `{...xs}` as the elements of the iterable, taken now
+   *  (a later child may change the array). */
+  private lowerJsxChildren(ctx: FnCtx, children: readonly ts.JsxChild[]): JsxArg[] {
+    const out: JsxArg[] = [];
     for (const child of children) {
       if (ts.isJsxText(child)) {
         const text = this.jsxTextValue(child.text, child);
         if (text.length === 0) continue;
-        const value = this.newLocal(ctx, "reference", "jsx.text");
-        ctx.body.push({ kind: "Const", dst: value, value: { kind: "Str", value: text } });
-        out.push(value);
-      } else if (ts.isJsxExpression(child)) {
-        if (!child.expression) continue; // JSX comment / empty expression
+        const local = this.newLocal(ctx, "reference", "jsx.text");
+        ctx.body.push({ kind: "Const", dst: local, value: { kind: "Str", value: text } });
+        out.push({ kind: "single", local });
+        continue;
+      }
+      let value: number;
+      if (ts.isJsxExpression(child)) {
+        if (!child.expression) continue; // a JSX comment / empty expression
+        value = this.lowerExpr(ctx, child.expression);
         if (child.dotDotDotToken) {
-          this.unsupported(child, "spread JSX child");
+          const site = this.site++;
+          this.recordSite(site, "array", this.inLoop(child) ? "many" : "once", false, child);
+          const local = this.newLocal(ctx, "reference", "jsx.spread");
+          ctx.body.push({ kind: "AllocArray", dst: local, elemType: 0, site });
+          ctx.body.push({ kind: "ArrayPushAll", arr: local, src: value });
+          out.push({ kind: "spread", local });
           continue;
         }
-        out.push(this.lowerExpr(ctx, child.expression));
       } else {
-        out.push(this.lowerExpr(ctx, child as ts.Expression));
+        value = this.lowerExpr(ctx, child as ts.Expression);
       }
+      if (this.isMutableStorageLocal(ctx, value)) {   // a later child may assign the binding
+        const snapshot = this.newLocal(ctx, "reference");
+        ctx.body.push({ kind: "Copy", dst: snapshot, src: value });
+        value = snapshot;
+      }
+      out.push({ kind: "single", local: value });
     }
     return out;
   }
 
-  private emitJsxFactoryCall(ctx: FnCtx, node: ts.Node, args: number[]): number {
-    const info = this.jsxFactoryInfo(node);
-    const dst = this.newLocal(ctx, "reference", "jsx");
-    if (!info) return dst;
-    const fn = info.createElementFn;
-    if (fn !== undefined && !this.funcTakesThisIds.has(fn)) {
-      const cells = this.directCallCellArgs(ctx, fn);
-      ctx.body.push({ kind: "Call", dst, callee: { kind: "Direct", func: fn }, args: [...cells, ...args] });
-      return dst;
-    }
-    const recv = this.lowerIdentifier(ctx, info.namespaceName);
-    const callee = this.newLocal(ctx, "reference", "React.createElement");
-    ctx.body.push({ kind: "LoadField", dst: callee, obj: recv, field: this.internField("createElement") });
-    ctx.body.push({ kind: "Call", dst, recv, callee: { kind: "Value", local: callee }, args });
-    return dst;
-  }
-
   private lowerJsxElement(ctx: FnCtx, node: ts.JsxElement | ts.JsxSelfClosingElement): number {
     const opening = ts.isJsxElement(node) ? node.openingElement : node;
+    const childNodes = ts.isJsxElement(node) ? node.children : undefined;
+    const site = this.jsxSiteCallees(node);
+    if (site.runtime) {
+      if (jsxKeyAfterSpread(opening)) {
+        // TypeScript calls `createElement` of the import source here; not modelled
+        this.unsupported(opening, "a JSX key attribute after a spread attribute under the automatic runtime");
+        return this.emitJsxCall(ctx, undefined, []);
+      }
+      const type = this.lowerJsxTag(ctx, opening);
+      const key = opening.attributes.properties.find((p): p is ts.JsxAttribute => ts.isJsxAttribute(p) && ts.isIdentifier(p.name) && p.name.text === "key");
+      const props = this.lowerJsxProps(ctx, node, opening, key, childNodes ?? []);
+      const args: JsxArg[] = [{ kind: "single", local: type }, { kind: "single", local: props }];
+      if (key) {
+        const k = this.lowerJsxAttributeValue(ctx, key);
+        if (k !== undefined) args.push({ kind: "single", local: k });
+      }
+      return this.emitJsxCall(ctx, site.call, args);
+    }
     const type = this.lowerJsxTag(ctx, opening);
-    const props = this.lowerJsxProps(ctx, opening);
-    const children = ts.isJsxElement(node) ? this.lowerJsxChildren(ctx, node.children) : [];
-    return this.emitJsxFactoryCall(ctx, node, [type, props, ...children]);
+    let props: number;
+    if (opening.attributes.properties.length > 0) props = this.lowerJsxProps(ctx, node, opening, undefined, undefined);
+    else {   // the classic transform passes null without attributes
+      props = this.newLocal(ctx, "reference", "jsx.props");
+      ctx.body.push({ kind: "Const", dst: props, value: { kind: "Null" } });
+    }
+    const children = childNodes ? this.lowerJsxChildren(ctx, childNodes) : [];
+    return this.emitJsxCall(ctx, site.call, [{ kind: "single", local: type }, { kind: "single", local: props }, ...children]);
   }
 
   private lowerJsxFragment(ctx: FnCtx, node: ts.JsxFragment): number {
-    const type = this.jsxExportValue(ctx, node, "Fragment");
+    const site = this.jsxSiteCallees(node);
+    const type = this.jsxCalleeValue(ctx, site.value);
+    if (site.runtime) {
+      const props = this.lowerJsxProps(ctx, node, undefined, undefined, node.children);
+      return this.emitJsxCall(ctx, site.call, [{ kind: "single", local: type }, { kind: "single", local: props }]);
+    }
     const props = this.newLocal(ctx, "reference", "jsx.fragment.props");
-    const site = this.site++;
-    this.labels[site] = `jsx-fragment-props@${ctx.name}`;
-    this.recordSite(site, "object", this.inLoop(node) ? "many" : "once", true, node);
-    ctx.body.push({ kind: "AllocObject", dst: props, typeId: 0, site });
+    ctx.body.push({ kind: "Const", dst: props, value: { kind: "Null" } });
     const children = this.lowerJsxChildren(ctx, node.children);
-    return this.emitJsxFactoryCall(ctx, node, [type ?? props, props, ...children]);
+    return this.emitJsxCall(ctx, site.call, [{ kind: "single", local: type }, { kind: "single", local: props }, ...children]);
   }
 
   private lowerTaggedTemplate(ctx: FnCtx, node: ts.TaggedTemplateExpression): number {
@@ -15512,6 +15834,11 @@ class Exporter {
       const target = spec && ts.isStringLiteral(spec) ? this.resolveModuleSf(spec) : undefined;
       if (target && !seen.has(target)) { seen.add(target); out.push(target); }
     }
+    // a file with JSX under the automatic runtime imports `<source>/jsx-runtime` (a synthetic import)
+    if (this.fileHasJsx(sf)) {
+      const rt = this.jsxRuntimeModuleOf(sf);
+      if (rt && !seen.has(rt)) { seen.add(rt); out.push(rt); }
+    }
     return out;
   }
 
@@ -16177,7 +16504,7 @@ function batchMain(listPath: string, outDir: string, strictCompiler = false) {
   });
   for (const e of entries) {
     try {
-      const program = programWithNodeSupport([e.input], opts, host, "module");
+      const program = programWithJsxRuntime([e.input], opts, host, "module");
       const r = exportOne(program, e.input, `${outDir}/${e.name}.program.json`, `${outDir}/${e.name}.labels.json`);
       const status = r.ok ? "OK" : "UNSUPPORTED";
       process.stdout.write(`${e.name}\t${status}\t${r.nfns}\n`);
@@ -16233,7 +16560,8 @@ function main() {
       try {
         const src = fs.readFileSync(input, "utf8");
         const out = ts.transpileModule(src, {
-          compilerOptions: { target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.ESNext },
+          fileName: input,   // a .tsx file parses JSX
+          compilerOptions: { target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.ESNext, jsx: oracleJsxEmit(src) },
         }).outputText;
         // Step 0(b)/Step C: the V8 reference NO LONGER auto-appends a main()
         // call. ESM semantics: the program runs its top-level statements only.
@@ -16302,9 +16630,12 @@ function main() {
     compilerOptions.noEmit = true;
     compilerOptions.noCheck = false;
     compilerOptions.strictNullChecks = true;
-    compilerOptions.jsx = ts.JsxEmit.Preserve;
+    // JSX stays in the tree for the exporter's lowering; the automatic runtime's mode is kept (the checker
+    // resolves `<jsxImportSource>/jsx-runtime` under it; the dev runtime is the production one here)
+    compilerOptions.jsx = compilerOptions.jsx === ts.JsxEmit.ReactJSX || compilerOptions.jsx === ts.JsxEmit.ReactJSXDev
+      ? ts.JsxEmit.ReactJSX : ts.JsxEmit.Preserve;
   }
-  const program = programWithNodeSupport(rootNames, compilerOptions, undefined, sourceMode);
+  const program = programWithJsxRuntime(rootNames, compilerOptions, undefined, sourceMode);
   const sf = program.getSourceFile(input)!;
   // Type-error gate: the checker still assigns a type to every node when the
   // program is ill-typed, but those types are unsound — either the error type

@@ -28,10 +28,13 @@ const dir = process.argv[2];
 for (const f of fs.readdirSync(dir)) {
   if (!f.endsWith(".ts") && !f.endsWith(".tsx")) continue;
   const src = fs.readFileSync(path.join(dir, f), "utf8");
-  let js = ts.transpileModule(src, { compilerOptions: {
+  // JSX: the classic transform, or the automatic runtime where the file asks for it by pragma
+  // (`@jsxImportSource`, `@jsxRuntime automatic`), as the exporter decides (docs/jsx_react_ssr_design.md)
+  const jsx = /@jsxImportSource\b|@jsxRuntime\s+automatic\b/.test(src) ? ts.JsxEmit.ReactJSX : ts.JsxEmit.React;
+  let js = ts.transpileModule(src, { fileName: path.join(dir, f), compilerOptions: {
     target: ts.ScriptTarget.ES2022,
     module: ts.ModuleKind.ESNext,
-    jsx: ts.JsxEmit.React,
+    jsx,
   } }).outputText;
   js = js.replace(/(from\s*['"])(\.\.?\/[^'"]+?)(['"])/g, (m, a, p, b) => a + (p.endsWith(".mjs") ? p : p + ".mjs") + b);
   js = js.replace(/(import\s*['"])(\.\.?\/[^'"]+?)(['"])/g, (m, a, p, b) => a + (p.endsWith(".mjs") ? p : p + ".mjs") + b);

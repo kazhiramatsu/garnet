@@ -52,13 +52,17 @@ ns from "m"`, `new Date(value)` with a Date, an ISO or `toString`-shaped string 
 ## hono_app (the application through `app.fetch`)
 
 `benchmarks/real/hono_app/driver.ts` (`build/real/hono_app` is a symbolic link to the hono clone)
-builds a hono application and drives it through `app.fetch(new Request(...))` over 17 request
+builds a hono application and drives it through `app.fetch(new Request(...))` over 19 request
 kinds: routing with params and wildcards, queries, middleware, JSON and form bodies, html, a
 redirect, a status, headers echoed, an HTTPException, `onError`, `notFound`, a sub-application
-with `route`, `all`, HEAD. The checksum is every response's status, headers and body, so the
-Web standard objects of `lib/node/web/` (docs/web_fetch_api_design.md) are compared with Node's
-own on hono's real code, and the loop over 20,000 requests is the dispatch benchmark (no socket).
-Session 358's first number: garnet 338 ms, Node 148 (2.3x).
+with `route`, `all`, HEAD, and a page rendered by hono's own JSX runtime (`view.tsx`, copied into
+the clone as `garnet-view.tsx`; the tsconfig's `jsxImportSource: ./src/jsx`,
+docs/jsx_react_ssr_design.md section 8) served with `c.html`: a layout component with children,
+a list with keys, a fragment, escaped text. The checksum is every response's status, headers and
+body, so the Web standard objects of `lib/node/web/` (docs/web_fetch_api_design.md) and the JSX
+rendering are compared with Node's own on hono's real code, and the loop over 20,000 requests is
+the dispatch benchmark (no socket). Session 358's numbers: 17 kinds garnet 337 ms, Node 142 (2.4x);
+with the two JSX pages 19 kinds with the two JSX pages: garnet 389 ms, Node 155 (2.5x) on a quiet machine; 438 vs 164 under the external load.
 
 ## hono (routers)
 

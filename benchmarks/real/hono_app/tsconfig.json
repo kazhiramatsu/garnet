@@ -5,7 +5,9 @@
     "moduleResolution": "Bundler",
     "allowImportingTsExtensions": true,
     "noEmit": true,
-    "types": []
+    "types": [],
+    "jsx": "react-jsx",
+    "jsxImportSource": "./src/jsx"
   },
   "files": ["garnet-driver.ts"]
 }
