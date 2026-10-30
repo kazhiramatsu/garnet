@@ -4771,6 +4771,35 @@ struct LayoutPlan {
     ctor_first: BTreeMap<usize, Vec<u32>>,
 }
 
+/// TSAOT_LITERAL_LAYOUT_IF=0: an object literal's layout stops at a conditional
+/// value, as it did (the stores after it are dynamic additions).
+fn literal_layout_through_if_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_LITERAL_LAYOUT_IF").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+
+/// Whether `inst`, or any instruction a control instruction nests, uses or defines `obj`.
+fn inst_mentions_deep(inst: &Inst, obj: u32) -> bool {
+    if inst_def(inst) == Some(obj) || inst_refs(inst).contains(&obj) {
+        return true;
+    }
+    match inst {
+        Inst::If { then_body, else_body, .. } => then_body.iter().chain(else_body.iter()).any(|i| inst_mentions_deep(i, obj)),
+        Inst::Loop { cond_body, body, .. } => cond_body.iter().chain(body.iter()).any(|i| inst_mentions_deep(i, obj)),
+        Inst::TryCatch { try_body, catch_body, finally_body, .. } => try_body
+            .iter()
+            .chain(catch_body.iter())
+            .chain(finally_body.iter())
+            .any(|i| inst_mentions_deep(i, obj)),
+        _ => false,
+    }
+}
+
 /// Stores into `obj` that follow `start` in `block` before anything else
 /// touches `obj`: (keys, store addresses). Intervening instructions may not
 /// mention `obj`; when `strict`, they may also not run user code.
@@ -4788,6 +4817,10 @@ fn collect_layout_stores(block: &[Inst], start: usize, obj: u32, strict: bool) -
                 addrs.push(inst as *const Inst as usize);
                 srcs.push(src.0);
             }
+            // a conditional value (`a ? b : c`, `??`, `||`, `&&`, `?.` lower to an If) that does not
+            // touch the object: the stores after it stay in the layout (an object literal's values
+            // cannot name the object it builds); a constructor's `this` sequence keeps stopping
+            Inst::If { .. } if !strict && literal_layout_through_if_enabled() && !inst_mentions_deep(inst, obj) => {}
             Inst::If { .. } | Inst::Loop { .. } | Inst::TryCatch { .. } => break,
             other => {
                 if inst_def(other) == Some(obj) || inst_refs(other).contains(&obj) {

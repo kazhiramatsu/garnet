@@ -12445,3 +12445,21 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   module binding read inside a function does not, and undefined cannot be the test there (a binding
   may hold undefined). Not fixed: it needs a TDZ sentinel for module bindings, or a proof that the
   read follows the initialization.
+- An object literal's layout through conditional values (docs/object_layout_design.md, "Literal layouts
+  through conditional values"). Comparing garnet's per-function time with Node's `--cpu-prof` on vue (the
+  sample attributed to its innermost compiled function): the parser's `getLoc` took six times V8's time.
+  Its literal `{ start, end: end == null ? end : getPos(end), source: ... }` had a layout of `start`
+  alone: the layout collected the stores after the allocation and stopped at the first branch, and a
+  conditional value (`?:`, `??`, `||`, `&&`, `?.`) is an `If`, so the keys after one were additions to
+  the built object. The collection now continues past an `If` whose bodies neither use nor define the
+  object (`inst_mentions_deep`; a constructor's `this` sequence keeps stopping;
+  `TSAOT_LITERAL_LAYOUT_IF=0`): vue's additions after a literal 300 -> 199, its compiler phase 342 -> 323
+  ms. Fixture objects/literal_layout_conditionals. Gates (`build/gates_s360g/run.sh`, r26 against r25):
+  unit, bundler 54/54, conformance plain and strict 703/703, protect 700/700, bench, ci, ir-parity
+  (the fixture; snapshot refreshed, 4,379 identical), the engine diff in both modes, the GC gate, the
+  hono survey 42/43. vue 993.9 -> 975.7 ms (Node 759.9), hono_app 147.0 -> 147.1 (Node 154.1), the
+  routers within noise, tsc-ts cycles 0.9940. Measured and dropped: `val in map` on a plain object
+  answered from its own map first (vue's makeMap tables): no gain under load.
+  Other per-function gaps from the comparison: the reactive array iterator's `next` (garnet about 26 ms
+  against 5: the native array iterator keeps its state in properties read through runtime caches),
+  makeMap's `val in map` (28 against 8), the reactive get trap (102 against 63).

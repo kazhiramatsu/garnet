@@ -79,3 +79,22 @@ a call and a repeated key inside the store sequence, 20k instances).
 Kernel `benchmarks/patterns/ctor_functions.ts` (ten adds per instance through
 a factory-provided constructor): native 265 ms vs node 96 ms before the fix.
 
+
+## Literal layouts through conditional values (Session 360)
+
+A literal's layout collected the stores that follow its allocation and
+stopped at the first branch. A conditional value (`a ? b : c`, `??`, `||`,
+`&&`, `?.`) lowers to an `If`, so every key after one became a property
+added to the built object, one shape transition and possibly an overflow
+vector each. vue's parser builds a location on every node, `{ start, end:
+end == null ? end : getPos(end), source: ... }`: the layout held `start`
+alone, and the two additions made `getLoc` six times V8's time. The
+collection now continues past an `If` whose bodies neither use nor define
+the object (`inst_mentions_deep`), which holds for every literal: its values
+cannot name the object it builds. A constructor's `this` sequence (the
+strict collection, which also stops at a call) keeps stopping. In vue's C
+the additions after a literal went from 300 to 199, and the compiler phase
+ran 342 -> 323 ms. `TSAOT_LITERAL_LAYOUT_IF=0` keeps stopping. Fixture
+`objects/literal_layout_conditionals` (every kind of conditional value, the
+key order through `Object.keys` and `JSON.stringify`, branches that
+allocate or call, a branch that throws midway).
