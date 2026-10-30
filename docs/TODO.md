@@ -12167,3 +12167,53 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   `[ReferenceError: msg]` with its own properties, `[cause]` and `[errors]` after it.
 - Gates: committed and pushed at Kaz's request with the gate run stopped part way (Kaz had to leave, 2026-10-30 11:30). Passed: unit, bundler 53/53, conformance plain 699/699 and strict 699/699, protect 696/696, bench (every benchmark correct and within budget), the `ci` gate (CI-FAST PASSED, 215 s), the GC gate's first phase (focused conformance at O2 under a young collection at every allocation, 60/60; the new fixtures also passed by hand under threshold 1, protect, zap and ASan). Not yet run: the rest of `gate.sh gc` (ASan, runtime units, protect), the regexp engine diff, ir-parity (the Error lowering changes the IR of every program with an Error subclass or `new Error(m, o)`: expect a snapshot refresh), the full hono survey, the r19 builds and A/Bs (vue, hono routers, hono_app, tsc-ts against build/tsc_ts_native_r18). The runner is build/gates_s359/run.sh (summary.txt holds the finished steps; baselines: vue-work/driver.r18, hono-work/driver.r18plain, hono_app-work/driver.r18). To finish the slice: run the remaining steps (refresh the ir-parity snapshot after reading its differences) and record the numbers here.
 - Next (planned): the Error part of console.log in Node's stackless form (`[TypeError: m] { code: ..., [cause]: ... }`, Node 25's formatError / improveStack; a draft and its differential test are in build/gates_s359/drafts/), then Kaz's agreed peak-memory tuning on hono_app. Recorded for later: garnet's inspector has none of util.inspect's layout (a depth of 2 with `[Object]`, lines broken past 80 columns, arrays of more than six entries grouped): any long or deep object prints differently from Node.
+
+## Session 360 (2026-10-30): Session 359's gates finished, the analyzer's quadratic passes (tsc-ts's emit from over 400 s to 21 s), the RegExpRouter's next direction
+
+- Session 359's remaining gates (the runner resumed after a reboot, `build/gates_s359/run2.sh`): the
+  GC gate's remaining phases (focused conformance and the runtime units under ASan and under
+  protect, the string-builder scale stress, the minor-collection modes) GC-STRESS PASSED (1,083 s:
+  the machine was still busy after the reboot, the usual 600 s); the regexp engine diff 43,593
+  cases, 0 differ; ir-parity: 123 programs differ and 18 files are new, as expected (the Error
+  lowering changes every program with an Error subclass or a `new Error(m, o)`, the lib code that
+  builds errors with a cause among them; the three new fixtures), the snapshot refreshed after
+  reading the differences; the hono survey 42 of 43 (ip-restriction needs BigInt). r19 against
+  r18, alternating rounds (medians; outputs identical): vue 2,049.0 -> 2,053.6 ms (unchanged); the
+  plain hono routers TrieRouter 491.9 -> 487.3, RegExpRouter 123.6 -> 122.8, PatternRouter 475.1
+  -> 463.2, SmartRouter 141.9 -> 139.7 (twice Session 358's absolute numbers: the machine was
+  loaded after the reboot); hono_app 352.8 -> 324.1 ms (Node 296.0 in the same run). The tsc-ts
+  build was stopped in its emit step after 756 s, which led to the next item.
+- The analyzer's emit of tsc-ts took over 400 s (nice 12; it was about 190 s when r18 was built at
+  night): three passes walked a whole body once per local, or per call, and per round, quadratic
+  on tsc-ts's module initializer (70,591 instructions, 42,682 locals) or worse over mutually
+  recursive methods. (1) `infer_numeric_analysis`'s int32-by-definition fixpoint kept a local by
+  scanning every instruction, every round: one pass over the definitions now, then a worklist over
+  the copy edges (the same greatest fixpoint). (2) `int32_narrow_locals`'s rules (the definitions
+  by bitwise operators, a wrap-safe local's definitions and uses, the copy sources, the widening
+  uses) each scanned the body per local and round, 30 s on the module initializer: each local's
+  definitions and uses are indexed once and every rule reads its local's own instructions; the
+  operands come from `any_used_local_shallow`, which `inst_uses_any` now uses for every
+  instruction but the containers, so the index and the rules cannot disagree. (3) SROA's
+  `needs_materialized_this` walked a callee and the methods it calls on its own `this`, to depth
+  16, for every such call in every body and nested body, remembering nothing (tsc's binder is a
+  class of mutually recursive methods: 14 s for `bindChildren`): memoized by (function, depth)
+  over the run's fixed snapshot of the bodies. Behaviour-invariant: the C of tsc-ts (r18's IR, 40
+  units) and of the whole ir-parity corpus (1,449 programs: conformance typed and untyped, the
+  bundler, selfhost) is byte-identical to HEAD's analyzer built in a worktree; unit gate PASS.
+  tsc-ts's emit: 1,099 G instructions after (1) alone, 752 G after (2), 502 G after (3) (21 s).
+  The rest of the emit's profile is spread out (the C emission, interproc's analysis).
+- The RegExpRouter's next direction (Kaz, 2026-10-30): V8 compiles hono's one big route regexp
+  to native code at run time; the VM should narrow by the static parts by string comparison, and
+  better, run a DFA built just in time for the regular part of a pattern. The facts behind the
+  plan: hono's router refuses ambiguous routes when they are added (a parameter beside another
+  child of the same trie node is a PATH_ERROR and SmartRouter takes another router), so the
+  regexp is one-pass except at the wildcard nodes (`.*`, `(?:|/.*)`): the next character decides
+  the one live path, and a one-pass DFA (RE2's OnePass) records the captures, the route's `$()`
+  among them, in its transitions. The R6 first-character dispatch (`ALT_FIRST`) already skips the
+  alternatives without choice points; what the DFA adds is one table step per character instead
+  of the ops, without a training run. The trained build's matchers are already native (R9), and
+  its remaining gap to Node (46.5 ms against 39) is mostly outside the matcher (R10's profile:
+  the result array's construction 27%, the driver's loop 14.7%, `rx_exec` around the matcher
+  11.8%, the closure's body 9%, the static map's `ts_get` 6%, `indexOf` 4.5%); Kaz asked for those
+  as well. Plan: the design (docs/regexp_dfa_design.md), then the slices; the result array beside
+  them.

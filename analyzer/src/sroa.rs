@@ -141,6 +141,7 @@ pub fn run_sroa(program: &mut Program, result: &EscapeResult) {
         .iter()
         .map(|f| (f.id.0, f.clone()))
         .collect();
+    NEEDS_THIS_MEMO.with(|m| m.borrow_mut().clear());
 
     // next fresh local id per function (max existing + 1)
     for fi in 0..program.functions.len() {
@@ -2216,6 +2217,22 @@ fn trim_trailing_alloc_proto_load(out: &mut Vec<Inst>, proto_local: u32) {
 /// local id (it read the caller's local 0, the module scope record, instead of
 /// the receiver). Depth-guarded; conservative (returns true) on overflow.
 fn needs_materialized_this(f: &Function, bodies: &BTreeMap<u32, Function>, depth: u32) -> bool {
+    // the answer is a function of the callee and the depth over the run's fixed `bodies`:
+    // without the table a class of mutually recursive methods (tsc's binder) was walked again
+    // for every call on `this` and at every depth, 14 s for one function
+    let key = (f.id.0, depth);
+    if let Some(known) = NEEDS_THIS_MEMO.with(|m| m.borrow().get(&key).copied()) {
+        return known;
+    }
+    let answer = needs_materialized_this_walk(f, bodies, depth);
+    NEEDS_THIS_MEMO.with(|m| m.borrow_mut().insert(key, answer));
+    answer
+}
+thread_local! {
+    /// `needs_materialized_this` by (function, depth), for the bodies of one `run_sroa`
+    static NEEDS_THIS_MEMO: std::cell::RefCell<std::collections::HashMap<(u32, u32), bool>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+fn needs_materialized_this_walk(f: &Function, bodies: &BTreeMap<u32, Function>, depth: u32) -> bool {
     if f.is_generator || f.is_async || f.rest_param.is_some() {
         return true;
     }

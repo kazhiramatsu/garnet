@@ -7067,23 +7067,13 @@ fn inst_def_local(inst: &Inst) -> Option<u32> {
     }
 }
 
-fn callee_uses_any(callee: &CalleeRef, ids: &BTreeSet<u32>) -> bool {
-    match callee {
-        CalleeRef::Value { local } => ids.contains(&local.0),
-        _ => false,
-    }
-}
-
-fn arg_spec_uses_any(spec: &ArgSpec, ids: &BTreeSet<u32>) -> bool {
-    match spec {
-        ArgSpec::Single { local } | ArgSpec::Spread { local } => ids.contains(&local.0),
-    }
-}
-
-fn inst_uses_any(inst: &Inst, ids: &BTreeSet<u32>) -> bool {
+/// Whether `f` holds for a local the instruction reads, the nested bodies of a container left
+/// out: an `If`'s or a `Loop`'s condition is its operand here, a `TryCatch` has none. Every
+/// local an instruction reads is visited when `f` returns false.
+fn any_used_local_shallow(inst: &Inst, f: &mut impl FnMut(u32) -> bool) -> bool {
     match inst {
-        Inst::AllocObject { proto, .. } => proto.map(|p| ids.contains(&p.0)).unwrap_or(false),
-        Inst::AllocClosure { captures, .. } => captures.iter().any(|c| ids.contains(&c.cell.0)),
+        Inst::AllocObject { proto, .. } => proto.map_or(false, |p| f(p.0)),
+        Inst::AllocClosure { captures, .. } | Inst::AllocClassValue { captures, .. } => captures.iter().any(|c| f(c.cell.0)),
         Inst::Copy { src, .. }
         | Inst::StoreElem { src, .. }
         | Inst::Return { src: Some(src) }
@@ -7098,7 +7088,7 @@ fn inst_uses_any(inst: &Inst, ids: &BTreeSet<u32>) -> bool {
         | Inst::ObjectCopyProps { src, .. }
         | Inst::Print { src }
         | Inst::StoreProtoMethod { src, .. }
-        | Inst::StoreMethod { src, .. } => ids.contains(&src.0),
+        | Inst::StoreMethod { src, .. } => f(src.0),
         Inst::LoadField { obj, .. }
         | Inst::LoadMethodValue { recv: obj, .. }
         | Inst::NewDynamic { callee: obj, .. }
@@ -7107,24 +7097,20 @@ fn inst_uses_any(inst: &Inst, ids: &BTreeSet<u32>) -> bool {
         | Inst::StringLen { src: obj, .. }
         | Inst::GenericLen { src: obj, .. }
         | Inst::DeleteField { obj, .. }
-        | Inst::GetProto { obj, .. } => ids.contains(&obj.0),
+        | Inst::GetProto { obj, .. }
+        | Inst::HasField { obj, .. } => f(obj.0),
         Inst::StoreField { obj, src, .. }
         | Inst::SetProto {
             obj, proto: src, ..
-        } => ids.contains(&obj.0) || ids.contains(&src.0),
-        Inst::StoreFieldDynamic { obj, key, src } => {
-            ids.contains(&obj.0) || ids.contains(&key.0) || ids.contains(&src.0)
-        }
-        Inst::StoreIndex { arr, index, src, .. } => {
-            ids.contains(&arr.0) || ids.contains(&index.0) || ids.contains(&src.0)
-        }
-        Inst::AllocClassValue { captures, .. } => captures.iter().any(|c| ids.contains(&c.cell.0)),
+        } => f(obj.0) || f(src.0),
+        Inst::StoreFieldDynamic { obj, key, src } => f(obj.0) || f(key.0) || f(src.0),
+        Inst::StoreIndex { arr, index, src, .. } => f(arr.0) || f(index.0) || f(src.0),
         Inst::Call {
             callee, recv, args, ..
         } => {
-            recv.map(|r| ids.contains(&r.0)).unwrap_or(false)
-                || callee_uses_any(callee, ids)
-                || args.iter().any(|a| ids.contains(&a.0))
+            recv.map_or(false, |r| f(r.0))
+                || matches!(callee, CalleeRef::Value { local } if f(local.0))
+                || args.iter().any(|a| f(a.0))
         }
         Inst::CallSpread {
             callee,
@@ -7132,19 +7118,11 @@ fn inst_uses_any(inst: &Inst, ids: &BTreeSet<u32>) -> bool {
             arg_specs,
             ..
         } => {
-            recv.map(|r| ids.contains(&r.0)).unwrap_or(false)
-                || callee_uses_any(callee, ids)
-                || arg_specs.iter().any(|a| arg_spec_uses_any(a, ids))
-        }
-        Inst::TryCatch {
-            try_body,
-            catch_body,
-            finally_body,
-            ..
-        } => {
-            try_body.iter().any(|i| inst_uses_any(i, ids))
-                || catch_body.iter().any(|i| inst_uses_any(i, ids))
-                || finally_body.iter().any(|i| inst_uses_any(i, ids))
+            recv.map_or(false, |r| f(r.0))
+                || matches!(callee, CalleeRef::Value { local } if f(local.0))
+                || arg_specs.iter().any(|a| match a {
+                    ArgSpec::Single { local } | ArgSpec::Spread { local } => f(local.0),
+                })
         }
         Inst::BinOp { lhs, rhs, .. }
         | Inst::LoadIndex {
@@ -7157,11 +7135,27 @@ fn inst_uses_any(inst: &Inst, ids: &BTreeSet<u32>) -> bool {
         }
         | Inst::LoadFieldDynamic {
             obj: lhs, key: rhs, ..
-        } => ids.contains(&lhs.0) || ids.contains(&rhs.0),
-        Inst::CallBuiltin { recv, args, .. } => {
-            ids.contains(&recv.0) || args.iter().any(|a| ids.contains(&a.0))
+        } => f(lhs.0) || f(rhs.0),
+        Inst::CallBuiltin { recv, args, .. } => f(recv.0) || args.iter().any(|a| f(a.0)),
+        Inst::CallBuiltinStatic { args, .. } => args.iter().any(|a| f(a.0)),
+        Inst::If { cond, .. } | Inst::Loop { cond, .. } => f(cond.0),
+        Inst::ConstructResult { inst, ret, .. } => f(inst.0) || f(ret.0),
+        _ => false,
+    }
+}
+
+fn inst_uses_any(inst: &Inst, ids: &BTreeSet<u32>) -> bool {
+    match inst {
+        Inst::TryCatch {
+            try_body,
+            catch_body,
+            finally_body,
+            ..
+        } => {
+            try_body.iter().any(|i| inst_uses_any(i, ids))
+                || catch_body.iter().any(|i| inst_uses_any(i, ids))
+                || finally_body.iter().any(|i| inst_uses_any(i, ids))
         }
-        Inst::CallBuiltinStatic { args, .. } => args.iter().any(|a| ids.contains(&a.0)),
         Inst::If {
             cond,
             then_body,
@@ -7180,9 +7174,7 @@ fn inst_uses_any(inst: &Inst, ids: &BTreeSet<u32>) -> bool {
                 || cond_body.iter().any(|i| inst_uses_any(i, ids))
                 || body.iter().any(|i| inst_uses_any(i, ids))
         }
-        Inst::HasField { obj, .. } => ids.contains(&obj.0),
-        Inst::ConstructResult { inst, ret, .. } => ids.contains(&inst.0) || ids.contains(&ret.0),
-        _ => false,
+        other => any_used_local_shallow(other, &mut |x| ids.contains(&x)),
     }
 }
 
@@ -7447,6 +7439,26 @@ fn int32_narrow_locals(f: &Function, facts: &BTreeMap<u32, NumFact>, int_local: 
     let params: BTreeSet<u32> = f.params.iter().map(|p| p.0).collect();
     let mut flat: Vec<&Inst> = Vec::new();
     flatten_inst(&f.body, &mut flat);
+    // each local's definitions and uses in body order (a container's own use is its condition;
+    // its children are in `flat` themselves): every rule below looks at a local's own
+    // instructions only (a scan of the body per local and round was quadratic, half a minute
+    // on a module initializer of 70k instructions)
+    let mut defs_at: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+    let mut uses_at: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+    for (index, inst) in flat.iter().enumerate() {
+        if let Some(x) = inst_def_local(inst) {
+            defs_at.entry(x).or_default().push(index);
+        }
+        any_used_local_shallow(inst, &mut |x| {
+            let at = uses_at.entry(x).or_default();
+            if at.last() != Some(&index) {
+                at.push(index);
+            }
+            false
+        });
+    }
+    let defs_of = |x: u32| defs_at.get(&x).into_iter().flatten().map(|&index| flat[index]);
+    let uses_of = |x: u32| uses_at.get(&x).into_iter().flatten().map(|&index| flat[index]);
     let mut exact: BTreeSet<u32> = int32_use.iter().filter(|id| !params.contains(id)).copied().collect();
     // an int local defined only by bitwise operators, int32 constants and copies of such locals
     // is an int32 whatever the loop joins did to its range (a `| 0` accumulator). The
@@ -7456,7 +7468,7 @@ fn int32_narrow_locals(f: &Function, facts: &BTreeMap<u32, NumFact>, int_local: 
     loop {
         let snapshot = by_def.clone();
         by_def.retain(|&x| {
-            flat.iter().all(|inst| match inst {
+            defs_of(x).all(|inst| match inst {
                 Inst::BinOp { dst, op, .. } if dst.0 == x => op != ">>>",
                 Inst::Copy { dst, src } if dst.0 == x => snapshot.contains(&src.0),
                 _ => true,
@@ -7479,7 +7491,7 @@ fn int32_narrow_locals(f: &Function, facts: &BTreeMap<u32, NumFact>, int_local: 
     let mut wrap: BTreeSet<u32> = int_local.iter().filter(|id| !exact.contains(id) && !params.contains(id)).copied().collect();
     // the definitions a wrap-safe local may have
     wrap.retain(|&x| {
-        flat.iter().all(|inst| match inst {
+        defs_of(x).all(|inst| match inst {
             Inst::BinOp { dst, op, .. } if dst.0 == x => matches!(op.as_str(), "+" | "-" | "*") || is_bitwise_op(op),
             Inst::UnOp { dst, op, .. } if dst.0 == x => op == "~",
             Inst::Copy { dst, src } if dst.0 == x => exact.contains(&src.0) || int_local.contains(&src.0),
@@ -7491,7 +7503,7 @@ fn int32_narrow_locals(f: &Function, facts: &BTreeMap<u32, NumFact>, int_local: 
         let snapshot = wrap.clone();
         wrap.retain(|&x| {
             let one: BTreeSet<u32> = std::iter::once(x).collect();
-            flat.iter().all(|inst| match inst {
+            uses_of(x).all(|inst| match inst {
                 Inst::BinOp { dst, op, lhs, rhs } if lhs.0 == x || rhs.0 == x => {
                     is_bitwise_op(op) || (matches!(op.as_str(), "+" | "-" | "*") && (exact.contains(&dst.0) || snapshot.contains(&dst.0)))
                 }
@@ -7510,7 +7522,7 @@ fn int32_narrow_locals(f: &Function, facts: &BTreeMap<u32, NumFact>, int_local: 
     // keep those wide (the copy sources above were allowed for the exact case)
     let wrap_snapshot = wrap.clone();
     wrap.retain(|&x| {
-        flat.iter().all(|inst| match inst {
+        defs_of(x).all(|inst| match inst {
             Inst::Copy { dst, src } if dst.0 == x => exact.contains(&src.0) || wrap_snapshot.contains(&src.0) || src.0 == x,
             _ => true,
         })
@@ -7534,7 +7546,7 @@ fn int32_narrow_locals(f: &Function, facts: &BTreeMap<u32, NumFact>, int_local: 
         narrow.retain(|&x| {
             let one: BTreeSet<u32> = std::iter::once(x).collect();
             // the first use that would widen the local, if any
-            let culprit = flat.iter().find(|inst| match inst {
+            let culprit = uses_of(x).find(|inst| match inst {
                 Inst::BinOp { dst, op, lhs, rhs } if lhs.0 == x || rhs.0 == x => {
                     let other = if lhs.0 == x { rhs.0 } else { lhs.0 };
                     let arith_or_cmp = is_bitwise_op(op) || matches!(op.as_str(), "+" | "-" | "*" | "<" | "<=" | ">" | ">=" | "==" | "!=" | "===" | "!==");
@@ -7641,23 +7653,36 @@ fn infer_numeric_analysis(
     // the instructions defining each local (a local defined only by bitwise operators holds an
     // int32 and is never -0), for the negative-zero rule of `*`
     // a local is int32 by definition when each of its definitions is a bitwise operator, `~`,
-    // an integer constant within int32, or a copy of such a local (a fixpoint over the copies:
-    // an accumulator `let isum = 0; ... isum = (isum + p) | 0` qualifies)
-    let mut int32_by_definition: BTreeSet<u32> = flat.iter().filter_map(|i| inst_def_local(i)).collect();
-    loop {
-        let before = int32_by_definition.len();
-        let snapshot = int32_by_definition.clone();
-        int32_by_definition.retain(|&x| {
-            flat.iter().all(|inst| match inst {
-                Inst::BinOp { dst, op, .. } if dst.0 == x => is_bitwise_op(op),
-                Inst::UnOp { dst, op, .. } if dst.0 == x => op == "~",
-                Inst::Const { dst, value } if dst.0 == x => matches!(value, ConstVal::Num { value } if value.fract() == 0.0 && *value >= -2147483648.0 && *value <= 2147483647.0),
-                Inst::Copy { dst, src } if dst.0 == x => snapshot.contains(&src.0),
-                other => inst_def_local(other) != Some(x),
-            })
-        });
-        if int32_by_definition.len() == before {
-            break;
+    // an integer constant within int32, or a copy of such a local (the greatest fixpoint over the
+    // copies: an accumulator `let isum = 0; ... isum = (isum + p) | 0` qualifies). One pass
+    // over the definitions, then a worklist over the copy edges: a scan of the body per local
+    // and round was quadratic, minutes on a module initializer of 70k instructions.
+    let mut def_ok: BTreeMap<u32, bool> = BTreeMap::new();
+    let mut copy_users: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    for inst in &flat {
+        let (x, ok) = match inst {
+            Inst::BinOp { dst, op, .. } => (dst.0, is_bitwise_op(op)),
+            Inst::UnOp { dst, op, .. } => (dst.0, op == "~"),
+            Inst::Const { dst, value } => (dst.0, matches!(value, ConstVal::Num { value } if value.fract() == 0.0 && *value >= -2147483648.0 && *value <= 2147483647.0)),
+            Inst::Copy { dst, src } => {
+                copy_users.entry(src.0).or_default().push(dst.0);
+                (dst.0, true)
+            }
+            other => match inst_def_local(other) {
+                Some(x) => (x, false),
+                None => continue,
+            },
+        };
+        *def_ok.entry(x).or_insert(true) &= ok;
+    }
+    let mut int32_by_definition: BTreeSet<u32> = def_ok.iter().filter(|(_, ok)| **ok).map(|(x, _)| *x).collect();
+    // a copy whose source is not int32 by definition disqualifies its destination, and so on
+    let mut removed: Vec<u32> = copy_users.keys().copied().filter(|src| !int32_by_definition.contains(src)).collect();
+    while let Some(src) = removed.pop() {
+        for &x in copy_users.get(&src).map(|v| v.as_slice()).unwrap_or(&[]) {
+            if int32_by_definition.remove(&x) {
+                removed.push(x);
+            }
         }
     }
     // Whether every use of `x` absorbs a negative zero: `+`/`-` with an int32-by-definition
