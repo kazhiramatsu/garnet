@@ -12217,3 +12217,42 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   11.8%, the closure's body 9%, the static map's `ts_get` 6%, `indexOf` 4.5%); Kaz asked for those
   as well. Plan: the design (docs/regexp_dfa_design.md), then the slices; the result array beside
   them.
+- tsc-ts r19 against r18 (the last of Session 359's gates): instructions 0.9992, cycles 1.0004,
+  wall 1.000, outputs identical.
+- Interrupted at Kaz's request (2026-10-30 evening), in the middle of the RegExpRouter's work
+  around the matcher. Where it stands:
+  - Profile of a RegExpRouter-only driver (`build/real/hono/garnet-rr.ts`, `RR_N` matches; the
+    plain build `build/s360/rr/rr`, 10 M matches 1,370 ms against Node's 660 with the machine
+    loaded; the sample `build/s360/rr/plain.sample.txt`): the matcher (`rx_run_8`, `try_at`) 29%,
+    `build_result` 25% (the capture slices, `ts_new_array_compact`'s hole fill, the layout's
+    separate four-slot vector in `ts_array_adopt_layout`), the driver's loop 11%, the method
+    lookup's fill on every `router.match` call 4%, the closure's body 7%, `ts_get` 5.5%,
+    `indexOf` 4.5%, the returned pair's allocation 4%. The GET route regexp is one-pass,
+    including the wildcard (`^\/(?:event\/([^/]+)(?:$()|\/comments$())|map\/([^/]+)\/events$()|
+    static(?:|\/.*)$()|user\/lookup\/(?:email\/([^/]+)$()|username\/([^/]+)$()))`, 10 groups).
+  - Found: `lib/node/web/string_object.ts` relinks `StringObject.prototype` onto
+    `String.prototype` at its module's start, and `ts_set_proto_user` then raises the sticky
+    `g_class_relinked`: every program that writes `new String(...)` (hono's `utils/html.ts`, so
+    every hono program) runs without the class method caches (the site caches' holder hits,
+    `g_method_cache`, the inherited-read cache, the trap cache) and without the generated
+    vtable calls and interval `instanceof` (their `&& !g_class_relinked`). The fix in progress,
+    saved as `build/s360/relink_epoch_wip.patch` (not applied; the tree is at the last commit):
+    a relink epoch (`g_class_relink_epoch`, moved by a relink of an object that may be a
+    prototype, saturating) recorded in every chain-derived cache entry and compared at its hit;
+    the sticky flag raised only when the class prototypes on some chain can change (a class
+    prototype whose proto was not Object.prototype, or a new chain with a class prototype, a
+    sized instance or an exotic link; a prototype given a chain with a class part); and a site
+    cache kind `TS_MSIC_DYN` for an own dynamic property of a class instance (hono's router
+    assigns its matcher to `this.match`), checked by the sidecar index and key. Still to do:
+    the epoch in `sized_method_lookup_fill`'s and `sized_inherited_*`'s use of `g_method_cache`
+    (an `epoch` member in its entries), in the trap cache, the absent cache's flag test removed
+    (ts_set_proto moves the addition epoch already), the DYN fill in `ts_method_lookup_sized_fill`;
+    then fixtures (relinks after calls, a root class onto a plain object and that object onto a
+    class prototype, an own method property replaced and deleted), the gates, and the A/Bs
+    (hono routers, hono_app, vue, tsc-ts).
+  - Then: `build_result` (one allocation for the cell, the elements and the named properties, no
+    hole fill), the per-attempt capture reset in `try_at`, and the DFA (docs/regexp_dfa_design.md
+    to be written: a one-pass DFA built at the first exec, captures in its transitions).
+  - Also waiting: an uncommitted port of Node's util.inspect layout from the previous session
+    (`build/wt360`, a worktree at 910d035: `runtime/inspect.c`, 1,441 lines, the Error form
+    included; its state unverified).
