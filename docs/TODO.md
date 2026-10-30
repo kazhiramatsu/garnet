@@ -12463,3 +12463,12 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   Other per-function gaps from the comparison: the reactive array iterator's `next` (garnet about 26 ms
   against 5: the native array iterator keeps its state in properties read through runtime caches),
   makeMap's `val in map` (28 against 8), the reactive get trap (102 against 63).
+- vue's reactive get trap reads `Reflect.get(target, key, receiver)` with the proxy as the receiver:
+  `ts_reflect_get_recv` takes the receiver-aware walk (the key converted, the class field table, the
+  chain's dictionary lookups) on every reactive read, with no cache. Measured and dropped: a per-site
+  keyed cache for it (a plain target's own data property; the receiver matters to an accessor alone)
+  made the reactivity phase slower, 646 -> 676 ms: the trap's one site sees every target shape and key,
+  so its four entries thrashed and every miss paid the check and the refill. The next step there is a
+  global cache keyed by (shape, key) -> own slot, as V8's megamorphic stub cache: a shape id names one
+  exact property sequence, so an entry never needs invalidating. Also measured and dropped this
+  session: `in` on a plain object answered from its own map first (no gain).
