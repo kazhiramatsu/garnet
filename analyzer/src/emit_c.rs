@@ -22596,6 +22596,22 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             // `name` is inherited). The kind index follows "error.new:".
             if let Some(kind) = builtin.strip_prefix("error.new:") {
                 let idx: u32 = kind.parse().unwrap_or(0);
+                // AggregateError (7) takes (errors, message, options); an options argument
+                // carries the cause: both construct through ts_new_error_args.
+                if idx == 7 || args.len() > 1 {
+                    let tmp = format!("_ve{}", dst.map(|d| d.0).unwrap_or(0));
+                    let _ = writeln!(s, "  {{ tsv _va[{}];", args.len().max(1));
+                    for (i, a) in args.iter().enumerate() {
+                        let _ = writeln!(s, "    _va[{}] = {};", i, ctx.val(a.0));
+                    }
+                    let _ = writeln!(s, "    tsv {} = ts_new_error_args({}, _va, {});", tmp, idx, args.len());
+                    if let Some(d) = dst {
+                        let _ = writeln!(s, "  {} }}", ctx.set_val(d.0, &tmp).trim_end());
+                    } else {
+                        s.push_str("  }\n");
+                    }
+                    return;
+                }
                 let msg = if args.is_empty() {
                     "TS_UNDEFINED".to_string()
                 } else {
@@ -22606,6 +22622,34 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     s.push_str(&ctx.set_val(d.0, &expr));
                 } else {
                     let _ = writeln!(s, "  {};", expr);
+                }
+                return;
+            }
+            // A subclass's `super(...)` of a built-in Error kind: the constructor's steps on the
+            // instance (`error.init:<kind>`, args = [this, ...the super arguments]).
+            if let Some(kind) = builtin.strip_prefix("error.init:") {
+                let idx: u32 = kind.parse().unwrap_or(0);
+                let n = args.len().saturating_sub(1);
+                let _ = writeln!(s, "  {{ tsv _va[{}];", n.max(1));
+                for (i, a) in args.iter().skip(1).enumerate() {
+                    let _ = writeln!(s, "    _va[{}] = {};", i, ctx.val(a.0));
+                }
+                let this_v = args.first().map(|a| ctx.val(a.0)).unwrap_or_else(|| "TS_UNDEFINED".to_string());
+                let _ = writeln!(s, "    ts_error_init({}, {}, _va, {}); }}", this_v, idx, n);
+                if let Some(d) = dst {
+                    s.push_str(&ctx.set_val(d.0, "TS_UNDEFINED"));
+                }
+                return;
+            }
+            // The same steps over a rest array: a no-constructor subclass's class value
+            // forwarding `new K(...args)` (`error.initRest:<kind>`, args = [this, rest]).
+            if let Some(kind) = builtin.strip_prefix("error.initRest:") {
+                let idx: u32 = kind.parse().unwrap_or(0);
+                let this_v = args.first().map(|a| ctx.val(a.0)).unwrap_or_else(|| "TS_UNDEFINED".to_string());
+                let rest = args.get(1).map(|a| ctx.val(a.0)).unwrap_or_else(|| "TS_UNDEFINED".to_string());
+                let _ = writeln!(s, "  ts_error_init_array({}, {}, {});", this_v, idx, rest);
+                if let Some(d) = dst {
+                    s.push_str(&ctx.set_val(d.0, "TS_UNDEFINED"));
                 }
                 return;
             }

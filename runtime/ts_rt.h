@@ -1453,6 +1453,11 @@ tsv  ts_set_proto_user(tsv obj, tsv proto); /* Object/Reflect.setPrototypeOf: ma
 void ts_setup_error_protos(void);
 tsv  ts_error_proto(int kind);
 tsv  ts_new_error(int kind, tsv msg);
+/* `new E(...args)` with the message, the options' cause and AggregateError's errors (ES2022), and
+   the same steps on an instance a subclass's `super(...args)` made */
+tsv  ts_new_error_args(int kind, tsv* args, int n);
+void ts_error_init(tsv e, int kind, tsv* args, int n);
+void ts_error_init_array(tsv e, int kind, tsv arr);
 /* first-class callable function values (methods and closures alike) */
 typedef tsv (*ts_code)(tsv*, int);
 void ts_object_proto_register(ts_key method_key, const char* name, ts_code fn);

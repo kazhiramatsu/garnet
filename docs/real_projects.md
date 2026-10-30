@@ -100,7 +100,7 @@ the fixes:
 | cache | OK |  |
 | client | OK |  |
 | combine | OK |  |
-| compress | DIFF | `CompressionStream` |
+| compress | OK |  |
 | context_storage | OK |  |
 | cookie_signed | OK |  |
 | cookie | OK |  |
@@ -136,7 +136,7 @@ the fixes:
 | css | OK |  |
 | jsx_renderer | OK |  |
 
-41 of 43 identical to Node's output (26 after the survey's own fixes; Web Crypto, docs/web_crypto_design.md, took eight more; streams, Blob / File and the client's two fixes, docs/web_streams_design.md, six more; AsyncLocalStorage, docs/async_context_design.md, one more).
+42 of 43 identical to Node's output (26 after the survey's own fixes; Web Crypto, docs/web_crypto_design.md, took eight more; streams, Blob / File and the client's two fixes, docs/web_streams_design.md, six more; AsyncLocalStorage, docs/async_context_design.md, one more; CompressionStream, docs/web_compression_design.md, the last library gap, Session 359). The remaining one, ip-restriction, needs BigInt (unsupported by design).
 
 What remains, by the number of drivers it blocks:
 
@@ -147,7 +147,9 @@ What remains, by the number of drivers it blocks:
    body as a stream; body-limit, the streaming helpers, etag and the JSX streaming renderer run.
 3. ~~Blob / File~~ and multipart file parts: `lib/node/web/blob.ts` since the same session; the
    request-body driver runs (`parseBody` with a file, `c.req.blob()`).
-4. `CompressionStream` (the compress middleware: gzip / deflate / brotli over streams; Node has it).
+4. ~~`CompressionStream`~~: `lib/node/web/compression.ts` over the system's zlib loaded on first use
+   (docs/web_compression_design.md) since Session 359; the compress driver decodes every body it
+   gets with DecompressionStream and compares it with what the handler sent. Brotli is a TypeError.
 5. ~~`node:async_hooks`'s `AsyncLocalStorage`~~: `lib/node/async_hooks.ts` over the runtime's
    asynchronous context (docs/async_context_design.md) since the same session; context-storage runs.
 6. BigInt (ip-restriction's IPv6 arithmetic): unsupported by design.

@@ -1489,6 +1489,7 @@ static void nh_method(tsv host, const char* name, ts_code code, int arity){
   ts_gc_root(&host); tsv fn = ts_make_fn_t(code, NULL, 0, 0); ts_gc_root(&fn);
   ts_set_fn_meta(fn, (uint32_t)arity, name); ts_set_cstr(host, name, fn); ts_gc_unroot(2);
 }
+static void zh_install(tsv host);   /* zlib_host.c: the zlib streams' methods */
 static void ts_garnet_node_global_init(tsv global){
   ts_gc_root(&global);
   clock_gettime(CLOCK_MONOTONIC, &nh_start);
@@ -1583,6 +1584,7 @@ static void ts_garnet_node_global_init(tsv global){
   nh_method(host, "postMessage", nh_post_message, 1);
   nh_method(host, "onParentMessage", nh_on_parent_message, 1);
   nh_method(host, "closeParentPort", nh_close_parent_port, 0);
+  zh_install(host);
 #ifdef __APPLE__
   ts_set_cstr(host, "platform", nh_string("darwin"));
 #else

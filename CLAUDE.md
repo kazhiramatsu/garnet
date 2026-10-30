@@ -141,7 +141,9 @@ Rust in §315; selfhost is kept as a performance metric).
 - Web Crypto (`docs/web_crypto_design.md`) provides digests and HMAC keys only: an RSA, ECDSA or AES key
   stops at `importKey` / `generateKey` with a `NotSupportedError` (Node imports them).
 - WHATWG streams (`docs/web_streams_design.md`) are default streams only: `new ReadableStream({ type:
-  "bytes" })` and BYOB readers are a TypeError (Node has them). A class extending a library class the
+  "bytes" })` and BYOB readers are a TypeError (Node has them). `new CompressionStream("brotli")` is a
+  TypeError (no brotli codec; gzip, deflate and deflate-raw run over the system's zlib loaded on first
+  use, docs/web_compression_design.md). A class extending a library class the
   prelude installs for a Web global (`class X extends Blob`, `extends Request`) is a compile-time
   reject, as extending any built-in but the Error classes is.
 - JSX (Session 358, `docs/jsx_react_ssr_design.md` section 8): under the automatic runtime a `key`

@@ -123,12 +123,16 @@ const NODE_PRELUDE_GLOBALS = new Set(["process", "Buffer", "atob", "btoa", "setT
   // Web Crypto (docs/web_crypto_design.md)
   "crypto", "Crypto", "SubtleCrypto", "CryptoKey",
   // streams (docs/web_streams_design.md)
-  "ReadableStream", "WritableStream", "TransformStream", "ReadableStreamDefaultReader", "WritableStreamDefaultWriter", "ReadableStreamDefaultController", "WritableStreamDefaultController", "TransformStreamDefaultController", "TextEncoderStream", "TextDecoderStream", "CountQueuingStrategy", "ByteLengthQueuingStrategy", "Blob", "File"]);
+  "ReadableStream", "WritableStream", "TransformStream", "ReadableStreamDefaultReader", "WritableStreamDefaultWriter", "ReadableStreamDefaultController", "WritableStreamDefaultController", "TransformStreamDefaultController", "TextEncoderStream", "TextDecoderStream", "CountQueuingStrategy", "ByteLengthQueuingStrategy", "Blob", "File",
+  // the compression streams (docs/web_compression_design.md)
+  "CompressionStream", "DecompressionStream"]);
 /** The constructors among them: lib.dom declares the identifier, the prelude's class is the
  *  global object's value, and `new URL(...)` constructs through that value. */
 const NODE_PRELUDE_CTORS = new Set(["URL", "URLSearchParams", "Headers", "Request", "Response", "FormData", "DataView", "__garnet_StringObject",
   "Crypto", "SubtleCrypto", "CryptoKey",
-  "ReadableStream", "WritableStream", "TransformStream", "ReadableStreamDefaultReader", "WritableStreamDefaultWriter", "ReadableStreamDefaultController", "WritableStreamDefaultController", "TransformStreamDefaultController", "TextEncoderStream", "TextDecoderStream", "CountQueuingStrategy", "ByteLengthQueuingStrategy", "Blob", "File"]);
+  "ReadableStream", "WritableStream", "TransformStream", "ReadableStreamDefaultReader", "WritableStreamDefaultWriter", "ReadableStreamDefaultController", "WritableStreamDefaultController", "TransformStreamDefaultController", "TextEncoderStream", "TextDecoderStream", "CountQueuingStrategy", "ByteLengthQueuingStrategy", "Blob", "File",
+  // the compression streams (docs/web_compression_design.md)
+  "CompressionStream", "DecompressionStream"]);
 /** The lib modules behind the globals: a program's prelude imports only the parts it names,
  *  so a program that uses setTimeout does not compile the streams behind process.stdout. */
 const NODE_PRELUDE_PARTS: { file: string; names: string[]; defaultImport?: string; triggers?: string[] }[] = [
@@ -149,6 +153,8 @@ const NODE_PRELUDE_PARTS: { file: string; names: string[]; defaultImport?: strin
   // WHATWG streams (docs/web_streams_design.md); the fetch part's bodies stream through them
   { file: "web/streams", names: ["ReadableStream", "WritableStream", "TransformStream", "ReadableStreamDefaultReader", "WritableStreamDefaultWriter", "ReadableStreamDefaultController", "WritableStreamDefaultController", "TransformStreamDefaultController", "TextEncoderStream", "TextDecoderStream", "CountQueuingStrategy", "ByteLengthQueuingStrategy"] },
   { file: "web/blob", names: ["Blob", "File"] },
+  // CompressionStream / DecompressionStream over the system's zlib (docs/web_compression_design.md)
+  { file: "web/compression", names: ["CompressionStream", "DecompressionStream"] },
   // on demand: fs.createReadStream / fs.createWriteStream (node:fs itself does not carry node:stream)
   { file: "fs/streams", names: [], triggers: ["createReadStream", "createWriteStream"] },
 ];
@@ -6362,18 +6368,16 @@ class Exporter {
           recv = ctx.thisLocal; // parent ctor initializes the same `this`
         } else {
           // The parent has no explicit constructor. Two cases:
-          // (a) the class extends the builtin `Error` (or a subclass): `super(m)`
-          //     sets `this.message = m` (the Error constructor's observable
-          //     effect). Error isn't a user class, so parentIdOf is undefined.
+          // (a) the class extends the builtin `Error` (or a subclass): `super(m, o)`
+          //     runs the Error constructor's steps on `this` (the message unless
+          //     undefined, the options' cause, AggregateError's errors). Error isn't
+          //     a user class, so parentIdOf is undefined.
           // (b) a user parent with only field initializers: run its implicit
           //     construction on `this` (field inits + parent chain). A silent
           //     no-op would skip base-class field initializers.
           const argLs = this.lowerSequenced(ctx, node.arguments);
           if (parent === undefined && this.extendsBuiltinError(ctx.currentClass) && ctx.thisLocal !== undefined) {
-            if (argLs.length > 0) {
-              // own, non-enumerable `message` (JS Error semantics)
-              this.defineDataField(ctx, ctx.thisLocal, "message", argLs[0], 0, 1, 1);
-            }
+            this.emitErrorSuperInit(ctx, ctx.currentClass, ctx.thisLocal, argLs);
           } else if (parent !== undefined && ctx.thisLocal !== undefined) {
             this.emitImplicitConstruction(ctx, parent, ctx.thisLocal, argLs);
           }
@@ -10038,13 +10042,20 @@ class Exporter {
       }
     } else {
       // No user-class parent. If this class extends the built-in Error family, the
-      // implicit `super(message)` sets `this.message` (Error's observable effect).
-      if (this.extendsBuiltinError(classId) && args.length > 0) {
-        this.defineDataField(ctx, dst, "message", args[0], 0, 1, 1); // own, non-enumerable
-      }
-      for (const a of args) void a;
+      // implicit `super(...args)` runs the Error constructor's steps on the instance.
+      if (this.extendsBuiltinError(classId)) this.emitErrorSuperInit(ctx, classId, dst, args);
     }
     this.emitFieldInitializers(ctx, classId, dst);
+  }
+
+  /** `super(...)` of a class that extends a built-in Error kind: the constructor's steps on
+   *  `this` (ts_error_init): an own non-enumerable `message` unless the message is undefined,
+   *  the options' `cause` (ES2022), and AggregateError's `errors`. */
+  private emitErrorSuperInit(ctx: FnCtx, classId: number, self: number, args: number[]): void {
+    const kind = this.errorKindIndex(this.classInfos[classId]?.parentName ?? "Error") ?? 0;
+    const used = args.slice(0, kind === 7 ? 3 : 2);
+    if (used.length === 0) return;
+    ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: `error.init:${kind}`, args: [self, ...used] });
   }
 
   /** How the SHARED (arg-count-agnostic) class-value ctor of a no-ctor class handles
@@ -10058,7 +10069,9 @@ class Exporter {
     let cur: number | undefined = classId;
     while (cur !== undefined) {
       const parent = this.parentIdOf(cur);
-      if (parent === undefined) return "ignore"; // no parent ctor anywhere -> args dropped
+      // no parent ctor anywhere -> args dropped, unless the chain ends at a built-in Error
+      // kind, whose constructor takes the message and the options
+      if (parent === undefined) return this.extendsBuiltinError(cur) ? "forward" : "ignore";
       if (this.methodFunc.has(`${parent}:ctor`)) return "forward";
       cur = parent; // parent is also no-ctor: keep walking
     }
@@ -10094,6 +10107,10 @@ class Exporter {
       } else {
         this.emitImplicitConstructionForward(ctx, parent, dst, restLid);
       }
+    } else if (this.extendsBuiltinError(classId)) {
+      // `super(...args)` of a built-in Error kind: its steps over the rest array
+      const kind = this.errorKindIndex(this.classInfos[classId]?.parentName ?? "Error") ?? 0;
+      ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: `error.initRest:${kind}`, args: [dst, restLid] });
     }
     this.emitFieldInitializers(ctx, classId, dst);
   }
@@ -10367,8 +10384,15 @@ class Exporter {
       if (errIdx !== undefined) {
         // Construct via the runtime so the instance is proto-linked to the shared
         // Error-family prototype (instanceof Error works; `name` is inherited).
+        // Every argument is evaluated in order; the runtime takes the message and the options'
+        // cause (ES2022), or AggregateError's (errors, message, options).
+        const argNodes: readonly ts.Expression[] = node.arguments ?? [];
+        if (argNodes.some((a) => ts.isSpreadElement(a))) {
+          this.unsupported(node, `a spread argument to new ${ctorName}(...)`);
+          return this.newLocal(ctx, "reference");
+        }
         const dst = this.newLocal(ctx, "reference");
-        const args = node.arguments && node.arguments.length > 0 ? [this.lowerExpr(ctx, node.arguments[0])] : [];
+        const args = this.lowerSequenced(ctx, argNodes).slice(0, errIdx === 7 ? 3 : 2);
         ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: `error.new:${errIdx}`, args });
         return dst;
       }

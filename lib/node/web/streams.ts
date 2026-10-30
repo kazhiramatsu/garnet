@@ -17,7 +17,12 @@ function deferred<T>(): Deferred<T> {
 }
 /** A promise nobody may await (a reader's `closed`, a writer's `ready`): its rejection is not unhandled. */
 function handled<T>(p: Promise<T>): Promise<T> { p.catch(() => undefined); return p; }
-const invalidState = (what: string): TypeError => new TypeError(`Invalid state: ${what}`);
+/** Node's ERR_INVALID_STATE: a TypeError carrying its code. */
+const invalidState = (what: string): TypeError => {
+  const e = new TypeError(`Invalid state: ${what}`) as TypeError & { code: string };
+  e.code = "ERR_INVALID_STATE";
+  return e;
+};
 
 export interface QueuingStrategy<T = unknown> { highWaterMark?: number; size?: (chunk: T) => number }
 export class CountQueuingStrategy implements QueuingStrategy<unknown> {
@@ -312,6 +317,10 @@ export class ReadableStream<R = unknown> {
         await writer.ready;
         await writer.write(result.value as R);
       }
+      // an errored destination propagates backward (its close would refuse with a TypeError); the
+      // state is read afresh (the awaits above may have changed it)
+      const finalState: string = destination.__state;
+      if (finalState === "errored") throw destination.__storedError;
       if (opts.preventClose !== true) await writer.close();
     } catch (e) {
       const sourceErrored = this.__state === "errored";
@@ -638,8 +647,10 @@ export class WritableStream<W = unknown> {
   }
   __close(): Promise<void> {
     if (this.__state === "closing") return Promise.reject(invalidState("Failure to close WritableStream"));
-    if (this.__state === "closed") return Promise.reject(invalidState("WritableStream is closed"));
-    if (this.__state === "errored" || this.__state === "erroring") return Promise.reject(this.__storedError);
+    // the standard's WritableStreamClose: a closed or errored stream refuses with a TypeError (an
+    // erroring one's close fails with the stored error, here at once)
+    if (this.__state === "closed" || this.__state === "errored") return Promise.reject(invalidState("WritableStream is closed"));
+    if (this.__state === "erroring") return Promise.reject(this.__storedError);
     this.__state = "closing";
     return this.__controller.__close();
   }

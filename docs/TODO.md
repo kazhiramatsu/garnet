@@ -12108,3 +12108,62 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
     receiver record per dynamic call site taken by the one PGO training run (every site at once, as
     V8's feedback vectors), feeding guarded inlining; no per-site or per-program work. The collector
     stays a tracing collector (without collections hono_app and vue are slower, tsc-ts 6% faster).
+
+## Session 359 (2026-10-30): CompressionStream (hono's last library gap), the Error cause
+
+- CompressionStream / DecompressionStream, the survey's last library gap (the compress middleware;
+  Kaz's order of 2026-10-30: finish hono, then peak memory): `lib/node/web/compression.ts`
+  (docs/web_compression_design.md), the globals installed by the prelude when named, over
+  `runtime/zlib_host.c`: the system's libz loaded with dlopen on the first use, as metal_host.c
+  loads Metal (no marker, no second runtime object, no link flag in any harness, no zlib header:
+  the z_stream is declared in the file), its methods on `__garnet_node` (zlibOpen, zlibWrite,
+  zlibError). Node builds the classes as a readable and writable pair over a zlib stream, and so
+  does garnet: the formats gzip, deflate and deflate-raw with Node's defaults, the output cut as
+  Node's zlib cuts it (a 16 KiB output buffer filled across writes, one chunk per call), Node's
+  checks after each call (an unexpected end when finishing, a gunzip's further members, zero bytes
+  as padding, trailing data: ERR_TRAILING_JUNK_AFTER_STREAM_END for gzip and deflate, the end of
+  the readable side for deflate-raw), a zlib failure as Node's TypeError with the zlib error as its
+  cause and its code, the writable side's chunk types and errors (a string as UTF-8, any view;
+  ERR_INVALID_ARG_TYPE, ERR_STREAM_NULL_VALUES), the high-water marks, a write held while the
+  readable side is full, abort and cancel. Node's zlib fails on its thread pool after the write
+  resolved: until the failure lands writes resolve and a close fails with it, afterwards the
+  writable side is errored by it; garnet keeps the failure for the close and errors the writable
+  side from an immediate. Brotli (Node 25 has it) is a TypeError: no brotli codec (CLAUDE.md).
+  A stream's memory is one ArrayBuffer the library object holds: the z_stream and every
+  allocation zlib makes bump through it (zfree does nothing); a buffer's bytes never move, so the
+  collector frees the whole stream with the buffer, an abandoned stream leaks nothing, and its
+  272 KB (deflate) / 48 KB (inflate) pace the collections as a buffer's bytes do. Homebrew's Node
+  links the same `/usr/lib/libz.1.dylib`, so the compressed bytes and their chunks are Node's
+  byte for byte here; the fixtures print only what any zlib agrees on.
+  Fixtures `web/compression` (round trips, the headers, the chunking of inflated output, the
+  surface, the chunk types, pipes, a slow reader, an empty stream) and `web/compression_errors`
+  (every failure, when it lands, abort, cancel), both profiles, also in the GC stress gate (young
+  collection at every allocation, protect, ASan). The survey's compress driver decodes every body
+  with DecompressionStream and compares it with what the handler sent (gzip, deflate, q-values, a
+  wildcard, the threshold, no-transform, a non-text type, ETag, a streamed body, HEAD, the
+  encoding option): 42 of 43 drivers agree with Node; ip-restriction needs BigInt.
+- Defects met on the way, three of them silent miscompiles in hono's own code paths:
+  - The ES2022 error cause was dropped: `new Error(msg, { cause })` passed the message only, a
+    subclass's `super(message, options)` defined `message` only (hono's HTTPException is
+    `super(options?.message, { cause: options?.cause })`, so `err.cause` read undefined), and a
+    constructor value (`new E(m, o)`, `Reflect.construct`) dropped it too. `ts_error_init`
+    (runtime) runs the constructor's steps on any of the three: the message unless undefined
+    (ToString; `super(undefined)` had defined an own `message` of undefined), InstallErrorCause
+    (an options object with a `cause`, own or inherited, through a getter), AggregateError's
+    `errors`. Every argument of `new E(...)` is evaluated now (the second and third were not).
+  - `new AggregateError(errors, message)` took the errors as the message (`"1,2"`) and had no
+    `errors` property.
+  - A no-constructor subclass of Error constructed through a class value (`new K("m", o)` with
+    `K = Plain`) dropped its arguments: the synthesized class-value constructor forwards them to
+    the Error steps now (`error.initRest`).
+  Fixture `errors/error_cause` (both profiles, `/// <reference lib="es2022" />`).
+- WritableStream's close of an errored stream rejected with the stored error; the standard (and
+  Node) refuse with a TypeError, Node's ERR_INVALID_STATE "Invalid state: WritableStream is
+  closed". Every "Invalid state" error of lib/node/web/streams.ts carries `code:
+  "ERR_INVALID_STATE"` now, and `pipeTo` propagates an errored destination backward before
+  closing it (the close would refuse with the TypeError).
+- Noted for the next slice: an Error printed by console.log is `ReferenceError {}` (the message
+  lost: hono's default error handler prints its errors so); Node prints a stackless error as
+  `[ReferenceError: msg]` with its own properties, `[cause]` and `[errors]` after it.
+- Gates: committed and pushed at Kaz's request with the gate run stopped part way (Kaz had to leave, 2026-10-30 11:30). Passed: unit, bundler 53/53, conformance plain 699/699 and strict 699/699, protect 696/696, bench (every benchmark correct and within budget), the `ci` gate (CI-FAST PASSED, 215 s), the GC gate's first phase (focused conformance at O2 under a young collection at every allocation, 60/60; the new fixtures also passed by hand under threshold 1, protect, zap and ASan). Not yet run: the rest of `gate.sh gc` (ASan, runtime units, protect), the regexp engine diff, ir-parity (the Error lowering changes the IR of every program with an Error subclass or `new Error(m, o)`: expect a snapshot refresh), the full hono survey, the r19 builds and A/Bs (vue, hono routers, hono_app, tsc-ts against build/tsc_ts_native_r18). The runner is build/gates_s359/run.sh (summary.txt holds the finished steps; baselines: vue-work/driver.r18, hono-work/driver.r18plain, hono_app-work/driver.r18). To finish the slice: run the remaining steps (refresh the ir-parity snapshot after reading its differences) and record the numbers here.
+- Next (planned): the Error part of console.log in Node's stackless form (`[TypeError: m] { code: ..., [cause]: ... }`, Node 25's formatError / improveStack; a draft and its differential test are in build/gates_s359/drafts/), then Kaz's agreed peak-memory tuning on hono_app. Recorded for later: garnet's inspector has none of util.inspect's layout (a depth of 2 with `[Object]`, lines broken past 80 columns, arrays of more than six entries grouped): any long or deep object prints differently from Node.

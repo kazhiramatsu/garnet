@@ -10702,7 +10702,7 @@ tsv ts_error_proto(int kind){
 static tsv g_error_ctor_values[TS_ERR_KINDS];
 static tsv ts_error_ctor_thunk(tsv* args, int n){
   int kind = n > 0 ? (int)ts_to_num(args[0]) : 0;   /* env: the kind */
-  return ts_new_error(kind, n > 1 ? args[1] : TS_UNDEFINED);
+  return ts_new_error_args(kind, n > 1 ? args + 1 : NULL, n > 1 ? n - 1 : 0);
 }
 tsv ts_error_ctor_value(int kind){
   if (kind < 0 || kind >= TS_ERR_KINDS) kind = TS_ERR_ERROR;
@@ -10784,6 +10784,47 @@ tsv ts_new_error(int kind, tsv msg){
     ts_gc_unroot(1);
   }
   ts_gc_unroot(1);
+  return e;
+}
+/* The Error constructors' steps after the instance exists, for `new E(...)`, a constructor value's
+   call and a subclass's `super(...)`: an own non-enumerable `message` unless the message is
+   undefined (ToString), then InstallErrorCause (an options object that has a `cause` property, own
+   or inherited, gives an own non-enumerable `cause` of its value), then AggregateError's `errors`
+   (an array of the iterable's values). The arguments are AggregateError's (errors, message,
+   options) or the others' (message, options). */
+void ts_error_init(tsv e, int kind, tsv* args, int n){
+  int agg = kind == TS_ERR_AGGREGATE;
+  tsv errors = agg && n > 0 ? args[0] : TS_UNDEFINED;
+  tsv msg = n > agg ? args[agg] : TS_UNDEFINED;
+  tsv opts = n > agg + 1 ? args[agg + 1] : TS_UNDEFINED;
+  ts_gc_root(&e); ts_gc_root(&errors); ts_gc_root(&msg); ts_gc_root(&opts);
+  if (!ts_is_undef(msg)) ts_define_data(e, ts_intern_field("message", 7), ts_to_string_v(msg), 0, 1, 1);
+  if (ts_is_obj(opts) || ts_is_func(opts)){
+    ts_key cause = ts_intern_field("cause", 5);
+    if (ts_has_prop(opts, cause)) ts_define_data(e, cause, ts_get(opts, cause), 0, 1, 1);
+  }
+  if (agg){
+    tsv list = ts_new_array(0); ts_gc_root(&list);
+    ts_array_push_all(list, errors);
+    ts_define_data(e, ts_intern_field("errors", 6), list, 0, 1, 1);
+    ts_gc_unroot(1);
+  }
+  ts_gc_unroot(4);
+}
+void ts_error_init_array(tsv e, int kind, tsv arr){
+  tsv a[3]; int n = 0;
+  if (ts_is_array(arr)) for (uint32_t len = ts_array_len(arr); n < 3 && (uint32_t)n < len; n++) a[n] = ts_array_get(arr, (uint32_t)n);
+  ts_error_init(e, kind, a, n);   /* it roots what it reads before allocating */
+}
+tsv ts_new_error_args(int kind, tsv* args, int n){
+  if (kind < 0 || kind >= TS_ERR_KINDS) kind = TS_ERR_ERROR;
+  tsv a[3];
+  int k = n < 3 ? n : 3;
+  for (int i = 0; i < k; i++) a[i] = args[i];
+  for (int i = 0; i < k; i++) ts_gc_root(&a[i]);
+  tsv e = ts_new_error(kind, TS_UNDEFINED); ts_gc_root(&e);
+  ts_error_init(e, kind, a, k);
+  ts_gc_unroot(1 + k);
   return e;
 }
 /* Throw a RangeError-tagged object (catchable): { message, name:"RangeError" },
@@ -23399,5 +23440,7 @@ int main(int argc, char** argv){
 #endif
 /* The Node modules' host (lib/node, docs/node_compat_design.md): one translation unit with the runtime. */
 #include "node_host.c"
+/* CompressionStream's zlib streams (lib/node/web/compression.ts, docs/web_compression_design.md): libz loaded on first use. */
+#include "zlib_host.c"
 /* garnet:metal's host (lib/garnet/metal.ts, docs/metal_design.md): Metal compute, loaded on first use. */
 #include "metal_host.c"
