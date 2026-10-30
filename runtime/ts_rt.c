@@ -1522,6 +1522,14 @@ void ts_gc_remember_slot(ts_gc_header* h, uint32_t slot){
   gc_remember(h);
 }
 
+/* ts_gc_root in line where the stack has room (the runtime's own hot paths: a string append roots
+   two values per piece) */
+static inline void gc_root_push(tsv* slot){
+#if !defined(TS_ASAN_ENABLED) && !defined(TSAOT_RT_STATS)
+  if (TS_RT_LIKELY(g_root_len < g_root_cap)){ g_roots[g_root_len++] = slot; return; }
+#endif
+  ts_gc_root(slot);
+}
 void ts_gc_root(tsv* slot){
   RT_STAT_INC(root_push);
   if (g_root_len==g_root_cap){ g_root_cap=g_root_cap?g_root_cap*2:64; g_roots=realloc(g_roots,sizeof(tsv*)*g_root_cap);}
@@ -4805,7 +4813,7 @@ static uint32_t ts_string_storage_capacity(const ts_string* str){
   if (str->h.gen == TS_GEN_NONHEAP) return 0;
   size_t bytes = gc_cell_capacity(&str->h);
   if (bytes < sizeof(ts_string) + unit) return 0;
-  size_t slots = (bytes - sizeof(ts_string)) / unit;
+  size_t slots = (bytes - sizeof(ts_string)) >> (unit >> 1);   /* a unit is one or two bytes: no division */
   if (slots == 0) return 0;
   slots--; /* preserve one trailing NUL code unit */
   return slots > UINT32_MAX ? UINT32_MAX : (uint32_t)slots;
@@ -4838,8 +4846,8 @@ static void ts_string_init_buffer_view(ts_string* out, tsv parent, uint32_t len)
   out->data[0] = 0;
 }
 static void ts_string_write_terminator(ts_string* str, uint32_t pos){
-  uint32_t unit = ts_str_unit_size_flags(str->flags);
-  memset(str->data + (size_t)pos * unit, 0, unit);
+  if (str->flags & TS_STR_FLAG_UTF16){ str->data[(size_t)pos * 2u] = 0; str->data[(size_t)pos * 2u + 1u] = 0; }
+  else str->data[pos] = 0;   /* (a memset call per append) */
 }
 static int ts_string_extendable_parent(tsv lhs, uint32_t result_flags,
                                        uint32_t result_len, tsv* parent_out){
@@ -4856,12 +4864,33 @@ static int ts_string_extendable_parent(tsv lhs, uint32_t result_flags,
   *parent_out = parent_v;
   return 1;
 }
+/* A copy of at most 32 bytes as two to four overlapping word moves (a byte loop becomes a memcpy
+   call), no byte read outside [s, s + n). */
+static inline void ts_copy_small(char* d, const char* s, size_t n){
+  if (n >= 16u){
+    uint64_t a, b, c, e;
+    memcpy(&a, s, 8); memcpy(&b, s + 8, 8); memcpy(&c, s + n - 16u, 8); memcpy(&e, s + n - 8u, 8);
+    memcpy(d, &a, 8); memcpy(d + 8, &b, 8); memcpy(d + n - 16u, &c, 8); memcpy(d + n - 8u, &e, 8);
+  } else if (n >= 8u){
+    uint64_t a, b; memcpy(&a, s, 8); memcpy(&b, s + n - 8u, 8); memcpy(d, &a, 8); memcpy(d + n - 8u, &b, 8);
+  } else if (n >= 4u){
+    uint32_t a, b; memcpy(&a, s, 4); memcpy(&b, s + n - 4u, 4); memcpy(d, &a, 4); memcpy(d + n - 4u, &b, 4);
+  } else if (n){
+    d[0] = s[0]; d[n - 1u] = s[n - 1u]; d[n / 2u] = s[n / 2u];
+  }
+}
 static void ts_str_copy_units(char* dst, uint32_t dst_flags, uint32_t dst_pos,
                               ts_strview src, uint32_t src_pos, uint32_t len){
   if (len == 0) return;
+  /* an immediate short string's bytes into a one-byte string: materialized, then the contiguous copy
+     (a template's static pieces are such strings; they went unit by unit through the accessors) */
+  char sbuf[TS_SHORTSTR_MAX];
+  if (!src.data && !(dst_flags & TS_STR_FLAG_UTF16)) src = ts_strview_materialize(src, sbuf);
   if (src.data && ((dst_flags ^ src.flags) & TS_STR_FLAG_UTF16) == 0){
     uint32_t w = ts_str_unit_size_flags(dst_flags);
-    memcpy(dst + (size_t)dst_pos * w, src.data + (size_t)src_pos * w, (size_t)len * w);
+    size_t nb = (size_t)len * w;
+    if (nb <= 32u) ts_copy_small(dst + (size_t)dst_pos * w, src.data + (size_t)src_pos * w, nb);   /* a piece: no call */
+    else memcpy(dst + (size_t)dst_pos * w, src.data + (size_t)src_pos * w, nb);
     return;
   }
   for(uint32_t i=0;i<len;i++) ts_str_cu_set(dst, dst_flags, dst_pos+i, ts_str_cu_at_view(src, src_pos+i));
@@ -4928,7 +4957,16 @@ static int ts_short_ascii_from_view(ts_strview src, uint32_t start,
   *out = ts_short_str_ascii(data, len);
   return 1;
 }
+static tsv ts_new_string_ascii(const char* s, uint32_t len);
+/* every byte below 0x80, a word at a time */
+static inline int ts_bytes_ascii(const char* s, uint32_t len){
+  uint32_t i = 0;
+  for (; i + 8u <= len; i += 8u){ uint64_t w; memcpy(&w, s + i, 8); if (w & 0x8080808080808080ull) return 0; }
+  for (; i < len; i++) if ((unsigned char)s[i] >= 0x80u) return 0;
+  return 1;
+}
 tsv ts_new_string(const char* s, uint32_t len){
+  if (ts_bytes_ascii(s, len)) return ts_new_string_ascii(s, len);   /* digits, names: one scan, one copy */
   uint32_t units = 0; int latin1 = 1, ascii = 1;
   utf8_measure(s, len, &units, &latin1, &ascii);
   if (ascii && units <= TS_SHORTSTR_MAX) return ts_short_str_ascii(s, units);
@@ -5053,21 +5091,6 @@ static tsv ts_new_string_from_key_bytes(const char* s, uint32_t len){
 /* Copy a slice from an existing heap string. The source is rooted across the
    destination allocation, then re-fetched before copying so a future moving
    collector cannot leave us reading through a stale data pointer. */
-/* A copy of at most 32 bytes as two to four overlapping word moves (a byte loop becomes a memcpy
-   call), no byte read outside [s, s + n). */
-static inline void ts_copy_small(char* d, const char* s, size_t n){
-  if (n >= 16u){
-    uint64_t a, b, c, e;
-    memcpy(&a, s, 8); memcpy(&b, s + 8, 8); memcpy(&c, s + n - 16u, 8); memcpy(&e, s + n - 8u, 8);
-    memcpy(d, &a, 8); memcpy(d + 8, &b, 8); memcpy(d + n - 16u, &c, 8); memcpy(d + n - 8u, &e, 8);
-  } else if (n >= 8u){
-    uint64_t a, b; memcpy(&a, s, 8); memcpy(&b, s + n - 8u, 8); memcpy(d, &a, 8); memcpy(d + n - 8u, &b, 8);
-  } else if (n >= 4u){
-    uint32_t a, b; memcpy(&a, s, 4); memcpy(&b, s + n - 4u, 4); memcpy(d, &a, 4); memcpy(d + n - 4u, &b, 4);
-  } else if (n){
-    d[0] = s[0]; d[n - 1u] = s[n - 1u]; d[n / 2u] = s[n / 2u];
-  }
-}
 static tsv ts_string_slice_copy(tsv src, uint32_t start, uint32_t len){
   if (!ts_is_str(src)) return TS_UNDEFINED;
   ts_gc_root(&src);
@@ -5862,8 +5885,130 @@ static int ts_add_str_digits_builder(tsv s, const char* digits, uint32_t nl, int
   ts_gc_unroot(2);
   return 1;
 }
+/* Two strings concatenated (`+` once both operands are strings, the common case of `s += piece`):
+   no conversions, no object or symbol tests (docs/string_build_fast_paths_design.md). */
+static tsv ts_str_add2(tsv sa, tsv sb){
+  /* The append history's live tail first (`s += piece` in a loop): sa a view of the whole of a
+     one-byte buffer, the piece one-byte and within the buffer's room. Its length and storage are the
+     buffer's, so the view of sa (out of line for a view) is not needed. */
+  if (ts_is_heap_str(sa)){
+    ts_string* va = ts_str_ptr_typed(sa);
+    if ((va->flags & TS_STR_FLAG_VIEW) && va->offset == 0 && ts_is_heap_str(va->parent)){
+      ts_string* buf = ts_str_ptr_typed(va->parent);
+      if ((buf->flags & (TS_STR_FLAG_BUFFER | TS_STR_FLAG_UTF16)) == TS_STR_FLAG_BUFFER && buf->len == va->len){
+        /* the piece: a short string's length from its value (ASCII), a heap string's from its view */
+        int short_piece = ts_is_short_str(sb);
+        uint32_t ylen, yflags;
+        if (short_piece){ ylen = ts_short_str_len(sb); yflags = TS_STR_FLAG_ASCII; }
+        else { ts_strview y0 = ts_str_view_typed(sb); ylen = y0.len; yflags = y0.flags; }
+        if (ylen == 0) return sa;
+        uint64_t n64 = (uint64_t)va->len + ylen;
+        if (!(yflags & TS_STR_FLAG_UTF16) && n64 <= ts_string_storage_capacity(buf)){
+          uint32_t n = (uint32_t)n64;
+          int ascii = (buf->flags & TS_STR_FLAG_ASCII) && (yflags & TS_STR_FLAG_ASCII);
+          tsv parent_v = va->parent;
+          gc_root_push(&sb); gc_root_push(&parent_v);
+          ts_string* out = ts_string_alloc_buffer_view();
+          ts_gc_unroot(2);
+          buf = ts_str_ptr_typed(parent_v);
+          uint32_t old_len = buf->len;
+          if (short_piece) ts_short_str_put(buf->data + old_len, sb);
+          else { ts_strview y = ts_str_view_typed(sb); ts_str_copy_units(buf->data, 0u, old_len, y, 0, y.len); }   /* after the allocation */
+          buf->len = n;
+          buf->hash = 0;
+          buf->flags = (buf->flags & ~(TS_STR_FLAG_ASCII | TS_STR_FLAG_HASHED)) | (ascii ? TS_STR_FLAG_ASCII : 0u);
+          buf->data[n] = 0;
+          ts_string_init_buffer_view(out, parent_v, n);
+          RT_STAT_INC(concat_calls); RT_STAT_ADD(concat_bytes, n); RT_STAT_INC(sb_extend);
+          return ts_str_v(out);
+        }
+      }
+    }
+  }
+  ts_gc_root(&sa); ts_gc_root(&sb);
+  ts_strview x=ts_str_view_typed(sa), y=ts_str_view_typed(sb);
+  /* an empty operand: the other string itself (`s + ""`, as V8 returns the operand) */
+  if (y.len == 0){ ts_gc_unroot(2); return sa; }
+  if (x.len == 0){ ts_gc_unroot(2); return sb; }
+  uint64_t n64=(uint64_t)x.len+(uint64_t)y.len;
+  if (n64 > UINT32_MAX){
+    ts_gc_unroot(2);
+    fprintf(stderr, "tsaot: RangeError: concatenated string too large\n");
+    abort();
+  }
+  uint32_t n=(uint32_t)n64;
+  uint32_t flags = (x.flags | y.flags) & TS_STR_FLAG_UTF16;
+  int all_ascii = !!(x.flags & TS_STR_FLAG_ASCII) && !!(y.flags & TS_STR_FLAG_ASCII);
+  RT_STAT_INC(concat_calls); RT_STAT_ADD(concat_bytes, n);
+  if (all_ascii && n <= TS_SHORTSTR_MAX){
+    char data[TS_SHORTSTR_MAX];
+    for (uint32_t i=0;i<x.len;i++) data[i] = (char)ts_str_cu_at_view(x, i);
+    for (uint32_t i=0;i<y.len;i++) data[x.len+i] = (char)ts_str_cu_at_view(y, i);
+    tsv r = ts_short_str_ascii(data, n);
+    RT_STAT_INC(short_string);
+    ts_gc_unroot(2);
+    return r;
+  }
+
+  /* Linear append history: allocate the public prefix view before mutating
+     its hidden parent, then re-fetch every movable pointer after allocation. */
+  tsv parent_v = TS_UNDEFINED;
+  if (n >= TS_SB_MIN && ts_string_extendable_parent(sa, flags, n, &parent_v)){
+    ts_gc_root(&parent_v);
+    ts_string* out = ts_string_alloc_buffer_view();
+    ts_string* parent = ts_str_ptr_typed(parent_v);
+    y = ts_str_view_typed(sb);
+    uint32_t old_len = parent->len;
+    ts_str_copy_units(parent->data, parent->flags, old_len, y, 0, y.len);
+    parent->len = n;
+    parent->hash = 0;
+    parent->flags = (parent->flags & ~(TS_STR_FLAG_ASCII | TS_STR_FLAG_HASHED)) |
+                    (all_ascii ? TS_STR_FLAG_ASCII : 0);
+    ts_string_write_terminator(parent, n);
+    ts_string_init_buffer_view(out, parent_v, n);
+    tsv r = ts_str_v(out);
+    RT_STAT_INC(sb_extend);
+    ts_gc_unroot(3);
+    return r;
+  }
+
+  /* Start or grow a builder. A copied prefix becomes immutable as soon as a
+     later branch advances the old buffer's high-water mark. */
+  uint32_t capacity = n >= TS_SB_MIN ? ts_string_builder_capacity(n) : 0;
+  if (capacity != 0){
+    ts_string* buffer = ts_string_alloc_buffer(capacity, flags);
+    tsv buffer_v = ts_str_v(buffer);
+    ts_gc_root(&buffer_v);
+    ts_string* out = ts_string_alloc_buffer_view();
+    buffer = ts_str_ptr_typed(buffer_v);
+    x = ts_str_view_typed(sa);
+    y = ts_str_view_typed(sb);
+    ts_str_copy_units(buffer->data, flags, 0, x, 0, x.len);
+    ts_str_copy_units(buffer->data, flags, x.len, y, 0, y.len);
+    buffer->len = n;
+    buffer->hash = 0;
+    buffer->flags = TS_STR_FLAG_BUFFER | flags |
+                    (all_ascii ? TS_STR_FLAG_ASCII : 0);
+    ts_string_write_terminator(buffer, n);
+    ts_string_init_buffer_view(out, buffer_v, n);
+    tsv r = ts_str_v(out);
+    RT_STAT_INC(sb_fresh);
+    ts_gc_unroot(3);
+    return r;
+  }
+
+  RT_STAT_INC(sb_flat);
+  ts_string* out = ts_string_alloc_storage(n, flags);
+  x=ts_str_view_typed(sa); y=ts_str_view_typed(sb);
+  ts_str_copy_units(out->data, flags, 0, x, 0, x.len);
+  ts_str_copy_units(out->data, flags, x.len, y, 0, y.len);
+  out->flags = flags | (all_ascii ? TS_STR_FLAG_ASCII : 0);
+  out->hash = 0; /* lazy: content consumers hash on first demand */
+  tsv r=ts_str_v(out); ts_gc_unroot(2); return r;
+}
 tsv ts_add(tsv a, tsv b){
   if (ts_is_num(a)&&ts_is_num(b)) return ts_num(ts_to_num(a)+ts_to_num(b));
+  if (ts_is_str(a) && ts_is_str(b)) return ts_str_add2(a, b);
   if (ts_is_str(a) && ts_is_num(b)){
     char nb[24]; uint32_t nl; tsv r;
     if (ts_int_digits(ts_to_num(b), nb, &nl) &&
@@ -5892,93 +6037,82 @@ tsv ts_add(tsv a, tsv b){
     tsv sa=ts_to_string_v(a);
     ts_gc_root(&sa);
     tsv sb=ts_to_string_v(b);
-    ts_gc_root(&sb);
-    ts_strview x=ts_str_view_typed(sa), y=ts_str_view_typed(sb);
-    /* an empty operand: the other string itself (`s + ""`, as V8 returns the operand) */
-    if (y.len == 0){ ts_gc_unroot(4); return sa; }
-    if (x.len == 0){ ts_gc_unroot(4); return sb; }
-    uint64_t n64=(uint64_t)x.len+(uint64_t)y.len;
-    if (n64 > UINT32_MAX){
-      ts_gc_unroot(4);
-      fprintf(stderr, "tsaot: RangeError: concatenated string too large\n");
-      abort();
-    }
-    uint32_t n=(uint32_t)n64;
-    uint32_t flags = (x.flags | y.flags) & TS_STR_FLAG_UTF16;
-    int all_ascii = !!(x.flags & TS_STR_FLAG_ASCII) && !!(y.flags & TS_STR_FLAG_ASCII);
-    RT_STAT_INC(concat_calls); RT_STAT_ADD(concat_bytes, n);
-    if (all_ascii && n <= TS_SHORTSTR_MAX){
-      char data[TS_SHORTSTR_MAX];
-      for (uint32_t i=0;i<x.len;i++) data[i] = (char)ts_str_cu_at_view(x, i);
-      for (uint32_t i=0;i<y.len;i++) data[x.len+i] = (char)ts_str_cu_at_view(y, i);
-      tsv r = ts_short_str_ascii(data, n);
-      RT_STAT_INC(short_string);
-      ts_gc_unroot(4);
-      return r;
-    }
-
-    /* Linear append history: allocate the public prefix view before mutating
-       its hidden parent, then re-fetch every movable pointer after allocation. */
-    tsv parent_v = TS_UNDEFINED;
-    if (n >= TS_SB_MIN && ts_string_extendable_parent(sa, flags, n, &parent_v)){
-      ts_gc_root(&parent_v);
-      ts_string* out = ts_string_alloc_buffer_view();
-      ts_string* parent = ts_str_ptr_typed(parent_v);
-      y = ts_str_view_typed(sb);
-      uint32_t old_len = parent->len;
-      ts_str_copy_units(parent->data, parent->flags, old_len, y, 0, y.len);
-      parent->len = n;
-      parent->hash = 0;
-      parent->flags = (parent->flags & ~(TS_STR_FLAG_ASCII | TS_STR_FLAG_HASHED)) |
-                      (all_ascii ? TS_STR_FLAG_ASCII : 0);
-      ts_string_write_terminator(parent, n);
-      ts_string_init_buffer_view(out, parent_v, n);
-      tsv r = ts_str_v(out);
-      RT_STAT_INC(sb_extend);
-      ts_gc_unroot(5);
-      return r;
-    }
-
-    /* Start or grow a builder. A copied prefix becomes immutable as soon as a
-       later branch advances the old buffer's high-water mark. */
-    uint32_t capacity = n >= TS_SB_MIN ? ts_string_builder_capacity(n) : 0;
-    if (capacity != 0){
-      ts_string* buffer = ts_string_alloc_buffer(capacity, flags);
-      tsv buffer_v = ts_str_v(buffer);
-      ts_gc_root(&buffer_v);
-      ts_string* out = ts_string_alloc_buffer_view();
-      buffer = ts_str_ptr_typed(buffer_v);
-      x = ts_str_view_typed(sa);
-      y = ts_str_view_typed(sb);
-      ts_str_copy_units(buffer->data, flags, 0, x, 0, x.len);
-      ts_str_copy_units(buffer->data, flags, x.len, y, 0, y.len);
-      buffer->len = n;
-      buffer->hash = 0;
-      buffer->flags = TS_STR_FLAG_BUFFER | flags |
-                      (all_ascii ? TS_STR_FLAG_ASCII : 0);
-      ts_string_write_terminator(buffer, n);
-      ts_string_init_buffer_view(out, buffer_v, n);
-      tsv r = ts_str_v(out);
-      RT_STAT_INC(sb_fresh);
-      ts_gc_unroot(5);
-      return r;
-    }
-
-    RT_STAT_INC(sb_flat);
-    ts_string* out = ts_string_alloc_storage(n, flags);
-    x=ts_str_view_typed(sa); y=ts_str_view_typed(sb);
-    ts_str_copy_units(out->data, flags, 0, x, 0, x.len);
-    ts_str_copy_units(out->data, flags, x.len, y, 0, y.len);
-    out->flags = flags | (all_ascii ? TS_STR_FLAG_ASCII : 0);
-    out->hash = 0; /* lazy: content consumers hash on first demand */
-    tsv r=ts_str_v(out); ts_gc_unroot(4); return r;
+    ts_gc_unroot(3);
+    return ts_str_add2(sa, sb);
   }
   if (ts_is_num(a)&&ts_is_num(b)) return ts_num(ts_to_num(a)+ts_to_num(b));
   /* mixed primitives (bool/null/undef): numeric add via coercion */
   if (!ts_is_obj(a) && !ts_is_obj(b)) return ts_num(ts_number_coerce(a)+ts_number_coerce(b));
   return ts_num(0);
 }
+/* The common many-piece concatenation (a template's pieces, a chain of strings): two to sixteen
+   pieces, each a string of one-byte storage or an integer, the result below the builder threshold.
+   One pass for the lengths (an integer's digits on the stack, a short string's length from its
+   value), one allocation, one copy pass (a short string's bytes from its value, a heap string's by
+   word moves); every other case takes the general path (docs/string_build_fast_paths_design.md). */
+static int ts_concat_simple(tsv* args, int n, tsv* out){
+  char digits[16][24];
+  uint32_t dlen[16];
+  uint32_t total = 0;
+  int all_ascii = 1, heap = 0;
+  for (int i = 0; i < n; i++){
+    tsv p = args[i];
+    dlen[i] = 0;
+    if (ts_is_short_str(p)){ total += ts_short_str_len(p); continue; }
+    if (ts_is_heap_str(p)){
+      ts_strview v = ts_str_view_typed(p);
+      if (!v.data || (v.flags & TS_STR_FLAG_UTF16)) return 0;
+      all_ascii &= !!(v.flags & TS_STR_FLAG_ASCII);
+      total += v.len; heap = 1;
+      if (total >= TS_SB_MIN) return 0;
+      continue;
+    }
+    if (ts_is_num(p) && ts_int_digits(ts_to_num(p), digits[i], &dlen[i]) && dlen[i]){ total += dlen[i]; continue; }
+    return 0;
+  }
+  if (total >= TS_SB_MIN) return 0;   /* a builder: the general path keeps the append history */
+  RT_STAT_INC(concat_calls); RT_STAT_ADD(concat_bytes, total);
+  if (total <= TS_SHORTSTR_MAX && all_ascii){
+    char data[8];
+    uint32_t pos = 0;
+    for (int i = 0; i < n; i++){
+      tsv p = args[i];
+      if (dlen[i]){ memcpy(data + pos, digits[i], dlen[i]); pos += dlen[i]; }
+      else if (ts_is_short_str(p)){ uint32_t l = ts_short_str_len(p); for (uint32_t k = 0; k < l; k++) data[pos + k] = (char)ts_short_str_byte(p, k); pos += l; }
+      else { ts_strview v = ts_str_view_typed(p); for (uint32_t k = 0; k < v.len; k++) data[pos + k] = v.data[k]; pos += v.len; }
+    }
+    *out = ts_short_str_ascii(data, total);
+    return 1;
+  }
+  if (heap) for (int i = 0; i < n; i++) ts_gc_root(&args[i]);   /* the pieces across the allocation */
+  ts_string* s = ts_string_alloc_storage(total, 0);
+  if (heap) ts_gc_unroot(n);
+  uint32_t pos = 0;
+  for (int i = 0; i < n; i++){
+    tsv p = args[i];
+    if (dlen[i]){ ts_copy_small(s->data + pos, digits[i], dlen[i]); pos += dlen[i]; }
+    else if (ts_is_short_str(p)){ ts_short_str_put(s->data + pos, p); pos += ts_short_str_len(p); }
+    else { ts_strview v = ts_str_view_typed(p); ts_copy_small(s->data + pos, v.data, v.len); pos += v.len; }   /* after the allocation */
+  }
+  s->flags = all_ascii ? TS_STR_FLAG_ASCII : 0u;
+  *out = ts_str_v(s);
+  return 1;
+}
+/* A template's pieces (docs/string_build_fast_paths_design.md): strings, and the number
+   substitutions whose ToString the exporter left to here (a number's ToString has no effect to
+   order). Every piece is converted to a string and the pieces are joined; never `+`'s numeric
+   addition, which the chain form (ts_str_concat_many) applies to a leading pair of numbers. */
+tsv ts_str_template(tsv* parts, int n){
+  tsv fast;
+  if (n >= 2 && n <= 16 && ts_concat_simple(parts, n, &fast)) return fast;
+  for (int i = 0; i < n; i++) ts_gc_root(&parts[i]);
+  for (int i = 0; i < n; i++) if (!ts_is_str(parts[i])) parts[i] = ts_to_string_template(parts[i]);
+  ts_gc_unroot(n);
+  return ts_str_concat_many(parts, n);
+}
 tsv ts_str_concat_many(tsv* args, int n){
+  tsv fast;
+  if (n >= 2 && n <= 16 && ts_concat_simple(args, n, &fast)) return fast;
   for (int i = 0; i < n; i++) if (ts_is_symbol(args[i])) ts_throw_type_error_msg("Cannot convert a Symbol value to a string");
   if (n <= 0) return ts_new_string("",0);
   int first_string_pair = n == 1 || ts_is_str(args[0]) || ts_is_str(args[1]);

@@ -2127,6 +2127,16 @@ class Exporter {
    *  constNumValue(), so folding cannot suppress user code or observable
    *  ToPrimitive/ToString calls. Numeric results are stringified by the exporter
    *  host (V8), including -0 -> "0" and NaN/Infinity spellings. */
+  /** A template substitution whose ToString the join may do (docs/string_build_fast_paths_design.md):
+   *  under the strict type profile, an expression of a number type (number, a number literal, a union
+   *  of them), whose value is a number. */
+  templateNumberSubstitution(node: ts.Expression): boolean {
+    if (process.env.TSAOT_TEMPLATE_NUMBERS === "0" || !this.strictTypeOptimizationProfile().enabled) return false;
+    let t: ts.Type;
+    try { t = this.checker.getTypeAtLocation(node); } catch { return false; }
+    const numeric = (m: ts.Type) => (m.flags & (ts.TypeFlags.Number | ts.TypeFlags.NumberLiteral)) !== 0;
+    return t.isUnion() ? t.types.every(numeric) : numeric(t);
+  }
   constTemplateString(node: ts.Expression): string | undefined {
     const n = this.stripTransparentExpr(node);
     if (ts.isStringLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n)) return n.text;
@@ -7757,6 +7767,14 @@ class Exporter {
       // of the next substitution.
       const parts: number[] = [];
       let pendingStatic = node.head.text;
+      // A number substitution's ToString has no effect to order, so under the strict type profile it is
+      // left to the join (`string.template`, which formats an integer's digits on the stack) when the
+      // template has two parts or more (docs/string_build_fast_paths_design.md).
+      const substitutions = node.templateSpans.filter((sp) => this.constTemplateString(sp.expression) === undefined).length;
+      const anyStatic = node.head.text.length > 0 || node.templateSpans.some((sp) =>
+        sp.literal.text.length > 0 || (this.constTemplateString(sp.expression) ?? "").length > 0);
+      const joinable = substitutions >= 2 || (substitutions === 1 && anyStatic);
+      let deferred = false;
       const flushStatic = () => {
         if (pendingStatic.length === 0) return;
         const lit = this.newLocal(ctx, "reference");
@@ -7773,6 +7791,12 @@ class Exporter {
         }
         flushStatic();
         const raw = this.lowerExpr(ctx, span.expression);
+        if (joinable && this.templateNumberSubstitution(span.expression)) {
+          parts.push(raw);
+          deferred = true;
+          pendingStatic = span.literal.text;
+          continue;
+        }
         const e = this.newLocal(ctx, "reference");
         // a template's ToString: a Symbol substitution is a TypeError (String(sym) is its description)
         ctx.body.push({ kind: "CallBuiltinStatic", dst: e, builtin: "string.coerceTemplate", args: [raw] });
@@ -7790,7 +7814,7 @@ class Exporter {
         return empty;
       }
       const out = this.newLocal(ctx, "reference");
-      ctx.body.push({ kind: "CallBuiltinStatic", dst: out, builtin: "string.concatMany", args: parts });
+      ctx.body.push({ kind: "CallBuiltinStatic", dst: out, builtin: deferred ? "string.template" : "string.concatMany", args: parts });
       return out;
     }
     if (ts.isNumericLiteral(node)) {

@@ -22627,18 +22627,16 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 }
                 return;
             }
-            if builtin == "string.concatMany" {
+            if builtin == "string.concatMany" || builtin == "string.template" {
+                // a template whose number substitutions are left unconverted joins them as strings
+                // (docs/string_build_fast_paths_design.md); the chain form keeps `+`'s semantics
+                let rt_fn = if builtin == "string.template" { "ts_str_template" } else { "ts_str_concat_many" };
                 let tmp = format!("_scm{}", dst.map(|d| d.0).unwrap_or(0));
                 let _ = writeln!(s, "  {{ tsv _scm_args[{}];", args.len().max(1));
                 for (i, a) in args.iter().enumerate() {
                     let _ = writeln!(s, "    _scm_args[{}] = {};", i, ctx.val(a.0));
                 }
-                let _ = writeln!(
-                    s,
-                    "    tsv {} = ts_str_concat_many(_scm_args, {});",
-                    tmp,
-                    args.len()
-                );
+                let _ = writeln!(s, "    tsv {} = {}(_scm_args, {});", tmp, rt_fn, args.len());
                 if let Some(d) = dst {
                     let _ = writeln!(s, "  {} }}", ctx.set_val(d.0, &tmp).trim_end());
                 } else {

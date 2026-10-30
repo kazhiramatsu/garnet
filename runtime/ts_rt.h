@@ -838,9 +838,21 @@ static inline uint16_t ts_str_cu_at_view(ts_strview v, uint32_t i){
    paths (memchr, memcmp) apply; any other view is returned as is. */
 static inline ts_strview ts_strview_materialize(ts_strview v, char* buf){
   if (v.data || !v.len) return v;
-  for (uint32_t i = 0; i < v.len; i++) buf[i] = (char)ts_str_cu_at_view(v, i);
+  memcpy(buf, &v.immediate, 4); buf[4] = (char)v.hash;   /* bytes 0-3 in the immediate, byte 4 in hash */
   v.data = buf; v.flags = TS_STR_FLAG_ASCII; v.hash = 0;
   return v;
+}
+/* An immediate short string's bytes into one-byte storage: they are its value's low bytes (two
+   overlapping word stores, no unit loop). */
+static inline void ts_short_str_put(char* d, tsv v){
+  uint32_t len = ts_short_str_len(v);
+  uint64_t bits = (uint64_t)v;
+  if (len >= 4u){
+    uint32_t lo = (uint32_t)bits, hi = (uint32_t)(bits >> ((len - 4u) * 8u));
+    memcpy(d, &lo, 4); memcpy(d + len - 4u, &hi, 4);
+  } else if (len){
+    d[0] = (char)bits; d[len - 1u] = (char)(bits >> ((len - 1u) * 8u)); d[len >> 1] = (char)(bits >> ((len >> 1) * 8u));
+  }
 }
 static inline void ts_str_cu_set(char* data, uint32_t flags, uint32_t i, uint16_t cu){
   if (flags & TS_STR_FLAG_UTF16){
@@ -2206,6 +2218,7 @@ uint32_t* ts_string_codepoints_copy(tsv v, uint32_t* out_len);
 tsv  ts_string_from_codepoints(const uint32_t* cps, uint32_t len);
 tsv  ts_add(tsv a, tsv b);            /* JS '+' (number add or string concat) */
 tsv  ts_str_concat_many(tsv* args, int n);
+tsv  ts_str_template(tsv* parts, int n);   /* a template's pieces: strings and deferred number substitutions */
 /* JS `===`. Identical bits are equal unless NaN; distinct bits can only be
    equal for two numbers (+0/-0) or two strings, which compare out of line. */
 int  ts_strict_eq_slow(tsv a, tsv b);
@@ -2438,8 +2451,13 @@ static inline void ts_write_barrier_at(tsv owner, ts_gc_header* oh, tsv* p, tsv 
     uint32_t slot = (p >= iv && p < iv + oh->inline_cap)
       ? (uint32_t)(p - iv)
       : (uint32_t)(p - (tsv*)obj_map_plain(o)->props) + oh->inline_cap;
+    /* remembered with the slot's card in its dirty range (hdr_spare: first card << 4 | end, 0xFF
+       every slot): the next young collection scans the slot whatever the value */
+    uint32_t r = oh->hdr_spare, card = slot >> 3;
+    if ((oh->flags & TS_HDR_REMEMBERED) && r && (r == 0xFFu || (card >= (r >> 4) && card < (r & 0xFu)))) return;
     ts_gc_remember_slot(oh, slot);
   } else {
+    if ((oh->flags & (TS_HDR_REMEMBERED | TS_HDR_SIZED)) == (TS_HDR_REMEMBERED | TS_HDR_SIZED)) return;   /* scanned whole */
     ts_gc_remember(oh);
   }
   (void)owner; (void)value;

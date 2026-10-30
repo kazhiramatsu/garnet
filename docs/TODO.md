@@ -12395,3 +12395,24 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
     shape tested once and young, as the integer slots already do, would store directly), closures (the
     cell, the environment payload, then the name and arity in a second call), anonymous object types'
     reads through the sized cache (no static slot hint without a named type).
+- String building (docs/string_build_fast_paths_design.md), found while looking for vue's gap to Node
+  (1,046 against 760 ms: reactivity 665 / 525, the template compiler 359 / 227): the compiler's codegen
+  `push` (`context.code += code`) was 8% of its phase. Kernels against Node (ns per iteration): five
+  pushes through a closure 95.2 (18.8), a local's two appends 31.5 (3.85), a template `item-${i}:${i &
+  7}` 54.2 (7.53). Two strings now skip the generic add's tests and conversions (`ts_str_add2`); an
+  append to the live tail of a builder is tested first from the headers alone (a short piece's length
+  and bytes from its value, the roots pushed in line, the capacity a shift, the terminator a store);
+  copies of an immediate short string and of short pieces are word moves; ASCII input to
+  `ts_new_string` takes the one-copy constructor; `ts_concat_simple` joins up to sixteen one-byte
+  strings and integers below the builder threshold in two passes; under the strict profile a number
+  substitution of a template with two parts or more is joined unconverted (`string.template` /
+  `ts_str_template`: every piece a string, never `+`'s addition, so `${1}${2}` stays "12";
+  `TSAOT_TEMPLATE_NUMBERS=0`); a plain object's slot barrier returns in line when its card is dirty.
+  Kernels: 50.5, 12.9, 14.2. Fixture strings/template_numbers (every kind of number, adjacent
+  substitutions, appends to a local and a property). Gates (`build/gates_s360e/run.sh`, r24 against
+  r23): unit, bundler 53/53, conformance plain and strict 702/702, protect 699/699, bench, ci,
+  ir-parity identical (4,370 after the snapshot took the fixture), the engine diff in both modes, the
+  GC gate, the hono survey 42/43. vue 1,049.1 -> 1,020.0 ms (compiler phase 380 -> 355), TrieRouter
+  220.6 -> 208.8, SmartRouter 55.4 -> 54.2, RegExpRouter 54.3 -> 53.7, PatternRouter 232.6 -> 237.3
+  in the four-router driver and unchanged alone (6.587 G instructions both), hono_app 150.0 -> 149.3
+  (Node 154.5), tsc-ts instructions 1.0010, cycles 0.9906.
