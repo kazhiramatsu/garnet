@@ -283,14 +283,15 @@ static int builtin_exec(tsv re, tsv s, int32_t* caps){
 static tsv slice(tsv s, int32_t a, int32_t b){
   if (b <= a) return ts_short_str_ascii("", 0);   /* an empty capture (`$()` marks a route in hono's router) */
   uint32_t n = (uint32_t)(b - a);
-  if (n <= TS_SHORTSTR_MAX && ts_is_heap_str(s)){
-    /* a short capture of a flat ASCII string (a route parameter): the immediate from the bytes */
+  if (ts_is_heap_str(s)){
     const ts_string* x = ts_str_ptr_typed(s);
-    if ((x->flags & (TS_STR_FLAG_ASCII | TS_STR_FLAG_VIEW | TS_STR_FLAG_UTF16)) == TS_STR_FLAG_ASCII) return ts_short_str_ascii(x->data + a, n);
+    if (a == 0 && n == x->len) return s;   /* the whole input (an anchored regexp's match: hono's routes) */
+    /* a short capture of a flat ASCII string (a route parameter): the immediate from the bytes */
+    if (n <= TS_SHORTSTR_MAX && (x->flags & (TS_STR_FLAG_ASCII | TS_STR_FLAG_VIEW | TS_STR_FLAG_UTF16)) == TS_STR_FLAG_ASCII) return ts_short_str_ascii(x->data + a, n);
   }
-  return ts_str_slice(s, (double)a, (double)b, 1);
+  return ts_str_slice_units(s, (uint32_t)a, n);   /* the engine's bounds lie in the input */
 }
-static tsv substr(tsv s, uint32_t start, uint32_t len){ return ts_str_slice(s, (double)start, (double)(start + len), 1); }
+static tsv substr(tsv s, uint32_t start, uint32_t len){ return ts_str_slice_units(s, start, len); }   /* clamped to s */
 /* the program's named groups as the runtime sees them, made once per program and freed with it:
    the interned key of each distinct name in group order (the `groups` object's layout) and
    each group's slot in it (-1 for an unnamed group; duplicate names share a slot) */
@@ -341,13 +342,13 @@ static tsv build_groups(tsv values, const int32_t* caps, rx_program* p){
   ts_gc_unroot(2);
   return obj;
 }
-/* The result arrays are allocated at their length, the elements stored in line (a fresh array:
-   the slot store and the generation test), and the named properties (`index`, `input`, `groups`,
-   and `indices` under `d`) are a layout the array adopts at creation (ts_array_adopt_layout), so
-   each is one slot store; the shape is the one the keys added in that order from the empty array
-   shape would give. The inline caches are the fallback when the array cannot adopt the layout
-   (the shape table exhausted): the addition cache answers each store without the probe of the
-   receiver and its prototype chain that a generic set does. */
+/* The result arrays: the elements are made first (each heap slice rooted where it is held) and the
+   array is allocated with them, no hole fill and no second pass; the named properties (`index`,
+   `input`, `groups`, and `indices` under `d`) are a layout the array adopts with their values
+   (ts_array_adopt_layout_vals): the shape is the one the keys added in that order from the empty
+   array shape would give. The inline caches are the fallback when the array cannot adopt the
+   layout (the shape table exhausted): the addition cache answers each store without the probe of
+   the receiver and its prototype chain that a generic set does. */
 static ts_prop_ic g_ic_index, g_ic_input, g_ic_groups, g_ic_indices, g_ic_ind_groups;
 static tsv build_indices(tsv s, const int32_t* caps, rx_program* p){
   uint32_t ng = rx_group_count(p);
@@ -371,26 +372,30 @@ static tsv build_result(tsv s, const int32_t* caps, rx_program* p){
   uint32_t ng = rx_group_count(p);
   int with_indices = (rx_flags(p) & TSAOT_REGEXP_FLAG_INDICES) != 0;
   ts_gc_root(&s);
-  tsv arr = ts_new_array_compact(ng + 1u);   /* the cell and the elements in one allocation */
-  int laid = ts_array_adopt_layout(arr, with_indices ? &g_result_layout_d : &g_result_layout);
-  ts_gc_root(&arr);
-  ts_array* a = (ts_array*)ts_ptr(arr);   /* dense at its length, never moves; the slot stores need only the generation test */
+  tsv inline_vals[16];
+  tsv* vals = ng < 16u ? inline_vals : (tsv*)malloc(sizeof(tsv) * ((size_t)ng + 1u));
+  if (!vals) abort();
+  uint32_t held = 0;   /* the heap slices rooted in vals (a slice may allocate: a collection moves them there) */
   for (uint32_t g = 0; g <= ng; g++){
-    tsv part = caps[2*g] >= 0 ? slice(s, caps[2*g], caps[2*g+1]) : TS_UNDEFINED;   /* arr is rooted; part is stored at once */
-    a->data[g] = part;
-    if (a->o.h.gen == TS_GEN_OLD) ts_array_remember(a, g, part);
+    vals[g] = caps[2*g] >= 0 ? slice(s, caps[2*g], caps[2*g+1]) : TS_UNDEFINED;
+    if (ts_is_heap_str(vals[g]) && vals[g] != s){ ts_gc_root(&vals[g]); held++; }
   }
-  if (laid){ ts_lit_store(arr, 0, ts_num(caps[0])); ts_lit_store(arr, 1, s); }
-  else { ts_set_pic(arr, k_index, ts_num(caps[0]), &g_ic_index); ts_set_pic(arr, k_input, s, &g_ic_input); }
+  tsv arr = ts_new_array_lit(ng + 1u, vals);   /* the cell and the elements in one allocation */
+  ts_gc_unroot(held);
+  if (vals != inline_vals) free(vals);
+  ts_gc_root(&arr);
   tsv groups = rx_has_named_groups(p) ? build_groups(arr, caps, p) : TS_UNDEFINED;
-  if (laid) ts_lit_store(arr, 2, groups);
-  else { ts_gc_root(&groups); ts_set_pic(arr, k_groups, groups, &g_ic_groups); ts_gc_unroot(1); }
-  if (with_indices){
-    tsv ind = build_indices(s, caps, p);
-    if (laid) ts_lit_store(arr, 3, ind);
-    else { ts_gc_root(&ind); ts_set_pic(arr, k_indices, ind, &g_ic_indices); ts_gc_unroot(1); }
+  ts_gc_root(&groups);
+  tsv ind = with_indices ? build_indices(s, caps, p) : TS_UNDEFINED;
+  ts_gc_root(&ind);
+  tsv named[4] = { ts_num(caps[0]), s, groups, ind };
+  if (!ts_array_adopt_layout_vals(arr, with_indices ? &g_result_layout_d : &g_result_layout, named)){
+    ts_set_pic(arr, k_index, named[0], &g_ic_index);
+    ts_set_pic(arr, k_input, s, &g_ic_input);
+    ts_set_pic(arr, k_groups, groups, &g_ic_groups);
+    if (with_indices) ts_set_pic(arr, k_indices, ind, &g_ic_indices);
   }
-  ts_gc_unroot(2);
+  ts_gc_unroot(4);
   return arr;
 }
 

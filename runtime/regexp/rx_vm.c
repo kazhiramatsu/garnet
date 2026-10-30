@@ -36,7 +36,10 @@ static inline int set_has(const rx_set* s, uint32_t ch){
 #undef RX_WIDE
 
 /* ---- the search loop ---- */
-static void reset_caps(rx_ctx* c){ for (uint32_t i = 0; i < c->p->ncap_regs; i++) c->regs[i] = -1; }
+/* every capture register unset (-1, all bits set): one memset (the loop reloaded the count per
+   register, the stores through regs aliasing the program for the compiler: 6% of hono's
+   RegExpRouter match) */
+static inline void reset_caps(rx_ctx* c){ memset(c->regs, 0xFF, sizeof(int32_t) * (size_t)c->p->ncap_regs); }
 
 static int try_at(rx_ctx* c, int wide, uint32_t pos, int32_t* caps){
   reset_caps(c);

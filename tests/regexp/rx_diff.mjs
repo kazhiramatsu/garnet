@@ -9,6 +9,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, statSync, readdirSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import { routeCases } from "./route_cases.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const dir = path.join(root, "runtime/regexp");
@@ -107,6 +108,8 @@ for (let i = 0; i < NRANDOM; i++) {
 // ---- run ----
 build();
 const hex = (s) => { let o = ""; for (let i = 0; i < s.length; i++) o += s.charCodeAt(i).toString(16).padStart(4, "0"); return o; };
+// hono's router regexps (tests/regexp/route_cases.mjs): random route tables and paths
+for (const c of routeCases(SEED)) cases.push(c);
 const lines = cases.map(([p, f, i, s]) => `${hex(p)}\t${f}\t${hex(i)}\t${s}`).join("\n") + "\n";
 const dump = opt("--dump", null);
 if (dump) { (await import("node:fs")).writeFileSync(dump, lines); console.log(`${cases.length} cases written`); process.exit(0); }
@@ -114,6 +117,12 @@ const NATIVE = args.includes("--native");
 const driver = NATIVE ? buildNative(lines) : cli;
 const run = spawnSync(driver, [], { input: lines, encoding: "utf8", maxBuffer: 1 << 28 });
 if (run.status !== 0) { console.error("rx_cli failed:", run.status, run.signal, run.stderr); }
+// TSAOT_REGEXP_TRACE=1: the engine's decisions per program, summed
+if (process.env.TSAOT_REGEXP_TRACE && run.stderr) {
+  const tally = new Map();
+  for (const l of run.stderr.split("\n")) if (l.startsWith("[regexp]")) tally.set(l, (tally.get(l) ?? 0) + 1);
+  for (const [l, n] of [...tally].sort((a, b) => b[1] - a[1])) console.log(`${String(n).padStart(7)} ${l}`);
+}
 const got = run.stdout.split("\n");
 const reason = (m) => m.replace(/^Invalid regular expression: \/[\s\S]*\/[a-z]*: /, "");
 function v8(p, f, input, start) {

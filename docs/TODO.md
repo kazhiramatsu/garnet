@@ -12314,3 +12314,36 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   copies a capture register pair per group of every route and builds a result array with an
   element per group, so a match's cost grows with the application's route count (1,400 groups at
   800 routes: about 150 ns a match, mostly that); V8 builds the same array.
+- The regexp result's construction and the per-attempt path (`runtime/regexp/ts_regexp_adapter.c`
+  `build_result`, `runtime/regexp/rx_vm.c` `try_at`): the elements are made first (each heap slice
+  rooted where it is held) and the array allocated with them (`ts_new_array_lit`: no hole fill, no
+  second pass), the named properties adopted with their values (`ts_array_adopt_layout_vals`: the
+  vector filled once, four stores instead of a `memset_pattern16` call), a capture that is the
+  whole input is the input itself, a capture slice goes straight to the view or copy
+  (`ts_str_slice_units`, no number conversions), and the capture registers' reset reads its count
+  once (the loop reloaded it per register: the stores through `regs` aliased the program for the
+  compiler, 6% of hono's RegExpRouter match). The engine diff now carries hono's router regexps:
+  `tests/regexp/route_cases.mjs` builds them from random route tables the way hono does (744
+  cases). Gates (`build/gates_s360b/run.sh`): unit, bundler 53/53, conformance plain and strict
+  700/700, protect 697/697, bench, ci, ir-parity identical, the engine diff 44,337 cases 0 differ
+  in both modes, the GC gate, the hono survey 42/43. r21 against r20 (alternating rounds,
+  medians; outputs identical): RegExpRouter 63.4 -> 57.3 ms, SmartRouter 66.0 -> 58.2, TrieRouter
+  248.5 -> 248.0, PatternRouter 241.9 -> 247.1 in the four-router driver but unchanged alone
+  (a PatternRouter-only driver, 2 M matches: 2.094 -> 2.074 G cycles, 13.60 -> 13.69 G
+  instructions: placement in the shared binary), hono_app 155.0 -> 155.3 (Node 156.7), vue
+  1,062.0 -> 1,064.6, tsc-ts instructions 0.9998, cycles 0.9878.
+- Kaz: 「これ以上v8に勝てませんか。くやしいです。」 The trained RegExpRouter-only driver against Node
+  (loaded machine): 55 ns a match against 39; the matcher is 7.7% of it (native), the rest the
+  code around it, about a fifth of it allocation. Collections are not the gap (with collections
+  off garnet is slower: the recycled young runs keep allocation in the cache). Kaz then: 「割り当て
+  作法にそこまで差があるのなら全体的に汎用的な高速化が可能なはずです。探してください」. Allocation
+  kernels against Node (ns per iteration): a two-element array 8.6 / 5.0, an object literal 11.2 /
+  4.1, a class instance 11.7 / 3.9, an eight-character slice 15.5 / 6.6, a closure 10.5 / 7.0; a
+  class instance's allocation alone is 110-130 instructions (two calls, the five-load budget test,
+  the size class looked up at run time, four counters, the header byte by byte), V8's a bump and a
+  limit. In progress: the young allocation as a bump below a per-class limit that folds the
+  collection budget in, the counters kept per run, the debug modes through the slow path
+  (docs/alloc_fast_path_design.md, to be written). First measurements: 50 instructions fewer per
+  allocation; the conservative roots' allocation bits (the generated main turns the roots on) set
+  in a batch per collection cost more than they saved (a chain of read-modify-writes on the
+  bitmap's words): the young cells are to be validated by the runs' records instead.

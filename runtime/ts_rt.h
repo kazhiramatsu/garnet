@@ -1745,6 +1745,8 @@ int ts_obj_adopt_layout(tsv obj, ts_lit_layout* layout);
    ts_lit_store; 1 when the slots follow the layout, 0 when the array already has named
    properties, the layout has more than four keys or the shape table is exhausted. */
 int ts_array_adopt_layout(tsv arr, ts_lit_layout* layout);
+/* The same with the layout's values stored at once (ts_rt.c). */
+int ts_array_adopt_layout_vals(tsv arr, ts_lit_layout* layout, const tsv* vals);
 void ts_array_set(tsv arr, uint32_t i, tsv v);
 void ts_array_push(tsv arr, tsv v);
 void ts_array_push_hole(tsv arr);
@@ -1755,6 +1757,7 @@ uint32_t ts_array_len(tsv arr);
 tsv ts_str_toupper(tsv s);
 tsv ts_str_tolower(tsv s);
 tsv ts_str_slice(tsv s, double start, double end, int has_end);
+tsv  ts_str_slice_units(tsv s, uint32_t start, uint32_t len);   /* a range known to lie in s (the regexp captures) */
 tsv ts_str_substring(tsv s, double start, double end, int has_end);
 tsv ts_str_substr(tsv s, tsv start, tsv length);
 tsv ts_str_value(tsv s);

@@ -7190,6 +7190,9 @@ static long ts_slice_index(double value, long length){
   if (value < 0) return value <= -(double)length ? 0 : length + (long)value;
   return value >= (double)length ? length : (long)value;
 }
+/* A substring by unit offsets (ts_rt.h; the regexp captures): ts_str_slice without the number
+   conversions and clamps, for a range the caller knows lies in the string. */
+tsv ts_str_slice_units(tsv s, uint32_t start, uint32_t len){ return ts_string_slice_view(s, start, len); }
 tsv ts_str_slice(tsv s, double start, double end, int has_end){
   if(!ts_is_str(s)) return s;
   long n=(long)ts_str_len_typed(s);
@@ -18302,6 +18305,25 @@ int ts_array_adopt_layout(tsv arr, ts_lit_layout* L){
   m->props = (ts_prop*)slots; m->cap = 4u; m->len = n;
   ts_obj_set_shape(o, sh);
   SHAPE_CHECK(o);
+  return 1;
+}
+/* ts_array_adopt_layout with the layout's values stored at once (the regexp result arrays: index,
+   input, groups and indices): no fill of the vector before its stores. A fresh young array, so no
+   barrier; an old one remembers the values. */
+int ts_array_adopt_layout_vals(tsv arr, ts_lit_layout* L, const tsv* vals){
+  if (!ts_is_indexed_array_fast(arr)) return 0;
+  ts_object* o = (ts_object*)ts_ptr(arr);
+  ts_propmap* m = obj_map_plain(o);
+  if (o->shape != TS_SHAPE_EMPTY || m->len != 0 || m->cap != 0 || o->h.inline_cap != 0) return 0;
+  uint32_t sh = lit_layout_shape(L);
+  uint32_t n = L->n;
+  if (sh == UINT32_MAX || n == 0 || n > 4u || L->kinds) return 0;
+  tsv* slots = vals_alloc_small(&o->h);
+  for (uint32_t i = 0; i < 4u; i++) slots[i] = i < n ? vals[i] : TS_UNDEFINED;   /* four stores, no call */
+  m->props = (ts_prop*)slots; m->cap = 4u; m->len = n;
+  ts_obj_set_shape(o, sh);
+  SHAPE_CHECK(o);
+  if (TS_RT_UNLIKELY(o->h.gen == TS_GEN_OLD)) for (uint32_t i = 0; i < n; i++) ts_write_barrier(arr, vals[i]);
   return 1;
 }
 void ts_lit_store_int_slow(tsv obj, uint32_t i, long long v){
