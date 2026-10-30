@@ -89,6 +89,7 @@ typedef struct ts_iso {
   uint32_t* probe_rkeys;
   uint32_t* probe_wkeys;
   int has_proxies, typed_slow, closed_receivers, class_relinked;
+  uint32_t class_relink_epoch;
   tsv* globals;
   tsv* class_proto;
   tsv object_proto;
@@ -149,6 +150,7 @@ static inline __attribute__((always_inline)) ts_iso* ts_iso_get(void){
 #define g_typed_slow (TS_ISO()->typed_slow)
 #define g_closed_receivers (TS_ISO()->closed_receivers)
 #define g_class_relinked (TS_ISO()->class_relinked)
+#define g_class_relink_epoch (TS_ISO()->class_relink_epoch)
 #endif
 
 /* NaN-boxing layout: a normal double is any pattern that is NOT a boxed form.
@@ -1031,9 +1033,21 @@ tsv ts_method_lookup_sized(tsv recv, ts_key fkey, ts_key mkey, ts_prop_ic* field
    layout, so the offset; an instance that abandons its layout clears the
    word) and a function in the slot: nothing in the sidecar shadows a struct
    field, and a field becomes neither read-only nor an accessor. */
+#if !TS_ISO_MODE
 extern int g_class_relinked;
+extern uint32_t g_class_relink_epoch;
+#endif
+/* The relink epoch (ts_set_proto_user): every relink of an object that may be a prototype moves it,
+   so a cache entry derived from a class's chain holds only for the epoch it was filled in. It
+   saturates at TS_RELINK_EPOCH_EXHAUSTED, where nothing is filled any more. */
+#define TS_RELINK_EPOCH_EXHAUSTED 0xFFFFFFFFu
 #define TS_MSIC_FIELD 1u
-typedef struct { uint32_t cls; uint32_t holder_shape; uint32_t slot; uint32_t kind; tsv holder; } ts_method_site_ic;
+#define TS_MSIC_DYN 2u
+/* The site's entry: the class word, then by kind the struct field's offset (FIELD), the index of an
+   own dynamic property under `key` in the instance's sidecar (DYN, as hono's router assigns its
+   matcher to `this.match`), or the prototype holding the method with its shape word and slot (0;
+   valid in its relink epoch). The generated sites initialize the first five members. */
+typedef struct { uint32_t cls; uint32_t holder_shape; uint32_t slot; uint32_t kind; tsv holder; uint32_t epoch; ts_key key; } ts_method_site_ic;
 tsv ts_method_lookup_sized_fill(tsv recv, ts_key fkey, ts_key mkey, ts_prop_ic* field_ic, ts_prop_ic* proto_ic, ts_method_site_ic* sic);
 /* The site's cached method for `recv` (1, in *out), or 0. */
 TS_RT_ALWAYS_INLINE int ts_method_site_hit(tsv recv, const ts_method_site_ic* sic, tsv* out){
@@ -1043,7 +1057,13 @@ TS_RT_ALWAYS_INLINE int ts_method_site_hit(tsv recv, const ts_method_site_ic* si
       tsv v;
       if (sic->kind == TS_MSIC_FIELD){
         memcpy(&v, (const char*)o + sic->slot, sizeof v);
-      } else if (!g_class_relinked && !o->dyn){
+      } else if (sic->kind == TS_MSIC_DYN){
+        const ts_propmap* d = o->dyn;
+        if (!d || sic->slot >= d->len) return 0;
+        const ts_prop* pr = &d->props[sic->slot];
+        if (pr->key != sic->key || (pr->flags & TS_PROP_ACCESSOR)) return 0;
+        v = pr->val;
+      } else if (sic->epoch == g_class_relink_epoch && !o->dyn){
         const ts_object* hd = (const ts_object*)ts_ptr(sic->holder);
         if (hd->shape != sic->holder_shape) return 0;
         v = *ts_obj_slot_ptr((ts_object*)hd, sic->slot);
@@ -2196,8 +2216,10 @@ void ts_register_class_meta(uint32_t class_id, size_t size, tsv proto, ts_class_
 tsv  ts_make_class_value(uint32_t class_id, ts_code ctor, tsv* env, uint32_t envlen);
 /* The class index words by class id (the generated CLASS_INDEX_TAB). */
 void ts_register_class_indices(const uint32_t* tab, uint32_t n);
-/* Raised when a prototype other than a sized instance's own is relinked by
-   the program: a class interval may no longer describe a prototype chain. */
+/* Raised when the program relinks a prototype so that a class interval may no
+   longer describe a chain: the class prototypes on some chain change (a
+   class prototype's relink that only puts built-in prototypes behind a root
+   class, as the String wrapper's library class does, keeps it down). */
 #if !TS_ISO_MODE
 extern int g_class_relinked;
 #endif

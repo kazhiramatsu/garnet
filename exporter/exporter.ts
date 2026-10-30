@@ -5636,8 +5636,10 @@ class Exporter {
         // Only a string or an array answers `.length` with its own number;
         // any other receiver (an object with a `length` property, ArrayLike,
         // a function, any, unknown, null) reads the property below.
+        // (A value typed by the String wrapper interface may be a wrapper object, whose `length` is
+        // its getter: the property read below.)
         const rk = this.builtinReceiverKind(node.expression);
-        if (rk === "array" || rk === "string" || this.lengthIsBuiltinNumber(node)) {
+        if ((rk === "array" || rk === "string" || this.lengthIsBuiltinNumber(node)) && !this.isStringWrapperTyped(node.expression)) {
           const base = this.lowerExpr(ctx, node.expression);
           const dst = this.newLocal(ctx, "primitive");
           if (rk === "array") {
@@ -11590,6 +11592,25 @@ class Exporter {
     return undefined;
   }
 
+  /** Whether the value's type is the String wrapper interface rather than the primitive string
+   *  (`v: String`, `new String(x)`): it may hold a wrapper object (lib/node/web/string_object.ts),
+   *  whose length and characters the primitive string paths do not read (`.length` read the
+   *  object's cell as a string's: 1152 for `new String("abc")`). The string methods take either. */
+  private isStringWrapperTyped(expr: ts.Expression): boolean {
+    try {
+      const F = ts.TypeFlags;
+      let t = this.checker.getTypeAtLocation(expr);
+      if (t.flags & F.Union) {
+        const members = (t as ts.UnionType).types.filter((m) => !(m.flags & (F.Undefined | F.Null | F.Void)));
+        if (members.length !== 1) return false;
+        t = members[0];
+      }
+      if (t.flags & (F.String | F.StringLiteral | F.TemplateLiteral | F.StringMapping)) return false;
+      const sym = t.getSymbol();
+      return !!sym && sym.name === "String" && this.isAmbientGlobalSymbol(sym);
+    } catch { return false; }
+  }
+
   /** Whether the non-nullish members of a union fall into more than one
    *  receiver kind (array, string, number, boolean, or a named builtin; any
    *  other object type counts as its own kind). */
@@ -14317,7 +14338,8 @@ class Exporter {
       // iterable (any, unknown, a union, a type parameter): the protocol is
       // chosen at run time (an array still walks by index).
       const forOfKind = this.builtinReceiverKind(stmt.expression);
-      if (this.forOfDynamicEnabled && forOfKind !== "array" && forOfKind !== "string") {
+      // (a value typed by the String wrapper interface may be a wrapper object: the protocol too)
+      if (this.forOfDynamicEnabled && ((forOfKind !== "array" && forOfKind !== "string") || (forOfKind === "string" && this.isStringWrapperTyped(stmt.expression)))) {
         this.lowerDynamicForOf(ctx, stmt.initializer, stmt.statement, stmt.expression);
         return;
       }

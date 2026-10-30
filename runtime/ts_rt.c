@@ -1999,6 +1999,7 @@ static void obj_link_fresh_proto(tsv obj, tsv proto){
    raises g_typed_slow (docs/foreign_receivers_design.md). */
 #if !TS_ISO_MODE
 int g_class_relinked = 0;
+uint32_t g_class_relink_epoch = 0;
 #endif
 static const uint32_t* g_class_index_tab = NULL;
 static uint32_t g_class_index_n = 0;
@@ -2028,15 +2029,35 @@ void ts_register_class_indices(const uint32_t* tab, uint32_t n){
   for (uint32_t c = 0; c < n; c++) if (tab[c]) g_class_of_word[tab[c]] = c + 1u;
   class_reg_by_word_reset();
 }
+/* Whether a chain from `link` on holds a class prototype, a sized instance or an exotic link (a
+   Proxy): something a class interval or a class's method table could have to account for. */
+static int chain_holds_class_part(tsv link){
+  for (int n = 0; ts_proto_ref(link); n++){
+    if (!ts_is_obj(link) || n > 4096) return 1;
+    const ts_object* p = (const ts_object*)ts_ptr(link);
+    if (chain_link_exotic(p) || p->cls == TS_CLS_PROTO || ts_obj_is_sized(p)) return 1;
+    link = p->proto;
+  }
+  return 0;
+}
 tsv ts_set_proto_user(tsv obj, tsv proto){
-  /* A sized instance relinked leaves its class's interval; a class's
-     prototype relinked changes its instances' chains
-     (docs/class_index_dispatch_design.md); other objects concern nobody. */
+  /* A sized instance relinked leaves its class's interval; a class's prototype relinked changes
+     its instances' chains (docs/class_index_dispatch_design.md), and so does the relink of any
+     object on such a chain. Every cache derived from a class's chain (the method caches, the trap
+     cache) holds for the relink epoch it was filled in. The intervals and the method tables of the
+     generated code stand while the class prototypes on every chain stay where the classes put
+     them: a root class's prototype (behind Object.prototype) relinked onto a chain of plain and
+     built-in prototypes keeps them there (the String wrapper's library class, behind
+     String.prototype, is the case: hono's `new String(...)`), any other relink of a class
+     prototype, or a prototype given a chain with a class part, raises g_class_relinked for good. */
   if (ts_is_obj(obj)){
     ts_object* o = (ts_object*)ts_ptr(obj);
     if (o->proto == proto) return obj;   /* no change of chain */
-    if (o->cls == TS_CLS_PROTO) g_class_relinked = 1;
-    else if (o->cls) o->cls |= TS_CLS_RELINKED;
+    if (obj_may_be_proto(obj) && g_class_relink_epoch < TS_RELINK_EPOCH_EXHAUSTED) g_class_relink_epoch++;
+    if (o->cls == TS_CLS_PROTO){
+      if (o->proto != g_object_proto_v || chain_holds_class_part(proto)) g_class_relinked = 1;
+    } else if (o->cls) o->cls |= TS_CLS_RELINKED;
+    else if ((o->h.flags & TS_HDR_IS_PROTO) && chain_holds_class_part(proto)) g_class_relinked = 1;
   }
   tsv r = ts_set_proto(obj, proto);
   if (!(g_typed_slow & TS_TYPED_SLOW_ANY) && !(g_has_proxies && ts_is_proxy(obj))) typed_slow_check_relink(obj, proto);
@@ -17435,13 +17456,15 @@ tsv ts_collection_method_dynamic(tsv recv, const char* name, tsv* args, int narg
    cache keyed by the class word and the method key that remembers the
    prototype object holding it, that object's shape word and the slot: a hit
    re-reads the slot, so a method replaced in place is followed, and a deleted
-   or redefined one changes the holder's shape and misses. A relinked
-   instance (its word carries the flag), a relinked prototype anywhere
-   (g_class_relinked), an accessor or a dictionary holder take the full
-   lookup. Anything else (a receiver that is not a sized instance) takes the
-   two cached reads the call made before. */
+   or redefined one changes the holder's shape and misses. An entry holds for
+   the relink epoch it was filled in (a relink of a prototype anywhere moves
+   it, ts_set_proto_user). A relinked instance (its word carries the flag), an
+   accessor or a dictionary holder take the full lookup. An own dynamic
+   property the instance holds a function in is remembered by its index in the
+   sidecar and its key (TS_MSIC_DYN). Anything else (a receiver that is not a
+   sized instance) takes the two cached reads the call made before. */
 static tsv prop_ic_read(tsv receiver, ts_pref p);
-typedef struct { uint32_t cls; ts_key key; uint32_t shape; uint32_t slot; tsv holder; } ts_method_cache_entry;
+typedef struct { uint32_t cls; ts_key key; uint32_t shape; uint32_t slot; tsv holder; uint32_t epoch; } ts_method_cache_entry;
 #define TS_METHOD_CACHE_SIZE 1024u
 static ts_method_cache_entry g_method_cache[TS_METHOD_CACHE_SIZE];
 tsv ts_method_lookup_sized(tsv recv, ts_key fkey, ts_key mkey, ts_prop_ic* field_ic, ts_prop_ic* proto_ic){
@@ -17460,9 +17483,9 @@ tsv ts_method_lookup_sized(tsv recv, ts_key fkey, ts_key mkey, ts_prop_ic* field
    properties reads the holder's slot. */
 static int sized_inherited_cached(ts_object* o, ts_key key, tsv* out){
   uint32_t w = o->cls;
-  if (w == 0u || (w & TS_CLS_RELINKED) || w == TS_CLS_PROTO || g_class_relinked) return 0;
+  if (w == 0u || (w & TS_CLS_RELINKED) || w == TS_CLS_PROTO) return 0;
   const ts_method_cache_entry* e = &g_method_cache[((w * 0x9E3779B1u) ^ prop_key_hash(key)) & (TS_METHOD_CACHE_SIZE - 1u)];
-  if (e->cls == w && e->key == key && e->holder){
+  if (e->cls == w && e->key == key && e->holder && e->epoch == g_class_relink_epoch){
     ts_object* h = (ts_object*)ts_ptr(e->holder);
     if (h->shape == e->shape){
       tsv v = *ts_obj_slot_ptr(h, e->slot);
@@ -17473,15 +17496,15 @@ static int sized_inherited_cached(ts_object* o, ts_key key, tsv* out){
 }
 static int sized_inherited_get(ts_object* o, ts_key key, tsv receiver, tsv* out){
   uint32_t w = o->cls;
-  if (!ts_obj_is_sized(o) || w == 0u || (w & TS_CLS_RELINKED) || w == TS_CLS_PROTO || g_class_relinked) return 0;
+  if (!ts_obj_is_sized(o) || w == 0u || (w & TS_CLS_RELINKED) || w == TS_CLS_PROTO) return 0;
   if (sized_inherited_cached(o, key, out)) return 1;
   ts_method_cache_entry* e = &g_method_cache[((w * 0x9E3779B1u) ^ prop_key_hash(key)) & (TS_METHOD_CACHE_SIZE - 1u)];
   for (ts_object* p = ts_next_proto(o); p; p = ts_next_proto(p)){
     if (chain_link_exotic(p) || p->h.kind == TS_KIND_FUNC) return lookup_prop_chain(receiver, p, key, out);
     ts_pref q = prop_find(p, key);
     if (pref_ok(q)){
-      if (!pref_is_accessor(q) && ts_obj_shape_id(p) != TS_SHAPE_NONE && p->h.gen == TS_GEN_OLD){
-        e->cls = w; e->key = key; e->shape = p->shape; e->slot = q.i; e->holder = ts_obj(p);
+      if (!pref_is_accessor(q) && ts_obj_shape_id(p) != TS_SHAPE_NONE && p->h.gen == TS_GEN_OLD && g_class_relink_epoch != TS_RELINK_EPOCH_EXHAUSTED){
+        e->cls = w; e->key = key; e->shape = p->shape; e->slot = q.i; e->holder = ts_obj(p); e->epoch = g_class_relink_epoch;
       }
       *out = prop_ic_read(receiver, q);
       return 1;
@@ -17495,7 +17518,7 @@ tsv ts_method_lookup_sized_fill(tsv recv, ts_key fkey, ts_key mkey, ts_prop_ic* 
   if (TS_TOP16(recv) == TS_SEL_OBJECT){
     ts_object* o = (ts_object*)ts_ptr(recv);
     uint32_t w = o->cls;
-    if (ts_obj_is_sized(o) && w != 0u && !(w & TS_CLS_RELINKED) && w != TS_CLS_PROTO && !g_class_relinked && !(g_has_proxies && ts_is_proxy(recv))){
+    if (ts_obj_is_sized(o) && w != 0u && !(w & TS_CLS_RELINKED) && w != TS_CLS_PROTO && !(g_has_proxies && ts_is_proxy(recv))){
       size_t off; int numeric; int has_field = 0;
       const ts_class_word_cache_entry* fe = ts_class_word_cache_entry_for(o, fkey);
       if (fe ? fe->found : (g_has_class_regs && class_field_lookup(o, fkey, &off, &numeric))){
@@ -17510,17 +17533,25 @@ tsv ts_method_lookup_sized_fill(tsv recv, ts_key fkey, ts_key mkey, ts_prop_ic* 
       }
       if (((ts_sized_head*)o)->dyn){
         ts_pref p = prop_find(o, fkey);
-        if (pref_ok(p)){ tsv v = prop_ic_read(recv, p); if (ts_is_callable(v)) return v; }
+        if (pref_ok(p)){
+          /* an own property shadows the prototype's method whatever it holds (a value that is not
+             a function makes the call a TypeError, as in JS); a function there (hono's router
+             assigns its matcher to `this.match`) is remembered by the site: its index in the
+             sidecar under the class word, checked by the key */
+          tsv v = prop_ic_read(recv, p);
+          if (ts_is_callable(v) && sic && !has_field && !pref_is_accessor(p)){ sic->cls = w; sic->kind = TS_MSIC_DYN; sic->slot = p.i; sic->key = fkey; sic->holder_shape = 0u; sic->holder = 0; }
+          return v;
+        }
       }
       if (has_field) sic = NULL;   /* a field of the method's name may shadow later: no site cache */
       uint32_t slot = ((w * 0x9E3779B1u) ^ prop_key_hash(mkey)) & (TS_METHOD_CACHE_SIZE - 1u);
       ts_method_cache_entry* e = &g_method_cache[slot];
-      if (e->cls == w && e->key == mkey && e->holder){
+      if (e->cls == w && e->key == mkey && e->holder && e->epoch == g_class_relink_epoch){
         ts_object* h = (ts_object*)ts_ptr(e->holder);
         if (h->shape == e->shape){
           tsv v = *ts_obj_slot_ptr(h, e->slot);
           if (!is_accessor(v)){
-            if (sic){ sic->cls = w; sic->kind = 0u; sic->holder = e->holder; sic->holder_shape = e->shape; sic->slot = e->slot; }
+            if (sic){ sic->cls = w; sic->kind = 0u; sic->holder = e->holder; sic->holder_shape = e->shape; sic->slot = e->slot; sic->epoch = e->epoch; }
             return v;
           }
         }
@@ -17533,9 +17564,9 @@ tsv ts_method_lookup_sized_fill(tsv recv, ts_key fkey, ts_key mkey, ts_prop_ic* 
         ts_pref q = prop_find(p, fkey);
         if (!pref_ok(q)) q = prop_find(p, mkey);
         if (pref_ok(q)){
-          if (!pref_is_accessor(q) && ts_obj_shape_id(p) != TS_SHAPE_NONE){
-            e->cls = w; e->key = mkey; e->shape = p->shape; e->slot = q.i; e->holder = ts_obj(p);
-            if (sic){ sic->cls = w; sic->kind = 0u; sic->holder = ts_obj(p); sic->holder_shape = p->shape; sic->slot = q.i; }
+          if (!pref_is_accessor(q) && ts_obj_shape_id(p) != TS_SHAPE_NONE && g_class_relink_epoch != TS_RELINK_EPOCH_EXHAUSTED){
+            e->cls = w; e->key = mkey; e->shape = p->shape; e->slot = q.i; e->holder = ts_obj(p); e->epoch = g_class_relink_epoch;
+            if (sic){ sic->cls = w; sic->kind = 0u; sic->holder = ts_obj(p); sic->holder_shape = p->shape; sic->slot = q.i; sic->epoch = g_class_relink_epoch; }
           }
           return prop_ic_read(recv, q);
         }
@@ -18043,7 +18074,7 @@ static inline ts_sized_absent_entry* sized_absent_slot(uint32_t w, ts_key key){
    line for an instance without dynamic properties) */
 static inline int sized_absent_cached_core(const ts_object* o, ts_key key){
   uint32_t w = o->cls;
-  if (w == 0u || (w & TS_CLS_RELINKED) || w == TS_CLS_PROTO || g_class_relinked) return 0;
+  if (w == 0u || (w & TS_CLS_RELINKED) || w == TS_CLS_PROTO) return 0;   /* a relink moves the addition epoch */
   const ts_sized_absent_entry* e = sized_absent_slot(w, key);
   if (e->cls != w || e->key != key || e->epoch != g_prop_add_epoch) return 0;
   const ts_object* p = o;
@@ -18063,7 +18094,7 @@ static int sized_absent_cached(ts_object* o, ts_key key){
 }
 static void sized_absent_fill(ts_object* o, ts_key key){
   uint32_t w = o->cls;
-  if (w == 0u || (w & TS_CLS_RELINKED) || w == TS_CLS_PROTO || g_class_relinked) return;
+  if (w == 0u || (w & TS_CLS_RELINKED) || w == TS_CLS_PROTO) return;
   if (!g_negative_pic || key >= TS_USERSYM_KEY_BASE || !prop_epoch_live()) return;
   uint32_t chain_shape[3]; uint32_t depth = 0;
   for (ts_object* p = ts_next_proto(o); p; p = ts_next_proto(p)){
@@ -18807,17 +18838,18 @@ static int proxy_trap_index(const char* name){
    changes it; a replaced value in the same slot is read as it is now). The handler's identity is
    the cell's bits: a dead handler whose cell another object of the same class took reads the
    trap that class's chain holds, which is that object's trap too. The holder is an
-   old-generation class prototype (the fill takes no other), so it never moves. */
-typedef struct { tsv handler; tsv holder; uint32_t word; uint32_t holder_shape; uint32_t slot; } ts_trap_cache_entry;
+   old-generation class prototype (the fill takes no other), so it never moves. An entry holds for
+   the relink epoch it was filled in. */
+typedef struct { tsv handler; tsv holder; uint32_t word; uint32_t holder_shape; uint32_t slot; uint32_t epoch; } ts_trap_cache_entry;
 static ts_trap_cache_entry g_trap_cache[TS_PROXY_TRAPS];
 static ts_key proxy_trap_key(const char* name){
   int i = proxy_trap_index(name);
   return i >= 0 ? g_trap_keys[i] : ts_intern_field(name, (uint32_t)strlen(name));
 }
 static tsv proxy_trap_cached(tsv handler, int ti){
-  if (ti < 0 || g_class_relinked) return TS_UNDEFINED;
+  if (ti < 0) return TS_UNDEFINED;
   const ts_trap_cache_entry* e = &g_trap_cache[ti];
-  if (e->handler != handler) return TS_UNDEFINED;
+  if (e->handler != handler || e->epoch != g_class_relink_epoch) return TS_UNDEFINED;
   ts_object* h = (ts_object*)ts_ptr(handler);
   tsv trap;
   if (e->holder){
@@ -18832,7 +18864,7 @@ static tsv proxy_trap_cached(tsv handler, int ti){
   return (ts_is_func(trap) && !is_accessor(trap)) ? trap : TS_UNDEFINED;
 }
 static void proxy_trap_fill(tsv handler, int ti, ts_key key){
-  if (ti < 0 || g_class_relinked || TS_TOP16(handler) != TS_SEL_OBJECT) return;
+  if (ti < 0 || g_class_relink_epoch == TS_RELINK_EPOCH_EXHAUSTED || TS_TOP16(handler) != TS_SEL_OBJECT) return;
   ts_object* h = (ts_object*)ts_ptr(handler);
   if (h->h.kind != TS_KIND_OBJECT) return;
   ts_trap_cache_entry* e = &g_trap_cache[ti];
@@ -18844,7 +18876,7 @@ static void proxy_trap_fill(tsv handler, int ti, ts_key key){
       ts_pref q = prop_find(p, key);
       if (pref_ok(q)){
         if (pref_is_accessor(q) || ts_obj_shape_id(p) == TS_SHAPE_NONE || p->h.gen != TS_GEN_OLD) return;
-        e->handler = handler; e->holder = ts_obj(p); e->word = w; e->holder_shape = p->shape; e->slot = q.i;
+        e->handler = handler; e->holder = ts_obj(p); e->word = w; e->holder_shape = p->shape; e->slot = q.i; e->epoch = g_class_relink_epoch;
         return;
       }
     }
@@ -18853,7 +18885,7 @@ static void proxy_trap_fill(tsv handler, int ti, ts_key key){
   if (!obj_shaped(h)) return;
   ts_pref q = prop_find(h, key);
   if (!pref_ok(q) || pref_is_accessor(q)) return;
-  e->handler = handler; e->holder = 0; e->word = h->shape; e->holder_shape = 0; e->slot = q.i;
+  e->handler = handler; e->holder = 0; e->word = h->shape; e->holder_shape = 0; e->slot = q.i; e->epoch = g_class_relink_epoch;
 }
 /* The trap lookup: `ts_proxy_trap(pv, handler, "get")` at a call site resolves the name's index once
    (a static per site; the names are literals), so the lookup is the cache probe alone. */

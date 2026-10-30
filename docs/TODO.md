@@ -12256,3 +12256,61 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   - Also waiting: an uncommitted port of Node's util.inspect layout from the previous session
     (`build/wt360`, a worktree at 910d035: `runtime/inspect.c`, 1,441 lines, the Error form
     included; its state unverified).
+- Resumed (Kaz: 「再開して」). The relink flag behind hono's slow class method calls, fixed
+  (`runtime/ts_rt.c` `ts_set_proto_user`, the class caches): `lib/node/web/string_object.ts` relinks
+  `StringObject.prototype` onto `String.prototype` at its module's start, and the sticky
+  `g_class_relinked` it raised turned off, for every program that writes `new String(...)` (hono's
+  `utils/html.ts`: every hono program), the site caches' prototype hits, `g_method_cache`, the
+  inherited-read cache, the trap cache, and the generated vtable calls and interval `instanceof`.
+  (1) The runtime's chain-derived caches hold for the relink epoch they were filled in
+  (`g_class_relink_epoch`, an isolate field in TS_ISO_MODE: moved by the relink of an object that
+  may be a prototype, saturating at TS_RELINK_EPOCH_EXHAUSTED where nothing is filled any more);
+  the absent-read cache keeps the addition epoch, which ts_set_proto moves on every relink. (2)
+  The sticky flag, which the generated code's interval tests read, rises only when the class
+  prototypes on some chain can change: a class prototype whose prototype was not Object.prototype,
+  or onto a chain holding a class prototype, a sized instance or an exotic link; a prototype (any
+  object that has been one) given such a chain. A root class's prototype put behind plain or
+  built-in prototypes keeps every class's interval and method table (only built-ins follow the
+  root, which the tables do not resolve). (3) A site cache kind for an own dynamic property of a
+  class instance holding a function (`TS_MSIC_DYN`: the sidecar index and key; hono's routers assign
+  `this.match`), and an own property shadows the prototype's method whatever it holds: a value that
+  is not a function made the call fall through to the prototype's method (a silent miscompile;
+  V8 throws the TypeError). The generated sites' five-member initializer is unchanged (the new
+  members follow). Fixture `classes/relink_epoch` (the String wrapper with vtable calls and
+  intervals, a root class behind a plain object after the caches were filled, that object given a
+  class prototype, a root class behind another class's prototype, an own function property
+  replaced, deleted, re-added at another index, turned into an accessor and into a number, the
+  prototype method replaced). The RegExpRouter-only driver (10 M matches, plain): 708 -> 647 ms.
+- The String wrapper's `.length` and `for..of` read a wrapper object as a primitive string: a
+  value typed by the `String` interface (`new String(v)`, `v: String`) took `StringLen`, which read
+  the object's cell (`new String("abc").length` was 1152), and the primitive's index walk. The
+  exporter (`isStringWrapperTyped`) sends such a `.length` to the property read (the wrapper's
+  getter; a primitive answers it too) and the `for..of` to the run-time protocol; the string methods
+  already took either. Fixture `web/string_object` extended (typed wrappers and primitives).
+- Gates (the runner `build/gates_s360/run.sh`): unit, bundler 53/53, conformance plain and strict
+  700/700, protect 697/697, bench (all correct and within budget), the `ci` gate, the GC gate
+  (GC-STRESS PASSED, 581 s), the hono survey 42/43, ir-parity (only the two fixtures differ: the
+  snapshot refreshed). r20 against r19, alternating rounds (medians; outputs identical): the plain
+  hono routers TrieRouter 250.4 -> 248.9 ms, RegExpRouter 63.6 -> 63.6, PatternRouter 241.3 ->
+  241.0, SmartRouter 72.4 -> 66.3 (its `this.match` is a bound function on the instance);
+  **hono_app 167.1 -> 155.8 ms, Node 155.2 in the same run: hono_app at Node's speed**; vue
+  1,056.1 -> 1,057.9; tsc-ts instructions 1.0000, cycles 0.9953.
+- The regexp DFA (Kaz's proposal: a DFA built just in time for the regular part of a pattern),
+  built and measured (docs/regexp_dfa_design.md, "Measured"): the NFA at compile, a one-pass DFA at
+  the first exec with the captures in its transitions; the engine diff 0 differ with 10,164 cases
+  on the DFA; on the RegExpRouter 46% slower than the interpreter at the same instruction count
+  (a chain of dependent loads per character, where the interpreter takes literal runs a word at a
+  time, `[^/]+` in a tight loop and the alternatives by their first character). Not merged; kept on
+  the local branch `attic/regexp-dfa-d1`.
+- The route tier (Kaz: exploit the RegExpRouter's shape, every route in one regexp): a pattern of
+  hono's shape matched as its route trie (a node's alternatives by the next byte, literal runs
+  compared at once, a parameter to the next `/`, the backtracking order kept), verified against V8
+  with random route tables built the way hono builds them (`tests/regexp/route_cases.mjs`, 744
+  cases) and 0 differ. A hand-written trie for the benchmark's regexp ran at 4 ns against the
+  interpreter's 21, but the data-driven matcher at 18: the speed was the specialized code's, which
+  is the native tier's job (R9). In the benchmark the matcher's instructions overlap the rest
+  (IPC about 7): -3.3% instructions, -1% cycles. Not merged; kept on `attic/regexp-route-tier`
+  (the case generator stays in the engine diff). What the shape does show: every match resets and
+  copies a capture register pair per group of every route and builds a result array with an
+  element per group, so a match's cost grows with the application's route count (1,400 groups at
+  800 routes: about 150 ns a match, mostly that); V8 builds the same array.
