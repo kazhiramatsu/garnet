@@ -24441,6 +24441,10 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 ),
                 // ---- WeakMap ----
                 "weakmap.set" => (format!("ts_weakmap_set({}, {}, {})", r, v(0), v(1)), false),
+                // the indexed weak map's identity probe in line (ts_rt.h ts_weakmap_get_ref; a key that
+                // is not an object or function, or a map still linear, takes the general entry)
+                "weakmap.get" if map_key_inline_enabled() => (format!("ts_weakmap_get_ref({}, {})", r, v(0)), false),
+                "weakmap.has" if map_key_inline_enabled() => (format!("ts_bool(ts_weakmap_has_ref({}, {}))", r, v(0)), false),
                 "weakmap.get" => (format!("ts_weakmap_get({}, {})", r, v(0)), false),
                 "weakmap.has" => (format!("ts_bool(ts_weakmap_has({}, {}))", r, v(0)), false),
                 "weakmap.delete" => (format!("ts_bool(ts_weakmap_delete({}, {}))", r, v(0)), false),

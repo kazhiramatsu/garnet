@@ -3139,6 +3139,13 @@ class Exporter {
     if (slot.kind === "cell") return this.availableCaptureCell(ctx, slot.sym);
     return this.availableRecord(ctx, slot.owner);
   }
+  /** Whether supplySlot would supply the slot (no instruction emitted). */
+  private slotSuppliable(ctx: FnCtx, slot: CaptureSlot): boolean {
+    if (slot.kind === "value") return ctx.localOfSymbol.has(slot.sym);
+    if (slot.kind === "cell") return ctx.cellAccess.has(slot.sym) || this.moduleCellGlobal.has(slot.sym);
+    return ctx.recordLocals?.has(slot.owner) === true ||
+      (slot.owner === this.moduleInitNode && this.moduleCtxGlobal !== undefined);
+  }
   /** Supply a capture slot strictly from what this function holds (ctor paths). */
   private heldSlot(ctx: FnCtx, slot: CaptureSlot): number | undefined {
     if (slot.kind === "value") return ctx.localOfSymbol.get(slot.sym);
@@ -7026,9 +7033,16 @@ class Exporter {
       const hasSpread = node.arguments.some((a) => ts.isSpreadElement(a));
       if (callee.kind === "Direct" && recv === undefined) {
         const target = this.fnNodeById(callee.func);
-        const unavailable = target && this.sortedFreeVars(target as FnLike).some((s) =>
-          !this.hasCaptured(ctx, s) && !this.moduleCellGlobal.has(s) &&
-          !(this.valueBindings.has(s) && ctx.localOfSymbol.has(s)));
+        // Unavailable: a capture slot of the target (a cell, a scope record, a value) this caller
+        // cannot supply. A record the caller holds is supplied whole, so a module-level `const f = () =>`
+        // reading another binding of its module is called directly from a caller that holds the
+        // module's record for other bindings (vue's `isIntegerKey` reading `isString`), where the
+        // per-binding test made a closure at every call (docs/alloc_fast_path_design.md, "Calls to module-level const functions").
+        const unavailable = target && (process.env.TSAOT_SLOT_DIRECT === "0"
+          ? this.sortedFreeVars(target as FnLike).some((s) =>
+              !this.hasCaptured(ctx, s) && !this.moduleCellGlobal.has(s) &&
+              !(this.valueBindings.has(s) && ctx.localOfSymbol.has(s)))
+          : this.captureSlots(this.sortedFreeVars(target as FnLike)).some((slot) => !this.slotSuppliable(ctx, slot)));
         // Fixed-ABI helpers may not hold every module cell. The already-created
         // function value carries the environment. It also supplies captured
         // arguments and `this` correctly when the call has a spread list.

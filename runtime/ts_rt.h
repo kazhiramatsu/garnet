@@ -3487,6 +3487,26 @@ TS_RT_ALWAYS_INLINE int ts_map_has_ref(tsv mv, tsv k){
   if (TS_RT_LIKELY(ts_map_probe_ref(mv, k, &i))) return i >= 0;
   return ts_map_has(mv, k);
 }
+/* WeakMap.get / WeakMap.has with an object or function key (vue's targetMap and proxy maps on
+   every reactive read): the indexed weak map's identity probe in line, as a Map's by reference;
+   anything else (not a WeakMap, a map still linear, a symbol key) takes the general entry. */
+TS_RT_ALWAYS_INLINE int ts_weakmap_probe_ref(tsv mv, tsv k, long* out){
+  if (TS_RT_UNLIKELY(!ts_is_obj(mv) || !(ts_is_obj(k) || ts_is_func(k)))) return 0;
+  ts_map* m = (ts_map*)ts_ptr(mv);
+  if (TS_RT_UNLIKELY(m->o.h.kind != TS_KIND_MAP || !m->weak || !m->index)) return 0;
+  ts_mapset_probe_inline(m->index, m->index_cap, m->keys, k, ts_ref_hash(k), 1, out);
+  return 1;
+}
+TS_RT_ALWAYS_INLINE tsv ts_weakmap_get_ref(tsv mv, tsv k){
+  long i;
+  if (TS_RT_LIKELY(ts_weakmap_probe_ref(mv, k, &i))) return i >= 0 ? ((ts_map*)ts_ptr(mv))->vals[i] : TS_UNDEFINED;
+  return ts_weakmap_get(mv, k);
+}
+TS_RT_ALWAYS_INLINE int ts_weakmap_has_ref(tsv mv, tsv k){
+  long i;
+  if (TS_RT_LIKELY(ts_weakmap_probe_ref(mv, k, &i))) return i >= 0;
+  return ts_weakmap_has(mv, k);
+}
 /* Set.has with a key the program types as a string or as a reference: the
    indexed set's probe in line, as for Maps. */
 TS_RT_ALWAYS_INLINE int ts_set_probe_str(tsv sv, tsv k, long* out){

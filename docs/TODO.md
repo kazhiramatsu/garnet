@@ -12416,3 +12416,32 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   220.6 -> 208.8, SmartRouter 55.4 -> 54.2, RegExpRouter 54.3 -> 53.7, PatternRouter 232.6 -> 237.3
   in the four-router driver and unchanged alone (6.587 G instructions both), hono_app 150.0 -> 149.3
   (Node 154.5), tsc-ts instructions 1.0010, cycles 0.9906.
+- vue's remaining gap after the string slice: 1,020 against about 755 ms (reactivity 685 / 525, the
+  compiler 355 / 227). In the reactivity phase, calls to `@vue/shared`'s helpers made a closure at
+  every call (141 sites in vue's C): a module-level `const f = (...) => ...` that reads another binding
+  of its own module (`isIntegerKey` reads `isString`) was called directly only when the caller had
+  captured each of the callee's free bindings by name, and a caller in another module holds the
+  module's scope record for its own imports but not the name `isString`; the fallback made the
+  function cell on the stack, set its name and arity by a call, and called the generic entry with an
+  arguments array. The test now asks whether each capture slot (a value, a cell, a record the caller
+  holds or the module's global record) can be supplied (`slotSuppliable`), which is what the direct
+  call's cell arguments pass (`TSAOT_SLOT_DIRECT=0` keeps the per-name test): 141 -> 90 call-site
+  closures (the rest are callbacks), the reactivity phase 675 -> 660 ms. WeakMap.get / has with an
+  object or function key probe the indexed weak map in line (`ts_weakmap_get_ref`; a Map's probe
+  refuses a weak map, as Map.prototype.get on one throws, and this one refuses a Map): 660 -> 650 ms.
+  Bundler case `const_arrow_capture`. docs/alloc_fast_path_design.md, "Calls to module-level const
+  functions". Gates (`build/gates_s360f/run.sh`, r25 against r24): unit, bundler 54/54, conformance
+  plain and strict 702/702, protect 699/699, bench, ci, ir-parity (4 fixtures: value calls through
+  made closures become direct calls, builtin_const_aliases 26 closures -> 8; snapshot refreshed, 4,373
+  identical), the engine diff in both modes, the GC gate, the hono survey 42/43. vue 1,017.3 -> 991.8
+  ms (Node 748.9 in the same run), hono_app 148.6 -> 147.0 (Node 153.7), the hono routers and tsc-ts
+  unchanged (instructions 1.0000).
+- Found while writing that case, both before this change (main's compiler gives the same): a
+  module-level `const` read before its declaration has run does not throw. (1) `const prefix = "p:"`
+  used as `${prefix}${s}` in a function the module calls before the declaration: the template folds
+  the literal, so the call reads "p:"; (2) with an initializer that does not fold
+  (`String.fromCharCode(112) + ":"`) the call reads undefined. V8 throws a ReferenceError (the TDZ).
+  The call sites of an imported function binding test it (`ts_throw_uninitialized`); a captured
+  module binding read inside a function does not, and undefined cannot be the test there (a binding
+  may hold undefined). Not fixed: it needs a TDZ sentinel for module bindings, or a proof that the
+  read follows the initialization.

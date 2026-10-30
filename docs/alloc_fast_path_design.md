@@ -210,6 +210,30 @@ in-line allocation (A), then with the short slice and the barriers' exits
 | an eight-unit slice into the ring | 434.7 / 55.0 | 434.6 / 56.1 | 269.3 / 34.3 | 7.55 | 6.84 |
 | a closure into the ring | 309.9 / 41.4 | 308.9 / 40.7 | 283.8 / 36.2 | 8.31 | 7.76 |
 
+## Calls to module-level const functions
+
+A module-level `const f = (...) => ...` is called directly when the
+caller can supply its captures (`TSAOT_CONST_FN_DIRECT`). The test asked
+whether the caller had captured each free binding of the callee by name.
+A callee that reads another binding of its own module (vue's
+`isIntegerKey` reads `isString`) captures that module's scope record,
+and a caller in another module holds the same record for the bindings
+it imports, but not the name `isString`. Such a call made a closure on
+the stack and called it through the value path: the function cell
+built, its name and arity set by a call, and the generic entry with an
+arguments array. The test now asks whether each capture slot can be
+supplied (`slotSuppliable`: a value, a cell, or a record the caller
+holds or the module's global record), which is what the direct call's
+cell arguments then pass. vue made 141 such closures at call sites and
+makes 90 now (the rest are callbacks); its reactivity phase ran 675 ->
+660 ms. `TSAOT_SLOT_DIRECT=0` keeps the per-name test. Bundler case
+`const_arrow_capture`.
+
+WeakMap.get and WeakMap.has with an object or function key probe the
+indexed weak map in line (`ts_weakmap_get_ref`), as a Map with a
+reference key does; vue reads its target and proxy maps on every
+reactive access (reactivity phase 660 -> 650 ms).
+
 ## Next
 
 - The kernels above were built without a tsconfig, so the strict type
