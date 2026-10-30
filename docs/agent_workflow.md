@@ -157,6 +157,13 @@ Principle: **measurement over theory**. Minimal reproduction → a probe that pi
    **fflush is mandatory for stderr** (otherwise it's lost, unflushed, before the crash).
 7. **Read the generated C**: `./garnet -c -o /tmp/x.c x.ts`, then `awk '/static tsv fn_0_main/,/^}/' /tmp/x.c`.
    You can see FrameArena/Stack/Heap alloc-site annotations, the AllocObject location of a cell, the env of ts_call, and so on.
+8. **Where a real project trails V8, per JS function**: sample the native run (`sample <pid> 2 1 -f run.txt`, a few
+   runs) and attribute every sample to its innermost compiled function, the runtime it calls included
+   (`scripts/sample_js_functions.py run*.txt`); profile the same workload under Node (`node --cpu-prof
+   --cpu-prof-dir=DIR --cpu-prof-interval 250 <driver>.mjs`, then `scripts/node_cpuprof_functions.py DIR/*.cpuprofile`).
+   The functions with the largest ratio are the targets: Session 360 found vue's `getLoc` at six times V8's time
+   (an object literal whose layout stopped at a conditional value), which a flat runtime profile spread
+   across `ts_set_pic` and the property-map functions.
 
 ---
 
