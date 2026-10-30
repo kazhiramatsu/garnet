@@ -12347,3 +12347,51 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   allocation; the conservative roots' allocation bits (the generated main turns the roots on) set
   in a batch per collection cost more than they saved (a chain of read-modify-writes on the
   bitmap's words): the young cells are to be validated by the runs' records instead.
+- The young allocation's fast path (docs/alloc_fast_path_design.md), Kaz's 「割り当て作法にそこまで差が
+  あるのなら全体的に汎用的な高速化が可能なはずです。探してください」. A class instance's allocation was
+  110-130 instructions (two calls, the five-load budget test, the class looked up at run time, four
+  counters, the conservative-roots bit as a read-modify-write, the header byte by byte); V8's is a bump
+  and a limit.
+  - The runtime: a young size class bumps below its limit, the run's end or where its grant of the
+    collection budget runs out. A grant (at most 64 KB) spans runs, since a compile's young runs average
+    a few cells (tsc-ts: 1.08 M runs, 58% a single cell, the gaps its in-place survivors leave) and
+    counting and running the triggers per run cost what the bumps saved. The slow path closes the run's
+    cells (their allocation bits set as a range, a word per 64 granules; their bytes pending) and, when
+    the grant is spent, counts the pending bytes (the cells by a reciprocal multiply: the slow path has
+    no division), runs the triggers and takes a new grant. A collection closes and counts every class
+    before it scans. A payload crossing its budget, or an ArrayBuffer crossing the full threshold, forces
+    every limit; the debug modes take the slow path at every allocation. Measured and dropped: a bit per
+    cell set in a batch (+29% on the allocation kernel); young cells validated by run records (tsc-ts
+    +1.7% instructions: 17,728 records in a cycle, 51.6 M walked by the stack scan); skipping gaps under
+    four cells (refills -76%, RSS +22 MB, no cycles). The young bytes now count the footprint (the arrays
+    kernel's young collections 250 -> 269; tsc-ts 93 -> 92 with the grants' lateness).
+  - The generated code: a class instance, an array literal whose elements fit in the cell and an object
+    literal of a resolved layout are allocated in line at their site (`ts_new_sized_site_in`,
+    `ts_new_array_lit4_site_in`, `ts_new_array_lit_site_in`, `ts_new_object_layout_site_in`): the bump,
+    the header word through the header helpers, the prefix, the site's count. A tenured site, a first
+    layout, a class without fields, an exhausted run or grant take the runtime's call, whose result is
+    assumed an object so the constructor's receiver tests fold. `TSAOT_INLINE_ALLOC=0` calls the runtime.
+    The size classes, the site table and the Array and Object prototypes are exported to the header; the
+    four helpers joined the inline-policy gate's list; the default-opts gate accepts the in-line site.
+  - The short string slice (under 13 units) in one cell, copied by word moves, the source's ASCII flag
+    kept; the barriers' remembered exits in line (an old array whose slot's card is dirty, a remembered
+    sized instance).
+  - Kernels (ns per iteration, Node in parentheses; before this work every one was 1.4 to 2.8 times
+    Node): a class instance to a module variable 1.53 (4.44), 45 instructions where it was 225; `[i, i +
+    1]` into a ring of 1024 4.32 (5.48); an eleven-element literal into the ring 6.94 (7.89); `{a, b}`
+    into the ring 5.66 (4.31); a class instance into the ring 6.20 (4.26), 3.49 under a strict tsconfig
+    (the class hint reads the field); an eight-unit slice 7.55 (6.84); a closure 8.31 (7.76).
+  - Gates (`build/gates_s360d/run.sh`, r23 against r21): unit, bundler 53/53, conformance plain and
+    strict 701/701 (the new `gc/inline_alloc.ts`: the in-line kinds, runs and collections crossed, sites
+    tenured at run time), protect 698/698, bench, ci (rerun after the default-opts gate's pattern),
+    ir-parity identical (4,364 after the snapshot took the new fixture), the engine diff 44,337 cases 0
+    differ in both modes, the GC gate, the hono survey 42/43. Alternating rounds, medians, outputs
+    identical: TrieRouter 248.7 -> 221.2 ms (-11.1%), RegExpRouter 56.9 -> 54.3, PatternRouter 246.0 ->
+    234.0, SmartRouter 58.1 -> 55.8; **hono_app 154.2 -> 150.0 ms (Node 155.0 in the same run: garnet
+    4% ahead)**; vue 1,059.8 -> 1,043.3; tsc-ts instructions 0.9954, cycles 1.0029 (the noise floor of
+    an A against itself 0.1%; earlier runs +0.14 to +0.37%), RSS 646 -> 641 MB. tsc-ts gains little: its
+    hot allocations are at tenured sites, and 5,053 sites in line grew the binary 44.1 -> 45.0 MB.
+  - Next: object literals' stores (each `ts_lit_store` tests the shape and the barrier; the layout's
+    shape tested once and young, as the integer slots already do, would store directly), closures (the
+    cell, the environment payload, then the name and arity in a second call), anonymous object types'
+    reads through the sized cache (no static slot hint without a named type).

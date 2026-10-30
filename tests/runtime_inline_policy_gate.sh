@@ -142,6 +142,10 @@ while IFS= read -r name; do
     ts_set_has_str | \
     ts_set_has_ref | \
     ts_eq_num | \
+    ts_new_sized_site_in | \
+    ts_new_array_lit4_site_in | \
+    ts_new_array_lit_site_in | \
+    ts_new_object_layout_site_in | \
     ts_map_has_num) ;;
     *)
       echo "[runtime-inline] FAIL: unexpected always-inline runtime helper $name"

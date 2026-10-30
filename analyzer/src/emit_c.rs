@@ -11624,6 +11624,14 @@ fn stack_check_enabled() -> bool {
     })
 }
 
+/// TSAOT_INLINE_ALLOC=0: a class instance or a short array literal at a site
+/// is allocated by the runtime's call, not by the header's in-line bump
+/// (docs/alloc_fast_path_design.md, "In the generated code"); the A/B knob.
+fn inline_alloc_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| !matches!(std::env::var("TSAOT_INLINE_ALLOC").as_deref(), Ok("0") | Ok("false") | Ok("no") | Ok("off")))
+}
+
 /// Function-scope declarations of the stack cells of a body: the `ts_func`
 /// (and environment array) of every closure site with the `Stack` strategy
 /// and the struct of every class-instance site with it. Declared in the
@@ -22091,7 +22099,8 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                             // time (docs/site_pretenuring_design.md); the
                             // runtime stores the prototype with the barrier an
                             // old cell needs
-                            let _ = writeln!(s, "  {} = ts_new_sized_site(sizeof({}), {}u, {});", dst_name, cn, id, proto_expr);
+                            let f = if inline_alloc_enabled() { "ts_new_sized_site_in" } else { "ts_new_sized_site" };
+                            let _ = writeln!(s, "  {} = {}(sizeof({}), {}u, {});", dst_name, f, cn, id, proto_expr);
                             // the typed pointer lives in a block of its own: a local allocated at two
                             // sites of one function (hono's ssg, an async body resumed) would declare
                             // it twice in one C scope
@@ -22152,11 +22161,21 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         let int_layout = kinds.iter().any(|k| *k != 0);
                         let close = if int_layout { "" } else { "\n  }" };
                         if let Some(sid) = alloc_site_id(site.0, st) {
-                            let _ = writeln!(
-                                s,
-                                "  {} = ts_new_object_layout_site(&_ts_lit_{}, {}u); /* site {} {:?} layout */{}",
-                                ctx.vname(dst.0), id, sid, site.0, st, close
-                            );
+                            if inline_alloc_enabled() {
+                                // the young bump in line (docs/alloc_fast_path_design.md)
+                                let kinds_arg = if int_layout { format!("_ts_lkk_{}", id) } else { "NULL".to_string() };
+                                let _ = writeln!(
+                                    s,
+                                    "  {} = ts_new_object_layout_site_in(&_ts_lit_{}, {}u, {}, {}u); /* site {} {:?} layout */{}",
+                                    ctx.vname(dst.0), id, keys.len(), kinds_arg, sid, site.0, st, close
+                                );
+                            } else {
+                                let _ = writeln!(
+                                    s,
+                                    "  {} = ts_new_object_layout_site(&_ts_lit_{}, {}u); /* site {} {:?} layout */{}",
+                                    ctx.vname(dst.0), id, sid, site.0, st, close
+                                );
+                            }
                         } else {
                             let alloc = if st == AllocStrategy::PretenuredHeap {
                                 "ts_new_object_layout_pretenured"
@@ -22261,7 +22280,13 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         regs.push("TS_ARRAY_HOLE".to_string());
                     }
                     let call = match alloc_site_id(site.0, st) {
-                        Some(sid) => format!("ts_new_array_lit4_site({}u, {}, {}u)", n, regs.join(", "), sid),
+                        Some(sid) => format!(
+                            "{}({}u, {}, {}u)",
+                            if inline_alloc_enabled() { "ts_new_array_lit4_site_in" } else { "ts_new_array_lit4_site" },
+                            n,
+                            regs.join(", "),
+                            sid
+                        ),
                         None if st == AllocStrategy::PretenuredHeap => format!("ts_new_array_lit4_pretenured({}u, {})", n, regs.join(", ")),
                         None => format!("ts_new_array_lit4({}u, {})", n, regs.join(", ")),
                     };
@@ -22272,7 +22297,12 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     return;
                 }
                 let call = match alloc_site_id(site.0, st) {
-                    Some(sid) => format!("ts_new_array_lit_site({}u, _al, {}u)", n, sid),
+                    Some(sid) => format!(
+                        "{}({}u, _al, {}u)",
+                        if inline_alloc_enabled() { "ts_new_array_lit_site_in" } else { "ts_new_array_lit_site" },
+                        n,
+                        sid
+                    ),
                     None if st == AllocStrategy::PretenuredHeap => format!("ts_new_array_lit_pretenured({}u, _al)", n),
                     None => format!("ts_new_array_lit({}u, _al)", n),
                 };

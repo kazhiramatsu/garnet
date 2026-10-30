@@ -612,7 +612,7 @@ __attribute__((noinline)) static int cr_sum(tsv arr){
 }
 static int g_cr_results[4];
 __attribute__((noinline)) static void test_conservative_roots(void){
-  g_conservative_roots = 1;
+  ts_gc_set_conservative_roots(1);
   ts_key kv = ts_intern_field("v", 1);
   tsv keep = ts_new_array(0);          /* never rooted: a register or a stack word */
   tsv other = ts_new_object();
@@ -636,7 +636,7 @@ __attribute__((noinline)) static void test_conservative_roots(void){
   g_cr_results[2] = cleared >= CR_DEAD - 16;
   if (!g_cr_results[2]) printf("  [diag] %d of %d dead cells lost their bit\n", cleared, CR_DEAD);
   g_cr_results[3] = cr_sum(keep) == 3000 * 2999 / 2 && ts_gc_debug_alloc_bit(keep);
-  g_conservative_roots = 0;
+  ts_gc_set_conservative_roots(0);
 }
 /* Shape chains (slice N): a dictionary-like object built one key at a time
    shares its chain's key vectors and index with the shapes of its prefixes;

@@ -58,3 +58,6 @@ construction path (`new` through a class value) zeroes numeric fields itself.
 
 Eight pairs; outputs identical. The zeroing of the other kinds' runs (arrays,
 strings, closures, maps) stays: their constructors rely on it.
+
+Session 360 replaced the per-allocation tests and counters with a limit per
+size class and counting per run (docs/alloc_fast_path_design.md).

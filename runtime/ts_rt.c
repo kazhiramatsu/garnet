@@ -79,7 +79,14 @@ static size_t g_payload_budget_bytes = 0;
 /* Set while a collection runs: a payload allocated then (the weak-table
    pruning compacts a WeakMap after scanning it) is allocated marked. */
 static int g_gc_collecting = 0;
-static inline void gc_note_payload(size_t bytes){ g_payload_fresh_bytes += bytes; }
+static void gc_young_limits_force(void);
+static inline void gc_note_payload(size_t bytes){
+  size_t before = g_payload_fresh_bytes;
+  g_payload_fresh_bytes += bytes;
+  /* crossing the budget: the young cells' next allocation runs the collection triggers
+     (docs/alloc_fast_path_design.md) */
+  if (TS_RT_UNLIKELY(before < g_payload_budget_bytes && g_payload_fresh_bytes >= g_payload_budget_bytes)) gc_young_limits_force();
+}
 
 /* ---------------- payload heap (docs/gc_v2_design.md §6.1, slice G2) ----------------
    Buffers owned by exactly one cell (closure environments first) live in a
@@ -289,7 +296,13 @@ typedef struct gc_block {
   uint32_t nblocks;    /* large run length in blocks */
   uint32_t slack;      /* large run: its blocks' bytes past the request (below one block) */
 } gc_block;
-typedef struct { char* ptr; char* end; uint32_t head; uint32_t scan; } gc_pclass;
+/* A size class (ts_rt.h ts_gc_pclass, whose young ones the generated code bumps in line): its current
+   run [ptr, end); for the young families also the limit of the fast allocation (<= end: where the
+   class's grant of the collection budget runs out), acc (the run position up to which the cells
+   handed out were closed: their bits set, their bytes pending), pend (the closed bytes not yet
+   counted into the collection's counters) and allow (the grant left from acc on).
+   docs/alloc_fast_path_design.md. */
+typedef ts_gc_pclass gc_pclass;
 static char* g_cage_base = NULL;
 static size_t g_cage_bytes = 0;
 static uint32_t g_cage_blocks = 0, g_cage_frontier = 0, g_cage_committed = 0;
@@ -309,7 +322,7 @@ static uint32_t g_large_head = 0;         /* large runs (index + 1) */
 static uint32_t g_payload_epoch = 1;
 static gc_pclass g_pclass[GC_PAYLOAD_NCLASS];
 /* The cell space (G3): cells in blocks of their size class, beside the payload blocks. */
-static gc_pclass g_cclass[GC_PAYLOAD_NCLASS];
+gc_pclass g_cclass[GC_PAYLOAD_NCLASS];   /* (ts_rt.h: the generated code's array literals) */
 /* Old cells (the pretenured constructions) take their runs from blocks of
    their own: allocated among the young cells, they left the young runs
    fragmented into one- and two-cell holes once the young cells died (1.36 M
@@ -320,9 +333,11 @@ static gc_pclass g_cclass_old[GC_PAYLOAD_NCLASS];
    writes every field of a new instance (undefined for a boxed field, zero
    for a numeric one) and the allocator writes the whole 32-byte prefix, so
    no byte of such a cell is read before it is written. */
-static gc_pclass g_cclass_sized[GC_PAYLOAD_NCLASS];
+gc_pclass g_cclass_sized[GC_PAYLOAD_NCLASS];   /* (ts_rt.h: the generated code's class instances) */
 static uint32_t g_large_cell_head = 0;   /* large cell runs (index + 1) */
 static uint32_t g_pclass_size[GC_PAYLOAD_NCLASS];
+/* ceil(2^32 / size): a run's cell count as a multiply (exact for a whole number of cells below 4 GB) */
+static uint64_t g_pclass_inv[GC_PAYLOAD_NCLASS];
 /* Per class: the bytes its cells tile from a block's start, and the cell
    starts as bitmap words (bit j of word w set when granule 64w + j starts a
    cell): a block's free run is then found with word operations. */
@@ -397,6 +412,7 @@ static void gc_cage_init(void){
   for (int k = 0; k < g_pclass_n; k++){
     uint32_t size = g_pclass_size[k], ncells = (uint32_t)(GC_BLOCK_BYTES / size);
     g_pclass_lim[k] = ncells * size;
+    g_pclass_inv[k] = (((uint64_t)1 << 32) + size - 1u) / size;
     for (uint32_t i = 0; i < ncells; i++){
       uint32_t g = (i * size) >> 4;
       g_pclass_starts[k][g >> 6] |= (uint64_t)1u << (g & 63u);
@@ -419,6 +435,23 @@ static inline void gc_alloc_bit_clear(const void* p){
 }
 static inline int gc_alloc_bit_test(uint32_t bi, uint32_t g){
   return (int)((gc_alloc_bits(bi)[g >> 6] >> (g & 63u)) & 1u);
+}
+/* The bits of every granule of [lo, hi), the young cells a size class handed out from one run (a
+   run lies in one block), set when the class counts them (docs/alloc_fast_path_design.md): the
+   scan tests a cell's start, which the block's class gives, and the settle after the collection
+   keeps the survivors' starts alone (alloc &= marks). A word move per 64 granules, where a bit
+   per cell was a read-modify-write per allocation. */
+static void gc_alloc_bits_fill(const char* lo, const char* hi){
+  uintptr_t off = (uintptr_t)lo - (uintptr_t)g_cage_base;
+  uint64_t* w = gc_alloc_bits((uint32_t)(off >> GC_BLOCK_SHIFT));
+  uint32_t g0 = (uint32_t)((off & (GC_BLOCK_BYTES - 1u)) >> 4);
+  uint32_t g1 = g0 + (uint32_t)(((size_t)(hi - lo) + 15u) >> 4);   /* exclusive */
+  uint32_t w0 = g0 >> 6, w1 = (g1 - 1u) >> 6;
+  uint64_t first = ~(uint64_t)0 << (g0 & 63u), last = ~(uint64_t)0 >> (63u - ((g1 - 1u) & 63u));
+  if (w0 == w1){ w[w0] |= first & last; return; }
+  w[w0] |= first;
+  for (uint32_t i = w0 + 1u; i < w1; i++) w[i] = ~(uint64_t)0;
+  w[w1] |= last;
 }
 /* A cell block the allocator hands a run from: its bits are settled after
    the next collection (alloc = alloc & marks: the dead young cells go). The
@@ -632,6 +665,12 @@ static uint32_t g_young_log_kinds = ~0u;
 #else
 static uint32_t g_young_log_kinds = GC_FINALIZABLE_KINDS;
 #endif
+/* every young allocation through its slow path (the debug modes: docs/alloc_fast_path_design.md) */
+#if defined(TS_ASAN_ENABLED) || defined(TSAOT_RT_STATS) || defined(TSAOT_STACK_CHECK)
+static int g_alloc_every_slow = 1;
+#else
+static int g_alloc_every_slow = 0;
+#endif
 /* The young cells the marker reached, promoted after marking. */
 static ts_gc_header** g_survivors = NULL;
 static size_t g_survivors_len = 0, g_survivors_cap = 0;
@@ -691,22 +730,6 @@ static inline void* gc_cell_alloc(size_t bytes, int old, size_t* cap){
     uintptr_t off = (uintptr_t)(p - g_cage_base);
     gc_payload_mark_small((uint32_t)(off >> GC_BLOCK_SHIFT), off & (GC_BLOCK_BYTES - 1u));
   }
-  return p;
-}
-/* A young class instance's cell from the unzeroed runs (GC_CELL_RUNS_ZEROED
-   only; under ASan every cell is zeroed when handed out, as before). */
-static inline void* gc_cell_alloc_sized(size_t bytes, size_t* cap){
-  if (TS_RT_UNLIKELY(!GC_CELL_RUNS_ZEROED || bytes > GC_PAYLOAD_SMALL_MAX)) return gc_cell_alloc(bytes, 0, cap);
-  if (TS_RT_UNLIKELY(!g_cage_base)) gc_cage_init();
-  unsigned cls = g_pclass_of[(bytes + 15u) >> 4];
-  gc_pclass* c = &g_cclass_sized[cls];
-  size_t size = g_pclass_size[cls];
-  *cap = size;
-  char* p = c->ptr;
-  if (TS_RT_UNLIKELY(!p || p + size > c->end)) p = gc_space_refill_z(g_cclass_sized, GC_BLK_CELL, cls, 0, 0);
-  c->ptr = p + size;
-  if (g_conservative_roots) gc_alloc_bit_set(p);
-  GC_PAYLOAD_UNPOISON(p, size);
   return p;
 }
 static inline gc_block* gc_cell_block(const ts_gc_header* h){
@@ -873,11 +896,11 @@ static void gc_payload_after_collection(int full){
     gc_pclass* c = &g_pclass[cls];
     c->ptr = c->end = NULL; c->scan = c->head;
     gc_pclass* cc = &g_cclass[cls];
-    cc->ptr = cc->end = NULL; cc->scan = cc->head;
+    cc->ptr = cc->end = cc->limit = cc->acc = NULL; cc->scan = cc->head; cc->pend = cc->allow = 0;
     cc = &g_cclass_old[cls];
     cc->ptr = cc->end = NULL; cc->scan = cc->head;
     cc = &g_cclass_sized[cls];
-    cc->ptr = cc->end = NULL; cc->scan = cc->head;
+    cc->ptr = cc->end = cc->limit = cc->acc = NULL; cc->scan = cc->head; cc->pend = cc->allow = 0;
   }
   uint32_t l = g_large_head;
   while (l){
@@ -1424,7 +1447,7 @@ static void gc_config_init(void){
   }
   const char* zap = getenv("TSAOT_GC_ZAP");
   if (zap && zap[0] && strcmp(zap, "0") != 0) g_gc_zap = 1;
-  if (g_gc_zap || g_gc_protect) g_young_log_kinds = ~0u;   /* dead cells are zapped or quarantined */
+  if (g_gc_zap || g_gc_protect){ g_young_log_kinds = ~0u; g_alloc_every_slow = 1; }   /* dead cells are zapped or quarantined */
 }
 tsv ts_heap_ref_value(uint16_t sel, void* p){
   if (!p) return TS_BOX(sel, 0);
@@ -1619,23 +1642,139 @@ static inline void gc_account_alloc(size_t sz, size_t cap){
   RT_STAT_INC(alloc_count); RT_STAT_ADD(alloc_bytes, sz);
   g_heap_bytes += cap;
 }
-/* The allocation of a young cell, in line at its twenty callers (the class
-   instance, array, string, closure and map constructors among them): the
-   budget test, the size class's bump, the header and the counters are a few
-   dozen instructions, and a call and its spills were a third of the path
-   (docs/alloc_inline_design.md). The refill, the large cell and the young
-   log stay calls. */
-TS_RT_ALWAYS_INLINE void* gc_alloc(size_t sz, uint8_t kind){
+/* ---- the young allocation (docs/alloc_fast_path_design.md) ----
+   A young cell is its size class's bump below the class's limit: where the run ends or where the
+   next collection's budget runs out, whichever comes first. The counters the collection triggers
+   read (the young cells and bytes since the last young collection, the heap's bytes) are kept per
+   run, not per allocation: the slow path counts what the class handed out since it last counted
+   ([acc, ptr)), runs the triggers (gc_before_alloc), refills, and sets the next limit; a collection
+   counts every class first and makes every class's next allocation set its limit anew. The debug
+   modes (zap, protect, ASan, the statistics build, conservative roots, the stack check) put every
+   allocation through the slow path, so a collection comes at the same allocation as before. */
+/* The class's cells handed out in its run since acc closed: their allocation bits, their bytes
+   pending, the grant spent by them. */
+static inline void gc_young_class_close(gc_pclass* c){
+  if (c->acc && c->ptr > c->acc){
+    size_t bytes = (size_t)(c->ptr - c->acc);
+    if (g_conservative_roots) gc_alloc_bits_fill(c->acc, c->ptr);
+    c->pend += bytes;
+    c->allow = c->allow > bytes ? c->allow - bytes : 0u;
+  }
+  c->acc = c->ptr;
+}
+/* ... and every pending byte counted into the counters the collection triggers read (whole cells of
+   one class below a grant: the cells by a multiply, no division on the slow path's latency) */
+static inline void gc_young_class_count(gc_pclass* c, unsigned cls){
+  gc_young_class_close(c);
+  size_t bytes = c->pend;
+  if (bytes){
+    g_young_new_since_minor += (size_t)(((uint64_t)bytes * g_pclass_inv[cls]) >> 32);
+    g_young_fresh_bytes += bytes;
+    g_heap_bytes += bytes;
+    c->pend = 0;
+  }
+}
+/* every young class's cells counted (a collection's start: its triggers and its statistics read them) */
+static void gc_young_count_all(void){
+  for (int cls = 0; cls < g_pclass_n; cls++){
+    gc_young_class_count(&g_cclass[cls], (unsigned)cls);
+    gc_young_class_count(&g_cclass_sized[cls], (unsigned)cls);
+  }
+}
+/* every young class's next allocation through the slow path (the counters restarted, or a budget
+   crossed elsewhere: a payload's, a debug mode switched on) */
+static void gc_young_limits_force(void){
+  for (int cls = 0; cls < GC_PAYLOAD_NCLASS; cls++){
+    g_cclass[cls].limit = g_cclass[cls].ptr; g_cclass[cls].allow = 0;
+    g_cclass_sized[cls].limit = g_cclass_sized[cls].ptr; g_cclass_sized[cls].allow = 0;
+  }
+}
+/* after a collection (every class counted, the counters reset): no grant, nothing pending */
+static void gc_young_restart(void){
+  for (int cls = 0; cls < GC_PAYLOAD_NCLASS; cls++){
+    gc_pclass* fam[2] = { &g_cclass[cls], &g_cclass_sized[cls] };
+    for (int k = 0; k < 2; k++){ fam[k]->acc = fam[k]->limit = fam[k]->ptr; fam[k]->pend = fam[k]->allow = 0; }
+  }
+}
+/* the bytes the class may hand out before the next collection is due: one cell in the debug modes */
+static inline size_t gc_young_room(size_t size){
+  if (g_alloc_every_slow) return size;
+  size_t cells = g_young_new_since_minor < g_young_threshold ? g_young_threshold - g_young_new_since_minor : 1u;
+  size_t room;
+  if (__builtin_mul_overflow(cells, size, &room)) room = (size_t)-1;
+  size_t yb = g_young_fresh_bytes < g_young_cap_bytes ? g_young_cap_bytes - g_young_fresh_bytes : 0u;
+  if (yb < room) room = yb;
+  size_t hb = g_heap_bytes < g_full_threshold_bytes ? g_full_threshold_bytes - g_heap_bytes : 0u;
+  if (hb < room) room = hb;
+  return room < size ? size : room;
+}
+/* The largest grant: a class may hand out this much of the collection budget before it counts and
+   runs the triggers again, over as many runs as it takes (a compile's young runs average a few
+   cells: per run, the triggers cost what the bumps saved). Every class's outstanding grant is what a
+   collection can come late by. */
+#define GC_YOUNG_GRANT_MAX ((size_t)64u << 10)
+/* The slow path: the run's cells closed; when the grant is spent, the class's bytes counted, the
+   triggers run and a new grant taken; the refill when the run is exhausted; the next limit. */
+__attribute__((noinline)) static void* gc_young_cell_slow(gc_pclass* classes, size_t bytes){
+  if (TS_RT_UNLIKELY(!g_cage_base)) gc_cage_init();
+  unsigned cls = g_pclass_of[(bytes + 15u) >> 4];
+  size_t size = g_pclass_size[cls];
+  gc_pclass* c = &classes[cls];
+  gc_young_class_close(c);
+  if (c->allow < size){
+    gc_young_class_count(c, cls);
+    gc_before_alloc();   /* may collect: a collection counts and restarts every class */
+    size_t room = gc_young_room(size);
+    c->allow = room < GC_YOUNG_GRANT_MAX ? room : GC_YOUNG_GRANT_MAX;
+    if (c->allow < size) c->allow = size;
+  }
+  char* p = c->ptr;
+  if (!p || p + size > c->end){
+    p = classes == g_cclass_sized ? gc_space_refill_z(g_cclass_sized, GC_BLK_CELL, cls, 0, 0)
+                                  : gc_space_refill(g_cclass, GC_BLK_CELL, cls, 0);
+    c->acc = p;
+  }
+  size_t run = (size_t)(c->end - p);
+  c->limit = p + (c->allow < run ? c->allow : run);
+  c->ptr = p + size;
+  GC_PAYLOAD_UNPOISON(p, size);
+  if (!GC_CELL_RUNS_ZEROED) memset(p, 0, bytes);
+  return p;
+}
+/* The fast path: a size of 256 bytes or less is its class by arithmetic (16-byte steps), a
+   larger one through the table (the slow path initializes it). */
+static inline void* gc_young_cell(gc_pclass* classes, size_t bytes){
+  unsigned cls; size_t size;
+  if (bytes <= 256u){ cls = (unsigned)((bytes + 15u) >> 4) - 1u; size = ((bytes + 15u) >> 4) << 4; }
+  else {
+    if (TS_RT_UNLIKELY(!g_cage_base)) return gc_young_cell_slow(classes, bytes);
+    cls = g_pclass_of[(bytes + 15u) >> 4]; size = g_pclass_size[cls];
+  }
+  gc_pclass* c = &classes[cls];
+  uintptr_t p = (uintptr_t)c->ptr;
+  if (TS_RT_UNLIKELY(p + size > (uintptr_t)c->limit)) return gc_young_cell_slow(classes, bytes);
+  c->ptr = (char*)(p + size);
+  return (void*)p;
+}
+/* A large young cell (its own blocks): the counters and the log per cell, as before. */
+__attribute__((noinline)) static void* gc_alloc_large_young(size_t sz){
   gc_before_alloc();
-  G0_ALLOC(kind, sz);
-  RT_STAT_INC(kind_alloc[kind]); RT_STAT_ADD(kind_bytes[kind], sz);
   size_t cap;
   ts_gc_header* h = (ts_gc_header*)gc_cell_alloc(sz, 0, &cap);
   gc_account_alloc(sz, cap);
-  h->kind=kind; h->gen=TS_GEN_YOUNG;
-  if (TS_RT_UNLIKELY(((g_young_log_kinds >> kind) & 1u) || sz > GC_PAYLOAD_SMALL_MAX)) gc_young_log_push(h);
   g_young_fresh_bytes += sz;
   g_young_new_since_minor++;
+  return h;
+}
+/* The allocation of a young cell, in line at its callers (the class instance, array, string,
+   closure and map constructors among them): the bump below the limit and the header. */
+TS_RT_ALWAYS_INLINE void* gc_alloc(size_t sz, uint8_t kind){
+  G0_ALLOC(kind, sz);
+  RT_STAT_INC(kind_alloc[kind]); RT_STAT_ADD(kind_bytes[kind], sz);
+  int large = sz > GC_PAYLOAD_SMALL_MAX;
+  ts_gc_header* h = (ts_gc_header*)(TS_RT_UNLIKELY(large) ? gc_alloc_large_young(sz) : gc_young_cell(g_cclass, sz));
+  h->kind=kind; h->gen=TS_GEN_YOUNG;
+  if (TS_RT_UNLIKELY(((g_young_log_kinds >> kind) & 1u) || large)) gc_young_log_push(h);
   RT_STAT_INC(young_alloc);
   return h;
 }
@@ -1667,15 +1806,7 @@ static inline void* gc_alloc_pretenured(size_t sz, uint8_t kind){
    anyway, and now the collector neither marks nor promotes them. A tenured
    site whose old cells a full collection finds mostly dead returns to young
    for good. Ids index a static table (the IR site + 1; 0 is no site). */
-typedef struct ts_alloc_site {
-  uint32_t allocs;   /* young: cells allocated in the open window; tenured: old cells since the last digest */
-  uint32_t counted;  /* young: the window's cells that survived; tenured: old cells a full collection found dead */
-  uint8_t state;     /* TS_SITE_YOUNG, TS_SITE_TENURED, TS_SITE_NEVER */
-  uint8_t touched;   /* listed for the next digest */
-  uint16_t pad;
-} ts_alloc_site;
-enum { TS_SITE_YOUNG = 0, TS_SITE_TENURED = 1, TS_SITE_NEVER = 2 };
-static ts_alloc_site g_alloc_sites[TS_ALLOC_SITE_MAX + 1u];
+ts_alloc_site g_alloc_sites[TS_ALLOC_SITE_MAX + 1u];   /* (ts_rt.h: the struct, read in line) */
 static uint16_t* g_site_touched = NULL;
 static uint32_t g_site_touched_len = 0, g_site_touched_cap = 0;
 static void gc_site_touch(ts_alloc_site* s, uint16_t id){
@@ -1755,8 +1886,8 @@ static void gc_sites_stats(FILE* out){
    method-name keys. Set up at program start (ts_setup_object_proto, emitted by
    the codegen which knows the method-name ids). NULL before setup, so early
    internal allocations simply have no proto until it's installed (harmless). */
-static tsv g_object_proto_v = TS_NULL;
-static tsv g_array_proto_v = TS_NULL;   /* unified model: Array.prototype */
+tsv g_object_proto_v = TS_NULL;   /* (ts_rt.h: the in-line object literal) */
+tsv g_array_proto_v = TS_NULL;   /* unified model: Array.prototype (ts_rt.h: the in-line array literal) */
 static tsv g_map_proto_v = TS_NULL;     /* unified model: Map.prototype */
 static tsv g_set_proto_v = TS_NULL;     /* unified model: Set.prototype */
 static tsv g_weakmap_proto_v = TS_NULL; /* unified model: WeakMap.prototype */
@@ -1793,7 +1924,6 @@ void ts_gc_root_static(tsv* slot, int* rooted){ ts_root_static_once(slot, rooted
 static void ts_proto_register_method(tsv proto, ts_key method_key, const char* name, ts_code fn);
 /* A fresh plain object's in-object slot count (its cell is zeroed: no
    flag, no card range). */
-static inline void gc_hdr_init_plain(ts_gc_header* h, uint32_t slots){ h->inline_cap = (uint8_t)slots; }
 static tsv ts_new_object_impl(int pretenured, uint32_t slots){
   if (slots > TS_INLINE_SLOTS_MAX) slots = TS_INLINE_SLOTS_MAX;
   size_t size = sizeof(ts_object) + sizeof(tsv) * (size_t)slots;
@@ -1862,6 +1992,8 @@ tsv ts_new_set(void);
 int g_typed_slow = 0;    /* declared in ts_rt.h; see ts_typed_slow there */
 int g_closed_receivers = 0;
 int g_conservative_roots = 0;
+/* (the young classes' next allocations through the slow path, which sets the cells' bits) */
+void ts_gc_set_conservative_roots(int on){ g_conservative_roots = on; gc_young_limits_force(); }
 #endif
 /* A foreign receiver can arise from here on. A closed program's typed
    accesses do not test the flag: the exporter's proof missed a route to this
@@ -2317,19 +2449,18 @@ static tsv ts_new_sized_impl(size_t size, int pretenured){
     /* A young instance from the unzeroed runs: every byte of the prefix is
        written here (the generated code writes every field), the flag and
        the extent before anything can remember the cell. */
-    gc_before_alloc();
     G0_ALLOC(TS_KIND_OBJECT, size);
     RT_STAT_INC(kind_alloc[TS_KIND_OBJECT]); RT_STAT_ADD(kind_bytes[TS_KIND_OBJECT], size);
-    size_t cap;
-    ts_sized_head* sh = (ts_sized_head*)gc_cell_alloc_sized(size, &cap);
-    gc_account_alloc(size, cap);
+    int large = size > GC_PAYLOAD_SMALL_MAX;
+    /* the unzeroed family (every byte is written below and by the generated code); the zeroed one
+       where cells are zeroed when handed out (ASan) */
+    ts_sized_head* sh = (ts_sized_head*)(TS_RT_UNLIKELY(large) ? gc_alloc_large_young(size)
+                                         : gc_young_cell(GC_CELL_RUNS_ZEROED ? g_cclass_sized : g_cclass, size));
     sh->h.kind = TS_KIND_OBJECT; sh->h.mark = 0; sh->h.gen = TS_GEN_YOUNG; sh->h.flags = 0;
     sh->h.pin_word = 0;
     ts_hdr_init_sized(&sh->h, size);   /* the flag and the extent, through the helper */
     sh->proto = TS_UNDEFINED; sh->cls = 0; sh->shape = TS_SHAPE_NONE; sh->dyn = NULL;
-    if (TS_RT_UNLIKELY(((g_young_log_kinds >> TS_KIND_OBJECT) & 1u) || size > GC_PAYLOAD_SMALL_MAX)) gc_young_log_push(&sh->h);
-    g_young_fresh_bytes += size;
-    g_young_new_since_minor++;
+    if (TS_RT_UNLIKELY(((g_young_log_kinds >> TS_KIND_OBJECT) & 1u) || large)) gc_young_log_push(&sh->h);
     RT_STAT_INC(young_alloc);
     return ts_obj((ts_object*)sh);
   }
@@ -2380,7 +2511,7 @@ static void array_compact_front(ts_array* a){
   a->data = base; a->cap += f; a->front = 0;
   array_invalidate_dirty(a);
 }
-#define GC_CONTAINER_CARD_SHIFT 6u
+#define GC_CONTAINER_CARD_SHIFT TS_CONTAINER_CARD_SHIFT   /* (ts_rt.h: the in-line barrier's card) */
 /* A heap value still in the young generation: the only stores an old
    container must remember. */
 static inline int array_value_is_young(tsv value){
@@ -4922,6 +5053,21 @@ static tsv ts_new_string_from_key_bytes(const char* s, uint32_t len){
 /* Copy a slice from an existing heap string. The source is rooted across the
    destination allocation, then re-fetched before copying so a future moving
    collector cannot leave us reading through a stale data pointer. */
+/* A copy of at most 32 bytes as two to four overlapping word moves (a byte loop becomes a memcpy
+   call), no byte read outside [s, s + n). */
+static inline void ts_copy_small(char* d, const char* s, size_t n){
+  if (n >= 16u){
+    uint64_t a, b, c, e;
+    memcpy(&a, s, 8); memcpy(&b, s + 8, 8); memcpy(&c, s + n - 16u, 8); memcpy(&e, s + n - 8u, 8);
+    memcpy(d, &a, 8); memcpy(d + 8, &b, 8); memcpy(d + n - 16u, &c, 8); memcpy(d + n - 8u, &e, 8);
+  } else if (n >= 8u){
+    uint64_t a, b; memcpy(&a, s, 8); memcpy(&b, s + n - 8u, 8); memcpy(d, &a, 8); memcpy(d + n - 8u, &b, 8);
+  } else if (n >= 4u){
+    uint32_t a, b; memcpy(&a, s, 4); memcpy(&b, s + n - 4u, 4); memcpy(d, &a, 4); memcpy(d + n - 4u, &b, 4);
+  } else if (n){
+    d[0] = s[0]; d[n - 1u] = s[n - 1u]; d[n / 2u] = s[n / 2u];
+  }
+}
 static tsv ts_string_slice_copy(tsv src, uint32_t start, uint32_t len){
   if (!ts_is_str(src)) return TS_UNDEFINED;
   ts_gc_root(&src);
@@ -4954,7 +5100,23 @@ static tsv ts_string_slice_view(tsv src, uint32_t start, uint32_t len){
     return short_result;
   }
   if (start == 0 && len == x.len){ ts_gc_unroot(1); return src; }
-  if (len < 13u){ ts_gc_unroot(1); return ts_string_slice_copy(src, start, len); }   /* a short substring is flat (V8's sliced-string threshold): read in line, no parent kept */
+  if (len < 13u){
+    /* A short substring is flat (V8's sliced-string threshold): read in line, no parent kept. One
+       cell (zeroed: its terminator is written anyway), the units copied by a few word moves, and
+       the source's ASCII flag kept rather than found again by a scan. */
+    uint32_t flags = x.flags & TS_STR_FLAG_UTF16;
+    uint32_t unit = ts_str_unit_size_flags(flags);
+    ts_string* out = gc_alloc(sizeof(ts_string) + (size_t)(len + 1u) * unit, TS_KIND_STRING);
+    x = ts_str_view_typed(src);   /* after the allocation (it may collect) */
+    out->len = len; out->hash = 0; out->parent = TS_UNDEFINED; out->offset = 0;
+    if (x.data) ts_copy_small(out->data, x.data + (size_t)start * unit, (size_t)len * unit);
+    else ts_str_copy_units(out->data, flags, 0, x, start, len);
+    out->data[(size_t)len * unit] = 0;
+    if (unit == 2u) out->data[(size_t)len * unit + 1u] = 0;
+    out->flags = (x.flags & TS_STR_FLAG_ASCII) ? (flags | TS_STR_FLAG_ASCII) : strflags_storage(out->data, flags, len);
+    ts_gc_unroot(1);
+    return ts_str_v(out);
+  }
   if (x.len > 65536u && len * 8u < x.len){
     ts_gc_unroot(1);
     return ts_string_slice_copy(src, start, len);
@@ -6382,6 +6544,7 @@ int ts_gc_debug_cell_gen(tsv v){   /* the header's generation byte (tests), -1 f
 }
 int ts_gc_debug_alloc_bit(tsv v){
   if (!g_cage_alloc_bits || !ts_heap_ref(v)) return 0;
+  gc_young_count_all();   /* the young cells handed out since their classes last counted get their bits */
   uintptr_t off = (uintptr_t)(v & TS_PAYLOAD_MASK) - (uintptr_t)g_cage_base;
   if (off >= g_cage_bytes) return 0;
   return gc_alloc_bit_test((uint32_t)(off >> GC_BLOCK_SHIFT), (uint32_t)((off & (GC_BLOCK_BYTES - 1u)) >> 4));
@@ -6707,7 +6870,7 @@ static void gc_cells_sweep_old(void){
   }
 }
 /* Tests: log every young cell (the probe below needs them). */
-void ts_gc_debug_log_young(void){ g_young_log_kinds = ~0u; }
+void ts_gc_debug_log_young(void){ g_young_log_kinds = ~0u; g_alloc_every_slow = 1; gc_young_limits_force(); }
 /* Tests: does `v` still name an allocated cell? A stale reference keeps the
    address of a freed cell; the cell space knows it is free (no mark bit,
    and not a young cell of this cycle). Needs ts_gc_debug_log_young. */
@@ -6835,8 +6998,9 @@ static void g0_dump(FILE* out){
 #endif
 static uint64_t g_minor_collections = 0;   /* this process's young collections (the fork trace) */
 void ts_gc_collect_young(void){
+  gc_young_count_all();
   g_payload_fresh_bytes = 0;
-  if (!g_young_new_since_minor && !g_young_log_len){ g_young_fresh_bytes = 0; return; }
+  if (!g_young_new_since_minor && !g_young_log_len){ g_young_fresh_bytes = 0; gc_young_restart(); return; }
   g_minor_collections++;
   g_gc_collecting = 1;
   RT_STAT_INC(minor_gc); RT_STAT_GC_T0;
@@ -6908,6 +7072,7 @@ void ts_gc_collect_young(void){
   G0_PHASE(g0_minor_ns, 4);
   g_young_new_since_minor = 0;
   g_young_fresh_bytes = 0;
+  gc_young_restart();
   gc_clear_nonheap_marks();
 #ifdef TSAOT_STACK_CHECK
   g_sc_minor = 0;
@@ -6923,6 +7088,7 @@ void ts_gc_collect_young(void){
 void ts_gc_collect(void){
   RT_STAT_INC(full_gc); RT_STAT_GC_T0;
   G0_T0;
+  gc_young_count_all();
   g_payload_fresh_bytes = 0;
   g_gc_collecting = 1;
   gc_payload_begin_full();
@@ -6976,6 +7142,7 @@ void ts_gc_collect(void){
   G0_PHASE(g0_full_ns, 3);
   g_young_new_since_minor = 0;
   g_young_fresh_bytes = 0;
+  gc_young_restart();
   gc_clear_nonheap_marks();
   if (g_gc_protect) gc_cell_quarantine_trim();
   gc_payload_after_collection(1);
@@ -15702,6 +15869,7 @@ static tsv ta_new_buffer(double length, int shared){
   gc_note_payload(n);
   ts_arraybuffer* b = (ts_arraybuffer*)gc_alloc(sizeof(ts_arraybuffer), TS_KIND_ARRAYBUFFER);
   g_heap_bytes += n;   /* after the allocation: a collection resets the count */
+  if (TS_RT_UNLIKELY(g_heap_bytes >= g_full_threshold_bytes)) gc_young_limits_force();   /* the trigger at the next young cell */
   b->bytes = bytes; b->byte_length = n; b->shared = (uint8_t)(shared ? 1 : 0);
   b->o.shape = TS_SHAPE_EMPTY;
   tsv bv = ts_obj(b);
@@ -21618,7 +21786,7 @@ static int ts_worker_fork_ex(tsv entry, tsv data, int shared){
       g_region_mode = 1; g_region_lo = region_lo; g_region_cur = region_lo; g_region_hi = region_hi;
       for (int cls = 0; cls < GC_PAYLOAD_NCLASS; cls++){
         gc_pclass* fam[4] = { &g_pclass[cls], &g_cclass[cls], &g_cclass_old[cls], &g_cclass_sized[cls] };
-        for (int k = 0; k < 4; k++){ fam[k]->ptr = fam[k]->end = NULL; fam[k]->head = 0; fam[k]->scan = 0; }
+        for (int k = 0; k < 4; k++){ fam[k]->ptr = fam[k]->end = fam[k]->limit = fam[k]->acc = NULL; fam[k]->head = 0; fam[k]->scan = 0; fam[k]->pend = fam[k]->allow = 0; }
       }
       g_free_blocks = 0; g_large_head = 0; g_large_cell_head = 0; g_alloc_dirty_len = 0;
       g_next_shape = child_shape_lo; g_shape_limit = child_shape_hi; g_shape_ranges_end = 0;

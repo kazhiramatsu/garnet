@@ -98,7 +98,7 @@ env \
   -u TSAOT_PRETENURE \
   -u TSAOT_SITE_PRETENURE \
   "$ROOT/garnet" -o "$work/sites.c" "$site_fixture" >>"$build_log" 2>&1
-grep -q 'ts_new_sized_site(' "$work/sites.c" || {
+grep -qE 'ts_new_sized_site(_in)?\(' "$work/sites.c" || {   # the in-line bump names the site too (docs/alloc_fast_path_design.md)
   echo "[default-opts] FAIL: class allocations do not name their sites by default"
   exit 1
 }

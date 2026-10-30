@@ -157,3 +157,16 @@ Gates with the mode on: parity (the oracle sets the knob off), unit,
 bundler 43/43, conformance 539/539 plain and strict, 536/536 under protect
 mode, GC stress (O2 and ASan), the runtime tests with the new conservative
 cases. `TSAOT_CONSERVATIVE_ROOTS=1` is the default; `=0` keeps the frames.
+
+## The young cells' bits set per range (Session 360)
+
+The allocator set a young cell's allocation bit when it handed the cell
+out, a read-modify-write per allocation that kept the young allocation from
+being a bare bump (docs/alloc_fast_path_design.md). A young size class now
+sets the bits of the range of cells it handed out when it closes the range
+(at its slow path, and at every collection's start, before the scan): all
+the granules' bits of `[acc, ptr)`, a word move per 64 granules
+(`gc_alloc_bits_fill`). The scan tests a cell's start, which the block's
+class gives; the settle after the collection (`gc_alloc_bits_settle`, alloc
+&= marks) keeps the survivors' starts alone. Old and large cells set their
+bits when allocated and a death clears them, as before.

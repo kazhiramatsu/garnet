@@ -703,6 +703,8 @@ static inline size_t ts_sized_extent_words(size_t bytes){
    is not sized, as it was when the allocation size decided. One of the
    writers of inline_cap and hdr_spare the header gate admits
    (tests/header_bytes_gate.sh). */
+/* A plain object's header: its in-object value slots (inline_cap). */
+static inline void gc_hdr_init_plain(ts_gc_header* h, uint32_t slots){ h->inline_cap = (uint8_t)slots; }
 static inline void ts_hdr_init_sized(ts_gc_header* h, size_t bytes){
   size_t words = ts_sized_extent_words(bytes);
   h->inline_cap = (uint8_t)words;
@@ -734,6 +736,7 @@ extern int g_closed_receivers;
    sets it when its functions keep no GC frames; the collectors then scan the
    native stack for references, validated against the allocation bitmap. */
 extern int g_conservative_roots;
+void ts_gc_set_conservative_roots(int on);   /* the flag, every young allocation's bit from then on */
 int ts_gc_debug_alloc_bit(tsv v);      /* the allocation bit of a cell (tests) */
 int ts_gc_debug_cell_gen(tsv v);       /* a cell header's generation (tests) */
 extern uintptr_t g_gc_debug_watch;    /* tests: the conservative scan reports the word naming this cell */
@@ -1718,6 +1721,96 @@ tsv  ts_new_array_lit_site(uint32_t n, const tsv* vals, uint32_t site);
 tsv  ts_new_array_lit4(uint32_t n, tsv a, tsv b, tsv c, tsv d);
 tsv  ts_new_array_lit4_pretenured(uint32_t n, tsv a, tsv b, tsv c, tsv d);
 tsv  ts_new_array_lit4_site(uint32_t n, tsv a, tsv b, tsv c, tsv d, uint32_t site);
+/* ---- The young allocation in line (docs/alloc_fast_path_design.md, "In the generated code") ----
+   A size class as the runtime keeps it: the current run [ptr, end); for the young families the
+   limit of the fast allocation (the run's end, or where the class's grant of the collection
+   budget runs out; the debug modes keep it at ptr), and the runtime's bookkeeping of the cells
+   handed out (ts_rt.c gc_pclass). The generated code bumps ptr below limit; everything else is the
+   runtime's. */
+typedef struct ts_gc_pclass { char* ptr; char* end; uint32_t head; uint32_t scan; char* limit; char* acc; size_t pend; size_t allow; } ts_gc_pclass;
+extern ts_gc_pclass g_cclass[];         /* the young runs, zeroed when a class takes them */
+extern ts_gc_pclass g_cclass_sized[];   /* the young class instances' runs, not zeroed */
+/* An allocation site's pretenuring state (docs/site_pretenuring_design.md). */
+typedef struct ts_alloc_site {
+  uint32_t allocs;   /* young: cells allocated in the open window; tenured: old cells since the last digest */
+  uint32_t counted;  /* young: the window's cells that survived; tenured: old cells a full collection found dead */
+  uint8_t state;     /* TS_SITE_YOUNG, TS_SITE_TENURED, TS_SITE_NEVER */
+  uint8_t touched;   /* listed for the next digest */
+  uint16_t pad;
+} ts_alloc_site;
+enum { TS_SITE_YOUNG = 0, TS_SITE_TENURED = 1, TS_SITE_NEVER = 2 };
+extern ts_alloc_site g_alloc_sites[];
+extern tsv g_array_proto_v;    /* Array.prototype; null before the setup */
+extern tsv g_object_proto_v;   /* Object.prototype; null before the setup */
+/* A class instance at a site: the unzeroed run's bump, the header word (the kind, the young
+   generation, the sidecar and sized flags, the site, the extent) and the prefix; the generated
+   code then writes the class index and every field. A tenured site, a class without struct
+   fields (its instance is a plain object), an exhausted run or budget: ts_new_sized_site. */
+TS_RT_ALWAYS_INLINE tsv ts_new_sized_site_in(size_t size, uint32_t site, tsv proto){
+  if (size > sizeof(ts_sized_head) && size <= 256u && (size - sizeof(ts_sized_head)) % sizeof(tsv) == 0){
+    size_t csz = (size + 15u) & ~(size_t)15u;
+    ts_gc_pclass* c = &g_cclass_sized[(size + 15u) / 16u - 1u];
+    char* p = c->ptr;
+    ts_alloc_site* s = &g_alloc_sites[site];
+    if (TS_RT_LIKELY((uintptr_t)p + csz <= (uintptr_t)c->limit && s->state != TS_SITE_TENURED)){
+      c->ptr = p + csz;
+      ts_sized_head* sh = (ts_sized_head*)p;
+      sh->h.kind = TS_KIND_OBJECT; sh->h.mark = 0; sh->h.gen = TS_GEN_YOUNG; sh->h.flags = 0; sh->h.spare = (uint16_t)site;
+      ts_hdr_init_sized(&sh->h, size);   /* the flags and the extent (constants here) */
+      sh->proto = proto; sh->cls = 0; sh->shape = TS_SHAPE_NONE; sh->dyn = NULL;
+      s->allocs++;
+      return ts_obj(sh);
+    }
+  }
+  tsv r = ts_new_sized_site(size, site, proto);
+  if (!ts_is_obj(r)) __builtin_unreachable();   /* an object either way: the typed accesses after it fold their receiver test */
+  return r;
+}
+/* An array literal of up to four elements at a site: the zeroed run's bump (the fields not
+   written here are zero), the header, the prototype and the four inline slots. */
+TS_RT_ALWAYS_INLINE tsv ts_new_array_lit4_site_in(uint32_t n, tsv a, tsv b, tsv c, tsv d, uint32_t site){
+  size_t csz = (sizeof(ts_array) + 15u) & ~(size_t)15u;
+  ts_gc_pclass* cl = &g_cclass[(sizeof(ts_array) + 15u) / 16u - 1u];
+  char* p = cl->ptr;
+  ts_alloc_site* s = &g_alloc_sites[site];
+  if (TS_RT_LIKELY((uintptr_t)p + csz <= (uintptr_t)cl->limit && s->state != TS_SITE_TENURED)){
+    cl->ptr = p + csz;
+    ts_array* arr = (ts_array*)p;
+    arr->o.h.kind = TS_KIND_ARRAY; arr->o.h.spare = (uint16_t)site;
+    arr->o.proto = g_array_proto_v; arr->o.shape = TS_SHAPE_EMPTY;
+    arr->len = n; arr->cap = 4u; arr->data = arr->inline_data;
+    arr->inline_data[0] = a; arr->inline_data[1] = b; arr->inline_data[2] = c; arr->inline_data[3] = d;
+    s->allocs++;
+    return ts_obj(arr);
+  }
+  tsv r = ts_new_array_lit4_site(n, a, b, c, d, site);
+  if (!ts_is_obj(r)) __builtin_unreachable();
+  return r;
+}
+/* The same for more than four elements, the cell holding them (n a constant of the site; a cell
+   over 256 bytes is the runtime's call). */
+TS_RT_ALWAYS_INLINE tsv ts_new_array_lit_site_in(uint32_t n, const tsv* vals, uint32_t site){
+  size_t size = sizeof(ts_array) + sizeof(tsv) * (size_t)(n > 4u ? n - 4u : 0u);
+  if (n > 4u && size <= 256u){
+    size_t csz = (size + 15u) & ~(size_t)15u;
+    ts_gc_pclass* cl = &g_cclass[(size + 15u) / 16u - 1u];
+    char* p = cl->ptr;
+    ts_alloc_site* s = &g_alloc_sites[site];
+    if (TS_RT_LIKELY((uintptr_t)p + csz <= (uintptr_t)cl->limit && s->state != TS_SITE_TENURED)){
+      cl->ptr = p + csz;
+      ts_array* arr = (ts_array*)p;
+      arr->o.h.kind = TS_KIND_ARRAY; arr->o.h.spare = (uint16_t)site;
+      arr->o.proto = g_array_proto_v; arr->o.shape = TS_SHAPE_EMPTY;
+      arr->len = n; arr->cap = n; arr->data = arr->inline_data;
+      for (uint32_t i = 0; i < n; i++) arr->inline_data[i] = vals[i];
+      s->allocs++;
+      return ts_obj(arr);
+    }
+  }
+  tsv r = ts_new_array_lit_site(n, vals, site);
+  if (!ts_is_obj(r)) __builtin_unreachable();
+  return r;
+}
 tsv  ts_new_uint16_array(tsv input);
 tsv  ts_new_array_pretenured(uint32_t len);
 tsv  ts_array_get(tsv arr, uint32_t i);
@@ -2323,6 +2416,8 @@ static inline void ts_write_barrier(tsv owner, tsv value){
    is NONHEAP; only an old owner looks at the value. */
 static inline void ts_write_barrier_hdr(ts_gc_header* oh, tsv value){
   if (TS_RT_LIKELY(oh->gen != TS_GEN_OLD)) return;
+  /* a remembered class instance is scanned whole at the next young collection, whatever the value */
+  if ((oh->flags & (TS_HDR_REMEMBERED | TS_HDR_SIZED)) == (TS_HDR_REMEMBERED | TS_HDR_SIZED)) return;
   if (!(ts_is_obj(value)||ts_is_func(value)||ts_is_heap_str(value))) return;
   uint64_t vp = value & TS_PAYLOAD_MASK;
   if ((vp & TS_PTR_STACK_TAG) || !vp) return;
@@ -2558,6 +2653,34 @@ TS_RT_ALWAYS_INLINE void ts_set_sized_pic_inline_lazy(tsv obj, ts_key key, tsv v
 static inline tsv ts_int_slot_box(tsv w){ return ts_num((double)(int32_t)(uint32_t)w); }
 static inline int32_t ts_int_slot_value(tsv w){ return (int32_t)(uint32_t)w; }
 static inline tsv ts_int_slot_word(int32_t i){ return (tsv)(uint32_t)i; }
+/* An object literal of a layout at a site (docs/alloc_fast_path_design.md, "In the generated
+   code"): the zeroed run's bump (the fields not written here are zero), the header, the
+   prototype, the layout's shape and the slots (an integer slot's zero, undefined); n and kinds are
+   the layout's, constants of the site. A layout not resolved yet (its first allocation) or not
+   shaped, a tenured site, an exhausted run or budget: ts_new_object_layout_site. */
+TS_RT_ALWAYS_INLINE tsv ts_new_object_layout_site_in(ts_lit_layout* L, uint32_t n, const uint8_t* kinds, uint32_t site){
+  size_t size = sizeof(ts_object) + sizeof(tsv) * (size_t)n;
+  if (size <= 256u){
+    uint32_t sh = L->shape;
+    size_t csz = (size + 15u) & ~(size_t)15u;
+    ts_gc_pclass* c = &g_cclass[(size + 15u) / 16u - 1u];
+    char* p = c->ptr;
+    ts_alloc_site* s = &g_alloc_sites[site];
+    if (TS_RT_LIKELY(sh - 1u < TS_SHAPE_MAX && (uintptr_t)p + csz <= (uintptr_t)c->limit && s->state != TS_SITE_TENURED)){
+      c->ptr = p + csz;
+      ts_object* o = (ts_object*)p;
+      o->h.kind = TS_KIND_OBJECT; o->h.spare = (uint16_t)site; gc_hdr_init_plain(&o->h, n);
+      o->proto = g_object_proto_v; o->shape = sh; obj_map_plain(o)->len = n;
+      tsv* slots = (tsv*)(p + sizeof(ts_object));
+      for (uint32_t i = 0; i < n; i++) slots[i] = (kinds && kinds[i]) ? ts_int_slot_word(0) : TS_UNDEFINED;
+      s->allocs++;
+      return ts_obj(o);
+    }
+  }
+  tsv r = ts_new_object_layout_site(L, site);
+  if (!ts_is_obj(r)) __builtin_unreachable();
+  return r;
+}
 /* an int32 the slot holds exactly: a number that is an integer in range, not -0 */
 static inline int ts_int32_exact(tsv v, int32_t* out){
   if (!ts_is_num(v)) return 0;
@@ -3572,6 +3695,16 @@ static inline tsv ts_array_get_inline_f64(tsv arr, double d){
    test and the cards are out of line). Growth, sparse arrays, frozen arrays
    and other receivers (typed arrays among them) take ts_array_set. */
 void ts_array_remember(ts_array* a, uint32_t index, tsv value);
+/* An old array's store (the remembered-set barrier, docs/remembered_slots_design.md): nothing to do
+   when the array is remembered and the slot's 64-element card is already dirty, since the next
+   young collection scans the card whatever the value; otherwise the out-of-line half. */
+#define TS_CONTAINER_CARD_SHIFT 6u
+static inline void ts_array_remember_inline(ts_array* a, uint32_t u, tsv v){
+  if (TS_RT_LIKELY(a->o.h.gen != TS_GEN_OLD)) return;
+  uint32_t card = u >> TS_CONTAINER_CARD_SHIFT;
+  if ((a->o.h.flags & TS_HDR_REMEMBERED) && (a->gc_dirty_all || (card >= a->gc_dirty_first && card < a->gc_dirty_end))) return;
+  ts_array_remember(a, u, v);
+}
 static inline void ts_array_set_inline(tsv arr, int64_t i, tsv v){
   if (ts_is_indexed_array_fast(arr)){
     ts_array* a = (ts_array*)ts_ptr(arr);
@@ -3579,7 +3712,7 @@ static inline void ts_array_set_inline(tsv arr, int64_t i, tsv v){
       uint32_t u = (uint32_t)i;
       a->data[u] = v;
       if (u >= a->len) a->len = u + 1u;
-      if (a->o.h.gen == TS_GEN_OLD) ts_array_remember(a, u, v);
+      ts_array_remember_inline(a, u, v);
       return;
     }
   }
@@ -3597,7 +3730,7 @@ static inline void ts_array_push_inline(tsv arr, tsv v){
     if (TS_RT_LIKELY(u < a->cap && ts_obj_integrity(&a->o) == 0u)){
       a->data[u] = v;
       a->len = u + 1u;
-      if (a->o.h.gen == TS_GEN_OLD) ts_array_remember(a, u, v);
+      ts_array_remember_inline(a, u, v);
       return;
     }
   }
