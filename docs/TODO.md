@@ -12522,10 +12522,10 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   still allocates a view), `Tokenizer.getPos` 10 / 3.4, `prepareDeps` 14 / 8.
 
 State at the end of the session: **the r27 slice above is committed; two more slices are built and
-not committed**, in the worktree `build/wt_s361`, branch `s361-wip` (local, not pushed; the worktree's
-HEAD is on it, on top of `589c702`, which is the r27 commit's code):
+not committed**, in the worktree `build/wt_s361`, branch `s361-wip` (local, not pushed; rebased on the
+r27 commit `a596dcd`, built, and the slices' fixtures pass in plain and strict mode there):
 
-- `3558bcb` **the candidate classes in line** (`docs/pic_sized_inline_design.md`, "The candidate
+- `5a56ab4` **the candidate classes in line** (`docs/pic_sized_inline_design.md`, "The candidate
   classes in line", rewritten to what was built): an interface-typed site tests the classes declaring
   the field and reads or writes the struct itself. It rests on a runtime change: `ts_symbol`, `ts_proxy`
   and `ts_coro` keep the class and shape words of the common prefix zero (a Proxy's `cls` was the low
@@ -12535,7 +12535,7 @@ HEAD is on it, on top of `589c702`, which is the r27 commit's code):
   strict profile, so only `TSAOT_CONF_STRICT=1` and real projects exercise it). `Subscriber`'s 31 sites
   are covered; vue's other `sized` sites without `cands` are class-hinted ones on the `Range` guard, or
   plain AST types, not misses. Passed on the worktree: unit, the fixture in the three modes.
-- `01110cb`, `2873a0c` **GetIterator's record and array patterns** (`docs/array_iterators_design.md`,
+- `9c0e5c4`, `c9edeb0` **GetIterator's record and array patterns** (`docs/array_iterators_design.md`,
   last section): `const [a, b] = v` with `v: any` holding a Set, Map or generator bound undefined (also
   a parameter, a nested pattern, a `for..of` variable, an assignment), a non-iterable was accepted, a
   string pattern split surrogate pairs, `next` was read per step (V8: once; an iterator replacing its
@@ -12543,15 +12543,11 @@ HEAD is on it, on top of `589c702`, which is the r27 commit's code):
   and its cache are gone. Fixture `iteration/iterator_protocol_fidelity`. Passed on the worktree: the
   fixture and the `forof|destruct` fixtures in the three modes.
 - An independent review of both slices was running when the session stopped and its result is not
-  here: repeat it before committing them (`git diff 589c702 3558bcb`, `git diff 3558bcb 2873a0c`).
+  here: repeat it before committing them (`git diff a596dcd 5a56ab4`, `git diff 5a56ab4 c9edeb0`).
 
 Next session, in order:
 
-1. `git -C build/wt_s361 rebase --onto main 589c702 s361-wip`. Expected conflicts:
-   `scripts/run_gc_stress.sh` (both add `iterator_objects_state` to the filter; keep
-   `interface_candidates|iterator_objects_state|iterator_protocol_fidelity`, the last one not yet in it)
-   and perhaps `docs/array_iterators_design.md` (the new section stays last).
-2. The candidate slice alone into the main tree (`git cherry-pick -n` its commit), `tsc` and `cargo build`
+1. The candidate slice alone into the main tree (`git cherry-pick -n 5a56ab4`), `tsc` and `cargo build`
    (`scripts/setup.sh` steps 2 and 3), then the full set: a copy of `build/gates_s361a/run.sh` with r27
    -> r28 against the baselines it left (`build/real/hono-work/driver.r27plain`,
    `build/real/hono_app-work/driver.r27`, `build/real/vue-work/driver.r27`,
@@ -12561,12 +12557,12 @@ Next session, in order:
    candidates, at most four declaring classes at a site). ir-parity differs by the `cands` keys:
    `TSAOT_SIZED_CANDS=0` must be identical, then `gate.sh ir-parity snap`. Fill in the design section's
    measurements, append to this log, commit, push.
-3. The iteration slice the same way (r29). Watch `any`-typed array patterns in the benches
+2. The iteration slice the same way (r29: `9c0e5c4` and `c9edeb0`). Watch `any`-typed array patterns in the benches
    (`forof.open` plus a `forof.next` per element, in line for an array).
-4. Add to CLAUDE.md's known items: a symbol through an `any` receiver (`.description` reads undefined,
+3. Add to CLAUDE.md's known items: a symbol through an `any` receiver (`.description` reads undefined,
    `.toString()` is a TypeError; the typed forms work, there is no `Symbol.prototype` object), and
    `yield*` over an `any` being a compile-time reject (V8 runs it). KNOWN_GAPS.md's no IteratorClose on
    an early exit of a dynamic `for..of` is unchanged.
-5. The next round on vue: `sample` and `--cpu-prof` per JS function (Session 360's scripts) from the list
+4. The next round on vue: `sample` and `--cpu-prof` per JS function (Session 360's scripts) from the list
    above. Note on `val in map`: Session 360 measured an own-map first test with no gain, so profile it
    (the dynamic key's conversion) before changing `ts_has_prop`.
