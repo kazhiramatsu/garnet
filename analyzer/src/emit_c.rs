@@ -3075,6 +3075,101 @@ fn frame_coalesce_enabled() -> bool {
     })
 }
 
+/// The numeric locals that must live in memory across a `try`. A function with a `try` keeps its
+/// reference locals in memory homes (docs/frame_elision_design.md), but a `dN` is a C local, and one
+/// written after the `setjmp` is indeterminate after the `longjmp`: `let n = 0; try { n = 1; f(); }
+/// catch { return n; }` answered 0 at -O2. So a local written in a protected body (a catch body too
+/// when a finally follows it) and read outside that body is `volatile`. A local read only inside
+/// the body it is written in needs nothing, which keeps a hot loop in a `try` in registers, unless
+/// a loop around the `try` enters the body again after a throw with a value the throw lost: more
+/// than one definition then, as a temporary has one.
+fn try_volatile_locals(body: &[Inst]) -> BTreeSet<u32> {
+    fn count_reads(body: &[Inst], out: &mut BTreeMap<u32, u32>) {
+        for inst in body {
+            match inst {
+                Inst::If { cond, then_body, else_body } => {
+                    *out.entry(cond.0).or_insert(0) += 1;
+                    count_reads(then_body, out);
+                    count_reads(else_body, out);
+                }
+                Inst::Loop { cond, cond_body, body, .. } => {
+                    *out.entry(cond.0).or_insert(0) += 1;
+                    count_reads(cond_body, out);
+                    count_reads(body, out);
+                }
+                Inst::TryCatch { try_body, catch_body, finally_body, .. } => {
+                    count_reads(try_body, out);
+                    count_reads(catch_body, out);
+                    count_reads(finally_body, out);
+                }
+                _ => {
+                    let d = inst_def(inst);
+                    let mut def_seen = false;
+                    for r in inst_refs(inst) {
+                        if Some(r) == d && !def_seen {
+                            def_seen = true;
+                            continue;
+                        }
+                        *out.entry(r).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+    }
+    fn count_defs(body: &[Inst], out: &mut BTreeMap<u32, u32>) {
+        let mut flat: Vec<&Inst> = Vec::new();
+        flatten_inst(body, &mut flat);
+        for inst in flat {
+            if let Some(d) = inst_def(inst) {
+                *out.entry(d).or_insert(0) += 1;
+            }
+        }
+    }
+    struct Whole {
+        reads: BTreeMap<u32, u32>,
+        defs: BTreeMap<u32, u32>,
+    }
+    fn visit(body: &[Inst], in_loop: bool, whole: &Whole, out: &mut BTreeSet<u32>) {
+        for inst in body {
+            match inst {
+                Inst::If { then_body, else_body, .. } => {
+                    visit(then_body, in_loop, whole, out);
+                    visit(else_body, in_loop, whole, out);
+                }
+                Inst::Loop { cond_body, body, .. } => {
+                    visit(cond_body, true, whole, out);
+                    visit(body, true, whole, out);
+                }
+                Inst::TryCatch { try_body, catch_body, finally_body, .. } => {
+                    for protected in [Some(try_body), (!finally_body.is_empty()).then_some(catch_body)].into_iter().flatten() {
+                        let mut reads_in = BTreeMap::new();
+                        count_reads(protected, &mut reads_in);
+                        let mut written = BTreeMap::new();
+                        count_defs(protected, &mut written);
+                        for d in written.keys() {
+                            let total = whole.reads.get(d).copied().unwrap_or(0);
+                            let inside = reads_in.get(d).copied().unwrap_or(0);
+                            if total > inside || (in_loop && whole.defs.get(d).copied().unwrap_or(0) > 1) {
+                                out.insert(*d);
+                            }
+                        }
+                    }
+                    visit(try_body, in_loop, whole, out);
+                    visit(catch_body, in_loop, whole, out);
+                    visit(finally_body, in_loop, whole, out);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = BTreeSet::new();
+    let mut whole = Whole { reads: BTreeMap::new(), defs: BTreeMap::new() };
+    count_reads(body, &mut whole.reads);
+    count_defs(body, &mut whole.defs);
+    visit(body, false, &whole, &mut out);
+    out
+}
+
 /// The local an instruction writes, when its `dst` really is a definition
 /// (ObjectCopyProps and SetProto read theirs; control flow has none).
 fn inst_def(inst: &Inst) -> Option<u32> {
@@ -9450,13 +9545,15 @@ fn emit_i64_function(
     } else {
         BTreeSet::new()
     };
+    let try_volatile = try_volatile_locals(&f.body);
+    let vol = |id: u32| if try_volatile.contains(&id) { "volatile " } else { "" };
     for l in &f.locals {
         if narrow.contains(&l.id.0) {
-            let _ = writeln!(s, "  int32_t d{} = 0;", l.id.0);
+            let _ = writeln!(s, "  {}int32_t d{} = 0;", vol(l.id.0), l.id.0);
         } else if int_local.contains(&l.id.0) || int32_use_decl.contains(&l.id.0) {
-            let _ = writeln!(s, "  long long d{} = 0;", l.id.0);
+            let _ = writeln!(s, "  {}long long d{} = 0;", vol(l.id.0), l.id.0);
         } else if unboxed.contains(&l.id.0) {
-            let _ = writeln!(s, "  double d{} = 0;", l.id.0);
+            let _ = writeln!(s, "  {}double d{} = 0;", vol(l.id.0), l.id.0);
         } else if !frame_locals.contains(&l.id.0) {
             let _ = writeln!(s, "  tsv v{} = TS_UNDEFINED;", l.id.0);
         }
@@ -9698,13 +9795,15 @@ fn emit_f64_function(
     } else {
         BTreeSet::new()
     };
+    let try_volatile = try_volatile_locals(&f.body);
+    let vol = |id: u32| if try_volatile.contains(&id) { "volatile " } else { "" };
     for l in &f.locals {
         if narrow.contains(&l.id.0) {
-            let _ = writeln!(s, "  int32_t d{} = 0;", l.id.0);
+            let _ = writeln!(s, "  {}int32_t d{} = 0;", vol(l.id.0), l.id.0);
         } else if int_local.contains(&l.id.0) || int32_use_decl.contains(&l.id.0) {
-            let _ = writeln!(s, "  long long d{} = 0;", l.id.0);
+            let _ = writeln!(s, "  {}long long d{} = 0;", vol(l.id.0), l.id.0);
         } else if unboxed.contains(&l.id.0) {
-            let _ = writeln!(s, "  double d{} = 0;", l.id.0);
+            let _ = writeln!(s, "  {}double d{} = 0;", vol(l.id.0), l.id.0);
         } else if !frame_locals.contains(&l.id.0) {
             let _ = writeln!(s, "  tsv v{} = TS_UNDEFINED;", l.id.0);
         }
@@ -10216,15 +10315,17 @@ fn emit_function(
     } else {
         BTreeSet::new()
     };
+    let try_volatile = try_volatile_locals(&f.body);
+    let vol = |id: u32| if try_volatile.contains(&id) { "volatile " } else { "" };
     for l in &f.locals {
         if narrow.contains(&l.id.0) {
-            let _ = writeln!(s, "  int32_t d{} = 0;", l.id.0);
+            let _ = writeln!(s, "  {}int32_t d{} = 0;", vol(l.id.0), l.id.0);
         } else if int_local.contains(&l.id.0) || int32_use_decl.contains(&l.id.0) {
-            let _ = writeln!(s, "  long long d{} = 0;", l.id.0);
+            let _ = writeln!(s, "  {}long long d{} = 0;", vol(l.id.0), l.id.0);
         } else if json_locals.contains(&l.id.0) {
-            let _ = writeln!(s, "  tjson_value* j{} = NULL;", l.id.0);
+            let _ = writeln!(s, "  tjson_value* {}j{} = NULL;", vol(l.id.0), l.id.0);
         } else if unboxed.contains(&l.id.0) {
-            let _ = writeln!(s, "  double d{} = 0;", l.id.0);
+            let _ = writeln!(s, "  {}double d{} = 0;", vol(l.id.0), l.id.0);
         } else if !frame_locals.contains(&l.id.0) {
             let _ = writeln!(s, "  tsv v{} = TS_UNDEFINED;", l.id.0);
         }
@@ -24006,6 +24107,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     let async_first: u32 = builtin["iter.acquire:".len()..].parse().unwrap_or(0);
                     (format!("ts_iter_acquire({}, {})", v(0), async_first), false)
                 }
+                "iter.acquiredSync" => ("ts_bool(g_iter_acquired_sync)".to_string(), false),
                 "symbol.description" => (format!("ts_symbol_description({})", v(0)), false),
                 "symbol.for" => (format!("ts_symbol_for({})", v(0)), false),
                 "symbol.keyFor" => (format!("ts_symbol_key_for({})", v(0)), false),
@@ -24160,8 +24262,16 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 }
             }
             // Map a stdlib method to its runtime helper. `r` is the receiver value
-            // (boxed tsv); numeric/string args are passed in the helper's ABI.
-            let r = ctx.val(recv.0);
+            // (boxed tsv); numeric/string args are passed in the helper's ABI. A string
+            // method's receiver is tested for null and undefined (RequireObjectCoercible:
+            // a read past an array's end, a `get()!` that missed, both typed string; the
+            // helpers would convert it), but for the code unit read, whose typed string
+            // view tests it for free.
+            let r = if builtin.starts_with("string.") && builtin != "string.charCodeAt" {
+                format!("ts_recv_coercible({})", ctx.val(recv.0))
+            } else {
+                ctx.val(recv.0)
+            };
             let v = |i: usize| -> String {
                 args.get(i)
                     .map(|a| ctx.val(a.0))
@@ -24695,35 +24805,36 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 ),
                 // for..of over a value of no known iterable type (exporter
                 // lowerDynamicForOf): open, next element or TS_ITER_DONE
-                "forof.open" => (format!("ts_forof_open({})", r), false),
+                "forof.open" => (format!("ts_forof_open_inline({})", r), false),
+                // an array pattern's: a string's first <n> code points are enough
+                _ if builtin.starts_with("forof.open:") => {
+                    let limit: u32 = builtin["forof.open:".len()..].parse().unwrap_or(0);
+                    (format!("ts_forof_open_limit_inline({}, {})", r, limit), false)
+                }
                 "forof.isDone" => (format!("(({}) == TS_ITER_DONE)", r), true),
-                _ if builtin.starts_with("forof.next:") => {
-                    let nid: u32 = builtin["forof.next:".len()..].parse().unwrap_or(0);
-                    (
-                        format!("ts_forof_next({}, {}, {})", r, args.get(0).map(|a| ctx.num(a.0)).unwrap_or_else(|| "0".into()), method_key_str(nid, ctx.wksym)),
-                        false,
-                    )
+                // the iterator's `next`, read once when the driver is set up (undefined for the
+                // array `forof.open` walks by index); forof.next: the element at the index, or
+                // an iterator's step through that method
+                _ if builtin.starts_with("forof.method:") => {
+                    let nid: u32 = builtin["forof.method:".len()..].parse().unwrap_or(0);
+                    (format!("ts_forof_method({}, {})", r, method_key_str(nid, ctx.wksym)), false)
                 }
-                _ if builtin.starts_with("iter.step:") => {
-                    // iter.step:<next-method-id> -> step a generic iterator, looking up
-                    // `next` by field key then method key (TS_KEY_METHOD of the id),
-                    // falling back to generator.next. See ts_iter_step.
-                    let nid: u32 = builtin["iter.step:".len()..].parse().unwrap_or(0);
-                    let sent = if args.is_empty() {
-                        "TS_UNDEFINED".to_string()
-                    } else {
-                        v(0)
-                    };
-                    (
-                        format!(
-                            "ts_iter_step({}, {}, {})",
-                            r,
-                            sent,
-                            method_key_str(nid, ctx.wksym)
-                        ),
-                        false,
-                    )
+                "forof.next" => (format!("ts_forof_next({}, {}, {})", r, ctx.num(args[0].0), v(1)), false),
+                "forof.skip" => (format!("ts_forof_skip({}, {}, {})", r, ctx.num(args[0].0), v(1)), false),
+                // IteratorClose of a value's driver: nothing for an array
+                _ if builtin.starts_with("forof.close:") => {
+                    let rid: u32 = builtin["forof.close:".len()..].parse().unwrap_or(0);
+                    (format!("ts_forof_close({}, {})", r, method_key_str(rid, ctx.wksym)), false)
                 }
+                // iter.method:<next-method-id> -> `next` by field key, then method key
+                // (TS_KEY_METHOD of the id); iter.stepWith calls it (generator.next
+                // when there is none). See ts_iter_step_with.
+                _ if builtin.starts_with("iter.method:") => {
+                    let nid: u32 = builtin["iter.method:".len()..].parse().unwrap_or(0);
+                    (format!("ts_iter_next_method({}, {})", r, method_key_str(nid, ctx.wksym)), false)
+                }
+                "iter.stepWith" => (format!("ts_iter_step_with({}, {}, {})", r, v(0), v(1)), false),
+                "iter.stepFresh" => (format!("ts_iter_step_fresh({}, {}, {})", r, v(0), v(1)), false),
                 _ if builtin.starts_with("iter.close:") => {
                     // iter.close:<return-method-id> -> IteratorClose: the iterator's
                     // `return` when it has one (field key, then method key), a generator

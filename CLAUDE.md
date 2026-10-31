@@ -171,6 +171,12 @@ Rust in §315; selfhost is kept as a performance metric).
   no `freeze` read or spelled out) emits no frozen test on typed stores; `O[k](instance)` with `k`
   computed at run time and `O` obtained through `.constructor` is a TypeError at the freeze (V8 freezes,
   Session 362).
+- A symbol through an `any` receiver: `.description` reads undefined and `.toString()` is a TypeError
+  (the typed forms work; there is no `Symbol.prototype` object). `yield*` over an `any` is a compile-time
+  reject (V8 runs it). `#method in o` for a private method answers false (a private field's brand works).
+  A method or accessor of a class in a function that captures the function's locals, and a static
+  initializer that does, are compile-time rejects: such a class is one class for all its evaluations
+  (constructors and field initializers capture).
 - `o.__proto__` and `o["__proto__"]` read undefined (V8: the prototype through the accessor);
   `Object.getPrototypeOf` / `setPrototypeOf` are the modelled forms (Session 355 note).
 - A typed receiver that is a Proxy (vue's reactive arrays and collections) takes its methods through

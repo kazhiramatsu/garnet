@@ -136,6 +136,20 @@ them only if the generator is resumed). Arrays, strings, Map and Set
 iterators have no `return()` and are unaffected; typed loops over
 generators and iterators close as before.
 
+## Generators: parameters and an own `next` (Session 362)
+
+`function* g([a]: any)` binds its parameter pattern (and defaults) inside the coroutine, at the first
+`next`: a value that is not iterable throws there, where V8 throws at the call. A typed `for..of` over a
+`Generator` steps the coroutine itself (`generator.step`): a `next` the program assigns onto the generator
+object, and an object made by `Object.create(gen)`, are not seen. A `gen.return(v)` into a `yield*` closes the
+delegate without passing `v` to its `return` (the outer result is `v`).
+
+## A constructor's return value through `super()` (Session 362)
+
+`class D extends B { b = 2 }` with B's constructor returning an object: `new D()` is the D instance (V8: the
+returned object, on which D's fields are defined). `Reflect.construct(F, args, newTarget)` ignores
+`newTarget`. `new B()` itself takes the returned object.
+
 ## Object(primitive) returns the primitive (Session 350, found at x69)
 
 `Object("x")`, `Object(5)`, `Object(true)` return the primitive itself instead

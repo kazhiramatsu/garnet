@@ -94,6 +94,9 @@ export interface ClassInfo {
   parentId?: number;
   ownMethods: MethodInfo[];
   ownFields: string[];
+  /** The fields only `this.x = ...` in the constructor declares: an accessor of that name, here or
+   *  above, takes the store instead (`dropAccessorStores`). Not serialized. */
+  ctorAssigned?: string[];
   instantiated: boolean;
   stable: boolean;
   reasons: string[]; // why it was marked unstable (diagnostics)
@@ -241,6 +244,9 @@ export class ClassExtractor {
         // erases it. The compiler's `SymbolLinks` is a brand-only class of
         // this form, instantiated once per symbol (Session 350).
         if (mods?.some((mod) => mod.kind === ts.SyntaxKind.DeclareKeyword)) continue;
+        // `abstract x: T` likewise emits nothing: a subclass implements it with a field of its own,
+        // laid out in its own order, or with an accessor on its prototype, which a slot here would hide.
+        if (mods?.some((mod) => mod.kind === ts.SyntaxKind.AbstractKeyword)) continue;
         const fn = memberKeyName(nameNode);
         if (fn === undefined) { info.reasons.push("computed-field-name(dynamic)"); info.stable = false; continue; }
         // a property initialized to a function value is effectively a reassignable
@@ -281,7 +287,10 @@ export class ClassExtractor {
         const lhs = n.left;
         if (ts.isPropertyAccessExpression(lhs) && lhs.expression.kind === ts.SyntaxKind.ThisKeyword) {
           const f = lhs.name.text;
-          if (!info.ownFields.includes(f)) info.ownFields.push(f);
+          if (!info.ownFields.includes(f)) {
+            info.ownFields.push(f);
+            (info.ctorAssigned ??= []).push(f);
+          }
         } else if (ts.isElementAccessExpression(lhs) && lhs.expression.kind === ts.SyntaxKind.ThisKeyword) {
           info.reasons.push("dynamic-this-write"); // this[expr] = ...
           info.stable = false;
@@ -295,6 +304,22 @@ export class ClassExtractor {
       n.forEachChild(visit);
     };
     if (ctor.body) ctor.body.forEachChild(visit);
+  }
+
+  /** `this.w = v` in a constructor with an accessor `w` on the class or an ancestor runs the setter: no
+   *  field, no own key. Runs once every class is declared, the parents resolved. */
+  private dropAccessorStores(): void {
+    for (const info of this.classes) {
+      if (!info.ctorAssigned) continue;
+      const accessor = (f: string): boolean => {
+        for (let c: ClassInfo | undefined = info; c; c = c.parentId !== undefined ? this.classes[c.parentId] : undefined) {
+          if (c.ownMethods.some((m) => m.name === f && (m.kind === "getter" || m.kind === "setter"))) return true;
+        }
+        return false;
+      };
+      info.ownFields = info.ownFields.filter((f) => !(info.ctorAssigned!.includes(f) && accessor(f)));
+      delete info.ctorAssigned;
+    }
   }
 
   // ----- pass 2: whole-program stability scan -----
@@ -1256,6 +1281,7 @@ export class ClassExtractor {
       }
     }
     this.breakParentCycles();
+    this.dropAccessorStores();
     for (const sf of sfs) this.scanStability(sf);
     for (const sf of sfs) this.scanStructuralFlows(sf);
     this.closeStructuralFlows();

@@ -234,7 +234,8 @@ static int shared_iter_keys_count(tsv m){
   tsv it = ts_map_keys(m); ts_gc_root(&it);
   ts_key nmk = ts_intern_field("next", 4), donek = ts_intern_field("done", 4);
   int n = 0;
-  for (;;){ tsv r = ts_iter_step(it, TS_UNDEFINED, nmk); if (ts_truthy(ts_get(r, donek))) break; if (++n > 100000) break; }
+  tsv next_m = ts_iter_next_method(it, nmk);
+  for (;;){ tsv r = ts_iter_step_with(it, next_m, TS_UNDEFINED); if (ts_truthy(ts_get(r, donek))) break; if (++n > 100000) break; }
   ts_gc_unroot(1);
   return n;
 }

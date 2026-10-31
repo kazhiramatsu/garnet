@@ -130,3 +130,106 @@ delete, inherited reads before and after the prototype's value, method,
 accessor and relink change, an iterator in dictionary mode, own `next`s
 across shapes beside an inherited one, an array-like whose `length`
 restructures its iterator).
+
+## GetIterator's record, and array patterns the types do not settle (Session 361)
+
+Differential tests written while reviewing the iterator state above found three places where the
+drivers were not the protocol. All three are silent or nearly so, and the first two give wrong values.
+
+**An array pattern over an `any` was an index walk.** `iterablePatternSource` and
+`dynamicPatternDriver` sent `any`, `unknown` and strings to the index path ("read by index"), so
+`const [a, b] = v` with `v: any` holding a Set, a generator or a custom iterable read `v[0]` and `v[1]`
+and bound undefined, a Map's `[[k, v]]` threw reading `undefined[0]`, and a non-iterable (an object with
+a `length`, a number) was accepted where V8 throws. The same held for a parameter `([a, b]: any)`, a
+nested pattern and `for (const [a, b] of anys)`. A string pattern split surrogate pairs: `const [a] =
+"😀"` bound a lone surrogate.
+
+Such a pattern now goes through `valueIterDriver`, which is the dynamic `for..of`'s pair: `forof.open`
+gives an array as it is, or an iterator through GetIterator (a string's code points as an array, a
+TypeError for what is not iterable), and `forof.next` gives the element at the index in line, or a
+step, with the done marker instead of a result object. So a real array in an `any` keeps its index read
+with no iterator object, and `lowerArrayPatternByProtocol` takes the driver's `elemStep`. IteratorClose
+at the end of a pattern is `forof.close` (nothing for an array). A pattern whose type is an array, a
+tuple or a union of them stays the index path; every other type, a union with a string among them,
+takes the driver. `TSAOT_FOROF_DYNAMIC=0` keeps the index reads.
+
+**`next` was read on every step.** GetIterator's record holds the `next` method read once: a `next`
+the iterator replaces while it runs is not seen by the loop, and a getter runs once. `ts_iter_step`
+read it per step (behind the four-entry cache above), so an iterator that reassigned `this.next`
+stopped early: `for (const x of it)` gave `1` where V8 gives `1,2,3`, for an `any`, a class and an
+interface alike, and in a pattern. The drivers now read it once when they are set up, into a local:
+`iter.method:<id>` (`ts_iter_next_method`: the field key, then the method key) or `forof.method:<id>`
+(undefined for an array), and each step takes the local (`iter.stepWith`, `forof.next`,
+`ts_iter_step_with`). `ts_iter_step` and its cache are gone, and with them a lookup per step on every
+iterator loop, and the class of bug the cache's own-`next` entry had. A driver over one of our generator
+objects keeps `generator.step`.
+
+**`ts_forof_open` took any object as an iterator.** An object without `[Symbol.iterator]` was returned
+as its own iterator ("an object with next"): `for (const x of { next() {...} })` ran, where V8 throws.
+Generator objects have `[Symbol.iterator]` (their prototype's), so nothing needs the fallback: such a
+value is a TypeError when the loop or the pattern opens.
+
+Spread, `Array.from`, `new Set`, `new Map`, `Promise.all`, `Object.fromEntries` and a call's spread were
+already right (each reads `next` once in the runtime). Not changed: `yield*` over an `any` is a
+compile-time reject, and a dynamic `for..of` that exits early does not close its iterator
+(`tests/conformance/KNOWN_GAPS.md`: a `try` per loop entry for the sake of the iterators that have a
+`return`).
+
+**The review of this slice** (Session 362) found three regressions no gate of the worktree had run into,
+and the protocol's other gaps behind the new driver:
+
+- The runtime's two users of `ts_forof_next` (`ts_forof_array_source`, `ts_mapset_cursor_source`: a typed
+  loop over a Proxy of an array or a collection) passed their `ts_key` where the step now takes the `next`
+  method, and C widened the integer silently. They read the method once as the drivers do.
+- The driver's type test asked for `pat.parent`'s type, the checker's error `any` for a declaration with
+  a pattern name, so every typed pattern took `forof.*`. It asks for `pat`'s. `const [a, b] = [y, x]` is
+  back at no instructions at all (SROA), `for (const [a, b] of rows)` at the index reads.
+- A string pattern copied the string (`const [c] = s` on 100 KB: 0.05 -> 526 G instructions). A pattern of n
+  elements opens with `forof.open:<n>` (`ts_forof_open_limit`): the first n code points; a rest element
+  takes them all.
+
+**IteratorClose in a pattern.** A throw while an element binds (a default that runs code, a nested
+pattern, a property target: `risky`) closes the iterator and the throw goes on. `done` stands for the
+record's [[Done]]: true across a step, so a `next`, `done` or `value` that throws closes nothing; what the
+close throws on a throw completion is dropped (a `TryCatch` around `returnCall` in the catch path). Such a
+`try` exists only for a pattern with a risky element. The typed loop's close follows the same rule
+(`resolveIterator`'s drivers, lowerForOf's try): `threw` picks the dropping close, a `break` or a
+`return` the checking one. `ts_iter_close` itself is the normal completion's: a `return` neither nullish
+nor callable and a result that is no object are TypeErrors. A Proxy sees one read of `next` and one of
+`return` (the method-key read and the generator test skip it).
+
+**Order and elisions.** An assignment pattern's property target is evaluated before its element's step
+(`IterPatternElement.pre`, `lowerAssignRefPre`). An elision steps without reading `value`
+(`forof.skip`, `ts_forof_skip_slow`).
+
+**What counts as an object.** `ts_object_like` is the coercion gates' test: an ordinary function is no
+object there and a Symbol's cell is. The protocol's checks take `ts_iter_object`: a function with
+`[Symbol.iterator]`, a function as an iterator or as a result work, a Symbol is a TypeError. A
+`next` that answers no object is a TypeError in the step itself (`iter_step`), for every driver, so a typed
+loop no longer spins on it.
+
+**Drivers and arrays.** The drivers take an array for the source, so an array handed back by
+`[Symbol.iterator]()` was walked by index, whatever its `next`: the open wraps it in a Proxy (cold). An array
+with an own `[Symbol.iterator]` runs that (`array_own_iterator`, behind one load of the property count:
+`ts_forof_plain_array`, also in spread). A pattern nested in another, or a loop's assignment target
+(`[[a, b]] = v`, `for ([a, b] of v)`), comes without a type and takes `valueIterDriver`; a top-level
+pattern over an array or a tuple takes `lowerAssignArrayByIndex`.
+
+**GetIterator by the value.** An `IterableIterator` type goes through `[Symbol.iterator]` (`iter.acquire`),
+the value itself was its own iterator; a union with a generator takes GetIterator too (`isGeneratorType`
+asks of every member); an object with `next` and no `[Symbol.iterator]` is a TypeError in
+`ts_iter_acquire`; a class type closes when a subclass declares `return` (`iteratorMayHaveReturn`).
+
+**for-await over a sync source.** Each value is awaited (`awaitValue`: always for a source the types call
+sync, by `g_iter_acquired_sync` when `iter.acquire:1` fell back at run time); an array or a string is
+accepted (it was a compile-time reject). A step an `await` separates from the reads of `done` and
+`value` never takes the coroutine's scratch result (`generator.next`, `iter.stepFresh`): two loops
+sharing a sync generator overwrote each other's.
+
+Still open, listed in `tests/conformance/KNOWN_GAPS.md`: a generator's parameter patterns bind at the first
+`next` (V8: at the call), a `next` assigned onto a generator object is not seen by a typed loop.
+
+Fixture `iteration/iterator_protocol_fidelity` (`next` once through every driver, a `next` getter,
+patterns over a Set, Map, generator, custom iterable and typed array in an `any`, closing, parameters,
+nested patterns, defaults, assignment targets, `for..of` variables, holes, a Proxy of an array, code
+points, every non-iterable's TypeError).

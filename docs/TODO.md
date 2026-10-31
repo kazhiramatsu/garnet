@@ -12601,3 +12601,39 @@ Next session, in order:
   234.7 -> 238.4, SmartRouter 54.6 -> 55.6; tsc-ts 21.865 -> 21.979 G instructions (+0.52%), cycles +1.33%,
   wall 1.14 -> 1.15 s. Switching each fix off in turn on hono: `field_struct` and the scan leave its binary
   byte-identical, `drop_reassigned_classes` is about 1% on RegExpRouter; the rest is placement.
+- **The iteration slice** (r29, Session 361's `9c0e5c4`, `c9edeb0`, `docs/array_iterators_design.md`) with what
+  its review found. Regressions of the slice: the runtime's two callers of `ts_forof_next` passed a key where
+  the step takes the method (a typed loop over a Proxy threw; conformance 701/704 on the worktree, which had
+  run only the `forof|destruct` fixtures), the driver asked for `pat.parent`'s type (every typed pattern took
+  `forof.*`, up to 1,500x on `const [a, b] = [y, x]`), a string pattern copied the string. The protocol's gaps
+  behind it: IteratorClose on a throw in a pattern, a target's reference before its step, a TypeError for
+  a `return` that is not callable or answers no object (a throw completion drops them, loops too), one
+  read of each method through a Proxy, an elision's unread `value`, functions as objects and Symbols not, an
+  array handed back as an iterator, an own `[Symbol.iterator]` on an array, nested assignment patterns, an
+  `IterableIterator`'s `[Symbol.iterator]`, a union with a generator, a subclass's `return`, for-await over a
+  sync source (values awaited, arrays and strings accepted, a compile-time reject before), two loops sharing a
+  sync generator across awaits, `next` called with no argument. Fixtures `iteration/iterator_protocol_fidelity`,
+  `iterator_close_protocol`, `iterator_acquire_protocol`. Open: `tests/conformance/KNOWN_GAPS.md`.
+- **Numeric locals across a `try`** (`try_volatile_locals`, `docs/exceptions_design.md`): an unboxed number or
+  boolean written in a try body and read in the catch, the finally or after them was a C local after a
+  `longjmp`: `let n = 0; try { n = 1; f(); } catch { return n; }` answered 0 at -O2, `sum` in a loop around a
+  `try` lost updates. The design note said no catch reads one. Reference locals had memory homes, coroutines
+  frames; these are `volatile` now. `exceptions/try_numeric_locals`.
+- **`abstract` properties** emit nothing (`class_extract.ts`): the slot in the base hid a subclass's accessor,
+  `this.kind` read undefined. With the slot gone, SROA's inlining of a method reading a field the receiver's
+  class lacks dropped the receiver (`touches_undeclared_field`). `this.w = v` in a constructor with an accessor
+  `w` adds no field. A class instance on a prototype chain answers its fields (`Object.create(instance)`, read
+  and `in`). `classes/abstract_and_accessor_members`.
+- **Typed receivers that are null or undefined** (`types/typed_receiver_nullish`): `xs[9].length` on a `string[]`
+  faulted (the test is now the typed reads' short-or-heap dispatch, free on a heap string), `get()!.toUpperCase()`
+  answered "UNDEFINED", `rows[9].push(1)` 0, `rows[9].length` 0. String methods test the receiver
+  (`ts_recv_coercible`), the array builtins in their no-array path.
+- A function declared in a block at the top level of a module read an unset binding
+  (`hoisting/top_level_block_functions`). `break L` out of a labeled block compiles: a one-shot loop
+  (`statements/labeled_blocks`); it was a reject.
+- Gates (`build/gates_s362a/run.sh`): unit, bundler 54/54, conformance 719/719 plain and strict, 716/716 under
+  protect, bench, ci, the engine diff in both modes, the GC gate, the hono survey 42/43. ir-parity differs in
+  120 programs, those with a typed loop over an iterator or a pattern driver, as the lowering changed.
+- Alternating on a quiet machine, outputs identical (r28 -> r29; Node): vue 872.6 -> 878.8 ms, hono_app 124.8 ->
+  123.6 (154), TrieRouter 211.4 -> 215.1, RegExpRouter 55.1 -> 54.2, PatternRouter 238.8 -> 235.6, SmartRouter 56.3
+  -> 55.5; tsc-ts 21.976 -> 22.060 G instructions (+0.38%), cycles 0.9991, wall 1.16 s.

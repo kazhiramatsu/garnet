@@ -962,8 +962,17 @@ static inline ts_string* ts_str_ptr(tsv s){
    Parent-view traversal is uncommon and substantially larger, so it lives in
    the precompiled runtime rather than being replicated at every call site. */
 ts_strview ts_str_view_typed_slow(tsv s);
+/* A value typed string that is none at run time (`xs[i].length` past the end, a `get()!` that missed):
+   the type's claim is checked where the test is free, the typed reads' short-or-heap dispatch, so
+   the read is the TypeError V8 throws and not a fault. */
+_Noreturn void ts_throw_receiver(tsv s);
+static inline tsv ts_recv_coercible(tsv s){
+  if (TS_RT_UNLIKELY(s == TS_UNDEFINED || s == TS_NULL)) ts_throw_receiver(s);
+  return s;
+}
 static inline ts_strview ts_str_view_typed(tsv s){
-  if (TS_RT_UNLIKELY(ts_is_short_str(s))){
+  if (TS_RT_UNLIKELY(!ts_is_heap_str(s))){
+    if (!ts_is_short_str(s)) ts_throw_receiver(s);
     uint32_t len = ts_short_str_len(s);
     ts_strview v = { NULL, len, len > 4u ? ts_short_str_byte(s, 4) : 0,
                      TS_STR_FLAG_ASCII, 0 };
@@ -1000,9 +1009,9 @@ static inline uint32_t ts_str_len_fast(tsv s){
     : ts_str_ptr_typed(s)->len;
 }
 static inline uint32_t ts_str_len_typed(tsv s){
-  return TS_RT_UNLIKELY(ts_is_short_str(s))
-    ? ts_short_str_len(s)
-    : ts_str_ptr_typed(s)->len;
+  if (TS_RT_LIKELY(ts_is_heap_str(s))) return ts_str_ptr_typed(s)->len;
+  if (ts_is_short_str(s)) return ts_short_str_len(s);
+  ts_throw_receiver(s);
 }
 static inline long long ts_i64_decimal_len_nonneg(long long x){
   if (x < 10LL) return 1;
@@ -1319,7 +1328,7 @@ static inline double ts_length(tsv v){
   if (ts_is_indexed_array_fast(v)) return (double)((ts_array*)ts_ptr(v))->len;
   return ts_length_slow(v);
 }
-uint32_t ts_array_len_foreign(tsv v);   /* a Proxy's length through its trap; 0 for anything else */
+uint32_t ts_array_len_foreign(tsv v);   /* a Proxy's length through its trap; null and undefined throw; 0 for anything else */
 static inline uint32_t ts_array_len_fast(tsv arr){
   return ts_is_indexed_array_fast(arr) ? ((ts_array*)ts_ptr(arr))->len : ts_array_len_foreign(arr);
 }
@@ -3807,14 +3816,35 @@ tsv ts_sb_append_range(tsv sb, tsv s, uint32_t start, uint32_t end);
 double ts_sb_len(tsv sb);
 tsv ts_sb_finish(tsv sb);
 tsv ts_forof_open(tsv v);
-tsv ts_forof_next_slow(tsv it, ts_key next_key);
-static inline tsv ts_forof_next(tsv it, double idx, ts_key next_key){
+tsv ts_forof_open_limit(tsv v, double limit);
+tsv ts_iter_next_method(tsv iter, ts_key nmk);
+tsv ts_iter_close(tsv iter, ts_key rmk);
+tsv ts_forof_next_slow(tsv it, tsv next_method);
+tsv ts_forof_skip_slow(tsv it, tsv next_method);
+/* An array needs no opening; the three tests of a pattern over one fold into one. */
+static inline int ts_forof_plain_array(tsv v){ return ts_is_indexed_array_fast(v) && obj_map_plain((ts_object*)ts_ptr(v))->len == 0; }
+static inline tsv ts_forof_open_inline(tsv v){ return ts_forof_plain_array(v) ? v : ts_forof_open(v); }
+static inline tsv ts_forof_open_limit_inline(tsv v, double limit){ return ts_forof_plain_array(v) ? v : ts_forof_open_limit(v, limit); }
+/* The next method of what ts_forof_open returned, read once per loop (GetIterator's record). */
+static inline tsv ts_forof_method(tsv it, ts_key nmk){
+  return ts_is_indexed_array_fast(it) ? TS_UNDEFINED : ts_iter_next_method(it, nmk);
+}
+static inline tsv ts_forof_next(tsv it, double idx, tsv next_method){
   if (ts_is_indexed_array_fast(it)){
     uint32_t i = (uint32_t)idx;
     if (i >= ((ts_array*)ts_ptr(it))->len) return TS_ITER_DONE;
     return ts_array_get_inline(it, i);
   }
-  return ts_forof_next_slow(it, next_key);
+  return ts_forof_next_slow(it, next_method);
+}
+/* A pattern's elision: ts_forof_next without the element (undefined for "not done"). */
+static inline tsv ts_forof_skip(tsv it, double idx, tsv next_method){
+  if (ts_is_indexed_array_fast(it)) return (uint32_t)idx >= ((ts_array*)ts_ptr(it))->len ? TS_ITER_DONE : TS_UNDEFINED;
+  return ts_forof_skip_slow(it, next_method);
+}
+/* IteratorClose of a value an array pattern left open; an array has none to close. */
+static inline tsv ts_forof_close(tsv it, ts_key rmk){
+  return ts_is_indexed_array_fast(it) ? TS_UNDEFINED : ts_iter_close(it, rmk);
 }
 static inline int ts_array_get_inline_try(tsv arr, int64_t i, tsv* out){
   if (ts_is_indexed_array_fast(arr)){
@@ -4018,7 +4048,7 @@ typedef struct ts_coro {
   int nvals;                 /* tsv locals leading the frame, scanned precisely;
                                 -1 = scan the frame conservatively (ts_coro_alloc_v) */
   tsv yielded;               /* generator: value produced by the current yield */
-  tsv iter_result;           /* generator: the {value, done} the iteration drivers reuse (ts_iter_step) */
+  tsv iter_result;           /* generator: the {value, done} the iteration drivers reuse (ts_iter_step_with) */
   int done;                  /* generator: 1 when the body has completed */
   int gen_status;            /* generator protocol lifecycle (TS_GEN_*) */
   int is_asyncgen;
@@ -4101,7 +4131,9 @@ tsv ts_gen_new_v(tsv cv);
 tsv ts_gen_next(tsv genobj, tsv sent);
 tsv ts_gen_step(tsv genobj, tsv sent);   /* a driver's step: the coroutine's own result object (emit_c generator.step) */
 tsv ts_asyncgen_next(tsv genobj, tsv sent);
-tsv ts_iter_step(tsv iter, tsv sent, ts_key nmk); /* generic iterator step: field/method `next` or generator fallback */
+tsv ts_iter_step_fresh(tsv iter, tsv next_method, tsv sent);
+extern int g_iter_acquired_sync;
+tsv ts_iter_step_with(tsv iter, tsv next_method, tsv sent); /* generic iterator step: its `next` (ts_iter_next_method) or the generator fallback */
 tsv ts_iter_close(tsv iter, ts_key rmk);         /* IteratorClose: `return` when present, generator return fallback */
 tsv ts_iter_acquire(tsv v, int async);           /* GetIterator over the runtime's representations */
 tsv ts_encode_uri_component(tsv v);

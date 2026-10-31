@@ -1071,7 +1071,13 @@ fn find_sroa_targets(
                                     // methods the callee calls on its own `this` (the rewrite
                                     // splices those too; a nested return in any of them would
                                     // be dropped).
-                                    if captures_this(callee_fn)
+                                    // A field the receiver's class does not declare (`this.kind` of an
+                                    // `abstract` property a subclass implements with an accessor) is
+                                    // no scalar of the object: the read needs it.
+                                    let undeclared = alloc_class.get(&resolve(r.0, alias)).and_then(|c| class_fields.get(c))
+                                        .map_or(false, |fields| touches_undeclared_field(callee_fn, fields, bodies, 0));
+                                    if undeclared
+                                        || captures_this(callee_fn)
                                         || returns_receiver(callee_fn)
                                         || needs_materialized_this(callee_fn, bodies, 0)
                                         || !inline_chain_safe(callee_fn, bodies, &mut Vec::new(), 0)
@@ -2216,6 +2222,27 @@ fn trim_trailing_alloc_proto_load(out: &mut Vec<Inst>, proto_local: u32) {
 /// use of the receiver would be spliced into the caller with the callee's raw
 /// local id (it read the caller's local 0, the module scope record, instead of
 /// the receiver). Depth-guarded; conservative (returns true) on overflow.
+/// Does a method, or a method it calls on its own `this`, touch a field of `this` outside `fields`?
+fn touches_undeclared_field(f: &Function, fields: &[u32], bodies: &BTreeMap<u32, Function>, depth: u32) -> bool {
+    fn scan(body: &[Inst], p0: u32, fields: &[u32], bodies: &BTreeMap<u32, Function>, depth: u32) -> bool {
+        body.iter().any(|inst| match inst {
+            Inst::LoadField { obj, field, .. } | Inst::StoreField { obj, field, .. } => obj.0 == p0 && !fields.contains(&field.0),
+            Inst::Call { recv: Some(r), callee: CalleeRef::Direct { func }, .. } if r.0 == p0 => {
+                bodies.get(&func.0).map_or(false, |cf| touches_undeclared_field(cf, fields, bodies, depth + 1))
+            }
+            Inst::If { then_body, else_body, .. } => scan(then_body, p0, fields, bodies, depth) || scan(else_body, p0, fields, bodies, depth),
+            Inst::Loop { cond_body, body, .. } => scan(cond_body, p0, fields, bodies, depth) || scan(body, p0, fields, bodies, depth),
+            Inst::TryCatch { try_body, catch_body, finally_body, .. } => {
+                scan(try_body, p0, fields, bodies, depth) || scan(catch_body, p0, fields, bodies, depth) || scan(finally_body, p0, fields, bodies, depth)
+            }
+            _ => false,
+        })
+    }
+    if depth > 16 {
+        return true;
+    }
+    f.params.first().map_or(false, |p| scan(&f.body, p.0, fields, bodies, depth))
+}
 fn needs_materialized_this(f: &Function, bodies: &BTreeMap<u32, Function>, depth: u32) -> bool {
     // the answer is a function of the callee and the depth over the run's fixed `bodies`:
     // without the table a class of mutually recursive methods (tsc's binder) was walked again

@@ -1997,7 +1997,9 @@ int g_has_callable_proxies = 0;
    entries' existing non-array branches, so an array pays nothing. The function-value forms
    (ts_arrproto_*) never come back here for a Proxy: they read the elements through the traps
    (arrproto_elements) or run the generic algorithm (arrlike_*), as Array.prototype.x.call(proxy) does. */
-#define TS_ARRAY_PROXY(arr) (TS_RT_UNLIKELY(g_has_proxies) && ts_is_proxy(arr))
+/* The array builtins' test of a receiver that is no array: null and undefined throw here, the one
+   path all of them take (a typed array read past an end: `rows[9].push(1)` answered 0). */
+#define TS_ARRAY_PROXY(arr) ((void)ts_recv_coercible(arr), TS_RT_UNLIKELY(g_has_proxies) && ts_is_proxy(arr))
 tsv ts_new_map(void);
 tsv ts_new_set(void);
 int g_typed_slow = 0;    /* declared in ts_rt.h; see ts_typed_slow there */
@@ -3617,6 +3619,14 @@ static void fn_realize_virtual(tsv fnv, ts_key key){
   ts_write_barrier(fnv, v);
   ts_gc_unroot(2);
 }
+/* A class instance on a prototype chain (`Object.create(instance)`: a child logger, a scope object)
+   holds its fields in its struct, which the chain's slot lookup does not see. */
+static inline int chain_link_field(ts_object* o, ts_key key, tsv* out){
+  size_t off; int numeric;
+  if (TS_RT_LIKELY(o->h.kind != TS_KIND_OBJECT || !ts_obj_is_sized(o)) || !class_field_lookup(o, key, &off, &numeric)) return 0;
+  *out = struct_field_get(o, off, numeric);
+  return 1;
+}
 static int lookup_prop_chain(tsv receiver, ts_object* o, ts_key key, tsv* out){
   while (o){
     if (chain_link_exotic(o)){
@@ -3626,6 +3636,7 @@ static int lookup_prop_chain(tsv receiver, ts_object* o, ts_key key, tsv* out){
       continue;
     }
     if (TS_RT_UNLIKELY(o->h.kind == TS_KIND_FUNC) && fn_link_get(o, key, out)) return 1;
+    if (chain_link_field(o, key, out)) return 1;
     tsv* s = find_slot(o, key, 0);
     if (s){
       if (is_accessor(*s)){
@@ -3654,6 +3665,7 @@ static int lookup_prop_chain_until(tsv receiver, ts_object* o, ts_object* stop, 
       continue;
     }
     if (TS_RT_UNLIKELY(o->h.kind == TS_KIND_FUNC) && fn_link_get(o, key, out)) return 1;
+    if (chain_link_field(o, key, out)) return 1;
     tsv* s = find_slot(o, key, 0);
     if (s){
       if (is_accessor(*s)){
@@ -3720,6 +3732,8 @@ static inline ts_object* ts_class_static_container(tsv v){
    decision in one place so a future coercion path can't silently forget it.
    Outside these gates, ts_is_class_value is used only by instanceof. */
 static inline int ts_object_like(tsv v){ return ts_is_obj(v) || ts_is_class_value(v); }
+/* An Object for the iteration protocol's checks: a function too, a Symbol's cell not. */
+static inline int ts_iter_object(tsv v){ return ts_is_callable(v) || (ts_object_like(v) && !ts_is_symbol(v)); }
 
 /* Object.freeze / Object.isFrozen / Object.create. Integrity remains logically
    separate from hidden-class identity; write caches consult it on every hit.
@@ -8189,6 +8203,7 @@ tsv ts_array_iter_typed(tsv arr, int kind){
 /* `arr.length` at a typed site on a receiver that is not an array: a Proxy's length through its get
    trap; anything else reads 0, as before (ts_array_len_fast's non-array answer). */
 uint32_t ts_array_len_foreign(tsv v){
+  if (ts_is_undef(v) || ts_is_null(v)) ts_throw_cannot_read(v, "length");
   if (!(g_has_proxies && ts_is_proxy(v))) return 0;
   double d = arrlike_len(v);
   return d > 4294967295.0 ? 4294967295u : (uint32_t)d;
@@ -8212,13 +8227,13 @@ tsv ts_forof_array_source(tsv v){
   ts_gc_root(&v);
   tsv out = ts_new_array(0); ts_gc_root(&out);
   tsv it = ts_forof_open(v); ts_gc_root(&it);
-  ts_key knext = ts_intern_field("next", 4);
+  tsv nm = ts_forof_method(it, ts_intern_field("next", 4)); ts_gc_root(&nm);
   for (double i = 0;; i += 1){
-    tsv e = ts_forof_next(it, i, knext);
+    tsv e = ts_forof_next(it, i, nm);
     if (e == TS_ITER_DONE) break;
     ts_array_push(out, e);
   }
-  ts_gc_unroot(3);
+  ts_gc_unroot(4);
   return out;
 }
 /* The collection a cursor-driven `for..of` walks (docs/map_cursor_forof_design.md): the Map or Set
@@ -8229,9 +8244,9 @@ tsv ts_mapset_cursor_source(tsv coll, int is_map){
   ts_gc_root(&coll);
   tsv copy = is_map ? ts_new_map() : ts_new_set(); ts_gc_root(&copy);
   tsv it = ts_forof_open(coll); ts_gc_root(&it);
-  ts_key knext = ts_intern_field("next", 4);
+  tsv nm = ts_forof_method(it, ts_intern_field("next", 4)); ts_gc_root(&nm);
   for (double i = 0;; i += 1){
-    tsv e = ts_forof_next(it, i, knext);
+    tsv e = ts_forof_next(it, i, nm);
     if (e == TS_ITER_DONE) break;
     ts_gc_root(&e);
     if (is_map){
@@ -8245,7 +8260,7 @@ tsv ts_mapset_cursor_source(tsv coll, int is_map){
     }
     ts_gc_unroot(1);
   }
-  ts_gc_unroot(3);
+  ts_gc_unroot(4);
   return copy;
 }
 
@@ -14334,10 +14349,37 @@ tsv ts_json_parse_reviver(tsv text, tsv reviver){
 }
 
 /* push all elements of src array onto dst array (for array-literal spread) */
+/* An array with an own [Symbol.iterator]: iterating it runs that, not the index walk. (A replaced
+   Array.prototype[Symbol.iterator] is outside the model.) */
+static int array_own_iterator(tsv v){
+  ts_object* o = (ts_object*)ts_ptr(v);
+  return TS_RT_UNLIKELY(obj_map_plain(o)->len != 0) && pref_ok(prop_find(o, TS_KEY_WKSYM(TS_WKSYM_ITERATOR)));
+}
+/* A string's code points, at most `max` of them, as strings of one or two units. `dst` and `src` are
+   the caller's rooted values. */
+static void array_push_code_points(tsv dst, tsv src, uint32_t max){
+  uint32_t i = 0;
+  for (uint32_t n = 0; n < max; n++){
+    uint32_t len = ts_str_len_typed(src);
+    if (i >= len) break;
+    ts_strview xs = ts_str_view_typed(src);
+    uint32_t clen = 1;
+    uint16_t hi = ts_str_cu_at_view(xs, i);
+    if (hi >= 0xD800u && hi <= 0xDBFFu && i + 1 < len){
+      uint16_t lo = ts_str_cu_at_view(xs, i + 1);
+      if (lo >= 0xDC00u && lo <= 0xDFFFu) clen = 2;
+    }
+    tsv ch = ts_string_slice_view(src, i, clen);
+    ts_gc_root(&ch);
+    ts_array_push(dst, ch);
+    ts_gc_unroot(1);
+    i += clen;
+  }
+}
 void ts_array_push_all(tsv dst, tsv src){
   ts_gc_root(&dst); ts_gc_root(&src);
   ts_array* s=as_arr(src);
-  if (s){
+  if (s && !array_own_iterator(src)){
     uint32_t len = s->len;
     for(uint32_t i=0;i<len;i++){
       ts_array_push(dst, ts_array_get(src, i));
@@ -14377,23 +14419,7 @@ void ts_array_push_all(tsv dst, tsv src){
     return;
   }
   if (ts_is_str(src)){
-    uint32_t i = 0;
-    for(;;){
-      uint32_t len = ts_str_len_typed(src);
-      if (i >= len) break;
-      ts_strview xs = ts_str_view_typed(src);
-      uint32_t clen = 1;
-      uint16_t hi = ts_str_cu_at_view(xs, i);
-      if (hi >= 0xD800u && hi <= 0xDBFFu && i + 1 < len){
-        uint16_t lo = ts_str_cu_at_view(xs, i + 1);
-        if (lo >= 0xDC00u && lo <= 0xDFFFu) clen = 2;
-      }
-      tsv ch = ts_string_slice_view(src, i, clen);
-      ts_gc_root(&ch);
-      ts_array_push(dst, ch);
-      ts_gc_unroot(1);
-      i += clen;
-    }
+    array_push_code_points(dst, src, UINT32_MAX);
     ts_gc_unroot(2);
     return;
   }
@@ -14564,26 +14590,31 @@ tsv ts_sb_finish(tsv sb){
    An array is walked by index (returned as is); a string by code points (a
    snapshot: strings are immutable); anything else through GetIterator: its
    [Symbol.iterator]() (Map / Set iterators are live, a generator is its own),
-   or the value itself when it is already an iterator. */
-tsv ts_forof_open(tsv v){
-  if (ts_is_indexed_array_fast(v)) return v;
+   a TypeError without one. */
+static tsv forof_open_limit(tsv v, double limit){
+  if (ts_is_indexed_array_fast(v) && !array_own_iterator(v)) return v;
   ts_gc_root(&v);
   tsv r = TS_UNDEFINED; ts_gc_root(&r);
   if (ts_is_str(v)){
     r = ts_new_array(0);
-    ts_array_push_all(r, v);
-  } else if (ts_object_like(v)){
+    array_push_code_points(r, v, limit < 0 ? UINT32_MAX : (uint32_t)limit);
+  } else if (ts_iter_object(v)){
     tsv itf = ts_get(v, TS_KEY_WKSYM(TS_WKSYM_ITERATOR));
     if (ts_is_callable(itf)){
       ts_gc_root(&itf);
       tsv a0 = v;
       r = ts_call_method(itf, &a0, 1);
       ts_gc_unroot(1);
-      if (!ts_object_like(r)) ts_throw_type_error_msg("Result of the Symbol.iterator method is not an object");
-    } else if (itf != TS_UNDEFINED && itf != TS_NULL){
-      ts_throw_type_error_msg("Symbol.iterator is not callable");
+      if (!ts_iter_object(r)) ts_throw_type_error_msg("Result of the Symbol.iterator method is not an object");
+      /* an array handed back as the iterator is stepped by its `next`, not walked by index (the
+         drivers take an array for the source): an iterator object around it */
+      if (TS_RT_UNLIKELY(ts_is_indexed_array_fast(r))){
+        tsv handler = ts_new_object(); ts_gc_root(&handler);
+        r = ts_proxy_new(r, handler);
+        ts_gc_unroot(1);
+      }
     } else {
-      r = v;      /* an iterator (a generator object, an object with next) */
+      ts_throw_type_error_msg(itf == TS_UNDEFINED || itf == TS_NULL ? "object is not iterable (cannot read property Symbol(Symbol.iterator))" : "Symbol.iterator is not callable");
     }
   } else {
     char buf[96];
@@ -14594,16 +14625,29 @@ tsv ts_forof_open(tsv v){
   ts_gc_unroot(2);
   return r;
 }
-tsv ts_forof_next_slow(tsv it, ts_key next_key){
-  static ts_key kdone, kvalue;
-  if (!kdone){ kdone = ts_intern_field("done", 4); kvalue = ts_intern_field("value", 5); }
-  tsv res = ts_iter_step(it, TS_UNDEFINED, next_key);
-  if (!ts_object_like(res)) ts_throw_type_error_msg("Iterator result is not an object");
-  ts_gc_root(&res);
+tsv ts_forof_open(tsv v){ return forof_open_limit(v, -1); }
+/* An array pattern takes as many elements as it has: a string's first code points, not all of them
+   (a pattern with a rest element opens with ts_forof_open). */
+tsv ts_forof_open_limit(tsv v, double limit){ return forof_open_limit(v, limit); }
+static ts_key forof_kdone, forof_kvalue;
+static ts_rt_ic forof_ic_done, forof_ic_value;
+static inline int forof_step_done(tsv* res, tsv it, tsv next_method){
+  if (!forof_kdone){ forof_kdone = ts_intern_field("done", 4); forof_kvalue = ts_intern_field("value", 5); }
+  *res = ts_iter_step_with(it, next_method, TS_UNDEFINED);
   /* the results are a few shapes (the runtime's {value, done} layout, a library's literal): the
      runtime's shape caches, not two generic lookups per step */
-  static ts_rt_ic ic_done, ic_value;
-  tsv out = ts_truthy(ts_get_ic(res, kdone, &ic_done)) ? TS_ITER_DONE : ts_get_ic(res, kvalue, &ic_value);
+  return ts_truthy(ts_get_ic(*res, forof_kdone, &forof_ic_done));
+}
+tsv ts_forof_next_slow(tsv it, tsv next_method){
+  tsv res = TS_UNDEFINED; ts_gc_root(&res);
+  tsv out = forof_step_done(&res, it, next_method) ? TS_ITER_DONE : ts_get_ic(res, forof_kvalue, &forof_ic_value);
+  ts_gc_unroot(1);
+  return out;
+}
+/* A pattern's elision steps the iterator and leaves `value` unread. */
+tsv ts_forof_skip_slow(tsv it, tsv next_method){
+  tsv res = TS_UNDEFINED; ts_gc_root(&res);
+  tsv out = forof_step_done(&res, it, next_method) ? TS_ITER_DONE : TS_UNDEFINED;
   ts_gc_unroot(1);
   return out;
 }
@@ -14797,6 +14841,7 @@ int ts_has_prop(tsv obj, ts_key key){
       continue;
     }
     if (TS_RT_UNLIKELY(o->h.kind == TS_KIND_FUNC) && fn_link_has(o, key)) return 1;
+    if (TS_RT_UNLIKELY(o->h.kind == TS_KIND_OBJECT && ts_obj_is_sized(o)) && class_has_field(o, key)) return 1;
     if (find_slot(o,key,0)) return 1;
     /* reaching Object.prototype: the well-known methods (stored under method
        keys) count as inherited properties for the `in` operator. */
@@ -17781,6 +17826,11 @@ tsv ts_object_rest(tsv src, const uint32_t* excl, int nexcl){
    the dynamic/`any` property-read path routes here; typed struct field reads use
    the direct-offset fast path and optional chaining (`x?.y`) guards the read out
    entirely, so neither reaches these. */
+void ts_throw_receiver(tsv s){
+  if (ts_is_null(s) || ts_is_undef(s)) ts_throw_cannot_read(s, NULL);
+  ts_throw_type_error_msg("a value typed as a string is not one");
+  abort();
+}
 static tsv ts_throw_cannot_read(tsv obj, const char* prop){
   const char* what = ts_is_null(obj) ? "null" : "undefined";
   char buf[256];
@@ -23316,82 +23366,32 @@ tsv ts_gen_new_v(tsv cv){
   return g;
 }
 
-/* Step a generic iterator, mirroring the dynamic `.next()` dispatch: look up `next`
-   as an OWN/field-key property (object-literal `{next}`) THEN as a prototype
-   method-key (a class iterator's `next()` method) — `nmk` is the interned method key
-   for "next", supplied by the caller. Call it with this=iter, arg0=sent. If neither
-   exists, the iterator is one of our generator coroutine objects (returned by a
-   generator `[Symbol.iterator]()`), so drive it with the generator.next builtin.
-   This makes `for...of`/`yield*` over a generator iterator work like spread, without
-   regressing class iterators whose `next` lives under a method key. */
 static tsv gen_next_into(tsv genobj, tsv sent, tsv result);   /* the generator step below */
 tsv ts_gen_step(tsv genobj, tsv sent);
-tsv ts_iter_step(tsv iter, tsv sent, ts_key nmk){
-  /* The `next` lookups through a four-entry cache (own slot, prototype slot
-     or absent, by receiver shape): the Map/Set and array iterators and the
-     generator objects are a handful of shapes. */
-  /* `next` lives on the iterator's prototype (the Map/Set and array iterator
-     protos, a class prototype); the cached read locates it through the own
-     shape (no own `next`), the prototype handle and the prototype's shape, and
-     reads the slot each time (a reassigned method keeps its slot; an added or
-     deleted property changes a shape). Four entries: the iterator kinds of a
-     compile are a handful. */
+/* IteratorRecord.[[NextMethod]]: an iterator's `next`, read once when a driver is set up, as the
+   dynamic `.next()` dispatch finds it: by its field key (an own `next`), then by its method key `nmk`
+   (a class's method). A `next` the iterator reassigns while it runs does not change the loop, and a
+   step needs no lookup. */
+tsv ts_iter_next_method(tsv iter, ts_key nmk){
   static ts_key k_next;
-  static struct { uint32_t shape, proto_shape, slot; tsv proto; } nc[4];
-  static uint32_t nc_next;
   if (!k_next) k_next = ts_intern_field("next", 4);
-  ts_gc_root(&iter); ts_gc_root(&sent);
-  tsv nf = TS_UNDEFINED;
-  int cached = 0;
-  if (TS_TOP16(iter) == TS_SEL_OBJECT){
-    ts_object* o = (ts_object*)ts_ptr(iter);
-    /* a shaped iterator alone: a dictionary's shape word is 0, which is what an empty entry holds */
-    if (o->h.kind == TS_KIND_OBJECT && !ts_obj_is_sized(o) && obj_shaped(o)){
-      for (uint32_t i = 0; i < 4u; i++){
-        if (nc[i].shape != o->shape) continue;
-        /* an own `next` (vue's wrapped array iterator): the receiver's shape fixes its slot */
-        if (nc[i].proto == 0){ nf = *ts_obj_slot_ptr(o, nc[i].slot); cached = 1; break; }
-        if (nc[i].proto == o->proto){
-          ts_object* p = (ts_object*)ts_ptr(o->proto);
-          if (p->shape == nc[i].proto_shape){ nf = *ts_obj_slot_ptr(p, nc[i].slot); cached = 1; }
-          break;
-        }
-      }
-    }
-  }
-  if (!cached){
-    nf = ts_get(iter, k_next);
-    if (!ts_is_callable(nf)) nf = ts_get(iter, nmk);
-    else if (TS_TOP16(iter) == TS_SEL_OBJECT){
-      ts_object* o = (ts_object*)ts_ptr(iter);
-      ts_pref own = (o->h.kind == TS_KIND_OBJECT && !ts_obj_is_sized(o) && obj_shaped(o)) ? prop_find(o, k_next) : PREF_NONE;
-      /* fill: an own `next` as a plain data slot of a shaped iterator */
-      if (pref_ok(own) && !(pref_flags(own) & (TS_PROP_ACCESSOR | TS_PROP_INT32)) && !is_accessor(pref_val(own))){
-        uint32_t i = nc_next++ & 3u;
-        nc[i].shape = o->shape; nc[i].proto = 0; nc[i].proto_shape = 0; nc[i].slot = own.i;
-      }
-      /* fill: an own-shaped iterator without an own `next`, the direct prototype
-         holding `next` as a plain data slot */
-      else if (o->h.kind == TS_KIND_OBJECT && !ts_obj_is_sized(o) && obj_shaped(o) && !pref_ok(own) && ts_is_obj(o->proto)){
-        ts_object* p = (ts_object*)ts_ptr(o->proto);
-        if (p->h.kind == TS_KIND_OBJECT && obj_shaped(p)){
-          ts_pref pr = prop_find(p, k_next);
-          if (pref_ok(pr) && !pref_is_accessor(pr)){
-            uint32_t i = nc_next++ & 3u;
-            nc[i].shape = o->shape; nc[i].proto = o->proto; nc[i].proto_shape = p->shape; nc[i].slot = pr.i;
-          }
-        }
-      }
-    }
-  }
-  ts_gc_root(&nf);
+  ts_gc_root(&iter);
+  tsv nf = ts_get(iter, k_next);
+  if (!ts_is_callable(nf) && !ts_is_proxy(iter)) nf = ts_get(iter, nmk);
+  ts_gc_unroot(1);
+  return nf;
+}
+/* One step: the method with this = iter and arg0 = sent; without a callable method the iterator is
+   one of our generator coroutine objects, driven by the generator.next builtin. */
+static tsv iter_step(tsv iter, tsv nf, tsv sent, int scratch){
+  ts_gc_root(&iter); ts_gc_root(&sent); ts_gc_root(&nf);
   tsv r;
   /* a native generator object stepped by a for...of / yield* / spread driver (its `next` is the
      prototype's own): the coroutine's scratch result instead of a fresh {value, done} per step. The
      drivers read done and value at once and never keep the object; gen.next() called by the program
      (the prototype method) still gets a fresh one. yaml's lexer and parser step a generator per
      token: the result objects were the minor collections' trigger. */
-  if (ts_is_heap_func(nf) && ((ts_func*)ts_ptr(nf))->code == (ts_code)ts_genproto_next && ts_is_obj(iter)){
+  if (scratch && ts_is_heap_func(nf) && ((ts_func*)ts_ptr(nf))->code == (ts_code)ts_genproto_next && ts_is_obj(iter)){
     RT_STAT_INC(iter_step_scratch);
     r = ts_gen_step(iter, sent);
     ts_gc_unroot(3);
@@ -23400,17 +23400,21 @@ tsv ts_iter_step(tsv iter, tsv sent, ts_key nmk){
   RT_STAT_INC(iter_step_generic);
   if (ts_is_callable(nf)){
     tsv a[2] = { iter, sent };
-    r = ts_call_method(nf, a, 2);
+    r = ts_call_method(nf, a, sent == TS_UNDEFINED ? 1 : 2);   /* a loop's next() takes no argument */
+    if (TS_RT_UNLIKELY(!ts_iter_object(r))) ts_throw_type_error_msg("Iterator result is not an object");
   } else {
     r = ts_gen_next(iter, sent);
   }
   ts_gc_unroot(3);
   return r;
 }
+tsv ts_iter_step_with(tsv iter, tsv nf, tsv sent){ return iter_step(iter, nf, sent, 1); }
+/* A step whose result an `await` separates from the reads of done and value: never the scratch. */
+tsv ts_iter_step_fresh(tsv iter, tsv nf, tsv sent){ return iter_step(iter, nf, sent, 0); }
 
 /* gen.next(sent) -> { value, done } */
 /* The step shared by gen.next() (a fresh result) and the iteration drivers (the coroutine's scratch
-   result, ts_iter_step): both slots of `result` are written on every path. */
+   result, ts_iter_step_with): both slots of `result` are written on every path. */
 static tsv gen_next_into(tsv genobj, tsv sent, tsv result){
   ts_gc_root(&genobj); ts_gc_root(&sent);
   ts_gc_root(&result);
@@ -23601,9 +23605,9 @@ tsv ts_gen_return(tsv genobj, tsv val){
    a collection iterator), else the runtime's own iterators of an array or typed
    array (values), a Map (entries), a Set (values) or a string (code points); an
    object with a `next` is taken as the iterator itself. TypeError otherwise. */
+int g_iter_acquired_sync;   /* the last async ts_iter_acquire fell back to a sync iterator: read at once */
 tsv ts_iter_acquire(tsv v, int async){
-  static ts_key knext;
-  if (!knext) knext = ts_intern_field("next", 4);
+  g_iter_acquired_sync = 1;
   if (ts_is_str(v)){
     ts_gc_root(&v);
     tsv arr = ts_new_array(0); ts_gc_root(&arr);
@@ -23612,51 +23616,64 @@ tsv ts_iter_acquire(tsv v, int async){
     ts_gc_unroot(2);
     return it;
   }
-  if (!ts_object_like(v)) ts_throw_type_error_msg("value is not iterable");
+  if (!ts_iter_object(v)) ts_throw_type_error_msg("value is not iterable");
   ts_gc_root(&v);
   tsv itf = TS_UNDEFINED;
   if (async) itf = ts_get(v, TS_KEY_WKSYM(TS_WKSYM_ASYNC_ITERATOR));
-  if (!ts_is_callable(itf)) itf = ts_get(v, TS_KEY_WKSYM(TS_WKSYM_ITERATOR));
+  int by_async = ts_is_callable(itf);
+  if (!by_async) itf = ts_get(v, TS_KEY_WKSYM(TS_WKSYM_ITERATOR));
   if (ts_is_callable(itf)){
     ts_gc_root(&itf);
     tsv a0 = v;
     tsv it = ts_call_method(itf, &a0, 1);
     ts_gc_unroot(2);
-    if (!ts_object_like(it)) ts_throw_type_error_msg("Result of the Symbol.iterator method is not an object");
+    if (!ts_iter_object(it)) ts_throw_type_error_msg("Result of the Symbol.iterator method is not an object");
+    g_iter_acquired_sync = !by_async;
     return it;
   }
   tsv it;
   if (as_arr(v) || ts_is_typed_array(v)) it = ts_array_iter_new(v, 0);
   else if (ts_is_map(v)) it = ts_map_entries(v);
   else if (ts_is_set(v)) it = ts_set_values(v);
-  else if (ts_is_callable(ts_get(v, knext))) it = v;
   else { ts_gc_unroot(1); ts_throw_type_error_msg("object is not iterable (cannot read property Symbol(Symbol.iterator))"); }
   ts_gc_unroot(1);
   return it;
 }
-/* IteratorClose: the iterator's `return` (an own or prototype field, then the
-   method key), called without an argument when it exists; a generator object
-   without one is returned from (its finally blocks run). The call's result, or
-   undefined when there was nothing to call (an async close awaits only a
-   result). */
+/* IteratorClose: the iterator's `return` (an own or prototype field, then the method key), called
+   without an argument when it exists; a generator object without one is returned from (its finally
+   blocks run). A `return` that is neither nullish nor callable, and a result that is not an object,
+   are TypeErrors: a close on a throw completion runs in a `try` that drops them, the drivers' rule
+   (`lowerArrayPatternByProtocol`). The call's result, or undefined when there was nothing to call
+   (an async close awaits only a result). A Proxy answers the one read of `return`. */
 tsv ts_iter_close(tsv iter, ts_key rmk){
   static ts_key k_return;
   if (!k_return) k_return = ts_intern_field("return", 6);
-  if (!ts_is_obj(iter)) return TS_UNDEFINED;
+  if (!ts_iter_object(iter)) return TS_UNDEFINED;
   ts_gc_root(&iter);
+  int proxy = ts_is_proxy(iter);
   tsv rf = ts_get(iter, k_return);
-  if (!ts_is_callable(rf)) rf = ts_get(iter, rmk);
+  if (!proxy && !ts_is_callable(rf)){
+    tsv m = ts_get(iter, rmk);
+    if (ts_is_callable(m)) rf = m;
+  }
   tsv r = TS_UNDEFINED;
   if (ts_is_callable(rf)){
     ts_gc_root(&rf);
     tsv a[1] = { iter };
     r = ts_call_method(rf, a, 1);
     ts_gc_unroot(2);
+    if (!ts_iter_object(r)) ts_throw_type_error_msg("Iterator result is not an object");
     return r;
   }
-  ensure_gen_fields();
-  tsv cv = ts_get_ic(iter, F_coro, &g_ic_coro);
-  if (ts_is_coro_value(cv)) r = ts_gen_return(iter, TS_UNDEFINED);
+  if (rf != TS_UNDEFINED && rf != TS_NULL){
+    ts_gc_unroot(1);
+    ts_throw_type_error_msg("iterator.return is not a function");
+  }
+  if (!proxy && ts_is_obj(iter)){
+    ensure_gen_fields();
+    tsv cv = ts_get_ic(iter, F_coro, &g_ic_coro);
+    if (ts_is_coro_value(cv)) r = ts_gen_return(iter, TS_UNDEFINED);
+  }
   ts_gc_unroot(1);
   return r;
 }

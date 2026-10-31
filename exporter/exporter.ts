@@ -610,9 +610,19 @@ type NewTarget =
 
 type ClassValueEmit = { local: number; classValue: boolean };
 /** What resolveIterator returns: the iterator local and the emitters of its protocol. */
-type IterDriver = { itLocal: number; srcLocal: number; isAsync: boolean; step: (sentLocal: number) => number; throwStep?: (excLocal: number) => number; returnCall?: () => void };
-/** One element of an array pattern bound from an iterator. */
-type IterPatternElement = { node: ts.Node; omitted: boolean; rest: boolean; bind: (value: number) => void };
+type IterDriver = {
+  itLocal: number; srcLocal: number; isAsync: boolean;
+  step: (sentLocal: number) => number; throwStep?: (excLocal: number) => number; returnCall?: () => void;
+  /** Instead of `step`: the next element, or the done marker (`forof.next`, a value's driver);
+   *  `skip`, for an elision, leaves the element unread. */
+  elemStep?: (skip: boolean) => number;
+  /** A for-await over a sync iterator awaits each value: always, or when this local says so. */
+  awaitValue?: number | "always";
+};
+/** One element of an array pattern bound from an iterator. `risky`: binding it can throw (a default
+ *  that runs code, a nested pattern, a property target), so the pattern closes the iterator then.
+ *  `pre`: evaluates a target's reference, which comes before the element's step. */
+type IterPatternElement = { node: ts.Node; omitted: boolean; rest: boolean; bind: (value: number) => void; risky?: boolean; pre?: () => void };
 
 interface Local {
   id: number;
@@ -7298,33 +7308,16 @@ class Exporter {
       }
       if (ts.isArrayLiteralExpression(lhs)) {
         // `[a, b = 1, ...rest] = <iterable>`: an iterator source is stepped by the protocol
-        const source = this.iterablePatternSource(ctx, node.right);
-        if (source !== undefined && !("drv" in source)) { this.lowerAssignTarget(ctx, lhs, source.array); return source.source; }
+        const source = this.iterablePatternSource(ctx, node.right, lhs.elements.some(ts.isSpreadElement) ? undefined : lhs.elements.length);
+        if (source !== undefined && !("drv" in source)) { this.lowerAssignArrayByIndex(ctx, lhs, source.array); return source.source; }
         if (source !== undefined && "drv" in source) {
           const drv = source.drv;
-          this.lowerArrayPatternByProtocol(ctx, drv, lhs.elements.map((el): IterPatternElement => ({
-            node: el,
-            omitted: ts.isOmittedExpression(el),
-            rest: ts.isSpreadElement(el),
-            bind: (v: number) => {
-              if (ts.isOmittedExpression(el)) return;
-              if (ts.isSpreadElement(el)) { this.lowerAssignTarget(ctx, el.expression, v); return; }
-              let target: ts.Expression = el;
-              if (ts.isBinaryExpression(el) && el.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
-                const isUndef = this.newLocal(ctx, "primitive");
-                ctx.body.push({ kind: "UnOp", dst: isUndef, op: "isundef", operand: v });
-                const thenB = this.captureBody(ctx, () => {
-                  const dv = this.lowerExpr(ctx, el.right);
-                  ctx.body.push({ kind: "Copy", dst: v, src: dv });
-                });
-                ctx.body.push({ kind: "If", cond: isUndef, thenBody: thenB, elseBody: [] });
-                target = el.left;
-              }
-              this.lowerAssignTarget(ctx, target, v);
-            },
-          })));
+          this.lowerArrayPatternByProtocol(ctx, drv, this.assignPatternElements(ctx, lhs));
           return drv.srcLocal;
         }
+        const array = this.lowerExpr(ctx, node.right);
+        this.lowerAssignArrayByIndex(ctx, lhs, array);
+        return array;
       }
       const rhs = this.lowerExpr(ctx, node.right);
       this.lowerAssignTarget(ctx, lhs, rhs);
@@ -11817,15 +11810,20 @@ class Exporter {
    *  not array-like: a Map or Set is materialized to an array (their iterators have
    *  no `return`, so nothing observable differs); a class iterable, a generator, an
    *  iterator object or an object with [Symbol.iterator] is stepped by the
-   *  protocol. undefined for an array, a tuple, a string or `any`: read by index. */
-  private iterablePatternSource(ctx: FnCtx, init: ts.Expression): { array: number; source: number } | { drv: IterDriver } | undefined {
+   *  protocol; a value the types do not settle (`any`, a string, a union with one)
+   *  by the protocol over the value (`valueIterDriver`). undefined for an array or
+   *  a tuple: read by index. */
+  private iterablePatternSource(ctx: FnCtx, init: ts.Expression, count: number | undefined): { array: number; source: number } | { drv: IterDriver } | undefined {
     const rk = this.builtinReceiverKind(init);
-    if (rk === "array" || rk === "string") return undefined;
+    if (rk === "array") return undefined;
     let t: ts.Type;
     try { t = this.checker.getTypeAtLocation(init); } catch { return undefined; }
-    if (t.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.StringLike)) return undefined;
-    const arrayLike = (ty: ts.Type): boolean => this.checker.isArrayLikeType(ty) || !!(ty.flags & ts.TypeFlags.StringLike);
-    if (arrayLike(t) || (t.isUnion() && t.types.every(arrayLike))) return undefined;
+    if (this.isArrayLikeUnion(t)) return undefined;
+    const stringLike = (ty: ts.Type): boolean => !!(ty.flags & ts.TypeFlags.StringLike);
+    if (rk === "string" || (t.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) || stringLike(t) || (t.isUnion() && t.types.some(stringLike))) {
+      if (!this.forOfDynamicEnabled) return undefined;
+      return { drv: this.valueIterDriver(ctx, this.lowerExpr(ctx, init), count) };
+    }
     if (rk === "map" || rk === "set") {
       const recv = this.lowerExpr(ctx, init);
       const it = this.newLocal(ctx, "reference");
@@ -11837,12 +11835,50 @@ class Exporter {
     const drv = this.resolveIterator(ctx, init);
     return drv === undefined ? undefined : { drv };
   }
+  /** The elements of an assignment pattern as the protocol binder takes them. */
+  private assignPatternElements(ctx: FnCtx, lhs: ts.ArrayLiteralExpression): IterPatternElement[] {
+    return lhs.elements.map((el): IterPatternElement => {
+      const defaulted = ts.isBinaryExpression(el) && el.operatorToken.kind === ts.SyntaxKind.EqualsToken ? el : undefined;
+      const target: ts.Expression = defaulted ? defaulted.left : ts.isSpreadElement(el) ? el.expression : el;
+      const unwrapped = this.unwrapAssignTarget(target);
+      // a property target's reference is evaluated before the element's step
+      const byRef = !ts.isOmittedExpression(el) && (ts.isElementAccessExpression(unwrapped) ||
+        (ts.isPropertyAccessExpression(unwrapped) && this.isPlainFieldStoreTarget(unwrapped)));
+      let ref: { obj?: number; key?: number } | undefined;
+      return {
+        node: el,
+        omitted: ts.isOmittedExpression(el),
+        rest: ts.isSpreadElement(el),
+        risky: !ts.isOmittedExpression(el) && (!ts.isIdentifier(unwrapped) || (defaulted !== undefined && !this.isInertDefault(defaulted.right))),
+        pre: byRef ? () => { ref = this.lowerAssignRefPre(ctx, unwrapped, true); } : undefined,
+        bind: (v: number) => {
+          if (ts.isOmittedExpression(el)) return;
+          if (defaulted) {
+            const isUndef = this.newLocal(ctx, "primitive");
+            ctx.body.push({ kind: "UnOp", dst: isUndef, op: "isundef", operand: v });
+            const thenB = this.captureBody(ctx, () => {
+              const dv = this.lowerExpr(ctx, defaulted.right);
+              ctx.body.push({ kind: "Copy", dst: v, src: dv });
+            });
+            ctx.body.push({ kind: "If", cond: isUndef, thenBody: thenB, elseBody: [] });
+          }
+          this.lowerAssignTarget(ctx, unwrapped, v, ref);
+        },
+      };
+    });
+  }
+  /** A default that cannot throw: a literal or a plain name. */
+  private isInertDefault(e: ts.Expression): boolean {
+    return ts.isLiteralExpression(e) || ts.isIdentifier(e) || e.kind === ts.SyntaxKind.TrueKeyword ||
+      e.kind === ts.SyntaxKind.FalseKeyword || e.kind === ts.SyntaxKind.NullKeyword;
+  }
   /** The elements of a binding pattern as the protocol binder takes them. */
   private bindingPatternElements(ctx: FnCtx, pat: ts.ArrayBindingPattern): IterPatternElement[] {
     return pat.elements.map((el): IterPatternElement => ({
       node: el,
       omitted: ts.isOmittedExpression(el),
       rest: !ts.isOmittedExpression(el) && el.dotDotDotToken !== undefined,
+      risky: !ts.isOmittedExpression(el) && (!ts.isIdentifier(el.name) || (el.initializer !== undefined && !this.isInertDefault(el.initializer))),
       bind: (v: number) => {
         if (ts.isOmittedExpression(el)) return;
         this.lowerBindingPattern(ctx, el.name, el.initializer ? this.applyDefault(ctx, v, el.initializer) : v);
@@ -11850,48 +11886,58 @@ class Exporter {
     }));
   }
   /** A pattern bound from a local rather than an expression (nested in another
-   *  pattern, a parameter, a for-of variable): when its declared type is not
-   *  array-like, the value is iterated through the runtime's GetIterator. */
+   *  pattern, a parameter, a for-of variable): unless its declared type is an array
+   *  or a tuple, the value is iterated through GetIterator (an `any` may hold a Set
+   *  or a generator, a string iterates by code points); a real array is read by
+   *  index there too. `TSAOT_FOROF_DYNAMIC=0` reads such a value by index. */
   private dynamicPatternDriver(ctx: FnCtx, pat: ts.ArrayBindingPattern, src: number): IterDriver | undefined {
+    if (!this.forOfDynamicEnabled) return undefined;
     let t: ts.Type;
-    try { t = this.checker.getTypeAtLocation(pat.parent); } catch { return undefined; }
-    if (t.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.StringLike)) return undefined;
-    const arrayLike = (ty: ts.Type): boolean => this.checker.isArrayLikeType(ty) || !!(ty.flags & (ts.TypeFlags.StringLike | ts.TypeFlags.Any | ts.TypeFlags.Unknown));
-    if (arrayLike(t) || (t.isUnion() && t.types.every(arrayLike))) return undefined;
-    return this.runtimeIterDriver(ctx, src, false);
+    try { t = this.checker.getTypeAtLocation(pat); } catch { return undefined; }
+    if (this.isArrayLikeUnion(t)) return undefined;
+    return this.valueIterDriver(ctx, src, this.bindingPatternCount(pat));
   }
-  /** The protocol over an iterator the runtime acquires (ts_iter_acquire): next by
-   *  the generic step, IteratorClose by the generic close. */
-  private runtimeIterDriver(ctx: FnCtx, src: number, async: boolean): IterDriver {
-    const itLocal = this.newLocal(ctx, "reference");
-    ctx.body.push({ kind: "CallBuiltinStatic", dst: itLocal, builtin: `iter.acquire:${async ? 1 : 0}`, args: [src] });
-    const step = (sent: number): number => {
-      const rr = this.emitIterNext(ctx, itLocal, sent);
-      if (!async) return rr;
-      const r = this.newLocal(ctx, "reference");
-      ctx.body.push({ kind: "Await", dst: r, operand: rr });
-      return r;
+  /** How many elements a pattern takes; undefined with a rest element, which takes them all. */
+  private bindingPatternCount(pat: ts.ArrayBindingPattern): number | undefined {
+    return pat.elements.some((el) => !ts.isOmittedExpression(el) && el.dotDotDotToken !== undefined) ? undefined : pat.elements.length;
+  }
+  /** An array or a tuple, or a union of them: an array pattern reads such a value by index. */
+  private isArrayLikeUnion(t: ts.Type): boolean {
+    const arrayLike = (ty: ts.Type): boolean => this.checker.isArrayLikeType(ty) && !(ty.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown));
+    return arrayLike(t) || (t.isUnion() && t.types.every(arrayLike));
+  }
+  /** The protocol over a value the types do not settle (`any`, a string, a union with one), for an
+   *  array pattern: `forof.open` gives an array, read by index with no iterator object, or an
+   *  iterator through GetIterator (a TypeError when it is not iterable; a string's code points, the
+   *  first `count` of them for a pattern of that many elements). */
+  private valueIterDriver(ctx: FnCtx, src: number, count?: number): IterDriver {
+    const itLocal = this.newLocal(ctx, "reference", "forofIter");
+    ctx.body.push({ kind: "CallBuiltin", dst: itLocal, builtin: count === undefined ? "forof.open" : `forof.open:${count}`, recv: src, args: [] });
+    const nextMethod = this.newLocal(ctx, "reference", "forofNext");
+    ctx.body.push({ kind: "CallBuiltin", dst: nextMethod, builtin: `forof.method:${this.internName("next")}`, recv: itLocal, args: [] });
+    const idx = this.newLocal(ctx, "primitive");
+    const zero = this.newLocal(ctx, "primitive");
+    ctx.body.push({ kind: "Const", dst: zero, value: { kind: "Num", value: 0 } });
+    ctx.body.push({ kind: "Copy", dst: idx, src: zero });
+    const elemStep = (skip: boolean): number => {
+      const elem = this.newLocal(ctx, "reference", "elem");
+      ctx.body.push({ kind: "CallBuiltin", dst: elem, builtin: skip ? "forof.skip" : "forof.next", recv: itLocal, args: [idx, nextMethod] });
+      this.emitIndexStep(ctx, idx, 1);
+      return elem;
     };
     const returnCall = (): void => {
       const rr = this.newLocal(ctx, "reference");
-      ctx.body.push({ kind: "CallBuiltin", dst: rr, builtin: `iter.close:${this.internName("return")}`, recv: itLocal, args: [] });
-      if (async) {
-        const undefV = this.newLocal(ctx, "reference");
-        ctx.body.push({ kind: "Const", dst: undefV, value: { kind: "Undef" } });
-        const called = this.newLocal(ctx, "primitive");
-        ctx.body.push({ kind: "BinOp", dst: called, op: "!==", lhs: rr, rhs: undefV });
-        const thenBody = this.captureBody(ctx, () => {
-          const awaited = this.newLocal(ctx, "reference");
-          ctx.body.push({ kind: "Await", dst: awaited, operand: rr });
-        });
-        ctx.body.push({ kind: "If", cond: called, thenBody, elseBody: [] });
-      }
+      ctx.body.push({ kind: "CallBuiltin", dst: rr, builtin: `forof.close:${this.internName("return")}`, recv: itLocal, args: [] });
     };
-    return { itLocal, srcLocal: src, isAsync: async, step, returnCall };
+    const step = (_sent: number): number => { throw new Error("a value's driver has no result objects: elemStep"); };
+    return { itLocal, srcLocal: src, isAsync: false, step, elemStep, returnCall };
   }
   /** Bind an array pattern from an iterator: one step per element (a hole takes one
    *  too, a step past the end leaves undefined), the rest element collecting what
-   *  remains, and IteratorClose when the pattern ends before the iterator does. */
+   *  remains, and IteratorClose when the pattern ends before the iterator does. A
+   *  pattern whose binding can throw closes the iterator on that throw as well: `done`
+   *  stands for the record's [[Done]], true across a step (a step that throws ends the
+   *  record: no close), and what that close throws is dropped for the throw in flight. */
   private lowerArrayPatternByProtocol(ctx: FnCtx, drv: IterDriver, elements: IterPatternElement[]): void {
     const doneField = this.internField("done");
     const valueField = this.internField("value");
@@ -11903,6 +11949,8 @@ class Exporter {
     ctx.body.push({ kind: "Const", dst: trueC, value: { kind: "Bool", value: true } });
     const done = this.newLocal(ctx, "primitive");
     ctx.body.push({ kind: "Copy", dst: done, src: falseC });
+    const guarded = drv.returnCall !== undefined && elements.some((el) => el.risky === true);
+    const stepped = (): void => { if (guarded) ctx.body.push({ kind: "Copy", dst: done, src: falseC }); };
     const notDone = (): number => {
       const nd = this.newLocal(ctx, "primitive");
       ctx.body.push({ kind: "UnOp", dst: nd, op: "!", operand: done });
@@ -11910,6 +11958,16 @@ class Exporter {
     };
     // r = it.next(); if (r.done) done = true; else <onValue>(r.value)
     const stepOnce = (onValue: ((value: number) => void) | undefined): void => {
+      if (guarded) ctx.body.push({ kind: "Copy", dst: done, src: trueC });
+      if (drv.elemStep !== undefined) {
+        const elem = drv.elemStep(onValue === undefined);
+        const ended = this.newLocal(ctx, "primitive");
+        ctx.body.push({ kind: "CallBuiltin", dst: ended, builtin: "forof.isDone", recv: elem, args: [] });
+        const thenBody = this.captureBody(ctx, () => { ctx.body.push({ kind: "Copy", dst: done, src: trueC }); });
+        const elseBody = this.captureBody(ctx, () => { stepped(); if (onValue !== undefined) onValue(elem); });
+        ctx.body.push({ kind: "If", cond: ended, thenBody, elseBody });
+        return;
+      }
       const r = drv.step(undef0);
       const d = this.newLocal(ctx, "reference");
       ctx.body.push({ kind: "LoadField", dst: d, obj: r, field: doneField });
@@ -11919,35 +11977,58 @@ class Exporter {
         if (onValue !== undefined) {
           const value = this.newLocal(ctx, "reference");
           ctx.body.push({ kind: "LoadField", dst: value, obj: r, field: valueField });
+          stepped();
           onValue(value);
+        } else {
+          stepped();
         }
       });
       const elseBody = this.captureBody(ctx, () => { ctx.body.push({ kind: "Copy", dst: done, src: trueC }); });
       ctx.body.push({ kind: "If", cond: more, thenBody, elseBody });
     };
-    for (const el of elements) {
-      if (el.rest) {
-        const site = this.site++;
-        this.recordSite(site, "array", this.inLoop(el.node) ? "many" : "once", false, el.node);
-        const arr = this.newLocal(ctx, "reference");
-        ctx.body.push({ kind: "AllocArray", dst: arr, elemType: 0, site });
-        let cond = -1;
-        const condBody = this.captureBody(ctx, () => { cond = notDone(); });
-        const body = this.captureLoopBody(ctx, "while", () => {
-          stepOnce((value) => { ctx.body.push({ kind: "ArrayPush", arr, src: value }); });
+    const bindAll = (): void => {
+      for (const el of elements) {
+        if (el.pre) el.pre();
+        if (el.rest) {
+          const site = this.site++;
+          this.recordSite(site, "array", this.inLoop(el.node) ? "many" : "once", false, el.node);
+          const arr = this.newLocal(ctx, "reference");
+          ctx.body.push({ kind: "AllocArray", dst: arr, elemType: 0, site });
+          let cond = -1;
+          const condBody = this.captureBody(ctx, () => { cond = notDone(); });
+          const body = this.captureLoopBody(ctx, "while", () => {
+            stepOnce((value) => { ctx.body.push({ kind: "ArrayPush", arr, src: value }); });
+          });
+          ctx.body.push({ kind: "Loop", cond, condBody, body });
+          el.bind(arr);
+          continue;
+        }
+        const v = this.newLocal(ctx, "reference");
+        ctx.body.push({ kind: "Const", dst: v, value: { kind: "Undef" } });
+        const pending = notDone();
+        const thenBody = this.captureBody(ctx, () => {
+          stepOnce(el.omitted ? undefined : (value) => { ctx.body.push({ kind: "Copy", dst: v, src: value }); });
         });
-        ctx.body.push({ kind: "Loop", cond, condBody, body });
-        el.bind(arr);
-        continue;
+        ctx.body.push({ kind: "If", cond: pending, thenBody, elseBody: [] });
+        if (!el.omitted) el.bind(v);
       }
-      const v = this.newLocal(ctx, "reference");
-      ctx.body.push({ kind: "Const", dst: v, value: { kind: "Undef" } });
-      const pending = notDone();
-      const thenBody = this.captureBody(ctx, () => {
-        stepOnce(el.omitted ? undefined : (value) => { ctx.body.push({ kind: "Copy", dst: v, src: value }); });
+    };
+    if (guarded) {
+      const thrown = this.newLocal(ctx, "reference");
+      const tryBody = this.captureBody(ctx, bindAll);
+      const catchBody = this.captureBody(ctx, () => {
+        const open = notDone();
+        const thenBody = this.captureBody(ctx, () => {
+          const dropped = this.newLocal(ctx, "reference");
+          const closeBody = this.captureBody(ctx, () => { drv.returnCall!(); });
+          ctx.body.push({ kind: "TryCatch", tryBody: closeBody, catchVar: dropped, catchBody: [], finallyBody: [] });
+        });
+        ctx.body.push({ kind: "If", cond: open, thenBody, elseBody: [] });
+        ctx.body.push({ kind: "Throw", src: thrown });
       });
-      ctx.body.push({ kind: "If", cond: pending, thenBody, elseBody: [] });
-      if (!el.omitted) el.bind(v);
+      ctx.body.push({ kind: "TryCatch", tryBody, catchVar: thrown, catchBody, finallyBody: [] });
+    } else {
+      bindAll();
     }
     if (drv.returnCall) {
       const open = notDone();
@@ -12143,17 +12224,21 @@ class Exporter {
   isGeneratorType(expr: ts.Expression): boolean {
     try {
       const t = this.checker.getTypeAtLocation(expr);
-      const tn = this.checker.typeToString(t);
-      // Only a Generator is one of our coroutines: an Iterator / IterableIterator may be an array,
-      // Map or Set iterator or a user's object (vue casts an array iterator to IterableIterator and
-      // wraps its next); those step through the dynamic protocol, which also drives a coroutine.
-      if (/^Generator\b/.test(tn)) return true;
-      // A type whose string merely CONTAINS "Generator<" — e.g. an object/class
-      // with a `[Symbol.iterator](): Generator<...>` member — is an ITERABLE, not a
-      // generator itself; it must own a `next` to be driven via the generator
-      // builtin (a real generator has next/return/throw). Otherwise it would be
-      // wrongly stepped with ts_gen_next on the object instead of its iterator.
-      return /\bGenerator</.test(tn) && !!(t.getProperty && t.getProperty("next"));
+      const isGen = (ty: ts.Type): boolean => {
+        const tn = this.checker.typeToString(ty);
+        // Only a Generator is one of our coroutines: an Iterator / IterableIterator may be an array,
+        // Map or Set iterator or a user's object (vue casts an array iterator to IterableIterator and
+        // wraps its next); those step through the dynamic protocol, which also drives a coroutine.
+        if (/^Generator\b/.test(tn)) return true;
+        // A type whose string merely CONTAINS "Generator<" — e.g. an object/class
+        // with a `[Symbol.iterator](): Generator<...>` member — is an ITERABLE, not a
+        // generator itself; it must own a `next` to be driven via the generator
+        // builtin (a real generator has next/return/throw). Otherwise it would be
+        // wrongly stepped with ts_gen_next on the object instead of its iterator.
+        return /\bGenerator</.test(tn) && !!(ty.getProperty && ty.getProperty("next"));
+      };
+      // a union with anything else (`Generator<T> | T[]`) takes the runtime's GetIterator
+      return t.isUnion() ? t.types.every(isGen) : isGen(t);
     } catch { return false; }
   }
 
@@ -12197,18 +12282,20 @@ class Exporter {
     } catch { return false; }
   }
 
-  /** Emit a dynamic `recv.next(arg)` method call (prototype-chain dispatch),
-   *  returning the result local holding the {value,done} object. */
-  emitIterNext(ctx: FnCtx, recv: number, arg: number): number {
-    // Step a generic iterator via the runtime helper, which mirrors the dynamic
-    // `.next()` dispatch (field-key then method-key lookup, passing the interned
-    // "next" method id) AND falls back to generator.next when the iterator is one of
-    // our generator coroutine objects (returned by a generator `[Symbol.iterator]()`,
-    // which has no `next` property). This makes `for...of`/`yield*` over a generator
-    // iterator work like spread, without regressing class iterators whose `next` is a
-    // prototype method.
+  /** The iterator's `next`, read once when a driver is set up (GetIterator's record: a `next` the
+   *  iterator replaces while it runs is not seen by the loop): the field key, then the method key
+   *  of the interned "next". */
+  emitIterMethod(ctx: FnCtx, recv: number): number {
+    const dst = this.newLocal(ctx, "reference", "iterNext");
+    ctx.body.push({ kind: "CallBuiltin", dst, builtin: `iter.method:${this.internName("next")}`, recv, args: [] });
+    return dst;
+  }
+  /** Emit one step of a generic iterator, `next.call(recv, arg)` of the method `emitIterMethod`
+   *  read, returning the result local holding the {value,done} object. The runtime falls back to
+   *  generator.next when there is no such method (a generator coroutine object). */
+  emitIterNext(ctx: FnCtx, recv: number, nextMethod: number, arg: number, fresh = false): number {
     const dst = this.newLocal(ctx, "reference");
-    ctx.body.push({ kind: "CallBuiltin", dst, builtin: `iter.step:${this.internName("next")}`, recv, args: [arg] });
+    ctx.body.push({ kind: "CallBuiltin", dst, builtin: fresh ? "iter.stepFresh" : "iter.stepWith", recv, args: [nextMethod, arg] });
     return dst;
   }
 
@@ -12237,8 +12324,11 @@ class Exporter {
     // A non-class object exposing [Symbol.iterator] (e.g. an object literal with a
     // computed `[Symbol.iterator]()` member). Acquired at runtime via the symbol
     // key, then stepped with the dynamic .next() protocol.
-    const plainObject = !isOurGen && !isOurAsyncGen && !isIterable && !isIterator;
-    const objSymSync = plainObject && this.typeHasSymbolIterator(expr, "iterator");
+    // An iterator type that also declares [Symbol.iterator] (IterableIterator) goes through it as well:
+    // the method answers `this` nearly always, but it is what GetIterator calls.
+    const plainObject = !isOurGen && !isOurAsyncGen && !isIterable;
+    const rk = this.builtinReceiverKind(expr);
+    const objSymSync = plainObject && (this.typeHasSymbolIterator(expr, "iterator") || (!!opts.forceAsync && (rk === "array" || rk === "string")));
     const objSymAsync = plainObject && this.typeHasSymbolIterator(expr, "asyncIterator");
     // for-await takes [Symbol.asyncIterator] when there is one; a sync loop needs [Symbol.iterator]
     const useAsyncSym = objSymAsync && (!!opts.forceAsync || !objSymSync);
@@ -12246,6 +12336,8 @@ class Exporter {
     if (!isOurGen && !isOurAsyncGen && !isIterable && !isIterator && !objSymIterable) return undefined;
 
     const isAsync = !!opts.forceAsync || isOurAsyncGen || hasAsyncIter || useAsyncSym || this.isAsyncIteratorType(expr);
+    // for-await over a sync iterator (AsyncFromSyncIterator): each value is awaited
+    let awaitValue: number | "always" | undefined = isAsync && !isOurAsyncGen && !hasAsyncIter && !useAsyncSym && !this.isAsyncIteratorType(expr) ? "always" : undefined;
     const src = this.lowerExpr(ctx, expr);
 
     // If the iterable's [Symbol.iterator]/[Symbol.asyncIterator] method is itself a
@@ -12270,12 +12362,19 @@ class Exporter {
       // a string or a collection (a parameter typed Iterable<T> takes any of them).
       itLocal = this.newLocal(ctx, "reference");
       ctx.body.push({ kind: "CallBuiltinStatic", dst: itLocal, builtin: `iter.acquire:${useAsyncSym ? 1 : 0}`, args: [src] });
+      if (useAsyncSym) {
+        // the value may turn out to have a sync iterator only
+        awaitValue = this.newLocal(ctx, "primitive");
+        ctx.body.push({ kind: "CallBuiltinStatic", dst: awaitValue, builtin: "iter.acquiredSync", args: [] });
+      }
     }
 
     const useBuiltin = isOurGen || isOurAsyncGen || iterIsGenerator;
+    const nextMethod = useBuiltin ? -1 : this.emitIterMethod(ctx, itLocal);
     // a sync generator stepped by a driver: generator.step reuses the coroutine's result object (the
-    // drivers read done and value at once and never keep it; gen.next() in the program stays fresh)
-    const nextBuiltin = (isOurAsyncGen || (iterIsGenerator && isAsync)) ? "asyncgen.next" : "generator.step";
+    // drivers read done and value at once and never keep it; gen.next() in the program stays fresh,
+    // and so does a step an await separates from those reads)
+    const nextBuiltin = (isOurAsyncGen || (iterIsGenerator && isAsync)) ? "asyncgen.next" : isAsync ? "generator.next" : "generator.step";
     const step = (sentLocal: number): number => {
       const r = this.newLocal(ctx, "reference");
       if (useBuiltin) {
@@ -12287,7 +12386,7 @@ class Exporter {
           ctx.body.push({ kind: "CallBuiltin", dst: r, builtin: nextBuiltin, recv: itLocal, args: [sentLocal] });
         }
       } else {
-        const rr = this.emitIterNext(ctx, itLocal, sentLocal);
+        const rr = this.emitIterNext(ctx, itLocal, nextMethod, sentLocal, isAsync);
         if (isAsync) ctx.body.push({ kind: "Await", dst: r, operand: rr });
         else ctx.body.push({ kind: "Copy", dst: r, src: rr });
       }
@@ -12364,7 +12463,7 @@ class Exporter {
         }
       };
     }
-    return { itLocal, srcLocal: src, isAsync, step, throwStep, returnCall };
+    return { itLocal, srcLocal: src, isAsync, step, throwStep, returnCall, awaitValue };
   }
 
   /** True if the expression's static type has a callable member `name`. */
@@ -12412,7 +12511,14 @@ class Exporter {
         if (ty.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) return true;
         if (ty.isUnion() || ty.isIntersection()) return ty.types.some(may);
         if (this.isBuiltinIteratorType(ty)) return false;
-        return ty.getProperty("return") !== undefined;
+        if (ty.getProperty("return") !== undefined) return true;
+        // a value of a class type may be a subclass's, which adds the method
+        const cid = ty.symbol ? this.classSymToId.get(ty.symbol) : undefined;
+        return cid !== undefined && [...this.classSymToId.values()].some((c) => {
+          if (c === cid || !this.classHasMethod(c, "return")) return false;
+          for (let p = this.parentIdOf(c); p !== undefined; p = this.parentIdOf(p)) if (p === cid) return true;
+          return false;
+        });
       };
       return may(t);
     } catch { return true; }
@@ -12716,6 +12822,8 @@ class Exporter {
     const src = this.lowerExpr(ctx, expr);
     const it = this.newLocal(ctx, "reference", "forofIter");
     ctx.body.push({ kind: "CallBuiltin", dst: it, builtin: "forof.open", recv: src, args: [] });
+    const nextMethod = this.newLocal(ctx, "reference", "forofNext");
+    ctx.body.push({ kind: "CallBuiltin", dst: nextMethod, builtin: `forof.method:${this.internName("next")}`, recv: it, args: [] });
     const idx = this.newLocal(ctx, "primitive");
     const zero = this.newLocal(ctx, "primitive");
     ctx.body.push({ kind: "Const", dst: zero, value: { kind: "Num", value: 0 } });
@@ -12724,10 +12832,9 @@ class Exporter {
     const decl = ts.isVariableDeclarationList(init) ? init.declarations[0] : undefined;
     const captureCells = decl && (init.flags & (ts.NodeFlags.Let | ts.NodeFlags.Const)) !== 0
       ? this.setupForOfCaptureCells(ctx, decl.name, decl) : [];
-    const nextBuiltin = `forof.next:${this.internName("next")}`;
     let condLocal = -1;
     const condBody = this.captureBody(ctx, () => {
-      ctx.body.push({ kind: "CallBuiltin", dst: elem, builtin: nextBuiltin, recv: it, args: [idx] });
+      ctx.body.push({ kind: "CallBuiltin", dst: elem, builtin: "forof.next", recv: it, args: [idx, nextMethod] });
       const done = this.newLocal(ctx, "primitive");
       ctx.body.push({ kind: "CallBuiltin", dst: done, builtin: "forof.isDone", recv: elem, args: [] });
       condLocal = this.newLocal(ctx, "primitive");
@@ -12838,7 +12945,7 @@ class Exporter {
   }
   private lowerDrivenForLoop(
     ctx: FnCtx, init: ts.ForInitializer, body: ts.Statement,
-    drv: { step: (sent: number) => number; returnCall?: () => void }
+    drv: Pick<IterDriver, "step" | "returnCall" | "awaitValue">
   ): void {
     const loopVar = this.newLocal(ctx, "reference", "elem");
     const decl0 = ts.isVariableDeclarationList(init) ? init.declarations[0] : undefined;
@@ -12856,10 +12963,12 @@ class Exporter {
     const undef0 = this.newLocal(ctx, "reference");
     ctx.body.push({ kind: "Const", dst: undef0, value: { kind: "Undef" } });
 
-    // emit the driving while-loop into the current ctx.body.
-    const emitLoop = () => {
+    // emit the driving while-loop into the current ctx.body; `done` (with a close) stands for the
+    // record's [[Done]]: true across a step, which a throw there ends without a close
+    const emitLoop = (done?: { local: number; yes: number; no: number }) => {
       let cond = -1;
       const condBody = this.captureBody(ctx, () => {
+        if (done) ctx.body.push({ kind: "Copy", dst: done.local, src: done.yes });
         const r = drv.step(undef0);
         ctx.body.push({ kind: "Copy", dst: res, src: r });
         const doneVal = this.newLocal(ctx, "reference");
@@ -12869,6 +12978,16 @@ class Exporter {
       });
       const loopBody = this.captureLoopBody(ctx, "forof_gen", () => {
         ctx.body.push({ kind: "LoadField", dst: loopVar, obj: res, field: valueField });
+        if (drv.awaitValue !== undefined) {
+          const awaitIt = (): void => {
+            const v = this.newLocal(ctx, "reference");
+            ctx.body.push({ kind: "Await", dst: v, operand: loopVar });
+            ctx.body.push({ kind: "Copy", dst: loopVar, src: v });
+          };
+          if (drv.awaitValue === "always") awaitIt();
+          else ctx.body.push({ kind: "If", cond: drv.awaitValue, thenBody: this.captureBody(ctx, awaitIt), elseBody: [] });
+        }
+        if (done) ctx.body.push({ kind: "Copy", dst: done.local, src: done.no });
         for (const c of captureCells) {
           ctx.body.push({ kind: "AllocObject", dst: c.cell, typeId: 0, site: c.perSite, classId: this.cellClassId });
         }
@@ -12887,33 +13006,40 @@ class Exporter {
       return;
     }
 
-    // The iterator exposes .return(): close it on ABNORMAL loop exit (break /
-    // return / throw escaping the loop), but NOT on natural exhaustion. We use a
-    // `normalDone` flag set only after the loop completes normally, wrapped in a
-    // try/finally so any abrupt exit still runs the close. This reuses the tested
-    // finally-through-unwind machinery rather than intercepting break directly.
-    const normalDone = this.newLocal(ctx, "primitive");
+    // The iterator exposes .return(): close it on ABNORMAL loop exit (break / return / throw
+    // escaping the loop), but NOT on natural exhaustion nor on a step that throws. A try/finally
+    // runs the close on any abrupt exit, reusing the tested finally-through-unwind machinery rather
+    // than intercepting break directly. On a throw completion what the close throws is dropped
+    // for the throw in flight; on the others it goes on (a `return` that answers no object).
+    const done = this.newLocal(ctx, "primitive");
+    const threw = this.newLocal(ctx, "primitive");
+    const thrown = this.newLocal(ctx, "reference");
     const falseC = this.newLocal(ctx, "primitive");
     ctx.body.push({ kind: "Const", dst: falseC, value: { kind: "Bool", value: false } });
-    ctx.body.push({ kind: "Copy", dst: normalDone, src: falseC });
-    const tryBody = this.captureBody(ctx, () => {
-      emitLoop();
-      // The loop exits either by natural exhaustion (res.done === true) or by an
-      // abrupt break/return/throw. Only natural exhaustion is a "normal" completion
-      // that must NOT close the iterator; break falls through here with res.done
-      // still false, while return/throw skip this entirely (handled by finally).
-      const d = this.newLocal(ctx, "reference");
-      ctx.body.push({ kind: "LoadField", dst: d, obj: res, field: doneField });
-      ctx.body.push({ kind: "Copy", dst: normalDone, src: d });
+    const trueC = this.newLocal(ctx, "primitive");
+    ctx.body.push({ kind: "Const", dst: trueC, value: { kind: "Bool", value: true } });
+    ctx.body.push({ kind: "Copy", dst: done, src: falseC });
+    ctx.body.push({ kind: "Copy", dst: threw, src: falseC });
+    const tryBody = this.captureBody(ctx, () => { emitLoop({ local: done, yes: trueC, no: falseC }); });
+    const catchBody = this.captureBody(ctx, () => {
+      ctx.body.push({ kind: "Copy", dst: threw, src: trueC });
+      ctx.body.push({ kind: "Throw", src: thrown });
     });
     const finallyBody = this.captureBody(ctx, () => {
-      // if (!normalDone) it.return();
-      const notDone = this.newLocal(ctx, "primitive");
-      ctx.body.push({ kind: "UnOp", dst: notDone, op: "!", operand: normalDone });
-      const thenBody = this.captureBody(ctx, () => { drv.returnCall!(); });
-      ctx.body.push({ kind: "If", cond: notDone, thenBody, elseBody: [] });
+      const open = this.newLocal(ctx, "primitive");
+      ctx.body.push({ kind: "UnOp", dst: open, op: "!", operand: done });
+      const thenBody = this.captureBody(ctx, () => {
+        const dropping = this.captureBody(ctx, () => {
+          const dropped = this.newLocal(ctx, "reference");
+          const closeBody = this.captureBody(ctx, () => { drv.returnCall!(); });
+          ctx.body.push({ kind: "TryCatch", tryBody: closeBody, catchVar: dropped, catchBody: [], finallyBody: [] });
+        });
+        const closing = this.captureBody(ctx, () => { drv.returnCall!(); });
+        ctx.body.push({ kind: "If", cond: threw, thenBody: dropping, elseBody: closing });
+      });
+      ctx.body.push({ kind: "If", cond: open, thenBody, elseBody: [] });
     });
-    ctx.body.push({ kind: "TryCatch", tryBody, catchVar: null, catchBody: [], finallyBody });
+    ctx.body.push({ kind: "TryCatch", tryBody, catchVar: thrown, catchBody, finallyBody });
     restoreCell();
   }
 
@@ -13520,42 +13646,12 @@ class Exporter {
         ctx.body.push(this.withViewElem({ kind: "StoreIndex", arr: base, index: idx, src: rhs }, lhs.expression));
       }
     } else if (ts.isArrayLiteralExpression(lhs)) {
-      // destructuring ASSIGNMENT target: [a, b, ...rest] = rhsArray. Read each
-      // element from rhs by index and assign recursively to each target. (This is
-      // assignment to existing lvalues; declaration destructuring uses
-      // lowerBindingPattern.) Supports holes (elisions) and a trailing rest.
-      const elems = lhs.elements;
-      for (let i = 0; i < elems.length; i++) {
-        const el = elems[i];
-        if (ts.isOmittedExpression(el)) continue; // hole: [, x] = arr
-        if (ts.isSpreadElement(el)) {
-          // ...rest = rhs.slice(i)
-          const startL = this.newLocal(ctx, "primitive");
-          ctx.body.push({ kind: "Const", dst: startL, value: { kind: "Num", value: i } });
-          const restL = this.newLocal(ctx, "reference");
-          ctx.body.push({ kind: "CallBuiltin", dst: restL, builtin: "array.slice", recv: rhs, args: [startL] });
-          this.lowerAssignTarget(ctx, el.expression, restL);
-          break;
-        }
-        // element value: rhs[i]
-        const idxL = this.newLocal(ctx, "primitive");
-        ctx.body.push({ kind: "Const", dst: idxL, value: { kind: "Num", value: i } });
-        const elemL = this.newLocal(ctx, "reference");
-        ctx.body.push({ kind: "LoadIndex", dst: elemL, arr: rhs, index: idxL });
-        // a defaulted target `[a = 1] = arr`: use default when element is undefined.
-        let target: ts.Expression = el;
-        if (ts.isBinaryExpression(el) && el.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
-          const isUndef = this.newLocal(ctx, "primitive");
-          ctx.body.push({ kind: "UnOp", dst: isUndef, op: "isundef", operand: elemL });
-          const thenB = this.captureBody(ctx, () => {
-            const dv = this.lowerExpr(ctx, el.right);
-            ctx.body.push({ kind: "Copy", dst: elemL, src: dv });
-          });
-          ctx.body.push({ kind: "If", cond: isUndef, thenBody: thenB, elseBody: [] });
-          target = el.left;
-        }
-        this.lowerAssignTarget(ctx, target, elemL);
-      }
+      // a pattern nested in another or a loop's target (`[[a, b]] = v`, `for ([a, b] of v)`): the value
+      // comes without a type here, so the protocol over it (an array stays an index read); a
+      // top-level pattern over an array or a tuple takes lowerAssignArrayByIndex directly
+      if (!this.forOfDynamicEnabled) { this.lowerAssignArrayByIndex(ctx, lhs, rhs); return; }
+      const count = lhs.elements.some(ts.isSpreadElement) ? undefined : lhs.elements.length;
+      this.lowerArrayPatternByProtocol(ctx, this.valueIterDriver(ctx, rhs, count), this.assignPatternElements(ctx, lhs));
     } else if (ts.isObjectLiteralExpression(lhs)) {
       // destructuring ASSIGNMENT target: ({a, b: alias} = rhsObj).
       for (const p of lhs.properties) {
@@ -13595,6 +13691,43 @@ class Exporter {
       }
     } else {
       this.unsupported(lhs, `assignment target of kind ${ts.SyntaxKind[lhs.kind]}`);
+    }
+  }
+  /** `[a, b, ...rest] = rhs` with `rhs` an array or a tuple: each element by index, assigned recursively
+   *  to its target. Holes (elisions) and a trailing rest. (Assignment to existing lvalues; declarations
+   *  take lowerBindingPattern.) */
+  private lowerAssignArrayByIndex(ctx: FnCtx, lhs: ts.ArrayLiteralExpression, rhs: number): void {
+    const elems = lhs.elements;
+    for (let i = 0; i < elems.length; i++) {
+      const el = elems[i];
+      if (ts.isOmittedExpression(el)) continue; // hole: [, x] = arr
+      if (ts.isSpreadElement(el)) {
+        // ...rest = rhs.slice(i)
+        const startL = this.newLocal(ctx, "primitive");
+        ctx.body.push({ kind: "Const", dst: startL, value: { kind: "Num", value: i } });
+        const restL = this.newLocal(ctx, "reference");
+        ctx.body.push({ kind: "CallBuiltin", dst: restL, builtin: "array.slice", recv: rhs, args: [startL] });
+        this.lowerAssignTarget(ctx, el.expression, restL);
+        break;
+      }
+      // element value: rhs[i]
+      const idxL = this.newLocal(ctx, "primitive");
+      ctx.body.push({ kind: "Const", dst: idxL, value: { kind: "Num", value: i } });
+      const elemL = this.newLocal(ctx, "reference");
+      ctx.body.push({ kind: "LoadIndex", dst: elemL, arr: rhs, index: idxL });
+      // a defaulted target `[a = 1] = arr`: use default when element is undefined.
+      let target: ts.Expression = el;
+      if (ts.isBinaryExpression(el) && el.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+        const isUndef = this.newLocal(ctx, "primitive");
+        ctx.body.push({ kind: "UnOp", dst: isUndef, op: "isundef", operand: elemL });
+        const thenB = this.captureBody(ctx, () => {
+          const dv = this.lowerExpr(ctx, el.right);
+          ctx.body.push({ kind: "Copy", dst: elemL, src: dv });
+        });
+        ctx.body.push({ kind: "If", cond: isUndef, thenBody: thenB, elseBody: [] });
+        target = el.left;
+      }
+      this.lowerAssignTarget(ctx, target, elemL);
     }
   }
   /** Strip parentheses and type assertions (`!`, `as`, `<T>`, `satisfies`) from
@@ -13954,7 +14087,7 @@ class Exporter {
           if (!d.initializer) { this.unsupported(d, "destructuring declaration without initializer"); continue; }
           if (ts.isArrayBindingPattern(d.name)) {
             const pat = d.name;
-            const source = this.iterablePatternSource(ctx, d.initializer);
+            const source = this.iterablePatternSource(ctx, d.initializer, this.bindingPatternCount(pat));
             if (source !== undefined && !("drv" in source)) { this.lowerBindingPattern(ctx, pat, source.array); continue; }
             if (source !== undefined && "drv" in source) {
               this.lowerArrayPatternByProtocol(ctx, source.drv, this.bindingPatternElements(ctx, pat));
@@ -14342,16 +14475,25 @@ class Exporter {
         }
         // depth === 0: labels the innermost loop -> same as an unlabeled
         // break/continue; fall through to the handling below.
+        if (ctxKind === "block") { ctx.body.push({ kind: "Break" }); return; }
       }
       if (ctxKind === undefined) {
         this.unsupported(stmt, `${ts.SyntaxKind[stmt.kind]} outside any loop/switch`);
-      } else if (ctxKind === "switch") {
+      } else if (ctxKind === "block" && isBreak) {
+        // a plain break is the enclosing loop's or switch's, past the labeled blocks
+        let depth = 1;
+        while (stack[stack.length - 1 - depth] === "block") depth++;
+        if (stack[stack.length - 1 - depth] === undefined) this.unsupported(stmt, "break outside any loop/switch");
+        else if (this.insideTryWithFinally(stmt)) this.unsupported(stmt, "break out of a labeled block inside a try/finally");
+        else ctx.body.push({ kind: "Break", up: depth });
+      } else if (ctxKind === "switch" || ctxKind === "block") {
         if (isBreak) ctx.body.push({ kind: "Break" });
         else {
           let depth = 1;
-          while (stack[stack.length - 1 - depth] === "switch") depth++;
+          while (stack[stack.length - 1 - depth] === "switch" || stack[stack.length - 1 - depth] === "block") depth++;
           const targetKind = stack[stack.length - 1 - depth];
-          if (continueSafe(targetKind)) ctx.body.push({ kind: "Continue", up: depth });
+          if (ctxKind === "block" && this.insideTryWithFinally(stmt)) this.unsupported(stmt, "continue out of a labeled block inside a try/finally");
+          else if (continueSafe(targetKind)) ctx.body.push({ kind: "Continue", up: depth });
           else this.unsupported(stmt, "continue without an enclosing iteration statement");
         }
       } else if (ctxKind === "do") {
@@ -14448,8 +14590,21 @@ class Exporter {
         ctx.pendingLabel = label;
         this.lowerStmt(ctx, inner);
         ctx.pendingLabel = prev;
+      } else if (this.hasBreakTo(inner, label)) {
+        // `break L` out of a block: a one-shot loop, as a switch is. A plain break or continue
+        // in it still means the enclosing loop.
+        const prev = ctx.pendingLabel;
+        ctx.pendingLabel = label;
+        const loopBody = this.captureLoopBody(ctx, "block", () => {
+          this.lowerStmt(ctx, inner);
+          ctx.body.push({ kind: "Break" });
+        });
+        ctx.pendingLabel = prev;
+        const condTrue = this.newLocal(ctx, "primitive");
+        ctx.body.push({ kind: "Const", dst: condTrue, value: { kind: "Num", value: 1 } });
+        ctx.body.push({ kind: "Loop", cond: condTrue, condBody: [], body: loopBody });
       } else {
-        // label on a non-loop (e.g. block): only safe if the label is unused.
+        // a label nothing jumps to
         this.lowerStmt(ctx, inner);
       }
     } else if (ts.isTryStatement(stmt)) {
@@ -14662,6 +14817,8 @@ class Exporter {
       for (const fd of fnDecls) {
         const sym = this.symbolOf(fd.name!);
         if (!sym || this.isScriptGlobalVarSymbol(sym, fd.name!.text) || this.functionValueGlobal.has(sym)) continue;
+        // a function in a block at the top level has no direct calls (funcSymbols): its calls read the value
+        if (!this.funcSymbols.has(sym)) continue;
         const directOnly = this.lazyFnDecls && !this.fnValueUsed.has(sym) && !this.hasCaptured(ctx, sym);
         if (directOnly) continue;
         this.lazyFnValueSyms.add(sym);
@@ -14679,7 +14836,7 @@ class Exporter {
       // A nested declaration that is only ever called directly needs no closure
       // value at all: direct calls pass the scope record. Skip the allocation
       // but still lower the body here, in lexical order (see ensureNestedLowered).
-      if (this.lazyFnDecls && !this.fnValueUsed.has(sym) &&
+      if (this.lazyFnDecls && this.funcSymbols.has(sym) && !this.fnValueUsed.has(sym) &&
           !this.isScriptGlobalVarSymbol(sym, fd.name!.text) &&
           !this.hasCaptured(ctx, sym) && !this.functionValueGlobal.has(sym)) {
         this.lowerFunctionLike(fd, this.fnId.get(fd)!, false);
@@ -15213,6 +15370,18 @@ class Exporter {
     const last = stmts[stmts.length - 1];
     if (ts.isBreakStatement(last) || ts.isContinueStatement(last) || ts.isReturnStatement(last) || ts.isThrowStatement(last)) return false;
     return this.statementsCompleteNormally(stmts);
+  }
+  /** Is there a `break label` under this statement (nested functions aside)? */
+  hasBreakTo(stmt: ts.Node, label: string): boolean {
+    let found = false;
+    const visit = (n: ts.Node): void => {
+      if (found) return;
+      if (ts.isBreakStatement(n) && n.label?.text === label) { found = true; return; }
+      if (ts.isFunctionLike(n) || ts.isClassLike(n)) return;
+      ts.forEachChild(n, visit);
+    };
+    visit(stmt);
+    return found;
   }
   // Is there a `break` in these statements that leaves the enclosing switch or
   // loop they belong to? A break nested in an inner loop or switch targets that
@@ -16169,6 +16338,11 @@ class Exporter {
     // Bindings in module-level blocks and loop heads also belong to module
     // initialization. They can be captured even though they are not exports.
     const registerOwned = (node: ts.Node) => {
+      // a function declared in such a block (another one's call reads it through a capture)
+      if (ts.isFunctionDeclaration(node) && node.name && node.body && !ts.isSourceFile(node.parent)) {
+        const sym = this.symbolOf(node.name);
+        if (sym) this.moduleScopeSyms.add(sym);
+      }
       if (isFunctionLike(node) || ts.isClassDeclaration(node) || ts.isClassExpression(node)) return;
       if (ts.isVariableDeclaration(node)) {
         const list = node.parent;

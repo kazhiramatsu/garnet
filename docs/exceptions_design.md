@@ -57,17 +57,17 @@ why `ts_eh_push` records the depth.
 Notes:
 - `setjmp` must be called in the function that owns the `try` (cannot be wrapped
   in a helper), so codegen emits it inline.
-- Locals declared in C are at function scope (we declare all locals up front), so
-  values written in the try body before a throw remain readable — but per JS
-  semantics the catch only sees what it binds (`e`), so that's fine. We must NOT
-  rely on try-body locals being valid in the catch path (they may be partially
-  assigned); the catch body only uses `e` + outer locals.
-- `setjmp`/`longjmp` + local mutation: C says locals modified between setjmp and
-  longjmp and not declared `volatile` have indeterminate value after longjmp *if
-  they are in registers*. We sidestep this: all tsv locals are plain stack
-  variables and the catch/finally only reads outer-scope locals that were set
-  before the try, plus `e`. To be safe we will not depend on any local mutated
-  *inside* the try being observable in the catch.
+- Locals declared in C are at function scope (we declare all locals up front), and JS lets the
+  catch, the finally and the code after them read whatever the try body wrote before the throw.
+- `setjmp`/`longjmp` + local mutation: C says locals modified between setjmp and longjmp and not
+  declared `volatile` have indeterminate value after longjmp. Reference locals of a function with a
+  `try` live in memory homes (`docs/frame_elision_design.md`); a coroutine's numerics in its frame.
+  An unboxed number or boolean of a plain function is a C local: until Session 362 this note said no
+  catch would read one, which is false (`let n = 0; try { n = 1; f(); } catch { return n; }` answered 0
+  at -O2, silently). `try_volatile_locals` declares `volatile` each numeric local written in a
+  protected body and read outside it, or read in a body that a loop around the `try` enters again
+  after a throw (more than one definition). A local read only inside the body it is written in stays in
+  a register, so a hot loop in a `try` pays nothing unless its accumulator is read after the `try`.
 
 ### finally
 `finally` must run on BOTH the normal and the exceptional path, and also when the
