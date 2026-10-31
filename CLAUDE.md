@@ -89,6 +89,10 @@ Rust in §315; selfhost is kept as a performance metric).
 - **Methods boxed onto the proto must be created after g_function_proto is initialized** (so that
   `.call`/`.apply`/`.bind` resolve).
 - **A namespace mismatch between the METHOD key and the FIELD key is a regular cause of silent DIFFs.**
+- **A field has one struct view** (`field_struct`, Session 362). The class structs are flat, a subclass's
+  does not contain its parent's, so clang's TBAA takes `((Sub*)p)->f3` and `((Base*)p)->f3` for two
+  objects and a load passes a store (silent, default and strict). Every access to a class field, new
+  emission included, goes through the declaring class's struct.
 - **`ts_to_num` is a raw bit reinterpretation (not ToNumber).** `undefined`→NaN matches JS, but
   `null`→NaN does not.
 - **Gate a new feature behind a single predictable branch** (e.g. `if (g_has_proxies && ...)`) = zero
@@ -163,6 +167,10 @@ Rust in §315; selfhost is kept as a performance metric).
 - `node:async_hooks` provides `AsyncLocalStorage` and `AsyncResource` (docs/async_context_design.md):
   `createHook`, `executionAsyncId` and the other tracing ids are not provided (an import of them is a
   compile-time error), and an EventEmitter's listeners run in the emitting caller's context.
+- A program with no visible freezer (no `Object.freeze`, no `Object`/`Reflect`/`globalThis` as a value,
+  no `freeze` read or spelled out) emits no frozen test on typed stores; `O[k](instance)` with `k`
+  computed at run time and `O` obtained through `.constructor` is a TypeError at the freeze (V8 freezes,
+  Session 362).
 - `o.__proto__` and `o["__proto__"]` read undefined (V8: the prototype through the accessor);
   `Object.getPrototypeOf` / `setPrototypeOf` are the modelled forms (Session 355 note).
 - A typed receiver that is a Proxy (vue's reactive arrays and collections) takes its methods through

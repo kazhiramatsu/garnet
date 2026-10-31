@@ -560,7 +560,7 @@ typedef struct { ts_gc_header h; tsv getter; tsv setter; uint8_t g_this, s_this;
    0xffffffff. registered = created via Symbol.for. description is the desc
    string (or undefined). The property key for obj[sym] is TS_KEY_USERSYM(sym_id)
    for ordinary symbols, or TS_KEY_WKSYM(wksym) for well-known ones. */
-typedef struct { ts_gc_header h; uint32_t sym_id; uint32_t wksym; uint8_t registered; tsv description; } ts_symbol;
+typedef struct { ts_gc_header h; uint32_t sym_id; uint32_t wksym; uint32_t cls, shape; tsv description; uint8_t registered; } ts_symbol;
 /* Common object header shared by ALL "object-like" GC values (unified object
    model, see docs/unified_object_model.md). Every object kind (plain object,
    class instance, Array, Map, Set, Function, ...) begins with this prefix so the
@@ -587,7 +587,11 @@ typedef struct ts_obj_common {
      a depth-first numbering of the class forest, so a class and its
      subclasses are one interval (docs/class_index_dispatch_design.md); 0 for
      every other object and after a user-level prototype change, TS_CLS_PROTO
-     on a class's prototype object. */
+     on a class's prototype object. The generated code's interval tests and the
+     inline probes read this word and the shape before they know the cell's kind,
+     so a cell that does not embed this prefix (a Symbol, a Proxy, a coroutine)
+     keeps both offsets zero (`cls`, `shape` in those structs, asserted there;
+     gc_alloc zero-fills): any other bytes there are a class index by chance. */
   uint32_t cls;
   /* Low 29 bits are hidden-class identity. The high 3 bits store integrity
      flags (frozen, non-extensible, sealed), keeping the common header compact. */
@@ -600,6 +604,8 @@ typedef struct ts_obj_common {
     struct { ts_prop* props; uint32_t cap, len; uint32_t* prop_index; };
   };
 } ts_obj_common;
+#define TS_CELL_ZERO_WORDS(T) (offsetof(T, cls) == offsetof(ts_obj_common, cls) && offsetof(T, shape) == offsetof(ts_obj_common, shape))
+_Static_assert(TS_CELL_ZERO_WORDS(ts_symbol), "a Symbol answers the class and shape words with zero");
 /* The class index word of a class's prototype object: no instance's, so
    intervals and tables reject it, and relinking such an object
    (setPrototypeOf on a class prototype) is what can change an instance's
@@ -2056,6 +2062,7 @@ tsv ts_object_for_in_keys(tsv obj);
 tsv ts_object_get_own_property_names(tsv obj);
 tsv ts_object_get_own_property_symbols(tsv obj);
 tsv ts_object_freeze(tsv v);
+tsv ts_object_freeze_unseen(tsv v);
 tsv ts_object_is_frozen(tsv v);
 /* A typed direct store on a frozen class instance: the strict-mode TypeError
    (`Cannot assign to read only property 'x' of object '#<C>'`). */
@@ -3955,15 +3962,18 @@ tsv         ts_current_exception(void);
 void        g_exception_set(tsv v);
 int         ts_handlers_count(void);
 
-/* Proxy: wraps a target + handler. Like ts_promise it does NOT embed
-   ts_obj_common — every property/call/construct operation is intercepted early
-   in ts_get/ts_set/... and dispatched to the handler's traps. */
+/* Proxy: wraps a target + handler. It does NOT embed ts_obj_common — every
+   property/call/construct operation is intercepted early in ts_get/ts_set/...
+   and dispatched to the handler's traps. Its class and shape words stay zero
+   (ts_obj_common's note). */
 typedef struct ts_proxy {
   ts_gc_header h;
   tsv target;
+  uint32_t cls, shape;
   tsv handler;
   uint8_t revoked;
 } ts_proxy;
+_Static_assert(TS_CELL_ZERO_WORDS(ts_proxy), "a Proxy answers the class and shape words with zero");
 tsv ts_proxy_new(tsv target, tsv handler);
 tsv ts_proxy_revocable(tsv target, tsv handler);
 tsv ts_proxy_revoke_thunk(tsv* args, int n);
@@ -3997,9 +4007,10 @@ enum {
 typedef struct ts_coro {
   ts_gc_header h;
   int state;
+  int rejected;
+  uint32_t cls, shape;       /* zero (ts_obj_common's note): a generator object is a program's value */
   tsv (*resume)(tsv);
   tsv result;                /* awaited value (async) / value sent into .next() (gen) */
-  int rejected;
   tsv ret;
   tsv async_ctx;             /* the asynchronous context captured when this continuation was registered on a promise (docs/async_context_design.md) */
   int ctx_captured;          /* async_ctx holds a capture for the next resume (one-shot): a resume nobody registered, a generator's next(), keeps the caller's context */
@@ -4033,6 +4044,7 @@ typedef struct ts_coro {
   int fin_tgt_inline[TS_CORO_EH_INLINE];
   int fin_top;               /* active finally-pending slots */
 } ts_coro;
+_Static_assert(TS_CELL_ZERO_WORDS(ts_coro), "a coroutine answers the class and shape words with zero");
 int         ts_coro_eh_push_slot(ts_coro* c);
 int         ts_coro_fin_push_slot(ts_coro* c);
 /* Promise/Coro handle APIs are the primary runtime boundary. */

@@ -2879,6 +2879,12 @@ fn may_freeze_instances_init(program: &Program) {
             }
         }
     }
+    fn freezer_name(name: &str) -> bool {
+        matches!(name, "freeze" | "seal" | "preventExtensions")
+    }
+    fn field_name(program: &Program, field: u32) -> &str {
+        program.fields.get(field as usize).and_then(|fi| fi.name.as_deref()).unwrap_or("")
+    }
     fn scan(block: &[Inst], lits: &BTreeSet<u32>, program: &Program) -> bool {
         for inst in block {
             match inst {
@@ -2895,10 +2901,19 @@ fn may_freeze_instances_init(program: &Program) {
                 // a dynamic method call named like a freezer on a receiver the
                 // program does not type (`(o as any).freeze(x)`)
                 Inst::Call { callee: CalleeRef::Method { recv_stable: false, method_field: Some(mf), .. }, .. } => {
-                    let name = program.fields.get(mf.0 as usize).and_then(|fi| fi.name.as_deref()).unwrap_or("");
-                    if matches!(name, "freeze" | "seal" | "preventExtensions") {
+                    if freezer_name(field_name(program, mf.0)) {
                         return true;
                     }
+                }
+                // one read as a value, for a call through it, off a value holding `Object`
+                // (`({}).constructor`, which needs no load of the global): `const f = O.freeze`
+                Inst::LoadField { field, .. } if freezer_name(field_name(program, field.0)) => {
+                    return true;
+                }
+                // or by a key the program spells out (`O["freeze"]`); a key computed at run
+                // time stays unseen, and the value's adapter refuses it (`ts_object_freeze_unseen`)
+                Inst::Const { value: ConstVal::Str { value }, .. } if freezer_name(value) => {
+                    return true;
                 }
                 Inst::If { then_body, else_body, .. } => {
                     if scan(then_body, lits, program) || scan(else_body, lits, program) {
@@ -5561,8 +5576,45 @@ fn local_class_map(f: &Function) -> BTreeMap<u32, u32> {
             local_class.insert(p, *cid);
         }
     }
+    let params: BTreeSet<u32> = local_class.keys().copied().collect();
     collect_local_class(&f.body, &mut local_class);
+    drop_reassigned_classes(&f.body, &params, &mut local_class);
     local_class
+}
+
+/// A local's class is flow-insensitive, so it must hold at every use: a local that came from `new A`
+/// and is assigned anything else (`let x: I = new A(); ...; x = new B();`, a call's result, a
+/// constant) has no class here, and each access takes its site's hint, whose guard tests the
+/// receiver. With the last allocation's class, the reads before that assignment took B's offsets
+/// on an A. A parameter keeps its class: its annotation covers every assignment (a cast aside,
+/// `receiver_class`'s note), and a subclass's struct starts with its parent's.
+fn drop_reassigned_classes(body: &[Inst], params: &BTreeSet<u32>, local_class: &mut BTreeMap<u32, u32>) {
+    let mut flat: Vec<&Inst> = Vec::new();
+    flatten_inst(body, &mut flat);
+    loop {
+        let mut drop: Vec<u32> = Vec::new();
+        for inst in &flat {
+            let Some(d) = inst_def(inst) else { continue };
+            if params.contains(&d) {
+                continue;
+            }
+            let Some(&c) = local_class.get(&d) else { continue };
+            let same = match inst {
+                Inst::AllocObject { class_id: Some(k), .. } => k.0 == c,
+                Inst::Copy { src, .. } => local_class.get(&src.0) == Some(&c),
+                _ => false,
+            };
+            if !same {
+                drop.push(d);
+            }
+        }
+        if drop.is_empty() {
+            break;
+        }
+        for d in drop {
+            local_class.remove(&d);
+        }
+    }
 }
 
 // ---- Flow-sensitive boxing of maybe-undefined numerics --------------------------
@@ -12001,6 +12053,16 @@ fn declaring_class(c: u32, field: u32, classes: &BTreeMap<u32, &ClassDef>) -> Op
     }
     found
 }
+/// The struct every access to a field goes through: its declaring class's, whatever the receiver's
+/// class. The class structs are flat (`emit_field_chain`), so a subclass's struct does not contain
+/// its parent's, and for the C compiler's type-based alias analysis `((Sub*)p)->f3` and
+/// `((Base*)p)->f3` are different objects: a store through one and a load through the other of the
+/// same field may pass each other (`o.x = 1.5; b.x = 2.5; return o.x;` with `o` a Sub and `b` a Base
+/// answered 1.5). One view per field keeps the analysis's facts true, and its use: fields of one
+/// struct, and of two classes, stay apart.
+fn field_struct(c: u32, field: u32, classes: &BTreeMap<u32, &ClassDef>) -> String {
+    struct_name(declaring_class(c, field, classes).unwrap_or(c))
+}
 /// The integer kind of (class `c`, field `field`): 0 not an integer slot, 2 an
 /// int32 slot (an enum-typed field), 3 a store-proven integer slot. The
 /// declaring ancestor's tag decides, as for `numeric_field`.
@@ -14486,6 +14548,9 @@ fn fnval_adapter_body(builtin: &str) -> Option<String> {
         "object.values" => hv(format!("ts_object_values({})", val(0))),
         "object.entries" => hv(format!("ts_object_entries({})", val(0))),
         "object.fromEntries" => hv(format!("ts_object_from_entries({})", val(0))),
+        // the scan found no way to freeze an instance, so typed stores test no frozen bit: the
+        // value can still come from a key computed at run time, where a class instance is refused
+        "object.freeze" if !frozen_tests_on() && frozen_stores_enabled() => hv(format!("ts_object_freeze_unseen({})", val(0))),
         "object.freeze" => hv(format!("ts_object_freeze({})", val(0))),
         "object.seal" => hv(format!("ts_object_seal({})", val(0))),
         "object.preventExtensions" => hv(format!("ts_object_prevent_extensions({})", val(0))),
@@ -22051,6 +22116,306 @@ fn emit_store_field_generic_key(s: &mut String, obj: u32, field: &str, src: u32,
     }
 }
 
+/// One class a site tests itself (docs/pic_sized_inline_design.md, "The candidate classes in line"):
+/// the topmost ancestor declaring the field (`hint_guard`'s rule) and its class interval.
+struct CandField {
+    decl: u32,
+    lo: u32,
+    span: u32,
+}
+
+/// A site with more classes declaring the field is left to its cache, which serves a megamorphic
+/// site by the class word.
+const CAND_FIELDS_MAX: usize = 4;
+
+/// The struct accesses of a site's candidate classes (`cands`, the exporter's guess from the
+/// receiver's static type): one per class declaring the field, kept with a class interval. A
+/// candidate without the field (a getter, an optional member it leaves out) has no test here: its
+/// instance takes the cache, as does every other receiver. An index in the declaring class's
+/// interval is a sized, unrelinked instance of it or a subclass, whose struct starts with that
+/// class's layout (`receiver_guard`'s `Range`), so the test needs no `g_typed_slow` gate; a cell of
+/// any other kind answers 0 (`ts_obj_common`'s note).
+fn candidate_fields(ctx: &Ctx, cands: &[u32], field: u32, obj: u32, dst: Option<u32>) -> Vec<CandField> {
+    let mut out: Vec<CandField> = Vec::new();
+    if cands.is_empty() || ctx.unboxed.contains(&obj) || ctx.int_local.contains(&obj) || ctx.json_locals.contains(&obj) {
+        return out;
+    }
+    if dst.map_or(false, |d| ctx.json_locals.contains(&d)) {
+        return out;
+    }
+    let dfs = class_dfs();
+    for &c in cands {
+        let Some(d) = declaring_class(c, field, ctx.classes) else { continue };
+        if out.iter().any(|f| f.decl == d) || !class_ranged(d) {
+            continue;
+        }
+        if let (Some(&i), Some(&span)) = (dfs.index.get(&d), dfs.span.get(&d)) {
+            out.push(CandField { decl: d, lo: i + 1, span });
+        }
+    }
+    if out.len() > CAND_FIELDS_MAX {
+        out.clear();
+    }
+    out
+}
+
+fn cand_test(o: &str, f: &CandField) -> String {
+    format!("ts_is_obj({o}) && (uint32_t)(((ts_object*)ts_ptr({o}))->cls - {lo}u) < {span}u", o = o, lo = f.lo, span = f.span)
+}
+
+/// Opens a read's candidates: `if (an instance of D1) dst = its field; else if ...; else {`, the
+/// site's cached read and the closing brace following. Each value goes to the destination as the
+/// hinted read's does.
+fn emit_cand_load_open(s: &mut String, ctx: &Ctx, dst: u32, obj: u32, field: u32, cand: &[CandField]) {
+    let o = ctx.vname(obj);
+    for (i, f) in cand.iter().enumerate() {
+        let st = format!("(({}*)ts_ptr({}))->f{}", struct_name(f.decl), o, field);
+        let _ = writeln!(s, "  {}if ({}) {{", if i == 0 { "" } else { "else " }, cand_test(&o, f));
+        if int32_field(f.decl, field, ctx.classes) {
+            if ctx.int_local.contains(&dst) {
+                s.push_str(&ctx.set_int_or_num(dst, &st));
+            } else {
+                s.push_str(&ctx.set_num(dst, &format!("(double){}", st)));
+            }
+        } else if numeric_field(f.decl, field, ctx.classes) {
+            s.push_str(&ctx.set_num(dst, &st));
+        } else {
+            s.push_str(&ctx.set_val(dst, &st));
+        }
+        s.push_str("  }\n");
+    }
+    s.push_str("  else {\n");
+}
+
+/// Opens a write's candidates as `emit_cand_load_open` does a read's; false when none takes it. A
+/// boxed field takes any value and a number field a number (a boxed local's is tested: any other
+/// value takes the site's write, which knows what such a store does); an integer slot applies the
+/// runtime's integer rule in line (`ts_int_field_value_k`: an integer, or a TypeError naming the
+/// field), the rule `infer_int_store_fields` assumes of a store without a receiver class. A frozen
+/// instance takes the site's write and its TypeError.
+fn emit_cand_store_open(s: &mut String, ctx: &Ctx, obj: u32, field: u32, src: u32, cand: &[CandField]) -> bool {
+    let o = ctx.vname(obj);
+    let frozen = if frozen_tests_on() { format!(" && !TS_RT_UNLIKELY(ts_store_frozen({}))", o) } else { String::new() };
+    let src_boxed = !ctx.unboxed.contains(&src) && !ctx.int_local.contains(&src);
+    let mut open = false;
+    for f in cand {
+        let is_num = numeric_field(f.decl, field, ctx.classes);
+        let num_test = if is_num && src_boxed { format!(" && ts_is_num({})", ctx.vname(src)) } else { String::new() };
+        let rhs = if int32_field(f.decl, field, ctx.classes) {
+            if ctx.int_local.contains(&src) {
+                format!("d{}", src)
+            } else if field_int_kind(f.decl, field, ctx.classes) == 3 {
+                format!("ts_int_field_value_k({}, {}u)", ctx.num(src), field)
+            } else {
+                format!("ts_int32_field_value_k({}, {}u)", ctx.num(src), field)
+            }
+        } else if is_num {
+            ctx.num(src)
+        } else {
+            ctx.val(src)
+        };
+        let _ = writeln!(s, "  {}if ({}{}{}) {{", if open { "else " } else { "" }, cand_test(&o, f), num_test, frozen);
+        let _ = writeln!(s, "    (({}*)ts_ptr({}))->f{} = {};", struct_name(f.decl), o, field, rhs);
+        if !is_num {
+            emit_field_store_barrier(s, &o, &rhs);
+        }
+        s.push_str("  }\n");
+        open = true;
+    }
+    if open {
+        s.push_str("  else {\n");
+    }
+    open
+}
+
+/// The barrier of a boxed struct field's store. The owner is untagged by the store itself; a value
+/// the emitter knows is no heap reference needs none.
+fn emit_field_store_barrier(s: &mut String, obj_name: &str, rhs: &str) {
+    if barrier_fast_enabled() {
+        if !non_heap_value_expr(rhs) {
+            let _ = writeln!(s, "    ts_write_barrier_hdr((ts_gc_header*)ts_ptr({}), {});", obj_name, rhs);
+        }
+    } else {
+        let _ = writeln!(s, "    ts_write_barrier({}, {});", obj_name, rhs);
+    }
+}
+
+/// A field read through the site's caches: a receiver the program does not type as one class
+/// (`Inst::LoadField`'s struct paths have declined it).
+#[allow(clippy::too_many_arguments)]
+fn emit_load_field_cached(s: &mut String, ctx: &Ctx, dst: &LocalId, obj: &LocalId, field: &FieldId, slots: &u32, elem: &u8, sized: &bool) {
+    // Static-slot hint (docs/static_slots_design.md): the probe checks the
+    // predicted in-object slot against the receiver's shape and falls to
+    // the out-of-line cached read otherwise.
+    if *slots != 0 && prop_pic_enabled() && static_slots_enabled() {
+        let pic = ctx.fresh_label();
+        let _ = writeln!(s, "  {{ static ts_prop_ic _ts_pic_{} = TS_PROP_IC_INIT;", pic);
+        let s1 = (slots & 0xFF) - 1;
+        let s2 = (slots >> 8) & 0xFF;
+        let s3 = (slots >> 16) & 0xFF;
+        let homes_try = |try_call: String| -> String {
+            format!(
+                "({{ tsv _lz; if (!{try_call}) {{ {sp}_lz = ts_get_linked({o}, {k}, &_ts_pic_{pic}, &F.h, {n});{rl} }} _lz; }})",
+                try_call = try_call, sp = ctx.spill_now(), rl = ctx.reload_now(),
+                o = ctx.val(obj.0), k = field.0, pic = pic, n = ctx.frame_nslots
+            )
+        };
+        // an integer destination at a single-slot site of an integer-friendly key: the
+        // integer slot's word (docs/record_int_fields_design.md; the helpers test the
+        // integer slot first, so a key that is never an integer slot keeps the boxed
+        // read); a boxed slot converts as set_val would (an integer local truncates,
+        // an int32 use is ToInt32)
+        if int_record_slots_enabled() && s2 == 0 && !ctx.lazy_homes && int_record_key(field.0)
+            && (ctx.int_local.contains(&dst.0) || ctx.int32_use.contains(&dst.0)) {
+            let helper = if ctx.int_local.contains(&dst.0) { "ts_get_static_int64_inline" } else { "ts_get_static_int32_inline" };
+            let call = if ctx.lazy_frame {
+                format!("{}_lazy({}, {}, {}u, &_ts_pic_{}, &F.h, {})", helper, ctx.val(obj.0), field.0, s1, pic, ctx.frame_nslots)
+            } else {
+                format!("{}({}, {}, {}u, &_ts_pic_{})", helper, ctx.val(obj.0), field.0, s1, pic)
+            };
+            if ctx.int_local.contains(&dst.0) || int32_codegen_enabled() {
+                let _ = writeln!(s, "  d{} = {};", dst.0, call);
+            } else {
+                let _ = writeln!(s, "  d{} = (double){};", dst.0, call);
+            }
+            let _ = writeln!(s, "  }}");
+            return;
+        }
+        let get_expr = match (s2, s3, ctx.lazy_frame) {
+            (0, _, true) if ctx.lazy_homes => homes_try(format!("ts_get_static_try({}, {}, {}u, &_ts_pic_{}, &_lz)", ctx.val(obj.0), field.0, s1, pic)),
+            (_, 0, true) if ctx.lazy_homes => homes_try(format!("ts_get_static2_try({}, {}, {}u, {}u, &_ts_pic_{}, &_lz)", ctx.val(obj.0), field.0, s1, s2 - 1, pic)),
+            (_, _, true) if ctx.lazy_homes => homes_try(format!("ts_get_static3_try({}, {}, {}u, {}u, {}u, &_ts_pic_{}, &_lz)", ctx.val(obj.0), field.0, s1, s2 - 1, s3 - 1, pic)),
+            (0, _, false) => format!("ts_get_static_inline({}, {}, {}u, &_ts_pic_{})", ctx.val(obj.0), field.0, s1, pic),
+            (0, _, true) => format!("ts_get_static_inline_lazy({}, {}, {}u, &_ts_pic_{}, &F.h, {})", ctx.val(obj.0), field.0, s1, pic, ctx.frame_nslots),
+            (_, 0, false) => format!("ts_get_static2_inline({}, {}, {}u, {}u, &_ts_pic_{})", ctx.val(obj.0), field.0, s1, s2 - 1, pic),
+            (_, 0, true) => format!("ts_get_static2_inline_lazy({}, {}, {}u, {}u, &_ts_pic_{}, &F.h, {})", ctx.val(obj.0), field.0, s1, s2 - 1, pic, ctx.frame_nslots),
+            (_, _, false) => format!("ts_get_static3_inline({}, {}, {}u, {}u, {}u, &_ts_pic_{})", ctx.val(obj.0), field.0, s1, s2 - 1, s3 - 1, pic),
+            (_, _, true) => format!("ts_get_static3_inline_lazy({}, {}, {}u, {}u, {}u, &_ts_pic_{}, &F.h, {})", ctx.val(obj.0), field.0, s1, s2 - 1, s3 - 1, pic, ctx.frame_nslots),
+        };
+        s.push_str(&ctx.set_val(dst.0, &get_expr));
+        let _ = writeln!(s, "  }}");
+        return;
+    }
+    // ctx.val boxes an unboxed-numeric receiver (int/double local) — using
+    // the raw `v{id}` name here would reference an undeclared identifier.
+    // Dynamic/`any` receiver: ts_get_checked throws a catchable TypeError
+    // when the receiver is null/undefined (typed struct reads took the
+    // direct-offset path above; optional chaining guards the read out).
+    if prop_pic_enabled() {
+        let pic = ctx.fresh_label();
+        let _ = writeln!(
+            s,
+            "  {{ static ts_prop_ic _ts_pic_{} = TS_PROP_IC_INIT;",
+            pic
+        );
+        // a site whose receiver's static type admits a class instance (`sized`): the
+        // inline read that probes the sized-receiver entries after the plain-object one
+        let sz = if *sized { "_sized" } else { "" };
+        let get_expr = if ctx.lazy_homes {
+            let extra = if *sized {
+                format!(" && !ts_get_sized_pic_try({o}, {k}, &_ts_pic_{pic}, &_lz)", o = ctx.val(obj.0), k = field.0, pic = pic)
+            } else {
+                String::new()
+            };
+            format!(
+                "({{ tsv _lz; if (!ts_get_pic_try({o}, {k}, &_ts_pic_{pic}, &_lz){extra}) {{ {sp}_lz = ts_get_linked({o}, {k}, &_ts_pic_{pic}, &F.h, {n});{rl} }} _lz; }})",
+                o = ctx.val(obj.0), k = field.0, pic = pic, n = ctx.frame_nslots,
+                sp = ctx.spill_now(), rl = ctx.reload_now(), extra = extra
+            )
+        } else if ctx.lazy_frame {
+            format!(
+                "ts_get_pic_checked_inline{}_lazy({}, {}, &_ts_pic_{}, &F.h, {})",
+                sz,
+                ctx.val(obj.0),
+                field.0,
+                pic,
+                ctx.frame_nslots
+            )
+        } else {
+            format!(
+                "ts_get_pic_checked_inline{}({}, {}, &_ts_pic_{})",
+                sz,
+                ctx.val(obj.0),
+                field.0,
+                pic
+            )
+        };
+        // A receiver typed as a view: its length in line (TA2); from the
+        // enclosing loop's hoisted test and length when it has them.
+        let hoisted_len = if *elem != 0 && is_length_field(field.0) {
+            ctx.ta_hoisted
+                .borrow()
+                .get(&obj.0)
+                .copied()
+                .filter(|(e, _)| *e == *elem - 1)
+                .map(|(_, top)| top)
+        } else {
+            None
+        };
+        let get_expr = if let Some(top) = hoisted_len {
+            format!(
+                "((_tah{a}_{t} && obj_map_plain(&_tah{a}_{t}->o)->len == 0) ? ts_num((double)_tal{a}_{t}) : {g})",
+                a = obj.0,
+                t = top,
+                g = get_expr
+            )
+        } else if *elem != 0 && is_length_field(field.0) {
+            format!(
+                "({{ tsv _tl; if (!ts_ta_try_length({}, &_tl)) _tl = {}; _tl; }})",
+                ctx.val(obj.0),
+                get_expr
+            )
+        } else {
+            get_expr
+        };
+        s.push_str(&ctx.set_val(dst.0, &get_expr));
+        let _ = writeln!(s, "  }}");
+    } else {
+        s.push_str(&ctx.set_val(
+            dst.0,
+            &format!("ts_get_checked({}, {})", ctx.val(obj.0), field.0),
+        ));
+    }
+}
+
+/// A field write through the site's caches (`Inst::StoreField`'s struct paths have declined it).
+fn emit_store_field_cached(s: &mut String, ctx: &Ctx, obj: &LocalId, field: &FieldId, src: &LocalId, slots: &u32, sized: &bool) {
+    // Static-slot hint (docs/static_slots_design.md): the probe checks the
+    // predicted in-object slot (plain writable data, the object not
+    // frozen) and falls to the out-of-line cached store otherwise.
+    if *slots != 0 && prop_pic_enabled() && static_slots_enabled() {
+        let pic = ctx.fresh_label();
+        let _ = writeln!(s, "  {{ static ts_prop_ic _ts_pic_{} = TS_PROP_IC_INIT;", pic);
+        let s1 = (slots & 0xFF) - 1;
+        let s2 = (slots >> 8) & 0xFF;
+        let s3 = (slots >> 16) & 0xFF;
+        let homes_set = |try_call: String| -> String {
+            format!(
+                "  if (!{try_call}) {{ {sp}ts_set_linked({o}, {k}, {v}, &_ts_pic_{pic}, &F.h, {n});{rl} }}",
+                try_call = try_call, sp = ctx.spill_now(), rl = ctx.reload_now(),
+                o = ctx.val(obj.0), k = field.0, v = ctx.val(src.0), pic = pic, n = ctx.frame_nslots
+            )
+        };
+        match (s2, s3, ctx.lazy_frame) {
+            (0, _, true) if ctx.lazy_homes => { let _ = writeln!(s, "{}", homes_set(format!("ts_set_static_try({}, {}, {}u, {}, &_ts_pic_{})", ctx.val(obj.0), field.0, s1, ctx.val(src.0), pic))); }
+            (_, 0, true) if ctx.lazy_homes => { let _ = writeln!(s, "{}", homes_set(format!("ts_set_static2_try({}, {}, {}u, {}u, {}, &_ts_pic_{})", ctx.val(obj.0), field.0, s1, s2 - 1, ctx.val(src.0), pic))); }
+            (_, _, true) if ctx.lazy_homes => { let _ = writeln!(s, "{}", homes_set(format!("ts_set_static3_try({}, {}, {}u, {}u, {}u, {}, &_ts_pic_{})", ctx.val(obj.0), field.0, s1, s2 - 1, s3 - 1, ctx.val(src.0), pic))); }
+            (0, _, false) => { let _ = writeln!(s, "  ts_set_static_inline({}, {}, {}u, {}, &_ts_pic_{});", ctx.val(obj.0), field.0, s1, ctx.val(src.0), pic); }
+            (0, _, true) => { let _ = writeln!(s, "  ts_set_static_inline_lazy({}, {}, {}u, {}, &_ts_pic_{}, &F.h, {});", ctx.val(obj.0), field.0, s1, ctx.val(src.0), pic, ctx.frame_nslots); }
+            (_, 0, false) => { let _ = writeln!(s, "  ts_set_static2_inline({}, {}, {}u, {}u, {}, &_ts_pic_{});", ctx.val(obj.0), field.0, s1, s2 - 1, ctx.val(src.0), pic); }
+            (_, 0, true) => { let _ = writeln!(s, "  ts_set_static2_inline_lazy({}, {}, {}u, {}u, {}, &_ts_pic_{}, &F.h, {});", ctx.val(obj.0), field.0, s1, s2 - 1, ctx.val(src.0), pic, ctx.frame_nslots); }
+            (_, _, false) => { let _ = writeln!(s, "  ts_set_static3_inline({}, {}, {}u, {}u, {}u, {}, &_ts_pic_{});", ctx.val(obj.0), field.0, s1, s2 - 1, s3 - 1, ctx.val(src.0), pic); }
+            (_, _, true) => { let _ = writeln!(s, "  ts_set_static3_inline_lazy({}, {}, {}u, {}u, {}u, {}, &_ts_pic_{}, &F.h, {});", ctx.val(obj.0), field.0, s1, s2 - 1, s3 - 1, ctx.val(src.0), pic, ctx.frame_nslots); }
+        }
+        let _ = writeln!(s, "  }}");
+        return;
+    }
+    // ctx.val (not a hardcoded v-name): the receiver local may be numeric-
+    // unboxed (`const n: any = 5; n.c = 3`) — rebox it so ts_set sees the
+    // primitive and throws V8's "Cannot create property ..." TypeError.
+    emit_store_field_generic(s, obj.0, field.0, src.0, ctx, *sized);
+}
+
 fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
     ctx.cur_inst.set(inst as *const Inst as usize);
     // an array literal's element store, done by the allocation (array_lits_for)
@@ -22103,7 +22468,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                             }
                             if !boxed.is_empty() {
                                 let inits: Vec<String> =
-                                    boxed.iter().map(|f| format!("{}->f{} = TS_UNDEFINED;", o, f)).collect();
+                                    boxed.iter().map(|f| format!("(({}*){})->f{} = TS_UNDEFINED;", field_struct(c.0, *f, ctx.classes), o, f)).collect();
                                 let _ = writeln!(s, "  {}", inits.join(" "));
                             }
                             let _ = writeln!(s, "  {} = ts_obj({}); }}", dst_name, o);
@@ -22121,7 +22486,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         if !boxed.is_empty() {
                             let inits: Vec<String> = boxed
                                 .iter()
-                                .map(|f| format!("sobj{}.f{} = TS_UNDEFINED;", dst.0, f))
+                                .map(|f| format!("(({}*)&sobj{})->f{} = TS_UNDEFINED;", field_struct(c.0, *f, ctx.classes), dst.0, f))
                                 .collect();
                             let _ = writeln!(s, "  {}", inits.join(" "));
                         }
@@ -22154,7 +22519,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         if !boxed.is_empty() {
                             let inits: Vec<String> = boxed
                                 .iter()
-                                .map(|f| format!("hobj{}->f{} = TS_UNDEFINED;", dst.0, f))
+                                .map(|f| format!("(({}*)hobj{})->f{} = TS_UNDEFINED;", field_struct(c.0, *f, ctx.classes), dst.0, f))
                                 .collect();
                             let _ = writeln!(s, "  {}", inits.join(" "));
                         }
@@ -22167,7 +22532,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         }
                         if !numeric.is_empty() {
                             let inits: Vec<String> =
-                                numeric.iter().map(|f| format!("hobj{}->f{} = 0;", dst.0, f)).collect();
+                                numeric.iter().map(|f| format!("(({}*)hobj{})->f{} = 0;", field_struct(c.0, *f, ctx.classes), dst.0, f)).collect();
                             let _ = writeln!(s, "  {}", inits.join(" "));
                         }
                         let _ = writeln!(s, "  }}");
@@ -24566,7 +24931,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 s.push_str(&ctx.set_val(dst.0, &ctx.val(src.0)));
             }
         }
-        Inst::LoadField { dst, obj, field, slots, elem, cls, sized } => {
+        Inst::LoadField { dst, obj, field, slots, elem, cls, sized, cands } => {
             if ctx.json_locals.contains(&obj.0) {
                 if is_length_field(field.0) && !ctx.json_locals.contains(&dst.0) {
                     s.push_str(&ctx.set_val(
@@ -24598,7 +24963,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             let (class, hinted) = receiver_class(ctx, obj.0, *cls, field.0);
             if let Some(c) = class {
                 if let Some(off) = struct_offset_for(ctx, obj.0, c, field.0, &hinted) {
-                    let cn = struct_name(c);
+                    let cn = field_struct(c, field.0, ctx.classes);
                     let obj_name = ctx.vname(obj.0);
                     let st = format!("((({}*)ts_ptr({}))->{})", cn, obj_name, off);
                     // A receiver that is NOT a struct of class `c` (a Proxy, a
@@ -24650,137 +25015,14 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     return;
                 }
             }
-            // Static-slot hint (docs/static_slots_design.md): the probe checks the
-            // predicted in-object slot against the receiver's shape and falls to
-            // the out-of-line cached read otherwise.
-            if *slots != 0 && prop_pic_enabled() && static_slots_enabled() {
-                let pic = ctx.fresh_label();
-                let _ = writeln!(s, "  {{ static ts_prop_ic _ts_pic_{} = TS_PROP_IC_INIT;", pic);
-                let s1 = (slots & 0xFF) - 1;
-                let s2 = (slots >> 8) & 0xFF;
-                let s3 = (slots >> 16) & 0xFF;
-                let homes_try = |try_call: String| -> String {
-                    format!(
-                        "({{ tsv _lz; if (!{try_call}) {{ {sp}_lz = ts_get_linked({o}, {k}, &_ts_pic_{pic}, &F.h, {n});{rl} }} _lz; }})",
-                        try_call = try_call, sp = ctx.spill_now(), rl = ctx.reload_now(),
-                        o = ctx.val(obj.0), k = field.0, pic = pic, n = ctx.frame_nslots
-                    )
-                };
-                // an integer destination at a single-slot site of an integer-friendly key: the
-                // integer slot's word (docs/record_int_fields_design.md; the helpers test the
-                // integer slot first, so a key that is never an integer slot keeps the boxed
-                // read); a boxed slot converts as set_val would (an integer local truncates,
-                // an int32 use is ToInt32)
-                if int_record_slots_enabled() && s2 == 0 && !ctx.lazy_homes && int_record_key(field.0)
-                    && (ctx.int_local.contains(&dst.0) || ctx.int32_use.contains(&dst.0)) {
-                    let helper = if ctx.int_local.contains(&dst.0) { "ts_get_static_int64_inline" } else { "ts_get_static_int32_inline" };
-                    let call = if ctx.lazy_frame {
-                        format!("{}_lazy({}, {}, {}u, &_ts_pic_{}, &F.h, {})", helper, ctx.val(obj.0), field.0, s1, pic, ctx.frame_nslots)
-                    } else {
-                        format!("{}({}, {}, {}u, &_ts_pic_{})", helper, ctx.val(obj.0), field.0, s1, pic)
-                    };
-                    if ctx.int_local.contains(&dst.0) || int32_codegen_enabled() {
-                        let _ = writeln!(s, "  d{} = {};", dst.0, call);
-                    } else {
-                        let _ = writeln!(s, "  d{} = (double){};", dst.0, call);
-                    }
-                    let _ = writeln!(s, "  }}");
-                    return;
-                }
-                let get_expr = match (s2, s3, ctx.lazy_frame) {
-                    (0, _, true) if ctx.lazy_homes => homes_try(format!("ts_get_static_try({}, {}, {}u, &_ts_pic_{}, &_lz)", ctx.val(obj.0), field.0, s1, pic)),
-                    (_, 0, true) if ctx.lazy_homes => homes_try(format!("ts_get_static2_try({}, {}, {}u, {}u, &_ts_pic_{}, &_lz)", ctx.val(obj.0), field.0, s1, s2 - 1, pic)),
-                    (_, _, true) if ctx.lazy_homes => homes_try(format!("ts_get_static3_try({}, {}, {}u, {}u, {}u, &_ts_pic_{}, &_lz)", ctx.val(obj.0), field.0, s1, s2 - 1, s3 - 1, pic)),
-                    (0, _, false) => format!("ts_get_static_inline({}, {}, {}u, &_ts_pic_{})", ctx.val(obj.0), field.0, s1, pic),
-                    (0, _, true) => format!("ts_get_static_inline_lazy({}, {}, {}u, &_ts_pic_{}, &F.h, {})", ctx.val(obj.0), field.0, s1, pic, ctx.frame_nslots),
-                    (_, 0, false) => format!("ts_get_static2_inline({}, {}, {}u, {}u, &_ts_pic_{})", ctx.val(obj.0), field.0, s1, s2 - 1, pic),
-                    (_, 0, true) => format!("ts_get_static2_inline_lazy({}, {}, {}u, {}u, &_ts_pic_{}, &F.h, {})", ctx.val(obj.0), field.0, s1, s2 - 1, pic, ctx.frame_nslots),
-                    (_, _, false) => format!("ts_get_static3_inline({}, {}, {}u, {}u, {}u, &_ts_pic_{})", ctx.val(obj.0), field.0, s1, s2 - 1, s3 - 1, pic),
-                    (_, _, true) => format!("ts_get_static3_inline_lazy({}, {}, {}u, {}u, {}u, &_ts_pic_{}, &F.h, {})", ctx.val(obj.0), field.0, s1, s2 - 1, s3 - 1, pic, ctx.frame_nslots),
-                };
-                s.push_str(&ctx.set_val(dst.0, &get_expr));
-                let _ = writeln!(s, "  }}");
-                return;
-            }
-            // ctx.val boxes an unboxed-numeric receiver (int/double local) — using
-            // the raw `v{id}` name here would reference an undeclared identifier.
-            // Dynamic/`any` receiver: ts_get_checked throws a catchable TypeError
-            // when the receiver is null/undefined (typed struct reads took the
-            // direct-offset path above; optional chaining guards the read out).
-            if prop_pic_enabled() {
-                let pic = ctx.fresh_label();
-                let _ = writeln!(
-                    s,
-                    "  {{ static ts_prop_ic _ts_pic_{} = TS_PROP_IC_INIT;",
-                    pic
-                );
-                // a site whose receiver's static type admits a class instance (`sized`): the
-                // inline read that probes the sized-receiver entries after the plain-object one
-                let sz = if *sized { "_sized" } else { "" };
-                let get_expr = if ctx.lazy_homes {
-                    let extra = if *sized {
-                        format!(" && !ts_get_sized_pic_try({o}, {k}, &_ts_pic_{pic}, &_lz)", o = ctx.val(obj.0), k = field.0, pic = pic)
-                    } else {
-                        String::new()
-                    };
-                    format!(
-                        "({{ tsv _lz; if (!ts_get_pic_try({o}, {k}, &_ts_pic_{pic}, &_lz){extra}) {{ {sp}_lz = ts_get_linked({o}, {k}, &_ts_pic_{pic}, &F.h, {n});{rl} }} _lz; }})",
-                        o = ctx.val(obj.0), k = field.0, pic = pic, n = ctx.frame_nslots,
-                        sp = ctx.spill_now(), rl = ctx.reload_now(), extra = extra
-                    )
-                } else if ctx.lazy_frame {
-                    format!(
-                        "ts_get_pic_checked_inline{}_lazy({}, {}, &_ts_pic_{}, &F.h, {})",
-                        sz,
-                        ctx.val(obj.0),
-                        field.0,
-                        pic,
-                        ctx.frame_nslots
-                    )
-                } else {
-                    format!(
-                        "ts_get_pic_checked_inline{}({}, {}, &_ts_pic_{})",
-                        sz,
-                        ctx.val(obj.0),
-                        field.0,
-                        pic
-                    )
-                };
-                // A receiver typed as a view: its length in line (TA2); from the
-                // enclosing loop's hoisted test and length when it has them.
-                let hoisted_len = if *elem != 0 && is_length_field(field.0) {
-                    ctx.ta_hoisted
-                        .borrow()
-                        .get(&obj.0)
-                        .copied()
-                        .filter(|(e, _)| *e == *elem - 1)
-                        .map(|(_, top)| top)
-                } else {
-                    None
-                };
-                let get_expr = if let Some(top) = hoisted_len {
-                    format!(
-                        "((_tah{a}_{t} && obj_map_plain(&_tah{a}_{t}->o)->len == 0) ? ts_num((double)_tal{a}_{t}) : {g})",
-                        a = obj.0,
-                        t = top,
-                        g = get_expr
-                    )
-                } else if *elem != 0 && is_length_field(field.0) {
-                    format!(
-                        "({{ tsv _tl; if (!ts_ta_try_length({}, &_tl)) _tl = {}; _tl; }})",
-                        ctx.val(obj.0),
-                        get_expr
-                    )
-                } else {
-                    get_expr
-                };
-                s.push_str(&ctx.set_val(dst.0, &get_expr));
-                let _ = writeln!(s, "  }}");
+            // the classes the receiver's static type admits, tested before the site's cache
+            let cand = candidate_fields(ctx, cands, field.0, obj.0, Some(dst.0));
+            if cand.is_empty() {
+                emit_load_field_cached(s, ctx, dst, obj, field, slots, elem, sized);
             } else {
-                s.push_str(&ctx.set_val(
-                    dst.0,
-                    &format!("ts_get_checked({}, {})", ctx.val(obj.0), field.0),
-                ));
+                emit_cand_load_open(s, ctx, dst.0, obj.0, field.0, &cand);
+                emit_load_field_cached(s, ctx, dst, obj, field, slots, elem, sized);
+                s.push_str("  }\n");
             }
         }
         Inst::LoadMethodValue { dst, recv, method } => {
@@ -24879,7 +25121,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 ),
             ));
         }
-        Inst::StoreField { obj, field, src, slots, cls, sized } => {
+        Inst::StoreField { obj, field, src, slots, cls, sized, cands } => {
             let addr = inst as *const Inst as usize;
             if let Some(keys) = ctx.layouts.ctor_first.get(&addr) {
                 let id = ctx.fresh_label();
@@ -24921,7 +25163,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             let (class, hinted) = receiver_class(ctx, obj.0, *cls, field.0);
             if let Some(c) = class {
                 if let Some(off) = struct_offset_for(ctx, obj.0, c, field.0, &hinted) {
-                    let cn = struct_name(c);
+                    let cn = field_struct(c, field.0, ctx.classes);
                     let is_num = numeric_field(c, field.0, ctx.classes);
                     // numeric field stores a raw double (an integer slot an integer, a
                     // non-integer value refused loudly); otherwise a boxed tsv
@@ -24957,15 +25199,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     let _ = writeln!(s, "  if ({}) {{ {} }} else {{", cond, slow);
                     let _ = writeln!(s, "    (({}*)ts_ptr({}))->{} = {};", cn, obj_name, off, rhs);
                     if !is_num {
-                        if barrier_fast_enabled() {
-                            // The owner is untagged by the store itself; a value the
-                            // emitter knows is no heap reference needs no barrier.
-                            if !non_heap_value_expr(&rhs) {
-                                let _ = writeln!(s, "    ts_write_barrier_hdr((ts_gc_header*)ts_ptr({}), {});", obj_name, rhs);
-                            }
-                        } else {
-                            let _ = writeln!(s, "    ts_write_barrier({}, {});", obj_name, rhs);
-                        }
+                        emit_field_store_barrier(s, &obj_name, &rhs);
                     }
                     let _ = writeln!(s, "  }}");
                     return;
@@ -24982,40 +25216,13 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     return;
                 }
             }
-            // Static-slot hint (docs/static_slots_design.md): the probe checks the
-            // predicted in-object slot (plain writable data, the object not
-            // frozen) and falls to the out-of-line cached store otherwise.
-            if *slots != 0 && prop_pic_enabled() && static_slots_enabled() {
-                let pic = ctx.fresh_label();
-                let _ = writeln!(s, "  {{ static ts_prop_ic _ts_pic_{} = TS_PROP_IC_INIT;", pic);
-                let s1 = (slots & 0xFF) - 1;
-                let s2 = (slots >> 8) & 0xFF;
-                let s3 = (slots >> 16) & 0xFF;
-                let homes_set = |try_call: String| -> String {
-                    format!(
-                        "  if (!{try_call}) {{ {sp}ts_set_linked({o}, {k}, {v}, &_ts_pic_{pic}, &F.h, {n});{rl} }}",
-                        try_call = try_call, sp = ctx.spill_now(), rl = ctx.reload_now(),
-                        o = ctx.val(obj.0), k = field.0, v = ctx.val(src.0), pic = pic, n = ctx.frame_nslots
-                    )
-                };
-                match (s2, s3, ctx.lazy_frame) {
-                    (0, _, true) if ctx.lazy_homes => { let _ = writeln!(s, "{}", homes_set(format!("ts_set_static_try({}, {}, {}u, {}, &_ts_pic_{})", ctx.val(obj.0), field.0, s1, ctx.val(src.0), pic))); }
-                    (_, 0, true) if ctx.lazy_homes => { let _ = writeln!(s, "{}", homes_set(format!("ts_set_static2_try({}, {}, {}u, {}u, {}, &_ts_pic_{})", ctx.val(obj.0), field.0, s1, s2 - 1, ctx.val(src.0), pic))); }
-                    (_, _, true) if ctx.lazy_homes => { let _ = writeln!(s, "{}", homes_set(format!("ts_set_static3_try({}, {}, {}u, {}u, {}u, {}, &_ts_pic_{})", ctx.val(obj.0), field.0, s1, s2 - 1, s3 - 1, ctx.val(src.0), pic))); }
-                    (0, _, false) => { let _ = writeln!(s, "  ts_set_static_inline({}, {}, {}u, {}, &_ts_pic_{});", ctx.val(obj.0), field.0, s1, ctx.val(src.0), pic); }
-                    (0, _, true) => { let _ = writeln!(s, "  ts_set_static_inline_lazy({}, {}, {}u, {}, &_ts_pic_{}, &F.h, {});", ctx.val(obj.0), field.0, s1, ctx.val(src.0), pic, ctx.frame_nslots); }
-                    (_, 0, false) => { let _ = writeln!(s, "  ts_set_static2_inline({}, {}, {}u, {}u, {}, &_ts_pic_{});", ctx.val(obj.0), field.0, s1, s2 - 1, ctx.val(src.0), pic); }
-                    (_, 0, true) => { let _ = writeln!(s, "  ts_set_static2_inline_lazy({}, {}, {}u, {}u, {}, &_ts_pic_{}, &F.h, {});", ctx.val(obj.0), field.0, s1, s2 - 1, ctx.val(src.0), pic, ctx.frame_nslots); }
-                    (_, _, false) => { let _ = writeln!(s, "  ts_set_static3_inline({}, {}, {}u, {}u, {}u, {}, &_ts_pic_{});", ctx.val(obj.0), field.0, s1, s2 - 1, s3 - 1, ctx.val(src.0), pic); }
-                    (_, _, true) => { let _ = writeln!(s, "  ts_set_static3_inline_lazy({}, {}, {}u, {}u, {}u, {}, &_ts_pic_{}, &F.h, {});", ctx.val(obj.0), field.0, s1, s2 - 1, s3 - 1, ctx.val(src.0), pic, ctx.frame_nslots); }
-                }
-                let _ = writeln!(s, "  }}");
-                return;
+            // the classes the receiver's static type admits, tested before the site's cache
+            let cand = candidate_fields(ctx, cands, field.0, obj.0, None);
+            let open = !ctx.json_locals.contains(&src.0) && emit_cand_store_open(s, ctx, obj.0, field.0, src.0, &cand);
+            emit_store_field_cached(s, ctx, obj, field, src, slots, sized);
+            if open {
+                s.push_str("  }\n");
             }
-            // ctx.val (not a hardcoded v-name): the receiver local may be numeric-
-            // unboxed (`const n: any = 5; n.c = 3`) — rebox it so ts_set sees the
-            // primitive and throws V8's "Cannot create property ..." TypeError.
-            emit_store_field_generic(s, obj.0, field.0, src.0, ctx, *sized);
         }
         Inst::LoadElem { dst, arr } => {
             s.push_str(&ctx.set_val(dst.0, &format!("ts_get({}, 0)", ctx.val(arr.0))));

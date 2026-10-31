@@ -660,7 +660,12 @@ fn build_constraints(f: &Function, summaries: &[Option<Summary>], facts: &Facts)
                     }
                 }
             }
-            Inst::SetProto { .. } => {} // proto materialization via op_forces_materialization
+            // proto materialization via op_forces_materialization; the result is the object itself
+            Inst::SetProto { dst, obj, .. } => {
+                if let Some(d) = dst {
+                    cs.push(C::Copy(Ref::Local(d), Ref::Local(obj)));
+                }
+            }
             Inst::Call {
                 dst,
                 ref recv,

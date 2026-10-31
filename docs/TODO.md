@@ -12566,3 +12566,38 @@ Next session, in order:
 4. The next round on vue: `sample` and `--cpu-prof` per JS function (Session 360's scripts) from the list
    above. Note on `val in map`: Session 360 measured an own-map first test with no gain, so profile it
    (the dynamic key's conversion) before changing `ts_has_prop`.
+
+## Session 362 (2026-10-31): the reviews of Session 361's two slices, the candidate classes landed, a run of silent miscompiles
+
+- The independent reviews Session 361 asked for found what every gate had passed, in the slices and far
+  behind them. Each fix below has a fixture that fails on the earlier build.
+- **The candidate classes in line** (r28, Session 361's `5a56ab4`, `docs/pic_sized_inline_design.md`), with
+  the review's findings:
+  - **One struct per field** (`field_struct`): class-typed accesses read `((Sub*)p)->fK`, candidate arms
+    `((Decl*)p)->fK`; the structs are flat, so clang's TBAA took them for two objects and `o.value` kept
+    its value across `h.value = x`. The same held between two class views long before the slice:
+    `o.x = 1.5; b.x = 2.5; return o.x;` with `o: Sub`, `b: Base` answered 1.5 at -O2, default mode, for
+    numbers and boxed fields alike. Every access and the allocation's fills now use the declaring
+    class's struct. `classes/field_one_view`.
+  - **The freezer scan** (`may_freeze_instances_init`) missed `const f = O.freeze` and `O["freeze"]` with
+    `O` from `({}).constructor`: a frozen instance was written with no TypeError through a typed store.
+    A read or a string of those names turns the tests on; a key computed at run time reaches
+    `ts_object_freeze_unseen`, a TypeError for a class instance (CLAUDE.md). `classes/frozen_read_by_name`,
+    `frozen_read_by_key`.
+  - **Integer slots in the candidate chain**: the runtime's rule in line (`ts_int_field_value_k`), was the
+    site's write, 7x a double field's (vue's `sub.flags |= ...`).
+- **A local's class is flow-insensitive** (`drop_reassigned_classes`): `let x: I = new A(); ...; x = new B();`
+  read every field at B's offsets, before the assignment too, and `x = call()` or a constant did not clear
+  it. A local from `new` assigned anything else takes its site's guarded hint. `classes/local_reassigned_class`
+  segfaulted on the earlier build.
+- **`Object.setPrototypeOf(new C(), p)`'s result** was not linked to its object in the escape constraints
+  (`interproc.rs`): the instance stayed on the stack and was read after the return (a segfault).
+  `classes/set_proto_result_escapes`.
+- Gates (`build/gates_s361d/run.sh`): unit, bundler 54/54, conformance 711/711 plain and strict, 708/708 under
+  protect, bench, ci, ir-parity with `TSAOT_SIZED_CANDS=0` (4,391 identical), the engine diff in both
+  modes, the GC gate, the hono survey 42/43.
+- Alternating on a quiet machine, outputs identical (r27 -> r28; Node): vue 895.5 -> 873.4 ms (about 750),
+  hono_app 123.7 -> 124.6 (155), TrieRouter 209.1 -> 208.8 (250), RegExpRouter 53.4 -> 54.4, PatternRouter
+  234.7 -> 238.4, SmartRouter 54.6 -> 55.6; tsc-ts 21.865 -> 21.979 G instructions (+0.52%), cycles +1.33%,
+  wall 1.14 -> 1.15 s. Switching each fix off in turn on hono: `field_struct` and the scan leave its binary
+  byte-identical, `drop_reassigned_classes` is about 1% on RegExpRouter; the rest is placement.

@@ -13106,7 +13106,11 @@ class Exporter {
       (inst as unknown as { cls?: number }).cls = cls;
       // an unstable class's hint the emitter may decline (no interval): the sized probe then
       if (!this.classInfos[cls - 1]?.stable) (inst as unknown as { sized?: boolean }).sized = true;
-    } else if (this.receiverAdmitsClassInstance(receiver)) (inst as unknown as { sized?: boolean }).sized = true;
+    } else if (this.receiverAdmitsClassInstance(receiver)) {
+      (inst as unknown as { sized?: boolean }).sized = true;
+      const cands = this.receiverCandidateClasses(receiver);
+      if (cands.length > 0) (inst as unknown as { cands?: number[] }).cands = cands;
+    }
     return inst;
   }
   /** An unstable class whose instances keep the declared struct layout and prototype chain (the
@@ -13133,6 +13137,45 @@ class Exporter {
     try { t = this.checker.getNonNullableType(this.checker.getTypeAtLocation(r)); } catch { return false; }
     return this.typeAdmitsClassInstance(t, 0);
   }
+  /** The program classes a value of a `sized` site's receiver type can be an instance of, for the
+   *  emitter's struct access per class (docs/pic_sized_inline_design.md, "The candidate classes in
+   *  line"): every class whose instance type is assignable to the receiver's non-nullable type (a
+   *  type parameter by its constraint), none past SIZED_CANDS_MAX: the emitter reduces them to the
+   *  classes declaring the field, so a union of many subclasses of one base stays a single test,
+   *  and the broadest types are left to the site's cache. The set is a guess the site tests, never a
+   *  claim: a value of any other class takes the cached read (a generic class's declared type is
+   *  not assignable to an instantiation, and is simply not a candidate there).
+   *  `TSAOT_SIZED_CANDS=0` records none. */
+  private receiverCandidateClasses(e: ts.Expression): number[] {
+    if (process.env.TSAOT_SIZED_CANDS === "0") return [];
+    let r = e;
+    while (ts.isParenthesizedExpression(r)) r = r.expression;
+    let t: ts.Type;
+    try {
+      t = this.checker.getNonNullableType(this.checker.getTypeAtLocation(r));
+      if (t.flags & ts.TypeFlags.TypeParameter) {
+        const c = this.checker.getBaseConstraintOfType(t);
+        if (!c) return [];
+        t = this.checker.getNonNullableType(c);
+      }
+    } catch { return []; }
+    const hit = this.sizedCandsCache.get(t);
+    if (hit) return hit;
+    const SIZED_CANDS_MAX = 32;
+    const out: number[] = [];
+    try {
+      for (const [csym, cid] of this.classSymToId) {
+        if (!this.classNodeOfId.has(cid)) continue;
+        if (!this.checker.isTypeAssignableTo(this.checker.getDeclaredTypeOfSymbol(csym), t)) continue;
+        out.push(cid);
+        if (out.length > SIZED_CANDS_MAX) { out.length = 0; break; }
+      }
+    } catch { out.length = 0; }
+    out.sort((a, b) => a - b);
+    this.sizedCandsCache.set(t, out);
+    return out;
+  }
+  private sizedCandsCache = new Map<ts.Type, number[]>();
   private admitsClassCache = new Map<ts.Type, boolean>();
   private typeAdmitsClassInstance(t: ts.Type, depth: number): boolean {
     if (depth > 2) return false;

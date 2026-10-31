@@ -631,6 +631,11 @@ pub enum Inst {
         /// the sized-receiver entries too (docs/pic_sized_inline_design.md).
         #[serde(default, skip_serializing_if = "is_false")]
         sized: bool,
+        /// The program classes a value of the receiver's static type can be an instance of, at a
+        /// `sized` site (docs/pic_sized_inline_design.md, "The candidate classes in line"): the
+        /// site tests them itself before its cache. A guess: any other receiver takes the cache.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cands: Vec<u32>,
     },
     StoreField {
         obj: LocalId,
@@ -644,6 +649,9 @@ pub enum Inst {
         /// As LoadField's.
         #[serde(default, skip_serializing_if = "is_false")]
         sized: bool,
+        /// As LoadField's.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cands: Vec<u32>,
     },
     /// First-class builtin PROTOTYPE method value: `recv.method` read as a value
     /// (not called). Loads the boxed (unbound) prototype method via ts_get with a

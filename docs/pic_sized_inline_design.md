@@ -378,7 +378,7 @@ slower). `TSAOT_KNOWN_METHOD=0` keeps the lookup alone (the parity oracle);
 `classes/known_callee_guards`. hono, five alternating rounds (medians; Node):
 plain: TrieRouter 244.5 -> 244.6 ms (260), RegExpRouter 68.6 -> 64.2 (39), PatternRouter 245.2 -> 241.5 (153), SmartRouter 81.4 -> 72.0 (42); trained (each side's own training): TrieRouter 179.2 -> 178.5, RegExpRouter 47.1 -> 46.5, PatternRouter 149.0 -> 146.1, SmartRouter 55.2 -> 50.1; outputs identical. tsc-ts 22.180 -> 22.181 G instructions (unchanged; outputs identical; 660 sites carry guards); vue 1,048.7 -> 1,051.1 ms (seven alternating rounds each, medians; outputs identical; Node 773; 702 sites carry guards).
 
-## The candidate classes in line (design, Session 361)
+## The candidate classes in line (Session 361)
 
 **Finding.** After Session 361's runtime slice vue's `Dep.track` is the largest gap to V8 (about 69
 ms of an 890 ms run against 23), and 37% of its samples fall on five interface-typed accesses:
@@ -394,50 +394,89 @@ struct layout and class interval. The generated code can test those classes itse
 **Exporter.** In `withClassHint`, a site marked `sized` through `receiverAdmitsClassInstance` (no
 class hint) also records `cands`: the ids of the program classes whose instance type is assignable
 to the receiver's non-nullable type (a type parameter by its constraint), all of them when there
-are at most eight, none past that (a broad interface such as tsc-ts's `Node` keeps the caches
-alone); cached per type, as `admitsClassCache` is. `TSAOT_SIZED_CANDS=0` records none.
+are at most 32, none past that; cached per type, as `admitsClassCache` is. The bound is not the
+number of tests: the emitter reduces the set to the classes declaring the field, so a union of many
+subclasses of one base (an AST's node type) is one test. The set is a guess the site tests, never
+a claim: a generic class's declared type is not assignable to an instantiation of its interface and
+is simply not a candidate there. `TSAOT_SIZED_CANDS=0` records none.
 
 **IR.** `cands: Vec<u32>` on `LoadField` and `StoreField` (`#[serde(default, skip_serializing_if =
-"Vec::is_empty")]`); the passes that construct these instructions leave it empty or copy it (the
-CLAUDE.md rule for new IR fields: `sroa.rs` and the `tests/*.rs` literals).
+"Vec::is_empty")]`); `sroa.rs` copies it (the CLAUDE.md rule for new IR fields, and the `tests/*.rs`
+literals).
 
-**Emitter, reads.** For each candidate, the topmost ancestor declaring the field as a struct field
-(`own_fields`, `hint_guard`'s rule), deduplicated, kept only with a class interval
-(`class_ranged`), at most four. The read becomes
+**The class word of every cell.** The test reads `cls` before it knows the cell's kind, and an
+interface-typed site, unlike a class-typed one, can honestly see any object: an array, a Map, a
+generator, a Proxy, a symbol through a cast. Every kind embedding `ts_obj_common` has word 0, but
+three did not embed it and held other bytes at that offset: a Proxy the low half of its handler's
+tagged address (a heap address whose low 32 bits are small is a class index), a Symbol its
+`registered` byte (`Symbol.for` read as class index 0), a coroutine the low half of its resume
+function. The class-typed interval guards and `ts_typed_outside` had the same exposure. These
+structs now keep the class and shape offsets zero (`cls, shape` members that nothing writes;
+`gc_alloc` zero-fills) with a `_Static_assert` each: a Proxy cell was already at least
+`sizeof(ts_object)`, a coroutine rearranges within its size, a Symbol grows from 32 to 48 bytes.
+
+**Emitter, reads.** `candidate_fields`: for each candidate, the topmost ancestor declaring the
+field as a struct field (`declaring_class`, `hint_guard`'s rule), deduplicated, kept only with a
+class interval (`class_ranged`); none at all past four such classes (`CAND_FIELDS_MAX`: a site with
+more is megamorphic and its cache's class-word table serves it). The read becomes
 
 ```c
-v = (ts_is_obj(o) && (uint32_t)(((ts_object*)ts_ptr(o))->cls - lo1) < span1) ? box1(((ClassD1*)ts_ptr(o))->fK)
-  : (ts_is_obj(o) && (uint32_t)(((ts_object*)ts_ptr(o))->cls - lo2) < span2) ? box2(((ClassD2*)ts_ptr(o))->fK)
-  : <the site's sized inline read, unchanged>;
+if (ts_is_obj(o) && (uint32_t)(((ts_object*)ts_ptr(o))->cls - lo1) < span1) { dst = ((ClassD1*)ts_ptr(o))->fK; }
+else if (ts_is_obj(o) && (uint32_t)(((ts_object*)ts_ptr(o))->cls - lo2) < span2) { dst = ((ClassD2*)ts_ptr(o))->fK; }
+else { <the site's cached read, unchanged> }
 ```
 
 The interval test needs no `g_typed_slow` gate (`receiver_guard`'s `Range` note): an index in the
 interval is a sized, unrelinked instance of the declaring class or a subclass, whose struct starts
 with the declaring class's layout; a plain object's `cls` is 0, an instance converted to a
-dictionary (a deleted field) has 0, a relinked one carries `TS_CLS_RELINKED`, a Proxy is not
-`TS_KIND_OBJECT`'s cell layout but its `cls` word is never in an interval (to confirm in the
-fixture). Each value is boxed by the field's kind (an integer slot `ts_num((double)st)`, a number
-`ts_num(st)`, a boxed slot as it is) and `set_val` converts to the destination's representation as
-it does for the cache's value, so the C compiler folds the box into an unboxed destination.
+dictionary (a deleted field) has 0, a relinked one carries `TS_CLS_RELINKED`, and a field cannot
+become read-only or an accessor on an instance (`sized_field_attr_set`'s note). Each value goes to
+the destination as the hinted read's does (`set_val`, `set_num`, `set_int_or_num`).
 
-**Emitter, writes.** `if (inst_i && !TS_RT_UNLIKELY(ts_store_frozen(o))) { store; barrier }` for a
-boxed field with any value (`ts_write_barrier_hdr`, as the hinted store), or a number field with a
-number (an unboxed local, or `ts_is_num(v)` of a boxed one); an integer slot keeps the dynamic store
-(the runtime's integer rule, which `infer_int_store_fields` assumes for receiver-less stores); a
-frozen instance and everything else take the site's sized inline write, unchanged.
+**Emitter, writes.** The same chain, each test with `!ts_store_frozen(o)` where the program can
+freeze instances (`frozen_tests_on`): a boxed field takes any value and the barrier
+(`ts_write_barrier_hdr`, as the hinted store); a number field takes an unboxed local, or a boxed one
+behind `ts_is_num`; an integer slot the same, through the runtime's integer rule in line
+(`ts_int_field_value_k`, which `infer_int_store_fields` assumes of receiver-less stores: an integer
+or a TypeError naming the field; 30 M `c.n = c.n + 1` through an interface were 7x the double
+field's time at the site's write, and vue's `sub.flags |= ...` is such a store). A frozen instance
+and everything else take the site's write, unchanged.
 
-**Not covered.** Lazy-home functions (their reads are statement expressions) keep the caches; a
-method read (`sub.notify()`) is not a field and keeps the dynamic call's caches. The candidates are
-tested in class id order; a profile-guided build could order them by the site's sized entries.
+**One struct per field** (`field_struct`). The chain reads `((Decl*)p)->fK`, the declaring class's
+struct; the review of this slice found that a class-typed access at the same field used the
+receiver's class, `((Sub*)p)->fK`. The class structs are flat, a subclass's does not contain its
+parent's, so for clang's struct-path TBAA those are two unrelated objects: `o.value` (a subclass) read
+after `h.value = x` kept its old number, a silent stale read. The same held between two class views
+long before this slice (`o.x = 1.5; b.x = 2.5; return o.x;` with `o: Sub`, `b: Base` answered 1.5).
+Every field access, and the allocation's undefined and zero fills, now go through the declaring
+class's struct, so one field has one view and the analysis's facts are true, keeping what TBAA gives
+(two fields, of one struct or of two classes, stay apart). `-fno-strict-aliasing` or `may_alias` on
+the structs would have thrown that away. The class word is written through the class's struct
+(`header.cls`) and tested through `ts_object*`, two views again, but of one pointer: an access through
+the same SSA value is a must-alias before TBAA is asked, and a load through another value (a phi) does
+not leave its block, so the test sees the store; nothing reproduced there.
 
-**Expected and to measure.** vue: `Dep.track`'s five accesses and the other interface-typed reads
-(`track`, `prepareDeps`, `cleanupDeps`, `refreshComputed`, `isDirty`), an estimated 20-30 ms of 890.
-tsc-ts: 2,262 sized sites; those with at most eight candidate classes grow in line, so its
-instructions, cycles and binary size are the regression check, as for every in-line change.
+**Covered and not.** The chain wraps the cached access as statements, so a lazy-home function (whose
+reads are statement expressions) and a site with a static-slot hint are covered too. A method read
+(`sub.notify()`) is not a field and keeps the dynamic call's caches. The candidates are tested in
+class id order; a profile-guided build could order them by the site's sized entries.
 
-**Fixture** (`classes/interface_candidates`): an interface implemented by two classes with the field
-at different offsets, a subclass of one, a third class implementing it with an accessor, a plain
-object satisfying it, an instance relinked by `Object.setPrototypeOf`, a frozen instance's write
-(TypeError), an instance whose field was deleted, number and integer fields read and written, a
-Proxy of an instance, and null and undefined receivers (the generic path's TypeError); all in
-plain and strict mode, under GC stress.
+**Fixture** (`classes/interface_candidates`, in the GC stress list; `sized` needs the strict
+profile, so `TSAOT_CONF_STRICT=1` is the mode that exercises the tests, 155 sites here): an interface
+implemented by two classes with the field at different offsets, a subclass of one, a third class
+implementing it with accessors, a plain object satisfying it, an instance relinked by
+`Object.setPrototypeOf`, a frozen instance's write (TypeError), sealed and non-extensible instances,
+an instance whose field was deleted, an object made from a class's prototype, number and integer
+fields read and written, a Proxy of an instance and a revoked one, null, undefined and primitive
+receivers, a union of ten subclasses of one base, and arrays, strings, functions, typed arrays, a
+Map, a Set, a Blob, an Error, a RegExp's `lastIndex`, a generator, array and Map iterators, a
+Promise, a Date, a WeakMap, an ArrayBuffer and symbols at sites that test classes. `classes/field_one_view`
+pins the two views of one field in both modes (it fails on every line without `field_struct`).
+
+**Measured** (alternating, outputs identical, r27 -> r28; Node in parentheses): vue 895.5 -> 873.4 ms
+(about 750), hono_app 123.7 -> 124.6 (155), TrieRouter 209.1 -> 208.8 (250), RegExpRouter 53.4 -> 54.4,
+PatternRouter 234.7 -> 238.4, SmartRouter 54.6 -> 55.6; tsc-ts 21.865 -> 21.979 G instructions (+0.52%),
+cycles +1.33%, wall 1.14 -> 1.15 s. hono's binaries are the same with or without `field_struct` and the
+wider freezer scan, so the routers' 1-2% is the reassigned locals' guards and code placement; tsc-ts's
+half a percent came with the review's fixes (the slice alone was 1.0000): a reassigned local's accesses
+take a guard they never should have skipped. vue's binary +3 KB, tsc-ts's +7 KB.

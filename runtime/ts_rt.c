@@ -3741,6 +3741,14 @@ static void ta_integrity_check(tsv v, int freeze){
   if (!(ts_obj_integrity(o) & (1u|2u|4u))) ts_throw_type_error_msg("Cannot seal array buffer views with elements");
 }
 tsv ts_object_freeze(tsv v){ if (ts_is_propbag(v)){ ta_integrity_check(v, 1); ts_obj_add_integrity((ts_object*)ts_ptr(v), 1u); prop_add_epoch_bump(); } return v; }
+/* Object.freeze as a value in a program whose scan found no freezer (`may_freeze_instances_init`):
+   only a key computed at run time reaches it. That program's typed stores test no frozen bit, so a
+   class instance is refused here, loudly, rather than left writable. */
+tsv ts_object_freeze_unseen(tsv v){
+  if (ts_is_obj(v) && ts_obj_is_sized((ts_object*)ts_ptr(v)))
+    ts_throw_type_error_msg("Object.freeze of a class instance through a computed key is not supported");
+  return ts_object_freeze(v);
+}
 tsv ts_object_is_frozen(tsv v){
   /* primitives are trivially "frozen" in JS; objects: check the flag. */
   return ts_bool(!ts_is_propbag(v) || (ts_obj_integrity((ts_object*)ts_ptr(v)) & 1u));
