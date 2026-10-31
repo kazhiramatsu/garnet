@@ -4,8 +4,10 @@
 # expected values. Adding a test = dropping a .ts file under the tier dir.
 #
 # Usage:  run_conformance.sh <tier> [name-filter-regex]
-#   tier = basic | exhaustive | all
-# Tiers live under tests/conformance/<tier>/**/*.ts (recursive).
+#   tier = basic | exhaustive | all | dir
+# Tiers live under tests/conformance/<tier>/**/*.ts (recursive); `dir` takes every .ts under
+# $TSAOT_CONF_DIR (test262's composed programs, scripts/test262/run.sh), deletes each test's files
+# when it is done, and marks a run killed by a signal in its output.
 #
 # Speed: ALL exports happen in ONE node process (shared lib-file cache, per-file
 # isolated Program) and ALL V8 refs in ONE transpile process. Runtime compiled
@@ -13,6 +15,7 @@
 #
 # Env:  TSAOT_CONF_SHARD="i/n"  run only shard i of n (1-indexed) for distribution
 #       TSAOT_CONF_STRICT=1      export with the strict type profile (`--strict`)
+#       TSAOT_CONF_TIMEOUT=S     kill a test's run (each engine's) after S seconds
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TIER="${1:-basic}"
@@ -63,8 +66,10 @@ case "$TIER" in
   basic)      dirs=("$ROOT/tests/conformance/basic");;
   exhaustive) dirs=("$ROOT/tests/conformance/exhaustive");;
   all)        dirs=("$ROOT/tests/conformance/basic" "$ROOT/tests/conformance/exhaustive");;
-  *) echo "unknown tier '$TIER' (use basic|exhaustive|all)"; exit 1;;
+  dir)        dirs=("$TSAOT_CONF_DIR");;
+  *) echo "unknown tier '$TIER' (use basic|exhaustive|all|dir)"; exit 1;;
 esac
+watchdog() { if [[ -n "${TSAOT_CONF_TIMEOUT:-}" ]]; then perl -e 'alarm shift; exec @ARGV' "$TSAOT_CONF_TIMEOUT" "$@"; else "$@"; fi; }
 
 mapfile_compat() { eval "$1=()"; local _l; while IFS= read -r _l; do eval "$1+=(\"\$_l\")"; done; }
 mapfile_compat allts < <(for d in "${dirs[@]}"; do [[ -d "$d" ]] && find "$d" -name '*.ts' | sort; done)
@@ -87,7 +92,7 @@ if (( ntotal == 0 )); then echo "[conf:$TIER] no tests matched"; rm -rf "$WORK";
 # build the batch list (name = path-relative slug to avoid collisions across dirs)
 LIST="$WORK/list.tsv"; : > "$LIST"
 for f in "${allts[@]}"; do
-  rel="${f#$ROOT/tests/conformance/}"; slug="${rel%.ts}"; slug="${slug//\//__}"
+  rel="${f#${TSAOT_CONF_DIR:-$ROOT/tests/conformance}/}"; slug="${rel%.ts}"; slug="${slug//\//__}"
   printf '%s\t%s\n' "$slug" "$f" >> "$LIST"
 done
 
@@ -122,7 +127,7 @@ while IFS=$'\t' read -r slug path; do
   # Default-locale fixtures (Date.toLocale*String without arguments) expect the
   # runtime's fixed en-US subset; pin the oracle so a ja_JP shell does not flip.
   nodeflags=""; grep -q "garnet:" "$jsref" && nodeflags="--import $ROOT/scripts/garnet_scheme_loader.mjs"
-  v8="$(LC_ALL=en_US.UTF-8 node $nodeflags "$jsref" 2>&1 | tr '\n' '|')"
+  v8="$(LC_ALL=en_US.UTF-8 watchdog node $nodeflags "$jsref" 2>&1 | tr '\n' '|')"
   if [[ "$UNITS" == 1 ]]; then
     "$TSAOT" "$prog" emit --units "$WORK/$slug.units" > /dev/null 2>"$WORK/$slug.an.err" || { echo "[conf] FAIL ${slug}: analyze"; cat "$WORK/$slug.an.err"|head -2; nfail=$((nfail+1)); fail=1; continue; }
     CFILE="$WORK/$slug.units/prog.h"
@@ -147,7 +152,12 @@ while IFS=$'\t' read -r slug path; do
   elif ! $CC "$WORK/$slug.c" "$TSAOT_FETCH_RT_OBJ_ARG" $TSAOT_REGEXP_OBJ_ARGS $TSAOT_UNICODE_OBJ_ARGS -I"$RT" -lm $TSAOT_FETCH_LDLIBS $TSAOT_LDLIBS -o "$WORK/$slug.bin" 2>"$WORK/$slug.cc.err"; then
     echo "[conf] FAIL ${slug}: gcc"; head -3 "$WORK/$slug.cc.err"; nfail=$((nfail+1)); fail=1; continue
   fi
-  aot="$("$WORK/$slug.bin" 2>&1 | tr '\n' '|')"
+  if [[ "$TIER" == dir ]]; then
+    aot="$( { watchdog "$WORK/$slug.bin" 2>&1; rc=$?; (( rc >= 128 )) && echo "[signal $((rc-128))]"; } | tr '\n' '|')"
+    rm -rf "$WORK/$slug".* "$prog" "$jsref"
+  else
+    aot="$(watchdog "$WORK/$slug.bin" 2>&1 | tr '\n' '|')"
+  fi
   if [[ "$aot" == "$v8" ]]; then
     npass=$((npass+1))
     [[ -n "${TSAOT_CONF_VERBOSE:-}" ]] && echo "[conf] PASS ${slug}  ($aot)"
