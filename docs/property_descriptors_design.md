@@ -484,3 +484,26 @@ Delete suppression for configurable:false can be honored by just adding one site
 - **With this, Object.defineProperty / defineProperties / getOwnPropertyDescriptor[s] are implemented completely without gaps,
   covering data attributes, accessor attributes, method-shorthand, enumerable accessor, and dynamic descriptors.**
   All of the original 8 rejects are resolved as either "implemented" or "a spec-legitimate rejection".
+
+## 9. for..in over chains that add no key (Session 361)
+
+`ts_object_for_in_keys` walks the object and each prototype: every own name of the link
+(`ts_object_get_own_property_names`), a duplicate test against the names seen so far (a scan
+with `ts_strict_eq`), and a descriptor object built per name to read its `enumerable`. vue's
+`baseParse` runs `for (key in options)` once per compile, about twenty own keys plus
+Object.prototype's names: 17 ms of a 980 ms run (Node: 1 ms), most of it in
+`build_data_descriptor` and the field interning behind it.
+
+When the object is a plain object or an array (not a Proxy) and each link of its chain is a
+plain object that is not a class instance with struct fields, or an empty array, with no
+enumerable string-keyed property (`for_in_link_silent`: Object.prototype, Array.prototype, a
+class's prototype, an object made to be a prototype, null), no key comes from the chain and none
+is shadowed, so the walk's keys are the object's own enumerable string keys in their order:
+`Object.keys`'s list (`ts_prop_own_enum`, integer-like keys first). Any other chain, and an
+enumerable key added to a shared prototype (`Object.prototype.x = 1`), keeps the walk.
+`TSAOT_FOR_IN_OWN=0` keeps it everywhere. vue's `baseParse` 19.6 -> 5.3 ms. Fixture
+`objects/for_in_own_keys` (key order, non-enumerable, accessor and symbol keys, null-prototype
+objects, class instances, arrays with holes and named properties, deleted keys, enumerable
+prototypes with shadowing, an array as a prototype, keys added to and deleted from
+Object.prototype, Array.prototype and a class's prototype, a long loop, keys added during the
+walk).

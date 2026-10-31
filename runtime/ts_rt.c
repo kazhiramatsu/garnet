@@ -47,6 +47,7 @@ static int g_remembered_slots = 1;      /* TSAOT_REMEMBERED_SLOTS=0: whole-cell 
 static int g_empty_class_plain = 1;     /* TSAOT_EMPTY_CLASS_PLAIN=0: field-less class instances stay dictionary cells */
 static int g_negative_pic = 1;          /* TSAOT_NEGATIVE_PIC=0: no absent-property cache entries */
 static int g_absent_site = 1;           /* TSAOT_ABSENT_SITE=0: read sites keep no absent record (docs/absent_reads_inline_design.md) */
+static int g_proto_reads = 1;           /* TSAOT_PROTO_READS=0: no table of plain objects' inherited reads (docs/hidden_class_design.md, S1d) */
 static int g_key_caches = 1;            /* TSAOT_KEY_CACHES=0: every dynamic key goes through ToString (docs/dynamic_keys_design.md) */
 static int g_sparse_elements = 1;       /* TSAOT_SPARSE_ELEMENTS=0: far stores always materialize dense storage */
 /* TSAOT_GC_ZAP=1 fills dead cell bodies with 0xDD during collection: a
@@ -982,7 +983,7 @@ static struct {
   unsigned long long remset_slot_writes, remset_full_marks, remset_precise_scans, remset_precise_slots, remset_full_scans, remset_full_slots;
   unsigned long long small_props_fresh, small_props_reused;
   unsigned long long prop_add_hits, prop_add_fills, prop_add_site_hits;   /* additions: global cache hits, slow fills, per-site entry hits */
-  unsigned long long pic_get_absent, pic_get_inherited, pic_absent_hits, absent_site_hits;
+  unsigned long long pic_get_absent, pic_get_inherited, pic_absent_hits, absent_site_hits, proto_read_hits;
   unsigned long long iter_step_scratch, iter_step_generic;   /* for...of / yield* steps: a native generator through its scratch result / the generic next() */
   unsigned long long array_sparse_convert, array_sparse_put, array_densify;   /* far stores: dense->sparse switches, side-table stores, sparse->dense */   /* out-of-line reads resolved on the chain / missing / answered by the absent cache */
   unsigned long long young_alloc;
@@ -1059,8 +1060,8 @@ __attribute__((destructor)) static void ts_rt_stats_dump(void){
           g_rt_stats.small_props_fresh, g_rt_stats.small_props_reused);
   fprintf(out, "[rt_stats] prop_add: site_hits=%llu hits=%llu slow=%llu\n",
           g_rt_stats.prop_add_site_hits, g_rt_stats.prop_add_hits, g_rt_stats.prop_add_fills);
-  fprintf(out, "[rt_stats] pic_ool_get: inherited=%llu absent=%llu absent_cache_hits=%llu\n",
-          g_rt_stats.pic_get_inherited, g_rt_stats.pic_get_absent, g_rt_stats.pic_absent_hits);
+  fprintf(out, "[rt_stats] pic_ool_get: inherited=%llu absent=%llu absent_cache_hits=%llu proto_read_hits=%llu\n",
+          g_rt_stats.pic_get_inherited, g_rt_stats.pic_get_absent, g_rt_stats.pic_absent_hits, g_rt_stats.proto_read_hits);
   fprintf(out, "[rt_stats] iter_step: scratch=%llu generic=%llu\n", g_rt_stats.iter_step_scratch, g_rt_stats.iter_step_generic);
   fprintf(out, "[rt_stats] absent_site: hits=%llu\n", g_rt_stats.absent_site_hits);
   fprintf(out, "[rt_stats] root_frames: frame_push=%llu\n",
@@ -1438,6 +1439,8 @@ static void gc_config_init(void){
   if (npic && npic[0] && strcmp(npic, "0") == 0) g_negative_pic = 0;
   const char* asite = getenv("TSAOT_ABSENT_SITE");
   if (asite && asite[0] && strcmp(asite, "0") == 0) g_absent_site = 0;
+  const char* preads = getenv("TSAOT_PROTO_READS");
+  if (preads && preads[0] && strcmp(preads, "0") == 0) g_proto_reads = 0;
   const char* sparse = getenv("TSAOT_SPARSE_ELEMENTS");
   if (sparse && sparse[0] && strcmp(sparse, "0") == 0) g_sparse_elements = 0;
   const char* protect = getenv("TSAOT_GC_PROTECT");
@@ -9254,23 +9257,58 @@ static tsv ts_array_iterator_identity(tsv* args, int n){ return n ? args[0] : TS
 /* Array Iterator objects (docs/array_iterators_design.md): the source array,
    the next index and the kind (values 0, keys 1, entries 2) in hidden fields;
    each step reads the array's current length, so the iteration is live. */
+/* An array iterator's state in its three slots (source, index, kind), allocated in one layout */
+static ts_key g_ai_layout_keys[3];
+static ts_lit_layout g_ai_layout = { 0, 3, g_ai_layout_keys };
+/* The slots of an iterator object in its layout's shape (the integrity bits aside: an iterator's
+   state is not its properties, so a frozen iterator still steps, as in V8); NULL for any other object
+   (an object made from the iterator prototype, the shape table's dictionary fallback). */
+static inline tsv* iter_state_slots(tsv iter, const ts_lit_layout* L){
+  if (TS_TOP16(iter) != TS_SEL_OBJECT) return NULL;
+  ts_object* o = (ts_object*)ts_ptr(iter);
+  if (o->h.kind != TS_KIND_OBJECT || L->shape - 1u >= TS_SHAPE_MAX - 1u || ts_obj_shape_id(o) != L->shape || o->h.inline_cap < L->n) return NULL;
+  return ts_obj_inline_vals(o);
+}
 static tsv ts_array_iterator_next(tsv* args, int n){
-  tsv iter = n ? args[0] : TS_UNDEFINED; ts_gc_root(&iter);
+  tsv iter = n ? args[0] : TS_UNDEFINED;
+  tsv* st = iter_state_slots(iter, &g_ai_layout);
+  if (st){
+    /* slots: 0 the source (undefined once done), 1 the next index, 2 the kind; a number or undefined
+       written in place needs no barrier */
+    tsv source = st[0], kindv = st[2];
+    double pos = ts_to_num(st[1]);
+    /* the values or keys of a dense array: no call that can allocate before the result */
+    if (ts_is_indexed_array_fast(source) && (kindv == ts_num(0) || kindv == ts_num(1))){
+      if (pos >= (double)ts_array_len(source)){
+        st[0] = TS_UNDEFINED;
+        return ts_iter_result_new(TS_UNDEFINED, 1);
+      }
+      st[1] = ts_num(pos + 1);
+      return ts_iter_result_new(kindv == ts_num(1) ? ts_num(pos) : ts_array_get(source, (uint32_t)pos), 0);
+    }
+  } else {
+    static ts_rt_ic ic_index;
+    tsv index = ts_get_ic(iter, g_ai_index, &ic_index);
+    if (!ts_is_num(index)) ts_throw_type_error_msg("Array iterator next called on incompatible receiver");
+  }
+  ts_gc_root(&iter);
   static ts_rt_ic ic_index, ic_source, ic_kind;
-  tsv index = ts_get_ic(iter, g_ai_index, &ic_index);
-  if (!ts_is_num(index)) ts_throw_type_error_msg("Array iterator next called on incompatible receiver");
-  tsv source = ts_get_ic(iter, g_ai_source, &ic_source); ts_gc_root(&source);
-  tsv kindv = ts_get_ic(iter, g_ai_kind, &ic_kind);
+  tsv index = st ? st[1] : ts_get_ic(iter, g_ai_index, &ic_index);
+  tsv source = st ? st[0] : ts_get_ic(iter, g_ai_source, &ic_source); ts_gc_root(&source);
+  tsv kindv = st ? st[2] : ts_get_ic(iter, g_ai_kind, &ic_kind);
   int kind = ts_is_num(kindv) ? (int)ts_to_num(kindv) : 0;
   double pos = ts_to_num(index);
   int alike = !ts_is_typed_array(source) && !ts_is_array(source) && ts_object_like(source);
   int done = ts_is_typed_array(source) ? pos >= ((ts_typedarray*)ts_ptr(source))->length
            : alike ? pos >= arrlike_len(source)
            : (!ts_is_array(source) || pos >= ts_array_len(source));
+  /* an array-like's `length` ran the program's code, which may have left the layout's shape */
+  if (alike && st) st = iter_state_slots(iter, &g_ai_layout);
   tsv value = TS_UNDEFINED; ts_gc_root(&value);
-  if (done) ts_set_ic(iter, g_ai_source, TS_UNDEFINED, &ic_source);
+  /* the iterator does not move (the collector never moves a cell) and is rooted: its slots stay */
+  if (done){ if (st) st[0] = TS_UNDEFINED; else ts_set_ic(iter, g_ai_source, TS_UNDEFINED, &ic_source); }
   else {
-    ts_set_ic(iter, g_ai_index, ts_num(pos + 1), &ic_index);
+    if (st) st[1] = ts_num(pos + 1); else ts_set_ic(iter, g_ai_index, ts_num(pos + 1), &ic_index);
     if (kind == 1) value = ts_num(pos);
     else {
       value = alike ? arrlike_get(source, pos) : ts_array_get(source, (uint32_t)pos);
@@ -9309,11 +9347,14 @@ tsv ts_array_iter_new(tsv source, int kind){
     ts_define_data(g_array_iterator_proto, TS_KEY_WKSYM(TS_WKSYM_TO_STRING_TAG), tag, 0, 0, 1);
     ts_gc_unroot(3);
   }
-  tsv iter = ts_new_object(); ts_gc_root(&iter);
+  /* the three slots in one layout, as a literal's: the keys are the runtime's hidden fields, never
+     listed by an enumeration, so the literal's attributes are not observed */
+  if (!g_ai_layout_keys[0]){ g_ai_layout_keys[0] = g_ai_source; g_ai_layout_keys[1] = g_ai_index; g_ai_layout_keys[2] = g_ai_kind; }
+  tsv iter = ts_new_object_layout(&g_ai_layout); ts_gc_root(&iter);
+  ts_lit_store(iter, 0, source);
+  ts_lit_store(iter, 1, ts_num(0));
+  ts_lit_store(iter, 2, ts_num((double)kind));
   obj_link_fresh_proto(iter, g_array_iterator_proto);
-  ts_define_data(iter, g_ai_source, source, 0, 1, 0);
-  ts_define_data(iter, g_ai_index, ts_num(0), 0, 1, 0);
-  ts_define_data(iter, g_ai_kind, ts_num((double)kind), 0, 1, 0);
   ts_gc_unroot(2);
   return iter;
 }
@@ -9373,6 +9414,9 @@ static tsv ts_iter_result_new(tsv value, int done){
   return r;
 }
 static ts_key g_mi_source, g_mi_last, g_mi_kind, g_mi_next, g_mi_value, g_mi_done;
+/* A Map or Set iterator's state in its three slots (source, last order id, kind), one layout */
+static ts_key g_mi_layout_keys[3];
+static ts_lit_layout g_mi_layout = { 0, 3, g_mi_layout_keys };
 static tsv ts_map_iterator_identity(tsv* args, int n){ return n ? args[0] : TS_UNDEFINED; }
 /* The iteration order of a published collection. A published cell is never
    written by a reader (docs/published_graphs_design.md: it may be another
@@ -9396,11 +9440,14 @@ static uint64_t* identity_order(uint32_t len){
 static tsv ts_map_iterator_next(tsv* args, int n){
   tsv iter = n ? args[0] : TS_UNDEFINED;
   ts_gc_root(&iter);
+  /* the slots of an iterator in the layout's shape (frozen or not; iter_state_slots), else its hidden
+     properties through the runtime caches */
+  tsv* st = iter_state_slots(iter, &g_mi_layout);
   static ts_rt_ic ic_kind, ic_source, ic_last;
-  tsv kindv = ts_get_ic(iter, g_mi_kind, &ic_kind);
+  tsv kindv = st ? st[2] : ts_get_ic(iter, g_mi_kind, &ic_kind);
   if (!ts_is_num(kindv)) ts_throw_type_error_msg("Collection iterator next called on incompatible receiver");
   int kind = (int)ts_to_num(kindv);
-  tsv source = ts_get_ic(iter, g_mi_source, &ic_source); ts_gc_root(&source);
+  tsv source = st ? st[0] : ts_get_ic(iter, g_mi_source, &ic_source); ts_gc_root(&source);
   tsv value = TS_UNDEFINED; ts_gc_root(&value);
   int done = 1;
   if (ts_is_map(source) || ts_is_set(source)) {
@@ -9409,7 +9456,7 @@ static tsv ts_map_iterator_next(tsv* args, int n){
     uint64_t* order = is_map ? ((ts_map*)ts_ptr(source))->iteration_order : ((ts_set_t*)ts_ptr(source))->iteration_order;
     if (!order) order = identity_order(len);   /* a published collection */
     tsv* keys = is_map ? ((ts_map*)ts_ptr(source))->keys : ((ts_set_t*)ts_ptr(source))->elems;
-    double last = ts_number_coerce(ts_get_ic(iter, g_mi_last, &ic_last));
+    double last = ts_number_coerce(st ? st[1] : ts_get_ic(iter, g_mi_last, &ic_last));
     uint32_t low = 0, high = len;
     // Insertion IDs survive deletion, compaction, clear and reinsertion. Binary
     // search avoids retaining dead iterators or disabling map compaction.
@@ -9422,7 +9469,7 @@ static tsv ts_map_iterator_next(tsv* args, int n){
     if (low < len) {
       done = 0;
       tsv key = keys[low], item = is_map ? ((ts_map*)ts_ptr(source))->vals[low] : key;
-      ts_set_ic(iter, g_mi_last, ts_num((double)order[low]), &ic_last);
+      if (st) st[1] = ts_num((double)order[low]); else ts_set_ic(iter, g_mi_last, ts_num((double)order[low]), &ic_last);
       if (kind == 0 || kind == 3) value = key;
       else if (kind == 1) value = item;
       else {
@@ -9433,7 +9480,7 @@ static tsv ts_map_iterator_next(tsv* args, int n){
       }
     }
   }
-  if (done) ts_set_ic(iter, g_mi_source, TS_UNDEFINED, &ic_source);
+  if (done){ if (st) st[0] = TS_UNDEFINED; else ts_set_ic(iter, g_mi_source, TS_UNDEFINED, &ic_source); }
   tsv result = ts_iter_result_new(value, done);
   ts_gc_unroot(3);
   return result;
@@ -9482,11 +9529,13 @@ tsv ts_map_iterator(tsv source, int kind){
     for (uint32_t i = 0; i < len; i++) (*order)[i] = i + 1u;
     *next = (uint64_t)len + 1u;
   }
-  tsv iter = ts_new_object(); ts_gc_root(&iter);
+  /* the three slots in one layout (the array iterator's note) */
+  if (!g_mi_layout_keys[0]){ g_mi_layout_keys[0] = g_mi_source; g_mi_layout_keys[1] = g_mi_last; g_mi_layout_keys[2] = g_mi_kind; }
+  tsv iter = ts_new_object_layout(&g_mi_layout); ts_gc_root(&iter);
+  ts_lit_store(iter, 0, source);
+  ts_lit_store(iter, 1, ts_num(0));
+  ts_lit_store(iter, 2, ts_num(kind));
   obj_link_fresh_proto(iter, is_set ? g_set_iterator_proto : g_map_iterator_proto);
-  ts_define_data(iter, g_mi_source, source, 0, 1, 0);
-  ts_define_data(iter, g_mi_last, ts_num(0), 0, 1, 0);
-  ts_define_data(iter, g_mi_kind, ts_num(kind), 0, 1, 0);
   ts_gc_unroot(2);
   return iter;
 }
@@ -14543,7 +14592,10 @@ tsv ts_forof_next_slow(tsv it, ts_key next_key){
   tsv res = ts_iter_step(it, TS_UNDEFINED, next_key);
   if (!ts_object_like(res)) ts_throw_type_error_msg("Iterator result is not an object");
   ts_gc_root(&res);
-  tsv out = ts_truthy(ts_get(res, kdone)) ? TS_ITER_DONE : ts_get(res, kvalue);
+  /* the results are a few shapes (the runtime's {value, done} layout, a library's literal): the
+     runtime's shape caches, not two generic lookups per step */
+  static ts_rt_ic ic_done, ic_value;
+  tsv out = ts_truthy(ts_get_ic(res, kdone, &ic_done)) ? TS_ITER_DONE : ts_get_ic(res, kvalue, &ic_value);
   ts_gc_unroot(1);
   return out;
 }
@@ -18108,6 +18160,47 @@ static void prop_absent_fill_impl(ts_prop_ic* ic, ts_object* o, ts_key key, int 
 static void prop_absent_site_fill(ts_prop_ic* ic, const ts_object* o, ts_key key, const ts_prop_absent_entry* e);
 static tsv ts_get_pic_checked_slow(tsv obj, ts_key key, ts_prop_ic* ic);
 static uint32_t g_prop_absent_epoch;   /* g_prop_add_epoch | TS_ABSENT_EPOCH_TAG */
+/* Inherited reads of plain objects (docs/hidden_class_design.md, S1d): a site's cache holds own
+   slots and its absent record, so a plain receiver whose property lives on its prototype (an
+   iterator's `next`, an Object.create or ES5 instance's method) took the slow read on every access:
+   the site's probes, the registry test, the receiver's own lookup, then the walk with a lookup on
+   each link. This table keys (receiver shape word, key) to the direct prototype that holds the
+   property as a plain data slot and that prototype's shape word. A hit needs the receiver's shape (it
+   fixes the receiver's keys, so the key is not its own), its prototype the recorded cell, that cell's
+   shape (its keys and attributes, so the slot still holds the property as data) and the addition
+   epoch (relinks, definitions on prototypes, class registrations, full collections). The recorded
+   cell is compared, never followed: a hit reads the receiver's live prototype. */
+static uint32_t g_prop_add_epoch;
+typedef struct { uint32_t shape; ts_key key; uint32_t epoch; uint32_t holder_shape; uint32_t slot; tsv holder; } ts_proto_read_entry;
+#define TS_PROTO_READ_CACHE_SIZE 2048u
+static ts_proto_read_entry g_proto_read_cache[TS_PROTO_READ_CACHE_SIZE];
+static inline ts_proto_read_entry* proto_read_entry(uint32_t shape, ts_key key){
+  uint32_t x = (shape * 0x9E3779B1u) ^ (key * 0x85EBCA6Bu);
+  x ^= x >> 15;
+  return &g_proto_read_cache[x & (TS_PROTO_READ_CACHE_SIZE - 1u)];
+}
+static inline int proto_read_hit(const ts_object* o, ts_key key, tsv* out){
+  const ts_proto_read_entry* e = proto_read_entry(o->shape, key);
+  if (e->shape != o->shape || e->key != key || e->epoch != g_prop_add_epoch || e->holder != o->proto) return 0;
+  ts_object* h = (ts_object*)ts_ptr(e->holder);
+  if (h->shape != e->holder_shape) return 0;
+  *out = *ts_obj_slot_ptr(h, e->slot);
+  return 1;
+}
+/* after the walk found `key` inherited: record it when the receiver is a shaped plain object and its
+   direct prototype a shaped plain object holding the key as a boxed data slot */
+static inline int prop_epoch_live(void);
+static int proto_read_fill(const ts_object* o, ts_key key){
+  if (!g_proto_reads || o->h.kind != TS_KIND_OBJECT || ts_obj_is_sized(o) || ts_obj_shape_id(o) == TS_SHAPE_NONE) return 0;
+  if (TS_TOP16(o->proto) != TS_SEL_OBJECT || !prop_epoch_live()) return 0;
+  ts_object* h = (ts_object*)ts_ptr(o->proto);
+  if (h->h.kind != TS_KIND_OBJECT || ts_obj_is_sized(h) || ts_obj_shape_id(h) == TS_SHAPE_NONE) return 0;
+  ts_pref p = prop_find(h, key);
+  if (!pref_ok(p) || (pref_flags(p) & (TS_PROP_ACCESSOR | TS_PROP_INT32)) || is_accessor(pref_val(p))) return 0;
+  ts_proto_read_entry* e = proto_read_entry(o->shape, key);
+  e->shape = o->shape; e->key = key; e->epoch = g_prop_add_epoch; e->holder_shape = h->shape; e->slot = p.i; e->holder = o->proto;
+  return 1;
+}
 /* An absent read answered from its site's record (docs/absent_reads_inline_design.md).
    The record, filled where the slow read answers from or fills the global
    absent table, is checked as the table's entries are: the key and the epoch
@@ -18238,6 +18331,9 @@ tsv ts_get_pic_checked(tsv obj, ts_key key, ts_prop_ic* ic){
       if (ic && (ic->rec_epoch & TS_ABSENT_EPOCH_TAG) && g_negative_pic && prop_absent_lookup(ic, o, key)){
         RT_STAT_INC(pic_absent_hits); return TS_UNDEFINED;
       }
+      /* a property of its direct prototype (an iterator's `next`) at a site that has read one: the
+         inherited reads' table (a site that never has pays one byte test) */
+      if (ic && (ic->absent_depth & TS_PIC_INHERITED_FLAG)){ tsv v; if (proto_read_hit(o, key, &v)){ RT_STAT_INC(proto_read_hits); return v; } }
       return ts_get_pic_checked_slow(obj, key, ic);
     }
     /* a Proxy receiver (vue's reactive objects, at every site that reads them): its [[Get]] at
@@ -18291,7 +18387,11 @@ __attribute__((noinline)) static tsv ts_get_pic_checked_slow(tsv obj, ts_key key
       }
       tsv inherited;
       if (sized_inherited_get(o, key, obj, &inherited)){ RT_STAT_INC(pic_get_inherited); return inherited; }
-      if (lookup_prop_chain(obj, ts_next_proto(o), key, &inherited)){ RT_STAT_INC(pic_get_inherited); return inherited; }
+      if (lookup_prop_chain(obj, ts_next_proto(o), key, &inherited)){
+        RT_STAT_INC(pic_get_inherited);
+        if (proto_read_fill(o, key) && ic) ic->absent_depth |= TS_PIC_INHERITED_FLAG;
+        return inherited;
+      }
       RT_STAT_INC(pic_get_absent);
       RT_STAT_KEY(g_key_absent, key);
       if (ts_obj_is_sized(o)) sized_absent_fill(o, key); else prop_absent_fill(ic, o, key);
@@ -18517,7 +18617,7 @@ static void prop_absent_site_fill(ts_prop_ic* ic, const ts_object* o, ts_key key
     return;
   }
   ic->absent_shape = e->shape; ic->absent_shape2 = e->shape;
-  ic->absent_key = key; ic->absent_depth = (uint8_t)(e->depth | (ic->absent_depth & TS_PIC_SIZED_FLAG));
+  ic->absent_key = key; ic->absent_depth = (uint8_t)(e->depth | (ic->absent_depth & (TS_PIC_SIZED_FLAG | TS_PIC_INHERITED_FLAG)));
   for (uint8_t i = 0; i < e->depth; i++) ic->absent_proto_shape[i] = e->proto_shape[i];
   ic->rec_epoch = g_prop_absent_epoch;
 }
@@ -18627,6 +18727,17 @@ int ts_array_adopt_layout_vals(tsv arr, ts_lit_layout* L, const tsv* vals){
   SHAPE_CHECK(o);
   if (TS_RT_UNLIKELY(o->h.gen == TS_GEN_OLD)) for (uint32_t i = 0; i < n; i++) ts_write_barrier(arr, vals[i]);
   return 1;
+}
+void ts_lit_store_slow(tsv obj, uint32_t i, tsv v){
+  ts_object* o = (ts_object*)ts_ptr(obj);
+  if (ts_obj_shape_id(o) != TS_SHAPE_NONE){
+    tsv* p = ts_obj_slot_ptr(o, i);
+    *p = v;
+    ts_write_barrier_ptr(obj, p, v);
+  } else {
+    obj_map_plain(o)->props[i].val = v;
+    ts_write_barrier(obj, v);
+  }
 }
 void ts_lit_store_int_slow(tsv obj, uint32_t i, long long v){
   ts_object* o = (ts_object*)ts_ptr(obj);
@@ -18923,8 +19034,24 @@ tsv ts_reflect_get_recv(tsv t, tsv k, tsv r){
   if (r == t || !ts_is_obj(t) || ts_same_cell(r, t)) return ts_get_dyn(t, k);
   if (g_has_proxies && ts_is_proxy(t)) return ts_proxy_get_v(t, k, r);
   if (((ts_gc_header*)ts_ptr(t))->kind != TS_KIND_OBJECT) return ts_get_dyn(t, k);
-  ts_gc_root(&t); ts_gc_root(&r);
   ts_key key;
+  /* a shaped plain target (vue's reactive objects behind their proxies, every read of the get trap):
+     an own data property, or one its direct prototype holds (the inherited reads' table), read
+     without the roots, the registry's test and the walk; the receiver matters to an accessor alone */
+  {
+    ts_object* o = (ts_object*)ts_ptr(t);
+    /* the key's id without a conversion that could allocate or run code (the values are not rooted
+       here): a string that carries its key id (what a trap receives), or a symbol */
+    int pure = 0;
+    if (ts_is_heap_str(k) && (ts_str_flags_typed(k) & TS_STR_FLAG_KEY)){ key = ts_str_ptr_typed(k)->offset; pure = 1; }
+    else if (ts_is_symbol(k)){ key = ts_symbol_key(k); pure = 1; }
+    if (pure && !ts_obj_is_sized(o) && ts_obj_shape_id(o) != TS_SHAPE_NONE){
+      ts_pref p = prop_find(o, key);
+      if (pref_ok(p)){ if (!(pref_flags(p) & TS_PROP_ACCESSOR)) return obj_val_read(o, p.i); }
+      else { tsv v; if (proto_read_hit(o, key, &v)) return v; }
+    }
+  }
+  ts_gc_root(&t); ts_gc_root(&r);
   tsv out = TS_UNDEFINED;
   if (ts_key_from_value(k, &key)){
     ts_object* o = (ts_object*)ts_ptr(t);
@@ -19704,7 +19831,36 @@ static void ts_proxy_enum(tsv pv, ts_prop_enum_cb cb, void* ud){
    prototype chain. A name is marked visited before its enumerable flag is
    checked, so a non-enumerable own property correctly shadows an enumerable
    property of the same name on a prototype. Symbols never participate. */
+/* A prototype link that adds nothing to a for..in walk: a plain object (not a class instance with
+   struct fields) or an empty array whose own properties are all non-enumerable or not named by
+   strings (Object.prototype, Array.prototype, a class's prototype, an object made as a prototype). */
+static int for_in_link_silent(tsv link){
+  if (!ts_is_obj(link)) return 0;
+  ts_object* p = (ts_object*)ts_ptr(link);
+  if (p->h.kind == TS_KIND_ARRAY){ if (ts_array_len(link) != 0) return 0; }
+  else if (p->h.kind != TS_KIND_OBJECT || ts_obj_is_sized(p)) return 0;
+  uint32_t n = obj_map(p)->len;
+  for (uint32_t i = 0; i < n; i++) if (prop_enum_data_at(p, i)) return 0;
+  return 1;
+}
 tsv ts_object_for_in_keys(tsv obj){
+  /* An object or array whose prototype links add no key (the usual chain ending in
+     Object.prototype or null): the walk's keys are its own enumerable string keys in their order,
+     which is what Object.keys lists; the walk below lists every own name of every link and builds a
+     descriptor for each (vue's `for (key in options)`, once per compile, 17 ms of its run).
+     TSAOT_FOR_IN_OWN=0 keeps the walk. */
+  static int own_fast = -1;
+  if (TS_RT_UNLIKELY(own_fast < 0)){ const char* e = getenv("TSAOT_FOR_IN_OWN"); own_fast = !(e && e[0] == '0'); }
+  if (own_fast && ts_is_obj(obj) && !(g_has_proxies && ts_is_proxy(obj))){
+    uint8_t kind = ((ts_gc_header*)ts_ptr(obj))->kind;
+    if (kind == TS_KIND_OBJECT || kind == TS_KIND_ARRAY){
+      int silent = 1;
+      for (tsv link = ts_get_proto(obj); !ts_is_null(link) && !ts_is_undef(link); link = ts_get_proto(link)){
+        if (!for_in_link_silent(link)){ silent = 0; break; }
+      }
+      if (silent) return ts_object_keys(obj);
+    }
+  }
   ts_gc_root(&obj);
   tsv out=ts_new_array(0); ts_gc_root(&out);
   tsv seen=ts_new_array(0); ts_gc_root(&seen);
@@ -23181,9 +23337,13 @@ tsv ts_iter_step(tsv iter, tsv sent, ts_key nmk){
   int cached = 0;
   if (TS_TOP16(iter) == TS_SEL_OBJECT){
     ts_object* o = (ts_object*)ts_ptr(iter);
-    if (o->h.kind == TS_KIND_OBJECT && ts_is_obj(o->proto)){
+    /* a shaped iterator alone: a dictionary's shape word is 0, which is what an empty entry holds */
+    if (o->h.kind == TS_KIND_OBJECT && !ts_obj_is_sized(o) && obj_shaped(o)){
       for (uint32_t i = 0; i < 4u; i++){
-        if (nc[i].shape == o->shape && nc[i].proto == o->proto){
+        if (nc[i].shape != o->shape) continue;
+        /* an own `next` (vue's wrapped array iterator): the receiver's shape fixes its slot */
+        if (nc[i].proto == 0){ nf = *ts_obj_slot_ptr(o, nc[i].slot); cached = 1; break; }
+        if (nc[i].proto == o->proto){
           ts_object* p = (ts_object*)ts_ptr(o->proto);
           if (p->shape == nc[i].proto_shape){ nf = *ts_obj_slot_ptr(p, nc[i].slot); cached = 1; }
           break;
@@ -23195,10 +23355,16 @@ tsv ts_iter_step(tsv iter, tsv sent, ts_key nmk){
     nf = ts_get(iter, k_next);
     if (!ts_is_callable(nf)) nf = ts_get(iter, nmk);
     else if (TS_TOP16(iter) == TS_SEL_OBJECT){
+      ts_object* o = (ts_object*)ts_ptr(iter);
+      ts_pref own = (o->h.kind == TS_KIND_OBJECT && !ts_obj_is_sized(o) && obj_shaped(o)) ? prop_find(o, k_next) : PREF_NONE;
+      /* fill: an own `next` as a plain data slot of a shaped iterator */
+      if (pref_ok(own) && !(pref_flags(own) & (TS_PROP_ACCESSOR | TS_PROP_INT32)) && !is_accessor(pref_val(own))){
+        uint32_t i = nc_next++ & 3u;
+        nc[i].shape = o->shape; nc[i].proto = 0; nc[i].proto_shape = 0; nc[i].slot = own.i;
+      }
       /* fill: an own-shaped iterator without an own `next`, the direct prototype
          holding `next` as a plain data slot */
-      ts_object* o = (ts_object*)ts_ptr(iter);
-      if (o->h.kind == TS_KIND_OBJECT && obj_shaped(o) && !pref_ok(prop_find(o, k_next)) && ts_is_obj(o->proto)){
+      else if (o->h.kind == TS_KIND_OBJECT && !ts_obj_is_sized(o) && obj_shaped(o) && !pref_ok(own) && ts_is_obj(o->proto)){
         ts_object* p = (ts_object*)ts_ptr(o->proto);
         if (p->h.kind == TS_KIND_OBJECT && obj_shaped(p)){
           ts_pref pr = prop_find(p, k_next);

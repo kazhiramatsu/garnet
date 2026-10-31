@@ -75,3 +75,58 @@ bounded by `Iterable`, a union of an array and a Set, live mutation of a
 Map, an array and a Set, labels, closures over the loop variable, a long
 `any` array loop); both also under GC stress. The parity oracle exports and
 emits with the old lowerings.
+
+## The iterator objects' state (Session 361)
+
+vue's reactive arrays are iterated through a wrapped native iterator
+(`wrapped.next = () => wrapResult(iter.next(), wrapValue)`, the native
+iterator's `next` read and called on every step), and garnet spent 41 ms of
+a 980 ms run there against V8's 5. The iterator kept its state in three
+hidden data properties (`__array_iterator_source`, `_index`, `_kind`,
+listed by no enumeration: `field_is_hidden`), defined one by one at
+creation (`ts_define_data`, three shape transitions), read through the
+runtime's monomorphic caches and written through `ts_set_ic` on every step.
+
+- **Creation** allocates the three slots in one layout (`g_ai_layout`, as a
+  literal's: `ts_new_object_layout` and three `ts_lit_store`), then links
+  the prototype. Map and Set iterators the same (`g_mi_layout`: source,
+  last order id, kind).
+- **`next`** finds the slots of an iterator in its layout's shape
+  (`iter_state_slots`: the shape id, the integrity bits aside) and, for the
+  values or keys of a dense array, reads them and writes the index in place
+  (a number or undefined needs no barrier) before the result object; every
+  other source (a typed array, an array-like, entries) takes the general
+  step over the same slots. An object made from the iterator prototype
+  (`Object.create(proto).next()`) has no such slots and keeps the
+  incompatible-receiver TypeError.
+- **A frozen iterator steps.** The state was written through the property
+  path, so `Object.freeze(arr.values()).next()` threw "Cannot assign to read
+  only property '__array_iterator_index'" where V8 steps it (an iterator's
+  internal slots are not properties); the slots are now written whatever
+  the integrity bits say. Map and Set iterators likewise.
+- **The generic step** (`ts_iter_step`, a `for..of` over an iterator the
+  type does not classify) keeps an iterator's own `next` (vue's `wrapped`)
+  in its four-entry cache by receiver shape beside the prototype entries,
+  and `ts_forof_next_slow` reads the result's `done` and `value` through
+  the runtime's shape caches instead of two generic lookups per step. The
+  cache's probe takes a shaped iterator alone: a dictionary's shape word is
+  0, which is what an empty entry holds, and such an entry reads as an own
+  `next` in slot 0. (A first cut lacked the test: an iterator with a deleted
+  property threw from the generator fallback. Conformance had no such
+  iterator; a review of the slice's diff before its commit found it.)
+- **An array-like's step.** `length` is the program's code (a getter, a
+  trap), which can take the iterator out of its layout's shape (a property
+  added and deleted leaves a dictionary): the step finds the slots again
+  after reading it, and otherwise writes the hidden properties.
+- The native iterator's `next`, inherited from its prototype, is read
+  through the inherited reads' table (`docs/hidden_class_design.md`, S1d).
+
+vue's `iterator_next` 41 -> 19 ms. Fixture
+`iteration/iterator_objects_state` (every kind by hand, live arrays, holes,
+a done iterator after a push, fresh result objects, a frozen iterator, no
+own properties, `next` through an object made from the prototype and as a
+value, many iterators and arrays, Map and Set iterators across a set and a
+delete, inherited reads before and after the prototype's value, method,
+accessor and relink change, an iterator in dictionary mode, own `next`s
+across shapes beside an inherited one, an array-like whose `length`
+restructures its iterator).

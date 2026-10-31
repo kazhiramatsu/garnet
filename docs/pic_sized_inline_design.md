@@ -377,3 +377,67 @@ slower). `TSAOT_KNOWN_METHOD=0` keeps the lookup alone (the parity oracle);
 `TSAOT_KNOWN_CALLEE_DEBUG=1` prints the sets at emission. Fixture
 `classes/known_callee_guards`. hono, five alternating rounds (medians; Node):
 plain: TrieRouter 244.5 -> 244.6 ms (260), RegExpRouter 68.6 -> 64.2 (39), PatternRouter 245.2 -> 241.5 (153), SmartRouter 81.4 -> 72.0 (42); trained (each side's own training): TrieRouter 179.2 -> 178.5, RegExpRouter 47.1 -> 46.5, PatternRouter 149.0 -> 146.1, SmartRouter 55.2 -> 50.1; outputs identical. tsc-ts 22.180 -> 22.181 G instructions (unchanged; outputs identical; 660 sites carry guards); vue 1,048.7 -> 1,051.1 ms (seven alternating rounds each, medians; outputs identical; Node 773; 702 sites carry guards).
+
+## The candidate classes in line (design, Session 361)
+
+**Finding.** After Session 361's runtime slice vue's `Dep.track` is the largest gap to V8 (about 69
+ms of an 890 ms run against 23), and 37% of its samples fall on five interface-typed accesses:
+`activeSub.deps` and `activeSub.depsTail`, read and written (`Subscriber`, implemented by
+ReactiveEffect and ComputedRefImpl). Each takes `ts_get_pic_checked_inline_sized`: the plain-object
+probe, which fails at the shape test on a sized receiver, then `ts_get_sized_pic_try`, which reads
+the site's flag byte, the receiver's flags and class word, and compares up to four entries (word
+and key): some 20-25 instructions and six dependent loads, where V8's polymorphic cache compares a
+map and loads a field per entry. The exporter already knows, through the checker, which program
+classes a value of the receiver's type can be an instance of; the emitter knows each class's
+struct layout and class interval. The generated code can test those classes itself.
+
+**Exporter.** In `withClassHint`, a site marked `sized` through `receiverAdmitsClassInstance` (no
+class hint) also records `cands`: the ids of the program classes whose instance type is assignable
+to the receiver's non-nullable type (a type parameter by its constraint), all of them when there
+are at most eight, none past that (a broad interface such as tsc-ts's `Node` keeps the caches
+alone); cached per type, as `admitsClassCache` is. `TSAOT_SIZED_CANDS=0` records none.
+
+**IR.** `cands: Vec<u32>` on `LoadField` and `StoreField` (`#[serde(default, skip_serializing_if =
+"Vec::is_empty")]`); the passes that construct these instructions leave it empty or copy it (the
+CLAUDE.md rule for new IR fields: `sroa.rs` and the `tests/*.rs` literals).
+
+**Emitter, reads.** For each candidate, the topmost ancestor declaring the field as a struct field
+(`own_fields`, `hint_guard`'s rule), deduplicated, kept only with a class interval
+(`class_ranged`), at most four. The read becomes
+
+```c
+v = (ts_is_obj(o) && (uint32_t)(((ts_object*)ts_ptr(o))->cls - lo1) < span1) ? box1(((ClassD1*)ts_ptr(o))->fK)
+  : (ts_is_obj(o) && (uint32_t)(((ts_object*)ts_ptr(o))->cls - lo2) < span2) ? box2(((ClassD2*)ts_ptr(o))->fK)
+  : <the site's sized inline read, unchanged>;
+```
+
+The interval test needs no `g_typed_slow` gate (`receiver_guard`'s `Range` note): an index in the
+interval is a sized, unrelinked instance of the declaring class or a subclass, whose struct starts
+with the declaring class's layout; a plain object's `cls` is 0, an instance converted to a
+dictionary (a deleted field) has 0, a relinked one carries `TS_CLS_RELINKED`, a Proxy is not
+`TS_KIND_OBJECT`'s cell layout but its `cls` word is never in an interval (to confirm in the
+fixture). Each value is boxed by the field's kind (an integer slot `ts_num((double)st)`, a number
+`ts_num(st)`, a boxed slot as it is) and `set_val` converts to the destination's representation as
+it does for the cache's value, so the C compiler folds the box into an unboxed destination.
+
+**Emitter, writes.** `if (inst_i && !TS_RT_UNLIKELY(ts_store_frozen(o))) { store; barrier }` for a
+boxed field with any value (`ts_write_barrier_hdr`, as the hinted store), or a number field with a
+number (an unboxed local, or `ts_is_num(v)` of a boxed one); an integer slot keeps the dynamic store
+(the runtime's integer rule, which `infer_int_store_fields` assumes for receiver-less stores); a
+frozen instance and everything else take the site's sized inline write, unchanged.
+
+**Not covered.** Lazy-home functions (their reads are statement expressions) keep the caches; a
+method read (`sub.notify()`) is not a field and keeps the dynamic call's caches. The candidates are
+tested in class id order; a profile-guided build could order them by the site's sized entries.
+
+**Expected and to measure.** vue: `Dep.track`'s five accesses and the other interface-typed reads
+(`track`, `prepareDeps`, `cleanupDeps`, `refreshComputed`, `isDirty`), an estimated 20-30 ms of 890.
+tsc-ts: 2,262 sized sites; those with at most eight candidate classes grow in line, so its
+instructions, cycles and binary size are the regression check, as for every in-line change.
+
+**Fixture** (`classes/interface_candidates`): an interface implemented by two classes with the field
+at different offsets, a subclass of one, a third class implementing it with an accessor, a plain
+object satisfying it, an instance relinked by `Object.setPrototypeOf`, a frozen instance's write
+(TypeError), an instance whose field was deleted, number and integer fields read and written, a
+Proxy of an instance, and null and undefined receivers (the generic path's TypeError); all in
+plain and strict mode, under GC stress.

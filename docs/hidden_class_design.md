@@ -192,6 +192,35 @@ What the S1 measurement pointed at, taken one by one with the annotated profile:
   of thousands of sites. The polymorphic interface site stays S4's business (one map word, one
   probe).
 
+### S1d. Inherited reads of plain objects (built, Session 361)
+
+S1's lesson, that a cache pays where it removes a path, pointed here. A site's cache holds own
+slots (shape -> slot) and one absent record; the location cache and the method caches serve sized
+instances. A plain receiver whose property lives on its prototype had nothing: every read missed
+in line and took the slow read, which probed the site's own entries, the absent table, the
+registry (`class_field_lookup`, a call), the receiver's own map (`prop_find`), the sized
+inherited cache, then walked the chain with a lookup on each link (`lookup_prop_chain`). vue's
+reactive array iteration reads a native array iterator's `next` this way on every step (1.28 M
+reads per run, `--rt-stats`' `pic_ool_get: inherited`), and so does any `Object.create` or ES5
+instance's method.
+
+`g_proto_read_cache` (2,048 entries, direct-mapped by (receiver shape word, key)) records the
+direct prototype that holds the key as a boxed data slot: {shape, key, epoch, holder shape,
+slot, holder}. A hit needs the receiver's shape word (it fixes the receiver's keys, so the key is
+not its own; a dictionary receiver is never recorded), its prototype the recorded cell (compared,
+never followed: a hit reads the receiver's live prototype, so a dead holder whose address was
+reused by another object of the same shape is still read correctly), that cell's shape word (its
+keys and attributes: the slot still holds the property as data) and the addition epoch (relinks,
+definitions on prototypes, class registrations, full collections move it). The slow read fills it
+after its walk found the key one link up (`proto_read_fill`: both shaped plain objects, the slot
+neither an accessor nor an integer slot) and sets the site's `TS_PIC_INHERITED_FLAG` (a bit of
+`absent_depth`, whose depth mask is now 0x3f); the leaf read (`ts_get_pic_checked`) probes the
+table for a plain receiver only at a flagged site, after the absent record, so a site that never
+read an inherited property pays one byte test on its misses (tsc-ts's polymorphic own reads).
+`Reflect.get(t, k, r)` on a shaped plain target with a key that carries its id (a trap's key) or a
+symbol reads an own data slot (`prop_find`) or the table without the roots, the registry test and
+the walk (vue's get trap on every reactive read). `TSAOT_PROTO_READS=0` fills nothing.
+
 ### S2. Prototype validity cells (private prototype shapes)
 
 An object that becomes a prototype (`TS_HDR_IS_PROTO`: a class's or builtin's prototype at

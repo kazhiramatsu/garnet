@@ -210,6 +210,20 @@ in-line allocation (A), then with the short slice and the barriers' exits
 | an eight-unit slice into the ring | 434.7 / 55.0 | 434.6 / 56.1 | 269.3 / 34.3 | 7.55 | 6.84 |
 | a closure into the ring | 309.9 / 41.4 | 308.9 / 40.7 | 283.8 / 36.2 | 8.31 | 7.76 |
 
+### The literal's slots and stores (Session 361)
+
+- The in-line literal (`ts_new_object_layout_site_in`) filled its slots
+  with undefined in a loop, which clang turned into a `memset_pattern16`
+  call at every site (90 calls in vue's binary for three or four slots, 1%
+  of its samples); the fill is now relaxed atomic stores, which the
+  compiler leaves as `n` stores.
+- `ts_lit_store` was a call (`static inline`, not inlined): it is now in
+  line for an in-object slot of a shaped object that is not old (a literal
+  just made in the young space, a stack cell), which needs no barrier, and
+  out of line otherwise (`ts_lit_store_slow`: an old object, an external
+  slot, a dictionary object). vue's compiler phase 318 -> 293 ms with the
+  `for..in` change of the same session.
+
 ## Calls to module-level const functions
 
 A module-level `const f = (...) => ...` is called directly when the
@@ -242,10 +256,10 @@ reactive access (reactivity phase 660 -> 650 ms).
   build, `ring[j]?.b` on a class instance reads the field behind the class
   interval test, and the class instance ring kernel runs at 3.49 ns (Node
   4.26).
-- An object literal's stores each go through `ts_lit_store`, which tests
-  the shape and the barrier. The layout's shape tested once, with the
-  object young, would let every store be direct, as the integer slots'
-  stores already are (`_ts_lkok`).
+- An object literal's stores each test the shape, the slot and the
+  generation in line (Session 361); the layout's shape tested once, with
+  the object young, would let every store be a plain store, as the integer
+  slots' stores already are (`_ts_lkok`).
 - An anonymous object type (`{ a: number; b: number }`) has no static slot
   hint (the hint needs a named type's producers), so its reads take the
   sized cache.

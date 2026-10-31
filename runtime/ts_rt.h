@@ -453,7 +453,10 @@ extern ts_key* g_ts_probe_wkeys;
    which never matches a stored word. */
 #define TS_PIC_SIZED_TAG 0x80000000u
 #define TS_PIC_SIZED_FLAG 0x80u
-#define TS_PIC_ABSENT_DEPTH_MASK 0x7fu
+/* the site has read a property a plain receiver inherits from its direct prototype (ts_rt.c,
+   the inherited reads' table): only such a site probes the table on its inline misses */
+#define TS_PIC_INHERITED_FLAG 0x40u
+#define TS_PIC_ABSENT_DEPTH_MASK 0x3fu
 typedef struct {
   ts_key key;
   uint32_t shape;
@@ -473,7 +476,8 @@ typedef struct {
      (TS_PIC_SIZED_FLAG): the site holds an entry for a sized class instance
      (prop_ic_fill_sized_site), so the inline probe for such receivers runs
      only then and a site that only ever sees plain objects pays one byte
-     test on its misses */
+     test on its misses; the next one (TS_PIC_INHERITED_FLAG): the site has
+     read an inherited property of a plain receiver */
   uint8_t absent_depth;
   /* The site's record: for a store, the addition it last performed
      (docs/site_add_transition_design.md); for a read, the absent property it
@@ -2690,7 +2694,10 @@ TS_RT_ALWAYS_INLINE tsv ts_new_object_layout_site_in(ts_lit_layout* L, uint32_t 
       o->h.kind = TS_KIND_OBJECT; o->h.spare = (uint16_t)site; gc_hdr_init_plain(&o->h, n);
       o->proto = g_object_proto_v; o->shape = sh; obj_map_plain(o)->len = n;
       tsv* slots = (tsv*)(p + sizeof(ts_object));
-      for (uint32_t i = 0; i < n; i++) slots[i] = (kinds && kinds[i]) ? ts_int_slot_word(0) : TS_UNDEFINED;
+      /* relaxed atomic stores: a plain fill loop became a memset_pattern16 call at every site
+         (90 calls in vue's binary for three or four slots); these unroll to n stores */
+      for (uint32_t i = 0; i < n; i++)
+        __atomic_store_n(&slots[i], (kinds && kinds[i]) ? ts_int_slot_word(0) : TS_UNDEFINED, __ATOMIC_RELAXED);
       s->allocs++;
       return ts_obj(o);
     }
@@ -2830,17 +2837,18 @@ TS_RT_ALWAYS_INLINE void ts_set_pic_inline_sized_lazy(
   ts_frame_pop(frame);
 }
 /* Store property `i` of a layout object (shaped: value slot; dictionary
-   fallback: entry in insertion order). */
-static inline void ts_lit_store(tsv obj, uint32_t i, tsv v){
+   fallback: entry in insertion order). In line: an in-object slot of a shaped
+   object that is not old (a literal just made in the young space, a stack
+   cell), which needs no barrier; the rest out of line (ts_lit_store_slow). The
+   call was 1% of vue's samples. */
+void ts_lit_store_slow(tsv obj, uint32_t i, tsv v);
+TS_RT_ALWAYS_INLINE void ts_lit_store(tsv obj, uint32_t i, tsv v){
   ts_object* o = (ts_object*)ts_ptr(obj);
-  if (ts_obj_shape_id(o) != TS_SHAPE_NONE){
-    tsv* p = ts_obj_slot_ptr(o, i);
-    *p = v;
-    ts_write_barrier_ptr(obj, p, v);
-  } else {
-    obj_map_plain(o)->props[i].val = v;
-    ts_write_barrier(obj, v);
+  if (TS_RT_LIKELY(o->h.gen != TS_GEN_OLD && i < o->h.inline_cap && ts_obj_shape_id(o) != TS_SHAPE_NONE)){
+    ts_obj_inline_vals(o)[i] = v;
+    return;
   }
+  ts_lit_store_slow(obj, i, v);
 }
 /* the same when the object is known to be in the layout's shape (the allocation's shape
    compared once, or a constructor's adopted layout): the range test and the store */

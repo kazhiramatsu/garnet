@@ -146,6 +146,7 @@ while IFS= read -r name; do
     ts_new_array_lit4_site_in | \
     ts_new_array_lit_site_in | \
     ts_new_object_layout_site_in | \
+    ts_lit_store | \
     ts_weakmap_probe_ref | \
     ts_weakmap_get_ref | \
     ts_weakmap_has_ref | \

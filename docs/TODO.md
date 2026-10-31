@@ -12472,3 +12472,101 @@ A1 と A2 は「これまで作った generics / 継承を性能まで到達さ�
   global cache keyed by (shape, key) -> own slot, as V8's megamorphic stub cache: a shape id names one
   exact property sequence, so an entry never needs invalidating. Also measured and dropped this
   session: `in` on a plain object answered from its own map first (no gain).
+
+## Session 361 (2026-10-31): vue's per-function gaps, the runtime round (for..in, literal stores, inherited reads, iterator state)
+
+- The method (Session 360's scripts): `sample` three native runs and Node's `--cpu-prof` on vue,
+  per JS function. Note: a hand-made build of a real project must source its `env.sh` (vue's
+  `TSAOT_DEFINE` folds `__DEV__`); a `--rt-stats` or `--profile` build without it reads `__DEV__`
+  from globalThis 20 M times and its profile shows `ts_intern_field` and `ts_global_get_ref` that the
+  real build does not have.
+- **for..in** (`docs/property_descriptors_design.md` section 9): an object or array whose prototype
+  links add no key (`for_in_link_silent`) takes Object.keys's list; the walk built a descriptor per
+  own name of every link. vue's `baseParse` 19.6 -> 5.3 ms. `TSAOT_FOR_IN_OWN=0`. Fixture
+  `objects/for_in_own_keys`.
+- **Literal slots and stores** (`docs/alloc_fast_path_design.md`, "The literal's slots and
+  stores"): the in-line literal's undefined fill was a `memset_pattern16` call per site (relaxed
+  atomic stores now); `ts_lit_store` is in line for a young shaped object's in-object slot
+  (`ts_lit_store_slow` otherwise). With the for..in change: vue 958.5 -> 930.4 ms, compiler phase
+  318 -> 293.
+- **Inherited reads of plain objects** (`docs/hidden_class_design.md` S1d): `g_proto_read_cache`,
+  (receiver shape, key) -> direct prototype, its shape, slot; probed by the leaf read at sites
+  flagged `TS_PIC_INHERITED_FLAG` (depth mask now 0x3f) and by `Reflect.get`'s new receiver fast
+  path (an own data slot or the table, no roots, for a key that carries its id or a symbol).
+  `TSAOT_PROTO_READS=0`.
+- **Iterator state** (`docs/array_iterators_design.md`, "The iterator objects' state"): array, Map
+  and Set iterators allocated in one layout; `next` reads and writes the slots in place
+  (`iter_state_slots`), which also fixes a silent difference: a frozen iterator threw "Cannot assign
+  to read only property '__array_iterator_index'" where V8 steps it. `ts_iter_step` caches an own
+  `next`; `ts_forof_next_slow` reads `done` / `value` through the runtime's shape caches. vue's
+  `iterator_next` 41 -> 19 ms. Fixture `iteration/iterator_objects_state`.
+- A review of the slice's diff before its commit found what the gates had passed: `ts_iter_step`'s
+  new own-`next` entry read an empty cache entry as "own `next` in slot 0" for a dictionary-mode
+  iterator (shape word 0), a TypeError from the generator fallback where V8 steps it (an iterator
+  with a deleted property; the probe now takes shaped iterators alone), and an array-like's `length`
+  could take the iterator out of its layout while the step held its slots (it finds them again). Both
+  are in `iteration/iterator_objects_state`, which fails on the first cut.
+- Gates (`build/gates_s361a/run.sh`, r27 against r26, before those two fixes): unit, bundler 54/54,
+  conformance plain and strict 705/705, protect 702/702, bench, ci, ir-parity (the new fixtures,
+  4,379 identical), the engine diff in both modes, the GC gate, the hono survey 42/43. After them
+  (`build/gates_s361b/run.sh`, the commit's code): unit, bundler, conformance in the three modes, bench,
+  ci, the GC gate, the ir-parity snapshot.
+- Alternating, outputs identical (r26 -> r27; Node): vue 981.3 -> 906.4 ms (about 750), hono_app 147.6
+  -> 125.0 ms (157), TrieRouter 213.0 -> 211.5 (plain builds; 260), RegExpRouter 54.3 -> 53.7,
+  PatternRouter 240.0 -> 236.1, SmartRouter 54.7 -> 54.4; tsc-ts 21.787 -> 21.856 G instructions
+  (+0.32%; cycles the same, wall 0.938), the one site-flag byte test on each plain object's
+  out-of-line read and the literal store's tests in line.
+- Remaining per-function gaps (native / Node ms per run, r27b): `Dep.track` 69 / 23 (the design
+  above), `BaseReactiveHandler.get` 85 / 66, makeMap's `val in map` 27 / 10 (`ts_has_prop` on a
+  plain object pays the registry call and the kind ladder), codegen `push` 13 / 2.4 (each append
+  still allocates a view), `Tokenizer.getPos` 10 / 3.4, `prepareDeps` 14 / 8.
+
+State at the end of the session: **the r27 slice above is committed; two more slices are built and
+not committed**, in the worktree `build/wt_s361`, branch `s361-wip` (local, not pushed; the worktree's
+HEAD is on it, on top of `589c702`, which is the r27 commit's code):
+
+- `3558bcb` **the candidate classes in line** (`docs/pic_sized_inline_design.md`, "The candidate
+  classes in line", rewritten to what was built): an interface-typed site tests the classes declaring
+  the field and reads or writes the struct itself. It rests on a runtime change: `ts_symbol`, `ts_proxy`
+  and `ts_coro` keep the class and shape words of the common prefix zero (a Proxy's `cls` was the low
+  half of its handler's address, a `Symbol.for`'s was 1: the class-typed interval guards had that
+  exposure too). vue 26.096 -> 25.44 G instructions (-2.5%), binary +3 KB, outputs identical; wall not
+  measured on a quiet machine. Fixture `classes/interface_candidates` (155 sites; `sized` needs the
+  strict profile, so only `TSAOT_CONF_STRICT=1` and real projects exercise it). `Subscriber`'s 31 sites
+  are covered; vue's other `sized` sites without `cands` are class-hinted ones on the `Range` guard, or
+  plain AST types, not misses. Passed on the worktree: unit, the fixture in the three modes.
+- `01110cb`, `2873a0c` **GetIterator's record and array patterns** (`docs/array_iterators_design.md`,
+  last section): `const [a, b] = v` with `v: any` holding a Set, Map or generator bound undefined (also
+  a parameter, a nested pattern, a `for..of` variable, an assignment), a non-iterable was accepted, a
+  string pattern split surrogate pairs, `next` was read per step (V8: once; an iterator replacing its
+  `next` stopped early), an object with `next` and no `[Symbol.iterator]` was iterated. `ts_iter_step`
+  and its cache are gone. Fixture `iteration/iterator_protocol_fidelity`. Passed on the worktree: the
+  fixture and the `forof|destruct` fixtures in the three modes.
+- An independent review of both slices was running when the session stopped and its result is not
+  here: repeat it before committing them (`git diff 589c702 3558bcb`, `git diff 3558bcb 2873a0c`).
+
+Next session, in order:
+
+1. `git -C build/wt_s361 rebase --onto main 589c702 s361-wip`. Expected conflicts:
+   `scripts/run_gc_stress.sh` (both add `iterator_objects_state` to the filter; keep
+   `interface_candidates|iterator_objects_state|iterator_protocol_fidelity`, the last one not yet in it)
+   and perhaps `docs/array_iterators_design.md` (the new section stays last).
+2. The candidate slice alone into the main tree (`git cherry-pick -n` its commit), `tsc` and `cargo build`
+   (`scripts/setup.sh` steps 2 and 3), then the full set: a copy of `build/gates_s361a/run.sh` with r27
+   -> r28 against the baselines it left (`build/real/hono-work/driver.r27plain`,
+   `build/real/hono_app-work/driver.r27`, `build/real/vue-work/driver.r27`,
+   `build/tsc_ts_native_r27/tsc-ts`). Wrap the runner in `caffeinate -ims`: a closed lid paused the first
+   run for hours, and the `alarm` watchdogs do not count during sleep. Watch tsc-ts's instructions, binary
+   size and export time (the exporter now tests every class against each `sized` type; at most 32
+   candidates, at most four declaring classes at a site). ir-parity differs by the `cands` keys:
+   `TSAOT_SIZED_CANDS=0` must be identical, then `gate.sh ir-parity snap`. Fill in the design section's
+   measurements, append to this log, commit, push.
+3. The iteration slice the same way (r29). Watch `any`-typed array patterns in the benches
+   (`forof.open` plus a `forof.next` per element, in line for an array).
+4. Add to CLAUDE.md's known items: a symbol through an `any` receiver (`.description` reads undefined,
+   `.toString()` is a TypeError; the typed forms work, there is no `Symbol.prototype` object), and
+   `yield*` over an `any` being a compile-time reject (V8 runs it). KNOWN_GAPS.md's no IteratorClose on
+   an early exit of a dynamic `for..of` is unchanged.
+5. The next round on vue: `sample` and `--cpu-prof` per JS function (Session 360's scripts) from the list
+   above. Note on `val in map`: Session 360 measured an own-map first test with no gain, so profile it
+   (the dynamic key's conversion) before changing `ts_has_prop`.
