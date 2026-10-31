@@ -22,6 +22,7 @@
  * Unknowns default to UNSTABLE. We only claim stability we can see.
  */
 import * as ts from "typescript";
+import { privateBrand } from "./private_names";
 /** The globals the Node prelude provides as classes of lib/node (exporter.ts NODE_PRELUDE_CTORS). */
 const PRELUDE_CLASS_NAMES = new Set(["Headers", "Request", "Response", "FormData", "DataView", "URL", "URLSearchParams", "Crypto", "SubtleCrypto", "CryptoKey",
   "ReadableStream", "WritableStream", "TransformStream", "ReadableStreamDefaultReader", "WritableStreamDefaultWriter", "ReadableStreamDefaultController", "WritableStreamDefaultController", "TransformStreamDefaultController", "TextEncoderStream", "TextDecoderStream", "CountQueuingStrategy", "ByteLengthQueuingStrategy", "Blob", "File",
@@ -215,6 +216,8 @@ export class ClassExtractor {
       }
     }
 
+    const brand = privateBrand(decl);
+    if (brand !== undefined) info.ownFields.push(brand);
     for (const m of decl.members) {
       const mods = ts.canHaveModifiers(m) ? ts.getModifiers(m) : undefined;
       const isStatic = !!mods?.some((mod) => mod.kind === ts.SyntaxKind.StaticKeyword);
@@ -287,7 +290,7 @@ export class ClassExtractor {
       // this.field = ...
       if (ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
         const lhs = n.left;
-        if (ts.isPropertyAccessExpression(lhs) && lhs.expression.kind === ts.SyntaxKind.ThisKeyword) {
+        if (ts.isPropertyAccessExpression(lhs) && lhs.expression.kind === ts.SyntaxKind.ThisKeyword && !ts.isPrivateIdentifier(lhs.name)) {
           const f = lhs.name.text;
           if (!info.ownFields.includes(f)) {
             info.ownFields.push(f);

@@ -13369,8 +13369,13 @@ fn emit_sm_resume_body(s: &mut String, f: &Function, ctx: &Ctx, mode: SmMode) {
     if has_coro_try {
         s.push_str("  jmp_buf _eh_buf;\n");
     }
+    let initial_suspend = initial_suspend_of(f);
     if mode.is_promise_backed() {
         let _ = writeln!(s, "  if ({}(_reject_buf) != 0) {{", exception_setjmp_name());
+        // the parameters' evaluation belongs to the call: no generator object yet, no promise to reject
+        if initial_suspend.is_some() {
+            s.push_str("    if (_fr->c.state == 0) { ts_eh_pop(); ts_throw(ts_current_exception()); }\n");
+        }
         if mode == SmMode::AsyncGenerator {
             s.push_str("    _fr->c.done = 1;\n");
             s.push_str("    if (ts_is_gen_return_completion(ts_current_exception())) {\n");
@@ -13682,11 +13687,13 @@ fn emit_sm_resume_body(s: &mut String, f: &Function, ctx: &Ctx, mode: SmMode) {
                         // then return to the .next() caller. The next .next() makes a
                         // fresh promise (c->ret) and resumes.
                         let _ = writeln!(s, "  _fr->c.state = {};", cur_state);
-                        let _ = writeln!(
-                            s,
-                            "  ts_promise_resolve_v(_fr->c.ret, ts_iter_result({}, 0));",
-                            ctx.val(operand.0)
-                        );
+                        if initial_suspend != Some(operand.0) {
+                            let _ = writeln!(
+                                s,
+                                "  ts_promise_resolve_v(_fr->c.ret, ts_iter_result({}, 0));",
+                                ctx.val(operand.0)
+                            );
+                        }
                         pop_if_active(s);
                         s.push_str("  return TS_UNDEFINED;\n");
                         let _ = writeln!(s, "  S{}: ;", cur_state);
@@ -14138,6 +14145,14 @@ fn emit_async_function(s: &mut String, f: &Function, ctx: &Ctx) {
 /// Generator function (`function*`) -> state machine + coroutine frame, driven by
 /// .next() rather than the event loop. Reuses the same frame/resume scaffolding
 /// as async; yield hands a value to the caller and suspends, Return marks done.
+/// The local a generator with non-simple parameters yields once, right after binding them
+/// (the exporter's `__initial_suspend`): its entry runs the body to that yield, so a default's
+/// effects and a pattern's throw happen at the call; the runtime still sees a generator that
+/// has not started.
+fn initial_suspend_of(f: &Function) -> Option<u32> {
+    f.locals.iter().find(|l| l.name.as_deref() == Some("__initial_suspend")).map(|l| l.id.0)
+}
+
 fn emit_generator_function(s: &mut String, f: &Function, ctx: &Ctx) {
     let fname = cname(f);
     // Frame struct (identical layout to async).
@@ -14160,6 +14175,9 @@ fn emit_generator_function(s: &mut String, f: &Function, ctx: &Ctx) {
     s.push_str("  ts_gc_root(&_cv);\n");
     let _ = writeln!(s, "  {}_frame* _fr = ({}_frame*)ts_ptr(_cv);", fname, fname);
     emit_coroutine_param_copy(s, f, ctx);
+    if initial_suspend_of(f).is_some() {
+        s.push_str("  ts_coro_resume_v(_cv);\n");
+    }
     s.push_str("  tsv _gen = ts_gen_new_v(_cv);\n");
     s.push_str("  ts_gc_unroot(1);\n");
     s.push_str("  return _gen;\n}\n\n");
@@ -14187,6 +14205,9 @@ fn emit_asyncgen_function(s: &mut String, f: &Function, ctx: &Ctx) {
     s.push_str("  ts_gc_root(&_cv);\n");
     let _ = writeln!(s, "  {}_frame* _fr = ({}_frame*)ts_ptr(_cv);", fname, fname);
     emit_coroutine_param_copy(s, f, ctx);
+    if initial_suspend_of(f).is_some() {
+        s.push_str("  ts_coro_resume_v(_cv);\n");
+    }
     s.push_str("  tsv _gen = ts_asyncgen_new_v(_cv);\n");
     s.push_str("  ts_gc_unroot(1);\n");
     s.push_str("  return _gen;\n}\n\n");
@@ -22621,6 +22642,9 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                                 let _ = writeln!(s, "  {}", inits.join(" "));
                             }
                             let _ = writeln!(s, "  {} = ts_obj({}); }}", dst_name, o);
+                            if proto.is_some() && class_index_enabled() {
+                                let _ = writeln!(s, "  ts_instance_of_evaluation({});", dst_name);
+                            }
                             return;
                         }
                         let decl = if stack_closures_enabled() && ctx.stack_cells {
@@ -22640,6 +22664,9 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                             let _ = writeln!(s, "  {}", inits.join(" "));
                         }
                         let _ = writeln!(s, "  {} = ts_obj(&sobj{});", dst_name, dst.0);
+                        if proto.is_some() && class_index_enabled() {
+                            let _ = writeln!(s, "  ts_instance_of_evaluation({});", dst_name);
+                        }
                     } else {
                         if let Some(id) = alloc_site_id(site.0, st) {
                             // the site's survival decides young or old at run
@@ -22664,6 +22691,9 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         }
                         if class_index_enabled() {
                             let _ = writeln!(s, "  hobj{}->header.cls={}u;", dst.0, class_index_word(c.0));
+                            if proto.is_some() {
+                                let _ = writeln!(s, "  ts_instance_of_evaluation({});", dst_name);
+                            }
                         }
                         if !boxed.is_empty() {
                             let inits: Vec<String> = boxed
@@ -23652,6 +23682,14 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 return;
             }
             // `new Function(src)`: code generation from a string, a catchable EvalError at the site
+            if let Some(name) = builtin.strip_prefix("throw.uninitialized:") {
+                let _ = writeln!(s, "  ts_throw_uninitialized({});", c_string_lit(name));
+                return;
+            }
+            if let Some(msg) = builtin.strip_prefix("throw.type:") {
+                let _ = writeln!(s, "  ts_throw_type_error_msg({});", c_string_lit(msg));
+                return;
+            }
             if let Some(msg) = builtin.strip_prefix("throw.eval:") {
                 let _ = writeln!(s, "  ts_throw_eval_error_msg({:?});", msg);
                 if let Some(d) = dst {
@@ -24162,6 +24200,17 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 "newtarget.ofThis" => (format!("ts_new_target_of({})", v(0)), false),
                 _ if builtin.starts_with("newtarget.take:") => (format!("ts_take_new_target((ts_code)FN_TABLE[{}])", &builtin["newtarget.take:".len()..]), false),
                 _ if builtin.starts_with("import.meta:") => (format!("ts_import_meta({}u, {})", &builtin["import.meta:".len()..], v(0)), false),
+                "function.keyName" => (format!("ts_fn_key_name({})", v(0)), false),
+                _ if builtin.starts_with("private.check:") => {
+                    (format!("(ts_private_check({}, {}u), TS_UNDEFINED)", v(0), &builtin["private.check:".len()..]), false)
+                }
+                _ if builtin.starts_with("private.has:") => {
+                    (format!("ts_bool(ts_private_has({}, {}u))", v(0), &builtin["private.has:".len()..]), false)
+                }
+                "object.restKeys" => {
+                    let keys: Vec<String> = (1..args.len()).map(|i| v(i)).collect();
+                    (format!("ts_object_rest_keys({}, (tsv[]){{{}}}, {})", v(0), keys.join(", "), keys.len()), false)
+                }
                 _ if builtin.starts_with("function.nameFromKey:") => {
                     let prefix = match &builtin["function.nameFromKey:".len()..] { "get" => "get ", "set" => "set ", _ => "" };
                     (format!("ts_fn_name_from_key({}, {}, {:?})", v(0), v(1), prefix), false)

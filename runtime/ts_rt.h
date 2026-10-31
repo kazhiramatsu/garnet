@@ -275,6 +275,10 @@ typedef struct ts_gc_header {
    it moves the addition caches' epoch; on any other object it changes that object alone (yaml defined
    a read-only property on every node: the epoch moved 45k times per parse). */
 #define TS_HDR_IS_PROTO 16u
+/* a prototype of the second or a later evaluation of a class: one class word, a prototype per
+   evaluation. The caches keyed by the word hold the first evaluation's chain, so an instance of a
+   later one carries TS_CLS_RELINKED (ts_instance_of_evaluation) and takes the full lookup. */
+#define TS_HDR_LATER_EVAL 32u
 /* 8 bytes (docs/cell_header_design.md; docs/gc_v2_design.md §4.4): a heap
    reference is the address, so the cell carries no handle and no list link,
    and its size is its size class's (or its large run's), so it carries no
@@ -2041,6 +2045,7 @@ int    ts_has_prop_dyn(tsv obj, tsv keyv);
 int    ts_has_own(tsv obj, ts_key key);
 int    ts_has_own_dyn(tsv obj, tsv keyv);
 tsv    ts_object_rest(tsv src, const uint32_t* excl, int nexcl);
+tsv    ts_object_rest_keys(tsv src, const tsv* keys, int n);
 tsv    ts_get_dyn(tsv obj, tsv keyv);
 tsv    ts_get_checked(tsv obj, ts_key key);
 tsv    ts_get_dyn_checked(tsv obj, tsv keyv);
@@ -2075,6 +2080,9 @@ tsv ts_object_get_own_property_symbols(tsv obj);
 tsv ts_object_freeze(tsv v);
 tsv ts_to_object(tsv v);
 tsv ts_property_key_value(tsv v);
+tsv ts_fn_key_name(tsv key);
+void ts_private_check(tsv obj, ts_key key);
+int ts_private_has(tsv obj, ts_key key);
 tsv ts_fn_name_from_key(tsv fn, tsv key, const char* prefix);
 tsv ts_new_target_of(tsv self);
 tsv ts_take_new_target(ts_code code);
@@ -2741,6 +2749,10 @@ static inline int ts_int32_exact(tsv v, int32_t* out){
   if (i == 0 && (v >> 63)) return 0;
   *out = i;
   return 1;
+}
+TS_RT_ALWAYS_INLINE void ts_instance_of_evaluation(tsv inst){
+  ts_object* o = (ts_object*)ts_ptr(inst);
+  if (ts_is_obj(o->proto) && TS_RT_UNLIKELY(((ts_object*)ts_ptr(o->proto))->h.flags & TS_HDR_LATER_EVAL)) o->cls |= TS_CLS_RELINKED;
 }
 TS_RT_ALWAYS_INLINE tsv ts_get_pic_checked_inline(
     tsv obj, ts_key key, ts_prop_ic* ic){
@@ -3832,7 +3844,8 @@ tsv ts_iter_throw(tsv iter, ts_key tmk, tsv exc);
 tsv ts_forof_next_slow(tsv it, tsv next_method);
 tsv ts_forof_skip_slow(tsv it, tsv next_method);
 /* An array needs no opening; the three tests of a pattern over one fold into one. */
-static inline int ts_forof_plain_array(tsv v){ return ts_is_indexed_array_fast(v) && obj_map_plain((ts_object*)ts_ptr(v))->len == 0; }
+extern int g_array_iter_patched;   /* Array.prototype[Symbol.iterator] replaced or deleted */
+static inline int ts_forof_plain_array(tsv v){ return ts_is_indexed_array_fast(v) && obj_map_plain((ts_object*)ts_ptr(v))->len == 0 && !g_array_iter_patched; }
 static inline tsv ts_forof_open_inline(tsv v){ return ts_forof_plain_array(v) ? v : ts_forof_open(v); }
 static inline tsv ts_forof_open_limit_inline(tsv v, double limit){ return ts_forof_plain_array(v) ? v : ts_forof_open_limit(v, limit); }
 /* The next method of what ts_forof_open returned, read once per loop (GetIterator's record). */

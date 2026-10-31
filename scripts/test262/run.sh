@@ -25,7 +25,7 @@ for c in "${chunks[@]}"; do
   node "$ROOT/scripts/test262/gen.mjs" "$SRC" "$GEN/$name" "$c" > "$OUT/$name.gen" 2>&1 || { echo "[test262] gen failed: $c"; continue; }
   cp "$GEN/$name/META.tsv" "$OUT/$name.meta"
   t0=$(date +%s)
-  TSAOT_CONF_DIR="$GEN/$name" TSAOT_CONF_VERBOSE=1 TSAOT_CONF_RT_OBJ="$RT_OBJ" TSAOT_UNTYPED=1 \
+  TSAOT_CONF_DIR="$GEN/$name" TSAOT_CONF_VERBOSE=1 TSAOT_CONF_RT_OBJ="$RT_OBJ" TSAOT_UNTYPED=1 TSAOT_CONF_ORACLE_ESNEXT=1 \
     TSAOT_CONF_TIMEOUT="${TSAOT_CONF_TIMEOUT:-20}" TSAOT_CONF_JOBS="${TSAOT_CONF_JOBS:-3}" \
     nice -n 12 bash "$ROOT/scripts/run_conformance.sh" dir > "$OUT/$name.log" 2>&1
   echo "[test262] $c: $(wc -l < "$GEN/$name/META.tsv") cases in $(( $(date +%s) - t0 )) s: $(tail -1 "$OUT/$name.log" | cut -c1-60)"

@@ -20,6 +20,8 @@ import * as ts from "typescript";
 import * as fs from "fs";
 import * as path from "path";
 import { ClassExtractor, ClassInfo, ClosedReceivers, memberKeyName, dynamicBaseEmptyClass } from "./class_extract";
+import { jsEarlyErrors } from "./early_errors";
+import { uniquePrivateNames, privateDisplayName, privateBrand } from "./private_names";
 import { JSX_ENTITIES } from "./jsx_entities";
 /** A regexp literal's text split into its source and flags (`/src/flags`). */
 function splitRegExpLiteral(raw: string): { source: string; flags: string } | undefined {
@@ -100,7 +102,7 @@ function isNodeBuiltinSpecifier(spec: string): boolean {
  *  an object literal is valid). */
 const NOT_EARLY_GRAMMAR = new Set([1117, 1149, 1192, 1202, 1203, 1205, 1208, 1259, 1261, 1286, 1287, 1323, 1324, 1343, 1371, 1375, 1378, 1432, 1470, 1471, 1479, 1484]);
 /** JavaScript's early errors that TypeScript makes in the checker. */
-const CHECKER_EARLY_ERRORS = new Set([2300, 2335, 2337, 2338, 2357, 2364, 2392, 2451, 2462, 2523, 2524, 2660, 2777, 2779, 17006, 17007, 17012, 17013, 18011, 18012, 18016, 18061]);
+const CHECKER_EARLY_ERRORS = new Set([2300, 2335, 2337, 2338, 2357, 2364, 2392, 2451, 2462, 2523, 2524, 2660, 2777, 2779, 2815, 5076, 17006, 17007, 17012, 17013, 18006, 18011, 18012, 18016, 18061]);
 /** Does this diagnostic say what JavaScript itself refuses before running? Under TSAOT_UNTYPED no type is
  *  trusted, but such a program is still not compiled. */
 function isEarlyError(d: ts.Diagnostic): boolean {
@@ -108,6 +110,22 @@ function isEarlyError(d: ts.Diagnostic): boolean {
   if ((d.code === 2300 || d.code === 2451) && !(d.relatedInformation ?? []).every((r) => r.file === d.file)) return false;
   if (d.code === 2339) return ts.flattenDiagnosticMessageText(d.messageText, " ").startsWith("Property '#"); // an undeclared private name
   return d.code < 2000 ? !NOT_EARLY_GRAMMAR.has(d.code) : CHECKER_EARLY_ERRORS.has(d.code);
+}
+
+/** A parser diagnostic that is TypeScript's, not JavaScript's: `o?.#x` is ES2022; an escape in `g\u0065t` is
+ *  refused where the word is a keyword, and a class field of that name followed by a line break is no keyword. */
+function isSyntaxError(d: ts.Diagnostic): boolean {
+  if (d.code === 18030) return false;
+  if (d.code === 1260 && d.file && d.start !== undefined && d.length !== undefined) {
+    const after = /^[ \t]*(.)?/.exec(d.file.text.slice(d.start + d.length, d.start + d.length + 80));
+    const c = after?.[1];
+    if (c === undefined || c === "\n" || c === "\r" || c === ";" || c === "=" || c === "(" || c === "}") {
+      const word = d.file.text.slice(d.start, d.start + d.length);
+      let cooked = word.replace(/\\u\{?([0-9a-fA-F]+)\}?/g, (_, h: string) => String.fromCodePoint(parseInt(h, 16)));
+      if (cooked === "get" || cooked === "set" || cooked === "static" || cooked === "async" || cooked === "accessor") return false;
+    }
+  }
+  return true;
 }
 
 function garnetModulePaths(): ts.MapLike<string[]> {
@@ -412,8 +430,23 @@ function jsxRuntimeImportOf(options: ts.CompilerOptions, sf: ts.SourceFile): str
  *  pragma (`@jsxImportSource`, `@jsxRuntime automatic`): under that mode TypeScript adds the synthetic
  *  import of `<source>/jsx-runtime` to each JSX file (resolved, type-checked, part of the program). A
  *  project option says so directly (the options are then already in that mode). */
+/** A host whose source files carry the class-scoped private names, before anything binds them. */
+function privateNameHost(options: ts.CompilerOptions, host: ts.CompilerHost | undefined): ts.CompilerHost {
+  const base = host ?? ts.createCompilerHost(options);
+  return Object.assign({}, base, {
+    getSourceFile(fileName: string, languageVersion: ts.ScriptTarget | ts.CreateSourceFileOptions, onError?: (m: string) => void, shouldCreate?: boolean) {
+      const sf = base.getSourceFile(fileName, languageVersion, onError, shouldCreate);
+      if (sf && !sf.isDeclarationFile) uniquePrivateNames(sf);
+      return sf;
+    },
+  });
+}
 function programWithJsxRuntime(rootNames: string[], options: ts.CompilerOptions, host: ts.CompilerHost | undefined,
                                sourceMode: SourceMode): ts.Program {
+  // Every file is an ES module, as the V8 oracle runs it: always strict, its top-level names its own, not
+  // merged with lib.dom's (`const name = ...`), with or without an import of its own.
+  if (sourceMode === "module") options = { ...options, moduleDetection: ts.ModuleDetectionKind.Force };
+  host = privateNameHost(options, host);
   const program = programWithNodeSupport(rootNames, options, host, sourceMode);
   if (options.jsx === ts.JsxEmit.ReactJSX) return program;
   const automatic = program.getSourceFiles().some((f) => !f.isDeclarationFile && f.languageVariant === ts.LanguageVariant.JSX &&
@@ -760,6 +793,12 @@ function isObjLitFn(n: ts.Node): boolean {
     && !!n.parent && ts.isObjectLiteralExpression(n.parent);
 }
 
+/** What a private name resolves to: a field, or a method or accessor with its functions; `brand` is the hidden
+ *  field an instance of a class with private methods or accessors carries. */
+interface PrivateMember { classId: number; kind: "field" | "method" | "accessor"; isStatic: boolean; method?: number; getter?: number; setter?: number; brand?: string }
+/** A destructuring property's key: a name the program spells, or a local holding a computed key. */
+type PatternKey = { field: string } | { key: number };
+
 class Exporter {
   checker: ts.TypeChecker;
   // Untyped mode (TSAOT_UNTYPED=1): treat the whole program as `any` — disable
@@ -1017,7 +1056,12 @@ class Exporter {
   classIdByNode = new Map<ts.Node, number>();
   computedKeyGlobals = new Map<ts.ClassElement, number>();
   /** An anonymous class expression's `name`: the binding or the key its site gives it. */
+  private arrayIteratorNamed = false;
+  private privateMembers?: Map<string, PrivateMember>;
+  private readingPrivateField = false;
   classInferredName = new Map<number, string>();
+  /** An anonymous class named by a computed key, with a static container: the global holding that key. */
+  classKeyNameGlobals = new Map<number, number>();
   /** A named class expression's inner binding: one class for all its evaluations, so one global. */
   classExprNameGlobals = new Map<number, number>();
   /** The class whose computed keys are being evaluated: its name is in the TDZ there. */
@@ -1044,6 +1088,15 @@ class Exporter {
    *  erased because it is stored as declaration metadata or node flags. */
   preflightRuntimeSyntax(sf: ts.SourceFile): void {
     const visit = (node: ts.Node) => {
+      // `Array.prototype[Symbol.iterator]`: a program that names it may replace it, so no pattern or loop here
+      // reads an array by index
+      if (ts.isElementAccessExpression(node) && ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === "prototype" &&
+          ts.isIdentifier(node.expression.expression) && node.expression.expression.text === "Array" &&
+          ts.isPropertyAccessExpression(node.argumentExpression) && node.argumentExpression.name.text === "iterator") {
+        this.arrayIteratorNamed = true;
+        this.arrayIterForOfEnabled = false;
+        this.forOfCursorEnabled = false;
+      }
       const decorators = ts.canHaveDecorators(node) ? ts.getDecorators(node) : undefined;
       if (decorators?.length) {
         this.unsupported(node, "decorators (standard and experimental evaluation is not implemented)");
@@ -1486,12 +1539,22 @@ class Exporter {
     const decl = (sym.valueDeclaration ?? sym.declarations?.[0]) as ts.Node | undefined;
     if (!decl || decl.getSourceFile() !== node.getSourceFile()) return false;
     let lexical = false;
-    if (ts.isVariableDeclaration(decl)) {
-      const list = decl.parent;
-      lexical = !!(list && ts.isVariableDeclarationList(list) &&
-        ((list.flags & ts.NodeFlags.Let) || (list.flags & ts.NodeFlags.Const)));
-    } else if (ts.isClassDeclaration(decl) || ts.isClassExpression(decl)) {
+    // the parameter a node is written in, up to its function
+    const parameterOf = (n: ts.Node): ts.ParameterDeclaration | undefined => {
+      for (let c: ts.Node | undefined = n; c && !ts.isSourceFile(c); c = c.parent) {
+        if (ts.isParameter(c)) return c;
+        if (isFunctionLike(c)) return undefined;
+      }
+      return undefined;
+    };
+    if (ts.isVariableDeclaration(decl) || ts.isBindingElement(decl)) {
+      if (ts.getCombinedNodeFlags(decl) & ts.NodeFlags.BlockScoped) lexical = true;
+    }
+    if (ts.isClassDeclaration(decl) || ts.isClassExpression(decl)) {
       lexical = true;
+    } else if (ts.isParameter(decl) || ts.isBindingElement(decl)) {
+      // parameters bind left to right: a default reads the ones before it (a closure in it, whichever)
+      if (parameterOf(decl) !== undefined && parameterOf(node) !== undefined) lexical = true;
     }
     if (!lexical) return false;
     if (this.enclosingFunction(node) !== this.enclosingFunction(decl)) return false;
@@ -1503,15 +1566,17 @@ class Exporter {
     const declPos = decl.getStart(sf);
     if (usePos < declPos) return true;
 
-    if (ts.isVariableDeclaration(decl) && decl.initializer) {
+    // a binding's own initializer, a pattern's default among them
+    const init = ts.isVariableDeclaration(decl) || ts.isBindingElement(decl) || ts.isParameter(decl) ? decl.initializer : undefined;
+    if (init) {
       let insideInit = false;
       const visit = (n: ts.Node) => {
         if (insideInit) return;
         if (n === node) { insideInit = true; return; }
-        if (isFunctionLike(n) && n !== decl.initializer) return;
+        if (isFunctionLike(n) && n !== init) return;
         ts.forEachChild(n, visit);
       };
-      visit(decl.initializer);
+      visit(init);
       if (insideInit) return true;
     }
     return false;
@@ -2052,7 +2117,7 @@ class Exporter {
     // value binding `a`, so redirect to the shorthand's value symbol centrally —
     // this keeps capture analysis and lowerIdentifier consistent.
     if (ts.isIdentifier(node) && ts.isShorthandPropertyAssignment(node.parent) && node.parent.name === node) {
-      return applyTopLevelFallback(this.checker.getShorthandAssignmentValueSymbol(node.parent) ?? this.checker.getSymbolAtLocation(node));
+      return applyTopLevelFallback(this.checker.getShorthandAssignmentValueSymbol(node.parent));
     }
     return applyTopLevelFallback(this.checker.getSymbolAtLocation(node));
   }
@@ -2963,7 +3028,10 @@ class Exporter {
       return false;
     }
     const captures = this.capturedByFns.get(s) ?? [];
-    if (!isParam) {
+    if (isParam) {
+      // a closure in the default of an earlier parameter is created before this one is bound
+      for (const f of captures) if (!ts.isFunctionDeclaration(f as unknown as ts.Node) && (f as unknown as ts.Node).pos < d.end) return false;
+    } else {
       for (const f of captures) {
         const fn = f as unknown as ts.Node;
         if (ts.isFunctionDeclaration(fn)) {
@@ -5096,7 +5164,7 @@ class Exporter {
     const bound = this.optChainBound.get(node);
     if (bound !== undefined) return bound;
     this.noteMethodEscape(ctx, node);
-    if (ctx.cellAccess.has(this.lexicalHomeSym)) {
+    if (ctx.cellAccess.has(this.lexicalHomeSym) || this.isComputedSuper(node)) {
       const v = this.lowerObjectSuper(ctx, node);
       if (v !== undefined) return v;
     }
@@ -5364,20 +5432,29 @@ class Exporter {
             // path so symbol-keyed literals do not depend on checker-erased dynamic
             // key lowering.
             const symLocal = this.lowerExpr(ctx, nameExpr);
-            const v = this.lowerExpr(ctx, p.initializer);
+            const v = this.lowerNamedByKey(ctx, p.initializer, symLocal);
             ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "symbol.set", args: [dst, symLocal, v] });
           } else if (ts.isStringLiteral(nameExpr)) {
-            const v = this.lowerExpr(ctx, p.initializer);
+            const keyL = this.newLocal(ctx, "reference");
+            ctx.body.push({ kind: "Const", dst: keyL, value: { kind: "Str", value: nameExpr.text } });
+            const v = this.lowerNamedByKey(ctx, p.initializer, keyL);
             ctx.body.push({ kind: "StoreField", obj: dst, field: this.internField(nameExpr.text), src: v });
           } else if (ts.isNumericLiteral(nameExpr)) {
             // numeric computed key -> JS coerces to the string form of the number
-            const v = this.lowerExpr(ctx, p.initializer);
+            const keyL = this.newLocal(ctx, "reference");
+            ctx.body.push({ kind: "Const", dst: keyL, value: { kind: "Str", value: String(Number(nameExpr.text)) } });
+            const v = this.lowerNamedByKey(ctx, p.initializer, keyL);
             ctx.body.push({ kind: "StoreField", obj: dst, field: this.internField(String(Number(nameExpr.text))), src: v });
           } else {
             // dynamic key: evaluate key then store. ts_set_dyn applies runtime
-            // ToPropertyKey (string/number keys and symbols).
-            const key = this.lowerExpr(ctx, nameExpr);
-            const v = this.lowerExpr(ctx, p.initializer);
+            // ToPropertyKey (string/number keys and symbols); once, before the value, as the name takes it too.
+            const raw = this.lowerExpr(ctx, nameExpr);
+            let key = raw;
+            if (!(this.checker.getTypeAtLocation(nameExpr).flags & (ts.TypeFlags.StringLike | ts.TypeFlags.NumberLike)) || this.anonymousDefinition(p.initializer)) {
+              key = this.newLocal(ctx, "reference");
+              ctx.body.push({ kind: "CallBuiltinStatic", dst: key, builtin: "key.normalize", args: [raw] });
+            }
+            const v = this.lowerNamedByKey(ctx, p.initializer, key);
             ctx.body.push({ kind: "StoreFieldDynamic", obj: dst, key, src: v });
           }
         } else if (ts.isShorthandPropertyAssignment(p)) {
@@ -5521,6 +5598,9 @@ class Exporter {
       return this.lowerUnboundThis(ctx);
     }
     if (ts.isPropertyAccessExpression(node)) {
+      if (ts.isPrivateIdentifier(node.name) && node.expression.kind !== ts.SyntaxKind.SuperKeyword) {
+        return this.lowerPrivateRead(ctx, node, this.lowerExpr(ctx, node.expression));
+      }
       const enumValue = this.constEnumMemberValue(node);
       if (enumValue !== undefined) return this.lowerEnumConstant(ctx, enumValue, hint);
       // `re.lastIndex` on a receiver typed RegExp: the slot read (`regexp.getLastIndex`; the
@@ -7007,6 +7087,18 @@ class Exporter {
             callee = mv !== undefined ? { kind: "Value", local: mv } : { kind: "Direct", func };
             recv = ctx.thisLocal; // super call runs the parent method on the same `this`
           }
+        } else if (ts.isPrivateIdentifier(fn.name) && fn.expression.kind !== ts.SyntaxKind.SuperKeyword) {
+          recv = this.lowerExpr(ctx, fn.expression);
+          if (this.isMutableStorageLocal(ctx, recv) && node.arguments.some((a) => this.mayHaveSideEffect(a))) {
+            const s = this.newLocal(ctx, this.refKindOf(fn.expression));
+            ctx.body.push({ kind: "Copy", dst: s, src: recv });
+            recv = s;
+          }
+          const pm = this.privateMember(fn.name);
+          if (pm?.kind === "method" && !pm.isStatic && pm.method !== undefined) {
+            this.checkPrivate(ctx, fn.expression, recv, pm, fn.name.text);
+            callee = { kind: "Direct", func: pm.method };
+          } else callee = { kind: "Value", local: this.lowerPrivateRead(ctx, fn, recv) };
         } else {
           recv = this.lowerExpr(ctx, fn.expression);
           // sequence-point eval: if an argument may mutate the receiver variable,
@@ -7191,7 +7283,8 @@ class Exporter {
       if (ts.isPrivateIdentifier(node.left)) {
         const obj = this.lowerExpr(ctx, node.right);
         const dst = this.newLocal(ctx, "reference");
-        ctx.body.push({ kind: "HasField", dst, obj, field: this.internField(node.left.text) });
+        const m = this.privateMember(node.left);
+        ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: `private.has:${this.internField(m?.brand ?? node.left.text)}`, args: [obj] });
         return dst;
       }
       // "key" in obj : with a string-literal key we know the field id statically.
@@ -7345,13 +7438,16 @@ class Exporter {
             isCtorVal = hasHook(rt);
           }
         } catch { /* leave false */ }
-        if (isCtorVal) {
-          const obj = this.lowerExpr(ctx, node.left);
-          const ctor = this.lowerExpr(ctx, node.right);
-          ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "instanceof.dyn", args: [obj, ctor] });
-        } else {
-          this.unsupported(node, "instanceof with non-static right-hand class (runtime constructor value not yet modeled)");
+        // whatever the type says: the runtime's check of the value, a TypeError if it is not callable
+        void isCtorVal;
+        let obj = this.lowerExpr(ctx, node.left);
+        if (this.isMutableStorageLocal(ctx, obj) && this.mayHaveSideEffect(node.right)) {
+          const s = this.newLocal(ctx, "reference");
+          ctx.body.push({ kind: "Copy", dst: s, src: obj });
+          obj = s;
         }
+        const ctor = this.lowerExpr(ctx, node.right);
+        ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "instanceof.dyn", args: [obj, ctor] });
       }
       return dst;
     }
@@ -7420,13 +7516,7 @@ class Exporter {
         // may mutate them, JS captures the target before the RHS), read through
         // it, then write back through the SAME ref. Identifier / static field /
         // prototype targets have no double-eval hazard, so keep the simple path.
-        let useRef = ts.isElementAccessExpression(lhs);
-        if (ts.isPropertyAccessExpression(lhs) && this.isPlainFieldStoreTarget(lhs)) {
-          const gClass = this.classOfExpr(lhs.expression);
-          // a getter-backed property reads via a method call, not a field load;
-          // leave those to the simple path (accessor handling is a separate gap).
-          if (!(gClass !== undefined && this.hasGetter(gClass, lhs.name.text))) useRef = true;
-        }
+        const useRef = ts.isElementAccessExpression(lhs) || (ts.isPropertyAccessExpression(lhs) && this.isPlainFieldStoreTarget(lhs));
         if (useRef) {
           const pre = this.lowerAssignRefPre(ctx, lhs, this.mayHaveSideEffect(node.right));
           const cur = this.lowerReadFromRef(ctx, lhs, pre);
@@ -7451,13 +7541,17 @@ class Exporter {
          node.operatorToken.kind === ts.SyntaxKind.BarBarEqualsToken ||
          node.operatorToken.kind === ts.SyntaxKind.QuestionQuestionEqualsToken)) {
       const kind = node.operatorToken.kind;
-      const cur = this.lowerExpr(ctx, node.left);
+      // the target's reference is evaluated once, whatever is read and written through it
+      const target = this.unwrapAssignTarget(node.left);
+      const pre = ts.isElementAccessExpression(target) || (ts.isPropertyAccessExpression(target) && this.isPlainFieldStoreTarget(target))
+        ? this.lowerAssignRefPre(ctx, target, this.mayHaveSideEffect(node.right)) : undefined;
+      const cur = pre ? this.lowerReadFromRef(ctx, target, pre) : this.lowerExpr(ctx, node.left);
       const res = this.newLocal(ctx, this.refKindOf(node));
       ctx.body.push({ kind: "Copy", dst: res, src: cur });
       const assignBody = this.captureBody(ctx, () => {
         const rhs = this.lowerExpr(ctx, node.right);
         ctx.body.push({ kind: "Copy", dst: res, src: rhs });
-        this.lowerAssignTarget(ctx, node.left, rhs);
+        this.lowerAssignTarget(ctx, target, rhs, pre);
       });
       if (kind === ts.SyntaxKind.AmpersandAmpersandEqualsToken) {
         // a &&= b : assign b only if a is truthy
@@ -7755,8 +7849,15 @@ class Exporter {
     if (ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) {
       // (Constant `-0` — the literal and any constant arithmetic evaluating to -0 —
       // is folded to a NegZero const at the top of lowerExpr via constNumValue.)
-      const operand = this.lowerExpr(ctx, node.operand);
       const op = node.operator;
+      // `f().x++`, `a[i++]--`: the target's reference is evaluated once, for the read and the write
+      const update = op === ts.SyntaxKind.PlusPlusToken || op === ts.SyntaxKind.MinusMinusToken;
+      const updateTarget = update ? this.unwrapAssignTarget(node.operand) : undefined;
+      const updatePre = updateTarget && ((ts.isElementAccessExpression(updateTarget) &&
+          (this.mayHaveSideEffect(updateTarget.expression) || this.mayHaveSideEffect(updateTarget.argumentExpression))) ||
+        (ts.isPropertyAccessExpression(updateTarget) && this.isPlainFieldStoreTarget(updateTarget) && this.mayHaveSideEffect(updateTarget.expression)))
+        ? this.lowerAssignRefPre(ctx, updateTarget, false) : undefined;
+      const operand = updatePre ? this.lowerReadFromRef(ctx, updateTarget!, updatePre) : this.lowerExpr(ctx, node.operand);
       if (op === ts.SyntaxKind.PlusPlusToken || op === ts.SyntaxKind.MinusMinusToken) {
         // ++/-- always operate numerically: oldValue = ToNumber(operand),
         // newValue = oldValue +/- 1. The postfix value is the *number* oldValue
@@ -7781,7 +7882,7 @@ class Exporter {
         ctx.body.push({ kind: "Const", dst: one, value: { kind: "Num", value: 1 } });
         const res = this.newLocal(ctx, "primitive");
         ctx.body.push({ kind: "BinOp", dst: res, op: op === ts.SyntaxKind.PlusPlusToken ? "+" : "-", lhs: base, rhs: one });
-        this.lowerAssignTarget(ctx, node.operand, res);
+        this.lowerAssignTarget(ctx, updateTarget ?? node.operand, res, updatePre);
         return isPostfix ? old : res;
       }
       if (op === ts.SyntaxKind.MinusToken) {
@@ -8101,7 +8202,13 @@ class Exporter {
       ctx.body.push({ kind: "Const", dst, value: { kind: "Undef" } });
       return dst;
     }
-    if (this.isLexicalTdzUse(node, sym) || this.isCyclicCrossModuleTdzUse(node, sym)) {
+    if (this.isLexicalTdzUse(node, sym)) {
+      ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: `throw.uninitialized:${node.text}`, args: [] });
+      const dst = this.newLocal(ctx, "reference");
+      ctx.body.push({ kind: "Const", dst, value: { kind: "Undef" } });
+      return dst;
+    }
+    if (this.isCyclicCrossModuleTdzUse(node, sym)) {
       this.unsupported(node, `TDZ read of '${node.text}' before initialization`);
       const dst = this.newLocal(ctx, "reference");
       ctx.body.push({ kind: "Const", dst, value: { kind: "Undef" } });
@@ -8242,7 +8349,7 @@ class Exporter {
     const cid = this.classIdByNode.get(node);
     if (cid === undefined) {
       const base = dynamicBaseEmptyClass(node, this.checker);
-      if (base) return this.lowerDynamicDerivedClass(ctx, base, node.name?.text ?? hint ?? "");
+      if (base) return this.lowerDynamicDerivedClass(ctx, base, node.name?.text ?? this.namedEvaluationName(node) ?? "");
       this.unsupported(node, "class expression (no resolved class id)");
       return this.newLocal(ctx, "reference", hint);
     }
@@ -8251,13 +8358,13 @@ class Exporter {
       this.unsupported(node, "class expression with a dynamic (mixin) base class");
       return this.newLocal(ctx, "reference", hint);
     }
-    if (!node.name) this.classInferredName.set(cid, hint ?? "");
+    if (!node.name) this.classInferredName.set(cid, this.namedEvaluationName(node) ?? "");
     const cv = this.emitClassValue(ctx, cid, node.name?.text ?? hint ?? "class", node, false);
     if (cv === undefined) {
       this.unsupported(node, "class expression value (unconstructible)");
       return this.newLocal(ctx, "reference", hint);
     }
-    this.emitComputedClassMembers(ctx, cid);
+    this.emitComputedClassMembers(ctx, cid, cv.classValue ? cv.local : undefined);
     if (node.name) ctx.body.push({ kind: "StoreGlobal", gref: this.classExprNameGlobal(cid), src: cv.local });
     // Run __static_init (if any) at the expression's evaluation position, then link
     // the static container — same order as the declaration form.
@@ -9891,6 +9998,12 @@ class Exporter {
     ctx.cellAccess.delete(this.lexicalThisSym);
     ctx.thisCellOfBody?.delete(ctx.body);
     try {
+      const brand = privateBrand(cnode);
+      if (brand !== undefined) {
+        const yes = this.newLocal(ctx, "reference");
+        ctx.body.push({ kind: "Const", dst: yes, value: { kind: "Bool", value: true } });
+        ctx.body.push({ kind: "StoreField", obj: dst, field: this.internField(brand), src: yes });
+      }
       for (const m of cnode.members) {
         if (this.isStaticMember(m)) continue;         // static: handled in __static_init
         // `declare [key]: T` / `declare x: T`: ambient, no runtime property.
@@ -9901,7 +10014,7 @@ class Exporter {
           const key = this.newLocal(ctx, "reference");
           ctx.body.push({ kind: "LoadGlobal", dst: key, gref: this.computedKeyGlobal(m) });
           let v: number;
-          if (m.initializer) v = this.lowerExpr(ctx, m.initializer);
+          if (m.initializer) v = this.lowerNamedByKey(ctx, m.initializer, key);
           else { v = this.newLocal(ctx, "reference"); ctx.body.push({ kind: "Const", dst: v, value: { kind: "Undef" } }); }
           ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "object.defineData:1:1:1", args: [dst, key, v] });
           continue;
@@ -10113,11 +10226,13 @@ class Exporter {
    *  instance field's key waits for its initializers in a global. Such a class is one class for all its
    *  evaluations, so a method that captures a function's local stays a loud reject. Static members with
    *  computed names run in __static_init right after. */
-  private emitComputedClassMembers(ctx: FnCtx, classId: number): void {
+  private emitComputedClassMembers(ctx: FnCtx, classId: number, classValue?: number): void {
     const cnode = this.classNodeOfId.get(classId);
     if (!cnode) return;
     const members = cnode.members.filter((m) => this.isDynComputedMember(m));
     if (members.length === 0) return;
+    // a class evaluated more than once has a prototype per evaluation: its members can capture
+    const perEvaluation = classValue !== undefined && !this.sharedClassProto(classId);
     let proto = -1;
     for (const m of members) {
       if (ts.isPropertyDeclaration(m) && ts.getModifiers(m)?.some((mod) => mod.kind === ts.SyntaxKind.DeclareKeyword)) continue;
@@ -10132,10 +10247,13 @@ class Exporter {
         continue;
       }
       if (proto < 0) {
-        proto = this.newLocal(ctx, "reference", "proto");
-        ctx.body.push({ kind: "CallBuiltinStatic", dst: proto, builtin: `class.proto:${classId}`, args: [] });
+        if (perEvaluation) proto = this.loadClassValuePrototype(ctx, classValue!);
+        else {
+          proto = this.newLocal(ctx, "reference", "proto");
+          ctx.body.push({ kind: "CallBuiltinStatic", dst: proto, builtin: `class.proto:${classId}`, args: [] });
+        }
       }
-      if (this.anyFunctionLocalCapture(this.freeVars(m as unknown as FnLike))) {
+      if (!perEvaluation && this.anyFunctionLocalCapture(this.freeVars(m as unknown as FnLike))) {
         this.unsupported(m, "class member with a computed name that captures an enclosing function's local");
         continue;
       }
@@ -10697,16 +10815,30 @@ class Exporter {
     // in the ctor body (see lowerFunctionLike 3b). When a class has field
     // initializers but no explicit ctor, a synthetic ctor is created so they run.
     const cfunc = classId !== undefined ? this.methodFunc.get(`${classId}:ctor`) : undefined;
-    if (classId === undefined && ts.isIdentifier(node.expression) && (node.arguments ?? []).some((a) => ts.isSpreadElement(a)) &&
-        this.isAmbientGlobalSymbol(this.symbolOf(node.expression))) {
+    const ambientCallee = ts.isIdentifier(node.expression) && this.isAmbientGlobalSymbol(this.symbolOf(node.expression));
+    // any other callee is a value: read before the arguments, tested by the runtime after them
+    let valueCallee: number | undefined;
+    if (classId === undefined && !ambientCallee && !(ts.isIdentifier(node.expression) && calleeName === "Function")) {
+      valueCallee = this.lowerExpr(ctx, node.expression);
+      if (this.isMutableStorageLocal(ctx, valueCallee)) {
+        const s = this.newLocal(ctx, "reference");
+        ctx.body.push({ kind: "Copy", dst: s, src: valueCallee });
+        valueCallee = s;
+      }
+    }
+    if (classId === undefined && (node.arguments ?? []).some((a) => ts.isSpreadElement(a)) && (ambientCallee || valueCallee !== undefined)) {
       // `new X(...spread)` of a constructor the environment declares but the runtime lacks (hono's
       // client: `new WebSocket(...args)`): the global object's value constructed dynamically over
       // an argument array, as the positional form below is; a ReferenceError where it is reached
-      const g = this.newLocal(ctx, "reference");
-      ctx.body.push({ kind: "LoadBuiltinFn", dst: g, builtin: "globalThis" });
-      const callee = this.newLocal(ctx, "reference", calleeName);
-      ctx.body.push({ kind: "LoadField", dst: callee, obj: g, field: this.internField(calleeName) });
-      ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: `global.check:${calleeName}`, args: [callee] });
+      let callee: number;
+      if (valueCallee !== undefined) callee = valueCallee;
+      else {
+        const g = this.newLocal(ctx, "reference");
+        ctx.body.push({ kind: "LoadBuiltinFn", dst: g, builtin: "globalThis" });
+        callee = this.newLocal(ctx, "reference", calleeName);
+        ctx.body.push({ kind: "LoadField", dst: callee, obj: g, field: this.internField(calleeName) });
+        ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: `global.check:${calleeName}`, args: [callee] });
+      }
       const arrSite = this.site++;
       this.recordSite(arrSite, "array", this.inLoop(node) ? "many" : "once", false, node);
       const arrL = this.newLocal(ctx, "reference");
@@ -10759,16 +10891,14 @@ class Exporter {
       ctx.body.push({ kind: "LoadField", dst: callee, obj: g, field: this.internField(calleeName) });
       ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: `global.check:${calleeName}`, args: [callee] });
       this.emitNewMaybeGuarded(ctx, node, dst, callee, args);
+    } else if (valueCallee !== undefined) {
+      // `new x()` of a value (an `any`, a variable holding a constructor): the runtime constructs it, a
+      // TypeError if it cannot. The static type has settled nothing here, so this is the general form.
+      this.emitNewMaybeGuarded(ctx, node, dst, valueCallee, args);
     } else {
-      // `new X()` where X is an identifier that does NOT resolve to a known user
-      // class and is not a supported built-in (Array/Map/Set/Date/Error...). The
-      // common cases are a class VALUE held in a variable (`const K = C; new K()`
-      // — a class can't carry a captured environment as a runtime value here) and
-      // an unsupported built-in constructor (`new Promise(...)`, `new RegExp(...)`,
-      // ...). Previously this silently produced an empty object (ctor + field
-      // initializers skipped). Loud-reject instead of miscompiling.
+      // Loud-reject instead of miscompiling: no callee was resolved at all.
       for (const a of args) void a;
-      this.unsupported(node, `new ${calleeName}(...) where ${calleeName} is not a statically-known class or a supported built-in (instantiating a class value held in a variable, or an unsupported built-in constructor, is not supported)`);
+      this.unsupported(node, `new ${calleeName}(...) where ${calleeName} is not a statically-known class or a supported built-in`);
     }
     return dst;
   }
@@ -11099,11 +11229,11 @@ class Exporter {
       }
     }
     const isAccessor = getProp !== undefined || setProp !== undefined;
-    if (isAccessor && valueProp !== undefined) {
-      this.unsupported(node, "Object.defineProperty descriptor with both value and get/set");
-      return;
-    }
-    if (attrNonLiteral) {
+    // the sides the static form lifts; a side that is any other expression (`set: undefined`, a variable),
+    // or both a value and an accessor (a TypeError), is the runtime's descriptor to read
+    const literalSide = (p: ts.ObjectLiteralElementLike | undefined): boolean => p === undefined || ts.isMethodDeclaration(p) ||
+      (ts.isPropertyAssignment(p) && (ts.isArrowFunction(p.initializer) || ts.isFunctionExpression(p.initializer)));
+    if (attrNonLiteral || (isAccessor && valueProp !== undefined) || !literalSide(getProp) || !literalSide(setProp)) {
       // An attribute value isn't a boolean literal (e.g. `{ value: 1, writable: w }`).
       // We can't read it statically, so lower the descriptor object as a normal
       // expression and dispatch to the runtime descriptor-inspection path.
@@ -11892,17 +12022,10 @@ class Exporter {
   /** Returns a local holding `value` unless it is undefined, in which case the
    *  default expression `def` is evaluated and used (JS destructuring default
    *  applies only on undefined, not null). */
-  applyDefault(ctx: FnCtx, value: number, def: ts.Expression, target?: ts.Node): number {
+  applyDefault(ctx: FnCtx, value: number, def: ts.Expression): number {
     const res = this.newLocal(ctx, "reference");
     ctx.body.push({ kind: "Copy", dst: res, src: value });
-    const isUndef = this.newLocal(ctx, "primitive");
-    ctx.body.push({ kind: "UnOp", dst: isUndef, op: "isundef", operand: value });
-    const body = this.captureBody(ctx, () => {
-      // an anonymous function or class takes the binding's name
-      const d = this.lowerExpr(ctx, def, target && ts.isIdentifier(target) ? target.text : undefined);
-      ctx.body.push({ kind: "Copy", dst: res, src: d });
-    });
-    ctx.body.push({ kind: "If", cond: isUndef, thenBody: body, elseBody: [] });
+    this.lowerPatternDefault(ctx, res, def);
     return res;
   }
 
@@ -11914,6 +12037,7 @@ class Exporter {
    *  by the protocol over the value (`valueIterDriver`). undefined for an array or
    *  a tuple: read by index. */
   private iterablePatternSource(ctx: FnCtx, init: ts.Expression, count: number | undefined): { array: number; source: number } | { drv: IterDriver } | undefined {
+    if (this.arrayIteratorNamed && this.forOfDynamicEnabled) return { drv: this.valueIterDriver(ctx, this.lowerExpr(ctx, init), count) };
     const rk = this.builtinReceiverKind(init);
     if (rk === "array") return undefined;
     let t: ts.Type;
@@ -11933,7 +12057,9 @@ class Exporter {
       return { array, source: recv };
     }
     const drv = this.resolveIterator(ctx, init);
-    return drv === undefined ? undefined : { drv };
+    if (drv !== undefined) return { drv };
+    // no iterator in the type (`{}`, a record): GetIterator on the value decides
+    return this.forOfDynamicEnabled ? { drv: this.valueIterDriver(ctx, this.lowerExpr(ctx, init), count) } : undefined;
   }
   /** The elements of an assignment pattern as the protocol binder takes them. */
   private assignPatternElements(ctx: FnCtx, lhs: ts.ArrayLiteralExpression): IterPatternElement[] {
@@ -11953,15 +12079,7 @@ class Exporter {
         pre: byRef ? () => { ref = this.lowerAssignRefPre(ctx, unwrapped, true); } : undefined,
         bind: (v: number) => {
           if (ts.isOmittedExpression(el)) return;
-          if (defaulted) {
-            const isUndef = this.newLocal(ctx, "primitive");
-            ctx.body.push({ kind: "UnOp", dst: isUndef, op: "isundef", operand: v });
-            const thenB = this.captureBody(ctx, () => {
-              const dv = this.lowerExpr(ctx, defaulted.right, ts.isIdentifier(unwrapped) ? unwrapped.text : undefined);
-              ctx.body.push({ kind: "Copy", dst: v, src: dv });
-            });
-            ctx.body.push({ kind: "If", cond: isUndef, thenBody: thenB, elseBody: [] });
-          }
+          this.lowerPatternDefault(ctx, v, defaulted?.right);
           this.lowerAssignTarget(ctx, unwrapped, v, ref);
         },
       };
@@ -11981,7 +12099,7 @@ class Exporter {
       risky: !ts.isOmittedExpression(el) && (!ts.isIdentifier(el.name) || (el.initializer !== undefined && !this.isInertDefault(el.initializer))),
       bind: (v: number) => {
         if (ts.isOmittedExpression(el)) return;
-        this.lowerBindingPattern(ctx, el.name, el.initializer ? this.applyDefault(ctx, v, el.initializer, el.name) : v);
+        this.lowerBindingPattern(ctx, el.name, el.initializer ? this.applyDefault(ctx, v, el.initializer) : v);
       },
     }));
   }
@@ -11994,8 +12112,21 @@ class Exporter {
     if (!this.forOfDynamicEnabled) return undefined;
     let t: ts.Type;
     try { t = this.checker.getTypeAtLocation(pat); } catch { return undefined; }
-    if (this.isArrayLikeUnion(t)) return undefined;
+    if (this.isArrayLikeUnion(t) && !this.patternTypeIsImplied(pat)) return undefined;
     return this.valueIterDriver(ctx, src, this.bindingPatternCount(pat));
+  }
+  /** The tuple the checker gives `function f([a, b])` comes from the pattern itself, not from what is passed:
+   *  no annotation, no default, no contextual signature. Such a parameter takes any iterable. */
+  private patternTypeIsImplied(pat: ts.BindingPattern): boolean {
+    if (this.untyped) return true;
+    let n: ts.Node = pat;
+    while (ts.isBindingElement(n.parent) || ts.isArrayBindingPattern(n.parent) || ts.isObjectBindingPattern(n.parent)) n = n.parent;
+    const root = n.parent;
+    if (!ts.isParameter(root) || root.type || root.initializer) return false;
+    const fn = root.parent;
+    if (!ts.isArrowFunction(fn) && !ts.isFunctionExpression(fn)) return true;
+    const contextual = this.checker.getContextualType(fn);
+    return contextual === undefined || this.checker.getSignaturesOfType(contextual, ts.SignatureKind.Call).length === 0;
   }
   /** How many elements a pattern takes; undefined with a rest element, which takes them all. */
   private bindingPatternCount(pat: ts.ArrayBindingPattern): number | undefined {
@@ -12003,6 +12134,7 @@ class Exporter {
   }
   /** An array or a tuple, or a union of them: an array pattern reads such a value by index. */
   private isArrayLikeUnion(t: ts.Type): boolean {
+    if (this.arrayIteratorNamed) return false;
     const arrayLike = (ty: ts.Type): boolean => this.checker.isArrayLikeType(ty) && !(ty.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown));
     return arrayLike(t) || (t.isUnion() && t.types.every(arrayLike));
   }
@@ -12211,35 +12343,25 @@ class Exporter {
       return;
     }
     if (ts.isObjectBindingPattern(pat)) {
-      const boundKeys: string[] = [];
-      // `const {} = null` reads nothing and still throws
-      if (pat.elements.length === 0) ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "object.coercible", args: [src] });
+      const boundKeys: PatternKey[] = [];
+      // the value must be coercible first: `const {} = null` reads nothing and still throws, a rest reads
+      // nothing that would, a computed key runs after the test
+      const head = pat.elements[0];
+      if (!head || head.dotDotDotToken || (head.propertyName && ts.isComputedPropertyName(head.propertyName)))
+        ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "object.coercible", args: [src] });
       for (const el of pat.elements) {
         this.noteMethodEscape(ctx, el);
         if (el.dotDotDotToken) {
           // rest: {a, ...others} -> others = copy of src minus already-bound keys.
-          const restObj = this.newLocal(ctx, "reference");
-          ctx.body.push({ kind: "ObjectRest", dst: restObj, src, exclude: boundKeys.map((k) => this.internField(k)) });
-          this.lowerBindingPattern(ctx, el.name, restObj);
+          this.lowerBindingPattern(ctx, el.name, this.objectRestOf(ctx, src, boundKeys));
           continue;
         }
-        const propVal = this.newLocal(ctx, "reference");
-        if (el.propertyName && ts.isComputedPropertyName(el.propertyName)) {
-          // `{[k]: name}` — evaluate the key and read dynamically (the property is
-          // determined at runtime; handles object and array, string and numeric
-          // keys). NOTE: a runtime key can't be statically excluded from a rest.
-          const keyL = this.lowerExpr(ctx, el.propertyName.expression);
-          ctx.body.push({ kind: "LoadFieldDynamic", dst: propVal, obj: src, key: keyL });
-        } else {
-          // `{prop: name}` / `{"prop": name}` / `{0: name}` / shorthand `{name}`.
-          const propName = el.propertyName
-            ? ((ts.isIdentifier(el.propertyName) || ts.isStringLiteral(el.propertyName) || ts.isNumericLiteral(el.propertyName)) ? el.propertyName.text : undefined)
-            : (ts.isIdentifier(el.name) ? el.name.text : undefined);
-          if (propName === undefined) { this.unsupported(el, "unsupported property name in destructuring"); continue; }
-          boundKeys.push(propName);
-          ctx.body.push({ kind: "LoadField", dst: propVal, obj: src, field: this.internField(propName) });
-        }
-        const bound = el.initializer ? this.applyDefault(ctx, propVal, el.initializer, el.name) : propVal;
+        // `{prop: name}` / `{"prop": name}` / `{0: name}` / `{[k]: name}` / shorthand `{name}`.
+        const key = el.propertyName ? this.patternKey(ctx, el.propertyName) : ts.isIdentifier(el.name) ? { field: el.name.text } : undefined;
+        if (key === undefined) { this.unsupported(el, "unsupported property name in destructuring"); continue; }
+        boundKeys.push(key);
+        const propVal = this.loadPatternKey(ctx, src, key);
+        const bound = el.initializer ? this.applyDefault(ctx, propVal, el.initializer) : propVal;
         this.lowerBindingPattern(ctx, el.name, bound);
       }
       return;
@@ -13526,6 +13648,7 @@ class Exporter {
     // `super.x` has no runtime base value to pre-evaluate; route it to the simple
     // assignment path (lowerAssignTarget handles super), not the obj/key pre-eval one.
     if (lhs.expression.kind === ts.SyntaxKind.SuperKeyword) return false;
+    if (ts.isPrivateIdentifier(lhs.name)) return true;
     if (ts.isIdentifier(lhs.expression)) {
       const csym = this.symbolOf(lhs.expression);
       const cid = csym ? this.classSymToId.get(csym) : undefined;
@@ -13534,8 +13657,6 @@ class Exporter {
     let inner: ts.Expression = lhs.expression;
     while (ts.isParenthesizedExpression(inner) || ts.isAsExpression(inner) || ts.isNonNullExpression(inner)) inner = inner.expression;
     if (ts.isPropertyAccessExpression(inner) && inner.name.text === "prototype" && this.classIdOfIdentifier(inner.expression) !== undefined) return false;
-    const sClass = this.classOfExpr(lhs.expression);
-    if (sClass !== undefined && this.hasSetter(sClass, lhs.name.text)) return false;
     return true;
   }
 
@@ -13557,6 +13678,7 @@ class Exporter {
     }
     // element access: object then key (JS order), each snapshotted if needed
     const ea = lhs as ts.ElementAccessExpression;
+    if (ea.expression.kind === ts.SyntaxKind.SuperKeyword) return { key: snap(this.lowerExpr(ctx, ea.argumentExpression), ea.argumentExpression) };
     const obj = snap(this.lowerExpr(ctx, ea.expression), ea.expression);
     const key = snap(this.lowerExpr(ctx, ea.argumentExpression), ea.argumentExpression);
     return { obj, key };
@@ -13569,12 +13691,26 @@ class Exporter {
    *  via the snapshotted reference. Only for element access and plain-field
    *  property access (the same targets lowerAssignTarget's `pre` path handles). */
   lowerReadFromRef(ctx: FnCtx, lhs: ts.Expression, pre: { obj?: number; key?: number }): number {
+    if (ts.isPropertyAccessExpression(lhs) && ts.isPrivateIdentifier(lhs.name) && !this.readingPrivateField) return this.lowerPrivateRead(ctx, lhs, pre.obj!);
     const dst = this.newLocal(ctx, this.refKindOf(lhs));
     if (ts.isPropertyAccessExpression(lhs)) {
+      const getter = this.classOfExpr(lhs.expression);
+      if (getter !== undefined && this.hasGetter(getter, lhs.name.text)) {
+        ctx.body.push({ kind: "Call", dst, recv: pre.obj!, args: [],
+          callee: { kind: "Method", recvClass: getter, method: this.internName(`get ${lhs.name.text}`),
+                    recvStable: this.classExtractor.recvStableAt(lhs.expression) } });
+        return dst;
+      }
       ctx.body.push(this.withClassHint(this.withSlots({ kind: "LoadField", dst, obj: pre.obj!, field: this.internField(lhs.name.text) }, this.staticSlotHint(lhs.expression, lhs.name.text)), lhs.expression));
       return dst;
     }
     const lea = lhs as ts.ElementAccessExpression;
+    if (lea.expression.kind === ts.SyntaxKind.SuperKeyword) {
+      const proto = this.superBase(ctx);
+      if (proto === undefined || ctx.thisLocal === undefined) { this.unsupported(lhs, "super outside a method"); return dst; }
+      ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "reflect.get", args: [proto, pre.key!, ctx.thisLocal] });
+      return dst;
+    }
     if (this.isSymbolKeyExpr(lea.argumentExpression)) {
       ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "symbol.get", args: [pre.obj!, pre.key!] });
       return dst;
@@ -13592,6 +13728,10 @@ class Exporter {
     // reference. (A wrapped target used to fall through every branch below and
     // drop the store silently; the final branch now rejects loudly.)
     lhs = this.unwrapAssignTarget(lhs);
+    if (ts.isPropertyAccessExpression(lhs) && ts.isPrivateIdentifier(lhs.name) && lhs.expression.kind !== ts.SyntaxKind.SuperKeyword) {
+      this.lowerPrivateWrite(ctx, lhs, pre?.obj ?? this.lowerExpr(ctx, lhs.expression), rhs);
+      return;
+    }
     if (ts.isIdentifier(lhs)) {
       const sym = this.symbolOf(lhs);
       const namespace = sym && this.namespaceBindings.get(sym);
@@ -13604,6 +13744,24 @@ class Exporter {
       if (declaration && ts.isFunctionExpression(declaration) && declaration.name &&
           this.symbolOf(declaration.name) === sym) {
         this.emitThrowTypeError(ctx, lhs, "Assignment to constant variable.");
+        return;
+      }
+      // a name no scope declares: strict code's ReferenceError, unless the global object has it by then
+      if (sym === undefined) {
+        ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: `global.assignRef:${lhs.text}`, args: [rhs] });
+        return;
+      }
+      // a class's own name inside its body is an immutable binding
+      if (declaration && ts.isClassLike(declaration)) {
+        for (let n: ts.Node | undefined = lhs.parent; n && !ts.isSourceFile(n); n = n.parent) {
+          if (n === declaration) { this.emitThrowTypeError(ctx, lhs, "Assignment to constant variable."); return; }
+        }
+      }
+      // a `const`: the checker refuses it in a typed program; a TypeError where the program is not checked
+      if (declaration && (ts.isVariableDeclaration(declaration) || ts.isBindingElement(declaration)) &&
+          (ts.getCombinedNodeFlags(declaration) & ts.NodeFlags.BlockScoped) === ts.NodeFlags.Const) {
+        if (this.isLexicalTdzUse(lhs, sym)) ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: `throw.uninitialized:${lhs.text}`, args: [] });
+        else this.emitThrowTypeError(ctx, lhs, "Assignment to constant variable.");
         return;
       }
       if (sym && this.funcSymbols.has(sym) && !this.isScriptGlobalVarSymbol(sym, lhs.text)) {
@@ -13624,7 +13782,7 @@ class Exporter {
         ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"),
           builtin: `global.assignRef:${lhs.text}`, args: [rhs] });
       } else if (this.isLexicalTdzUse(lhs, sym)) {
-        this.unsupported(lhs, `TDZ write of '${lhs.text}' before initialization`);
+        ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: `throw.uninitialized:${lhs.text}`, args: [] });
       } else if (sym && this.hasCaptured(ctx, sym)) {
         this.storeCaptured(ctx, sym, rhs);
       } else if (sym && this.moduleCellGlobal.has(sym)) {
@@ -13764,7 +13922,7 @@ class Exporter {
       // setter: obj.x = v where x is an accessor -> a method call passing v
       const sClass = this.classOfExpr(lhs.expression);
       if (sClass !== undefined && this.hasSetter(sClass, lhs.name.text)) {
-        const recv = this.lowerExpr(ctx, lhs.expression);
+        const recv = pre?.obj ?? this.lowerExpr(ctx, lhs.expression);
         ctx.body.push({
           kind: "Call", recv, args: [rhs],
           callee: { kind: "Method", recvClass: sClass, method: this.internName(`set ${lhs.name.text}`),
@@ -13774,6 +13932,12 @@ class Exporter {
       }
       const base = pre?.obj ?? this.lowerExpr(ctx, lhs.expression);
       ctx.body.push(this.withClassHint(this.withSlots({ kind: "StoreField", obj: base, field: this.internField(lhs.name.text), src: rhs }, this.staticSlotHint(lhs.expression, lhs.name.text)), lhs.expression));
+    } else if (ts.isElementAccessExpression(lhs) && lhs.expression.kind === ts.SyntaxKind.SuperKeyword) {
+      // `super[k] = v`: the write starts at the home object's prototype, the receiver is `this`
+      const proto = this.superBase(ctx);
+      if (proto === undefined || ctx.thisLocal === undefined) { this.unsupported(lhs, "super outside a method"); return; }
+      ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "reflect.set",
+        args: [proto, pre?.key ?? this.lowerExpr(ctx, lhs.argumentExpression), rhs, ctx.thisLocal] });
     } else if (ts.isElementAccessExpression(lhs)) {
       // obj[symbolKey] = v — symbol-keyed property write (user OR well-known).
       if (this.isSymbolKeyExpr(lhs.argumentExpression)) {
@@ -13799,45 +13963,174 @@ class Exporter {
       const count = lhs.elements.some(ts.isSpreadElement) ? undefined : lhs.elements.length;
       this.lowerArrayPatternByProtocol(ctx, this.valueIterDriver(ctx, rhs, count), this.assignPatternElements(ctx, lhs));
     } else if (ts.isObjectLiteralExpression(lhs)) {
-      // destructuring ASSIGNMENT target: ({a, b: alias} = rhsObj).
-      for (const p of lhs.properties) {
-        if (ts.isShorthandPropertyAssignment(p)) {
-          const valL = this.newLocal(ctx, "reference");
-          ctx.body.push({ kind: "LoadField", dst: valL, obj: rhs, field: this.internField(p.name.text) });
-          // shorthand default: ({a = 1} = obj)
-          if (p.objectAssignmentInitializer) {
-            const isUndef = this.newLocal(ctx, "primitive");
-            ctx.body.push({ kind: "UnOp", dst: isUndef, op: "isundef", operand: valL });
-            const thenB = this.captureBody(ctx, () => {
-              const dv = this.lowerExpr(ctx, p.objectAssignmentInitializer!);
-              ctx.body.push({ kind: "Copy", dst: valL, src: dv });
-            });
-            ctx.body.push({ kind: "If", cond: isUndef, thenBody: thenB, elseBody: [] });
-          }
-          // The shorthand target is the VARIABLE, not the property: getSymbolAt-
-          // Location(p.name) yields the property symbol, so resolve the value
-          // symbol explicitly and store into its existing local.
-          const vsym = this.checker.getShorthandAssignmentValueSymbol(p) ?? this.symbolOf(p.name);
-          if (vsym && this.hasCaptured(ctx, vsym)) {
-            this.storeCaptured(ctx, vsym, valL);
-          } else if (vsym && this.moduleCellGlobal.has(vsym)) {
-            const ref = this.moduleCapturedRef(ctx, vsym)!;
-            ctx.body.push({ kind: "StoreField", obj: ref.obj, field: ref.field, src: valL, ...(ref.cls ? { cls: ref.cls } : {}) });
-          } else if (vsym) {
-            const lid = this.ensureLocal(ctx, vsym, this.refKindOf(p.name), p.name.text);
-            ctx.body.push({ kind: "Copy", dst: lid, src: valL });
-          }
-        } else if (ts.isPropertyAssignment(p) && ts.isIdentifier(p.name)) {
-          const valL = this.newLocal(ctx, "reference");
-          ctx.body.push({ kind: "LoadField", dst: valL, obj: rhs, field: this.internField(p.name.text) });
-          this.lowerAssignTarget(ctx, p.initializer, valL);
-        } else {
-          this.unsupported(p, "object destructuring assignment property form");
-        }
-      }
+      this.lowerAssignObjectPattern(ctx, lhs, rhs);
     } else {
       this.unsupported(lhs, `assignment target of kind ${ts.SyntaxKind[lhs.kind]}`);
     }
+  }
+  /** The class member a private name resolves to (the names are unique: private_names.ts). */
+  private privateMember(id: ts.PrivateIdentifier): PrivateMember | undefined {
+    if (!this.privateMembers) {
+      const out = new Map<string, PrivateMember>();
+      for (const [classId, cn] of this.classNodeOfId) {
+        const brand = privateBrand(cn);
+        for (const m of cn.members) {
+          const nm = (m as { name?: ts.PropertyName }).name;
+          if (!nm || !ts.isPrivateIdentifier(nm)) continue;
+          const isStatic = this.isStaticMember(m);
+          const kind = ts.isPropertyDeclaration(m) ? "field" : ts.isMethodDeclaration(m) ? "method" : "accessor";
+          const e: PrivateMember = out.get(nm.text) ?? { classId, kind, isStatic };
+          const key = isStatic ? `${classId}:static:${nm.text}` : undefined;
+          if (ts.isMethodDeclaration(m)) e.method = key ? this.staticMethodFunc.get(key) : this.methodFunc.get(`${classId}:method:${nm.text}`);
+          else if (ts.isGetAccessorDeclaration(m)) e.getter = key ? this.staticGetterFunc.get(key) : this.methodFunc.get(`${classId}:getter:${nm.text}`);
+          else if (ts.isSetAccessorDeclaration(m)) e.setter = key ? this.staticSetterFunc.get(key) : this.methodFunc.get(`${classId}:setter:${nm.text}`);
+          if (kind !== "field" && !isStatic) e.brand = brand;
+          out.set(nm.text, e);
+        }
+      }
+      this.privateMembers = out;
+    }
+    return this.privateMembers.get(id.text);
+  }
+  /** Is `recv` known to carry the member, so an access needs no test? A receiver typed as the class is
+   *  trusted as every typed access is; `this` in the class's own code too, unless the program has foreign
+   *  receivers at all (closedReceivers). */
+  private privateReceiverProven(recv: ts.Expression, m: PrivateMember): boolean {
+    if (m.isStatic) return false;
+    let cur = this.classOfExpr(recv);
+    if (cur === undefined) return false;
+    while (cur !== undefined && cur !== m.classId) cur = this.parentIdOf(cur);
+    if (cur === undefined) return false;
+    let r = recv;
+    while (ts.isParenthesizedExpression(r)) r = r.expression;
+    return r.kind === ts.SyntaxKind.ThisKeyword ? this.closedReceivers.closed : !this.untyped && this.classExtractor.recvStableAt(recv);
+  }
+  /** The private name's element must be `recv`'s own: a field's slot, a static member, the class's brand. */
+  private checkPrivate(ctx: FnCtx, recvExpr: ts.Expression, recv: number, m: PrivateMember, text: string): void {
+    if (this.privateReceiverProven(recvExpr, m)) return;
+    ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: `private.check:${this.internField(m.brand ?? text)}`, args: [recv] });
+  }
+  private lowerPrivateRead(ctx: FnCtx, access: ts.PropertyAccessExpression, recv: number): number {
+    const text = access.name.text;
+    const m = this.privateMember(access.name as ts.PrivateIdentifier);
+    const field = (): number => {
+      this.readingPrivateField = true;
+      const v = this.lowerReadFromRef(ctx, access, { obj: recv });
+      this.readingPrivateField = false;
+      return v;
+    };
+    if (m === undefined) return field();
+    this.checkPrivate(ctx, access.expression, recv, m, text);
+    if (m.kind === "accessor" && m.getter === undefined) {
+      this.emitThrowTypeError(ctx, access, `'${privateDisplayName(text)}' was defined without a getter`);
+      const u = this.newLocal(ctx, "reference");
+      ctx.body.push({ kind: "Const", dst: u, value: { kind: "Undef" } });
+      return u;
+    }
+    if (m.kind === "accessor" && !m.isStatic) {
+      const dst = this.newLocal(ctx, this.refKindOf(access));
+      ctx.body.push({ kind: "Call", dst, recv, callee: { kind: "Direct", func: m.getter! }, args: [] });
+      return dst;
+    }
+    if (m.kind === "method" && !m.isStatic) {
+      const proto = this.newLocal(ctx, "reference", "proto");
+      ctx.body.push({ kind: "CallBuiltinStatic", dst: proto, builtin: `class.proto:${m.classId}`, args: [] });
+      const dst = this.newLocal(ctx, "reference");
+      ctx.body.push({ kind: "LoadMethodValue", dst, recv: proto, method: this.internName(text) });
+      return dst;
+    }
+    return field();
+  }
+  private lowerPrivateWrite(ctx: FnCtx, access: ts.PropertyAccessExpression, recv: number, rhs: number): void {
+    const text = access.name.text;
+    const m = this.privateMember(access.name as ts.PrivateIdentifier);
+    if (m !== undefined) {
+      this.checkPrivate(ctx, access.expression, recv, m, text);
+      if (m.kind === "method") { this.emitThrowTypeError(ctx, access, `Private method '${privateDisplayName(text)}' is not writable`); return; }
+      if (m.kind === "accessor" && m.setter === undefined) { this.emitThrowTypeError(ctx, access, `'${privateDisplayName(text)}' was defined without a setter`); return; }
+      if (m.kind === "accessor" && !m.isStatic) {
+        ctx.body.push({ kind: "Call", dst: this.newLocal(ctx, "reference"), recv, callee: { kind: "Direct", func: m.setter! }, args: [rhs] });
+        return;
+      }
+    }
+    ctx.body.push(this.withClassHint(this.withSlots({ kind: "StoreField", obj: recv, field: this.internField(text), src: rhs }, this.staticSlotHint(access.expression, text)), access.expression));
+  }
+  /** A destructuring ASSIGNMENT's object pattern, `({ a, b: c = 1, [k]: d, "e": f.g, ...rest } = v)`: the value
+   *  must be coercible to an object, then each property in order: the key, a member target's reference, the
+   *  read, the default, the store. */
+  private lowerAssignObjectPattern(ctx: FnCtx, lhs: ts.ObjectLiteralExpression, rhs: number): void {
+    const first = lhs.properties[0];
+    if (!first || !(ts.isShorthandPropertyAssignment(first) || (ts.isPropertyAssignment(first) && !ts.isComputedPropertyName(first.name))))
+      ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "object.coercible", args: [rhs] });
+    const bound: PatternKey[] = [];
+    for (const p of lhs.properties) {
+      if (ts.isSpreadAssignment(p)) {
+        const target = this.unwrapAssignTarget(p.expression);
+        const ref = this.patternTargetRef(ctx, target);
+        this.lowerAssignTarget(ctx, target, this.objectRestOf(ctx, rhs, bound), ref);
+      } else if (ts.isShorthandPropertyAssignment(p)) {
+        bound.push({ field: p.name.text });
+        const v = this.newLocal(ctx, "reference");
+        ctx.body.push({ kind: "LoadField", dst: v, obj: rhs, field: this.internField(p.name.text) });
+        this.lowerPatternDefault(ctx, v, p.objectAssignmentInitializer);
+        this.lowerAssignTarget(ctx, p.name, v);
+      } else if (ts.isPropertyAssignment(p)) {
+        const key = this.patternKey(ctx, p.name);
+        if (key === undefined) { this.unsupported(p, "object destructuring assignment property form"); continue; }
+        bound.push(key);
+        const defaulted = ts.isBinaryExpression(p.initializer) && p.initializer.operatorToken.kind === ts.SyntaxKind.EqualsToken ? p.initializer : undefined;
+        const target = this.unwrapAssignTarget(defaulted ? defaulted.left : p.initializer);
+        const ref = this.patternTargetRef(ctx, target);
+        const v = this.loadPatternKey(ctx, rhs, key);
+        this.lowerPatternDefault(ctx, v, defaulted?.right);
+        this.lowerAssignTarget(ctx, target, v, ref);
+      } else {
+        this.unsupported(p, "object destructuring assignment property form");
+      }
+    }
+  }
+  /** A destructuring target's reference (a member's object and key), taken before its value is read. */
+  private patternTargetRef(ctx: FnCtx, target: ts.Expression): { obj?: number; key?: number } | undefined {
+    const byRef = ts.isElementAccessExpression(target) || (ts.isPropertyAccessExpression(target) && this.isPlainFieldStoreTarget(target));
+    return byRef ? this.lowerAssignRefPre(ctx, target, true) : undefined;
+  }
+  /** `v = def` when `v` holds undefined; an anonymous function or class in `def` takes its name where it is written. */
+  private lowerPatternDefault(ctx: FnCtx, v: number, def: ts.Expression | undefined): void {
+    if (!def) return;
+    const isUndef = this.newLocal(ctx, "primitive");
+    ctx.body.push({ kind: "UnOp", dst: isUndef, op: "isundef", operand: v });
+    const thenB = this.captureBody(ctx, () => {
+      const dv = this.lowerExpr(ctx, def);
+      ctx.body.push({ kind: "Copy", dst: v, src: dv });
+    });
+    ctx.body.push({ kind: "If", cond: isUndef, thenBody: thenB, elseBody: [] });
+  }
+  /** A pattern property's key: a name known here, or a computed key as a value, ToPropertyKey taken once. */
+  private patternKey(ctx: FnCtx, name: ts.PropertyName): PatternKey | undefined {
+    if (ts.isIdentifier(name) || ts.isStringLiteralLike(name)) return { field: name.text };
+    if (ts.isNumericLiteral(name)) return { field: String(Number(name.text)) };
+    if (!ts.isComputedPropertyName(name)) return undefined;
+    const raw = this.lowerExpr(ctx, name.expression);
+    const key = this.newLocal(ctx, "reference");
+    ctx.body.push({ kind: "CallBuiltinStatic", dst: key, builtin: "key.normalize", args: [raw] });
+    return { key };
+  }
+  private loadPatternKey(ctx: FnCtx, src: number, key: PatternKey): number {
+    const v = this.newLocal(ctx, "reference");
+    if ("field" in key) ctx.body.push({ kind: "LoadField", dst: v, obj: src, field: this.internField(key.field) });
+    else ctx.body.push({ kind: "LoadFieldDynamic", dst: v, obj: src, key: key.key });
+    return v;
+  }
+  /** CopyDataProperties of a pattern's rest: `src`'s own enumerable properties but the keys already bound. */
+  private objectRestOf(ctx: FnCtx, src: number, bound: PatternKey[]): number {
+    const dst = this.newLocal(ctx, "reference");
+    if (bound.every((k) => "field" in k)) {
+      ctx.body.push({ kind: "ObjectRest", dst, src, exclude: bound.map((k) => this.internField((k as { field: string }).field)) });
+    } else {
+      const keys = bound.map((k) => "field" in k ? this.constString(ctx, k.field) : k.key);
+      ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "object.restKeys", args: [src, ...keys] });
+    }
+    return dst;
   }
   /** `[a, b, ...rest] = rhs` with `rhs` an array or a tuple: each element by index, assigned recursively
    *  to its target. Holes (elisions) and a trailing rest. (Assignment to existing lvalues; declarations
@@ -14002,18 +14295,33 @@ class Exporter {
   }
   /** `super.x`, `super[k]`, `super.m(...)` in an object literal's method: the home object's prototype,
    *  the read and the call on `this`. undefined for any other expression. */
-  private lowerObjectSuper(ctx: FnCtx, node: ts.Expression): number | undefined {
+  /** `super[k]`, and a call of it. */
+  private isComputedSuper(node: ts.Expression): boolean {
+    const t = ts.isCallExpression(node) ? node.expression : node;
+    return ts.isElementAccessExpression(t) && t.expression.kind === ts.SyntaxKind.SuperKeyword;
+  }
+  /** The object `super` starts at: the prototype of the home object, a literal's (through its cell), the
+   *  class's prototype or static container. */
+  private superBase(ctx: FnCtx): number | undefined {
     const home = ctx.cellAccess.get(this.lexicalHomeSym);
-    if (home === undefined || ctx.thisLocal === undefined) return undefined;
+    const h = this.newLocal(ctx, "reference");
+    if (home !== undefined) ctx.body.push({ kind: "LoadField", dst: h, obj: home, field: this.VALUE });
+    else if (ctx.staticClass !== undefined && this.classStaticGlobal.has(ctx.staticClass)) ctx.body.push({ kind: "LoadGlobal", dst: h, gref: this.classStaticGlobal.get(ctx.staticClass)! });
+    else if (ctx.currentClass !== undefined) ctx.body.push({ kind: "CallBuiltinStatic", dst: h, builtin: `class.proto:${ctx.currentClass}`, args: [] });
+    else return undefined;
+    const proto = this.newLocal(ctx, "reference");
+    ctx.body.push({ kind: "CallBuiltinStatic", dst: proto, builtin: "reflect.getPrototypeOf", args: [h] });
+    return proto;
+  }
+  private lowerObjectSuper(ctx: FnCtx, node: ts.Expression): number | undefined {
+    if (ctx.thisLocal === undefined) return undefined;
     const isSuperAccess = (e: ts.Expression): e is ts.PropertyAccessExpression | ts.ElementAccessExpression =>
       (ts.isPropertyAccessExpression(e) || ts.isElementAccessExpression(e)) && e.expression.kind === ts.SyntaxKind.SuperKeyword;
     const target = ts.isCallExpression(node) ? node.expression : node;
     if (!isSuperAccess(target)) return undefined;
     const read = (): number => {
-      const h = this.newLocal(ctx, "reference");
-      ctx.body.push({ kind: "LoadField", dst: h, obj: home, field: this.VALUE });
-      const proto = this.newLocal(ctx, "reference");
-      ctx.body.push({ kind: "CallBuiltinStatic", dst: proto, builtin: "reflect.getPrototypeOf", args: [h] });
+      const proto = this.superBase(ctx);
+      if (proto === undefined) { this.unsupported(target, "super outside a method"); return this.newLocal(ctx, "reference"); }
       const key = ts.isPropertyAccessExpression(target) ? this.constString(ctx, target.name.text) : this.lowerExpr(ctx, target.argumentExpression);
       const dst = this.newLocal(ctx, "reference");
       ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "reflect.get", args: [proto, key, ctx.thisLocal!] });
@@ -14318,6 +14626,7 @@ class Exporter {
     if (ctor.parameters.some((p) => ts.isIdentifier(p.name) && this.isParameterProperty(p))) return true;
     const cnode = this.classNodeOfId.get(classId);
     if (cnode === undefined) return false;
+    if (privateBrand(cnode) !== undefined) return true;
     return cnode.members.some((m) => !this.isStaticMember(m) &&
       ts.isPropertyDeclaration(m) && (m.initializer !== undefined || this.isDynComputedMember(m)));
   }
@@ -14830,6 +15139,7 @@ class Exporter {
       // elements.
       // Drive Map/Set iterators directly so mutations during iteration remain
       // visible. Headers still uses its existing array representation.
+      if (this.arrayIteratorNamed && this.forOfDynamicEnabled) { this.lowerDynamicForOf(ctx, stmt.initializer, stmt.statement, stmt.expression); return; }
       const cursorTarget = this.forOfCursorTarget(stmt.expression);
       if (cursorTarget) { this.lowerCursorForLoop(ctx, stmt.initializer, stmt.statement, cursorTarget); return; }
       const rkForOf = this.builtinReceiverKind(stmt.expression);
@@ -15006,7 +15316,7 @@ class Exporter {
           }
         }
       }
-      if (cid !== undefined) this.emitComputedClassMembers(ctx, cid);
+      if (cid !== undefined) this.emitComputedClassMembers(ctx, cid, classValue?.classValue ? classValue.local : undefined);
       // Step F: at the declaration's source position, run __static_init (if it has
       // statics) so static initializers observe earlier bindings and the class
       // binding initialized above.
@@ -15230,6 +15540,64 @@ class Exporter {
   }
   /** The static text of a member's key: an identifier, a string or number literal, a private name,
    *  or a well-known symbol (`[Symbol.iterator]`); undefined for any other computed key. */
+  /** The anonymous function or class `e` is, through parentheses and the wrappers that erase. */
+  private anonymousDefinition(e: ts.Expression): ts.ArrowFunction | ts.FunctionExpression | ts.ClassExpression | undefined {
+    let cur = e;
+    while (ts.isParenthesizedExpression(cur) || ts.isAsExpression(cur) || ts.isNonNullExpression(cur) ||
+           ts.isTypeAssertionExpression(cur) || (ts as any).isSatisfiesExpression?.(cur)) cur = (cur as ts.ParenthesizedExpression).expression;
+    if (ts.isArrowFunction(cur)) return cur;
+    return (ts.isFunctionExpression(cur) || ts.isClassExpression(cur)) && !cur.name ? cur : undefined;
+  }
+  /** The name NamedEvaluation gives the anonymous function or class `node`, from where it is written: a
+   *  binding, a parameter or a pattern's default, an assignment to a plain name (not a parenthesized one), a
+   *  member, a field, `export default`. undefined where nothing names it and where the key is computed: that
+   *  site names the value at run time (lowerNamedByKey). */
+  private namedEvaluationName(node: ts.Node): string | undefined {
+    let cur = node;
+    let par = cur.parent;
+    while (par && (ts.isParenthesizedExpression(par) || ts.isAsExpression(par) || ts.isNonNullExpression(par) ||
+                   ts.isTypeAssertionExpression(par) || (ts as any).isSatisfiesExpression?.(par))) { cur = par; par = par.parent; }
+    if (!par) return undefined;
+    if ((ts.isVariableDeclaration(par) || ts.isBindingElement(par) || ts.isParameter(par)) && par.initializer === cur)
+      return ts.isIdentifier(par.name) ? par.name.text : undefined;
+    if (ts.isPropertyAssignment(par) && par.initializer === cur) {
+      if (ts.isComputedPropertyName(par.name)) return undefined;
+      const key = this.memberKeyName(par.name);
+      return key === "__proto__" ? undefined : key;   // that form sets the prototype
+    }
+    if (ts.isShorthandPropertyAssignment(par) && par.objectAssignmentInitializer === cur) return par.name.text;
+    if (ts.isBinaryExpression(par) && par.right === cur && ts.isIdentifier(par.left)) {
+      const op = par.operatorToken.kind;
+      return op === ts.SyntaxKind.EqualsToken || op === ts.SyntaxKind.AmpersandAmpersandEqualsToken ||
+        op === ts.SyntaxKind.BarBarEqualsToken || op === ts.SyntaxKind.QuestionQuestionEqualsToken ? par.left.text : undefined;
+    }
+    if (ts.isPropertyDeclaration(par) && par.initializer === cur) {
+      if (ts.isComputedPropertyName(par.name)) return undefined;
+      const key = this.memberKeyName(par.name);
+      return key === undefined ? undefined : privateDisplayName(key);
+    }
+    if (ts.isExportAssignment(par) && !par.isExportEquals) return "default";
+    return undefined;
+  }
+  /** `init`'s value under a key known at run time (`{ [k]: v }`, a computed field): an anonymous function or
+   *  class takes the key as its name. A class with a static container reads the key from a global where
+   *  `name` is defined, ahead of its static members, which may read it or replace it. */
+  private lowerNamedByKey(ctx: FnCtx, init: ts.Expression, key: number): number {
+    const anon = this.anonymousDefinition(init);
+    if (!anon) return this.lowerExpr(ctx, init);
+    if (ts.isClassExpression(anon)) {
+      const cid = this.classIdByNode.get(anon);
+      if (cid !== undefined && this.classStaticGlobal.has(cid)) {
+        let g = this.classKeyNameGlobals.get(cid);
+        if (g === undefined) { g = this.internGlobal(`__clskey_${cid}`); this.classKeyNameGlobals.set(cid, g); }
+        ctx.body.push({ kind: "StoreGlobal", gref: g, src: key });
+        return this.lowerExpr(ctx, init);
+      }
+    }
+    const v = this.lowerExpr(ctx, init);
+    ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "function.nameFromKey:method", args: [v, key] });
+    return v;
+  }
   private memberKeyName(nm: ts.PropertyName | undefined): string | undefined {
     if (!nm) return undefined;
     if (ts.isIdentifier(nm) || ts.isPrivateIdentifier(nm) || ts.isStringLiteral(nm) || ts.isNumericLiteral(nm) ||
@@ -15503,7 +15871,7 @@ class Exporter {
     // array comes as a hidden last parameter, filled by the entry (`emit_coroutine_param_copy`).
     if (!ts.isArrowFunction(node) && node.body && ctx.argumentsOffset !== undefined && node !== (this.moduleInitNode as unknown as FnLike)) {
       const coroutine = !!ctx.isAsync || !!ctx.isGenerator;
-      if (this.readsArguments(node.body, coroutine)) {
+      if (this.readsArguments(node.body, coroutine) || node.parameters.some((p) => this.readsArguments(p, coroutine))) {
         if (coroutine) {
           ctx.argumentsLocal = this.newLocal(ctx, "reference", `__arguments_all:${ctx.argumentsOffset}`);
           ctx.params.push(ctx.argumentsLocal);
@@ -15511,7 +15879,7 @@ class Exporter {
           ctx.argumentsLocal = this.newLocal(ctx, "reference", "arguments");
           ctx.body.push({ kind: "CallBuiltinStatic", dst: ctx.argumentsLocal, builtin: `arguments.array:${ctx.argumentsOffset}`, args: [] });
         }
-        if (this.arrowInsideReadsArguments(node.body)) {
+        if (this.arrowInsideReadsArguments(node.body) || node.parameters.some((p) => this.arrowInsideReadsArguments(p))) {
           const cell = this.newLocal(ctx, "reference", "argumentsCell");
           const site = this.site++;
           this.recordSite(site, "cell", "once", true, node as ts.Node, true);
@@ -15612,6 +15980,13 @@ class Exporter {
     if (node.body && ts.isBlock(node.body)) {
       this.hoistDeclarations(ctx, node.body);
     }
+    // FunctionDeclarationInstantiation runs at the call, ahead of the generator object: a default's effects
+    // and a pattern's throw are the caller's. Such a generator's entry runs its body to this suspension.
+    if (ctx.isGenerator && node.parameters.some((p) => p.initializer !== undefined || !ts.isIdentifier(p.name))) {
+      const none = this.newLocal(ctx, "reference", "__initial_suspend");
+      ctx.body.push({ kind: "Const", dst: none, value: { kind: "Undef" } });
+      ctx.body.push({ kind: "Yield", dst: this.newLocal(ctx, "reference"), operand: none });
+    }
     // 4. body
     if (node.body) {
       // v1 async: only top-level awaits are supported (the state machine splits
@@ -15651,18 +16026,16 @@ class Exporter {
     // context (`const f = () => {}` -> "f", `{ m: () => {} }` -> "m"), else "".
     let displayName = ctx.name;
     if (ts.isArrowFunction(node) || (ts.isFunctionExpression(node) && !node.name)) {
-      const par = (node as ts.Node).parent;
-      if (par && ts.isVariableDeclaration(par) && ts.isIdentifier(par.name)) displayName = par.name.text;
-      else if (par && ts.isPropertyAssignment(par) && ts.isIdentifier(par.name)) displayName = par.name.text;
-      else if (par && ts.isBinaryExpression(par) && par.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isIdentifier(par.left)) displayName = par.left.text;
-      else displayName = "";
+      displayName = this.namedEvaluationName(node as ts.Node) ?? "";
+    } else if (ts.isFunctionDeclaration(node as ts.Node) && !(node as ts.FunctionDeclaration).name) {
+      displayName = "default";   // `export default function () {}`
     } else if (ts.isMethodDeclaration(node as ts.Node) || ts.isGetAccessorDeclaration(node as ts.Node) ||
                ts.isSetAccessorDeclaration(node as ts.Node)) {
       // A class or object-literal member is named after its key, an accessor "get x" / "set x"
       // (V8); a computed key other than a well-known symbol has no static name here. (The
       // member's C symbol is the debugName below; this is what `fn.name` reads.)
       const m = node as unknown as ts.MethodDeclaration | ts.AccessorDeclaration;
-      const key = this.memberKeyName(m.name);
+      const key = this.memberKeyName(m.name) && privateDisplayName(this.memberKeyName(m.name)!);
       displayName = key === undefined ? "" : ts.isGetAccessorDeclaration(m) ? `get ${key}` :
         ts.isSetAccessorDeclaration(m) ? `set ${key}` : key;
     }
@@ -15878,17 +16251,7 @@ class Exporter {
    *  (mirrors the new-Error lowering) followed by Throw. Used where JS rejects an
    *  assignment with a TypeError (e.g. `super.x = v` into a getter-only member). */
   emitThrowTypeError(ctx: FnCtx, node: ts.Node, msg: string) {
-    const err = this.newLocal(ctx, "reference");
-    const site = this.site++;
-    this.recordSite(site, "object", "once", true, node);
-    ctx.body.push({ kind: "AllocObject", dst: err, typeId: 0, site });
-    const m = this.newLocal(ctx, "reference");
-    ctx.body.push({ kind: "Const", dst: m, value: { kind: "Str", value: msg } });
-    ctx.body.push({ kind: "StoreField", obj: err, field: this.internField("message"), src: m });
-    const nm = this.newLocal(ctx, "reference");
-    ctx.body.push({ kind: "Const", dst: nm, value: { kind: "Str", value: "TypeError" } });
-    ctx.body.push({ kind: "StoreField", obj: err, field: this.internField("name"), src: nm });
-    ctx.body.push({ kind: "Throw", src: err });
+    ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: `throw.type:${msg}`, args: [] });
   }
 
   /** The static SETTER fnId for `name` resolved up the class chain from `classId`
@@ -16338,7 +16701,12 @@ class Exporter {
     const info = this.classInfos[classId];
     const className = info?.anonymous ? this.classInferredName.get(classId) ?? "" : info?.name ?? "";
     const nameLocal = this.newLocal(ctx, "reference", "class.name");
-    ctx.body.push({ kind: "Const", dst: nameLocal, value: { kind: "Str", value: className } });
+    const nameKey = this.classKeyNameGlobals.get(classId);
+    if (nameKey !== undefined) {
+      const keyLocal = this.newLocal(ctx, "reference");
+      ctx.body.push({ kind: "LoadGlobal", dst: keyLocal, gref: nameKey });
+      ctx.body.push({ kind: "CallBuiltinStatic", dst: nameLocal, builtin: "function.keyName", args: [keyLocal] });
+    } else ctx.body.push({ kind: "Const", dst: nameLocal, value: { kind: "Str", value: className } });
     defineStaticData(container, "name", nameLocal, 0, 0, 1);
     const ctorNode = this.ctorNodeOfClassId(classId);
     const lengthLocal = this.newLocal(ctx, "primitive", "class.length");
@@ -16460,7 +16828,7 @@ class Exporter {
           const keyLocal = this.newLocal(ctx, "reference");
           ctx.body.push({ kind: "LoadGlobal", dst: keyLocal, gref: this.computedKeyGlobal(m) });
           let src: number;
-          if (m.initializer) src = this.lowerExpr(ctx, m.initializer);
+          if (m.initializer) src = this.lowerNamedByKey(ctx, m.initializer, keyLocal);
           else { src = this.newLocal(ctx, "reference"); ctx.body.push({ kind: "Const", dst: src, value: { kind: "Undef" } }); }
           const c2 = this.newLocal(ctx, "reference");
           ctx.body.push({ kind: "LoadGlobal", dst: c2, gref: gid });
@@ -16475,6 +16843,7 @@ class Exporter {
         ctx.body.push({ kind: "LoadGlobal", dst: c2, gref: gid });
         // a field defines: `name` and `length` of the class are read only, not its fields' business
         if (sfname === "name" || sfname === "length") defineStaticData(c2, sfname, src, 1, 1, 1);
+        else if (ts.isPrivateIdentifier(m.name!)) defineStaticData(c2, sfname, src, 0, 1, 1);   // no reflection sees it
         else ctx.body.push({ kind: "StoreField", obj: c2, field: this.internField(sfname), src });
       } else if (ts.isClassStaticBlockDeclaration(m)) {
         m.body.statements.forEach((s) => this.lowerStmt(ctx, s));
@@ -16660,6 +17029,7 @@ class Exporter {
     this.modules = this.computeModuleOrder(sf);
     this.modules.forEach((module, index) => this.moduleInitializationOrder.set(module, index));
     this.sf = sf;
+    if (this.sourceMode === "module") for (const m of this.modules) for (const e of jsEarlyErrors(m)) this.unsupported(e.node, `SyntaxError: ${e.message}`);
     for (const m of this.modules) this.preflightRuntimeSyntax(m);
     for (const m of this.modules) this.assignIds(m);
     this.setupClasses(sf);
@@ -16716,6 +17086,15 @@ class Exporter {
                 this.moduleTopBindingByName.set(d.name.text, s);
               }
             }
+          } else {
+            // a pattern's names shadow the environment's as a plain binding's do (`const { length } = v`)
+            const walkPattern = (n: ts.BindingName): void => {
+              if (ts.isIdentifier(n)) {
+                const s = this.symbolOf(n);
+                if (s && !(this.sourceMode === "script" && isVar)) this.moduleTopBindingByName.set(n.text, s);
+              } else for (const el of n.elements) if (!ts.isOmittedExpression(el)) walkPattern(el.name);
+            };
+            walkPattern(d.name);
           }
         }
       } else if (this.isValueDefaultExport(stmt)) {
@@ -16860,9 +17239,7 @@ class Exporter {
       // Object-literal method-shorthand and accessor members are lifted functions
       // whose captures need cells (incl. the defineProperty `{ get() {} }` case).
       if ((ts.isMethodDeclaration(n) || ts.isGetAccessorDeclaration(n) || ts.isSetAccessorDeclaration(n)) &&
-          n.body && n.parent && ts.isObjectLiteralExpression(n.parent) &&
-          n.name && (ts.isIdentifier(n.name) || ts.isStringLiteral(n.name) ||
-                     (ts.isComputedPropertyName(n.name) && this.isSymbolKeyExpr(n.name.expression)))) allFns.push(n as unknown as FnLike);
+          n.body && n.parent && ts.isObjectLiteralExpression(n.parent)) allFns.push(n as unknown as FnLike);
       n.forEachChild(walk);
     };
     for (const m of this.modules) walk(m);
@@ -17278,6 +17655,16 @@ function batchMain(listPath: string, outDir: string, strictCompiler = false) {
   for (const e of entries) {
     try {
       const program = programWithJsxRuntime([e.input], opts, host, "module");
+      if (process.env.TSAOT_UNTYPED === "1") {
+        // what the single-file path refuses in this mode: a syntax or an early error stops the compile
+        const sf = program.getSourceFile(e.input);
+        const early = sf ? [...program.getSyntacticDiagnostics(sf).filter(isSyntaxError), ...program.getSemanticDiagnostics(sf).filter(isEarlyError)] : [];
+        if (early.length > 0) {
+          process.stdout.write(`${e.name}\tSYNTAX\t0\n`);
+          process.stderr.write(`  [${e.name}] - TS${early[0].code}: ${ts.flattenDiagnosticMessageText(early[0].messageText, " ")}\n`);
+          continue;
+        }
+      }
       const r = exportOne(program, e.input, `${outDir}/${e.name}.program.json`, `${outDir}/${e.name}.labels.json`);
       const status = r.ok ? "OK" : "UNSUPPORTED";
       process.stdout.write(`${e.name}\t${status}\t${r.nfns}\n`);
@@ -17334,7 +17721,11 @@ function main() {
         const src = fs.readFileSync(input, "utf8");
         const out = ts.transpileModule(src, {
           fileName: input,   // a .tsx file parses JSX
-          compilerOptions: { target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.ESNext, jsx: oracleJsxEmit(src) },
+          // test262's cases are JavaScript already: nothing to lower, nothing to drop. A fixture of what ES2020
+          // output has no form for (private names, a field's define) asks for the same with `// @oracle esnext`.
+          compilerOptions: process.env.TSAOT_CONF_ORACLE_ESNEXT === "1" || src.startsWith("// @oracle esnext")
+            ? { target: ts.ScriptTarget.ESNext, module: ts.ModuleKind.ESNext, verbatimModuleSyntax: true, useDefineForClassFields: true }
+            : { target: ts.ScriptTarget.ES2020, module: ts.ModuleKind.ESNext, jsx: oracleJsxEmit(src) },
         }).outputText;
         // Step 0(b)/Step C: the V8 reference NO LONGER auto-appends a main()
         // call. ESM semantics: the program runs its top-level statements only.
@@ -17433,7 +17824,7 @@ function main() {
     const diagnostics: ts.Diagnostic[] = untyped
       // no type is trusted, but what JavaScript itself refuses stays refused: the parser's errors and the checker's early errors
       ? [
-          ...userFiles.flatMap((f) => program.getSyntacticDiagnostics(f)),
+          ...userFiles.flatMap((f) => program.getSyntacticDiagnostics(f)).filter(isSyntaxError),
           ...userFiles.flatMap((f) => program.getSemanticDiagnostics(f)).filter(isEarlyError),
         ]
       : [

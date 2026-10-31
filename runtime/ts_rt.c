@@ -5450,8 +5450,11 @@ ts_key ts_symbol_key(tsv sym){
   if (s->wksym != 0xffffffffu) return TS_KEY_WKSYM(s->wksym);
   return TS_KEY_USERSYM(s->sym_id);
 }
+/* Array.prototype[Symbol.iterator] replaced or deleted: no array iterates by index any more. */
+int g_array_iter_patched = 0;
 void ts_set_symkey(tsv obj, tsv sym, tsv val){
   if (!ts_is_propbag(obj) || !ts_is_symbol(sym)) return;
+  if (TS_RT_UNLIKELY(obj == g_array_proto_v) && ts_symbol_key(sym) == TS_KEY_WKSYM(TS_WKSYM_ITERATOR)) g_array_iter_patched = 1;
   ts_set(obj, ts_symbol_key(sym), val);
 }
 tsv ts_get_symkey(tsv obj, tsv sym){
@@ -11715,6 +11718,7 @@ static int field_name_is_internal(const char* n, uint32_t len){
     "__text_decoder_ignore_bom", "__array_iterator_source", "__array_iterator_index",
     "__array_iterator_kind", "__map_iterator_source", "__map_iterator_last", "__map_iterator_kind",
     "__tsaot_rx_iter_re", "__tsaot_rx_iter_input", "__tsaot_rx_iter_done", "__primitive" };
+  if (len > 2 && n[0] == '#' && memchr(n, 1, len)) return 1;   /* a private name (exporter/private_names.ts) */
   if (len < 2 || n[0] != '_' || n[1] != '_') return 0;
   for (size_t i = 0; i < sizeof names / sizeof names[0]; i++)
     if (strlen(names[i]) == len && memcmp(names[i], n, len) == 0) return 1;
@@ -12916,6 +12920,7 @@ void ts_register_class_meta(uint32_t class_id, size_t size, tsv proto, ts_class_
   g_class_fields[class_id] = fields;
   g_class_nfields[class_id] = nfields;
 }
+static uint8_t* g_class_evaluated = NULL;   /* [class id]: a class value of this class exists */
 static tsv ts_clone_class_proto(uint32_t class_id){
   if (class_id >= g_class_meta_cap || !ts_is_obj(g_class_proto_tab[class_id])) return TS_UNDEFINED;
   tsv tmplv = g_class_proto_tab[class_id];
@@ -12963,6 +12968,9 @@ tsv ts_make_class_value(uint32_t class_id, ts_code ctor, tsv* env, uint32_t envl
     ts_write_barrier(fv, proto);
     if (ts_is_obj(proto)) {
       ts_define_data(proto, ts_intern_field("constructor", 11), fv, 0, 1, 1);
+      if (!g_class_evaluated) g_class_evaluated = (uint8_t*)calloc(g_class_meta_cap, 1);
+      if (g_class_evaluated[class_id]) ((ts_object*)ts_ptr(proto))->h.flags |= TS_HDR_LATER_EVAL;
+      g_class_evaluated[class_id] = 1;
     }
     ts_gc_unroot(2);
   }
@@ -13072,7 +13080,7 @@ tsv ts_construct(tsv ctorv, tsv* args, int n){
   }
   tsv proto = ((ts_func*)ts_ptr(ctorv))->prototype_prop;
   ((ts_object*)ts_ptr(inst))->proto = ts_is_obj(proto) ? proto : g_class_proto_tab[cid];
-  if (cid < g_class_index_n) ((ts_object*)ts_ptr(inst))->cls = g_class_index_tab[cid];
+  if (cid < g_class_index_n){ ((ts_object*)ts_ptr(inst))->cls = g_class_index_tab[cid]; ts_instance_of_evaluation(inst); }
   /* Boxed fields start as undefined and numeric ones at zero (a young
      instance's run is not zeroed, docs/alloc_inline_design.md); generated
      allocation sites do the same inline. */
@@ -13209,7 +13217,9 @@ static void typed_slow_check_borrow(tsv fn, tsv thisArg){
   if (ts_is_undef(home)) return;
   if (ts_is_obj(thisArg)){
     ts_object* t = (ts_object*)ts_ptr(thisArg);
-    if (ts_obj_is_sized(t) && !(t->cls & TS_CLS_RELINKED) &&
+    /* an instance of a later evaluation of the class carries the flag for the caches' sake, not for a chain of another shape */
+    int relinked = (t->cls & TS_CLS_RELINKED) && !(ts_is_obj(t->proto) && (((ts_object*)ts_ptr(t->proto))->h.flags & TS_HDR_LATER_EVAL));
+    if (ts_obj_is_sized(t) && !relinked &&
         (proto_chain_includes(t->proto, home) || proto_chain_has_class_of(t->proto, home))) return;
   }
   typed_this_raise("a class method called with a foreign this");
@@ -13358,7 +13368,7 @@ static ts_pref sized_field_attr_find(ts_object* o, ts_key key){
    and descriptors), as V8's private names are not properties. */
 static inline int class_field_is_private(ts_key key){
   const char* nm = ts_field_name(key);
-  return nm != NULL && nm[0] == '#';
+  return nm != NULL && nm[0] == '#' && strchr(nm, 1) != NULL;   /* the mark of exporter/private_names.ts */
 }
 static int sized_field_enumerable(ts_object* o, ts_key key){
   if (class_field_is_private(key)) return 0;
@@ -13594,11 +13604,12 @@ static void ts_prop_own_enum(tsv obj, ts_prop_enum_cb cb, void* ud){
    Mirrors JS semantics (walk [[Prototype]] looking for C.prototype). */
 static tsv chain_exotic_proto(tsv link);
 int ts_instanceof(tsv obj, tsv target_proto){
-  if (!ts_is_obj(obj) || !ts_is_obj(target_proto)) return 0;
+  if ((!ts_is_obj(obj) && !ts_is_func(obj)) || !ts_proto_ref(target_proto)) return 0;
   ts_object* o = (ts_object*)ts_ptr(obj);
   /* start from obj's own prototype (an instance is not its own prototype); a
-     promise has no common header, its prototype is Promise.prototype */
-  tsv first = o->h.kind == TS_KIND_PROMISE ? chain_exotic_proto(obj) : o->proto;
+     promise has no common header, its prototype is Promise.prototype; a function's is
+     Function.prototype unless relinked */
+  tsv first = ts_is_func(obj) ? ts_get_proto(obj) : o->h.kind == TS_KIND_PROMISE ? chain_exotic_proto(obj) : o->proto;
   for (tsv p = first; ts_proto_ref(p); ){
     if (p == target_proto || ts_same_cell(p, target_proto)) return 1;
     ts_object* link = (ts_object*)ts_ptr(p);
@@ -14493,6 +14504,7 @@ tsv ts_json_parse_reviver(tsv text, tsv reviver){
    Array.prototype[Symbol.iterator] is outside the model.) */
 static int array_own_iterator(tsv v){
   ts_object* o = (ts_object*)ts_ptr(v);
+  if (TS_RT_UNLIKELY(g_array_iter_patched)) return 1;
   return TS_RT_UNLIKELY(obj_map_plain(o)->len != 0) && pref_ok(prop_find(o, TS_KEY_WKSYM(TS_WKSYM_ITERATOR)));
 }
 /* A string's code points, at most `max` of them, as strings of one or two units. `dst` and `src` are
@@ -15193,6 +15205,7 @@ static int fn_delete(tsv obj, ts_key key, int strict){
   return r;
 }
 int ts_delete_prop(tsv obj, ts_key key){
+  if (TS_RT_UNLIKELY(obj == g_array_proto_v) && key == TS_KEY_WKSYM(TS_WKSYM_ITERATOR)) g_array_iter_patched = 1;
   if (ts_is_obj(obj)){ ts_gc_header* _dh = (ts_gc_header*)ts_ptr(obj); if (_dh->gen == TS_GEN_OLD) gc_cards_all(_dh); }
   if (g_has_proxies && ts_is_proxy(obj)) return ts_proxy_delete_v(obj, ts_key_to_value(key));
   if (ts_is_func(obj)) return fn_delete(obj, key, 0);
@@ -15595,7 +15608,7 @@ static int define_property_from(tsv obj, tsv keyv, tsv desc, int throws){
     return 0;
   }
   if (!ts_is_obj(desc) && !ts_is_func(desc)){
-    ts_throw(ts_new_string("TypeError: Property description must be an object", 48));
+    ts_throw_type_error("Property description must be an object");
     return 0;
   }
   tsv getter = TS_UNDEFINED, setter = TS_UNDEFINED, value = TS_UNDEFINED;
@@ -15624,7 +15637,7 @@ static int define_property_from(tsv obj, tsv keyv, tsv desc, int throws){
   }
   if ((present & (DEF_VALUE | DEF_WRITABLE)) && (present & (DEF_GET | DEF_SET))){
     ts_gc_unroot(6);
-    ts_throw(ts_new_string("TypeError: Invalid property descriptor (value with get/set)", 59));
+    ts_throw_type_error("Invalid property descriptor. Cannot both specify accessors and a value or writable attribute");
     return 0;
   }
   ts_key key;
@@ -17786,6 +17799,11 @@ static tsv ts_noop_fn(tsv* args, int n){ (void)args; (void)n; return TS_UNDEFINE
 /* Boxed with the FUNC selector (NOT ts_obj) so `typeof Function.prototype` is
    "function" and ts_get routes it through the function name/length path. */
 tsv ts_function_proto(void){ return ts_is_func(g_function_proto_v) ? g_function_proto_v : TS_NULL; }
+static tsv ts_restricted_property(tsv* a, int n){
+  (void)a; (void)n;
+  ts_throw_type_error_msg("'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them");
+  return TS_UNDEFINED;
+}
 void ts_function_proto_init(void){
   if (ts_is_func(g_function_proto_v)) return;
   /* Allocate Function.prototype as a real callable no-op function (arity 0, name
@@ -17798,6 +17816,12 @@ void ts_function_proto_init(void){
   static int rooted = 0;
   ts_root_static_once(&g_function_proto_v, &rooted);
   ((ts_func*)ts_ptr(g_function_proto_v))->o.proto = g_object_proto_v;
+  /* the two restricted properties: accessors that throw (%ThrowTypeError%) */
+  tsv thrower = ts_make_fn_t(ts_restricted_property, NULL, 0, 1);
+  ts_gc_root(&thrower);
+  ts_define_accessor_attr(g_function_proto_v, ts_intern_field("caller", 6), thrower, thrower, 1, 1, 0, 1);
+  ts_define_accessor_attr(g_function_proto_v, ts_intern_field("arguments", 9), thrower, thrower, 1, 1, 0, 1);
+  ts_gc_unroot(1);
 }
 void ts_function_proto_register(ts_key method_key, const char* name, ts_code fn){
   if (!ts_is_func(g_function_proto_v)) ts_function_proto_init();
@@ -17999,20 +18023,42 @@ tsv ts_property_key_value(tsv v){
   return ts_key_from_value(v, &key) ? ts_key_to_value(key) : v;
 }
 /* SetFunctionName from a computed key: a symbol's description in brackets, a prefix for an accessor. */
+/* A private name's element is the object's own (docs/private_names_design.md): the prototype chain has no
+   part in it and a Proxy is not asked. */
+static int private_present(tsv obj, ts_key key){
+  if (!ts_is_obj(obj) && !ts_is_func(obj)) return 0;
+  if (g_has_proxies && ts_is_proxy(obj)) return 0;
+  return ts_has_own(obj, key);
+}
+void ts_private_check(tsv obj, ts_key key){
+  if (private_present(obj, key)) return;
+  const char* nm = ts_field_name(key);
+  size_t n = 0;
+  while (nm && nm[n] && nm[n] != '\001') n++;
+  char buf[256];
+  snprintf(buf, sizeof buf, "Cannot access private member %.*s on an object whose class did not declare it", (int)(n > 128 ? 128 : n), nm ? nm : "");
+  ts_throw_type_error_msg(buf);
+}
+int ts_private_has(tsv obj, ts_key key){
+  if (!ts_is_obj(obj) && !ts_is_func(obj)) ts_throw_type_error_msg("Cannot use 'in' operator to search for a private name in a value that is not an object");
+  return private_present(obj, key);
+}
+/* SetFunctionName's text for a property key: a symbol in brackets, its description (none: empty). */
+tsv ts_fn_key_name(tsv key){
+  if (!ts_is_symbol(key)) return ts_to_string_v(key);
+  tsv d = ts_symbol_description(key);
+  if (!ts_is_str(d)) return ts_new_string("", 0);
+  uint32_t n = 0; char* u = ts_string_cstr_copy(d, &n);
+  char* b = (char*)malloc(n + 3);
+  b[0] = '['; memcpy(b + 1, u, n); b[n + 1] = ']'; b[n + 2] = 0;
+  tsv text = ts_new_string(b, n + 2);
+  free(u); free(b);
+  return text;
+}
 tsv ts_fn_name_from_key(tsv fn, tsv key, const char* prefix){
   if (!ts_is_func(fn)) return fn;
   ts_gc_root(&fn);
-  tsv text;
-  if (ts_is_symbol(key)){
-    tsv d = ts_symbol_description(key);
-    if (ts_is_str(d)){
-      uint32_t n = 0; char* u = ts_string_cstr_copy(d, &n);
-      char* b = (char*)malloc(n + 3);
-      b[0] = '['; memcpy(b + 1, u, n); b[n + 1] = ']'; b[n + 2] = 0;
-      text = ts_new_string(b, n + 2);
-      free(u); free(b);
-    } else text = ts_new_string("", 0);
-  } else text = ts_to_string_v(key);
+  tsv text = ts_fn_key_name(key);
   uint32_t n = 0; char* u = ts_string_cstr_copy(text, &n);
   size_t pl = strlen(prefix);
   char* name = (char*)malloc(pl + n + 1);   /* a ts_func's name lives as long as the program */
@@ -18088,11 +18134,20 @@ static void cb_rest_copy(uint32_t key, tsv val, void* ud){
 tsv ts_object_rest(tsv src, const uint32_t* excl, int nexcl){
   ts_gc_root(&src);
   tsv dst=ts_new_object(); ts_gc_root(&dst);
-  if (!ts_is_obj(src) || ts_is_map(src) || ts_is_set(src) || ts_is_indexed_array_fast(src)) { ts_gc_unroot(2); return dst; }
+  /* the sources of a spread: an array's indices, a string's, a function's own properties, the symbols */
+  if (ts_is_map(src) || ts_is_set(src) || (!ts_is_obj(src) && !ts_is_func(src) && !ts_is_class_value(src) && !ts_is_str(src))) { ts_gc_unroot(2); return dst; }
   enum_rest_ctx c; c.dst=dst; c.excl=excl; c.nexcl=nexcl; c.recv=src;
   ts_prop_own_enum(src, cb_rest_copy, &c);
+  ts_prop_own_enum_symbols(src, cb_rest_copy, &c);
   ts_gc_unroot(2);
   return dst;
+}
+/* A pattern with a computed key: the keys taken out of the rest are values. */
+tsv ts_object_rest_keys(tsv src, const tsv* keys, int n){
+  uint32_t excl[n > 0 ? n : 1];
+  int m = 0;
+  for (int i = 0; i < n; i++){ ts_key k; if (ts_key_from_value(keys[i], &k)) excl[m++] = k; }
+  return ts_object_rest(src, excl, m);
 }
 
 /* obj[key]: dynamic property load using ToPropertyKey (string/number/symbol). */

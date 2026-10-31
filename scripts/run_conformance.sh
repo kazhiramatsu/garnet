@@ -125,7 +125,9 @@ while IFS=$'\t' read -r slug path; do
   prog="$WORK/json/$slug.program.json"; jsref="$WORK/v8/$slug.js"
   estatus="$(awk -F'\t' -v n="$slug" '$1==n{print $2}' "$WORK/exp.status")"
   if [[ "$estatus" != "OK" || ! -f "$prog" ]]; then
-    echo "[conf] FAIL ${slug}: export ${estatus:-?}"; grep "\[$slug\]" "$WORK/exp.err" | head -2; nfail=$((nfail+1)); fail=1; continue
+    # a refused program: does V8 refuse it too? (the `dir` tier's summary tells the two apart)
+    v8note=""; [[ "$TIER" == dir ]] && v8note=" V8=[$(LC_ALL=en_US.UTF-8 watchdog node "$jsref" 2>&1 | grep -m1 -E 'SyntaxError|Error:' | cut -c1-100)]"
+    echo "[conf] FAIL ${slug}: export ${estatus:-?}${v8note}"; grep "\[$slug\]" "$WORK/exp.err" | head -2; nfail=$((nfail+1)); fail=1; rm -f "$jsref"; continue
   fi
   # Default-locale fixtures (Date.toLocale*String without arguments) expect the
   # runtime's fixed en-US subset; pin the oracle so a ja_JP shell does not flip.

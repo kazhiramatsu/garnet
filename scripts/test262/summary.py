@@ -5,7 +5,8 @@ A case passes when it prints nothing (or the async harness's completion line) an
 the compile refuses it or the run throws the expected error. Otherwise, by what garnet did:
   reject     the compile stopped (loud)        wrong    ran, and differs from V8
   crash      killed by a signal                timeout  killed by the watchdog
-  v8-also    V8 fails as well in this harness (a sloppy-only case in a strict module, a host hook)"""
+  v8-also    V8 fails as well in this harness (a sloppy-only case in a strict module, a host hook)
+  no-eval    needs code from strings at run time, which a compiled program has no engine for"""
 import collections, glob, os, re, sys
 out = sys.argv[1]
 top = int(sys.argv[sys.argv.index("--top") + 1]) if "--top" in sys.argv else 30
@@ -30,13 +31,14 @@ def note(slug, kind, why=""):
             for x in m[4].split(","):
                 if x: feats[x] += 1
 for log in sorted(glob.glob(os.path.join(out, "*.log"))):
-    pending = None
+    pending = None; v8_refused = False
     for line in open(log, errors="replace"):
         line = line.rstrip("\n")
         if pending and line.startswith("  ["):
             why = re.sub(r"^\s*\[\S+\]\s*-?\s*", "", line); why = re.sub(r" at /.*", "", why)[:90]
             m = meta.get(pending)
             if m and m[2]: note(pending, "pass")
+            elif v8_refused: note(pending, "v8-also")
             else: note(pending, "reject", why)
             pending = None
             continue
@@ -58,7 +60,7 @@ for log in sorted(glob.glob(os.path.join(out, "*.log"))):
         if not m: continue
         slug, rest = m.groups()
         if rest.startswith("export"):
-            pending = slug; continue
+            pending = slug; v8_refused = "SyntaxError" in rest; continue
         a = re.match(r"AOT=\[(.*)\] V8=\[(.*)\]$", rest)
         if not a:
             note(slug, "reject", rest[:80]); continue
@@ -67,6 +69,8 @@ for log in sorted(glob.glob(os.path.join(out, "*.log"))):
         if n and n[2]:
             note(slug, "pass" if n[3] and n[3] in aot else "wrong", "" if n[3] and n[3] in aot else "negative: " + re.sub(r"\d+", "N", aot)[:60]); continue
         short = re.sub(r"\d+", "N", aot.replace("tsaot: Uncaught exception: ", ""))[:70]
+        if "eval is not defined" in aot or "Code generation from strings" in aot:
+            note(slug, "no-eval"); continue
         sig = re.search(r"\[signal (\d+)\]", aot)
         if sig: note(slug, "timeout" if sig.group(1) == "14" else "crash", "signal " + sig.group(1) + ": " + short)
         elif v8 not in OK: note(slug, "v8-also")
