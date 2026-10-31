@@ -13739,6 +13739,12 @@ fn emit_coroutine_param_copy(s: &mut String, f: &Function, ctx: &Ctx) {
             continue;
         }
         let j = i - ncap;
+        // the arguments object of a coroutine (the exporter's hidden last parameter)
+        if let Some(offset) = f.locals.iter().find(|l| l.id.0 == p.0).and_then(|l| l.name.as_deref()).and_then(|n| n.strip_prefix("__arguments_all:")) {
+            let offset = offset.parse::<usize>().unwrap_or(0).saturating_sub(ncap);
+            let _ = writeln!(s, "  _fr->v{} = ts_arguments_array(args + {1}, nargs > {1} ? nargs - {1} : 0);", p.0, offset);
+            continue;
+        }
         if ctx.int_local.contains(&p.0) {
             let _ = writeln!(
                 s,
@@ -14614,7 +14620,7 @@ fn fnval_adapter_body(builtin: &str) -> Option<String> {
             "if(n==1 && ts_is_num({})) return ts_array_new_length(ts_to_num({})); return ts_array_of(a, n);",
             val(0), val(0)
         )),
-        "global.Object" => Some("if(n==0 || a[0]==TS_UNDEFINED || a[0]==TS_NULL) return ts_new_object(); return a[0];".to_string()),
+        "global.Object" => Some("if(n==0 || a[0]==TS_UNDEFINED || a[0]==TS_NULL) return ts_new_object(); return ts_to_object(a[0]);".to_string()),
         "global.Promise" => Some("return ts_promise_new_executor(n>0 ? a[0] : TS_UNDEFINED);".to_string()),
         "global.Map" => Some("ts_unsupported_builtin(\"Map constructor called without supported new lowering\"); return TS_UNDEFINED;".to_string()),
         "global.Set" => Some("ts_unsupported_builtin(\"Set constructor called without supported new lowering\"); return TS_UNDEFINED;".to_string()),
@@ -14639,7 +14645,22 @@ fn fnval_adapter_body(builtin: &str) -> Option<String> {
         "json.parse" => hv(format!("ts_json_parse({})", val(0))),
         // ---- Object ----
         "object.assign" => Some("return ts_object_assign(a, n);".to_string()),
-        "object.create" => hv(format!("ts_object_create({})", val(0))),
+        "object.create" => Some(format!("tsv _r = ts_object_create({}); if (n > 1 && a[1] != TS_UNDEFINED) ts_define_properties(_r, a[1]); return _r;", val(0))),
+        "object.defineProperty" => Some(format!("ts_define_property({}, {}, {}); return {};", val(0), val(1), val(2), val(0))),
+        "object.defineProperties" => Some(format!("ts_define_properties({}, {}); return {};", val(0), val(1), val(0))),
+        "reflect.get" => hv(format!("(n > 2 ? ts_reflect_get_recv({}, {}, a[2]) : ts_get_dyn({}, {}))", val(0), val(1), val(0), val(1))),
+        "reflect.set" => hv(format!("(n > 3 ? ts_reflect_set_recv({0}, {1}, {2}, a[3]) : ts_reflect_set({0}, {1}, {2}))", val(0), val(1), val(2))),
+        "reflect.has" => hv(format!("ts_reflect_has({}, {})", val(0), val(1))),
+        "reflect.deleteProperty" => hv(format!("ts_reflect_delete({}, {})", val(0), val(1))),
+        "reflect.ownKeys" => hv(format!("ts_reflect_own_keys({})", val(0))),
+        "reflect.getPrototypeOf" => hv(format!("ts_get_proto({})", val(0))),
+        "reflect.setPrototypeOf" => hv(format!("ts_reflect_set_proto({}, {})", val(0), val(1))),
+        "reflect.defineProperty" => hv(format!("ts_reflect_define_property({}, {}, {})", val(0), val(1), val(2))),
+        "reflect.getOwnPropertyDescriptor" => hv(format!("ts_get_own_property_descriptor({}, {})", val(0), val(1))),
+        "reflect.isExtensible" => hv(format!("ts_object_is_extensible({})", val(0))),
+        "reflect.preventExtensions" => hv(format!("ts_reflect_prevent_extensions({})", val(0))),
+        "reflect.apply" => hv(format!("ts_reflect_apply({}, {}, {})", val(0), val(1), val(2))),
+        "reflect.construct" => hv(format!("ts_reflect_construct({}, {})", val(0), val(1))),
         "object.getPrototypeOf" => hv(format!("ts_get_proto({})", val(0))),
         "object.setPrototypeOf" => hv(format!("{}({}, {})", user_set_proto_fn(), val(0), val(1))),
         "object.keys" => hv(format!("ts_object_keys({})", val(0))),
@@ -14848,6 +14869,21 @@ fn global_fn_value_builtins() -> &'static [&'static str] {
         "object.entries",
         "object.fromEntries",
         "object.freeze",
+        "object.defineProperty",
+        "object.defineProperties",
+        "reflect.get",
+        "reflect.set",
+        "reflect.has",
+        "reflect.deleteProperty",
+        "reflect.ownKeys",
+        "reflect.getPrototypeOf",
+        "reflect.setPrototypeOf",
+        "reflect.defineProperty",
+        "reflect.getOwnPropertyDescriptor",
+        "reflect.isExtensible",
+        "reflect.preventExtensions",
+        "reflect.apply",
+        "reflect.construct",
         "object.seal",
         "object.preventExtensions",
         "object.isFrozen",
@@ -15015,6 +15051,8 @@ fn emit_global_setup(s: &mut String, needs_fetch: bool, needs_typed_array_global
     );
     set_fn(s, "_Object", "freeze", "object.freeze", 1, "freeze");
     set_fn(s, "_Object", "seal", "object.seal", 1, "seal");
+    set_fn(s, "_Object", "defineProperty", "object.defineProperty", 3, "defineProperty");
+    set_fn(s, "_Object", "defineProperties", "object.defineProperties", 2, "defineProperties");
     set_fn(
         s,
         "_Object",
@@ -15221,7 +15259,9 @@ fn emit_global_setup(s: &mut String, needs_fetch: bool, needs_typed_array_global
     );
     root_local(s, "_Boolean");
     set_val(s, "_Boolean", "prototype", "ts_boolean_proto()");
+    set_val(s, "ts_boolean_proto()", "constructor", "_Boolean");
     global_set_rooted(s, "Boolean", "_Boolean");
+    s.push_str("  ts_register_primitive_ctors(_Object, _Number, _Boolean);\n");
 
     /* Initialize well-known symbol singletons before rooting _Symbol. ts_wksym()
     installs permanent GC roots; pushing them above a short-lived setup local
@@ -15340,6 +15380,14 @@ fn emit_global_setup(s: &mut String, needs_fetch: bool, needs_typed_array_global
     }
     global_set_rooted(s, "Math", "_Math");
 
+    s.push_str("  tsv _Reflect = ts_new_object();\n");
+    root_local(s, "_Reflect");
+    s.push_str("  ts_define_data(_Reflect, TS_KEY_WKSYM(TS_WKSYM_TO_STRING_TAG), ts_new_string(\"Reflect\", 7), 0, 0, 1);\n");
+    for (name, arity) in [("get", 2), ("set", 3), ("has", 2), ("deleteProperty", 2), ("ownKeys", 1), ("getPrototypeOf", 1), ("setPrototypeOf", 2),
+        ("defineProperty", 3), ("getOwnPropertyDescriptor", 2), ("isExtensible", 1), ("preventExtensions", 1), ("apply", 3), ("construct", 2)] {
+        set_fn(s, "_Reflect", name, &format!("reflect.{}", name), arity, name);
+    }
+    global_set_rooted(s, "Reflect", "_Reflect");
     s.push_str("  tsv _JSON = ts_new_object();\n");
     root_local(s, "_JSON");
     s.push_str("  ts_define_data(_JSON, TS_KEY_WKSYM(TS_WKSYM_TO_STRING_TAG), ts_new_string(\"JSON\", 4), 0, 0, 1);\n");
@@ -24108,6 +24156,16 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     (format!("ts_iter_acquire({}, {})", v(0), async_first), false)
                 }
                 "iter.acquiredSync" => ("ts_bool(g_iter_acquired_sync)".to_string(), false),
+                "object.coercible" => (format!("ts_recv_coercible({})", v(0)), false),
+                "key.normalize" => (format!("ts_property_key_value({})", v(0)), false),
+                _ if builtin.starts_with("class.proto:") => (format!("CLASS_PROTO[{}]", &builtin["class.proto:".len()..]), false),
+                "newtarget.ofThis" => (format!("ts_new_target_of({})", v(0)), false),
+                _ if builtin.starts_with("newtarget.take:") => (format!("ts_take_new_target((ts_code)FN_TABLE[{}])", &builtin["newtarget.take:".len()..]), false),
+                _ if builtin.starts_with("import.meta:") => (format!("ts_import_meta({}u, {})", &builtin["import.meta:".len()..], v(0)), false),
+                _ if builtin.starts_with("function.nameFromKey:") => {
+                    let prefix = match &builtin["function.nameFromKey:".len()..] { "get" => "get ", "set" => "set ", _ => "" };
+                    (format!("ts_fn_name_from_key({}, {}, {:?})", v(0), v(1), prefix), false)
+                }
                 "symbol.description" => (format!("ts_symbol_description({})", v(0)), false),
                 "symbol.for" => (format!("ts_symbol_for({})", v(0)), false),
                 "symbol.keyFor" => (format!("ts_symbol_key_for({})", v(0)), false),
@@ -24355,6 +24413,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 "string.concat" => (format!("ts_str_concat({}, {})", r, v(0)), false),
                 "string.codePointAt" => (format!("ts_str_codepointat({}, {})", r, n(0)), false),
                 "string.repeat" => (format!("ts_str_repeat({}, {})", r, n(0)), false),
+                "string.localeCompare" => (format!("ts_str_locale_compare({}, {})", r, v(0)), true),
                 "string.trim" => (format!("ts_str_trim({})", r), false),
                 "string.split" => (format!("ts_str_split({}, {}, {})", r, v(0), v(1)), false),
                 "array.map" => (format!("ts_array_map({}, {})", r, cbv()), false),
@@ -24835,6 +24894,10 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 }
                 "iter.stepWith" => (format!("ts_iter_step_with({}, {}, {})", r, v(0), v(1)), false),
                 "iter.stepFresh" => (format!("ts_iter_step_fresh({}, {}, {})", r, v(0), v(1)), false),
+                _ if builtin.starts_with("iter.throw:") => {
+                    let tid: u32 = builtin["iter.throw:".len()..].parse().unwrap_or(0);
+                    (format!("ts_iter_throw({}, {}, {})", r, method_key_str(tid, ctx.wksym), v(0)), false)
+                }
                 _ if builtin.starts_with("iter.close:") => {
                     // iter.close:<return-method-id> -> IteratorClose: the iterator's
                     // `return` when it has one (field key, then method key), a generator

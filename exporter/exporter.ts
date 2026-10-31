@@ -96,6 +96,20 @@ const NODE_BUILTIN_MODULES = ["assert", "assert/strict", "async_hooks", "buffer"
 function isNodeBuiltinSpecifier(spec: string): boolean {
   return spec.startsWith("node:") || NODE_BUILTIN_MODULES.includes(spec);
 }
+/** TypeScript's grammar errors that hang on the project's options or are not JavaScript's (a key twice in
+ *  an object literal is valid). */
+const NOT_EARLY_GRAMMAR = new Set([1117, 1149, 1192, 1202, 1203, 1205, 1208, 1259, 1261, 1286, 1287, 1323, 1324, 1343, 1371, 1375, 1378, 1432, 1470, 1471, 1479, 1484]);
+/** JavaScript's early errors that TypeScript makes in the checker. */
+const CHECKER_EARLY_ERRORS = new Set([2300, 2335, 2337, 2338, 2357, 2364, 2392, 2451, 2462, 2523, 2524, 2660, 2777, 2779, 17006, 17007, 17012, 17013, 18011, 18012, 18016, 18061]);
+/** Does this diagnostic say what JavaScript itself refuses before running? Under TSAOT_UNTYPED no type is
+ *  trusted, but such a program is still not compiled. */
+function isEarlyError(d: ts.Diagnostic): boolean {
+  // a redeclaration against another file (a script's `name` and lib.dom's) is the checker's view of scripts
+  if ((d.code === 2300 || d.code === 2451) && !(d.relatedInformation ?? []).every((r) => r.file === d.file)) return false;
+  if (d.code === 2339) return ts.flattenDiagnosticMessageText(d.messageText, " ").startsWith("Property '#"); // an undeclared private name
+  return d.code < 2000 ? !NOT_EARLY_GRAMMAR.has(d.code) : CHECKER_EARLY_ERRORS.has(d.code);
+}
+
 function garnetModulePaths(): ts.MapLike<string[]> {
   const lib = path.join(__dirname, "..", "lib");
   const paths: ts.MapLike<string[]> = {
@@ -668,6 +682,8 @@ interface FnCtx {
   isExported: boolean;
   thisLocal?: number; // for methods: the local holding `this` (param 0)
   currentClass?: number; // for methods: the defining class id (for super.m())
+  newTargetLocal?: number; // a plain function's `new.target`, taken at entry
+  argumentsLocal?: number; // the arguments object of this function, one array for the activation
   staticClass?: number; // for STATIC bodies: the defining class id, used only to resolve `super.X`
   // A derived class's constructor: its parameter properties and field initializers wait for the
   // statement that calls super() (lowerStmt), as JS runs them when super() returns.
@@ -838,6 +854,17 @@ class Exporter {
   // Synthetic symbol representing an arrow's lexical `this`. Arrows that use
   // `this` capture the enclosing function's `this` value through a cell keyed by
   // this sentinel (reusing the normal cell-threading path). Created lazily.
+  _lexicalHomeSym?: ts.Symbol;
+  /** The home object of an object literal's method that uses `super`, captured as `this` is by an arrow. */
+  get lexicalHomeSym(): ts.Symbol {
+    if (!this._lexicalHomeSym) this._lexicalHomeSym = { name: "<home>", flags: 0 } as unknown as ts.Symbol;
+    return this._lexicalHomeSym;
+  }
+  _lexicalArgumentsSym?: ts.Symbol;
+  get lexicalArgumentsSym(): ts.Symbol {
+    if (!this._lexicalArgumentsSym) this._lexicalArgumentsSym = { name: "<arguments>", flags: 0 } as unknown as ts.Symbol;
+    return this._lexicalArgumentsSym;
+  }
   _lexicalThisSym?: ts.Symbol;
   get lexicalThisSym(): ts.Symbol {
     if (!this._lexicalThisSym) this._lexicalThisSym = { name: "<this>", flags: 0 } as unknown as ts.Symbol;
@@ -988,6 +1015,13 @@ class Exporter {
   /** class declaration/expression AST node -> class id. Covers anonymous class
    *  expressions (`const C = class {}`) that have no name symbol to key by. */
   classIdByNode = new Map<ts.Node, number>();
+  computedKeyGlobals = new Map<ts.ClassElement, number>();
+  /** An anonymous class expression's `name`: the binding or the key its site gives it. */
+  classInferredName = new Map<number, string>();
+  /** A named class expression's inner binding: one class for all its evaluations, so one global. */
+  classExprNameGlobals = new Map<number, number>();
+  /** The class whose computed keys are being evaluated: its name is in the TDZ there. */
+  classInKeys: number | undefined = undefined;
   /** class id -> its declaration node (for generic class specialization/cloning). */
   classNodeOfId = new Map<number, ts.ClassLikeDeclaration>();
   /** Cache of class specializations: "classId|tag" -> specialized class id. */
@@ -1021,7 +1055,7 @@ class Exporter {
           node.modifiers?.some((m) => m.kind === ts.SyntaxKind.AccessorKeyword)) {
         this.unsupported(node, "auto-accessor class fields");
       }
-      if (ts.isMetaProperty(node)) {
+      if (ts.isMetaProperty(node) && node.getText() !== "new.target" && node.getText() !== "import.meta") {
         this.unsupported(node, `${node.getText()} meta-property`);
       }
       if ((ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) && node.attributes) {
@@ -2340,9 +2374,7 @@ class Exporter {
       // these, so id them here. (Includes the defineProperty descriptor case
       // `{ get() {} }`, which is a MethodDeclaration named "get".)
       if ((ts.isMethodDeclaration(n) || ts.isGetAccessorDeclaration(n) || ts.isSetAccessorDeclaration(n)) &&
-          n.body && n.parent && ts.isObjectLiteralExpression(n.parent) &&
-          n.name && (ts.isIdentifier(n.name) || ts.isStringLiteral(n.name) ||
-                     (ts.isComputedPropertyName(n.name) && this.isSymbolKeyExpr(n.name.expression)))) {
+          n.body && n.parent && ts.isObjectLiteralExpression(n.parent) && n.name) {
         if (!this.fnId.has(n)) this.fnId.set(n, this.fnId.size);
       }
       // Dynamic/symbol-keyed computed class METHOD (`class C { [k](){}, [sym](){},
@@ -2746,9 +2778,6 @@ class Exporter {
         for (const m of cls.members) {
           if (this.isStaticMember(m)) continue;
           if (ts.isPropertyDeclaration(m) && m.initializer) scanExpr(m.initializer);
-          const nm = (m as { name?: ts.PropertyName }).name;
-          if (nm && ts.isComputedPropertyName(nm) && this.isDynComputedMember(m)) scanExpr(nm.expression);
-          if (this.isDynComputedInstallMethod(m) || this.isDynComputedInstallAccessor(m)) nested.push(m as unknown as FnLike); // its body captures roll up
         }
       }
     }
@@ -5067,6 +5096,10 @@ class Exporter {
     const bound = this.optChainBound.get(node);
     if (bound !== undefined) return bound;
     this.noteMethodEscape(ctx, node);
+    if (ctx.cellAccess.has(this.lexicalHomeSym)) {
+      const v = this.lowerObjectSuper(ctx, node);
+      if (v !== undefined) return v;
+    }
     if (ts.isTaggedTemplateExpression(node)) return this.lowerTaggedTemplate(ctx, node);
     const jcv = this.constJsonNumberValue(node);
     if (jcv !== undefined && jcv.usedJson && Number.isFinite(jcv.value)) {
@@ -5112,6 +5145,7 @@ class Exporter {
       return dst;
     }
 
+    if (ts.isMetaProperty(node)) return this.lowerMetaProperty(ctx, node, hint);
     if (ts.isArrowFunction(node) || ts.isFunctionExpression(node)) {
       return this.lowerClosure(ctx, node, hint);
     }
@@ -5289,6 +5323,19 @@ class Exporter {
         }
       });
       const emittedAcc = new Set<string>();
+      // a method using `super`: the literal, in a cell its closures capture
+      const savedHome = ctx.cellAccess.get(this.lexicalHomeSym);
+      const homeUsed = node.properties.some((p) => (ts.isMethodDeclaration(p) || ts.isGetAccessorDeclaration(p) || ts.isSetAccessorDeclaration(p)) && this.usesSuper(p));
+      if (homeUsed) {
+        const cell = this.newLocal(ctx, "reference", "homeCell");
+        const hsite = this.site++;
+        this.recordSite(hsite, "cell", this.inLoop(node) ? "many" : "once", true, node, true);
+        ctx.body.push({ kind: "AllocObject", dst: cell, typeId: 0, site: hsite, classId: this.cellClassId });
+        ctx.body.push({ kind: "StoreField", obj: cell, field: this.VALUE, src: dst });
+        ctx.cellAccess.set(this.lexicalHomeSym, cell);
+      } else {
+        ctx.cellAccess.delete(this.lexicalHomeSym);
+      }
       for (const p of node.properties) {
         if (ts.isPropertyAssignment(p) && (ts.isIdentifier(p.name) || ts.isStringLiteral(p.name)) && p.name.text === "__proto__") {
           // `{ __proto__: v }` sets the prototype (an object or null; any other value is ignored), as
@@ -5383,10 +5430,35 @@ class Exporter {
           const symLocal = this.lowerExpr(ctx, p.name.expression);
           ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"),
             builtin: "symbol.set", args: [dst, symLocal, fnLocal] });
+        } else if ((ts.isMethodDeclaration(p) || ts.isGetAccessorDeclaration(p) || ts.isSetAccessorDeclaration(p)) && p.body) {
+          // a computed or numeric name: the key evaluated in place, the member defined under it and
+          // the function named from it (an accessor's other half stays: a merging definition)
+          let key: number;
+          if (ts.isComputedPropertyName(p.name)) {
+            key = this.lowerExpr(ctx, p.name.expression);
+          } else {
+            key = this.newLocal(ctx, "reference");
+            ctx.body.push({ kind: "Const", dst: key, value: { kind: "Str", value: ts.isNumericLiteral(p.name) ? String(Number(p.name.text)) : (p.name as ts.StringLiteral).text } });
+          }
+          const fnLocal = this.lowerClosure(ctx, p as unknown as FnLike, "", /*thisParam*/ true);
+          const prefix = ts.isGetAccessorDeclaration(p) ? "get" : ts.isSetAccessorDeclaration(p) ? "set" : "method";
+          ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: `function.nameFromKey:${prefix}`, args: [fnLocal, key] });
+          if (ts.isMethodDeclaration(p)) {
+            ctx.body.push({ kind: "StoreFieldDynamic", obj: dst, key, src: fnLocal });
+          } else {
+            const undefL = this.newLocal(ctx, "reference");
+            ctx.body.push({ kind: "Const", dst: undefL, value: { kind: "Undef" } });
+            const isGet = ts.isGetAccessorDeclaration(p);
+            ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"),
+              builtin: `object.defineAccessor:${isGet ? 1 : 0}:${isGet ? 0 : 1}:1:1:${(isGet ? 1 : 2) | 4 | 8}`,
+              args: [dst, key, isGet ? fnLocal : undefL, isGet ? undefL : fnLocal] });
+          }
         } else {
           this.unsupported(p, `object literal member ${ts.SyntaxKind[p.kind]}`);
         }
       }
+      if (savedHome !== undefined) ctx.cellAccess.set(this.lexicalHomeSym, savedHome);
+      else ctx.cellAccess.delete(this.lexicalHomeSym);
       return dst;
     }
     if (ts.isArrayLiteralExpression(node)) {
@@ -5461,12 +5533,11 @@ class Exporter {
       }
       if (node.name.text === "length" && ts.isIdentifier(node.expression) &&
           node.expression.text === "arguments" &&
-          !this.symbolOf(node.expression)?.declarations?.length) {
+          !this.symbolOf(node.expression)?.declarations?.length &&
+          ctx.argumentsOffset !== undefined && ctx.argumentsLocal === undefined) {
         const dst = this.newLocal(ctx, "primitive");
-        if (ctx.argumentsOffset === undefined || ctx.isAsync || ctx.isGenerator)
-          this.unsupported(node, "arguments.length in an arrow or coroutine");
         ctx.body.push({ kind: "CallBuiltinStatic", dst,
-          builtin: `arguments.length:${ctx.argumentsOffset ?? 0}`, args: [] });
+          builtin: `arguments.length:${ctx.argumentsOffset}`, args: [] });
         return dst;
       }
       if (this.isGlobalThisPropertyAccess(node, "fetch")) {
@@ -6894,7 +6965,8 @@ class Exporter {
                 }
                 return dst;
               }
-              const numericResult = bname === "string.indexOf" || bname === "string.charCodeAt"
+              if (bname === "string.localeCompare" && argLs.length > 1) this.unsupported(node, "localeCompare with locales or options");
+              const numericResult = bname === "string.indexOf" || bname === "string.charCodeAt" || bname === "string.localeCompare"
                 || bname === "array.indexOf" || bname === "array.push"
                 || bname === "array.findIndex" || bname === "array.lastIndexOf"
                 || bname === "array.unshift";
@@ -7560,11 +7632,9 @@ class Exporter {
         // yield* drives the inner iterator, forwarding each value to our caller and
         // sent values back in. The driver is shared via resolveIterator so the
         // iterator-kind handling is identical to for-of / for-await.
-        const drv = this.resolveIterator(ctx, innerExpr, { forceAsync: !!ctx.isAsync });
-        if (!drv) {
-          this.unsupported(node, "yield* over a non-iterable (only Generator/AsyncGenerator/iterator-protocol objects supported)");
-          return this.newLocal(ctx, "reference");
-        }
+        const innerType = this.checker.getTypeAtLocation(innerExpr);
+        const drv = (innerType.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown) ? undefined : this.resolveIterator(ctx, innerExpr, { forceAsync: !!ctx.isAsync }))
+          ?? this.runtimeIterDriver(ctx, this.lowerExpr(ctx, innerExpr), !!ctx.isAsync);
         const valueField = this.internField("value");
         const doneField = this.internField("done");
         const sent = this.newLocal(ctx, "reference");          // value sent into inner
@@ -7962,17 +8032,25 @@ class Exporter {
       this.unsupported(node, `specialized callback '${node.text}' used as a value where its captures are unavailable`);
       sym = target;
     }
+    if (this.classInKeys !== undefined && sym && this.classSymToId.get(sym) === this.classInKeys) {
+      // a computed key reads the class's name before the class exists
+      const undef = this.newLocal(ctx, "reference");
+      ctx.body.push({ kind: "Const", dst: undef, value: { kind: "Undef" } });
+      ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: `binding.check:${node.text}`, args: [undef] });
+      return undef;
+    }
     if (node.text === "arguments" && !sym?.declarations?.length) {
-      // the arguments object as a value: the actual arguments as an array (`apply(this, arguments)`,
-      // `arguments[i]`, `Array.from(arguments)`; the function keeps its generic entry for the count)
-      const dst = this.newLocal(ctx, "reference", "arguments");
-      if (ctx.argumentsOffset === undefined || ctx.isAsync || ctx.isGenerator) {
-        this.unsupported(node, "the arguments object in an arrow function or a coroutine");
-        ctx.body.push({ kind: "Const", dst, value: { kind: "Undef" } });
+      // the arguments object as a value: the actual arguments as an array, made once at the function's
+      // entry (`apply(this, arguments)`, `arguments[i]`, `Array.from(arguments)`; the function keeps its
+      // generic entry for the count); an arrow reads its enclosing function's through a capture
+      if (ctx.argumentsLocal !== undefined) return ctx.argumentsLocal;
+      const cell = ctx.cellAccess.get(this.lexicalArgumentsSym);
+      if (cell !== undefined) {
+        const dst = this.newLocal(ctx, "reference", "arguments");
+        ctx.body.push({ kind: "LoadField", dst, obj: cell, field: this.VALUE });
         return dst;
       }
-      ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: `arguments.array:${ctx.argumentsOffset}`, args: [] });
-      return dst;
+      return this.loadEnvironmentValue(ctx, node);   // a module has none
     }
     const namespace = sym && this.namespaceBindings.get(sym);
     if (namespace) {
@@ -8070,6 +8148,14 @@ class Exporter {
     {
       const cvClassId = sym ? this.classSymToId.get(sym) : undefined;
       if (cvClassId !== undefined) {
+        const decl = this.classNodeOfId.get(cvClassId);
+        if (decl && ts.isClassExpression(decl)) {
+          // a class expression's own name, inside it
+          const dst = this.newLocal(ctx, "reference", node.text);
+          ctx.body.push({ kind: "LoadGlobal", dst, gref: this.classExprNameGlobal(cvClassId) });
+          ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: `binding.check:${node.text}`, args: [dst] });
+          return dst;
+        }
         const v = this.emitClassValue(ctx, cvClassId, node.text, node);
         if (v !== undefined) return v.local;
       }
@@ -8118,7 +8204,8 @@ class Exporter {
     }
     if (sym && (this.isDefaultLibSymbol(sym) || this.isAmbientValueSymbol(sym))) return this.loadEnvironmentValue(ctx, node);
     if (sym) return this.ensureLocal(ctx, sym, this.refKindOf(node), node.text);
-    return this.newLocal(ctx, this.refKindOf(node), node.text);
+    // no binding at all (a JavaScript file, `@ts-nocheck`): the global object's, or a ReferenceError
+    return this.loadEnvironmentValue(ctx, node);
   }
   /** A value the environment provides: a variable, function or class whose
    *  every declaration is ambient (a .d.ts file, `declare`, `declare global`). */
@@ -8164,11 +8251,14 @@ class Exporter {
       this.unsupported(node, "class expression with a dynamic (mixin) base class");
       return this.newLocal(ctx, "reference", hint);
     }
+    if (!node.name) this.classInferredName.set(cid, hint ?? "");
     const cv = this.emitClassValue(ctx, cid, node.name?.text ?? hint ?? "class", node, false);
     if (cv === undefined) {
       this.unsupported(node, "class expression value (unconstructible)");
       return this.newLocal(ctx, "reference", hint);
     }
+    this.emitComputedClassMembers(ctx, cid);
+    if (node.name) ctx.body.push({ kind: "StoreGlobal", gref: this.classExprNameGlobal(cid), src: cv.local });
     // Run __static_init (if any) at the expression's evaluation position, then link
     // the static container — same order as the declaration form.
     if (this.classStaticGlobal.has(cid)) {
@@ -9801,40 +9891,19 @@ class Exporter {
     ctx.cellAccess.delete(this.lexicalThisSym);
     ctx.thisCellOfBody?.delete(ctx.body);
     try {
-      // Pre-pass: dynamic/symbol-keyed INSTANCE accessors (`get [Symbol.x]()` /
-      // `set [k]()`) install as real accessor descriptors. Grouped by key-expression
-      // source text so a get/set pair becomes one descriptor (installDynamicMember
-      // handles one member at a time, which can't pair get+set). e.g. an instance
-      // `get [Symbol.toStringTag]()` is then consulted by String(obj) for free.
-      const dynAcc = new Map<string, { getter?: ts.GetAccessorDeclaration; setter?: ts.SetAccessorDeclaration; keyExpr: ts.Expression; symKey: boolean }>();
-      for (const m of cnode.members) {
-        if (this.isStaticMember(m) || !this.isDynComputedInstallAccessor(m)) continue;
-        const keyExpr = (m.name as ts.ComputedPropertyName).expression;
-        const k = keyExpr.getText();
-        let a = dynAcc.get(k);
-        if (a === undefined) { a = { keyExpr, symKey: this.isSymbolKeyExpr(keyExpr) }; dynAcc.set(k, a); }
-        if (ts.isGetAccessorDeclaration(m)) a.getter = m; else if (ts.isSetAccessorDeclaration(m)) a.setter = m;
-      }
-      for (const gs of dynAcc.values()) {
-        const keyLocal = this.lowerExpr(ctx, gs.keyExpr);
-        const boxAcc = (d: ts.FunctionLikeDeclaration | undefined): number => {
-          if (d === undefined) { const v = this.newLocal(ctx, "reference"); ctx.body.push({ kind: "Const", dst: v, value: { kind: "Undef" } }); return v; }
-          return this.lowerClosure(ctx, d as unknown as FnLike, "symaccessor", /*thisParam*/ true, classId);
-        };
-        const getterV = boxAcc(gs.getter);
-        const setterV = boxAcc(gs.setter);
-        const builtin = gs.symKey ? "symbol.defineAccessor:1:1:0:1" : "object.defineAccessor:1:1:0:1";
-        ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin, args: [dst, keyLocal, getterV, setterV] });
-      }
       for (const m of cnode.members) {
         if (this.isStaticMember(m)) continue;         // static: handled in __static_init
-        if (this.isDynComputedInstallAccessor(m)) continue;  // handled in the pre-pass above
         // `declare [key]: T` / `declare x: T`: ambient, no runtime property.
         if (ts.isPropertyDeclaration(m) && ts.getModifiers(m)?.some((mod) => mod.kind === ts.SyntaxKind.DeclareKeyword)) continue;
-        // dynamic/symbol-keyed computed member -> install at runtime (field, or a
-        // plain/generator/async method as a data-property closure).
+        // a computed name: the key the class definition kept (a method or an accessor is on the prototype)
         if (this.isDynComputedMember(m)) {
-          this.installDynamicMember(ctx, dst, m, /*thisParam*/ true, classId);
+          if (!ts.isPropertyDeclaration(m)) continue;
+          const key = this.newLocal(ctx, "reference");
+          ctx.body.push({ kind: "LoadGlobal", dst: key, gref: this.computedKeyGlobal(m) });
+          let v: number;
+          if (m.initializer) v = this.lowerExpr(ctx, m.initializer);
+          else { v = this.newLocal(ctx, "reference"); ctx.body.push({ kind: "Const", dst: v, value: { kind: "Undef" } }); }
+          ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "object.defineData:1:1:1", args: [dst, key, v] });
           continue;
         }
         if (!ts.isPropertyDeclaration(m)) continue;   // named methods/accessors -> vtable
@@ -9902,9 +9971,7 @@ class Exporter {
    *  field-initializer module-ref scan in run()). */
   memberCapturesFunctionLocal(m: ts.ClassElement): boolean {
     const name = (m as { name?: ts.PropertyName }).name;
-    if (name && ts.isComputedPropertyName(name) && this.anyFunctionLocalCapture(this.exprOuterRefs(name.expression))) return true;
     if (ts.isPropertyDeclaration(m) && m.initializer && this.anyFunctionLocalCapture(this.exprOuterRefs(m.initializer))) return true;
-    if (ts.isMethodDeclaration(m) && m.body && this.anyFunctionLocalCapture(this.freeVars(m as unknown as FnLike))) return true;
     if (ts.isConstructorDeclaration(m) && m.body && this.anyFunctionLocalCapture(this.freeVars(m as unknown as FnLike))) return true;
     return false;
   }
@@ -10024,38 +10091,72 @@ class Exporter {
     return true;
   }
 
-  /** Install a dynamic/symbol-keyed computed class member onto `obj` at runtime,
-   *  mirroring the object-literal computed-member lowering (exporter.ts ~861-938):
-   *  a string/numeric key -> StoreFieldDynamic (runtime ToPropertyKey); a symbol
-   *  key -> the `symbol.set` builtin (ts_set_symkey). A method is lifted as
-   *  a closure (this bound at call); `thisParam` is true for instance members,
-   *  false for statics (matching lifted static methods). Plain, generator and
-   *  async methods are all installed; getters/setters with such keys are
-   *  loud-rejected (they take the accessor-descriptor path instead). */
-  installDynamicMember(ctx: FnCtx, obj: number, m: ts.ClassElement, thisParam: boolean, classId?: number) {
-    const nameNode = (m as { name: ts.ComputedPropertyName }).name;
-    const keyExpr = nameNode.expression;
-    const symKey = this.isSymbolKeyExpr(keyExpr);
-    // Evaluate the key first (JS evaluates a computed member key before its value).
-    const keyLocal = this.lowerExpr(ctx, keyExpr);
-    let v: number;
-    if (ts.isPropertyDeclaration(m)) {
-      if (m.initializer) v = this.lowerExpr(ctx, m.initializer);
-      else { v = this.newLocal(ctx, "reference"); ctx.body.push({ kind: "Const", dst: v, value: { kind: "Undef" } }); }
-    } else if (ts.isMethodDeclaration(m) && m.body) {
-      // Plain/generator/async method: lower its body (lowerFunctionLike emits a
-      // state machine for generator/async) and box it as a ts_func closure.
-      v = this.lowerClosure(ctx, m as unknown as FnLike, "dynmember", thisParam, classId);
-    } else {
-      // get/set accessor (or any other member) with a dynamic/symbol key
-      this.unsupported(m, "class getter/setter with a dynamic or symbol computed name (only plain methods and fields supported)");
+  private classExprNameGlobal(classId: number): number {
+    let g = this.classExprNameGlobals.get(classId);
+    if (g === undefined) {
+      g = this.internGlobal(`__clsname_${classId}`);
+      this.classExprNameGlobals.set(classId, g);
+    }
+    return g;
+  }
+  /** The global keeping a computed field's key from the class's definition to its initializers. */
+  private computedKeyGlobal(m: ts.ClassElement): number {
+    let g = this.computedKeyGlobals.get(m);
+    if (g === undefined) {
+      g = this.internGlobal(`__cpnkey_${this.computedKeyGlobals.size}`);
+      this.computedKeyGlobals.set(m, g);
+    }
+    return g;
+  }
+  /** ClassDefinitionEvaluation's computed names, in order, where the class is defined: a key is evaluated
+   *  once, whatever the number of instances; a method or an accessor goes on the prototype, not enumerable; an
+   *  instance field's key waits for its initializers in a global. Such a class is one class for all its
+   *  evaluations, so a method that captures a function's local stays a loud reject. Static members with
+   *  computed names run in __static_init right after. */
+  private emitComputedClassMembers(ctx: FnCtx, classId: number): void {
+    const cnode = this.classNodeOfId.get(classId);
+    if (!cnode) return;
+    const members = cnode.members.filter((m) => this.isDynComputedMember(m));
+    if (members.length === 0) return;
+    let proto = -1;
+    for (const m of members) {
+      if (ts.isPropertyDeclaration(m) && ts.getModifiers(m)?.some((mod) => mod.kind === ts.SyntaxKind.DeclareKeyword)) continue;
+      const outerKeys = this.classInKeys;
+      this.classInKeys = classId;
+      const raw = this.lowerExpr(ctx, (m.name as ts.ComputedPropertyName).expression);
+      this.classInKeys = outerKeys;
+      const key = this.newLocal(ctx, "reference");
+      ctx.body.push({ kind: "CallBuiltinStatic", dst: key, builtin: "key.normalize", args: [raw] });
+      if (ts.isPropertyDeclaration(m) || this.isStaticMember(m)) {
+        ctx.body.push({ kind: "StoreGlobal", gref: this.computedKeyGlobal(m), src: key });
+        continue;
+      }
+      if (proto < 0) {
+        proto = this.newLocal(ctx, "reference", "proto");
+        ctx.body.push({ kind: "CallBuiltinStatic", dst: proto, builtin: `class.proto:${classId}`, args: [] });
+      }
+      if (this.anyFunctionLocalCapture(this.freeVars(m as unknown as FnLike))) {
+        this.unsupported(m, "class member with a computed name that captures an enclosing function's local");
+        continue;
+      }
+      const fn = this.lowerClosure(ctx, m as unknown as FnLike, "", /*thisParam*/ true, classId);
+      this.defineComputedMember(ctx, m, proto, key, fn);
+    }
+  }
+  /** A computed name's method or accessor on its holder: SetFunctionName, not enumerable. */
+  private defineComputedMember(ctx: FnCtx, m: ts.ClassElement, holder: number, key: number, fn: number): void {
+    const kind = ts.isGetAccessorDeclaration(m) ? "get" : ts.isSetAccessorDeclaration(m) ? "set" : "method";
+    ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: `function.nameFromKey:${kind}`, args: [fn, key] });
+    if (kind === "method") {
+      ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "object.defineData:0:1:1", args: [holder, key, fn] });
       return;
     }
-    if (symKey) {
-      ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "symbol.set", args: [obj, keyLocal, v] });
-    } else {
-      ctx.body.push({ kind: "StoreFieldDynamic", obj, key: keyLocal, src: v });
-    }
+    const undefL = this.newLocal(ctx, "reference");
+    ctx.body.push({ kind: "Const", dst: undefL, value: { kind: "Undef" } });
+    const isGet = kind === "get";
+    ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"),
+      builtin: `object.defineAccessor:${isGet ? 1 : 0}:${isGet ? 0 : 1}:0:1:${(isGet ? 1 : 2) | 4 | 8}`,
+      args: [holder, key, isGet ? fn : undefL, isGet ? undefL : fn] });
   }
 
   /** Construct an instance of a class that has NO explicit constructor: chain to
@@ -10224,13 +10325,8 @@ class Exporter {
       if (cnode) {
         for (const m of cnode.members) {
           if (this.isStaticMember(m)) continue;
-          const nm = (m as { name?: ts.PropertyName }).name;
-          if (nm && ts.isComputedPropertyName(nm) && this.isDynComputedMember(m))
-            for (const s of this.exprOuterRefs(nm.expression)) res.add(s);
           if (ts.isPropertyDeclaration(m) && m.initializer)
             for (const s of this.exprOuterRefs(m.initializer)) res.add(s);
-          if (this.isDynComputedInstallMethod(m) || this.isDynComputedInstallAccessor(m))
-            for (const s of this.freeVars(m as unknown as FnLike)) res.add(s);
         }
       }
       const parent: number | undefined = this.parentIdOf(cur);
@@ -11674,7 +11770,7 @@ class Exporter {
   builtinMethodName2(kind: "string" | "array" | "map" | "set" | "weakmap" | "weakset" | "headers" | "number" | "boolean" | "promise", method: string): string | undefined {
     const stringMethods = new Set([
       "toUpperCase","toLowerCase","toLocaleUpperCase","toLocaleLowerCase","slice","substring","indexOf","includes",
-      "charAt","charCodeAt","codePointAt","concat","repeat","trim","split",
+      "charAt","charCodeAt","codePointAt","concat","repeat","localeCompare","trim","split",
       "startsWith","endsWith","padStart","padEnd","trimStart","trimEnd",
       "trimLeft","trimRight","at","isWellFormed","toWellFormed",
       "replace","replaceAll","lastIndexOf","normalize","substr","toString","valueOf",
@@ -11720,13 +11816,16 @@ class Exporter {
       "assign","create","getPrototypeOf","setPrototypeOf","keys","getOwnPropertyNames",
       "values","entries","fromEntries","freeze","seal","preventExtensions","isFrozen",
       "isSealed","isExtensible","hasOwn","is","getOwnPropertyDescriptor",
-      "getOwnPropertyDescriptors","getOwnPropertySymbols",
+      "getOwnPropertyDescriptors","getOwnPropertySymbols","defineProperty","defineProperties",
     ]);
+    const reflect = new Set(["get","set","has","deleteProperty","ownKeys","getPrototypeOf","setPrototypeOf",
+      "defineProperty","getOwnPropertyDescriptor","isExtensible","preventExtensions","apply","construct"]);
     const arr = new Set(["isArray","from","of"]);
     const str = new Set(["fromCharCode","fromCodePoint"]);
     if (ns === "Math" && math.has(member)) return `math.${member}`;
     if (ns === "Number" && num.has(member)) return `number.${member}`;
     if (ns === "Object" && obj.has(member)) return `object.${member}`;
+    if (ns === "Reflect" && reflect.has(member)) return `reflect.${member}`;
     if (ns === "JSON" && (member === "stringify" || member === "parse")) return `json.${member}`;
     if (ns === "Array" && arr.has(member)) return `array.${member}`;
     if (ns === "String" && str.has(member)) return `string.${member}`;
@@ -11793,13 +11892,14 @@ class Exporter {
   /** Returns a local holding `value` unless it is undefined, in which case the
    *  default expression `def` is evaluated and used (JS destructuring default
    *  applies only on undefined, not null). */
-  applyDefault(ctx: FnCtx, value: number, def: ts.Expression): number {
+  applyDefault(ctx: FnCtx, value: number, def: ts.Expression, target?: ts.Node): number {
     const res = this.newLocal(ctx, "reference");
     ctx.body.push({ kind: "Copy", dst: res, src: value });
     const isUndef = this.newLocal(ctx, "primitive");
     ctx.body.push({ kind: "UnOp", dst: isUndef, op: "isundef", operand: value });
     const body = this.captureBody(ctx, () => {
-      const d = this.lowerExpr(ctx, def);
+      // an anonymous function or class takes the binding's name
+      const d = this.lowerExpr(ctx, def, target && ts.isIdentifier(target) ? target.text : undefined);
       ctx.body.push({ kind: "Copy", dst: res, src: d });
     });
     ctx.body.push({ kind: "If", cond: isUndef, thenBody: body, elseBody: [] });
@@ -11857,7 +11957,7 @@ class Exporter {
             const isUndef = this.newLocal(ctx, "primitive");
             ctx.body.push({ kind: "UnOp", dst: isUndef, op: "isundef", operand: v });
             const thenB = this.captureBody(ctx, () => {
-              const dv = this.lowerExpr(ctx, defaulted.right);
+              const dv = this.lowerExpr(ctx, defaulted.right, ts.isIdentifier(unwrapped) ? unwrapped.text : undefined);
               ctx.body.push({ kind: "Copy", dst: v, src: dv });
             });
             ctx.body.push({ kind: "If", cond: isUndef, thenBody: thenB, elseBody: [] });
@@ -11881,7 +11981,7 @@ class Exporter {
       risky: !ts.isOmittedExpression(el) && (!ts.isIdentifier(el.name) || (el.initializer !== undefined && !this.isInertDefault(el.initializer))),
       bind: (v: number) => {
         if (ts.isOmittedExpression(el)) return;
-        this.lowerBindingPattern(ctx, el.name, el.initializer ? this.applyDefault(ctx, v, el.initializer) : v);
+        this.lowerBindingPattern(ctx, el.name, el.initializer ? this.applyDefault(ctx, v, el.initializer, el.name) : v);
       },
     }));
   }
@@ -11905,6 +12005,41 @@ class Exporter {
   private isArrayLikeUnion(t: ts.Type): boolean {
     const arrayLike = (ty: ts.Type): boolean => this.checker.isArrayLikeType(ty) && !(ty.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown));
     return arrayLike(t) || (t.isUnion() && t.types.every(arrayLike));
+  }
+  /** The protocol over an iterator the runtime acquires (ts_iter_acquire), for a `yield*` over a value
+   *  of no known type: next by the generic step, IteratorClose by the generic close. */
+  private runtimeIterDriver(ctx: FnCtx, src: number, async: boolean): IterDriver {
+    const itLocal = this.newLocal(ctx, "reference");
+    ctx.body.push({ kind: "CallBuiltinStatic", dst: itLocal, builtin: `iter.acquire:${async ? 1 : 0}`, args: [src] });
+    const nextMethod = this.emitIterMethod(ctx, itLocal);
+    const settle = (rr: number): number => {
+      if (!async) return rr;
+      const r = this.newLocal(ctx, "reference");
+      ctx.body.push({ kind: "Await", dst: r, operand: rr });
+      return r;
+    };
+    const step = (sent: number): number => settle(this.emitIterNext(ctx, itLocal, nextMethod, sent, async));
+    const throwStep = (exc: number): number => {
+      const rr = this.newLocal(ctx, "reference");
+      ctx.body.push({ kind: "CallBuiltin", dst: rr, builtin: `iter.throw:${this.internName("throw")}`, recv: itLocal, args: [exc] });
+      return settle(rr);
+    };
+    const returnCall = (): void => {
+      const rr = this.newLocal(ctx, "reference");
+      ctx.body.push({ kind: "CallBuiltin", dst: rr, builtin: `iter.close:${this.internName("return")}`, recv: itLocal, args: [] });
+      if (async) {
+        const undefV = this.newLocal(ctx, "reference");
+        ctx.body.push({ kind: "Const", dst: undefV, value: { kind: "Undef" } });
+        const called = this.newLocal(ctx, "primitive");
+        ctx.body.push({ kind: "BinOp", dst: called, op: "!==", lhs: rr, rhs: undefV });
+        const thenBody = this.captureBody(ctx, () => {
+          const awaited = this.newLocal(ctx, "reference");
+          ctx.body.push({ kind: "Await", dst: awaited, operand: rr });
+        });
+        ctx.body.push({ kind: "If", cond: called, thenBody, elseBody: [] });
+      }
+    };
+    return { itLocal, srcLocal: src, isAsync: async, step, throwStep, returnCall };
   }
   /** The protocol over a value the types do not settle (`any`, a string, a union with one), for an
    *  array pattern: `forof.open` gives an array, read by index with no iterator object, or an
@@ -12077,6 +12212,8 @@ class Exporter {
     }
     if (ts.isObjectBindingPattern(pat)) {
       const boundKeys: string[] = [];
+      // `const {} = null` reads nothing and still throws
+      if (pat.elements.length === 0) ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "object.coercible", args: [src] });
       for (const el of pat.elements) {
         this.noteMethodEscape(ctx, el);
         if (el.dotDotDotToken) {
@@ -12102,7 +12239,7 @@ class Exporter {
           boundKeys.push(propName);
           ctx.body.push({ kind: "LoadField", dst: propVal, obj: src, field: this.internField(propName) });
         }
-        const bound = el.initializer ? this.applyDefault(ctx, propVal, el.initializer) : propVal;
+        const bound = el.initializer ? this.applyDefault(ctx, propVal, el.initializer, el.name) : propVal;
         this.lowerBindingPattern(ctx, el.name, bound);
       }
       return;
@@ -13511,6 +13648,15 @@ class Exporter {
       // `super.x = v`: resolve a setter from the PARENT (call it with this=receiver),
       // else write an own data property on the receiver — skipping the current class's
       // own setter, per JS super semantics. Mirrors the §72 super READ resolution.
+      if (lhs.expression.kind === ts.SyntaxKind.SuperKeyword && ctx.cellAccess.has(this.lexicalHomeSym)) {
+        const h = this.newLocal(ctx, "reference");
+        ctx.body.push({ kind: "LoadField", dst: h, obj: ctx.cellAccess.get(this.lexicalHomeSym)!, field: this.VALUE });
+        const proto = this.newLocal(ctx, "reference");
+        ctx.body.push({ kind: "CallBuiltinStatic", dst: proto, builtin: "reflect.getPrototypeOf", args: [h] });
+        ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "reflect.set",
+          args: [proto, this.constString(ctx, lhs.name.text), rhs, ctx.thisLocal!] });
+        return;
+      }
       if (lhs.expression.kind === ts.SyntaxKind.SuperKeyword) {
         const nm = lhs.name.text;
         // A super setter is Direct-called with the receiver in `recv` (NOT args[0]),
@@ -13745,7 +13891,8 @@ class Exporter {
     let found = false;
     const visit = (n: ts.Node) => {
       if (found) return;
-      if (n.kind === ts.SyntaxKind.ThisKeyword) { found = true; return; }
+      if (n.kind === ts.SyntaxKind.ThisKeyword || n.kind === ts.SyntaxKind.SuperKeyword ||
+          (ts.isMetaProperty(n) && n.keywordToken === ts.SyntaxKind.NewKeyword)) { found = true; return; }
       // a non-arrow function rebinds `this`, so its body's `this` is not ours.
       if (ts.isFunctionDeclaration(n) || ts.isFunctionExpression(n) ||
           ts.isMethodDeclaration(n) || ts.isGetAccessorDeclaration(n) ||
@@ -13754,6 +13901,157 @@ class Exporter {
     };
     if (node.body) visit(node.body);
     return found;
+  }
+  /** `import.meta`: one object per module, made at first use (a null prototype, `url`, `filename`, `dirname`
+   *  of the source file). `new.target`: in a class constructor the class of `this` being constructed; in a
+   *  function, what `new` left for it (`newtarget.take`, read once at entry into `ctx.newTargetLocal`); in a
+   *  method or an accessor undefined. An arrow sees its enclosing constructor's through the lexical `this`. */
+  private lowerMetaProperty(ctx: FnCtx, node: ts.MetaProperty, hint?: string): number {
+    const dst = this.newLocal(ctx, "reference", hint);
+    if (node.keywordToken === ts.SyntaxKind.ImportKeyword) {
+      const file = node.getSourceFile().fileName;
+      const idx = this.modules.indexOf(node.getSourceFile());
+      const path = this.newLocal(ctx, "reference");
+      ctx.body.push({ kind: "Const", dst: path, value: { kind: "Str", value: file } });
+      ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: `import.meta:${idx}`, args: [path] });
+      return dst;
+    }
+    let owner: ts.Node | undefined = node.parent;
+    while (owner && (ts.isArrowFunction(owner) || !(ts.isFunctionLike(owner) || ts.isPropertyDeclaration(owner) || ts.isClassStaticBlockDeclaration(owner)))) owner = owner.parent;
+    // (an arrow in a plain function takes the lexical `this` too: a constructed instance's class)
+    const viaThis = owner && (ts.isConstructorDeclaration(owner) || ((ts.isFunctionDeclaration(owner) || ts.isFunctionExpression(owner)) && ctx.newTargetLocal === undefined));
+    if (viaThis && ctx.thisLocal !== undefined) {
+      ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "newtarget.ofThis", args: [ctx.thisLocal] });
+    } else if (ctx.newTargetLocal !== undefined) {
+      ctx.body.push({ kind: "Copy", dst, src: ctx.newTargetLocal });
+    } else {
+      ctx.body.push({ kind: "Const", dst, value: { kind: "Undef" } });
+    }
+    return dst;
+  }
+  /** The body reads the arguments object: as a value, or `.length` where that has no fast form (an arrow
+   *  inside, a coroutine). Nested arrows count, other functions have their own. */
+  private readsArguments(body: ts.Node, lengthToo: boolean): boolean {
+    let found = false;
+    const visit = (n: ts.Node, inArrow: boolean): void => {
+      if (found) return;
+      if (ts.isFunctionLike(n) && !ts.isArrowFunction(n)) return;
+      if (ts.isClassLike(n)) return;
+      if (ts.isPropertyAccessExpression(n) && !lengthToo && !inArrow && n.name.text === "length" &&
+          ts.isIdentifier(n.expression) && n.expression.text === "arguments") return;
+      if (ts.isIdentifier(n) && n.text === "arguments" && this.isVarRef(n) && !this.symbolOf(n)?.declarations?.length) { found = true; return; }
+      ts.forEachChild(n, (c) => visit(c, inArrow || ts.isArrowFunction(n)));
+    };
+    visit(body, false);
+    return found;
+  }
+  private arrowInsideReadsArguments(body: ts.Node): boolean {
+    let found = false;
+    const visit = (n: ts.Node): void => {
+      if (found || (ts.isFunctionLike(n) && !ts.isArrowFunction(n)) || ts.isClassLike(n)) return;
+      if (ts.isArrowFunction(n)) { found = this.readsArguments(n, true); if (found) return; }
+      ts.forEachChild(n, visit);
+    };
+    visit(body);
+    return found;
+  }
+  /** An arrow captures the arguments of the function around it, if there is one. */
+  private arrowCapturesArguments(node: ts.ArrowFunction): boolean {
+    if (!this.readsArguments(node, true)) return false;
+    for (let p: ts.Node | undefined = node.parent; p; p = p.parent) {
+      if (ts.isFunctionLike(p) && !ts.isArrowFunction(p)) return true;
+      if (ts.isClassLike(p)) return false;
+    }
+    return false;
+  }
+  /** Does this function read `new.target` itself (arrows inside it read through their `this`)? */
+  private fnUsesNewTarget(node: ts.Node): boolean {
+    let found = false;
+    const visit = (n: ts.Node): void => {
+      if (found) return;
+      if (ts.isMetaProperty(n) && n.keywordToken === ts.SyntaxKind.NewKeyword) { found = true; return; }
+      if (ts.isFunctionLike(n) || ts.isClassLike(n)) return;
+      ts.forEachChild(n, visit);
+    };
+    ts.forEachChild(node, visit);
+    return found;
+  }
+  /** `super` in this function, nested arrows included. */
+  private usesSuper(node: ts.Node): boolean {
+    let found = false;
+    const visit = (n: ts.Node): void => {
+      if (found) return;
+      if (n.kind === ts.SyntaxKind.SuperKeyword) { found = true; return; }
+      if ((ts.isFunctionLike(n) && !ts.isArrowFunction(n)) || ts.isClassLike(n)) return;
+      ts.forEachChild(n, visit);
+    };
+    ts.forEachChild(node, visit);
+    return found;
+  }
+  /** The object literal's member a function belongs to for `super`: itself or, past arrows, the method around it. */
+  private objectSuperOwner(node: ts.Node): boolean {
+    if (!this.usesSuper(node)) return false;
+    let p: ts.Node = node;
+    while (ts.isArrowFunction(p)) {
+      let up: ts.Node | undefined = p.parent;
+      while (up && !ts.isFunctionLike(up) && !ts.isClassLike(up)) up = up.parent;
+      if (!up) return false;
+      p = up;
+    }
+    return (ts.isMethodDeclaration(p) || ts.isGetAccessorDeclaration(p) || ts.isSetAccessorDeclaration(p)) && !!p.parent && ts.isObjectLiteralExpression(p.parent);
+  }
+  /** `super.x`, `super[k]`, `super.m(...)` in an object literal's method: the home object's prototype,
+   *  the read and the call on `this`. undefined for any other expression. */
+  private lowerObjectSuper(ctx: FnCtx, node: ts.Expression): number | undefined {
+    const home = ctx.cellAccess.get(this.lexicalHomeSym);
+    if (home === undefined || ctx.thisLocal === undefined) return undefined;
+    const isSuperAccess = (e: ts.Expression): e is ts.PropertyAccessExpression | ts.ElementAccessExpression =>
+      (ts.isPropertyAccessExpression(e) || ts.isElementAccessExpression(e)) && e.expression.kind === ts.SyntaxKind.SuperKeyword;
+    const target = ts.isCallExpression(node) ? node.expression : node;
+    if (!isSuperAccess(target)) return undefined;
+    const read = (): number => {
+      const h = this.newLocal(ctx, "reference");
+      ctx.body.push({ kind: "LoadField", dst: h, obj: home, field: this.VALUE });
+      const proto = this.newLocal(ctx, "reference");
+      ctx.body.push({ kind: "CallBuiltinStatic", dst: proto, builtin: "reflect.getPrototypeOf", args: [h] });
+      const key = ts.isPropertyAccessExpression(target) ? this.constString(ctx, target.name.text) : this.lowerExpr(ctx, target.argumentExpression);
+      const dst = this.newLocal(ctx, "reference");
+      ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "reflect.get", args: [proto, key, ctx.thisLocal!] });
+      return dst;
+    };
+    if (!ts.isCallExpression(node)) return read();
+    const f = read();
+    const site = this.site++;
+    this.recordSite(site, "array", this.inLoop(node) ? "many" : "once", false, node);
+    const arr = this.newLocal(ctx, "reference");
+    ctx.body.push({ kind: "AllocArray", dst: arr, elemType: 0, site });
+    for (const a of node.arguments) {
+      if (ts.isSpreadElement(a)) {
+        const v = this.lowerExpr(ctx, a.expression);
+        ctx.body.push({ kind: "ArrayPushAll", arr, src: v });
+      } else {
+        const v = this.lowerExpr(ctx, a);
+        ctx.body.push({ kind: "ArrayPush", arr, src: v });
+      }
+    }
+    const dst = this.newLocal(ctx, "reference");
+    ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "reflect.apply", args: [f, ctx.thisLocal, arr] });
+    return dst;
+  }
+  /** The class member an arrow's `super` means: the member around it, past enclosing arrows. */
+  private arrowHomeClass(node: ts.ArrowFunction): { classId: number; isStatic: boolean } | undefined {
+    for (let p: ts.Node | undefined = node.parent; p; p = p.parent) {
+      if (ts.isArrowFunction(p)) continue;
+      if (ts.isClassLike(p.parent ?? p) && (ts.isMethodDeclaration(p) || ts.isGetAccessorDeclaration(p) || ts.isSetAccessorDeclaration(p) ||
+          ts.isConstructorDeclaration(p) || ts.isPropertyDeclaration(p) || ts.isClassStaticBlockDeclaration(p))) {
+        const classId = this.classIdByNode.get(p.parent as ts.ClassLikeDeclaration);
+        if (classId === undefined) return undefined;
+        const isStatic = ts.isClassStaticBlockDeclaration(p) || !!(ts.canHaveModifiers(p) && ts.getModifiers(p)?.some((m) => m.kind === ts.SyntaxKind.StaticKeyword));
+        return { classId, isStatic };
+      }
+      if (ts.isFunctionLike(p)) return undefined;
+    }
+    return undefined;
   }
 
   /** Does this plain function's body reference its OWN `this` (directly, or
@@ -13846,10 +14144,16 @@ class Exporter {
       const cellLocal = cell ?? this.newLocal(ctx, "reference", "missingCell");
       return { binding: slot.binding, cell: cellLocal };
     });
-    // Append the lexical-this capture (if this arrow uses `this`).
+    // Append the lexical-this capture (if this arrow uses `this`), then the arguments'.
     if (arrowThis) {
       const cell = ctx.cellAccess.get(this.lexicalThisSym)!;
       captures.push({ binding: this.bindingIdOf(this.lexicalThisSym), cell });
+    }
+    if (ts.isArrowFunction(node) && this.arrowCapturesArguments(node as ts.ArrowFunction)) {
+      captures.push({ binding: this.bindingIdOf(this.lexicalArgumentsSym), cell: ctx.cellAccess.get(this.lexicalArgumentsSym)! });
+    }
+    if (this.objectSuperOwner(node as ts.Node)) {
+      captures.push({ binding: this.bindingIdOf(this.lexicalHomeSym), cell: ctx.cellAccess.get(this.lexicalHomeSym)! });
     }
     const site = this.site++;
     const dst = this.newLocal(ctx, "reference", hint);
@@ -14015,7 +14319,7 @@ class Exporter {
     const cnode = this.classNodeOfId.get(classId);
     if (cnode === undefined) return false;
     return cnode.members.some((m) => !this.isStaticMember(m) &&
-      ((ts.isPropertyDeclaration(m) && m.initializer !== undefined) || this.isDynComputedMember(m)));
+      ts.isPropertyDeclaration(m) && (m.initializer !== undefined || this.isDynComputedMember(m)));
   }
   isParameterProperty(p: ts.ParameterDeclaration): boolean {
     return p.modifiers?.some((mod) =>
@@ -14618,16 +14922,34 @@ class Exporter {
       let catchBody: any[] = [];
       if (stmt.catchClause) {
         const cc = stmt.catchClause;
-        if (cc.variableDeclaration) {
-          if (!ts.isIdentifier(cc.variableDeclaration.name)) {
-            this.unsupported(cc, "destructured catch binding (only `catch (e)` supported)");
-            return;
-          }
-          const sym = this.symbolOf(cc.variableDeclaration.name);
-          catchVar = sym ? this.ensureLocal(ctx, sym, "reference", cc.variableDeclaration.name.text)
+        const name = cc.variableDeclaration?.name;
+        // a parameter a closure captures, or a pattern, is bound as the body begins, in a cell of
+        // this entry of the clause (a loop around the `try` makes one per catch)
+        const boundSyms: ts.Symbol[] = [];
+        const collect = (n: ts.BindingName): void => {
+          if (ts.isIdentifier(n)) { const b = this.symbolOf(n); if (b) boundSyms.push(b); return; }
+          for (const el of n.elements) if (ts.isBindingElement(el)) collect(el.name);
+        };
+        if (name) collect(name);
+        const inCell = boundSyms.some((b) => this.hasCaptured(ctx, b));
+        if (name && ts.isIdentifier(name) && !inCell) {
+          const sym = this.symbolOf(name);
+          catchVar = sym ? this.ensureLocal(ctx, sym, "reference", name.text)
                          : this.newLocal(ctx, "reference");
+        } else if (name) {
+          catchVar = this.newLocal(ctx, "reference");
         }
-        catchBody = this.captureBody(ctx, () => this.lowerStmt(ctx, cc.block));
+        catchBody = this.captureBody(ctx, () => {
+          for (const b of boundSyms) {
+            const cell = ctx.cellAccess.get(b);
+            if (cell === undefined) continue;
+            const site = this.site++;
+            this.recordSite(site, "cell", "many", true, cc, true);
+            ctx.body.push({ kind: "AllocObject", dst: cell, typeId: 0, site, classId: this.cellClassId });
+          }
+          if (name && (!ts.isIdentifier(name) || inCell)) this.lowerBindingPattern(ctx, name, catchVar!);
+          this.lowerStmt(ctx, cc.block);
+        });
       }
       const finallyBody = hasFinally
         ? this.captureBody(ctx, () => this.lowerStmt(ctx, stmt.finallyBlock!))
@@ -14684,6 +15006,7 @@ class Exporter {
           }
         }
       }
+      if (cid !== undefined) this.emitComputedClassMembers(ctx, cid);
       // Step F: at the declaration's source position, run __static_init (if it has
       // statics) so static initializers observe earlier bindings and the class
       // binding initialized above.
@@ -15065,7 +15388,14 @@ class Exporter {
     // An arrow using `this` lexically receives the enclosing `this` as a trailing
     // cell capture (appended after freeVar cells in lowerClosure, matching order).
     const arrowThis = ts.isArrowFunction(node) && this.arrowUsesThis(node as ts.ArrowFunction);
-    const hasCaptures = freeVars.length > 0 || arrowThis;
+    const arrowArguments = ts.isArrowFunction(node) && this.arrowCapturesArguments(node as ts.ArrowFunction);
+    const objectHome = this.objectSuperOwner(node as ts.Node);
+    const hasCaptures = freeVars.length > 0 || arrowThis || arrowArguments || objectHome;
+    if (arrowThis) {
+      const home = this.arrowHomeClass(node as ts.ArrowFunction);
+      if (home?.isStatic) ctx.staticClass = home.classId;
+      else if (home) ctx.currentClass = home.classId;
+    }
     const emitThis = () => {
       if (thisParam) {
         const tid = this.newLocal(ctx, "reference", "this");
@@ -15101,10 +15431,22 @@ class Exporter {
         ctx.body.push({ kind: "LoadField", dst: tid, obj: lid, field: this.VALUE });
         ctx.thisLocal = tid;
       }
+      if (arrowArguments) {
+        const lid = this.newLocal(ctx, "reference", "cell_arguments", this.bindingIdOf(this.lexicalArgumentsSym));
+        ctx.cellAccess.set(this.lexicalArgumentsSym, lid);
+        ctx.params.push(lid);
+        this.markCellParam(ctx, lid);
+      }
+      if (objectHome) {
+        const lid = this.newLocal(ctx, "reference", "cell_home", this.bindingIdOf(this.lexicalHomeSym));
+        ctx.cellAccess.set(this.lexicalHomeSym, lid);
+        ctx.params.push(lid);
+        this.markCellParam(ctx, lid);
+      }
     };
     if (hasCaptures) { emitCells(); emitThis(); }   // [cells..., this]
     else { emitThis(); }                            // [this] (no cells)
-    ctx.captureCount = hasCaptures ? captureSlots.length + (arrowThis ? 1 : 0) : 0;
+    ctx.captureCount = hasCaptures ? captureSlots.length + (arrowThis ? 1 : 0) + (arrowArguments ? 1 : 0) + (objectHome ? 1 : 0) : 0;
     if (!ts.isArrowFunction(node)) ctx.argumentsOffset = ctx.params.length;
     // 2. real parameters
     const parameterBindings: { node: ts.ParameterDeclaration; local: number }[] = [];
@@ -15156,6 +15498,28 @@ class Exporter {
         const pcid = this.classOfExpr(p.name);
         if (pcid !== undefined) (ctx.paramClasses ||= {})[String(lid)] = pcid;
       } catch { /* ignore */ }
+    }
+    // The arguments object: made here, once. A coroutine's body runs after its entry returns, so its
+    // array comes as a hidden last parameter, filled by the entry (`emit_coroutine_param_copy`).
+    if (!ts.isArrowFunction(node) && node.body && ctx.argumentsOffset !== undefined && node !== (this.moduleInitNode as unknown as FnLike)) {
+      const coroutine = !!ctx.isAsync || !!ctx.isGenerator;
+      if (this.readsArguments(node.body, coroutine)) {
+        if (coroutine) {
+          ctx.argumentsLocal = this.newLocal(ctx, "reference", `__arguments_all:${ctx.argumentsOffset}`);
+          ctx.params.push(ctx.argumentsLocal);
+        } else {
+          ctx.argumentsLocal = this.newLocal(ctx, "reference", "arguments");
+          ctx.body.push({ kind: "CallBuiltinStatic", dst: ctx.argumentsLocal, builtin: `arguments.array:${ctx.argumentsOffset}`, args: [] });
+        }
+        if (this.arrowInsideReadsArguments(node.body)) {
+          const cell = this.newLocal(ctx, "reference", "argumentsCell");
+          const site = this.site++;
+          this.recordSite(site, "cell", "once", true, node as ts.Node, true);
+          ctx.body.push({ kind: "AllocObject", dst: cell, typeId: 0, site, classId: this.cellClassId });
+          ctx.body.push({ kind: "StoreField", obj: cell, field: this.VALUE, src: ctx.argumentsLocal });
+          ctx.cellAccess.set(this.lexicalArgumentsSym, cell);
+        }
+      }
     }
     // 3. prologue: the scope record for the record-resident bindings this
     // function owns (one allocation; fields start as undefined), then a cell
@@ -15230,6 +15594,11 @@ class Exporter {
         this.emitParameterProperties(ctx, ctor, ctx.thisLocal);
         if (ctx.currentClass !== undefined) this.emitFieldInitializers(ctx, ctx.currentClass, ctx.thisLocal);
       }
+    }
+    // new.target of a function: what `new` left for it, taken before anything can call another
+    if ((ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node)) && node.body && this.fnUsesNewTarget(node.body)) {
+      ctx.newTargetLocal = this.newLocal(ctx, "reference", "newTarget");
+      ctx.body.push({ kind: "CallBuiltinStatic", dst: ctx.newTargetLocal, builtin: `newtarget.take:${fnId}`, args: [] });
     }
     // 3d. HOISTING (Step D, scope_resolution.md §6). JS hoists `var` and
     // `function` declarations to the top of the enclosing function:
@@ -15721,6 +16090,9 @@ class Exporter {
           // base's fields and methods (silent wrong values). Reject it loudly.
           const reasons = this.classInfos[classId]?.reasons ?? [];
           const ext = n.heritageClauses?.find((h) => h.token === ts.SyntaxKind.ExtendsKeyword)?.types[0]?.expression;
+          if (ext && (ts.isLiteralExpression(ext) || ext.kind === ts.SyntaxKind.TrueKeyword || ext.kind === ts.SyntaxKind.FalseKeyword)) {
+            this.unsupported(ext, "class extends a value that is not a constructor (a TypeError at the definition)");
+          }
           if (ext && (reasons.includes("extends-non-identifier(mixin)") || reasons.includes("extends-value(unresolved)"))) {
             this.unsupported(ext, "class extends an expression or a class-valued binding (only a class declaration or a library class is supported as a base)");
           }
@@ -15963,7 +16335,8 @@ class Exporter {
       ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"),
         builtin: `object.defineData:${enumerable}:${writable}:${configurable}`, args: [obj, keyLocal, val] });
     };
-    const className = this.classInfos[classId]?.name ?? "";
+    const info = this.classInfos[classId];
+    const className = info?.anonymous ? this.classInferredName.get(classId) ?? "" : info?.name ?? "";
     const nameLocal = this.newLocal(ctx, "reference", "class.name");
     ctx.body.push({ kind: "Const", dst: nameLocal, value: { kind: "Str", value: className } });
     defineStaticData(container, "name", nameLocal, 0, 0, 1);
@@ -15999,17 +16372,6 @@ class Exporter {
       if (a === undefined) { a = {}; accessors.set(nm, a); }
       return a;
     };
-    // Dynamic/symbol-keyed static accessors: grouped by the key-expression's source
-    // text so a `static get [S.x]()` and `static set [S.x]()` pair into one
-    // descriptor (their key source is identical; SameValue pairing within one class
-    // body). `symKey` selects symbol.defineAccessor vs the string object.defineAccessor.
-    const dynAccessors = new Map<string, { getter?: number; setter?: number; keyExpr: ts.Expression; symKey: boolean }>();
-    const dynAccFor = (keyExpr: ts.Expression) => {
-      const k = keyExpr.getText();
-      let a = dynAccessors.get(k);
-      if (a === undefined) { a = { keyExpr, symKey: this.isSymbolKeyExpr(keyExpr) }; dynAccessors.set(k, a); }
-      return a;
-    };
     for (const m of classNode.members) {
       if (!this.isStaticMember(m)) continue;
       // Static well-known-symbol METHOD (`static [Symbol.iterator]() {}`): install it
@@ -16032,33 +16394,21 @@ class Exporter {
         }
         continue;
       }
-      // Other static dynamic/symbol-keyed members (`static [Symbol.toPrimitive]()`,
-      // `static [mySym]()`, `static [k]()`, plus get/set). Methods install as a
-      // closure under the (symbol or dynamic-string) key; accessors are grouped and
-      // emitted as descriptors below. Fields are handled in the field loop. Reads
-      // resolve via the class identifier -> container (§71) + symbol.get / dyn read.
+      // Other computed static members: the key the class definition kept; a field runs in the loop below.
       if (this.isDynComputedMember(m)) {
-        const keyExpr = (m.name as ts.ComputedPropertyName).expression;
-        const symKey = this.isSymbolKeyExpr(keyExpr);
-        if (ts.isMethodDeclaration(m) && m.body) {
+        if (!ts.isPropertyDeclaration(m) && (m as ts.MethodDeclaration).body) {
           const mfn = this.fnId.get(m);
           if (mfn !== undefined) {
-            const keyLocal = this.lowerExpr(ctx, keyExpr);
             const fnval = this.newLocal(ctx, "reference");
             const s2 = this.site++;
             this.recordSite(s2, "closure", "once", true, m);
             ctx.body.push({ kind: "AllocClosure", dst: fnval, func: mfn, captures: [], site: s2 });
+            const keyLocal = this.newLocal(ctx, "reference");
+            ctx.body.push({ kind: "LoadGlobal", dst: keyLocal, gref: this.computedKeyGlobal(m) });
             const c2 = this.newLocal(ctx, "reference");
             ctx.body.push({ kind: "LoadGlobal", dst: c2, gref: gid });
-            if (symKey) ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "symbol.set", args: [c2, keyLocal, fnval] });
-            else ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "object.defineData:0:1:1", args: [c2, keyLocal, fnval] });
+            this.defineComputedMember(ctx, m, c2, keyLocal, fnval);
           }
-        } else if (ts.isGetAccessorDeclaration(m) && m.body) {
-          const f = this.fnId.get(m);
-          if (f !== undefined) dynAccFor(keyExpr).getter = f;
-        } else if (ts.isSetAccessorDeclaration(m) && m.body) {
-          const f = this.fnId.get(m);
-          if (f !== undefined) dynAccFor(keyExpr).setter = f;
         }
         continue;
       }
@@ -16101,43 +16451,20 @@ class Exporter {
       ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"),
         builtin: "object.defineAccessor:1:1:0:1", args: [c2, keyL, getterV, setterV] });
     }
-    // Dynamic/symbol-keyed static accessors (same descriptor shape as above, but the
-    // key is a lowered symbol/dynamic value -> symbol.defineAccessor / object.defineAccessor).
-    for (const gs of dynAccessors.values()) {
-      const keyLocal = this.lowerExpr(ctx, gs.keyExpr);
-      const c2 = this.newLocal(ctx, "reference");
-      ctx.body.push({ kind: "LoadGlobal", dst: c2, gref: gid });
-      const boxFn = (f: number | undefined): number => {
-        const v = this.newLocal(ctx, "reference");
-        if (f === undefined) { ctx.body.push({ kind: "Const", dst: v, value: { kind: "Undef" } }); return v; }
-        const s2 = this.site++; this.recordSite(s2, "closure", "once", true, classNode);
-        ctx.body.push({ kind: "AllocClosure", dst: v, func: f, captures: [], site: s2 });
-        return v;
-      };
-      const getterV = boxFn(gs.getter);
-      const setterV = boxFn(gs.setter);
-      const builtin = gs.symKey ? "symbol.defineAccessor:1:1:0:1" : "object.defineAccessor:1:1:0:1";
-      ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"),
-        builtin, args: [c2, keyLocal, getterV, setterV] });
-    }
     for (const m of classNode.members) {
       const isStatic = this.isStaticMember(m);
       const sfname = isStatic && ts.isPropertyDeclaration(m) ? memberKeyName(m.name) : undefined;
       if (isStatic && this.isDynComputedMember(m)) {
-        // Static dynamic/symbol-keyed FIELD (`static [Symbol.x]=v` / `static [k]=v`):
-        // lower the key + initializer and install on the container (symbol.set for a
-        // symbol key, StoreFieldDynamic for a dynamic-string key). Methods/accessors
-        // were handled above; a non-field dyn member has no initializer to run here.
+        // A computed static field: the key the definition took, the initializer here.
         if (ts.isPropertyDeclaration(m)) {
-          const keyExpr = (m.name as ts.ComputedPropertyName).expression;
-          const keyLocal = this.lowerExpr(ctx, keyExpr);
+          const keyLocal = this.newLocal(ctx, "reference");
+          ctx.body.push({ kind: "LoadGlobal", dst: keyLocal, gref: this.computedKeyGlobal(m) });
           let src: number;
           if (m.initializer) src = this.lowerExpr(ctx, m.initializer);
           else { src = this.newLocal(ctx, "reference"); ctx.body.push({ kind: "Const", dst: src, value: { kind: "Undef" } }); }
           const c2 = this.newLocal(ctx, "reference");
           ctx.body.push({ kind: "LoadGlobal", dst: c2, gref: gid });
-          if (this.isSymbolKeyExpr(keyExpr)) ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "symbol.set", args: [c2, keyLocal, src] });
-          else ctx.body.push({ kind: "StoreFieldDynamic", obj: c2, key: keyLocal, src });
+          ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "object.defineData:1:1:1", args: [c2, keyLocal, src] });
         }
         continue;
       } else if (sfname !== undefined) {
@@ -16146,7 +16473,9 @@ class Exporter {
         else { src = this.newLocal(ctx, "reference"); ctx.body.push({ kind: "Const", dst: src, value: { kind: "Undef" } }); }
         const c2 = this.newLocal(ctx, "reference");
         ctx.body.push({ kind: "LoadGlobal", dst: c2, gref: gid });
-        ctx.body.push({ kind: "StoreField", obj: c2, field: this.internField(sfname), src });
+        // a field defines: `name` and `length` of the class are read only, not its fields' business
+        if (sfname === "name" || sfname === "length") defineStaticData(c2, sfname, src, 1, 1, 1);
+        else ctx.body.push({ kind: "StoreField", obj: c2, field: this.internField(sfname), src });
       } else if (ts.isClassStaticBlockDeclaration(m)) {
         m.body.statements.forEach((s) => this.lowerStmt(ctx, s));
       }
@@ -16202,7 +16531,7 @@ class Exporter {
         : undefined;
       return {
         id: c.id,
-        name: c.name,
+        name: c.anonymous ? this.classInferredName.get(c.id) ?? "" : c.name,
         parent: c.parentId ?? null, // symbol-resolved parent id (scope-correct)
         ownMethods: methods,
         ownFields: c.ownFields.map((f) => this.internField(f)),
@@ -16589,6 +16918,17 @@ class Exporter {
         this.unsupported(md.node, "class method/accessor that captures an enclosing function's local (vtable/static dispatch can't thread the cell; only constructors, field initializers, and dynamic-keyed members capture function-locals — move the class to module scope or pass the value in)");
       }
     }
+    // A class in a function is one class however often it is evaluated: a static initializer has no
+    // cell to read either, and answered 0 with no error.
+    for (const [, cn] of this.classNodeOfId) {
+      for (const m of cn.members) {
+        const init = ts.isPropertyDeclaration(m) && m.modifiers?.some((mod) => mod.kind === ts.SyntaxKind.StaticKeyword) ? m.initializer
+          : ts.isClassStaticBlockDeclaration(m) ? (m.body as unknown as ts.Expression) : undefined;
+        if (init && this.anyFunctionLocalCapture(this.exprOuterRefs(init))) {
+          this.unsupported(m, "static initializer that captures an enclosing function's local (a class in a function is one class for all its evaluations)");
+        }
+      }
+    }
 
     // Step E: any module-scope binding captured by a METHOD body must be
     // published into a GLOBALS[] slot (methods can't receive cell params via the
@@ -16814,7 +17154,7 @@ class Exporter {
       ["charCodeAt","ts_strproto_charCodeAt"],["codePointAt","ts_strproto_codePointAt"],["at","ts_strproto_at"],
       ["isWellFormed","ts_strproto_isWellFormed"],["toWellFormed","ts_strproto_toWellFormed"],
       ["normalize","ts_strproto_normalize"],
-      ["concat","ts_strproto_concat"],["repeat","ts_strproto_repeat"],
+      ["concat","ts_strproto_concat"],["repeat","ts_strproto_repeat"],["localeCompare","ts_strproto_localeCompare"],
       ["trim","ts_strproto_trim"],["trimStart","ts_strproto_trimStart"],
       ["trimEnd","ts_strproto_trimEnd"],["trimLeft","ts_strproto_trimLeft"],
       ["trimRight","ts_strproto_trimRight"],["split","ts_strproto_split"],
@@ -17079,7 +17419,8 @@ function main() {
   // NOT trust the unsound types — it compiles the whole program as `any` (all
   // type-driven optimization off, everything boxed), so it is safe to run even
   // when ill-typed (correct JS semantics, just slower).
-  if (process.env.TSAOT_UNTYPED !== "1") {
+  const untyped = process.env.TSAOT_UNTYPED === "1";
+  {
     const userFiles = program.getSourceFiles().filter((f) =>
       !f.isDeclarationFile &&
       !program.isSourceFileDefaultLibrary(f) &&
@@ -17089,12 +17430,18 @@ function main() {
     // type-only imports) are not type errors and do not block the compile; type errors in them do
     const libDir = path.resolve(__dirname, "..", "lib") + path.sep;
     const lintOnly = new Set([6133, 6138, 6192, 6196, 6198, 6199, 6205, 4114, 1484, 7027]);
-    const diagnostics: ts.Diagnostic[] = [
-      ...userFiles.flatMap((f) => program.getSyntacticDiagnostics(f)),
-      ...userFiles.flatMap((f) => program.getSemanticDiagnostics(f)),
-      ...program.getGlobalDiagnostics(),
-      ...program.getOptionsDiagnostics(),
-    ].filter((d) => !(d.file !== undefined && path.resolve(d.file.fileName).startsWith(libDir) && lintOnly.has(d.code)));
+    const diagnostics: ts.Diagnostic[] = untyped
+      // no type is trusted, but what JavaScript itself refuses stays refused: the parser's errors and the checker's early errors
+      ? [
+          ...userFiles.flatMap((f) => program.getSyntacticDiagnostics(f)),
+          ...userFiles.flatMap((f) => program.getSemanticDiagnostics(f)).filter(isEarlyError),
+        ]
+      : [
+          ...userFiles.flatMap((f) => program.getSyntacticDiagnostics(f)),
+          ...userFiles.flatMap((f) => program.getSemanticDiagnostics(f)),
+          ...program.getGlobalDiagnostics(),
+          ...program.getOptionsDiagnostics(),
+        ].filter((d) => !(d.file !== undefined && path.resolve(d.file.fileName).startsWith(libDir) && lintOnly.has(d.code)));
     if (diagnostics.length > 0) {
       const fmtHost: ts.FormatDiagnosticsHost = {
         getCanonicalFileName: (f) => f,
@@ -17105,6 +17452,10 @@ function main() {
         ? ts.formatDiagnosticsWithColorAndContext(diagnostics, fmtHost)
         : ts.formatDiagnostics(diagnostics, fmtHost);
       process.stderr.write(formatted);
+      if (untyped) {
+        console.error(`\nSyntaxError: ${diagnostics.length} early error(s). Refusing to compile input JavaScript itself refuses.`);
+        process.exit(2);
+      }
       const errs = diagnostics.filter((d) => d.category === ts.DiagnosticCategory.Error).length;
       console.error(`\n${errs || diagnostics.length} type error(s). Refusing to compile ill-typed input ` +
         `(types are unsound under type errors — silent-miscompile hazard). ` +

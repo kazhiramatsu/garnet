@@ -82,6 +82,8 @@ export function dynamicBaseEmptyClass(decl: ts.ClassLikeDeclaration, checker: ts
 export interface ClassInfo {
   id: number;
   name: string;
+  /** A class expression without a name: `name` is an internal label, the value's `name` is inferred at its site. */
+  anonymous?: boolean;
   parentName?: string;
   /** The `extends` target's SYMBOL (lexical name resolution), captured for an
    *  identifier base. Resolving the parent via this symbol (not by name) is
@@ -191,7 +193,7 @@ export class ClassExtractor {
     const name = decl.name?.text ?? `anonClass${this.classes.length}`;
     const id = this.classes.length;
     const info: ClassInfo = {
-      id, name, ownMethods: [], ownFields: [], instantiated: false, stable: true, reasons: [],
+      id, name, anonymous: decl.name === undefined, ownMethods: [], ownFields: [], instantiated: false, stable: true, reasons: [],
     };
 
     // extends clause: only a plain class reference keeps stability.

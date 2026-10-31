@@ -107,3 +107,16 @@ try/catch itself throws (rethrow) or returns. v1 scope:
   the primary correctness fix.
 - GC root depth restored on every unwind (no leak / no use-after-free).
 - finally-via-unwind edge cases rejected loudly rather than miscompiled.
+
+### Stack overflow (Session 362)
+
+A recursion that overflows the stack is the RangeError V8 throws, catchable, with no test on a call. The
+main program runs on a thread of 256 MB (`TSAOT_MAIN_STACK_MB`); `ts_fault` (SIGSEGV, SIGBUS, on an
+alternate stack) takes a fault within 1 MB below the stack pointer for the guard page, rewrites the
+context to resume `ts_stack_overflow_throw` on a stack of its own, and returns, so the kernel leaves the
+signal state as it found it. That function builds the error with the collector held (`g_gc_hold`: the
+conservative scan walks the thread's stack, which is not this one) and throws: the `longjmp` lands on the
+thread's stack again, at the nearest `try`. A fault during a collection, and every other fault, flushes
+stdout and takes the default action, so a crash no longer loses what the program printed. ASan builds
+keep their own handler. The depth is 256 MB's, not V8's 1 MB, and a recursion the C compiler turns into a
+loop (a tail call, an accumulator) has no stack to overflow: it spins where V8 throws.

@@ -1,32 +1,83 @@
 #!/usr/bin/env python3
-"""Classify a conformance log of test262 programs: scripts/test262/summary.py <log> [--top N]
-export: a compile-time reject (loud); aot-*: the program ran and differs from V8 (silent or a crash)."""
-import collections, re, sys
-log, top = sys.argv[1], int(sys.argv[3]) if len(sys.argv) > 3 else 25
-kinds = collections.Counter(); reasons = collections.Counter(); dirs = collections.Counter(); samples = {}
-total = None
-for line in open(log, errors="replace"):
-    m = re.match(r"\[conf:\S+\] PASS=(\d+) FAIL=(\d+) / (\d+)", line)
-    if m: total = tuple(map(int, m.groups())); continue
-    m = re.match(r"\[conf\] FAIL (\S+?): (.*)", line)
-    if m:
+"""Classify the logs of scripts/test262/run.sh: scripts/test262/summary.py <out dir> [--top N] [--dir PREFIX]
+
+A case passes when it prints nothing (or the async harness's completion line) and exits; a negative case when
+the compile refuses it or the run throws the expected error. Otherwise, by what garnet did:
+  reject     the compile stopped (loud)        wrong    ran, and differs from V8
+  crash      killed by a signal                timeout  killed by the watchdog
+  v8-also    V8 fails as well in this harness (a sloppy-only case in a strict module, a host hook)"""
+import collections, glob, os, re, sys
+out = sys.argv[1]
+top = int(sys.argv[sys.argv.index("--top") + 1]) if "--top" in sys.argv else 30
+prefix = sys.argv[sys.argv.index("--dir") + 1] if "--dir" in sys.argv else ""
+meta = {}
+for f in glob.glob(os.path.join(out, "*.meta")):
+    for line in open(f, errors="replace"):
+        p = line.rstrip("\n").split("\t")
+        if len(p) >= 5: meta[p[0]] = p
+kinds = collections.Counter(); reasons = collections.Counter(); dirs = collections.defaultdict(collections.Counter); samples = {}; feats = collections.Counter()
+OK = ("", "Test262:AsyncTestComplete|")
+def note(slug, kind, why=""):
+    if prefix and not slug.startswith(prefix): return
+    kinds[kind] += 1
+    dirs["/".join(slug.split("__")[:3])][kind] += 1
+    if why:
+        reasons[(kind, why)] += 1
+        samples.setdefault((kind, why), slug)
+    if kind in ("wrong", "crash", "timeout", "reject"):
+        m = meta.get(slug)
+        if m:
+            for x in m[4].split(","):
+                if x: feats[x] += 1
+for log in sorted(glob.glob(os.path.join(out, "*.log"))):
+    pending = None
+    for line in open(log, errors="replace"):
+        line = line.rstrip("\n")
+        if pending and line.startswith("  ["):
+            why = re.sub(r"^\s*\[\S+\]\s*-?\s*", "", line); why = re.sub(r" at /.*", "", why)[:90]
+            m = meta.get(pending)
+            if m and m[2]: note(pending, "pass")
+            else: note(pending, "reject", why)
+            pending = None
+            continue
+        if pending:
+            m = meta.get(pending)
+            if m and m[2]: note(pending, "pass")
+            else: note(pending, "reject", "(no reason line)")
+            pending = None
+        m = re.match(r"\[conf\] PASS (\S+)\s+\((.*)\)$", line)
+        if m:
+            slug, o = m.groups()
+            n = meta.get(slug)
+            if n and n[2]:
+                note(slug, "pass" if n[3] and n[3] in o else "wrong" if o in OK else "v8-also", "" if o not in OK else "accepted a negative case")
+            elif o in OK: note(slug, "pass")
+            else: note(slug, "v8-also", re.sub(r"\d+", "N", o)[:70])
+            continue
+        m = re.match(r"\[conf\] FAIL (\S+?): (.*)", line)
+        if not m: continue
         slug, rest = m.groups()
-        if rest.startswith("AOT=["):
-            aot = re.match(r"AOT=\[(.*?)\] V8=\[", rest).group(1) if re.match(r"AOT=\[(.*?)\] V8=\[", rest) else rest
-            k = "aot-crash" if "Segmentation" in rest or "Bus error" in rest or "Abort" in rest or "signal" in aot else "aot-timeout" if "TIMEOUT" in aot else "aot-diff"
-            why = re.sub(r"\d+", "N", aot)[:70]
-        else:
-            k = rest.split()[0].rstrip(":")
-            why = rest[:80]
-        kinds[k] += 1
-        reasons[(k, why)] += 1
-        dirs["/".join(slug.split("__")[:3])] += 1
-        samples.setdefault((k, why), slug)
-    elif line.startswith("  - ") or "UNSUPPORTED" in line and False:
-        reasons[("reject", re.sub(r" at /.*", "", line.strip())[:90])] += 1
-if total: print(f"PASS {total[0]}  FAIL {total[1]}  of {total[2]}")
-for k, v in kinds.most_common(): print(f"{v:7} {k}")
+        if rest.startswith("export"):
+            pending = slug; continue
+        a = re.match(r"AOT=\[(.*)\] V8=\[(.*)\]$", rest)
+        if not a:
+            note(slug, "reject", rest[:80]); continue
+        aot, v8 = a.groups()
+        n = meta.get(slug)
+        if n and n[2]:
+            note(slug, "pass" if n[3] and n[3] in aot else "wrong", "" if n[3] and n[3] in aot else "negative: " + re.sub(r"\d+", "N", aot)[:60]); continue
+        short = re.sub(r"\d+", "N", aot.replace("tsaot: Uncaught exception: ", ""))[:70]
+        sig = re.search(r"\[signal (\d+)\]", aot)
+        if sig: note(slug, "timeout" if sig.group(1) == "14" else "crash", "signal " + sig.group(1) + ": " + short)
+        elif v8 not in OK: note(slug, "v8-also")
+        else: note(slug, "wrong", short)
+    if pending: note(pending, "reject", "(no reason line)")
+total = sum(kinds.values())
+print("total", total, " ".join(f"{k}={v}" for k, v in kinds.most_common()))
 print("-- by reason")
-for (k, why), v in reasons.most_common(top): print(f"{v:7} {k:12} {why}   e.g. {samples.get((k, why), '')}")
-print("-- by directory")
-for d, v in dirs.most_common(top): print(f"{v:7} {d}")
+for (k, why), v in reasons.most_common(top): print(f"{v:7} {k:8} {why}   e.g. {samples[(k, why)]}")
+print("-- by directory (not passing)")
+rows = sorted(dirs.items(), key=lambda kv: -sum(v for k, v in kv[1].items() if k != "pass"))
+for d, c in rows[:top]: print(f"{sum(c.values()):7} {d:48} " + " ".join(f"{k}={v}" for k, v in c.most_common()))
+print("-- features of the failures")
+for f, v in feats.most_common(top): print(f"{v:7} {f}")

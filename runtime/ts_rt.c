@@ -6471,9 +6471,11 @@ void ts_print(tsv v){ g_inspect_color = ts_stream_wants_color(stdout); ts_print_
 /* console.log / .info / .debug -> stdout; .warn / .error -> stderr. Multiple
    arguments are printed space-separated with a single trailing newline, matching
    the JS console family. */
+static void console_format_to(FILE* out, tsv* args, int n);
 static void ts_console_to(FILE* out, tsv* args, int n){
   g_inspect_color = ts_stream_wants_color(out);
-  for (int i=0;i<n;i++){ if (i) fputc(' ', out); ts_print_to(out, args[i]); }
+  if (n > 1 && ts_is_str(args[0])) console_format_to(out, args, n);
+  else for (int i=0;i<n;i++){ if (i) fputc(' ', out); ts_print_to(out, args[i]); }
   fputc('\n', out);
 }
 void ts_console_log(tsv* args, int n){ ts_console_to(stdout, args, n); }
@@ -7156,7 +7158,10 @@ static void g0_dump(FILE* out){
 }
 #endif
 static uint64_t g_minor_collections = 0;   /* this process's young collections (the fork trace) */
+/* The stack overflow's error is built on another stack (ts_fault), which the conservative scan cannot walk. */
+static int g_gc_hold;
 void ts_gc_collect_young(void){
+  if (TS_RT_UNLIKELY(g_gc_hold)) return;
   gc_young_count_all();
   g_payload_fresh_bytes = 0;
   if (!g_young_new_since_minor && !g_young_log_len){ g_young_fresh_bytes = 0; gc_young_restart(); return; }
@@ -7245,6 +7250,7 @@ void ts_gc_collect_young(void){
   RT_STAT_GC_T1;
 }
 void ts_gc_collect(void){
+  if (TS_RT_UNLIKELY(g_gc_hold)) return;
   RT_STAT_INC(full_gc); RT_STAT_GC_T0;
   G0_T0;
   gc_young_count_all();
@@ -7918,10 +7924,58 @@ tsv ts_str_to_well_formed(tsv s){
 }
 
 tsv ts_str_concat(tsv a, tsv b){ return ts_add(a,b); }
+/* String.prototype.localeCompare, the default collation (ICU root) over ASCII and the Latin letters,
+   whose accents compare after the base letter: the first primary difference decides (punctuation, then
+   digits, then letters without case), then the first accent, then the first case (lower before upper).
+   A prefix sorts first. Other characters compare by code unit after the letters. Locales and options
+   are a compile-time reject. */
+static const char k_collate_ascii[] = " _-,;:!?.'\"()[]{}@*/\\&#%`^+<=>|~$0123456789aAbBcCdDeEfFgGhHiIjJkKlLmMnNoOpPqQrRsStTuUvVwWxXyYzZ";
+static const char k_latin_base[] = "AAAAAA.CEEEEIIII.NOOOOO..UUUUY..aaaaaa.ceeeeiiii.nooooo..uuuuy.yAaAaAaCcCcCcCcDd..EeEeEeEeEeGgGgGgGgHh..IiIiIiIiI...JjKk.LlLlLl....NnNnNn...OoOoOo..RrRrRrSsSsSsSsTtTt..UuUuUuUuUuUuWwYyYZzZzZz.";
+static uint8_t g_collate_primary[128], g_collate_upper[128];
+static void collate_init(void){
+  if (g_collate_primary[(unsigned char)'a']) return;
+  uint8_t p = 1;
+  for (const char* c = k_collate_ascii; *c; c++){
+    unsigned char u = (unsigned char)*c;
+    if (u >= 'A' && u <= 'Z'){ g_collate_primary[u] = g_collate_primary[u + 32]; g_collate_upper[u] = 1; }
+    else g_collate_primary[u] = ++p;
+  }
+}
+static void collate_key(uint32_t cu, uint32_t* primary, uint32_t* accent, uint32_t* upper){
+  *accent = 0; *upper = 0;
+  if (cu >= 0xC0 && cu < 0x180 && k_latin_base[cu - 0xC0] != '.'){ *accent = cu; cu = (unsigned char)k_latin_base[cu - 0xC0]; }
+  if (cu < 128){ *primary = g_collate_primary[cu]; *upper = g_collate_upper[cu]; }
+  else *primary = 1000u + cu;
+}
+double ts_str_locale_compare(tsv a, tsv b){
+  collate_init();
+  tsv sa = ts_to_string_v(a); ts_gc_root(&sa);
+  tsv sb = ts_to_string_v(b);
+  ts_gc_unroot(1);
+  ts_strview x = ts_str_view_typed(sa), y = ts_str_view_typed(sb);
+  int accent = 0, upper = 0;
+  uint32_t n = x.len < y.len ? x.len : y.len;
+  for (uint32_t i = 0; i < n; i++){
+    uint32_t pa, aa, ua, pb, ab, ub;
+    collate_key(ts_str_cu_at_view(x, i), &pa, &aa, &ua);
+    collate_key(ts_str_cu_at_view(y, i), &pb, &ab, &ub);
+    if (pa != pb) return pa < pb ? -1 : 1;
+    if (!accent && aa != ab) accent = aa < ab ? -1 : 1;
+    if (!upper && ua != ub) upper = ua < ub ? -1 : 1;
+  }
+  if (x.len != y.len) return x.len < y.len ? -1 : 1;
+  return accent ? accent : upper;
+}
 tsv ts_str_repeat(tsv s, double count){
   if(!ts_is_str(s)) return s;
+  if (count < 0 || isinf(count)){
+    char msg[64], num[40];
+    ts_fmt_num(trunc(count), num, sizeof num);
+    snprintf(msg, sizeof msg, "Invalid count value: %s", num);
+    ts_throw_range_error_msg(msg);
+  }
   ts_strview xs=ts_str_view_typed(s);
-  long c=(long)count; if(c<0)c=0;
+  long c=(long)count;
   uint64_t total64=(uint64_t)xs.len*(uint64_t)c;
   if(total64 > UINT32_MAX) ts_abort_msg("string too large");
   uint32_t total=(uint32_t)total64;
@@ -8505,8 +8559,8 @@ tsv ts_array_slice(tsv arr, double start, double end, int has_end){
 }
 /* new Array(n): a sparse array of length n (no indexed own properties). */
 tsv ts_array_new_length(double n){
-  long len=(long)n; if(len<0) len=0;
-  return ts_new_array((uint32_t)len);
+  if (!(n >= 0.0) || n > 4294967295.0 || floor(n) != n) ts_throw_range_error_msg("Invalid array length");
+  return ts_new_array((uint32_t)n);
 }
 tsv ts_array_concat(tsv x, tsv y){
   if (TS_ARRAY_PROXY(x)) return ts_method_dynamic(x, "concat", &y, 1);
@@ -11644,6 +11698,7 @@ static uint32_t g_field_cap = 0;
    back through `Reflect.get(target, key)` or used as a Map key costs no allocation, no interning and
    no byte comparison (vue's handlers do all three on every access). */
 static tsv* g_field_strings = NULL;
+static int g_has_wrappers;   /* a Number or Boolean object exists: the tests for one stay off the paths otherwise */
 /* The runtime's and the compiler's internal slots on user-visible objects (a Date's `__date_ms`, a
    generator object's `__coro`, a RegExp string iterator's `__tsaot_rx_iter_*`, a capture cell's `__value`, the host
    objects on the global, ...) are hidden from every enumeration, serialization and copy; a user's
@@ -11659,7 +11714,7 @@ static int field_name_is_internal(const char* n, uint32_t len){
     "__generator_return_value", "__text_encoder", "__text_decoder_encoding", "__text_decoder_fatal",
     "__text_decoder_ignore_bom", "__array_iterator_source", "__array_iterator_index",
     "__array_iterator_kind", "__map_iterator_source", "__map_iterator_last", "__map_iterator_kind",
-    "__tsaot_rx_iter_re", "__tsaot_rx_iter_input", "__tsaot_rx_iter_done" };
+    "__tsaot_rx_iter_re", "__tsaot_rx_iter_input", "__tsaot_rx_iter_done", "__primitive" };
   if (len < 2 || n[0] != '_' || n[1] != '_') return 0;
   for (size_t i = 0; i < sizeof names / sizeof names[0]; i++)
     if (strlen(names[i]) == len && memcmp(names[i], n, len) == 0) return 1;
@@ -12492,7 +12547,9 @@ static void json_enter(jbuf* b, json_path* node, tsv* slot, int depth){
   node->slot = slot; node->up = b->path; b->path = node;
 }
 static inline void json_leave(jbuf* b, json_path* node){ b->path = node->up; }
+static tsv wrapper_value(tsv v);
 static int json_stringify_val(jbuf* b, tsv v, int depth, const char* indent){
+  if (TS_RT_UNLIKELY(g_has_wrappers) && wrapper_value(v) != TS_UNDEFINED) v = wrapper_value(v);
   /* top-level toJSON (key ""): children get toJSON applied by their property /
      element / map emitters, so depth>0 never re-applies it to the same value. */
   if (depth == 0 && ts_is_obj(v)) v = json_apply_tojson(v, "", 0);
@@ -12938,6 +12995,8 @@ tsv ts_make_class_value_cells_once(uint32_t class_id, ts_code ctor, tsv* env, ui
    then run the constructor (env auto-prepended by ts_call -> [cells..., this, args]).
    Per ECMA-262, if the ctor returns an object, that object is the result. */
 #define TS_CONSTRUCT_ARGS_STACK 16
+static int primitive_ctor_construct(tsv ctor, tsv* args, int n, tsv* out);
+static tsv g_new_target = TS_UNDEFINED;
 tsv ts_construct(tsv ctorv, tsv* args, int n){
   if (g_has_proxies && ts_is_proxy(ctorv)) return ts_proxy_construct(ctorv, args, n);
   if (!ts_is_func(ctorv)) ts_throw_type_error("value is not a constructor");
@@ -12957,6 +13016,8 @@ tsv ts_construct(tsv ctorv, tsv* args, int n){
        function expressions — the constructable flag mirrors FN_HAS_PROTOTYPE);
        arrows/methods/async/generators/builtins throw V8's catchable TypeError. */
     if (!((ts_func*)ts_ptr(ctorv))->constructable){
+      tsv wrapped;
+      if (primitive_ctor_construct(ctorv, args, n, &wrapped)) return wrapped;
       const char* nm = ((ts_func*)ts_ptr(ctorv))->name;
       char buf[192];
       snprintf(buf, sizeof(buf), "%s is not a constructor", (nm && nm[0]) ? nm : "value");
@@ -12972,6 +13033,7 @@ tsv ts_construct(tsv ctorv, tsv* args, int n){
     tsv inst = ts_new_object_n(est ? est : 12u);
     ts_gc_root(&inst);
     ((ts_object*)ts_ptr(inst))->proto = ts_is_obj(proto) ? proto : ts_object_proto();
+    g_new_target = ctorv;
     int pm = n + 1;
     tsv pstack[TS_CONSTRUCT_ARGS_STACK];
     tsv* pcallargs = pm <= TS_CONSTRUCT_ARGS_STACK
@@ -13737,6 +13799,14 @@ static void inspect_val(jbuf* b, tsv v, int depth, int top){
   if (ts_is_undef(v)){ jbc(b,TSC_UNDEF); jb_putz(b,"undefined"); jbc(b,TSC_FGOFF); return; }
   if (ts_is_null(v)){ jbc(b,TSC_BOLD); jb_putz(b,"null"); jbc(b,TSC_BOLDOFF); return; }
   if (ts_is_bool(v)){ jbc(b,TSC_NUM); jb_putz(b,(v&1)?"true":"false"); jbc(b,TSC_FGOFF); return; }
+  if (ts_is_symbol(v)){
+    jbc(b,TSC_STR);
+    ts_strview sv = ts_str_view_typed(ts_symbol_tostring(v));
+    uint32_t sn = 0; char* su = ts_str_utf8_copy_view(sv, &sn);
+    jb_puts(b, su, sn); free(su);
+    jbc(b,TSC_FGOFF);
+    return;
+  }
   if (ts_is_num(v)){ jbc(b,TSC_NUM); double d=ts_to_num(v); if (d==0.0 && signbit(d)) jb_putz(b,"-0"); else { char nb[40]; ts_fmt_num(d,nb,sizeof nb); jb_putz(b,nb); } jbc(b,TSC_FGOFF); return; }
   if (ts_is_str(v)){
     ts_strview s=ts_str_view_typed(v);
@@ -13786,7 +13856,20 @@ static void inspect_val(jbuf* b, tsv v, int depth, int top){
     if (a->len==0){ jb_putz(b,"[]"); ts_gc_unroot(1); return; }
     uint32_t len=a->len;
     jb_putz(b,"[ ");
-    for (uint32_t i=0;i<len;i++){ a=ts_ptr(v); if(i) jb_putz(b,", "); inspect_val(b, ts_array_get(v,i), depth+1, 0); }
+    for (uint32_t i=0;i<len;i++){
+      a=ts_ptr(v);
+      if (i) jb_putz(b,", ");
+      if (!a->sparse && i < a->len && array_is_hole(a->data[i])){
+        uint32_t run = 1;
+        while (i + run < a->len && array_is_hole(a->data[i + run])) run++;
+        char holes[48];
+        snprintf(holes, sizeof holes, "<%u empty item%s>", run, run == 1 ? "" : "s");
+        jbc(b,TSC_UNDEF); jb_putz(b, holes); jbc(b,TSC_FGOFF);
+        i += run - 1;
+        continue;
+      }
+      inspect_val(b, ts_array_get(v,i), depth+1, 0);
+    }
     jb_putz(b," ]");
     ts_gc_unroot(1);
     return;
@@ -13851,6 +13934,14 @@ static void inspect_val(jbuf* b, tsv v, int depth, int top){
     ts_gc_root(&v);
     ts_prop_own_enum(v, cb_inspect_count, &ic);
     int symc = count_own_enum_sym_props(v);
+    if (TS_RT_UNLIKELY(g_has_wrappers) && wrapper_value(v) != TS_UNDEFINED){
+      tsv w = wrapper_value(v);
+      jb_putz(b, ts_is_num(w) ? "[Number: " : "[Boolean: ");
+      inspect_val(b, w, depth + 1, 0);
+      jb_putc(b, ']');
+      ts_gc_unroot(1);
+      return;
+    }
     inspect_ctor_prefix(b, v);   /* Node: `ClassName { ... }` / `Empty {}` (omitted for plain objects) */
     if (ic.count==0 && symc==0){ ts_gc_unroot(1); jb_putz(b,"{}"); return; }
     jb_putz(b,"{ ");
@@ -13869,6 +13960,55 @@ static void ts_inspect_to(FILE* out, tsv v){
   inspect_val(&b, v, 0, 1);
   fwrite(b.p, 1, b.len, out);
   jb_free(&b);
+}
+/* console.log with a string first and more arguments: Node's formatWithOptions. %s %d %i %f %j %o %O %c
+   take the next argument while there is one, %% is a percent sign, and what is left follows with spaces.
+   The string is walked as UTF-8: only its ASCII percent signs matter. */
+static void console_format_arg(FILE* out, char c, tsv t){
+  switch (c){
+    case 's':
+      if (ts_is_num(t) || ts_is_str(t) || !ts_object_like(t) || ts_is_symbol(t)) ts_print_to(out, ts_is_symbol(t) ? ts_symbol_tostring(t) : ts_is_num(t) ? t : ts_to_string_v(t));
+      else ts_print_to(out, t);
+      return;
+    case 'd': ts_print_to(out, ts_num(ts_is_symbol(t) ? NAN : ts_number_coerce(t))); return;
+    case 'i': ts_print_to(out, ts_num(ts_is_symbol(t) ? NAN : ts_parse_int_v(t, TS_UNDEFINED))); return;
+    case 'f': ts_print_to(out, ts_num(ts_is_symbol(t) ? NAN : ts_parse_float(t))); return;
+    case 'j': { tsv j = ts_json_stringify(t); ts_print_to(out, j); return; }
+    default: { jbuf b; jb_init(&b); inspect_val(&b, t, 0, 0); fwrite(b.p, 1, b.len, out); jb_free(&b); return; }
+  }
+}
+static void console_format_to(FILE* out, tsv* args, int n){
+  uint32_t flen = 0;
+  char* first = ts_str_utf8_copy_view(ts_str_view_typed(args[0]), &flen);
+  int a = 0;
+  size_t last = 0;
+  for (size_t i = 0; i + 1 < flen; i++){
+    if (first[i] != '%') continue;
+    char c = first[++i];
+    if (a + 1 != n){
+      if (c == '%'){ fwrite(first + last, 1, i - last, out); last = i + 1; continue; }
+      if (!strchr("sjdOoifc", c)) continue;
+      if (last != i - 1) fwrite(first + last, 1, i - 1 - last, out);
+      a++;
+      if (c != 'c') console_format_arg(out, c, args[a]);
+      last = i + 1;
+    } else if (c == '%'){
+      fwrite(first + last, 1, i - last, out);
+      last = i + 1;
+    }
+  }
+  int join = 0;
+  if (last != 0){
+    a++;
+    join = 1;
+    if (last < flen) fwrite(first + last, 1, flen - last, out);
+  }
+  free(first);
+  for (; a < n; a++){
+    if (join) fputc(' ', out);
+    ts_print_to(out, args[a]);
+    join = 1;
+  }
 }
 /* console.dir(v): always inspect (nested-string quoting), trailing newline. */
 void ts_console_dir(tsv v){
@@ -15685,6 +15825,11 @@ tsv ts_objproto_tostring_call(tsv v){
       return r;
     }
     ts_gc_unroot(1);
+  }
+  if (TS_RT_UNLIKELY(g_has_wrappers)){
+    tsv w = wrapper_value(v);
+    if (ts_is_num(w)) return ts_new_string("[object Number]", 15);
+    if (ts_is_bool(w)) return ts_new_string("[object Boolean]", 16);
   }
   if (ts_is_regexp(v)) return TS_TAG(g_tag_regexp);
   /* the builtin tags of the collections, promises and errors (ECMA-262's @@toStringTag of their
@@ -17686,6 +17831,7 @@ tsv ts_strproto_isWellFormed(tsv* a, int n){ (void)n; return ts_bool(ts_str_is_w
 tsv ts_strproto_toWellFormed(tsv* a, int n){ (void)n; return ts_str_to_well_formed(a[0]); }
 tsv ts_strproto_concat(tsv* a, int n){ tsv r=a[0]; for (int i=1;i<n;i++) r=ts_str_concat(r, a[i]); return r; }
 tsv ts_strproto_repeat(tsv* a, int n){ return ts_str_repeat(a[0], n>1?ts_to_num(a[1]):0); }
+tsv ts_strproto_localeCompare(tsv* a, int n){ return ts_num(ts_str_locale_compare(a[0], n>1?a[1]:TS_UNDEFINED)); }
 tsv ts_strproto_trim(tsv* a, int n){ (void)n; return ts_str_trim(a[0]); }
 tsv ts_strproto_trimStart(tsv* a, int n){ (void)n; return ts_str_trimstart(a[0]); }
 tsv ts_strproto_trimEnd(tsv* a, int n){ (void)n; return ts_str_trimend(a[0]); }
@@ -17761,11 +17907,139 @@ void ts_string_proto_register(ts_key method_key, const char* name, ts_code fn){
    Thin ts_code wrappers over the static number builtins so a method call on an
    any-typed number (resolved via ts_get -> g_number_proto) reaches the same
    implementation as the statically-typed `n.method()` fast path. */
-tsv ts_numproto_toFixed(tsv* a, int n){ return ts_number_to_fixed_v(a[0], n>1?a[1]:TS_UNDEFINED); }
-tsv ts_numproto_toString(tsv* a, int n){ return ts_number_to_string_radix_v(a[0], n>1?a[1]:TS_UNDEFINED); }
-tsv ts_numproto_toPrecision(tsv* a, int n){ return ts_number_to_precision_v(a[0], n>1?a[1]:TS_UNDEFINED); }
-tsv ts_numproto_toExponential(tsv* a, int n){ return ts_number_to_exponential_v(a[0], n>1?a[1]:TS_UNDEFINED); }
-tsv ts_numproto_valueOf(tsv* a, int n){ (void)n; return a[0]; }
+/* The wrapper objects of numbers and booleans (`new Number(5)`, `Object(true)`): an ordinary object of the
+   type's prototype, its primitive in an internal slot; `typeof` says "object", a wrapper of false is
+   truthy, and ToPrimitive reaches the primitive through the prototype's valueOf. */
+static ts_key primitive_slot_key(void){ static ts_key k; if (!k) k = ts_intern_field("__primitive", 11); return k; }
+static tsv wrapper_value(tsv v){
+  if (TS_TOP16(v) != TS_SEL_OBJECT) return TS_UNDEFINED;
+  ts_object* o = (ts_object*)ts_ptr(v);
+  if (o->h.kind != TS_KIND_OBJECT) return TS_UNDEFINED;
+  tsv* s = find_slot(o, primitive_slot_key(), 0);
+  return s ? *s : TS_UNDEFINED;
+}
+static tsv this_number(tsv v, const char* method){
+  if (ts_is_num(v)) return v;
+  tsv w = wrapper_value(v);
+  if (ts_is_num(w)) return w;
+  char m[96];
+  snprintf(m, sizeof m, "Number.prototype.%s requires that 'this' be a Number", method);
+  ts_throw_type_error_msg(m);
+  return TS_UNDEFINED;
+}
+static tsv this_boolean(tsv v, const char* method){
+  if (ts_is_bool(v)) return v;
+  tsv w = wrapper_value(v);
+  if (ts_is_bool(w)) return w;
+  char m[96];
+  snprintf(m, sizeof m, "Boolean.prototype.%s requires that 'this' be a Boolean", method);
+  ts_throw_type_error_msg(m);
+  return TS_UNDEFINED;
+}
+static tsv new_wrapper(tsv prim, tsv proto){
+  g_has_wrappers = 1;
+  ts_gc_root(&prim); ts_gc_root(&proto);
+  tsv o = ts_new_object();
+  ((ts_object*)ts_ptr(o))->proto = proto;
+  ts_gc_root(&o);
+  ts_define_data(o, primitive_slot_key(), prim, 0, 0, 0);
+  ts_gc_unroot(3);
+  return o;
+}
+/* ToObject for what has a wrapper here; a string stays itself (`Object("s")`, KNOWN_GAPS.md). */
+tsv ts_to_object(tsv v){
+  if (ts_is_num(v)) return new_wrapper(v, ts_number_proto());
+  if (ts_is_bool(v)) return new_wrapper(v, ts_boolean_proto());
+  return v;
+}
+/* new.target. A class's constructor runs on an instance already of the class being constructed: the
+   `constructor` of its prototype. A function is told by ts_construct, which leaves the constructor here for
+   the next entry of that code: a function that reads new.target takes it first thing, so a plain call
+   made meanwhile by a constructor that does not read it finds another function's value and ignores it. */
+tsv ts_new_target_of(tsv self){
+  static ts_key k;
+  if (!k) k = ts_intern_field("constructor", 11);
+  if (!ts_is_obj(self)) return TS_UNDEFINED;
+  tsv p = ts_get_proto(self);
+  return ts_is_obj(p) ? ts_get(p, k) : TS_UNDEFINED;
+}
+tsv ts_take_new_target(ts_code code){
+  tsv v = g_new_target;
+  if (v == TS_UNDEFINED || ((ts_func*)ts_ptr(v))->code != code) return TS_UNDEFINED;
+  g_new_target = TS_UNDEFINED;
+  return v;
+}
+/* import.meta: one object per module, kept for the program's run. */
+tsv ts_import_meta(uint32_t module, tsv path){
+  typedef struct meta_entry { struct meta_entry* next; uint32_t module; int rooted; tsv v; } meta_entry;
+  static meta_entry* metas;
+  for (meta_entry* e = metas; e; e = e->next) if (e->module == module) return e->v;
+  ts_gc_root(&path);
+  tsv o = ts_object_create(TS_NULL); ts_gc_root(&o);
+  uint32_t n = 0; char* u = ts_string_cstr_copy(path, &n);
+  char* url = (char*)malloc(n + 8);
+  memcpy(url, "file://", 7); memcpy(url + 7, u, n);
+  char* slash = strrchr(u, '/');
+  tsv dir = ts_new_string(u, slash ? (uint32_t)(slash - u) : 0u);
+  ts_gc_root(&dir);
+  ts_set(o, ts_intern_field("url", 3), ts_new_string(url, n + 7));
+  ts_set(o, ts_intern_field("filename", 8), path);
+  ts_set(o, ts_intern_field("dirname", 7), dir);
+  free(u); free(url);
+  meta_entry* e = (meta_entry*)calloc(1, sizeof *e);
+  e->module = module; e->v = o; e->next = metas; metas = e;
+  ts_root_static_once(&e->v, &e->rooted);
+  ts_gc_unroot(3);
+  return o;
+}
+/* ToPropertyKey as a value: a computed class member's key is taken once, at the definition. */
+tsv ts_property_key_value(tsv v){
+  if (ts_is_str(v) || ts_is_symbol(v)) return v;
+  ts_key key;
+  return ts_key_from_value(v, &key) ? ts_key_to_value(key) : v;
+}
+/* SetFunctionName from a computed key: a symbol's description in brackets, a prefix for an accessor. */
+tsv ts_fn_name_from_key(tsv fn, tsv key, const char* prefix){
+  if (!ts_is_func(fn)) return fn;
+  ts_gc_root(&fn);
+  tsv text;
+  if (ts_is_symbol(key)){
+    tsv d = ts_symbol_description(key);
+    if (ts_is_str(d)){
+      uint32_t n = 0; char* u = ts_string_cstr_copy(d, &n);
+      char* b = (char*)malloc(n + 3);
+      b[0] = '['; memcpy(b + 1, u, n); b[n + 1] = ']'; b[n + 2] = 0;
+      text = ts_new_string(b, n + 2);
+      free(u); free(b);
+    } else text = ts_new_string("", 0);
+  } else text = ts_to_string_v(key);
+  uint32_t n = 0; char* u = ts_string_cstr_copy(text, &n);
+  size_t pl = strlen(prefix);
+  char* name = (char*)malloc(pl + n + 1);   /* a ts_func's name lives as long as the program */
+  memcpy(name, prefix, pl); memcpy(name + pl, u, n); name[pl + n] = 0;
+  free(u);
+  ((ts_func*)ts_ptr(fn))->name = name;
+  ts_gc_unroot(1);
+  return fn;
+}
+static tsv g_ctor_object = TS_UNDEFINED, g_ctor_number = TS_UNDEFINED, g_ctor_boolean = TS_UNDEFINED;
+void ts_register_primitive_ctors(tsv object, tsv number, tsv boolean){ g_ctor_object = object; g_ctor_number = number; g_ctor_boolean = boolean; }
+/* `new` of Object, Number or Boolean: 1 and the object; their adapters are plain functions otherwise. */
+static int primitive_ctor_construct(tsv ctor, tsv* args, int n, tsv* out){
+  tsv a = n > 0 ? args[0] : TS_UNDEFINED;
+  if (ctor == g_ctor_object){
+    *out = a == TS_UNDEFINED || a == TS_NULL ? ts_new_object() : ts_to_object(a);
+    return 1;
+  }
+  if (ctor == g_ctor_number){ *out = new_wrapper(ts_num(n > 0 ? ts_number_coerce(a) : 0.0), ts_number_proto()); return 1; }
+  if (ctor == g_ctor_boolean){ *out = new_wrapper(ts_bool(ts_truthy(a)), ts_boolean_proto()); return 1; }
+  return 0;
+}
+tsv ts_numproto_toFixed(tsv* a, int n){ return ts_number_to_fixed_v(this_number(a[0], "toFixed"), n>1?a[1]:TS_UNDEFINED); }
+tsv ts_numproto_toString(tsv* a, int n){ return ts_number_to_string_radix_v(this_number(a[0], "toString"), n>1?a[1]:TS_UNDEFINED); }
+tsv ts_numproto_toPrecision(tsv* a, int n){ return ts_number_to_precision_v(this_number(a[0], "toPrecision"), n>1?a[1]:TS_UNDEFINED); }
+tsv ts_numproto_toExponential(tsv* a, int n){ return ts_number_to_exponential_v(this_number(a[0], "toExponential"), n>1?a[1]:TS_UNDEFINED); }
+tsv ts_numproto_valueOf(tsv* a, int n){ (void)n; return this_number(a[0], "valueOf"); }
 
 tsv ts_number_proto(void){ return ts_proto_ref(g_number_proto_v) ? g_number_proto_v : TS_NULL; }
 void ts_number_proto_init(void){
@@ -17783,9 +18057,9 @@ void ts_number_proto_register(ts_key method_key, const char* name, ts_code fn){
 /* ---- Boolean.prototype methods (this = args[0]) ---- */
 tsv ts_boolproto_toString(tsv* a, int n){
   (void)n;
-  return ts_truthy(a[0]) ? ts_new_string("true", 4) : ts_new_string("false", 5);
+  return ts_truthy(this_boolean(a[0], "toString")) ? ts_new_string("true", 4) : ts_new_string("false", 5);
 }
-tsv ts_boolproto_valueOf(tsv* a, int n){ (void)n; return ts_bool(ts_truthy(a[0])); }
+tsv ts_boolproto_valueOf(tsv* a, int n){ (void)n; return this_boolean(a[0], "valueOf"); }
 
 tsv ts_boolean_proto(void){ return ts_proto_ref(g_boolean_proto_v) ? g_boolean_proto_v : TS_NULL; }
 void ts_boolean_proto_init(void){
@@ -19012,9 +19286,9 @@ tsv ts_get_dyn(tsv obj, tsv keyv){
     ts_gc_unroot(1);
     return r;
   }
-  /* non-string key on an object: ToPropertyKey. Number keys become string/index
-     keys; symbol keys stay symbols. */
-  if (ts_is_obj(obj)){
+  /* non-string key: ToPropertyKey (number keys become string/index keys; symbol keys stay symbols),
+     on an object, a function, or a primitive's prototype chain */
+  if (ts_is_obj(obj) || ts_is_func(obj) || ts_is_num(obj) || ts_is_bool(obj)){
     ts_gc_root(&obj);
     ts_key key;
     int ok = ts_key_from_value(keyv, &key);
@@ -19028,7 +19302,7 @@ tsv ts_get_dyn_pic_checked(tsv obj, tsv keyv, ts_prop_ic* ic){
   if (ts_is_null(obj) || ts_is_undef(obj)) return ts_get_dyn_checked(obj, keyv);
   if (g_has_proxies && ts_is_proxy(obj)) return ts_get_dyn(obj, keyv);
   if (ts_is_indexed_array_fast(obj) && ts_is_num(keyv)) return ts_get_dyn(obj, keyv);
-  if (ts_is_str(keyv) || ts_is_str(obj) || ts_is_obj(obj)){
+  if (ts_is_str(keyv) || ts_is_str(obj) || ts_is_obj(obj) || ts_is_func(obj) || ts_is_num(obj) || ts_is_bool(obj)){
     ts_key key;
     int ok;
     if (ts_is_str(keyv)) ok = ts_key_from_value(keyv, &key);   /* a string key allocates nothing on the way to its id */
@@ -19058,7 +19332,7 @@ void ts_set_dyn(tsv obj, tsv keyv, tsv v){
   }
   /* non-string key on an object: ToPropertyKey. Number keys become string/index
      keys; symbol keys stay symbols. */
-  if (ts_is_obj(obj)){
+  if (ts_is_obj(obj) || ts_is_func(obj)){
     ts_gc_root(&obj); ts_gc_root(&v);
     ts_key key;
     int ok = ts_key_from_value(keyv, &key);
@@ -19069,7 +19343,7 @@ void ts_set_dyn(tsv obj, tsv keyv, tsv v){
 void ts_set_dyn_pic(tsv obj, tsv keyv, tsv v, ts_prop_ic* ic){
   if (g_has_proxies && ts_is_proxy(obj)){ ts_set_dyn(obj, keyv, v); return; }
   if (ts_is_indexed_array_fast(obj) && ts_is_num(keyv)){ ts_set_dyn(obj, keyv, v); return; }
-  if (ts_is_str(keyv) || ts_is_obj(obj)){
+  if (ts_is_str(keyv) || ts_is_obj(obj) || ts_is_func(obj)){
     ts_gc_root(&obj); ts_gc_root(&v);
     ts_key key;
     int ok = ts_key_from_value(keyv, &key);
@@ -23678,6 +23952,27 @@ tsv ts_iter_close(tsv iter, ts_key rmk){
   return r;
 }
 
+/* A throw forwarded into a delegate of `yield*` over a value of no known type: its `throw`, found as
+   ts_iter_next_method finds `next`; without one the delegate is closed and the throw is a TypeError. */
+tsv ts_iter_throw(tsv iter, ts_key tmk, tsv exc){
+  static ts_key k_throw;
+  if (!k_throw) k_throw = ts_intern_field("throw", 5);
+  ts_gc_root(&iter); ts_gc_root(&exc);
+  tsv tf = ts_get(iter, k_throw);
+  if (!ts_is_callable(tf) && !ts_is_proxy(iter)) tf = ts_get(iter, tmk);
+  if (!ts_is_callable(tf)){
+    ts_iter_close(iter, ts_intern_field("return", 6));
+    ts_gc_unroot(2);
+    ts_throw_type_error_msg("The iterator does not provide a 'throw' method");
+  }
+  ts_gc_root(&tf);
+  tsv a[2] = { iter, exc };
+  tsv r = ts_call_method(tf, a, 2);
+  ts_gc_unroot(3);
+  if (!ts_iter_object(r)) ts_throw_type_error_msg("Iterator result is not an object");
+  return r;
+}
+
 /* ---- async generators (async function*) ---- */
 /* build a {value, done} iterator-result object */
 tsv ts_iter_result(tsv value, int done){
@@ -23879,7 +24174,8 @@ static char** ts_user_argv;
    declares it without a prototype so a `main(void)` definition compiles too;
    a `(void)` entry ignores the two registers, as isolate mode's entry does) */
 typedef int (*ts_user_main_fn)(int, char**);
-static int ts_user_main_call(int argc, char** argv){ return ((ts_user_main_fn)ts_user_main)(argc, argv); }
+static void ts_fault_install(void);
+static int ts_user_main_call(int argc, char** argv){ ts_fault_install(); return ((ts_user_main_fn)ts_user_main)(argc, argv); }
 static void* ts_user_main_thread(void* arg){ (void)arg; ts_user_main_rc = ts_user_main_call(ts_user_argc, ts_user_argv); return NULL; }
 /* TSAOT_CRASH_TRACE=1: a fault prints its address, whether it lies in a shared
    worker's region (docs/published_graphs_design.md, the protect diagnostic),
@@ -23907,6 +24203,74 @@ static void ts_crash_trace_install(void){
   sa.sa_sigaction = ts_crash_trace; sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
   sigaction(SIGSEGV, &sa, NULL); sigaction(SIGBUS, &sa, NULL);
 }
+/* A stack overflow is the RangeError V8 throws, at no cost to a call: the thread's guard page faults, the
+   handler (on its own stack) sees the fault beside the stack pointer and resumes in
+   ts_stack_overflow_throw on a second stack, which builds the error and unwinds to the nearest `try`.
+   Any other fault flushes what the program printed and takes the default action again. */
+#if defined(__has_feature)
+# if __has_feature(address_sanitizer)
+#  define TS_NO_FAULT_HANDLER 1
+# endif
+#endif
+#if !defined(TS_NO_FAULT_HANDLER) && !defined(__SANITIZE_ADDRESS__) && \
+    ((defined(__APPLE__) && (defined(__arm64__) || defined(__x86_64__))) || (defined(__linux__) && (defined(__aarch64__) || defined(__x86_64__))))
+#if defined(__APPLE__)
+#include <sys/ucontext.h>
+#else
+#include <ucontext.h>
+#endif
+#define TS_FAULT_SIGSTACK (64u << 10)
+#define TS_OVERFLOW_STACK (256u << 10)
+static char* g_overflow_stack;
+static void ts_stack_overflow_throw(void){
+  g_gc_hold = 1;
+  tsv e = ts_new_error(TS_ERR_RANGE, ts_new_string("Maximum call stack size exceeded", 32));
+  g_gc_hold = 0;
+  ts_throw(e);
+  abort();
+}
+static void ts_fault(int sig, siginfo_t* si, void* ucv){
+  ucontext_t* uc = (ucontext_t*)ucv;
+#if defined(__APPLE__) && defined(__arm64__)
+  uintptr_t sp = (uintptr_t)uc->uc_mcontext->__ss.__sp;
+#elif defined(__APPLE__)
+  uintptr_t sp = (uintptr_t)uc->uc_mcontext->__ss.__rsp;
+#elif defined(__aarch64__)
+  uintptr_t sp = (uintptr_t)uc->uc_mcontext.sp;
+#else
+  uintptr_t sp = (uintptr_t)uc->uc_mcontext.gregs[REG_RSP];
+#endif
+  uintptr_t a = (uintptr_t)si->si_addr;
+  if (!g_gc_collecting && a + (1u << 20) >= sp && a < sp + (1u << 16)){
+    uintptr_t top = ((uintptr_t)g_overflow_stack + TS_OVERFLOW_STACK) & ~(uintptr_t)15;
+#if defined(__APPLE__) && defined(__arm64__)
+    uc->uc_mcontext->__ss.__sp = top; uc->uc_mcontext->__ss.__pc = (uintptr_t)ts_stack_overflow_throw;
+#elif defined(__APPLE__)
+    uc->uc_mcontext->__ss.__rsp = top - 8; uc->uc_mcontext->__ss.__rip = (uintptr_t)ts_stack_overflow_throw;
+#elif defined(__aarch64__)
+    uc->uc_mcontext.sp = top; uc->uc_mcontext.pc = (uintptr_t)ts_stack_overflow_throw;
+#else
+    uc->uc_mcontext.gregs[REG_RSP] = (greg_t)(top - 8); uc->uc_mcontext.gregs[REG_RIP] = (greg_t)ts_stack_overflow_throw;
+#endif
+    return;
+  }
+  signal(sig, SIG_DFL);
+  fflush(stdout);
+}
+static void ts_fault_install(void){
+  const char* e = getenv("TSAOT_CRASH_TRACE");
+  if (e && e[0] == '1') return;
+  g_overflow_stack = (char*)malloc(TS_OVERFLOW_STACK);
+  stack_t ss; memset(&ss, 0, sizeof ss);
+  ss.ss_sp = malloc(TS_FAULT_SIGSTACK); ss.ss_size = TS_FAULT_SIGSTACK;
+  if (!g_overflow_stack || !ss.ss_sp || sigaltstack(&ss, NULL) != 0) return;
+  struct sigaction sa; memset(&sa, 0, sizeof sa);
+  sa.sa_sigaction = ts_fault; sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+  sigaction(SIGSEGV, &sa, NULL); sigaction(SIGBUS, &sa, NULL);
+}
+#else
+static void ts_fault_install(void){}
+#endif
 int main(int argc, char** argv){
   ts_user_argc = argc; ts_user_argv = argv;
   ts_crash_trace_install();
