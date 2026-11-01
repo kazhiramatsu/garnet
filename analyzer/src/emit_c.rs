@@ -24137,6 +24137,8 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 "dynclass.thisCheck" => (format!("ts_dyn_this_check({})", v(0)), false),
                 "super.set" => (format!("ts_super_set({}, {}, {}, {})", v(0), v(1), v(2), v(3)), false),
                 "cast.number" => (format!("ts_cast_number({})", v(0)), false),
+                "cast.numberArray" => (format!("ts_cast_number_array({})", v(0)), false),
+                _ if builtin.starts_with("cast.foreignNumber:") => (format!("ts_cast_foreign_number({}, {})", v(0), c_string_lit(&builtin["cast.foreignNumber:".len()..])), false),
                 _ if builtin.starts_with("method.receiver:") => (format!("ts_method_receiver({}, {})", v(0), c_string_lit(&builtin["method.receiver:".len()..])), false),
                 "dynclass.super" => (format!("ts_dyn_super({}, {}, {})", v(0), v(1), v(2)), false),
                 "dynclass.bindCheck" => (format!("(ts_dyn_bind_check({}), TS_UNDEFINED)", v(0)), false),

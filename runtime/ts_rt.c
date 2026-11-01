@@ -2002,9 +2002,8 @@ int g_has_callable_proxies = 0;
    (ts_arrproto_*) never come back here for a Proxy: they read the elements through the traps
    (arrproto_elements) or run the generic algorithm (arrlike_*), as Array.prototype.x.call(proxy) does. */
 /* The array builtins' test of a receiver that is no array: null and undefined throw here, the one
-   path all of them take (a typed array read past an end: `rows[9].push(1)` answered 0); anything else takes
-   the dynamic call V8 makes: a Proxy, an array-like a cast called an array (`.push` answered 0, silently). */
-#define TS_ARRAY_PROXY(arr) ((void)ts_recv_coercible(arr), 1)
+   path all of them take (a typed array read past an end: `rows[9].push(1)` answered 0). */
+#define TS_ARRAY_PROXY(arr) ((void)ts_recv_coercible(arr), TS_RT_UNLIKELY(g_has_proxies) && ts_is_proxy(arr))
 tsv ts_new_map(void);
 tsv ts_new_set(void);
 int g_typed_slow = 0;    /* declared in ts_rt.h; see ts_typed_slow there */
@@ -20090,6 +20089,23 @@ void ts_throw_bad_number_cast(tsv v){
   snprintf(buf, sizeof buf, "A value of type %s was cast to number", u);
   free(u);
   ts_throw_type_error_msg(buf);
+}
+void ts_throw_foreign_number(tsv v, const char* name){
+  tsv t = ts_typeof(v);
+  uint32_t n = 0; char* u = ts_string_cstr_copy(t, &n);
+  char buf[192];
+  snprintf(buf, sizeof buf, "'%s' is typed number and holds a value of type %s", name, u);
+  free(u);
+  ts_throw_type_error_msg(buf);
+}
+tsv ts_cast_number_array(tsv v){
+  if (!ts_is_indexed_array_fast(v)) return v;
+  uint32_t n = ts_array_len(v);
+  for (uint32_t i = 0; i < n; i++){
+    tsv e = ts_array_get(v, i);
+    if (!ts_is_num(e)) ts_throw_foreign_number(e, "element");
+  }
+  return v;
 }
 tsv ts_super_set(tsv proto, tsv k, tsv v, tsv receiver){
   ts_gc_root(&v);

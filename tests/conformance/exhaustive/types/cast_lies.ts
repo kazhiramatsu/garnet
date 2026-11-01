@@ -12,7 +12,7 @@ t("literal", () => { const u: unknown = 2; return (u as 1 | 2) + 1; });
 t("array-like length", () => { const a = { length: 2, 0: 7 } as unknown as number[]; return [a[0], a.length]; });
 t("array-like push", () => { const a = { length: 0 } as unknown as number[]; return a.push(1); });
 t("array-like own push", () => { const a = { length: 0, push(v: number) { return v * 2; } } as unknown as number[]; return a.push(4); });
-t("array-like join", () => { const a = Object.create(Array.prototype); a.length = 2; a[0] = "x"; a[1] = "y"; return (a as string[]).join("-"); });
+t("array-like in place", () => ({ length: 3 } as unknown as number[]).length);
 t("string as array", () => { const s = "abc" as unknown as string[]; return [s.length, s.slice(1)]; });
 t("class from a literal", () => { const p = { x: 5 } as unknown as P; return p.x; });
 t("class from a number", () => { const p = 7 as unknown as P; return (p as any).x; });

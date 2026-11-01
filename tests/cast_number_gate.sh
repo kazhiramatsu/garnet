@@ -12,14 +12,26 @@ t(() => { const n = "x" as unknown as number; return n; });
 t(() => { function r(): number { return {} as unknown as number; } return r(); });
 t(() => { const u: unknown = 5; const n = u as number; return n + 1; });
 t(() => { let n = undefined as unknown as number; n = 7; return n; });
+interface Config { port: number; name: string; tags: string[] }
+t(() => { const c = JSON.parse('{"port":"8080"}') as Config; const p: number = c.port; return p; });
+t(() => { const c = JSON.parse("{}") as Config; const f = (n: number) => n; return f(c.port); });
+t(() => { const c: Config = JSON.parse('{"port":"x"}'); return c.port + 1; });
+t(() => (JSON.parse('[1,"x"]') as number[]).length);
 TS
 TSAOT_CC="${TSAOT_CC:-cc -O1}" ./garnet -o "$tmp/c.c" "$tmp/c.ts" > "$tmp/out" 2>&1 || { echo "[cast-number] FAIL: compile"; tail -3 "$tmp/out"; exit 1; }
 got=$("$tmp/c")
-want='TypeError: A value of type string was cast to number
+want=$(cat <<'WANT'
+TypeError: A value of type string was cast to number
 TypeError: A value of type string was cast to number
 TypeError: A value of type string was cast to number
 TypeError: A value of type object was cast to number
 6
-7'
+7
+TypeError: 'port' is typed number and holds a value of type string
+TypeError: 'port' is typed number and holds a value of type undefined
+TypeError: A value of type string was cast to number
+TypeError: 'element' is typed number and holds a value of type string
+WANT
+)
 if [ "$got" == "$want" ]; then echo "[cast-number] PASS: a lying cast into a number slot throws"; else echo "[cast-number] FAIL:"; echo "$got"; fail=1; fi
 exit $fail

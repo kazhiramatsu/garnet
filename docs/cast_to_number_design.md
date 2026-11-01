@@ -29,6 +29,33 @@ A cast to a number type is **unbacked** when the operand's static type does not 
 
 Untyped mode (`TSAOT_UNTYPED=1`) trusts no annotation and takes no test.
 
+## Data out of JSON
+
+`JSON.parse(s) as Config` is the same lie one level down: the cast is to an object type, the number comes later, from
+`c.port`, and nothing says the file holds one. `c.port + 1` over `"8080"` gave 8081, `c.port === undefined` was false for
+a missing key.
+
+`computeForeignTypes` finds, over the whole program, each type a value out of JSON is cast or assigned to:
+`JSON.parse(...)`, `res.json()`, a variable holding one, through `as`, an annotation, an argument or a return. That type
+and what the program declares inside it are **foreign**. A property read off a foreign type (`foreignValue`) follows the
+rule above: `any` in place, tested flowing on. The test is stricter, undefined does not pass: nobody wrote a placeholder,
+the key is missing. A variable with no declared type that takes such a read stays boxed, so `const p = c.port` keeps
+what the file held.
+
+The seeds are the entries of external data and not every cast from `any`: a compiler is full of `x as any as Node`, its
+values are its own, and the types behind them are the ones that must stay fast. A type no parsed value reaches pays
+nothing; a program with no such cast pays nothing.
+
+`JSON.parse(s) as number[]` tests every element at the cast: an array type is shared by the whole program, so it cannot
+be foreign.
+
+## Arrays
+
+`{ length: 2 } as unknown as number[]`, whose operand is known not to be an array, follows the same rule without the
+test: `any` in place, a variable with no declared type stays boxed. `.length` and `.push` are V8's. A cast to an array
+type from `any` is believed, being how a program types what it built; the typed builtins over a value that turns out
+no array keep their defaults, `.length` being the receiver's own (`ts_array_len_foreign`).
+
 ## What it costs
 
 A backed cast costs nothing. An unbacked one used in place takes the boxed operators, where it took the unboxed ones
@@ -36,7 +63,9 @@ over a value it could not vouch for; one that flows on pays one test.
 
 ## Gaps
 
-- The elements of `xs as number[]` are not tested: `["x"] as unknown as number[]` reads NaN (V8: the string).
+- The elements of `xs as number[]` are tested only for a value out of JSON: `["x"] as unknown as number[]` reads NaN (V8:
+  the string). A number array inside a foreign type is read as `any` by `for..of`, not by a callback's parameter.
+- What was cast from an `any` that came from elsewhere (a `fetch` wrapper of the program's own, a global) is trusted.
 - A number field read through a class cast that lied, `(new Q() as unknown as P).x` for a field `P` declares and the
   value lacks, reads NaN (V8: undefined).
 - Only explicit casts are covered: an `any` assigned to a `number` slot without one is still unboxed unchecked.

@@ -810,6 +810,12 @@ class Exporter {
   checker: ts.TypeChecker;
   rawChecker: ts.TypeChecker;
   private distrustCache = new WeakMap<ts.Node, boolean>();
+  /** The object types external data was cast to, and the variables holding what was read off them
+   *  (docs/cast_to_number_design.md). */
+  private foreignTypes = new Set<ts.Symbol>();
+  private foreignSyms = new Set<ts.Symbol>();
+  private sawForeignSource = false;
+  private hasForeign = false;
   private distrustSkip = new Set<ts.Node>();
   // Untyped mode (TSAOT_UNTYPED=1): treat the whole program as `any` — disable
   // ALL type-driven lowering (no unbox/SROA via classify, no generic
@@ -1099,7 +1105,8 @@ class Exporter {
     const anyType = (this.rawChecker as unknown as { getAnyType(): ts.Type }).getAnyType();
     const checker = Object.create(this.rawChecker) as ts.TypeChecker;
     checker.getTypeAtLocation = (n: ts.Node): ts.Type =>
-      this.distrustedExpr(n) && (ts.isBinaryExpression(n) || this.usedInPlace(n as ts.Expression)) ? anyType : this.rawChecker.getTypeAtLocation(n);
+      (this.distrustedExpr(n) && (ts.isBinaryExpression(n) || this.usedInPlace(n as ts.Expression))) ||
+      (this.hasForeign && this.foreignValue(n)) ? anyType : this.rawChecker.getTypeAtLocation(n);
     this.checker = checker;
     this.VALUE = this.internField("__value");
     this.DATE_MS_FIELD = this.internField("__date_ms");
@@ -2078,6 +2085,21 @@ class Exporter {
       return !all(this.rawChecker.getTypeAtLocation(node.expression), F.NumberLike | F.Never | F.Undefined | F.Null | F.Void);
     } catch { return false; }
   }
+  /** `x as unknown as T[]` of what is known not to be an array: an array-like, a string. From `any` a cast to an
+   *  array type is believed: the typed form of a value the program built. */
+  private unbackedArrayCast(node: ts.AsExpression | ts.TypeAssertion): boolean {
+    try {
+      if (ts.isConstTypeReference(node.type) || !this.rawChecker.isArrayType(this.rawChecker.getTypeFromTypeNode(node.type))) return false;
+      let e: ts.Expression = node.expression;
+      while (ts.isParenthesizedExpression(e) || ts.isAsExpression(e) || ts.isTypeAssertionExpression(e)) {
+        if ((ts.isAsExpression(e) || ts.isTypeAssertionExpression(e)) && (this.rawChecker.getTypeFromTypeNode(e.type).flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) === 0) return false;
+        e = e.expression;
+      }
+      if (e === node.expression) return false;
+      const t = this.rawChecker.getTypeAtLocation(e);
+      return (t.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) === 0 && !this.rawChecker.isArrayType(t) && !this.rawChecker.isTupleType(t);
+    } catch { return false; }
+  }
   /** An expression whose static type says number with nothing behind it: an unbacked cast, in parentheses,
    *  or a `+` over one, which may be a concatenation. */
   distrustedExpr(node: ts.Node): boolean {
@@ -2095,8 +2117,8 @@ class Exporter {
     let known = this.distrustCache.get(node);
     if (known === undefined) {
       known = ts.isBinaryExpression(node)
-        ? this.distrustedExpr(node.left) || this.distrustedExpr(node.right)
-        : this.unbackedNumberCast(node as ts.AsExpression | ts.TypeAssertion);
+        ? this.distrustedExpr(node.left) || this.distrustedExpr(node.right) || this.foreignValue(node.left) || this.foreignValue(node.right)
+        : this.unbackedNumberCast(node as ts.AsExpression | ts.TypeAssertion) || this.unbackedArrayCast(node as ts.AsExpression | ts.TypeAssertion);
       this.distrustCache.set(node, known);
     }
     return known;
@@ -2110,10 +2132,14 @@ class Exporter {
     const p = e.parent;
     if (ts.isPropertyAccessExpression(p) || ts.isElementAccessExpression(p)) return true;
     if (ts.isPrefixUnaryExpression(p) || ts.isTypeOfExpression(p) || ts.isVoidExpression(p) || ts.isDeleteExpression(p) || ts.isTemplateSpan(p)) return true;
-    if (ts.isExpressionStatement(p)) return true;
+    if (ts.isExpressionStatement(p) || ts.isPropertyAssignment(p) || ts.isShorthandPropertyAssignment(p) || ts.isArrayLiteralExpression(p) || ts.isSpreadElement(p) || ts.isSpreadAssignment(p)) return true;
     if (ts.isBinaryExpression(p)) {
       const op = p.operatorToken.kind;
       return op < ts.SyntaxKind.FirstAssignment || op > ts.SyntaxKind.LastAssignment ? true : e === p.left;
+    }
+    if (ts.isVariableDeclaration(p) && p.type === undefined && ts.isIdentifier(p.name)) {
+      const sym = this.rawChecker.getSymbolAtLocation(p.name);
+      if (sym !== undefined && this.foreignSyms.has(sym)) return true;
     }
     if ((ts.isIfStatement(p) || ts.isWhileStatement(p) || ts.isDoStatement(p)) && e === p.expression) return true;
     if (ts.isConditionalExpression(p) && e === p.condition) return true;
@@ -2122,6 +2148,117 @@ class Exporter {
       return slot === undefined || (slot.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0;
     }
     return false;
+  }
+  /** A value out of JSON: `JSON.parse(...)`, `res.json()`, a variable holding one. */
+  private foreignSource(e: ts.Expression): boolean {
+    while (ts.isParenthesizedExpression(e) || ts.isAwaitExpression(e) || ts.isNonNullExpression(e) || ts.isAsExpression(e) || ts.isTypeAssertionExpression(e)) e = e.expression;
+    if (ts.isIdentifier(e)) {
+      const sym = this.rawChecker.getSymbolAtLocation(e);
+      return sym !== undefined && this.foreignSyms.has(sym);
+    }
+    if (!ts.isCallExpression(e) || !ts.isPropertyAccessExpression(e.expression)) return false;
+    const callee = e.expression;
+    if (callee.name.text === "parse") return ts.isIdentifier(callee.expression) && callee.expression.text === "JSON";
+    return callee.name.text === "json" && e.arguments.length === 0;
+  }
+  /** `t` and the object types reachable from it, the lib's excepted: what a program declares for its data. */
+  private markForeign(t: ts.Type | undefined, seen: Set<ts.Type>): void {
+    if (t === undefined || seen.has(t)) return;
+    seen.add(t);
+    if (t.isUnionOrIntersection()) { for (const m of t.types) this.markForeign(m, seen); return; }
+    if (this.rawChecker.isArrayType(t) || this.rawChecker.isTupleType(t)) {
+      for (const a of this.rawChecker.getTypeArguments(t as ts.TypeReference)) this.markForeign(a, seen);
+      return;
+    }
+    if ((t.flags & ts.TypeFlags.Object) === 0 || t.symbol === undefined) return;
+    const decl = t.symbol.declarations?.[0];
+    if (decl === undefined || this.program.isSourceFileDefaultLibrary(decl.getSourceFile())) return;
+    this.foreignTypes.add(t.symbol);
+    for (const prop of this.rawChecker.getPropertiesOfType(t)) {
+      const d = prop.valueDeclaration ?? prop.declarations?.[0];
+      if (d !== undefined) this.markForeign(this.rawChecker.getTypeOfSymbolAtLocation(prop, d), seen);
+    }
+    this.markForeign(this.rawChecker.getIndexTypeOfType(t, ts.IndexKind.String), seen);
+  }
+  /** The whole program's entries of external data: each type a value out of JSON is cast or assigned to, and
+   *  what the program declares inside it, is told apart from the types its own code builds. A type nothing
+   *  parsed reaches pays nothing. */
+  private computeForeignTypes(): void {
+    const seen = new Set<ts.Type>();
+    const visit = (n: ts.Node): void => {
+      if ((ts.isCallExpression(n) || ts.isIdentifier(n)) && this.foreignSource(n as ts.Expression) && !(ts.isIdentifier(n) && ts.isVariableDeclaration(n.parent) && n.parent.name === n)) {
+        this.sawForeignSource = true;
+        let e: ts.Node = n;
+        while (ts.isParenthesizedExpression(e.parent) || ts.isAwaitExpression(e.parent) || ts.isNonNullExpression(e.parent) || ts.isAsExpression(e.parent) || ts.isTypeAssertionExpression(e.parent)) {
+          e = e.parent;
+          if (ts.isAsExpression(e) || ts.isTypeAssertionExpression(e)) this.markForeign(this.rawChecker.getTypeFromTypeNode(e.type), seen);
+        }
+        const p = e.parent;
+        if (ts.isVariableDeclaration(p) && p.initializer === e && p.type === undefined && ts.isIdentifier(p.name) && !ts.isAsExpression(e) && !ts.isTypeAssertionExpression(e)) {
+          const sym = this.rawChecker.getSymbolAtLocation(p.name);
+          if (sym !== undefined) this.foreignSyms.add(sym);
+        } else if (ts.isExpression(e)) this.markForeign(this.rawChecker.getContextualType(e), seen);
+      }
+      ts.forEachChild(n, visit);
+    };
+    for (const m of this.modules) if (m.text.includes("JSON.parse") || m.text.includes(".json(")) visit(m);
+    // `const a = {...} as unknown as number[]`: nothing array about it, the variable stays boxed
+    const lied = (n: ts.Node): void => {
+      if (ts.isVariableDeclaration(n) && n.initializer !== undefined && n.type === undefined && ts.isIdentifier(n.name)) {
+        let e: ts.Expression = n.initializer;
+        while (ts.isParenthesizedExpression(e)) e = e.expression;
+        if ((ts.isAsExpression(e) || ts.isTypeAssertionExpression(e)) && this.unbackedArrayCast(e)) {
+          const sym = this.rawChecker.getSymbolAtLocation(n.name);
+          if (sym !== undefined) this.foreignSyms.add(sym);
+        }
+      }
+      ts.forEachChild(n, lied);
+    };
+    for (const m of this.modules) if (m.text.includes("as unknown as")) lied(m);
+    this.hasForeign = this.foreignTypes.size > 0 || this.foreignSyms.size > 0;
+    if (this.foreignTypes.size === 0) return;
+    this.distrustCache = new WeakMap();
+    // what is read off such a value into a variable with no declared type stays boxed
+    const reads = (n: ts.Node): void => {
+      if (ts.isVariableDeclaration(n) && n.initializer !== undefined && n.type === undefined) {
+        if (ts.isIdentifier(n.name)) {
+          if (this.foreignValue(n.initializer)) {
+            const sym = this.rawChecker.getSymbolAtLocation(n.name);
+            if (sym !== undefined) this.foreignSyms.add(sym);
+          }
+        } else if (ts.isObjectBindingPattern(n.name) && this.foreignReceiver(n.initializer)) {
+          for (const el of n.name.elements) {
+            const sym = ts.isIdentifier(el.name) ? this.rawChecker.getSymbolAtLocation(el.name) : undefined;
+            if (sym !== undefined) this.foreignSyms.add(sym);
+          }
+        }
+      }
+      if (ts.isForOfStatement(n) && ts.isVariableDeclarationList(n.initializer) && this.foreignValue(n.expression)) {
+        const name = n.initializer.declarations[0]?.name;
+        const sym = name !== undefined && ts.isIdentifier(name) ? this.rawChecker.getSymbolAtLocation(name) : undefined;
+        if (sym !== undefined) this.foreignSyms.add(sym);
+      }
+      ts.forEachChild(n, reads);
+    };
+    for (const m of this.modules) reads(m);
+  }
+  private foreignReceiver(e: ts.Expression): boolean {
+    const t = this.rawChecker.getNonNullableType(this.rawChecker.getTypeAtLocation(e));
+    return t.isUnion() ? t.types.some((m) => m.symbol !== undefined && this.foreignTypes.has(m.symbol)) : t.symbol !== undefined && this.foreignTypes.has(t.symbol);
+  }
+  /** A property read off an object type external data was cast to, or a variable holding one. */
+  private foreignValue(n: ts.Node): boolean {
+    if (ts.isIdentifier(n)) {
+      const sym = this.rawChecker.getSymbolAtLocation(n);
+      if (sym !== undefined && this.foreignSyms.has(sym)) return true;
+      // a variable of a class type: the class's typed reads and writes would come first
+      if (sym === undefined || (sym.flags & ts.SymbolFlags.Variable) === 0) return false;
+      const t = this.rawChecker.getTypeAtLocation(n).symbol;
+      return t !== undefined && (t.flags & ts.SymbolFlags.Class) !== 0 && this.foreignTypes.has(t);
+    }
+    if (ts.isParenthesizedExpression(n)) return this.foreignValue(n.expression);
+    if (!ts.isPropertyAccessExpression(n) && !ts.isElementAccessExpression(n)) return false;
+    return n.expression.kind !== ts.SyntaxKind.SuperKeyword && (this.foreignReceiver(n.expression) || this.foreignValue(n.expression));
   }
   /** The callee of a `new`: read before the arguments, which may reassign the variable (`new x(x = 1)`). */
   private lowerNewCallee(ctx: FnCtx, node: ts.NewExpression, callee: number): number {
@@ -5309,15 +5446,34 @@ class Exporter {
       return this.lowerOptionalChain(ctx, node);
     }
     if (ts.isParenthesizedExpression(node)) return this.lowerExpr(ctx, node.expression, hint);
+    if (this.hasForeign && !this.distrustSkip.has(node) && (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node) || ts.isIdentifier(node)) &&
+        this.foreignValue(node) && !this.usedInPlace(node)) {
+      const F = ts.TypeFlags, t = this.rawChecker.getTypeAtLocation(node);
+      if ((t.flags & F.NumberLike) !== 0) {
+        this.distrustSkip.add(node);
+        const v = this.lowerExpr(ctx, node, hint);
+        this.distrustSkip.delete(node);
+        const label = ts.isPropertyAccessExpression(node) ? node.name.text : ts.isIdentifier(node) ? node.text : "element";
+        ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: `cast.foreignNumber:${label}`, args: [v] });
+        return v;
+      }
+    }
     if (ts.isNonNullExpression(node)) return this.lowerExpr(ctx, node.expression, hint);
     // `x as T` and `<T>x` erase to their operand. A cast to `number` of what is not known to be one is no
     // promise that can be kept in an unboxed slot (docs/cast_to_number_design.md): used in place the value
     // is `any` to everything that asks (distrustedExpr), what flows on into a number-typed slot is tested.
     if (ts.isAsExpression(node) || ts.isTypeAssertionExpression(node)) {
       const v = this.lowerExpr(ctx, node.expression, hint);
-      return this.distrustedExpr(node) && !this.usedInPlace(node) ? this.checkedNumber(ctx, v) : v;
+      if (this.foreignTypes.size > 0 || this.sawForeignSource) {
+        const target = this.rawChecker.getTypeFromTypeNode(node.type);
+        const elem = this.rawChecker.isArrayType(target) ? this.rawChecker.getTypeArguments(target as ts.TypeReference)[0] : undefined;
+        if (elem !== undefined && (elem.flags & ts.TypeFlags.NumberLike) !== 0 && this.foreignSource(node.expression))
+          ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "cast.numberArray", args: [v] });
+      }
+      return this.distrustedExpr(node) && !this.usedInPlace(node) && !this.unbackedArrayCast(node) ? this.checkedNumber(ctx, v) : v;
     }
-    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.PlusToken && !this.distrustSkip.has(node) && this.distrustedExpr(node) && !this.usedInPlace(node)) {
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.PlusToken && !this.distrustSkip.has(node) && this.distrustedExpr(node) && !this.usedInPlace(node) &&
+        (this.rawChecker.getTypeAtLocation(node).flags & ts.TypeFlags.NumberLike) !== 0) {
       this.distrustSkip.add(node);
       const v = this.lowerExpr(ctx, node, hint);
       this.distrustSkip.delete(node);
@@ -17693,6 +17849,7 @@ class Exporter {
     if (this.functionValuesInitNode) allFns.push(this.functionValuesInitNode as unknown as FnLike);
     if (this.moduleInitNode) allFns.push(this.moduleInitNode as unknown as FnLike);
     this.computeAssignedBindings();
+    if (!this.untyped) this.computeForeignTypes();
     for (const f of allFns) for (const s of this.freeVars(f)) {
       this.cellBindings.add(s);
       let arr = this.capturedByFns.get(s);

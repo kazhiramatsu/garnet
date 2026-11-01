@@ -2094,6 +2094,13 @@ static inline tsv ts_cast_number(tsv v){
   if (TS_RT_UNLIKELY(!ts_is_num(v) && !ts_is_null(v) && !ts_is_undef(v))) ts_throw_bad_number_cast(v);
   return v;
 }
+/* a property of data out of JSON, typed number, flowing into a number slot: nothing else fits there */
+void   ts_throw_foreign_number(tsv v, const char* name);
+static inline tsv ts_cast_foreign_number(tsv v, const char* name){
+  if (TS_RT_UNLIKELY(!ts_is_num(v))) ts_throw_foreign_number(v, name);
+  return v;
+}
+tsv    ts_cast_number_array(tsv v);   /* `JSON.parse(s) as number[]`: every element is a number */
 /* the member of a call is read before its arguments run: a nullish receiver throws first */
 void   ts_throw_method_receiver(tsv v, const char* name);
 static inline tsv ts_method_receiver(tsv v, const char* name){
