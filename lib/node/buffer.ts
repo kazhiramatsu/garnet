@@ -555,7 +555,6 @@ const bufferStatics = {
   },
   poolSize: 8192,
   prototype: proto as unknown as Buffer,
-  [Symbol.hasInstance](value: unknown): value is Buffer { return isBufferValue(value); },
 };
 /** The Buffer constructor is a function, as in Node (`typeof Buffer === "function"`, `Buffer.name`); its
  *  statics are assigned onto it, and Symbol.hasInstance answers `instanceof` for the adopted views. The
@@ -563,8 +562,8 @@ const bufferStatics = {
 export const Buffer: BufferConstructor = Object.assign(function Buffer(value: string | number | ArrayLike<number> | Uint8Array | ArrayBuffer | SharedArrayBuffer, encodingOrOffset?: string | number, length?: number): Buffer {
   if (typeof value === "number") return bufferStatics.alloc(value);
   return fromValue(value, encodingOrOffset, length);
-}, bufferStatics);
-Object.defineProperty(Buffer, Symbol.hasInstance, { value: isBufferValue });   // a symbol key: not copied by Object.assign
+}, bufferStatics) as unknown as BufferConstructor;
+Object.defineProperty(Buffer, Symbol.hasInstance, { value: isBufferValue });   // (Function.prototype's is read-only: a definition, not an assignment)
 export const kMaxLength = 4294967295;
 export const kStringMaxLength = 536870888;
 export const constants = { MAX_LENGTH: kMaxLength, MAX_STRING_LENGTH: kStringMaxLength };

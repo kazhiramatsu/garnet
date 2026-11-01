@@ -12799,7 +12799,7 @@ Where it stopped (branch `s363-dc`, worktree `build/wt_dc`, on top of `s362-wip`
   one line with no depth limit, a cycle looped to `[deep]`, a Date printed `Date {}`, a Promise `Promise {}`, an Error `Error {}`, a Map
   iterator `Iterator {}`, a Proxy ran its traps, an array had no `... n more items`. `util.inspect` takes its options, the custom
   inspect symbol is honored, `%s %d %i %f %j %o %O` follow `formatWithOptions`. 250 lines of the probe agree with Node
-  (`tests/conformance/exhaustive/stdlib/console_inspect.ts`). `err.stack` read undefined: an accessor on `Error.prototype` makes the
+  (`tests/conformance/exhaustive/stdlib/console_inspect.ts`, `docs/console_inspect_design.md`). `err.stack` read undefined: an accessor on `Error.prototype` makes the
   header and one frame line when read, so an error costs nothing for it; `Error.captureStackTrace` exists.
 - **JSON.parse's reviver** was a plain callback: `this` undefined, one walk over a snapshot of the keys, a reviver's write to its holder
   not seen, no third argument. InternalizeJSONProperty over any holder, CreateDataProperty and [[Delete]] with their failures
@@ -12841,6 +12841,11 @@ Where it stopped (branch `s363-dc`, worktree `build/wt_dc`, on top of `s362-wip`
   clang minutes and gigabytes.
 - **A long constant array is data**: 256 elements or more of literals are a JSON text parsed where the literal is reached (60 000 numbers:
   over three minutes of clang, now one second).
+- **`new Class(...)` with a parameter named as a class built that class** (a fallback for a name lib.dom shadows, silent: zod's
+  `_number(Class, ...)` built its abstract `Class`). `import * as z` of an ES module from a CommonJS file read undefined (TypeScript's
+  synthetic namespace is a symbol of its own). A parameter property is the first key of an instance, wherever the constructor stands.
+  rxjs, zod and yaml compile again: a generic arrow's type parameter was a capture in a static initializer, `exactOptionalPropertyTypes`
+  stopped `lib/node/web/streams.ts`, `Object.assign(Buffer, statics)` wrote the read-only `Function.prototype[Symbol.hasInstance]`.
 - **import() of a bundled module** (`docs/dynamic_import_design.md`): a compile-time reject before. A module only `import()` reaches is
   compiled in, its top-level statements a function of their own, evaluated once when asked, deps first, a failure kept, a top-level
   await honored. `export default class {}` was missing from a namespace and its statics never ran (silent): a dynamic class.

@@ -122,6 +122,19 @@ function capturesEnclosingLocal(decl: ts.ClassLikeDeclaration, checker: ts.TypeC
   return false;
 }
 
+/** The parameter properties of a constructor (`constructor(public x: number)`). */
+function parameterProperties(ctor: ts.ConstructorDeclaration): string[] {
+  const out: string[] = [];
+  for (const p of ctor.parameters) {
+    if (p.modifiers?.some((mod) =>
+      mod.kind === ts.SyntaxKind.PublicKeyword || mod.kind === ts.SyntaxKind.PrivateKeyword ||
+      mod.kind === ts.SyntaxKind.ProtectedKeyword || mod.kind === ts.SyntaxKind.ReadonlyKeyword)) {
+      if (ts.isIdentifier(p.name)) out.push(p.name.text);
+    }
+  }
+  return out;
+}
+
 export interface ClassInfo {
   id: number;
   name: string;
@@ -260,6 +273,9 @@ export class ClassExtractor {
 
     const brand = privateBrand(decl);
     if (brand !== undefined) info.ownFields.push(brand);
+    // parameter properties come first, wherever the constructor is written: they are the first keys of an instance
+    const declaredCtor = decl.members.find((m) => ts.isConstructorDeclaration(m) && m.body !== undefined) as ts.ConstructorDeclaration | undefined;
+    if (declaredCtor) for (const f of parameterProperties(declaredCtor)) info.ownFields.push(f);
     for (const m of decl.members) {
       const mods = ts.canHaveModifiers(m) ? ts.getModifiers(m) : undefined;
       const isStatic = !!mods?.some((mod) => mod.kind === ts.SyntaxKind.StaticKeyword);
@@ -320,14 +336,7 @@ export class ClassExtractor {
   // constructor: collect `this.x = ...` field declarations; flag dynamic writes
   // and an object-returning constructor (which would replace the instance).
   private scanConstructor(ctor: ts.ConstructorDeclaration, info: ClassInfo) {
-    // parameter properties (e.g. `constructor(public x: number)`)
-    for (const p of ctor.parameters) {
-      if (p.modifiers?.some((mod) =>
-        mod.kind === ts.SyntaxKind.PublicKeyword || mod.kind === ts.SyntaxKind.PrivateKeyword ||
-        mod.kind === ts.SyntaxKind.ProtectedKeyword || mod.kind === ts.SyntaxKind.ReadonlyKeyword)) {
-        if (ts.isIdentifier(p.name)) info.ownFields.push(p.name.text);
-      }
-    }
+    for (const f of parameterProperties(ctor)) if (!info.ownFields.includes(f)) info.ownFields.push(f);
     const visit = (n: ts.Node) => {
       // this.field = ...
       if (ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.EqualsToken) {

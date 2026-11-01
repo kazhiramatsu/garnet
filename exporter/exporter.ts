@@ -4493,6 +4493,13 @@ class Exporter {
     if (!modSym) return;
     const held = this.moduleNamespaceLocals.get(modSym);
     const obj = this.namespaceOfModule(ctx, modSym, name.text, stmt);
+    // what the name's reads resolve to may not be the module's symbol: TypeScript makes a synthetic namespace for a
+    // CommonJS file importing an ES module (zod's driver), a symbol of its own
+    const bound = this.symbolOf(name);
+    if (bound && bound !== modSym) {
+      if (this.hasCaptured(ctx, bound)) this.storeCaptured(ctx, bound, obj);
+      else this.ensureLocalAlias(ctx, bound, obj);
+    }
     if (held !== undefined) return;
     const aliasSym = this.checker.getSymbolAtLocation(name);
     if (aliasSym && aliasSym !== modSym) this.ensureLocalAlias(ctx, aliasSym, obj);
@@ -10596,6 +10603,7 @@ class Exporter {
     collect(expr);
     const refs = new Set<ts.Symbol>();
     const walk = (n: ts.Node) => {
+      if (ts.isTypeNode(n) || ts.isTypeParameterDeclaration(n)) return;    // (a type parameter of a generic arrow is no capture)
       if (ts.isIdentifier(n) && this.isVarRef(n)) {
         const s = this.symbolOf(n);
         if (s && !declaredHere.has(s)) refs.add(s);
@@ -11198,7 +11206,8 @@ class Exporter {
     // symbol that isn't the map key. If unresolved and the constructor
     // identifier's name matches a known user class, use that class id (the
     // user class shadows the ambient global value).
-    if (classId === undefined && ts.isIdentifier(node.expression)) {
+    // (a binding of the program of that name is not the class: `function make(Class) { return new Class(); }`)
+    if (classId === undefined && ts.isIdentifier(node.expression) && (!csym || this.isAmbientGlobalSymbol(csym))) {
       const nm = node.expression.text;
       for (const [cid, cnode] of this.classNodeOfId) {
         if (cnode.name && cnode.name.text === nm) { classId = cid; break; }
