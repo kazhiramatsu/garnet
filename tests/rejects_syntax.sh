@@ -64,5 +64,5 @@ chk "unsupported number method as a value"    'function main(): void { const f:a
 # (`super.x = v` is now fully supported — declared data field / parent accessor setter
 # / static members; getter-only writes throw a catchable TypeError and undeclared
 # properties create own data, both matching JS — see conformance_fixes §124–§127.)
-[ $fail -eq 0 ] && echo "[reject-syntax] PASS: finally-crossing-label / import-linkage / TDZ / class-member() / number-method-value rejected"
+[ $fail -eq 0 ] && echo "[reject-syntax] PASS: finally-crossing-label / import-linkage / TDZ / number-method-value rejected"
 exit $fail

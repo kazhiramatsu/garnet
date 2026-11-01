@@ -3830,6 +3830,11 @@ tsv ts_get(tsv obj, ts_key key){
     }
     if (TS_RT_UNLIKELY(ts_kind_is_buffer_or_view(fast->h.kind)))
       return fast->h.kind == TS_KIND_TYPEDARRAY ? ta_get_key(obj, key) : ab_get_key(obj, key);
+    if (TS_RT_UNLIKELY(fast->h.kind == TS_KIND_SYMBOL)){
+      tsv found;
+      if (lookup_prop_chain(obj, ts_proto_ptr(ts_symbol_proto()), key, &found)) return found;
+      return TS_UNDEFINED;
+    }
   }
   /* Primitives are not prop-bags, but a string exposes the usual String exotic
      own properties (`length` and indexed characters) and then resolves methods
@@ -6412,8 +6417,8 @@ int ts_loose_eq(tsv a, tsv b){
   if (ts_is_num(a) && ts_is_str(b)) return ts_to_num(a)==ts_number_coerce(b);
   if (ts_is_str(a) && ts_is_num(b)) return ts_number_coerce(a)==ts_to_num(b);
   /* object <-> primitive: ToPrimitive(object) then re-compare */
-  if ((ts_object_like(a)&&!ts_is_symbol(a)) && (ts_is_num(b)||ts_is_str(b))){ ts_gc_root(&b); tsv p=ts_to_primitive(a,2); ts_gc_unroot(1); return ts_loose_eq(p,b); }
-  if ((ts_object_like(b)&&!ts_is_symbol(b)) && (ts_is_num(a)||ts_is_str(a))){ ts_gc_root(&a); tsv p=ts_to_primitive(b,2); ts_gc_unroot(1); return ts_loose_eq(a,p); }
+  if ((ts_object_like(a)&&!ts_is_symbol(a)) && (ts_is_num(b)||ts_is_str(b)||ts_is_symbol(b))){ ts_gc_root(&b); tsv p=ts_to_primitive(a,2); ts_gc_unroot(1); return ts_loose_eq(p,b); }
+  if ((ts_object_like(b)&&!ts_is_symbol(b)) && (ts_is_num(a)||ts_is_str(a)||ts_is_symbol(a))){ ts_gc_root(&a); tsv p=ts_to_primitive(b,2); ts_gc_unroot(1); return ts_loose_eq(a,p); }
   return 0;
 }
 /* Object.is(a,b): SameValue. Like ===, except NaN equals NaN and +0 != -0. */
@@ -18111,7 +18116,51 @@ static tsv new_wrapper(tsv prim, tsv proto){
 tsv ts_to_object(tsv v){
   if (ts_is_num(v)) return new_wrapper(v, ts_number_proto());
   if (ts_is_bool(v)) return new_wrapper(v, ts_boolean_proto());
+  if (ts_is_symbol(v)) return new_wrapper(v, ts_symbol_proto());
   return v;
+}
+/* Symbol.prototype: a symbol is no object with a prototype of its own, ts_get starts here for one. */
+static tsv g_symbol_proto_v = TS_NULL;
+static tsv this_symbol(tsv* a, int n, const char* method){
+  tsv v = n > 0 ? a[0] : TS_UNDEFINED;
+  if (ts_is_symbol(v)) return v;
+  tsv w = wrapper_value(v);
+  if (ts_is_symbol(w)) return w;
+  char m[96];
+  snprintf(m, sizeof m, "Symbol.prototype.%s requires that 'this' be a Symbol", method);
+  ts_throw_type_error_msg(m);
+  return TS_UNDEFINED;
+}
+static tsv ts_symproto_toString(tsv* a, int n){ return ts_symbol_tostring(this_symbol(a, n, "toString")); }
+static tsv ts_symproto_valueOf(tsv* a, int n){ return this_symbol(a, n, "valueOf"); }
+static tsv ts_symproto_description(tsv* a, int n){ return ts_symbol_description(this_symbol(a, n, "description")); }
+static tsv ts_symproto_toPrimitive(tsv* a, int n){ return this_symbol(a, n, "[Symbol.toPrimitive]"); }
+void ts_symbol_ctor_link(tsv ctor){
+  ts_gc_root(&ctor);
+  tsv p = ts_symbol_proto();
+  ts_define_data(ctor, ts_intern_field("prototype", 9), p, 0, 0, 0);
+  ts_define_data(p, ts_intern_field("constructor", 11), ctor, 0, 1, 1);
+  ts_gc_unroot(1);
+}
+tsv ts_symbol_proto(void){
+  if (ts_proto_ref(g_symbol_proto_v)) return g_symbol_proto_v;
+  static int rooted = 0;
+  g_symbol_proto_v = ts_new_proto_pretenured();
+  ts_root_static_once(&g_symbol_proto_v, &rooted);
+  ((ts_object*)ts_ptr(g_symbol_proto_v))->proto = g_object_proto_v;
+  ts_prim_field_init();
+  ts_proto_register_method(g_symbol_proto_v, g_tostring_key, "toString", ts_symproto_toString);
+  ts_proto_register_method(g_symbol_proto_v, g_valueof_key, "valueOf", ts_symproto_valueOf);
+  tsv desc = ts_make_fn_t(ts_symproto_description, NULL, 0, 1); ts_gc_root(&desc);
+  ts_set_fn_meta(desc, 0, "get description");
+  ts_define_accessor_attr(g_symbol_proto_v, ts_intern_field("description", 11), desc, TS_UNDEFINED, 1, 0, 0, 1);
+  tsv prim = ts_make_fn_t(ts_symproto_toPrimitive, NULL, 0, 1); ts_gc_root(&prim);
+  ts_set_fn_meta(prim, 1, "[Symbol.toPrimitive]");
+  ts_define_data(g_symbol_proto_v, TS_KEY_WKSYM(TS_WKSYM_TO_PRIMITIVE), prim, 0, 0, 1);
+  tsv tag = ts_new_string("Symbol", 6); ts_gc_root(&tag);
+  ts_define_data(g_symbol_proto_v, TS_KEY_WKSYM(TS_WKSYM_TO_STRING_TAG), tag, 0, 0, 1);
+  ts_gc_unroot(3);
+  return g_symbol_proto_v;
 }
 /* new.target. A class's constructor runs on an instance already of the class being constructed: the
    `constructor` of its prototype. A function is told by ts_construct, which leaves the constructor here for
@@ -21593,13 +21642,13 @@ void ts_await_register_v(tsv pv, tsv cv){
     rc->async_ctx = g_async_ctx; rc->ctx_captured = 1;
     ts_write_barrier(cv, g_async_ctx);
   }
-  if (ts_is_promise(pv)) unhandled_remove(pv);
   if (!ts_is_promise(pv)){
     /* Await uses PromiseResolve, so arbitrary thenables must be assimilated rather
        than delivered as plain objects. Primitives/non-thenable objects become an
        already-fulfilled promise and still resume through the microtask queue. */
     pv=ts_promise_resolved(pv);
   }
+  unhandled_remove(pv);   /* (a `then` getter that throws has rejected the promise just made) */
   tsv value = TS_UNDEFINED;
   int state = promise_state_value_v(pv, &value);
   if (state==1){ coro_deliver_v(cv, value, 0); microq_push_v(cv); }

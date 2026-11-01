@@ -15353,7 +15353,7 @@ fn emit_global_setup(s: &mut String, needs_fetch: bool, needs_typed_array_global
     s.push_str("  (void)ts_wksym(0u);\n");
     s.push_str("  tsv _Symbol = ts_make_global_fn(ts_fnval_global_Symbol, 0u, \"Symbol\", 0);\n");
     root_local(s, "_Symbol");
-    set_val(s, "_Symbol", "prototype", "ts_new_object()");
+    s.push_str("  ts_symbol_ctor_link(_Symbol);\n");
     set_fn(s, "_Symbol", "for", "symbol.for", 1, "for");
     set_fn(s, "_Symbol", "keyFor", "symbol.keyFor", 1, "keyFor");
     set_val(s, "_Symbol", "iterator", "ts_wksym(0u)");
@@ -25401,6 +25401,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     "number" => "ts_number_proto",
                     "boolean" => "ts_boolean_proto",
                     "function" => "ts_function_proto",
+                    "symbol" => "ts_symbol_proto",
                     _ => unreachable!("unknown protoobj kind"),
                 };
                 s.push_str(&ctx.set_val(dst.0, &format!("{}()", acc)));

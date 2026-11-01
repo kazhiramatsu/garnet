@@ -2402,15 +2402,15 @@ class Exporter {
    *  object is loaded via LoadBuiltinFn {protoobj.<kind>} (the §90 mechanism), which
    *  already returns the proto object itself — the bare form just omits the trailing
    *  LoadMethodValue. */
-  bareBuiltinProtoKind(e: ts.Expression): "object" | "string" | "array" | "map" | "set" | "weakmap" | "weakset" | "headers" | "number" | "boolean" | "function" | undefined {
+  bareBuiltinProtoKind(e: ts.Expression): "object" | "string" | "array" | "map" | "set" | "weakmap" | "weakset" | "headers" | "number" | "boolean" | "function" | "symbol" | "promise" | undefined {
     if (!ts.isPropertyAccessExpression(e) || e.name.text !== "prototype") return undefined;
     const ns = e.expression;
     if (!ts.isIdentifier(ns)) return undefined;
-    const kinds: [string, "object" | "string" | "array" | "map" | "set" | "weakmap" | "weakset" | "headers" | "number" | "boolean" | "function"][] =
+    const kinds: [string, "object" | "string" | "array" | "map" | "set" | "weakmap" | "weakset" | "headers" | "number" | "boolean" | "function" | "symbol" | "promise"][] =
       [["Object", "object"], ["Array", "array"], ["String", "string"], ["Map", "map"],
        ["Set", "set"], ["WeakMap", "weakmap"], ["WeakSet", "weakset"],
        ["Number", "number"], ["Boolean", "boolean"],
-       ["Function", "function"]];
+       ["Function", "function"], ["Symbol", "symbol"], ["Promise", "promise"]];
     for (const [name, kind] of kinds) {
       if (this.isBuiltinNamespaceRef(ns, name)) return kind;
     }
