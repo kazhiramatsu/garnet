@@ -1656,6 +1656,7 @@ tsv ts_funcproto_call(tsv* args, int n);
 tsv ts_funcproto_apply(tsv* args, int n);
 tsv ts_funcproto_bind(tsv* args, int n);
 tsv ts_funcproto_toString(tsv* args, int n);
+tsv ts_numproto_toLocaleString(tsv* args, int n);
 /* String.prototype setup (any-typed string method dispatch). */
 tsv  ts_string_proto(void);
 void ts_string_proto_init(void);
@@ -4344,6 +4345,7 @@ tsv ts_gen_new_v(tsv cv);
 tsv ts_gen_new_fn(tsv cv, uint32_t fnid);   /* a generator of the function `fnid` */
 tsv ts_set_fn_kind(tsv fv, int kind, uint32_t fnid);   /* a generator or async function boxed as a value */
 tsv ts_gen_next(tsv genobj, tsv sent);
+tsv ts_gen_next_site(tsv genobj, tsv sent);
 tsv ts_gen_step(tsv genobj, tsv sent);   /* a driver's step: the coroutine's own result object (emit_c generator.step) */
 tsv ts_asyncgen_next(tsv genobj, tsv sent);
 tsv ts_iter_step_fresh(tsv iter, tsv next_method, tsv sent);

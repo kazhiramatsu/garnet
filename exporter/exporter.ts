@@ -4195,13 +4195,14 @@ class Exporter {
     const arr = node.arguments ? Array.from(node.arguments) : [];
     if (!ts.isNewExpression(node) && !this.regexpProtocol &&
         arr.length > 0 &&
-        (this.isRegExpExpr(arr[0]) || this.regexpRawFromConstExpr(arr[0]) !== undefined) &&
+        ts.isRegularExpressionLiteral(arr[0]) &&
         (arr.length < 2 || this.isUndefinedConstValue(arr[1]))) {
       const same = this.lowerExpr(ctx, arr[0], hint);
       for (let i = 1; i < arr.length; i++) this.lowerExpr(ctx, arr[i]);
       return same;
     }
-    const raw = this.regexpProtocol ? undefined : this.regexpConstructorRawFromArgs(node.arguments);
+    // (`RegExp(x)` answers x itself: only a string pattern is a new object of known text)
+    const raw = this.regexpProtocol || (!ts.isNewExpression(node) && arr.length > 0 && this.isRegExpExpr(arr[0])) ? undefined : this.regexpConstructorRawFromArgs(node.arguments);
     if (raw === undefined) {
       const args = this.lowerSequenced(ctx, arr);
       const undef = this.newLocal(ctx, "reference");
@@ -5923,8 +5924,7 @@ class Exporter {
     // and construct dynamically via ts_construct (reflect.construct). That runs a
     // class value's ctor, a plain function's [[Construct]], or a proxy trap, and
     // throws a catchable TypeError for a non-constructor — matching JS.
-    if (ts.isNewExpression(node) && node.arguments && Array.from(node.arguments).some((a) => ts.isSpreadElement(a))
-        && !this.isAmbientGlobalSymbol(this.symbolOf(node.expression))) {
+    if (ts.isNewExpression(node) && node.arguments && Array.from(node.arguments).some((a) => ts.isSpreadElement(a))) {
       const args = Array.from(node.arguments);
       const callee = this.lowerExpr(ctx, node.expression);
       const site = this.site++;
@@ -7646,7 +7646,7 @@ class Exporter {
             // A method on a known builtin string/array type that we don't yet
             // implement: reject loudly rather than silently miscompiling/trapping.
             // (a method of the runtime's prototype the static table does not list: the dynamic path)
-            if (cls === "array" && fn.name.text === "toLocaleString") return this.lowerStringMethodDynamically(ctx, node, fn.expression);
+            if ((cls === "array" || cls === "number") && fn.name.text === "toLocaleString") return this.lowerStringMethodDynamically(ctx, node, fn.expression);
             if (!this.untyped && !(cls === "set" && ["union", "intersection", "difference", "symmetricDifference", "isSubsetOf", "isSupersetOf", "isDisjointFrom"].includes(fn.name.text)))
               this.unsupported(node, `${cls} method '${fn.name.text}' (stdlib method not yet implemented)`);
           }
@@ -11115,7 +11115,13 @@ class Exporter {
         ctx.body.push({ kind: "CallBuiltinStatic", dst: ms, builtin: "date.value_ms", args: [v] });   // a Date's time, a string parsed, else a clipped number
       } else {
         // new Date(year, month, day=1, hours=0, minutes=0, seconds=0, ms=0) — local time.
-        const a = args.map((x) => this.lowerExpr(ctx, x));
+        const a = args.map((x) => this.lowerExpr(ctx, x)).map((l, i) => {
+          if (ctx.locals[l]?.refKind === "primitive") return l;     // (ToNumber in order, after all are evaluated)
+          const coerced = this.newLocal(ctx, "primitive");
+          ctx.body.push({ kind: "CallBuiltinStatic", dst: coerced, builtin: "number.coerce", args: [l] });
+          void i;
+          return coerced;
+        });
         const comp = [
           a[0], a[1],
           a[2] ?? numConst(1),
@@ -18564,7 +18570,7 @@ class Exporter {
     const numberProtoSpec: [string, string][] = [
       ["toFixed","ts_numproto_toFixed"],["toString","ts_numproto_toString"],
       ["toPrecision","ts_numproto_toPrecision"],["toExponential","ts_numproto_toExponential"],
-      ["valueOf","ts_numproto_valueOf"],
+      ["valueOf","ts_numproto_valueOf"],["toLocaleString","ts_numproto_toLocaleString"],
     ];
     const numberProtoMethods = numberProtoSpec.map(([name, runtime]) => ({ name, runtime, methodId: this.internName(name) }));
     const booleanProtoSpec: [string, string][] = [

@@ -14707,7 +14707,7 @@ fn fnval_adapter_body(builtin: &str) -> Option<String> {
         "global.isNaN" => hv(format!("ts_bool(isnan(ts_number_coerce({})))", val(0))),
         "global.isFinite" => hv(format!("ts_bool(isfinite(ts_number_coerce({})))", val(0))),
         // ---- conversion functions (bare identifiers String/Number/Boolean) ----
-        "global.String" => hv(format!("ts_to_string_v({})", val(0))),
+        "global.String" => hv("(n > 0 ? ts_to_string_v(a[0]) : ts_new_string(\"\", 0))".to_string()),
         "global.Number" => hv(format!("ts_num(ts_number_coerce({}))", val(0))),
         "global.Boolean" => hv(format!("ts_bool(ts_truthy_fast({}))", val(0))),
         "global.Symbol" => hv(format!("ts_symbol_new({})", val(0))),
@@ -15084,13 +15084,16 @@ fn emit_global_setup(s: &mut String, needs_fetch: bool, needs_typed_array_global
         );
     }
     fn set_val(s: &mut String, obj: &str, prop: &str, expr: &str) {
+        // a built-in constructor's `prototype` is read-only
+        let attrs = if prop == "prototype" { "0, 0, 0" } else { "0, 1, 1" };
         let _ = writeln!(
             s,
-            "  ts_define_data({}, ts_intern_field({}, (uint32_t)strlen({})), {}, 0, 1, 1);",
+            "  ts_define_data({}, ts_intern_field({}, (uint32_t)strlen({})), {}, {});",
             obj,
             cstr(prop),
             cstr(prop),
-            expr
+            expr,
+            attrs
         );
     }
     /* a constant: not writable, not enumerable, not configurable */
@@ -24229,7 +24232,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     // Date.UTC(year, month, day=1, hours=0, minutes=0, seconds=0, ms=0): the missing components' defaults
                     let argc: usize = b["date.utc:".len()..].parse().unwrap_or(0);
                     let comp: Vec<String> = (0..7)
-                        .map(|i| if i < argc { n(i) } else if i == 0 { "NAN".to_string() } else if i == 2 { "1.0".to_string() } else { "0.0".to_string() })
+                        .map(|i| if i < argc { nc(i) } else if i == 0 { "NAN".to_string() } else if i == 2 { "1.0".to_string() } else { "0.0".to_string() })
                         .collect();
                     (format!("ts_date_utc({})", comp.join(", ")), true)
                 }
@@ -25084,7 +25087,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 ),
                 "generator.next" => (
                     format!(
-                        "ts_gen_next({}, {})",
+                        "ts_gen_next_site({}, {})",
                         r,
                         if args.is_empty() {
                             "TS_UNDEFINED".to_string()

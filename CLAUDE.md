@@ -163,9 +163,9 @@ Rust in §315; selfhost is kept as a performance metric).
   (`jsx` / `jsxs` of `jsx-runtime`, no source positions); `jsxImportSource` is resolved from each
   JSX file as TypeScript resolves the synthetic import. A typed `.toString()` / `.valueOf()` on a
   receiver that is not a string (a cast lied, a String wrapper) takes the receiver's own method.
-- A dynamic `import()` of a module the program does not bundle (a const of a literal type, hono's
-  `cloudflare:workers` probe) rejects at run time with an Error; of a bundled module it is a
-  compile-time reject (Session 358). `new X()` of a constructor the environment declares but the runtime lacks
+- A dynamic `import()` of a module the program does not have rejects at run time with an Error (hono's
+  `cloudflare:workers` probe, any specifier known at run time only); of a bundled module it is evaluated
+  when asked (`docs/dynamic_import_design.md`). `new X()` of a constructor the environment declares but the runtime lacks
   (ReadableStream, CustomEvent, WebSocket) is a ReferenceError where it is reached (Node without the
   global throws there too); `console.trace` as a value is the error writer (no stack).
 - `Promise.prototype.finally` called on a thenable that is not a promise is a garnet TypeError (V8
@@ -185,6 +185,10 @@ Rust in §315; selfhost is kept as a performance metric).
   reject there. A promise subclass's `then` gives a plain promise.
 - A `let` or `const` read through a closure before its declaration ran reads undefined (V8: a
   ReferenceError); a read or a write in the same function, a parameter default among them, throws.
+- `Function.prototype.toString` answers `function name() { [native code] }` for every function (a compiled
+  program keeps no source text): a library that reads a function's source sees no body. `err.stack` is the
+  header and one `at <anonymous>` line, made when read. A WeakRef holds its target strongly and a
+  FinalizationRegistry never calls back, as the specification allows.
 - `o.__proto__` and `o["__proto__"]` read undefined (V8: the prototype through the accessor);
   `Object.getPrototypeOf` / `setPrototypeOf` are the modelled forms (Session 355 note).
 - A typed receiver that is a Proxy (vue's reactive arrays and collections) takes its methods through

@@ -2079,6 +2079,8 @@ static int ts_proxy_is_extensible(tsv pv);
 static void ts_proxy_prevent_extensions(tsv pv);
 static tsv ts_proxy_get_own_desc(tsv pv, tsv keyv);
 static void ts_proxy_define_property(tsv pv, tsv keyv, tsv desc);
+static int proxy_define_answer(tsv pv, tsv keyv, tsv desc);
+static void proxy_define_refused(tsv keyv);
 static tsv ts_proxy_apply(tsv pv, tsv thisArg, tsv* args, int nargs);
 static tsv ts_proxy_construct(tsv pv, tsv* args, int nargs);
 static int proxy_set_proto_answer(tsv pv, tsv proto);
@@ -2678,7 +2680,13 @@ static void array_release_dead(ts_array* a){
    to more than double by at least ARRAY_SPARSE_MIN_GAP slots (V8's
    dictionary-elements rule in spirit). */
 static inline int array_store_is_far(ts_array* a, uint32_t i){
-  return g_sparse_elements && i >= a->cap + ARRAY_SPARSE_MIN_GAP && (i >> 1) >= a->cap;
+  if (!g_sparse_elements || i < a->cap + ARRAY_SPARSE_MIN_GAP) return 0;
+  if ((i >> 1) >= a->cap) return 1;
+  /* within twice the capacity, but the buffer is mostly holes: an index that keeps doubling must not
+     grow a dense buffer to the end of the index space (the gap test keeps this off the common path) */
+  uint32_t live = 0, n = a->len < a->cap ? a->len : a->cap;
+  for (uint32_t k = 0; k < n; k++) if (!array_is_hole(a->data[k])) live++;
+  return live < (i >> 3);
 }
 static void array_make_sparse(ts_array* a){
   RT_STAT_INC(array_sparse_convert);
@@ -3879,7 +3887,12 @@ static void ta_integrity_check(tsv v, int freeze){
   }
   if (!(ts_obj_integrity(o) & (1u|2u|4u))) ts_throw_type_error_msg("Cannot seal array buffer views with elements");
 }
-tsv ts_object_freeze(tsv v){ if (ts_is_propbag(v)){ ta_integrity_check(v, 1); ts_obj_add_integrity((ts_object*)ts_ptr(v), 1u); prop_add_epoch_bump(); } return v; }
+static tsv proxy_set_integrity(tsv pv, int frozen);
+static tsv proxy_test_integrity(tsv pv, int frozen);
+/* TestIntegrityLevel of a non-extensible object without the mark: what its properties say (an object
+   with no properties left that could change, or none at all) */
+static int object_test_integrity(tsv v, int frozen);
+tsv ts_object_freeze(tsv v){ if (g_has_proxies && ts_is_proxy(v)) return proxy_set_integrity(v, 1); if (ts_is_propbag(v)){ ta_integrity_check(v, 1); ts_obj_add_integrity((ts_object*)ts_ptr(v), 1u); prop_add_epoch_bump(); } return v; }
 /* Object.freeze as a value in a program whose scan found no freezer (`may_freeze_instances_init`):
    only a key computed at run time reaches it. That program's typed stores test no frozen bit, so a
    class instance is refused here, loudly, rather than left writable. */
@@ -3890,7 +3903,9 @@ tsv ts_object_freeze_unseen(tsv v){
 }
 tsv ts_object_is_frozen(tsv v){
   /* primitives are trivially "frozen" in JS; objects: check the flag. */
-  return ts_bool(!ts_is_propbag(v) || (ts_obj_integrity((ts_object*)ts_ptr(v)) & 1u));
+  if (g_has_proxies && ts_is_proxy(v)) return proxy_test_integrity(v, 1);
+  if (!ts_is_propbag(v) || (ts_obj_integrity((ts_object*)ts_ptr(v)) & 1u)) return ts_bool(1);
+  return ts_bool(object_test_integrity(v, 1));
 }
 tsv ts_object_create(tsv proto){
   /* The result is a plain object even when `proto` carries a registered
@@ -3908,10 +3923,12 @@ tsv ts_object_create(tsv proto){
 }
 /* bit0=frozen, bit1=non-extensible, bit2=sealed. seal/freeze imply
    non-extensible; freeze implies sealed. See ts_set / ts_delete_prop guards. */
-tsv ts_object_seal(tsv v){ if (ts_is_propbag(v)){ ta_integrity_check(v, 0); ts_obj_add_integrity((ts_object*)ts_ptr(v), 4u); } return v; }
+tsv ts_object_seal(tsv v){ if (g_has_proxies && ts_is_proxy(v)) return proxy_set_integrity(v, 0); if (ts_is_propbag(v)){ ta_integrity_check(v, 0); ts_obj_add_integrity((ts_object*)ts_ptr(v), 4u); } return v; }
 tsv ts_object_prevent_extensions(tsv v){ if (g_has_proxies && ts_is_proxy(v)){ ts_proxy_prevent_extensions(v); return v; } if (ts_is_propbag(v)) ts_obj_add_integrity((ts_object*)ts_ptr(v), 2u); return v; }
 tsv ts_object_is_sealed(tsv v){
-  return ts_bool(!ts_is_propbag(v) || (ts_obj_integrity((ts_object*)ts_ptr(v)) & (1u|4u)));
+  if (g_has_proxies && ts_is_proxy(v)) return proxy_test_integrity(v, 0);
+  if (!ts_is_propbag(v) || (ts_obj_integrity((ts_object*)ts_ptr(v)) & (1u|4u))) return ts_bool(1);
+  return ts_bool(object_test_integrity(v, 0));
 }
 tsv ts_object_is_extensible(tsv v){
   if (g_has_proxies && ts_is_proxy(v)) return ts_bool(ts_proxy_is_extensible(v));
@@ -4215,6 +4232,15 @@ static ts_pref ts_set_named_prop(tsv obj, ts_object* o, ts_key key, tsv val,
         break;
       }
       if (fn_virtual(lf, key)){ ts_throw_readonly_write(obj, key); return PREF_NONE; }
+    }
+    if (TS_RT_UNLIKELY(p->h.kind == TS_KIND_TYPEDARRAY) && p != o){
+      /* an integer-indexed link: an element is a writable data property, so the receiver gets its own;
+         a numeric key past it names nothing, and the write does nothing */
+      uint32_t idx;
+      if (ta_numeric_key(key, &idx)){
+        if (idx >= ((ts_typedarray*)p)->length) return PREF_NONE;
+        break;
+      }
     }
     if (chain_link_exotic(p)){
       /* a proxy's [[Set]] with this receiver (its set trap decides), or the
@@ -9822,6 +9848,8 @@ static tsv ts_array_iterator_next(tsv* args, int n){
   tsv kindv = st ? st[2] : ts_get_ic(iter, g_ai_kind, &ic_kind);
   int kind = ts_is_num(kindv) ? (int)ts_to_num(kindv) : 0;
   double pos = ts_to_num(index);
+  if (ts_is_typed_array(source) && ((ts_typedarray*)ts_ptr(source))->out_of_bounds)
+    ts_throw_type_error_msg("Cannot perform Array Iterator.prototype.next on a detached ArrayBuffer");
   int alike = !ts_is_typed_array(source) && !ts_is_array(source) && ts_object_like(source);
   int done = ts_is_typed_array(source) ? pos >= ((ts_typedarray*)ts_ptr(source))->length
            : alike ? pos >= arrlike_len(source)
@@ -11861,6 +11889,7 @@ static int objproto_tostring_is_error(tsv v);
 static tsv error_stack_get(tsv* a, int n){
   tsv e = n > 0 ? a[0] : TS_UNDEFINED;
   if (!ts_is_obj(e) || !objproto_tostring_is_error(e)) return TS_UNDEFINED;
+  for (int i = 0; i < TS_ERR_KINDS; i++) if (e == g_error_protos[i]) return TS_UNDEFINED;
   return error_stack_text(e);
 }
 static tsv error_stack_set(tsv* a, int n){
@@ -16237,7 +16266,7 @@ static tsv ts_own_descriptor_by_key(tsv obj, ts_key key){
     }
     if (nm && field_bytes_is(nm, nm_len, "prototype") && fn_has_own_prototype(f)){
       f = fn_materialize_prototype(f, obj);
-      return build_data_descriptor(f->prototype_prop, ts_is_class_value(obj) || f->dyn_class ? 0 : 1, 0, 0);
+      return build_data_descriptor(f->prototype_prop, ts_is_class_value(obj) || f->dyn_class || f->native_ctor ? 0 : 1, 0, 0);
     }
   }
   ts_object* o = ts_ptr(obj);
@@ -16641,8 +16670,17 @@ void ts_define_accessor_desc(tsv obj, tsv keyv, tsv getter, tsv setter, int g_th
   if (ok) define_own_property(obj, key, bits, TS_UNDEFINED, getter, setter, e, 0, c, 1);
 }
 static void descriptor_not_object(tsv desc);
+static tsv normalized_descriptor(tsv desc);
 static int define_property_from(tsv obj, tsv keyv, tsv desc, int throws){
-  if (g_has_proxies && ts_is_proxy(obj)){ ts_proxy_define_property(obj, keyv, desc); return 1; }
+  if (g_has_proxies && ts_is_proxy(obj)){
+    ts_gc_root(&obj); ts_gc_root(&keyv);
+    tsv normal = normalized_descriptor(desc);
+    ts_gc_root(&normal);
+    int ok = proxy_define_answer(obj, keyv, normal);
+    ts_gc_unroot(3);
+    if (!ok && throws) proxy_define_refused(keyv);
+    return ok;
+  }
   if (!ts_is_propbag(obj)){
     ts_throw_type_error(throws ? "Object.defineProperty called on non-object" : "Reflect.defineProperty called on non-object");
     return 0;
@@ -17510,6 +17548,7 @@ tsv ts_new_typed_array(int elem, tsv* args, int n){
     if (!ts_is_typed_array(src) && !ts_is_indexed_array_fast(src)){
       tsv itf = ts_get(src, TS_KEY_WKSYM(TS_WKSYM_ITERATOR));
       if (ts_is_callable(itf)) src = ts_array_from(src);
+      else if (!ts_is_undef(itf) && !ts_is_null(itf)) ts_throw_type_error_msg("TypedArray's constructor requires that the property of the first argument, items[Symbol.iterator], when exists, be a function");
     }
     uint32_t len = ta_source_length(src);
     tsv r = ta_new_length(elem, len); ts_gc_root(&r);
@@ -17699,6 +17738,7 @@ static double ta_big_search(tsv t, tsv needle, double from, double to, double st
 static tsv ta_m_index_of(tsv* a, int n){
   tsv t = ta_require(n ? a[0] : TS_UNDEFINED, "indexOf"); ts_gc_root(&t);
   int is_num; double v = ta_search_arg(a, n, &is_num);
+  if (ta_ptr(t)->length == 0){ ts_gc_unroot(1); return ts_num(-1); }    /* before fromIndex converts */
   uint32_t len = ta_ptr(t)->length, from = ta_rel(a, n, 2, len, 0);
   double r = -1;
   if (ta_is_big(ta_ptr(t))) r = ta_big_search(t, n > 1 ? a[1] : TS_UNDEFINED, (double)from, (double)len, 1);
@@ -17729,6 +17769,7 @@ static tsv ta_m_last_index_of(tsv* a, int n){
 static tsv ta_m_includes(tsv* a, int n){
   tsv t = ta_require(n ? a[0] : TS_UNDEFINED, "includes"); ts_gc_root(&t);
   int is_num; double v = ta_search_arg(a, n, &is_num);
+  if (ta_ptr(t)->length == 0){ ts_gc_unroot(1); return ts_bool(0); }
   uint32_t len = ta_ptr(t)->length, from = ta_rel(a, n, 2, len, 0);
   int r = 0;
   /* Get: an element gone reads undefined, and undefined is found there */
@@ -19685,11 +19726,15 @@ void ts_function_proto_register(ts_key method_key, const char* name, ts_code fn)
    are boxed (ts_num) and boolean results wrapped (ts_bool) to match the value
    calling convention. */
 /* A String.prototype method called on anything: RequireObjectCoercible, then ToString of `this`, first thing */
-static void str_this_slow(tsv* a, int n){
-  if (n < 1 || ts_is_undef(a[0]) || ts_is_null(a[0])) ts_throw_type_error_msg("String.prototype method called on null or undefined");
-  a[0] = ts_to_string_v(a[0]);
+static void str_this_slow(tsv* a, int n, const char* fn){
+  if (n < 1 || ts_is_undef(a[0]) || ts_is_null(a[0])){
+    char buf[96];
+    snprintf(buf, sizeof buf, "String.prototype.%s called on null or undefined", fn + 12);   /* (past `ts_strproto_`) */
+    ts_throw_type_error_msg(buf);
+  }
+  a[0] = ts_to_string_template(a[0]);
 }
-#define STR_THIS(a, n) do { if (TS_RT_UNLIKELY((n) < 1 || !ts_is_str((a)[0]))) str_this_slow(a, n); } while (0)
+#define STR_THIS(a, n) do { if (TS_RT_UNLIKELY((n) < 1 || !ts_is_str((a)[0]))) str_this_slow(a, n, __func__); } while (0)
 tsv ts_strproto_toUpperCase(tsv* a, int n){ STR_THIS(a, n); (void)n; return ts_str_toupper(a[0]); }
 tsv ts_strproto_toLowerCase(tsv* a, int n){ STR_THIS(a, n); (void)n; return ts_str_tolower(a[0]); }
 tsv ts_strproto_toLocaleUpperCase(tsv* a, int n){ STR_THIS(a, n); (void)n; return ts_str_toupper(a[0]); }
@@ -19887,6 +19932,64 @@ static tsv this_number(tsv v, const char* method){
   snprintf(m, sizeof m, "Number.prototype.%s requires that 'this' be a Number", method);
   ts_throw_type_error_msg(m);
   return TS_UNDEFINED;
+}
+/* Number.prototype.toLocaleString: en-US, the only locale a compiled program has data for: the shortest digits,
+   at most three of them after the point (rounded half away from zero) unless the options say, grouped by three. */
+tsv ts_numproto_toLocaleString(tsv* a, int n){
+  double d = ts_to_num(this_number(n > 0 ? a[0] : TS_UNDEFINED, "toLocaleString"));
+  if (d != d) return ts_new_string("NaN", 3);
+  tsv opts = n > 2 ? a[2] : TS_UNDEFINED;
+  int min_frac = 0, max_frac = 3, grouping = 1;
+  if (ts_is_obj(opts)){
+    tsv mn = ts_get(opts, ts_intern_field("minimumFractionDigits", 21)), mx = ts_get(opts, ts_intern_field("maximumFractionDigits", 21));
+    if (!ts_is_undef(mn)){ min_frac = (int)ts_number_coerce(mn); if (max_frac < min_frac) max_frac = min_frac; }
+    if (!ts_is_undef(mx)){ max_frac = (int)ts_number_coerce(mx); if (min_frac > max_frac) min_frac = max_frac; }
+    tsv g = ts_get(opts, ts_intern_field("useGrouping", 11));
+    if (!ts_is_undef(g)) grouping = ts_truthy(g);
+    if (min_frac < 0 || max_frac > 100) ts_throw_range_error_msg("maximumFractionDigits value is out of range.");
+  }
+  jbuf b; jb_init(&b);
+  if (signbit(d)) jb_putc(&b, '-');
+  if (isinf(d)){ jb_putz(&b, "\xE2\x88\x9E"); tsv r = ts_new_string(b.p, (uint32_t)b.len); jb_free(&b); return r; }
+  /* the digits and the point's place */
+  char num[48]; ts_fmt_num(fabs(d), num, sizeof num);
+  char digits[64]; int nd = 0, point = -1, exp10 = 0;
+  for (const char* p = num; *p; p++){
+    if (*p == '.') point = nd;
+    else if (*p == 'e'){ exp10 = atoi(p + 1); break; }
+    else digits[nd++] = *p;
+  }
+  if (point < 0) point = nd;
+  point += exp10;
+  /* the plain decimal form: a carry's room, the integer part, the fraction */
+  int int_len = point > 0 ? point : 1;
+  int frac_len = point >= nd ? 0 : point > 0 ? nd - point : nd - point;
+  char* plain = (char*)malloc((size_t)int_len + (size_t)frac_len + (size_t)max_frac + 3);
+  char* ip = plain + 1;
+  plain[0] = '0';
+  memset(ip, '0', (size_t)int_len + (size_t)frac_len + (size_t)max_frac);
+  for (int i = 0; i < nd; i++) ip[point > 0 ? i : 1 - point + i] = digits[i];
+  char* fp = ip + int_len;
+  /* half away from zero at the last kept place */
+  if (frac_len > max_frac && fp[max_frac] >= '5'){
+    int i = int_len + max_frac - 1;
+    for (; i >= -1; i--){ if (ip[i] == '9'){ ip[i] = '0'; continue; } ip[i]++; break; }
+  }
+  char* first = plain[0] != '0' ? plain : ip;
+  int shown = (int)(fp - first);
+  for (int i = 0; i < shown; i++){
+    jb_putc(&b, first[i]);
+    int left = shown - i - 1;
+    if (grouping && left > 0 && left % 3 == 0) jb_putc(&b, ',');
+  }
+  int keep = frac_len < max_frac ? frac_len : max_frac;
+  while (keep > 0 && keep > min_frac && fp[keep - 1] == '0') keep--;
+  if (keep < min_frac) keep = min_frac;
+  if (keep > 0){ jb_putc(&b, '.'); jb_puts(&b, fp, (size_t)keep); }
+  free(plain);
+  tsv r = ts_new_string(b.p, (uint32_t)b.len);
+  jb_free(&b);
+  return r;
 }
 static tsv this_boolean(tsv v, const char* method){
   if (ts_is_bool(v)) return v;
@@ -22054,7 +22157,7 @@ static tsv ts_proxy_get_v(tsv pv, tsv keyv, tsv receiver){
   tsv trap = ts_proxy_trap(F.s[PX_PV], F.s[PX_HANDLER], "get");
   if (ts_is_undef(trap)){
     /* the target's [[Get]] with the receiver (a getter there sees it) */
-    tsv r = (F.s[PX_RECV] == F.s[PX_PV]) ? ts_get_dyn(F.s[PX_TARGET], F.s[PX_KEY]) : ts_reflect_get_recv(F.s[PX_TARGET], F.s[PX_KEY], F.s[PX_RECV]);
+    tsv r = ts_reflect_get_recv(F.s[PX_TARGET], F.s[PX_KEY], F.s[PX_RECV]);
     ts_frame_pop(&F.h); return r;
   }
   F.s[PX_TRAP] = trap;
@@ -22088,9 +22191,7 @@ static int ts_proxy_set_v(tsv pv, tsv keyv, tsv value, tsv receiver){
   if (ts_is_undef(trap)){
     /* the target's [[Set]] with the receiver: a write through the proxy
        itself lands on the target, a foreign receiver takes its own property */
-    int ok = 1;
-    if (F.s[PX_RECV] == F.s[PX_PV]) ts_set_dyn(F.s[PX_TARGET], F.s[PX_KEY], F.s[PX_VALUE]);
-    else ok = ts_truthy(ts_reflect_set_recv(F.s[PX_TARGET], F.s[PX_KEY], F.s[PX_VALUE], F.s[PX_RECV]));
+    int ok = ts_truthy(ts_reflect_set_recv(F.s[PX_TARGET], F.s[PX_KEY], F.s[PX_VALUE], F.s[PX_RECV]));
     ts_frame_pop(&F.h); return ok;
   }
   F.s[PX_TRAP] = trap;
@@ -22337,17 +22438,136 @@ static tsv ts_proxy_get_own_desc(tsv pv, tsv keyv){
   return r;
 }
 /* === defineProperty === */
-static void ts_proxy_define_property(tsv pv, tsv keyv, tsv desc){
+/* IsCompatiblePropertyDescriptor: `desc` applied over `cur`, both descriptor objects */
+static int pd_compatible(tsv desc, tsv cur){
+  if (pd_bool(cur, "configurable")) return 1;
+  if (pd_has(desc, "configurable") && pd_bool(desc, "configurable")) return 0;
+  if (pd_has(desc, "enumerable") && pd_bool(desc, "enumerable") != pd_bool(cur, "enumerable")) return 0;
+  int desc_data = pd_has(desc, "value") || pd_has(desc, "writable"), desc_acc = pd_has(desc, "get") || pd_has(desc, "set");
+  if (!desc_data && !desc_acc) return 1;
+  int cur_acc = pd_has(cur, "get") || pd_has(cur, "set");
+  if (desc_acc != cur_acc) return 0;
+  if (cur_acc){
+    if (pd_has(desc, "get") && !ts_object_is(pd_get(desc, "get"), pd_get(cur, "get"))) return 0;
+    if (pd_has(desc, "set") && !ts_object_is(pd_get(desc, "set"), pd_get(cur, "set"))) return 0;
+    return 1;
+  }
+  if (!pd_bool(cur, "writable")){
+    if (pd_has(desc, "writable") && pd_bool(desc, "writable")) return 0;
+    if (pd_has(desc, "value") && !ts_object_is(pd_get(desc, "value"), pd_get(cur, "value"))) return 0;
+  }
+  return 1;
+}
+/* [[DefineOwnProperty]]: its answer */
+static int proxy_define_answer(tsv pv, tsv keyv, tsv desc){
   ts_gc_root(&pv); ts_gc_root(&keyv); ts_gc_root(&desc);
   ts_proxy* px = ts_ptr(pv);
   tsv target = px->target, handler = px->handler;
   ts_gc_root(&target); ts_gc_root(&handler);
   tsv trap = ts_proxy_trap(pv, handler, "defineProperty");
-  if (ts_is_undef(trap)){ ts_define_property(target, keyv, desc); ts_gc_unroot(5); return; }
+  if (ts_is_undef(trap)){
+    int r = ts_truthy(ts_reflect_define_property(target, keyv, desc));
+    ts_gc_unroot(5);
+    return r;
+  }
   ts_gc_root(&trap);
   tsv argv[3] = { target, keyv, desc };
-  (void)invoke_with_this(trap, handler, argv, 3);
-  ts_gc_unroot(6);
+  if (!ts_truthy(invoke_with_this(trap, handler, argv, 3))){ ts_gc_unroot(6); return 0; }
+  tsv cur = ts_get_own_property_descriptor(target, keyv);
+  ts_gc_root(&cur);
+  int extensible = ts_truthy(ts_object_is_extensible(target));
+  int sets_final = pd_has(desc, "configurable") && !pd_bool(desc, "configurable");
+  char m[160];
+  tsv text = ts_is_symbol(keyv) ? ts_symbol_tostring(keyv) : keyv;
+  ts_gc_root(&text);
+  uint32_t kn = 0; char* ku = ts_string_cstr_copy(text, &kn);
+  const char* refused = NULL;
+  if (ts_is_undef(cur)){
+    if (!extensible) refused = "trap returned truish for adding property '%.80s'  to the non-extensible proxy target";
+    else if (sets_final) refused = "trap returned truish for defining non-configurable property '%.80s' which is either non-existent or configurable in the proxy target";
+  } else {
+    if (!pd_compatible(desc, cur)) refused = "trap returned truish for adding property '%.80s'  that is incompatible with the existing property in the proxy target";
+    else if (sets_final && pd_bool(cur, "configurable")) refused = "trap returned truish for defining non-configurable property '%.80s' which is either non-existent or configurable in the proxy target";
+    else if (pd_has(cur, "value") && !pd_bool(cur, "configurable") && pd_bool(cur, "writable") && pd_has(desc, "writable") && !pd_bool(desc, "writable"))
+      refused = "trap returned truish for defining non-configurable property '%.80s' which cannot be non-writable, unless there exists a corresponding non-configurable, non-writable own property of the target object.";
+  }
+  if (refused){
+    int at = snprintf(m, sizeof m, "'defineProperty' on proxy: ");
+    snprintf(m + at, sizeof m - (size_t)at, refused, ku);
+    free(ku);
+    ts_throw_type_error_msg(m);
+  }
+  free(ku);
+  ts_gc_unroot(8);
+  return 1;
+}
+static void proxy_define_refused(tsv keyv){
+  ts_gc_root(&keyv);
+  tsv text = ts_is_symbol(keyv) ? ts_symbol_tostring(keyv) : keyv;
+  uint32_t kn = 0; char* ku = ts_string_cstr_copy(text, &kn);
+  char m[160];
+  snprintf(m, sizeof m, "'defineProperty' on proxy: trap returned falsish for property '%.80s'", ku);
+  free(ku);
+  ts_throw_type_error_msg(m);
+}
+static void ts_proxy_define_property(tsv pv, tsv keyv, tsv desc){
+  if (!proxy_define_answer(pv, keyv, desc)) proxy_define_refused(keyv);
+}
+static int object_test_integrity(tsv v, int frozen){
+  if ((ts_obj_integrity((ts_object*)ts_ptr(v)) & 2u) == 0) return 0;     /* extensible */
+  ts_gc_root(&v);
+  tsv keys = ts_reflect_own_keys(v); ts_gc_root(&keys);
+  uint32_t n = (uint32_t)ts_array_len(keys);
+  int r = 1;
+  for (uint32_t i = 0; i < n && r; i++){
+    tsv cur = ts_get_own_property_descriptor(v, ts_array_get(keys, i));
+    if (ts_is_undef(cur)) continue;
+    ts_gc_root(&cur);
+    if (pd_bool(cur, "configurable")) r = 0;
+    else if (frozen && pd_has(cur, "value") && pd_bool(cur, "writable")) r = 0;
+    ts_gc_unroot(1);
+  }
+  ts_gc_unroot(2);
+  return r;
+}
+/* SetIntegrityLevel and TestIntegrityLevel: what a Proxy's traps see */
+static tsv proxy_set_integrity(tsv pv, int frozen){
+  ts_gc_root(&pv);
+  ts_proxy_prevent_extensions(pv);
+  tsv keys = ts_reflect_own_keys(pv); ts_gc_root(&keys);
+  uint32_t n = (uint32_t)ts_array_len(keys);
+  for (uint32_t i = 0; i < n; i++){
+    tsv k = ts_array_get(keys, i); ts_gc_root(&k);
+    tsv d = ts_new_object(); ts_gc_root(&d);
+    ts_set(d, ts_intern_field("configurable", 12), ts_bool(0));
+    int define = 1;
+    if (frozen){
+      tsv cur = ts_get_own_property_descriptor(pv, k);
+      if (ts_is_undef(cur)) define = 0;
+      else if (pd_has(cur, "value")) ts_set(d, ts_intern_field("writable", 8), ts_bool(0));
+    }
+    if (define) ts_proxy_define_property(pv, k, d);
+    ts_gc_unroot(2);
+  }
+  ts_gc_unroot(2);
+  return pv;
+}
+static tsv proxy_test_integrity(tsv pv, int frozen){
+  if (ts_proxy_is_extensible(pv)) return ts_bool(0);
+  ts_gc_root(&pv);
+  tsv keys = ts_reflect_own_keys(pv); ts_gc_root(&keys);
+  uint32_t n = (uint32_t)ts_array_len(keys);
+  int r = 1;
+  for (uint32_t i = 0; i < n && r; i++){
+    tsv cur = ts_get_own_property_descriptor(pv, ts_array_get(keys, i));
+    if (ts_is_undef(cur)) continue;
+    ts_gc_root(&cur);
+    if (pd_bool(cur, "configurable")) r = 0;
+    else if (frozen && pd_has(cur, "value") && pd_bool(cur, "writable")) r = 0;
+    ts_gc_unroot(1);
+  }
+  ts_gc_unroot(2);
+  return ts_bool(r);
 }
 /* === apply / construct === */
 /* [[Call]] of a Proxy exists when its target's does (ECMA-262 10.5.12): a method read through a
@@ -26395,6 +26615,14 @@ static tsv gen_next_into(tsv genobj, tsv sent, tsv result){
   }
   ts_gc_unroot(4);
   return result;
+}
+/* A `.next()` the types call a generator's: the value may be another iterator (an unchecked program's
+   reassignment, a cast), and takes its own method */
+tsv ts_gen_next_site(tsv genobj, tsv sent){
+  ensure_gen_fields();
+  if (ts_is_obj(genobj) && ts_is_coro_value(ts_get_ic(genobj, F_coro, &g_ic_coro))) return ts_gen_next(genobj, sent);
+  tsv a[1] = { sent };
+  return ts_method_dynamic(genobj, "next", a, 1);
 }
 tsv ts_gen_next(tsv genobj, tsv sent){
   ensure_gen_fields();

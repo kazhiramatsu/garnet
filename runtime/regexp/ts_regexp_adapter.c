@@ -206,8 +206,8 @@ static inline double last_index_raw(tsv re){
   return ts_is_num(v) ? ts_to_num(v) : ts_number_coerce(v);
 }
 static inline uint32_t to_length_u32(double d){
-  if (!(d > 0.0) || !isfinite(d)) return 0;
-  if (d > 4294967295.0) return 4294967295u;
+  if (!(d > 0.0)) return 0;
+  if (d > 4294967295.0) return 4294967295u;     /* (past any string: Infinity's ToLength too) */
   return (uint32_t)floor(d);
 }
 static uint32_t last_index_get(tsv re){ return to_length_u32(last_index_raw(re)); }
@@ -862,7 +862,9 @@ tsv ts_regexp_adapter_construct_tsv(tsv pattern, tsv flags, int as_constructor){
     }
   }
   if (ts_is_regexp(pattern)){
-    if (flags == TS_UNDEFINED && !as_constructor){ ts_gc_unroot(2); return pattern; }
+    /* RegExp(re) is re while re's `constructor` is RegExp */
+    if (flags == TS_UNDEFINED && !as_constructor &&
+        ts_get(pattern, ts_intern_field("constructor", 11)) == ts_get(ts_regexp_proto(), ts_intern_field("constructor", 11))){ ts_gc_unroot(2); return pattern; }
     ts_regexp* r = as_re(pattern);
     tsv source = r->source; uint32_t mask = r->flags;
     ts_gc_root(&source);

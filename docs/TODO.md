@@ -12826,6 +12826,16 @@ Where it stopped (branch `s363-dc`, worktree `build/wt_dc`, on top of `s362-wip`
   three minutes). `import(expr)` with a specifier known at run time is a rejected promise, its ToString run. `new.target` in a
   nested function was counted as a capture of the enclosing method. `Generator<T>[]` was taken for a Generator (by the printed type).
   `Proxy` as a value, `class extends Proxy`, ToNumeric(lhs) of a Symbol before the right side converts.
+- **A Proxy without a trap passes its receiver** (a getter on the target saw the target), `[[DefineOwnProperty]]` answers and its
+  invariants hold (a false from the trap was ignored), `Object.freeze` / `seal` / `isFrozen` / `isSealed` go through the traps in the
+  specification's order (they marked the proxy cell and did nothing to the target). `Object.isFrozen` / `isSealed` of a
+  non-extensible object read its properties: `Object.isFrozen(Object.preventExtensions({}))` was false, silently.
+- **`String()` was "undefined"**, `String.prototype.x.call(undefined)` and a Symbol receiver under the Unicode case mapping,
+  `/./g` with `lastIndex` Infinity, `RegExp(re)` with `re.constructor` changed, a built-in constructor's `prototype` writable,
+  `new Date(a, b)` and `Date.UTC` not converting object arguments (Invalid Date instead of the valueOf's throw), `new Date(...a)`
+  and any spread in a built-in `new` (a compile-time reject), `n.toLocaleString()` on a number (a compile-time reject): en-US grouping
+  and three fraction digits, `minimumFractionDigits`, `maximumFractionDigits`, `useGrouping`. A typed array on an object's
+  chain takes an element write as the specification says. `x[2^k - 2]` doubling grew a dense buffer to 2^32 (14 s).
 - **import() of a bundled module** (`docs/dynamic_import_design.md`): a compile-time reject before. A module only `import()` reaches is
   compiled in, its top-level statements a function of their own, evaluated once when asked, deps first, a failure kept, a top-level
   await honored. `export default class {}` was missing from a namespace and its statics never ran (silent): a dynamic class.
