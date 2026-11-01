@@ -1578,6 +1578,10 @@ void ts_string_proto_register(ts_key method_key, const char* name, ts_code fn);
    reference the optional QuickJS adapter. */
 tsv  ts_regexp_proto(void);
 tsv  ts_symbol_proto(void);
+tsv  ts_date_proto(void);
+void ts_date_ctor_link(tsv ctor);   /* Date.prototype and its `constructor` */
+tsv  ts_date_link(tsv o);           /* a fresh object is a Date */
+tsv  ts_date_utc_value(tsv* a, int n);
 void ts_symbol_ctor_link(tsv ctor);   /* Symbol.prototype and its `constructor` */
 tsv  ts_regexpproto_toString(tsv* a, int n);
 void ts_regexp_proto_init(void);
@@ -2084,6 +2088,12 @@ tsv    ts_reflect_get_recv(tsv t, tsv k, tsv receiver);
 tsv    ts_reflect_set_recv(tsv t, tsv k, tsv v, tsv receiver);
 /* `super.x = v`: Set on the parent chain with `this` the receiver; a refusal is a TypeError */
 tsv    ts_super_set(tsv proto, tsv k, tsv v, tsv receiver);
+/* `x as number` from what is not known to be one: a cast that lies is a TypeError, not a NaN later */
+void   ts_throw_bad_number_cast(tsv v);
+static inline tsv ts_cast_number(tsv v){
+  if (TS_RT_UNLIKELY(!ts_is_num(v) && !ts_is_null(v) && !ts_is_undef(v))) ts_throw_bad_number_cast(v);
+  return v;
+}
 /* the member of a call is read before its arguments run: a nullish receiver throws first */
 void   ts_throw_method_receiver(tsv v, const char* name);
 static inline tsv ts_method_receiver(tsv v, const char* name){

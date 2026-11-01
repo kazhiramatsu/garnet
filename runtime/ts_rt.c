@@ -2002,8 +2002,9 @@ int g_has_callable_proxies = 0;
    (ts_arrproto_*) never come back here for a Proxy: they read the elements through the traps
    (arrproto_elements) or run the generic algorithm (arrlike_*), as Array.prototype.x.call(proxy) does. */
 /* The array builtins' test of a receiver that is no array: null and undefined throw here, the one
-   path all of them take (a typed array read past an end: `rows[9].push(1)` answered 0). */
-#define TS_ARRAY_PROXY(arr) ((void)ts_recv_coercible(arr), TS_RT_UNLIKELY(g_has_proxies) && ts_is_proxy(arr))
+   path all of them take (a typed array read past an end: `rows[9].push(1)` answered 0); anything else takes
+   the dynamic call V8 makes: a Proxy, an array-like a cast called an array (`.push` answered 0, silently). */
+#define TS_ARRAY_PROXY(arr) ((void)ts_recv_coercible(arr), 1)
 tsv ts_new_map(void);
 tsv ts_new_set(void);
 int g_typed_slow = 0;    /* declared in ts_rt.h; see ts_typed_slow there */
@@ -3800,6 +3801,10 @@ tsv ts_object_is_extensible(tsv v){
 /* Frozen check used by the array mutators (pop/shift/sort/...): a frozen array
    must not be mutated. */
 static inline int ts_arr_frozen(tsv v){ return (ts_obj_integrity(&((ts_array*)ts_ptr(v))->o) & 1u) != 0; }
+/* An Array.prototype method writes with Set(..., true): on a frozen array, or a sealed one where it would
+   delete, that is a TypeError, whatever the code's mode. */
+static void array_refused(void){ ts_throw_type_error_msg("Cannot assign to read only property 'length' of object '[object Array]'"); }
+static inline int ts_arr_sealed(tsv v){ return (ts_obj_integrity(&((ts_array*)ts_ptr(v))->o) & (1u|4u)) != 0; }
 static int sized_inherited_get(ts_object* o, ts_key key, tsv receiver, tsv* out);
 static int sized_absent_cached(ts_object* o, ts_key key);     /* the absent-read cache of sized receivers (defined with the addition cache) */
 static void sized_absent_fill(ts_object* o, ts_key key);
@@ -4514,10 +4519,27 @@ void ts_define_data_dyn(tsv obj, tsv keyv, tsv value, int e, int w, int c){
   ts_define_data(obj, key, value, e, w, c);
 }
 
+/* `length` of the built-in methods, sorted by name for the search; a name means the same count on every
+   prototype but for Number.prototype.toString. */
+static const struct { const char* name; uint8_t length; } g_builtin_lengths[] = {
+  {"add", 1}, {"apply", 2}, {"at", 1}, {"bind", 1}, {"call", 1}, {"catch", 1}, {"charAt", 1}, {"charCodeAt", 1}, {"clear", 0}, {"codePointAt", 1}, {"concat", 1}, {"copyWithin", 2}, {"delete", 1}, {"endsWith", 1}, {"entries", 0}, {"every", 1}, {"exec", 1}, {"fill", 1}, {"filter", 1}, {"finally", 1}, {"find", 1}, {"findIndex", 1}, {"findLast", 1}, {"findLastIndex", 1}, {"flat", 0}, {"flatMap", 1}, {"forEach", 1}, {"get", 1}, {"has", 1}, {"hasOwnProperty", 1}, {"includes", 1}, {"indexOf", 1}, {"isPrototypeOf", 1}, {"isWellFormed", 0}, {"join", 1}, {"keys", 0}, {"lastIndexOf", 1}, {"localeCompare", 1}, {"map", 1}, {"match", 1}, {"matchAll", 1}, {"normalize", 0}, {"padEnd", 1}, {"padStart", 1}, {"pop", 0}, {"propertyIsEnumerable", 1}, {"push", 1}, {"reduce", 1}, {"reduceRight", 1}, {"repeat", 1}, {"replace", 2}, {"replaceAll", 2}, {"reverse", 0}, {"search", 1}, {"set", 2}, {"shift", 0}, {"slice", 2}, {"some", 1}, {"sort", 1}, {"splice", 2}, {"split", 2}, {"startsWith", 1}, {"substr", 2}, {"substring", 2}, {"test", 1}, {"then", 2}, {"toExponential", 1}, {"toFixed", 1}, {"toLocaleLowerCase", 0}, {"toLocaleString", 0}, {"toLocaleUpperCase", 0}, {"toLowerCase", 0}, {"toPrecision", 1}, {"toReversed", 0}, {"toSorted", 1}, {"toSpliced", 2}, {"toString", 0}, {"toUpperCase", 0}, {"toWellFormed", 0}, {"trim", 0}, {"trimEnd", 0}, {"trimStart", 0}, {"unshift", 1}, {"valueOf", 0}, {"values", 0}, {"with", 2}
+};
+static uint32_t builtin_method_length(tsv proto, const char* name){
+  if (proto == g_number_proto_v && strcmp(name, "toString") == 0) return 1;
+  size_t lo = 0, hi = sizeof g_builtin_lengths / sizeof g_builtin_lengths[0];
+  while (lo < hi){
+    size_t mid = (lo + hi) / 2;
+    int c = strcmp(name, g_builtin_lengths[mid].name);
+    if (c == 0) return g_builtin_lengths[mid].length;
+    if (c < 0) hi = mid; else lo = mid + 1;
+  }
+  return 0;
+}
 static void ts_proto_register_method(tsv proto, ts_key method_key, const char* name, ts_code fn){
   if (!ts_proto_ref(proto)) return;
   tsv fv = ts_make_fn_t(fn, 0, 0, 1);
   ts_gc_root(&proto); ts_gc_root(&fv);
+  if (name) ts_set_fn_meta(fv, builtin_method_length(proto, name), name);
   ts_object* o = (ts_object*)ts_ptr(proto);
   ts_pref mp = props_define(o, method_key, (uint8_t)(TS_PROP_WRITABLE | TS_PROP_CONFIGURABLE));
   *pref_valp(mp) = fv;
@@ -8281,7 +8303,13 @@ tsv ts_array_iter_typed(tsv arr, int kind){
    trap; anything else reads 0, as before (ts_array_len_fast's non-array answer). */
 uint32_t ts_array_len_foreign(tsv v){
   if (ts_is_undef(v) || ts_is_null(v)) ts_throw_cannot_read(v, "length");
-  if (!(g_has_proxies && ts_is_proxy(v))) return 0;
+  if (!(g_has_proxies && ts_is_proxy(v))){
+    /* an array-like a cast called an array: its own `length` */
+    tsv l = ts_get(v, ts_intern_field("length", 6));
+    if (!ts_is_num(l)) return 0;
+    double n = ts_to_num(l);
+    return n >= 0.0 && n <= 4294967295.0 ? (uint32_t)n : 0u;
+  }
   double d = arrlike_len(v);
   return d > 4294967295.0 ? 4294967295u : (uint32_t)d;
 }
@@ -8468,7 +8496,7 @@ tsv ts_array_reduce_right(tsv arr, tsv cb, tsv init, int has_init){
    Length is unchanged; overlapping ranges are handled like memmove. */
 tsv ts_array_copy_within(tsv arr, double target, double start, double end, int has_end){
   ts_array* a=as_arr(arr); if(!a){ if (TS_ARRAY_PROXY(arr)){ tsv av[3] = { ts_num(target), ts_num(start), ts_num(end) }; return ts_method_dynamic(arr, "copyWithin", av, has_end ? 3 : 2); } return arr; }
-  if (ts_arr_frozen(arr)) return arr;
+  if (ts_arr_frozen(arr)){ if (a->len) array_refused(); return arr; }
   long n=(long)a->len;
   long to = (long)target; if(to<0) to+=n; if(to<0) to=0; if(to>n) to=n;
   long fr = (long)start;  if(fr<0) fr+=n; if(fr<0) fr=0; if(fr>n) fr=n;
@@ -8813,8 +8841,8 @@ tsv ts_array_join(tsv arr, tsv sep){
 tsv ts_array_pop(tsv arr){
   ts_array* a = ts_is_indexed_array_fast(arr) ? (ts_array*)ts_ptr(arr) : NULL;
   if(!a) return TS_ARRAY_PROXY(arr) ? ts_method_dynamic(arr, "pop", NULL, 0) : TS_UNDEFINED;
+  if (TS_RT_UNLIKELY(ts_arr_sealed(arr)) && (a->len || ts_arr_frozen(arr))) array_refused();
   if(a->len==0) return TS_UNDEFINED;
-  if (ts_arr_frozen(arr)) return TS_UNDEFINED;   /* frozen: no mutation */
   if (a->sparse){   /* stays sparse: take the last entry, if any */
     uint32_t last = a->len - 1u;
     ts_sparse_elems* s = array_sparse_table(a);
@@ -10530,23 +10558,6 @@ tsv ts_date_now_ms(void){
   struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
   return ts_num((double)ts.tv_sec*1000.0 + (double)(ts.tv_nsec/1000000));
 }
-/* new Date(year, month, day, hours, minutes, seconds, ms) in LOCAL time -> epoch
-   ms. mktime interprets the broken-down fields as local time and normalizes
-   overflow (matching JS component-Date semantics). Years 0..99 map to 1900..1999
-   like JS. */
-double ts_date_from_components(double y,double mo,double d,double h,double mi,double s,double mil){
-  struct tm tm; memset(&tm,0,sizeof tm);
-  int yr = (int)y;
-  tm.tm_year = (yr>=0 && yr<=99) ? yr : yr-1900;
-  tm.tm_mon  = (int)mo;
-  tm.tm_mday = (int)d;
-  tm.tm_hour = (int)h;
-  tm.tm_min  = (int)mi;
-  tm.tm_sec  = (int)s;
-  tm.tm_isdst = -1;                        /* let libc resolve DST */
-  time_t t = mktime(&tm);
-  return (double)t*1000.0 + mil;
-}
 /* The ISO format of the spec (Date Time String Format): YYYY or ±YYYYYY, optional -MM and -DD, an
    optional time THH:mm[:ss[.sss...]] (a space for the T too) with Z or ±HH:mm, or none (date-only forms
    are UTC, date-time forms local time); then this runtime's toString and toUTCString shapes
@@ -10658,33 +10669,69 @@ tsv ts_date_to_utc_string(double ms){
 /* Date.UTC(year, month, day=1, hours=0, minutes=0, seconds=0, ms=0): MakeDay and MakeTime in UTC; a
    month past December or a day past the month's end rolls over; a year 0..99 is 1900-based; NaN for a
    non-finite component. */
-double ts_date_utc(double y, double mo, double d, double h, double mi, double s, double ms){
-  if (!isfinite(y) || !isfinite(mo) || !isfinite(d) || !isfinite(h) || !isfinite(mi) || !isfinite(s) || !isfinite(ms)) return NAN;
-  double yi = trunc(y), mi_ = trunc(mo);
-  if (yi >= 0.0 && yi <= 99.0) yi += 1900.0;
-  double ym = yi + floor(mi_ / 12.0);
-  int mn = (int)(mi_ - floor(mi_ / 12.0) * 12.0);
-  double days = date_days_from_civil((long long)ym, mn + 1, 1) + trunc(d) - 1.0;
-  double t = days * 86400000.0 + trunc(h) * 3600000.0 + trunc(mi) * 60000.0 + trunc(s) * 1000.0 + trunc(ms);
-  if (fabs(t) > 8.64e15) return NAN;
-  return t;
+/* The specification's arithmetic: doubles all the way, so a day or a month past its range rolls over and a value
+   out of range is NaN, where mktime would give up. */
+#define DATE_MS_DAY 86400000.0
+static double date_floor_mod(double a, double b){ double r = fmod(a, b); return r < 0.0 ? r + b : r; }
+static double date_make_time(double h, double m, double s, double ms){
+  if (!isfinite(h) || !isfinite(m) || !isfinite(s) || !isfinite(ms)) return NAN;
+  return trunc(h) * 3600000.0 + trunc(m) * 60000.0 + trunc(s) * 1000.0 + trunc(ms);
 }
-/* new Date(value): a Date's own time value, a string parsed as above, anything else through ToNumber. */
+static double date_make_day(double y, double m, double d){
+  if (!isfinite(y) || !isfinite(m) || !isfinite(d)) return NAN;
+  double mi = trunc(m), ym = trunc(y) + floor(mi / 12.0);
+  if (fabs(ym) > 400000.0) return NAN;
+  return date_days_from_civil((long long)ym, (int)date_floor_mod(mi, 12.0) + 1, 1) + trunc(d) - 1.0;
+}
+static double date_make_date(double day, double time){
+  double r = day * DATE_MS_DAY + time;
+  return isfinite(r) ? r : NAN;
+}
+static double date_time_clip(double t){
+  if (!isfinite(t) || fabs(t) > 8.64e15) return NAN;
+  return trunc(t) + 0.0;
+}
+/* the milliseconds local time is ahead of UTC at the instant t */
+static double date_offset(double t){
+  time_t secs = (time_t)floor(t / 1000.0);
+  struct tm lt;
+  return localtime_r(&secs, &lt) ? (double)lt.tm_gmtoff * 1000.0 : 0.0;
+}
+static double date_utc_of_local(double t){
+  if (!isfinite(t)) return NAN;
+  return t - date_offset(t - date_offset(t));
+}
+static double date_full_year(double y){
+  if (y != y) return y;
+  double yi = trunc(y);
+  return yi >= 0.0 && yi <= 99.0 ? 1900.0 + yi : y;
+}
+double ts_date_utc(double y, double mo, double d, double h, double mi, double s, double ms){
+  return date_time_clip(date_make_date(date_make_day(date_full_year(y), mo, d), date_make_time(h, mi, s, ms)));
+}
+/* new Date(year, month, day, hours, minutes, seconds, ms) in local time */
+double ts_date_from_components(double y, double mo, double d, double h, double mi, double s, double ms){
+  return date_time_clip(date_utc_of_local(date_make_date(date_make_day(date_full_year(y), mo, d), date_make_time(h, mi, s, ms))));
+}
+tsv ts_date_utc_value(tsv* a, int n){
+  double c[7] = { NAN, 0, 1, 0, 0, 0, 0 };
+  for (int i = 0; i < n && i < 7; i++) c[i] = ts_number_coerce(a[i]);
+  return ts_num(ts_date_utc(c[0], c[1], c[2], c[3], c[4], c[5], c[6]));
+}
+static ts_key date_key(void){ static ts_key k; if (!k) k = ts_intern_field("__date_ms", 9); return k; }
+static int date_is(tsv v){
+  return TS_TOP16(v) == TS_SEL_OBJECT && ((ts_gc_header*)ts_ptr(v))->kind == TS_KIND_OBJECT && ts_has_own(v, date_key());
+}
 double ts_date_value_ms(tsv v){
-  if (ts_is_num(v)) return ts_to_num(v);
+  if (date_is(v)){ tsv ms = ts_get(v, date_key()); return ts_is_num(ms) ? ts_to_num(ms) : NAN; }
+  if (ts_object_like(v) && !ts_is_symbol(v)) v = ts_to_primitive(v, 2);
   if (ts_is_str(v)){
     uint32_t len; char* text = ts_string_utf8_copy(v, &len);
     double r = ts_date_parse_chars(text, len);
     free(text);
     return r;
   }
-  if (ts_is_obj(v)){
-    static uint32_t key = 0;
-    if (!key) key = ts_intern_field("__date_ms", 9);
-    tsv ms = ts_get(v, key);
-    if (ts_is_num(ms)) return ts_to_num(ms);
-  }
-  return ts_number_coerce(v);
+  return date_time_clip(ts_is_num(v) ? ts_to_num(v) : ts_number_coerce(v));
 }
 /* Extract a Date component from epoch-ms. `which` low nibble selects the field;
    bit 4 (|16) selects the UTC variant. 8 = getTimezoneOffset (minutes). */
@@ -10769,18 +10816,252 @@ tsv ts_date_to_locale_time(double ms, tsv locales, tsv options){
 }
 
 /* toISOString: always UTC, "YYYY-MM-DDTHH:mm:ss.sssZ". */
+static void date_civil(double days, double* y, int* m, int* d){
+  long long z = (long long)days + 719468;
+  long long era = (z >= 0 ? z : z - 146096) / 146097;
+  unsigned doe = (unsigned)(z - era * 146097);
+  unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  unsigned mp = (5 * doy + 2) / 153;
+  *d = (int)(doy - (153 * mp + 2) / 5 + 1);
+  *m = (int)(mp < 10 ? mp + 3 : mp - 9);
+  *y = (double)((long long)yoe + era * 400 + (*m <= 2));
+}
 tsv ts_date_to_iso(double ms){
   if (ms != ms) ts_throw_range_error_msg("Invalid time value");   /* catchable, as V8's */
-  time_t secs=(time_t)floor(ms/1000.0); struct tm tm; gmtime_r(&secs,&tm);
-  long long m=(long long)floor(ms); long long msec=m%1000; if(msec<0)msec+=1000;
-  char buf[40];
-  snprintf(buf,sizeof buf,"%04d-%02d-%02dT%02d:%02d:%02d.%03lldZ",
-    tm.tm_year+1900, tm.tm_mon+1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, msec);
-  return ts_new_string(buf,(uint32_t)strlen(buf));
+  double y; int mo, d;
+  double day = floor(ms / DATE_MS_DAY), tod = date_floor_mod(ms, DATE_MS_DAY);
+  date_civil(day, &y, &mo, &d);
+  long long yy = (long long)y;
+  int h = (int)(tod / 3600000.0), mi = (int)date_floor_mod(floor(tod / 60000.0), 60.0), sec = (int)date_floor_mod(floor(tod / 1000.0), 60.0), m = (int)date_floor_mod(tod, 1000.0);
+  char buf[48];
+  if (yy >= 0 && yy <= 9999) snprintf(buf, sizeof buf, "%04lld-%02d-%02dT%02d:%02d:%02d.%03dZ", yy, mo, d, h, mi, sec, m);
+  else snprintf(buf, sizeof buf, "%c%06lld-%02d-%02dT%02d:%02d:%02d.%03dZ", yy < 0 ? '-' : '+', yy < 0 ? -yy : yy, mo, d, h, mi, sec, m);
+  return ts_new_string(buf, (uint32_t)strlen(buf));
 }
-/* Date.prototype.toJSON: the ISO string, null for an invalid date (the step JSON.stringify takes
-   for a Date, which has no toJSON method value in this runtime: json_apply_tojson). */
 tsv ts_date_to_json(double ms){ return ms != ms ? TS_NULL : ts_date_to_iso(ms); }
+/* Date.prototype (docs/date_design.md). A Date is a plain object holding its time value under a reserved key;
+   the typed forms the exporter resolves read that key, everything else comes here. */
+static tsv g_date_proto_v = TS_NULL;
+static double date_this(tsv* a, int n){
+  tsv v = n > 0 ? a[0] : TS_UNDEFINED;
+  if (!date_is(v)) ts_throw_type_error_msg("this is not a Date object.");
+  tsv ms = ts_get(v, date_key());
+  return ts_is_num(ms) ? ts_to_num(ms) : NAN;
+}
+#define DATE_GETTER(name, which) static tsv dp_##name(tsv* a, int n){ return ts_num(ts_date_component(date_this(a, n), which)); }
+DATE_GETTER(getFullYear, 0) DATE_GETTER(getMonth, 1) DATE_GETTER(getDate, 2) DATE_GETTER(getDay, 3) DATE_GETTER(getHours, 4)
+DATE_GETTER(getMinutes, 5) DATE_GETTER(getSeconds, 6) DATE_GETTER(getMilliseconds, 7) DATE_GETTER(getTimezoneOffset, 8)
+DATE_GETTER(getUTCFullYear, 16) DATE_GETTER(getUTCMonth, 17) DATE_GETTER(getUTCDate, 18) DATE_GETTER(getUTCDay, 19)
+DATE_GETTER(getUTCHours, 20) DATE_GETTER(getUTCMinutes, 21) DATE_GETTER(getUTCSeconds, 22) DATE_GETTER(getUTCMilliseconds, 23)
+#undef DATE_GETTER
+static tsv dp_getTime(tsv* a, int n){ return ts_num(date_this(a, n)); }
+static tsv dp_getYear(tsv* a, int n){ double t = date_this(a, n); return ts_num(t != t ? t : ts_date_component(t, 0) - 1900.0); }
+static tsv dp_setTime(tsv* a, int n){
+  (void)date_this(a, n);
+  double t = date_time_clip(ts_number_coerce(n > 1 ? a[1] : TS_UNDEFINED));
+  ts_set(a[0], date_key(), ts_num(t));
+  return ts_num(t);
+}
+enum { DS_MS, DS_SEC, DS_MIN, DS_HOUR, DS_DATE, DS_MONTH, DS_YEAR };
+/* the setters: the time value is read before the arguments are converted; what an argument's conversion does
+   to the date afterwards does not count */
+static tsv date_set(tsv* a, int n, int which, int utc){
+  static const int maxargs[] = { 1, 2, 3, 4, 1, 2, 3 };
+  double t = date_this(a, n);
+  tsv self = a[0];
+  ts_gc_root(&self);
+  double v[4] = { NAN, NAN, NAN, NAN };
+  int given = n - 1 < maxargs[which] ? n - 1 : maxargs[which];
+  for (int i = 0; i < given; i++) v[i] = ts_number_coerce(a[i + 1]);
+  if (t != t){
+    if (which != DS_YEAR){ ts_gc_unroot(1); return ts_num(NAN); }
+    t = 0.0;
+  } else if (!utc) t += date_offset(t);
+  double day = floor(t / DATE_MS_DAY), tod = date_floor_mod(t, DATE_MS_DAY);
+  double h = floor(tod / 3600000.0), mi = date_floor_mod(floor(tod / 60000.0), 60.0);
+  double sec = date_floor_mod(floor(tod / 1000.0), 60.0), ms = date_floor_mod(tod, 1000.0);
+  double y; int mo, d;
+  date_civil(day, &y, &mo, &d);
+  double month = (double)(mo - 1), dt = (double)d;
+  switch (which){
+    case DS_MS: ms = v[0]; break;
+    case DS_SEC: sec = v[0]; if (given > 1) ms = v[1]; break;
+    case DS_MIN: mi = v[0]; if (given > 1) sec = v[1]; if (given > 2) ms = v[2]; break;
+    case DS_HOUR: h = v[0]; if (given > 1) mi = v[1]; if (given > 2) sec = v[2]; if (given > 3) ms = v[3]; break;
+    case DS_DATE: dt = v[0]; break;
+    case DS_MONTH: month = v[0]; if (given > 1) dt = v[1]; break;
+    case DS_YEAR: y = v[0]; if (given > 1) month = v[1]; if (given > 2) dt = v[2]; break;
+  }
+  double made = date_make_date(date_make_day(y, month, dt), date_make_time(h, mi, sec, ms));
+  double u = date_time_clip(utc ? made : date_utc_of_local(made));
+  ts_set(self, date_key(), ts_num(u));
+  ts_gc_unroot(1);
+  return ts_num(u);
+}
+#define DATE_SETTER(name, which, utc) static tsv dp_##name(tsv* a, int n){ return date_set(a, n, which, utc); }
+DATE_SETTER(setMilliseconds, DS_MS, 0) DATE_SETTER(setSeconds, DS_SEC, 0) DATE_SETTER(setMinutes, DS_MIN, 0) DATE_SETTER(setHours, DS_HOUR, 0)
+DATE_SETTER(setDate, DS_DATE, 0) DATE_SETTER(setMonth, DS_MONTH, 0) DATE_SETTER(setFullYear, DS_YEAR, 0)
+DATE_SETTER(setUTCMilliseconds, DS_MS, 1) DATE_SETTER(setUTCSeconds, DS_SEC, 1) DATE_SETTER(setUTCMinutes, DS_MIN, 1) DATE_SETTER(setUTCHours, DS_HOUR, 1)
+DATE_SETTER(setUTCDate, DS_DATE, 1) DATE_SETTER(setUTCMonth, DS_MONTH, 1) DATE_SETTER(setUTCFullYear, DS_YEAR, 1)
+#undef DATE_SETTER
+static tsv dp_setYear(tsv* a, int n){
+  double t = date_this(a, n);
+  tsv self = a[0];
+  ts_gc_root(&self);
+  double y = ts_number_coerce(n > 1 ? a[1] : TS_UNDEFINED);
+  double u = NAN;
+  if (y == y){
+    t = t != t ? 0.0 : t + date_offset(t);
+    double yy, unused = 0.0; int mo, d;
+    (void)unused;
+    date_civil(floor(t / DATE_MS_DAY), &yy, &mo, &d);
+    u = date_time_clip(date_utc_of_local(date_make_date(date_make_day(date_full_year(y), (double)(mo - 1), (double)d), date_floor_mod(t, DATE_MS_DAY))));
+  }
+  ts_set(self, date_key(), ts_num(u));
+  ts_gc_unroot(1);
+  return ts_num(u);
+}
+/* the host names a zone by its abbreviation, V8 (through ICU) by its long name */
+static const char* date_zone_name(double tv){
+  static const struct { const char* abbr; const char* name; } zones[] = {
+    {"UTC", "Coordinated Universal Time"}, {"GMT", "Greenwich Mean Time"}, {"BST", "British Summer Time"},
+    {"JST", "Japan Standard Time"}, {"KST", "Korean Standard Time"}, {"IST", "India Standard Time"},
+    {"CET", "Central European Standard Time"}, {"CEST", "Central European Summer Time"},
+    {"EET", "Eastern European Standard Time"}, {"EEST", "Eastern European Summer Time"},
+    {"EST", "Eastern Standard Time"}, {"EDT", "Eastern Daylight Time"}, {"CST", "Central Standard Time"}, {"CDT", "Central Daylight Time"},
+    {"MST", "Mountain Standard Time"}, {"MDT", "Mountain Daylight Time"}, {"PST", "Pacific Standard Time"}, {"PDT", "Pacific Daylight Time"},
+  };
+  time_t secs = (time_t)floor(tv / 1000.0);
+  struct tm lt;
+  if (!localtime_r(&secs, &lt) || !lt.tm_zone) return "UTC";
+  for (size_t i = 0; i < sizeof zones / sizeof zones[0]; i++) if (strcmp(zones[i].abbr, lt.tm_zone) == 0) return zones[i].name;
+  return lt.tm_zone;
+}
+/* parts: 1 the date, 2 the time, 3 both */
+static tsv date_string(double tv, int parts){
+  static const char* const days[7] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+  static const char* const months[12] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+  if (tv != tv) return ts_new_string("Invalid Date", 12);
+  double off = date_offset(tv), t = tv + off, day = floor(t / DATE_MS_DAY), tod = date_floor_mod(t, DATE_MS_DAY);
+  double y; int mo, d;
+  date_civil(day, &y, &mo, &d);
+  long long yy = (long long)y;
+  char date[48] = "", time_part[128] = "";
+  if (parts & 1) snprintf(date, sizeof date, "%s %s %02d %s%04lld", days[(int)date_floor_mod(day + 4.0, 7.0)], months[mo - 1], d, yy < 0 ? "-" : "", yy < 0 ? -yy : yy);
+  if (parts & 2){
+    long om = (long)(off / 60000.0), am = om < 0 ? -om : om;
+    snprintf(time_part, sizeof time_part, "%02d:%02d:%02d GMT%c%02ld%02ld (%s)", (int)(tod / 3600000.0), (int)date_floor_mod(floor(tod / 60000.0), 60.0),
+      (int)date_floor_mod(floor(tod / 1000.0), 60.0), om < 0 ? '-' : '+', am / 60, am % 60, date_zone_name(tv));
+  }
+  char out[180];
+  int len = snprintf(out, sizeof out, "%s%s%s", date, parts == 3 ? " " : "", time_part);
+  return ts_new_string(out, (uint32_t)len);
+}
+static tsv dp_toString(tsv* a, int n){ return date_string(date_this(a, n), 3); }
+static tsv dp_toDateString(tsv* a, int n){ return date_string(date_this(a, n), 1); }
+static tsv dp_toTimeString(tsv* a, int n){ return date_string(date_this(a, n), 2); }
+static tsv dp_toISOString(tsv* a, int n){ return ts_date_to_iso(date_this(a, n)); }
+static tsv dp_toUTCString(tsv* a, int n){ return ts_date_to_utc_string(date_this(a, n)); }
+static tsv dp_toLocaleTimeString(tsv* a, int n){ return ts_date_to_locale_time(date_this(a, n), n > 1 ? a[1] : TS_UNDEFINED, n > 2 ? a[2] : TS_UNDEFINED); }
+static tsv date_locale_date(double t, tsv locales, tsv options){
+  if (!ts_is_undef(locales) || !ts_is_undef(options)) ts_unsupported_builtin("Date.toLocaleDateString with locales or options");
+  double y; int mo, d;
+  date_civil(floor((t + date_offset(t)) / DATE_MS_DAY), &y, &mo, &d);
+  char out[40];
+  int len = snprintf(out, sizeof out, "%d/%d/%lld", mo, d, (long long)y);
+  return ts_new_string(out, (uint32_t)len);
+}
+static tsv dp_toLocaleDateString(tsv* a, int n){
+  double t = date_this(a, n);
+  if (t != t) return ts_new_string("Invalid Date", 12);
+  return date_locale_date(t, n > 1 ? a[1] : TS_UNDEFINED, n > 2 ? a[2] : TS_UNDEFINED);
+}
+static tsv dp_toLocaleString(tsv* a, int n){
+  double t = date_this(a, n);
+  if (t != t) return ts_new_string("Invalid Date", 12);
+  tsv locales = n > 1 ? a[1] : TS_UNDEFINED, options = n > 2 ? a[2] : TS_UNDEFINED;
+  tsv date = date_locale_date(t, locales, options); ts_gc_root(&date);
+  tsv time_part = ts_date_to_locale_time(t, TS_UNDEFINED, TS_UNDEFINED); ts_gc_root(&time_part);
+  tsv sep = ts_new_string(", ", 2); ts_gc_root(&sep);
+  tsv r = ts_str_concat(ts_str_concat(date, sep), time_part);
+  ts_gc_unroot(3);
+  return r;
+}
+static tsv dp_toJSON(tsv* a, int n){
+  tsv self = n > 0 ? a[0] : TS_UNDEFINED;
+  if (ts_is_undef(self) || ts_is_null(self)) ts_throw_type_error_msg("Cannot convert undefined or null to object");
+  ts_gc_root(&self);
+  tsv tv = ts_to_primitive(self, 0);
+  if (ts_is_num(tv) && !isfinite(ts_to_num(tv))){ ts_gc_unroot(1); return TS_NULL; }
+  tsv r = ts_method_dynamic(self, "toISOString", NULL, 0);
+  ts_gc_unroot(1);
+  return r;
+}
+static tsv dp_toPrimitive(tsv* a, int n){
+  tsv self = n > 0 ? a[0] : TS_UNDEFINED, hint = n > 1 ? a[1] : TS_UNDEFINED;
+  if (!ts_object_like(self) || ts_is_symbol(self)) ts_throw_type_error_msg("Date.prototype[Symbol.toPrimitive] called on a non-object");
+  int number = 0;
+  if (date_option_equals(hint, "number")) number = 1;
+  else if (!date_option_equals(hint, "string") && !date_option_equals(hint, "default")) ts_throw_type_error_msg("Invalid hint");
+  ts_prim_field_init();
+  ts_gc_root(&self);
+  for (int i = 0; i < 2; i++){
+    int to_string = (i == 0) != number;
+    tsv m = ts_prim_method(self, to_string ? g_tostring_field : g_valueof_field, to_string ? g_tostring_key : g_valueof_key);
+    if (ts_is_callable(m)){
+      ts_gc_root(&m);
+      tsv r = ts_call_method(m, &self, 1);
+      ts_gc_unroot(1);
+      if ((!ts_is_obj(r) && !ts_is_func(r)) || ts_is_symbol(r)){ ts_gc_unroot(1); return r; }
+    }
+  }
+  ts_gc_unroot(1);
+  ts_throw_type_error_msg("Cannot convert object to primitive value");
+  return TS_UNDEFINED;
+}
+static void date_define(tsv p, const char* name, ts_code fn, uint32_t length){
+  tsv f = ts_make_fn_t(fn, NULL, 0, 1); ts_gc_root(&f);
+  ts_set_fn_meta(f, length, name);
+  ts_define_data(p, ts_intern_field(name, (uint32_t)strlen(name)), f, 0, 1, 1);
+  ts_gc_unroot(1);
+}
+tsv ts_date_proto(void){
+  if (ts_proto_ref(g_date_proto_v)) return g_date_proto_v;
+  static int rooted = 0;
+  g_date_proto_v = ts_new_proto_pretenured();
+  ts_root_static_once(&g_date_proto_v, &rooted);
+  tsv p = g_date_proto_v;
+  ((ts_object*)ts_ptr(p))->proto = g_object_proto_v;
+  static const struct { const char* name; ts_code fn; uint8_t length; } methods[] = {
+#define M(name, length) { #name, dp_##name, length }
+    M(getFullYear, 0), M(getMonth, 0), M(getDate, 0), M(getDay, 0), M(getHours, 0), M(getMinutes, 0), M(getSeconds, 0), M(getMilliseconds, 0),
+    M(getTimezoneOffset, 0), M(getUTCFullYear, 0), M(getUTCMonth, 0), M(getUTCDate, 0), M(getUTCDay, 0), M(getUTCHours, 0), M(getUTCMinutes, 0),
+    M(getUTCSeconds, 0), M(getUTCMilliseconds, 0), M(getTime, 0), M(getYear, 0), M(setTime, 1), M(setYear, 1),
+    M(setMilliseconds, 1), M(setSeconds, 2), M(setMinutes, 3), M(setHours, 4), M(setDate, 1), M(setMonth, 2), M(setFullYear, 3),
+    M(setUTCMilliseconds, 1), M(setUTCSeconds, 2), M(setUTCMinutes, 3), M(setUTCHours, 4), M(setUTCDate, 1), M(setUTCMonth, 2), M(setUTCFullYear, 3),
+    M(toString, 0), M(toDateString, 0), M(toTimeString, 0), M(toISOString, 0), M(toUTCString, 0), M(toLocaleString, 0), M(toLocaleDateString, 0),
+    M(toLocaleTimeString, 0), M(toJSON, 1),
+#undef M
+  };
+  for (size_t i = 0; i < sizeof methods / sizeof methods[0]; i++) date_define(p, methods[i].name, methods[i].fn, methods[i].length);
+  /* valueOf is its own function, toGMTString the same function as toUTCString (Annex B) */
+  date_define(p, "valueOf", dp_getTime, 0);
+  ts_define_data(p, ts_intern_field("toGMTString", 11), ts_get(p, ts_intern_field("toUTCString", 11)), 0, 1, 1);
+  tsv prim = ts_make_fn_t(dp_toPrimitive, NULL, 0, 1); ts_gc_root(&prim);
+  ts_set_fn_meta(prim, 1, "[Symbol.toPrimitive]");
+  ts_define_data(p, TS_KEY_WKSYM(TS_WKSYM_TO_PRIMITIVE), prim, 0, 0, 1);
+  ts_gc_unroot(1);
+  return p;
+}
+void ts_date_ctor_link(tsv ctor){
+  ts_gc_root(&ctor);
+  tsv p = ts_date_proto();
+  ts_define_data(ctor, ts_intern_field("prototype", 9), p, 0, 0, 0);
+  ts_define_data(p, ts_intern_field("constructor", 11), ctor, 0, 1, 1);
+  ts_gc_unroot(1);
+}
+tsv ts_date_link(tsv o){ obj_link_fresh_proto(o, ts_date_proto()); return o; }
 
 /* ---------------- Array: additional methods ---------------- */
 /* callback predicates: find/findIndex/some/every. cb(element, index). */
@@ -10957,7 +11238,7 @@ tsv ts_array_at(tsv arr, double idx){
 }
 tsv ts_array_reverse(tsv arr){
   ts_array* a=as_arr(arr); if(!a) return TS_ARRAY_PROXY(arr) ? ts_method_dynamic(arr, "reverse", NULL, 0) : arr;
-  if (ts_arr_frozen(arr)) return arr;   /* frozen: no mutation */
+  if (ts_arr_frozen(arr)){ if (a->len > 1) array_refused(); return arr; }
   array_invalidate_dirty(a);
   for(uint32_t i=0,j=a->len?a->len-1:0; i<j; i++,j--){ tsv t=a->data[i]; a->data[i]=a->data[j]; a->data[j]=t; }
   return arr; /* in place, returns same array */
@@ -10965,8 +11246,8 @@ tsv ts_array_reverse(tsv arr){
 tsv ts_array_shift(tsv arr){
   ts_array* a=as_arr(arr);
   if(!a) return TS_ARRAY_PROXY(arr) ? ts_method_dynamic(arr, "shift", NULL, 0) : TS_UNDEFINED;
+  if (TS_RT_UNLIKELY(ts_arr_sealed(arr)) && (a->len || ts_arr_frozen(arr))) array_refused();
   if(a->len==0) return TS_UNDEFINED;
-  if (ts_arr_frozen(arr)) return TS_UNDEFINED;   /* frozen: no mutation */
   array_invalidate_dirty(a);
   tsv v=a->data[0];
   if (a->len > 16u && !array_uses_inline(a)){
@@ -10985,7 +11266,7 @@ tsv ts_array_shift(tsv arr){
 }
 double ts_array_unshift(tsv arr, tsv v){
   ts_array* a=as_arr(arr); if(!a) return TS_ARRAY_PROXY(arr) ? ts_number_coerce(ts_method_dynamic(arr, "unshift", &v, 1)) : 0;
-  if (ts_arr_frozen(arr)) return (double)a->len;   /* frozen: no mutation */
+  if (TS_RT_UNLIKELY(ts_obj_integrity(&a->o) & (1u|2u|4u))) array_refused();
   if (a->front){   /* a slot shift() left before data: the element goes there */
     array_invalidate_dirty(a);
     a->data--; a->front--; a->cap++;
@@ -11234,7 +11515,7 @@ int ts_native_new_take(void){ int v = g_native_new; g_native_new = 0; return v; 
 /* The Date function value: `new` makes what the typed form makes, a plain call is a string. */
 tsv ts_ctor_date(tsv* a, int n){
   double ms;
-  if (!ts_native_new_take()) ms = ts_to_num(ts_date_now_ms());
+  if (!ts_native_new_take()) return date_string(ts_to_num(ts_date_now_ms()), 3);
   else if (n == 0) ms = ts_to_num(ts_date_now_ms());
   else if (n == 1) ms = ts_date_value_ms(a[0]);
   else {
@@ -11244,7 +11525,8 @@ tsv ts_ctor_date(tsv* a, int n){
   }
   tsv o = ts_new_object();
   ts_gc_root(&o);
-  ts_set(o, ts_intern_field("__date_ms", 9), ts_num(ms));
+  ts_date_link(o);
+  ts_set(o, date_key(), ts_num(ms));
   ts_gc_unroot(1);
   return o;
 }
@@ -15421,10 +15703,11 @@ static tsv ts_own_descriptor_by_key(tsv obj, ts_key key){
   }
   if (ts_is_indexed_array_fast(obj) && nm){
     ts_array* a = ts_ptr(obj);
-    if (field_bytes_is(nm, nm_len, "length")) return build_data_descriptor(ts_num((double)a->len), 1, 0, 0);
+    uint32_t integ = ts_obj_integrity((ts_object*)a);   /* a frozen or sealed array's elements say so */
+    if (field_bytes_is(nm, nm_len, "length")) return build_data_descriptor(ts_num((double)a->len), !(integ & 1u), 0, 0);
     long ix = ts_canonical_array_index(nm, nm_len);
     if (ix >= 0 && ts_array_has_index(obj, (uint32_t)ix))
-      return build_data_descriptor(ts_array_get(obj, (uint32_t)ix), 1, 1, 1);
+      return build_data_descriptor(ts_array_get(obj, (uint32_t)ix), !(integ & 1u), 1, !(integ & (1u|4u)));
   }
   if (ts_is_typed_array(obj)){
     uint32_t idx;
@@ -18456,7 +18739,7 @@ tsv ts_method_dynamic(tsv recv, const char* name, const tsv* args, int nargs){
   if (ts_is_undef(recv) || ts_is_null(recv)) ts_throw_cannot_read(recv, name);
   tsv fn = TS_UNDEFINED;
   ts_gc_root(&recv);
-  if (ts_is_obj(recv) || ts_is_func(recv)) fn = ts_get(recv, ts_intern_field(name, (uint32_t)strlen(name)));
+  fn = ts_get(recv, ts_intern_field(name, (uint32_t)strlen(name)));
   if (!ts_is_func(fn)){ ts_gc_unroot(1); ts_throw_not_a_function(name); }
   ts_gc_root(&fn);
   tsv stack_argv[8];
@@ -19799,6 +20082,14 @@ static int receiver_part_set(tsv r, ts_key key, tsv v){
   }
   ts_gc_unroot(2);
   return ok;
+}
+void ts_throw_bad_number_cast(tsv v){
+  tsv t = ts_typeof(v);
+  uint32_t n = 0; char* u = ts_string_cstr_copy(t, &n);
+  char buf[128];
+  snprintf(buf, sizeof buf, "A value of type %s was cast to number", u);
+  free(u);
+  ts_throw_type_error_msg(buf);
 }
 tsv ts_super_set(tsv proto, tsv k, tsv v, tsv receiver){
   ts_gc_root(&v);

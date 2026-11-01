@@ -14823,6 +14823,8 @@ fn fnval_adapter_body(builtin: &str) -> Option<String> {
         "symbol.keyFor" => hv(format!("ts_symbol_key_for({})", val(0))),
         // ---- Date statics ----
         "date.now" => Some("return ts_date_now_ms();".to_string()),
+        "date.parse" => hv(format!("ts_num(ts_date_parse_value({}))", val(0))),
+        "date.UTC" => Some("return ts_date_utc_value(a, n);".to_string()),
         // ---- the URI functions as values (a program that names one; calls lower directly) ----
         "global.encodeURIComponent" => hv(format!("ts_encode_uri_component({})", val(0))),
         "global.decodeURIComponent" => hv(format!("ts_decode_uri_component({})", val(0))),
@@ -14974,6 +14976,8 @@ fn global_fn_value_builtins() -> &'static [&'static str] {
         "symbol.for",
         "symbol.keyFor",
         "date.now",
+        "date.parse",
+        "date.UTC",
         "math.sqrt",
         "math.abs",
         "math.floor",
@@ -15374,10 +15378,10 @@ fn emit_global_setup(s: &mut String, needs_fetch: bool, needs_typed_array_global
     s.push_str("  tsv _Date = ts_make_global_fn(ts_fnval_global_Date, 7u, \"Date\", 0);\n");
     root_local(s, "_Date");
     s.push_str("  ts_fn_mark_native_ctor(_Date);\n");
-    set_val(s, "_Date", "prototype", "ts_new_object()");
-    // Object.prototype.toString.call(new Date()) is "[object Date]": the builtin tag, as the prototype's @@toStringTag
-    s.push_str("  ts_define_data(ts_get(_Date, ts_intern_field(\"prototype\", 9)), TS_KEY_WKSYM(TS_WKSYM_TO_STRING_TAG), ts_new_string(\"Date\", 4), 0, 0, 1);\n");
+    s.push_str("  ts_date_ctor_link(_Date);\n");
     set_fn(s, "_Date", "now", "date.now", 0, "now");
+    set_fn(s, "_Date", "parse", "date.parse", 1, "parse");
+    set_fn(s, "_Date", "UTC", "date.UTC", 7, "UTC");
     global_set_rooted(s, "Date", "_Date");
 
     for (idx, name) in [
@@ -24124,7 +24128,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 // Date static
                 "date.now" => ("ts_to_num(ts_date_now_ms())".to_string(), true),
                 "date.value_ms" => (format!("ts_date_value_ms({})", v(0)), true),
-                _ if builtin.starts_with("date.isInstance:") => (format!("ts_bool(ts_has_prop({}, {}u))", v(0), &builtin["date.isInstance:".len()..]), false),
+                "date.link" => (format!("ts_date_link({})", v(0)), false),
                 "dynclass.define:0" => (format!("ts_dyn_class({}, TS_UNDEFINED, 0)", v(0)), false),
                 "dynclass.define:1" => (format!("ts_dyn_class({}, {}, 1)", v(0), v(1)), false),
                 _ if builtin.starts_with("dynclass.enter:") => (format!("ts_dyn_enter({})", c_string_lit(&builtin["dynclass.enter:".len()..])), false),
@@ -24132,6 +24136,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 "dynclass.this" => (format!("ts_dyn_this({})", v(0)), false),
                 "dynclass.thisCheck" => (format!("ts_dyn_this_check({})", v(0)), false),
                 "super.set" => (format!("ts_super_set({}, {}, {}, {})", v(0), v(1), v(2), v(3)), false),
+                "cast.number" => (format!("ts_cast_number({})", v(0)), false),
                 _ if builtin.starts_with("method.receiver:") => (format!("ts_method_receiver({}, {})", v(0), c_string_lit(&builtin["method.receiver:".len()..])), false),
                 "dynclass.super" => (format!("ts_dyn_super({}, {}, {})", v(0), v(1), v(2)), false),
                 "dynclass.bindCheck" => (format!("(ts_dyn_bind_check({}), TS_UNDEFINED)", v(0)), false),
@@ -24142,7 +24147,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     // Date.UTC(year, month, day=1, hours=0, minutes=0, seconds=0, ms=0): the missing components' defaults
                     let argc: usize = b["date.utc:".len()..].parse().unwrap_or(0);
                     let comp: Vec<String> = (0..7)
-                        .map(|i| if i < argc { n(i) } else if i == 2 { "1.0".to_string() } else { "0.0".to_string() })
+                        .map(|i| if i < argc { n(i) } else if i == 0 { "NAN".to_string() } else if i == 2 { "1.0".to_string() } else { "0.0".to_string() })
                         .collect();
                     (format!("ts_date_utc({})", comp.join(", ")), true)
                 }
@@ -25278,7 +25283,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             if let Some(c) = class {
                 if let Some(off) = struct_offset_for(ctx, obj.0, c, field.0, &hinted) {
                     let cn = field_struct(c, field.0, ctx.classes);
-                    let obj_name = ctx.vname(obj.0);
+                    let obj_name = ctx.val(obj.0);   // boxed: a lie can leave a number behind a class type
                     let st = format!("((({}*)ts_ptr({}))->{})", cn, obj_name, off);
                     // A receiver that is NOT a struct of class `c` (a Proxy, a
                     // plain object relinked behind the class prototype, a borrowed
@@ -25402,6 +25407,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     "boolean" => "ts_boolean_proto",
                     "function" => "ts_function_proto",
                     "symbol" => "ts_symbol_proto",
+                    "date" => "ts_date_proto",
                     _ => unreachable!("unknown protoobj kind"),
                 };
                 s.push_str(&ctx.set_val(dst.0, &format!("{}()", acc)));
@@ -25503,7 +25509,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     // `this.field = v` through ts_set (see the read above); a
                     // frozen instance throws as strict JS does (the dynamic
                     // paths test the same bit before they store).
-                    let obj_name = ctx.vname(obj.0);
+                    let obj_name = ctx.val(obj.0);   // boxed: a lie can leave a number behind a class type
                     let guard = receiver_guard(&obj_name, &hinted, c);
                     let (cond, slow) = if frozen_tests_on() && !ctx.frozen_elide.contains(&addr) {
                         let frozen = format!("TS_RT_UNLIKELY(ts_store_frozen({}))", obj_name);

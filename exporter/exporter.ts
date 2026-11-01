@@ -808,6 +808,9 @@ type PatternKey = { field: string } | { key: number };
 
 class Exporter {
   checker: ts.TypeChecker;
+  rawChecker: ts.TypeChecker;
+  private distrustCache = new WeakMap<ts.Node, boolean>();
+  private distrustSkip = new Set<ts.Node>();
   // Untyped mode (TSAOT_UNTYPED=1): treat the whole program as `any` — disable
   // ALL type-driven lowering (no unbox/SROA via classify, no generic
   // specialization). Every value stays boxed and goes the fully dynamic runtime
@@ -1090,7 +1093,14 @@ class Exporter {
   unsupportedList: string[] = [];
 
   constructor(private program: ts.Program, private sourceMode: SourceMode = "module") {
-    this.checker = program.getTypeChecker();
+    this.rawChecker = program.getTypeChecker();
+    // Whoever asks the type of a number cast with nothing behind it, used in place, is told `any`: one answer
+    // for the receiver tests, the operators, the kinds of locals. A `+` over one may be a concatenation.
+    const anyType = (this.rawChecker as unknown as { getAnyType(): ts.Type }).getAnyType();
+    const checker = Object.create(this.rawChecker) as ts.TypeChecker;
+    checker.getTypeAtLocation = (n: ts.Node): ts.Type =>
+      this.distrustedExpr(n) && (ts.isBinaryExpression(n) || this.usedInPlace(n as ts.Expression)) ? anyType : this.rawChecker.getTypeAtLocation(n);
+    this.checker = checker;
     this.VALUE = this.internField("__value");
     this.DATE_MS_FIELD = this.internField("__date_ms");
   }
@@ -2052,6 +2062,67 @@ class Exporter {
    *  snapshot that operand into a fresh local (Copy) so its value is fixed at its
    *  evaluation point. (Only aliasing bare-variable reads need this; every other
    *  expression already lands its value in a fresh local at its own instruction.) */
+  private checkedNumber(ctx: FnCtx, v: number): number {
+    ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "cast.number", args: [v] });
+    return v;
+  }
+  /** Is this cast a claim that a value is a number, which the operand's static type does not back? */
+  private unbackedNumberCast(node: ts.AsExpression | ts.TypeAssertion): boolean {
+    const all = (t: ts.Type, flags: ts.TypeFlags): boolean => t.isUnion() ? t.types.every((m) => all(m, flags)) : (t.flags & flags) !== 0;
+    const F = ts.TypeFlags;
+    try {
+      if (ts.isConstTypeReference(node.type)) return false;
+      const target = this.rawChecker.getTypeFromTypeNode(node.type);
+      if ((target.flags & F.Never) !== 0 || !all(target, F.NumberLike)) return false;
+      // `map.get(k) as number`: a number or nothing is what a typed number holds anyway
+      return !all(this.rawChecker.getTypeAtLocation(node.expression), F.NumberLike | F.Never | F.Undefined | F.Null | F.Void);
+    } catch { return false; }
+  }
+  /** An expression whose static type says number with nothing behind it: an unbacked cast, in parentheses,
+   *  or a `+` over one, which may be a concatenation. */
+  distrustedExpr(node: ts.Node): boolean {
+    if (this.untyped) return false;
+    switch (node.kind) {
+      case ts.SyntaxKind.ParenthesizedExpression: return this.distrustedExpr((node as ts.ParenthesizedExpression).expression);
+      case ts.SyntaxKind.AsExpression: case ts.SyntaxKind.TypeAssertionExpression: break;
+      case ts.SyntaxKind.BinaryExpression: {
+        const b = node as ts.BinaryExpression;
+        if (b.operatorToken.kind !== ts.SyntaxKind.PlusToken) return false;
+        break;
+      }
+      default: return false;
+    }
+    let known = this.distrustCache.get(node);
+    if (known === undefined) {
+      known = ts.isBinaryExpression(node)
+        ? this.distrustedExpr(node.left) || this.distrustedExpr(node.right)
+        : this.unbackedNumberCast(node as ts.AsExpression | ts.TypeAssertion);
+      this.distrustCache.set(node, known);
+    }
+    return known;
+  }
+  /** Is the value consumed right here, where a boxed value keeps every meaning it has in JS: the receiver of a
+   *  member, an operand, a test, a template part, an argument for a parameter that is not a number? What is not,
+   *  a variable, a field, a return, flows on into a slot that holds a number unboxed. */
+  private usedInPlace(node: ts.Expression): boolean {
+    let e: ts.Node = node;
+    while (ts.isParenthesizedExpression(e.parent) || ts.isAsExpression(e.parent) || ts.isNonNullExpression(e.parent)) e = e.parent;
+    const p = e.parent;
+    if (ts.isPropertyAccessExpression(p) || ts.isElementAccessExpression(p)) return true;
+    if (ts.isPrefixUnaryExpression(p) || ts.isTypeOfExpression(p) || ts.isVoidExpression(p) || ts.isDeleteExpression(p) || ts.isTemplateSpan(p)) return true;
+    if (ts.isExpressionStatement(p)) return true;
+    if (ts.isBinaryExpression(p)) {
+      const op = p.operatorToken.kind;
+      return op < ts.SyntaxKind.FirstAssignment || op > ts.SyntaxKind.LastAssignment ? true : e === p.left;
+    }
+    if ((ts.isIfStatement(p) || ts.isWhileStatement(p) || ts.isDoStatement(p)) && e === p.expression) return true;
+    if (ts.isConditionalExpression(p) && e === p.condition) return true;
+    if (((ts.isCallExpression(p) || ts.isNewExpression(p)) && e !== p.expression) || (ts.isVariableDeclaration(p) && p.type !== undefined)) {
+      const slot = this.rawChecker.getContextualType(e as ts.Expression);
+      return slot === undefined || (slot.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0;
+    }
+    return false;
+  }
   /** The callee of a `new`: read before the arguments, which may reassign the variable (`new x(x = 1)`). */
   private lowerNewCallee(ctx: FnCtx, node: ts.NewExpression, callee: number): number {
     if (!this.isMutableStorageLocal(ctx, callee) || !(node.arguments ?? []).some((a) => this.mayHaveSideEffect(a))) return callee;
@@ -2402,15 +2473,15 @@ class Exporter {
    *  object is loaded via LoadBuiltinFn {protoobj.<kind>} (the §90 mechanism), which
    *  already returns the proto object itself — the bare form just omits the trailing
    *  LoadMethodValue. */
-  bareBuiltinProtoKind(e: ts.Expression): "object" | "string" | "array" | "map" | "set" | "weakmap" | "weakset" | "headers" | "number" | "boolean" | "function" | "symbol" | "promise" | undefined {
+  bareBuiltinProtoKind(e: ts.Expression): "object" | "string" | "array" | "map" | "set" | "weakmap" | "weakset" | "headers" | "number" | "boolean" | "function" | "symbol" | "promise" | "date" | undefined {
     if (!ts.isPropertyAccessExpression(e) || e.name.text !== "prototype") return undefined;
     const ns = e.expression;
     if (!ts.isIdentifier(ns)) return undefined;
-    const kinds: [string, "object" | "string" | "array" | "map" | "set" | "weakmap" | "weakset" | "headers" | "number" | "boolean" | "function" | "symbol" | "promise"][] =
+    const kinds: [string, "object" | "string" | "array" | "map" | "set" | "weakmap" | "weakset" | "headers" | "number" | "boolean" | "function" | "symbol" | "promise" | "date"][] =
       [["Object", "object"], ["Array", "array"], ["String", "string"], ["Map", "map"],
        ["Set", "set"], ["WeakMap", "weakmap"], ["WeakSet", "weakset"],
        ["Number", "number"], ["Boolean", "boolean"],
-       ["Function", "function"], ["Symbol", "symbol"], ["Promise", "promise"]];
+       ["Function", "function"], ["Symbol", "symbol"], ["Promise", "promise"], ["Date", "date"]];
     for (const [name, kind] of kinds) {
       if (this.isBuiltinNamespaceRef(ns, name)) return kind;
     }
@@ -5238,10 +5309,20 @@ class Exporter {
       return this.lowerOptionalChain(ctx, node);
     }
     if (ts.isParenthesizedExpression(node)) return this.lowerExpr(ctx, node.expression, hint);
-    if (ts.isAsExpression(node) || ts.isNonNullExpression(node)) return this.lowerExpr(ctx, node.expression, hint);
-    // Type-only wrappers that erase to their operand: `<T>x` (angle-bracket
-    // assertion) and `x satisfies T`. Same erasure as `x as T`.
-    if (ts.isTypeAssertionExpression(node)) return this.lowerExpr(ctx, node.expression, hint);
+    if (ts.isNonNullExpression(node)) return this.lowerExpr(ctx, node.expression, hint);
+    // `x as T` and `<T>x` erase to their operand. A cast to `number` of what is not known to be one is no
+    // promise that can be kept in an unboxed slot (docs/cast_to_number_design.md): used in place the value
+    // is `any` to everything that asks (distrustedExpr), what flows on into a number-typed slot is tested.
+    if (ts.isAsExpression(node) || ts.isTypeAssertionExpression(node)) {
+      const v = this.lowerExpr(ctx, node.expression, hint);
+      return this.distrustedExpr(node) && !this.usedInPlace(node) ? this.checkedNumber(ctx, v) : v;
+    }
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.PlusToken && !this.distrustSkip.has(node) && this.distrustedExpr(node) && !this.usedInPlace(node)) {
+      this.distrustSkip.add(node);
+      const v = this.lowerExpr(ctx, node, hint);
+      this.distrustSkip.delete(node);
+      return this.checkedNumber(ctx, v);
+    }
     if ((ts as any).isSatisfiesExpression?.(node)) return this.lowerExpr(ctx, (node as any).expression, hint);
     if (ts.isJsxElement(node) || ts.isJsxSelfClosingElement(node)) return this.lowerJsxElement(ctx, node);
     if (ts.isJsxFragment(node)) return this.lowerJsxFragment(ctx, node);
@@ -6883,7 +6964,7 @@ class Exporter {
               ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "date.toLocaleTimeString", args: [ms, ...args] });
               return dst;
             }
-            this.unsupported(node, `Date method '${fn.name.text}' (not implemented)`);
+            // anything else is a call of the prototype's method, by the dynamic path
           }
           // (asyncgen).next() -> ts_asyncgen_next, returns a Promise<{value,done}>.
           if (fn.name.text === "next" && this.isAsyncGeneratorType(fn.expression)) {
@@ -7388,16 +7469,10 @@ class Exporter {
       // no class_id.)
       if (rclass === undefined && ts.isIdentifier(node.right) &&
           this.isBuiltinSymbol(this.checker.getSymbolAtLocation(node.right))) {
-        if (node.right.text === "Date") {
-          // A Date is a plain object carrying the internal `__date_ms` field (the
-          // `new Date` lowering): the field's presence is the instanceof answer.
-          const obj = this.lowerExpr(ctx, node.left);
-          ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: `date.isInstance:${this.DATE_MS_FIELD}`, args: [obj] });
-          return dst;
-        }
         const ek = this.errorKindIndex(node.right.text);
         const builtinProtoKinds: Record<string, string> = {
           Object: "object",
+          Date: "date",
           RegExp: "regexp",
           Map: "map",
           Set: "set",
@@ -10579,16 +10654,8 @@ class Exporter {
         // current time.
         ctx.body.push({ kind: "CallBuiltinStatic", dst: ms, builtin: "date.now", args: [] });
       } else if (args.length === 1) {
-        // new Date(epochMs): numeric only. String/Date arguments need date
-        // parsing, which is not implemented (loud-reject rather than NaN).
-        let isNumeric = false;
-        try {
-          const t = this.checker.getTypeAtLocation(args[0]);
-          isNumeric = (t.flags & (ts.TypeFlags.Number | ts.TypeFlags.NumberLiteral)) !== 0;
-        } catch { /* leave isNumeric false */ }
         const v = this.lowerExpr(ctx, args[0]);
-        if (isNumeric) ctx.body.push({ kind: "Copy", dst: ms, src: v });
-        else ctx.body.push({ kind: "CallBuiltinStatic", dst: ms, builtin: "date.value_ms", args: [v] });   // a Date's time, a string parsed, else ToNumber
+        ctx.body.push({ kind: "CallBuiltinStatic", dst: ms, builtin: "date.value_ms", args: [v] });   // a Date's time, a string parsed, else a clipped number
       } else {
         // new Date(year, month, day=1, hours=0, minutes=0, seconds=0, ms=0) — local time.
         const a = args.map((x) => this.lowerExpr(ctx, x));
@@ -10600,6 +10667,7 @@ class Exporter {
         ctx.body.push({ kind: "CallBuiltinStatic", dst: ms, builtin: "date.fromComponents", args: comp });
       }
       ctx.body.push({ kind: "StoreField", obj: dst, field: this.DATE_MS_FIELD, src: ms });
+      ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "date.link", args: [dst] });
       return dst;
     }
     // new Error(msg) / new TypeError(msg) / ... -> a plain object whose
@@ -11546,7 +11614,7 @@ class Exporter {
     if (ns === "Date") {
       if (member === "now") return "date.now";
       if (member === "parse") return argc === 1 ? "date.parse" : "__UNSUPPORTED__";
-      if (member === "UTC") return argc >= 1 && argc <= 7 ? `date.utc:${argc}` : "__UNSUPPORTED__";
+      if (member === "UTC") return argc <= 7 ? `date.utc:${argc}` : "__UNSUPPORTED__";
       return "__UNSUPPORTED__";
     }
     if (ns === "Object") {
@@ -11946,6 +12014,7 @@ class Exporter {
     if (ns === "Symbol" && (member === "for" || member === "keyFor")) return `symbol.${member}`;
     if (ns === "Date" && member === "now") return "date.now";
     if (ns === "Date" && member === "parse") return "date.parse";
+    if (ns === "Date" && member === "UTC") return "date.UTC";
     if (ns === "console") {
       if (member === "log" || member === "info" || member === "debug") return "console.log";
       // `trace` as a value (hono's `onError = console.trace` default): the error writer; the stack lines are not modelled
@@ -12362,8 +12431,16 @@ class Exporter {
     };
     if (guarded) {
       const thrown = this.newLocal(ctx, "reference");
-      const tryBody = this.captureBody(ctx, bindAll);
+      // A generator's `return()` at a `yield` inside the pattern leaves by neither way below: it reaches the
+      // finally with the pattern unfinished, and its close is an ordinary IteratorClose.
+      const finished = ctx.isGenerator ? this.newLocal(ctx, "primitive") : undefined;
+      if (finished !== undefined) ctx.body.push({ kind: "Copy", dst: finished, src: falseC });
+      const tryBody = this.captureBody(ctx, () => {
+        bindAll();
+        if (finished !== undefined) ctx.body.push({ kind: "Copy", dst: finished, src: trueC });
+      });
       const catchBody = this.captureBody(ctx, () => {
+        if (finished !== undefined) ctx.body.push({ kind: "Copy", dst: finished, src: trueC });
         const open = notDone();
         const thenBody = this.captureBody(ctx, () => {
           const dropped = this.newLocal(ctx, "reference");
@@ -12373,7 +12450,17 @@ class Exporter {
         ctx.body.push({ kind: "If", cond: open, thenBody, elseBody: [] });
         ctx.body.push({ kind: "Throw", src: thrown });
       });
-      ctx.body.push({ kind: "TryCatch", tryBody, catchVar: thrown, catchBody, finallyBody: [] });
+      const finallyBody = finished === undefined ? [] : this.captureBody(ctx, () => {
+        const unfinished = this.newLocal(ctx, "primitive");
+        ctx.body.push({ kind: "UnOp", dst: unfinished, op: "!", operand: finished });
+        const thenBody = this.captureBody(ctx, () => {
+          const open = notDone();
+          const closeBody = this.captureBody(ctx, () => { drv.returnCall!(); });
+          ctx.body.push({ kind: "If", cond: open, thenBody: closeBody, elseBody: [] });
+        });
+        ctx.body.push({ kind: "If", cond: unfinished, thenBody, elseBody: [] });
+      });
+      ctx.body.push({ kind: "TryCatch", tryBody, catchVar: thrown, catchBody, finallyBody });
     } else {
       bindAll();
     }

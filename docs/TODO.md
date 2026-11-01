@@ -12719,14 +12719,21 @@ Where it stopped (branch `s363-dc`, worktree `build/wt_dc`, on top of `s362-wip`
   `Object.prototype.toString` as a value ran an array's join, and functions had no tag.
 - `docs/generator_functions_design.md`: a generator function's `prototype` and the objects generator and async functions
   inherit from. Typed arrays, ArrayBuffer and SharedArrayBuffer construct as values and as bases.
+- `docs/date_design.md`: a real `Date.prototype`; every setter and string form was missing (`d.setDate(1)` was a compile-time
+  reject). `docs/cast_to_number_design.md`: a cast to number with nothing behind it is `any` where it is used in place
+  and tested where it flows into a number slot (Kaz: lies should be loud, and `(x as unknown as number).toString()` is
+  as legal as hono's `(str as unknown as string).toString()`). Frozen arrays' mutators throw; built-in methods have
+  their `name` and `length`; an array-like behind an array type takes the dynamic path; a sample of 500 cases of
+  `built-ins` and `language/statements` passed 280 before this: 39 rejects are resizable buffers in the harness,
+  29 BigInt, and Iterator helpers, Set methods and `using` are absent.
+- Open, next: `JSON.parse(s) as Config` trusts `Config`'s number fields: `c.port + 1` over `"8080"` gives 8081,
+  `c.port === undefined` is false for a missing field (silent). Plan: enumerate the casts from any or unknown, whole
+  program; the object types they reach are distrusted, their fields follow the rule of a cast to number.
 - `language/expressions` was last measured in full at 9,260 of 11,152, before dynamic classes, `yield*` and ToPrimitive;
   a rerun of the failures on an earlier state of this branch passed 1,920 of 2,803. Measure again before quoting a
   number. `scripts/test262/gen.mjs` now records the cases that build code from strings, `summary.py` counts them
   `no-eval`.
 - Still open in `language/expressions`: frozen array descriptors, `Symbol.prototype` and wrappers, String as a dynamic
   base, a second `super()` (a typed class's, and through an arrow), `super` in a static method after
-  `Object.setPrototypeOf(C, null)` (the class value and the static container are two objects), IteratorClose on a
-  generator's return in assignment patterns, TDZ through closures, `Date()` as a string and `Date.prototype`
-  (`"getTime" in date` is false, silent), `Promise.prototype` as a value, a leftover unhandled rejection after `yield*`
-  over a `then` getter that throws, private names per evaluation.
+  `Object.setPrototypeOf(C, null)` (the class value and the static container are two objects), TDZ through closures, private names per evaluation.
 - Then the rest of test262 (statements, built-ins, annexB), BigInt, dynamic import, the elements kinds above.

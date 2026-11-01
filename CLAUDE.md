@@ -118,7 +118,10 @@ Rust in §315; selfhost is kept as a performance metric).
   representation for a missing number (Session 350 x32 note).
 - An `any` value that holds a non-number, assigned to a `number`-typed local, is unboxed in
   typed mode (V8 keeps the value; garnet reads NaN): typed mode trusts the annotation (Session 350
-  x53 note).
+  x53 note). A `number` property of an object type reached by a cast from `any` is trusted as well
+  (`(JSON.parse(s) as Config).port` over a string or a missing key, next on the list). An explicit
+  `x as number` with nothing behind it is `any` used in place and a TypeError flowing into a number
+  slot (`docs/cast_to_number_design.md`).
 - A property read through an index signature (`d.zz` with `d: Record<string, number>`, the key absent)
   is typed `number` by the annotation and read unboxed in typed mode: garnet reads NaN and `typeof`
   says "number" where V8 gives undefined. The keyed form (`d[k]`, `d["zz"]`) keeps the value
