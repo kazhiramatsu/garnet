@@ -65,3 +65,10 @@ console.log(new U(1).equals(new U(1)), new U(1).equals({}), new U(1).equals(new 
 console.log(JSON.stringify(new U(1)), Object.keys(new U(1)), new U(1));
 const fz = Object.freeze(new U(1)); console.log(fz.equals(new U(1)));
 class Str { "#a" = 1; } console.log(Object.keys(new Str()), new Str()["#a"]);
+
+// a private method whose locals are captured: the scope record is named after it
+class ScopedPrivate {
+  #m() { let a = 1; let b = 2; const f = () => a + b; const g = () => { a += 1; b += 1; }; g(); return f(); }
+  run() { return this.#m(); }
+}
+console.log(new ScopedPrivate().run());

@@ -93,6 +93,10 @@ Rust in §315; selfhost is kept as a performance metric).
   does not contain its parent's, so clang's TBAA takes `((Sub*)p)->f3` and `((Base*)p)->f3` for two
   objects and a load passes a store (silent, default and strict). Every access to a class field, new
   emission included, goes through the declaring class's struct.
+- **A cache keyed by a class word assumes one prototype chain per word.** A class in a function has a
+  prototype per evaluation: an instance of a later evaluation carries `TS_CLS_RELINKED`
+  (`ts_instance_of_evaluation`) and takes the full lookup, or a site's cache answers the first evaluation's
+  method (silent, Session 363).
 - **`ts_to_num` is a raw bit reinterpretation (not ToNumber).** `undefined`→NaN matches JS, but
   `null`→NaN does not.
 - **Gate a new feature behind a single predictable branch** (e.g. `if (g_has_proxies && ...)`) = zero
@@ -105,7 +109,8 @@ Rust in §315; selfhost is kept as a performance metric).
 - Precision of int-specialized `+`/`-` loop variables in the rare case they straddle [2^53, 2^63]
   (V8 uses double rounding).
 - bigint (the whole numeric-type story; fundamentally unsupported), and Array.prototype monkey-patch
-  (outside the model).
+  (outside the model; replacing or deleting `Array.prototype[Symbol.iterator]` is honored: a program that
+  names it walks every array through the protocol, Session 363).
 - A monomorphized numeric class field (`x: number`, unboxed double) reads as 0 before its first
   assignment (V8: undefined). Boxed fields and typed cells are initialized to undefined (Session 350).
 - Likewise a `number`-typed parameter that receives no argument (a call or `new` through an `any`
@@ -130,16 +135,17 @@ Rust in §315; selfhost is kept as a performance metric).
 - The `arguments` object as a value is an Array of the actual arguments (`apply(this, arguments)`,
   `arguments[i]`, `Array.from(arguments)` and `arguments.length` agree with V8; strict code never
   maps it). `Array.isArray(arguments)` is true and it has the Array methods, where V8's Arguments
-  object has `Object.prototype` (Session 354 vue note). Not available in arrow functions or
-  coroutines (a compile-time reject).
+  object has `Object.prototype` (Session 354 vue note).
 - An ordinary (non-const) enum's member with a constant value is read as that constant at every
   `E.A` / `E["A"]` site (Session 355), as TypeScript inlines const enum members: a write to the enum
   object through `any` (`(E as any).A = 5`) is not seen by those reads, and a read before the enum's
   module has evaluated (an import cycle) gives the constant where V8 throws. The enum object itself
   is intact for `Object.keys(E)`, `E[0]` and a variable key. `TSAOT_ENUM_FOLD=0` keeps the loads.
-- A class's private field (`#x`) is hidden from enumeration and reflection (Session 358), but
-  `o.hasOwnProperty("#x")` and `"#x" in o` still see it, and `(o as any)["#x"]` reads it (V8: a
-  private name is not a property).
+- A private name (`docs/private_names_design.md`) is one per class declaration, not per evaluation: an
+  instance of one evaluation of a class in a function passes the checks of another. An element read
+  before its initializer ran answers undefined (V8: a TypeError), a frozen object's private field cannot
+  be written, a second initialization of a name on one object (through a base's return override) is not
+  detected.
 - `Request.signal` is the init's signal itself (Node: a fresh signal following it), and
   `ArrayBuffer.isView` does not recognize the library's `DataView` (docs/web_fetch_api_design.md).
 - Web Crypto (`docs/web_crypto_design.md`) provides digests and HMAC keys only: an RSA, ECDSA or AES key
@@ -147,9 +153,7 @@ Rust in §315; selfhost is kept as a performance metric).
 - WHATWG streams (`docs/web_streams_design.md`) are default streams only: `new ReadableStream({ type:
   "bytes" })` and BYOB readers are a TypeError (Node has them). `new CompressionStream("brotli")` is a
   TypeError (no brotli codec; gzip, deflate and deflate-raw run over the system's zlib loaded on first
-  use, docs/web_compression_design.md). A class extending a library class the
-  prelude installs for a Web global (`class X extends Blob`, `extends Request`) is a compile-time
-  reject, as extending any built-in but the Error classes is.
+  use, docs/web_compression_design.md).
 - JSX (Session 358, `docs/jsx_react_ssr_design.md` section 8): under the automatic runtime a `key`
   attribute after a spread attribute (`<A {...p} key="k">`) is a compile-time reject (TypeScript
   calls the import source's `createElement` there); `react-jsxdev` builds the production runtime
@@ -172,11 +176,15 @@ Rust in §315; selfhost is kept as a performance metric).
   computed at run time and `O` obtained through `.constructor` is a TypeError at the freeze (V8 freezes,
   Session 362).
 - A symbol through an `any` receiver: `.description` reads undefined and `.toString()` is a TypeError
-  (the typed forms work; there is no `Symbol.prototype` object). `yield*` over an `any` is a compile-time
-  reject (V8 runs it). `#method in o` for a private method answers false (a private field's brand works).
-  A method or accessor of a class in a function that captures the function's locals, and a static
-  initializer that does, are compile-time rejects: such a class is one class for all its evaluations
-  (constructors and field initializers capture).
+  (the typed forms work; there is no `Symbol.prototype` object).
+- A class extending an expression, a built-in other than the Error kinds or a value, and a class whose
+  methods or static initializers capture a function's locals, is a value made at run time
+  (`docs/dynamic_classes_design.md`): nothing types its instances, they are read by key. `extends String`
+  and `extends Date` construct, but a `String` base has no wrapper behind it (a TypeError at the definition)
+  and a `Date` has no methods on `Date.prototype` to find by key (a TypeError at the call); `super()` inside
+  an arrow function is a compile-time reject there. A promise subclass's `then` gives a plain promise.
+- A `let` or `const` read through a closure before its declaration ran reads undefined (V8: a
+  ReferenceError); a read or a write in the same function, a parameter default among them, throws.
 - `o.__proto__` and `o["__proto__"]` read undefined (V8: the prototype through the accessor);
   `Object.getPrototypeOf` / `setPrototypeOf` are the modelled forms (Session 355 note).
 - A typed receiver that is a Proxy (vue's reactive arrays and collections) takes its methods through

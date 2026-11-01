@@ -2,7 +2,8 @@
 // Compose test262 cases into conformance programs: harness + includes + test, one .ts each, under
 // <out>/<path>.ts, for scripts/run_conformance.sh's `dir` tier (TSAOT_CONF_DIR). Every case is written,
 // whatever it needs: what garnet cannot do shows in the results. <out>/META.tsv records each case's
-// flags, its negative expectation and its features for scripts/test262/summary.py.
+// flags, its negative expectation, its features and whether it needs an engine at run time, for
+// scripts/test262/summary.py.
 //   node scripts/test262/gen.mjs <test262 checkout> <out dir> <subpath under test/>...
 import fs from "node:fs";
 import path from "node:path";
@@ -26,6 +27,8 @@ function listField(meta, name) {
 const dstOf = (rel) => path.join(out, rel.replace(/\.js$/, ".ts").replace(/[^A-Za-z0-9_\/.-]/g, "_"));
 const slugOf = (rel) => rel.replace(/\.js$/, "").replace(/[^A-Za-z0-9_\/.-]/g, "_").replaceAll("/", "__");
 const meta = [];
+// The case builds code from a string at run time, which a compiled program has no engine for.
+const usesRuntimeCode = (body) => /\beval\s*\(|\bnew\s+\w*Function\s*\(|(^|[^.\w])(\w*Function)\s*\(\s*['"`]/m.test(body);
 function compose(file, rel) {
   const text = fs.readFileSync(file, "utf8");
   const dst = dstOf(rel);
@@ -54,7 +57,7 @@ function compose(file, rel) {
   }
   parts.push(text);
   fs.writeFileSync(dst, parts.join("\n"));
-  meta.push([slugOf(rel), flags.join(","), phase, type, listField(front, "features").join(",")].join("\t"));
+  meta.push([slugOf(rel), flags.join(","), phase, type, listField(front, "features").join(","), usesRuntimeCode(text.replace(m?.[0] ?? "", "")) ? "eval" : ""].join("\t"));
 }
 const walk = (dir, rel) => {
   for (const e of fs.readdirSync(dir, { withFileTypes: true })) {

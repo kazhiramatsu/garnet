@@ -69,7 +69,7 @@ for log in sorted(glob.glob(os.path.join(out, "*.log"))):
         if n and n[2]:
             note(slug, "pass" if n[3] and n[3] in aot else "wrong", "" if n[3] and n[3] in aot else "negative: " + re.sub(r"\d+", "N", aot)[:60]); continue
         short = re.sub(r"\d+", "N", aot.replace("tsaot: Uncaught exception: ", ""))[:70]
-        if "eval is not defined" in aot or "Code generation from strings" in aot:
+        if "eval is not defined" in aot or "Code generation from strings" in aot or (n and len(n) > 5 and n[5] == "eval"):
             note(slug, "no-eval"); continue
         sig = re.search(r"\[signal (\d+)\]", aot)
         if sig: note(slug, "timeout" if sig.group(1) == "14" else "crash", "signal " + sig.group(1) + ": " + short)

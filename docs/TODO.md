@@ -12637,3 +12637,82 @@ Next session, in order:
 - Alternating on a quiet machine, outputs identical (r28 -> r29; Node): vue 872.6 -> 878.8 ms, hono_app 124.8 ->
   123.6 (154), TrieRouter 211.4 -> 215.1, RegExpRouter 55.1 -> 54.2, PatternRouter 238.8 -> 235.6, SmartRouter 56.3
   -> 55.5; tsc-ts 21.976 -> 22.060 G instructions (+0.38%), cycles 0.9991, wall 1.16 s.
+
+## Session 363 (2026-11-01): test262, `language/expressions` from 6,451 to more than 9,000 of 11,152
+
+- The harness first. `--batch` had no diagnostics step, so a negative case compiled, ran and counted as accepted
+  (1,282 of the "wrong" of the first run); under `TSAOT_UNTYPED` the batch now refuses what the single-file path
+  refuses. The oracle transpiled test262 at ES2020 (`TSAOT_CONF_ORACLE_ESNEXT`, a fixture's `// @oracle esnext`). A
+  refused program is run under V8 too, so "both refuse" (a script-only case in our strict module) is `v8-also`;
+  `no-eval` counts what needs code from strings. `scripts/test262/run.sh`, `summary.py`.
+- **Every file is a module to the checker** (`moduleDetection: force`): always strict, its top-level names its own.
+  `const name = ...` needs no import to compile, TS's strict-mode early errors apply.
+- **Early errors TypeScript lets through** (`exporter/early_errors.ts`): `eval`/`arguments` as targets, `arguments`
+  in a field initializer or a static block, `await` as an identifier in a module, duplicate and undeclared private
+  names, `super.#x`, a static member `prototype`, `await`/`yield` in an arrow's parameters. All 2,040 parse and early
+  negative cases of `language/expressions` are refused; the last one is a script-goal case.
+- **Name inference in one place** (`namedEvaluationName`, `lowerNamedByKey`): every site of NamedEvaluation, read off
+  the AST; computed keys at run time, a class with a container through its `name` definition.
+- **Object assignment patterns in all forms** (`lowerAssignObjectPattern`): string, numeric and computed keys, member
+  targets in order, defaults, `...rest`. **Rest with a computed key** left the key in (silent); rest over an array, a
+  string or a function gave `{}` (silent).
+- **A generator's parameters bind at the call** (`__initial_suspend`): defaults ran at the first `next()`, a pattern's
+  throw came there too. **An unannotated `function f([a])`** took the implied tuple for an array and read by index,
+  no iterator, no throw (silent; `patternTypeIsImplied`).
+- **Parameter TDZ**, `let [a = a]`, reads and writes in the TDZ are run-time ReferenceErrors, as is a write to an
+  undeclared name; writes to a `const` or to a class's name inside it are TypeErrors. A closure in a default reading
+  a later parameter read a value captured too early (silent).
+- **Real private names** (`docs/private_names_design.md`). `class A { #x } class B extends A { #x }` shared one slot
+  (silent), a missing element answered undefined, strings reached them. Class-scoped spelling in the AST, a brand
+  for methods and accessors, own-only checks, direct calls.
+- **Targets are evaluated once**: `f().x++`, `a[i++]--`, `f().x ||= 1`, `f().acc += 1` evaluated `f()` twice (silent);
+  `g().acc = h()` called `h` first.
+- **A prototype per evaluation** was not in the caches: the method cache keyed by the class word answered the first
+  evaluation's method for the second's instance (silent, `TS_HDR_LATER_EVAL`).
+- `x instanceof Function` and `Object` were false for every function (silent). `new` of any value is a run-time
+  construct; `instanceof` of any value too. `super[k]` in classes. `Object.defineProperty` with `set: undefined`.
+  `Function.prototype.caller` / `arguments` throw. Errors the runtime threw as strings are TypeErrors. An object
+  literal's computed accessors capture. `Array.prototype[Symbol.iterator]` replaced or deleted is honored.
+- **Dynamic classes** (`docs/dynamic_classes_design.md`): `extends <expression>`, `extends null`, `extends Map` and the
+  other built-ins, methods and static initializers capturing a function's locals. They were compile-time rejects; such
+  a class is now a value made at run time, each evaluation its own class. Built-in constructors work as values
+  (`new V()`, `Reflect.construct(Map, [])`, `RegExp`).
+- **`yield*` as the specification writes it** (`lowerYieldDelegate`): the received completion goes to `next`, `throw` or
+  `return` with the value, the inner result object is handed on, an async generator awaits and does not re-await.
+- **ToPrimitive** throws when both methods answer objects (it answered NaN or recursed), Symbols do not convert to
+  numbers. **`new f(a)` of a function that never reads `this`** shifted its arguments by the instance (silent). A plain
+  function's prototype object was not linked to Object.prototype (`f.prototype.toString` undefined, silent).
+
+Ideas from Kaz, for a slice after test262: **array elements kinds**. `number[]` costs 2x and 11x the instructions of
+`Float64Array` on a sum and fill (0.41 s against 0.19 s; V8 0.74 s): the values are already raw doubles, the cost is the
+tag, bound and hole tests per element and the vectorization they prevent. Keep `ts_array`, add a kind byte (all numbers
+and no holes, `kind_spare`): a store of anything else clears it in O(1), no conversion, since the elements are the same
+eight bytes. Loops version on it as the typed-array loops do. Strings gain less (4-15% on the element read alone, the
+rest is in the string operations, where typed comparisons would help); a kind for "instances of one class" could drop
+the guard on `arr[i].x` (not measured). With **generics** this goes further than a JIT can: `T[]` cloned per type
+argument (`Vec<T>` is not specialized today, its `get` returns a boxed value), and a whole-program proof that an array
+only ever receives numbers removes the run-time test altogether. Order: the flag and the loops, the generic clones, the
+proof. Needs a checking mode that verifies the flag against the elements, in the gates, as the GC stress is.
+
+Where it stopped (branch `s363-dc`, worktree `build/wt_dc`, on top of `s362-wip` 324dc2d; neither is on main):
+
+- Not gated. `s362-wip` at 324dc2d passed conformance (739, 739, 736), bundler and the regexp differentials, but it
+  does not build hono: a scope record named after a private method (`__ctx_#m\x011`) reached `CLASS_NAME` through
+  Rust's `{:?}`, which C refuses. Fixed on `s363-dc` (`c_string_lit`, a case in `classes/private_names`). The survey and
+  the hono, vue and tsc A/B of that run mean nothing; the bench's only failure, `string_unicode_search_kernel` at 102
+  ms against 100, was under concurrent load and has to be re-timed quietly.
+- To land: the full gates on `s363-dc`, the A/B against the r29 builds (`build/gates_s363a/run.sh` is the runner),
+  `gate.sh ir-parity snap`, the final numbers here, merge to main, push.
+- `tests/rejects_async.sh` now holds what is still refused (`super()` in an arrow of a dynamic class): a computed
+  method in a literal and `yield*` over a number compile and agree with V8.
+- `language/expressions` was last measured in full at 9,260 of 11,152, before dynamic classes, `yield*` and ToPrimitive;
+  a rerun of the failures on an earlier state of this branch passed 1,920 of 2,803. Measure again before quoting a
+  number. `scripts/test262/gen.mjs` now records the cases that build code from strings, `summary.py` counts them
+  `no-eval`.
+- Still open in `language/expressions`: frozen array descriptors, `Symbol.prototype` and wrappers, a generator
+  function's `.prototype` and `%GeneratorFunction.prototype%` (plan: one prototype per code in a static slot the entry
+  links, `Object.getPrototypeOf(g)` set when the function is boxed, no cost on a step), typed arrays, ArrayBuffer and
+  String as dynamic bases, `super.x` over ES5 parents, a static double `super()`, a Proxy's ownKeys order in spread and
+  rest, IteratorClose on a generator's return in assignment patterns, TDZ through closures, `Date()` as a string and
+  `Date.prototype` (`"getTime" in date` is false, silent), `yield*` with an abrupt `next` getter.
+- Then the rest of test262 (statements, built-ins, annexB), BigInt, dynamic import, the elements kinds above.

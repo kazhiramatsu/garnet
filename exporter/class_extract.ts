@@ -59,25 +59,66 @@ function isQualifiedName(e: ts.Expression): boolean {
 export type MKind = "method" | "getter" | "setter";
 
 export interface MethodInfo { name: string; kind: MKind; isGenerator?: boolean; }
-/** A class with no members over a base that is a runtime value (`class D extends Parent {}` with
- *  `Parent` a binding, a call or a member expression): it is not laid out as a class; the exporter
- *  lowers it to a derived constructor over the value (`ts_class_extend_dyn`). A base naming a class
- *  declaration or a library class (Error) stays a class. Returns the base expression when it applies. */
-export function dynamicBaseEmptyClass(decl: ts.ClassLikeDeclaration, checker: ts.TypeChecker): ts.Expression | undefined {
-  if (decl.members.length !== 0) return undefined;
+/** A class that is a value made at run time (docs/dynamic_classes_design.md): what the structs and the vtables
+ *  cannot hold. Not registered with the extractor: its instances are read and written by key. */
+export const dynamicClasses = new WeakSet<ts.Node>();
+const dynamicVerdicts = new WeakMap<ts.Node, boolean>();
+const ERROR_BASES = new Set(["Error", "TypeError", "RangeError", "SyntaxError", "ReferenceError", "EvalError", "URIError", "AggregateError"]);
+
+export function isDynamicClass(decl: ts.ClassLikeDeclaration, checker: ts.TypeChecker): boolean {
+  const known = dynamicVerdicts.get(decl);
+  if (known !== undefined) return known;
+  dynamicVerdicts.set(decl, false);   // a cycle of `extends` is reported elsewhere
+  const ambient = (ts.getCombinedModifierFlags(decl) & ts.ModifierFlags.Ambient) !== 0;
+  const verdict = !ambient && (heritageIsDynamic(decl, checker) || capturesEnclosingLocal(decl, checker));
+  dynamicVerdicts.set(decl, verdict);
+  if (verdict) dynamicClasses.add(decl);
+  return verdict;
+}
+function heritageIsDynamic(decl: ts.ClassLikeDeclaration, checker: ts.TypeChecker): boolean {
   const ext = decl.heritageClauses?.find((h) => h.token === ts.SyntaxKind.ExtendsKeyword);
-  if (!ext || ext.types.length !== 1) return undefined;
+  if (!ext || ext.types.length !== 1) return false;
   const expr = ext.types[0].expression;
-  if (ts.isIdentifier(expr) || (ts.isPropertyAccessExpression(expr) && isQualifiedName(expr))) {
-    let sym = checker.getSymbolAtLocation(ts.isIdentifier(expr) ? expr : expr.name);
-    if (sym && (sym.flags & ts.SymbolFlags.Alias)) sym = checker.getAliasedSymbol(sym);
-    const decls = sym?.getDeclarations() ?? [];
-    if (decls.length === 0) return undefined;   // unresolved: the class path reports it
-    if (decls.some((d) => ts.isClassDeclaration(d) || ts.isClassExpression(d))) return undefined;   // a class
-    if (decls.every((d) => d.getSourceFile().isDeclarationFile)) return undefined;   // a library class
-    return expr;   // a binding that holds a constructor value
+  if (!ts.isIdentifier(expr) && !(ts.isPropertyAccessExpression(expr) && isQualifiedName(expr))) return true;
+  let sym = checker.getSymbolAtLocation(ts.isIdentifier(expr) ? expr : expr.name);
+  if (sym && (sym.flags & ts.SymbolFlags.Alias)) sym = checker.getAliasedSymbol(sym);
+  const decls = sym?.getDeclarations() ?? [];
+  if (decls.length === 0) return true;   // nothing declares it: a ReferenceError at the definition
+  const cls = decls.find((d) => (ts.isClassDeclaration(d) || ts.isClassExpression(d)) && !d.getSourceFile().isDeclarationFile);
+  if (cls) return isDynamicClass(cls as ts.ClassLikeDeclaration, checker);
+  // the environment's: the Error family has its own layout, any other is a built-in to construct
+  if (decls.every((d) => d.getSourceFile().isDeclarationFile)) return !(ts.isIdentifier(expr) && ERROR_BASES.has(expr.text));
+  return true;   // a binding that holds a constructor
+}
+/** A method, an accessor or a static initializer that reads a local of the function around the class: the
+ *  function is one, the evaluations are many. (A constructor and an instance field get their cells threaded.) */
+function capturesEnclosingLocal(decl: ts.ClassLikeDeclaration, checker: ts.TypeChecker): boolean {
+  let outer: ts.Node | undefined = decl.parent;
+  while (outer && !ts.isSourceFile(outer) && !ts.isFunctionLike(outer)) outer = outer.parent;
+  if (!outer || ts.isSourceFile(outer)) return false;
+  const within = (n: ts.Node, top: ts.Node): boolean => {
+    for (let p: ts.Node | undefined = n; p; p = p.parent) if (p === top) return true;
+    return false;
+  };
+  let found = false;
+  const visit = (n: ts.Node): void => {
+    if (found || ts.isTypeNode(n)) return;
+    if (ts.isIdentifier(n) && !(ts.isPropertyAccessExpression(n.parent) && n.parent.name === n)) {
+      let s: ts.Symbol | undefined;
+      try { s = checker.getSymbolAtLocation(n); } catch { s = undefined; }
+      const d = s?.valueDeclaration ?? s?.declarations?.[0];
+      if (d && within(d, outer!) && !within(d, decl)) { found = true; return; }
+    }
+    ts.forEachChild(n, visit);
+  };
+  for (const m of decl.members) {
+    if (ts.isMethodDeclaration(m) || ts.isGetAccessorDeclaration(m) || ts.isSetAccessorDeclaration(m)) {
+      if (m.body) { visit(m.body); m.parameters.forEach(visit); }
+    } else if (ts.isClassStaticBlockDeclaration(m)) visit(m.body);
+    else if (ts.isPropertyDeclaration(m) && m.initializer && (ts.getCombinedModifierFlags(m) & ts.ModifierFlags.Static)) visit(m.initializer);
+    if (found) return true;
   }
-  return expr;   // a call, an element access, a conditional: a mixin or a runtime value
+  return false;
 }
 
 export interface ClassInfo {
@@ -190,7 +231,7 @@ export class ClassExtractor {
 
   // ----- pass 1: declare classes, own members -----
   private declareClass(decl: ts.ClassLikeDeclaration) {
-    if (dynamicBaseEmptyClass(decl, this.checker)) return;   // a derived constructor over a runtime value, not a class
+    if (isDynamicClass(decl, this.checker)) return;   // a value made at run time, not a class of the program's
     const name = decl.name?.text ?? `anonClass${this.classes.length}`;
     const id = this.classes.length;
     const info: ClassInfo = {

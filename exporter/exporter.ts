@@ -19,9 +19,9 @@
 import * as ts from "typescript";
 import * as fs from "fs";
 import * as path from "path";
-import { ClassExtractor, ClassInfo, ClosedReceivers, memberKeyName, dynamicBaseEmptyClass } from "./class_extract";
+import { ClassExtractor, ClassInfo, ClosedReceivers, memberKeyName, isDynamicClass, dynamicClasses } from "./class_extract";
 import { jsEarlyErrors } from "./early_errors";
-import { uniquePrivateNames, privateDisplayName, privateBrand } from "./private_names";
+import { uniquePrivateNames, privateDisplayName, privateBrand, PRIVATE_MARK } from "./private_names";
 import { JSX_ENTITIES } from "./jsx_entities";
 /** A regexp literal's text split into its source and flags (`/src/flags`). */
 function splitRegExpLiteral(raw: string): { source: string; flags: string } | undefined {
@@ -660,6 +660,8 @@ type ClassValueEmit = { local: number; classValue: boolean };
 type IterDriver = {
   itLocal: number; srcLocal: number; isAsync: boolean;
   step: (sentLocal: number) => number; throwStep?: (excLocal: number) => number; returnCall?: () => void;
+  /** The `next` read once from the iterator, where the driver holds it. */
+  nextMethod?: number;
   /** Instead of `step`: the next element, or the done marker (`forof.next`, a value's driver);
    *  `skip`, for an elision, leaves the element unread. */
   elemStep?: (skip: boolean) => number;
@@ -728,6 +730,10 @@ interface FnCtx {
   captureCount?: number;    // leading cell params (the closure environment)
   isAsync?: boolean;
   isGenerator?: boolean;
+  /** A dynamic class's constructor: the class, the active function, whether `this` waits for super(). */
+  dynCtor?: { classNode: ts.ClassLikeDeclaration; active: number; derived: boolean };
+  /** A derived class's constructor, lowered up to its first super(). */
+  thisBeforeSuper?: boolean;
   // A named function expression binds its name only inside its own body:
   // `const f = function self(){ return self(); }`.
   selfFunctionSymbol?: ts.Symbol;
@@ -788,9 +794,10 @@ function isLiftable(n: ts.Node): n is FnLike {
  *  capture outer variables — so the free-var / cell machinery must treat them as
  *  nested function boundaries (collectNested/freeVars), not opaque skips. */
 function isObjLitFn(n: ts.Node): boolean {
+  if (!n.parent || !(n as ts.MethodDeclaration).body) return false;
+  if (ts.isConstructorDeclaration(n)) return dynamicClasses.has(n.parent);
   return (ts.isMethodDeclaration(n) || ts.isGetAccessorDeclaration(n) || ts.isSetAccessorDeclaration(n))
-    && !!(n as ts.MethodDeclaration).body
-    && !!n.parent && ts.isObjectLiteralExpression(n.parent);
+    && (ts.isObjectLiteralExpression(n.parent) || dynamicClasses.has(n.parent));
 }
 
 /** What a private name resolves to: a field, or a method or accessor with its functions; `brand` is the hidden
@@ -1057,6 +1064,10 @@ class Exporter {
   computedKeyGlobals = new Map<ts.ClassElement, number>();
   /** An anonymous class expression's `name`: the binding or the key its site gives it. */
   private arrayIteratorNamed = false;
+  private dynamicClassNodes: ts.ClassLikeDeclaration[] = [];
+  private dynamicCtors = new Map<ts.ClassLikeDeclaration, ts.ConstructorDeclaration>();
+  private synthDynamicCtors = new WeakSet<ts.Node>();
+  private dynamicFieldKeys = new Map<ts.ClassElement, string>();
   private privateMembers?: Map<string, PrivateMember>;
   private readingPrivateField = false;
   classInferredName = new Map<number, string>();
@@ -2438,9 +2449,12 @@ class Exporter {
       // are lifted like function expressions (this = object). isLiftable() excludes
       // these, so id them here. (Includes the defineProperty descriptor case
       // `{ get() {} }`, which is a MethodDeclaration named "get".)
-      if ((ts.isMethodDeclaration(n) || ts.isGetAccessorDeclaration(n) || ts.isSetAccessorDeclaration(n)) &&
-          n.body && n.parent && ts.isObjectLiteralExpression(n.parent) && n.name) {
+      if (isObjLitFn(n)) {
         if (!this.fnId.has(n)) this.fnId.set(n, this.fnId.size);
+      }
+      if (ts.isClassLike(n) && isDynamicClass(n, this.checker)) {
+        const ctor = this.dynamicCtorNode(n);
+        if (!this.fnId.has(ctor)) this.fnId.set(ctor, this.fnId.size);
       }
       // Dynamic/symbol-keyed computed class METHOD (`class C { [k](){}, [sym](){},
       // *[sym](){}, async [k](){} }`) is installed at runtime as a data-property
@@ -2624,6 +2638,7 @@ class Exporter {
     return decl;
   }
   collectNested(n: ts.Node, out: FnLike[]) {
+    if (ts.isClassLike(n) && dynamicClasses.has(n) && this.synthDynamicCtors.has(this.dynamicCtorNode(n))) out.push(this.dynamicCtorNode(n) as unknown as FnLike);
     n.forEachChild((c) => {
       if (isLiftable(c)) out.push(c);
       else if (isObjLitFn(c)) out.push(c as unknown as FnLike); // obj-literal method/accessor: captures like an arrow
@@ -2807,6 +2822,12 @@ class Exporter {
       this.collectNested(e, nested);
     };
     if (F.body) scanExpr(F.body);
+    // a dynamic class's constructor runs the field initializers
+    if (ts.isConstructorDeclaration(F as unknown as ts.Node) && (F as unknown as ts.Node).parent && dynamicClasses.has((F as unknown as ts.Node).parent)) {
+      for (const m of ((F as unknown as ts.Node).parent as ts.ClassLikeDeclaration).members) {
+        if (ts.isPropertyDeclaration(m) && m.initializer && !this.isStaticMember(m)) scanExpr(m.initializer);
+      }
+    }
     // Also scan PARAMETER patterns: a default value or a computed destructuring
     // key (`function f({[k]: v} = d)`) can reference an enclosing-scope variable
     // that must be captured. (Param NAMES are in declaredIn, so they're skipped.)
@@ -5131,8 +5152,8 @@ class Exporter {
       for (const literal of literals) {
         const flags = (literal as unknown as { templateFlags?: number }).templateFlags ?? 0;
         const invalid = (flags & (ts as any).TokenFlags.ContainsInvalidEscape) !== 0;
-        const cooked = invalid ? undefinedValue : this.constString(ctx, literal.text);
-        const rawText = this.constString(ctx, literal.rawText ?? literal.text);
+        const cooked = invalid ? undefinedValue : this.constString(ctx, this.templateCooked(literal));
+        const rawText = this.constString(ctx, (literal.rawText ?? literal.text).replace(/\r\n?/g, "\n"));
         ctx.body.push({ kind: "ArrayPush", arr: template, src: cooked });
         ctx.body.push({ kind: "ArrayPush", arr: raw, src: rawText });
       }
@@ -5150,6 +5171,17 @@ class Exporter {
     return dst;
   }
 
+  /** A template chunk's value: a line terminator sequence in the source counts as a line feed (an escape `\\r`
+   *  stays a carriage return, so the source is what gets normalized). */
+  private templateCooked(literal: ts.TemplateLiteralLikeNode): string {
+    const src = literal.getText();
+    if (!src.includes("\r")) return literal.text;
+    const inner = src.slice(1, src.endsWith("${") ? -2 : -1).replace(/\r\n?/g, "\n");
+    const sf = ts.createSourceFile("t.ts", "`" + inner + "`", ts.ScriptTarget.ESNext);
+    const st = sf.statements[0];
+    const lit = st && ts.isExpressionStatement(st) ? st.expression : undefined;
+    return lit && ts.isNoSubstitutionTemplateLiteral(lit) ? lit.text : literal.text;
+  }
   /** A class method read as a value here (class_extract.ts pass 5): note it
    *  at run time, before the read, so typed accesses test the class interval
    *  from then on (docs/closed_receivers_design.md, slice 2). */
@@ -5414,7 +5446,10 @@ class Exporter {
         }
         if (ts.isPropertyAssignment(p) && (ts.isIdentifier(p.name) || ts.isStringLiteral(p.name))) {
           const v = this.lowerExpr(ctx, p.initializer);
-          ctx.body.push({ kind: "StoreField", obj: dst, field: this.internField(p.name.text), src: v });
+          // a data member after an accessor of its name replaces it: a definition, not a store through the setter
+          if (accPairs.has(p.name.text) && accPairs.get(p.name.text)!.firstIdx < node.properties.indexOf(p)) {
+            ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "object.defineData:1:1:1", args: [dst, this.constString(ctx, p.name.text), v] });
+          } else ctx.body.push({ kind: "StoreField", obj: dst, field: this.internField(p.name.text), src: v });
         } else if (ts.isPropertyAssignment(p) && ts.isNumericLiteral(p.name)) {
           // numeric key (e.g. `{ 0: "a" }`) -> its string form ("0"), like JS.
           const v = this.lowerExpr(ctx, p.initializer);
@@ -5593,6 +5628,16 @@ class Exporter {
       return dst;
     }
     if (ts.isIdentifier(node)) return this.lowerIdentifier(ctx, node);
+    if (node.kind === ts.SyntaxKind.ThisKeyword && ctx.thisBeforeSuper) {
+      // a derived class's `this` written ahead of its super(): the checker refuses it, a program it does not check throws
+      ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "dynclass.thisCheck", args: [this.undefLocal(ctx)] });
+    }
+    if (node.kind === ts.SyntaxKind.ThisKeyword && ctx.dynCtor?.derived) {
+      // no `this` before super() has returned
+      const dst = this.newLocal(ctx, "reference");
+      ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "dynclass.thisCheck", args: [ctx.thisLocal!] });
+      return dst;
+    }
     if (node.kind === ts.SyntaxKind.ThisKeyword) {
       if (ctx.thisLocal !== undefined) return ctx.thisLocal;
       return this.lowerUnboundThis(ctx);
@@ -5897,7 +5942,9 @@ class Exporter {
       const opm = this.objectProtoMethodName(node);
       if (opm !== undefined) {
         const dst = this.newLocal(ctx, "reference");
-        ctx.body.push({ kind: "LoadBuiltinFn", dst, builtin: `objproto.${opm}` });
+        const protoL = this.newLocal(ctx, "reference");
+        ctx.body.push({ kind: "LoadBuiltinFn", dst: protoL, builtin: "protoobj.object" });
+        ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: `object.methodValue:${this.internField(opm)}:${this.internName(opm)}`, args: [protoL] });
         return dst;
       }
       // `Array/String/Map/Set/Number.prototype.<m>` as a first-class VALUE (or the
@@ -6523,9 +6570,12 @@ class Exporter {
           const vloc = this.lowerExpr(ctx, fn);
           if (vloc !== undefined) callee = { kind: "Value", local: vloc };
         }
+      } else if (fn.kind === ts.SyntaxKind.SuperKeyword && ctx.dynCtor !== undefined) {
+        return this.lowerDynamicSuper(ctx, node);
       } else if (fn.kind === ts.SyntaxKind.SuperKeyword && ctx.currentClass !== undefined) {
         // super(...) constructor call -> Direct to the parent's constructor.
         ctx.superCallLowered = true;   // the derived class's inits follow this statement (lowerStmt)
+        ctx.thisBeforeSuper = false;
         const parent = this.parentIdOf(ctx.currentClass);
         const cfunc = parent !== undefined ? this.methodFunc.get(`${parent}:ctor`) : undefined;
         if (cfunc !== undefined) {
@@ -7332,7 +7382,7 @@ class Exporter {
           // A Date is a plain object carrying the internal `__date_ms` field (the
           // `new Date` lowering): the field's presence is the instanceof answer.
           const obj = this.lowerExpr(ctx, node.left);
-          ctx.body.push({ kind: "HasField", dst, obj, field: this.DATE_MS_FIELD });
+          ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: `date.isInstance:${this.DATE_MS_FIELD}`, args: [obj] });
           return dst;
         }
         const ek = this.errorKindIndex(node.right.text);
@@ -7668,6 +7718,7 @@ class Exporter {
       // nameIntern is probed with get() so the lookup never mints new ids.
       const emitDelete = (objExpr: ts.Expression, name: string): number => {
         const obj = this.lowerExpr(ctx, objExpr);
+        ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "object.coercible", args: [obj] });
         const dst = this.newLocal(ctx, "reference");
         const inst: any = { kind: "DeleteField", dst, obj, field: this.internField(name) };
         const m = this.nameIntern.get(name);
@@ -7675,6 +7726,14 @@ class Exporter {
         ctx.body.push(inst);
         return dst;
       };
+      let unwrapped: ts.Expression = target;
+      while (ts.isParenthesizedExpression(unwrapped)) unwrapped = unwrapped.expression;
+      if ((ts.isPropertyAccessExpression(unwrapped) || ts.isElementAccessExpression(unwrapped)) && unwrapped.expression.kind === ts.SyntaxKind.SuperKeyword) {
+        // `delete super.x`: a ReferenceError, after the key's evaluation
+        if (ts.isElementAccessExpression(unwrapped)) this.lowerExpr(ctx, unwrapped.argumentExpression);
+        ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "throw.reference:Unsupported reference to super", args: [] });
+        return this.undefLocal(ctx);
+      }
       if (ts.isPropertyAccessExpression(target) && ts.isIdentifier(target.name)) {
         return emitDelete(target.expression, target.name.text);
       }
@@ -7688,7 +7747,17 @@ class Exporter {
         ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "object.deleteDynamic", args: [obj, key] });
         return dst;
       }
-      this.unsupported(node, "delete with a dynamic/computed property (only obj.prop and obj['lit'] supported)");
+      if (ts.isPropertyAccessExpression(unwrapped) || ts.isElementAccessExpression(unwrapped)) {
+        // through parentheses: the same reference
+        const inner = ts.factory.createDeleteExpression(unwrapped);
+        (inner as { parent: ts.Node }).parent = node;
+        return this.lowerExpr(ctx, inner);
+      }
+      // anything else is no reference: evaluated, and the answer is true
+      this.lowerExpr(ctx, target);
+      const yes = this.newLocal(ctx, "reference");
+      ctx.body.push({ kind: "Const", dst: yes, value: { kind: "Bool", value: true } });
+      return yes;
     }
     if (ts.isYieldExpression(node)) {
       // yield* inner: delegate to an inner (async) generator. Lower to the explicit
@@ -7729,92 +7798,7 @@ class Exporter {
         const innerType = this.checker.getTypeAtLocation(innerExpr);
         const drv = (innerType.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown) ? undefined : this.resolveIterator(ctx, innerExpr, { forceAsync: !!ctx.isAsync }))
           ?? this.runtimeIterDriver(ctx, this.lowerExpr(ctx, innerExpr), !!ctx.isAsync);
-        const valueField = this.internField("value");
-        const doneField = this.internField("done");
-        const sent = this.newLocal(ctx, "reference");          // value sent into inner
-        const undef0 = this.newLocal(ctx, "reference");
-        ctx.body.push({ kind: "Const", dst: undef0, value: { kind: "Undef" } });
-        ctx.body.push({ kind: "Copy", dst: sent, src: undef0 });
-        const rstar = this.newLocal(ctx, "reference");         // {value,done} of inner
-        // The delegation ends abruptly when this generator is returned from or thrown
-        // into (the resumption runs the finally) or the body of a throw-forwarding
-        // step rethrows: then the inner iterator is closed, as for-of closes it.
-        const delegationDone = this.newLocal(ctx, "primitive");
-        const falseD = this.newLocal(ctx, "primitive");
-        ctx.body.push({ kind: "Const", dst: falseD, value: { kind: "Bool", value: false } });
-        ctx.body.push({ kind: "Copy", dst: delegationDone, src: falseD });
-        const delegationBody = this.captureBody(ctx, () => {
-        // first step
-        { const r = drv.step(sent); ctx.body.push({ kind: "Copy", dst: rstar, src: r }); }
-        // loop: while (!r.done) { sent = yield r.value; r = it.next(sent); }
-        let condLocal = -1;
-        const condBody = this.captureBody(ctx, () => {
-          const doneVal = this.newLocal(ctx, "reference");
-          ctx.body.push({ kind: "LoadField", dst: doneVal, obj: rstar, field: doneField });
-          condLocal = this.newLocal(ctx, "primitive");
-          ctx.body.push({ kind: "UnOp", dst: condLocal, op: "!", operand: doneVal });
-        });
-        const bodyB = this.captureLoopBody(ctx, "while", () => {
-          const val = this.newLocal(ctx, "reference");
-          ctx.body.push({ kind: "LoadField", dst: val, obj: rstar, field: valueField });
-          if (!drv.throwStep) {
-            // no throw forwarding possible: plain yield + advance.
-            this.emitYieldInst(ctx, sent, val);
-            const r = drv.step(sent);
-            ctx.body.push({ kind: "Copy", dst: rstar, src: r });
-            return;
-          }
-          // throw-aware step: a .throw() into the delegating generator at this
-          // yield point must be forwarded to inner.throw(e). We detect the throw
-          // by wrapping the yield in try/catch:
-          //   try { sent = yield val; threw = false }
-          //   catch (e) { thrown = e; threw = true }
-          //   r = threw ? inner.throw(thrown) : inner.next(sent)
-          const threw = this.newLocal(ctx, "primitive");
-          const thrown = this.newLocal(ctx, "reference");
-          const falseC = this.newLocal(ctx, "primitive");
-          ctx.body.push({ kind: "Const", dst: falseC, value: { kind: "Bool", value: false } });
-          ctx.body.push({ kind: "Copy", dst: threw, src: falseC });
-          const tryBody = this.captureBody(ctx, () => {
-            this.emitYieldInst(ctx, sent, val);
-          });
-          const catchBody = this.captureBody(ctx, () => {
-            const trueC = this.newLocal(ctx, "primitive");
-            ctx.body.push({ kind: "Const", dst: trueC, value: { kind: "Bool", value: true } });
-            ctx.body.push({ kind: "Copy", dst: threw, src: trueC });
-          });
-          ctx.body.push({ kind: "TryCatch", tryBody, catchVar: thrown, catchBody, finallyBody: [] });
-          // r = threw ? inner.throw(thrown) : inner.next(sent)
-          const thenBody = this.captureBody(ctx, () => {
-            const r = drv.throwStep!(thrown);
-            ctx.body.push({ kind: "Copy", dst: rstar, src: r });
-          });
-          const elseBody = this.captureBody(ctx, () => {
-            const r = drv.step(sent);
-            ctx.body.push({ kind: "Copy", dst: rstar, src: r });
-          });
-          ctx.body.push({ kind: "If", cond: threw, thenBody, elseBody });
-        });
-        ctx.body.push({ kind: "Loop", cond: condLocal, condBody, body: bodyB });
-        const trueD = this.newLocal(ctx, "primitive");
-        ctx.body.push({ kind: "Const", dst: trueD, value: { kind: "Bool", value: true } });
-        ctx.body.push({ kind: "Copy", dst: delegationDone, src: trueD });
-        });
-        if (drv.returnCall) {
-          const finallyBody = this.captureBody(ctx, () => {
-            const abrupt = this.newLocal(ctx, "primitive");
-            ctx.body.push({ kind: "UnOp", dst: abrupt, op: "!", operand: delegationDone });
-            const thenBody = this.captureBody(ctx, () => { drv.returnCall!(); });
-            ctx.body.push({ kind: "If", cond: abrupt, thenBody, elseBody: [] });
-          });
-          ctx.body.push({ kind: "TryCatch", tryBody: delegationBody, catchVar: null, catchBody: [], finallyBody });
-        } else {
-          for (const inst of delegationBody) ctx.body.push(inst);
-        }
-        // value of the yield* expression = inner's return value (r.value when done)
-        const exprVal = this.newLocal(ctx, "reference");
-        ctx.body.push({ kind: "LoadField", dst: exprVal, obj: rstar, field: valueField });
-        return exprVal;
+        return this.lowerYieldDelegate(ctx, drv);
       }
       // yield e: hand e to the .next() caller and suspend; resume value -> dst.
       const operand = node.expression ? this.lowerExpr(ctx, node.expression) : this.newLocal(ctx, "reference");
@@ -7944,13 +7928,13 @@ class Exporter {
       // spec-observable order between one substitution's ToString and evaluation
       // of the next substitution.
       const parts: number[] = [];
-      let pendingStatic = node.head.text;
+      let pendingStatic = this.templateCooked(node.head);
       // A number substitution's ToString has no effect to order, so under the strict type profile it is
       // left to the join (`string.template`, which formats an integer's digits on the stack) when the
       // template has two parts or more (docs/string_build_fast_paths_design.md).
       const substitutions = node.templateSpans.filter((sp) => this.constTemplateString(sp.expression) === undefined).length;
-      const anyStatic = node.head.text.length > 0 || node.templateSpans.some((sp) =>
-        sp.literal.text.length > 0 || (this.constTemplateString(sp.expression) ?? "").length > 0);
+      const anyStatic = this.templateCooked(node.head).length > 0 || node.templateSpans.some((sp) =>
+        this.templateCooked(sp.literal).length > 0 || (this.constTemplateString(sp.expression) ?? "").length > 0);
       const joinable = substitutions >= 2 || (substitutions === 1 && anyStatic);
       let deferred = false;
       const flushStatic = () => {
@@ -7964,7 +7948,7 @@ class Exporter {
         const folded = this.constTemplateString(span.expression);
         if (folded !== undefined) {
           pendingStatic += folded;
-          pendingStatic += span.literal.text;
+          pendingStatic += this.templateCooked(span.literal);
           continue;
         }
         flushStatic();
@@ -7972,14 +7956,14 @@ class Exporter {
         if (joinable && this.templateNumberSubstitution(span.expression)) {
           parts.push(raw);
           deferred = true;
-          pendingStatic = span.literal.text;
+          pendingStatic = this.templateCooked(span.literal);
           continue;
         }
         const e = this.newLocal(ctx, "reference");
         // a template's ToString: a Symbol substitution is a TypeError (String(sym) is its description)
         ctx.body.push({ kind: "CallBuiltinStatic", dst: e, builtin: "string.coerceTemplate", args: [raw] });
         parts.push(e);
-        pendingStatic = span.literal.text;
+        pendingStatic = this.templateCooked(span.literal);
       }
       flushStatic();
       if (parts.length === 1) return parts[0];
@@ -8002,7 +7986,7 @@ class Exporter {
     }
     if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) {
       const dst = this.newLocal(ctx, "reference");
-      ctx.body.push({ kind: "Const", dst, value: { kind: "Str", value: node.text } });
+      ctx.body.push({ kind: "Const", dst, value: { kind: "Str", value: ts.isStringLiteral(node) ? node.text : this.templateCooked(node) } });
       return dst;
     }
     if (node.kind === ts.SyntaxKind.TrueKeyword || node.kind === ts.SyntaxKind.FalseKeyword) {
@@ -8197,9 +8181,8 @@ class Exporter {
       return this.loadGlobalObjectProperty(ctx, node.text);
     }
     if (node.text === "RegExp" && this.isAmbientGlobalSymbol(sym)) {
-      this.unsupported(node, "RegExp as a value (not implemented)");
       const dst = this.newLocal(ctx, "reference", node.text);
-      ctx.body.push({ kind: "Const", dst, value: { kind: "Undef" } });
+      ctx.body.push({ kind: "LoadBuiltinFn", dst, builtin: "global.RegExp" });
       return dst;
     }
     if (this.isLexicalTdzUse(node, sym)) {
@@ -8329,17 +8312,6 @@ class Exporter {
     return !!decls && decls.length > 0 && decls.every((d) => this.program.isSourceFileDefaultLibrary(d.getSourceFile()));
   }
 
-  /** `class D extends <value> {}` (no members): a derived constructor over the runtime value, made by
-   *  the runtime (`ts_class_extend_dyn`): `new D(...)` constructs the base and gives the instance D's
-   *  prototype (whose prototype is the base's), D's statics chain to the base, D's name is the class's. */
-  private lowerDynamicDerivedClass(ctx: FnCtx, base: ts.Expression, name: string): number {
-    const parent = this.lowerExpr(ctx, base);
-    const nameL = this.newLocal(ctx, "reference");
-    ctx.body.push({ kind: "Const", dst: nameL, value: { kind: "Str", value: name } });
-    const dst = this.newLocal(ctx, "reference", name || undefined);
-    ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "class.extend_dyn", args: [parent, nameL] });
-    return dst;
-  }
   /** Lower a class EXPRESSION (`const C = class { ... }`, named or anonymous) to a
    *  runtime class value — the same machinery a class declaration uses when read as
    *  a value. Dynamic-base (mixin) class expressions stay loud-rejected (their
@@ -8348,8 +8320,7 @@ class Exporter {
   lowerClassExpressionValue(ctx: FnCtx, node: ts.ClassExpression, hint?: string): number {
     const cid = this.classIdByNode.get(node);
     if (cid === undefined) {
-      const base = dynamicBaseEmptyClass(node, this.checker);
-      if (base) return this.lowerDynamicDerivedClass(ctx, base, node.name?.text ?? this.namedEvaluationName(node) ?? "");
+      if (dynamicClasses.has(node)) return this.lowerDynamicClass(ctx, node);
       this.unsupported(node, "class expression (no resolved class id)");
       return this.newLocal(ctx, "reference", hint);
     }
@@ -11647,7 +11618,7 @@ class Exporter {
       if (member === "isExtensible") return argc === 1 ? "reflect.isExtensible" : "__UNSUPPORTED__";
       if (member === "preventExtensions") return argc === 1 ? "reflect.preventExtensions" : "__UNSUPPORTED__";
       if (member === "apply") return argc === 3 ? "reflect.apply" : "__UNSUPPORTED__";
-      if (member === "construct") return (argc === 2 || argc === 3) ? "reflect.construct" : "__UNSUPPORTED__";
+      if (member === "construct") return argc === 3 ? "reflect.construct3" : argc === 2 ? "reflect.construct" : "__UNSUPPORTED__";
       return "__UNSUPPORTED__";
     }
     if (ns === "Proxy") {
@@ -12138,6 +12109,105 @@ class Exporter {
     const arrayLike = (ty: ts.Type): boolean => this.checker.isArrayLikeType(ty) && !(ty.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown));
     return arrayLike(t) || (t.isUnion() && t.types.every(arrayLike));
   }
+  /** `yield*`'s loop, as the specification writes it: the received completion goes to the iterator's `next`,
+   *  `throw` or `return` (GetMethod each time), an async generator awaits the result, a result that is not done
+   *  is yielded as it stands (a sync generator hands the object on, an async one its value, unawaited). The yield
+   *  does not raise on resumption: `yield.resumeKind` says how it was resumed. */
+  private lowerYieldDelegate(ctx: FnCtx, drv: IterDriver): number {
+    const isAsync = !!ctx.isAsync;
+    const it = drv.itLocal;
+    const valueField = this.internField("value");
+    const doneField = this.internField("done");
+    const fromSync = this.newLocal(ctx, "primitive");
+    if (isAsync) ctx.body.push({ kind: "CallBuiltinStatic", dst: fromSync, builtin: "iter.acquiredSync", args: [] });
+    const kind = this.constNumber(ctx, 0);          // 0 next, 1 throw, 2 return
+    const received = this.newLocal(ctx, "reference");
+    ctx.body.push({ kind: "Const", dst: received, value: { kind: "Undef" } });
+    const inner = this.newLocal(ctx, "reference");
+    const result = this.newLocal(ctx, "reference");
+    const settled = (r: number): number => {
+      if (!isAsync) return r;
+      const a = this.newLocal(ctx, "reference");
+      ctx.body.push({ kind: "Await", dst: a, operand: r });
+      return a;
+    };
+    /** `await` a value that came from a sync iterator wrapped for an async generator */
+    const awaitedIfSync = (v: number): void => {
+      if (!isAsync) return;
+      const body = this.captureBody(ctx, () => { ctx.body.push({ kind: "Await", dst: v, operand: v }); });
+      ctx.body.push({ kind: "If", cond: fromSync, thenBody: body, elseBody: [] });
+    };
+    const returnNow = (v: number): void => { ctx.body.push({ kind: "Return", src: v }); };
+    const callMethod = (m: number): void => {
+      const r = this.newLocal(ctx, "reference");
+      ctx.body.push({ kind: "CallBuiltinStatic", dst: r, builtin: "iter.invoke", args: [m, it, received] });
+      ctx.body.push({ kind: "Copy", dst: inner, src: settled(r) });
+    };
+    const isKind = (k: number): number => {
+      const c = this.constNumber(ctx, k);
+      const dst = this.newLocal(ctx, "primitive");
+      ctx.body.push({ kind: "BinOp", dst, op: "===", lhs: kind, rhs: c });
+      return dst;
+    };
+    const getMethod = (name: string): { m: number; missing: number } => {
+      const m = this.newLocal(ctx, "reference");
+      ctx.body.push({ kind: "CallBuiltin", dst: m, builtin: `iter.getMethod:${name}:${this.internName(name)}`, recv: it, args: [] });
+      const missing = this.newLocal(ctx, "primitive");
+      ctx.body.push({ kind: "UnOp", dst: missing, op: "isundef", operand: m });
+      return { m, missing };
+    };
+    const cond = this.newLocal(ctx, "primitive");
+    ctx.body.push({ kind: "Const", dst: cond, value: { kind: "Bool", value: true } });
+    const bodyB = this.captureLoopBody(ctx, "while", () => {
+      const nextB = this.captureBody(ctx, () => {
+        if (drv.nextMethod !== undefined) callMethod(drv.nextMethod);
+        else ctx.body.push({ kind: "Copy", dst: inner, src: drv.step(received) });
+      });
+      const throwB = this.captureBody(ctx, () => {
+        const { m, missing } = getMethod("throw");
+        const noThrow = this.captureBody(ctx, () => {
+          drv.returnCall?.();
+          ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "throw.type:The iterator does not provide a 'throw' method", args: [] });
+        });
+        ctx.body.push({ kind: "If", cond: missing, thenBody: noThrow, elseBody: this.captureBody(ctx, () => callMethod(m)) });
+      });
+      const returnB = this.captureBody(ctx, () => {
+        const { m, missing } = getMethod("return");
+        const noReturn = this.captureBody(ctx, () => {
+          if (isAsync) ctx.body.push({ kind: "Await", dst: received, operand: received });
+          returnNow(received);
+        });
+        ctx.body.push({ kind: "If", cond: missing, thenBody: noReturn, elseBody: this.captureBody(ctx, () => callMethod(m)) });
+      });
+      ctx.body.push({ kind: "If", cond: isKind(0), thenBody: nextB, elseBody: this.captureBody(ctx, () => {
+        ctx.body.push({ kind: "If", cond: isKind(1), thenBody: throwB, elseBody: returnB });
+      }) });
+      ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "iter.checkResult", args: [inner] });
+      const doneV = this.newLocal(ctx, "reference");
+      ctx.body.push({ kind: "LoadField", dst: doneV, obj: inner, field: doneField });
+      const doneB = this.captureBody(ctx, () => {
+        const v = this.newLocal(ctx, "reference");
+        ctx.body.push({ kind: "LoadField", dst: v, obj: inner, field: valueField });
+        awaitedIfSync(v);
+        const retB = this.captureBody(ctx, () => returnNow(v));
+        ctx.body.push({ kind: "If", cond: isKind(2), thenBody: retB, elseBody: [] });
+        ctx.body.push({ kind: "Copy", dst: result, src: v });
+        ctx.body.push({ kind: "Break" });
+      });
+      ctx.body.push({ kind: "If", cond: doneV, thenBody: doneB, elseBody: [] });
+      const parked = this.newLocal(ctx, "reference", "__yield_delegate");
+      if (isAsync) {
+        const v = this.newLocal(ctx, "reference");
+        ctx.body.push({ kind: "LoadField", dst: v, obj: inner, field: valueField });
+        awaitedIfSync(v);
+        ctx.body.push({ kind: "Yield", dst: parked, operand: v });
+      } else ctx.body.push({ kind: "Yield", dst: parked, operand: inner });
+      ctx.body.push({ kind: "CallBuiltinStatic", dst: kind, builtin: "yield.resumeKind", args: [] });
+      ctx.body.push({ kind: "CallBuiltinStatic", dst: received, builtin: "yield.resumeValue", args: [] });
+    });
+    ctx.body.push({ kind: "Loop", cond, condBody: [], body: bodyB });
+    return result;
+  }
   /** The protocol over an iterator the runtime acquires (ts_iter_acquire), for a `yield*` over a value
    *  of no known type: next by the generic step, IteratorClose by the generic close. */
   private runtimeIterDriver(ctx: FnCtx, src: number, async: boolean): IterDriver {
@@ -12171,7 +12241,7 @@ class Exporter {
         ctx.body.push({ kind: "If", cond: called, thenBody, elseBody: [] });
       }
     };
-    return { itLocal, srcLocal: src, isAsync: async, step, throwStep, returnCall };
+    return { itLocal, srcLocal: src, isAsync: async, step, throwStep, returnCall, nextMethod };
   }
   /** The protocol over a value the types do not settle (`any`, a string, a union with one), for an
    *  array pattern: `forof.open` gives an array, read by index with no iterator object, or an
@@ -12722,7 +12792,7 @@ class Exporter {
         }
       };
     }
-    return { itLocal, srcLocal: src, isAsync, step, throwStep, returnCall, awaitValue };
+    return { itLocal, srcLocal: src, isAsync, step, throwStep, returnCall, awaitValue, nextMethod: nextMethod < 0 ? undefined : nextMethod };
   }
 
   /** True if the expression's static type has a callable member `name`. */
@@ -13747,7 +13817,7 @@ class Exporter {
         return;
       }
       // a name no scope declares: strict code's ReferenceError, unless the global object has it by then
-      if (sym === undefined) {
+      if (sym === undefined || (lhs.text === "undefined" && !sym.declarations?.length)) {
         ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: `global.assignRef:${lhs.text}`, args: [rhs] });
         return;
       }
@@ -13968,10 +14038,254 @@ class Exporter {
       this.unsupported(lhs, `assignment target of kind ${ts.SyntaxKind[lhs.kind]}`);
     }
   }
+  /** The constructor of a dynamic class: its own, or a synthetic one with an empty body. */
+  private dynamicCtorNode(c: ts.ClassLikeDeclaration): ts.ConstructorDeclaration {
+    let ctor = this.dynamicCtors.get(c);
+    if (ctor) return ctor;
+    ctor = c.members.find((m): m is ts.ConstructorDeclaration => ts.isConstructorDeclaration(m) && m.body !== undefined);
+    if (!ctor) {
+      ctor = ts.factory.createConstructorDeclaration(undefined, [], ts.setTextRange(ts.factory.createBlock([], false), c));
+      ts.setTextRange(ctor, c);
+      (ctor as { parent: ts.Node }).parent = c;
+      (ctor.body as unknown as { parent: ts.Node }).parent = ctor;
+      this.synthDynamicCtors.add(ctor);
+    }
+    this.dynamicCtors.set(c, ctor);
+    this.dynamicClassNodes.push(c);
+    return ctor;
+  }
+  private undefLocal(ctx: FnCtx): number {
+    const u = this.newLocal(ctx, "reference");
+    ctx.body.push({ kind: "Const", dst: u, value: { kind: "Undef" } });
+    return u;
+  }
+  /** A home cell for `super` in a class's members: filled when the home object exists. */
+  private newHomeCell(ctx: FnCtx, node: ts.Node): number {
+    const cell = this.newLocal(ctx, "reference", "homeCell");
+    const site = this.site++;
+    this.recordSite(site, "cell", this.inLoop(node) ? "many" : "once", true, node, true);
+    ctx.body.push({ kind: "AllocObject", dst: cell, typeId: 0, site, classId: this.cellClassId });
+    return cell;
+  }
+  /** `this` is `value` for what `fn` lowers: arrows there capture it through a cell of their own. */
+  private withThisValue(ctx: FnCtx, value: number, fn: () => void): void {
+    const savedThis = ctx.thisLocal;
+    const savedCell = ctx.cellAccess.get(this.lexicalThisSym);
+    const savedBody = ctx.thisCellOfBody?.get(ctx.body);
+    const body = ctx.body;
+    ctx.thisLocal = value;
+    ctx.cellAccess.delete(this.lexicalThisSym);
+    ctx.thisCellOfBody?.delete(body);
+    fn();
+    ctx.thisLocal = savedThis;
+    if (savedCell !== undefined) ctx.cellAccess.set(this.lexicalThisSym, savedCell);
+    else ctx.cellAccess.delete(this.lexicalThisSym);
+    if (ctx.thisCellOfBody) {
+      if (savedBody !== undefined) ctx.thisCellOfBody.set(body, savedBody);
+      else ctx.thisCellOfBody.delete(body);
+    }
+  }
+  /** ClassDefinitionEvaluation at run time (docs/dynamic_classes_design.md). `bind` gives the class's binding
+   *  its value, ahead of the static members. */
+  lowerDynamicClass(ctx: FnCtx, node: ts.ClassLikeDeclaration, bind?: (v: number) => void): number {
+    const ext = node.heritageClauses?.find((h) => h.token === ts.SyntaxKind.ExtendsKeyword)?.types[0]?.expression;
+    // the name of a class expression is a binding of the class's own
+    const selfSym = ts.isClassExpression(node) && node.name ? this.symbolOf(node.name) : undefined;
+    const savedSelf = selfSym && ctx.cellAccess.get(selfSym);
+    let selfCell: number | undefined;
+    if (selfSym) {
+      selfCell = this.newLocal(ctx, "reference", "classSelf", this.bindingIdOf(selfSym));
+      const site = this.site++;
+      this.recordSite(site, "cell", this.inLoop(node) ? "many" : "once", true, node, true);
+      ctx.body.push({ kind: "AllocObject", dst: selfCell, typeId: 0, site, classId: this.cellClassId });
+      ctx.cellAccess.set(selfSym, selfCell);
+    }
+    let base: number | undefined;
+    if (ext) base = ext.kind === ts.SyntaxKind.NullKeyword ? undefined : this.lowerExpr(ctx, ext);
+    if (ext && base === undefined) { base = this.newLocal(ctx, "reference"); ctx.body.push({ kind: "Const", dst: base, value: { kind: "Null" } }); }
+    const protoHome = this.newHomeCell(ctx, node);
+    const staticHome = this.newHomeCell(ctx, node);
+    const savedHome = ctx.cellAccess.get(this.lexicalHomeSym);
+    ctx.cellAccess.set(this.lexicalHomeSym, protoHome);
+    const F = this.lowerClosure(ctx, this.dynamicCtorNode(node) as unknown as FnLike, node.name?.text ?? "class");
+    const proto = this.newLocal(ctx, "reference", "proto");
+    ctx.body.push({ kind: "CallBuiltinStatic", dst: proto, builtin: ext ? "dynclass.define:1" : "dynclass.define:0", args: ext ? [F, base!] : [F] });
+    ctx.body.push({ kind: "StoreField", obj: protoHome, field: this.VALUE, src: proto });
+    ctx.body.push({ kind: "StoreField", obj: staticHome, field: this.VALUE, src: F });
+    // the members, in order; a static field's or block's turn comes after the binding
+    const staticKeys = new Map<ts.ClassElement, number>();
+    for (const m of node.members) {
+      const nm = (m as { name?: ts.PropertyName }).name;
+      const isStatic = this.isStaticMember(m);
+      const isField = ts.isPropertyDeclaration(m);
+      const isMember = (ts.isMethodDeclaration(m) || ts.isGetAccessorDeclaration(m) || ts.isSetAccessorDeclaration(m)) && m.body !== undefined;
+      if (!nm || (!isField && !isMember)) continue;
+      if (isField && ts.getModifiers(m as ts.PropertyDeclaration)?.some((mod) => mod.kind === ts.SyntaxKind.DeclareKeyword || mod.kind === ts.SyntaxKind.AbstractKeyword)) continue;
+      const computed = ts.isComputedPropertyName(nm);
+      let key: number | undefined;
+      if (computed) {
+        const raw = this.lowerExpr(ctx, nm.expression);
+        key = this.newLocal(ctx, "reference");
+        ctx.body.push({ kind: "CallBuiltinStatic", dst: key, builtin: "key.normalize", args: [raw] });
+      }
+      const holder = isStatic ? F : proto;
+      if (isMember) {
+        key ??= this.constString(ctx, this.memberKeyName(nm) ?? "");
+        ctx.cellAccess.set(this.lexicalHomeSym, isStatic ? staticHome : protoHome);
+        const fn = this.lowerClosure(ctx, m as unknown as FnLike, "", /*thisParam*/ true);
+        const kind = ts.isGetAccessorDeclaration(m) ? "get" : ts.isSetAccessorDeclaration(m) ? "set" : "method";
+        if (computed) ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: `function.nameFromKey:${kind}`, args: [fn, key] });
+        if (kind === "method") {
+          ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "object.defineData:0:1:1", args: [holder, key, fn] });
+        } else {
+          const u = this.newLocal(ctx, "reference");
+          ctx.body.push({ kind: "Const", dst: u, value: { kind: "Undef" } });
+          const isGet = kind === "get";
+          ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"),
+            builtin: `object.defineAccessor:${isGet ? 1 : 0}:${isGet ? 0 : 1}:0:1:${(isGet ? 1 : 2) | 4 | 8}`,
+            args: [holder, key, isGet ? fn : u, isGet ? u : fn] });
+        }
+      } else if (computed) {
+        if (isStatic) staticKeys.set(m, key!);
+        else {
+          // an instance field's key waits for the constructor on the prototype, one per evaluation
+          ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "object.defineData:0:1:1", args: [proto, this.constString(ctx, this.dynamicHiddenKey(m)), key!] });
+        }
+      }
+    }
+    if (selfCell !== undefined) ctx.body.push({ kind: "StoreField", obj: selfCell, field: this.VALUE, src: F });
+    bind?.(F);
+    // static fields and blocks, `this` being the class
+    ctx.cellAccess.set(this.lexicalHomeSym, staticHome);
+    this.withThisValue(ctx, F, () => {
+      for (const m of node.members) {
+        if (ts.isClassStaticBlockDeclaration(m)) { m.body.statements.forEach((st) => this.lowerStmt(ctx, st)); continue; }
+        if (!ts.isPropertyDeclaration(m) || !this.isStaticMember(m)) continue;
+        if (ts.getModifiers(m)?.some((mod) => mod.kind === ts.SyntaxKind.DeclareKeyword || mod.kind === ts.SyntaxKind.AbstractKeyword)) continue;
+        const key = staticKeys.get(m) ?? this.constString(ctx, this.memberKeyName(m.name) ?? "");
+        let v: number;
+        if (!m.initializer) { v = this.newLocal(ctx, "reference"); ctx.body.push({ kind: "Const", dst: v, value: { kind: "Undef" } }); }
+        else v = staticKeys.has(m) ? this.lowerNamedByKey(ctx, m.initializer, key) : this.lowerExpr(ctx, m.initializer);
+        const enumerable = ts.isPrivateIdentifier(m.name) ? 0 : 1;
+        ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: `object.defineData:${enumerable}:1:1`, args: [F, key, v] });
+      }
+    });
+    if (savedHome !== undefined) ctx.cellAccess.set(this.lexicalHomeSym, savedHome);
+    else ctx.cellAccess.delete(this.lexicalHomeSym);
+    if (selfSym) {
+      if (savedSelf !== undefined) ctx.cellAccess.set(selfSym, savedSelf);
+      else ctx.cellAccess.delete(selfSym);
+    }
+    return F;
+  }
+  /** A dynamic class's constructor, on entry: what `new` left (nothing: the class was called), and `this`. */
+  private emitDynamicCtorEntry(ctx: FnCtx, classNode: ts.ClassLikeDeclaration): void {
+    const derived = classNode.heritageClauses?.some((h) => h.token === ts.SyntaxKind.ExtendsKeyword) ?? false;
+    const nt = this.newLocal(ctx, "reference", "newTarget");
+    const name = classNode.name?.text ?? "";
+    ctx.body.push({ kind: "CallBuiltinStatic", dst: nt, builtin: `dynclass.enter:${name}`, args: [] });
+    const active = this.newLocal(ctx, "reference", "activeFunction");
+    ctx.body.push({ kind: "CallBuiltinStatic", dst: active, builtin: "dynclass.active", args: [] });
+    ctx.newTargetLocal = nt;
+    ctx.dynCtor = { classNode, active, derived };
+    ctx.thisLocal = this.newLocal(ctx, "reference", "this");
+    if (derived) ctx.body.push({ kind: "Const", dst: ctx.thisLocal, value: { kind: "Undef" } });
+    else ctx.body.push({ kind: "CallBuiltinStatic", dst: ctx.thisLocal, builtin: "dynclass.this", args: [nt] });
+  }
+  /** Every argument of the running constructor, as an array. */
+  private dynamicAllArguments(ctx: FnCtx): number {
+    const arr = this.newLocal(ctx, "reference");
+    ctx.body.push({ kind: "CallBuiltinStatic", dst: arr, builtin: `arguments.array:${ctx.argumentsOffset ?? 0}`, args: [] });
+    return arr;
+  }
+  private lowerDynamicSuper(ctx: FnCtx, node: ts.CallExpression): number {
+    const site = this.site++;
+    this.recordSite(site, "array", this.inLoop(node) ? "many" : "once", false, node);
+    const arr = this.newLocal(ctx, "reference");
+    ctx.body.push({ kind: "AllocArray", dst: arr, elemType: 0, site });
+    for (const a of node.arguments) {
+      if (ts.isSpreadElement(a)) ctx.body.push({ kind: "ArrayPushAll", arr, src: this.lowerExpr(ctx, a.expression) });
+      else ctx.body.push({ kind: "ArrayPush", arr, src: this.lowerExpr(ctx, a) });
+    }
+    return this.emitDynamicSuper(ctx, arr);
+  }
+  /** super(...): the parent constructs under the same new.target; then `this` is bound, once, and the fields run. */
+  private emitDynamicSuper(ctx: FnCtx, args: number): number {
+    const dc = ctx.dynCtor!;
+    const made = this.newLocal(ctx, "reference");
+    ctx.body.push({ kind: "CallBuiltinStatic", dst: made, builtin: "dynclass.super", args: [dc.active, ctx.newTargetLocal!, args] });
+    ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "dynclass.bindCheck", args: [ctx.thisLocal!] });
+    ctx.body.push({ kind: "Copy", dst: ctx.thisLocal!, src: made });
+    this.emitDynamicInits(ctx);
+    return made;
+  }
+  /** The instance elements of a dynamic class on `this`: the brand, the parameter properties, the fields. */
+  private emitDynamicInits(ctx: FnCtx): void {
+    const dc = ctx.dynCtor!;
+    const self = ctx.thisLocal!;
+    const brand = privateBrand(dc.classNode);
+    const defineOn = (key: number, v: number, enumerable: number): void => {
+      ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: `object.defineData:${enumerable}:1:1`, args: [self, key, v] });
+    };
+    if (brand !== undefined) {
+      const yes = this.newLocal(ctx, "reference");
+      ctx.body.push({ kind: "Const", dst: yes, value: { kind: "Bool", value: true } });
+      defineOn(this.constString(ctx, brand), yes, 0);
+    }
+    const ctor = this.dynamicCtorNode(dc.classNode);
+    if (!this.synthDynamicCtors.has(ctor)) this.emitParameterProperties(ctx, ctor, self);
+    const derived = dc.derived;
+    dc.derived = false;   // `this` is bound from here on
+    this.withThisValue(ctx, self, () => {
+      for (const m of dc.classNode.members) {
+        if (!ts.isPropertyDeclaration(m) || this.isStaticMember(m)) continue;
+        if (ts.getModifiers(m)?.some((mod) => mod.kind === ts.SyntaxKind.DeclareKeyword || mod.kind === ts.SyntaxKind.AbstractKeyword)) continue;
+        let key: number;
+        if (ts.isComputedPropertyName(m.name)) {
+          // the key the class's evaluation left on the prototype
+          const proto = this.newLocal(ctx, "reference");
+          ctx.body.push({ kind: "LoadField", dst: proto, obj: dc.active, field: this.internField("prototype") });
+          key = this.newLocal(ctx, "reference");
+          ctx.body.push({ kind: "LoadField", dst: key, obj: proto, field: this.internField(this.dynamicHiddenKey(m)) });
+        } else key = this.constString(ctx, this.memberKeyName(m.name) ?? "");
+        let v: number;
+        if (!m.initializer) { v = this.newLocal(ctx, "reference"); ctx.body.push({ kind: "Const", dst: v, value: { kind: "Undef" } }); }
+        else v = ts.isComputedPropertyName(m.name) ? this.lowerNamedByKey(ctx, m.initializer, key) : this.lowerExpr(ctx, m.initializer);
+        defineOn(key, v, ts.isPrivateIdentifier(m.name) ? 0 : 1);
+      }
+    });
+    dc.derived = derived;
+  }
+  private dynamicHiddenKey(m: ts.ClassElement): string {
+    let hidden = this.dynamicFieldKeys.get(m);
+    if (hidden === undefined) { hidden = `#ck${PRIVATE_MARK}f${this.dynamicFieldKeys.size}`; this.dynamicFieldKeys.set(m, hidden); }
+    return hidden;
+  }
+  private emitDynamicReturn(ctx: FnCtx, v: number): void {
+    const dc = ctx.dynCtor!;
+    const r = this.newLocal(ctx, "reference");
+    ctx.body.push({ kind: "CallBuiltinStatic", dst: r, builtin: `dynclass.result:${dc.derived ? 1 : 0}`, args: [v, ctx.thisLocal!] });
+    ctx.body.push({ kind: "Return", src: r });
+  }
   /** The class member a private name resolves to (the names are unique: private_names.ts). */
   private privateMember(id: ts.PrivateIdentifier): PrivateMember | undefined {
     if (!this.privateMembers) {
       const out = new Map<string, PrivateMember>();
+      for (const cn of this.dynamicClassNodes) {
+        const brand = privateBrand(cn);
+        for (const m of cn.members) {
+          const nm = (m as { name?: ts.PropertyName }).name;
+          if (!nm || !ts.isPrivateIdentifier(nm)) continue;
+          const isStatic = this.isStaticMember(m);
+          const kind = ts.isPropertyDeclaration(m) ? "field" : ts.isMethodDeclaration(m) ? "method" : "accessor";
+          // on the chain under the hidden key: reached by key, no direct call
+          const e: PrivateMember = out.get(nm.text) ?? { classId: -1, kind, isStatic };
+          if (ts.isGetAccessorDeclaration(m)) e.getter = -1;
+          if (ts.isSetAccessorDeclaration(m)) e.setter = -1;
+          if (kind !== "field" && !isStatic) e.brand = brand;
+          out.set(nm.text, e);
+        }
+      }
       for (const [classId, cn] of this.classNodeOfId) {
         const brand = privateBrand(cn);
         for (const m of cn.members) {
@@ -14027,6 +14341,7 @@ class Exporter {
       ctx.body.push({ kind: "Const", dst: u, value: { kind: "Undef" } });
       return u;
     }
+    if (m.classId < 0) return field();
     if (m.kind === "accessor" && !m.isStatic) {
       const dst = this.newLocal(ctx, this.refKindOf(access));
       ctx.body.push({ kind: "Call", dst, recv, callee: { kind: "Direct", func: m.getter! }, args: [] });
@@ -14048,7 +14363,7 @@ class Exporter {
       this.checkPrivate(ctx, access.expression, recv, m, text);
       if (m.kind === "method") { this.emitThrowTypeError(ctx, access, `Private method '${privateDisplayName(text)}' is not writable`); return; }
       if (m.kind === "accessor" && m.setter === undefined) { this.emitThrowTypeError(ctx, access, `'${privateDisplayName(text)}' was defined without a setter`); return; }
-      if (m.kind === "accessor" && !m.isStatic) {
+      if (m.kind === "accessor" && !m.isStatic && m.classId >= 0) {
         ctx.body.push({ kind: "Call", dst: this.newLocal(ctx, "reference"), recv, callee: { kind: "Direct", func: m.setter! }, args: [rhs] });
         return;
       }
@@ -14283,6 +14598,7 @@ class Exporter {
   }
   /** The object literal's member a function belongs to for `super`: itself or, past arrows, the method around it. */
   private objectSuperOwner(node: ts.Node): boolean {
+    if (ts.isConstructorDeclaration(node) && node.parent && dynamicClasses.has(node.parent)) return true;   // its initializers' too
     if (!this.usesSuper(node)) return false;
     let p: ts.Node = node;
     while (ts.isArrowFunction(p)) {
@@ -14291,7 +14607,10 @@ class Exporter {
       if (!up) return false;
       p = up;
     }
-    return (ts.isMethodDeclaration(p) || ts.isGetAccessorDeclaration(p) || ts.isSetAccessorDeclaration(p)) && !!p.parent && ts.isObjectLiteralExpression(p.parent);
+    if (ts.isClassLike(p)) return dynamicClasses.has(p);   // an arrow in a dynamic class's field initializer
+    if (ts.isConstructorDeclaration(p)) return !!p.parent && dynamicClasses.has(p.parent);
+    return (ts.isMethodDeclaration(p) || ts.isGetAccessorDeclaration(p) || ts.isSetAccessorDeclaration(p)) && !!p.parent &&
+      (ts.isObjectLiteralExpression(p.parent) || dynamicClasses.has(p.parent));
   }
   /** `super.x`, `super[k]`, `super.m(...)` in an object literal's method: the home object's prototype,
    *  the read and the call on `this`. undefined for any other expression. */
@@ -14715,6 +15034,11 @@ class Exporter {
       }
     } else if (ts.isExpressionStatement(stmt)) {
       this.lowerExpr(ctx, stmt.expression);
+    } else if (ts.isReturnStatement(stmt) && ctx.dynCtor) {
+      let v: number;
+      if (stmt.expression) v = this.lowerExpr(ctx, stmt.expression);
+      else { v = this.newLocal(ctx, "reference"); ctx.body.push({ kind: "Const", dst: v, value: { kind: "Undef" } }); }
+      this.emitDynamicReturn(ctx, v);
     } else if (ts.isReturnStatement(stmt)) {
       if (stmt.expression) {
         let src=this.lowerExpr(ctx, stmt.expression);
@@ -15296,14 +15620,13 @@ class Exporter {
       // the stored binding, preserving constructor identity (`C === C`).
       const csym = stmt.name ? this.symbolOf(stmt.name) : undefined;
       const cid = csym ? this.classSymToId.get(csym) : undefined;
-      if (cid === undefined && stmt.name && csym) {
-        // `class D extends Parent {}` over a runtime value: a derived constructor bound like a const
-        const base = dynamicBaseEmptyClass(stmt, this.checker);
-        if (base) {
-          const v = this.lowerDynamicDerivedClass(ctx, base, stmt.name.text);
-          if (this.hasCaptured(ctx, csym)) this.storeCaptured(ctx, csym, v); else this.ensureLocalAlias(ctx, csym, v);
-          return;
-        }
+      if (dynamicClasses.has(stmt)) {
+        // a value made here, bound like a const before its static members run
+        this.lowerDynamicClass(ctx, stmt, (v) => {
+          if (csym) { if (this.hasCaptured(ctx, csym)) this.storeCaptured(ctx, csym, v); else this.ensureLocalAlias(ctx, csym, v); }
+          else this.bindDefaultExport(ctx, stmt, v);
+        });
+        return;
       }
       let classValue: ClassValueEmit | undefined;
       if (stmt.name && csym && cid !== undefined) {
@@ -15816,6 +16139,9 @@ class Exporter {
     else { emitThis(); }                            // [this] (no cells)
     ctx.captureCount = hasCaptures ? captureSlots.length + (arrowThis ? 1 : 0) + (arrowArguments ? 1 : 0) + (objectHome ? 1 : 0) : 0;
     if (!ts.isArrowFunction(node)) ctx.argumentsOffset = ctx.params.length;
+    const dynClass = ts.isConstructorDeclaration(node as ts.Node) && (node as ts.Node).parent && dynamicClasses.has((node as ts.Node).parent)
+      ? (node as ts.Node).parent as ts.ClassLikeDeclaration : undefined;
+    if (dynClass) this.emitDynamicCtorEntry(ctx, dynClass);
     // 2. real parameters
     const parameterBindings: { node: ts.ParameterDeclaration; local: number }[] = [];
     for (const p of node.parameters) {
@@ -15828,12 +16154,12 @@ class Exporter {
         if (ps && this.callbackSubst.has(ps)) continue;
       }
       if (p.dotDotDotToken) {
-        // rest parameter: a normal local that the callee fills with an array of
-        // the surplus args. Must be a simple identifier (no destructured rest).
-        if (!ts.isIdentifier(p.name)) { this.unsupported(p, "destructured rest parameter"); continue; }
-        const psym = this.symbolOf(p.name);
-        const lid = psym ? this.ensureLocal(ctx, psym, "reference", p.name.text)
-                         : this.newLocal(ctx, "reference", p.name.text);
+        // rest parameter: a normal local that the callee fills with an array of the surplus args;
+        // a pattern (`...[a, b]`) binds from it with the other parameters, below.
+        const psym = ts.isIdentifier(p.name) ? this.symbolOf(p.name) : undefined;
+        const restName = ts.isIdentifier(p.name) ? p.name.text : "rest";
+        const lid = psym ? this.ensureLocal(ctx, psym, "reference", restName)
+                         : this.newLocal(ctx, "reference", restName);
         ctx.params.push(lid);
         ctx.restParam = lid;
         parameterBindings.push({ node: p, local: lid });
@@ -15954,8 +16280,14 @@ class Exporter {
     // uninitialized, and a field the base constructor sets is overwritten by the
     // derived initializer, not the other way round (a derived `get [Symbol.toStringTag]`
     // installed before super() was replaced by the base's).
-    if (ts.isConstructorDeclaration(node as ts.Node) && ctx.thisLocal !== undefined) {
+    if (dynClass) {
+      if (ctx.dynCtor!.derived) {
+        // the default constructor of a derived class: super(...arguments)
+        if (this.synthDynamicCtors.has(node as unknown as ts.ConstructorDeclaration)) this.emitDynamicSuper(ctx, this.dynamicAllArguments(ctx));
+      } else this.emitDynamicInits(ctx);
+    } else if (ts.isConstructorDeclaration(node as ts.Node) && ctx.thisLocal !== undefined) {
       const ctor = node as unknown as ts.ConstructorDeclaration;
+      ctx.thisBeforeSuper = ctx.currentClass !== undefined && this.classIsDerived(ctx.currentClass);
       if (ctx.currentClass !== undefined && this.classIsDerived(ctx.currentClass) && this.ctorHasInits(ctx.currentClass, ctor)) {
         ctx.deferredCtorInits = { classId: ctx.currentClass, thisLocal: ctx.thisLocal, ctor, emitted: false };
       } else {
@@ -16011,7 +16343,13 @@ class Exporter {
         // whose explicit returns are all numeric but whose end is reachable
         // must not get a numeric direct-call clone (it would read the
         // fall-through as 0).
-        if (this.statementsCompleteNormally(node.body.statements)) ctx.body.push({ kind: "Return" });
+        if (this.statementsCompleteNormally(node.body.statements)) {
+          if (ctx.dynCtor) {
+            const u = this.newLocal(ctx, "reference");
+            ctx.body.push({ kind: "Const", dst: u, value: { kind: "Undef" } });
+            this.emitDynamicReturn(ctx, u);
+          } else ctx.body.push({ kind: "Return" });
+        }
       } else ctx.body.push({ kind: "Return", src: this.lowerExpr(ctx, node.body) });
     }
 
@@ -16027,6 +16365,8 @@ class Exporter {
     let displayName = ctx.name;
     if (ts.isArrowFunction(node) || (ts.isFunctionExpression(node) && !node.name)) {
       displayName = this.namedEvaluationName(node as ts.Node) ?? "";
+    } else if (dynClass) {
+      displayName = dynClass.name?.text ?? this.namedEvaluationName(dynClass) ?? (ts.isClassDeclaration(dynClass) ? "default" : "");
     } else if (ts.isFunctionDeclaration(node as ts.Node) && !(node as ts.FunctionDeclaration).name) {
       displayName = "default";   // `export default function () {}`
     } else if (ts.isMethodDeclaration(node as ts.Node) || ts.isGetAccessorDeclaration(node as ts.Node) ||
@@ -16453,19 +16793,8 @@ class Exporter {
           // base's fields and methods (silent wrong values). Reject it loudly.
           const reasons = this.classInfos[classId]?.reasons ?? [];
           const ext = n.heritageClauses?.find((h) => h.token === ts.SyntaxKind.ExtendsKeyword)?.types[0]?.expression;
-          if (ext && (ts.isLiteralExpression(ext) || ext.kind === ts.SyntaxKind.TrueKeyword || ext.kind === ts.SyntaxKind.FalseKeyword)) {
-            this.unsupported(ext, "class extends a value that is not a constructor (a TypeError at the definition)");
-          }
           if (ext && (reasons.includes("extends-non-identifier(mixin)") || reasons.includes("extends-value(unresolved)"))) {
-            this.unsupported(ext, "class extends an expression or a class-valued binding (only a class declaration or a library class is supported as a base)");
-          }
-          // A built-in base other than the Error classes (a typed array, Map, Array, Promise):
-          // the instance would be a plain object, not one of the base's kind (silent wrong values).
-          if (ext && ts.isIdentifier(ext) && this.classInfos[classId]?.parentId === undefined && !this.extendsBuiltinError(classId)) {
-            const bsym = this.symbolOf(ext);
-            if (bsym && this.isAmbientGlobalSymbol(bsym)) {
-              this.unsupported(ext, `class extends the built-in ${ext.text} (only the Error classes are supported as a built-in base; an instance would be a plain object, not a ${ext.text})`);
-            }
+            this.unsupported(ext, "class extends an expression the class analysis did not take for a dynamic class");
           }
           let hasStatic = false;
           for (const m of n.members) {
@@ -17238,8 +17567,11 @@ class Exporter {
       if (isLiftable(n) && (!ts.isFunctionDeclaration(n) || n.body)) allFns.push(n);
       // Object-literal method-shorthand and accessor members are lifted functions
       // whose captures need cells (incl. the defineProperty `{ get() {} }` case).
-      if ((ts.isMethodDeclaration(n) || ts.isGetAccessorDeclaration(n) || ts.isSetAccessorDeclaration(n)) &&
-          n.body && n.parent && ts.isObjectLiteralExpression(n.parent)) allFns.push(n as unknown as FnLike);
+      if (isObjLitFn(n)) allFns.push(n as unknown as FnLike);
+      if (ts.isClassLike(n) && dynamicClasses.has(n)) {
+        const ctor = this.dynamicCtorNode(n);
+        if (this.synthDynamicCtors.has(ctor)) allFns.push(ctor as unknown as FnLike);
+      }
       n.forEachChild(walk);
     };
     for (const m of this.modules) walk(m);
@@ -17553,7 +17885,7 @@ class Exporter {
     ];
     const booleanProtoMethods = booleanProtoSpec.map(([name, runtime]) => ({ name, runtime, methodId: this.internName(name) }));
     const regexpProtoSpec: [string, string][] = [
-      ["test","ts_regexpproto_test"],["exec","ts_regexpproto_exec"],
+      ["test","ts_regexpproto_test"],["exec","ts_regexpproto_exec"],["toString","ts_regexpproto_toString"],
     ];
     const regexpProtoMethods = regexpProtoSpec.map(([name, runtime]) => ({ name, runtime, methodId: this.internName(name) }));
     // Well-known symbol methods (§3.6): map the method-name id the exporter

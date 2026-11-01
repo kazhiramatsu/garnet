@@ -560,7 +560,7 @@ fn emit_program_with_string_plans(
             // a synthesized __module_init / anonymous fn has no JS name -> "".
             .filter(|n| !n.starts_with("__"))
             .unwrap_or("");
-        let _ = write!(s, "{:?}, ", nm);
+        let _ = write!(s, "{}, ", c_string_lit(nm));
     }
     s.push_str("};\n\n");
     let _ = write!(
@@ -596,7 +596,7 @@ fn emit_program_with_string_plans(
             .find(|c| c.id.0 == i)
             .and_then(|c| c.name.as_deref())
             .unwrap_or("");
-        let _ = write!(s, "{:?}, ", nm);
+        let _ = write!(s, "{}, ", c_string_lit(nm));
     }
     s.push_str("};\n\n");
     // Object.prototype: a shared prototype carrying the modeled Object.prototype
@@ -7271,7 +7271,6 @@ fn any_used_local_shallow(inst: &Inst, f: &mut impl FnMut(u32) -> bool) -> bool 
         | Inst::StoreMethod { src, .. } => f(src.0),
         Inst::LoadField { obj, .. }
         | Inst::LoadMethodValue { recv: obj, .. }
-        | Inst::NewDynamic { callee: obj, .. }
         | Inst::LoadElem { arr: obj, .. }
         | Inst::ArrayLen { arr: obj, .. }
         | Inst::StringLen { src: obj, .. }
@@ -7285,6 +7284,7 @@ fn any_used_local_shallow(inst: &Inst, f: &mut impl FnMut(u32) -> bool) -> bool 
         } => f(obj.0) || f(src.0),
         Inst::StoreFieldDynamic { obj, key, src } => f(obj.0) || f(key.0) || f(src.0),
         Inst::StoreIndex { arr, index, src, .. } => f(arr.0) || f(index.0) || f(src.0),
+        Inst::NewDynamic { callee, args, .. } => f(callee.0) || args.iter().any(|a| f(a.0)),
         Inst::Call {
             callee, recv, args, ..
         } => {
@@ -13673,13 +13673,19 @@ fn emit_sm_resume_body(s: &mut String, f: &Function, ctx: &Ctx, mode: SmMode) {
                     (SmMode::Generator, Inst::Yield { dst, operand }) => {
                         let _ = writeln!(s, "  _fr->c.yielded = {};", ctx.val(operand.0));
                         let _ = writeln!(s, "  _fr->c.state = {};", cur_state);
+                        let delegate = is_delegate_yield(f, dst);
+                        // yield*: the inner result object, handed on as it stands
+                        if delegate { s.push_str("  _fr->c.yield_raw = 1;\n"); }
                         pop_if_active(s);
                         s.push_str("  return TS_UNDEFINED;\n");
                         let _ = writeln!(s, "  S{}: ;", cur_state);
                         // .throw(e) injected at this yield resumes by raising e here.
-                        throw_guard(s);
-                        if let Some(d) = dst {
-                            s.push_str(&ctx.set_val(d.0, "_fr->c.result"));
+                        // (a yield* forwards the completion instead: yield.resumeKind)
+                        if !delegate {
+                            throw_guard(s);
+                            if let Some(d) = dst {
+                                s.push_str(&ctx.set_val(d.0, "_fr->c.result"));
+                            }
                         }
                     }
                     (SmMode::AsyncGenerator, Inst::Yield { dst, operand }) => {
@@ -13697,11 +13703,13 @@ fn emit_sm_resume_body(s: &mut String, f: &Function, ctx: &Ctx, mode: SmMode) {
                         pop_if_active(s);
                         s.push_str("  return TS_UNDEFINED;\n");
                         let _ = writeln!(s, "  S{}: ;", cur_state);
-                        // .throw(e) injected at this yield resumes by raising e here.
-                        throw_guard(s);
-                        // value sent into the resuming .next(v) arrives in c->result.
-                        if let Some(d) = dst {
-                            s.push_str(&ctx.set_val(d.0, "_fr->c.result"));
+                        if !is_delegate_yield(f, dst) {
+                            // .throw(e) injected at this yield resumes by raising e here.
+                            throw_guard(s);
+                            // value sent into the resuming .next(v) arrives in c->result.
+                            if let Some(d) = dst {
+                                s.push_str(&ctx.set_val(d.0, "_fr->c.result"));
+                            }
                         }
                     }
                     _ => {
@@ -14149,6 +14157,12 @@ fn emit_async_function(s: &mut String, f: &Function, ctx: &Ctx) {
 /// (the exporter's `__initial_suspend`): its entry runs the body to that yield, so a default's
 /// effects and a pattern's throw happen at the call; the runtime still sees a generator that
 /// has not started.
+/// The yield of a `yield*` loop (the exporter's `__yield_delegate`): its resumption does not raise,
+/// the loop reads how it was resumed (`yield.resumeKind`, `yield.resumeValue`).
+fn is_delegate_yield(f: &Function, dst: &Option<LocalId>) -> bool {
+    dst.is_some_and(|d| f.locals.iter().any(|l| l.id.0 == d.0 && l.name.as_deref() == Some("__yield_delegate")))
+}
+
 fn initial_suspend_of(f: &Function) -> Option<u32> {
     f.locals.iter().find(|l| l.name.as_deref() == Some("__initial_suspend")).map(|l| l.id.0)
 }
@@ -14643,12 +14657,13 @@ fn fnval_adapter_body(builtin: &str) -> Option<String> {
         )),
         "global.Object" => Some("if(n==0 || a[0]==TS_UNDEFINED || a[0]==TS_NULL) return ts_new_object(); return ts_to_object(a[0]);".to_string()),
         "global.Promise" => Some("return ts_promise_new_executor(n>0 ? a[0] : TS_UNDEFINED);".to_string()),
-        "global.Map" => Some("ts_unsupported_builtin(\"Map constructor called without supported new lowering\"); return TS_UNDEFINED;".to_string()),
-        "global.Set" => Some("ts_unsupported_builtin(\"Set constructor called without supported new lowering\"); return TS_UNDEFINED;".to_string()),
-        "global.WeakMap" => Some("ts_unsupported_builtin(\"WeakMap constructor called without supported new lowering\"); return TS_UNDEFINED;".to_string()),
-        "global.WeakSet" => Some("ts_unsupported_builtin(\"WeakSet constructor called without supported new lowering\"); return TS_UNDEFINED;".to_string()),
-        "global.Date" => Some("ts_unsupported_builtin(\"Date constructor called as first-class value\"); return TS_UNDEFINED;".to_string()),
-        "global.Function" => Some("ts_unsupported_builtin(\"Function constructor\"); return TS_UNDEFINED;".to_string()),
+        "global.Map" => Some("return ts_ctor_collection(0, a, n);".to_string()),
+        "global.Set" => Some("return ts_ctor_collection(1, a, n);".to_string()),
+        "global.WeakMap" => Some("return ts_ctor_collection(2, a, n);".to_string()),
+        "global.WeakSet" => Some("return ts_ctor_collection(3, a, n);".to_string()),
+        "global.Date" => Some("return ts_ctor_date(a, n);".to_string()),
+        "global.RegExp" => hv(format!("ts_regexp_adapter_construct_tsv({}, {}, ts_native_new_take())", val(0), val(1))),
+        "global.Function" => Some("ts_throw_eval_error_msg(\"Code generation from strings is not available in a compiled program (Function)\"); return TS_UNDEFINED;".to_string()),
         "global.Error" | "global.TypeError" | "global.RangeError" | "global.SyntaxError" |
         "global.ReferenceError" | "global.EvalError" | "global.URIError" | "global.AggregateError" =>
             Some("tsv o=ts_new_object(); if(n>0) ts_set(o, ts_intern_field(\"message\",7), ts_to_string_v(a[0])); return o;".to_string()),
@@ -14681,7 +14696,7 @@ fn fnval_adapter_body(builtin: &str) -> Option<String> {
         "reflect.isExtensible" => hv(format!("ts_object_is_extensible({})", val(0))),
         "reflect.preventExtensions" => hv(format!("ts_reflect_prevent_extensions({})", val(0))),
         "reflect.apply" => hv(format!("ts_reflect_apply({}, {}, {})", val(0), val(1), val(2))),
-        "reflect.construct" => hv(format!("ts_reflect_construct({}, {})", val(0), val(1))),
+        "reflect.construct" => hv(format!("(n > 2 ? ts_reflect_construct_target({0}, {1}, a[2]) : ts_reflect_construct_target({0}, {1}, {0}))", val(0), val(1))),
         "object.getPrototypeOf" => hv(format!("ts_get_proto({})", val(0))),
         "object.setPrototypeOf" => hv(format!("{}({}, {})", user_set_proto_fn(), val(0), val(1))),
         "object.keys" => hv(format!("ts_object_keys({})", val(0))),
@@ -14999,6 +15014,17 @@ fn emit_global_setup(s: &mut String, needs_fetch: bool, needs_typed_array_global
             expr
         );
     }
+    /* a constant: not writable, not enumerable, not configurable */
+    fn set_const(s: &mut String, obj: &str, prop: &str, expr: &str) {
+        let _ = writeln!(
+            s,
+            "  ts_define_data({}, ts_intern_field({}, (uint32_t)strlen({})), {}, 0, 0, 0);",
+            obj,
+            cstr(prop),
+            cstr(prop),
+            expr
+        );
+    }
     fn root_local(s: &mut String, var: &str) {
         let _ = writeln!(s, "  ts_gc_root(&{});", var);
     }
@@ -15008,7 +15034,7 @@ fn emit_global_setup(s: &mut String, needs_fetch: bool, needs_typed_array_global
     }
 
     s.push_str("static tsv ts_make_global_fn(ts_code code, uint32_t arity, const char* name, int takes_this){\n");
-    s.push_str("  tsv f = ts_make_fn_t(code, 0, 0, takes_this);\n");
+    s.push_str("  tsv f = ts_builtin_fn_value(code, takes_this);\n");
     s.push_str("  ts_set_fn_meta(f, arity, name);\n");
     s.push_str("  return f;\n");
     s.push_str("}\n\n");
@@ -15017,9 +15043,10 @@ fn emit_global_setup(s: &mut String, needs_fetch: bool, needs_typed_array_global
     s.push_str("  ts_global_this_init();\n");
     s.push_str("  tsv _g = ts_global_this();\n");
     s.push_str("  ts_global_set(\"globalThis\", _g);\n");
-    s.push_str("  ts_global_set(\"undefined\", TS_UNDEFINED);\n");
-    s.push_str("  ts_global_set(\"NaN\", ts_num(0.0/0.0));\n");
-    s.push_str("  ts_global_set(\"Infinity\", ts_num(1.0/0.0));\n");
+    set_const(s, "_g", "undefined", "TS_UNDEFINED");
+    set_const(s, "_g", "NaN", "ts_num(0.0/0.0)");
+    set_const(s, "_g", "Infinity", "ts_num(1.0/0.0)");
+    set_const(s, "ts_string_proto()", "length", "ts_num(0.0)");
 
     s.push_str("  tsv _Object = ts_make_global_fn(ts_fnval_global_Object, 1u, \"Object\", 0);\n");
     root_local(s, "_Object");
@@ -15114,6 +15141,7 @@ fn emit_global_setup(s: &mut String, needs_fetch: bool, needs_typed_array_global
 
     s.push_str("  tsv _Array = ts_make_global_fn(ts_fnval_global_Array, 1u, \"Array\", 0);\n");
     root_local(s, "_Array");
+    s.push_str("  ts_fn_mark_native_ctor(_Array);\n");
     set_val(s, "_Array", "prototype", "ts_array_proto()");
     set_val(s, "ts_array_proto()", "constructor", "_Array");
     set_fn(s, "_Array", "isArray", "array.isArray", 1, "isArray");
@@ -15125,6 +15153,7 @@ fn emit_global_setup(s: &mut String, needs_fetch: bool, needs_typed_array_global
         "  tsv _Promise = ts_make_global_fn(ts_fnval_global_Promise, 1u, \"Promise\", 0);\n",
     );
     root_local(s, "_Promise");
+    s.push_str("  ts_fn_mark_native_ctor(_Promise);\n");
     set_val(s, "_Promise", "prototype", "ts_promise_proto()");
     set_val(s, "ts_promise_proto()", "constructor", "_Promise");
     set_fn(s, "_Promise", "resolve", "promise.resolve", 1, "resolve");
@@ -15182,11 +15211,13 @@ fn emit_global_setup(s: &mut String, needs_fetch: bool, needs_typed_array_global
 
     s.push_str("  tsv _Map = ts_make_global_fn(ts_fnval_global_Map, 0u, \"Map\", 0);\n");
     root_local(s, "_Map");
+    s.push_str("  ts_fn_mark_native_ctor(_Map);\n");
     set_val(s, "_Map", "prototype", "ts_map_proto()");
     set_val(s, "ts_map_proto()", "constructor", "_Map");
     global_set_rooted(s, "Map", "_Map");
     s.push_str("  tsv _Set = ts_make_global_fn(ts_fnval_global_Set, 0u, \"Set\", 0);\n");
     root_local(s, "_Set");
+    s.push_str("  ts_fn_mark_native_ctor(_Set);\n");
     set_val(s, "_Set", "prototype", "ts_set_proto_obj()");
     set_val(s, "ts_set_proto_obj()", "constructor", "_Set");
     global_set_rooted(s, "Set", "_Set");
@@ -15194,6 +15225,7 @@ fn emit_global_setup(s: &mut String, needs_fetch: bool, needs_typed_array_global
         "  tsv _WeakMap = ts_make_global_fn(ts_fnval_global_WeakMap, 0u, \"WeakMap\", 0);\n",
     );
     root_local(s, "_WeakMap");
+    s.push_str("  ts_fn_mark_native_ctor(_WeakMap);\n");
     set_val(s, "_WeakMap", "prototype", "ts_weakmap_proto()");
     set_val(s, "ts_weakmap_proto()", "constructor", "_WeakMap");
     global_set_rooted(s, "WeakMap", "_WeakMap");
@@ -15201,6 +15233,7 @@ fn emit_global_setup(s: &mut String, needs_fetch: bool, needs_typed_array_global
         "  tsv _WeakSet = ts_make_global_fn(ts_fnval_global_WeakSet, 0u, \"WeakSet\", 0);\n",
     );
     root_local(s, "_WeakSet");
+    s.push_str("  ts_fn_mark_native_ctor(_WeakSet);\n");
     set_val(s, "_WeakSet", "prototype", "ts_weakset_proto_obj()");
     set_val(s, "ts_weakset_proto_obj()", "constructor", "_WeakSet");
     global_set_rooted(s, "WeakSet", "_WeakSet");
@@ -15270,9 +15303,14 @@ fn emit_global_setup(s: &mut String, needs_fetch: bool, needs_typed_array_global
         "MIN_SAFE_INTEGER",
         "ts_num(-9007199254740991.0)",
     );
-    set_val(s, "_Number", "MAX_VALUE", "ts_num(1.7976931348623157e308)");
-    set_val(s, "_Number", "MIN_VALUE", "ts_num(5e-324)");
-    set_val(s, "_Number", "EPSILON", "ts_num(2.220446049250313e-16)");
+    set_const(s, "_Number", "MAX_VALUE", "ts_num(1.7976931348623157e308)");
+    set_const(s, "_Number", "MIN_VALUE", "ts_num(5e-324)");
+    set_const(s, "_Number", "EPSILON", "ts_num(2.220446049250313e-16)");
+    set_const(s, "_Number", "NaN", "ts_num(0.0/0.0)");
+    set_const(s, "_Number", "POSITIVE_INFINITY", "ts_num(1.0/0.0)");
+    set_const(s, "_Number", "NEGATIVE_INFINITY", "ts_num(-1.0/0.0)");
+    set_const(s, "_Number", "MAX_SAFE_INTEGER", "ts_num(9007199254740991.0)");
+    set_const(s, "_Number", "MIN_SAFE_INTEGER", "ts_num(-9007199254740991.0)");
     global_set_rooted(s, "Number", "_Number");
 
     s.push_str(
@@ -15310,6 +15348,7 @@ fn emit_global_setup(s: &mut String, needs_fetch: bool, needs_typed_array_global
 
     s.push_str("  tsv _Date = ts_make_global_fn(ts_fnval_global_Date, 7u, \"Date\", 0);\n");
     root_local(s, "_Date");
+    s.push_str("  ts_fn_mark_native_ctor(_Date);\n");
     set_val(s, "_Date", "prototype", "ts_new_object()");
     // Object.prototype.toString.call(new Date()) is "[object Date]": the builtin tag, as the prototype's @@toStringTag
     s.push_str("  ts_define_data(ts_get(_Date, ts_intern_field(\"prototype\", 9)), TS_KEY_WKSYM(TS_WKSYM_TO_STRING_TAG), ts_new_string(\"Date\", 4), 0, 0, 1);\n");
@@ -15357,7 +15396,7 @@ fn emit_global_setup(s: &mut String, needs_fetch: bool, needs_typed_array_global
         ("SQRT2", "ts_num(1.41421356237309504880168872420969808)"),
         ("SQRT1_2", "ts_num(0.707106781186547524400844362104849039)"),
     ] {
-        set_val(s, "_Math", prop, expr);
+        set_const(s, "_Math", prop, expr);
     }
     for (prop, builtin, arity) in [
         ("sqrt", "math.sqrt", 1),
@@ -23686,6 +23725,10 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 let _ = writeln!(s, "  ts_throw_uninitialized({});", c_string_lit(name));
                 return;
             }
+            if let Some(msg) = builtin.strip_prefix("throw.reference:") {
+                let _ = writeln!(s, "  ts_throw_reference_error_msg({});", c_string_lit(msg));
+                return;
+            }
             if let Some(msg) = builtin.strip_prefix("throw.type:") {
                 let _ = writeln!(s, "  ts_throw_type_error_msg({});", c_string_lit(msg));
                 return;
@@ -24056,7 +24099,17 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 // Date static
                 "date.now" => ("ts_to_num(ts_date_now_ms())".to_string(), true),
                 "date.value_ms" => (format!("ts_date_value_ms({})", v(0)), true),
-                "class.extend_dyn" => (format!("ts_class_extend_dyn({}, {})", v(0), v(1)), false),
+                _ if builtin.starts_with("date.isInstance:") => (format!("ts_bool(ts_has_prop({}, {}u))", v(0), &builtin["date.isInstance:".len()..]), false),
+                "dynclass.define:0" => (format!("ts_dyn_class({}, TS_UNDEFINED, 0)", v(0)), false),
+                "dynclass.define:1" => (format!("ts_dyn_class({}, {}, 1)", v(0), v(1)), false),
+                _ if builtin.starts_with("dynclass.enter:") => (format!("ts_dyn_enter({})", c_string_lit(&builtin["dynclass.enter:".len()..])), false),
+                "dynclass.active" => ("ts_dyn_active()".to_string(), false),
+                "dynclass.this" => (format!("ts_dyn_this({})", v(0)), false),
+                "dynclass.thisCheck" => (format!("ts_dyn_this_check({})", v(0)), false),
+                "dynclass.super" => (format!("ts_dyn_super({}, {}, {})", v(0), v(1), v(2)), false),
+                "dynclass.bindCheck" => (format!("(ts_dyn_bind_check({}), TS_UNDEFINED)", v(0)), false),
+                "dynclass.result:0" => (format!("ts_dyn_result({}, {}, 0)", v(0), v(1)), false),
+                "dynclass.result:1" => (format!("ts_dyn_result({}, {}, 1)", v(0), v(1)), false),
                 "date.parse" => (format!("ts_date_parse_value({})", v(0)), true),
                 b if b.starts_with("date.utc:") => {
                     // Date.UTC(year, month, day=1, hours=0, minutes=0, seconds=0, ms=0): the missing components' defaults
@@ -24174,6 +24227,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 "reflect.preventExtensions" => (format!("ts_reflect_prevent_extensions({})", v(0)), false),
                 "reflect.apply" => (format!("ts_reflect_apply({}, {}, {})", v(0), v(1), v(2)), false),
                 "reflect.construct" => (format!("ts_reflect_construct({}, {})", v(0), v(1)), false),
+                "reflect.construct3" => (format!("ts_reflect_construct_target({}, {}, {})", v(0), v(1), v(2)), false),
                 "map.cursorNext" => (format!("ts_map_cursor_next({}, {}, {})", v(0), n(1), n(2)), true),
                 "map.cursorOrder" => (format!("ts_map_cursor_order({}, {})", v(0), n(1)), true),
                 "map.cursorKey" => (format!("ts_map_cursor_key({}, {})", v(0), n(1)), false),
@@ -24194,6 +24248,10 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     (format!("ts_iter_acquire({}, {})", v(0), async_first), false)
                 }
                 "iter.acquiredSync" => ("ts_bool(g_iter_acquired_sync)".to_string(), false),
+                "yield.resumeKind" => ("ts_num((double)ts_coro_resume_kind(ts_obj(&_fr->c)))".to_string(), false),
+                "yield.resumeValue" => ("_fr->c.result".to_string(), false),
+                "iter.invoke" => (format!("ts_iter_invoke({}, {}, {})", v(0), v(1), v(2)), false),
+                "iter.checkResult" => (format!("(ts_iter_check_result({}), TS_UNDEFINED)", v(0)), false),
                 "object.coercible" => (format!("ts_recv_coercible({})", v(0)), false),
                 "key.normalize" => (format!("ts_property_key_value({})", v(0)), false),
                 _ if builtin.starts_with("class.proto:") => (format!("CLASS_PROTO[{}]", &builtin["class.proto:".len()..]), false),
@@ -24943,6 +25001,12 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 }
                 "iter.stepWith" => (format!("ts_iter_step_with({}, {}, {})", r, v(0), v(1)), false),
                 "iter.stepFresh" => (format!("ts_iter_step_fresh({}, {}, {})", r, v(0), v(1)), false),
+                _ if builtin.starts_with("iter.getMethod:") => {
+                    let mut parts = builtin["iter.getMethod:".len()..].splitn(2, ':');
+                    let name = parts.next().unwrap_or("");
+                    let id: u32 = parts.next().unwrap_or("0").parse().unwrap_or(0);
+                    (format!("ts_iter_get_method({}, {}, {})", r, c_string_lit(name), method_key_str(id, ctx.wksym)), false)
+                }
                 _ if builtin.starts_with("iter.throw:") => {
                     let tid: u32 = builtin["iter.throw:".len()..].parse().unwrap_or(0);
                     (format!("ts_iter_throw({}, {}, {})", r, method_key_str(tid, ctx.wksym), v(0)), false)
@@ -25259,6 +25323,10 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             ));
         }
         Inst::LoadBuiltinFn { dst, builtin } => {
+            if builtin == "global.RegExp" {
+                s.push_str(&ctx.set_val(dst.0, &format!("ts_regexp_ctor_value({})", fnval_adapter_name(builtin))));
+                return;
+            }
             if builtin == "globalThis" {
                 s.push_str(&ctx.set_val(dst.0, "ts_global_this()"));
                 return;
@@ -25338,7 +25406,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             s.push_str(&ctx.set_val(
                 dst.0,
                 &format!(
-                    "ts_make_fn_t({}, 0, 0, {})",
+                    "ts_builtin_fn_value({}, {})",
                     fnval_adapter_name(builtin),
                     tt
                 ),
@@ -25615,7 +25683,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
         Inst::HasField { dst, obj, field } => {
             s.push_str(&ctx.set_val(
                 dst.0,
-                &format!("ts_bool(ts_has_prop({}, {}))", ctx.val(obj.0), field.0),
+                &format!("ts_bool(ts_has_prop_in({}, {}))", ctx.val(obj.0), field.0),
             ));
         }
         Inst::LoadFieldDynamic { dst, obj, key } => {

@@ -1964,7 +1964,11 @@ static tsv ts_new_proto_impl(int pretenured){
     : gc_alloc(sizeof(ts_object), TS_KIND_OBJECT);
   o->shape = TS_SHAPE_EMPTY;
   o->h.flags |= TS_HDR_IS_PROTO;   /* made to be a prototype (a class's, a builtin's, a function's) */
-  return ts_obj(o);
+  tsv v = ts_obj(o);
+  /* a plain function's prototype object inherits from Object.prototype; whoever makes one for another
+     chain relinks it */
+  if (ts_proto_ref(g_object_proto_v)){ o->proto = g_object_proto_v; ts_write_barrier(v, g_object_proto_v); }
+  return v;
 }
 tsv ts_new_proto(void){ return ts_new_proto_impl(0); }
 tsv ts_new_proto_pretenured(void){ return ts_new_proto_impl(1); }
@@ -3731,7 +3735,7 @@ static inline ts_object* ts_class_static_container(tsv v){
    coercion/iteration gates below — keeping the "is a class value object-like?"
    decision in one place so a future coercion path can't silently forget it.
    Outside these gates, ts_is_class_value is used only by instanceof. */
-static inline int ts_object_like(tsv v){ return ts_is_obj(v) || ts_is_class_value(v); }
+static inline int ts_object_like(tsv v){ return ts_is_obj(v) || ts_is_func(v); }
 /* An Object for the iteration protocol's checks: a function too, a Symbol's cell not. */
 static inline int ts_iter_object(tsv v){ return ts_is_callable(v) || (ts_object_like(v) && !ts_is_symbol(v)); }
 
@@ -3773,13 +3777,13 @@ tsv ts_object_create(tsv proto){
      only in sized instances), while a TYPED read of a declared field on it
      (`(Object.create(C.prototype) as C).m()`) still assumes the layout the
      cell lacks — an open hazard noted in docs/TODO.md (Session 350). */
-  tsv o = ts_new_proto();                 /* bare object: proto=NULL */
+  tsv o = ts_new_proto();
   if (ts_is_propbag(proto)){
     obj_mark_proto(proto);
     ((ts_object*)ts_ptr(o))->proto = proto;
     if (!(g_typed_slow & TS_TYPED_SLOW_ANY)) typed_slow_check_relink(o, proto);
-  }
-  return o;                               /* Object.create(null) keeps proto=NULL */
+  } else ((ts_object*)ts_ptr(o))->proto = TS_NULL;   /* Object.create(null) */
+  return o;
 }
 /* bit0=frozen, bit1=non-extensible, bit2=sealed. seal/freeze imply
    non-extensible; freeze implies sealed. See ts_set / ts_delete_prop guards. */
@@ -4128,7 +4132,7 @@ void ts_set(tsv obj, ts_key key, tsv val){
     fn_keys_init();
     if (key == g_fn_key_prototype && fn_has_own_prototype(f)){
       /* a class's prototype is not writable, nor a frozen function's */
-      if (ts_is_class_value(obj) || (ts_obj_integrity(&f->o) & 1u)){ ts_throw_readonly_write(obj, key); return; }
+      if (ts_is_class_value(obj) || f->dyn_class || (ts_obj_integrity(&f->o) & 1u)){ ts_throw_readonly_write(obj, key); return; }
       f->prototype_prop = val; f->ctor_pending = 0; f->proto_lazy = 0; ts_write_barrier(obj, val);
       return;
     }
@@ -5642,6 +5646,10 @@ void ts_regexp_proto_init(void){
 tsv ts_regexp_proto(void){
   return ts_proto_ref(g_regexp_proto_v) ? g_regexp_proto_v : TS_NULL;
 }
+tsv ts_regexpproto_toString(tsv* a, int n){
+  if (n < 1 || !ts_is_regexp(a[0])) ts_throw_type_error_msg("RegExp.prototype.toString requires that 'this' be a RegExp");
+  return ts_regexp_to_string(a[0]);
+}
 void ts_regexp_proto_register(ts_key method_key, const char* name, ts_code fn){
   if (!ts_proto_ref(g_regexp_proto_v)) ts_regexp_proto_init();
   ts_proto_register_method(g_regexp_proto_v, method_key, name, fn);
@@ -5709,15 +5717,17 @@ tsv ts_to_primitive(tsv v, int hint){
   ts_gc_root(&v);
   /* 1. Symbol.toPrimitive */
   tsv sp = ts_get(v, TS_KEY_WKSYM(TS_WKSYM_TO_PRIMITIVE));
+  if (!ts_is_undef(sp) && !ts_is_null(sp) && !ts_is_callable(sp)) ts_throw_type_error_msg("Symbol.toPrimitive is not a function");
   if (ts_is_callable(sp)){
     ts_gc_root(&sp);
     const char* h = hint==1 ? "string" : (hint==0 ? "number" : "default");
     tsv hs = ts_new_string(h, (uint32_t)strlen(h));
     ts_gc_root(&hs);
     tsv args[2]; args[0]=v; args[1]=hs;
-    tsv r = ts_call(sp, args, 2);
+    tsv r = ts_call_method(sp, args, 2);
     ts_gc_unroot(3);
-    return (ts_is_obj(r) && !ts_is_symbol(r)) ? ts_num(NAN) : r; /* spec: must be primitive */
+    if ((ts_is_obj(r) && !ts_is_symbol(r)) || ts_is_func(r)) ts_throw_type_error_msg("Cannot convert object to primitive value");
+    return r;
   }
   /* 2. ordered valueOf / toString. string hint -> toString first; number/default
      -> valueOf first. own object-literal method (FIELD key) shadows the
@@ -5731,13 +5741,14 @@ tsv ts_to_primitive(tsv v, int hint){
     tsv m = ts_prim_method(v, i==0?ffirst:fsecond, i==0?mfirst:msecond);
     if (ts_is_callable(m)){
       ts_gc_root(&m);
-      tsv r = ts_call(m, &v, 1);   /* this = v */
+      tsv r = ts_call_method(m, &v, 1);   /* this = v */
       ts_gc_unroot(1);
-      if (!ts_is_obj(r) || ts_is_symbol(r)){ ts_gc_unroot(1); return r; }
+      if ((!ts_is_obj(r) && !ts_is_func(r)) || ts_is_symbol(r)){ ts_gc_unroot(1); return r; }
     }
   }
   ts_gc_unroot(1);
-  return v;  /* no usable conversion; callers handle (NaN / [object Object]) */
+  ts_throw_type_error_msg("Cannot convert object to primitive value");
+  return v;
 }
 
 /* `s.toString()` / `s.valueOf()` on a receiver the program types as a string: the string itself; a
@@ -6397,8 +6408,8 @@ int ts_loose_eq(tsv a, tsv b){
   if (ts_is_num(a) && ts_is_str(b)) return ts_to_num(a)==ts_number_coerce(b);
   if (ts_is_str(a) && ts_is_num(b)) return ts_number_coerce(a)==ts_to_num(b);
   /* object <-> primitive: ToPrimitive(object) then re-compare */
-  if ((ts_object_like(a)&&!ts_is_symbol(a)) && (ts_is_num(b)||ts_is_str(b))){ ts_gc_root(&b); tsv p=ts_to_primitive(a,0); ts_gc_unroot(1); return ts_loose_eq(p,b); }
-  if ((ts_object_like(b)&&!ts_is_symbol(b)) && (ts_is_num(a)||ts_is_str(a))){ ts_gc_root(&a); tsv p=ts_to_primitive(b,0); ts_gc_unroot(1); return ts_loose_eq(a,p); }
+  if ((ts_object_like(a)&&!ts_is_symbol(a)) && (ts_is_num(b)||ts_is_str(b))){ ts_gc_root(&b); tsv p=ts_to_primitive(a,2); ts_gc_unroot(1); return ts_loose_eq(p,b); }
+  if ((ts_object_like(b)&&!ts_is_symbol(b)) && (ts_is_num(a)||ts_is_str(a))){ ts_gc_root(&a); tsv p=ts_to_primitive(b,2); ts_gc_unroot(1); return ts_loose_eq(a,p); }
   return 0;
 }
 /* Object.is(a,b): SameValue. Like ===, except NaN equals NaN and +0 != -0. */
@@ -10231,10 +10242,8 @@ double ts_number_coerce_slow(tsv v){
   if (ts_is_str(v)) return js_string_to_number_view(ts_str_view_typed(v));
   /* object: ToPrimitive(number) via Symbol.toPrimitive / valueOf / toString,
      then coerce the resulting primitive. (Symbols are not numerically coercible.) */
-  if (ts_object_like(v) && !ts_is_symbol(v)){
-    tsv p = ts_to_primitive(v, /*string_hint*/0);
-    if (!ts_is_obj(p)) return ts_number_coerce(p);
-  }
+  if (ts_is_symbol(v)) ts_throw_type_error_msg("Cannot convert a Symbol value to a number");
+  if (ts_object_like(v)) return ts_number_coerce(ts_to_primitive(v, /*string_hint*/0));
   return NAN;
 }
 /* parseInt/parseFloat (global). parseInt supports an optional radix. */
@@ -11174,53 +11183,6 @@ tsv ts_error_ctor_value(int kind){
   ts_gc_unroot(1);
   return g_error_ctor_values[kind];
 }
-/* `class D extends Parent {}` with Parent a runtime value (zod's `$constructor`): the derived default
-   constructor as a native constructor whose environment holds the parent and D's prototype object.
-   `new D(args)` constructs the parent with the arguments and gives the instance D's prototype (an Error
-   parent makes an error, a class parent its instance, a plain function its object); D.prototype's
-   prototype is the parent's, D's own [[Prototype]] is the parent (the statics), D.name the class's.
-   A call without `new` constructs too (a class constructor cannot be called in JS; no program does). */
-static tsv ts_derived_ctor_thunk(tsv* args, int n){
-  tsv parent = n > 0 ? args[0] : TS_UNDEFINED, proto = n > 1 ? args[1] : TS_UNDEFINED;   /* env: parent, prototype */
-  int argc = n > 2 ? n - 2 : 0;
-  ts_gc_root(&proto);
-  tsv inst = ts_construct(parent, argc ? args + 2 : NULL, argc);
-  if (ts_is_obj(inst) && ts_is_obj(proto)){
-    ts_set_proto(inst, proto);
-    /* a sized instance of a class parent now sits behind the derived prototype: its layout's
-       registration is found through its allocation class (the relinked word, as a program's own
-       Object.setPrototypeOf marks it), so its fields enumerate (JSON.stringify of a mixin's instance
-       gave `{}`). The typed-slow machinery is not raised: the typed code's direct accesses stay valid,
-       the instance is the parent's layout (docs/class_index_dispatch_design.md). */
-    ts_object* io = (ts_object*)ts_ptr(inst);
-    if (ts_obj_is_sized(io) && io->cls && io->cls != TS_CLS_PROTO) io->cls |= TS_CLS_RELINKED;
-  }
-  ts_gc_unroot(1);
-  return inst;
-}
-tsv ts_class_extend_dyn(tsv parent, tsv name){
-  if (!ts_is_func(parent)) ts_throw_type_error_msg("Class extends value is not a constructor or null");
-  ts_gc_root(&parent); ts_gc_root(&name);
-  static ts_key proto_key = 0xFFFFFFFFu;
-  if (proto_key == 0xFFFFFFFFu) proto_key = ts_intern_field("prototype", 9);
-  tsv pproto = ts_get(parent, proto_key);
-  ts_gc_root(&pproto);
-  tsv proto = ts_new_proto_pretenured();   /* a prototype lives as long as its constructor; the caches record old holders */
-  ts_gc_root(&proto);
-  if (ts_is_obj(pproto) || ts_is_null(pproto)) ts_set_proto(proto, pproto);   /* Object.create(Parent.prototype) */
-  tsv env[2] = { parent, proto };
-  tsv fn = ts_make_fn_t(ts_derived_ctor_thunk, env, 2, 0);
-  ts_gc_root(&fn);
-  if (ts_is_str(name) && ts_str_len_typed(name) > 0){
-    uint32_t len; char* nm = ts_string_utf8_copy(name, &len);   /* kept for the run, as a class's name is */
-    ts_set_fn_meta(fn, 0, nm);
-  } else ts_set_fn_meta(fn, 0, "");
-  ts_set_fn_prototype(fn, proto);
-  ((ts_func*)ts_ptr(fn))->native_ctor = 1;
-  ts_set_proto(fn, parent);
-  ts_gc_unroot(5);
-  return fn;
-}
 /* Construct an Error-family instance with the proper prototype. `msg` undefined
    leaves message inherited (""); otherwise an own `message` is set (ToString). */
 tsv ts_new_error(int kind, tsv msg){
@@ -11239,6 +11201,77 @@ tsv ts_new_error(int kind, tsv msg){
   }
   ts_gc_unroot(1);
   return e;
+}
+void ts_fn_mark_native_ctor(tsv fn){ ((ts_func*)ts_ptr(fn))->native_ctor = 1; }
+void ts_throw_reference_error_msg(const char* msg){ ts_throw(ts_new_error(TS_ERR_REFERENCE, ts_new_string(msg, (uint32_t)strlen(msg)))); }
+/* A built-in read as a value is one function, however often it is read and from wherever
+   (`Math.max === Math.max`, `arr.map(Math.sqrt)`, the global object's property). */
+typedef struct builtin_fn_entry { ts_code code; tsv value; int rooted; struct builtin_fn_entry* next; } builtin_fn_entry;
+tsv ts_builtin_fn_value(ts_code code, int takes_this){
+  static builtin_fn_entry* table[64];
+  uintptr_t h = (uintptr_t)code; h ^= h >> 7; h ^= h >> 15;
+  builtin_fn_entry** head = &table[h & 63u];
+  for (builtin_fn_entry* e = *head; e; e = e->next) if (e->code == code) return e->value;
+  builtin_fn_entry* e = (builtin_fn_entry*)calloc(1, sizeof *e);
+  e->code = code; e->value = TS_UNDEFINED; e->next = *head;
+  ts_root_static_once(&e->value, &e->rooted);
+  *head = e;
+  e->value = ts_make_fn_t(code, 0, 0, takes_this);
+  return e->value;
+}
+/* a built-in constructor's value: set around the call `new` makes of it */
+static int g_native_new = 0;
+int ts_native_new_take(void){ int v = g_native_new; g_native_new = 0; return v; }
+/* The Date function value: `new` makes what the typed form makes, a plain call is a string. */
+tsv ts_ctor_date(tsv* a, int n){
+  double ms;
+  if (!ts_native_new_take()) ms = ts_to_num(ts_date_now_ms());
+  else if (n == 0) ms = ts_to_num(ts_date_now_ms());
+  else if (n == 1) ms = ts_date_value_ms(a[0]);
+  else {
+    double c[7] = { 0, 0, 1, 0, 0, 0, 0 };
+    for (int i = 0; i < n && i < 7; i++) c[i] = ts_number_coerce(a[i]);
+    ms = ts_date_from_components(c[0], c[1], c[2], c[3], c[4], c[5], c[6]);
+  }
+  tsv o = ts_new_object();
+  ts_gc_root(&o);
+  ts_set(o, ts_intern_field("__date_ms", 9), ts_num(ms));
+  ts_gc_unroot(1);
+  return o;
+}
+/* RegExp as a value: one function for the run, made where a program names it (the engine is linked then) */
+tsv ts_regexp_ctor_value(ts_code adapter){
+  static tsv value = TS_UNDEFINED;
+  static int rooted = 0;
+  if (ts_is_func(value)) return value;
+  ts_root_static_once(&value, &rooted);
+  value = ts_make_fn_t(adapter, 0, 0, 0);
+  ts_set_fn_meta(value, 2u, "RegExp");
+  ts_fn_mark_native_ctor(value);
+  ts_define_data(value, ts_intern_field("prototype", 9), ts_regexp_proto(), 0, 0, 0);
+  ts_define_data(ts_regexp_proto(), ts_intern_field("constructor", 11), value, 0, 1, 1);
+  return value;
+}
+/* The function values of Map, Set, WeakMap and WeakSet: `new` constructs, a plain call is a TypeError. */
+tsv ts_ctor_collection(int kind, tsv* a, int n){
+  static const char* const names[] = { "Map", "Set", "WeakMap", "WeakSet" };
+  if (!g_native_new){
+    char buf[64];
+    snprintf(buf, sizeof buf, "Constructor %s requires 'new'", names[kind]);
+    ts_throw_type_error_msg(buf);
+  }
+  g_native_new = 0;
+  tsv src = n > 0 ? a[0] : TS_UNDEFINED;
+  ts_gc_root(&src);
+  tsv c = kind == 0 ? ts_new_map() : kind == 1 ? ts_new_set() : kind == 2 ? ts_new_weakmap() : ts_new_weakset();
+  if (!ts_is_undef(src) && !ts_is_null(src)){
+    ts_gc_root(&c);
+    if (kind == 0) ts_map_seed(c, src); else if (kind == 1) ts_set_seed(c, src);
+    else if (kind == 2) ts_weakmap_seed(c, src); else ts_weakset_seed(c, src);
+    ts_gc_unroot(1);
+  }
+  ts_gc_unroot(1);
+  return c;
 }
 /* The Error constructors' steps after the instance exists, for `new E(...)`, a constructor value's
    call and a subclass's `super(...)`: an own non-enumerable `message` unless the message is
@@ -13005,16 +13038,56 @@ tsv ts_make_class_value_cells_once(uint32_t class_id, ts_code ctor, tsv* env, ui
 #define TS_CONSTRUCT_ARGS_STACK 16
 static int primitive_ctor_construct(tsv ctor, tsv* args, int n, tsv* out);
 static tsv g_new_target = TS_UNDEFINED;
+static ts_code g_new_target_code = NULL;   /* the function g_new_target is meant for */
+/* What `new` hands a dynamic class's constructor (docs/dynamic_classes_design.md): new.target and the
+   active function, taken on entry; a plain call finds nothing. A `super(...)` sets the target. */
+static tsv g_dyn_new_target = TS_UNDEFINED, g_dyn_active = TS_UNDEFINED, g_construct_target = TS_UNDEFINED;
+/* the object a constructor made, behind new.target's prototype (Reflect.construct, a dynamic class's super) */
+static void construct_relink(tsv inst, tsv target){
+  if (!ts_is_obj(inst) && !ts_is_func(inst)) return;
+  ts_gc_root(&inst);
+  tsv proto = ts_get(target, ts_intern_field("prototype", 9));
+  if ((ts_is_obj(proto) || ts_is_func(proto)) && ts_get_proto(inst) != proto){
+    ts_set_proto(inst, proto);
+    /* a sized instance of a class behind another prototype: the layout's registration is found through
+       its allocation class, as for a program's own Object.setPrototypeOf */
+    if (ts_is_obj(inst)){
+      ts_object* io = (ts_object*)ts_ptr(inst);
+      if (ts_obj_is_sized(io) && io->cls && io->cls != TS_CLS_PROTO) io->cls |= TS_CLS_RELINKED;
+    }
+  }
+  ts_gc_unroot(1);
+}
+static inline void dyn_enter_note(tsv ctorv){
+  if (!((ts_func*)ts_ptr(ctorv))->dyn_class) return;
+  static int rooted[3];
+  ts_root_static_once(&g_dyn_new_target, &rooted[0]);
+  ts_root_static_once(&g_dyn_active, &rooted[1]);
+  ts_root_static_once(&g_construct_target, &rooted[2]);
+  g_dyn_new_target = ts_is_undef(g_construct_target) ? ctorv : g_construct_target;
+  g_construct_target = TS_UNDEFINED;
+  g_dyn_active = ctorv;
+}
 tsv ts_construct(tsv ctorv, tsv* args, int n){
   if (g_has_proxies && ts_is_proxy(ctorv)) return ts_proxy_construct(ctorv, args, n);
   if (!ts_is_func(ctorv)) ts_throw_type_error("value is not a constructor");
   uint32_t raw = ((ts_func*)ts_ptr(ctorv))->class_id;
   if (raw == 0){
     if (TS_RT_UNLIKELY(((ts_func*)ts_ptr(ctorv))->native_ctor)){
-      /* a runtime constructor (an Error kind's value, a derived class over a runtime base): the
-         code builds the instance itself from the arguments */
+      /* a runtime constructor (an Error kind's value, a built-in's, a dynamic class): the code builds
+         the instance itself from the arguments */
+      int dyn = ((ts_func*)ts_ptr(ctorv))->dyn_class;
+      tsv target = g_construct_target;
+      if (!dyn) g_construct_target = TS_UNDEFINED;
+      dyn_enter_note(ctorv);
+      ts_gc_root(&target);
+      g_native_new = 1;
       tsv r = ts_call(ctorv, args, n);
-      if (!ts_is_obj(r)) ts_throw_type_error("constructor returned a non-object");
+      g_native_new = 0;
+      if (!ts_is_obj(r) && !ts_is_func(r)) ts_throw_type_error("constructor returned a non-object");
+      /* a built-in under another new.target: its instance, behind that target's prototype */
+      if (!dyn && !ts_is_undef(target)) construct_relink(r, target);
+      ts_gc_unroot(1);
       return r;
     }
     /* A plain function used as a constructor (`new fn()`): allocate an ordinary
@@ -13025,7 +13098,12 @@ tsv ts_construct(tsv ctorv, tsv* args, int n){
        arrows/methods/async/generators/builtins throw V8's catchable TypeError. */
     if (!((ts_func*)ts_ptr(ctorv))->constructable){
       tsv wrapped;
-      if (primitive_ctor_construct(ctorv, args, n, &wrapped)) return wrapped;
+      if (primitive_ctor_construct(ctorv, args, n, &wrapped)){
+        tsv target = g_construct_target;
+        g_construct_target = TS_UNDEFINED;
+        if (!ts_is_undef(target)) construct_relink(wrapped, target);
+        return wrapped;
+      }
       const char* nm = ((ts_func*)ts_ptr(ctorv))->name;
       char buf[192];
       snprintf(buf, sizeof(buf), "%s is not a constructor", (nm && nm[0]) ? nm : "value");
@@ -13034,6 +13112,14 @@ tsv ts_construct(tsv ctorv, tsv* args, int n){
     ts_gc_root(&ctorv);
     fn_materialize_prototype((ts_func*)ts_ptr(ctorv), ctorv);
     tsv proto = ((ts_func*)ts_ptr(ctorv))->prototype_prop;
+    tsv target = g_construct_target;
+    g_construct_target = TS_UNDEFINED;
+    if (!ts_is_undef(target)){
+      ts_gc_root(&target);
+      tsv tp = ts_get(target, ts_intern_field("prototype", 9));
+      ts_gc_unroot(1);
+      if (ts_is_obj(tp) || ts_is_func(tp)) proto = tp;
+    }
     /* In-object slack tracking: the first instance gets a generous inline
        area; afterwards the learned count (largest instance so far plus a
        little slack) sizes the allocation. */
@@ -13041,7 +13127,8 @@ tsv ts_construct(tsv ctorv, tsv* args, int n){
     tsv inst = ts_new_object_n(est ? est : 12u);
     ts_gc_root(&inst);
     ((ts_object*)ts_ptr(inst))->proto = ts_is_obj(proto) ? proto : ts_object_proto();
-    g_new_target = ctorv;
+    g_new_target = ts_is_undef(target) ? ctorv : target;
+    g_new_target_code = ((ts_func*)ts_ptr(ctorv))->code;
     int pm = n + 1;
     tsv pstack[TS_CONSTRUCT_ARGS_STACK];
     tsv* pcallargs = pm <= TS_CONSTRUCT_ARGS_STACK
@@ -13050,7 +13137,8 @@ tsv ts_construct(tsv ctorv, tsv* args, int n){
                           (tsv*)malloc(sizeof(tsv) * (size_t)pm));
     pcallargs[0] = inst;
     for (int i = 0; i < n; i++) pcallargs[1 + i] = args[i];
-    tsv pr = ts_call(ctorv, pcallargs, pm);
+    /* a function that never reads `this` has no slot for it: its arguments start at 0 */
+    tsv pr = ((ts_func*)ts_ptr(ctorv))->takes_this ? ts_call(ctorv, pcallargs, pm) : ts_call(ctorv, args, n);
     if (pcallargs != pstack) free(pcallargs);
     {
       uint32_t used = obj_map_plain(((ts_object*)ts_ptr(inst)))->len + 4u;
@@ -13059,7 +13147,7 @@ tsv ts_construct(tsv ctorv, tsv* args, int n){
       if (used > cf->inst_slots) cf->inst_slots = (uint8_t)used;
     }
     ts_gc_unroot(2);
-    return ts_is_obj(pr) ? pr : inst;
+    return ts_is_obj(pr) || ts_is_func(pr) ? pr : inst;
   }
   uint32_t cid = raw - 1;
   if (cid >= g_class_meta_cap || g_class_size[cid] == 0){ fprintf(stderr, "tsaot: TypeError: unregistered class in new\n"); abort(); }
@@ -13079,8 +13167,21 @@ tsv ts_construct(tsv ctorv, tsv* args, int n){
     inst = ts_new_sized(g_class_nfields[cid] ? g_class_size[cid] : sizeof(ts_sized_head));
   }
   tsv proto = ((ts_func*)ts_ptr(ctorv))->prototype_prop;
+  tsv target = g_construct_target;
+  g_construct_target = TS_UNDEFINED;
+  int retargeted = 0;
+  if (!ts_is_undef(target)){
+    ts_gc_root(&inst);
+    tsv tp = ts_get(target, ts_intern_field("prototype", 9));
+    ts_gc_unroot(1);
+    if ((ts_is_obj(tp) || ts_is_func(tp)) && tp != proto){ proto = tp; retargeted = 1; }
+  }
   ((ts_object*)ts_ptr(inst))->proto = ts_is_obj(proto) ? proto : g_class_proto_tab[cid];
-  if (cid < g_class_index_n){ ((ts_object*)ts_ptr(inst))->cls = g_class_index_tab[cid]; ts_instance_of_evaluation(inst); }
+  if (cid < g_class_index_n){
+    ((ts_object*)ts_ptr(inst))->cls = g_class_index_tab[cid];
+    ts_instance_of_evaluation(inst);
+    if (retargeted && ts_obj_is_sized((ts_object*)ts_ptr(inst))) ((ts_object*)ts_ptr(inst))->cls |= TS_CLS_RELINKED;
+  }
   /* Boxed fields start as undefined and numeric ones at zero (a young
      instance's run is not zeroed, docs/alloc_inline_design.md); generated
      allocation sites do the same inline. */
@@ -15206,6 +15307,7 @@ static int fn_delete(tsv obj, ts_key key, int strict){
 }
 int ts_delete_prop(tsv obj, ts_key key){
   if (TS_RT_UNLIKELY(obj == g_array_proto_v) && key == TS_KEY_WKSYM(TS_WKSYM_ITERATOR)) g_array_iter_patched = 1;
+  if (ts_is_null(obj) || ts_is_undef(obj)) ts_throw_type_error_msg("Cannot convert undefined or null to object");
   if (ts_is_obj(obj)){ ts_gc_header* _dh = (ts_gc_header*)ts_ptr(obj); if (_dh->gen == TS_GEN_OLD) gc_cards_all(_dh); }
   if (g_has_proxies && ts_is_proxy(obj)) return ts_proxy_delete_v(obj, ts_key_to_value(key));
   if (ts_is_func(obj)) return fn_delete(obj, key, 0);
@@ -15318,7 +15420,7 @@ static tsv ts_own_descriptor_by_key(tsv obj, ts_key key){
     }
     if (nm && field_bytes_is(nm, nm_len, "prototype") && fn_has_own_prototype(f)){
       f = fn_materialize_prototype(f, obj);
-      return build_data_descriptor(f->prototype_prop, ts_is_class_value(obj) ? 0 : 1, 0, 0);
+      return build_data_descriptor(f->prototype_prop, ts_is_class_value(obj) || f->dyn_class ? 0 : 1, 0, 0);
     }
   }
   ts_object* o = ts_ptr(obj);
@@ -15669,8 +15771,14 @@ void ts_define_properties(tsv obj, tsv descs){
   ts_gc_unroot(2);
 }
 
+static void in_operand_check(tsv obj){
+  if (TS_RT_LIKELY((ts_is_obj(obj) && !ts_is_symbol(obj)) || ts_is_func(obj))) return;
+  ts_throw_type_error_msg("Cannot use 'in' operator to search for a key in a value that is not an object");
+}
+int ts_has_prop_in(tsv obj, ts_key key){ in_operand_check(obj); return ts_has_prop(obj, key); }
 /* `keyStr in obj` with a runtime string key (interns to a field id first). */
 int ts_has_prop_dyn(tsv obj, tsv keyv){
+  in_operand_check(obj);
   if (g_has_proxies && ts_is_proxy(obj)) return ts_proxy_has_v(obj, keyv);
   /* numeric key on an array: direct bounds check (`0 in arr`). */
   if (ts_is_indexed_array_fast(obj) && ts_is_num(keyv)){
@@ -15738,43 +15846,8 @@ int ts_has_own_dyn(tsv obj, tsv keyv){
 }
 
 /* ---- Object.prototype methods (this = args[0]) ---- */
-/* o.toString(): plain objects -> "[object Object]"; arrays -> elements joined by
-   "," (Array.prototype.toString). Mirrors the common JS cases. */
-tsv ts_objproto_toString(tsv* args, int n){
-  tsv self = (n>0) ? args[0] : TS_UNDEFINED;
-  if (ts_is_indexed_array_fast(self)) return ts_array_join(self, ts_new_string(",",1));
-  if (ts_is_regexp(self)){
-    tsv r = ts_regexp_to_string(self);
-    if (ts_is_str(r)) return r;
-  }
-  /* Symbol.toStringTag: a string-valued [Symbol.toStringTag] replaces the default
-     "Object" tag (ES2015), so Object.prototype.toString -> "[object <tag>]". This
-     also reaches String(o) / `${o}` / o.toString() via ts_to_primitive's toString.
-     self/tag stay rooted and tag bytes are copied into a local buffer before
-     the single result allocation, so moving minor cannot stale the raw data. */
-  if (ts_is_obj(self)){
-    ts_gc_root(&self);
-    tsv tag = ts_get(self, TS_KEY_WKSYM(TS_WKSYM_TO_STRING_TAG));
-    if (ts_is_str(tag)){
-      ts_gc_root(&tag);
-      uint32_t tag_len = 0;
-      char* tag_utf8 = ts_string_cstr_copy(tag, &tag_len);
-      uint32_t len = 8u + tag_len + 1u;          /* "[object " (8) + tag + "]" (1) */
-      char* buf = malloc(len);
-      memcpy(buf, "[object ", 8);
-      memcpy(buf + 8, tag_utf8, tag_len);
-      buf[8u + tag_len] = ']';
-      tsv r = ts_new_string(buf, len);
-      free(tag_utf8);
-      free(buf);
-      ts_gc_unroot(1);
-      ts_gc_unroot(1);
-      return r;
-    }
-    ts_gc_unroot(1);
-  }
-  return ts_objproto_tostring_call(self);   /* the builtin tag (a Map, a Set, an Error, a Date, a Proxy of an array) */
-}
+tsv ts_objproto_tostring_call(tsv v);
+tsv ts_objproto_toString(tsv* args, int n){ return ts_objproto_tostring_call(n > 0 ? args[0] : TS_UNDEFINED); }
 /* Object.prototype.toString.call(x): the SPEC Object.prototype.toString applied to
    an arbitrary `this` — produces the internal [[Class]]-style tag, NOT x's own
    toString (so an array yields "[object Array]", not its join). A string-valued
@@ -17799,6 +17872,38 @@ static tsv ts_noop_fn(tsv* args, int n){ (void)args; (void)n; return TS_UNDEFINE
 /* Boxed with the FUNC selector (NOT ts_obj) so `typeof Function.prototype` is
    "function" and ts_get routes it through the function name/length path. */
 tsv ts_function_proto(void){ return ts_is_func(g_function_proto_v) ? g_function_proto_v : TS_NULL; }
+static tsv objproto_define_accessor(tsv* a, int n, const char* side){
+  if (n < 1 || ts_is_undef(a[0]) || ts_is_null(a[0])) ts_throw_type_error_msg("Cannot convert undefined or null to object");
+  tsv fn = n > 2 ? a[2] : TS_UNDEFINED;
+  if (!ts_is_callable(fn)) ts_throw_type_error_msg("Object.prototype.__defineGetter__: Expecting function");
+  tsv desc = ts_new_object();
+  ts_gc_root(&desc);
+  ts_set(desc, ts_intern_field(side, 3), fn);
+  ts_set(desc, ts_intern_field("enumerable", 10), ts_bool(1));
+  ts_set(desc, ts_intern_field("configurable", 12), ts_bool(1));
+  ts_define_property(a[0], n > 1 ? a[1] : TS_UNDEFINED, desc);
+  ts_gc_unroot(1);
+  return TS_UNDEFINED;
+}
+static tsv ts_objproto_define_getter(tsv* a, int n){ return objproto_define_accessor(a, n, "get"); }
+static tsv ts_objproto_define_setter(tsv* a, int n){ return objproto_define_accessor(a, n, "set"); }
+static tsv objproto_lookup_accessor(tsv* a, int n, const char* side){
+  if (n < 1 || ts_is_undef(a[0]) || ts_is_null(a[0])) ts_throw_type_error_msg("Cannot convert undefined or null to object");
+  tsv key = ts_property_key_value(n > 1 ? a[1] : TS_UNDEFINED);
+  ts_gc_root(&key);
+  for (tsv o = a[0]; ts_proto_ref(o); o = ts_get_proto(o)){
+    tsv d = ts_get_own_property_descriptor(o, key);
+    if (ts_is_obj(d)){
+      tsv r = ts_get(d, ts_intern_field(side, 3));
+      ts_gc_unroot(1);
+      return r;
+    }
+  }
+  ts_gc_unroot(1);
+  return TS_UNDEFINED;
+}
+static tsv ts_objproto_lookup_getter(tsv* a, int n){ return objproto_lookup_accessor(a, n, "get"); }
+static tsv ts_objproto_lookup_setter(tsv* a, int n){ return objproto_lookup_accessor(a, n, "set"); }
 static tsv ts_restricted_property(tsv* a, int n){
   (void)a; (void)n;
   ts_throw_type_error_msg("'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them");
@@ -17816,6 +17921,17 @@ void ts_function_proto_init(void){
   static int rooted = 0;
   ts_root_static_once(&g_function_proto_v, &rooted);
   ((ts_func*)ts_ptr(g_function_proto_v))->o.proto = g_object_proto_v;
+  /* Annex B: Object.prototype.__defineGetter__ and its three companions */
+  static const struct { const char* name; ts_code fn; } annexb[] = {
+    { "__defineGetter__", ts_objproto_define_getter }, { "__defineSetter__", ts_objproto_define_setter },
+    { "__lookupGetter__", ts_objproto_lookup_getter }, { "__lookupSetter__", ts_objproto_lookup_setter } };
+  for (size_t i = 0; i < sizeof annexb / sizeof annexb[0]; i++){
+    tsv f = ts_make_fn_t(annexb[i].fn, NULL, 0, 1);
+    ts_gc_root(&f);
+    ts_set_fn_meta(f, i < 2 ? 2 : 1, annexb[i].name);
+    if (ts_proto_ref(g_object_proto_v)) ts_define_data(g_object_proto_v, ts_intern_field(annexb[i].name, (uint32_t)strlen(annexb[i].name)), f, 0, 1, 1);
+    ts_gc_unroot(1);
+  }
   /* the two restricted properties: accessors that throw (%ThrowTypeError%) */
   tsv thrower = ts_make_fn_t(ts_restricted_property, NULL, 0, 1);
   ts_gc_root(&thrower);
@@ -17989,7 +18105,7 @@ tsv ts_new_target_of(tsv self){
 }
 tsv ts_take_new_target(ts_code code){
   tsv v = g_new_target;
-  if (v == TS_UNDEFINED || ((ts_func*)ts_ptr(v))->code != code) return TS_UNDEFINED;
+  if (v == TS_UNDEFINED || g_new_target_code != code) return TS_UNDEFINED;
   g_new_target = TS_UNDEFINED;
   return v;
 }
@@ -18019,6 +18135,10 @@ tsv ts_import_meta(uint32_t module, tsv path){
 /* ToPropertyKey as a value: a computed class member's key is taken once, at the definition. */
 tsv ts_property_key_value(tsv v){
   if (ts_is_str(v) || ts_is_symbol(v)) return v;
+  if (ts_object_like(v)){
+    v = ts_to_primitive(v, 1);
+    if (ts_is_str(v) || ts_is_symbol(v)) return v;
+  }
   ts_key key;
   return ts_key_from_value(v, &key) ? ts_key_to_value(key) : v;
 }
@@ -18070,6 +18190,90 @@ tsv ts_fn_name_from_key(tsv fn, tsv key, const char* prefix){
 }
 static tsv g_ctor_object = TS_UNDEFINED, g_ctor_number = TS_UNDEFINED, g_ctor_boolean = TS_UNDEFINED;
 void ts_register_primitive_ctors(tsv object, tsv number, tsv boolean){ g_ctor_object = object; g_ctor_number = number; g_ctor_boolean = boolean; }
+/* ---- dynamic classes (docs/dynamic_classes_design.md) ---- */
+static int ts_value_is_constructor(tsv v){
+  if (g_has_proxies && ts_is_proxy(v)) return ts_is_callable(v);
+  if (!ts_is_func(v)) return 0;
+  ts_func* f = (ts_func*)ts_ptr(v);
+  return f->class_id != 0 || f->constructable || f->native_ctor || v == g_ctor_object || v == g_ctor_number || v == g_ctor_boolean;
+}
+static void dyn_throw_named(const char* before, tsv v, const char* after){
+  ts_gc_root(&v);
+  tsv text = ts_is_symbol(v) ? ts_new_string("Symbol()", 8) : ts_to_string_v(v);
+  uint32_t n = 0; char* u = ts_string_cstr_copy(text, &n);
+  char buf[192];
+  snprintf(buf, sizeof buf, "%s%.100s%s", before, u, after);
+  free(u);
+  ts_gc_unroot(1);
+  ts_throw_type_error_msg(buf);
+}
+/* ClassDefinitionEvaluation's heritage: the prototype's parent and the constructor's. */
+tsv ts_dyn_class(tsv fn, tsv base, int has_base){
+  ts_gc_root(&fn); ts_gc_root(&base);
+  tsv pproto = ts_object_proto();
+  ts_gc_root(&pproto);
+  if (has_base){
+    if (ts_is_null(base)) pproto = TS_NULL;
+    else {
+      if (!ts_value_is_constructor(base)) dyn_throw_named("Class extends value ", base, " is not a constructor or null");
+      pproto = ts_get(base, ts_intern_field("prototype", 9));
+      if (!ts_is_obj(pproto) && !ts_is_func(pproto) && !ts_is_null(pproto)) dyn_throw_named("Class extends value does not have valid prototype property ", pproto, "");
+    }
+  }
+  tsv proto = ts_new_proto_pretenured();
+  ts_gc_root(&proto);
+  ts_set_proto(proto, pproto);
+  ts_set_fn_prototype(fn, proto);
+  ts_func* f = (ts_func*)ts_ptr(fn);
+  f->native_ctor = 1; f->dyn_class = 1; f->ctor_pending = 0;
+  ts_define_data(proto, fn_constructor_key(), fn, 0, 1, 1);
+  if (has_base && !ts_is_null(base)) ts_set_proto(fn, base);
+  ts_gc_unroot(4);
+  return proto;
+}
+tsv ts_dyn_enter(const char* name){
+  tsv nt = g_dyn_new_target;
+  g_dyn_new_target = TS_UNDEFINED;
+  if (ts_is_undef(nt)){
+    char buf[192];
+    snprintf(buf, sizeof buf, "Class constructor %.100s cannot be invoked without 'new'", name);
+    ts_throw_type_error_msg(buf);
+  }
+  return nt;
+}
+tsv ts_dyn_active(void){ tsv f = g_dyn_active; g_dyn_active = TS_UNDEFINED; return f; }
+/* OrdinaryCreateFromConstructor: a base class's `this` */
+tsv ts_dyn_this(tsv new_target){
+  tsv p = ts_get(new_target, ts_intern_field("prototype", 9));
+  return ts_object_create(ts_is_obj(p) || ts_is_func(p) ? p : ts_object_proto());
+}
+tsv ts_dyn_this_check(tsv self){
+  if (ts_is_undef(self)) ts_throw(ts_new_error(TS_ERR_REFERENCE, ts_new_string("Must call super constructor in derived class before accessing 'this' or returning from derived constructor", 106)));
+  return self;
+}
+void ts_dyn_bind_check(tsv self){
+  if (!ts_is_undef(self)) ts_throw(ts_new_error(TS_ERR_REFERENCE, ts_new_string("Super constructor may only be called once", 41)));
+}
+/* super(...): the parent constructs under the same new.target. A dynamic class makes its instance from
+   it; any other constructor makes its own, relinked to it afterwards. */
+tsv ts_dyn_super(tsv active, tsv new_target, tsv args){
+  ts_gc_root(&new_target);
+  tsv parent = ts_get_proto(active);
+  ts_gc_root(&parent);
+  if (!ts_value_is_constructor(parent)) ts_throw_type_error_msg("Super constructor is not a constructor");
+  g_construct_target = new_target;
+  tsv inst = ts_reflect_construct(parent, args);
+  ts_gc_root(&inst);
+  ts_gc_unroot(3);
+  return inst;
+}
+/* A constructor's completion: an object wins; a derived class's other value is a TypeError, and it has
+   to have called super(). */
+tsv ts_dyn_result(tsv v, tsv self, int derived){
+  if (ts_is_obj(v) || ts_is_func(v)) return v;
+  if (derived && !ts_is_undef(v)) ts_throw_type_error_msg("Derived constructors may only return object or undefined");
+  return ts_dyn_this_check(self);
+}
 /* `new` of Object, Number or Boolean: 1 and the object; their adapters are plain functions otherwise. */
 static int primitive_ctor_construct(tsv ctor, tsv* args, int n, tsv* out){
   tsv a = n > 0 ? args[0] : TS_UNDEFINED;
@@ -19608,6 +19812,14 @@ tsv ts_construct_end(tsv ctorv, tsv inst, tsv result){
   if (used > cf->inst_slots) cf->inst_slots = (uint8_t)used;
   return ts_is_obj(result) ? result : inst;
 }
+/* Reflect.construct with a newTarget */
+tsv ts_reflect_construct_target(tsv fn, tsv argsArray, tsv target){
+  if (!ts_value_is_constructor(fn)) ts_throw_type_error_msg("target is not a constructor");
+  if (!ts_value_is_constructor(target)) ts_throw_type_error_msg("newTarget is not a constructor");
+  if (!ts_object_like(argsArray) || ts_is_symbol(argsArray)) ts_throw_type_error_msg("CreateListFromArrayLike called on non-object");
+  if (target != fn) g_construct_target = target;
+  return ts_reflect_construct(fn, argsArray);
+}
 tsv ts_reflect_construct(tsv fn, tsv argsArray){
   if (!ts_is_indexed_array_fast(argsArray)) return ts_construct(fn, NULL, 0);
   ts_gc_root(&fn); ts_gc_root(&argsArray);
@@ -20052,7 +20264,12 @@ static int chain_exotic_set(ts_object* p, ts_key key, tsv receiver, tsv val, ts_
 static tsv chain_exotic_proto(tsv link){
   uint8_t kind = ((ts_gc_header*)ts_ptr(link))->kind;
   if (kind == TS_KIND_PROXY) return ts_proxy_get_proto(link);
-  if (kind == TS_KIND_PROMISE) return ts_proto_ref(g_promise_proto_v) ? g_promise_proto_v : TS_NULL;
+  if (kind == TS_KIND_PROMISE){
+    /* a subclass's instance is relinked; any other promise has Promise.prototype */
+    tsv own = ((ts_promise*)ts_ptr(link))->o.proto;
+    if (ts_proto_ref(own)) return own;
+    return ts_proto_ref(g_promise_proto_v) ? g_promise_proto_v : TS_NULL;
+  }
   return TS_NULL;
 }
 static tsv ts_proxy_set_proto(tsv pv, tsv proto){
@@ -23787,8 +24004,11 @@ static tsv gen_next_into(tsv genobj, tsv sent, tsv result){
     ts_lit_store(result, 1, ts_bool(1));
   } else {
     c->gen_status=TS_GEN_SUSPENDED_YIELD;
-    ts_lit_store(result, 0, c->yielded);
-    ts_lit_store(result, 1, ts_bool(0));
+    if (c->yield_raw){ c->yield_raw = 0; result = c->yielded; }
+    else {
+      ts_lit_store(result, 0, c->yielded);
+      ts_lit_store(result, 1, ts_bool(0));
+    }
   }
   ts_gc_unroot(4);
   return result;
@@ -23865,8 +24085,11 @@ tsv ts_gen_throw(tsv genobj, tsv exc){
     ts_lit_store(result, 1, ts_bool(1));
   } else {
     c->gen_status=TS_GEN_SUSPENDED_YIELD;
-    ts_lit_store(result, 0, c->yielded);
-    ts_lit_store(result, 1, ts_bool(0));
+    if (c->yield_raw){ c->yield_raw = 0; result = c->yielded; }
+    else {
+      ts_lit_store(result, 0, c->yielded);
+      ts_lit_store(result, 1, ts_bool(0));
+    }
   }
   ts_gc_unroot(4);
   return result;
@@ -23920,8 +24143,11 @@ tsv ts_gen_return(tsv genobj, tsv val){
     ts_set(result,F_done,ts_bool(1));
   } else {
     c->gen_status=TS_GEN_SUSPENDED_YIELD;
-    ts_set(result,F_value,c->yielded);
-    ts_set(result,F_done,ts_bool(0));
+    if (c->yield_raw){ c->yield_raw = 0; result = c->yielded; }
+    else {
+      ts_set(result,F_value,c->yielded);
+      ts_set(result,F_done,ts_bool(0));
+    }
   }
   ts_gc_unroot(1);
   ts_gc_unroot(4);
@@ -23949,8 +24175,11 @@ tsv ts_iter_acquire(tsv v, int async){
   ts_gc_root(&v);
   tsv itf = TS_UNDEFINED;
   if (async) itf = ts_get(v, TS_KEY_WKSYM(TS_WKSYM_ASYNC_ITERATOR));
+  /* GetMethod: a method that is neither nullish nor callable is a TypeError, not a fallback */
+  if (!ts_is_undef(itf) && !ts_is_null(itf) && !ts_is_callable(itf)){ ts_gc_unroot(1); ts_throw_type_error_msg("Symbol.asyncIterator is not a function"); }
   int by_async = ts_is_callable(itf);
   if (!by_async) itf = ts_get(v, TS_KEY_WKSYM(TS_WKSYM_ITERATOR));
+  if (!by_async && !ts_is_undef(itf) && !ts_is_null(itf) && !ts_is_callable(itf)){ ts_gc_unroot(1); ts_throw_type_error_msg("Symbol.iterator is not a function"); }
   if (ts_is_callable(itf)){
     ts_gc_root(&itf);
     tsv a0 = v;
@@ -24009,6 +24238,42 @@ tsv ts_iter_close(tsv iter, ts_key rmk){
 
 /* A throw forwarded into a delegate of `yield*` over a value of no known type: its `throw`, found as
    ts_iter_next_method finds `next`; without one the delegate is closed and the throw is a TypeError. */
+/* GetMethod(iter, name): undefined when nullish, a TypeError when it is not callable. */
+tsv ts_iter_get_method(tsv iter, const char* name, ts_key mk){
+  ts_gc_root(&iter);
+  tsv m = ts_get(iter, ts_intern_field(name, (uint32_t)strlen(name)));
+  if ((ts_is_undef(m) || ts_is_null(m)) && !ts_is_proxy(iter)) m = ts_get(iter, mk);
+  ts_gc_unroot(1);
+  if (ts_is_undef(m) || ts_is_null(m)) return TS_UNDEFINED;
+  if (!ts_is_callable(m)){
+    char buf[96];
+    snprintf(buf, sizeof buf, "The iterator's '%s' is not a function", name);
+    ts_throw_type_error_msg(buf);
+  }
+  return m;
+}
+tsv ts_iter_invoke(tsv method, tsv iter, tsv arg){
+  tsv a[2] = { iter, arg };
+  ts_gc_root(&a[0]); ts_gc_root(&a[1]);
+  tsv r = ts_call_method(method, a, 2);
+  ts_gc_unroot(2);
+  return r;
+}
+void ts_iter_check_result(tsv r){
+  if (!ts_iter_object(r)) ts_throw_type_error_msg("Iterator result is not an object");
+}
+/* How a yield*'s yield was resumed: 0 next, 1 throw, 2 return (c->result then holds the value). */
+int ts_coro_resume_kind(tsv cv){
+  ts_coro* c = (ts_coro*)ts_ptr(cv);
+  if (!c->rejected) return 0;
+  c->rejected = 0;
+  if (!ts_is_gen_return_completion(c->result)) return 1;
+  tsv v = ts_gen_return_completion_value(c->result);
+  c = (ts_coro*)ts_ptr(cv);
+  c->result = v;
+  ts_write_barrier(cv, v);
+  return 2;
+}
 tsv ts_iter_throw(tsv iter, ts_key tmk, tsv exc){
   static ts_key k_throw;
   if (!k_throw) k_throw = ts_intern_field("throw", 5);

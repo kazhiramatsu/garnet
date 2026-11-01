@@ -1449,6 +1449,9 @@ typedef struct ts_func {
      `new fn(...)` calls the code with the arguments alone and takes the object it returns;
      no instance is allocated for it (ts_construct). */
   uint8_t native_ctor : 1;
+  /* 1: the constructor of a dynamic class (docs/dynamic_classes_design.md): `new` leaves new.target and
+     the active function for its entry; its `prototype` is read only. */
+  uint8_t dyn_class : 1;
   /* For a CLASS VALUE (a class used as a runtime value, `const K = C`): the
      class id PLUS ONE (0 = ordinary function/closure, not a constructor). `new K()`
      reads this via ts_construct. code holds the constructor cfunc; env holds the
@@ -1572,6 +1575,7 @@ void ts_string_proto_register(ts_key method_key, const char* name, ts_code fn);
    generated RegExp method wrappers live in emitted C so no-RegExp programs do not
    reference the optional QuickJS adapter. */
 tsv  ts_regexp_proto(void);
+tsv  ts_regexpproto_toString(tsv* a, int n);
 void ts_regexp_proto_init(void);
 void ts_regexp_proto_register(ts_key method_key, const char* name, ts_code fn);
 int  ts_regexp_is_object(tsv re);
@@ -1992,7 +1996,22 @@ double ts_date_from_components(double y,double mo,double d,double h,double mi,do
 double ts_date_component(double ms, int which);
 double ts_date_value_ms(tsv v);          /* new Date(value): a Date, an ISO or toString-shaped string, else ToNumber */
 tsv ts_error_ctor_value(int kind);     /* an Error kind as a constructor value (one per kind) */
-tsv ts_class_extend_dyn(tsv parent, tsv name);   /* `class D extends <value> {}`: a derived constructor */
+/* dynamic classes (docs/dynamic_classes_design.md) */
+tsv ts_dyn_class(tsv fn, tsv base, int has_base);   /* wires F and its prototype, answers the prototype */
+tsv ts_dyn_enter(const char* name);
+tsv ts_dyn_active(void);
+tsv ts_dyn_this(tsv new_target);
+tsv ts_dyn_this_check(tsv self);
+tsv ts_dyn_super(tsv active, tsv new_target, tsv args);
+void ts_dyn_bind_check(tsv self);
+tsv ts_dyn_result(tsv v, tsv self, int derived);
+void ts_fn_mark_native_ctor(tsv fn);
+void ts_throw_reference_error_msg(const char* msg);
+tsv ts_builtin_fn_value(ts_code code, int takes_this);   /* one function value per built-in */
+int ts_native_new_take(void);   /* a built-in constructor's value: was this call a `new`? */
+tsv ts_ctor_date(tsv* a, int n);
+tsv ts_regexp_ctor_value(ts_code adapter);
+tsv ts_ctor_collection(int kind, tsv* a, int n);
 double ts_date_parse_chars(const char* s, uint32_t len);
 double ts_date_parse_value(tsv v);        /* Date.parse */
 double ts_date_utc(double y, double mo, double d, double h, double mi, double s, double ms);   /* Date.UTC */
@@ -2066,6 +2085,8 @@ tsv    ts_reflect_prevent_extensions(tsv t);
 tsv    ts_reflect_own_keys(tsv t);
 tsv    ts_reflect_apply(tsv fn, tsv thisArg, tsv argsArray);
 tsv    ts_reflect_construct(tsv fn, tsv argsArray);
+tsv    ts_reflect_construct_target(tsv fn, tsv argsArray, tsv target);
+int    ts_has_prop_in(tsv obj, ts_key key);
 
 /* field-id <-> name table (seeded at startup by emitted FIELD_NAMES) */
 void        ts_init_fields(const char* const* names, const uint32_t* lens, uint32_t count);
@@ -2750,7 +2771,7 @@ static inline int ts_int32_exact(tsv v, int32_t* out){
   *out = i;
   return 1;
 }
-TS_RT_ALWAYS_INLINE void ts_instance_of_evaluation(tsv inst){
+static inline void ts_instance_of_evaluation(tsv inst){
   ts_object* o = (ts_object*)ts_ptr(inst);
   if (ts_is_obj(o->proto) && TS_RT_UNLIKELY(((ts_object*)ts_ptr(o->proto))->h.flags & TS_HDR_LATER_EVAL)) o->cls |= TS_CLS_RELINKED;
 }
@@ -3841,6 +3862,10 @@ tsv ts_forof_open_limit(tsv v, double limit);
 tsv ts_iter_next_method(tsv iter, ts_key nmk);
 tsv ts_iter_close(tsv iter, ts_key rmk);
 tsv ts_iter_throw(tsv iter, ts_key tmk, tsv exc);
+tsv ts_iter_get_method(tsv iter, const char* name, ts_key mk);
+tsv ts_iter_invoke(tsv method, tsv iter, tsv arg);
+void ts_iter_check_result(tsv r);
+int ts_coro_resume_kind(tsv cv);
 tsv ts_forof_next_slow(tsv it, tsv next_method);
 tsv ts_forof_skip_slow(tsv it, tsv next_method);
 /* An array needs no opening; the three tests of a pattern over one fold into one. */
@@ -4071,6 +4096,7 @@ typedef struct ts_coro {
   int nvals;                 /* tsv locals leading the frame, scanned precisely;
                                 -1 = scan the frame conservatively (ts_coro_alloc_v) */
   tsv yielded;               /* generator: value produced by the current yield */
+  int yield_raw;             /* generator: `yielded` is a yield*'s inner result object, handed on as it stands */
   tsv iter_result;           /* generator: the {value, done} the iteration drivers reuse (ts_iter_step_with) */
   int done;                  /* generator: 1 when the body has completed */
   int gen_status;            /* generator protocol lifecycle (TS_GEN_*) */
