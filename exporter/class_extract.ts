@@ -945,6 +945,14 @@ export class ClassExtractor {
     }
     return true;
   }
+  /** The libraries that spell out a builtin's protocol (the exporter compiles one in when the program's
+   *  code can tell it, lib/node/web). What they call is what the program handed them, with the receiver or
+   *  the thisArg the program gave: a method reaches them only through a read as a value, which pass 5 sees at
+   *  the program's site, or from the object it runs on (`value[Symbol.dispose]`). The objects they relink are
+   *  errors and wrappers, not instances of a class with struct fields. A miss stops at the raise point. */
+  private protocolLibrary(sf: ts.SourceFile): boolean {
+    return /[\\/]lib[\\/]node[\\/]web[\\/](species|disposable|promise_protocol|array_generic|regexp_protocol)\.ts$/.test(sf.fileName);
+  }
   private scanClosedReceivers(sf: ts.SourceFile): void {
     const checker = this.checker;
     const RELINK = new Set(["ObjectConstructor.setPrototypeOf", "ObjectConstructor.create", "Reflect.setPrototypeOf"]);
@@ -1341,8 +1349,8 @@ export class ClassExtractor {
     for (const sf of sfs) this.scanStability(sf);
     for (const sf of sfs) this.scanStructuralFlows(sf);
     this.closeStructuralFlows();
-    for (const sf of sfs) this.scanClosedReceivers(sf);
-    for (const sf of sfs) this.scanMethodEscapes(sf);
+    for (const sf of sfs) if (!this.protocolLibrary(sf)) this.scanClosedReceivers(sf);
+    for (const sf of sfs) if (!this.protocolLibrary(sf)) this.scanMethodEscapes(sf);
     if (this.methodEscapes.size > 0) {
       for (const b of this.deferredBorrows) this.openAt(b.node, `${b.what} (the program reads methods as values)`);
     }

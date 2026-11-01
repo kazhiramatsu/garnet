@@ -197,6 +197,36 @@ const ARRAY_GENERIC_TRIGGER = "__garnet_array_generic";
 const arrayGenericText = /\bArray\s*\.\s*prototype\b|\[\s*\]\s*\.\s*\w+\s*\.\s*(call|apply|bind)\b|\bObject\s*\.\s*prototype\s*\[|defineProperty\s*\(\s*Object\s*\.\s*prototype\b/;
 const PROMISE_PROTOCOL_TRIGGER = "__garnet_promise_protocol";
 const promiseProtocolText = /\bextends\s+Promise\b|defineProperty\s*\([^,]+,\s*["']constructor["']|\bPromise\s*\.\s*\w+\s*\.\s*(call|apply|bind)\b|\bPromise\s*\.\s*resolve\s*=[^=]|\bPromise\s*\.\s*prototype\b|\.\s*then\s*=[^=]|["']then["']|\bPromise\s*\.\s*try\b|\bPromise\s*\.\s*withResolvers\b|\bPromise\s*,/;
+/** A file's text as code, for the text triggers: no comments, and of the literals only the one-word strings
+ *  (`"then"` is how a program names a key). A sentence that mentions `extends Array` or `Symbol.dispose`, the
+ *  diagnostics of a compiler, says nothing about what the program does. */
+const codeTexts = new WeakMap<ts.SourceFile, string>();
+function codeText(f: ts.SourceFile): string {
+  let code = codeTexts.get(f);
+  if (code !== undefined) return code;
+  const K = ts.SyntaxKind;
+  const parts: string[] = [];
+  let at = 0;
+  const blank = (n: ts.Node): void => {
+    const start = n.getStart(f);
+    parts.push(f.text.slice(at, start), " ");
+    at = n.end;
+  };
+  const visit = (n: ts.Node): void => {
+    if (n.kind === K.StringLiteral || n.kind === K.NoSubstitutionTemplateLiteral) {
+      if (!/^\w+$/.test((n as ts.LiteralExpression).text)) blank(n);
+    } else if (n.kind === K.TemplateHead || n.kind === K.TemplateMiddle || n.kind === K.TemplateTail ||
+               n.kind === K.RegularExpressionLiteral || n.kind === K.JsxText) blank(n);
+    else n.forEachChild(visit);
+  };
+  visit(f);
+  parts.push(f.text.slice(at));
+  // what is left holds no string or regular expression, so `//` and `/*` start comments
+  code = parts.join("").replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, " ");
+  codeTexts.set(f, code);
+  return code;
+}
+const inCode = (f: ts.SourceFile, re: RegExp): boolean => re.test(f.text) && re.test(codeText(f));
 const OBJECT_PROTO_METHODS = new Set(["call", "apply", "bind", "hasOwnProperty", "isPrototypeOf", "propertyIsEnumerable", "toLocaleString", "toString", "valueOf"]);
 const REGEXP_METHODS = new Set(["test", "exec", "match", "matchAll", "search", "replace", "replaceAll", "split"]);
 const regexpProtocolText = /\bSymbol\s*\.\s*(match|matchAll|replace|search|split)\b|\.\s*exec\s*=[^=]|["']exec["']|\bextends\s+RegExp\b/;
@@ -615,11 +645,11 @@ function programWithNodeSupport(rootNames: string[], options: ts.CompilerOptions
       // naming process.stderr (util.debuglog) works with the minimal writer
       const triggers = f.fileName.startsWith(libNode) ? undefined : NODE_PRELUDE_TRIGGERS;
       const named = (text: string): boolean => NODE_PRELUDE_GLOBALS.has(text) || (triggers !== undefined && triggers.has(text));
-      if (triggers !== undefined && regexpProtocolText.test(f.text)) found.add(REGEXP_PROTOCOL_TRIGGER);
-      if (triggers !== undefined && speciesText.test(f.text)) found.add(SPECIES_TRIGGER);
-      if (triggers !== undefined && (promiseProtocolText.test(f.text) || (/\bPromise\b/.test(f.text) && /(?<!\bprototype\s*)\.\s*constructor\s*=[^=]/.test(f.text)))) found.add(PROMISE_PROTOCOL_TRIGGER);
-      if (triggers !== undefined && arrayGenericText.test(f.text)) found.add(ARRAY_GENERIC_TRIGGER);
-      if (triggers !== undefined && /\bSymbol\s*\.\s*(dispose|asyncDispose)\b/.test(f.text)) found.add("DisposableStack");
+      if (triggers !== undefined && inCode(f, regexpProtocolText)) found.add(REGEXP_PROTOCOL_TRIGGER);
+      if (triggers !== undefined && inCode(f, speciesText)) found.add(SPECIES_TRIGGER);
+      if (triggers !== undefined && (inCode(f, promiseProtocolText) || (inCode(f, /\bPromise\b/) && inCode(f, /(?<!\bprototype\s*)\.\s*constructor\s*=[^=]/)))) found.add(PROMISE_PROTOCOL_TRIGGER);
+      if (triggers !== undefined && inCode(f, arrayGenericText)) found.add(ARRAY_GENERIC_TRIGGER);
+      if (triggers !== undefined && inCode(f, /\bSymbol\s*\.\s*(dispose|asyncDispose)\b/)) found.add("DisposableStack");
       const visit = (n: ts.Node): void => {
         // a property named like a global (`globalThis.btoa`, `g.URL` through an alias of the
         // global object, `globalThis["performance"]`) counts too: conservative, and cheap
@@ -18302,15 +18332,15 @@ class Exporter {
     if (!this.untyped) this.computeForeignTypes();
     // can the program make a BigInt? It takes a literal or the name, in the program's own text
     const bigIntText = /\bBigInt|\bbigint\b|\b\d[\d_]*n\b|\b0[xXoObB][\da-fA-F_]+n\b/;
-    this.usesBigInt = this.modules.some((m) => !/\/lib\/(node|garnet)\/|node_prelude/.test(m.fileName) && bigIntText.test(m.text));
+    this.usesBigInt = this.modules.some((m) => !/\/lib\/(node|garnet)\/|node_prelude/.test(m.fileName) && inCode(m, bigIntText));
     if (this.usesBigInt) this.internField("__garnet_bigint");
     this.regexpProtocol = this.modules.some((m) => /web[\/\\]regexp_protocol\.ts$/.test(m.fileName));
     if (this.regexpProtocol) this.internField(REGEXP_PROTOCOL_TRIGGER);
     this.promiseProtocol = this.modules.some((m) => /web[\/\\]promise_protocol\.ts$/.test(m.fileName));
-    if (this.modules.some((m) => !/\/lib\/(node|garnet)\/|node_prelude/.test(m.fileName) && /\b__proto__\b/.test(m.text))) this.internField("__garnet_proto_accessor");
-    if (this.modules.some((m) => !/\/lib\/(node|garnet)\/|node_prelude/.test(m.fileName) && /\btoStringTag\b/.test(m.text))) this.internField("__garnet_builtin_tags");
-    if (this.modules.some((m) => !/\/lib\/(node|garnet)\/|node_prelude/.test(m.fileName) && /\bhasInstance\b/.test(m.text))) this.internField("__garnet_has_instance");
-    if (this.modules.some((m) => !/\/lib\/(node|garnet)\/|node_prelude/.test(m.fileName) && /\.caller\b|["']caller["']|ThrowTypeError/.test(m.text))) this.internField("__garnet_function_poison");
+    if (this.modules.some((m) => !/\/lib\/(node|garnet)\/|node_prelude/.test(m.fileName) && inCode(m, /\b__proto__\b/))) this.internField("__garnet_proto_accessor");
+    if (this.modules.some((m) => !/\/lib\/(node|garnet)\/|node_prelude/.test(m.fileName) && inCode(m, /\btoStringTag\b/))) this.internField("__garnet_builtin_tags");
+    if (this.modules.some((m) => !/\/lib\/(node|garnet)\/|node_prelude/.test(m.fileName) && inCode(m, /\bhasInstance\b/))) this.internField("__garnet_has_instance");
+    if (this.modules.some((m) => !/\/lib\/(node|garnet)\/|node_prelude/.test(m.fileName) && inCode(m, /\.caller\b|["']caller["']|ThrowTypeError/))) this.internField("__garnet_function_poison");
     if (this.modules.some((m) => /web[\/\\]species\.ts$/.test(m.fileName))) this.internField(SPECIES_TRIGGER);
     for (const f of allFns) for (const s of this.freeVars(f)) {
       this.cellBindings.add(s);

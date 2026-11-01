@@ -78,6 +78,22 @@ unwrapped), as builtin detection does everywhere else.
   operation. The analysis missed a route there: a loud internal error, never
   a silent wrong value.
 
+## The protocol libraries
+
+The modules that spell out a builtin's protocol (`lib/node/web/species.ts`, `disposable.ts`, `promise_protocol.ts`,
+`array_generic.ts`, `regexp_protocol.ts`, Session 363) are written over `any`: by the rules above each opens every
+program it is compiled into. Neither pass walks them. What they call is what the program handed them, with the
+receiver or the `thisArg` the program gave, so a struct method reaches them only through a read as a value, which pass 5
+sees at the program's own site, or from the object it then runs on (`value[Symbol.dispose]`, `items[Symbol.iterator]`);
+the objects they relink are errors and wrappers. Any other library module counts as the program does. A miss
+stops at the raise point, as above.
+
+Which programs compile one in is decided by text triggers, which read code (`codeText` in the exporter: no comments,
+and of the literals only the one-word strings). They read the raw text before Session 363's fix: a sentence in a comment
+(`interface Tuple extends Array<T>`) compiled `species` into tsc-ts, whose array methods then read `constructor`, and
+the two libraries opened its receivers: 22.1 G -> 37.3 G instructions, unnoticed for several slices because the fixtures
+stay correct. `tests/closed_receivers.sh` holds both facts now.
+
 ## Measured
 
 - tsc-ts: closed (the first draft's two sites were a record's `call: Node`

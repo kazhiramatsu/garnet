@@ -12851,3 +12851,9 @@ Where it stopped (branch `s363-dc`, worktree `build/wt_dc`, on top of `s362-wip`
 - **import() of a bundled module** (`docs/dynamic_import_design.md`): a compile-time reject before. A module only `import()` reaches is
   compiled in, its top-level statements a function of their own, evaluated once when asked, deps first, a failure kept, a top-level
   await honored. `export default class {}` was missing from a namespace and its statics never ran (silent): a dynamic class.
+- **A comment compiled a protocol library into tsc-ts, and the library opened its receivers** (22.1 G -> 37.3 G instructions, found by the
+  tsc-ts A/B after several slices that did not run it). The text triggers read comments and diagnostics (`interface Tuple extends Array<T>`,
+  `[Symbol.dispose]()` in a message): they read code now (`codeText` in the exporter). `web/promise_protocol.ts` imported `web/species.ts`
+  for one getter, which put a `constructor` read on every array method of any program with the word `"then"`: it defines the getter itself.
+  The five protocol libraries are no longer walked by the closed-receivers passes (docs/closed_receivers_design.md, "The protocol
+  libraries"; tests/closed_receivers.sh, 59 programs). tsc-ts against r29: 22.06 G -> 21.94 G, cycles x1.011, wall 1.19 s both, outputs identical.

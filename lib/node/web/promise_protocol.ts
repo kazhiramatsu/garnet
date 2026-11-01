@@ -3,10 +3,11 @@
 // extends Promise, borrows a static with `.call`, replaces `then` or `resolve`. Any other program keeps the runtime's direct
 // paths, which agree for an unmodified Promise.
 
-import "./species";
-
 const host = (globalThis as any).__garnet;
 const NativePromise: any = Promise;
+// (web/species.ts defines the same getter: this module does not need the array side, whose test costs every array method)
+const speciesGetter = { get [Symbol.species]() { return this; } };
+Object.defineProperty(NativePromise, Symbol.species, { ...Object.getOwnPropertyDescriptor(speciesGetter, Symbol.species), enumerable: false, configurable: true });
 const nativeThen = NativePromise.prototype.then;
 const isObject = (v: any): boolean => (typeof v === "object" && v !== null) || typeof v === "function";
 

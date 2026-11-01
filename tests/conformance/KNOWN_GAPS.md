@@ -169,3 +169,16 @@ V8 does; any other descriptor (`writable: false`, `enumerable: false`,
 `configurable: false`, an accessor) throws a TypeError ("Cannot redefine
 property: field (a class field keeps its default attributes)") where V8
 applies it. `Object.freeze` and `Object.seal` of an instance are modeled.
+
+## Session 363 (test262)
+
+- `class C { static constructor() {} }`: TypeScript parses it as a constructor with a `static` modifier (an error it reports in a checked
+  program), so the static method named `constructor` does not exist in a program that compiles unchecked.
+- `class A {}; Object.defineProperty(A, Symbol.hasInstance, { value })`: an `instanceof` that names the class statically does not see a hook
+  defined at run time; a `static [Symbol.hasInstance]` in the class body is seen.
+- `try { return; } finally { super(); }` in a derived constructor of a dynamic class checks `this` at the `return`.
+- A store to a hole of an array with a setter on `Array.prototype` that freezes the array: the write of `length` is not refused.
+- Class members with computed keys are defined after the others: `Object.getOwnPropertyNames(C.prototype)` lists them last.
+- `import.source`, `import.defer` and `with { type: "text" }` are proposals V8 does not ship either; `export * as "string name"` is a
+  compile-time reject; TypeScript refuses a keyword written with escapes (`g\u0065t`).
+
