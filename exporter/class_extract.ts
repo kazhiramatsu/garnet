@@ -71,7 +71,7 @@ export function isDynamicClass(decl: ts.ClassLikeDeclaration, checker: ts.TypeCh
   dynamicVerdicts.set(decl, false);   // a cycle of `extends` is reported elsewhere
   const ambient = (ts.getCombinedModifierFlags(decl) & ts.ModifierFlags.Ambient) !== 0;
   // (`export default class {}` has no name to hold it: a value, bound to the default export)
-  const verdict = !ambient && ((ts.isClassDeclaration(decl) && decl.name === undefined) || heritageIsDynamic(decl, checker) || capturesEnclosingLocal(decl, checker));
+  const verdict = !ambient && ((ts.isClassDeclaration(decl) && decl.name === undefined) || heritageIsDynamic(decl, checker) || capturesEnclosingLocal(decl, checker) || constructorAnswers(decl));
   dynamicVerdicts.set(decl, verdict);
   if (verdict) dynamicClasses.add(decl);
   return verdict;
@@ -90,6 +90,20 @@ function heritageIsDynamic(decl: ts.ClassLikeDeclaration, checker: ts.TypeChecke
   // the environment's: the Error family has its own layout, any other is a built-in to construct
   if (decls.every((d) => d.getSourceFile().isDeclarationFile)) return !(ts.isIdentifier(expr) && ERROR_BASES.has(expr.text));
   return true;   // a binding that holds a constructor
+}
+/** A constructor that returns a value: what `super()` gives a subclass is that object, not an instance with the
+ *  subclass's layout (`return new Proxy(this, handler)`, a pool, a singleton). */
+function constructorAnswers(decl: ts.ClassLikeDeclaration): boolean {
+  const ctor = decl.members.find((m) => ts.isConstructorDeclaration(m) && m.body !== undefined) as ts.ConstructorDeclaration | undefined;
+  if (!ctor) return false;
+  let found = false;
+  const visit = (n: ts.Node): void => {
+    if (found || ts.isFunctionLike(n) || ts.isClassLike(n)) return;
+    if (ts.isReturnStatement(n) && n.expression && n.expression.kind !== ts.SyntaxKind.ThisKeyword) { found = true; return; }
+    ts.forEachChild(n, visit);
+  };
+  ts.forEachChild(ctor.body!, visit);
+  return found;
 }
 /** A method, an accessor or a static initializer that reads a local of the function around the class: the
  *  function is one, the evaluations are many. (A constructor and an instance field get their cells threaded.) */

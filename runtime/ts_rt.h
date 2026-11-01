@@ -2249,6 +2249,7 @@ tsv ts_to_object(tsv v);
 tsv ts_property_key_value(tsv v);
 tsv ts_fn_key_name(tsv key);
 void ts_private_check(tsv obj, ts_key key);
+void ts_private_add(tsv obj, ts_key key, const char* cls);
 int ts_private_has(tsv obj, ts_key key);
 tsv ts_fn_name_from_key(tsv fn, tsv key, const char* prefix);
 tsv ts_new_target_of(tsv self);
@@ -3925,6 +3926,8 @@ void ts_set_linked(tsv obj, ts_key key, tsv value, ts_prop_ic* ic, ts_frame_hdr*
 /* The hole marker of a sparse array element (never a user-visible value). */
 #define TS_ARRAY_HOLE TS_BOX(0xFFFEu, 0x4152484Fu)
 static inline int array_is_hole(tsv v){ return v == TS_ARRAY_HOLE; }
+/* The value of a captured binding before its declaration has run (never a user-visible value: docs/tdz_design.md). */
+#define TS_TDZ_HOLE TS_BOX(0xFFFEu, 0x54445A5Au)
 /* A hole reads undefined, unless Array.prototype or Object.prototype was given an element (the library that tracks
    it, docs/array_protocol_design.md): the test is on the path of a hole only. */
 extern int g_proto_elements;

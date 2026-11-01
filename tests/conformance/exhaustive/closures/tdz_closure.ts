@@ -1,0 +1,24 @@
+function t(name: string, f: () => unknown) { try { console.log(name, f()); } catch (e: any) { console.log(name, e.name, e.message); } }
+t("closure let", () => { function f() { return x + 1; } const r = f(); let x = 1; return r; });
+t("closure const", () => { function f() { return x + 1; } const r = f(); const x = 1; return r; });
+t("closure write", () => { function f() { x = 2; } f(); let x = 1; return x; });
+t("closure typeof", () => { function f() { return typeof x; } const r = f(); let x = 1; return r; });
+t("arrow later", () => { const f = () => x; const r = f(); let x = 1; return r; });
+t("after init", () => { function f() { return x + 1; } let x = 1; return f(); });
+t("loop closure", () => { const fs: (() => number)[] = []; for (let i = 0; i < 2; i++) fs.push(() => i); return fs.map((f) => f()).join(); });
+t("dstr target in closure", () => { function f() { [x] = [1]; } f(); let x: any; return x; });
+t("hoisted later", () => { const r = () => g(); function g() { return y; } const y = 5; return r(); });
+t("chain", () => { function a() { return b(); } function b() { return z; } const v = a(); const z = 1; return v; });
+t("chain ok", () => { function a() { return b(); } function b() { return z; } const z = 1; return a(); });
+t("object method", () => { const o = { m() { return q; } }; const v = o.m(); const q = 1; return v; });
+t("object method ok", () => { const o = { m() { return q; } }; const q = 1; return o.m(); });
+t("arg closure", () => { const run = (f: () => number) => f(); const v = run(() => w); const w = 1; return v; });
+t("class method", () => { class K { m() { return u; } } const v = new K().m(); const u = 1; return v; });
+t("loop second", () => { const out: any[] = []; for (let i = 0; i < 2; i++) { const f = () => n; try { out.push(f()); } catch (e: any) { out.push(e.name); } let n = i; out.push(f()); } return out.join(); });
+t("number typed", () => { const f = (): number => m * 2; let r = 0; try { r = f(); } catch (e: any) { return e.name; } let m = 3; return r; });
+t("string typed", () => { const f = (): string => s + "x"; const v = f(); const s = "a"; return v; });
+t("compound closure", () => { function f() { c += 1; } f(); let c = 1; return c; });
+t("update closure", () => { function f() { c++; } f(); let c = 1; return c; });
+t("typeof after", () => { function f() { return typeof c; } let c = 1; return f(); });
+t("destructure let", () => { const f = () => p; const v = f(); const { p } = { p: 1 }; return v; });
+t("array destructure", () => { const f = () => p; const v = f(); const [p] = [1]; return v; });

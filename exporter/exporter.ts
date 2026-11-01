@@ -103,7 +103,7 @@ function isNodeBuiltinSpecifier(spec: string): boolean {
  *  an object literal is valid). */
 const NOT_EARLY_GRAMMAR = new Set([1117, 1149, 1192, 1202, 1203, 1205, 1208, 1259, 1261, 1286, 1287, 1323, 1324, 1343, 1371, 1375, 1378, 1432, 1470, 1471, 1479, 1484]);
 /** JavaScript's early errors that TypeScript makes in the checker. */
-const CHECKER_EARLY_ERRORS = new Set([2300, 2335, 2337, 2338, 2357, 2364, 2392, 2451, 2462, 2523, 2524, 2660, 2777, 2779, 2815, 5076, 17006, 17007, 17012, 17013, 18006, 18011, 18012, 18016, 18061]);
+const CHECKER_EARLY_ERRORS = new Set([2300, 2305, 2459, 2460, 2614, 2335, 2337, 2338, 2357, 2364, 2392, 2451, 2462, 2523, 2524, 2660, 2777, 2779, 2815, 5076, 17006, 17007, 17012, 17013, 18006, 18011, 18012, 18016, 18061]);
 /** Does this diagnostic say what JavaScript itself refuses before running? Under TSAOT_UNTYPED no type is
  *  trusted, but such a program is still not compiled. */
 function isEarlyError(d: ts.Diagnostic): boolean {
@@ -111,6 +111,31 @@ function isEarlyError(d: ts.Diagnostic): boolean {
   if ((d.code === 2300 || d.code === 2451) && !(d.relatedInformation ?? []).every((r) => r.file === d.file)) return false;
   if (d.code === 2339) return ts.flattenDiagnosticMessageText(d.messageText, " ").startsWith("Property '#"); // an undeclared private name
   return d.code < 2000 ? !NOT_EARLY_GRAMMAR.has(d.code) : CHECKER_EARLY_ERRORS.has(d.code);
+}
+
+/** A declaration where the grammar has a Statement, which the parser and the checker let through: `for (...) async
+ *  function* g() {}`. A plain function under `if` or a label is Annex B's, in a script only. A diagnostic, as the parser's. */
+function declarationsInStatementPosition(sf: ts.SourceFile): ts.Diagnostic[] {
+  const out: ts.Diagnostic[] = [];
+  const check = (st: ts.Statement | undefined, plainFunctionAllowed: boolean): void => {
+    if (!st) return;
+    let bad = ts.isClassDeclaration(st) || (ts.isVariableStatement(st) && (st.declarationList.flags & ts.NodeFlags.BlockScoped) !== 0);
+    if (ts.isFunctionDeclaration(st)) {
+      const plain = !st.asteriskToken && !ts.getModifiers(st)?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword);
+      bad = !plain || !plainFunctionAllowed || ts.isExternalModule(sf);
+    }
+    if (bad) out.push({ file: sf, start: st.getStart(sf), length: st.getEnd() - st.getStart(sf), category: ts.DiagnosticCategory.Error,
+      code: 1344, messageText: "A declaration is not allowed here: only a statement is." });
+  };
+  const visit = (n: ts.Node): void => {
+    if (ts.isIfStatement(n)) { check(n.thenStatement, true); check(n.elseStatement, true); }
+    else if (ts.isIterationStatement(n, false)) check(n.statement, false);
+    else if (ts.isLabeledStatement(n)) check(n.statement, true);
+    else if (ts.isWithStatement(n)) check(n.statement, false);
+    n.forEachChild(visit);
+  };
+  visit(sf);
+  return out;
 }
 
 /** A parser diagnostic that is TypeScript's, not JavaScript's: `o?.#x` is ES2022; an escape in `g\u0065t` is
@@ -1721,6 +1746,11 @@ class Exporter {
       if (parameterOf(decl) !== undefined && parameterOf(node) !== undefined) lexical = true;
     }
     if (!lexical) return false;
+    // (a closure in the expression of `for (let x of expr)` keeps that scope, whose binding never initializes)
+    if (ts.isVariableDeclaration(decl) && ts.isVariableDeclarationList(decl.parent)) {
+      const loop = decl.parent.parent;
+      if ((ts.isForInStatement(loop) || ts.isForOfStatement(loop)) && node.pos >= loop.expression.pos && node.end <= loop.expression.end) return true;
+    }
     if (this.enclosingFunction(node) !== this.enclosingFunction(decl)) return false;
 
     // node and decl are in the SAME file (guarded above), so use that file's
@@ -1729,6 +1759,11 @@ class Exporter {
     const usePos = node.getStart(sf);
     const declPos = decl.getStart(sf);
     if (usePos < declPos) return true;
+    // the expression of `for (let x of expr)` sees the binding uninitialized
+    if (ts.isVariableDeclaration(decl) && ts.isVariableDeclarationList(decl.parent)) {
+      const loop = decl.parent.parent;
+      if ((ts.isForInStatement(loop) || ts.isForOfStatement(loop)) && usePos >= loop.expression.getStart(sf) && usePos < loop.expression.getEnd()) return true;
+    }
 
     // a binding's own initializer, a pattern's default among them
     const init = ts.isVariableDeclaration(decl) || ts.isBindingElement(decl) || ts.isParameter(decl) ? decl.initializer : undefined;
@@ -3523,11 +3558,160 @@ class Exporter {
   }
   private recordEligible(s: ts.Symbol): boolean {
     if (s === this.lexicalThisSym) return false;
+    if (this.tdzBindings.has(s)) return false;   // a plain cell holds the hole
     const d = s.valueDeclaration ?? s.declarations?.[0];
     if (!d) return false;
     if (ts.isFunctionExpression(d) || ts.isClassExpression(d)) return false;
     if (this.inLoop(d)) return false;
     return true;
+  }
+  // ----- the temporal dead zone of a captured binding (docs/tdz_design.md) -----
+  /** The let, const and using bindings something may reach before the declaration has run: a closure that
+   *  code before it can run, or a later clause of a `switch`. Each lives in a cell that starts as a hole, and
+   *  a read or a write that cannot be proven after the declaration tests it. Any other binding costs nothing. */
+  tdzBindings = new Set<ts.Symbol>();
+  private computeTdzBindings(): void {
+    if (process.env.TSAOT_TDZ === "0") return;
+    const scopes = (n: ts.Node): void => {
+      if (ts.isSourceFile(n) || ts.isBlock(n) || ts.isModuleBlock(n)) this.tdzScope(n.statements);
+      else if (ts.isCaseBlock(n)) this.tdzSwitch(n);
+      n.forEachChild(scopes);
+    };
+    for (const m of this.modules) scopes(m);
+  }
+  /** The bindings a `let`, `const` or `using` statement declares. */
+  private lexicalNames(stmt: ts.Statement): ts.Symbol[] {
+    const out: ts.Symbol[] = [];
+    if (!ts.isVariableStatement(stmt) || !(stmt.declarationList.flags & ts.NodeFlags.BlockScoped)) return out;
+    const names = (n: ts.BindingName): void => {
+      if (ts.isIdentifier(n)) { const s = this.symbolOf(n); if (s) out.push(s); return; }
+      for (const el of n.elements) if (ts.isBindingElement(el)) names(el.name);
+    };
+    for (const d of stmt.declarationList.declarations) names(d.name);
+    return out;
+  }
+  /** A binding of a clause that another clause names: the jump can pass over the declaration. */
+  private tdzSwitch(block: ts.CaseBlock): void {
+    const items: (ts.Statement | ts.Expression)[] = [];
+    for (const c of block.clauses) {
+      if (ts.isCaseClause(c)) items.push(c.expression);
+      items.push(...c.statements);
+      const here = c.statements.flatMap((st) => this.lexicalNames(st));
+      if (here.length === 0) continue;
+      const names = new Set(here.map((s) => (s as { name?: string }).name));
+      const seen = new Set<ts.Symbol>();
+      const visit = (n: ts.Node): void => {
+        if (ts.isIdentifier(n) && names.has(n.text)) { const s = this.symbolOf(n); if (s) seen.add(s); }
+        n.forEachChild(visit);
+      };
+      for (const other of block.clauses) if (other !== c) visit(other);
+      for (const s of here) if (seen.has(s)) { this.tdzBindings.add(s); this.cellBindings.add(s); this.cellOnlySyms.add(s); }
+    }
+    this.tdzScope(items);
+  }
+  /** One pass over a scope's statements: what the code before a declaration can reach, through the names it mentions.
+   *  A declaration's function, a class's methods and a closure a const holds run only if their name is
+   *  mentioned; a closure anywhere else (an argument, an assignment) may run at once. */
+  private tdzScope(items: readonly (ts.Statement | ts.Expression)[]): void {
+    const K = ts.SyntaxKind;
+    const lexical = new Set<ts.Symbol>();
+    for (const it of items) for (const s of this.lexicalNames(it as ts.Statement)) if (this.cellBindings.has(s)) lexical.add(s);
+    if (lexical.size === 0) return;
+    const unwrap = (e: ts.Expression): ts.Expression => {
+      while (ts.isParenthesizedExpression(e) || ts.isAsExpression(e) || ts.isSatisfiesExpression(e) || ts.isNonNullExpression(e)) e = e.expression;
+      return e;
+    };
+    const isStatic = (m: ts.ClassElement): boolean => (ts.getCombinedModifierFlags(m as ts.Declaration) & ts.ModifierFlags.Static) !== 0;
+    // an initializer that runs nothing where it stands
+    const holder = (e0: ts.Expression): boolean => {
+      const e = unwrap(e0);
+      if (ts.isFunctionExpression(e) || ts.isArrowFunction(e)) return true;
+      if (ts.isClassExpression(e)) return !e.heritageClauses && !e.members.some((m) => isStatic(m) || (m.name && ts.isComputedPropertyName(m.name)) || ts.isClassStaticBlockDeclaration(m));
+      if (ts.isObjectLiteralExpression(e)) return e.properties.every((p) => {
+        if (p.name && ts.isComputedPropertyName(p.name)) return false;
+        return ts.isMethodDeclaration(p) || ts.isAccessor(p) || (ts.isPropertyAssignment(p) && holder(p.initializer));
+      });
+      return false;
+    };
+    const bodies = new Map<ts.Symbol, ts.Node>();
+    for (const it of items) {
+      if ((ts.isFunctionDeclaration(it) || ts.isClassDeclaration(it)) && it.name) {
+        const s = this.symbolOf(it.name);
+        if (s) bodies.set(s, it);
+      } else if (ts.isVariableStatement(it)) {
+        for (const d of it.declarationList.declarations) {
+          if (d.initializer && ts.isIdentifier(d.name) && holder(d.initializer)) {
+            const s = this.symbolOf(d.name);
+            if (s) bodies.set(s, d.initializer);
+          }
+        }
+      }
+    }
+    // only these names matter: what the scope declares
+    const interest = new Set<string>();
+    for (const s of lexical) interest.add((s as { name?: string }).name ?? "");
+    for (const s of bodies.keys()) interest.add((s as { name?: string }).name ?? "");
+    const reached = new Set<ts.Symbol>();
+    const walk = (n: ts.Node): void => {
+      if (ts.isIdentifier(n)) {
+        if (!interest.has(n.text)) return;
+        const p = n.parent;
+        if (ts.isPropertyAccessExpression(p) && p.name === n) return;
+        const s = this.symbolOf(n);
+        if (!s || reached.has(s)) return;
+        reached.add(s);
+        const b = bodies.get(s);
+        if (b) walk(b);
+        return;
+      }
+      if (ts.isTypeNode(n) && n.kind !== K.ExpressionWithTypeArguments) return;
+      if (ts.isExportDeclaration(n) || ts.isInterfaceDeclaration(n) || ts.isTypeAliasDeclaration(n)) return;
+      n.forEachChild(walk);
+    };
+    const runClass = (c: ts.ClassLikeDeclaration): void => {
+      for (const h of c.heritageClauses ?? []) if (h.token === K.ExtendsKeyword) for (const t of h.types) walk(t.expression);
+      for (const m of c.members) {
+        if (m.name && ts.isComputedPropertyName(m.name)) walk(m.name.expression);
+        if (ts.isClassStaticBlockDeclaration(m)) walk(m);
+        else if (ts.isPropertyDeclaration(m) && isStatic(m) && m.initializer) walk(m.initializer);
+      }
+    };
+    for (const it of items) {
+      if (ts.isFunctionDeclaration(it)) continue;
+      if (ts.isClassDeclaration(it)) { runClass(it); continue; }
+      if (ts.isVariableStatement(it)) {
+        for (const d of it.declarationList.declarations) {
+          if (d.initializer && !holder(d.initializer)) walk(d.initializer);
+        }
+        for (const s of this.lexicalNames(it)) if (reached.has(s) && lexical.has(s)) { this.tdzBindings.add(s); this.cellOnlySyms.add(s); }
+        continue;
+      }
+      walk(it);
+    }
+  }
+  /** Whether this mention of a dead-zone binding stands after its declaration on every path to it. */
+  private tdzProvenAfter(node: ts.Node, sym: ts.Symbol): boolean {
+    const d = (sym.valueDeclaration ?? sym.declarations?.[0]) as ts.Node | undefined;
+    if (!d || d.getSourceFile() !== node.getSourceFile() || this.enclosingFunction(node) !== this.enclosingFunction(d)) return false;
+    if (node.getStart() < d.getEnd()) return false;
+    for (let c: ts.Node | undefined = d.parent; c && !ts.isSourceFile(c); c = c.parent) {
+      if (ts.isCaseClause(c) || ts.isDefaultClause(c)) return false;
+      if (isFunctionLike(c)) break;
+    }
+    return true;
+  }
+  /** Reads `load` into `dst`, the hole tested as the raw value it is before the local's representation takes it. */
+  private tdzLoad(ctx: FnCtx, node: ts.Identifier, sym: ts.Symbol, dst: number, load: (d: number) => void): void {
+    if (!this.tdzBindings.has(sym) || this.tdzProvenAfter(node, sym)) { load(dst); return; }
+    const raw = this.newLocal(ctx, "reference", node.text);
+    load(raw);
+    ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: `tdz.check:${node.text}`, args: [raw] });
+    ctx.body.push({ kind: "Copy", dst, src: raw });
+  }
+  private storeTdzHole(ctx: FnCtx, cell: number): void {
+    const hole = this.newLocal(ctx, "reference", "tdz");
+    ctx.body.push({ kind: "CallBuiltinStatic", dst: hole, builtin: "tdz.hole", args: [] });
+    ctx.body.push({ kind: "StoreField", obj: cell, field: this.VALUE, src: hole });
   }
   /** A nested declaration that is only called directly is never hoisted as a
    *  closure, so its body must be lowered when the first direct call is seen. */
@@ -4295,7 +4479,7 @@ class Exporter {
    *  read is the constant (TSAOT_MODULE_CONST_FOLD=0 keeps the cell read). */
   private moduleConstLiteral(sym: ts.Symbol | undefined):
     { kind: "Num"; value: number | string } | { kind: "NegZero" } | { kind: "Str"; value: string } | { kind: "Bool"; value: boolean } | undefined {
-    if (!sym || !this.moduleScopeSyms.has(sym) || process.env.TSAOT_MODULE_CONST_FOLD === "0") return undefined;
+    if (!sym || !this.moduleScopeSyms.has(sym) || process.env.TSAOT_MODULE_CONST_FOLD === "0" || this.tdzBindings.has(sym)) return undefined;
     const d = sym.valueDeclaration;
     if (!d || !ts.isVariableDeclaration(d) || !ts.isIdentifier(d.name) || !d.initializer) return undefined;
     const list = d.parent;
@@ -4493,8 +4677,10 @@ class Exporter {
       this.noteFnModule(func, node.getSourceFile().fileName);
       this.functions.push({
         id: func, name: `__get_export_${name}`, params: [0], ret: 0,
-        locals: [{ id: 0, typeId: 0, refKind: "reference" }, { id: 1, typeId: 0, refKind: "reference" }],
-        body: [{ kind: "LoadField", dst: 1, obj: 0, field: cont.field }, { kind: "Return", src: 1 }],
+        locals: [{ id: 0, typeId: 0, refKind: "reference" }, { id: 1, typeId: 0, refKind: "reference" }, { id: 2, typeId: 0, refKind: "reference" }],
+        body: [{ kind: "LoadField", dst: 1, obj: 0, field: cont.field },
+          ...(this.tdzBindings.has(sym) ? [{ kind: "CallBuiltinStatic", dst: 2, builtin: `tdz.check:${name}`, args: [1] }] : []),
+          { kind: "Return", src: 1 }],
         isExported: false, paramClasses: cont.classId !== undefined ? { 0: cont.classId } : {}, restParam: null,
         isAsync: false, isGenerator: false, takesThis: false, captureCount: 1, arity: 0, hasPrototype: false,
       });
@@ -8810,7 +8996,7 @@ class Exporter {
     }
     if (sym && this.hasCaptured(ctx, sym)) {
       const dst = this.newLocal(ctx, this.refKindOf(node));
-      this.loadCaptured(ctx, sym, dst);
+      this.tdzLoad(ctx, node, sym, dst, (d) => this.loadCaptured(ctx, sym, d));
       return dst;
     }
     if (sym && ctx.localOfSymbol.has(sym)) {
@@ -8823,7 +9009,7 @@ class Exporter {
     if (sym && this.moduleCellGlobal.has(sym)) {
       const ref = this.moduleCapturedRef(ctx, sym)!;
       const dst = this.newLocal(ctx, this.refKindOf(node));
-      ctx.body.push({ kind: "LoadField", dst, obj: ref.obj, field: ref.field, ...(ref.cls ? { cls: ref.cls } : {}) });
+      this.tdzLoad(ctx, node, sym, dst, (d) => ctx.body.push({ kind: "LoadField", dst: d, obj: ref.obj, field: ref.field, ...(ref.cls ? { cls: ref.cls } : {}) }));
       return dst;
     }
     // Fallback for class values that do not have a stored lexical binding in this
@@ -10566,9 +10752,12 @@ class Exporter {
     ctx.thisCellOfBody?.delete(ctx.body);
     try {
       const brand = privateBrand(cnode);
+      // a base constructor can answer an object this class has already initialized
+      const foreignThis = this.baseMayReturnObject(classId);
       if (brand !== undefined) {
         const yes = this.newLocal(ctx, "reference");
         ctx.body.push({ kind: "Const", dst: yes, value: { kind: "Bool", value: true } });
+        if (foreignThis) this.pushPrivateAdd(ctx, dst, brand, cnode.name?.text ?? "anonymous");
         ctx.body.push({ kind: "StoreField", obj: dst, field: this.internField(brand), src: yes });
       }
       for (const m of cnode.members) {
@@ -10587,11 +10776,15 @@ class Exporter {
           continue;
         }
         if (!ts.isPropertyDeclaration(m)) continue;   // named methods/accessors -> vtable
-        if (!m.initializer) continue;                 // declaration-only field: nothing to run
+        const added = foreignThis && ts.isPrivateIdentifier(m.name);
+        if (!m.initializer && !added) continue;       // declaration-only field: nothing to run
         const fname = memberKeyName(m.name);
         if (fname === undefined) continue;            // (unreachable: covered by isDynComputedMember)
 
-        const v = this.lowerExpr(ctx, m.initializer);
+        let v: number;
+        if (m.initializer) v = this.lowerExpr(ctx, m.initializer);
+        else { v = this.newLocal(ctx, "reference"); ctx.body.push({ kind: "Const", dst: v, value: { kind: "Undef" } }); }
+        if (added) this.pushPrivateAdd(ctx, dst, fname, "");
         ctx.body.push({ kind: "StoreField", obj: dst, field: this.internField(fname), src: v });
       }
     } finally {
@@ -10605,6 +10798,26 @@ class Exporter {
     }
   }
 
+  /** PrivateFieldAdd and PrivateMethodOrAccessorAdd: the second initialization of an object is a TypeError. */
+  private pushPrivateAdd(ctx: FnCtx, obj: number, key: string, className: string): void {
+    ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: `private.add:${this.internField(key)}:${className}`, args: [obj] });
+  }
+  /** Can `super()` in this class give an object other than a fresh instance: an ancestor's constructor returns a value. */
+  private baseMayReturnObject(classId: number): boolean {
+    for (let p = this.parentIdOf(classId); p !== undefined; p = this.parentIdOf(p)) {
+      const ctor = this.classNodeOfId.get(p)?.members.find((m) => ts.isConstructorDeclaration(m) && m.body !== undefined) as ts.ConstructorDeclaration | undefined;
+      if (!ctor) continue;
+      let found = false;
+      const visit = (n: ts.Node): void => {
+        if (found || isFunctionLike(n)) return;
+        if (ts.isReturnStatement(n) && n.expression) { found = true; return; }
+        n.forEachChild(visit);
+      };
+      ctor.body!.forEachChild(visit);
+      if (found) return true;
+    }
+    return false;
+  }
   /** True if any of these symbols is owned by an enclosing FUNCTION scope (not
    *  module scope). Module-scope captures (owner === moduleInitNode, or no owner)
    *  are publishable to a GLOBALS[] cell and read via LoadGlobal, so they work in
@@ -13576,6 +13789,7 @@ class Exporter {
       this.labels[perSite] = `cell:${(sym as any).name ?? "v"}@loopbody`;
       this.recordSite(perSite, "cell", "many", true, body, true);
       ctx.body.push({ kind: "AllocObject", dst: cellLocal, typeId: 0, site: perSite, classId: this.cellClassId });
+      if (this.tdzBindings.has(sym)) this.storeTdzHole(ctx, cellLocal);
     }
   }
 
@@ -14489,11 +14703,13 @@ class Exporter {
       } else if (this.isLexicalTdzUse(lhs, sym)) {
         ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: `throw.uninitialized:${lhs.text}`, args: [] });
       } else if (sym && this.hasCaptured(ctx, sym)) {
+        if (this.tdzBindings.has(sym)) this.tdzLoad(ctx, lhs, sym, this.newLocal(ctx, "reference"), (d) => this.loadCaptured(ctx, sym, d));
         this.storeCaptured(ctx, sym, rhs);
       } else if (sym && this.moduleCellGlobal.has(sym)) {
         // Step E: write to a module binding from a method — its record field,
         // or the cell loaded from its GLOBALS[] slot.
         const ref = this.moduleCapturedRef(ctx, sym)!;
+        if (this.tdzBindings.has(sym)) this.tdzLoad(ctx, lhs, sym, this.newLocal(ctx, "reference"), (d) => ctx.body.push({ kind: "LoadField", dst: d, obj: ref.obj, field: ref.field }));
         ctx.body.push({ kind: "StoreField", obj: ref.obj, field: ref.field, src: rhs, ...(ref.cls ? { cls: ref.cls } : {}) });
       } else if (sym) {
         // Step B: module bindings no longer use StoreGlobal; fall through to a
@@ -14864,6 +15080,7 @@ class Exporter {
     if (brand !== undefined) {
       const yes = this.newLocal(ctx, "reference");
       ctx.body.push({ kind: "Const", dst: yes, value: { kind: "Bool", value: true } });
+      if (dc.derived) this.pushPrivateAdd(ctx, self, brand, dc.classNode.name?.text ?? "anonymous");
       defineOn(this.constString(ctx, brand), yes, 0);
     }
     const ctor = this.dynamicCtorNode(dc.classNode);
@@ -14885,6 +15102,7 @@ class Exporter {
         let v: number;
         if (!m.initializer) { v = this.newLocal(ctx, "reference"); ctx.body.push({ kind: "Const", dst: v, value: { kind: "Undef" } }); }
         else v = ts.isComputedPropertyName(m.name) ? this.lowerNamedByKey(ctx, m.initializer, key) : this.lowerExpr(ctx, m.initializer);
+        if (derived && ts.isPrivateIdentifier(m.name)) this.pushPrivateAdd(ctx, self, this.memberKeyName(m.name) ?? "", "");
         defineOn(key, v, ts.isPrivateIdentifier(m.name) ? 0 : 1);
       }
     });
@@ -16899,6 +17117,7 @@ class Exporter {
         this.recordSite(site, "cell", this.inLoop(declNode) ? "many" : "once", true, declNode, true);
         ctx.body.push({ kind: "AllocObject", dst: cell, typeId: 0, site, classId: this.cellClassId });
         ctx.cellAccess.set(s, cell);
+        if (this.tdzBindings.has(s)) this.storeTdzHole(ctx, cell);
         // Step E: if this module-scope binding is captured by a method, publish
         // the cell object into its GLOBALS[] slot so methods (which can't receive
         // cell params) can read it.
@@ -18372,6 +18591,7 @@ class Exporter {
       void cn;
       for (const s of this.synthCtorFreeVars(cid)) { this.cellBindings.add(s); this.cellOnlySyms.add(s); }
     }
+    this.computeTdzBindings();
     // Capture by value: an immutable binding leaves cellBindings (its owner keeps
     // a plain local) and is supplied to its closures as a value slot.
     for (const s of [...this.cellBindings]) {
@@ -18756,7 +18976,7 @@ function batchMain(listPath: string, outDir: string, strictCompiler = false) {
       if (process.env.TSAOT_UNTYPED === "1") {
         // what the single-file path refuses in this mode: a syntax or an early error stops the compile
         const sf = program.getSourceFile(e.input);
-        const early = sf ? [...program.getSyntacticDiagnostics(sf).filter(isSyntaxError), ...program.getSemanticDiagnostics(sf).filter(isEarlyError)] : [];
+        const early = sf ? [...program.getSyntacticDiagnostics(sf).filter(isSyntaxError), ...program.getSemanticDiagnostics(sf).filter(isEarlyError), ...declarationsInStatementPosition(sf)] : [];
         if (early.length > 0) {
           process.stdout.write(`${e.name}\tSYNTAX\t0\n`);
           process.stderr.write(`  [${e.name}] - TS${early[0].code}: ${ts.flattenDiagnosticMessageText(early[0].messageText, " ")}\n`);
@@ -18924,10 +19144,12 @@ function main() {
       ? [
           ...userFiles.flatMap((f) => program.getSyntacticDiagnostics(f)).filter(isSyntaxError),
           ...userFiles.flatMap((f) => program.getSemanticDiagnostics(f)).filter(isEarlyError),
+          ...userFiles.flatMap(declarationsInStatementPosition),
         ]
       : [
           ...userFiles.flatMap((f) => program.getSyntacticDiagnostics(f)),
           ...userFiles.flatMap((f) => program.getSemanticDiagnostics(f)),
+          ...userFiles.flatMap(declarationsInStatementPosition),
           ...program.getGlobalDiagnostics(),
           ...program.getOptionsDiagnostics(),
         ].filter((d) => !(d.file !== undefined && path.resolve(d.file.fileName).startsWith(libDir) && lintOnly.has(d.code)));

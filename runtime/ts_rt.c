@@ -4722,6 +4722,20 @@ void ts_define_accessor_symkey(tsv obj, tsv sym, tsv getter, tsv setter, int g_t
 static int ta_define_index(tsv obj, ts_key key, uint32_t idx, unsigned present, tsv value, int e, int w, int c, int throws);
 void ts_define_data(tsv obj, ts_key key, tsv value, int e, int w, int c){
   if (!ts_is_obj(obj) && !ts_is_func(obj)) return;
+  if (TS_RT_UNLIKELY(g_has_proxies) && ts_is_proxy(obj)){
+    /* a field of a class whose base constructor answered a Proxy: its [[DefineOwnProperty]]. A Proxy holds no
+       private element here: the read that follows throws (docs/private_names_design.md) */
+    { const char* nm = ts_field_name(key); if (nm && strchr(nm, '\001')) return; }
+    ts_gc_root(&obj); ts_gc_root(&value);
+    tsv d = ts_new_object(); ts_gc_root(&d);
+    ts_set(d, ts_intern_field("value", 5), value);
+    ts_set(d, ts_intern_field("writable", 8), ts_bool(w));
+    ts_set(d, ts_intern_field("enumerable", 10), ts_bool(e));
+    ts_set(d, ts_intern_field("configurable", 12), ts_bool(c));
+    ts_proxy_define_property(obj, ts_key_to_value(key), d);
+    ts_gc_unroot(3);
+    return;
+  }
   { uint32_t idx;
     if (TS_RT_UNLIKELY(ts_is_typed_array(obj)) && ta_numeric_key(key, &idx)){
       (void)ta_define_index(obj, key, idx, 15u, value, e, w, c, 1);
@@ -11803,7 +11817,6 @@ static int default_cmp(tsv a, tsv b){
   ts_gc_unroot(2);
   return r;
 }
-/* insertion sort (stable, simple). With cb!=undefined, use the comparator. */
 /* ---- Array.prototype.sort: V8's TimSort (src/third_party/v8/builtins/array-sort.tq), so that a comparator sees
    the same calls in the same order and an inconsistent one leaves the same array. The non-undefined elements
    are compacted into `work`; the merge space is `temp`. Both are runtime arrays a comparator can move, so
@@ -20598,6 +20611,21 @@ void ts_private_check(tsv obj, ts_key key){
   while (nm && nm[n] && nm[n] != '\001') n++;
   char buf[256];
   snprintf(buf, sizeof buf, "Cannot access private member %.*s on an object whose class did not declare it", (int)(n > 128 ? 128 : n), nm ? nm : "");
+  ts_throw_type_error_msg(buf);
+}
+/* PrivateFieldAdd and PrivateMethodOrAccessorAdd on an object a base constructor gave: `cls` names the class of a
+   brand, empty for a field. A class instance holds its fields from the allocation: only the property map tells. */
+void ts_private_add(tsv obj, ts_key key, const char* cls){
+  if (!ts_is_propbag(obj) || !kind_has_common_header(((ts_gc_header*)ts_ptr(obj))->kind)) return;
+  if (!find_slot((ts_object*)ts_ptr(obj), key, 0)) return;
+  char buf[256];
+  if (cls[0]) snprintf(buf, sizeof buf, "Cannot initialize private methods of class %s twice on the same object", cls);
+  else {
+    const char* nm = ts_field_name(key);
+    size_t n = 0;
+    while (nm && nm[n] && nm[n] != '\001') n++;
+    snprintf(buf, sizeof buf, "Cannot initialize %.*s twice on the same object", (int)(n > 128 ? 128 : n), nm ? nm : "");
+  }
   ts_throw_type_error_msg(buf);
 }
 int ts_private_has(tsv obj, ts_key key){

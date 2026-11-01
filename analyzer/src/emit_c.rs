@@ -4861,7 +4861,7 @@ fn body_is_gc_free(body: &[Inst], numeric: &BTreeSet<u32>) -> bool {
         // `x instanceof C` links around its chain walk; a class binding's
         // check only throws, leaving the function (a lazy body has no try)
         Inst::CallBuiltinStatic { builtin, .. }
-            if builtin.starts_with("instanceof.class:") || builtin.starts_with("binding.check:") || builtin.starts_with("global.check:") =>
+            if builtin.starts_with("instanceof.class:") || builtin.starts_with("binding.check:") || builtin.starts_with("tdz.check:") || builtin.starts_with("global.check:") =>
         {
             true
         }
@@ -24387,6 +24387,11 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 _ if builtin.starts_with("private.check:") => {
                     (format!("(ts_private_check({}, {}u), TS_UNDEFINED)", v(0), &builtin["private.check:".len()..]), false)
                 }
+                _ if builtin.starts_with("private.add:") => {
+                    let rest = &builtin["private.add:".len()..];
+                    let (key, class) = rest.split_once(':').unwrap_or((rest, ""));
+                    (format!("(ts_private_add({}, {}u, {}), TS_UNDEFINED)", v(0), key, c_string_lit(class)), false)
+                }
                 _ if builtin.starts_with("private.has:") => {
                     (format!("ts_bool(ts_private_has({}, {}u))", v(0), &builtin["private.has:".len()..]), false)
                 }
@@ -24408,6 +24413,16 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 "class.methodEscape" => ("(ts_note_method_escape(), TS_UNDEFINED)".to_string(), false),
                 // A class binding that may not be initialized yet: undefined
                 // until its declaration ran (a ReferenceError to read).
+                // the hole of a binding in its temporal dead zone (docs/tdz_design.md)
+                "tdz.hole" => ("TS_TDZ_HOLE".to_string(), false),
+                b if b.starts_with("tdz.check:") => (
+                    format!(
+                        "({v} == TS_TDZ_HOLE ? (ts_throw_uninitialized({n}), TS_UNDEFINED) : TS_UNDEFINED)",
+                        v = v(0),
+                        n = c_string_lit(&b["tdz.check:".len()..])
+                    ),
+                    false,
+                ),
                 b if b.starts_with("binding.check:") => (
                     format!(
                         "(ts_is_undef({v}) ? (ts_throw_uninitialized({n}), TS_UNDEFINED) : TS_UNDEFINED)",

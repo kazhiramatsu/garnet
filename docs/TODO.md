@@ -12871,3 +12871,15 @@ Where it stopped (branch `s363-dc`, worktree `build/wt_dc`, on top of `s362-wip`
   ToPrimitive gives a symbol, `Symbol(Symbol())`, `Reflect.apply` without a list, `resolve(p)` for a promise with its own `then` or a replaced
   `Promise.prototype.then` (adopted directly before), `new encodeURIComponent()`, `with` over a buffer a conversion shrank, `Array.fromAsync`
   is a built-in rather than an async function. test262 slice NR%25==19 of built-ins: 663 pass, 24 wrong -> 6 wrong.
+- **The temporal dead zone of a captured binding** (`docs/tdz_design.md`): a closure that read a `let` or `const` before its declaration got a
+  value (`function f() { return x + 1; } f(); let x = 1;` gave 1), silently. A pass per scope proves most bindings out (tsc-ts: 12 of them
+  keep a hole, 114 tests); only those live in a cell that starts as a hole and tests it. `switch` clauses, the head of `for..of` / `for..in`.
+- **A constructor that returns a value was ignored by a subclass**: `class P { constructor() { return new Proxy(this, h); } } class D extends P {}`
+  gave a plain instance (silent). Such a class is a dynamic class now, and a field on a Proxy `this` goes through its define (it overwrote the cell).
+  The second initialization of a private element is a TypeError, a private field without an initializer exists on an answered object.
+- A declaration where the grammar has a statement (`for (...) async function* g() {}`), an import of a name the module does not export
+  in an unchecked program: compile-time rejects.
+- Not gated yet (2026-11-02, stopped at Kaz's request): after the last three items conformance has not been rerun, nor bench, unit, strict,
+  protect, gc, bundler or the tsc-ts A/B. The last run: 778 of 778 before them. Next: `build/t262_some_lf` left 7 wrong (module-code: `instn-iee-err-circular`,
+  `early-dup-top-function` kinds) and 3 rejects of an assignment to a function declaration's binding. /tmp/claude-501/scale/scale.ts is a scaling
+  benchmark of the builtins against node, not run yet.
