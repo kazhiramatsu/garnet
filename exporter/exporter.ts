@@ -178,6 +178,12 @@ const NODE_PRELUDE_CTORS = new Set(["URL", "URLSearchParams", "Headers", "Reques
   "CompressionStream", "DecompressionStream"]);
 /** The lib modules behind the globals: a program's prelude imports only the parts it names,
  *  so a program that uses setTimeout does not compile the streams behind process.stdout. */
+/** A program text that can tell the engine's direct paths from the protocol: it names a matcher's well-known
+ *  symbol, writes or defines an `exec`, or extends RegExp. A method named `exec` on a class of its own, or
+ *  `Reflect.ownKeys`, says nothing: a real program has those and keeps the direct paths. */
+const REGEXP_PROTOCOL_TRIGGER = "__garnet_regexp_protocol";
+const REGEXP_METHODS = new Set(["test", "exec", "match", "matchAll", "search", "replace", "replaceAll", "split"]);
+const regexpProtocolText = /\bSymbol\s*\.\s*(match|matchAll|replace|search|split)\b|\.\s*exec\s*=[^=]|["']exec["']|\bextends\s+RegExp\b/;
 const NODE_PRELUDE_PARTS: { file: string; names: string[]; defaultImport?: string; triggers?: string[] }[] = [
   { file: "process", names: ["process"], defaultImport: "process" },
   // on demand (imported for its registration): the standard streams behind process.stdout/stderr/stdin
@@ -198,6 +204,8 @@ const NODE_PRELUDE_PARTS: { file: string; names: string[]; defaultImport?: strin
   { file: "web/blob", names: ["Blob", "File"] },
   // CompressionStream / DecompressionStream over the system's zlib (docs/web_compression_design.md)
   { file: "web/compression", names: ["CompressionStream", "DecompressionStream"] },
+  // on demand: a program that customizes a RegExp or a matcher (docs/well_known_symbols_design.md)
+  { file: "web/regexp_protocol", names: [], triggers: [REGEXP_PROTOCOL_TRIGGER] },
   // on demand: fs.createReadStream / fs.createWriteStream (node:fs itself does not carry node:stream)
   { file: "fs/streams", names: [], triggers: ["createReadStream", "createWriteStream"] },
 ];
@@ -562,6 +570,7 @@ function programWithNodeSupport(rootNames: string[], options: ts.CompilerOptions
       // naming process.stderr (util.debuglog) works with the minimal writer
       const triggers = f.fileName.startsWith(libNode) ? undefined : NODE_PRELUDE_TRIGGERS;
       const named = (text: string): boolean => NODE_PRELUDE_GLOBALS.has(text) || (triggers !== undefined && triggers.has(text));
+      if (triggers !== undefined && regexpProtocolText.test(f.text)) found.add(REGEXP_PROTOCOL_TRIGGER);
       const visit = (n: ts.Node): void => {
         // a property named like a global (`globalThis.btoa`, `g.URL` through an alias of the
         // global object, `globalThis["performance"]`) counts too: conservative, and cheap
@@ -830,6 +839,20 @@ class Exporter {
   /** The program can make a BigInt: the arithmetic over what is not known to be a number looks at run time
    *  (docs/bigint_design.md). Any other program's operators are untouched. */
   private usesBigInt = false;
+  /** The program carries lib/node/web/regexp_protocol.ts: `exec`, `test` and the string methods that take a
+   *  matcher are dynamic calls (docs/well_known_symbols_design.md). */
+  private regexpProtocol = false;
+  private dynamicReceivers = new Set<ts.Node>();
+  private regexpMethodReceiver(n: ts.Node): boolean {
+    // the result of the call as well: a custom matcher answers what it likes, whatever the signature says
+    if (ts.isCallExpression(n) && ts.isPropertyAccessExpression(n.expression)) return this.regexpMethodReceiver(n.expression.expression);
+    const p = n.parent;
+    if (p === undefined || !ts.isPropertyAccessExpression(p) || p.expression !== n || !REGEXP_METHODS.has(p.name.text) ||
+        !ts.isCallExpression(p.parent) || p.parent.expression !== p) return false;
+    const stringOrRegExp = (t: ts.Type): boolean => (t.flags & ts.TypeFlags.StringLike) !== 0 || t.getSymbol()?.name === "RegExp";
+    const t = this.rawChecker.getTypeAtLocation(n);
+    return t.isUnion() ? t.types.some(stringOrRegExp) : stringOrRegExp(t);
+  }
   private distrustSkip = new Set<ts.Node>();
   // Untyped mode (TSAOT_UNTYPED=1): treat the whole program as `any` — disable
   // ALL type-driven lowering (no unbox/SROA via classify, no generic
@@ -1120,7 +1143,8 @@ class Exporter {
     const checker = Object.create(this.rawChecker) as ts.TypeChecker;
     checker.getTypeAtLocation = (n: ts.Node): ts.Type =>
       (this.distrustedExpr(n) && (ts.isBinaryExpression(n) || this.usedInPlace(n as ts.Expression))) ||
-      (this.hasForeign && this.foreignValue(n)) || (this.usesBigInt && this.bigIntOperator(n)) ? anyType : this.rawChecker.getTypeAtLocation(n);
+      (this.hasForeign && this.foreignValue(n)) || (this.usesBigInt && this.bigIntOperator(n)) ||
+      (this.regexpProtocol && this.regexpMethodReceiver(n)) || this.dynamicReceivers.has(n) ? anyType : this.rawChecker.getTypeAtLocation(n);
     this.checker = checker;
     this.VALUE = this.internField("__value");
     this.DATE_MS_FIELD = this.internField("__date_ms");
@@ -4750,6 +4774,159 @@ class Exporter {
     return dst;
   }
 
+  /** A pattern known only at run time: the method read from the receiver, whatever its static type. */
+  private lowerStringMethodDynamically(ctx: FnCtx, node: ts.CallExpression, recvExpr: ts.Expression): number {
+    this.dynamicReceivers.add(recvExpr);
+    this.dynamicReceivers.add(node);
+    return this.lowerExpr(ctx, node);
+  }
+  /** A call of a RegExp method or a string method that takes a pattern, where the engine answers directly. */
+  private lowerRegExpCall(ctx: FnCtx, node: ts.CallExpression, fnx: ts.Expression): number | undefined {
+    if (ts.isPropertyAccessExpression(fnx) &&
+        fnx.name.text === "test" &&
+        fnx.expression.kind === ts.SyntaxKind.RegularExpressionLiteral) {
+      const fallback = this.lowerRegExpLiteralTestFallback(ctx, node, fnx.expression.getText());
+      if (fallback !== undefined) return fallback;
+      this.unsupported(node, "RegExp literal has invalid flags");
+      return this.newLocal(ctx, "reference");
+    }
+    if (ts.isPropertyAccessExpression(fnx) &&
+        fnx.name.text === "test" &&
+        this.isRegExpExpr(fnx.expression)) {
+      return this.lowerRegExpObjectTestCall(ctx, node, fnx.expression);
+    }
+    if (ts.isPropertyAccessExpression(fnx) &&
+        fnx.name.text === "exec" &&
+        fnx.expression.kind === ts.SyntaxKind.RegularExpressionLiteral) {
+      const fallback = this.lowerRegExpLiteralExecFallback(ctx, node, fnx.expression.getText());
+      if (fallback !== undefined) return fallback;
+      this.unsupported(node, "RegExp literal has invalid flags");
+      return this.newLocal(ctx, "reference");
+    }
+    if (ts.isPropertyAccessExpression(fnx) &&
+        fnx.name.text === "exec" &&
+        this.isRegExpExpr(fnx.expression)) {
+      return this.lowerRegExpObjectExecCall(ctx, node, fnx.expression);
+    }
+    if (ts.isPropertyAccessExpression(fnx) &&
+        fnx.name.text === "search" &&
+        node.arguments.length >= 1 &&
+        node.arguments[0].kind === ts.SyntaxKind.RegularExpressionLiteral &&
+        this.builtinReceiverKind(fnx.expression) === "string") {
+      const fallback = this.lowerStringSearchRegExpFallback(ctx, node, fnx.expression, node.arguments[0].getText());
+      if (fallback !== undefined) return fallback;
+      this.unsupported(node, "RegExp literal has invalid flags");
+      return this.newLocal(ctx, "primitive");
+    }
+    if (ts.isPropertyAccessExpression(fnx) &&
+        fnx.name.text === "search" &&
+        node.arguments.length >= 1 &&
+        this.isRegExpExpr(node.arguments[0]) &&
+        this.builtinReceiverKind(fnx.expression) === "string") {
+      return this.lowerStringSearchRegExpObject(ctx, node, fnx.expression, node.arguments[0]);
+    }
+    if (ts.isPropertyAccessExpression(fnx) &&
+        fnx.name.text === "search" &&
+        this.builtinReceiverKind(fnx.expression) === "string") {
+      const lowered = this.lowerStringSearchStringPattern(ctx, node, fnx.expression);
+      if (lowered !== undefined) return lowered;
+      return this.lowerStringMethodDynamically(ctx, node, fnx.expression);
+    }
+    if (ts.isPropertyAccessExpression(fnx) &&
+        fnx.name.text === "match" &&
+        node.arguments.length >= 1 &&
+        node.arguments[0].kind === ts.SyntaxKind.RegularExpressionLiteral &&
+        this.builtinReceiverKind(fnx.expression) === "string") {
+      const lowered = this.lowerStringMatchRegExpLiteral(ctx, node, fnx.expression, node.arguments[0].getText());
+      if (lowered !== undefined) return lowered;
+      this.unsupported(node, "RegExp literal has invalid flags");
+      return this.newLocal(ctx, "reference");
+    }
+    if (ts.isPropertyAccessExpression(fnx) &&
+        fnx.name.text === "match" &&
+        node.arguments.length >= 1 &&
+        this.isRegExpExpr(node.arguments[0]) &&
+        this.builtinReceiverKind(fnx.expression) === "string") {
+      return this.lowerStringMatchRegExpObject(ctx, node, fnx.expression, node.arguments[0]);
+    }
+    if (ts.isPropertyAccessExpression(fnx) &&
+        fnx.name.text === "match" &&
+        this.builtinReceiverKind(fnx.expression) === "string") {
+      const lowered = this.lowerStringMatchStringPattern(ctx, node, fnx.expression);
+      if (lowered !== undefined) return lowered;
+      return this.lowerStringMethodDynamically(ctx, node, fnx.expression);
+    }
+    if (ts.isPropertyAccessExpression(fnx) &&
+        fnx.name.text === "matchAll" &&
+        node.arguments.length >= 1 &&
+        node.arguments[0].kind === ts.SyntaxKind.RegularExpressionLiteral &&
+        this.builtinReceiverKind(fnx.expression) === "string") {
+      const lowered = this.lowerStringMatchAllRegExpLiteral(ctx, node, fnx.expression, node.arguments[0].getText());
+      if (lowered !== undefined) return lowered;
+      this.unsupported(node, "RegExp literal has invalid flags");
+      return this.newLocal(ctx, "reference");
+    }
+    if (ts.isPropertyAccessExpression(fnx) &&
+        fnx.name.text === "matchAll" &&
+        node.arguments.length >= 1 &&
+        this.isRegExpExpr(node.arguments[0]) &&
+        this.builtinReceiverKind(fnx.expression) === "string") {
+      const lowered = this.lowerStringMatchAllRegExpObject(ctx, node, fnx.expression, node.arguments[0]);
+      if (lowered !== undefined) return lowered;
+      this.unsupported(node, "String.prototype.matchAll(RegExp) unsupported");
+      return this.newLocal(ctx, "reference");
+    }
+    if (ts.isPropertyAccessExpression(fnx) &&
+        fnx.name.text === "matchAll" &&
+        this.builtinReceiverKind(fnx.expression) === "string") {
+      const lowered = this.lowerStringMatchAllStringPattern(ctx, node, fnx.expression);
+      if (lowered !== undefined) return lowered;
+      return this.lowerStringMethodDynamically(ctx, node, fnx.expression);
+    }
+    if (ts.isPropertyAccessExpression(fnx) &&
+        (fnx.name.text === "replace" || fnx.name.text === "replaceAll") &&
+        node.arguments.length >= 1 &&
+        node.arguments[0].kind === ts.SyntaxKind.RegularExpressionLiteral &&
+        this.builtinReceiverKind(fnx.expression) === "string") {
+      const replaceAll = fnx.name.text === "replaceAll";
+      const lowered = this.lowerStringReplaceRegExpLiteral(ctx, node, fnx.expression, node.arguments[0].getText(), replaceAll);
+      if (lowered !== undefined) return lowered;
+      this.unsupported(node, "RegExp literal has invalid flags");
+      return this.newLocal(ctx, "reference");
+    }
+    if (ts.isPropertyAccessExpression(fnx) &&
+        (fnx.name.text === "replace" || fnx.name.text === "replaceAll") &&
+        node.arguments.length >= 1 &&
+        this.isRegExpExpr(node.arguments[0]) &&
+        this.builtinReceiverKind(fnx.expression) === "string") {
+      const replaceAll = fnx.name.text === "replaceAll";
+      const lowered = this.lowerStringReplaceRegExpObject(ctx, node, fnx.expression, node.arguments[0], replaceAll);
+      if (lowered !== undefined) return lowered;
+      this.unsupported(node, replaceAll
+        ? "String.prototype.replaceAll(RegExp) requires a global RegExp"
+        : "String.prototype.replace(RegExp) unsupported");
+      return this.newLocal(ctx, "reference");
+    }
+    if (ts.isPropertyAccessExpression(fnx) &&
+        fnx.name.text === "split" &&
+        node.arguments.length >= 1 &&
+        node.arguments[0].kind === ts.SyntaxKind.RegularExpressionLiteral &&
+        this.builtinReceiverKind(fnx.expression) === "string") {
+      const lowered = this.lowerStringSplitRegExpLiteral(ctx, node, fnx.expression, node.arguments[0].getText());
+      if (lowered !== undefined) return lowered;
+      this.unsupported(node, "RegExp literal has invalid flags");
+      return this.newLocal(ctx, "reference");
+    }
+    if (ts.isPropertyAccessExpression(fnx) &&
+        fnx.name.text === "split" &&
+        node.arguments.length >= 1 &&
+        this.isRegExpExpr(node.arguments[0]) &&
+        this.builtinReceiverKind(fnx.expression) === "string") {
+      return this.lowerStringSplitRegExpObject(ctx, node, fnx.expression, node.arguments[0]);
+    }
+    return undefined;
+  }
+
   /** Resolve the classic JSX factory from `import * as React from "./..."`.
    *
    *  The import target is part of the whole-program bundle, so a top-level
@@ -6441,150 +6618,9 @@ class Exporter {
         ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "regexp.escape", args: [arg] });
         return dst;
       }
-      if (ts.isPropertyAccessExpression(fnx) &&
-          fnx.name.text === "test" &&
-          fnx.expression.kind === ts.SyntaxKind.RegularExpressionLiteral) {
-        const fallback = this.lowerRegExpLiteralTestFallback(ctx, node, fnx.expression.getText());
-        if (fallback !== undefined) return fallback;
-        this.unsupported(node, "RegExp literal has invalid flags");
-        return this.newLocal(ctx, "reference");
-      }
-      if (ts.isPropertyAccessExpression(fnx) &&
-          fnx.name.text === "test" &&
-          this.isRegExpExpr(fnx.expression)) {
-        return this.lowerRegExpObjectTestCall(ctx, node, fnx.expression);
-      }
-      if (ts.isPropertyAccessExpression(fnx) &&
-          fnx.name.text === "exec" &&
-          fnx.expression.kind === ts.SyntaxKind.RegularExpressionLiteral) {
-        const fallback = this.lowerRegExpLiteralExecFallback(ctx, node, fnx.expression.getText());
-        if (fallback !== undefined) return fallback;
-        this.unsupported(node, "RegExp literal has invalid flags");
-        return this.newLocal(ctx, "reference");
-      }
-      if (ts.isPropertyAccessExpression(fnx) &&
-          fnx.name.text === "exec" &&
-          this.isRegExpExpr(fnx.expression)) {
-        return this.lowerRegExpObjectExecCall(ctx, node, fnx.expression);
-      }
-      if (ts.isPropertyAccessExpression(fnx) &&
-          fnx.name.text === "search" &&
-          node.arguments.length >= 1 &&
-          node.arguments[0].kind === ts.SyntaxKind.RegularExpressionLiteral &&
-          this.builtinReceiverKind(fnx.expression) === "string") {
-        const fallback = this.lowerStringSearchRegExpFallback(ctx, node, fnx.expression, node.arguments[0].getText());
-        if (fallback !== undefined) return fallback;
-        this.unsupported(node, "RegExp literal has invalid flags");
-        return this.newLocal(ctx, "primitive");
-      }
-      if (ts.isPropertyAccessExpression(fnx) &&
-          fnx.name.text === "search" &&
-          node.arguments.length >= 1 &&
-          this.isRegExpExpr(node.arguments[0]) &&
-          this.builtinReceiverKind(fnx.expression) === "string") {
-        return this.lowerStringSearchRegExpObject(ctx, node, fnx.expression, node.arguments[0]);
-      }
-      if (ts.isPropertyAccessExpression(fnx) &&
-          fnx.name.text === "search" &&
-          this.builtinReceiverKind(fnx.expression) === "string") {
-        const lowered = this.lowerStringSearchStringPattern(ctx, node, fnx.expression);
-        if (lowered !== undefined) return lowered;
-        this.unsupported(node, "String.prototype.search(string) requires a const string pattern");
-        return this.newLocal(ctx, "primitive");
-      }
-      if (ts.isPropertyAccessExpression(fnx) &&
-          fnx.name.text === "match" &&
-          node.arguments.length >= 1 &&
-          node.arguments[0].kind === ts.SyntaxKind.RegularExpressionLiteral &&
-          this.builtinReceiverKind(fnx.expression) === "string") {
-        const lowered = this.lowerStringMatchRegExpLiteral(ctx, node, fnx.expression, node.arguments[0].getText());
-        if (lowered !== undefined) return lowered;
-        this.unsupported(node, "RegExp literal has invalid flags");
-        return this.newLocal(ctx, "reference");
-      }
-      if (ts.isPropertyAccessExpression(fnx) &&
-          fnx.name.text === "match" &&
-          node.arguments.length >= 1 &&
-          this.isRegExpExpr(node.arguments[0]) &&
-          this.builtinReceiverKind(fnx.expression) === "string") {
-        return this.lowerStringMatchRegExpObject(ctx, node, fnx.expression, node.arguments[0]);
-      }
-      if (ts.isPropertyAccessExpression(fnx) &&
-          fnx.name.text === "match" &&
-          this.builtinReceiverKind(fnx.expression) === "string") {
-        const lowered = this.lowerStringMatchStringPattern(ctx, node, fnx.expression);
-        if (lowered !== undefined) return lowered;
-        this.unsupported(node, "String.prototype.match(string) requires a const string pattern");
-        return this.newLocal(ctx, "reference");
-      }
-      if (ts.isPropertyAccessExpression(fnx) &&
-          fnx.name.text === "matchAll" &&
-          node.arguments.length >= 1 &&
-          node.arguments[0].kind === ts.SyntaxKind.RegularExpressionLiteral &&
-          this.builtinReceiverKind(fnx.expression) === "string") {
-        const lowered = this.lowerStringMatchAllRegExpLiteral(ctx, node, fnx.expression, node.arguments[0].getText());
-        if (lowered !== undefined) return lowered;
-        this.unsupported(node, "RegExp literal has invalid flags");
-        return this.newLocal(ctx, "reference");
-      }
-      if (ts.isPropertyAccessExpression(fnx) &&
-          fnx.name.text === "matchAll" &&
-          node.arguments.length >= 1 &&
-          this.isRegExpExpr(node.arguments[0]) &&
-          this.builtinReceiverKind(fnx.expression) === "string") {
-        const lowered = this.lowerStringMatchAllRegExpObject(ctx, node, fnx.expression, node.arguments[0]);
-        if (lowered !== undefined) return lowered;
-        this.unsupported(node, "String.prototype.matchAll(RegExp) unsupported");
-        return this.newLocal(ctx, "reference");
-      }
-      if (ts.isPropertyAccessExpression(fnx) &&
-          fnx.name.text === "matchAll" &&
-          this.builtinReceiverKind(fnx.expression) === "string") {
-        const lowered = this.lowerStringMatchAllStringPattern(ctx, node, fnx.expression);
-        if (lowered !== undefined) return lowered;
-        this.unsupported(node, "String.prototype.matchAll(string) requires a const string pattern");
-        return this.newLocal(ctx, "reference");
-      }
-      if (ts.isPropertyAccessExpression(fnx) &&
-          (fnx.name.text === "replace" || fnx.name.text === "replaceAll") &&
-          node.arguments.length >= 1 &&
-          node.arguments[0].kind === ts.SyntaxKind.RegularExpressionLiteral &&
-          this.builtinReceiverKind(fnx.expression) === "string") {
-        const replaceAll = fnx.name.text === "replaceAll";
-        const lowered = this.lowerStringReplaceRegExpLiteral(ctx, node, fnx.expression, node.arguments[0].getText(), replaceAll);
-        if (lowered !== undefined) return lowered;
-        this.unsupported(node, "RegExp literal has invalid flags");
-        return this.newLocal(ctx, "reference");
-      }
-      if (ts.isPropertyAccessExpression(fnx) &&
-          (fnx.name.text === "replace" || fnx.name.text === "replaceAll") &&
-          node.arguments.length >= 1 &&
-          this.isRegExpExpr(node.arguments[0]) &&
-          this.builtinReceiverKind(fnx.expression) === "string") {
-        const replaceAll = fnx.name.text === "replaceAll";
-        const lowered = this.lowerStringReplaceRegExpObject(ctx, node, fnx.expression, node.arguments[0], replaceAll);
-        if (lowered !== undefined) return lowered;
-        this.unsupported(node, replaceAll
-          ? "String.prototype.replaceAll(RegExp) requires a global RegExp"
-          : "String.prototype.replace(RegExp) unsupported");
-        return this.newLocal(ctx, "reference");
-      }
-      if (ts.isPropertyAccessExpression(fnx) &&
-          fnx.name.text === "split" &&
-          node.arguments.length >= 1 &&
-          node.arguments[0].kind === ts.SyntaxKind.RegularExpressionLiteral &&
-          this.builtinReceiverKind(fnx.expression) === "string") {
-        const lowered = this.lowerStringSplitRegExpLiteral(ctx, node, fnx.expression, node.arguments[0].getText());
-        if (lowered !== undefined) return lowered;
-        this.unsupported(node, "RegExp literal has invalid flags");
-        return this.newLocal(ctx, "reference");
-      }
-      if (ts.isPropertyAccessExpression(fnx) &&
-          fnx.name.text === "split" &&
-          node.arguments.length >= 1 &&
-          this.isRegExpExpr(node.arguments[0]) &&
-          this.builtinReceiverKind(fnx.expression) === "string") {
-        return this.lowerStringSplitRegExpObject(ctx, node, fnx.expression, node.arguments[0]);
+      if (!this.regexpProtocol && !this.dynamicReceivers.has(node)) {
+        const direct = this.lowerRegExpCall(ctx, node, fnx);
+        if (direct !== undefined) return direct;
       }
       if ((ts.isPropertyAccessExpression(fnx) || ts.isElementAccessExpression(fnx)) &&
           this.isGlobalThisPropertyAccess(fnx, "fetch")) {
@@ -13774,6 +13810,16 @@ class Exporter {
         case "toPrimitive": return 2;
         case "hasInstance": return 3;
         case "toStringTag": return 4;
+        case "match": return 5;
+        case "matchAll": return 6;
+        case "replace": return 7;
+        case "search": return 8;
+        case "split": return 9;
+        case "species": return 10;
+        case "isConcatSpreadable": return 11;
+        case "unscopables": return 12;
+        case "dispose": return 13;
+        case "asyncDispose": return 14;
         default: return undefined;
       }
     }
@@ -17921,6 +17967,8 @@ class Exporter {
     const bigIntText = /\bBigInt|\bbigint\b|\b\d[\d_]*n\b|\b0[xXoObB][\da-fA-F_]+n\b/;
     this.usesBigInt = this.modules.some((m) => !/\/lib\/(node|garnet)\/|node_prelude/.test(m.fileName) && bigIntText.test(m.text));
     if (this.usesBigInt) this.internField("__garnet_bigint");
+    this.regexpProtocol = this.modules.some((m) => /web[\/\\]regexp_protocol\.ts$/.test(m.fileName));
+    if (this.regexpProtocol) this.internField(REGEXP_PROTOCOL_TRIGGER);
     for (const f of allFns) for (const s of this.freeVars(f)) {
       this.cellBindings.add(s);
       let arr = this.capturedByFns.get(s);

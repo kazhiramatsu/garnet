@@ -847,6 +847,19 @@ tsv ts_regexp_adapter_construct_tsv(tsv pattern, tsv flags, int as_constructor){
   keys_init();
   if (ts_is_symbol(pattern) || ts_is_symbol(flags)) ts_throw_type_error_msg("Cannot convert a Symbol value to a string");
   ts_gc_root(&pattern); ts_gc_root(&flags);
+  /* IsRegExp: an object that says so through @@match gives its source and flags */
+  if (TS_RT_UNLIKELY(g_regexp_protocol) && (ts_is_obj(pattern) || ts_is_func(pattern))){
+    tsv m = ts_get(pattern, TS_KEY_WKSYM(TS_WKSYM_MATCH));
+    int is_regexp = m != TS_UNDEFINED ? ts_truthy(m) : ts_is_regexp(pattern);
+    if (is_regexp && flags == TS_UNDEFINED && !as_constructor &&
+        ts_get(pattern, ts_intern_field("constructor", 11)) == ts_get(ts_regexp_proto(), ts_intern_field("constructor", 11))){ ts_gc_unroot(2); return pattern; }
+    if (is_regexp && !ts_is_regexp(pattern)){
+      tsv src = ts_get(pattern, ts_intern_field("source", 6)); ts_gc_root(&src);
+      if (flags == TS_UNDEFINED) flags = ts_get(pattern, ts_intern_field("flags", 5));
+      pattern = src;
+      ts_gc_unroot(1);
+    }
+  }
   if (ts_is_regexp(pattern)){
     if (flags == TS_UNDEFINED && !as_constructor){ ts_gc_unroot(2); return pattern; }
     ts_regexp* r = as_re(pattern);
@@ -905,7 +918,25 @@ static tsv this_regexp(tsv* args, int nargs, const char* name){
   return TS_UNDEFINED;
 }
 static tsv get_source(tsv* a, int n){ tsv t = this_regexp(a, n, "source"); return t == TS_UNDEFINED ? ts_new_string("(?:)", 4) : source_text(t); }
-static tsv get_flags(tsv* a, int n){ tsv t = this_regexp(a, n, "flags"); return t == TS_UNDEFINED ? ts_new_string("", 0) : flags_string(t); }
+/* RegExp.prototype.flags reads each flag's property from any object, in the specification's order. */
+static tsv get_flags(tsv* a, int n){
+  tsv t = n > 0 ? a[0] : TS_UNDEFINED;
+  if (!ts_is_obj(t) && !ts_is_func(t)){
+    uint32_t len = 0; char* text = ts_string_utf8_copy(ts_to_string_v(t), &len);
+    char msg[160];
+    snprintf(msg, sizeof msg, "RegExp.prototype.flags getter called on non-object %.*s", (int)(len > 80 ? 80 : len), text);
+    free(text);
+    ts_throw_type_error_msg(msg);
+  }
+  static const struct { const char* name; char c; } order[] = {
+    {"hasIndices",'d'},{"global",'g'},{"ignoreCase",'i'},{"multiline",'m'},{"dotAll",'s'},{"unicode",'u'},{"unicodeSets",'v'},{"sticky",'y'} };
+  char out[9]; int k = 0;
+  ts_gc_root(&t);
+  for (int i = 0; i < 8; i++)
+    if (ts_truthy(ts_get(t, ts_intern_field(order[i].name, (uint32_t)strlen(order[i].name))))) out[k++] = order[i].c;
+  ts_gc_unroot(1);
+  return ts_new_string(out, (uint32_t)k);
+}
 #define FLAG_GETTER(fname, bit, pname) static tsv fname(tsv* a, int n){ tsv t = this_regexp(a, n, pname); return t == TS_UNDEFINED ? TS_UNDEFINED : ts_bool((as_re(t)->flags & (bit)) != 0); }
 FLAG_GETTER(get_global, TSAOT_REGEXP_FLAG_GLOBAL, "global")
 FLAG_GETTER(get_ignoreCase, TSAOT_REGEXP_FLAG_IGNORECASE, "ignoreCase")

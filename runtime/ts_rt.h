@@ -391,6 +391,17 @@ enum ts_wksym_id {
   TS_WKSYM_TO_PRIMITIVE   = 2,
   TS_WKSYM_HAS_INSTANCE   = 3,
   TS_WKSYM_TO_STRING_TAG  = 4,
+  TS_WKSYM_MATCH          = 5,
+  TS_WKSYM_MATCH_ALL      = 6,
+  TS_WKSYM_REPLACE        = 7,
+  TS_WKSYM_SEARCH         = 8,
+  TS_WKSYM_SPLIT          = 9,
+  TS_WKSYM_SPECIES        = 10,
+  TS_WKSYM_IS_CONCAT_SPREADABLE = 11,
+  TS_WKSYM_UNSCOPABLES    = 12,
+  TS_WKSYM_DISPOSE        = 13,
+  TS_WKSYM_ASYNC_DISPOSE  = 14,
+  TS_WKSYM_COUNT          = 15,
 };
 
 typedef struct { ts_key key; tsv val; uint8_t flags; } ts_prop;
@@ -1665,6 +1676,9 @@ tsv ts_regexp_last_index_write(tsv re, tsv v);
 /* the adapter's entry points the core runtime calls when the program links RegExps
    (runtime/regexp/ts_regexp_adapter.c installs them): toString, the String methods with a
    RegExp argument, a RegExp from a string pattern, the program's release on sweep */
+/* A program with customized matchers (docs/well_known_symbols_design.md): the string methods take their
+   argument's method at the well-known symbol. Set at startup; the typed paths are not in such a program. */
+extern int g_regexp_protocol;
 typedef struct ts_regexp_hooks {
   tsv (*to_string)(tsv re);
   tsv (*replace)(tsv s, tsv re, tsv replacement, int all);

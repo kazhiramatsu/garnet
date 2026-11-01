@@ -5516,30 +5516,33 @@ tsv ts_get_symkey(tsv obj, tsv sym){
    to TS_KEY_WKSYM(id) — the same key a class `[Symbol.iterator]()` method is
    registered under, so obj[Symbol.iterator] (value form) and the class/object-
    literal method form share a key. Allocated once, kept as permanent GC roots. */
-static tsv g_wksym_singletons[5];
+static tsv g_wksym_singletons[TS_WKSYM_COUNT];
 static int g_wksym_inited = 0;
+/* in the order of TS_WKSYM_* */
+static const char* const g_wksym_names[TS_WKSYM_COUNT] = {
+  "iterator","asyncIterator","toPrimitive","hasInstance","toStringTag","match","matchAll","replace","search",
+  "split","species","isConcatSpreadable","unscopables","dispose","asyncDispose" };
 static void ts_wksym_init(void){
   if (g_wksym_inited) return;
   g_wksym_inited = 1;
-  static const char* descs[5] = {
-    "Symbol.iterator","Symbol.asyncIterator","Symbol.toPrimitive",
-    "Symbol.hasInstance","Symbol.toStringTag" };
-  static int rooted[5];
-  for (int i=0;i<5;i++){
+  static int rooted[TS_WKSYM_COUNT];
+  for (int i=0;i<TS_WKSYM_COUNT;i++){
     ts_symbol* s = gc_alloc(sizeof(ts_symbol), TS_KIND_SYMBOL);
     s->sym_id = g_next_sym_id++;     /* unique, though key uses wksym */
     s->wksym = (uint32_t)i;
     s->registered = 0;
     g_wksym_singletons[i] = ts_obj(s);
     ts_root_static_once(&g_wksym_singletons[i], &rooted[i]);
-    tsv desc = ts_new_string(descs[i], (uint32_t)strlen(descs[i]));
+    char label[32];
+    snprintf(label, sizeof label, "Symbol.%s", g_wksym_names[i]);
+    tsv desc = ts_new_string(label, (uint32_t)strlen(label));
     s = (ts_symbol*)ts_ptr(g_wksym_singletons[i]);
     s->description = desc;
     ts_write_barrier(g_wksym_singletons[i], desc);
   }
 }
 tsv ts_wksym(uint32_t id){
-  if (id >= 5) return TS_UNDEFINED;
+  if (id >= TS_WKSYM_COUNT) return TS_UNDEFINED;
   ts_wksym_init();
   return g_wksym_singletons[id];
 }
@@ -5848,7 +5851,8 @@ tsv ts_to_string_v(tsv v){
     ts_gc_root(&v);
     tsv p = ts_to_primitive(v, /*string_hint*/1);
     ts_gc_root(&p);
-    if (!ts_is_obj(p)){
+    if (ts_is_symbol(p)) ts_throw_type_error_msg("Cannot convert a Symbol value to a string");
+    if (!ts_is_obj(p) || ts_is_prim_cell(p)){
       tsv r = ts_to_string_v(p);   /* primitive を再帰整形 */
       ts_gc_unroot(2);
       return r;
@@ -7935,12 +7939,53 @@ double ts_str_search_coerce(tsv s, tsv needle, double from, int has_from, int la
   ts_gc_unroot(2);
   return last ? ts_str_lastindexof_fast(s, needle, from, has_from) : ts_str_indexof_fast(s, needle, from, has_from);
 }
+/* IsRegExp */
+int g_regexp_protocol = 0;
+static int str_is_regexp(tsv v){
+  if (!ts_is_obj(v) && !ts_is_func(v)) return 0;
+  if (ts_is_prim_cell(v)) return 0;
+  if (TS_RT_UNLIKELY(g_regexp_protocol)){
+    tsv m = ts_get(v, TS_KEY_WKSYM(TS_WKSYM_MATCH));
+    if (m != TS_UNDEFINED) return ts_truthy(m);
+  }
+  return ts_is_regexp(v);
+}
+/* The argument's own matcher, under the gate: GetMethod(arg, @@x) called with the receiver as it is. */
+static int str_protocol(tsv s, tsv arg, uint32_t wk, tsv extra, int has_extra, tsv* out){
+  if (!(ts_is_obj(arg) || ts_is_func(arg)) || ts_is_prim_cell(arg)) return 0;
+  ts_gc_root(&s); ts_gc_root(&arg); ts_gc_root(&extra);
+  tsv m = ts_get(arg, TS_KEY_WKSYM(wk));
+  ts_gc_unroot(3);
+  if (m == TS_UNDEFINED || m == TS_NULL) return 0;
+  if (!ts_is_callable(m)) ts_throw_type_error_msg("The value at the well-known symbol is not a function");
+  tsv argv[3] = { arg, s, extra };
+  *out = ts_call_method(m, argv, has_extra ? 3 : 2);
+  return 1;
+}
+/* replaceAll and matchAll over a regexp: a flags that has no g is a TypeError. */
+static void str_require_global(tsv arg, const char* name){
+  if (!str_is_regexp(arg)) return;
+  ts_gc_root(&arg);
+  tsv flags = ts_get(arg, ts_intern_field("flags", 5));
+  char msg[112];
+  if (flags == TS_UNDEFINED || flags == TS_NULL){
+    if (name[0] == 'r') str_require_coercible(flags, name);
+    snprintf(msg, sizeof msg, "The .flags property of the argument to String.prototype.%s cannot be null or undefined", name);
+    ts_throw_type_error_msg(msg);
+  }
+  tsv text = str_arg(flags);
+  ts_gc_unroot(1);
+  if (ts_str_indexof_fast(text, ts_new_string("g", 1), 0, 0) < 0){
+    snprintf(msg, sizeof msg, "String.prototype.%s called with a non-global RegExp argument", name);
+    ts_throw_type_error_msg(msg);
+  }
+}
 /* includes / startsWith / endsWith: IsRegExp is a TypeError, then ToString. */
 static void str_search_args(tsv* s, tsv* arg, const char* name){
   str_require_coercible(*s, name);
   ts_gc_root(s); ts_gc_root(arg);
   *s = str_arg(*s);
-  if (ts_is_regexp(*arg)){
+  if (str_is_regexp(*arg)){
     char msg[96];
     snprintf(msg, sizeof msg, "First argument to String.prototype.%s must not be a regular expression", name);
     ts_throw_type_error_msg(msg);
@@ -8126,7 +8171,10 @@ tsv ts_arguments_array(const tsv* args, uint32_t n){
   return arr;
 }
 tsv ts_str_split(tsv s, tsv sep, tsv limit){
-  if (g_regexp_hooks && ts_is_regexp(sep)) return g_regexp_hooks->split(ts_is_str(s) ? s : ts_to_string_v(s), sep, limit);
+  if (TS_RT_UNLIKELY(g_regexp_protocol)){
+    tsv r;
+    if (str_protocol(s, sep, TS_WKSYM_SPLIT, limit, 1, &r)) return r;
+  } else if (g_regexp_hooks && ts_is_regexp(sep)) return g_regexp_hooks->split(ts_is_str(s) ? s : ts_to_string_v(s), sep, limit);
   if (!ts_is_str(s) && (s == TS_UNDEFINED || s == TS_NULL)) str_require_coercible(s, "split");
   ts_gc_root(&s); ts_gc_root(&sep);
   s = str_arg(s);
@@ -12037,7 +12085,11 @@ static tsv ts_str_replace_literal_build(tsv s, tsv pat, tsv rep, int all){
 }
 
 tsv ts_str_replace(tsv s, tsv pat, tsv rep, int all){
-  if (g_regexp_hooks && ts_is_regexp(pat)) return g_regexp_hooks->replace(ts_is_str(s) ? s : ts_to_string_v(s), pat, rep, all);
+  if (TS_RT_UNLIKELY(g_regexp_protocol)){
+    tsv r;
+    if (all) str_require_global(pat, "replaceAll");
+    if (str_protocol(s, pat, TS_WKSYM_REPLACE, rep, 1, &r)) return r;
+  } else if (g_regexp_hooks && ts_is_regexp(pat)) return g_regexp_hooks->replace(ts_is_str(s) ? s : ts_to_string_v(s), pat, rep, all);
   /* rep may be a FUNCTION replacer (called per match) instead of a string. */
   int rep_is_fn = ts_is_callable(rep);
   if (TS_RT_UNLIKELY(!ts_is_str(s) || !ts_is_str(pat) || (!rep_is_fn && !ts_is_str(rep)))){
@@ -12939,7 +12991,7 @@ static int json_emit_obj_prop(jbuf* b, tsv recv, uint32_t key, tsv val, int dept
   if (!n) return 0;
   val = json_apply_tojson(val, n, ts_field_name_len(key)); /* toJSON before omit */
   val = json_apply_replacer(b, recv, n, ts_field_name_len(key), val);
-  if (ts_is_undef(val)||ts_is_func(val)) return 0;          /* omit in objects */
+  if (ts_is_undef(val)||ts_is_func(val)||ts_is_symbol(val)) return 0;          /* omit in objects */
   ts_gc_root(&val);
   if (!*first) jb_putc(b,','); *first=0;
   jb_indent(b, indent, depth+1);
@@ -12995,6 +13047,7 @@ static int json_stringify_val(jbuf* b, tsv v, int depth, const char* indent){
   if (ts_is_num(v)){ json_num(b, ts_to_num(v)); return 1; }
   if (ts_is_bigint(v)) ts_throw_type_error_msg("Do not know how to serialize a BigInt");
   if (ts_is_str(v)){ json_quote(b, ts_str_view_typed(v)); return 1; }
+  if (ts_is_symbol(v)) return 0;
   if (ts_is_array(v)){
     ts_gc_root(&v);
     json_path node; json_enter(b, &node, &v, depth);
@@ -14280,6 +14333,19 @@ static void cb_inspect_obj_prop(uint32_t key, tsv val, void* ud){
   inspect_val(c->b, val, c->depth+1, 0);
 }
 
+/* An array's own named properties after its elements; with `emit` 0 only their count. */
+static uint32_t inspect_array_named(jbuf* b, tsv v, int depth, int first, int emit){
+  ts_object* o = ts_ptr(v);
+  uint32_t count = 0, idx;
+  inspect_obj_ctx ic = { b, depth, first, 0 };
+  for (uint32_t i = 0; i < obj_map(o)->len; i++){
+    ts_key k = obj_key_at(o, i);
+    if (k >= TS_WKSYM_KEY_BASE || !(obj_flags_at(o, i) & TS_PROP_ENUMERABLE) || !ts_field_name(k) || prop_key_is_array_index(k, &idx)) continue;
+    count++;
+    if (emit){ cb_inspect_obj_prop(k, obj_val_read(o, i), &ic); o = ts_ptr(v); }
+  }
+  return count;
+}
 /* Emit an ANSI color code into the buffer only when colorization is active. */
 static void jbc(jbuf* b, const char* code){ if (g_inspect_color) jb_putz(b, code); }
 
@@ -14372,7 +14438,7 @@ static void inspect_val(jbuf* b, tsv v, int depth, int top){
   if (ts_is_indexed_array_fast(v)){
     ts_gc_root(&v);
     ts_array* a=ts_ptr(v);
-    if (a->len==0){ jb_putz(b,"[]"); ts_gc_unroot(1); return; }
+    if (a->len==0 && !inspect_array_named(b, v, depth, 1, 0)){ jb_putz(b,"[]"); ts_gc_unroot(1); return; }
     uint32_t len=a->len;
     jb_putz(b,"[ ");
     for (uint32_t i=0;i<len;i++){
@@ -14389,6 +14455,7 @@ static void inspect_val(jbuf* b, tsv v, int depth, int top){
       }
       inspect_val(b, ts_array_get(v,i), depth+1, 0);
     }
+    inspect_array_named(b, v, depth, len == 0, 1);   /* `index`, `input` and `groups` of a match */
     jb_putz(b," ]");
     ts_gc_unroot(1);
     return;
@@ -18914,10 +18981,19 @@ tsv ts_strproto_trimStart(tsv* a, int n){ STR_THIS(a, n); (void)n; return ts_str
 tsv ts_strproto_trimEnd(tsv* a, int n){ STR_THIS(a, n); (void)n; return ts_str_trimend(a[0]); }
 tsv ts_strproto_trimLeft(tsv* a, int n){ STR_THIS(a, n); (void)n; return ts_str_trimstart(a[0]); }
 tsv ts_strproto_trimRight(tsv* a, int n){ STR_THIS(a, n); (void)n; return ts_str_trimend(a[0]); }
-tsv ts_strproto_split(tsv* a, int n){ STR_THIS(a, n); return ts_str_split(a[0], n>1?a[1]:TS_UNDEFINED, n>2?a[2]:TS_UNDEFINED); }
+/* The method of a dynamic receiver: the matcher sees the receiver before any ToString. */
+static int str_this_protocol(tsv* a, int n, const char* name, uint32_t wk, int has_extra, tsv* out){
+  str_require_coercible(n > 0 ? a[0] : TS_UNDEFINED, name);
+  return n > 1 && str_protocol(a[0], a[1], wk, n > 2 ? a[2] : TS_UNDEFINED, has_extra, out);
+}
+tsv ts_strproto_split(tsv* a, int n){
+  if (TS_RT_UNLIKELY(g_regexp_protocol)){ tsv r; if (str_this_protocol(a, n, "split", TS_WKSYM_SPLIT, 1, &r)) return r; }
+  STR_THIS(a, n); return ts_str_split(a[0], n>1?a[1]:TS_UNDEFINED, n>2?a[2]:TS_UNDEFINED); }
 tsv ts_strproto_padStart(tsv* a, int n){ STR_THIS(a, n); return ts_str_padstart(a[0], n>1?ts_number_coerce(a[1]):0, n>2?a[2]:TS_UNDEFINED); }
 tsv ts_strproto_padEnd(tsv* a, int n){ STR_THIS(a, n); return ts_str_padend(a[0], n>1?ts_number_coerce(a[1]):0, n>2?a[2]:TS_UNDEFINED); }
-tsv ts_strproto_replace(tsv* a, int n){ STR_THIS(a, n); return ts_str_replace(a[0], n>1?a[1]:TS_UNDEFINED, n>2?a[2]:TS_UNDEFINED, 0); }
+tsv ts_strproto_replace(tsv* a, int n){
+  if (TS_RT_UNLIKELY(g_regexp_protocol)){ tsv r; if (str_this_protocol(a, n, "replace", TS_WKSYM_REPLACE, 1, &r)) return r; }
+  STR_THIS(a, n); return ts_str_replace(a[0], n>1?a[1]:TS_UNDEFINED, n>2?a[2]:TS_UNDEFINED, 0); }
 /* match / matchAll / search on a dynamic receiver: a RegExp argument through the adapter, a
    string pattern as a RegExp made from it (matchAll adds the g flag), as the spec's
    String.prototype methods do */
@@ -18930,31 +19006,56 @@ static tsv ts_str_regexp_arg(tsv pat, const char* flags){
   ts_gc_unroot(1);
   return r;
 }
-tsv ts_strproto_match(tsv* a, int n){ STR_THIS(a, n);
+/* Invoke(rx, @@x, S) */
+static tsv str_invoke_regexp(tsv re, tsv s, uint32_t wk){
+  tsv m = ts_get(re, TS_KEY_WKSYM(wk));
+  if (!ts_is_callable(m)) ts_throw_type_error_msg("The value at the well-known symbol is not a function");
+  tsv argv[2] = { re, s };
+  return ts_call_method(m, argv, 2);
+}
+tsv ts_strproto_match(tsv* a, int n){
+  if (TS_RT_UNLIKELY(g_regexp_protocol)){ tsv r; if (str_this_protocol(a, n, "match", TS_WKSYM_MATCH, 0, &r)) return r; }
+  STR_THIS(a, n);
   if (!g_regexp_hooks) ts_throw_type_error_msg("RegExp support is not linked into this program");
   tsv s = ts_is_str(a[0]) ? a[0] : ts_to_string_v(a[0]); ts_gc_root(&s);
   tsv re = ts_str_regexp_arg(n>1?a[1]:TS_UNDEFINED, NULL); ts_gc_root(&re);
-  tsv r = g_regexp_hooks->match(s, re);
+  tsv r = TS_RT_UNLIKELY(g_regexp_protocol) ? str_invoke_regexp(re, s, TS_WKSYM_MATCH) : g_regexp_hooks->match(s, re);
   ts_gc_unroot(2);
   return r;
 }
-tsv ts_strproto_matchAll(tsv* a, int n){ STR_THIS(a, n);
+tsv ts_strproto_matchAll(tsv* a, int n){
+  if (TS_RT_UNLIKELY(g_regexp_protocol)){
+    tsv r;
+    str_require_coercible(n > 0 ? a[0] : TS_UNDEFINED, "matchAll");
+    if (n > 1) str_require_global(a[1], "matchAll");
+    if (str_this_protocol(a, n, "matchAll", TS_WKSYM_MATCH_ALL, 0, &r)) return r;
+  }
+  STR_THIS(a, n);
   if (!g_regexp_hooks) ts_throw_type_error_msg("RegExp support is not linked into this program");
   tsv s = ts_is_str(a[0]) ? a[0] : ts_to_string_v(a[0]); ts_gc_root(&s);
   tsv re = ts_str_regexp_arg(n>1?a[1]:TS_UNDEFINED, "g"); ts_gc_root(&re);
-  tsv r = g_regexp_hooks->match_all(s, re);
+  tsv r = TS_RT_UNLIKELY(g_regexp_protocol) ? str_invoke_regexp(re, s, TS_WKSYM_MATCH_ALL) : g_regexp_hooks->match_all(s, re);
   ts_gc_unroot(2);
   return r;
 }
-tsv ts_strproto_search(tsv* a, int n){ STR_THIS(a, n);
+tsv ts_strproto_search(tsv* a, int n){
+  if (TS_RT_UNLIKELY(g_regexp_protocol)){ tsv r; if (str_this_protocol(a, n, "search", TS_WKSYM_SEARCH, 0, &r)) return r; }
+  STR_THIS(a, n);
   if (!g_regexp_hooks) ts_throw_type_error_msg("RegExp support is not linked into this program");
   tsv s = ts_is_str(a[0]) ? a[0] : ts_to_string_v(a[0]); ts_gc_root(&s);
   tsv re = ts_str_regexp_arg(n>1?a[1]:TS_UNDEFINED, NULL); ts_gc_root(&re);
-  double r = g_regexp_hooks->search(s, re);
+  tsv r = TS_RT_UNLIKELY(g_regexp_protocol) ? str_invoke_regexp(re, s, TS_WKSYM_SEARCH) : ts_num(g_regexp_hooks->search(s, re));
   ts_gc_unroot(2);
-  return ts_num(r);
+  return r;
 }
-tsv ts_strproto_replaceAll(tsv* a, int n){ STR_THIS(a, n); return ts_str_replace(a[0], n>1?a[1]:TS_UNDEFINED, n>2?a[2]:TS_UNDEFINED, 1); }
+tsv ts_strproto_replaceAll(tsv* a, int n){
+  if (TS_RT_UNLIKELY(g_regexp_protocol)){
+    tsv r;
+    str_require_coercible(n > 0 ? a[0] : TS_UNDEFINED, "replaceAll");
+    if (n > 1) str_require_global(a[1], "replaceAll");
+    if (str_this_protocol(a, n, "replaceAll", TS_WKSYM_REPLACE, 1, &r)) return r;
+  }
+  STR_THIS(a, n); return ts_str_replace(a[0], n>1?a[1]:TS_UNDEFINED, n>2?a[2]:TS_UNDEFINED, 1); }
 
 tsv ts_string_proto(void){ return ts_proto_ref(g_string_proto_v) ? g_string_proto_v : TS_NULL; }
 /* String.prototype[Symbol.iterator]: the string's code points, as for-of and spread see them
@@ -19052,6 +19153,8 @@ void ts_symbol_ctor_link(tsv ctor){
   tsv p = ts_symbol_proto();
   ts_define_data(ctor, ts_intern_field("prototype", 9), p, 0, 0, 0);
   ts_define_data(p, ts_intern_field("constructor", 11), ctor, 0, 1, 1);
+  for (uint32_t i = 0; i < TS_WKSYM_COUNT; i++)
+    ts_define_data(ctor, ts_intern_field(g_wksym_names[i], (uint32_t)strlen(g_wksym_names[i])), ts_wksym(i), 0, 0, 0);
   ts_gc_unroot(1);
 }
 tsv ts_symbol_proto(void){

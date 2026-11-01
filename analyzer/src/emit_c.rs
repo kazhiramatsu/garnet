@@ -799,6 +799,9 @@ fn emit_program_with_string_plans(
         s.push_str("static void ts_setup_regexp_proto(void){\n");
         s.push_str("  ts_regexp_proto_init();\n");
         s.push_str("  ts_regexp_adapter_init();\n");
+        if program.fields.iter().any(|f| f.name.as_deref() == Some("__garnet_regexp_protocol")) {
+            s.push_str("  g_regexp_protocol = 1;\n");
+        }
         for m in &program.regexp_proto_methods {
             let _ = writeln!(
                 s,
@@ -15385,11 +15388,6 @@ fn emit_global_setup(s: &mut String, needs_fetch: bool, needs_typed_array_global
     s.push_str("  ts_symbol_ctor_link(_Symbol);\n");
     set_fn(s, "_Symbol", "for", "symbol.for", 1, "for");
     set_fn(s, "_Symbol", "keyFor", "symbol.keyFor", 1, "keyFor");
-    set_val(s, "_Symbol", "iterator", "ts_wksym(0u)");
-    set_val(s, "_Symbol", "asyncIterator", "ts_wksym(1u)");
-    set_val(s, "_Symbol", "toPrimitive", "ts_wksym(2u)");
-    set_val(s, "_Symbol", "hasInstance", "ts_wksym(3u)");
-    set_val(s, "_Symbol", "toStringTag", "ts_wksym(4u)");
     global_set_rooted(s, "Symbol", "_Symbol");
 
     s.push_str(
