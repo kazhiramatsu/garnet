@@ -1579,6 +1579,7 @@ void ts_string_proto_register(ts_key method_key, const char* name, ts_code fn);
 tsv  ts_regexp_proto(void);
 tsv  ts_object_group_by(tsv* a, int n);
 tsv  ts_map_group_by(tsv* a, int n);
+tsv  ts_new_array_buffer_options(tsv length, tsv options, int shared);
 tsv  ts_symbol_proto(void);
 tsv  ts_date_proto(void);
 void ts_date_ctor_link(tsv ctor);   /* Date.prototype and its `constructor` */

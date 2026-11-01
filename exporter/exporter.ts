@@ -10716,14 +10716,9 @@ class Exporter {
         this.unsupported(node, `new ${ctorName}(...spread)`);
         return this.newLocal(ctx, "reference", hint);
       }
-      // A second ArrayBuffer argument makes a resizable buffer, which is not modeled.
-      if (taElem === undefined && argNodes.length > 1) {
-        this.unsupported(node, `resizable ${ctorName} (an options argument)`);
-        return this.newLocal(ctx, "reference", hint);
-      }
       const args = this.lowerSequenced(ctx, argNodes);
       const dst = this.newLocal(ctx, "reference", hint);
-      const builtin = taElem !== undefined ? `typedarray.new:${taElem}` : `arraybuffer.new:${ctorName === "ArrayBuffer" ? 0 : 1}`;
+      const builtin = taElem !== undefined ? `typedarray.new:${taElem}` : `arraybuffer.new${args.length > 1 ? "Options" : ""}:${ctorName === "ArrayBuffer" ? 0 : 1}`;
       ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin, args });
       return dst;
     }

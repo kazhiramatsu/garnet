@@ -16751,6 +16751,12 @@ tsv ts_new_typed_array(int elem, tsv* args, int n){
 tsv ts_new_array_buffer(tsv length, int shared){
   return ta_new_buffer(ts_is_undef(length) ? 0 : ta_to_index(length, 1), shared);
 }
+/* `new ArrayBuffer(n, { maxByteLength })`: no resizable buffers yet, a catchable TypeError where one is made */
+tsv ts_new_array_buffer_options(tsv length, tsv options, int shared){
+  if (ts_object_like(options) && !ts_is_symbol(options) && !ts_is_undef(ts_get(options, ts_intern_field("maxByteLength", 13))))
+    ts_throw_type_error_msg("A resizable ArrayBuffer is not supported");
+  return ts_new_array_buffer(length, shared);
+}
 static uint32_t ta_source_length(tsv src){
   if (ts_is_typed_array(src)) return ta_ptr(src)->length;
   if (ts_is_indexed_array_fast(src)) return ts_array_len(src);
@@ -17109,6 +17115,109 @@ static tsv ta_m_reduce(tsv* a, int n){
   }
   ts_gc_unroot(3); return acc;
 }
+static tsv ta_m_reduce_right(tsv* a, int n){
+  tsv t = ta_require(n ? a[0] : TS_UNDEFINED, "reduceRight"); ts_gc_root(&t);
+  tsv cb = n > 1 ? a[1] : TS_UNDEFINED; ts_gc_root(&cb);
+  ta_require_callable(cb, 1);
+  uint32_t len = ta_ptr(t)->length, i = len;
+  tsv acc = TS_UNDEFINED; ts_gc_root(&acc);
+  if (n > 2) acc = a[2];
+  else {
+    if (len == 0) ts_throw_type_error_msg("Reduce of empty array with no initial value");
+    acc = ts_num(ta_load(ta_ptr(t), len - 1)); i = len - 1;
+  }
+  ts_cb cbf; cb_resolve(&cbf, cb);
+  while (i-- > 0){
+    tsv v = i < ta_ptr(t)->length ? ts_num(ta_load(ta_ptr(t), i)) : TS_UNDEFINED;
+    tsv args[4] = { acc, v, ts_num((double)i), t };
+    acc = cb_call(&cbf, cb, args, 4);
+  }
+  ts_gc_unroot(3); return acc;
+}
+static tsv ta_m_find_last(tsv* a, int n){
+  TA_CB_BEGIN("findLast")
+  tsv r = TS_UNDEFINED;
+  for (uint32_t i = ta_ptr(t)->length; i-- > 0;){
+    double v = ta_load(ta_ptr(t), i);
+    if (ts_truthy(ta_cb_call(&cbf, cb, t, i))){ r = ts_num(v); break; }
+  }
+  ts_gc_unroot(2); return r;
+}
+static tsv ta_m_find_last_index(tsv* a, int n){
+  TA_CB_BEGIN("findLastIndex")
+  double r = -1;
+  for (uint32_t i = ta_ptr(t)->length; i-- > 0;) if (ts_truthy(ta_cb_call(&cbf, cb, t, i))){ r = i; break; }
+  ts_gc_unroot(2); return ts_num(r);
+}
+/* the change-by-copy methods: a new array of the same element type, never through species */
+static tsv ta_copy_of(tsv t){
+  ts_gc_root(&t);
+  tsv r = ta_new_length(ta_ptr(t)->elem, ta_ptr(t)->length);
+  ts_typedarray* x = ta_ptr(t); ts_typedarray* y = ta_ptr(r);
+  for (uint32_t i = 0; i < x->length; i++) ta_store(y, i, ta_load(x, i));
+  ts_gc_unroot(1);
+  return r;
+}
+static tsv ta_m_to_reversed(tsv* a, int n){
+  tsv t = ta_require(n ? a[0] : TS_UNDEFINED, "toReversed");
+  tsv r = ta_copy_of(t);
+  tsv av[1] = { r };
+  return ta_m_reverse(av, 1);
+}
+static tsv ta_m_to_sorted(tsv* a, int n){
+  tsv t = ta_require(n ? a[0] : TS_UNDEFINED, "toSorted");
+  tsv cmp = n > 1 ? a[1] : TS_UNDEFINED;
+  if (!ts_is_undef(cmp) && !ts_is_callable(cmp)) ts_throw_type_error_msg("The comparison function must be either a function or undefined");
+  ts_gc_root(&cmp);
+  tsv r = ta_copy_of(t);
+  tsv av[2] = { r, cmp };
+  ts_gc_root(&av[0]);
+  tsv out = ta_m_sort(av, 2);
+  ts_gc_unroot(2);
+  return out;
+}
+static tsv ta_m_with(tsv* a, int n){
+  tsv t = ta_require(n ? a[0] : TS_UNDEFINED, "with"); ts_gc_root(&t);
+  double len = (double)ta_ptr(t)->length;
+  double d = n > 1 ? ts_number_coerce(a[1]) : 0.0;
+  d = d != d ? 0.0 : trunc(d);
+  double index = d < 0 ? len + d : d;
+  double v = ts_number_coerce(n > 2 ? a[2] : TS_UNDEFINED);
+  if (!(index >= 0 && index < (double)ta_ptr(t)->length)) ts_throw_range_error_msg("Invalid typed array index");
+  tsv r = ta_copy_of(t);
+  ta_store(ta_ptr(r), (uint32_t)index, v);
+  ts_gc_unroot(1);
+  return r;
+}
+/* the getters of %TypedArray%.prototype: an instance answers by key before the chain, so these are what
+   a descriptor shows and what a receiver that is no typed array meets */
+static tsv ta_get_this(tsv* a, int n, const char* what){
+  tsv v = n > 0 ? a[0] : TS_UNDEFINED;
+  if (!ts_is_typed_array(v)){
+    char m[96];
+    snprintf(m, sizeof m, "Method get %%TypedArray%%.prototype.%s called on incompatible receiver", what);
+    ts_throw_type_error_msg(m);
+  }
+  return v;
+}
+static tsv ta_g_buffer(tsv* a, int n){ return ta_ptr(ta_get_this(a, n, "buffer"))->buffer; }
+static tsv ta_g_length(tsv* a, int n){ return ts_num((double)ta_ptr(ta_get_this(a, n, "length"))->length); }
+static tsv ta_g_byte_offset(tsv* a, int n){ return ts_num((double)ta_ptr(ta_get_this(a, n, "byteOffset"))->byte_offset); }
+static tsv ta_g_byte_length(tsv* a, int n){
+  ts_typedarray* t = ta_ptr(ta_get_this(a, n, "byteLength"));
+  return ts_num((double)t->length * g_ta_size[t->elem]);
+}
+static tsv ta_g_tag(tsv* a, int n){
+  if (n < 1 || !ts_is_typed_array(a[0])) return TS_UNDEFINED;
+  const char* name = g_ta_name[ta_ptr(a[0])->elem];
+  return ts_new_string(name, (uint32_t)strlen(name));
+}
+static void ta_getter(tsv p, ts_key key, const char* name, ts_code fn){
+  tsv f = ts_make_fn_t(fn, NULL, 0, 1); ts_gc_root(&f);
+  ts_set_fn_meta(f, 0, name);
+  ts_define_accessor_attr(p, key, f, TS_UNDEFINED, 1, 0, 0, 1);
+  ts_gc_unroot(1);
+}
 static tsv ta_m_values(tsv* a, int n){ return ts_array_iter_new(ta_require(n ? a[0] : TS_UNDEFINED, "values"), 0); }
 static tsv ta_m_keys(tsv* a, int n){ return ts_array_iter_new(ta_require(n ? a[0] : TS_UNDEFINED, "keys"), 1); }
 static tsv ta_m_entries(tsv* a, int n){ return ts_array_iter_new(ta_require(n ? a[0] : TS_UNDEFINED, "entries"), 2); }
@@ -17164,15 +17273,22 @@ static void ta_protos_init(void){
   ta_proto_method(p, "find", ta_m_find, 1);
   ta_proto_method(p, "findIndex", ta_m_find_index, 1);
   ta_proto_method(p, "reduce", ta_m_reduce, 1);
+  ta_proto_method(p, "reduceRight", ta_m_reduce_right, 1);
+  ta_proto_method(p, "findLast", ta_m_find_last, 1);
+  ta_proto_method(p, "findLastIndex", ta_m_find_last_index, 1);
+  ta_proto_method(p, "toReversed", ta_m_to_reversed, 0);
+  ta_proto_method(p, "toSorted", ta_m_to_sorted, 1);
+  ta_proto_method(p, "with", ta_m_with, 2);
   ta_proto_method(p, "keys", ta_m_keys, 0);
   ta_proto_method(p, "entries", ta_m_entries, 0);
   ta_proto_method(p, "values", ta_m_values, 0);
-  {
-    tsv it = ts_make_fn_t(ta_m_values, NULL, 0, 1); ts_gc_root(&it);
-    ts_set_fn_meta(it, 0, "values");
-    ts_define_data(p, TS_KEY_WKSYM(TS_WKSYM_ITERATOR), it, 0, 1, 1);
-    ts_gc_unroot(1);
-  }
+  /* one function under both names */
+  ts_define_data(p, TS_KEY_WKSYM(TS_WKSYM_ITERATOR), ts_get(p, ts_intern_field("values", 6)), 0, 1, 1);
+  ta_getter(p, g_ta_k_buffer, "get buffer", ta_g_buffer);
+  ta_getter(p, g_ta_k_byte_length, "get byteLength", ta_g_byte_length);
+  ta_getter(p, g_ta_k_byte_offset, "get byteOffset", ta_g_byte_offset);
+  ta_getter(p, g_ta_k_length, "get length", ta_g_length);
+  ta_getter(p, TS_KEY_WKSYM(TS_WKSYM_TO_STRING_TAG), "get [Symbol.toStringTag]", ta_g_tag);
   for (int e = 0; e < TS_TA_COUNT; e++){
     g_ta_proto[e] = ts_new_proto();
     ts_root_static_once(&g_ta_proto[e], &rooted_each[e]);
@@ -17209,21 +17325,14 @@ static void ta_requires_new(const char* name){
   ts_throw_type_error_msg(buf);
 }
 #define TA_CTOR_ADAPTERS(E) \
-  static tsv ta_ctor_call_##E(tsv* a, int n){ if (!ts_native_new_take()) ta_requires_new(g_ta_name[E]); return ts_new_typed_array(E, a, n); } \
-  static tsv ta_static_from_##E(tsv* a, int n){ \
-    return ts_typed_array_from(E, n > 0 ? a[0] : TS_UNDEFINED, n > 1 ? a[1] : TS_UNDEFINED, n > 2 ? a[2] : TS_UNDEFINED); } \
-  static tsv ta_static_of_##E(tsv* a, int n){ return ts_typed_array_of(E, a, n); }
+  static tsv ta_ctor_call_##E(tsv* a, int n){ if (!ts_native_new_take()) ta_requires_new(g_ta_name[E]); return ts_new_typed_array(E, a, n); }
 TA_CTOR_ADAPTERS(0) TA_CTOR_ADAPTERS(1) TA_CTOR_ADAPTERS(2) TA_CTOR_ADAPTERS(3) TA_CTOR_ADAPTERS(4)
 TA_CTOR_ADAPTERS(5) TA_CTOR_ADAPTERS(6) TA_CTOR_ADAPTERS(7) TA_CTOR_ADAPTERS(8)
 #undef TA_CTOR_ADAPTERS
 static const ts_code g_ta_ctor_call[TS_TA_COUNT] = { ta_ctor_call_0, ta_ctor_call_1, ta_ctor_call_2,
   ta_ctor_call_3, ta_ctor_call_4, ta_ctor_call_5, ta_ctor_call_6, ta_ctor_call_7, ta_ctor_call_8 };
-static const ts_code g_ta_static_from[TS_TA_COUNT] = { ta_static_from_0, ta_static_from_1, ta_static_from_2,
-  ta_static_from_3, ta_static_from_4, ta_static_from_5, ta_static_from_6, ta_static_from_7, ta_static_from_8 };
-static const ts_code g_ta_static_of[TS_TA_COUNT] = { ta_static_of_0, ta_static_of_1, ta_static_of_2,
-  ta_static_of_3, ta_static_of_4, ta_static_of_5, ta_static_of_6, ta_static_of_7, ta_static_of_8 };
-static tsv ab_ctor_call_0(tsv* a, int n){ if (!ts_native_new_take()) ta_requires_new("ArrayBuffer"); return ts_new_array_buffer(n ? a[0] : TS_UNDEFINED, 0); }
-static tsv ab_ctor_call_1(tsv* a, int n){ if (!ts_native_new_take()) ta_requires_new("SharedArrayBuffer"); return ts_new_array_buffer(n ? a[0] : TS_UNDEFINED, 1); }
+static tsv ab_ctor_call_0(tsv* a, int n){ if (!ts_native_new_take()) ta_requires_new("ArrayBuffer"); return ts_new_array_buffer_options(n ? a[0] : TS_UNDEFINED, n > 1 ? a[1] : TS_UNDEFINED, 0); }
+static tsv ab_ctor_call_1(tsv* a, int n){ if (!ts_native_new_take()) ta_requires_new("SharedArrayBuffer"); return ts_new_array_buffer_options(n ? a[0] : TS_UNDEFINED, n > 1 ? a[1] : TS_UNDEFINED, 1); }
 static tsv ab_static_is_view(tsv* a, int n){ return ts_bool(n > 0 && ts_array_buffer_is_view(a[0])); }
 static void ta_static_fn(tsv obj, const char* name, ts_code fn, uint32_t arity){
   tsv fv = ts_make_fn_t(fn, NULL, 0, 0); ts_gc_root(&fv);
@@ -17241,14 +17350,62 @@ static tsv ta_ctor_value(const char* name, ts_code call, uint32_t arity, tsv pro
   ts_gc_unroot(2);
   return f;
 }
+/* %TypedArray%: the constructors' prototype, abstract; `from` and `of` live here and go by `this` */
+static tsv g_ta_abstract = TS_UNDEFINED;
+static tsv ta_abstract_call(tsv* a, int n){
+  (void)a; (void)n; ts_native_new_take();
+  ts_throw_type_error_msg("Abstract class TypedArray not directly constructable");
+  return TS_UNDEFINED;
+}
+static int ts_value_is_constructor(tsv v);
+/* `new this(len)`, for a constructor that is none of the built-in ones */
+static tsv ta_create_by(tsv ctor, uint32_t len){
+  tsv arg = ts_num((double)len);
+  tsv r = ts_construct(ctor, &arg, 1);
+  if (!ts_is_typed_array(r)) ts_throw_type_error_msg("The constructor did not make a typed array");
+  if (ta_ptr(r)->length < len) ts_throw_type_error_msg("The typed array made is too short");
+  return r;
+}
+static tsv ta_abstract_from(tsv* a, int n){
+  tsv self = n > 0 ? a[0] : TS_UNDEFINED;
+  tsv src = n > 1 ? a[1] : TS_UNDEFINED, mapfn = n > 2 ? a[2] : TS_UNDEFINED, this_arg = n > 3 ? a[3] : TS_UNDEFINED;
+  if (!ts_value_is_constructor(self)) ts_throw_type_error_msg("%TypedArray%.from: `this` is not a constructor");
+  if (!ts_is_undef(mapfn) && !ts_is_callable(mapfn)) ts_throw_type_error_msg("%TypedArray%.from: the map function is not callable");
+  for (int e = 0; e < TS_TA_COUNT; e++) if (self == g_ta_ctor[e]) return ts_typed_array_from(e, src, mapfn, this_arg);
+  ts_gc_root(&self); ts_gc_root(&mapfn); ts_gc_root(&this_arg);
+  tsv list = ts_array_from(src); ts_gc_root(&list);
+  uint32_t len = ts_array_len(list);
+  tsv out = ta_create_by(self, len); ts_gc_root(&out);
+  for (uint32_t i = 0; i < len; i++){
+    tsv v = ts_array_get(list, i);
+    if (!ts_is_undef(mapfn)){ tsv av[3] = { this_arg, v, ts_num((double)i) }; v = ts_call_method(mapfn, av, 3); }
+    ts_set_dyn(out, ts_num((double)i), v);
+  }
+  ts_gc_unroot(5);
+  return out;
+}
+static tsv ta_abstract_of(tsv* a, int n){
+  tsv self = n > 0 ? a[0] : TS_UNDEFINED;
+  if (!ts_value_is_constructor(self)) ts_throw_type_error_msg("%TypedArray%.of: `this` is not a constructor");
+  for (int e = 0; e < TS_TA_COUNT; e++) if (self == g_ta_ctor[e]) return ts_typed_array_of(e, n > 1 ? a + 1 : NULL, n > 1 ? n - 1 : 0);
+  ts_gc_root(&self);
+  uint32_t len = n > 1 ? (uint32_t)(n - 1) : 0;
+  tsv out = ta_create_by(self, len); ts_gc_root(&out);
+  for (uint32_t i = 0; i < len; i++) ts_set_dyn(out, ts_num((double)i), a[i + 1]);
+  ts_gc_unroot(2);
+  return out;
+}
 static void ta_ctors_init(void){
-  static int rooted_each[TS_TA_COUNT], rooted_ab = 0, rooted_sab = 0;
+  static int rooted_each[TS_TA_COUNT], rooted_ab = 0, rooted_sab = 0, rooted_abstract = 0;
+  g_ta_abstract = ta_ctor_value("TypedArray", ta_abstract_call, 0, g_typed_array_proto);
+  ts_root_static_once(&g_ta_abstract, &rooted_abstract);
+  ta_proto_method(g_ta_abstract, "from", ta_abstract_from, 1);
+  ta_proto_method(g_ta_abstract, "of", ta_abstract_of, 0);
   for (int e = 0; e < TS_TA_COUNT; e++){
     g_ta_ctor[e] = ta_ctor_value(g_ta_name[e], g_ta_ctor_call[e], 3, g_ta_proto[e]);
     ts_root_static_once(&g_ta_ctor[e], &rooted_each[e]);
     ts_define_data(g_ta_ctor[e], g_ta_k_bpe, ts_num((double)g_ta_size[e]), 0, 0, 0);
-    ta_static_fn(g_ta_ctor[e], "from", g_ta_static_from[e], 1);
-    ta_static_fn(g_ta_ctor[e], "of", g_ta_static_of[e], 0);
+    ((ts_object*)ts_ptr(g_ta_ctor[e]))->proto = g_ta_abstract;
   }
   g_ab_ctor = ta_ctor_value("ArrayBuffer", ab_ctor_call_0, 1, g_arraybuffer_proto);
   ts_root_static_once(&g_ab_ctor, &rooted_ab);

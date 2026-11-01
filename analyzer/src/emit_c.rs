@@ -23969,6 +23969,10 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 "atomics.isLockFree" => (format!("ts_atomics_is_lock_free({})", v(0)), false),
                 "atomics.wait" => (format!("ts_atomics_wait({}, {}, {}, {})", v(0), v(1), v(2), v(3)), false),
                 "atomics.notify" => (format!("ts_atomics_notify({}, {}, {})", v(0), v(1), v(2)), false),
+                b if b.starts_with("arraybuffer.newOptions:") => (
+                    format!("ts_new_array_buffer_options({}, {}, {})", v(0), v(1), &b["arraybuffer.newOptions:".len()..]),
+                    false,
+                ),
                 b if b.starts_with("arraybuffer.new:") => (
                     format!("ts_new_array_buffer({}, {})", v(0), &b["arraybuffer.new:".len()..]),
                     false,
