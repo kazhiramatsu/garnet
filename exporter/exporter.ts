@@ -617,7 +617,7 @@ function programWithNodeSupport(rootNames: string[], options: ts.CompilerOptions
       const named = (text: string): boolean => NODE_PRELUDE_GLOBALS.has(text) || (triggers !== undefined && triggers.has(text));
       if (triggers !== undefined && regexpProtocolText.test(f.text)) found.add(REGEXP_PROTOCOL_TRIGGER);
       if (triggers !== undefined && speciesText.test(f.text)) found.add(SPECIES_TRIGGER);
-      if (triggers !== undefined && (promiseProtocolText.test(f.text) || (/\bPromise\b/.test(f.text) && /\.\s*constructor\s*=[^=]/.test(f.text)))) found.add(PROMISE_PROTOCOL_TRIGGER);
+      if (triggers !== undefined && (promiseProtocolText.test(f.text) || (/\bPromise\b/.test(f.text) && /(?<!\bprototype\s*)\.\s*constructor\s*=[^=]/.test(f.text)))) found.add(PROMISE_PROTOCOL_TRIGGER);
       if (triggers !== undefined && arrayGenericText.test(f.text)) found.add(ARRAY_GENERIC_TRIGGER);
       if (triggers !== undefined && /\bSymbol\s*\.\s*(dispose|asyncDispose)\b/.test(f.text)) found.add("DisposableStack");
       const visit = (n: ts.Node): void => {

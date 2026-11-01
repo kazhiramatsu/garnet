@@ -12846,6 +12846,8 @@ Where it stopped (branch `s363-dc`, worktree `build/wt_dc`, on top of `s362-wip`
   synthetic namespace is a symbol of its own). A parameter property is the first key of an instance, wherever the constructor stands.
   rxjs, zod and yaml compile again: a generic arrow's type parameter was a capture in a static initializer, `exactOptionalPropertyTypes`
   stopped `lib/node/web/streams.ts`, `Object.assign(Buffer, statics)` wrote the read-only `Function.prototype[Symbol.hasInstance]`.
+- vue's text reaches the protocol libraries (`Array.prototype`, `Promise.prototype`, `isConcatSpreadable`): its driver takes 2.7% more
+  instructions than before them (25.47G to 26.16G), for what it can observe. Kept, to be recovered with the elements-kind work.
 - **import() of a bundled module** (`docs/dynamic_import_design.md`): a compile-time reject before. A module only `import()` reaches is
   compiled in, its top-level statements a function of their own, evaluated once when asked, deps first, a failure kept, a top-level
   await honored. `export default class {}` was missing from a namespace and its statics never ran (silent): a dynamic class.
