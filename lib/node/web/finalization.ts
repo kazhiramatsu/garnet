@@ -26,3 +26,13 @@ export class FinalizationRegistry {
   }
 }
 Object.defineProperty(FinalizationRegistry.prototype, Symbol.toStringTag, { value: "FinalizationRegistry", writable: false, enumerable: false, configurable: true });
+
+export class WeakRef {
+  #target: any;
+  constructor(target: any) {
+    if (!canBeHeldWeakly(target)) throw new TypeError("WeakRef: invalid target");
+    this.#target = target;
+  }
+  deref(): any { return this.#target; }
+}
+Object.defineProperty(WeakRef.prototype, Symbol.toStringTag, { value: "WeakRef", writable: false, enumerable: false, configurable: true });

@@ -1359,6 +1359,7 @@ tsv  ts_atomics_compare_exchange(tsv ta, tsv index, tsv expected, tsv replacemen
 tsv  ts_atomics_is_lock_free(tsv n);
 tsv  ts_atomics_wait(tsv ta, tsv index, tsv value, tsv timeout);
 tsv  ts_atomics_notify(tsv ta, tsv index, tsv count);
+tsv  ts_atomics_pause(tsv n);
 tsv  ts_text_encoder_new(void);
 tsv  ts_text_decoder_new(tsv label, tsv options);
 tsv  ts_text_encoder_proto(void);
@@ -1531,6 +1532,9 @@ typedef struct ts_func {
      `new fn(...)` calls the code with the arguments alone and takes the object it returns;
      no instance is allocated for it (ts_construct). */
   uint8_t native_ctor : 1;
+  /* 1 once the program gave a class value a [[Prototype]] (Object.setPrototypeOf): it is `o.proto` then, and
+     no longer the base class the prototypes' chain says (ts_get_proto) */
+  uint8_t user_proto : 1;
   /* 1: the constructor of a dynamic class (docs/dynamic_classes_design.md): `new` leaves new.target and
      the active function for its entry; its `prototype` is read only. */
   uint8_t dyn_class : 1;
@@ -1651,6 +1655,7 @@ tsv  ts_make_fn_t_pretenured(ts_code code, tsv* env, uint32_t envlen, int takes_
 tsv ts_funcproto_call(tsv* args, int n);
 tsv ts_funcproto_apply(tsv* args, int n);
 tsv ts_funcproto_bind(tsv* args, int n);
+tsv ts_funcproto_toString(tsv* args, int n);
 /* String.prototype setup (any-typed string method dispatch). */
 tsv  ts_string_proto(void);
 void ts_string_proto_init(void);
@@ -2248,6 +2253,8 @@ tsv ts_new_target_of(tsv self);
 tsv ts_take_new_target(ts_code code);
 tsv ts_import_meta(uint32_t module, tsv path);
 void ts_register_primitive_ctors(tsv object, tsv number, tsv boolean);
+void ts_register_symbol_ctor(tsv symbol);
+void ts_define_has_instance(void);
 tsv ts_object_freeze_unseen(tsv v);
 tsv ts_object_is_frozen(tsv v);
 /* A typed direct store on a frozen class instance: the strict-mode TypeError

@@ -12783,5 +12783,16 @@ Where it stopped (branch `s363-dc`, worktree `build/wt_dc`, on top of `s362-wip`
 - test262 samples now: 500 random of statements and built-ins pass 376 of 412 runnable; 400 random of `language/` 341 of 354;
   a tenth of the rest of built-ins 743 of 879 before the last batches; `Array.prototype` 527 of 554 in a fifth;
   `Object.defineProperty` and `defineProperties` 568 of 576 in a third; RegExp's protocol directories 92 of 92 in a third.
+- **The `arguments` object** as a value is an object of its own where it is observed (`argumentsNeedObject`,
+  `ts_arguments_object`): `Object.prototype` as its prototype, `length` and the index keys own and configurable, its iterator
+  the same value as `Array.prototype.values`, the poisoned `callee`.
+- **String objects belong to the runtime**: `new String(s)` is a wrapper as `new Number` is, where a prelude class stood before.
+  The characters are read on a miss and become own, read-only properties at the first look that needs them
+  (`string_object_touch`: a program that wraps a long string to hang properties on it, hono's escaped HTML, never pays). Two
+  String objects of one shape can differ in length, so the index read goes past every site cache. `String.raw` over any
+  array-like, `[...new String("ab")]`, a write to a character throws.
+- **Collections seed through the adder** (`collection_seed`): `new Map(iterable)`, `Set`, `WeakMap`, `WeakSet` look up
+  `set` / `add` once, close the iterator on a throw, and a replaced adder is observed. `Array.fromAsync`
+  (`lib/node/web/array_from_async.ts`), `Object.prototype.toString`'s built-in tags, `Object.getPrototypeOf` of a primitive.
 - Found, not fixed: `console.log` prints an object or array on one line where Node breaks at 72 columns and groups long
   numeric arrays.

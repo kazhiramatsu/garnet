@@ -172,14 +172,16 @@ const NODE_PRELUDE_GLOBALS = new Set(["process", "Buffer", "atob", "btoa", "setT
   "CompressionStream", "DecompressionStream",
   // explicit resource management (docs/using_declarations_design.md)
   "SuppressedError", "DisposableStack", "AsyncDisposableStack", "__garnet_using_stack", "__garnet_use", "__garnet_dispose", "__garnet_dispose_async",
-  "FinalizationRegistry"]);
+  "FinalizationRegistry", "WeakRef"]);
 /** The constructors among them: lib.dom declares the identifier, the prelude's class is the
  *  global object's value, and `new URL(...)` constructs through that value. */
+/** The members of a builtin namespace a library part puts on the object: read, and called, as properties. */
+const LIBRARY_NAMESPACE_MEMBERS = new Set(["rawJSON", "isRawJSON", "fromAsync", "raw", "waitAsync", "fromBase64", "fromHex"]);
 const NODE_PRELUDE_CTORS = new Set(["URL", "URLSearchParams", "Headers", "Request", "Response", "FormData", "DataView",
   "Crypto", "SubtleCrypto", "CryptoKey",
   "ReadableStream", "WritableStream", "TransformStream", "ReadableStreamDefaultReader", "WritableStreamDefaultWriter", "ReadableStreamDefaultController", "WritableStreamDefaultController", "TransformStreamDefaultController", "TextEncoderStream", "TextDecoderStream", "CountQueuingStrategy", "ByteLengthQueuingStrategy", "Blob", "File",
   // the compression streams (docs/web_compression_design.md)
-  "CompressionStream", "DecompressionStream", "SuppressedError", "DisposableStack", "AsyncDisposableStack", "FinalizationRegistry"]);
+  "CompressionStream", "DecompressionStream", "SuppressedError", "DisposableStack", "AsyncDisposableStack", "FinalizationRegistry", "WeakRef"]);
 /** The lib modules behind the globals: a program's prelude imports only the parts it names,
  *  so a program that uses setTimeout does not compile the streams behind process.stdout. */
 /** A program text that can tell the engine's direct paths from the protocol: it names a matcher's well-known
@@ -217,10 +219,12 @@ const NODE_PRELUDE_PARTS: { file: string; names: string[]; defaultImport?: strin
   { file: "web/blob", names: ["Blob", "File"] },
   // CompressionStream / DecompressionStream over the system's zlib (docs/web_compression_design.md)
   { file: "web/compression", names: ["CompressionStream", "DecompressionStream"] },
-  { file: "web/finalization", names: ["FinalizationRegistry"] },
+  { file: "web/finalization", names: ["FinalizationRegistry", "WeakRef"] },
   // explicit resource management (docs/using_declarations_design.md)
   { file: "web/disposable", names: ["SuppressedError", "DisposableStack", "AsyncDisposableStack", "__garnet_using_stack", "__garnet_use", "__garnet_dispose", "__garnet_dispose_async"] },
   { file: "web/array_from_async", names: [], triggers: ["fromAsync"] },
+  { file: "web/atomics_wait_async", names: [], triggers: ["waitAsync"] },
+  { file: "web/uint8_base64", names: [], triggers: ["fromBase64", "fromHex", "toBase64", "toHex", "setFromBase64", "setFromHex"] },
   // on demand: a program that can see Promise's protocol (docs/promise_protocol_design.md)
   { file: "web/promise_protocol", names: [], triggers: [PROMISE_PROTOCOL_TRIGGER] },
   // on demand: a program that passes the array methods an array-like (docs/array_protocol_design.md)
@@ -599,7 +603,7 @@ function programWithNodeSupport(rootNames: string[], options: ts.CompilerOptions
       const named = (text: string): boolean => NODE_PRELUDE_GLOBALS.has(text) || (triggers !== undefined && triggers.has(text));
       if (triggers !== undefined && regexpProtocolText.test(f.text)) found.add(REGEXP_PROTOCOL_TRIGGER);
       if (triggers !== undefined && speciesText.test(f.text)) found.add(SPECIES_TRIGGER);
-      if (triggers !== undefined && promiseProtocolText.test(f.text)) found.add(PROMISE_PROTOCOL_TRIGGER);
+      if (triggers !== undefined && (promiseProtocolText.test(f.text) || (/\bPromise\b/.test(f.text) && /\.\s*constructor\s*=[^=]/.test(f.text)))) found.add(PROMISE_PROTOCOL_TRIGGER);
       if (triggers !== undefined && arrayGenericText.test(f.text)) found.add(ARRAY_GENERIC_TRIGGER);
       if (triggers !== undefined && /\bSymbol\s*\.\s*(dispose|asyncDispose)\b/.test(f.text)) found.add("DisposableStack");
       const visit = (n: ts.Node): void => {
@@ -1731,7 +1735,7 @@ class Exporter {
   defineConst(ctx: FnCtx, id: ts.Identifier, v: boolean | number | string): number {
     const dst = this.newLocal(ctx, typeof v === "string" ? "reference" : "primitive", id.text);
     const value = typeof v === "boolean" ? { kind: "Bool", value: v }
-      : typeof v === "number" ? (Object.is(v, -0) ? { kind: "NegZero" } : Number.isNaN(v) ? { kind: "NaN" } : { kind: "Num", value: this.numWire(v) })
+      : typeof v === "number" ? this.numConst(v)
       : { kind: "Str", value: v };
     ctx.body.push({ kind: "Const", dst, value } as any);
     return dst;
@@ -4225,15 +4229,22 @@ class Exporter {
     let init: ts.Expression = d.initializer;
     while (ts.isParenthesizedExpression(init)) init = init.expression;
     const num = (lit: ts.NumericLiteral): number => Number(lit.text.replace(/_/g, ""));
-    if (ts.isNumericLiteral(init)) return { kind: "Num", value: this.numWire(num(init)) };
+    if (ts.isNumericLiteral(init)) return this.numConst(num(init));
     if (ts.isPrefixUnaryExpression(init) && init.operator === ts.SyntaxKind.MinusToken && ts.isNumericLiteral(init.operand)) {
-      const v = -num(init.operand);
-      return Object.is(v, -0) ? { kind: "NegZero" } : { kind: "Num", value: this.numWire(v) };
+      return this.numConst(-num(init.operand));
     }
     if (ts.isStringLiteral(init) || ts.isNoSubstitutionTemplateLiteral(init)) return { kind: "Str", value: init.text };
     if (init.kind === ts.SyntaxKind.TrueKeyword) return { kind: "Bool", value: true };
     if (init.kind === ts.SyntaxKind.FalseKeyword) return { kind: "Bool", value: false };
     return undefined;
+  }
+  /** The constant of a number: the values JSON has no form for have kinds of their own (`1e999` is a literal of Infinity). */
+  private numConst(v: number): any {
+    if (Object.is(v, -0)) return { kind: "NegZero" };
+    if (Number.isNaN(v)) return { kind: "NaN" };
+    if (v === Infinity) return { kind: "PosInf" };
+    if (v === -Infinity) return { kind: "NegInf" };
+    return { kind: "Num", value: this.numWire(v) };
   }
   private numWire(value: number): number | string {
     if (Number.isFinite(value) && Number.isInteger(value) && Math.abs(value) > Number.MAX_SAFE_INTEGER) {
@@ -4288,7 +4299,7 @@ class Exporter {
 
   private constNumber(ctx: FnCtx, value: number, hint?: string): number {
     const dst = this.newLocal(ctx, "primitive", hint);
-    ctx.body.push({ kind: "Const", dst, value: { kind: "Num", value: this.numWire(value) } });
+    ctx.body.push({ kind: "Const", dst, value: this.numConst(value) });
     return dst;
   }
 
@@ -6553,8 +6564,7 @@ class Exporter {
           return dst;
         }
         // the members the runtime or a library puts on the object itself
-        if ((nsName === "Promise" && this.promiseProtocol) || (nsName === "JSON" && (node.name.text === "rawJSON" || node.name.text === "isRawJSON")) ||
-            (nsName === "Array" && node.name.text === "fromAsync") || (nsName === "String" && node.name.text === "raw") ||
+        if ((nsName === "Promise" && this.promiseProtocol) || LIBRARY_NAMESPACE_MEMBERS.has(node.name.text) ||
             node.name.text === "length" || node.name.text === "name") {
           const nsObj = this.newLocal(ctx, "reference");
           ctx.body.push({ kind: "LoadBuiltinFn", dst: nsObj, builtin: `globalobj.${nsName}` });
@@ -7130,7 +7140,7 @@ class Exporter {
             ctx.body.push({ kind: "CallBuiltinStatic", dst: obj, builtin: "object.create", args: [proto] });
             const descsLocal = this.lowerExpr(ctx, node.arguments[1]);
             ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"),
-              builtin: "object.definePropertiesDyn", args: [obj, descsLocal] });
+              builtin: "object.createProperties", args: [obj, descsLocal] });
             return obj;
           }
           // Object.defineProperties(obj, { k1: desc1, ... }) — expand statically
@@ -7236,7 +7246,7 @@ class Exporter {
           }
           if (sname !== undefined) {
             // what `Math` and `JSON` inherit: the namespace object is an ordinary receiver
-            if (sname === "__UNSUPPORTED__" && (OBJECT_PROTO_METHODS.has(fn.name.text) || fn.name.text === "rawJSON" || fn.name.text === "isRawJSON" || fn.name.text === "fromAsync" || fn.name.text === "raw")) {
+            if (sname === "__UNSUPPORTED__" && (OBJECT_PROTO_METHODS.has(fn.name.text) || LIBRARY_NAMESPACE_MEMBERS.has(fn.name.text))) {
               const recv = this.lowerExpr(ctx, fn.expression);
               const callee = this.lowerExpr(ctx, fn);
               return this.lowerDynamicValueCall(ctx, callee, recv, node.arguments, this.refKindOf(node));
@@ -8436,7 +8446,7 @@ class Exporter {
     }
     if (ts.isNumericLiteral(node)) {
       const dst = this.newLocal(ctx, "primitive");
-      ctx.body.push({ kind: "Const", dst, value: { kind: "Num", value: this.numWire(Number(node.text)) } });
+      ctx.body.push({ kind: "Const", dst, value: this.numConst(Number(node.text)) });
       return dst;
     }
     if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) {
@@ -12043,7 +12053,7 @@ class Exporter {
     // operand reads undefined.
     if (ns === "Atomics") {
       const arity: Record<string, number> = { load: 2, store: 3, add: 3, sub: 3, and: 3, or: 3, xor: 3,
-        exchange: 3, compareExchange: 4, isLockFree: 1, wait: 4, notify: 3 };
+        exchange: 3, compareExchange: 4, isLockFree: 1, wait: 4, notify: 3, pause: 1 };
       if (!Object.prototype.hasOwnProperty.call(arity, member)) return "__UNSUPPORTED__";
       return argc <= arity[member] ? `atomics.${member}` : "__UNSUPPORTED__";
     }
@@ -13129,7 +13139,8 @@ class Exporter {
     const plainObject = !isOurGen && !isOurAsyncGen && !isIterable;
     const rk = this.builtinReceiverKind(expr);
     const objSymSync = plainObject && (this.typeHasSymbolIterator(expr, "iterator") || (!!opts.forceAsync && (rk === "array" || rk === "string")));
-    const objSymAsync = plainObject && this.typeHasSymbolIterator(expr, "asyncIterator");
+    const unknownSource = (this.checker.getTypeAtLocation(expr).flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0;
+    const objSymAsync = plainObject && (this.typeHasSymbolIterator(expr, "asyncIterator") || (!!opts.forceAsync && unknownSource));
     // for-await takes [Symbol.asyncIterator] when there is one; a sync loop needs [Symbol.iterator]
     const useAsyncSym = objSymAsync && (!!opts.forceAsync || !objSymSync);
     const objSymIterable = useAsyncSym || objSymSync;
@@ -18093,6 +18104,7 @@ class Exporter {
     this.promiseProtocol = this.modules.some((m) => /web[\/\\]promise_protocol\.ts$/.test(m.fileName));
     if (this.modules.some((m) => !/\/lib\/(node|garnet)\/|node_prelude/.test(m.fileName) && /\b__proto__\b/.test(m.text))) this.internField("__garnet_proto_accessor");
     if (this.modules.some((m) => !/\/lib\/(node|garnet)\/|node_prelude/.test(m.fileName) && /\btoStringTag\b/.test(m.text))) this.internField("__garnet_builtin_tags");
+    if (this.modules.some((m) => !/\/lib\/(node|garnet)\/|node_prelude/.test(m.fileName) && /\bhasInstance\b/.test(m.text))) this.internField("__garnet_has_instance");
     if (this.modules.some((m) => !/\/lib\/(node|garnet)\/|node_prelude/.test(m.fileName) && /\.caller\b|["']caller["']|ThrowTypeError/.test(m.text))) this.internField("__garnet_function_poison");
     if (this.modules.some((m) => /web[\/\\]species\.ts$/.test(m.fileName))) this.internField(SPECIES_TRIGGER);
     for (const f of allFns) for (const s of this.freeVars(f)) {
@@ -18363,7 +18375,7 @@ class Exporter {
     const promiseProtoMethods = promiseProtoSpec.map(([name, runtime]) => ({ name, runtime, methodId: this.internName(name) }));
     // Function.prototype methods: call/apply/bind (this = args[0] = the function).
     const functionProtoSpec: [string, string][] = [
-      ["call","ts_funcproto_call"],["apply","ts_funcproto_apply"],["bind","ts_funcproto_bind"],
+      ["call","ts_funcproto_call"],["apply","ts_funcproto_apply"],["bind","ts_funcproto_bind"],["toString","ts_funcproto_toString"],
     ];
     const functionProtoMethods = functionProtoSpec.map(([name, runtime]) => ({ name, runtime, methodId: this.internName(name) }));
     // String.prototype methods: lets a method call on an any-typed string

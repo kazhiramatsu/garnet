@@ -1257,6 +1257,9 @@ fn emit_program_with_string_plans(
     if program.fields.iter().any(|f| f.name.as_deref() == Some("__garnet_builtin_tags")) {
         s.push_str("  ts_define_builtin_tags();\n");
     }
+    if program.fields.iter().any(|f| f.name.as_deref() == Some("__garnet_has_instance")) {
+        s.push_str("  ts_define_has_instance();\n");
+    }
     s.push_str("  ts_setup_number_proto();\n");
     s.push_str("  ts_setup_boolean_proto();\n");
     s.push_str("  ts_setup_global_object();\n");
@@ -15408,6 +15411,7 @@ fn emit_global_setup(s: &mut String, needs_fetch: bool, needs_typed_array_global
     s.push_str("  tsv _Symbol = ts_make_global_fn(ts_fnval_global_Symbol, 0u, \"Symbol\", 0);\n");
     root_local(s, "_Symbol");
     s.push_str("  ts_symbol_ctor_link(_Symbol);\n");
+    s.push_str("  ts_register_symbol_ctor(_Symbol);\n");
     set_fn(s, "_Symbol", "for", "symbol.for", 1, "for");
     set_fn(s, "_Symbol", "keyFor", "symbol.keyFor", 1, "keyFor");
     global_set_rooted(s, "Symbol", "_Symbol");
@@ -23462,6 +23466,14 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 }
                 return;
             }
+            if builtin == "object.createProperties" {
+                let a = |i: usize| ctx.val(args.get(i).map(|x| x.0).unwrap_or(0));
+                let _ = writeln!(s, "  if ({} != TS_UNDEFINED) ts_define_properties({}, {});", a(1), a(0), a(1));
+                if let Some(d) = dst {
+                    s.push_str(&ctx.set_val(d.0, "TS_UNDEFINED"));
+                }
+                return;
+            }
             if builtin == "object.definePropertiesDyn" {
                 let a = |i: usize| ctx.val(args.get(i).map(|x| x.0).unwrap_or(0));
                 let _ = writeln!(s, "  ts_define_properties({}, {});", a(0), a(1));
@@ -24019,6 +24031,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 "atomics.isLockFree" => (format!("ts_atomics_is_lock_free({})", v(0)), false),
                 "atomics.wait" => (format!("ts_atomics_wait({}, {}, {}, {})", v(0), v(1), v(2), v(3)), false),
                 "atomics.notify" => (format!("ts_atomics_notify({}, {}, {})", v(0), v(1), v(2)), false),
+                "atomics.pause" => (format!("ts_atomics_pause({})", v(0)), false),
                 b if b.starts_with("arraybuffer.newOptions:") => (
                     format!("ts_new_array_buffer_options({}, {}, {})", v(0), v(1), &b["arraybuffer.newOptions:".len()..]),
                     false,
@@ -24347,7 +24360,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     let async_first: u32 = builtin["iter.acquire:".len()..].parse().unwrap_or(0);
                     (format!("ts_iter_acquire({}, {})", v(0), async_first), false)
                 }
-                "iter.acquiredSync" => ("ts_bool(g_iter_acquired_sync)".to_string(), false),
+                "iter.acquiredSync" => ("(double)g_iter_acquired_sync".to_string(), true),
                 "yield.resumeKind" => ("ts_num((double)ts_coro_resume_kind(ts_obj(&_fr->c)))".to_string(), false),
                 "yield.resumeValue" => ("_fr->c.result".to_string(), false),
                 "iter.invoke" => (format!("ts_iter_invoke({}, {}, {})", v(0), v(1), v(2)), false),
