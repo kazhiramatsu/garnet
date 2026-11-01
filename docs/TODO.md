@@ -12836,6 +12836,11 @@ Where it stopped (branch `s363-dc`, worktree `build/wt_dc`, on top of `s362-wip`
   and any spread in a built-in `new` (a compile-time reject), `n.toLocaleString()` on a number (a compile-time reject): en-US grouping
   and three fraction digits, `minimumFractionDigits`, `maximumFractionDigits`, `useGrouping`. A typed array on an object's
   chain takes an element write as the specification says. `x[2^k - 2]` doubling grew a dense buffer to 2^32 (14 s).
+- **Properties of strings** (`\p{RGI_Emoji}` and its six parts) under the `v` flag: `runtime/regexp/rx_emoji_sequences.h`, generated from
+  test262's lists by `scripts/gen_emoji_sequences.mjs`. test262: 61 of 61. A pattern of more than 32 KB of code stays in the VM: its C took
+  clang minutes and gigabytes.
+- **A long constant array is data**: 256 elements or more of literals are a JSON text parsed where the literal is reached (60 000 numbers:
+  over three minutes of clang, now one second).
 - **import() of a bundled module** (`docs/dynamic_import_design.md`): a compile-time reject before. A module only `import()` reaches is
   compiled in, its top-level statements a function of their own, evaluated once when asked, deps first, a failure kept, a top-level
   await honored. `export default class {}` was missing from a namespace and its statics never ran (silent): a dynamic class.

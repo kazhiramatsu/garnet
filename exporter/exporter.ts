@@ -5683,6 +5683,7 @@ class Exporter {
       return dst;
     }
     if (arg) this.lowerExpr(ctx, arg);   // the specifier expression's own effects
+    if (node.arguments[1]) this.lowerExpr(ctx, node.arguments[1]);
     const msg = this.constString(ctx, `Cannot find module '${spec}': a dynamic import of a module the program does not bundle`);
     const err = this.newLocal(ctx, "reference");
     ctx.body.push({ kind: "CallBuiltinStatic", dst: err, builtin: `error.new:${this.errorKindIndex("Error")}`, args: [msg] });
@@ -6225,6 +6226,16 @@ class Exporter {
       return dst;
     }
     if (ts.isArrayLiteralExpression(node)) {
+      // a long list of constants is data: as statements it is one enormous C function (60 000 numbers took clang
+      // over three minutes), as a text the runtime parses it where it is reached
+      if (node.elements.length >= 256) {
+        const data = this.constantDataOf(node);
+        if (data !== undefined) {
+          const dst = this.newLocal(ctx, "reference", hint);
+          ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "json.parse", args: [this.constString(ctx, JSON.stringify(data))] });
+          return dst;
+        }
+      }
       const site = this.site++;
       const dst = this.newLocal(ctx, "reference", hint);
       this.labels[site] = `${hint ?? "arr"}@${ctx.name}`;
@@ -17959,6 +17970,28 @@ class Exporter {
       }
     }
     return modules;
+  }
+  /** The value of an expression made of literals that JSON can carry the same, else undefined. */
+  private constantDataOf(e: ts.Expression): unknown {
+    while (ts.isParenthesizedExpression(e)) e = e.expression;
+    const finite = (v: number): number | undefined => (Number.isFinite(v) && !Object.is(v, -0) ? v : undefined);
+    if (ts.isNumericLiteral(e)) return finite(Number(e.text));
+    if (ts.isPrefixUnaryExpression(e) && e.operator === ts.SyntaxKind.MinusToken && ts.isNumericLiteral(e.operand)) return finite(-Number(e.operand.text));
+    if (ts.isStringLiteralLike(e)) return e.text;
+    if (e.kind === ts.SyntaxKind.TrueKeyword) return true;
+    if (e.kind === ts.SyntaxKind.FalseKeyword) return false;
+    if (e.kind === ts.SyntaxKind.NullKeyword) return null;
+    if (ts.isArrayLiteralExpression(e)) {
+      const out: unknown[] = [];
+      for (const el of e.elements) {
+        if (ts.isOmittedExpression(el) || ts.isSpreadElement(el)) return undefined;
+        const v = this.constantDataOf(el);
+        if (v === undefined) return undefined;
+        out.push(v);
+      }
+      return out;
+    }
+    return undefined;
   }
   /** The module an `import(specifier)` names, when the program can know it. */
   private dynamicImportTarget(arg: ts.Expression | undefined): ts.SourceFile | undefined {
