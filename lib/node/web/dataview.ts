@@ -72,8 +72,14 @@ export class DataView {
     this.#load(i, 8, littleEndian === true);
     return scratchF64[0];
   }
-  getBigInt64(): never { throw new TypeError("BigInt is not supported"); }
-  getBigUint64(): never { throw new TypeError("BigInt is not supported"); }
+  #big(byteOffset: unknown, littleEndian: boolean | undefined): Uint8Array {
+    const i = this.#at(byteOffset, 8);
+    const t = new Uint8Array(8);
+    for (let k = 0; k < 8; k++) t[k] = this.#bytes[littleEndian ? i + k : i + 7 - k];
+    return t;
+  }
+  getBigInt64(byteOffset: number, littleEndian?: boolean): bigint { return new BigInt64Array(this.#big(byteOffset, littleEndian).buffer)[0]; }
+  getBigUint64(byteOffset: number, littleEndian?: boolean): bigint { return new BigUint64Array(this.#big(byteOffset, littleEndian).buffer)[0]; }
   setInt8(byteOffset: number, value: number): void { const i = this.#at(byteOffset, 1); this.#bytes[i] = (Number(value) | 0) & 0xff; }
   setUint8(byteOffset: number, value: number): void { const i = this.#at(byteOffset, 1); this.#bytes[i] = (Number(value) | 0) & 0xff; }
   setInt16(byteOffset: number, value: number, littleEndian?: boolean): void { this.setUint16(byteOffset, value, littleEndian); }
@@ -93,8 +99,20 @@ export class DataView {
   setFloat64(byteOffset: number, value: number, littleEndian?: boolean): void {
     const i = this.#at(byteOffset, 8); scratchF64[0] = Number(value); this.#store(i, 8, littleEndian === true);
   }
-  setBigInt64(): never { throw new TypeError("BigInt is not supported"); }
-  setBigUint64(): never { throw new TypeError("BigInt is not supported"); }
+  #setBig(byteOffset: unknown, b: Uint8Array, littleEndian: boolean | undefined): void {
+    const i = this.#at(byteOffset, 8);
+    for (let k = 0; k < 8; k++) this.#bytes[littleEndian ? i + k : i + 7 - k] = b[k];
+  }
+  setBigInt64(byteOffset: number, value: bigint, littleEndian?: boolean): void {
+    const i = toIndex(byteOffset, "Offset");
+    const b = new BigInt64Array(1); b[0] = value;
+    this.#setBig(i, new Uint8Array(b.buffer), littleEndian);
+  }
+  setBigUint64(byteOffset: number, value: bigint, littleEndian?: boolean): void {
+    const i = toIndex(byteOffset, "Offset");
+    const b = new BigUint64Array(1); b[0] = value;
+    this.#setBig(i, new Uint8Array(b.buffer), littleEndian);
+  }
   /** the scratch buffer's first `size` bytes from the view at `i`, in the platform's order */
   #load(i: number, size: number, littleEndian: boolean): void {
     const b = this.#bytes;

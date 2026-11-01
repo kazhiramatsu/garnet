@@ -2063,10 +2063,10 @@ static tsv ts_proxy_set_proto(tsv pv, tsv proto);
 #define chain_link_exotic(p) TS_RT_UNLIKELY((p)->h.kind > TS_KIND_PROMISE)
 static int chain_exotic_get(ts_object* p, ts_key key, tsv receiver, tsv* out, ts_object** next);
 /* typed arrays (docs/typed_arrays_design.md), defined after the array methods */
-static const uint8_t g_ta_size[TS_TA_COUNT] = { 1, 1, 1, 2, 2, 4, 4, 4, 8 };
+static const uint8_t g_ta_size[TS_TA_COUNT] = { 1, 1, 1, 2, 2, 4, 4, 4, 8, 8, 8 };
 static const char* const g_ta_name[TS_TA_COUNT] = {
   "Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Array",
-  "Int32Array", "Uint32Array", "Float32Array", "Float64Array" };
+  "Int32Array", "Uint32Array", "Float32Array", "Float64Array", "BigInt64Array", "BigUint64Array" };
 static tsv ta_get_key(tsv obj, ts_key key);
 static tsv ab_get_key(tsv obj, ts_key key);
 static void ta_set_key(tsv obj, ts_key key, tsv val);
@@ -16289,7 +16289,7 @@ tsv ts_objproto_tostring_call(tsv v){
   if (ts_is_typed_array(v)){
     static const char* const tags[TS_TA_COUNT] = { "[object Int8Array]", "[object Uint8Array]", "[object Uint8ClampedArray]",
       "[object Int16Array]", "[object Uint16Array]", "[object Int32Array]", "[object Uint32Array]",
-      "[object Float32Array]", "[object Float64Array]" };
+      "[object Float32Array]", "[object Float64Array]", "[object BigInt64Array]", "[object BigUint64Array]" };
     const char* tg = tags[((ts_typedarray*)ts_ptr(v))->elem];
     return ts_new_string(tg, (uint32_t)strlen(tg));
   }
@@ -16641,11 +16641,37 @@ static tsv ta_require(tsv v, const char* method){
    type); the store takes the number already converted by ToNumber. */
 static inline double ta_load(const ts_typedarray* t, uint32_t i){ return ts_ta_elem_load(t->data, i, t->elem); }
 static inline void ta_store(ts_typedarray* t, uint32_t i, double d){ ts_ta_elem_store(t->data, i, d, t->elem); }
+/* The element as a value, and back: a BigInt array's elements are 64 bits, not doubles. ta_coerce is
+   ToNumber or ToBigInt, by the array's content type. */
+static inline int ta_is_big(const ts_typedarray* t){ return t->elem >= TS_TA_BIGINT64; }
+static tsv ta_value(const ts_typedarray* t, uint32_t i){
+  if (TS_RT_UNLIKELY(ta_is_big(t))){
+    uint64_t u;
+    memcpy(&u, t->data + (size_t)i * 8, 8);
+    return t->elem == TS_TA_BIGINT64 ? ts_bigint_from_i64((int64_t)u) : ts_bigint_from_u64(u);
+  }
+  return ts_num(ta_load(t, i));
+}
+static tsv ta_coerce(int elem, tsv x){
+  if (elem >= TS_TA_BIGINT64) return ts_to_bigint(x);
+  return ts_is_num(x) ? x : ts_num(ts_number_coerce(x));
+}
+static void ta_put(ts_typedarray* t, uint32_t i, tsv v){
+  if (TS_RT_UNLIKELY(ta_is_big(t))){ uint64_t u = ts_bigint_to_u64(v); memcpy(t->data + (size_t)i * 8, &u, 8); }
+  else ta_store(t, i, ts_to_num(v));
+}
 tsv ts_ta_get(tsv v, uint32_t i){
   ts_typedarray* t = ta_ptr(v);
-  return i < t->length ? ts_num(ta_load(t, i)) : TS_UNDEFINED;
+  return i < t->length ? ta_value(t, i) : TS_UNDEFINED;
 }
 void ts_ta_set(tsv v, uint32_t i, tsv x){
+  if (TS_RT_UNLIKELY(ta_is_big(ta_ptr(v)))){
+    ts_gc_root(&v);
+    tsv b = ts_to_bigint(x);
+    ts_gc_unroot(1);
+    if (i < ta_ptr(v)->length) ta_put(ta_ptr(v), i, b);
+    return;
+  }
   double d;
   if (ts_is_num(x)) d = ts_to_num(x);
   else { ts_gc_root(&v); d = ts_number_coerce(x); ts_gc_unroot(1); }
@@ -16933,7 +16959,8 @@ static tsv ta_m_set(tsv* a, int n){
   ts_typedarray* x = ta_ptr(t);
   if (off + slen > x->length) ts_throw_range_error_msg("offset is out of bounds");
   uint32_t o = (uint32_t)off;
-  if (ts_is_typed_array(src) && ta_ptr(src)->elem == x->elem){
+  if (ts_is_typed_array(src) && ta_is_big(ta_ptr(src)) != ta_is_big(x)) ts_throw_type_error_msg("Cannot mix BigInt and other types, use explicit conversions");
+  if (ts_is_typed_array(src) && (ta_ptr(src)->elem == x->elem || ta_is_big(x))){
     uint32_t sz = g_ta_size[x->elem];
     memmove(x->data + (size_t)o * sz, ta_ptr(src)->data, (size_t)slen * sz);
   } else if (ts_is_typed_array(src)){
@@ -16950,12 +16977,13 @@ static tsv ta_m_set(tsv* a, int n){
 }
 static tsv ta_m_fill(tsv* a, int n){
   tsv t = ta_require(n ? a[0] : TS_UNDEFINED, "fill"); ts_gc_root(&t);
-  double d = n > 1 ? (ts_is_num(a[1]) ? ts_to_num(a[1]) : ts_number_coerce(a[1])) : NAN;
+  tsv fv = ta_coerce(ta_ptr(t)->elem, n > 1 ? a[1] : TS_UNDEFINED); ts_gc_root(&fv);
   uint32_t len = ta_ptr(t)->length;
   uint32_t b = ta_rel(a, n, 2, len, 0), e = ta_rel(a, n, 3, len, len);
   ts_typedarray* x = ta_ptr(t);
-  for (uint32_t i = b; i < e && i < x->length; i++) ta_store(x, i, d);
-  ts_gc_unroot(1);
+  if (ta_is_big(x)) for (uint32_t i = b; i < e && i < x->length; i++) ta_put(x, i, fv);
+  else { double d = ts_to_num(fv); for (uint32_t i = b; i < e && i < x->length; i++) ta_store(x, i, d); }
+  ts_gc_unroot(2);
   return t;
 }
 static tsv ta_m_copy_within(tsv* a, int n){
@@ -16975,12 +17003,25 @@ static double ta_search_arg(tsv* a, int n, int* is_num){
   *is_num = n > 1 && ts_is_num(a[1]);
   return *is_num ? ts_to_num(a[1]) : 0;
 }
+/* indexOf and includes over a BigInt array: only a BigInt can match */
+static double ta_big_search(tsv t, tsv needle, double from, double to, double step){
+  if (!ts_is_bigint(needle)) return -1;
+  ts_gc_root(&t); ts_gc_root(&needle);
+  double r = -1;
+  for (double i = from; step > 0 ? i < to : i >= to; i += step){
+    if (i >= (double)ta_ptr(t)->length) continue;
+    if (ts_bigint_eq(ta_value(ta_ptr(t), (uint32_t)i), needle)){ r = i; break; }
+  }
+  ts_gc_unroot(2);
+  return r;
+}
 static tsv ta_m_index_of(tsv* a, int n){
   tsv t = ta_require(n ? a[0] : TS_UNDEFINED, "indexOf"); ts_gc_root(&t);
   int is_num; double v = ta_search_arg(a, n, &is_num);
   uint32_t len = ta_ptr(t)->length, from = ta_rel(a, n, 2, len, 0);
   double r = -1;
-  if (is_num) for (uint32_t i = from; i < ta_ptr(t)->length; i++) if (ta_load(ta_ptr(t), i) == v){ r = i; break; }
+  if (ta_is_big(ta_ptr(t))) r = ta_big_search(t, n > 1 ? a[1] : TS_UNDEFINED, (double)from, (double)len, 1);
+  else if (is_num) for (uint32_t i = from; i < ta_ptr(t)->length; i++) if (ta_load(ta_ptr(t), i) == v){ r = i; break; }
   ts_gc_unroot(1);
   return ts_num(r);
 }
@@ -16989,7 +17030,8 @@ static tsv ta_m_last_index_of(tsv* a, int n){
   int is_num; double v = ta_search_arg(a, n, &is_num);
   uint32_t len = ta_ptr(t)->length;
   double r = -1;
-  if (is_num && len){
+  int big = ta_is_big(ta_ptr(t));
+  if ((is_num || big) && len){
     double start = len - 1;
     if (n > 2 && !ts_is_undef(a[2])){
       double d = ts_number_coerce(a[2]);
@@ -16997,7 +17039,8 @@ static tsv ta_m_last_index_of(tsv* a, int n){
       d = d < 0 ? ceil(d) : floor(d);
       start = d < 0 ? len + d : (d > len - 1 ? len - 1 : d);
     }
-    for (double i = start; i >= 0; i--) if (ta_load(ta_ptr(t), (uint32_t)i) == v){ r = i; break; }
+    if (big) r = ta_big_search(t, n > 1 ? a[1] : TS_UNDEFINED, start, 0, -1);
+    else for (double i = start; i >= 0; i--) if (ta_load(ta_ptr(t), (uint32_t)i) == v){ r = i; break; }
   }
   ts_gc_unroot(1);
   return ts_num(r);
@@ -17007,7 +17050,8 @@ static tsv ta_m_includes(tsv* a, int n){
   int is_num; double v = ta_search_arg(a, n, &is_num);
   uint32_t len = ta_ptr(t)->length, from = ta_rel(a, n, 2, len, 0);
   int r = 0;
-  if (is_num) for (uint32_t i = from; i < ta_ptr(t)->length; i++) if (ta_same_value_zero(ta_load(ta_ptr(t), i), v)){ r = 1; break; }
+  if (ta_is_big(ta_ptr(t))) r = ta_big_search(t, n > 1 ? a[1] : TS_UNDEFINED, (double)from, (double)len, 1) >= 0;
+  else if (is_num) for (uint32_t i = from; i < ta_ptr(t)->length; i++) if (ta_same_value_zero(ta_load(ta_ptr(t), i), v)){ r = 1; break; }
   ts_gc_unroot(1);
   return ts_bool(r);
 }
@@ -17022,6 +17066,11 @@ static tsv ta_join(tsv t, tsv sepv){
   uint32_t len = ta_ptr(t)->length;
   for (uint32_t i = 0; i < len && i < ta_ptr(t)->length; i++){
     if (i){ if (sep) jb_puts(&b, sep, seplen); else jb_putc(&b, ','); }
+    if (ta_is_big(ta_ptr(t))){
+      uint32_t ln = 0; char* u = ts_string_cstr_copy(ts_bigint_to_string(ta_value(ta_ptr(t), i), 10), &ln);
+      jb_puts(&b, u, ln); free(u);
+      continue;
+    }
     double d = ta_load(ta_ptr(t), i);
     char nb[40]; ts_fmt_num(d, nb, sizeof nb); jb_putz(&b, nb);
   }
@@ -17040,12 +17089,13 @@ static tsv ta_m_at(tsv* a, int n){
   d = d < 0 ? ceil(d) : floor(d);
   uint32_t len = ta_ptr(t)->length;
   if (d < 0) d += len;
-  return d < 0 || d >= len ? TS_UNDEFINED : ts_num(ta_load(ta_ptr(t), (uint32_t)d));
+  return d < 0 || d >= len ? TS_UNDEFINED : ta_value(ta_ptr(t), (uint32_t)d);
 }
 static tsv ta_m_reverse(tsv* a, int n){
   tsv t = ta_require(n ? a[0] : TS_UNDEFINED, "reverse");
   ts_typedarray* x = ta_ptr(t);
   for (uint32_t i = 0, j = x->length ? x->length - 1 : 0; i < j; i++, j--){
+    if (ta_is_big(x)){ uint64_t p, q; memcpy(&p, x->data + (size_t)i * 8, 8); memcpy(&q, x->data + (size_t)j * 8, 8); memcpy(x->data + (size_t)i * 8, &q, 8); memcpy(x->data + (size_t)j * 8, &p, 8); continue; }
     double p = ta_load(x, i), q = ta_load(x, j);
     ta_store(x, i, q); ta_store(x, j, p);
   }
@@ -17059,6 +17109,8 @@ static int ta_default_cmp(double x, double y){
   if (x == 0 && y == 0){ int sx = signbit(x) != 0, sy = signbit(y) != 0; return sx == sy ? 0 : (sx ? -1 : 1); }
   return 0;
 }
+static int ta_cmp_i64(const void* a, const void* b){ int64_t x, y; memcpy(&x, a, 8); memcpy(&y, b, 8); return x < y ? -1 : x > y; }
+static int ta_cmp_u64(const void* a, const void* b){ uint64_t x, y; memcpy(&x, a, 8); memcpy(&y, b, 8); return x < y ? -1 : x > y; }
 static tsv ta_m_sort(tsv* a, int n){
   tsv t = ta_require(n ? a[0] : TS_UNDEFINED, "sort"); ts_gc_root(&t);
   tsv cmp = n > 1 ? a[1] : TS_UNDEFINED; ts_gc_root(&cmp);
@@ -17069,6 +17121,21 @@ static tsv ta_m_sort(tsv* a, int n){
     ts_throw_type_error_msg(buf);
   }
   uint32_t len = ta_ptr(t)->length;
+  if (ta_is_big(ta_ptr(t))){
+    /* the elements as values, through the array sort; by value without a comparator */
+    if (ts_is_undef(cmp)){
+      ts_typedarray* y = ta_ptr(t);
+      qsort(y->data, len, 8, y->elem == TS_TA_BIGINT64 ? ta_cmp_i64 : ta_cmp_u64);
+      ts_gc_unroot(2);
+      return t;
+    }
+    tsv items = ts_new_array(0); ts_gc_root(&items);
+    for (uint32_t i = 0; i < len; i++) ts_array_push(items, ta_value(ta_ptr(t), i));
+    ts_array_sort(items, cmp);
+    for (uint32_t i = 0; i < len && i < ta_ptr(t)->length; i++) ta_put(ta_ptr(t), i, ts_array_get(items, i));
+    ts_gc_unroot(3);
+    return t;
+  }
   double* v = (double*)malloc(sizeof(double) * (len ? len : 1));
   double* w = (double*)malloc(sizeof(double) * (len ? len : 1));
   for (uint32_t i = 0; i < len; i++) v[i] = ta_load(ta_ptr(t), i);
@@ -17135,7 +17202,7 @@ static void ta_require_callable(tsv cb, int typed){
   ta_require_callable(cb, strcmp(name, "map") != 0); \
   ts_cb cbf; cb_resolve(&cbf, cb);
 static tsv ta_cb_call(ts_cb* cbf, tsv cb, tsv t, uint32_t i){
-  tsv args[3] = { ts_num(ta_load(ta_ptr(t), i)), ts_num((double)i), t };
+  tsv args[3] = { ta_value(ta_ptr(t), i), ts_num((double)i), t };
   return cb_call(cbf, cb, args, 3);
 }
 static tsv ta_m_for_each(tsv* a, int n){
@@ -17152,13 +17219,15 @@ static tsv ta_m_map(tsv* a, int n){
 static tsv ta_m_filter(tsv* a, int n){
   TA_CB_BEGIN("filter")
   uint32_t len = ta_ptr(t)->length;
-  double* kept = (double*)malloc(sizeof(double) * (len ? len : 1)); uint32_t k = 0;
+  uint32_t sz = g_ta_size[ta_ptr(t)->elem];
+  uint8_t* kept = (uint8_t*)malloc((size_t)sz * (len ? len : 1)); uint32_t k = 0;
   for (uint32_t i = 0; i < len && i < ta_ptr(t)->length; i++){
-    double v = ta_load(ta_ptr(t), i);
-    if (ts_truthy(ta_cb_call(&cbf, cb, t, i))) kept[k++] = v;
+    uint8_t raw[8];
+    memcpy(raw, ta_ptr(t)->data + (size_t)i * sz, sz);
+    if (ts_truthy(ta_cb_call(&cbf, cb, t, i))) memcpy(kept + (size_t)(k++) * sz, raw, sz);
   }
   tsv r = ta_new_length(ta_ptr(t)->elem, k);
-  for (uint32_t i = 0; i < k; i++) ta_store(ta_ptr(r), i, kept[i]);
+  if (k) memcpy(ta_ptr(r)->data, kept, (size_t)k * sz);
   free(kept);
   ts_gc_unroot(2); return r;
 }
@@ -17178,8 +17247,10 @@ static tsv ta_m_find(tsv* a, int n){
   TA_CB_BEGIN("find")
   tsv r = TS_UNDEFINED;
   for (uint32_t i = 0; i < ta_ptr(t)->length; i++){
-    double v = ta_load(ta_ptr(t), i);
-    if (ts_truthy(ta_cb_call(&cbf, cb, t, i))){ r = ts_num(v); break; }
+    tsv v = ta_value(ta_ptr(t), i); ts_gc_root(&v);
+    int hit = ts_truthy(ta_cb_call(&cbf, cb, t, i));
+    ts_gc_unroot(1);
+    if (hit){ r = v; break; }
   }
   ts_gc_unroot(2); return r;
 }
@@ -17198,11 +17269,11 @@ static tsv ta_m_reduce(tsv* a, int n){
   if (n > 2) acc = a[2];
   else {
     if (ta_ptr(t)->length == 0) ts_throw_type_error_msg("Reduce of empty array with no initial value");
-    acc = ts_num(ta_load(ta_ptr(t), 0)); i = 1;
+    acc = ta_value(ta_ptr(t), 0); i = 1;
   }
   ts_cb cbf; cb_resolve(&cbf, cb);
   for (; i < ta_ptr(t)->length; i++){
-    tsv args[4] = { acc, ts_num(ta_load(ta_ptr(t), i)), ts_num((double)i), t };
+    tsv args[4] = { acc, ta_value(ta_ptr(t), i), ts_num((double)i), t };
     acc = cb_call(&cbf, cb, args, 4);
   }
   ts_gc_unroot(3); return acc;
@@ -17216,11 +17287,11 @@ static tsv ta_m_reduce_right(tsv* a, int n){
   if (n > 2) acc = a[2];
   else {
     if (len == 0) ts_throw_type_error_msg("Reduce of empty array with no initial value");
-    acc = ts_num(ta_load(ta_ptr(t), len - 1)); i = len - 1;
+    acc = ta_value(ta_ptr(t), len - 1); i = len - 1;
   }
   ts_cb cbf; cb_resolve(&cbf, cb);
   while (i-- > 0){
-    tsv v = i < ta_ptr(t)->length ? ts_num(ta_load(ta_ptr(t), i)) : TS_UNDEFINED;
+    tsv v = i < ta_ptr(t)->length ? ta_value(ta_ptr(t), i) : TS_UNDEFINED;
     tsv args[4] = { acc, v, ts_num((double)i), t };
     acc = cb_call(&cbf, cb, args, 4);
   }
@@ -17230,8 +17301,10 @@ static tsv ta_m_find_last(tsv* a, int n){
   TA_CB_BEGIN("findLast")
   tsv r = TS_UNDEFINED;
   for (uint32_t i = ta_ptr(t)->length; i-- > 0;){
-    double v = ta_load(ta_ptr(t), i);
-    if (ts_truthy(ta_cb_call(&cbf, cb, t, i))){ r = ts_num(v); break; }
+    tsv v = ta_value(ta_ptr(t), i); ts_gc_root(&v);
+    int hit = ts_truthy(ta_cb_call(&cbf, cb, t, i));
+    ts_gc_unroot(1);
+    if (hit){ r = v; break; }
   }
   ts_gc_unroot(2); return r;
 }
@@ -17246,7 +17319,7 @@ static tsv ta_copy_of(tsv t){
   ts_gc_root(&t);
   tsv r = ta_new_length(ta_ptr(t)->elem, ta_ptr(t)->length);
   ts_typedarray* x = ta_ptr(t); ts_typedarray* y = ta_ptr(r);
-  for (uint32_t i = 0; i < x->length; i++) ta_store(y, i, ta_load(x, i));
+  if (x->length) memcpy(y->data, x->data, (size_t)x->length * g_ta_size[x->elem]);
   ts_gc_unroot(1);
   return r;
 }
@@ -17274,11 +17347,11 @@ static tsv ta_m_with(tsv* a, int n){
   double d = n > 1 ? ts_number_coerce(a[1]) : 0.0;
   d = d != d ? 0.0 : trunc(d);
   double index = d < 0 ? len + d : d;
-  double v = ts_number_coerce(n > 2 ? a[2] : TS_UNDEFINED);
+  tsv v = ta_coerce(ta_ptr(t)->elem, n > 2 ? a[2] : TS_UNDEFINED); ts_gc_root(&v);
   if (!(index >= 0 && index < (double)ta_ptr(t)->length)) ts_throw_range_error_msg("Invalid typed array index");
   tsv r = ta_copy_of(t);
-  ta_store(ta_ptr(r), (uint32_t)index, v);
-  ts_gc_unroot(1);
+  ta_put(ta_ptr(r), (uint32_t)index, v);
+  ts_gc_unroot(2);
   return r;
 }
 /* the getters of %TypedArray%.prototype: an instance answers by key before the chain, so these are what
@@ -17497,10 +17570,10 @@ static void ta_requires_new(const char* name){
 #define TA_CTOR_ADAPTERS(E) \
   static tsv ta_ctor_call_##E(tsv* a, int n){ if (!ts_native_new_take()) ta_requires_new(g_ta_name[E]); return ts_new_typed_array(E, a, n); }
 TA_CTOR_ADAPTERS(0) TA_CTOR_ADAPTERS(1) TA_CTOR_ADAPTERS(2) TA_CTOR_ADAPTERS(3) TA_CTOR_ADAPTERS(4)
-TA_CTOR_ADAPTERS(5) TA_CTOR_ADAPTERS(6) TA_CTOR_ADAPTERS(7) TA_CTOR_ADAPTERS(8)
+TA_CTOR_ADAPTERS(5) TA_CTOR_ADAPTERS(6) TA_CTOR_ADAPTERS(7) TA_CTOR_ADAPTERS(8) TA_CTOR_ADAPTERS(9) TA_CTOR_ADAPTERS(10)
 #undef TA_CTOR_ADAPTERS
 static const ts_code g_ta_ctor_call[TS_TA_COUNT] = { ta_ctor_call_0, ta_ctor_call_1, ta_ctor_call_2,
-  ta_ctor_call_3, ta_ctor_call_4, ta_ctor_call_5, ta_ctor_call_6, ta_ctor_call_7, ta_ctor_call_8 };
+  ta_ctor_call_3, ta_ctor_call_4, ta_ctor_call_5, ta_ctor_call_6, ta_ctor_call_7, ta_ctor_call_8, ta_ctor_call_9, ta_ctor_call_10 };
 static tsv ab_ctor_call_0(tsv* a, int n){ if (!ts_native_new_take()) ta_requires_new("ArrayBuffer"); return ts_new_array_buffer_options(n ? a[0] : TS_UNDEFINED, n > 1 ? a[1] : TS_UNDEFINED, 0); }
 static tsv ab_ctor_call_1(tsv* a, int n){ if (!ts_native_new_take()) ta_requires_new("SharedArrayBuffer"); return ts_new_array_buffer_options(n ? a[0] : TS_UNDEFINED, n > 1 ? a[1] : TS_UNDEFINED, 1); }
 static tsv ab_static_is_view(tsv* a, int n){ return ts_bool(n > 0 && ts_array_buffer_is_view(a[0])); }
@@ -18216,7 +18289,7 @@ static tsv ta_get_key(tsv obj, ts_key key){
   uint32_t idx;
   int numeric = ta_numeric_key(key, &idx);
   ts_typedarray* t = ta_ptr(obj);
-  if (numeric) return idx < t->length ? ts_num(ta_load(t, idx)) : TS_UNDEFINED;
+  if (numeric) return idx < t->length ? ta_value(t, idx) : TS_UNDEFINED;
   tsv* own = find_slot(&t->o, key, 0);
   if (own) return ta_slot_value(obj, *own);
   if (key == g_ta_k_length) return ts_num((double)t->length);

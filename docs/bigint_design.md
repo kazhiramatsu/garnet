@@ -1,6 +1,6 @@
 # BigInt
 
-Session 363. Runtime (`runtime/bigint.c`, `ts_rt.c`), exporter (`exporter.ts`), emitter (`emit_c.rs`). Slices 1 to 3 are in.
+Session 363. Runtime (`runtime/bigint.c`, `ts_rt.c`), exporter (`exporter.ts`), emitter (`emit_c.rs`). All four slices are in; the pattern of "Small values" is not.
 
 ## Why now
 
@@ -72,3 +72,13 @@ operators work.
 2. The operators, typed and `any`.
 3. `asIntN`, `asUintN`, the conversions, JSON, Map and Set keys.
 4. The typed arrays, DataView, Atomics.
+
+## Gaps
+
+- `process.hrtime.bigint()` is not provided.
+- A BigInt array's elements take the runtime's paths: `BigInt64Array` is not in the exporter's typed tables, and an element
+  read makes a cell.
+- `Atomics` over a BigInt array is not done.
+- A value typed `number` by a cast or an annotation and holding a BigInt is the same lie as any other
+  (`docs/cast_to_number_design.md`).
+- Multiplication stops at Karatsuba, division at Knuth's D.

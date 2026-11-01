@@ -1251,7 +1251,9 @@ static inline int ts_is_indexed_array_fast(tsv v){
 /* Typed arrays (docs/typed_arrays_design.md): a buffer owns bytes outside the
    heap; a view points into them and keeps the buffer alive. */
 enum { TS_TA_INT8, TS_TA_UINT8, TS_TA_UINT8C, TS_TA_INT16, TS_TA_UINT16, TS_TA_INT32,
-       TS_TA_UINT32, TS_TA_FLOAT32, TS_TA_FLOAT64, TS_TA_COUNT };
+       TS_TA_UINT32, TS_TA_FLOAT32, TS_TA_FLOAT64,
+       /* elements that are no doubles: the typed fast paths never see these two, only the runtime's */
+       TS_TA_BIGINT64, TS_TA_BIGUINT64, TS_TA_COUNT };
 typedef struct ts_arraybuffer {
   ts_obj_common o;
   uint8_t* bytes;
