@@ -1629,6 +1629,8 @@ tsv  ts_object_group_by(tsv* a, int n);
 tsv  ts_map_group_by(tsv* a, int n);
 tsv  ts_new_array_buffer_options(tsv length, tsv options, int shared);
 void ts_track_buffer_views(void);   /* the program can detach a buffer: every view is registered with it */
+tsv  ts_iterator_proto(void);
+void ts_iterator_global(void);
 tsv  ts_symbol_proto(void);
 tsv  ts_date_proto(void);
 void ts_date_ctor_link(tsv ctor);   /* Date.prototype and its `constructor` */

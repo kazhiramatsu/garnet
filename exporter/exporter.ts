@@ -7411,7 +7411,7 @@ class Exporter {
             // A method on a known builtin string/array type that we don't yet
             // implement: reject loudly rather than silently miscompiling/trapping.
             // (a method of the runtime's prototype the static table does not list: the dynamic path)
-            if (!(cls === "set" && ["union", "intersection", "difference", "symmetricDifference", "isSubsetOf", "isSupersetOf", "isDisjointFrom"].includes(fn.name.text)))
+            if (!this.untyped && !(cls === "set" && ["union", "intersection", "difference", "symmetricDifference", "isSubsetOf", "isSupersetOf", "isDisjointFrom"].includes(fn.name.text)))
               this.unsupported(node, `${cls} method '${fn.name.text}' (stdlib method not yet implemented)`);
           }
         }

@@ -9491,6 +9491,7 @@ tsv ts_array_iter_new(tsv source, int kind){
     static int rooted = 0;
     g_array_iterator_proto = ts_new_proto();
     ts_root_static_once(&g_array_iterator_proto, &rooted);
+    ((ts_object*)ts_ptr(g_array_iterator_proto))->proto = ts_iterator_proto();
     tsv next = ts_make_fn_t(ts_array_iterator_next, NULL, 0, 1); ts_gc_root(&next);
     ts_set_fn_meta(next, 0, "next");
     ts_define_data(g_array_iterator_proto, g_ai_next, next, 0, 1, 1);
@@ -9650,6 +9651,7 @@ static void ts_map_iterator_proto_init(int is_set){
   static int rooted[2] = {0, 0};
   *proto = ts_new_proto();
   ts_root_static_once(proto, &rooted[is_set != 0]);
+  ((ts_object*)ts_ptr(*proto))->proto = ts_iterator_proto();
   tsv next = ts_make_fn_t(ts_map_iterator_next, NULL, 0, 1); ts_gc_root(&next);
   ts_set_fn_meta(next, 0, "next");
   ts_define_data(*proto, g_mi_next, next, 0, 1, 1);
@@ -13376,7 +13378,7 @@ static tsv g_new_target = TS_UNDEFINED;
 static ts_code g_new_target_code = NULL;   /* the function g_new_target is meant for */
 /* What `new` hands a dynamic class's constructor (docs/dynamic_classes_design.md): new.target and the
    active function, taken on entry; a plain call finds nothing. A `super(...)` sets the target. */
-static tsv g_dyn_new_target = TS_UNDEFINED, g_dyn_active = TS_UNDEFINED, g_construct_target = TS_UNDEFINED;
+static tsv g_dyn_new_target = TS_UNDEFINED, g_dyn_active = TS_UNDEFINED, g_construct_target = TS_UNDEFINED, g_native_new_target = TS_UNDEFINED;
 /* the object a constructor made, behind new.target's prototype (Reflect.construct, a dynamic class's super) */
 static void construct_relink(tsv inst, tsv target){
   if (!ts_is_obj(inst) && !ts_is_func(inst)) return;
@@ -13413,6 +13415,7 @@ tsv ts_construct(tsv ctorv, tsv* args, int n){
          the instance itself from the arguments */
       int dyn = ((ts_func*)ts_ptr(ctorv))->dyn_class;
       tsv target = g_construct_target;
+      g_native_new_target = target;   /* (not a root: read first thing by the constructor) */
       if (!dyn) g_construct_target = TS_UNDEFINED;
       dyn_enter_note(ctorv);
       ts_gc_root(&target);
@@ -25735,6 +25738,7 @@ int main(int argc, char** argv){
 #endif
 /* The Node modules' host (lib/node, docs/node_compat_design.md): one translation unit with the runtime. */
 #include "bigint.c"
+#include "iterator_helpers.c"
 #include "node_host.c"
 /* CompressionStream's zlib streams (lib/node/web/compression.ts, docs/web_compression_design.md): libz loaded on first use. */
 #include "zlib_host.c"

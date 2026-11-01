@@ -15547,6 +15547,7 @@ fn emit_global_setup(s: &mut String, needs_fetch: bool, needs_typed_array_global
     if needs_typed_array_globals {
         s.push_str("  ts_typed_array_globals();\n");
     }
+    s.push_str("  ts_iterator_global();\n");
     s.push_str("}\n\n");
 }
 
