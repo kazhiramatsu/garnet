@@ -2192,6 +2192,27 @@ static int chain_holds_class_part(tsv link){
   }
   return 0;
 }
+/* Object.getPrototypeOf and Object.setPrototypeOf: ToObject of a primitive, RequireObjectCoercible */
+tsv ts_object_get_prototype_of(tsv v){
+  if (v == TS_UNDEFINED || v == TS_NULL) ts_throw_type_error_msg("Cannot convert undefined or null to object");
+  if (ts_is_num(v)) return ts_number_proto();
+  if (ts_is_str(v)) return ts_string_proto();
+  if (ts_is_bool(v)) return ts_boolean_proto();
+  if (ts_is_symbol(v)) return ts_symbol_proto();
+  return ts_get_proto(v);
+}
+tsv ts_object_set_prototype_of(tsv v, tsv p){
+  if (v == TS_UNDEFINED || v == TS_NULL) ts_throw_type_error_msg("Object.setPrototypeOf called on null or undefined");
+  if (((!ts_is_obj(p) && !ts_is_func(p)) || ts_is_prim_cell(p)) && p != TS_NULL){
+    uint32_t len = 0; char* text = ts_string_utf8_copy(ts_to_string_v(p), &len);
+    char msg[160];
+    snprintf(msg, sizeof msg, "Object prototype may only be an Object or null: %.*s", (int)(len > 100 ? 100 : len), text);
+    free(text);
+    ts_throw_type_error_msg(msg);
+  }
+  if ((!ts_is_obj(v) && !ts_is_func(v)) || ts_is_prim_cell(v)) return v;
+  return ts_set_proto_user(v, p);
+}
 /* OrdinarySetPrototypeOf's refusals: a non-extensible object keeps its prototype, and no cycle forms. */
 static const char* set_proto_refused(tsv obj, tsv proto){
   if (!ts_is_obj(obj) && !ts_is_func(obj)) return NULL;
@@ -2695,6 +2716,11 @@ static inline void proto_element_note(ts_object* o, ts_key key){
   if (TS_RT_UNLIKELY(g_proto_tracking) && (o == ts_proto_ptr(g_array_proto_v) || o == ts_proto_ptr(g_object_proto_v)) &&
       prop_key_is_array_index(key, &idx)) g_proto_elements = 1;
 }
+static int g_has_wrappers;   /* a Number, Boolean or String object exists: the tests for one stay off the paths otherwise */
+static void string_object_touch(tsv obj);
+static tsv string_object_char(tsv obj, ts_key key);
+static tsv wrapper_value(tsv v);
+static int g_has_arguments_objects = 0;
 /* the dictionary form (ts_rt.h) */
 static ts_key array_index_key(uint32_t i){
   char b[16]; int n = snprintf(b, sizeof b, "%u", i);
@@ -3907,7 +3933,7 @@ tsv ts_get(tsv obj, ts_key key){
         return TS_UNDEFINED;
       }
       if (lookup_prop_chain(obj, fast, key, &found)) return found;
-      return TS_UNDEFINED;
+      return TS_RT_UNLIKELY(g_has_wrappers) ? string_object_char(obj, key) : TS_UNDEFINED;
     }
     if (TS_RT_UNLIKELY(ts_kind_is_buffer_or_view(fast->h.kind)))
       return fast->h.kind == TS_KIND_TYPEDARRAY ? ta_get_key(obj, key) : ab_get_key(obj, key);
@@ -3991,6 +4017,16 @@ tsv ts_get(tsv obj, ts_key key){
     if (class_field_lookup(o, key, &off, &numeric)) return struct_field_get(o, off, numeric); }
   tsv found;
   if (lookup_prop_chain(obj, o, key, &found)) return found;
+  if (TS_RT_UNLIKELY(g_has_wrappers)){
+    /* the first look at a String object's character */
+    uint32_t idx;
+    if (ts_is_obj(obj) && o->h.kind == TS_KIND_OBJECT && prop_key_is_array_index(key, &idx)){
+      string_object_touch(obj);
+      o = ts_ptr(obj);
+      tsv* s = find_slot(o, key, 0);
+      if (s) return *s;
+    }
+  }
   return TS_UNDEFINED;
 }
 /* Read a property that may be an own (or inherited DATA) property under its FIELD
@@ -4046,6 +4082,7 @@ static void ts_throw_readonly_write(tsv obj, ts_key key){
   const char* nm = ts_field_name(key);
   char buf[320];
   if (ts_is_indexed_array_fast(obj)) snprintf(buf, sizeof(buf), "Cannot assign to read only property '%s' of object '[object Array]'", nm ? nm : "?");
+  else if (TS_RT_UNLIKELY(g_has_wrappers) && ts_is_str(wrapper_value(obj))) snprintf(buf, sizeof(buf), "Cannot assign to read only property '%s' of object '[object String]'", nm ? nm : "?");
   else snprintf(buf, sizeof(buf), "Cannot assign to read only property '%s' of object '#<%s>'", nm ? nm : "?",
            TS_TOP16(obj) == TS_SEL_OBJECT ? ts_obj_ctor_name_for_message(obj) : "Object");
   ts_throw_type_error_msg(buf);
@@ -4193,6 +4230,17 @@ static ts_pref ts_set_named_prop(tsv obj, ts_object* o, ts_key key, tsv val,
      (frozen bit0 / preventExtensions bit1 / sealed bit2). */
   if (ts_obj_integrity(o) & (1u|2u|4u)){ ts_throw_not_extensible(key); return PREF_NONE; }
   proto_element_note(o, key);
+  if (TS_RT_UNLIKELY(g_has_wrappers)){
+    /* a String object's character is read-only */
+    uint32_t idx;
+    if (prop_key_is_array_index(key, &idx) && ts_is_obj(obj)){
+      ts_gc_root(&obj); ts_gc_root(&val);
+      string_object_touch(obj);
+      ts_gc_unroot(2);
+      o = (ts_object*)ts_ptr(obj);
+      if (find_slot(o, key, 0)){ ts_throw_readonly_write(obj, key); return PREF_NONE; }
+    }
+  }
   ts_pref created = find_prop(o,key,1);
   { tsv* vp = pref_valp(created); *vp = val;
     /* slot-precise for a shaped receiver: an old object remembers one card,
@@ -8266,6 +8314,41 @@ tsv ts_str_trim(tsv s){
    actual arguments of the generic entry as an array (strict code: unmapped, so a copy is exact; the
    array has Array.prototype where an Arguments object has Object.prototype, CLAUDE.md known items).
    `arguments.length` alone reads the count without this. */
+/* The arguments object of a function that uses it as one: an ordinary object with the actual arguments as its elements,
+   `length`, the array iterator, and the `callee` that throws in strict code. */
+static tsv g_throw_type_error = TS_UNDEFINED;
+static tsv throw_type_error_fn(tsv* a, int n){
+  (void)a; (void)n;
+  ts_throw_type_error_msg("'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them");
+  return TS_UNDEFINED;
+}
+tsv ts_throw_type_error_value(void){
+  static int rooted;
+  if (g_throw_type_error == TS_UNDEFINED){
+    ts_root_static_once(&g_throw_type_error, &rooted);
+    tsv f = ts_make_fn_t(throw_type_error_fn, NULL, 0, 0);
+    ts_set_fn_meta(f, 0u, "");
+    g_throw_type_error = f;
+    ts_define_data(f, ts_intern_field("length", 6), ts_num(0), 0, 0, 0);
+    ts_define_data(f, ts_intern_field("name", 4), ts_new_string("", 0), 0, 0, 0);
+    ts_object_freeze(f);
+  }
+  return g_throw_type_error;
+}
+tsv ts_arguments_object(tsv arr){
+  ts_gc_root(&arr);
+  tsv o = ts_new_object(); ts_gc_root(&o);
+  uint32_t n = ts_array_len(arr);
+  for (uint32_t i = 0; i < n; i++) ts_define_data(o, array_index_key(i), ts_array_get(arr, i), 1, 1, 1);
+  ts_define_data(o, ts_intern_field("length", 6), ts_num((double)n), 0, 1, 1);
+  ts_define_data(o, TS_KEY_WKSYM(TS_WKSYM_ITERATOR), ts_get(g_array_proto_v, ts_intern_field("values", 6)), 0, 1, 1);
+  tsv thrower = ts_throw_type_error_value();
+  ts_define_accessor_attr(o, ts_intern_field("callee", 6), thrower, thrower, 0, 0, 0, 0);
+  ts_define_data(o, ts_intern_field("__arguments", 11), ts_bool(1), 0, 0, 0);
+  g_has_arguments_objects = 1;
+  ts_gc_unroot(2);
+  return o;
+}
 tsv ts_arguments_array(const tsv* args, uint32_t n){
   tsv arr = ts_new_array(n);
   for (uint32_t i = 0; i < n; i++) ts_array_store_existing(arr, i, args[i]);
@@ -11374,8 +11457,15 @@ tsv ts_string_from_code_point(tsv* args, int n){
   uint16_t* units = (uint16_t*)malloc(sizeof(uint16_t) * (size_t)(n>0?n*2:1));
   uint32_t len = 0;
   for (int i=0;i<n;i++){
-    double d = ts_to_num(args[i]);
-    uint32_t cp = (d!=d) ? 0 : (uint32_t)(long long)d;
+    double d = ts_number_coerce(args[i]);
+    if (!(d >= 0 && d <= 0x10FFFF) || d != floor(d)){
+      char num[40], msg[64];
+      ts_fmt_num(d, num, sizeof num);
+      snprintf(msg, sizeof msg, "Invalid code point %s", num);
+      free(units);
+      ts_throw_range_error_msg(msg);
+    }
+    uint32_t cp = (uint32_t)d;
     if (cp <= 0xFFFFu){
       units[len++] = (uint16_t)cp;
     } else {
@@ -12415,7 +12505,7 @@ static uint32_t g_field_cap = 0;
    back through `Reflect.get(target, key)` or used as a Map key costs no allocation, no interning and
    no byte comparison (vue's handlers do all three on every access). */
 static tsv* g_field_strings = NULL;
-static int g_has_wrappers;   /* a Number or Boolean object exists: the tests for one stay off the paths otherwise */
+/* g_has_wrappers's declaration is above, with the first path that tests it */
 /* The runtime's and the compiler's internal slots on user-visible objects (a Date's `__date_ms`, a
    generator object's `__coro`, a RegExp string iterator's `__tsaot_rx_iter_*`, a capture cell's `__value`, the host
    objects on the global, ...) are hidden from every enumeration, serialization and copy; a user's
@@ -12427,7 +12517,7 @@ static uint8_t* g_field_hidden = NULL;
 static int field_name_is_internal(const char* n, uint32_t len){
   static const char* const names[] = {
     "__value", "__date_ms", "__views", "__coro", "__timeoutMs", "__body", "__garnet", "__garnet_json",
-    "__garnet_node", "__garnet_metal", "__garnet_species", "__is_error", "__raw_json", "__promise_resolver_done", "__generator_return_tag",
+    "__garnet_node", "__garnet_metal", "__garnet_species", "__is_error", "__raw_json", "__arguments", "__primitive", "__promise_resolver_done", "__generator_return_tag",
     "__generator_return_value", "__text_encoder", "__text_decoder_encoding", "__text_decoder_fatal",
     "__text_decoder_ignore_bom", "__array_iterator_source", "__array_iterator_index",
     "__array_iterator_kind", "__map_iterator_source", "__map_iterator_last", "__map_iterator_kind",
@@ -12806,6 +12896,7 @@ static tsv proxy_keys_of_kind(tsv pv, int symbols){
 }
 tsv ts_object_get_own_property_names(tsv obj){
   if (g_has_proxies && ts_is_proxy(obj)) return proxy_keys_of_kind(obj, 0);
+  if (TS_RT_UNLIKELY(g_has_wrappers) && ts_is_obj(obj)) string_object_touch(obj);
   ts_gc_root(&obj);
   tsv arr = ts_new_array(0);
   ts_gc_root(&arr);
@@ -13035,6 +13126,99 @@ tsv ts_object_assign(tsv* args, int n){
 /* Object.fromEntries(entries): build an object from an array of [key, value]
    pairs (each pair is a 2-element array). Non-string keys are coerced. */
 static int array_own_iterator(tsv v);
+/* AddEntriesFromIterable and its Set form: the adder read from the new collection, one Get of each entry's parts, the
+   iterator closed by what goes wrong. kind: 0 Map, 1 Set, 2 WeakMap, 3 WeakSet. A plain source and the built-in adder
+   keep the direct path. */
+tsv ts_mapproto_set(tsv* a, int n); tsv ts_setproto_add(tsv* a, int n); tsv ts_weakmapproto_set(tsv* a, int n); tsv ts_weaksetproto_add(tsv* a, int n);
+static void collection_put(int kind, tsv target, tsv key, tsv value){
+  switch (kind){
+    case 0: ts_map_set(target, key, value); break;
+    case 1: ts_set_add(target, key); break;
+    case 2: ts_weakmap_set(target, key, value); break;
+    default: ts_weakset_add(target, key); break;
+  }
+}
+static void collection_add(int kind, tsv target, tsv adder, int custom, tsv item){
+  tsv k = item, v = TS_UNDEFINED;
+  ts_gc_root(&target); ts_gc_root(&adder); ts_gc_root(&item); ts_gc_root(&k); ts_gc_root(&v);
+  if (kind == 0 || kind == 2){
+    if (!(ts_is_obj(item) || ts_is_func(item)) || ts_is_prim_cell(item)){
+      uint32_t len = 0; char* text = ts_string_utf8_copy(ts_to_string_v(item), &len);
+      char msg[160];
+      snprintf(msg, sizeof msg, "Iterator value %.*s is not an entry object", (int)(len > 100 ? 100 : len), text);
+      free(text);
+      ts_throw_type_error_msg(msg);
+    }
+    if (ts_is_plain_array(item)){ k = ts_array_get(item, 0); v = ts_array_get(item, 1); }
+    else {
+      k = ts_get_dyn(item, ts_num(0));
+      v = ts_get_dyn(item, ts_num(1));
+    }
+  }
+  if (custom){
+    tsv argv[3] = { target, k, v };
+    ts_call_method(adder, argv, (kind == 0 || kind == 2) ? 3 : 2);
+  } else collection_put(kind, target, k, v);
+  ts_gc_unroot(5);
+}
+static int collection_add_catching(int kind, tsv target, tsv adder, int custom, tsv item, tsv* exc){
+  ts_handler* h = ts_eh_push();
+  if (ts_setjmp(h->buf) != 0){
+    ts_gc_set_root_depth(h->gc_root_len);
+    ts_frame_restore(h->frame_top);
+    ts_eh_pop();
+    *exc = ts_current_exception();
+    return 0;
+  }
+  collection_add(kind, target, adder, custom, item);
+  ts_eh_pop();
+  return 1;
+}
+static tsv collection_seed(int kind, tsv target, tsv iterable){
+  static const char* const names[4] = { "set", "add", "set", "add" };
+  static const ts_code codes[4] = { ts_mapproto_set, ts_setproto_add, ts_weakmapproto_set, ts_weaksetproto_add };
+  if (iterable == TS_UNDEFINED || iterable == TS_NULL) return target;
+  ts_gc_root(&target); ts_gc_root(&iterable);
+  tsv adder = ts_get(target, ts_intern_field(names[kind], 3)); ts_gc_root(&adder);
+  if (!ts_is_callable(adder)){
+    char msg[96];
+    snprintf(msg, sizeof msg, "'%s' returned for property '%s' of object is not a function", "undefined", names[kind]);
+    ts_throw_type_error_msg(msg);
+  }
+  int custom = !(ts_is_heap_func(adder) && ((ts_func*)ts_ptr(adder))->code == (void*)codes[kind]);
+  /* a source that cannot be told from its elements: read at once */
+  if (!custom && ((ts_is_plain_array(iterable) && !array_own_iterator(iterable) && !g_array_iter_patched) || ts_is_set(iterable) || ts_is_map(iterable) || ts_is_str(iterable))){
+    tsv tmp = iterable;
+    if (!ts_is_plain_array(iterable)){ tmp = ts_new_array(0); ts_gc_root(&tmp); ts_array_push_all(tmp, iterable); }
+    else ts_gc_root(&tmp);
+    for (uint32_t i = 0; i < ts_array_len(tmp); i++) collection_add(kind, target, adder, 0, ts_array_get(tmp, i));
+    ts_gc_unroot(4);
+    return target;
+  }
+  tsv m = ts_get(iterable, TS_KEY_WKSYM(TS_WKSYM_ITERATOR));
+  if (!ts_is_callable(m)) ts_throw_type_error_msg("object is not iterable (cannot read property Symbol(Symbol.iterator))");
+  tsv it = ts_call_method(m, &iterable, 1); ts_gc_root(&it);
+  if ((!ts_is_obj(it) && !ts_is_func(it)) || ts_is_prim_cell(it)) ts_throw_type_error_msg("Result of the Symbol.iterator method is not an object");
+  tsv next = ts_get(it, ts_intern_field("next", 4)); ts_gc_root(&next);
+  tsv exc = TS_UNDEFINED; ts_gc_root(&exc);
+  ts_key k_done = ts_intern_field("done", 4), k_value = ts_intern_field("value", 5);
+  for (;;){
+    tsv r = ts_call_method(next, &it, 1);
+    if ((!ts_is_obj(r) && !ts_is_func(r)) || ts_is_prim_cell(r)) ts_throw_type_error_msg("Iterator result is not an object");
+    ts_gc_root(&r);
+    if (ts_truthy(ts_get(r, k_done))){ ts_gc_unroot(7); return target; }
+    tsv item = ts_get(r, k_value); ts_gc_root(&item);
+    if (!collection_add_catching(kind, target, adder, custom, item, &exc)){
+      ts_iterator_close_quietly(it);
+      ts_throw(exc);
+    }
+    ts_gc_unroot(2);
+  }
+}
+tsv ts_map_seed(tsv mapv, tsv iterable){ return ts_is_map(mapv) ? collection_seed(0, mapv, iterable) : mapv; }
+tsv ts_set_seed(tsv setv, tsv iterable){ return ts_is_set(setv) ? collection_seed(1, setv, iterable) : setv; }
+tsv ts_weakmap_seed(tsv mapv, tsv iterable){ return ts_is_weakmap(mapv) ? collection_seed(2, mapv, iterable) : mapv; }
+tsv ts_weakset_seed(tsv setv, tsv iterable){ return ts_is_weakset(setv) ? collection_seed(3, setv, iterable) : setv; }
 /* One entry of Object.fromEntries: anything that goes wrong here closes the iterator. */
 static int from_entries_add(tsv obj, tsv item, tsv* exc){
   ts_handler* h = ts_eh_push();
@@ -14415,6 +14599,7 @@ static int prop_key_is_array_index(uint32_t key, uint32_t* idx){
 static void ts_proxy_enum(tsv pv, ts_prop_enum_cb cb, void* ud);
 static void ts_prop_own_enum(tsv obj, ts_prop_enum_cb cb, void* ud){
   if (g_has_proxies && ts_is_proxy(obj)){ ts_proxy_enum(obj, cb, ud); return; }
+  if (TS_RT_UNLIKELY(g_has_wrappers) && ts_is_obj(obj)) string_object_touch(obj);
   if (ts_is_str(obj)){
     ts_gc_root(&obj);
     for (uint32_t i=0;;i++){
@@ -14949,7 +15134,7 @@ static void inspect_val(jbuf* b, tsv v, int depth, int top){
     int symc = count_own_enum_sym_props(v);
     if (TS_RT_UNLIKELY(g_has_wrappers) && wrapper_value(v) != TS_UNDEFINED){
       tsv w = wrapper_value(v);
-      jb_putz(b, ts_is_num(w) ? "[Number: " : "[Boolean: ");
+      jb_putz(b, ts_is_num(w) ? "[Number: " : ts_is_str(w) ? "[String: " : "[Boolean: ");
       inspect_val(b, w, depth + 1, 0);
       jb_putc(b, ']');
       ts_gc_unroot(1);
@@ -15865,67 +16050,6 @@ tsv ts_array_from_mapped(tsv src, tsv fn){
 /* new Set(iterable): add each element. new Map(iterable): each element is a
    [key,value] pair. The iterable is first materialized into an array (reusing
    ts_array_push_all, which spreads arrays/generators/sets/maps/strings). */
-tsv ts_set_seed(tsv setv, tsv iterable){
-  if (iterable == TS_UNDEFINED || iterable == TS_NULL) return setv;
-  if (!ts_is_set(setv)) return setv;
-  ts_gc_root(&setv); ts_gc_root(&iterable);
-  tsv tmp = ts_new_array(0); ts_gc_root(&tmp);
-  ts_array_push_all(tmp, iterable);
-  ts_array* a = as_arr(tmp);
-  for(uint32_t i=0;i<a->len;i++){ ts_set_add(setv, a->data[i]); a = as_arr(tmp); }
-  ts_gc_unroot(3);
-  return setv;
-}
-tsv ts_map_seed(tsv mapv, tsv iterable){
-  if (iterable == TS_UNDEFINED || iterable == TS_NULL) return mapv;
-  if (!ts_is_map(mapv)) return mapv;
-  ts_gc_root(&mapv); ts_gc_root(&iterable);
-  tsv tmp = ts_new_array(0); ts_gc_root(&tmp);
-  ts_array_push_all(tmp, iterable);
-  ts_array* a = as_arr(tmp);
-  for(uint32_t i=0;i<a->len;i++){
-    tsv pair = a->data[i];
-    ts_array* p = as_arr(pair);
-    tsv k = (p && p->len>0) ? p->data[0] : TS_UNDEFINED;
-    tsv v = (p && p->len>1) ? p->data[1] : TS_UNDEFINED;
-    ts_map_set(mapv, k, v);
-    a = as_arr(tmp);
-  }
-  ts_gc_unroot(3);
-  return mapv;
-}
-tsv ts_weakset_seed(tsv setv, tsv iterable){
-  if (iterable == TS_UNDEFINED || iterable == TS_NULL) return setv;
-  if (!ts_is_weakset(setv)) return setv;
-  ts_gc_root(&setv); ts_gc_root(&iterable);
-  tsv tmp = ts_new_array(0); ts_gc_root(&tmp);
-  ts_array_push_all(tmp, iterable);
-  ts_array* a = as_arr(tmp);
-  for (uint32_t i = 0; i < a->len; i++){
-    ts_weakset_add(setv, a->data[i]);
-    a = as_arr(tmp);
-  }
-  ts_gc_unroot(3);
-  return setv;
-}
-tsv ts_weakmap_seed(tsv mapv, tsv iterable){
-  if (iterable == TS_UNDEFINED || iterable == TS_NULL) return mapv;
-  if (!ts_is_weakmap(mapv)) return mapv;
-  ts_gc_root(&mapv); ts_gc_root(&iterable);
-  tsv tmp = ts_new_array(0); ts_gc_root(&tmp);
-  ts_array_push_all(tmp, iterable);
-  ts_array* a = as_arr(tmp);
-  for (uint32_t i = 0; i < a->len; i++){
-    tsv pair = a->data[i];
-    ts_array* p = as_arr(pair);
-    tsv key = (p && p->len > 0) ? p->data[0] : TS_UNDEFINED;
-    tsv value = (p && p->len > 1) ? p->data[1] : TS_UNDEFINED;
-    ts_weakmap_set(mapv, key, value);
-    a = as_arr(tmp);
-  }
-  ts_gc_unroot(3);
-  return mapv;
-}
 
 /* `key in obj`: own-or-inherited property presence by field id. */
 /* Does `key` name one of the modeled Object.prototype methods? Used so that
@@ -16345,6 +16469,7 @@ static tsv ts_own_descriptor_by_key(tsv obj, ts_key key){
 }
 tsv ts_get_own_property_descriptor(tsv obj, tsv keyv){
   if (g_has_proxies && ts_is_proxy(obj)) return ts_proxy_get_own_desc(obj, keyv);
+  if (TS_RT_UNLIKELY(g_has_wrappers) && ts_is_obj(obj)) string_object_touch(obj);
   if (obj == TS_UNDEFINED || obj == TS_NULL) ts_throw_type_error_msg("Cannot convert undefined or null to object");
   if (!ts_is_propbag(obj) && !ts_is_str(obj)) return TS_UNDEFINED;
   if (ts_is_propbag(obj)){
@@ -16842,6 +16967,7 @@ int ts_has_prop_in(tsv obj, ts_key key){ in_operand_check(obj); return ts_has_pr
 /* `keyStr in obj` with a runtime string key (interns to a field id first). */
 int ts_has_prop_dyn(tsv obj, tsv keyv){
   in_operand_check(obj);
+  if (TS_RT_UNLIKELY(g_has_wrappers) && ts_is_obj(obj)) string_object_touch(obj);
   if (g_has_proxies && ts_is_proxy(obj)) return ts_proxy_has_v(obj, keyv);
   /* numeric key on an array: direct bounds check (`0 in arr`). */
   if (ts_is_indexed_array_fast(obj) && ts_is_num(keyv)){
@@ -16895,6 +17021,7 @@ int ts_has_own(tsv obj, ts_key key){
   return find_slot(o, key, 0) != NULL;       /* own prop slot (no proto walk) */
 }
 int ts_has_own_dyn(tsv obj, tsv keyv){
+  if (TS_RT_UNLIKELY(g_has_wrappers) && ts_is_obj(obj)) string_object_touch(obj);
   /* ToObject(this): `o.hasOwnProperty(k)`, `Object.hasOwn(o, k)` and
      `hasOwnProperty.call(o, k)` all throw on null/undefined (V8: "Cannot
      convert undefined or null to object"); a silent false would be a
@@ -16976,10 +17103,13 @@ tsv ts_objproto_tostring_call(tsv v){
     }
     ts_gc_unroot(1);
   }
+  if (TS_RT_UNLIKELY(g_has_arguments_objects) && ts_is_obj(v) && ((ts_gc_header*)ts_ptr(v))->kind == TS_KIND_OBJECT &&
+      find_slot((ts_object*)ts_ptr(v), ts_intern_field("__arguments", 11), 0)) return ts_new_string("[object Arguments]", 18);
   if (TS_RT_UNLIKELY(g_has_wrappers)){
     tsv w = wrapper_value(v);
     if (ts_is_num(w)) return ts_new_string("[object Number]", 15);
     if (ts_is_bool(w)) return ts_new_string("[object Boolean]", 16);
+    if (ts_is_str(w)) return ts_new_string("[object String]", 15);
   }
   if (ts_is_regexp(v)) return TS_TAG(g_tag_regexp);
   /* the builtin tags of the collections, promises and errors (ECMA-262's @@toStringTag of their
@@ -18498,6 +18628,16 @@ static void atomics_view_error(tsv v, const char* what){
   snprintf(buf, sizeof buf, "%s is not %s typed array.", tag, what);
   ts_throw_type_error_msg(buf);
 }
+/* @@toStringTag of the built-in prototypes, for a program that names the symbol */
+void ts_define_builtin_tags(void){
+  ta_protos_init();
+  const struct { tsv proto; const char* tag; } list[] = {
+    { g_map_proto_v, "Map" }, { g_set_proto_v, "Set" }, { g_weakmap_proto_v, "WeakMap" }, { g_weakset_proto_v, "WeakSet" },
+    { g_promise_proto_v, "Promise" }, { g_arraybuffer_proto, "ArrayBuffer" }, { g_sab_proto, "SharedArrayBuffer" } };
+  for (size_t i = 0; i < sizeof list / sizeof list[0]; i++)
+    if (ts_proto_ref(list[i].proto))
+      ts_define_data(list[i].proto, TS_KEY_WKSYM(TS_WKSYM_TO_STRING_TAG), ts_new_string(list[i].tag, (uint32_t)strlen(list[i].tag)), 0, 0, 1);
+}
 static int atomics_integer_elem(int elem){ return elem != TS_TA_UINT8C && elem != TS_TA_FLOAT32 && elem != TS_TA_FLOAT64 && elem != TS_TA_FLOAT16; }
 /* The element index of an access (the view is rooted by the caller). */
 static uint32_t atomics_index(tsv ta, tsv index){
@@ -19744,8 +19884,8 @@ tsv ts_string_proto(void){ return ts_proto_ref(g_string_proto_v) ? g_string_prot
    (ts_iter_acquire's string case; it does not consult this method, so there is no cycle). */
 static tsv ts_string_iterator(tsv* a, int n){
   (void)n;
-  if (!ts_is_str(a[0])) ts_throw_type_error_msg("String.prototype[Symbol.iterator] requires that 'this' be a String");
-  return ts_iter_acquire(a[0], 0);
+  if (n < 1 || a[0] == TS_UNDEFINED || a[0] == TS_NULL) ts_throw_type_error_msg("String.prototype[Symbol.iterator] called on null or undefined");
+  return ts_iter_acquire(ts_is_str(a[0]) ? a[0] : ts_to_string_template(a[0]), 0);
 }
 void ts_string_proto_init(void){
   if (ts_proto_ref(g_string_proto_v)) return;
@@ -19771,6 +19911,25 @@ void ts_string_proto_register(ts_key method_key, const char* name, ts_code fn){
    type's prototype, its primitive in an internal slot; `typeof` says "object", a wrapper of false is
    truthy, and ToPrimitive reaches the primitive through the prototype's valueOf. */
 static ts_key primitive_slot_key(void){ static ts_key k; if (!k) k = ts_intern_field("__primitive", 11); return k; }
+/* A String object's characters are own properties, made at the first look at them: a program that wraps a long
+   string to hang properties on it (hono's escaped HTML) never pays for them. */
+static void string_object_touch(tsv obj){
+  tsv w = wrapper_value(obj);
+  if (!ts_is_str(w)) return;
+  uint32_t n = ts_str_len_typed(w);
+  if (n == 0 || find_slot((ts_object*)ts_ptr(obj), array_index_key(0), 0)) return;
+  ts_gc_root(&obj); ts_gc_root(&w);
+  for (uint32_t i = 0; i < n; i++) ts_define_data(obj, array_index_key(i), ts_string_slice_view(w, i, 1), 1, 0, 0);
+  ts_gc_unroot(2);
+}
+/* a read that found no own property: the character of a String object not yet touched */
+static tsv string_object_char(tsv obj, ts_key key){
+  uint32_t i;
+  if (!prop_key_is_array_index(key, &i)) return TS_UNDEFINED;
+  tsv w = wrapper_value(obj);
+  if (!ts_is_str(w) || i >= ts_str_len_typed(w)) return TS_UNDEFINED;
+  return ts_string_slice_view(w, i, 1);
+}
 static tsv wrapper_value(tsv v){
   if (TS_TOP16(v) != TS_SEL_OBJECT) return TS_UNDEFINED;
   ts_object* o = (ts_object*)ts_ptr(v);
@@ -19811,11 +19970,9 @@ static tsv new_wrapper(tsv prim, tsv proto){
 /* ToObject. A String's length and characters are own properties, as its exotic object answers them. */
 tsv ts_to_object(tsv v){
   if (ts_is_str(v)){
-    tsv o = new_wrapper(v, ts_string_proto()); ts_gc_root(&o); ts_gc_root(&v);
-    uint32_t n = ts_str_len_typed(v);
-    for (uint32_t i = 0; i < n; i++) ts_define_data(o, array_index_key(i), ts_string_slice_view(v, i, 1), 1, 0, 0);
-    ts_define_data(o, ts_intern_field("length", 6), ts_num((double)n), 0, 0, 0);
-    ts_gc_unroot(2);
+    tsv o = new_wrapper(v, ts_string_proto()); ts_gc_root(&o);
+    ts_define_data(o, ts_intern_field("length", 6), ts_num((double)ts_str_len_typed(v)), 0, 0, 0);
+    ts_gc_unroot(1);
     return o;
   }
   if (ts_is_num(v)) return new_wrapper(v, ts_number_proto());
@@ -19965,14 +20122,48 @@ tsv ts_fn_name_from_key(tsv fn, tsv key, const char* prefix){
   ts_gc_unroot(1);
   return fn;
 }
-static tsv g_ctor_object = TS_UNDEFINED, g_ctor_number = TS_UNDEFINED, g_ctor_boolean = TS_UNDEFINED;
+static tsv g_ctor_object = TS_UNDEFINED, g_ctor_number = TS_UNDEFINED, g_ctor_boolean = TS_UNDEFINED, g_ctor_string = TS_UNDEFINED;
+static tsv string_raw_fn(tsv* a, int n){
+  tsv cooked = n > 0 ? a[0] : TS_UNDEFINED;
+  if (cooked == TS_UNDEFINED || cooked == TS_NULL) ts_throw_type_error_msg("Cannot convert undefined or null to object");
+  if ((!ts_is_obj(cooked) && !ts_is_func(cooked)) || ts_is_prim_cell(cooked)) cooked = ts_to_object(cooked);
+  ts_gc_root(&cooked);
+  tsv raw = ts_get(cooked, ts_intern_field("raw", 3));
+  if (raw == TS_UNDEFINED || raw == TS_NULL) ts_throw_type_error_msg("Cannot convert undefined or null to object");
+  if ((!ts_is_obj(raw) && !ts_is_func(raw)) || ts_is_prim_cell(raw)) raw = ts_to_object(raw);
+  ts_gc_root(&raw);
+  double d = ts_number_coerce(ts_get(raw, ts_intern_field("length", 6)));
+  d = d != d || d <= 0 ? 0 : trunc(d);
+  tsv out = ts_new_string("", 0); ts_gc_root(&out);
+  for (double i = 0; i < d; i++){
+    out = ts_add(out, ts_to_string_template(ts_get_dyn(raw, ts_num(i))));
+    if (i + 1 >= d) break;
+    if (i + 1 < n) out = ts_add(out, ts_to_string_template(a[(int)i + 1]));
+  }
+  ts_gc_unroot(3);
+  return out;
+}
+void ts_register_string_ctor(tsv string){
+  g_ctor_string = string;
+  ts_gc_root(&string);
+  tsv f = ts_make_fn_t(string_raw_fn, NULL, 0, 0); ts_gc_root(&f);
+  ts_set_fn_meta(f, 1u, "raw");
+  ts_define_data(string, ts_intern_field("raw", 3), f, 0, 1, 1);
+  ts_gc_unroot(2);
+}
+void ts_define_function_poison(void){
+  tsv thrower = ts_throw_type_error_value();
+  tsv p = ts_function_proto();
+  ts_define_accessor_attr(p, ts_intern_field("caller", 6), thrower, thrower, 0, 0, 0, 1);
+  ts_define_accessor_attr(p, ts_intern_field("arguments", 9), thrower, thrower, 0, 0, 0, 1);
+}
 void ts_register_primitive_ctors(tsv object, tsv number, tsv boolean){ g_ctor_object = object; g_ctor_number = number; g_ctor_boolean = boolean; }
 /* ---- dynamic classes (docs/dynamic_classes_design.md) ---- */
 static int ts_value_is_constructor(tsv v){
   if (g_has_proxies && ts_is_proxy(v)) return ts_is_callable(v);
   if (!ts_is_func(v)) return 0;
   ts_func* f = (ts_func*)ts_ptr(v);
-  return f->class_id != 0 || f->constructable || f->native_ctor || v == g_ctor_object || v == g_ctor_number || v == g_ctor_boolean;
+  return f->class_id != 0 || f->constructable || f->native_ctor || v == g_ctor_string || v == g_ctor_object || v == g_ctor_number || v == g_ctor_boolean;
 }
 static void dyn_throw_named(const char* before, tsv v, const char* after){
   ts_gc_root(&v);
@@ -20054,6 +20245,7 @@ tsv ts_dyn_result(tsv v, tsv self, int derived){
 /* `new` of Object, Number or Boolean: 1 and the object; their adapters are plain functions otherwise. */
 static int primitive_ctor_construct(tsv ctor, tsv* args, int n, tsv* out){
   tsv a = n > 0 ? args[0] : TS_UNDEFINED;
+  if (ctor == g_ctor_string){ *out = ts_to_object(n > 0 ? ts_to_string_template(a) : ts_new_string("", 0)); return 1; }
   if (ctor == g_ctor_object){
     *out = a == TS_UNDEFINED || a == TS_NULL ? ts_new_object() : ts_to_object(a);
     return 1;
@@ -20726,6 +20918,11 @@ __attribute__((noinline)) static tsv ts_get_pic_checked_slow(tsv obj, ts_key key
   if (ts_is_null(obj) || ts_is_undef(obj))
     return ts_throw_cannot_read(obj, ts_field_name(key));
   TS_RT_STAT_PIC_GET_CALL();
+  if (TS_RT_UNLIKELY(g_has_wrappers) && TS_TOP16(obj) == TS_SEL_OBJECT){
+    /* a String object's character: two of one shape can differ in length, so no site remembers it */
+    uint32_t i;
+    if (prop_key_is_array_index(key, &i) && ts_is_str(wrapper_value(obj))) return ts_get(obj, key);
+  }
   if (ic && g_negative_pic && TS_TOP16(obj) == TS_SEL_OBJECT){
     ts_object* o = (ts_object*)ts_ptr(obj);
     const ts_prop_absent_entry* e;

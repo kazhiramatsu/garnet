@@ -1,0 +1,24 @@
+// @ts-nocheck
+const t = (name, f) => { try { console.log(name, JSON.stringify(f())); } catch (e) { console.log(name, "THROW", e.name, e.message); } };
+const tag = (o) => { const d = Object.getOwnPropertyDescriptor(o, Symbol.toStringTag); return d ? [d.value, d.writable, d.enumerable, d.configurable] : "none"; };
+t("tags", () => ({ Map: tag(Map.prototype), Set: tag(Set.prototype), WeakMap: tag(WeakMap.prototype), WeakSet: tag(WeakSet.prototype), Promise: tag(Promise.prototype), Symbol: tag(Symbol.prototype), Math: tag(Math), JSON: tag(JSON), ArrayBuffer: tag(ArrayBuffer.prototype), SAB: tag(SharedArrayBuffer.prototype), Atomics: tag(Atomics), Reflect: tag(Reflect), BigInt: tag(BigInt.prototype), Iterator: typeof Iterator }));
+t("strs", () => [Object.prototype.toString.call(new Map()), Object.prototype.toString.call(new Set()), Object.prototype.toString.call(new WeakMap()), Object.prototype.toString.call(Promise.resolve()), Object.prototype.toString.call(Math), Object.prototype.toString.call(JSON), String(Symbol.prototype[Symbol.toStringTag])]);
+t("gpo prim", () => [Object.getPrototypeOf(1) === Number.prototype, Object.getPrototypeOf("a") === String.prototype, Object.getPrototypeOf(true) === Boolean.prototype, Object.getPrototypeOf(Symbol()) === Symbol.prototype, Object.getPrototypeOf(1n) === BigInt.prototype]);
+t("gpo null", () => Object.getPrototypeOf(null));
+t("spo", () => [Object.setPrototypeOf(1, null), Object.setPrototypeOf("s", {})]);
+t("spo null", () => Object.setPrototypeOf(undefined, {}));
+t("spo bad", () => Object.setPrototypeOf({}, 1));
+t("keys prim", () => [Object.keys("ab"), Object.keys(1), Object.values("ab"), Object.entries("a"), Object.getOwnPropertyNames("ab"), Object.isFrozen(1), Object.isSealed("a"), Object.isExtensible(1), Object.freeze(1), Object.seal("a"), Object.preventExtensions(true)]);
+t("keys null", () => Object.keys(null));
+t("fromCodePoint", () => [String.fromCodePoint(65, 0x1F600).length, String.fromCodePoint("65"), String.fromCodePoint()]);
+t("fcp frac", () => String.fromCodePoint(1.5));
+t("fcp neg", () => String.fromCodePoint(-1));
+t("fcp big", () => String.fromCodePoint(0x110000));
+t("fcp nan", () => String.fromCodePoint(NaN));
+t("fcp str", () => String.fromCodePoint("a"));
+t("new string", () => { const s = new String("lego"); let x; return [s.charAt(x), s.charAt(1), s.indexOf("g", x), s.slice(x, 2), s.substring(1), s.length, s.toUpperCase(), s.concat("!"), s + "", s.at(-1)]; });
+t("map close", () => { const o = Map.prototype.set; let closed = 0; Map.prototype.set = function () { throw new RangeError("x"); }; const it = { [Symbol.iterator]() { return { next() { return { value: [], done: false }; }, return() { closed++; return {}; } }; } }; try { new Map(it); } catch (e) { Map.prototype.set = o; return [e.name, closed]; } });
+t("set close", () => { const o = Set.prototype.add; let closed = 0; Set.prototype.add = function () { throw new RangeError("x"); }; const it = { [Symbol.iterator]() { return { next() { return { value: 1, done: false }; }, return() { closed++; return {}; } }; } }; try { new Set(it); } catch (e) { Set.prototype.add = o; return [e.name, closed]; } });
+t("map adder", () => { const o = Map.prototype.set; const seen = []; Map.prototype.set = function (k, v) { seen.push(k); return o.call(this, k, v); }; const m = new Map([[1, 2]]); Map.prototype.set = o; return [seen, m.size]; });
+t("set adder", () => { const o = Set.prototype.add; const seen = []; Set.prototype.add = function (k) { seen.push(k); return o.call(this, k); }; const m = new Set([1]); Set.prototype.add = o; return [seen, m.size]; });
+t("map bad entry", () => { let closed = 0; const it = { [Symbol.iterator]() { return { next() { return { value: 1, done: false }; }, return() { closed++; return {}; } }; } }; try { new Map(it); } catch (e) { return [e.name, closed]; } });

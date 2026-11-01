@@ -213,6 +213,13 @@ for (const name of Object.keys(statics)) {
   Object.defineProperty(NativePromise, name, { value: statics[name], writable: true, enumerable: false, configurable: true });
 }
 
+// How V8 prints a receiver in a message
+function describe(v: any): string {
+  if (Array.isArray(v)) return "[object Array]";
+  if (!isObject(v)) return String(v);
+  const name = typeof v === "function" ? "Function" : v.constructor?.name;
+  return `#<${name || "Object"}>`;
+}
 // A reaction of a promise of another constructor: the handler's result settles that capability.
 function reaction(handler: any, cap: any, rejecting: boolean): any {
   return (value: any): void => {
@@ -231,7 +238,7 @@ function reaction(handler: any, cap: any, rejecting: boolean): any {
 }
 const prototype: any = {
   then(this: any, onFulfilled: any, onRejected: any): any {
-    if (!host.isPromise(this)) throw new TypeError(`Method Promise.prototype.then called on incompatible receiver ${String(this)}`);
+    if (!host.isPromise(this)) throw new TypeError(`Method Promise.prototype.then called on incompatible receiver ${describe(this)}`);
     const C = speciesConstructor(this, NativePromise);
     if (C === NativePromise) return nativeThen.call(this, onFulfilled, onRejected);
     const cap = newPromiseCapability(C);
@@ -239,15 +246,19 @@ const prototype: any = {
     return cap.promise;
   },
   catch(this: any, onRejected: any): any {
-    return this.then(undefined, onRejected);
+    const then = this.then;
+    if (typeof then !== "function") throw new TypeError(`${String(then)} is not a function`);
+    return then.call(this, undefined, onRejected);
   },
   finally(this: any, onFinally: any): any {
-    if (!isObject(this)) throw new TypeError("Promise.prototype.finally called on a non-object");
+    if (!isObject(this)) throw new TypeError("Promise.prototype.finally called on non-object");
     const C = speciesConstructor(this, NativePromise);
-    if (typeof onFinally !== "function") return this.then(onFinally, onFinally);
+    const then = this.then;
+    if (typeof then !== "function") throw new TypeError(`${String(then)} is not a function`);
+    if (typeof onFinally !== "function") return then.call(this, onFinally, onFinally);
     const thenFinally = anonymous((value: any): any => promiseResolve(C, onFinally()).then(anonymous(() => value)));
     const catchFinally = anonymous((reason: any): any => promiseResolve(C, onFinally()).then(anonymous(() => { throw reason; })));
-    return this.then(thenFinally, catchFinally);
+    return then.call(this, thenFinally, catchFinally);
   },
 };
 for (const name of ["then", "catch", "finally"]) {

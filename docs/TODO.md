@@ -12765,5 +12765,23 @@ Where it stopped (branch `s363-dc`, worktree `build/wt_dc`, on top of `s362-wip`
 - **Array.prototype over any receiver** (`docs/array_protocol_design.md`): the specification's 35 methods in TypeScript for
   array-likes, Proxies and dictionary arrays, a wrapper on the prototype that keeps plain arrays on the runtime's path.
   `Object.defineProperties` reads every descriptor first.
+- **`using` and `await using`** (`docs/using_declarations_design.md`): a source rewrite, `const` plus a try around the statement
+  list, so the checker keeps the types; `DisposableStack`, `AsyncDisposableStack`, `SuppressedError` in the library. test262: 269
+  of 299 runnable.
+- **Promise's protocol** (`docs/promise_protocol_design.md`): subclasses, `Promise.all.call(C, ...)`, a replaced `then` or
+  `resolve`, in TypeScript for a program that can tell. `Promise.try`, `withResolvers`. test262: 186 of about 200.
+- **A class value refuses a plain call**: `A.call({})` ran the constructor on the object and answered undefined, silently, and
+  `A()` read `this` undefined, a segfault for a prelude class. The function's code is an emitted thunk that throws;
+  `ts_construct` keeps the constructor by class.
+- **Smaller**: `Reflect.*` on a non-object and `Reflect.set`'s false; `ownKeys` invariants; `Object("s")` is a wrapper with its
+  index keys; `Object.prototype.valueOf` and `Object.assign` of a primitive; `Object.entries` with a getter that changes the
+  object; `Object.setPrototypeOf` refuses a cycle (a hang before) and a non-extensible object; `Object.fromEntries` closes its
+  iterator; DataView's conversion order, resizable buffers, truthy `littleEndian` (`getUint16(0, 1)` read big-endian);
+  `Float16Array`; `__proto__`; `JSON.rawJSON`, `Error.isError`, `RegExp.escape` as a value, `FinalizationRegistry`, `eval` as a
+  value that throws; the names of RegExp's getters pointed at a dead stack frame; a missing or extra argument of a namespace
+  builtin is padded or dropped where it was a compile-time reject.
+- test262 samples now: 500 random of statements and built-ins pass 376 of 412 runnable; 400 random of `language/` 341 of 354;
+  a tenth of the rest of built-ins 743 of 879 before the last batches; `Array.prototype` 527 of 554 in a fifth;
+  `Object.defineProperty` and `defineProperties` 568 of 576 in a third; RegExp's protocol directories 92 of 92 in a third.
 - Found, not fixed: `console.log` prints an object or array on one line where Node breaks at 72 columns and groups long
   numeric arrays.

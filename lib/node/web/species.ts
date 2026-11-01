@@ -60,7 +60,7 @@ function flattenIntoArray(target: any, source: any, sourceLen: number, start: nu
   return targetIndex;
 }
 export function toObject(v: any): any {
-  if (v === undefined || v === null) throw new TypeError("Array.prototype method called on null or undefined");
+  if (v === undefined || v === null) throw new TypeError("Cannot convert undefined or null to object");
   if (typeof v === "object" && v instanceof String) v = v.toString();
   if (typeof v !== "string") return Object(v);
   // a String's elements read-only, as its exotic object has them

@@ -162,8 +162,8 @@ let nodePreludeFile: string | undefined;
 let nodeLibDir: string | undefined;
 const NODE_PRELUDE_GLOBALS = new Set(["process", "Buffer", "atob", "btoa", "setTimeout", "setInterval", "setImmediate", "clearTimeout",
   "clearInterval", "clearImmediate", "queueMicrotask", "structuredClone", "performance", "URL", "URLSearchParams", "global",
-  // the Web standard objects (docs/web_fetch_api_design.md); `__garnet_StringObject` is named by a `new String(...)`
-  "Headers", "Request", "Response", "FormData", "fetch", "DataView", "__garnet_StringObject",
+  // the Web standard objects (docs/web_fetch_api_design.md)
+  "Headers", "Request", "Response", "FormData", "fetch", "DataView",
   // Web Crypto (docs/web_crypto_design.md)
   "crypto", "Crypto", "SubtleCrypto", "CryptoKey",
   // streams (docs/web_streams_design.md)
@@ -175,7 +175,7 @@ const NODE_PRELUDE_GLOBALS = new Set(["process", "Buffer", "atob", "btoa", "setT
   "FinalizationRegistry"]);
 /** The constructors among them: lib.dom declares the identifier, the prelude's class is the
  *  global object's value, and `new URL(...)` constructs through that value. */
-const NODE_PRELUDE_CTORS = new Set(["URL", "URLSearchParams", "Headers", "Request", "Response", "FormData", "DataView", "__garnet_StringObject",
+const NODE_PRELUDE_CTORS = new Set(["URL", "URLSearchParams", "Headers", "Request", "Response", "FormData", "DataView",
   "Crypto", "SubtleCrypto", "CryptoKey",
   "ReadableStream", "WritableStream", "TransformStream", "ReadableStreamDefaultReader", "WritableStreamDefaultWriter", "ReadableStreamDefaultController", "WritableStreamDefaultController", "TransformStreamDefaultController", "TextEncoderStream", "TextDecoderStream", "CountQueuingStrategy", "ByteLengthQueuingStrategy", "Blob", "File",
   // the compression streams (docs/web_compression_design.md)
@@ -195,7 +195,7 @@ const ARRAY_GENERIC_TRIGGER = "__garnet_array_generic";
 const arrayGenericText = /\bArray\s*\.\s*prototype\b|\[\s*\]\s*\.\s*\w+\s*\.\s*(call|apply|bind)\b|\bObject\s*\.\s*prototype\s*\[|defineProperty\s*\(\s*Object\s*\.\s*prototype\b/;
 const PROMISE_PROTOCOL_TRIGGER = "__garnet_promise_protocol";
 const promiseProtocolText = /\bextends\s+Promise\b|defineProperty\s*\([^,]+,\s*["']constructor["']|\bPromise\s*\.\s*\w+\s*\.\s*(call|apply|bind)\b|\bPromise\s*\.\s*resolve\s*=[^=]|\bPromise\s*\.\s*prototype\b|\.\s*then\s*=[^=]|["']then["']|\bPromise\s*\.\s*try\b|\bPromise\s*\.\s*withResolvers\b|\bPromise\s*,/;
-const OBJECT_PROTO_METHODS = new Set(["hasOwnProperty", "isPrototypeOf", "propertyIsEnumerable", "toLocaleString", "toString", "valueOf"]);
+const OBJECT_PROTO_METHODS = new Set(["call", "apply", "bind", "hasOwnProperty", "isPrototypeOf", "propertyIsEnumerable", "toLocaleString", "toString", "valueOf"]);
 const REGEXP_METHODS = new Set(["test", "exec", "match", "matchAll", "search", "replace", "replaceAll", "split"]);
 const regexpProtocolText = /\bSymbol\s*\.\s*(match|matchAll|replace|search|split)\b|\.\s*exec\s*=[^=]|["']exec["']|\bextends\s+RegExp\b/;
 const NODE_PRELUDE_PARTS: { file: string; names: string[]; defaultImport?: string; triggers?: string[] }[] = [
@@ -210,7 +210,6 @@ const NODE_PRELUDE_PARTS: { file: string; names: string[]; defaultImport?: strin
   // the Web standard objects (docs/web_fetch_api_design.md)
   { file: "web/fetch", names: ["Headers", "Request", "Response", "FormData", "fetch"] },
   { file: "web/dataview", names: ["DataView"] },
-  { file: "web/string_object", names: ["__garnet_StringObject"] },
   // Web Crypto (docs/web_crypto_design.md): the `crypto` global over node:crypto's digests and HMAC
   { file: "web/crypto", names: ["crypto", "Crypto", "SubtleCrypto", "CryptoKey"] },
   // WHATWG streams (docs/web_streams_design.md); the fetch part's bodies stream through them
@@ -221,6 +220,7 @@ const NODE_PRELUDE_PARTS: { file: string; names: string[]; defaultImport?: strin
   { file: "web/finalization", names: ["FinalizationRegistry"] },
   // explicit resource management (docs/using_declarations_design.md)
   { file: "web/disposable", names: ["SuppressedError", "DisposableStack", "AsyncDisposableStack", "__garnet_using_stack", "__garnet_use", "__garnet_dispose", "__garnet_dispose_async"] },
+  { file: "web/array_from_async", names: [], triggers: ["fromAsync"] },
   // on demand: a program that can see Promise's protocol (docs/promise_protocol_design.md)
   { file: "web/promise_protocol", names: [], triggers: [PROMISE_PROTOCOL_TRIGGER] },
   // on demand: a program that passes the array methods an array-like (docs/array_protocol_design.md)
@@ -615,10 +615,6 @@ function programWithNodeSupport(rootNames: string[], options: ts.CompilerOptions
           if (!sym || !sym.declarations || sym.declarations.every((d) => d.getSourceFile().isDeclarationFile)) found.add(n.text);
         }
         // `new String(v)` constructs the prelude's wrapper class (docs/web_fetch_api_design.md)
-        if (ts.isNewExpression(n) && ts.isIdentifier(n.expression) && n.expression.text === "String" && !found.has("__garnet_StringObject")) {
-          const sym = ck.getSymbolAtLocation(n.expression);
-          if (!sym || !sym.declarations || sym.declarations.every((d) => d.getSourceFile().isDeclarationFile)) found.add("__garnet_StringObject");
-        }
         n.forEachChild(visit);
       };
       visit(f);
@@ -2369,6 +2365,41 @@ class Exporter {
     if (ts.isParenthesizedExpression(n)) return this.foreignValue(n.expression);
     if (!ts.isPropertyAccessExpression(n) && !ts.isElementAccessExpression(n)) return false;
     return n.expression.kind !== ts.SyntaxKind.SuperKeyword && (this.foreignReceiver(n.expression) || this.foreignValue(n.expression));
+  }
+  /** Is this use of `arguments` one the array of the actual arguments stands for? A read of `length` or of an element, a
+   *  spread, `f.apply(t, arguments)`, `Array.from(arguments)`, `Array.prototype.slice.call(arguments)`. */
+  private argumentsArrayUse(n: ts.Identifier): boolean {
+    let e: ts.Node = n;
+    while (ts.isParenthesizedExpression(e.parent) || ts.isAsExpression(e.parent) || ts.isNonNullExpression(e.parent)) e = e.parent;
+    const p = e.parent;
+    const written = (x: ts.Node): boolean => {
+      const q = x.parent;
+      return (ts.isBinaryExpression(q) && q.left === x && q.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && q.operatorToken.kind <= ts.SyntaxKind.LastAssignment) ||
+        ts.isDeleteExpression(q) || ((ts.isPrefixUnaryExpression(q) || ts.isPostfixUnaryExpression(q)) && (q.operator === ts.SyntaxKind.PlusPlusToken || q.operator === ts.SyntaxKind.MinusMinusToken));
+    };
+    if (ts.isPropertyAccessExpression(p) && p.expression === e && p.name.text === "length") return !written(p);
+    if (ts.isElementAccessExpression(p) && p.expression === e) return !written(p);
+    if (ts.isSpreadElement(p)) return true;
+    if (ts.isCallExpression(p) && p.expression !== e) {
+      const callee = this.unwrapExpr(p.expression);
+      if (!ts.isPropertyAccessExpression(callee)) return false;
+      if (callee.name.text === "apply" && p.arguments[1] === e) return true;
+      if (callee.name.text === "from" && ts.isIdentifier(callee.expression) && callee.expression.text === "Array") return true;
+      if (callee.name.text === "call" && p.arguments[0] === e && ts.isPropertyAccessExpression(callee.expression) && callee.expression.name.text === "slice") return true;
+    }
+    return false;
+  }
+  private argumentsNeedObject(fn: FnLike): boolean {
+    let needs = false;
+    const visit = (n: ts.Node): void => {
+      if (needs) return;
+      if ((ts.isFunctionLike(n) && !ts.isArrowFunction(n)) || ts.isClassLike(n)) return;
+      if (ts.isIdentifier(n) && n.text === "arguments" && this.isVarRef(n) && !this.symbolOf(n)?.declarations?.length && !this.argumentsArrayUse(n)) { needs = true; return; }
+      ts.forEachChild(n, visit);
+    };
+    for (const p of fn.parameters) visit(p);
+    if (fn.body) visit(fn.body);
+    return needs;
   }
   /** The callee of a `new`: read before the arguments, which may reassign the variable (`new x(x = 1)`). */
   private lowerNewCallee(ctx: FnCtx, node: ts.NewExpression, callee: number): number {
@@ -4123,7 +4154,7 @@ class Exporter {
       for (let i = 1; i < arr.length; i++) this.lowerExpr(ctx, arr[i]);
       return same;
     }
-    const raw = this.regexpConstructorRawFromArgs(node.arguments);
+    const raw = this.regexpProtocol ? undefined : this.regexpConstructorRawFromArgs(node.arguments);
     if (raw === undefined) {
       const args = this.lowerSequenced(ctx, arr);
       const undef = this.newLocal(ctx, "reference");
@@ -5736,7 +5767,11 @@ class Exporter {
         const v = this.lowerExpr(ctx, node, hint);
         this.distrustSkip.delete(node);
         const label = ts.isPropertyAccessExpression(node) ? node.name.text : ts.isIdentifier(node) ? node.text : "element";
-        ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: `cast.foreignNumber:${label}`, args: [v] });
+        // the operand of a compound assignment: an absent field is NaN there, as it is for any operator
+        const parent = node.parent;
+        const operand = ts.isBinaryExpression(parent) && parent.right === node && parent.operatorToken.kind > ts.SyntaxKind.FirstAssignment &&
+          parent.operatorToken.kind <= ts.SyntaxKind.LastAssignment;
+        ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: operand ? "cast.number" : `cast.foreignNumber:${label}`, args: [v] });
         return v;
       }
     }
@@ -5870,12 +5905,7 @@ class Exporter {
         // the static classId equals the runtime class, so downstream
         // devirtualization agrees. functionValue: an ES5 function constructor —
         // ts_construct's class_id==0 arm builds the instance on fn.prototype.
-        // `new String(v)`: the prelude's wrapper class (docs/web_fetch_api_design.md), not the
-        // String function the identifier names as a value
-        const callee = target.kind === "functionValue" && nodePreludeFile !== undefined && ts.isIdentifier(node.expression) &&
-            node.expression.text === "String" && this.isAmbientGlobalSymbol(this.symbolOf(node.expression))
-          ? this.loadGlobalObjectProperty(ctx, "__garnet_StringObject")
-          : this.lowerNewCallee(ctx, node, this.lowerExpr(ctx, node.expression));
+        const callee = this.lowerNewCallee(ctx, node, this.lowerExpr(ctx, node.expression));
         const dargs = this.lowerSequenced(ctx, node.arguments ?? []);
         const ddst = this.newLocal(ctx, "reference", hint);
         this.emitNewMaybeGuarded(ctx, node, ddst, callee, dargs);
@@ -6330,8 +6360,8 @@ class Exporter {
       // stdlib global.
       if (ts.isIdentifier(node.expression) && this.isAmbientGlobalSymbol(this.symbolOf(node.expression))) {
         if (node.expression.text === "Number") {
-          const special: Record<string, string> = { POSITIVE_INFINITY: "PosInf", NEGATIVE_INFINITY: "NegInf", NaN: "NaN" };
-          const kind = special[node.name.text];
+          const special = new Map([["POSITIVE_INFINITY", "PosInf"], ["NEGATIVE_INFINITY", "NegInf"], ["NaN", "NaN"]]);
+          const kind = special.get(node.name.text);
           if (kind) {
             const dst = this.newLocal(ctx, "primitive");
             ctx.body.push({ kind: "Const", dst, value: { kind } });
@@ -6523,7 +6553,9 @@ class Exporter {
           return dst;
         }
         // the members the runtime or a library puts on the object itself
-        if ((nsName === "Promise" && this.promiseProtocol) || (nsName === "JSON" && (node.name.text === "rawJSON" || node.name.text === "isRawJSON"))) {
+        if ((nsName === "Promise" && this.promiseProtocol) || (nsName === "JSON" && (node.name.text === "rawJSON" || node.name.text === "isRawJSON")) ||
+            (nsName === "Array" && node.name.text === "fromAsync") || (nsName === "String" && node.name.text === "raw") ||
+            node.name.text === "length" || node.name.text === "name") {
           const nsObj = this.newLocal(ctx, "reference");
           ctx.body.push({ kind: "LoadBuiltinFn", dst: nsObj, builtin: `globalobj.${nsName}` });
           const dst = this.newLocal(ctx, "reference");
@@ -7204,7 +7236,7 @@ class Exporter {
           }
           if (sname !== undefined) {
             // what `Math` and `JSON` inherit: the namespace object is an ordinary receiver
-            if (sname === "__UNSUPPORTED__" && (OBJECT_PROTO_METHODS.has(fn.name.text) || fn.name.text === "rawJSON" || fn.name.text === "isRawJSON")) {
+            if (sname === "__UNSUPPORTED__" && (OBJECT_PROTO_METHODS.has(fn.name.text) || fn.name.text === "rawJSON" || fn.name.text === "isRawJSON" || fn.name.text === "fromAsync" || fn.name.text === "raw")) {
               const recv = this.lowerExpr(ctx, fn.expression);
               const callee = this.lowerExpr(ctx, fn);
               return this.lowerDynamicValueCall(ctx, callee, recv, node.arguments, this.refKindOf(node));
@@ -12160,6 +12192,9 @@ class Exporter {
       };
       if (innerKind && arrayReturning[innerKind]?.has(meth)) return "array";
     }
+    // `new String(...)`: an object, whatever methods the type shares with a string
+    { const raw = this.rawChecker.getTypeAtLocation(recvExpr);
+      if (raw.getSymbol()?.name === "String" && (raw.flags & ts.TypeFlags.StringLike) === 0) return undefined; }
     const spec = this.typeSpecOfExpr(recvExpr);
     if (spec?.kind === "string") return "string";
     if (spec?.kind === "array") return "array";
@@ -16669,6 +16704,12 @@ class Exporter {
           ctx.argumentsLocal = this.newLocal(ctx, "reference", "arguments");
           ctx.body.push({ kind: "CallBuiltinStatic", dst: ctx.argumentsLocal, builtin: `arguments.array:${ctx.argumentsOffset}`, args: [] });
         }
+        // a use only an object answers: the array becomes one, the function reads it as any object
+        if (this.argumentsNeedObject(node)) {
+          const object = this.newLocal(ctx, "reference", "arguments");
+          ctx.body.push({ kind: "CallBuiltinStatic", dst: object, builtin: "arguments.object", args: [ctx.argumentsLocal] });
+          ctx.argumentsLocal = object;
+        }
         if (this.arrowInsideReadsArguments(node.body) || node.parameters.some((p) => this.arrowInsideReadsArguments(p))) {
           const cell = this.newLocal(ctx, "reference", "argumentsCell");
           const site = this.site++;
@@ -18051,6 +18092,8 @@ class Exporter {
     if (this.regexpProtocol) this.internField(REGEXP_PROTOCOL_TRIGGER);
     this.promiseProtocol = this.modules.some((m) => /web[\/\\]promise_protocol\.ts$/.test(m.fileName));
     if (this.modules.some((m) => !/\/lib\/(node|garnet)\/|node_prelude/.test(m.fileName) && /\b__proto__\b/.test(m.text))) this.internField("__garnet_proto_accessor");
+    if (this.modules.some((m) => !/\/lib\/(node|garnet)\/|node_prelude/.test(m.fileName) && /\btoStringTag\b/.test(m.text))) this.internField("__garnet_builtin_tags");
+    if (this.modules.some((m) => !/\/lib\/(node|garnet)\/|node_prelude/.test(m.fileName) && /\.caller\b|["']caller["']|ThrowTypeError/.test(m.text))) this.internField("__garnet_function_poison");
     if (this.modules.some((m) => /web[\/\\]species\.ts$/.test(m.fileName))) this.internField(SPECIES_TRIGGER);
     for (const f of allFns) for (const s of this.freeVars(f)) {
       this.cellBindings.add(s);

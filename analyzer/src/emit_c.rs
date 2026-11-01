@@ -1233,6 +1233,9 @@ fn emit_program_with_string_plans(
     if names_proto_accessor {
         s.push_str("  ts_define_proto_accessor();\n");
     }
+    if program.fields.iter().any(|f| f.name.as_deref() == Some("__garnet_function_poison")) {
+        s.push_str("  ts_define_function_poison();\n");
+    }
     // Function.prototype must be set up BEFORE the array/map/set prototypes: each
     // proto method is boxed via ts_make_fn (which records Function.prototype
     // at creation time), so if Function.prototype is still absent the boxed method has
@@ -1250,6 +1253,9 @@ fn emit_program_with_string_plans(
     s.push_str("  ts_setup_string_proto();\n");
     if needs_regexp {
         s.push_str("  ts_setup_regexp_proto();\n");
+    }
+    if program.fields.iter().any(|f| f.name.as_deref() == Some("__garnet_builtin_tags")) {
+        s.push_str("  ts_define_builtin_tags();\n");
     }
     s.push_str("  ts_setup_number_proto();\n");
     s.push_str("  ts_setup_boolean_proto();\n");
@@ -14756,8 +14762,8 @@ fn fnval_adapter_body(builtin: &str) -> Option<String> {
         "reflect.preventExtensions" => hv(format!("ts_reflect_prevent_extensions({})", val(0))),
         "reflect.apply" => hv(format!("ts_reflect_apply({}, {}, {})", val(0), val(1), val(2))),
         "reflect.construct" => hv(format!("(n > 2 ? ts_reflect_construct_target({0}, {1}, a[2]) : ts_reflect_construct_target({0}, {1}, {0}))", val(0), val(1))),
-        "object.getPrototypeOf" => hv(format!("ts_get_proto({})", val(0))),
-        "object.setPrototypeOf" => hv(format!("{}({}, {})", user_set_proto_fn(), val(0), val(1))),
+        "object.getPrototypeOf" => hv(format!("ts_object_get_prototype_of({})", val(0))),
+        "object.setPrototypeOf" => hv(format!("ts_object_set_prototype_of({}, {})", val(0), val(1))),
         "object.keys" => hv(format!("ts_object_keys({})", val(0))),
         "object.forInKeys" => hv(format!("ts_object_for_in_keys({})", val(0))),
         "object.getOwnPropertyNames" => hv(format!("ts_object_get_own_property_names({})", val(0))),
@@ -15330,6 +15336,7 @@ fn emit_global_setup(s: &mut String, needs_fetch: bool, needs_typed_array_global
         1,
         "fromCodePoint",
     );
+    s.push_str("  ts_register_string_ctor(_String);\n");
     global_set_rooted(s, "String", "_String");
 
     s.push_str("  tsv _Number = ts_make_global_fn(ts_fnval_global_Number, 1u, \"Number\", 0);\n");
@@ -24195,6 +24202,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 _ if builtin.starts_with("bigint.unary:") => (format!("ts_numeric_unary({}, {})", &builtin["bigint.unary:".len()..], v(0)), false),
                 "bigint.toNumber" => (format!("ts_number_of({})", v(0)), false),
                 "cast.number" => (format!("ts_cast_number({})", v(0)), false),
+                "arguments.object" => (format!("ts_arguments_object({})", v(0)), false),
                 "cast.numberArray" => (format!("ts_cast_number_array({})", v(0)), false),
                 _ if builtin.starts_with("cast.foreignNumber:") => (format!("ts_cast_foreign_number({}, {})", v(0), c_string_lit(&builtin["cast.foreignNumber:".len()..])), false),
                 _ if builtin.starts_with("method.receiver:") => (format!("ts_method_receiver({}, {})", v(0), c_string_lit(&builtin["method.receiver:".len()..])), false),
@@ -25278,12 +25286,12 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             }
         }
         Inst::GetProto { dst, obj } => {
-            s.push_str(&ctx.set_val(dst.0, &format!("ts_get_proto({})", ctx.val(obj.0))));
+            s.push_str(&ctx.set_val(dst.0, &format!("ts_object_get_prototype_of({})", ctx.val(obj.0))));
         }
         Inst::SetProto { dst, obj, proto } => {
             // A SetProto with a result is the program's Object.setPrototypeOf;
             // the class setup's links have none (see ts_set_proto_user).
-            let f = if dst.is_some() { user_set_proto_fn() } else { "ts_set_proto" };
+            let f = if dst.is_some() { "ts_object_set_prototype_of" } else { "ts_set_proto" };
             let call = format!("{}({}, {})", f, ctx.val(obj.0), ctx.val(proto.0));
             match dst {
                 Some(d) => s.push_str(&ctx.set_val(d.0, &call)),
