@@ -12794,5 +12794,35 @@ Where it stopped (branch `s363-dc`, worktree `build/wt_dc`, on top of `s362-wip`
 - **Collections seed through the adder** (`collection_seed`): `new Map(iterable)`, `Set`, `WeakMap`, `WeakSet` look up
   `set` / `add` once, close the iterator on a throw, and a replaced adder is observed. `Array.fromAsync`
   (`lib/node/web/array_from_async.ts`), `Object.prototype.toString`'s built-in tags, `Object.getPrototypeOf` of a primitive.
-- Found, not fixed: `console.log` prints an object or array on one line where Node breaks at 72 columns and groups long
-  numeric arrays.
+- **console.log is Node's util.inspect** (`runtime/inspect.c`): `formatValue`, `formatRaw`, `formatProperty`, `groupArrayElements` and
+  `reduceToSingleString` ported function for function from Node 25's `lib/internal/util/inspect.js`. Before, every object printed on
+  one line with no depth limit, a cycle looped to `[deep]`, a Date printed `Date {}`, a Promise `Promise {}`, an Error `Error {}`, a Map
+  iterator `Iterator {}`, a Proxy ran its traps, an array had no `... n more items`. `util.inspect` takes its options, the custom
+  inspect symbol is honored, `%s %d %i %f %j %o %O` follow `formatWithOptions`. 250 lines of the probe agree with Node
+  (`tests/conformance/exhaustive/stdlib/console_inspect.ts`). `err.stack` read undefined: an accessor on `Error.prototype` makes the
+  header and one frame line when read, so an error costs nothing for it; `Error.captureStackTrace` exists.
+- **JSON.parse's reviver** was a plain callback: `this` undefined, one walk over a snapshot of the keys, a reviver's write to its holder
+  not seen, no third argument. InternalizeJSONProperty over any holder, CreateDataProperty and [[Delete]] with their failures
+  ignored, a Proxy in the tree through its traps, `context.source` from a parse record (a second walk of the text beside the
+  value). `JSON.stringify`'s space takes String and Number objects, its property list too, NaN and Infinity were undefined casts.
+- **A bound function constructs** (`new (F.bind(null, 3))()`, `new.target`, instanceof through it), a TypeError before. A class value's
+  [[Prototype]] is its base class: `Object.getPrototypeOf(B) === A` and `A.isPrototypeOf(B)` and `B instanceof Function` were
+  false, silently. `Object.setPrototypeOf(class, x)` is kept apart by `user_proto`.
+- **Function.prototype.toString** answers the NativeFunction form (a compiled program keeps no source text) and is a TypeError on a
+  non-function; `Function.prototype[Symbol.hasInstance]` for a program that names it; a callable Proxy on the right of instanceof.
+- **Atomics**: BigInt64Array and BigUint64Array in every operation, RevalidateAtomicAccess after a conversion, `Atomics.pause`,
+  `Atomics.waitAsync` (`lib/node/web/atomics_wait_async.ts`, woken by notify through a hook), notify's count.
+- **Uint8Array base64 and hex** (`lib/node/web/uint8_base64.ts`), **WeakRef** (strong, as the specification allows), a Proxy's
+  [[SetPrototypeOf]] answers, `Symbol` as a constructor value, a construct trap's Symbol, `for await` over `any`, a sync iterable in
+  `for await` behind an async-typed value never awaited its values (the flag crossed a number local as a boxed boolean:
+  NaN), `1e999` as a literal crashed the analyzer, a Map or Set's own properties were not enumerated.
+- **A typed array method walks the length it started with**: a shrink in a callback read past the view (lastIndexOf: past the buffer),
+  a grow visited elements it must not. An element gone reads undefined; `subarray` takes a view out of bounds and a length-tracking
+  view gives one; `slice` over its own buffer copies forward by bytes, as the specification says.
+- **Names starting with `__`**: a user's `function __X() {}` had no `.prototype` and an empty `.name` (the test meant the compiler's
+  synthesized functions, by prefix). `[Symbol.iterator]`, `String.prototype[Symbol.iterator]`'s own prototype and tag.
+- **`import x from "./d.json"` read undefined**: a JSON module is a TypeScript module now (a literal, or `JSON.parse` over 256 KB, with
+  `with { type: "json" }` accepted), `JSON.parse` of a long literal is no longer expanded into code (60 000 elements took clang over
+  three minutes). `import(expr)` with a specifier known at run time is a rejected promise, its ToString run. `new.target` in a
+  nested function was counted as a capture of the enclosing method. `Generator<T>[]` was taken for a Generator (by the printed type).
+  `Proxy` as a value, `class extends Proxy`, ToNumeric(lhs) of a Symbol before the right side converts.

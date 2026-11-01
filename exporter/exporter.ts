@@ -477,11 +477,25 @@ function jsxRuntimeImportOf(options: ts.CompilerOptions, sf: ts.SourceFile): str
  *  import of `<source>/jsx-runtime` to each JSX file (resolved, type-checked, part of the program). A
  *  project option says so directly (the options are then already in that mode). */
 /** A host whose source files carry the class-scoped private names, before anything binds them. */
+/** A JSON module as a TypeScript one: the default export is the value, and a key that can be a name is a named
+ *  export too, as TypeScript types the import. A small file is a literal, its type the checker's; a large one
+ *  is parsed at startup, as a program with a large table does not want it in code. */
+function jsonModuleSource(text: string): string {
+  let value: unknown;
+  try { value = JSON.parse(text); } catch { return text; }
+  const reserved = /^(break|case|catch|class|const|continue|debugger|default|delete|do|else|enum|export|extends|false|finally|for|function|if|implements|import|in|instanceof|interface|let|new|null|package|private|protected|public|return|static|super|switch|this|throw|true|try|typeof|var|void|while|with|yield|await|arguments|eval)$/;
+  let named = "";
+  if (typeof value === "object" && value !== null && !Array.isArray(value))
+    for (const k of Object.keys(value)) if (/^[A-Za-z_$][\w$]*$/.test(k) && !reserved.test(k)) named += `export const ${k} = __json[${JSON.stringify(k)}];\n`;
+  const init = text.length > 256 * 1024 ? `const __json: any = JSON.parse(${JSON.stringify(text)});` : `const __json = ${text.trim()};`;
+  return `${init}\nexport default __json;\n${named}`;
+}
 function privateNameHost(options: ts.CompilerOptions, host: ts.CompilerHost | undefined): ts.CompilerHost {
   const base = host ?? ts.createCompilerHost(options);
   return Object.assign({}, base, {
     getSourceFile(fileName: string, languageVersion: ts.ScriptTarget | ts.CreateSourceFileOptions, onError?: (m: string) => void, shouldCreate?: boolean) {
       let sf = base.getSourceFile(fileName, languageVersion, onError, shouldCreate);
+      if (sf && fileName.endsWith(".json")) return ts.createSourceFile(fileName, jsonModuleSource(sf.text), languageVersion, true, ts.ScriptKind.TS);
       if (sf && !sf.isDeclarationFile) {
         const rewritten = rewriteUsing(sf);
         if (rewritten !== undefined) sf = ts.createSourceFile(fileName, rewritten, languageVersion, true);
@@ -1218,7 +1232,11 @@ class Exporter {
         this.unsupported(node, `${node.getText()} meta-property`);
       }
       if ((ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) && node.attributes) {
-        this.unsupported(node, "import/export attributes");
+        // `with { type: "json" }` on a JSON module is what the module already is
+        const e = node.attributes.elements;
+        const json = e.length === 1 && e[0].name.text === "type" && ts.isStringLiteral(e[0].value) && e[0].value.text === "json" &&
+          node.moduleSpecifier !== undefined && ts.isStringLiteral(node.moduleSpecifier) && node.moduleSpecifier.text.endsWith(".json");
+        if (!json) this.unsupported(node, "import/export attributes");
       }
       node.forEachChild(visit);
     };
@@ -2906,6 +2924,7 @@ class Exporter {
 
   // --------------------------- capture analysis -------------------------------
   isVarRef(id: ts.Identifier): boolean {
+    if (ts.isMetaProperty(id.parent)) return false;   // the `target` of new.target, the `meta` of import.meta
     const p = id.parent;
     if (ts.isPropertyAccessExpression(p) && p.name === id) return false;
     if (ts.isQualifiedName(p) && p.right === id) return false;
@@ -5592,7 +5611,9 @@ class Exporter {
     const spec = t && (t.flags & ts.TypeFlags.StringLiteral) ? (t as ts.StringLiteralType).value : undefined;
     const dst = this.newLocal(ctx, "reference", "import");
     if (spec === undefined) {
-      this.unsupported(node, "a dynamic import() whose specifier is not a string literal (or a const of one)");
+      // known at run time only: its ToString runs, and the promise rejects, naming the module
+      const args: number[] = node.arguments.map((a) => this.lowerExpr(ctx, a));
+      ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "import.unknown", args: [args[0]] });
       return dst;
     }
     const resolved = ts.resolveModuleName(spec, node.getSourceFile().fileName, this.program.getCompilerOptions(), ts.sys).resolvedModule;
@@ -7226,7 +7247,8 @@ class Exporter {
           }
           if (ns === "JSON" && fn.name.text === "parse" && node.arguments.length === 1) {
             const text = node.arguments[0];
-            if (ts.isStringLiteral(text) || ts.isNoSubstitutionTemplateLiteral(text)) {
+            // (a long text is parsed at run time: as code it would be one enormous function)
+            if ((ts.isStringLiteral(text) || ts.isNoSubstitutionTemplateLiteral(text)) && text.text.length <= 16384) {
               try {
                 return this.lowerJsonConstValue(ctx, JSON.parse(text.text), node);
               } catch {
@@ -13039,7 +13061,8 @@ class Exporter {
         // Only a Generator is one of our coroutines: an Iterator / IterableIterator may be an array,
         // Map or Set iterator or a user's object (vue casts an array iterator to IterableIterator and
         // wraps its next); those step through the dynamic protocol, which also drives a coroutine.
-        if (/^Generator\b/.test(tn)) return true;
+        // (by the symbol: `Generator<T>[]` prints with the same start)
+        if (ty.getSymbol()?.name === "Generator") return true;
         // A type whose string merely CONTAINS "Generator<" — e.g. an object/class
         // with a `[Symbol.iterator](): Generator<...>` member — is an ITERABLE, not a
         // generator itself; it must own a `next` to be driven via the generator
@@ -13056,7 +13079,7 @@ class Exporter {
     try {
       const t = this.checker.getTypeAtLocation(expr);
       const tn = this.checker.typeToString(t);
-      if (/^AsyncGenerator\b/.test(tn)) return true;
+      if (t.getSymbol()?.name === "AsyncGenerator") return true;
       return /\bAsyncGenerator</.test(tn) && !!(t.getProperty && t.getProperty("next"));
     } catch { return false; }
   }
@@ -16910,7 +16933,7 @@ class Exporter {
       takesThis: thisParam || staticThis,
       captureCount: ctx.captureCount ?? 0,
       arity,
-      hasPrototype: !name.startsWith("__") &&
+      hasPrototype: !/^__(module_init|static_init_\d+|class_ctor_\d+)$/.test(name) &&
         (ts.isFunctionDeclaration(node as ts.Node) || ts.isFunctionExpression(node as ts.Node)) &&
         !isAsync && !isGenerator,
       debugName: this.debugNameOf(node as ts.Node),

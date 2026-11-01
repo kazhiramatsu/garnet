@@ -4214,6 +4214,8 @@ typedef struct ts_proxy {
 _Static_assert(TS_CELL_ZERO_WORDS(ts_proxy), "a Proxy answers the class and shape words with zero");
 tsv ts_proxy_new(tsv target, tsv handler);
 tsv ts_proxy_revocable(tsv target, tsv handler);
+tsv ts_proxy_ctor_value(void);
+tsv ts_import_unknown(tsv spec);
 tsv ts_proxy_revoke_thunk(tsv* args, int n);
 /* Promise + coroutine frame (async/await) */
 typedef struct ts_promise {

@@ -75,10 +75,18 @@ const walk = (dir, rel) => {
     else if (e.name.endsWith(".js")) compose(p, r);
   }
 };
+const fixturesDone = new Set();
 for (const s of subs) {
   const base = path.join(src, "test", s);
-  if (fs.statSync(base).isDirectory()) walk(base, s);
-  else compose(base, s);
+  if (fs.statSync(base).isDirectory()) { walk(base, s); continue; }
+  compose(base, s);
+  // a case given by its path: the module fixtures beside it
+  const dir = path.dirname(s);
+  if (fixturesDone.has(dir)) continue;
+  fixturesDone.add(dir);
+  for (const e of fs.readdirSync(path.dirname(base), { withFileTypes: true })) {
+    if (e.isFile() && e.name.includes("_FIXTURE") && e.name.endsWith(".js")) compose(path.join(path.dirname(base), e.name), dir + "/" + e.name);
+  }
 }
 fs.mkdirSync(out, { recursive: true });
 fs.writeFileSync(path.join(out, "META.tsv"), meta.join("\n") + "\n");

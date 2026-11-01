@@ -568,7 +568,7 @@ fn emit_program_with_string_plans(
         let nm = functions_by_id[i as usize]
             .and_then(|f| f.name.as_deref())
             // a synthesized __module_init / anonymous fn has no JS name -> "".
-            .filter(|n| !n.starts_with("__"))
+            .filter(|n| !(*n == "__module_init" || n.starts_with("__get_export_") || n.starts_with("__class_ctor_") || n.starts_with("__static_init_")))
             .unwrap_or("");
         let _ = write!(s, "{}, ", c_string_lit(nm));
     }
@@ -15415,6 +15415,7 @@ fn emit_global_setup(s: &mut String, needs_fetch: bool, needs_typed_array_global
     set_fn(s, "_Symbol", "for", "symbol.for", 1, "for");
     set_fn(s, "_Symbol", "keyFor", "symbol.keyFor", 1, "keyFor");
     global_set_rooted(s, "Symbol", "_Symbol");
+    s.push_str("  ts_global_set(\"Proxy\", ts_proxy_ctor_value());\n");
 
     s.push_str(
         "  tsv _Function = ts_make_global_fn(ts_fnval_global_Function, 1u, \"Function\", 0);\n",
@@ -24351,6 +24352,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 b if b.starts_with("construct.begin:") => (format!("ts_construct_begin_n({}, {}u)", v(0), &b["construct.begin:".len()..]), false),
                 "construct.end" => (format!("ts_construct_end({}, {}, {})", v(0), v(1), v(2)), false),
                 "proxy.new" => (format!("ts_proxy_new({}, {})", v(0), v(1)), false),
+                "import.unknown" => (format!("ts_import_unknown({})", v(0)), false),
                 "proxy.revocable" => (format!("ts_proxy_revocable({}, {})", v(0), v(1)), false),
                 "symbol.new" => (format!("ts_symbol_new({})", v(0)), false),
                 "symbol.get" => (format!("ts_get_symkey({}, {})", v(0), v(1)), false),

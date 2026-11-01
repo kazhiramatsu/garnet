@@ -17583,14 +17583,16 @@ static uint32_t ta_rel(tsv* a, int n, int i, uint32_t len, uint32_t dflt){
 }
 /* ---- the methods (args[0] is the receiver) ---- */
 static tsv ta_m_subarray(tsv* a, int n){
-  tsv t = ta_require(n ? a[0] : TS_UNDEFINED, "subarray"); ts_gc_root(&t);
-  uint32_t len = ta_ptr(t)->length;
+  tsv t = n ? a[0] : TS_UNDEFINED;
+  if (!ts_is_typed_array(t)) ta_require(t, "subarray");
+  ts_gc_root(&t);
+  uint32_t len = ta_ptr(t)->out_of_bounds ? 0 : ta_ptr(t)->length;
   uint32_t b = ta_rel(a, n, 1, len, 0), e = ta_rel(a, n, 2, len, len);
   ts_typedarray* x = ta_ptr(t);
   uint32_t count = e > b ? e - b : 0;
-  if (TS_RT_UNLIKELY(g_species)){
+  int tracking = x->tracking && (n <= 2 || ts_is_undef(a[2]));
+  if (TS_RT_UNLIKELY(g_species || tracking)){
     tsv args[3] = { x->buffer, ts_num((double)x->byte_offset + (double)b * g_ta_size[x->elem]), ts_num((double)count) };
-    int tracking = x->tracking && (n <= 2 || ts_is_undef(a[2]));
     tsv r = ta_species_create(t, args, tracking ? 2 : 3);
     ts_gc_unroot(1);
     return r;
@@ -17613,7 +17615,12 @@ static tsv ta_m_slice(tsv* a, int n){
     if (end > b){
       if (ta_ptr(r)->elem == x->elem){
         size_t bytes = (size_t)(end - b) * sz, room = (size_t)ta_ptr(r)->length * sz;
-        memmove(ta_ptr(r)->data, x->data + (size_t)b * sz, bytes < room ? bytes : room);
+        size_t copy = bytes < room ? bytes : room;
+        const uint8_t* from = x->data + (size_t)b * sz;
+        uint8_t* to = ta_ptr(r)->data;
+        /* a species over the same buffer: the specification's copy goes byte by byte, forward */
+        if (to > from && to < from + copy) for (size_t k = 0; k < copy; k++) *(volatile uint8_t*)(to + k) = from[k];
+        else memmove(to, from, copy);
       } else {
         for (uint32_t i = b, to = 0; i < end; i++, to++) ts_ta_set(r, to, ta_value(ta_ptr(t), i));
       }
@@ -17695,7 +17702,7 @@ static tsv ta_m_index_of(tsv* a, int n){
   uint32_t len = ta_ptr(t)->length, from = ta_rel(a, n, 2, len, 0);
   double r = -1;
   if (ta_is_big(ta_ptr(t))) r = ta_big_search(t, n > 1 ? a[1] : TS_UNDEFINED, (double)from, (double)len, 1);
-  else if (is_num) for (uint32_t i = from; i < ta_ptr(t)->length; i++) if (ta_load(ta_ptr(t), i) == v){ r = i; break; }
+  else if (is_num) for (uint32_t i = from; i < len && i < ta_ptr(t)->length; i++) if (ta_load(ta_ptr(t), i) == v){ r = i; break; }
   ts_gc_unroot(1);
   return ts_num(r);
 }
@@ -17714,7 +17721,7 @@ static tsv ta_m_last_index_of(tsv* a, int n){
       start = d < 0 ? len + d : (d > len - 1 ? len - 1 : d);
     }
     if (big) r = ta_big_search(t, n > 1 ? a[1] : TS_UNDEFINED, start, 0, -1);
-    else for (double i = start; i >= 0; i--) if (ta_load(ta_ptr(t), (uint32_t)i) == v){ r = i; break; }
+    else for (double i = start; i >= 0; i--) if (i < (double)ta_ptr(t)->length && ta_load(ta_ptr(t), (uint32_t)i) == v){ r = i; break; }
   }
   ts_gc_unroot(1);
   return ts_num(r);
@@ -17724,8 +17731,10 @@ static tsv ta_m_includes(tsv* a, int n){
   int is_num; double v = ta_search_arg(a, n, &is_num);
   uint32_t len = ta_ptr(t)->length, from = ta_rel(a, n, 2, len, 0);
   int r = 0;
-  if (ta_is_big(ta_ptr(t))) r = ta_big_search(t, n > 1 ? a[1] : TS_UNDEFINED, (double)from, (double)len, 1) >= 0;
-  else if (is_num) for (uint32_t i = from; i < ta_ptr(t)->length; i++) if (ta_same_value_zero(ta_load(ta_ptr(t), i), v)){ r = 1; break; }
+  /* Get: an element gone reads undefined, and undefined is found there */
+  if (n > 1 && ts_is_undef(a[1]) && len > ta_ptr(t)->length && from < len) r = 1;
+  else if (ta_is_big(ta_ptr(t))) r = ta_big_search(t, n > 1 ? a[1] : TS_UNDEFINED, (double)from, (double)len, 1) >= 0;
+  else if (is_num) for (uint32_t i = from; i < len && i < ta_ptr(t)->length; i++) if (ta_same_value_zero(ta_load(ta_ptr(t), i), v)){ r = 1; break; }
   ts_gc_unroot(1);
   return ts_bool(r);
 }
@@ -17876,60 +17885,62 @@ static void array_not_callable(tsv cb){ ta_require_callable(cb, 1); }
   tsv cb = TS_ITER_CB(a, n); ts_gc_root(&cb); \
   ta_require_callable(cb, strcmp(name, "map") != 0); \
   ts_cb cbf; cb_resolve(&cbf, cb);
+/* Get(O, k): an index past a shrunk or detached view reads undefined */
+static tsv ta_value_live(tsv t, uint32_t i){
+  ts_typedarray* x = ta_ptr(t);
+  return i < x->length && !x->out_of_bounds ? ta_value(x, i) : TS_UNDEFINED;
+}
 static tsv ta_cb_call(ts_cb* cbf, tsv cb, tsv t, uint32_t i){
-  tsv args[3] = { ta_value(ta_ptr(t), i), ts_num((double)i), t };
+  tsv args[3] = { ta_value_live(t, i), ts_num((double)i), t };
   return cb_call(cbf, cb, args, 3);
 }
 static tsv ta_m_for_each(tsv* a, int n){
   TA_CB_BEGIN("forEach")
-  for (uint32_t i = 0; i < ta_ptr(t)->length; i++) ta_cb_call(&cbf, cb, t, i);
+  uint32_t len = ta_ptr(t)->length;
+  for (uint32_t i = 0; i < len; i++) ta_cb_call(&cbf, cb, t, i);
   ts_gc_unroot(2); return TS_UNDEFINED;
 }
 static tsv ta_m_map(tsv* a, int n){
   TA_CB_BEGIN("map")
-  tsv r = ta_species_length(t, ta_ptr(t)->length); ts_gc_root(&r);
-  for (uint32_t i = 0; i < ta_ptr(t)->length; i++) ts_ta_set(r, i, ta_cb_call(&cbf, cb, t, i));
+  uint32_t len = ta_ptr(t)->length;
+  tsv r = ta_species_length(t, len); ts_gc_root(&r);
+  for (uint32_t i = 0; i < len; i++) ts_ta_set(r, i, ta_cb_call(&cbf, cb, t, i));
   ts_gc_unroot(3); return r;
 }
 static tsv ta_m_filter(tsv* a, int n){
   TA_CB_BEGIN("filter")
   uint32_t len = ta_ptr(t)->length;
-  uint32_t sz = g_ta_size[ta_ptr(t)->elem];
-  uint8_t* kept = (uint8_t*)malloc((size_t)sz * (len ? len : 1)); uint32_t k = 0;
-  for (uint32_t i = 0; i < len && i < ta_ptr(t)->length; i++){
-    uint8_t raw[8];
-    memcpy(raw, ta_ptr(t)->data + (size_t)i * sz, sz);
-    if (ts_truthy(ta_cb_call(&cbf, cb, t, i))) memcpy(kept + (size_t)(k++) * sz, raw, sz);
+  tsv kept = ts_new_array(0); ts_gc_root(&kept);
+  for (uint32_t i = 0; i < len; i++){
+    tsv v = ta_value_live(t, i); ts_gc_root(&v);
+    if (ts_truthy(ta_cb_call(&cbf, cb, t, i))) ts_array_push(kept, v);
+    ts_gc_unroot(1);
   }
-  tsv r = ta_species_length(t, k);
-  if (ta_ptr(r)->elem == ta_ptr(t)->elem){ if (k) memcpy(ta_ptr(r)->data, kept, (size_t)k * sz); }
-  else {
-    ts_gc_root(&r);
-    tsv held = ta_new_length(ta_ptr(t)->elem, k); ts_gc_root(&held);
-    if (k) memcpy(ta_ptr(held)->data, kept, (size_t)k * sz);
-    for (uint32_t i = 0; i < k; i++) ts_ta_set(r, i, ta_value(ta_ptr(held), i));
-    ts_gc_unroot(2);
-  }
-  free(kept);
-  ts_gc_unroot(2); return r;
+  uint32_t k = (uint32_t)ts_array_len(kept);
+  tsv r = ta_species_length(t, k); ts_gc_root(&r);
+  for (uint32_t i = 0; i < k; i++) ts_ta_set(r, i, ts_array_get(kept, i));
+  ts_gc_unroot(4); return r;
 }
 static tsv ta_m_every(tsv* a, int n){
   TA_CB_BEGIN("every")
   int r = 1;
-  for (uint32_t i = 0; i < ta_ptr(t)->length; i++) if (!ts_truthy(ta_cb_call(&cbf, cb, t, i))){ r = 0; break; }
+  uint32_t len = ta_ptr(t)->length;
+  for (uint32_t i = 0; i < len; i++) if (!ts_truthy(ta_cb_call(&cbf, cb, t, i))){ r = 0; break; }
   ts_gc_unroot(2); return ts_bool(r);
 }
 static tsv ta_m_some(tsv* a, int n){
   TA_CB_BEGIN("some")
   int r = 0;
-  for (uint32_t i = 0; i < ta_ptr(t)->length; i++) if (ts_truthy(ta_cb_call(&cbf, cb, t, i))){ r = 1; break; }
+  uint32_t len = ta_ptr(t)->length;
+  for (uint32_t i = 0; i < len; i++) if (ts_truthy(ta_cb_call(&cbf, cb, t, i))){ r = 1; break; }
   ts_gc_unroot(2); return ts_bool(r);
 }
 static tsv ta_m_find(tsv* a, int n){
   TA_CB_BEGIN("find")
   tsv r = TS_UNDEFINED;
-  for (uint32_t i = 0; i < ta_ptr(t)->length; i++){
-    tsv v = ta_value(ta_ptr(t), i); ts_gc_root(&v);
+  uint32_t len = ta_ptr(t)->length;
+  for (uint32_t i = 0; i < len; i++){
+    tsv v = ta_value_live(t, i); ts_gc_root(&v);
     int hit = ts_truthy(ta_cb_call(&cbf, cb, t, i));
     ts_gc_unroot(1);
     if (hit){ r = v; break; }
@@ -17939,7 +17950,8 @@ static tsv ta_m_find(tsv* a, int n){
 static tsv ta_m_find_index(tsv* a, int n){
   TA_CB_BEGIN("findIndex")
   double r = -1;
-  for (uint32_t i = 0; i < ta_ptr(t)->length; i++) if (ts_truthy(ta_cb_call(&cbf, cb, t, i))){ r = i; break; }
+  uint32_t len = ta_ptr(t)->length;
+  for (uint32_t i = 0; i < len; i++) if (ts_truthy(ta_cb_call(&cbf, cb, t, i))){ r = i; break; }
   ts_gc_unroot(2); return ts_num(r);
 }
 static tsv ta_m_reduce(tsv* a, int n){
@@ -17954,8 +17966,9 @@ static tsv ta_m_reduce(tsv* a, int n){
     acc = ta_value(ta_ptr(t), 0); i = 1;
   }
   ts_cb cbf; cb_resolve(&cbf, cb);
-  for (; i < ta_ptr(t)->length; i++){
-    tsv args[4] = { acc, ta_value(ta_ptr(t), i), ts_num((double)i), t };
+  uint32_t len = ta_ptr(t)->length;
+  for (; i < len; i++){
+    tsv args[4] = { acc, ta_value_live(t, i), ts_num((double)i), t };
     acc = cb_call(&cbf, cb, args, 4);
   }
   ts_gc_unroot(3); return acc;
@@ -17973,8 +17986,7 @@ static tsv ta_m_reduce_right(tsv* a, int n){
   }
   ts_cb cbf; cb_resolve(&cbf, cb);
   while (i-- > 0){
-    tsv v = i < ta_ptr(t)->length ? ta_value(ta_ptr(t), i) : TS_UNDEFINED;
-    tsv args[4] = { acc, v, ts_num((double)i), t };
+    tsv args[4] = { acc, ta_value_live(t, i), ts_num((double)i), t };
     acc = cb_call(&cbf, cb, args, 4);
   }
   ts_gc_unroot(3); return acc;
@@ -17983,7 +17995,7 @@ static tsv ta_m_find_last(tsv* a, int n){
   TA_CB_BEGIN("findLast")
   tsv r = TS_UNDEFINED;
   for (uint32_t i = ta_ptr(t)->length; i-- > 0;){
-    tsv v = ta_value(ta_ptr(t), i); ts_gc_root(&v);
+    tsv v = ta_value_live(t, i); ts_gc_root(&v);
     int hit = ts_truthy(ta_cb_call(&cbf, cb, t, i));
     ts_gc_unroot(1);
     if (hit){ r = v; break; }
@@ -22543,6 +22555,47 @@ tsv ts_object_for_in_keys(tsv obj){
   return out;
 }
 /* Proxy.revocable(target, handler) -> { proxy, revoke } */
+/* Proxy as a value: a constructor without a `prototype` */
+static tsv proxy_ctor_fn(tsv* a, int n){
+  if (!ts_native_new_take()) ts_throw_type_error_msg("Constructor Proxy requires 'new'");
+  return ts_proxy_new(n > 0 ? a[0] : TS_UNDEFINED, n > 1 ? a[1] : TS_UNDEFINED);
+}
+static tsv proxy_revocable_fn(tsv* a, int n){ return ts_proxy_revocable(n > 0 ? a[0] : TS_UNDEFINED, n > 1 ? a[1] : TS_UNDEFINED); }
+tsv ts_proxy_ctor_value(void){
+  tsv f = ts_make_fn_t(proxy_ctor_fn, NULL, 0, 0); ts_gc_root(&f);
+  ts_set_fn_meta(f, 2u, "Proxy");
+  ts_fn_mark_native_ctor(f);
+  tsv r = ts_make_fn_t(proxy_revocable_fn, NULL, 0, 0); ts_gc_root(&r);
+  ts_set_fn_meta(r, 2u, "revocable");
+  ts_define_data(f, ts_intern_field("revocable", 9), r, 0, 1, 1);
+  ts_gc_unroot(2);
+  return f;
+}
+/* import(specifier) with a specifier known at run time only: nothing can be loaded, and the promise says
+   so; a specifier whose ToString throws rejects with what it threw */
+tsv ts_import_unknown(tsv spec){
+  ts_gc_root(&spec);
+  tsv err;
+  ts_handler* h = ts_eh_push();
+  if (ts_setjmp(h->buf) != 0){
+    ts_gc_set_root_depth(h->gc_root_len);
+    ts_frame_restore(h->frame_top);
+    ts_eh_pop();
+    err = ts_current_exception();
+  } else {
+    tsv text = ts_to_string_template(spec);
+    ts_eh_pop();
+    uint32_t n = 0; char* u = ts_string_cstr_copy(text, &n);
+    char buf[256];
+    int len = snprintf(buf, sizeof buf, "Cannot find module '%.180s': a dynamic import of a module known only at run time", u);
+    free(u);
+    err = ts_new_error(TS_ERR_ERROR, ts_new_string(buf, (uint32_t)len));
+  }
+  ts_gc_root(&err);
+  tsv r = ts_promise_rejected(err);
+  ts_gc_unroot(2);
+  return r;
+}
 tsv ts_proxy_revocable(tsv target, tsv handler){
   tsv pv = ts_proxy_new(target, handler);
   ts_gc_root(&pv);

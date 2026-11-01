@@ -364,17 +364,21 @@ static tsv ip_find(tsv* a, int n){ return ih_eager(a, n, IE_FIND, "find"); }
 static tsv ip_iterator(tsv* a, int n){ return n > 0 ? a[0] : TS_UNDEFINED; }
 
 /* ---- Iterator.from, the wrapper ---- */
+/* [[Iterated]]: an own slot, read past a Proxy's traps */
+static int wrap_receiver(tsv self, ts_key ki){
+  return ih_object(self) && !(g_has_proxies && ts_is_proxy(self)) && !ts_is_func(self) && ts_has_own(self, ki);
+}
 static tsv wrap_next(tsv* a, int n){
   IH_KEY(ki, "__ih_it"); IH_KEY(kn, "__ih_next");
   tsv self = n > 0 ? a[0] : TS_UNDEFINED;
-  if (!ih_object(self) || ts_is_undef(ts_get(self, ki))) ts_throw_type_error_msg("Wrap for valid iterator: incompatible receiver");
+  if (!wrap_receiver(self, ki)) ts_throw_type_error_msg("Wrap for valid iterator: incompatible receiver");
   tsv it = ts_get(self, ki);
   return ts_call_method(ts_get(self, kn), &it, 1);
 }
 static tsv wrap_return(tsv* a, int n){
   IH_KEY(ki, "__ih_it"); IH_KEY(kr, "return");
   tsv self = n > 0 ? a[0] : TS_UNDEFINED;
-  if (!ih_object(self) || ts_is_undef(ts_get(self, ki))) ts_throw_type_error_msg("Wrap for valid iterator: incompatible receiver");
+  if (!wrap_receiver(self, ki)) ts_throw_type_error_msg("Wrap for valid iterator: incompatible receiver");
   tsv it = ts_get(self, ki);
   ts_gc_root(&it);
   tsv ret = ts_get(it, kr);

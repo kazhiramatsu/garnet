@@ -605,6 +605,7 @@ tsv ts_numeric_op(int op, tsv a, tsv b){
   if (ts_is_num(a) && ts_is_num(b)) return num_binary(op, ts_to_num(a), ts_to_num(b));
   ts_gc_root(&a); ts_gc_root(&b);
   tsv pa = ts_to_primitive(a, 0); ts_gc_root(&pa);
+  if (ts_is_symbol(pa)) (void)ts_number_coerce(pa);    /* ToNumeric(lhs) throws before the right side converts */
   tsv pb = ts_to_primitive(b, 0); ts_gc_root(&pb);
   tsv r;
   if (ts_is_bigint(pa) || ts_is_bigint(pb)){
