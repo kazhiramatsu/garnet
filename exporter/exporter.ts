@@ -186,6 +186,10 @@ const REGEXP_PROTOCOL_TRIGGER = "__garnet_regexp_protocol";
  *  a `constructor` (not a prototype's, the usual assignment), or calls Array.of / Array.from on another receiver. */
 const SPECIES_TRIGGER = "__garnet_species";
 const speciesText = /\bSymbol\s*\.\s*(species|isConcatSpreadable|unscopables)\b|\bextends\s+(Array|ArrayBuffer|SharedArrayBuffer|Int8Array|Uint8Array|Uint8ClampedArray|Int16Array|Uint16Array|Int32Array|Uint32Array|Float16Array|Float32Array|Float64Array|BigInt64Array|BigUint64Array)\b|(?<!prototype)\.\s*constructor\s*=[^=]|\bArray\s*\.\s*(of|from)\s*\.\s*(call|apply)\b/;
+/** A program text that can hand an array method another receiver: `Array.prototype.x.call(o)`, `[].x.call(o)`. */
+const ARRAY_GENERIC_TRIGGER = "__garnet_array_generic";
+const arrayGenericText = /\bArray\s*\.\s*prototype\b|\[\s*\]\s*\.\s*\w+\s*\.\s*(call|apply|bind)\b|\bObject\s*\.\s*prototype\s*\[|defineProperty\s*\(\s*Object\s*\.\s*prototype\b/;
+const OBJECT_PROTO_METHODS = new Set(["hasOwnProperty", "isPrototypeOf", "propertyIsEnumerable", "toLocaleString", "toString", "valueOf"]);
 const REGEXP_METHODS = new Set(["test", "exec", "match", "matchAll", "search", "replace", "replaceAll", "split"]);
 const regexpProtocolText = /\bSymbol\s*\.\s*(match|matchAll|replace|search|split)\b|\.\s*exec\s*=[^=]|["']exec["']|\bextends\s+RegExp\b/;
 const NODE_PRELUDE_PARTS: { file: string; names: string[]; defaultImport?: string; triggers?: string[] }[] = [
@@ -208,6 +212,8 @@ const NODE_PRELUDE_PARTS: { file: string; names: string[]; defaultImport?: strin
   { file: "web/blob", names: ["Blob", "File"] },
   // CompressionStream / DecompressionStream over the system's zlib (docs/web_compression_design.md)
   { file: "web/compression", names: ["CompressionStream", "DecompressionStream"] },
+  // on demand: a program that passes the array methods an array-like (docs/array_protocol_design.md)
+  { file: "web/array_generic", names: [], triggers: [ARRAY_GENERIC_TRIGGER] },
   // on demand: a program that can see an array's constructor (docs/well_known_symbols_design.md)
   { file: "web/species", names: [], triggers: [SPECIES_TRIGGER] },
   // on demand: a program that customizes a RegExp or a matcher (docs/well_known_symbols_design.md)
@@ -578,6 +584,7 @@ function programWithNodeSupport(rootNames: string[], options: ts.CompilerOptions
       const named = (text: string): boolean => NODE_PRELUDE_GLOBALS.has(text) || (triggers !== undefined && triggers.has(text));
       if (triggers !== undefined && regexpProtocolText.test(f.text)) found.add(REGEXP_PROTOCOL_TRIGGER);
       if (triggers !== undefined && speciesText.test(f.text)) found.add(SPECIES_TRIGGER);
+      if (triggers !== undefined && arrayGenericText.test(f.text)) found.add(ARRAY_GENERIC_TRIGGER);
       const visit = (n: ts.Node): void => {
         // a property named like a global (`globalThis.btoa`, `g.URL` through an alias of the
         // global object, `globalThis["performance"]`) counts too: conservative, and cheap
@@ -6489,6 +6496,14 @@ class Exporter {
           ctx.body.push({ kind: "Const", dst, value: { kind: "Undef" } });
           return dst;
         }
+        // what the namespace object inherits from Object.prototype
+        if (OBJECT_PROTO_METHODS.has(node.name.text)) {
+          const nsObj = this.newLocal(ctx, "reference");
+          ctx.body.push({ kind: "LoadBuiltinFn", dst: nsObj, builtin: `globalobj.${nsName}` });
+          const dst = this.newLocal(ctx, "reference");
+          ctx.body.push({ kind: "LoadMethodValue", dst, recv: nsObj, method: this.internName(node.name.text) });
+          return dst;
+        }
         // A builtin-namespace function we don't represent as a first-class value
         // (e.g. Object.assign, Promise.resolve). Loud-reject rather than silently
         // loading undefined. (CALLs go through the call path and never reach here.)
@@ -7050,33 +7065,11 @@ class Exporter {
           // when the map and each descriptor are literals; otherwise fall back to
           // the runtime form (which iterates the descriptor map at run time).
           if (ns === "Object" && fn.name.text === "defineProperties" && node.arguments.length === 2) {
-            const descs = node.arguments[1];
-            if (!ts.isObjectLiteralExpression(descs)) {
-              const obj = this.lowerExpr(ctx, node.arguments[0]);
-              const descsLocal = this.lowerExpr(ctx, descs);
-              ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"),
-                builtin: "object.definePropertiesDyn", args: [obj, descsLocal] });
-              return obj;
-            }
-            // Literal map: if every entry is a literal `key: { ...descriptor }`,
-            // expand statically (fast path). If any entry is dynamic, fall back to
-            // the runtime form for the whole call (simpler + always correct).
-            const allStatic = descs.properties.every(pr =>
-              ts.isPropertyAssignment(pr) && (ts.isIdentifier(pr.name) || ts.isStringLiteral(pr.name)) &&
-              ts.isObjectLiteralExpression(pr.initializer));
+            // the runtime reads every descriptor before it defines one
             const obj = this.lowerExpr(ctx, node.arguments[0]);
-            if (!allStatic) {
-              const descsLocal = this.lowerExpr(ctx, descs);
-              ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"),
-                builtin: "object.definePropertiesDyn", args: [obj, descsLocal] });
-              return obj;
-            }
-            for (const pr of descs.properties) {
-              const pa = pr as ts.PropertyAssignment;
-              const keyLocal = this.newLocal(ctx, "reference");
-              ctx.body.push({ kind: "Const", dst: keyLocal, value: { kind: "Str", value: (pa.name as ts.Identifier | ts.StringLiteral).text } });
-              this.lowerDefineOneProperty(ctx, node, obj, keyLocal, pa.initializer as ts.ObjectLiteralExpression);
-            }
+            const descsLocal = this.lowerExpr(ctx, node.arguments[1]);
+            ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"),
+              builtin: "object.definePropertiesDyn", args: [obj, descsLocal] });
             return obj;
           }
           // Variadic Math.max/min/hypot: seed with the identity and fold every arg
@@ -7161,6 +7154,12 @@ class Exporter {
           }
           const sname = this.namespaceBuiltin(ns, fn.name.text, node.arguments.length);
           if (sname !== undefined) {
+            // what `Math` and `JSON` inherit: the namespace object is an ordinary receiver
+            if (sname === "__UNSUPPORTED__" && OBJECT_PROTO_METHODS.has(fn.name.text)) {
+              const recv = this.lowerExpr(ctx, fn.expression);
+              const callee = this.lowerExpr(ctx, fn);
+              return this.lowerDynamicValueCall(ctx, callee, recv, node.arguments, this.refKindOf(node));
+            }
             if (sname === "__UNSUPPORTED__") {
               this.unsupported(node, `${ns}.${fn.name.text} (not supported with ${node.arguments.length} args / not implemented)`);
             }
@@ -7459,6 +7458,7 @@ class Exporter {
             // A method on a known builtin string/array type that we don't yet
             // implement: reject loudly rather than silently miscompiling/trapping.
             // (a method of the runtime's prototype the static table does not list: the dynamic path)
+            if (cls === "array" && fn.name.text === "toLocaleString") return this.lowerStringMethodDynamically(ctx, node, fn.expression);
             if (!this.untyped && !(cls === "set" && ["union", "intersection", "difference", "symmetricDifference", "isSubsetOf", "isSupersetOf", "isDisjointFrom"].includes(fn.name.text)))
               this.unsupported(node, `${cls} method '${fn.name.text}' (stdlib method not yet implemented)`);
           }

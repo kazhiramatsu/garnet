@@ -1271,12 +1271,23 @@ typedef struct ts_array {
 static inline int ts_is_indexed_array_fast(tsv v){
   return ts_is_obj(v) && ((ts_gc_header*)ts_ptr(v))->kind == TS_KIND_ARRAY;
 }
+/* A dictionary array (`sparse` == TS_ARRAY_DICT, docs/dictionary_arrays_design.md): an element with an accessor or
+   an attribute of its own, or a read-only length, moved every element to the property map under its index key. cap is
+   0, as for a sparse array, so every inline path leaves for the runtime, and as_arr answers NULL: the methods take the
+   receiver as they take a Proxy. `len` stays the length. */
+#define TS_ARRAY_DICT 2
+#define TS_ARRAY_LENGTH_READONLY 1u   /* kind_spare */
+static inline int ts_is_plain_array(tsv v){
+  return ts_is_indexed_array_fast(v) && ((ts_array*)ts_ptr(v))->sparse != TS_ARRAY_DICT;
+}
 /* Typed arrays (docs/typed_arrays_design.md): a buffer owns bytes outside the
    heap; a view points into them and keeps the buffer alive. */
 enum { TS_TA_INT8, TS_TA_UINT8, TS_TA_UINT8C, TS_TA_INT16, TS_TA_UINT16, TS_TA_INT32,
        TS_TA_UINT32, TS_TA_FLOAT32, TS_TA_FLOAT64,
        /* elements that are no doubles: the typed fast paths never see these two, only the runtime's */
-       TS_TA_BIGINT64, TS_TA_BIGUINT64, TS_TA_COUNT };
+       TS_TA_BIGINT64, TS_TA_BIGUINT64,
+       /* no typed path either */
+       TS_TA_FLOAT16, TS_TA_COUNT };
 typedef struct ts_arraybuffer {
   ts_obj_common o;
   uint8_t* bytes;
@@ -3412,8 +3423,11 @@ static inline uint8_t ts_ta_clamp_u8(double d){
   if (r > 0.5 || (r == 0.5 && (u & 1u))) u++;   /* round half to even */
   return (uint8_t)u;
 }
+uint16_t ts_double_to_f16_bits(double x);
+double ts_f16_bits_to_double(uint16_t h);
 TS_RT_ALWAYS_INLINE double ts_ta_elem_load(const uint8_t* data, uint32_t i, int elem){
   switch (elem){
+    case TS_TA_FLOAT16: { uint16_t x; memcpy(&x, data + (size_t)i * 2u, 2); return ts_f16_bits_to_double(x); }
     case TS_TA_INT8: return (double)((const int8_t*)data)[i];
     case TS_TA_UINT8: case TS_TA_UINT8C: return (double)data[i];
     case TS_TA_INT16: { int16_t x; memcpy(&x, data + (size_t)i * 2u, 2); return (double)x; }
@@ -3428,6 +3442,7 @@ TS_RT_ALWAYS_INLINE double ts_ta_elem_load(const uint8_t* data, uint32_t i, int 
    by rounding half to even, Float32 by rounding. */
 TS_RT_ALWAYS_INLINE void ts_ta_elem_store(uint8_t* data, uint32_t i, double d, int elem){
   switch (elem){
+    case TS_TA_FLOAT16: { uint16_t x = ts_double_to_f16_bits(d); memcpy(data + (size_t)i * 2u, &x, 2); break; }
     case TS_TA_INT8: case TS_TA_UINT8: data[i] = (uint8_t)(uint32_t)ts_to_int32(d); break;
     case TS_TA_UINT8C: data[i] = ts_ta_clamp_u8(d); break;
     case TS_TA_INT16: case TS_TA_UINT16: { uint16_t x = (uint16_t)(uint32_t)ts_to_int32(d); memcpy(data + (size_t)i * 2u, &x, 2); break; }
@@ -3884,6 +3899,11 @@ void ts_set_linked(tsv obj, ts_key key, tsv value, ts_prop_ic* ic, ts_frame_hdr*
 /* The hole marker of a sparse array element (never a user-visible value). */
 #define TS_ARRAY_HOLE TS_BOX(0xFFFEu, 0x4152484Fu)
 static inline int array_is_hole(tsv v){ return v == TS_ARRAY_HOLE; }
+/* A hole reads undefined, unless Array.prototype or Object.prototype was given an element (the library that tracks
+   it, docs/array_protocol_design.md): the test is on the path of a hole only. */
+extern int g_proto_elements;
+tsv ts_array_hole_read(tsv arr, int64_t i);
+static inline tsv ts_array_hole_value(tsv arr, int64_t i){ return TS_RT_UNLIKELY(g_proto_elements) ? ts_array_hole_read(arr, i) : TS_UNDEFINED; }
 /* Element read with the array case in line: a dense slot (below cap: every
    slot in [len, cap) is a hole) that is not a hole is the value, any other
    index of a dense array is undefined (ts_array_get agrees); a sparse array
@@ -3899,8 +3919,8 @@ static inline int array_is_hole(tsv v){ return v == TS_ARRAY_HOLE; }
 static inline tsv ts_array_get_inline(tsv arr, int64_t i){
   if (ts_is_indexed_array_fast(arr)){
     ts_array* a = (ts_array*)ts_ptr(arr);
-    if ((uint64_t)i < a->cap){ tsv v = a->data[i]; return array_is_hole(v) ? TS_UNDEFINED : v; }
-    if (!a->sparse && (uint64_t)i < TS_ARRAY_INDEX_LIMIT) return TS_UNDEFINED;
+    if ((uint64_t)i < a->cap){ tsv v = a->data[i]; return array_is_hole(v) ? ts_array_hole_value(arr, i) : v; }
+    if (!a->sparse && (uint64_t)i < TS_ARRAY_INDEX_LIMIT) return ts_array_hole_value(arr, i);
   }
   return ts_array_get_key_i64(arr, i);
 }
@@ -4013,8 +4033,8 @@ static inline tsv ts_forof_close(tsv it, ts_key rmk){
 static inline int ts_array_get_inline_try(tsv arr, int64_t i, tsv* out){
   if (ts_is_indexed_array_fast(arr)){
     ts_array* a = (ts_array*)ts_ptr(arr);
-    if ((uint64_t)i < a->cap){ tsv v = a->data[i]; *out = array_is_hole(v) ? TS_UNDEFINED : v; return 1; }
-    if (!a->sparse && (uint64_t)i < TS_ARRAY_INDEX_LIMIT){ *out = TS_UNDEFINED; return 1; }
+    if ((uint64_t)i < a->cap){ tsv v = a->data[i]; *out = array_is_hole(v) ? ts_array_hole_value(arr, i) : v; return 1; }
+    if (!a->sparse && (uint64_t)i < TS_ARRAY_INDEX_LIMIT){ *out = ts_array_hole_value(arr, i); return 1; }
   }
   return 0;
 }
@@ -4035,8 +4055,8 @@ tsv ts_array_get_linked_f64(tsv arr, double d, ts_frame_hdr* frame, uint32_t nsl
 static inline tsv ts_array_get_inline_lazy(tsv arr, int64_t i, ts_frame_hdr* frame, uint32_t nslots){
   if (ts_is_indexed_array_fast(arr)){
     ts_array* a = (ts_array*)ts_ptr(arr);
-    if ((uint64_t)i < a->cap){ tsv v = a->data[i]; return array_is_hole(v) ? TS_UNDEFINED : v; }
-    if (!a->sparse && (uint64_t)i < TS_ARRAY_INDEX_LIMIT) return TS_UNDEFINED;
+    if ((uint64_t)i < a->cap){ tsv v = a->data[i]; if (TS_RT_LIKELY(!array_is_hole(v) || !g_proto_elements)) return array_is_hole(v) ? TS_UNDEFINED : v; }
+    else if (!a->sparse && (uint64_t)i < TS_ARRAY_INDEX_LIMIT && !g_proto_elements) return TS_UNDEFINED;
   }
   ts_frame_push(frame, nslots);
   tsv r = ts_array_get_key_i64(arr, i);

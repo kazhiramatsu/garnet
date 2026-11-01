@@ -194,6 +194,7 @@ fn builtin_needs_typed_array_globals(builtin: &str) -> bool {
                 | "Uint16Array"
                 | "Int32Array"
                 | "Uint32Array"
+                | "Float16Array"
                 | "Float32Array"
                 | "Float64Array"
                 | "BigInt64Array"

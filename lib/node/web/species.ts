@@ -4,16 +4,16 @@
 // array_species_custom); every other array keeps the direct path. `this` is the receiver, as in the specification.
 
 const isObject = (v: any): boolean => (typeof v === "object" && v !== null) || typeof v === "function";
-const MAX_SAFE = 9007199254740991;
-function toIntegerOrInfinity(v: any): number {
+export const MAX_SAFE = 9007199254740991;
+export function toIntegerOrInfinity(v: any): number {
   const n = +v;
   return n !== n ? 0 : Math.trunc(n);
 }
-function lengthOf(O: any): number {
+export function lengthOf(O: any): number {
   const n = toIntegerOrInfinity(O.length);
   return n <= 0 ? 0 : Math.min(n, MAX_SAFE);
 }
-function relativeIndex(v: any, len: number): number {
+export function relativeIndex(v: any, len: number): number {
   const n = toIntegerOrInfinity(v);
   return n < 0 ? Math.max(len + n, 0) : Math.min(n, len);
 }
@@ -31,11 +31,11 @@ function arraySpeciesCreate(O: any, length: number): any {
   if (typeof C !== "function") throw new TypeError("object.constructor[Symbol.species] is not a constructor");
   return new C(length);
 }
-function arrayCreate(length: number): any {
+export function arrayCreate(length: number): any {
   if (length > 4294967295) throw new RangeError("Invalid array length");
   return new Array(length);
 }
-function requireCallable(fn: any): void {
+export function requireCallable(fn: any): void {
   if (typeof fn !== "function") throw new TypeError(`${String(fn)} is not a function`);
 }
 function isConcatSpreadable(E: any): boolean {
@@ -59,12 +59,18 @@ function flattenIntoArray(target: any, source: any, sourceLen: number, start: nu
   }
   return targetIndex;
 }
-function toObject(v: any): any {
+export function toObject(v: any): any {
   if (v === undefined || v === null) throw new TypeError("Array.prototype method called on null or undefined");
-  return Object(v);
+  if (typeof v === "object" && v instanceof String) v = v.toString();
+  if (typeof v !== "string") return Object(v);
+  // a String's elements read-only, as its exotic object has them
+  const o = Object.create(String.prototype);
+  Object.defineProperty(o, "length", { value: v.length });
+  for (let i = 0; i < v.length; i++) Object.defineProperty(o, i, { value: v[i], enumerable: true });
+  return o;
 }
 
-const arrayMethods = {
+export const arrayMethods = {
   Array,
   map(this: any, fn: any, thisArg?: any): any {
     const O = toObject(this);

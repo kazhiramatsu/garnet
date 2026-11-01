@@ -1,0 +1,22 @@
+// @ts-nocheck
+const t = (name, f) => { try { console.log(name, JSON.stringify(f())); } catch (e) { console.log(name, "THROW", e.name, e.message); } };
+t("no callback", () => new Array(3).every("abc"));
+t("no callback2", () => [].forEach(undefined));
+t("no callback3", () => [].map(1));
+t("no callback4", () => [].reduce(null));
+t("before", () => { const a = [, 1]; return [a[0], 0 in a, a.indexOf(9)]; });
+Array.prototype[0] = 9;
+t("hole reads proto", () => { const a = [, 1]; return [a[0], 0 in a, a.hasOwnProperty(0), a.indexOf(9), a.includes(9), a.join(), a.slice(), a.map((x) => x + 1), a.filter((x) => x), a.reduce((x, y) => x + y)]; });
+t("for loop", () => { const a: number[] = [, 1]; let s = 0; for (let i = 0; i < a.length; i++) s += a[i]; for (const v of a) s += v; a.forEach((v) => { s += v; }); return s; });
+t("length grow", () => { const x = []; x.length = 2; return [x.join(), x.concat([1])]; });
+delete Array.prototype[0];
+t("after delete", () => { const a = [, 1]; return [a[0], 0 in a, a.indexOf(9)]; });
+Object.prototype[1] = "op";
+t("object proto", () => { const a = [0, , 2]; return [a[1], a.join(), a.indexOf("op")]; });
+delete Object.prototype[1];
+t("getter on proto", () => { Object.defineProperty(Array.prototype, "1", { get() { return "g"; }, configurable: true }); const r = [0, , 2].join(); delete Array.prototype[1]; return r; });
+t("array proto link", () => { function F() {} F.prototype = [1, 2, 3]; const f = new F(); return [f.length, f[1], Array.prototype.reduce.call(f, (a, b) => a + b, 0), 1 in f]; });
+t("string wrapper", () => [Array.prototype.map.call(new String("ab"), (x) => x + x), Array.prototype.filter.call(new String("ab"), (x) => x === "a")]);
+t("toLocaleString", () => [[{ toLocaleString() { return "ok"; } }, 1, null].toLocaleString()]);
+t("f16", () => { const a = new Float16Array([1.5, 1.337, 1e10, -0]); return [a.length, a.BYTES_PER_ELEMENT, Float16Array.BYTES_PER_ELEMENT, a[0], a[1], a[2], Object.is(a[3], -0), Object.prototype.toString.call(a), new Uint8Array(a.buffer)[1], Math.f16round(1.337), [...a.map((x) => x + 1)], a.slice(1).length]; });
+t("f16 dv", () => { const d = new DataView(new ArrayBuffer(4)); d.setFloat16(0, 1.5); d.setFloat16(2, 2.5, true); return [d.getFloat16(0), d.getFloat16(2, true), d.getUint8(0), d.getUint8(3)]; });

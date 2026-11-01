@@ -7,6 +7,9 @@ const scratch = new ArrayBuffer(8);
 const scratchBytes = new Uint8Array(scratch);
 const scratchF64 = new Float64Array(scratch);
 const scratchF32 = new Float32Array(scratch);
+// the global exists when the program names it: a DataView alone does not bring it in, so it is read on first use
+let scratchF16Cached: any;
+const scratchF16 = (): any => scratchF16Cached ??= new (globalThis as any).Float16Array(scratch);
 // the platform's byte order, read once: the scratch bytes of 1.0
 scratchF64[0] = 1;
 const PLATFORM_LITTLE = scratchBytes[7] === 0x3f;
@@ -62,6 +65,11 @@ export class DataView {
       ? (b[i] + b[i + 1] * 0x100 + b[i + 2] * 0x10000 + b[i + 3] * 0x1000000)
       : (b[i] * 0x1000000 + b[i + 1] * 0x10000 + b[i + 2] * 0x100 + b[i + 3]);
   }
+  getFloat16(byteOffset: number, littleEndian?: boolean): number {
+    const i = this.#at(byteOffset, 2);
+    this.#load(i, 2, littleEndian === true);
+    return scratchF16()[0];
+  }
   getFloat32(byteOffset: number, littleEndian?: boolean): number {
     const i = this.#at(byteOffset, 4);
     this.#load(i, 4, littleEndian === true);
@@ -92,6 +100,9 @@ export class DataView {
     const i = this.#at(byteOffset, 4); const v = (Number(value) | 0) >>> 0; const b = this.#bytes;
     if (littleEndian) { b[i] = v & 0xff; b[i + 1] = (v >>> 8) & 0xff; b[i + 2] = (v >>> 16) & 0xff; b[i + 3] = v >>> 24; }
     else { b[i] = v >>> 24; b[i + 1] = (v >>> 16) & 0xff; b[i + 2] = (v >>> 8) & 0xff; b[i + 3] = v & 0xff; }
+  }
+  setFloat16(byteOffset: number, value: number, littleEndian?: boolean): void {
+    const i = this.#at(byteOffset, 2); scratchF16()[0] = Number(value); this.#store(i, 2, littleEndian === true);
   }
   setFloat32(byteOffset: number, value: number, littleEndian?: boolean): void {
     const i = this.#at(byteOffset, 4); scratchF32[0] = Number(value); this.#store(i, 4, littleEndian === true);

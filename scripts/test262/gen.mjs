@@ -15,7 +15,16 @@ if (!src || !out || subs.length === 0) {
 }
 const harnessCache = new Map();
 const harness = (name) => {
-  if (!harnessCache.has(name)) harnessCache.set(name, fs.readFileSync(path.join(src, "harness", name), "utf8"));
+  if (!harnessCache.has(name)) {
+    let text = fs.readFileSync(path.join(src, "harness", name), "utf8");
+    // the subclasses are built from strings "without bombing out when `class` isn't supported": a compiled
+    // program writes them out
+    if (name === "resizableArrayBufferUtils.js") {
+      text = text.replace(/function subClass\(type\) \{[\s\S]*?\n\}\n/, "")
+        .replace(/const (My\w+) = subClass\('(\w+)'\);/g, "const $1 = class $1 extends $2 {};");
+    }
+    harnessCache.set(name, text);
+  }
   return harnessCache.get(name);
 };
 function listField(meta, name) {

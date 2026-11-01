@@ -232,6 +232,7 @@ const methods = {
     return A;
   },
 };
+(globalThis as any).__garnet.replaceMethod(regexpProto, regexpProto.test, methods.test);
 for (const key of Reflect.ownKeys(methods)) {
   Object.defineProperty(regexpProto, key, { value: (methods as any)[key], writable: true, enumerable: false, configurable: true });
 }

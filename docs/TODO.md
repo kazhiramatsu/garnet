@@ -12737,3 +12737,33 @@ Where it stopped (branch `s363-dc`, worktree `build/wt_dc`, on top of `s362-wip`
   base, a second `super()` (a typed class's, and through an arrow), `super` in a static method after
   `Object.setPrototypeOf(C, null)` (the class value and the static container are two objects), TDZ through closures, private names per evaluation.
 - Then the rest of test262 (statements, built-ins, annexB), BigInt, dynamic import, the elements kinds above.
+- **Session 363, later batch (built-ins).** `docs/bigint_design.md`: BigInt, its operators, `BigInt64Array`, DataView's 64-bit
+  integers. %IteratorPrototype%, the `Iterator` global, the helpers, `Iterator.from` (`runtime/iterator_helpers.c`).
+  `JSON.parse(s) as Config` is closed: a number field out of JSON is `any` where it is used in place and strict in a slot
+  (`docs/cast_to_number_design.md`); a parameter of a built-in counts as in place, the runtime converts it.
+- **Builtin arguments.** A boxed argument of a typed builtin was read with the raw bit reinterpretation: `arr.slice("2")`,
+  `s.charAt(obj)`, `arr.fill(9, "2")` answered from garbage, silently. An explicit undefined end counted as present
+  (`copyWithin(0, 1, undefined)`, `endsWith("f", undefined)`). A string method's non-string needle, separator, fill or
+  replacement answered -1, false or the receiver (`"a1".indexOf(1)`, `"a1b".split(1)`, `s.replace("a", undefined)`,
+  `padEnd(8, 1)`). Also `padStart(8, "")`, `lastIndexOf("a", -5)`, `repeat(-0.5)`, `$` in the replacement of an empty
+  pattern, `fill` on a frozen array, `Array.from(null)`, `Array.from({ length: "2" })`, `toString` returning a Symbol.
+  `ts_index_ll` is the one conversion of an index: NaN and the infinities were undefined casts.
+- **Well-known symbols** (`docs/well_known_symbols_design.md`): `Symbol.match`, `matchAll`, `replace`, `search`, `split`,
+  `species`, `isConcatSpreadable`, `unscopables`, `dispose`, `asyncDispose` read undefined, so `{ [Symbol.replace]() {} }`
+  made a property named "undefined". RegExp's protocol is the specification in TypeScript
+  (`lib/node/web/regexp_protocol.ts`), compiled only by a program that names a symbol, writes `exec` or extends RegExp; any
+  other program keeps the direct paths. test262: `RegExp/prototype` 92 of 92 in a third of the protocol directories.
+  `s.match(p)` with a pattern known at run time was a compile-time reject and is a dynamic call.
+- **Species** (`lib/node/web/species.ts`): `class X extends Array`'s `map`, `filter`, `slice`, `splice`, `concat`, `flat`, `flatMap`
+  gave a plain array, silently. `Array.from` / `Array.of` construct `this`. Typed arrays and `ArrayBuffer.prototype.slice` in
+  the runtime. test262: 270 of 295 runnable cases naming the symbols.
+- **Dictionary arrays** (`docs/dictionary_arrays_design.md`): `Object.defineProperty(arr, 1, { get() {} })` wrote a key no element
+  read looked at, silently; a read-only `length` and non-writable elements had no representation. A third element form,
+  with no cost to other arrays: `cap` is 0, as for a sparse array, so every inline path leaves. `Object.defineProperty`
+  with `{ value }`, a spread or a computed key dropped the fields: silent, and hit by any shorthand. test262:
+  `Object.defineProperty` and `defineProperties` 568 of 576 runnable in a third of them.
+- **Array.prototype over any receiver** (`docs/array_protocol_design.md`): the specification's 35 methods in TypeScript for
+  array-likes, Proxies and dictionary arrays, a wrapper on the prototype that keeps plain arrays on the runtime's path.
+  `Object.defineProperties` reads every descriptor first.
+- Found, not fixed: `console.log` prints an object or array on one line where Node breaks at 72 columns and groups long
+  numeric arrays.

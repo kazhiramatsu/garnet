@@ -39,7 +39,7 @@ static char** nh_argv;
 static tsv nh_arg(tsv* a, int n, int i){ return i < n ? a[i] : TS_UNDEFINED; }
 static uint32_t nh_elem_size(uint8_t elem){
   switch (elem){
-    case TS_TA_INT16: case TS_TA_UINT16: return 2;
+    case TS_TA_INT16: case TS_TA_UINT16: case TS_TA_FLOAT16: return 2;
     case TS_TA_INT32: case TS_TA_UINT32: case TS_TA_FLOAT32: return 4;
     case TS_TA_FLOAT64: return 8;
     default: return 1;
