@@ -7350,7 +7350,9 @@ class Exporter {
             }
             // A method on a known builtin string/array type that we don't yet
             // implement: reject loudly rather than silently miscompiling/trapping.
-            this.unsupported(node, `${cls} method '${fn.name.text}' (stdlib method not yet implemented)`);
+            // (a method of the runtime's prototype the static table does not list: the dynamic path)
+            if (!(cls === "set" && ["union", "intersection", "difference", "symmetricDifference", "isSubsetOf", "isSupersetOf", "isDisjointFrom"].includes(fn.name.text)))
+              this.unsupported(node, `${cls} method '${fn.name.text}' (stdlib method not yet implemented)`);
           }
         }
         // super.staticMethod(...) inside a STATIC body -> Direct call to the parent's
@@ -11782,6 +11784,7 @@ class Exporter {
       if (member === "keys" || member === "values" || member === "entries") return `object.${member}`;
       if (member === "getOwnPropertySymbols") return argc === 1 ? "object.getOwnPropertySymbols" : "__UNSUPPORTED__";
       if (member === "assign") return argc >= 1 ? "object.assign" : "__UNSUPPORTED__";
+      if (member === "groupBy") return "object.groupBy";
       if (member === "fromEntries") return argc === 1 ? "object.fromEntries" : "__UNSUPPORTED__";
       if (member === "freeze") return argc === 1 ? "object.freeze" : "__UNSUPPORTED__";
       if (member === "isFrozen") return argc === 1 ? "object.isFrozen" : "__UNSUPPORTED__";
@@ -12171,6 +12174,7 @@ class Exporter {
     if (ns === "Date" && member === "now") return "date.now";
     if (ns === "Date" && member === "parse") return "date.parse";
     if (ns === "Date" && member === "UTC") return "date.UTC";
+    if (ns === "Object" && member === "groupBy") return "object.groupBy";
     if (ns === "console") {
       if (member === "log" || member === "info" || member === "debug") return "console.log";
       // `trace` as a value (hono's `onError = console.trace` default): the error writer; the stack lines are not modelled

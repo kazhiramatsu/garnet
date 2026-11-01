@@ -1577,6 +1577,8 @@ void ts_string_proto_register(ts_key method_key, const char* name, ts_code fn);
    generated RegExp method wrappers live in emitted C so no-RegExp programs do not
    reference the optional QuickJS adapter. */
 tsv  ts_regexp_proto(void);
+tsv  ts_object_group_by(tsv* a, int n);
+tsv  ts_map_group_by(tsv* a, int n);
 tsv  ts_symbol_proto(void);
 tsv  ts_date_proto(void);
 void ts_date_ctor_link(tsv ctor);   /* Date.prototype and its `constructor` */

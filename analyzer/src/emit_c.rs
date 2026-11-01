@@ -14825,6 +14825,8 @@ fn fnval_adapter_body(builtin: &str) -> Option<String> {
         "date.now" => Some("return ts_date_now_ms();".to_string()),
         "date.parse" => hv(format!("ts_num(ts_date_parse_value({}))", val(0))),
         "date.UTC" => Some("return ts_date_utc_value(a, n);".to_string()),
+        "object.groupBy" => Some("return ts_object_group_by(a, n);".to_string()),
+        "map.groupBy" => Some("return ts_map_group_by(a, n);".to_string()),
         // ---- the URI functions as values (a program that names one; calls lower directly) ----
         "global.encodeURIComponent" => hv(format!("ts_encode_uri_component({})", val(0))),
         "global.decodeURIComponent" => hv(format!("ts_decode_uri_component({})", val(0))),
@@ -14978,6 +14980,8 @@ fn global_fn_value_builtins() -> &'static [&'static str] {
         "date.now",
         "date.parse",
         "date.UTC",
+        "object.groupBy",
+        "map.groupBy",
         "math.sqrt",
         "math.abs",
         "math.floor",
@@ -15082,6 +15086,7 @@ fn emit_global_setup(s: &mut String, needs_fetch: bool, needs_typed_array_global
     set_val(s, "_Object", "prototype", "ts_object_proto()");
     set_val(s, "ts_object_proto()", "constructor", "_Object");
     set_fn(s, "_Object", "assign", "object.assign", 2, "assign");
+    set_fn(s, "_Object", "groupBy", "object.groupBy", 2, "groupBy");
     set_fn(s, "_Object", "create", "object.create", 1, "create");
     set_fn(
         s,
@@ -15242,6 +15247,7 @@ fn emit_global_setup(s: &mut String, needs_fetch: bool, needs_typed_array_global
     root_local(s, "_Map");
     s.push_str("  ts_fn_mark_native_ctor(_Map);\n");
     set_val(s, "_Map", "prototype", "ts_map_proto()");
+    set_fn(s, "_Map", "groupBy", "map.groupBy", 2, "groupBy");
     set_val(s, "ts_map_proto()", "constructor", "_Map");
     global_set_rooted(s, "Map", "_Map");
     s.push_str("  tsv _Set = ts_make_global_fn(ts_fnval_global_Set, 0u, \"Set\", 0);\n");
@@ -24136,6 +24142,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 "dynclass.this" => (format!("ts_dyn_this({})", v(0)), false),
                 "dynclass.thisCheck" => (format!("ts_dyn_this_check({})", v(0)), false),
                 "super.set" => (format!("ts_super_set({}, {}, {}, {})", v(0), v(1), v(2), v(3)), false),
+                "object.groupBy" => (format!("ts_object_group_by((tsv[]){{{}, {}}}, 2)", v(0), v(1)), false),
                 "cast.number" => (format!("ts_cast_number({})", v(0)), false),
                 "cast.numberArray" => (format!("ts_cast_number_array({})", v(0)), false),
                 _ if builtin.starts_with("cast.foreignNumber:") => (format!("ts_cast_foreign_number({}, {})", v(0), c_string_lit(&builtin["cast.foreignNumber:".len()..])), false),

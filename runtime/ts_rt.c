@@ -17999,6 +17999,155 @@ void ts_map_proto_init(void){
   ((ts_object*)ts_ptr(g_map_proto_v))->proto = g_object_proto_v;
   ts_collection_size_accessor(g_map_proto_v, ts_mapproto_size);
 }
+/* The ES2025 Set methods. `other` is any object with `size`, `has` and `keys` (GetSetRecord); the elements of
+   `this` are walked over a snapshot, so a `has` that changes the set does not change the walk. */
+typedef struct { tsv obj, has, keys; double size; } set_record;
+static void set_record_of(tsv other, set_record* r){
+  if (!ts_object_like(other) || ts_is_symbol(other)) ts_throw_type_error_msg("The argument of a Set method must be an object");
+  r->obj = other;
+  double n = ts_number_coerce(ts_get(other, ts_intern_field("size", 4)));
+  if (n != n) ts_throw_type_error_msg("The .size property of the argument is NaN");
+  n = trunc(n);
+  if (n < 0.0) ts_throw_range_error_msg("The .size property of the argument is negative");
+  r->size = n;
+  r->has = ts_get(other, ts_intern_field("has", 3));
+  if (!ts_is_callable(r->has)) ts_throw_type_error_msg("The .has property of the argument is not callable");
+  r->keys = ts_get(other, ts_intern_field("keys", 4));
+  if (!ts_is_callable(r->keys)) ts_throw_type_error_msg("The .keys property of the argument is not callable");
+}
+static int set_record_has(set_record* r, tsv v){
+  tsv a[2] = { r->obj, v };
+  return ts_truthy(ts_call_method(r->has, a, 2));
+}
+/* the keys of `other`, read by next() until done; `stop` closes the iterator when the walk ends early */
+static tsv set_record_keys(set_record* r, tsv* next){
+  tsv a[1] = { r->obj };
+  tsv it = ts_call_method(r->keys, a, 1);
+  if (!ts_object_like(it) || ts_is_symbol(it)) ts_throw_type_error_msg("The .keys() result is not an object");
+  *next = ts_get(it, ts_intern_field("next", 4));
+  return it;
+}
+static int set_keys_step(tsv it, tsv next, tsv* out){
+  tsv a[1] = { it };
+  tsv r = ts_call_method(next, a, 1);
+  if (!ts_object_like(r) || ts_is_symbol(r)) ts_throw_type_error_msg("The iterator result is not an object");
+  if (ts_truthy(ts_get(r, ts_intern_field("done", 4)))) return 0;
+  *out = ts_get(r, ts_intern_field("value", 5));
+  return 1;
+}
+static void set_keys_stop(tsv it){
+  tsv ret = ts_get(it, ts_intern_field("return", 6));
+  if (ts_is_callable(ret)){ tsv a[1] = { it }; ts_call_method(ret, a, 1); }
+}
+static tsv set_this(tsv* a, int n, const char* name){
+  tsv v = n > 0 ? a[0] : TS_UNDEFINED;
+  if (!ts_is_set(v)){
+    char m[96];
+    snprintf(m, sizeof m, "Method Set.prototype.%s called on incompatible receiver", name);
+    ts_throw_type_error_msg(m);
+  }
+  return v;
+}
+static tsv set_copy(tsv src){
+  ts_gc_root(&src);
+  tsv out = ts_new_set(); ts_gc_root(&out);
+  tsv items = ts_array_from(src); ts_gc_root(&items);
+  uint32_t n = ts_array_len(items);
+  for (uint32_t i = 0; i < n; i++) ts_set_add(out, ts_array_get(items, i));
+  ts_gc_unroot(3);
+  return out;
+}
+enum { SET_UNION, SET_INTERSECTION, SET_DIFFERENCE, SET_SYMMETRIC, SET_SUBSET, SET_SUPERSET, SET_DISJOINT };
+static tsv set_method(tsv* a, int n, int op, const char* name){
+  tsv self = set_this(a, n, name);
+  tsv other = n > 1 ? a[1] : TS_UNDEFINED;
+  set_record r;
+  ts_gc_root(&self); ts_gc_root(&other);
+  set_record_of(other, &r);
+  ts_gc_root(&r.obj); ts_gc_root(&r.has); ts_gc_root(&r.keys);
+  double size = ts_set_size(self);
+  tsv out = op <= SET_SYMMETRIC ? set_copy(self) : TS_UNDEFINED;
+  if (op == SET_INTERSECTION){ out = ts_new_set(); }
+  ts_gc_root(&out);
+  tsv answer = TS_UNDEFINED;
+  /* walk `this` where the specification does, else the keys of `other` */
+  int walk_this = (op == SET_INTERSECTION || op == SET_DIFFERENCE || op == SET_DISJOINT) ? size <= r.size : op == SET_SUBSET;
+  if ((op == SET_SUBSET && size > r.size) || (op == SET_SUPERSET && size < r.size)) answer = ts_bool(0);
+  else if (walk_this){
+    tsv items = ts_array_from(self); ts_gc_root(&items);
+    uint32_t len = ts_array_len(items);
+    for (uint32_t i = 0; i < len && ts_is_undef(answer); i++){
+      tsv e = ts_array_get(items, i);
+      int present = set_record_has(&r, e);
+      if (op == SET_INTERSECTION){ if (present) ts_set_add(out, e); }
+      else if (op == SET_DIFFERENCE){ if (present) ts_set_delete(out, e); }
+      else if (op == SET_SUBSET){ if (!present) answer = ts_bool(0); }
+      else if (present) answer = ts_bool(0);
+    }
+    ts_gc_unroot(1);
+  } else {
+    tsv next = TS_UNDEFINED;
+    tsv it = set_record_keys(&r, &next);
+    ts_gc_root(&it); ts_gc_root(&next);
+    tsv k = TS_UNDEFINED; ts_gc_root(&k);
+    while (ts_is_undef(answer) && set_keys_step(it, next, &k)){
+      if (ts_is_num(k) && ts_to_num(k) == 0.0) k = ts_num(0.0);   /* -0 is +0 in a Set */
+      if (op == SET_UNION) ts_set_add(out, k);
+      else if (op == SET_INTERSECTION){ if (ts_set_has(self, k)) ts_set_add(out, k); }
+      else if (op == SET_DIFFERENCE) ts_set_delete(out, k);
+      else if (op == SET_SYMMETRIC){ if (ts_set_has(self, k)) ts_set_delete(out, k); else ts_set_add(out, k); }
+      else if (op == SET_SUPERSET){ if (!ts_set_has(self, k)){ answer = ts_bool(0); set_keys_stop(it); } }
+      else if (ts_set_has(self, k)){ answer = ts_bool(0); set_keys_stop(it); }
+    }
+    ts_gc_unroot(3);
+  }
+  ts_gc_unroot(6);
+  if (op <= SET_SYMMETRIC) return out;
+  return ts_is_undef(answer) ? ts_bool(1) : answer;
+}
+#define SET_METHOD(fname, jsname, op) static tsv fname(tsv* a, int n){ return set_method(a, n, op, jsname); }
+SET_METHOD(sp_union, "union", SET_UNION) SET_METHOD(sp_intersection, "intersection", SET_INTERSECTION)
+SET_METHOD(sp_difference, "difference", SET_DIFFERENCE) SET_METHOD(sp_symmetric, "symmetricDifference", SET_SYMMETRIC)
+SET_METHOD(sp_subset, "isSubsetOf", SET_SUBSET) SET_METHOD(sp_superset, "isSupersetOf", SET_SUPERSET)
+SET_METHOD(sp_disjoint, "isDisjointFrom", SET_DISJOINT)
+#undef SET_METHOD
+static void ts_set_methods_init(tsv p){
+  date_define(p, "union", sp_union, 1); date_define(p, "intersection", sp_intersection, 1);
+  date_define(p, "difference", sp_difference, 1); date_define(p, "symmetricDifference", sp_symmetric, 1);
+  date_define(p, "isSubsetOf", sp_subset, 1); date_define(p, "isSupersetOf", sp_superset, 1);
+  date_define(p, "isDisjointFrom", sp_disjoint, 1);
+}
+/* Object.groupBy, Map.groupBy: a group per key, in the order the keys first appear; a Map's -0 is +0 */
+static tsv group_by(tsv items, tsv cb, int to_map){
+  if (ts_is_undef(items) || ts_is_null(items)) ts_throw_type_error_msg("groupBy over undefined or null");
+  if (!ts_is_callable(cb)) ts_throw_type_error_msg("The groupBy callback is not a function");
+  ts_gc_root(&items); ts_gc_root(&cb);
+  tsv list = ts_array_from(items); ts_gc_root(&list);
+  tsv out = to_map ? ts_new_map() : ts_object_create(TS_NULL); ts_gc_root(&out);
+  uint32_t n = ts_array_len(list);
+  for (uint32_t i = 0; i < n; i++){
+    tsv e = ts_array_get(list, i); ts_gc_root(&e);
+    tsv av[2] = { e, ts_num((double)i) };
+    tsv key = ts_call(cb, av, 2); ts_gc_root(&key);
+    tsv group;
+    if (to_map){
+      if (ts_is_num(key) && ts_to_num(key) == 0.0) key = ts_num(0.0);
+      group = ts_map_has(out, key) ? ts_map_get(out, key) : TS_UNDEFINED;
+      if (ts_is_undef(group)){ group = ts_new_array(0); ts_gc_root(&group); ts_map_set(out, key, group); ts_gc_unroot(1); }
+    } else {
+      tsv pk = ts_property_key_value(key); ts_gc_root(&pk);
+      group = ts_get_dyn(out, pk);
+      if (ts_is_undef(group)){ group = ts_new_array(0); ts_gc_root(&group); ts_set_dyn(out, pk, group); ts_gc_unroot(1); }
+      ts_gc_unroot(1);
+    }
+    ts_array_push(group, e);
+    ts_gc_unroot(2);
+  }
+  ts_gc_unroot(4);
+  return out;
+}
+tsv ts_object_group_by(tsv* a, int n){ return group_by(n > 0 ? a[0] : TS_UNDEFINED, n > 1 ? a[1] : TS_UNDEFINED, 0); }
+tsv ts_map_group_by(tsv* a, int n){ return group_by(n > 0 ? a[0] : TS_UNDEFINED, n > 1 ? a[1] : TS_UNDEFINED, 1); }
 void ts_set_proto_init(void){
   if (ts_proto_ref(g_set_proto_v)) return;
   static int rooted = 0;
@@ -18006,6 +18155,7 @@ void ts_set_proto_init(void){
   ts_root_static_once(&g_set_proto_v, &rooted);
   ((ts_object*)ts_ptr(g_set_proto_v))->proto = g_object_proto_v;
   ts_collection_size_accessor(g_set_proto_v, ts_setproto_size);
+  ts_set_methods_init(g_set_proto_v);
 }
 void ts_weakmap_proto_init(void){
   if (ts_proto_ref(g_weakmap_proto_v)) return;
