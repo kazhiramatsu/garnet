@@ -21,6 +21,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { ClassExtractor, ClassInfo, ClosedReceivers, memberKeyName, isDynamicClass, dynamicClasses } from "./class_extract";
 import { jsEarlyErrors } from "./early_errors";
+import { rewriteUsing } from "./using_rewrite";
 import { uniquePrivateNames, privateDisplayName, privateBrand, PRIVATE_MARK } from "./private_names";
 import { JSX_ENTITIES } from "./jsx_entities";
 /** A regexp literal's text split into its source and flags (`/src/flags`). */
@@ -168,14 +169,16 @@ const NODE_PRELUDE_GLOBALS = new Set(["process", "Buffer", "atob", "btoa", "setT
   // streams (docs/web_streams_design.md)
   "ReadableStream", "WritableStream", "TransformStream", "ReadableStreamDefaultReader", "WritableStreamDefaultWriter", "ReadableStreamDefaultController", "WritableStreamDefaultController", "TransformStreamDefaultController", "TextEncoderStream", "TextDecoderStream", "CountQueuingStrategy", "ByteLengthQueuingStrategy", "Blob", "File",
   // the compression streams (docs/web_compression_design.md)
-  "CompressionStream", "DecompressionStream"]);
+  "CompressionStream", "DecompressionStream",
+  // explicit resource management (docs/using_declarations_design.md)
+  "SuppressedError", "DisposableStack", "AsyncDisposableStack", "__garnet_using_stack", "__garnet_use", "__garnet_dispose", "__garnet_dispose_async"]);
 /** The constructors among them: lib.dom declares the identifier, the prelude's class is the
  *  global object's value, and `new URL(...)` constructs through that value. */
 const NODE_PRELUDE_CTORS = new Set(["URL", "URLSearchParams", "Headers", "Request", "Response", "FormData", "DataView", "__garnet_StringObject",
   "Crypto", "SubtleCrypto", "CryptoKey",
   "ReadableStream", "WritableStream", "TransformStream", "ReadableStreamDefaultReader", "WritableStreamDefaultWriter", "ReadableStreamDefaultController", "WritableStreamDefaultController", "TransformStreamDefaultController", "TextEncoderStream", "TextDecoderStream", "CountQueuingStrategy", "ByteLengthQueuingStrategy", "Blob", "File",
   // the compression streams (docs/web_compression_design.md)
-  "CompressionStream", "DecompressionStream"]);
+  "CompressionStream", "DecompressionStream", "SuppressedError", "DisposableStack", "AsyncDisposableStack"]);
 /** The lib modules behind the globals: a program's prelude imports only the parts it names,
  *  so a program that uses setTimeout does not compile the streams behind process.stdout. */
 /** A program text that can tell the engine's direct paths from the protocol: it names a matcher's well-known
@@ -212,6 +215,8 @@ const NODE_PRELUDE_PARTS: { file: string; names: string[]; defaultImport?: strin
   { file: "web/blob", names: ["Blob", "File"] },
   // CompressionStream / DecompressionStream over the system's zlib (docs/web_compression_design.md)
   { file: "web/compression", names: ["CompressionStream", "DecompressionStream"] },
+  // explicit resource management (docs/using_declarations_design.md)
+  { file: "web/disposable", names: ["SuppressedError", "DisposableStack", "AsyncDisposableStack", "__garnet_using_stack", "__garnet_use", "__garnet_dispose", "__garnet_dispose_async"] },
   // on demand: a program that passes the array methods an array-like (docs/array_protocol_design.md)
   { file: "web/array_generic", names: [], triggers: [ARRAY_GENERIC_TRIGGER] },
   // on demand: a program that can see an array's constructor (docs/well_known_symbols_design.md)
@@ -466,8 +471,12 @@ function privateNameHost(options: ts.CompilerOptions, host: ts.CompilerHost | un
   const base = host ?? ts.createCompilerHost(options);
   return Object.assign({}, base, {
     getSourceFile(fileName: string, languageVersion: ts.ScriptTarget | ts.CreateSourceFileOptions, onError?: (m: string) => void, shouldCreate?: boolean) {
-      const sf = base.getSourceFile(fileName, languageVersion, onError, shouldCreate);
-      if (sf && !sf.isDeclarationFile) uniquePrivateNames(sf);
+      let sf = base.getSourceFile(fileName, languageVersion, onError, shouldCreate);
+      if (sf && !sf.isDeclarationFile) {
+        const rewritten = rewriteUsing(sf);
+        if (rewritten !== undefined) sf = ts.createSourceFile(fileName, rewritten, languageVersion, true);
+        uniquePrivateNames(sf);
+      }
       return sf;
     },
   });
@@ -585,6 +594,7 @@ function programWithNodeSupport(rootNames: string[], options: ts.CompilerOptions
       if (triggers !== undefined && regexpProtocolText.test(f.text)) found.add(REGEXP_PROTOCOL_TRIGGER);
       if (triggers !== undefined && speciesText.test(f.text)) found.add(SPECIES_TRIGGER);
       if (triggers !== undefined && arrayGenericText.test(f.text)) found.add(ARRAY_GENERIC_TRIGGER);
+      if (triggers !== undefined && /\bSymbol\s*\.\s*(dispose|asyncDispose)\b/.test(f.text)) found.add("DisposableStack");
       const visit = (n: ts.Node): void => {
         // a property named like a global (`globalThis.btoa`, `g.URL` through an alias of the
         // global object, `globalThis["performance"]`) counts too: conservative, and cheap
