@@ -14886,7 +14886,11 @@ fn fnval_adapter_body(builtin: &str) -> Option<String> {
 const URI_FN_VALUE_NAMES: [&str; 4] = ["encodeURIComponent", "decodeURIComponent", "encodeURI", "decodeURI"];
 fn builtin_needs_uri_fn_values(builtin: &str) -> bool {
     match builtin.split_once('.') {
-        Some((prefix, name)) => prefix != "global" && URI_FN_VALUE_NAMES.contains(&name),
+        // (`global.check:x` is the read of an ambient name, a callee of `new` among them)
+        Some((prefix, name)) => match name.strip_prefix("check:") {
+            Some(name) => URI_FN_VALUE_NAMES.contains(&name),
+            None => prefix != "global" && URI_FN_VALUE_NAMES.contains(&name),
+        },
         None => false,
     }
 }
@@ -15136,7 +15140,7 @@ fn emit_global_setup(s: &mut String, needs_fetch: bool, needs_typed_array_global
     set_val(s, "ts_object_proto()", "constructor", "_Object");
     set_fn(s, "_Object", "assign", "object.assign", 2, "assign");
     set_fn(s, "_Object", "groupBy", "object.groupBy", 2, "groupBy");
-    set_fn(s, "_Object", "create", "object.create", 1, "create");
+    set_fn(s, "_Object", "create", "object.create", 2, "create");
     set_fn(
         s,
         "_Object",
@@ -15557,8 +15561,9 @@ fn emit_global_setup(s: &mut String, needs_fetch: bool, needs_typed_array_global
     set_fn(s, "_console", "dir", "console.dir", 1, "dir");
     global_set_rooted(s, "console", "_console");
 
-    s.push_str("  ts_global_set(\"parseInt\", ts_make_global_fn(ts_fnval_global_parseInt, 2u, \"parseInt\", 0));\n");
-    s.push_str("  ts_global_set(\"parseFloat\", ts_make_global_fn(ts_fnval_global_parseFloat, 1u, \"parseFloat\", 0));\n");
+    // Number.parseInt is the global parseInt, the same function object
+    s.push_str("  ts_global_set(\"parseInt\", ts_get(_Number, ts_intern_field(\"parseInt\", 8)));\n");
+    s.push_str("  ts_global_set(\"parseFloat\", ts_get(_Number, ts_intern_field(\"parseFloat\", 10)));\n");
     s.push_str(
         "  ts_global_set(\"isNaN\", ts_make_global_fn(ts_fnval_global_isNaN, 1u, \"isNaN\", 0));\n",
     );
@@ -24570,6 +24575,15 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     .unwrap_or_else(|| "0".into())
             };
             let has = |i: usize| if args.len() > i { "1" } else { "0" };
+            // A boxed fromIndex can run code: not for an empty array.
+            let boxed_from = |empty: &str| -> String {
+                match args.get(1) {
+                    Some(a) if !ctx.unboxed.contains(&a.0) && !ctx.int_local.contains(&a.0) && !ctx.json_locals.contains(&a.0) => {
+                        format!("ts_array_is_empty({}) ? {}", r, empty)
+                    }
+                    _ => String::new(),
+                }
+            };
             // An argument the method takes as absent when it is undefined (an end position).
             let has_defined = |i: usize| -> String {
                 match args.get(i) {
@@ -24693,13 +24707,15 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     ),
                     false,
                 ),
+                // (an empty array answers before fromIndex is converted)
                 "array.indexOf" => (
-                    format!("ts_array_indexof({}, {}, {}, {})", r, v(0), n(1), has(1)),
+                    format!("{}ts_array_indexof({}, {}, {}, {})", boxed_from("-1.0 : "), r, v(0), n(1), has(1)),
                     true,
                 ),
                 "array.includes" => (
                     format!(
-                        "ts_bool(ts_array_includes({}, {}, {}, {}))",
+                        "ts_bool({}ts_array_includes({}, {}, {}, {}))",
+                        boxed_from("0 : "),
                         r,
                         v(0),
                         n(1),
@@ -24767,7 +24783,8 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 "array.every" => (format!("ts_bool(ts_array_every({}, {}))", r, cbv()), false),
                 "array.lastIndexOf" => (
                     format!(
-                        "ts_array_lastindexof({}, {}, {}, {})",
+                        "{}ts_array_lastindexof({}, {}, {}, {})",
+                        boxed_from("-1.0 : "),
                         r,
                         v(0),
                         n(1),

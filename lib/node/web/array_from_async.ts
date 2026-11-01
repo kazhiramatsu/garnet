@@ -11,9 +11,8 @@ function lengthOf(O: any): number {
   const i = n !== n ? 0 : Math.trunc(n);
   return i <= 0 ? 0 : Math.min(i, 9007199254740991);
 }
-const holder = {
-  async fromAsync(this: any, asyncItems: any, mapfn?: any, thisArg?: any): Promise<any> {
-    const C = this;
+const steps = {
+  async run(C: any, asyncItems: any, mapfn: any, thisArg: any): Promise<any> {
     const mapping = mapfn !== undefined;
     if (mapping && typeof mapfn !== "function") throw new TypeError(`${String(mapfn)} is not a function`);
     const asyncMethod = asyncItems === undefined || asyncItems === null ? undefined : asyncItems[Symbol.asyncIterator];
@@ -40,6 +39,10 @@ const holder = {
     A.length = len;
     return A;
   },
+};
+// a built-in, not an async function: its prototype is Function.prototype and it returns the promise of the steps
+const holder = {
+  fromAsync(this: any, asyncItems: any, mapfn?: any, thisArg?: any): Promise<any> { return steps.run(this, asyncItems, mapfn, thisArg); },
 };
 Object.defineProperty(holder.fromAsync, "length", { value: 1, configurable: true });
 Object.defineProperty(Array, "fromAsync", { value: holder.fromAsync, writable: true, enumerable: false, configurable: true });

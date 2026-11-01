@@ -1280,6 +1280,7 @@ static inline int ts_is_indexed_array_fast(tsv v){
 static inline int ts_is_plain_array(tsv v){
   return ts_is_indexed_array_fast(v) && ((ts_array*)ts_ptr(v))->sparse != TS_ARRAY_DICT;
 }
+static inline int ts_array_is_empty(tsv v){ return ts_is_plain_array(v) && ((ts_array*)ts_ptr(v))->len == 0; }
 /* Typed arrays (docs/typed_arrays_design.md): a buffer owns bytes outside the
    heap; a view points into them and keeps the buffer alive. */
 enum { TS_TA_INT8, TS_TA_UINT8, TS_TA_UINT8C, TS_TA_INT16, TS_TA_UINT16, TS_TA_INT32,

@@ -12857,3 +12857,17 @@ Where it stopped (branch `s363-dc`, worktree `build/wt_dc`, on top of `s362-wip`
   for one getter, which put a `constructor` read on every array method of any program with the word `"then"`: it defines the getter itself.
   The five protocol libraries are no longer walked by the closed-receivers passes (docs/closed_receivers_design.md, "The protocol
   libraries"; tests/closed_receivers.sh, 59 programs). tsc-ts against r29: 22.06 G -> 21.94 G, cycles x1.011, wall 1.19 s both, outputs identical.
+- **`Array.prototype.sort` was an insertion sort**: O(n^2), a million numbers would have taken hours. It is V8's TimSort now (V8 14: a run search
+  from 8 elements, binary insertion below), compared call by call against Node on 1008 sequences, inconsistent comparators included
+  (`arrays/array_sort_timsort`, 20 000 elements): the same calls in the same order and the same result. A million numbers with a comparator:
+  202 ms (Node 146). A collection during a comparator can move everything: no element or data pointer crosses a comparison. `sort(null)` is a
+  TypeError, a frozen array throws at the write, a dictionary array is sorted (it was left as it was, silently).
+- **A bound function had no `name` and no `length`** (`f.bind(x).name` was ""), `bind` of a non-function did not throw. `Math.round` rounded
+  through `floor(x + 0.5)`: 0.49999999999999994 gave 1, 2^52 + 1 gave 2^52 + 2. `Number.parseFloat === parseFloat`, `Object.create.length`.
+- **A value typed as an array that is none at run time** (a cast, untyped code) answered a default from 41 array builtins (`[]`, 0, -1,
+  undefined, or a store dropped): it takes the method it has now, or fails as the call would (`arrays/array_typed_receiver_lie`).
+- `escape` and `unescape` did not exist (`lib/node/web/escape.ts`). A Proxy passes NewTarget, a nested Proxy's `preventExtensions` answers,
+  `Reflect.preventExtensions` of a refusing Proxy is false, `Reflect.set` is false on a read-only property of any kind of object, a key whose
+  ToPrimitive gives a symbol, `Symbol(Symbol())`, `Reflect.apply` without a list, `resolve(p)` for a promise with its own `then` or a replaced
+  `Promise.prototype.then` (adopted directly before), `new encodeURIComponent()`, `with` over a buffer a conversion shrank, `Array.fromAsync`
+  is a built-in rather than an async function. test262 slice NR%25==19 of built-ins: 663 pass, 24 wrong -> 6 wrong.

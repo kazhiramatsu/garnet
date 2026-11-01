@@ -2005,7 +2005,9 @@ int g_has_callable_proxies = 0;
    (arrproto_elements) or run the generic algorithm (arrlike_*), as Array.prototype.x.call(proxy) does. */
 /* The array builtins' test of a receiver that is no array: null and undefined throw here, the one
    path all of them take (a typed array read past an end: `rows[9].push(1)` answered 0). */
-#define TS_ARRAY_PROXY(arr) ((void)ts_recv_coercible(arr), TS_RT_UNLIKELY(g_has_proxies) && (ts_is_proxy(arr) || (ts_is_indexed_array_fast(arr) && !ts_is_plain_array(arr))))
+/* Anything else takes the method it has, or fails as the call would: a value typed as an array that is none at run
+   time (a cast lied, untyped code assigned it) answered a default here (`[]`, 0, -1, undefined), silently. */
+#define TS_ARRAY_PROXY(arr) ((void)ts_recv_coercible(arr), !ts_is_plain_array(arr))
 tsv ts_new_map(void);
 tsv ts_new_set(void);
 int g_typed_slow = 0;    /* declared in ts_rt.h; see ts_typed_slow there */
@@ -2077,6 +2079,7 @@ static int chain_exotic_set(ts_object* p, ts_key key, tsv receiver, tsv val, ts_
 static tsv chain_exotic_proto(tsv link);
 static int ts_proxy_is_extensible(tsv pv);
 static void ts_proxy_prevent_extensions(tsv pv);
+static int proxy_prevent_answer(tsv pv);
 static tsv ts_proxy_get_own_desc(tsv pv, tsv keyv);
 static void ts_proxy_define_property(tsv pv, tsv keyv, tsv desc);
 static int proxy_define_answer(tsv pv, tsv keyv, tsv desc);
@@ -2955,7 +2958,11 @@ int ts_array_has_index(tsv arr, uint32_t i){
 }
 static void ts_array_set_grow(ts_array* a, uint32_t i, tsv v);
 void ts_array_set(tsv arr, uint32_t i, tsv v){
-  if (!ts_is_indexed_array_fast(arr)){ if (ts_is_typed_array(arr)) ts_ta_set(arr, i, v); return; }
+  if (!ts_is_indexed_array_fast(arr)){
+    if (ts_is_typed_array(arr)) ts_ta_set(arr, i, v);
+    else ts_set_dyn(arr, ts_num((double)i), v);   /* typed as an array, and none: a store like any other */
+    return;
+  }
   ts_array* a = ts_ptr(arr);
   uint32_t integ = ts_obj_integrity(&a->o);
   if (TS_RT_UNLIKELY(integ)){
@@ -3688,11 +3695,22 @@ static int fn_virtual(ts_func* f, ts_key key){
   }
   return which;
 }
-/* The value of a virtual property (allocates the name string). */
+/* The value of a virtual property (allocates the name string). A bound function has no name of its own: one
+   "bound " for each level over its target's. */
+tsv ts_bound_thunk(tsv* args, int n);
 static tsv fn_virtual_value(const ts_func* f, int which){
   if (which == FN_VIRTUAL_NAME){
+    uint32_t bound = 0;
+    while (!f->name && f->code == (void*)ts_bound_thunk && ts_is_func(f->env[0])){ f = (const ts_func*)ts_ptr(f->env[0]); bound++; }
     const char* nm = f->name ? f->name : "";
-    return ts_new_string(nm, (uint32_t)strlen(nm));
+    size_t n = strlen(nm);
+    if (!bound) return ts_new_string(nm, (uint32_t)n);
+    char* text = (char*)malloc(6u * bound + n);
+    for (uint32_t i = 0; i < bound; i++) memcpy(text + 6u * i, "bound ", 6);
+    memcpy(text + 6u * bound, nm, n);
+    tsv r = ts_new_string(text, (uint32_t)(6u * bound + n));
+    free(text);
+    return r;
   }
   return ts_num((double)f->arity);
 }
@@ -3734,6 +3752,14 @@ static void fn_realize_virtual(tsv fnv, ts_key key){
   *pref_valp(p) = v;
   ts_write_barrier(fnv, v);
   ts_gc_unroot(2);
+}
+/* An own `name` or `length` with a value of its own, in place of the metadata. */
+static void fn_define_virtual(tsv fnv, ts_key key, tsv v){
+  ts_func* f = (ts_func*)ts_ptr(fnv);
+  if (key == g_fn_key_name) f->name_gone = 1; else f->length_gone = 1;
+  ts_pref p = props_define(&f->o, key, TS_PROP_CONFIGURABLE);
+  *pref_valp(p) = v;
+  ts_write_barrier(fnv, v);
 }
 /* A class instance on a prototype chain (`Object.create(instance)`: a child logger, a scope object)
    holds its fields in its struct, which the chain's slot lookup does not see. */
@@ -4585,6 +4611,11 @@ static int ts_key_from_value_slow(tsv keyv, ts_key* out){
       *out = k;
       return 1;
     }
+  }
+  if (ts_is_propbag(keyv) || ts_is_func(keyv)){
+    /* ToPropertyKey: ToPrimitive (hint string) may answer a symbol */
+    keyv = ts_property_key_value(keyv);
+    if (ts_is_symbol(keyv)){ *out = ts_symbol_key(keyv); return 1; }
   }
   tsv ks = keyv;
   if (!ts_is_str(ks)){
@@ -5663,6 +5694,7 @@ int ts_is_symbol(tsv v){
 /* Allocate a fresh symbol with the given description (string or undefined).
    wksym = 0xffffffff (not well-known). */
 tsv ts_symbol_new(tsv description){
+  if (TS_RT_UNLIKELY(ts_is_symbol(description))) ts_throw_type_error_msg("Cannot convert a Symbol value to a string");
   ts_gc_root(&description);
   ts_symbol* s = gc_alloc(sizeof(ts_symbol), TS_KIND_SYMBOL);
   s->sym_id = g_next_sym_id++;
@@ -8627,7 +8659,7 @@ static tsv arrlike_splice(tsv recv, const tsv* args, int nargs){
 }
 /* push / unshift at a typed site whose receiver is not an array: a Proxy takes one dynamic call with
    every argument (vue's instrumented push sees them together, as V8 does); the result is the new
-   length that call returns. Another foreign receiver keeps the old answer (nothing happens, 0). */
+   length that call returns. */
 double ts_array_push_foreign(tsv arr, const tsv* args, int n){
   if (TS_ARRAY_PROXY(arr)) return ts_number_coerce(ts_method_dynamic(arr, "push", args, n));
   return 0;
@@ -10488,11 +10520,11 @@ static void gc_symbol_weak_prune(int young){
 /* JS Math.round: round half up (toward +Inf), unlike C round() which rounds
    half away from zero. Math.round(-0.5) === -0 (=> 0), Math.round(2.5) === 3. */
 double ts_math_round(double x){
-  double r = floor(x + 0.5);
-  /* JS Math.round preserves the sign of zero: x in [-0.5, -0] rounds to -0, but
-     floor(x+0.5) yields +0. Restore the negative sign for those inputs. */
-  if (r == 0.0 && (x < 0.0 || signbit(x))) return -0.0;
-  return r;
+  /* floor(x + 0.5) rounds the sum first: 0.49999999999999994 gave 1 and 2^52 + 1 gave 2^52 + 2. The distance
+     to the floor is exact. A zero takes the argument's sign: x in [-0.5, -0] rounds to -0. */
+  double r = floor(x);
+  if (x - r >= 0.5) r += 1.0;
+  return r == 0.0 ? copysign(0.0, x) : r;
 }
 double ts_math_sign(double x){ if (x>0) return 1; if (x<0) return -1; return x; /* +-0 or NaN */ }
 double ts_math_trunc(double x){ return trunc(x); }
@@ -11772,42 +11804,429 @@ static int default_cmp(tsv a, tsv b){
   return r;
 }
 /* insertion sort (stable, simple). With cb!=undefined, use the comparator. */
-tsv ts_array_sort(tsv arr, tsv cb){
-  ts_array* a=as_arr(arr); if(!a) return TS_ARRAY_PROXY(arr) ? ts_method_dynamic(arr, "sort", &cb, cb == TS_UNDEFINED ? 0 : 1) : arr;
-  if (ts_arr_frozen(arr)) return arr;   /* frozen: no mutation */
-  int has_cb = ts_is_func(cb);
-  ts_gc_root(&arr); ts_gc_root(&cb);
-  uint32_t len=a->len;
-  for(uint32_t i=1;i<len;i++){
-    a=as_arr(arr);
-    tsv key=(a && i<a->len) ? a->data[i] : TS_UNDEFINED; long j=(long)i-1;
-    while(j>=0){
-      a=as_arr(arr);
-      int cmp;
-      tsv left=(a && (uint32_t)j<a->len) ? a->data[j] : TS_UNDEFINED;
-      if (array_is_hole(left) || array_is_hole(key) ||
-          left==TS_UNDEFINED || key==TS_UNDEFINED) {
-        cmp = default_cmp(left, key);
-      } else if(has_cb){
-        tsv args[2]={left,key};
-        /* ToNumber of the comparator's result, its sign decides (a fraction such as `b.q - a.q` = 0.5 is
-           not 0; NaN, a boolean or a string coerce as the spec's SortCompare does) */
-        double d = ts_number_coerce(ts_call_value(cb,args,2));
-        cmp = d>0?1:(d<0?-1:0);
-      } else cmp = default_cmp(left, key);
-      a=as_arr(arr);
-      if(cmp>0 && a && (uint32_t)(j+1)<a->cap){
-        array_invalidate_dirty(a);
-        a->data[j+1]=left; array_write_barrier(a, (uint32_t)(j+1), left); j--;
-      } else break;
+/* ---- Array.prototype.sort: V8's TimSort (src/third_party/v8/builtins/array-sort.tq), so that a comparator sees
+   the same calls in the same order and an inconsistent one leaves the same array. The non-undefined elements
+   are compacted into `work`; the merge space is `temp`. Both are runtime arrays a comparator can move, so
+   nothing here keeps an element or a data pointer across a comparison: a key is named by where it stays. */
+#define SORT_MAX_RUNS 85
+#define SORT_MIN_GALLOP_WINS 7
+typedef struct sort_state {
+  tsv work, temp, cmp;
+  uint32_t temp_cap;
+  int min_gallop, pending;
+  int run_base[SORT_MAX_RUNS], run_len[SORT_MAX_RUNS];
+} sort_state;
+static inline tsv sort_at(const tsv* arr, int i){ return ((ts_array*)ts_ptr(*arr))->data[i]; }
+static inline void sort_put(tsv* arr, int i, tsv v){
+  ts_array* a = (ts_array*)ts_ptr(*arr);
+  a->data[i] = v;
+  array_write_barrier(a, (uint32_t)i, v);
+}
+static void sort_copy(const tsv* src, int from, tsv* dst, int to, int n){
+  if (src == dst && from < to) for (int i = n - 1; i >= 0; i--) sort_put(dst, to + i, sort_at(src, from + i));
+  else for (int i = 0; i < n; i++) sort_put(dst, to + i, sort_at(src, from + i));
+}
+/* SmiLexicographicCompare, for any integer a double holds exactly: no strings */
+static int sort_digits(double d, char* out){
+  char rev[24];
+  int n = 0, at = 0;
+  if (d < 0){ out[at++] = '-'; d = -d; }
+  unsigned long long u = (unsigned long long)d;
+  do { rev[n++] = (char)('0' + u % 10); u /= 10; } while (u);
+  while (n) out[at++] = rev[--n];
+  return at;
+}
+static double sort_compare(sort_state* st, tsv x, tsv y){
+  if (ts_is_undef(st->cmp)){
+    if (ts_is_num(x) && ts_is_num(y)){
+      double a = ts_to_num(x), b = ts_to_num(y);
+      if (a == floor(a) && b == floor(b) && fabs(a) < 9007199254740992.0 && fabs(b) < 9007199254740992.0){
+        char ax[24], bx[24];
+        int al = sort_digits(a, ax), bl = sort_digits(b, bx);
+        int c = memcmp(ax, bx, (size_t)(al < bl ? al : bl));
+        return c ? c : al - bl;
+      }
     }
-    a=as_arr(arr);
-    array_invalidate_dirty(a);
-    a->data[j+1]=key;
-    array_write_barrier(a, (uint32_t)(j+1), key);
+    return default_cmp(x, y);
   }
-  ts_gc_unroot(2);
+  tsv args[2] = { x, y };
+  double d = ts_number_coerce(ts_call_value(st->cmp, args, 2));
+  return d != d ? 0 : d;
+}
+/* The length of the run at low_arg, a descending one reversed: strictly so, to stay stable. */
+static int sort_count_run(sort_state* st, int low_arg, int high){
+  int low = low_arg + 1;
+  if (low == high) return 1;
+  double order = sort_compare(st, sort_at(&st->work, low), sort_at(&st->work, low - 1));
+  int descending = order < 0;
+  int run = 2;
+  for (int idx = low + 1; idx < high; idx++){
+    order = sort_compare(st, sort_at(&st->work, idx), sort_at(&st->work, idx - 1));
+    if (descending ? order >= 0 : order < 0) break;
+    run++;
+  }
+  if (descending){
+    for (int a = low_arg, b = low_arg + run - 1; a < b; a++, b--){
+      tsv t = sort_at(&st->work, a);
+      sort_put(&st->work, a, sort_at(&st->work, b));
+      sort_put(&st->work, b, t);
+    }
+  }
+  return run;
+}
+static void sort_binary_insertion(sort_state* st, int low, int start_arg, int high){
+  for (int start = low == start_arg ? start_arg + 1 : start_arg; start < high; start++){
+    int left = low, right = start;
+    /* the pivot stays at work[start] while it is placed */
+    while (left < right){
+      int mid = left + ((right - left) >> 1);
+      if (sort_compare(st, sort_at(&st->work, start), sort_at(&st->work, mid)) < 0) right = mid;
+      else left = mid + 1;
+    }
+    tsv pivot = sort_at(&st->work, start);
+    for (int p = start; p > left; p--) sort_put(&st->work, p, sort_at(&st->work, p - 1));
+    sort_put(&st->work, left, pivot);
+  }
+}
+/* The offsets a gallop leaves are refined by a binary search in both directions. */
+static inline int sort_next_offset(int offset, int max_ofs){
+  int next = (offset << 1) + 1;
+  return next <= 0 ? max_ofs : next;
+}
+/* The position of the key (at key_arr[key_at]) in the run: left of any equal element. */
+static int sort_gallop_left(sort_state* st, const tsv* arr, const tsv* key_arr, int key_at, int base, int length, int hint){
+  int last = 0, offset = 1;
+#define SORT_KEY() sort_at(key_arr, key_at)
+  double order = sort_compare(st, sort_at(arr, base + hint), SORT_KEY());
+  if (order < 0){
+    int max_ofs = length - hint;
+    while (offset < max_ofs){
+      order = sort_compare(st, sort_at(arr, base + hint + offset), SORT_KEY());
+      if (order >= 0) break;
+      last = offset;
+      offset = sort_next_offset(offset, max_ofs);
+    }
+    if (offset > max_ofs) offset = max_ofs;
+    last += hint;
+    offset += hint;
+  } else {
+    int max_ofs = hint + 1;
+    while (offset < max_ofs){
+      order = sort_compare(st, sort_at(arr, base + hint - offset), SORT_KEY());
+      if (order < 0) break;
+      last = offset;
+      offset = sort_next_offset(offset, max_ofs);
+    }
+    if (offset > max_ofs) offset = max_ofs;
+    int tmp = last;
+    last = hint - offset;
+    offset = hint - tmp;
+  }
+  last++;
+  while (last < offset){
+    int m = last + ((offset - last) >> 1);
+    if (sort_compare(st, sort_at(arr, base + m), SORT_KEY()) < 0) last = m + 1;
+    else offset = m;
+  }
+  return offset;
+}
+/* The same, right of any equal element. */
+static int sort_gallop_right(sort_state* st, const tsv* arr, const tsv* key_arr, int key_at, int base, int length, int hint){
+  int last = 0, offset = 1;
+  double order = sort_compare(st, SORT_KEY(), sort_at(arr, base + hint));
+  if (order < 0){
+    int max_ofs = hint + 1;
+    while (offset < max_ofs){
+      order = sort_compare(st, SORT_KEY(), sort_at(arr, base + hint - offset));
+      if (order >= 0) break;
+      last = offset;
+      offset = sort_next_offset(offset, max_ofs);
+    }
+    if (offset > max_ofs) offset = max_ofs;
+    int tmp = last;
+    last = hint - offset;
+    offset = hint - tmp;
+  } else {
+    int max_ofs = length - hint;
+    while (offset < max_ofs){
+      order = sort_compare(st, SORT_KEY(), sort_at(arr, base + hint + offset));
+      if (order < 0) break;
+      last = offset;
+      offset = sort_next_offset(offset, max_ofs);
+    }
+    if (offset > max_ofs) offset = max_ofs;
+    last += hint;
+    offset += hint;
+  }
+  last++;
+  while (last < offset){
+    int m = last + ((offset - last) >> 1);
+    if (sort_compare(st, SORT_KEY(), sort_at(arr, base + m)) < 0) offset = m;
+    else last = m + 1;
+  }
+  return offset;
+#undef SORT_KEY
+}
+static void sort_temp_space(sort_state* st, int need){
+  if ((uint32_t)need <= st->temp_cap) return;
+  st->temp = ts_new_array((uint32_t)need);
+  st->temp_cap = (uint32_t)need;
+}
+/* run A [base_a, base_a + length_a) has the shorter length, its last element ends the merge */
+static void sort_merge_low(sort_state* st, int base_a, int length_a, int base_b, int length_b){
+  sort_temp_space(st, length_a);
+  tsv* work = &st->work; tsv* temp = &st->temp;
+  sort_copy(work, base_a, temp, 0, length_a);
+  int dest = base_a, cursor_temp = 0, cursor_b = base_b;
+  sort_put(work, dest++, sort_at(work, cursor_b++));
+  if (--length_b == 0) goto succeed;
+  if (length_a == 1) goto copy_b;
+  int min_gallop = st->min_gallop;
+  for (;;){
+    int wins_a = 0, wins_b = 0;
+    for (;;){
+      if (sort_compare(st, sort_at(work, cursor_b), sort_at(temp, cursor_temp)) < 0){
+        sort_put(work, dest++, sort_at(work, cursor_b++));
+        wins_b++; length_b--; wins_a = 0;
+        if (length_b == 0) goto succeed;
+        if (wins_b >= min_gallop) break;
+      } else {
+        sort_put(work, dest++, sort_at(temp, cursor_temp++));
+        wins_a++; length_a--; wins_b = 0;
+        if (length_a == 1) goto copy_b;
+        if (wins_a >= min_gallop) break;
+      }
+    }
+    min_gallop++;
+    int first = 1;
+    while (wins_a >= SORT_MIN_GALLOP_WINS || wins_b >= SORT_MIN_GALLOP_WINS || first){
+      first = 0;
+      min_gallop = min_gallop - 1 > 1 ? min_gallop - 1 : 1;
+      st->min_gallop = min_gallop;
+      wins_a = sort_gallop_right(st, temp, work, cursor_b, cursor_temp, length_a, 0);
+      if (wins_a > 0){
+        sort_copy(temp, cursor_temp, work, dest, wins_a);
+        dest += wins_a; cursor_temp += wins_a; length_a -= wins_a;
+        if (length_a == 1) goto copy_b;
+        /* impossible for a consistent comparator */
+        if (length_a == 0) goto succeed;
+      }
+      sort_put(work, dest++, sort_at(work, cursor_b++));
+      if (--length_b == 0) goto succeed;
+      wins_b = sort_gallop_left(st, work, temp, cursor_temp, cursor_b, length_b, 0);
+      if (wins_b > 0){
+        sort_copy(work, cursor_b, work, dest, wins_b);
+        dest += wins_b; cursor_b += wins_b; length_b -= wins_b;
+        if (length_b == 0) goto succeed;
+      }
+      sort_put(work, dest++, sort_at(temp, cursor_temp++));
+      if (--length_a == 1) goto copy_b;
+    }
+    min_gallop++;
+    st->min_gallop = min_gallop;
+  }
+succeed:
+  if (length_a > 0) sort_copy(temp, cursor_temp, work, dest, length_a);
+  return;
+copy_b:
+  sort_copy(work, cursor_b, work, dest, length_b);
+  sort_put(work, dest + length_b, sort_at(temp, cursor_temp));
+}
+/* the mirror: run B is the shorter, the first element of A starts the merge; it works backwards */
+static void sort_merge_high(sort_state* st, int base_a, int length_a, int base_b, int length_b){
+  sort_temp_space(st, length_b);
+  tsv* work = &st->work; tsv* temp = &st->temp;
+  sort_copy(work, base_b, temp, 0, length_b);
+  int dest = base_b + length_b - 1, cursor_temp = length_b - 1, cursor_a = base_a + length_a - 1;
+  sort_put(work, dest--, sort_at(work, cursor_a--));
+  if (--length_a == 0) goto succeed;
+  if (length_b == 1) goto copy_a;
+  int min_gallop = st->min_gallop;
+  for (;;){
+    int wins_a = 0, wins_b = 0;
+    for (;;){
+      if (sort_compare(st, sort_at(temp, cursor_temp), sort_at(work, cursor_a)) < 0){
+        sort_put(work, dest--, sort_at(work, cursor_a--));
+        wins_a++; length_a--; wins_b = 0;
+        if (length_a == 0) goto succeed;
+        if (wins_a >= min_gallop) break;
+      } else {
+        sort_put(work, dest--, sort_at(temp, cursor_temp--));
+        wins_b++; length_b--; wins_a = 0;
+        if (length_b == 1) goto copy_a;
+        if (wins_b >= min_gallop) break;
+      }
+    }
+    min_gallop++;
+    int first = 1;
+    while (wins_a >= SORT_MIN_GALLOP_WINS || wins_b >= SORT_MIN_GALLOP_WINS || first){
+      first = 0;
+      min_gallop = min_gallop - 1 > 1 ? min_gallop - 1 : 1;
+      st->min_gallop = min_gallop;
+      int k = sort_gallop_right(st, work, temp, cursor_temp, base_a, length_a, length_a - 1);
+      wins_a = length_a - k;
+      if (wins_a > 0){
+        dest -= wins_a; cursor_a -= wins_a;
+        sort_copy(work, cursor_a + 1, work, dest + 1, wins_a);
+        length_a -= wins_a;
+        if (length_a == 0) goto succeed;
+      }
+      sort_put(work, dest--, sort_at(temp, cursor_temp--));
+      if (--length_b == 1) goto copy_a;
+      k = sort_gallop_left(st, temp, work, cursor_a, 0, length_b, length_b - 1);
+      wins_b = length_b - k;
+      if (wins_b > 0){
+        dest -= wins_b; cursor_temp -= wins_b;
+        sort_copy(temp, cursor_temp + 1, work, dest + 1, wins_b);
+        length_b -= wins_b;
+        if (length_b == 1) goto copy_a;
+        /* impossible for a consistent comparator */
+        if (length_b == 0) goto succeed;
+      }
+      sort_put(work, dest--, sort_at(work, cursor_a--));
+      if (--length_a == 0) goto succeed;
+    }
+    min_gallop++;
+    st->min_gallop = min_gallop;
+  }
+succeed:
+  if (length_b > 0) sort_copy(temp, 0, work, dest - (length_b - 1), length_b);
+  return;
+copy_a:
+  dest -= length_a; cursor_a -= length_a;
+  sort_copy(work, cursor_a + 1, work, dest + 1, length_a);
+  sort_put(work, dest, sort_at(temp, cursor_temp));
+}
+/* Merges the runs at stack indices i and i + 1. */
+static void sort_merge_at(sort_state* st, int i){
+  int base_a = st->run_base[i], length_a = st->run_len[i];
+  int base_b = st->run_base[i + 1], length_b = st->run_len[i + 1];
+  st->run_len[i] = length_a + length_b;
+  if (i == st->pending - 3){
+    st->run_base[i + 1] = st->run_base[i + 2];
+    st->run_len[i + 1] = st->run_len[i + 2];
+  }
+  st->pending--;
+  /* where b starts in a: what stands before it is in place */
+  int k = sort_gallop_right(st, &st->work, &st->work, base_b, base_a, length_a, 0);
+  base_a += k;
+  length_a -= k;
+  if (length_a == 0) return;
+  /* where a ends in b: what stands after it is in place */
+  length_b = sort_gallop_left(st, &st->work, &st->work, base_a + length_a - 1, base_b, length_b, length_b - 1);
+  if (length_b == 0) return;
+  if (length_a <= length_b) sort_merge_low(st, base_a, length_a, base_b, length_b);
+  else sort_merge_high(st, base_a, length_a, base_b, length_b);
+}
+/* run_length(n - 2) > run_length(n - 1) + run_length(n) */
+static int sort_invariant(const sort_state* st, int n){
+  return n < 2 || st->run_len[n - 2] > st->run_len[n - 1] + st->run_len[n];
+}
+static void sort_merge_collapse(sort_state* st){
+  while (st->pending > 1){
+    int n = st->pending - 2;
+    if (!sort_invariant(st, n + 1) || !sort_invariant(st, n)){
+      if (st->run_len[n - 1] < st->run_len[n + 1]) n--;
+      sort_merge_at(st, n);
+    } else if (st->run_len[n] <= st->run_len[n + 1]) sort_merge_at(st, n);
+    else break;
+  }
+}
+static void sort_merge_force_collapse(sort_state* st){
+  while (st->pending > 1){
+    int n = st->pending - 2;
+    if (n > 0 && st->run_len[n - 1] < st->run_len[n + 1]) n--;
+    sort_merge_at(st, n);
+  }
+}
+static void sort_tim(sort_state* st, int length){
+  if (length < 2) return;
+  /* V8 14: a short array does not look for runs (measured: 4 comparisons for 4 sorted elements, 7 for 8) */
+  if (length < 8){ sort_binary_insertion(st, 0, 0, length); return; }
+  int n = length, r = 0;
+  while (n >= 64){ r |= n & 1; n >>= 1; }
+  int min_run = n + r;
+  int low = 0, remaining = length;
+  while (remaining != 0){
+    int current = sort_count_run(st, low, low + remaining);
+    if (current < min_run){
+      int forced = min_run < remaining ? min_run : remaining;
+      sort_binary_insertion(st, low, low + current, low + forced);
+      current = forced;
+    }
+    st->run_base[st->pending] = low;
+    st->run_len[st->pending] = current;
+    st->pending++;
+    sort_merge_collapse(st);
+    low += current;
+    remaining -= current;
+  }
+  sort_merge_force_collapse(st);
+}
+static tsv arrlike_sort(tsv recv, tsv cb);
+static void arrlike_put(tsv recv, double i, tsv v);
+static void arrlike_del(tsv recv, double i);
+static void array_sort_comparator(tsv cb){
+  char m[200];
+  int at = snprintf(m, sizeof m, "The comparison function must be either a function or undefined: ");
+  if (ts_is_indexed_array_fast(cb)) snprintf(m + at, sizeof m - (size_t)at, "[object Array]");
+  else if (ts_is_obj(cb) && !ts_is_prim_cell(cb)) snprintf(m + at, sizeof m - (size_t)at, "#<%s>", ts_obj_ctor_name_for_message(cb));
+  else {
+    ts_strview v = ts_str_view_typed(ts_is_symbol(cb) ? ts_symbol_tostring(cb) : ts_to_string_v(cb));
+    for (uint32_t i = 0; i < v.len && at < (int)sizeof m - 1; i++) m[at++] = (char)ts_str_cu_at_view(v, i);
+    m[at] = 0;
+  }
+  ts_throw_type_error_msg(m);
+}
+static tsv array_sort_dense(tsv arr, tsv cb){
+  ts_array* a = as_arr(arr);
+  uint32_t len = a->len;
+  if (len < 2) return arr;
+  sort_state st;
+  st.temp = st.work = TS_UNDEFINED; st.cmp = cb; st.temp_cap = 0; st.pending = 0; st.min_gallop = SORT_MIN_GALLOP_WINS;
+  ts_gc_root(&arr); ts_gc_root(&st.work); ts_gc_root(&st.temp); ts_gc_root(&st.cmp);
+  st.work = ts_new_array(len);
+  a = as_arr(arr);
+  /* the elements that are compared: undefineds go after them, the holes last */
+  int n = 0;
+  uint32_t undefineds = 0;
+  for (uint32_t i = 0; i < len; i++){
+    tsv v = a->data[i];
+    if (array_is_hole(v)) continue;
+    if (v == TS_UNDEFINED){ undefineds++; continue; }
+    sort_put(&st.work, n++, v);
+  }
+  sort_tim(&st, n);
+  /* CopyWorkArrayToReceiver: the comparator may have changed the array in any way */
+  a = as_arr(arr);
+  if (a && a->len >= len && !ts_arr_frozen(arr)){
+    array_invalidate_dirty(a);
+    for (int i = 0; i < n; i++){
+      tsv v = sort_at(&st.work, i);
+      a->data[i] = v;
+      array_write_barrier(a, (uint32_t)i, v);
+    }
+    uint32_t at = (uint32_t)n;
+    for (uint32_t i = 0; i < undefineds; i++) a->data[at++] = TS_UNDEFINED;
+    while (at < len) a->data[at++] = TS_ARRAY_HOLE;
+  } else {
+    uint32_t at = 0;
+    for (int i = 0; i < n; i++) arrlike_put(arr, (double)at++, sort_at(&st.work, i));
+    for (uint32_t i = 0; i < undefineds; i++) arrlike_put(arr, (double)at++, TS_UNDEFINED);
+    while (at < len) arrlike_del(arr, (double)at++);
+  }
+  ts_gc_unroot(4);
   return arr;
+}
+tsv ts_array_sort(tsv arr, tsv cb){
+  if (TS_RT_UNLIKELY(!ts_is_undef(cb) && !ts_is_callable(cb))) array_sort_comparator(cb);
+  ts_array* a = as_arr(arr);
+  if (!a){
+    if (TS_ARRAY_PROXY(arr)) return ts_method_dynamic(arr, "sort", &cb, cb == TS_UNDEFINED ? 0 : 1);
+    return ts_is_indexed_array_fast(arr) ? arrlike_sort(arr, cb) : arr;   /* a dictionary array */
+  }
+  if (TS_RT_UNLIKELY(g_proto_elements)) return arrlike_sort(arr, cb);   /* a hole reads through the chain */
+  return array_sort_dense(arr, cb);
 }
 
 /* ES2023 change-by-copy methods read every index with Get and create a data
@@ -16290,6 +16709,7 @@ tsv ts_get_own_property_descriptor(tsv obj, tsv keyv){
     if (!kind_has_common_header(o->h.kind)) return TS_UNDEFINED;
   }
   ts_gc_root(&obj);
+  if (TS_RT_UNLIKELY(ts_object_like(keyv))) keyv = ts_property_key_value(keyv);
   ts_key key;
   int ok = ts_key_from_value(keyv, &key);
   if (!ok){ ts_gc_unroot(1); return TS_UNDEFINED; }
@@ -16850,6 +17270,7 @@ int ts_has_own_dyn(tsv obj, tsv keyv){
      miscompile. */
   if (ts_is_null(obj) || ts_is_undef(obj)) { ts_throw_type_error_msg("Cannot convert undefined or null to object"); return 0; }
   ts_gc_root(&obj);
+  if (TS_RT_UNLIKELY(ts_object_like(keyv))) keyv = ts_property_key_value(keyv);
   ts_key key;
   int ok = ts_key_from_value(keyv, &key);
   int r = ok ? ts_has_own(obj, key) : 0;
@@ -17095,9 +17516,10 @@ static void arrlike_write_back(tsv recv, tsv arr){
   ts_gc_unroot(2);
 }
 static tsv arrlike_sort(tsv recv, tsv cb){
+  if (!ts_is_undef(cb) && !ts_is_callable(cb)) array_sort_comparator(cb);
   ts_gc_root(&recv); ts_gc_root(&cb);
   tsv copy = arrlike_snapshot(recv, arrlike_len(recv)); ts_gc_root(&copy);
-  ts_array_sort(copy, cb);
+  array_sort_dense(copy, cb);
   arrlike_write_back(recv, copy);
   ts_gc_unroot(3);
   return recv;
@@ -17176,9 +17598,11 @@ tsv ts_arrproto_toString(tsv* a, int n){
   }
   return ts_array_join(ARR_THIS(a, "toString"), ts_new_string(",",1));
 }
-tsv ts_arrproto_indexOf(tsv* a, int n){ return ts_num(ts_array_indexof(ARR_THIS(a, "indexOf"), n>1?a[1]:TS_UNDEFINED, n>2?ts_number_coerce(a[2]):0, n>2)); }
-tsv ts_arrproto_includes(tsv* a, int n){ return ts_bool(ts_array_includes(ARR_THIS(a, "includes"), n>1?a[1]:TS_UNDEFINED, n>2?ts_number_coerce(a[2]):0, n>2)); }
-tsv ts_arrproto_lastIndexOf(tsv* a, int n){ return ts_num(ts_array_lastindexof(ARR_THIS(a, "lastIndexOf"), n>1?a[1]:TS_UNDEFINED, n>2?ts_number_coerce(a[2]):0, n>2)); }
+/* the specification answers an empty array before it converts fromIndex */
+static int arrproto_empty(tsv recv){ ts_array* x = as_arr(recv); return x && x->len == 0; }
+tsv ts_arrproto_indexOf(tsv* a, int n){ tsv r = ARR_THIS(a, "indexOf"); if (n > 2 && arrproto_empty(r)) return ts_num(-1); return ts_num(ts_array_indexof(r, n>1?a[1]:TS_UNDEFINED, n>2?ts_number_coerce(a[2]):0, n>2)); }
+tsv ts_arrproto_includes(tsv* a, int n){ tsv r = ARR_THIS(a, "includes"); if (n > 2 && arrproto_empty(r)) return ts_bool(0); return ts_bool(ts_array_includes(r, n>1?a[1]:TS_UNDEFINED, n>2?ts_number_coerce(a[2]):0, n>2)); }
+tsv ts_arrproto_lastIndexOf(tsv* a, int n){ tsv r = ARR_THIS(a, "lastIndexOf"); if (n > 2 && arrproto_empty(r)) return ts_num(-1); return ts_num(ts_array_lastindexof(r, n>1?a[1]:TS_UNDEFINED, n>2?ts_number_coerce(a[2]):0, n>2)); }
 tsv ts_arrproto_slice(tsv* a, int n){ return ts_array_slice_method(ARR_THIS(a, "slice"), n>1?ts_number_coerce(a[1]):0, n>2?ts_number_coerce(a[2]):0, n>2 && !ts_is_undef(a[2])); }
 tsv ts_arrproto_concat(tsv* a, int n){
   /* variadic: fold each arg through the 2-arg concat; no args -> shallow copy. */
@@ -18084,6 +18508,16 @@ static tsv ta_m_with(tsv* a, int n){
   double index = d < 0 ? len + d : d;
   tsv v = ta_coerce(ta_ptr(t)->elem, n > 2 ? a[2] : TS_UNDEFINED); ts_gc_root(&v);
   if (!(index >= 0 && index < (double)ta_ptr(t)->length)) ts_throw_range_error_msg("Invalid typed array index");
+  if ((double)ta_ptr(t)->length < len){
+    /* a conversion shrank the buffer: the elements gone read undefined, which is NaN or a BigInt's TypeError */
+    tsv r = ta_new_length(ta_ptr(t)->elem, (uint32_t)len); ts_gc_root(&r);
+    for (uint32_t k = 0; k < (uint32_t)len; k++){
+      tsv e = k == (uint32_t)index ? v : k < ta_ptr(t)->length ? ts_ta_get(t, k) : ta_coerce(ta_ptr(t)->elem, TS_UNDEFINED);
+      ta_put(ta_ptr(r), k, e);
+    }
+    ts_gc_unroot(3);
+    return r;
+  }
   tsv r = ta_copy_of(t);
   ta_put(ta_ptr(r), (uint32_t)index, v);
   ts_gc_unroot(2);
@@ -19602,9 +20036,29 @@ tsv ts_bound_thunk(tsv* args, int n){
   return invoke_with_this(target, thisArg, (nrest>0)?(args+2):NULL, nrest);
 }
 /* fn.bind(thisArg, partial...) -> a new function with this and leading args fixed. */
+/* SetFunctionLength and SetFunctionName of a bound function, when the target's are not its metadata (a definition,
+   a Proxy, a static `name`). The others are read when asked for (fn_virtual_value): no string for a bind nobody names. */
+static void bound_define_meta(tsv* bound, tsv* target, int npart){
+  fn_keys_init();
+  double len = 0;
+  tsv d = ts_get_own_property_descriptor(*target, ts_new_string("length", 6));
+  if (ts_object_like(d)){
+    tsv v = ts_get(*target, g_fn_key_length);
+    if (ts_is_num(v)){
+      double t = ts_to_num(v);
+      t = t != t ? 0 : trunc(t);
+      len = t == -INFINITY ? 0 : t - npart > 0 ? t - npart : 0;
+    }
+  }
+  fn_define_virtual(*bound, g_fn_key_length, ts_num(len));
+  tsv name = ts_get(*target, g_fn_key_name);
+  tsv prefix = ts_new_string("bound ", 6);
+  fn_define_virtual(*bound, g_fn_key_name, ts_is_str(name) ? ts_str_concat(prefix, name) : prefix);
+}
 tsv ts_funcproto_bind(tsv* args, int n){
   tsv fn = (n>0)?args[0]:TS_UNDEFINED;
   tsv thisArg = (n>1)?args[1]:TS_UNDEFINED;
+  if (TS_RT_UNLIKELY(!ts_is_callable(fn))) ts_throw_type_error_msg("Bind must be called on a function");
   if (!g_typed_slow) typed_slow_check_borrow(fn, thisArg);
   int npart = (n>2)?(n-2):0;
   uint32_t envlen = 2 + (uint32_t)npart;   /* [target, thisArg, partial...] */
@@ -19616,6 +20070,15 @@ tsv ts_funcproto_bind(tsv* args, int n){
   if (env != stackbuf) free(env);           /* ts_make_fn copies env */
   /* the bound function itself does NOT take a separate `this` (its this is fixed),
      so a further .call on it won't re-inject — takes_this stays 0. */
+  fn_keys_init();
+  if (ts_is_func(fn) && fn_virtual((ts_func*)ts_ptr(fn), g_fn_key_name) && fn_virtual((ts_func*)ts_ptr(fn), g_fn_key_length)){
+    uint32_t arity = ((ts_func*)ts_ptr(fn))->arity;
+    ((ts_func*)ts_ptr(bound))->arity = (uint16_t)(arity > (uint32_t)npart ? arity - (uint32_t)npart : 0);
+  } else {
+    ts_gc_root(&bound); ts_gc_root(&fn);
+    bound_define_meta(&bound, &fn, npart);
+    ts_gc_unroot(2);
+  }
   return bound;
 }
 
@@ -21652,6 +22115,23 @@ tsv ts_reflect_get_proto(tsv t){ reflect_require(t, "getPrototypeOf"); return ts
 tsv ts_reflect_own_desc(tsv t, tsv k){ reflect_require(t, "getOwnPropertyDescriptor"); return ts_get_own_property_descriptor(t, k); }
 tsv ts_reflect_is_extensible(tsv t){ reflect_require(t, "isExtensible"); return ts_object_is_extensible(t); }
 static int ordinary_set_recv(tsv t, ts_key key, tsv v, tsv r);
+static int pd_has(tsv d, const char* nm);
+static int pd_bool(tsv d, const char* nm);
+static int reflect_set_refused(tsv t, tsv k){
+  uint32_t idx;
+  ts_key key;
+  if (ts_is_typed_array(t) && ts_key_from_value(k, &key) && ta_numeric_key(key, &idx)) return 0;
+  for (tsv o = t; ts_object_like(o); o = ts_get_proto(o)){
+    if (g_has_proxies && ts_is_proxy(o)) return 0;
+    ts_gc_root(&o);
+    tsv d = ts_get_own_property_descriptor(o, k);
+    ts_gc_unroot(1);
+    if (ts_is_undef(d)) continue;
+    if (pd_has(d, "value")) return !pd_bool(d, "writable");
+    return ts_is_undef(ts_get(d, ts_intern_field("set", 3)));
+  }
+  return !ts_truthy(ts_object_is_extensible(t));
+}
 tsv ts_reflect_set(tsv t, tsv k, tsv v){
   reflect_require(t, "set");
   if (g_has_proxies && ts_is_proxy(t)) return ts_bool(ts_proxy_set_v(t, k, v, t));
@@ -21662,6 +22142,11 @@ tsv ts_reflect_set(tsv t, tsv k, tsv v){
     ts_gc_unroot(2);
     return ts_bool(ok);
   }
+  /* the kinds with a store of their own: OrdinarySet's refusals, asked of the descriptors */
+  ts_gc_root(&t); ts_gc_root(&k); ts_gc_root(&v);
+  int refused = reflect_set_refused(t, k);
+  ts_gc_unroot(3);
+  if (refused) return ts_bool(0);
   ts_set_dyn(t, k, v);
   return ts_bool(1);
 }
@@ -21835,7 +22320,12 @@ tsv ts_reflect_set_proto(tsv t, tsv p){
 }
 /* false (not a TypeError) when the property cannot be defined as described */
 tsv ts_reflect_define_property(tsv t, tsv k, tsv d){ return ts_bool(define_property_from(t, k, d, 0)); }
-tsv ts_reflect_prevent_extensions(tsv t){ reflect_require(t, "preventExtensions"); ts_object_prevent_extensions(t); return ts_bool(1); }
+tsv ts_reflect_prevent_extensions(tsv t){
+  reflect_require(t, "preventExtensions");
+  if (g_has_proxies && ts_is_proxy(t)) return ts_bool(proxy_prevent_answer(t));
+  ts_object_prevent_extensions(t);
+  return ts_bool(1);
+}
 /* Reflect.ownKeys: all own string keys (incl. non-enumerable, in spec order)
    followed by all own symbol keys. */
 tsv ts_reflect_own_keys(tsv t){
@@ -21852,6 +22342,8 @@ tsv ts_reflect_own_keys(tsv t){
 }
 /* Reflect.apply(fn, thisArg, argsArray) — identical to fn.apply's marshalling. */
 tsv ts_reflect_apply(tsv fn, tsv thisArg, tsv argsArray){
+  if (!ts_is_callable(fn)) ts_throw_type_error_msg("Function.prototype.apply was called on a value that is not a function");
+  if (!ts_object_like(argsArray) || ts_is_prim_cell(argsArray)) ts_throw_type_error_msg("CreateListFromArrayLike called on non-object");
   tsv a[3] = { fn, thisArg, argsArray };
   return ts_funcproto_apply(a, 3);
 }
@@ -22268,7 +22760,7 @@ static tsv ts_proxy_get_proto(tsv pv){
   ts_gc_root(&trap);
   tsv argv[1] = { target };
   tsv r = invoke_with_this(trap, handler, argv, 1);
-  if (!ts_is_obj(r) && !ts_is_null(r))
+  if ((!ts_object_like(r) || ts_is_prim_cell(r)) && !ts_is_null(r))
     ts_throw_type_error("'getPrototypeOf' on proxy: trap returned neither object nor null");
   if (!ts_truthy(ts_object_is_extensible(target))){
     ts_gc_root(&r);
@@ -22407,19 +22899,30 @@ static int ts_proxy_is_extensible(tsv pv){
   ts_gc_unroot(4);
   return r;
 }
-static void ts_proxy_prevent_extensions(tsv pv){
+/* [[PreventExtensions]] of a Proxy: its answer. */
+static int proxy_prevent_answer(tsv pv){
   ts_gc_root(&pv);
   ts_proxy* px = ts_ptr(pv);
   tsv target = px->target, handler = px->handler;
   ts_gc_root(&target); ts_gc_root(&handler);
   tsv trap = ts_proxy_trap(pv, handler, "preventExtensions");
-  if (ts_is_undef(trap)){ ts_object_prevent_extensions(target); ts_gc_unroot(3); return; }
+  if (ts_is_undef(trap)){
+    int a = 1;
+    if (ts_is_proxy(target)) a = proxy_prevent_answer(target);
+    else ts_object_prevent_extensions(target);
+    ts_gc_unroot(3);
+    return a;
+  }
   ts_gc_root(&trap);
   tsv argv[1] = { target };
   int r = ts_truthy(invoke_with_this(trap, handler, argv, 1));
   if (r && ts_truthy(ts_object_is_extensible(target)))
     ts_throw_type_error("'preventExtensions' on proxy: trap returned true but target is still extensible");
   ts_gc_unroot(4);
+  return r;
+}
+static void ts_proxy_prevent_extensions(tsv pv){
+  if (!proxy_prevent_answer(pv)) ts_throw_type_error("'preventExtensions' on proxy: trap returned falsish");
 }
 /* === getOwnPropertyDescriptor === */
 static tsv ts_proxy_get_own_desc(tsv pv, tsv keyv){
@@ -22598,17 +23101,27 @@ static tsv ts_proxy_construct(tsv pv, tsv* args, int nargs){
   ts_proxy* px = ts_ptr(pv);
   tsv target = px->target, handler = px->handler;
   ts_gc_root(&target); ts_gc_root(&handler);
+  /* newTarget: what Reflect.construct gave, or the proxy `new` was applied to */
+  tsv new_target = ts_is_undef(g_construct_target) ? pv : g_construct_target;
+  g_construct_target = TS_UNDEFINED;
+  ts_gc_root(&new_target);
   tsv trap = ts_proxy_trap(pv, handler, "construct");
-  if (ts_is_undef(trap)){ tsv r = ts_construct(target, args, nargs); ts_gc_unroot(3); return r; }
+  if (ts_is_undef(trap)){
+    g_construct_target = new_target;
+    tsv r = ts_construct(target, args, nargs);
+    g_construct_target = TS_UNDEFINED;
+    ts_gc_unroot(4);
+    return r;
+  }
   ts_gc_root(&trap);
   tsv arglist = ts_new_array((uint32_t)(nargs>0?nargs:0));
   ts_gc_root(&arglist);
   for (int i=0;i<nargs;i++) ts_array_set(arglist, (uint32_t)i, args[i]);
-  tsv argv[3] = { target, arglist, pv /* newTarget = the proxy */ };
+  tsv argv[3] = { target, arglist, new_target };
   tsv r = invoke_with_this(trap, handler, argv, 3);
   if ((!ts_is_obj(r) && !ts_is_func(r)) || ts_is_prim_cell(r))
     ts_throw_type_error("'construct' on proxy: trap returned a non-object");
-  ts_gc_unroot(5);
+  ts_gc_unroot(6);
   return r;
 }
 /* === ownKeys (array) and enumeration === */
@@ -23296,6 +23809,17 @@ static tsv promise_resolution_type_error(const char* msg){
   return err;
 }
 
+/* A promise whose `then` is the runtime's own, known without running anything: adopted directly. Any other is a
+   thenable like any other: an own `then`, a subclass's, a replaced Promise.prototype.then. */
+tsv ts_promiseproto_then(tsv* a, int n);
+static int promise_then_is_native(tsv v){
+  static ts_key k = 0xFFFFFFFFu;
+  if (k == 0xFFFFFFFFu) k = ts_intern_field("then", 4);
+  ts_object* o = (ts_object*)ts_ptr(v);
+  if (o->proto != g_promise_proto_v || find_slot(o, k, 0)) return 0;
+  tsv* s = find_slot((ts_object*)ts_ptr(g_promise_proto_v), k, 0);
+  return s && ts_is_func(*s) && ((ts_func*)ts_ptr(*s))->code == (void*)ts_promiseproto_then;
+}
 void ts_promise_resolve_v(tsv pv, tsv v){
   if (!ts_promise_ptr(pv) || !promise_pending_v(pv)) return;
   if (ts_strict_eq(pv,v)){
@@ -23305,7 +23829,7 @@ void ts_promise_resolve_v(tsv pv, tsv v){
     ts_gc_unroot(1);
     return;
   }
-  if (ts_is_promise(v)){
+  if (ts_is_promise(v) && promise_then_is_native(v)){
     /* Promise Resolve Functions enqueue a job even for a native inner promise.
        The first adapter turn registers on `v`; its second turn forwards the
        eventual state. This preserves ordering when the inner settles between
