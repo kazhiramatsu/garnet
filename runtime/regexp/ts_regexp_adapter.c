@@ -999,6 +999,7 @@ static const ts_regexp_hooks g_hooks = {
   ts_regexp_adapter_object_search_tsv,
   construct_from_string,
   release_program,
+  ts_regexp_escape_tsv,
 };
 void ts_regexp_adapter_init(void){
   static int done = 0;

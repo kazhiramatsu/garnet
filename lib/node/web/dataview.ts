@@ -53,31 +53,31 @@ export class DataView {
   }
   getInt8(byteOffset: number): number { const i = this.#at(byteOffset, 1); const b = this.#bytes[i]; return b >= 128 ? b - 256 : b; }
   getUint8(byteOffset: number): number { const i = this.#at(byteOffset, 1); return this.#bytes[i]; }
-  getInt16(byteOffset: number, littleEndian?: boolean): number { const v = this.getUint16(byteOffset, littleEndian); return v >= 0x8000 ? v - 0x10000 : v; }
-  getUint16(byteOffset: number, littleEndian?: boolean): number {
+  getInt16(byteOffset: number, littleEndian: any = undefined): number { const v = this.getUint16(byteOffset, littleEndian); return v >= 0x8000 ? v - 0x10000 : v; }
+  getUint16(byteOffset: number, littleEndian: any = undefined): number {
     const i = this.#at(byteOffset, 2); const b = this.#bytes;
     return littleEndian ? b[i] | (b[i + 1] << 8) : (b[i] << 8) | b[i + 1];
   }
-  getInt32(byteOffset: number, littleEndian?: boolean): number { return this.getUint32(byteOffset, littleEndian) | 0; }
-  getUint32(byteOffset: number, littleEndian?: boolean): number {
+  getInt32(byteOffset: number, littleEndian: any = undefined): number { return this.getUint32(byteOffset, littleEndian) | 0; }
+  getUint32(byteOffset: number, littleEndian: any = undefined): number {
     const i = this.#at(byteOffset, 4); const b = this.#bytes;
     return littleEndian
       ? (b[i] + b[i + 1] * 0x100 + b[i + 2] * 0x10000 + b[i + 3] * 0x1000000)
       : (b[i] * 0x1000000 + b[i + 1] * 0x10000 + b[i + 2] * 0x100 + b[i + 3]);
   }
-  getFloat16(byteOffset: number, littleEndian?: boolean): number {
+  getFloat16(byteOffset: number, littleEndian: any = undefined): number {
     const i = this.#at(byteOffset, 2);
-    this.#load(i, 2, littleEndian === true);
+    this.#load(i, 2, !!littleEndian);
     return scratchF16()[0];
   }
-  getFloat32(byteOffset: number, littleEndian?: boolean): number {
+  getFloat32(byteOffset: number, littleEndian: any = undefined): number {
     const i = this.#at(byteOffset, 4);
-    this.#load(i, 4, littleEndian === true);
+    this.#load(i, 4, !!littleEndian);
     return scratchF32[0];
   }
-  getFloat64(byteOffset: number, littleEndian?: boolean): number {
+  getFloat64(byteOffset: number, littleEndian: any = undefined): number {
     const i = this.#at(byteOffset, 8);
-    this.#load(i, 8, littleEndian === true);
+    this.#load(i, 8, !!littleEndian);
     return scratchF64[0];
   }
   #big(byteOffset: unknown, littleEndian: boolean | undefined): Uint8Array {
@@ -86,40 +86,40 @@ export class DataView {
     for (let k = 0; k < 8; k++) t[k] = this.#bytes[littleEndian ? i + k : i + 7 - k];
     return t;
   }
-  getBigInt64(byteOffset: number, littleEndian?: boolean): bigint { return new BigInt64Array(this.#big(byteOffset, littleEndian).buffer)[0]; }
-  getBigUint64(byteOffset: number, littleEndian?: boolean): bigint { return new BigUint64Array(this.#big(byteOffset, littleEndian).buffer)[0]; }
+  getBigInt64(byteOffset: number, littleEndian: any = undefined): bigint { return new BigInt64Array(this.#big(byteOffset, littleEndian).buffer)[0]; }
+  getBigUint64(byteOffset: number, littleEndian: any = undefined): bigint { return new BigUint64Array(this.#big(byteOffset, littleEndian).buffer)[0]; }
   setInt8(byteOffset: number, value: number): void { const i = this.#at(byteOffset, 1); this.#bytes[i] = (Number(value) | 0) & 0xff; }
   setUint8(byteOffset: number, value: number): void { const i = this.#at(byteOffset, 1); this.#bytes[i] = (Number(value) | 0) & 0xff; }
-  setInt16(byteOffset: number, value: number, littleEndian?: boolean): void { this.setUint16(byteOffset, value, littleEndian); }
-  setUint16(byteOffset: number, value: number, littleEndian?: boolean): void {
+  setInt16(byteOffset: number, value: number, littleEndian: any = undefined): void { this.setUint16(byteOffset, value, littleEndian); }
+  setUint16(byteOffset: number, value: number, littleEndian: any = undefined): void {
     const i = this.#at(byteOffset, 2); const v = (Number(value) | 0) & 0xffff; const b = this.#bytes;
     if (littleEndian) { b[i] = v & 0xff; b[i + 1] = v >>> 8; } else { b[i] = v >>> 8; b[i + 1] = v & 0xff; }
   }
-  setInt32(byteOffset: number, value: number, littleEndian?: boolean): void { this.setUint32(byteOffset, value, littleEndian); }
-  setUint32(byteOffset: number, value: number, littleEndian?: boolean): void {
+  setInt32(byteOffset: number, value: number, littleEndian: any = undefined): void { this.setUint32(byteOffset, value, littleEndian); }
+  setUint32(byteOffset: number, value: number, littleEndian: any = undefined): void {
     const i = this.#at(byteOffset, 4); const v = (Number(value) | 0) >>> 0; const b = this.#bytes;
     if (littleEndian) { b[i] = v & 0xff; b[i + 1] = (v >>> 8) & 0xff; b[i + 2] = (v >>> 16) & 0xff; b[i + 3] = v >>> 24; }
     else { b[i] = v >>> 24; b[i + 1] = (v >>> 16) & 0xff; b[i + 2] = (v >>> 8) & 0xff; b[i + 3] = v & 0xff; }
   }
-  setFloat16(byteOffset: number, value: number, littleEndian?: boolean): void {
-    const i = this.#at(byteOffset, 2); scratchF16()[0] = Number(value); this.#store(i, 2, littleEndian === true);
+  setFloat16(byteOffset: number, value: number, littleEndian: any = undefined): void {
+    const i = this.#at(byteOffset, 2); scratchF16()[0] = Number(value); this.#store(i, 2, !!littleEndian);
   }
-  setFloat32(byteOffset: number, value: number, littleEndian?: boolean): void {
-    const i = this.#at(byteOffset, 4); scratchF32[0] = Number(value); this.#store(i, 4, littleEndian === true);
+  setFloat32(byteOffset: number, value: number, littleEndian: any = undefined): void {
+    const i = this.#at(byteOffset, 4); scratchF32[0] = Number(value); this.#store(i, 4, !!littleEndian);
   }
-  setFloat64(byteOffset: number, value: number, littleEndian?: boolean): void {
-    const i = this.#at(byteOffset, 8); scratchF64[0] = Number(value); this.#store(i, 8, littleEndian === true);
+  setFloat64(byteOffset: number, value: number, littleEndian: any = undefined): void {
+    const i = this.#at(byteOffset, 8); scratchF64[0] = Number(value); this.#store(i, 8, !!littleEndian);
   }
   #setBig(byteOffset: unknown, b: Uint8Array, littleEndian: boolean | undefined): void {
     const i = this.#at(byteOffset, 8);
     for (let k = 0; k < 8; k++) this.#bytes[littleEndian ? i + k : i + 7 - k] = b[k];
   }
-  setBigInt64(byteOffset: number, value: bigint, littleEndian?: boolean): void {
+  setBigInt64(byteOffset: number, value: bigint, littleEndian: any = undefined): void {
     const i = toIndex(byteOffset, "Offset");
     const b = new BigInt64Array(1); b[0] = value;
     this.#setBig(i, new Uint8Array(b.buffer), littleEndian);
   }
-  setBigUint64(byteOffset: number, value: bigint, littleEndian?: boolean): void {
+  setBigUint64(byteOffset: number, value: bigint, littleEndian: any = undefined): void {
     const i = toIndex(byteOffset, "Offset");
     const b = new BigUint64Array(1); b[0] = value;
     this.#setBig(i, new Uint8Array(b.buffer), littleEndian);

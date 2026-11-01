@@ -1701,6 +1701,7 @@ typedef struct ts_regexp_hooks {
   double (*search)(tsv s, tsv re);
   tsv (*from_string)(tsv pattern, tsv flags);
   void (*release)(rx_program* p);
+  tsv (*escape)(tsv v);
 } ts_regexp_hooks;
 void ts_regexp_hooks_install(const ts_regexp_hooks* h);
 /* register a static cell holding a tsv as a permanent root (idempotent through *rooted) */
@@ -2128,6 +2129,8 @@ tsv    ts_array_findlast(tsv arr, tsv cb);
 double ts_array_findlastindex(tsv arr, tsv cb);
 double ts_array_flat_depth(tsv depth);   /* undefined is 1, as an absent depth */
 tsv    ts_array_flat(tsv arr, double depth);
+double ts_array_touch_length(tsv arr);
+void   ts_iterator_close_quietly(tsv it);
 tsv    ts_array_slice_method(tsv arr, double start, double end, int has_end);   /* `arr.slice()`: ts_array_slice is also the runtime's own copy */
 tsv    ts_array_flatmap(tsv arr, tsv cb);
 tsv    ts_string_from_char_code(tsv* args, int n);

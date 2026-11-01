@@ -24678,6 +24678,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 "promise.then" => (format!("ts_promise_then({}, {}, {})", r, v(0), v(1)), false),
                 "promise.catch" => (format!("ts_promise_catch({}, {})", r, v(0)), false),
                 "promise.finally" => (format!("ts_promise_finally({}, {})", r, v(0)), false),
+                "array.push" | "array.unshift" if args.is_empty() => (format!("ts_array_touch_length({})", r), true),
                 "array.push" => {
                     // push(a, b, c, ...): append each arg, result is the new length
                     // (a raw double, since this arm is marked numeric). The array test is

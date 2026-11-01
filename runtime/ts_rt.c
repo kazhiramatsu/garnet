@@ -11375,9 +11375,7 @@ tsv ts_string_from_char_code(tsv* args, int n){
   uint16_t* units = (uint16_t*)malloc(sizeof(uint16_t) * (size_t)(n>0?n:1));
   uint32_t len = 0;
   for (int i=0;i<n;i++){
-    double d = ts_to_num(args[i]);
-    unsigned code = (d!=d) ? 0 : (unsigned)(long long)d;
-    units[len++] = (uint16_t)(code & 0xFFFFu);
+    units[len++] = (uint16_t)(ts_to_uint32(ts_number_coerce(args[i])) & 0xFFFFu);   /* ToUint16: a BigInt throws */
   }
   tsv s = ts_new_string_from_code_units(units, len);
   free(units);
@@ -11739,8 +11737,8 @@ void ts_setup_error_protos(void){
     ts_object* o = (ts_object*)ts_ptr(g_error_protos[i]);
     o->proto = (i == TS_ERR_ERROR) ? objproto : g_error_protos[TS_ERR_ERROR];
     const char* nm = TS_ERROR_NAMES[i];
-    ts_set(g_error_protos[i], ts_intern_field("name", 4), ts_new_string(nm, (uint32_t)strlen(nm)));
-    ts_set(g_error_protos[i], ts_intern_field("message", 7), ts_new_string("", 0));
+    ts_define_data(g_error_protos[i], ts_intern_field("name", 4), ts_new_string(nm, (uint32_t)strlen(nm)), 0, 1, 1);
+    ts_define_data(g_error_protos[i], ts_intern_field("message", 7), ts_new_string("", 0), 0, 1, 1);
   }
   // Error.prototype.toString (inherited by subtypes). Registered under the same
   // method key ToPrimitive consults; the global-object setup that triggers this
@@ -11835,6 +11833,7 @@ tsv ts_ctor_date(tsv* a, int n){
   ts_gc_unroot(1);
   return o;
 }
+static tsv regexp_escape_value(tsv* a, int n){ return g_regexp_hooks->escape(n > 0 ? a[0] : TS_UNDEFINED); }
 /* RegExp as a value: one function for the run, made where a program names it (the engine is linked then) */
 tsv ts_regexp_ctor_value(ts_code adapter){
   static tsv value = TS_UNDEFINED;
@@ -11846,6 +11845,11 @@ tsv ts_regexp_ctor_value(ts_code adapter){
   ts_fn_mark_native_ctor(value);
   ts_define_data(value, ts_intern_field("prototype", 9), ts_regexp_proto(), 0, 0, 0);
   ts_define_data(ts_regexp_proto(), ts_intern_field("constructor", 11), value, 0, 1, 1);
+  if (g_regexp_hooks && g_regexp_hooks->escape){
+    tsv f = ts_make_fn_t(regexp_escape_value, NULL, 0, 0);
+    ts_set_fn_meta(f, 1u, "escape");
+    ts_define_data(value, ts_intern_field("escape", 6), f, 0, 1, 1);
+  }
   return value;
 }
 /* The function values of Map, Set, WeakMap and WeakSet: `new` constructs, a plain call is a TypeError. */
@@ -12928,35 +12932,62 @@ tsv ts_object_assign(tsv* args, int n){
 
 /* Object.fromEntries(entries): build an object from an array of [key, value]
    pairs (each pair is a 2-element array). Non-string keys are coerced. */
-tsv ts_object_from_entries(tsv entries){
-  ts_gc_root(&entries);
-  tsv obj = ts_new_object();
-  ts_gc_root(&obj);
-  /* accept any iterable of [key,value] pairs: arrays pass through; Map/Set/
-     generator/etc. are materialized to an array of pairs first (push_all turns
-     a Map into [k,v] pairs). */
-  tsv arr = entries;
-  if (!ts_is_indexed_array_fast(entries)){ arr = ts_new_array(0); }
-  ts_gc_root(&arr);
-  if (arr != entries) ts_array_push_all(arr, entries);
-  uint32_t len = ts_array_len(arr);
-  for (uint32_t i=0;i<len;i++){
-    tsv pair = ts_array_get(arr, i);
-    if (!ts_is_indexed_array_fast(pair)) continue;
-    ts_gc_root(&pair);
-    tsv k = ts_array_get(pair, 0);
-    tsv v = ts_array_get(pair, 1);
-    ts_gc_root(&k); ts_gc_root(&v);
-    tsv ks = ts_to_string_v(k);
-  ts_gc_root(&ks);
-  if (ts_is_str(ks)){
-      uint32_t kid = ts_intern_string_value(ks);
-      ts_set(obj, kid, v);
-    }
-    ts_gc_unroot(4);
+static int array_own_iterator(tsv v);
+/* One entry of Object.fromEntries: anything that goes wrong here closes the iterator. */
+static int from_entries_add(tsv obj, tsv item, tsv* exc){
+  ts_handler* h = ts_eh_push();
+  if (ts_setjmp(h->buf) != 0){
+    ts_gc_set_root_depth(h->gc_root_len);
+    ts_frame_restore(h->frame_top);
+    ts_eh_pop();
+    *exc = ts_current_exception();
+    return 0;
   }
-  ts_gc_unroot(3);
-  return obj;
+  if ((!ts_is_obj(item) && !ts_is_func(item)) || ts_is_prim_cell(item)){
+    uint32_t len = 0; char* text = ts_string_utf8_copy(ts_to_string_v(item), &len);
+    char msg[160];
+    snprintf(msg, sizeof msg, "Iterator value %.*s is not an entry object", (int)(len > 100 ? 100 : len), text);
+    free(text);
+    ts_throw_type_error_msg(msg);
+  }
+  ts_gc_root(&obj); ts_gc_root(&item);
+  tsv k = ts_get_dyn(item, ts_num(0)); ts_gc_root(&k);
+  tsv v = ts_get_dyn(item, ts_num(1)); ts_gc_root(&v);
+  ts_key key;
+  if (ts_key_from_value(k, &key)) ts_define_data(obj, key, v, 1, 1, 1);
+  ts_gc_unroot(4);
+  ts_eh_pop();
+  return 1;
+}
+tsv ts_object_from_entries(tsv entries){
+  if (entries == TS_UNDEFINED || entries == TS_NULL) ts_throw_type_error_msg("undefined is not iterable");
+  ts_gc_root(&entries);
+  tsv obj = ts_new_object(); ts_gc_root(&obj);
+  tsv exc = TS_UNDEFINED; ts_gc_root(&exc);
+  if (ts_is_plain_array(entries) && !array_own_iterator(entries) && !g_array_iter_patched){
+    for (uint32_t i = 0; i < ts_array_len(entries); i++)
+      if (!from_entries_add(obj, ts_array_get(entries, i), &exc)) ts_throw(exc);
+    ts_gc_unroot(3);
+    return obj;
+  }
+  tsv m = ts_get(entries, TS_KEY_WKSYM(TS_WKSYM_ITERATOR));
+  if (!ts_is_callable(m)) ts_throw_type_error_msg("object is not iterable");
+  tsv it = ts_call_method(m, &entries, 1); ts_gc_root(&it);
+  if ((!ts_is_obj(it) && !ts_is_func(it)) || ts_is_prim_cell(it)) ts_throw_type_error_msg("Result of the Symbol.iterator method is not an object");
+  tsv next = ts_get(it, ts_intern_field("next", 4)); ts_gc_root(&next);
+  ts_key k_done = ts_intern_field("done", 4), k_value = ts_intern_field("value", 5);
+  for (;;){
+    tsv r = ts_call_method(next, &it, 1);
+    if ((!ts_is_obj(r) && !ts_is_func(r)) || ts_is_prim_cell(r)) ts_throw_type_error_msg("Iterator result is not an object");
+    ts_gc_root(&r);
+    if (ts_truthy(ts_get(r, k_done))){ ts_gc_unroot(6); return obj; }
+    tsv item = ts_get(r, k_value); ts_gc_root(&item);
+    if (!from_entries_add(obj, item, &exc)){
+      ts_iterator_close_quietly(it);
+      ts_throw(exc);
+    }
+    ts_gc_unroot(2);
+  }
 }
 
 /* ---------------- JSON ---------------- */
@@ -17036,9 +17067,16 @@ tsv ts_arrproto_concat(tsv* a, int n){
 }
 tsv ts_arrproto_join_pop(tsv* a, int n){ (void)n; arrproto_mutating(a[0], "pop"); return ts_array_pop(a[0]); }
 tsv ts_arrproto_pop(tsv* a, int n){ (void)n; if (arrproto_generic(a[0], "pop")) return arrlike_pop(a[0]); arrproto_mutating(a[0], "pop"); return ts_array_pop(a[0]); }
-tsv ts_arrproto_push(tsv* a, int n){ if (arrproto_generic(a[0], "push")) return arrlike_push(a[0], a + 1, n - 1); arrproto_mutating(a[0], "push"); for(int i=1;i<n;i++) ts_array_push(a[0], a[i]); return ts_num(ts_array_len(a[0])); }
+/* push() and unshift() with no items still Set the length */
+double ts_array_touch_length(tsv arr){
+  if (!ts_is_indexed_array_fast(arr)) return ts_number_coerce(ts_get(arr, ts_intern_field("length", 6)));
+  ts_array* a = (ts_array*)ts_ptr(arr);
+  if ((ts_obj_integrity(&a->o) & 1u) || (a->kind_spare & TS_ARRAY_LENGTH_READONLY)) ts_throw_readonly_write(arr, ts_intern_field("length", 6));
+  return (double)a->len;
+}
+tsv ts_arrproto_push(tsv* a, int n){ if (n == 1 && ts_is_indexed_array_fast(a[0])) return ts_num(ts_array_touch_length(a[0])); if (arrproto_generic(a[0], "push")) return arrlike_push(a[0], a + 1, n - 1); arrproto_mutating(a[0], "push"); for(int i=1;i<n;i++) ts_array_push(a[0], a[i]); return ts_num(ts_array_len(a[0])); }
 tsv ts_arrproto_shift(tsv* a, int n){ (void)n; if (arrproto_generic(a[0], "shift")) return arrlike_shift(a[0]); arrproto_mutating(a[0], "shift"); return ts_array_shift(a[0]); }
-tsv ts_arrproto_unshift(tsv* a, int n){ if (arrproto_generic(a[0], "unshift")) return arrlike_unshift(a[0], a + 1, n - 1); arrproto_mutating(a[0], "unshift"); for(int i=n-1;i>=1;i--) ts_array_unshift(a[0], a[i]); return ts_num(ts_array_len(a[0])); }
+tsv ts_arrproto_unshift(tsv* a, int n){ if (n == 1 && ts_is_indexed_array_fast(a[0])) return ts_num(ts_array_touch_length(a[0])); if (arrproto_generic(a[0], "unshift")) return arrlike_unshift(a[0], a + 1, n - 1); arrproto_mutating(a[0], "unshift"); for(int i=n-1;i>=1;i--) ts_array_unshift(a[0], a[i]); return ts_num(ts_array_len(a[0])); }
 tsv ts_arrproto_reverse(tsv* a, int n){
   if (ts_is_typed_array(a[0])) return ta_m_reverse(a, n);
   if (arrproto_generic(a[0], "reverse")) return arrlike_reverse(a[0]);
@@ -18044,6 +18082,21 @@ static tsv ab_m_slice(tsv* a, int n){
   ts_gc_unroot(1);
   return r;
 }
+static tsv ta_m_to_locale_string(tsv* a, int n){
+  tsv t = ta_require(n ? a[0] : TS_UNDEFINED, "toLocaleString"); ts_gc_root(&t);
+  tsv out = ts_new_string("", 0); ts_gc_root(&out);
+  uint32_t len = ta_ptr(t)->length;
+  for (uint32_t i = 0; i < len; i++){
+    if (i) out = ts_add(out, ts_new_string(",", 1));
+    tsv v = ta_ptr(t)->length > i ? ta_value(ta_ptr(t), i) : TS_UNDEFINED;
+    if (v != TS_UNDEFINED && v != TS_NULL){
+      tsv s = ts_method_dynamic(v, "toLocaleString", NULL, 0);
+      out = ts_add(out, ts_to_string_template(s));
+    }
+  }
+  ts_gc_unroot(2);
+  return out;
+}
 static void ta_proto_method(tsv proto, const char* name, ts_code fn, uint32_t arity){
   tsv fv = ts_make_fn_t(fn, NULL, 0, 1); ts_gc_root(&fv);
   ts_set_fn_meta(fv, arity, name);
@@ -18072,7 +18125,7 @@ static void ta_protos_init(void){
   ta_proto_method(p, "includes", ta_m_includes, 1);
   ta_proto_method(p, "join", ta_m_join, 1);
   ta_proto_method(p, "toString", ta_m_to_string, 0);
-  ta_proto_method(p, "toLocaleString", ta_m_to_string, 0);
+  ta_proto_method(p, "toLocaleString", ta_m_to_locale_string, 0);
   ta_proto_method(p, "at", ta_m_at, 1);
   ta_proto_method(p, "reverse", ta_m_reverse, 0);
   ta_proto_method(p, "sort", ta_m_sort, 1);
@@ -19455,9 +19508,9 @@ tsv ts_strproto_replace(tsv* a, int n){
    string pattern as a RegExp made from it (matchAll adds the g flag), as the spec's
    String.prototype methods do */
 static tsv ts_str_regexp_arg(tsv pat, const char* flags){
-  if (ts_is_regexp(pat)) return pat;
+  if (ts_is_regexp(pat) && !g_regexp_protocol) return pat;
   if (!g_regexp_hooks) ts_throw_type_error_msg("RegExp support is not linked into this program");
-  tsv p = pat == TS_UNDEFINED ? ts_new_string("", 0) : (ts_is_str(pat) ? pat : ts_to_string_v(pat));
+  tsv p = pat == TS_UNDEFINED ? ts_new_string("", 0) : (ts_is_str(pat) || ts_is_regexp(pat) ? pat : ts_to_string_v(pat));
   ts_gc_root(&p);
   tsv r = g_regexp_hooks->from_string(p, flags ? ts_new_string(flags, (uint32_t)strlen(flags)) : TS_UNDEFINED);
   ts_gc_unroot(1);
@@ -19557,6 +19610,7 @@ static tsv this_number(tsv v, const char* method){
   if (ts_is_num(v)) return v;
   tsv w = wrapper_value(v);
   if (ts_is_num(w)) return w;
+  if (v == g_number_proto_v) return ts_num(0);   /* Number.prototype is a Number object of 0 */
   char m[96];
   snprintf(m, sizeof m, "Number.prototype.%s requires that 'this' be a Number", method);
   ts_throw_type_error_msg(m);
@@ -19566,6 +19620,7 @@ static tsv this_boolean(tsv v, const char* method){
   if (ts_is_bool(v)) return v;
   tsv w = wrapper_value(v);
   if (ts_is_bool(w)) return w;
+  if (v == g_boolean_proto_v) return ts_bool(0);
   char m[96];
   snprintf(m, sizeof m, "Boolean.prototype.%s requires that 'this' be a Boolean", method);
   ts_throw_type_error_msg(m);
@@ -21163,7 +21218,19 @@ void ts_set_dyn_pic(tsv obj, tsv keyv, tsv v, ts_prop_ic* ic){
    Reflect mirrors the proxy traps and returns booleans (success) where Object.*
    returns the object or throws. */
 tsv ts_reflect_has(tsv t, tsv k){ return ts_bool(ts_has_prop_dyn(t, k)); }
-tsv ts_reflect_set(tsv t, tsv k, tsv v){ ts_set_dyn(t, k, v); return ts_bool(1); }
+static int ordinary_set_recv(tsv t, ts_key key, tsv v, tsv r);
+tsv ts_reflect_set(tsv t, tsv k, tsv v){
+  if (g_has_proxies && ts_is_proxy(t)) return ts_bool(ts_proxy_set_v(t, k, v, t));
+  if (ts_is_obj(t) && ((ts_gc_header*)ts_ptr(t))->kind == TS_KIND_OBJECT){   /* false where an assignment throws */
+    ts_gc_root(&t); ts_gc_root(&v);
+    ts_key key;
+    int ok = ts_key_from_value(k, &key) ? ordinary_set_recv(t, key, v, t) : 0;
+    ts_gc_unroot(2);
+    return ts_bool(ok);
+  }
+  ts_set_dyn(t, k, v);
+  return ts_bool(1);
+}
 /* Reflect.get(t, k, receiver): t.[[Get]](k, receiver) — a getter found on t's
    chain runs with the receiver as `this`. A plain-object target walks its
    chain with the receiver (exotic links included); other targets, and a

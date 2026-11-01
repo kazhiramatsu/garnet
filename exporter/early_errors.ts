@@ -70,6 +70,19 @@ export function jsEarlyErrors(sf: ts.SourceFile): EarlyError[] {
       }
     }
   };
+  /** LexicallyDeclaredNames of a block or a case block: a duplicate. In strict code a function in a block is one of them. */
+  const checkLexicalDuplicates = (statements: readonly ts.Statement[]): void => {
+    const seen = new Set<string>();
+    const note = (name: ts.Identifier): void => {
+      if (seen.has(name.text)) out.push({ node: name, message: `Identifier '${name.text}' has already been declared` });
+      seen.add(name.text);
+    };
+    for (const s of statements) {
+      if (ts.isVariableStatement(s) && (s.declarationList.flags & ts.NodeFlags.BlockScoped)) {
+        for (const d of s.declarationList.declarations) if (ts.isIdentifier(d.name)) note(d.name);
+      } else if ((ts.isClassDeclaration(s) || (ts.isFunctionDeclaration(s) && s.body !== undefined)) && s.name !== undefined) note(s.name);
+    }
+  };
   /** ContainsArguments: a field initializer or a static block may not name `arguments`. An arrow is no boundary. */
   const checkNoArguments = (n: ts.Node): void => {
     if (ts.isIdentifier(n) && n.text === "arguments" && isBindingOrReference(n)) {
@@ -93,6 +106,8 @@ export function jsEarlyErrors(sf: ts.SourceFile): EarlyError[] {
     ts.forEachChild(n, checkArrowParameters);
   };
   const visit = (n: ts.Node): void => {
+    if (ts.isBlock(n) && !ts.isFunctionLike(n.parent)) checkLexicalDuplicates(n.statements);
+    else if (ts.isCaseBlock(n)) checkLexicalDuplicates(n.clauses.flatMap((c) => [...c.statements]));
     if (ts.isBinaryExpression(n) && n.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && n.operatorToken.kind <= ts.SyntaxKind.LastAssignment) {
       checkTarget(n.left);
     } else if ((ts.isPrefixUnaryExpression(n) || ts.isPostfixUnaryExpression(n)) &&

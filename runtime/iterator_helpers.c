@@ -47,6 +47,7 @@ static void ih_close_quietly(tsv it){
   if (!threw && ts_is_callable(ret)) (void)ih_method_catching(ret, it, &threw);
   ts_gc_unroot(1);
 }
+void ts_iterator_close_quietly(tsv it){ ih_close_quietly(it); }
 /* a call of a user function; if it throws the iterator is closed and the throw goes on */
 static tsv ih_call_closing(tsv it, tsv fn, tsv* args, int n){
   int threw = 0;
