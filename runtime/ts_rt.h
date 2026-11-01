@@ -1679,6 +1679,8 @@ tsv ts_regexp_last_index_write(tsv re, tsv v);
 /* A program with customized matchers (docs/well_known_symbols_design.md): the string methods take their
    argument's method at the well-known symbol. Set at startup; the typed paths are not in such a program. */
 extern int g_regexp_protocol;
+/* A program whose array results can have a constructor of their own: lib/node/web/species.ts is compiled in. */
+extern int g_species;
 typedef struct ts_regexp_hooks {
   tsv (*to_string)(tsv re);
   tsv (*replace)(tsv s, tsv re, tsv replacement, int all);
@@ -2115,6 +2117,7 @@ tsv    ts_array_findlast(tsv arr, tsv cb);
 double ts_array_findlastindex(tsv arr, tsv cb);
 double ts_array_flat_depth(tsv depth);   /* undefined is 1, as an absent depth */
 tsv    ts_array_flat(tsv arr, double depth);
+tsv    ts_array_slice_method(tsv arr, double start, double end, int has_end);   /* `arr.slice()`: ts_array_slice is also the runtime's own copy */
 tsv    ts_array_flatmap(tsv arr, tsv cb);
 tsv    ts_string_from_char_code(tsv* args, int n);
 tsv    ts_string_from_code_point(tsv* args, int n);

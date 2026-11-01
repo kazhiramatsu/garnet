@@ -182,6 +182,10 @@ const NODE_PRELUDE_CTORS = new Set(["URL", "URLSearchParams", "Headers", "Reques
  *  symbol, writes or defines an `exec`, or extends RegExp. A method named `exec` on a class of its own, or
  *  `Reflect.ownKeys`, says nothing: a real program has those and keeps the direct paths. */
 const REGEXP_PROTOCOL_TRIGGER = "__garnet_regexp_protocol";
+/** A program text that can tell an array's species: it names the symbols, extends a kind of array, gives an object
+ *  a `constructor` (not a prototype's, the usual assignment), or calls Array.of / Array.from on another receiver. */
+const SPECIES_TRIGGER = "__garnet_species";
+const speciesText = /\bSymbol\s*\.\s*(species|isConcatSpreadable|unscopables)\b|\bextends\s+(Array|ArrayBuffer|SharedArrayBuffer|Int8Array|Uint8Array|Uint8ClampedArray|Int16Array|Uint16Array|Int32Array|Uint32Array|Float16Array|Float32Array|Float64Array|BigInt64Array|BigUint64Array)\b|(?<!prototype)\.\s*constructor\s*=[^=]|\bArray\s*\.\s*(of|from)\s*\.\s*(call|apply)\b/;
 const REGEXP_METHODS = new Set(["test", "exec", "match", "matchAll", "search", "replace", "replaceAll", "split"]);
 const regexpProtocolText = /\bSymbol\s*\.\s*(match|matchAll|replace|search|split)\b|\.\s*exec\s*=[^=]|["']exec["']|\bextends\s+RegExp\b/;
 const NODE_PRELUDE_PARTS: { file: string; names: string[]; defaultImport?: string; triggers?: string[] }[] = [
@@ -204,6 +208,8 @@ const NODE_PRELUDE_PARTS: { file: string; names: string[]; defaultImport?: strin
   { file: "web/blob", names: ["Blob", "File"] },
   // CompressionStream / DecompressionStream over the system's zlib (docs/web_compression_design.md)
   { file: "web/compression", names: ["CompressionStream", "DecompressionStream"] },
+  // on demand: a program that can see an array's constructor (docs/well_known_symbols_design.md)
+  { file: "web/species", names: [], triggers: [SPECIES_TRIGGER] },
   // on demand: a program that customizes a RegExp or a matcher (docs/well_known_symbols_design.md)
   { file: "web/regexp_protocol", names: [], triggers: [REGEXP_PROTOCOL_TRIGGER] },
   // on demand: fs.createReadStream / fs.createWriteStream (node:fs itself does not carry node:stream)
@@ -571,6 +577,7 @@ function programWithNodeSupport(rootNames: string[], options: ts.CompilerOptions
       const triggers = f.fileName.startsWith(libNode) ? undefined : NODE_PRELUDE_TRIGGERS;
       const named = (text: string): boolean => NODE_PRELUDE_GLOBALS.has(text) || (triggers !== undefined && triggers.has(text));
       if (triggers !== undefined && regexpProtocolText.test(f.text)) found.add(REGEXP_PROTOCOL_TRIGGER);
+      if (triggers !== undefined && speciesText.test(f.text)) found.add(SPECIES_TRIGGER);
       const visit = (n: ts.Node): void => {
         // a property named like a global (`globalThis.btoa`, `g.URL` through an alias of the
         // global object, `globalThis["performance"]`) counts too: conservative, and cheap
@@ -2209,6 +2216,11 @@ class Exporter {
     if ((ts.isIfStatement(p) || ts.isWhileStatement(p) || ts.isDoStatement(p)) && e === p.expression) return true;
     if (ts.isConditionalExpression(p) && e === p.condition) return true;
     if (((ts.isCallExpression(p) || ts.isNewExpression(p)) && e !== p.expression) || (ts.isVariableDeclaration(p) && p.type !== undefined)) {
+      // a parameter of a built-in: the runtime converts it with ToNumber, as the specification does
+      if (!ts.isVariableDeclaration(p)) {
+        const decl = this.rawChecker.getResolvedSignature(p)?.getDeclaration();
+        if (decl !== undefined && this.program.isSourceFileDefaultLibrary(decl.getSourceFile())) return true;
+      }
       const slot = this.rawChecker.getContextualType(e as ts.Expression);
       return slot === undefined || (slot.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0;
     }
@@ -11512,10 +11524,14 @@ class Exporter {
     // unlike a literal `{x:1}` (all true). tri-state: undefined = omitted.
     let enumAttr: boolean | undefined, writeAttr: boolean | undefined, confAttr: boolean | undefined;
     let attrNonLiteral = false;
+    // `{ value }`, `{ ...d, enumerable: false }`, a computed key, `get value() {}`: the descriptor as a value
+    let dynamicForm = false;
     const boolLit = (e: ts.Expression): boolean | undefined =>
       e.kind === ts.SyntaxKind.TrueKeyword ? true :
       e.kind === ts.SyntaxKind.FalseKeyword ? false : undefined;
     for (const pr of desc.properties) {
+      if (ts.isSpreadAssignment(pr) || ts.isShorthandPropertyAssignment(pr) || ts.isAccessor(pr) ||
+          (pr.name !== undefined && !ts.isIdentifier(pr.name) && !ts.isStringLiteral(pr.name))) dynamicForm = true;
       const nm = pr.name && (ts.isIdentifier(pr.name) || ts.isStringLiteral(pr.name)) ? pr.name.text : undefined;
       // get/set forms:
       //  - function value:    { get: fn }      -> PropertyAssignment named "get"
@@ -11539,7 +11555,7 @@ class Exporter {
     // or both a value and an accessor (a TypeError), is the runtime's descriptor to read
     const literalSide = (p: ts.ObjectLiteralElementLike | undefined): boolean => p === undefined || ts.isMethodDeclaration(p) ||
       (ts.isPropertyAssignment(p) && (ts.isArrowFunction(p.initializer) || ts.isFunctionExpression(p.initializer)));
-    if (attrNonLiteral || (isAccessor && valueProp !== undefined) || !literalSide(getProp) || !literalSide(setProp)) {
+    if (attrNonLiteral || dynamicForm || (isAccessor && valueProp !== undefined) || !literalSide(getProp) || !literalSide(setProp)) {
       // An attribute value isn't a boolean literal (e.g. `{ value: 1, writable: w }`).
       // We can't read it statically, so lower the descriptor object as a normal
       // expression and dispatch to the runtime descriptor-inspection path.
@@ -17969,6 +17985,7 @@ class Exporter {
     if (this.usesBigInt) this.internField("__garnet_bigint");
     this.regexpProtocol = this.modules.some((m) => /web[\/\\]regexp_protocol\.ts$/.test(m.fileName));
     if (this.regexpProtocol) this.internField(REGEXP_PROTOCOL_TRIGGER);
+    if (this.modules.some((m) => /web[\/\\]species\.ts$/.test(m.fileName))) this.internField(SPECIES_TRIGGER);
     for (const f of allFns) for (const s of this.freeVars(f)) {
       this.cellBindings.add(s);
       let arr = this.capturedByFns.get(s);

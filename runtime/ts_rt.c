@@ -8508,7 +8508,38 @@ static inline tsv cb_call(const ts_cb* c, tsv fn, tsv* args, int n){
 /* callback-based: map/filter/forEach/reduce. cb is a ts_func value invoked with
    (element, index, array), the array the method was called on (reduce adds the
    accumulator in front). */
+/* Species (docs/well_known_symbols_design.md): under the gate, an array whose constructor is not Array is
+   the library's. g_species_lib is its table of methods, unset until the module has run. */
+int g_species = 0;
+static tsv g_species_lib = TS_UNDEFINED;
+static tsv species_lib(void){
+  static int rooted;
+  if (g_species_lib == TS_UNDEFINED){
+    ts_root_static_once(&g_species_lib, &rooted);
+    g_species_lib = ts_get(ts_global_this(), ts_intern_field("__garnet_species", 16));
+  }
+  return g_species_lib;
+}
+static int array_species_custom(tsv arr){
+  if (!as_arr(arr)) return 0;
+  tsv lib = species_lib();
+  if (lib == TS_UNDEFINED) return 0;
+  ts_gc_root(&arr);
+  tsv c = ts_get(arr, ts_intern_field("constructor", 11));
+  ts_gc_unroot(1);
+  return c != ts_get(lib, ts_intern_field("Array", 5));
+}
+static tsv array_species_call(tsv arr, const char* name, const tsv* args, int n){
+  tsv fn = ts_get(species_lib(), ts_intern_field(name, (uint32_t)strlen(name)));
+  tsv argv[8];
+  argv[0] = arr;
+  for (int i = 0; i < n && i < 7; i++) argv[i + 1] = args[i];
+  return ts_call_method(fn, argv, n + 1);
+}
+#define ARRAY_SPECIES(arr, name, args, n) \
+  if (TS_RT_UNLIKELY(g_species) && array_species_custom(arr)) return array_species_call(arr, name, args, n)
 tsv ts_array_map(tsv arr, tsv cb){
+  ARRAY_SPECIES(arr, "map", &cb, 1);
   ts_array* a=as_arr(arr); if(!a) return TS_ARRAY_PROXY(arr) ? ts_method_dynamic(arr, "map", &cb, 1) : ts_new_array(0);
   ts_gc_root(&arr); ts_gc_root(&cb);
   ts_cb cbf; cb_resolve(&cbf, cb);
@@ -8526,6 +8557,7 @@ tsv ts_array_map(tsv arr, tsv cb){
   return out;
 }
 tsv ts_array_filter(tsv arr, tsv cb){
+  ARRAY_SPECIES(arr, "filter", &cb, 1);
   ts_array* a=as_arr(arr); if(!a) return TS_ARRAY_PROXY(arr) ? ts_method_dynamic(arr, "filter", &cb, 1) : ts_new_array(0);
   ts_gc_root(&arr); ts_gc_root(&cb);
   ts_cb cbf; cb_resolve(&cbf, cb);
@@ -8702,6 +8734,13 @@ int ts_array_includes(tsv arr, tsv v, double from, int has_from){
   return 0;
 }
 static tsv arrproto_elements(tsv recv, const char* name);
+tsv ts_array_slice_method(tsv arr, double start, double end, int has_end){
+  if (TS_RT_UNLIKELY(g_species) && array_species_custom(arr)){
+    tsv av[2] = { ts_num(start), ts_num(end) };
+    return array_species_call(arr, "slice", av, has_end ? 2 : 1);
+  }
+  return ts_array_slice(arr, start, end, has_end);
+}
 tsv ts_array_slice(tsv arr, double start, double end, int has_end){
   ts_array* a=as_arr(arr);
   if(!a && TS_ARRAY_PROXY(arr)){ tsv av[2] = { ts_num(start), ts_num(end) }; return ts_method_dynamic(arr, "slice", av, has_end ? 2 : 1); }
@@ -8726,7 +8765,13 @@ tsv ts_array_new_length(double n){
   if (!(n >= 0.0) || n > 4294967295.0 || floor(n) != n) ts_throw_range_error_msg("Invalid array length");
   return ts_new_array((uint32_t)n);
 }
+/* @@isConcatSpreadable on an operand */
+static int array_concat_custom(tsv v){
+  return (ts_is_obj(v) || ts_is_func(v)) && !ts_is_prim_cell(v) && ts_get(v, TS_KEY_WKSYM(TS_WKSYM_IS_CONCAT_SPREADABLE)) != TS_UNDEFINED;
+}
 tsv ts_array_concat(tsv x, tsv y){
+  if (TS_RT_UNLIKELY(g_species) && species_lib() != TS_UNDEFINED &&
+      (array_species_custom(x) || array_concat_custom(x) || array_concat_custom(y))) return array_species_call(x, "concat", &y, 1);
   if (TS_ARRAY_PROXY(x)) return ts_method_dynamic(x, "concat", &y, 1);
   /* concat one argument onto a copy of x: an array argument is spread, any other
      value is appended as a single element (JS Array.prototype.concat semantics). */
@@ -8759,10 +8804,15 @@ tsv ts_array_concat(tsv x, tsv y){
    place — grow like push, shift the tail, store — with no items array, no
    removed array and no rebuilt buffer (docs/splice_fast_paths_design.md). */
 tsv ts_array_splice_insert1(tsv arr, double start, tsv item){
+  if (TS_RT_UNLIKELY(g_species) && array_species_custom(arr)){
+    tsv av[3] = { ts_num(start), ts_num(0), item };
+    array_species_call(arr, "splice", av, 3);
+    return TS_UNDEFINED;
+  }
   ts_array* a=as_arr(arr); if(!a){ if (TS_ARRAY_PROXY(arr)){ tsv av[3] = { ts_num(start), ts_num(0), item }; ts_method_dynamic(arr, "splice", av, 3); } return TS_UNDEFINED; }
   if(ts_arr_frozen(arr)){ ts_array_set(arr, a->len, item); return TS_UNDEFINED; }   /* strict: a frozen array throws (ts_array_set's message) */
   long n=(long)a->len;
-  long s=(long)start; if(s<0){ s+=n; if(s<0)s=0; } if(s>n) s=n;
+  long s=(long)ts_index_ll(start); if(s<0){ s+=n; if(s<0)s=0; } if(s>n) s=n;
   array_ensure_cap(a, (uint32_t)n+1u);
   memmove(a->data+s+1, a->data+s, (size_t)(n-s)*sizeof(tsv));
   a->data[s]=item;
@@ -8781,6 +8831,13 @@ tsv ts_array_splice_drop(tsv arr, double start, double dc, int has_dc, tsv items
   return TS_UNDEFINED;
 }
 static tsv ts_array_splice_impl(tsv arr, double start, double dc, int has_dc, tsv items, int want_removed){
+  if (TS_RT_UNLIKELY(g_species) && array_species_custom(arr)){
+    tsv av[7] = { ts_num(start), ts_num(dc) };
+    int k = 2, count = ts_is_array(items) ? (int)ts_array_len(items) : 0;
+    for (int i = 0; i < count && k < 7; i++) av[k++] = ts_array_get(items, (uint32_t)i);
+    tsv r = array_species_call(arr, "splice", av, has_dc ? k : 1);
+    return want_removed ? r : TS_UNDEFINED;
+  }
   ts_array* a=as_arr(arr);
   if(!a){ if (TS_ARRAY_PROXY(arr)){ tsv r = array_proxy_splice(arr, "splice", start, dc, has_dc, items); return want_removed ? r : TS_UNDEFINED; } return want_removed ? ts_new_array(0) : TS_UNDEFINED; }
   if(ts_arr_frozen(arr)){ ts_array_set(arr, a->len, TS_UNDEFINED); return want_removed ? ts_new_array(0) : TS_UNDEFINED; }   /* strict: a frozen array throws (ts_array_set's message) */
@@ -11274,6 +11331,7 @@ static void flat_into(tsv out, tsv arr, int depth){
 }
 double ts_array_flat_depth(tsv depth){ return ts_is_undef(depth) ? 1 : ts_number_coerce(depth); }
 tsv ts_array_flat(tsv arr, double depth){
+  if (TS_RT_UNLIKELY(g_species) && array_species_custom(arr)){ tsv d = ts_num(depth); return array_species_call(arr, "flat", &d, 1); }
   if (TS_ARRAY_PROXY(arr)){ tsv d = ts_num(depth); return ts_method_dynamic(arr, "flat", &d, 1); }
   ts_gc_root(&arr);
   tsv out=ts_new_array(0);
@@ -11286,6 +11344,7 @@ tsv ts_array_flat(tsv arr, double depth){
 
 /* flatMap(cb): map each element then flatten the result one level. */
 tsv ts_array_flatmap(tsv arr, tsv cb){
+  ARRAY_SPECIES(arr, "flatMap", &cb, 1);
   ts_array* a=as_arr(arr); if(!a) return TS_ARRAY_PROXY(arr) ? ts_method_dynamic(arr, "flatMap", &cb, 1) : ts_new_array(0);
   ts_gc_root(&arr); ts_gc_root(&cb);
   ts_cb cbf; cb_resolve(&cbf, cb);
@@ -12183,7 +12242,7 @@ static uint8_t* g_field_hidden = NULL;
 static int field_name_is_internal(const char* n, uint32_t len){
   static const char* const names[] = {
     "__value", "__date_ms", "__views", "__coro", "__timeoutMs", "__body", "__garnet", "__garnet_json",
-    "__garnet_node", "__garnet_metal", "__promise_resolver_done", "__generator_return_tag",
+    "__garnet_node", "__garnet_metal", "__garnet_species", "__promise_resolver_done", "__generator_return_tag",
     "__generator_return_value", "__text_encoder", "__text_decoder_encoding", "__text_decoder_fatal",
     "__text_decoder_ignore_bom", "__array_iterator_source", "__array_iterator_index",
     "__array_iterator_kind", "__map_iterator_source", "__map_iterator_last", "__map_iterator_kind",
@@ -16070,7 +16129,19 @@ static int ta_define_index(tsv obj, ts_key key, uint32_t idx, unsigned present, 
 static int define_own_property(tsv obj, ts_key key, unsigned present, tsv value, tsv getter, tsv setter, int e, int w, int c, int throws){
   { uint32_t idx;
     if (TS_RT_UNLIKELY(ts_is_typed_array(obj)) && ta_numeric_key(key, &idx))
-      return ta_define_index(obj, key, idx, present, value, e, w, c, throws); }
+      return ta_define_index(obj, key, idx, present, value, e, w, c, throws);
+    /* an array's element with the attributes elements have: a store (createDataProperty, the species library) */
+    if (ts_is_indexed_array_fast(obj) && ts_obj_integrity((ts_object*)ts_ptr(obj)) == 0u && prop_key_is_array_index(key, &idx) &&
+        !(present & (DEF_GET | DEF_SET))){
+      int has = ts_array_has_index(obj, idx);
+      int plain = has ? (!(present & DEF_WRITABLE) || w) && (!(present & DEF_ENUMERABLE) || e) && (!(present & DEF_CONFIGURABLE) || c)
+                      : (present & DEF_WRITABLE) && w && (present & DEF_ENUMERABLE) && e && (present & DEF_CONFIGURABLE) && c;
+      if (plain){
+        if ((present & DEF_VALUE) || !has) ts_array_set(obj, idx, value);
+        return 1;
+      }
+    }
+  }
   ts_gc_root(&obj); ts_gc_root(&value); ts_gc_root(&getter); ts_gc_root(&setter);
   if (ts_is_func(obj)) fn_realize_virtual(obj, key);   /* the definition applies to an own entry */
   int is_acc = (present & (DEF_GET | DEF_SET)) != 0, is_data = (present & (DEF_VALUE | DEF_WRITABLE)) != 0;
@@ -16637,9 +16708,10 @@ tsv ts_arrproto_toString(tsv* a, int n){
 tsv ts_arrproto_indexOf(tsv* a, int n){ return ts_num(ts_array_indexof(ARR_THIS(a, "indexOf"), n>1?a[1]:TS_UNDEFINED, n>2?ts_number_coerce(a[2]):0, n>2)); }
 tsv ts_arrproto_includes(tsv* a, int n){ return ts_bool(ts_array_includes(ARR_THIS(a, "includes"), n>1?a[1]:TS_UNDEFINED, n>2?ts_number_coerce(a[2]):0, n>2)); }
 tsv ts_arrproto_lastIndexOf(tsv* a, int n){ return ts_num(ts_array_lastindexof(ARR_THIS(a, "lastIndexOf"), n>1?a[1]:TS_UNDEFINED, n>2?ts_number_coerce(a[2]):0, n>2)); }
-tsv ts_arrproto_slice(tsv* a, int n){ return ts_array_slice(ARR_THIS(a, "slice"), n>1?ts_number_coerce(a[1]):0, n>2?ts_number_coerce(a[2]):0, n>2 && !ts_is_undef(a[2])); }
+tsv ts_arrproto_slice(tsv* a, int n){ return ts_array_slice_method(ARR_THIS(a, "slice"), n>1?ts_number_coerce(a[1]):0, n>2?ts_number_coerce(a[2]):0, n>2 && !ts_is_undef(a[2])); }
 tsv ts_arrproto_concat(tsv* a, int n){
   /* variadic: fold each arg through the 2-arg concat; no args -> shallow copy. */
+  if (TS_RT_UNLIKELY(g_species) && species_lib() != TS_UNDEFINED && n <= 8) return array_species_call(ARR_THIS(a, "concat"), "concat", a + 1, n - 1);
   if(n<=1) return ts_array_slice(ARR_THIS(a, "concat"), 0, 0, 0);
   /* a receiver that is not an array (a Proxy): its elements, read through the traps (a typed
      ts_array_concat on the Proxy itself would come back here through the trap's method) */
@@ -16784,6 +16856,10 @@ static inline void ta_store(ts_typedarray* t, uint32_t i, double d){ ts_ta_elem_
 /* The element as a value, and back: a BigInt array's elements are 64 bits, not doubles. ta_coerce is
    ToNumber or ToBigInt, by the array's content type. */
 static inline int ta_is_big(const ts_typedarray* t){ return t->elem >= TS_TA_BIGINT64; }
+static inline int ta_detached(const ts_typedarray* t){ return ts_is_array_buffer(t->buffer) && ((ts_arraybuffer*)ts_ptr(t->buffer))->detached; }
+static tsv species_constructor(tsv o, tsv dflt);
+static tsv ta_species_create(tsv exemplar, tsv* args, int n);
+static tsv ta_species_length(tsv exemplar, uint32_t len);
 static tsv ta_value(const ts_typedarray* t, uint32_t i){
   if (TS_RT_UNLIKELY(ta_is_big(t))){
     uint64_t u;
@@ -17072,6 +17148,13 @@ static tsv ta_m_subarray(tsv* a, int n){
   uint32_t b = ta_rel(a, n, 1, len, 0), e = ta_rel(a, n, 2, len, len);
   ts_typedarray* x = ta_ptr(t);
   uint32_t count = e > b ? e - b : 0;
+  if (TS_RT_UNLIKELY(g_species)){
+    tsv args[3] = { x->buffer, ts_num((double)x->byte_offset + (double)b * g_ta_size[x->elem]), ts_num((double)count) };
+    int tracking = x->tracking && (n <= 2 || ts_is_undef(a[2]));
+    tsv r = ta_species_create(t, args, tracking ? 2 : 3);
+    ts_gc_unroot(1);
+    return r;
+  }
   tsv r = ta_new_view(x->elem, x->buffer, x->byte_offset + b * g_ta_size[x->elem], count);
   ts_gc_unroot(1);
   return r;
@@ -17081,11 +17164,22 @@ static tsv ta_m_slice(tsv* a, int n){
   uint32_t len = ta_ptr(t)->length;
   uint32_t b = ta_rel(a, n, 1, len, 0), e = ta_rel(a, n, 2, len, len);
   uint32_t count = e > b ? e - b : 0;
-  tsv r = ta_new_length(ta_ptr(t)->elem, count);
-  ts_typedarray* x = ta_ptr(t);
-  uint32_t sz = g_ta_size[x->elem];
-  if (count) memcpy(ta_ptr(r)->data, x->data + (size_t)b * sz, (size_t)count * sz);
-  ts_gc_unroot(1);
+  tsv r = ta_species_length(t, count); ts_gc_root(&r);
+  if (count){
+    if (ta_ptr(t)->out_of_bounds || ta_detached(ta_ptr(t))) ts_throw_type_error_msg("Cannot perform %TypedArray%.prototype.slice on a detached ArrayBuffer");
+    ts_typedarray* x = ta_ptr(t);
+    uint32_t sz = g_ta_size[x->elem];
+    uint32_t end = e < x->length ? e : x->length;
+    if (end > b){
+      if (ta_ptr(r)->elem == x->elem){
+        size_t bytes = (size_t)(end - b) * sz, room = (size_t)ta_ptr(r)->length * sz;
+        memmove(ta_ptr(r)->data, x->data + (size_t)b * sz, bytes < room ? bytes : room);
+      } else {
+        for (uint32_t i = b, to = 0; i < end; i++, to++) ts_ta_set(r, to, ta_value(ta_ptr(t), i));
+      }
+    }
+  }
+  ts_gc_unroot(2);
   return r;
 }
 static tsv ta_m_set(tsv* a, int n){
@@ -17352,7 +17446,7 @@ static tsv ta_m_for_each(tsv* a, int n){
 }
 static tsv ta_m_map(tsv* a, int n){
   TA_CB_BEGIN("map")
-  tsv r = ta_new_length(ta_ptr(t)->elem, ta_ptr(t)->length); ts_gc_root(&r);
+  tsv r = ta_species_length(t, ta_ptr(t)->length); ts_gc_root(&r);
   for (uint32_t i = 0; i < ta_ptr(t)->length; i++) ts_ta_set(r, i, ta_cb_call(&cbf, cb, t, i));
   ts_gc_unroot(3); return r;
 }
@@ -17366,8 +17460,15 @@ static tsv ta_m_filter(tsv* a, int n){
     memcpy(raw, ta_ptr(t)->data + (size_t)i * sz, sz);
     if (ts_truthy(ta_cb_call(&cbf, cb, t, i))) memcpy(kept + (size_t)(k++) * sz, raw, sz);
   }
-  tsv r = ta_new_length(ta_ptr(t)->elem, k);
-  if (k) memcpy(ta_ptr(r)->data, kept, (size_t)k * sz);
+  tsv r = ta_species_length(t, k);
+  if (ta_ptr(r)->elem == ta_ptr(t)->elem){ if (k) memcpy(ta_ptr(r)->data, kept, (size_t)k * sz); }
+  else {
+    ts_gc_root(&r);
+    tsv held = ta_new_length(ta_ptr(t)->elem, k); ts_gc_root(&held);
+    if (k) memcpy(ta_ptr(held)->data, kept, (size_t)k * sz);
+    for (uint32_t i = 0; i < k; i++) ts_ta_set(r, i, ta_value(ta_ptr(held), i));
+    ts_gc_unroot(2);
+  }
   free(kept);
   ts_gc_unroot(2); return r;
 }
@@ -17610,8 +17711,21 @@ static tsv ab_m_slice(tsv* a, int n){
   uint32_t len = ((ts_arraybuffer*)ts_ptr(b))->byte_length;
   uint32_t s = ta_rel(a, n, 1, len, 0), e = ta_rel(a, n, 2, len, len);
   uint32_t count = e > s ? e - s : 0;
-  tsv r = ta_new_buffer(count, ((ts_arraybuffer*)ts_ptr(b))->shared); 
-  if (count) memcpy(((ts_arraybuffer*)ts_ptr(r))->bytes, ((ts_arraybuffer*)ts_ptr(b))->bytes + s, count);
+  int shared = ((ts_arraybuffer*)ts_ptr(b))->shared;
+  tsv r;
+  if (TS_RT_UNLIKELY(g_species)){
+    tsv c = species_constructor(b, shared ? g_sab_ctor : g_ab_ctor);
+    tsv arg = ts_num((double)count);
+    r = ts_construct(c, &arg, 1);
+    if (!ts_is_array_buffer(r) || ((ts_arraybuffer*)ts_ptr(r))->shared != shared) ts_throw_type_error_msg("Species constructor did not return an ArrayBuffer");
+    if (((ts_arraybuffer*)ts_ptr(r))->detached) ts_throw_type_error_msg("Species constructor returned a detached ArrayBuffer");
+    if (r == b) ts_throw_type_error_msg("ArrayBuffer subclass returned this from species constructor");
+    if (((ts_arraybuffer*)ts_ptr(r))->byte_length < count) ts_throw_type_error_msg("Species constructor returned a too small ArrayBuffer");
+    if (((ts_arraybuffer*)ts_ptr(b))->detached) ts_throw_type_error_msg("Cannot perform ArrayBuffer.prototype.slice on a detached ArrayBuffer");
+    uint32_t len_now = ((ts_arraybuffer*)ts_ptr(b))->byte_length;
+    if (s >= len_now) count = 0; else if (count > len_now - s) count = len_now - s;
+  } else r = ta_new_buffer(count, shared);
+  if (count) memmove(((ts_arraybuffer*)ts_ptr(r))->bytes, ((ts_arraybuffer*)ts_ptr(b))->bytes + s, count);
   ts_gc_unroot(1);
   return r;
 }
@@ -17742,6 +17856,33 @@ static tsv ta_abstract_call(tsv* a, int n){
 }
 static int ts_value_is_constructor(tsv v);
 /* `new this(len)`, for a constructor that is none of the built-in ones */
+/* SpeciesConstructor */
+static tsv species_constructor(tsv o, tsv dflt){
+  tsv c = ts_get(o, ts_intern_field("constructor", 11));
+  if (c == TS_UNDEFINED) return dflt;
+  if (!ts_object_like(c) || ts_is_prim_cell(c)) ts_throw_type_error_msg("object.constructor is not an object");
+  tsv s = ts_get(c, TS_KEY_WKSYM(TS_WKSYM_SPECIES));
+  if (s == TS_UNDEFINED || s == TS_NULL) return dflt;
+  if (!ts_value_is_constructor(s)) ts_throw_type_error_msg("object.constructor[Symbol.species] is not a constructor");
+  return s;
+}
+/* TypedArraySpeciesCreate; the exemplar and the arguments stay rooted by the caller */
+static tsv ta_species_create(tsv exemplar, tsv* args, int n){
+  tsv c = species_constructor(exemplar, g_ta_ctor[ta_ptr(exemplar)->elem]);
+  tsv r = ts_construct(c, args, n);
+  if (!ts_is_typed_array(r)) ts_throw_type_error_msg("this is not a typed array.");
+  if (ta_ptr(r)->out_of_bounds || ta_detached(ta_ptr(r)))
+    ts_throw_type_error_msg("Cannot perform %TypedArray%.prototype method on a detached ArrayBuffer");
+  if (n == 1 && ts_is_num(args[0]) && (double)ta_ptr(r)->length < ts_to_num(args[0]))
+    ts_throw_type_error_msg("Derived TypedArray constructor created an array which was too small");
+  if (ta_is_big(ta_ptr(r)) != ta_is_big(ta_ptr(exemplar))) ts_throw_type_error_msg("Content type of the new typed array differs from the source");
+  return r;
+}
+static tsv ta_species_length(tsv exemplar, uint32_t len){
+  if (TS_RT_LIKELY(!g_species)) return ta_new_length(ta_ptr(exemplar)->elem, len);
+  tsv arg = ts_num((double)len);
+  return ta_species_create(exemplar, &arg, 1);
+}
 static tsv ta_create_by(tsv ctor, uint32_t len){
   tsv arg = ts_num((double)len);
   tsv r = ts_construct(ctor, &arg, 1);

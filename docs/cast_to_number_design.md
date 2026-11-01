@@ -71,3 +71,8 @@ over a value it could not vouch for; one that flows on pays one test.
 - Only explicit casts are covered: an `any` assigned to a `number` slot without one is still unboxed unchecked.
 - `(5 as unknown as string).toUpperCase()` answers "5" (V8: a TypeError); a boxed string type stays a dynamic fallback,
   which hono needs.
+
+## A parameter of a built-in
+
+An argument with a cast behind it for a `number` parameter of the library (`arr.slice(s as unknown as number)`) is used in
+place: nothing typed holds it, and the runtime converts it with ToNumber as the specification does.

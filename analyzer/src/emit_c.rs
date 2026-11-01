@@ -1207,6 +1207,9 @@ fn emit_program_with_string_plans(
         s.push_str("static ts_prop_ic TS_ICS_ISO0[@@TS_ISO_NICS@@];\n");
     }
     s.push_str("int main(void){\n");
+    if program.fields.iter().any(|f| f.name.as_deref() == Some("__garnet_species")) {
+        s.push_str("  g_species = 1;\n");
+    }
     if iso_mode() {
         s.push_str("  TS_ISO()->ics = TS_ICS_ISO0;\n");
         if !program.globals.is_empty() {
@@ -24662,7 +24665,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     false,
                 ),
                 "array.slice" => (
-                    format!("ts_array_slice({}, {}, {}, {})", r, n(0), n(1), optional_end),
+                    format!("ts_array_slice_method({}, {}, {}, {})", r, n(0), n(1), optional_end),
                     false,
                 ),
                 "array.concat" => (format!("ts_array_concat({}, {})", r, v(0)), false),
