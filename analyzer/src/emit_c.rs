@@ -13754,10 +13754,22 @@ fn emit_coroutine_param_copy(s: &mut String, f: &Function, ctx: &Ctx) {
             continue;
         }
         let j = i - ncap;
-        // the arguments object of a coroutine (the exporter's hidden last parameter)
+        // An array of the arguments from `from` on: the arguments object of a coroutine (the exporter's
+        // hidden last parameter) and the rest parameter. The allocation may move the frame, and may
+        // have promoted it, so the store is the last thing, through the frame's new address, barriered.
+        let gather = |s: &mut String, from: usize| {
+            let _ = writeln!(
+                s,
+                "  {{ tsv _ga = ts_arguments_array(args + {1}, nargs > {1} ? nargs - {1} : 0); _fr = ({2}_frame*)ts_ptr(_cv); _fr->v{0} = _ga; ts_write_barrier(_cv, _ga); }}",
+                p.0, from, cname(f)
+            );
+        };
         if let Some(offset) = f.locals.iter().find(|l| l.id.0 == p.0).and_then(|l| l.name.as_deref()).and_then(|n| n.strip_prefix("__arguments_all:")) {
-            let offset = offset.parse::<usize>().unwrap_or(0).saturating_sub(ncap);
-            let _ = writeln!(s, "  _fr->v{} = ts_arguments_array(args + {1}, nargs > {1} ? nargs - {1} : 0);", p.0, offset);
+            gather(s, offset.parse::<usize>().unwrap_or(0).saturating_sub(ncap));
+            continue;
+        }
+        if Some(p.0) == f.rest_param {
+            gather(s, j);
             continue;
         }
         if ctx.int_local.contains(&p.0) {

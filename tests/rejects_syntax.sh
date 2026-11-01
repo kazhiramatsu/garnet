@@ -19,14 +19,12 @@ chk "mutually-cyclic class extends" 'class A extends B {} class B extends A {} f
 chk "value import linkage" 'import { value } from "./dep"; console.log(value);'
 chk "lexical TDZ read" 'console.log(x); let x = 1;'
 chk "lexical TDZ self read" 'let x = x; console.log(x);'
-chk "destructured rest parameter"  'function f(...{a}: any): void {} function main(): void { console.log(1); }'
 # Class capture of enclosing-function locals: constructors / field initializers /
 # dynamic-keyed members now THREAD function-local cells (conformance_fixes §90), so
 # the factory-function pattern works. Still loud-rejected: a NAMED (vtable) method
 # or accessor capturing a function-local (the vtable ABI can't thread the cell).
 # (Static dynamic/symbol computed members and dynamic/symbol instance accessors are
 # now SUPPORTED — see tests/rejects_symbol.sh for what's installed vs still rejected.)
-chk "vtable method capturing function-local" 'function make(b:number){ class C { constructor(){} scale(n:number){return b*n} } return new C(); } function main(): void { const c:any=make(10); console.log(c.scale(4)); }'
 # `new X()` where X does not statically resolve to a known class or supported
 # built-in: a class value held in a variable (a class can't carry a captured env
 # as a runtime value), or an unsupported built-in constructor.
@@ -66,5 +64,5 @@ chk "unsupported number method as a value"    'function main(): void { const f:a
 # (`super.x = v` is now fully supported — declared data field / parent accessor setter
 # / static members; getter-only writes throw a catchable TypeError and undeclared
 # properties create own data, both matching JS — see conformance_fixes §124–§127.)
-[ $fail -eq 0 ] && echo "[reject-syntax] PASS: finally-crossing-label / import-linkage / TDZ / destructured-rest-param / class-member(vtable-method-capture) / number-method-value rejected"
+[ $fail -eq 0 ] && echo "[reject-syntax] PASS: finally-crossing-label / import-linkage / TDZ / class-member() / number-method-value rejected"
 exit $fail

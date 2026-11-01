@@ -12703,8 +12703,13 @@ Where it stopped (branch `s363-dc`, worktree `build/wt_dc`, on top of `s362-wip`
   ms against 100, was under concurrent load and has to be re-timed quietly.
 - To land: the full gates on `s363-dc`, the A/B against the r29 builds (`build/gates_s363a/run.sh` is the runner),
   `gate.sh ir-parity snap`, the final numbers here, merge to main, push.
-- `tests/rejects_async.sh` now holds what is still refused (`super()` in an arrow of a dynamic class): a computed
-  method in a literal and `yield*` over a number compile and agree with V8.
+- The reject scripts lost what now compiles and agrees with V8: a computed method in a literal, `yield*` over a number,
+  `RegExp` as a value, a pattern as a rest parameter, a method capturing a function's local.
+  `tests/rejects_async.sh` holds what is still refused (`super()` in an arrow of a dynamic class).
+- **A generator's or an async function's rest parameter was not an array** (silent, before this session):
+  `function* g(a, ...r)` bound `r` to the next argument, `async function f(...r)` too. The coroutine entry gathers it
+  now, and the arguments array there no longer stores through a frame the allocation may have moved
+  (`functions/rest_parameter_patterns`).
 - `language/expressions` was last measured in full at 9,260 of 11,152, before dynamic classes, `yield*` and ToPrimitive;
   a rerun of the failures on an earlier state of this branch passed 1,920 of 2,803. Measure again before quoting a
   number. `scripts/test262/gen.mjs` now records the cases that build code from strings, `summary.py` counts them

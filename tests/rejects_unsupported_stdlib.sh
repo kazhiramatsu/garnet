@@ -38,13 +38,8 @@ if node exporter/exporter.js "$tmp/d.ts" "$tmp/d.json" "$tmp/dl.json" 2>/dev/nul
   echo "[reject-stdlib] FAIL: Object.fromEntries() accepted"; fail=1
 fi
 # RegExp constructors now accept dynamic inputs and throw catchable SyntaxError
-# for invalid flags. Unsupported global value entry points still reject.
-cat > "$tmp/h.ts" <<'TS'
-function main(): void { const R: any = RegExp; console.log(typeof R); }
-TS
-if node exporter/exporter.js "$tmp/h.ts" "$tmp/h.json" "$tmp/hl.json" 2>/dev/null; then
-  echo "[reject-stdlib] FAIL: RegExp value accepted"; fail=1
-fi
+# for invalid flags, and `RegExp` is a value (Session 363). The entry points through
+# globalThis still reject.
 cat > "$tmp/i.ts" <<'TS'
 function main(): void { const R: any = globalThis.RegExp; console.log(typeof R); }
 TS

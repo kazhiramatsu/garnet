@@ -32,3 +32,4 @@ const kbad = { toString() { return {}; }, valueOf() { return {}; } }; t(() => { 
 const ksym = { [Symbol.toPrimitive]() { return Symbol.iterator; } }; t(() => typeof ({ [ksym]: 1 })[Symbol.iterator]);
 log(Object.prototype.__lookupGetter__ !== undefined, typeof ({ get a() { return 1; } }).__lookupGetter__("a"));
 const od = {}; od.__defineGetter__("g", () => 5); od.__defineSetter__("g", () => {}); log(od.g, typeof od.__lookupSetter__("g"));
+const Rv: any = RegExp; log(typeof Rv, new Rv("a+").source, Rv("b", "g").flags, new Rv("a+").test("caat"));
