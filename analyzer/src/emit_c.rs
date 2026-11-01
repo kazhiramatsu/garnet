@@ -575,6 +575,18 @@ fn emit_program_with_string_plans(
         let _ = write!(s, "{}, ", if hp { 1 } else { 0 });
     }
     s.push_str("};\n\n");
+    // 1 generator, 2 async generator, 3 async function (ts_set_fn_kind): their values have prototypes of their own
+    let _ = write!(s, "static const uint8_t FN_KIND[{}] = {{", maxid + 1);
+    for i in 0..=maxid {
+        let k = functions_by_id[i as usize].map_or(0, |f| match (f.is_generator, f.is_async) {
+            (true, false) => 1,
+            (true, true) => 2,
+            (false, true) => 3,
+            (false, false) => 0,
+        });
+        let _ = write!(s, "{}, ", k);
+    }
+    s.push_str("};\n\n");
 
     // Per-class prototype objects for the DYNAMIC dispatch path. Each class gets a
     // prototype object holding its methods (name-id key -> FN_TABLE index, stored
@@ -930,6 +942,7 @@ fn emit_program_with_string_plans(
                 // `fn.name` / `fn.length` of the member (V8: the key, "get x" / "set x")
                 if mfn.is_some() {
                     let _ = writeln!(s, "  ts_set_fn_meta({0}, FN_ARITY[{1}], FN_NAME[{1}]);", var, m.func.0);
+                    let _ = writeln!(s, "  if (FN_KIND[{1}]) {0} = ts_set_fn_kind({0}, FN_KIND[{1}], {1}u);", var, m.func.0);
                 }
                 let _ = writeln!(
                     s,
@@ -14204,7 +14217,7 @@ fn emit_generator_function(s: &mut String, f: &Function, ctx: &Ctx) {
     if initial_suspend_of(f).is_some() {
         s.push_str("  ts_coro_resume_v(_cv);\n");
     }
-    s.push_str("  tsv _gen = ts_gen_new_v(_cv);\n");
+    let _ = writeln!(s, "  tsv _gen = ts_gen_new_fn(_cv, {}u);", f.id.0);
     s.push_str("  ts_gc_unroot(1);\n");
     s.push_str("  return _gen;\n}\n\n");
 }
@@ -14234,7 +14247,7 @@ fn emit_asyncgen_function(s: &mut String, f: &Function, ctx: &Ctx) {
     if initial_suspend_of(f).is_some() {
         s.push_str("  ts_coro_resume_v(_cv);\n");
     }
-    s.push_str("  tsv _gen = ts_asyncgen_new_v(_cv);\n");
+    let _ = writeln!(s, "  tsv _gen = ts_asyncgen_new_fn(_cv, {}u);", f.id.0);
     s.push_str("  ts_gc_unroot(1);\n");
     s.push_str("  return _gen;\n}\n\n");
 }
@@ -23020,11 +23033,11 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
             let dst_name = ctx.vname(dst.0);
             let set_meta = if lazy_fn_prototype_enabled() {
                 format!(
-                    "  ts_set_fn_meta({0}, FN_ARITY[{1}], FN_NAME[{1}]);\n  if (FN_HAS_PROTOTYPE[{1}]) ts_set_fn_prototype_lazy({0});\n",
+                    "  ts_set_fn_meta({0}, FN_ARITY[{1}], FN_NAME[{1}]);\n  if (FN_HAS_PROTOTYPE[{1}]) ts_set_fn_prototype_lazy({0});\n  if (FN_KIND[{1}]) {0} = ts_set_fn_kind({0}, FN_KIND[{1}], {1}u);\n",
                     dst_name, func.0)
             } else {
                 format!(
-                    "  ts_set_fn_meta({0}, FN_ARITY[{1}], FN_NAME[{1}]);\n  if (FN_HAS_PROTOTYPE[{1}]) ts_set_fn_prototype({0}, {2}());\n",
+                    "  ts_set_fn_meta({0}, FN_ARITY[{1}], FN_NAME[{1}]);\n  if (FN_HAS_PROTOTYPE[{1}]) ts_set_fn_prototype({0}, {2}());\n  if (FN_KIND[{1}]) {0} = ts_set_fn_kind({0}, FN_KIND[{1}], {1}u);\n",
                     dst_name, func.0, make_proto)
             };
             if st == AllocStrategy::Stack && stack_closures_enabled() && ctx.stack_cells && stack_check_enabled() {
@@ -24118,6 +24131,8 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 "dynclass.active" => ("ts_dyn_active()".to_string(), false),
                 "dynclass.this" => (format!("ts_dyn_this({})", v(0)), false),
                 "dynclass.thisCheck" => (format!("ts_dyn_this_check({})", v(0)), false),
+                "super.set" => (format!("ts_super_set({}, {}, {}, {})", v(0), v(1), v(2), v(3)), false),
+                _ if builtin.starts_with("method.receiver:") => (format!("ts_method_receiver({}, {})", v(0), c_string_lit(&builtin["method.receiver:".len()..])), false),
                 "dynclass.super" => (format!("ts_dyn_super({}, {}, {})", v(0), v(1), v(2)), false),
                 "dynclass.bindCheck" => (format!("(ts_dyn_bind_check({}), TS_UNDEFINED)", v(0)), false),
                 "dynclass.result:0" => (format!("ts_dyn_result({}, {}, 0)", v(0), v(1)), false),

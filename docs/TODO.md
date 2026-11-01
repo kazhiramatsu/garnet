@@ -12710,14 +12710,23 @@ Where it stopped (branch `s363-dc`, worktree `build/wt_dc`, on top of `s362-wip`
   `function* g(a, ...r)` bound `r` to the next argument, `async function f(...r)` too. The coroutine entry gathers it
   now, and the arguments array there no longer stores through a frame the allocation may have moved
   (`functions/rest_parameter_patterns`).
+- **Found on the way, all silent and all older than this session:** the name of a named function expression at module
+  level read undefined from its body and from closures in it (`const f = function g() { return [1].map(() => g); }`;
+  its owner was no function, so nothing captured it, and a recursive call from a closure was "not a function"). An
+  object spread set instead of defining, so a setter on the literal ran. `{ toString: undefined }` still took the
+  method. `super.x` of what a class's parents do not declare read undefined, whatever the prototypes held. A store
+  through `super` to a frozen receiver did nothing. `x in (x = "other", o)` read the key late, `new x(x = 1)` the callee.
+  `Object.prototype.toString` as a value ran an array's join, and functions had no tag.
+- `docs/generator_functions_design.md`: a generator function's `prototype` and the objects generator and async functions
+  inherit from. Typed arrays, ArrayBuffer and SharedArrayBuffer construct as values and as bases.
 - `language/expressions` was last measured in full at 9,260 of 11,152, before dynamic classes, `yield*` and ToPrimitive;
   a rerun of the failures on an earlier state of this branch passed 1,920 of 2,803. Measure again before quoting a
   number. `scripts/test262/gen.mjs` now records the cases that build code from strings, `summary.py` counts them
   `no-eval`.
-- Still open in `language/expressions`: frozen array descriptors, `Symbol.prototype` and wrappers, a generator
-  function's `.prototype` and `%GeneratorFunction.prototype%` (plan: one prototype per code in a static slot the entry
-  links, `Object.getPrototypeOf(g)` set when the function is boxed, no cost on a step), typed arrays, ArrayBuffer and
-  String as dynamic bases, `super.x` over ES5 parents, a static double `super()`, a Proxy's ownKeys order in spread and
-  rest, IteratorClose on a generator's return in assignment patterns, TDZ through closures, `Date()` as a string and
-  `Date.prototype` (`"getTime" in date` is false, silent), `yield*` with an abrupt `next` getter.
+- Still open in `language/expressions`: frozen array descriptors, `Symbol.prototype` and wrappers, String as a dynamic
+  base, a second `super()` (a typed class's, and through an arrow), `super` in a static method after
+  `Object.setPrototypeOf(C, null)` (the class value and the static container are two objects), IteratorClose on a
+  generator's return in assignment patterns, TDZ through closures, `Date()` as a string and `Date.prototype`
+  (`"getTime" in date` is false, silent), `Promise.prototype` as a value, a leftover unhandled rejection after `yield*`
+  over a `then` getter that throws, private names per evaluation.
 - Then the rest of test262 (statements, built-ins, annexB), BigInt, dynamic import, the elements kinds above.

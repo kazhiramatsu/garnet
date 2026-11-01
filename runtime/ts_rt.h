@@ -1452,6 +1452,8 @@ typedef struct ts_func {
   /* 1: the constructor of a dynamic class (docs/dynamic_classes_design.md): `new` leaves new.target and
      the active function for its entry; its `prototype` is read only. */
   uint8_t dyn_class : 1;
+  /* 1: a generator function: `prototype` is the one its generators get (docs/generator_functions_design.md) */
+  uint8_t gen_fn : 1;
   /* For a CLASS VALUE (a class used as a runtime value, `const K = C`): the
      class id PLUS ONE (0 = ordinary function/closure, not a constructor). `new K()`
      reads this via ts_construct. code holds the constructor cfunc; env holds the
@@ -2078,6 +2080,14 @@ tsv    ts_reflect_has(tsv t, tsv k);
 tsv    ts_reflect_set(tsv t, tsv k, tsv v);
 tsv    ts_reflect_get_recv(tsv t, tsv k, tsv receiver);
 tsv    ts_reflect_set_recv(tsv t, tsv k, tsv v, tsv receiver);
+/* `super.x = v`: Set on the parent chain with `this` the receiver; a refusal is a TypeError */
+tsv    ts_super_set(tsv proto, tsv k, tsv v, tsv receiver);
+/* the member of a call is read before its arguments run: a nullish receiver throws first */
+void   ts_throw_method_receiver(tsv v, const char* name);
+static inline tsv ts_method_receiver(tsv v, const char* name){
+  if (TS_RT_UNLIKELY(ts_is_null(v) || ts_is_undef(v))) ts_throw_method_receiver(v, name);
+  return v;
+}
 tsv    ts_reflect_delete(tsv t, tsv k);
 tsv    ts_reflect_set_proto(tsv t, tsv p);
 tsv    ts_reflect_define_property(tsv t, tsv k, tsv d);
@@ -4177,6 +4187,8 @@ tsv ts_abortcontrollerproto_abort(tsv* a, int n);
 
 /* generators */
 tsv ts_gen_new_v(tsv cv);
+tsv ts_gen_new_fn(tsv cv, uint32_t fnid);   /* a generator of the function `fnid` */
+tsv ts_set_fn_kind(tsv fv, int kind, uint32_t fnid);   /* a generator or async function boxed as a value */
 tsv ts_gen_next(tsv genobj, tsv sent);
 tsv ts_gen_step(tsv genobj, tsv sent);   /* a driver's step: the coroutine's own result object (emit_c generator.step) */
 tsv ts_asyncgen_next(tsv genobj, tsv sent);
@@ -4194,6 +4206,7 @@ tsv ts_asyncgen_return(tsv genobj, tsv val);
 tsv ts_gen_throw(tsv genobj, tsv exc);
 tsv ts_gen_return(tsv genobj, tsv val);
 tsv ts_asyncgen_new_v(tsv cv);
+tsv ts_asyncgen_new_fn(tsv cv, uint32_t fnid);
 tsv ts_iter_result(tsv value, int done);
 int ts_is_gen_return_completion(tsv v);
 tsv ts_gen_return_completion_value(tsv v);

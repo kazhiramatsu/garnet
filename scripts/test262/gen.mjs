@@ -28,7 +28,7 @@ const dstOf = (rel) => path.join(out, rel.replace(/\.js$/, ".ts").replace(/[^A-Z
 const slugOf = (rel) => rel.replace(/\.js$/, "").replace(/[^A-Za-z0-9_\/.-]/g, "_").replaceAll("/", "__");
 const meta = [];
 // The case builds code from a string at run time, which a compiled program has no engine for.
-const usesRuntimeCode = (body) => /\beval\s*\(|\bnew\s+\w*Function\s*\(|(^|[^.\w])(\w*Function)\s*\(\s*['"`]/m.test(body);
+const usesRuntimeCode = (body) => /\beval\s*\(|\(\s*0\s*,\s*eval\s*\)|\bnew\s+\w*Function\s*\(|(^|[^.\w])(\w*Function)\s*\(\s*['"`]/m.test(body);
 function compose(file, rel) {
   const text = fs.readFileSync(file, "utf8");
   const dst = dstOf(rel);

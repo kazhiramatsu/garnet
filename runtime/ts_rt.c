@@ -2316,6 +2316,7 @@ void ts_set_fn_prototype_lazy(tsv fn){
   f->ctor_pending = 0;
   f->proto_lazy = 1;
 }
+static void gen_fn_prototype_stored(ts_func* f, tsv val);
 /* An own `.prototype` exists while the slot holds an object or is pending. */
 static inline int fn_has_own_prototype(const ts_func* f){
   return !ts_is_undef(f->prototype_prop) || f->proto_lazy;
@@ -4134,6 +4135,7 @@ void ts_set(tsv obj, ts_key key, tsv val){
       /* a class's prototype is not writable, nor a frozen function's */
       if (ts_is_class_value(obj) || f->dyn_class || (ts_obj_integrity(&f->o) & 1u)){ ts_throw_readonly_write(obj, key); return; }
       f->prototype_prop = val; f->ctor_pending = 0; f->proto_lazy = 0; ts_write_barrier(obj, val);
+      if (TS_RT_UNLIKELY(f->gen_fn)) gen_fn_prototype_stored(f, val);
       return;
     }
     /* `name` and `length` are read-only (docs/function_own_properties_design.md) */
@@ -5705,6 +5707,8 @@ tsv ts_regexp_last_index_write(tsv re, tsv v){
 static tsv ts_prim_method(tsv v, uint32_t field_key, uint32_t method_key){
   tsv m = ts_get(v, field_key);
   if (ts_is_callable(m)) return m;
+  /* an own property of that name that is no function shadows the method: `{ toString: undefined }` */
+  if (ts_is_propbag(v) && !ts_is_func(v) && pref_ok(prop_find((ts_object*)ts_ptr(v), field_key))) return TS_UNDEFINED;
   if (method_key){ m = ts_get(v, method_key); if (ts_is_callable(m)) return m; }
   return TS_UNDEFINED;
 }
@@ -12229,11 +12233,21 @@ tsv ts_object_entries(tsv obj){
 /* Object.assign(target, ...srcs): copy each src's own enumerable data props
    (struct fields + prop map) onto target. */
 typedef struct { tsv target; tsv recv; } enum_copy_ctx;
+static void ts_proxy_copy(tsv pv, const uint32_t* excl, int nexcl, ts_prop_enum_cb cb, void* ud);
 static void cb_copy_to_target(uint32_t key, tsv val, void* ud){
   enum_copy_ctx* c=(enum_copy_ctx*)ud;
   tsv resolved = enum_resolve_value(c->recv, val);   /* accessor -> getter */
   ts_gc_root(&resolved);
   ts_set(c->target, key, resolved);
+  ts_gc_unroot(1);
+}
+/* An object spread defines (CreateDataProperty): a setter of that name on the literal or its chain is not
+   called, and an accessor the literal defined is replaced. Object.assign sets. */
+static void cb_spread_to_target(uint32_t key, tsv val, void* ud){
+  enum_copy_ctx* c=(enum_copy_ctx*)ud;
+  tsv resolved = enum_resolve_value(c->recv, val);
+  ts_gc_root(&resolved);
+  ts_define_data(c->target, key, resolved, 1, 1, 1);
   ts_gc_unroot(1);
 }
 /* The own enumerable symbol-keyed properties of a source, visited after its string keys: Object.assign
@@ -12278,8 +12292,11 @@ tsv ts_object_assign(tsv* args, int n){
     if (ts_is_map(src) || ts_is_set(src) || (!ts_is_obj(src) && !ts_is_class_value(src) && !ts_is_str(src))) continue;  /* arrays/strings OK (index keys) */
     ts_gc_root(&src);
     c.recv = src;   /* accessor getters run with this=src */
-    ts_prop_own_enum(src, cb_copy_to_target, &c);
-    ts_prop_own_enum_symbols(src, cb_copy_to_target, &c);
+    if (g_has_proxies && ts_is_proxy(src)) ts_proxy_copy(src, NULL, 0, cb_copy_to_target, &c);
+    else {
+      ts_prop_own_enum(src, cb_copy_to_target, &c);
+      ts_prop_own_enum_symbols(src, cb_copy_to_target, &c);
+    }
     ts_gc_unroot(1);
   }
   ts_gc_unroot(1);
@@ -15116,8 +15133,11 @@ void ts_object_copy_props(tsv dst, tsv src){
   if (ts_is_map(src) || ts_is_set(src) || (!ts_is_obj(src) && !ts_is_func(src) && !ts_is_class_value(src) && !ts_is_str(src))) return;
   ts_gc_root(&dst); ts_gc_root(&src);
   enum_copy_ctx c; c.target=dst; c.recv=src;
-  ts_prop_own_enum(src, cb_copy_to_target, &c);
-  ts_prop_own_enum_symbols(src, cb_copy_to_target, &c);
+  if (g_has_proxies && ts_is_proxy(src)) ts_proxy_copy(src, NULL, 0, cb_spread_to_target, &c);
+  else {
+    ts_prop_own_enum(src, cb_spread_to_target, &c);
+    ts_prop_own_enum_symbols(src, cb_spread_to_target, &c);
+  }
   ts_gc_unroot(2);
 }
 
@@ -15889,9 +15909,9 @@ TS_TAG_STATIC(g_tag_object, "[object Object]", 15)
 tsv ts_objproto_tostring_call(tsv v){
   if (ts_is_undef(v)) return TS_TAG(g_tag_undefined);
   if (ts_is_null(v))  return TS_TAG(g_tag_null);
-  /* arrays/plain objects can carry [Symbol.toStringTag]; funcs/primitives don't.
+  /* arrays, plain objects and functions (a generator's) can carry [Symbol.toStringTag]; primitives don't.
      Keep v/tag rooted and copy tag bytes before the result allocation. */
-  if (ts_is_obj(v) && !ts_is_symbol(v)){
+  if ((ts_is_obj(v) && !ts_is_symbol(v)) || ts_is_func(v)){
     ts_gc_root(&v);
     tsv tag = ts_get(v, TS_KEY_WKSYM(TS_WKSYM_TO_STRING_TAG));
     if (ts_is_str(tag)){
@@ -16893,16 +16913,16 @@ tsv ts_array_buffer_proto(int shared){
 /* The constructor values (Int8Array .. Float64Array, ArrayBuffer and
    SharedArrayBuffer), made with the prototypes (each prototype's
    `constructor`): their prototypes, BYTES_PER_ELEMENT and the static methods.
-   `new T(...)` is lowered statically; calling a constructor value throws, as
-   constructing through one does (like the other builtin constructors held as
-   values). The program's global object holds them when it reads one. */
+   `new T(...)` is lowered statically; a constructor value constructs through
+   ts_construct (a subclass's super(), `new V()`) and throws when called plainly.
+   The program's global object holds them when it reads one. */
 static void ta_requires_new(const char* name){
   char buf[96];
   snprintf(buf, sizeof buf, "Constructor %s requires 'new'", name);
   ts_throw_type_error_msg(buf);
 }
 #define TA_CTOR_ADAPTERS(E) \
-  static tsv ta_ctor_call_##E(tsv* a, int n){ (void)a; (void)n; ta_requires_new(g_ta_name[E]); return TS_UNDEFINED; } \
+  static tsv ta_ctor_call_##E(tsv* a, int n){ if (!ts_native_new_take()) ta_requires_new(g_ta_name[E]); return ts_new_typed_array(E, a, n); } \
   static tsv ta_static_from_##E(tsv* a, int n){ \
     return ts_typed_array_from(E, n > 0 ? a[0] : TS_UNDEFINED, n > 1 ? a[1] : TS_UNDEFINED, n > 2 ? a[2] : TS_UNDEFINED); } \
   static tsv ta_static_of_##E(tsv* a, int n){ return ts_typed_array_of(E, a, n); }
@@ -16915,8 +16935,8 @@ static const ts_code g_ta_static_from[TS_TA_COUNT] = { ta_static_from_0, ta_stat
   ta_static_from_3, ta_static_from_4, ta_static_from_5, ta_static_from_6, ta_static_from_7, ta_static_from_8 };
 static const ts_code g_ta_static_of[TS_TA_COUNT] = { ta_static_of_0, ta_static_of_1, ta_static_of_2,
   ta_static_of_3, ta_static_of_4, ta_static_of_5, ta_static_of_6, ta_static_of_7, ta_static_of_8 };
-static tsv ab_ctor_call_0(tsv* a, int n){ (void)a; (void)n; ta_requires_new("ArrayBuffer"); return TS_UNDEFINED; }
-static tsv ab_ctor_call_1(tsv* a, int n){ (void)a; (void)n; ta_requires_new("SharedArrayBuffer"); return TS_UNDEFINED; }
+static tsv ab_ctor_call_0(tsv* a, int n){ if (!ts_native_new_take()) ta_requires_new("ArrayBuffer"); return ts_new_array_buffer(n ? a[0] : TS_UNDEFINED, 0); }
+static tsv ab_ctor_call_1(tsv* a, int n){ if (!ts_native_new_take()) ta_requires_new("SharedArrayBuffer"); return ts_new_array_buffer(n ? a[0] : TS_UNDEFINED, 1); }
 static tsv ab_static_is_view(tsv* a, int n){ return ts_bool(n > 0 && ts_array_buffer_is_view(a[0])); }
 static void ta_static_fn(tsv obj, const char* name, ts_code fn, uint32_t arity){
   tsv fv = ts_make_fn_t(fn, NULL, 0, 0); ts_gc_root(&fv);
@@ -16928,6 +16948,7 @@ static tsv ta_ctor_value(const char* name, ts_code call, uint32_t arity, tsv pro
   ts_gc_root(&proto);
   tsv f = ts_make_fn_t(call, NULL, 0, 0); ts_gc_root(&f);
   ts_set_fn_meta(f, arity, name);
+  ts_fn_mark_native_ctor(f);
   ts_define_data(f, ts_intern_field("prototype", 9), proto, 0, 0, 0);
   ts_define_data(proto, ts_intern_field("constructor", 11), f, 0, 1, 1);
   ts_gc_unroot(2);
@@ -18341,8 +18362,11 @@ tsv ts_object_rest(tsv src, const uint32_t* excl, int nexcl){
   /* the sources of a spread: an array's indices, a string's, a function's own properties, the symbols */
   if (ts_is_map(src) || ts_is_set(src) || (!ts_is_obj(src) && !ts_is_func(src) && !ts_is_class_value(src) && !ts_is_str(src))) { ts_gc_unroot(2); return dst; }
   enum_rest_ctx c; c.dst=dst; c.excl=excl; c.nexcl=nexcl; c.recv=src;
-  ts_prop_own_enum(src, cb_rest_copy, &c);
-  ts_prop_own_enum_symbols(src, cb_rest_copy, &c);
+  if (g_has_proxies && ts_is_proxy(src)) ts_proxy_copy(src, excl, nexcl, cb_rest_copy, &c);
+  else {
+    ts_prop_own_enum(src, cb_rest_copy, &c);
+    ts_prop_own_enum_symbols(src, cb_rest_copy, &c);
+  }
   ts_gc_unroot(2);
   return dst;
 }
@@ -18364,6 +18388,8 @@ void ts_throw_receiver(tsv s){
   ts_throw_type_error_msg("a value typed as a string is not one");
   abort();
 }
+static tsv ts_throw_cannot_read(tsv obj, const char* prop);
+void ts_throw_method_receiver(tsv v, const char* name){ ts_throw_cannot_read(v, name); }
 static tsv ts_throw_cannot_read(tsv obj, const char* prop){
   const char* what = ts_is_null(obj) ? "null" : "undefined";
   char buf[256];
@@ -19725,6 +19751,13 @@ static int receiver_part_set(tsv r, ts_key key, tsv v){
   ts_gc_unroot(2);
   return ok;
 }
+tsv ts_super_set(tsv proto, tsv k, tsv v, tsv receiver){
+  ts_gc_root(&v);
+  tsv ok = ts_reflect_set_recv(proto, k, v, receiver);
+  ts_gc_unroot(1);
+  if (!ts_truthy(ok)) ts_throw_type_error_msg("Cannot assign to a read only property through super");
+  return v;
+}
 tsv ts_reflect_set_recv(tsv t, tsv k, tsv v, tsv r){
   if (r == t || !ts_is_obj(t) || ts_same_cell(r, t)) return ts_reflect_set(t, k, v);
   if (g_has_proxies && ts_is_proxy(t)) return ts_bool(ts_proxy_set_v(t, k, v, r));
@@ -20426,6 +20459,28 @@ static void ts_proxy_enum(tsv pv, ts_prop_enum_cb cb, void* ud){
         cb(k, val, ud);
       }
     }
+    ts_gc_unroot(1);
+  }
+  ts_gc_unroot(2);
+}
+
+/* CopyDataProperties from a Proxy: ownKeys, then key by key in its order, symbols where the trap put them,
+   the own descriptor and, for an enumerable property, the value. An excluded key asks neither. */
+static void ts_proxy_copy(tsv pv, const uint32_t* excl, int nexcl, ts_prop_enum_cb cb, void* ud){
+  ts_gc_root(&pv);
+  tsv keys = ts_proxy_own_keys_arr(pv);
+  ts_gc_root(&keys);
+  uint32_t n = ts_is_indexed_array_fast(keys) ? ts_array_len(keys) : 0;
+  for (uint32_t i=0;i<n;i++){
+    tsv kv = ts_array_get(keys, i);
+    ts_key k;
+    if (!ts_key_from_value(kv, &k)) continue;
+    int excluded = 0;
+    for (int j=0;j<nexcl;j++) if (excl[j] == k) excluded = 1;
+    if (excluded) continue;
+    ts_gc_root(&kv);
+    tsv desc = ts_proxy_get_own_desc(pv, kv);
+    if (ts_is_obj(desc) && pd_bool(desc, "enumerable")) cb(k, ts_proxy_get_v(pv, kv, pv), ud);
     ts_gc_unroot(1);
   }
   ts_gc_unroot(2);
@@ -23900,6 +23955,89 @@ static void ts_generator_proto_init(int async){
   ts_define_data(g_generator_protos[async], TS_KEY_WKSYM(TS_WKSYM_TO_STRING_TAG), tag, 0, 0, 1);
   ts_gc_unroot(2);
 }
+/* A generator function's `prototype` (docs/generator_functions_design.md): one object per function code,
+   the prototype of the generators that code makes, so the entry needs no function value and a generator
+   costs one test more. Old from the start, as a function's prototype is. */
+typedef struct gen_slot { tsv proto; int rooted; void* code; } gen_slot;
+static gen_slot** g_gen_slots = NULL;
+static uint32_t g_gen_slot_cap = 0;
+static gen_slot* gen_slot_of(uint32_t fnid, int async){
+  if (fnid >= g_gen_slot_cap){
+    uint32_t cap = g_gen_slot_cap ? g_gen_slot_cap : 64;
+    while (cap <= fnid) cap *= 2;
+    g_gen_slots = (gen_slot**)realloc(g_gen_slots, sizeof(gen_slot*) * cap);
+    memset(g_gen_slots + g_gen_slot_cap, 0, sizeof(gen_slot*) * (cap - g_gen_slot_cap));
+    g_gen_slot_cap = cap;
+  }
+  gen_slot* s = g_gen_slots[fnid];
+  if (TS_RT_UNLIKELY(!s)){
+    s = (gen_slot*)calloc(1, sizeof(gen_slot));
+    if (!s) abort();
+    g_gen_slots[fnid] = s;
+    s->proto = TS_UNDEFINED;
+    ts_root_static_once(&s->proto, &s->rooted);
+    ts_generator_proto_init(async);
+    s->proto = ts_new_proto_pretenured();
+    ((ts_object*)ts_ptr(s->proto))->proto = g_generator_protos[async];
+  }
+  return s;
+}
+/* `g.prototype = x`: the generators made from then on. A value that is no object leaves them %GeneratorPrototype%. */
+static void gen_fn_prototype_stored(ts_func* f, tsv val){
+  for (uint32_t i = 0; i < g_gen_slot_cap; i++) if (g_gen_slots[i] && g_gen_slots[i]->code == f->code) g_gen_slots[i]->proto = val;
+}
+static tsv gen_instance_proto(uint32_t fnid, int async){
+  tsv p = gen_slot_of(fnid, async)->proto;
+  return ts_proto_ref(p) ? p : g_generator_protos[async];
+}
+/* %GeneratorFunction.prototype%, %AsyncGeneratorFunction.prototype%, %AsyncFunction.prototype%. Their
+   constructors build code from strings, so they throw. */
+static tsv g_genfn_protos[3] = {TS_NULL, TS_NULL, TS_NULL};
+static tsv ts_genfn_ctor(tsv* a, int n){
+  (void)a; (void)n; ts_native_new_take();
+  ts_throw_eval_error_msg("Code generation from strings is not available in a compiled program (a function constructor)");
+  return TS_UNDEFINED;
+}
+static tsv genfn_proto(int kind){
+  if (g_genfn_protos[kind] != TS_NULL) return g_genfn_protos[kind];
+  static int rooted[3];
+  static const char* const names[3] = {"GeneratorFunction", "AsyncGeneratorFunction", "AsyncFunction"};
+  if (kind < 2) ts_generator_proto_init(kind);
+  tsv p = ts_new_proto_pretenured();
+  g_genfn_protos[kind] = p;
+  ts_root_static_once(&g_genfn_protos[kind], &rooted[kind]);
+  ((ts_object*)ts_ptr(p))->proto = ts_function_proto();
+  tsv ctor = ts_make_fn_t(ts_genfn_ctor, NULL, 0, 0); ts_gc_root(&ctor);
+  ts_set_fn_meta(ctor, 1, names[kind]);
+  ts_fn_mark_native_ctor(ctor);
+  ts_define_data(ctor, ts_intern_field("prototype", 9), g_genfn_protos[kind], 0, 0, 0);
+  ts_define_data(g_genfn_protos[kind], ts_intern_field("constructor", 11), ctor, 0, 0, 1);
+  tsv tag = ts_new_string(names[kind], (uint32_t)strlen(names[kind])); ts_gc_root(&tag);
+  ts_define_data(g_genfn_protos[kind], TS_KEY_WKSYM(TS_WKSYM_TO_STRING_TAG), tag, 0, 0, 1);
+  ts_gc_unroot(2);
+  if (kind < 2){
+    ts_define_data(g_genfn_protos[kind], ts_intern_field("prototype", 9), g_generator_protos[kind], 0, 0, 1);
+    ts_define_data(g_generator_protos[kind], ts_intern_field("constructor", 11), g_genfn_protos[kind], 0, 0, 1);
+  }
+  return g_genfn_protos[kind];
+}
+/* A generator or async function boxed as a value: kind 1 generator, 2 async generator, 3 async. */
+tsv ts_set_fn_kind(tsv fv, int kind, uint32_t fnid){
+  ts_gc_root(&fv);
+  tsv p = genfn_proto(kind - 1);
+  ((ts_func*)ts_ptr(fv))->o.proto = p;
+  ts_write_barrier(fv, p);
+  if (kind < 3){
+    gen_slot* s = gen_slot_of(fnid, kind - 1);
+    ts_func* f = (ts_func*)ts_ptr(fv);
+    s->code = f->code;
+    f->prototype_prop = s->proto;
+    f->gen_fn = 1;
+    ts_write_barrier(fv, s->proto);
+  }
+  ts_gc_unroot(1);
+  return fv;
+}
 tsv ts_gen_new_v(tsv cv){
   ts_gc_root(&cv);
   ensure_gen_fields();
@@ -23907,6 +24045,17 @@ tsv ts_gen_new_v(tsv cv){
   tsv g = ts_new_object_layout(&g_gen_layout);
   ts_gc_root(&g);
   obj_link_fresh_proto(g, g_generator_protos[0]);
+  ts_lit_store(g, 0, cv);   /* __coro: the coroutine (OBJECT-tagged, kind CORO) */
+  ts_gc_unroot(2);
+  return g;
+}
+tsv ts_gen_new_fn(tsv cv, uint32_t fnid){
+  ts_gc_root(&cv);
+  ensure_gen_fields();
+  ts_generator_proto_init(0);
+  tsv g = ts_new_object_layout(&g_gen_layout);
+  ts_gc_root(&g);
+  obj_link_fresh_proto(g, gen_instance_proto(fnid, 0));
   ts_lit_store(g, 0, cv);   /* __coro: the coroutine (OBJECT-tagged, kind CORO) */
   ts_gc_unroot(2);
   return g;
@@ -24306,18 +24455,20 @@ tsv ts_iter_result(tsv value, int done){
   return r;
 }
 /* async-generator object: same shape as a sync generator (holds __coro). */
-tsv ts_asyncgen_new_v(tsv cv){
+static tsv asyncgen_new(tsv cv, int fnid){
   ts_gc_root(&cv);
   ensure_gen_fields();
   ts_generator_proto_init(1);
   if (ts_is_coro_value(cv)) ((ts_coro*)ts_ptr(cv))->is_asyncgen=1;
   tsv g = ts_new_object();
   ts_gc_root(&g);
-  obj_link_fresh_proto(g, g_generator_protos[1]);
+  obj_link_fresh_proto(g, fnid < 0 ? g_generator_protos[1] : gen_instance_proto((uint32_t)fnid, 1));
   ts_set(g, F_coro, cv);
   ts_gc_unroot(2);
   return g;
 }
+tsv ts_asyncgen_new_v(tsv cv){ return asyncgen_new(cv, -1); }
+tsv ts_asyncgen_new_fn(tsv cv, uint32_t fnid){ return asyncgen_new(cv, (int)fnid); }
 static void asyncgen_pop_head(ts_coro* c){
   ts_asyncgen_req* r=c->ag_head;
   if (!r) return;

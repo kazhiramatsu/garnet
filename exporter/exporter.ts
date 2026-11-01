@@ -2052,6 +2052,13 @@ class Exporter {
    *  snapshot that operand into a fresh local (Copy) so its value is fixed at its
    *  evaluation point. (Only aliasing bare-variable reads need this; every other
    *  expression already lands its value in a fresh local at its own instruction.) */
+  /** The callee of a `new`: read before the arguments, which may reassign the variable (`new x(x = 1)`). */
+  private lowerNewCallee(ctx: FnCtx, node: ts.NewExpression, callee: number): number {
+    if (!this.isMutableStorageLocal(ctx, callee) || !(node.arguments ?? []).some((a) => this.mayHaveSideEffect(a))) return callee;
+    const s = this.newLocal(ctx, "reference");
+    ctx.body.push({ kind: "Copy", dst: s, src: callee });
+    return s;
+  }
   lowerSequenced(ctx: FnCtx, exprs: readonly ts.Expression[]): number[] {
     const out: number[] = [];
     for (let i = 0; i < exprs.length; i++) {
@@ -2430,7 +2437,10 @@ class Exporter {
     // bodies inline into __module_init, so their bindings live there too). Both are
     // recorded in moduleScopeSyms, which is the authority; `enc === undefined`
     // confirms there is no enclosing real function.
-    if (enc === undefined && this.moduleInitNode && this.moduleScopeSyms.has(s)) {
+    // So is the name of a named function expression written there: its body and the closures inside it
+    // reached a local nobody set (`const f = function g() { return [1].map(() => g); }` read undefined).
+    if (enc === undefined && this.moduleInitNode && (this.moduleScopeSyms.has(s) ||
+        (d !== undefined && ts.isFunctionExpression(d) && d.name !== undefined && this.symbolOf(d.name) === s))) {
       return this.moduleInitNode;
     }
     return enc;
@@ -5310,7 +5320,7 @@ class Exporter {
         const ct = this.checker.getTypeAtLocation(node.expression);
         if ((ct.flags & ts.TypeFlags.Any) !== 0) {
           const args = node.arguments ? Array.from(node.arguments) : [];
-          const callee = this.lowerExpr(ctx, node.expression);
+          const callee = this.lowerNewCallee(ctx, node, this.lowerExpr(ctx, node.expression));
           const ddst = this.newLocal(ctx, "reference", hint);
           if (args.some((a) => ts.isSpreadElement(a))) {
             // `new x(...spread)`: materialize an argument array and construct via
@@ -5346,7 +5356,7 @@ class Exporter {
         const callee = target.kind === "functionValue" && nodePreludeFile !== undefined && ts.isIdentifier(node.expression) &&
             node.expression.text === "String" && this.isAmbientGlobalSymbol(this.symbolOf(node.expression))
           ? this.loadGlobalObjectProperty(ctx, "__garnet_StringObject")
-          : this.lowerExpr(ctx, node.expression);
+          : this.lowerNewCallee(ctx, node, this.lowerExpr(ctx, node.expression));
         const dargs = this.lowerSequenced(ctx, node.arguments ?? []);
         const ddst = this.newLocal(ctx, "reference", hint);
         this.emitNewMaybeGuarded(ctx, node, ddst, callee, dargs);
@@ -5363,7 +5373,7 @@ class Exporter {
           const ambient = this.isAmbientGlobalSymbol(this.symbolOf(node.expression));
           const ct = this.checker.getTypeAtLocation(node.expression);
           if (!ambient && ct.getConstructSignatures && ct.getConstructSignatures().length > 0) {
-            const callee = this.lowerExpr(ctx, node.expression);
+            const callee = this.lowerNewCallee(ctx, node, this.lowerExpr(ctx, node.expression));
             const dargs = this.lowerSequenced(ctx, node.arguments ?? []);
             const ddst = this.newLocal(ctx, "reference", hint);
             this.emitNewMaybeGuarded(ctx, node, ddst, callee, dargs);
@@ -5383,7 +5393,7 @@ class Exporter {
     // value. ts_construct enforces constructability for any/untyped inputs.
     if (ts.isNewExpression(node)) {
       const args = node.arguments ? Array.from(node.arguments) : [];
-      const callee = this.lowerExpr(ctx, node.expression);
+      const callee = this.lowerNewCallee(ctx, node, this.lowerExpr(ctx, node.expression));
       const ddst = this.newLocal(ctx, "reference", hint);
       if (args.some((a) => ts.isSpreadElement(a))) {
         const site = this.site++;
@@ -5628,10 +5638,7 @@ class Exporter {
       return dst;
     }
     if (ts.isIdentifier(node)) return this.lowerIdentifier(ctx, node);
-    if (node.kind === ts.SyntaxKind.ThisKeyword && ctx.thisBeforeSuper) {
-      // a derived class's `this` written ahead of its super(): the checker refuses it, a program it does not check throws
-      ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "dynclass.thisCheck", args: [this.undefLocal(ctx)] });
-    }
+    if (node.kind === ts.SyntaxKind.ThisKeyword && ctx.thisBeforeSuper) this.checkThisBound(ctx);
     if (node.kind === ts.SyntaxKind.ThisKeyword && ctx.dynCtor?.derived) {
       // no `this` before super() has returned
       const dst = this.newLocal(ctx, "reference");
@@ -5715,15 +5722,17 @@ class Exporter {
             return dst;
           }
         }
+        return this.lowerSuperRead(ctx, node);
       }
       // INSTANCE `super.x` READ: [[Get]] on the parent PROTOTYPE with this=receiver.
       // A parent getter is invoked (this=instance), a parent method yields its function
-      // value, and ANYTHING ELSE — an instance DATA field (which lives on the instance,
-      // not the prototype), a setter-only accessor, or an absent member — reads as
-      // undefined (matching JS). The getter is Direct-called via `recv` (not args[0]),
-      // so SROA's inline_callee scalar-replaces its `this.field` read on a non-escaping
-      // instance (§86). `super.m()` calls are handled earlier in the call path.
+      // value, and anything else goes to the chain: an instance DATA field (which lives on
+      // the instance, not the prototype) and a setter-only accessor read as undefined there,
+      // a property the program put on a prototype is found. The getter is Direct-called via
+      // `recv` (not args[0]), so SROA's inline_callee scalar-replaces its `this.field` read on
+      // a non-escaping instance (§86). `super.m()` calls are handled earlier in the call path.
       if (node.expression.kind === ts.SyntaxKind.SuperKeyword && ctx.currentClass !== undefined && ctx.thisLocal !== undefined) {
+        this.checkThisBound(ctx);
         const parent = this.parentIdOf(ctx.currentClass);
         if (parent !== undefined) {
           const gfn = this.resolveMemberFunc(parent, node.name.text, "getter");
@@ -5742,9 +5751,7 @@ class Exporter {
             return dst;
           }
         }
-        const dst = this.newLocal(ctx, "reference");
-        ctx.body.push({ kind: "Const", dst, value: { kind: "Undef" } });
-        return dst;
+        return this.lowerSuperRead(ctx, node);
       }
       if (node.name.text === "prototype") {
         const classId = this.classIdOfIdentifier(node.expression);
@@ -7213,6 +7220,10 @@ class Exporter {
             // the name. methodField lets the dynamic path try the OWN property
             // (field-key) first (object-literal methods, `{g: fn}`, own-field
             // shadowing) before the prototype method-key.
+            // The member is read before the arguments are evaluated: a nullish receiver throws first.
+            if (recv !== undefined && node.arguments.some((a) => this.mayHaveSideEffect(a))) {
+              ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: `method.receiver:${fn.name.text}`, args: [recv] });
+            }
             callee = {
               kind: "Method",
               recvClass: 0xffffffff,
@@ -7345,8 +7356,7 @@ class Exporter {
         return dst;
       }
       // dynamic key (string-valued expression): intern at runtime.
-      const key = this.lowerExpr(ctx, node.left);
-      const obj = this.lowerExpr(ctx, node.right);
+      const [key, obj] = this.lowerSequenced(ctx, [node.left, node.right]);
       const dst = this.newLocal(ctx, "reference");
       ctx.body.push({ kind: "HasFieldDynamic", dst, obj, key });
       return dst;
@@ -13748,7 +13758,10 @@ class Exporter {
     }
     // element access: object then key (JS order), each snapshotted if needed
     const ea = lhs as ts.ElementAccessExpression;
-    if (ea.expression.kind === ts.SyntaxKind.SuperKeyword) return { key: snap(this.lowerExpr(ctx, ea.argumentExpression), ea.argumentExpression) };
+    if (ea.expression.kind === ts.SyntaxKind.SuperKeyword) {
+      this.checkThisBound(ctx);
+      return { key: snap(this.lowerExpr(ctx, ea.argumentExpression), ea.argumentExpression) };
+    }
     const obj = snap(this.lowerExpr(ctx, ea.expression), ea.expression);
     const key = snap(this.lowerExpr(ctx, ea.argumentExpression), ea.argumentExpression);
     return { obj, key };
@@ -13881,7 +13894,7 @@ class Exporter {
         ctx.body.push({ kind: "LoadField", dst: h, obj: ctx.cellAccess.get(this.lexicalHomeSym)!, field: this.VALUE });
         const proto = this.newLocal(ctx, "reference");
         ctx.body.push({ kind: "CallBuiltinStatic", dst: proto, builtin: "reflect.getPrototypeOf", args: [h] });
-        ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "reflect.set",
+        ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "super.set",
           args: [proto, this.constString(ctx, lhs.name.text), rhs, ctx.thisLocal!] });
         return;
       }
@@ -13940,10 +13953,9 @@ class Exporter {
           // receiver instance, skipping any prototype setter. A normal dynamic store
           // routes through ts_set and would invoke the current prototype setter, so
           // define an own enumerable/writable/configurable data property directly.
-          const keyL = this.newLocal(ctx, "reference");
-          ctx.body.push({ kind: "Const", dst: keyL, value: { kind: "Str", value: nm } });
-          ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"),
-            builtin: "object.defineData:1:1:1", args: [ctx.thisLocal, keyL, rhs] });
+          const proto = this.superBase(ctx)!;
+          ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "super.set",
+            args: [proto, this.constString(ctx, nm), rhs, ctx.thisLocal] });
           return;
         }
         // super outside a class method body: fall through to the generic reject.
@@ -14006,7 +14018,7 @@ class Exporter {
       // `super[k] = v`: the write starts at the home object's prototype, the receiver is `this`
       const proto = this.superBase(ctx);
       if (proto === undefined || ctx.thisLocal === undefined) { this.unsupported(lhs, "super outside a method"); return; }
-      ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "reflect.set",
+      ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "super.set",
         args: [proto, pre?.key ?? this.lowerExpr(ctx, lhs.argumentExpression), rhs, ctx.thisLocal] });
     } else if (ts.isElementAccessExpression(lhs)) {
       // obj[symbolKey] = v — symbol-keyed property write (user OR well-known).
@@ -14614,6 +14626,12 @@ class Exporter {
   }
   /** `super.x`, `super[k]`, `super.m(...)` in an object literal's method: the home object's prototype,
    *  the read and the call on `this`. undefined for any other expression. */
+  /** A derived constructor's `this`, a `super` reference among its uses, before super() has returned: the
+   *  checker refuses `this`, a program it does not check throws. */
+  private checkThisBound(ctx: FnCtx): void {
+    if (ctx.thisBeforeSuper) ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "dynclass.thisCheck", args: [this.undefLocal(ctx)] });
+    else if (ctx.dynCtor?.derived) ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "dynclass.thisCheck", args: [ctx.thisLocal!] });
+  }
   /** `super[k]`, and a call of it. */
   private isComputedSuper(node: ts.Expression): boolean {
     const t = ts.isCallExpression(node) ? node.expression : node;
@@ -14622,6 +14640,7 @@ class Exporter {
   /** The object `super` starts at: the prototype of the home object, a literal's (through its cell), the
    *  class's prototype or static container. */
   private superBase(ctx: FnCtx): number | undefined {
+    this.checkThisBound(ctx);
     const home = ctx.cellAccess.get(this.lexicalHomeSym);
     const h = this.newLocal(ctx, "reference");
     if (home !== undefined) ctx.body.push({ kind: "LoadField", dst: h, obj: home, field: this.VALUE });
@@ -14631,6 +14650,14 @@ class Exporter {
     const proto = this.newLocal(ctx, "reference");
     ctx.body.push({ kind: "CallBuiltinStatic", dst: proto, builtin: "reflect.getPrototypeOf", args: [h] });
     return proto;
+  }
+  /** `super.x` off the chain, `this` the receiver. */
+  private lowerSuperRead(ctx: FnCtx, node: ts.PropertyAccessExpression): number {
+    const proto = this.superBase(ctx);
+    if (proto === undefined) { this.unsupported(node, "super outside a method"); return this.newLocal(ctx, "reference"); }
+    const dst = this.newLocal(ctx, "reference");
+    ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "reflect.get", args: [proto, this.constString(ctx, node.name.text), ctx.thisLocal!] });
+    return dst;
   }
   private lowerObjectSuper(ctx: FnCtx, node: ts.Expression): number | undefined {
     if (ctx.thisLocal === undefined) return undefined;
@@ -14690,9 +14717,10 @@ class Exporter {
    *  without one. */
   fnUsesOwnThis(node: ts.FunctionDeclaration | ts.FunctionExpression): boolean {
     let found = false;
-    const visit = (n: ts.Node) => {
+    const visit = (n: ts.Node, inArrow: boolean) => {
       if (found) return;
-      if (n.kind === ts.SyntaxKind.ThisKeyword) { found = true; return; }
+      // an arrow reads `new.target` through the lexical `this`
+      if (n.kind === ts.SyntaxKind.ThisKeyword || (inArrow && ts.isMetaProperty(n) && n.keywordToken === ts.SyntaxKind.NewKeyword)) { found = true; return; }
       if (ts.isFunctionDeclaration(n) || ts.isFunctionExpression(n) ||
           ts.isMethodDeclaration(n) || ts.isGetAccessorDeclaration(n) ||
           ts.isSetAccessorDeclaration(n) || ts.isConstructorDeclaration(n)) return;
@@ -14700,9 +14728,9 @@ class Exporter {
       // above, but a field initializer (`f = () => this.v`) or a static block
       // reads the CLASS's this, not this function's. Don't descend.
       if (ts.isClassDeclaration(n) || ts.isClassExpression(n)) return;
-      ts.forEachChild(n, visit);
+      ts.forEachChild(n, (c) => visit(c, inArrow || ts.isArrowFunction(n)));
     };
-    if (node.body) visit(node.body);
+    if (node.body) visit(node.body, false);
     return found;
   }
 
