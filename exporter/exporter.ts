@@ -946,6 +946,15 @@ class Exporter {
   // Symbols declared at module scope (top-level var/let/const + top-level
   // function/class names). Used to redirect symbolOwnerFunction to moduleInitNode.
   moduleScopeSyms = new Set<ts.Symbol>();
+  /** The modules only `import()` reaches, evaluated when it asks (docs/dynamic_import_design.md), and each one's
+   *  top-level statements as a function of its own. */
+  private lazyModules = new Set<ts.SourceFile>();
+  private lazyInitNodes = new Map<ts.SourceFile, ts.FunctionDeclaration>();
+  private lazyInitFns = new Set<unknown>();
+  /** The targets of `import()`, static or lazy. */
+  private dynamicImportTargets = new Set<ts.SourceFile>();
+  /** The runtime's record of each lazy module and each target. */
+  private importRecords = new Map<ts.SourceFile, number>();
   /** JSX (docs/jsx_react_ssr_design.md): per file, the automatic runtime's module (undefined under the
    *  classic transform) and whether it has a JSX element; per runtime module, the exports it calls. */
   jsxRuntimeModules = new Map<ts.SourceFile, ts.SourceFile | undefined>();
@@ -2937,9 +2946,23 @@ class Exporter {
     if (ts.isBindingElement(p) && (p.name === id || p.propertyName === id)) return false;
     return true;
   }
+  /** A lazy module's top-level bindings are __module_init's, as every module's are: their cells exist from the
+   *  start, a lazy module's function reaches them as any function does. The bindings of its nested blocks are its own. */
   declaredIn(F: FnLike): Set<ts.Symbol> {
     const cached = this.declaredCache.get(F);
     if (cached) return cached;
+    const own = this.declaredInBody(F);
+    let decl = own;
+    if (this.lazyInitFns.has(F)) decl = new Set([...own].filter((s) => !this.moduleScopeSyms.has(s)));
+    else if ((F as unknown) === this.moduleInitNode) {
+      decl = new Set(own);
+      for (const fn of this.lazyInitNodes.values())
+        for (const s of this.declaredInBody(fn as unknown as FnLike)) if (this.moduleScopeSyms.has(s)) decl.add(s);
+    }
+    this.declaredCache.set(F, decl);
+    return decl;
+  }
+  private declaredInBody(F: FnLike): Set<ts.Symbol> {
     const decl = new Set<ts.Symbol>();
     const bind = (name: ts.BindingName) => {
       if (ts.isIdentifier(name)) {
@@ -3016,7 +3039,6 @@ class Exporter {
       });
     };
     if (F.body) visitOwn(F.body);
-    this.declaredCache.set(F, decl);
     return decl;
   }
   collectNested(n: ts.Node, out: FnLike[]) {
@@ -3078,6 +3100,8 @@ class Exporter {
     this.freeInProgress.add(F);
     const decl = this.declaredIn(F);
     const res = new Set<ts.Symbol>();
+    // a lazy module's function initializes the module's bindings, which __module_init holds
+    if (this.lazyInitFns.has(F)) for (const s of this.declaredInBody(F)) if (this.moduleScopeSyms.has(s)) res.add(s);
     const calledFns: FnLike[] = [];
     const nested: FnLike[] = [];
     const ctorRefs: ts.ConstructorDeclaration[] = []; // ctors Direct-called from F (new/super)
@@ -4464,11 +4488,23 @@ class Exporter {
   private materializeNamespace(ctx: FnCtx, moduleSpecifier: ts.Expression, name: ts.Identifier, stmt: ts.Statement): void {
     const target = this.resolveModuleSf(moduleSpecifier);
     if (!target) return;
-    const modSym = this.checker.getSymbolAtLocation(target) ?? (target as unknown as { symbol?: ts.Symbol }).symbol;
+    const modSym = this.moduleSymbolOf(target);
     if (!modSym) return;
-    if (this.moduleNamespaceLocals.has(modSym)) return;
+    const held = this.moduleNamespaceLocals.get(modSym);
+    const obj = this.namespaceOfModule(ctx, modSym, name.text, stmt);
+    if (held !== undefined) return;
+    const aliasSym = this.checker.getSymbolAtLocation(name);
+    if (aliasSym && aliasSym !== modSym) this.ensureLocalAlias(ctx, aliasSym, obj);
+  }
+  private moduleSymbolOf(target: ts.SourceFile): ts.Symbol | undefined {
+    return this.checker.getSymbolAtLocation(target) ?? (target as unknown as { symbol?: ts.Symbol }).symbol;
+  }
+  /** The one namespace object of a module, made at its first need. */
+  private namespaceOfModule(ctx: FnCtx, modSym: ts.Symbol, hint: string, stmt: ts.Node): number {
+    const held = this.moduleNamespaceLocals.get(modSym);
+    if (held !== undefined) return held;
     const site = this.site++;
-    const obj = this.newLocal(ctx, "reference", name.text);
+    const obj = this.newLocal(ctx, "reference", hint);
     this.recordSite(site, "object", "once", false, stmt);
     ctx.body.push({ kind: "AllocObject", dst: obj, typeId: 0, site });
     this.moduleNamespaceLocals.set(modSym, obj);
@@ -4476,8 +4512,6 @@ class Exporter {
     // bind the alias symbol itself defensively.
     if (this.hasCaptured(ctx, modSym)) this.storeCaptured(ctx, modSym, obj);
     else this.ensureLocalAlias(ctx, modSym, obj);
-    const aliasSym = this.checker.getSymbolAtLocation(name);
-    if (aliasSym && aliasSym !== modSym) this.ensureLocalAlias(ctx, aliasSym, obj);
     const nullValue = this.newLocal(ctx, "reference");
     ctx.body.push({ kind: "Const", dst: nullValue, value: { kind: "Null" } });
     ctx.body.push({ kind: "SetProto", dst: this.newLocal(ctx, "reference"), obj, proto: nullValue });
@@ -4502,6 +4536,24 @@ class Exporter {
     ctx.body.push({ kind: "CallBuiltinStatic", dst: tag, builtin: "symbol.wksym:4", args: [] });
     ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "object.defineData:0:0:0", args: [obj, tag, this.constString(ctx, "Module")] });
     ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "object.preventExtensions", args: [obj] });
+    return obj;
+  }
+  /** At the start of __module_init: the runtime's record of each module `import()` can reach, with the namespace of a
+   *  target, the function of a lazy module and the lazy modules it imports. */
+  private emitImportRecords(ctx: FnCtx): void {
+    for (const [m, k] of this.importRecords) {
+      let ns: number;
+      const modSym = this.moduleSymbolOf(m);
+      if (this.dynamicImportTargets.has(m) && modSym) ns = this.namespaceOfModule(ctx, modSym, "ns", m);
+      else { ns = this.newLocal(ctx, "reference"); ctx.body.push({ kind: "Const", dst: ns, value: { kind: "Undef" } }); }
+      const initNode = this.lazyInitNodes.get(m);
+      let init: number;
+      if (initNode) init = this.lowerClosure(ctx, initNode as unknown as FnLike, "lazyInit");
+      else { init = this.newLocal(ctx, "reference"); ctx.body.push({ kind: "Const", dst: init, value: { kind: "Undef" } }); }
+      const deps = this.moduleDeps(m, true).filter((d) => this.lazyModules.has(d)).map((d) => this.importRecords.get(d)!).join(",");
+      ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "import.register",
+        args: [this.constNumber(ctx, k), ns, init, this.constString(ctx, deps)] });
+    }
   }
 
   /** Lower a STANDALONE `namespace N { ... }` to a runtime object (the IIFE pattern
@@ -5610,6 +5662,14 @@ class Exporter {
     const t = arg ? this.checker.getTypeAtLocation(arg) : undefined;
     const spec = t && (t.flags & ts.TypeFlags.StringLiteral) ? (t as ts.StringLiteralType).value : undefined;
     const dst = this.newLocal(ctx, "reference", "import");
+    const bundled = this.dynamicImportTarget(arg);
+    if (bundled && this.importRecords.has(bundled)) {
+      if (arg && !ts.isStringLiteralLike(arg)) this.lowerExpr(ctx, arg);   // (a const: its read)
+      const options = node.arguments[1] ? this.lowerExpr(ctx, node.arguments[1]) : this.newLocal(ctx, "reference");
+      if (!node.arguments[1]) ctx.body.push({ kind: "Const", dst: options, value: { kind: "Undef" } });
+      ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "import.bundled", args: [this.constNumber(ctx, this.importRecords.get(bundled)!), options] });
+      return dst;
+    }
     if (spec === undefined) {
       // known at run time only: its ToString runs, and the promise rejects, naming the module
       const args: number[] = node.arguments.map((a) => this.lowerExpr(ctx, a));
@@ -16228,7 +16288,8 @@ class Exporter {
    *  name, which aliases a binding) or an anonymous `export default function`. */
   private isValueDefaultExport(stmt: ts.Node): boolean {
     return (ts.isExportAssignment(stmt) && !stmt.isExportEquals && !ts.isIdentifier(stmt.expression)) ||
-      (ts.isFunctionDeclaration(stmt) && stmt.body !== undefined && stmt.name === undefined);
+      (ts.isFunctionDeclaration(stmt) && stmt.body !== undefined && stmt.name === undefined) ||
+      (ts.isClassDeclaration(stmt) && stmt.name === undefined);
   }
   /** The binding of a namespace statement (`import * as name from` or `export * as name from`), else undefined. */
   private namespaceBindingName(stmt: ts.Node): ts.Identifier | undefined {
@@ -16849,6 +16910,7 @@ class Exporter {
     // functions or class bodies) for these declarations and emit their bindings
     // here at the prologue, before the textual body runs.
     if (node.body && ts.isBlock(node.body)) {
+      if ((node as unknown) === this.moduleInitNode) this.emitImportRecords(ctx);
       this.hoistDeclarations(ctx, node.body);
     }
     // FunctionDeclarationInstantiation runs at the call, ahead of the generator object: a default's effects
@@ -16933,7 +16995,7 @@ class Exporter {
       takesThis: thisParam || staticThis,
       captureCount: ctx.captureCount ?? 0,
       arity,
-      hasPrototype: !/^__(module_init|static_init_\d+|class_ctor_\d+)$/.test(name) &&
+      hasPrototype: !/^__(module_init|static_init_\d+|class_ctor_\d+|lazy_init_\d+)$/.test(name) &&
         (ts.isFunctionDeclaration(node as ts.Node) || ts.isFunctionExpression(node as ts.Node)) &&
         !isAsync && !isGenerator,
       debugName: this.debugNameOf(node as ts.Node),
@@ -17874,7 +17936,45 @@ class Exporter {
       live.add(sf);
       for (const d of this.moduleDeps(sf, true)) pending.push(d);
     }
-    return order.filter((sf) => live.has(sf));
+    const modules = order.filter((sf) => live.has(sf));
+    // what `import()` reaches and nothing imports: a lazy module, with the static imports of its own
+    for (let i = 0; i < modules.length; i++) {
+      for (const target of this.dynamicImportsOf(modules[i])) {
+        this.dynamicImportTargets.add(target);
+        if (live.has(target)) continue;
+        const from = order.length;
+        visit(target);
+        for (const m of order.slice(from)) {
+          if (live.has(m)) continue;
+          live.add(m);
+          modules.push(m);
+          this.lazyModules.add(m);
+        }
+      }
+    }
+    return modules;
+  }
+  /** The module an `import(specifier)` names, when the program can know it. */
+  private dynamicImportTarget(arg: ts.Expression | undefined): ts.SourceFile | undefined {
+    if (!arg) return undefined;
+    if (ts.isStringLiteralLike(arg)) return this.resolveModuleSf(arg);
+    const t = this.checker.getTypeAtLocation(arg);
+    if (!(t.flags & ts.TypeFlags.StringLiteral)) return undefined;
+    const r = ts.resolveModuleName((t as ts.StringLiteralType).value, arg.getSourceFile().fileName, this.program.getCompilerOptions(), ts.sys).resolvedModule;
+    const f = r ? this.program.getSourceFile(r.resolvedFileName) : undefined;
+    return f && !f.isDeclarationFile ? f : undefined;
+  }
+  private dynamicImportsOf(sf: ts.SourceFile): ts.SourceFile[] {
+    const out: ts.SourceFile[] = [];
+    const visit = (n: ts.Node): void => {
+      if (ts.isCallExpression(n) && n.expression.kind === ts.SyntaxKind.ImportKeyword) {
+        const t = this.dynamicImportTarget(n.arguments[0]);
+        if (t) out.push(t);
+      }
+      n.forEachChild(visit);
+    };
+    visit(sf);
+    return out;
   }
 
   /** True if `stmts` contain a top-level `await` (an await — or a `for await`
@@ -17896,6 +17996,8 @@ class Exporter {
   run(sf: ts.SourceFile) {
     this.modules = this.computeModuleOrder(sf);
     this.modules.forEach((module, index) => this.moduleInitializationOrder.set(module, index));
+    for (const m of this.lazyModules) this.importRecords.set(m, this.importRecords.size);
+    for (const m of this.dynamicImportTargets) if (!this.importRecords.has(m)) this.importRecords.set(m, this.importRecords.size);
     this.sf = sf;
     if (this.sourceMode === "module") for (const m of this.modules) for (const e of jsEarlyErrors(m)) this.unsupported(e.node, `SyntaxError: ${e.message}`);
     for (const m of this.modules) this.preflightRuntimeSyntax(m);
@@ -18014,6 +18116,15 @@ class Exporter {
         if (canonical.valueDeclaration && this.moduleScopeSyms.has(canonical)) this.cellBindings.add(canonical);
       }
     }
+    for (const target of this.dynamicImportTargets) {
+      const modSym = this.moduleSymbolOf(target);
+      if (!modSym) continue;
+      this.moduleScopeSyms.add(modSym);
+      for (const exp of this.checker.getExportsOfModule(modSym)) {
+        const canonical = this.unwrapImportAlias(exp) ?? exp;
+        if (canonical.valueDeclaration && this.moduleScopeSyms.has(canonical)) this.cellBindings.add(canonical);
+      }
+    }
     for (const m of this.modules) this.collectMutatedGlobalRefs(m);
     this.collectUnsafeFieldStores();
 
@@ -18046,12 +18157,20 @@ class Exporter {
     // execution order (deps first). Each statement keeps its own SourceFile parent
     // so symbol/position resolution stays per-module-correct.
     const moduleStmts: ts.Statement[] = [];
+    const lazyStmts = new Map<ts.SourceFile, ts.Statement[]>();
+    for (const m of this.lazyModules) lazyStmts.set(m, []);
     for (const stmt of allTopStmts) {
       if (stmt.flags & AMBIENT_NODE_FLAG) continue;
       if (ts.isFunctionDeclaration(stmt)) {
         if (stmt.body && (this.sourceMode === "script" || needsModuleInit)) moduleStmts.push(stmt);
         continue;
       }
+      // a lazy module's statements wait for its import(); a function's value and a namespace object do nothing to wait for
+      const lazy = lazyStmts.get(stmt.getSourceFile());
+      if (lazy && !ts.isInterfaceDeclaration(stmt) && !ts.isTypeAliasDeclaration(stmt) && !ts.isImportDeclaration(stmt) &&
+          !ts.isExportDeclaration(stmt) && !ts.isImportEqualsDeclaration(stmt) && stmt.kind !== ts.SyntaxKind.EmptyStatement &&
+          (!ts.isExportAssignment(stmt) || this.isValueDefaultExport(stmt)) &&
+          (!ts.isModuleDeclaration(stmt) || (ts.isIdentifier(stmt.name) && this.isValueNamespace(stmt)))) { lazy.push(stmt); continue; }
       if (ts.isClassDeclaration(stmt)) {
         // Class declarations now create a stable constructor value at runtime.
         // Keep every top-level class in __module_init, not only classes with
@@ -18070,8 +18189,11 @@ class Exporter {
       if (stmt.kind === ts.SyntaxKind.EmptyStatement) continue;
       moduleStmts.push(stmt);
     }
-    if (moduleStmts.length > 0) {
-      const initBlock = ts.factory.createBlock(moduleStmts, true);
+    if (moduleStmts.length > 0 || this.importRecords.size > 0) {
+      // what stays of a lazy module (a function's value, a namespace object) is there before any module runs
+      const firstInit = moduleStmts.filter((s) => lazyStmts.has(s.getSourceFile()));
+      const restInit = moduleStmts.filter((s) => !lazyStmts.has(s.getSourceFile()));
+      const initBlock = ts.factory.createBlock([...firstInit, ...restInit], true);
       // Top-level await → lower __module_init as an async coroutine.
       this.moduleInitIsAsync = this.hasTopLevelAwait(moduleStmts);
       const initMods = this.moduleInitIsAsync
@@ -18086,6 +18208,17 @@ class Exporter {
       this.moduleInitId = this.fnId.size;
       this.fnId.set(initFn, this.moduleInitId);
       this._fnNodeById = undefined; // invalidate reverse-map cache (now includes init)
+      for (const [m, stmts] of lazyStmts) {
+        const block = ts.factory.createBlock(stmts, true);
+        const fn = ts.factory.createFunctionDeclaration(this.hasTopLevelAwait(stmts) ? [ts.factory.createModifier(ts.SyntaxKind.AsyncKeyword)] : undefined,
+          undefined, `__lazy_init_${this.importRecords.get(m)}`, undefined, [], undefined, block);
+        (fn as any).parent = m;
+        (block as any).parent = fn;
+        ts.setTextRange(fn, m);    // (a site's report asks a position)
+        this.fnId.set(fn, this.fnId.size);
+        this.lazyInitNodes.set(m, fn);
+        this.lazyInitFns.add(fn);
+      }
     } else if (this.sourceMode !== "script" && topLevelFunctionDecls.length > 0) {
       const initBlock = ts.factory.createBlock(topLevelFunctionDecls, true);
       const initFn = ts.factory.createFunctionDeclaration(
@@ -18116,6 +18249,7 @@ class Exporter {
     for (const m of this.modules) walk(m);
     if (this.functionValuesInitNode) allFns.push(this.functionValuesInitNode as unknown as FnLike);
     if (this.moduleInitNode) allFns.push(this.moduleInitNode as unknown as FnLike);
+    for (const fn of this.lazyInitNodes.values()) allFns.push(fn as unknown as FnLike);
     this.computeAssignedBindings();
     if (!this.untyped) this.computeForeignTypes();
     // can the program make a BigInt? It takes a literal or the name, in the program's own text
@@ -18295,6 +18429,7 @@ class Exporter {
     if (this.moduleInitNode && this.moduleInitId !== undefined) {
       this.lowerFunctionLike(this.moduleInitNode as unknown as FnLike, this.moduleInitId, false);
     }
+    for (const fn of this.lazyInitNodes.values()) this.lowerFunctionLike(fn as unknown as FnLike, this.fnId.get(fn)!, false);
 
     // lift class method bodies. Static members (thisName === "") are lowered with a
     // plain-object `this` parameter (staticThis: the receiver "class object"/static

@@ -12826,3 +12826,6 @@ Where it stopped (branch `s363-dc`, worktree `build/wt_dc`, on top of `s362-wip`
   three minutes). `import(expr)` with a specifier known at run time is a rejected promise, its ToString run. `new.target` in a
   nested function was counted as a capture of the enclosing method. `Generator<T>[]` was taken for a Generator (by the printed type).
   `Proxy` as a value, `class extends Proxy`, ToNumeric(lhs) of a Symbol before the right side converts.
+- **import() of a bundled module** (`docs/dynamic_import_design.md`): a compile-time reject before. A module only `import()` reaches is
+  compiled in, its top-level statements a function of their own, evaluated once when asked, deps first, a failure kept, a top-level
+  await honored. `export default class {}` was missing from a namespace and its statics never ran (silent): a dynamic class.

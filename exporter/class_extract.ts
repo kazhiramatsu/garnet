@@ -70,7 +70,8 @@ export function isDynamicClass(decl: ts.ClassLikeDeclaration, checker: ts.TypeCh
   if (known !== undefined) return known;
   dynamicVerdicts.set(decl, false);   // a cycle of `extends` is reported elsewhere
   const ambient = (ts.getCombinedModifierFlags(decl) & ts.ModifierFlags.Ambient) !== 0;
-  const verdict = !ambient && (heritageIsDynamic(decl, checker) || capturesEnclosingLocal(decl, checker));
+  // (`export default class {}` has no name to hold it: a value, bound to the default export)
+  const verdict = !ambient && ((ts.isClassDeclaration(decl) && decl.name === undefined) || heritageIsDynamic(decl, checker) || capturesEnclosingLocal(decl, checker));
   dynamicVerdicts.set(decl, verdict);
   if (verdict) dynamicClasses.add(decl);
   return verdict;

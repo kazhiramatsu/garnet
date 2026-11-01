@@ -568,7 +568,7 @@ fn emit_program_with_string_plans(
         let nm = functions_by_id[i as usize]
             .and_then(|f| f.name.as_deref())
             // a synthesized __module_init / anonymous fn has no JS name -> "".
-            .filter(|n| !(*n == "__module_init" || n.starts_with("__get_export_") || n.starts_with("__class_ctor_") || n.starts_with("__static_init_")))
+            .filter(|n| !(*n == "__module_init" || n.starts_with("__get_export_") || n.starts_with("__class_ctor_") || n.starts_with("__static_init_") || n.starts_with("__lazy_init_")))
             .unwrap_or("");
         let _ = write!(s, "{}, ", c_string_lit(nm));
     }
@@ -24353,6 +24353,8 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 "construct.end" => (format!("ts_construct_end({}, {}, {})", v(0), v(1), v(2)), false),
                 "proxy.new" => (format!("ts_proxy_new({}, {})", v(0), v(1)), false),
                 "import.unknown" => (format!("ts_import_unknown({})", v(0)), false),
+                "import.bundled" => (format!("ts_import_bundled({}, {})", v(0), v(1)), false),
+                "import.register" => (format!("ts_import_register({}, {}, {}, {})", v(0), v(1), v(2), v(3)), false),
                 "proxy.revocable" => (format!("ts_proxy_revocable({}, {})", v(0), v(1)), false),
                 "symbol.new" => (format!("ts_symbol_new({})", v(0)), false),
                 "symbol.get" => (format!("ts_get_symkey({}, {})", v(0), v(1)), false),

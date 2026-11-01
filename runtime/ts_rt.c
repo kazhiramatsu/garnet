@@ -23462,6 +23462,148 @@ static tsv qm_job_resume(tsv cv){
   ts_gc_unroot(1);
   return TS_UNDEFINED;
 }
+static void ts_queue_microtask(tsv cb);
+/* ---- import() of a bundled module (docs/dynamic_import_design.md) ----
+   A record per module: its namespace, the function of its statements (a lazy module's), its lazy imports, and
+   how its evaluation went. A module with a top-level await leaves a promise as its result. */
+enum { IR_NS, IR_INIT, IR_DEPS, IR_STATE, IR_RESULT, IR_ERROR, IR_SIZE };
+enum { IS_NEW, IS_RUNNING, IS_DONE, IS_FAILED };
+static tsv g_import_records = TS_UNDEFINED;
+tsv ts_import_register(tsv record, tsv ns, tsv init, tsv deps){
+  static int rooted = 0;
+  ts_root_static_once(&g_import_records, &rooted);
+  ts_gc_root(&ns); ts_gc_root(&init); ts_gc_root(&deps);
+  if (ts_is_undef(g_import_records)) g_import_records = ts_new_array(0);
+  tsv r = ts_new_array(0); ts_gc_root(&r);
+  ts_array_push(r, ns); ts_array_push(r, init); ts_array_push(r, deps);
+  ts_array_push(r, ts_num(ts_is_undef(init) ? IS_DONE : IS_NEW));
+  ts_array_push(r, TS_UNDEFINED); ts_array_push(r, TS_UNDEFINED);
+  ts_array_set(g_import_records, (uint32_t)ts_to_num(record), r);
+  ts_gc_unroot(4);
+  return TS_UNDEFINED;
+}
+static tsv import_next_dep(tsv* a, int n){ (void)n; return a[0]; }
+/* a dependency that was still waiting for its top-level await, then the module */
+static tsv import_after_deps(tsv* a, int n){
+  (void)n;
+  return ts_call_value(a[0], NULL, 0);
+}
+/* The module evaluated, deps first: undefined, or the promise of its top-level await; a module that threw
+   throws the same value at every later import */
+static tsv import_evaluate(uint32_t id){
+  tsv rec = ts_array_get(g_import_records, id);
+  ts_gc_root(&rec);
+  int state = (int)ts_to_num(ts_array_get(rec, IR_STATE));
+  if (state == IS_FAILED){ tsv e = ts_array_get(rec, IR_ERROR); ts_gc_unroot(1); ts_throw(e); }
+  if (state != IS_NEW){ tsv r = ts_array_get(rec, IR_RESULT); ts_gc_unroot(1); return r; }
+  ts_array_set(rec, IR_STATE, ts_num(IS_RUNNING));
+  tsv pending = TS_UNDEFINED; ts_gc_root(&pending);
+  ts_handler* h = ts_eh_push();
+  if (ts_setjmp(h->buf) != 0){
+    ts_gc_set_root_depth(h->gc_root_len);
+    ts_frame_restore(h->frame_top);
+    ts_eh_pop();
+    tsv e = ts_current_exception();
+    ts_array_set(rec, IR_STATE, ts_num(IS_FAILED));
+    ts_array_set(rec, IR_ERROR, e);
+    ts_gc_unroot(2);
+    ts_throw(e);
+  }
+  tsv deps = ts_array_get(rec, IR_DEPS);
+  uint32_t dn = 0; char* text = ts_string_cstr_copy(deps, &dn);
+  for (char* p = text; p && *p; ){
+    char* end;
+    long d = strtol(p, &end, 10);
+    tsv r = import_evaluate((uint32_t)d);
+    if (ts_is_promise(r)){
+      /* (one dependency at a time: their completions are in order) */
+      if (ts_is_undef(pending)) pending = r;
+      else { tsv env[1] = { r }; pending = ts_promise_then(pending, ts_make_fn_t(import_next_dep, env, 1, 0), TS_UNDEFINED); }
+    }
+    p = *end == ',' ? end + 1 : end;
+  }
+  free(text);
+  tsv init = ts_array_get(rec, IR_INIT);
+  tsv result;
+  if (ts_is_undef(pending)) result = ts_call_value(init, NULL, 0);
+  else { tsv env[1] = { init }; result = ts_promise_then(pending, ts_make_fn_t(import_after_deps, env, 1, 0), TS_UNDEFINED); }
+  ts_eh_pop();
+  ts_array_set(rec, IR_STATE, ts_num(IS_DONE));
+  ts_array_set(rec, IR_RESULT, result);
+  ts_gc_unroot(2);
+  return result;
+}
+static tsv import_settled(tsv* a, int n){
+  (void)n;
+  tsv rec = ts_array_get(g_import_records, (uint32_t)ts_to_num(a[0]));
+  ts_promise_resolve_v(a[1], ts_array_get(rec, IR_NS));
+  return TS_UNDEFINED;
+}
+static tsv import_refused(tsv* a, int n){
+  ts_promise_reject_v(a[0], n > 1 ? a[1] : TS_UNDEFINED);
+  return TS_UNDEFINED;
+}
+/* the job import() queues: Node loads a module after the code that asked has run */
+static tsv import_job(tsv* a, int n){
+  (void)n;
+  tsv k = a[0], p = a[1];
+  ts_gc_root(&p);
+  ts_handler* h = ts_eh_push();
+  if (ts_setjmp(h->buf) != 0){
+    ts_gc_set_root_depth(h->gc_root_len);
+    ts_frame_restore(h->frame_top);
+    ts_eh_pop();
+    ts_promise_reject_v(p, ts_current_exception());
+    ts_gc_unroot(1);
+    return TS_UNDEFINED;
+  }
+  tsv r = import_evaluate((uint32_t)ts_to_num(k));
+  ts_eh_pop();
+  ts_gc_root(&r);
+  tsv env[2] = { k, p };
+  if (ts_is_promise(r)){
+    tsv ok = ts_make_fn_t(import_settled, env, 2, 0); ts_gc_root(&ok);
+    tsv no = ts_make_fn_t(import_refused, env + 1, 1, 0);
+    (void)ts_promise_then(r, ok, no);
+    ts_gc_unroot(1);
+  } else {
+    tsv av[2] = { k, p };
+    import_settled(av, 2);
+  }
+  ts_gc_unroot(2);
+  return TS_UNDEFINED;
+}
+tsv ts_import_bundled(tsv record, tsv options){
+  tsv p = ts_promise_new_v(); ts_gc_root(&p);
+  ts_gc_root(&options);
+  /* the options: read now, a failure rejects */
+  ts_handler* h = ts_eh_push();
+  if (ts_setjmp(h->buf) != 0){
+    ts_gc_set_root_depth(h->gc_root_len);
+    ts_frame_restore(h->frame_top);
+    ts_eh_pop();
+    ts_promise_reject_v(p, ts_current_exception());
+    ts_gc_unroot(2);
+    return p;
+  }
+  if (!ts_is_undef(options)){
+    if ((!ts_is_obj(options) && !ts_is_func(options)) || ts_is_prim_cell(options)) ts_throw_type_error_msg("The second argument of import() must be an object");
+    tsv with = ts_get(options, ts_intern_field("with", 4));
+    if (!ts_is_undef(with)){
+      ts_gc_root(&with);
+      if ((!ts_is_obj(with) && !ts_is_func(with)) || ts_is_prim_cell(with)) ts_throw_type_error_msg("The 'options.with' must be an object");
+      tsv keys = ts_object_keys(with); ts_gc_root(&keys);
+      uint32_t n = (uint32_t)ts_array_len(keys);
+      for (uint32_t i = 0; i < n; i++) if (!ts_is_str(ts_get_dyn(with, ts_array_get(keys, i)))) ts_throw_type_error_msg("Import attribute values must be strings");
+      ts_gc_unroot(2);
+    }
+  }
+  ts_eh_pop();
+  tsv env[2] = { record, p };
+  ts_queue_microtask(ts_make_fn_t(import_job, env, 2, 0));
+  ts_gc_unroot(2);
+  return p;
+}
 static void ts_queue_microtask(tsv cb){
   ts_gc_root(&cb);
   tsv wv = ts_coro_alloc_adapter_v(sizeof(ts_qm_job), qm_job_resume);

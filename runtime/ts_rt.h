@@ -4216,6 +4216,8 @@ tsv ts_proxy_new(tsv target, tsv handler);
 tsv ts_proxy_revocable(tsv target, tsv handler);
 tsv ts_proxy_ctor_value(void);
 tsv ts_import_unknown(tsv spec);
+tsv ts_import_bundled(tsv record, tsv options);
+tsv ts_import_register(tsv record, tsv ns, tsv init, tsv deps);
 tsv ts_proxy_revoke_thunk(tsv* args, int n);
 /* Promise + coroutine frame (async/await) */
 typedef struct ts_promise {

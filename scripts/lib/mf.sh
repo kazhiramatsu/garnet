@@ -36,8 +36,10 @@ for (const f of fs.readdirSync(dir)) {
     module: ts.ModuleKind.ESNext,
     jsx,
   } }).outputText;
-  js = js.replace(/(from\s*['"])(\.\.?\/[^'"]+?)(['"])/g, (m, a, p, b) => a + (p.endsWith(".mjs") ? p : p + ".mjs") + b);
-  js = js.replace(/(import\s*['"])(\.\.?\/[^'"]+?)(['"])/g, (m, a, p, b) => a + (p.endsWith(".mjs") ? p : p + ".mjs") + b);
+  const relative = (m, a, p, b) => a + (p.endsWith(".mjs") || p.endsWith(".json") ? p : p + ".mjs") + b;
+  js = js.replace(/(from\s*['"])(\.\.?\/[^'"]+?)(['"])/g, relative);
+  js = js.replace(/(import\s*['"])(\.\.?\/[^'"]+?)(['"])/g, relative);
+  js = js.replace(/(import\(\s*['"])(\.\.?\/[^'"]+?)(['"])/g, relative);
   fs.writeFileSync(path.join(dir, f.replace(/\.tsx?$/, ".mjs")), js);
 }
 JS
