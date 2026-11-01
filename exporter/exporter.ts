@@ -144,6 +144,17 @@ function garnetModulePaths(): ts.MapLike<string[]> {
  *  behind the globals the program, or the lib modules it imports, name), which
  *  computeModuleOrder evaluates first, and with lib/node/globals.d.ts unless @types/node
  *  already types the program. */
+/* the operators of runtime/bigint.c, by token; `+` is ts_add's */
+const BIGINT_OPCODE: Record<number, number> = {
+  [ts.SyntaxKind.MinusToken]: 1, [ts.SyntaxKind.AsteriskToken]: 2, [ts.SyntaxKind.SlashToken]: 3, [ts.SyntaxKind.PercentToken]: 4,
+  [ts.SyntaxKind.AsteriskAsteriskToken]: 5, [ts.SyntaxKind.AmpersandToken]: 6, [ts.SyntaxKind.BarToken]: 7, [ts.SyntaxKind.CaretToken]: 8,
+  [ts.SyntaxKind.LessThanLessThanToken]: 9, [ts.SyntaxKind.GreaterThanGreaterThanToken]: 10, [ts.SyntaxKind.GreaterThanGreaterThanGreaterThanToken]: 11,
+};
+const BIGINT_COMPOUND: Record<number, number> = {
+  [ts.SyntaxKind.MinusEqualsToken]: 1, [ts.SyntaxKind.AsteriskEqualsToken]: 2, [ts.SyntaxKind.SlashEqualsToken]: 3, [ts.SyntaxKind.PercentEqualsToken]: 4,
+  [ts.SyntaxKind.AsteriskAsteriskEqualsToken]: 5, [ts.SyntaxKind.AmpersandEqualsToken]: 6, [ts.SyntaxKind.BarEqualsToken]: 7, [ts.SyntaxKind.CaretEqualsToken]: 8,
+  [ts.SyntaxKind.LessThanLessThanEqualsToken]: 9, [ts.SyntaxKind.GreaterThanGreaterThanEqualsToken]: 10, [ts.SyntaxKind.GreaterThanGreaterThanGreaterThanEqualsToken]: 11,
+};
 let nodePreludeFile: string | undefined;
 /** lib/node's directory once the prelude is in use: a lib module's own ambient primitive
  *  (`__garnet_fetch`) is recognized by its declaration's file. */
@@ -816,6 +827,9 @@ class Exporter {
   private foreignSyms = new Set<ts.Symbol>();
   private sawForeignSource = false;
   private hasForeign = false;
+  /** The program can make a BigInt: the arithmetic over what is not known to be a number looks at run time
+   *  (docs/bigint_design.md). Any other program's operators are untouched. */
+  private usesBigInt = false;
   private distrustSkip = new Set<ts.Node>();
   // Untyped mode (TSAOT_UNTYPED=1): treat the whole program as `any` — disable
   // ALL type-driven lowering (no unbox/SROA via classify, no generic
@@ -1106,7 +1120,7 @@ class Exporter {
     const checker = Object.create(this.rawChecker) as ts.TypeChecker;
     checker.getTypeAtLocation = (n: ts.Node): ts.Type =>
       (this.distrustedExpr(n) && (ts.isBinaryExpression(n) || this.usedInPlace(n as ts.Expression))) ||
-      (this.hasForeign && this.foreignValue(n)) ? anyType : this.rawChecker.getTypeAtLocation(n);
+      (this.hasForeign && this.foreignValue(n)) || (this.usesBigInt && this.bigIntOperator(n)) ? anyType : this.rawChecker.getTypeAtLocation(n);
     this.checker = checker;
     this.VALUE = this.internField("__value");
     this.DATE_MS_FIELD = this.internField("__date_ms");
@@ -2069,6 +2083,33 @@ class Exporter {
    *  snapshot that operand into a fresh local (Copy) so its value is fixed at its
    *  evaluation point. (Only aliasing bare-variable reads need this; every other
    *  expression already lands its value in a fresh local at its own instruction.) */
+  /** May this value be a BigInt, as far as the checker can tell? */
+  private maybeBigInt(e: ts.Expression): boolean {
+    if (this.untyped) return true;
+    const F = ts.TypeFlags;
+    const may = (t: ts.Type): boolean => t.isUnionOrIntersection() ? t.types.some(may) : (t.flags & (F.BigIntLike | F.Any | F.Unknown | F.TypeParameter)) !== 0;
+    try { return may(this.rawChecker.getTypeAtLocation(e)); } catch { return true; }
+  }
+  /** An arithmetic operator whose operands may be BigInts: its value is no number the checker can vouch for. */
+  private bigIntOperator(n: ts.Node): boolean {
+    if (ts.isBinaryExpression(n)) {
+      const k = n.operatorToken.kind;
+      if (BIGINT_OPCODE[k] === undefined && BIGINT_COMPOUND[k] === undefined && k !== ts.SyntaxKind.PlusToken && k !== ts.SyntaxKind.PlusEqualsToken) return false;
+      return this.maybeBigInt(n.left) || this.maybeBigInt(n.right);
+    }
+    if (ts.isPrefixUnaryExpression(n)) {
+      const k = n.operator;
+      return (k === ts.SyntaxKind.MinusToken || k === ts.SyntaxKind.TildeToken || k === ts.SyntaxKind.PlusPlusToken || k === ts.SyntaxKind.MinusMinusToken) && this.maybeBigInt(n.operand);
+    }
+    return ts.isPostfixUnaryExpression(n) && this.maybeBigInt(n.operand);
+  }
+  /** `a op= b`: BinOp, or the run-time form where a BigInt may be involved. */
+  private pushCompound(ctx: FnCtx, node: ts.BinaryExpression, res: number, op: string, lhs: number, rhs: number): void {
+    const code = BIGINT_COMPOUND[node.operatorToken.kind];
+    if (this.usesBigInt && code !== undefined && this.bigIntOperator(node))
+      ctx.body.push({ kind: "CallBuiltinStatic", dst: res, builtin: `bigint.op:${code}`, args: [lhs, rhs] });
+    else ctx.body.push({ kind: "BinOp", dst: res, op, lhs, rhs });
+  }
   private checkedNumber(ctx: FnCtx, v: number): number {
     ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: "cast.number", args: [v] });
     return v;
@@ -5446,6 +5487,25 @@ class Exporter {
       return this.lowerOptionalChain(ctx, node);
     }
     if (ts.isParenthesizedExpression(node)) return this.lowerExpr(ctx, node.expression, hint);
+    if (ts.isBigIntLiteral(node)) {
+      const dst = this.newLocal(ctx, "reference", hint);
+      ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: `bigint.literal:${BigInt(node.text.replace(/n$/, "").replace(/_/g, "")).toString()}`, args: [] });
+      return dst;
+    }
+    if (this.usesBigInt && this.bigIntOperator(node)) {
+      if (ts.isBinaryExpression(node) && BIGINT_OPCODE[node.operatorToken.kind] !== undefined) {
+        const [a, b] = this.lowerSequenced(ctx, [node.left, node.right]);
+        const dst = this.newLocal(ctx, "reference", hint);
+        ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: `bigint.op:${BIGINT_OPCODE[node.operatorToken.kind]}`, args: [a, b] });
+        return dst;
+      }
+      if (ts.isPrefixUnaryExpression(node) && (node.operator === ts.SyntaxKind.MinusToken || node.operator === ts.SyntaxKind.TildeToken)) {
+        const v = this.lowerExpr(ctx, node.operand);
+        const dst = this.newLocal(ctx, "reference", hint);
+        ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: `bigint.unary:${node.operator === ts.SyntaxKind.MinusToken ? 0 : 1}`, args: [v] });
+        return dst;
+      }
+    }
     if (this.hasForeign && !this.distrustSkip.has(node) && (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node) || ts.isIdentifier(node)) &&
         this.foreignValue(node) && !this.usedInPlace(node)) {
       const F = ts.TypeFlags, t = this.rawChecker.getTypeAtLocation(node);
@@ -6736,7 +6796,7 @@ class Exporter {
         if (fn.text === "Number" && node.arguments.length === 1 && isBuiltinSym) {
           const argLs = [this.lowerExpr(ctx, node.arguments[0])];
           const dst = this.newLocal(ctx, "primitive");
-          ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "number.coerce", args: argLs });
+          ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: this.usesBigInt && this.maybeBigInt(node.arguments[0]) ? "bigint.toNumber" : "number.coerce", args: argLs });
           return dst;
         }
         if (fn.text === "String" && node.arguments.length === 1 && isBuiltinSym) {
@@ -7815,14 +7875,14 @@ class Exporter {
           const cur = this.lowerReadFromRef(ctx, lhs, pre);
           const rhs = this.lowerExpr(ctx, node.right);
           const res = this.newLocal(ctx, this.refKindOf(node));
-          ctx.body.push({ kind: "BinOp", dst: res, op, lhs: cur, rhs });
+          this.pushCompound(ctx, node, res, op, cur, rhs);
           this.lowerAssignTarget(ctx, lhs, res, pre);
           return res;
         }
         const cur = this.lowerExpr(ctx, node.left);
         const rhs = this.lowerExpr(ctx, node.right);
         const res = this.newLocal(ctx, this.refKindOf(node));
-        ctx.body.push({ kind: "BinOp", dst: res, op, lhs: cur, rhs });
+        this.pushCompound(ctx, node, res, op, cur, rhs);
         this.lowerAssignTarget(ctx, node.left, res);
         return res;
       }
@@ -8092,6 +8152,14 @@ class Exporter {
         // both numbers). Without coercion `++` lowered to a string-aware `+`
         // BinOp (ts_add), miscompiling string/`any` operands.
         const isPostfix = ts.isPostfixUnaryExpression(node);
+        if (this.usesBigInt && this.maybeBigInt(node.operand)) {
+          const numeric = this.newLocal(ctx, "reference");
+          ctx.body.push({ kind: "CallBuiltinStatic", dst: numeric, builtin: "bigint.unary:4", args: [operand] });
+          const updated = this.newLocal(ctx, "reference");
+          ctx.body.push({ kind: "CallBuiltinStatic", dst: updated, builtin: `bigint.unary:${op === ts.SyntaxKind.PlusPlusToken ? 2 : 3}`, args: [numeric] });
+          this.lowerAssignTarget(ctx, updateTarget ?? node.operand, updated, updatePre);
+          return isPostfix ? numeric : updated;
+        }
         // Keep the unboxed fast path when the operand is already numeric;
         // otherwise ToNumber-coerce once (mirrors unary `+`).
         let isNum = false;
@@ -17849,6 +17917,10 @@ class Exporter {
     if (this.moduleInitNode) allFns.push(this.moduleInitNode as unknown as FnLike);
     this.computeAssignedBindings();
     if (!this.untyped) this.computeForeignTypes();
+    // can the program make a BigInt? It takes a literal or the name, in the program's own text
+    const bigIntText = /\bBigInt|\bbigint\b|\b\d[\d_]*n\b|\b0[xXoObB][\da-fA-F_]+n\b/;
+    this.usesBigInt = this.modules.some((m) => !/\/lib\/(node|garnet)\/|node_prelude/.test(m.fileName) && bigIntText.test(m.text));
+    if (this.usesBigInt) this.internField("__garnet_bigint");
     for (const f of allFns) for (const s of this.freeVars(f)) {
       this.cellBindings.add(s);
       let arr = this.capturedByFns.get(s);

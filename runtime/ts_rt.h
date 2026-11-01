@@ -240,7 +240,8 @@ enum { TS_KIND_OBJECT = 1, TS_KIND_ARRAY = 2, TS_KIND_STRING = 3, TS_KIND_FUNC =
           before the exotic kinds: the prototype walk treats every kind from PROMISE on as exotic */
        TS_KIND_REGEXP = 9,
        TS_KIND_PROMISE = 10, TS_KIND_CORO = 11, TS_KIND_ACCESSOR = 12, TS_KIND_SYMBOL = 13, TS_KIND_PROXY = 14,
-       TS_KIND_LAST = TS_KIND_PROXY };
+       TS_KIND_BIGINT = 15,
+       TS_KIND_LAST = TS_KIND_BIGINT };
 typedef struct ts_gc_header {
   uint8_t kind, mark, gen;
   uint8_t flags;   /* TS_HDR_REMEMBERED, TS_HDR_SIZED */
@@ -1350,10 +1351,47 @@ static inline int ts_array_is_array(tsv v){
   if (ts_is_indexed_array_fast(v)) return 1;
   return TS_RT_UNLIKELY(g_has_proxies) ? ts_array_is_array_slow(v) : 0;
 }
+/* A BigInt value (docs/bigint_design.md): OBJECT-tagged as a Symbol is, immutable. `0n` is false, so a
+   truthiness test looks at an object's kind in a program that can make one (TS_PROGRAM_BIGINT, set by the
+   emitter); any other pays nothing. */
+typedef struct ts_bigint { ts_gc_header h; uint32_t len, neg; uint64_t limb[]; } ts_bigint;
+static inline int ts_is_bigint(tsv v){ return ts_is_obj(v) && ((ts_gc_header*)ts_ptr(v))->kind == TS_KIND_BIGINT; }
+/* a primitive in a cell: what the tests for an object must leave out */
+static inline int ts_is_prim_cell(tsv v){
+  if (!ts_is_obj(v)) return 0;
+  uint8_t k = ((ts_gc_header*)ts_ptr(v))->kind;
+  return k == TS_KIND_SYMBOL || k == TS_KIND_BIGINT;
+}
+extern int g_has_bigint;
+tsv    ts_bigint_literal(const char* text);
+tsv    ts_bigint_call(tsv* a, int n);
+tsv    ts_bigint_as_int_n(tsv* a, int n);
+tsv    ts_bigint_as_uint_n(tsv* a, int n);
+tsv    ts_bigint_to_string(tsv v, int radix);
+tsv    ts_bigint_proto(void);
+void   ts_bigint_ctor_link(tsv ctor);
+tsv    ts_bigint_negate(tsv v);
+int    ts_bigint_eq(tsv a, tsv b);
+int    ts_bigint_relational(tsv a, tsv b);
+int    ts_bigint_loose_eq(tsv big, tsv other);
+uint32_t ts_bigint_hash(tsv v);
+double ts_bigint_to_double(tsv v);
+tsv    ts_to_bigint(tsv v);
+uint64_t ts_bigint_to_u64(tsv v);
+tsv    ts_bigint_from_i64(int64_t i);
+tsv    ts_bigint_from_u64(uint64_t u);
+tsv    ts_numeric_op(int op, tsv a, tsv b);
+tsv    ts_numeric_unary(int op, tsv v);
+tsv    ts_number_of(tsv v);   /* Number(v) */
 TS_RT_ALWAYS_INLINE int ts_truthy_fast(tsv v){
   if (ts_is_num(v)){ double d=ts_to_num(v); return d!=0 && !(d!=d); }
   uint16_t t = TS_TOP16(v);
+#ifdef TS_PROGRAM_BIGINT
+  if (t == TS_SEL_OBJECT) return !(((ts_gc_header*)ts_ptr(v))->kind == TS_KIND_BIGINT && ((ts_bigint*)ts_ptr(v))->len == 0);
+  if (t == TS_SEL_FUNC) return 1;
+#else
   if (t == TS_SEL_OBJECT || t == TS_SEL_FUNC) return 1;
+#endif
   if (t == TS_SEL_BOOL) return (int)(v&1);
   if (t == TS_SEL_UNDEF || t == TS_SEL_NULL) return 0;
   return ts_truthy(v);   /* strings (and short strings): length test out of line */
@@ -1368,7 +1406,7 @@ static inline int ts_typeof_is_boolean(tsv v){ return !ts_is_num(v) && !ts_is_st
 static inline int ts_typeof_is_undefined(tsv v){ return !ts_is_num(v) && !ts_is_str(v) && !ts_is_bool(v) && ts_is_undef(v); }
 static inline int ts_typeof_is_function(tsv v){ return !ts_is_num(v) && !ts_is_str(v) && !ts_is_bool(v) && !ts_is_undef(v) && (ts_is_func(v) || ts_is_callable_proxy(v)); }
 static inline int ts_typeof_is_symbol(tsv v){ return !ts_is_num(v) && !ts_is_str(v) && !ts_is_bool(v) && !ts_is_undef(v) && !ts_is_func(v) && ts_is_symbol(v); }
-static inline int ts_typeof_is_object(tsv v){ return !ts_is_num(v) && !ts_is_str(v) && !ts_is_bool(v) && !ts_is_undef(v) && !ts_is_func(v) && !ts_is_symbol(v) && !ts_is_callable_proxy(v); }
+static inline int ts_typeof_is_object(tsv v){ return !ts_is_num(v) && !ts_is_str(v) && !ts_is_bool(v) && !ts_is_undef(v) && !ts_is_func(v) && !ts_is_prim_cell(v) && !ts_is_callable_proxy(v); }
 static inline int ts_is_undefined_fast(tsv v){ return ts_is_undef(v); }
 
 /* JS Map: parallel key/value arrays preserving insertion order, plus a side
@@ -2332,6 +2370,9 @@ int ts_strict_eq_str(tsv a, tsv b);   /* two strings: the lengths first, then th
 TS_RT_ALWAYS_INLINE int ts_strict_eq(tsv a, tsv b){
   if (a == b) return !(ts_is_num(a) && ts_to_num(a) != ts_to_num(a));
   if (ts_is_num(a) || ts_is_num(b)) return ts_is_num(a) && ts_is_num(b) && ts_to_num(a) == ts_to_num(b);
+#ifdef TS_PROGRAM_BIGINT
+  if (ts_is_bigint(a)) return ts_is_bigint(b) && ts_bigint_eq(a, b);
+#endif
   if (ts_is_obj(a) || ts_is_func(a)) return ts_same_cell(a, b);
   if (ts_is_str(a) && ts_is_str(b)) return ts_strict_eq_str(a, b);
   return 0;

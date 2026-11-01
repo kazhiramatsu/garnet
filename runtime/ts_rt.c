@@ -1,5 +1,6 @@
 #include <limits.h>
 #include <unistd.h>   /* isatty: gate console.log colorization on a TTY (Node parity) */
+#define TS_PROGRAM_BIGINT 1
 #include "ts_rt.h"
 #include "json_core.c"
 #include "ts_ieee754.c"   /* Math's transcendental functions, V8's implementations */
@@ -1992,6 +1993,7 @@ void ts_object_proto_register(ts_key method_key, const char* name, ts_code fn){
    (keyv) entry points; ts_key_to_value reconstructs the value from a ts_key. */
 #if !TS_ISO_MODE
 int g_has_proxies = 0;   /* declared in ts_rt.h; see ts_is_proxy there */
+int g_has_bigint = 0;    /* a BigInt exists: the tests for one stay off the paths otherwise */
 /* A Proxy of a callable target exists: until then `typeof x === "object"` and the callable tests
    never read a header for it (vue's reactive Proxies wrap plain objects: one predictable branch) */
 int g_has_callable_proxies = 0;
@@ -2085,6 +2087,7 @@ static void ts_proxy_enum(tsv pv, ts_prop_enum_cb_fwd cb, void* ud);
 /* Object.getPrototypeOf: return the object's prototype (or null). */
 tsv ts_get_proto(tsv obj){
   if (g_has_proxies && ts_is_proxy(obj)) return ts_proxy_get_proto(obj);
+  if (TS_RT_UNLIKELY(g_has_bigint) && ts_is_bigint(obj)) return ts_bigint_proto();
   if (ts_is_func(obj)){
     /* a function's [[Prototype]]: Function.prototype unless relinked (a class value's base, a derived
        constructor over a runtime value: `Object.getPrototypeOf(Derived) === Base`) */
@@ -3701,7 +3704,12 @@ static inline int kind_has_common_header(uint8_t k){
 /* A property-bag receiver: anything carrying the common header. Object/array/map/
    set use the OBJECT NaN-box selector; functions use the FUNC selector. Both are
    valid ts_get/ts_set receivers in the unified model. */
-static inline int ts_is_propbag(tsv v){ return ts_is_obj(v) || ts_is_func(v); }
+static inline int ts_is_propbag(tsv v){
+  if (ts_is_func(v)) return 1;
+  if (!ts_is_obj(v)) return 0;
+  /* a BigInt's cell holds limbs where an object has its map */
+  return TS_RT_LIKELY(!g_has_bigint) || ((ts_gc_header*)ts_ptr(v))->kind != TS_KIND_BIGINT;
+}
 /* A receiver the property caches serve for `key`: a plain object, or an array
    for any named key but `length` (an array's length is virtual, not a slot;
    docs/shaped_array_props_design.md). Index keys reach the caches only through
@@ -3738,7 +3746,7 @@ static inline ts_object* ts_class_static_container(tsv v){
    Outside these gates, ts_is_class_value is used only by instanceof. */
 static inline int ts_object_like(tsv v){ return ts_is_obj(v) || ts_is_func(v); }
 /* An Object for the iteration protocol's checks: a function too, a Symbol's cell not. */
-static inline int ts_iter_object(tsv v){ return ts_is_callable(v) || (ts_object_like(v) && !ts_is_symbol(v)); }
+static inline int ts_iter_object(tsv v){ return ts_is_callable(v) || (ts_object_like(v) && !ts_is_prim_cell(v)); }
 
 /* Object.freeze / Object.isFrozen / Object.create. Integrity remains logically
    separate from hidden-class identity; write caches consult it on every hit.
@@ -3834,9 +3842,9 @@ tsv ts_get(tsv obj, ts_key key){
     }
     if (TS_RT_UNLIKELY(ts_kind_is_buffer_or_view(fast->h.kind)))
       return fast->h.kind == TS_KIND_TYPEDARRAY ? ta_get_key(obj, key) : ab_get_key(obj, key);
-    if (TS_RT_UNLIKELY(fast->h.kind == TS_KIND_SYMBOL)){
+    if (TS_RT_UNLIKELY(fast->h.kind == TS_KIND_SYMBOL || fast->h.kind == TS_KIND_BIGINT)){
       tsv found;
-      if (lookup_prop_chain(obj, ts_proto_ptr(ts_symbol_proto()), key, &found)) return found;
+      if (lookup_prop_chain(obj, ts_proto_ptr(fast->h.kind == TS_KIND_SYMBOL ? ts_symbol_proto() : ts_bigint_proto()), key, &found)) return found;
       return TS_UNDEFINED;
     }
   }
@@ -4013,6 +4021,12 @@ static void ts_throw_bad_write_receiver(tsv obj, ts_key key){
   if (ts_is_undef(obj) || ts_is_null(obj)){
     snprintf(buf, sizeof buf, "Cannot set properties of %s (setting '%s')",
              ts_is_null(obj) ? "null" : "undefined", nm ? nm : "?");
+    ts_throw_type_error_msg(buf);
+  }
+  if (ts_is_bigint(obj)){
+    uint32_t sl; char* sc = ts_string_cstr_copy(ts_bigint_to_string(obj, 10), &sl);
+    snprintf(buf, sizeof buf, "Cannot create property '%s' on bigint '%s'", nm ? nm : "?", sc ? sc : "?");
+    free(sc);
     ts_throw_type_error_msg(buf);
   }
   if (ts_is_num(obj)){
@@ -4475,7 +4489,7 @@ void ts_define_accessor_dyn(tsv obj, tsv keyv, tsv getter, tsv setter, int g_thi
    symbol-keyed slot is read/written/invoked by ts_get/ts_set just like any other
    key, so this is the only runtime piece needed for symbol-keyed accessors. */
 void ts_define_accessor_symkey(tsv obj, tsv sym, tsv getter, tsv setter, int g_this, int s_this, int e, int c){
-  if ((!ts_is_obj(obj) && !ts_is_func(obj)) || !ts_is_symbol(sym)) return;
+  if ((!ts_is_obj(obj) && !ts_is_func(obj)) || !ts_is_prim_cell(sym)) return;
   ts_define_accessor_attr(obj, ts_symbol_key(sym), getter, setter, g_this, s_this, e, c);
 }
 
@@ -5471,7 +5485,7 @@ tsv ts_symbol_new(tsv description){
   return symv;
 }
 tsv ts_symbol_description(tsv sym){
-  if (!ts_is_symbol(sym)) return TS_UNDEFINED;
+  if (!ts_is_prim_cell(sym)) return TS_UNDEFINED;
   return ((ts_symbol*)ts_ptr(sym))->description;
 }
 /* The property key for obj[sym]: well-known symbols map to their WKSYM key (so
@@ -5485,12 +5499,12 @@ ts_key ts_symbol_key(tsv sym){
 /* Array.prototype[Symbol.iterator] replaced or deleted: no array iterates by index any more. */
 int g_array_iter_patched = 0;
 void ts_set_symkey(tsv obj, tsv sym, tsv val){
-  if (!ts_is_propbag(obj) || !ts_is_symbol(sym)) return;
+  if (!ts_is_propbag(obj) || !ts_is_prim_cell(sym)) return;
   if (TS_RT_UNLIKELY(obj == g_array_proto_v) && ts_symbol_key(sym) == TS_KEY_WKSYM(TS_WKSYM_ITERATOR)) g_array_iter_patched = 1;
   ts_set(obj, ts_symbol_key(sym), val);
 }
 tsv ts_get_symkey(tsv obj, tsv sym){
-  if (!ts_is_symbol(sym)) return TS_UNDEFINED;
+  if (!ts_is_prim_cell(sym)) return TS_UNDEFINED;
   if (ts_is_null(obj) || ts_is_undef(obj)) return ts_throw_cannot_read(obj, NULL);   /* V8's TypeError (a silent undefined was a miscompile) */
   /* a string or number primitive reads through its prototype ("ab"[Symbol.iterator]), as ts_get does */
   if (!ts_is_propbag(obj) && !ts_is_str(obj) && !ts_is_num(obj)) return TS_UNDEFINED;
@@ -5572,7 +5586,7 @@ tsv ts_symbol_for(tsv key){
   return symv;
 }
 tsv ts_symbol_key_for(tsv sym){
-  if (!ts_is_symbol(sym)) return TS_UNDEFINED;
+  if (!ts_is_prim_cell(sym)) return TS_UNDEFINED;
   for (uint32_t i=0;i<g_symreg_len;i++){
     if (g_symreg[i].sym == sym || ts_same_cell(g_symreg[i].sym, sym)) return g_symreg[i].key;
   }
@@ -5580,7 +5594,7 @@ tsv ts_symbol_key_for(tsv sym){
 }
 /* sym.toString() -> "Symbol(desc)" (desc empty if undefined). */
 tsv ts_symbol_tostring(tsv sym){
-  if (!ts_is_symbol(sym)) return ts_new_string("Symbol()", 8);
+  if (!ts_is_prim_cell(sym)) return ts_new_string("Symbol()", 8);
   ts_symbol* s = (ts_symbol*)ts_ptr(sym);
   const char* d = ""; uint32_t dl = 0;
   ts_strview ds = {0};
@@ -5633,6 +5647,7 @@ tsv ts_typeof(tsv v){
   if (ts_is_undef(v))return ts_str_v(&g_typeof_undefined);
   if (ts_is_func(v)) return ts_str_v(&g_typeof_function);
   if (ts_is_symbol(v)) return ts_str_v(&g_typeof_symbol);
+  if (TS_RT_UNLIKELY(g_has_bigint) && ts_is_bigint(v)) return ts_new_string("bigint", 6);
   if (ts_is_callable_proxy(v)) return ts_str_v(&g_typeof_function);   /* a Proxy of a function */
   return ts_str_v(&g_typeof_object); /* objects, arrays, null */
 }
@@ -5743,7 +5758,7 @@ static tsv ts_prim_method(tsv v, uint32_t field_key, uint32_t method_key){
    valueOf()->toString(), for string toString()->valueOf(). Returns a primitive
    (non-object) tsv, or the input unchanged if it is already primitive. */
 tsv ts_to_primitive(tsv v, int hint){
-  if (!ts_object_like(v) || ts_is_symbol(v)) return v;  /* already primitive (or symbol); a class value coerces like an object */
+  if (!ts_object_like(v) || ts_is_prim_cell(v)) return v;  /* already primitive (or a symbol, a BigInt); a class value coerces like an object */
   ts_gc_root(&v);
   /* 1. Symbol.toPrimitive */
   tsv sp = ts_get(v, TS_KEY_WKSYM(TS_WKSYM_TO_PRIMITIVE));
@@ -5756,7 +5771,7 @@ tsv ts_to_primitive(tsv v, int hint){
     tsv args[2]; args[0]=v; args[1]=hs;
     tsv r = ts_call_method(sp, args, 2);
     ts_gc_unroot(3);
-    if ((ts_is_obj(r) && !ts_is_symbol(r)) || ts_is_func(r)) ts_throw_type_error_msg("Cannot convert object to primitive value");
+    if ((ts_is_obj(r) && !ts_is_prim_cell(r)) || ts_is_func(r)) ts_throw_type_error_msg("Cannot convert object to primitive value");
     return r;
   }
   /* 2. ordered valueOf / toString. string hint -> toString first; number/default
@@ -5773,7 +5788,7 @@ tsv ts_to_primitive(tsv v, int hint){
       ts_gc_root(&m);
       tsv r = ts_call_method(m, &v, 1);   /* this = v */
       ts_gc_unroot(1);
-      if ((!ts_is_obj(r) && !ts_is_func(r)) || ts_is_symbol(r)){ ts_gc_unroot(1); return r; }
+      if ((!ts_is_obj(r) && !ts_is_func(r)) || ts_is_prim_cell(r)){ ts_gc_unroot(1); return r; }
     }
   }
   ts_gc_unroot(1);
@@ -5788,7 +5803,7 @@ tsv ts_to_primitive(tsv v, int hint){
 static tsv ts_str_value_typed(tsv s, int valueof){
   if (ts_is_str(s)) return s;
   if (s == ts_string_proto()) return ts_new_string("", 0);
-  if (ts_object_like(s) && !ts_is_symbol(s)) {
+  if (ts_object_like(s) && !ts_is_prim_cell(s)) {
     static int depth = 0;   /* an object whose chain ends in String.prototype's own method would recurse */
     ts_prim_field_init();
     tsv m = ts_prim_method(s, valueof ? g_valueof_field : g_tostring_field, valueof ? g_valueof_key : g_tostring_key);
@@ -5815,6 +5830,7 @@ tsv ts_to_string_v(tsv v){
   if (ts_is_bool(v)) return ts_new_string((v&1)?"true":"false",(v&1)?4:5);
   if (ts_is_undef(v)) return ts_new_string("undefined",9);
   if (ts_is_null(v)) return ts_new_string("null",4);
+  if (ts_is_bigint(v)) return ts_bigint_to_string(v, 10);
   if (ts_is_symbol(v)) return ts_symbol_tostring(v);   /* String(sym): SymbolDescriptiveString (`+` and a template throw before this) */
   if (ts_is_indexed_array_fast(v)){
     ts_gc_root(&v);
@@ -5828,7 +5844,7 @@ tsv ts_to_string_v(tsv v){
      ("string") if present, else toString()/valueOf() (own override shadows the
      Object.prototype default). ts_to_primitive resolves both FIELD-key
      object-literal methods and METHOD-key prototype/builtin methods. */
-  if (ts_object_like(v) && !ts_is_symbol(v)){
+  if (ts_object_like(v) && !ts_is_prim_cell(v)){
     ts_gc_root(&v);
     tsv p = ts_to_primitive(v, /*string_hint*/1);
     ts_gc_root(&p);
@@ -6090,7 +6106,7 @@ tsv ts_add(tsv a, tsv b){
   /* JS `+`: ToPrimitive(default) each operand first. An object becomes its
      valueOf()/toString()/Symbol.toPrimitive("default") result, so `o + 5` and
      `o + ""` follow spec instead of silently yielding 0. */
-  if ((ts_object_like(a)&&!ts_is_symbol(a)) || (ts_object_like(b)&&!ts_is_symbol(b))){
+  if ((ts_object_like(a)&&!ts_is_prim_cell(a)) || (ts_object_like(b)&&!ts_is_prim_cell(b))){
     ts_gc_root(&a); ts_gc_root(&b);
     tsv pa = ts_to_primitive(a, 2);  /* hint: default */
     ts_gc_root(&pa);                 /* the second conversion may collect */
@@ -6099,6 +6115,7 @@ tsv ts_add(tsv a, tsv b){
     /* avoid infinite recursion if ToPrimitive returned an object (shouldn't) */
     if (!ts_is_obj(pa) || !ts_is_obj(pb) || pa!=a || pb!=b) return ts_add(pa, pb);
   }
+  if (TS_RT_UNLIKELY(g_has_bigint) && (ts_is_bigint(a) || ts_is_bigint(b)) && !ts_is_str(a) && !ts_is_str(b)) return ts_numeric_op(0, a, b);
   if (TS_RT_UNLIKELY(ts_is_symbol(a) || ts_is_symbol(b)))
     ts_throw_type_error_msg((ts_is_str(a) || ts_is_str(b)) ? "Cannot convert a Symbol value to a string" : "Cannot convert a Symbol value to a number");
   if (ts_is_str(a)||ts_is_str(b)){
@@ -6186,7 +6203,7 @@ tsv ts_str_concat_many(tsv* args, int n){
   if (n <= 0) return ts_new_string("",0);
   int first_string_pair = n == 1 || ts_is_str(args[0]) || ts_is_str(args[1]);
   for(int i=0;i<n;i++){
-    if (ts_object_like(args[i]) && !ts_is_symbol(args[i])) first_string_pair = 0;
+    if (ts_object_like(args[i]) && !ts_is_prim_cell(args[i])) first_string_pair = 0;
   }
   if (!first_string_pair){
     tsv r = args[0];
@@ -6375,6 +6392,7 @@ int ts_strict_eq_slow(tsv a, tsv b){
   if (a == b) return !(ts_is_num(a) && ts_to_num(a) != ts_to_num(a));
   if (ts_is_num(a)&&ts_is_num(b)) return ts_to_num(a)==ts_to_num(b);
   if ((ts_is_obj(a) || ts_is_func(a)) && ts_same_cell(a, b)) return 1;
+  if (TS_RT_UNLIKELY(g_has_bigint) && ts_is_bigint(a) && ts_is_bigint(b)) return ts_bigint_eq(a, b);
   if (ts_is_str(a)&&ts_is_str(b)){
     ts_strview x=ts_str_view_typed(a), y=ts_str_view_typed(b);
     if (x.len!=y.len) return 0;
@@ -6407,14 +6425,18 @@ int ts_relational_slow(tsv a, tsv b, int op){
     switch(op){ case 0: return na<nb; case 1: return na<=nb; case 2: return na>nb; default: return na>=nb; }
   }
   ts_gc_root(&a); ts_gc_root(&b);
-  tsv pa = (ts_object_like(a)&&!ts_is_symbol(a)) ? ts_to_primitive(a,0) : a;
+  tsv pa = (ts_object_like(a)&&!ts_is_prim_cell(a)) ? ts_to_primitive(a,0) : a;
   ts_gc_root(&pa);   /* the second conversion may collect */
-  tsv pb = (ts_object_like(b)&&!ts_is_symbol(b)) ? ts_to_primitive(b,0) : b;
+  tsv pb = (ts_object_like(b)&&!ts_is_prim_cell(b)) ? ts_to_primitive(b,0) : b;
   ts_gc_root(&pb);
   int r;
   if (ts_is_str(pa) && ts_is_str(pb)){
     int c = str_view_compare(ts_str_view_typed(pa), ts_str_view_typed(pb));
     switch(op){ case 0: r = c<0; break; case 1: r = c<=0; break; case 2: r = c>0; break; default: r = c>=0; }
+  } else if (ts_is_bigint(pa) || ts_is_bigint(pb)){
+    int c = ts_bigint_relational(pa, pb);   /* 2: undefined, a NaN or a string that is no integer */
+    if (c == 2) r = 0;
+    else switch(op){ case 0: r = c<0; break; case 1: r = c<=0; break; case 2: r = c>0; break; default: r = c>=0; }
   } else {
     double na = ts_number_coerce(pa), nb = ts_number_coerce(pb);
     if (na!=na || nb!=nb) r = 0; /* NaN -> all relational false */
@@ -6438,8 +6460,10 @@ int ts_loose_eq(tsv a, tsv b){
   if (ts_is_num(a) && ts_is_str(b)) return ts_to_num(a)==ts_number_coerce(b);
   if (ts_is_str(a) && ts_is_num(b)) return ts_number_coerce(a)==ts_to_num(b);
   /* object <-> primitive: ToPrimitive(object) then re-compare */
-  if ((ts_object_like(a)&&!ts_is_symbol(a)) && (ts_is_num(b)||ts_is_str(b)||ts_is_symbol(b))){ ts_gc_root(&b); tsv p=ts_to_primitive(a,2); ts_gc_unroot(1); return ts_loose_eq(p,b); }
-  if ((ts_object_like(b)&&!ts_is_symbol(b)) && (ts_is_num(a)||ts_is_str(a)||ts_is_symbol(a))){ ts_gc_root(&a); tsv p=ts_to_primitive(b,2); ts_gc_unroot(1); return ts_loose_eq(a,p); }
+  if ((ts_object_like(a)&&!ts_is_prim_cell(a)) && (ts_is_num(b)||ts_is_str(b)||ts_is_prim_cell(b))){ ts_gc_root(&b); tsv p=ts_to_primitive(a,2); ts_gc_unroot(1); return ts_loose_eq(p,b); }
+  if ((ts_object_like(b)&&!ts_is_prim_cell(b)) && (ts_is_num(a)||ts_is_str(a)||ts_is_prim_cell(a))){ ts_gc_root(&a); tsv p=ts_to_primitive(b,2); ts_gc_unroot(1); return ts_loose_eq(a,p); }
+  if (ts_is_bigint(a)) return ts_bigint_loose_eq(a, b);
+  if (ts_is_bigint(b)) return ts_bigint_loose_eq(b, a);
   return 0;
 }
 /* Object.is(a,b): SameValue. Like ===, except NaN equals NaN and +0 != -0. */
@@ -6458,6 +6482,7 @@ int ts_truthy(tsv v){
   if (ts_is_bool(v)) return (int)(v&1);
   if (ts_is_undef(v)||ts_is_null(v)) return 0;
   if (ts_is_str(v)) return ts_str_len_typed(v)!=0;
+  if (TS_RT_UNLIKELY(g_has_bigint) && ts_is_bigint(v)) return ((ts_bigint*)ts_ptr(v))->len != 0;
   return 1;
 }
 /* forward decl: structural inspection (defined after the jbuf/json helpers). */
@@ -8946,6 +8971,7 @@ TS_RT_ALWAYS_INLINE uint32_t sv0_hash(tsv k){
   } else if (ts_is_str(k)){
     return ts_str_hash_fast(k);
   } else if (ts_heap_ref(k)){
+    if (TS_RT_UNLIKELY(g_has_bigint) && ts_is_bigint(k)) return ts_bigint_hash(k);
     /* identity: the cell's address (cells never move); the high half of
        the product mixes every address bit into the index bits */
     uint64_t x = ((k & TS_PAYLOAD_MASK) >> 4) * 0x9E3779B97F4A7C15ull;
@@ -10279,8 +10305,14 @@ double ts_number_coerce_slow(tsv v){
   /* object: ToPrimitive(number) via Symbol.toPrimitive / valueOf / toString,
      then coerce the resulting primitive. (Symbols are not numerically coercible.) */
   if (ts_is_symbol(v)) ts_throw_type_error_msg("Cannot convert a Symbol value to a number");
+  if (ts_is_bigint(v)) ts_throw_type_error_msg("Cannot convert a BigInt value to a number");
   if (ts_object_like(v)) return ts_number_coerce(ts_to_primitive(v, /*string_hint*/0));
   return NAN;
+}
+/* Number(v): a BigInt converts here, not through ToNumber */
+tsv ts_number_of(tsv v){
+  tsv p = ts_to_primitive(v, 0);
+  return ts_is_bigint(p) ? ts_num(ts_bigint_to_double(p)) : ts_num(ts_number_coerce(p));
 }
 /* parseInt/parseFloat (global). parseInt supports an optional radix. */
 /* ---------------- string to number (ECMA-262 StringToNumber, parseFloat,
@@ -10723,7 +10755,7 @@ static int date_is(tsv v){
 }
 double ts_date_value_ms(tsv v){
   if (date_is(v)){ tsv ms = ts_get(v, date_key()); return ts_is_num(ms) ? ts_to_num(ms) : NAN; }
-  if (ts_object_like(v) && !ts_is_symbol(v)) v = ts_to_primitive(v, 2);
+  if (ts_object_like(v) && !ts_is_prim_cell(v)) v = ts_to_primitive(v, 2);
   if (ts_is_str(v)){
     uint32_t len; char* text = ts_string_utf8_copy(v, &len);
     double r = ts_date_parse_chars(text, len);
@@ -11011,7 +11043,7 @@ static tsv dp_toPrimitive(tsv* a, int n){
       ts_gc_root(&m);
       tsv r = ts_call_method(m, &self, 1);
       ts_gc_unroot(1);
-      if ((!ts_is_obj(r) && !ts_is_func(r)) || ts_is_symbol(r)){ ts_gc_unroot(1); return r; }
+      if ((!ts_is_obj(r) && !ts_is_func(r)) || ts_is_prim_cell(r)){ ts_gc_unroot(1); return r; }
     }
   }
   ts_gc_unroot(1);
@@ -12897,6 +12929,7 @@ static int json_stringify_val(jbuf* b, tsv v, int depth, const char* indent){
   if (ts_is_null(v)){ jb_putz(b,"null"); return 1; }
   if (ts_is_bool(v)){ jb_putz(b,(v&1)?"true":"false"); return 1; }
   if (ts_is_num(v)){ json_num(b, ts_to_num(v)); return 1; }
+  if (ts_is_bigint(v)) ts_throw_type_error_msg("Do not know how to serialize a BigInt");
   if (ts_is_str(v)){ json_quote(b, ts_str_view_typed(v)); return 1; }
   if (ts_is_array(v)){
     ts_gc_root(&v);
@@ -14213,6 +14246,13 @@ static void inspect_val(jbuf* b, tsv v, int depth, int top){
   if (ts_is_undef(v)){ jbc(b,TSC_UNDEF); jb_putz(b,"undefined"); jbc(b,TSC_FGOFF); return; }
   if (ts_is_null(v)){ jbc(b,TSC_BOLD); jb_putz(b,"null"); jbc(b,TSC_BOLDOFF); return; }
   if (ts_is_bool(v)){ jbc(b,TSC_NUM); jb_putz(b,(v&1)?"true":"false"); jbc(b,TSC_FGOFF); return; }
+  if (ts_is_bigint(v)){
+    tsv text = ts_bigint_to_string(v, 10);
+    uint32_t n = 0; char* u = ts_string_cstr_copy(text, &n);
+    jbc(b,TSC_NUM); jb_puts(b, u, n); jb_putz(b, "n"); jbc(b,TSC_FGOFF);
+    free(u);
+    return;
+  }
   if (ts_is_symbol(v)){
     jbc(b,TSC_STR);
     ts_strview sv = ts_str_view_typed(ts_symbol_tostring(v));
@@ -15062,7 +15102,7 @@ tsv ts_sb_append(tsv sb, tsv e){
   ts_gc_root(&sb); ts_gc_root(&e);
   if (!digits && !ts_is_str(e)){
     /* `L + e` with L a string: ToPrimitive(default), then ToString */
-    if (ts_object_like(e) && !ts_is_symbol(e)) e = ts_to_primitive(e, 2);
+    if (ts_object_like(e) && !ts_is_prim_cell(e)) e = ts_to_primitive(e, 2);
     e = ts_to_string_v(e);
   }
   uint32_t add_len, add_utf16 = 0, add_ascii = 1;
@@ -16078,7 +16118,7 @@ void ts_define_properties(tsv obj, tsv descs){
 }
 
 static void in_operand_check(tsv obj){
-  if (TS_RT_LIKELY((ts_is_obj(obj) && !ts_is_symbol(obj)) || ts_is_func(obj))) return;
+  if (TS_RT_LIKELY((ts_is_obj(obj) && !ts_is_prim_cell(obj)) || ts_is_func(obj))) return;
   ts_throw_type_error_msg("Cannot use 'in' operator to search for a key in a value that is not an object");
 }
 int ts_has_prop_in(tsv obj, ts_key key){ in_operand_check(obj); return ts_has_prop(obj, key); }
@@ -16195,9 +16235,10 @@ TS_TAG_STATIC(g_tag_object, "[object Object]", 15)
 tsv ts_objproto_tostring_call(tsv v){
   if (ts_is_undef(v)) return TS_TAG(g_tag_undefined);
   if (ts_is_null(v))  return TS_TAG(g_tag_null);
+  if (TS_RT_UNLIKELY(g_has_bigint) && ts_is_bigint(v)) return ts_new_string("[object BigInt]", 15);
   /* arrays, plain objects and functions (a generator's) can carry [Symbol.toStringTag]; primitives don't.
      Keep v/tag rooted and copy tag bytes before the result allocation. */
-  if ((ts_is_obj(v) && !ts_is_symbol(v)) || ts_is_func(v)){
+  if ((ts_is_obj(v) && !ts_is_prim_cell(v)) || ts_is_func(v)){
     ts_gc_root(&v);
     tsv tag = ts_get(v, TS_KEY_WKSYM(TS_WKSYM_TO_STRING_TAG));
     if (ts_is_str(tag)){
@@ -16802,7 +16843,7 @@ tsv ts_new_array_buffer(tsv length, int shared){
 /* `new ArrayBuffer(n, { maxByteLength })` (docs/resizable_buffers_design.md) */
 tsv ts_new_array_buffer_options(tsv length, tsv options, int shared){
   double n = ts_is_undef(length) ? 0 : ta_to_index(length, 1);
-  tsv max = ts_object_like(options) && !ts_is_symbol(options) ? ts_get(options, ts_intern_field("maxByteLength", 13)) : TS_UNDEFINED;
+  tsv max = ts_object_like(options) && !ts_is_prim_cell(options) ? ts_get(options, ts_intern_field("maxByteLength", 13)) : TS_UNDEFINED;
   if (ts_is_undef(max)) return ta_new_buffer(n, shared);
   double m = ta_to_index(max, 1);
   if (n > m) ts_throw_range_error_msg("Invalid array buffer max length");
@@ -18841,6 +18882,7 @@ tsv ts_to_object(tsv v){
   if (ts_is_num(v)) return new_wrapper(v, ts_number_proto());
   if (ts_is_bool(v)) return new_wrapper(v, ts_boolean_proto());
   if (ts_is_symbol(v)) return new_wrapper(v, ts_symbol_proto());
+  if (ts_is_bigint(v)) return new_wrapper(v, ts_bigint_proto());
   return v;
 }
 /* Symbol.prototype: a symbol is no object with a prototype of its own, ts_get starts here for one. */
@@ -18959,7 +19001,7 @@ int ts_private_has(tsv obj, ts_key key){
 }
 /* SetFunctionName's text for a property key: a symbol in brackets, its description (none: empty). */
 tsv ts_fn_key_name(tsv key){
-  if (!ts_is_symbol(key)) return ts_to_string_v(key);
+  if (!ts_is_prim_cell(key)) return ts_to_string_v(key);
   tsv d = ts_symbol_description(key);
   if (!ts_is_str(d)) return ts_new_string("", 0);
   uint32_t n = 0; char* u = ts_string_cstr_copy(d, &n);
@@ -25619,6 +25661,7 @@ int main(int argc, char** argv){
 }
 #endif
 /* The Node modules' host (lib/node, docs/node_compat_design.md): one translation unit with the runtime. */
+#include "bigint.c"
 #include "node_host.c"
 /* CompressionStream's zlib streams (lib/node/web/compression.ts, docs/web_compression_design.md): libz loaded on first use. */
 #include "zlib_host.c"
