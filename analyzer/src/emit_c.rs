@@ -24518,24 +24518,29 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     .map(|a| ctx.val(a.0))
                     .unwrap_or_else(|| "TS_UNDEFINED".into())
             };
+            // ToNumber of an argument: the types call it a number at most, a boxed value can
+            // be a numeric string or an object with a valueOf.
             let n = |i: usize| -> String {
                 args.get(i)
-                    .map(|a| ctx.num(a.0))
+                    .map(|a| ctx.numc(a.0))
                     .unwrap_or_else(|| "0".into())
             };
             let has = |i: usize| if args.len() > i { "1" } else { "0" };
+            // An argument the method takes as absent when it is undefined (an end position).
+            let has_defined = |i: usize| -> String {
+                match args.get(i) {
+                    None => "0".into(),
+                    Some(a) if ctx.unboxed.contains(&a.0) || ctx.json_locals.contains(&a.0) => "1".into(),
+                    Some(a) => format!("!ts_is_undefined_fast({})", ctx.val(a.0)),
+                }
+            };
             // The callback of an iteration method, bound to its thisArg when
             // the call passes one (`arr.forEach(fn, ctx)`).
             let cbv = || -> String {
                 if args.len() > 1 { format!("ts_callback_with_this({}, {})", v(0), v(1)) } else { v(0) }
             };
             // (expr, is_numeric_result)
-            let optional_end = if let Some(end) = args.get(1) {
-                if ctx.unboxed.contains(&end.0) { "1".into() }
-                else { format!("!ts_is_undefined_fast({})", ctx.val(end.0)) }
-            } else {
-                "0".into()
-            };
+            let optional_end = has_defined(1);
             let (expr, numeric): (String, bool) = match builtin.as_str() {
                 "string.toUpperCase" => (format!("ts_unicode_toupper_tsv({})", r), false),
                 "string.toLowerCase" => (format!("ts_unicode_tolower_tsv({})", r), false),
@@ -24640,7 +24645,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         n(0),
                         n(1),
                         n(2),
-                        has(2)
+                        has_defined(2)
                     ),
                     false,
                 ),
@@ -24704,8 +24709,10 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         r,
                         if args.is_empty() {
                             "1".to_string()
-                        } else {
+                        } else if ctx.unboxed.contains(&args[0].0) || ctx.json_locals.contains(&args[0].0) {
                             n(0)
+                        } else {
+                            format!("ts_array_flat_depth({})", v(0))
                         }
                     ),
                     false,
@@ -24755,7 +24762,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         n(1),
                         n(2),
                         has(1),
-                        has(2)
+                        has_defined(2)
                     ),
                     false,
                 ),
@@ -24812,7 +24819,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         r,
                         v(0),
                         n(1),
-                        has(1)
+                        has_defined(1)
                     ),
                     false,
                 ),

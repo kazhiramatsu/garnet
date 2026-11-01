@@ -321,6 +321,8 @@ static inline int ts_is_str(tsv v) {
 }
 static inline int ts_is_func(tsv v){ return TS_TOP16(v) == TS_SEL_FUNC; }
 #define TS_SHORTSTR_MAX 5u
+/* The longest string (V8's): past it the string builtins are a RangeError, not a truncated length. */
+#define TS_STR_MAX_LENGTH 536870888u
 static inline uint32_t ts_short_str_len(tsv v){
   return (uint32_t)((v >> 40) & 7u);
 }
@@ -1178,6 +1180,12 @@ static inline double ts_str_slice_charcodeat_typed(tsv s, long long start, long 
   ts_strview x = ts_str_view_typed(s);
   return (double)ts_str_cu_at_view(x, (uint32_t)(start + (long long)idx));
 }
+/* ToIntegerOrInfinity of an index argument as a 64-bit integer: NaN is 0, a magnitude past 2^53
+   saturates (a cast of either is undefined, and the two targets differ). */
+static inline long long ts_index_ll(double d){
+  if (TS_RT_LIKELY(d > -9007199254740992.0 && d < 9007199254740992.0)) return (long long)d;
+  return d != d ? 0 : (d < 0 ? -9007199254740992LL : 9007199254740992LL);
+}
 /* General multi-code-unit and mixed-width scanning is an out-of-line worker.
    The allocation-free one-byte/single-unit case stays in the header because it
    collapses to memchr at generated call sites. */
@@ -1207,16 +1215,20 @@ static inline long long ts_str_find_backward_view(ts_strview xs, ts_strview ns, 
   if (start < 0) return -1;
   return ts_str_find_backward_view_slow(xs, ns, start);
 }
+double ts_str_search_coerce(tsv s, tsv needle, double from, int has_from, int last);   /* a receiver or a needle that is not a string */
 static inline double ts_str_indexof_fast(tsv s, tsv needle, double from, int has_from){
-  if (!ts_is_str(s) || !ts_is_str(needle)) return -1;
+  if (!ts_is_str(s) || !ts_is_str(needle)) return ts_str_search_coerce(s, needle, from, has_from, 0);
   ts_strview xs = ts_str_view_typed(s), ns = ts_str_view_typed(needle);
-  long long start = has_from ? (long long)from : 0;
+  long long start = has_from ? ts_index_ll(from) : 0;
   return (double)ts_str_find_forward_view(xs, ns, start);
 }
+/* NaN (an explicit undefined among them) is the end of the string, unlike every other position
+   argument; a negative position is 0: the needle can still match at the start. */
 static inline double ts_str_lastindexof_fast(tsv s, tsv needle, double from, int has_from){
-  if (!ts_is_str(s) || !ts_is_str(needle)) return -1;
+  if (!ts_is_str(s) || !ts_is_str(needle)) return ts_str_search_coerce(s, needle, from, has_from, 1);
   ts_strview xs = ts_str_view_typed(s), ns = ts_str_view_typed(needle);
-  long long start = has_from ? (long long)from : (long long)xs.len - (long long)ns.len;
+  long long start = has_from && from == from ? ts_index_ll(from) : (long long)xs.len - (long long)ns.len;
+  if (start < 0) start = 0;
   return (double)ts_str_find_backward_view(xs, ns, start);
 }
 long long ts_str_replace_literal_metric3(tsv s, tsv pat, tsv rep, tsv needle,
@@ -2087,6 +2099,7 @@ tsv    ts_array_find(tsv arr, tsv cb);
 double ts_array_findindex(tsv arr, tsv cb);
 tsv    ts_array_findlast(tsv arr, tsv cb);
 double ts_array_findlastindex(tsv arr, tsv cb);
+double ts_array_flat_depth(tsv depth);   /* undefined is 1, as an absent depth */
 tsv    ts_array_flat(tsv arr, double depth);
 tsv    ts_array_flatmap(tsv arr, tsv cb);
 tsv    ts_string_from_char_code(tsv* args, int n);

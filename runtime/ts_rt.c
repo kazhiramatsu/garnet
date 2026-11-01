@@ -7919,10 +7919,42 @@ tsv ts_number_to_precision(tsv numv, double prec){
   if (x != x || isinf(x)) return ts_to_string_v(numv);
   return number_to_precision(x, p);
 }
-int ts_str_includes(tsv s, tsv needle, double pos, int has_pos){ return ts_str_indexof(s,needle,pos,has_pos) >= 0; }
+/* A string method past the typed path: a receiver or an argument that is not a string. */
+static tsv str_arg(tsv v){ return ts_is_str(v) ? v : ts_to_string_template(v); }
+static void str_require_coercible(tsv s, const char* name){
+  if (s != TS_UNDEFINED && s != TS_NULL) return;
+  char msg[96];
+  snprintf(msg, sizeof msg, "String.prototype.%s called on null or undefined", name);
+  ts_throw_type_error_msg(msg);
+}
+double ts_str_search_coerce(tsv s, tsv needle, double from, int has_from, int last){
+  str_require_coercible(s, last ? "lastIndexOf" : "indexOf");
+  ts_gc_root(&s); ts_gc_root(&needle);
+  s = str_arg(s);
+  needle = str_arg(needle);
+  ts_gc_unroot(2);
+  return last ? ts_str_lastindexof_fast(s, needle, from, has_from) : ts_str_indexof_fast(s, needle, from, has_from);
+}
+/* includes / startsWith / endsWith: IsRegExp is a TypeError, then ToString. */
+static void str_search_args(tsv* s, tsv* arg, const char* name){
+  str_require_coercible(*s, name);
+  ts_gc_root(s); ts_gc_root(arg);
+  *s = str_arg(*s);
+  if (ts_is_regexp(*arg)){
+    char msg[96];
+    snprintf(msg, sizeof msg, "First argument to String.prototype.%s must not be a regular expression", name);
+    ts_throw_type_error_msg(msg);
+  }
+  *arg = str_arg(*arg);
+  ts_gc_unroot(2);
+}
+int ts_str_includes(tsv s, tsv needle, double pos, int has_pos){
+  if (TS_RT_UNLIKELY(!ts_is_str(s) || !ts_is_str(needle))) str_search_args(&s, &needle, "includes");
+  return ts_str_indexof(s,needle,pos,has_pos) >= 0;
+}
 tsv ts_str_charat(tsv s, double idx){
   if(!ts_is_str(s)) return ts_new_string("",0);
-  long i=(long)idx; if(i<0||i>=(long)ts_str_len_typed(s)) return ts_new_string("",0);
+  long i=(long)ts_index_ll(idx); if(i<0||i>=(long)ts_str_len_typed(s)) return ts_new_string("",0);
   return ts_string_slice_view(s, (uint32_t)i, 1);
 }
 double ts_str_charcodeat(tsv s, double idx){
@@ -7932,7 +7964,7 @@ double ts_str_charcodeat(tsv s, double idx){
 tsv ts_str_codepointat(tsv s, double idx){
   if(!ts_is_str(s)) return TS_UNDEFINED;
   ts_strview xs=ts_str_view_typed(s);
-  long i=(long)idx; if(i<0||i>=(long)xs.len) return TS_UNDEFINED;
+  long i=(long)ts_index_ll(idx); if(i<0||i>=(long)xs.len) return TS_UNDEFINED;
   uint16_t hi = ts_str_cu_at_view(xs, (uint32_t)i);
   if (hi >= 0xD800u && hi <= 0xDBFFu && i + 1 < (long)xs.len){
     uint16_t lo = ts_str_cu_at_view(xs, (uint32_t)i + 1);
@@ -7992,7 +8024,13 @@ tsv ts_str_to_well_formed(tsv s){
   return r;
 }
 
-tsv ts_str_concat(tsv a, tsv b){ return ts_add(a,b); }
+tsv ts_str_concat(tsv a, tsv b){
+  if (TS_RT_LIKELY(ts_is_str(b))) return ts_add(a, b);
+  ts_gc_root(&a);
+  b = str_arg(b);
+  ts_gc_unroot(1);
+  return ts_add(a, b);
+}
 /* String.prototype.localeCompare, the default collation (ICU root) over ASCII and the Latin letters,
    whose accents compare after the base letter: the first primary difference decides (punctuation, then
    digits, then letters without case), then the first accent, then the first case (lower before upper).
@@ -8037,16 +8075,18 @@ double ts_str_locale_compare(tsv a, tsv b){
 }
 tsv ts_str_repeat(tsv s, double count){
   if(!ts_is_str(s)) return s;
-  if (count < 0 || isinf(count)){
+  double whole = count != count ? 0 : trunc(count);
+  if (whole < 0 || isinf(whole)){
     char msg[64], num[40];
-    ts_fmt_num(trunc(count), num, sizeof num);
+    ts_fmt_num(count, num, sizeof num);
     snprintf(msg, sizeof msg, "Invalid count value: %s", num);
     ts_throw_range_error_msg(msg);
   }
   ts_strview xs=ts_str_view_typed(s);
-  long c=(long)count;
+  if (xs.len == 0 || whole == 0) return ts_new_string("",0);
+  if (whole * xs.len > TS_STR_MAX_LENGTH) ts_throw_range_error_msg("Invalid string length");
+  long c=(long)whole;
   uint64_t total64=(uint64_t)xs.len*(uint64_t)c;
-  if(total64 > UINT32_MAX) ts_abort_msg("string too large");
   uint32_t total=(uint32_t)total64;
   if ((xs.flags & TS_STR_FLAG_ASCII) && total <= TS_SHORTSTR_MAX){
     char data[TS_SHORTSTR_MAX];
@@ -8087,19 +8127,20 @@ tsv ts_arguments_array(const tsv* args, uint32_t n){
 }
 tsv ts_str_split(tsv s, tsv sep, tsv limit){
   if (g_regexp_hooks && ts_is_regexp(sep)) return g_regexp_hooks->split(ts_is_str(s) ? s : ts_to_string_v(s), sep, limit);
-  if(!ts_is_str(s)) return ts_new_array(0);
+  if (!ts_is_str(s) && (s == TS_UNDEFINED || s == TS_NULL)) str_require_coercible(s, "split");
   ts_gc_root(&s); ts_gc_root(&sep);
+  s = str_arg(s);
+  /* optional limit: truncate the result to ToUint32(limit) substrings; split(sep,-1) is
+     4294967295, effectively no limit. Converted before the separator, as the spec does. */
+  int has_lim = (limit != TS_UNDEFINED);
+  uint32_t lim = has_lim ? ts_to_uint32(ts_number_coerce(limit)) : 0;
+  if (sep != TS_UNDEFINED) sep = str_arg(sep);
   int sep_is_str=ts_is_str(sep);
   ts_strview xs=ts_str_view_typed(s), ss={0};
   char sepbuf[TS_SHORTSTR_MAX];
   /* a short immediate separator (`split(",")`: a literal of a few units) has no data pointer; its
      units on the stack keep the one-pass memchr path below (the first loop allocates nothing) */
   if(sep_is_str) ss=ts_strview_materialize(ts_str_view_typed(sep), sepbuf);
-  /* optional limit: truncate the result to ToUint32(limit) substrings. */
-  int has_lim = (limit != TS_UNDEFINED);
-  /* ToUint32 per spec (so split(sep,-1) -> 4294967295 = effectively no limit);
-     a direct (uint32_t)(negative double) cast is undefined behavior. */
-  uint32_t lim = has_lim ? (uint32_t)(int64_t)ts_to_num(limit) : 0;
   if(has_lim && lim==0){
     tsv arr=ts_new_array(0); ts_gc_root(&arr);
     ts_gc_unroot(3);
@@ -8522,9 +8563,9 @@ tsv ts_array_copy_within(tsv arr, double target, double start, double end, int h
   ts_array* a=as_arr(arr); if(!a){ if (TS_ARRAY_PROXY(arr)){ tsv av[3] = { ts_num(target), ts_num(start), ts_num(end) }; return ts_method_dynamic(arr, "copyWithin", av, has_end ? 3 : 2); } return arr; }
   if (ts_arr_frozen(arr)){ if (a->len) array_refused(); return arr; }
   long n=(long)a->len;
-  long to = (long)target; if(to<0) to+=n; if(to<0) to=0; if(to>n) to=n;
-  long fr = (long)start;  if(fr<0) fr+=n; if(fr<0) fr=0; if(fr>n) fr=n;
-  long en = has_end ? (long)end : n; if(en<0) en+=n; if(en<0) en=0; if(en>n) en=n;
+  long to = (long)ts_index_ll(target); if(to<0) to+=n; if(to<0) to=0; if(to>n) to=n;
+  long fr = (long)ts_index_ll(start);  if(fr<0) fr+=n; if(fr<0) fr=0; if(fr>n) fr=n;
+  long en = has_end ? (long)ts_index_ll(end) : n; if(en<0) en+=n; if(en<0) en=0; if(en>n) en=n;
   long count = en-fr; if(count > n-to) count = n-to;
   if(count>0){
     array_invalidate_dirty(a);
@@ -8581,7 +8622,7 @@ tsv ts_array_values_arr(tsv arr){
 }
 double ts_array_indexof(tsv arr, tsv v, double from, int has_from){
   ts_array* a=as_arr(arr); if(!a){ if (TS_ARRAY_PROXY(arr)){ tsv av[2] = { v, ts_num(from) }; return ts_number_coerce(ts_method_dynamic(arr, "indexOf", av, has_from ? 2 : 1)); } return -1; }
-  long n=(long)a->len, s = has_from ? (long)from : 0;
+  long n=(long)a->len, s = has_from ? (long)ts_index_ll(from) : 0;
   if(s<0){ s+=n; if(s<0) s=0; }
   if (ts_is_short_str(v)){
     /* an immediate needle (`match.indexOf("", 1)` over a result's captures, hono's route marker):
@@ -8602,7 +8643,7 @@ int ts_array_includes(tsv arr, tsv v, double from, int has_from){
      treats NaN as equal to NaN. (+0/-0 already compare equal under ===.) */
   ts_array* a=as_arr(arr);
   if(!a){ if (TS_ARRAY_PROXY(arr)){ tsv av[2] = { v, ts_num(from) }; return ts_truthy(ts_method_dynamic(arr, "includes", av, has_from ? 2 : 1)); } return 0; }
-  long n=(long)a->len, s = has_from ? (long)from : 0;
+  long n=(long)a->len, s = has_from ? (long)ts_index_ll(from) : 0;
   if(s<0){ s+=n; if(s<0) s=0; }
   int v_is_nan = ts_is_num(v) && (ts_to_num(v) != ts_to_num(v));
   for(long i=s;i<n;i++){
@@ -8700,8 +8741,8 @@ static tsv ts_array_splice_impl(tsv arr, double start, double dc, int has_dc, ts
   ts_gc_root(&removed);
   a=as_arr(arr);
   long n=(long)a->len;
-  long s=(long)start; if(s<0){ s+=n; if(s<0)s=0; } if(s>n) s=n;
-  long del = has_dc ? (long)dc : (n-s); if(del<0) del=0; if(del>n-s) del=n-s;
+  long s=(long)ts_index_ll(start); if(s<0){ s+=n; if(s<0)s=0; } if(s>n) s=n;
+  long del = has_dc ? (long)ts_index_ll(dc) : (n-s); if(del<0) del=0; if(del>n-s) del=n-s;
   if (want_removed) for(long i=0;i<del;i++){
     a=as_arr(arr);
     if (array_is_hole(a->data[s+i])) ts_array_push_hole(removed);
@@ -11183,6 +11224,7 @@ static void flat_into(tsv out, tsv arr, int depth){
     else ts_array_push(out, e);
   }
 }
+double ts_array_flat_depth(tsv depth){ return ts_is_undef(depth) ? 1 : ts_number_coerce(depth); }
 tsv ts_array_flat(tsv arr, double depth){
   if (TS_ARRAY_PROXY(arr)){ tsv d = ts_num(depth); return ts_method_dynamic(arr, "flat", &d, 1); }
   ts_gc_root(&arr);
@@ -11256,7 +11298,7 @@ int ts_array_every(tsv arr, tsv cb){
 }
 double ts_array_lastindexof(tsv arr, tsv v, double from, int has_from){
   ts_array* a=as_arr(arr); if(!a){ if (TS_ARRAY_PROXY(arr)){ tsv av[2] = { v, ts_num(from) }; return ts_number_coerce(ts_method_dynamic(arr, "lastIndexOf", av, has_from ? 2 : 1)); } return -1; }
-  long n=(long)a->len, s = has_from ? (long)from : n-1;
+  long n=(long)a->len, s = has_from ? (long)ts_index_ll(from) : n-1;
   if(s<0) s+=n;             /* negative fromIndex counts from the end */
   if(s>=n) s=n-1;
   for(long i=s;i>=0;i--) if(!array_is_hole(a->data[i]) && ts_strict_eq(a->data[i],v)) return (double)i;
@@ -11264,7 +11306,7 @@ double ts_array_lastindexof(tsv arr, tsv v, double from, int has_from){
 }
 tsv ts_array_at(tsv arr, double idx){
   ts_array* a=as_arr(arr); if(!a){ if (TS_ARRAY_PROXY(arr)){ tsv av = ts_num(idx); return ts_method_dynamic(arr, "at", &av, 1); } return TS_UNDEFINED; }
-  long i=(long)idx; if(i<0) i+=(long)a->len;
+  long i=(long)ts_index_ll(idx); if(i<0) i+=(long)a->len;
   if(i<0||i>=(long)a->len) return TS_UNDEFINED;
   return array_is_hole(a->data[i]) ? TS_UNDEFINED : a->data[i];
 }
@@ -11311,14 +11353,14 @@ double ts_array_unshift(tsv arr, tsv v){
 }
 tsv ts_array_fill(tsv arr, tsv v, double start, double end, int has_start, int has_end){
   ts_array* a=as_arr(arr); if(!a){ if (TS_ARRAY_PROXY(arr)){ tsv av[3] = { v, ts_num(start), ts_num(end) }; return ts_method_dynamic(arr, "fill", av, has_end ? 3 : has_start ? 2 : 1); } return arr; }
-  if (ts_arr_frozen(arr)) return arr;   /* frozen: no mutation */
   int64_t len=(int64_t)a->len;
   /* JS fill(value, start=0, end=len): negative indices count from the end and
      are clamped to [0, len]. */
-  int64_t s = has_start ? (int64_t)start : 0;
-  int64_t e = has_end ? (int64_t)end : len;
+  int64_t s = has_start ? ts_index_ll(start) : 0;
+  int64_t e = has_end ? ts_index_ll(end) : len;
   if (s < 0) s += len; if (s < 0) s = 0; if (s > len) s = len;
   if (e < 0) e += len; if (e < 0) e = 0; if (e > len) e = len;
+  if (ts_arr_frozen(arr)){ if (s < e) ts_array_set(arr, (uint32_t)s, v); return arr; }   /* strict: it throws, naming the element */
   for(int64_t i=s;i<e;i++) a->data[i]=v;
   ts_write_barrier(arr, v);
   return arr;
@@ -11792,8 +11834,8 @@ tsv ts_array_toreversed(tsv arr){
 tsv ts_array_with(tsv arr, double idx, tsv val){
   ts_array* a=as_arr(arr); if(!a){ if (TS_ARRAY_PROXY(arr)){ tsv av[2] = { ts_num(idx), val }; return ts_method_dynamic(arr, "with", av, 2); } return ts_new_array(0); }
   long n=(long)a->len;
-  long i=(long)idx; if(i<0) i+=n;
-  if(i<0 || i>=n){ char buf[64]; snprintf(buf,sizeof buf,"Invalid index : %ld",(long)idx); ts_throw_range_error(buf); }
+  long i=(long)ts_index_ll(idx); if(i<0) i+=n;
+  if(i<0 || i>=n){ char num[40], buf[64]; ts_fmt_num(idx, num, sizeof num); snprintf(buf,sizeof buf,"Invalid index : %s",num); ts_throw_range_error(buf); }
   /* root `val` across array_clone (which allocates -> may GC) so a heap value
      passed in isn't collected before we store it. */
   ts_gc_root(&val);
@@ -11814,8 +11856,8 @@ tsv ts_array_tospliced(tsv arr, double start, double dc, int has_dc, tsv items){
   ts_gc_root(&out);
   a=as_arr(arr);
   long n=(long)a->len;
-  long s=(long)start; if(s<0){ s+=n; if(s<0)s=0; } if(s>n) s=n;
-  long del = has_dc ? (long)dc : (n-s); if(del<0) del=0; if(del>n-s) del=n-s;
+  long s=(long)ts_index_ll(start); if(s<0){ s+=n; if(s<0)s=0; } if(s>n) s=n;
+  long del = has_dc ? (long)ts_index_ll(dc) : (n-s); if(del<0) del=0; if(del>n-s) del=n-s;
   a=as_arr(arr);
   for(long i=0;i<s;i++){ ts_array_push(out, ts_array_get(arr,(uint32_t)i)); a=as_arr(arr); }
   ts_array* it=as_arr(items);
@@ -11828,26 +11870,41 @@ tsv ts_array_tospliced(tsv arr, double start, double dc, int has_dc, tsv items){
 
 /* ---------------- String: additional methods ---------------- */
 int ts_str_startswith(tsv s, tsv pre, double pos, int has_pos){
-  if(!ts_is_str(s)||!ts_is_str(pre)) return 0;
+  if(TS_RT_UNLIKELY(!ts_is_str(s)||!ts_is_str(pre))) str_search_args(&s, &pre, "startsWith");
   ts_strview xs=ts_str_view_typed(s), ps=ts_str_view_typed(pre);
-  long start = has_pos ? (long)pos : 0; if(start<0) start=0; if(start>(long)xs.len) start=(long)xs.len;
+  long start = has_pos ? (long)ts_index_ll(pos) : 0; if(start<0) start=0; if(start>(long)xs.len) start=(long)xs.len;
   if((long)ps.len > (long)xs.len - start) return 0;
   return ts_str_region_eq(xs, (uint32_t)start, ps, 0, ps.len);
 }
 int ts_str_endswith(tsv s, tsv suf, double endpos, int has_endpos){
-  if(!ts_is_str(s)||!ts_is_str(suf)) return 0;
+  if(TS_RT_UNLIKELY(!ts_is_str(s)||!ts_is_str(suf))) str_search_args(&s, &suf, "endsWith");
   ts_strview xs=ts_str_view_typed(s), ps=ts_str_view_typed(suf);
-  long end = has_endpos ? (long)endpos : (long)xs.len;
+  long end = has_endpos ? (long)ts_index_ll(endpos) : (long)xs.len;
   if(end<0) end=0; if(end>(long)xs.len) end=(long)xs.len;
   if((long)ps.len > end) return 0;
   return ts_str_region_eq(xs, (uint32_t)(end-(long)ps.len), ps, 0, ps.len);
 }
+/* padStart / padEnd: ToLength of the target, the fill by ToString with undefined a space. An
+   empty fill, or a target within the string, answers the string. */
+static long str_pad_prepare(tsv* s, double target, tsv* pad, const char* name){
+  str_require_coercible(*s, name);
+  ts_gc_root(s); ts_gc_root(pad);
+  *s = str_arg(*s);
+  long t = (long)ts_index_ll(target), slen = (long)ts_str_len_typed(*s);
+  if (t > slen){
+    if (*pad != TS_UNDEFINED) *pad = str_arg(*pad);
+    if (*pad != TS_UNDEFINED && ts_str_len_typed(*pad) == 0) t = 0;
+    else if (t > (long)TS_STR_MAX_LENGTH) ts_throw_range_error_msg("Invalid string length");
+  }
+  ts_gc_unroot(2);
+  return t;
+}
 tsv ts_str_padstart(tsv s, double target, tsv pad){
-  if(!ts_is_str(s)) return s;
+  long t = str_pad_prepare(&s, target, &pad, "padStart");
   int pad_is_str=ts_is_str(pad);
   ts_strview xs=ts_str_view_typed(s), ps={0};
   if(pad_is_str) ps=ts_str_view_typed(pad);
-  long t=(long)target; if(t<=(long)xs.len) return s;
+  if(t<=(long)xs.len) return s;
   uint32_t need=(uint32_t)t - xs.len;
   ts_gc_root(&s); ts_gc_root(&pad);
   xs=ts_str_view_typed(s); pad_is_str=ts_is_str(pad); if(pad_is_str) ps=ts_str_view_typed(pad);
@@ -11864,11 +11921,11 @@ tsv ts_str_padstart(tsv s, double target, tsv pad){
   tsv r=ts_str_v(y); ts_gc_unroot(2); return r;
 }
 tsv ts_str_padend(tsv s, double target, tsv pad){
-  if(!ts_is_str(s)) return s;
+  long t = str_pad_prepare(&s, target, &pad, "padEnd");
   int pad_is_str=ts_is_str(pad);
   ts_strview xs=ts_str_view_typed(s), ps={0};
   if(pad_is_str) ps=ts_str_view_typed(pad);
-  long t=(long)target; if(t<=(long)xs.len) return s;
+  if(t<=(long)xs.len) return s;
   uint32_t need=(uint32_t)t - xs.len;
   ts_gc_root(&s); ts_gc_root(&pad);
   xs=ts_str_view_typed(s); pad_is_str=ts_is_str(pad); if(pad_is_str) ps=ts_str_view_typed(pad);
@@ -11899,7 +11956,7 @@ tsv ts_str_trimend(tsv s){
 tsv ts_str_at(tsv s, double idx){
   if(!ts_is_str(s)) return TS_UNDEFINED;
   long len=(long)ts_str_len_typed(s);
-  long i=(long)idx; if(i<0) i+=len;
+  long i=(long)ts_index_ll(idx); if(i<0) i+=len;
   if(i<0||i>=len) return TS_UNDEFINED;
   return ts_string_slice_view(s, (uint32_t)i, 1);
 }
@@ -11981,33 +12038,38 @@ static tsv ts_str_replace_literal_build(tsv s, tsv pat, tsv rep, int all){
 
 tsv ts_str_replace(tsv s, tsv pat, tsv rep, int all){
   if (g_regexp_hooks && ts_is_regexp(pat)) return g_regexp_hooks->replace(ts_is_str(s) ? s : ts_to_string_v(s), pat, rep, all);
-  int source_is_str=ts_is_str(s), pattern_is_str=ts_is_str(pat);
   /* rep may be a FUNCTION replacer (called per match) instead of a string. */
   int rep_is_fn = ts_is_callable(rep);
-  int replacement_is_str = !rep_is_fn && ts_is_str(rep);
-  if(!source_is_str||!pattern_is_str||(!rep_is_fn && !replacement_is_str))
-    return source_is_str ? s : ts_new_string("",0);
+  if (TS_RT_UNLIKELY(!ts_is_str(s) || !ts_is_str(pat) || (!rep_is_fn && !ts_is_str(rep)))){
+    str_require_coercible(s, all ? "replaceAll" : "replace");
+    ts_gc_root(&s); ts_gc_root(&pat); ts_gc_root(&rep);
+    s = str_arg(s);
+    pat = str_arg(pat);
+    if (!rep_is_fn) rep = str_arg(rep);
+    ts_gc_unroot(3);
+  }
+  int replacement_is_str = !rep_is_fn;
   ts_strview pattern_view = ts_str_view_typed(pat);
   if(pattern_view.len==0){
     /* empty pattern matches at index 0 (replace) or between every char + ends
        (replaceAll): "abc".replace("","X")="Xabc", replaceAll -> "XaXbXcX". A
        function replacer is invoked with matched="" at each such offset. */
-    ts_gc_root(&s); ts_gc_root(&rep);
-    tsv out = rep_is_fn ? ts_str_replace_call(rep, ts_new_string("",0), 0, s) : rep;
+    ts_gc_root(&s); ts_gc_root(&rep); ts_gc_root(&pat);
+    tsv out = rep_is_fn ? ts_str_replace_call(rep, ts_new_string("",0), 0, s) : expand_replacement(s, pat, 0, rep);
     ts_gc_root(&out);
     uint32_t len=ts_str_len_typed(s);
     for(uint32_t k=0;k<len;k++){
       out=ts_add(out, ts_string_slice_view(s, k, 1));
       if(all && k+1<len){
-        tsv rp = rep_is_fn ? ts_str_replace_call(rep, ts_new_string("",0), k+1, s) : rep;
+        tsv rp = rep_is_fn ? ts_str_replace_call(rep, ts_new_string("",0), k+1, s) : expand_replacement(s, pat, k+1, rep);
         out=ts_add(out, rp);
       }
     }
     if(all && len>0){
-      tsv rp = rep_is_fn ? ts_str_replace_call(rep, ts_new_string("",0), len, s) : rep;
+      tsv rp = rep_is_fn ? ts_str_replace_call(rep, ts_new_string("",0), len, s) : expand_replacement(s, pat, len, rep);
       out=ts_add(out, rp);
     }
-    ts_gc_unroot(3);
+    ts_gc_unroot(4);
     return out;
   }
   /* whether the replacement uses $ patterns (else append it verbatim — fast path).
@@ -15254,6 +15316,9 @@ tsv ts_forof_skip_slow(tsv it, tsv next_method){
    ts_array_push_all; an object exposing a callable `.next` is treated as an
    iterator, otherwise it is read positionally up to its numeric `length`. */
 tsv ts_array_from(tsv src){
+  if (src == TS_UNDEFINED || src == TS_NULL)
+    ts_throw_type_error_msg(src == TS_NULL ? "object null is not iterable (cannot read property Symbol(Symbol.iterator))"
+                                           : "undefined is not iterable (cannot read property Symbol(Symbol.iterator))");
   ts_gc_root(&src);
   tsv dst = ts_new_array(0);
   ts_gc_root(&dst);
@@ -15272,8 +15337,8 @@ tsv ts_array_from(tsv src){
     if (ts_is_obj(coro) || ts_is_func(nextfn) || ts_is_callable(itf)){
       ts_array_push_all(dst, src);               /* iterable / iterator protocol */
     } else {
-      tsv lv = ts_get(src, ts_intern_field("length", 6));
-      uint32_t len = ts_is_num(lv) ? (uint32_t)ts_to_num(lv) : 0;
+      double len = arrlike_len(src);
+      if (len > 4294967295.0) ts_throw_range_error_msg("Invalid array length");
       /* array-like (non-iterable object): read numeric properties "0".."len-1" by
          their string key (ts_array_get is for real arrays only). */
       for (uint32_t i=0;i<len;i++){
@@ -16502,9 +16567,9 @@ tsv ts_arrproto_toString(tsv* a, int n){
   }
   return ts_array_join(ARR_THIS(a, "toString"), ts_new_string(",",1));
 }
-tsv ts_arrproto_indexOf(tsv* a, int n){ return ts_num(ts_array_indexof(ARR_THIS(a, "indexOf"), n>1?a[1]:TS_UNDEFINED, n>2?ts_to_num(a[2]):0, n>2)); }
-tsv ts_arrproto_includes(tsv* a, int n){ return ts_bool(ts_array_includes(ARR_THIS(a, "includes"), n>1?a[1]:TS_UNDEFINED, n>2?ts_to_num(a[2]):0, n>2)); }
-tsv ts_arrproto_lastIndexOf(tsv* a, int n){ return ts_num(ts_array_lastindexof(ARR_THIS(a, "lastIndexOf"), n>1?a[1]:TS_UNDEFINED, n>2?ts_to_num(a[2]):0, n>2)); }
+tsv ts_arrproto_indexOf(tsv* a, int n){ return ts_num(ts_array_indexof(ARR_THIS(a, "indexOf"), n>1?a[1]:TS_UNDEFINED, n>2?ts_number_coerce(a[2]):0, n>2)); }
+tsv ts_arrproto_includes(tsv* a, int n){ return ts_bool(ts_array_includes(ARR_THIS(a, "includes"), n>1?a[1]:TS_UNDEFINED, n>2?ts_number_coerce(a[2]):0, n>2)); }
+tsv ts_arrproto_lastIndexOf(tsv* a, int n){ return ts_num(ts_array_lastindexof(ARR_THIS(a, "lastIndexOf"), n>1?a[1]:TS_UNDEFINED, n>2?ts_number_coerce(a[2]):0, n>2)); }
 tsv ts_arrproto_slice(tsv* a, int n){ return ts_array_slice(ARR_THIS(a, "slice"), n>1?ts_number_coerce(a[1]):0, n>2?ts_number_coerce(a[2]):0, n>2 && !ts_is_undef(a[2])); }
 tsv ts_arrproto_concat(tsv* a, int n){
   /* variadic: fold each arg through the 2-arg concat; no args -> shallow copy. */
@@ -16526,14 +16591,16 @@ tsv ts_arrproto_reverse(tsv* a, int n){
   if (arrproto_generic(a[0], "reverse")) return arrlike_reverse(a[0]);
   arrproto_mutating(a[0], "reverse"); return ts_array_reverse(a[0]);
 }
-tsv ts_arrproto_at(tsv* a, int n){ return ts_array_at(ARR_THIS(a, "at"), n>1?ts_to_num(a[1]):0); }
+tsv ts_arrproto_at(tsv* a, int n){ return ts_array_at(ARR_THIS(a, "at"), n>1?ts_number_coerce(a[1]):0); }
 tsv ts_arrproto_fill(tsv* a, int n){
   if (ts_is_typed_array(a[0])) return ta_m_fill(a, n);
-  if (arrproto_generic(a[0], "fill")) return arrlike_fill(a[0], n>1?a[1]:TS_UNDEFINED, n>2?ts_to_num(a[2]):0, n>3?ts_to_num(a[3]):0, n>2, n>3);
+  double start = n>2 ? ts_number_coerce(a[2]) : 0, end = n>3 ? ts_number_coerce(a[3]) : 0;
+  int has_end = n>3 && !ts_is_undef(a[3]);
+  if (arrproto_generic(a[0], "fill")) return arrlike_fill(a[0], n>1?a[1]:TS_UNDEFINED, start, end, n>2, has_end);
   arrproto_mutating(a[0], "fill");
-  return ts_array_fill(a[0], n>1?a[1]:TS_UNDEFINED, n>2?ts_to_num(a[2]):0, n>3?ts_to_num(a[3]):0, n>2, n>3);
+  return ts_array_fill(a[0], n>1?a[1]:TS_UNDEFINED, start, end, n>2, has_end);
 }
-tsv ts_arrproto_flat(tsv* a, int n){ return ts_array_flat(ARR_THIS(a, "flat"), n>1?ts_to_num(a[1]):1); }
+tsv ts_arrproto_flat(tsv* a, int n){ return ts_array_flat(ARR_THIS(a, "flat"), n>1?ts_array_flat_depth(a[1]):1); }
 tsv ts_arrproto_sort(tsv* a, int n){ if (arrproto_generic(a[0], "sort")) return arrlike_sort(a[0], n>1?a[1]:TS_UNDEFINED); arrproto_mutating(a[0], "sort"); return ts_array_sort(a[0], n>1?a[1]:TS_UNDEFINED); }
 /* callback-taking methods: the callback is args[1] (a ts_func/closure). */
 /* The callback of an iteration method bound to the call's thisArg
@@ -16557,16 +16624,19 @@ tsv ts_arrproto_splice(tsv* a, int n){
   /* n counts the receiver: n==1 -> splice() deletes nothing; n==2 -> splice(start)
      deletes to end (has_dc=0); n>=3 -> deleteCount given. */
   int has_dc = (n>=3) || (n<=1);
-  tsv r = ts_array_splice(a[0], n>1?ts_to_num(a[1]):0, n>2?ts_to_num(a[2]):0, has_dc, items);
+  double start = n>1 ? ts_number_coerce(a[1]) : 0, dc = n>2 ? ts_number_coerce(a[2]) : 0;
+  tsv r = ts_array_splice(a[0], start, dc, has_dc, items);
   ts_gc_unroot(1);
   return r;
 }
 tsv ts_arrproto_reduceRight(tsv* a, int n){ return ts_array_reduce_right(ARR_THIS(a, "reduceRight"), n>1?a[1]:TS_UNDEFINED, n>2?a[2]:TS_UNDEFINED, n>2); }
 tsv ts_arrproto_copyWithin(tsv* a, int n){
   if (ts_is_typed_array(a[0])) return ta_m_copy_within(a, n);
-  if (arrproto_generic(a[0], "copyWithin")) return arrlike_copy_within(a[0], n>1?ts_to_num(a[1]):0, n>2?ts_to_num(a[2]):0, n>3?ts_to_num(a[3]):0, n>3);
+  double to = n>1 ? ts_number_coerce(a[1]) : 0, from = n>2 ? ts_number_coerce(a[2]) : 0, end = n>3 ? ts_number_coerce(a[3]) : 0;
+  int has_end = n>3 && !ts_is_undef(a[3]);
+  if (arrproto_generic(a[0], "copyWithin")) return arrlike_copy_within(a[0], to, from, end, has_end);
   arrproto_mutating(a[0], "copyWithin");
-  return ts_array_copy_within(a[0], n>1?ts_to_num(a[1]):0, n>2?ts_to_num(a[2]):0, n>3?ts_to_num(a[3]):0, n>3);
+  return ts_array_copy_within(a[0], to, from, end, has_end);
 }
 tsv ts_arrproto_find(tsv* a, int n){ return ts_array_find(ARR_THIS(a, "find"), TS_ITER_CB(a, n)); }
 tsv ts_arrproto_findIndex(tsv* a, int n){ return ts_num(ts_array_findindex(ARR_THIS(a, "findIndex"), TS_ITER_CB(a, n))); }
@@ -18822,22 +18892,22 @@ tsv ts_strproto_toLowerCase(tsv* a, int n){ STR_THIS(a, n); (void)n; return ts_s
 tsv ts_strproto_toLocaleUpperCase(tsv* a, int n){ STR_THIS(a, n); (void)n; return ts_str_toupper(a[0]); }
 tsv ts_strproto_toLocaleLowerCase(tsv* a, int n){ STR_THIS(a, n); (void)n; return ts_str_tolower(a[0]); }
 tsv ts_strproto_slice(tsv* a, int n){ STR_THIS(a, n); return ts_str_slice(a[0], n>1?ts_number_coerce(a[1]):0, n>2?ts_number_coerce(a[2]):0, n>2 && !ts_is_undef(a[2])); }
-tsv ts_strproto_indexOf(tsv* a, int n){ STR_THIS(a, n); return ts_num(ts_str_indexof(a[0], n>1?a[1]:TS_UNDEFINED, n>2?ts_to_num(a[2]):0, n>2)); }
-tsv ts_strproto_lastIndexOf(tsv* a, int n){ STR_THIS(a, n); return ts_num(ts_str_lastindexof(a[0], n>1?a[1]:TS_UNDEFINED, n>2?ts_to_num(a[2]):0, n>2)); }
-tsv ts_strproto_includes(tsv* a, int n){ STR_THIS(a, n); return ts_bool(ts_str_includes(a[0], n>1?a[1]:TS_UNDEFINED, n>2?ts_to_num(a[2]):0, n>2)); }
+tsv ts_strproto_indexOf(tsv* a, int n){ STR_THIS(a, n); return ts_num(ts_str_indexof(a[0], n>1?a[1]:TS_UNDEFINED, n>2?ts_number_coerce(a[2]):0, n>2)); }
+tsv ts_strproto_lastIndexOf(tsv* a, int n){ STR_THIS(a, n); return ts_num(ts_str_lastindexof(a[0], n>1?a[1]:TS_UNDEFINED, n>2?ts_number_coerce(a[2]):0, n>2)); }
+tsv ts_strproto_includes(tsv* a, int n){ STR_THIS(a, n); return ts_bool(ts_str_includes(a[0], n>1?a[1]:TS_UNDEFINED, n>2?ts_number_coerce(a[2]):0, n>2)); }
 tsv ts_strproto_substring(tsv* a, int n){ STR_THIS(a, n); return ts_str_substring(a[0], n>1?ts_number_coerce(a[1]):0, n>2?ts_number_coerce(a[2]):0, n>2 && !ts_is_undef(a[2])); }
 tsv ts_strproto_substr(tsv* a, int n){ STR_THIS(a, n); return ts_str_substr(n>0?a[0]:TS_UNDEFINED, n>1?a[1]:TS_UNDEFINED, n>2?a[2]:TS_UNDEFINED); }
 tsv ts_strproto_toString(tsv* a, int n){ return ts_str_value(n>0?a[0]:TS_UNDEFINED); }
-tsv ts_strproto_startsWith(tsv* a, int n){ STR_THIS(a, n); return ts_bool(ts_str_startswith(a[0], n>1?a[1]:TS_UNDEFINED, n>2?ts_to_num(a[2]):0, n>2)); }
-tsv ts_strproto_endsWith(tsv* a, int n){ STR_THIS(a, n); return ts_bool(ts_str_endswith(a[0], n>1?a[1]:TS_UNDEFINED, n>2?ts_to_num(a[2]):0, n>2)); }
-tsv ts_strproto_charAt(tsv* a, int n){ STR_THIS(a, n); return ts_str_charat(a[0], n>1?ts_to_num(a[1]):0); }
+tsv ts_strproto_startsWith(tsv* a, int n){ STR_THIS(a, n); return ts_bool(ts_str_startswith(a[0], n>1?a[1]:TS_UNDEFINED, n>2?ts_number_coerce(a[2]):0, n>2)); }
+tsv ts_strproto_endsWith(tsv* a, int n){ STR_THIS(a, n); return ts_bool(ts_str_endswith(a[0], n>1?a[1]:TS_UNDEFINED, n>2?ts_number_coerce(a[2]):0, n>2 && !ts_is_undef(a[2]))); }
+tsv ts_strproto_charAt(tsv* a, int n){ STR_THIS(a, n); return ts_str_charat(a[0], n>1?ts_number_coerce(a[1]):0); }
 tsv ts_strproto_charCodeAt(tsv* a, int n){ STR_THIS(a, n); return ts_num(ts_str_charcodeat(a[0], n>1?ts_number_coerce(a[1]):0)); }
-tsv ts_strproto_codePointAt(tsv* a, int n){ STR_THIS(a, n); return ts_str_codepointat(a[0], n>1?ts_to_num(a[1]):0); }
-tsv ts_strproto_at(tsv* a, int n){ STR_THIS(a, n); return ts_str_at(a[0], n>1?ts_to_num(a[1]):0); }
+tsv ts_strproto_codePointAt(tsv* a, int n){ STR_THIS(a, n); return ts_str_codepointat(a[0], n>1?ts_number_coerce(a[1]):0); }
+tsv ts_strproto_at(tsv* a, int n){ STR_THIS(a, n); return ts_str_at(a[0], n>1?ts_number_coerce(a[1]):0); }
 tsv ts_strproto_isWellFormed(tsv* a, int n){ STR_THIS(a, n); (void)n; return ts_bool(ts_str_is_well_formed(a[0])); }
 tsv ts_strproto_toWellFormed(tsv* a, int n){ STR_THIS(a, n); (void)n; return ts_str_to_well_formed(a[0]); }
 tsv ts_strproto_concat(tsv* a, int n){ STR_THIS(a, n); tsv r=a[0]; for (int i=1;i<n;i++) r=ts_str_concat(r, a[i]); return r; }
-tsv ts_strproto_repeat(tsv* a, int n){ STR_THIS(a, n); return ts_str_repeat(a[0], n>1?ts_to_num(a[1]):0); }
+tsv ts_strproto_repeat(tsv* a, int n){ STR_THIS(a, n); return ts_str_repeat(a[0], n>1?ts_number_coerce(a[1]):0); }
 tsv ts_strproto_localeCompare(tsv* a, int n){ STR_THIS(a, n); return ts_num(ts_str_locale_compare(a[0], n>1?a[1]:TS_UNDEFINED)); }
 tsv ts_strproto_trim(tsv* a, int n){ STR_THIS(a, n); (void)n; return ts_str_trim(a[0]); }
 tsv ts_strproto_trimStart(tsv* a, int n){ STR_THIS(a, n); (void)n; return ts_str_trimstart(a[0]); }
@@ -18845,8 +18915,8 @@ tsv ts_strproto_trimEnd(tsv* a, int n){ STR_THIS(a, n); (void)n; return ts_str_t
 tsv ts_strproto_trimLeft(tsv* a, int n){ STR_THIS(a, n); (void)n; return ts_str_trimstart(a[0]); }
 tsv ts_strproto_trimRight(tsv* a, int n){ STR_THIS(a, n); (void)n; return ts_str_trimend(a[0]); }
 tsv ts_strproto_split(tsv* a, int n){ STR_THIS(a, n); return ts_str_split(a[0], n>1?a[1]:TS_UNDEFINED, n>2?a[2]:TS_UNDEFINED); }
-tsv ts_strproto_padStart(tsv* a, int n){ STR_THIS(a, n); return ts_str_padstart(a[0], n>1?ts_to_num(a[1]):0, n>2?a[2]:TS_UNDEFINED); }
-tsv ts_strproto_padEnd(tsv* a, int n){ STR_THIS(a, n); return ts_str_padend(a[0], n>1?ts_to_num(a[1]):0, n>2?a[2]:TS_UNDEFINED); }
+tsv ts_strproto_padStart(tsv* a, int n){ STR_THIS(a, n); return ts_str_padstart(a[0], n>1?ts_number_coerce(a[1]):0, n>2?a[2]:TS_UNDEFINED); }
+tsv ts_strproto_padEnd(tsv* a, int n){ STR_THIS(a, n); return ts_str_padend(a[0], n>1?ts_number_coerce(a[1]):0, n>2?a[2]:TS_UNDEFINED); }
 tsv ts_strproto_replace(tsv* a, int n){ STR_THIS(a, n); return ts_str_replace(a[0], n>1?a[1]:TS_UNDEFINED, n>2?a[2]:TS_UNDEFINED, 0); }
 /* match / matchAll / search on a dynamic receiver: a RegExp argument through the adapter, a
    string pattern as a RegExp made from it (matchAll adds the g flag), as the spec's
