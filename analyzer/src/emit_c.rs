@@ -621,6 +621,13 @@ fn emit_program_with_string_plans(
         let _ = write!(s, "{}, ", c_string_lit(nm));
     }
     s.push_str("};\n\n");
+    // What a class value's function runs when it is called without `new`.
+    for i in 0..=max_class_id {
+        let _ = writeln!(
+            s,
+            "static tsv ts_class_refused_{i}(tsv* a, int n){{ (void)a; (void)n; ts_throw_class_call(CLASS_NAME[{i}]); return TS_UNDEFINED; }}"
+        );
+    }
     // Object.prototype: a shared prototype carrying the modeled Object.prototype
     // methods under METHOD_KEY_BASE+id. Held in a rooted static; installed
     // via ts_install_object_proto so ts_new_object() chains new objects to it.
@@ -1211,6 +1218,7 @@ fn emit_program_with_string_plans(
     if program.fields.iter().any(|f| f.name.as_deref() == Some("__garnet_species")) {
         s.push_str("  g_species = 1;\n");
     }
+    let names_proto_accessor = program.fields.iter().any(|f| f.name.as_deref() == Some("__garnet_proto_accessor"));
     if iso_mode() {
         s.push_str("  TS_ISO()->ics = TS_ICS_ISO0;\n");
         if !program.globals.is_empty() {
@@ -1222,6 +1230,9 @@ fn emit_program_with_string_plans(
     }
     s.push_str("  ts_init_fields(FIELD_NAMES, FIELD_NAME_LENS, FIELD_NAMES_COUNT);\n");
     s.push_str("  ts_setup_object_proto();\n");
+    if names_proto_accessor {
+        s.push_str("  ts_define_proto_accessor();\n");
+    }
     // Function.prototype must be set up BEFORE the array/map/set prototypes: each
     // proto method is boxed via ts_make_fn (which records Function.prototype
     // at creation time), so if Function.prototype is still absent the boxed method has
@@ -14732,16 +14743,16 @@ fn fnval_adapter_body(builtin: &str) -> Option<String> {
         "object.create" => Some(format!("tsv _r = ts_object_create({}); if (n > 1 && a[1] != TS_UNDEFINED) ts_define_properties(_r, a[1]); return _r;", val(0))),
         "object.defineProperty" => Some(format!("ts_define_property({}, {}, {}); return {};", val(0), val(1), val(2), val(0))),
         "object.defineProperties" => Some(format!("ts_define_properties({}, {}); return {};", val(0), val(1), val(0))),
-        "reflect.get" => hv(format!("(n > 2 ? ts_reflect_get_recv({}, {}, a[2]) : ts_get_dyn({}, {}))", val(0), val(1), val(0), val(1))),
+        "reflect.get" => hv(format!("(n > 2 ? ts_reflect_get_recv({}, {}, a[2]) : ts_reflect_get({}, {}))", val(0), val(1), val(0), val(1))),
         "reflect.set" => hv(format!("(n > 3 ? ts_reflect_set_recv({0}, {1}, {2}, a[3]) : ts_reflect_set({0}, {1}, {2}))", val(0), val(1), val(2))),
         "reflect.has" => hv(format!("ts_reflect_has({}, {})", val(0), val(1))),
         "reflect.deleteProperty" => hv(format!("ts_reflect_delete({}, {})", val(0), val(1))),
         "reflect.ownKeys" => hv(format!("ts_reflect_own_keys({})", val(0))),
-        "reflect.getPrototypeOf" => hv(format!("ts_get_proto({})", val(0))),
+        "reflect.getPrototypeOf" => hv(format!("ts_reflect_get_proto({})", val(0))),
         "reflect.setPrototypeOf" => hv(format!("ts_reflect_set_proto({}, {})", val(0), val(1))),
         "reflect.defineProperty" => hv(format!("ts_reflect_define_property({}, {}, {})", val(0), val(1), val(2))),
-        "reflect.getOwnPropertyDescriptor" => hv(format!("ts_get_own_property_descriptor({}, {})", val(0), val(1))),
-        "reflect.isExtensible" => hv(format!("ts_object_is_extensible({})", val(0))),
+        "reflect.getOwnPropertyDescriptor" => hv(format!("ts_reflect_own_desc({}, {})", val(0), val(1))),
+        "reflect.isExtensible" => hv(format!("ts_reflect_is_extensible({})", val(0))),
         "reflect.preventExtensions" => hv(format!("ts_reflect_prevent_extensions({})", val(0))),
         "reflect.apply" => hv(format!("ts_reflect_apply({}, {}, {})", val(0), val(1), val(2))),
         "reflect.construct" => hv(format!("(n > 2 ? ts_reflect_construct_target({0}, {1}, a[2]) : ts_reflect_construct_target({0}, {1}, {0}))", val(0), val(1))),
@@ -15516,6 +15527,7 @@ fn emit_global_setup(s: &mut String, needs_fetch: bool, needs_typed_array_global
     s.push_str("  ts_define_data(_JSON, TS_KEY_WKSYM(TS_WKSYM_TO_STRING_TAG), ts_new_string(\"JSON\", 4), 0, 0, 1);\n");
     set_fn(s, "_JSON", "stringify", "json.stringify", 1, "stringify");
     set_fn(s, "_JSON", "parse", "json.parse", 2, "parse");
+    s.push_str("  ts_json_extras(_JSON);\n");
     global_set_rooted(s, "JSON", "_JSON");
 
     s.push_str("  tsv _console = ts_new_object();\n");
@@ -23189,6 +23201,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     class_id,
                     fname
                 );
+                let _ = writeln!(s, "  ts_class_refuse_call({}, {}u, ts_class_refused_{});", dst_name, class_id, class_id);
                 s.push_str(&set_meta);
             } else {
                 let _ = writeln!(s, "  {{ tsv _env[{}];", captures.len());
@@ -23216,6 +23229,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     fname,
                     captures.len()
                 );
+                let _ = writeln!(s, "    ts_class_refuse_call({}, {}u, ts_class_refused_{});", dst_name, class_id, class_id);
                 s.push_str("  }\n");
                 s.push_str(&set_meta);
             }
@@ -24291,17 +24305,17 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 // construct runtime (Reflect.get(t,k[,recv]) ignores receiver in
                 // v1, matching the common non-proxy / non-accessor case).
                 "reflect.get" if args.len() == 3 && reflect_receiver_enabled() => (format!("ts_reflect_get_recv({}, {}, {})", v(0), v(1), v(2)), false),
-                "reflect.get" => (format!("ts_get_dyn({}, {})", v(0), v(1)), false),
+                "reflect.get" => (format!("ts_reflect_get({}, {})", v(0), v(1)), false),
                 "reflect.set" if args.len() == 4 && reflect_receiver_enabled() => (format!("ts_reflect_set_recv({}, {}, {}, {})", v(0), v(1), v(2), v(3)), false),
                 "reflect.set" => (format!("ts_reflect_set({}, {}, {})", v(0), v(1), v(2)), false),
                 "reflect.has" => (format!("ts_reflect_has({}, {})", v(0), v(1)), false),
                 "reflect.deleteProperty" => (format!("ts_reflect_delete({}, {})", v(0), v(1)), false),
                 "reflect.ownKeys" => (format!("ts_reflect_own_keys({})", v(0)), false),
-                "reflect.getPrototypeOf" => (format!("ts_get_proto({})", v(0)), false),
+                "reflect.getPrototypeOf" => (format!("ts_reflect_get_proto({})", v(0)), false),
                 "reflect.setPrototypeOf" => (format!("ts_reflect_set_proto({}, {})", v(0), v(1)), false),
                 "reflect.defineProperty" => (format!("ts_reflect_define_property({}, {}, {})", v(0), v(1), v(2)), false),
-                "reflect.getOwnPropertyDescriptor" => (format!("ts_get_own_property_descriptor({}, {})", v(0), v(1)), false),
-                "reflect.isExtensible" => (format!("ts_object_is_extensible({})", v(0)), false),
+                "reflect.getOwnPropertyDescriptor" => (format!("ts_reflect_own_desc({}, {})", v(0), v(1)), false),
+                "reflect.isExtensible" => (format!("ts_reflect_is_extensible({})", v(0)), false),
                 "reflect.preventExtensions" => (format!("ts_reflect_prevent_extensions({})", v(0)), false),
                 "reflect.apply" => (format!("ts_reflect_apply({}, {}, {})", v(0), v(1), v(2)), false),
                 "reflect.construct" => (format!("ts_reflect_construct({}, {})", v(0), v(1)), false),

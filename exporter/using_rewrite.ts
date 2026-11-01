@@ -35,9 +35,9 @@ export function rewriteUsing(source: ts.SourceFile): string | undefined {
   const rewriteList = (list: ts.VariableDeclarationList, kind: "sync" | "await", stack: string): void => {
     any = true;
     edits.push({ pos: list.getStart(sf), end: list.declarations[0].getStart(sf), text: "const " });
+    // a second declarator registers it: the initializer keeps its place, so an anonymous function takes the name
     for (const d of list.declarations) {
-      insert(d.initializer!.getStart(sf), `__garnet_use_of(`);
-      insert(d.initializer!.end, `, ${stack}, ${kind === "await" ? 1 : 0})`);
+      insert(d.end, `, ${stack}r${counter++} = __garnet_use_of(${d.name.getText(sf)}, ${stack}, ${kind === "await" ? 1 : 0})`);
     }
   };
   const prologue = (stack: string): string => `const ${stack}: any = (globalThis as any).__garnet_using_stack(); try { `;

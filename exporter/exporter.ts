@@ -171,14 +171,15 @@ const NODE_PRELUDE_GLOBALS = new Set(["process", "Buffer", "atob", "btoa", "setT
   // the compression streams (docs/web_compression_design.md)
   "CompressionStream", "DecompressionStream",
   // explicit resource management (docs/using_declarations_design.md)
-  "SuppressedError", "DisposableStack", "AsyncDisposableStack", "__garnet_using_stack", "__garnet_use", "__garnet_dispose", "__garnet_dispose_async"]);
+  "SuppressedError", "DisposableStack", "AsyncDisposableStack", "__garnet_using_stack", "__garnet_use", "__garnet_dispose", "__garnet_dispose_async",
+  "FinalizationRegistry"]);
 /** The constructors among them: lib.dom declares the identifier, the prelude's class is the
  *  global object's value, and `new URL(...)` constructs through that value. */
 const NODE_PRELUDE_CTORS = new Set(["URL", "URLSearchParams", "Headers", "Request", "Response", "FormData", "DataView", "__garnet_StringObject",
   "Crypto", "SubtleCrypto", "CryptoKey",
   "ReadableStream", "WritableStream", "TransformStream", "ReadableStreamDefaultReader", "WritableStreamDefaultWriter", "ReadableStreamDefaultController", "WritableStreamDefaultController", "TransformStreamDefaultController", "TextEncoderStream", "TextDecoderStream", "CountQueuingStrategy", "ByteLengthQueuingStrategy", "Blob", "File",
   // the compression streams (docs/web_compression_design.md)
-  "CompressionStream", "DecompressionStream", "SuppressedError", "DisposableStack", "AsyncDisposableStack"]);
+  "CompressionStream", "DecompressionStream", "SuppressedError", "DisposableStack", "AsyncDisposableStack", "FinalizationRegistry"]);
 /** The lib modules behind the globals: a program's prelude imports only the parts it names,
  *  so a program that uses setTimeout does not compile the streams behind process.stdout. */
 /** A program text that can tell the engine's direct paths from the protocol: it names a matcher's well-known
@@ -188,10 +189,12 @@ const REGEXP_PROTOCOL_TRIGGER = "__garnet_regexp_protocol";
 /** A program text that can tell an array's species: it names the symbols, extends a kind of array, gives an object
  *  a `constructor` (not a prototype's, the usual assignment), or calls Array.of / Array.from on another receiver. */
 const SPECIES_TRIGGER = "__garnet_species";
-const speciesText = /\bSymbol\s*\.\s*(species|isConcatSpreadable|unscopables)\b|\bextends\s+(Array|ArrayBuffer|SharedArrayBuffer|Int8Array|Uint8Array|Uint8ClampedArray|Int16Array|Uint16Array|Int32Array|Uint32Array|Float16Array|Float32Array|Float64Array|BigInt64Array|BigUint64Array)\b|(?<!prototype)\.\s*constructor\s*=[^=]|\bArray\s*\.\s*(of|from)\s*\.\s*(call|apply)\b/;
+const speciesText = /\bSymbol\s*\.\s*(species|isConcatSpreadable|unscopables)\b|defineProperty\s*\([^,]+,\s*["']constructor["']|\bextends\s+(Array|ArrayBuffer|SharedArrayBuffer|Int8Array|Uint8Array|Uint8ClampedArray|Int16Array|Uint16Array|Int32Array|Uint32Array|Float16Array|Float32Array|Float64Array|BigInt64Array|BigUint64Array)\b|(?<!prototype)\.\s*constructor\s*=[^=]|\bArray\s*\.\s*(of|from)\s*\.\s*(call|apply)\b/;
 /** A program text that can hand an array method another receiver: `Array.prototype.x.call(o)`, `[].x.call(o)`. */
 const ARRAY_GENERIC_TRIGGER = "__garnet_array_generic";
 const arrayGenericText = /\bArray\s*\.\s*prototype\b|\[\s*\]\s*\.\s*\w+\s*\.\s*(call|apply|bind)\b|\bObject\s*\.\s*prototype\s*\[|defineProperty\s*\(\s*Object\s*\.\s*prototype\b/;
+const PROMISE_PROTOCOL_TRIGGER = "__garnet_promise_protocol";
+const promiseProtocolText = /\bextends\s+Promise\b|defineProperty\s*\([^,]+,\s*["']constructor["']|\bPromise\s*\.\s*\w+\s*\.\s*(call|apply|bind)\b|\bPromise\s*\.\s*resolve\s*=[^=]|\bPromise\s*\.\s*prototype\b|\.\s*then\s*=[^=]|["']then["']|\bPromise\s*\.\s*try\b|\bPromise\s*\.\s*withResolvers\b|\bPromise\s*,/;
 const OBJECT_PROTO_METHODS = new Set(["hasOwnProperty", "isPrototypeOf", "propertyIsEnumerable", "toLocaleString", "toString", "valueOf"]);
 const REGEXP_METHODS = new Set(["test", "exec", "match", "matchAll", "search", "replace", "replaceAll", "split"]);
 const regexpProtocolText = /\bSymbol\s*\.\s*(match|matchAll|replace|search|split)\b|\.\s*exec\s*=[^=]|["']exec["']|\bextends\s+RegExp\b/;
@@ -215,8 +218,11 @@ const NODE_PRELUDE_PARTS: { file: string; names: string[]; defaultImport?: strin
   { file: "web/blob", names: ["Blob", "File"] },
   // CompressionStream / DecompressionStream over the system's zlib (docs/web_compression_design.md)
   { file: "web/compression", names: ["CompressionStream", "DecompressionStream"] },
+  { file: "web/finalization", names: ["FinalizationRegistry"] },
   // explicit resource management (docs/using_declarations_design.md)
   { file: "web/disposable", names: ["SuppressedError", "DisposableStack", "AsyncDisposableStack", "__garnet_using_stack", "__garnet_use", "__garnet_dispose", "__garnet_dispose_async"] },
+  // on demand: a program that can see Promise's protocol (docs/promise_protocol_design.md)
+  { file: "web/promise_protocol", names: [], triggers: [PROMISE_PROTOCOL_TRIGGER] },
   // on demand: a program that passes the array methods an array-like (docs/array_protocol_design.md)
   { file: "web/array_generic", names: [], triggers: [ARRAY_GENERIC_TRIGGER] },
   // on demand: a program that can see an array's constructor (docs/well_known_symbols_design.md)
@@ -593,6 +599,7 @@ function programWithNodeSupport(rootNames: string[], options: ts.CompilerOptions
       const named = (text: string): boolean => NODE_PRELUDE_GLOBALS.has(text) || (triggers !== undefined && triggers.has(text));
       if (triggers !== undefined && regexpProtocolText.test(f.text)) found.add(REGEXP_PROTOCOL_TRIGGER);
       if (triggers !== undefined && speciesText.test(f.text)) found.add(SPECIES_TRIGGER);
+      if (triggers !== undefined && promiseProtocolText.test(f.text)) found.add(PROMISE_PROTOCOL_TRIGGER);
       if (triggers !== undefined && arrayGenericText.test(f.text)) found.add(ARRAY_GENERIC_TRIGGER);
       if (triggers !== undefined && /\bSymbol\s*\.\s*(dispose|asyncDispose)\b/.test(f.text)) found.add("DisposableStack");
       const visit = (n: ts.Node): void => {
@@ -867,6 +874,14 @@ class Exporter {
    *  matcher are dynamic calls (docs/well_known_symbols_design.md). */
   private regexpProtocol = false;
   private dynamicReceivers = new Set<ts.Node>();
+  /** The program carries lib/node/web/promise_protocol.ts: `then`, `catch`, `finally` and the statics are dynamic calls. */
+  private promiseProtocol = false;
+  private promiseMethodReceiver(n: ts.Node): boolean {
+    const p = n.parent;
+    if (p === undefined || !ts.isPropertyAccessExpression(p) || p.expression !== n || !(p.name.text === "then" || p.name.text === "catch" || p.name.text === "finally") ||
+        !ts.isCallExpression(p.parent) || p.parent.expression !== p) return false;
+    return this.rawChecker.getTypeAtLocation(n).getSymbol()?.name === "Promise";
+  }
   private regexpMethodReceiver(n: ts.Node): boolean {
     // the result of the call as well: a custom matcher answers what it likes, whatever the signature says
     if (ts.isCallExpression(n) && ts.isPropertyAccessExpression(n.expression)) return this.regexpMethodReceiver(n.expression.expression);
@@ -1168,7 +1183,8 @@ class Exporter {
     checker.getTypeAtLocation = (n: ts.Node): ts.Type =>
       (this.distrustedExpr(n) && (ts.isBinaryExpression(n) || this.usedInPlace(n as ts.Expression))) ||
       (this.hasForeign && this.foreignValue(n)) || (this.usesBigInt && this.bigIntOperator(n)) ||
-      (this.regexpProtocol && this.regexpMethodReceiver(n)) || this.dynamicReceivers.has(n) ? anyType : this.rawChecker.getTypeAtLocation(n);
+      (this.regexpProtocol && this.regexpMethodReceiver(n)) || this.dynamicReceivers.has(n) ||
+      (this.promiseProtocol && this.promiseMethodReceiver(n)) ? anyType : this.rawChecker.getTypeAtLocation(n);
     this.checker = checker;
     this.VALUE = this.internField("__value");
     this.DATE_MS_FIELD = this.internField("__date_ms");
@@ -4099,7 +4115,7 @@ class Exporter {
 
   private lowerRegExpConstructor(ctx: FnCtx, node: ts.CallExpression | ts.NewExpression, hint?: string): number | undefined {
     const arr = node.arguments ? Array.from(node.arguments) : [];
-    if (!ts.isNewExpression(node) &&
+    if (!ts.isNewExpression(node) && !this.regexpProtocol &&
         arr.length > 0 &&
         (this.isRegExpExpr(arr[0]) || this.regexpRawFromConstExpr(arr[0]) !== undefined) &&
         (arr.length < 2 || this.isUndefinedConstValue(arr[1]))) {
@@ -6506,6 +6522,14 @@ class Exporter {
           ctx.body.push({ kind: "Const", dst, value: { kind: "Undef" } });
           return dst;
         }
+        // the members the runtime or a library puts on the object itself
+        if ((nsName === "Promise" && this.promiseProtocol) || (nsName === "JSON" && (node.name.text === "rawJSON" || node.name.text === "isRawJSON"))) {
+          const nsObj = this.newLocal(ctx, "reference");
+          ctx.body.push({ kind: "LoadBuiltinFn", dst: nsObj, builtin: `globalobj.${nsName}` });
+          const dst = this.newLocal(ctx, "reference");
+          ctx.body.push({ kind: "LoadField", dst, obj: nsObj, field: this.internField(node.name.text) });
+          return dst;
+        }
         // what the namespace object inherits from Object.prototype
         if (OBJECT_PROTO_METHODS.has(node.name.text)) {
           const nsObj = this.newLocal(ctx, "reference");
@@ -7027,6 +7051,12 @@ class Exporter {
           // Promise.resolve/reject(v) -> settled promise; Promise.all/race(arr) ->
           // combinator promise. allSettled/any are not yet implemented (loud-reject
           // rather than a bad dynamic dispatch).
+          if (ns === "Promise" && this.promiseProtocol) {
+            const recv = this.lowerExpr(ctx, fn.expression);
+            const member = this.newLocal(ctx, "reference");
+            ctx.body.push({ kind: "LoadField", dst: member, obj: recv, field: this.internField(fn.name.text) });
+            return this.lowerDynamicValueCall(ctx, member, recv, node.arguments, this.refKindOf(node));
+          }
           if (ns === "Promise") {
             const m = fn.name.text;
             if (m === "resolve" || m === "reject" || m === "all" || m === "race" || m === "allSettled" || m === "any") {
@@ -7162,10 +7192,19 @@ class Exporter {
               }
             }
           }
-          const sname = this.namespaceBuiltin(ns, fn.name.text, node.arguments.length);
+          let sname = this.namespaceBuiltin(ns, fn.name.text, node.arguments.length);
+          // the same function with a missing argument undefined, or with an extra one evaluated and dropped
+          let argCount = node.arguments.length;
+          if (sname === "__UNSUPPORTED__") {
+            for (const k of [argCount + 1, argCount + 2, argCount + 3, argCount - 1, argCount - 2]) {
+              if (k < 0) continue;
+              const other = this.namespaceBuiltin(ns, fn.name.text, k);
+              if (other !== undefined && other !== "__UNSUPPORTED__") { sname = other; argCount = k; break; }
+            }
+          }
           if (sname !== undefined) {
             // what `Math` and `JSON` inherit: the namespace object is an ordinary receiver
-            if (sname === "__UNSUPPORTED__" && OBJECT_PROTO_METHODS.has(fn.name.text)) {
+            if (sname === "__UNSUPPORTED__" && (OBJECT_PROTO_METHODS.has(fn.name.text) || fn.name.text === "rawJSON" || fn.name.text === "isRawJSON")) {
               const recv = this.lowerExpr(ctx, fn.expression);
               const callee = this.lowerExpr(ctx, fn);
               return this.lowerDynamicValueCall(ctx, callee, recv, node.arguments, this.refKindOf(node));
@@ -7174,6 +7213,21 @@ class Exporter {
               this.unsupported(node, `${ns}.${fn.name.text} (not supported with ${node.arguments.length} args / not implemented)`);
             }
             const argLs = this.lowerSequenced(ctx, node.arguments);
+            argLs.length = Math.min(argLs.length, argCount);
+            while (argLs.length < argCount) {
+              const u = this.newLocal(ctx, "reference");
+              ctx.body.push({ kind: "Const", dst: u, value: { kind: "Undef" } });
+              argLs.push(u);
+            }
+            // what Reflect's functions take, an omitted argument undefined
+            if (sname.startsWith("reflect.")) {
+              const least = sname === "reflect.set" || sname === "reflect.defineProperty" ? 3 : sname === "reflect.ownKeys" || sname === "reflect.getPrototypeOf" || sname === "reflect.isExtensible" || sname === "reflect.preventExtensions" ? 1 : 2;
+              while (argLs.length < least) {
+                const u = this.newLocal(ctx, "reference");
+                ctx.body.push({ kind: "Const", dst: u, value: { kind: "Undef" } });
+                argLs.push(u);
+              }
+            }
             const numericResult = sname.startsWith("math.") || sname.endsWith("parseInt")
               || sname.endsWith("parseFloat") || sname === "number.coerce" || sname === "date.now";
             const dst = this.newLocal(ctx, numericResult ? "primitive" : "reference");
@@ -11968,17 +12022,17 @@ class Exporter {
     if (ns === "Reflect") {
       // Reflect mirrors the proxy traps. get/set/construct accept an optional
       // trailing arg (receiver / newTarget) which v1 ignores.
-      if (member === "get") return (argc === 2 || argc === 3) ? "reflect.get" : "__UNSUPPORTED__";
-      if (member === "set") return (argc === 3 || argc === 4) ? "reflect.set" : "__UNSUPPORTED__";
-      if (member === "has") return argc === 2 ? "reflect.has" : "__UNSUPPORTED__";
-      if (member === "deleteProperty") return argc === 2 ? "reflect.deleteProperty" : "__UNSUPPORTED__";
-      if (member === "ownKeys") return argc === 1 ? "reflect.ownKeys" : "__UNSUPPORTED__";
-      if (member === "getPrototypeOf") return argc === 1 ? "reflect.getPrototypeOf" : "__UNSUPPORTED__";
-      if (member === "setPrototypeOf") return argc === 2 ? "reflect.setPrototypeOf" : "__UNSUPPORTED__";
-      if (member === "defineProperty") return argc === 3 ? "reflect.defineProperty" : "__UNSUPPORTED__";
-      if (member === "getOwnPropertyDescriptor") return argc === 2 ? "reflect.getOwnPropertyDescriptor" : "__UNSUPPORTED__";
-      if (member === "isExtensible") return argc === 1 ? "reflect.isExtensible" : "__UNSUPPORTED__";
-      if (member === "preventExtensions") return argc === 1 ? "reflect.preventExtensions" : "__UNSUPPORTED__";
+      if (member === "get") return argc <= 3 ? "reflect.get" : "__UNSUPPORTED__";
+      if (member === "set") return argc <= 4 ? "reflect.set" : "__UNSUPPORTED__";
+      if (member === "has") return "reflect.has";
+      if (member === "deleteProperty") return "reflect.deleteProperty";
+      if (member === "ownKeys") return "reflect.ownKeys";
+      if (member === "getPrototypeOf") return "reflect.getPrototypeOf";
+      if (member === "setPrototypeOf") return "reflect.setPrototypeOf";
+      if (member === "defineProperty") return "reflect.defineProperty";
+      if (member === "getOwnPropertyDescriptor") return "reflect.getOwnPropertyDescriptor";
+      if (member === "isExtensible") return "reflect.isExtensible";
+      if (member === "preventExtensions") return "reflect.preventExtensions";
       if (member === "apply") return argc === 3 ? "reflect.apply" : "__UNSUPPORTED__";
       if (member === "construct") return argc === 3 ? "reflect.construct3" : argc === 2 ? "reflect.construct" : "__UNSUPPORTED__";
       return "__UNSUPPORTED__";
@@ -17995,6 +18049,8 @@ class Exporter {
     if (this.usesBigInt) this.internField("__garnet_bigint");
     this.regexpProtocol = this.modules.some((m) => /web[\/\\]regexp_protocol\.ts$/.test(m.fileName));
     if (this.regexpProtocol) this.internField(REGEXP_PROTOCOL_TRIGGER);
+    this.promiseProtocol = this.modules.some((m) => /web[\/\\]promise_protocol\.ts$/.test(m.fileName));
+    if (this.modules.some((m) => !/\/lib\/(node|garnet)\/|node_prelude/.test(m.fileName) && /\b__proto__\b/.test(m.text))) this.internField("__garnet_proto_accessor");
     if (this.modules.some((m) => /web[\/\\]species\.ts$/.test(m.fileName))) this.internField(SPECIES_TRIGGER);
     for (const f of allFns) for (const s of this.freeVars(f)) {
       this.cellBindings.add(s);

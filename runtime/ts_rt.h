@@ -2210,6 +2210,12 @@ tsv    ts_reflect_set_proto(tsv t, tsv p);
 tsv    ts_reflect_define_property(tsv t, tsv k, tsv d);
 tsv    ts_reflect_prevent_extensions(tsv t);
 tsv    ts_reflect_own_keys(tsv t);
+void   ts_define_proto_accessor(void);
+void   ts_json_extras(tsv json);
+tsv    ts_reflect_get(tsv t, tsv k);
+tsv    ts_reflect_get_proto(tsv t);
+tsv    ts_reflect_own_desc(tsv t, tsv k);
+tsv    ts_reflect_is_extensible(tsv t);
 tsv    ts_reflect_apply(tsv fn, tsv thisArg, tsv argsArray);
 tsv    ts_reflect_construct(tsv fn, tsv argsArray);
 tsv    ts_reflect_construct_target(tsv fn, tsv argsArray, tsv target);
@@ -2524,6 +2530,8 @@ tsv  ts_make_class_value_once(uint32_t class_id, ts_code ctor, tsv* env, uint32_
 void ts_throw_uninitialized(const char* name);
 void ts_throw_not_defined(const char* name);   /* V8's "X is not defined" ReferenceError */
 tsv  ts_construct(tsv ctorv, tsv* args, int n);
+void ts_class_refuse_call(tsv fv, uint32_t class_id, ts_code refused);
+void ts_throw_class_call(const char* name);
 /* guarded direct construction (ts_rt.c): the predicted constructor's code,
    the instance before the direct body call, the result after it */
 int ts_construct_same_code(tsv ctorv, tsv fval);

@@ -193,3 +193,14 @@ const iteratorProto = (globalThis as any).Iterator?.prototype;
 if (iteratorProto !== undefined) {
   Object.defineProperty(iteratorProto, dispose, { value: iteratorDispose[dispose], writable: true, enumerable: false, configurable: true });
 }
+const asyncIteratorDispose = {
+  async [asyncDispose](this: any): Promise<void> {
+    const ret = this.return;
+    if (ret !== undefined && ret !== null) await ret.call(this);
+  },
+};
+const asyncGeneratorProto = Object.getPrototypeOf(Object.getPrototypeOf((async function* () {}).prototype));
+if (isObject(asyncGeneratorProto)) {
+  const asyncIteratorProto = Object.getPrototypeOf(asyncGeneratorProto);
+  if (isObject(asyncIteratorProto)) Object.defineProperty(asyncIteratorProto, asyncDispose, { value: asyncIteratorDispose[asyncDispose], writable: true, enumerable: false, configurable: true });
+}

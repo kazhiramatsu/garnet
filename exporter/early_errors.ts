@@ -77,11 +77,22 @@ export function jsEarlyErrors(sf: ts.SourceFile): EarlyError[] {
       if (seen.has(name.text)) out.push({ node: name, message: `Identifier '${name.text}' has already been declared` });
       seen.add(name.text);
     };
+    // the VarDeclaredNames under the statements: a `var` hoists through the block
+    const vars: ts.Identifier[] = [];
+    const walkVars = (n: ts.Node): void => {
+      if (ts.isFunctionLike(n) || ts.isClassLike(n)) return;
+      if (ts.isVariableDeclarationList(n) && !(n.flags & ts.NodeFlags.BlockScoped)) {
+        for (const d of n.declarations) if (ts.isIdentifier(d.name)) vars.push(d.name);
+      }
+      ts.forEachChild(n, walkVars);
+    };
+    for (const s of statements) walkVars(s);
     for (const s of statements) {
       if (ts.isVariableStatement(s) && (s.declarationList.flags & ts.NodeFlags.BlockScoped)) {
         for (const d of s.declarationList.declarations) if (ts.isIdentifier(d.name)) note(d.name);
       } else if ((ts.isClassDeclaration(s) || (ts.isFunctionDeclaration(s) && s.body !== undefined)) && s.name !== undefined) note(s.name);
     }
+    for (const v of vars) if (seen.has(v.text)) out.push({ node: v, message: `Identifier '${v.text}' has already been declared` });
   };
   /** ContainsArguments: a field initializer or a static block may not name `arguments`. An arrow is no boundary. */
   const checkNoArguments = (n: ts.Node): void => {
@@ -107,6 +118,25 @@ export function jsEarlyErrors(sf: ts.SourceFile): EarlyError[] {
   };
   const visit = (n: ts.Node): void => {
     if (ts.isBlock(n) && !ts.isFunctionLike(n.parent)) checkLexicalDuplicates(n.statements);
+    else if (ts.isSourceFile(n)) {
+      // two default exports, or an exported name twice
+      const exported = new Set<string>();
+      const exportName = (node: ts.Node, name: string): void => {
+        if (exported.has(name)) out.push({ node, message: `Duplicate export of '${name}'` });
+        exported.add(name);
+      };
+      for (const s of n.statements) {
+        if (ts.isExportAssignment(s) && !s.isExportEquals) exportName(s, "default");
+        else if (ts.isExportDeclaration(s) && s.exportClause !== undefined && ts.isNamedExports(s.exportClause)) {
+          for (const e of s.exportClause.elements) exportName(e, e.name.text);
+        } else if ((ts.isFunctionDeclaration(s) || ts.isClassDeclaration(s)) && s.modifiers?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword)) {
+          if (s.modifiers.some((m) => m.kind === ts.SyntaxKind.DefaultKeyword)) exportName(s, "default");
+          else if (s.name !== undefined && (ts.isClassDeclaration(s) || s.body !== undefined)) exportName(s, s.name.text);
+        } else if (ts.isVariableStatement(s) && s.modifiers?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword)) {
+          for (const d of s.declarationList.declarations) if (ts.isIdentifier(d.name)) exportName(d, d.name.text);
+        }
+      }
+    }
     else if (ts.isCaseBlock(n)) checkLexicalDuplicates(n.clauses.flatMap((c) => [...c.statements]));
     if (ts.isBinaryExpression(n) && n.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && n.operatorToken.kind <= ts.SyntaxKind.LastAssignment) {
       checkTarget(n.left);

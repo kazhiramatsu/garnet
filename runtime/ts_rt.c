@@ -2192,7 +2192,20 @@ static int chain_holds_class_part(tsv link){
   }
   return 0;
 }
+/* OrdinarySetPrototypeOf's refusals: a non-extensible object keeps its prototype, and no cycle forms. */
+static const char* set_proto_refused(tsv obj, tsv proto){
+  if (!ts_is_obj(obj) && !ts_is_func(obj)) return NULL;
+  if (g_has_proxies && ts_is_proxy(obj)) return NULL;
+  if (ts_get_proto(obj) == proto) return NULL;
+  if (ts_obj_integrity((ts_object*)ts_ptr(obj)) & (1u|2u|4u)) return "#<Object> is not extensible";
+  for (tsv p = proto; ts_is_obj(p) || ts_is_func(p); p = ts_get_proto(p)){
+    if (g_has_proxies && ts_is_proxy(p)) break;
+    if (p == obj) return "Cyclic __proto__ value";
+  }
+  return NULL;
+}
 tsv ts_set_proto_user(tsv obj, tsv proto){
+  { const char* refused = set_proto_refused(obj, proto); if (refused) ts_throw_type_error_msg(refused); }
   /* A sized instance relinked leaves its class's interval; a class's prototype relinked changes
      its instances' chains (docs/class_index_dispatch_design.md), and so does the relink of any
      object on such a chain. Every cache derived from a class's chain (the method caches, the trap
@@ -2381,11 +2394,14 @@ __attribute__((noinline)) static tsv ts_call_medium_env(ts_func* f, ts_code code
   return code(merged, (int)f->envlen + nargs);
 }
 #endif
+static tsv call_with_code(ts_func* f, ts_code code, tsv* args, int nargs);
 tsv ts_call(tsv fn, tsv* args, int nargs){
   if (g_has_proxies && ts_is_proxy(fn)) return ts_proxy_apply(fn, TS_UNDEFINED, args, nargs);
   if (!ts_is_func(fn)) ts_throw_not_a_function(NULL);
   ts_func* f = ts_ptr(fn);
-  ts_code code = (ts_code)f->code;
+  return call_with_code(f, (ts_code)f->code, args, nargs);
+}
+static tsv call_with_code(ts_func* f, ts_code code, tsv* args, int nargs){
   if (f->envlen){
     /* Environment ABI: the callee reads its cells from the register. */
     if (f->env_abi){ g_ts_cur_env = f->env; return code(args, nargs); }
@@ -7715,9 +7731,11 @@ tsv ts_str_substr(tsv s, tsv start, tsv length){
   ts_gc_unroot(3);
   return result;
 }
+static tsv wrapper_value(tsv v);
 tsv ts_str_value(tsv s){
   if (ts_is_str(s)) return s;
   if (s == ts_string_proto()) return ts_new_string("", 0);
+  { tsv w = wrapper_value(s); if (ts_is_str(w)) return w; }
   ts_throw_type_error_msg("String.prototype.toString requires a string receiver");
   return TS_UNDEFINED;
 }
@@ -11756,6 +11774,7 @@ tsv ts_error_proto(int kind){
    through its native constructor, its `prototype` the kind's prototype, its [[Prototype]] the Error
    value for the subtypes (TypeError.__proto__ === Error). */
 static tsv g_error_ctor_values[TS_ERR_KINDS];
+static tsv error_is_error_fn(tsv* a, int n);
 static tsv ts_error_ctor_thunk(tsv* args, int n){
   int kind = n > 0 ? (int)ts_to_num(args[0]) : 0;   /* env: the kind */
   return ts_new_error_args(kind, n > 1 ? args + 1 : NULL, n > 1 ? n - 1 : 0);
@@ -11772,12 +11791,24 @@ tsv ts_error_ctor_value(int kind){
   ((ts_func*)ts_ptr(f))->native_ctor = 1;
   g_error_ctor_values[kind] = f;
   ts_root_static_once(&g_error_ctor_values[kind], &rooted[kind]);
+  if (kind == TS_ERR_ERROR){
+    tsv is = ts_make_fn_t(error_is_error_fn, NULL, 0, 0); ts_gc_root(&is);
+    ts_set_fn_meta(is, 1u, "isError");
+    ts_define_data(f, ts_intern_field("isError", 7), is, 0, 1, 1);
+    ts_gc_unroot(1);
+  }
   if (kind != TS_ERR_ERROR){ tsv base = ts_error_ctor_value(TS_ERR_ERROR); ts_set_proto(g_error_ctor_values[kind], base); }
   ts_gc_unroot(1);
   return g_error_ctor_values[kind];
 }
 /* Construct an Error-family instance with the proper prototype. `msg` undefined
    leaves message inherited (""); otherwise an own `message` is set (ToString). */
+static ts_key error_mark_key(void){ static ts_key k; if (!k) k = ts_intern_field("__is_error", 10); return k; }
+static tsv error_is_error_fn(tsv* a, int n){
+  if (n < 1 || !ts_is_obj(a[0]) || ts_is_prim_cell(a[0])) return ts_bool(0);
+  if (g_has_proxies && ts_is_proxy(a[0])) return ts_bool(0);
+  return ts_bool(find_slot((ts_object*)ts_ptr(a[0]), error_mark_key(), 0) != NULL);
+}
 tsv ts_new_error(int kind, tsv msg){
   if (kind < 0 || kind >= TS_ERR_KINDS) kind = TS_ERR_ERROR;
   ts_setup_error_protos();
@@ -11785,6 +11816,9 @@ tsv ts_new_error(int kind, tsv msg){
   tsv e = ts_new_object();
   ((ts_object*)ts_ptr(e))->proto = g_error_protos[kind];
   ts_write_barrier(e, g_error_protos[kind]);
+  ts_gc_root(&e);
+  ts_define_data(e, error_mark_key(), ts_bool(1), 0, 0, 0);
+  ts_gc_unroot(1);
   if (!ts_is_undef(msg)){
     ts_gc_root(&e);
     /* `message` is an own data property but NON-enumerable (JS semantics): it must
@@ -11797,6 +11831,29 @@ tsv ts_new_error(int kind, tsv msg){
 }
 void ts_fn_mark_native_ctor(tsv fn){ ((ts_func*)ts_ptr(fn))->native_ctor = 1; }
 void ts_throw_reference_error_msg(const char* msg){ ts_throw(ts_new_error(TS_ERR_REFERENCE, ts_new_string(msg, (uint32_t)strlen(msg)))); }
+/* Object.prototype.__proto__, for a program that names it */
+static tsv proto_getter(tsv* a, int n){
+  tsv v = n > 0 ? a[0] : TS_UNDEFINED;
+  if (v == TS_UNDEFINED || v == TS_NULL) ts_throw_type_error_msg("Cannot convert undefined or null to object");
+  if ((!ts_is_obj(v) && !ts_is_func(v)) || ts_is_prim_cell(v)) v = ts_to_object(v);
+  return ts_get_proto(v);
+}
+static tsv proto_setter(tsv* a, int n){
+  tsv v = n > 0 ? a[0] : TS_UNDEFINED, p = n > 1 ? a[1] : TS_UNDEFINED;
+  if (v == TS_UNDEFINED || v == TS_NULL) ts_throw_type_error_msg("Cannot convert undefined or null to object");
+  if (((!ts_is_obj(p) && !ts_is_func(p)) || ts_is_prim_cell(p)) && p != TS_NULL) return TS_UNDEFINED;
+  if ((!ts_is_obj(v) && !ts_is_func(v)) || ts_is_prim_cell(v)) return TS_UNDEFINED;
+  ts_set_proto_user(v, p);
+  return TS_UNDEFINED;
+}
+void ts_define_proto_accessor(void){
+  tsv g = ts_make_fn_t(proto_getter, NULL, 0, 1); ts_gc_root(&g);
+  ts_set_fn_meta(g, 0u, "get __proto__");
+  tsv s = ts_make_fn_t(proto_setter, NULL, 0, 1); ts_gc_root(&s);
+  ts_set_fn_meta(s, 1u, "set __proto__");
+  ts_define_accessor_attr(g_object_proto_v, ts_intern_field("__proto__", 9), g, s, 1, 1, 0, 1);
+  ts_gc_unroot(2);
+}
 /* A built-in read as a value is one function, however often it is read and from wherever
    (`Math.max === Math.max`, `arr.map(Math.sqrt)`, the global object's property). */
 typedef struct builtin_fn_entry { ts_code code; tsv value; int rooted; struct builtin_fn_entry* next; } builtin_fn_entry;
@@ -12370,7 +12427,7 @@ static uint8_t* g_field_hidden = NULL;
 static int field_name_is_internal(const char* n, uint32_t len){
   static const char* const names[] = {
     "__value", "__date_ms", "__views", "__coro", "__timeoutMs", "__body", "__garnet", "__garnet_json",
-    "__garnet_node", "__garnet_metal", "__garnet_species", "__promise_resolver_done", "__generator_return_tag",
+    "__garnet_node", "__garnet_metal", "__garnet_species", "__is_error", "__raw_json", "__promise_resolver_done", "__generator_return_tag",
     "__generator_return_value", "__text_encoder", "__text_decoder_encoding", "__text_decoder_fatal",
     "__text_decoder_ignore_bom", "__array_iterator_source", "__array_iterator_index",
     "__array_iterator_kind", "__map_iterator_source", "__map_iterator_last", "__map_iterator_kind",
@@ -12735,7 +12792,20 @@ static void push_index_name(tsv arr, uint32_t i){
 static void push_cstr_name(tsv arr, const char* n){
   ts_array_push_rooted(arr, ts_new_string(n, (uint32_t)strlen(n)));
 }
+/* A Proxy's keys of one kind, through its ownKeys trap */
+static tsv ts_proxy_own_keys_arr(tsv pv);
+static tsv proxy_keys_of_kind(tsv pv, int symbols){
+  tsv all = ts_proxy_own_keys_arr(pv); ts_gc_root(&all);
+  tsv out = ts_new_array(0); ts_gc_root(&out);
+  for (uint32_t i = 0; i < ts_array_len(all); i++){
+    tsv k = ts_array_get(all, i);
+    if (ts_is_symbol(k) == symbols) ts_array_push(out, k);
+  }
+  ts_gc_unroot(2);
+  return out;
+}
 tsv ts_object_get_own_property_names(tsv obj){
+  if (g_has_proxies && ts_is_proxy(obj)) return proxy_keys_of_kind(obj, 0);
   ts_gc_root(&obj);
   tsv arr = ts_new_array(0);
   ts_gc_root(&arr);
@@ -12810,6 +12880,7 @@ tsv ts_object_get_own_property_names(tsv obj){
   return arr;
 }
 tsv ts_object_get_own_property_symbols(tsv obj){
+  if (g_has_proxies && ts_is_proxy(obj)) return proxy_keys_of_kind(obj, 1);
   ts_gc_root(&obj);
   tsv arr = ts_new_array(0);
   ts_gc_root(&arr);
@@ -12835,9 +12906,39 @@ tsv ts_object_get_own_property_symbols(tsv obj){
   ts_gc_unroot(2);
   return arr;
 }
+/* A getter can change the object: EnumerableOwnProperties takes the keys, then tests and reads each. */
+static int object_has_accessor(tsv obj){
+  if (!ts_is_propbag(obj)) return 0;
+  uint32_t len = propbag_len(obj);
+  for (uint32_t i = 0; i < len; i++){ ts_pref p = propbag_prop(obj, i); if (pref_ok(p) && pref_is_accessor(p)) return 1; }
+  return 0;
+}
+static tsv object_read_each(tsv obj, int pairs){
+  tsv keys = ts_object_keys(obj); ts_gc_root(&keys);
+  tsv out = ts_new_array(0); ts_gc_root(&out);
+  ts_key k_enumerable = ts_intern_field("enumerable", 10);
+  uint32_t n = ts_array_len(keys);
+  for (uint32_t i = 0; i < n; i++){
+    tsv k = ts_array_get(keys, i); ts_gc_root(&k);
+    tsv d = ts_get_own_property_descriptor(obj, k);
+    if (!ts_is_undef(d) && ts_truthy(ts_get(d, k_enumerable))){
+      tsv v = ts_get_dyn(obj, k); ts_gc_root(&v);
+      if (pairs){
+        tsv pair = ts_new_array(0); ts_gc_root(&pair);
+        ts_array_push(pair, k); ts_array_push(pair, v); ts_array_push(out, pair);
+        ts_gc_unroot(1);
+      } else ts_array_push(out, v);
+      ts_gc_unroot(1);
+    }
+    ts_gc_unroot(1);
+  }
+  ts_gc_unroot(2);
+  return out;
+}
 tsv ts_object_values(tsv obj){
   object_enum_check(obj);
   ts_gc_root(&obj);
+  if (object_has_accessor(obj)){ tsv r = object_read_each(obj, 0); ts_gc_unroot(1); return r; }
   enum_arr_ctx c; c.arr=ts_new_array(0); c.recv=obj; ts_gc_root(&c.arr);
   ts_prop_own_enum(obj, cb_push_val, &c);
   ts_gc_unroot(2);
@@ -12848,6 +12949,7 @@ tsv ts_object_values(tsv obj){
 tsv ts_object_entries(tsv obj){
   object_enum_check(obj);
   ts_gc_root(&obj);
+  if (object_has_accessor(obj)){ tsv r = object_read_each(obj, 1); ts_gc_unroot(1); return r; }
   enum_arr_ctx c; c.arr=ts_new_array(0); c.recv=obj; ts_gc_root(&c.arr);
   ts_prop_own_enum(obj, cb_push_entry, &c);
   ts_gc_unroot(2);
@@ -12907,11 +13009,11 @@ tsv ts_construct_result(tsv inst, tsv ret){
 }
 
 tsv ts_object_assign(tsv* args, int n){
-  if (n <= 0) return ts_new_object();
+  if (n <= 0) ts_throw_type_error_msg("Cannot convert undefined or null to object");
   tsv target = args[0];
   if (ts_is_null(target) || ts_is_undef(target)) ts_throw_type_error_msg("Cannot convert undefined or null to object");
-  /* a function target takes the properties too (a callable namespace); arrays, maps and sets keep their own storage */
-  if (!(ts_is_obj(target) || ts_is_func(target)) || ts_is_indexed_array_fast(target) || ts_is_map(target) || ts_is_set(target)) return target;
+  /* ToObject of a primitive; a function target takes the properties too (a callable namespace) */
+  if ((!ts_is_obj(target) && !ts_is_func(target)) || ts_is_prim_cell(target)) target = ts_to_object(target);
   ts_gc_root(&target);
   enum_copy_ctx c; c.target=target;
   for (int si=1; si<n; si++){
@@ -13166,6 +13268,7 @@ static void jb_indent(jbuf* b, const char* indent, int depth){
   for (int i=0;i<depth;i++) jb_putz(b, indent);
 }
 static int json_stringify_val(jbuf* b, tsv v, int depth, const char* indent);
+static int json_is_raw(tsv v);
 /* SerializeJSONProperty step 2: if `v` is an object with a callable `toJSON`,
    replace it with `v.toJSON(key)`. Applied once at each property/element/top
    site (not inside json_stringify_val) so the omit decision for objects/maps
@@ -13269,6 +13372,13 @@ static int json_stringify_val(jbuf* b, tsv v, int depth, const char* indent){
   if (ts_is_bigint(v)) ts_throw_type_error_msg("Do not know how to serialize a BigInt");
   if (ts_is_str(v)){ json_quote(b, ts_str_view_typed(v)); return 1; }
   if (ts_is_symbol(v)) return 0;
+  if (TS_RT_UNLIKELY(json_is_raw(v))){
+    tsv text = ts_get(v, ts_intern_field("rawJSON", 7));
+    uint32_t n = 0; char* bytes = ts_string_utf8_copy(text, &n);
+    jb_puts(b, bytes, n);
+    free(bytes);
+    return 1;
+  }
   if (ts_is_array(v)){
     ts_gc_root(&v);
     json_path node; json_enter(b, &node, &v, depth);
@@ -13376,6 +13486,37 @@ static int json_stringify_val(jbuf* b, tsv v, int depth, const char* indent){
   jb_putz(b,"null"); return 1;
 }
 
+/* JSON.rawJSON: a frozen object without a prototype, its text an own property, stringified as it stands. */
+static ts_key raw_json_key(void){ static ts_key k; if (!k) k = ts_intern_field("__raw_json", 10); return k; }
+static tsv json_raw_fn(tsv* a, int n){
+  tsv s = ts_to_string_template(n > 0 ? a[0] : TS_UNDEFINED); ts_gc_root(&s);
+  uint32_t len = ts_str_len_typed(s);
+  ts_strview v = ts_str_view_typed(s);
+  if (len == 0) ts_throw_syntax_error_msg("Invalid value for JSON.rawJSON");
+  uint16_t first = ts_str_cu_at_view(v, 0), last = ts_str_cu_at_view(v, len - 1);
+  if (first == 9 || first == 10 || first == 13 || first == 32 || last == 9 || last == 10 || last == 13 || last == 32 || first == '[' || first == '{')
+    ts_throw_syntax_error_msg("Invalid value for JSON.rawJSON");
+  (void)ts_json_parse(s);
+  tsv o = ts_new_object(); ts_gc_root(&o);
+  ((ts_object*)ts_ptr(o))->proto = TS_NULL;
+  ts_define_data(o, raw_json_key(), ts_bool(1), 0, 0, 0);
+  ts_set(o, ts_intern_field("rawJSON", 7), s);
+  ts_object_freeze(o);
+  ts_gc_unroot(2);
+  return o;
+}
+static int json_is_raw(tsv v){ return ts_is_obj(v) && !ts_is_prim_cell(v) && ((ts_gc_header*)ts_ptr(v))->kind == TS_KIND_OBJECT && find_slot((ts_object*)ts_ptr(v), raw_json_key(), 0) != NULL; }
+static tsv json_is_raw_fn(tsv* a, int n){ return ts_bool(n > 0 && json_is_raw(a[0])); }
+void ts_json_extras(tsv json){
+  ts_gc_root(&json);
+  tsv f = ts_make_fn_t(json_raw_fn, NULL, 0, 0); ts_gc_root(&f);
+  ts_set_fn_meta(f, 1u, "rawJSON");
+  ts_define_data(json, ts_intern_field("rawJSON", 7), f, 0, 1, 1);
+  f = ts_make_fn_t(json_is_raw_fn, NULL, 0, 0);
+  ts_set_fn_meta(f, 1u, "isRawJSON");
+  ts_define_data(json, ts_intern_field("isRawJSON", 9), f, 0, 1, 1);
+  ts_gc_unroot(2);
+}
 tsv ts_json_stringify(tsv v){
   jbuf b; jb_init(&b);
   ts_gc_root(&v);
@@ -13741,6 +13882,27 @@ static inline void dyn_enter_note(tsv ctorv){
   g_construct_target = TS_UNDEFINED;
   g_dyn_active = ctorv;
 }
+/* A class value's constructor, by class; its function's code is the emitted thunk that throws. */
+static ts_code* g_class_ctor_code = NULL;
+static uint32_t g_class_ctor_cap = 0;
+void ts_class_refuse_call(tsv fv, uint32_t class_id, ts_code refused){
+  if (class_id >= g_class_ctor_cap){
+    uint32_t cap = g_class_ctor_cap ? g_class_ctor_cap : 64u;
+    while (cap <= class_id) cap *= 2u;
+    g_class_ctor_code = (ts_code*)realloc(g_class_ctor_code, sizeof(ts_code) * cap);
+    memset(g_class_ctor_code + g_class_ctor_cap, 0, sizeof(ts_code) * (cap - g_class_ctor_cap));
+    g_class_ctor_cap = cap;
+  }
+  ts_func* f = (ts_func*)ts_ptr(fv);
+  g_class_ctor_code[class_id] = (ts_code)f->code;
+  f->code = (void*)refused;
+}
+void ts_throw_class_call(const char* name){
+  char buf[192];
+  if (name && name[0]) snprintf(buf, sizeof buf, "Class constructor %.100s cannot be invoked without 'new'", name);
+  else snprintf(buf, sizeof buf, "Class constructors cannot be invoked without 'new'");
+  ts_throw_type_error_msg(buf);
+}
 tsv ts_construct(tsv ctorv, tsv* args, int n){
   if (g_has_proxies && ts_is_proxy(ctorv)) return ts_proxy_construct(ctorv, args, n);
   if (!ts_is_func(ctorv)) ts_throw_type_error("value is not a constructor");
@@ -13876,7 +14038,10 @@ tsv ts_construct(tsv ctorv, tsv* args, int n){
                        (tsv*)malloc(sizeof(tsv) * (size_t)m));
   callargs[0] = inst;
   for (int i = 0; i < n; i++) callargs[1 + i] = args[i];
-  tsv r = ts_call(ctorv, callargs, m);
+  /* a class value's own code refuses a plain call; `new` runs the constructor */
+  tsv r = cid < g_class_ctor_cap && g_class_ctor_code[cid]
+    ? call_with_code((ts_func*)ts_ptr(ctorv), g_class_ctor_code[cid], callargs, m)
+    : ts_call(ctorv, callargs, m);
   if (callargs != stackargs) free(callargs);
   if (plain_inst){
     uint32_t used = obj_map_plain(((ts_object*)ts_ptr(inst)))->len + 4u;
@@ -16180,6 +16345,7 @@ static tsv ts_own_descriptor_by_key(tsv obj, ts_key key){
 }
 tsv ts_get_own_property_descriptor(tsv obj, tsv keyv){
   if (g_has_proxies && ts_is_proxy(obj)) return ts_proxy_get_own_desc(obj, keyv);
+  if (obj == TS_UNDEFINED || obj == TS_NULL) ts_throw_type_error_msg("Cannot convert undefined or null to object");
   if (!ts_is_propbag(obj) && !ts_is_str(obj)) return TS_UNDEFINED;
   if (ts_is_propbag(obj)){
     ts_object* o = ts_ptr(obj);
@@ -16856,7 +17022,13 @@ tsv ts_objproto_tostring_call(tsv v){
        : TS_TAG(g_tag_object);
 }
 /* o.valueOf(): returns the object itself (default Object.prototype.valueOf). */
-tsv ts_objproto_valueOf(tsv* args, int n){ return (n>0) ? args[0] : TS_UNDEFINED; }
+tsv ts_objproto_valueOf(tsv* args, int n){
+  tsv v = n > 0 ? args[0] : TS_UNDEFINED;
+  if (ts_is_obj(v) && !ts_is_prim_cell(v)) return v;
+  if (ts_is_func(v)) return v;
+  if (v == TS_UNDEFINED || v == TS_NULL) ts_throw_type_error_msg("Cannot convert undefined or null to object");
+  return ts_to_object(v);
+}
 /* o.toLocaleString(): Object.prototype delegates to this.toString(). The lookup is
    ordinary property lookup, so an own toString shadows and Array/String/Number
    prototype toString methods are respected when this method is borrowed. */
@@ -19636,8 +19808,16 @@ static tsv new_wrapper(tsv prim, tsv proto){
   ts_gc_unroot(3);
   return o;
 }
-/* ToObject for what has a wrapper here; a string stays itself (`Object("s")`, KNOWN_GAPS.md). */
+/* ToObject. A String's length and characters are own properties, as its exotic object answers them. */
 tsv ts_to_object(tsv v){
+  if (ts_is_str(v)){
+    tsv o = new_wrapper(v, ts_string_proto()); ts_gc_root(&o); ts_gc_root(&v);
+    uint32_t n = ts_str_len_typed(v);
+    for (uint32_t i = 0; i < n; i++) ts_define_data(o, array_index_key(i), ts_string_slice_view(v, i, 1), 1, 0, 0);
+    ts_define_data(o, ts_intern_field("length", 6), ts_num((double)n), 0, 0, 0);
+    ts_gc_unroot(2);
+    return o;
+  }
   if (ts_is_num(v)) return new_wrapper(v, ts_number_proto());
   if (ts_is_bool(v)) return new_wrapper(v, ts_boolean_proto());
   if (ts_is_symbol(v)) return new_wrapper(v, ts_symbol_proto());
@@ -21217,9 +21397,20 @@ void ts_set_dyn_pic(tsv obj, tsv keyv, tsv v, ts_prop_ic* ic){
    Thin wrappers over the existing dynamic property / call / construct runtime.
    Reflect mirrors the proxy traps and returns booleans (success) where Object.*
    returns the object or throws. */
-tsv ts_reflect_has(tsv t, tsv k){ return ts_bool(ts_has_prop_dyn(t, k)); }
+static void reflect_require(tsv t, const char* name){
+  if ((ts_is_obj(t) || ts_is_func(t)) && !ts_is_prim_cell(t)) return;
+  char m[96];
+  snprintf(m, sizeof m, "Reflect.%s called on non-object", name);
+  ts_throw_type_error_msg(m);
+}
+tsv ts_reflect_has(tsv t, tsv k){ reflect_require(t, "has"); return ts_bool(ts_has_prop_dyn(t, k)); }
+tsv ts_reflect_get(tsv t, tsv k){ reflect_require(t, "get"); return ts_get_dyn(t, k); }
+tsv ts_reflect_get_proto(tsv t){ reflect_require(t, "getPrototypeOf"); return ts_get_proto(t); }
+tsv ts_reflect_own_desc(tsv t, tsv k){ reflect_require(t, "getOwnPropertyDescriptor"); return ts_get_own_property_descriptor(t, k); }
+tsv ts_reflect_is_extensible(tsv t){ reflect_require(t, "isExtensible"); return ts_object_is_extensible(t); }
 static int ordinary_set_recv(tsv t, ts_key key, tsv v, tsv r);
 tsv ts_reflect_set(tsv t, tsv k, tsv v){
+  reflect_require(t, "set");
   if (g_has_proxies && ts_is_proxy(t)) return ts_bool(ts_proxy_set_v(t, k, v, t));
   if (ts_is_obj(t) && ((ts_gc_header*)ts_ptr(t))->kind == TS_KIND_OBJECT){   /* false where an assignment throws */
     ts_gc_root(&t); ts_gc_root(&v);
@@ -21236,6 +21427,7 @@ tsv ts_reflect_set(tsv t, tsv k, tsv v){
    chain with the receiver (exotic links included); other targets, and a
    receiver that is the target itself, keep the ordinary read. */
 tsv ts_reflect_get_recv(tsv t, tsv k, tsv r){
+  reflect_require(t, "get");
   if (r == t || !ts_is_obj(t) || ts_same_cell(r, t)) return ts_get_dyn(t, k);
   if (g_has_proxies && ts_is_proxy(t)) return ts_proxy_get_v(t, k, r);
   if (((ts_gc_header*)ts_ptr(t))->kind != TS_KIND_OBJECT) return ts_get_dyn(t, k);
@@ -21372,6 +21564,7 @@ tsv ts_super_set(tsv proto, tsv k, tsv v, tsv receiver){
   return v;
 }
 tsv ts_reflect_set_recv(tsv t, tsv k, tsv v, tsv r){
+  reflect_require(t, "set");
   if (r == t || !ts_is_obj(t) || ts_same_cell(r, t)) return ts_reflect_set(t, k, v);
   if (g_has_proxies && ts_is_proxy(t)) return ts_bool(ts_proxy_set_v(t, k, v, r));
   if (((ts_gc_header*)ts_ptr(t))->kind != TS_KIND_OBJECT) return ts_reflect_set(t, k, v);
@@ -21382,19 +21575,28 @@ tsv ts_reflect_set_recv(tsv t, tsv k, tsv v, tsv r){
   return ts_bool(ok);
 }
 tsv ts_reflect_delete(tsv t, tsv k){
+  reflect_require(t, "deleteProperty");
   ts_gc_root(&t);
   ts_key key; int ok = ts_key_from_value(k, &key);
   int r = ok ? ts_delete_prop(t, key) : 1;
   ts_gc_unroot(1);
   return ts_bool(r);
 }
-tsv ts_reflect_set_proto(tsv t, tsv p){ ts_set_proto_user(t, p); return ts_bool(1); }
+tsv ts_reflect_set_proto(tsv t, tsv p){
+  reflect_require(t, "setPrototypeOf");
+  if (((!ts_is_obj(p) && !ts_is_func(p)) || ts_is_prim_cell(p)) && p != TS_NULL) ts_throw_type_error_msg("Object prototype may only be an Object or null");
+  if (set_proto_refused(t, p)) return ts_bool(0);
+  ts_set_proto_user(t, p);
+  return ts_bool(1);
+}
 /* false (not a TypeError) when the property cannot be defined as described */
 tsv ts_reflect_define_property(tsv t, tsv k, tsv d){ return ts_bool(define_property_from(t, k, d, 0)); }
-tsv ts_reflect_prevent_extensions(tsv t){ ts_object_prevent_extensions(t); return ts_bool(1); }
+tsv ts_reflect_prevent_extensions(tsv t){ reflect_require(t, "preventExtensions"); ts_object_prevent_extensions(t); return ts_bool(1); }
 /* Reflect.ownKeys: all own string keys (incl. non-enumerable, in spec order)
    followed by all own symbol keys. */
 tsv ts_reflect_own_keys(tsv t){
+  reflect_require(t, "ownKeys");
+  if (g_has_proxies && ts_is_proxy(t)) return ts_proxy_own_keys_arr(t);
   ts_gc_root(&t);
   tsv names = ts_object_get_own_property_names(t);
   ts_gc_root(&names);
@@ -22048,10 +22250,43 @@ static tsv ts_proxy_own_keys_arr(tsv pv){
   ts_gc_root(&trap);
   tsv argv[1] = { target };
   tsv r = invoke_with_this(trap, handler, argv, 1);
-  if (!ts_is_indexed_array_fast(r))
-    ts_throw_type_error("'ownKeys' on proxy: trap did not return an array");
-  ts_gc_unroot(4);
-  return r;
+  if (!ts_is_obj(r) || ts_is_prim_cell(r)) ts_throw_type_error("CreateListFromArrayLike called on non-object");
+  ts_gc_root(&r);
+  /* CreateListFromArrayLike: strings and symbols, no duplicates */
+  double len = ts_number_coerce(ts_get(r, ts_intern_field("length", 6)));
+  uint32_t n = !(len > 0) ? 0 : len > 4294967295.0 ? 4294967295u : (uint32_t)len;
+  tsv list = ts_new_array(0); ts_gc_root(&list);
+  for (uint32_t i = 0; i < n; i++){
+    tsv k = ts_get_dyn(r, ts_num((double)i));
+    if (!ts_is_str(k) && !ts_is_symbol(k)){
+      char num[40], msg[96];
+      if (ts_is_num(k)){ ts_fmt_num(ts_to_num(k), num, sizeof num); snprintf(msg, sizeof msg, "%s is not a valid property name", num); ts_throw_type_error(msg); }
+      ts_throw_type_error("A value is not a valid property name");
+    }
+    for (uint32_t j = 0; j < i; j++) if (ts_strict_eq(ts_array_get(list, j), k)) ts_throw_type_error("'ownKeys' on proxy: trap returned duplicate entries");
+    ts_array_push(list, k);
+  }
+  /* the invariants: every non-configurable key of the target, and on a non-extensible target its keys exactly */
+  int extensible = ts_truthy(ts_object_is_extensible(target));
+  tsv tkeys = ts_reflect_own_keys(target); ts_gc_root(&tkeys);
+  uint32_t tn = ts_array_len(tkeys), matched = 0;
+  for (uint32_t i = 0; i < tn; i++){
+    tsv k = ts_array_get(tkeys, i); ts_gc_root(&k);
+    tsv d = ts_get_own_property_descriptor(target, k);
+    int nonconf = ts_is_obj(d) && !pd_bool(d, "configurable"), found = 0;
+    for (uint32_t j = 0; j < n && !found; j++) found = ts_strict_eq(ts_array_get(list, j), k);
+    if (!found && (nonconf || !extensible)){
+      char msg[120]; uint32_t len = 0; char* text = ts_string_utf8_copy(ts_to_string_v(k), &len);
+      snprintf(msg, sizeof msg, "'ownKeys' on proxy: trap result did not include '%.*s'", (int)(len > 60 ? 60 : len), text);
+      free(text);
+      ts_throw_type_error(msg);
+    }
+    matched += (uint32_t)found;
+    ts_gc_unroot(1);
+  }
+  if (!extensible && matched != n) ts_throw_type_error("'ownKeys' on proxy: trap returned extra keys but proxy target is non-extensible");
+  ts_gc_unroot(7);
+  return list;
 }
 /* Enumerate own ENUMERABLE STRING keys (Object.keys / JSON / for-in semantics):
    take the ownKeys-trap result, and for each string key whose own descriptor is
@@ -22614,7 +22849,9 @@ static void promise_make_resolvers(tsv pv, tsv* resolve_out, tsv* reject_out, ts
   ts_set(cell, F_resolver_done, ts_bool(0));
   tsv env[2]={pv,cell};
   tsv resolve=ts_make_fn(ts_resolve_thunk, env, 2); ts_gc_root(&resolve);
+  ts_set_fn_meta(resolve, 1u, "");
   tsv reject=ts_make_fn(ts_reject_thunk, env, 2);
+  ts_set_fn_meta(reject, 1u, "");
   *resolve_out=resolve; *reject_out=reject; *cell_out=cell;
   ts_gc_unroot(3);
 }
@@ -22755,8 +22992,9 @@ static tsv comb_race_resume(tsv cv){
 /* Materialize a synchronous iterable for Promise combinators. Invalid inputs and
    abrupt iterator operations reject the returned promise instead of escaping
    synchronously or being mistaken for an empty iterable. */
+static int array_own_iterator(tsv v);
 static int promise_materialize_inputs(tsv input, tsv* array_out, tsv* error_out){
-  if (ts_is_indexed_array_fast(input)){ *array_out=input; return 1; }
+  if (ts_is_plain_array(input) && !array_own_iterator(input) && !g_array_iter_patched){ *array_out=input; return 1; }
   ts_gc_root(&input);
   tsv tmp=ts_new_array(0); ts_gc_root(&tmp);
   int valid=ts_is_set(input) || ts_is_map(input) || ts_is_str(input);
@@ -23689,6 +23927,9 @@ static tsv garnet_is_published_fn(tsv* a, int n){ return ts_bool(ts_is_published
 static tsv garnet_is_plain_array_fn(tsv* a, int n){
   return ts_bool(n > 0 && ts_is_plain_array(a[0]) && !g_proto_elements);
 }
+static tsv garnet_is_array_buffer_fn(tsv* a, int n){ return ts_bool(n > 0 && ts_is_array_buffer(a[0])); }
+static tsv garnet_is_constructor_fn(tsv* a, int n){ return ts_bool(n > 0 && ts_value_is_constructor(a[0])); }
+static tsv garnet_is_promise_fn(tsv* a, int n){ return ts_bool(n > 0 && ts_is_obj(a[0]) && ((ts_gc_header*)ts_ptr(a[0]))->kind == TS_KIND_PROMISE); }
 static tsv garnet_track_proto_elements_fn(tsv* a, int n){
   (void)a; (void)n;
   array_to_dict(g_array_proto_v);   /* its stores come to the runtime */
@@ -23706,8 +23947,17 @@ static tsv garnet_replace_method_fn(tsv* a, int n){
   }
   return TS_UNDEFINED;
 }
+static tsv global_eval_fn(tsv* a, int n){
+  (void)a; (void)n;
+  ts_throw(ts_new_error(TS_ERR_EVAL, ts_new_string("Code generation from strings is not available in a compiled program (eval)", 74)));
+  return TS_UNDEFINED;
+}
 static void ts_garnet_global_init(tsv global){
   ts_gc_root(&global);
+  tsv ev = ts_make_fn_t(global_eval_fn, NULL, 0, 0); ts_gc_root(&ev);
+  ts_set_fn_meta(ev, 1u, "eval");
+  ts_define_data(global, ts_intern_field("eval", 4), ev, 0, 1, 1);
+  ts_gc_unroot(1);
   tsv g = ts_new_object(); ts_gc_root(&g);
   tsv f0 = ts_make_fn_t(garnet_is_plain_array_fn, NULL, 0, 0); ts_gc_root(&f0);
   ts_set_fn_meta(f0, 1u, "isPlainArray"); ts_set_cstr(g, "isPlainArray", f0);
@@ -23715,13 +23965,19 @@ static void ts_garnet_global_init(tsv global){
   ts_set_fn_meta(f3, 3u, "replaceMethod"); ts_set_cstr(g, "replaceMethod", f3);
   tsv f4 = ts_make_fn_t(garnet_track_proto_elements_fn, NULL, 0, 0); ts_gc_root(&f4);
   ts_set_fn_meta(f4, 0u, "trackProtoElements"); ts_set_cstr(g, "trackProtoElements", f4);
+  tsv f5 = ts_make_fn_t(garnet_is_array_buffer_fn, NULL, 0, 0); ts_gc_root(&f5);
+  ts_set_fn_meta(f5, 1u, "isArrayBuffer"); ts_set_cstr(g, "isArrayBuffer", f5);
+  tsv f6 = ts_make_fn_t(garnet_is_constructor_fn, NULL, 0, 0); ts_gc_root(&f6);
+  ts_set_fn_meta(f6, 1u, "isConstructor"); ts_set_cstr(g, "isConstructor", f6);
+  tsv f7 = ts_make_fn_t(garnet_is_promise_fn, NULL, 0, 0); ts_gc_root(&f7);
+  ts_set_fn_meta(f7, 1u, "isPromise"); ts_set_cstr(g, "isPromise", f7);
   tsv f1 = ts_make_fn_t(garnet_publish_fn, NULL, 0, 0); ts_gc_root(&f1);
   ts_set_fn_meta(f1, 1u, "publish"); ts_set_cstr(g, "publish", f1);
   tsv f2 = ts_make_fn_t(garnet_is_published_fn, NULL, 0, 0); ts_gc_root(&f2);
   ts_set_fn_meta(f2, 1u, "isPublished"); ts_set_cstr(g, "isPublished", f2);
   ts_set_cstr(g, "sharesGraphs", ts_bool(1));
   ts_set_cstr(global, "__garnet", g);
-  ts_gc_unroot(7);
+  ts_gc_unroot(10);
 }
 /* The `__garnet_json` global the garnet:json module calls (lib/garnet/json.ts,
    docs/typed_json_design.md): `layout(keys)` interns a key sequence as a

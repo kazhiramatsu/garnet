@@ -851,6 +851,7 @@ tsv ts_regexp_adapter_construct_tsv(tsv pattern, tsv flags, int as_constructor){
   if (TS_RT_UNLIKELY(g_regexp_protocol) && (ts_is_obj(pattern) || ts_is_func(pattern))){
     tsv m = ts_get(pattern, TS_KEY_WKSYM(TS_WKSYM_MATCH));
     int is_regexp = m != TS_UNDEFINED ? ts_truthy(m) : ts_is_regexp(pattern);
+    if (!is_regexp && flags == TS_UNDEFINED && !as_constructor && ts_is_regexp(pattern)) as_constructor = 1;   /* a new object: it says it is no regexp */
     if (is_regexp && flags == TS_UNDEFINED && !as_constructor &&
         ts_get(pattern, ts_intern_field("constructor", 11)) == ts_get(ts_regexp_proto(), ts_intern_field("constructor", 11))){ ts_gc_unroot(2); return pattern; }
     if (is_regexp && !ts_is_regexp(pattern)){
@@ -950,7 +951,7 @@ static void define_getter(tsv proto, const char* name, ts_code fn){
   ts_gc_root(&proto);
   tsv f = ts_make_fn_t(fn, NULL, 0, 1); ts_gc_root(&f);
   char label[48]; snprintf(label, sizeof label, "get %s", name);
-  ts_set_fn_meta(f, 0, label);
+  ts_set_fn_meta(f, 0, strdup(label));   /* the function keeps the pointer */
   ts_define_accessor_attr(proto, ts_intern_field(name, (uint32_t)strlen(name)), f, TS_UNDEFINED, 1, 0, 0, 1);
   ts_gc_unroot(2);
 }
@@ -974,7 +975,9 @@ tsv ts_regexp_escape_tsv(tsv v){
     int lone = (c >= 0xD800u && c <= 0xDFFFu) &&
       !((c <= 0xDBFFu && i + 1 < n && ts_str_cu_at_view(sv, i + 1) >= 0xDC00u && ts_str_cu_at_view(sv, i + 1) <= 0xDFFFu) ||
         (c >= 0xDC00u && i > 0 && ts_str_cu_at_view(sv, i - 1) >= 0xD800u && ts_str_cu_at_view(sv, i - 1) <= 0xDBFFu));
-    if ((first && alnum) || (punct && c < 0x80) || (ws && c < 0x100) ){
+    if (c >= 9 && c <= 13){
+      out[k++] = '\\'; out[k++] = (uint16_t)"tnvfr"[c - 9];
+    } else if ((first && alnum) || (punct && c < 0x80) || (ws && c < 0x100) ){
       out[k++] = '\\'; out[k++] = 'x'; out[k++] = (uint16_t)hexd[(c >> 4) & 15]; out[k++] = (uint16_t)hexd[c & 15];
     } else if (syntax){
       out[k++] = '\\'; out[k++] = (uint16_t)c;
