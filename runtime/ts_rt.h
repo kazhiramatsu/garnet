@@ -1256,12 +1256,20 @@ typedef struct ts_arraybuffer {
   uint8_t* bytes;
   uint32_t byte_length;
   uint8_t shared;
+  uint8_t resizable;        /* made with maxByteLength: `bytes` holds that many, it never moves */
+  uint8_t detached;
+  uint32_t max_byte_length;
 } ts_arraybuffer;
 typedef struct ts_typedarray {
   ts_obj_common o;
   uint8_t* data;            /* bytes + byte_offset of the buffer */
   uint32_t length, byte_offset;
   uint8_t elem;             /* TS_TA_* */
+  /* `length` is the live one for every reader: a resize or a detach rewrites it in each view of the
+     buffer, so an element access has one bound to test (docs/resizable_buffers_design.md) */
+  uint8_t tracking;         /* the length follows the buffer */
+  uint8_t out_of_bounds;    /* length 0 until the buffer covers the view again; a detached buffer's for good */
+  uint32_t fixed_length;
   tsv buffer;
 } ts_typedarray;
 static inline int ts_is_typed_array(tsv v){
@@ -1580,6 +1588,7 @@ tsv  ts_regexp_proto(void);
 tsv  ts_object_group_by(tsv* a, int n);
 tsv  ts_map_group_by(tsv* a, int n);
 tsv  ts_new_array_buffer_options(tsv length, tsv options, int shared);
+void ts_track_buffer_views(void);   /* the program can detach a buffer: every view is registered with it */
 tsv  ts_symbol_proto(void);
 tsv  ts_date_proto(void);
 void ts_date_ctor_link(tsv ctor);   /* Date.prototype and its `constructor` */

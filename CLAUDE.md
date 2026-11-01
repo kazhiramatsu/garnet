@@ -178,14 +178,11 @@ Rust in §315; selfhost is kept as a performance metric).
   no `freeze` read or spelled out) emits no frozen test on typed stores; `O[k](instance)` with `k`
   computed at run time and `O` obtained through `.constructor` is a TypeError at the freeze (V8 freezes,
   Session 362).
-- A symbol through an `any` receiver: `.description` reads undefined and `.toString()` is a TypeError
-  (the typed forms work; there is no `Symbol.prototype` object).
 - A class extending an expression, a built-in other than the Error kinds or a value, and a class whose
   methods or static initializers capture a function's locals, is a value made at run time
-  (`docs/dynamic_classes_design.md`): nothing types its instances, they are read by key. `extends String`
-  and `extends Date` construct, but a `String` base has no wrapper behind it (a TypeError at the definition)
-  and a `Date` has no methods on `Date.prototype` to find by key (a TypeError at the call); `super()` inside
-  an arrow function is a compile-time reject there. A promise subclass's `then` gives a plain promise.
+  (`docs/dynamic_classes_design.md`): nothing types its instances, they are read by key. A `String` base has
+  no wrapper behind it (a TypeError at the definition); `super()` inside an arrow function is a compile-time
+  reject there. A promise subclass's `then` gives a plain promise.
 - A `let` or `const` read through a closure before its declaration ran reads undefined (V8: a
   ReferenceError); a read or a write in the same function, a parameter default among them, throws.
 - `o.__proto__` and `o["__proto__"]` read undefined (V8: the prototype through the accessor);

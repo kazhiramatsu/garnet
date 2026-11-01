@@ -1236,6 +1236,10 @@ fn emit_program_with_string_plans(
         // longer keep in frames (docs/conservative_roots_design.md)
         s.push_str("  g_conservative_roots = 1;\n");
     }
+    // a program that can detach a buffer has every view registered with it (docs/resizable_buffers_design.md)
+    if program.fields.iter().any(|f| matches!(f.name.as_deref(), Some("transfer") | Some("transferToFixedLength"))) {
+        s.push_str("  ts_track_buffer_views();\n");
+    }
     s.push_str("  ts_setup_globals();\n");
     if site_stats_enabled() {
         s.push_str("  ts_site_stats_init((const char**)FN_NAME, (uint32_t)(sizeof(FN_NAME) / sizeof(FN_NAME[0])));\n");

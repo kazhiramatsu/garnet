@@ -6924,7 +6924,7 @@ static void gc_free_cell_payload(ts_gc_header* h){
   }
   else if (h->kind==TS_KIND_ARRAYBUFFER){
     ts_arraybuffer* ab=(ts_arraybuffer*)h;
-    if (ab->shared) munmap(ab->bytes, sab_mapped_bytes(ab->byte_length)); else free(ab->bytes);
+    if (ab->shared) munmap(ab->bytes, sab_mapped_bytes(ab->resizable ? ab->max_byte_length : ab->byte_length)); else free(ab->bytes);
     ab->bytes = NULL; props_release_dead(&ab->o);
   }
   else if (h->kind==TS_KIND_TYPEDARRAY){ props_release_dead(&((ts_typedarray*)h)->o); }
@@ -10912,8 +10912,7 @@ static tsv dp_setYear(tsv* a, int n){
   double u = NAN;
   if (y == y){
     t = t != t ? 0.0 : t + date_offset(t);
-    double yy, unused = 0.0; int mo, d;
-    (void)unused;
+    double yy; int mo, d;
     date_civil(floor(t / DATE_MS_DAY), &yy, &mo, &d);
     u = date_time_clip(date_utc_of_local(date_make_date(date_make_day(date_full_year(y), (double)(mo - 1), (double)d), date_floor_mod(t, DATE_MS_DAY))));
   }
@@ -12035,7 +12034,7 @@ static int g_has_wrappers;   /* a Number or Boolean object exists: the tests for
 static uint8_t* g_field_hidden = NULL;
 static int field_name_is_internal(const char* n, uint32_t len){
   static const char* const names[] = {
-    "__value", "__date_ms", "__coro", "__timeoutMs", "__body", "__garnet", "__garnet_json",
+    "__value", "__date_ms", "__views", "__coro", "__timeoutMs", "__body", "__garnet", "__garnet_json",
     "__garnet_node", "__garnet_metal", "__promise_resolver_done", "__generator_return_tag",
     "__generator_return_value", "__text_encoder", "__text_decoder_encoding", "__text_decoder_fatal",
     "__text_decoder_ignore_bom", "__array_iterator_source", "__array_iterator_index",
@@ -16594,6 +16593,7 @@ static inline ts_typedarray* ta_ptr(tsv v){ return (ts_typedarray*)ts_ptr(v); }
 static tsv ta_require(tsv v, const char* method){
   (void)method;
   if (!ts_is_typed_array(v)) ts_throw_type_error_msg("this is not a typed array.");
+  if (TS_RT_UNLIKELY(((ts_typedarray*)ts_ptr(v))->out_of_bounds)) ts_throw_type_error_msg("Cannot perform the operation on a detached or out-of-bounds typed array");
   return v;
 }
 /* Element load and store (the header's in-line forms with the view's element
@@ -16624,11 +16624,12 @@ static void ta_range_error_num(const char* fmt, double d){
   snprintf(buf, sizeof buf, fmt, num);
   ts_throw_range_error_msg(buf);
 }
-static tsv ta_new_buffer(double length, int shared){
-  if (!(length >= 0) || length != floor(length) || length > 4294967295.0)
+/* `max` < 0: a fixed length. Otherwise the whole of max is reserved, so a resize moves nothing. */
+static tsv ta_new_buffer_max(double length, double max, int shared){
+  if (!(length >= 0) || length != floor(length) || length > 4294967295.0 || max > 4294967295.0)
     ts_throw_range_error_msg("Array buffer allocation failed");
   ta_protos_init();
-  uint32_t n = (uint32_t)length;
+  uint32_t n = max >= 0 ? (uint32_t)max : (uint32_t)length;
   uint8_t* bytes;
   if (shared){
     /* A SharedArrayBuffer's store is shared memory (docs/fork_workers_design.md,
@@ -16647,11 +16648,48 @@ static tsv ta_new_buffer(double length, int shared){
   ts_arraybuffer* b = (ts_arraybuffer*)gc_alloc(sizeof(ts_arraybuffer), TS_KIND_ARRAYBUFFER);
   g_heap_bytes += n;   /* after the allocation: a collection resets the count */
   if (TS_RT_UNLIKELY(g_heap_bytes >= g_full_threshold_bytes)) gc_young_limits_force();   /* the trigger at the next young cell */
-  b->bytes = bytes; b->byte_length = n; b->shared = (uint8_t)(shared ? 1 : 0);
+  b->bytes = bytes; b->byte_length = (uint32_t)length; b->shared = (uint8_t)(shared ? 1 : 0);
+  b->resizable = max >= 0; b->detached = 0; b->max_byte_length = n;
   b->o.shape = TS_SHAPE_EMPTY;
   tsv bv = ts_obj(b);
   obj_link_fresh_proto(bv, shared ? g_sab_proto : g_arraybuffer_proto);
   return bv;
+}
+static tsv ta_new_buffer(double length, int shared){ return ta_new_buffer_max(length, -1.0, shared); }
+/* The views of a resizable buffer, and of any buffer in a program that can detach one: held by the buffer, under
+   a hidden key, for a resize or a detach to rewrite. A program with neither pays nothing on a view. */
+static int g_track_views = 0;
+void ts_track_buffer_views(void){ g_track_views = 1; }
+static ts_key ab_views_key(void){ static ts_key k; if (!k) k = ts_intern_field("__views", 7); return k; }
+static void ab_register_view(tsv buffer, tsv view){
+  ts_gc_root(&buffer); ts_gc_root(&view);
+  tsv list = ts_get(buffer, ab_views_key());
+  if (!ts_is_indexed_array_fast(list)){
+    list = ts_new_array(0);
+    ts_gc_root(&list);
+    ts_define_data(buffer, ab_views_key(), list, 0, 1, 1);
+    ts_gc_unroot(1);
+  }
+  ts_array_push(list, view);
+  ts_gc_unroot(2);
+}
+static void ab_refresh_views(tsv buffer){
+  ts_arraybuffer* b = (ts_arraybuffer*)ts_ptr(buffer);
+  tsv list = ts_get(buffer, ab_views_key());
+  if (!ts_is_indexed_array_fast(list)) return;
+  uint32_t n = ts_array_len(list), blen = b->byte_length;
+  for (uint32_t i = 0; i < n; i++){
+    ts_typedarray* t = (ts_typedarray*)ts_ptr(ts_array_get(list, i));
+    uint32_t size = g_ta_size[t->elem];
+    if (b->detached){ t->length = 0; t->out_of_bounds = 1; t->data = NULL; continue; }
+    if (t->tracking){
+      t->out_of_bounds = t->byte_offset > blen;
+      t->length = t->out_of_bounds ? 0 : (blen - t->byte_offset) / size;
+    } else {
+      t->out_of_bounds = (uint64_t)t->byte_offset + (uint64_t)t->fixed_length * size > blen;
+      t->length = t->out_of_bounds ? 0 : t->fixed_length;
+    }
+  }
 }
 /* A SharedArrayBuffer of n bytes (the runtime's tests, the host). */
 tsv ts_new_shared_array_buffer(uint32_t n){ return ta_new_buffer((double)n, 1); }
@@ -16661,12 +16699,14 @@ static tsv ta_new_view(int elem, tsv buffer, uint32_t byte_offset, uint32_t leng
   ts_typedarray* t = (ts_typedarray*)gc_alloc(sizeof(ts_typedarray), TS_KIND_TYPEDARRAY);
   ts_arraybuffer* b = (ts_arraybuffer*)ts_ptr(buffer);
   t->buffer = buffer; t->elem = (uint8_t)elem;
-  t->byte_offset = byte_offset; t->length = length;
+  t->byte_offset = byte_offset; t->length = length; t->fixed_length = length;
+  t->tracking = 0; t->out_of_bounds = 0;
   t->data = b->bytes + byte_offset;
   t->o.shape = TS_SHAPE_EMPTY;
   tsv tv = ts_obj(t);
   ts_write_barrier(tv, buffer);
   obj_link_fresh_proto(tv, g_ta_proto[elem]);
+  if (TS_RT_UNLIKELY(b->resizable || g_track_views)){ ts_gc_root(&tv); ab_register_view(buffer, tv); ts_gc_unroot(1); }
   ts_gc_unroot(1);
   return tv;
 }
@@ -16714,8 +16754,16 @@ tsv ts_new_typed_array(int elem, tsv* args, int n){
     }
     double new_length = -1;
     if (n > 2 && !ts_is_undef(args[2])) new_length = ta_to_index(args[2], 0);
+    if (((ts_arraybuffer*)ts_ptr(a0))->detached) ts_throw_type_error_msg("Cannot perform Construct on a detached ArrayBuffer");
     uint32_t blen = ((ts_arraybuffer*)ts_ptr(a0))->byte_length;
     uint32_t length;
+    if (new_length < 0 && ((ts_arraybuffer*)ts_ptr(a0))->resizable){
+      if (off > blen) ta_range_error_num("Start offset %s is outside the bounds of the buffer", off);
+      tsv tracked = ta_new_view(elem, a0, (uint32_t)off, (uint32_t)((blen - off) / size));
+      ta_ptr(tracked)->tracking = 1;
+      ts_gc_unroot(1);
+      return tracked;
+    }
     if (new_length < 0){
       if (blen % size != 0){
         snprintf(msg, sizeof msg, "byte length of %s should be a multiple of %u", g_ta_name[elem], size);
@@ -16751,11 +16799,14 @@ tsv ts_new_typed_array(int elem, tsv* args, int n){
 tsv ts_new_array_buffer(tsv length, int shared){
   return ta_new_buffer(ts_is_undef(length) ? 0 : ta_to_index(length, 1), shared);
 }
-/* `new ArrayBuffer(n, { maxByteLength })`: no resizable buffers yet, a catchable TypeError where one is made */
+/* `new ArrayBuffer(n, { maxByteLength })` (docs/resizable_buffers_design.md) */
 tsv ts_new_array_buffer_options(tsv length, tsv options, int shared){
-  if (ts_object_like(options) && !ts_is_symbol(options) && !ts_is_undef(ts_get(options, ts_intern_field("maxByteLength", 13))))
-    ts_throw_type_error_msg("A resizable ArrayBuffer is not supported");
-  return ts_new_array_buffer(length, shared);
+  double n = ts_is_undef(length) ? 0 : ta_to_index(length, 1);
+  tsv max = ts_object_like(options) && !ts_is_symbol(options) ? ts_get(options, ts_intern_field("maxByteLength", 13)) : TS_UNDEFINED;
+  if (ts_is_undef(max)) return ta_new_buffer(n, shared);
+  double m = ta_to_index(max, 1);
+  if (n > m) ts_throw_range_error_msg("Invalid array buffer max length");
+  return ta_new_buffer_max(n, m, shared);
 }
 static uint32_t ta_source_length(tsv src){
   if (ts_is_typed_array(src)) return ta_ptr(src)->length;
@@ -17202,7 +17253,7 @@ static tsv ta_get_this(tsv* a, int n, const char* what){
 }
 static tsv ta_g_buffer(tsv* a, int n){ return ta_ptr(ta_get_this(a, n, "buffer"))->buffer; }
 static tsv ta_g_length(tsv* a, int n){ return ts_num((double)ta_ptr(ta_get_this(a, n, "length"))->length); }
-static tsv ta_g_byte_offset(tsv* a, int n){ return ts_num((double)ta_ptr(ta_get_this(a, n, "byteOffset"))->byte_offset); }
+static tsv ta_g_byte_offset(tsv* a, int n){ ts_typedarray* t = ta_ptr(ta_get_this(a, n, "byteOffset")); return ts_num(t->out_of_bounds ? 0.0 : (double)t->byte_offset); }
 static tsv ta_g_byte_length(tsv* a, int n){
   ts_typedarray* t = ta_ptr(ta_get_this(a, n, "byteLength"));
   return ts_num((double)t->length * g_ta_size[t->elem]);
@@ -17221,8 +17272,85 @@ static void ta_getter(tsv p, ts_key key, const char* name, ts_code fn){
 static tsv ta_m_values(tsv* a, int n){ return ts_array_iter_new(ta_require(n ? a[0] : TS_UNDEFINED, "values"), 0); }
 static tsv ta_m_keys(tsv* a, int n){ return ts_array_iter_new(ta_require(n ? a[0] : TS_UNDEFINED, "keys"), 1); }
 static tsv ta_m_entries(tsv* a, int n){ return ts_array_iter_new(ta_require(n ? a[0] : TS_UNDEFINED, "entries"), 2); }
+static ts_arraybuffer* ab_this(tsv* a, int n, int shared, const char* what){
+  tsv v = n > 0 ? a[0] : TS_UNDEFINED;
+  if (!ts_is_array_buffer(v) || ((ts_arraybuffer*)ts_ptr(v))->shared != shared){
+    char m[96];
+    snprintf(m, sizeof m, "Method %s.prototype.%s called on incompatible receiver", shared ? "SharedArrayBuffer" : "ArrayBuffer", what);
+    ts_throw_type_error_msg(m);
+  }
+  return (ts_arraybuffer*)ts_ptr(v);
+}
+static tsv ab_m_resize(tsv* a, int n){
+  ts_arraybuffer* b = ab_this(a, n, 0, "resize");
+  if (!b->resizable) ts_throw_type_error_msg("Method ArrayBuffer.prototype.resize called on a fixed-length buffer");
+  double want = ta_to_index(n > 1 ? a[1] : TS_UNDEFINED, 1);
+  b = (ts_arraybuffer*)ts_ptr(a[0]);
+  if (b->detached) ts_throw_type_error_msg("Cannot perform ArrayBuffer.prototype.resize on a detached ArrayBuffer");
+  if (want > (double)b->max_byte_length) ts_throw_range_error_msg("Invalid array buffer length");
+  uint32_t len = (uint32_t)want;
+  if (len < b->byte_length) memset(b->bytes + len, 0, b->byte_length - len);   /* what grows back is zeros */
+  b->byte_length = len;
+  ab_refresh_views(a[0]);
+  return TS_UNDEFINED;
+}
+static tsv ab_m_grow(tsv* a, int n){
+  ts_arraybuffer* b = ab_this(a, n, 1, "grow");
+  if (!b->resizable) ts_throw_type_error_msg("Method SharedArrayBuffer.prototype.grow called on a fixed-length buffer");
+  double want = ta_to_index(n > 1 ? a[1] : TS_UNDEFINED, 1);
+  b = (ts_arraybuffer*)ts_ptr(a[0]);
+  if (want > (double)b->max_byte_length || want < (double)b->byte_length) ts_throw_range_error_msg("Invalid array buffer length");
+  b->byte_length = (uint32_t)want;
+  ab_refresh_views(a[0]);
+  return TS_UNDEFINED;
+}
+/* transfer, transferToFixedLength: the bytes move to a new buffer, this one is detached */
+static tsv ab_transfer(tsv* a, int n, int fixed, const char* what){
+  ts_arraybuffer* b = ab_this(a, n, 0, what);
+  tsv self = a[0]; ts_gc_root(&self);
+  double want = n > 1 && !ts_is_undef(a[1]) ? ta_to_index(a[1], 1) : (double)b->byte_length;
+  b = (ts_arraybuffer*)ts_ptr(self);
+  if (b->detached){ char m[96]; snprintf(m, sizeof m, "Cannot perform ArrayBuffer.prototype.%s on a detached ArrayBuffer", what); ts_throw_type_error_msg(m); }
+  double max = !fixed && b->resizable ? (double)b->max_byte_length : -1.0;
+  if (max >= 0 && want > max) ts_throw_range_error_msg("Invalid array buffer length");
+  tsv out = ta_new_buffer_max(want, max, 0);
+  b = (ts_arraybuffer*)ts_ptr(self);
+  ts_arraybuffer* o = (ts_arraybuffer*)ts_ptr(out);
+  uint32_t keep = b->byte_length < o->byte_length ? b->byte_length : o->byte_length;
+  if (keep) memcpy(o->bytes, b->bytes, keep);
+  free(b->bytes);
+  b->bytes = NULL; b->byte_length = 0; b->detached = 1;
+  ab_refresh_views(self);
+  ts_gc_unroot(1);
+  return out;
+}
+static tsv ab_m_transfer(tsv* a, int n){ return ab_transfer(a, n, 0, "transfer"); }
+static tsv ab_m_transfer_fixed(tsv* a, int n){ return ab_transfer(a, n, 1, "transferToFixedLength"); }
+static tsv ab_g_byte_length(tsv* a, int n){ return ts_num((double)ab_this(a, n, 0, "byteLength")->byte_length); }
+static tsv ab_g_max(tsv* a, int n){ ts_arraybuffer* b = ab_this(a, n, 0, "maxByteLength"); return ts_num(b->detached ? 0.0 : (double)b->max_byte_length); }
+static tsv ab_g_resizable(tsv* a, int n){ return ts_bool(ab_this(a, n, 0, "resizable")->resizable); }
+static tsv ab_g_detached(tsv* a, int n){ return ts_bool(ab_this(a, n, 0, "detached")->detached); }
+static tsv sab_g_byte_length(tsv* a, int n){ return ts_num((double)ab_this(a, n, 1, "byteLength")->byte_length); }
+static tsv sab_g_max(tsv* a, int n){ return ts_num((double)ab_this(a, n, 1, "maxByteLength")->max_byte_length); }
+static tsv sab_g_growable(tsv* a, int n){ return ts_bool(ab_this(a, n, 1, "growable")->resizable); }
+static void ta_proto_method(tsv proto, const char* name, ts_code fn, uint32_t arity);
+static void ab_getters_init(void){
+  ts_key mx = ts_intern_field("maxByteLength", 13);
+  ta_proto_method(g_arraybuffer_proto, "resize", ab_m_resize, 1);
+  ta_proto_method(g_arraybuffer_proto, "transfer", ab_m_transfer, 0);
+  ta_proto_method(g_arraybuffer_proto, "transferToFixedLength", ab_m_transfer_fixed, 0);
+  ta_proto_method(g_sab_proto, "grow", ab_m_grow, 1);
+  ta_getter(g_arraybuffer_proto, g_ta_k_byte_length, "get byteLength", ab_g_byte_length);
+  ta_getter(g_arraybuffer_proto, mx, "get maxByteLength", ab_g_max);
+  ta_getter(g_arraybuffer_proto, ts_intern_field("resizable", 9), "get resizable", ab_g_resizable);
+  ta_getter(g_arraybuffer_proto, ts_intern_field("detached", 8), "get detached", ab_g_detached);
+  ta_getter(g_sab_proto, g_ta_k_byte_length, "get byteLength", sab_g_byte_length);
+  ta_getter(g_sab_proto, mx, "get maxByteLength", sab_g_max);
+  ta_getter(g_sab_proto, ts_intern_field("growable", 8), "get growable", sab_g_growable);
+}
 static tsv ab_m_slice(tsv* a, int n){
   tsv b = n ? a[0] : TS_UNDEFINED;
+  if (n > 0 && ts_is_array_buffer(a[0]) && ((ts_arraybuffer*)ts_ptr(a[0]))->detached) ts_throw_type_error_msg("Cannot perform ArrayBuffer.prototype.slice on a detached ArrayBuffer");
   if (!ts_is_array_buffer(b)) ts_throw_type_error_msg("ArrayBuffer.prototype.slice called on incompatible receiver");
   ts_gc_root(&b);
   uint32_t len = ((ts_arraybuffer*)ts_ptr(b))->byte_length;
@@ -17302,6 +17430,7 @@ static void ta_protos_init(void){
   if (ts_proto_ref(g_object_proto_v)){ ts_set_proto(g_arraybuffer_proto, g_object_proto_v); ts_set_proto(g_sab_proto, g_object_proto_v); }
   ta_proto_method(g_arraybuffer_proto, "slice", ab_m_slice, 2);
   ta_proto_method(g_sab_proto, "slice", ab_m_slice, 2);
+  ab_getters_init();
   ta_ctors_init();
 }
 /* The prototypes, for `x instanceof Uint8Array` (protoobj.typedarray:N). */
@@ -18051,7 +18180,7 @@ static tsv ta_get_key(tsv obj, ts_key key){
   if (own) return ta_slot_value(obj, *own);
   if (key == g_ta_k_length) return ts_num((double)t->length);
   if (key == g_ta_k_byte_length) return ts_num((double)t->length * g_ta_size[t->elem]);
-  if (key == g_ta_k_byte_offset) return ts_num((double)t->byte_offset);
+  if (key == g_ta_k_byte_offset) return ts_num(t->out_of_bounds ? 0.0 : (double)t->byte_offset);
   if (key == g_ta_k_buffer) return t->buffer;
   if (key == TS_KEY_WKSYM(TS_WKSYM_TO_STRING_TAG)) return ts_new_string(g_ta_name[t->elem], (uint32_t)strlen(g_ta_name[t->elem]));
   tsv found;
@@ -18565,37 +18694,43 @@ void ts_function_proto_register(ts_key method_key, const char* name, ts_code fn)
    implementation as the statically-typed `s.method()` fast path. Numeric results
    are boxed (ts_num) and boolean results wrapped (ts_bool) to match the value
    calling convention. */
-tsv ts_strproto_toUpperCase(tsv* a, int n){ (void)n; return ts_str_toupper(a[0]); }
-tsv ts_strproto_toLowerCase(tsv* a, int n){ (void)n; return ts_str_tolower(a[0]); }
-tsv ts_strproto_toLocaleUpperCase(tsv* a, int n){ (void)n; return ts_str_toupper(a[0]); }
-tsv ts_strproto_toLocaleLowerCase(tsv* a, int n){ (void)n; return ts_str_tolower(a[0]); }
-tsv ts_strproto_slice(tsv* a, int n){ return ts_str_slice(a[0], n>1?ts_number_coerce(a[1]):0, n>2?ts_number_coerce(a[2]):0, n>2 && !ts_is_undef(a[2])); }
-tsv ts_strproto_indexOf(tsv* a, int n){ return ts_num(ts_str_indexof(a[0], n>1?a[1]:TS_UNDEFINED, n>2?ts_to_num(a[2]):0, n>2)); }
-tsv ts_strproto_lastIndexOf(tsv* a, int n){ return ts_num(ts_str_lastindexof(a[0], n>1?a[1]:TS_UNDEFINED, n>2?ts_to_num(a[2]):0, n>2)); }
-tsv ts_strproto_includes(tsv* a, int n){ return ts_bool(ts_str_includes(a[0], n>1?a[1]:TS_UNDEFINED, n>2?ts_to_num(a[2]):0, n>2)); }
-tsv ts_strproto_substring(tsv* a, int n){ return ts_str_substring(a[0], n>1?ts_number_coerce(a[1]):0, n>2?ts_number_coerce(a[2]):0, n>2 && !ts_is_undef(a[2])); }
-tsv ts_strproto_substr(tsv* a, int n){ return ts_str_substr(n>0?a[0]:TS_UNDEFINED, n>1?a[1]:TS_UNDEFINED, n>2?a[2]:TS_UNDEFINED); }
+/* A String.prototype method called on anything: RequireObjectCoercible, then ToString of `this`, first thing */
+static void str_this_slow(tsv* a, int n){
+  if (n < 1 || ts_is_undef(a[0]) || ts_is_null(a[0])) ts_throw_type_error_msg("String.prototype method called on null or undefined");
+  a[0] = ts_to_string_v(a[0]);
+}
+#define STR_THIS(a, n) do { if (TS_RT_UNLIKELY((n) < 1 || !ts_is_str((a)[0]))) str_this_slow(a, n); } while (0)
+tsv ts_strproto_toUpperCase(tsv* a, int n){ STR_THIS(a, n); (void)n; return ts_str_toupper(a[0]); }
+tsv ts_strproto_toLowerCase(tsv* a, int n){ STR_THIS(a, n); (void)n; return ts_str_tolower(a[0]); }
+tsv ts_strproto_toLocaleUpperCase(tsv* a, int n){ STR_THIS(a, n); (void)n; return ts_str_toupper(a[0]); }
+tsv ts_strproto_toLocaleLowerCase(tsv* a, int n){ STR_THIS(a, n); (void)n; return ts_str_tolower(a[0]); }
+tsv ts_strproto_slice(tsv* a, int n){ STR_THIS(a, n); return ts_str_slice(a[0], n>1?ts_number_coerce(a[1]):0, n>2?ts_number_coerce(a[2]):0, n>2 && !ts_is_undef(a[2])); }
+tsv ts_strproto_indexOf(tsv* a, int n){ STR_THIS(a, n); return ts_num(ts_str_indexof(a[0], n>1?a[1]:TS_UNDEFINED, n>2?ts_to_num(a[2]):0, n>2)); }
+tsv ts_strproto_lastIndexOf(tsv* a, int n){ STR_THIS(a, n); return ts_num(ts_str_lastindexof(a[0], n>1?a[1]:TS_UNDEFINED, n>2?ts_to_num(a[2]):0, n>2)); }
+tsv ts_strproto_includes(tsv* a, int n){ STR_THIS(a, n); return ts_bool(ts_str_includes(a[0], n>1?a[1]:TS_UNDEFINED, n>2?ts_to_num(a[2]):0, n>2)); }
+tsv ts_strproto_substring(tsv* a, int n){ STR_THIS(a, n); return ts_str_substring(a[0], n>1?ts_number_coerce(a[1]):0, n>2?ts_number_coerce(a[2]):0, n>2 && !ts_is_undef(a[2])); }
+tsv ts_strproto_substr(tsv* a, int n){ STR_THIS(a, n); return ts_str_substr(n>0?a[0]:TS_UNDEFINED, n>1?a[1]:TS_UNDEFINED, n>2?a[2]:TS_UNDEFINED); }
 tsv ts_strproto_toString(tsv* a, int n){ return ts_str_value(n>0?a[0]:TS_UNDEFINED); }
-tsv ts_strproto_startsWith(tsv* a, int n){ return ts_bool(ts_str_startswith(a[0], n>1?a[1]:TS_UNDEFINED, n>2?ts_to_num(a[2]):0, n>2)); }
-tsv ts_strproto_endsWith(tsv* a, int n){ return ts_bool(ts_str_endswith(a[0], n>1?a[1]:TS_UNDEFINED, n>2?ts_to_num(a[2]):0, n>2)); }
-tsv ts_strproto_charAt(tsv* a, int n){ return ts_str_charat(a[0], n>1?ts_to_num(a[1]):0); }
-tsv ts_strproto_charCodeAt(tsv* a, int n){ return ts_num(ts_str_charcodeat(a[0], n>1?ts_number_coerce(a[1]):0)); }
-tsv ts_strproto_codePointAt(tsv* a, int n){ return ts_str_codepointat(a[0], n>1?ts_to_num(a[1]):0); }
-tsv ts_strproto_at(tsv* a, int n){ return ts_str_at(a[0], n>1?ts_to_num(a[1]):0); }
-tsv ts_strproto_isWellFormed(tsv* a, int n){ (void)n; return ts_bool(ts_str_is_well_formed(a[0])); }
-tsv ts_strproto_toWellFormed(tsv* a, int n){ (void)n; return ts_str_to_well_formed(a[0]); }
-tsv ts_strproto_concat(tsv* a, int n){ tsv r=a[0]; for (int i=1;i<n;i++) r=ts_str_concat(r, a[i]); return r; }
-tsv ts_strproto_repeat(tsv* a, int n){ return ts_str_repeat(a[0], n>1?ts_to_num(a[1]):0); }
-tsv ts_strproto_localeCompare(tsv* a, int n){ return ts_num(ts_str_locale_compare(a[0], n>1?a[1]:TS_UNDEFINED)); }
-tsv ts_strproto_trim(tsv* a, int n){ (void)n; return ts_str_trim(a[0]); }
-tsv ts_strproto_trimStart(tsv* a, int n){ (void)n; return ts_str_trimstart(a[0]); }
-tsv ts_strproto_trimEnd(tsv* a, int n){ (void)n; return ts_str_trimend(a[0]); }
-tsv ts_strproto_trimLeft(tsv* a, int n){ (void)n; return ts_str_trimstart(a[0]); }
-tsv ts_strproto_trimRight(tsv* a, int n){ (void)n; return ts_str_trimend(a[0]); }
-tsv ts_strproto_split(tsv* a, int n){ return ts_str_split(a[0], n>1?a[1]:TS_UNDEFINED, n>2?a[2]:TS_UNDEFINED); }
-tsv ts_strproto_padStart(tsv* a, int n){ return ts_str_padstart(a[0], n>1?ts_to_num(a[1]):0, n>2?a[2]:TS_UNDEFINED); }
-tsv ts_strproto_padEnd(tsv* a, int n){ return ts_str_padend(a[0], n>1?ts_to_num(a[1]):0, n>2?a[2]:TS_UNDEFINED); }
-tsv ts_strproto_replace(tsv* a, int n){ return ts_str_replace(a[0], n>1?a[1]:TS_UNDEFINED, n>2?a[2]:TS_UNDEFINED, 0); }
+tsv ts_strproto_startsWith(tsv* a, int n){ STR_THIS(a, n); return ts_bool(ts_str_startswith(a[0], n>1?a[1]:TS_UNDEFINED, n>2?ts_to_num(a[2]):0, n>2)); }
+tsv ts_strproto_endsWith(tsv* a, int n){ STR_THIS(a, n); return ts_bool(ts_str_endswith(a[0], n>1?a[1]:TS_UNDEFINED, n>2?ts_to_num(a[2]):0, n>2)); }
+tsv ts_strproto_charAt(tsv* a, int n){ STR_THIS(a, n); return ts_str_charat(a[0], n>1?ts_to_num(a[1]):0); }
+tsv ts_strproto_charCodeAt(tsv* a, int n){ STR_THIS(a, n); return ts_num(ts_str_charcodeat(a[0], n>1?ts_number_coerce(a[1]):0)); }
+tsv ts_strproto_codePointAt(tsv* a, int n){ STR_THIS(a, n); return ts_str_codepointat(a[0], n>1?ts_to_num(a[1]):0); }
+tsv ts_strproto_at(tsv* a, int n){ STR_THIS(a, n); return ts_str_at(a[0], n>1?ts_to_num(a[1]):0); }
+tsv ts_strproto_isWellFormed(tsv* a, int n){ STR_THIS(a, n); (void)n; return ts_bool(ts_str_is_well_formed(a[0])); }
+tsv ts_strproto_toWellFormed(tsv* a, int n){ STR_THIS(a, n); (void)n; return ts_str_to_well_formed(a[0]); }
+tsv ts_strproto_concat(tsv* a, int n){ STR_THIS(a, n); tsv r=a[0]; for (int i=1;i<n;i++) r=ts_str_concat(r, a[i]); return r; }
+tsv ts_strproto_repeat(tsv* a, int n){ STR_THIS(a, n); return ts_str_repeat(a[0], n>1?ts_to_num(a[1]):0); }
+tsv ts_strproto_localeCompare(tsv* a, int n){ STR_THIS(a, n); return ts_num(ts_str_locale_compare(a[0], n>1?a[1]:TS_UNDEFINED)); }
+tsv ts_strproto_trim(tsv* a, int n){ STR_THIS(a, n); (void)n; return ts_str_trim(a[0]); }
+tsv ts_strproto_trimStart(tsv* a, int n){ STR_THIS(a, n); (void)n; return ts_str_trimstart(a[0]); }
+tsv ts_strproto_trimEnd(tsv* a, int n){ STR_THIS(a, n); (void)n; return ts_str_trimend(a[0]); }
+tsv ts_strproto_trimLeft(tsv* a, int n){ STR_THIS(a, n); (void)n; return ts_str_trimstart(a[0]); }
+tsv ts_strproto_trimRight(tsv* a, int n){ STR_THIS(a, n); (void)n; return ts_str_trimend(a[0]); }
+tsv ts_strproto_split(tsv* a, int n){ STR_THIS(a, n); return ts_str_split(a[0], n>1?a[1]:TS_UNDEFINED, n>2?a[2]:TS_UNDEFINED); }
+tsv ts_strproto_padStart(tsv* a, int n){ STR_THIS(a, n); return ts_str_padstart(a[0], n>1?ts_to_num(a[1]):0, n>2?a[2]:TS_UNDEFINED); }
+tsv ts_strproto_padEnd(tsv* a, int n){ STR_THIS(a, n); return ts_str_padend(a[0], n>1?ts_to_num(a[1]):0, n>2?a[2]:TS_UNDEFINED); }
+tsv ts_strproto_replace(tsv* a, int n){ STR_THIS(a, n); return ts_str_replace(a[0], n>1?a[1]:TS_UNDEFINED, n>2?a[2]:TS_UNDEFINED, 0); }
 /* match / matchAll / search on a dynamic receiver: a RegExp argument through the adapter, a
    string pattern as a RegExp made from it (matchAll adds the g flag), as the spec's
    String.prototype methods do */
@@ -18608,7 +18743,7 @@ static tsv ts_str_regexp_arg(tsv pat, const char* flags){
   ts_gc_unroot(1);
   return r;
 }
-tsv ts_strproto_match(tsv* a, int n){
+tsv ts_strproto_match(tsv* a, int n){ STR_THIS(a, n);
   if (!g_regexp_hooks) ts_throw_type_error_msg("RegExp support is not linked into this program");
   tsv s = ts_is_str(a[0]) ? a[0] : ts_to_string_v(a[0]); ts_gc_root(&s);
   tsv re = ts_str_regexp_arg(n>1?a[1]:TS_UNDEFINED, NULL); ts_gc_root(&re);
@@ -18616,7 +18751,7 @@ tsv ts_strproto_match(tsv* a, int n){
   ts_gc_unroot(2);
   return r;
 }
-tsv ts_strproto_matchAll(tsv* a, int n){
+tsv ts_strproto_matchAll(tsv* a, int n){ STR_THIS(a, n);
   if (!g_regexp_hooks) ts_throw_type_error_msg("RegExp support is not linked into this program");
   tsv s = ts_is_str(a[0]) ? a[0] : ts_to_string_v(a[0]); ts_gc_root(&s);
   tsv re = ts_str_regexp_arg(n>1?a[1]:TS_UNDEFINED, "g"); ts_gc_root(&re);
@@ -18624,7 +18759,7 @@ tsv ts_strproto_matchAll(tsv* a, int n){
   ts_gc_unroot(2);
   return r;
 }
-tsv ts_strproto_search(tsv* a, int n){
+tsv ts_strproto_search(tsv* a, int n){ STR_THIS(a, n);
   if (!g_regexp_hooks) ts_throw_type_error_msg("RegExp support is not linked into this program");
   tsv s = ts_is_str(a[0]) ? a[0] : ts_to_string_v(a[0]); ts_gc_root(&s);
   tsv re = ts_str_regexp_arg(n>1?a[1]:TS_UNDEFINED, NULL); ts_gc_root(&re);
@@ -18632,7 +18767,7 @@ tsv ts_strproto_search(tsv* a, int n){
   ts_gc_unroot(2);
   return ts_num(r);
 }
-tsv ts_strproto_replaceAll(tsv* a, int n){ return ts_str_replace(a[0], n>1?a[1]:TS_UNDEFINED, n>2?a[2]:TS_UNDEFINED, 1); }
+tsv ts_strproto_replaceAll(tsv* a, int n){ STR_THIS(a, n); return ts_str_replace(a[0], n>1?a[1]:TS_UNDEFINED, n>2?a[2]:TS_UNDEFINED, 1); }
 
 tsv ts_string_proto(void){ return ts_proto_ref(g_string_proto_v) ? g_string_proto_v : TS_NULL; }
 /* String.prototype[Symbol.iterator]: the string's code points, as for-of and spread see them
