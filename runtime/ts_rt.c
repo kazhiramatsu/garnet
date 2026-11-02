@@ -3466,8 +3466,14 @@ static inline void pref_store(tsv obj, ts_pref p, tsv val){
 /* Dictionary index (shape 0 only). */
 /* The index block: its capacity, then the entries. */
 static inline uint32_t prop_index_capacity(const ts_object* o){ return obj_map(o)->prop_index ? obj_map(o)->prop_index[0] : 0u; }
+/* The index of a dictionary: its capacity, the holes the entries hold, then the slots. A deletion leaves a hole:
+   the entry keeps its position under the key below (hidden, no value, no attributes, so every walk over the
+   entries passes it) and the slot that names it stops matching any lookup. The entries are compacted when they
+   are half holes, so a delete costs O(1) amortized and `len` bounds what the index holds. */
+#define PROP_INDEX_HDR 2u
+static ts_key g_prop_hole_key = 0xFFFFFFFFu;
 static void prop_index_put(ts_object* o, uint32_t prop_i){
-  uint32_t* entries = obj_map(o)->prop_index + 1;
+  uint32_t* entries = obj_map(o)->prop_index + PROP_INDEX_HDR;
   uint32_t mask = obj_map(o)->prop_index[0] - 1u;
   uint32_t slot = prop_key_hash(obj_map(o)->props[prop_i].key) & mask;
   while (entries[slot]) slot = (slot + 1u) & mask;
@@ -3484,11 +3490,16 @@ static void prop_index_rebuild(ts_object* o, uint32_t need){
   while (need * 4u >= cap * 3u) cap *= 2u;
   if (cap != old_cap){
     gc_owned_free(obj_map(o)->prop_index);
-    obj_map(o)->prop_index = (uint32_t*)gc_owned_alloc(&o->h, sizeof(uint32_t) * (cap + 1u));
+    obj_map(o)->prop_index = (uint32_t*)gc_owned_alloc(&o->h, sizeof(uint32_t) * (cap + PROP_INDEX_HDR));
   }
-  memset(obj_map(o)->prop_index, 0, sizeof(uint32_t) * (cap + 1u));
+  memset(obj_map(o)->prop_index, 0, sizeof(uint32_t) * (cap + PROP_INDEX_HDR));
   obj_map(o)->prop_index[0] = cap;
-  for (uint32_t i = 0; i < obj_map(o)->len; i++) prop_index_put(o, i);
+  uint32_t holes = 0;
+  for (uint32_t i = 0; i < obj_map(o)->len; i++){
+    if (obj_map(o)->props[i].key == g_prop_hole_key) holes++;
+    else prop_index_put(o, i);
+  }
+  obj_map(o)->prop_index[1] = holes;
 }
 static void prop_index_reserve(ts_object* o, uint32_t need){
   if (need < TS_PROP_INDEX_MIN) return;
@@ -3498,7 +3509,7 @@ static void prop_index_reserve(ts_object* o, uint32_t need){
 static int32_t prop_index_lookup(ts_object* o, ts_key key, uint32_t* probes){
   uint32_t p = 0;
   uint32_t mask = obj_map(o)->prop_index[0] - 1u;
-  const uint32_t* entries = obj_map(o)->prop_index + 1;
+  const uint32_t* entries = obj_map(o)->prop_index + PROP_INDEX_HDR;
   for (uint32_t slot = prop_key_hash(key) & mask; ; slot = (slot + 1u) & mask){
     p++;
     uint32_t entry = entries[slot];
@@ -5600,38 +5611,61 @@ static int ts_i64_to_str(long long v, char* buf){
    - 0 < n <= 21: the digits with the point after the n-th;
    - -6 < n <= 0: "0.", -n zeros, the digits;
    - otherwise the exponential form d[.ddd]e+/-(n-1).
-   The digits come from the smallest %.*e precision that round-trips. */
-/* tmp holds "[-]d[.ddd]e[+-]xx" (the correctly rounded form at some precision) that does not
-   read back as d. Tries the decimal one unit of the last digit above and below; on success
-   rewrites tmp with the neighbour that reads back as d and returns 1. */
-static int ts_fmt_num_neighbour(char* tmp, size_t n, double d){
-  char digits[24]; int k = 0; int neg = 0; const char* t = tmp;
-  if (*t == '-'){ neg = 1; t++; }
-  while (*t && *t != 'e' && *t != 'E'){ if (*t != '.') digits[k++] = *t; t++; }
-  if (*t != 'e' && *t != 'E') return 0;
-  int e10 = atoi(t + 1);
-  for (int dir = 1; dir >= -1; dir -= 2){
-    char c[24]; memcpy(c, digits, (size_t)k); int ce = e10;
-    if (dir > 0){
-      int i = k - 1;
-      while (i >= 0 && c[i] == '9'){ c[i] = '0'; i--; }
-      if (i >= 0) c[i]++;
-      else { /* 999.. + 1: one more digit, exponent up, digits 1000.. */ memset(c, '0', (size_t)k); c[0] = '1'; ce++; }
-    } else {
-      int i = k - 1;
-      while (i >= 0 && c[i] == '0'){ c[i] = '9'; i--; }
-      if (i < 0) continue;            /* 000.. cannot go lower */
-      c[i]--;
-      if (c[0] == '0'){ if (k == 1) continue; /* 1 -> 0.9...9: shift to 9..9 with exponent down */ memset(c, '9', (size_t)k); ce--; }
-    }
-    char cand[48]; int o = 0;
-    if (neg) cand[o++] = '-';
-    cand[o++] = c[0];
-    if (k > 1){ cand[o++] = '.'; for (int i = 1; i < k; i++) cand[o++] = c[i]; }
-    o += snprintf(cand + o, sizeof cand - (size_t)o, "e%+03d", ce);
-    if (strtod(cand, 0) == d){ snprintf(tmp, n, "%s", cand); return 1; }
+   */
+/* The shortest digits of a double, the closest to it among those of that length: Schubfach (R. Giulietti, "The
+   Schubfach way to render doubles", the steps of the JDK's DoubleToDecimal), without its two-digit minimum.
+   |d| = c 2^q, finite and not zero. The candidates are s 10^k and (s + 1) 10^k, around the value
+   in [cbl, cbr] / 4 scaled by 10^-k; one multiple of 10^(k+1) at most lies in that interval. */
+#include "dtoa_table.h"
+static inline uint64_t dtoa_mulhi(uint64_t a, uint64_t b){ return (uint64_t)(((unsigned __int128)a * b) >> 64); }
+static inline uint64_t dtoa_rop(uint64_t g1, uint64_t g0, uint64_t cp){
+  const uint64_t mask = 0x7FFFFFFFFFFFFFFFull;
+  uint64_t x1 = dtoa_mulhi(g0, cp), y0 = g1 * cp, y1 = dtoa_mulhi(g1, cp);
+  uint64_t z = (y0 >> 1) + x1;
+  uint64_t w = y1 + (z >> 63);
+  return w | (((z & mask) + mask) >> 63);
+}
+static inline int dtoa_flog10pow2(int e){ return (int)(((long long)e * 661971961083LL) >> 41); }
+static inline int dtoa_flog10threequarters(int e){ return (int)(((long long)e * 661971961083LL - 274743187321LL) >> 41); }
+static inline int dtoa_flog2pow10(int e){ return (int)(((long long)e * 913124641741LL) >> 38); }
+/* digits (no trailing zero) and the k they have; *e10 is the exponent of the first digit */
+static int dtoa_shortest(double d, char* digits, int* e10){
+  uint64_t bits; memcpy(&bits, &d, 8);
+  uint64_t t = bits & 0xFFFFFFFFFFFFFull;
+  int bq = (int)((bits >> 52) & 0x7FF);
+  const uint64_t cmin = 1ull << 52;
+  uint64_t c = bq ? (cmin | t) : t;
+  int q = bq ? bq - 1075 : -1074;
+  int out = (int)(c & 1);
+  uint64_t cb = c << 2, cbr = cb + 2, cbl;
+  int k;
+  if (c != cmin || bq <= 1){ cbl = cb - 2; k = dtoa_flog10pow2(q); }   /* regular spacing */
+  else { cbl = cb - 1; k = dtoa_flog10threequarters(q); }               /* a power of two: the gap below is half */
+  int h = q + dtoa_flog2pow10(-k) + 2;
+  uint64_t g1 = g_dtoa_g[2 * (k - DTOA_K_MIN)], g0 = g_dtoa_g[2 * (k - DTOA_K_MIN) + 1];
+  uint64_t vb = dtoa_rop(g1, g0, cb << h), vbl = dtoa_rop(g1, g0, cbl << h), vbr = dtoa_rop(g1, g0, cbr << h);
+  uint64_t s = vb >> 2, f = 0;
+  int found = 0;
+  if (s >= 10){
+    uint64_t sp10 = 10 * (s / 10), tp10 = sp10 + 10;
+    int upin = vbl + (uint64_t)out <= sp10 << 2, wpin = (tp10 << 2) + (uint64_t)out <= vbr;
+    if (upin != wpin){ f = upin ? sp10 : tp10; found = 1; }
   }
-  return 0;
+  if (!found){
+    uint64_t u = s + 1;
+    int uin = vbl + (uint64_t)out <= s << 2, win = (u << 2) + (uint64_t)out <= vbr;
+    if (uin != win) f = uin ? s : u;
+    else {
+      int64_t cmp = (int64_t)(vb - ((s + u) << 1));
+      f = (cmp < 0 || (cmp == 0 && (s & 1) == 0)) ? s : u;
+    }
+  }
+  while (f % 10 == 0){ f /= 10; k++; }
+  char rev[24]; int n = 0;
+  do { rev[n++] = (char)('0' + f % 10); f /= 10; } while (f);
+  for (int i = 0; i < n; i++) digits[i] = rev[n - 1 - i];
+  *e10 = k + n - 1;
+  return n;
 }
 static void ts_fmt_num(double d, char* buf, size_t n){
   if (d != d) { snprintf(buf,n,"NaN"); return; }
@@ -5639,26 +5673,11 @@ static void ts_fmt_num(double d, char* buf, size_t n){
   if (d == -1.0/0.0) { snprintf(buf,n,"-Infinity"); return; }
   /* small integers: exact decimal via fast itoa */
   if (d == (double)(long long)d && d < 9e15 && d > -9e15) { ts_i64_to_str((long long)d, buf); return; }
-  char tmp[48];
-  int p;
-  for (p = 0; p <= 16; p++){
-    snprintf(tmp, sizeof tmp, "%.*e", p, d);
-    if (strtod(tmp, 0) == d) break;
-    /* The correctly rounded p+1-digit decimal is outside the rounding interval of d; at a
-       power of two the interval is asymmetric (the gap below d is half the gap above), so
-       the neighbouring decimal on the other side may still read back as d: the shortest
-       form is then that neighbour (2^-24 is 5.960464477539063e-8, not ...0625e-8). */
-    if (ts_fmt_num_neighbour(tmp, sizeof tmp, d)) break;
-  }
-  if (p > 16) snprintf(tmp, sizeof tmp, "%.16e", d);
-  const char* t = tmp;
   char out[64];
   int o = 0;
-  if (*t == '-'){ out[o++] = '-'; t++; }
-  char digits[24]; int k = 0;
-  while (*t && *t != 'e' && *t != 'E'){ if (*t != '.') digits[k++] = *t; t++; }
-  int e10 = (*t == 'e' || *t == 'E') ? atoi(t + 1) : 0;
-  while (k > 1 && digits[k - 1] == '0') k--;     /* a shortest form has no trailing zero */
+  if (d < 0){ out[o++] = '-'; d = -d; }
+  char digits[24]; int e10;
+  int k = dtoa_shortest(d, digits, &e10);
   int ne = e10 + 1;                               /* n: x = 0.digits * 10^n */
   if (k <= ne && ne <= 21){
     for (int i = 0; i < k; i++) out[o++] = digits[i];
@@ -7411,7 +7430,7 @@ static void g0_count_fate(ts_gc_header* h, int fate){
       if (obj_shaped(common)) g0_payload(fate, G0_P_VALS, (unsigned long long)obj_map(common)->cap * sizeof(tsv), &any);
       else g0_payload(fate, G0_P_DICT, (unsigned long long)obj_map(common)->cap * sizeof(ts_prop), &any);
     }
-    if (obj_map(common)->prop_index) g0_payload(fate, G0_P_INDEX, (unsigned long long)(obj_map(common)->prop_index[0] + 1u) * sizeof(uint32_t), &any);
+    if (obj_map(common)->prop_index) g0_payload(fate, G0_P_INDEX, (unsigned long long)(obj_map(common)->prop_index[0] + PROP_INDEX_HDR) * sizeof(uint32_t), &any);
   }
   if (any) g0_owner_cells[fate][kind]++;
 }
@@ -13134,6 +13153,7 @@ void ts_init_fields(const char* const* names, const uint32_t* lens, uint32_t cou
      at startup; reset defensively in case of re-init). */
   free(g_field_index); g_field_index = NULL; g_field_index_cap = 0;
   field_index_reserve(count + 1);
+  g_prop_hole_key = ts_intern_field("#\001hole", 6);
 }
 const char* ts_field_name(uint32_t id){
   if (id >= g_field_count) return NULL;
@@ -13198,6 +13218,7 @@ uint32_t ts_intern_field(const char* name, uint32_t len){
     char buf[256]; snprintf(buf, sizeof buf, "a shared worker interned a new property name '%.*s' (docs/published_graphs_design.md: not carried to the parent yet)", (int)(len < 200 ? len : 200), name);
     ts_abort_msg(buf);
   }
+  if (TS_RT_UNLIKELY(g_field_count >= TS_METHOD_KEY_BASE)) ts_abort_msg("too many distinct property names");
   /* new field: grow the parallel name/len arrays if needed */
   if (g_field_count==g_field_cap){
     uint32_t old_cap = g_field_cap;
@@ -15233,25 +15254,23 @@ static void ts_prop_own_enum(tsv obj, ts_prop_enum_cb cb, void* ud){
     if (prop_enum_data_at(o, i) && prop_key_is_array_index(obj_key_at(o, i), &idx)){ has_index = 1; break; }
   }
   if (has_index){
-    /* selection over integer indices in ascending order (n is small in practice;
-       plain objects with many integer keys should use an array anyway). */
-    uint32_t prev_idx; int have_prev = 0; uint32_t emitted = 0, total_idx = 0;
+    /* the integer keys in ascending order; a callback can change the map, so each is read back by its key */
     o = ts_ptr(obj);
-    for (uint32_t i=0;i<obj_map(o)->len;i++){ uint32_t idx; if (prop_enum_data_at(o, i) && prop_key_is_array_index(obj_key_at(o, i),&idx)) total_idx++; }
-    while (emitted < total_idx){
-      uint32_t best=0, best_key=0; tsv best_val=TS_UNDEFINED; int found=0;
-      o = ts_ptr(obj);
-      for (uint32_t i=0;i<obj_map(o)->len;i++){
-        uint32_t idx;
-        if (!prop_enum_data_at(o, i) || !prop_key_is_array_index(obj_key_at(o, i),&idx)) continue;
-        if (have_prev && idx <= prev_idx) continue;      /* already emitted */
-        if (!found || idx < best){ best=idx; best_key=obj_key_at(o, i); best_val=(obj_val_read(o, i)); found=1; }
-      }
-      if (!found) break;
-      cb(best_key, best_val, ud);
-      prev_idx = best; have_prev = 1; emitted++;
-      o = ts_ptr(obj);
+    uint32_t total = 0, cap = obj_map(o)->len;
+    uint32_t* pairs = (uint32_t*)malloc(sizeof(uint32_t) * 2u * (cap ? cap : 1u));
+    for (uint32_t i=0;i<cap;i++){
+      uint32_t idx;
+      if (prop_enum_data_at(o, i) && prop_key_is_array_index(obj_key_at(o, i),&idx)){ pairs[2*total] = idx; pairs[2*total+1] = obj_key_at(o, i); total++; }
     }
+    qsort(pairs, total, sizeof(uint32_t) * 2u, cmp_u32_pair);
+    for (uint32_t t = 0; t < total; t++){
+      o = ts_ptr(obj);
+      uint32_t k = pairs[2*t+1];
+      ts_pref p = prop_find(o, k);
+      if (!pref_ok(p) || !prop_enum_data_at(o, p.i)) continue;
+      cb(k, obj_val_read(o, p.i), ud);
+    }
+    free(pairs);
     /* then the non-integer (string) keys in insertion order */
     o = ts_ptr(obj);
     for (uint32_t i=0;;i++){
@@ -16541,13 +16560,24 @@ static int props_delete_own(ts_object* o, ts_key key){
   /* non-configurable: delete is ignored (returns false in sloppy mode). */
   if (!pref_is_configurable(found)) return 0;
   uint32_t i = found.i;
-  /* Deletion leaves the hidden-class regime. Shift the remaining dictionary
-     entries to preserve insertion order; indexed entries store dense
-     positions, so every successful deletion rebuilds the sparse index. */
+  /* Deletion leaves the hidden-class regime. A dictionary with an index keeps the position as a hole
+     (prop_index_put); a small one shifts the remaining entries, which preserves insertion order. */
   obj_to_dictionary(o);
-  for (uint32_t j=i;j+1<obj_map(o)->len;j++) obj_map(o)->props[j]=obj_map(o)->props[j+1];
-  obj_map(o)->len--;
-  if (obj_map(o)->prop_index) prop_index_rebuild(o, obj_map(o)->len);
+  ts_propmap* m = obj_map(o);
+  if (m->prop_index){
+    m->props[i].key = g_prop_hole_key;
+    m->props[i].flags = 0;
+    m->props[i].val = TS_UNDEFINED;
+    if (++m->prop_index[1] * 2u > m->len){
+      uint32_t n = 0;
+      for (uint32_t j = 0; j < m->len; j++) if (m->props[j].key != g_prop_hole_key) m->props[n++] = m->props[j];
+      m->len = n;
+      prop_index_rebuild(o, n);
+    }
+    return 1;
+  }
+  for (uint32_t j=i;j+1<m->len;j++) m->props[j]=m->props[j+1];
+  m->len--;
   return 1;
 }
 static void fn_delete_refused(ts_key key){
@@ -25036,6 +25066,7 @@ static tsv garnet_is_plain_array_fn(tsv* a, int n){
 }
 static tsv garnet_is_array_buffer_fn(tsv* a, int n){ return ts_bool(n > 0 && ts_is_array_buffer(a[0])); }
 static tsv garnet_is_constructor_fn(tsv* a, int n){ return ts_bool(n > 0 && ts_value_is_constructor(a[0])); }
+static tsv garnet_is_proxy_fn(tsv* a, int n){ return ts_bool(n > 0 && g_has_proxies && ts_is_proxy(a[0])); }
 static tsv garnet_is_promise_fn(tsv* a, int n){ return ts_bool(n > 0 && ts_is_obj(a[0]) && ((ts_gc_header*)ts_ptr(a[0]))->kind == TS_KIND_PROMISE); }
 static tsv garnet_track_proto_elements_fn(tsv* a, int n){
   (void)a; (void)n;
@@ -25076,6 +25107,8 @@ static void ts_garnet_global_init(tsv global){
   ts_set_fn_meta(f5, 1u, "isArrayBuffer"); ts_set_cstr(g, "isArrayBuffer", f5);
   tsv f6 = ts_make_fn_t(garnet_is_constructor_fn, NULL, 0, 0); ts_gc_root(&f6);
   ts_set_fn_meta(f6, 1u, "isConstructor"); ts_set_cstr(g, "isConstructor", f6);
+  tsv f10 = ts_make_fn_t(garnet_is_proxy_fn, NULL, 0, 0); ts_gc_root(&f10);
+  ts_set_fn_meta(f10, 1u, "isProxy"); ts_set_cstr(g, "isProxy", f10);
   tsv f7 = ts_make_fn_t(garnet_is_promise_fn, NULL, 0, 0); ts_gc_root(&f7);
   ts_set_fn_meta(f7, 1u, "isPromise"); ts_set_cstr(g, "isPromise", f7);
   tsv f8 = ts_make_fn_t(garnet_atomics_wait_start_fn, NULL, 0, 0); ts_gc_root(&f8);

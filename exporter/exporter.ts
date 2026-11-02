@@ -201,7 +201,7 @@ let nodePreludeFile: string | undefined;
 /** lib/node's directory once the prelude is in use: a lib module's own ambient primitive
  *  (`__garnet_fetch`) is recognized by its declaration's file. */
 let nodeLibDir: string | undefined;
-const NODE_PRELUDE_GLOBALS = new Set(["process", "Buffer", "atob", "btoa", "escape", "unescape", "setTimeout", "setInterval", "setImmediate", "clearTimeout",
+const NODE_PRELUDE_GLOBALS = new Set(["process", "Buffer", "atob", "btoa", "escape", "unescape", "DOMException", "setTimeout", "setInterval", "setImmediate", "clearTimeout",
   "clearInterval", "clearImmediate", "queueMicrotask", "structuredClone", "performance", "URL", "URLSearchParams", "global",
   // the Web standard objects (docs/web_fetch_api_design.md)
   "Headers", "Request", "Response", "FormData", "fetch", "DataView",
@@ -294,6 +294,8 @@ const NODE_PRELUDE_PARTS: { file: string; names: string[]; defaultImport?: strin
   // explicit resource management (docs/using_declarations_design.md)
   { file: "web/disposable", names: ["SuppressedError", "DisposableStack", "AsyncDisposableStack", "__garnet_using_stack", "__garnet_use", "__garnet_dispose", "__garnet_dispose_async"] },
   { file: "web/escape", names: ["escape", "unescape"] },
+  { file: "web/dom_exception", names: ["DOMException"] },
+  { file: "web/structured_clone", names: ["structuredClone"] },
   { file: "web/array_from_async", names: [], triggers: ["fromAsync"] },
   { file: "web/atomics_wait_async", names: [], triggers: ["waitAsync"] },
   { file: "web/uint8_base64", names: [], triggers: ["fromBase64", "fromHex", "toBase64", "toHex", "setFromBase64", "setFromHex"] },

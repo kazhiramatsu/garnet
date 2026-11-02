@@ -364,7 +364,9 @@ static inline int ts_is_regexp(tsv v){ return ts_is_obj(v) && ((ts_gc_header*)ts
    the analyzer emits TS_KEY_METHOD(id) rather than open-coding the arithmetic. */
 typedef uint32_t ts_key;
 enum ts_key_tag { TS_K_STRING = 0, TS_K_SYMBOL = 1, TS_K_INDEX = 2, TS_K_WKSYM = 3 };
-#define TS_METHOD_KEY_BASE 1000000u
+/* (1000000 until Session 363: the millionth distinct property name of a run became a method key: gone from
+   Object.keys, and the same id as a method's. Ids are not recycled: ts_intern_field stops at this base.) */
+#define TS_METHOD_KEY_BASE 1900000000u
 /* a named-method key from a method-name id (single source of the partition). */
 #define TS_KEY_METHOD(id) (TS_METHOD_KEY_BASE + (uint32_t)(id))
 
