@@ -24303,6 +24303,8 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 // Object static methods (use the field-name table)
                 "object.keys" => (format!("ts_object_keys({})", v(0)), false),
                 "object.forInKeys" => (format!("ts_object_for_in_keys({})", v(0)), false),
+                "object.forInStamp" => ("ts_for_in_stamp()".to_string(), true),
+                "object.forInLive" => (format!("(double)ts_for_in_live({}, {}, {})", v(0), v(1), n(2)), true),
                 // Object.prototype.toString.call(x): spec [[Class]] tag of any value.
                 "object.protoToStringCall" => {
                     (format!("ts_objproto_tostring_call({})", v(0)), false)

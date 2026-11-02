@@ -1797,6 +1797,9 @@ tsv ts_headersproto_set(tsv* a, int n); tsv ts_headersproto_delete(tsv* a, int n
 /* Array.prototype method wrappers (ts_code signature, this = args[0]). */
 tsv ts_arrproto_join(tsv* args, int n);
 tsv ts_arrproto_toString(tsv* args, int n);
+tsv ts_arrproto_toLocaleString(tsv* args, int n);
+double ts_for_in_stamp(void);
+int ts_for_in_live(tsv obj, tsv key, double stamp);
 tsv ts_arrproto_indexOf(tsv* args, int n);
 tsv ts_arrproto_includes(tsv* args, int n);
 tsv ts_arrproto_lastIndexOf(tsv* args, int n);

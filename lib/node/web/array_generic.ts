@@ -350,7 +350,7 @@ for (const name of Object.keys(lengths)) {
   const holder = {
     m(this: any, ...args: any[]): any {
       // an object among the arguments converts in the specification's order, with the length read before it
-      const direct = name !== "toLocaleString" && host.isPlainArray(this) &&
+      const direct = host.isPlainArray(this) &&
         !(convertsArguments.has(name) && args.some((a) => typeof a === "object" && a !== null));
       return direct ? builtin.apply(this, args) : spec.apply(this, args);
     },

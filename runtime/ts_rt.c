@@ -2221,6 +2221,8 @@ tsv ts_object_get_prototype_of(tsv v){
   if (ts_is_symbol(v)) return ts_symbol_proto();
   return ts_get_proto(v);
 }
+/* What can take a key from an object while a for..in walks it (ts_for_in_live). */
+static uint32_t g_for_in_changes;
 tsv ts_object_set_prototype_of(tsv v, tsv p){
   if (v == TS_UNDEFINED || v == TS_NULL) ts_throw_type_error_msg("Object.setPrototypeOf called on null or undefined");
   if (((!ts_is_obj(p) && !ts_is_func(p)) || ts_is_prim_cell(p)) && p != TS_NULL){
@@ -2246,6 +2248,7 @@ static const char* set_proto_refused(tsv obj, tsv proto){
   return NULL;
 }
 tsv ts_set_proto_user(tsv obj, tsv proto){
+  g_for_in_changes++;
   { const char* refused = set_proto_refused(obj, proto); if (refused) ts_throw_type_error_msg(refused); }
   if (ts_is_func(obj)) ((ts_func*)ts_ptr(obj))->user_proto = 1;
   /* A sized instance relinked leaves its class's interval; a class's prototype relinked changes
@@ -2724,6 +2727,22 @@ static void array_densify(ts_array* a, uint32_t need){
   gc_owned_free(s);
   a->data = nd; a->cap = nc; a->sparse = 0; a->front = 0;
   array_invalidate_dirty(a);
+}
+/* The indices a sparse table holds, ascending: what enumerates a sparse array, which stays sparse and can be longer than
+   memory. A snapshot: a caller's callback can change the table, so each element is read back. Malloc'd, the caller frees it. */
+static int cmp_u32_asc(const void* x, const void* y){
+  uint32_t a = *(const uint32_t*)x, b = *(const uint32_t*)y;
+  return a < b ? -1 : a > b;
+}
+static uint32_t* sparse_sorted_indices(ts_array* a, uint32_t* out){
+  ts_sparse_elems* s = array_sparse_table(a);
+  tsv* vals = sparse_vals(s);
+  uint32_t* idx = (uint32_t*)malloc(sizeof(uint32_t) * ((size_t)s->count + 1u));
+  uint32_t n = 0;
+  for (uint32_t h = 0; h <= s->mask; h++) if (s->keys[h] != ARRAY_SPARSE_EMPTY && !array_is_hole(vals[h])) idx[n++] = s->keys[h];
+  qsort(idx, n, sizeof(uint32_t), cmp_u32_asc);
+  *out = n;
+  return idx;
 }
 /* An element on Array.prototype or Object.prototype (docs/array_protocol_design.md). g_proto_tracking is the library's
    promise that it handles arrays with holes then; without the library the hole stays undefined. */
@@ -9253,7 +9272,37 @@ static tsv ts_array_splice_impl(tsv arr, double start, double dc, int has_dc, ts
   ts_gc_unroot(3);
   return removed;
 }
-static tsv ts_array_join_slow(tsv arr, tsv sep){
+/* V8's join stack: the arrays being joined. One met again answers the empty string (`a.push(a); a.join()` is "1,", a
+   stack overflow otherwise). Only the slow path runs another value's conversion, so only it can come back; a throw through
+   it pops. */
+static tsv* g_join_stack;
+static uint32_t g_join_depth, g_join_cap;
+typedef tsv (*array_join_body)(tsv arr, tsv sep, tsv* args, int nargs);
+static tsv array_join_guarded(tsv arr, tsv sep, tsv* args, int nargs, array_join_body body){
+  for (uint32_t i = 0; i < g_join_depth; i++) if (g_join_stack[i] == arr) return ts_new_string("", 0);
+  if (g_join_depth == g_join_cap){
+    g_join_cap = g_join_cap ? g_join_cap * 2u : 16u;
+    g_join_stack = (tsv*)realloc(g_join_stack, sizeof(tsv) * g_join_cap);
+  }
+  uint32_t depth = g_join_depth;
+  g_join_stack[g_join_depth++] = arr;
+  ts_gc_root(&arr); ts_gc_root(&sep);
+  ts_handler* h = ts_eh_push();
+  if (ts_setjmp(h->buf) != 0){
+    ts_gc_set_root_depth(h->gc_root_len);
+    ts_frame_restore(h->frame_top);
+    ts_eh_pop();
+    g_join_depth = depth;
+    ts_throw(ts_current_exception());
+  }
+  tsv r = body(arr, sep, args, nargs);
+  ts_eh_pop();
+  g_join_depth = depth;
+  ts_gc_unroot(2);
+  return r;
+}
+static tsv array_join_slow_body(tsv arr, tsv sep, tsv* args, int nargs){
+  (void)args; (void)nargs;
   if(!ts_is_plain_array(arr)) return ts_new_string("",0);
   ts_gc_root(&arr);
   if(sep==TS_UNDEFINED) sep=ts_new_string(",",1);   /* join() / join(undefined) -> "," */
@@ -9275,6 +9324,29 @@ static tsv ts_array_join_slow(tsv arr, tsv sep){
     }
   }
   ts_gc_unroot(3);
+  return acc;
+}
+static tsv ts_array_join_slow(tsv arr, tsv sep){ return array_join_guarded(arr, sep, NULL, 0, array_join_slow_body); }
+/* Array.prototype.toLocaleString: each element's own method with the call's arguments, an empty field for null and undefined. */
+static tsv array_to_locale_body(tsv arr, tsv sep, tsv* args, int nargs){
+  (void)sep;
+  ts_gc_root(&arr);
+  for (int i = 0; i < nargs; i++) ts_gc_root(&args[i]);
+  tsv acc = ts_new_string("", 0); ts_gc_root(&acc);
+  for (uint32_t i = 0;; i++){
+    ts_array* a = as_arr(arr);
+    if (!a || i >= a->len) break;
+    if (i) acc = ts_add(acc, ts_new_string(",", 1));
+    tsv e = ts_array_get(arr, i);
+    if (e != TS_UNDEFINED && e != TS_NULL){
+      tsv s = ts_method_dynamic(e, "toLocaleString", args, nargs);
+      ts_gc_root(&s);
+      s = ts_to_string_template(s);
+      acc = ts_add(acc, s);
+      ts_gc_unroot(1);
+    }
+  }
+  ts_gc_unroot(2 + nargs);
   return acc;
 }
 static int ts_array_join_fast_value(tsv v){
@@ -13518,11 +13590,18 @@ tsv ts_object_get_own_property_names(tsv obj){
     return arr;
   }
   if (ts_is_indexed_array_fast(obj)){
-    ts_array* a = arr_dense(obj);
-    uint32_t len = a->len;
-    for (uint32_t i=0;i<len;i++){
-      if (ts_array_has_index(obj, i)) push_index_name(arr, i);
-      a = ts_ptr(obj); len = a->len;
+    ts_array* a = (ts_array*)ts_ptr(obj);
+    if (a->sparse){
+      uint32_t n;
+      uint32_t* idx = sparse_sorted_indices(a, &n);
+      for (uint32_t t = 0; t < n; t++) push_index_name(arr, idx[t]);
+      free(idx);
+    } else {
+      uint32_t len = a->len;
+      for (uint32_t i=0;i<len;i++){
+        if (ts_array_has_index(obj, i)) push_index_name(arr, i);
+        a = ts_ptr(obj); len = a->len;
+      }
     }
     push_cstr_name(arr, "length");
     push_prop_names_js_order(arr, obj, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu);
@@ -15295,7 +15374,15 @@ static void ts_prop_own_enum(tsv obj, ts_prop_enum_cb cb, void* ud){
     return;
   }
   if (ts_is_indexed_array_fast(obj)){
-    for (uint32_t i=0;;i++){
+    if (((ts_array*)ts_ptr(obj))->sparse){
+      uint32_t n;
+      uint32_t* idx = sparse_sorted_indices((ts_array*)ts_ptr(obj), &n);
+      ts_gc_root(&obj);
+      for (uint32_t t = 0; t < n; t++)
+        if (ts_array_has_index(obj, idx[t])) cb(array_index_key(idx[t]), ts_array_get(obj, idx[t]), ud);
+      ts_gc_unroot(1);
+      free(idx);
+    } else for (uint32_t i=0;;i++){
       ts_array* a = arr_dense(obj);   /* the callback may have changed the storage */
       if (i>=a->len) break;
       if (array_is_hole(a->data[i])) continue;
@@ -16753,6 +16840,7 @@ static int fn_delete(tsv obj, ts_key key, int strict){
   return r;
 }
 int ts_delete_prop(tsv obj, ts_key key){
+  g_for_in_changes++;
   if (TS_RT_UNLIKELY(obj == g_array_proto_v) && key == TS_KEY_WKSYM(TS_WKSYM_ITERATOR)) g_array_iter_patched = 1;
   if (ts_is_null(obj) || ts_is_undef(obj)) ts_throw_type_error_msg("Cannot convert undefined or null to object");
   if (ts_is_obj(obj)){ ts_gc_header* _dh = (ts_gc_header*)ts_ptr(obj); if (_dh->gen == TS_GEN_OLD) gc_cards_all(_dh); }
@@ -17768,6 +17856,7 @@ static tsv ta_m_reverse(tsv* a, int n);
 static tsv ta_m_fill(tsv* a, int n);
 static tsv ta_m_copy_within(tsv* a, int n);
 tsv ts_arrproto_join(tsv* a, int n){ return ts_array_join(ARR_THIS(a, "join"), (n>1 && a[1]!=TS_UNDEFINED)?a[1]:ts_new_string(",",1)); }
+tsv ts_arrproto_toLocaleString(tsv* a, int n){ return array_join_guarded(ARR_THIS(a, "toLocaleString"), TS_UNDEFINED, a + 1, n > 3 ? 2 : (n > 1 ? n - 1 : 0), array_to_locale_body); }
 tsv ts_arrproto_toString(tsv* a, int n){
   /* another receiver: its join, or Object.prototype.toString without one */
   if (!ts_is_indexed_array_fast(a[0]) && !ts_is_typed_array(a[0])){
@@ -23497,6 +23586,23 @@ tsv ts_object_for_in_keys(tsv obj){
   }
   ts_gc_unroot(4);
   return out;
+}
+/* A key that has gone before the walk reached it is skipped; that it is still there is all that is asked, on the object or
+   its chain (V8's ForInFilter: a key that stopped being enumerable is visited). g_for_in_changes counts what can take a key
+   from an object, so nothing is looked up until something has; an array and a view lose elements on too many paths to
+   count and answer per key. A Proxy was read at the walk's start, as its descriptors are (ts_object_for_in_keys). */
+double ts_for_in_stamp(void){ return (double)g_for_in_changes; }
+int ts_for_in_live(tsv obj, tsv key, double stamp){
+  int indexed = ts_is_indexed_array_fast(obj) || ts_is_typed_array(obj);
+  if (!indexed && stamp == (double)g_for_in_changes) return 1;
+  if (!ts_is_str(key) || (g_has_proxies && ts_is_proxy(obj))) return 1;
+  ts_gc_root(&obj); ts_gc_root(&key);
+  int live = 0;
+  for (tsv cur = obj; (ts_is_obj(cur) || ts_is_func(cur) || ts_is_str(cur)) && !ts_is_null(cur); cur = ts_get_proto(cur)){
+    if ((g_has_proxies && ts_is_proxy(cur)) || ts_has_own_dyn(cur, key)){ live = 1; break; }
+  }
+  ts_gc_unroot(2);
+  return live;
 }
 /* Proxy.revocable(target, handler) -> { proxy, revoke } */
 /* Proxy as a value: a constructor without a `prototype` */

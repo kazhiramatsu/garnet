@@ -4,15 +4,6 @@ cd "$(dirname "$0")/.."
 cp -r /home/claude/exporter/node_modules exporter/ 2>/dev/null || true
 tmp=$(mktemp -d)
 fail=0
-# unsupported array method (Array.from/copyWithin/reduceRight and the ES2023
-# change-by-copy methods toSorted/toReversed/with/toSpliced are now implemented;
-# toLocaleString is not — locale-aware element formatting is out of scope).
-cat > "$tmp/a.ts" <<'TS'
-function main(): void { const a = [3,1,2]; console.log(a.toLocaleString()); }
-TS
-if node exporter/exporter.js "$tmp/a.ts" "$tmp/a.json" "$tmp/al.json" 2>/dev/null; then
-  echo "[reject-stdlib] FAIL: unsupported array method accepted"; fail=1
-fi
 # new Map(iterable) seeding and m.entries() are now implemented (conformance_fixes
 # §3). Test methods that remain unsupported instead.
 # unsupported Set method (Set.prototype.union is not implemented)
@@ -57,20 +48,6 @@ function main(): void { const R: any = globalThis["RegExp"]; console.log(typeof 
 TS
 if node exporter/exporter.js "$tmp/k.ts" "$tmp/k.json" "$tmp/kl.json" 2>/dev/null; then
   echo "[reject-stdlib] FAIL: globalThis[\"RegExp\"] value accepted"; fail=1
-fi
-cat > "$tmp/l.ts" <<'TS'
-function choose(): string { return "b"; }
-function main(): void { console.log("abc".match(choose())); }
-TS
-if node exporter/exporter.js "$tmp/l.ts" "$tmp/l.json" "$tmp/ll.json" 2>/dev/null; then
-  echo "[reject-stdlib] FAIL: dynamic String.prototype.match accepted"; fail=1
-fi
-cat > "$tmp/m.ts" <<'TS'
-function choose(): string { return "b"; }
-function main(): void { console.log("abc".search(choose())); }
-TS
-if node exporter/exporter.js "$tmp/m.ts" "$tmp/m.json" "$tmp/ml.json" 2>/dev/null; then
-  echo "[reject-stdlib] FAIL: dynamic String.prototype.search accepted"; fail=1
 fi
 cat > "$tmp/p.ts" <<'TS'
 function main(): void { const r = /ab+/; console.log("abb".replaceAll(r, "x")); }

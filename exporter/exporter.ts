@@ -4168,7 +4168,7 @@ class Exporter {
         // miscompile (the callee read garbage through the missing cell).
         this.unsupported(
           node,
-          `direct call cannot thread captured cell '${this.slotName(slot)}' (caller does not hold it)`
+          `direct call from ${ctx.name} cannot thread captured cell '${this.slotName(slot)}' (caller does not hold it)`
         );
         const u = this.newLocal(ctx, "reference", "missingCell");
         out.push(u);
@@ -13900,7 +13900,7 @@ class Exporter {
    *  code-point iteration for string iteration. */
   private lowerArrayIndexForOf(
     ctx: FnCtx, init: ts.ForInitializer, statement: ts.Statement, arr: number, iterIsString: boolean,
-    mode: "values" | "keys" | "entries" = "values",
+    mode: "values" | "keys" | "entries" = "values", skipElement?: (element: number) => void,
   ): void {
     const idx = this.newLocal(ctx, "primitive");
     const zero = this.newLocal(ctx, "primitive");
@@ -13937,6 +13937,7 @@ class Exporter {
       // particular, continue must not skip the index/code-point advance.
       if (iterIsString) this.emitStringIteratorAdvance(ctx, idx, cp);
       else this.emitIndexStep(ctx, idx, 1);
+      skipElement?.(varLocal);
       for (const c of captureCells) {
         ctx.body.push({ kind: "AllocObject", dst: c.cell, typeId: 0, site: c.perSite, classId: this.cellClassId });
       }
@@ -16454,7 +16455,14 @@ class Exporter {
       const obj = this.lowerExpr(ctx, stmt.expression);
       const keys = this.newLocal(ctx, "reference");
       ctx.body.push({ kind: "CallBuiltinStatic", dst: keys, builtin: "object.forInKeys", args: [obj] });
-      this.lowerArrayIndexForOf(ctx, stmt.initializer, stmt.statement, keys, false);
+      // a key that has gone before the walk reached it is not visited (ts_for_in_live)
+      const stamp = this.newLocal(ctx, "primitive");
+      ctx.body.push({ kind: "CallBuiltinStatic", dst: stamp, builtin: "object.forInStamp", args: [] });
+      this.lowerArrayIndexForOf(ctx, stmt.initializer, stmt.statement, keys, false, "values", (key) => {
+        const live = this.newLocal(ctx, "primitive");
+        ctx.body.push({ kind: "CallBuiltinStatic", dst: live, builtin: "object.forInLive", args: [obj, key, stamp] });
+        ctx.body.push({ kind: "If", cond: live, thenBody: [], elseBody: [{ kind: "Continue" }] });
+      });
     } else if (ts.isLabeledStatement(stmt)) {
       // A label on a loop: record it so an immediately-enclosed `break L` /
       // `continue L` targeting THIS loop maps to a plain break/continue. Labels
@@ -18709,6 +18717,14 @@ class Exporter {
         }
       }
     }
+    // A module's dead-zone binding lives in a cell of its own and not in the module's record, and a direct call of a
+    // `const f = () => ...` threads the record alone (constFnSymbols): its callers hold no such cell. Published too.
+    for (const s of this.tdzBindings) {
+      if (!this.isScriptGlobalVarSymbol(s) && this.moduleScopeSyms.has(s) && !this.moduleCellGlobal.has(s)) {
+        this.moduleCellGlobal.set(s, this.internGlobal(`__modcell_${(s as any).name ?? "v"}_${this.bindingId.get(s) ?? this.moduleCellGlobal.size}`));
+        this.cellBindings.add(s);
+      }
+    }
 
     // Step F: static field initializers and static blocks live in synthesized
     // __static_init functions (separate from __module_init), so the AST-based
@@ -18854,7 +18870,7 @@ class Exporter {
       ["lastIndexOf","ts_arrproto_lastIndexOf"],["slice","ts_arrproto_slice"],["concat","ts_arrproto_concat"],
       ["pop","ts_arrproto_pop"],["push","ts_arrproto_push"],["shift","ts_arrproto_shift"],
       ["unshift","ts_arrproto_unshift"],["reverse","ts_arrproto_reverse"],["at","ts_arrproto_at"],
-      ["fill","ts_arrproto_fill"],["flat","ts_arrproto_flat"],["sort","ts_arrproto_sort"],["splice","ts_arrproto_splice"],["toString","ts_arrproto_toString"],
+      ["fill","ts_arrproto_fill"],["flat","ts_arrproto_flat"],["sort","ts_arrproto_sort"],["splice","ts_arrproto_splice"],["toString","ts_arrproto_toString"],["toLocaleString","ts_arrproto_toLocaleString"],
       ["map","ts_arrproto_map"],["filter","ts_arrproto_filter"],["forEach","ts_arrproto_forEach"],
       ["reduce","ts_arrproto_reduce"],["reduceRight","ts_arrproto_reduceRight"],["copyWithin","ts_arrproto_copyWithin"],["find","ts_arrproto_find"],["findIndex","ts_arrproto_findIndex"],
       ["findLast","ts_arrproto_findLast"],["findLastIndex","ts_arrproto_findLastIndex"],
