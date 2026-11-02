@@ -12956,4 +12956,12 @@ Where it stopped (branch `s363-dc`, worktree `build/wt_dc`, on top of `s362-wip`
 - **`a.push(a); a.join()` was a stack overflow** (V8: "1,"): the join stack, in the slow path only, the one that runs another value's conversion; a throw through it pops (`arrays/join_cycles`).
 - **hono's `timeout` middleware answered 500** (a loud TypeError of the cast-to-number rule, this session's): `timer = setTimeout(f) as unknown as number` with `let timer: number | undefined`. A variable of a union is no unboxed slot: a cast of what is known not to be a number makes
   it `any` everywhere, a narrowing to number is tested only where a number slot takes it (`docs/cast_to_number_design.md`, `types/cast_lies`). `const n = "x" as unknown as number` stays a TypeError. The survey's `ip_restriction`, a reject since Session 362's gates, passes: 43 of 43 expected.
+- Stopped at Kaz's request (2026-11-02, going out), nothing running, not gated: the second run stopped after `unit` passed. What the first run measured before the fixes above, not to be quoted: vue r29 875.9 -> 916.6 ms, 25.52 -> 26.22 G instructions (+2.75%, the protocol libraries' cost
+  already noted), cycles +4.1%, binary +15% (5.09 -> 5.86 MB); hono, hono_app and the tsc-ts A/B did not run. Next, in this order:
+  1. `caffeinate -ims bash build/gates_s363d/run.sh` from the main checkout's `build/`, on mains power (the runner is not in the repo; about 40 minutes; summary in `build/gates_s363d/summary.txt`). The worktree has `build/ir_parity` and `build/typescript_603` as links to the main checkout's now.
+     The survey should read 43 of 43. Read each step's log, not the rc: `hono_ab` and `hono_app_ab` print "ok" with an empty B column when the build before them failed.
+  2. Look at vue's cycles: the instructions are the known +2.75%, cycles +4.1% and +15% of binary are not explained.
+  3. `gate.sh ir-parity snap`, the final numbers here.
+  4. Land on main as one commit with a descriptive message (`git merge --squash s363-dc`): main has no merge and no WIP commit in its history, this branch keeps the steps on origin.
+  5. Then more fuzzing: `scripts/fuzz/run.sh features 151 300`, and a generator for objects (delete, property order, getters, spread, JSON round trips): the for..in bug was found by a probe, no generator reaches it.
 
