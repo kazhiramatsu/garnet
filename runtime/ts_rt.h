@@ -2029,6 +2029,7 @@ tsv ts_str_charat(tsv s, double idx);
 tsv ts_str_codepointat(tsv s, double idx);
 double ts_str_charcodeat(tsv s, double idx);
 tsv ts_str_concat(tsv a, tsv b);
+int ts_str_case_ascii(tsv s, int upper, tsv* out);
 tsv ts_str_repeat(tsv s, double count);
 tsv ts_str_trim(tsv s);
 tsv ts_str_split(tsv s, tsv sep, tsv limit);

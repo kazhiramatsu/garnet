@@ -160,6 +160,8 @@ static tsv ts_unicode_case_tsv_inner(tsv input, int upper, int locale_kind){
   return upper ? ts_str_toupper(input) : ts_str_tolower(input);
 #else
   tsv s = ts_to_string_v(input);
+  tsv quick;
+  if (locale_kind == 0 && ts_str_case_ascii(s, upper, &quick)) return quick;
   ts_gc_root(&s);
   uint32_t src_len = 0;
   uint32_t* src = ts_string_codepoints_copy(s, &src_len);

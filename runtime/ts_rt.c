@@ -7819,25 +7819,28 @@ static void ts_case_append_lower(ts_cu_builder* out, uint32_t cp, ts_strview x,
   ts_cu_builder_put_cp(out, cp);
 }
 
+/* ASCII: no context, no expansion, one byte for one byte; a string with nothing to change is itself. 1 and *out when s is ASCII. */
+int ts_str_case_ascii(tsv s, int upper, tsv* out){
+  ts_strview ax = ts_str_view_typed(s);
+  if (!ax.data || (ax.flags & TS_STR_FLAG_UTF16) || !ts_bytes_ascii(ax.data, ax.len)) return 0;
+  const unsigned char lo = upper ? 'a' : 'A';
+  uint32_t i = 0;
+  while (i < ax.len && (unsigned char)((unsigned char)ax.data[i] - lo) >= 26u) i++;
+  if (i == ax.len){ *out = s; return 1; }
+  char stack[256];
+  char* buf = ax.len <= sizeof stack ? stack : (char*)malloc(ax.len);
+  for (uint32_t k = 0; k < ax.len; k++){
+    unsigned char c = (unsigned char)ax.data[k];
+    buf[k] = (char)((unsigned char)(c - lo) < 26u ? c ^ 0x20u : c);
+  }
+  *out = ts_new_string(buf, ax.len);
+  if (buf != stack) free(buf);
+  return 1;
+}
 static tsv ts_str_case_convert(tsv s, int upper){
   if (!ts_is_str(s)) return s;
-  ts_strview ax = ts_str_view_typed(s);
-  if (ax.data && !(ax.flags & TS_STR_FLAG_UTF16) && ts_bytes_ascii(ax.data, ax.len)){
-    /* ASCII: no context, no expansion, one byte for one byte; a string with nothing to change is itself */
-    const unsigned char lo = upper ? 'a' : 'A';
-    uint32_t i = 0;
-    while (i < ax.len && (unsigned char)((unsigned char)ax.data[i] - lo) >= 26u) i++;
-    if (i == ax.len) return s;
-    char stack[256];
-    char* buf = ax.len <= sizeof stack ? stack : (char*)malloc(ax.len);
-    for (uint32_t k = 0; k < ax.len; k++){
-      unsigned char c = (unsigned char)ax.data[k];
-      buf[k] = (char)((unsigned char)(c - lo) < 26u ? c ^ 0x20u : c);
-    }
-    tsv r = ts_new_string(buf, ax.len);
-    if (buf != stack) free(buf);
-    return r;
-  }
+  tsv quick;
+  if (ts_str_case_ascii(s, upper, &quick)) return quick;
   ts_gc_root(&s);
   ts_strview sv = ts_str_view_typed(s);
   ts_cu_builder out;
