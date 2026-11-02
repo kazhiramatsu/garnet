@@ -2301,6 +2301,18 @@ class Exporter {
       return !all(this.rawChecker.getTypeAtLocation(node.expression), F.NumberLike | F.Never | F.Undefined | F.Null | F.Void);
     } catch { return false; }
   }
+  /** `x as unknown as number` of what is known not to be one: `setTimeout(f) as unknown as number`. From `any` the program
+   *  may mean it, and such a variable stays what it is. */
+  private unbackedHandleCast(value: ts.Expression): boolean {
+    while (ts.isParenthesizedExpression(value)) value = value.expression;
+    if (!(ts.isAsExpression(value) || ts.isTypeAssertionExpression(value)) || !this.unbackedNumberCast(value)) return false;
+    let e: ts.Expression = value.expression;
+    while (ts.isParenthesizedExpression(e) || ts.isAsExpression(e) || ts.isTypeAssertionExpression(e)) {
+      if ((ts.isAsExpression(e) || ts.isTypeAssertionExpression(e)) && (this.rawChecker.getTypeFromTypeNode(e.type).flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) === 0) return false;
+      e = e.expression;
+    }
+    return e !== value.expression && (this.rawChecker.getTypeAtLocation(e).flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) === 0;
+  }
   /** `x as unknown as T[]` of what is known not to be an array: an array-like, a string. From `any` a cast to an
    *  array type is believed: the typed form of a value the program built. */
   private unbackedArrayCast(node: ts.AsExpression | ts.TypeAssertion): boolean {
@@ -2351,9 +2363,13 @@ class Exporter {
     if (ts.isExpressionStatement(p) || ts.isPropertyAssignment(p) || ts.isShorthandPropertyAssignment(p) || ts.isArrayLiteralExpression(p) || ts.isSpreadElement(p) || ts.isSpreadAssignment(p)) return true;
     if (ts.isBinaryExpression(p)) {
       const op = p.operatorToken.kind;
+      if (op === ts.SyntaxKind.EqualsToken && e === p.right && ts.isIdentifier(p.left)) {
+        const sym = this.rawChecker.getSymbolAtLocation(p.left);
+        if (sym !== undefined && this.foreignSyms.has(sym)) return true;
+      }
       return op < ts.SyntaxKind.FirstAssignment || op > ts.SyntaxKind.LastAssignment ? true : e === p.left;
     }
-    if (ts.isVariableDeclaration(p) && p.type === undefined && ts.isIdentifier(p.name)) {
+    if (ts.isVariableDeclaration(p) && ts.isIdentifier(p.name)) {
       const sym = this.rawChecker.getSymbolAtLocation(p.name);
       if (sym !== undefined && this.foreignSyms.has(sym)) return true;
     }
@@ -2474,6 +2490,16 @@ class Exporter {
           if (sym !== undefined) this.foreignSyms.add(sym);
         }
       }
+      // `let timer: number | undefined; timer = setTimeout(f) as unknown as number`: a variable of a union is no unboxed
+      // slot, it holds the handle as V8's does
+      const holds = (target: ts.Identifier, value: ts.Expression): void => {
+        const sym = this.rawChecker.getSymbolAtLocation(target);
+        const decl = sym?.valueDeclaration;
+        if (sym === undefined || decl === undefined || !ts.isVariableDeclaration(decl) || !this.unbackedHandleCast(value)) return;
+        if ((this.rawChecker.getTypeAtLocation(decl.name).flags & ts.TypeFlags.NumberLike) === 0) { this.foreignSyms.add(sym); this.handleSyms.add(sym); }
+      };
+      if (ts.isVariableDeclaration(n) && n.initializer !== undefined && ts.isIdentifier(n.name)) holds(n.name, n.initializer);
+      if (ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isIdentifier(n.left)) holds(n.left, n.right);
       ts.forEachChild(n, lied);
     };
     for (const m of this.modules) if (m.text.includes("as unknown as")) lied(m);
@@ -3634,6 +3660,8 @@ class Exporter {
   /** The let, const and using bindings something may reach before the declaration has run: a closure that
    *  code before it can run, or a later clause of a `switch`. Each lives in a cell that starts as a hole, and
    *  a read or a write that cannot be proven after the declaration tests it. Any other binding costs nothing. */
+  /** Variables of a union that took a cast of what is known to be no number (`unbackedHandleCast`). */
+  handleSyms = new Set<ts.Symbol>();
   tdzBindings = new Set<ts.Symbol>();
   private computeTdzBindings(): void {
     if (process.env.TSAOT_TDZ === "0") return;
@@ -6145,7 +6173,9 @@ class Exporter {
     if (this.hasForeign && !this.distrustSkip.has(node) && (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node) || ts.isIdentifier(node)) &&
         this.foreignValue(node) && !this.usedInPlace(node)) {
       const F = ts.TypeFlags, t = this.rawChecker.getTypeAtLocation(node);
-      if ((t.flags & F.NumberLike) !== 0) {
+      // a narrowing says number of a variable that holds a handle: only a number slot needs one
+      const handle = ts.isIdentifier(node) && this.handleSyms.size > 0 && this.handleSyms.has(this.rawChecker.getSymbolAtLocation(node)!);
+      if ((t.flags & F.NumberLike) !== 0 && !(handle && ((this.rawChecker.getContextualType(node as ts.Expression)?.flags ?? F.NumberLike) & F.NumberLike) === 0)) {
         this.distrustSkip.add(node);
         const v = this.lowerExpr(ctx, node, hint);
         this.distrustSkip.delete(node);

@@ -12954,4 +12954,6 @@ Where it stopped (branch `s363-dc`, worktree `build/wt_dc`, on top of `s362-wip`
 - **`for..in` visited a key deleted during the walk** (silent, older than this session, on every kind of receiver; found by a sparse fixture): a key that has gone is skipped, on the object and on its chain (V8's ForInFilter: presence only, a key made non-enumerable is visited). `g_for_in_changes` counts what can
   take a key (`ts_delete_prop`, `ts_set_proto_user`), so an object's walk costs a compare per key until something has; an array or a view looks its key up (`statements/for_in_deleted_keys`).
 - **`a.push(a); a.join()` was a stack overflow** (V8: "1,"): the join stack, in the slow path only, the one that runs another value's conversion; a throw through it pops (`arrays/join_cycles`).
+- **hono's `timeout` middleware answered 500** (a loud TypeError of the cast-to-number rule, this session's): `timer = setTimeout(f) as unknown as number` with `let timer: number | undefined`. A variable of a union is no unboxed slot: a cast of what is known not to be a number makes
+  it `any` everywhere, a narrowing to number is tested only where a number slot takes it (`docs/cast_to_number_design.md`, `types/cast_lies`). `const n = "x" as unknown as number` stays a TypeError. The survey's `ip_restriction`, a reject since Session 362's gates, passes: 43 of 43 expected.
 

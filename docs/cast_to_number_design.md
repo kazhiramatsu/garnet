@@ -27,6 +27,11 @@ A cast to a number type is **unbacked** when the operand's static type does not 
   there, and a value of another type is a TypeError. `null` and `undefined` pass: `undefined as unknown as number` is a
   placeholder idiom, and a typed number reads them as NaN as it always has.
 
+A variable of a union is no such slot. `let timer: number | undefined; timer = setTimeout(f) as unknown as number` (hono's timeout
+middleware) keeps a Timeout object in it under V8 and only hands it to `clearTimeout`: when a cast of what is known not to be a
+number lands in a variable that is not plainly a number (`unbackedHandleCast`), the variable is `any` everywhere and holds what
+V8's holds. A cast from `any` stays as above: the program may mean it, and its variable keeps its representation.
+
 Untyped mode (`TSAOT_UNTYPED=1`) trusts no annotation and takes no test.
 
 ## Data out of JSON

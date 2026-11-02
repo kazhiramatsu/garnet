@@ -31,3 +31,23 @@ t("number cast, template", () => `${"t" as unknown as number}`);
 t("number cast, console", () => { console.log("y" as unknown as number); return 1; });
 t("map get", () => { const m = new Map([["a", 1]]); return (m.get("a") as number) + 1; });
 t("from any", () => { const a: any = [1, 2]; return (a[1] as number) * 3; });
+// a variable of a union holds what the cast held: a timer handle, hono's timeout middleware
+function timerHandle(): void {
+  let timer: number | undefined;
+  const p = new Promise<void>((resolve) => {
+    timer = setTimeout(() => resolve(), 1) as unknown as number;
+  });
+  console.log(typeof timer, timer !== undefined, timer === undefined);
+  p.then(() => {
+    if (timer !== undefined) clearTimeout(timer);
+    console.log("cleared");
+  });
+  let declared: number | null = { a: 1 } as unknown as number;
+  console.log(typeof declared, declared === null, JSON.stringify(declared));
+  declared = 5;
+  console.log(typeof declared, (declared as number) + 1);
+  let label: number | string = "s" as unknown as number;
+  console.log(typeof label, label + "!");
+}
+timerHandle();
+
