@@ -42,9 +42,25 @@ rule above: `any` in place, tested flowing on. The test is stricter, undefined d
 the key is missing. A variable with no declared type that takes such a read stays boxed, so `const p = c.port` keeps
 what the file held.
 
+The walk goes through the arguments of the lib's generics: `JSON.parse(s) as Record<string, Config>` reads its values as a
+`Config` the file filled in (those read NaN, silently), and `Promise.resolve(JSON.parse(s))` hands the value on to the type
+of the promise.
+
 The seeds are the entries of external data and not every cast from `any`: a compiler is full of `x as any as Node`, its
 values are its own, and the types behind them are the ones that must stay fast. A type no parsed value reaches pays
 nothing; a program with no such cast pays nothing.
+
+## Clones
+
+`structuredClone`'s d.ts answers `T`, and the clone of an instance is a plain object with its data: no methods, no
+accessors, not an instance. `structuredClone(new K()).m()` was a direct call of `K.m`, `kc.g` ran the getter and
+`kc instanceof K` folded to true, silently. Nobody wrote a cast, so this is not the annotation a program answers for.
+
+`clonedClasses` marks the classes a clone can reach foreign, and only those: an interface is what it says about a clone
+and stays fast. A value whose static type names a foreign class (`foreignClassValue`: a variable, a call's result, a
+read) is `any` wherever it is asked. A generic function that answers a clone is a clone for its callers, whose `T` is the
+class, to a fixed point; so is a call that takes `structuredClone` itself as an argument. A class no clone reaches pays
+nothing.
 
 `JSON.parse(s) as number[]` tests every element at the cast: an array type is shared by the whole program, so it cannot
 be foreign.

@@ -49,3 +49,9 @@ t("number array", () => (JSON.parse("[1,2,3]") as number[]).map((x) => x * 2));
   const r: unknown = c.port + 1;
   console.log("awaited", r);
 })();
+
+// behind a generic the lib declares: the record's values are the same data
+const records = JSON.parse('{"a":{"port":"8080"}}') as Record<string, { port: number; host?: string }>;
+console.log(records.a.port + 1, records.a.host === undefined, typeof records.a.port);
+const promised: Promise<{ port: number }> = Promise.resolve(JSON.parse('{"port":"1"}'));
+promised.then((c) => console.log(c.port + 1, typeof c.port));

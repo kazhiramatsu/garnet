@@ -12899,3 +12899,7 @@ Where it stopped (branch `s363-dc`, worktree `build/wt_dc`, on top of `s362-wip`
   785 of 786 (`stdlib/structured_clone`: `kc instanceof K` true under `@ts-nocheck`, the d.ts says `T`); bench `string_unicode_search_kernel` 102 against a budget of 100;
   unit: three runtime tests of the property index ("shrinks to linear", "rebuild after shrink", "collision rebuild") that describe the rebuild a delete used to do.
   protect and gc did not run, nor the tsc-ts build and A/B. Next: those three, then build/s363_probes/lim.ts (behaviour at the limits, not run yet).
+- **Resumed (2026-11-02).** The stopped run's failures: `structuredClone(new K())` was the real thing, not the fixture: the d.ts answers `T`, so `.m()` was a direct call of `K.m`,
+  `.g` ran the getter, `instanceof` folded to true (silent, V8: TypeError, undefined, false). The classes a clone reaches are foreign now, a generic function that answers a clone counts for its
+  callers (`clonedClasses`, `docs/cast_to_number_design.md`, `stdlib/structured_clone_classes`). The same walk found `JSON.parse(s) as Record<string, Config>` and
+  `Promise.resolve(JSON.parse(s))` reading NaN (silent): it goes through the arguments of the lib's generics. The three unit tests of the property index describe holes and compaction at half.

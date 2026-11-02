@@ -2382,24 +2382,60 @@ class Exporter {
     if (callee.name.text === "parse") return ts.isIdentifier(callee.expression) && callee.expression.text === "JSON";
     return callee.name.text === "json" && e.arguments.length === 0;
   }
-  /** `t` and the object types reachable from it, the lib's excepted: what a program declares for its data. */
-  private markForeign(t: ts.Type | undefined, seen: Set<ts.Type>): void {
+  /** The arguments of a generic type: `K` of `K[]`, of `Map<string, K>`, of `Record<string, K>`. */
+  private typeArgumentsOf(t: ts.Type): readonly ts.Type[] {
+    if (t.aliasTypeArguments !== undefined) return t.aliasTypeArguments;
+    return ((t as ts.ObjectType).objectFlags & ts.ObjectFlags.Reference) !== 0 ? this.rawChecker.getTypeArguments(t as ts.TypeReference) : [];
+  }
+  /** `t` and the object types reachable from it, the lib's excepted: what a program declares for its data. Only
+   *  the classes among them when the data is the program's own and only the class is untrue (`clonedClasses`). */
+  private markForeign(t: ts.Type | undefined, seen: Set<ts.Type>, classesOnly = false): void {
     if (t === undefined || seen.has(t)) return;
     seen.add(t);
-    if (t.isUnionOrIntersection()) { for (const m of t.types) this.markForeign(m, seen); return; }
-    if (this.rawChecker.isArrayType(t) || this.rawChecker.isTupleType(t)) {
-      for (const a of this.rawChecker.getTypeArguments(t as ts.TypeReference)) this.markForeign(a, seen);
+    if (t.isUnionOrIntersection()) { for (const m of t.types) this.markForeign(m, seen, classesOnly); return; }
+    const decl = t.symbol?.declarations?.[0];
+    if (this.rawChecker.isArrayType(t) || this.rawChecker.isTupleType(t) || (decl !== undefined && this.program.isSourceFileDefaultLibrary(decl.getSourceFile()))) {
+      for (const a of this.typeArgumentsOf(t)) this.markForeign(a, seen, classesOnly);
       return;
     }
-    if ((t.flags & ts.TypeFlags.Object) === 0 || t.symbol === undefined) return;
-    const decl = t.symbol.declarations?.[0];
-    if (decl === undefined || this.program.isSourceFileDefaultLibrary(decl.getSourceFile())) return;
-    this.foreignTypes.add(t.symbol);
+    if ((t.flags & ts.TypeFlags.Object) === 0 || decl === undefined) return;
+    if (!classesOnly || (t.symbol.flags & ts.SymbolFlags.Class) !== 0) this.foreignTypes.add(t.symbol);
     for (const prop of this.rawChecker.getPropertiesOfType(t)) {
       const d = prop.valueDeclaration ?? prop.declarations?.[0];
-      if (d !== undefined) this.markForeign(this.rawChecker.getTypeOfSymbolAtLocation(prop, d), seen);
+      if (d !== undefined) this.markForeign(this.rawChecker.getTypeOfSymbolAtLocation(prop, d), seen, classesOnly);
     }
-    this.markForeign(this.rawChecker.getIndexTypeOfType(t, ts.IndexKind.String), seen);
+    this.markForeign(this.rawChecker.getIndexTypeOfType(t, ts.IndexKind.String), seen, classesOnly);
+  }
+  /** `structuredClone`'s d.ts answers `T`, and the clone of an instance is a plain object with its data: no
+   *  methods, no accessors, not an instance. The classes a clone can reach go the way of the types parsed data
+   *  reaches, the other types are what they say. A generic function that answers a clone is a clone for its
+   *  callers, whose `T` is the class, and so is `xs.map(structuredClone)`. */
+  private clonedClasses(): void {
+    if (!this.modules.some((m) => m.text.includes("structuredClone"))) return;
+    const seen = new Set<ts.Type>(), cloners = new Set<ts.Node>();
+    const isBuiltin = (e: ts.Node): boolean => ts.isIdentifier(e) && e.text === "structuredClone" && this.isBuiltinSymbol(this.rawChecker.getSymbolAtLocation(e));
+    const generic = (t: ts.Type, walked = new Set<ts.Type>()): boolean => {
+      if (walked.has(t)) return false;
+      walked.add(t);
+      return (t.flags & ts.TypeFlags.TypeParameter) !== 0 || this.typeArgumentsOf(t).some((a) => generic(a, walked));
+    };
+    let grew = true;
+    const visit = (n: ts.Node): void => {
+      if (ts.isCallExpression(n)) {
+        const decl = this.rawChecker.getResolvedSignature(n)?.getDeclaration();
+        if (isBuiltin(n.expression) || n.arguments.some(isBuiltin) || (decl !== undefined && cloners.has(decl))) {
+          const t = this.rawChecker.getTypeAtLocation(n);
+          this.markForeign(t, seen, true);
+          if (generic(t)) {
+            let fn: ts.Node | undefined = n.parent;
+            while (fn !== undefined && !ts.isFunctionLike(fn)) fn = fn.parent;
+            if (fn !== undefined && !cloners.has(fn)) { cloners.add(fn); grew = true; }
+          }
+        }
+      }
+      ts.forEachChild(n, visit);
+    };
+    while (grew) { grew = false; for (const m of this.modules) visit(m); }
   }
   /** The whole program's entries of external data: each type a value out of JSON is cast or assigned to, and
    *  what the program declares inside it, is told apart from the types its own code builds. A type nothing
@@ -2410,7 +2446,12 @@ class Exporter {
       if ((ts.isCallExpression(n) || ts.isIdentifier(n)) && this.foreignSource(n as ts.Expression) && !(ts.isIdentifier(n) && ts.isVariableDeclaration(n.parent) && n.parent.name === n)) {
         this.sawForeignSource = true;
         let e: ts.Node = n;
-        while (ts.isParenthesizedExpression(e.parent) || ts.isAwaitExpression(e.parent) || ts.isNonNullExpression(e.parent) || ts.isAsExpression(e.parent) || ts.isTypeAssertionExpression(e.parent)) {
+        const resolved = (x: ts.Node): boolean => {
+          const q = x.parent;
+          return ts.isCallExpression(q) && q.arguments[0] === x && ts.isPropertyAccessExpression(q.expression) && q.expression.name.text === "resolve" &&
+            ts.isIdentifier(q.expression.expression) && q.expression.expression.text === "Promise";
+        };
+        while (ts.isParenthesizedExpression(e.parent) || ts.isAwaitExpression(e.parent) || ts.isNonNullExpression(e.parent) || ts.isAsExpression(e.parent) || ts.isTypeAssertionExpression(e.parent) || resolved(e)) {
           e = e.parent;
           if (ts.isAsExpression(e) || ts.isTypeAssertionExpression(e)) this.markForeign(this.rawChecker.getTypeFromTypeNode(e.type), seen);
         }
@@ -2436,6 +2477,7 @@ class Exporter {
       ts.forEachChild(n, lied);
     };
     for (const m of this.modules) if (m.text.includes("as unknown as")) lied(m);
+    this.clonedClasses();
     this.hasForeign = this.foreignTypes.size > 0 || this.foreignSyms.size > 0;
     if (this.foreignTypes.size === 0) return;
     this.distrustCache = new WeakMap();
@@ -2467,19 +2509,24 @@ class Exporter {
     const t = this.rawChecker.getNonNullableType(this.rawChecker.getTypeAtLocation(e));
     return t.isUnion() ? t.types.some((m) => m.symbol !== undefined && this.foreignTypes.has(m.symbol)) : t.symbol !== undefined && this.foreignTypes.has(t.symbol);
   }
+  /** Is a value of this expression's static type possibly no instance of the class the type names? The class's
+   *  typed reads, direct calls and `instanceof` would come first otherwise. */
+  private foreignClassValue(n: ts.Node): boolean {
+    const t = this.rawChecker.getTypeAtLocation(n).symbol;
+    return t !== undefined && (t.flags & ts.SymbolFlags.Class) !== 0 && this.foreignTypes.has(t);
+  }
   /** A property read off an object type external data was cast to, or a variable holding one. */
   private foreignValue(n: ts.Node): boolean {
     if (ts.isIdentifier(n)) {
       const sym = this.rawChecker.getSymbolAtLocation(n);
       if (sym !== undefined && this.foreignSyms.has(sym)) return true;
-      // a variable of a class type: the class's typed reads and writes would come first
       if (sym === undefined || (sym.flags & ts.SymbolFlags.Variable) === 0) return false;
-      const t = this.rawChecker.getTypeAtLocation(n).symbol;
-      return t !== undefined && (t.flags & ts.SymbolFlags.Class) !== 0 && this.foreignTypes.has(t);
+      return this.foreignClassValue(n);
     }
     if (ts.isParenthesizedExpression(n)) return this.foreignValue(n.expression);
+    if (ts.isCallExpression(n)) return this.foreignClassValue(n);
     if (!ts.isPropertyAccessExpression(n) && !ts.isElementAccessExpression(n)) return false;
-    return n.expression.kind !== ts.SyntaxKind.SuperKeyword && (this.foreignReceiver(n.expression) || this.foreignValue(n.expression));
+    return n.expression.kind !== ts.SyntaxKind.SuperKeyword && (this.foreignReceiver(n.expression) || this.foreignValue(n.expression) || this.foreignClassValue(n));
   }
   /** Is this use of `arguments` one the array of the actual arguments stands for? A read of `length` or of an element, a
    *  spread, `f.apply(t, arguments)`, `Array.from(arguments)`, `Array.prototype.slice.call(arguments)`. */
