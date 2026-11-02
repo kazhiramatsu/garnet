@@ -1,0 +1,28 @@
+const o: Record<string, number> = {};
+for (let i = 0; i < 200000; i++) o["k" + i] = i;
+for (let i = 0; i < 200000; i += 2) delete o["k" + i];
+console.log(Object.keys(o).length, Object.keys(o).slice(0, 3), o.k1, o["k2"], "k3" in o, "k4" in o, o.hasOwnProperty("k5"), o.hasOwnProperty("k6"));
+for (let i = 0; i < 1000; i++) o["n" + i] = i;
+console.log(Object.keys(o).length, Object.keys(o).slice(-2), JSON.stringify(o).length, Object.entries(o).length);
+let c = 0; for (const k in o) c += o[k] & 1; console.log(c);
+for (const k of Object.keys(o)) delete o[k];
+console.log(Object.keys(o), JSON.stringify(o), Object.getOwnPropertyNames(o), Reflect.ownKeys(o));
+o.again = 1; console.log(o, Object.keys(o));
+const q: Record<string, number> = {};
+for (let r = 0; r < 300000; r++) { q["a" + (r % 50)] = r; delete q["a" + ((r + 7) % 50)]; }
+console.log(Object.keys(q).length, Object.keys(q));
+const s: any = {};
+for (let i = 0; i < 100; i++) s["p" + i] = i;
+Object.defineProperty(s, "p50", { get() { return 7; }, enumerable: true, configurable: true });
+delete s.p49; delete s.p50; delete s.p51;
+console.log(Object.keys(s).length, s.p50, Object.getOwnPropertyDescriptor(s, "p50"), Object.getOwnPropertyDescriptor(s, "p52"));
+const frozen = Object.freeze(Object.assign({}, s)); console.log(Object.keys(frozen).length, Object.isFrozen(frozen));
+const clone = { ...s }; console.log(Object.keys(clone).length); 
+const m1: any = Object.create(s); delete s.p52; console.log(m1.p52, m1.p53);
+const big: any = {};
+big[4294967294] = 1; big[4294967295] = 2; big[4294967296] = 3; big[2147483648] = 4; big[-1] = 5; big[1.5] = 6; big["007"] = 7; big[1e21] = 8; big[3] = 9; big[0] = 10;
+console.log(Object.keys(big));
+const z: Record<number, number> = {};
+for (let i = 0; i < 300000; i++) z[(i * 7919) % 300007] = i;
+const zk = Object.keys(z); console.log(zk.length, zk[0], zk[1], zk[299999]);
+let order = true; for (let i = 1; i < zk.length; i++) if (+zk[i - 1] >= +zk[i]) order = false; console.log(order);

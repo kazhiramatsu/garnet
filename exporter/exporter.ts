@@ -18580,7 +18580,7 @@ class Exporter {
     this.regexpProtocol = this.modules.some((m) => /web[\/\\]regexp_protocol\.ts$/.test(m.fileName));
     if (this.regexpProtocol) this.internField(REGEXP_PROTOCOL_TRIGGER);
     this.promiseProtocol = this.modules.some((m) => /web[\/\\]promise_protocol\.ts$/.test(m.fileName));
-    if (this.modules.some((m) => !/\/lib\/(node|garnet)\/|node_prelude/.test(m.fileName) && inCode(m, /\b__proto__\b/))) this.internField("__garnet_proto_accessor");
+    if (this.modules.some((m) => !/\/lib\/(node|garnet)\/|node_prelude/.test(m.fileName) && /\b__proto__\b/.test(m.text))) this.internField("__garnet_proto_accessor");   // (startup only: a JSON text counts too)
     if (this.modules.some((m) => !/\/lib\/(node|garnet)\/|node_prelude/.test(m.fileName) && inCode(m, /\btoStringTag\b/))) this.internField("__garnet_builtin_tags");
     if (this.modules.some((m) => !/\/lib\/(node|garnet)\/|node_prelude/.test(m.fileName) && inCode(m, /\bhasInstance\b/))) this.internField("__garnet_has_instance");
     if (this.modules.some((m) => !/\/lib\/(node|garnet)\/|node_prelude/.test(m.fileName) && inCode(m, /\.caller\b|["']caller["']|ThrowTypeError/))) this.internField("__garnet_function_poison");

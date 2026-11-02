@@ -7821,6 +7821,23 @@ static void ts_case_append_lower(ts_cu_builder* out, uint32_t cp, ts_strview x,
 
 static tsv ts_str_case_convert(tsv s, int upper){
   if (!ts_is_str(s)) return s;
+  ts_strview ax = ts_str_view_typed(s);
+  if (ax.data && !(ax.flags & TS_STR_FLAG_UTF16) && ts_bytes_ascii(ax.data, ax.len)){
+    /* ASCII: no context, no expansion, one byte for one byte; a string with nothing to change is itself */
+    const unsigned char lo = upper ? 'a' : 'A';
+    uint32_t i = 0;
+    while (i < ax.len && (unsigned char)((unsigned char)ax.data[i] - lo) >= 26u) i++;
+    if (i == ax.len) return s;
+    char stack[256];
+    char* buf = ax.len <= sizeof stack ? stack : (char*)malloc(ax.len);
+    for (uint32_t k = 0; k < ax.len; k++){
+      unsigned char c = (unsigned char)ax.data[k];
+      buf[k] = (char)((unsigned char)(c - lo) < 26u ? c ^ 0x20u : c);
+    }
+    tsv r = ts_new_string(buf, ax.len);
+    if (buf != stack) free(buf);
+    return r;
+  }
   ts_gc_root(&s);
   ts_strview sv = ts_str_view_typed(s);
   ts_cu_builder out;
@@ -9011,6 +9028,12 @@ tsv ts_array_values_arr(tsv arr){
   ts_gc_unroot(2);
   return out;
 }
+/* A value only its own bits equal: anything but a string, a BigInt, a zero of either sign and NaN. */
+static inline int array_search_by_bits(tsv v){
+  if (ts_is_num(v)){ double d = ts_to_num(v); return d == d && d != 0; }
+  if (ts_is_undef(v)) return 1;
+  return !ts_is_str(v) && !ts_is_bigint(v);
+}
 double ts_array_indexof(tsv arr, tsv v, double from, int has_from){
   if (TS_RT_UNLIKELY(g_proto_elements) && array_species_custom(arr)){ tsv av[2] = { v, ts_num(from) }; return ts_number_coerce(array_species_call(arr, "indexOf", av, has_from ? 2 : 1)); }
   ts_array* a=as_arr(arr); if(!a){ if (TS_ARRAY_PROXY(arr)){ tsv av[2] = { v, ts_num(from) }; return ts_number_coerce(ts_method_dynamic(arr, "indexOf", av, has_from ? 2 : 1)); } return -1; }
@@ -9027,6 +9050,11 @@ double ts_array_indexof(tsv arr, tsv v, double from, int has_from){
     }
     return -1;
   }
+  if (array_search_by_bits(v)){
+    const tsv* d = a->data;
+    for(long i=s;i<n;i++) if (d[i] == v) return (double)i;
+    return -1;
+  }
   for(long i=s;i<n;i++) if(!array_is_hole(a->data[i]) && ts_strict_eq(a->data[i], v)) return (double)i;
   return -1;
 }
@@ -9038,6 +9066,11 @@ int ts_array_includes(tsv arr, tsv v, double from, int has_from){
   if(!a){ if (TS_ARRAY_PROXY(arr)){ tsv av[2] = { v, ts_num(from) }; return ts_truthy(ts_method_dynamic(arr, "includes", av, has_from ? 2 : 1)); } return 0; }
   long n=(long)a->len, s = has_from ? (long)ts_index_ll(from) : 0;
   if(s<0){ s+=n; if(s<0) s=0; }
+  if (!ts_is_undef(v) && array_search_by_bits(v)){   /* (a hole reads as undefined) */
+    const tsv* d = a->data;
+    for(long i=s;i<n;i++) if (d[i] == v) return 1;
+    return 0;
+  }
   int v_is_nan = ts_is_num(v) && (ts_to_num(v) != ts_to_num(v));
   for(long i=s;i<n;i++){
     tsv e=array_is_hole(a->data[i]) ? TS_UNDEFINED : a->data[i];
@@ -9047,6 +9080,17 @@ int ts_array_includes(tsv arr, tsv v, double from, int has_from){
   return 0;
 }
 static tsv arrproto_elements(tsv recv, const char* name);
+/* A fresh array of xn elements of x from xs and then the yn of y: one allocation and a copy, holes staying holes. */
+static tsv array_copy_ranges(tsv x, long xs, long xn, tsv y, long yn){
+  ts_gc_root(&x); ts_gc_root(&y);
+  tsv out = ts_new_array((uint32_t)(xn + yn));
+  ts_array* o = (ts_array*)ts_ptr(out);
+  if (xn) memcpy(o->data, ((ts_array*)ts_ptr(x))->data + xs, sizeof(tsv) * (size_t)xn);
+  if (yn) memcpy(o->data + xn, ((ts_array*)ts_ptr(y))->data, sizeof(tsv) * (size_t)yn);
+  if (o->o.h.gen == TS_GEN_OLD){ o->gc_dirty_all = 1; gc_remember(&o->o.h); }
+  ts_gc_unroot(2);
+  return out;
+}
 tsv ts_array_slice_method(tsv arr, double start, double end, int has_end){
   if (TS_RT_UNLIKELY(g_species) && array_species_custom(arr)){
     tsv av[2] = { ts_num(start), ts_num(end) };
@@ -9062,16 +9106,7 @@ tsv ts_array_slice(tsv arr, double start, double end, int has_end){
     ? ts_array_slice(arrproto_elements(arr, "slice"), start, end, has_end) : ts_new_array(0);
   long n=(long)a->len, s=ts_slice_index(start,(long)a->len), e=has_end ? ts_slice_index(end,(long)a->len) : n;
   if(e<s)e=s;
-  ts_gc_root(&arr);
-  tsv out=ts_new_array(0);
-  ts_gc_root(&out);
-  for(long i=s;i<e;i++){
-    a=as_arr(arr);
-    if (a && i<(long)a->len && !array_is_hole(a->data[i])) ts_array_push(out, a->data[i]);
-    else ts_array_push_hole(out);
-  }
-  ts_gc_unroot(2);
-  return out;
+  return array_copy_ranges(arr, s, e - s, TS_UNDEFINED, 0);
 }
 /* new Array(n): a sparse array of length n (no indexed own properties). */
 tsv ts_array_new_length(double n){
@@ -9089,6 +9124,13 @@ tsv ts_array_concat(tsv x, tsv y){
   if (TS_ARRAY_PROXY(x)) return ts_method_dynamic(x, "concat", &y, 1);
   /* concat one argument onto a copy of x: an array argument is spread, any other
      value is appended as a single element (JS Array.prototype.concat semantics). */
+  if (ts_is_plain_array(x) && ts_is_plain_array(y)){
+    ts_array* xa = as_arr(x);
+    long xn = (long)xa->len;
+    ts_array* ya = as_arr(y);
+    xa = as_arr(x);
+    return array_copy_ranges(x, 0, xn, y, (long)ya->len);
+  }
   ts_gc_root(&x); ts_gc_root(&y);
   tsv out=ts_new_array(0);
   ts_gc_root(&out);
@@ -9156,40 +9198,43 @@ static tsv ts_array_splice_impl(tsv arr, double start, double dc, int has_dc, ts
   if(!a){ if (TS_ARRAY_PROXY(arr)){ tsv r = array_proxy_splice(arr, "splice", start, dc, has_dc, items); return want_removed ? r : TS_UNDEFINED; } return want_removed ? ts_new_array(0) : TS_UNDEFINED; }
   if(ts_arr_frozen(arr)){ ts_array_set(arr, a->len, TS_UNDEFINED); return want_removed ? ts_new_array(0) : TS_UNDEFINED; }   /* strict: a frozen array throws (ts_array_set's message) */
   ts_gc_root(&arr); ts_gc_root(&items);
-  tsv removed = want_removed ? ts_new_array(0) : TS_UNDEFINED;
+  tsv removed = TS_UNDEFINED;
   ts_gc_root(&removed);
   a=as_arr(arr);
   long n=(long)a->len;
   long s=(long)ts_index_ll(start); if(s<0){ s+=n; if(s<0)s=0; } if(s>n) s=n;
   long del = has_dc ? (long)ts_index_ll(dc) : (n-s); if(del<0) del=0; if(del>n-s) del=n-s;
-  if (want_removed) for(long i=0;i<del;i++){
-    a=as_arr(arr);
-    if (array_is_hole(a->data[s+i])) ts_array_push_hole(removed);
-    else ts_array_push(removed, a->data[s+i]);
-  }
+  if (want_removed) removed = array_copy_ranges(arr, s, del, TS_UNDEFINED, 0);
   ts_array* it=as_arr(items); long ni = it?(long)it->len:0;
   long newlen = n - del + ni;
-  /* rebuild data buffer: [0,s) + items + [s+del,n). No GC between malloc and
-     assignment, so the raw pointers stay valid. */
-  tsv* nd = (tsv*)gc_owned_alloc(&as_arr(arr)->o.h, (size_t)(newlen?newlen:1)*sizeof(tsv));
-  long w=0;
+  /* in place: the side after the cut moves, or the head when it is the shorter and the array shrinks (as shift()
+     leaves the buffer's base behind). Nothing allocates after the removed array. */
   a=as_arr(arr);
-  for(long i=0;i<s;i++) nd[w++]=a->data[i];
-  it=as_arr(items); for(long i=0;i<ni;i++) nd[w++]=it->data[i];
-  a=as_arr(arr); for(long i=s+del;i<n;i++) nd[w++]=a->data[i];
-  array_free_data(a);   /* (front reset there) */
-  if (newlen <= 4) {
-    a->data = a->inline_data;
-    a->cap = 4;
-    for (uint32_t i=0;i<4;i++) a->data[i] = (i < (uint32_t)newlen) ? nd[i] : TS_ARRAY_HOLE;
-    gc_owned_free(nd);
-  } else {
-    a->data=nd;
-    a->cap=(uint32_t)newlen;
+  long tail = n - s - del;
+  if (newlen > (long)a->cap) array_ensure_cap(a, (uint32_t)newlen);
+  array_invalidate_dirty(a);
+  int moved = del == ni;
+  if (ni < del && s < tail && !array_uses_inline(a) && a->len > 16u){
+    uint32_t up = (uint32_t)(del - ni);
+    if ((uint32_t)a->front + up > 255u) array_compact_front(a);
+    if (up <= 255u){
+      memmove(a->data + up, a->data, sizeof(tsv) * (size_t)s);
+      for (uint32_t i = 0; i < up; i++) a->data[i] = TS_ARRAY_HOLE;
+      a->data += up; a->front = (uint8_t)(a->front + up); a->cap -= up;
+      moved = 1;
+    }
+  }
+  if (!moved){
+    memmove(a->data + s + ni, a->data + s + del, sizeof(tsv) * (size_t)tail);
+    for (long i = newlen; i < n; i++) a->data[i] = TS_ARRAY_HOLE;   /* keep [len, cap) holes */
+  }
+  it=as_arr(items);
+  for (long i = 0; i < ni; i++){
+    tsv v = it->data[i];
+    a->data[s + i] = v;
+    array_write_barrier(a, (uint32_t)(s + i), v);
   }
   a->len=(uint32_t)newlen;
-  array_invalidate_dirty(a);
-  for (uint32_t i=0;i<a->len;i++) ts_write_barrier(arr, a->data[i]);
   ts_gc_unroot(3);
   return removed;
 }
@@ -13637,6 +13682,23 @@ tsv ts_construct_result(tsv inst, tsv ret){
   return ret;   /* object-like (plain object / array / func / map / set) */
 }
 
+static int object_copy_whole(tsv dst, tsv src);
+/* No accessor (`__proto__` aside: a copy leaves that key out) and no read-only property on Object.prototype: a store
+   into an object that inherits from nothing else adds an own property. Asked again when its property count changes. */
+static int object_proto_takes_stores(void){
+  static uint32_t seen = 0xFFFFFFFFu;
+  static int yes = 0;
+  ts_object* p = ts_proto_ptr(g_object_proto_v);
+  uint32_t n = obj_map(p)->len;
+  if (n == seen) return yes;
+  ts_key proto_key = ts_intern_field("__proto__", 9);
+  seen = n; yes = 1;
+  for (uint32_t i = 0; i < n; i++){
+    uint8_t f = obj_flags_at(p, i);
+    if (((f & TS_PROP_ACCESSOR) || !(f & TS_PROP_WRITABLE)) && obj_key_at(p, i) != proto_key) yes = 0;
+  }
+  return yes;
+}
 tsv ts_object_assign(tsv* args, int n){
   if (n <= 0) ts_throw_type_error_msg("Cannot convert undefined or null to object");
   tsv target = args[0];
@@ -13647,6 +13709,9 @@ tsv ts_object_assign(tsv* args, int n){
   enum_copy_ctx c; c.target=target;
   for (int si=1; si<n; si++){
     tsv src = args[si];
+    /* into a fresh object, an Object.prototype nothing was added to: no setter is in the way */
+    if (TS_TOP16(target) == TS_SEL_OBJECT && ((ts_object*)ts_ptr(target))->proto == g_object_proto_v &&
+        object_proto_takes_stores() && object_copy_whole(target, src)) continue;
     if (ts_is_map(src) || ts_is_set(src) || (!ts_is_obj(src) && !ts_is_class_value(src) && !ts_is_str(src))) continue;  /* arrays/strings OK (index keys) */
     ts_gc_root(&src);
     c.recv = src;   /* accessor getters run with this=src */
@@ -15983,8 +16048,25 @@ void ts_array_push_all(tsv dst, tsv src){
   ts_gc_root(&dst); ts_gc_root(&src);
   ts_array* s=as_arr(src);
   if (s && !array_own_iterator(src)){
-    uint32_t len = s->len;
-    for(uint32_t i=0;i<len;i++){
+    uint32_t len = s->len, i = 0;
+    /* the elements at once, up to a hole (which reads through the chain) */
+    if (ts_is_plain_array(dst) && !ts_obj_integrity(&((ts_array*)ts_ptr(dst))->o)){
+      ts_array* d = as_arr(dst);
+      uint32_t at = d->len;
+      if (len < 0x40000000u && at < 0x40000000u){
+        array_ensure_cap(d, at + len);
+        array_invalidate_dirty(d);
+        s = as_arr(src);
+        for (; i < len; i++){
+          tsv v = s->data[i];
+          if (array_is_hole(v)) break;
+          d->data[at + i] = v;
+        }
+        d->len = at + i;
+        if (i && d->o.h.gen == TS_GEN_OLD){ d->gc_dirty_all = 1; gc_remember(&d->o.h); }
+      }
+    }
+    for(;i<len;i++){
       ts_array_push(dst, ts_array_get(src, i));
     }
     ts_gc_unroot(2);
@@ -16401,8 +16483,48 @@ int ts_is_nullish(tsv v){ return ts_is_null(v) || ts_is_undef(v); }
 
 /* object spread / Object.assign: copy own enumerable props from src to dst.
    Later writes win (matches {...a, ...b} and explicit keys after a spread). */
+/* The keys of a shape all plain data under ordinary names, in creation order (no integer key): what a copy can take whole.
+   A small cache by shape id holds the answers that are yes. */
+static int shape_copies_whole(uint32_t sid, uint32_t n){
+  static uint32_t yes[256];
+  if (yes[sid & 255u] == sid + 1u) return 1;
+  const ts_key* ks = g_ts_shape_keys[sid];
+  const uint8_t* fl = g_ts_shape_flags[sid];
+  static ts_key proto_key = 0xFFFFFFFFu;
+  if (proto_key == 0xFFFFFFFFu) proto_key = ts_intern_field("__proto__", 9);
+  for (uint32_t i = 0; i < n; i++){
+    uint32_t idx;
+    if ((fl[i] & (uint8_t)~TS_PROP_INT32) != TS_PROP_DEFAULT || ks[i] >= TS_METHOD_KEY_BASE || ks[i] == proto_key) return 0;
+    if (field_is_hidden(ks[i]) || prop_key_is_array_index(ks[i], &idx)) return 0;
+  }
+  yes[sid & 255u] = sid + 1u;
+  return 1;
+}
+/* A copy into a fresh object: src's shape and slots at once. */
+static int object_copy_whole(tsv dst, tsv src){
+  if (TS_TOP16(dst) != TS_SEL_OBJECT || TS_TOP16(src) != TS_SEL_OBJECT) return 0;
+  ts_object* d = (ts_object*)ts_ptr(dst), *s = (ts_object*)ts_ptr(src);
+  if (d->h.kind != TS_KIND_OBJECT || s->h.kind != TS_KIND_OBJECT || d->shape != TS_SHAPE_EMPTY) return 0;
+  if (ts_obj_is_sized(d) || ts_obj_is_sized(s) || !obj_shaped(s) || obj_map_plain(d)->len != 0 || ts_obj_integrity(d)) return 0;
+  uint32_t n = obj_map_plain(s)->len;
+  if (n == 0) return 1;
+  uint32_t sid = ts_obj_shape_id(s);
+  if (!shape_copies_whole(sid, n)) return 0;
+  ts_propmap* m = obj_map_plain(d);
+  uint32_t icap = d->h.inline_cap, ext = n > icap ? n - icap : 0;
+  if (ext > m->cap){
+    if (ext <= 4u){ m->props = (ts_prop*)vals_alloc_small(&d->h); m->cap = 4u; }
+    else { m->props = (ts_prop*)gc_owned_alloc(&d->h, sizeof(tsv) * (size_t)ext); m->cap = ext; }
+  }
+  for (uint32_t i = 0; i < n; i++) *ts_obj_slot_ptr(d, i) = *ts_obj_slot_ptr(s, i);
+  m->len = n;
+  ts_obj_set_shape(d, s->shape);
+  if (d->h.gen == TS_GEN_OLD) for (uint32_t i = 0; i < n; i++) ts_write_barrier(dst, *ts_obj_slot_ptr(d, i));
+  return 1;
+}
 void ts_object_copy_props(tsv dst, tsv src){
   if (!ts_is_obj(dst)) return;
+  if (object_copy_whole(dst, src)) return;
   /* arrays ARE valid spread sources ({...arr} -> {0:.., 1:..}); the enumerator
      yields their index keys. Only map/set/non-object sources are skipped. */
   /* a function source spreads its own enumerable properties as any object does ({ ...fnWithProps }) */
@@ -18169,7 +18291,20 @@ static tsv ta_m_fill(tsv* a, int n){
   uint32_t b = ta_rel(a, n, 2, len, 0), e = ta_rel(a, n, 3, len, len);
   ts_typedarray* x = ta_ptr(t);
   if (ta_is_big(x)) for (uint32_t i = b; i < e && i < x->length; i++) ta_put(x, i, fv);
-  else { double d = ts_to_num(fv); for (uint32_t i = b; i < e && i < x->length; i++) ta_store(x, i, d); }
+  else {
+    /* the first element stored as the kind does, then its bytes */
+    double d = ts_to_num(fv);
+    if (e > x->length) e = x->length;
+    if (b < e){
+      ta_store(x, b, d);
+      uint32_t size = g_ta_size[x->elem], count = e - b - 1;
+      uint8_t* p = x->data + (size_t)b * size;
+      if (size == 1) memset(p + 1, *p, count);
+      else if (size == 2){ uint16_t v; memcpy(&v, p, 2); uint16_t* q = (uint16_t*)(void*)p; for (uint32_t i = 1; i <= count; i++) q[i] = v; }
+      else if (size == 4){ uint32_t v; memcpy(&v, p, 4); uint32_t* q = (uint32_t*)(void*)p; for (uint32_t i = 1; i <= count; i++) q[i] = v; }
+      else { uint64_t v; memcpy(&v, p, 8); uint64_t* q = (uint64_t*)(void*)p; for (uint32_t i = 1; i <= count; i++) q[i] = v; }
+    }
+  }
   ts_gc_unroot(2);
   return t;
 }
