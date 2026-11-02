@@ -38,4 +38,15 @@ with tempfile.TemporaryDirectory() as d:
             t = parts[:i] + parts[i + 1:]
             if t and differs(t, d):
                 parts = t; changed = True
-print("\n".join(parts))
+    # then line by line, a balanced chunk at a time: what does not compile is refused by `differs`
+    lines = "\n".join(parts).splitlines()
+    size = max(len(lines) // 4, 1)
+    while size >= 1:
+        i = len(lines) - size
+        while i >= 0:
+            t = lines[:i] + lines[i + size:]
+            if t and differs(t, d):
+                lines = t
+            i -= size
+        size //= 2
+    print("\n".join(lines))

@@ -12927,3 +12927,14 @@ Where it stopped (branch `s363-dc`, worktree `build/wt_dc`, on top of `s362-wip`
 - **`int32_narrow_locals` took any sum for a ring** (silent, older than this session, the fuzzer again): an operand of `+ - *` whose result is used modulo 2^32 was stored in 32 bits, whatever the other operand: `(Math.max(1e-7, s) - (p0 + p2)) ^ x`
   wrapped `p0 + p2` and lost it beside the fraction (-7 for 7), and `(x * y) | 0` multiplied wrapped operands in doubles when the product passes 2^53 (145474304 for 145473536). Both operands and the result must be exact integers now.
 - `scripts/fuzz/`: the two differential fuzzers (`numbers`, `statements`), a reducer, `docs/agent_workflow.md` section 2.3.
+- **`try { f(); } catch { } finally { g(); }` rethrew what `f` threw** (silent to the statement, older than this session, found by the `statements` fuzzer; `catch (e) { }` was right): the emitter tells a clause from none by its
+  variable or its body, and this form has neither. A clause with no binding has a variable now (`exceptions/empty_catch_finally`).
+- Fuzzer totals: `numbers` 300 programs (5 wrong from the return facts, 1 from the ring, 1 on the 2^53 limit, taken out of the constants), `statements` 287 (2 from the empty catch, then 137 clean). `scripts/fuzz/gen_features.py` (strings, collections,
+  patterns, coroutines, captures, classes, typed arrays, nullable, labels) is written: seed 1 agrees, no other seed has run. `scripts/fuzz/run.sh` is the scratchpad runner with its paths through the repo and has not run as it stands.
+- Stopped at Kaz's request (2026-11-02), not gated, nothing running. On battery in Low Power Mode. Next, in this order:
+  1. `bash scripts/fuzz/run.sh features 1 150`, then fix what it finds.
+  2. The kernels by instructions again: `int32_narrow_locals` changed after the sweep above, so the int32 chains are not yet measured.
+  3. The gates: `caffeinate -ims bash build/gates_s363b/run.sh` from the main checkout's `build/` (the runner is not in the repo; about 1.5 hours in Low Power Mode, summary in `build/gates_s363b/summary.txt`; unit, bundler, conf three ways,
+     bench correctness, ci, ir-parity, rx diffs, gc, hono survey, hono, hono_app and vue against r29, tsc-ts build and A/B). `protect`, `gc` and the tsc-ts build have not run on anything since Session 362.
+  4. `scripts/gate.sh bench` with its budgets on mains power: only there can it pass.
+  5. `gate.sh ir-parity snap`, the final numbers here, merge to main, push.

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # A differential fuzzer against Node: random programs, each compiled by garnet and run under both engines.
-#   bash scripts/fuzz/run.sh numbers|statements <first-seed> <last-seed>
+#   bash scripts/fuzz/run.sh numbers|statements|features <first-seed> <last-seed>
 # One program at a time at nice 12. What differs is kept in build/fuzz/found (`<kind><seed>.ts`, `.v8`, `.aot`), a reject too;
 # scripts/fuzz/reduce.py cuts a program down. A seed names a program, so a finding can be run again by anyone.
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-kind=${1:?numbers or statements}; from=${2:?first seed}; to=${3:?last seed}
+kind=${1:?numbers, statements or features}; from=${2:?first seed}; to=${3:?last seed}
 W="$ROOT/build/fuzz/work"; F="$ROOT/build/fuzz/found"; mkdir -p "$W" "$F"
 n=0; bad=0; rej=0
 for s in $(seq "$from" "$to"); do

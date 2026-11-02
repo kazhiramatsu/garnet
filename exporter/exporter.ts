@@ -16508,7 +16508,9 @@ class Exporter {
           const sym = this.symbolOf(name);
           catchVar = sym ? this.ensureLocal(ctx, sym, "reference", name.text)
                          : this.newLocal(ctx, "reference");
-        } else if (name) {
+        } else {
+          // a clause with no binding has a variable too: the emitter tells a clause from none by it, and
+          // `try { f(); } catch {} finally { g(); }` swallows what `f` threw
           catchVar = this.newLocal(ctx, "reference");
         }
         catchBody = this.captureBody(ctx, () => {
