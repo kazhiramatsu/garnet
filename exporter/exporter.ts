@@ -101,12 +101,14 @@ function isNodeBuiltinSpecifier(spec: string): boolean {
 }
 /** TypeScript's grammar errors that hang on the project's options or are not JavaScript's (a key twice in
  *  an object literal is valid). */
-const NOT_EARLY_GRAMMAR = new Set([1117, 1149, 1192, 1202, 1203, 1205, 1208, 1259, 1261, 1286, 1287, 1323, 1324, 1343, 1371, 1375, 1378, 1432, 1470, 1471, 1479, 1484]);
+const NOT_EARLY_GRAMMAR = new Set([1117, 1149, 1202, 1203, 1205, 1208, 1259, 1261, 1286, 1287, 1323, 1324, 1343, 1371, 1375, 1378, 1432, 1470, 1471, 1479, 1484]);
 /** JavaScript's early errors that TypeScript makes in the checker. */
-const CHECKER_EARLY_ERRORS = new Set([2300, 2305, 2459, 2460, 2614, 2335, 2337, 2338, 2357, 2364, 2392, 2451, 2462, 2523, 2524, 2660, 2777, 2779, 2815, 5076, 17006, 17007, 17012, 17013, 18006, 18011, 18012, 18016, 18061]);
+const CHECKER_EARLY_ERRORS = new Set([2300, 2303, 2305, 2306, 2459, 2460, 2614, 2661, 2335, 2337, 2338, 2357, 2364, 2392, 2451, 2462, 2523, 2524, 2660, 2777, 2779, 2815, 5076, 17006, 17007, 17012, 17013, 18006, 18011, 18012, 18016, 18061]);
 /** Does this diagnostic say what JavaScript itself refuses before running? Under TSAOT_UNTYPED no type is
  *  trusted, but such a program is still not compiled. */
 function isEarlyError(d: ts.Diagnostic): boolean {
+  // two functions of one name: a module's lexical declarations, a script's hoisted vars
+  if (d.code === 2393) return d.file !== undefined && ts.isExternalModule(d.file);
   // a redeclaration against another file (a script's `name` and lib.dom's) is the checker's view of scripts
   if ((d.code === 2300 || d.code === 2451) && !(d.relatedInformation ?? []).every((r) => r.file === d.file)) return false;
   if (d.code === 2339) return ts.flattenDiagnosticMessageText(d.messageText, " ").startsWith("Property '#"); // an undeclared private name
@@ -128,6 +130,20 @@ function declarationsInStatementPosition(sf: ts.SourceFile): ts.Diagnostic[] {
       code: 1344, messageText: "A declaration is not allowed here: only a statement is." });
   };
   const visit = (n: ts.Node): void => {
+    // a binding of an import in strict code
+    if ((ts.isImportSpecifier(n) || ts.isImportClause(n) || ts.isNamespaceImport(n)) && n.name && (n.name.text === "eval" || n.name.text === "arguments")) {
+      out.push({ file: sf, start: n.name.getStart(sf), length: n.name.getWidth(sf), category: ts.DiagnosticCategory.Error,
+        code: 1100, messageText: `Unexpected eval or arguments in strict mode: '${n.name.text}'.` });
+    }
+    // `export { x }` of a name the module does not declare
+    if (ts.isExportSpecifier(n) && !n.parent.parent.moduleSpecifier) {
+      const name = n.propertyName ?? n.name;
+      const locals = (sf as unknown as { locals?: Map<string, ts.Symbol> }).locals;
+      if (ts.isIdentifier(name) && locals && !locals.has(name.escapedText as string)) {
+        out.push({ file: sf, start: name.getStart(sf), length: name.getWidth(sf), category: ts.DiagnosticCategory.Error,
+          code: 2661, messageText: `Export '${name.text}' is not defined in the module.` });
+      }
+    }
     if (ts.isIfStatement(n)) { check(n.thenStatement, true); check(n.elseStatement, true); }
     else if (ts.isIterationStatement(n, false)) check(n.statement, false);
     else if (ts.isLabeledStatement(n)) check(n.statement, true);
@@ -14652,6 +14668,11 @@ class Exporter {
       return;
     }
     if (ts.isIdentifier(lhs)) {
+      // an import is an immutable view of the exporter's binding (TS2632 in a checked program)
+      if (((this.checker.getSymbolAtLocation(lhs)?.flags ?? 0) & ts.SymbolFlags.Alias) !== 0) {
+        this.emitThrowTypeError(ctx, lhs, "Assignment to constant variable.");
+        return;
+      }
       const sym = this.symbolOf(lhs);
       const namespace = sym && this.namespaceBindings.get(sym);
       if (namespace) {

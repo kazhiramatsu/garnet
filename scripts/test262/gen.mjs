@@ -53,7 +53,7 @@ function compose(file, rel) {
   const type = neg ? (neg[1].match(/type:\s*(\S+)/)?.[1] ?? "") : "";
   // A case that must be refused before it runs is compiled as a TypeScript file is: alone, with the
   // checker on, whose syntax and early errors are what a real program would meet.
-  if (phase === "parse" || phase === "early") {
+  if (phase === "parse" || phase === "early" || phase === "resolution") {
     fs.writeFileSync(dst, "declare function $DONOTEVALUATE(): never;\n" + text);
     meta.push([slugOf(rel), flags.join(","), phase, type, listField(front, "features").join(",")].join("\t"));
     return;

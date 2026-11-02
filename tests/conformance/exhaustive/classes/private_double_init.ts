@@ -1,3 +1,4 @@
+// @oracle esnext
 class Base { constructor(o: any) { return o; } }
 function t(name: string, mk: () => any) { const o = {}; try { mk()(o); console.log(name, "first ok"); mk()(o); console.log(name, "no throw"); } catch (e: any) { console.log(name, e.name, e.message); } }
 class F extends Base { #x = 1; }
