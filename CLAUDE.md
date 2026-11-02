@@ -189,6 +189,11 @@ Rust in §315; selfhost is kept as a performance metric).
   program keeps no source text): a library that reads a function's source sees no body. `err.stack` is the
   header and one `at <anonymous>` line, made when read. A WeakRef holds its target strongly and a
   FinalizationRegistry never calls back, as the specification allows.
+- A property name is interned for the life of the run: a program that makes unbounded distinct dynamic keys grows, and stops loudly at 1.9 G of them.
+  A dense integer-keyed plain object is a dictionary of those names (V8: elements), x35 of Node on a million keys.
+- A dead-zone read of a class binding other than `new` and `instanceof` is undefined, and the static analysis does not see through an import cycle
+  (`docs/tdz_design.md`). `Number.prototype.valueOf` installed on a typed `Date` instance is not seen by `d.valueOf()` (a builtin receiver's method is static).
+- A class whose constructor returns a value is a dynamic class, its subclasses too (`return new Proxy(this, h)`); a private element on a Proxy `this` is a TypeError at its read.
 - `o.__proto__` and `o["__proto__"]` read undefined (V8: the prototype through the accessor);
   `Object.getPrototypeOf` / `setPrototypeOf` are the modelled forms (Session 355 note).
 - A typed receiver that is a Proxy (vue's reactive arrays and collections) takes its methods through

@@ -12879,7 +12879,19 @@ Where it stopped (branch `s363-dc`, worktree `build/wt_dc`, on top of `s362-wip`
   The second initialization of a private element is a TypeError, a private field without an initializer exists on an answered object.
 - A declaration where the grammar has a statement (`for (...) async function* g() {}`), an import of a name the module does not export
   in an unchecked program: compile-time rejects.
-- Not gated yet (2026-11-02, stopped at Kaz's request): after the last three items conformance has not been rerun, nor bench, unit, strict,
-  protect, gc, bundler or the tsc-ts A/B. The last run: 778 of 778 before them. Next: `build/t262_some_lf` left 7 wrong (module-code: `instn-iee-err-circular`,
-  `early-dup-top-function` kinds) and 3 rejects of an assignment to a function declaration's binding. /tmp/claude-501/scale/scale.ts is a scaling
-  benchmark of the builtins against node, not run yet.
+- **A scaling benchmark of the builtins against Node** (98 operations at sizes where a quadratic path shows) found, in one run:
+  - `delete o[k]` shifted the entries and rebuilt the index each time: 200 000 deletes took 54 s (Node 49 ms). A dictionary with an index keeps
+    a hole now and compacts at half holes: 43 ms.
+  - **the millionth distinct property name of a run became a method key** (`TS_METHOD_KEY_BASE` was 1 000 000): gone from `Object.keys` (63
+    keys of 300 000), and sharing an id with a method. The base is 1.9 G now, and past it the program stops loudly.
+  - `Object.keys` of integer keys was a selection sort (30 000 keys: 4 s): sorted now.
+  - a double's digits came from trying 17 precisions through `snprintf` and `strtod` (1.1 us for a short one): Schubfach, `runtime/dtoa_table.h`
+    from `scripts/gen_dtoa_table.py`, 1.3 million doubles of every kind printed as V8 prints them: 53 ns, x2.2 of Node.
+  - `splice` allocated a new buffer each time: in place, the shorter side moves (x11 -> x1.x); `slice`, `concat`, `[...a]`, `push(...a)` copy at once;
+    `indexOf` and `includes` of what only its own bits equal compare bits; a typed array's `fill` by size; `{...o}` and `Object.assign({}, o)`
+    take the shape and the slots of a plain object (x11 -> x2.7); ASCII `toUpperCase` / `toLowerCase` (x30 -> x1.5).
+  - `structuredClone` and `DOMException` did not exist.
+  Left, recorded: `replace` of a first match copies the string (Node's result is a cons string), a dense integer-keyed plain object is a dictionary of
+  interned names (x35: V8 has elements), `"ab".repeat(n)` copies, an interned name is never freed.
+- test262's `phase: resolution` cases now go through the checker as `parse` and `early` do. language NR%50==31 slice: 405 pass, 7 wrong -> 4 wrong on
+  module-code's resolution errors (a default through a star, a circular re-export, a missing star target), 3 rejects of an assignment to a function declaration's binding.
