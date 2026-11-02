@@ -16452,7 +16452,9 @@ class Exporter {
       // Snapshot enumerable string keys across the full prototype chain,
       // deduplicating shadowed names as EnumerateObjectProperties requires.
       //   let i=0; while(i<keys.length){ k = keys[i]; body; i++ }
-      const obj = this.lowerExpr(ctx, stmt.expression);
+      // (a local of its own: the body can assign the variable the expression names)
+      const obj = this.newLocal(ctx, "reference");
+      ctx.body.push({ kind: "Copy", dst: obj, src: this.lowerExpr(ctx, stmt.expression) });
       const keys = this.newLocal(ctx, "reference");
       ctx.body.push({ kind: "CallBuiltinStatic", dst: keys, builtin: "object.forInKeys", args: [obj] });
       // a key that has gone before the walk reached it is not visited (ts_for_in_live)

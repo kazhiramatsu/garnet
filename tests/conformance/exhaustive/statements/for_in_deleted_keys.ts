@@ -27,6 +27,10 @@ t("shadowed", () => { const p: any = { a: 1, b: 2 }; const o: any = Object.creat
 t("delete uncovers", () => { const p: any = { a: 1, b: 2 }; const o: any = Object.create(p); o.b = 1; return walk(o, () => { delete o.b; }); });
 t("relinked", () => { const o: any = Object.create({ q: 1, r: 2 }); o.a = 1; return walk(o, () => { Object.setPrototypeOf(o, null); }); });
 t("elsewhere", () => { const o: any = { a: 1, b: 2 }; const other: any = { z: 1 }; return walk(o, () => { delete other.z; }); });
+t("receiver reassigned", () => { let o: any = { a: 1, b: 2, c: 3 }; const r: string[] = []; for (const k in o) { r.push(k); o = { z: 1 }; } return r; });
+t("receiver deleted from after", () => { let o: any = { a: 1, b: 2, c: 3 }; const first = o; const r: string[] = []; for (const k in o) { r.push(k); o = null; delete first.c; } return r; });
+t("number receiver", () => { let o: any = 5; const r: string[] = []; for (const k in o) r.push(k); return r; });
+t("null receiver", () => { let o: any = null; const r: string[] = []; for (const k in o) r.push(k); return r; });
 t("typed array", () => { const a = new Int32Array(3); return walk(a, () => { }); });
 t("string", () => walk("ab", () => { }));
 t("nested", () => { const o: any = { a: 1, b: 2, c: 3 }; const r: string[] = []; for (const k in o) { r.push(k); for (const j in o) { if (j === "b") delete o.c; } } return r; });

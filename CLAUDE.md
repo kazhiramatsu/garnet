@@ -195,14 +195,16 @@ Rust in §315; selfhost is kept as a performance metric).
   FinalizationRegistry never calls back, as the specification allows.
 - A recursion the C compiler makes a loop spins where V8 throws a RangeError, when it has an exit that is never taken
   (`if (n < 0) return 0; return f(n + 1) + 1;`); one with no exit keeps its calls and overflows (`docs/exceptions_design.md`).
-  A sparse array past 2^29 elements stays sparse and a generic method over it (`indexOf`, `Object.keys`) is a RangeError
-  where V8 walks its dictionary. `new Float64Array(2 ** 33)` is a RangeError where V8 maps it lazily. V8's cycle error
+  A sparse array past 2^29 elements stays sparse and a generic method over it (`indexOf`, `join`) is a RangeError
+  where V8 walks its dictionary; its own keys, values and `console.log` come from the table. `new Float64Array(2 ** 33)` is a RangeError where V8 maps it lazily. V8's cycle error
   has the path in its message, garnet's is the first line; a cycle past 1024 levels is found up to 1024 levels late.
 - A property name is interned for the life of the run: a program that makes unbounded distinct dynamic keys grows, and stops loudly at 1.9 G of them.
   A dense integer-keyed plain object is a dictionary of those names (V8: elements), x35 of Node on a million keys.
 - A dead-zone read of a class binding other than `new` and `instanceof` is undefined, and the static analysis does not see through an import cycle
   (`docs/tdz_design.md`). `Number.prototype.valueOf` installed on a typed `Date` instance is not seen by `d.valueOf()` (a builtin receiver's method is static).
 - A class whose constructor returns a value is a dynamic class, its subclasses too (`return new Proxy(this, h)`); a private element on a Proxy `this` is a TypeError at its read.
+- A `for..in` over a Proxy does not skip a key deleted during the walk (its keys and descriptors are read at the start, V8 reads each
+  descriptor at the visit). `Array.prototype.join.call(arrayLike)` through the array library has no cycle stack (a plain array has, Session 363).
 - `o.__proto__` and `o["__proto__"]` read undefined (V8: the prototype through the accessor);
   `Object.getPrototypeOf` / `setPrototypeOf` are the modelled forms (Session 355 note).
 - A typed receiver that is a Proxy (vue's reactive arrays and collections) takes its methods through

@@ -49,6 +49,10 @@ binding is never initialized.
 
 `TSAOT_TDZ=0` turns the pass off.
 
+A module's dead-zone binding has its cell published in GLOBALS (`moduleCellGlobal`), as a binding a method captures: a direct
+call of a module-level `const f = () => ...` threads the module's record alone and the callers' free variables do not include
+what the callee captures (`constFnSymbols`), so a caller could not supply a cell (hono's `decodeURIComponent_`, a reject).
+
 ## Left
 
 A class binding keeps the `undefined` test of `binding.check`: `new K()` and `instanceof` throw the ReferenceError;
