@@ -7872,6 +7872,7 @@ tsv ts_str_tolower(tsv s){
 /* slice(start[,end]) with JS negative-index + clamping semantics */
 static long ts_slice_index(double value, long length){
   if (isnan(value)) return 0;
+  value = trunc(value);   /* ToIntegerOrInfinity first: a fraction above -1 is 0, not an offset from the end */
   if (value < 0) return value <= -(double)length ? 0 : length + (long)value;
   return value >= (double)length ? length : (long)value;
 }

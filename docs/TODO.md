@@ -12938,3 +12938,8 @@ Where it stopped (branch `s363-dc`, worktree `build/wt_dc`, on top of `s362-wip`
      bench correctness, ci, ir-parity, rx diffs, gc, hono survey, hono, hono_app and vue against r29, tsc-ts build and A/B). `protect`, `gc` and the tsc-ts build have not run on anything since Session 362.
   4. `scripts/gate.sh bench` with its budgets on mains power: only there can it pass.
   5. `gate.sh ir-parity snap`, the final numbers here, merge to main, push.
+- **Resumed (2026-11-02), on mains power.** `scripts/fuzz/run.sh features 1 150`: 148 ran, 1 wrong. The first run stood 34 minutes on seed 2, a generated `do..while` that never ends under Node, with no limit around `node` and nobody looking: every step of the runner
+  has a limit now, a program that does not end under Node is counted as `hung` and not compared, and there is a progress line per 25 seeds. `.join(<number>)` in the generator was a type error (seeds 7 and 15).
+- **`s.slice(-0.5)` and `a.slice(-0.5)` answered nothing** (silent, older than this session, found by the `features` fuzzer): `ts_slice_index` added `(long)value` to the length, and a fraction above -1 truncates to 0, so the end of the receiver. ToIntegerOrInfinity comes first now.
+  A probe of 5,022 lines (every index argument of the string, array and typed array methods, fractions, -0, NaN and the infinities, literal and through a variable) differed in 66, all of them this; 0 now (`stdlib/slice_fractional_index`).
+- Every bench kernel by instructions again, 324dc2d -> here, after `int32_narrow_locals`: 92 kernels +0.37%, the 17 of more than 500 M +0.32%, `int_kernel` -0.0%, the int32 chains not in the top of the list. Worst `gc_old_heap_churn_kernel` +4.9% (4.2 M, start-up), `string_unicode_search_kernel` +3.3%.

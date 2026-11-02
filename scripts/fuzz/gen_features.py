@@ -23,7 +23,7 @@ class G:
         if d <= 0 or r.random() < 0.3:
             return r.choice(sv) if sv and r.random() < 0.7 else s.str()
         a, b, n = s.sexpr(vs, sv, d-1), s.sexpr(vs, sv, d-1), s.nexpr(vs, 1)
-        return r.choice([f"({a} + {b})", f"({a} + {n})", f"({n} + {a})", f"`${{{a}}}-${{{n}}}`", f"{a}.slice({n})", f"{a}.substring({n})", f"{a}.toUpperCase()", f"{a}.trim()", f"{a}.padStart(4, \"*\")", f"{a}.repeat(2)", f"String({n})", f"({n}).toString()", f"{a}.replace(\"a\", {b})", f"{a}.split(\"\").reverse().join(\"\")", f"{a}.charAt(1)", f"[{a}, {b}].join({n})"])
+        return r.choice([f"({a} + {b})", f"({a} + {n})", f"({n} + {a})", f"`${{{a}}}-${{{n}}}`", f"{a}.slice({n})", f"{a}.substring({n})", f"{a}.toUpperCase()", f"{a}.trim()", f"{a}.padStart(4, \"*\")", f"{a}.repeat(2)", f"String({n})", f"({n}).toString()", f"{a}.replace(\"a\", {b})", f"{a}.split(\"\").reverse().join(\"\")", f"{a}.charAt(1)", f"[{a}, {b}].join(String({n}))"])
     def strings(s):
         r = s.r; v = s.id("v"); w = s.id("w"); n = s.num(); a = s.sexpr([v], [w]); 
         return [f"let {v} = {n};", f"let {w} = {s.str()};", f"{w} += {s.sexpr([v],[w])};", f"for (let i = 0; i < 3; i++) {{ {w} = {a}.slice(0, 40); {v} += {w}.length; }}",
@@ -75,7 +75,7 @@ class G:
     def controls(s):
         r = s.r; v = s.id("v")
         return [f"let {v} = 0;", f"outer: for (let i = 0; i < 4; i++) {{ for (let j = 0; j < 4; j++) {{ if (j === {r.randint(0,3)}) continue outer; if (i === {r.randint(1,3)}) break outer; {v} += i * j + 1; }} }}",
-                f"do {{ {v} = ({v} * 2 + 1) % 17; }} while ({v} % {r.choice([3,5,7])} !== 0 && {v} < 50);", f"switch ({v} % 4) {{ case 0: {v} += 1; case 1: {v} += 2; break; case 2: {{ {v} += 3; break; }} default: {v} -= 1; }}",
+                f"let {v}n = 0; do {{ {v} = ({v} * 2 + 1) % 17; }} while ({v} % {r.choice([3,5,7])} !== 0 && {v} < 50 && ++{v}n < 20);", f"switch ({v} % 4) {{ case 0: {v} += 1; case 1: {v} += 2; break; case 2: {{ {v} += 3; break; }} default: {v} -= 1; }}",
                 f"const {v}f = (a: number): number => {{ try {{ if (a > {s.num()}) return a; throw a; }} catch (e) {{ return (e as number) + 1; }} finally {{ {v} += 1; }} }};", f"p({v}, {v}f({s.num()}), {v}f({s.num()}), {v});"]
     def program(s):
         kinds = [s.strings, s.maps, s.patterns, s.coroutines, s.captures, s.classes, s.typed, s.nullable, s.controls]

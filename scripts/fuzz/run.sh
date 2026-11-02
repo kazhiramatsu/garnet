@@ -3,22 +3,25 @@
 #   bash scripts/fuzz/run.sh numbers|statements|features <first-seed> <last-seed>
 # One program at a time at nice 12. What differs is kept in build/fuzz/found (`<kind><seed>.ts`, `.v8`, `.aot`), a reject too;
 # scripts/fuzz/reduce.py cuts a program down. A seed names a program, so a finding can be run again by anyone.
+# Every step has a time limit: a program that does not end under Node is the generator's fault and is counted, not compared.
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 kind=${1:?numbers, statements or features}; from=${2:?first seed}; to=${3:?last seed}
 W="$ROOT/build/fuzz/work"; F="$ROOT/build/fuzz/found"; mkdir -p "$W" "$F"
-n=0; bad=0; rej=0
+n=0; bad=0; rej=0; hung=0
 for s in $(seq "$from" "$to"); do
   p="$W/$kind$s"; python3 "$ROOT/scripts/fuzz/gen_$kind.py" "$s" > "$p.ts"
-  if ! nice -n 12 "$ROOT/garnet" -o "$p.c" "$p.ts" > "$p.log" 2>&1; then
+  if ! nice -n 12 perl -e 'alarm 180; exec @ARGV' "$ROOT/garnet" -o "$p.c" "$p.ts" > "$p.log" 2>&1; then
     rej=$((rej+1)); cp "$p.ts" "$p.log" "$F/"; echo "BUILD $s: $(grep -m1 -E 'error|Error|reject|UNSUPPORTED' "$p.log" | cut -c1-120)"; continue
   fi
-  node "$ROOT/scripts/fuzz/transpile.js" "$p.ts"; node "$p.mjs" > "$p.v8" 2>&1
+  node "$ROOT/scripts/fuzz/transpile.js" "$p.ts"; perl -e 'alarm 20; exec @ARGV' node "$p.mjs" > "$p.v8" 2>&1
+  if [ $? -eq 142 ]; then hung=$((hung+1)); echo "HUNG $s: no end under Node"; continue; fi
   perl -e 'alarm 20; exec @ARGV' "$p" > "$p.aot" 2>&1
   n=$((n+1))
   if ! cmp -s "$p.v8" "$p.aot"; then
     bad=$((bad+1)); cp "$p.ts" "$p.v8" "$p.aot" "$F/"; echo "DIFF $s: $(diff "$p.v8" "$p.aot" | sed -n 2,4p | tr '\n' ' ' | cut -c1-150)"
   fi
   rm -f "$p" "$p.c" "$p.mjs" "$p.json" "$p.l.json" "$p.lsites.json"
+  [ $(( (s - from + 1) % 25 )) -eq 0 ] && echo "[fuzz] at $s: ran=$n diff=$bad rejected=$rej hung=$hung"
 done
-echo "[fuzz] $kind ran=$n diff=$bad rejected=$rej"
+echo "[fuzz] $kind ran=$n diff=$bad rejected=$rej hung=$hung"
