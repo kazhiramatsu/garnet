@@ -25380,7 +25380,7 @@ static void ts_garnet_global_init(tsv global){
   ts_set_fn_meta(f2, 1u, "isPublished"); ts_set_cstr(g, "isPublished", f2);
   ts_set_cstr(g, "sharesGraphs", ts_bool(1));
   ts_set_cstr(global, "__garnet", g);
-  ts_gc_unroot(12);
+  ts_gc_unroot(13);
 }
 /* The `__garnet_json` global the garnet:json module calls (lib/garnet/json.ts,
    docs/typed_json_design.md): `layout(keys)` interns a key sequence as a
