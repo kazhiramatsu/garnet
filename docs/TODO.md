@@ -12895,3 +12895,7 @@ Where it stopped (branch `s363-dc`, worktree `build/wt_dc`, on top of `s362-wip`
   interned names (x35: V8 has elements), `"ab".repeat(n)` copies, an interned name is never freed.
 - test262's `phase: resolution` cases now go through the checker as `parse` and `early` do. language NR%50==31 slice: 405 pass, 7 wrong -> 4 wrong on
   module-code's resolution errors (a default through a star, a circular re-export, a missing star target), 3 rejects of an assignment to a function declaration's binding.
+- Stopped at Kaz's request (2026-11-02), not gated. The stopped gate run at `cbf7202` (logs: build/s363_probes/g2): bundler 56 pass; conformance 788 of 789 and strict
+  785 of 786 (`stdlib/structured_clone`: `kc instanceof K` true under `@ts-nocheck`, the d.ts says `T`); bench `string_unicode_search_kernel` 102 against a budget of 100;
+  unit: three runtime tests of the property index ("shrinks to linear", "rebuild after shrink", "collision rebuild") that describe the rebuild a delete used to do.
+  protect and gc did not run, nor the tsc-ts build and A/B. Next: those three, then build/s363_probes/lim.ts (behaviour at the limits, not run yet).
