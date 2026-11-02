@@ -48,6 +48,15 @@
 #define TS_RT_UNLIKELY(x) (x)
 #endif
 
+/* A recursion with no way out keeps its calls: a loop has no stack to overflow (docs/exceptions_design.md). */
+#if defined(__clang__)
+#define TS_NO_TAIL_CALLS __attribute__((disable_tail_calls))
+#elif defined(__GNUC__)
+#define TS_NO_TAIL_CALLS __attribute__((optimize("no-optimize-sibling-calls")))
+#else
+#define TS_NO_TAIL_CALLS
+#endif
+
 #if defined(TSAOT_USE_MIMALLOC)
 #include <mimalloc.h>
 #define malloc  mi_malloc

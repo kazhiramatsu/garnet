@@ -195,3 +195,73 @@ fn tarjan_scc(adj: &[Vec<FunctionId>]) -> Vec<Vec<FunctionId>> {
     }
     sccs
 }
+
+/// Functions that cannot return without calling back into their own recursion. V8 overflows its stack on one and
+/// throws a RangeError a program can catch; the C compiler would turn it into a loop, which has no stack to overflow
+/// and spins (docs/exceptions_design.md). Only these lose their tail calls: a recursion with a way out wants the loop
+/// (`fib`'s second call), and one whose exit is never taken still spins.
+pub fn recursion_without_exit(program: &Program) -> std::collections::HashSet<u32> {
+    fn leaves(body: &[Inst]) -> bool {
+        body.iter().any(|i| match i {
+            Inst::Return { .. } | Inst::Throw { .. } => true,
+            Inst::If { then_body, else_body, .. } => leaves(then_body) || leaves(else_body),
+            Inst::Loop { cond_body, body, .. } => leaves(cond_body) || leaves(body),
+            Inst::TryCatch { try_body, catch_body, finally_body, .. } => {
+                leaves(try_body) || leaves(catch_body) || leaves(finally_body)
+            }
+            _ => false,
+        })
+    }
+    /// What every path through `body` calls directly before it leaves the function, `after` being what the code
+    /// that follows calls. A loop and a `try` promise nothing, and end the walk when they can leave.
+    fn must_call(body: &[Inst], after: BTreeSet<u32>) -> BTreeSet<u32> {
+        let mut cur = after;
+        for inst in body.iter().rev() {
+            match inst {
+                Inst::Return { .. } | Inst::Throw { .. } | Inst::Break { .. } | Inst::Continue { .. } => cur.clear(),
+                Inst::Call { callee: CalleeRef::Direct { func }, .. } => {
+                    cur.insert(func.0);
+                }
+                Inst::If { then_body, else_body, .. } => {
+                    let a = must_call(then_body, cur.clone());
+                    let b = must_call(else_body, cur);
+                    cur = a.intersection(&b).copied().collect();
+                }
+                Inst::Loop { .. } | Inst::TryCatch { .. } => {
+                    if leaves(std::slice::from_ref(inst)) {
+                        cur.clear();
+                    }
+                }
+                _ => {}
+            }
+        }
+        cur
+    }
+    let mut out = std::collections::HashSet::new();
+    let by_id: std::collections::HashMap<u32, &Function> = program.functions.iter().map(|f| (f.id.0, f)).collect();
+    let graph = build_call_graph(program);
+    for scc in graph.order.iter().filter(|scc| graph.is_cyclic(scc)) {
+        let mut live: BTreeSet<u32> = scc
+            .iter()
+            .map(|f| f.0)
+            .filter(|id| by_id.get(id).is_some_and(|f| !f.is_async && !f.is_generator))
+            .collect();
+        let edges: Vec<(u32, BTreeSet<u32>)> =
+            live.iter().map(|&id| (id, must_call(&by_id[&id].body, BTreeSet::new()))).collect();
+        // what remains has an edge into what remains: no walk along these edges ever ends
+        loop {
+            let before = live.len();
+            let kept: BTreeSet<u32> = edges
+                .iter()
+                .filter(|(id, to)| live.contains(id) && to.iter().any(|t| live.contains(t)))
+                .map(|(id, _)| *id)
+                .collect();
+            live = kept;
+            if live.len() == before {
+                break;
+            }
+        }
+        out.extend(live);
+    }
+    out
+}

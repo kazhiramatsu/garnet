@@ -12903,3 +12903,20 @@ Where it stopped (branch `s363-dc`, worktree `build/wt_dc`, on top of `s362-wip`
   `.g` ran the getter, `instanceof` folded to true (silent, V8: TypeError, undefined, false). The classes a clone reaches are foreign now, a generic function that answers a clone counts for its
   callers (`clonedClasses`, `docs/cast_to_number_design.md`, `stdlib/structured_clone_classes`). The same walk found `JSON.parse(s) as Record<string, Config>` and
   `Promise.resolve(JSON.parse(s))` reading NaN (silent): it goes through the arguments of the lib's generics. The three unit tests of the property index describe holes and compaction at half.
+- **The limits probe** (build/s363_probes/lim.ts, 72 cases, one at a time under a wall and an RSS limit, against Node). No crash and no wrong value; what it found:
+  - `s + s` past `UINT32_MAX` was an `abort()`, and below it a string past V8's maximum length went on growing (`(s + s + s + s).length` was 1073741824; a `RangeError` in V8). Every string is
+    allocated in `ts_string_alloc_storage` now, which throws, and the six aborts of the concat, join and builder paths are that RangeError; `replace` over the limit answered `undefined`, silently.
+  - `const a = []; a[4294967294] = 1; a.indexOf(1)` and `new Array(2 ** 32 - 1)` asked for 32 GB: the first through `array_densify`, which every generic method takes. Past 4 GB it is a RangeError
+    (V8 walks a dictionary, 80 s on that line), `new Array(n)` past 2^28 elements is only a length.
+  - A recursion the C compiler made a loop spun where V8 throws: `function f(n) { return f(n + 1) + 1; }`, `function f() { depth++; f(); }`. A function that cannot return without calling back
+    into its recursion keeps its calls (`recursion_without_exit`, docs/exceptions_design.md, every entry: the boxed one, `_d`, `_i64`, `_f64`). `fib` keeps its loop.
+  - `JSON.stringify` stopped at 4096 levels, a list of ten thousand links was a RangeError: 2 million now, and the cycle test every 1024 levels past the first 1024.
+  - A regular expression's backtrack stack held a quarter of V8's: the same 64 MiB, in entries of four slots (`/^(a|b)*$/` over two million characters). 256 MiB.
+  - Left as they are: the text of V8's cycle error (`--> starting at object with constructor`), a `Float64Array(2 ** 33)` that is a RangeError where V8 maps it lazily. Where V8 throws and garnet answers the
+    right value (`Math.max(...new Array(200000))`, `flat(Infinity)` 200 000 deep) it stays that way.
+- The bench budgets could not be judged today: the machine is on battery in Low Power Mode, every kernel x1.88 (median) of the stopped run, seven over budget. By instructions (324dc2d -> this) the kernels
+  are +0.1% (start-up, 0.9 M), `string_unicode_search_kernel` +3.4% with identical generated C: the position arguments' correctness and clang's inlining; budget 100 -> 105 ms. `inherit_sroa_kernel` (31, 64, 125 ms) and
+  `obj_kernel` (76, 126, 204 ms) move run to run with the same instruction counts.
+- **A parameter's facts did not count the function's own calls** (silent, older than this session, found by the limits fixture): `gcd(1071, 462)` was 147, the integer entry `_i64` took `b` for 462 because
+  `gcd(b, a % b)` was skipped: `collect_i64_seed_param_facts` dropped an argument the base facts could not prove, and `validate_i64_direct_calls` holds it to an integer and no more. In a candidate's body the
+  argument now takes the parameter's constant, range and sign away (`functions/recursive_param_facts`); `console.log(gcd(1071, 462))` alone hid it because the emitted C happened to use a different call path only with a second call site.

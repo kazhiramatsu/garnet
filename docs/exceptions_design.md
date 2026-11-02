@@ -118,5 +118,10 @@ signal state as it found it. That function builds the error with the collector h
 conservative scan walks the thread's stack, which is not this one) and throws: the `longjmp` lands on the
 thread's stack again, at the nearest `try`. A fault during a collection, and every other fault, flushes
 stdout and takes the default action, so a crash no longer loses what the program printed. ASan builds
-keep their own handler. The depth is 256 MB's, not V8's 1 MB, and a recursion the C compiler turns into a
-loop (a tail call, an accumulator) has no stack to overflow: it spins where V8 throws.
+keep their own handler. The depth is 256 MB's, not V8's 1 MB.
+
+A recursion the C compiler turns into a loop (a tail call, an accumulator) has no stack to overflow and spins where V8
+throws. A function that cannot return without calling back into its recursion, `function f(n) { return f(n + 1) + 1; }`,
+keeps its calls (`recursion_without_exit`, `TS_NO_TAIL_CALLS`, clang's `disable_tail_calls`). Every other recursion keeps
+the loop, which is what `fib` runs on: one with an exit that is never taken (`if (n < 0) return 0; return f(n + 1) + 1;`)
+still spins.

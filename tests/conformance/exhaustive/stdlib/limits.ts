@@ -1,0 +1,25 @@
+// At the limits: V8's error and the program goes on, or the right value; never a crash, a wrapped length or a machine out of memory.
+const t = (name: string, f: () => unknown) => { try { console.log(name, f()); } catch (e: any) { console.log(name, "throws", e.name, e.message); } };
+const s = "a".repeat(2 ** 28);
+t("plus", () => (s + s).length);
+t("plus equals", () => { let b = s; b += s; return b.length; });
+t("plus equals a loop", () => { let b = ""; for (let i = 0; i < 3; i++) b += s; return b.length; });
+t("template", () => `${s}${s}`.length);
+t("template with a number", () => `${s}${s}${1}`.length);
+t("concat", () => s.concat(s).length);
+t("join", () => [s, s].join("").length);
+t("join four", () => [s, s, s, s, s, s, s, s, s].join(",").length);
+t("replaceAll", () => ("a".repeat(1024) as any).replaceAll("a", "x".repeat(2 ** 20)).length);
+t("replace callback", () => "a".repeat(1024).replace(/a/g, () => "b".repeat(2 ** 20)).length);
+t("padEnd", () => s.padEnd(2 ** 29).length);
+t("repeat", () => s.repeat(2).length);
+t("a number joined", () => (s + s.slice(0, 2 ** 28 - 25) + 12).length);
+t("the program goes on", () => (s + "b").length);
+t("new Array at the top", () => new Array(2 ** 32 - 1).length);
+t("new Array past 2^28", () => { const a = new Array(2 ** 29); a[5] = 1; a[2 ** 29 - 1] = 2; return [a.length, a[5], a[2 ** 29 - 1], a[6]]; });
+t("a far store", () => { const a: number[] = []; a[4294967294] = 1; return [a.length, a[4294967294], a[0]]; });
+t("push past the top", () => { const a: unknown[] = []; a.length = 2 ** 32 - 1; a.push(1); return a.length; });
+t("radix", () => (255).toString(37));
+t("regexp backtracking", () => /^(a|b)*$/.test("ab".repeat(1000000)));
+t("deep stringify", () => { let o: unknown = {}; for (let i = 0; i < 200000; i++) o = { o }; return JSON.stringify(o).length; });
+t("deep cycle", () => { const top: any = {}; let o = top; for (let i = 0; i < 5000; i++) { o.o = {}; o = o.o; } o.o = top; try { return JSON.stringify(top).length; } catch (e: any) { return e.name; } });

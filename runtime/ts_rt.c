@@ -2703,12 +2703,16 @@ static void array_make_sparse(ts_array* a){
   array_set_sparse_table(a, s);
   array_invalidate_dirty(a);
 }
+/* The longest array that goes dense on its own (4 GB of elements). The generic methods work on dense storage, and
+   one `a[4294967294] = 1` must not ask for 32 GB behind a read: a loud RangeError, where V8 walks a dictionary. */
+#define ARRAY_DENSE_LIMIT (1u << 29)
 /* Back to dense storage of max(len, need) slots: a hole wherever the table
    has no entry. Tombstones at or beyond the length are dropped. */
 static void array_densify(ts_array* a, uint32_t need){
   RT_STAT_INC(array_densify);
   ts_sparse_elems* s = array_sparse_table(a);
   uint32_t n = a->len > need ? a->len : need;
+  if (n > ARRAY_DENSE_LIMIT) ts_throw_range_error_msg("Invalid array length");
   uint32_t nc = n < 4u ? 4u : n;
   tsv* nd = nc <= 4u ? a->inline_data : (tsv*)gc_owned_alloc(&a->o.h, sizeof(tsv) * nc);
   for (uint32_t i = 0; i < nc; i++) nd[i] = TS_ARRAY_HOLE;
@@ -2770,7 +2774,7 @@ static void array_sparse_store(ts_array* a, uint32_t i, tsv v){
   if (a->o.h.gen == TS_GEN_OLD && array_value_is_young(v)){ a->gc_dirty_all = 1; gc_remember(&a->o.h); }
   /* A table holding an eighth of the length is cheaper dense (V8's
      fast-elements heuristic): materialize it. */
-  if ((uint64_t)s->count * 8u >= (uint64_t)a->len) array_densify(a, 0);
+  if ((uint64_t)s->count * 8u >= (uint64_t)a->len && a->len <= ARRAY_DENSE_LIMIT) array_densify(a, 0);
 }
 /* delete arr[i] / a reviver's undefined: the slot becomes a hole */
 static void array_put_hole(ts_array* a, uint32_t i){
@@ -2994,7 +2998,7 @@ void ts_array_set(tsv arr, uint32_t i, tsv v){
 /* i >= cap: grow the dense buffer, or store into the side table */
 static void ts_array_set_grow(ts_array* a, uint32_t i, tsv v){
   if (a->sparse == TS_ARRAY_DICT){ array_dict_store(ts_obj(a), i, v); return; }
-  if (i == UINT32_MAX){ ts_throw_range_error_msg("Invalid array index"); return; }   /* 2^32-1 is a named key: outside the element model (loud) */
+  if (i == UINT32_MAX){ ts_throw_range_error_msg("Invalid array length"); return; }   /* 2^32-1 is a named key: outside the element model (loud) */
   if (a->sparse){ array_sparse_store(a, i, v); return; }
   if (array_store_is_far(a, i)){ array_make_sparse(a); array_sparse_store(a, i, v); return; }
   array_ensure_cap(a, i + 1u);
@@ -5107,7 +5111,10 @@ static uint32_t strflags_storage(const char* data, uint32_t flags, uint32_t n){
   for (uint32_t i = 0; i < n; i++){ uint16_t cu; memcpy(&cu, data + (size_t)i * 2u, 2); if (cu >= 0x80u) return f; }
   return f | TS_STR_FLAG_ASCII;
 }
+/* Every string is allocated here, a builder's storage too, so a result past V8's maximum length is the RangeError
+   V8 throws whatever built it (a build that counts in 32 bits checks its total first: a wrapped length would pass). */
 static ts_string* ts_string_alloc_storage(uint32_t len, uint32_t flags){
+  if (TS_RT_UNLIKELY(len > TS_STR_MAX_LENGTH)) ts_throw_range_error_msg("Invalid string length");
   flags &= TS_STR_FLAG_UTF16;
   uint32_t unit = ts_str_unit_size_flags(flags);
   size_t bytes = (size_t)len * unit;
@@ -5133,16 +5140,15 @@ static uint32_t ts_string_storage_capacity(const ts_string* str){
   size_t slots = (bytes - sizeof(ts_string)) >> (unit >> 1);   /* a unit is one or two bytes: no division */
   if (slots == 0) return 0;
   slots--; /* preserve one trailing NUL code unit */
-  return slots > UINT32_MAX ? UINT32_MAX : (uint32_t)slots;
+  return slots > TS_STR_MAX_LENGTH ? TS_STR_MAX_LENGTH : (uint32_t)slots;   /* the append paths stop at the limit */
 }
 static uint32_t ts_string_builder_capacity(uint32_t used){
-  if (used > UINT32_MAX / 2u) return 0;
+  if (used > TS_STR_MAX_LENGTH) return 0;
   uint64_t target = (uint64_t)used * 2u;
   if (target < 32u) target = 32u;
   uint64_t cap = 32u;
-  while (cap < target && cap < 0x80000000ull) cap <<= 1;
-  if (cap < target) cap = target;
-  return cap <= UINT32_MAX ? (uint32_t)cap : 0;
+  while (cap < target && cap < TS_STR_MAX_LENGTH) cap <<= 1;
+  return cap < TS_STR_MAX_LENGTH ? (uint32_t)cap : TS_STR_MAX_LENGTH;
 }
 static ts_string* ts_string_alloc_buffer(uint32_t capacity, uint32_t flags){
   ts_string* str = ts_string_alloc_storage(capacity, flags);
@@ -6179,7 +6185,7 @@ static int ts_add_str_int_fast(tsv s, const char* digits, uint32_t nl, int digit
 static int ts_add_str_digits_builder(tsv s, const char* digits, uint32_t nl, int digits_first, tsv* out){
   ts_strview x = ts_str_view_typed(s);
   uint64_t n64 = (uint64_t)x.len + nl;
-  if (n64 > UINT32_MAX) return 0;
+  if (n64 > TS_STR_MAX_LENGTH) return 0;
   uint32_t n = (uint32_t)n64;
   uint32_t flags = x.flags & TS_STR_FLAG_UTF16;
   int all_ascii = !!(x.flags & TS_STR_FLAG_ASCII);
@@ -6275,10 +6281,9 @@ static tsv ts_str_add2(tsv sa, tsv sb){
   if (y.len == 0){ ts_gc_unroot(2); return sa; }
   if (x.len == 0){ ts_gc_unroot(2); return sb; }
   uint64_t n64=(uint64_t)x.len+(uint64_t)y.len;
-  if (n64 > UINT32_MAX){
+  if (n64 > TS_STR_MAX_LENGTH){
     ts_gc_unroot(2);
-    fprintf(stderr, "tsaot: RangeError: concatenated string too large\n");
-    abort();
+    ts_throw_range_error_msg("Invalid string length");
   }
   uint32_t n=(uint32_t)n64;
   uint32_t flags = (x.flags | y.flags) & TS_STR_FLAG_UTF16;
@@ -6501,11 +6506,10 @@ tsv ts_str_concat_many(tsv* args, int n){
     total += v.len;
     out_flags |= v.flags & TS_STR_FLAG_UTF16;
     all_ascii = all_ascii && !!(v.flags & TS_STR_FLAG_ASCII);
-    if(total > UINT32_MAX){
+    if(total > TS_STR_MAX_LENGTH){
       ts_gc_unroot(rooted);
       if (heap_parts) free(parts);
-      fprintf(stderr, "tsaot: RangeError: concatenated string too large\n");
-      abort();
+      ts_throw_range_error_msg("Invalid string length");
     }
   }
   if(total == 0){
@@ -7697,11 +7701,12 @@ static void ts_cu_builder_init(ts_cu_builder* b, uint32_t cap){
 }
 static void ts_cu_builder_reserve(ts_cu_builder* b, uint32_t add){
   if (add <= b->cap - b->len) return;
-  uint32_t nc = b->cap;
-  while (add > nc - b->len){
-    if (nc > UINT32_MAX / 2u) ts_abort_msg("string too large");
-    nc *= 2u;
+  if ((uint64_t)b->len + add > TS_STR_MAX_LENGTH){
+    free(b->data); b->data = NULL;
+    ts_throw_range_error_msg("Invalid string length");
   }
+  uint32_t nc = b->cap;
+  while (add > nc - b->len) nc *= 2u;
   uint16_t* p = (uint16_t*)realloc(b->data, sizeof(uint16_t) * (size_t)nc);
   if (!p) ts_abort_msg("out of memory growing string");
   b->data = p;
@@ -8051,7 +8056,7 @@ static double number_this_value(tsv numv){
    RangeError outside 2..36. */
 tsv ts_number_to_string_radix_d(tsv numv, double radix){
   double r = num_to_integer_or_inf(radix);
-  if (!(r >= 2 && r <= 36)) ts_throw_range_error_msg("toString() radix must be between 2 and 36");
+  if (!(r >= 2 && r <= 36)) ts_throw_range_error_msg("toString() radix argument must be between 2 and 36");
   double x = number_this_value(numv);
   if (r == 10 || x != x || isinf(x)) return ts_to_string_v(ts_num(x));
   return number_to_radix_string(x, (int)r);
@@ -9111,9 +9116,15 @@ tsv ts_array_slice(tsv arr, double start, double end, int has_end){
   if(e<s)e=s;
   return array_copy_ranges(arr, s, e - s, TS_UNDEFINED, 0);
 }
-/* new Array(n): a sparse array of length n (no indexed own properties). */
+/* new Array(n): a sparse array of length n (no indexed own properties): holes in a dense buffer, or past 2^28 elements
+   (2 GB of them) only a length, as for a far store, until the table is full enough to go dense. */
 tsv ts_array_new_length(double n){
   if (!(n >= 0.0) || n > 4294967295.0 || floor(n) != n) ts_throw_range_error_msg("Invalid array length");
+  if (n > (double)(1u << 28)){
+    tsv arr = ts_new_array(0);
+    ts_array_set_length(arr, (uint32_t)n);
+    return arr;
+  }
   return ts_new_array((uint32_t)n);
 }
 /* @@isConcatSpreadable on an operand */
@@ -9315,11 +9326,10 @@ tsv ts_array_join(tsv arr, tsv sep){
     out_flags |= pv.flags & TS_STR_FLAG_UTF16;
     all_ascii = all_ascii && !!(pv.flags & TS_STR_FLAG_ASCII);
     total += pv.len;
-    if(total > UINT32_MAX){
+    if(total > TS_STR_MAX_LENGTH){
       ts_gc_unroot((int)rooted + 2);
       if (heap_parts) free(parts);
-      fprintf(stderr, "tsaot: RangeError: joined string too large\n");
-      abort();
+      ts_throw_range_error_msg("Invalid string length");
     }
   }
   if(total==0){
@@ -12976,7 +12986,7 @@ static tsv ts_str_replace_literal_build(tsv s, tsv pat, tsv rep, int all){
   }
   if(count==0) return s;
   int64_t total64 = (int64_t)xs.len + (int64_t)count * ((int64_t)rs.len - (int64_t)ps.len);
-  if(total64 < 0 || total64 > UINT32_MAX) return TS_UNDEFINED;
+  if(total64 > TS_STR_MAX_LENGTH) ts_throw_range_error_msg("Invalid string length");
   uint32_t total = (uint32_t)total64;
   ts_gc_root(&s); ts_gc_root(&pat); ts_gc_root(&rep);
   uint32_t flags = (xs.flags | rs.flags) & TS_STR_FLAG_UTF16;
@@ -14138,13 +14148,17 @@ static int json_emit_prop_map_direct(jbuf* b, tsv obj, int depth, const char* in
 
 /* Open an object or array: a value already open on the path is a cycle
    (V8: TypeError "Converting circular structure to JSON"); past a depth the
-   C stack cannot take, V8's RangeError for a stack overflow. */
-#define TS_JSON_MAX_DEPTH 4096
+   C stack cannot take, V8's RangeError for a stack overflow. Below 1024 levels every value
+   is looked up on the path, as V8 does; deeper, every 1024th, or a chain of a million links costs
+   half a million million steps: a cycle that long is found up to 1024 levels late. */
+#define TS_JSON_MAX_DEPTH 2000000
 static void json_enter(jbuf* b, json_path* node, tsv* slot, int depth){
   if (depth > TS_JSON_MAX_DEPTH) ts_throw_range_error_msg("Maximum call stack size exceeded");
-  void* p = ts_ptr(*slot);
-  for (json_path* q = b->path; q; q = q->up)
-    if (ts_ptr(*q->slot) == p) ts_throw_type_error_msg("Converting circular structure to JSON");
+  if (depth < 1024 || (depth & 1023) == 0){
+    void* p = ts_ptr(*slot);
+    for (json_path* q = b->path; q; q = q->up)
+      if (ts_ptr(*q->slot) == p) ts_throw_type_error_msg("Converting circular structure to JSON");
+  }
   node->slot = slot; node->up = b->path; b->path = node;
 }
 static inline void json_leave(jbuf* b, json_path* node){ b->path = node->up; }
@@ -16173,7 +16187,7 @@ static tsv sb_from_view_value(tsv src, uint32_t extra, uint32_t want_utf16){
   ts_strview x = ts_str_view_typed(src);
   uint32_t flags = (x.flags | want_utf16) & TS_STR_FLAG_UTF16;
   uint64_t need = (uint64_t)x.len + extra;
-  if (need > UINT32_MAX / 2u){ ts_gc_unroot(1); fprintf(stderr, "tsaot: RangeError: concatenated string too large\n"); abort(); }
+  if (need > TS_STR_MAX_LENGTH){ ts_gc_unroot(1); ts_throw_range_error_msg("Invalid string length"); }
   uint32_t cap = ts_string_builder_capacity(need < 16u ? 16u : (uint32_t)need);
   ts_string* b = ts_string_alloc_buffer(cap, flags);
   x = ts_str_view_typed(src);
@@ -16209,7 +16223,7 @@ tsv ts_sb_append(tsv sb, tsv e){
   if (!sb_is_builder(sb)) sb = sb_from_view_value(ts_is_str(sb) ? sb : ts_to_string_v(sb), add_len, add_utf16);
   ts_string* b = ts_str_ptr_typed(sb);
   uint64_t n64 = (uint64_t)b->len + add_len;
-  if (n64 > UINT32_MAX / 2u){ ts_gc_unroot(2); fprintf(stderr, "tsaot: RangeError: concatenated string too large\n"); abort(); }
+  if (n64 > TS_STR_MAX_LENGTH){ ts_gc_unroot(2); ts_throw_range_error_msg("Invalid string length"); }
   uint32_t n = (uint32_t)n64;
   if (n > ts_string_storage_capacity(b) || (add_utf16 && !(b->flags & TS_STR_FLAG_UTF16))){
     sb = sb_from_view_value(sb, add_len, add_utf16);   /* copies; the old buffer becomes garbage */
@@ -16246,7 +16260,7 @@ tsv ts_sb_append_range(tsv sb, tsv s, uint32_t start, uint32_t end){
   if (!sb_is_builder(sb)) sb = sb_from_view_value(ts_is_str(sb) ? sb : ts_to_string_v(sb), add_len, add_utf16);
   ts_string* b = ts_str_ptr_typed(sb);
   uint64_t n64 = (uint64_t)b->len + add_len;
-  if (n64 > UINT32_MAX / 2u){ ts_gc_unroot(2); fprintf(stderr, "tsaot: RangeError: concatenated string too large\n"); abort(); }
+  if (n64 > TS_STR_MAX_LENGTH){ ts_gc_unroot(2); ts_throw_range_error_msg("Invalid string length"); }
   uint32_t n = (uint32_t)n64;
   if (n > ts_string_storage_capacity(b) || (add_utf16 && !(b->flags & TS_STR_FLAG_UTF16))){
     sb = sb_from_view_value(sb, add_len, add_utf16);

@@ -44,8 +44,9 @@ int rx_anchored_at_start(const rx_program* p);
 #define RX_EXEC_OVERFLOW (-1)
 int rx_exec(const rx_program* p, const void* input, uint32_t len, int wide, uint32_t start, int32_t* caps);
 
-/* The backtrack stack's limit in bytes (RX_EXEC_OVERFLOW past it): 64 MiB, V8's default. */
-#define RX_BACKTRACK_LIMIT_BYTES (64u << 20)
+/* The backtrack stack's limit in bytes (RX_EXEC_OVERFLOW past it): V8's 64 MiB holds slots of four bytes, an entry
+   here is four of them, so a pattern V8 runs fits in four times that. */
+#define RX_BACKTRACK_LIMIT_BYTES (256u << 20)
 
 /* Case mapping (rx_unicode.c): the non-`u` Canonicalize of a code unit, and the simple case
    folding of a code point (`u`/`v`). */

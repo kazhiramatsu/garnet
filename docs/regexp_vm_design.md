@@ -61,7 +61,7 @@ RegExp with every flag `d g i m s u v y`, including:
   `Object.prototype.toString`, `instanceof RegExp`. New: `RegExp.escape`, and a RegExp argument
   to the dynamic string methods (`(s as any).replace(re, f)`), which the runtime treated as a
   string.
-- Limits: a backtrack stack of 64 MiB; past it the match throws `RangeError: Maximum call stack
+- Limits: a backtrack stack of 256 MiB (V8's 64 MiB holds slots of four bytes, an entry here takes sixteen); past it the match throws `RangeError: Maximum call stack
   size exceeded` (V8's message). Out of the model, rejected loudly as today: the `Symbol.replace`
   / `Symbol.split` / `Symbol.match` protocol on RegExp subclasses, `RegExp.prototype.compile`,
   the legacy static properties (`RegExp.$1`), the `l` flag.

@@ -474,15 +474,17 @@ fn emit_program_with_string_plans(
     emit_static_string_literals(&mut s, &static_strings);
     emit_class_layout(&mut s, &classes);
 
+    let no_exit = crate::call_graph::recursion_without_exit(program);
+    let keeps_calls = |f: &Function| if no_exit.contains(&f.id.0) { "TS_NO_TAIL_CALLS " } else { "" };
     for f in &program.functions {
-        let _ = writeln!(s, "static tsv {}(tsv* args, int nargs);", cname(f));
+        let _ = writeln!(s, "{}static tsv {}(tsv* args, int nargs);", keeps_calls(f), cname(f));
     }
     let direct_sigs = direct_entry_sigs(program, &fclass, &param_facts_by_func, &i64_fast);
     let known_methods = known_method_candidates(program);
     for f in &program.functions {
         if let Some(sig) = direct_sigs.get(&f.id.0) {
             let storage = direct_entry_storage(f);
-            let _ = writeln!(s, "{} {} {}_d({});", storage, sig.c_ret(), cname(f), sig.c_params());
+            let _ = writeln!(s, "{}{} {} {}_d({});", keeps_calls(f), storage, sig.c_ret(), cname(f), sig.c_params());
         }
     }
     if needs_regexp {
@@ -506,7 +508,7 @@ fn emit_program_with_string_plans(
             } else {
                 "static"
             };
-            let _ = writeln!(s, "{} long long {}({});", storage, i64_cname(f), params);
+            let _ = writeln!(s, "{}{} long long {}({});", keeps_calls(f), storage, i64_cname(f), params);
         }
     }
     for f in &program.functions {
@@ -526,7 +528,7 @@ fn emit_program_with_string_plans(
             } else {
                 "static"
             };
-            let _ = writeln!(s, "{} double {}({});", storage, f64_cname(f), params);
+            let _ = writeln!(s, "{}{} double {}({});", keeps_calls(f), storage, f64_cname(f), params);
         }
     }
     s.push('\n');
@@ -9277,6 +9279,11 @@ fn collect_i64_seed_param_facts(
         .map(|f| (f.id.0, f.params.iter().map(|p| p.0).collect()))
         .collect();
     let mut out: BTreeMap<u32, BTreeMap<u32, NumFact>> = BTreeMap::new();
+    // A call outside a candidate with an argument nothing proves an integer takes the double entry, so it says
+    // nothing about the `_i64` one. In a candidate's body it reaches the `_i64` entry: `validate_i64_direct_calls`
+    // holds the argument to an integer, and that is all that is known of it. The parameter's constant, range and sign
+    // cannot stand (`gcd(b, a % b)`, with `gcd(1071, 462)` the only other call, took `b` for 462).
+    let mut widened: BTreeSet<(u32, u32)> = BTreeSet::new();
     for caller in &program.functions {
         let mut flat = Vec::new();
         flatten_inst(&caller.body, &mut flat);
@@ -9320,23 +9327,31 @@ fn collect_i64_seed_param_facts(
                 if let Some(params) = fn_params.get(&func.0) {
                     for (idx, p) in params.iter().enumerate() {
                         if let Some(arg) = argv.get(idx) {
-                            if !numeric_values.contains(arg) {
-                                continue;
-                            }
-                            if let Some(fact) =
+                            let proven = if numeric_values.contains(arg) {
                                 analysis.facts.get(arg).cloned().filter(|f| f.i64_safe)
-                            {
+                            } else {
+                                None
+                            };
+                            if let Some(fact) = proven {
                                 let merged = if let Some(old) = dst.get(p) {
                                     old.join(&fact)
                                 } else {
                                     fact
                                 };
                                 dst.insert(*p, merged);
+                            } else if candidates.contains(&caller.id.0) {
+                                widened.insert((func.0, *p));
                             }
                         }
                     }
                 }
             }
+        }
+    }
+    // a parameter with no proven call at all stays absent: the function is no candidate
+    for (func, p) in widened {
+        if let Some(fact) = out.get_mut(&func).and_then(|m| m.get_mut(&p)) {
+            *fact = fact.join(&NumFact::i64_value());
         }
     }
     out
