@@ -12919,4 +12919,11 @@ Where it stopped (branch `s363-dc`, worktree `build/wt_dc`, on top of `s362-wip`
   `obj_kernel` (76, 126, 204 ms) move run to run with the same instruction counts.
 - **A parameter's facts did not count the function's own calls** (silent, older than this session, found by the limits fixture): `gcd(1071, 462)` was 147, the integer entry `_i64` took `b` for 462 because
   `gcd(b, a % b)` was skipped: `collect_i64_seed_param_facts` dropped an argument the base facts could not prove, and `validate_i64_direct_calls` holds it to an integer and no more. In a candidate's body the
-  argument now takes the parameter's constant, range and sign away (`functions/recursive_param_facts`); `console.log(gcd(1071, 462))` alone hid it because the emitted C happened to use a different call path only with a second call site.
+  argument now takes the parameter's constant, range and sign away (`functions/recursive_param_facts`); a second outside call with other constants hid it: the join has no constant.
+- Every bench kernel by instructions, 324dc2d -> here (92 of 102 through the driver; ten need the bench's own lib settings): total +0.44%, the recursive kernels unchanged by the parameter fix (fibonacci, `int_kernel`, `generic_fn_kernel`
+  +0.1% or less), start-up +1.1 M of 49 M (0.3 ms), peak RSS +7% of 3.4 MB. Worst `gc_old_heap_churn_kernel` +5.0% (4.3 M). `string_huge_case_trim_kernel` -29%.
+- **A return fact is the integer entry's** (silent, older than this session, found by a differential fuzzer of number functions: scratchpad `fz/gen.py`, 150 programs, 5 wrong and 1 on the 2^53 limit): `return_facts` held at every
+  direct call, so with `f(-1)` somewhere, `f(-2.5)` of a function that returns its parameter was stored in an integer local: -2. It holds now where every argument is an integer, the same condition as the emission's choice of `_i64`.
+- **`int32_narrow_locals` took any sum for a ring** (silent, older than this session, the fuzzer again): an operand of `+ - *` whose result is used modulo 2^32 was stored in 32 bits, whatever the other operand: `(Math.max(1e-7, s) - (p0 + p2)) ^ x`
+  wrapped `p0 + p2` and lost it beside the fraction (-7 for 7), and `(x * y) | 0` multiplied wrapped operands in doubles when the product passes 2^53 (145474304 for 145473536). Both operands and the result must be exact integers now.
+- `scripts/fuzz/`: the two differential fuzzers (`numbers`, `statements`), a reducer, `docs/agent_workflow.md` section 2.3.

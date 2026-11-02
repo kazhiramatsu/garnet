@@ -7739,8 +7739,15 @@ fn int32_narrow_locals(f: &Function, facts: &BTreeMap<u32, NumFact>, int_local: 
         wrap.retain(|&x| {
             let one: BTreeSet<u32> = std::iter::once(x).collect();
             uses_of(x).all(|inst| match inst {
+                // the ring is the exact integers': `(f - x) | 0` with a fraction `f` is not a function of `x` modulo 2^32,
+                // and neither is `(x * y) | 0` of a product a double rounds (past 2^53, where it is no integer fact)
                 Inst::BinOp { dst, op, lhs, rhs } if lhs.0 == x || rhs.0 == x => {
-                    is_bitwise_op(op) || (matches!(op.as_str(), "+" | "-" | "*") && (exact.contains(&dst.0) || snapshot.contains(&dst.0)))
+                    let other = if lhs.0 == x { rhs.0 } else { lhs.0 };
+                    is_bitwise_op(op)
+                        || (matches!(op.as_str(), "+" | "-" | "*")
+                            && int_local.contains(&other)
+                            && int_local.contains(&dst.0)
+                            && (exact.contains(&dst.0) || snapshot.contains(&dst.0)))
                 }
                 Inst::UnOp { operand, op, .. } if operand.0 == x => op == "~",
                 Inst::Copy { dst, src } if src.0 == x => snapshot.contains(&dst.0),
@@ -7989,6 +7996,11 @@ fn infer_numeric_analysis(
                 users.entry(lhs.0).or_default().push(index);
                 if lhs != rhs {
                     users.entry(rhs.0).or_default().push(index);
+                }
+            }
+            Inst::Call { dst: Some(_), recv, args, .. } => {
+                for a in recv.iter().chain(args.iter()) {
+                    users.entry(a.0).or_default().push(index);
                 }
             }
             _ => {}
@@ -8305,6 +8317,17 @@ fn infer_numeric_analysis(
                 | Inst::GetProto { dst, .. }
                 | Inst::NewMap { dst }
                 | Inst::NewSet { dst } => Some((dst.0, NumFact::unknown())),
+                // A return fact is the integer entry's: a call with an argument no integer takes the double entry,
+                // and `f(-2.5)` of a function that returns its parameter is no integer.
+                Inst::Call {
+                    dst: Some(d),
+                    callee: CalleeRef::Direct { .. } | CalleeRef::Set { .. },
+                    recv,
+                    args,
+                    ..
+                } if !recv.iter().chain(args.iter()).all(|a| get(&facts, a.0).i64_safe) => {
+                    Some((d.0, NumFact::unknown()))
+                }
                 Inst::Call {
                     dst: Some(d),
                     callee: CalleeRef::Direct { func },
@@ -9282,7 +9305,8 @@ fn collect_i64_seed_param_facts(
     // A call outside a candidate with an argument nothing proves an integer takes the double entry, so it says
     // nothing about the `_i64` one. In a candidate's body it reaches the `_i64` entry: `validate_i64_direct_calls`
     // holds the argument to an integer, and that is all that is known of it. The parameter's constant, range and sign
-    // cannot stand (`gcd(b, a % b)`, with `gcd(1071, 462)` the only other call, took `b` for 462).
+    // cannot stand (`gcd(b, a % b)`, with `gcd(1071, 462)` the only other call, took `b` for 462). So with an argument
+    // proven an integer that is no numeric value here: the return fact holds at that call, on no fact of its own.
     let mut widened: BTreeSet<(u32, u32)> = BTreeSet::new();
     for caller in &program.functions {
         let mut flat = Vec::new();
@@ -9339,7 +9363,9 @@ fn collect_i64_seed_param_facts(
                                     fact
                                 };
                                 dst.insert(*p, merged);
-                            } else if candidates.contains(&caller.id.0) {
+                            } else if candidates.contains(&caller.id.0)
+                                || analysis.facts.get(arg).is_some_and(|f| f.i64_safe)
+                            {
                                 widened.insert((func.0, *p));
                             }
                         }

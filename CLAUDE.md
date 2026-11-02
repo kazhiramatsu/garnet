@@ -97,6 +97,10 @@ Rust in §315; selfhost is kept as a performance metric).
   prototype per evaluation: an instance of a later evaluation carries `TS_CLS_RELINKED`
   (`ts_instance_of_evaluation`) and takes the full lookup, or a site's cache answers the first evaluation's
   method (silent, Session 363).
+- **A fact about a parameter needs every call that reaches the entry, the function's own calls among them.** An argument
+  the first pass could not prove was skipped, so the integer entry of a recursive function took the one outside call's
+  constant for the parameter (`gcd(1071, 462)` was 147, Session 363). What is assumed of a recursive call holds only as
+  far as something validates it: an integer, here, and no constant, range or sign.
 - **`ts_to_num` is a raw bit reinterpretation (not ToNumber).** `undefined`→NaN matches JS, but
   `null`→NaN does not.
 - **Gate a new feature behind a single predictable branch** (e.g. `if (g_has_proxies && ...)`) = zero
@@ -189,6 +193,11 @@ Rust in §315; selfhost is kept as a performance metric).
   program keeps no source text): a library that reads a function's source sees no body. `err.stack` is the
   header and one `at <anonymous>` line, made when read. A WeakRef holds its target strongly and a
   FinalizationRegistry never calls back, as the specification allows.
+- A recursion the C compiler makes a loop spins where V8 throws a RangeError, when it has an exit that is never taken
+  (`if (n < 0) return 0; return f(n + 1) + 1;`); one with no exit keeps its calls and overflows (`docs/exceptions_design.md`).
+  A sparse array past 2^29 elements stays sparse and a generic method over it (`indexOf`, `Object.keys`) is a RangeError
+  where V8 walks its dictionary. `new Float64Array(2 ** 33)` is a RangeError where V8 maps it lazily. V8's cycle error
+  has the path in its message, garnet's is the first line; a cycle past 1024 levels is found up to 1024 levels late.
 - A property name is interned for the life of the run: a program that makes unbounded distinct dynamic keys grows, and stops loudly at 1.9 G of them.
   A dense integer-keyed plain object is a dictionary of those names (V8: elements), x35 of Node on a million keys.
 - A dead-zone read of a class binding other than `new` and `instanceof` is undefined, and the static analysis does not see through an import cycle

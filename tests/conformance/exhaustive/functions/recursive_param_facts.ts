@@ -26,3 +26,30 @@ console.log(both(1), both(2), h(9));
 function a(n: number): number { return n === 0 ? 0 : b(n - 1, 7 % (n + 1)); }
 function b(n: number, m: number): number { return m + a(n) % 3; }
 console.log(1, a(4));
+// A return fact is the integer entry's: `keep(-1)` proves nothing of `keep(-2.5)`, which takes the double entry.
+function pad(p0: number, p1: number): number {
+  let s = p1 * 5 - (p1 >> p1);
+  for (let i = 0; i < 1; i++) s = ~Math.abs(-7 | 0);
+  return s;
+}
+function keep(p0: number): number {
+  const a = -7;
+  let b = a;
+  if (((1e21 << a) as number) < b) b = pad((b as number) >= 1e-7 ? p0 : a, a & p0);
+  return p0;
+}
+function caller(p0: number): number {
+  let b = ~Math.sign(p0);
+  if ((~p0 as number) < b) b = keep(-1);
+  return b;
+}
+console.log(1, keep(-2.5), caller(3), keep(1), keep(0.5) + 1, -keep(0));
+// Modulo 2^32 is a ring of exact integers: a fraction beside an operand, or a product a double rounds, is outside it.
+function wrapBeside(p0: number, p1: number, p2: number): number {
+  let s = (p1 * 2) % (p2 + p1);
+  for (let i = 0; i < 3; i++) s = (Math.max(1e-7, s) - (p0 + p2)) ^ (s / (p2 ^ p0));
+  return s;
+}
+console.log(1, wrapBeside(8, 3, 4294967296));
+function rounded(a: number, b: number): number { const x = a + 1; const y = b + 1; return (x * y) | 0; }
+console.log(1, rounded(3037000499, 3037000499));
