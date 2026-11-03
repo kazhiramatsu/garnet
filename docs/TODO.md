@@ -13099,3 +13099,17 @@ Branch `s366-tdz-extends` from main after Session 365 (30e68cf).
   pulled in are gone, their outputs agree with V8 in all three modes); snapshot taken. Against r35, outputs identical: hono_app -2.81% instructions, cycles -3.4%,
   112.0 -> 107.5 ms (Node 157), binary -4.3%; vue -0.96%, 926.9 -> 912.9 ms, binary -2.8%; hono the same binary; tsc-ts -0.11% over five rounds (the gate's three read
   +0.13% and a wall +4% that a rerun did not repeat), its C 182 KB and 290 functions smaller.
+- **test262, a sample** (`TSAOT_T262_SRC=build/test262_src scripts/test262/run.sh language/expressions/{assignment,arrow-function,generators,function,addition,exponentiation}`
+  from the worktree, about 0.6 s a case with three jobs): 1,474 cases, 1,317 pass, 120 refused by both engines (script-only cases in a strict module), 33 need
+  code from strings; of the runnable 99.7% pass. What is left there is known from Session 363: `super.x = v` in a static method after
+  `Object.setPrototypeOf(C, null)` (no TypeError), a second `super()` through an arrow (no ReferenceError), and the compile-time reject of an assignment to a
+  function declaration's binding in a pattern. The whole of `language/expressions` (11,214 cases) is about two hours of three cores: not started without a
+  time slot (the machine's owner asks for one before long heavy jobs).
+
+State at the end of the session: main is d2822b8 (five landings today: Session 363's branch, the objects fuzzer's findings, a borrowed method's
+`this.m()`, the dead zone at `extends`, the trigger text without types), nothing running. Next, in this order:
+
+1. test262: the full `language/expressions` in a time slot, then statements, built-ins and annexB the same way (`docs/test262` scripts; the runner resumes).
+2. The objects fuzzer further: `scripts/fuzz/run.sh objects 201 600`, and `features 151 300`; the arrays with accessor elements it reports are known.
+3. The deferred items of CLAUDE.md that are silent: an own method assigned through an `any` value is not seen by `this.m()`; an arrow in a borrowed method.
+4. Kaz's elements kinds for `number[]` (Session 363's note): the flag and the loops, the generic clones, the proof.
