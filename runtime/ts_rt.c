@@ -4427,13 +4427,17 @@ void ts_set(tsv obj, ts_key key, tsv val){
     // `arr.length = v`: set the real array length (truncate/extend). JS requires v
     // to be a non-negative integer < 2^32, else RangeError.
     if (field_name_is(key, "length")){
-      ts_gc_root(&obj);
+      /* [[Set]] asks whether the property is writable before ArraySetLength converts the value: a frozen array's
+         `length = NaN` is the TypeError, and the value's valueOf is never called (it was the RangeError) */
+      if (frozen || (((ts_array*)ts_ptr(obj))->kind_spare & TS_ARRAY_LENGTH_READONLY)){ ts_throw_readonly_write(obj, key); return; }
+      ts_gc_root(&obj); ts_gc_root(&val);
       double d = ts_number_coerce(val);
-      ts_gc_unroot(1);
+      /* ArraySetLength converts twice, ToUint32 and then ToNumber: an object's valueOf runs twice, as under V8 */
+      if (ts_is_obj(val) || ts_is_func(val)) d = ts_number_coerce(val);
+      ts_gc_unroot(2);
       uint32_t u = ts_to_uint32(d);
       if ((double)u != d){ ts_throw_range_error_msg("Invalid array length"); return; }
       ts_array* a = (ts_array*)ts_ptr(obj);
-      if (frozen || (a->kind_spare & TS_ARRAY_LENGTH_READONLY)){ ts_throw_readonly_write(obj, key); return; }
       /* a sealed array's elements stay: the length stops above the last one */
       if ((ts_obj_integrity(&a->o) & 4u) && u < a->len){
         uint32_t last = a->len;
@@ -14265,11 +14269,13 @@ static void json_enter(jbuf* b, json_path* node, tsv* slot, int depth){
 static inline void json_leave(jbuf* b, json_path* node){ b->path = node->up; }
 static tsv wrapper_value(tsv v);
 static int json_stringify_val(jbuf* b, tsv v, int depth, const char* indent){
-  if (TS_RT_UNLIKELY(g_has_wrappers) && wrapper_value(v) != TS_UNDEFINED) v = wrapper_value(v);
   /* top-level toJSON (key ""): children get toJSON applied by their property /
      element / map emitters, so depth>0 never re-applies it to the same value. */
   if (depth == 0 && ts_is_obj(v)) v = json_apply_tojson(v, "", 0);
   if (depth == 0 && b->rep) v = json_apply_replacer(b, b->rep->root_holder, "", 0, v);
+  /* a Number, String or Boolean object becomes its value after toJSON and the replacer, which see the object
+     (SerializeJSONProperty step 4: the root's was unwrapped first, so a replacer saw 3 for `new Number(3)`) */
+  if (TS_RT_UNLIKELY(g_has_wrappers) && wrapper_value(v) != TS_UNDEFINED) v = wrapper_value(v);
   if (ts_is_undef(v) || ts_is_func(v)) return 0;          /* caller decides null vs omit */
   if (ts_is_null(v)){ jb_putz(b,"null"); return 1; }
   if (ts_is_bool(v)){ jb_putz(b,(v&1)?"true":"false"); return 1; }
@@ -15617,6 +15623,38 @@ typedef struct { const char* s; size_t i, n; int ok; } jparse;
 static void jp_ws(jparse* p){ while(p->i<p->n){ char c=p->s[p->i]; if(c==' '||c=='\t'||c=='\n'||c=='\r') p->i++; else break; } }
 static tsv jp_value(jparse* p);
 
+/* Four hex digits of a `\u` escape, -1 when they are not (strtol took `\u12g4` as 0x12). */
+static int jp_hex4(jparse* p){
+  if (p->i + 4 > p->n) return -1;
+  int v = 0;
+  for (int k = 0; k < 4; k++){
+    char h = p->s[p->i + k];
+    int d = h >= '0' && h <= '9' ? h - '0' : h >= 'a' && h <= 'f' ? h - 'a' + 10 : h >= 'A' && h <= 'F' ? h - 'A' + 10 : -1;
+    if (d < 0) return -1;
+    v = v * 16 + d;
+  }
+  p->i += 4;
+  return v;
+}
+static tsv string_from_units(const uint16_t* u, uint32_t n);
+/* A string from WTF-8 (UTF-8 that may carry a surrogate as three bytes): its UTF-16 units. */
+static tsv jp_string_from_wtf8(const char* s, size_t n){
+  uint16_t* u = (uint16_t*)malloc(sizeof(uint16_t) * (n ? n : 1));
+  uint32_t k = 0;
+  for (size_t i = 0; i < n;){
+    unsigned char c = (unsigned char)s[i];
+    uint32_t cp;
+    if (c < 0x80){ cp = c; i += 1; }
+    else if (c < 0xE0){ cp = ((c & 0x1Fu) << 6) | ((unsigned char)s[i + 1] & 0x3Fu); i += 2; }
+    else if (c < 0xF0){ cp = ((c & 0x0Fu) << 12) | (((unsigned char)s[i + 1] & 0x3Fu) << 6) | ((unsigned char)s[i + 2] & 0x3Fu); i += 3; }
+    else { cp = ((c & 0x07u) << 18) | (((unsigned char)s[i + 1] & 0x3Fu) << 12) | (((unsigned char)s[i + 2] & 0x3Fu) << 6) | ((unsigned char)s[i + 3] & 0x3Fu); i += 4; }
+    if (cp >= 0x10000u){ cp -= 0x10000u; u[k++] = (uint16_t)(0xD800u + (cp >> 10)); u[k++] = (uint16_t)(0xDC00u + (cp & 0x3FFu)); }
+    else u[k++] = (uint16_t)cp;
+  }
+  tsv r = string_from_units(u, k);
+  free(u);
+  return r;
+}
 static tsv jp_string(jparse* p){
   /* assumes p->s[p->i]=='"' */
   if (p->i >= p->n || p->s[p->i] != '"'){ p->ok=0; return TS_UNDEFINED; }
@@ -15633,9 +15671,10 @@ static tsv jp_string(jparse* p){
     j++;
   }
   p->i++; jbuf b; jb_init(&b);
+  int lone = 0;   /* a lone surrogate went into the buffer as WTF-8: the string is made of UTF-16 units */
   while (p->i<p->n){
     unsigned char c=(unsigned char)p->s[p->i++];
-    if (c=='"'){ tsv r=ts_new_string(b.p,(uint32_t)b.len); jb_free(&b); return r; }
+    if (c=='"'){ tsv r = lone ? jp_string_from_wtf8(b.p, b.len) : ts_new_string(b.p,(uint32_t)b.len); jb_free(&b); return r; }
     if (c=='\\' && p->i<p->n){
       char e=p->s[p->i++];
       switch(e){
@@ -15648,16 +15687,23 @@ static tsv jp_string(jparse* p){
         case 'b': jb_putc(&b,'\b'); break;
         case 'f': jb_putc(&b,'\f'); break;
         case 'u': {
-          if (p->i+4<=p->n){
-            char h[5]={p->s[p->i],p->s[p->i+1],p->s[p->i+2],p->s[p->i+3],0};
-            p->i+=4; unsigned cp=(unsigned)strtol(h,NULL,16);
-            /* encode UTF-8 (BMP only) */
-            if (cp<0x80) jb_putc(&b,(char)cp);
-            else if (cp<0x800){ jb_putc(&b,(char)(0xC0|(cp>>6))); jb_putc(&b,(char)(0x80|(cp&0x3F))); }
-            else { jb_putc(&b,(char)(0xE0|(cp>>12))); jb_putc(&b,(char)(0x80|((cp>>6)&0x3F))); jb_putc(&b,(char)(0x80|(cp&0x3F))); }
+          int cp = jp_hex4(p);
+          if (cp < 0){ jb_free(&b); p->ok=0; return TS_UNDEFINED; }
+          /* a pair of escapes is one code point (Python's json.dumps writes every character past the BMP so); a
+             surrogate alone stays one: each half was written as three bytes of its own, two U+FFFD in the string */
+          if (cp >= 0xD800 && cp <= 0xDBFF && p->i+6<=p->n && p->s[p->i]=='\\' && p->s[p->i+1]=='u'){
+            size_t at = p->i; p->i += 2;
+            int lo = jp_hex4(p);
+            if (lo >= 0xDC00 && lo <= 0xDFFF) cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+            else p->i = at;   /* not a low half: this one is alone, the next escape is read on its own */
           }
+          if (cp >= 0xD800 && cp <= 0xDFFF) lone = 1;
+          if (cp<0x80) jb_putc(&b,(char)cp);
+          else if (cp<0x800){ jb_putc(&b,(char)(0xC0|(cp>>6))); jb_putc(&b,(char)(0x80|(cp&0x3F))); }
+          else if (cp<0x10000){ jb_putc(&b,(char)(0xE0|(cp>>12))); jb_putc(&b,(char)(0x80|((cp>>6)&0x3F))); jb_putc(&b,(char)(0x80|(cp&0x3F))); }
+          else { jb_putc(&b,(char)(0xF0|(cp>>18))); jb_putc(&b,(char)(0x80|((cp>>12)&0x3F))); jb_putc(&b,(char)(0x80|((cp>>6)&0x3F))); jb_putc(&b,(char)(0x80|(cp&0x3F))); }
         } break;
-        default: jb_putc(&b,e);
+        default: jb_free(&b); p->ok=0; return TS_UNDEFINED;   /* `\x`, `\'`: not JSON escapes (the character was kept) */
       }
     } else {
       if (c < 0x20u){ jb_free(&b); p->ok=0; return TS_UNDEFINED; }
@@ -15759,9 +15805,9 @@ static tsv jp_value(jparse* p){
     ts_gc_root(&obj);
     jp_ws(p);
     if (p->i<p->n && p->s[p->i]=='}'){ p->i++; ts_gc_unroot(1); return obj; }
-    while (p->i<p->n){
+    for (;;){   /* a `}` ends it, nothing else does: `{` and `{"a":1,` were objects (silent) */
       jp_ws(p);
-      if (p->s[p->i]!='"'){ p->ok=0; ts_gc_unroot(1); return obj; }
+      if (p->i>=p->n || p->s[p->i]!='"'){ p->ok=0; ts_gc_unroot(1); return obj; }
       uint32_t key=jp_key_intern(p); if(!p->ok){ ts_gc_unroot(1); return obj; }
       jp_ws(p); if (p->i>=p->n||p->s[p->i]!=':'){ p->ok=0; ts_gc_unroot(1); return obj; } p->i++;
       tsv val=jp_value(p); if(!p->ok){ ts_gc_unroot(1); return obj; }
@@ -15781,7 +15827,7 @@ static tsv jp_value(jparse* p){
     ts_gc_root(&arr);
     jp_ws(p);
     if (p->i<p->n && p->s[p->i]==']'){ p->i++; ts_gc_unroot(1); return arr; }
-    while (p->i<p->n){
+    for (;;){   /* a `]` ends it, nothing else does: `[` and `[1,` were arrays (silent) */
       tsv val=jp_value(p); if(!p->ok){ ts_gc_unroot(1); return arr; }
       ts_gc_root(&val);
       jp_array_push_fast(arr, val);
@@ -16730,9 +16776,15 @@ int ts_is_undefined(tsv v){ return ts_is_undef(v); }
    the internal ts_delete_prop which returns false. Non-own / configurable / absent
    keys delete normally. */
 static int fn_delete(tsv obj, ts_key key, int strict);
+static void define_property_error(const char* fmt, ts_key key);
 int ts_delete_prop_strict(tsv obj, ts_key key){
   if (ts_is_obj(obj)){ ts_gc_header* _dh = (ts_gc_header*)ts_ptr(obj); if (_dh->gen == TS_GEN_OLD) gc_cards_all(_dh); }
-  if (g_has_proxies && ts_is_proxy(obj)) return ts_proxy_delete_v(obj, ts_key_to_value(key));
+  if (g_has_proxies && ts_is_proxy(obj)){
+    /* a strict delete is true or a TypeError: a trap's false came back as the delete's value (silent) */
+    if (ts_proxy_delete_v(obj, ts_key_to_value(key))) return 1;
+    define_property_error("'deleteProperty' on proxy: trap returned falsish for property '%s'", key);
+    return 0;
+  }
   if (ts_is_func(obj)) return fn_delete(obj, key, 1);
   if (!ts_is_obj(obj)) return 1;
   if (ts_is_typed_array(obj)){
@@ -23400,6 +23452,8 @@ static int pd_compatible(tsv desc, tsv cur){
 }
 /* [[DefineOwnProperty]]: its answer */
 static int proxy_define_answer(tsv pv, tsv keyv, tsv desc){
+  /* ToPropertyKey: the trap gets "0" for `Object.defineProperty(p, 0, d)`, as the other traps do (it got the number) */
+  if (!ts_is_str(keyv) && !ts_is_symbol(keyv)) keyv = ts_property_key_value(keyv);
   ts_gc_root(&pv); ts_gc_root(&keyv); ts_gc_root(&desc);
   ts_proxy* px = ts_ptr(pv);
   tsv target = px->target, handler = px->handler;
@@ -23454,7 +23508,9 @@ static void ts_proxy_define_property(tsv pv, tsv keyv, tsv desc){
   if (!proxy_define_answer(pv, keyv, desc)) proxy_define_refused(keyv);
 }
 static int object_test_integrity(tsv v, int frozen){
-  if ((ts_obj_integrity((ts_object*)ts_ptr(v)) & 2u) == 0) return 0;     /* extensible */
+  /* extensible: a seal or a freeze also means non-extensible, and sets its own bit alone (a sealed object with no
+     property was not frozen, silent) */
+  if ((ts_obj_integrity((ts_object*)ts_ptr(v)) & (1u|2u|4u)) == 0) return 0;
   ts_gc_root(&v);
   tsv keys = ts_reflect_own_keys(v); ts_gc_root(&keys);
   uint32_t n = (uint32_t)ts_array_len(keys);

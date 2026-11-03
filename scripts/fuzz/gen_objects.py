@@ -138,7 +138,9 @@ class G:
         base = r.choice([f"{s.literal(1, 4)}", "[1, 2, 3]", f"new ({s.cls()[1]})(1)", "Object.create({ h: 1 })", "function () { return 1; }"])
         ops = [f"{o}[{s.key()}] = 1;", f"{o}.a = 2;", f"delete {o}[{s.key()}];", f"delete {o}.a;", f"Object.defineProperty({o}, {s.key()}, {{ value: 3 }});", f"Object.setPrototypeOf({o}, {{}});", f"{o}.push?.(1);", f"{o}.pop?.();", f"{o}.length = 0;", f"Object.assign({o}, {{ a: 1 }});"]
         return [f"const {o}: any = {base};", f"const {l} = Object.{lvl}({o}) === {o};"] + [f"try {{ {x} p(\"ok\"); }} catch (e: any) {{ p(\"threw\", e.name); }}" for x in r.sample(ops, 5)] + \
-               [f"p({l}, Object.isFrozen({o}), Object.isSealed({o}), Object.isExtensible({o}), Object.keys({o}), Object.getOwnPropertyDescriptor({o}, \"a\"));"]
+               [f"p({l}, Array.isArray({o}) || typeof {o} === \"function\" ? \"-\" : Object.isFrozen({o}), Object.isSealed({o}), Object.isExtensible({o}), Object.keys({o}), Object.getOwnPropertyDescriptor({o}, \"a\"));"]
+        # (V8 answers Object.isFrozen true for a non-extensible empty array or a sealed function, whose `length` and
+        # `prototype` stay writable; the specification and garnet answer false)
     def arrays(s):
         # keys of their own, holes, a length that moves, and what the methods make of them
         r = s.r; a = s.id("a"); l = s.id("l")
