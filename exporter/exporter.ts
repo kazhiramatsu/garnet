@@ -253,11 +253,17 @@ function codeText(f: ts.SourceFile): string {
     parts.push(f.text.slice(at, start), " ");
     at = n.end;
   };
+  // a class's `extends` clause is the one type-like node that runs: the base is evaluated
+  const classHeritage = (n: ts.Node): boolean =>
+    n.kind === K.ExpressionWithTypeArguments && ts.isHeritageClause(n.parent) && n.parent.token === K.ExtendsKeyword && ts.isClassLike(n.parent.parent);
   const visit = (n: ts.Node): void => {
     if (n.kind === K.StringLiteral || n.kind === K.NoSubstitutionTemplateLiteral) {
       if (!/^\w+$/.test((n as ts.LiteralExpression).text)) blank(n);
     } else if (n.kind === K.TemplateHead || n.kind === K.TemplateMiddle || n.kind === K.TemplateTail ||
                n.kind === K.RegularExpressionLiteral || n.kind === K.JsxText) blank(n);
+    // types run nothing: `T extends Promise<infer U>` in a conditional type, `interface X extends Array<T>`, a constraint,
+    // a cast's type (hono's types.ts compiled the Promise protocol into every program that imports hono)
+    else if (ts.isInterfaceDeclaration(n) || ts.isTypeAliasDeclaration(n) || (ts.isTypeNode(n) && !classHeritage(n))) blank(n);
     else n.forEachChild(visit);
   };
   visit(f);
