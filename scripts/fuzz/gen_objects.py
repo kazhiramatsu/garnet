@@ -177,7 +177,7 @@ class G:
         body = []
         for _ in range(s.r.randint(8, 14)):
             body.append("{\n" + "\n".join(s.r.choice(kinds)()) + "\n}")
-        head = f"const p = (...a: unknown[]) => console.log(...a);\nconst K: any[] = {json.dumps(ALL)};\n"
+        head = f"// @ts-nocheck\nconst p = (...a: unknown[]) => console.log(...a);\nconst K: any[] = {json.dumps(ALL)};\n"  # the checker's lib is ES2020: Object.hasOwn, Object.groupBy
         return head + "\n".join(s.decls) + "\n" + "\n".join(body) + "\n"
 if __name__ == "__main__":
     print(G(int(sys.argv[1])).program(), end="")
