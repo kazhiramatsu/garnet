@@ -13061,3 +13061,27 @@ borrowed `this`".
   (112.3 -> 111.9 ms, Node 155), vue +0.00% (918.3 -> 914.8 ms), tsc-ts +0.00% (closed: no clone; 1.24 -> 1.23 s). Binaries: hono +2.2%, hono_app +1.6%, vue and tsc-ts the same.
 - Next: tsc-ts's +1.9% over r29 (a bisect of Session 363's commits, `build/bisect_tsc/step.sh <commit>`: a worktree, a shared cargo target, the native build,
   the instruction A/B against r29), then the survey's compile time, then test262 measured again.
+
+## Session 366 (2026-11-03): tsc-ts's 1.9%, found by a bisect
+
+Branch `s366-tdz-extends` from main after Session 365 (30e68cf).
+
+- **The bisect** (`build/bisect_tsc/bisect.sh` over Session 363's 21 commits: a worktree per point, a shared cargo target, the native build,
+  the instruction A/B against r29; five points, about 35 minutes): 6d8c4c7 0.9944, 74e3efe 0.9917, 179d486 1.0194, 675c03b 1.0184, 8de57ef 1.0206.
+  All of it in 179d486, the dead zone of captured bindings (`docs/tdz_design.md`).
+- **The cause**: the dead-zone pass walked a base class's whole body at `class Sub extends Base`, so every binding a method of the
+  base reads became a dead-zone binding when a subclass is declared before it. tsc-ts's checker-types.ts declares `emptyTypes`,
+  `emptySymbols`, `emptySignatures`, `emptyIndexInfos` (and `emptySymbolTable`) after `class ObjectType extends Type` and the rest:
+  188 tests of a hole in its hottest reads, each a load of the cell through GLOBALS, a load of its value and a compare, where one
+  load had been. `extends Base` reads the binding and runs none of Base's code; a construction that does reaches Base through its
+  own mention. tsc-ts: 188 tests -> 39, against main 22.558 -> 21.946 G instructions (-2.71%), cycles -2.96%, wall 1.25 -> 1.21 s;
+  0.993 of r29. Fixture `closures/tdz_extends_base` (a construction and a static call before the binding still throw).
+- Tried and dropped: taking an instance field's initializer out of the positional check, so that `class A { v = x + 1; } const x = 1;
+  new A()` gives 2 as under V8 (it always throws, older than Session 363). The dead-zone analysis covers captured bindings only, and a
+  module constant read there is folded: an early construction gave 2 where V8 throws, silent. Recorded in `docs/tdz_design.md`.
+- Gates on the commit (`build/gates_s366a/run.sh`, mains power, 15:23): unit, bundler 56, conformance 818/818 plain and strict, 815/815 under protect, bench with
+  its budgets, ci, ir-parity identical (5,043; no program of the corpus changes; snapshot taken with the fixture), the regexp differentials (0 differ), GC stress, the
+  hono survey 43/43. Against r34 (main after Session 365), outputs identical: tsc-ts 22.585 -> 21.971 G instructions (-2.72%), cycles -2.17%, wall 1.23 -> 1.21 s;
+  hono +0.04%, hono_app -0.05% (113.5 -> 113.8 ms, Node 160), vue +0.00% (931.6 -> 928.6 ms).
+- Next: the hono survey's compile time (1,020 s against 780 s through Session 362: each driver 24 s against 18, not yet divided between the exporter and clang),
+  then test262 measured again, then the deferred items of CLAUDE.md (a field initializer's dead zone, an own method through `any`).
