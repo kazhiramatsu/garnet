@@ -22,6 +22,7 @@
  * Unknowns default to UNSTABLE. We only claim stability we can see.
  */
 import * as ts from "typescript";
+import { privateBrand } from "./private_names";
 /** The globals the Node prelude provides as classes of lib/node (exporter.ts NODE_PRELUDE_CTORS). */
 const PRELUDE_CLASS_NAMES = new Set(["Headers", "Request", "Response", "FormData", "DataView", "URL", "URLSearchParams", "Crypto", "SubtleCrypto", "CryptoKey",
   "ReadableStream", "WritableStream", "TransformStream", "ReadableStreamDefaultReader", "WritableStreamDefaultWriter", "ReadableStreamDefaultController", "WritableStreamDefaultController", "TransformStreamDefaultController", "TextEncoderStream", "TextDecoderStream", "CountQueuingStrategy", "ByteLengthQueuingStrategy", "Blob", "File",
@@ -58,30 +59,101 @@ function isQualifiedName(e: ts.Expression): boolean {
 export type MKind = "method" | "getter" | "setter";
 
 export interface MethodInfo { name: string; kind: MKind; isGenerator?: boolean; }
-/** A class with no members over a base that is a runtime value (`class D extends Parent {}` with
- *  `Parent` a binding, a call or a member expression): it is not laid out as a class; the exporter
- *  lowers it to a derived constructor over the value (`ts_class_extend_dyn`). A base naming a class
- *  declaration or a library class (Error) stays a class. Returns the base expression when it applies. */
-export function dynamicBaseEmptyClass(decl: ts.ClassLikeDeclaration, checker: ts.TypeChecker): ts.Expression | undefined {
-  if (decl.members.length !== 0) return undefined;
+/** A class that is a value made at run time (docs/dynamic_classes_design.md): what the structs and the vtables
+ *  cannot hold. Not registered with the extractor: its instances are read and written by key. */
+export const dynamicClasses = new WeakSet<ts.Node>();
+const dynamicVerdicts = new WeakMap<ts.Node, boolean>();
+const ERROR_BASES = new Set(["Error", "TypeError", "RangeError", "SyntaxError", "ReferenceError", "EvalError", "URIError", "AggregateError"]);
+
+export function isDynamicClass(decl: ts.ClassLikeDeclaration, checker: ts.TypeChecker): boolean {
+  const known = dynamicVerdicts.get(decl);
+  if (known !== undefined) return known;
+  dynamicVerdicts.set(decl, false);   // a cycle of `extends` is reported elsewhere
+  const ambient = (ts.getCombinedModifierFlags(decl) & ts.ModifierFlags.Ambient) !== 0;
+  // (`export default class {}` has no name to hold it: a value, bound to the default export)
+  const verdict = !ambient && ((ts.isClassDeclaration(decl) && decl.name === undefined) || heritageIsDynamic(decl, checker) || capturesEnclosingLocal(decl, checker) || constructorAnswers(decl));
+  dynamicVerdicts.set(decl, verdict);
+  if (verdict) dynamicClasses.add(decl);
+  return verdict;
+}
+function heritageIsDynamic(decl: ts.ClassLikeDeclaration, checker: ts.TypeChecker): boolean {
   const ext = decl.heritageClauses?.find((h) => h.token === ts.SyntaxKind.ExtendsKeyword);
-  if (!ext || ext.types.length !== 1) return undefined;
+  if (!ext || ext.types.length !== 1) return false;
   const expr = ext.types[0].expression;
-  if (ts.isIdentifier(expr) || (ts.isPropertyAccessExpression(expr) && isQualifiedName(expr))) {
-    let sym = checker.getSymbolAtLocation(ts.isIdentifier(expr) ? expr : expr.name);
-    if (sym && (sym.flags & ts.SymbolFlags.Alias)) sym = checker.getAliasedSymbol(sym);
-    const decls = sym?.getDeclarations() ?? [];
-    if (decls.length === 0) return undefined;   // unresolved: the class path reports it
-    if (decls.some((d) => ts.isClassDeclaration(d) || ts.isClassExpression(d))) return undefined;   // a class
-    if (decls.every((d) => d.getSourceFile().isDeclarationFile)) return undefined;   // a library class
-    return expr;   // a binding that holds a constructor value
+  if (!ts.isIdentifier(expr) && !(ts.isPropertyAccessExpression(expr) && isQualifiedName(expr))) return true;
+  let sym = checker.getSymbolAtLocation(ts.isIdentifier(expr) ? expr : expr.name);
+  if (sym && (sym.flags & ts.SymbolFlags.Alias)) sym = checker.getAliasedSymbol(sym);
+  const decls = sym?.getDeclarations() ?? [];
+  if (decls.length === 0) return true;   // nothing declares it: a ReferenceError at the definition
+  const cls = decls.find((d) => (ts.isClassDeclaration(d) || ts.isClassExpression(d)) && !d.getSourceFile().isDeclarationFile);
+  if (cls) return isDynamicClass(cls as ts.ClassLikeDeclaration, checker);
+  // the environment's: the Error family has its own layout, any other is a built-in to construct
+  if (decls.every((d) => d.getSourceFile().isDeclarationFile)) return !(ts.isIdentifier(expr) && ERROR_BASES.has(expr.text));
+  return true;   // a binding that holds a constructor
+}
+/** A constructor that returns a value: what `super()` gives a subclass is that object, not an instance with the
+ *  subclass's layout (`return new Proxy(this, handler)`, a pool, a singleton). */
+function constructorAnswers(decl: ts.ClassLikeDeclaration): boolean {
+  const ctor = decl.members.find((m) => ts.isConstructorDeclaration(m) && m.body !== undefined) as ts.ConstructorDeclaration | undefined;
+  if (!ctor) return false;
+  let found = false;
+  const visit = (n: ts.Node): void => {
+    if (found || ts.isFunctionLike(n) || ts.isClassLike(n)) return;
+    if (ts.isReturnStatement(n) && n.expression && n.expression.kind !== ts.SyntaxKind.ThisKeyword) { found = true; return; }
+    ts.forEachChild(n, visit);
+  };
+  ts.forEachChild(ctor.body!, visit);
+  return found;
+}
+/** A method, an accessor or a static initializer that reads a local of the function around the class: the
+ *  function is one, the evaluations are many. (A constructor and an instance field get their cells threaded.) */
+function capturesEnclosingLocal(decl: ts.ClassLikeDeclaration, checker: ts.TypeChecker): boolean {
+  let outer: ts.Node | undefined = decl.parent;
+  while (outer && !ts.isSourceFile(outer) && !ts.isFunctionLike(outer)) outer = outer.parent;
+  if (!outer || ts.isSourceFile(outer)) return false;
+  const within = (n: ts.Node, top: ts.Node): boolean => {
+    for (let p: ts.Node | undefined = n; p; p = p.parent) if (p === top) return true;
+    return false;
+  };
+  let found = false;
+  const visit = (n: ts.Node): void => {
+    if (found || ts.isTypeNode(n)) return;
+    if (ts.isIdentifier(n) && !(ts.isPropertyAccessExpression(n.parent) && n.parent.name === n)) {
+      let s: ts.Symbol | undefined;
+      try { s = checker.getSymbolAtLocation(n); } catch { s = undefined; }
+      const d = s?.valueDeclaration ?? s?.declarations?.[0];
+      if (d && within(d, outer!) && !within(d, decl)) { found = true; return; }
+    }
+    ts.forEachChild(n, visit);
+  };
+  for (const m of decl.members) {
+    if (ts.isMethodDeclaration(m) || ts.isGetAccessorDeclaration(m) || ts.isSetAccessorDeclaration(m)) {
+      if (m.body) { visit(m.body); m.parameters.forEach(visit); }
+    } else if (ts.isClassStaticBlockDeclaration(m)) visit(m.body);
+    else if (ts.isPropertyDeclaration(m) && m.initializer && (ts.getCombinedModifierFlags(m) & ts.ModifierFlags.Static)) visit(m.initializer);
+    if (found) return true;
   }
-  return expr;   // a call, an element access, a conditional: a mixin or a runtime value
+  return false;
+}
+
+/** The parameter properties of a constructor (`constructor(public x: number)`). */
+function parameterProperties(ctor: ts.ConstructorDeclaration): string[] {
+  const out: string[] = [];
+  for (const p of ctor.parameters) {
+    if (p.modifiers?.some((mod) =>
+      mod.kind === ts.SyntaxKind.PublicKeyword || mod.kind === ts.SyntaxKind.PrivateKeyword ||
+      mod.kind === ts.SyntaxKind.ProtectedKeyword || mod.kind === ts.SyntaxKind.ReadonlyKeyword)) {
+      if (ts.isIdentifier(p.name)) out.push(p.name.text);
+    }
+  }
+  return out;
 }
 
 export interface ClassInfo {
   id: number;
   name: string;
+  /** A class expression without a name: `name` is an internal label, the value's `name` is inferred at its site. */
+  anonymous?: boolean;
   parentName?: string;
   /** The `extends` target's SYMBOL (lexical name resolution), captured for an
    *  identifier base. Resolving the parent via this symbol (not by name) is
@@ -187,11 +259,11 @@ export class ClassExtractor {
 
   // ----- pass 1: declare classes, own members -----
   private declareClass(decl: ts.ClassLikeDeclaration) {
-    if (dynamicBaseEmptyClass(decl, this.checker)) return;   // a derived constructor over a runtime value, not a class
+    if (isDynamicClass(decl, this.checker)) return;   // a value made at run time, not a class of the program's
     const name = decl.name?.text ?? `anonClass${this.classes.length}`;
     const id = this.classes.length;
     const info: ClassInfo = {
-      id, name, ownMethods: [], ownFields: [], instantiated: false, stable: true, reasons: [],
+      id, name, anonymous: decl.name === undefined, ownMethods: [], ownFields: [], instantiated: false, stable: true, reasons: [],
     };
 
     // extends clause: only a plain class reference keeps stability.
@@ -213,6 +285,11 @@ export class ClassExtractor {
       }
     }
 
+    const brand = privateBrand(decl);
+    if (brand !== undefined) info.ownFields.push(brand);
+    // parameter properties come first, wherever the constructor is written: they are the first keys of an instance
+    const declaredCtor = decl.members.find((m) => ts.isConstructorDeclaration(m) && m.body !== undefined) as ts.ConstructorDeclaration | undefined;
+    if (declaredCtor) for (const f of parameterProperties(declaredCtor)) info.ownFields.push(f);
     for (const m of decl.members) {
       const mods = ts.canHaveModifiers(m) ? ts.getModifiers(m) : undefined;
       const isStatic = !!mods?.some((mod) => mod.kind === ts.SyntaxKind.StaticKeyword);
@@ -273,19 +350,12 @@ export class ClassExtractor {
   // constructor: collect `this.x = ...` field declarations; flag dynamic writes
   // and an object-returning constructor (which would replace the instance).
   private scanConstructor(ctor: ts.ConstructorDeclaration, info: ClassInfo) {
-    // parameter properties (e.g. `constructor(public x: number)`)
-    for (const p of ctor.parameters) {
-      if (p.modifiers?.some((mod) =>
-        mod.kind === ts.SyntaxKind.PublicKeyword || mod.kind === ts.SyntaxKind.PrivateKeyword ||
-        mod.kind === ts.SyntaxKind.ProtectedKeyword || mod.kind === ts.SyntaxKind.ReadonlyKeyword)) {
-        if (ts.isIdentifier(p.name)) info.ownFields.push(p.name.text);
-      }
-    }
+    for (const f of parameterProperties(ctor)) if (!info.ownFields.includes(f)) info.ownFields.push(f);
     const visit = (n: ts.Node) => {
       // this.field = ...
       if (ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
         const lhs = n.left;
-        if (ts.isPropertyAccessExpression(lhs) && lhs.expression.kind === ts.SyntaxKind.ThisKeyword) {
+        if (ts.isPropertyAccessExpression(lhs) && lhs.expression.kind === ts.SyntaxKind.ThisKeyword && !ts.isPrivateIdentifier(lhs.name)) {
           const f = lhs.name.text;
           if (!info.ownFields.includes(f)) {
             info.ownFields.push(f);
@@ -889,6 +959,14 @@ export class ClassExtractor {
     }
     return true;
   }
+  /** The libraries that spell out a builtin's protocol (the exporter compiles one in when the program's
+   *  code can tell it, lib/node/web). What they call is what the program handed them, with the receiver or
+   *  the thisArg the program gave: a method reaches them only through a read as a value, which pass 5 sees at
+   *  the program's site, or from the object it runs on (`value[Symbol.dispose]`). The objects they relink are
+   *  errors and wrappers, not instances of a class with struct fields. A miss stops at the raise point. */
+  private protocolLibrary(sf: ts.SourceFile): boolean {
+    return /[\\/]lib[\\/]node[\\/]web[\\/](species|disposable|promise_protocol|array_generic|regexp_protocol)\.ts$/.test(sf.fileName);
+  }
   private scanClosedReceivers(sf: ts.SourceFile): void {
     const checker = this.checker;
     const RELINK = new Set(["ObjectConstructor.setPrototypeOf", "ObjectConstructor.create", "Reflect.setPrototypeOf"]);
@@ -1285,8 +1363,8 @@ export class ClassExtractor {
     for (const sf of sfs) this.scanStability(sf);
     for (const sf of sfs) this.scanStructuralFlows(sf);
     this.closeStructuralFlows();
-    for (const sf of sfs) this.scanClosedReceivers(sf);
-    for (const sf of sfs) this.scanMethodEscapes(sf);
+    for (const sf of sfs) if (!this.protocolLibrary(sf)) this.scanClosedReceivers(sf);
+    for (const sf of sfs) if (!this.protocolLibrary(sf)) this.scanMethodEscapes(sf);
     if (this.methodEscapes.size > 0) {
       for (const b of this.deferredBorrows) this.openAt(b.node, `${b.what} (the program reads methods as values)`);
     }

@@ -1,0 +1,25 @@
+// @ts-nocheck
+const t = (name, f) => { try { console.log(name, JSON.stringify(f())); } catch (e) { console.log(name, "THROW", e.name, e.message); } };
+t("multi concat", () => [1].concat(2, 3, [4]));
+const mk = () => ({ length: 3, 0: "a", 1: "b", 2: "c" });
+const P = Array.prototype;
+t("like", () => [P.map.call(mk(), (x) => x + "!"), P.filter.call(mk(), (x) => x > "a"), P.slice.call(mk(), 1), P.join.call(mk(), "-"), P.indexOf.call(mk(), "b"), P.includes.call(mk(), "c"), P.reduce.call(mk(), (a, b) => a + b), P.reduceRight.call(mk(), (a, b) => a + b), P.at.call(mk(), -1), P.find.call(mk(), (x) => x === "b"), P.findLast.call(mk(), (x) => x), P.some.call(mk(), (x) => x === "c"), P.every.call(mk(), (x) => x)]);
+t("mutate", () => { const o = mk(); const r = [P.push.call(o, "d"), P.pop.call(o), P.shift.call(o), P.unshift.call(o, "z"), P.reverse.call(o), P.sort.call(o), P.fill.call(o, 1, 1), P.copyWithin.call(o, 0, 1), P.splice.call(o, 1, 1)]; return [r, o]; });
+t("change by copy", () => [P.toReversed.call(mk()), P.toSorted.call(mk()), P.toSpliced.call(mk(), 1, 1), P.with.call(mk(), 1, "x"), P.flat.call({ length: 1, 0: [1] }), P.flatMap.call(mk(), (x) => [x])]);
+t("names", () => [P.map.name, P.map.length, P.slice.length, P.splice.length, P.concat.length, P.push.length, P.reduce.length, typeof P.map]);
+t("mutating cb", () => { const a = [1, 2, 3]; Object.defineProperty(a, 0, { get() { return 1; }, enumerable: true, configurable: true }); const seen = []; a.forEach((v, i) => { seen.push(v); if (i === 0) a[2] = 30; }); return seen; });
+t("deleting cb", () => { const o = mk(); const seen = []; P.forEach.call(o, (v, i) => { seen.push(v); delete o[1]; }); return seen; });
+t("getter len", () => { let n = 0; const o = { get length() { n++; return 2; }, 0: 1, 1: 2 }; P.map.call(o, (x) => x); return n; });
+t("proxy", () => { const log = []; const p = new Proxy([1, 2], { get(t, k, r) { log.push(String(k)); return Reflect.get(t, k, r); }, has(t, k) { log.push("has:" + String(k)); return Reflect.has(t, k); } }); P.map.call(p, (x) => x); return log; });
+t("string this", () => [P.map.call("ab", (x) => x + x), P.join.call("ab", "-")]);
+t("number this", () => P.map.call(5, (x) => x));
+t("borrow", () => [[].slice.call({ length: 1, 0: 1 }), [].map.call("ab", (x) => x)]);
+t("defineProperties", () => { const s = Symbol("s"); const o = {}; Object.defineProperties(o, { a: { value: 1 }, [s]: { value: 2 } }); return [o.a, o[s]]; });
+t("defprops order", () => { const log = []; const d = { get a() { log.push("a"); return { value: 1 }; }, get b() { log.push("b"); return 5; } }; try { Object.defineProperties({}, d); } catch (e) { log.push(e.name); } return log; });
+t("defprops atomic", () => { const o = {}; try { Object.defineProperties(o, { a: { value: 1 }, b: 5 }); } catch (e) {} return Object.keys(Object.getOwnPropertyDescriptors(o)); });
+t("defprops null", () => Object.defineProperties({}, null));
+t("defprops target", () => Object.defineProperties(1, {}));
+t("defprops str", () => Object.defineProperties({}, "ab"));
+t("math has", () => [Math.hasOwnProperty("abs"), JSON.hasOwnProperty("parse"), Math.hasOwnProperty("x")]);
+t("math str", () => [Math.toString(), JSON.toString(), typeof Math.valueOf(), Math.propertyIsEnumerable("abs")]);
+t("desc sym", () => Object.defineProperty({}, "a", Symbol()));

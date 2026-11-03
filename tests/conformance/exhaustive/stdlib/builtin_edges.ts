@@ -1,0 +1,20 @@
+// @ts-nocheck
+const t = (name, f) => { try { console.log(name, JSON.stringify(f())); } catch (e) { console.log(name, "THROW", e.name, e.message); } };
+t("push none frozen", () => Object.freeze([]).push());
+t("unshift none frozen", () => Object.freeze([1]).unshift());
+t("push none", () => [1, 2].push());
+t("push none ro", () => { const a = []; Object.defineProperty(a, "length", { writable: false }); return a.push(); });
+t("dv", () => { const d = new DataView(new ArrayBuffer(8)); d.setUint16(0, 0x0102, 1); return [d.getUint8(0), d.getUint16(0, "yes"), DataView.prototype.getUint16.length, DataView.prototype.setUint16.length, DataView.prototype.getFloat64.length]; });
+t("err name", () => [Object.getOwnPropertyDescriptor(TypeError.prototype, "name").enumerable, Object.getOwnPropertyDescriptor(Error.prototype, "message").enumerable, Object.keys(TypeError.prototype)]);
+t("proto values", () => [Number.prototype.toString(), Number.prototype.valueOf(), Boolean.prototype.toString(), Boolean.prototype.valueOf(), String.prototype.toString(), String.prototype.length]);
+t("fromEntries close", () => { let closed = 0; const it = { [Symbol.iterator]() { return { next() { return { done: false, value: null }; }, return() { closed++; return {}; } }; } }; try { Object.fromEntries(it); } catch (e) { return [e.name, closed]; } });
+t("fromEntries abrupt", () => { let closed = 0; const it = { [Symbol.iterator]() { return { next() { return { done: false, value: { get 0() { throw new RangeError("x"); } } }; }, return() { closed++; return {}; } }; } }; try { Object.fromEntries(it); } catch (e) { return [e.name, closed]; } });
+t("fromEntries", () => [Object.fromEntries([["a", 1], ["b", 2]]), Object.fromEntries(new Map([["c", 3]])), Object.fromEntries([{ 0: "z", 1: 26 }]), Object.fromEntries((function* () { yield ["g", 1]; })())]);
+t("fromEntries bad", () => Object.fromEntries([1]));
+t("fromEntries null", () => Object.fromEntries(null));
+t("fromEntries sym", () => { const s = Symbol("k"); return Object.fromEntries([[s, 1]])[s]; });
+t("reflect set proxy", () => [Reflect.set(new Proxy({}, { set() { return undefined; } }), "a", 1), Reflect.set(new Proxy({}, { set() { return 1; } }), "a", 1), Reflect.set(Object.freeze({ a: 1 }), "a", 2), Reflect.set({}, "a", 1)]);
+t("escape", () => [typeof RegExp.escape, RegExp.escape("a.b"), RegExp.escape.length, RegExp.escape.name]);
+t("fromCharCode", () => [String.fromCharCode(65, "66", { valueOf() { return 67; } }), String.fromCharCode(65536 + 65), String.fromCharCode(-1).charCodeAt(0), String.fromCharCode(NaN).charCodeAt(0)]);
+t("fromCharCode big", () => String.fromCharCode(1n));
+t("ta locale", () => { const o = Number.prototype.toLocaleString; let n = 0; Number.prototype.toLocaleString = function () { n++; return "x" + this; }; const r = new Uint8Array([1, 2]).toLocaleString(); Number.prototype.toLocaleString = o; return [r, n]; });

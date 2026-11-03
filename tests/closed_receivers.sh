@@ -76,5 +76,22 @@ check closed 'sink(new C() instanceof C); sink(typeof Object.keys);'
 check closed 'const r: Record<string, number> = { a: 1 }; delete r.a; const xs = [1, 2]; delete xs[0]; sink(r); sink(xs);'
 check closed 'class E2 extends C { g = 1; } const e = new E2(); sink(C.prototype.m.call(e)); sink(e.m.bind(e)());'
 check closed 'const c = new C(); sink(typeof c.m);'
+# the protocol libraries forward the program's own values: compiling one in does not open the program
+check closed 'class A extends Array<number> {} sink(new A(1).map((x) => x));'
+check closed 'class P extends Promise<number> {} sink(P.resolve(1));'
+check closed 'const S = (globalThis as any).DisposableStack; sink(S);'
+check closed 'sink(Array.prototype.slice.call([1, 2], 1));'
+check closed 'class R extends RegExp {} sink(new R("a").test("a"));'
+# ... and what a program calls through them is judged at its own site
+check open   'class A extends Array<number> {} const c = new C(); sink(new A(1).map(c.m, {}));'
+# the text triggers read code: a comment or a sentence in a string compiles nothing in
+n=$((n+1))
+printf '%s\n' '// class A extends Array, Symbol.species, Symbol.dispose, Array.prototype, Promise.prototype, Symbol.toStringTag' \
+  'const message = "x extends Array, Symbol.species, Symbol.dispose, Array.prototype, Promise.prototype";' \
+  'console.log(message);' > "$T/p$n.ts"
+node "$ROOT/exporter/exporter.js" "$T/p$n.ts" "$T/p.json" "$T/l.json" 2>/dev/null
+if grep -qE '__garnet_(species|builtin_tags|array_generic|promise_protocol)|disposable' "$T/p.json"; then
+  echo "[closed] FAIL a comment or a string compiled a protocol library in"; fail=1
+fi
 echo "[closed] $n programs, $([ $fail -eq 0 ] && echo PASS || echo FAIL)"
 exit $fail

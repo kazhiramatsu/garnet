@@ -93,6 +93,18 @@ Rust in §315; selfhost is kept as a performance metric).
   does not contain its parent's, so clang's TBAA takes `((Sub*)p)->f3` and `((Base*)p)->f3` for two
   objects and a load passes a store (silent, default and strict). Every access to a class field, new
   emission included, goes through the declaring class's struct.
+- **A cache keyed by a class word assumes one prototype chain per word.** A class in a function has a
+  prototype per evaluation: an instance of a later evaluation carries `TS_CLS_RELINKED`
+  (`ts_instance_of_evaluation`) and takes the full lookup, or a site's cache answers the first evaluation's
+  method (silent, Session 363).
+- **A fact about a parameter needs every call that reaches the entry, the function's own calls among them.** An argument
+  the first pass could not prove was skipped, so the integer entry of a recursive function took the one outside call's
+  constant for the parameter (`gcd(1071, 462)` was 147, Session 363). What is assumed of a recursive call holds only as
+  far as something validates it: an integer, here, and no constant, range or sign.
+- **Every value with the object selector is read before its kind is known.** Generated guards take `cls` and `shape` at
+  their offsets from anything `ts_is_obj` admits, so a cell that does not begin with `ts_obj_common` keeps both words zero and
+  says so in a `_Static_assert` (`TS_CELL_ZERO_WORDS`). A BigInt's first limb stood there: `1n instanceof A` was true (Session 363).
+  What must leave such a cell out of an object test is `ts_is_prim_cell`; `ts_is_obj` alone says "selector", not "object".
 - **`ts_to_num` is a raw bit reinterpretation (not ToNumber).** `undefined`→NaN matches JS, but
   `null`→NaN does not.
 - **Gate a new feature behind a single predictable branch** (e.g. `if (g_has_proxies && ...)`) = zero
@@ -104,8 +116,13 @@ Rust in §315; selfhost is kept as a performance metric).
 ## Known remaining items (low priority, intentionally deferred)
 - Precision of int-specialized `+`/`-` loop variables in the rare case they straddle [2^53, 2^63]
   (V8 uses double rounding).
-- bigint (the whole numeric-type story; fundamentally unsupported), and Array.prototype monkey-patch
-  (outside the model).
+- Array.prototype monkey-patch: a replaced method (`Array.prototype.push = f`) is not seen by a typed call
+  (outside the model; replacing or deleting `Array.prototype[Symbol.iterator]` is honored: a program that
+  names it walks every array through the protocol, Session 363).
+- A method called through `call` or `apply` on a value of another class, or on a plain object: a `this.m()` in
+  its body was resolved from the class's own hierarchy and may be inlined, so `D.prototype.d.call({ m() {} })`
+  runs the class's `m`, silently (Session 363, older than that session; field accesses are guarded, these
+  calls are not, `docs/foreign_receivers_design.md`).
 - A monomorphized numeric class field (`x: number`, unboxed double) reads as 0 before its first
   assignment (V8: undefined). Boxed fields and typed cells are initialized to undefined (Session 350).
 - Likewise a `number`-typed parameter that receives no argument (a call or `new` through an `any`
@@ -113,7 +130,8 @@ Rust in §315; selfhost is kept as a performance metric).
   representation for a missing number (Session 350 x32 note).
 - An `any` value that holds a non-number, assigned to a `number`-typed local, is unboxed in
   typed mode (V8 keeps the value; garnet reads NaN): typed mode trusts the annotation (Session 350
-  x53 note).
+  x53 note). An explicit `x as number` with nothing behind it, and a number field out of JSON, are `any`
+  used in place and a TypeError flowing into a number slot (`docs/cast_to_number_design.md`).
 - A property read through an index signature (`d.zz` with `d: Record<string, number>`, the key absent)
   is typed `number` by the annotation and read unboxed in typed mode: garnet reads NaN and `typeof`
   says "number" where V8 gives undefined. The keyed form (`d[k]`, `d["zz"]`) keeps the value
@@ -127,19 +145,15 @@ Rust in §315; selfhost is kept as a performance metric).
   `docs/int32_fields_design.md` "Store-proven fields"); a dynamic store of a fraction into it
   (`(n as any).pos = 2.5`) throws a TypeError naming the field (V8 stores the fraction).
   `TSAOT_INT_STORE_FIELDS=0` turns it off.
-- The `arguments` object as a value is an Array of the actual arguments (`apply(this, arguments)`,
-  `arguments[i]`, `Array.from(arguments)` and `arguments.length` agree with V8; strict code never
-  maps it). `Array.isArray(arguments)` is true and it has the Array methods, where V8's Arguments
-  object has `Object.prototype` (Session 354 vue note). Not available in arrow functions or
-  coroutines (a compile-time reject).
 - An ordinary (non-const) enum's member with a constant value is read as that constant at every
   `E.A` / `E["A"]` site (Session 355), as TypeScript inlines const enum members: a write to the enum
   object through `any` (`(E as any).A = 5`) is not seen by those reads, and a read before the enum's
   module has evaluated (an import cycle) gives the constant where V8 throws. The enum object itself
   is intact for `Object.keys(E)`, `E[0]` and a variable key. `TSAOT_ENUM_FOLD=0` keeps the loads.
-- A class's private field (`#x`) is hidden from enumeration and reflection (Session 358), but
-  `o.hasOwnProperty("#x")` and `"#x" in o` still see it, and `(o as any)["#x"]` reads it (V8: a
-  private name is not a property).
+- A private name (`docs/private_names_design.md`) is one per class declaration, not per evaluation: an
+  instance of one evaluation of a class in a function passes the checks of another. An element read
+  before its initializer ran answers undefined (V8: a TypeError), and a frozen object's private field
+  cannot be written.
 - `Request.signal` is the init's signal itself (Node: a fresh signal following it), and
   `ArrayBuffer.isView` does not recognize the library's `DataView` (docs/web_fetch_api_design.md).
 - Web Crypto (`docs/web_crypto_design.md`) provides digests and HMAC keys only: an RSA, ECDSA or AES key
@@ -147,19 +161,17 @@ Rust in §315; selfhost is kept as a performance metric).
 - WHATWG streams (`docs/web_streams_design.md`) are default streams only: `new ReadableStream({ type:
   "bytes" })` and BYOB readers are a TypeError (Node has them). `new CompressionStream("brotli")` is a
   TypeError (no brotli codec; gzip, deflate and deflate-raw run over the system's zlib loaded on first
-  use, docs/web_compression_design.md). A class extending a library class the
-  prelude installs for a Web global (`class X extends Blob`, `extends Request`) is a compile-time
-  reject, as extending any built-in but the Error classes is.
+  use, docs/web_compression_design.md).
 - JSX (Session 358, `docs/jsx_react_ssr_design.md` section 8): under the automatic runtime a `key`
   attribute after a spread attribute (`<A {...p} key="k">`) is a compile-time reject (TypeScript
   calls the import source's `createElement` there); `react-jsxdev` builds the production runtime
   (`jsx` / `jsxs` of `jsx-runtime`, no source positions); `jsxImportSource` is resolved from each
   JSX file as TypeScript resolves the synthetic import. A typed `.toString()` / `.valueOf()` on a
   receiver that is not a string (a cast lied, a String wrapper) takes the receiver's own method.
-- A dynamic `import()` of a module the program does not bundle (a const of a literal type, hono's
-  `cloudflare:workers` probe) rejects at run time with an Error; of a bundled module it is a
-  compile-time reject (Session 358). `new X()` of a constructor the environment declares but the runtime lacks
-  (ReadableStream, CustomEvent, WebSocket) is a ReferenceError where it is reached (Node without the
+- A dynamic `import()` of a module the program does not have rejects at run time with an Error (hono's
+  `cloudflare:workers` probe, any specifier known at run time only); of a bundled module it is evaluated
+  when asked (`docs/dynamic_import_design.md`). `new X()` of a constructor the environment declares but the runtime lacks
+  (CustomEvent, WebSocket) is a ReferenceError where it is reached (Node without the
   global throws there too); `console.trace` as a value is the error writer (no stack).
 - `Promise.prototype.finally` called on a thenable that is not a promise is a garnet TypeError (V8
   builds its thenFinally / catchFinally for any receiver); then and catch on other receivers follow V8
@@ -171,14 +183,26 @@ Rust in §315; selfhost is kept as a performance metric).
   no `freeze` read or spelled out) emits no frozen test on typed stores; `O[k](instance)` with `k`
   computed at run time and `O` obtained through `.constructor` is a TypeError at the freeze (V8 freezes,
   Session 362).
-- A symbol through an `any` receiver: `.description` reads undefined and `.toString()` is a TypeError
-  (the typed forms work; there is no `Symbol.prototype` object). `yield*` over an `any` is a compile-time
-  reject (V8 runs it). `#method in o` for a private method answers false (a private field's brand works).
-  A method or accessor of a class in a function that captures the function's locals, and a static
-  initializer that does, are compile-time rejects: such a class is one class for all its evaluations
-  (constructors and field initializers capture).
-- `o.__proto__` and `o["__proto__"]` read undefined (V8: the prototype through the accessor);
-  `Object.getPrototypeOf` / `setPrototypeOf` are the modelled forms (Session 355 note).
+- A class extending an expression, a built-in other than the Error kinds or a value, and a class whose
+  methods or static initializers capture a function's locals, is a value made at run time
+  (`docs/dynamic_classes_design.md`): nothing types its instances, they are read by key. `super()` inside an
+  arrow function is a compile-time reject there.
+- `Function.prototype.toString` answers `function name() { [native code] }` for every function (a compiled
+  program keeps no source text): a library that reads a function's source sees no body. `err.stack` is the
+  header and one `at <anonymous>` line, made when read. A WeakRef holds its target strongly and a
+  FinalizationRegistry never calls back, as the specification allows.
+- A recursion the C compiler makes a loop spins where V8 throws a RangeError, when it has an exit that is never taken
+  (`if (n < 0) return 0; return f(n + 1) + 1;`); one with no exit keeps its calls and overflows (`docs/exceptions_design.md`).
+  A sparse array past 2^29 elements stays sparse and a generic method over it (`indexOf`, `join`) is a RangeError
+  where V8 walks its dictionary; its own keys, values and `console.log` come from the table. `new Float64Array(2 ** 33)` is a RangeError where V8 maps it lazily. V8's cycle error
+  has the path in its message, garnet's is the first line; a cycle past 1024 levels is found up to 1024 levels late.
+- A property name is interned for the life of the run: a program that makes unbounded distinct dynamic keys grows, and stops loudly at 1.9 G of them.
+  A dense integer-keyed plain object is a dictionary of those names (V8: elements), x35 of Node on a million keys.
+- A dead-zone read of a class binding other than `new` and `instanceof` is undefined, and the static analysis does not see through an import cycle
+  (`docs/tdz_design.md`). `Number.prototype.valueOf` installed on a typed `Date` instance is not seen by `d.valueOf()` (a builtin receiver's method is static).
+- A class whose constructor returns a value is a dynamic class, its subclasses too (`return new Proxy(this, h)`); a private element on a Proxy `this` is a TypeError at its read.
+- A `for..in` over a Proxy does not skip a key deleted during the walk (its keys and descriptors are read at the start, V8 reads each
+  descriptor at the visit). `Array.prototype.join.call(arrayLike)` through the array library has no cycle stack (a plain array has, Session 363).
 - A typed receiver that is a Proxy (vue's reactive arrays and collections) takes its methods through
   the traps, but a typed `for..of` over one, and a cursor `for..of` over a Proxy of a Map or Set,
   walk a snapshot taken through the iteration protocol at loop entry (elements added during the

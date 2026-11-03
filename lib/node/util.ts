@@ -9,7 +9,11 @@ import process from "./process";
 
 export interface InspectOptions { depth?: number | null; colors?: boolean; compact?: boolean | number; breakLength?: number; showHidden?: boolean; sorted?: boolean; getters?: boolean }
 /** The text console.log would print for the value (a string quoted, as util.inspect does). */
-export function inspect(value: unknown, _options?: InspectOptions): string { return inspectValue(value); }
+export function inspect(value: unknown, options?: InspectOptions | boolean, depth?: number | null, colors?: boolean): string {
+  // the legacy signature
+  if (typeof options === "boolean") return inspectValue(value, { showHidden: options, depth, colors });
+  return inspectValue(value, options);
+}
 function formatValue(v: unknown): string { return typeof v === "string" ? v : inspect(v); }
 function formatNumber(v: unknown): string {
   if (typeof v === "number") return Object.is(v, -0) ? "-0" : String(v);

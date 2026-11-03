@@ -320,6 +320,7 @@ fn escape_locals(inst: &Inst) -> Vec<u32> {
                 || builtin == "instanceof.dyn"
                 || builtin.starts_with("instanceof.class:")
                 || builtin.starts_with("binding.check:")
+                || builtin.starts_with("tdz.check:")
             {
                 vec![]
             } else {

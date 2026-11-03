@@ -16,6 +16,7 @@
 # Env:  TSAOT_CONF_SHARD="i/n"  run only shard i of n (1-indexed) for distribution
 #       TSAOT_CONF_STRICT=1      export with the strict type profile (`--strict`)
 #       TSAOT_CONF_TIMEOUT=S     kill a test's run (each engine's) after S seconds
+#       TSAOT_CONF_RT_OBJ=F      link this runtime object instead of compiling one per run
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TIER="${1:-basic}"
@@ -72,7 +73,7 @@ esac
 watchdog() { if [[ -n "${TSAOT_CONF_TIMEOUT:-}" ]]; then perl -e 'alarm shift; exec @ARGV' "$TSAOT_CONF_TIMEOUT" "$@"; else "$@"; fi; }
 
 mapfile_compat() { eval "$1=()"; local _l; while IFS= read -r _l; do eval "$1+=(\"\$_l\")"; done; }
-mapfile_compat allts < <(for d in "${dirs[@]}"; do [[ -d "$d" ]] && find "$d" -name '*.ts' | sort; done)
+mapfile_compat allts < <(for d in "${dirs[@]}"; do [[ -d "$d" ]] && find "$d" -name '*.ts' ! -name '*_FIXTURE*' | sort; done)
 # optional name filter
 if [[ -n "$FILTER" ]]; then
   filtered=(); for f in "${allts[@]}"; do n=$(basename "$f" .ts); [[ "$n" =~ ${FILTER} ]] && filtered+=("$f"); done
@@ -101,8 +102,10 @@ done
 UNITS="${TSAOT_CONF_UNITS:-0}"
 if [[ "$UNITS" == 1 ]]; then . "$ROOT/scripts/lib/units.sh"; fi
 # runtime once
-RT_OBJ="$WORK/ts_rt.o"
-$CC -c "$RT/ts_rt.c" -I"$RT" -o "$RT_OBJ" 2>"$WORK/rt.err" || { echo "[conf] runtime compile FAILED"; cat "$WORK/rt.err"; exit 1; }
+RT_OBJ="${TSAOT_CONF_RT_OBJ:-$WORK/ts_rt.o}"
+if [[ -z "${TSAOT_CONF_RT_OBJ:-}" ]]; then
+  $CC -c "$RT/ts_rt.c" -I"$RT" -o "$RT_OBJ" 2>"$WORK/rt.err" || { echo "[conf] runtime compile FAILED"; cat "$WORK/rt.err"; exit 1; }
+fi
 
 # portable millisecond clock (macOS BSD date lacks %3N; %N also unsupported).
 . "$ROOT/scripts/lib/now_ms.sh"
@@ -122,7 +125,9 @@ while IFS=$'\t' read -r slug path; do
   prog="$WORK/json/$slug.program.json"; jsref="$WORK/v8/$slug.js"
   estatus="$(awk -F'\t' -v n="$slug" '$1==n{print $2}' "$WORK/exp.status")"
   if [[ "$estatus" != "OK" || ! -f "$prog" ]]; then
-    echo "[conf] FAIL ${slug}: export ${estatus:-?}"; grep "\[$slug\]" "$WORK/exp.err" | head -2; nfail=$((nfail+1)); fail=1; continue
+    # a refused program: does V8 refuse it too? (the `dir` tier's summary tells the two apart)
+    v8note=""; [[ "$TIER" == dir ]] && v8note=" V8=[$(LC_ALL=en_US.UTF-8 watchdog node "$jsref" 2>&1 | grep -m1 -E 'SyntaxError|Error:' | cut -c1-100)]"
+    echo "[conf] FAIL ${slug}: export ${estatus:-?}${v8note}"; grep "\[$slug\]" "$WORK/exp.err" | head -2; nfail=$((nfail+1)); fail=1; rm -f "$jsref"; continue
   fi
   # Default-locale fixtures (Date.toLocale*String without arguments) expect the
   # runtime's fixed en-US subset; pin the oracle so a ja_JP shell does not flip.

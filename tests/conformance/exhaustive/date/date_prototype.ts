@@ -1,0 +1,45 @@
+// @ts-nocheck
+// Date.prototype: every member a real method, the setters, the string forms, the conversions.
+const log = (...a) => console.log(...a);
+const name = (f) => { try { return f(); } catch (e) { return e.name; } };
+const d = new Date(Date.UTC(2026, 10, 1, 12, 30, 45, 678));
+log(d.getTime(), d.valueOf(), +d, d.toISOString(), JSON.stringify(d), d.toJSON());
+log(Object.getPrototypeOf(d) === Date.prototype, d instanceof Date, Date.prototype.constructor === Date, Object.keys(d).length);
+log(typeof Date.prototype.setDate, Date.prototype.setHours.length, Date.prototype.setHours.name, Date.prototype.getTime.length);
+log(Object.getOwnPropertyNames(Date.prototype).length > 40, Date.prototype.toGMTString === Date.prototype.toUTCString);
+const u = new Date(0);
+u.setUTCFullYear(2024, 1, 29); log(u.toISOString());
+u.setUTCMonth(12); log(u.toISOString());
+u.setUTCDate(0); log(u.toISOString());
+u.setUTCHours(25, 61, 61, 1001); log(u.toISOString());
+u.setUTCMinutes(-1); log(u.toISOString());
+u.setUTCSeconds(90); log(u.toISOString());
+u.setUTCMilliseconds(5); log(u.toISOString());
+log(u.setTime(1000), u.getTime());
+const l = new Date(2024, 0, 31, 10, 20, 30, 40);
+log(l.getFullYear(), l.getMonth(), l.getDate(), l.getDay(), l.getHours(), l.getMinutes(), l.getSeconds(), l.getMilliseconds());
+l.setDate(l.getDate() + 1); log(l.getMonth(), l.getDate());
+l.setMonth(l.getMonth() + 1); log(l.getMonth(), l.getDate());
+l.setFullYear(2023); log(l.getFullYear());
+l.setHours(23, 59, 59, 999); log(l.getHours(), l.getMinutes(), l.getSeconds(), l.getMilliseconds());
+l.setMinutes(0); l.setSeconds(0); l.setMilliseconds(0); log(l.getHours(), l.getMinutes(), l.getSeconds(), l.getMilliseconds());
+const inv = new Date(NaN);
+log(inv.getTime(), inv.setDate(1), inv.setHours(1), inv.toString(), name(() => inv.toISOString()), inv.toJSON());
+inv.setFullYear(2000); log(inv.getFullYear(), inv.getMonth(), inv.getDate());
+log(new Date(8.64e15).getTime(), new Date(8.64e15 + 1).getTime(), new Date(1.5).getTime(), new Date(-1.5).getTime());
+log(new Date(99, 0).getFullYear(), new Date(100, 0).getFullYear(), new Date(2020, 12, 1).getFullYear(), new Date(2020, 0, 32).getDate());
+log(Date.UTC(2017), Date.UTC(99, 11), Date.UTC(), Date.UTC(2017, 0, 1, 0, 0, 0, 0.9), typeof Date.UTC, Date.UTC.length, Date.parse("2000-01-01T00:00:00Z"));
+const U = Date.UTC, P = Date.parse; log(U(2000, 0), P("2000-01-01T00:00:00.000Z"));
+log(new Date(1e15).toISOString(), new Date(-1e14).toISOString(), new Date(Date.UTC(-1, 0)).toISOString());
+log(d + 1 === d.toString() + "1", d - 1, `${d}` === d.toString(), String(d) === d.toString());
+log(d[Symbol.toPrimitive]("number"), d[Symbol.toPrimitive]("default") === d.toString(), name(() => d[Symbol.toPrimitive]("x")));
+log(new Date(5000) - new Date(2000), new Date(2000) < new Date(5000), new Date(7) == new Date(7), new Date(new Date(9)).getTime());
+log(name(() => Date.prototype.getTime.call({})), name(() => Date.prototype.setDate.call(1, 2)));
+log(typeof Date(), Date().length > 20, Object.prototype.toString.call(d), Object.prototype.toString.call(Date.prototype));
+const any = [d][0]; log(any.getUTCDate(), any.toISOString(), any.hasOwnProperty("x"), any.toUTCString());
+log(d.toUTCString(), d.toGMTString());
+log(d.getYear(), (() => { const y = new Date(0); y.setYear(99); return y.getUTCFullYear(); })());
+log({ toJSON: Date.prototype.toJSON, toISOString() { return "custom"; }, valueOf() { return 1; } }.toJSON());
+log(new Date("2000-01-01T00:00:00Z").getTime(), new Date({ valueOf() { return 5; } }).getTime(), new Date({ toString() { return "2000-01-01T00:00:00Z"; }, valueOf: null }).getTime());
+class Sub extends Date { twice() { return this.getTime() * 2; } }
+log(new Sub(4).twice(), new Sub(4) instanceof Date, Object.prototype.toString.call(new Sub(1)));

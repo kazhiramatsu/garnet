@@ -160,6 +160,8 @@ static tsv ts_unicode_case_tsv_inner(tsv input, int upper, int locale_kind){
   return upper ? ts_str_toupper(input) : ts_str_tolower(input);
 #else
   tsv s = ts_to_string_v(input);
+  tsv quick;
+  if (locale_kind == 0 && ts_str_case_ascii(s, upper, &quick)) return quick;
   ts_gc_root(&s);
   uint32_t src_len = 0;
   uint32_t* src = ts_string_codepoints_copy(s, &src_len);
@@ -297,22 +299,31 @@ tsv ts_strproto_normalize(tsv* args, int nargs){
   return ts_unicode_normalize_tsv(input, form);
 }
 
+/* `this`: RequireObjectCoercible, then ToString */
+static tsv unicode_this(tsv* args, int nargs, const char* name){
+  tsv v = nargs > 0 ? args[0] : TS_UNDEFINED;
+  if (ts_is_str(v)) return v;
+  if (ts_is_undef(v) || ts_is_null(v)){
+    char buf[96];
+    snprintf(buf, sizeof buf, "String.prototype.%s called on null or undefined", name);
+    ts_throw_type_error_msg(buf);
+  }
+  return ts_to_string_template(v);
+}
 tsv ts_unicode_strproto_toUpperCase(tsv* args, int nargs){
-  (void)nargs;
-  return ts_unicode_toupper_tsv(args[0]);
+  return ts_unicode_toupper_tsv(unicode_this(args, nargs, "toUpperCase"));
 }
 
 tsv ts_unicode_strproto_toLowerCase(tsv* args, int nargs){
-  (void)nargs;
-  return ts_unicode_tolower_tsv(args[0]);
+  return ts_unicode_tolower_tsv(unicode_this(args, nargs, "toLowerCase"));
 }
 
 tsv ts_unicode_strproto_toLocaleUpperCase(tsv* args, int nargs){
   tsv locales = nargs > 1 ? args[1] : TS_UNDEFINED;
-  return ts_unicode_tolocaleupper_tsv(args[0], locales);
+  return ts_unicode_tolocaleupper_tsv(unicode_this(args, nargs, "toLocaleUpperCase"), locales);
 }
 
 tsv ts_unicode_strproto_toLocaleLowerCase(tsv* args, int nargs){
   tsv locales = nargs > 1 ? args[1] : TS_UNDEFINED;
-  return ts_unicode_tolocalelower_tsv(args[0], locales);
+  return ts_unicode_tolocalelower_tsv(unicode_this(args, nargs, "toLocaleLowerCase"), locales);
 }

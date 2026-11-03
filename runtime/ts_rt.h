@@ -48,6 +48,15 @@
 #define TS_RT_UNLIKELY(x) (x)
 #endif
 
+/* A recursion with no way out keeps its calls: a loop has no stack to overflow (docs/exceptions_design.md). */
+#if defined(__clang__)
+#define TS_NO_TAIL_CALLS __attribute__((disable_tail_calls))
+#elif defined(__GNUC__)
+#define TS_NO_TAIL_CALLS __attribute__((optimize("no-optimize-sibling-calls")))
+#else
+#define TS_NO_TAIL_CALLS
+#endif
+
 #if defined(TSAOT_USE_MIMALLOC)
 #include <mimalloc.h>
 #define malloc  mi_malloc
@@ -240,7 +249,8 @@ enum { TS_KIND_OBJECT = 1, TS_KIND_ARRAY = 2, TS_KIND_STRING = 3, TS_KIND_FUNC =
           before the exotic kinds: the prototype walk treats every kind from PROMISE on as exotic */
        TS_KIND_REGEXP = 9,
        TS_KIND_PROMISE = 10, TS_KIND_CORO = 11, TS_KIND_ACCESSOR = 12, TS_KIND_SYMBOL = 13, TS_KIND_PROXY = 14,
-       TS_KIND_LAST = TS_KIND_PROXY };
+       TS_KIND_BIGINT = 15,
+       TS_KIND_LAST = TS_KIND_BIGINT };
 typedef struct ts_gc_header {
   uint8_t kind, mark, gen;
   uint8_t flags;   /* TS_HDR_REMEMBERED, TS_HDR_SIZED */
@@ -275,6 +285,10 @@ typedef struct ts_gc_header {
    it moves the addition caches' epoch; on any other object it changes that object alone (yaml defined
    a read-only property on every node: the epoch moved 45k times per parse). */
 #define TS_HDR_IS_PROTO 16u
+/* a prototype of the second or a later evaluation of a class: one class word, a prototype per
+   evaluation. The caches keyed by the word hold the first evaluation's chain, so an instance of a
+   later one carries TS_CLS_RELINKED (ts_instance_of_evaluation) and takes the full lookup. */
+#define TS_HDR_LATER_EVAL 32u
 /* 8 bytes (docs/cell_header_design.md; docs/gc_v2_design.md §4.4): a heap
    reference is the address, so the cell carries no handle and no list link,
    and its size is its size class's (or its large run's), so it carries no
@@ -316,6 +330,8 @@ static inline int ts_is_str(tsv v) {
 }
 static inline int ts_is_func(tsv v){ return TS_TOP16(v) == TS_SEL_FUNC; }
 #define TS_SHORTSTR_MAX 5u
+/* The longest string (V8's): past it the string builtins are a RangeError, not a truncated length. */
+#define TS_STR_MAX_LENGTH 536870888u
 static inline uint32_t ts_short_str_len(tsv v){
   return (uint32_t)((v >> 40) & 7u);
 }
@@ -357,7 +373,9 @@ static inline int ts_is_regexp(tsv v){ return ts_is_obj(v) && ((ts_gc_header*)ts
    the analyzer emits TS_KEY_METHOD(id) rather than open-coding the arithmetic. */
 typedef uint32_t ts_key;
 enum ts_key_tag { TS_K_STRING = 0, TS_K_SYMBOL = 1, TS_K_INDEX = 2, TS_K_WKSYM = 3 };
-#define TS_METHOD_KEY_BASE 1000000u
+/* (1000000 until Session 363: the millionth distinct property name of a run became a method key: gone from
+   Object.keys, and the same id as a method's. Ids are not recycled: ts_intern_field stops at this base.) */
+#define TS_METHOD_KEY_BASE 1900000000u
 /* a named-method key from a method-name id (single source of the partition). */
 #define TS_KEY_METHOD(id) (TS_METHOD_KEY_BASE + (uint32_t)(id))
 
@@ -384,6 +402,17 @@ enum ts_wksym_id {
   TS_WKSYM_TO_PRIMITIVE   = 2,
   TS_WKSYM_HAS_INSTANCE   = 3,
   TS_WKSYM_TO_STRING_TAG  = 4,
+  TS_WKSYM_MATCH          = 5,
+  TS_WKSYM_MATCH_ALL      = 6,
+  TS_WKSYM_REPLACE        = 7,
+  TS_WKSYM_SEARCH         = 8,
+  TS_WKSYM_SPLIT          = 9,
+  TS_WKSYM_SPECIES        = 10,
+  TS_WKSYM_IS_CONCAT_SPREADABLE = 11,
+  TS_WKSYM_UNSCOPABLES    = 12,
+  TS_WKSYM_DISPOSE        = 13,
+  TS_WKSYM_ASYNC_DISPOSE  = 14,
+  TS_WKSYM_COUNT          = 15,
 };
 
 typedef struct { ts_key key; tsv val; uint8_t flags; } ts_prop;
@@ -1173,6 +1202,12 @@ static inline double ts_str_slice_charcodeat_typed(tsv s, long long start, long 
   ts_strview x = ts_str_view_typed(s);
   return (double)ts_str_cu_at_view(x, (uint32_t)(start + (long long)idx));
 }
+/* ToIntegerOrInfinity of an index argument as a 64-bit integer: NaN is 0, a magnitude past 2^53
+   saturates (a cast of either is undefined, and the two targets differ). */
+static inline long long ts_index_ll(double d){
+  if (TS_RT_LIKELY(d > -9007199254740992.0 && d < 9007199254740992.0)) return (long long)d;
+  return d != d ? 0 : (d < 0 ? -9007199254740992LL : 9007199254740992LL);
+}
 /* General multi-code-unit and mixed-width scanning is an out-of-line worker.
    The allocation-free one-byte/single-unit case stays in the header because it
    collapses to memchr at generated call sites. */
@@ -1202,16 +1237,20 @@ static inline long long ts_str_find_backward_view(ts_strview xs, ts_strview ns, 
   if (start < 0) return -1;
   return ts_str_find_backward_view_slow(xs, ns, start);
 }
+double ts_str_search_coerce(tsv s, tsv needle, double from, int has_from, int last);   /* a receiver or a needle that is not a string */
 static inline double ts_str_indexof_fast(tsv s, tsv needle, double from, int has_from){
-  if (!ts_is_str(s) || !ts_is_str(needle)) return -1;
+  if (!ts_is_str(s) || !ts_is_str(needle)) return ts_str_search_coerce(s, needle, from, has_from, 0);
   ts_strview xs = ts_str_view_typed(s), ns = ts_str_view_typed(needle);
-  long long start = has_from ? (long long)from : 0;
+  long long start = has_from ? ts_index_ll(from) : 0;
   return (double)ts_str_find_forward_view(xs, ns, start);
 }
+/* NaN (an explicit undefined among them) is the end of the string, unlike every other position
+   argument; a negative position is 0: the needle can still match at the start. */
 static inline double ts_str_lastindexof_fast(tsv s, tsv needle, double from, int has_from){
-  if (!ts_is_str(s) || !ts_is_str(needle)) return -1;
+  if (!ts_is_str(s) || !ts_is_str(needle)) return ts_str_search_coerce(s, needle, from, has_from, 1);
   ts_strview xs = ts_str_view_typed(s), ns = ts_str_view_typed(needle);
-  long long start = has_from ? (long long)from : (long long)xs.len - (long long)ns.len;
+  long long start = has_from && from == from ? ts_index_ll(from) : (long long)xs.len - (long long)ns.len;
+  if (start < 0) start = 0;
   return (double)ts_str_find_backward_view(xs, ns, start);
 }
 long long ts_str_replace_literal_metric3(tsv s, tsv pat, tsv rep, tsv needle,
@@ -1243,21 +1282,43 @@ typedef struct ts_array {
 static inline int ts_is_indexed_array_fast(tsv v){
   return ts_is_obj(v) && ((ts_gc_header*)ts_ptr(v))->kind == TS_KIND_ARRAY;
 }
+/* A dictionary array (`sparse` == TS_ARRAY_DICT, docs/dictionary_arrays_design.md): an element with an accessor or
+   an attribute of its own, or a read-only length, moved every element to the property map under its index key. cap is
+   0, as for a sparse array, so every inline path leaves for the runtime, and as_arr answers NULL: the methods take the
+   receiver as they take a Proxy. `len` stays the length. */
+#define TS_ARRAY_DICT 2
+#define TS_ARRAY_LENGTH_READONLY 1u   /* kind_spare */
+static inline int ts_is_plain_array(tsv v){
+  return ts_is_indexed_array_fast(v) && ((ts_array*)ts_ptr(v))->sparse != TS_ARRAY_DICT;
+}
+static inline int ts_array_is_empty(tsv v){ return ts_is_plain_array(v) && ((ts_array*)ts_ptr(v))->len == 0; }
 /* Typed arrays (docs/typed_arrays_design.md): a buffer owns bytes outside the
    heap; a view points into them and keeps the buffer alive. */
 enum { TS_TA_INT8, TS_TA_UINT8, TS_TA_UINT8C, TS_TA_INT16, TS_TA_UINT16, TS_TA_INT32,
-       TS_TA_UINT32, TS_TA_FLOAT32, TS_TA_FLOAT64, TS_TA_COUNT };
+       TS_TA_UINT32, TS_TA_FLOAT32, TS_TA_FLOAT64,
+       /* elements that are no doubles: the typed fast paths never see these two, only the runtime's */
+       TS_TA_BIGINT64, TS_TA_BIGUINT64,
+       /* no typed path either */
+       TS_TA_FLOAT16, TS_TA_COUNT };
 typedef struct ts_arraybuffer {
   ts_obj_common o;
   uint8_t* bytes;
   uint32_t byte_length;
   uint8_t shared;
+  uint8_t resizable;        /* made with maxByteLength: `bytes` holds that many, it never moves */
+  uint8_t detached;
+  uint32_t max_byte_length;
 } ts_arraybuffer;
 typedef struct ts_typedarray {
   ts_obj_common o;
   uint8_t* data;            /* bytes + byte_offset of the buffer */
   uint32_t length, byte_offset;
   uint8_t elem;             /* TS_TA_* */
+  /* `length` is the live one for every reader: a resize or a detach rewrites it in each view of the
+     buffer, so an element access has one bound to test (docs/resizable_buffers_design.md) */
+  uint8_t tracking;         /* the length follows the buffer */
+  uint8_t out_of_bounds;    /* length 0 until the buffer covers the view again; a detached buffer's for good */
+  uint32_t fixed_length;
   tsv buffer;
 } ts_typedarray;
 static inline int ts_is_typed_array(tsv v){
@@ -1310,6 +1371,7 @@ tsv  ts_atomics_compare_exchange(tsv ta, tsv index, tsv expected, tsv replacemen
 tsv  ts_atomics_is_lock_free(tsv n);
 tsv  ts_atomics_wait(tsv ta, tsv index, tsv value, tsv timeout);
 tsv  ts_atomics_notify(tsv ta, tsv index, tsv count);
+tsv  ts_atomics_pause(tsv n);
 tsv  ts_text_encoder_new(void);
 tsv  ts_text_decoder_new(tsv label, tsv options);
 tsv  ts_text_encoder_proto(void);
@@ -1338,10 +1400,50 @@ static inline int ts_array_is_array(tsv v){
   if (ts_is_indexed_array_fast(v)) return 1;
   return TS_RT_UNLIKELY(g_has_proxies) ? ts_array_is_array_slow(v) : 0;
 }
+/* A BigInt value (docs/bigint_design.md): OBJECT-tagged as a Symbol is, immutable. `0n` is false, so a
+   truthiness test looks at an object's kind in a program that can make one (TS_PROGRAM_BIGINT, set by the
+   emitter); any other pays nothing. */
+/* `cls` and `shape`: never written, zero as gc_alloc leaves them (ts_obj_common: generated code reads the two words before
+   it knows the cell's kind). The first limb stood there, so `1n instanceof A` was true. */
+typedef struct ts_bigint { ts_gc_header h; uint32_t len, neg; uint32_t cls, shape; uint64_t limb[]; } ts_bigint;
+_Static_assert(TS_CELL_ZERO_WORDS(ts_bigint), "a BigInt answers the class and shape words with zero");
+static inline int ts_is_bigint(tsv v){ return ts_is_obj(v) && ((ts_gc_header*)ts_ptr(v))->kind == TS_KIND_BIGINT; }
+/* a primitive in a cell: what the tests for an object must leave out */
+static inline int ts_is_prim_cell(tsv v){
+  if (!ts_is_obj(v)) return 0;
+  uint8_t k = ((ts_gc_header*)ts_ptr(v))->kind;
+  return k == TS_KIND_SYMBOL || k == TS_KIND_BIGINT;
+}
+extern int g_has_bigint;
+tsv    ts_bigint_literal(const char* text);
+tsv    ts_bigint_call(tsv* a, int n);
+tsv    ts_bigint_as_int_n(tsv* a, int n);
+tsv    ts_bigint_as_uint_n(tsv* a, int n);
+tsv    ts_bigint_to_string(tsv v, int radix);
+tsv    ts_bigint_proto(void);
+void   ts_bigint_ctor_link(tsv ctor);
+tsv    ts_bigint_negate(tsv v);
+int    ts_bigint_eq(tsv a, tsv b);
+int    ts_bigint_relational(tsv a, tsv b);
+int    ts_bigint_loose_eq(tsv big, tsv other);
+uint32_t ts_bigint_hash(tsv v);
+double ts_bigint_to_double(tsv v);
+tsv    ts_to_bigint(tsv v);
+uint64_t ts_bigint_to_u64(tsv v);
+tsv    ts_bigint_from_i64(int64_t i);
+tsv    ts_bigint_from_u64(uint64_t u);
+tsv    ts_numeric_op(int op, tsv a, tsv b);
+tsv    ts_numeric_unary(int op, tsv v);
+tsv    ts_number_of(tsv v);   /* Number(v) */
 TS_RT_ALWAYS_INLINE int ts_truthy_fast(tsv v){
   if (ts_is_num(v)){ double d=ts_to_num(v); return d!=0 && !(d!=d); }
   uint16_t t = TS_TOP16(v);
+#ifdef TS_PROGRAM_BIGINT
+  if (t == TS_SEL_OBJECT) return !(((ts_gc_header*)ts_ptr(v))->kind == TS_KIND_BIGINT && ((ts_bigint*)ts_ptr(v))->len == 0);
+  if (t == TS_SEL_FUNC) return 1;
+#else
   if (t == TS_SEL_OBJECT || t == TS_SEL_FUNC) return 1;
+#endif
   if (t == TS_SEL_BOOL) return (int)(v&1);
   if (t == TS_SEL_UNDEF || t == TS_SEL_NULL) return 0;
   return ts_truthy(v);   /* strings (and short strings): length test out of line */
@@ -1356,7 +1458,7 @@ static inline int ts_typeof_is_boolean(tsv v){ return !ts_is_num(v) && !ts_is_st
 static inline int ts_typeof_is_undefined(tsv v){ return !ts_is_num(v) && !ts_is_str(v) && !ts_is_bool(v) && ts_is_undef(v); }
 static inline int ts_typeof_is_function(tsv v){ return !ts_is_num(v) && !ts_is_str(v) && !ts_is_bool(v) && !ts_is_undef(v) && (ts_is_func(v) || ts_is_callable_proxy(v)); }
 static inline int ts_typeof_is_symbol(tsv v){ return !ts_is_num(v) && !ts_is_str(v) && !ts_is_bool(v) && !ts_is_undef(v) && !ts_is_func(v) && ts_is_symbol(v); }
-static inline int ts_typeof_is_object(tsv v){ return !ts_is_num(v) && !ts_is_str(v) && !ts_is_bool(v) && !ts_is_undef(v) && !ts_is_func(v) && !ts_is_symbol(v) && !ts_is_callable_proxy(v); }
+static inline int ts_typeof_is_object(tsv v){ return !ts_is_num(v) && !ts_is_str(v) && !ts_is_bool(v) && !ts_is_undef(v) && !ts_is_func(v) && !ts_is_prim_cell(v) && !ts_is_callable_proxy(v); }
 static inline int ts_is_undefined_fast(tsv v){ return ts_is_undef(v); }
 
 /* JS Map: parallel key/value arrays preserving insertion order, plus a side
@@ -1445,6 +1547,14 @@ typedef struct ts_func {
      `new fn(...)` calls the code with the arguments alone and takes the object it returns;
      no instance is allocated for it (ts_construct). */
   uint8_t native_ctor : 1;
+  /* 1 once the program gave a class value a [[Prototype]] (Object.setPrototypeOf): it is `o.proto` then, and
+     no longer the base class the prototypes' chain says (ts_get_proto) */
+  uint8_t user_proto : 1;
+  /* 1: the constructor of a dynamic class (docs/dynamic_classes_design.md): `new` leaves new.target and
+     the active function for its entry; its `prototype` is read only. */
+  uint8_t dyn_class : 1;
+  /* 1: a generator function: `prototype` is the one its generators get (docs/generator_functions_design.md) */
+  uint8_t gen_fn : 1;
   /* For a CLASS VALUE (a class used as a runtime value, `const K = C`): the
      class id PLUS ONE (0 = ordinary function/closure, not a constructor). `new K()`
      reads this via ts_construct. code holds the constructor cfunc; env holds the
@@ -1560,6 +1670,8 @@ tsv  ts_make_fn_t_pretenured(ts_code code, tsv* env, uint32_t envlen, int takes_
 tsv ts_funcproto_call(tsv* args, int n);
 tsv ts_funcproto_apply(tsv* args, int n);
 tsv ts_funcproto_bind(tsv* args, int n);
+tsv ts_funcproto_toString(tsv* args, int n);
+tsv ts_numproto_toLocaleString(tsv* args, int n);
 /* String.prototype setup (any-typed string method dispatch). */
 tsv  ts_string_proto(void);
 void ts_string_proto_init(void);
@@ -1568,6 +1680,19 @@ void ts_string_proto_register(ts_key method_key, const char* name, ts_code fn);
    generated RegExp method wrappers live in emitted C so no-RegExp programs do not
    reference the optional QuickJS adapter. */
 tsv  ts_regexp_proto(void);
+tsv  ts_object_group_by(tsv* a, int n);
+tsv  ts_map_group_by(tsv* a, int n);
+tsv  ts_new_array_buffer_options(tsv length, tsv options, int shared);
+void ts_track_buffer_views(void);   /* the program can detach a buffer: every view is registered with it */
+tsv  ts_iterator_proto(void);
+void ts_iterator_global(void);
+tsv  ts_symbol_proto(void);
+tsv  ts_date_proto(void);
+void ts_date_ctor_link(tsv ctor);   /* Date.prototype and its `constructor` */
+tsv  ts_date_link(tsv o);           /* a fresh object is a Date */
+tsv  ts_date_utc_value(tsv* a, int n);
+void ts_symbol_ctor_link(tsv ctor);   /* Symbol.prototype and its `constructor` */
+tsv  ts_regexpproto_toString(tsv* a, int n);
 void ts_regexp_proto_init(void);
 void ts_regexp_proto_register(ts_key method_key, const char* name, ts_code fn);
 int  ts_regexp_is_object(tsv re);
@@ -1583,6 +1708,11 @@ tsv ts_regexp_last_index_write(tsv re, tsv v);
 /* the adapter's entry points the core runtime calls when the program links RegExps
    (runtime/regexp/ts_regexp_adapter.c installs them): toString, the String methods with a
    RegExp argument, a RegExp from a string pattern, the program's release on sweep */
+/* A program with customized matchers (docs/well_known_symbols_design.md): the string methods take their
+   argument's method at the well-known symbol. Set at startup; the typed paths are not in such a program. */
+extern int g_regexp_protocol;
+/* A program whose array results can have a constructor of their own: lib/node/web/species.ts is compiled in. */
+extern int g_species;
 typedef struct ts_regexp_hooks {
   tsv (*to_string)(tsv re);
   tsv (*replace)(tsv s, tsv re, tsv replacement, int all);
@@ -1592,6 +1722,7 @@ typedef struct ts_regexp_hooks {
   double (*search)(tsv s, tsv re);
   tsv (*from_string)(tsv pattern, tsv flags);
   void (*release)(rx_program* p);
+  tsv (*escape)(tsv v);
 } ts_regexp_hooks;
 void ts_regexp_hooks_install(const ts_regexp_hooks* h);
 /* register a static cell holding a tsv as a permanent root (idempotent through *rooted) */
@@ -1611,6 +1742,8 @@ tsv ts_strproto_endsWith(tsv* a, int n);
 tsv ts_strproto_charAt(tsv* a, int n);
 tsv ts_strproto_charCodeAt(tsv* a, int n);
 tsv ts_strproto_codePointAt(tsv* a, int n);
+tsv ts_strproto_localeCompare(tsv* a, int n);
+double ts_str_locale_compare(tsv a, tsv b);
 tsv ts_strproto_substring(tsv* a, int n);
 tsv ts_strproto_substr(tsv* a, int n);
 tsv ts_strproto_toString(tsv* a, int n);
@@ -1667,6 +1800,9 @@ tsv ts_headersproto_set(tsv* a, int n); tsv ts_headersproto_delete(tsv* a, int n
 /* Array.prototype method wrappers (ts_code signature, this = args[0]). */
 tsv ts_arrproto_join(tsv* args, int n);
 tsv ts_arrproto_toString(tsv* args, int n);
+tsv ts_arrproto_toLocaleString(tsv* args, int n);
+double ts_for_in_stamp(void);
+int ts_for_in_live(tsv obj, tsv key, double stamp);
 tsv ts_arrproto_indexOf(tsv* args, int n);
 tsv ts_arrproto_includes(tsv* args, int n);
 tsv ts_arrproto_lastIndexOf(tsv* args, int n);
@@ -1908,6 +2044,7 @@ tsv ts_str_charat(tsv s, double idx);
 tsv ts_str_codepointat(tsv s, double idx);
 double ts_str_charcodeat(tsv s, double idx);
 tsv ts_str_concat(tsv a, tsv b);
+int ts_str_case_ascii(tsv s, int upper, tsv* out);
 tsv ts_str_repeat(tsv s, double count);
 tsv ts_str_trim(tsv s);
 tsv ts_str_split(tsv s, tsv sep, tsv limit);
@@ -1986,7 +2123,22 @@ double ts_date_from_components(double y,double mo,double d,double h,double mi,do
 double ts_date_component(double ms, int which);
 double ts_date_value_ms(tsv v);          /* new Date(value): a Date, an ISO or toString-shaped string, else ToNumber */
 tsv ts_error_ctor_value(int kind);     /* an Error kind as a constructor value (one per kind) */
-tsv ts_class_extend_dyn(tsv parent, tsv name);   /* `class D extends <value> {}`: a derived constructor */
+/* dynamic classes (docs/dynamic_classes_design.md) */
+tsv ts_dyn_class(tsv fn, tsv base, int has_base);   /* wires F and its prototype, answers the prototype */
+tsv ts_dyn_enter(const char* name);
+tsv ts_dyn_active(void);
+tsv ts_dyn_this(tsv new_target);
+tsv ts_dyn_this_check(tsv self);
+tsv ts_dyn_super(tsv active, tsv new_target, tsv args);
+void ts_dyn_bind_check(tsv self);
+tsv ts_dyn_result(tsv v, tsv self, int derived);
+void ts_fn_mark_native_ctor(tsv fn);
+void ts_throw_reference_error_msg(const char* msg);
+tsv ts_builtin_fn_value(ts_code code, int takes_this);   /* one function value per built-in */
+int ts_native_new_take(void);   /* a built-in constructor's value: was this call a `new`? */
+tsv ts_ctor_date(tsv* a, int n);
+tsv ts_regexp_ctor_value(ts_code adapter);
+tsv ts_ctor_collection(int kind, tsv* a, int n);
 double ts_date_parse_chars(const char* s, uint32_t len);
 double ts_date_parse_value(tsv v);        /* Date.parse */
 double ts_date_utc(double y, double mo, double d, double h, double mi, double s, double ms);   /* Date.UTC */
@@ -2000,7 +2152,11 @@ tsv    ts_array_find(tsv arr, tsv cb);
 double ts_array_findindex(tsv arr, tsv cb);
 tsv    ts_array_findlast(tsv arr, tsv cb);
 double ts_array_findlastindex(tsv arr, tsv cb);
+double ts_array_flat_depth(tsv depth);   /* undefined is 1, as an absent depth */
 tsv    ts_array_flat(tsv arr, double depth);
+double ts_array_touch_length(tsv arr);
+void   ts_iterator_close_quietly(tsv it);
+tsv    ts_array_slice_method(tsv arr, double start, double end, int has_end);   /* `arr.slice()`: ts_array_slice is also the runtime's own copy */
 tsv    ts_array_flatmap(tsv arr, tsv cb);
 tsv    ts_string_from_char_code(tsv* args, int n);
 tsv    ts_string_from_code_point(tsv* args, int n);
@@ -2039,6 +2195,7 @@ int    ts_has_prop_dyn(tsv obj, tsv keyv);
 int    ts_has_own(tsv obj, ts_key key);
 int    ts_has_own_dyn(tsv obj, tsv keyv);
 tsv    ts_object_rest(tsv src, const uint32_t* excl, int nexcl);
+tsv    ts_object_rest_keys(tsv src, const tsv* keys, int n);
 tsv    ts_get_dyn(tsv obj, tsv keyv);
 tsv    ts_get_checked(tsv obj, ts_key key);
 tsv    ts_get_dyn_checked(tsv obj, tsv keyv);
@@ -2052,13 +2209,48 @@ tsv    ts_reflect_has(tsv t, tsv k);
 tsv    ts_reflect_set(tsv t, tsv k, tsv v);
 tsv    ts_reflect_get_recv(tsv t, tsv k, tsv receiver);
 tsv    ts_reflect_set_recv(tsv t, tsv k, tsv v, tsv receiver);
+/* `super.x = v`: Set on the parent chain with `this` the receiver; a refusal is a TypeError */
+tsv    ts_super_set(tsv proto, tsv k, tsv v, tsv receiver);
+/* `x as number` from what is not known to be one: a cast that lies is a TypeError, not a NaN later */
+void   ts_throw_bad_number_cast(tsv v);
+static inline tsv ts_cast_number(tsv v){
+  if (TS_RT_UNLIKELY(!ts_is_num(v) && !ts_is_null(v) && !ts_is_undef(v))) ts_throw_bad_number_cast(v);
+  return v;
+}
+/* a property of data out of JSON, typed number, flowing into a number slot: nothing else fits there */
+void   ts_throw_foreign_number(tsv v, const char* name);
+static inline tsv ts_cast_foreign_number(tsv v, const char* name){
+  if (TS_RT_UNLIKELY(!ts_is_num(v))) ts_throw_foreign_number(v, name);
+  return v;
+}
+tsv    ts_cast_number_array(tsv v);   /* `JSON.parse(s) as number[]`: every element is a number */
+/* the member of a call is read before its arguments run: a nullish receiver throws first */
+void   ts_throw_method_receiver(tsv v, const char* name);
+static inline tsv ts_method_receiver(tsv v, const char* name){
+  if (TS_RT_UNLIKELY(ts_is_null(v) || ts_is_undef(v))) ts_throw_method_receiver(v, name);
+  return v;
+}
 tsv    ts_reflect_delete(tsv t, tsv k);
 tsv    ts_reflect_set_proto(tsv t, tsv p);
 tsv    ts_reflect_define_property(tsv t, tsv k, tsv d);
 tsv    ts_reflect_prevent_extensions(tsv t);
 tsv    ts_reflect_own_keys(tsv t);
+tsv    ts_arguments_object(tsv arr);
+void   ts_register_string_ctor(tsv string);
+void   ts_define_function_poison(void);
+void   ts_define_builtin_tags(void);
+tsv    ts_object_get_prototype_of(tsv v);
+tsv    ts_object_set_prototype_of(tsv v, tsv p);
+void   ts_define_proto_accessor(void);
+void   ts_json_extras(tsv json);
+tsv    ts_reflect_get(tsv t, tsv k);
+tsv    ts_reflect_get_proto(tsv t);
+tsv    ts_reflect_own_desc(tsv t, tsv k);
+tsv    ts_reflect_is_extensible(tsv t);
 tsv    ts_reflect_apply(tsv fn, tsv thisArg, tsv argsArray);
 tsv    ts_reflect_construct(tsv fn, tsv argsArray);
+tsv    ts_reflect_construct_target(tsv fn, tsv argsArray, tsv target);
+int    ts_has_prop_in(tsv obj, ts_key key);
 
 /* field-id <-> name table (seeded at startup by emitted FIELD_NAMES) */
 void        ts_init_fields(const char* const* names, const uint32_t* lens, uint32_t count);
@@ -2071,6 +2263,19 @@ tsv ts_object_for_in_keys(tsv obj);
 tsv ts_object_get_own_property_names(tsv obj);
 tsv ts_object_get_own_property_symbols(tsv obj);
 tsv ts_object_freeze(tsv v);
+tsv ts_to_object(tsv v);
+tsv ts_property_key_value(tsv v);
+tsv ts_fn_key_name(tsv key);
+void ts_private_check(tsv obj, ts_key key);
+void ts_private_add(tsv obj, ts_key key, const char* cls);
+int ts_private_has(tsv obj, ts_key key);
+tsv ts_fn_name_from_key(tsv fn, tsv key, const char* prefix);
+tsv ts_new_target_of(tsv self);
+tsv ts_take_new_target(ts_code code);
+tsv ts_import_meta(uint32_t module, tsv path);
+void ts_register_primitive_ctors(tsv object, tsv number, tsv boolean);
+void ts_register_symbol_ctor(tsv symbol);
+void ts_define_has_instance(void);
 tsv ts_object_freeze_unseen(tsv v);
 tsv ts_object_is_frozen(tsv v);
 /* A typed direct store on a frozen class instance: the strict-mode TypeError
@@ -2086,6 +2291,7 @@ void ts_register_class_names(const char* const* tab, uint32_t n);
 tsv ts_publish(tsv v);
 int ts_is_published(tsv v);
 tsv ts_object_create(tsv proto);
+tsv ts_object_create_value(tsv proto);
 tsv ts_object_seal(tsv v);
 tsv ts_object_prevent_extensions(tsv v);
 tsv ts_object_is_sealed(tsv v);
@@ -2253,6 +2459,9 @@ int ts_strict_eq_str(tsv a, tsv b);   /* two strings: the lengths first, then th
 TS_RT_ALWAYS_INLINE int ts_strict_eq(tsv a, tsv b){
   if (a == b) return !(ts_is_num(a) && ts_to_num(a) != ts_to_num(a));
   if (ts_is_num(a) || ts_is_num(b)) return ts_is_num(a) && ts_is_num(b) && ts_to_num(a) == ts_to_num(b);
+#ifdef TS_PROGRAM_BIGINT
+  if (ts_is_bigint(a)) return ts_is_bigint(b) && ts_bigint_eq(a, b);
+#endif
   if (ts_is_obj(a) || ts_is_func(a)) return ts_same_cell(a, b);
   if (ts_is_str(a) && ts_is_str(b)) return ts_strict_eq_str(a, b);
   return 0;
@@ -2356,6 +2565,8 @@ tsv  ts_make_class_value_once(uint32_t class_id, ts_code ctor, tsv* env, uint32_
 void ts_throw_uninitialized(const char* name);
 void ts_throw_not_defined(const char* name);   /* V8's "X is not defined" ReferenceError */
 tsv  ts_construct(tsv ctorv, tsv* args, int n);
+void ts_class_refuse_call(tsv fv, uint32_t class_id, ts_code refused);
+void ts_throw_class_call(const char* name);
 /* guarded direct construction (ts_rt.c): the predicted constructor's code,
    the instance before the direct body call, the result after it */
 int ts_construct_same_code(tsv ctorv, tsv fval);
@@ -2732,6 +2943,10 @@ static inline int ts_int32_exact(tsv v, int32_t* out){
   if (i == 0 && (v >> 63)) return 0;
   *out = i;
   return 1;
+}
+static inline void ts_instance_of_evaluation(tsv inst){
+  ts_object* o = (ts_object*)ts_ptr(inst);
+  if (ts_is_obj(o->proto) && TS_RT_UNLIKELY(((ts_object*)ts_ptr(o->proto))->h.flags & TS_HDR_LATER_EVAL)) o->cls |= TS_CLS_RELINKED;
 }
 TS_RT_ALWAYS_INLINE tsv ts_get_pic_checked_inline(
     tsv obj, ts_key key, ts_prop_ic* ic){
@@ -3254,8 +3469,11 @@ static inline uint8_t ts_ta_clamp_u8(double d){
   if (r > 0.5 || (r == 0.5 && (u & 1u))) u++;   /* round half to even */
   return (uint8_t)u;
 }
+uint16_t ts_double_to_f16_bits(double x);
+double ts_f16_bits_to_double(uint16_t h);
 TS_RT_ALWAYS_INLINE double ts_ta_elem_load(const uint8_t* data, uint32_t i, int elem){
   switch (elem){
+    case TS_TA_FLOAT16: { uint16_t x; memcpy(&x, data + (size_t)i * 2u, 2); return ts_f16_bits_to_double(x); }
     case TS_TA_INT8: return (double)((const int8_t*)data)[i];
     case TS_TA_UINT8: case TS_TA_UINT8C: return (double)data[i];
     case TS_TA_INT16: { int16_t x; memcpy(&x, data + (size_t)i * 2u, 2); return (double)x; }
@@ -3270,6 +3488,7 @@ TS_RT_ALWAYS_INLINE double ts_ta_elem_load(const uint8_t* data, uint32_t i, int 
    by rounding half to even, Float32 by rounding. */
 TS_RT_ALWAYS_INLINE void ts_ta_elem_store(uint8_t* data, uint32_t i, double d, int elem){
   switch (elem){
+    case TS_TA_FLOAT16: { uint16_t x = ts_double_to_f16_bits(d); memcpy(data + (size_t)i * 2u, &x, 2); break; }
     case TS_TA_INT8: case TS_TA_UINT8: data[i] = (uint8_t)(uint32_t)ts_to_int32(d); break;
     case TS_TA_UINT8C: data[i] = ts_ta_clamp_u8(d); break;
     case TS_TA_INT16: case TS_TA_UINT16: { uint16_t x = (uint16_t)(uint32_t)ts_to_int32(d); memcpy(data + (size_t)i * 2u, &x, 2); break; }
@@ -3726,6 +3945,13 @@ void ts_set_linked(tsv obj, ts_key key, tsv value, ts_prop_ic* ic, ts_frame_hdr*
 /* The hole marker of a sparse array element (never a user-visible value). */
 #define TS_ARRAY_HOLE TS_BOX(0xFFFEu, 0x4152484Fu)
 static inline int array_is_hole(tsv v){ return v == TS_ARRAY_HOLE; }
+/* The value of a captured binding before its declaration has run (never a user-visible value: docs/tdz_design.md). */
+#define TS_TDZ_HOLE TS_BOX(0xFFFEu, 0x54445A5Au)
+/* A hole reads undefined, unless Array.prototype or Object.prototype was given an element (the library that tracks
+   it, docs/array_protocol_design.md): the test is on the path of a hole only. */
+extern int g_proto_elements;
+tsv ts_array_hole_read(tsv arr, int64_t i);
+static inline tsv ts_array_hole_value(tsv arr, int64_t i){ return TS_RT_UNLIKELY(g_proto_elements) ? ts_array_hole_read(arr, i) : TS_UNDEFINED; }
 /* Element read with the array case in line: a dense slot (below cap: every
    slot in [len, cap) is a hole) that is not a hole is the value, any other
    index of a dense array is undefined (ts_array_get agrees); a sparse array
@@ -3741,8 +3967,8 @@ static inline int array_is_hole(tsv v){ return v == TS_ARRAY_HOLE; }
 static inline tsv ts_array_get_inline(tsv arr, int64_t i){
   if (ts_is_indexed_array_fast(arr)){
     ts_array* a = (ts_array*)ts_ptr(arr);
-    if ((uint64_t)i < a->cap){ tsv v = a->data[i]; return array_is_hole(v) ? TS_UNDEFINED : v; }
-    if (!a->sparse && (uint64_t)i < TS_ARRAY_INDEX_LIMIT) return TS_UNDEFINED;
+    if ((uint64_t)i < a->cap){ tsv v = a->data[i]; return array_is_hole(v) ? ts_array_hole_value(arr, i) : v; }
+    if (!a->sparse && (uint64_t)i < TS_ARRAY_INDEX_LIMIT) return ts_array_hole_value(arr, i);
   }
   return ts_array_get_key_i64(arr, i);
 }
@@ -3819,10 +4045,16 @@ tsv ts_forof_open(tsv v);
 tsv ts_forof_open_limit(tsv v, double limit);
 tsv ts_iter_next_method(tsv iter, ts_key nmk);
 tsv ts_iter_close(tsv iter, ts_key rmk);
+tsv ts_iter_throw(tsv iter, ts_key tmk, tsv exc);
+tsv ts_iter_get_method(tsv iter, const char* name, ts_key mk);
+tsv ts_iter_invoke(tsv method, tsv iter, tsv arg);
+void ts_iter_check_result(tsv r);
+int ts_coro_resume_kind(tsv cv);
 tsv ts_forof_next_slow(tsv it, tsv next_method);
 tsv ts_forof_skip_slow(tsv it, tsv next_method);
 /* An array needs no opening; the three tests of a pattern over one fold into one. */
-static inline int ts_forof_plain_array(tsv v){ return ts_is_indexed_array_fast(v) && obj_map_plain((ts_object*)ts_ptr(v))->len == 0; }
+extern int g_array_iter_patched;   /* Array.prototype[Symbol.iterator] replaced or deleted */
+static inline int ts_forof_plain_array(tsv v){ return ts_is_indexed_array_fast(v) && obj_map_plain((ts_object*)ts_ptr(v))->len == 0 && !g_array_iter_patched; }
 static inline tsv ts_forof_open_inline(tsv v){ return ts_forof_plain_array(v) ? v : ts_forof_open(v); }
 static inline tsv ts_forof_open_limit_inline(tsv v, double limit){ return ts_forof_plain_array(v) ? v : ts_forof_open_limit(v, limit); }
 /* The next method of what ts_forof_open returned, read once per loop (GetIterator's record). */
@@ -3849,8 +4081,8 @@ static inline tsv ts_forof_close(tsv it, ts_key rmk){
 static inline int ts_array_get_inline_try(tsv arr, int64_t i, tsv* out){
   if (ts_is_indexed_array_fast(arr)){
     ts_array* a = (ts_array*)ts_ptr(arr);
-    if ((uint64_t)i < a->cap){ tsv v = a->data[i]; *out = array_is_hole(v) ? TS_UNDEFINED : v; return 1; }
-    if (!a->sparse && (uint64_t)i < TS_ARRAY_INDEX_LIMIT){ *out = TS_UNDEFINED; return 1; }
+    if ((uint64_t)i < a->cap){ tsv v = a->data[i]; *out = array_is_hole(v) ? ts_array_hole_value(arr, i) : v; return 1; }
+    if (!a->sparse && (uint64_t)i < TS_ARRAY_INDEX_LIMIT){ *out = ts_array_hole_value(arr, i); return 1; }
   }
   return 0;
 }
@@ -3871,8 +4103,8 @@ tsv ts_array_get_linked_f64(tsv arr, double d, ts_frame_hdr* frame, uint32_t nsl
 static inline tsv ts_array_get_inline_lazy(tsv arr, int64_t i, ts_frame_hdr* frame, uint32_t nslots){
   if (ts_is_indexed_array_fast(arr)){
     ts_array* a = (ts_array*)ts_ptr(arr);
-    if ((uint64_t)i < a->cap){ tsv v = a->data[i]; return array_is_hole(v) ? TS_UNDEFINED : v; }
-    if (!a->sparse && (uint64_t)i < TS_ARRAY_INDEX_LIMIT) return TS_UNDEFINED;
+    if ((uint64_t)i < a->cap){ tsv v = a->data[i]; if (TS_RT_LIKELY(!array_is_hole(v) || !g_proto_elements)) return array_is_hole(v) ? TS_UNDEFINED : v; }
+    else if (!a->sparse && (uint64_t)i < TS_ARRAY_INDEX_LIMIT && !g_proto_elements) return TS_UNDEFINED;
   }
   ts_frame_push(frame, nslots);
   tsv r = ts_array_get_key_i64(arr, i);
@@ -4006,6 +4238,10 @@ typedef struct ts_proxy {
 _Static_assert(TS_CELL_ZERO_WORDS(ts_proxy), "a Proxy answers the class and shape words with zero");
 tsv ts_proxy_new(tsv target, tsv handler);
 tsv ts_proxy_revocable(tsv target, tsv handler);
+tsv ts_proxy_ctor_value(void);
+tsv ts_import_unknown(tsv spec);
+tsv ts_import_bundled(tsv record, tsv options);
+tsv ts_import_register(tsv record, tsv ns, tsv init, tsv deps);
 tsv ts_proxy_revoke_thunk(tsv* args, int n);
 /* Promise + coroutine frame (async/await) */
 typedef struct ts_promise {
@@ -4048,6 +4284,7 @@ typedef struct ts_coro {
   int nvals;                 /* tsv locals leading the frame, scanned precisely;
                                 -1 = scan the frame conservatively (ts_coro_alloc_v) */
   tsv yielded;               /* generator: value produced by the current yield */
+  int yield_raw;             /* generator: `yielded` is a yield*'s inner result object, handed on as it stands */
   tsv iter_result;           /* generator: the {value, done} the iteration drivers reuse (ts_iter_step_with) */
   int done;                  /* generator: 1 when the body has completed */
   int gen_status;            /* generator protocol lifecycle (TS_GEN_*) */
@@ -4128,7 +4365,10 @@ tsv ts_abortcontrollerproto_abort(tsv* a, int n);
 
 /* generators */
 tsv ts_gen_new_v(tsv cv);
+tsv ts_gen_new_fn(tsv cv, uint32_t fnid);   /* a generator of the function `fnid` */
+tsv ts_set_fn_kind(tsv fv, int kind, uint32_t fnid);   /* a generator or async function boxed as a value */
 tsv ts_gen_next(tsv genobj, tsv sent);
+tsv ts_gen_next_site(tsv genobj, tsv sent);
 tsv ts_gen_step(tsv genobj, tsv sent);   /* a driver's step: the coroutine's own result object (emit_c generator.step) */
 tsv ts_asyncgen_next(tsv genobj, tsv sent);
 tsv ts_iter_step_fresh(tsv iter, tsv next_method, tsv sent);
@@ -4145,6 +4385,7 @@ tsv ts_asyncgen_return(tsv genobj, tsv val);
 tsv ts_gen_throw(tsv genobj, tsv exc);
 tsv ts_gen_return(tsv genobj, tsv val);
 tsv ts_asyncgen_new_v(tsv cv);
+tsv ts_asyncgen_new_fn(tsv cv, uint32_t fnid);
 tsv ts_iter_result(tsv value, int done);
 int ts_is_gen_return_completion(tsv v);
 tsv ts_gen_return_completion_value(tsv v);

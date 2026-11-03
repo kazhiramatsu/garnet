@@ -2,12 +2,14 @@
    ECMAScript 2025 RegExp syntax with Annex B in non-`u` mode: two passes (a group scan, then
    the grammar), an arena-allocated AST, V8's error reasons. */
 #include "rx_internal.h"
+#include "rx_emoji_sequences.h"
 
 typedef struct rx_path { uint32_t disj, alt; } rx_path;
 typedef struct rx_gpath { uint32_t group; const rx_path* path; uint32_t len; } rx_gpath;
 typedef struct rx_nref { rx_node* node; const uint16_t* name; uint32_t len; uint32_t pos; } rx_nref;
 
 typedef struct rx_pstate {
+  rx_strlist* str_sink;      /* where \p of a property of strings puts its sequences (v mode) */
   rx_arena* a;
   const uint16_t* s; uint32_t n, i;
   uint32_t flags; int u, v;
@@ -111,6 +113,41 @@ static void builtin_class(rx_pstate* p, rx_cpset* s, uint32_t c){
   else { rx_cpset inv = rx_cpset_invert(p->a, &base, set_max(p)); rx_cpset_add_set(p->a, s, &inv); }
 }
 
+/* A property of strings (v mode): a member of one code point goes to the set, a sequence to the strings. */
+static void strlist_push(rx_pstate* p, rx_strlist* l, rx_cpstr s);
+static void vfold_str(rx_cpstr* s);
+static void string_property_add(rx_pstate* p, const char* text, rx_cpset* s){
+  const unsigned char* q = (const unsigned char*)text;
+  uint32_t buf[32];
+  while (*q){
+    uint32_t len = 0;
+    while (*q && *q != '\n'){
+      uint32_t cp = *q; int more = cp < 0x80 ? 0 : cp < 0xE0 ? 1 : cp < 0xF0 ? 2 : 3;
+      if (more) cp &= 0x3Fu >> more;
+      q++;
+      for (int i = 0; i < more; i++) cp = (cp << 6) | (*q++ & 0x3Fu);
+      if (len < 32) buf[len++] = cp;
+    }
+    if (*q == '\n') q++;
+    if (len == 1){
+      uint32_t cp = vfold_on(p) ? rx_fold_u(buf[0]) : buf[0];
+      rx_cpset_add(p->a, s, cp, cp);
+    } else {
+      rx_cpstr str; str.n = len; str.cps = (uint32_t*)rx_arena_alloc(p->a, sizeof(uint32_t) * len);
+      memcpy(str.cps, buf, sizeof(uint32_t) * len);
+      if (vfold_on(p)) vfold_str(&str);
+      strlist_push(p, p->str_sink, str);
+    }
+  }
+}
+static int string_property(rx_pstate* p, const char* name, uint32_t nl, rx_cpset* s){
+  int all = nl == 9 && memcmp(name, "RGI_Emoji", 9) == 0, found = 0;
+  for (size_t i = 0; i < sizeof rx_string_properties / sizeof rx_string_properties[0]; i++){
+    const rx_string_property* sp = &rx_string_properties[i];
+    if (all || (strlen(sp->name) == nl && memcmp(sp->name, name, nl) == 0)){ string_property_add(p, sp->strings, s); found = 1; }
+  }
+  return found;
+}
 /* \p{...} / \P{...} after the `p`: the name and optional value, resolved against the tables */
 static void parse_property(rx_pstate* p, rx_cpset* s, int negate){
   uint32_t start = p->i;
@@ -128,6 +165,7 @@ static void parse_property(rx_pstate* p, rx_cpset* s, int negate){
     else { if (nl >= sizeof name - 1) fail_at(p, "Invalid property name", start); name[nl++] = (char)c; }
   }
   const uint32_t* ranges = NULL; uint32_t n = 0;
+  if (!has_value && p->str_sink && !negate && string_property(p, name, nl, s)) return;
   if (!has_value){
     if (nl == 0) fail_at(p, "Invalid property name", start);
     ranges = rx_prop_lookup(name, nl, 0, &n);
@@ -273,7 +311,9 @@ static rx_node* parse_atom_escape(rx_pstate* p){
       if (!p->u){ p->i++; return mk_char(p, c); }
       p->i++;
       rx_node* n = mk(p, RX_N_CLASS);
+      p->str_sink = p->v ? &n->strs : NULL;
       parse_property(p, &n->set, c == 'P');
+      p->str_sink = NULL;
       n->folded = (uint8_t)vfold_on(p);
       return n;
     }
@@ -567,7 +607,10 @@ static vclass parse_class_set_operand(rx_pstate* p, uint32_t class_start, int al
     if (e == 'd' || e == 'D' || e == 's' || e == 'S' || e == 'w' || e == 'W' || e == 'p' || e == 'P'){
       p->i++;
       uint32_t cp;
+      p->str_sink = &out.strs;
       parse_class_escape(p, &out.set, &cp);   /* builtin_class / parse_property fold in v mode */
+      p->str_sink = NULL;
+      if (out.strs.n) out.may_strings = 1;
       return out;
     }
   }

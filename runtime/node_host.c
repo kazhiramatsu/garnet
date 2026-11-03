@@ -39,7 +39,7 @@ static char** nh_argv;
 static tsv nh_arg(tsv* a, int n, int i){ return i < n ? a[i] : TS_UNDEFINED; }
 static uint32_t nh_elem_size(uint8_t elem){
   switch (elem){
-    case TS_TA_INT16: case TS_TA_UINT16: return 2;
+    case TS_TA_INT16: case TS_TA_UINT16: case TS_TA_FLOAT16: return 2;
     case TS_TA_INT32: case TS_TA_UINT32: case TS_TA_FLOAT32: return 4;
     case TS_TA_FLOAT64: return 8;
     default: return 1;
@@ -644,21 +644,7 @@ static tsv nh_random_bytes(tsv* a, int n){
   return out;
 }
 /* inspect(value) -> the string console.log prints for the value (util.inspect) */
-static tsv nh_inspect(tsv* a, int n){
-  tsv v = nh_arg(a, n, 0);
-  ts_gc_root(&v);
-  char* buf = NULL; size_t len = 0;
-  FILE* f = open_memstream(&buf, &len);
-  if (!f){ ts_gc_unroot(1); ts_throw_type_error_msg("inspect: out of memory"); }
-  int color = g_inspect_color; g_inspect_color = 0;
-  ts_print_to(f, v);
-  g_inspect_color = color;
-  fclose(f);
-  tsv out = ts_new_string(buf ? buf : "", (uint32_t)len);
-  free(buf);
-  ts_gc_unroot(1);
-  return out;
-}
+static tsv nh_inspect(tsv* a, int n){ return ts_util_inspect(nh_arg(a, n, 0), nh_arg(a, n, 1)); }
 /* atExit(hook): called once when the event loop ends (the program's natural end);
    a nonzero number it returns is the exit status (process.exitCode). */
 static tsv nh_exit_hook = TS_UNDEFINED;

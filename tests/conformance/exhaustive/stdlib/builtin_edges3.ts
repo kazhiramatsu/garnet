@@ -1,0 +1,24 @@
+// @ts-nocheck
+const t = (name, f) => { try { console.log(name, JSON.stringify(f())); } catch (e) { console.log(name, "THROW", e.name, name.startsWith("rawJSON") ? "" : e.message); } };
+t("isError", () => [Error.isError(new Error()), Error.isError(new TypeError("x")), Error.isError({}), Error.isError(Object.create(Error.prototype)), Error.isError(1), Error.isError.length, Error.isError.name]);
+t("isError caught", () => { try { null.x; } catch (e) { return Error.isError(e); } });
+t("rawJSON", () => [JSON.stringify({ a: JSON.rawJSON("1e1000"), b: [JSON.rawJSON('"x"')] }), JSON.isRawJSON(JSON.rawJSON("1")), JSON.isRawJSON({}), JSON.isRawJSON(1), JSON.rawJSON("null").rawJSON, Object.isFrozen(JSON.rawJSON("1")), Object.getPrototypeOf(JSON.rawJSON("1")), Object.keys(JSON.rawJSON("1"))]);
+t("rawJSON bad", () => JSON.rawJSON("{}"));
+t("rawJSON ws", () => JSON.rawJSON(" 1"));
+t("rawJSON empty", () => JSON.rawJSON(""));
+t("rawJSON sym", () => JSON.rawJSON(Symbol()));
+t("proto read", () => { const p = { x: 1 }; const o = Object.create(p); return [o.__proto__ === p, o["__proto__"] === p, [].__proto__ === Array.prototype, (1 as any).__proto__ === Number.prototype, ("a" as any).__proto__ === String.prototype, Object.prototype.__proto__]; });
+t("proto write", () => { const o = {}; const p = { y: 2 }; o.__proto__ = p; const q = {}; q.__proto__ = 1; return [o.y, Object.getPrototypeOf(o) === p, Object.getPrototypeOf(q) === Object.prototype]; });
+t("proto null", () => { const o = {}; o.__proto__ = null; return [Object.getPrototypeOf(o), o.__proto__, "__proto__" in o]; });
+t("proto desc", () => { const d = Object.getOwnPropertyDescriptor(Object.prototype, "__proto__"); return [typeof d.get, typeof d.set, d.enumerable, d.configurable, d.get.name, d.set.name, Object.keys(Object.prototype)]; });
+t("proto literal", () => { const p = { z: 3 }; const o = { __proto__: p, a: 1 }; const k = { "__proto__": p }; const s = { ["__proto__"]: 1 }; return [o.z, Object.keys(o), k.z, Object.keys(s), Object.getPrototypeOf(s) === Object.prototype]; });
+t("proto json", () => { const o = JSON.parse('{"__proto__": {"x": 1}, "a": 2}'); return [Object.keys(o), o.x, Object.getPrototypeOf(o) === Object.prototype]; });
+t("proto cycle", () => { const a = {}; const b = Object.create(a); a.__proto__ = b; });
+t("proto frozen", () => { const a = Object.freeze({}); a.__proto__ = {}; });
+t("eval value", () => [typeof eval, eval.length, eval.name]);
+t("eval new", () => new eval());
+t("fr", () => { const r = new FinalizationRegistry(() => {}); const o = {}, tok = {}; return [r.register(o, 1), r.register(o, 2, tok), r.unregister(tok), r.unregister(tok), Object.prototype.toString.call(r), FinalizationRegistry.length, FinalizationRegistry.prototype.register.length]; });
+t("fr bad", () => new FinalizationRegistry(1));
+t("fr same", () => { const r = new FinalizationRegistry(() => {}); const o = {}; r.register(o, o); });
+t("fr target", () => new FinalizationRegistry(() => {}).register(1, 2));
+t("resolver len", () => { let r; new Promise((a, b) => { r = [a.length, b.length, a.name, b.name, typeof a.prototype]; }); return r; });

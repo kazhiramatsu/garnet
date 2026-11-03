@@ -729,13 +729,13 @@ export class TransformStream<I = unknown, O = unknown> {
       start: (rc) => { this.__readableController = rc; return startDeferred.promise; },
       pull: () => { this.__setBackpressure(false); return undefined; },
       cancel: (reason) => { this.__errorWritableAndUnblock(reason); return Promise.resolve(cancelAlgorithm(reason)); },
-    }, { highWaterMark: highWaterMarkOf(readableStrategy, 0), size: readableStrategy === undefined ? undefined : readableStrategy.size });
+    }, { highWaterMark: highWaterMarkOf(readableStrategy, 0), size: readableStrategy === undefined ? undefined : readableStrategy.size } as QueuingStrategy<O>);
     this.writable = new WritableStream<I>({
       start: () => startDeferred.promise,
       write: (chunk) => this.#transformWrite(chunk, transformAlgorithm),
       close: () => this.#flushClose(flushAlgorithm),
       abort: (reason) => { this.__error(reason); return Promise.resolve(cancelAlgorithm(reason)); },
-    }, { highWaterMark: highWaterMarkOf(writableStrategy, 1), size: writableStrategy === undefined ? undefined : writableStrategy.size });
+    }, { highWaterMark: highWaterMarkOf(writableStrategy, 1), size: writableStrategy === undefined ? undefined : writableStrategy.size } as QueuingStrategy<I>);
     let started: unknown;
     try { started = t.start === undefined ? undefined : t.start.call(t, controller); } catch (e) { startDeferred.reject(e); return; }
     Promise.resolve(started).then(() => startDeferred.resolve(undefined), (e) => startDeferred.reject(e));

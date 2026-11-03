@@ -96,7 +96,7 @@ export interface GarnetNodeHost {
   watchFd(fd: number, onData: (bytes: Uint8Array) => void, onEnd: () => void): number;
   unwatchFd(id: number): void;
   /** The text console.log prints for a value. */
-  inspect(value: unknown): string;
+  inspect(value: unknown, options?: unknown): string;
   /** The hook the loop calls when nothing keeps it alive: phase 0 is 'beforeExit' (the hook
    *  may schedule more work), phase 1 is 'exit' (its number is the exit status). */
   atExit(hook: (phase: number) => number | undefined): void;

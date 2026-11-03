@@ -102,6 +102,19 @@ Tips for judging:
 
 ---
 
+### 2.3 The differential fuzzers
+
+`scripts/fuzz/run.sh numbers|statements|features|objects <first-seed> <last-seed>` compiles random programs and compares each with
+Node, one at a time. `numbers` is number functions (recursion on a counter, loops, constants at single call sites: what
+integer and range inference believes), `statements` is locals, arrays, object literals, class instances, closures, `switch`,
+`try` (store-proven fields, scalar replacement, captures), `features` is snippets over strings, collections, patterns,
+coroutines, captures in loops, classes, typed arrays and nullable values, `objects` is objects used as objects (property order
+and delete, walks that change what they walk, descriptors, getters and traps that write to a log, spread and rest, JSON
+round trips, prototype chains under a hot site, integrity levels, arrays and instances with keys of their own). What differs lands in `build/fuzz/found`, `scripts/fuzz/reduce.py <file>`
+cuts it down, and a seed names a program. Three seconds a program on the dev machine. They found five silent wrong values in
+their first 300 programs (Session 363), older than anyone had noticed. Run a few hundred seeds after a change to the
+analyzer's facts; a value past 2^53 through an int-specialized `+` is the known limit in CLAUDE.md, not a finding.
+
 ## 3. Debugging procedure (crashes, wrong values)
 
 Principle: **measurement over theory**. Minimal reproduction → a probe that pins down the mechanism.

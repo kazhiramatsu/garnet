@@ -54,5 +54,6 @@ bash "$ROOT/tests/strict_generic_inference_gate.sh" || rc=1
 bash "$ROOT/tests/strict_type_spec_specialization_gate.sh" || rc=1
 bash "$ROOT/tests/strict_explicit_specialization_gate.sh" || rc=1
 bash "$ROOT/tests/rejects_syntax.sh" || rc=1
+bash "$ROOT/tests/cast_number_gate.sh" || rc=1
 if [[ $rc -eq 0 ]]; then echo " CI-FAST PASSED"; else echo " CI-FAST FAILED"; fi
 exit $rc

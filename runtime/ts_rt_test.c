@@ -850,8 +850,9 @@ int main(){
   CK("pic compact slot safe", ts_to_num(ts_get_pic_checked_inline(compact, compact_key, &compact_ic))==2);
   ts_gc_unroot(1);
 
-  /* The adaptive property index appears at eight entries, survives growth and
-     dense compaction, disappears below eight, and can be rebuilt afterwards. */
+  /* The adaptive property index appears at eight entries and survives growth. A
+     delete leaves a hole, the entries compact at half holes, and a compaction
+     below eight drops the index, which can be rebuilt afterwards. */
   tsv indexed=ts_new_object(); ts_gc_root(&indexed);
   const ts_key index_base=460000u;
   for (uint32_t i=0;i<24;i++) ts_set(indexed, index_base+i, ts_num((double)i));
@@ -875,19 +876,28 @@ int main(){
   for (uint32_t i=1;i<=15;i++)
     if (i!=11u) (void)ts_delete_prop(indexed,index_base+i);
   indexed_obj=(ts_object*)ts_ptr(indexed);
+  /* 13 deletes compacted 24 entries to 11, the 4 after them are holes */
+  CK("prop index holes",
+     indexed_obj->len==11 && indexed_obj->prop_index!=NULL && indexed_obj->prop_index[1]==4u &&
+     ts_is_undef(ts_get(indexed,index_base+15u)) && ts_to_num(ts_get(indexed,index_base+16u))==16);
+  (void)ts_delete_prop(indexed,index_base+16u);
+  (void)ts_delete_prop(indexed,index_base+17u);
+  indexed_obj=(ts_object*)ts_ptr(indexed);
   CK("prop index shrinks to linear",
-     indexed_obj->len==7 && indexed_obj->prop_index==NULL);
-  ts_set(indexed, index_base+100u, ts_num(100));
+     indexed_obj->len==5 && indexed_obj->prop_index==NULL &&
+     ts_to_num(ts_get(indexed,index_base+18u))==18 && ts_to_num(ts_get(indexed,index_base+22u))==22);
+  for (uint32_t i=100;i<103;i++) ts_set(indexed, index_base+i, ts_num((double)i));
   indexed_obj=(ts_object*)ts_ptr(indexed);
   CK("prop index rebuild after shrink",
      indexed_obj->len==8 && indexed_obj->prop_index!=NULL &&
      ts_obj_shape_id(indexed_obj)==TS_SHAPE_NONE &&
-     ts_to_num(ts_get(indexed,index_base+100u))==100);
+     ts_to_num(ts_get(indexed,index_base+18u))==18 &&
+     ts_to_num(ts_get(indexed,index_base+102u))==102);
   ts_gc_unroot(1);
 
   /* Force eight keys into one initial-index bucket. This deterministically
-     covers the open-addressing probe chain, a missing key at its end, and a
-     rebuild after deleting from the middle of the chain. */
+     covers the open-addressing probe chain, a missing key at its end, a hole
+     in the middle of the chain, and the same key added again after it. */
   ts_key collision_keys[9];
   uint32_t collision_count=0;
   const uint32_t collision_bucket=test_prop_hash(465000u)&15u;
@@ -907,10 +917,17 @@ int main(){
   CK("prop index collision hits", collision_ok);
   CK("prop index collision miss", ts_is_undef(ts_get(collisions,collision_keys[8])));
   CK("prop index collision delete", ts_delete_prop(collisions,collision_keys[3]));
-  CK("prop index collision rebuild",
+  CK("prop index collision hole",
      ts_is_undef(ts_get(collisions,collision_keys[3])) &&
      ts_to_num(ts_get(collisions,collision_keys[4]))==204 &&
-     ((ts_object*)ts_ptr(collisions))->prop_index==NULL);
+     ts_to_num(ts_get(collisions,collision_keys[7]))==207 &&
+     ((ts_object*)ts_ptr(collisions))->prop_index!=NULL &&
+     ((ts_object*)ts_ptr(collisions))->prop_index[1]==1u);
+  ts_set(collisions,collision_keys[3],ts_num(999));
+  CK("prop index collision added again",
+     ts_to_num(ts_get(collisions,collision_keys[3]))==999 &&
+     ts_to_num(ts_get(collisions,collision_keys[4]))==204 &&
+     ((ts_object*)ts_ptr(collisions))->len==9);
   ts_gc_unroot(1);
 
   /* Register enough distinct class prototypes to grow and probe the class

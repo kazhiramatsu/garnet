@@ -12637,3 +12637,362 @@ Next session, in order:
 - Alternating on a quiet machine, outputs identical (r28 -> r29; Node): vue 872.6 -> 878.8 ms, hono_app 124.8 ->
   123.6 (154), TrieRouter 211.4 -> 215.1, RegExpRouter 55.1 -> 54.2, PatternRouter 238.8 -> 235.6, SmartRouter 56.3
   -> 55.5; tsc-ts 21.976 -> 22.060 G instructions (+0.38%), cycles 0.9991, wall 1.16 s.
+
+## Session 363 (2026-11-01): test262, `language/expressions` from 6,451 to more than 9,000 of 11,152
+
+- The harness first. `--batch` had no diagnostics step, so a negative case compiled, ran and counted as accepted
+  (1,282 of the "wrong" of the first run); under `TSAOT_UNTYPED` the batch now refuses what the single-file path
+  refuses. The oracle transpiled test262 at ES2020 (`TSAOT_CONF_ORACLE_ESNEXT`, a fixture's `// @oracle esnext`). A
+  refused program is run under V8 too, so "both refuse" (a script-only case in our strict module) is `v8-also`;
+  `no-eval` counts what needs code from strings. `scripts/test262/run.sh`, `summary.py`.
+- **Every file is a module to the checker** (`moduleDetection: force`): always strict, its top-level names its own.
+  `const name = ...` needs no import to compile, TS's strict-mode early errors apply.
+- **Early errors TypeScript lets through** (`exporter/early_errors.ts`): `eval`/`arguments` as targets, `arguments`
+  in a field initializer or a static block, `await` as an identifier in a module, duplicate and undeclared private
+  names, `super.#x`, a static member `prototype`, `await`/`yield` in an arrow's parameters. All 2,040 parse and early
+  negative cases of `language/expressions` are refused; the last one is a script-goal case.
+- **Name inference in one place** (`namedEvaluationName`, `lowerNamedByKey`): every site of NamedEvaluation, read off
+  the AST; computed keys at run time, a class with a container through its `name` definition.
+- **Object assignment patterns in all forms** (`lowerAssignObjectPattern`): string, numeric and computed keys, member
+  targets in order, defaults, `...rest`. **Rest with a computed key** left the key in (silent); rest over an array, a
+  string or a function gave `{}` (silent).
+- **A generator's parameters bind at the call** (`__initial_suspend`): defaults ran at the first `next()`, a pattern's
+  throw came there too. **An unannotated `function f([a])`** took the implied tuple for an array and read by index,
+  no iterator, no throw (silent; `patternTypeIsImplied`).
+- **Parameter TDZ**, `let [a = a]`, reads and writes in the TDZ are run-time ReferenceErrors, as is a write to an
+  undeclared name; writes to a `const` or to a class's name inside it are TypeErrors. A closure in a default reading
+  a later parameter read a value captured too early (silent).
+- **Real private names** (`docs/private_names_design.md`). `class A { #x } class B extends A { #x }` shared one slot
+  (silent), a missing element answered undefined, strings reached them. Class-scoped spelling in the AST, a brand
+  for methods and accessors, own-only checks, direct calls.
+- **Targets are evaluated once**: `f().x++`, `a[i++]--`, `f().x ||= 1`, `f().acc += 1` evaluated `f()` twice (silent);
+  `g().acc = h()` called `h` first.
+- **A prototype per evaluation** was not in the caches: the method cache keyed by the class word answered the first
+  evaluation's method for the second's instance (silent, `TS_HDR_LATER_EVAL`).
+- `x instanceof Function` and `Object` were false for every function (silent). `new` of any value is a run-time
+  construct; `instanceof` of any value too. `super[k]` in classes. `Object.defineProperty` with `set: undefined`.
+  `Function.prototype.caller` / `arguments` throw. Errors the runtime threw as strings are TypeErrors. An object
+  literal's computed accessors capture. `Array.prototype[Symbol.iterator]` replaced or deleted is honored.
+- **Dynamic classes** (`docs/dynamic_classes_design.md`): `extends <expression>`, `extends null`, `extends Map` and the
+  other built-ins, methods and static initializers capturing a function's locals. They were compile-time rejects; such
+  a class is now a value made at run time, each evaluation its own class. Built-in constructors work as values
+  (`new V()`, `Reflect.construct(Map, [])`, `RegExp`).
+- **`yield*` as the specification writes it** (`lowerYieldDelegate`): the received completion goes to `next`, `throw` or
+  `return` with the value, the inner result object is handed on, an async generator awaits and does not re-await.
+- **ToPrimitive** throws when both methods answer objects (it answered NaN or recursed), Symbols do not convert to
+  numbers. **`new f(a)` of a function that never reads `this`** shifted its arguments by the instance (silent). A plain
+  function's prototype object was not linked to Object.prototype (`f.prototype.toString` undefined, silent).
+
+Ideas from Kaz, for a slice after test262: **array elements kinds**. `number[]` costs 2x and 11x the instructions of
+`Float64Array` on a sum and fill (0.41 s against 0.19 s; V8 0.74 s): the values are already raw doubles, the cost is the
+tag, bound and hole tests per element and the vectorization they prevent. Keep `ts_array`, add a kind byte (all numbers
+and no holes, `kind_spare`): a store of anything else clears it in O(1), no conversion, since the elements are the same
+eight bytes. Loops version on it as the typed-array loops do. Strings gain less (4-15% on the element read alone, the
+rest is in the string operations, where typed comparisons would help); a kind for "instances of one class" could drop
+the guard on `arr[i].x` (not measured). With **generics** this goes further than a JIT can: `T[]` cloned per type
+argument (`Vec<T>` is not specialized today, its `get` returns a boxed value), and a whole-program proof that an array
+only ever receives numbers removes the run-time test altogether. Order: the flag and the loops, the generic clones, the
+proof. Needs a checking mode that verifies the flag against the elements, in the gates, as the GC stress is.
+
+Where it stopped (branch `s363-dc`, worktree `build/wt_dc`, on top of `s362-wip` 324dc2d; neither is on main):
+
+- Not gated. `s362-wip` at 324dc2d passed conformance (739, 739, 736), bundler and the regexp differentials, but it
+  does not build hono: a scope record named after a private method (`__ctx_#m\x011`) reached `CLASS_NAME` through
+  Rust's `{:?}`, which C refuses. Fixed on `s363-dc` (`c_string_lit`, a case in `classes/private_names`). The survey and
+  the hono, vue and tsc A/B of that run mean nothing; the bench's only failure, `string_unicode_search_kernel` at 102
+  ms against 100, was under concurrent load and has to be re-timed quietly.
+- To land: the full gates on `s363-dc`, the A/B against the r29 builds (`build/gates_s363a/run.sh` is the runner),
+  `gate.sh ir-parity snap`, the final numbers here, merge to main, push.
+- The reject scripts lost what now compiles and agrees with V8: a computed method in a literal, `yield*` over a number,
+  `RegExp` as a value, a pattern as a rest parameter, a method capturing a function's local.
+  `tests/rejects_async.sh` holds what is still refused (`super()` in an arrow of a dynamic class).
+- **A generator's or an async function's rest parameter was not an array** (silent, before this session):
+  `function* g(a, ...r)` bound `r` to the next argument, `async function f(...r)` too. The coroutine entry gathers it
+  now, and the arguments array there no longer stores through a frame the allocation may have moved
+  (`functions/rest_parameter_patterns`).
+- **Found on the way, all silent and all older than this session:** the name of a named function expression at module
+  level read undefined from its body and from closures in it (`const f = function g() { return [1].map(() => g); }`;
+  its owner was no function, so nothing captured it, and a recursive call from a closure was "not a function"). An
+  object spread set instead of defining, so a setter on the literal ran. `{ toString: undefined }` still took the
+  method. `super.x` of what a class's parents do not declare read undefined, whatever the prototypes held. A store
+  through `super` to a frozen receiver did nothing. `x in (x = "other", o)` read the key late, `new x(x = 1)` the callee.
+  `Object.prototype.toString` as a value ran an array's join, and functions had no tag.
+- `docs/generator_functions_design.md`: a generator function's `prototype` and the objects generator and async functions
+  inherit from. Typed arrays, ArrayBuffer and SharedArrayBuffer construct as values and as bases.
+- `docs/date_design.md`: a real `Date.prototype`; every setter and string form was missing (`d.setDate(1)` was a compile-time
+  reject). `docs/cast_to_number_design.md`: a cast to number with nothing behind it is `any` where it is used in place
+  and tested where it flows into a number slot (Kaz: lies should be loud, and `(x as unknown as number).toString()` is
+  as legal as hono's `(str as unknown as string).toString()`). Frozen arrays' mutators throw; built-in methods have
+  their `name` and `length`; an array-like behind an array type takes the dynamic path; a sample of 500 cases of
+  `built-ins` and `language/statements` passed 280 before this: 39 rejects are resizable buffers in the harness,
+  29 BigInt, and Iterator helpers, Set methods and `using` are absent.
+- Open, next: `JSON.parse(s) as Config` trusts `Config`'s number fields: `c.port + 1` over `"8080"` gives 8081,
+  `c.port === undefined` is false for a missing field (silent). Plan: enumerate the casts from any or unknown, whole
+  program; the object types they reach are distrusted, their fields follow the rule of a cast to number.
+- `language/expressions` was last measured in full at 9,260 of 11,152, before dynamic classes, `yield*` and ToPrimitive;
+  a rerun of the failures on an earlier state of this branch passed 1,920 of 2,803. Measure again before quoting a
+  number. `scripts/test262/gen.mjs` now records the cases that build code from strings, `summary.py` counts them
+  `no-eval`.
+- Still open in `language/expressions`: frozen array descriptors, `Symbol.prototype` and wrappers, String as a dynamic
+  base, a second `super()` (a typed class's, and through an arrow), `super` in a static method after
+  `Object.setPrototypeOf(C, null)` (the class value and the static container are two objects), TDZ through closures, private names per evaluation.
+- Then the rest of test262 (statements, built-ins, annexB), BigInt, dynamic import, the elements kinds above.
+- **Session 363, later batch (built-ins).** `docs/bigint_design.md`: BigInt, its operators, `BigInt64Array`, DataView's 64-bit
+  integers. %IteratorPrototype%, the `Iterator` global, the helpers, `Iterator.from` (`runtime/iterator_helpers.c`).
+  `JSON.parse(s) as Config` is closed: a number field out of JSON is `any` where it is used in place and strict in a slot
+  (`docs/cast_to_number_design.md`); a parameter of a built-in counts as in place, the runtime converts it.
+- **Builtin arguments.** A boxed argument of a typed builtin was read with the raw bit reinterpretation: `arr.slice("2")`,
+  `s.charAt(obj)`, `arr.fill(9, "2")` answered from garbage, silently. An explicit undefined end counted as present
+  (`copyWithin(0, 1, undefined)`, `endsWith("f", undefined)`). A string method's non-string needle, separator, fill or
+  replacement answered -1, false or the receiver (`"a1".indexOf(1)`, `"a1b".split(1)`, `s.replace("a", undefined)`,
+  `padEnd(8, 1)`). Also `padStart(8, "")`, `lastIndexOf("a", -5)`, `repeat(-0.5)`, `$` in the replacement of an empty
+  pattern, `fill` on a frozen array, `Array.from(null)`, `Array.from({ length: "2" })`, `toString` returning a Symbol.
+  `ts_index_ll` is the one conversion of an index: NaN and the infinities were undefined casts.
+- **Well-known symbols** (`docs/well_known_symbols_design.md`): `Symbol.match`, `matchAll`, `replace`, `search`, `split`,
+  `species`, `isConcatSpreadable`, `unscopables`, `dispose`, `asyncDispose` read undefined, so `{ [Symbol.replace]() {} }`
+  made a property named "undefined". RegExp's protocol is the specification in TypeScript
+  (`lib/node/web/regexp_protocol.ts`), compiled only by a program that names a symbol, writes `exec` or extends RegExp; any
+  other program keeps the direct paths. test262: `RegExp/prototype` 92 of 92 in a third of the protocol directories.
+  `s.match(p)` with a pattern known at run time was a compile-time reject and is a dynamic call.
+- **Species** (`lib/node/web/species.ts`): `class X extends Array`'s `map`, `filter`, `slice`, `splice`, `concat`, `flat`, `flatMap`
+  gave a plain array, silently. `Array.from` / `Array.of` construct `this`. Typed arrays and `ArrayBuffer.prototype.slice` in
+  the runtime. test262: 270 of 295 runnable cases naming the symbols.
+- **Dictionary arrays** (`docs/dictionary_arrays_design.md`): `Object.defineProperty(arr, 1, { get() {} })` wrote a key no element
+  read looked at, silently; a read-only `length` and non-writable elements had no representation. A third element form,
+  with no cost to other arrays: `cap` is 0, as for a sparse array, so every inline path leaves. `Object.defineProperty`
+  with `{ value }`, a spread or a computed key dropped the fields: silent, and hit by any shorthand. test262:
+  `Object.defineProperty` and `defineProperties` 568 of 576 runnable in a third of them.
+- **Array.prototype over any receiver** (`docs/array_protocol_design.md`): the specification's 35 methods in TypeScript for
+  array-likes, Proxies and dictionary arrays, a wrapper on the prototype that keeps plain arrays on the runtime's path.
+  `Object.defineProperties` reads every descriptor first.
+- **`using` and `await using`** (`docs/using_declarations_design.md`): a source rewrite, `const` plus a try around the statement
+  list, so the checker keeps the types; `DisposableStack`, `AsyncDisposableStack`, `SuppressedError` in the library. test262: 269
+  of 299 runnable.
+- **Promise's protocol** (`docs/promise_protocol_design.md`): subclasses, `Promise.all.call(C, ...)`, a replaced `then` or
+  `resolve`, in TypeScript for a program that can tell. `Promise.try`, `withResolvers`. test262: 186 of about 200.
+- **A class value refuses a plain call**: `A.call({})` ran the constructor on the object and answered undefined, silently, and
+  `A()` read `this` undefined, a segfault for a prelude class. The function's code is an emitted thunk that throws;
+  `ts_construct` keeps the constructor by class.
+- **Smaller**: `Reflect.*` on a non-object and `Reflect.set`'s false; `ownKeys` invariants; `Object("s")` is a wrapper with its
+  index keys; `Object.prototype.valueOf` and `Object.assign` of a primitive; `Object.entries` with a getter that changes the
+  object; `Object.setPrototypeOf` refuses a cycle (a hang before) and a non-extensible object; `Object.fromEntries` closes its
+  iterator; DataView's conversion order, resizable buffers, truthy `littleEndian` (`getUint16(0, 1)` read big-endian);
+  `Float16Array`; `__proto__`; `JSON.rawJSON`, `Error.isError`, `RegExp.escape` as a value, `FinalizationRegistry`, `eval` as a
+  value that throws; the names of RegExp's getters pointed at a dead stack frame; a missing or extra argument of a namespace
+  builtin is padded or dropped where it was a compile-time reject.
+- test262 samples now: 500 random of statements and built-ins pass 376 of 412 runnable; 400 random of `language/` 341 of 354;
+  a tenth of the rest of built-ins 743 of 879 before the last batches; `Array.prototype` 527 of 554 in a fifth;
+  `Object.defineProperty` and `defineProperties` 568 of 576 in a third; RegExp's protocol directories 92 of 92 in a third.
+- **The `arguments` object** as a value is an object of its own where it is observed (`argumentsNeedObject`,
+  `ts_arguments_object`): `Object.prototype` as its prototype, `length` and the index keys own and configurable, its iterator
+  the same value as `Array.prototype.values`, the poisoned `callee`.
+- **String objects belong to the runtime**: `new String(s)` is a wrapper as `new Number` is, where a prelude class stood before.
+  The characters are read on a miss and become own, read-only properties at the first look that needs them
+  (`string_object_touch`: a program that wraps a long string to hang properties on it, hono's escaped HTML, never pays). Two
+  String objects of one shape can differ in length, so the index read goes past every site cache. `String.raw` over any
+  array-like, `[...new String("ab")]`, a write to a character throws.
+- **Collections seed through the adder** (`collection_seed`): `new Map(iterable)`, `Set`, `WeakMap`, `WeakSet` look up
+  `set` / `add` once, close the iterator on a throw, and a replaced adder is observed. `Array.fromAsync`
+  (`lib/node/web/array_from_async.ts`), `Object.prototype.toString`'s built-in tags, `Object.getPrototypeOf` of a primitive.
+- **console.log is Node's util.inspect** (`runtime/inspect.c`): `formatValue`, `formatRaw`, `formatProperty`, `groupArrayElements` and
+  `reduceToSingleString` ported function for function from Node 25's `lib/internal/util/inspect.js`. Before, every object printed on
+  one line with no depth limit, a cycle looped to `[deep]`, a Date printed `Date {}`, a Promise `Promise {}`, an Error `Error {}`, a Map
+  iterator `Iterator {}`, a Proxy ran its traps, an array had no `... n more items`. `util.inspect` takes its options, the custom
+  inspect symbol is honored, `%s %d %i %f %j %o %O` follow `formatWithOptions`. 250 lines of the probe agree with Node
+  (`tests/conformance/exhaustive/stdlib/console_inspect.ts`, `docs/console_inspect_design.md`). `err.stack` read undefined: an accessor on `Error.prototype` makes the
+  header and one frame line when read, so an error costs nothing for it; `Error.captureStackTrace` exists.
+- **JSON.parse's reviver** was a plain callback: `this` undefined, one walk over a snapshot of the keys, a reviver's write to its holder
+  not seen, no third argument. InternalizeJSONProperty over any holder, CreateDataProperty and [[Delete]] with their failures
+  ignored, a Proxy in the tree through its traps, `context.source` from a parse record (a second walk of the text beside the
+  value). `JSON.stringify`'s space takes String and Number objects, its property list too, NaN and Infinity were undefined casts.
+- **A bound function constructs** (`new (F.bind(null, 3))()`, `new.target`, instanceof through it), a TypeError before. A class value's
+  [[Prototype]] is its base class: `Object.getPrototypeOf(B) === A` and `A.isPrototypeOf(B)` and `B instanceof Function` were
+  false, silently. `Object.setPrototypeOf(class, x)` is kept apart by `user_proto`.
+- **Function.prototype.toString** answers the NativeFunction form (a compiled program keeps no source text) and is a TypeError on a
+  non-function; `Function.prototype[Symbol.hasInstance]` for a program that names it; a callable Proxy on the right of instanceof.
+- **Atomics**: BigInt64Array and BigUint64Array in every operation, RevalidateAtomicAccess after a conversion, `Atomics.pause`,
+  `Atomics.waitAsync` (`lib/node/web/atomics_wait_async.ts`, woken by notify through a hook), notify's count.
+- **Uint8Array base64 and hex** (`lib/node/web/uint8_base64.ts`), **WeakRef** (strong, as the specification allows), a Proxy's
+  [[SetPrototypeOf]] answers, `Symbol` as a constructor value, a construct trap's Symbol, `for await` over `any`, a sync iterable in
+  `for await` behind an async-typed value never awaited its values (the flag crossed a number local as a boxed boolean:
+  NaN), `1e999` as a literal crashed the analyzer, a Map or Set's own properties were not enumerated.
+- **A typed array method walks the length it started with**: a shrink in a callback read past the view (lastIndexOf: past the buffer),
+  a grow visited elements it must not. An element gone reads undefined; `subarray` takes a view out of bounds and a length-tracking
+  view gives one; `slice` over its own buffer copies forward by bytes, as the specification says.
+- **Names starting with `__`**: a user's `function __X() {}` had no `.prototype` and an empty `.name` (the test meant the compiler's
+  synthesized functions, by prefix). `[Symbol.iterator]`, `String.prototype[Symbol.iterator]`'s own prototype and tag.
+- **`import x from "./d.json"` read undefined**: a JSON module is a TypeScript module now (a literal, or `JSON.parse` over 256 KB, with
+  `with { type: "json" }` accepted), `JSON.parse` of a long literal is no longer expanded into code (60 000 elements took clang over
+  three minutes). `import(expr)` with a specifier known at run time is a rejected promise, its ToString run. `new.target` in a
+  nested function was counted as a capture of the enclosing method. `Generator<T>[]` was taken for a Generator (by the printed type).
+  `Proxy` as a value, `class extends Proxy`, ToNumeric(lhs) of a Symbol before the right side converts.
+- **A Proxy without a trap passes its receiver** (a getter on the target saw the target), `[[DefineOwnProperty]]` answers and its
+  invariants hold (a false from the trap was ignored), `Object.freeze` / `seal` / `isFrozen` / `isSealed` go through the traps in the
+  specification's order (they marked the proxy cell and did nothing to the target). `Object.isFrozen` / `isSealed` of a
+  non-extensible object read its properties: `Object.isFrozen(Object.preventExtensions({}))` was false, silently.
+- **`String()` was "undefined"**, `String.prototype.x.call(undefined)` and a Symbol receiver under the Unicode case mapping,
+  `/./g` with `lastIndex` Infinity, `RegExp(re)` with `re.constructor` changed, a built-in constructor's `prototype` writable,
+  `new Date(a, b)` and `Date.UTC` not converting object arguments (Invalid Date instead of the valueOf's throw), `new Date(...a)`
+  and any spread in a built-in `new` (a compile-time reject), `n.toLocaleString()` on a number (a compile-time reject): en-US grouping
+  and three fraction digits, `minimumFractionDigits`, `maximumFractionDigits`, `useGrouping`. A typed array on an object's
+  chain takes an element write as the specification says. `x[2^k - 2]` doubling grew a dense buffer to 2^32 (14 s).
+- **Properties of strings** (`\p{RGI_Emoji}` and its six parts) under the `v` flag: `runtime/regexp/rx_emoji_sequences.h`, generated from
+  test262's lists by `scripts/gen_emoji_sequences.mjs`. test262: 61 of 61. A pattern of more than 32 KB of code stays in the VM: its C took
+  clang minutes and gigabytes.
+- **A long constant array is data**: 256 elements or more of literals are a JSON text parsed where the literal is reached (60 000 numbers:
+  over three minutes of clang, now one second).
+- **`new Class(...)` with a parameter named as a class built that class** (a fallback for a name lib.dom shadows, silent: zod's
+  `_number(Class, ...)` built its abstract `Class`). `import * as z` of an ES module from a CommonJS file read undefined (TypeScript's
+  synthetic namespace is a symbol of its own). A parameter property is the first key of an instance, wherever the constructor stands.
+  rxjs, zod and yaml compile again: a generic arrow's type parameter was a capture in a static initializer, `exactOptionalPropertyTypes`
+  stopped `lib/node/web/streams.ts`, `Object.assign(Buffer, statics)` wrote the read-only `Function.prototype[Symbol.hasInstance]`.
+- vue's text reaches the protocol libraries (`Array.prototype`, `Promise.prototype`, `isConcatSpreadable`): its driver takes 2.7% more
+  instructions than before them (25.47G to 26.16G), for what it can observe. Kept, to be recovered with the elements-kind work.
+- **import() of a bundled module** (`docs/dynamic_import_design.md`): a compile-time reject before. A module only `import()` reaches is
+  compiled in, its top-level statements a function of their own, evaluated once when asked, deps first, a failure kept, a top-level
+  await honored. `export default class {}` was missing from a namespace and its statics never ran (silent): a dynamic class.
+- **A comment compiled a protocol library into tsc-ts, and the library opened its receivers** (22.1 G -> 37.3 G instructions, found by the
+  tsc-ts A/B after several slices that did not run it). The text triggers read comments and diagnostics (`interface Tuple extends Array<T>`,
+  `[Symbol.dispose]()` in a message): they read code now (`codeText` in the exporter). `web/promise_protocol.ts` imported `web/species.ts`
+  for one getter, which put a `constructor` read on every array method of any program with the word `"then"`: it defines the getter itself.
+  The five protocol libraries are no longer walked by the closed-receivers passes (docs/closed_receivers_design.md, "The protocol
+  libraries"; tests/closed_receivers.sh, 59 programs). tsc-ts against r29: 22.06 G -> 21.94 G, cycles x1.011, wall 1.19 s both, outputs identical.
+- **`Array.prototype.sort` was an insertion sort**: O(n^2), a million numbers would have taken hours. It is V8's TimSort now (V8 14: a run search
+  from 8 elements, binary insertion below), compared call by call against Node on 1008 sequences, inconsistent comparators included
+  (`arrays/array_sort_timsort`, 20 000 elements): the same calls in the same order and the same result. A million numbers with a comparator:
+  202 ms (Node 146). A collection during a comparator can move everything: no element or data pointer crosses a comparison. `sort(null)` is a
+  TypeError, a frozen array throws at the write, a dictionary array is sorted (it was left as it was, silently).
+- **A bound function had no `name` and no `length`** (`f.bind(x).name` was ""), `bind` of a non-function did not throw. `Math.round` rounded
+  through `floor(x + 0.5)`: 0.49999999999999994 gave 1, 2^52 + 1 gave 2^52 + 2. `Number.parseFloat === parseFloat`, `Object.create.length`.
+- **A value typed as an array that is none at run time** (a cast, untyped code) answered a default from 41 array builtins (`[]`, 0, -1,
+  undefined, or a store dropped): it takes the method it has now, or fails as the call would (`arrays/array_typed_receiver_lie`).
+- `escape` and `unescape` did not exist (`lib/node/web/escape.ts`). A Proxy passes NewTarget, a nested Proxy's `preventExtensions` answers,
+  `Reflect.preventExtensions` of a refusing Proxy is false, `Reflect.set` is false on a read-only property of any kind of object, a key whose
+  ToPrimitive gives a symbol, `Symbol(Symbol())`, `Reflect.apply` without a list, `resolve(p)` for a promise with its own `then` or a replaced
+  `Promise.prototype.then` (adopted directly before), `new encodeURIComponent()`, `with` over a buffer a conversion shrank, `Array.fromAsync`
+  is a built-in rather than an async function. test262 slice NR%25==19 of built-ins: 663 pass, 24 wrong -> 6 wrong.
+- **The temporal dead zone of a captured binding** (`docs/tdz_design.md`): a closure that read a `let` or `const` before its declaration got a
+  value (`function f() { return x + 1; } f(); let x = 1;` gave 1), silently. A pass per scope proves most bindings out (tsc-ts: 12 of them
+  keep a hole, 114 tests); only those live in a cell that starts as a hole and tests it. `switch` clauses, the head of `for..of` / `for..in`.
+- **A constructor that returns a value was ignored by a subclass**: `class P { constructor() { return new Proxy(this, h); } } class D extends P {}`
+  gave a plain instance (silent). Such a class is a dynamic class now, and a field on a Proxy `this` goes through its define (it overwrote the cell).
+  The second initialization of a private element is a TypeError, a private field without an initializer exists on an answered object.
+- A declaration where the grammar has a statement (`for (...) async function* g() {}`), an import of a name the module does not export
+  in an unchecked program: compile-time rejects.
+- **A scaling benchmark of the builtins against Node** (98 operations at sizes where a quadratic path shows) found, in one run:
+  - `delete o[k]` shifted the entries and rebuilt the index each time: 200 000 deletes took 54 s (Node 49 ms). A dictionary with an index keeps
+    a hole now and compacts at half holes: 43 ms.
+  - **the millionth distinct property name of a run became a method key** (`TS_METHOD_KEY_BASE` was 1 000 000): gone from `Object.keys` (63
+    keys of 300 000), and sharing an id with a method. The base is 1.9 G now, and past it the program stops loudly.
+  - `Object.keys` of integer keys was a selection sort (30 000 keys: 4 s): sorted now.
+  - a double's digits came from trying 17 precisions through `snprintf` and `strtod` (1.1 us for a short one): Schubfach, `runtime/dtoa_table.h`
+    from `scripts/gen_dtoa_table.py`, 1.3 million doubles of every kind printed as V8 prints them: 53 ns, x2.2 of Node.
+  - `splice` allocated a new buffer each time: in place, the shorter side moves (x11 -> x1.x); `slice`, `concat`, `[...a]`, `push(...a)` copy at once;
+    `indexOf` and `includes` of what only its own bits equal compare bits; a typed array's `fill` by size; `{...o}` and `Object.assign({}, o)`
+    take the shape and the slots of a plain object (x11 -> x2.7); ASCII `toUpperCase` / `toLowerCase` (x30 -> x1.5).
+  - `structuredClone` and `DOMException` did not exist.
+  Left, recorded: `replace` of a first match copies the string (Node's result is a cons string), a dense integer-keyed plain object is a dictionary of
+  interned names (x35: V8 has elements), `"ab".repeat(n)` copies, an interned name is never freed.
+- test262's `phase: resolution` cases now go through the checker as `parse` and `early` do. language NR%50==31 slice: 405 pass, 7 wrong -> 4 wrong on
+  module-code's resolution errors (a default through a star, a circular re-export, a missing star target), 3 rejects of an assignment to a function declaration's binding.
+- Stopped at Kaz's request (2026-11-02), not gated. The stopped gate run at `cbf7202` (logs: build/s363_probes/g2): bundler 56 pass; conformance 788 of 789 and strict
+  785 of 786 (`stdlib/structured_clone`: `kc instanceof K` true under `@ts-nocheck`, the d.ts says `T`); bench `string_unicode_search_kernel` 102 against a budget of 100;
+  unit: three runtime tests of the property index ("shrinks to linear", "rebuild after shrink", "collision rebuild") that describe the rebuild a delete used to do.
+  protect and gc did not run, nor the tsc-ts build and A/B. Next: those three, then build/s363_probes/lim.ts (behaviour at the limits, not run yet).
+- **Resumed (2026-11-02).** The stopped run's failures: `structuredClone(new K())` was the real thing, not the fixture: the d.ts answers `T`, so `.m()` was a direct call of `K.m`,
+  `.g` ran the getter, `instanceof` folded to true (silent, V8: TypeError, undefined, false). The classes a clone reaches are foreign now, a generic function that answers a clone counts for its
+  callers (`clonedClasses`, `docs/cast_to_number_design.md`, `stdlib/structured_clone_classes`). The same walk found `JSON.parse(s) as Record<string, Config>` and
+  `Promise.resolve(JSON.parse(s))` reading NaN (silent): it goes through the arguments of the lib's generics. The three unit tests of the property index describe holes and compaction at half.
+- **The limits probe** (build/s363_probes/lim.ts, 72 cases, one at a time under a wall and an RSS limit, against Node). No crash and no wrong value; what it found:
+  - `s + s` past `UINT32_MAX` was an `abort()`, and below it a string past V8's maximum length went on growing (`(s + s + s + s).length` was 1073741824; a `RangeError` in V8). Every string is
+    allocated in `ts_string_alloc_storage` now, which throws, and the six aborts of the concat, join and builder paths are that RangeError; `replace` over the limit answered `undefined`, silently.
+  - `const a = []; a[4294967294] = 1; a.indexOf(1)` and `new Array(2 ** 32 - 1)` asked for 32 GB: the first through `array_densify`, which every generic method takes. Past 4 GB it is a RangeError
+    (V8 walks a dictionary, 80 s on that line), `new Array(n)` past 2^28 elements is only a length.
+  - A recursion the C compiler made a loop spun where V8 throws: `function f(n) { return f(n + 1) + 1; }`, `function f() { depth++; f(); }`. A function that cannot return without calling back
+    into its recursion keeps its calls (`recursion_without_exit`, docs/exceptions_design.md, every entry: the boxed one, `_d`, `_i64`, `_f64`). `fib` keeps its loop.
+  - `JSON.stringify` stopped at 4096 levels, a list of ten thousand links was a RangeError: 2 million now, and the cycle test every 1024 levels past the first 1024.
+  - A regular expression's backtrack stack held a quarter of V8's: the same 64 MiB, in entries of four slots (`/^(a|b)*$/` over two million characters). 256 MiB.
+  - Left as they are: the text of V8's cycle error (`--> starting at object with constructor`), a `Float64Array(2 ** 33)` that is a RangeError where V8 maps it lazily. Where V8 throws and garnet answers the
+    right value (`Math.max(...new Array(200000))`, `flat(Infinity)` 200 000 deep) it stays that way.
+- The bench budgets could not be judged today: the machine is on battery in Low Power Mode, every kernel x1.88 (median) of the stopped run, seven over budget. By instructions (324dc2d -> this) the kernels
+  are +0.1% (start-up, 0.9 M), `string_unicode_search_kernel` +3.4% with identical generated C: the position arguments' correctness and clang's inlining; budget 100 -> 105 ms. `inherit_sroa_kernel` (31, 64, 125 ms) and
+  `obj_kernel` (76, 126, 204 ms) move run to run with the same instruction counts.
+- **A parameter's facts did not count the function's own calls** (silent, older than this session, found by the limits fixture): `gcd(1071, 462)` was 147, the integer entry `_i64` took `b` for 462 because
+  `gcd(b, a % b)` was skipped: `collect_i64_seed_param_facts` dropped an argument the base facts could not prove, and `validate_i64_direct_calls` holds it to an integer and no more. In a candidate's body the
+  argument now takes the parameter's constant, range and sign away (`functions/recursive_param_facts`); a second outside call with other constants hid it: the join has no constant.
+- Every bench kernel by instructions, 324dc2d -> here (92 of 102 through the driver; ten need the bench's own lib settings): total +0.44%, the recursive kernels unchanged by the parameter fix (fibonacci, `int_kernel`, `generic_fn_kernel`
+  +0.1% or less), start-up +1.1 M of 49 M (0.3 ms), peak RSS +7% of 3.4 MB. Worst `gc_old_heap_churn_kernel` +5.0% (4.3 M). `string_huge_case_trim_kernel` -29%.
+- **A return fact is the integer entry's** (silent, older than this session, found by a differential fuzzer of number functions: scratchpad `fz/gen.py`, 150 programs, 5 wrong and 1 on the 2^53 limit): `return_facts` held at every
+  direct call, so with `f(-1)` somewhere, `f(-2.5)` of a function that returns its parameter was stored in an integer local: -2. It holds now where every argument is an integer, the same condition as the emission's choice of `_i64`.
+- **`int32_narrow_locals` took any sum for a ring** (silent, older than this session, the fuzzer again): an operand of `+ - *` whose result is used modulo 2^32 was stored in 32 bits, whatever the other operand: `(Math.max(1e-7, s) - (p0 + p2)) ^ x`
+  wrapped `p0 + p2` and lost it beside the fraction (-7 for 7), and `(x * y) | 0` multiplied wrapped operands in doubles when the product passes 2^53 (145474304 for 145473536). Both operands and the result must be exact integers now.
+- `scripts/fuzz/`: the two differential fuzzers (`numbers`, `statements`), a reducer, `docs/agent_workflow.md` section 2.3.
+- **`try { f(); } catch { } finally { g(); }` rethrew what `f` threw** (silent to the statement, older than this session, found by the `statements` fuzzer; `catch (e) { }` was right): the emitter tells a clause from none by its
+  variable or its body, and this form has neither. A clause with no binding has a variable now (`exceptions/empty_catch_finally`).
+- Fuzzer totals: `numbers` 300 programs (5 wrong from the return facts, 1 from the ring, 1 on the 2^53 limit, taken out of the constants), `statements` 287 (2 from the empty catch, then 137 clean). `scripts/fuzz/gen_features.py` (strings, collections,
+  patterns, coroutines, captures, classes, typed arrays, nullable, labels) is written: seed 1 agrees, no other seed has run. `scripts/fuzz/run.sh` is the scratchpad runner with its paths through the repo and has not run as it stands.
+- Stopped at Kaz's request (2026-11-02), not gated, nothing running. On battery in Low Power Mode. Next, in this order:
+  1. `bash scripts/fuzz/run.sh features 1 150`, then fix what it finds.
+  2. The kernels by instructions again: `int32_narrow_locals` changed after the sweep above, so the int32 chains are not yet measured.
+  3. The gates: `caffeinate -ims bash build/gates_s363b/run.sh` from the main checkout's `build/` (the runner is not in the repo; about 1.5 hours in Low Power Mode, summary in `build/gates_s363b/summary.txt`; unit, bundler, conf three ways,
+     bench correctness, ci, ir-parity, rx diffs, gc, hono survey, hono, hono_app and vue against r29, tsc-ts build and A/B). `protect`, `gc` and the tsc-ts build have not run on anything since Session 362.
+  4. `scripts/gate.sh bench` with its budgets on mains power: only there can it pass.
+  5. `gate.sh ir-parity snap`, the final numbers here, merge to main, push.
+- **Resumed (2026-11-02), on mains power.** `scripts/fuzz/run.sh features 1 150`: 148 ran, 1 wrong. The first run stood 34 minutes on seed 2, a generated `do..while` that never ends under Node, with no limit around `node` and nobody looking: every step of the runner
+  has a limit now, a program that does not end under Node is counted as `hung` and not compared, and there is a progress line per 25 seeds. `.join(<number>)` in the generator was a type error (seeds 7 and 15).
+- **`s.slice(-0.5)` and `a.slice(-0.5)` answered nothing** (silent, older than this session, found by the `features` fuzzer): `ts_slice_index` added `(long)value` to the length, and a fraction above -1 truncates to 0, so the end of the receiver. ToIntegerOrInfinity comes first now.
+  A probe of 5,022 lines (every index argument of the string, array and typed array methods, fractions, -0, NaN and the infinities, literal and through a variable) differed in 66, all of them this; 0 now (`stdlib/slice_fractional_index`).
+- Every bench kernel by instructions again, 324dc2d -> here, after `int32_narrow_locals`: 92 kernels +0.37%, the 17 of more than 500 M +0.32%, `int_kernel` -0.0%, the int32 chains not in the top of the list. Worst `gc_old_heap_churn_kernel` +4.9% (4.2 M, start-up), `string_unicode_search_kernel` +3.3%.
+- **The gates on mains power, first run** (`build/gates_s363c/run.sh`). Unit, bundler 56, bench with its budgets, the regexp differentials passed. What the others found, all on this branch, none visible to the conformance runs of the slices:
+  - **A leaked root since `eval` became a value** (`ts_garnet_global_init` rooted 14, unrooted 13): the slot of its parameter stayed in the root table, dead stack read as a value at the first collection. `gc/string_slack_growth` faulted with the libc allocator and a young threshold of 1, six
+    fixtures faulted at exit under `--stack-check`. The GC gate had not run since Session 362. The two were one bug.
+  - **hono and hono_app did not compile** (survey 2 of 43): a module's dead-zone binding captured by a `const f = () => ...` that others call directly: such a call threads the module's record, the callers hold no cell. The cell of a module's dead-zone binding is published in GLOBALS
+    (`docs/tdz_design.md`, `hoisting/tdz_const_fn_direct`). The reject message names the caller now.
+  - **`Object.keys`, `for..in`, spread and `console.log` of a sparse array past 2^29** went through the densify that this session's limit made a RangeError (`arrays/numeric_index_keys`): a sparse array is enumerated from its table, in order, and stays sparse (`arrays/sparse_huge_own_keys`).
+  - **`[1234.5].toLocaleString()` was `join`** (silent, `tests/rejects_unsupported_stdlib.sh` reported it as accepted, which it had become by way of Object.prototype's method): each element's own method with the call's arguments (`stdlib/array_to_locale_string`).
+    The script's checks of a run-time pattern in `match` and `search` were out of date, both agree with V8 and moved to the fixture.
+- **`for..in` visited a key deleted during the walk** (silent, older than this session, on every kind of receiver; found by a sparse fixture): a key that has gone is skipped, on the object and on its chain (V8's ForInFilter: presence only, a key made non-enumerable is visited). `g_for_in_changes` counts what can
+  take a key (`ts_delete_prop`, `ts_set_proto_user`), so an object's walk costs a compare per key until something has; an array or a view looks its key up (`statements/for_in_deleted_keys`).
+- **`a.push(a); a.join()` was a stack overflow** (V8: "1,"): the join stack, in the slow path only, the one that runs another value's conversion; a throw through it pops (`arrays/join_cycles`).
+- **hono's `timeout` middleware answered 500** (a loud TypeError of the cast-to-number rule, this session's): `timer = setTimeout(f) as unknown as number` with `let timer: number | undefined`. A variable of a union is no unboxed slot: a cast of what is known not to be a number makes
+  it `any` everywhere, a narrowing to number is tested only where a number slot takes it (`docs/cast_to_number_design.md`, `types/cast_lies`). `const n = "x" as unknown as number` stays a TypeError. The survey's `ip_restriction`, a reject since Session 362's gates, passes: 43 of 43 expected.
+- Stopped at Kaz's request (2026-11-02, going out), nothing running, not gated: the second run stopped after `unit` passed. What the first run measured before the fixes above, not to be quoted: vue r29 875.9 -> 916.6 ms, 25.52 -> 26.22 G instructions (+2.75%, the protocol libraries' cost
+  already noted), cycles +4.1%, binary +15% (5.09 -> 5.86 MB); hono, hono_app and the tsc-ts A/B did not run. Next, in this order:
+  1. `caffeinate -ims bash build/gates_s363d/run.sh` from the main checkout's `build/`, on mains power (the runner is not in the repo; about 40 minutes; summary in `build/gates_s363d/summary.txt`). The worktree has `build/ir_parity` and `build/typescript_603` as links to the main checkout's now.
+     The survey should read 43 of 43. Read each step's log, not the rc: `hono_ab` and `hono_app_ab` print "ok" with an empty B column when the build before them failed.
+  2. Look at vue's cycles: the instructions are the known +2.75%, cycles +4.1% and +15% of binary are not explained.
+  3. `gate.sh ir-parity snap`, the final numbers here.
+  4. Land on main as one commit with a descriptive message (`git merge --squash s363-dc`): main has no merge and no WIP commit in its history, this branch keeps the steps on origin.
+  5. Then more fuzzing: `scripts/fuzz/run.sh features 151 300`, and a generator for objects (delete, property order, getters, spread, JSON round trips): the for..in bug was found by a probe, no generator reaches it.
+- **Resumed (2026-11-03): the gates, and what the first complete A/B found.** `build/gates_s363e/run.sh` (on battery in Low Power Mode until the machine was plugged in: every gate that does not depend on the clock, and an instruction A/B of each
+  driver, which does not move with the power state) passed on 70ed91e. The hono A/B, which no run had reached since the branch began (the builds failed or the machine was on battery), read +14.0% instructions, PatternRouter 238.6 -> 294.7 ms.
+  - **A private check was a name lookup** (`docs/private_names_design.md`): in a program with foreign receivers every `this.#x` called `ts_private_check`, `ts_has_own` and `class_field_lookup`. The class index in the declaring class's interval is the runtime's own answer on a sized instance; anything else
+    takes the call. hono +14.0% -> +0.77% instructions, PatternRouter 233.4 ms against r29's 236.6 (`classes/private_check_receivers`: 55 kinds of receiver on a field, a brand and an accessor's brand).
+  - **A BigInt's first limb stood on the class word** (silent, this session's): that test reads `cls` from whatever it is given, so reading the cell's layout showed that `1n instanceof A` was already true, and a read through a site could take the limb's upper half for a shape. `A.prototype.x.call(1n)` read past the cell
+    (a segfault, through `ts_has_own` and `find_slot`). `ts_bigint` keeps `cls` and `shape` zero as a Symbol, a Proxy and a coroutine do, under the same `_Static_assert`; a BigInt is no weak key; `ts_has_own` leaves primitive cells out (`types/bigint_cell_words`).
+  - **`Object.create` of anything but an object or null made an object with no prototype** (silent, older): `Object.create(1)`, `Object.create(undefined)`. A TypeError, the check shared with `setPrototypeOf` (`objects/object_create_prototype_argument`).
+  - **JSON numbers** (`stdlib/json_parse_numbers`; reading the path of the long constant arrays): `01` and `1.` were accepted, `"12345678901234567890"` was 1234567890123456 (silent: the test of sixteen digits sat inside `p->i < p->n`, so a number at the very end of the text kept the truncated value), `strtod` read on past a slice's end, a literal
+    `JSON.parse("1e400")` crashed the analyzer and a literal's `-0` was 0 (silent; `lowerJsonConstValue` and `numConst`).
+  - **A typed `.length` answered 0 for what the type does not say** (silent, older): a String subclass (`class S extends String` compiles now, its `s.length` was 0), `null` and `undefined` through a union, an object behind a lie (`types/typed_length_fallback`).
+  - vue: `array_species_custom` interned two names and read two properties on every `map`, `slice`, `filter` and `splice` of a program that can tell; `ts_call` had become two functions for the construct path. Instructions over r29 +2.78% -> +1.43%.
+    **Vue's cycles, Session 363's open question, decomposed** by building it with the protocol libraries' triggers off: r29 -> no libraries +0.22% instructions, +1.68% cycles, `__text` +9.7%; no libraries -> with them +1.20%, +0.90%. So the libraries are 1.2%, as recorded, and the rest of the cycles is the placement of a runtime
+    10% larger, no logic: the binary's +15% is 320 KB of runtime (inspect, sort, Date, iterator helpers, BigInt), 291 KB of generated code, 62 KB of strings. No `default.pgo` is involved (`pgo: auto` finds none in the clone).
+- **Left, not this session's and not landed with it:** a method called through `call` on a value of another class resolves a `this.m()` from its own hierarchy, up to inlining it: `D.prototype.d.call({ m() {} })` runs the class's `m` (silent; 324dc2d does it too). Field accesses are guarded (`docs/foreign_receivers_design.md`), these calls are not. It needs a design: a guard at every direct call of an open program and the inliner's answer to it. CLAUDE.md's known items.
+- CLAUDE.md's known items, read against a probe under Node: BigInt, `arguments`, `__proto__`, the dead zone through closures, a private name's second initialization, a promise subclass's `then`, `JSON.parse(s) as Config`, `ReadableStream` and a `String` base agree with V8 now and came out or were corrected; what still differs is as written there.
+- **The fourth fuzzer, `scripts/fuzz/gen_objects.py`** (Session 363's step 5): 36 of 40 programs differ from Node (seeds 1-40, a hang among them). By cause, from the outputs alone, none fixed yet:
+  1. seed 36 does not end under garnet (20 s, stdout still in its buffer): find it first.
+  2. A walk over an object is live (`ts_prop_own_enum`): a getter that deletes or adds a key during `{...o}`, `Object.assign`, `Object.entries`, `Object.values`, `JSON.stringify` or a rest pattern shifts the entries: added keys are visited, a key can be lost (77 lines, the generator favours it). Plan: at the first accessor the remaining keys are snapshotted and the walk goes on by key, so an object without accessors pays nothing.
+  3. A Proxy: `Object.getOwnPropertyDescriptors(proxy)` is `{}` (silent), `JSON.stringify(proxy)` interleaves `gopd` and `get` (the specification takes every `gopd` first).
+  4. 15 lines where a TypeError appears on one side only (strict `delete`, frozen and sealed receivers: to reduce with `scripts/fuzz/reduce.py`); a class field `a: any = -0` read 0.
+  5. `Object.getOwnPropertyNames(fn)` puts integer keys after `length`, `name`, `prototype`; `console.log` of a lone surrogate prints U+FFFD (Node escapes it).
+- Costs measured and left: the hono survey takes 1,020 s on a quiet machine (780 s through Sessions 360-362): compile time, each driver 24 s against 18, not yet divided between the exporter and clang. tsc-ts is +1.92% instructions over r29 where the note above reads -0.5%: it came in after that note; a flat profile does not resolve it, a bisect between 6d8c4c7 and here would.
+- **The gates on 12e586f, mains power** (`build/gates_s363f/run.sh`, 11:13): unit, bundler 56, conformance 805/805 plain and strict, 802/802 under protect, bench with its budgets, ci, the regexp differentials (44,337 cases, 0 differ) in both engines, GC stress, the hono survey 43/43. `gate.sh ir-parity snap` taken, then PASS.
+  Alternating, outputs identical, r29 -> r32 (Node): hono 16.08 -> 16.21 G instructions (+0.77%), cycles +0.62%, TrieRouter 223.7 -> 230.2 ms, RegExpRouter 55.3 -> 56.4, PatternRouter 238.2 -> 240.7, SmartRouter 56.1 -> 57.0 (with another application running; alone: 219.9 -> 222.2, 236.6 -> 233.4); hono_app 3.01 -> 2.64 G (-12.4%), 128.7 -> 114.6 ms (165);
+  vue 25.44 -> 25.80 G (+1.43%), cycles +3.1%, 911.0 -> 945.0 ms (765; the same conditions, 890.6 -> 921.3 quiet); tsc-ts 22.11 -> 22.53 G (+1.92%), cycles +2.95%, wall 1.21 -> 1.24 s, RSS 643 -> 659 MB. Binaries: hono +11.6%, hono_app +20.0%, vue +15.1%, tsc-ts +3.5%.
+
+Session 363 ends with the landing on main (one commit, `git merge --squash s363-dc`; the branch keeps the steps on origin). Next, on a new branch, in this order:
+
+1. The fuzzer's findings above, one at a time against V8, each with a fixture: the hang first. Then `scripts/fuzz/run.sh objects 41 200`, `features 151 300`.
+2. The borrowed method's `this.m()`, with a design note.
+3. tsc-ts's +1.92% (the bisect) and the compile time of the survey.
+4. The rest of test262, measured again (`language/expressions` last in full at 9,260 of 11,152), and the elements kinds above.

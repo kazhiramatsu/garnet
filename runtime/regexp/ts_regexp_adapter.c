@@ -206,8 +206,8 @@ static inline double last_index_raw(tsv re){
   return ts_is_num(v) ? ts_to_num(v) : ts_number_coerce(v);
 }
 static inline uint32_t to_length_u32(double d){
-  if (!(d > 0.0) || !isfinite(d)) return 0;
-  if (d > 4294967295.0) return 4294967295u;
+  if (!(d > 0.0)) return 0;
+  if (d > 4294967295.0) return 4294967295u;     /* (past any string: Infinity's ToLength too) */
   return (uint32_t)floor(d);
 }
 static uint32_t last_index_get(tsv re){ return to_length_u32(last_index_raw(re)); }
@@ -847,8 +847,24 @@ tsv ts_regexp_adapter_construct_tsv(tsv pattern, tsv flags, int as_constructor){
   keys_init();
   if (ts_is_symbol(pattern) || ts_is_symbol(flags)) ts_throw_type_error_msg("Cannot convert a Symbol value to a string");
   ts_gc_root(&pattern); ts_gc_root(&flags);
+  /* IsRegExp: an object that says so through @@match gives its source and flags */
+  if (TS_RT_UNLIKELY(g_regexp_protocol) && (ts_is_obj(pattern) || ts_is_func(pattern))){
+    tsv m = ts_get(pattern, TS_KEY_WKSYM(TS_WKSYM_MATCH));
+    int is_regexp = m != TS_UNDEFINED ? ts_truthy(m) : ts_is_regexp(pattern);
+    if (!is_regexp && flags == TS_UNDEFINED && !as_constructor && ts_is_regexp(pattern)) as_constructor = 1;   /* a new object: it says it is no regexp */
+    if (is_regexp && flags == TS_UNDEFINED && !as_constructor &&
+        ts_get(pattern, ts_intern_field("constructor", 11)) == ts_get(ts_regexp_proto(), ts_intern_field("constructor", 11))){ ts_gc_unroot(2); return pattern; }
+    if (is_regexp && !ts_is_regexp(pattern)){
+      tsv src = ts_get(pattern, ts_intern_field("source", 6)); ts_gc_root(&src);
+      if (flags == TS_UNDEFINED) flags = ts_get(pattern, ts_intern_field("flags", 5));
+      pattern = src;
+      ts_gc_unroot(1);
+    }
+  }
   if (ts_is_regexp(pattern)){
-    if (flags == TS_UNDEFINED && !as_constructor){ ts_gc_unroot(2); return pattern; }
+    /* RegExp(re) is re while re's `constructor` is RegExp */
+    if (flags == TS_UNDEFINED && !as_constructor &&
+        ts_get(pattern, ts_intern_field("constructor", 11)) == ts_get(ts_regexp_proto(), ts_intern_field("constructor", 11))){ ts_gc_unroot(2); return pattern; }
     ts_regexp* r = as_re(pattern);
     tsv source = r->source; uint32_t mask = r->flags;
     ts_gc_root(&source);
@@ -905,7 +921,25 @@ static tsv this_regexp(tsv* args, int nargs, const char* name){
   return TS_UNDEFINED;
 }
 static tsv get_source(tsv* a, int n){ tsv t = this_regexp(a, n, "source"); return t == TS_UNDEFINED ? ts_new_string("(?:)", 4) : source_text(t); }
-static tsv get_flags(tsv* a, int n){ tsv t = this_regexp(a, n, "flags"); return t == TS_UNDEFINED ? ts_new_string("", 0) : flags_string(t); }
+/* RegExp.prototype.flags reads each flag's property from any object, in the specification's order. */
+static tsv get_flags(tsv* a, int n){
+  tsv t = n > 0 ? a[0] : TS_UNDEFINED;
+  if (!ts_is_obj(t) && !ts_is_func(t)){
+    uint32_t len = 0; char* text = ts_string_utf8_copy(ts_to_string_v(t), &len);
+    char msg[160];
+    snprintf(msg, sizeof msg, "RegExp.prototype.flags getter called on non-object %.*s", (int)(len > 80 ? 80 : len), text);
+    free(text);
+    ts_throw_type_error_msg(msg);
+  }
+  static const struct { const char* name; char c; } order[] = {
+    {"hasIndices",'d'},{"global",'g'},{"ignoreCase",'i'},{"multiline",'m'},{"dotAll",'s'},{"unicode",'u'},{"unicodeSets",'v'},{"sticky",'y'} };
+  char out[9]; int k = 0;
+  ts_gc_root(&t);
+  for (int i = 0; i < 8; i++)
+    if (ts_truthy(ts_get(t, ts_intern_field(order[i].name, (uint32_t)strlen(order[i].name))))) out[k++] = order[i].c;
+  ts_gc_unroot(1);
+  return ts_new_string(out, (uint32_t)k);
+}
 #define FLAG_GETTER(fname, bit, pname) static tsv fname(tsv* a, int n){ tsv t = this_regexp(a, n, pname); return t == TS_UNDEFINED ? TS_UNDEFINED : ts_bool((as_re(t)->flags & (bit)) != 0); }
 FLAG_GETTER(get_global, TSAOT_REGEXP_FLAG_GLOBAL, "global")
 FLAG_GETTER(get_ignoreCase, TSAOT_REGEXP_FLAG_IGNORECASE, "ignoreCase")
@@ -919,7 +953,7 @@ static void define_getter(tsv proto, const char* name, ts_code fn){
   ts_gc_root(&proto);
   tsv f = ts_make_fn_t(fn, NULL, 0, 1); ts_gc_root(&f);
   char label[48]; snprintf(label, sizeof label, "get %s", name);
-  ts_set_fn_meta(f, 0, label);
+  ts_set_fn_meta(f, 0, strdup(label));   /* the function keeps the pointer */
   ts_define_accessor_attr(proto, ts_intern_field(name, (uint32_t)strlen(name)), f, TS_UNDEFINED, 1, 0, 0, 1);
   ts_gc_unroot(2);
 }
@@ -943,7 +977,9 @@ tsv ts_regexp_escape_tsv(tsv v){
     int lone = (c >= 0xD800u && c <= 0xDFFFu) &&
       !((c <= 0xDBFFu && i + 1 < n && ts_str_cu_at_view(sv, i + 1) >= 0xDC00u && ts_str_cu_at_view(sv, i + 1) <= 0xDFFFu) ||
         (c >= 0xDC00u && i > 0 && ts_str_cu_at_view(sv, i - 1) >= 0xD800u && ts_str_cu_at_view(sv, i - 1) <= 0xDBFFu));
-    if ((first && alnum) || (punct && c < 0x80) || (ws && c < 0x100) ){
+    if (c >= 9 && c <= 13){
+      out[k++] = '\\'; out[k++] = (uint16_t)"tnvfr"[c - 9];
+    } else if ((first && alnum) || (punct && c < 0x80) || (ws && c < 0x100) ){
       out[k++] = '\\'; out[k++] = 'x'; out[k++] = (uint16_t)hexd[(c >> 4) & 15]; out[k++] = (uint16_t)hexd[c & 15];
     } else if (syntax){
       out[k++] = '\\'; out[k++] = (uint16_t)c;
@@ -968,6 +1004,7 @@ static const ts_regexp_hooks g_hooks = {
   ts_regexp_adapter_object_search_tsv,
   construct_from_string,
   release_program,
+  ts_regexp_escape_tsv,
 };
 void ts_regexp_adapter_init(void){
   static int done = 0;

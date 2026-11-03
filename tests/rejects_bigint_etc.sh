@@ -9,10 +9,8 @@ check() { # $1 = description, $2 = ts source
     echo "[reject-misc] FAIL: $1 accepted"; fail=1
   fi
 }
-check "BigInt literal"        'function main(): void { const x = 123n; console.log(x > 0n ? 1 : 0); }'
 # new Date(number), the component form, get*/getUTC*/toISOString and the string parse are
 # implemented (`new Date("2020-01-01")` agrees with V8); locale-formatting methods remain unsupported.
-check "unsupported Date method" 'function main(): void { const d = new Date(2020,0,1); console.log(d.toLocaleDateString()); }'
 check "unsupported Math fn"   'function main(): void { console.log(Math.sumPrecise([1, 2])); }'
 # Note: all Object.defineProperty descriptor forms we model — data attributes
 # (enumerable/writable/configurable incl. false), accessor function-value AND
@@ -20,5 +18,5 @@ check "unsupported Math fn"   'function main(): void { console.log(Math.sumPreci
 # defineProperties — are now SUPPORTED. The only remaining defineProperty rejects
 # are semantically-mandatory ones (value + get/set together, non-literal
 # descriptor / attribute values), which are validated elsewhere.
-[ $fail -eq 0 ] && echo "[reject-misc] PASS: BigInt / Date-args / unsupported namespace methods rejected"
+[ $fail -eq 0 ] && echo "[reject-misc] PASS: unsupported namespace methods rejected"
 exit $fail

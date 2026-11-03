@@ -9,7 +9,8 @@ function main(): void {
   console.log(JSON.stringify(objs.slice().sort((a, b) => a.q - b.q).map((o) => o.t)));
   console.log(JSON.stringify([0.5, 1, 0.25, -0.5, 3].sort((a, b) => b - a)));
   console.log(JSON.stringify([0.5, 1, 0.25].sort((a, b) => (b !== a ? b - a : 0))));
-  console.log(JSON.stringify([3, 1, 2].sort((a, b) => String(a - b) as unknown as number)));    // "-2" -> -2
+  const byString: any = (a: number, b: number) => String(a - b);
+  console.log(JSON.stringify([3, 1, 2].sort(byString)));                                        // "-2" -> -2
   console.log(JSON.stringify([3, 1, 2].sort(() => NaN)));                                       // NaN -> 0: unchanged
   console.log(JSON.stringify([3, 1, 2].sort(() => undefined as unknown as number)));           // undefined -> NaN -> 0
   console.log(JSON.stringify([0.5, 1, 0.25].toSorted((a, b) => b - a)));

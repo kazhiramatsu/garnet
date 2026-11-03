@@ -350,6 +350,8 @@ int rx_emit_native(const uint16_t* src, uint32_t len, uint32_t flags, uint32_t i
   rx_error err;
   rx_program* p = rx_compile(src, len, flags, &err);
   if (!p){ *out = NULL; return -1; }
+  /* a pattern this long (\p{RGI_Emoji} is 3800 strings) stays in the VM: as C it took clang minutes and gigabytes */
+  if (p->code_len > 32768){ rx_release(p); *out = NULL; return -1; }
   *out = rx_emit_c(p, id);
   rx_release(p);
   return 0;
