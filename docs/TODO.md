@@ -13079,3 +13079,9 @@ Branch `s366-tdz-extends` from main after Session 365 (30e68cf).
 - Tried and dropped: taking an instance field's initializer out of the positional check, so that `class A { v = x + 1; } const x = 1;
   new A()` gives 2 as under V8 (it always throws, older than Session 363). The dead-zone analysis covers captured bindings only, and a
   module constant read there is folded: an early construction gave 2 where V8 throws, silent. Recorded in `docs/tdz_design.md`.
+- Gates on the commit (`build/gates_s366a/run.sh`, mains power, 15:23): unit, bundler 56, conformance 818/818 plain and strict, 815/815 under protect, bench with
+  its budgets, ci, ir-parity identical (5,043; no program of the corpus changes; snapshot taken with the fixture), the regexp differentials (0 differ), GC stress, the
+  hono survey 43/43. Against r34 (main after Session 365), outputs identical: tsc-ts 22.585 -> 21.971 G instructions (-2.72%), cycles -2.17%, wall 1.23 -> 1.21 s;
+  hono +0.04%, hono_app -0.05% (113.5 -> 113.8 ms, Node 160), vue +0.00% (931.6 -> 928.6 ms).
+- Next: the hono survey's compile time (1,020 s against 780 s through Session 362: each driver 24 s against 18, not yet divided between the exporter and clang),
+  then test262 measured again, then the deferred items of CLAUDE.md (a field initializer's dead zone, an own method through `any`).
