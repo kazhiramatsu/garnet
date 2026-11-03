@@ -119,6 +119,12 @@ Rust in §315; selfhost is kept as a performance metric).
 - Array.prototype monkey-patch: a replaced method (`Array.prototype.push = f`) is not seen by a typed call
   (outside the model; replacing or deleting `Array.prototype[Symbol.iterator]` is honored: a program that
   names it walks every array through the protocol, Session 363).
+- An array with accessor elements (`Object.defineProperty(a, 1, { get })`) in a program that does not name
+  `Array.prototype`: the generic methods read every element first (a getter runs more often than under V8,
+  `indexOf` does not stop at its find, `copyWithin` writes through an accessor it would not reach). A
+  function's `length` redefined moves to the end of its keys; `delete arguments.length` is a ReferenceError
+  (V8: true). V8 itself answers `Object.isFrozen` true for a non-extensible empty array and a sealed function,
+  whose `length` and `prototype` stay writable; garnet answers false, as the specification does (Session 364).
 - A method called through `call` or `apply` on a value of another class, or on a plain object: a `this.m()` in
   its body was resolved from the class's own hierarchy and may be inlined, so `D.prototype.d.call({ m() {} })`
   runs the class's `m`, silently (Session 363, older than that session; field accesses are guarded, these

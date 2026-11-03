@@ -2089,6 +2089,7 @@ static tsv ts_proxy_construct(tsv pv, tsv* args, int nargs);
 static int proxy_set_proto_answer(tsv pv, tsv proto);
 typedef void (*ts_prop_enum_cb_fwd)(uint32_t, tsv, void*);
 static void ts_proxy_enum(tsv pv, ts_prop_enum_cb_fwd cb, void* ud);
+static tsv ts_proxy_enumerable_keys(tsv pv);
 
 static tsv* find_slot(ts_object* o, ts_key key, int create);
 /* Object.getPrototypeOf: return the object's prototype (or null). */
@@ -4426,13 +4427,17 @@ void ts_set(tsv obj, ts_key key, tsv val){
     // `arr.length = v`: set the real array length (truncate/extend). JS requires v
     // to be a non-negative integer < 2^32, else RangeError.
     if (field_name_is(key, "length")){
-      ts_gc_root(&obj);
+      /* [[Set]] asks whether the property is writable before ArraySetLength converts the value: a frozen array's
+         `length = NaN` is the TypeError, and the value's valueOf is never called (it was the RangeError) */
+      if (frozen || (((ts_array*)ts_ptr(obj))->kind_spare & TS_ARRAY_LENGTH_READONLY)){ ts_throw_readonly_write(obj, key); return; }
+      ts_gc_root(&obj); ts_gc_root(&val);
       double d = ts_number_coerce(val);
-      ts_gc_unroot(1);
+      /* ArraySetLength converts twice, ToUint32 and then ToNumber: an object's valueOf runs twice, as under V8 */
+      if (ts_is_obj(val) || ts_is_func(val)) d = ts_number_coerce(val);
+      ts_gc_unroot(2);
       uint32_t u = ts_to_uint32(d);
       if ((double)u != d){ ts_throw_range_error_msg("Invalid array length"); return; }
       ts_array* a = (ts_array*)ts_ptr(obj);
-      if (frozen || (a->kind_spare & TS_ARRAY_LENGTH_READONLY)){ ts_throw_readonly_write(obj, key); return; }
       /* a sealed array's elements stay: the length stops above the last one */
       if ((ts_obj_integrity(&a->o) & 4u) && u < a->len){
         uint32_t last = a->len;
@@ -13476,6 +13481,7 @@ static void object_enum_check(tsv obj){
 }
 tsv ts_object_keys(tsv obj){
   object_enum_check(obj);
+  if (g_has_proxies && ts_is_proxy(obj)) return ts_proxy_enumerable_keys(obj);
   ts_gc_root(&obj);
   enum_arr_ctx c; c.arr=ts_new_array(0); c.recv=obj; ts_gc_root(&c.arr);
   ts_prop_own_enum(obj, cb_push_key, &c);
@@ -13631,30 +13637,28 @@ tsv ts_object_get_own_property_names(tsv obj){
                   (sc && find_slot(sc, g_fn_key_length, 0));
     int has_name = fn_virtual(f, g_fn_key_name) || find_slot(&f->o, g_fn_key_name, 0) ||
                    (sc && find_slot(sc, g_fn_key_name, 0));
+    /* the integer keys first, as for any object (they followed `prototype`) */
+    tsv owner = sc ? ts_obj(sc) : obj;
+    ts_gc_root(&owner);
+    push_prop_names_part(arr, owner, g_fn_key_length, g_fn_key_name, g_fn_key_prototype, 1);
     if (has_len) push_cstr_name(arr, "length");
     if (has_name) push_cstr_name(arr, "name");
     if (has_proto) push_cstr_name(arr, "prototype");
-    sc = ts_class_static_container(obj);
-    if (sc){
-      tsv scv = ts_obj(sc);
-      push_prop_names_js_order(arr, scv, g_fn_key_length, g_fn_key_name, g_fn_key_prototype);
-      ts_gc_unroot(2);
-      return arr;
-    }
-    push_prop_names_js_order(arr, obj, g_fn_key_length, g_fn_key_name, g_fn_key_prototype);
-    ts_gc_unroot(2);
+    push_prop_names_part(arr, owner, g_fn_key_length, g_fn_key_name, g_fn_key_prototype, 2);
+    ts_gc_unroot(3);
     return arr;
   }
   if (!ts_is_obj(obj) || ts_is_map(obj) || ts_is_set(obj)){
     ts_gc_unroot(2);
     return arr;
   }
+  /* the integer keys, then a class instance's fields (its first string keys), then the map's strings */
+  push_prop_names_part(arr, obj, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 1);
   ts_object* o = ts_ptr(obj);
   ts_class_reg* reg = class_reg_for(o);
   int nf = class_reg_nfields(reg);
   for (int i=0;i<nf;i++){ uint32_t k = class_reg_field_key(reg, i); if (!class_field_is_private(k)) push_own_name(arr, k); }
-  o = ts_ptr(obj);
-  push_prop_names_js_order(arr, obj, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu);
+  push_prop_names_part(arr, obj, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 2);
   ts_gc_unroot(2);
   return arr;
 }
@@ -13817,7 +13821,9 @@ tsv ts_object_assign(tsv* args, int n){
     /* into a fresh object, an Object.prototype nothing was added to: no setter is in the way */
     if (TS_TOP16(target) == TS_SEL_OBJECT && ((ts_object*)ts_ptr(target))->proto == g_object_proto_v &&
         object_proto_takes_stores() && object_copy_whole(target, src)) continue;
-    if (ts_is_map(src) || ts_is_set(src) || (!ts_is_obj(src) && !ts_is_class_value(src) && !ts_is_str(src))) continue;  /* arrays/strings OK (index keys) */
+    /* a function's own enumerable properties are copied as any object's (they were skipped, silent), a Map's or a Set's
+       too (its named properties; its entries are not properties); a primitive cell has none */
+    if ((!ts_is_obj(src) && !ts_is_func(src) && !ts_is_str(src)) || ts_is_prim_cell(src)) continue;  /* arrays/strings OK (index keys) */
     ts_gc_root(&src);
     c.recv = src;   /* accessor getters run with this=src */
     if (g_has_proxies && ts_is_proxy(src)) ts_proxy_copy(src, NULL, 0, cb_copy_to_target, &c);
@@ -14221,12 +14227,20 @@ static void cb_json_obj_prop(uint32_t key, tsv val, void* ud){
   json_obj_ctx* c=(json_obj_ctx*)ud;
   json_emit_obj_prop(c->b, c->recv, key, val, c->depth, c->indent, &c->first);
 }
-static int json_emit_prop_map_direct(jbuf* b, tsv obj, int depth, const char* indent, int* first){
+/* Can the map be written in its own order, after the struct's fields? Not with an integer key (they come first, the
+   struct's fields after them) nor with an accessor (a getter can change the map: the walk is over its keys). Asked before
+   anything is written: a toJSON or a getter must not run twice. */
+static int json_map_direct_ok(tsv obj){
   ts_object* o=ts_ptr(obj);
   for (uint32_t i=0;i<obj_map(o)->len;i++){
     uint32_t idx;
+    if (obj_flags_at(o, i) & TS_PROP_ACCESSOR) return 0;
     if (prop_enum_data_at(o, i) && prop_key_is_array_index(obj_key_at(o, i), &idx)) return 0;
   }
+  return 1;
+}
+static void json_emit_prop_map_direct(jbuf* b, tsv obj, int depth, const char* indent, int* first){
+  ts_object* o;
   for (uint32_t i=0;;i++){
     o=ts_ptr(obj);
     if (i>=obj_map(o)->len) break;
@@ -14235,7 +14249,6 @@ static int json_emit_prop_map_direct(jbuf* b, tsv obj, int depth, const char* in
     tsv val=(obj_val_read(o, i));
     json_emit_obj_prop(b, obj, k, val, depth, indent, first);
   }
-  return 1;
 }
 
 /* Open an object or array: a value already open on the path is a cycle
@@ -14256,11 +14269,13 @@ static void json_enter(jbuf* b, json_path* node, tsv* slot, int depth){
 static inline void json_leave(jbuf* b, json_path* node){ b->path = node->up; }
 static tsv wrapper_value(tsv v);
 static int json_stringify_val(jbuf* b, tsv v, int depth, const char* indent){
-  if (TS_RT_UNLIKELY(g_has_wrappers) && wrapper_value(v) != TS_UNDEFINED) v = wrapper_value(v);
   /* top-level toJSON (key ""): children get toJSON applied by their property /
      element / map emitters, so depth>0 never re-applies it to the same value. */
   if (depth == 0 && ts_is_obj(v)) v = json_apply_tojson(v, "", 0);
   if (depth == 0 && b->rep) v = json_apply_replacer(b, b->rep->root_holder, "", 0, v);
+  /* a Number, String or Boolean object becomes its value after toJSON and the replacer, which see the object
+     (SerializeJSONProperty step 4: the root's was unwrapped first, so a replacer saw 3 for `new Number(3)`) */
+  if (TS_RT_UNLIKELY(g_has_wrappers) && wrapper_value(v) != TS_UNDEFINED) v = wrapper_value(v);
   if (ts_is_undef(v) || ts_is_func(v)) return 0;          /* caller decides null vs omit */
   if (ts_is_null(v)){ jb_putz(b,"null"); return 1; }
   if (ts_is_bool(v)){ jb_putz(b,(v&1)?"true":"false"); return 1; }
@@ -14334,7 +14349,14 @@ static int json_stringify_val(jbuf* b, tsv v, int depth, const char* indent){
     ts_gc_root(&v);
     json_path node; json_enter(b, &node, &v, depth);
     json_obj_ctx jc; jc.b=b; jc.depth=depth; jc.first=1; jc.recv=v; jc.indent=indent;
-    ts_proxy_enum(v, cb_json_obj_prop, &jc);
+    /* SerializeJSONObject: the keys are settled first, a value read afterwards for each */
+    tsv keys = ts_proxy_enumerable_keys(v); ts_gc_root(&keys);
+    for (uint32_t i = 0, n = ts_array_len(keys); i < n; i++){
+      tsv kv = ts_array_get(keys, i);
+      ts_key k;
+      if (ts_key_from_value(kv, &k)) cb_json_obj_prop(k, ts_proxy_get_v(v, kv, v), &jc);
+    }
+    ts_gc_unroot(1);
     json_leave(b, &node);
     ts_gc_unroot(1);
     if (!jc.first) jb_indent(b, indent, depth);
@@ -14345,37 +14367,35 @@ static int json_stringify_val(jbuf* b, tsv v, int depth, const char* indent){
     ts_gc_root(&v);
     json_path node; json_enter(b, &node, &v, depth);
     int first=1;
-    if (ts_is_typed_array(v)) {
-      for (uint32_t i = 0; i < ((ts_typedarray*)ts_ptr(v))->length; i++) {
-        char name[16]; int size = snprintf(name, sizeof name, "%u", i);
-        ts_key key = ts_intern_field(name, (uint32_t)size);
-        json_emit_obj_prop(b, v, key, ts_ta_get(v, i), depth, indent, &first);
+    if (json_map_direct_ok(v)){
+      if (ts_is_typed_array(v)) {
+        for (uint32_t i = 0; i < ((ts_typedarray*)ts_ptr(v))->length; i++) {
+          char name[16]; int size = snprintf(name, sizeof name, "%u", i);
+          ts_key key = ts_intern_field(name, (uint32_t)size);
+          json_emit_obj_prop(b, v, key, ts_ta_get(v, i), depth, indent, &first);
+        }
       }
-    }
-    ts_object* o=ts_ptr(v);
-    ts_class_reg* reg=class_reg_for(o);
-    int used_direct=1;
-    int nf=class_reg_nfields(reg);
-    for (int i=0;i<nf;i++){
-      reg=class_reg_for((ts_object*)ts_ptr(v));
-      uint32_t k=class_reg_field_key(reg, i);
-      if (!sized_field_enumerable((ts_object*)ts_ptr(v), k)) continue;   /* hidden on this instance */
-      tsv val=class_reg_field_value(reg, (ts_object*)ts_ptr(v), i);
-      json_emit_obj_prop(b, v, k, val, depth, indent, &first);
-    }
-    if (!json_emit_prop_map_direct(b, v, depth, indent, &first)) {
-      /* Rare integer-index props need the canonical ordering logic. */
-      first=1;
-      b->len--; /* discard the opening brace and re-emit through the canonical path */
-      jb_putc(b,'{');
+      ts_object* o=ts_ptr(v);
+      ts_class_reg* reg=class_reg_for(o);
+      int nf=class_reg_nfields(reg);
+      for (int i=0;i<nf;i++){
+        reg=class_reg_for((ts_object*)ts_ptr(v));
+        uint32_t k=class_reg_field_key(reg, i);
+        if (!sized_field_enumerable((ts_object*)ts_ptr(v), k)) continue;   /* hidden on this instance */
+        tsv val=class_reg_field_value(reg, (ts_object*)ts_ptr(v), i);
+        json_emit_obj_prop(b, v, k, val, depth, indent, &first);
+      }
+      json_emit_prop_map_direct(b, v, depth, indent, &first);
+    } else {
+      /* integer keys or accessors: the canonical order and walk. Before, this path was taken after the struct's fields
+         had been written, and it backed up one byte: a class instance with an integer key gave a string with its fields
+         twice and the first copy cut (silent). */
       json_obj_ctx jc; jc.b=b; jc.depth=depth; jc.first=1; jc.recv=v; jc.indent=indent;
       ts_prop_own_enum(v, cb_json_obj_prop, &jc);
       first=jc.first;
-      used_direct=0;
     }
     json_leave(b, &node);
     ts_gc_unroot(1);
-    (void)used_direct;
     if (!first) jb_indent(b, indent, depth);
     jb_putc(b,'}'); return 1;
   }
@@ -15309,6 +15329,21 @@ static int prop_key_is_array_index(uint32_t key, uint32_t* idx){
   *idx = (uint32_t)v; return 1;
 }
 static void ts_proxy_enum(tsv pv, ts_prop_enum_cb cb, void* ud);
+/* A class instance's struct fields, in declaration order (the string keys made at its construction). */
+static void enum_struct_fields(tsv obj, ts_prop_enum_cb cb, void* ud){
+  ts_object* o = ts_ptr(obj);
+  ts_class_reg* reg = class_reg_for(o);
+  int nf = class_reg_nfields(reg);
+  for (int i=0;i<nf;i++){
+    uint32_t k = class_reg_field_key(reg, i);
+    if (!sized_field_enumerable(o, k)) continue;   /* hidden on this instance */
+    tsv v = class_reg_field_value(reg, ts_ptr(obj), i);
+    cb(k, v, ud);
+    /* the callback may have converted the instance: re-resolve for the next read */
+    o = ts_ptr(obj); reg = class_reg_for(o);
+    if (class_reg_nfields(reg) != nf) break;
+  }
+}
 static void ts_prop_own_enum(tsv obj, ts_prop_enum_cb cb, void* ud){
   if (g_has_proxies && ts_is_proxy(obj)){ ts_proxy_enum(obj, cb, ud); return; }
   if (TS_RT_UNLIKELY(g_has_wrappers) && ts_is_obj(obj)) string_object_touch(obj);
@@ -15415,26 +15450,28 @@ static void ts_prop_own_enum(tsv obj, ts_prop_enum_cb cb, void* ud){
     return;
   }
   ts_object* o=ts_ptr(obj);
-  ts_class_reg* reg = class_reg_for(o);
-  int nf = class_reg_nfields(reg);
-  for (int i=0;i<nf;i++){
-    uint32_t k = class_reg_field_key(reg, i);
-    if (!sized_field_enumerable(o, k)) continue;   /* hidden on this instance */
-    tsv v = class_reg_field_value(reg, ts_ptr(obj), i);
-    cb(k, v, ud);
-    /* reg/o may be stale after cb if a GC moved things; re-resolve for next read. */
-    o = ts_ptr(obj); reg = class_reg_for(o);
-  }
-  /* JS property order for the prop map: integer-index keys first in ascending
-     numeric order, then the remaining (string) keys in insertion order. We do a
-     cheap pass to see if any integer-index key exists; if not (the common case),
-     fall straight through to plain insertion order. */
-  o = ts_ptr(obj);
-  int has_index = 0;
+  /* JS property order: integer-index keys first in ascending numeric order, then the string keys in the order they
+     were made, a class instance's struct fields first among them (they come from its construction). A cheap pass sees
+     whether any integer-index key exists; if not (the common case), the walk is the fields and then the map's order. */
+  int has_index = 0, has_accessor = 0;
   for (uint32_t i=0;i<obj_map(o)->len;i++){
     uint32_t idx;
-    if (prop_enum_data_at(o, i) && prop_key_is_array_index(obj_key_at(o, i), &idx)){ has_index = 1; break; }
+    if (obj_flags_at(o, i) & TS_PROP_ACCESSOR) has_accessor = 1;
+    if (prop_enum_data_at(o, i) && prop_key_is_array_index(obj_key_at(o, i), &idx)) has_index = 1;
   }
+  /* A getter can change the object under the walk, and the walk is over the keys it began with (CopyDataProperties,
+     EnumerableOwnProperties): a key that has gone is skipped, one that was added is not visited. An object with no
+     accessor keeps the index loop below; the list is taken before any getter runs, the integer keys' among them. */
+  uint32_t* later = NULL; uint32_t nlater = 0;
+  if (has_accessor){
+    uint32_t cap = obj_map(o)->len;
+    later = (uint32_t*)malloc(sizeof(uint32_t) * cap);
+    for (uint32_t i = 0; i < cap; i++){
+      uint32_t idx, k = obj_key_at(o, i);
+      if (field_enumerable(k) && !prop_key_is_array_index(k, &idx)) later[nlater++] = k;
+    }
+  }
+  int fields_done = 0;
   if (has_index){
     /* the integer keys in ascending order; a callback can change the map, so each is read back by its key */
     o = ts_ptr(obj);
@@ -15453,9 +15490,11 @@ static void ts_prop_own_enum(tsv obj, ts_prop_enum_cb cb, void* ud){
       cb(k, obj_val_read(o, p.i), ud);
     }
     free(pairs);
+    enum_struct_fields(obj, cb, ud);
+    fields_done = 1;
     /* then the non-integer (string) keys in insertion order */
     o = ts_ptr(obj);
-    for (uint32_t i=0;;i++){
+    if (!has_accessor) for (uint32_t i=0;;i++){
       o = ts_ptr(obj);
       if (i>=obj_map(o)->len) break;
       uint32_t idx;
@@ -15465,6 +15504,16 @@ static void ts_prop_own_enum(tsv obj, ts_prop_enum_cb cb, void* ud){
       tsv v = (obj_val_read(o, i));
       cb(k, v, ud);
     }
+    if (!has_accessor) return;
+  }
+  if (!fields_done) enum_struct_fields(obj, cb, ud);
+  if (has_accessor){
+    for (uint32_t t = 0; t < nlater; t++){
+      o = ts_ptr(obj);
+      ts_pref p = prop_find(o, later[t]);
+      if (pref_ok(p) && prop_enum_data_at(o, p.i)) cb(later[t], obj_val_read(o, p.i), ud);
+    }
+    free(later);
     return;
   }
   for (uint32_t i=0;;i++){
@@ -15574,6 +15623,38 @@ typedef struct { const char* s; size_t i, n; int ok; } jparse;
 static void jp_ws(jparse* p){ while(p->i<p->n){ char c=p->s[p->i]; if(c==' '||c=='\t'||c=='\n'||c=='\r') p->i++; else break; } }
 static tsv jp_value(jparse* p);
 
+/* Four hex digits of a `\u` escape, -1 when they are not (strtol took `\u12g4` as 0x12). */
+static int jp_hex4(jparse* p){
+  if (p->i + 4 > p->n) return -1;
+  int v = 0;
+  for (int k = 0; k < 4; k++){
+    char h = p->s[p->i + k];
+    int d = h >= '0' && h <= '9' ? h - '0' : h >= 'a' && h <= 'f' ? h - 'a' + 10 : h >= 'A' && h <= 'F' ? h - 'A' + 10 : -1;
+    if (d < 0) return -1;
+    v = v * 16 + d;
+  }
+  p->i += 4;
+  return v;
+}
+static tsv string_from_units(const uint16_t* u, uint32_t n);
+/* A string from WTF-8 (UTF-8 that may carry a surrogate as three bytes): its UTF-16 units. */
+static tsv jp_string_from_wtf8(const char* s, size_t n){
+  uint16_t* u = (uint16_t*)malloc(sizeof(uint16_t) * (n ? n : 1));
+  uint32_t k = 0;
+  for (size_t i = 0; i < n;){
+    unsigned char c = (unsigned char)s[i];
+    uint32_t cp;
+    if (c < 0x80){ cp = c; i += 1; }
+    else if (c < 0xE0){ cp = ((c & 0x1Fu) << 6) | ((unsigned char)s[i + 1] & 0x3Fu); i += 2; }
+    else if (c < 0xF0){ cp = ((c & 0x0Fu) << 12) | (((unsigned char)s[i + 1] & 0x3Fu) << 6) | ((unsigned char)s[i + 2] & 0x3Fu); i += 3; }
+    else { cp = ((c & 0x07u) << 18) | (((unsigned char)s[i + 1] & 0x3Fu) << 12) | (((unsigned char)s[i + 2] & 0x3Fu) << 6) | ((unsigned char)s[i + 3] & 0x3Fu); i += 4; }
+    if (cp >= 0x10000u){ cp -= 0x10000u; u[k++] = (uint16_t)(0xD800u + (cp >> 10)); u[k++] = (uint16_t)(0xDC00u + (cp & 0x3FFu)); }
+    else u[k++] = (uint16_t)cp;
+  }
+  tsv r = string_from_units(u, k);
+  free(u);
+  return r;
+}
 static tsv jp_string(jparse* p){
   /* assumes p->s[p->i]=='"' */
   if (p->i >= p->n || p->s[p->i] != '"'){ p->ok=0; return TS_UNDEFINED; }
@@ -15590,9 +15671,10 @@ static tsv jp_string(jparse* p){
     j++;
   }
   p->i++; jbuf b; jb_init(&b);
+  int lone = 0;   /* a lone surrogate went into the buffer as WTF-8: the string is made of UTF-16 units */
   while (p->i<p->n){
     unsigned char c=(unsigned char)p->s[p->i++];
-    if (c=='"'){ tsv r=ts_new_string(b.p,(uint32_t)b.len); jb_free(&b); return r; }
+    if (c=='"'){ tsv r = lone ? jp_string_from_wtf8(b.p, b.len) : ts_new_string(b.p,(uint32_t)b.len); jb_free(&b); return r; }
     if (c=='\\' && p->i<p->n){
       char e=p->s[p->i++];
       switch(e){
@@ -15605,16 +15687,23 @@ static tsv jp_string(jparse* p){
         case 'b': jb_putc(&b,'\b'); break;
         case 'f': jb_putc(&b,'\f'); break;
         case 'u': {
-          if (p->i+4<=p->n){
-            char h[5]={p->s[p->i],p->s[p->i+1],p->s[p->i+2],p->s[p->i+3],0};
-            p->i+=4; unsigned cp=(unsigned)strtol(h,NULL,16);
-            /* encode UTF-8 (BMP only) */
-            if (cp<0x80) jb_putc(&b,(char)cp);
-            else if (cp<0x800){ jb_putc(&b,(char)(0xC0|(cp>>6))); jb_putc(&b,(char)(0x80|(cp&0x3F))); }
-            else { jb_putc(&b,(char)(0xE0|(cp>>12))); jb_putc(&b,(char)(0x80|((cp>>6)&0x3F))); jb_putc(&b,(char)(0x80|(cp&0x3F))); }
+          int cp = jp_hex4(p);
+          if (cp < 0){ jb_free(&b); p->ok=0; return TS_UNDEFINED; }
+          /* a pair of escapes is one code point (Python's json.dumps writes every character past the BMP so); a
+             surrogate alone stays one: each half was written as three bytes of its own, two U+FFFD in the string */
+          if (cp >= 0xD800 && cp <= 0xDBFF && p->i+6<=p->n && p->s[p->i]=='\\' && p->s[p->i+1]=='u'){
+            size_t at = p->i; p->i += 2;
+            int lo = jp_hex4(p);
+            if (lo >= 0xDC00 && lo <= 0xDFFF) cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+            else p->i = at;   /* not a low half: this one is alone, the next escape is read on its own */
           }
+          if (cp >= 0xD800 && cp <= 0xDFFF) lone = 1;
+          if (cp<0x80) jb_putc(&b,(char)cp);
+          else if (cp<0x800){ jb_putc(&b,(char)(0xC0|(cp>>6))); jb_putc(&b,(char)(0x80|(cp&0x3F))); }
+          else if (cp<0x10000){ jb_putc(&b,(char)(0xE0|(cp>>12))); jb_putc(&b,(char)(0x80|((cp>>6)&0x3F))); jb_putc(&b,(char)(0x80|(cp&0x3F))); }
+          else { jb_putc(&b,(char)(0xF0|(cp>>18))); jb_putc(&b,(char)(0x80|((cp>>12)&0x3F))); jb_putc(&b,(char)(0x80|((cp>>6)&0x3F))); jb_putc(&b,(char)(0x80|(cp&0x3F))); }
         } break;
-        default: jb_putc(&b,e);
+        default: jb_free(&b); p->ok=0; return TS_UNDEFINED;   /* `\x`, `\'`: not JSON escapes (the character was kept) */
       }
     } else {
       if (c < 0x20u){ jb_free(&b); p->ok=0; return TS_UNDEFINED; }
@@ -15716,9 +15805,9 @@ static tsv jp_value(jparse* p){
     ts_gc_root(&obj);
     jp_ws(p);
     if (p->i<p->n && p->s[p->i]=='}'){ p->i++; ts_gc_unroot(1); return obj; }
-    while (p->i<p->n){
+    for (;;){   /* a `}` ends it, nothing else does: `{` and `{"a":1,` were objects (silent) */
       jp_ws(p);
-      if (p->s[p->i]!='"'){ p->ok=0; ts_gc_unroot(1); return obj; }
+      if (p->i>=p->n || p->s[p->i]!='"'){ p->ok=0; ts_gc_unroot(1); return obj; }
       uint32_t key=jp_key_intern(p); if(!p->ok){ ts_gc_unroot(1); return obj; }
       jp_ws(p); if (p->i>=p->n||p->s[p->i]!=':'){ p->ok=0; ts_gc_unroot(1); return obj; } p->i++;
       tsv val=jp_value(p); if(!p->ok){ ts_gc_unroot(1); return obj; }
@@ -15738,7 +15827,7 @@ static tsv jp_value(jparse* p){
     ts_gc_root(&arr);
     jp_ws(p);
     if (p->i<p->n && p->s[p->i]==']'){ p->i++; ts_gc_unroot(1); return arr; }
-    while (p->i<p->n){
+    for (;;){   /* a `]` ends it, nothing else does: `[` and `[1,` were arrays (silent) */
       tsv val=jp_value(p); if(!p->ok){ ts_gc_unroot(1); return arr; }
       ts_gc_root(&val);
       jp_array_push_fast(arr, val);
@@ -16666,7 +16755,8 @@ void ts_object_copy_props(tsv dst, tsv src){
   /* arrays ARE valid spread sources ({...arr} -> {0:.., 1:..}); the enumerator
      yields their index keys. Only map/set/non-object sources are skipped. */
   /* a function source spreads its own enumerable properties as any object does ({ ...fnWithProps }) */
-  if (ts_is_map(src) || ts_is_set(src) || (!ts_is_obj(src) && !ts_is_func(src) && !ts_is_class_value(src) && !ts_is_str(src))) return;
+  /* a Map's or a Set's named properties are copied (its entries are not properties); a primitive cell has none */
+  if ((!ts_is_obj(src) && !ts_is_func(src) && !ts_is_class_value(src) && !ts_is_str(src)) || ts_is_prim_cell(src)) return;
   ts_gc_root(&dst); ts_gc_root(&src);
   enum_copy_ctx c; c.target=dst; c.recv=src;
   if (g_has_proxies && ts_is_proxy(src)) ts_proxy_copy(src, NULL, 0, cb_spread_to_target, &c);
@@ -16686,9 +16776,15 @@ int ts_is_undefined(tsv v){ return ts_is_undef(v); }
    the internal ts_delete_prop which returns false. Non-own / configurable / absent
    keys delete normally. */
 static int fn_delete(tsv obj, ts_key key, int strict);
+static void define_property_error(const char* fmt, ts_key key);
 int ts_delete_prop_strict(tsv obj, ts_key key){
   if (ts_is_obj(obj)){ ts_gc_header* _dh = (ts_gc_header*)ts_ptr(obj); if (_dh->gen == TS_GEN_OLD) gc_cards_all(_dh); }
-  if (g_has_proxies && ts_is_proxy(obj)) return ts_proxy_delete_v(obj, ts_key_to_value(key));
+  if (g_has_proxies && ts_is_proxy(obj)){
+    /* a strict delete is true or a TypeError: a trap's false came back as the delete's value (silent) */
+    if (ts_proxy_delete_v(obj, ts_key_to_value(key))) return 1;
+    define_property_error("'deleteProperty' on proxy: trap returned falsish for property '%s'", key);
+    return 0;
+  }
   if (ts_is_func(obj)) return fn_delete(obj, key, 1);
   if (!ts_is_obj(obj)) return 1;
   if (ts_is_typed_array(obj)){
@@ -16716,7 +16812,8 @@ int ts_delete_prop_strict(tsv obj, ts_key key){
     }
   }
   int nonconf = 0;
-  if (ts_obj_integrity(o) & (1u|4u)) {        /* frozen / sealed => all own props non-configurable */
+  if (ts_is_indexed_array_fast(obj) && key == arrlike_length_key()) nonconf = 1;   /* an array's length is never configurable */
+  else if (ts_obj_integrity(o) & (1u|4u)) {        /* frozen / sealed => all own props non-configurable */
     /* (a class instance's struct fields are own properties too) */
     if (pref_ok(prop_find(o, key)) || (g_has_class_regs && class_has_field(o, key))) nonconf = 1;
   } else if (g_has_class_regs && class_has_field(o, key)){
@@ -16814,9 +16911,9 @@ static int obj_abandon_layout(tsv obj){
 }
 static int props_delete_own(ts_object* o, ts_key key){
   if (o->h.gen == TS_GEN_OLD) gc_cards_all(&o->h);
-  if (ts_obj_integrity(o) & (1u|4u)) return 0;   /* frozen / sealed: delete ignored (false) */
   ts_pref found = prop_find(o, key);
-  if (!pref_ok(found)) return 1;
+  if (!pref_ok(found)) return 1;                  /* absent: true, whatever the object's integrity (it answered false) */
+  if (ts_obj_integrity(o) & (1u|4u)) return 0;   /* frozen / sealed: not configurable */
   /* non-configurable: delete is ignored (returns false in sloppy mode). */
   if (!pref_is_configurable(found)) return 0;
   uint32_t i = found.i;
@@ -16884,6 +16981,7 @@ int ts_delete_prop(tsv obj, ts_key key){
     uint32_t idx;   /* an element is not configurable */
     if (ta_numeric_key(key, &idx)) return idx >= ((ts_typedarray*)ts_ptr(obj))->length;
   }
+  if (ts_is_indexed_array_fast(obj) && key == arrlike_length_key()) return 0;   /* not configurable: Reflect.deleteProperty's false */
   ts_object* o=ts_ptr(obj);
   if (ts_is_plain_array(obj)){
     const char* nm=ts_field_name(key);
@@ -17024,10 +17122,25 @@ tsv ts_get_own_property_descriptor(tsv obj, tsv keyv){
 /* Object.getOwnPropertyDescriptors(obj): object mapping each own key to its
    descriptor (includes non-enumerable own props and accessors). */
 tsv ts_get_own_property_descriptors(tsv obj){
+  if (obj == TS_UNDEFINED || obj == TS_NULL) ts_throw_type_error_msg("Cannot convert undefined or null to object");
   if (!ts_is_propbag(obj) && !ts_is_str(obj)) return ts_new_object();
   ts_gc_root(&obj);
   tsv res = ts_new_object();
   ts_gc_root(&res);
+  if (g_has_proxies && ts_is_proxy(obj)){   /* ownKeys, then the trap for each: a Proxy's cell has no map */
+    tsv keys = ts_proxy_own_keys_arr(obj); ts_gc_root(&keys);
+    uint32_t n = ts_is_indexed_array_fast(keys) ? ts_array_len(keys) : 0;
+    for (uint32_t i = 0; i < n; i++){
+      tsv kv = ts_array_get(keys, i);
+      ts_gc_root(&kv);
+      tsv d = ts_proxy_get_own_desc(obj, kv);
+      ts_key k;
+      if (!ts_is_undef(d) && ts_key_from_value(kv, &k)) ts_set(res, k, d);
+      ts_gc_unroot(1);
+    }
+    ts_gc_unroot(3);
+    return res;
+  }
   if (ts_is_str(obj)){
     uint32_t len = ts_str_len_typed(obj);
     for (uint32_t i=0;i<len;i++){
@@ -17340,9 +17453,14 @@ static int define_own_property(tsv obj, ts_key key, unsigned present, tsv value,
     }
   }
   int acc_result = exists ? (is_acc || (!is_data && cur_acc)) : is_acc;
+  if (field && (acc_result || nw != cur_w)){
+    /* an accessor, or a value no longer writable, where the struct has a writable slot: the instance becomes a dictionary
+       object, as a delete of one of its fields makes it (the typed accesses take the generic path from then on), and the
+       entry takes the attributes. These were TypeErrors V8 does not throw. */
+    if (!obj_abandon_layout(obj)){ ts_gc_unroot(7); define_property_error("Cannot redefine property: %s (garnet: this instance's layout is too large to become a plain object)", key); return 0; }
+    field = 0;
+  }
   if (field){
-    if (acc_result){ ts_gc_unroot(7); define_property_error("Cannot redefine property: %s (a class field stays a data property)", key); return 0; }
-    if (nw != cur_w){ ts_gc_unroot(7); define_property_error("Cannot redefine property: %s (a class field stays writable)", key); return 0; }
     /* enumerable or configurable redefined: the instance's record of the field's attributes */
     if (ne != cur_e || nc != cur_c) sized_field_attr_set((ts_object*)ts_ptr(obj), key, ne, nc);
     /* the value (also on a sealed instance; a frozen one refused above) */
@@ -17575,6 +17693,8 @@ int ts_has_own_dyn(tsv obj, tsv keyv){
   if (ts_is_null(obj) || ts_is_undef(obj)) { ts_throw_type_error_msg("Cannot convert undefined or null to object"); return 0; }
   ts_gc_root(&obj);
   if (TS_RT_UNLIKELY(ts_object_like(keyv))) keyv = ts_property_key_value(keyv);
+  /* [[GetOwnProperty]]: the trap (ts_has_own is the runtime's, which asks a Proxy nothing) */
+  if (g_has_proxies && ts_is_proxy(obj)){ int own = !ts_is_undef(ts_proxy_get_own_desc(obj, keyv)); ts_gc_unroot(1); return own; }
   ts_key key;
   int ok = ts_key_from_value(keyv, &key);
   int r = ok ? ts_has_own(obj, key) : 0;
@@ -23258,6 +23378,9 @@ static void ts_proxy_prevent_extensions(tsv pv){
   if (!proxy_prevent_answer(pv)) ts_throw_type_error("'preventExtensions' on proxy: trap returned falsish");
 }
 /* === getOwnPropertyDescriptor === */
+static int pd_compatible(tsv desc, tsv cur);
+static tsv build_data_descriptor(tsv value, int w, int e, int c);
+static tsv build_accessor_descriptor(tsv getter, tsv setter, int e, int c);
 static tsv ts_proxy_get_own_desc(tsv pv, tsv keyv){
   ts_gc_root(&pv); ts_gc_root(&keyv);
   ts_proxy* px = ts_ptr(pv);
@@ -23268,10 +23391,43 @@ static tsv ts_proxy_get_own_desc(tsv pv, tsv keyv){
   ts_gc_root(&trap);
   tsv argv[2] = { target, keyv };
   tsv r = invoke_with_this(trap, handler, argv, 2);
-  if (!ts_is_obj(r) && !ts_is_undef(r))
+  ts_gc_root(&r);
+  if (!((ts_is_obj(r) && !ts_is_prim_cell(r)) || ts_is_func(r)) && !ts_is_undef(r))
     ts_throw_type_error("'getOwnPropertyDescriptor' on proxy: trap returned neither object nor undefined");
-  ts_gc_unroot(5);
-  return r;
+  tsv tdesc = ts_get_own_property_descriptor(target, keyv);
+  ts_gc_root(&tdesc);
+  int extensible = ts_truthy(ts_reflect_is_extensible(target));
+  tsv out = TS_UNDEFINED;
+  if (ts_is_undef(r)){
+    if (!ts_is_undef(tdesc) && (!pd_bool(tdesc, "configurable") || !extensible))
+      ts_throw_type_error("'getOwnPropertyDescriptor' on proxy: trap returned undefined for a property the target must keep");
+  } else {
+    /* ToPropertyDescriptor and CompletePropertyDescriptor: the trap's object is read once, in this order, and the caller
+       gets a descriptor with every field, not that object */
+    int e = pd_has(r, "enumerable") && pd_bool(r, "enumerable");
+    int c = pd_has(r, "configurable") && pd_bool(r, "configurable");
+    int has_value = pd_has(r, "value");
+    tsv value = has_value ? pd_get(r, "value") : TS_UNDEFINED; ts_gc_root(&value);
+    int has_writable = pd_has(r, "writable"), w = has_writable && pd_bool(r, "writable");
+    int has_get = pd_has(r, "get");
+    tsv get = has_get ? pd_get(r, "get") : TS_UNDEFINED; ts_gc_root(&get);
+    int has_set = pd_has(r, "set");
+    tsv set = has_set ? pd_get(r, "set") : TS_UNDEFINED; ts_gc_root(&set);
+    if ((has_get && !ts_is_undef(get) && !ts_is_callable(get)) || (has_set && !ts_is_undef(set) && !ts_is_callable(set)))
+      ts_throw_type_error("Getter or setter must be a function");
+    if ((has_get || has_set) && (has_value || has_writable))
+      ts_throw_type_error("Invalid property descriptor. Cannot both specify accessors and a value or writable attribute");
+    out = has_get || has_set ? build_accessor_descriptor(get, set, e, c) : build_data_descriptor(value, w, e, c);
+    ts_gc_unroot(3);
+    ts_gc_root(&out);
+    if (ts_is_undef(tdesc) ? !extensible : !pd_compatible(out, tdesc))
+      ts_throw_type_error("'getOwnPropertyDescriptor' on proxy: trap returned a descriptor incompatible with the target's property");
+    if (!c && (ts_is_undef(tdesc) || pd_bool(tdesc, "configurable") || (has_writable && !w && pd_bool(tdesc, "writable"))))
+      ts_throw_type_error("'getOwnPropertyDescriptor' on proxy: trap reported non-configurability for a property that is not so on the target");
+    ts_gc_unroot(1);
+  }
+  ts_gc_unroot(7);
+  return out;
 }
 /* === defineProperty === */
 /* IsCompatiblePropertyDescriptor: `desc` applied over `cur`, both descriptor objects */
@@ -23296,6 +23452,8 @@ static int pd_compatible(tsv desc, tsv cur){
 }
 /* [[DefineOwnProperty]]: its answer */
 static int proxy_define_answer(tsv pv, tsv keyv, tsv desc){
+  /* ToPropertyKey: the trap gets "0" for `Object.defineProperty(p, 0, d)`, as the other traps do (it got the number) */
+  if (!ts_is_str(keyv) && !ts_is_symbol(keyv)) keyv = ts_property_key_value(keyv);
   ts_gc_root(&pv); ts_gc_root(&keyv); ts_gc_root(&desc);
   ts_proxy* px = ts_ptr(pv);
   tsv target = px->target, handler = px->handler;
@@ -23350,7 +23508,9 @@ static void ts_proxy_define_property(tsv pv, tsv keyv, tsv desc){
   if (!proxy_define_answer(pv, keyv, desc)) proxy_define_refused(keyv);
 }
 static int object_test_integrity(tsv v, int frozen){
-  if ((ts_obj_integrity((ts_object*)ts_ptr(v)) & 2u) == 0) return 0;     /* extensible */
+  /* extensible: a seal or a freeze also means non-extensible, and sets its own bit alone (a sealed object with no
+     property was not frozen, silent) */
+  if ((ts_obj_integrity((ts_object*)ts_ptr(v)) & (1u|2u|4u)) == 0) return 0;
   ts_gc_root(&v);
   tsv keys = ts_reflect_own_keys(v); ts_gc_root(&keys);
   uint32_t n = (uint32_t)ts_array_len(keys);
@@ -23509,6 +23669,26 @@ static tsv ts_proxy_own_keys_arr(tsv pv){
 /* Enumerate own ENUMERABLE STRING keys (Object.keys / JSON / for-in semantics):
    take the ownKeys-trap result, and for each string key whose own descriptor is
    enumerable, invoke the callback with its ts_key and current value. */
+/* EnumerableOwnProperties(proxy, key): ownKeys, then the descriptor of each string key. No value is read: a get trap
+   sees `Object.keys` and the first half of JSON.stringify ask for none. */
+static tsv ts_proxy_enumerable_keys(tsv pv){
+  ts_gc_root(&pv);
+  tsv keys = ts_proxy_own_keys_arr(pv);
+  ts_gc_root(&keys);
+  tsv out = ts_new_array(0);
+  ts_gc_root(&out);
+  uint32_t n = ts_is_indexed_array_fast(keys) ? ts_array_len(keys) : 0;
+  for (uint32_t i = 0; i < n; i++){
+    tsv kv = ts_array_get(keys, i);
+    if (!ts_is_str(kv)) continue;
+    ts_gc_root(&kv);
+    tsv desc = ts_proxy_get_own_desc(pv, kv);
+    if (ts_is_obj(desc) && pd_bool(desc, "enumerable")) ts_array_push_rooted(out, kv);
+    ts_gc_unroot(1);
+  }
+  ts_gc_unroot(3);
+  return out;
+}
 static void ts_proxy_enum(tsv pv, ts_prop_enum_cb cb, void* ud){
   ts_gc_root(&pv);
   tsv keys = ts_proxy_own_keys_arr(pv);
