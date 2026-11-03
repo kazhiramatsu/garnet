@@ -1,0 +1,62 @@
+[
+  {
+    "site": 0,
+    "kind": "object",
+    "synthetic": false,
+    "line": 6,
+    "col": 32,
+    "endLine": 6,
+    "endCol": 39,
+    "text": "new B()"
+  },
+  {
+    "site": 1,
+    "kind": "object",
+    "synthetic": false,
+    "line": 6,
+    "col": 61,
+    "endLine": 6,
+    "endCol": 68,
+    "text": "new C()"
+  },
+  {
+    "site": 2,
+    "kind": "object",
+    "synthetic": false,
+    "line": 6,
+    "col": 90,
+    "endLine": 6,
+    "endCol": 117,
+    "text": "{ y() { return \"plain\"; } }"
+  },
+  {
+    "site": 3,
+    "kind": "closure",
+    "synthetic": false,
+    "line": 6,
+    "col": 92,
+    "endLine": 6,
+    "endCol": 115,
+    "text": "y() { return \"plain\"; }"
+  },
+  {
+    "site": 4,
+    "kind": "object",
+    "synthetic": false,
+    "line": 8,
+    "col": 34,
+    "endLine": 8,
+    "endCol": 65,
+    "text": "{ override_me() { return 2; } }"
+  },
+  {
+    "site": 5,
+    "kind": "closure",
+    "synthetic": false,
+    "line": 8,
+    "col": 36,
+    "endLine": 8,
+    "endCol": 63,
+    "text": "override_me() { return 2; }"
+  }
+]

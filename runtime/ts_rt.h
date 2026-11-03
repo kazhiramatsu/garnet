@@ -792,6 +792,14 @@ static inline int ts_typed_slow(tsv v){
 static inline int ts_typed_outside(tsv v, uint32_t lo, uint32_t span){
   return !ts_is_obj(v) || (uint32_t)(((const ts_object*)ts_ptr(v))->cls - lo) >= span;
 }
+/* A borrowed method's `this` that is not an instance of the class its `this.m()` was resolved from
+   (docs/foreign_receivers_design.md, "Direct calls on a borrowed `this`"): a class without struct fields has plain
+   objects for instances, so its test is the prototype, then the chain (a subclass's instance). */
+int ts_this_outside_proto_slow(tsv v, tsv proto);
+static inline int ts_this_outside_proto(tsv v, tsv proto){
+  if (TS_RT_LIKELY(ts_is_obj(v) && ((const ts_object*)ts_ptr(v))->proto == proto)) return 0;
+  return ts_this_outside_proto_slow(v, proto);
+}
 /* A class method read as a value (not called): it may run with any `this`
    from here on (docs/closed_receivers_design.md, slice 2). In line: a site
    in a loop costs a load and a branch once the flag is up. */
