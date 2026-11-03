@@ -101,6 +101,10 @@ Rust in §315; selfhost is kept as a performance metric).
   the first pass could not prove was skipped, so the integer entry of a recursive function took the one outside call's
   constant for the parameter (`gcd(1071, 462)` was 147, Session 363). What is assumed of a recursive call holds only as
   far as something validates it: an integer, here, and no constant, range or sign.
+- **Every value with the object selector is read before its kind is known.** Generated guards take `cls` and `shape` at
+  their offsets from anything `ts_is_obj` admits, so a cell that does not begin with `ts_obj_common` keeps both words zero and
+  says so in a `_Static_assert` (`TS_CELL_ZERO_WORDS`). A BigInt's first limb stood there: `1n instanceof A` was true (Session 363).
+  What must leave such a cell out of an object test is `ts_is_prim_cell`; `ts_is_obj` alone says "selector", not "object".
 - **`ts_to_num` is a raw bit reinterpretation (not ToNumber).** `undefined`→NaN matches JS, but
   `null`→NaN does not.
 - **Gate a new feature behind a single predictable branch** (e.g. `if (g_has_proxies && ...)`) = zero
@@ -112,9 +116,13 @@ Rust in §315; selfhost is kept as a performance metric).
 ## Known remaining items (low priority, intentionally deferred)
 - Precision of int-specialized `+`/`-` loop variables in the rare case they straddle [2^53, 2^63]
   (V8 uses double rounding).
-- bigint (the whole numeric-type story; fundamentally unsupported), and Array.prototype monkey-patch
+- Array.prototype monkey-patch: a replaced method (`Array.prototype.push = f`) is not seen by a typed call
   (outside the model; replacing or deleting `Array.prototype[Symbol.iterator]` is honored: a program that
   names it walks every array through the protocol, Session 363).
+- A method called through `call` or `apply` on a value of another class, or on a plain object: a `this.m()` in
+  its body was resolved from the class's own hierarchy and may be inlined, so `D.prototype.d.call({ m() {} })`
+  runs the class's `m`, silently (Session 363, older than that session; field accesses are guarded, these
+  calls are not, `docs/foreign_receivers_design.md`).
 - A monomorphized numeric class field (`x: number`, unboxed double) reads as 0 before its first
   assignment (V8: undefined). Boxed fields and typed cells are initialized to undefined (Session 350).
 - Likewise a `number`-typed parameter that receives no argument (a call or `new` through an `any`
@@ -122,10 +130,8 @@ Rust in §315; selfhost is kept as a performance metric).
   representation for a missing number (Session 350 x32 note).
 - An `any` value that holds a non-number, assigned to a `number`-typed local, is unboxed in
   typed mode (V8 keeps the value; garnet reads NaN): typed mode trusts the annotation (Session 350
-  x53 note). A `number` property of an object type reached by a cast from `any` is trusted as well
-  (`(JSON.parse(s) as Config).port` over a string or a missing key, next on the list). An explicit
-  `x as number` with nothing behind it is `any` used in place and a TypeError flowing into a number
-  slot (`docs/cast_to_number_design.md`).
+  x53 note). An explicit `x as number` with nothing behind it, and a number field out of JSON, are `any`
+  used in place and a TypeError flowing into a number slot (`docs/cast_to_number_design.md`).
 - A property read through an index signature (`d.zz` with `d: Record<string, number>`, the key absent)
   is typed `number` by the annotation and read unboxed in typed mode: garnet reads NaN and `typeof`
   says "number" where V8 gives undefined. The keyed form (`d[k]`, `d["zz"]`) keeps the value
@@ -139,10 +145,6 @@ Rust in §315; selfhost is kept as a performance metric).
   `docs/int32_fields_design.md` "Store-proven fields"); a dynamic store of a fraction into it
   (`(n as any).pos = 2.5`) throws a TypeError naming the field (V8 stores the fraction).
   `TSAOT_INT_STORE_FIELDS=0` turns it off.
-- The `arguments` object as a value is an Array of the actual arguments (`apply(this, arguments)`,
-  `arguments[i]`, `Array.from(arguments)` and `arguments.length` agree with V8; strict code never
-  maps it). `Array.isArray(arguments)` is true and it has the Array methods, where V8's Arguments
-  object has `Object.prototype` (Session 354 vue note).
 - An ordinary (non-const) enum's member with a constant value is read as that constant at every
   `E.A` / `E["A"]` site (Session 355), as TypeScript inlines const enum members: a write to the enum
   object through `any` (`(E as any).A = 5`) is not seen by those reads, and a read before the enum's
@@ -150,9 +152,8 @@ Rust in §315; selfhost is kept as a performance metric).
   is intact for `Object.keys(E)`, `E[0]` and a variable key. `TSAOT_ENUM_FOLD=0` keeps the loads.
 - A private name (`docs/private_names_design.md`) is one per class declaration, not per evaluation: an
   instance of one evaluation of a class in a function passes the checks of another. An element read
-  before its initializer ran answers undefined (V8: a TypeError), a frozen object's private field cannot
-  be written, a second initialization of a name on one object (through a base's return override) is not
-  detected.
+  before its initializer ran answers undefined (V8: a TypeError), and a frozen object's private field
+  cannot be written.
 - `Request.signal` is the init's signal itself (Node: a fresh signal following it), and
   `ArrayBuffer.isView` does not recognize the library's `DataView` (docs/web_fetch_api_design.md).
 - Web Crypto (`docs/web_crypto_design.md`) provides digests and HMAC keys only: an RSA, ECDSA or AES key
@@ -170,7 +171,7 @@ Rust in §315; selfhost is kept as a performance metric).
 - A dynamic `import()` of a module the program does not have rejects at run time with an Error (hono's
   `cloudflare:workers` probe, any specifier known at run time only); of a bundled module it is evaluated
   when asked (`docs/dynamic_import_design.md`). `new X()` of a constructor the environment declares but the runtime lacks
-  (ReadableStream, CustomEvent, WebSocket) is a ReferenceError where it is reached (Node without the
+  (CustomEvent, WebSocket) is a ReferenceError where it is reached (Node without the
   global throws there too); `console.trace` as a value is the error writer (no stack).
 - `Promise.prototype.finally` called on a thenable that is not a promise is a garnet TypeError (V8
   builds its thenFinally / catchFinally for any receiver); then and catch on other receivers follow V8
@@ -184,11 +185,8 @@ Rust in §315; selfhost is kept as a performance metric).
   Session 362).
 - A class extending an expression, a built-in other than the Error kinds or a value, and a class whose
   methods or static initializers capture a function's locals, is a value made at run time
-  (`docs/dynamic_classes_design.md`): nothing types its instances, they are read by key. A `String` base has
-  no wrapper behind it (a TypeError at the definition); `super()` inside an arrow function is a compile-time
-  reject there. A promise subclass's `then` gives a plain promise.
-- A `let` or `const` read through a closure before its declaration ran reads undefined (V8: a
-  ReferenceError); a read or a write in the same function, a parameter default among them, throws.
+  (`docs/dynamic_classes_design.md`): nothing types its instances, they are read by key. `super()` inside an
+  arrow function is a compile-time reject there.
 - `Function.prototype.toString` answers `function name() { [native code] }` for every function (a compiled
   program keeps no source text): a library that reads a function's source sees no body. `err.stack` is the
   header and one `at <anonymous>` line, made when read. A WeakRef holds its target strongly and a
@@ -205,8 +203,6 @@ Rust in §315; selfhost is kept as a performance metric).
 - A class whose constructor returns a value is a dynamic class, its subclasses too (`return new Proxy(this, h)`); a private element on a Proxy `this` is a TypeError at its read.
 - A `for..in` over a Proxy does not skip a key deleted during the walk (its keys and descriptors are read at the start, V8 reads each
   descriptor at the visit). `Array.prototype.join.call(arrayLike)` through the array library has no cycle stack (a plain array has, Session 363).
-- `o.__proto__` and `o["__proto__"]` read undefined (V8: the prototype through the accessor);
-  `Object.getPrototypeOf` / `setPrototypeOf` are the modelled forms (Session 355 note).
 - A typed receiver that is a Proxy (vue's reactive arrays and collections) takes its methods through
   the traps, but a typed `for..of` over one, and a cursor `for..of` over a Proxy of a Map or Set,
   walk a snapshot taken through the iteration protocol at loop entry (elements added during the

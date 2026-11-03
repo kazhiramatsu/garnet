@@ -19,7 +19,8 @@ most of them in tests about something else, and of 150 TypedArray cases 61 stop 
 
 ## The value
 
-A heap cell, kind `TS_KIND_BIGINT`, under the object selector as a Symbol is: sign, length, 64-bit limbs in place,
+A heap cell, kind `TS_KIND_BIGINT`, under the object selector as a Symbol is: sign, length, the `cls` and `shape` words of
+every object cell (zero, generated code reads them before it knows the kind), 64-bit limbs in place,
 immutable. (`unsigned __int128` gives the full product of two limbs on both targets.) `ts_is_bigint`. The tests that mean "an object, not a Symbol" (`ts_object_like(v) && !ts_is_symbol(v)`) become
 `ts_is_object_value`, one definition for both primitive cells. A leaf for the collector.
 

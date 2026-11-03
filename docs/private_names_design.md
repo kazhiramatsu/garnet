@@ -40,8 +40,17 @@ set first thing in `emitFieldInitializers`: a method has no slot whose presence 
 `private.check:<key>` (`ts_private_check`) is own-only: the chain has no part in it and a Proxy is not asked
 (`Object.create(new A()).#x` and `new Proxy(new A(), {}).#x` throw). A check is skipped when the receiver is
 proven (`privateReceiverProven`): a receiver typed as the class or a subclass, trusted as every typed access is,
-or `this` in a program with no foreign receivers at all (`closedReceivers`). A program with foreign receivers
-pays the call on `this.#x`; a typed program without them pays nothing, its reads and writes are the struct's.
+or `this` in a program with no foreign receivers at all (`closedReceivers`); a typed program without them pays
+nothing, its reads and writes are the struct's.
+
+Any other check of an instance element is `private.check:<key>:<class>`, tested in line (`private_check_expr`): the
+receiver is an object and its class index is in the declaring class's interval. That is the runtime's own answer: on a sized
+instance `ts_has_own` asks whether the class's layout has the slot (`class_field_lookup`), and every class of the interval has it.
+Everything else takes the call, a relinked instance among them (out of the interval, its fields are its own). The call
+on every `this.#x` of a program with foreign receivers cost hono 14% of its instructions and PatternRouter 23% of its time, a
+name lookup per read (Session 363). The test reads `cls` from whatever the check is given, so it rests on every cell with the
+object selector answering that word: a BigInt had to stop keeping a limb there (`types/bigint_cell_words`,
+`classes/private_check_receivers`).
 
 The load and the store after the check are the ordinary `LoadField` and `StoreField`, not a runtime call of their
 own: every field analysis (the store-proven integer slots, the frozen tests) keeps seeing every store.
