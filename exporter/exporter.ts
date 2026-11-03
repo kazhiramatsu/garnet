@@ -12189,7 +12189,7 @@ class Exporter {
     }
     if (typeof value === "number") {
       const dst = this.newLocal(ctx, "primitive");
-      ctx.body.push({ kind: "Const", dst, value: { kind: "Num", value: this.numWire(value) } });
+      ctx.body.push({ kind: "Const", dst, value: this.numConst(value) });   // `1e400` and `-0` are JSON numbers
       return dst;
     }
     if (typeof value === "boolean") {
@@ -15275,7 +15275,9 @@ class Exporter {
   /** The private name's element must be `recv`'s own: a field's slot, a static member, the class's brand. */
   private checkPrivate(ctx: FnCtx, recvExpr: ts.Expression, recv: number, m: PrivateMember, text: string): void {
     if (this.privateReceiverProven(recvExpr, m)) return;
-    ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: `private.check:${this.internField(m.brand ?? text)}`, args: [recv] });
+    // an instance element names its class: the emitter tests the class index in line (a dynamic class has none, a static's holder is no instance)
+    const cls = m.isStatic || m.classId < 0 ? "" : `:${m.classId}`;
+    ctx.body.push({ kind: "CallBuiltinStatic", dst: this.newLocal(ctx, "reference"), builtin: `private.check:${this.internField(m.brand ?? text)}${cls}`, args: [recv] });
   }
   private lowerPrivateRead(ctx: FnCtx, access: ts.PropertyAccessExpression, recv: number): number {
     const text = access.name.text;

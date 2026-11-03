@@ -11728,6 +11728,25 @@ fn hint_guard(c: u32, field: u32, classes: &BTreeMap<u32, &ClassDef>) -> Option<
     Some(HintGuard::Leaf(d))
 }
 
+/// A private name's check (`<key>` or `<key>:<class>`, docs/private_names_design.md). The runtime's answer on a sized
+/// instance is whether the class's layout has the slot, which is what a class index in the declaring class's interval
+/// says, so that test is the whole check; anything else, a relinked instance among them, asks the runtime.
+fn private_check_expr(obj: &str, spec: &str) -> String {
+    let (key, class) = spec.split_once(':').unwrap_or((spec, ""));
+    let call = format!("ts_private_check({}, {}u)", obj, key);
+    let interval = class.parse::<u32>().ok().filter(|_| class_index_enabled()).and_then(|c| {
+        let dfs = class_dfs();
+        Some((*dfs.index.get(&c)? + 1, *dfs.span.get(&c)?))
+    });
+    match interval {
+        Some((lo, span)) => format!(
+            "(TS_RT_LIKELY(ts_is_obj({o}) && (uint32_t)(((ts_object*)ts_ptr({o}))->cls - {lo}u) < {span}u) ? TS_UNDEFINED : ({call}, TS_UNDEFINED))",
+            o = obj
+        ),
+        None => format!("({}, TS_UNDEFINED)", call),
+    }
+}
+
 /// `c`: the class whose struct offset the access uses.
 fn receiver_guard(obj: &str, hint: &Option<HintGuard>, c: u32) -> String {
     match hint {
@@ -14790,7 +14809,7 @@ fn fnval_adapter_body(builtin: &str) -> Option<String> {
         "json.parse" => hv(format!("ts_json_parse({})", val(0))),
         // ---- Object ----
         "object.assign" => Some("return ts_object_assign(a, n);".to_string()),
-        "object.create" => Some(format!("tsv _r = ts_object_create({}); if (n > 1 && a[1] != TS_UNDEFINED) ts_define_properties(_r, a[1]); return _r;", val(0))),
+        "object.create" => Some(format!("tsv _r = ts_object_create_value({}); if (n > 1 && a[1] != TS_UNDEFINED) ts_define_properties(_r, a[1]); return _r;", val(0))),
         "object.defineProperty" => Some(format!("ts_define_property({}, {}, {}); return {};", val(0), val(1), val(2), val(0))),
         "object.defineProperties" => Some(format!("ts_define_properties({}, {}); return {};", val(0), val(1), val(0))),
         "reflect.get" => hv(format!("(n > 2 ? ts_reflect_get_recv({}, {}, a[2]) : ts_reflect_get({}, {}))", val(0), val(1), val(0), val(1))),
@@ -24314,7 +24333,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 }
                 "object.freeze" => (format!("ts_object_freeze({})", v(0)), false),
                 "object.isFrozen" => (format!("ts_object_is_frozen({})", v(0)), false),
-                "object.create" => (format!("ts_object_create({})", v(0)), false),
+                "object.create" => (format!("ts_object_create_value({})", v(0)), false),
                 "object.seal" => (format!("ts_object_seal({})", v(0)), false),
                 "object.preventExtensions" => {
                     (format!("ts_object_prevent_extensions({})", v(0)), false)
@@ -24427,9 +24446,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 _ if builtin.starts_with("newtarget.take:") => (format!("ts_take_new_target((ts_code)FN_TABLE[{}])", &builtin["newtarget.take:".len()..]), false),
                 _ if builtin.starts_with("import.meta:") => (format!("ts_import_meta({}u, {})", &builtin["import.meta:".len()..], v(0)), false),
                 "function.keyName" => (format!("ts_fn_key_name({})", v(0)), false),
-                _ if builtin.starts_with("private.check:") => {
-                    (format!("(ts_private_check({}, {}u), TS_UNDEFINED)", v(0), &builtin["private.check:".len()..]), false)
-                }
+                _ if builtin.starts_with("private.check:") => (private_check_expr(&v(0), &builtin["private.check:".len()..]), false),
                 _ if builtin.starts_with("private.add:") => {
                     let rest = &builtin["private.add:".len()..];
                     let (key, class) = rest.split_once(':').unwrap_or((rest, ""));

@@ -1403,7 +1403,10 @@ static inline int ts_array_is_array(tsv v){
 /* A BigInt value (docs/bigint_design.md): OBJECT-tagged as a Symbol is, immutable. `0n` is false, so a
    truthiness test looks at an object's kind in a program that can make one (TS_PROGRAM_BIGINT, set by the
    emitter); any other pays nothing. */
-typedef struct ts_bigint { ts_gc_header h; uint32_t len, neg; uint64_t limb[]; } ts_bigint;
+/* `cls` and `shape`: never written, zero as gc_alloc leaves them (ts_obj_common: generated code reads the two words before
+   it knows the cell's kind). The first limb stood there, so `1n instanceof A` was true. */
+typedef struct ts_bigint { ts_gc_header h; uint32_t len, neg; uint32_t cls, shape; uint64_t limb[]; } ts_bigint;
+_Static_assert(TS_CELL_ZERO_WORDS(ts_bigint), "a BigInt answers the class and shape words with zero");
 static inline int ts_is_bigint(tsv v){ return ts_is_obj(v) && ((ts_gc_header*)ts_ptr(v))->kind == TS_KIND_BIGINT; }
 /* a primitive in a cell: what the tests for an object must leave out */
 static inline int ts_is_prim_cell(tsv v){
@@ -2288,6 +2291,7 @@ void ts_register_class_names(const char* const* tab, uint32_t n);
 tsv ts_publish(tsv v);
 int ts_is_published(tsv v);
 tsv ts_object_create(tsv proto);
+tsv ts_object_create_value(tsv proto);
 tsv ts_object_seal(tsv v);
 tsv ts_object_prevent_extensions(tsv v);
 tsv ts_object_is_sealed(tsv v);

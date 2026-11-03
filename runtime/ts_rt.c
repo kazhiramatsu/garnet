@@ -2223,15 +2223,20 @@ tsv ts_object_get_prototype_of(tsv v){
 }
 /* What can take a key from an object while a for..in walks it (ts_for_in_live). */
 static uint32_t g_for_in_changes;
+/* What a program may name as a prototype: an object or null. */
+static void object_proto_require(tsv p){
+  if (TS_RT_LIKELY(p == TS_NULL) || TS_RT_LIKELY((ts_is_obj(p) || ts_is_func(p)) && !ts_is_prim_cell(p))) return;
+  /* a Symbol's ToString throws its own TypeError, not this one's: the description is what the text wants */
+  tsv shown = ts_is_prim_cell(p) && !ts_is_bigint(p) ? ts_symbol_description(p) : ts_to_string_v(p);
+  uint32_t len = 0; char* text = ts_string_utf8_copy(ts_is_str(shown) ? shown : ts_to_string_v(TS_UNDEFINED), &len);
+  char msg[160];
+  snprintf(msg, sizeof msg, "Object prototype may only be an Object or null: %.*s", (int)(len > 100 ? 100 : len), text);
+  free(text);
+  ts_throw_type_error_msg(msg);
+}
 tsv ts_object_set_prototype_of(tsv v, tsv p){
   if (v == TS_UNDEFINED || v == TS_NULL) ts_throw_type_error_msg("Object.setPrototypeOf called on null or undefined");
-  if (((!ts_is_obj(p) && !ts_is_func(p)) || ts_is_prim_cell(p)) && p != TS_NULL){
-    uint32_t len = 0; char* text = ts_string_utf8_copy(ts_to_string_v(p), &len);
-    char msg[160];
-    snprintf(msg, sizeof msg, "Object prototype may only be an Object or null: %.*s", (int)(len > 100 ? 100 : len), text);
-    free(text);
-    ts_throw_type_error_msg(msg);
-  }
+  object_proto_require(p);
   if ((!ts_is_obj(v) && !ts_is_func(v)) || ts_is_prim_cell(v)) return v;
   return ts_set_proto_user(v, p);
 }
@@ -2439,14 +2444,8 @@ __attribute__((noinline)) static tsv ts_call_medium_env(ts_func* f, ts_code code
   return code(merged, (int)f->envlen + nargs);
 }
 #endif
-static tsv call_with_code(ts_func* f, ts_code code, tsv* args, int nargs);
-tsv ts_call(tsv fn, tsv* args, int nargs){
-  if (g_has_proxies && ts_is_proxy(fn)) return ts_proxy_apply(fn, TS_UNDEFINED, args, nargs);
-  if (!ts_is_func(fn)) ts_throw_not_a_function(NULL);
-  ts_func* f = ts_ptr(fn);
-  return call_with_code(f, (ts_code)f->code, args, nargs);
-}
-static tsv call_with_code(ts_func* f, ts_code code, tsv* args, int nargs){
+/* In line in both callers: ts_call is every indirect call of the program. */
+__attribute__((always_inline)) static inline tsv call_with_code(ts_func* f, ts_code code, tsv* args, int nargs){
   if (f->envlen){
     /* Environment ABI: the callee reads its cells from the register. */
     if (f->env_abi){ g_ts_cur_env = f->env; return code(args, nargs); }
@@ -2470,6 +2469,12 @@ static tsv call_with_code(ts_func* f, ts_code code, tsv* args, int nargs){
     return r;
   }
   return code(args, nargs);
+}
+tsv ts_call(tsv fn, tsv* args, int nargs){
+  if (g_has_proxies && ts_is_proxy(fn)) return ts_proxy_apply(fn, TS_UNDEFINED, args, nargs);
+  if (!ts_is_func(fn)) ts_throw_not_a_function(NULL);
+  ts_func* f = ts_ptr(fn);
+  return call_with_code(f, (ts_code)f->code, args, nargs);
 }
 /* Call a first-class function VALUE (the `g(...)` / callback path, where the
    caller supplied no `this`). If the callee was declared to read args[0] as
@@ -3981,6 +3986,8 @@ tsv ts_object_create(tsv proto){
   } else ((ts_object*)ts_ptr(o))->proto = TS_NULL;   /* Object.create(null) */
   return o;
 }
+/* Object.create as a program calls it: anything but an object or null is a TypeError (it made an object with no prototype). */
+tsv ts_object_create_value(tsv proto){ object_proto_require(proto); return ts_object_create(proto); }
 /* bit0=frozen, bit1=non-extensible, bit2=sealed. seal/freeze imply
    non-extensible; freeze implies sealed. See ts_set / ts_delete_prop guards. */
 tsv ts_object_seal(tsv v){ if (g_has_proxies && ts_is_proxy(v)) return proxy_set_integrity(v, 0); if (ts_is_propbag(v)){ ta_integrity_check(v, 0); ts_obj_add_integrity((ts_object*)ts_ptr(v), 4u); } return v; }
@@ -8866,10 +8873,15 @@ static int array_species_custom(tsv arr){
   tsv lib = species_lib();
   if (lib == TS_UNDEFINED) return 0;
   if (TS_RT_UNLIKELY(g_proto_elements)) return 1;   /* a callback can make a hole */
+  /* every `map`, `slice`, `filter` of a program that can tell asks: no name is interned here, and the library's
+     Array is one value for the run (the library object holds it, cells do not move) */
+  static ts_key constructor_key;
+  static tsv library_array = TS_UNDEFINED;
+  if (!constructor_key){ constructor_key = ts_intern_field("constructor", 11); library_array = ts_get(lib, ts_intern_field("Array", 5)); }
   ts_gc_root(&arr);
-  tsv c = ts_get(arr, ts_intern_field("constructor", 11));
+  tsv c = ts_get(arr, constructor_key);
   ts_gc_unroot(1);
-  return c != ts_get(lib, ts_intern_field("Array", 5));
+  return c != library_array;
 }
 static tsv array_species_call(tsv arr, const char* name, const tsv* args, int n){
   tsv fn = ts_get(species_lib(), ts_intern_field(name, (uint32_t)strlen(name)));
@@ -10534,7 +10546,7 @@ static int weak_key_valid(tsv key){
   ts_gc_header* h = (ts_gc_header*)ts_ptr(key);
   if (!h) return 0;
   if (h->kind == TS_KIND_SYMBOL) return !((ts_symbol*)h)->registered;
-  return h->kind != TS_KIND_ACCESSOR;
+  return h->kind != TS_KIND_ACCESSOR && h->kind != TS_KIND_BIGINT;
 }
 static void weak_key_require(tsv key, const char* collection){
   if (weak_key_valid(key)) return;
@@ -15642,6 +15654,7 @@ static tsv jp_number(jparse* p){
     p->ok = 0;
     return TS_UNDEFINED;
   }
+  const char first = p->s[p->i];
   uint64_t v = 0;
   int nd = 0;
   while (p->i < p->n && p->s[p->i] >= '0' && p->s[p->i] <= '9') {
@@ -15649,12 +15662,32 @@ static tsv jp_number(jparse* p){
     nd++;
     p->i++;
   }
-  if (p->i < p->n && (p->s[p->i] == '.' || p->s[p->i] == 'e' || p->s[p->i] == 'E' || nd >= 16)) {
-    p->i = start;
-    char* end = NULL;
-    double d = strtod(p->s + p->i, &end);
-    if (end == p->s + p->i) { p->ok = 0; return TS_UNDEFINED; }
-    p->i += (size_t)(end - (p->s + p->i));
+  if (first == '0' && nd > 1) { p->ok = 0; return TS_UNDEFINED; }   /* JSON's integer has no leading zero */
+  /* The grammar, then strtod for the value: it takes `1.`, `.5`, hex and `inf`, which JSON does not. Sixteen digits or
+     more do not fit `v` wherever they end, the last byte of the text among the places. */
+  size_t i = p->i;
+  if (i < p->n && p->s[i] == '.') {
+    size_t digits = ++i;
+    while (i < p->n && p->s[i] >= '0' && p->s[i] <= '9') i++;
+    if (i == digits) { p->ok = 0; return TS_UNDEFINED; }
+  }
+  if (i < p->n && (p->s[i] == 'e' || p->s[i] == 'E')) {
+    i++;
+    if (i < p->n && (p->s[i] == '+' || p->s[i] == '-')) i++;
+    size_t digits = i;
+    while (i < p->n && p->s[i] >= '0' && p->s[i] <= '9') i++;
+    if (i == digits) { p->ok = 0; return TS_UNDEFINED; }
+  }
+  if (i != p->i || nd >= 16) {
+    /* the token alone: a string's bytes go on past its end when it is a slice of a longer one */
+    size_t len = i - start;
+    char small[64];
+    char* z = len < sizeof small ? small : (char*)malloc(len + 1);
+    memcpy(z, p->s + start, len);
+    z[len] = 0;
+    double d = strtod(z, NULL);
+    if (z != small) free(z);
+    p->i = i;
     return ts_num(d);
   }
   if (neg && v == 0) return ts_num(-0.0);
@@ -17516,7 +17549,7 @@ int ts_has_own(tsv obj, ts_key key){
     if (sc && find_slot(sc, key, 0) != NULL) return 1;
     return find_slot((ts_object*)ts_ptr(obj), key, 0) != NULL;
   }
-  if (!ts_is_obj(obj)) return 0;
+  if (!ts_is_obj(obj) || ts_is_prim_cell(obj)) return 0;   /* a Symbol's or a BigInt's cell has no map to look in */
   if (ts_is_typed_array(obj)){
     uint32_t idx;
     if (ta_numeric_key(key, &idx)) return idx < ((ts_typedarray*)ts_ptr(obj))->length;
@@ -27136,8 +27169,11 @@ double ts_length_slow(tsv v){
   if (ts_is_indexed_array_fast(v)) return (double)((ts_array*)ts_ptr(v))->len;
   if (ts_is_typed_array(v)) return (double)((ts_typedarray*)ts_ptr(v))->length;
   if (ts_is_func(v)) return (double)((ts_func*)ts_ptr(v))->arity; /* fn.length */
-  if (g_has_proxies && ts_is_proxy(v)) return ts_to_num(ts_get(v, ts_intern_field("length", 6))); /* honor get trap */
-  return 0;
+  /* the rest: a Proxy's trap, a String object (`class S extends String` is typed as a string), an object behind a union
+     that says string or array, null and undefined (a TypeError: this answered 0 for all of them) */
+  static ts_key key;
+  if (!key) key = ts_intern_field("length", 6);
+  return ts_to_num(ts_get_checked(v, key));
 }
 
 /* ---------------- generators (function* / yield) ---------------- */
