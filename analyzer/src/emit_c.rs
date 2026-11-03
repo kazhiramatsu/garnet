@@ -391,6 +391,7 @@ fn emit_program_with_string_plans(
     let classes: BTreeMap<u32, &ClassDef> = program.classes.iter().map(|c| (c.id.0, c)).collect();
     set_class_dfs(&program.classes);
     set_closed_receivers(program.closed_receivers.closed);
+    set_borrow_clones(program);
     set_method_classes(program);
 
     // Classes whose instances flow into a dynamic enumeration builtin
@@ -5439,10 +5440,11 @@ fn param_kind(id: u32, int_local: &BTreeSet<u32>, unboxed: &BTreeSet<u32>) -> Pa
 /// The generic `(args, nargs)` entry of a function with a direct entry: read
 /// the environment register and the argument array once and forward. A
 /// missing argument keeps the value the generic prologue left in place.
-fn emit_direct_forwarder(s: &mut String, f: &Function, sig: &DirectSig, ncap: usize) {
+fn emit_direct_forwarder(s: &mut String, f: &Function, sig: &DirectSig, ncap: usize, classes: &BTreeMap<u32, &ClassDef>) {
     let _ = writeln!(s, "static tsv {}(tsv* args, int nargs){{", cname(f));
     s.push_str(&src_comment(f));
     s.push_str("  (void)args; (void)nargs;\n");
+    s.push_str(&borrow_prologue(f, classes));
     if ncap > 0 {
         s.push_str("  tsv* _env = g_ts_cur_env;\n");
     }
@@ -10397,6 +10399,7 @@ fn emit_function(
         let _ = writeln!(s, "static tsv {}(tsv* args, int nargs){{", cname(f));
         s.push_str(&src_comment(f));
         s.push_str("  (void)nargs;\n");
+        s.push_str(&borrow_prologue(f, classes));
         s.push_str(&method_this_check(f, &format!("(nargs > {c} ? args[{c}] : TS_UNDEFINED)", c = f.capture_count)));
     }
     let int32_use_decl = if int32_codegen_enabled() {
@@ -10650,7 +10653,7 @@ fn emit_function(
         }
     );
     if let Some(sig) = dsig {
-        emit_direct_forwarder(s, f, sig, ncap);
+        emit_direct_forwarder(s, f, sig, ncap, classes);
     }
 }
 
@@ -11726,6 +11729,55 @@ fn hint_guard(c: u32, field: u32, classes: &BTreeMap<u32, &ClassDef>) -> Option<
         return None;
     }
     Some(HintGuard::Leaf(d))
+}
+
+thread_local! {
+    /// A method whose `this.m()` calls devirt.rs resolved statically: its clone's C name and the class (devirt::borrow_clones).
+    static BORROW_CLONE: std::cell::RefCell<BTreeMap<u32, (String, u32)>> = std::cell::RefCell::new(BTreeMap::new());
+}
+
+fn set_borrow_clones(program: &Program) {
+    let mut m = BTreeMap::new();
+    for (func, clone, class) in crate::devirt::borrow_clones() {
+        if let Some(g) = program.functions.get(clone as usize) {
+            m.insert(func, (cname(g), class));
+        }
+    }
+    BORROW_CLONE.with(|x| *x.borrow_mut() = m);
+}
+
+/// The generic entry's test of a borrowed method's `this` (devirt.rs `clone_borrowable_methods`): a foreign one runs the
+/// clone, whose calls on `this` dispatch by name. Asked only once something has read a method as a value or borrowed one
+/// (`g_typed_slow`, either bit): before that no foreign `this` exists. The method's typed entries are reached by direct
+/// calls alone, whose receivers are trusted as every typed access's are.
+fn borrow_prologue(f: &Function, classes: &BTreeMap<u32, &ClassDef>) -> String {
+    let Some((clone, class)) = BORROW_CLONE.with(|m| m.borrow().get(&f.id.0).cloned()) else {
+        return String::new();
+    };
+    let this = format!("(nargs > {c} ? args[{c}] : TS_UNDEFINED)", c = f.capture_count);
+    // (the foreign `this` raises ANY first: the clone's typed accesses on `this` test their receiver from then on, as the
+    // method's own entry test would have made them)
+    format!("  if (TS_RT_UNLIKELY(g_typed_slow != 0) && {}){{ ts_foreign_this_seen(); return {}(args, nargs); }}\n", foreign_this_test(&this, class, classes), clone)
+}
+
+/// Is `obj` not an instance of class `c`? A class with struct fields somewhere up its chain has sized instances, the
+/// interval; one without has plain objects, the prototype (then the chain, a subclass's instance).
+fn foreign_this_test(obj: &str, c: u32, classes: &BTreeMap<u32, &ClassDef>) -> String {
+    let mut sized = false;
+    let mut cur = Some(c);
+    while let Some(id) = cur {
+        let Some(cd) = classes.get(&id) else { break };
+        if !cd.own_fields.is_empty() {
+            sized = true;
+            break;
+        }
+        cur = cd.parent.map(|p| p.0);
+    }
+    let dfs = class_dfs();
+    match (sized && class_index_enabled(), dfs.index.get(&c), dfs.span.get(&c)) {
+        (true, Some(&i), Some(&span)) => format!("ts_typed_outside({}, {}u, {}u)", obj, i + 1, span),
+        _ => format!("ts_this_outside_proto({}, CLASS_PROTO[{}])", obj, c),
+    }
 }
 
 /// A private name's check (`<key>` or `<key>:<class>`, docs/private_names_design.md). The runtime's answer on a sized

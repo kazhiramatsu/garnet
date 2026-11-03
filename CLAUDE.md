@@ -125,10 +125,11 @@ Rust in §315; selfhost is kept as a performance metric).
   function's `length` redefined moves to the end of its keys; `delete arguments.length` is a ReferenceError
   (V8: true). V8 itself answers `Object.isFrozen` true for a non-extensible empty array and a sealed function,
   whose `length` and `prototype` stay writable; garnet answers false, as the specification does (Session 364).
-- A method called through `call` or `apply` on a value of another class, or on a plain object: a `this.m()` in
-  its body was resolved from the class's own hierarchy and may be inlined, so `D.prototype.d.call({ m() {} })`
-  runs the class's `m`, silently (Session 363, older than that session; field accesses are guarded, these
-  calls are not, `docs/foreign_receivers_design.md`).
+- A method borrowed with a `this` of another class (`D.prototype.d.call(x)`) takes a clone whose `this.m()` calls
+  dispatch by name (Session 364, `docs/foreign_receivers_design.md`), except an async or generator method and an
+  arrow function inside the method (its `this` is a capture). An own method assigned through an `any` value
+  (`const d: any = new D(); d.y = f`) is not seen by `this.y()` in D's methods: writes through `any` are trusted,
+  where a write through a value typed as D makes the class dynamic.
 - A monomorphized numeric class field (`x: number`, unboxed double) reads as 0 before its first
   assignment (V8: undefined). Boxed fields and typed cells are initialized to undefined (Session 350).
 - Likewise a `number`-typed parameter that receives no argument (a call or `new` through an `any`

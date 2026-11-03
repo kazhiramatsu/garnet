@@ -118,32 +118,33 @@ classes (worker data cast from `any`, two structurally swapped completion
 classes), the TypeScript 6.0.3 compiler two (casts from interface types),
 the self-hosted analyzer none.
 
-## Direct calls on a borrowed `this` (Session 364, planned)
+## Direct calls on a borrowed `this` (Session 364)
 
 `D.prototype.d.call({ m() { return 1; } })`, where `d` is `return this.m()`: the call in `d` was resolved from D's
 hierarchy (`devirt.rs`, one implementation in the subtree: `Direct`) and inlined, so the borrowed method ran D's `m`
-whatever `this` was, a plain object's own `m` and a sibling class's override alike (silent; older than Session 363,
-CLAUDE.md's known items). Field accesses are guarded since slice 2 of docs/closed_receivers_design.md; calls are not.
+whatever `this` was, a plain object's own `m` and a sibling class's override alike (silent; older than Session 363).
+Field accesses are guarded since slice 2 of docs/closed_receivers_design.md; calls were not.
 
-The rules a fix has to keep: a closed program pays nothing (it has no foreign `this`); an open one pays one predictable
-branch per call while no foreign `this` has arrived (the ANY bit down), which is every run of vue, hono and hono_app but
-for vue's Proxies, whose ANY is up from the start and whose calls would take the interval test, a load and a compare.
+**First cut, dropped: a guard at each call.** `if (foreign(this)) by-name call else direct call` cost the open programs
+nothing measurable (vue +0.26% instructions, hono and hono_app 0.0%), but a kernel of `this.inc()` in a loop went from 0 ms
+to 800 ms: clang had folded the loop whole, and an opaque call in it stops that. A guard inside the body cannot be free.
 
-Plan:
+**As built: a clone, and a test at the generic entry.** In an open program, `devirt.rs` (`clone_borrowable_methods`, before
+any inlining) clones each method that has a call on its own `this` the table resolves to one function; in the clone those
+calls take `recv_stable: false`, so they dispatch by name. The method itself is not touched. The emitter gives the method's
+generic entry, `fn_N(tsv* args, int nargs)`, the only entry a borrow can reach (`call`, `apply`, `bind`, a method value, a
+graft, `Reflect.apply`), one test: `if (TS_RT_UNLIKELY(g_typed_slow != 0) && <this is not an instance of the class>) return
+clone(args, nargs);`. `g_typed_slow` is zero until something reads a method as a value or borrows one. The test of a class
+with struct fields up its chain is the class interval (`ts_typed_outside`); one without has plain objects for instances,
+so the prototype, then the chain (`ts_this_outside_proto`). The typed entries are reached by direct calls alone, whose
+receivers are trusted as every typed access's are.
 
-- `devirt.rs`, in an open program: a call whose receiver is the function's own `this` and whose dispatch is `Direct` becomes
-  `t = class.foreignThis:<class>(this); if (t) { the call by name, as Dynamic } else { the direct call }`. The site's
-  inlining (`sroa.rs`) still sees the direct call in the else branch. `SiteDispatch` has no consumer past the pass, so
-  the shift of the instruction indices is free.
-- `class.foreignThis:<c>`: `(g_typed_slow & TS_TYPED_SLOW_ANY) && ts_typed_outside(this, lo, span)`, the test field
-  accesses already make, with c's interval, for a class with struct fields. A class without any (D above, and every
-  class of the reported case) has plain objects for instances, `cls` 0: the interval would send each of them to the
-  dynamic call. Its test is the prototype: `proto == CLASS_PROTO[c]`, else the chain (`ts_instanceof`), a subclass's
-  instance being the rare case.
-- A method that has such a call gets the entry test of slice 2 even when its class has no struct field (`METHOD_CLASS`
-  holds only those today), so the first foreign `this` that enters raises ANY.
-- Receivers other than `this` stay trusted, as typed accesses through them are (a value typed as a class that is none is
-  a type lie).
+Measured (against main, alternating, outputs identical): the kernel 0 ms either way, the same instructions; hono +0.01%
+instructions, hono_app +0.08%, vue +0.00% (no method of its qualifies; hono has 31, hono_app 30). Fixtures
+`classes/borrowed_this_stable_classes` (the clone path, a class with fields and one without) and
+`classes/borrowed_this_calls` (classes made dynamic by a relink in the same program). `TSAOT_BORROWED_THIS=0` turns it off.
 
-To measure: the A/B of hono, hono_app, vue and tsc-ts (closed: identical C expected), the binaries' size (each site gets
-a second call), and a kernel of `this.m()` calls in a loop in an open program.
+Left: a coroutine method (async, generator) is not cloned; an arrow function in a borrowed method reads `this` through its
+capture, and its `this.m()` is not tested; an own method assigned through an `any` value (`d.y = f` with `d: any`) does
+not make the class dynamic, so `this.y()` still resolves to the class's `y` (class_extract.ts trusts writes through `any`,
+as a test would mark every class with a common method name).

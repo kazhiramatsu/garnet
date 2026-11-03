@@ -15530,6 +15530,7 @@ static void ts_prop_own_enum(tsv obj, ts_prop_enum_cb cb, void* ud){
    chain. Subclass protos chain to their parent, so this handles inheritance.
    Mirrors JS semantics (walk [[Prototype]] looking for C.prototype). */
 static tsv chain_exotic_proto(tsv link);
+int ts_this_outside_proto_slow(tsv v, tsv proto){ return !ts_instanceof(v, proto); }
 int ts_instanceof(tsv obj, tsv target_proto){
   if ((!ts_is_obj(obj) && !ts_is_func(obj)) || !ts_proto_ref(target_proto)) return 0;
   ts_object* o = (ts_object*)ts_ptr(obj);

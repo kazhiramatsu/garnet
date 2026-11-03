@@ -169,9 +169,110 @@ impl ClassTable {
     }
 }
 
+// (method, its clone, the class its `this.m()` calls were resolved from): read by the emitter, which gives the method's
+// generic entry a test of `this` that sends a foreign one to the clone.
+thread_local! {
+    static BORROW_CLONES: std::cell::RefCell<Vec<(u32, u32, u32)>> = std::cell::RefCell::new(Vec::new());
+}
+
+/// The methods whose `this.m()` calls this pass resolved statically, each with its clone, and the class.
+pub fn borrow_clones() -> Vec<(u32, u32, u32)> {
+    BORROW_CLONES.with(|b| b.borrow().clone())
+}
+
+fn borrowed_this_enabled() -> bool {
+    !matches!(std::env::var("TSAOT_BORROWED_THIS").as_deref(), Ok("0") | Ok("false") | Ok("no") | Ok("off"))
+}
+
+/// The class of the first call on `this` (`recv`) that the table resolves to one function, if any.
+fn direct_this_call_class(body: &[Inst], this: u32, table: &ClassTable, use_rta: bool) -> Option<ClassId> {
+    for inst in body {
+        let found = match inst {
+            Inst::Call { callee: CalleeRef::Method { recv_class, method, recv_stable, .. }, recv: Some(r), .. } if r.0 == this => {
+                let direct = match table.devirtualize(*recv_class, *method, *recv_stable, use_rta) {
+                    Dispatch::Direct(_) => true,
+                    Dispatch::Virtual { .. } => table.impls(*recv_class, *method, use_rta).len() == 1,
+                    Dispatch::Dynamic => false,
+                };
+                if direct { Some(*recv_class) } else { None }
+            }
+            Inst::Loop { cond_body, body, .. } => direct_this_call_class(cond_body, this, table, use_rta).or_else(|| direct_this_call_class(body, this, table, use_rta)),
+            Inst::If { then_body, else_body, .. } => direct_this_call_class(then_body, this, table, use_rta).or_else(|| direct_this_call_class(else_body, this, table, use_rta)),
+            Inst::TryCatch { try_body, catch_body, finally_body, .. } => direct_this_call_class(try_body, this, table, use_rta)
+                .or_else(|| direct_this_call_class(catch_body, this, table, use_rta))
+                .or_else(|| direct_this_call_class(finally_body, this, table, use_rta)),
+            _ => None,
+        };
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
+}
+
+/// Every call on `this` dispatches by name: the clone's calls are the ones a foreign `this` must take.
+fn this_calls_by_name(body: &mut [Inst], this: u32) {
+    for inst in body {
+        match inst {
+            Inst::Call { callee: CalleeRef::Method { recv_stable, .. }, recv: Some(r), .. } if r.0 == this => *recv_stable = false,
+            Inst::Loop { cond_body, body, .. } => {
+                this_calls_by_name(cond_body, this);
+                this_calls_by_name(body, this);
+            }
+            Inst::If { then_body, else_body, .. } => {
+                this_calls_by_name(then_body, this);
+                this_calls_by_name(else_body, this);
+            }
+            Inst::TryCatch { try_body, catch_body, finally_body, .. } => {
+                this_calls_by_name(try_body, this);
+                this_calls_by_name(catch_body, this);
+                this_calls_by_name(finally_body, this);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A method run with a `this` of another class or of none (`D.prototype.d.call(x)`, a method value, a graft) must not take
+/// the calls on `this` this pass resolves from its own class's hierarchy (docs/foreign_receivers_design.md, "Direct calls
+/// on a borrowed `this`"). In a program that can borrow (an open one, docs/closed_receivers_design.md), each method with
+/// such a call gets a clone whose calls on `this` dispatch by name; the emitter's generic entry of the method, the one a
+/// borrow reaches, sends a foreign `this` there. The method itself is left as it is: its direct calls stay direct and
+/// inlinable, nothing is added inside it. A coroutine keeps its frame layout and is left out. TSAOT_BORROWED_THIS=0: none.
+fn clone_borrowable_methods(program: &mut Program, table: &ClassTable, use_rta: bool) -> Vec<(u32, u32, u32)> {
+    let mut records = Vec::new();
+    if program.closed_receivers.closed || !borrowed_this_enabled() {
+        return records;
+    }
+    // function ids are the indices of the functions (the emitter's FN_TABLE): a clone takes the next one
+    if program.functions.iter().enumerate().any(|(i, f)| f.id.0 as usize != i) {
+        return records;
+    }
+    let mut clones = Vec::new();
+    let mut next = program.functions.len() as u32;
+    for f in &program.functions {
+        if !f.takes_this || f.is_async || f.is_generator {
+            continue;
+        }
+        let Some(this) = f.params.first().map(|p| p.0) else { continue };
+        let Some(class) = direct_this_call_class(&f.body, this, table, use_rta) else { continue };
+        let mut g = f.clone();
+        g.id = FunctionId(next);
+        g.is_exported = false;
+        this_calls_by_name(&mut g.body, this);
+        records.push((f.id.0, next, class.0));
+        clones.push(g);
+        next += 1;
+    }
+    program.functions.extend(clones);
+    records
+}
+
 /// Rewrite all Method callees in place; return the per-site Dispatch for codegen.
 pub fn run_devirt(program: &mut Program, use_rta: bool) -> Vec<SiteDispatch> {
     let table = ClassTable::new(&program.classes);
+    let records = clone_borrowable_methods(program, &table, use_rta);
+    BORROW_CLONES.with(|b| *b.borrow_mut() = records);
     let mut out = Vec::new();
     for f in &mut program.functions {
         let fid = f.id;
