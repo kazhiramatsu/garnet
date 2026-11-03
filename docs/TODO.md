@@ -13035,3 +13035,29 @@ fixture that fails on main.
 - **Next: the borrowed method's `this.m()`**, planned in `docs/foreign_receivers_design.md` ("Direct calls on a borrowed `this`"): a guarded direct call in an open program,
   the interval test for a class with struct fields and the prototype for one without (the reported case's classes have none), the entry test for every method that has such a call.
   Then tsc-ts's +1.9% over r29 (bisect between 6d8c4c7 and 8de4714), the survey's compile time, test262 measured again.
+
+## Session 365 (2026-11-03): a borrowed method's `this.m()`
+
+Branch `s365-borrowed-this` from main after Session 364 (2f99412). Design and measurements: `docs/foreign_receivers_design.md`, "Direct calls on a
+borrowed `this`".
+
+- **The miscompile** (silent, older than Session 363): `D.prototype.d.call({ y() {} })`, where `d` is `return this.y()`, ran C's `y`: the call on `this` was
+  resolved from D's hierarchy (`devirt.rs`) and inlined, whatever `this` was. Field accesses had been guarded since closed receivers' slice 2; calls had not.
+- **A guard at each call, measured and dropped** (Kaz's rule: measure, and revise what degrades): the open programs did not move (vue +0.26% instructions), but a
+  kernel of `this.inc()` in a loop went from 0 ms to 800 ms, a loop clang had folded whole and could not with an opaque call in it.
+- **As built**: in an open program each method with a call on its own `this` that the table resolves to one function gets a clone, made before any inlining, whose
+  calls on `this` dispatch by name; the method is not touched. Its generic entry, the only one a borrow reaches, tests `this` once something has read a method as a
+  value (`g_typed_slow`): not an instance of the class (the interval with struct fields, the prototype without) raises ANY and runs the clone. The kernel: 0 ms with
+  it, the same instructions. hono +0.01% instructions, hono_app +0.08%, vue +0.00% (no qualifying method), binaries +2.2% and +1.6% (31 and 30 clones).
+- The first strict run read a plain object's `f` through a struct offset in the clone (`8589934692` for 105): the clone runs no entry test of its own, so the
+  prologue raises ANY before it calls the clone.
+- Found on the way, left (CLAUDE.md): an own method assigned through an `any` value (`const d: any = new D(); d.y = f`) is not seen by `this.y()` in D's methods,
+  `class_extract.ts` trusting writes through `any`; a coroutine method is not cloned; an arrow function in a borrowed method reads `this` as a capture.
+- Fixtures `classes/borrowed_this_stable_classes` (the clone path, a class with fields and one without, call, apply, bind, a method value, a graft, Reflect.apply)
+  and `classes/borrowed_this_calls` (the same program with a relink, which makes the classes dynamic).
+- Gates on 62d6dad (`build/gates_s365a/run.sh`, mains power, 14:12): unit, bundler 56, conformance 817/817 plain and strict, 814/814 under protect, bench with its budgets,
+  ci, ir-parity identical (5,031; snapshot taken with the two fixtures), the regexp differentials (0 differ), GC stress, the hono survey 43/43. Alternating against r33 (main
+  after Session 364), outputs identical: hono +0.04% instructions (TrieRouter 224.7 -> 225.0 ms, PatternRouter 230.4 -> 233.2, RegExpRouter 54.9 -> 53.8), hono_app -0.01%
+  (112.3 -> 111.9 ms, Node 155), vue +0.00% (918.3 -> 914.8 ms), tsc-ts +0.00% (closed: no clone; 1.24 -> 1.23 s). Binaries: hono +2.2%, hono_app +1.6%, vue and tsc-ts the same.
+- Next: tsc-ts's +1.9% over r29 (a bisect of Session 363's commits, `build/bisect_tsc/step.sh <commit>`: a worktree, a shared cargo target, the native build,
+  the instruction A/B against r29), then the survey's compile time, then test262 measured again.
