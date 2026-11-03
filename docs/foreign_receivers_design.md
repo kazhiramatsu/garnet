@@ -117,3 +117,33 @@ prints each marked class, its reason and the flow's site. Marked: tsc-ts six
 classes (worker data cast from `any`, two structurally swapped completion
 classes), the TypeScript 6.0.3 compiler two (casts from interface types),
 the self-hosted analyzer none.
+
+## Direct calls on a borrowed `this` (Session 364, planned)
+
+`D.prototype.d.call({ m() { return 1; } })`, where `d` is `return this.m()`: the call in `d` was resolved from D's
+hierarchy (`devirt.rs`, one implementation in the subtree: `Direct`) and inlined, so the borrowed method ran D's `m`
+whatever `this` was, a plain object's own `m` and a sibling class's override alike (silent; older than Session 363,
+CLAUDE.md's known items). Field accesses are guarded since slice 2 of docs/closed_receivers_design.md; calls are not.
+
+The rules a fix has to keep: a closed program pays nothing (it has no foreign `this`); an open one pays one predictable
+branch per call while no foreign `this` has arrived (the ANY bit down), which is every run of vue, hono and hono_app but
+for vue's Proxies, whose ANY is up from the start and whose calls would take the interval test, a load and a compare.
+
+Plan:
+
+- `devirt.rs`, in an open program: a call whose receiver is the function's own `this` and whose dispatch is `Direct` becomes
+  `t = class.foreignThis:<class>(this); if (t) { the call by name, as Dynamic } else { the direct call }`. The site's
+  inlining (`sroa.rs`) still sees the direct call in the else branch. `SiteDispatch` has no consumer past the pass, so
+  the shift of the instruction indices is free.
+- `class.foreignThis:<c>`: `(g_typed_slow & TS_TYPED_SLOW_ANY) && ts_typed_outside(this, lo, span)`, the test field
+  accesses already make, with c's interval, for a class with struct fields. A class without any (D above, and every
+  class of the reported case) has plain objects for instances, `cls` 0: the interval would send each of them to the
+  dynamic call. Its test is the prototype: `proto == CLASS_PROTO[c]`, else the chain (`ts_instanceof`), a subclass's
+  instance being the rare case.
+- A method that has such a call gets the entry test of slice 2 even when its class has no struct field (`METHOD_CLASS`
+  holds only those today), so the first foreign `this` that enters raises ANY.
+- Receivers other than `this` stay trusted, as typed accesses through them are (a value typed as a class that is none is
+  a type lie).
+
+To measure: the A/B of hono, hono_app, vue and tsc-ts (closed: identical C expected), the binaries' size (each site gets
+a second call), and a kernel of `this.m()` calls in a loop in an open program.

@@ -12996,3 +12996,42 @@ Session 363 ends with the landing on main (one commit, `git merge --squash s363-
 2. The borrowed method's `this.m()`, with a design note.
 3. tsc-ts's +1.92% (the bisect) and the compile time of the survey.
 4. The rest of test262, measured again (`language/expressions` last in full at 9,260 of 11,152), and the elements kinds above.
+
+## Session 364 (2026-11-03): what the objects fuzzer found
+
+Branch `s364-objects` from main after Session 363's landing (8de4714). `scripts/fuzz/gen_objects.py` differed from Node in 36 of its
+first 40 programs; after the fixes below, in 14 of 200, all of them explained at the end. The generator prints a marker per snippet
+(`-- <kind> <n>`), so a difference names its snippet; the scratchpad's helpers cut a snippet out and label its statements. Each fix has a
+fixture that fails on main.
+
+- **A Proxy** (`proxy/proxy_enumeration_traps`, `proxy_trap_keys`, `proxy_delete_and_frozen_length`): `Object.getOwnPropertyDescriptors(proxy)` was `{}` (silent);
+  [[GetOwnProperty]] handed back the trap's object, not completed and not held to the target's invariants; `Object.keys(proxy)` read every value and
+  `JSON.stringify(proxy)` read each value beside its descriptor (the keys come first, `ts_proxy_enumerable_keys`); `Object.hasOwn` asked a Proxy nothing; a
+  strict delete whose trap answers false gave false (silent); the defineProperty trap got a number key as a number, and a handler typed by `ProxyHandler`
+  stopped at the check of a value typed as a string.
+- **A walk over the keys it began with** (`objects/object_walk_snapshot`): a getter that deletes or adds a key during `{...o}`, `Object.assign`, `Object.entries`,
+  `Object.values`, `JSON.stringify` or a rest pattern: the walk was over the live map, so an added key was copied and another lost (silent). At an accessor the
+  keys are taken before any getter runs; an object without one keeps the index loop.
+- **Deletes**: a key a frozen or sealed object does not have answered false through a static key (silent: a strict delete is true or throws) and threw through a
+  dynamic one (`props_delete_own` refused before it looked); `delete a.length` on an array answered true (silent), `Reflect.deleteProperty` too (`objects/delete_absent_on_frozen`,
+  `arrays/array_length_not_deletable`).
+- **JSON.stringify of a class instance with an integer key** wrote its fields twice, the first copy cut by a byte (silent: the fallback backed up over one byte, the
+  `{`, after the fields were written). Integer keys come first on an instance and on a function; `Object.assign` skipped a function's own properties, a Map's and a Set's, spread a
+  Map's and a Set's (silent; `objects/integer_keys_first`).
+- **A class field redefined as an accessor or read-only** converts the instance as a delete of a field does; it was a TypeError (`classes/field_redefined_as_accessor`).
+- **JSON.parse's strings and containers** (`stdlib/json_strings_and_containers`): a pair of `\u` escapes was two U+FFFD (Python's `json.dumps` writes every character past the BMP so);
+  a lone surrogate is kept, as WTF-8 turned into UTF-16 units; a `\u` takes four hex digits, an unknown escape is a SyntaxError (`"\x41"` was "x41"); `[`, `[1,`, `{` and
+  `{"a":1,` were values (silent). A Number, String or Boolean object at the root reaches toJSON and the replacer as the object.
+- **`Object.isFrozen` after a seal** was false for an object with no property (silent): a seal sets its own bit, not the non-extensible one (`objects/integrity_with_no_properties`).
+- A frozen array's `length = NaN` is the read-only TypeError (it was the RangeError), and an object length converts twice, as ArraySetLength does.
+- Left, recorded: the generic array methods read every element of an array with accessor elements first when the program does not name `Array.prototype` (a getter's count
+  differs, `copyWithin` writes through one); a function's `length` redefined moves to the end of its keys; `delete arguments.length` is a ReferenceError (V8: true).
+  Two differences are Node's: V8 answers `Object.isFrozen` true for a non-extensible empty array and a sealed function (their `length` and `prototype` stay writable; the
+  specification says false, as garnet does), and Node's inspect prints `<Revoked Proxy>` for a Proxy whose target has `"0": null` (it tests `target[0] === null`).
+- Gates on 37a41a8 (`build/gates_s364a/run.sh`, mains power, 13:03): unit, bundler 56, conformance 815/815 plain and strict, 812/812 under protect, bench with its
+  budgets, ci, ir-parity identical (4,971; the 60 new files are the new fixtures; snapshot taken), the regexp differentials (44,337, 0 differ), GC stress, the hono survey 43/43.
+  Alternating against r32 (main after Session 363), outputs identical: hono 16.204 -> 16.200 G instructions, cycles -0.4%, the routers within noise (PatternRouter 239.6 -> 233.1 ms);
+  hono_app +0.06%, 114.1 -> 113.5 ms (Node 162); vue +0.00%, cycles +0.26%, 927.1 -> 932.1 ms; tsc-ts +0.17%, cycles -1.4%, wall 1.32 -> 1.28 s; vue's binary +0.29%.
+- **Next: the borrowed method's `this.m()`**, planned in `docs/foreign_receivers_design.md` ("Direct calls on a borrowed `this`"): a guarded direct call in an open program,
+  the interval test for a class with struct fields and the prototype for one without (the reported case's classes have none), the entry test for every method that has such a call.
+  Then tsc-ts's +1.9% over r29 (bisect between 6d8c4c7 and 8de4714), the survey's compile time, test262 measured again.
