@@ -13085,3 +13085,17 @@ Branch `s366-tdz-extends` from main after Session 365 (30e68cf).
   hono +0.04%, hono_app -0.05% (113.5 -> 113.8 ms, Node 160), vue +0.00% (931.6 -> 928.6 ms).
 - Next: the hono survey's compile time (1,020 s against 780 s through Session 362: each driver 24 s against 18, not yet divided between the exporter and clang),
   then test262 measured again, then the deferred items of CLAUDE.md (a field initializer's dead zone, an own method through `any`).
+- **The survey's compile time** (1,020 s against 780 s): one driver (cors) 22.7 s, of which the exporter 2.0 s, the analyzer 1.0 s, clang 14 s of a 5.0 MB C
+  file, the backend 13.4 s and no function above 0.6 s (`__module_init`): volume, not a pathology. The C of Session 363's features: the module init +105 KB,
+  the protocol libraries about 180 KB, a regexp's native matcher +47 KB, the prototypes' setup +29 KB. (The comparison against the main checkout's
+  324dc2d build was void: that C does not compile, the `\u{1}` class name Session 363 fixed, and its 7.4 s was the time to the error.)
+- **The text triggers read types** (`codeText`): hono's `T extends Promise<infer U>` in types.ts compiled the Promise protocol, every `then`
+  a dynamic call, and species into every program importing hono; vue's types did the same. Types are blanked now, a class's `extends` clause
+  kept (`docs/closed_receivers_design.md`). Against r35: hono_app -2.78% instructions, cycles -3.96%, 113.0 -> 108.5 ms; vue -0.96%, 934.2 -> 923.8 ms;
+  the cors driver's C -4%, its compile 22.7 -> 21.7 s.
+- Gates on 86e5065 (`build/gates_s366b/run.sh`, mains power, 16:19): unit, bundler 56, conformance 818/818 plain and strict, 815/815 under protect, bench with its
+  budgets, ci, the regexp differentials (0 differ), GC stress, the hono survey 43/43 in 977 s (1,029 before). ir-parity: 32 files of six type-heavy fixtures differ
+  (`types/conditional_mapped`, `infer_types`, `deep_utility`, `arrays/array_interfaces`, `named_props_shaped`, `syntax/syntax_type_forms`: the libraries their types
+  pulled in are gone, their outputs agree with V8 in all three modes); snapshot taken. Against r35, outputs identical: hono_app -2.81% instructions, cycles -3.4%,
+  112.0 -> 107.5 ms (Node 157), binary -4.3%; vue -0.96%, 926.9 -> 912.9 ms, binary -2.8%; hono the same binary; tsc-ts -0.11% over five rounds (the gate's three read
+  +0.13% and a wall +4% that a rerun did not repeat), its C 182 KB and 290 functions smaller.

@@ -94,6 +94,12 @@ and of the literals only the one-word strings). They read the raw text before Se
 the two libraries opened its receivers: 22.1 G -> 37.3 G instructions, unnoticed for several slices because the fixtures
 stay correct. `tests/closed_receivers.sh` holds both facts now.
 
+The code they read has no types either (Session 366): a conditional type `T extends Promise<infer U>`, an interface's
+`extends Array<T>`, a constraint or a cast runs nothing, and hono's types.ts compiled the Promise protocol (every `then`
+a dynamic call) and species into every program that imports hono. A class's `extends` clause is kept: it evaluates its base.
+hono_app -2.8% instructions and 113.0 -> 108.5 ms, vue -1.0%; `class P extends Promise` and `class A extends Array` still
+compile them.
+
 ## Measured
 
 - tsc-ts: closed (the first draft's two sites were a record's `call: Node`
