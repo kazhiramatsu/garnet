@@ -3762,7 +3762,16 @@ class Exporter {
       n.forEachChild(walk);
     };
     const runClass = (c: ts.ClassLikeDeclaration): void => {
-      for (const h of c.heritageClauses ?? []) if (h.token === K.ExtendsKeyword) for (const t of h.types) walk(t.expression);
+      for (const h of c.heritageClauses ?? []) if (h.token === K.ExtendsKeyword) for (const t of h.types) {
+        // `extends Base` reads the binding and Base.prototype, and runs none of Base's code: Base's methods run when
+        // something constructs or calls, which reaches them through that mention. Walking Base's body here made every
+        // binding its methods read a dead-zone binding (tsc-ts's emptyTypes behind `class ObjectType extends Type`: 2.8%).
+        const e = unwrap(t.expression);
+        const s = ts.isIdentifier(e) ? this.symbolOf(e) : undefined;
+        const b = s ? bodies.get(s) : undefined;
+        if (s && b && ts.isClassDeclaration(b)) continue;   // (not `reached`: a later mention that constructs must still walk it)
+        walk(t.expression);
+      }
       for (const m of c.members) {
         if (m.name && ts.isComputedPropertyName(m.name)) walk(m.name.expression);
         if (ts.isClassStaticBlockDeclaration(m)) walk(m);

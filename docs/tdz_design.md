@@ -26,6 +26,12 @@ common case. One pass over a scope's statements, in order, keeps the set of name
   static members, or an object literal of those. Such code runs only if the name is mentioned;
 - any other closure (an argument, an assignment, an array element) may run at once, so its body counts as mentioned.
 
+`class Sub extends Base` mentions Base as a value and runs none of its code (Base's static initializers ran at its own
+definition): the walk does not follow Base's body there. A construction or a call that does run it reaches Base through
+the mention that constructs (Session 366: following it made tsc-ts's `emptyTypes`, `emptySignatures`, `emptyIndexInfos`,
+`emptySymbols` and `emptySymbolTable` dead-zone bindings behind `class ObjectType extends Type`, 149 tests of reads in the
+checker's hottest paths, 2.8% of its instructions).
+
 A binding that is in the set when its declaration is reached is a *dead-zone binding*. Every other binding keeps
 exactly what it had. A closure can only name a binding from inside the binding's scope, so one pass per scope
 following that scope's names is enough: the work is close to linear.
@@ -54,6 +60,11 @@ call of a module-level `const f = () => ...` threads the module's record alone a
 what the callee captures (`constFnSymbols`), so a caller could not supply a cell (hono's `decodeURIComponent_`, a reject).
 
 ## Left
+
+An instance field's initializer that reads a binding of its scope declared after the class (`class A { v = x + 1; }
+const x = 1; new A()`) always throws the ReferenceError: the positional check (`isLexicalTdzUse`) takes the initializer for
+code that runs where the class stands, and the dead-zone analysis covers captured bindings only, so a module constant read
+there (and folded) has nothing else to catch an early construction. Older than Session 363; V8 gives 2.
 
 A class binding keeps the `undefined` test of `binding.check`: `new K()` and `instanceof` throw the ReferenceError;
 reading the value by other means gives undefined (a TypeError where it is used, not a ReferenceError).
