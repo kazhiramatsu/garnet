@@ -7,8 +7,9 @@
 import json, random, sys
 NAMES = ["a", "b", "c", "d", "e", "f", "x", "y"]
 INTS = ["0", "1", "2", "7", "10", "100"]
-ODD = ["01", "-1", "1.5", "1e3", "4294967294", "4294967295", "4294967296", "", "a b", "constructor", "toString", "length", "valueOf"]
-ALL = NAMES + INTS + ODD
+ODD = ["01", "-1", "1.5", "1e3", "4294967295", "4294967296", "", "a b", "constructor", "toString", "length", "valueOf"]
+# the largest array index, in literals alone: on an array it makes a length that JSON.stringify walks to V8's string limit
+ALL = NAMES + INTS + ODD + ["4294967294"]
 VALS = ["0", "1", "-1", "2.5", "-0", "NaN", "Infinity", "1e21", "0.1", '"s"', '""', '"1"', "true", "false", "null", "undefined", "[1, 2]", "{ q: 1 }"]
 JSON_LEAVES = ["0", "-0", "1", "1.5", "1e21", "1e-7", "123456789012345680000", "NaN", "Infinity", "true", "false", "null", "undefined", '""', '"a"', '"\\"q\\""', '"\\\\"', '"\\n\\t"', '"\\u2028"', '"é"', '"😀"', '"\\ud83d"',
                "new Date(0)", "new Date(NaN)", "new Number(3)", 'new String("s")', "new Boolean(false)", "new Map([[1, 2]])", "new Set([1])", "/x/g", "(() => 1)", 'Symbol("s")', "{ toJSON() { return 1; } }", "{ toJSON(k: string) { return k; } }", "[, 1]", "new Uint8Array(2)"]
@@ -21,8 +22,9 @@ class G:
         s.n += 1; return f"{p}{s.n}"
     def val(s): return s.r.choice(VALS)
     def flag(s): return s.r.choice(["true", "false"])
-    def rawkey(s):
+    def rawkey(s, wide=False):
         c = s.r.random()
+        if wide and c < 0.04: return "4294967294"
         return s.r.choice(NAMES) if c < 0.6 else s.r.choice(INTS) if c < 0.8 else s.r.choice(ODD)
     def key(s, k=None):
         # a key as an expression: a literal, a number, one the compiler cannot read
@@ -34,10 +36,10 @@ class G:
         if k in NAMES: return k
         if k in INTS and s.r.random() < 0.5: return k
         return json.dumps(k)
-    def literal(s, lo=0, hi=6):
+    def literal(s, lo=0, hi=6, wide=True):
         seen = []; parts = []
         for _ in range(s.r.randint(lo, hi)):
-            k = s.rawkey()
+            k = s.rawkey(wide)
             if k in seen: continue
             seen.append(k)
             parts.append(f"[K[{ALL.index(k)}]]: {s.val()}" if s.r.random() < 0.15 else f"{s.litkey(k)}: {s.val()}")
@@ -67,7 +69,7 @@ class G:
         elif c < 0.76: x = f"Object.defineProperty({o}, {k}, {{ value: {v}, enumerable: {s.flag()}, writable: {s.flag()}, configurable: {s.flag()} }});"
         elif c < 0.84: x = f"Object.defineProperty({o}, {k}, {{ get() {{ {l}.push(\"g\"); return {v}; }}, set(q: any) {{ {l}.push(\"s\"); }}, enumerable: {s.flag()}, configurable: {s.flag()} }});"
         elif c < 0.88: x = f"Object.defineProperty({o}, {k}, {{ enumerable: {s.flag()} }});"
-        elif c < 0.92: x = f"Object.assign({o}, {s.literal(0, 3)});"
+        elif c < 0.92: x = f"Object.assign({o}, {s.literal(0, 3, False)});"
         elif c < 0.95: x = f"Object.setPrototypeOf({o}, {s.literal(0, 2)});"
         elif c < 0.97: x = f"Object.{r.choice(['freeze', 'seal', 'preventExtensions'])}({o});"
         else: x = f"p({o}[{k}], {k} in {o}, Object.hasOwn({o}, {k}));"
@@ -175,8 +177,9 @@ class G:
     def program(s):
         kinds = [s.churn, s.churn, s.forin, s.accessors, s.spreads, s.jsons, s.protos, s.protos, s.integrity, s.arrays, s.instances, s.proxies, s.symbols, s.tables]
         body = []
-        for _ in range(s.r.randint(8, 14)):
-            body.append("{\n" + "\n".join(s.r.choice(kinds)()) + "\n}")
+        for i in range(s.r.randint(8, 14)):
+            kind = s.r.choice(kinds)
+            body.append("{\n" + f'p("-- {kind.__name__} {i}");\n' + "\n".join(kind()) + "\n}")  # the marker: a diff names its snippet
         head = f"// @ts-nocheck\nconst p = (...a: unknown[]) => console.log(...a);\nconst K: any[] = {json.dumps(ALL)};\n"  # the checker's lib is ES2020: Object.hasOwn, Object.groupBy
         return head + "\n".join(s.decls) + "\n" + "\n".join(body) + "\n"
 if __name__ == "__main__":

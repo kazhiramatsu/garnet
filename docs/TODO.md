@@ -12979,8 +12979,8 @@ Where it stopped (branch `s363-dc`, worktree `build/wt_dc`, on top of `s362-wip`
     10% larger, no logic: the binary's +15% is 320 KB of runtime (inspect, sort, Date, iterator helpers, BigInt), 291 KB of generated code, 62 KB of strings. No `default.pgo` is involved (`pgo: auto` finds none in the clone).
 - **Left, not this session's and not landed with it:** a method called through `call` on a value of another class resolves a `this.m()` from its own hierarchy, up to inlining it: `D.prototype.d.call({ m() {} })` runs the class's `m` (silent; 324dc2d does it too). Field accesses are guarded (`docs/foreign_receivers_design.md`), these calls are not. It needs a design: a guard at every direct call of an open program and the inliner's answer to it. CLAUDE.md's known items.
 - CLAUDE.md's known items, read against a probe under Node: BigInt, `arguments`, `__proto__`, the dead zone through closures, a private name's second initialization, a promise subclass's `then`, `JSON.parse(s) as Config`, `ReadableStream` and a `String` base agree with V8 now and came out or were corrected; what still differs is as written there.
-- **The fourth fuzzer, `scripts/fuzz/gen_objects.py`** (Session 363's step 5): 36 of 40 programs differ from Node (seeds 1-40, a hang among them). By cause, from the outputs alone, none fixed yet:
-  1. seed 36 does not end under garnet (20 s, stdout still in its buffer): find it first.
+- **The fourth fuzzer, `scripts/fuzz/gen_objects.py`** (Session 363's step 5): 36 of 40 programs differ from Node (seeds 1-40). By cause, from the outputs alone, none fixed yet:
+  1. Not a hang, as first read: seed 36 gave an array the length 2^32-1, and `JSON.stringify` walks it to the string limit, a RangeError under Node in seconds and under garnet, a name interned per index, in minutes. The largest index is in the generator's literals alone now.
   2. A walk over an object is live (`ts_prop_own_enum`): a getter that deletes or adds a key during `{...o}`, `Object.assign`, `Object.entries`, `Object.values`, `JSON.stringify` or a rest pattern shifts the entries: added keys are visited, a key can be lost (77 lines, the generator favours it). Plan: at the first accessor the remaining keys are snapshotted and the walk goes on by key, so an object without accessors pays nothing.
   3. A Proxy: `Object.getOwnPropertyDescriptors(proxy)` is `{}` (silent), `JSON.stringify(proxy)` interleaves `gopd` and `get` (the specification takes every `gopd` first).
   4. 15 lines where a TypeError appears on one side only (strict `delete`, frozen and sealed receivers: to reduce with `scripts/fuzz/reduce.py`); a class field `a: any = -0` read 0.
@@ -12992,7 +12992,7 @@ Where it stopped (branch `s363-dc`, worktree `build/wt_dc`, on top of `s362-wip`
 
 Session 363 ends with the landing on main (one commit, `git merge --squash s363-dc`; the branch keeps the steps on origin). Next, on a new branch, in this order:
 
-1. The fuzzer's findings above, one at a time against V8, each with a fixture: the hang first. Then `scripts/fuzz/run.sh objects 41 200`, `features 151 300`.
+1. The fuzzer's findings above, one at a time against V8, each with a fixture. Then `scripts/fuzz/run.sh objects 41 200`, `features 151 300`.
 2. The borrowed method's `this.m()`, with a design note.
 3. tsc-ts's +1.92% (the bisect) and the compile time of the survey.
 4. The rest of test262, measured again (`language/expressions` last in full at 9,260 of 11,152), and the elements kinds above.
