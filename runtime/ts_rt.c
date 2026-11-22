@@ -112,6 +112,7 @@ static size_t sab_mapped_bytes(uint32_t n);
 static int publish_protect_on(void);
 static int fork_trace_on(void);
 static double fork_trace_now_ms(void);
+static void fork_trace_self_counts(unsigned long long* insn, unsigned long long* cycles);
 /* A program-counter sampling profiler (TSAOT_PROF_PC=path): a sampler
    thread suspends the main thread every TSAOT_PROF_PC_US microseconds
    (default 100), reads its PC, link register and frame pointer, and resumes
@@ -751,7 +752,7 @@ static inline size_t gc_block_cell_capacity(const gc_block* b){
 static inline size_t gc_cell_capacity(const ts_gc_header* h){ return gc_block_cell_capacity(gc_cell_block(h)); }
 /* Promotion in place: the cell's mark bit (or run mark) makes it old.
    Returns the cell's capacity (the block is at hand). */
-static size_t gc_cell_set_old_bit(ts_gc_header* h){
+static inline size_t gc_cell_set_old_bit(ts_gc_header* h){
   gc_block* b = gc_cell_block(h);
   if (b->state == GC_BLK_CELL){
     uintptr_t off = (uintptr_t)h - (uintptr_t)g_cage_base;
@@ -7331,7 +7332,7 @@ static void gc_cell_die(ts_gc_header* h){
   if (g_gc_zap && size) memset(h, 0xDD, size);
   GC_PAYLOAD_POISON(h, g_pclass_size[b->cls]);
 }
-static size_t gc_cell_promote(ts_gc_header* h){
+TS_RT_ALWAYS_INLINE size_t gc_cell_promote(ts_gc_header* h){
   size_t cap = gc_cell_set_old_bit(h);
   h->mark = 0; h->gen = TS_GEN_OLD; h->flags &= (uint8_t)~TS_HDR_REMEMBERED;
   return cap;
@@ -14575,6 +14576,11 @@ struct ts_class_reg {
   ts_class_field* fields;
   int nfields;
   size_t min_size;
+  /* The offsets of the fields that hold a value (the boxed ones), in field order: what the marker
+     and the publish walk visit of an instance. A descriptor per field cost them a load and a test
+     of its kind for every field, numbers included. */
+  uint32_t* ref_offs;
+  int nrefs;
 };
 typedef struct ts_class_reg ts_class_reg;
 static ts_class_reg* g_class_regs = NULL;
@@ -14645,6 +14651,11 @@ void ts_register_class(tsv proto, ts_class_field* fields, int nfields){
     size_t end = fields[i].offset + width;
     if (end > reg->min_size) reg->min_size = end;
   }
+  reg->nrefs = 0;
+  for (int i = 0; i < nfields; i++) if (!fields[i].numeric) reg->nrefs++;
+  reg->ref_offs = reg->nrefs ? (uint32_t*)malloc(sizeof(uint32_t) * (size_t)reg->nrefs) : NULL;
+  if (reg->nrefs && !reg->ref_offs) ts_abort_msg("out of memory registering a class");
+  for (int i = 0, k = 0; i < nfields; i++) if (!fields[i].numeric) reg->ref_offs[k++] = (uint32_t)fields[i].offset;
   class_reg_index_put((uint32_t)g_class_reg_len);
   g_class_reg_len++;
   g_has_class_regs = 1;
@@ -15305,19 +15316,28 @@ static ts_class_reg* class_reg_for_sized(ts_object* o){
   if (r == CLASS_REG_NONE) return NULL;
   return ts_obj_sized_bytes(o) >= r->min_size ? r : NULL;
 }
+/* The same in line: the table's entry for an indexed class word (the marker and the publish walk
+   ask for every class instance they visit); the first sight of a word, a word without an index
+   and a relinked instance take the call. */
+TS_RT_ALWAYS_INLINE ts_class_reg* class_reg_for_sized_in(ts_object* o){
+  uint32_t w = o->cls;
+  if (TS_RT_LIKELY(w != 0 && !(w & TS_CLS_RELINKED) && w < g_class_reg_by_word_n)){
+    ts_class_reg* r = g_class_reg_by_word[w];
+    if (TS_RT_LIKELY((uintptr_t)r > (uintptr_t)CLASS_REG_NONE)) return ts_obj_sized_bytes(o) >= r->min_size ? r : NULL;
+  }
+  return class_reg_for_sized(o);
+}
 static void gc_mark_class_fields(ts_object* o, int young, int depth, int stable){
   /* Struct fields exist only in sized instances (a registered layout after
      the header); a plain object, even one whose prototype has a registered
      layout, has none. Skipping the registry probe for the unsized majority
      removed 11.6M hash lookups from a compile's collections (Session 350). */
   if (!ts_obj_is_sized(o)) return;
-  ts_class_reg* reg = class_reg_for_sized(o);
+  ts_class_reg* reg = class_reg_for_sized_in(o);
   if (!reg) return;
   char* base = (char*)o;
-  for (int i=0;i<reg->nfields;i++){
-    if (reg->fields[i].numeric) continue;
-    gc_visit_slot((tsv*)(base + reg->fields[i].offset), young, depth, stable);
-  }
+  const uint32_t* offs = reg->ref_offs;
+  for (int i = 0, n = reg->nrefs; i < n; i++) gc_visit_slot((tsv*)(base + offs[i]), young, depth, stable);
 }
 
 /* ---- canonical own-enumeration (property_model_redesign §3.2, A-2b-2) ----
@@ -25321,13 +25341,15 @@ typedef struct {
 } publish_walk;
 #define PUBLISH_DONE_WAS_FROZEN 1u
 #define PUBLISH_DONE_KEPT 2u
-static void publish_append(ts_gc_header*** arr, size_t* len, size_t* cap, ts_gc_header* h){
-  if (*len == *cap){
-    size_t ncap = *cap ? *cap * 2u : 256u;
-    ts_gc_header** nc = (ts_gc_header**)realloc(*arr, ncap * sizeof *nc);
-    if (!nc) ts_abort_msg("out of memory in publish");
-    *arr = nc; *cap = ncap;
-  }
+__attribute__((noinline)) static void publish_grow(ts_gc_header*** arr, size_t* cap){
+  size_t ncap = *cap ? *cap * 2u : 256u;
+  ts_gc_header** nc = (ts_gc_header**)realloc(*arr, ncap * sizeof *nc);
+  if (!nc) ts_abort_msg("out of memory in publish");
+  *arr = nc; *cap = ncap;
+}
+/* In line in the walk: an append is a compare and a store (the walk appends twice or more a cell). */
+TS_RT_ALWAYS_INLINE void publish_append(ts_gc_header*** arr, size_t* len, size_t* cap, ts_gc_header* h){
+  if (TS_RT_UNLIKELY(*len == *cap)) publish_grow(arr, cap);
   (*arr)[(*len)++] = h;
 }
 /* A reference the walk will visit. Only the tag is read here: the header, a
@@ -25336,22 +25358,28 @@ static void publish_append(ts_gc_header*** arr, size_t* len, size_t* cap, ts_gc_
    allocation order, and the visit does everything in one pass (a 3 MB
    source file's 490k cells: 27 ms as two passes breadth first, 17 ms this
    way). */
-static void publish_push(publish_walk* w, tsv v){
+TS_RT_ALWAYS_INLINE void publish_push_in(publish_walk* w, tsv v, int region){   /* region: g_region_mode, read once by the visit */
   ts_gc_header* h;
   if (TS_TOP16(v) == TS_SEL_OBJECT || ts_is_func(v)) h = (ts_gc_header*)ts_ptr(v);
-  else if (g_region_mode && ts_is_heap_str(v)) h = (ts_gc_header*)ts_ptr(v);   /* promoted with the graph: publish_visit */
+  else if (region && ts_is_heap_str(v)) h = (ts_gc_header*)ts_ptr(v);   /* promoted with the graph: publish_visit */
   else return;
   if (w->keeping){
     if (!region_holds(h)) return;         /* a pre-fork cell a prototype reaches is the parent's own */
     publish_append(&w->keep, &w->klen, &w->kcap, h);
-  } else publish_append(&w->edges, &w->elen, &w->ecap, h);
+  } else {
+    /* once, where the edge is found: the visit reads the header, then the fields, which a cell of
+       more than 64 bytes (most class instances) keeps in its second line */
+    __builtin_prefetch(h); __builtin_prefetch((const char*)h + 64);
+    publish_append(&w->edges, &w->elen, &w->ecap, h);
+  }
 }
+TS_RT_ALWAYS_INLINE void publish_push(publish_walk* w, tsv v){ publish_push_in(w, v, g_region_mode); }
 /* Region mode: a prototype the graph reaches is kept, immortal here and opaque
    to the readers like a published cell (the worker's collector would otherwise
    free it under them), but not frozen, as a deep freeze leaves prototypes
    alone; what it reaches is kept the same way. A prototype the parent made
    before the fork is the parent's own (a class prototype, Object.prototype). */
-static void publish_keep_proto(publish_walk* w, tsv proto){
+TS_RT_ALWAYS_INLINE void publish_keep_proto(publish_walk* w, tsv proto){
   if (!g_region_mode) return;
   int saved = w->keeping; w->keeping = 1;
   publish_push(w, proto);
@@ -25369,7 +25397,9 @@ static const char* publish_rejected_kind(const ts_gc_header* h){
     default: return NULL;
   }
 }
-static void publish_common_props(publish_walk* w, ts_object* o){
+TS_RT_ALWAYS_INLINE void publish_common_props(publish_walk* w, ts_object* o){
+  /* a class instance without a property of its own (nearly every one): its sidecar is absent */
+  if ((o->h.flags & TS_HDR_SIDECAR) && !((ts_sized_head*)o)->dyn){ publish_keep_proto(w, o->proto); return; }
   ts_propmap* m = obj_map(o);
   if (obj_shaped(o)){
     for (uint32_t i = 0; i < m->len; i++) publish_push(w, *ts_obj_slot_ptr(o, i));
@@ -25382,8 +25412,11 @@ static void publish_children(publish_walk* w, ts_gc_header* h){
   if (h->kind == TS_KIND_OBJECT){
     ts_object* o = (ts_object*)h;
     if (ts_obj_is_sized(o)){
-      ts_class_reg* reg = class_reg_for_sized(o);
-      if (reg){ char* base = (char*)o; for (int i = 0; i < reg->nfields; i++) if (!reg->fields[i].numeric) publish_push(w, *(tsv*)(base + reg->fields[i].offset)); }
+      ts_class_reg* reg = class_reg_for_sized_in(o);
+      if (reg){
+        char* base = (char*)o; const uint32_t* offs = reg->ref_offs; const int region = g_region_mode;
+        for (int i = 0, n = reg->nrefs; i < n; i++) publish_push_in(w, *(tsv*)(base + offs[i]), region);
+      }
     }
     publish_common_props(w, o);
   } else if (h->kind == TS_KIND_FUNC){
@@ -25499,14 +25532,19 @@ tsv ts_publish(tsv v){
   if (g_has_proxies && ts_is_proxy(v)) ts_throw_type_error_msg("Cannot publish a Proxy");
   publish_walk w = { NULL, 0, 0, NULL, 0, 0, NULL, 0, 0, 0 };
   double pt0 = fork_trace_on() ? fork_trace_now_ms() : 0;
+  unsigned long long pi0 = 0, pc0 = 0;
+  if (pt0) fork_trace_self_counts(&pi0, &pc0);
   publish_push(&w, v);
   const char* rejected = NULL;
   /* depth first (a stack): a cell's children were allocated right after it,
-     so the walk follows the allocation order and its cache lines; the cells
-     just pushed are prefetched for the visits that follow */
+     so the walk follows the allocation order and its cache lines. An edge's
+     cell is prefetched where the edge is pushed, and once more a few visits
+     before its turn (its line may have left the cache under the subtrees
+     visited in between): one prefetch a push and one a pop, where six a pop
+     were a third of the walk's instructions. */
   while (w.elen && !rejected){
     ts_gc_header* h = w.edges[--w.elen];
-    for (size_t k = w.elen > 6u ? w.elen - 6u : 0; k < w.elen; k++) __builtin_prefetch(w.edges[k]);
+    if (w.elen >= 4u) __builtin_prefetch(w.edges[w.elen - 4u]);
     rejected = publish_visit(&w, h);
   }
   w.keeping = 1;   /* the prototypes reached (region mode), and what they reach */
@@ -25538,8 +25576,11 @@ tsv ts_publish(tsv v){
   /* the marks of the cells reached are reset, except in a shared worker, where they stay */
   if (!g_region_mode) for (size_t i = 0; i < w.dlen; i++) publish_done_cell(w.done[i])->mark = 0;
   if (w.dlen) prop_add_epoch_bump();
-  if (pt0 && w.dlen >= 50000)
-    fprintf(stderr, "[publish] pid %d: %zu cells: %.2f ms\n", (int)getpid(), w.dlen, fork_trace_now_ms() - pt0);
+  if (pt0 && w.dlen >= 50000){
+    unsigned long long pi1 = 0, pc1 = 0; fork_trace_self_counts(&pi1, &pc1);
+    fprintf(stderr, "[publish] pid %d: %zu cells: %.2f ms, %.1f M instructions, %.1f M cycles\n", (int)getpid(), w.dlen, fork_trace_now_ms() - pt0,
+            (double)(pi1 - pi0) / 1e6, (double)(pc1 - pc0) / 1e6);
+  }
   free(w.edges); free(w.done); free(w.keep);
   return v;
 }

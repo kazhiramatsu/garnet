@@ -459,6 +459,39 @@ that carries its objects is decoded.
 - *Test.* A runtime test counts the page faults of a shared worker's first
   objects and shapes: 1,469 before, 31 after, the bound 256.
 
+### The publish walk's instructions (Session 367)
+
+With no collection before it (a shared worker's young budget, "Sharing by fork", item 2), the
+publish of a parsed file is a quarter of its parse worker: `checker.ts`, 488,771 cells, 266 M
+instructions (545 a cell) and 13 ms on the path that ends the parse phase. The walk's own counts
+for that graph: 6.4 class fields a cell, 4.3 values handed to the push, 2.4 edges pushed (1.4 of
+them to a cell already reached, a `parent` mostly). What it cost, and what changed:
+
+- **Six prefetches at every pop** (the top of the edge stack, each entry prefetched again and
+  again): one where an edge is pushed, the cell's header line and the next (a class instance
+  keeps its fields past the first 64 bytes), and one at each pop for the entry four pops ahead.
+  266 to 232 M instructions, cycles -16%.
+- **The push, the append and the prototype's keep out of line**: in line, the append a compare
+  and a store with the growth out of line, and a class instance without a property of its own
+  (its sidecar absent) skipped before the property walk. 232 to 210 M.
+- **The promotion and the class's layout by calls** (`gc_cell_promote`, `class_reg_for_sized`):
+  the promotion in line, and the table of the class word read in line
+  (`class_reg_for_sized_in`; the first sight of a word, an unindexed word and a relinked
+  instance take the call). 210 to 199 M.
+- **A descriptor per field** (24 bytes: the name, the offset, the kind, loaded and tested for
+  every field, numbers included, with the count and the table reloaded past each store): a
+  class's registration lists the offsets of its boxed fields (`ts_class_reg.ref_offs`), and the
+  walk reads the mode once a cell. The marker's `gc_mark_class_fields` takes the same list.
+  199 to 175 M.
+
+Together 266 to 176 M instructions (360 a cell), 66.0 to 46.7 M cycles in alternating rounds on
+a loaded machine, about 13 to 9 ms; the parse worker of `checker.ts` 1.086 to 0.996 G
+instructions, all parse workers 4.19 to 3.85 G, one thread (the marker's list) 13.560 to
+13.473 G. What remains is the first read of each cell's header (a fifth of the walk's samples:
+memory, with the prefetches in place), the edges to cells already reached (pushed and popped
+to find their mark set; reading the mark at the push would take the cell's miss there) and the
+visit itself. `TSAOT_FORK_TRACE=1` prints a publish's instructions and cycles beside its time.
+
 ## Sharing by fork: regions
 
 The fork prototype shares the parent's heap with its children by

@@ -15,6 +15,8 @@ ORIG="$(pwd)"
 [ $# -ge 3 ] || { echo "usage: $0 <rounds> <checkers> <label>=<binary>[;ENV=VALUE ...] ..." >&2; exit 2; }
 N=$1; K=$2; shift 2
 export TSC_TS_LIB_DIR="${TSC_TS_LIB_DIR:-$(ls -d "$ROOT"/build/tsc-ts/node_modules/@scriptc/cli-*/dist/lib/typescript/lib 2>/dev/null | head -1)}"
+# without the lib directory tsc-ts looks beside its executable and checks another program
+[ -f "$TSC_TS_LIB_DIR/lib.d.ts" ] || { echo "TSC_TS_LIB_DIR: no lib.d.ts in '$TSC_TS_LIB_DIR' (set it, or build/tsc-ts with its @scriptc package)" >&2; exit 2; }
 cd "$ROOT/build/typescript_603/source" || { echo "build/typescript_603/source missing" >&2; exit 2; }
 ARGS="-p src/compiler/tsconfig.json --composite false --incremental false --declaration false --declarationMap false --emitDeclarationOnly false --isolatedDeclarations false --sourceMap false --pretty false --noEmit --checkers $K"
 T=$(mktemp); trap 'rm -f "$T"' EXIT

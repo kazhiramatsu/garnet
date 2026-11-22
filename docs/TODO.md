@@ -13182,6 +13182,12 @@ walls are minima and medians of interleaved rounds, and everything else is instr
   (`proc_pid_rusage`): the parent's rusage carries none of it, and it is the one reading of a parallel compile that a loaded machine
   does not move. The statistics build lists the allocation sites that allocated most (`alloc_site`, ids as `sites.json`) and the
   outcomes of the in-line Map and Set probes (`map_probe_inline`).
+- **The publish walk** (docs/published_graphs_design.md, "The publish walk's instructions"): with no collection before it the
+  publish of checker.ts was a quarter of its parse worker (488,771 cells, 266 M instructions, 13 ms on the critical path). One
+  prefetch where an edge is pushed and one a pop instead of six a pop, the push and the append in line, the promotion and the class
+  word's layout in line, and a list of each class's boxed-field offsets (`ts_class_reg.ref_offs`, the marker's
+  `gc_mark_class_fields` too) instead of a descriptor per field: 266 to 176 M instructions, cycles 66.0 to 46.7 M. The parse worker
+  of checker.ts 1.086 to 0.996 G, all parse workers 4.19 to 3.85 G, one thread 13.560 to 13.473 G.
 - Measured and not kept: the direct table's density rule relaxed for the checkers' sparse id tables (128 to 8192 times the entries: no
   gain, a sparse direct table is as cold as the index); tsc-ts's `SparseLinkTable` as pages of 256 ids instead of a Map (+1.4%
   instructions in the checker).
@@ -13196,6 +13202,20 @@ Gates (`build/gates_s367a/run.sh`, other sessions' load on the machine): unit, b
 in the run (`string_unicode_search_kernel` 116 ms against 105, code the session did not touch), all within budget when run alone
 afterwards. ir-parity: the ten files of the three programs that import `node:worker_threads` differ, as the library's constructor
 changed; snapshot taken (5,055 identical).
+
+The second slice's gates (`build/gates_s367b/run.sh`, r37 to r38, the publish walk and the reference offsets): unit, bundler 56,
+conformance 819/819 plain and strict, 816/816 under protect, bench within budget, ci, GC stress, the drivers' outputs identical
+(hono +0.01% instructions, hono_app +0.05%, vue -0.03%), tsc-ts outputs identical (one thread with emit 21.876 to 21.775 G), the
+compiler project under `TSAOT_GC_PROTECT` on one thread and on four checkers with a 20,000-cell young budget and under
+`TSAOT_PUBLISH_PROTECT`, all clean. The one-thread resident set moved 464 to 448 MB with the marker's loop (the same slots, by an
+assertion over a whole compile, and the same sites tenured in the same order: fewer pages of the marker's recursion, not fewer cells).
+
+**Found, not fixed: four checkers lose diagnostics on one corpus case, by timing.** The corpus differential with `--checkers 4`
+(1,500 cases, to put the publish walk under it) differed in one, `compiler/moduleElementsInWrongContext.ts`, and the same binary
+differs from itself there: of eight runs of r36 (the build before this session) three print 19 diagnostics, as one thread always
+does, and five print 16, without TS2305 at (20,14) and (28,14) and TS2307 at (25,25) (an import and an export of a module inside a
+block). The other 1,499 cases agree between runs. Not looked into: whether it is tsc-ts's (under scriptc too) or the fork workers'.
+The corpus check of a tsc-ts patch runs on one thread for that reason.
 
 **What it takes to pass tsrs** (2.1x on the wall from here, 2.6x on one thread):
 
