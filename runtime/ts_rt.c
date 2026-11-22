@@ -8809,7 +8809,7 @@ int ts_array_is_array_slow(tsv v){
    loop through their [Symbol.iterator] trap; any other iterable held in an array-typed binding), so the
    index loop keeps its shape; a non-iterable is the TypeError V8 throws. A snapshot: elements added to
    a Proxy's target during the loop are not visited (an array's are). */
-tsv ts_forof_array_source(tsv v){
+tsv ts_forof_array_source_slow(tsv v){
   if (TS_RT_LIKELY(ts_is_indexed_array_fast(v))) return v;
   ts_gc_root(&v);
   tsv out = ts_new_array(0); ts_gc_root(&out);

@@ -23147,14 +23147,29 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 return;
             }
             if let Some(sid) = alloc_site_id(site.0, st) {
-                let _ = writeln!(
-                    s,
-                    "  {} = ts_new_array_site(0, {}u); /* site {} {:?} */",
-                    ctx.vname(dst.0),
-                    sid,
-                    site.0,
-                    st
-                );
+                if inline_alloc_enabled() {
+                    // an empty array (`[]`, or one its elements are pushed into): the literal's
+                    // in-line allocation with no element, its four inline slots holes, as
+                    // ts_new_array_site(0) lays it out. It was the one allocation of a compiler's
+                    // check still behind a call (1.4 M of its 2 M arrays: the working lists).
+                    let _ = writeln!(
+                        s,
+                        "  {} = ts_new_array_lit4_site_in(0u, TS_ARRAY_HOLE, TS_ARRAY_HOLE, TS_ARRAY_HOLE, TS_ARRAY_HOLE, {}u); /* site {} {:?}: empty */",
+                        ctx.vname(dst.0),
+                        sid,
+                        site.0,
+                        st
+                    );
+                } else {
+                    let _ = writeln!(
+                        s,
+                        "  {} = ts_new_array_site(0, {}u); /* site {} {:?} */",
+                        ctx.vname(dst.0),
+                        sid,
+                        site.0,
+                        st
+                    );
+                }
             } else {
                 let alloc = if st == AllocStrategy::PretenuredHeap {
                     "ts_new_array_pretenured"

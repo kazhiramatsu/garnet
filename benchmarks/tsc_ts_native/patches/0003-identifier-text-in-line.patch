@@ -1,0 +1,34 @@
+isThisInTypeQuery reads the identifier's text field; getResolvedSymbol asks for the text once
+
+isThisInTypeQuery runs for every identifier a check or a flow walk meets (checkIdentifier,
+isMatchingReference, the narrowing of a reference). It compared getText(node) with 'this': a
+call that switches on the node's kind again, after the kind was tested the line before. It reads
+(node as Identifier).text. getResolvedSymbol called getText twice for a lookup that misses its
+table; once now.
+
+diff --git a/packages/tsc-ts/src/compiler/checker-expressions.ts b/packages/tsc-ts/src/compiler/checker-expressions.ts
+index aaa1ae2..3a11a29 100644
+--- a/packages/tsc-ts/src/compiler/checker-expressions.ts
++++ b/packages/tsc-ts/src/compiler/checker-expressions.ts
+@@ -531,7 +531,9 @@ function isSameScopedBindingElement(node: Node, declaration: Node): boolean {
+ 
+ /** Whether `node` is the `this` of `typeof this` or `typeof this.x`, which parses as an identifier. */
+ export function isThisInTypeQuery(node: Node): boolean {
+-  if (node.kind !== SyntaxKind.Identifier || getText(node) !== 'this') return false;
++  // The identifier's own field: this runs for every identifier a check or a flow walk meets, and
++  // `getText` is a call that switches on the kind again.
++  if (node.kind !== SyntaxKind.Identifier || (node as Identifier).text !== 'this') return false;
+   let current = node;
+   while (current.parent!.kind === SyntaxKind.QualifiedName && (current.parent as QualifiedName).left === current)
+     current = current.parent!;
+@@ -552,8 +554,8 @@ export function getResolvedSymbol(c: Checker, node: Node): Symbol {
+   const cached = c.resolvedSymbols.get(node.id);
+   if (cached !== undefined) return cached;
+   let symbol = c.unknownSymbol;
+-  if (getText(node) !== '') {
+-    const text = getText(node);
++  const text = getText(node);
++  if (text !== '') {
+     const found = resolveName(
+       c,
+       node,

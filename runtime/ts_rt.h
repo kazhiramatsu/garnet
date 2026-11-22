@@ -1860,7 +1860,14 @@ double ts_array_push_foreign(tsv arr, const tsv* args, int n);
 double ts_array_unshift_foreign(tsv arr, const tsv* args, int n);
 tsv ts_method_dynamic(tsv recv, const char* name, const tsv* args, int nargs);
 tsv ts_to_string_template(tsv v);
-tsv ts_forof_array_source(tsv v);
+/* The array a typed `for..of` walks: the array itself, tested in line (every such loop asks
+   once at its entry, and the answer is nearly always the receiver); another iterable is drained
+   through its protocol into an array (ts_rt.c). */
+tsv ts_forof_array_source_slow(tsv v);
+static inline tsv ts_forof_array_source(tsv v){
+  if (TS_RT_LIKELY(ts_is_indexed_array_fast(v))) return v;
+  return ts_forof_array_source_slow(v);
+}
 tsv ts_mapset_cursor_source(tsv coll, int is_map);
 
 tsv  ts_make_fn(ts_code code, tsv* env, uint32_t envlen); /* boxed callable; env may be NULL */

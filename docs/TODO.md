@@ -13188,9 +13188,19 @@ walls are minima and medians of interleaved rounds, and everything else is instr
   word's layout in line, and a list of each class's boxed-field offsets (`ts_class_reg.ref_offs`, the marker's
   `gc_mark_class_fields` too) instead of a descriptor per field: 266 to 176 M instructions, cycles 66.0 to 46.7 M. The parse worker
   of checker.ts 1.086 to 0.996 G, all parse workers 4.19 to 3.85 G, one thread 13.560 to 13.473 G.
+- **An empty array literal is allocated in line** (`emit_c.rs`, `Inst::AllocArray` without elements): `[]` was the one allocation
+  of a check still behind a call (`ts_new_array_site(0)`, 2,200 sites of tsc-ts, 1.4 M of its 2 M arrays a compile: the working
+  lists); it is the literal's in-line allocation with no element (`ts_new_array_lit4_site_in(0, holes)`). A typed `for..of` asked
+  `ts_forof_array_source` by a call at every loop: the array test is in line, the protocol path the call. With tsc-ts's third patch
+  (`isThisInTypeQuery` reads the identifier's `text` field, `getResolvedSymbol` asks for the text once): the checker of checker.ts
+  3.167 to 3.100 G instructions (-2.1%), cycles -2.5%; one thread 13.502 to 13.391 G; the binary +1%. Fixture
+  `arrays/empty_array_sites`.
 - Measured and not kept: the direct table's density rule relaxed for the checkers' sparse id tables (128 to 8192 times the entries: no
   gain, a sparse direct table is as cold as the index); tsc-ts's `SparseLinkTable` as pages of 256 ids instead of a Map (+1.4%
-  instructions in the checker).
+  instructions in the checker), and with the 1,024 values found last in front of the Map (86% of that checker's 1.9 M lookups hit
+  them, yet +1.7% instructions and cycles -0.2%: the emitter boxes the `Int32Array` element for the compare, and two array reads
+  through fields cost what the in-line probe costs. `SparseLinkTable.get` stays that checker's first function, 5.3%); `-O3` for
+  the generated code (no difference).
 
 **Together, r36 to r37**: the critical path's two workers 4.654 to 4.256 G instructions (-8.6%: the parse worker 1.277 to 1.092, the
 checker 3.377 to 3.165); wall, eleven interleaved rounds beside tsrs at 0.15 / 0.16 s (minimum / median): default 0.39 / 0.41 to
@@ -13209,6 +13219,12 @@ conformance 819/819 plain and strict, 816/816 under protect, bench within budget
 compiler project under `TSAOT_GC_PROTECT` on one thread and on four checkers with a 20,000-cell young budget and under
 `TSAOT_PUBLISH_PROTECT`, all clean. The one-thread resident set moved 464 to 448 MB with the marker's loop (the same slots, by an
 assertion over a whole compile, and the same sites tenured in the same order: fewer pages of the marker's recursion, not fewer cells).
+
+The third slice's gates (`build/gates_s367c/run.sh`, r38 to r39, the empty array in line, the for-of source, tsc-ts's third patch):
+unit, bundler 56, conformance 820/820 plain and strict, 817/817 under protect, bench within budget, ci, ir-parity identical (5,055; the
+emitter changed, the IR did not; snapshot taken with the fixture), GC stress, the compiler project under the protect modes, the corpus
+differential on one thread 6,537 of 6,537 identical. hono 16.200 to 15.885 G instructions (-1.9%), cycles -3.1%; hono_app -0.25%,
+vue -0.23%; tsc-ts one thread with emit 21.841 to 21.722 G.
 
 **Found, not fixed: four checkers lose diagnostics on one corpus case, by timing.** The corpus differential with `--checkers 4`
 (1,500 cases, to put the publish walk under it) differed in one, `compiler/moduleElementsInWrongContext.ts`, and the same binary
