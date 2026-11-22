@@ -13319,6 +13319,26 @@ the checkers forked by 59 to 64, checked by 211 to 222. What is left is work, no
 instructions is the same lazy work done by more than one process (ten checkers that start cold, nine forks that start with a
 third of checker.ts resolved).
 
+Measured after the fifth slice, nothing changed by them:
+
+- **The number of checkers** (the trained r41, exit in ms, minimum / median of 15): 4 checkers 227.7 / 236.5, 6: 213.7 / 222.2,
+  7: 208.9 / 215.9, 8: 206.8 / 214.6, the default 10: 208.8 / 219.1, 12: 216.9 / 229.4, 14: 235.3 / 245.6. Flat from 7 to 10 now
+  that the largest file's check is shared: fewer cold checkers on the efficiency cores gain what the idle cores lose.
+- **The root files matched before the parse threads are forked**, the third measurement, on r41's runtime and over 31 alternating
+  runs: parse done 65.1 / 71.6 to 63.0 / 69.8, exit 265.0 / 275.9 to 261.8 / 272.2. A real 2 to 3 ms, and not kept: a project
+  whose root files take tens of milliseconds to match (tsc-ts's own note: 3,276 root files, 35 to 45 ms) would start its libraries
+  that much later, which is what starting the threads first is for.
+
+**Where the next gains are, by size.** The wall is the work now: 150 ms of check on ten processors, then 55 ms that are one
+file's parse. (1) The same lazy work in several processes, a fifth of the check's instructions: checkers that divide like the
+forks of the fourth slice (one starts, forks once it has resolved what every file needs, and so on) would keep about half of
+it, against processors idle while the first ones warm up: a few percent of the check, for a new scheduler. (2) The check's
+generated code, 2 to 3% a slice as the first three. (3) The parse worker of the largest file: the scanner and the parser a
+quarter each, the publish walk a tenth now. (4) The 15 ms before the largest file starts to parse: 6 ms to the entry (the
+modules' initialization 1.7 ms, the shapes and classes of the runtime's start 1.5 ms), 8 ms for ten forks with a young
+collection before each. On a machine with more performance cores the same build scales where tsrs's largest file stays on one
+thread: the check is 10.6 G instructions against tsrs's 4.9 G for the whole compile, but on as many processors as there are.
+
 **Found, not fixed: four checkers lose diagnostics on one corpus case, by timing.** The corpus differential with `--checkers 4`
 (1,500 cases, to put the publish walk under it) differed in one, `compiler/moduleElementsInWrongContext.ts`, and the same binary
 differs from itself there: of eight runs of r36 (the build before this session) three print 19 diagnostics, as one thread always
