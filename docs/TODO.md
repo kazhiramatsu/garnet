@@ -13301,6 +13301,24 @@ walk shared, eight runs with every walk shared (ten publishes of 50,000 cells or
 the corpus on one thread 6,537 of 6,537 identical against r40, and on two checkers with every walk shared against one walker
 6,537 of 6,537 (four walkers in every case).
 
+**Where the session stands** (the compiler project, type check only, default settings; a load average of 11 to 14 from other
+sessions' jobs, so read the ratios). Milliseconds from the executable's load to its exit, minimum / median of 21 alternating runs:
+
+| build | parse done | exit |
+|---|---|---|
+| r36, the session's first, plain | 90.4 / 98.3 | 407.4 / 416.4 |
+| r40 (the statements shared), plain | 73.1 / 79.9 | 264.2 / 275.5 |
+| r41 (wide text, the shared walk), plain | 59.7 / 67.1 | 255.8 / 263.1 |
+| r40, trained | 66.6 / 72.8 | 225.7 / 233.7 |
+| r41, trained | 55.3 / 59.9 | 211.4 / 221.8 |
+
+`/usr/bin/time`, 15 rounds: tsrs 0.15 / 0.16 s, r36 0.40 / 0.41, r41 plain 0.25 / 0.27, r41 trained 0.22 / 0.22: from 2.6x of tsrs to
+1.4x. The trained r41: 15 ms to the first parse thread's first file, checker.ts read, parsed, bound and published by 55 to 60 ms,
+the checkers forked by 59 to 64, checked by 211 to 222. What is left is work, not waiting: the check is 150 ms of ten processors
+(six of them efficiency cores) on 10.6 G instructions, where tsrs's whole compile is 4.9 G on one thread; a fifth of those
+instructions is the same lazy work done by more than one process (ten checkers that start cold, nine forks that start with a
+third of checker.ts resolved).
+
 **Found, not fixed: four checkers lose diagnostics on one corpus case, by timing.** The corpus differential with `--checkers 4`
 (1,500 cases, to put the publish walk under it) differed in one, `compiler/moduleElementsInWrongContext.ts`, and the same binary
 differs from itself there: of eight runs of r36 (the build before this session) three print 19 diagnostics, as one thread always
