@@ -13323,8 +13323,18 @@ third of checker.ts resolved).
 (1,500 cases, to put the publish walk under it) differed in one, `compiler/moduleElementsInWrongContext.ts`, and the same binary
 differs from itself there: of eight runs of r36 (the build before this session) three print 19 diagnostics, as one thread always
 does, and five print 16, without TS2305 at (20,14) and (28,14) and TS2307 at (25,25) (an import and an export of a module inside a
-block). The other 1,499 cases agree between runs. Not looked into: whether it is tsc-ts's (under scriptc too) or the fork workers'.
-The corpus check of a tsc-ts patch runs on one thread for that reason.
+block). The other 1,499 cases agree between runs. The corpus check of a tsc-ts patch runs on one thread for that reason.
+
+Its cause, looked into after the fifth slice (two and three checkers always print 19, four print 16 in 11 runs of 16, six in 14 of
+16): it is tsc-ts's own, not the workers'. The three diagnostics are not produced by the check of the case file: an import or an
+export in a block is not checked further, and its alias, which the binder of a script puts among the globals, is resolved, with its
+error, when something first asks for the type of every global: `DecoratorMetadata` of lib.decorators.d.ts is `typeof globalThis
+extends ...`, so the check of that library file reports them into the case file (a debug line in `reportNonExportedMember` names
+lib.decorators.d.ts as the file being checked). One checker checks the libraries first and has them when it reports the case file;
+with several, a file's diagnostics are those of the checker that checks it, and the three exist only in the checker that checked
+lib.decorators.d.ts, and only count if it did so before it checked the case file. tsgo collects what every checker has for a file
+and has the race in another form. A checker thread that resolved the globals' aliases before its first file would make it
+deterministic; not done: it is upstream's behaviour, for a program with module elements in a block of a script.
 
 **What it takes to pass tsrs** (2.1x on the wall after the third slice, 1.45x after the fourth; 2.6x on one thread):
 
