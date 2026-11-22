@@ -514,8 +514,10 @@ is quiet.
 
 A profile of one worker: `TSAOT_PROF_PC=<dir>/pcs` writes `pcs.<pid>` per worker; the checker of
 the largest file is the file with the most samples among the last forked. A parse worker's file
-is mostly `poll` (it waits for its next chunk and the sampler counts wall time): cut the parse
-phase out of a one-thread profile instead (`TSAOT_PROF_PC_RAW`, `scripts/prof_window.py`).
+is mostly `poll` (it waits for its next chunk and the sampler counts wall time): count the samples
+in the program's image only, and the parse worker of the largest file is the worker with the most
+of them among those with samples in `Scanner_scan` (its publish walk is in it, which a one-thread
+profile cut by `TSAOT_PROF_PC_RAW` and `scripts/prof_window.py` does not have).
 
 ### Changing tsc-ts: the patches and their check
 

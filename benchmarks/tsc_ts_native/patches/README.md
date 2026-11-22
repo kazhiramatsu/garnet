@@ -53,8 +53,12 @@ Measured and not made a patch, for the start of the parse phase (the largest fil
 9 ms after the parse threads start to be forked): the parse threads forked when there is a chunk
 for them (the config read moved from 15 to 21 ms, and the libraries' chain of references with
 it: the parse phase 5 to 10 ms longer), and the root files matched before the threads are forked
-with the largest handed to the first thread (it starts at 10 ms instead of 15, and parses slower
-beside the nine threads forked after it, which take the performance cores: 9 ms longer).
+with the largest handed to the first thread (it starts at 10 ms instead of 15: with other chunks
+queued behind it on its thread, as the session queues while root files are matched, the phase
+was 9 ms longer; with nothing queued behind it, 1 to 2 ms shorter at the median of 25 runs and
+no shorter at the minimum). A wide text's line starts by searches instead of the unit loop of
+`computeCachesFromUnits`: checker.ts has CR LF line ends in this checkout, which sends
+`computeLineStarts` to its own unit loop.
 
 ## Writing one
 

@@ -13259,14 +13259,47 @@ diagnostics it added; the checker reports the file when all have.
   `--no-backup-if-mismatch` (`--posix` cannot add a file).
 - Measured and not kept, both for the parse phase's start: the parse threads forked when there is a chunk for them (the config is
   read 6 ms later and the libraries' chain of references with it: 5 to 10 ms slower), and the root files matched first with
-  the largest handed to the first thread (it starts 5 ms earlier and parses 12 ms longer beside the nine threads forked after it,
-  which hold the performance cores: 9 ms slower).
+  the largest handed to the first thread (it starts 5 ms earlier and the phase ended 9 ms later; the cause, found in the fifth
+  slice, was other chunks queued behind it on its thread, and without them the gain is 1 to 2 ms).
 
 Gates (`build/gates_s367d/run.sh` and `run_tsc.sh`, r39 to r40): unit, bundler 56, conformance 821/821 plain and strict, 818/818
 under protect, bench within budget, ci, ir-parity identical (5,061; snapshot taken with the fixture), GC stress; tsc-ts built from the
 checkout with the four patches (the sources the forced corpus runs checked), one thread with emit outputs identical, the compiler
 project under `TSAOT_GC_PROTECT` and `TSAOT_PUBLISH_PROTECT` with forks forced and one failing, eight default runs with nine forks
 each identical to a run without sharing, the corpus on one thread 6,537 of 6,537 identical against r39, and with forks forced.
+
+**Fifth slice: the parse worker of the largest file** (after the fourth slice a fifth of the wall: read, parse, bind and publish of
+checker.ts on one process, 51 ms). Its profile (`build/s367/prof_pw.sh`: the worker with the most samples among those in the
+scanner): the publish walk 21%, the scanner 22%, the binder 10%.
+
+- **A UTF-16 text is searched and measured sixteen bytes at a time** (`ts_u16_find`, `ts_u16_find2`, `ts_u16_utf8_length`; NEON, SSE2,
+  a unit loop elsewhere). checker.ts is stored as UTF-16 for one character (U+09F9 in 3.1 M), and tsc-ts searches a source text
+  whole for each kind of line break and for `import` and `require`, and measures it (`Buffer.byteLength`): unit loops of two to five
+  instructions a unit, the multi-unit needle's a compare at every unit. Now a compare of eight units, the needle's first two units
+  together (its first alone is a common letter). The worker 0.989 to 0.920 G instructions (-7.0%), cycles -5.3%; all parse workers
+  3.834 to 3.718 G. Fixture `strings/wide_text_search` (every position of a block of 8 and of 32, needles across blocks and at the
+  end, surrogate pairs split by a block).
+- **The publish walk of a large graph on several threads** (docs/published_graphs_design.md, "The walk of a large graph on several
+  threads"): the walk writes cell headers and the allocator's bitmaps and nothing else, so walkers share it, each taking cells by
+  their mark byte, with a pool through which a walker gives the older half of its edges to those that have none. A worker that
+  allocated 32 MB since its last publish only (checker.ts here: a smaller walk would take the processors of workers that still
+  parse). 10.2 to 5.5 ms for checker.ts's 488,771 cells with four walkers (6.1 with two); the parse phase ends 7 ms earlier.
+- Together, plain builds, 25 alternating runs, minimum / median ms: parse done 65.1 / 72.6 to 58.1 / 65.8, exit 251.5 / 266.7 to
+  242.0 / 254.9.
+- Measured and not kept: a budgeted worker's allocation sites reset to young at its fork (the parent's tenured sites were not what
+  sent a parse worker's nodes out of line: no change in any worker's instructions); a wide text's line starts by searches
+  (checker.ts has CR LF line ends in this checkout, so tsc-ts's search path does not apply and its unit loop stays: the worker
+  +36 M instructions with the search path forced); the root files matched before the parse threads are forked, again, with
+  nothing queued behind a file this time (the first attempt's 9 ms loss was chunks queued behind checker.ts on its thread, not the
+  performance cores as the fourth slice's note said): 1 to 2 ms at the median, nothing at the minimum, not kept.
+
+Gates of the fifth slice (`build/gates_s367e/run.sh`, r40 to r41): unit (the runtime's C tests with the shared walk's among them),
+bundler 56, conformance 822/822 plain and strict, 819/819 under protect, bench within budget, ci, ir-parity identical (5,067; snapshot
+taken with the fixture), GC stress, hono / hono_app / vue outputs identical (instructions 0.9998 / 1.0000 / 1.0001); tsc-ts one thread
+with emit outputs identical (21.583 to 21.507 G), the compiler project under the protect modes and small young budgets with every
+walk shared, eight runs with every walk shared (ten publishes of 50,000 cells or more on four walkers each) identical to one walker's,
+the corpus on one thread 6,537 of 6,537 identical against r40, and on two checkers with every walk shared against one walker
+6,537 of 6,537 (four walkers in every case).
 
 **Found, not fixed: four checkers lose diagnostics on one corpus case, by timing.** The corpus differential with `--checkers 4`
 (1,500 cases, to put the publish walk under it) differed in one, `compiler/moduleElementsInWrongContext.ts`, and the same binary

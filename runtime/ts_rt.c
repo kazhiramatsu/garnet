@@ -603,10 +603,17 @@ static char* gc_space_refill(gc_pclass* classes, uint8_t state, unsigned cls, in
   return gc_space_refill_z(classes, state, cls, log_runs, 1);
 }
 static char* gc_payload_refill(unsigned cls){ return gc_space_refill(g_pclass, GC_BLK_PAYLOAD, cls, GC_PAYLOAD_CHECKED); }
+/* More than one while a publish walks a graph on several threads (publish_walk_shared): the only
+   time two threads write a block's bitmap and its live count. */
+static int g_publish_walkers = 1;
 static inline void gc_payload_mark_small(uint32_t bi, uintptr_t off_in_block){
   uint32_t g = (uint32_t)(off_in_block >> 4);
   uint64_t* w = &gc_block_bitmap(bi)[g >> 6];
   uint64_t m = (uint64_t)1u << (g & 63u);
+  if (TS_RT_UNLIKELY(__atomic_load_n(&g_publish_walkers, __ATOMIC_RELAXED) > 1)){
+    if (!(__atomic_fetch_or(w, m, __ATOMIC_RELAXED) & m)) __atomic_fetch_add(&g_blocks[bi].live, (uint32_t)g_pclass_size[g_blocks[bi].cls], __ATOMIC_RELAXED);
+    return;
+  }
   if (!(*w & m)){ *w |= m; g_blocks[bi].live += g_pclass_size[g_blocks[bi].cls]; }
 }
 static void* gc_payload_alloc_large(size_t bytes, int old){
@@ -4890,6 +4897,106 @@ ts_strview ts_str_view_typed_slow(tsv s){
   return v;
 }
 
+/* A text stored as UTF-16 (one unit past U+00FF is enough: a compiler's largest source file, for
+   a character in a comment) is searched and measured sixteen bytes at a time. The unit loops took
+   two to five instructions a unit, and tsc-ts searches a source text whole for each kind of line
+   break, for `import` and `require`, and measures it (Buffer.byteLength): 5 ms of the 40 its
+   largest file's scan and parse take. The pointers are byte pointers: a view's units need not be
+   aligned. */
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#define TS_U16_VEC 1
+typedef uint16x8_t ts_u16x8;
+static inline ts_u16x8 ts_u16x8_load(const char* p){ return vreinterpretq_u16_u8(vld1q_u8((const uint8_t*)p)); }
+static inline ts_u16x8 ts_u16x8_splat(uint16_t u){ return vdupq_n_u16(u); }
+static inline ts_u16x8 ts_u16x8_eq(ts_u16x8 a, ts_u16x8 b){ return vceqq_u16(a, b); }
+static inline ts_u16x8 ts_u16x8_or(ts_u16x8 a, ts_u16x8 b){ return vorrq_u16(a, b); }
+static inline ts_u16x8 ts_u16x8_and(ts_u16x8 a, ts_u16x8 b){ return vandq_u16(a, b); }
+static inline int ts_u16x8_any(ts_u16x8 m){ return vmaxvq_u16(m) != 0; }
+/* the lanes of `v` not below `u`, each as all ones */
+static inline ts_u16x8 ts_u16x8_ge(ts_u16x8 v, ts_u16x8 u){ return vcgeq_u16(v, u); }
+/* how many lanes of a mask are set */
+static inline uint32_t ts_u16x8_count(ts_u16x8 m){ return (uint32_t)vaddvq_u16(vshrq_n_u16(m, 15)); }
+#elif defined(__SSE2__)
+#include <emmintrin.h>
+#define TS_U16_VEC 1
+typedef __m128i ts_u16x8;
+static inline ts_u16x8 ts_u16x8_load(const char* p){ return _mm_loadu_si128((const __m128i*)p); }
+static inline ts_u16x8 ts_u16x8_splat(uint16_t u){ return _mm_set1_epi16((short)u); }
+static inline ts_u16x8 ts_u16x8_eq(ts_u16x8 a, ts_u16x8 b){ return _mm_cmpeq_epi16(a, b); }
+static inline ts_u16x8 ts_u16x8_or(ts_u16x8 a, ts_u16x8 b){ return _mm_or_si128(a, b); }
+static inline ts_u16x8 ts_u16x8_and(ts_u16x8 a, ts_u16x8 b){ return _mm_and_si128(a, b); }
+static inline int ts_u16x8_any(ts_u16x8 m){ return _mm_movemask_epi8(m) != 0; }
+/* unsigned v >= u: the saturated difference u - v is zero */
+static inline ts_u16x8 ts_u16x8_ge(ts_u16x8 v, ts_u16x8 u){ return _mm_cmpeq_epi16(_mm_subs_epu16(u, v), _mm_setzero_si128()); }
+static inline uint32_t ts_u16x8_count(ts_u16x8 m){ return (uint32_t)__builtin_popcount((unsigned)_mm_movemask_epi8(m)) >> 1; }
+#else
+#define TS_U16_VEC 0
+#endif
+static inline uint16_t ts_u16_at(const char* p, size_t i){ uint16_t cu; memcpy(&cu, p + 2u * i, sizeof cu); return cu; }
+/* The first of the n UTF-16 units at p that equals `unit`, or n. */
+static size_t ts_u16_find(const char* p, size_t n, uint16_t unit){
+  size_t i = 0;
+#if TS_U16_VEC
+  const ts_u16x8 want = ts_u16x8_splat(unit);
+  for (; i + 32u <= n; i += 32u){
+    const char* q = p + 2u * i;
+    ts_u16x8 m = ts_u16x8_or(ts_u16x8_or(ts_u16x8_eq(ts_u16x8_load(q), want), ts_u16x8_eq(ts_u16x8_load(q + 16), want)),
+                             ts_u16x8_or(ts_u16x8_eq(ts_u16x8_load(q + 32), want), ts_u16x8_eq(ts_u16x8_load(q + 48), want)));
+    if (ts_u16x8_any(m)) break;   /* in these 32 units: the loop below says where */
+  }
+  for (; i + 8u <= n; i += 8u) if (ts_u16x8_any(ts_u16x8_eq(ts_u16x8_load(p + 2u * i), want))) break;
+#endif
+  for (; i < n; i++) if (ts_u16_at(p, i) == unit) return i;
+  return n;
+}
+/* The first i below n with the units `first` at i and `second` at i + 1, or n. The unit at n is
+   read: the caller's text has it. A needle's first unit alone is a common letter (the `i` of
+   `import` every fifteen units of a source text); its first two are rare. */
+static size_t ts_u16_find2(const char* p, size_t n, uint16_t first, uint16_t second){
+  size_t i = 0;
+#if TS_U16_VEC
+  const ts_u16x8 want0 = ts_u16x8_splat(first), want1 = ts_u16x8_splat(second);
+  for (; i + 8u <= n; i += 8u){
+    const char* q = p + 2u * i;
+    if (ts_u16x8_any(ts_u16x8_and(ts_u16x8_eq(ts_u16x8_load(q), want0), ts_u16x8_eq(ts_u16x8_load(q + 2), want1)))) break;
+  }
+#endif
+  for (; i < n; i++) if (ts_u16_at(p, i) == first && ts_u16_at(p, i + 1u) == second) return i;
+  return n;
+}
+/* The UTF-8 length of n UTF-16 units: one byte a unit, one more from U+0080, one more from U+0800,
+   and a surrogate pair four bytes together (a surrogate alone three, the replacement character's). */
+static double ts_u16_utf8_length(const char* p, size_t n){
+  double total = 0; size_t i = 0;
+  while (i < n){
+#if TS_U16_VEC
+    const ts_u16x8 c80 = ts_u16x8_splat(0x80u), c800 = ts_u16x8_splat(0x800u), sur_mask = ts_u16x8_splat(0xF800u), sur = ts_u16x8_splat(0xD800u);
+    uint32_t extra = 0; size_t from = i;
+    while (i + 8u <= n){
+      ts_u16x8 v = ts_u16x8_load(p + 2u * i);
+      if (ts_u16x8_any(ts_u16x8_eq(ts_u16x8_and(v, sur_mask), sur))) break;   /* a surrogate: the units one by one */
+      extra += ts_u16x8_count(ts_u16x8_ge(v, c80)) + ts_u16x8_count(ts_u16x8_ge(v, c800));
+      i += 8u;
+    }
+    total += (double)(i - from) + (double)extra;
+#endif
+    /* up to eight units one by one: the tail, or the units around a surrogate */
+    size_t stop = n - i > 8u ? i + 8u : n;
+    while (i < stop){
+      uint32_t cu = ts_u16_at(p, i);
+      if (cu < 0x80u) total += 1;
+      else if (cu < 0x800u) total += 2;
+      else if (cu >= 0xD800u && cu <= 0xDBFFu && i + 1u < n){
+        uint32_t lo = ts_u16_at(p, i + 1u);
+        if (lo >= 0xDC00u && lo <= 0xDFFFu){ total += 4; i++; } else total += 3;
+      } else total += 3;
+      i++;
+    }
+  }
+  return total;
+}
+
 long long ts_str_find_forward_view_slow(ts_strview xs, ts_strview ns,
                                         long long start){
   char nbuf[TS_SHORTSTR_MAX];
@@ -4932,18 +5039,23 @@ long long ts_str_find_forward_view_slow(ts_strview xs, ts_strview ns,
       }
       return -1;
     }
+    /* both UTF-16 here: sixteen bytes at a time (ts_u16_find) */
     uint16_t first = ts_str_cu_at_contiguous(ns, 0);
     if (ns.len == 1){
-      for (uint32_t i=(uint32_t)start;i<xs.len;i++)
-        if (ts_str_cu_at_contiguous(xs, i) == first) return (long long)i;
-      return -1;
+      size_t left = xs.len - (uint32_t)start;
+      size_t at = ts_u16_find(xdata + 2u * (size_t)start, left, first);
+      return at < left ? start + (long long)at : -1;
     }
-    uint16_t last = ts_str_cu_at_contiguous(ns, ns.len - 1);
-    for (uint32_t i=(uint32_t)start;i<=xs.len-ns.len;i++){
-      if (ts_str_cu_at_contiguous(xs, i) == first &&
-          ts_str_cu_at_contiguous(xs, i + ns.len - 1) == last &&
-          ts_str_region_eq(xs, i + 1, ns, 1, ns.len - 2))
-        return (long long)i;
+    /* the needle's first two units together, then its rest */
+    uint16_t second = ts_str_cu_at_contiguous(ns, 1);
+    uint32_t i = (uint32_t)start; const uint32_t last_start = xs.len - ns.len;
+    while (i <= last_start){
+      size_t left = (size_t)(last_start - i) + 1u;
+      size_t at = ts_u16_find2(xdata + 2u * (size_t)i, left, first, second);
+      if (at >= left) return -1;
+      i += (uint32_t)at;
+      if (ns.len == 2 || ts_str_region_eq(xs, i + 2, ns, 2, ns.len - 2)) return (long long)i;
+      i++;
     }
     return -1;
   }
@@ -25338,6 +25450,13 @@ typedef struct {
   ts_gc_header** done; size_t dlen, dcap;    /* the cells visited, tagged in the pointer's low bits: 1 frozen before this walk, 2 kept (not frozen) */
   ts_gc_header** keep; size_t klen, kcap;    /* region mode: the prototypes reached and what they reach, visited after the graph */
   int keeping;                               /* pushes go to `keep`, visits keep rather than freeze */
+  /* one of several walkers of the graph (publish_walk_shared): a cell is taken by its mark byte
+     atomically, the bitmaps are written atomically, and what the walk would add to the runtime's
+     own lists and counters is kept here until the walkers have joined */
+  int shared;
+  ts_gc_header** prefork; size_t plen, pcap; /* shared: the pre-fork cells reached */
+  size_t old_bytes;                          /* shared: the bytes promoted */
+  const char* rejected;                      /* shared: the kind this walker met that cannot be published */
 } publish_walk;
 #define PUBLISH_DONE_WAS_FROZEN 1u
 #define PUBLISH_DONE_KEPT 2u
@@ -25504,6 +25623,8 @@ static const char* publish_visit(publish_walk* w, ts_gc_header* h){
   if (h->kind == TS_KIND_STRING && h->gen != TS_GEN_YOUNG && h->gen != TS_GEN_OLD) return NULL;   /* interned: immortal */
   const char* rejected = publish_rejected_kind(h);
   if (rejected) return rejected;
+  /* one of several walkers: the cell is this walker's if it sets the mark first */
+  if (w->shared && __atomic_exchange_n(&h->mark, (uint8_t)1, __ATOMIC_RELAXED)) return NULL;
   int bag = h->kind == TS_KIND_OBJECT || h->kind == TS_KIND_ARRAY || h->kind == TS_KIND_FUNC || h->kind == TS_KIND_MAP || h->kind == TS_KIND_SET;
   uintptr_t tag = 0;
   if (w->keeping) tag = PUBLISH_DONE_KEPT;
@@ -25513,24 +25634,201 @@ static const char* publish_visit(publish_walk* w, ts_gc_header* h){
       ts_obj_add_integrity((ts_object*)h, 1u);
     }
     h->flags |= TS_HDR_PUBLISHED;
-    if (g_region_mode && !region_holds(h)) prefork_frozen_push((uintptr_t)h);
+    if (g_region_mode && !region_holds(h)){
+      if (w->shared) publish_append(&w->prefork, &w->plen, &w->pcap, h);
+      else prefork_frozen_push((uintptr_t)h);
+    }
   }
   publish_append(&w->done, &w->dlen, &w->dcap, (ts_gc_header*)((uintptr_t)h | tag));
   if (g_region_mode){
     /* immortal here (old, never collected) and opaque to the parent's markers
        (mark 1 reads as already marked) */
-    if (h->gen == TS_GEN_YOUNG) g_old_bytes += gc_cell_heap_bytes(h, gc_cell_promote(h));
+    if (w->shared){
+      /* the mark stays set from the claim on: another walker reads it */
+      if (h->gen == TS_GEN_YOUNG){
+        w->old_bytes += gc_cell_heap_bytes(h, gc_cell_set_old_bit(h));
+        h->gen = TS_GEN_OLD; h->flags &= (uint8_t)~TS_HDR_REMEMBERED;
+      }
+    } else if (h->gen == TS_GEN_YOUNG) g_old_bytes += gc_cell_heap_bytes(h, gc_cell_promote(h));
     publish_mark_payloads(h);
   }
   h->mark = 1;
   publish_children(w, h);
   return NULL;
 }
+/* The rest of a large graph on several threads. A shared worker's publish of a parsed source file
+   is a walk of half a million cells whose time is the cells' cache misses (13 ms for a 3 MB file,
+   on the path that ends a compiler's parse phase), run when the other parse workers are done and
+   their processors idle. The walk touches cells and the allocator's bitmaps and nothing else of
+   the runtime, so walkers on threads share it: each takes a part of the edges found so far and
+   walks depth first from them; a cell belongs to the walker that sets its mark first
+   (publish_visit), the bitmaps are written atomically (g_publish_walkers), and each walker's
+   lists and counts are merged when all have joined. The threads exist during the walk only: the
+   process is single-threaded again when publish returns (a worker may fork after it). */
+#define PUBLISH_SHARED_EDGES 64u        /* the least edges found to share */
+#define PUBLISH_WALKERS_MAX 4
+/* Which walks are shared: those of a worker that allocated this much of its region since its last
+   publish (a graph of a quarter of a million cells or more, a source file past a megabyte: below
+   that a walk is two or three milliseconds, and its walkers would take the processors of workers
+   that still parse), from this many cells on (the walk has found the graph's breadth by then).
+   TSAOT_PUBLISH_SHARE_BYTES and TSAOT_PUBLISH_SHARE_AFTER set them, for the tests that share
+   every walk. */
+static size_t g_publish_share_bytes = (size_t)32u << 20;
+static size_t g_publish_share_after = 8192u;
+static uint32_t g_publish_region_mark = 0;   /* the region's blocks taken when the last publish ended */
+#define PUBLISH_GIVE_MIN 64u            /* a walker with fewer edges keeps them */
+/* The edges a walker gave away for the walkers that have none. A graph is not a balanced tree (a
+   source file is one function of three megabytes): a walker that has run out waits here, and a
+   walker with edges to spare, asked every 128 visits, gives the older half of its stack, which
+   are the cells nearest the root and so the largest subgraphs. A waiting walker spins: the walk
+   lasts milliseconds, and a sleep and its wake-up cost more than the edges they wait for (with a
+   condition variable the wake-ups were a third of the walk's cycles). */
+static struct {
+  pthread_mutex_t lock;
+  ts_gc_header** edges; size_t len, cap;
+  int walkers, waiting;      /* the walkers, and those waiting for edges */
+  int stop;                  /* a walker met a kind that cannot be published: the others stop */
+} g_publish_pool = { PTHREAD_MUTEX_INITIALIZER, NULL, 0, 0, 0, 0, 0 };
+static inline void publish_spin_pause(uint32_t round){
+#if defined(__aarch64__)
+  __asm__ __volatile__("yield");
+#elif defined(__x86_64__) || defined(__i386__)
+  __builtin_ia32_pause();
+#endif
+  if ((round & 1023u) == 1023u) sched_yield();             /* a processor short of threads: let one run */
+}
+static int publish_walker_count(void){
+  static int n = 0;
+  if (!n){
+    const char* e = getenv("TSAOT_PUBLISH_THREADS");
+    long c = e && e[0] ? strtol(e, NULL, 10) : 0;
+    const char* sb = getenv("TSAOT_PUBLISH_SHARE_BYTES"); if (sb && sb[0]) g_publish_share_bytes = (size_t)strtoull(sb, NULL, 10);
+    const char* sa = getenv("TSAOT_PUBLISH_SHARE_AFTER"); if (sa && sa[0]) g_publish_share_after = (size_t)strtoull(sa, NULL, 10);
+    if (!g_publish_share_after) g_publish_share_after = 1u;
+    if (c <= 0){
+      /* the processors this process counts on (TSAOT_CPUS, as os.availableParallelism) */
+      const char* cpus = getenv("TSAOT_CPUS");
+      c = cpus && cpus[0] ? strtol(cpus, NULL, 10) : sysconf(_SC_NPROCESSORS_ONLN);
+    }
+    n = c < 1 ? 1 : c > PUBLISH_WALKERS_MAX ? PUBLISH_WALKERS_MAX : (int)c;
+  }
+  return n;
+}
+/* The older half of `w`'s edges to the pool (its stack keeps the newer half, in order). */
+static void publish_give(publish_walk* w){
+  size_t give = w->elen / 2u;
+  pthread_mutex_lock(&g_publish_pool.lock);
+  if (g_publish_pool.waiting && !g_publish_pool.len){
+    for (size_t i = 0; i < give; i++) publish_append(&g_publish_pool.edges, &g_publish_pool.len, &g_publish_pool.cap, w->edges[i]);
+    memmove(w->edges, w->edges + give, (w->elen - give) * sizeof *w->edges);
+    w->elen -= give;
+  }
+  pthread_mutex_unlock(&g_publish_pool.lock);
+}
+/* Edges for a walker that has none: a share of the pool, once a walker has given some. 0 once
+   every walker waits (the graph is walked) or one has stopped the walk. */
+static int publish_take(publish_walk* w){
+  __atomic_fetch_add(&g_publish_pool.waiting, 1, __ATOMIC_RELAXED);
+  for (uint32_t round = 0; ; round++){
+    if (__atomic_load_n(&g_publish_pool.len, __ATOMIC_RELAXED)){
+      pthread_mutex_lock(&g_publish_pool.lock);
+      size_t len = g_publish_pool.len;
+      if (len){
+        /* a share that leaves some for the other walkers waiting, the pool's newest edges first */
+        size_t take = len / (size_t)g_publish_pool.waiting;
+        if (!take) take = 1;
+        for (size_t i = 0; i < take; i++) publish_append(&w->edges, &w->elen, &w->ecap, g_publish_pool.edges[len - take + i]);
+        g_publish_pool.len = len - take;
+        __atomic_fetch_sub(&g_publish_pool.waiting, 1, __ATOMIC_RELAXED);
+        pthread_mutex_unlock(&g_publish_pool.lock);
+        return 1;
+      }
+      pthread_mutex_unlock(&g_publish_pool.lock);
+    }
+    if (__atomic_load_n(&g_publish_pool.stop, __ATOMIC_RELAXED)) return 0;
+    /* every walker waits and none can give: the graph is walked (a walker that still has edges is
+       not waiting, and only a waiting walker's edges are in the pool's count of none) */
+    if (__atomic_load_n(&g_publish_pool.waiting, __ATOMIC_RELAXED) == g_publish_pool.walkers &&
+        !__atomic_load_n(&g_publish_pool.len, __ATOMIC_RELAXED)) return 0;
+    publish_spin_pause(round);
+  }
+}
+static void* publish_walker(void* arg){
+  publish_walk* w = (publish_walk*)arg;
+  const char* rejected = NULL;
+  uint32_t visits = 0;
+  for (;;){
+    while (w->elen && !rejected){
+      ts_gc_header* h = w->edges[--w->elen];
+      if (w->elen >= 4u) __builtin_prefetch(w->edges[w->elen - 4u]);
+      rejected = publish_visit(w, h);
+      if (TS_RT_UNLIKELY((++visits & 127u) == 0)){
+        if (__atomic_load_n(&g_publish_pool.stop, __ATOMIC_RELAXED)) break;
+        if (w->elen >= PUBLISH_GIVE_MIN && __atomic_load_n(&g_publish_pool.waiting, __ATOMIC_RELAXED)) publish_give(w);
+      }
+    }
+    if (rejected){
+      w->rejected = rejected;
+      __atomic_store_n(&g_publish_pool.stop, 1, __ATOMIC_RELAXED);
+      return NULL;
+    }
+    if (__atomic_load_n(&g_publish_pool.stop, __ATOMIC_RELAXED) || !publish_take(w)) return NULL;
+  }
+}
+/* Walks the graph from `w`'s edges on `n` threads, this one among them, and merges what the
+   others found into `w`. Returns the kind that cannot be published, if a walker met one. */
+static const char* publish_walk_shared(publish_walk* w, int n){
+  publish_walk part[PUBLISH_WALKERS_MAX]; pthread_t thread[PUBLISH_WALKERS_MAX]; int started[PUBLISH_WALKERS_MAX];
+  /* the class table every walker reads exists before they start (class_reg_for_sized allocates it) */
+  if (!g_class_reg_by_word){
+    g_class_reg_by_word = (ts_class_reg**)calloc(g_class_of_word_n ? g_class_of_word_n : 1u, sizeof(*g_class_reg_by_word));
+    if (!g_class_reg_by_word) return NULL;                 /* out of memory: this thread walks on alone */
+    g_class_reg_by_word_n = g_class_of_word_n;
+  }
+  memset(part, 0, sizeof part);
+  g_publish_pool.len = 0; g_publish_pool.waiting = 0; g_publish_pool.stop = 0; g_publish_pool.walkers = n;
+  __atomic_store_n(&g_publish_walkers, n, __ATOMIC_RELAXED);
+  w->shared = 1;
+  /* the others start without edges: they wait at the pool, and this walker gives them its older half */
+  pthread_attr_t attr; pthread_attr_init(&attr);
+#ifdef __APPLE__
+  /* the walkers on performance cores: a thread without a class of its own is placed on an
+     efficiency core beside a busy one, where the walk's cache misses take twice as long */
+  pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+  for (int k = 1; k < n; k++){
+    part[k].shared = 1;
+    started[k] = pthread_create(&thread[k], &attr, publish_walker, &part[k]) == 0;
+    if (!started[k]) g_publish_pool.walkers--;             /* written before any walker can be waiting for all */
+  }
+  pthread_attr_destroy(&attr);
+  publish_walker(w);
+  for (int k = 1; k < n; k++) if (started[k]) pthread_join(thread[k], NULL);
+  __atomic_store_n(&g_publish_walkers, 1, __ATOMIC_RELAXED);
+  const char* rejected = w->rejected;
+  for (int k = 1; k < n; k++){
+    publish_walk* p = &part[k];
+    if (!rejected) rejected = p->rejected;
+    for (size_t i = 0; i < p->dlen; i++) publish_append(&w->done, &w->dlen, &w->dcap, p->done[i]);
+    for (size_t i = 0; i < p->klen; i++) publish_append(&w->keep, &w->klen, &w->kcap, p->keep[i]);
+    for (size_t i = 0; i < p->plen; i++) publish_append(&w->prefork, &w->plen, &w->pcap, p->prefork[i]);
+    for (size_t i = 0; i < p->elen; i++) publish_append(&w->edges, &w->elen, &w->ecap, p->edges[i]);   /* left when the walk was stopped */
+    w->old_bytes += p->old_bytes;
+    free(p->edges); free(p->done); free(p->keep); free(p->prefork);
+  }
+  for (size_t i = 0; i < g_publish_pool.len; i++) publish_append(&w->edges, &w->elen, &w->ecap, g_publish_pool.edges[i]);   /* the same */
+  free(g_publish_pool.edges); g_publish_pool.edges = NULL; g_publish_pool.len = g_publish_pool.cap = 0;
+  for (size_t i = 0; i < w->plen; i++) prefork_frozen_push((uintptr_t)w->prefork[i]);
+  free(w->prefork); w->prefork = NULL; w->plen = w->pcap = 0;
+  g_old_bytes += w->old_bytes; w->old_bytes = 0;
+  w->shared = 0; w->rejected = NULL;
+  return rejected;
+}
 static inline ts_gc_header* publish_done_cell(ts_gc_header* tagged){ return (ts_gc_header*)((uintptr_t)tagged & ~(uintptr_t)3u); }
 tsv ts_publish(tsv v){
   if (!(TS_TOP16(v) == TS_SEL_OBJECT || ts_is_func(v))) return v;    /* primitives: already immutable */
   if (g_has_proxies && ts_is_proxy(v)) ts_throw_type_error_msg("Cannot publish a Proxy");
-  publish_walk w = { NULL, 0, 0, NULL, 0, 0, NULL, 0, 0, 0 };
+  publish_walk w; memset(&w, 0, sizeof w);
   double pt0 = fork_trace_on() ? fork_trace_now_ms() : 0;
   unsigned long long pi0 = 0, pc0 = 0;
   if (pt0) fork_trace_self_counts(&pi0, &pc0);
@@ -25542,11 +25840,24 @@ tsv ts_publish(tsv v){
      before its turn (its line may have left the cache under the subtrees
      visited in between): one prefetch a push and one a pop, where six a pop
      were a third of the walk's instructions. */
+  /* a shared worker that allocated much since its last publish: a large graph, shared between
+     walkers once it has shown its breadth */
+  int walkers = 1, shared_by = 1;
+  if (g_region_mode){
+    walkers = publish_walker_count();
+    uint32_t since = g_region_cur - (g_publish_region_mark > g_region_lo ? g_publish_region_mark : g_region_lo);
+    if (((size_t)since << GC_BLOCK_SHIFT) < g_publish_share_bytes) walkers = 1;
+  }
   while (w.elen && !rejected){
     ts_gc_header* h = w.edges[--w.elen];
     if (w.elen >= 4u) __builtin_prefetch(w.edges[w.elen - 4u]);
     rejected = publish_visit(&w, h);
+    if (TS_RT_UNLIKELY(walkers > 1) && w.dlen >= g_publish_share_after && w.elen >= PUBLISH_SHARED_EDGES && !rejected){
+      rejected = publish_walk_shared(&w, walkers);
+      shared_by = walkers; walkers = 1;
+    }
   }
+  if (g_region_mode) g_publish_region_mark = g_region_cur;
   w.keeping = 1;   /* the prototypes reached (region mode), and what they reach */
   while (w.klen && !rejected){
     ts_gc_header* h = w.keep[--w.klen];
@@ -25578,8 +25889,8 @@ tsv ts_publish(tsv v){
   if (w.dlen) prop_add_epoch_bump();
   if (pt0 && w.dlen >= 50000){
     unsigned long long pi1 = 0, pc1 = 0; fork_trace_self_counts(&pi1, &pc1);
-    fprintf(stderr, "[publish] pid %d: %zu cells: %.2f ms, %.1f M instructions, %.1f M cycles\n", (int)getpid(), w.dlen, fork_trace_now_ms() - pt0,
-            (double)(pi1 - pi0) / 1e6, (double)(pc1 - pc0) / 1e6);
+    fprintf(stderr, "[publish] pid %d: %zu cells: %.2f ms, %.1f M instructions, %.1f M cycles, %d walker%s\n", (int)getpid(), w.dlen, fork_trace_now_ms() - pt0,
+            (double)(pi1 - pi0) / 1e6, (double)(pc1 - pc0) / 1e6, shared_by, shared_by == 1 ? "" : "s");
   }
   free(w.edges); free(w.done); free(w.keep);
   return v;

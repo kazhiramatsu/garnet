@@ -588,21 +588,9 @@ static tsv nh_utf8_length_walk(ts_strview v){
     return ts_num((double)v.len + (double)high);
   }
   double total = 0;
-  if (v.data){
-    /* UTF-16 storage: the units read directly (a source text with one
-       character past U+00FF is stored this way and measured once per text) */
-    const unsigned char* d = (const unsigned char*)v.data;
-    for (uint32_t i = 0; i < v.len; i++){
-      uint32_t cu = (uint32_t)d[2 * i] | ((uint32_t)d[2 * i + 1] << 8);
-      if (cu < 0x80u) total += 1;
-      else if (cu < 0x800u) total += 2;
-      else if (cu >= 0xD800u && cu <= 0xDBFFu && i + 1 < v.len){
-        uint32_t lo = (uint32_t)d[2 * i + 2] | ((uint32_t)d[2 * i + 3] << 8);
-        if (lo >= 0xDC00u && lo <= 0xDFFFu){ total += 4; i++; } else total += 3;
-      } else total += 3;
-    }
-    return ts_num(total);
-  }
+  /* UTF-16 storage (a source text with one character past U+00FF is stored this way and
+     measured once per text): sixteen bytes at a time (ts_rt.c, ts_u16_utf8_length) */
+  if (v.data) return ts_num(ts_u16_utf8_length(v.data, v.len));
   for (uint32_t i = 0; i < v.len; i++){
     uint32_t cu = ts_str_cu_at_view(v, i);
     if (cu < 0x80u) total += 1;

@@ -492,6 +492,45 @@ memory, with the prefetches in place), the edges to cells already reached (pushe
 to find their mark set; reading the mark at the push would take the cell's miss there) and the
 visit itself. `TSAOT_FORK_TRACE=1` prints a publish's instructions and cycles beside its time.
 
+### The walk of a large graph on several threads (Session 367)
+
+After the instructions, the walk's time is the cells' cache misses, and it is the last thing on
+the path that ends a compiler's parse phase: the parse worker of the largest file publishes half
+a million cells while the other parse workers are done and their processors idle. A shared
+worker's walk of a large graph is therefore shared between threads (`publish_walk_shared`):
+
+- **Which walks.** A worker that allocated 32 MB or more of its region since its last publish (a
+  source file past a megabyte), once the walk has visited 8,192 cells and holds 64 edges. Smaller
+  graphs are walked as before: their walk is two or three milliseconds, and walkers would take the
+  processors of workers that still parse. `TSAOT_PUBLISH_THREADS` is the number of walkers (four
+  at most, the default; 1 for none), `TSAOT_PUBLISH_SHARE_BYTES` and `TSAOT_PUBLISH_SHARE_AFTER`
+  the two thresholds (the tests set them to 0 and 64, which shares every walk).
+- **What the walkers share.** The walk writes cell headers and the allocator's bitmaps and reads
+  the class table: nothing else of the runtime. A cell belongs to the walker that sets its mark
+  byte first (an atomic exchange; the walk's visited set was the mark byte already), a bitmap word
+  and a block's live count are written atomically while more than one walker runs
+  (`g_publish_walkers`), and each walker keeps its own stack of edges, its list of cells done (the
+  undo of a refused publish runs over all of them), its prototypes to keep, its pre-fork cells and
+  its promoted bytes, merged when the walkers have joined. The threads exist during the walk only:
+  the process is single-threaded again when `publish` returns.
+- **The edges move.** A source file is not a balanced tree (one function of three megabytes), so
+  the walkers start with nothing but the first one: a walker that has run out waits at a pool, and
+  a walker with 64 edges or more, asked every 128 visits, gives the older half of its stack (the
+  cells nearest the root, the largest subgraphs). A waiting walker spins: with a condition
+  variable the sleeps and wake-ups were a third of the walk's cycles and no faster.
+- **Measured** (`TSAOT_FORK_TRACE=1` prints the walkers beside a publish's time): checker.ts,
+  488,771 cells, 10.2 ms with one walker, 6.1 with two, 5.5 with four (cycles 43 M to 77 M: the
+  walkers on efficiency cores, the waiting ones spinning, the bitmap's atomic writes, about a
+  millisecond of the four-walker time); a graph of 200,000 cells in rows (the runtime test's)
+  4 ms to 1.2 ms. On the compiler project the parse phase ends 7 ms earlier (58.1 / 65.8 ms
+  against 65.1 / 72.6, minimum / median of 25 alternating runs, with the search of UTF-16 text
+  below; 64.0 / 72.2 with one walker).
+- **Tests.** `runtime/ts_rt_test.c`, "shared walk": a worker's graph of 200,000 cells with a
+  chain through all of them, a pre-fork cell reached from a fifth, prototypes of its own, refused
+  whole for a typed array at its end (nothing stays published), then published, read cell by cell
+  in the parent after the worker's collections. tsc-ts with every walk shared: the compiler
+  project and TypeScript's test cases identical, the protect modes and a small young budget clean.
+
 ## Sharing by fork: regions
 
 The fork prototype shares the parent's heap with its children by

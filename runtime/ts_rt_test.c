@@ -263,6 +263,78 @@ static int map_set_throws(tsv m){
   ts_eh_pop();
   return 0;
 }
+static int publish_throws(tsv root){
+  ts_handler* h = ts_eh_push();
+  if (ts_setjmp(h->buf) != 0){
+    ts_gc_set_root_depth(h->gc_root_len);
+    ts_frame_restore(h->frame_top);
+    ts_eh_pop();
+    return 1;
+  }
+  ts_publish(root);
+  ts_eh_pop();
+  return 0;
+}
+/* A shared worker publishes a graph of two hundred thousand cells, its walk shared between
+   threads (the test sets TSAOT_PUBLISH_SHARE_BYTES=0, TSAOT_PUBLISH_SHARE_AFTER=64 and
+   TSAOT_PUBLISH_THREADS=4): rows of objects with a string each, a chain through all of them, a
+   pre-fork cell reached from every fifth, a prototype of the worker's own under every eighth, a
+   Map of the rows. First with a typed array in the last row: the publish is refused whole and
+   nothing stays published. Then without it. The collections after the publish reuse what a
+   walker failed to mark old. */
+#define SHARED_WIDE_ROWS 2500
+#define SHARED_WIDE_COLS 40
+static tsv shared_wide_got = TS_UNDEFINED;
+static tsv test_shared_wide_entry(tsv* a, int n){
+  tsv data = n > 0 ? a[0] : TS_UNDEFINED;
+  tsv pre = ts_get(data, ts_intern_field("pre", 3)); ts_gc_root(&pre);
+  ts_key kdeep = ts_intern_field("deep", 4), ktext = ts_intern_field("text", 4), kpre = ts_intern_field("pre", 3);
+  tsv root = ts_new_object(); ts_gc_root(&root);
+  tsv rows = ts_new_array(0); ts_gc_root(&rows);
+  tsv proto = ts_new_object(); ts_gc_root(&proto);
+  ts_set(proto, ts_intern_field("inh", 3), ts_num(7));
+  tsv m = ts_new_map(); ts_gc_root(&m);
+  tsv prev = TS_UNDEFINED; ts_gc_root(&prev);
+  for (int r = 0; r < SHARED_WIDE_ROWS; r++){
+    tsv row = ts_new_array(0); ts_gc_root(&row);
+    for (int c = 0; c < SHARED_WIDE_COLS; c++){
+      tsv o = c % 8 == 0 ? ts_object_create(proto) : ts_new_object(); ts_gc_root(&o);
+      char b[32]; int len = snprintf(b, sizeof b, "cell_%d_%d_of_the_wide_graph", r, c);
+      ts_set(o, kdeep, ts_num((double)(r * SHARED_WIDE_COLS + c)));
+      ts_set(o, ktext, ts_new_string(b, (uint32_t)len));
+      ts_set(o, kpre, c % 5 == 0 ? pre : prev);
+      ts_array_push(row, o);
+      prev = o;
+      ts_gc_unroot(1);
+    }
+    ts_array_push(rows, row);
+    if (r % 5 == 0){ char kb[16]; int kl = snprintf(kb, sizeof kb, "row%d", r); tsv k = ts_new_string(kb, (uint32_t)kl); ts_gc_root(&k); ts_map_set(m, k, row); ts_gc_unroot(1); }
+    ts_gc_unroot(1);
+  }
+  ts_set(root, ts_intern_field("arr", 3), rows);
+  ts_set(root, ts_intern_field("m", 1), m);
+  /* refused: a typed array at the end of the last row */
+  tsv last = ts_array_get(rows, SHARED_WIDE_ROWS - 1); ts_gc_root(&last);
+  tsv one = ts_num(1);
+  ts_array_push(last, ts_new_typed_array(TS_TA_UINT8, &one, 1));
+  int refused = publish_throws(root);
+  tsv probe = ts_array_get(ts_array_get(rows, 1234), 7); ts_gc_root(&probe);
+  int clean = !ts_is_published(root) && !ts_is_published(rows) && !ts_is_published(probe) && !ts_is_published(m) &&
+              !write_throws(probe, kdeep, ts_num((double)(1234 * SHARED_WIDE_COLS + 7)));
+  ts_array_pop(last);
+  ts_publish(root);
+  int published = ts_is_published(root) && ts_is_published(probe) && ts_is_published(last) && write_throws(probe, kdeep, ts_num(0));
+  ts_gc_unroot(8);   /* the publish alone keeps the graph from here */
+  ts_gc_root(&root);
+  if (!getenv("TSAOT_TEST_NO_GC")){ ts_gc_collect_young(); shared_string_churn(); ts_gc_collect_young(); }
+  tsv wrap = ts_new_object(); ts_gc_root(&wrap);
+  ts_set(wrap, ts_intern_field("batch", 5), root);
+  ts_set(wrap, kdeep, ts_num((double)(refused | (clean << 1) | (published << 2))));
+  ts_worker_post(wrap);
+  ts_gc_unroot(2);
+  return TS_UNDEFINED;
+}
+static tsv test_shared_wide_on_message(tsv* a, int n){ if (n > 0) shared_wide_got = a[0]; return TS_UNDEFINED; }
 /* Frames from the parent (P4): the worker doubles each number it is sent and
    closes its port on `{ stop: true }`; the loop then ends with its work. */
 static tsv test_echo_handler(tsv* a, int n){
@@ -2187,6 +2259,64 @@ int main(){
     }
     if (iter_bad) printf("    (iteration flags %d)\n", iter_bad);
     CK("shared worker: the published Map and Set iterate in the identity order with nothing stored in the shared cells, after another process iterated them", ok && !iter_bad);
+    ts_gc_unroot(6);
+  }
+  {
+    /* a shared worker's large graph, published by a walk shared between threads */
+    ts_gc_root(&shared_wide_got);
+    tsv entry = ts_make_fn_t(test_shared_wide_entry, NULL, 0, 0); ts_gc_root(&entry);
+    tsv pre = ts_new_object(); ts_gc_root(&pre);
+    ts_set(pre, ts_intern_field("own", 3), ts_num(42));
+    tsv data = ts_new_object(); ts_gc_root(&data);
+    ts_set(data, ts_intern_field("pre", 3), pre);
+    for (int i = 0; i < 2000; i++){ tsv junk = ts_new_array(0); ts_array_push(junk, ts_num(i)); }
+    ts_gc_collect_young();   /* the pre-fork cell is old, as a program's are by the time it forks */
+    tsv onm = ts_make_fn_t(test_shared_wide_on_message, NULL, 0, 0); ts_gc_root(&onm);
+    tsv one = ts_make_fn_t(test_worker_on_error, NULL, 0, 0); ts_gc_root(&one);
+    setenv("TSAOT_PUBLISH_SHARE_BYTES", "0", 1); setenv("TSAOT_PUBLISH_SHARE_AFTER", "64", 1); setenv("TSAOT_PUBLISH_THREADS", "4", 1);
+    worker_errors = 0;
+    int id = ts_worker_start(entry, data, 1);
+    ts_worker_on_message(id, onm); ts_worker_on_error(id, one);
+    ts_run_event_loop();
+    unsetenv("TSAOT_PUBLISH_SHARE_BYTES"); unsetenv("TSAOT_PUBLISH_SHARE_AFTER"); unsetenv("TSAOT_PUBLISH_THREADS");
+    int ok = worker_errors == 0 && ts_is_obj(shared_wide_got);
+    int flags = ok ? (int)ts_to_num(ts_get(shared_wide_got, ts_intern_field("deep", 4))) : 0;
+    CK("shared walk: a graph with a typed array deep in it is refused, and nothing of it stays published", ok && (flags & 3) == 3);
+    CK("shared walk: the graph without it is published in the worker", ok && (flags & 4));
+    int wrong = 0, unpublished = 0, chain = 0, pres = 0, inherited = 0, map_wrong = 0;
+    if (ok){
+      tsv root = ts_get(shared_wide_got, ts_intern_field("batch", 5));
+      tsv rows = ts_get(root, ts_intern_field("arr", 3)), m = ts_get(root, ts_intern_field("m", 1));
+      ts_key kdeep = ts_intern_field("deep", 4), ktext = ts_intern_field("text", 4), kpre = ts_intern_field("pre", 3), kinh = ts_intern_field("inh", 3);
+      if (ts_array_len(rows) != SHARED_WIDE_ROWS) wrong += 100000;
+      tsv prev = TS_UNDEFINED;
+      for (int r = 0; r < SHARED_WIDE_ROWS && wrong < 100000; r++){
+        tsv row = ts_array_get(rows, r);
+        if (ts_array_len(row) != SHARED_WIDE_COLS){ wrong += 1000; continue; }
+        if (!ts_is_published(row)) unpublished++;
+        for (int c = 0; c < SHARED_WIDE_COLS; c++){
+          tsv o = ts_array_get(row, c);
+          char b[32]; int len = snprintf(b, sizeof b, "cell_%d_%d_of_the_wide_graph", r, c);
+          tsv text = ts_get(o, ktext);
+          if (ts_to_num(ts_get(o, kdeep)) != (double)(r * SHARED_WIDE_COLS + c)) wrong++;
+          if (!ts_is_str(text) || !ts_truthy(ts_strict_eq(text, ts_new_string(b, (uint32_t)len)))) wrong++;
+          if (!ts_is_published(o)) unpublished++;
+          tsv link = ts_get(o, kpre);
+          if (c % 5 == 0){ if (link == pre) pres++; } else if (link == prev) chain++;
+          if (c % 8 == 0 && ts_to_num(ts_get(o, kinh)) == 7) inherited++;
+          prev = o;
+        }
+        if (r % 5 == 0){ char kb[16]; int kl = snprintf(kb, sizeof kb, "row%d", r); if (ts_map_get(m, ts_new_string(kb, (uint32_t)kl)) != row) map_wrong++; }
+      }
+      if (!ts_is_published(root) || !ts_is_published(m) || !ts_is_published(pre) || !ts_truthy(ts_object_is_frozen(pre))) unpublished += 1000;
+      if (!write_throws(ts_array_get(ts_array_get(rows, 77), 3), kdeep, ts_num(1)) || !map_set_throws(m)) unpublished += 10000;
+    }
+    int cells = SHARED_WIDE_ROWS * SHARED_WIDE_COLS;
+    if (wrong || unpublished || map_wrong || chain != cells - cells / 5 || pres != cells / 5 || inherited != cells / 8)
+      printf("    (wrong %d, unpublished %d, map wrong %d, chain %d of %d, pre-fork %d of %d, inherited %d of %d)\n",
+             wrong, unpublished, map_wrong, chain, cells - cells / 5, pres, cells / 5, inherited, cells / 8);
+    CK("shared walk: every cell of the graph reads in the parent after the worker's collections, published, with its chain, its pre-fork cell and its prototype",
+       ok && !wrong && !unpublished && !map_wrong && chain == cells - cells / 5 && pres == cells / 5 && inherited == cells / 8);
     ts_gc_unroot(6);
   }
   {
