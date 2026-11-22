@@ -315,3 +315,42 @@ the GC stress gates collect in every worker as before.
 counts, and on a busy machine a worker's wall clock says nothing: the instructions of the
 heaviest parse worker and of the heaviest checker are how a change to the critical path of a
 parallel compile is read (`scripts/tsc_ts_workers_ab.sh`).
+
+## Update (Session 367): a worker's workers, and a checker that shares a file with forks of itself
+
+A forked worker can start workers of its own: `ts_worker_fork_ex` in a child is the same fork, the
+child's `parentPort` is the pipe to the worker that started it, and its event loop watches its own
+workers' pipes. A `SharedArrayBuffer` a worker creates is shared with the workers it starts after
+(`MAP_SHARED`, made before the fork). Nothing was added for it; fixture `node/worker_nested` (an
+outer worker and its inner workers take items from a cursor in a buffer the outer one made; one
+inner worker throws; Node agrees).
+
+What Node does not have is what a fork is: **the worker has the starting thread's memory as it
+is** (lib/node/worker_threads.ts: "module-level state is the parent's at the fork, not fresh").
+tsc-ts's parallel check now uses that on purpose (`benchmarks/tsc_ts_native/patches/0004`, and
+`startThreads(spawn, drivers, args, true)` in the driver): a checker thread is itself a forked
+worker, and when it is in a huge file while another checker has run out of files, it starts a
+fork of itself, by `new Worker` on the same entry module, for the idle processor. The fork finds
+the checker's state where the checker left it (a module-level variable holds the statements being
+shared), takes statements from a cursor in a `SharedArrayBuffer` the checker made, checks them,
+and posts the diagnostics it added. No cache is rebuilt and nothing is copied until a page is
+written.
+
+- **The cost of a fork there**: `fork()` of a checker with 160 MB resident takes 0.3 to 2.7 ms
+  (`TSAOT_FORK_TRACE=1`), and a fork that finds no statement left ends after 0.9 ms and 3 M
+  instructions. The forks get twice the checker's young budget
+  (`resourceLimits.maxYoungGenerationSizeMb`): they inherit the checker's young cells and its
+  counters, and a collection in a fork would mark what the checker allocated.
+- **What it buys** (the TypeScript compiler project, type check only, ten checkers, plain builds,
+  21 alternating runs, milliseconds from the executable's load to its exit, minimum / median):
+  352.7 / 364.3 to 259.2 / 269.5. The checker of checker.ts is forked nine times when it has
+  taken a third of the function's 2,350 statements; the forks run 0.15 to 0.45 G instructions
+  each for 50 ms, 2.7 G together, where the checker alone ran 2.0 G more for 140 ms: a fork
+  computes again what the checker had not computed yet and another fork computes too, and six
+  of the ten processors are efficiency cores. The checker's own instructions 3.09 to 1.35 G.
+- **What it does not change**: the diagnostics (the patch's check: TypeScript's 6,537 test cases
+  with forks forced into the first statements of each), and a run in which no processor falls
+  idle.
+
+A design that needs this stays garnet's: under Node the same `startThreads` is called without the
+flag and a checker shares nothing.

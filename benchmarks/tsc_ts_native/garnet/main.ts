@@ -46,6 +46,10 @@ const checkerYoungMb = 128;
 function spawnThread(data: ThreadData): Worker {
   if (data.kind === 'check')
     return new Worker(new URL(import.meta.url), { workerData: data, resourceLimits: { maxYoungGenerationSizeMb: checkerYoungMb } });
+  // A fork of a checker thread, started by that thread to share a huge file's statements: it has the
+  // checker's heap as it is, the young cells it allocated so far among it, and the same budget again.
+  if (data.kind === 'split')
+    return new Worker(new URL(import.meta.url), { workerData: data, resourceLimits: { maxYoungGenerationSizeMb: 2 * checkerYoungMb } });
   return new Worker(new URL(import.meta.url), { workerData: data, shared: data.kind === 'parse' });
 }
 
@@ -57,8 +61,9 @@ if (!isMainThread) {
     const hr = process.hrtime();
     mark(`main clock ${hr[0]} ${hr[1]}`);
   }
-  // checker, parse and reference threads, as the Node build starts them
-  if (args[0] !== '--api') startThreads(spawnThread, drivers, args);
+  // checker, parse and reference threads, as the Node build starts them; here a thread is a fork of
+  // the thread that starts it (a checker thread shares a huge file with forks of itself)
+  if (args[0] !== '--api') startThreads(spawnThread, drivers, args, true);
   const status = args[0] === '--api' ? runServer(args.slice(1), defaultLibraryPath) : runTsc(args, defaultLibraryPath);
   // Watch mode and `--checkers` keep running until their callbacks exit.
   if (status !== watching) {

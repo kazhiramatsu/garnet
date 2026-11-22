@@ -7,6 +7,8 @@
 # machine's load, the instructions do not). Configurations alternate for `rounds` rounds, type check
 # only, and the medians are printed: the heaviest checker (the one that checks checker.ts), all
 # checkers, the heaviest parse worker, all parse workers, and the checkers' peak resident sets.
+# A checker's forks (a huge file's statements shared, benchmarks/tsc_ts_native/patches) count as
+# checkers: each one's instructions are its own from its fork on, so "checkers" is the whole check.
 #   scripts/tsc_ts_workers_ab.sh <rounds> <checkers> <label>=<binary>[;ENV=VALUE ...] ...
 #   e.g. scripts/tsc_ts_workers_ab.sh 5 4 a=build/tsc_ts_native_a/tsc-ts "b=build/tsc_ts_native_b/tsc-ts;TSAOT_GC_NURSERY_BYTES=67108864"
 set -u

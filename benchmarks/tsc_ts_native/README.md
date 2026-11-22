@@ -12,7 +12,10 @@ AOT compilers can be compared on one program.
   a region the main thread reads; Node ignores it). A checker thread gets
   `resourceLimits: { maxYoungGenerationSizeMb: 128 }`: a checker's heap ends
   with it, and with a young budget its run fits in it never collects
-  (docs/fork_workers_design.md, the Session 367 update).
+  (docs/fork_workers_design.md, the Session 367 update). `startThreads(...,
+  true)` tells tsc-ts that a thread is a fork of the thread that starts it:
+  the checker of a huge file then shares the file's statements with forks
+  of itself (`patches/README.md`, "Sharing a file's statements").
 - `patches/`: changes to the compiler's sources, applied to the build's copy
   of them (`patches/README.md`): each makes the compiler faster and changes
   nothing it reports. `TSAOT_TSC_TS_PATCHES=0` builds the sources unmodified,

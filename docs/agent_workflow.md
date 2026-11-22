@@ -526,3 +526,16 @@ checkout>/tests/cases` compiles every file of TypeScript's own `tests/cases/comp
 with a build without the patch and one with it and compares output and exit status (about ten
 minutes at three jobs; `--limit 300` for a first look), and `scripts/tsc_ts_insn_ab.sh` compares
 the files they emit for the compiler project.
+
+One build under two settings is the same tool with `--env-a` / `--env-b` (and `--count-b TEXT`
+for the cases in which B's stderr has TEXT). The statement sharing of patch `0004` is checked
+that way, forks forced into the first statements of every case against a checker alone: the
+command is in the patches' README. A change to the order in which a checker does things (what it
+checks before or after its forks, which process reports what) is run through it before anything
+else: both of the patch's defects were found there or by its failing-fork knob, not by the
+compiler project, which reports no diagnostic.
+
+The wall clock of a default run at millisecond resolution is the timeline's own
+(`TSC_TS_TIMELINE=1`: `@<ms> main exit`, milliseconds since the executable was loaded):
+`/usr/bin/time` rounds to 10 ms, which is the size of most changes to the parse phase. Take the
+minimum and the median of twenty alternating runs.

@@ -13226,6 +13226,48 @@ emitter changed, the IR did not; snapshot taken with the fixture), GC stress, th
 differential on one thread 6,537 of 6,537 identical. hono 16.200 to 15.885 G instructions (-1.9%), cycles -3.1%; hono_app -0.25%,
 vue -0.23%; tsc-ts one thread with emit 21.841 to 21.722 G.
 
+**Fourth slice: the checker of a huge file shares its statements with forks of itself** (tsc-ts's patch `0004`, its README;
+docs/fork_workers_design.md, the second Session 367 update). The wall clock of a default run was the parse of checker.ts and then its
+check on one checker, whatever the number of checkers: with ten, the nine others were done with the 77 other files in half the
+time. A forked worker has the memory of the thread that started it, so a checker's fork is a checker with every type and cache
+computed so far. The checker of a huge file (200 KB or more of a file's or of a top-level function's statements) starts one for
+each processor another checker leaves idle (two words of the schedule: the checkers that ran out of files, the forks started
+for them), and the checker and its forks take the remaining statements from a cursor in shared memory. A fork posts the
+diagnostics it added; the checker reports the file when all have.
+
+- **Nothing changes in the diagnostics.** A statement is checked in full by one process and the rest is lazy; what was queued
+  before a fork stays the checker's; a deferred node belongs to the process that takes the statement around it; an unreachable run
+  is reported with its first statement; an interface's once-only check runs at the first of its shared declarations; a fork that
+  fails is replaced by the checker. Kept whole: a program with `noUnusedLocals` / `noUnusedParameters` (the marks of every
+  statement are needed), `importHelpers`, a checker that emits or reports declaration diagnostics, a scope that declares
+  `WeakMap`, `WeakSet` or `Reflect` below ES2022. The check is the corpus with forks forced into the first statements of every
+  case (`scripts/tsc_ts_corpus_diff.py`, now with `--env-a` / `--env-b` / `--count-b`): 6,537 of 6,537 identical, forks started
+  in 3,749 (three forks after two statements, the second fork failing) and in 4,904 (two forks at the first statement). It found
+  two defects on the way: a second container shared by one checker after a function inside the first had shared its own (the
+  failing fork's share was then checked against the wrong board), and TS2320 reported at the second declaration of a merged
+  interface when another process took it first (tsc-ts runs that check at the first declaration it meets).
+- **The numbers** (the compiler project, type check only, the default ten checkers; milliseconds from the executable's load to its
+  exit, minimum / median of 21 alternating runs under a load average of 14): plain builds 348.8 / 371.2 to 269.3 / 278.7; trained
+  builds 290.7 / 305.0 to 224.2 / 234.2. `/usr/bin/time`, 15 rounds beside tsrs at 0.15 / 0.16 s: the session's first build 0.40 /
+  0.41, plain 0.26 / 0.27, trained 0.22 / 0.23 (four checkers 0.25 / 0.25: the default is now the faster). The checker of
+  checker.ts 3.091 to 1.304 G instructions; it starts its nine forks having taken a third of the function's 2,350 statements,
+  130 ms into its check, and they are done 45 ms later. All checkers and forks together 11.73 to 12.81 G instructions (+9%), cycles
+  4.39 to 5.18 G (+18%): a fork computes what the checker had not computed yet and another fork computes too, and it starts on a
+  cold processor. One thread is unchanged (21.629 to 21.583 G with emit, outputs identical).
+- **In garnet**: the driver passes `startThreads(..., true)` and gives a fork twice the checker's young budget; a fixture for a
+  worker's own workers (`node/worker_nested`: nothing was missing in the runtime); the build applies patches with
+  `--no-backup-if-mismatch` (`--posix` cannot add a file).
+- Measured and not kept, both for the parse phase's start: the parse threads forked when there is a chunk for them (the config is
+  read 6 ms later and the libraries' chain of references with it: 5 to 10 ms slower), and the root files matched first with
+  the largest handed to the first thread (it starts 5 ms earlier and parses 12 ms longer beside the nine threads forked after it,
+  which hold the performance cores: 9 ms slower).
+
+Gates (`build/gates_s367d/run.sh` and `run_tsc.sh`, r39 to r40): unit, bundler 56, conformance 821/821 plain and strict, 818/818
+under protect, bench within budget, ci, ir-parity identical (5,061; snapshot taken with the fixture), GC stress; tsc-ts built from the
+checkout with the four patches (the sources the forced corpus runs checked), one thread with emit outputs identical, the compiler
+project under `TSAOT_GC_PROTECT` and `TSAOT_PUBLISH_PROTECT` with forks forced and one failing, eight default runs with nine forks
+each identical to a run without sharing, the corpus on one thread 6,537 of 6,537 identical against r39, and with forks forced.
+
 **Found, not fixed: four checkers lose diagnostics on one corpus case, by timing.** The corpus differential with `--checkers 4`
 (1,500 cases, to put the publish walk under it) differed in one, `compiler/moduleElementsInWrongContext.ts`, and the same binary
 differs from itself there: of eight runs of r36 (the build before this session) three print 19 diagnostics, as one thread always
@@ -13233,13 +13275,15 @@ does, and five print 16, without TS2305 at (20,14) and (28,14) and TS2307 at (25
 block). The other 1,499 cases agree between runs. Not looked into: whether it is tsc-ts's (under scriptc too) or the fork workers'.
 The corpus check of a tsc-ts patch runs on one thread for that reason.
 
-**What it takes to pass tsrs** (2.1x on the wall from here, 2.6x on one thread):
+**What it takes to pass tsrs** (2.1x on the wall after the third slice, 1.45x after the fourth; 2.6x on one thread):
 
 1. The cost of an operation in generated code, which is 78% of the checker: nothing in the runtime reaches it. Profile-guided builds
    are worth about 16% of the instructions and are the build's default (the table above compares plain builds, as tsc-rs's README does).
-2. The check of one large file on one thread bounds the wall whatever the checker count. tsrs's `--fast` and tsc-rs's `TSRS_FAST=1`
-   split further and say so ("may report a few diagnostics differently"); tsc-ts splitting a file's statements between checkers would
-   be that mode, not the default.
+2. ~~The check of one large file on one thread bounds the wall whatever the checker count.~~ Done in the fourth slice, with the
+   diagnostics unchanged (tsrs's `--fast` and tsc-rs's `TSRS_FAST=1` split further and say "may report a few diagnostics
+   differently"). What bounds the wall now (1.45x from here with a trained build) is the whole check's work over the machine's
+   ten processors, six of them efficiency cores, after a parse phase of 70 ms that is still one file on one thread (checker.ts:
+   read 2, parse 26 to 31, bind 8, publish 13 ms).
 3. In the runtime: the out-of-line allocation of a tenured site (the main thread and any program that collects), an array's
    112-byte cell, the publish walk (13 ms of the critical path).
 4. In tsc-ts: the accessors of ast.ts at their hottest callers (`getLocals` in the resolver's scope walk, `getText` in

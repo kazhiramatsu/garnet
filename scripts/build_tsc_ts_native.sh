@@ -37,13 +37,15 @@ shutil.copytree(repo / "benchmarks/tsc_ts_native/garnet", source / "garnet")
 shutil.copy2(repo / "benchmarks/tsc_ts_native/tsconfig.json", source / "tsconfig.json")
 PY
 # The patches, applied to the copy (a patch names packages/tsc-ts/src/..., the
-# copy's src/...; --posix: no backup files). One that does not apply stops the
-# build by its name.
+# copy's src/...; no backup files, also when a hunk applies at an offset: the
+# copy is the program that is built). One that does not apply stops the build
+# by its name. (Not --posix: it leaves no backups either, but cannot name the
+# file a patch adds, whose old side is /dev/null.)
 PATCHES=()
 if [[ "${TSAOT_TSC_TS_PATCHES:-1}" != "0" ]]; then
   for patch_file in "$ROOT"/benchmarks/tsc_ts_native/patches/*.patch; do
     [[ -e "$patch_file" ]] || continue
-    if ! patch --posix -p3 -s -N -d "$SOURCE" < "$patch_file" > "$WORK/patch.log" 2>&1; then
+    if ! patch --no-backup-if-mismatch -p3 -s -N -d "$SOURCE" < "$patch_file" > "$WORK/patch.log" 2>&1; then
       echo "the tsc-ts patch $(basename "$patch_file") does not apply to $CHECKOUT (the patches are against c002e8e; TSAOT_TSC_TS_PATCHES=0 builds without them):" >&2
       cat "$WORK/patch.log" >&2
       exit 1

@@ -1,0 +1,914 @@
+A checker thread shares a huge file's statements with forks of itself
+
+A checker checks a file on one thread, and one file can be most of a program's check. The
+TypeScript compiler's checker.ts is one function of three megabytes: the thread that checks it
+runs twice as long as the nine threads that check the 77 other files of the compiler, whose
+processors then wait for it.
+
+Where a new thread is a fork of the thread that starts it (the garnet build: a worker is a forked
+process and has the starting thread's memory as it is, copy-on-write; `startThreads(..., forks)`),
+a checker thread that is in a huge container, a file or a function declared at the top of one,
+when another checker runs out of files starts a fork of itself for the idle processor. The fork
+has every type, link and cache the checker had. The checker and its forks take the container's
+remaining statements one at a time from a cursor in shared memory; a fork checks what it takes,
+posts the diagnostics it added and ends, and the thread adds them to its own before it reports
+the file (checker-split.ts, `ThreadSplit` in parallel-check.ts). Until a processor is idle
+nothing differs from a checker that does not share.
+
+The diagnostics are those of the checker alone (the reasons are at the top of checker-split.ts):
+a statement is checked in full by one process and everything else is lazy; what was queued
+before a fork stays the checker's; a deferred node belongs to the process that takes the
+statement around it; a run of unreachable statements is reported with its first statement; an
+interface's once-only checks run at the first of its shared declarations. A fork that fails is
+replaced by the checker, which checks what the fork had taken. A container is kept whole where
+every statement's side effects must be in one checker: unused identifiers, emit and declaration
+diagnostics, imported helpers, and a scope that declares WeakMap, WeakSet or Reflect below
+ES2022.
+
+The TypeScript compiler project, type check only, ten checkers: 0.36 to 0.27 s (median of 11
+alternating rounds on a loaded machine, without PGO). TypeScript's test cases, each compiled by a
+checker alone and with forks forced at the first, second or third statement (TSC_TS_SPLIT_FORKS,
+_AT, _BODY, _MIN, _FILE): 6,537 of 6,537 outputs identical, forks started in 4,904 of them, also
+with a fork made to fail in each (TSC_TS_SPLIT_FAIL).
+
+diff --git a/packages/tsc-ts/src/compiler/checker-functions.ts b/packages/tsc-ts/src/compiler/checker-functions.ts
+index 0e812c9..c838c59 100644
+--- a/packages/tsc-ts/src/compiler/checker-functions.ts
++++ b/packages/tsc-ts/src/compiler/checker-functions.ts
+@@ -1,6 +1,7 @@
+ // Functions: function expressions and arrows, bodies, inferred return types, generators, `await`.
+ import { checkCollisionsForDeclarationName } from './checker-generated-code.js';
+ import { ScriptTarget } from './options.js';
++import { checkSharedStatements, sharesStatements } from './checker-split.js';
+ import { ExternalEmitHelpers, checkExternalEmitHelpers } from './checker-emit-helpers.js';
+ import { resolvedReturnTypeOf, signatureSideOf } from './side-state.js';
+ import { isJsxAttributesContextSensitive } from './checker-jsx.js';
+@@ -415,7 +416,17 @@ export function checkFunctionLikeBody(c: Checker, node: Node): void {
+   )
+     getReturnTypeOfSignature(c, getSignatureFromDeclaration(c, node));
+   if (body.kind === SyntaxKind.Block) {
+-    for (const s of getStatements(body)!.nodes) checkSourceElement(c, s);
++    const statements = getStatements(body)!.nodes;
++    // The statements of a huge function at the top of a file are shared with forks of this checker
++    // once a processor is idle (checker-split.ts).
++    if (
++      c.splitHost !== undefined &&
++      node.kind === SyntaxKind.FunctionDeclaration &&
++      node.parent!.kind === SyntaxKind.SourceFile &&
++      sharesStatements(c, body, statements)
++    )
++      checkSharedStatements(c, body, statements);
++    else for (const s of statements) checkSourceElement(c, s);
+     if (node.kind !== SyntaxKind.Constructor && node.kind !== SyntaxKind.SetAccessor)
+       checkAllCodePathsInNonVoidFunctionReturnOrThrow(c, node, returnType);
+   } else {
+diff --git a/packages/tsc-ts/src/compiler/checker-heritage.ts b/packages/tsc-ts/src/compiler/checker-heritage.ts
+index 44210e3..b31ec0b 100644
+--- a/packages/tsc-ts/src/compiler/checker-heritage.ts
++++ b/packages/tsc-ts/src/compiler/checker-heritage.ts
+@@ -1,5 +1,6 @@
+ // Class and interface heritage: base class and implemented interface conformance, member overrides,
+ // index signature constraints and duplicate members.
++import { checksSymbolAt } from './checker-split.js';
+ import {
+   type HeritageClause,
+   ModifierFlags,
+@@ -775,7 +776,8 @@ export function checkInterfaceHeritage(c: Checker, node: Node): void {
+   if (symbol === undefined) return;
+   checkTypeParameterListsIdentical(c, symbol);
+   const links = c.symbolLinks(symbol);
+-  if (!links.interfaceChecked) {
++  // Once per symbol, at the first of its declarations checked, where its errors are reported.
++  if (!links.interfaceChecked && checksSymbolAt(symbol, node)) {
+     links.interfaceChecked = true;
+     const t = getDeclaredTypeOfSymbol(c, symbol) as InterfaceType;
+     if ((t.flags & TypeFlags.Object) !== 0) {
+diff --git a/packages/tsc-ts/src/compiler/checker-source-file.ts b/packages/tsc-ts/src/compiler/checker-source-file.ts
+index f76e3cf..8d4b20e 100644
+--- a/packages/tsc-ts/src/compiler/checker-source-file.ts
++++ b/packages/tsc-ts/src/compiler/checker-source-file.ts
+@@ -121,6 +121,8 @@ import { getTypeOfSymbol, reportImplicitAny } from './checker-symbol-types.js';
+ import { getSymbolOfDeclaration } from './checker-symbols.js';
+ import { checkUnusedIdentifiers } from './checker-unused.js';
+ import { checkDeprecatedTypeReference } from './checker-deprecation.js';
++import { checkSharedStatements, sharesStatements } from './checker-split.js';
++import { mark } from './timeline.js';
+ 
+ /**
+  * Checks `file` once; diagnostics accumulate in the checker. `checkUnused` also reports unused
+@@ -141,7 +143,10 @@ export function checkSourceFile(c: Checker, file: SourceFile, checkUnused = fals
+ function checkSourceFileWorker(c: Checker, file: SourceFile): void {
+   c.fileBeingChecked = file;
+   c.saveDeferredDiagnostics = true;
+-  for (const statement of getStatements(file)!.nodes) checkSourceElement(c, statement);
++  const statements = getStatements(file)!.nodes;
++  // A huge file's statements are shared with forks of this checker once a processor is idle (checker-split.ts).
++  if (c.splitHost !== undefined && sharesStatements(c, file, statements)) checkSharedStatements(c, file, statements);
++  else for (const statement of statements) checkSourceElement(c, statement);
+   checkDeferredNodes(c, file);
+   if (isExternalOrCommonJSModule(file)) checkExternalModuleExports(c, file);
+   if (!file.isDeclarationFile) checkUnusedRenamedBindingElements(c);
+@@ -155,6 +160,7 @@ function checkSourceFileWorker(c: Checker, file: SourceFile): void {
+   c.saveDeferredDiagnostics = false;
+   produceDeferredIterationErrors(c);
+   produceDeferredCollisionChecks(c);
++  if (c.split !== undefined && c.split.file === file) mark('shared file checked');
+   // The file's deferred nodes are all checked; later ones are not queued (checkNodeDeferred).
+   const links = c.nodeLinks(file);
+   links.typeChecked = true;
+@@ -206,6 +212,19 @@ function checkSourceElementUnreachable(c: Checker, node: Node): boolean {
+   return true;
+ }
+ 
++/**
++ * Whether `node` continues the run of unreachable statements that `previous`, the statement before it,
++ * is in: the run is reported once, at its first statement (`checkSourceElementUnreachable`).
++ */
++export function continuesUnreachableRun(c: Checker, previous: Node, node: Node): boolean {
++  return (
++    isPotentiallyExecutableNode(node) &&
++    isPotentiallyExecutableNode(previous) &&
++    isSourceElementUnreachable(c, previous) &&
++    isSourceElementUnreachable(c, node)
++  );
++}
++
+ function isSourceElementUnreachable(c: Checker, node: Node): boolean {
+   if ((node.flags & NodeFlags.Unreachable) !== 0) {
+     // The binder knows the code is unreachable; const enums only count when preserved.
+@@ -673,7 +692,7 @@ export function checkNodeDeferred(c: Checker, node: Node): void {
+   nodes.push(node);
+ }
+ 
+-function checkDeferredNodes(c: Checker, file: SourceFile): void {
++export function checkDeferredNodes(c: Checker, file: SourceFile): void {
+   const nodes = c.nodeLinks(file).deferredNodes;
+   if (nodes === undefined) return;
+   // Deferred checks may defer more nodes.
+@@ -688,7 +707,7 @@ function checkObjectLiteralAccessorType(c: Checker, node: Node): void {
+   if (symbol !== undefined) getTypeOfSymbol(c, symbol);
+ }
+ 
+-function checkDeferredNode(c: Checker, node: Node): void {
++export function checkDeferredNode(c: Checker, node: Node): void {
+   const saveCurrentNode = c.currentNode;
+   c.currentNode = node;
+   c.instantiationCount = 0;
+diff --git a/packages/tsc-ts/src/compiler/checker-split.ts b/packages/tsc-ts/src/compiler/checker-split.ts
+new file mode 100644
+index 0000000..938a4a5
+--- /dev/null
++++ b/packages/tsc-ts/src/compiler/checker-split.ts
+@@ -0,0 +1,347 @@
++// Sharing the statements of one container between a checker and forks of itself.
++//
++// A checker checks a file on one thread, and one file can be most of a program's check: the
++// TypeScript compiler's checker.ts is one function of three megabytes, and the thread that checks
++// it runs twice as long as the threads that check the 77 other files of the compiler, whose
++// processors then wait for it.
++//
++// Where a new thread is a fork of the thread that starts it (garnet's workers are forked processes:
++// a fork has every type, link and cache its checker had, copy-on-write), a checker shares what is
++// left of a huge container's statements, a file's or a top-level function's, as soon as a processor
++// is idle: it starts a fork for that processor, and the checker and its forks take the remaining
++// statements one at a time from a cursor in shared memory. A fork checks the statements it takes and
++// what they queue, sends back the diagnostics it added, and ends. The checker finishes the file as
++// it always does and adds the forks' diagnostics to its own (parallel-check.ts, `ThreadSplit`).
++// Until a processor is idle nothing differs from a checker that does not share.
++//
++// The diagnostics are those of the checker alone:
++// - A statement is checked in full by exactly one process, and what it needs of the other statements
++//   (types, signatures, control flow) is computed on demand by any process alike. A diagnostic two
++//   processes report is one after `sortAndDeduplicateDiagnostics`.
++// - What the checker queued before a fork stays its own: a fork starts with empty queues (deferred
++//   nodes, deferred iteration errors and collision checks, renamed binding elements) and with the
++//   set of the deferred nodes queued so far, so none of them is checked twice or dropped.
++// - A deferred node belongs to the process that takes the statement around it, which reaches it
++//   while it checks the statement. A fork leaves the nodes it reached in other statements (inferring
++//   a return type) to their processes; the checker checks all it queued, what it queued before its
++//   first fork as soon as that fork is started.
++// - A run of unreachable statements is reported by the process that takes its first statement.
++// - A check that a checker runs once for a symbol, at the first of its declarations it checks, and
++//   reports there (an interface's inherited properties), runs at the first of the declarations among
++//   the shared statements, which is the one a checker alone meets first (`checksSymbolAt`).
++// - The grammar checks, the module's exports and whatever else ends a file are the checker's.
++//
++// What needs the side effects of every statement in one process keeps a container whole
++// (`sharesStatements`, and the thread's conditions in parallel-check.ts): unused identifiers, emit
++// and declaration diagnostics, imported helpers, and the names the emit of private identifiers
++// reserves.
++import { type Node, type SourceFile, getBody, getLocals, getStatements } from './ast.js';
++import { getSourceFileOfNode } from './binder-utilities.js';
++import type { Checker } from './checker.js';
++import { checkUnusedRenamedBindingElements } from './checker-declarations.js';
++import { produceDeferredCollisionChecks } from './checker-generated-code.js';
++import { produceDeferredIterationErrors } from './checker-iteration.js';
++import {
++  checkDeferredNode,
++  checkDeferredNodes,
++  checkSourceElement,
++  continuesUnreachableRun,
++} from './checker-source-file.js';
++import { ScriptTarget } from './options.js';
++import type { Symbol } from './symbol.js';
++import { SyntaxKind } from './syntax-kind.js';
++import { mark } from './timeline.js';
++
++/** What the thread of a checker provides to share statements (parallel-check.ts). */
++export interface SplitHost {
++  /** The least text of a container whose statements are shared. */
++  readonly containerText: number;
++  /** The least text left to check for each process that shares it. */
++  readonly forkText: number;
++  /** For tests: only files whose names contain this share statements ('' for every file). */
++  readonly only: string;
++  /** Whether a processor is idle. Called between the statements of a container. */
++  idle(): boolean;
++  /**
++   * Takes an idle processor and starts fork `index` of this thread, which runs `checkForkShare(index)`;
++   * false when no processor is left to take.
++   */
++  fork(index: number): boolean;
++}
++
++/** The statements of a container that a checker shares with its forks. */
++export class StatementSplit {
++  /**
++   * In shared memory: [0] the next statement to take, then who took each statement (0 no one yet, 1
++   * the checker, n + 1 its fork n).
++   */
++  readonly board: Int32Array;
++  /** This process: 0 the checker, n its fork n. */
++  self = 0;
++  /** The forks started. */
++  forks = 0;
++  /** Whether this process took each statement. */
++  mine: Uint8Array;
++  /** `Checker.withinUnreachableCode` where the container's statements are checked. */
++  readonly withinUnreachableCode: boolean;
++  /** Where the shared statements start in the file's text. */
++  readonly sharedFrom: number;
++
++  constructor(
++    readonly c: Checker,
++    readonly host: SplitHost,
++    readonly file: SourceFile,
++    readonly container: Node,
++    readonly statements: readonly Node[],
++    start: number,
++  ) {
++    this.board = new Int32Array(new SharedArrayBuffer(4 * (1 + statements.length)));
++    this.board[0] = start;
++    this.mine = new Uint8Array(statements.length);
++    for (let k = 0; k < start; k++) {
++      this.board[1 + k] = 1;
++      this.mine[k] = 1;
++    }
++    this.withinUnreachableCode = c.withinUnreachableCode;
++    this.sharedFrom = statements[start]!.pos;
++  }
++
++  /** The first declaration of `symbol` of `kind` among the shared statements, if it has one there. */
++  firstShared(symbol: Symbol, kind: SyntaxKind): Node | undefined {
++    let first: Node | undefined = undefined;
++    for (const d of symbol.declarations) {
++      if (d.kind !== kind || d.pos < this.sharedFrom || d.end > this.container.end) continue;
++      if (first !== undefined && first.pos <= d.pos) continue;
++      if (getSourceFileOfNode(d) === this.file) first = d;
++    }
++    return first;
++  }
++
++  /** The index of the statement around `node`, or -1 when `node` is in none of the container's statements. */
++  statementAround(node: Node): number {
++    const statements = this.statements;
++    let lo = 0;
++    let hi = statements.length - 1;
++    while (lo <= hi) {
++      const mid = (lo + hi) >> 1;
++      const statement = statements[mid]!;
++      if (node.end <= statement.pos) hi = mid - 1;
++      else if (node.pos >= statement.end) lo = mid + 1;
++      else return node.pos >= statement.pos && node.end <= statement.end ? mid : -1;
++    }
++    return -1;
++  }
++
++  /**
++   * Whether `node`, a node of the container's file, is this process's to check: one inside a statement
++   * it took, and for the checker one outside the container's statements.
++   */
++  owns(node: Node): boolean {
++    const k = this.statementAround(node);
++    return k < 0 ? this.self === 0 : this.mine[k] === 1;
++  }
++}
++
++/** The statements this process shares: a checker's own, and in a fork those it was started for. */
++let active: StatementSplit | undefined = undefined;
++
++/**
++ * Whether a check of `symbol` that has not run, and that a checker runs once, at the first declaration
++ * of `node`'s kind it checks, runs at `node`. A checker alone meets the declarations among a
++ * container's statements in their order; where the statements are shared, the first of them runs the
++ * check in the process that takes it, and the others leave it to that process.
++ */
++export function checksSymbolAt(symbol: Symbol, node: Node): boolean {
++  const split = active;
++  if (split === undefined || symbol.declarations.length < 2) return true;
++  const first = split.firstShared(symbol, node.kind);
++  return first === undefined || first === node;
++}
++
++/**
++ * Whether the statements of `container`, a file or the body of a function declared at the top of one,
++ * may be shared with forks of the checker.
++ */
++export function sharesStatements(c: Checker, container: Node, statements: readonly Node[]): boolean {
++  const host = c.splitHost;
++  if (host === undefined || statements.length < 2 || container.end - container.pos < host.containerText) return false;
++  if (host.only !== '' && !getSourceFileOfNode(container).fileName.includes(host.only)) return false;
++  return c.languageVersion > ScriptTarget.ES2021 || !declaresReservedName(c, container);
++}
++
++/**
++ * Whether the scope of `container`'s statements declares a name the emit of private identifiers and of
++ * `super` in static initializers reserves: such a declaration is checked against what every statement
++ * of its scope found (checkCollisionsForDeclarationName).
++ */
++function declaresReservedName(c: Checker, container: Node): boolean {
++  const scope = container.kind === SyntaxKind.SourceFile ? container : container.parent!;
++  const locals = getLocals(scope);
++  for (const name of ['WeakMap', 'WeakSet', 'Reflect']) {
++    if (locals !== undefined && locals.has(name)) return true;
++    // The declarations at the top of a script are globals.
++    if (scope.kind !== SyntaxKind.SourceFile) continue;
++    const symbol = c.globals.get(name);
++    if (symbol !== undefined) for (const d of symbol.declarations) if (getSourceFileOfNode(d) === scope) return true;
++  }
++  return false;
++}
++
++/** Whether `node` is a function declaration whose statements may be shared (`sharesStatements`). */
++function isSharedFunction(c: Checker, node: Node): boolean {
++  if (node.kind !== SyntaxKind.FunctionDeclaration) return false;
++  const body = getBody(node);
++  return body !== undefined && body.kind === SyntaxKind.Block && sharesStatements(c, body, getStatements(body)!.nodes);
++}
++
++/** Whether a fork is worth starting for the statements of `container` from `k` on. */
++function worthSharing(c: Checker, host: SplitHost, container: Node, statements: readonly Node[], k: number): boolean {
++  if (container.end - statements[k]!.pos < 2 * host.forkText) return false;
++  // A function whose own statements can be shared is shared from inside, once the checker is there.
++  if (container.kind === SyntaxKind.SourceFile)
++    for (let i = k; i < statements.length; i++) if (isSharedFunction(c, statements[i]!)) return false;
++  return true;
++}
++
++/**
++ * Checks the statements of a container that may be shared (`sharesStatements`): as always until a
++ * processor is idle, then together with forks of this checker.
++ */
++export function checkSharedStatements(c: Checker, container: Node, statements: readonly Node[]): void {
++  const host = c.splitHost!;
++  let k = 0;
++  for (; k < statements.length; k++) {
++    // One container a checker: a function among these statements may have shared its own.
++    if (c.splitHost === undefined) {
++      for (; k < statements.length; k++) checkSourceElement(c, statements[k]!);
++      return;
++    }
++    if (host.idle() && worthSharing(c, host, container, statements, k)) break;
++    checkSourceElement(c, statements[k]!);
++  }
++  if (k === statements.length) return;
++  // Its forks report once this checker has checked its files, so it shares no other container.
++  c.splitHost = undefined;
++  const split = new StatementSplit(c, host, getSourceFileOfNode(container), container, statements, k);
++  c.split = split;
++  active = split;
++  takeStatements(split);
++  mark('statements taken');
++}
++
++/** Takes statements until none is left. The checker starts a fork for each processor that is idle meanwhile. */
++function takeStatements(split: StatementSplit): void {
++  const statements = split.statements;
++  const board = split.board;
++  for (;;) {
++    if (split.self === 0) {
++      const forks = split.forks;
++      startForks(split);
++      // What the checker queued before its first fork is its own to check, and the forks take the
++      // statements meanwhile: checked now, not when the statements have run out and the forks wait.
++      if (forks === 0 && split.forks > 0) {
++        mark(`statements shared from ${Atomics.load(board, 0)} of ${statements.length}`);
++        checkDeferredNodes(split.c, split.file);
++      }
++    }
++    const k = Atomics.add(board, 0, 1);
++    if (k >= statements.length) return;
++    Atomics.store(board, 1 + k, split.self + 1);
++    split.mine[k] = 1;
++    checkTakenStatement(split.c, statements, k);
++  }
++}
++
++function checkTakenStatement(c: Checker, statements: readonly Node[], k: number): void {
++  const statement = statements[k]!;
++  // A run of unreachable statements is reported once, with its first statement: the statements after
++  // it count as reported wherever they are checked.
++  if (
++    k > 0 &&
++    !c.withinUnreachableCode &&
++    c.compilerOptions.allowUnreachableCode !== true &&
++    continuesUnreachableRun(c, statements[k - 1]!, statement)
++  )
++    c.reportedUnreachableNodes.add(statement);
++  checkSourceElement(c, statement);
++}
++
++/** Starts forks while processors are idle and enough text is left for one more process. */
++function startForks(split: StatementSplit): void {
++  const host = split.host;
++  const statements = split.statements;
++  for (;;) {
++    const next = Atomics.load(split.board, 0);
++    if (next >= statements.length) return;
++    const left = split.container.end - statements[next]!.pos;
++    if (left < (split.forks + 2) * host.forkText || !host.idle() || !host.fork(split.forks + 1)) return;
++    split.forks++;
++  }
++}
++
++/**
++ * The share of fork `index`: the statements it takes and what they queue. The diagnostics it adds are
++ * in the log of `Checker.diagnostics`.
++ */
++export function checkForkShare(index: number): StatementSplit {
++  const split = active!;
++  const c = split.c;
++  split.self = index;
++  split.mine = new Uint8Array(split.statements.length);
++  // What the checker queued before this fork is the checker's.
++  const links = c.nodeLinks(split.file);
++  if (links.deferredNodes !== undefined) links.deferredNodes = [];
++  c.deferredIterationErrors = [];
++  c.deferredCollisionChecks = [];
++  c.renamedBindingElementsInTypes.length = 0;
++  c.diagnostics.startLog();
++  takeStatements(split);
++  // Deferred checks may defer more nodes. Those of other statements are checked with their statements.
++  const nodes = links.deferredNodes;
++  if (nodes !== undefined) for (let i = 0; i < nodes.length; i++) if (split.owns(nodes[i]!)) checkDeferredNode(c, nodes[i]!);
++  const renamed = c.renamedBindingElementsInTypes;
++  let kept = 0;
++  for (const element of renamed)
++    if (getSourceFileOfNode(element) === split.file && split.owns(element)) renamed[kept++] = element;
++  renamed.length = kept;
++  checkUnusedRenamedBindingElements(c);
++  c.fileBeingChecked = undefined;
++  c.saveDeferredDiagnostics = false;
++  produceDeferredIterationErrors(c);
++  produceDeferredCollisionChecks(c);
++  return split;
++}
++
++/**
++ * The checker checks what fork `index` took, after the fork failed, and what no process says it took
++ * (a fork that failed between taking a statement and saying so).
++ */
++export function checkFailedShare(split: StatementSplit, index: number): void {
++  const c = split.c;
++  const file = split.file;
++  const statements = split.statements;
++  const board = split.board;
++  const links = c.nodeLinks(file);
++  // As while the file was checked: its nodes are deferred again, to the end of this.
++  links.typeChecked = false;
++  c.fileBeingChecked = file;
++  c.saveDeferredDiagnostics = true;
++  const saveWithinUnreachableCode = c.withinUnreachableCode;
++  c.withinUnreachableCode = split.withinUnreachableCode;
++  for (let k = 0; k < statements.length; k++) {
++    const taker = Atomics.load(board, 1 + k);
++    if (taker !== index + 1 && taker !== 0) continue;
++    Atomics.store(board, 1 + k, 1);
++    split.mine[k] = 1;
++    checkTakenStatement(c, statements, k);
++  }
++  c.withinUnreachableCode = saveWithinUnreachableCode;
++  checkDeferredNodes(c, file);
++  checkUnusedRenamedBindingElements(c);
++  c.fileBeingChecked = undefined;
++  c.saveDeferredDiagnostics = false;
++  produceDeferredIterationErrors(c);
++  produceDeferredCollisionChecks(c);
++  links.typeChecked = true;
++  links.deferredNodes = undefined;
++}
+diff --git a/packages/tsc-ts/src/compiler/checker.ts b/packages/tsc-ts/src/compiler/checker.ts
+index 6a1bc3b..bc86451 100644
+--- a/packages/tsc-ts/src/compiler/checker.ts
++++ b/packages/tsc-ts/src/compiler/checker.ts
+@@ -32,6 +32,7 @@
+ import type { DeferredCollisionCheck } from './checker-generated-code.js';
+ import type { EmitHelperFileLinks } from './checker-emit-helpers.js';
+ import { sideOf } from './side-state.js';
++import type { SplitHost, StatementSplit } from './checker-split.js';
+ import type { Node, PatternAmbientModule, SourceFile } from './ast.js';
+ import { IntLinkTable, LinkTable, SparseLinkTable } from './link-tables.js';
+ import { getErrorRangeForNode, getSourceFileOfNode } from './binder-utilities.js';
+@@ -590,6 +591,10 @@ export class Checker implements TypeChecking {
+   deferredIterationErrors: DeferredIterationError[] = [];
+   /** Collision checks waiting for the end of the file (checker-generated-code.ts). */
+   deferredCollisionChecks: DeferredCollisionCheck[] = [];
++  /** Lets this checker share the statements of a huge container with forks of itself (checker-split.ts). */
++  splitHost: SplitHost | undefined = undefined;
++  /** The statements this checker shares, once it has started to. */
++  split: StatementSplit | undefined = undefined;
+   /** Binding patterns whose implied type is being computed as a contextual type. */
+   readonly contextualBindingPatterns: Node[] = [];
+   /** The binding pattern or assignment pattern that implied each type. */
+diff --git a/packages/tsc-ts/src/compiler/parallel-check.ts b/packages/tsc-ts/src/compiler/parallel-check.ts
+index fa49998..a76a920 100644
+--- a/packages/tsc-ts/src/compiler/parallel-check.ts
++++ b/packages/tsc-ts/src/compiler/parallel-check.ts
+@@ -15,6 +15,10 @@
+  * emits the files it checks, right after checking each one, as tsgo emits on its checkers, and sends
+  * back what it wrote (`checkersEmit`).
+  *
++ * Where a new thread is a fork of the thread that starts it (`ParallelCheck.fork`), a checker thread
++ * that is left with a huge file while others have run out of files shares the file's statements with
++ * forks of itself, one for each idle processor (`ThreadSplit`, checker-split.ts).
++ *
+  * In scriptc builds, threads share one program: the main thread computes the program's lazy caches,
+  * publishes it with `@scriptc/threads` (the program becomes immutable and immortal, and threads
+  * receive it by reference), and keeps the JSDoc that checking parses lazily in tables of each thread.
+@@ -43,6 +47,7 @@ import type { Program } from './program.js';
+ import type { SourceFile } from './ast.js';
+ import { lastSymbolIdValue } from './symbol.js';
+ import { shareMergedGlobals } from './checker-symbols.js';
++import { type SplitHost, checkFailedShare, checkForkShare } from './checker-split.js';
+ import { readFileSync } from 'node:fs';
+ import { availableParallelism, totalmem } from 'node:os';
+ 
+@@ -85,6 +90,12 @@ export class ParallelCheck {
+   spawn: CheckerSpawn | undefined = undefined;
+   /** Where checkers write the files they emit (`checkersEmit`); set where they can write files. */
+   writer: OutputWriter | undefined = undefined;
++  /**
++   * Starts fork `index` of this checker thread, where a new thread is a fork of the thread that
++   * starts it: it has the starting thread's memory as it is (garnet's workers are forked processes).
++   * The fork posts `forkShare(index)`. Undefined elsewhere, and a checker then shares no statements.
++   */
++  fork: ((index: number) => Worker) | undefined = undefined;
+ }
+ 
+ export const parallelCheck = new ParallelCheck();
+@@ -760,7 +771,9 @@ function isExternalModuleFile(file: SourceFile): boolean {
+  * has resolved (one bit per library), and for each position the number of files of the group starting
+  * there (0 or 1 for a file of its own). Between the ranges and the costs, the time of the latest
+  * retirement (`Date.now()` modulo 2^31, 0 for none) and for each checker whether it retired
+- * (`retires`). The last word is 1 once a checked file has diagnostics (`blocksEmit`).
++ * (`retires`). The two words before the last count the checkers that ran out of files, and the forks
++ * that checkers sharing their statements started on the processors those left idle (`ThreadSplit`).
++ * The last word is 1 once a checked file has diagnostics (`blocksEmit`).
+  *
+  * The leading positions are the shared queue: the costliest files, and groups of files that a
+  * checker takes as a whole (`checkGroups`), which no other checker takes from it.
+@@ -778,7 +791,7 @@ const scheduleHeader = 8;
+ export function newSchedule(count: number, positions = 0, libraries = 0, references = 0): SharedArrayBuffer {
+   const words = (libraries + 31) >> 5;
+   const plan = positions === 0 ? 0 : 3 * positions + 1 + references + libraries + count * words;
+-  const buffer = new SharedArrayBuffer(4 * (scheduleHeader + 3 * count + 1 + plan + 1));
++  const buffer = new SharedArrayBuffer(4 * (scheduleHeader + 3 * count + 1 + plan + 3));
+   const schedule = new Int32Array(buffer);
+   schedule[3] = count;
+   if (positions > 0) {
+@@ -954,6 +967,156 @@ export function takePosition(
+   return lo;
+ }
+ 
++/** Whether threads share statements with forks of themselves (TSC_TS_SPLIT=0 for never). */
++const splitsStatements = process.env.TSC_TS_SPLIT !== '0';
++
++function splitNumber(text: string | undefined, standard: number): number {
++  const n = text === undefined ? NaN : Number(text);
++  return n >= 0 ? Math.floor(n) : standard;
++}
++
++/**
++ * A checker thread's side of sharing statements with forks of itself (checker-split.ts): the idle
++ * processors, which are the checkers that ran out of files, the forks, and what they report.
++ */
++class ThreadSplit implements SplitHost {
++  /** The least text of a file or function whose statements are shared (TSC_TS_SPLIT_BODY). */
++  readonly containerText = splitNumber(process.env.TSC_TS_SPLIT_BODY, 200_000);
++  /** The least text left for each process that shares it (TSC_TS_SPLIT_MIN). */
++  readonly forkText = splitNumber(process.env.TSC_TS_SPLIT_MIN, 50_000);
++  /**
++   * For tests: the files that share statements, by a part of their names (TSC_TS_SPLIT_FILE), forks
++   * to start whether a processor is idle or not (TSC_TS_SPLIT_FORKS), after this many statements of
++   * containers that may be shared (TSC_TS_SPLIT_AT), and the fork that fails (TSC_TS_SPLIT_FAIL).
++   */
++  readonly only = process.env.TSC_TS_SPLIT_FILE ?? '';
++  private forced = splitNumber(process.env.TSC_TS_SPLIT_FORKS, 0);
++  private forcedAfter = splitNumber(process.env.TSC_TS_SPLIT_AT, 0);
++  readonly failing = splitNumber(process.env.TSC_TS_SPLIT_FAIL, 0);
++  /** Whether a fork could not be started: no other is tried. */
++  private exhausted = false;
++  /** The forks that have not reported. */
++  private running = 0;
++  private done: (() => void) | undefined = undefined;
++  private readonly files = new Map<string, DiagnosticFile>();
++
++  constructor(
++    readonly checked: CheckedProgram,
++    private readonly schedule: Int32Array,
++  ) {}
++
++  idle(): boolean {
++    if (this.exhausted) return false;
++    if (this.forced > 0) {
++      if (this.forcedAfter === 0) return true;
++      this.forcedAfter--;
++      return false;
++    }
++    const idle = this.schedule.length - 3;
++    return Atomics.load(this.schedule, idle) > Atomics.load(this.schedule, idle + 1);
++  }
++
++  fork(index: number): boolean {
++    if (this.forced > 0) this.forced--;
++    else {
++      // One fork for each checker that ran out of files, whichever thread starts it.
++      const idle = this.schedule.length - 3;
++      for (;;) {
++        const taken = Atomics.load(this.schedule, idle + 1);
++        if (taken >= Atomics.load(this.schedule, idle)) return false;
++        if (Atomics.compareExchange(this.schedule, idle + 1, taken, taken + 1) === taken) break;
++      }
++    }
++    let worker: Worker;
++    try {
++      worker = parallelCheck.fork!(index);
++    } catch {
++      // The system starts no more processes: the statements stay with those that share them now.
++      this.exhausted = true;
++      return false;
++    }
++    this.running++;
++    let reported = false;
++    // Events arrive once this thread has checked its files: nothing is being checked then.
++    const end = (failed: boolean): void => {
++      if (reported) return;
++      reported = true;
++      if (failed) {
++        mark(`fork ${index} failed`);
++        checkFailedShare(this.checked.checker.split!, index);
++      }
++      this.running--;
++      if (this.running === 0 && this.done !== undefined) this.done();
++    };
++    worker.on('message', (message: unknown) => {
++      if (reported) return;
++      const share = unpackResult((message as ForkMessage).share, this.checked.program, this.files);
++      const diagnostics = this.checked.checker.diagnostics;
++      for (const d of share.diagnostics[0]!) diagnostics.add(d);
++      for (const d of share.globals) diagnostics.add(d);
++      end(false);
++    });
++    worker.on('error', () => end(true));
++    worker.on('exit', () => end(true));
++    return true;
++  }
++
++  /** Calls `done` once every fork has reported or failed. */
++  whenDone(done: () => void): void {
++    if (this.running === 0) done();
++    else this.done = done;
++  }
++}
++
++/** This thread's split: a checker thread's own, and in a fork that of the thread it is a fork of. */
++let threadSplit: ThreadSplit | undefined = undefined;
++
++/** What a fork posts: the diagnostics it added to those of the shared file, and to the global ones. */
++export type ForkMessage = { readonly share: PackedResult };
++
++/** Fork `index` of a checker thread: checks its share of the statements and returns what it found. */
++export function forkShare(index: number): ForkMessage {
++  const host = threadSplit!;
++  const split = checkForkShare(index);
++  if (host.failing === index) throw new Error(`fork ${index} fails (TSC_TS_SPLIT_FAIL)`);
++  const fileName = split.file.fileName;
++  const ofFile: Diagnostic[] = [];
++  const globals: Diagnostic[] = [];
++  for (const d of split.c.diagnostics.takeLog()) {
++    if (d.file === undefined) globals.push(d);
++    else if (d.file.fileName === fileName) ofFile.push(d);
++  }
++  if (timeline) {
++    let taken = 0;
++    for (let k = 0; k < split.mine.length; k++) taken += split.mine[k]!;
++    mark(`share checked: ${taken} statements, ${ofFile.length} diagnostics`);
++  }
++  return { share: packResult(new CheckerResult(index, [0], [ofFile], [], globals, 0, []), host.checked.program) };
++}
++
++/**
++ * Calls `post` once `result`, of this checker thread, holds what its forks found: at once when the
++ * thread shared no statements. The file it shared gets its diagnostics again, now with the forks'.
++ */
++export function whenForksDone(result: CheckerResult, post: () => void): void {
++  const host = threadSplit;
++  const split = host === undefined ? undefined : host.checked.checker.split;
++  if (host === undefined || split === undefined) {
++    post();
++    return;
++  }
++  host.whenDone(() => {
++    const checked = host.checked;
++    const files = checked.program.getSourceFiles();
++    for (let k = 0; k < result.files.length; k++)
++      if (files[result.files[k]!] === split.file) result.diagnostics[k] = checked.unfilteredDiagnosticsOfFile(split.file);
++    result.globals.length = 0;
++    for (const d of checked.getGlobalDiagnostics()) result.globals.push(d);
++    mark(`forks done: ${split.forks}`);
++    post();
++  });
++}
++
+ /** The rest of a group that checker `index` took from the shared queue, by checker index. */
+ const reservedPositions = new Map<number, number[]>();
+ 
+@@ -1467,6 +1630,25 @@ export function checkFromQueue(
+   let memoryReadAt = 0;
+   let more = false;
+   let left: number[] = [];
++  // A thread that only checks shares the statements of a huge file with forks of itself, where it can
++  // fork. Not where every statement's side effects must be in one checker: unused identifiers, the
++  // helpers a file imports, emit and declaration diagnostics.
++  if (
++    splitsStatements &&
++    parallelCheck.fork !== undefined &&
++    !onMainThread &&
++    checking &&
++    limit === 0 &&
++    writer === undefined &&
++    emitter === undefined &&
++    options.noUnusedLocals !== true &&
++    options.noUnusedParameters !== true &&
++    options.importHelpers !== true
++  ) {
++    threadSplit = new ThreadSplit(checked, counter);
++    checked.checker.splitHost = threadSplit;
++  }
++  let ranOut = false;
+   for (const k of reserved) reservedBy(index).push(k);
+   for (;;) {
+     // At its file limit the thread ends; a new one continues its schedule index, and the rest of the
+@@ -1482,7 +1664,10 @@ export function checkFromQueue(
+       if (retires(counter, index, retirement)) break;
+     }
+     const k = takePosition(counter, order.length, index, plan);
+-    if (k < 0) break;
++    if (k < 0) {
++      ranOut = true;
++      break;
++    }
+     const i = order[k]!;
+     done.push(i);
+     const fileStart = verbose || timeline ? performance.now() : 0;
+@@ -1523,6 +1708,8 @@ export function checkFromQueue(
+     } else if (emitter !== undefined) declarations.push(declarationDiagnosticsOfFile(emitter, files[i]!));
+   }
+   mark(`checked ${done.length} files`);
++  // This thread's processor is idle from here: a thread that shares its statements starts a fork for it.
++  if (ranOut && !onMainThread) Atomics.add(counter, counter.length - 3, 1);
+   // The main thread reports its own global diagnostics (CheckedProgram.getGlobalDiagnostics).
+   const globals = onMainThread ? [] : checked.getGlobalDiagnostics().slice();
+   let stats: number[] = [];
+diff --git a/packages/tsc-ts/src/compiler/thread-entry.ts b/packages/tsc-ts/src/compiler/thread-entry.ts
+index 96409df..900341c 100644
+--- a/packages/tsc-ts/src/compiler/thread-entry.ts
++++ b/packages/tsc-ts/src/compiler/thread-entry.ts
+@@ -11,10 +11,12 @@ import { compareReferencesOfThread, type ReferenceJob, referenceThreads } from '
+ import {
+   CheckerResult,
+   checkFromQueue,
++  forkShare,
+   packResult,
+   packsResults,
+   parallelCheck,
+   recycleFiles,
++  whenForksDone,
+ } from './parallel-check.js';
+ import { type LoadMessage, parallelParse } from './parallel-parse.js';
+ import type { ParseThread } from './parse-thread.js';
+@@ -22,7 +24,7 @@ import { useLazyJSDocTable } from './parser.js';
+ import { CheckedProgram } from './program-checker.js';
+ import type { Program } from './program.js';
+ import { assignSymbolIdsAtCreation, reserveSymbolIds, shareSymbolIds } from './symbol.js';
+-import { mark, setTimelineThread } from './timeline.js';
++import { mark, setTimelineThread, timelineThread } from './timeline.js';
+ 
+ /** What threads need from the command line that starts them. */
+ export interface ThreadDrivers {
+@@ -38,7 +40,13 @@ export interface ThreadDrivers {
+ export type ThreadSpawn = (data: ThreadData) => Worker;
+ 
+ /** The `workerData` of a thread of tsc-ts. */
+-export type ThreadData = CheckerThreadData | ParseThreadData | ReferenceThreadData;
++export type ThreadData = CheckerThreadData | ParseThreadData | ReferenceThreadData | SplitThreadData;
++
++/** A fork of a checker thread, which shares the statements of a huge file with it (parallel-check.ts, `ThreadSplit`). */
++export interface SplitThreadData {
++  readonly kind: 'split';
++  readonly index: number;
++}
+ 
+ export interface CheckerThreadData {
+   readonly kind: 'check';
+@@ -71,10 +79,18 @@ export interface ReferenceThreadData {
+ 
+ /**
+  * Lets `--checkers N` start checker threads that write the files they emit, and parse threads where
+- * threads share objects; `args` is the command line the threads read.
++ * threads share objects; `args` is the command line the threads read. `forks` says that a thread
++ * `spawn` starts is a fork of the thread that starts it, with that thread's memory as it is: a checker
++ * thread then shares a huge file with forks of itself.
+  */
+-export function startThreads(spawn: ThreadSpawn, drivers: ThreadDrivers, args: readonly string[]): void {
++export function startThreads(
++  spawn: ThreadSpawn,
++  drivers: ThreadDrivers,
++  args: readonly string[],
++  forks: boolean = false,
++): void {
+   parallelCheck.writer = drivers.outputWriter();
++  if (forks) parallelCheck.fork = (index) => spawn({ kind: 'split', index });
+   parallelCheck.spawn = (program, index, counter, order, nodeIds, symbolIds, reserved, emits, emitKinds, checking) =>
+     spawn({
+       kind: 'check',
+@@ -109,6 +125,7 @@ export function runThread(data: unknown, drivers: ThreadDrivers): void {
+   const kind = (data as { kind: string }).kind;
+   if (kind === 'parse') runParseThread(data as ParseThreadData, drivers);
+   else if (kind === 'references') runReferenceThread(data as ReferenceThreadData);
++  else if (kind === 'split') runSplitThread(data as SplitThreadData);
+   else runCheckerThread(data as CheckerThreadData, drivers);
+ }
+ 
+@@ -127,6 +144,17 @@ function runReferenceThread(data: ReferenceThreadData): void {
+   mark('references compared');
+ }
+ 
++/**
++ * A fork of a checker thread: it has the thread's program and checker as they were when it was
++ * started, checks its share of the statements the thread shares, and posts what it found.
++ */
++function runSplitThread(job: SplitThreadData): void {
++  setTimelineThread(`${timelineThread()}f${job.index}`);
++  mark('fork start');
++  parentPort!.postMessage(forkShare(job.index));
++  mark('share posted');
++}
++
+ /** A checker thread (parallel-check.ts). */
+ function runCheckerThread(job: CheckerThreadData, drivers: ThreadDrivers): void {
+   const startedAt = Date.now();
+@@ -162,10 +190,13 @@ function runCheckerThread(job: CheckerThreadData, drivers: ThreadDrivers): void
+           job.emitKinds,
+           job.checking,
+         );
+-  // Packed results are copied: nothing this thread allocated stays reachable after it ends.
+-  if (packsResults) parentPort!.postMessage(packResult(result, program!));
+-  else parentPort!.postMessage({ result: sharesPublishedGraphs ? publish(result) : result });
+-  mark('result posted');
++  // A thread that shared a file's statements with forks of itself waits for what they found.
++  whenForksDone(result, () => {
++    // Packed results are copied: nothing this thread allocated stays reachable after it ends.
++    if (packsResults) parentPort!.postMessage(packResult(result, program!));
++    else parentPort!.postMessage({ result: sharesPublishedGraphs ? publish(result) : result });
++    mark('result posted');
++  });
+ }
+ 
+ /** A parse thread (parallel-parse.ts): loads the chunks the main thread posts until it posts `stop`. */
+diff --git a/packages/tsc-ts/src/compiler/timeline.ts b/packages/tsc-ts/src/compiler/timeline.ts
+index 85fed23..0e7cb06 100644
+--- a/packages/tsc-ts/src/compiler/timeline.ts
++++ b/packages/tsc-ts/src/compiler/timeline.ts
+@@ -15,6 +15,11 @@ export function setTimelineThread(name: string): void {
+   thread = name;
+ }
+ 
++/** This thread's name in the timeline. */
++export function timelineThread(): string {
++  return thread;
++}
++
+ /** Writes a timeline event at the current time. */
+ export function mark(event: string): void {
+   if (timeline) markAt(performance.now(), event);
