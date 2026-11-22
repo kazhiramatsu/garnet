@@ -559,6 +559,11 @@ extern unsigned long long g_ts_static_miss_slot[65536u * 18u];
 void ts_rt_stat_static_miss_slot(tsv obj, ts_key key);
 #define TS_RT_STAT_STATIC_MISS_SLOT(obj, key) ts_rt_stat_static_miss_slot(obj, key)
 #define TS_RT_STAT_PIC_KEYVAL() (g_ts_pic_keyval_hits++)
+/* Statistics build: the outcomes of the in-line Map and Set probes (ts_map_probe_num and the typed
+   probes below): number keys by the direct table or the hash index, hit or absent; string and
+   reference keys; the calls that left for the general entry. */
+extern unsigned long long g_ts_mapprobe[16];
+#define TS_RT_STAT_MAPPROBE(i) (g_ts_mapprobe[(i)]++)
 #define TS_RT_STAT_PIC_OOL() (g_ts_pic_ool_hits++)
 #define TS_RT_STAT_PIC_SET_CALL() (g_ts_pic_set_calls++)
 #define TS_RT_STAT_PIC_SET_HIT()  (g_ts_pic_set_hits++)
@@ -572,6 +577,7 @@ void ts_rt_stat_static_miss_slot(tsv obj, ts_key key);
 #define TS_RT_STAT_STATIC_MISS_KEY(arr, key) ((void)0)
 #define TS_RT_STAT_STATIC_MISS_SLOT(obj, key) ((void)0)
 #define TS_RT_STAT_PIC_KEYVAL() ((void)0)
+#define TS_RT_STAT_MAPPROBE(i) ((void)0)
 #define TS_RT_STAT_PIC_OOL() ((void)0)
 #define TS_RT_STAT_PIC_SET_CALL() ((void)0)
 #define TS_RT_STAT_PIC_SET_HIT()  ((void)0)
@@ -1347,6 +1353,7 @@ tsv  ts_new_shared_array_buffer(uint32_t n);   /* a store in shared memory */
    a worker's handlers (a message, its uncaught exception, its exit code),
    terminate() and ref/unref; the child's postMessage. */
 int  ts_worker_start(tsv entry, tsv data, int shared);   /* the worker's id; the child never returns */
+int  ts_worker_start_limits(tsv entry, tsv data, int shared, uint32_t young_mb);   /* with its young budget in MiB (0: the default) */
 void ts_worker_set_start(tsv fn);              /* the child calls fn(entry, data, id) instead of entry(data) */
 void ts_worker_on_message(int id, tsv fn);
 void ts_worker_on_error(int id, tsv fn);
@@ -1912,7 +1919,15 @@ typedef struct ts_alloc_site {
   uint8_t state;     /* TS_SITE_YOUNG, TS_SITE_TENURED, TS_SITE_NEVER */
   uint8_t touched;   /* listed for the next digest */
   uint16_t pad;
+#ifdef TSAOT_RT_STATS
+  uint64_t total;    /* every cell the site allocated, young or old (the statistics build's top-sites table) */
+#endif
 } ts_alloc_site;
+#ifdef TSAOT_RT_STATS
+#define TS_SITE_STAT_TOTAL(s) ((s)->total++)
+#else
+#define TS_SITE_STAT_TOTAL(s) ((void)0)
+#endif
 enum { TS_SITE_YOUNG = 0, TS_SITE_TENURED = 1, TS_SITE_NEVER = 2 };
 extern ts_alloc_site g_alloc_sites[];
 extern tsv g_array_proto_v;    /* Array.prototype; null before the setup */
@@ -1933,7 +1948,7 @@ TS_RT_ALWAYS_INLINE tsv ts_new_sized_site_in(size_t size, uint32_t site, tsv pro
       sh->h.kind = TS_KIND_OBJECT; sh->h.mark = 0; sh->h.gen = TS_GEN_YOUNG; sh->h.flags = 0; sh->h.spare = (uint16_t)site;
       ts_hdr_init_sized(&sh->h, size);   /* the flags and the extent (constants here) */
       sh->proto = proto; sh->cls = 0; sh->shape = TS_SHAPE_NONE; sh->dyn = NULL;
-      s->allocs++;
+      s->allocs++; TS_SITE_STAT_TOTAL(s);
       return ts_obj(sh);
     }
   }
@@ -1955,7 +1970,7 @@ TS_RT_ALWAYS_INLINE tsv ts_new_array_lit4_site_in(uint32_t n, tsv a, tsv b, tsv 
     arr->o.proto = g_array_proto_v; arr->o.shape = TS_SHAPE_EMPTY;
     arr->len = n; arr->cap = 4u; arr->data = arr->inline_data;
     arr->inline_data[0] = a; arr->inline_data[1] = b; arr->inline_data[2] = c; arr->inline_data[3] = d;
-    s->allocs++;
+    s->allocs++; TS_SITE_STAT_TOTAL(s);
     return ts_obj(arr);
   }
   tsv r = ts_new_array_lit4_site(n, a, b, c, d, site);
@@ -1978,7 +1993,7 @@ TS_RT_ALWAYS_INLINE tsv ts_new_array_lit_site_in(uint32_t n, const tsv* vals, ui
       arr->o.proto = g_array_proto_v; arr->o.shape = TS_SHAPE_EMPTY;
       arr->len = n; arr->cap = n; arr->data = arr->inline_data;
       for (uint32_t i = 0; i < n; i++) arr->inline_data[i] = vals[i];
-      s->allocs++;
+      s->allocs++; TS_SITE_STAT_TOTAL(s);
       return ts_obj(arr);
     }
   }
@@ -2933,7 +2948,7 @@ TS_RT_ALWAYS_INLINE tsv ts_new_object_layout_site_in(ts_lit_layout* L, uint32_t 
          (90 calls in vue's binary for three or four slots); these unroll to n stores */
       for (uint32_t i = 0; i < n; i++)
         __atomic_store_n(&slots[i], (kinds && kinds[i]) ? ts_int_slot_word(0) : TS_UNDEFINED, __ATOMIC_RELAXED);
-      s->allocs++;
+      s->allocs++; TS_SITE_STAT_TOTAL(s);
       return ts_obj(o);
     }
   }
@@ -3632,18 +3647,24 @@ TS_RT_ALWAYS_INLINE int ts_ta_try_store_f(tsv v, double d, double x, int elem){
    shadow the accessor). */
 /* ---- Map and Set number keys (docs/map_entries_design.md) ----
    The hash of a number key, consistent with SameValueZero: +0 and -0 one
-   value, every NaN one value, then MurmurHash3's fmix64 (a small integer's
-   double has a zero low word; one multiply left the slot-choosing low bits
-   poor). The map code and the inline lookups below share it. */
+   value, every NaN one value. A small integer's double has a zero low word,
+   so the high word is folded onto it first; then one multiply, whose high
+   half mixes every bit of the fold into the bits that choose the slot and
+   into the tag bits above them. It replaced MurmurHash3's fmix64 (two
+   multiplies, about twice the instructions and the latency in front of the
+   index load of every lookup by number): the probe lengths of the index are
+   equal or shorter on ids, strided integers, negatives, fractions and
+   timestamps, and 14% longer on n + 0.5 alone (Session 367, the simulation
+   in docs/map_direct_index_design.md). The map code and the inline lookups
+   below share it. */
 #define TS_MAPSET_NEG_ZERO 0x8000000000000000ull
 TS_RT_ALWAYS_INLINE uint32_t sv0_hash_num_d(double d){
   uint64_t bits;
   if (d == 0) d = 0;                            /* -0 -> +0 */
   if (d != d) bits = 0x7FF8000000000000ull;     /* canonical NaN */
   else memcpy(&bits, &d, sizeof bits);
-  bits ^= bits >> 33; bits *= 0xff51afd7ed558ccdull; bits ^= bits >> 33;
-  bits *= 0xc4ceb9fe1a85ec53ull; bits ^= bits >> 33;
-  return (uint32_t)bits;
+  bits ^= bits >> 32; bits *= 0x9E3779B97F4A7C15ull;
+  return (uint32_t)(bits >> 32);
 }
 TS_RT_ALWAYS_INLINE uint32_t sv0_hash_num(tsv k){ return sv0_hash_num_d(ts_to_num(k)); }
 /* Map.get / Map.has with a number key from an unboxed local (the checker's
@@ -3720,22 +3741,26 @@ TS_RT_ALWAYS_INLINE int ts_map_probe_ref(tsv mv, tsv k, long* out){
 }
 TS_RT_ALWAYS_INLINE tsv ts_map_get_str(tsv mv, tsv k){
   long i;
-  if (TS_RT_LIKELY(ts_map_probe_str(mv, k, &i))) return i >= 0 ? ((ts_map*)ts_ptr(mv))->vals[i] : TS_UNDEFINED;
+  if (TS_RT_LIKELY(ts_map_probe_str(mv, k, &i))){ TS_RT_STAT_MAPPROBE(i >= 0 ? 5 : 6); return i >= 0 ? ((ts_map*)ts_ptr(mv))->vals[i] : TS_UNDEFINED; }
+  TS_RT_STAT_MAPPROBE(7);
   return ts_map_get(mv, k);
 }
 TS_RT_ALWAYS_INLINE int ts_map_has_str(tsv mv, tsv k){
   long i;
-  if (TS_RT_LIKELY(ts_map_probe_str(mv, k, &i))) return i >= 0;
+  if (TS_RT_LIKELY(ts_map_probe_str(mv, k, &i))){ TS_RT_STAT_MAPPROBE(i >= 0 ? 5 : 6); return i >= 0; }
+  TS_RT_STAT_MAPPROBE(7);
   return ts_map_has(mv, k);
 }
 TS_RT_ALWAYS_INLINE tsv ts_map_get_ref(tsv mv, tsv k){
   long i;
-  if (TS_RT_LIKELY(ts_map_probe_ref(mv, k, &i))) return i >= 0 ? ((ts_map*)ts_ptr(mv))->vals[i] : TS_UNDEFINED;
+  if (TS_RT_LIKELY(ts_map_probe_ref(mv, k, &i))){ TS_RT_STAT_MAPPROBE(i >= 0 ? 8 : 9); return i >= 0 ? ((ts_map*)ts_ptr(mv))->vals[i] : TS_UNDEFINED; }
+  TS_RT_STAT_MAPPROBE(10);
   return ts_map_get(mv, k);
 }
 TS_RT_ALWAYS_INLINE int ts_map_has_ref(tsv mv, tsv k){
   long i;
-  if (TS_RT_LIKELY(ts_map_probe_ref(mv, k, &i))) return i >= 0;
+  if (TS_RT_LIKELY(ts_map_probe_ref(mv, k, &i))){ TS_RT_STAT_MAPPROBE(i >= 0 ? 8 : 9); return i >= 0; }
+  TS_RT_STAT_MAPPROBE(10);
   return ts_map_has(mv, k);
 }
 /* WeakMap.get / WeakMap.has with an object or function key (vue's targetMap and proxy maps on
@@ -3778,12 +3803,14 @@ TS_RT_ALWAYS_INLINE int ts_set_probe_ref(tsv sv, tsv k, long* out){
 }
 TS_RT_ALWAYS_INLINE int ts_set_has_str(tsv sv, tsv k){
   long i;
-  if (TS_RT_LIKELY(ts_set_probe_str(sv, k, &i))) return i >= 0;
+  if (TS_RT_LIKELY(ts_set_probe_str(sv, k, &i))){ TS_RT_STAT_MAPPROBE(i >= 0 ? 11 : 12); return i >= 0; }
+  TS_RT_STAT_MAPPROBE(15);
   return ts_set_has(sv, k);
 }
 TS_RT_ALWAYS_INLINE int ts_set_has_ref(tsv sv, tsv k){
   long i;
-  if (TS_RT_LIKELY(ts_set_probe_ref(sv, k, &i))) return i >= 0;
+  if (TS_RT_LIKELY(ts_set_probe_ref(sv, k, &i))){ TS_RT_STAT_MAPPROBE(i >= 0 ? 13 : 14); return i >= 0; }
+  TS_RT_STAT_MAPPROBE(15);
   return ts_set_has(sv, k);
 }
 TS_RT_ALWAYS_INLINE int ts_map_probe_num(tsv mv, double d, long* out){
@@ -3795,9 +3822,9 @@ TS_RT_ALWAYS_INLINE int ts_map_probe_num(tsv mv, double d, long* out){
        indexes it, and any other number is absent (docs/map_direct_index_design.md) */
     if (d >= 0.0 && d < 4294967296.0){
       uint32_t u = (uint32_t)d;
-      if ((double)u == d && u < m->direct_cap){ uint32_t di = m->direct[u]; *out = di ? (long)(di - 1u) : -1; return 1; }
+      if ((double)u == d && u < m->direct_cap){ uint32_t di = m->direct[u]; TS_RT_STAT_MAPPROBE(di ? 0 : 1); *out = di ? (long)(di - 1u) : -1; return 1; }
     }
-    *out = -1; return 1;
+    TS_RT_STAT_MAPPROBE(1); *out = -1; return 1;
   }
   if (TS_RT_UNLIKELY(!m->index)) return 0;
   tsv k = ts_num(d == 0 ? 0.0 : d);
@@ -3805,10 +3832,10 @@ TS_RT_ALWAYS_INLINE int ts_map_probe_num(tsv mv, double d, long* out){
   uint32_t mask = m->index_cap - 1u, slot = h & mask;
   for (;;){
     uint32_t w = m->index[slot];
-    if (w == 0u){ *out = -1; return 1; }
+    if (w == 0u){ TS_RT_STAT_MAPPROBE(3); *out = -1; return 1; }
     if (w != 1u && ((w ^ h) & ~mask) == 0u){
       uint32_t di = (w & mask) - 2u;
-      if (m->keys[di] == k){ *out = (long)di; return 1; }
+      if (m->keys[di] == k){ TS_RT_STAT_MAPPROBE(2); *out = (long)di; return 1; }
       return 0;
     }
     slot = (slot + 1u) & mask;
@@ -3817,11 +3844,13 @@ TS_RT_ALWAYS_INLINE int ts_map_probe_num(tsv mv, double d, long* out){
 TS_RT_ALWAYS_INLINE tsv ts_map_get_num(tsv mv, double d){
   long i;
   if (TS_RT_LIKELY(ts_map_probe_num(mv, d, &i))) return i >= 0 ? ((ts_map*)ts_ptr(mv))->vals[i] : TS_UNDEFINED;
+  TS_RT_STAT_MAPPROBE(4);
   return ts_map_get(mv, ts_num(d));
 }
 TS_RT_ALWAYS_INLINE int ts_map_has_num(tsv mv, double d){
   long i;
   if (TS_RT_LIKELY(ts_map_probe_num(mv, d, &i))) return i >= 0;
+  TS_RT_STAT_MAPPROBE(4);
   return ts_map_has(mv, ts_num(d));
 }
 TS_RT_ALWAYS_INLINE int ts_ta_try_length(tsv v, tsv* out){

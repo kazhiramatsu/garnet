@@ -70,6 +70,9 @@ static void gc_freed_reached(ts_gc_header* h){
    copying nursery's knob, keeps its name). */
 static size_t g_young_fresh_bytes = 0;
 static size_t g_young_cap_bytes = (size_t)4u * 1024u * 1024u;
+/* Whether the environment chose the young budget (the cell count or the bytes) or the payload
+   budget: a shared worker then keeps it, instead of its own larger one (ts_worker_fork_ex). */
+static int g_young_budget_env = 0, g_payload_budget_env = 0;
 /* Payload bytes (malloc'd element, property and table buffers) grown since
    the last minor collection. They are outside the cells' byte count, so a
    loop that only drops large containers would never trigger a collection
@@ -952,6 +955,7 @@ static unsigned long long g_key_ool_get[TS_RT_KEY_HIST], g_key_absent[TS_RT_KEY_
 static unsigned long long g_key_prop_find[TS_RT_KEY_HIST];
 unsigned long long g_ts_key_inline_get[65536], g_ts_key_inline_set[65536];
 unsigned long long g_ts_static_get_hit, g_ts_static_get_miss, g_ts_static_set_hit, g_ts_static_set_miss, g_ts_static_learned;
+unsigned long long g_ts_mapprobe[16];
 unsigned long long g_ts_key_static_get_miss[65536], g_ts_key_static_set_miss[65536];
 unsigned long long g_ts_static_miss_slot[65536u * 18u];
 void ts_rt_stat_static_miss_slot(tsv obj, ts_key key){
@@ -1128,6 +1132,9 @@ __attribute__((destructor)) static void ts_rt_stats_dump(void){
           g_rt_stats.map_fast_miss, g_rt_stats.map_fast_bail, g_rt_stats.map_linear, g_rt_stats.map_indexed);
   rt_stats_hist_line(out, "find_prop", g_rt_stats.find_prop_calls, g_rt_stats.find_prop_probes, g_rt_stats.find_prop_hist);
   rt_stats_hist_line(out, "class_reg", g_rt_stats.class_reg_calls, g_rt_stats.class_reg_probes, g_rt_stats.class_reg_hist);
+  fprintf(out, "[rt_stats] map_probe_inline: num direct hit=%llu absent=%llu | num hashed hit=%llu absent=%llu | num general=%llu | str hit=%llu absent=%llu general=%llu | ref hit=%llu absent=%llu general=%llu | set str hit=%llu absent=%llu | set ref hit=%llu absent=%llu | set general=%llu\n",
+          g_ts_mapprobe[0], g_ts_mapprobe[1], g_ts_mapprobe[2], g_ts_mapprobe[3], g_ts_mapprobe[4], g_ts_mapprobe[5], g_ts_mapprobe[6], g_ts_mapprobe[7],
+          g_ts_mapprobe[8], g_ts_mapprobe[9], g_ts_mapprobe[10], g_ts_mapprobe[11], g_ts_mapprobe[12], g_ts_mapprobe[13], g_ts_mapprobe[14], g_ts_mapprobe[15]);
   fprintf(out, "[rt_stats] class_field_cache: calls=%llu hits=%llu\n", g_rt_stats.class_field_calls, g_rt_stats.class_field_hits);
   fprintf(out, "[rt_stats] location_cache: probes=%llu hits=%llu collisions=%llu\n",
           g_rt_stats.location_probes, g_rt_stats.location_hits, g_rt_stats.location_collisions);
@@ -1377,13 +1384,13 @@ static void gc_config_init(void){
   if (young && young[0]){
     char* end = NULL;
     unsigned long long v = strtoull(young, &end, 10);
-    if (end != young) g_young_threshold = (size_t)(v ? v : 1);
+    if (end != young){ g_young_threshold = (size_t)(v ? v : 1); g_young_budget_env = 1; }
   }
   const char* nbytes = getenv("TSAOT_GC_NURSERY_BYTES");
   if (nbytes && nbytes[0]){
     char* end = NULL;
     unsigned long long v = strtoull(nbytes, &end, 10);
-    if (end != nbytes && v) g_young_cap_bytes = (size_t)v;
+    if (end != nbytes && v){ g_young_cap_bytes = (size_t)v; g_young_budget_env = 1; }
     if (g_young_cap_bytes < ((size_t)256u << 10)) g_young_cap_bytes = (size_t)256u << 10;
   }
   g_payload_budget_bytes = g_young_cap_bytes * 16u;
@@ -1391,7 +1398,7 @@ static void gc_config_init(void){
   if (pbudget && pbudget[0]){
     char* end = NULL;
     unsigned long long v = strtoull(pbudget, &end, 10);
-    if (end != pbudget && v) g_payload_budget_bytes = (size_t)v;
+    if (end != pbudget && v){ g_payload_budget_bytes = (size_t)v; g_payload_budget_env = 1; }
   }
   /* Full-GC byte threshold override (B-3). Mainly a stress/tuning knob: a tiny
      value forces frequent full collections the way TSAOT_GC_YOUNG_THRESHOLD=1
@@ -1879,7 +1886,7 @@ static inline int gc_site_tenured(uint32_t site){
 }
 static inline tsv gc_site_note(tsv v, uint32_t site){
   ((ts_gc_header*)ts_ptr(v))->spare = (uint16_t)site;
-  g_alloc_sites[site].allocs++;
+  g_alloc_sites[site].allocs++; TS_SITE_STAT_TOTAL(&g_alloc_sites[site]);
   return v;
 }
 #ifdef TSAOT_RT_STATS
@@ -1890,6 +1897,15 @@ static void gc_sites_stats(FILE* out){
     else if (g_alloc_sites[i].state == TS_SITE_NEVER) reverted++;
   }
   fprintf(out, "[rt_stats] alloc_sites: tenured=%u reverted=%u\n", tenured, reverted);
+  /* the sites that allocated most (the id is the IR site, sites.json's `site`), with their tenure */
+  for (int rank = 0; rank < 80; rank++){
+    uint32_t best = 0; uint64_t bestc = 0;
+    for (uint32_t i = 1; i <= TS_ALLOC_SITE_MAX; i++) if (g_alloc_sites[i].total > bestc){ bestc = g_alloc_sites[i].total; best = i; }
+    if (!bestc) break;
+    fprintf(out, "[rt_stats] alloc_site %u: %llu%s\n", best - 1u, (unsigned long long)bestc,
+            g_alloc_sites[best].state == TS_SITE_TENURED ? " tenured" : "");
+    g_alloc_sites[best].total = 0;
+  }
 }
 #endif
 
@@ -26150,7 +26166,7 @@ static uint32_t env_u32(const char* name, uint32_t dflt){
   unsigned long v = strtoul(s, NULL, 10);
   return v ? (uint32_t)v : dflt;
 }
-static int ts_worker_fork_ex(tsv entry, tsv data, int shared);
+static int ts_worker_fork_ex(tsv entry, tsv data, int shared, uint32_t young_mb);
 /* TSAOT_PUBLISH_PROTECT=1 (a check mode): the regions a process only reads
    are mapped read-only in it, so a write by a reader faults instead of
    reaching the other processes (the parent at a shared worker's exit, a
@@ -26171,7 +26187,10 @@ static void region_protect_all(void){
     bi = e;
   }
 }
-int ts_worker_start(tsv entry, tsv data, int shared){ return ts_worker_fork_ex(entry, data, shared); }
+int ts_worker_start(tsv entry, tsv data, int shared){ return ts_worker_fork_ex(entry, data, shared, 0u); }
+/* The same with the worker's young budget in MiB (node:worker_threads' resourceLimits.maxYoungGenerationSizeMb;
+   0: the default, a shared worker's larger one). */
+int ts_worker_start_limits(tsv entry, tsv data, int shared, uint32_t young_mb){ return ts_worker_fork_ex(entry, data, shared, young_mb); }
 /* TSAOT_FORK_TRACE=1: the cost of each fork on stderr (the parent's young
    collection, its setup, fork() itself, and the child's time from the fork to
    its entry), on the system clock both processes share. */
@@ -26181,8 +26200,22 @@ static int fork_trace_on(void){
   return on;
 }
 static double fork_trace_now_ms(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6; }
+/* This process's instructions and cycles since it started (a forked worker: since its fork), for
+   the worker's exit line: on a busy machine they are what an A/B of one worker can read, where
+   its wall clock cannot (the parent's rusage does not carry a child's counts). */
+#ifdef __APPLE__
+#include <libproc.h>
+static void fork_trace_self_counts(unsigned long long* insn, unsigned long long* cycles){
+  struct rusage_info_v4 ri;
+  *insn = 0; *cycles = 0;
+  if (proc_pid_rusage(getpid(), RUSAGE_INFO_V4, (rusage_info_t*)&ri) == 0){ *insn = ri.ri_instructions; *cycles = ri.ri_cycles; }
+}
+#else
+static void fork_trace_self_counts(unsigned long long* insn, unsigned long long* cycles){ *insn = 0; *cycles = 0; }
+#endif
 static double g_fork_trace_forked_at = 0;   /* the parent's clock just before fork(), inherited by the child */
-static int ts_worker_fork_ex(tsv entry, tsv data, int shared){
+#define TS_SHARED_WORKER_YOUNG_FACTOR 16u   /* a shared worker's young budget over the default (below) */
+static int ts_worker_fork_ex(tsv entry, tsv data, int shared, uint32_t young_mb){
   if (!ts_is_func(entry)) ts_throw_type_error_msg("Worker: the entry is not a function of the program");
   if (shared && g_region_mode) ts_throw_type_error_msg("Worker: a shared worker cannot fork a shared worker");
   ts_gc_root(&data); ts_gc_root(&entry);
@@ -26252,6 +26285,31 @@ static int ts_worker_fork_ex(tsv entry, tsv data, int shared){
       g_free_blocks = 0; g_large_head = 0; g_large_cell_head = 0; g_alloc_dirty_len = 0;
       g_next_shape = child_shape_lo; g_shape_limit = child_shape_hi; g_shape_ranges_end = 0;
       g_shared_workers_alive = 0; g_shape_log_len = 0; g_prefork_frozen_len = 0;
+      /* What a shared worker allocates is mostly the graph it publishes, and the publish promotes
+         it: a young collection before that marks and promotes the graph a part at a time, for the
+         little garbage made in between (a parse worker of tsc-ts on a 3 MB source file: four
+         collections, 14% of its instructions, to free 3 MB of a 61 MB region). Sixteen times the
+         young budget, unless the environment chose one (the stress gates' one-cell budget stays). */
+      gc_config_init();
+      if (!g_young_budget_env && !young_mb){
+        g_young_threshold *= TS_SHARED_WORKER_YOUNG_FACTOR; g_young_cap_bytes *= TS_SHARED_WORKER_YOUNG_FACTOR;
+        if (!g_payload_budget_env) g_payload_budget_bytes = g_young_cap_bytes * 16u;
+      }
+    }
+    /* The young budget the program gave this worker (resourceLimits.maxYoungGenerationSizeMb): the bytes,
+       and the cells at the default budget's bytes per cell. A worker whose heap ends with it can ask for one
+       its whole run fits in: a collection there promotes what the run keeps and makes the rest of the run pay
+       for an old generation (a checker of tsc-ts: 4.9% of its instructions for 63 MB). The environment's
+       budget, when set, stays (the stress gates'). */
+    if (young_mb){
+      gc_config_init();
+      if (!g_young_budget_env){
+        size_t bytes_per_cell = g_young_cap_bytes / g_young_threshold;
+        if (!bytes_per_cell) bytes_per_cell = 64u;
+        g_young_cap_bytes = (size_t)young_mb << 20;
+        g_young_threshold = g_young_cap_bytes / bytes_per_cell;
+        if (!g_payload_budget_env) g_payload_budget_bytes = g_young_cap_bytes * 16u;
+      }
     }
     /* the parent's pending work is the parent's: its workers' pipes, its
        microtasks and I/O tasks */
@@ -26282,9 +26340,13 @@ static int ts_worker_fork_ex(tsv entry, tsv data, int shared){
     else { tsv args[1] = { data }; ts_call(entry, args, 1); }
     ts_run_event_loop();
     ts_eh_pop();
-    if (ftrace) fprintf(stderr, "[fork child] %d: exit %.2f ms after the fork, region used %u MB, young collections %llu\n", (int)getpid(),
-                        fork_trace_now_ms() - g_fork_trace_forked_at, g_region_mode ? (unsigned)((((size_t)(g_region_cur - g_region_lo)) << GC_BLOCK_SHIFT) >> 20) : 0u,
-                        (unsigned long long)g_minor_collections);
+    if (ftrace){
+      unsigned long long insn, cycles; fork_trace_self_counts(&insn, &cycles);
+      struct rusage ru; getrusage(RUSAGE_SELF, &ru);
+      fprintf(stderr, "[fork child] %d: exit %.2f ms after the fork, region used %u MB, young collections %llu, instructions %.4f G, cycles %.4f G, max rss %ld MB\n", (int)getpid(),
+              fork_trace_now_ms() - g_fork_trace_forked_at, g_region_mode ? (unsigned)((((size_t)(g_region_cur - g_region_lo)) << GC_BLOCK_SHIFT) >> 20) : 0u,
+              (unsigned long long)g_minor_collections, (double)insn / 1e9, (double)cycles / 1e9, (long)(ru.ru_maxrss >> 20));
+    }
     prof_pc_dump_child();
     fflush(stdout); fflush(stderr);
     _exit(0);

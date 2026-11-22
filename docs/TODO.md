@@ -13113,3 +13113,98 @@ State at the end of the session: main is d2822b8 (five landings today: Session 3
 2. The objects fuzzer further: `scripts/fuzz/run.sh objects 201 600`, and `features 151 300`; the arrays with accessor elements it reports are known.
 3. The deferred items of CLAUDE.md that are silent: an own method assigned through an `any` value is not seen by `this.m()`; an arrow in a borrowed method.
 4. Kaz's elements kinds for `number[]` (Session 363's note): the flag and the loops, the generic clones, the proof.
+
+## Session 367 (2026-11-22): tsc-ts against tsrs: where the time is, the workers' collections, the first changes to tsc-ts
+
+Branch `s367-runtime-perf` from main after Session 366 (c8adf15), in the worktree `build/wt_dc`. Kaz's direction for the session, in
+three messages: make the runtime faster (fewer machine instructions, fewer allocations); the goal is tsc-ts faster than **tsrs**
+(oxc-project's Rust port of tsgo, 7.1.0-beta.tsrs3, the source build without profile guidance that tsc-rs's README compares:
+`~/dev/tsc-rs/target/claude-tools/perf11/bin/tsrs-7.1.0-beta.tsrs3-nopgo`); tsc-ts itself may be changed where that makes it faster.
+
+**The gap, measured** (the TypeScript 6.0.3 compiler project, `--noEmit`, r36 = main; other sessions' jobs on the machine throughout, so
+walls are minima and medians of interleaved rounds, and everything else is instructions):
+
+| | tsrs | garnet tsc-ts (r36) |
+|---|---|---|
+| default settings, wall | 0.14 - 0.17 s | 0.37 - 0.41 s (ten checkers) |
+| four checkers, wall | (its default) | 0.34 - 0.38 s |
+| one thread, wall | 0.31 s | 0.81 s |
+| one thread, instructions / cycles | 4.91 G / 1.38 G | 13.71 G / 3.56 G |
+| one thread, peak resident set | 120 MB | 464 MB |
+
+- **The critical path is one file.** tsc-ts's own timeline, four checkers: the process's start 6 ms, the parse threads forked by 13 ms,
+  checker.ts (3.15 MB of the project's 10 MB) parsed in 45 ms and bound in 15 ms on one parse worker, published in 13 ms (488,771
+  cells), the program built and the checkers forked by 93 ms, checker.ts checked in 245 ms by one checker (the other three: 191 ms
+  each), exit at 338 ms. Ten checkers finish no sooner (their sum of per-file check times: 615 ms on one checker, 704 on two, 819 on
+  four, 1,423 on ten: each checker derives the shared declarations again, and six of the ten cores are efficiency cores).
+  `--checkers 4` (tsgo's and tsrs's default, what `TSC_TS_CHECKERS=fixed` selects) is 10% faster than tsc-ts's `auto` on this machine;
+  the default was left alone.
+- **Where it goes.** One thread (PC samples): generated code 70%, allocation 6.9%, collection 5.9%, Map and Set 4.3%, system
+  libraries 4.2%, strings 2.9%. The checker of checker.ts: generated code 78%, Map and Set 7.1%, allocation 4.6%, collection 2.2%;
+  by tsc-ts source file: checker-narrowing 12.7%, relations 7.4%, ast.ts (the accessors that switch on `kind` and test `instanceof`)
+  6.4%, checker-symbols 5.8%, checker-type-factory 5.7%, link-tables 5.5%. No function above 5%: the 2.8x in instructions is what each
+  operation costs (the 32-byte object header, NaN boxes, guards, Maps for side tables), not a place.
+- **Allocations of one type check** (the statistics build, new per-site totals): 5.26 M cells: 2.48 M objects, 1.97 M arrays (every
+  array a 112-byte cell; 1.38 M die young), 325 k closures (each with its environment buffer), 315 k strings, 86 k Sets (84 k die
+  young), 72 k Maps; 2.39 M of them pretenured. The busiest temporary sites are working arrays of the port (`getTypeAtFlowBranchLabel`'s
+  `types` 247 k, the four arrays of a `CallState` 53 k each, an `InferenceState`'s two 28 k each). 8.4 M in-line Map and Set probes: 3.4 M
+  direct hits by number, 1.3 M hashed by number, 1.4 M by string.
+- **Is the collector the bottleneck? Its ceiling.** With every collection switched off (the three budgets huge; zero collections
+  confirmed by the statistics build), one thread: 13.66 to 12.08 G instructions (-11.6%), cycles -9.7%, wall 0.84 to 0.75 s, resident
+  set 464 to 778 MB. A sixteen times larger young budget alone: -0.8%; site pretenuring off: +6.6%. So about a tenth, most of it not
+  the collections but the old generation they create (the out-of-line allocation of a tenured site, 2.39 M times, about 180
+  instructions on its path by a reading of the machine code against 15 in line; the barriers), and nothing like the 2.6x.
+
+**What changed** (each measured by the instructions of the two workers on the critical path; `scripts/tsc_ts_workers_ab.sh`, new):
+
+- **A shared worker's young budget is sixteen times the default** (`ts_worker_fork_ex`; docs/published_graphs_design.md, "Sharing by
+  fork", item 2). What a parse worker allocates is the graph it publishes, and the publish promotes it; its young collections marked and
+  promoted that graph a part at a time (four collections for the 3 MB file, to free 3 MB of a 61 MB region). The parse worker of
+  checker.ts: 1.270 to 1.085 G instructions (-14.6%), cycles -11.8%; all parse workers 4.91 to 4.21 G. An environment budget stays as
+  given (the stress gates' one cell).
+- **`resourceLimits.maxYoungGenerationSizeMb` is a forked worker's young budget** (`lib/node/worker_threads.ts`,
+  `ts_worker_start_limits`; docs/fork_workers_design.md, the Session 367 update). The program says which workers are short-lived;
+  tsc-ts's driver gives its checker threads 128 MiB, under which a checker of this project never collects. The checker of checker.ts:
+  3.326 to 3.169 G instructions (-4.7%), cycles -5.7%, peak resident set 204 to 267 MB; the four checkers 11.06 to 10.43 G, 740 to
+  1,005 MB. A budget below the run's allocation gains nothing (64 MiB: -0.5%): the first collection's old generation is the cost.
+  Node ignores a `resourceLimits` that is not an object, and so does the library. Fixture `node/worker_young_generation`.
+- **tsc-ts, two patches** (`benchmarks/tsc_ts_native/patches`, applied by `scripts/build_tsc_ts_native.sh` to its copy of the
+  sources, `TSAOT_TSC_TS_PATCHES=0` for the unmodified program; the working copy is the branch `garnet-s367` of `build/tsc-ts` in
+  the worktree `build/tsc-ts-garnet`): `getMergedSymbol` tests a bit of the symbol's id before its lookup in `mergedSymbols`, which
+  found nothing for nearly every symbol (2.9% of that checker's samples), and the "cannot find name" message of an identifier is
+  chosen when its lookup fails (some forty string cases before every lookup). The checker of checker.ts: 3.377 to 3.326 G (-1.5%),
+  cycles -2.0%. Checked by `scripts/tsc_ts_corpus_diff.py` (new): every file of TypeScript's `tests/cases/compiler`, 6,537 compiles
+  by each build, identical output and exit status in all (4,225 report diagnostics), and a case with every branch of the message
+  choice under `--lib es5`.
+- **The hash of a number key** is a fold and one multiply (`sv0_hash_num_d`; docs/map_direct_index_design.md, with the probe-length
+  table): half the instructions of fmix64 in front of every hashed lookup by number. One thread 13.651 to 13.618 G.
+- **Diagnostics**: `TSAOT_FORK_TRACE=1` ends a worker's exit line with its own instructions, cycles and peak resident set
+  (`proc_pid_rusage`): the parent's rusage carries none of it, and it is the one reading of a parallel compile that a loaded machine
+  does not move. The statistics build lists the allocation sites that allocated most (`alloc_site`, ids as `sites.json`) and the
+  outcomes of the in-line Map and Set probes (`map_probe_inline`).
+- Measured and not kept: the direct table's density rule relaxed for the checkers' sparse id tables (128 to 8192 times the entries: no
+  gain, a sparse direct table is as cold as the index); tsc-ts's `SparseLinkTable` as pages of 256 ids instead of a Map (+1.4%
+  instructions in the checker).
+
+**Together, r36 to r37**: the critical path's two workers 4.654 to 4.256 G instructions (-8.6%: the parse worker 1.277 to 1.092, the
+checker 3.377 to 3.165); wall, eleven interleaved rounds beside tsrs at 0.15 / 0.16 s (minimum / median): default 0.39 / 0.41 to
+0.35 / 0.37 s, four checkers 0.35 / 0.38 to 0.32 / 0.34 s. One thread with emit (the instruction A/B, outputs identical): 21.957 to
+21.898 G, cycles -1.2%. hono -0.06% instructions, hono_app -0.03%, vue 0.00%.
+
+Gates (`build/gates_s367a/run.sh`, other sessions' load on the machine): unit, bundler 56, conformance 819/819 plain and strict,
+816/816 under protect, ci, GC stress, the drivers' outputs identical, the corpus differential above. bench: one kernel over its budget
+in the run (`string_unicode_search_kernel` 116 ms against 105, code the session did not touch), all within budget when run alone
+afterwards. ir-parity: the ten files of the three programs that import `node:worker_threads` differ, as the library's constructor
+changed; snapshot taken (5,055 identical).
+
+**What it takes to pass tsrs** (2.1x on the wall from here, 2.6x on one thread):
+
+1. The cost of an operation in generated code, which is 78% of the checker: nothing in the runtime reaches it. Profile-guided builds
+   are worth about 16% of the instructions and are the build's default (the table above compares plain builds, as tsc-rs's README does).
+2. The check of one large file on one thread bounds the wall whatever the checker count. tsrs's `--fast` and tsc-rs's `TSRS_FAST=1`
+   split further and say so ("may report a few diagnostics differently"); tsc-ts splitting a file's statements between checkers would
+   be that mode, not the default.
+3. In the runtime: the out-of-line allocation of a tenured site (the main thread and any program that collects), an array's
+   112-byte cell, the publish walk (13 ms of the critical path).
+4. In tsc-ts: the accessors of ast.ts at their hottest callers (`getLocals` in the resolver's scope walk, `getText` in
+   `isMatchingReference`), the per-call state objects and their arrays.

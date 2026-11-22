@@ -497,3 +497,32 @@ hot path, compare the hot functions of the two runtimes (`objdump -d -r`
 of each relinked `rt.o`, counting the `ARM64_RELOC_BRANCH26` calls per
 function). Pin such a helper with `TS_RT_ALWAYS_INLINE` (in `ts_rt.c` the
 header's allowlist does not apply).
+
+### Measuring a parallel tsc-ts run: each worker's own instructions
+
+A default tsc-ts run is a main process, ten forked parse workers and the forked checkers. The
+parent's rusage carries none of a child's instructions, and the wall clock moves with whatever
+else the machine runs, so neither says whether a change helped. `TSAOT_FORK_TRACE=1` ends each
+worker's exit line with its own instructions, cycles and peak resident set, and
+`scripts/tsc_ts_workers_ab.sh <rounds> <checkers> a=<binary> b=<binary>[;ENV=VALUE ...]` alternates
+configurations and prints the medians of the two workers the wall clock is made of (the parse
+worker and the checker of the largest file, checker.ts on the compiler project) and of all of
+each kind. The instructions repeat within 0.1% under a load average of 40; the cycles do not
+(they drifted 10% over an hour of other sessions' jobs), so read the instructions there and
+take the wall as the minimum and the median of ten or more interleaved rounds once the machine
+is quiet.
+
+A profile of one worker: `TSAOT_PROF_PC=<dir>/pcs` writes `pcs.<pid>` per worker; the checker of
+the largest file is the file with the most samples among the last forked. A parse worker's file
+is mostly `poll` (it waits for its next chunk and the sampler counts wall time): cut the parse
+phase out of a one-thread profile instead (`TSAOT_PROF_PC_RAW`, `scripts/prof_window.py`).
+
+### Changing tsc-ts: the patches and their check
+
+tsc-ts's sources are changed by patches (`benchmarks/tsc_ts_native/patches`, its README: the
+working copy, how a commit becomes a patch). A patch may change how fast the compiler runs and
+nothing it prints: `scripts/tsc_ts_corpus_diff.py <binary A> <binary B> --root <TypeScript
+checkout>/tests/cases` compiles every file of TypeScript's own `tests/cases/compiler` (6,537)
+with a build without the patch and one with it and compares output and exit status (about ten
+minutes at three jobs; `--limit 300` for a first look), and `scripts/tsc_ts_insn_ab.sh` compares
+the files they emit for the compiler project.

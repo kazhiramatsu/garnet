@@ -127,9 +127,10 @@ export interface GarnetNodeHost {
   /** Forks a worker that runs `entry` (a function of the program the exporter names for the
    *  worker's module) with `data` as its workerData; `shared` forks it into a region the parent
    *  reads (garnet:shared). The handlers run from the event loop: a message from the worker, an
-   *  uncaught exception of the worker, and its exit code. The worker's id. */
+   *  uncaught exception of the worker, and its exit code. `youngMb` is the worker's young budget in
+   *  MiB (resourceLimits.maxYoungGenerationSizeMb), 0 for the default. The worker's id. */
   spawnWorker(entry: unknown, data: unknown, shared: boolean, onMessage: (value: unknown) => void,
-              onError: (error: unknown) => void, onExit: (code: number) => void): number;
+              onError: (error: unknown) => void, onExit: (code: number) => void, youngMb: number): number;
   sendToWorker(id: number, value: unknown): void;
   /** SIGTERM to the worker; its exit handler then runs with code 1. */
   killWorker(id: number): void;

@@ -119,10 +119,16 @@ export class Worker extends EventEmitter {
     if (options?.stdout || options?.stderr || options?.stdin) throw new TypeError("new Worker: piped stdio (`stdout`, `stderr`, `stdin`) is not available: a worker writes to the process's streams (docs/node_compat_design.md)");
     if (options?.env !== undefined && options.env !== SHARE_ENV) throw new TypeError("new Worker: an `env` of its own is not available: a worker sees the process's environment (docs/node_compat_design.md)");
     if (options?.argv !== undefined && options.argv.length > 0) throw new TypeError("new Worker: `argv` is not available: a worker sees the process's arguments (docs/node_compat_design.md)");
+    // resourceLimits.maxYoungGenerationSizeMb is the forked worker's young budget: the allocation between
+    // two young collections (docs/node_compat_design.md); the other limits have no counterpart here. Node
+    // reads the limits of an object and ignores anything else it is given.
+    const limits: unknown = options?.resourceLimits;
+    const youngMb: unknown = typeof limits === "object" && limits !== null ? (limits as ResourceLimits).maxYoungGenerationSizeMb : undefined;
     this.threadId = host.spawnWorker(filename, options?.workerData, options?.shared === true,
       (value: unknown) => { this.emit("message", value); },
       (error: unknown) => { this.emit("error", error); },
-      (code: number) => { this.exited = true; this.exitCode = code; this.emit("exit", code); });
+      (code: number) => { this.exited = true; this.exitCode = code; this.emit("exit", code); },
+      typeof youngMb === "number" && youngMb >= 1 ? Math.floor(youngMb) : 0);
     host.nextTick(() => { if (!this.exited) this.emit("online"); }, undefined);
   }
   postMessage(value: unknown, _transferList?: unknown[]): void {

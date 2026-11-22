@@ -1,0 +1,94 @@
+getMergedSymbol tests a bit of the symbol's id before it asks the table
+
+getMergedSymbol runs for every symbol a check touches. Symbols of a shared program have their
+ids from creation, so each call looked the id up in mergedSymbols, a Map<number, Symbol> that
+holds the few symbols the program merges: nearly every lookup hashed the id and found nothing
+(2.9% of the samples of the checker that checks checker.ts of the TypeScript compiler project,
+garnet build). The checker keeps one bit per id that is or has been a key of the table; a clear
+bit answers without the lookup. The bits are a superset of the keys: they are set where a
+checker takes its table (its own, a copy, or the library globals it borrows) and by
+setMergedSymbol, the one writer; an undo of a borrowed table leaves them set.
+
+diff --git a/packages/tsc-ts/src/compiler/checker-symbols.ts b/packages/tsc-ts/src/compiler/checker-symbols.ts
+index e65ac30..663ae16 100644
+--- a/packages/tsc-ts/src/compiler/checker-symbols.ts
++++ b/packages/tsc-ts/src/compiler/checker-symbols.ts
+@@ -951,10 +951,29 @@ export function setGlobal(c: Checker, name: string, symbol: Symbol): void {
+ }
+ 
+ function setMergedSymbol(c: Checker, id: number, target: Symbol): void {
++  noteMergedSymbolId(c, id);
+   if (c.mergedSymbolChanges !== undefined) c.mergedSymbolChanges.set(c.mergedSymbols, id, target);
+   else c.mergedSymbols.set(id, target);
+ }
+ 
++/** Sets the bit of `id` in `c.mergedSymbolIdBits`: `id` is a key of `c.mergedSymbols` from now on. */
++function noteMergedSymbolId(c: Checker, id: number): void {
++  const word = id >>> 5;
++  let bits = c.mergedSymbolIdBits;
++  if (word >= bits.length) {
++    const grown = new Int32Array(Math.max(word + 1, bits.length * 2, 1024));
++    grown.set(bits);
++    bits = grown;
++    c.mergedSymbolIdBits = grown;
++  }
++  bits[word] = bits[word]! | (1 << (id & 31));
++}
++
++/** Sets the bits of the keys `c.mergedSymbols` holds: a checker starts from another's table. */
++export function noteMergedSymbolIds(c: Checker): void {
++  for (const id of c.mergedSymbols.keys()) noteMergedSymbolId(c, id);
++}
++
+ /** Merges script locals into globals; ambient modules and augmentations wait for global types. */
+ export function initializeGlobals(c: Checker): void {
+   const globals = c.globals;
+@@ -1294,8 +1313,13 @@ function recordMergedSymbol(c: Checker, target: Symbol, source: Symbol): void {
+ export function getMergedSymbol(c: Checker, symbol: Symbol): Symbol {
+   const id = symbol.id;
+   if (id !== 0) {
+-    const merged = c.mergedSymbols.get(id);
+-    if (merged !== undefined) return merged;
++    // Few symbols are merged: the id's bit says whether the table can hold it at all.
++    const bits = c.mergedSymbolIdBits;
++    const word = id >>> 5;
++    if (word < bits.length && (bits[word]! & (1 << (id & 31))) !== 0) {
++      const merged = c.mergedSymbols.get(id);
++      if (merged !== undefined) return merged;
++    }
+   }
+   return symbol;
+ }
+diff --git a/packages/tsc-ts/src/compiler/checker.ts b/packages/tsc-ts/src/compiler/checker.ts
+index bdb53b0..6a1bc3b 100644
+--- a/packages/tsc-ts/src/compiler/checker.ts
++++ b/packages/tsc-ts/src/compiler/checker.ts
+@@ -97,6 +97,7 @@ import {
+   getGlobalType,
+   initializeGlobals,
+   mergeAmbientModulesAndAugmentations,
++  noteMergedSymbolIds,
+ } from './checker-symbols.js';
+ import { PermissiveMapper, ReportingMapper, RestrictiveMapper, UniqueLiteralMapper } from './instantiation.js';
+ import { Relation, RelationKey, type InternedRelationKey, type Relater, TypeComparer } from './relations.js';
+@@ -385,6 +386,12 @@ export class Checker implements TypeChecking {
+   readonly resolvedSignatures = new SparseLinkTable<Signature>();
+   /** Merged symbols, indexed by the id of the symbol merged into them. */
+   readonly mergedSymbols: Map<number, Symbol>;
++  /**
++   * One bit per symbol id that is, or has been, a key of `mergedSymbols` (an undo of a borrowed table
++   * leaves its bits: a superset). `getMergedSymbol` runs for every symbol a check touches and nearly
++   * none of them is merged, so it tests the id's bit before it asks the table.
++   */
++  mergedSymbolIdBits: Int32Array = new Int32Array(0);
+   /** Globals merged from the default libraries, shared with other checkers. */
+   libGlobals: LibGlobals | undefined;
+   /** The program's globals and module augmentations as another checker merged them, shared with it. */
+@@ -720,6 +727,7 @@ export class Checker implements TypeChecking {
+       this.globals = libs.copyGlobals();
+       this.mergedSymbols = libs.copyMergedSymbols();
+     }
++    noteMergedSymbolIds(this);
+     this.globalThisSymbol = this.newSymbol(SymbolFlags.Module, 'globalThis');
+     this.globalThisSymbol.checkFlags = CheckFlags.Readonly;
+     this.globalThisSymbol.exports = this.globals;

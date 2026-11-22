@@ -284,3 +284,34 @@ function the exporter makes of the module `new Worker(...)` names
 per-worker entry, the library's start hook, an exit handler with the exit
 code, `terminate()` (SIGTERM), `ref`/`unref`, the uncaught exception as a
 frame to the parent, and the child dropping the parent's pending loop work.
+
+## Update (Session 367): a worker's young budget, and a worker's own counts
+
+A worker is a process that ends, and a young collection in it buys less than in a program that
+lives on: it promotes what the run keeps, the sites of the survivors turn tenured (the
+out-of-line allocation), and every later store into what became old pays the barrier's slow
+half. Two budgets follow from that (`ts_worker_fork_ex`):
+
+- **A shared worker** takes sixteen times the default young budget, since what it allocates is
+  the graph it publishes (docs/published_graphs_design.md, "Sharing by fork", item 2).
+- **`resourceLimits.maxYoungGenerationSizeMb`** of `new Worker(...)` is a forked worker's young
+  budget in MiB: the bytes, and the cells at the default budget's bytes per cell
+  (`ts_worker_start_limits`; under Node the option sizes V8's young generation, so a program
+  passes one number to both). A plain worker without it keeps the default: a pool of long-lived
+  workers must not each hold a large nursery of garbage, so the program says which workers are
+  short. tsc-ts's driver (`benchmarks/tsc_ts_native/garnet/main.ts`) gives its checker threads
+  128 MiB: a checker of the compiler project allocates under 100 MiB and then runs no collection
+  at all. The checker of checker.ts: 3.326 to 3.169 G instructions (-4.7%), cycles -5.7%, peak
+  resident set 204 to 267 MB; the four checkers together 11.06 to 10.43 G, 740 to 1005 MB. A
+  budget below the run's allocation gains almost nothing (64 MiB: -0.5%): the cost is the first
+  collection's old generation, not the number of collections. Fixture
+  `node/worker_young_generation`.
+
+An environment budget (`TSAOT_GC_YOUNG_THRESHOLD`, `TSAOT_GC_NURSERY_BYTES`) overrides both, so
+the GC stress gates collect in every worker as before.
+
+`TSAOT_FORK_TRACE=1` now ends a worker's exit line with the worker's own instructions, cycles
+(`proc_pid_rusage`, macOS) and peak resident set. The parent's rusage does not carry a child's
+counts, and on a busy machine a worker's wall clock says nothing: the instructions of the
+heaviest parse worker and of the heaviest checker are how a change to the critical path of a
+parallel compile is read (`scripts/tsc_ts_workers_ab.sh`).

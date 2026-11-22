@@ -1,0 +1,75 @@
+The message of an unresolved identifier is chosen when its lookup fails
+
+getResolvedSymbol and resolveEntityName chose the "cannot find name" message before the lookup:
+getCannotFindNameDiagnosticForName compares the identifier's text with some forty names, for
+every identifier a check resolves, and nearly every lookup finds its name. A lookup that starts
+at the identifier itself now passes cannotFindNameOfLocation, and onFailedToResolveSymbol asks
+for the message with the location it was given, which is that identifier. A lookup from another
+location (resolveEntityName with a location) chooses the message first, as before.
+
+diff --git a/packages/tsc-ts/src/compiler/checker-expressions.ts b/packages/tsc-ts/src/compiler/checker-expressions.ts
+index c440c77..aaa1ae2 100644
+--- a/packages/tsc-ts/src/compiler/checker-expressions.ts
++++ b/packages/tsc-ts/src/compiler/checker-expressions.ts
+@@ -129,7 +129,7 @@ import {
+   resolveEntityName,
+   resolveName,
+   getFirstIdentifier,
+-  getCannotFindNameDiagnosticForName,
++  cannotFindNameOfLocation,
+   getDeclarationOfAliasSymbol,
+   TypeSystemPropertyName,
+   popTypeResolution,
+@@ -559,7 +559,7 @@ export function getResolvedSymbol(c: Checker, node: Node): Symbol {
+       node,
+       text,
+       SymbolFlags.Value | SymbolFlags.ExportValue,
+-      getCannotFindNameDiagnosticForName(c, node),
++      cannotFindNameOfLocation,
+       !isWriteOnlyAccess(node),
+       false,
+     );
+diff --git a/packages/tsc-ts/src/compiler/checker-symbols.ts b/packages/tsc-ts/src/compiler/checker-symbols.ts
+index 663ae16..e49dbf2 100644
+--- a/packages/tsc-ts/src/compiler/checker-symbols.ts
++++ b/packages/tsc-ts/src/compiler/checker-symbols.ts
+@@ -328,6 +328,13 @@ function isES2015OrLaterConstructorName(name: string): boolean {
+   );
+ }
+ 
++/**
++ * Stands for `getCannotFindNameDiagnosticForName(c, location)` in a lookup that starts at the
++ * identifier it resolves: the message is chosen when the lookup fails (`onFailedToResolveSymbol`),
++ * since nearly every lookup finds its name and the choice compares the name with some forty others.
++ */
++export const cannotFindNameOfLocation = -1 as DiagnosticMessage;
++
+ function onFailedToResolveSymbol(
+   c: Checker,
+   location: Node | undefined,
+@@ -335,6 +342,7 @@ function onFailedToResolveSymbol(
+   meaning: SymbolFlags,
+   message: DiagnosticMessage,
+ ): void {
++  if (message === cannotFindNameOfLocation) message = getCannotFindNameDiagnosticForName(c, location!);
+   let declarationName = name;
+   if (location !== undefined) {
+     if (location.parent !== undefined && location.parent.kind === SyntaxKind.JSDocLink) return;
+@@ -1830,12 +1838,15 @@ export function resolveEntityName(
+   if (nodeIsMissing(name)) return undefined;
+   let symbol: Symbol | undefined;
+   if (name.kind === SyntaxKind.Identifier) {
++    const resolveLocation = location ?? name;
++    // The lookup starts at the identifier itself unless a location is given: its message can wait.
+     const message = ignoreErrors
+       ? undefined
+       : meaning === SymbolFlags.Namespace || (name.flags & NodeFlags.Synthesized) !== 0
+         ? Diagnostics.Cannot_find_namespace_0
+-        : getCannotFindNameDiagnosticForName(c, getFirstIdentifier(name));
+-    const resolveLocation = location ?? name;
++        : resolveLocation === name
++          ? cannotFindNameOfLocation
++          : getCannotFindNameDiagnosticForName(c, getFirstIdentifier(name));
+     const text = getText(name);
+     if (meaning === SymbolFlags.Namespace) {
+       const found = resolveName(c, resolveLocation, text, meaning, undefined, true, false);

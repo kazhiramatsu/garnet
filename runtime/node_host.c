@@ -1383,7 +1383,9 @@ static tsv nh_worker_data(tsv* a, int n){ (void)a; (void)n; return ts_worker_dat
 static tsv nh_spawn_worker(tsv* a, int n){
   tsv entry = nh_arg(a, n, 0), data = nh_arg(a, n, 1);
   int shared = ts_truthy(nh_arg(a, n, 2));
-  int id = ts_worker_start(entry, data, shared);
+  double young_mb = nh_num(a, n, 6, 0);   /* resourceLimits.maxYoungGenerationSizeMb, 0 for none */
+  if (!(young_mb >= 1 && young_mb <= 65536)) young_mb = 0;
+  int id = ts_worker_start_limits(entry, data, shared, (uint32_t)young_mb);
   ts_worker_on_message(id, nh_arg(a, n, 3));
   ts_worker_on_error(id, nh_arg(a, n, 4));
   ts_worker_on_exit(id, nh_arg(a, n, 5));
@@ -1563,7 +1565,7 @@ static void ts_garnet_node_global_init(tsv global){
   nh_method(host, "isWorker", nh_is_worker, 0);
   nh_method(host, "threadId", nh_thread_id, 0);
   nh_method(host, "workerData", nh_worker_data, 0);
-  nh_method(host, "spawnWorker", nh_spawn_worker, 6);
+  nh_method(host, "spawnWorker", nh_spawn_worker, 7);
   nh_method(host, "sendToWorker", nh_send_to_worker, 2);
   nh_method(host, "killWorker", nh_kill_worker, 1);
   nh_method(host, "workerRef", nh_worker_ref, 2);

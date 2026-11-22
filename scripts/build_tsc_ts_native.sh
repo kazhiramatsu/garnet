@@ -3,7 +3,11 @@
 # benchmarks/tsc_ts_native/README.md, docs/tsc_ts_native_design.md.
 #   usage: scripts/build_tsc_ts_native.sh <tsc-ts checkout> [work-directory]
 # The checkout is left unchanged: its packages/tsc-ts/src is copied next to
-# the garnet entry and the Node module shims (benchmarks/tsc_ts_native/garnet).
+# the garnet entry and the Node module shims (benchmarks/tsc_ts_native/garnet),
+# and the copy takes the patches of benchmarks/tsc_ts_native/patches in the
+# order of their names (changes to how fast the compiler runs, none to what it
+# reports; the README there). TSAOT_TSC_TS_PATCHES=0 builds the sources as
+# they are.
 # The build is profile-guided (docs/pgo_design.md): an instrumented build is
 # trained on the TypeScript compiler project (build/typescript_603) and the
 # profile, written to <work>/default.pgo, guides the final build. TSAOT_PGO=off
@@ -32,6 +36,21 @@ shutil.copy2(pkg / "package.json", source / "package.json")   # "type": "module"
 shutil.copytree(repo / "benchmarks/tsc_ts_native/garnet", source / "garnet")
 shutil.copy2(repo / "benchmarks/tsc_ts_native/tsconfig.json", source / "tsconfig.json")
 PY
+# The patches, applied to the copy (a patch names packages/tsc-ts/src/..., the
+# copy's src/...; --posix: no backup files). One that does not apply stops the
+# build by its name.
+PATCHES=()
+if [[ "${TSAOT_TSC_TS_PATCHES:-1}" != "0" ]]; then
+  for patch_file in "$ROOT"/benchmarks/tsc_ts_native/patches/*.patch; do
+    [[ -e "$patch_file" ]] || continue
+    if ! patch --posix -p3 -s -N -d "$SOURCE" < "$patch_file" > "$WORK/patch.log" 2>&1; then
+      echo "the tsc-ts patch $(basename "$patch_file") does not apply to $CHECKOUT (the patches are against c002e8e; TSAOT_TSC_TS_PATCHES=0 builds without them):" >&2
+      cat "$WORK/patch.log" >&2
+      exit 1
+    fi
+    PATCHES+=("$(basename "$patch_file" .patch)")
+  done
+fi
 (
   cd "$SOURCE"
   node --max-old-space-size=8192 "$ROOT/exporter/exporter.js" \
@@ -155,7 +174,7 @@ case "$PGO" in
     PGO_PROFILE="$(cd "$(dirname "$PGO")" && pwd)/$(basename "$PGO")"
     native_build "$(tsaot_pgo_use_flags "$PGO_PROFILE")" "$WORK/tsc-ts" "$WORK/pass" ;;
 esac
-python3 - "$WORK" "$CHECKOUT" "$CC" "$GEN_CC" "$UNITS" "${TSAOT_UNITS_LTO:-1}" "$PGO" "$PGO_PROFILE" "$PGO_TRAINED_WITH" "$RX_PROFILE" <<'PY'
+python3 - "$WORK" "$CHECKOUT" "$CC" "$GEN_CC" "$UNITS" "${TSAOT_UNITS_LTO:-1}" "$PGO" "$PGO_PROFILE" "$PGO_TRAINED_WITH" "$RX_PROFILE" ${PATCHES[@]+"${PATCHES[@]}"} <<'PY'
 import json, pathlib, subprocess, sys
 work, checkout = map(pathlib.Path, sys.argv[1:3])
 commit = subprocess.run(["git", "-C", str(checkout), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
@@ -164,6 +183,7 @@ metadata = dict(checkout=str(checkout), commit=commit, source=str(work / "source
                 runtime_cc=sys.argv[3], generated_cc=sys.argv[4],
                 units=units, thin_lto=units and sys.argv[6] == "1",
                 pgo=dict(mode=sys.argv[7], profile=sys.argv[8] or None, trained_with=sys.argv[9] or None, regexps=sys.argv[10] or None),
+                tsc_ts_patches=sys.argv[11:],
                 optimization_exceptions=json.loads((work / "optimization_exceptions.json").read_text()))
 (work / "build.json").write_text(json.dumps(metadata, indent=2) + "\n")
 PY

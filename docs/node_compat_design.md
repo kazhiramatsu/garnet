@@ -469,6 +469,11 @@ start, sharing everything copy-on-write, exchanging messages over pipes.
   garnet's option on the constructor: `new Worker(file, { workerData,
   shared: true })`; Node ignores the key, so the driver stays runnable under
   Node. Checkers stay plain forks.
+- `resourceLimits.maxYoungGenerationSizeMb` (Session 367) is the forked worker's young budget, the
+  allocation between two of its young collections (docs/fork_workers_design.md, the Session 367
+  update): a worker whose heap ends with it can ask for one its whole run fits in. The other
+  limits have no counterpart and are ignored, as is a `resourceLimits` that is not an object
+  (Node ignores it too). Fixture `node/worker_young_generation`.
 - Not available (a TypeError that says so): `MessageChannel`, `MessagePort`
   of one's own, `BroadcastChannel`, `receiveMessageOnPort`,
   `moveMessagePortToContext`, `postMessageToThread`, `eval: true`, piped

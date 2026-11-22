@@ -478,7 +478,17 @@ fork:
 2. **The child in region mode.** After the fork the child resets every
    size-class cursor and takes blocks from the region only (exhaustion
    aborts loudly, naming the knob). Its young collections run as today over
-   its private metadata; it never runs a full one (as the prototype).
+   its private metadata; it never runs a full one (as the prototype). Its
+   young budget is sixteen times the default (64 MiB, 2^20 cells; Session
+   367): what a shared worker allocates is mostly the graph it publishes,
+   which the publish promotes, so a collection before that marks and
+   promotes the graph a part at a time for the little garbage made in
+   between. The parse worker of a 3 MB source file ran four collections to
+   free 3 MB of a 61 MB region: 14% of its instructions (1.270 to 1.085 G;
+   every parse worker of the compiler project together 4.91 to 4.21 G). A
+   budget from the environment (`TSAOT_GC_YOUNG_THRESHOLD`,
+   `TSAOT_GC_NURSERY_BYTES`: the stress gates' one cell) or from the worker's
+   `resourceLimits` stays as given.
    Objects allocated before the fork stay the parent's: a write to one goes
    to the child's private page, as in the prototype and as a scriptc parse
    thread's write to its own module state.
