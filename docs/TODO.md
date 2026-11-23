@@ -13541,3 +13541,20 @@ generated code. (4) The 6 ms to the entry.
 - **Not SSA yet** (Kaz asked): the numeric analysis is a flow-insensitive data flow (one fact a local), with interprocedural
   fixpoints for parameters, returns and fields. A flow-sensitive one has the conversions' 1.75% and part of the guards' 5.6%
   to take in the checkers; the frames come first.
+
+**Design note, not built: an entry without a frame, by running the pure start of a function again** (the frames are 14% of the
+checkers' samples, in functions of 150 to 1,000 instructions that return early most of the time; a hand-written split of the
+scanner's entry got a frame all the same from the slow paths generated in place).
+- For a chosen function F the emitter writes its body twice: `F_full`, as now, under a private name, and the entry under F's
+  name, the same text compiled with "anything that is not pure leaves": every call of a generated function, every store, every
+  loop and every call of the runtime outside a list of pure helpers becomes `return F_full(args)`, a call in tail position. The
+  C compiler drops what follows each, so the entry is F's leading tests, loads and returns, has no call but tail calls, and
+  needs no frame. A path that leaves has changed nothing, so `F_full` starts again from the arguments and computes the same.
+- How the text is the same and the meaning differs: the calls of generated functions and the stores are written through two
+  macros at the few places the emitter writes them (`TS_CALL(expr)`, `TS_EFFECT`), and the runtime's functions through a
+  generated header that defines each name as a macro for the entry's text (`#define ts_get_checked(...) ({ return F_full(ARGS);
+  (tsv)0; })`, from the prototypes of ts_rt.h, less the pure helpers) and is undone after it.
+- Chosen where the IR has a `Return` that is reached from the entry through pure instructions only, the function has calls,
+  and the pure start is short; a function that rarely returns early pays its pure start twice, a few instructions.
+- To check: conformance and the fuzzers (an impure helper missing from the header is a silent double effect: the list of pure
+  helpers is the risk, so it is a list of what is pure, and everything else leaves), the size of the code, and the A/B on tsc-ts.
