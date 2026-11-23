@@ -13640,3 +13640,50 @@ lines compiled at `-O0`, and nothing said so.
   with 10 (0.37 G a checker, what each resolves again).
 - **Next for the start** (S4 in the design): 5,528 function objects are made at the start and 5,313 stored in module-level
   bindings of which 126 are ever read; what the start does now is shapes (`shape_desc_record` 12%, `shape_transition_f` 6%).
+
+## Session 368 (2026-11-24): object pointers stored as themselves: the audit and the design (nothing built)
+
+Kaz asked for the plan of Session 367's last candidate to go ahead (pointers stored as themselves: a design
+note, the representation behind the helpers, a compile-time switch gated in both representations, the A/B),
+with builds and gates from the next morning on, and for the branch to be merged into main now.
+
+- **The design** (`docs/unmasked_pointers_design.md`): every word is today's word exclusive-or
+  `0xFFF8_0000_0000_0000`. An object's word is its address (no mask; the test is "the top 16 bits are
+  zero", no constant in a register; boxing a pointer is no load), the other selectors are 1 to 6, a boxed
+  number costs one `eor` each way, and the stack tag (bit 47) goes: the generation byte and the cage's
+  range answer what it answered. The selectors keep their order, so the two representations are one
+  bijection and everything written through the helpers computes the same. `TS_VALUE_REP` 0 / 1, a link
+  guard, a checking build (`TS_VALUE_CHECK`), four slices, the gates of each.
+- **The audit** (read, not built; at `f9439c5`). Confirmed: the emitter writes no bit pattern of a value
+  (27 `ts_ptr`, one short string constant through `TS_BOX`), initializes its frames, locals, globals and
+  boxed fields to `TS_UNDEFINED`; the runtime has `TS_TOP16` at 64 sites, the payload mask at 16, the
+  stack tag at 13, four hole markers spelled `0xFFFEu`. **Found, and not in the summary the plan started
+  from**:
+  - two places read a number's bits off the word itself and would be **silent** in the new
+    representation: `ts_int32_exact`'s sign-bit test for `-0` (`+0` refused an integer slot, `-0` stored
+    as `0`), and `TS_MAPSET_NEG_ZERO 0x8000…` compared with a key (in the new representation that word
+    is the NaN: `map.set(NaN, 1)` would land on `+0`);
+  - words that are no value sit in value slots: **an integer slot of a plain object** is the int32
+    zero-extended, a number today and an object reference tomorrow (so integer slots are not untouched:
+    reads are, a store gains one `orr`), and a sparse array's side table pointer. Rule: such a word is
+    kept xor the same constant (`ts_raw_word`);
+  - a coroutine frame without a frame map is scanned by selector: it goes through the conservative
+    visitor (the allocation bitmap);
+  - zeroed memory is a smaller matter than feared: constructors write their value fields (a young class
+    instance's run is not zeroed at all), so the candidates are a coroutine frame's boxed locals, six
+    static arrays without an initializer and whatever the checking build reports.
+- **main** is fast-forwarded to this commit on Kaz's word (from `c8adf15`). It carries Session 367's
+  slices, each with the minimal gates its entry records; **the whole set has not run on this tip**.
+
+Next session, in order:
+
+1. The whole gate set on main's tip, quietly (`TSAOT_CONF_JOBS=3`, `nice -n 12`, under `caffeinate -ims`):
+   unit, bundler, conformance plain, strict and protect, bench, ci, the collector stress, hono / hono_app /
+   vue, the tsc-ts build with its corpus in the plain mode. The baselines of the A/B to come are this build.
+2. Slice 2 of the design: the definitions block, `ts_obj_ptr` / `ts_raw_word` / `ts_is_heap_ref`, sections
+   3 to 5 rewritten against them in representation 0, the source gate `tests/value_rep_gate.sh`; generated
+   C and instruction counts unchanged.
+3. Slice 3: `-DTS_VALUE_REP=1`, both representations through every gate, the fuzzers and the checking
+   build; the fixtures the design lists.
+4. Slice 4: the A/B on plain builds (tsc-ts, hono, hono_app, vue, the bench budgets, the kernels over
+   number arrays), then the default.
