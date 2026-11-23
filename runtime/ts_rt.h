@@ -42,11 +42,18 @@
 #define TS_RT_ALWAYS_INLINE static inline __attribute__((always_inline))
 #define TS_RT_LIKELY(x) __builtin_expect(!!(x), 1)
 #define TS_RT_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#define TS_RT_NORETURN __attribute__((noreturn, cold))
 #else
 #define TS_RT_ALWAYS_INLINE static inline
 #define TS_RT_LIKELY(x) (x)
 #define TS_RT_UNLIKELY(x) (x)
+#define TS_RT_NORETURN _Noreturn
 #endif
+/* TS_RT_NORETURN: a function that throws whatever it is given (ts_throw leaves by longjmp, or ends the process
+   when nothing catches). Generated code calls these on the failing side of a guard, at every store to a field
+   among others; a C compiler that takes the call to come back keeps every value that is live after the guard
+   in a callee-saved register across it, and writes the code that goes on from it. Told that it does not, it
+   keeps nothing for it and puts the block out of line. */
 
 /* A recursion with no way out keeps its calls: a loop has no stack to overflow (docs/exceptions_design.md). */
 #if defined(__clang__)
@@ -1008,7 +1015,7 @@ ts_strview ts_str_view_typed_slow(tsv s);
 /* A value typed string that is none at run time (`xs[i].length` past the end, a `get()!` that missed):
    the type's claim is checked where the test is free, the typed reads' short-or-heap dispatch, so
    the read is the TypeError V8 throws and not a fault. */
-_Noreturn void ts_throw_receiver(tsv s);
+TS_RT_NORETURN void ts_throw_receiver(tsv s);
 static inline tsv ts_recv_coercible(tsv s){
   if (TS_RT_UNLIKELY(s == TS_UNDEFINED || s == TS_NULL)) ts_throw_receiver(s);
   return s;
@@ -2166,7 +2173,7 @@ tsv ts_dyn_super(tsv active, tsv new_target, tsv args);
 void ts_dyn_bind_check(tsv self);
 tsv ts_dyn_result(tsv v, tsv self, int derived);
 void ts_fn_mark_native_ctor(tsv fn);
-void ts_throw_reference_error_msg(const char* msg);
+TS_RT_NORETURN void ts_throw_reference_error_msg(const char* msg);
 tsv ts_builtin_fn_value(ts_code code, int takes_this);   /* one function value per built-in */
 int ts_native_new_take(void);   /* a built-in constructor's value: was this call a `new`? */
 tsv ts_ctor_date(tsv* a, int n);
@@ -2245,20 +2252,20 @@ tsv    ts_reflect_set_recv(tsv t, tsv k, tsv v, tsv receiver);
 /* `super.x = v`: Set on the parent chain with `this` the receiver; a refusal is a TypeError */
 tsv    ts_super_set(tsv proto, tsv k, tsv v, tsv receiver);
 /* `x as number` from what is not known to be one: a cast that lies is a TypeError, not a NaN later */
-void   ts_throw_bad_number_cast(tsv v);
+TS_RT_NORETURN void   ts_throw_bad_number_cast(tsv v);
 static inline tsv ts_cast_number(tsv v){
   if (TS_RT_UNLIKELY(!ts_is_num(v) && !ts_is_null(v) && !ts_is_undef(v))) ts_throw_bad_number_cast(v);
   return v;
 }
 /* a property of data out of JSON, typed number, flowing into a number slot: nothing else fits there */
-void   ts_throw_foreign_number(tsv v, const char* name);
+TS_RT_NORETURN void   ts_throw_foreign_number(tsv v, const char* name);
 static inline tsv ts_cast_foreign_number(tsv v, const char* name){
   if (TS_RT_UNLIKELY(!ts_is_num(v))) ts_throw_foreign_number(v, name);
   return v;
 }
 tsv    ts_cast_number_array(tsv v);   /* `JSON.parse(s) as number[]`: every element is a number */
 /* the member of a call is read before its arguments run: a nullish receiver throws first */
-void   ts_throw_method_receiver(tsv v, const char* name);
+TS_RT_NORETURN void   ts_throw_method_receiver(tsv v, const char* name);
 static inline tsv ts_method_receiver(tsv v, const char* name){
   if (TS_RT_UNLIKELY(ts_is_null(v) || ts_is_undef(v))) ts_throw_method_receiver(v, name);
   return v;
@@ -2313,7 +2320,7 @@ tsv ts_object_freeze_unseen(tsv v);
 tsv ts_object_is_frozen(tsv v);
 /* A typed direct store on a frozen class instance: the strict-mode TypeError
    (`Cannot assign to read only property 'x' of object '#<C>'`). */
-void ts_throw_frozen_field(tsv obj, ts_key key);
+TS_RT_NORETURN void ts_throw_frozen_field(tsv obj, ts_key key);
 /* The program's class names by class id (NULL for an anonymous class), for
    messages and `console.log` prefixes of instances whose class value the
    program never observed (the prototype's `constructor` is realized lazily). */
@@ -2531,14 +2538,14 @@ int  ts_object_is(tsv a, tsv b);          /* Object.is SameValue */
 tsv  ts_to_string_v(tsv v);
 tsv  ts_typeof(tsv v);
 tsv  ts_dynamic_method_unsupported(void); /* traps: truly-unknown callee */
-void ts_dynamic_method_missing(uint32_t name_field); /* throws TypeError: <name> is not a function */
-void ts_check_method_recv_slow(tsv recv, uint32_t name_field);   /* the TypeError of a null/undefined receiver */
+TS_RT_NORETURN void ts_dynamic_method_missing(uint32_t name_field); /* throws TypeError: <name> is not a function */
+TS_RT_NORETURN void ts_check_method_recv_slow(tsv recv, uint32_t name_field);   /* the TypeError of a null/undefined receiver */
 /* Reading `recv.method` off null or undefined is a property-read TypeError, thrown before any call:
    the test in line at the head of every dynamic method call, the throw out of line. */
 static inline void ts_check_method_recv(tsv recv, uint32_t name_field){
   if (TS_RT_UNLIKELY(ts_is_null(recv) || ts_is_undef(recv))) ts_check_method_recv_slow(recv, name_field);
 }
-void ts_throw_not_a_function(const char* name); /* throws TypeError: <name>/value is not a function */
+TS_RT_NORETURN void ts_throw_not_a_function(const char* name); /* throws TypeError: <name>/value is not a function */
 /* diagnostic per-site allocation counters (TSAOT_SITE_STATS=1 builds only) */
 void ts_site_note(uint32_t site, uint32_t func);
 void ts_site_stats_init(const char** fn_names, uint32_t nfn);
@@ -2556,7 +2563,7 @@ tsv ts_instanceof_dyn(tsv obj, tsv ctorv);  /* x instanceof <runtime constructor
    (`long long` holding an int32: an enum-typed field, docs/int32_fields_design.md) */
 typedef struct { uint32_t name_id; size_t offset; int numeric; } ts_class_field;
 void ts_throw_int32_field(double d);
-void ts_throw_int_field_key(double d, uint32_t key);   /* names the field */
+TS_RT_NORETURN void ts_throw_int_field_key(double d, uint32_t key);   /* names the field */
 /* The value stored into an integer slot: an exact int32, or a TypeError (the
    field's type says an enum member; a program storing 1.5 through a cast is
    refused, never truncated silently). */
@@ -2595,11 +2602,11 @@ void ts_register_class_indices(const uint32_t* tab, uint32_t n);
 extern int g_class_relinked;
 #endif
 tsv  ts_make_class_value_once(uint32_t class_id, ts_code ctor, tsv* env, uint32_t envlen);
-void ts_throw_uninitialized(const char* name);
-void ts_throw_not_defined(const char* name);   /* V8's "X is not defined" ReferenceError */
+TS_RT_NORETURN void ts_throw_uninitialized(const char* name);
+TS_RT_NORETURN void ts_throw_not_defined(const char* name);   /* V8's "X is not defined" ReferenceError */
 tsv  ts_construct(tsv ctorv, tsv* args, int n);
 void ts_class_refuse_call(tsv fv, uint32_t class_id, ts_code refused);
-void ts_throw_class_call(const char* name);
+TS_RT_NORETURN void ts_throw_class_call(const char* name);
 /* guarded direct construction (ts_rt.c): the predicted constructor's code,
    the instance before the direct body call, the result after it */
 int ts_construct_same_code(tsv ctorv, tsv fval);
@@ -4262,13 +4269,13 @@ void        ts_gc_set_root_depth(int n);
 ts_handler* ts_eh_push(void);
 void        ts_eh_push_coro(void* extbuf);
 void        ts_eh_pop(void);
-void        ts_throw(tsv v);
-void        ts_throw_range_error_msg(const char* msg);
-void        ts_throw_type_error_msg(const char* msg);
-void        ts_throw_eval_error_msg(const char* msg);
+TS_RT_NORETURN void        ts_throw(tsv v);
+TS_RT_NORETURN void        ts_throw_range_error_msg(const char* msg);
+TS_RT_NORETURN void        ts_throw_type_error_msg(const char* msg);
+TS_RT_NORETURN void        ts_throw_eval_error_msg(const char* msg);
 tsv         ts_arguments_array(const tsv* args, uint32_t n);
 tsv         ts_callback_with_this(tsv cb, tsv thisArg); /* arr.forEach(fn, ctx): fn bound to ctx */
-void        ts_throw_syntax_error_msg(const char* msg);
+TS_RT_NORETURN void        ts_throw_syntax_error_msg(const char* msg);
 tsv         ts_current_exception(void);
 void        g_exception_set(tsv v);
 int         ts_handlers_count(void);

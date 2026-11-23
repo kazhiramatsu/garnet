@@ -2487,7 +2487,7 @@ static ts_func* fn_materialize_prototype(ts_func* f, tsv fnv){
    ts_throw_cannot_read is defined later (with ts_get_checked) — forward-declared
    so the method-dispatch receiver guard can reuse it. */
 void ts_throw_not_a_function(const char* name);
-static tsv ts_throw_cannot_read(tsv obj, const char* prop);
+TS_RT_NORETURN static tsv ts_throw_cannot_read(tsv obj, const char* prop);
 /* Closure calls merge captured cells (env) with the actual args into one buffer
    that lives ONLY for the duration of code() — the callee reads its leading
    parameters (cells..., args...) at entry and never retains the pointer. So a
@@ -4227,7 +4227,7 @@ tsv ts_get_method_value(tsv recv, uint32_t field_key, uint32_t method_key){
      func), so primitives and functions dispatch correctly too. */
   return ts_get(recv, method_key);
 }
-static void ts_throw_getter_only_write(tsv obj, ts_key key){
+TS_RT_NORETURN static void ts_throw_getter_only_write(tsv obj, ts_key key){
   const char* nm = ts_field_name(key);
   char buf[256];
   snprintf(buf, sizeof(buf), ts_is_indexed_array_fast(obj) ? "Cannot set property %s of [object Array] which has only a getter" : "Cannot set property %s of #<Object> which has only a getter",
@@ -4247,7 +4247,7 @@ static void invoke_setter(ts_accessor* ac, tsv obj, ts_key key, tsv val){
    a new property on a non-extensible object throws "Cannot add property ...". The
    messages match V8 so a try/catch sees identical e.message. */
 static const char* ts_obj_ctor_name_for_message(tsv obj);
-static void ts_throw_readonly_write(tsv obj, ts_key key){
+TS_RT_NORETURN static void ts_throw_readonly_write(tsv obj, ts_key key){
   const char* nm = ts_field_name(key);
   char buf[320];
   if (ts_is_indexed_array_fast(obj)) snprintf(buf, sizeof(buf), "Cannot assign to read only property '%s' of object '[object Array]'", nm ? nm : "?");
@@ -4278,7 +4278,7 @@ void ts_throw_frozen_field(tsv obj, ts_key key){
   snprintf(buf, sizeof(buf), "Cannot assign to read only property '%s' of object '#<%s>'", nm ? nm : "?", ts_obj_ctor_name_for_message(obj));
   ts_throw_type_error_msg(buf);
 }
-static void ts_throw_not_extensible(ts_key key){
+TS_RT_NORETURN static void ts_throw_not_extensible(ts_key key){
   const char* nm = ts_field_name(key);
   char buf[256];
   snprintf(buf, sizeof(buf), "Cannot add property %s, object is not extensible", nm ? nm : "?");
@@ -10075,7 +10075,7 @@ static tsv map_set_unchecked(tsv mv, tsv k, tsv v){
   }
   return map_set_hashed(m, mv, k, v);
 }
-static void ts_throw_published_collection(const char* what){
+TS_RT_NORETURN static void ts_throw_published_collection(const char* what){
   char buf[96];
   snprintf(buf, sizeof buf, "Cannot modify a published %s", what);
   ts_throw_type_error_msg(buf);
@@ -12934,13 +12934,13 @@ tsv ts_new_error_args(int kind, tsv* args, int n){
 /* Throw a RangeError-tagged object (catchable): { message, name:"RangeError" },
    matching the surface that `new RangeError(msg)` produces (see exporter's Error
    lowering) so a catch clause can read e.name / e.message. */
-static void ts_throw_range_error(const char* msg){
+TS_RT_NORETURN static void ts_throw_range_error(const char* msg){
   ts_throw(ts_new_error(TS_ERR_RANGE, ts_new_string(msg,(uint32_t)strlen(msg))));
 }
-static void ts_throw_type_error(const char* msg){
+TS_RT_NORETURN static void ts_throw_type_error(const char* msg){
   ts_throw(ts_new_error(TS_ERR_TYPE, ts_new_string(msg,(uint32_t)strlen(msg))));
 }
-static void ts_throw_syntax_error(const char* msg){
+TS_RT_NORETURN static void ts_throw_syntax_error(const char* msg){
   ts_throw(ts_new_error(TS_ERR_SYNTAX, ts_new_string(msg,(uint32_t)strlen(msg))));
 }
 void ts_throw_type_error_msg(const char* msg){ ts_throw_type_error(msg ? msg : "TypeError"); }
@@ -21504,7 +21504,7 @@ void ts_throw_receiver(tsv s){
   ts_throw_type_error_msg("a value typed as a string is not one");
   abort();
 }
-static tsv ts_throw_cannot_read(tsv obj, const char* prop);
+TS_RT_NORETURN static tsv ts_throw_cannot_read(tsv obj, const char* prop);
 void ts_throw_method_receiver(tsv v, const char* name){ ts_throw_cannot_read(v, name); }
 static tsv ts_throw_cannot_read(tsv obj, const char* prop){
   const char* what = ts_is_null(obj) ? "null" : "undefined";
@@ -21512,7 +21512,6 @@ static tsv ts_throw_cannot_read(tsv obj, const char* prop){
   if (prop) snprintf(buf, sizeof buf, "Cannot read properties of %s (reading '%s')", what, prop);
   else      snprintf(buf, sizeof buf, "Cannot read properties of %s", what);
   ts_throw(ts_new_error(TS_ERR_TYPE, ts_new_string(buf, (uint32_t)strlen(buf))));
-  return TS_UNDEFINED;
 }
 /* A collection method on a receiver that is not that collection (an `any`
    value behind a Map or Set type, which the typed entry trusted): null and
