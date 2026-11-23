@@ -1,0 +1,431 @@
+{
+  "about": "The techniques tsrs (oxc-project/tsrs, Apache-2.0, a Rust port of the same compiler) has over tsgo, as candidates for tsc-ts. Paths under \"tsrs\" are relative to a tsrs checkout. scripts/tsc_ts_delta.py reads and writes this file; README.md here is the procedure.",
+  "upstream": "c002e8e",
+  "tsrs_version": "7.1.0-beta.tsrs3",
+  "deltas": [
+    {
+      "id": "enum-members",
+      "title": "Two enum members of different values answered before the rules for simple types",
+      "status": "in-progress",
+      "tsrs": {
+        "notes": [
+          "notes/perf-simple-relation-enum-members.md"
+        ],
+        "source": [
+          "crates/tsrs_checker/src/relater_1.rs:289-319"
+        ],
+        "measured": "Compiler -1.51%, Compiler-Unions -7.48%",
+        "mode": "default"
+      },
+      "tsc_ts": {
+        "files": [
+          "relations.ts"
+        ],
+        "probe": "isSimpleTypeRelatedTo|sameLiteralValue|isTypeRelatedTo_d"
+      },
+      "exactness": "Both flag words are exactly NumberLiteral|EnumLiteral (or StringLiteral|EnumLiteral): the one rule that relates two enum members asks for equal values, every other rule needs a flag neither has. Pure early return."
+    },
+    {
+      "id": "flow-memo",
+      "title": "The type of a reference at a flow node kept across walks, by (flow node, reference key)",
+      "status": "candidate",
+      "tsrs": {
+        "notes": [
+          "notes/flow-memo.md",
+          "notes/perf-flow-union-inference.md"
+        ],
+        "source": [
+          "crates/tsrs_checker/src/flowmemo.rs"
+        ],
+        "measured": "webpack -5.0%, vscode -2.2% (whole process); no Compiler number",
+        "mode": "default"
+      },
+      "tsc_ts": {
+        "files": [
+          "checker-narrowing.ts"
+        ],
+        "probe": "getTypeAtFlowNode|isMatchingReference|narrowType|getFlowTypeOfReferenceAt|getTypeFactsWorker|isReachableFlowNode"
+      },
+      "exactness": "The seven conditions of flow-memo.md:29-64 (nothing transient, nothing specific to the reference node, the same instantiation counters, no new identities, the same caches, the depth limit, faithful shared flows); a shadow mode that walks every hit again found two of them.",
+      "note": "tsc-ts keeps one walk per reference key (FlowWalk, upstream 5dc9acc): the delta is the table by flow node with checkpoints every fourth node."
+    },
+    {
+      "id": "type-facts-union-bit",
+      "title": "A union of kinds that are never undefined or null answers the nullability facts with one bit",
+      "status": "candidate",
+      "tsrs": {
+        "notes": [
+          "notes/perf-union-type-facts.md"
+        ],
+        "source": [
+          "crates/tsrs_checker/src/checker_15.rs:1687-1700",
+          "crates/tsrs_checker/src/checker_13.rs:230"
+        ],
+        "measured": "Compiler -0.36%, Compiler-Unions -1.10%",
+        "mode": "default"
+      },
+      "tsc_ts": {
+        "files": [
+          "checker-type-factory.ts",
+          "checker-narrowing.ts"
+        ],
+        "probe": "getTypeFactsWorker|getTypeFacts_d"
+      },
+      "exactness": "The bit is set where the union is built from its final sorted list; the shortcut fires only when the caller needs no object fact, and the walk it skips resolves nothing."
+    },
+    {
+      "id": "name-filter",
+      "title": "A filter over the member names of Function, CallableFunction, NewableFunction and Object skips the fallback lookups of a property miss",
+      "status": "candidate",
+      "tsrs": {
+        "notes": [
+          "notes/perf-symbol-map-lookups.md"
+        ],
+        "source": [
+          "crates/tsrs_checker/src/checker_09.rs:2960-3000"
+        ],
+        "measured": "vscode -0.99%, supabase -11.92%, cal-diy -4.29%; no Compiler number",
+        "mode": "default"
+      },
+      "tsc_ts": {
+        "files": [
+          "checker-members.ts",
+          "checker-property-access.ts"
+        ],
+        "probe": "getPropertyOfTypeEx|getPropertyOfObjectType|getPropertyOfType_d"
+      },
+      "exactness": "Built once the four global types have resolved members, dropped where base types are reset; a rejected name is a key of none of the four tables, and the skipped steps have no side effects for a type with resolved members."
+    },
+    {
+      "id": "symbol-table-filter",
+      "title": "Symbol tables with a filter and fingerprints in front of the key comparison, equal strings decided by identity first",
+      "status": "candidate",
+      "tsrs": {
+        "notes": [
+          "notes/perf-symbol-map-lookups.md",
+          "notes/perf-checker-cpu2.md",
+          "notes/perf-checker-cpu3.md"
+        ],
+        "source": [
+          "crates/tsrs_core"
+        ],
+        "measured": "-0.3% to -1.1% a step on a large codebase; Compiler: SymbolMap::search + position 3.3% of samples",
+        "mode": "default"
+      },
+      "tsc_ts": {
+        "files": [
+          "symbol.ts",
+          "checker-symbols.ts"
+        ],
+        "probe": "NameResolver_resolve|getSymbol_d|getSymbolOfMeaning|getLocals"
+      },
+      "exactness": "A lookup structure only: the same symbols in the same order.",
+      "note": "Probe first: tsc-ts tables are Maps keyed by strings whose hashes garnet caches."
+    },
+    {
+      "id": "control-flow-container-cache",
+      "title": "The control flow container of a declaration kept by node",
+      "status": "candidate",
+      "tsrs": {
+        "notes": [
+          "notes/perf-checker-single-base-flag.md:185-188"
+        ],
+        "source": [],
+        "measured": "not built in tsrs; Compiler 0.82% of samples",
+        "mode": "default"
+      },
+      "tsc_ts": {
+        "files": [
+          "checker-narrowing.ts",
+          "checker-expressions.ts"
+        ],
+        "probe": "getControlFlowContainer"
+      },
+      "exactness": "The tree does not change while it is checked."
+    },
+    {
+      "id": "union-run-merge",
+      "title": "A union built by merging the sorted runs of its inputs",
+      "status": "candidate",
+      "tsrs": {
+        "notes": [
+          "notes/perf-tsgo-can1357-speedups.md:301-319"
+        ],
+        "source": [
+          "crates/tsrs_checker (add_types_to_union, merge_ascending_runs)"
+        ],
+        "measured": "Compiler -0.83%, Compiler-Unions -1.64%, mikro-orm -9.9%",
+        "mode": "default"
+      },
+      "tsc_ts": {
+        "files": [
+          "checker-type-factory.ts"
+        ],
+        "probe": "addTypesToUnion|addTypeToUnion|getUnionType|compareTypes"
+      },
+      "exactness": "compareTypes ends with the type id, so every correct sort gives one order; where the symbol order is not total the stable sort stays."
+    },
+    {
+      "id": "lazy-members",
+      "title": "The members of an instantiated type resolved one at a time",
+      "status": "candidate",
+      "tsrs": {
+        "notes": [
+          "notes/lazy-members.md"
+        ],
+        "source": [
+          "crates/tsrs_checker (lazy_member_tables)"
+        ],
+        "measured": "on by default in tsrs (#64475 port); no Compiler number",
+        "mode": "default"
+      },
+      "tsc_ts": {
+        "files": [
+          "checker-members.ts"
+        ],
+        "probe": "resolveObjectTypeMembers|resolveTypeReferenceMembers|instantiateSymbolTable|getResolvedMember|getNamedMembers"
+      },
+      "exactness": "See the note: member order and the points where a table is listed in full."
+    },
+    {
+      "id": "member-order-keys",
+      "title": "Members sorted by precomputed keys, an instantiation reusing its target's order",
+      "status": "candidate",
+      "tsrs": {
+        "notes": [
+          "notes/perf-tsgo-can1357-speedups.md:321-331"
+        ],
+        "source": [
+          "can1357 ba343defd, 6d557d0e3"
+        ],
+        "measured": "under 1% in tsrs (Go: -1.3% to -2.9%)",
+        "mode": "not ported in tsrs"
+      },
+      "tsc_ts": {
+        "files": [
+          "checker-members.ts"
+        ],
+        "probe": "getNamedMembers|sortSymbols|compareSymbols"
+      },
+      "exactness": "Store the resolved table before listing it: listing resolves aliases, which can come back to the type (two extra TS2303 in the first tsrs version)."
+    },
+    {
+      "id": "instantiation-keys",
+      "title": "The cache key of an instantiation without an alias, the active mapper caches pooled, the inference visited map shrunk",
+      "status": "candidate",
+      "tsrs": {
+        "notes": [
+          "notes/cpu-checker.md:30-41",
+          "notes/perf-checker-cpu3.md:81-84"
+        ],
+        "source": [],
+        "measured": "-1.0% to -1.5% each on a large codebase",
+        "mode": "default"
+      },
+      "tsc_ts": {
+        "files": [
+          "checker-type-operators.ts",
+          "checker-inference.ts"
+        ],
+        "probe": "instantiateTypeWithAlias|getObjectTypeInstantiation|pushInferenceContext|inferTypes|TypeListCache"
+      },
+      "exactness": "Lookup structures only."
+    },
+    {
+      "id": "list-copies",
+      "title": "Lists returned as stored where Go returns its slice",
+      "status": "candidate",
+      "tsrs": {
+        "notes": [
+          "notes/cpu-checker.md:44-51",
+          "notes/perf-checker-cpu2.md:88-94"
+        ],
+        "source": [],
+        "measured": "-1.6% and -0.9% on a large codebase",
+        "mode": "default"
+      },
+      "tsc_ts": {
+        "files": [
+          "checker-members.ts",
+          "checker-type-operators.ts"
+        ],
+        "probe": "getPropertiesOfType|getSignaturesOfType|getIndexInfosOfType|getTypeArguments|new_array_lit"
+      },
+      "exactness": "No caller writes the list."
+    },
+    {
+      "id": "sort-parity",
+      "title": "Go's sort and search algorithms where the comparison sequence is observable",
+      "status": "candidate",
+      "tsrs": {
+        "notes": [
+          "notes/cpu-checker.md:58-78"
+        ],
+        "source": [],
+        "measured": "CompareTypes calls -12%, -0.7%",
+        "mode": "default"
+      },
+      "tsc_ts": {
+        "files": [
+          "core.ts"
+        ],
+        "probe": "compareTypes|compareSymbols|stableSort|binarySearch"
+      },
+      "exactness": "compareSymbols can assign symbol ids: the sequence of comparisons is tsgo's only with tsgo's algorithms."
+    },
+    {
+      "id": "type-of-symbol-fast-path",
+      "title": "The cached type of a symbol read before links are made; recursion identity and compareTypes take their common cases first",
+      "status": "candidate",
+      "tsrs": {
+        "notes": [
+          "notes/perf-checker-cpu3.md:93-104",
+          "notes/perf-checker-cpu2.md"
+        ],
+        "source": [],
+        "measured": "-0.2% to -0.7% each",
+        "mode": "default"
+      },
+      "tsc_ts": {
+        "files": [
+          "checker-symbols.ts",
+          "relations.ts"
+        ],
+        "probe": "getTypeOfSymbol_d|getRecursionIdentity|hasMatchingRecursionIdentity|compareTypes"
+      },
+      "exactness": "Reordered tests."
+    },
+    {
+      "id": "deprecated-symbol",
+      "title": "A symbol with one declaration is not asked for its parent before the deprecation test",
+      "status": "candidate",
+      "tsrs": {
+        "notes": [
+          "notes/perf-checker-single-base-flag.md:179-184"
+        ],
+        "source": [],
+        "measured": "Compiler 1.16% of samples; \"worth little\"",
+        "mode": "not built in tsrs"
+      },
+      "tsc_ts": {
+        "files": [
+          "checker-symbols.ts"
+        ],
+        "probe": "isDeprecatedSymbol|getCombinedNodeFlags"
+      },
+      "exactness": "Skipping the test is not exact (getParentOfSymbol can late-bind a computed name); testing the declaration count first is."
+    },
+    {
+      "id": "fast-caches",
+      "title": "The union front cache, the inference walk memo and the indexed access cache",
+      "status": "candidate",
+      "tsrs": {
+        "notes": [
+          "docs/DEBUGGING.md:309-370",
+          "docs/USAGE.md:36-115"
+        ],
+        "source": [
+          "crates/tsrs_checker"
+        ],
+        "measured": "under 1% on the two Compiler cases (perf-fast-audit-20261027.md:28)",
+        "mode": "--fast"
+      },
+      "tsc_ts": {
+        "files": [
+          "checker-type-factory.ts",
+          "checker-inference.ts"
+        ],
+        "probe": "getUnionType|inferFromTypes|getIndexedAccessType"
+      },
+      "exactness": "A call is stored only if it created no type but its result and instantiated nothing; off under tsgo's history in tsrs."
+    },
+    {
+      "id": "single-base-flag",
+      "title": "The \"has an identical base\" bit read before the map",
+      "status": "rejected",
+      "tsrs": {
+        "notes": [
+          "notes/perf-checker-single-base-flag.md:59-114"
+        ],
+        "source": [
+          "crates/tsrs_checker/src/checker_14.rs:539-549"
+        ],
+        "measured": "Compiler +0.04% (noise)",
+        "mode": "default"
+      },
+      "tsc_ts": {
+        "files": [
+          "relations.ts"
+        ],
+        "probe": "getSingleBaseForNonAugmentingSubtype"
+      },
+      "exactness": "Exact.",
+      "reason": "nothing to gain on the compiler project by tsrs's own numbers"
+    },
+    {
+      "id": "merged-symbols-by-id",
+      "title": "Merged symbols found by symbol id",
+      "status": "present",
+      "tsrs": {
+        "notes": [
+          "notes/perf-tsgo-can1357-speedups.md (728ae2e5f)"
+        ],
+        "source": [],
+        "measured": "Go: -1.1% to -2.2%",
+        "mode": "not ported in tsrs"
+      },
+      "tsc_ts": {
+        "files": [
+          "checker-symbols.ts"
+        ],
+        "probe": "getMergedSymbol"
+      },
+      "exactness": "",
+      "patch": "0001-merged-symbol-id-bits"
+    },
+    {
+      "id": "link-stores-by-page",
+      "title": "Link stores found through an array of pages",
+      "status": "present",
+      "tsrs": {
+        "notes": [
+          "notes/cpu-checker.md:36-37"
+        ],
+        "source": [],
+        "measured": "-1.4% with inlining",
+        "mode": "default"
+      },
+      "tsc_ts": {
+        "files": [
+          "link-tables.ts"
+        ],
+        "probe": "LinkTable_get|NearLinkTable_get|Checker_nodeLinks"
+      },
+      "exactness": "",
+      "patch": "0007-near-link-tables"
+    },
+    {
+      "id": "scheduling",
+      "title": "Files to checkers by module affinity, sticky thieves, a heavy declaration file split",
+      "status": "not-applicable",
+      "tsrs": {
+        "notes": [
+          "notes/perf-clustered-assignment.md",
+          "notes/perf-heavy-files.md",
+          "notes/perf-checker-processes.md"
+        ],
+        "source": [],
+        "measured": "-2% to -8% wall from 16 checkers on",
+        "mode": "--fast"
+      },
+      "tsc_ts": {
+        "files": [
+          "parallel-check.ts"
+        ],
+        "probe": ""
+      },
+      "exactness": "",
+      "reason": "tsc-ts schedules by cost with stealing, and garnet's build shares a huge file's statements with forks (0004)"
+    }
+  ]
+}

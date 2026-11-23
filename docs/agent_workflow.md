@@ -561,3 +561,28 @@ what a change to the schedule gains is what it removes of processors waiting: de
 that has processors to share its work with later costs nothing (the checker of the largest file
 started 70 ms late: the end moved by 1 to 3 ms), and work moved from one phase to the other gains
 nothing by itself.
+
+### Bringing a technique over from tsrs: the delta harness
+
+tsrs is a Rust port of the compiler tsc-ts ports, with changes of its own that leave its reports
+unchanged. One such change brought to tsc-ts is a **delta**: one commit of the working copy, one
+patch. `benchmarks/tsc_ts_native/deltas/README.md` is the procedure and `catalog.json` the list
+(what tsrs measured, where its note and source are, what was found here);
+`scripts/tsc_ts_delta.py` runs everything that is not writing the change:
+
+```sh
+export TSC_TS_WORK=build/tsc-ts-garnet TSC_TS_CORPUS=<TypeScript checkout>/tests/cases
+scripts/tsc_ts_delta.py status                      # candidates, landed, rejected, with the numbers
+scripts/tsc_ts_delta.py probe 'getTypeFactsWorker'  # the technique's upper bound: share of one thread's samples
+scripts/tsc_ts_delta.py new <id>                    # a worktree of the working copy, branch delta/<id>
+scripts/tsc_ts_delta.py eval <id>                   # the commit against its parent: builds both, compares
+                                                    # reports, instructions (one thread, default run), 400 cases
+scripts/tsc_ts_delta.py eval <id> --corpus full     # every case, and the forced modes for a structural change
+scripts/tsc_ts_delta.py land <id> --name <slug>     # the patch file, the catalog entry
+```
+
+`eval` takes any commit or branch of the working copy, so it is also the quickest A/B of an
+experiment that is not a delta (four minutes: two builds kept by the sources' tree, six compiles a
+side, the counts, 400 cases). Its verdict is by instructions, which do not follow the machine's
+load; `--wall N` adds the wall clock for a quiet machine, and a change to the schedule needs it.
+One lock serializes every build and run of every invocation.
