@@ -13596,3 +13596,22 @@ slow half in place at every guard.
   frames of functions with a return reachable through loads and tests only (`build/s367/entrypot.py`): the bound of an entry
   without a frame, emitted as two C functions. A capture parameter (the module's context) is dead in 1,087 of 5,490
   functions and is an argument at 6% of the direct call sites (`build/s367/deadcaps.py`): small.
+
+**After the eighth slice: flags of the C compiler, and what a profile changes** (docs/c_for_the_compiler_design.md).
+- Flags measured on the same sources, one thread, instructions / cycles (the minimum of nine rounds): a callee-saved
+  register's first use priced at 16,384 to 65,536 (`-regalloc-csr-first-time-cost`) -0.6 to -0.8% / 0 to +0.9%; the runtime as
+  bitcode in the ThinLTO link -0.89% / +0.27%; LLVM's partial inliner -0.33% / -0.07%; inline hints 1 and 2 +0.04% and +0.19%;
+  hot/cold splitting +1.24%. **None kept**: fewer instructions, no fewer cycles. The scanner's dispatcher (tsc-ts,
+  `exp/scan-dispatch`) on the new base: -0.02% (it was +0.32%); its entry still saves three pairs for the typed array read's
+  slow half.
+- **The profile-guided build** (the benchmark script's default; the A/Bs of this session are plain builds): one thread
+  12.557 -> 10.344 G instructions (-17.6%), cycles -20.2%. A default run's wall on a machine in use, interleaved, the minimum
+  of 15: **tsrs 171 ms** (`--fast` 150), plain r42 265, plain now 248, **profile-guided now 212**. Today's slice under a profile:
+  -0.88% instructions, -0.2% cycles (212 against 214 ms): a profile already knew the slow halves were cold.
+- **Where the checkers' samples are under a profile**: frames 6.7% (12.8% plain), **the pointer mask 6.5%, tag tests 6.5%**,
+  loads 25%, stores 8.4%. What is left is the representation's (a mask at every pointer read from a slot, a tag test at every
+  receiver that is not proven) and the work itself. Candidates, largest first as far as measured: pointers stored as
+  themselves (the encoding JavaScriptCore uses: doubles offset, cells unmasked; the whole runtime and the emitter go through
+  `ts_num` / `ts_to_num` / `ts_ptr` / `TS_BOX`, which is where it would be done); proven receivers (a class fact for fields,
+  parameters and returns as the integer facts are, which removes tag tests and class tests); the flow memo of tsrs (bound 5%);
+  the parse threads (2.15 G of 12.9 G).

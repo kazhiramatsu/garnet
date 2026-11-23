@@ -109,11 +109,38 @@ execution), and the signatures are computed once after it where they were comput
 
 One thread repeats within 0.05%. A default run's total moves by up to 1% between two measurements of
 one binary (which fork takes which statements), so the second column is a direction, not a figure.
+Cycles on one thread, the minimum of the rounds on a machine in use: 3.476 -> 3.347 G (-3.7%), more
+than the instructions: what went is frame work (saves and restores, values kept in memory across
+calls), which costs more than its count. Every variant under "Tried and not kept" removed instructions
+too and no cycles.
 
 The shape of one function, `Scanner.scan` (its unit compiled alone): 374 instructions and six saved
 register pairs; 288 with the throws declared; 269 and three pairs with three of its slow halves under
 `preserve_most`. `getCombinedNodeFlags`, whose eleven call sites are all slow halves: three saved
 pairs to one.
+
+## Under a profile
+
+The benchmark build of tsc-ts is profile-guided by default (docs/pgo_design.md); the figures above are
+of plain builds, which is what a program without a `default.pgo` gets. With a profile the C compiler
+has the real frequencies and does most of this by itself:
+
+| | plain | profile-guided |
+|---|---|---|
+| one thread, instructions | 12.557 G | 10.344 G (-17.6%) |
+| one thread, cycles | 3.343 G | 2.666 G (-20.2%) |
+| a default run, wall (a machine in use; tsrs 171 ms) | 248 ms | 212 ms |
+| this slice, one thread: instructions / cycles | -1.47% / -3.7% | -0.88% / -0.2% |
+| the checkers' samples on frame instructions | 12.8% | 6.7% |
+| on the pointer mask | 4.8% | 6.5% |
+| on tag tests | 5.2% | 6.5% |
+| on loads | 21.2% | 25.0% |
+| on stores | 6.0% | 8.4% |
+
+A profile halves the frames (what is left is in functions of more than a thousand instructions, which
+make their calls) and leaves what the representation costs: the mask of every pointer read out of a
+slot and the tag test of every receiver that is not proven. Those are the analyzer's to remove (a
+proof) or the encoding's (a pointer stored as itself); no statement to the C compiler does.
 
 ## Tried and not kept
 
@@ -125,20 +152,37 @@ pairs to one.
 - **LLVM's partial inliner** (`-mllvm -enable-partial-inlining`, the same to the link): the bodies of
   396 functions outlined behind their leading test, -0.34% on one thread, a default run within its
   noise. Not switched on: what it finds is what "An entry without a frame" below does on purpose.
+- **A callee-saved register's first use priced at what it costs** (`-Wl,-mllvm,-regalloc-csr-first-time-cost=N`,
+  N relative to an entry frequency of 16,384; AArch64's default is 5, next to free, so a value live
+  across any call takes one): with 16,384, 32,768 and 65,536 the instructions on one thread fall by
+  0.59%, 0.76% and 0.83% and the cycles do not (-0.04%, +0.85%, +0.20%, the minimum of nine rounds):
+  a value split around a call is a store and a load there in place of a pair at the entry.
+  `getAssignmentTarget` keeps its five pairs under every setting: its body is a loop, which the static
+  estimate runs 32 times, so the tag constants and the jump table's address are hoisted into
+  callee-saved registers for a loop that runs once.
+- **The runtime as bitcode in the ThinLTO link** (`TSAOT_HOST_CC='... -flto=thin'`): -0.89%
+  instructions on one thread, cycles +0.27%, the binary 1.9 MB larger, the build as long. The inline
+  helpers of the header already carry the fast paths; and code of the runtime inlined into generated
+  code would put its untyped slot accesses next to the typed struct views (the lesson of the one struct
+  view a field), which no gate has seen.
+- **Inline hints** (`TSAOT_INLINE_HINT=1`, `2`): +0.04% and +0.19%.
 - **`preserve_all`** in place of `preserve_most`: the same code for the function looked at.
 - A scanner entry split by hand into a dispatcher and the full scan (tsc-ts, `exp/scan-dispatch`):
   +0.32%, because the dispatcher's own slow halves gave it a frame. To be measured again on this base.
 
 ## Next
 
-- **An entry without a frame**, as two C functions: the leading part of a function that changes
-  nothing (loads, tests, returns) under the function's name, every path that would call or store
-  leaving by `return f_rest(args)`, a call in tail position; `f_rest` is the function as it is. 14% of
-  the samples are frame instructions and 4 to 8% of all samples are the frames of functions that have
-  such a return (`build/s367/entrypot.py`). The failing side of a guard in the entry must leave, not
-  run the generic read: `f_rest` would run it again.
+- **An entry without a frame**, as two C functions, for plain builds: the leading part of a function
+  that changes nothing (loads, tests, returns) under the function's name, every path that would call
+  or store leaving by `return f_rest(args)`, a call in tail position; `f_rest` is the function as it
+  is. In a plain build 3.5 to 5% of all samples are the frames of functions that have such a return
+  (`build/s367/entrypot.py`); under a profile the frames of functions of at most a thousand
+  instructions are 2.6% in all, so it is worth little there. The failing side of a guard in the entry
+  must leave, not run the generic read: `f_rest` would run it again.
 - **`pure` on what the analyzer proves pure and total**: the C compiler reloads every field after an
   opaque call. A function that can throw is not pure to it (a call whose result is unused may be
   deleted), so this waits for receivers that need no guard.
-- The runtime as bitcode in the link, so that the header's statements are inferred instead of written:
-  it is one translation unit of 29 K lines, and the link would compile it again for every program.
+- **Branch weights**: every decision above that the C compiler makes by frequency (what to split
+  around, where the frame goes, what to hoist out of a loop) uses its static estimate, which takes a
+  loop for 32 iterations and an `if` for an even bet. The profile-guided build has the real ones
+  (docs/pgo_design.md); what generated code knows without a profile (a failing guard, a throw) it says.
