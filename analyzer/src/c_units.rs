@@ -873,12 +873,13 @@ struct InitSplit {
 /// Split a function of the module initialization's shape (docs/startup_design.md,
 /// S1); `None` keeps it whole.
 fn split_init_function(name: &str, sig: &str, body: &str, chunk_lines: usize) -> Option<InitSplit> {
+    let fname = name;   // the arms below bind `name` to a declaration's
     if sig.trim() != format!("tsv {}(void)", name) {
-        return None;
+        return init_stays_whole(fname, line!());
     }
     let lines: Vec<&str> = body.lines().collect();
     if lines.len() < 8 || lines[0].trim() != "{" || lines[lines.len() - 1].trim() != "}" {
-        return None;
+        return init_stays_whole(fname, line!());
     }
     // the prologue: plain declarations with constant initializers (they move
     // to the chunk that uses them, so no side effect may move with them)
@@ -892,10 +893,22 @@ fn split_init_function(name: &str, sig: &str, body: &str, chunk_lines: usize) ->
             || matches!(t, "TS_UNDEFINED" | "TS_NULL" | "TS_TRUE" | "TS_FALSE" | "NULL")
     };
     let mut pro: Vec<(String, String, Option<String>, &str)> = Vec::new(); // (type, name, init, line)
+    // the prologue's arrays (`TYPE NAME[N];`, the environment of a closure the escape analysis put on the stack,
+    // declared at function scope beside its `ts_func`): name -> dimensions. A value made in one chunk points
+    // into it and is used by a later one, so it is a member of the shared struct whatever its users.
+    let mut pro_dims: HashMap<String, String> = HashMap::new();
     let mut k = 1;
     while k < lines.len() - 1 {
         match top_stmt(lines[k]) {
             TopStmt::Plain { ty, name, init } if const_init(&init) => pro.push((ty, name, init, lines[k])),
+            TopStmt::Pinned { names, automatic_array: true } if names.len() == 1 => {
+                let Some((ty, name, dims)) = plain_array_decl(lines[k]) else { break };
+                if name != names[0].0 {
+                    break;
+                }
+                pro_dims.insert(name.clone(), dims);
+                pro.push((ty, name, None, lines[k]));
+            }
             _ => break,
         }
         k += 1;
@@ -907,7 +920,7 @@ fn split_init_function(name: &str, sig: &str, body: &str, chunk_lines: usize) ->
         let push = (fr + 1..lines.len()).find(|&i| lines[i].trim().starts_with("ts_frame_push(&F.h,"))?;
         for l in &lines[fr + 1..push] {
             if !l.trim().starts_with("F.") {
-                return None;
+                return init_stays_whole(fname, line!());
             }
         }
         let ft = lines[fr].trim();
@@ -923,13 +936,13 @@ fn split_init_function(name: &str, sig: &str, body: &str, chunk_lines: usize) ->
     }
     let first = if framed { "ts_frame_pop(&F.h);" } else { "return TS_UNDEFINED;" };
     if epi == close || lines[epi].trim() != first || epi <= body_start {
-        return None;
+        return init_stays_whole(fname, line!());
     }
     let body_lines: Vec<&str> = lines[body_start..epi].to_vec();
     let n = body_lines.len();
     let dep = line_depths(&body_lines);
     if dep.last().map_or(true, |d| d.0 != 0 || d.1) {
-        return None;
+        return init_stays_whole(fname, line!());
     }
     // what the split does not move between functions
     let mut fscope: HashMap<String, usize> = HashMap::new(); // function-scope name -> prologue index or usize::MAX
@@ -941,7 +954,7 @@ fn split_init_function(name: &str, sig: &str, body: &str, chunk_lines: usize) ->
             for (s, e) in identifiers(init) {
                 let id = &init[s..e];
                 if id == "F" || fscope.contains_key(id) {
-                    return None;
+                    return init_stays_whole(fname, line!());
                 }
             }
         }
@@ -955,17 +968,17 @@ fn split_init_function(name: &str, sig: &str, body: &str, chunk_lines: usize) ->
         let lb = l.as_bytes();
         let tl = l.trim_start();
         if tl.starts_with('#') {
-            return None;
+            return init_stays_whole(fname, line!());
         }
         for &(s, e) in &toks {
             let id = &l[s..e];
             if id.starts_with("mi__")
                 || matches!(id, "return" | "setjmp" | "_setjmp" | "sigsetjmp" | "ts_setjmp" | "ts_eh_push" | "__label__")
             {
-                return None;
+                return init_stays_whole(fname, line!());
             }
             if id == "F" && (!framed || !(e < lb.len() && lb[e] == b'.')) {
-                return None;
+                return init_stays_whole(fname, line!());
             }
             if id == "goto" {
                 let mut j = e;
@@ -973,7 +986,7 @@ fn split_init_function(name: &str, sig: &str, body: &str, chunk_lines: usize) ->
                     j += 1;
                 }
                 if j < lb.len() && lb[j] == b'*' {
-                    return None; // a computed goto
+                    return init_stays_whole(fname, line!()); // a computed goto
                 }
             }
         }
@@ -982,7 +995,7 @@ fn split_init_function(name: &str, sig: &str, body: &str, chunk_lines: usize) ->
             match top_stmt(l) {
                 TopStmt::Plain { ty, name, init } => {
                     if fscope.contains_key(&name) {
-                        return None;
+                        return init_stays_whole(fname, line!());
                     }
                     fscope.insert(name.clone(), usize::MAX);
                     mid_plain.insert(name, (i, ty, init));
@@ -991,11 +1004,11 @@ fn split_init_function(name: &str, sig: &str, body: &str, chunk_lines: usize) ->
                     // an automatic array may be reached through a pointer from a
                     // later chunk (it decays); a static's storage outlives them all
                     if automatic_array {
-                        return None;
+                        return init_stays_whole(fname, line!());
                     }
                     for (nm, is_static) in names {
                         if fscope.contains_key(&nm) {
-                            return None;
+                            return init_stays_whole(fname, line!());
                         }
                         fscope.insert(nm.clone(), usize::MAX);
                         if is_static {
@@ -1048,7 +1061,7 @@ fn split_init_function(name: &str, sig: &str, body: &str, chunk_lines: usize) ->
             let start = toks[m].0;
             let before = l[..start].trim_end();
             if before.is_empty() || before.ends_with('{') || before.ends_with(';') || before.ends_with('(') {
-                return None;
+                return init_stays_whole(fname, line!());
             }
         }
     }
@@ -1133,7 +1146,7 @@ fn split_init_function(name: &str, sig: &str, body: &str, chunk_lines: usize) ->
     }
     cuts.push(n);
     if cuts.len() < 3 {
-        return None; // one chunk: nothing to gain
+        return init_stays_whole(fname, line!()); // one chunk: nothing to gain
     }
     let chunk_of = |line: usize| -> usize { cuts.partition_point(|&c| c <= line) - 1 };
     // which chunks use each function-scope variable
@@ -1149,7 +1162,7 @@ fn split_init_function(name: &str, sig: &str, body: &str, chunk_lines: usize) ->
     }
     for (nm, _) in &pinned {
         if users.get(nm.as_str()).map_or(false, |u| u.len() > 1) {
-            return None; // the spans above keep them in one chunk; never reached
+            return init_stays_whole(fname, line!()); // the spans above keep them in one chunk; never reached
         }
     }
     // a variable whose address is taken, or of a struct type (an object the
@@ -1170,7 +1183,7 @@ fn split_init_function(name: &str, sig: &str, body: &str, chunk_lines: usize) ->
         }
     }
     if pinned.iter().any(|(p, _)| addressed.contains(p.as_str()) && !pinned_static.contains(p)) {
-        return None; // a pointer to an automatic variable could outlive its chunk
+        return init_stays_whole(fname, line!()); // a pointer to an automatic variable could outlive its chunk
     }
     let scalar = |ty: &str| -> bool {
         ty.ends_with('*')
@@ -1191,7 +1204,7 @@ fn split_init_function(name: &str, sig: &str, body: &str, chunk_lines: usize) ->
         .iter()
         .filter(|(nm, u)| {
             !pinned.iter().any(|(p, _)| p == **nm)
-                && (u.len() > 1 || addressed.contains(**nm) || !scalar(&type_of(nm)))
+                && (u.len() > 1 || addressed.contains(**nm) || !scalar(&type_of(nm)) || pro_dims.contains_key(**nm))
         })
         .map(|(nm, _)| nm.to_string())
         .collect();
@@ -1212,7 +1225,7 @@ fn split_init_function(name: &str, sig: &str, body: &str, chunk_lines: usize) ->
                 usize::MAX => mid_plain[nm].1.clone(),
                 k => pro[k].0.clone(),
             };
-            let _ = write!(typedefs, " {} {};", ty, nm);
+            let _ = write!(typedefs, " {} {}{};", ty, nm, pro_dims.get(nm).map_or("", |d| d.as_str()));
         }
     }
     let _ = writeln!(typedefs, " }} {};", shared_t);
@@ -1286,6 +1299,41 @@ fn split_init_function(name: &str, sig: &str, body: &str, chunk_lines: usize) ->
 /// Replace each cold function of the module initialization's shape with its
 /// caller and chunks; records their units and each unit's preamble (the two
 /// struct types).
+/// `TYPE NAME[DIMS];` alone on a line, with no initializer: the type, the name and the dimensions (`[1]`, `[2][3]`).
+fn plain_array_decl(line: &str) -> Option<(String, String, String)> {
+    let t = line.trim().strip_suffix(';')?.trim_end();
+    let open = t.find('[')?;
+    let (head, dims) = t.split_at(open);
+    // the dimensions: brackets of digits only
+    let mut rest = dims;
+    while !rest.is_empty() {
+        let inner = rest.strip_prefix('[')?;
+        let close = inner.find(']')?;
+        if close == 0 || !inner[..close].bytes().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        rest = &inner[close + 1..];
+    }
+    let head = head.trim_end();
+    let cut = head.rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))?;
+    let (ty, name) = (head[..=cut].trim(), &head[cut + 1..]);
+    if ty.is_empty() || name.is_empty() || ty.contains('=') || ty.contains('(') || ty.starts_with("static") {
+        return None;
+    }
+    Some((ty.to_string(), name.to_string(), dims.to_string()))
+}
+
+/// The split gave up on a cold function. For the module initialization that is said every time: it then stays one
+/// function of every module's top-level code, compiled at -O0, and the program starts slower for it without anything
+/// else showing (a shape of declaration the prologue does not expect kept tsc-ts's whole for five sessions).
+/// TSAOT_UNIT_SPLIT_LOG=1 says it for every cold function.
+fn init_stays_whole(name: &str, line: u32) -> Option<InitSplit> {
+    if name.contains("__module_init") || std::env::var("TSAOT_UNIT_SPLIT_LOG").is_ok() {
+        eprintln!("[units] {} is not split into chunks and stays one cold function (c_units.rs:{})", name, line);
+    }
+    None
+}
+
 fn split_init_items(
     items: Vec<Item>,
     opt: &Options,
