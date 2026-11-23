@@ -42,9 +42,10 @@ reference to a cell outside the heap) goes away.
 | function at `p` | `0xFFFA << 48 \| p` | `2 << 48 \| p` |
 | boolean, undefined, null | selectors `0xFFFB`, `0xFFFC`, `0xFFFD` | selectors 3, 4, 5 |
 | short string, the internal holes | selector `0xFFFE` | selector 6 |
+| small integer (an integer slot's word, section 5) | the int32 zero-extended, a denormal number; selector `0xFFFF` from slice 2b | selector 7 over the int32 |
 | a double `d` | the bits of `d` | the bits of `d` xor `K` |
 | `+0`, `1`, `-0`, the one NaN | `0`, `0x3FF0…`, `0x8000…`, `0x7FF8…` | `0xFFF8…`, `0xC008…`, `0x7FF8…`, `0x8000…` |
-| a number, by its top 16 bits | below `0xFFF8`, or `0xFFFF` | above 6 (7 is never made) |
+| a number, by its top 16 bits | below `0xFFF8`, or `0xFFFF` | above 6 (`ts_num` never makes 7) |
 | the zero word | the number `+0` | no value: the object selector over a null address |
 
 What follows from "the same word xor `K`":
@@ -70,7 +71,8 @@ differ is code that reads a word's bits itself. The audit below is the list of t
 #endif
 #define TS_NUM_XOR  (TS_VALUE_REP ? 0xFFF8000000000000ULL : 0ULL)
 #define TS_SEL_BASE (TS_VALUE_REP ? 0x0000U : 0xFFF8U)
-enum { TS_SEL_OBJECT = TS_SEL_BASE, TS_SEL_STRING, TS_SEL_FUNC, TS_SEL_BOOL, TS_SEL_UNDEF, TS_SEL_NULL, TS_SEL_SHORTSTR };
+enum { TS_SEL_OBJECT = TS_SEL_BASE, TS_SEL_STRING, TS_SEL_FUNC, TS_SEL_BOOL, TS_SEL_UNDEF, TS_SEL_NULL, TS_SEL_SHORTSTR,
+       TS_SEL_INT32 };   /* base + 7: the small integer of an integer slot (section 5) */
 
 static inline tsv ts_num(double d){
   uint64_t b; memcpy(&b, &d, 8);
@@ -83,7 +85,11 @@ static inline int ts_is_heap_ref(tsv v){ return (uint16_t)(TS_TOP16(v) - TS_SEL_
 static inline void* ts_ptr(tsv v);       /* any heap reference: the payload (rep 0: less the stack tag) */
 static inline void* ts_obj_ptr(tsv v);   /* a word known to carry the object selector: rep 1, the word itself */
 static inline tsv   ts_obj(void* p);     /* rep 1: the address; no load, no branch, NULL is the zero word */
-static inline tsv   ts_raw_word(uint64_t w){ return w ^ TS_NUM_XOR; }   /* a word that is no value, kept in a value slot */
+/* an integer slot: its word is a small integer; a store writes the low half and leaves the selector */
+static inline tsv     ts_int_slot_word(int32_t i){ return TS_BOX(TS_SEL_INT32, (uint32_t)i); }
+static inline int32_t ts_int_slot_value(tsv w){ return (int32_t)(uint32_t)w; }
+static inline void    ts_int_slot_store(tsv* p, int32_t i){ memcpy(p, &i, 4); }
+static inline tsv     ts_raw_word(uint64_t w){ return w ^ TS_NUM_XOR; }   /* a word that is no value, kept in a value slot */
 ```
 
 `ts_obj_ptr` is new and is the point of the change: `ts_ptr` must keep its mask, since it also serves
@@ -103,7 +109,7 @@ it, or the allocation that made the word, proves the object selector.
 | number read | `fmov d0, x0` | `eor x8, x0, #0xfff8000000000000; fmov d0, x8` |
 | number write | `fmov`, the NaN test | `fmov`, the NaN test, `eor` |
 | integer slot read | 32-bit load | the same |
-| integer slot store | 64-bit store of the zero-extended integer | one `orr` more (below) |
+| integer slot store | 64-bit store of the zero-extended integer | 32-bit store of the low half (below) |
 | unboxed double and integer fields, typed arrays, unboxed locals | | unchanged |
 
 `K`, the 48-bit mask and the 16-bit test are logical immediates: nothing needs a constant register.
@@ -122,8 +128,16 @@ few of them on its hot paths; the bench kernels over number arrays are where a r
   apart) is possible later and separate: this change keeps the order so that it stays a bijection.
 - **Functions and strings under selector 0** (the kind byte tells them apart) would unmask them too,
   at the price of a load in every `typeof` and callable test. Not in this design.
-
-Selector 7 is free in the new representation (`ts_num` never makes it).
+- **V8's small integers.** Taken: the integer slot's word is a small integer, a word that says what
+  it is, under the one selector `ts_num` never makes (section 5). An integer slot is already what V8
+  calls a field of Smi representation (the shape says the kind, a store of anything else moves the
+  object to the generalized shape); what it lacked is a word that is a value. Not taken: small
+  integers as a second form of number everywhere. `ts_to_num` is a reinterpretation at hundreds of
+  sites and numbers are identical by their bits; a second form puts a test on every boxed number read
+  and ends that identity (`1` and `1.0`), for what the analyzer mostly has already (integers proven
+  and unboxed; conversions between integers and doubles are 1.75% of the checkers' samples). The
+  selector keeps that door open: it is a separate project, to be decided by counting how much of the
+  boxed number traffic of vue and hono is int32.
 
 ## What depends on the representation: the audit
 
@@ -186,18 +200,34 @@ Today a small integer in a value slot reads as a denormal number, so nothing tha
 it. In the new representation a word below `2^48` reads as **an object reference**.
 
 - **Integer slots of plain objects** (`TS_PROP_INT32`, docs/record_int_fields_design.md):
-  `ts_int_slot_word(i)` is `(tsv)(uint32_t)i` (ts_rt.h 2965; the literal fill at 2988 and the stores
-  around 3056 to 3495 go through it, the reads through `ts_int_slot_value` / `ts_int_slot_box`). The
-  collector visits these slots as values (`gc_mark_common_props`).
+  `ts_int_slot_word(i)` is `(tsv)(uint32_t)i` (ts_rt.h 2965). The collector visits these slots as
+  values (`gc_mark_common_props`).
 - **A sparse array's side table**: `a->inline_data[0] = (tsv)(uintptr_t)s` (ts_rt.c 2712); the scan
   does not visit `data` while `a->sparse`, other walks must not either.
 
-Rule: **a raw word in a value slot is `ts_raw_word(w)`, the word xor `K`**. It is then the number it
-is today (the same denormal), in both representations, to every reader. An integer slot's store
-becomes `orr x8, x8, #0xfff8000000000000` and the store; its read is the low 32 bits as now. If the
-`orr` shows on vue (its `flags |=` sites are why integer slots exist), the store can write the low
-half alone (`str w`), the high half written once when the slot becomes an integer slot: measured
-before it is built.
+**The integer slot's word becomes a small integer, as V8's Smi is a value** (Kaz, 2026-11-24): the
+selector at base + 7 (`0xFFFF` in representation 0, 7 in representation 1) over the int32. The word
+then says what it is to whoever meets it: no reference to the collector by its selector, not by the
+accident of being a denormal; and a small integer met outside an integer slot is recognizable, where
+today it is one more plausible number.
+
+- What makes a slot an integer slot does not change: the shape's flag, set by the layout
+  (`lit_layout_shape`, ts_rt.c 22391). Every creation writes the whole word, `ts_int_slot_word(0)`
+  (ts_rt.h 2988; ts_rt.c 22406, 22431), and a store of anything but an int32 moves the object to the
+  sibling shape with the slot boxed, its integer boxed first (`obj_generalize_slot`, ts_rt.c 3544).
+  So **the high half of an integer slot is the selector from the slot's creation to its end**.
+- Hence a store writes the low half only, `ts_int_slot_store` (a 4-byte `memcpy`, which the compiler
+  makes `str w`; no second view of the slot's type, CLAUDE.md's one-view lesson): the stores at ts_rt.h
+  3056 to 3495, 3148, 3155 and ts_rt.c 3555, 22485. **An integer slot costs what it costs today**, in
+  both representations. Reads are the low half already (`ts_int_slot_value`, `ts_int_slot_box`).
+- Outside its slot nothing changes: a generic read boxes the integer to a double by the flag
+  (`obj_val_read`, ts_rt.c 3495), as now. The small integer is a kind of word only integer slots hold.
+- Little-endian only, said in a `_Static_assert`. A 32-bit store followed at once by a 64-bit load of
+  the slot (a generic read after a typed store) is not forwarded from the store buffer: rare, and
+  looked for in the measurement.
+
+The side table's pointer is the one other such word. Rule for it: **a raw word in a value slot is
+`ts_raw_word(w)`, the word xor `K`**, the number it is today in both representations.
 
 Not affected: a class instance's unboxed double and integer fields (the marker reads `ref_offs`, the
 boxed offsets, ts_rt.c 15499), a coroutine frame's numeric locals behind its frame map.
@@ -272,6 +302,10 @@ A build for the gates, not for speed:
 - In representation 1, the value tests abort on the zero word (`ts_is_obj`, `ts_truthy`, `ts_typeof`,
   the equality entries): a zeroed field read as a value where nothing would fault.
 
+- A small integer reaching `ts_to_num`, `ts_is_num`, `ts_typeof` or the equality entries aborts (it
+  left its slot unboxed), and the marker aborts on a slot flagged integer whose high half is not the
+  selector (a store that wrote the whole word, a creation that did not).
+
 With `TSAOT_CRASH_TRACE=1` a fault at a small address is the same finding from generated code.
 
 ## Slices
@@ -282,7 +316,8 @@ With `TSAOT_CRASH_TRACE=1` a fault at a small address is the same finding from g
      `ts_raw_word` and its reader; the four hole markers on the enum.
    - Sections 3 to 5 rewritten against the helpers: the barriers and the collector through one
      `ts_ref_is_nonheap` / the cage test, `signbit` in `ts_int32_exact`, the `-0` key as
-     `ts_num(-0.0)`, integer slots and the sparse table through `ts_raw_word`.
+     `ts_num(-0.0)`, the sparse table through `ts_raw_word`, the integer slot's stores through
+     `ts_int_slot_store` (still the whole word here).
    - `ts_ptr` to `ts_obj_ptr` where the selector is proven: the emitter's 27 sites less its three
      function sites (11445, 11453, 26669), the header's inline paths (arrays, maps, the property
      caches, typed field access), then the runtime's hot functions. Each is checked by the checking
@@ -294,6 +329,10 @@ With `TSAOT_CRASH_TRACE=1` a fault at a small address is the same finding from g
    - Verified by: the generated C byte-identical (the emitter's text changes only where `ts_obj_ptr`
      replaces `ts_ptr`: identical after that substitution), the instructions of tsc-ts and the bench
      unchanged, unit, conformance plain, the checking build over conformance.
+   - **2b, the integer slot's word** (the one part that changes the runtime's code, so by itself):
+     `TS_SEL_INT32` (`0xFFFF` here), the creations write it, the stores write the low half. Generated C
+     unchanged (it is all in ts_rt.h). Measured alone: vue, hono, hono_app, tsc-ts by instructions and
+     cycles; conformance plain and strict, the objects fuzzer, the checking build's two tests.
 3. **The switch.** `-DTS_VALUE_REP=1`, the link guard, the mapless frames through the conservative
    visitor, the marker's out-of-cage path, and what the checking build finds of section 7 (the
    coroutine frame's fill if a local is read unwritten). Both representations pass the
@@ -334,4 +373,5 @@ representations.
 ## Open for Kaz
 
 - Whether representation 0 is kept after the default moves, and for how long.
-- The integer slot's store: the `orr`, or the half-word store, by vue's measurement.
+- Small integers as values outside their slots (a second form of number): not in this change; whether
+  to count the int32 share of boxed numbers on vue and hono, to decide it later.

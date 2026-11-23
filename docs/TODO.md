@@ -13675,6 +13675,17 @@ with builds and gates from the next morning on, and for the branch to be merged 
 - **main** is fast-forwarded to this commit on Kaz's word (from `c8adf15`). It carries Session 367's
   slices, each with the minimal gates its entry records; **the whole set has not run on this tip**.
 
+- **Later the same day, the integer slot's word** (Kaz: could it be like V8's Smi?). Yes, and better than
+  the rule above for it: the word becomes a small integer under the selector `ts_num` never makes (base + 7:
+  `0xFFFF` now, 7 in the new representation), a word that says what it is. The slot is already V8's field of
+  Smi representation (the shape's flag, a store of anything else generalizes the shape); its high half is
+  then the selector from creation to the end, so **a store writes the low half and an integer slot costs
+  what it costs today** (no `orr`). Read for it: every creation writes the whole word through
+  `ts_int_slot_word(0)`, every store goes through the helper, `obj_generalize_slot` boxes before the shape
+  changes. Its own slice, 2b, in representation 0, measured alone. Not taken: small integers as values
+  outside their slots (a second form of number); the selector leaves it possible. This note is on the
+  branch; main stays at `1c995c8` until the next landing.
+
 Next session, in order:
 
 1. The whole gate set on main's tip, quietly (`TSAOT_CONF_JOBS=3`, `nice -n 12`, under `caffeinate -ims`):
@@ -13682,7 +13693,7 @@ Next session, in order:
    vue, the tsc-ts build with its corpus in the plain mode. The baselines of the A/B to come are this build.
 2. Slice 2 of the design: the definitions block, `ts_obj_ptr` / `ts_raw_word` / `ts_is_heap_ref`, sections
    3 to 5 rewritten against them in representation 0, the source gate `tests/value_rep_gate.sh`; generated
-   C and instruction counts unchanged.
+   C and instruction counts unchanged. Then 2b, the integer slot's small integer, measured alone.
 3. Slice 3: `-DTS_VALUE_REP=1`, both representations through every gate, the fuzzers and the checking
    build; the fixtures the design lists.
 4. Slice 4: the A/B on plain builds (tsc-ts, hono, hono_app, vue, the bench budgets, the kernels over
