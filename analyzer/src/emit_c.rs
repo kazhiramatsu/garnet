@@ -25717,7 +25717,10 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     // a hinted receiver may be null or undefined, and so may a
                     // method's `this` once it can be called bare: the read throws
                     // (the frozen emitter's ts_get under TSAOT_TYPED_SLOW=0)
-                    let getter = if hinted.is_some() || typed_slow_enabled() { "ts_get_checked" } else { "ts_get" };
+                    // the failing side is told to the C compiler as such: a branch it lays out of line, and a
+                    // call that keeps the function's registers (TS_RT_COLD_CALL)
+                    let getter = if hinted.is_some() || typed_slow_enabled() { "ts_get_checked_cold" } else { "ts_get_cold" };
+                    let guard = if guard == "0" { guard } else { format!("TS_RT_UNLIKELY({})", guard) };
                     let slow = ctx.lazy_linked(&format!("{}({}, {})", getter, obj_name, field.0));
                     if int32_field(c, field.0, ctx.classes) {
                         if ctx.int_local.contains(&dst.0) {
@@ -25934,17 +25937,21 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     // paths test the same bit before they store).
                     let obj_name = ctx.val(obj.0);   // boxed: a lie can leave a number behind a class type
                     let guard = receiver_guard(&obj_name, &hinted, c);
-                    let (cond, slow) = if frozen_tests_on() && !ctx.frozen_elide.contains(&addr) {
-                        let frozen = format!("TS_RT_UNLIKELY(ts_store_frozen({}))", obj_name);
-                        let cond = if guard == "0" { frozen } else { format!("({}) || {}", guard, frozen) };
-                        let slow = ctx.lazy_linked_stmt(&format!(
-                            "if (ts_store_frozen({o})) ts_throw_frozen_field({o}, {k}); else ts_set({o}, {k}, {v})",
-                            o = obj_name, k = field.0, v = ctx.val(src.0)));
-                        (cond, slow)
-                    } else {
-                        (guard, ctx.lazy_linked_stmt(&format!("ts_set({}, {}, {})", obj_name, field.0, ctx.val(src.0))))
-                    };
-                    let _ = writeln!(s, "  if ({}) {{ {} }} else {{", cond, slow);
+                    // Two tests, in this order: a receiver that is not the struct takes the generic store
+                    // (which answers for whatever it is, a frozen object and undefined among them: the frozen
+                    // bit is read off a struct only, never off a value that may be no object), then a frozen
+                    // instance throws. Each failing side is told to the C compiler as such: an unlikely
+                    // branch, a call that keeps the function's registers (TS_RT_COLD_CALL) and a throw that
+                    // does not come back.
+                    if guard != "0" {
+                        let slow = ctx.lazy_linked_stmt(&format!("ts_set_cold({}, {}, {})", obj_name, field.0, ctx.val(src.0)));
+                        let _ = writeln!(s, "  if (TS_RT_UNLIKELY({})) {{ {} }} else", guard, slow);
+                    }
+                    if frozen_tests_on() && !ctx.frozen_elide.contains(&addr) {
+                        let slow = ctx.lazy_linked_stmt(&format!("ts_throw_frozen_field({}, {})", obj_name, field.0));
+                        let _ = writeln!(s, "  if (TS_RT_UNLIKELY(ts_store_frozen({}))) {{ {} }} else", obj_name, slow);
+                    }
+                    let _ = writeln!(s, "  {{");
                     let _ = writeln!(s, "    (({}*)ts_ptr({}))->{} = {};", cn, obj_name, off, rhs);
                     if !is_num {
                         emit_field_store_barrier(s, &obj_name, &rhs);

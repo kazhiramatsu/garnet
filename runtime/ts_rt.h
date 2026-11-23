@@ -43,17 +43,28 @@
 #define TS_RT_LIKELY(x) __builtin_expect(!!(x), 1)
 #define TS_RT_UNLIKELY(x) __builtin_expect(!!(x), 0)
 #define TS_RT_NORETURN __attribute__((noreturn, cold))
+#define TS_RT_SLOW_CALL __attribute__((noinline, preserve_most))
+#define TS_RT_COLD_CALL __attribute__((cold, noinline, preserve_most))
 #else
 #define TS_RT_ALWAYS_INLINE static inline
 #define TS_RT_LIKELY(x) (x)
 #define TS_RT_UNLIKELY(x) (x)
 #define TS_RT_NORETURN _Noreturn
+#define TS_RT_SLOW_CALL
+#define TS_RT_COLD_CALL
 #endif
 /* TS_RT_NORETURN: a function that throws whatever it is given (ts_throw leaves by longjmp, or ends the process
    when nothing catches). Generated code calls these on the failing side of a guard, at every store to a field
    among others; a C compiler that takes the call to come back keeps every value that is live after the guard
    in a callee-saved register across it, and writes the code that goes on from it. Told that it does not, it
-   keeps nothing for it and puts the block out of line. */
+   keeps nothing for it and puts the block out of line.
+   TS_RT_SLOW_CALL: the out-of-line half of a test generated code makes in line (the write barrier's remembered
+   set, an element past an array's capacity, a number that is none), which does come back. Under the ordinary
+   convention every value live after such a call sits in a callee-saved register, saved and restored by each
+   call of the function whether or not the slow half runs; preserve_most leaves the caller's registers alone
+   (all but the arguments' and the result's), so only the slow half pays for what it uses. TS_RT_COLD_CALL: the
+   same for a half that is the failing side of a guard (a receiver that is not what its type says). Every
+   declaration of such a function must carry the attribute: the convention is part of the call. */
 
 /* A recursion with no way out keeps its calls: a loop has no stack to overflow (docs/exceptions_design.md). */
 #if defined(__clang__)
@@ -302,7 +313,7 @@ typedef struct ts_gc_header {
    size. A cell stays 16-byte aligned; its body starts at offset 8. */
 _Static_assert(sizeof(ts_gc_header) == 8, "the cell header is 8 bytes");
 enum { TS_GEN_YOUNG = 0, TS_GEN_OLD = 1, TS_GEN_NONHEAP = 2 };
-void ts_gc_remember(ts_gc_header* h);
+TS_RT_SLOW_CALL void ts_gc_remember(ts_gc_header* h);
 
 /* ---- heap refs (docs/gc_v2_design.md §6.8, slice D2) ----
  * Heap cells never move (they live in the cell blocks of the heap cage), so
@@ -1407,18 +1418,18 @@ static inline int ts_is_array_fast(tsv v){
 /* `x.length` of a value the compiler only knows to be a string, an array or a
    function (GenericLen): a string or a plain array in line, the rest (a
    function's arity, a proxy's get trap) out of line. */
-double ts_length_slow(tsv v);
+TS_RT_COLD_CALL double ts_length_slow(tsv v);
 static inline double ts_length(tsv v){
   if (ts_is_str(v)) return (double)ts_str_len_typed(v);
   if (ts_is_indexed_array_fast(v)) return (double)((ts_array*)ts_ptr(v))->len;
   return ts_length_slow(v);
 }
-uint32_t ts_array_len_foreign(tsv v);   /* a Proxy's length through its trap; null and undefined throw; 0 for anything else */
+TS_RT_COLD_CALL uint32_t ts_array_len_foreign(tsv v);   /* a Proxy's length through its trap; null and undefined throw; 0 for anything else */
 static inline uint32_t ts_array_len_fast(tsv arr){
-  return ts_is_indexed_array_fast(arr) ? ((ts_array*)ts_ptr(arr))->len : ts_array_len_foreign(arr);
+  return TS_RT_LIKELY(ts_is_indexed_array_fast(arr)) ? ((ts_array*)ts_ptr(arr))->len : ts_array_len_foreign(arr);
 }
 /* Array.isArray: an array, or a Proxy whose target is one (ECMA-262 IsArray). */
-int ts_array_is_array_slow(tsv v);
+TS_RT_COLD_CALL int ts_array_is_array_slow(tsv v);
 static inline int ts_array_is_array(tsv v){
   if (ts_is_indexed_array_fast(v)) return 1;
   return TS_RT_UNLIKELY(g_has_proxies) ? ts_array_is_array_slow(v) : 0;
@@ -1469,7 +1480,10 @@ TS_RT_ALWAYS_INLINE int ts_truthy_fast(tsv v){
 #endif
   if (t == TS_SEL_BOOL) return (int)(v&1);
   if (t == TS_SEL_UNDEF || t == TS_SEL_NULL) return 0;
-  return ts_truthy(v);   /* strings (and short strings): length test out of line */
+  /* a string by its length, in line: a call here, taken or not, is a frame for the function around it */
+  if (t == TS_SEL_STRING) return ts_str_ptr_typed(v)->len != 0;
+  if (t == TS_SEL_SHORTSTR) return ts_short_str_len(v) != 0;
+  return 1;   /* a symbol: every other value is one of the above (ts_truthy's order) */
 }
 static inline int ts_is_nullish_fast(tsv v){ return ts_is_null(v) || ts_is_undef(v); }
 /* `typeof x === "lit"` as a tag test (the emitter fuses the compare); each
@@ -1871,7 +1885,7 @@ tsv ts_to_string_template(tsv v);
 /* The array a typed `for..of` walks: the array itself, tested in line (every such loop asks
    once at its entry, and the answer is nearly always the receiver); another iterable is drained
    through its protocol into an array (ts_rt.c). */
-tsv ts_forof_array_source_slow(tsv v);
+TS_RT_COLD_CALL tsv ts_forof_array_source_slow(tsv v);
 static inline tsv ts_forof_array_source(tsv v){
   if (TS_RT_LIKELY(ts_is_indexed_array_fast(v))) return v;
   return ts_forof_array_source_slow(v);
@@ -2147,7 +2161,7 @@ int    ts_number_is_integer(tsv v);
 int    ts_number_is_finite(tsv v);
 int    ts_number_is_nan(tsv v);
 int    ts_number_is_safe_integer(tsv v);
-double ts_number_coerce_slow(tsv v);
+TS_RT_COLD_CALL double ts_number_coerce_slow(tsv v);
 /* JS ToNumber. The number case is the overwhelmingly common one at emitted
    sites; strings, objects and the remaining primitives convert out of line. */
 static inline double ts_number_coerce(tsv v){
@@ -2447,6 +2461,11 @@ tsv  ts_get(tsv obj, ts_key key);
    METHOD (method key). For instance Object.prototype-method values (o.toString). */
 tsv  ts_get_method_value(tsv recv, uint32_t field_key, uint32_t method_key);
 void ts_set(tsv obj, ts_key key, tsv val);
+/* The failing side of a typed field access's guard (a receiver that is not the struct its type names): the
+   generic read and store, called so that the function around the access keeps its registers. */
+TS_RT_COLD_CALL tsv  ts_get_checked_cold(tsv obj, ts_key key);
+TS_RT_COLD_CALL tsv  ts_get_cold(tsv obj, ts_key key);
+TS_RT_COLD_CALL void ts_set_cold(tsv obj, ts_key key, tsv val);
 /* Symbol support (symbol_design.md). */
 tsv  ts_symbol_new(tsv description);          /* Symbol(desc): fresh unique symbol */
 int  ts_is_symbol(tsv v);
@@ -2716,7 +2735,7 @@ static inline void ts_write_barrier_hdr(ts_gc_header* oh, tsv value){
    the written slot of a SHAPED object (in-object or overflow value). A sized
    instance's header bytes hold its extent, not slots: it is remembered
    whole (docs/cell_header_design.md). */
-void ts_gc_remember_slot(ts_gc_header* h, uint32_t slot);
+TS_RT_SLOW_CALL void ts_gc_remember_slot(ts_gc_header* h, uint32_t slot);
 static inline void ts_write_barrier_at(tsv owner, ts_gc_header* oh, tsv* p, tsv value){
   if (oh->kind == TS_KIND_OBJECT && !(oh->flags & (TS_HDR_SIZED | TS_HDR_SIDECAR))){
     ts_object* o = (ts_object*)oh;
@@ -3487,8 +3506,8 @@ static inline int ts_num_array_index(double d, uint32_t* out){
   if (d >= 0.0 && d < 4294967295.0){ uint32_t i = (uint32_t)d; if ((double)i == d){ *out = i; return 1; } }
   return 0;
 }
-tsv ts_array_get_key_i64(tsv arr, int64_t i);
-tsv ts_array_get_key_f64(tsv arr, double d);
+TS_RT_SLOW_CALL tsv ts_array_get_key_i64(tsv arr, int64_t i);
+TS_RT_SLOW_CALL tsv ts_array_get_key_f64(tsv arr, double d);
 void ts_array_set_key_i64(tsv arr, int64_t i, tsv v);
 void ts_array_set_key_f64(tsv arr, double d, tsv v);
 /* Elements and length of a view in line (TA2, docs/typed_arrays_design.md),
@@ -4006,7 +4025,7 @@ static inline int array_is_hole(tsv v){ return v == TS_ARRAY_HOLE; }
 /* A hole reads undefined, unless Array.prototype or Object.prototype was given an element (the library that tracks
    it, docs/array_protocol_design.md): the test is on the path of a hole only. */
 extern int g_proto_elements;
-tsv ts_array_hole_read(tsv arr, int64_t i);
+TS_RT_COLD_CALL tsv ts_array_hole_read(tsv arr, int64_t i);
 static inline tsv ts_array_hole_value(tsv arr, int64_t i){ return TS_RT_UNLIKELY(g_proto_elements) ? ts_array_hole_read(arr, i) : TS_UNDEFINED; }
 /* Element read with the array case in line: a dense slot (below cap: every
    slot in [len, cap) is a hole) that is not a hole is the value, any other
@@ -4038,7 +4057,7 @@ static inline tsv ts_array_get_inline_f64(tsv arr, double d){
    ts_array_set does, and remembers the array when it is old (the young-value
    test and the cards are out of line). Growth, sparse arrays, frozen arrays
    and other receivers (typed arrays among them) take ts_array_set. */
-void ts_array_remember(ts_array* a, uint32_t index, tsv value);
+TS_RT_SLOW_CALL void ts_array_remember(ts_array* a, uint32_t index, tsv value);
 /* An old array's store (the remembered-set barrier, docs/remembered_slots_design.md): nothing to do
    when the array is remembered and the slot's 64-element card is already dirty, since the next
    young collection scans the card whatever the value; otherwise the out-of-line half. */

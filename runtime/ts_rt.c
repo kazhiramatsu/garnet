@@ -21703,6 +21703,9 @@ tsv ts_get_checked(tsv obj, ts_key key){
   if (ts_is_null(obj) || ts_is_undef(obj)) return ts_throw_cannot_read(obj, ts_field_name(key));
   return ts_get(obj, key);
 }
+tsv ts_get_checked_cold(tsv obj, ts_key key){ return ts_get_checked(obj, key); }
+tsv ts_get_cold(tsv obj, ts_key key){ return ts_get(obj, key); }
+void ts_set_cold(tsv obj, ts_key key, tsv val){ ts_set(obj, key, val); }
 
 /* Extra location guards stay outside the compact shape cache. A bounded table
    keyed by the emitted site's stable address covers sized and dictionary
