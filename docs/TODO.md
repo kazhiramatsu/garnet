@@ -13615,3 +13615,28 @@ slow half in place at every guard.
   `ts_num` / `ts_to_num` / `ts_ptr` / `TS_BOX`, which is where it would be done); proven receivers (a class fact for fields,
   parameters and returns as the integer facts are, which removes tag tests and class tests); the flow memo of tsrs (bound 5%);
   the parse threads (2.15 G of 12.9 G).
+
+**The module initialization split again** (docs/startup_design.md, "Update (Session 367)"; found while looking at where a
+default run's wall goes). Its split into optimized chunks (Session 353, S1) had stopped for every program that imports the
+Node library's `fs`: a callback at a module's top level is a closure on the stack, declared at function scope as a `ts_func`
+and an array, and the split took the array for the end of the prologue. tsc-ts's initialization was one function of 117,699
+lines compiled at `-O0`, and nothing said so.
+- **The fix** (`analyzer/src/c_units.rs`): the prologue's arrays are members of the shared struct. The split now says
+  `[units] <name> is not split into chunks ...` when it gives up on a module initialization.
+- **What it cost was mostly not the start**: the `-O0` function keeps its 30 K locals in a frame that lies under everything,
+  and the conservative stack scan walked it at every collection of every process (`gc_scan_stack_words` 1.3% of a
+  one-thread compile).
+- **Measured** (tsc-ts, plain builds): `--version` 9.7 -> 8.2 ms (tsrs 3.0), 39 -> 29 MB at that point, the binary 48.3 ->
+  39.1 MB; the compiler project on one thread 12.554 -> 12.257 G instructions (**-2.4%**), cycles -1.8%, 444 -> 433 MB.
+- **Gates, the minimum** (`gates_s367j`): unit (the splitter's test has a stack closure in the initialization now), the units
+  build gate, the tsc-ts corpus in its plain mode 6,537 / 6,537; bench correct and within budget on a second run alone
+  (`string_unicode_search_kernel` 117 ms against its budget of 105 in the runner, right after the units build, then 104: that
+  kernel has one millisecond of room).
+- **Where a default run's wall is, under a profile, against tsrs** (a machine in use; `--extendedDiagnostics`): parse 41 to
+  47 ms against 19 to 22, check 141 against 132, the process around them about 20 against 17. The parse session is bound by
+  its work (200 ms of processor time over ten threads against tsrs's 56); the check by the largest file (the nine other
+  checkers end at about 100 ms, the checker of checker.ts and its forks at 141), which on a machine in use costs garnet's
+  ten processes more than tsrs's four threads. The checkers' total grows with their number: 7.7 G with 2, 8.7 with 4, 10.7
+  with 10 (0.37 G a checker, what each resolves again).
+- **Next for the start** (S4 in the design): 5,528 function objects are made at the start and 5,313 stored in module-level
+  bindings of which 126 are ever read; what the start does now is shapes (`shape_desc_record` 12%, `shape_transition_f` 6%).

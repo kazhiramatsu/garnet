@@ -68,6 +68,7 @@ fn init_program(extra: &str) -> String {
     c.push_str("static tsv fn_11___module_init_d(void){\n");
     for k in 1..=6 { c.push_str(&format!("  tsv v{} = TS_UNDEFINED;\n", k)); }
     c.push_str("  long long d7 = 0;\n  double d8 = 0.0;\n  tsv v9 = TS_UNDEFINED;\n  tsv v10 = TS_UNDEFINED;\n  Class1 sobj1;\n");
+    c.push_str("  ts_func sfn2;\n  tsv senv2[1];\n");   // a closure on the stack: its function and its environment, at function scope
     c.push_str("  struct { ts_frame_hdr h; tsv s0; tsv s1; } F;\n  F.s0 = TS_UNDEFINED;\n  F.s1 = TS_UNDEFINED;\n  ts_frame_push(&F.h, 2);\n");
     c.push_str("  v1 = ts_num(1);\n");                                   // v1: used by every chunk (shared)
     c.push_str("  F.s0 = fn_12_use(v1);\n");
@@ -79,6 +80,7 @@ fn init_program(extra: &str) -> String {
     c.push_str("  v5 = ts_num((double)lk_1[0]);\n  v5 = fn_12_use(v5);\n  v5 = ts_num((double)lit_1);\n");
     c.push_str("  v6 = fn_12_use(v5);\n  v10 = fn_12_use(v6); ts_gc_root(&v10); ts_gc_unroot(1);\n");   // v10: one line, but its address is taken
     c.push_str("  memset(&sobj1, 0, sizeof(Class1)); F.s1 = ts_obj(&sobj1);\n");   // a stack object: its address in a frame slot
+    c.push_str("  senv2[0] = v1;\n  ts_init_fn_stack(&sfn2, (ts_code)fn_12_use, senv2, 1, 1);\n  F.s1 = ts_func_v(&sfn2);\n");   // a stack closure: a value points at both
     c.push_str("  double _md1 = (double)d7; double _md1b = (double)d8; if (_md1 == _md1b) {\n    v6 = ts_num(_md1);\n  }\n");   // a modulo's operands, then its test
     c.push_str(extra);
     c.push_str("  hobj0->f0 = v1;\n  d8 = (double)d7;\n  F.s1 = fn_12_use(v6);\n");
@@ -219,6 +221,8 @@ fn main() {
     ck("init: a variable whose address is taken lives on the caller's stack", all_parts.contains("ts_gc_root(&mi__s->v10)") && !all_parts.contains("tsv v10 = TS_UNDEFINED;"));
     ck("init: a stack object lives on the caller's stack", all_parts.contains("F.s1 = ts_obj(&mi__s->sobj1);") || all_parts.contains("mi__f->s1 = ts_obj(&mi__s->sobj1);"));
     ck("init: its struct type is a field of the shared struct", cu.contains(" Class1 sobj1;") && !all_parts.contains("Class1 sobj1;"));
+    ck("init: a stack closure and its environment array are fields of the shared struct", cu.contains(" ts_func sfn2;") && cu.contains(" tsv senv2[1];") && !all_parts.contains("ts_func sfn2;") && !all_parts.contains("tsv senv2[1];"));
+    ck("init: the closure is made through the struct", all_parts.contains("  mi__s->senv2[0] = mi__s->v1;") && all_parts.contains("  ts_init_fn_stack(&mi__s->sfn2, (ts_code)fn_12_use, mi__s->senv2, 1, 1);") && all_parts.contains("mi__f->s1 = ts_func_v(&mi__s->sfn2);"));
     ck("init: declarations sharing a line with a block start stay in one part", part_of("double _md1 = (double)").len() == 1 && part_of("double _md1 = (double)") == part_of("v6 = ts_num(_md1);"));
     ck("init: the frame through its pointer in the parts", !all_parts.contains("F.s") && all_parts.contains("mi__f->s1"));
     ck("init: the parts are noinline, hidden, and the struct types are the unit's", parts.values().all(|(f, _)| read(&d6, f).contains("typedef struct { ts_frame_hdr h; tsv s0; tsv s1; } mi__frame_")) && cu.contains("__attribute__((noinline, visibility(\"hidden\"))) void fn_11___module_init_d__part_"));

@@ -181,3 +181,43 @@ own.
   (`TSAOT_CONF_UNITS=1`, a low cold threshold and chunk size).
 - tsc-ts: outputs identical at 1, 4 and 10 checkers; the startup and compile
   A/B; the build time.
+
+## Update (Session 367): the split had stopped, and what the whole function cost
+
+tsc-ts's `--version` took 9.7 ms, against 6.4 after S1, and its build had no `init_*` unit: the module
+initialization was one cold function of 117,699 lines again. Nothing said so.
+
+- **Why.** A callback handed to a call at a module's top level is a closure the escape analysis puts
+  on the stack, and the emitter declares a function's stack cells at function scope
+  (`emit_stack_cell_decls`): `ts_func sfnN;` and, for the environment, `tsv senvN[1];`. The Node
+  library's `fs` module has such calls, so every program that imports it got them (40 in tsc-ts, and a
+  class instance). The split read the array as a declaration that ends the prologue, did not find the
+  frame on the next line, took the function for frameless, did not find its epilogue and kept it whole.
+- **The fix.** The prologue's arrays (`TYPE NAME[N];`, no initializer) are members of the shared
+  struct whatever their users, as the structs beside them are: a value made in one chunk points into
+  them and is used by a later one. The cells stay on the stack (the caller's), so nothing changes in
+  what the program does.
+- **It says so now.** When the split gives up on a module initialization the analyzer writes
+  `[units] <name> is not split into chunks and stays one cold function (c_units.rs:<line>)`;
+  `TSAOT_UNIT_SPLIT_LOG=1` says it for every cold function.
+- **What the whole function cost was more than its own code.** Compiled at `-O0` it keeps every one of
+  its 30 K locals in its frame, and that frame is under everything the program does: the conservative
+  scan of the C stack walked it at every collection, in the main process and in every process forked
+  from it (`gc_scan_stack_words`: 1.3% of a one-thread compile's samples, and what stale words kept
+  alive).
+
+| tsc-ts | whole | split |
+|---|---|---|
+| `--version`, wall (minimum of 25) | 9.7 ms | 8.2 ms (tsrs 3.0) |
+| `--version`, instructions / cycles | 87.5 M / 38.1 M | 80.2 M / 34.0 M |
+| resident at that point | 39 MB | 29 MB |
+| the binary | 48.3 MB | 39.1 MB |
+| the compiler project on one thread, instructions | 12.554 G | 12.257 G (-2.4%) |
+| cycles | 3.341 G | 3.280 G (-1.8%) |
+| peak memory | 444 MB | 433 MB |
+
+What is left of the start, measured in the same profile: the module initialization is 39% of the
+samples and the runtime it calls another 30%. It creates 5,528 function objects and stores 5,313 of
+them in module-level bindings, of which **126 are ever read** (`LoadGlobal`): a function that is only
+called directly needs no object. 5,009 of the closures have no other use than such a store. Removing
+a store to a binding nothing reads, and the closure with it, is the next step (S4).

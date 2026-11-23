@@ -111,6 +111,10 @@ Rust in §315; selfhost is kept as a performance metric).
   line is `TS_RT_SLOW_CALL` (`preserve_most`: every declaration must carry it, the convention is part of
   the call); a guard's failing side is written `TS_RT_UNLIKELY`. A returning call left in a hot function,
   taken or not, puts its live values in callee-saved registers that every call of the function saves.
+- **The module initialization's frame is under everything.** A build in units cuts it into chunks
+  (`docs/startup_design.md`); when the split gives up it stays one function compiled at `-O0`, whose
+  30 K locals the conservative stack scan then walks at every collection of every process (tsc-ts: 2.4%
+  of a compile, unnoticed for five sessions). The analyzer says `[units] ... is not split`: read it.
 - **`ts_to_num` is a raw bit reinterpretation (not ToNumber).** `undefined`→NaN matches JS, but
   `null`→NaN does not.
 - **Gate a new feature behind a single predictable branch** (e.g. `if (g_has_proxies && ...)`) = zero
