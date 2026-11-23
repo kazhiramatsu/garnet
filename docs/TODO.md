@@ -13519,9 +13519,25 @@ generated code. (4) The 6 ms to the entry.
   int-double conversions, double compares and moves between the register files **1.75%**, the frozen byte 0.4%. So a
   flow-sensitive number analysis (SSA) has under 2% to take in the checkers; guards up to 7%; frames are the largest single
   thing, and are inlining and splitting an early return off a large body, not SSA.
-- **In progress on `s367-ir-int`** (worktree `build/wt_ir`, not gated): integer returns for every directly called function
-  (assumed and refuted in the rounds of the store-proven fields, `INT_RETURNS`; `TSAOT_INT_RETURNS=0`), and `Atomics` results
-  as integers. tsc-ts without patch `0011`: 2,611 functions proven, the integer fields 291 -> 308 (`Scanner.pos`, `Symbol.id`
-  among them), one thread 12.978 -> 12.734 G (-1.88%), a default run -2.44%, reports identical. The rounds analyze every
-  candidate again each time: +20 s of analyzer time on tsc-ts, to be made incremental; the number fuzzers and the gates are
-  to run; `0011` goes when it lands.
+- **Integer returns, landed** (docs/int32_fields_design.md, "Integer returns"; fixture `numbers/integer_returns`): a function
+  whose every return is an integer value returns one whatever calls it, proven in the rounds of the store-proven fields
+  (`INT_RETURNS`, read by `infer_numeric_analysis` at a resolved call; `TSAOT_INT_RETURNS=0`), and `Atomics` results are
+  integers. tsc-ts without the four hand-written `| 0` (patch `0011`, removed: the sources stay upstream's): 2,611 functions
+  proven, the integer fields 291 -> 308, one thread 12.978 -> 12.734 G (-1.88%; the marks were -0.78%), a default run -2.44%.
+  The rounds re-analyze only what changed and keep the parameters' facts after the second round: the analyzer 23.7 -> 27.1 s
+  on tsc-ts (it was 31.0 before that). Unit, conformance 828 / 828 plain and strict, bundler, the number fuzzer 300 and the
+  statement fuzzer 200.
+- **Found by the number fuzzer, older than this session, open** (seed 5236, a trap at run time, exit 133, no output):
+  `function f0(p0: number): number { return (p0 << Math.max((256 | 0), p0)); }` and
+  `function f1(p0: number, p1: number, p2: number): number { return !(p0 >= 1 && p0 < 32) ? f0(p1) : (f1(p0 - 1, (~((1e21 % 5))), (p1 ^ (p2 / p1))) >>> ((-(p1)) + ((p2 as number) !== p2 ? p2 : p1))); }`
+  with `console.log(f1(1, 3, 4294967296))` (V8: 4294967295). `f0` alone and `f5` of the same program are right.
+- **Frames, measured further** (`build/s367/framefns.py`): the 14% of the checkers' samples on frame instructions are in
+  functions with real calls (0.33% in functions whose only calls are the runtime's slow paths), most in functions of 150 to
+  1,000 instructions with five to seven saved register pairs: `getAssignmentTarget` 0.69% of its 0.81%,
+  `tryGetTypeAtPosition` 0.63% of 0.73%. They return early most of the time and pay the whole frame. **Next, at the IR
+  level**: an entry that is the function's leading pure region (loads, tests, returns), where every path that would reach a
+  call or a store leaves by a call in tail position to the function in full; it has no frame. What tsc-ts did by hand for
+  `isSimpleTypeRelatedTo`, and what the scanner's dispatcher needs (the slow paths in place gave it a frame: patches' README).
+- **Not SSA yet** (Kaz asked): the numeric analysis is a flow-insensitive data flow (one fact a local), with interprocedural
+  fixpoints for parameters, returns and fields. A flow-sensitive one has the conversions' 1.75% and part of the guards' 5.6%
+  to take in the checkers; the frames come first.
