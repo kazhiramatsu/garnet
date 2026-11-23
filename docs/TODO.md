@@ -13506,4 +13506,22 @@ generated code. (4) The 6 ms to the entry.
 - **Found on the way**: generated functions carry stack protectors (Apple clang's default; 3 to 5% of `Scanner.scan`'s samples):
   `-fno-stack-protector` for the generated units is not measured yet, and is Kaz's call. The exporter's worker-entry rewrite
   rejects a top-level interface that names a class of the same module.
-- Gates: pending for this slice (the runtime changed: the full set).
+- Gates (`build/gates_s367g`, 27 steps, three jobs, nice 12, 94 minutes): unit, bundler 56, conformance 827 / 827 plain and
+  strict, 824 / 824 under the collector's protect mode, bench within budget, CI, the collector stress, hono / hono_app / vue
+  identical, tsc-ts built from the patches (r43) with one-thread outputs identical to r42's, the skeleton check, the protect
+  modes, eight default runs the same, and the corpus five ways at 6,537 of 6,537 (r42 against r43 on one thread; bodies left out
+  by force; their replacement failing by force; statements shared by force; arenas with `TSAOT_ARENA_CHECK=1` against none).
+  IR parity re-snapshotted (5,103 files): the 33 differences were the six fixtures that compile `lib/node/worker_threads.ts`.
+  r43 against r42, plain: a default run's processes 16.553 -> 15.812 G (-4.5%), one thread 13.298 -> 12.900 G (-3.0%).
+- **Where generated code spends its samples** (the checkers and forks of a default run, 244 K samples, 79% in generated code,
+  by the instruction a sample falls on; `build/s367/insnclass.py`): loads 22%, arithmetic and moves 19%, **frame set-up,
+  tear-down and return 14.8%**, stores 6.4%, a value's tag checks 5.2%, the pointer mask of an unboxing 4.8%, branches 4.4%,
+  int-double conversions, double compares and moves between the register files **1.75%**, the frozen byte 0.4%. So a
+  flow-sensitive number analysis (SSA) has under 2% to take in the checkers; guards up to 7%; frames are the largest single
+  thing, and are inlining and splitting an early return off a large body, not SSA.
+- **In progress on `s367-ir-int`** (worktree `build/wt_ir`, not gated): integer returns for every directly called function
+  (assumed and refuted in the rounds of the store-proven fields, `INT_RETURNS`; `TSAOT_INT_RETURNS=0`), and `Atomics` results
+  as integers. tsc-ts without patch `0011`: 2,611 functions proven, the integer fields 291 -> 308 (`Scanner.pos`, `Symbol.id`
+  among them), one thread 12.978 -> 12.734 G (-1.88%), a default run -2.44%, reports identical. The rounds analyze every
+  candidate again each time: +20 s of analyzer time on tsc-ts, to be made incremental; the number fuzzers and the gates are
+  to run; `0011` goes when it lands.
