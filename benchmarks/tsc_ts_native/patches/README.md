@@ -58,8 +58,10 @@ in tail position to the full scan; `exp/scan-dispatch`): +0.32% instructions on 
 calls are there, but the dispatcher has a frame of six register pairs all the same, because
 generated code calls its slow paths in place (`ts_truthy` for a boolean field, the throw of a store
 to a frozen object, a typed array read out of range), and a function with calls scattered in it
-saves its registers at the entry: a token that goes on to the full scan pays for two frames. To be
-measured again when those slow paths no longer ask for a frame.
+saves its registers at the entry: a token that goes on to the full scan pays for two frames.
+Measured again once the runtime's throws were declared as not returning and the slow halves kept the
+caller's registers (docs/c_for_the_compiler_design.md): -0.02%, neutral; the dispatcher still saves
+three pairs for the typed array read's slow half. Not a patch.
 
 `0007`: `SparseLinkTable.get` was 5.5 to 6.6% of the samples of every checker process, nearly all
 of them at the read of the map's index (a table as large as everything stored, read where the id's
