@@ -13527,6 +13527,12 @@ generated code. (4) The 6 ms to the entry.
   The rounds re-analyze only what changed and keep the parameters' facts after the second round: the analyzer 23.7 -> 27.1 s
   on tsc-ts (it was 31.0 before that). Unit, conformance 828 / 828 plain and strict, bundler, the number fuzzer 300 and the
   statement fuzzer 200.
+- **Gates of the integer returns** (`gates_s367h`, b432b5c, r44g against r43g): unit, bundler 56, conformance 828 / 828 plain
+  and strict, 825 / 825 protect, bench (correct and within budget), ci, GC stress, hono / hono_app / vue outputs identical,
+  the tsc-ts build with its reports identical under three option sets, its fixtures, and the corpus in its plain mode
+  6,537 / 6,537 identical. IR parity: identical 5,103, extra 6 (the new fixture; re-snapshot with the next one). The four
+  structural modes of the corpus (skeleton, forced split, arena) were stopped: they test who checks what, which an analyzer
+  change does not touch, and Kaz asked for the minimum of gates a slice (2026-11-23).
 - **Found by the number fuzzer, older than this session, open** (seed 5236, a trap at run time, exit 133, no output):
   `function f0(p0: number): number { return (p0 << Math.max((256 | 0), p0)); }` and
   `function f1(p0: number, p1: number, p2: number): number { return !(p0 >= 1 && p0 < 32) ? f0(p1) : (f1(p0 - 1, (~((1e21 % 5))), (p1 ^ (p2 / p1))) >>> ((-(p1)) + ((p2 as number) !== p2 ? p2 : p1))); }`
