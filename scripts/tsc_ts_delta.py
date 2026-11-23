@@ -193,15 +193,28 @@ def find_record(sha):
     return (best[1], best[2]) if best else (None, None)
 
 
+_garnet_key = None
+
+
 def garnet_key():
-    """What of garnet a build depends on: the commit, and the changes not committed."""
-    head = git('rev-parse', '--short=8', 'HEAD', cwd=ROOT)
-    paths = ['runtime', 'analyzer/src', 'exporter', 'lib', 'benchmarks/tsc_ts_native/garnet', 'scripts/build_tsc_ts_native.sh']
-    diff = subprocess.run(['git', '-C', ROOT, 'diff', 'HEAD', '--'] + paths, capture_output=True).stdout
-    untracked = subprocess.run(['git', '-C', ROOT, 'ls-files', '--others', '--exclude-standard', '--'] + paths, capture_output=True).stdout
-    if not diff and not untracked:
-        return head
-    return head + '+' + hashlib.sha1(diff + untracked).hexdigest()[:6]
+    """What of garnet a build depends on, by content: the runtime, the analyzer, the exporter, the libraries, the
+    driver and the build script as they are in the working tree, committed or not. (The analyzer and the exporter
+    are used as built: build them before an evaluation that follows a change to them.)"""
+    global _garnet_key
+    if _garnet_key is None:
+        paths = ['runtime', 'analyzer/src', 'exporter', 'lib', 'benchmarks/tsc_ts_native/garnet', 'benchmarks/tsc_ts_native/tsconfig.json',
+                 'scripts/build_tsc_ts_native.sh']
+        names = subprocess.run(['git', '-C', ROOT, 'ls-files', '-z', '--cached', '--others', '--exclude-standard', '--'] + paths,
+                               capture_output=True).stdout.split(b'\0')
+        h = hashlib.sha1()
+        for name in sorted(set(n for n in names if n)):
+            try:
+                with open(os.path.join(ROOT.encode(), name), 'rb') as f:
+                    h.update(name + b'\0' + hashlib.sha1(f.read()).digest())
+            except OSError:
+                pass
+        _garnet_key = h.hexdigest()[:10]
+    return _garnet_key
 
 
 def build(sha):
@@ -233,7 +246,7 @@ def build(sha):
         die(f'the build of {sha} failed (exit {rc}): {log}')
     os.rename(partial, out)
     print(f'  built {sha} in {time.time() - t0:.0f} s', file=sys.stderr)
-    return binary
+    return os.path.join(out, 'tsc-ts')
 
 
 def compile_project(binary, extra, one_thread, env=None, seconds=120):
@@ -251,6 +264,9 @@ def reports(binary):
     for name, extra in VARIANTS.items():
         for mode, one in (('one', True), ('default', False)):
             rc, so, se = compile_project(binary, extra, one)
+            # 0 nothing reported, 1 and 2 diagnostics: anything else is a build that does not run
+            if rc not in (0, 1, 2):
+                die(f'{binary} {name}/{mode}: exit {rc}: {se.strip()[-300:]}')
             text = f'exit {rc}\n{so}\n{se}'
             found[f'{name}/{mode}'] = {'sha': hashlib.sha1(text.encode()).hexdigest()[:12], 'lines': so.count('\n'), 'exit': rc}
     return found
@@ -267,8 +283,8 @@ def timed(binary, extra, one_thread, env=None):
     insn = re.search(r'(\d+)\s+instructions retired', se)
     cycles = re.search(r'(\d+)\s+cycles elapsed', se)
     real = re.search(r'([\d.]+) real', se)
-    if not insn or not cycles:
-        die(f'no counts from {binary} (exit {rc})')
+    if not insn or not cycles or int(insn.group(1)) < 100_000_000:
+        die(f'no counts from {binary} (exit {rc}): {se.strip()[-300:]}')
     return int(insn.group(1)), int(cycles.group(1)), float(real.group(1)) if real else 0.0, se
 
 
