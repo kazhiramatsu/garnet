@@ -1,0 +1,60 @@
+Four stores marked as integers: the scanner's position after a line comment, the id chunks, a symbol's id
+
+A native build keeps a number field as an integer where every store to it is one it can prove an
+integer (scriptc and garnet both: the `| 0` of this file's hot paths). Four stores were not: the
+scanner's position from `lineCommentEnd` (a method's result), the first id of a chunk from
+`Atomics.add` (twice), and a symbol's id from `takeSymbolId`. With one unproven store the field is
+a double everywhere: under garnet `Scanner.pos` was converted at every token, and `Symbol.id` at
+every link table lookup. Each of the four values is an int32 already; `| 0` says so.
+
+The compiler project under garnet: 13.025 -> 12.931 G instructions on one thread (-0.72%). The
+corpus: 6,537 of 6,537 cases identical.
+
+diff --git a/packages/tsc-ts/src/compiler/ast.ts b/packages/tsc-ts/src/compiler/ast.ts
+index fb314c0..8bd1aa2 100644
+--- a/packages/tsc-ts/src/compiler/ast.ts
++++ b/packages/tsc-ts/src/compiler/ast.ts
+@@ -19,7 +19,7 @@ let nodeIdCounter: Int32Array | undefined = undefined;
+ const nodeIdChunk = 16384;
+ 
+ function takeNodeIdChunk(): number {
+-  const base = Atomics.add(nodeIdCounter!, 0, nodeIdChunk);
++  const base = Atomics.add(nodeIdCounter!, 0, nodeIdChunk) | 0;
+   lastNodeId = base + 1;
+   nodeIdLimit = base + nodeIdChunk;
+   return lastNodeId;
+diff --git a/packages/tsc-ts/src/compiler/scanner.ts b/packages/tsc-ts/src/compiler/scanner.ts
+index aa5314a..c1a6c46 100644
+--- a/packages/tsc-ts/src/compiler/scanner.ts
++++ b/packages/tsc-ts/src/compiler/scanner.ts
+@@ -1154,7 +1154,7 @@ export class Scanner {
+         case CharacterCodes.slash: {
+           const next = chars[this.pos + 1] | 0;
+           if (next === CharacterCodes.slash) {
+-            const pos = this.lineCommentEnd((this.pos + 2) | 0);
++            const pos = this.lineCommentEnd((this.pos + 2) | 0) | 0;
+             this.pos = pos;
+             this.processCommentDirective(this.tokenStart, pos, false);
+             if (this.skipTrivia) continue;
+diff --git a/packages/tsc-ts/src/compiler/symbol.ts b/packages/tsc-ts/src/compiler/symbol.ts
+index bcc8510..8950887 100644
+--- a/packages/tsc-ts/src/compiler/symbol.ts
++++ b/packages/tsc-ts/src/compiler/symbol.ts
+@@ -284,7 +284,7 @@ function takeSymbolId(): number {
+ }
+ 
+ function takeSymbolIdChunk(): number {
+-  const base = Atomics.add(symbolIdCounter!, 0, symbolIdChunk);
++  const base = Atomics.add(symbolIdCounter!, 0, symbolIdChunk) | 0;
+   nextSymbolId = base + 1;
+   symbolIdLimit = base + symbolIdChunk;
+   return nextSymbolId;
+@@ -349,7 +349,7 @@ function byEscapedName(table: SymbolTable | undefined): Map<__String, PublicSymb
+ export function getSymbolId(symbol: Symbol): number {
+   let id = symbol.id;
+   if (id === 0) {
+-    id = takeSymbolId();
++    id = takeSymbolId() | 0;
+     symbol.id = id;
+   }
+   return id;

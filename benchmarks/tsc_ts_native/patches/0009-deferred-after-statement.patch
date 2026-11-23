@@ -1,0 +1,113 @@
+A deferred node is checked right after the statement around it, where statements are shared
+
+A checker defers the bodies of function expressions and the like to the end of the file. Where a
+container's statements are shared with forks, each process was left at the end with what its own
+statements had deferred: one fork with ten times another's, the checker with what 500 statements
+queued before the first fork, and nothing to even them out while the others waited. A process now
+checks the deferred nodes of a statement right after it (`checkOwnDeferred`): they are part of the
+statement's share. A node reached in a statement the process has not taken (inferring a return
+type) waits for that statement (`StatementSplit.waiting`): if the process takes it later the node
+is checked then, and otherwise it is its taker's, which reaches it itself. A fork keeps what the
+checker left waiting, since those nodes are in the set of the nodes queued so far.
+
+The compiler project, 15 alternating runs, medians: the forks' shares done over 6.5 ms where it was
+9.0, from the first share done to the exit 9.0 ms where it was 10.2. The corpus with statements
+shared by force three ways (3 forks from statement 2 with fork 2 failing, 2 forks from the first
+statement, 3 forks from statement 5 with fork 1 failing): 6,537 of 6,537 cases identical each.
+
+diff --git a/packages/tsc-ts/src/compiler/checker-split.ts b/packages/tsc-ts/src/compiler/checker-split.ts
+index 938a4a5..80e3255 100644
+--- a/packages/tsc-ts/src/compiler/checker-split.ts
++++ b/packages/tsc-ts/src/compiler/checker-split.ts
+@@ -22,9 +22,13 @@
+ //   nodes, deferred iteration errors and collision checks, renamed binding elements) and with the
+ //   set of the deferred nodes queued so far, so none of them is checked twice or dropped.
+ // - A deferred node belongs to the process that takes the statement around it, which reaches it
+-//   while it checks the statement. A fork leaves the nodes it reached in other statements (inferring
+-//   a return type) to their processes; the checker checks all it queued, what it queued before its
+-//   first fork as soon as that fork is started.
++//   while it checks the statement, and checks it right after the statement (`checkOwnDeferred`):
++//   at the end of the file each process would be left with what its own statements queued, some
++//   with ten times what others have, and nothing to even it out. A node a process reached in
++//   another statement (inferring a return type) waits for that statement: if the process, or a fork
++//   started after it, takes the statement later, the node is checked then (a process queues a node
++//   once), and otherwise it is its taker's, which reaches it itself. What the checker queued before
++//   its first fork is its own, checked as soon as that fork is started.
+ // - A run of unreachable statements is reported by the process that takes its first statement.
+ // - A check that a checker runs once for a symbol, at the first of its declarations it checks, and
+ //   reports there (an interface's inherited properties), runs at the first of the declarations among
+@@ -82,6 +86,11 @@ export class StatementSplit {
+   forks = 0;
+   /** Whether this process took each statement. */
+   mine: Uint8Array;
++  /**
++   * The deferred nodes this process reached in statements it had not taken, by statement: checked
++   * when it takes the statement (`checkOwnDeferred`), or when it takes over a fork's (`checkFailedShare`).
++   */
++  waiting: (Node[] | undefined)[] = [];
+   /** `Checker.withinUnreachableCode` where the container's statements are checked. */
+   readonly withinUnreachableCode: boolean;
+   /** Where the shared statements start in the file's text. */
+@@ -249,7 +258,38 @@ function takeStatements(split: StatementSplit): void {
+     Atomics.store(board, 1 + k, split.self + 1);
+     split.mine[k] = 1;
+     checkTakenStatement(split.c, statements, k);
++    checkOwnDeferred(split, k);
++  }
++}
++
++/**
++ * Checks the deferred nodes that are this process's after it took statement `k`: those the statement
++ * queued, those of the statement that were reached before it was taken, and for the checker those
++ * outside the container's statements. The nodes of other statements wait for theirs (`waiting`).
++ */
++function checkOwnDeferred(split: StatementSplit, k: number): void {
++  const c = split.c;
++  const waiting = split.waiting;
++  const earlier = k < waiting.length ? waiting[k] : undefined;
++  if (earlier !== undefined) {
++    waiting[k] = undefined;
++    for (const node of earlier) checkDeferredNode(c, node);
++  }
++  const nodes = c.nodeLinks(split.file).deferredNodes;
++  if (nodes === undefined) return;
++  // Deferred checks may defer more nodes.
++  for (let i = 0; i < nodes.length; i++) {
++    const node = nodes[i]!;
++    const j = split.statementAround(node);
++    if (j < 0 ? split.self === 0 : split.mine[j] === 1) checkDeferredNode(c, node);
++    else if (j >= 0) {
++      while (waiting.length <= j) waiting.push(undefined);
++      const list = waiting[j];
++      if (list === undefined) waiting[j] = [node];
++      else list.push(node);
++    }
+   }
++  nodes.length = 0;
+ }
+ 
+ function checkTakenStatement(c: Checker, statements: readonly Node[], k: number): void {
+@@ -295,10 +335,11 @@ export function checkForkShare(index: number): StatementSplit {
+   c.deferredCollisionChecks = [];
+   c.renamedBindingElementsInTypes.length = 0;
+   c.diagnostics.startLog();
++  // It keeps what the checker left waiting (`StatementSplit.waiting`): a node the checker reached in a
++  // statement nobody had taken is in the set of the nodes queued so far, so this fork would not queue
++  // it again if it takes the statement.
+   takeStatements(split);
+-  // Deferred checks may defer more nodes. Those of other statements are checked with their statements.
+-  const nodes = links.deferredNodes;
+-  if (nodes !== undefined) for (let i = 0; i < nodes.length; i++) if (split.owns(nodes[i]!)) checkDeferredNode(c, nodes[i]!);
++  // Its deferred nodes were checked with its statements (`checkOwnDeferred`).
+   const renamed = c.renamedBindingElementsInTypes;
+   let kept = 0;
+   for (const element of renamed)
+@@ -334,6 +375,8 @@ export function checkFailedShare(split: StatementSplit, index: number): void {
+     Atomics.store(board, 1 + k, 1);
+     split.mine[k] = 1;
+     checkTakenStatement(c, statements, k);
++    // with the nodes of the statement that the checker reached while the fork had it
++    checkOwnDeferred(split, k);
+   }
+   c.withinUnreachableCode = saveWithinUnreachableCode;
+   checkDeferredNodes(c, file);

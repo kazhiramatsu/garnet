@@ -1379,6 +1379,39 @@ static tsv nh_spawn_worker(tsv* a, int n){
   ts_worker_on_exit(id, nh_arg(a, n, 5));
   return ts_num((double)id);
 }
+/* spawnWorkers(entries, datas, shared, youngMb): the workers started together (ts_workers_start_together); their ids */
+static tsv nh_spawn_workers(tsv* a, int n){
+  tsv entries = nh_arg(a, n, 0), datas = nh_arg(a, n, 1), shared = nh_arg(a, n, 2), young = nh_arg(a, n, 3);
+  if (!ts_is_array(entries) || !ts_is_array(datas) || !ts_is_array(shared) || !ts_is_array(young)) ts_throw_type_error_msg("spawnWorkers: four arrays are expected");
+  uint32_t count = ts_array_len(entries);
+  if (ts_array_len(datas) != count || ts_array_len(shared) != count || ts_array_len(young) != count) ts_throw_type_error_msg("spawnWorkers: the arrays differ in length");
+  tsv out = ts_new_array(0);
+  if (!count) return out;
+  ts_gc_root(&out);
+  tsv* es = (tsv*)calloc(count, sizeof *es); tsv* ds = (tsv*)calloc(count, sizeof *ds);
+  int* sh = (int*)calloc(count, sizeof *sh); uint32_t* ym = (uint32_t*)calloc(count, sizeof *ym); int* ids = (int*)calloc(count, sizeof *ids);
+  if (!es || !ds || !sh || !ym || !ids) ts_abort_msg("out of memory starting workers");
+  for (uint32_t i = 0; i < count; i++){
+    es[i] = ts_array_get(entries, i); ds[i] = ts_array_get(datas, i);
+    sh[i] = ts_truthy(ts_array_get(shared, i));
+    tsv y = ts_array_get(young, i);
+    double mb = ts_is_num(y) ? ts_to_num(y) : 0;
+    ym[i] = mb >= 1 && mb <= 65536 ? (uint32_t)mb : 0u;
+  }
+  ts_workers_start_together((int)count, es, ds, sh, ym, ids);
+  for (uint32_t i = 0; i < count; i++) ts_array_push(out, ts_num((double)ids[i]));
+  free(es); free(ds); free(sh); free(ym); free(ids);
+  ts_gc_unroot(1);
+  return out;
+}
+/* workerHandlers(id, onMessage, onError, onExit): the handlers of a worker started with others */
+static tsv nh_worker_handlers(tsv* a, int n){
+  int id = (int)nh_num(a, n, 0, 0);
+  ts_worker_on_message(id, nh_arg(a, n, 1));
+  ts_worker_on_error(id, nh_arg(a, n, 2));
+  ts_worker_on_exit(id, nh_arg(a, n, 3));
+  return TS_UNDEFINED;
+}
 static tsv nh_send_to_worker(tsv* a, int n){ ts_worker_send((int)nh_num(a, n, 0, 0), nh_arg(a, n, 1)); return TS_UNDEFINED; }
 static tsv nh_kill_worker(tsv* a, int n){ ts_worker_kill((int)nh_num(a, n, 0, 0)); return TS_UNDEFINED; }
 static tsv nh_worker_ref(tsv* a, int n){ ts_worker_ref((int)nh_num(a, n, 0, 0), ts_truthy(nh_arg(a, n, 1))); return TS_UNDEFINED; }
@@ -1554,6 +1587,8 @@ static void ts_garnet_node_global_init(tsv global){
   nh_method(host, "threadId", nh_thread_id, 0);
   nh_method(host, "workerData", nh_worker_data, 0);
   nh_method(host, "spawnWorker", nh_spawn_worker, 7);
+  nh_method(host, "spawnWorkers", nh_spawn_workers, 4);
+  nh_method(host, "workerHandlers", nh_worker_handlers, 4);
   nh_method(host, "sendToWorker", nh_send_to_worker, 2);
   nh_method(host, "killWorker", nh_kill_worker, 1);
   nh_method(host, "workerRef", nh_worker_ref, 2);

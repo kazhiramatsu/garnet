@@ -1354,6 +1354,7 @@ tsv  ts_new_shared_array_buffer(uint32_t n);   /* a store in shared memory */
    terminate() and ref/unref; the child's postMessage. */
 int  ts_worker_start(tsv entry, tsv data, int shared);   /* the worker's id; the child never returns */
 int  ts_worker_start_limits(tsv entry, tsv data, int shared, uint32_t young_mb);   /* with its young budget in MiB (0: the default) */
+void ts_workers_start_together(int n, tsv* entries, tsv* datas, const int* shared, const uint32_t* young_mb, int* ids);   /* n workers through one fork of the caller */
 void ts_worker_set_start(tsv fn);              /* the child calls fn(entry, data, id) instead of entry(data) */
 void ts_worker_on_message(int id, tsv fn);
 void ts_worker_on_error(int id, tsv fn);
@@ -2641,6 +2642,8 @@ tsv  ts_make_class_value_cells_once(uint32_t class_id, ts_code ctor, tsv* env, u
 void ts_set_fn_prototype_lazy(tsv fn);
 void ts_gc_collect(void);             /* full mark/sweep over the dynamic heap */
 void ts_gc_collect_young(void);       /* minor collection of young objects */
+void ts_arena_begin(void);            /* garnet:arena (docs/arena_design.md): what is allocated until ts_arena_end is kept untraced */
+void ts_arena_end(void);
 int  ts_gc_debug_cell_live(tsv v);    /* tests: does v still name an allocated cell? */
 void ts_gc_debug_log_young(void);    /* tests: log every young cell (for the probe) */
 void ts_gc_root(tsv* slot);           /* register a root (stack slot address) */

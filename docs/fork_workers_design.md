@@ -354,3 +354,54 @@ written.
 
 A design that needs this stays garnet's: under Node the same `startThreads` is called without the
 flag and a checker shares nothing.
+
+## Update (Session 367): workers started together
+
+Started one after another, every worker keeps the thread that starts it for most of a millisecond:
+the fork itself (page tables in proportion to what the process has mapped: 0.3 ms for a main thread
+of 60 MB, 0.8 ms for a checker of 400 MB in the middle of a file), a young collection before each
+shared worker, and the program's own code between two. tsc-ts starts ten parse threads, then ten
+checkers, then a checker starts a fork of itself for each processor that falls idle: 8 ms before the
+last parse thread exists, 6.5 ms in which the checker of the largest file forks instead of checking.
+
+`ts_workers_start_together(n, entries, datas, shared, young_mb, ids)` starts n workers at the cost of
+one fork to their parent. The process forks once, a **starter**, which is the process as it is with
+nothing to do but fork the n workers, one after the other with nothing in between, close its copies
+of their pipes and wait for them. Everything a worker needs of its parent is made before the starter
+is: the one young collection (every live cell is old before the first shared worker exists), each
+shared worker's region and shape ids, each worker's two pipes and its watch.
+
+- **The workers are the starter's children**, not the parent's: `waitpid` in the parent would not
+  find them. A batch has an array of slots in memory mapped shared before the fork
+  (`worker_slot`: pid, wait status, done), which the starter fills: a slot's pid when it has forked
+  the worker, its status when `waitpid(-1)` returns it. The parent reads a worker's status when its
+  pipe ends (the starter has it within microseconds of the worker's exit; a second without it, the
+  starter having been killed, is an exit whose status nobody has), reads its pid to signal it
+  (`terminate()`: within a millisecond or two of the start the slot may still be empty, and the
+  parent waits for it), and reaps the starter with the batch's last worker.
+- **A worker's end of a pipe is the only one.** The starter closes every pipe end it inherited once
+  the last worker has its own; each worker closes the ends of the other workers of its batch, and
+  what its parent watched before (as a worker started alone does). A worker that is itself a
+  worker's child closes the pipes to its grandparent too.
+- **A fork that fails**: where the starter cannot fork a worker, the slot says an exit with code 1,
+  and the parent's `'exit'` handler sees that when the pipe ends, as for a worker that died at once.
+  Where the starter itself cannot be forked, every slot says so and the pipes' other ends are
+  closed: n workers that could not be started, each reported to its handlers, nothing aborted.
+- **What the children see** is the parent at the starter's fork: the n workers are siblings with the
+  same memory, whatever the parent did after.
+
+`node:worker_threads` (lib/node/worker_threads.ts): `new Worker(file, { start: false })` makes a worker
+that is not forked yet, `Worker.startTogether(workers)` starts those among `workers` that wait, and
+`postMessage` before that queues the message for the start; `terminate()` of a worker that was never
+started ends it with code 1. Node has neither: it ignores the option and starts the worker in the
+constructor, and a program calls `Worker.startTogether?.(workers)`, which does nothing there, so the
+same source runs under both. Fixture `node/worker_together` (eight workers together, one throwing,
+one exiting with a code, one terminated while it waits, one idle; four shared workers that publish;
+a batch of one and an empty one; Node agrees).
+
+Measured on the TypeScript compiler project (`TSAOT_FORK_TRACE=1` prints `[fork] 8 workers together,
+starter <pid>: ... fork() 0.37 ms`): the root files are queued at 8.6 ms from the executable's load
+where they were at 13.8 (plain build, minimum of 15 runs), the checkers start 5 ms earlier, and a
+checker that shares a file with nine forks gives one fork's time to starting them. The starter's
+last forks lag under load (the tenth worker of a batch has started 5 ms after the first in a run on a
+busy machine): the workers start one after another either way, and what is saved is their parent.

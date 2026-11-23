@@ -131,6 +131,11 @@ export interface GarnetNodeHost {
    *  MiB (resourceLimits.maxYoungGenerationSizeMb), 0 for the default. The worker's id. */
   spawnWorker(entry: unknown, data: unknown, shared: boolean, onMessage: (value: unknown) => void,
               onError: (error: unknown) => void, onExit: (code: number) => void, youngMb: number): number;
+  /** The same for several workers at once, through one fork of this process (`Worker.startTogether`):
+   *  the entries, the data, whether each is shared and its young budget; their ids. A worker's
+   *  handlers are set with `workerHandlers` before this process returns to its event loop. */
+  spawnWorkers(entries: unknown[], datas: unknown[], shared: boolean[], youngMb: number[]): number[];
+  workerHandlers(id: number, onMessage: (value: unknown) => void, onError: (error: unknown) => void, onExit: (code: number) => void): void;
   sendToWorker(id: number, value: unknown): void;
   /** SIGTERM to the worker; its exit handler then runs with code 1. */
   killWorker(id: number): void;

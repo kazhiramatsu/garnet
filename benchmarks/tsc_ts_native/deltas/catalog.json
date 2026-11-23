@@ -6,7 +6,7 @@
     {
       "id": "enum-members",
       "title": "Two enum members of different values answered before the rules for simple types",
-      "status": "in-progress",
+      "status": "landed",
       "tsrs": {
         "notes": [
           "notes/perf-simple-relation-enum-members.md"
@@ -23,7 +23,15 @@
         ],
         "probe": "isSimpleTypeRelatedTo|sameLiteralValue|isTypeRelatedTo_d"
       },
-      "exactness": "Both flag words are exactly NumberLiteral|EnumLiteral (or StringLiteral|EnumLiteral): the one rule that relates two enum members asks for equal values, every other rule needs a flag neither has. Pure early return."
+      "exactness": "Both flag words are exactly NumberLiteral|EnumLiteral (or StringLiteral|EnumLiteral): the one rule that relates two enum members asks for equal values, every other rule needs a flag neither has. Pure early return.",
+      "patch": "0010-enum-members",
+      "result": {
+        "commit": "4e38b4b5a09f",
+        "one_thread": 0.9775,
+        "default_run": 0.9779,
+        "corpus": "full",
+        "date": "2026-11-23 14:22"
+      }
     },
     {
       "id": "flow-memo",

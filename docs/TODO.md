@@ -13457,3 +13457,53 @@ started together as a tree of forks would take a tenth of that. (2) The same laz
 create 311 K types where two create 140 K. A schedule that lets a first checker warm up before the others are forked from it
 idles nine processors meanwhile, which by the arithmetic costs what it saves (not built). (3) The cost of an operation in
 generated code. (4) The 6 ms to the entry.
+
+**Seventh slice: workers started together, tsrs's first delta, `garnet:arena`, and a harness for the deltas** (tsc-ts's patches
+`0008` to `0012`; Kaz, 2026-11-23: both fronts, tsrs's strategies into tsc-ts as deltas, not a port of tsrs).
+
+- **Where tsrs is** (the same project, one thread, its no-PGO build): 4.9 G instructions and 0.35 s against 13.3 G and 1.0 s;
+  parse 36 ms against 163 (4.5x), bind 20 against 49, check 291 against 684 (2.35x). Its default run is 5.6 G and 0.15 to 0.17 s
+  (four checkers, bound by checker.ts on one thread); ours is 16.2 G on every processor. Porting tsrs whole to TypeScript was
+  weighed and dropped: what Rust gives it does not come along.
+- **Workers started together** (`ts_workers_start_together`, `Worker.startTogether`, `{ start: false }`;
+  docs/fork_workers_design.md, the last update; fixture `node/worker_together`; patch `0008`): one fork of the caller, a starter,
+  forks the n workers; their pids and wait statuses come back through slots mapped shared. The root files are queued at 8.6 ms
+  where it was 13.8, the checkers start 5 ms earlier. A starter that cannot be forked reports n workers that failed to start.
+- **A deferred node after its statement** (`0009`): where statements are shared, each process checks what a statement deferred
+  right after it; the forks' shares end over 6.5 ms where it was 9.0. Forced forks, three ways: 6,537 of 6,537 each.
+- **`scripts/tsc_ts_delta.py` and `benchmarks/tsc_ts_native/deltas`** (the procedure, a catalog of 19 techniques from tsrs's
+  notes): `eval` builds a commit of the working copy and its parent (kept by the sources' tree and garnet's content), compares
+  the compiler project's reports under three option sets on one thread and in the default run, instructions on one thread and
+  summed over the default run's processes, the corpus (400 cases, or all, with the forced modes for a structural commit), and
+  writes a record and a verdict; `probe` gives a technique's upper bound from one thread's samples; `land` writes the patch and
+  the catalog entry. Four minutes for an experiment. One lock, nice 12, three jobs.
+- **The first delta, enum members** (`0010`, tsrs's -1.51% on its Compiler case): two enum members of different values are
+  unrelated before the rules for simple types. One thread 13.331 -> 13.032 G (-2.25%), a default run -2.21%.
+- **What the probes say of the rest** (share of one thread's samples in the functions each would shorten): the flow functions
+  5.2% (tsc-ts keeps one walk a reference key already; the delta is tsrs's table by flow node), union building 0.8%,
+  `getControlFlowContainer` 0.56%, the deprecation test 0.54%, type facts 0.47%, the property fallback 0.31%. The deltas are a
+  few percent in all on this project.
+- **Integer stores** (`0011`): garnet's store-proven integer fields need every store proven, and its integer facts stop at a
+  method's result (`return_facts` are the `_i64` candidates' only: no receiver, number parameters) and at `Atomics`. One
+  such store had `Scanner.pos` a double at every token, another `Symbol.id` at every link table lookup. Four `| 0`: one
+  thread -0.72%. **Not done, garnet's side**: an integer return fact for any directly called function, and `Atomics` on an
+  integer array (`TSAOT_INT_STORE_FIELDS_LOG=1` lists 226 refuted fields in tsc-ts).
+- **Why the parse is 4.5x tsrs's** (one thread, the parse phase's samples; 12.9 M characters, 1.05 M nodes): the scanner 27%
+  (46 instructions a character: 20 in the identifier loop with a hash multiply each, the position's double, a string view and
+  an intern a token), allocation 11% and the young collections of a tree that is all alive 13%, the grammar and the nodes'
+  constructors, parents and lists 20%, strings 10%, files 6%, line starts and the ASCII test 5%. About 2,100 instructions a
+  node against tsrs's 390. In the parse threads of a default run the collections' place was the publish's walk: 19%.
+- **`garnet:arena`** (docs/arena_design.md; `lib/garnet/arena.ts`, `ts_arena_begin` / `ts_arena_end`; fixtures `gc/arena_plain`,
+  `node/worker_arena`; patch `0012`): what the work allocates is kept untraced: at the arena's end every young cell is old
+  where it is, by the runs the size classes handed out (logged at the refills, from the process's first arena on), and in a
+  shared worker the arena's cells are published, so a publish stops at them. No collection inside. `TSAOT_ARENA_CHECK=1` walks
+  each published graph again and aborts on a cell of the worker that is not published (it found the one in tsc-ts: the
+  loader's options object, kept by each file). tsc-ts's parse thread reads, parses and binds a file in one: the parse threads
+  2.903 -> 2.562 G (-11.7%), every thread 16.207 -> 15.825 G (-2.35%), `ts_arena_end` 3.6% of their samples where the walk was 19%.
+- **Measured and not kept**: a container's heavy statements first (the forks then start colder: +5% instructions over the
+  checkers and forks, 6 ms later). Its variant (heavy statements first only among those shared, forks from inside a statement
+  and all at once) is equal in instructions and waits for a quiet machine (`exp/split-heavy` in the working copy).
+- **Found on the way**: generated functions carry stack protectors (Apple clang's default; 3 to 5% of `Scanner.scan`'s samples):
+  `-fno-stack-protector` for the generated units is not measured yet, and is Kaz's call. The exporter's worker-entry rewrite
+  rejects a top-level interface that names a class of the same module.
+- Gates: pending for this slice (the runtime changed: the full set).

@@ -27,6 +27,11 @@ export interface WorkerOptions {
   /** garnet: the worker is forked into a region the parent maps shared, so a graph it
    *  publishes (`garnet:shared`) reaches the parent by reference. Node ignores the key. */
   shared?: boolean;
+  /** garnet: with `false` the worker is not started by its constructor but by
+   *  `Worker.startTogether`, with the others given to it: one fork of this process instead of
+   *  one for each worker. Messages posted before that are delivered once it runs. Node ignores
+   *  the key, and starts the worker. */
+  start?: boolean;
 }
 export interface ResourceLimits { maxYoungGenerationSizeMb?: number; maxOldGenerationSizeMb?: number; codeRangeSizeMb?: number; stackSizeMb?: number }
 
@@ -106,9 +111,43 @@ export class BroadcastChannel extends EventEmitter {
 
 /** A forked process running the named module's top level with `isMainThread` false. */
 export class Worker extends EventEmitter {
-  readonly threadId: number;
+  threadId: number;
   private exited = false;
   private exitCode: number | null = null;
+  /** What a worker that waits for `startTogether` is started with, and the messages posted to it meanwhile. */
+  private pending: { entry: unknown; data: unknown; shared: boolean; youngMb: number } | undefined = undefined;
+  private queued: unknown[] = [];
+  /**
+   * garnet: starts the workers constructed with `start: false` among `workers`, together: this
+   * process is forked once, and that fork starts them, so the caller is back after one fork
+   * however many they are. Each sees this process's state as it is now. Node has no such
+   * function: `Worker.startTogether?.(workers)` runs under both.
+   */
+  static startTogether(workers: readonly Worker[]): void {
+    const waiting: Worker[] = [];
+    for (const w of workers) if (w.pending !== undefined && !w.exited) waiting.push(w);
+    if (waiting.length === 0) return;
+    const ids = host.spawnWorkers(
+      waiting.map((w) => w.pending!.entry),
+      waiting.map((w) => w.pending!.data),
+      waiting.map((w) => w.pending!.shared),
+      waiting.map((w) => w.pending!.youngMb),
+    );
+    for (let i = 0; i < waiting.length; i++) {
+      const w = waiting[i]!;
+      w.pending = undefined;
+      w.threadId = ids[i]!;
+      host.workerHandlers(
+        w.threadId,
+        (value: unknown) => { w.emit("message", value); },
+        (error: unknown) => { w.emit("error", error); },
+        (code: number) => { w.exited = true; w.exitCode = code; w.emit("exit", code); },
+      );
+      for (const value of w.queued) host.sendToWorker(w.threadId, value);
+      w.queued = [];
+      host.nextTick(() => { if (!w.exited) w.emit("online"); }, undefined);
+    }
+  }
   constructor(filename: string | URL, options?: WorkerOptions) {
     super();
     if (typeof filename !== "function") {
@@ -124,6 +163,12 @@ export class Worker extends EventEmitter {
     // reads the limits of an object and ignores anything else it is given.
     const limits: unknown = options?.resourceLimits;
     const youngMb: unknown = typeof limits === "object" && limits !== null ? (limits as ResourceLimits).maxYoungGenerationSizeMb : undefined;
+    if (options?.start === false) {
+      // started by `startTogether`
+      this.threadId = 0;
+      this.pending = { entry: filename, data: options.workerData, shared: options.shared === true, youngMb: typeof youngMb === "number" && youngMb >= 1 ? Math.floor(youngMb) : 0 };
+      return;
+    }
     this.threadId = host.spawnWorker(filename, options?.workerData, options?.shared === true,
       (value: unknown) => { this.emit("message", value); },
       (error: unknown) => { this.emit("error", error); },
@@ -133,18 +178,31 @@ export class Worker extends EventEmitter {
   }
   postMessage(value: unknown, _transferList?: unknown[]): void {
     if (this.exited) return;
+    if (this.pending !== undefined) {
+      this.queued.push(value);
+      return;
+    }
     host.sendToWorker(this.threadId, value);
   }
   /** SIGTERM; the promise resolves with the exit code (1 for a terminated worker, as Node). */
   terminate(): Promise<number> {
     if (this.exited) return Promise.resolve(this.exitCode as number);
+    if (this.pending !== undefined) {
+      // never started: it ends as a terminated worker does
+      this.pending = undefined;
+      this.queued = [];
+      this.exited = true;
+      this.exitCode = 1;
+      host.nextTick(() => { this.emit("exit", 1); }, undefined);
+      return Promise.resolve(1);
+    }
     return new Promise<number>((resolve) => {
       this.once("exit", (code: number) => resolve(code));
       host.killWorker(this.threadId);
     });
   }
-  ref(): void { if (!this.exited) host.workerRef(this.threadId, true); }
-  unref(): void { if (!this.exited) host.workerRef(this.threadId, false); }
+  ref(): void { if (!this.exited && this.pending === undefined) host.workerRef(this.threadId, true); }
+  unref(): void { if (!this.exited && this.pending === undefined) host.workerRef(this.threadId, false); }
   get performance(): { eventLoopUtilization(): { idle: number; active: number; utilization: number } } {
     return { eventLoopUtilization: () => ({ idle: 0, active: 0, utilization: 0 }) };
   }

@@ -474,6 +474,10 @@ start, sharing everything copy-on-write, exchanging messages over pipes.
   update): a worker whose heap ends with it can ask for one its whole run fits in. The other
   limits have no counterpart and are ignored, as is a `resourceLimits` that is not an object
   (Node ignores it too). Fixture `node/worker_young_generation`.
+- Workers started together (Session 367, docs/fork_workers_design.md, the last update): `new
+  Worker(file, { start: false })` waits, and `Worker.startTogether(workers)` starts those that wait
+  through one fork of the caller. Both are garnet's: Node ignores the option, and a program calls
+  `Worker.startTogether?.(workers)`. Fixture `node/worker_together`.
 - Not available (a TypeError that says so): `MessageChannel`, `MessagePort`
   of one's own, `BroadcastChannel`, `receiveMessageOnPort`,
   `moveMessagePortToContext`, `postMessageToThread`, `eval: true`, piped

@@ -499,7 +499,8 @@ def write_patches(names):
         name = names.get(number) or (os.path.basename(existing[0])[5:-6] if existing else None)
         if not name:
             die(f'no name for patch {number} ({git("log", "-1", "--format=%s", commit)}): --name {number}=<slug>')
-        text = git('log', '-1', '--format=%B', commit) + '\n' + git('diff', f'{commit}~1', commit, '--', 'packages/tsc-ts/src') + '\n'
+        # the message, a blank line, the diff (as `git log -1 --format=%B` and `git diff` write them)
+        text = git('log', '-1', '--format=%B', commit) + '\n\n' + git('diff', f'{commit}~1', commit, '--', 'packages/tsc-ts/src') + '\n'
         out = os.path.join(PATCHES, f'{number}-{name}.patch')
         if existing and existing[0] != out:
             die(f'patch {number} is {os.path.basename(existing[0])}: rename it by hand before it is written as {os.path.basename(out)}')
@@ -526,14 +527,17 @@ def cmd_land(args):
         # written on a branch of its own (`new`): it joins the patches' branch
         git('cherry-pick', sha)
         print(f'cherry-picked {sha} onto {head}')
-    count = len(git('rev-list', f'{c["upstream"]}..HEAD').split('\n'))
+    # the delta's patch is numbered by its commit's place above the upstream commit
+    commits = git('rev-list', '--reverse', '--abbrev-commit', '--abbrev=12', f'{c["upstream"]}..HEAD').split('\n')
+    place = next((i for i, x in enumerate(commits, 1) if tree(x) == tree(sha) and tree(f'{x}~1') == tree(f'{sha}~1')), len(commits))
     names = dict(n.split('=', 1) for n in args.name if '=' in n)
     for n in args.name:
         if '=' not in n:
-            names[f'{count:04d}'] = n
+            names[f'{place:04d}'] = n
     written = write_patches(names)
     d['status'] = 'landed'
-    d['patch'] = next((w[:-6] for w in written if w.startswith(f'{count:04d}-')), d.get('patch'))
+    found = sorted(glob.glob(os.path.join(PATCHES, f'{place:04d}-*.patch')))
+    d['patch'] = os.path.basename(found[0])[:-6] if found else d.get('patch')
     d['result'] = {'commit': sha, 'one_thread': round(r['one_thread']['instructions_ratio'], 4), 'default_run': round(r['default_run']['instructions_ratio'], 4),
                    'corpus': r['corpus_depth'], 'date': r['date']}
     save_catalog(c)

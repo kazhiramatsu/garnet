@@ -48,7 +48,7 @@ Rust in §315; selfhost is kept as a performance metric).
 - `runtime/ts_rt.c` … The shared runtime. A primary development target.
 - `runtime/regexp/` … garnet's regular expression engine (`docs/regexp_vm_design.md`): parser, bytecode
   compiler, backtracking VM, generated Unicode tables, and the adapter that owns the RegExp objects.
-- `lib/garnet/` … garnet's own modules (`garnet:shared`, `garnet:json`, `garnet:ndarray`, `garnet:metal`,
+- `lib/garnet/` … garnet's own modules (`garnet:shared`, `garnet:arena`, `garnet:json`, `garnet:ndarray`, `garnet:metal`,
   `garnet:llama`, `garnet:llama_metal`): TypeScript compiled with the program (the exporter maps `garnet:*`
   here); a `<name>_node.ts` beside one is the V8 oracle's polyfill (`scripts/garnet_scheme_loader.mjs`).
   The runtime side is a `__garnet*` host object in ts_rt.c (`runtime/node_host.c`, `runtime/metal_host.c`
@@ -161,6 +161,9 @@ Rust in §315; selfhost is kept as a performance metric).
   instance of one evaluation of a class in a function passes the checks of another. An element read
   before its initializer ran answers undefined (V8: a TypeError), and a frozen object's private field
   cannot be written.
+- An object made inside a shared worker's arena (`garnet:arena`, docs/arena_design.md) is frozen when the arena ends, whether a
+  `publish` reaches it or not (Node's polyfill freezes what `publish` reaches); an arena's cell that refers to a mutable cell the
+  worker made outside it hands that cell over unfrozen (`TSAOT_ARENA_CHECK=1` finds it).
 - `Request.signal` is the init's signal itself (Node: a fresh signal following it), and
   `ArrayBuffer.isView` does not recognize the library's `DataView` (docs/web_fetch_api_design.md).
 - Web Crypto (`docs/web_crypto_design.md`) provides digests and HMAC keys only: an RSA, ECDSA or AES key

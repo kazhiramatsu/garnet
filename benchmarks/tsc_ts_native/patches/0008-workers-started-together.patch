@@ -1,0 +1,164 @@
+The parse threads and the checker threads started together
+
+A host that starts a thread by forking the thread that starts it (garnet) keeps that thread for most
+of a millisecond a fork: ten parse threads were started over 8 ms in which the main thread queued
+nothing, and ten checkers over 5 ms more. `startThreads` takes a `together` function: where it is
+given, `spawn` makes threads that are not started, and the session that made them all hands them to
+it at once (garnet's `Worker.startTogether`: one fork of the caller, which forks them). A chunk posted
+to a thread that is not started yet reaches it once it runs. A checker thread that replaces one at
+its file limit is started alone.
+
+The TypeScript 6.0.3 compiler project, type check only, a plain build, 15 alternating runs,
+milliseconds from the executable's load (minimum / median): the root files queued 13.8 / 14.2 ->
+8.6 / 8.9, the other files parsed 40.0 / 44.0 -> 35.2 / 38.5, the checkers started 44.3 / 48.6 ->
+39.4 / 42.8, exit 235.7 / 245.2 -> 233.8 / 239.7. What the compiler reports is unchanged.
+
+diff --git a/packages/tsc-ts/src/compiler/parallel-check.ts b/packages/tsc-ts/src/compiler/parallel-check.ts
+index 1e4b29f..ed3c7bc 100644
+--- a/packages/tsc-ts/src/compiler/parallel-check.ts
++++ b/packages/tsc-ts/src/compiler/parallel-check.ts
+@@ -95,6 +95,12 @@ export type CheckerSpawn = (
+ export class ParallelCheck {
+   /** Set where checker threads can be started. */
+   spawn: CheckerSpawn | undefined = undefined;
++  /**
++   * Starts the threads `spawn` made, together, where a host can start several at the cost of one
++   * (`startThreads`): `spawn` then returns threads that are not started. Undefined where `spawn`
++   * starts each thread itself.
++   */
++  together: ((workers: readonly Worker[]) => void) | undefined = undefined;
+   /** Where checkers write the files they emit (`checkersEmit`); set where they can write files. */
+   writer: OutputWriter | undefined = undefined;
+   /**
+@@ -2126,7 +2132,7 @@ export function startParallelCheck(
+     if (remaining === 0 && ownDone) finish();
+   };
+   const diagnosticFiles = new Map<string, DiagnosticFile>();
+-  const spawn = (i: number, reserved: number[]): void => {
++  const spawn = (i: number, reserved: number[]): Worker => {
+     const worker = parallelCheck.spawn!(
+       shared ? program : undefined,
+       i,
+@@ -2151,8 +2157,10 @@ export function startParallelCheck(
+         record(revival === undefined ? publish(result) : revival.result(result));
+       }
+       // A thread at its file limit hands its schedule index to a new one.
+-      if (result.more) spawn(i, result.reserved);
+-      else threadDone();
++      if (result.more) {
++        const next = spawn(i, result.reserved);
++        if (parallelCheck.together !== undefined) parallelCheck.together([next]);
++      } else threadDone();
+     });
+     worker.on('error', (error: unknown) => {
+       if (trace) process.stderr.write(`checkers: thread ${i} failed: ${String(error)}\n`);
+@@ -2160,8 +2168,12 @@ export function startParallelCheck(
+       if (String(error).includes(bodyMisplaced)) compileAgainInFull(workers);
+       threadDone();
+     });
++    return worker;
+   };
+-  for (let i = firstThread; i < count; i++) spawn(i, []);
++  const first: Worker[] = [];
++  for (let i = firstThread; i < count; i++) first.push(spawn(i, []));
++  // One after another, each checker starts most of a millisecond after the one before it.
++  if (parallelCheck.together !== undefined) parallelCheck.together(first);
+   mark('checkers spawned');
+   // Without a shared program, this thread's checker (`CheckedProgram.checker`) merges the globals
+   // while the threads start.
+diff --git a/packages/tsc-ts/src/compiler/parallel-parse.ts b/packages/tsc-ts/src/compiler/parallel-parse.ts
+index 680645f..4b555d4 100644
+--- a/packages/tsc-ts/src/compiler/parallel-parse.ts
++++ b/packages/tsc-ts/src/compiler/parallel-parse.ts
+@@ -142,6 +142,12 @@ export type ParserSpawn = (
+ export class ParallelParse {
+   /** Set where parse threads can be started and share what they parse (scriptc builds). */
+   spawn: ParserSpawn | undefined = undefined;
++  /**
++   * Starts the threads `spawn` made, together, where a host can start several at the cost of one
++   * (`startThreads`): `spawn` then returns threads that are not started, and a chunk posted to one
++   * reaches it once it runs. Undefined where `spawn` starts each thread itself.
++   */
++  together: ((workers: readonly Worker[]) => void) | undefined = undefined;
+   /** Prepared files by file name, taken by the FileLoader. */
+   readonly files = new Map<string, PreparedFile>();
+   /** Files the FileLoader took, found with other parse inputs, and did not find. */
+@@ -513,6 +519,8 @@ export class ParseSession {
+       const chunk = queue.next(count, true);
+       if (chunk !== undefined) this.post(this.idle.pop()!, chunk);
+     }
++    // Started one after another, ten threads keep this thread 8 ms before it reads the first root file.
++    if (parallelParse.together !== undefined) parallelParse.together(this.workers);
+     mark('parse threads spawned');
+     this.dispatch();
+   }
+diff --git a/packages/tsc-ts/src/compiler/thread-entry.ts b/packages/tsc-ts/src/compiler/thread-entry.ts
+index b863462..ba4a51f 100644
+--- a/packages/tsc-ts/src/compiler/thread-entry.ts
++++ b/packages/tsc-ts/src/compiler/thread-entry.ts
+@@ -36,8 +36,11 @@ export interface ThreadDrivers {
+   parseThreadOfCommandLine(args: readonly string[], configFileName: string): ParseThread | undefined;
+ }
+ 
+-/** Starts a worker that runs `runThread(data)`. */
+-export type ThreadSpawn = (data: ThreadData) => Worker;
++/**
++ * Makes a worker that runs `runThread(data)`: started, or with `together` to be started with the other
++ * workers given to the `together` function of `startThreads`.
++ */
++export type ThreadSpawn = (data: ThreadData, together?: boolean) => Worker;
+ 
+ /** The `workerData` of a thread of tsc-ts. */
+ export type ThreadData = CheckerThreadData | ParseThreadData | ReferenceThreadData | SplitThreadData;
+@@ -90,27 +93,36 @@ export function startThreads(
+   drivers: ThreadDrivers,
+   args: readonly string[],
+   forks: boolean = false,
++  together: ((workers: readonly Worker[]) => void) | undefined = undefined,
+ ): void {
+   parallelCheck.writer = drivers.outputWriter();
+   if (forks) parallelCheck.fork = (index) => spawn({ kind: 'split', index });
++  // Where the threads of one kind can be started together (`together`), the parse threads and the
++  // checker threads are made unstarted and started by the session that made them all.
++  parallelCheck.together = together;
++  parallelParse.together = together;
++  const unstarted = together !== undefined;
+   parallelCheck.spawn = (program, index, counter, order, nodeIds, symbolIds, reserved, emits, emitKinds, checking) =>
+-    spawn({
+-      kind: 'check',
+-      program,
+-      args,
+-      index,
+-      counter,
+-      order,
+-      nodeIds,
+-      symbolIds,
+-      reserved,
+-      emits,
+-      emitKinds,
+-      checking,
+-    });
++    spawn(
++      {
++        kind: 'check',
++        program,
++        args,
++        index,
++        counter,
++        order,
++        nodeIds,
++        symbolIds,
++        reserved,
++        emits,
++        emitKinds,
++        checking,
++      },
++      unstarted,
++    );
+   if (sharesPublishedGraphs) {
+     parallelParse.spawn = (configFileName, counter, index, skipBodies) =>
+-      spawn({ kind: 'parse', configFileName, args, counter, index, skipBodies });
++      spawn({ kind: 'parse', configFileName, args, counter, index, skipBodies }, unstarted);
+     // The main thread compares the files a reference thread that failed did not.
+     referenceThreads.spawn = (job) => {
+       const worker = spawn({ kind: 'references', job });

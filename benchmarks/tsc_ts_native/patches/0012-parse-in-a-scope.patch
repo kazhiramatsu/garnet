@@ -1,0 +1,138 @@
+A parse thread's work on a file in a scope of the host's
+
+What a parse thread makes of a file (its text, its tree, its symbols) all outlives the thread, and
+none of it is written after the file is published. A host can use that: garnet's arena keeps what
+is allocated inside it without tracing it and publishes it when it ends, so the publish of a batch
+no longer walks every node of every file (19% of the parse threads' time). `startThreads` takes the
+host's scope function, and `PreparingHost` reads, parses and binds a file inside it
+(`ParallelParse.scope`; TSC_TS_ARENA=0 for none under any host). The file keeps its own copy of the
+loader's `ExternalModuleIndicatorOptions`, made with it: the one object a file referred to that the
+loader had made before (garnet's TSAOT_ARENA_CHECK found it).
+
+The compiler project under garnet, nine alternating runs of one build with and without: the parse
+threads' instructions 2.903 -> 2.562 G (-11.7%), every thread's 16.207 -> 15.825 G (-2.35%), the
+other files parsed at 38.0 ms where it was 40.7 (median). What the compiler reports is unchanged.
+
+diff --git a/packages/tsc-ts/src/compiler/parallel-parse.ts b/packages/tsc-ts/src/compiler/parallel-parse.ts
+index 4b555d4..0f207f9 100644
+--- a/packages/tsc-ts/src/compiler/parallel-parse.ts
++++ b/packages/tsc-ts/src/compiler/parallel-parse.ts
+@@ -148,6 +148,13 @@ export class ParallelParse {
+    * reaches it once it runs. Undefined where `spawn` starts each thread itself.
+    */
+   together: ((workers: readonly Worker[]) => void) | undefined = undefined;
++  /**
++   * Runs the work of a parse thread on one file (read, parse, bind) where the host keeps what such
++   * work allocates without tracing it, and hands it over without walking it (garnet's arenas): the
++   * file is published when the work returns. Undefined where a thread's allocations are the
++   * collector's as always (TSC_TS_ARENA=0 for that under any host).
++   */
++  scope: (<T>(work: () => T) => T) | undefined = undefined;
+   /** Prepared files by file name, taken by the FileLoader. */
+   readonly files = new Map<string, PreparedFile>();
+   /** Files the FileLoader took, found with other parse inputs, and did not find. */
+diff --git a/packages/tsc-ts/src/compiler/parse-thread.ts b/packages/tsc-ts/src/compiler/parse-thread.ts
+index 069e466..0353321 100644
+--- a/packages/tsc-ts/src/compiler/parse-thread.ts
++++ b/packages/tsc-ts/src/compiler/parse-thread.ts
+@@ -4,7 +4,7 @@
+  * returns their bound source files, published, with the files they add.
+  */
+ import { publish } from '@scriptc/threads';
+-import { type ExternalModuleIndicatorOptions, ParseOptions, ScriptKind, type SourceFile } from './ast.js';
++import { ExternalModuleIndicatorOptions, ParseOptions, ScriptKind, type SourceFile } from './ast.js';
+ import { bindSourceFile } from './binder.js';
+ import { useThreadTextCaches } from './diagnostics.js';
+ import { CompilerHost, FileLoader } from './file-loader.js';
+@@ -19,6 +19,7 @@ import {
+   PackageJsonLookups,
+   PreparedBatch,
+   PreparedFile,
++  parallelParse,
+ } from './parallel-parse.js';
+ import { parseSourceFile } from './parser.js';
+ import { mark, markAt, timeline } from './timeline.js';
+@@ -39,6 +40,31 @@ class PreparingHost extends CompilerHost {
+     fileName: string,
+     path: string,
+     externalModuleIndicatorOptions: ExternalModuleIndicatorOptions,
++  ): SourceFile | undefined {
++    // The file's text, tree and symbols are made in one scope of the host's, where it has one
++    // (`ParallelParse.scope`): they all outlive the thread, and nothing of them is written later.
++    const scope = parallelParse.scope;
++    const file = scope === undefined ? this.parsed(fileName, path, externalModuleIndicatorOptions) : scope(() => this.parsed(fileName, path, externalModuleIndicatorOptions));
++    if (file === undefined) return undefined;
++    const version = this.computesVersions ? computeHash(file.text) : '';
++    this.prepared.push(
++      new PreparedFile(
++        fileName,
++        path,
++        externalModuleIndicatorOptions.jsx,
++        externalModuleIndicatorOptions.force,
++        file,
++        version,
++      ),
++    );
++    return file;
++  }
++
++  /** The file read, parsed and bound. */
++  private parsed(
++    fileName: string,
++    path: string,
++    externalModuleIndicatorOptions: ExternalModuleIndicatorOptions,
+   ): SourceFile | undefined {
+     const t0 = timeline ? performance.now() : 0;
+     const text = this.fs.readFile(fileName);
+@@ -47,7 +73,12 @@ class PreparingHost extends CompilerHost {
+     const file = parseSourceFile(
+       fileName,
+       text,
+-      new ParseOptions(path, ScriptKind.Unknown, externalModuleIndicatorOptions),
++      // The file keeps its options: a copy made here, with the file, not the loader's object.
++      new ParseOptions(
++        path,
++        ScriptKind.Unknown,
++        new ExternalModuleIndicatorOptions(externalModuleIndicatorOptions.jsx, externalModuleIndicatorOptions.force),
++      ),
+       this.skipBodies > 0 && text.length >= this.skipBodies ? this.skipBodies : 0,
+     );
+     const t2 = timeline ? performance.now() : 0;
+@@ -65,17 +96,6 @@ class PreparingHost extends CompilerHost {
+           `file read ${(t1 - t0).toFixed(1)} parse ${(t2 - t1).toFixed(1)} bind ${(t3 - t2).toFixed(1)} ${text.length} ${fileName}`,
+         );
+     }
+-    const version = this.computesVersions ? computeHash(file.text) : '';
+-    this.prepared.push(
+-      new PreparedFile(
+-        fileName,
+-        path,
+-        externalModuleIndicatorOptions.jsx,
+-        externalModuleIndicatorOptions.force,
+-        file,
+-        version,
+-      ),
+-    );
+     return file;
+   }
+ }
+diff --git a/packages/tsc-ts/src/compiler/thread-entry.ts b/packages/tsc-ts/src/compiler/thread-entry.ts
+index ba4a51f..9e952d6 100644
+--- a/packages/tsc-ts/src/compiler/thread-entry.ts
++++ b/packages/tsc-ts/src/compiler/thread-entry.ts
+@@ -94,6 +94,7 @@ export function startThreads(
+   args: readonly string[],
+   forks: boolean = false,
+   together: ((workers: readonly Worker[]) => void) | undefined = undefined,
++  scope: (<T>(work: () => T) => T) | undefined = undefined,
+ ): void {
+   parallelCheck.writer = drivers.outputWriter();
+   if (forks) parallelCheck.fork = (index) => spawn({ kind: 'split', index });
+@@ -101,6 +102,7 @@ export function startThreads(
+   // checker threads are made unstarted and started by the session that made them all.
+   parallelCheck.together = together;
+   parallelParse.together = together;
++  if (process.env.TSC_TS_ARENA !== '0') parallelParse.scope = scope;
+   const unstarted = together !== undefined;
+   parallelCheck.spawn = (program, index, counter, order, nodeIds, symbolIds, reserved, emits, emitKinds, checking) =>
+     spawn(

@@ -1,0 +1,62 @@
+Two enum members of different values are unrelated before the rules for simple types
+
+Narrowing by `kind === SyntaxKind.X` asks whether each member of the enum is comparable to the
+literal, both ways, and each answer came at the end of the rules for simple types: for the 360
+members of `SyntaxKind` that is 1,440 passes through `isSimpleTypeRelatedToWorker` for one
+comparison. Two types whose flags are exactly a numeric enum member's (or a string enum member's)
+are related by one rule only, the one for members with equal values of related enums; every other
+rule needs a flag neither has. So two such types with different values are unrelated under every
+relation, and `isTypeRelatedTo` and `isSimpleTypeRelatedTo` say so first. Where the values are
+equal the rules run as before (`isEnumTypeRelatedTo` may report).
+
+From tsrs (notes/perf-simple-relation-enum-members.md: -1.51% on its Compiler case). Here, the
+TypeScript 6.0.3 compiler project: 13.331 -> 13.032 G instructions on one thread (-2.25%), 16.877
+-> 16.503 G over the processes of a default run (-2.21%). The corpus: 6,537 of 6,537 cases
+identical.
+
+diff --git a/packages/tsc-ts/src/compiler/relations.ts b/packages/tsc-ts/src/compiler/relations.ts
+index 4185e36..ffd3b18 100644
+--- a/packages/tsc-ts/src/compiler/relations.ts
++++ b/packages/tsc-ts/src/compiler/relations.ts
+@@ -452,10 +452,34 @@ export function areTypesComparable(c: Checker, type1: Type, type2: Type): boolea
+   return isTypeComparableTo(c, type1, type2) || isTypeComparableTo(c, type2, type1);
+ }
+ 
++/** The flags of a member of a numeric enum, and of a string enum. */
++const numericEnumMember = TypeFlags.NumberLiteral | TypeFlags.EnumLiteral;
++const stringEnumMember = TypeFlags.StringLiteral | TypeFlags.EnumLiteral;
++
++/**
++ * Whether `source` and `target` are two enum members of one kind with different values. Such a pair
++ * is related under no relation: the one rule that relates two enum members asks for equal values
++ * (and related enums), and every other rule needs a flag that neither type has. Narrowing by
++ * `kind === SyntaxKind.X` asks it of every member of the enum, both ways, and each answer otherwise
++ * comes at the end of the rules for simple types.
++ */
++function areEnumMembersOfDifferentValues(source: Type, target: Type): boolean {
++  const flags = source.flags;
++  if (flags !== target.flags) return false;
++  if (flags === numericEnumMember) {
++    const x = (source as LiteralType).numberValue;
++    const y = (target as LiteralType).numberValue;
++    // Two NaN are one value (`sameLiteralValue`).
++    return x !== y && (x === x || y === y);
++  }
++  return flags === stringEnumMember && (source as LiteralType).stringValue !== (target as LiteralType).stringValue;
++}
++
+ export function isTypeRelatedTo(c: Checker, source: Type, target: Type, relation: Relation): boolean {
+   if (isFreshLiteralType(source)) source = (source as LiteralType).regularType;
+   if (isFreshLiteralType(target)) target = (target as LiteralType).regularType;
+   if (source === target) return true;
++  if (areEnumMembersOfDifferentValues(source, target)) return false;
+   // A template literal target whose start and end texts rule out a match relates to no string
+   // literal or template literal source, under any relation. (The full check reports unreliable
+   // variance for type variables in a template literal source, so those take it.)
+@@ -590,6 +614,7 @@ export function isSimpleTypeRelatedTo(
+     source !== c.wildcardType
+   )
+     return false;
++  if (areEnumMembersOfDifferentValues(source, target)) return false;
+   return isSimpleTypeRelatedToWorker(c, source, target, relation, reporter);
+ }

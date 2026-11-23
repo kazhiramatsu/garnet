@@ -7,6 +7,7 @@
 // on the Worker, which Node ignores).
 import { dirname } from 'node:path';
 import { runServer } from '../src/api/server.js';
+import { arena } from 'garnet:arena';
 import { runThread, startThreads, type ThreadData, type ThreadDrivers } from '../src/compiler/thread-entry.js';
 import { mark, markMemory, timeline } from '../src/compiler/timeline.js';
 import {
@@ -54,8 +55,11 @@ const fullFileBytesPerChar = 32;
 let checkerBudgetMb = checkerYoungMb;
 let budgetProgram: unknown = undefined;
 
-/** A thread: a forked child running this file, which calls `runThread` with `data`. */
-function spawnThread(data: ThreadData): Worker {
+/**
+ * A thread: a forked child running this file, which calls `runThread` with `data`. With `together` it is
+ * not started here but by `Worker.startTogether`, with the other threads of its kind (below).
+ */
+function spawnThread(data: ThreadData, together = false): Worker {
   if (data.kind === 'check') {
     const program = data.program;
     if (program !== undefined && program !== budgetProgram) {
@@ -64,13 +68,13 @@ function spawnThread(data: ThreadData): Worker {
       for (const file of program.getSourceFiles()) if (file.skippedBodies > 0) chars += file.text.length;
       checkerBudgetMb = checkerYoungMb + Math.ceil((chars * fullFileBytesPerChar) / (1024 * 1024));
     }
-    return new Worker(new URL(import.meta.url), { workerData: data, resourceLimits: { maxYoungGenerationSizeMb: checkerBudgetMb } });
+    return new Worker(new URL(import.meta.url), { workerData: data, resourceLimits: { maxYoungGenerationSizeMb: checkerBudgetMb }, start: !together });
   }
   // A fork of a checker thread, started by that thread to share a huge file's statements: it has the
   // checker's heap as it is, the young cells it allocated so far among it, and the same budget again.
   if (data.kind === 'split')
     return new Worker(new URL(import.meta.url), { workerData: data, resourceLimits: { maxYoungGenerationSizeMb: 2 * checkerBudgetMb } });
-  return new Worker(new URL(import.meta.url), { workerData: data, shared: data.kind === 'parse' });
+  return new Worker(new URL(import.meta.url), { workerData: data, shared: data.kind === 'parse', start: !together });
 }
 
 if (!isMainThread) {
@@ -82,8 +86,11 @@ if (!isMainThread) {
     mark(`main clock ${hr[0]} ${hr[1]}`);
   }
   // checker, parse and reference threads, as the Node build starts them; here a thread is a fork of
-  // the thread that starts it (a checker thread shares a huge file with forks of itself)
-  if (args[0] !== '--api') startThreads(spawnThread, drivers, args, true);
+  // the thread that starts it (a checker thread shares a huge file with forks of itself), and the
+  // parse threads, like the checker threads, are started together: one fork of this process, which
+  // forks them, instead of ten forks that each keep this thread most of a millisecond
+  // (docs/fork_workers_design.md, "Workers started together")
+  if (args[0] !== '--api') startThreads(spawnThread, drivers, args, true, (workers) => Worker.startTogether(workers), arena);
   const status = args[0] === '--api' ? runServer(args.slice(1), defaultLibraryPath) : runTsc(args, defaultLibraryPath);
   // Watch mode and `--checkers` keep running until their callbacks exit.
   if (status !== watching) {

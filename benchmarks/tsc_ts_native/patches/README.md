@@ -18,6 +18,39 @@ reason and the measurement. A patch that no longer applies stops the build and n
 | `0005-parse-queue-by-bytes` | the parse threads' chunks are bounded by their bytes, the automatic type directives and the files they add go out with the libraries, the large files the largest first (below) |
 | `0006-files-without-function-bodies` | a file that is mostly one function is parsed without that function's body for the checkers of the other files, which then start when the other files are parsed; the checker that takes the file parses it in full (below) |
 | `0007-near-link-tables` | the symbol an identifier resolved to, and the links of a symbol, are kept in pages of 64 ids instead of a map |
+| `0008-workers-started-together` | the parse threads, then the checker threads, are made unstarted and started at once where the host starts several threads at the cost of one (garnet: one fork of the caller, docs/fork_workers_design.md) |
+| `0009-deferred-after-statement` | where a container's statements are shared with forks, a process checks the deferred nodes of a statement right after it, not all of its own when the statements have run out |
+| `0010-enum-members` | two enum members of different values are unrelated under every relation, answered before the rules for simple types (a delta from tsrs: `../deltas`) |
+| `0011-integer-stores` | four stores that a native build could not prove integers say so (`\| 0`): the scanner's position after a line comment, the first id of a chunk, a symbol's id |
+| `0012-parse-in-a-scope` | a parse thread reads, parses and binds a file inside a scope of the host's (garnet's arena, docs/arena_design.md: kept untraced, published when it ends, so the batch's publish walks no tree) |
+
+`0008` to `0012` (Session 367, the seventh slice), each against the one before, the TypeScript 6.0.3
+compiler project, type check only, plain builds:
+
+| | measured |
+|---|---|
+| `0008` | the root files queued at 8.6 ms from the executable's load where it was 13.8, the checkers started 5 ms earlier, exit 233.8 / 239.7 ms where it was 235.7 / 245.2 (minimum / median of 15) |
+| `0009` | the forks' shares done over 6.5 ms where it was 9.0, the last 9.0 ms of the run where it was 10.2 (medians of 15) |
+| `0010` | one thread 13.331 -> 13.032 G instructions (-2.25%), a default run's processes 16.877 -> 16.503 G (-2.21%) |
+| `0011` | one thread 13.025 -> 12.931 G (-0.72%) |
+| `0012` | the parse threads 2.903 -> 2.562 G (-11.7%), every thread 16.207 -> 15.825 G (-2.35%), the other files parsed at 38.0 ms where it was 40.7 |
+
+`0010` and whatever follows it from tsrs are evaluated by `scripts/tsc_ts_delta.py` (`../deltas/README.md`):
+the commit against its parent, the reports, the instructions, the corpus, one command. `0011` is the
+same harness on an experiment that is not a delta. What `0011` works around is garnet's: its integer
+facts stop at a method's result and at `Atomics`, so one such store makes the field a double
+(docs/TODO.md, Session 367, the seventh slice).
+
+Measured and not made a patch (the seventh slice): a container's heavy statements checked first by
+the checker alone (`createNodeBuilder`, 327K of the 3M of `createTypeChecker`, before the 500
+statements written above it). The statements the checker checks alone are what its forks start
+with, and a checker that began with its heaviest statement was still in it when the other checkers
+ran out of files: the forks resolved for themselves what the skipped statements would have, 5%
+more instructions over the checkers and forks, and the run ended 6 ms later (median of 15). A
+variant that keeps the checker's own order and takes the heavy statements left first once
+statements are shared, with forks started between the statements of a function the checker is in
+and all at once, is equal in instructions and not measured on a quiet machine yet (the working
+copy's branch `exp/split-heavy`).
 
 `0007`: `SparseLinkTable.get` was 5.5 to 6.6% of the samples of every checker process, nearly all
 of them at the read of the map's index (a table as large as everything stored, read where the id's

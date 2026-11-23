@@ -616,6 +616,28 @@ static inline void gc_payload_mark_small(uint32_t bi, uintptr_t off_in_block){
   }
   if (!(*w & m)){ *w |= m; g_blocks[bi].live += g_pclass_size[g_blocks[bi].cls]; }
 }
+/* ---- the runs the classes hand out (docs/arena_design.md) ----
+   An arena keeps what was allocated without tracing it, so it must know where the young cells and
+   the payloads are: every run a class takes since the last collection is logged, with the class's
+   cursor as the end of the one it is in. Nothing is logged until the process has its first arena
+   (g_runs_on); a refill is the only place that writes the log. */
+typedef struct { char* lo; char* hi; uint8_t cls; uint8_t fam; } gc_run;
+enum { GC_RUN_YOUNG = 0, GC_RUN_SIZED = 1, GC_RUN_OLD = 2, GC_RUN_PAYLOAD = 3 };
+static gc_run* g_runs = NULL;
+static size_t g_runs_len = 0, g_runs_cap = 0;
+static uint32_t g_run_cur[4][GC_PAYLOAD_NCLASS];   /* a class's latest run in the log, + 1 */
+static int g_runs_on = 0;
+static int g_arena_depth = 0;
+static void gc_run_log(char* lo, char* hi, unsigned cls, unsigned fam){
+  if (g_runs_len == g_runs_cap){
+    size_t next = g_runs_cap ? g_runs_cap * 2u : 1024u;
+    gc_run* grown = (gc_run*)realloc(g_runs, sizeof(gc_run) * next);
+    if (!grown) ts_abort_msg("out of memory growing the log of runs");
+    g_runs = grown; g_runs_cap = next;
+  }
+  g_runs[g_runs_len].lo = lo; g_runs[g_runs_len].hi = hi; g_runs[g_runs_len].cls = (uint8_t)cls; g_runs[g_runs_len].fam = (uint8_t)fam;
+  g_run_cur[fam][cls] = (uint32_t)++g_runs_len;
+}
 static void* gc_payload_alloc_large(size_t bytes, int old){
   uint32_t n = (uint32_t)((bytes + GC_BLOCK_BYTES - 1u) >> GC_BLOCK_SHIFT);
   uint32_t bi = gc_cage_frontier_take(n);   /* runs are not recycled yet: rare (G0) */
@@ -640,7 +662,10 @@ static void* gc_payload_alloc(size_t bytes, int old){
   gc_pclass* c = &g_pclass[cls];
   size_t size = g_pclass_size[cls];
   char* p = c->ptr;
-  if (TS_RT_UNLIKELY(!p || p + size > c->end)) p = gc_payload_refill(cls);
+  if (TS_RT_UNLIKELY(!p || p + size > c->end)){
+    p = gc_payload_refill(cls);
+    if (TS_RT_UNLIKELY(g_runs_on)) gc_run_log(p, c->end, cls, GC_RUN_PAYLOAD);
+  }
   c->ptr = p + size;
   GC_PAYLOAD_UNPOISON(p, size);
   if (old){
@@ -734,7 +759,10 @@ static inline void* gc_cell_alloc(size_t bytes, int old, size_t* cap){
   size_t size = g_pclass_size[cls];
   *cap = size;
   char* p = c->ptr;
-  if (TS_RT_UNLIKELY(!p || p + size > c->end)) p = gc_space_refill(classes, GC_BLK_CELL, cls, 0);
+  if (TS_RT_UNLIKELY(!p || p + size > c->end)){
+    p = gc_space_refill(classes, GC_BLK_CELL, cls, 0);
+    if (TS_RT_UNLIKELY(g_runs_on)) gc_run_log(p, c->end, cls, old ? GC_RUN_OLD : GC_RUN_YOUNG);
+  }
   c->ptr = p + size;
   if (g_conservative_roots) gc_alloc_bit_set(p);
   GC_PAYLOAD_UNPOISON(p, size);
@@ -1579,6 +1607,7 @@ void ts_frame_restore(ts_frame_hdr* frame){ g_ts_frame_top = frame; }
    is the comparisons alone: an allocation-heavy loop pays a few loads and no call. */
 __attribute__((noinline)) static void gc_before_alloc_slow(void){
   if (TS_RT_UNLIKELY(!g_gc_config_inited)) gc_config_init();
+  if (g_arena_depth) return;   /* an arena keeps what it allocates: nothing is collected inside one */
   if (g_young_new_since_minor>=g_young_threshold || g_young_fresh_bytes>=g_young_cap_bytes ||
       g_payload_fresh_bytes>=g_payload_budget_bytes)
     ts_gc_collect_young();
@@ -1717,11 +1746,24 @@ static void gc_young_limits_force(void){
   }
 }
 /* after a collection (every class counted, the counters reset): no grant, nothing pending */
+static inline gc_pclass* gc_run_class(unsigned fam, unsigned cls){
+  return fam == GC_RUN_YOUNG ? &g_cclass[cls] : fam == GC_RUN_SIZED ? &g_cclass_sized[cls] : fam == GC_RUN_OLD ? &g_cclass_old[cls] : &g_pclass[cls];
+}
+/* The log from the classes' cursors: what each may still hand out of the run it is in. */
+static void gc_runs_restart(void){
+  g_runs_len = 0; memset(g_run_cur, 0, sizeof g_run_cur);
+  for (unsigned fam = 0; fam < 4; fam++)
+    for (int cls = 0; cls < g_pclass_n; cls++){
+      gc_pclass* c = gc_run_class(fam, (unsigned)cls);
+      if (c->ptr && c->ptr < c->end) gc_run_log(c->ptr, c->end, (unsigned)cls, fam);
+    }
+}
 static void gc_young_restart(void){
   for (int cls = 0; cls < GC_PAYLOAD_NCLASS; cls++){
     gc_pclass* fam[2] = { &g_cclass[cls], &g_cclass_sized[cls] };
     for (int k = 0; k < 2; k++){ fam[k]->acc = fam[k]->limit = fam[k]->ptr; fam[k]->pend = fam[k]->allow = 0; }
   }
+  if (TS_RT_UNLIKELY(g_runs_on)) gc_runs_restart();
 }
 /* the bytes the class may hand out before the next collection is due: one cell in the debug modes */
 static inline size_t gc_young_room(size_t size){
@@ -1760,6 +1802,7 @@ __attribute__((noinline)) static void* gc_young_cell_slow(gc_pclass* classes, si
     p = classes == g_cclass_sized ? gc_space_refill_z(g_cclass_sized, GC_BLK_CELL, cls, 0, 0)
                                   : gc_space_refill(g_cclass, GC_BLK_CELL, cls, 0);
     c->acc = p;
+    if (TS_RT_UNLIKELY(g_runs_on)) gc_run_log(p, c->end, cls, classes == g_cclass_sized ? GC_RUN_SIZED : GC_RUN_YOUNG);
   }
   size_t run = (size_t)(c->end - p);
   c->limit = p + (c->allow < run ? c->allow : run);
@@ -7653,7 +7696,7 @@ static uint64_t g_minor_collections = 0;   /* this process's young collections (
 /* The stack overflow's error is built on another stack (ts_fault), which the conservative scan cannot walk. */
 static int g_gc_hold;
 void ts_gc_collect_young(void){
-  if (TS_RT_UNLIKELY(g_gc_hold)) return;
+  if (TS_RT_UNLIKELY(g_gc_hold || g_arena_depth)) return;
   gc_young_count_all();
   g_payload_fresh_bytes = 0;
   if (!g_young_new_since_minor && !g_young_log_len){ g_young_fresh_bytes = 0; gc_young_restart(); return; }
@@ -7742,7 +7785,7 @@ void ts_gc_collect_young(void){
   RT_STAT_GC_T1;
 }
 void ts_gc_collect(void){
-  if (TS_RT_UNLIKELY(g_gc_hold)) return;
+  if (TS_RT_UNLIKELY(g_gc_hold || g_arena_depth)) return;
   RT_STAT_INC(full_gc); RT_STAT_GC_T0;
   G0_T0;
   gc_young_count_all();
@@ -25838,6 +25881,8 @@ static const char* publish_walk_shared(publish_walk* w, int n){
   w->shared = 0; w->rejected = NULL;
   return rejected;
 }
+static int g_arena_check;                    /* the arena check (below): on after a shared worker's first arena */
+static void arena_check_graph(tsv root);
 static inline ts_gc_header* publish_done_cell(ts_gc_header* tagged){ return (ts_gc_header*)((uintptr_t)tagged & ~(uintptr_t)3u); }
 tsv ts_publish(tsv v){
   if (!(TS_TOP16(v) == TS_SEL_OBJECT || ts_is_func(v))) return v;    /* primitives: already immutable */
@@ -25907,12 +25952,174 @@ tsv ts_publish(tsv v){
             (double)(pi1 - pi0) / 1e6, (double)(pc1 - pc0) / 1e6, shared_by, shared_by == 1 ? "" : "s");
   }
   free(w.edges); free(w.done); free(w.keep);
+  if (TS_RT_UNLIKELY(g_region_mode && g_arena_check > 0)) arena_check_graph(v);
   return v;
 }
 int ts_is_published(tsv v){
   if (!(TS_TOP16(v) == TS_SEL_OBJECT || ts_is_func(v))) return 1;
   return (((const ts_gc_header*)ts_ptr(v))->flags & TS_HDR_PUBLISHED) != 0;
 }
+/* ---- allocation arenas (docs/arena_design.md) ----
+   What is allocated between ts_arena_begin and ts_arena_end is kept without being traced. At the end
+   every young cell of the process becomes old where it is, by the runs the classes handed out (the
+   mark bit of each cell and of each payload, the generation in the header), with no marker run: a
+   parser's tree is all alive when the parse ends, and a collection would mark and promote it a
+   reference at a time. In a shared worker the cells allocated inside the arena are also what a
+   publish makes of a cell (frozen, published, opaque to the parent's marker), so a publish that
+   reaches one stops there: the graph is handed over without being walked.
+
+   - Every young cell is promoted, not only the arena's: a cell of the arena may refer to a young
+     cell made before it, and an old cell that refers to a young one without the barrier having
+     seen the store would lose it at the next collection.
+   - Nothing is collected inside an arena (gc_before_alloc_slow, the collections' entries), so the
+     runs logged since the last collection are exactly the young cells.
+   - The first arena of a process starts with a young collection: the log begins there.
+   - The kinds a publish rejects (a typed array, a promise) are promoted and not published. */
+static size_t g_arena_runs_from = 0;
+static uint32_t g_arena_large_cell_head = 0;
+/* TSAOT_ARENA_CHECK=1 (2 to report without stopping): after a shared worker's publish, the graph is walked
+   again from its root, through the cells the arenas published too, and every cell of the worker it reaches
+   must be published (a string may be a plain old one: it cannot change). A cell that is not is one the
+   publish's own walk would have reached and frozen, had the arena's cells not stopped it. */
+static unsigned long long g_arena_count = 0, g_arena_cells = 0, g_arena_bytes = 0;
+static int g_arena_check = -1;
+static int arena_check_on(void){
+  if (g_arena_check < 0){ const char* e = getenv("TSAOT_ARENA_CHECK"); g_arena_check = e && e[0] && e[0] != '0' ? (e[0] == '2' ? 2 : 1) : 0; }
+  return g_arena_check;
+}
+static const char* publish_rejected_kind(const ts_gc_header* h);
+static inline void gc_arena_stamp(ts_gc_header* h){
+  if ((h->flags & TS_HDR_PUBLISHED) || publish_rejected_kind(h)) return;
+  if (h->kind == TS_KIND_OBJECT || h->kind == TS_KIND_ARRAY || h->kind == TS_KIND_FUNC || h->kind == TS_KIND_MAP || h->kind == TS_KIND_SET)
+    ts_obj_add_integrity((ts_object*)h, 1u);
+  h->flags |= TS_HDR_PUBLISHED; h->mark = 1;
+}
+void ts_arena_begin(void){
+  if (g_arena_depth++) return;
+  if (TS_RT_UNLIKELY(g_gc_hold)) ts_abort_msg("an arena inside a collection hold");
+  if (!g_runs_on){
+    /* the first arena of the process: no young cell from before the log */
+    g_arena_depth = 0; ts_gc_collect_young(); g_arena_depth = 1;
+    g_runs_on = 1;
+    gc_runs_restart();
+    g_arena_runs_from = 0;
+  } else {
+    /* what a class handed out of its run before the arena is not the arena's: the run ends at the
+       cursor, and the rest of it is a run of the arena */
+    g_arena_runs_from = g_runs_len;
+    for (unsigned fam = 0; fam < 4; fam++)
+      for (int cls = 0; cls < g_pclass_n; cls++){
+        uint32_t e = g_run_cur[fam][cls];
+        if (!e) continue;
+        gc_pclass* c = gc_run_class(fam, (unsigned)cls);
+        if (c->ptr && c->ptr >= g_runs[e - 1u].lo && c->ptr < g_runs[e - 1u].hi){
+          char* hi = g_runs[e - 1u].hi;
+          g_runs[e - 1u].hi = c->ptr;
+          gc_run_log(c->ptr, hi, (unsigned)cls, fam);
+        }
+      }
+  }
+  g_arena_large_cell_head = g_large_cell_head;
+}
+void ts_arena_end(void){
+  if (!g_arena_depth) ts_abort_msg("an arena ended that was not begun");
+  if (--g_arena_depth) return;
+  gc_young_count_all();
+  int stamp = g_region_mode;
+  unsigned long long cells = 0; size_t bytes = 0;
+  for (size_t i = 0; i < g_runs_len; i++){
+    gc_run* e = &g_runs[i];
+    gc_pclass* c = gc_run_class(e->fam, e->cls);
+    char* hi = (g_run_cur[e->fam][e->cls] == i + 1u && c->ptr >= e->lo && c->ptr <= e->hi) ? c->ptr : e->hi;
+    if (hi <= e->lo) continue;
+    size_t size = g_pclass_size[e->cls];
+    uintptr_t off = (uintptr_t)(e->lo - g_cage_base);
+    uint32_t bi = (uint32_t)(off >> GC_BLOCK_SHIFT);
+    uintptr_t in = off & (GC_BLOCK_BYTES - 1u);
+    if (e->fam == GC_RUN_PAYLOAD){
+      for (char* p = e->lo; p < hi; p += size, in += size) gc_payload_mark_small(bi, in);
+      continue;
+    }
+    int in_arena = stamp && i >= g_arena_runs_from;
+    for (char* p = e->lo; p < hi; p += size, in += size){
+      ts_gc_header* h = (ts_gc_header*)p;
+      if (h->gen == TS_GEN_YOUNG){
+        gc_payload_mark_small(bi, in);
+        h->gen = TS_GEN_OLD; h->flags &= (uint8_t)~TS_HDR_REMEMBERED;
+        if (TS_RT_UNLIKELY(h->kind == TS_KIND_CORO)) ts_gc_remember(h);
+      }
+      if (in_arena) gc_arena_stamp(h);
+    }
+    if (i >= g_arena_runs_from){ cells += (unsigned long long)((size_t)(hi - e->lo) / size); bytes += (size_t)(hi - e->lo); }
+  }
+  /* the large cells: the young ones are in the log; those made inside the arena lead the list */
+  for (size_t i = 0; i < g_young_log_len; i++){
+    ts_gc_header* h = g_young_log[i];
+    if (h->gen != TS_GEN_YOUNG) continue;
+    gc_block* b = gc_cell_block(h);
+    if (b->state != GC_BLK_LARGE_CELL) continue;
+    b->mark = 1; h->gen = TS_GEN_OLD; h->flags &= (uint8_t)~TS_HDR_REMEMBERED;
+    if (TS_RT_UNLIKELY(h->kind == TS_KIND_CORO)) ts_gc_remember(h);
+  }
+  g_young_log_len = 0;
+  if (stamp)
+    for (uint32_t l = g_large_cell_head; l && l != g_arena_large_cell_head; l = g_blocks[l - 1u].next)
+      gc_arena_stamp((ts_gc_header*)gc_block_base(l - 1u));
+  for (uint32_t l = g_large_head; l; l = g_blocks[l - 1u].next) g_blocks[l - 1u].mark = 1;
+  /* as after a collection that found everything alive */
+  g_old_bytes = g_heap_bytes;
+  g_young_new_since_minor = 0; g_young_fresh_bytes = 0; g_payload_fresh_bytes = 0;
+  gc_young_restart();
+  if (stamp && cells) prop_add_epoch_bump();
+  if (stamp) (void)arena_check_on();
+  g_arena_count++; g_arena_cells += cells; g_arena_bytes += bytes;
+}
+static void publish_children(publish_walk* w, ts_gc_header* h);
+static void arena_check_graph(tsv root){
+  if (!(TS_TOP16(root) == TS_SEL_OBJECT || ts_is_func(root))) return;
+  size_t cap = 1u << 16, len = 0;
+  uintptr_t* seen = (uintptr_t*)calloc(cap, sizeof *seen);
+  publish_walk w; memset(&w, 0, sizeof w);
+  if (!seen) ts_abort_msg("out of memory in the arena check");
+  unsigned long long cells = 0, strings = 0, bad = 0;
+  publish_append(&w.edges, &w.elen, &w.ecap, (ts_gc_header*)ts_ptr(root));
+  while (w.elen){
+    ts_gc_header* h = w.edges[--w.elen];
+    if (!region_holds(h)) continue;                       /* the parent's own, from before the fork */
+    size_t at = (size_t)(((uintptr_t)h >> 4) * 0x9E3779B97F4A7C15ull >> 20) & (cap - 1u);
+    while (seen[at] && seen[at] != (uintptr_t)h) at = (at + 1u) & (cap - 1u);
+    if (seen[at]) continue;
+    seen[at] = (uintptr_t)h;
+    if (++len * 2u > cap){
+      size_t ncap = cap * 2u; uintptr_t* grown = (uintptr_t*)calloc(ncap, sizeof *grown);
+      if (!grown) ts_abort_msg("out of memory in the arena check");
+      for (size_t i = 0; i < cap; i++) if (seen[i]){
+        size_t j = (size_t)((seen[i] >> 4) * 0x9E3779B97F4A7C15ull >> 20) & (ncap - 1u);
+        while (grown[j]) j = (j + 1u) & (ncap - 1u);
+        grown[j] = seen[i];
+      }
+      free(seen); seen = grown; cap = ncap;
+    }
+    cells++;
+    if (!(h->flags & TS_HDR_PUBLISHED)){
+      if (h->kind == TS_KIND_STRING && h->gen != TS_GEN_YOUNG) strings++;
+      else if (bad++ < 12){
+        const char* rejected = publish_rejected_kind(h);
+        fprintf(stderr, "tsaot: arena check: the published graph reaches %s the worker did not publish (kind %d, %s)\n",
+                rejected ? rejected : "a cell", (int)h->kind, h->gen == TS_GEN_YOUNG ? "young" : "old");
+      }
+      if (publish_rejected_kind(h)) continue;
+    }
+    publish_children(&w, h);
+  }
+  free(seen); free(w.edges);
+  if (fork_trace_on() || bad)
+    fprintf(stderr, "tsaot: arena check: pid %d: %llu cells reached, %llu plain old strings among them, %llu cells not published\n",
+            (int)getpid(), cells, strings, bad);
+  if (bad && g_arena_check != 2) ts_abort_msg("a published graph reaches a cell of the worker that was not published (TSAOT_ARENA_CHECK)");
+}
+static tsv garnet_arena_begin_fn(tsv* a, int n){ (void)a; (void)n; ts_arena_begin(); return TS_UNDEFINED; }
+static tsv garnet_arena_end_fn(tsv* a, int n){ (void)a; (void)n; ts_arena_end(); return TS_UNDEFINED; }
 static tsv garnet_publish_fn(tsv* a, int n){ return ts_publish(n > 0 ? a[0] : TS_UNDEFINED); }
 static tsv garnet_is_published_fn(tsv* a, int n){ return ts_bool(ts_is_published(n > 0 ? a[0] : TS_UNDEFINED)); }
 /* The `__garnet` global the garnet:shared module calls (lib/garnet/shared.ts). */
@@ -25975,8 +26182,12 @@ static void ts_garnet_global_init(tsv global){
   tsv f2 = ts_make_fn_t(garnet_is_published_fn, NULL, 0, 0); ts_gc_root(&f2);
   ts_set_fn_meta(f2, 1u, "isPublished"); ts_set_cstr(g, "isPublished", f2);
   ts_set_cstr(g, "sharesGraphs", ts_bool(1));
+  tsv f11 = ts_make_fn_t(garnet_arena_begin_fn, NULL, 0, 0); ts_gc_root(&f11);
+  ts_set_fn_meta(f11, 0u, "arenaBegin"); ts_set_cstr(g, "arenaBegin", f11);
+  tsv f12 = ts_make_fn_t(garnet_arena_end_fn, NULL, 0, 0); ts_gc_root(&f12);
+  ts_set_fn_meta(f12, 0u, "arenaEnd"); ts_set_cstr(g, "arenaEnd", f12);
   ts_set_cstr(global, "__garnet", g);
-  ts_gc_unroot(13);
+  ts_gc_unroot(15);
 }
 /* The `__garnet_json` global the garnet:json module calls (lib/garnet/json.ts,
    docs/typed_json_design.md): `layout(keys)` interns a key sequence as a
@@ -26252,10 +26463,16 @@ tsv ts_message_roundtrip(tsv v){
   return r;
 }
 
+/* Workers started together (ts_workers_start_together) are children of a starter process, not of the
+   process that watches them: what that process needs of each (its pid to signal it, its wait status once it
+   has ended) the starter leaves in memory the processes of the batch share. */
+typedef struct worker_slot { volatile int32_t pid, status, done; int32_t unused; } worker_slot;
+typedef struct worker_batch { worker_slot* slots; int n, alive; pid_t starter; } worker_batch;
 typedef struct ts_watch { int id; pid_t pid; int fd; uint8_t* buf; size_t len, cap; int messages; struct ts_watch* next;
                           uint32_t region_lo, region_hi;   /* a shared worker's blocks, else 0 */
                           int out_fd;                       /* the parent's end of the pipe to the worker */
-                          int unref, terminated; } ts_watch; /* unref: not keeping the loop alive; terminated: by terminate() */
+                          int unref, terminated;            /* unref: not keeping the loop alive; terminated: by terminate() */
+                          worker_slot* slot; worker_batch* batch; } ts_watch;   /* of a worker started with others, else NULL */
 /* A worker's side of the parent's frames: the read end, the listener, and
    whether the port is open (a registered listener keeps the loop alive). */
 static int g_parent_fd = -1, g_parent_watching = 0;
@@ -26287,7 +26504,17 @@ void ts_worker_on_error(int id, tsv fn){ ts_array_set(watch_handlers(), (uint32_
 void ts_worker_on_exit(int id, tsv fn){ ts_array_set(watch_handlers(), (uint32_t)id * 3u + 2u, fn); }
 static ts_watch* watch_by_id(int id){ ts_watch* w = g_watches; while (w && w->id != id) w = w->next; return w; }
 /* terminate(): SIGTERM; the worker's end then reaches the exit handler with code 1 and no error */
-void ts_worker_kill(int id){ ts_watch* w = watch_by_id(id); if (!w) return; w->terminated = 1; kill(w->pid, SIGTERM); }
+void ts_worker_kill(int id){
+  ts_watch* w = watch_by_id(id); if (!w) return;
+  w->terminated = 1;
+  pid_t pid = w->pid;
+  if (w->slot){
+    /* started with others: its process exists once the starter has forked it (within a millisecond or two) */
+    for (int k = 0; !w->slot->pid && !w->slot->done && k < 20000; k++) usleep(50);
+    pid = (pid_t)w->slot->pid;
+  }
+  if (pid > 0) kill(pid, SIGTERM);
+}
 void ts_worker_ref(int id, int on){ ts_watch* w = watch_by_id(id); if (w) w->unref = !on; }
 /* a live worker keeps the parent's loop alive unless unref()'d */
 static int ts_watches_refd(void){ for (ts_watch* w = g_watches; w; w = w->next) if (!w->unref) return 1; return 0; }
@@ -26303,6 +26530,7 @@ static void msg_write_all(int fd, const void* p, size_t n){
 void ts_worker_post(tsv value){
   if (!g_is_worker) ts_throw_type_error_msg("postMessage: this is the main thread (parentPort is null)");
   ts_gc_root(&value);
+
   g_post_enc.len = 0; g_post_enc.nseen = 0;
   if (g_region_mode){
     msg_put_u8(&g_post_enc, MSG_FRAME_SHARED);
@@ -26386,7 +26614,18 @@ static void watch_close(ts_watch* w){
   if (*pp) *pp = w->next;
   close(w->fd); close(w->out_fd);
   int status = 0;
-  if (waitpid(w->pid, &status, 0) != w->pid) status = 0;
+  if (w->slot){
+    /* Its parent is the batch's starter, which is waiting for it: the status is there within microseconds of
+       the pipe's end. A second without it (the starter was killed) is an exit whose status nobody has. */
+    for (int k = 0; !w->slot->done && k < 20000; k++) usleep(50);
+    status = w->slot->done ? (int)w->slot->status : 0;
+    worker_batch* b = w->batch;
+    if (--b->alive == 0){
+      int st; if (b->starter > 0) (void)waitpid(b->starter, &st, 0);   /* the starter ends with its last worker */
+      munmap(b->slots, sizeof(worker_slot) * (size_t)b->n);
+      free(b);
+    }
+  } else if (waitpid(w->pid, &status, 0) != w->pid) status = 0;
   int code = WIFEXITED(status) ? WEXITSTATUS(status) : 1;   /* a signal death is 1, as a terminate()d worker's in Node */
   int died = WIFSIGNALED(status) && !w->terminated;
   int id = w->id;
@@ -26594,16 +26833,50 @@ static long fork_trace_cow_faults(void){
 static long fork_trace_cow_faults(void){ return -1; }
 #endif
 #define TS_SHARED_WORKER_YOUNG_FACTOR 16u   /* a shared worker's young budget over the default (below) */
+/* What a worker's process is started with: its id, its ends of the two pipes, and for a shared worker its
+   region and its range of shape ids. */
+typedef struct worker_start { int id, to_parent, from_parent, shared; uint32_t young_mb, region_lo, region_hi, shape_lo, shape_hi; } worker_start;
+/* The parent's side of a shared worker, before its fork (and after the young collection that makes every
+   live cell of the parent old: ts_worker_fork_ex): the region, a run of blocks mapped shared at its cage
+   address, which the parent keeps as GC_BLK_REGION; the shape ids partitioned. */
+static void worker_shared_prepare(worker_start* s){
+  uint32_t mb = env_u32("TSAOT_SHARED_REGION_MB", 512u);
+  uint32_t nblocks = (uint32_t)(((size_t)mb << 20) >> GC_BLOCK_SHIFT);
+  if (!nblocks) nblocks = 1u;
+  s->region_lo = gc_cage_frontier_take(nblocks); s->region_hi = s->region_lo + nblocks;
+  char* base = gc_block_base(s->region_lo);
+  void* m = mmap(base, (size_t)nblocks << GC_BLOCK_SHIFT, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON | MAP_FIXED, -1, 0);
+  if (m != (void*)base) ts_abort_msg("cannot map a shared worker's region");
+  for (uint32_t i = s->region_lo; i < s->region_hi; i++){ memset(&g_blocks[i], 0, sizeof(gc_block)); g_blocks[i].state = GC_BLK_REGION; }
+  g_shared_regions_exist = 1;
+  uint32_t span = env_u32("TSAOT_SHARED_SHAPES", 65536u);
+  if (!g_shared_workers_alive){
+    g_full_threshold_saved = g_full_threshold_bytes; g_full_threshold_forced_saved = g_full_threshold_forced;
+    g_full_threshold_bytes = SIZE_MAX; g_full_threshold_forced = 1;   /* young collections only while workers live */
+  }
+  /* the parent's headroom: a span above its next id, set once per run of
+     workers; a worker's range: a span above the headroom and above every
+     range handed out before (never reused: the parent keeps installing a
+     worker's shapes at its ids after the worker is gone) */
+  if (!g_shape_limit) g_shape_limit = g_next_shape + span;
+  s->shape_lo = g_shape_ranges_end > g_shape_limit ? g_shape_ranges_end : g_shape_limit;
+  s->shape_hi = s->shape_lo + span;
+  if (s->shape_hi > g_shape_ids_limit) ts_abort_msg("too many shared workers for the shape id space (TSAOT_SHARED_SHAPES)");
+  g_shape_ranges_end = s->shape_hi;
+  g_shared_forks++;
+  g_shared_workers_alive++;
+}
+static void worker_child_run(const worker_start* s, tsv entry, tsv data, int ftrace) __attribute__((noreturn));
 static int ts_worker_fork_ex(tsv entry, tsv data, int shared, uint32_t young_mb){
   if (!ts_is_func(entry)) ts_throw_type_error_msg("Worker: the entry is not a function of the program");
   if (shared && g_region_mode) ts_throw_type_error_msg("Worker: a shared worker cannot fork a shared worker");
+  if (shared && g_arena_depth) ts_throw_type_error_msg("Worker: a shared worker cannot be started inside an arena (its start collects, and an arena holds what it allocates)");
   ts_gc_root(&data); ts_gc_root(&entry);
   fflush(stdout); fflush(stderr);
   int ftrace = fork_trace_on();
   double ft0 = ftrace ? fork_trace_now_ms() : 0, ft1 = ft0, ft2 = ft0;
-  /* the region: a run of blocks mapped shared at its cage address; the
-     parent keeps it as GC_BLK_REGION; the shape ids partitioned */
-  uint32_t region_lo = 0, region_hi = 0, child_shape_lo = 0, child_shape_hi = 0;
+  worker_start s; memset(&s, 0, sizeof s);
+  s.shared = shared; s.young_mb = young_mb;
   if (shared){
     /* Every live pre-fork cell becomes old: the parent's young collections
        while the worker runs never free it, and its full collections are
@@ -26611,37 +26884,14 @@ static int ts_worker_fork_ex(tsv entry, tsv data, int shared, uint32_t young_mb)
        A dead young cell is freed here, before the child could see it. */
     ts_gc_collect_young();
     if (ftrace) ft1 = fork_trace_now_ms();
-    uint32_t mb = env_u32("TSAOT_SHARED_REGION_MB", 512u);
-    uint32_t nblocks = (uint32_t)(((size_t)mb << 20) >> GC_BLOCK_SHIFT);
-    if (!nblocks) nblocks = 1u;
-    region_lo = gc_cage_frontier_take(nblocks); region_hi = region_lo + nblocks;
-    char* base = gc_block_base(region_lo);
-    void* m = mmap(base, (size_t)nblocks << GC_BLOCK_SHIFT, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON | MAP_FIXED, -1, 0);
-    if (m != (void*)base) ts_abort_msg("cannot map a shared worker's region");
-    for (uint32_t i = region_lo; i < region_hi; i++){ memset(&g_blocks[i], 0, sizeof(gc_block)); g_blocks[i].state = GC_BLK_REGION; }
-    g_shared_regions_exist = 1;
-    uint32_t span = env_u32("TSAOT_SHARED_SHAPES", 65536u);
-    if (!g_shared_workers_alive){
-      g_full_threshold_saved = g_full_threshold_bytes; g_full_threshold_forced_saved = g_full_threshold_forced;
-      g_full_threshold_bytes = SIZE_MAX; g_full_threshold_forced = 1;   /* young collections only while workers live */
-    }
-    /* the parent's headroom: a span above its next id, set once per run of
-       workers; a worker's range: a span above the headroom and above every
-       range handed out before (never reused: the parent keeps installing a
-       worker's shapes at its ids after the worker is gone) */
-    if (!g_shape_limit) g_shape_limit = g_next_shape + span;
-    child_shape_lo = g_shape_ranges_end > g_shape_limit ? g_shape_ranges_end : g_shape_limit;
-    child_shape_hi = child_shape_lo + span;
-    if (child_shape_hi > g_shape_ids_limit) ts_abort_msg("too many shared workers for the shape id space (TSAOT_SHARED_SHAPES)");
-    g_shape_ranges_end = child_shape_hi;
-    g_shared_forks++;
-    g_shared_workers_alive++;
+    worker_shared_prepare(&s);
   }
   int fds[2], in[2];
   if (pipe(fds) != 0) ts_throw_type_error_msg("Worker: pipe failed");
   if (pipe(in) != 0){ close(fds[0]); close(fds[1]); ts_throw_type_error_msg("Worker: pipe failed"); }
   if (ftrace){ ft2 = fork_trace_now_ms(); g_fork_trace_forked_at = ft2; g_fork_trace_frontier = g_cage_frontier; }
   int id = ++g_watch_ids;
+  s.id = id; s.to_parent = fds[1]; s.from_parent = in[0];
   pid_t pid = fork();
   if (pid < 0){ close(fds[0]); close(fds[1]); close(in[0]); close(in[1]); ts_throw_type_error_msg("Worker: fork failed"); }
   if (ftrace && pid > 0){
@@ -26651,7 +26901,26 @@ static int ts_worker_fork_ex(tsv entry, tsv data, int shared, uint32_t young_mb)
   }
   if (pid == 0){
     close(fds[0]); close(in[1]);
-    g_parent_fd = in[0]; g_parent_watching = 0; g_parent_len = 0;
+    worker_child_run(&s, entry, data, ftrace);
+  }
+  close(fds[1]);
+  ts_gc_unroot(2);
+  ts_watch* w = (ts_watch*)calloc(1, sizeof *w);
+  if (!w) ts_abort_msg("out of memory starting a worker");
+  close(in[0]);
+  w->id = id; w->pid = pid; w->fd = fds[0]; w->out_fd = in[1]; w->next = g_watches; g_watches = w;
+  w->region_lo = s.region_lo; w->region_hi = s.region_hi;
+  return w->id;
+}
+/* The worker's process, from its fork to its end: `s` is what its parent prepared. The parent's ends of the
+   worker's own pipes are closed by the caller, or are among the parent's watches, which are closed here. */
+static void worker_child_run(const worker_start* s, tsv entry, tsv data, int ftrace){
+  int shared = s->shared, id = s->id;
+  uint32_t young_mb = s->young_mb, region_lo = s->region_lo, region_hi = s->region_hi, child_shape_lo = s->shape_lo, child_shape_hi = s->shape_hi;
+  {
+    /* a worker's worker: the ends of its parent's own pipes are its parent's */
+    if (g_is_worker){ if (g_worker_fd >= 0) close(g_worker_fd); if (g_parent_fd >= 0) close(g_parent_fd); }
+    g_parent_fd = s->from_parent; g_parent_watching = 0; g_parent_len = 0;
     if (shared){
       /* region mode: every cursor and list abandoned (the parent's blocks
          are the parent's), blocks from the region only, the shape ids of
@@ -26662,6 +26931,7 @@ static int ts_worker_fork_ex(tsv entry, tsv data, int shared, uint32_t young_mb)
         for (int k = 0; k < 4; k++){ fam[k]->ptr = fam[k]->end = fam[k]->limit = fam[k]->acc = NULL; fam[k]->head = 0; fam[k]->scan = 0; fam[k]->pend = fam[k]->allow = 0; }
       }
       g_free_blocks = 0; g_large_head = 0; g_large_cell_head = 0; g_alloc_dirty_len = 0;
+      g_runs_len = 0; memset(g_run_cur, 0, sizeof g_run_cur); g_arena_depth = 0;
       g_next_shape = child_shape_lo; g_shape_limit = child_shape_hi; g_shape_ranges_end = 0;
       g_shared_workers_alive = 0; g_shape_log_len = 0; g_prefork_frozen_len = 0;
       /* What a shared worker allocates is mostly the graph it publishes, and the publish promotes
@@ -26696,7 +26966,7 @@ static int ts_worker_fork_ex(tsv entry, tsv data, int shared, uint32_t young_mb)
     g_watches = NULL;
     g_mq_head = g_mq_len = 0;
     g_io_head = g_io_tail = g_io_active = NULL;
-    g_is_worker = 1; g_worker_fd = fds[1]; g_thread_id = id;
+    g_is_worker = 1; g_worker_fd = s->to_parent; g_thread_id = id;
     nh_fork_child_reset();   /* the parent's timers, ticks, immediates, watched fds and children are the parent's */
     prof_pc_fork_child();
     g_worker_data = data; ts_root_static_once(&g_worker_data, &g_worker_data_rooted);
@@ -26733,14 +27003,100 @@ static int ts_worker_fork_ex(tsv entry, tsv data, int shared, uint32_t young_mb)
     fflush(stdout); fflush(stderr);
     _exit(0);
   }
-  close(fds[1]);
-  ts_gc_unroot(2);
-  ts_watch* w = (ts_watch*)calloc(1, sizeof *w);
-  if (!w) ts_abort_msg("out of memory starting a worker");
-  close(in[0]);
-  w->id = id; w->pid = pid; w->fd = fds[0]; w->out_fd = in[1]; w->next = g_watches; g_watches = w;
-  w->region_lo = region_lo; w->region_hi = region_hi;
-  return w->id;
+}
+/* Workers started together: `n` forks of this process as it is now, each with its entry, its data, whether it
+   is a shared worker and its young budget; their ids go to `ids`.
+
+   One after another (ts_worker_start), every fork keeps this process for most of a millisecond (a young
+   collection before a shared worker's, the fork itself, the program's own code between two), so ten workers
+   start over eight milliseconds in which their parent does nothing else, and what it has to tell them waits.
+   Here this process forks once: a starter, which is this process without anything to do but fork the n
+   workers, one after another with nothing in between, and then wait for them. The parent is back after the
+   one fork; the workers are the starter's children, so their pids and their wait statuses come back through
+   memory the batch shares (worker_slot), which the parent reads when a worker's pipe ends or it must signal
+   one. Everything a worker needs of its parent is prepared before the starter is forked (the one young
+   collection, each shared worker's region and shape ids, each worker's pipes and watch), and the starter
+   closes its copies of every pipe once the last worker has them, so a worker's end of a pipe is the only
+   one. The starter ends when its last worker has. */
+void ts_workers_start_together(int n, tsv* entries, tsv* datas, const int* shared, const uint32_t* young_mb, int* ids){
+  if (n <= 0) return;
+  int any_shared = 0;
+  for (int i = 0; i < n; i++){
+    if (!ts_is_func(entries[i])) ts_throw_type_error_msg("Worker: the entry is not a function of the program");
+    if (shared[i] && g_region_mode) ts_throw_type_error_msg("Worker: a shared worker cannot fork a shared worker");
+    if (shared[i] && g_arena_depth) ts_throw_type_error_msg("Worker: a shared worker cannot be started inside an arena (its start collects, and an arena holds what it allocates)");
+    any_shared |= shared[i];
+  }
+  for (int i = 0; i < n; i++){ ts_gc_root(&datas[i]); ts_gc_root(&entries[i]); }
+  fflush(stdout); fflush(stderr);
+  int ftrace = fork_trace_on();
+  double ft0 = ftrace ? fork_trace_now_ms() : 0, ft1 = ft0, ft2 = ft0;
+  worker_start* starts = (worker_start*)calloc((size_t)n, sizeof *starts);
+  int* parent_ends = (int*)calloc((size_t)n * 2u, sizeof *parent_ends);   /* [2i] reads from worker i, [2i + 1] writes to it */
+  worker_batch* batch = (worker_batch*)calloc(1, sizeof *batch);
+  if (!starts || !parent_ends || !batch) ts_abort_msg("out of memory starting workers");
+  /* one collection for all of them: every live cell of this process is old before the first shared worker exists */
+  if (any_shared){ ts_gc_collect_young(); if (ftrace) ft1 = fork_trace_now_ms(); }
+  for (int i = 0; i < n; i++){
+    starts[i].shared = shared[i]; starts[i].young_mb = young_mb[i];
+    if (shared[i]) worker_shared_prepare(&starts[i]);
+  }
+  void* slots = mmap(NULL, sizeof(worker_slot) * (size_t)n, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
+  if (slots == MAP_FAILED) ts_abort_msg("out of memory starting workers");
+  memset(slots, 0, sizeof(worker_slot) * (size_t)n);
+  batch->slots = (worker_slot*)slots; batch->n = n; batch->alive = n;
+  for (int i = 0; i < n; i++){
+    int fds[2], in[2];
+    if (pipe(fds) != 0 || pipe(in) != 0) ts_abort_msg("Worker: pipe failed");
+    starts[i].id = ++g_watch_ids; starts[i].to_parent = fds[1]; starts[i].from_parent = in[0];
+    parent_ends[2 * i] = fds[0]; parent_ends[2 * i + 1] = in[1];
+    ids[i] = starts[i].id;
+  }
+  /* the watches, before the fork: a worker closes its parent's watches, these among them */
+  for (int i = 0; i < n; i++){
+    ts_watch* w = (ts_watch*)calloc(1, sizeof *w);
+    if (!w) ts_abort_msg("out of memory starting a worker");
+    w->id = starts[i].id; w->pid = 0; w->fd = parent_ends[2 * i]; w->out_fd = parent_ends[2 * i + 1]; w->next = g_watches; g_watches = w;
+    w->region_lo = starts[i].region_lo; w->region_hi = starts[i].region_hi;
+    w->slot = &batch->slots[i]; w->batch = batch;
+  }
+  if (ftrace){ ft2 = fork_trace_now_ms(); g_fork_trace_forked_at = ft2; g_fork_trace_frontier = g_cage_frontier; }
+  pid_t starter = fork();
+  if (starter < 0){
+    /* no process for the starter: every worker of the batch ends as one the starter could not fork does, with
+       an exit of code 1 that its parent sees when it reads the pipe (whose other end is closed below) */
+    for (int i = 0; i < n; i++){ batch->slots[i].status = 1 << 8; batch->slots[i].done = 1; }
+  }
+  if (starter == 0){
+    /* the starter: the workers, then nothing but their ends */
+    for (int i = 0; i < n; i++){
+      pid_t pid = fork();
+      if (pid == 0){
+        for (int j = 0; j < n; j++) if (j != i){ close(starts[j].to_parent); close(starts[j].from_parent); }
+        worker_child_run(&starts[i], entries[i], datas[i], ftrace);
+      }
+      if (pid > 0) batch->slots[i].pid = (int32_t)pid;
+      else { batch->slots[i].status = 1 << 8; batch->slots[i].done = 1; }   /* no process: as an exit with code 1 */
+    }
+    for (int i = 0; i < n; i++){ close(starts[i].to_parent); close(starts[i].from_parent); }
+    for (ts_watch* w = g_watches; w; w = w->next){ close(w->fd); close(w->out_fd); }
+    if (g_is_worker){ if (g_worker_fd >= 0) close(g_worker_fd); if (g_parent_fd >= 0) close(g_parent_fd); }
+    for (;;){
+      int st = 0; pid_t p = waitpid(-1, &st, 0);
+      if (p < 0){ if (errno == EINTR) continue; break; }   /* ECHILD: every worker has ended */
+      for (int i = 0; i < n; i++) if (batch->slots[i].pid == (int32_t)p){ batch->slots[i].status = (int32_t)st; batch->slots[i].done = 1; break; }
+    }
+    _exit(0);
+  }
+  for (int i = 0; i < n; i++){ close(starts[i].to_parent); close(starts[i].from_parent); }
+  batch->starter = starter > 0 ? starter : 0;
+  if (ftrace){
+    struct rusage ru; getrusage(RUSAGE_SELF, &ru);
+    fprintf(stderr, "[fork] %d workers together, starter %d: young gc %.2f ms, setup %.2f ms, fork() %.2f ms, parent max rss %ld MB\n", n, (int)starter,
+            ft1 - ft0, ft2 - ft1, fork_trace_now_ms() - ft2, (long)(ru.ru_maxrss >> 20));
+  }
+  free(starts); free(parent_ends);
+  ts_gc_unroot(2 * n);
 }
 
 /* The event loop (docs/node_compat_design.md): nextTick and microtasks, then
