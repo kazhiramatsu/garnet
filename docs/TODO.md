@@ -13564,3 +13564,35 @@ scanner's entry got a frame all the same from the slow paths generated in place)
   and the pure start is short; a function that rarely returns early pays its pure start twice, a few instructions.
 - To check: conformance and the fuzzers (an impure helper missing from the header is a silent double effect: the list of pure
   helpers is the risk, so it is a list of what is pure, and everything else leaves), the size of the code, and the A/B on tsc-ts.
+
+**Eighth slice: the generated C says what the C compiler can use** (`docs/c_for_the_compiler_design.md`; Kaz, 2026-11-23:
+emitting a form LLVM can optimize is an option too, since what we emit is C). The runtime is a native object beside the
+ThinLTO units, so a declaration in `ts_rt.h` is all the C compiler knows of a runtime function, and generated code calls a
+slow half in place at every guard.
+- **Throws that do not return** (`TS_RT_NORETURN`, eighteen declarations and seven static helpers): `ts_throw_frozen_field`
+  at every store to a field and the others were ordinary functions, so every value live after a guard sat in a callee-saved
+  register across them.
+- **Slow halves that keep the caller's registers** (`TS_RT_SLOW_CALL` / `TS_RT_COLD_CALL`: noinline, `preserve_most`): the
+  remembered set of the write barrier, element reads past the capacity, holes, foreign lengths, a number that is none, a
+  `for..of` source that is no array; `ts_get_checked_cold`, `ts_get_cold`, `ts_set_cold` for the failing side of a typed
+  field access, which is written as an unlikely branch now. `ts_truthy_fast` answers for a string in line.
+- **A typed store's two failing sides apart** (foreign receiver, then frozen instance). They were one condition whose slow
+  block read the frozen bit off a receiver that could be `undefined`: **a fault where V8 throws a TypeError**, older than this
+  session, for a store through a function value with an `undefined` receiver in a program that freezes instances (fixture
+  `classes/frozen_store_foreign_receiver`).
+- **Raw boolean returns as the greatest fixed point**: a predicate that returns its own call (`isMatchingReference`) returns
+  an `int` now; 2,212 -> 2,296 entries; the signatures computed once after the fixed point (`TSAOT_BOOL_RETURNS_REC=0`).
+- **Measured** (tsc-ts, the TypeScript 6.0.3 compiler project, instructions, r44 before): one thread 12.788 -> 12.729 G with
+  the throws (-0.46%), 12.610 G with the slow halves (-1.39%), 12.600 G with the boolean returns (**-1.47%**; cycles -3.7% on
+  a busy machine); a default run's processes 15.693 -> 15.226 G (**-3.0%**; the total of one binary moves by up to 1%
+  between two measurements, the forks' shares of the statements vary). The reports identical under three option sets.
+  Since r42 (the start of the seventh slice): one thread 13.333 -> 12.600 G (-5.5%), a default run 16.634 -> 15.2 G (-8.5%).
+- **Tried and not kept**: hot/cold splitting in the ThinLTO link (20,529 parts outlined, +1.24% on one thread); LLVM's
+  partial inliner (396 bodies outlined, -0.34% on one thread, a default run within its noise).
+- **Gates, the minimum** (`gates_s367i`, 8a03153): unit, conformance 829 / 829 plain, bench (correct and within budget), the
+  tsc-ts corpus in its plain mode 6,537 / 6,537 identical; the analyzer on tsc-ts 20 s as before.
+- **Also measured, for what comes next**: of the 14% of the checkers' samples on frame instructions, 10.8 points are in
+  functions that call generated functions (a slow half is not what gives them a frame), and 4 to 8% of all samples are the
+  frames of functions with a return reachable through loads and tests only (`build/s367/entrypot.py`): the bound of an entry
+  without a frame, emitted as two C functions. A capture parameter (the module's context) is dead in 1,087 of 5,490
+  functions and is an argument at 6% of the direct call sites (`build/s367/deadcaps.py`): small.

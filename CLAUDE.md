@@ -105,6 +105,12 @@ Rust in §315; selfhost is kept as a performance metric).
   their offsets from anything `ts_is_obj` admits, so a cell that does not begin with `ts_obj_common` keeps both words zero and
   says so in a `_Static_assert` (`TS_CELL_ZERO_WORDS`). A BigInt's first limb stood there: `1n instanceof A` was true (Session 363).
   What must leave such a cell out of an object test is `ts_is_prim_cell`; `ts_is_obj` alone says "selector", not "object".
+- **The runtime is a native object beside the ThinLTO units: a declaration in `ts_rt.h` is all the C
+  compiler knows of a runtime function** (`docs/c_for_the_compiler_design.md`, Session 367). A function
+  every path of which throws is `TS_RT_NORETURN`; the out-of-line half of a test generated code makes in
+  line is `TS_RT_SLOW_CALL` (`preserve_most`: every declaration must carry it, the convention is part of
+  the call); a guard's failing side is written `TS_RT_UNLIKELY`. A returning call left in a hot function,
+  taken or not, puts its live values in callee-saved registers that every call of the function saves.
 - **`ts_to_num` is a raw bit reinterpretation (not ToNumber).** `undefined`→NaN matches JS, but
   `null`→NaN does not.
 - **Gate a new feature behind a single predictable branch** (e.g. `if (g_has_proxies && ...)`) = zero
