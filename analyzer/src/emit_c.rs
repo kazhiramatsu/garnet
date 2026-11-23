@@ -5387,44 +5387,70 @@ fn direct_entry_sigs(
     }
     let return_facts = i64_return_facts(i64_fast);
     let empty: BTreeMap<u32, NumFact> = BTreeMap::new();
-    // Raw-boolean returns feed each other (`return isX(n)`), so the
-    // classification is iterated to a fixpoint over the set of functions
-    // whose direct entry returns a raw boolean; the set only grows.
-    let mut bool_callees: BTreeSet<u32> = BTreeSet::new();
+    // Raw-boolean returns feed each other (`return isX(n)`): the set of functions whose direct entry
+    // returns a raw boolean is a fixed point of the classification (bool_return_locals, which reads
+    // the set at a call). The greatest one: every eligible function is assumed, and one whose returns
+    // do not all hold booleans under the assumption is dropped, until none is. A function left in the
+    // set returns booleans produced in place or the results of functions in the set, so by induction
+    // on the returns of an execution every one of them returns a boolean. A predicate that calls
+    // itself, or two that call each other, are in it; growing the set from nothing (the least fixed
+    // point, TSAOT_BOOL_RETURNS_REC=0) never reaches them: their own call is what they return.
+    let mut bool_callees: BTreeSet<u32> = if bool_returns_recursive() {
+        program.functions.iter().filter(|f| direct_entry_eligible(f)).map(|f| f.id.0).collect()
+    } else {
+        BTreeSet::new()
+    };
     loop {
         set_bool_callees(&bool_callees);
-        out.clear();
-        let mut next_bool: BTreeSet<u32> = BTreeSet::new();
-        for f in &program.functions {
-            if !direct_entry_eligible(f) {
-                continue;
-            }
-            let mut local_class = local_class_map(f);
-            if let Some(&c) = fclass.get(&f.id.0) {
-                if let Some(p0) = f.params.first() {
-                    local_class.insert(p0.0, c);
-                }
-            }
-            let unboxed = unboxed_candidates(f, &local_class);
-            let pf = param_facts_by_func.get(&f.id.0).unwrap_or(&empty);
-            let numeric = infer_numeric_analysis(&f.body, &unboxed, pf, &return_facts, &int32_field_loads(&f.body, &local_class, &classes));
-            let kinds = f
-                .params
-                .iter()
-                .map(|p| param_kind(p.0, &numeric.int_local, &unboxed))
-                .collect();
-            let ret = direct_return_kind(f, &unboxed, &numeric.int_local);
-            if ret == RetKind::Bool {
-                next_bool.insert(f.id.0);
-            }
-            out.insert(f.id.0, DirectSig { kinds, ret });
-        }
+        let next_bool: BTreeSet<u32> = program
+            .functions
+            .iter()
+            .filter(|f| direct_entry_eligible(f) && !bool_return_locals(f).is_empty())
+            .map(|f| f.id.0)
+            .collect();
         if next_bool == bool_callees {
             break;
         }
         bool_callees = next_bool;
     }
+    // the signatures, once, under the set (the numeric analysis reads it too: a call's raw boolean)
+    for f in &program.functions {
+        if !direct_entry_eligible(f) {
+            continue;
+        }
+        let mut local_class = local_class_map(f);
+        if let Some(&c) = fclass.get(&f.id.0) {
+            if let Some(p0) = f.params.first() {
+                local_class.insert(p0.0, c);
+            }
+        }
+        let unboxed = unboxed_candidates(f, &local_class);
+        let pf = param_facts_by_func.get(&f.id.0).unwrap_or(&empty);
+        let numeric = infer_numeric_analysis(&f.body, &unboxed, pf, &return_facts, &int32_field_loads(&f.body, &local_class, &classes));
+        let kinds = f
+            .params
+            .iter()
+            .map(|p| param_kind(p.0, &numeric.int_local, &unboxed))
+            .collect();
+        let ret = direct_return_kind(f, &unboxed, &numeric.int_local);
+        assert_eq!(ret == RetKind::Bool, bool_callees.contains(&f.id.0), "raw boolean return of function {} outside its fixed point", f.id.0);
+        out.insert(f.id.0, DirectSig { kinds, ret });
+    }
+    if std::env::var("TSAOT_INT_STORE_FIELDS_LOG").is_ok() {
+        eprintln!("[bool-returns] {} direct entries return a raw boolean", bool_callees.len());
+    }
     out
+}
+
+/// TSAOT_BOOL_RETURNS_REC=0: the raw boolean returns as the least fixed point (no predicate that returns its own call).
+fn bool_returns_recursive() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_BOOL_RETURNS_REC").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
 }
 
 fn param_kind(id: u32, int_local: &BTreeSet<u32>, unboxed: &BTreeSet<u32>) -> ParamKind {
