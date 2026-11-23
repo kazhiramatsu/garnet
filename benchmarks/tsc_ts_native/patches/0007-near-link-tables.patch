@@ -1,0 +1,126 @@
+The symbols identifiers resolved to, and the links of symbols, in pages of 64 ids
+
+SparseLinkTable.get was 5.5 to 6.6% of the samples of every checker process of a garnet build,
+nearly all at the read of the map's index (a table as large as everything stored, read where the
+id's hash says) and the branch after it. getResolvedSymbol's lookup alone was 2.3% of a checker.
+
+The ids of a file's nodes are consecutive, and so are those of the symbols a checker creates, so the
+lookups of one function fall into a few pages of 64 ids (NearLinkTable). The symbols' links and the
+resolved symbols of identifiers are stored for most ids of the pages they touch; the links of nodes
+and the resolved types and signatures for few, and stay maps.
+
+The checkers and forks of the TypeScript compiler project together, eleven alternating runs:
+instructions 13.762 to 13.600 G (-1.2%), cycles 5.442 to 5.268 G (-3.2%), page faults +0.9%. With
+all five tables in pages: instructions +0.7%, cycles -2.6%, page faults +4.4%.
+
+diff --git a/packages/tsc-ts/src/compiler/checker.ts b/packages/tsc-ts/src/compiler/checker.ts
+index bc86451..b681f32 100644
+--- a/packages/tsc-ts/src/compiler/checker.ts
++++ b/packages/tsc-ts/src/compiler/checker.ts
+@@ -34,7 +34,7 @@ import type { EmitHelperFileLinks } from './checker-emit-helpers.js';
+ import { sideOf } from './side-state.js';
+ import type { SplitHost, StatementSplit } from './checker-split.js';
+ import type { Node, PatternAmbientModule, SourceFile } from './ast.js';
+-import { IntLinkTable, LinkTable, SparseLinkTable } from './link-tables.js';
++import { IntLinkTable, LinkTable, NearLinkTable, SparseLinkTable } from './link-tables.js';
+ import { getErrorRangeForNode, getSourceFileOfNode } from './binder-utilities.js';
+ import { Diagnostic, type DiagnosticMessage, Diagnostics, compareDiagnostics } from './diagnostics.js';
+ import {
+@@ -354,7 +354,7 @@ export class Checker implements TypeChecking {
+   // Links of symbols and nodes by symbol and node id (see link-tables.ts). Values that many symbols
+   // or nodes have are columns of their own; the rest share one links object per symbol or node,
+   // created on first use.
+-  readonly symbolLinkTable = new SparseLinkTable<SymbolLinks>();
++  readonly symbolLinkTable = new NearLinkTable<SymbolLinks>();
+   readonly nodeLinkTable = new SparseLinkTable<NodeLinks>();
+   /** The holders of the lazily computed state of types with side state (`sideOf`), by type id. */
+   readonly sideHolders = new LinkTable<Type>();
+@@ -380,7 +380,7 @@ export class Checker implements TypeChecking {
+   /** Bits of SymbolFlags for the meanings in which a symbol was referenced. */
+   readonly symbolReferenceKinds = new IntLinkTable();
+   /** The resolved symbol of an identifier, entity name or call. */
+-  readonly resolvedSymbols = new SparseLinkTable<Symbol>();
++  readonly resolvedSymbols = new NearLinkTable<Symbol>();
+   /** The resolved type of a type node or expression. */
+   readonly resolvedTypes = new SparseLinkTable<Type>();
+   /** The resolved signature of a call-like node or a signature declaration. */
+diff --git a/packages/tsc-ts/src/compiler/link-tables.ts b/packages/tsc-ts/src/compiler/link-tables.ts
+index bc3653c..1190c9c 100644
+--- a/packages/tsc-ts/src/compiler/link-tables.ts
++++ b/packages/tsc-ts/src/compiler/link-tables.ts
+@@ -75,6 +75,53 @@ export class IntLinkTable {
+   }
+ }
+ 
++/** The pages of a `NearLinkTable`: 64 ids. */
++export const enum NearPaging {
++  Bits = 6,
++  Size = 1 << Bits,
++  Mask = Size - 1,
++}
++
++/**
++ * Values by id in small pages, for ids that come in runs: the values a checker stores for most nodes of
++ * the files it checks, one after another, and reads back as it goes (the symbol an identifier resolved
++ * to). A lookup in a map of them reads a table as large as everything stored, at a place the id's hash
++ * picks; a page holds the values of the 64 ids around the last one.
++ */
++export class NearLinkTable<T> {
++  readonly pages: LinkPage<T>[] = [];
++
++  get(id: number): T | undefined {
++    const page = this.pages[id >> NearPaging.Bits];
++    return page !== undefined ? page[id & NearPaging.Mask] : undefined;
++  }
++
++  set(id: number, value: T | undefined): void {
++    const index = id >> NearPaging.Bits;
++    const page = this.pages[index];
++    if (page !== undefined) page[id & NearPaging.Mask] = value;
++    else if (value !== undefined) {
++      const pages = this.pages;
++      while (pages.length <= index) pages.push(undefined);
++      const created: (T | undefined)[] = [];
++      for (let i = 0; i < NearPaging.Size; i++) created.push(undefined);
++      pages[index] = created;
++      created[id & NearPaging.Mask] = value;
++    }
++  }
++
++  clear(): void {
++    this.pages.length = 0;
++  }
++
++  /** The number of values stored (a count over the pages: for traces). */
++  size(): number {
++    let n = 0;
++    for (const page of this.pages) if (page !== undefined) for (const v of page) if (v !== undefined) n++;
++    return n;
++  }
++}
++
+ /**
+  * Values by id in a map, for ids that are sparse: a checker caches values for a small part of the
+  * nodes of a program, spread over the declaration files it reads, where a page would mostly hold
+diff --git a/packages/tsc-ts/src/compiler/parallel-check.ts b/packages/tsc-ts/src/compiler/parallel-check.ts
+index be7ad5a..1e4b29f 100644
+--- a/packages/tsc-ts/src/compiler/parallel-check.ts
++++ b/packages/tsc-ts/src/compiler/parallel-check.ts
+@@ -1693,7 +1693,7 @@ export function traceSingleChecker(checked: CheckedProgram): void {
+     c.identityRelation.size();
+   const cpu = process.threadCpuUsage();
+   process.stderr.write(
+-    `checkers: single types ${c.typeCount} inst ${c.totalInstantiations} user ${Math.round(cpu.user / 1000)} sys ${Math.round(cpu.system / 1000)} rss ${residentMB().join('/')}MB symlinks ${c.symbolLinkTable.values.size} nodelinks ${c.nodeLinkTable.values.size} sigs ${c.signatureCount} rel ${relations}\n`,
++    `checkers: single types ${c.typeCount} inst ${c.totalInstantiations} user ${Math.round(cpu.user / 1000)} sys ${Math.round(cpu.system / 1000)} rss ${residentMB().join('/')}MB symlinks ${c.symbolLinkTable.size()} nodelinks ${c.nodeLinkTable.values.size} sigs ${c.signatureCount} rel ${relations}\n`,
+   );
+ }
+ 
+@@ -1865,7 +1865,7 @@ export function checkFromQueue(
+       cpu.user / 1000,
+       cpu.system / 1000,
+       residentMB()[0]!,
+-      checker.symbolLinkTable.values.size,
++      checker.symbolLinkTable.size(),
+       checker.nodeLinkTable.values.size,
+       checker.signatureCount,
+       relations,

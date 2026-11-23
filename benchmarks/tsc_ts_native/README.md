@@ -15,7 +15,13 @@ AOT compilers can be compared on one program.
   (docs/fork_workers_design.md, the Session 367 update). `startThreads(...,
   true)` tells tsc-ts that a thread is a fork of the thread that starts it:
   the checker of a huge file then shares the file's statements with forks
-  of itself (`patches/README.md`, "Sharing a file's statements").
+  of itself (`patches/README.md`, "Sharing a file's statements"). A checker's
+  budget grows by 32 bytes for each character of the files it may have to
+  parse in full itself (`patches/README.md`, "Files without function
+  bodies").
+- `tests/skeleton/`: programs of two and three files for
+  `scripts/tsc_ts_skeleton_check.sh`, which compiles each with its files in
+  full and without the function bodies a parse thread may leave out.
 - `patches/`: changes to the compiler's sources, applied to the build's copy
   of them (`patches/README.md`): each makes the compiler faster and changes
   nothing it reports. `TSAOT_TSC_TS_PATCHES=0` builds the sources unmodified,

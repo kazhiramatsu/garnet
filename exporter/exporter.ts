@@ -15890,13 +15890,29 @@ class Exporter {
   // of undefined); any other argument list is the element list. Shared by the
   // NewExpression and bare-call paths.
   lowerArrayConstruct(ctx: FnCtx, args: ts.Expression[], node: ts.Node, hint?: string): number {
-    if (args.length === 1) {
-      let isNumeric = false;
-      try { isNumeric = (this.checker.getTypeAtLocation(args[0]).flags & ts.TypeFlags.NumberLike) !== 0; } catch { /* not numeric */ }
+    if (args.length === 1 && !ts.isSpreadElement(args[0])) {
+      // One argument: a number is the length, any other value the array's one element. Decided here when
+      // the argument's type says which; at run time when it may be either (`any`, `unknown`, a type
+      // parameter, a union with a number in it: taken for an element, `new Array(n)` with `n: any = 3`
+      // was `[3]`).
+      let isNumeric = false, mayBeNumber = true;
+      try {
+        const t = this.checker.getTypeAtLocation(args[0]);
+        isNumeric = (t.flags & ts.TypeFlags.NumberLike) !== 0;
+        const never = ts.TypeFlags.StringLike | ts.TypeFlags.BooleanLike | ts.TypeFlags.BigIntLike | ts.TypeFlags.ESSymbolLike |
+          ts.TypeFlags.Null | ts.TypeFlags.Undefined | ts.TypeFlags.Void | ts.TypeFlags.Object | ts.TypeFlags.NonPrimitive;
+        mayBeNumber = (t.isUnion() ? t.types : [t]).some((part) => (part.flags & never) === 0);
+      } catch { /* decided at run time */ }
       if (isNumeric) {
         const nL = this.lowerExpr(ctx, args[0]);
         const dst = this.newLocal(ctx, "reference", hint);
         ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "array.newLength", args: [nL] });
+        return dst;
+      }
+      if (mayBeNumber) {
+        const v = this.lowerExpr(ctx, args[0]);
+        const dst = this.newLocal(ctx, "reference", hint);
+        ctx.body.push({ kind: "CallBuiltinStatic", dst, builtin: "array.construct1", args: [v] });
         return dst;
       }
     }

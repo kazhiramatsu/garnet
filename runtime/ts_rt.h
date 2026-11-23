@@ -2088,6 +2088,8 @@ tsv ts_array_splice(tsv arr, double start, double dc, int has_dc, tsv items);
 tsv  ts_array_splice_drop(tsv arr, double start, double dc, int has_dc, tsv items);   /* result discarded: returns undefined */
 tsv  ts_array_splice_insert1(tsv arr, double start, tsv item);                          /* splice(start, 0, item), result discarded */
 tsv ts_array_new_length(double n);
+tsv ts_array_construct1(tsv v);
+tsv ts_array_of(tsv* args, int n);
 tsv ts_array_copy_within(tsv arr, double target, double start, double end, int has_end);
 double ts_array_indexof(tsv arr, tsv v, double from, int has_from);
 int ts_array_includes(tsv arr, tsv v, double from, int has_from);

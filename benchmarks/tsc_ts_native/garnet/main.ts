@@ -42,14 +42,34 @@ const drivers: ThreadDrivers = {
  */
 const checkerYoungMb = 128;
 
+/**
+ * What a checker allocates for each character of a file it parses in full itself, in bytes: a file whose
+ * parse thread left a function body out (tsc-ts's `skippedBodyText`) is parsed and bound by the checker
+ * that takes it, in its own heap (the parse thread of checker.ts used 64 MB of its region for 3.15 M
+ * characters). Those files are part of what a checker's young budget must hold.
+ */
+const fullFileBytesPerChar = 32;
+
+/** The budget of the checkers of the program last given to one, with the files they may parse in full. */
+let checkerBudgetMb = checkerYoungMb;
+let budgetProgram: unknown = undefined;
+
 /** A thread: a forked child running this file, which calls `runThread` with `data`. */
 function spawnThread(data: ThreadData): Worker {
-  if (data.kind === 'check')
-    return new Worker(new URL(import.meta.url), { workerData: data, resourceLimits: { maxYoungGenerationSizeMb: checkerYoungMb } });
+  if (data.kind === 'check') {
+    const program = data.program;
+    if (program !== undefined && program !== budgetProgram) {
+      budgetProgram = program;
+      let chars = 0;
+      for (const file of program.getSourceFiles()) if (file.skippedBodies > 0) chars += file.text.length;
+      checkerBudgetMb = checkerYoungMb + Math.ceil((chars * fullFileBytesPerChar) / (1024 * 1024));
+    }
+    return new Worker(new URL(import.meta.url), { workerData: data, resourceLimits: { maxYoungGenerationSizeMb: checkerBudgetMb } });
+  }
   // A fork of a checker thread, started by that thread to share a huge file's statements: it has the
   // checker's heap as it is, the young cells it allocated so far among it, and the same budget again.
   if (data.kind === 'split')
-    return new Worker(new URL(import.meta.url), { workerData: data, resourceLimits: { maxYoungGenerationSizeMb: 2 * checkerYoungMb } });
+    return new Worker(new URL(import.meta.url), { workerData: data, resourceLimits: { maxYoungGenerationSizeMb: 2 * checkerBudgetMb } });
   return new Worker(new URL(import.meta.url), { workerData: data, shared: data.kind === 'parse' });
 }
 

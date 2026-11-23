@@ -139,7 +139,13 @@ Principle: **measurement over theory**. Minimal reproduction → a probe that pi
      the forked children, this can.
    - `TSAOT_FORK_TRACE=1` … each worker fork's cost (the parent's young collection, fork() itself,
      the child's time to its entry and to its exit, a region's use) and a publish walk of 50k
-     cells or more; with `TSC_TS_TIMELINE=1` (tsc-ts's own marks) the two clocks agree.
+     cells or more; with `TSC_TS_TIMELINE=1` (tsc-ts's own marks) the two clocks agree. The exit
+     line ends with the worker's user and system time, its page faults, those that copied a page
+     (a write to a page it shares with the process it was forked from, or with its own forks) and
+     the heap blocks it took: a worker's system time is its page faults, about a microsecond
+     each, and most of a checker's are first reads of pages it inherited, which nothing asks for
+     in bulk more cheaply (`madvise(MADV_WILLNEED)` on fresh heap blocks, a megabyte at a time:
+     no change in the workers' system time, Session 367).
    - `TSAOT_UNTYPED=1` … isolate whether type-driven optimization (SROA/unbox) is the cause
    - `garnet --stack-check` … every escape-analysis `Stack` object (class instance, scope record,
      closure) lives in a never-reused quarantine and dies with its activation; a dead one the
@@ -537,7 +543,21 @@ checks before or after its forks, which process reports what) is run through it 
 else: both of the patch's defects were found there or by its failing-fork knob, not by the
 compiler project, which reports no diagnostic.
 
+Patch `0006` (a file parsed without its largest function's body for the checkers of other files)
+has a check of its own, `scripts/tsc_ts_skeleton_check.sh <binary> <TypeScript checkout>`: cases of
+two and three files, and the compiler project under options that report hundreds of diagnostics,
+each in full, by default and with every body left out (`TSC_TS_SKELETON_BODY=1`). A corpus case is
+one file, so the corpus under the same knob checks the parse and the replacement of the file, not
+what the checkers of other files read: both commands are in the patches' README. Anything that
+changes what a parse thread hands the main thread, or what a checker thread does before its first
+file, goes through both.
+
 The wall clock of a default run at millisecond resolution is the timeline's own
 (`TSC_TS_TIMELINE=1`: `@<ms> main exit`, milliseconds since the executable was loaded):
 `/usr/bin/time` rounds to 10 ms, which is the size of most changes to the parse phase. Take the
-minimum and the median of twenty alternating runs.
+minimum and the median of twenty alternating runs. A default run is work on every processor from
+the moment the root files are queued (the parse threads, then the checkers and their forks), so
+what a change to the schedule gains is what it removes of processors waiting: delaying one process
+that has processors to share its work with later costs nothing (the checker of the largest file
+started 70 ms late: the end moved by 1 to 3 ms), and work moved from one phase to the other gains
+nothing by itself.

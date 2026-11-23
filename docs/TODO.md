@@ -13369,3 +13369,91 @@ deterministic; not done: it is upstream's behaviour, for a program with module e
    112-byte cell, the publish walk (13 ms of the critical path).
 4. In tsc-ts: the accessors of ast.ts at their hottest callers (`getLocals` in the resolver's scope walk, `getText` in
    `isMatchingReference`), the per-call state objects and their arrays.
+
+**Sixth slice: the checkers start when the other files are parsed** (tsc-ts's patches `0005` to `0007`, their README; r42). After
+the fifth slice the parse phase was one file again: checker.ts read, parsed, bound and published in 45 ms on one thread while
+the other 248 files were done 12 to 15 ms earlier, and the ten checkers waited for the body of `createTypeChecker`, which none of
+the nine that check other files reads.
+
+- **How much an early start is worth, measured first.** The first checker started late by a knob, the largest file kept for it:
+  20, 40, 55 and 70 ms late moved the end of the compile by 1 to 3 ms (258.9 / 270.4 ms at 0, 260.3 / 271.3 at 70, minimum / median
+  of 21): that checker shares what is left of its file with forks of itself once the others run out of files, so its own start
+  does not bound anything. What bounds the others is when they start.
+- **`0006`: a file without the body of its largest function.** A parse thread leaves out the body of a function declaration at
+  the top of a TypeScript module that has a return type and a megabyte of body: the file without it takes 7 ms and stands in for
+  itself, the program is built and the checkers start when the other files are parsed, and the checker that takes the file parses
+  it in full in its own heap and continues with a program of its own (`Program.updateFile`, which tsc-ts has for an edited file).
+  Where the body ends is a guess (the first line that starts with `}`) that the checker's own parse confirms, or the command line
+  runs again in full; what a signature can read of its body (a `typeof` query, a computed name, an initializer without a type)
+  keeps the body. The README has the argument and the knobs.
+- **`0005`: the parse threads' queue.** With the largest file out of the way the other files decide when the checkers start, and
+  they took 35 ms for 25 ms of work on nine threads: sixteen root files a chunk (2.4 MB, 25 ms, on three threads while six
+  waited), the automatic type directives in the first of those chunks (the 65 files of `@types/node` queued 29 ms late), every
+  chunk queued ahead on the threads that were idle during a match of one millisecond. Chunks are bounded by their bytes, the type
+  directives go out with the libraries, a thread holds ahead what it loads in the time the match has taken, the large files go
+  out the largest first.
+- **`0007`: two of the checker's tables in pages.** `SparseLinkTable.get` was 5.5 to 6.6% of the samples of every checker
+  process, at the read of the map's index and the branch after it; `getResolvedSymbol`'s lookup alone 2.3%. The symbols
+  identifiers resolved to and the links of symbols are in pages of 64 ids now: the checkers and forks together, eleven alternating
+  runs, instructions -1.2%, cycles -3.2%, page faults +0.9%. The other three tables hold few ids of a page and stay maps (all
+  five in pages: instructions +0.7%, page faults +4.4%).
+- **In garnet:** a checker's young budget covers the file it may parse in full (`garnet/main.ts`). The fork trace's exit line
+  has the worker's user and system time, its page faults, those that copied a page, and its heap blocks.
+
+Two defects found on the way, both older than the session:
+
+- **A shared worker that makes the run's first Error died** ("a shared worker interned a new property name '__is_error'"): the
+  Error mark was interned by the first Error, and a shared worker cannot intern. tsc-ts given files on the command line with
+  `--ignoreConfig` lost the two parse threads of those files that way (r36 too), and the main thread parsed them instead, so
+  nothing was wrong in what it printed. The mark is interned with the Error prototypes
+  (`tests/conformance/exhaustive/node/worker_shared_errors.ts`, which fails without it).
+- **`new Array(v)` with `v` of no known type was `[v]`** when `v` held a number: `const n: any = 3; new Array(n)` had length 1
+  where V8 makes three holes, and `-1` or `1.5` gave an array where V8 throws. The exporter chose length or element by the
+  argument's static type; where the type does not say (`any`, `unknown`, a type parameter, a union with a number) the runtime
+  chooses now (`array.construct1`, `ts_array_construct1`; `tests/conformance/exhaustive/arrays/array_constructor_one_argument.ts`).
+  `Array` read as a value already did.
+
+Checked: the corpus on two checkers with every body left out that may be, 6,537 of 6,537 identical (a file replaced by its
+checker in 75), and with the checker's parse made to disagree, 6,537 identical (75 compiled again);
+`scripts/tsc_ts_skeleton_check.sh`: eight programs of two and three files, and the compiler project where 69 of 78 files then
+stand in for themselves, under option sets that report 1,391 and 762 diagnostics, all as in full.
+
+Gates (r42g, built by the gate run from the patches): unit, bundler 56, conformance 824 / 824 plain and strict and 821 / 821 under
+the collector's protection, bench, ci, the IR snapshot (5,085 files: retaken for the two new fixtures, no other file changed),
+GC stress, hono, hono_app and vue (outputs identical, instructions within 0.06%); tsc-ts: the files it emits on one thread
+identical to r41's (instructions +0.3%, which is `0007` with one checker for every file, where its cycles are still -1.5%),
+`scripts/tsc_ts_skeleton_check.sh`, the protection modes with every body left out, eight default runs and four with 2,229 lines
+of diagnostics the same, and the corpus four ways, 6,537 identical each: one thread against r41, two checkers with every body
+left out, with the checker's parse made to disagree, and with bodies left out and forks forced (forks in 3,749 cases).
+
+Milliseconds from the executable's load to its exit, minimum / median of 21 alternating runs (load 6 to 10):
+
+| build | the other files parsed | checkers start | exit |
+|---|---|---|---|
+| r41, plain | 50.8 / 54.8 | 68.7 / 75.4 | 259.7 / 272.1 |
+| r42, plain | 39.5 / 43.7 | 44.0 / 49.0 | 246.3 / 249.7 |
+| r41, trained | 46.1 / 50.2 | 62.6 / 70.4 | 221.9 / 233.0 |
+| r42, trained | 40.1 / 42.9 | 44.2 / 48.0 | 201.5 / 214.9 |
+
+`/usr/bin/time`, 15 rounds: tsrs 0.15 / 0.16 s, r41 trained 0.22 / 0.23, r42 trained 0.21 / 0.22; user time 0.89 to 0.82 s. The
+workers' instructions are what they were (parse workers 3.77 to 2.96 G, checkers and forks 12.78 to 13.73 G: the body's parse
+moved, and the forks take more of the file and resolve more of it again): the gain is processors that no longer wait.
+
+Measured and not kept: **parse threads started when there is a chunk for them** (the root files queued at 10.2 ms instead of
+15.6, the last thread started at 22.6 instead of 15: the other files parsed at 46.9 / 52.7 ms against 48.7 / 51.7, the end
+unchanged; ten forks are 8 ms of the main thread whenever they are made). **The pages of fresh heap blocks asked for a megabyte
+at a time** (`madvise(MADV_WILLNEED)`, which maps anonymous memory on Darwin, two thirds of the time of the faults in a loop
+that touches every page): the workers' system time and faults unchanged over seven runs; of a checker's 8,500 faults 3,600 are
+its own heap's first writes, 200 copy a page, and the rest are first reads of pages it inherited (its system time, 12 ms of
+105, is about a microsecond a fault). **The declared signatures of a huge function's nested functions resolved before its
+statements**, for the forks to inherit: no change (patches' README).
+
+**Where the wall is after the sixth slice.** A default run is the main thread alone for 14 ms (6 to the entry, 8 for ten
+forks, the match), then every processor until the end: the parse threads for 28 ms, 4 ms of the main thread building the
+program, then the checkers, which start one fork apart (0.9 ms each: the tenth starts 9 ms after the first). The whole is
+16.7 G instructions (plain) on a machine that runs about 67 M a millisecond when every processor works, which is the 250 ms. So:
+(1) the forks one after another: twenty of them are 17 ms of the main thread, with processors waiting behind each; workers
+started together as a tree of forks would take a tenth of that. (2) The same lazy work in several processes: ten checkers
+create 311 K types where two create 140 K. A schedule that lets a first checker warm up before the others are forked from it
+idles nine processors meanwhile, which by the arithmetic costs what it saves (not built). (3) The cost of an operation in
+generated code. (4) The 6 ms to the entry.

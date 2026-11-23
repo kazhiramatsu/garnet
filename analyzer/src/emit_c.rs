@@ -24624,6 +24624,8 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     false,
                 ),
                 "array.newLength" => (format!("ts_array_new_length({})", n(0)), false),
+                // new Array(v) with v of no type that says whether it is a length or an element
+                "array.construct1" => (format!("ts_array_construct1({})", v(0)), false),
                 "array.from" => (
                     if args.len() >= 2 {
                         format!("ts_array_from_mapped({}, {})", v(0), v(1))

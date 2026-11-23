@@ -577,7 +577,15 @@ fork:
    static.
    Interning a *new* property name in a shared worker aborts loudly in this
    version (the parent could not map the id); tsc-ts's parse and bind are
-   expected not to, and the abort says so if they do.
+   expected not to, and the abort says so if they do. The names the runtime
+   itself interns on first use are therefore the parent's before the first
+   fork where a worker can need them: an Error's mark (`__is_error`) was
+   interned by the first Error of a run, and a run whose first Error is one
+   a worker makes and catches lost that worker (Session 367: tsc-ts given
+   its files on the command line with `--ignoreConfig`; its parse threads
+   catch one, and the main thread parsed their files instead). It is
+   interned with the Error prototypes now
+   (`tests/conformance/exhaustive/node/worker_shared_errors.ts`).
 4. **`publish` in the child** walks the graph from the root with the
    collector's visitor: each cell gets the integrity bit (or the published
    flag for a collection), the generation `OLD` so the child's young

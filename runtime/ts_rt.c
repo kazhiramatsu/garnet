@@ -9293,6 +9293,15 @@ tsv ts_array_new_length(double n){
   }
   return ts_new_array((uint32_t)n);
 }
+/* new Array(v) (or Array(v)) with one argument whose type does not say what it is: a number is the length, any other
+   value the one element. */
+tsv ts_array_construct1(tsv v){
+  if (ts_is_num(v)) return ts_array_new_length(ts_to_num(v));
+  ts_gc_root(&v);
+  tsv arr = ts_array_of(&v, 1);
+  ts_gc_unroot(1);
+  return arr;
+}
 /* @@isConcatSpreadable on an operand */
 static int array_concat_custom(tsv v){
   return (ts_is_obj(v) || ts_is_func(v)) && !ts_is_prim_cell(v) && ts_get(v, TS_KEY_WKSYM(TS_WKSYM_IS_CONCAT_SPREADABLE)) != TS_UNDEFINED;
@@ -12635,9 +12644,14 @@ static tsv error_capture_stack_trace(tsv* a, int n){
   ts_gc_unroot(1);
   return TS_UNDEFINED;
 }
+static ts_key error_mark_key(void);
 void ts_setup_error_protos(void){
   if (g_error_protos_init) return;
   g_error_protos_init = 1;
+  /* The mark of an Error instance is a name of its own, interned with the prototypes rather than by the first
+     Error: a shared worker cannot intern a name (ts_intern_field), and the first Error of a run may be one a
+     worker makes and catches (a parse thread of tsc-ts given files on the command line died of it). */
+  (void)error_mark_key();
   tsv objproto = ts_object_proto();
   static int rooted[TS_ERR_KINDS];
   for (int i = 0; i < TS_ERR_KINDS; i++){
@@ -26566,6 +26580,19 @@ static void fork_trace_self_counts(unsigned long long* insn, unsigned long long*
 static void fork_trace_self_counts(unsigned long long* insn, unsigned long long* cycles){ *insn = 0; *cycles = 0; }
 #endif
 static double g_fork_trace_forked_at = 0;   /* the parent's clock just before fork(), inherited by the child */
+static uint32_t g_fork_trace_frontier = 0;  /* the heap cage's frontier then: the child's exit line says how many blocks it took since */
+/* The page faults of this process that copied a page (a write to a page shared with the process it was forked from, or with
+   its own forks), for the worker's exit line. */
+#ifdef __APPLE__
+#include <mach/mach.h>
+static long fork_trace_cow_faults(void){
+  struct task_events_info info; mach_msg_type_number_t count = TASK_EVENTS_INFO_COUNT;
+  if (task_info(mach_task_self(), TASK_EVENTS_INFO, (task_info_t)&info, &count) != KERN_SUCCESS) return -1;
+  return (long)info.cow_faults;
+}
+#else
+static long fork_trace_cow_faults(void){ return -1; }
+#endif
 #define TS_SHARED_WORKER_YOUNG_FACTOR 16u   /* a shared worker's young budget over the default (below) */
 static int ts_worker_fork_ex(tsv entry, tsv data, int shared, uint32_t young_mb){
   if (!ts_is_func(entry)) ts_throw_type_error_msg("Worker: the entry is not a function of the program");
@@ -26613,7 +26640,7 @@ static int ts_worker_fork_ex(tsv entry, tsv data, int shared, uint32_t young_mb)
   int fds[2], in[2];
   if (pipe(fds) != 0) ts_throw_type_error_msg("Worker: pipe failed");
   if (pipe(in) != 0){ close(fds[0]); close(fds[1]); ts_throw_type_error_msg("Worker: pipe failed"); }
-  if (ftrace){ ft2 = fork_trace_now_ms(); g_fork_trace_forked_at = ft2; }
+  if (ftrace){ ft2 = fork_trace_now_ms(); g_fork_trace_forked_at = ft2; g_fork_trace_frontier = g_cage_frontier; }
   int id = ++g_watch_ids;
   pid_t pid = fork();
   if (pid < 0){ close(fds[0]); close(fds[1]); close(in[0]); close(in[1]); ts_throw_type_error_msg("Worker: fork failed"); }
@@ -26695,9 +26722,12 @@ static int ts_worker_fork_ex(tsv entry, tsv data, int shared, uint32_t young_mb)
     if (ftrace){
       unsigned long long insn, cycles; fork_trace_self_counts(&insn, &cycles);
       struct rusage ru; getrusage(RUSAGE_SELF, &ru);
-      fprintf(stderr, "[fork child] %d: exit %.2f ms after the fork, region used %u MB, young collections %llu, instructions %.4f G, cycles %.4f G, max rss %ld MB\n", (int)getpid(),
+      long cow = fork_trace_cow_faults();
+      fprintf(stderr, "[fork child] %d: exit %.2f ms after the fork, region used %u MB, young collections %llu, instructions %.4f G, cycles %.4f G, max rss %ld MB, user %.1f ms, system %.1f ms, faults %ld, copied %ld, heap blocks %u\n", (int)getpid(),
               fork_trace_now_ms() - g_fork_trace_forked_at, g_region_mode ? (unsigned)((((size_t)(g_region_cur - g_region_lo)) << GC_BLOCK_SHIFT) >> 20) : 0u,
-              (unsigned long long)g_minor_collections, (double)insn / 1e9, (double)cycles / 1e9, (long)(ru.ru_maxrss >> 20));
+              (unsigned long long)g_minor_collections, (double)insn / 1e9, (double)cycles / 1e9, (long)(ru.ru_maxrss >> 20),
+              ru.ru_utime.tv_sec * 1e3 + ru.ru_utime.tv_usec / 1e3, ru.ru_stime.tv_sec * 1e3 + ru.ru_stime.tv_usec / 1e3, (long)ru.ru_minflt, cow,
+              (unsigned)(g_cage_frontier - g_fork_trace_frontier));
     }
     prof_pc_dump_child();
     fflush(stdout); fflush(stderr);

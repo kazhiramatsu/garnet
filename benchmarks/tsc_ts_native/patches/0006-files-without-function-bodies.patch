@@ -1,0 +1,712 @@
+Files without the bodies of their largest functions for the checkers of other files
+
+checker.ts is 3.15 MB, 3.10 of them the body of createTypeChecker. Its parse thread reads, parses,
+binds and publishes it in 45 ms, the other 248 files of the TypeScript compiler are parsed 15 to
+30 ms earlier, and the checkers of those files wait for a body none of them reads.
+
+A parse thread now leaves such a body out (Parser.skipFunctionBlock): of a function declaration at
+the top of a TypeScript module, with a return type, whose body has a megabyte of text or more
+(TSC_TS_SKELETON_BODY; TSC_TS_SKELETON=0 for none). The file without it takes its thread 7 ms and
+stands in for itself (SourceFile.skippedBodies): the program is built and the checkers start when
+the other files are parsed. The checker that takes the file parses it in full, in its own heap,
+and continues with a program of its own in which the file is whole (withFullFile, over
+Program.updateFile).
+
+What keeps the diagnostics those of files parsed in full:
+
+- Where the body ends is a guess that is checked. Nothing between the braces is read: the body is
+  taken to end at the first line that starts with `}`, in a declaration that starts a line and
+  whose `{` ends one. The checker's own parse says whether it does (the same statements at the top
+  of the file, each from and to the same character, and no syntax error); if not, or if the file in
+  full does not import what the file without the body does, the command line is run again with
+  every file parsed in full (compileAgainInFull).
+- The checkers of other files read the signature, not the body. A body's declarations are in scope
+  in the signature as values, not as types: a signature with a typeof query or a computed property
+  name, or a parameter typed by its initializer or its binding pattern, keeps its body, and so does
+  a function without a return type. A file that is a module only by what a body holds is parsed in
+  full.
+- Only where every use of the program's files is a check on a checker thread: not when the program
+  emits or reports declaration diagnostics, is incremental or watched, lists files or counts nodes,
+  or has one checker; a program that is not checked after all (a syntax error elsewhere, a thread
+  that failed) compiles again in full.
+
+On the TypeScript compiler project (noEmit, ten checkers, a plain garnet build on a loaded machine,
+fifteen alternating runs, with the change before this one in both): the checkers start at 45.9 ms
+(minimum) and 49.9 (median) instead of 70.5 and 75.3, and the compile ends at 256.0 and 267.2 ms
+instead of 269.4 and 281.5. The whole work is what it was (the body is parsed by a checker instead
+of a parse thread, and the forks of that checker take more of the file); what is gone is nine
+processors waiting for one file. The checker of checker.ts starts on its statements 60 ms later
+than it did: delaying it by up to 70 ms in the old schedule moved the end by 1 to 3 ms, since it
+shares what is left with forks of itself.
+
+Checked with every body left out that may be (TSC_TS_SKELETON_BODY=1): the corpus on two checkers,
+6,537 cases identical, a file replaced by its checker in 75; with the checker's parse made to
+disagree (TSC_TS_SKELETON_FAIL=1), 6,537 identical and 75 compiled again; the compiler project,
+where 69 of 78 files then stand in for themselves, under options that report 1,391 and 762
+diagnostics; and eight cases of two and three files with errors in and outside bodies.
+
+diff --git a/packages/tsc-ts/src/compiler/ast.ts b/packages/tsc-ts/src/compiler/ast.ts
+index 2086146..fb314c0 100644
+--- a/packages/tsc-ts/src/compiler/ast.ts
++++ b/packages/tsc-ts/src/compiler/ast.ts
+@@ -8152,6 +8152,11 @@ export class SourceFile extends Node {
+   patternAmbientModules: PatternAmbientModule[];
+   /** UMD exports from `export as namespace N`. */
+   globalExports: SymbolTable | undefined;
++  /**
++   * The function bodies the parser left out (`parseSourceFile`'s `skipBodies`): above 0 the file stands in
++   * for itself, for the checkers of other files; the checker that checks it parses it in full first.
++   */
++  skippedBodies: number;
+ 
+   constructor(
+     fileName: string,
+@@ -8204,6 +8209,7 @@ export class SourceFile extends Node {
+     this.symbolCount = 0;
+     this.patternAmbientModules = [];
+     this.globalExports = undefined;
++    this.skippedBodies = 0;
+   }
+ 
+   forEachChild(v: NodeVisitor): boolean {
+diff --git a/packages/tsc-ts/src/compiler/parallel-check.ts b/packages/tsc-ts/src/compiler/parallel-check.ts
+index a76a920..be7ad5a 100644
+--- a/packages/tsc-ts/src/compiler/parallel-check.ts
++++ b/packages/tsc-ts/src/compiler/parallel-check.ts
+@@ -19,6 +19,10 @@
+  * that is left with a huge file while others have run out of files shares the file's statements with
+  * forks of itself, one for each idle processor (`ThreadSplit`, checker-split.ts).
+  *
++ * A file whose parse thread left a function body out (`skippedBodyText`) stands in for itself until a
++ * checker takes it: that checker parses it in full and checks it, and what it takes after it, against
++ * a program of its own with the file in full (`withFullFile`).
++ *
+  * In scriptc builds, threads share one program: the main thread computes the program's lazy caches,
+  * publishes it with `@scriptc/threads` (the program becomes immutable and immortal, and threads
+  * receive it by reference), and keeps the JSDoc that checking parses lazily in tables of each thread.
+@@ -27,9 +31,11 @@
+  * thread revives the diagnostics it receives against its own files.
+  */
+ import { mark, markAt, timeline } from './timeline.js';
++import { spawnSync } from 'node:child_process';
+ import type { Worker } from 'node:worker_threads';
+ import { publish, sharesPublishedGraphs } from '@scriptc/threads';
+-import { lastNodeIdValue } from './ast.js';
++import { lastNodeIdValue, ParseOptions, ScriptKind } from './ast.js';
++import { bindSourceFile } from './binder.js';
+ import {
+   declarationDiagnosticsOfFile,
+   EmitIndexes,
+@@ -39,10 +45,11 @@ import {
+ } from './compile-program.js';
+ import { Diagnostic, DiagnosticFile, RepopulateInfo } from './diagnostics.js';
+ import { EmitOnly, EmitResult } from './emitter.js';
+-import { getEmitDeclarations, isIncremental } from './options.js';
++import { type CompilerOptions, getEmitDeclarations, isIncremental } from './options.js';
+ import { DeclarationSignatureWriter } from './incremental.js';
+-import { useLazyJSDocTable } from './parser.js';
+-import type { CheckedProgram } from './program-checker.js';
++import { parallelParse, PreparedFile } from './parallel-parse.js';
++import { parseSourceFile, useLazyJSDocTable } from './parser.js';
++import { CheckedProgram } from './program-checker.js';
+ import type { Program } from './program.js';
+ import type { SourceFile } from './ast.js';
+ import { lastSymbolIdValue } from './symbol.js';
+@@ -1001,7 +1008,8 @@ class ThreadSplit implements SplitHost {
+   private readonly files = new Map<string, DiagnosticFile>();
+ 
+   constructor(
+-    readonly checked: CheckedProgram,
++    /** The thread's program: the one it was started with, or its own with a file in full (`withFullFile`). */
++    public checked: CheckedProgram,
+     private readonly schedule: Int32Array,
+   ) {}
+ 
+@@ -1117,6 +1125,118 @@ export function whenForksDone(result: CheckerResult, post: () => void): void {
+   });
+ }
+ 
++/**
++ * The least text, in characters, of a function body that the parse threads of a program with `options`
++ * leave out of the file they return when `checkers` threads check it (TSC_TS_SKELETON_BODY, 1,000,000;
++ * TSC_TS_SKELETON=0 for none), or 0 where they leave none out.
++ *
++ * The checkers start once every file is parsed, and a file that is mostly one function takes its parse
++ * thread long after the others are done (TypeScript's `checker.ts`: 3 MB in `createTypeChecker`, 45 ms
++ * when the other 248 files of the compiler take 30 on nine threads). What the checkers of the other
++ * files read of such a file is outside the function's body (`Parser.skipFunctionBlock`), so they start
++ * with the file as it is without the body, and the checker that takes the file parses it in full
++ * (`withFullFile`): it starts on the file later than it would have, and shares more of it with forks of
++ * itself once the others run out of files (`ThreadSplit`).
++ *
++ * Only where every use of the program's files is a check on a checker thread, which is where a file
++ * left without a body is replaced: not when the program emits or reports declaration diagnostics, is
++ * incremental or watched, lists its files or counts its nodes, and not without checker threads.
++ */
++export function skippedBodyText(options: CompilerOptions, checkers: number): number {
++  if (process.env.TSC_TS_SKELETON === '0' || checkers < 2 || !sharesPublishedGraphs) return 0;
++  if (
++    options.noEmit !== true ||
++    options.noCheck === true ||
++    options.watch === true ||
++    options.listFilesOnly === true ||
++    options.diagnostics === true ||
++    options.extendedDiagnostics === true ||
++    isIncremental(options) ||
++    getEmitDeclarations(options)
++  )
++    return 0;
++  return Math.max(1, splitNumber(process.env.TSC_TS_SKELETON_BODY, 1_000_000));
++}
++
++/** Whether a file of `program` stands in for itself (`SourceFile.skippedBodies`). */
++export function standsIn(program: Program): boolean {
++  for (const file of program.getSourceFiles()) if (file.skippedBodies > 0) return true;
++  return false;
++}
++
++/** What a thread throws that finds a file other than it was taken to be without a body (`withFullFile`). */
++const bodyMisplaced = 'A function body does not end where it was taken to end';
++
++/**
++ * Runs the command line again in a process of its own, with every file parsed in full, and exits with
++ * its status: for a program with a file that stands in for itself (`standsIn`) which a thread found
++ * to be another file in full (`withFullFile`), or which is not checked on threads after all (one
++ * checker, a syntax error elsewhere, a thread that failed). Nothing was reported yet; `workers` are
++ * the checker threads that run.
++ */
++export function compileAgainInFull(workers: readonly Worker[] = []): never {
++  mark('compiling again in full');
++  for (const worker of workers) void worker.terminate();
++  const env: { [name: string]: string | undefined } = {};
++  for (const name of Object.keys(process.env)) env[name] = process.env[name];
++  env.TSC_TS_SKELETON = '0';
++  const again = spawnSync(process.execPath, process.argv.slice(2), { stdio: 'inherit', env });
++  return process.exit(again.status ?? 1);
++}
++
++/**
++ * Whether `full`, the file `skeleton` stands in for, is that file outside the bodies it was parsed
++ * without: no syntax error (the program reports those before it checks anything), and the same
++ * statements at the top, each from and to the same character. The statements of both come from the
++ * same text and, with a body that ends where it was taken to end, from the same parser state, so
++ * what is outside the bodies is then the same node for node.
++ */
++function sameOutsideBodies(skeleton: SourceFile, full: SourceFile): boolean {
++  if (full.diagnostics.length !== 0) return false;
++  const a = skeleton.statements.nodes;
++  const b = full.statements.nodes;
++  if (a.length !== b.length) return false;
++  for (let i = 0; i < a.length; i++) {
++    const x = a[i]!;
++    const y = b[i]!;
++    if (x.kind !== y.kind || x.pos !== y.pos || x.end !== y.end) return false;
++  }
++  return true;
++}
++
++/**
++ * The program of `checked` with `file`, which stands in for itself, parsed in full, for the thread
++ * that checks the file: a program of its own, as an edit of the file gives one (`Program.updateFile`,
++ * which also finds a module the body imports). The other threads keep the file without its bodies.
++ * Throws when the file in full is another file than it was taken to be, or cannot take its place:
++ * the program is then compiled again (`compileAgainInFull`).
++ */
++function withFullFile(checked: CheckedProgram, file: SourceFile): CheckedProgram {
++  const start = timeline ? performance.now() : 0;
++  const options = file.externalModuleIndicatorOptions;
++  const full = parseSourceFile(file.fileName, file.text, new ParseOptions(file.path, ScriptKind.Unknown, options));
++  const parsed = timeline ? performance.now() : 0;
++  bindSourceFile(full);
++  if (timeline)
++    markAt(
++      start,
++      `full file parse ${(parsed - start).toFixed(1)} bind ${(performance.now() - parsed).toFixed(1)} ${file.fileName}`,
++    );
++  let program: Program | undefined = undefined;
++  if (sameOutsideBodies(file, full) && process.env.TSC_TS_SKELETON_FAIL !== '1') {
++    // The program's host takes the file where it takes a parse thread's.
++    const files = parallelParse.files;
++    const prepared = files.get(file.fileName);
++    files.set(file.fileName, new PreparedFile(file.fileName, file.path, options.jsx, options.force, full, ''));
++    program = checked.program.updateFile(file.path, checked.program.host);
++    if (prepared !== undefined) files.set(file.fileName, prepared);
++    else files.delete(file.fileName);
++  }
++  if (program === undefined || program.getSourceFileByPath(file.path) !== full) throw new Error(bodyMisplaced);
++  mark('full program');
++  return new CheckedProgram(program);
++}
++
+ /** The rest of a group that checker `index` took from the shared queue, by checker index. */
+ const reservedPositions = new Map<number, number[]>();
+ 
+@@ -1601,7 +1721,9 @@ export function checkFromQueue(
+   const readyAt = Date.now();
+   const verbose = process.env.TSC_TS_CHECKERS_TRACE === '3';
+   mark('checking');
+-  const files = checked.program.getSourceFiles();
++  let files = checked.program.getSourceFiles();
++  // The global diagnostics of the checker this thread had before it took a file in full (`withFullFile`).
++  const carried: Diagnostic[] = [];
+   const done: number[] = [];
+   const diagnostics: Diagnostic[][] = [];
+   const declarations: Diagnostic[][] = [];
+@@ -1669,6 +1791,17 @@ export function checkFromQueue(
+       break;
+     }
+     const i = order[k]!;
++    if (files[i]!.skippedBodies > 0) {
++      // The file stands in for itself: this thread checks it, and what it takes from here on, against
++      // a program with the file in full.
++      if (done.length > 0) for (const d of checked.getGlobalDiagnostics()) carried.push(d);
++      checked = withFullFile(checked, files[i]!);
++      files = checked.program.getSourceFiles();
++      if (threadSplit !== undefined) {
++        threadSplit.checked = checked;
++        checked.checker.splitHost = threadSplit;
++      }
++    }
+     done.push(i);
+     const fileStart = verbose || timeline ? performance.now() : 0;
+     // Without `checking` the file is only emitted: declaration emit checks what it needs.
+@@ -1712,6 +1845,7 @@ export function checkFromQueue(
+   if (ranOut && !onMainThread) Atomics.add(counter, counter.length - 3, 1);
+   // The main thread reports its own global diagnostics (CheckedProgram.getGlobalDiagnostics).
+   const globals = onMainThread ? [] : checked.getGlobalDiagnostics().slice();
++  for (const d of carried) globals.push(d);
+   let stats: number[] = [];
+   if (process.env.TSC_TS_CHECKERS_TRACE !== undefined) {
+     const cpu = process.threadCpuUsage();
+@@ -1938,10 +2072,16 @@ export function startParallelCheck(
+   const firstThread = mainChecks ? 1 : 0;
+   let remaining = count - firstThread;
+   let ownDone = false;
++  const workers: Worker[] = [];
+   const finish = (): void => {
+     if (checking) {
+-      // A thread that failed may have taken files it never checked: check them here.
+-      for (const i of order) if (perFile[i] === undefined) perFile[i] = checked.unfilteredDiagnosticsOfFile(files[i]!);
++      // A thread that failed may have taken files it never checked: check them here. Not a file that
++      // stands in for itself, which a thread replaces by the file in full.
++      for (const i of order)
++        if (perFile[i] === undefined) {
++          if (files[i]!.skippedBodies > 0) compileAgainInFull(workers);
++          perFile[i] = checked.unfilteredDiagnosticsOfFile(files[i]!);
++        }
+       checked.checkedInParallel = perFile;
+     }
+     mark('all checked');
+@@ -1999,6 +2139,7 @@ export function startParallelCheck(
+       emitKinds,
+       checking,
+     );
++    workers.push(worker);
+     worker.on('message', (message: unknown) => {
+       mark(`result from c${i}`);
+       let result: CheckerResult;
+@@ -2015,6 +2156,8 @@ export function startParallelCheck(
+     });
+     worker.on('error', (error: unknown) => {
+       if (trace) process.stderr.write(`checkers: thread ${i} failed: ${String(error)}\n`);
++      // The files were checked against a file that is another file in full (`withFullFile`).
++      if (String(error).includes(bodyMisplaced)) compileAgainInFull(workers);
+       threadDone();
+     });
+   };
+diff --git a/packages/tsc-ts/src/compiler/parallel-parse.ts b/packages/tsc-ts/src/compiler/parallel-parse.ts
+index 424b889..680645f 100644
+--- a/packages/tsc-ts/src/compiler/parallel-parse.ts
++++ b/packages/tsc-ts/src/compiler/parallel-parse.ts
+@@ -129,9 +129,15 @@ export type LoadMessage = {
+ /**
+  * Starts a parse thread (main.ts owns the worker entry point). It reads the config `configFileName`
+  * (`''` for none) with the command line of this run, takes ids from `counter`, and loads the chunks
+- * posted to it (`LoadMessage`) until it is told to stop.
++ * posted to it (`LoadMessage`) until it is told to stop. It leaves out the function bodies of
++ * `skipBodies` characters or more that it may (`parseSourceFile`), none with 0.
+  */
+-export type ParserSpawn = (configFileName: string, counter: SharedArrayBuffer, index: number) => Worker;
++export type ParserSpawn = (
++  configFileName: string,
++  counter: SharedArrayBuffer,
++  index: number,
++  skipBodies: number,
++) => Worker;
+ 
+ export class ParallelParse {
+   /** Set where parse threads can be started and share what they parse (scriptc builds). */
+@@ -426,7 +432,9 @@ export class ParseSession {
+    * Starts `count` parse threads for a program with `options`, with or without root files
+    * (`hasRootFiles`; `true` when not known yet). They read the config `configFileName` (`''` for none).
+    * They don't load the files `skip` names (a library's name, or another file's normalized name),
+-   * which the program gets elsewhere; nor the files only those add.
++   * which the program gets elsewhere; nor the files only those add. With `skipBodies` above 0 they leave
++   * out the function bodies of that many characters or more that they may (`skippedBodyText`,
++   * parallel-check.ts: the program is then checked on threads that parse such a file in full).
+    */
+   constructor(
+     private readonly count: number,
+@@ -435,8 +443,9 @@ export class ParseSession {
+     configFileName: string,
+     hasRootFiles: boolean,
+     skip?: (kind: LoadKind, name: string) => boolean,
++    skipBodies = 0,
+   ) {
+-    mark(`parse start, ${count} threads`);
++    mark(`parse start, ${count} threads${skipBodies > 0 ? `, files without bodies from ${skipBodies}` : ''}`);
+     // Prepared files are published (immutable): this thread keeps lazily parsed JSDoc, and the text
+     // caches of declaration files, in tables.
+     useLazyJSDocTable();
+@@ -475,7 +484,7 @@ export class ParseSession {
+     shareSymbolIds(new Int32Array(counter, 4, 1));
+ 
+     for (let i = 0; i < count; i++) {
+-      const worker = parallelParse.spawn!(configFileName, counter, i);
++      const worker = parallelParse.spawn!(configFileName, counter, i, skipBodies);
+       this.workers.push(worker);
+       this.alive.push(true);
+       this.outstanding.push(0);
+diff --git a/packages/tsc-ts/src/compiler/parse-thread.ts b/packages/tsc-ts/src/compiler/parse-thread.ts
+index ab662de..069e466 100644
+--- a/packages/tsc-ts/src/compiler/parse-thread.ts
++++ b/packages/tsc-ts/src/compiler/parse-thread.ts
+@@ -29,6 +29,8 @@ class PreparingHost extends CompilerHost {
+   prepared: PreparedFile[] = [];
+   /** Whether the files' build info versions are computed (an incremental program). */
+   computesVersions = false;
++  /** The least text of a function body left out of a file (`parseSourceFile`), or 0 for none. */
++  skipBodies = 0;
+   readMs = 0;
+   parseMs = 0;
+   bindMs = 0;
+@@ -46,9 +48,12 @@ class PreparingHost extends CompilerHost {
+       fileName,
+       text,
+       new ParseOptions(path, ScriptKind.Unknown, externalModuleIndicatorOptions),
++      this.skipBodies > 0 && text.length >= this.skipBodies ? this.skipBodies : 0,
+     );
+     const t2 = timeline ? performance.now() : 0;
+     bindSourceFile(file);
++    if (timeline && file.skippedBodies > 0)
++      markAt(t0, `skeleton ${(performance.now() - t0).toFixed(1)} bodies ${file.skippedBodies} ${text.length} ${fileName}`);
+     if (timeline) {
+       const t3 = performance.now();
+       this.readMs += t1 - t0;
+@@ -92,6 +97,11 @@ export class ParseThread {
+     useThreadTextCaches();
+   }
+ 
++  /** Leaves out the function bodies of `text` characters or more that it may, none with 0 (`ParserSpawn`). */
++  skipBodies(text: number): void {
++    this.host.skipBodies = text;
++  }
++
+   /** Loads `chunk`: its bound files, published, and the files they add. */
+   load(chunk: LoadMessage): PreparedBatch {
+     const start = performance.now();
+diff --git a/packages/tsc-ts/src/compiler/parser.ts b/packages/tsc-ts/src/compiler/parser.ts
+index c42570a..390ef3e 100644
+--- a/packages/tsc-ts/src/compiler/parser.ts
++++ b/packages/tsc-ts/src/compiler/parser.ts
+@@ -381,14 +381,32 @@ function appendRange(to: Node[], from: readonly Node[], start: number, end: numb
+   for (let i = start; i < end; i += 1) to.push(from[i]!);
+ }
+ 
+-/** Parses `text` as the file `fileName`. The script kind defaults to the one implied by the extension. */
+-export function parseSourceFile(fileName: string, text: string, options?: ParseOptions): SourceFile {
++/**
++ * Parses `text` as the file `fileName`. The script kind defaults to the one implied by the extension.
++ *
++ * With `skipBodies` above 0, a TypeScript file is parsed without the bodies of that many characters or
++ * more of the function declarations at its top that have a return type (`Parser.skipFunctionBlock`), where
++ * that gives a file other files can be checked against: `SourceFile.skippedBodies` says how many it left
++ * out, 0 for a file parsed in full.
++ */
++export function parseSourceFile(fileName: string, text: string, options?: ParseOptions, skipBodies = 0): SourceFile {
++  if (skipBodies > 0) {
++    const skeleton = parseSourceFile(fileName, text, options, -skipBodies);
++    // What the bodies hold is unknown: a file that is a module by what is outside them, and has no errors
++    // there, stands in for the whole. Otherwise, and where no body was left out, the file as a whole.
++    if (
++      skeleton.skippedBodies === 0 ||
++      (skeleton.diagnostics.length === 0 && skeleton.externalModuleIndicator !== undefined)
++    )
++      return skeleton;
++  }
+   const path = options === undefined ? fileName : options.path;
+   let scriptKind = options === undefined ? ScriptKind.Unknown : options.scriptKind;
+   if (scriptKind === ScriptKind.Unknown) scriptKind = getScriptKindFromFileName(fileName);
+   const moduleOptions =
+     options === undefined ? new ExternalModuleIndicatorOptions(false, false) : options.externalModuleIndicatorOptions;
+   const p = new Parser(fileName, path, text, scriptKind, moduleOptions);
++  if (skipBodies < 0 && scriptKind === ScriptKind.TS && !isDeclarationFileName(fileName)) p.skipBodies = -skipBodies;
+   p.nextToken();
+   if (scriptKind === ScriptKind.JSON) {
+     // Like other files (parseSourceFileWorker): reading the caches later never writes to the file.
+@@ -444,6 +462,20 @@ function getLanguageVariant(scriptKind: ScriptKind): LanguageVariant {
+   return LanguageVariant.Standard;
+ }
+ 
++/**
++ * Whether each of `parameters` has the type its declaration gives it: a type annotation, or a name alone
++ * (no initializer or binding pattern, whose expressions may name what the function's body declares).
++ */
++function signatureIsOfItsTypes(parameters: NodeList): boolean {
++  for (const node of parameters.nodes) {
++    if (node.kind !== SyntaxKind.Parameter) return false;
++    const parameter = node as ParameterDeclaration;
++    if (parameter.type === undefined && (parameter.initializer !== undefined || parameter.name.kind !== SyntaxKind.Identifier))
++      return false;
++  }
++  return true;
++}
++
+ export class Parser extends ScannerErrorReporter {
+   readonly scanner: Scanner;
+   readonly fileName: string;
+@@ -469,6 +501,14 @@ export class Parser extends ScannerErrorReporter {
+   identifierTexts: string[];
+   identifierCount: number;
+   nodeCount: number;
++  /** The least text of a function body that is left out (`skipFunctionBlock`), 0 for none. */
++  skipBodies: number;
++  /** The bodies left out. */
++  skippedBodies: number;
++  /** Where the statement at the top of the file that is being parsed starts. */
++  topLevelStatementPos: number;
++  /** The `typeof` queries and computed property names parsed so far: what a type looks up as a value. */
++  valueNamesInTypes: number;
+   /** Start positions of parenthesized arrow function candidates that turned out not to be arrows. */
+   notParenthesizedArrow: Set<number>;
+   /** Pairs of [start, end) statement indexes that may need reparsing for top-level await. */
+@@ -533,6 +573,10 @@ export class Parser extends ScannerErrorReporter {
+     this.identifierTexts = [];
+     this.identifierCount = 0;
+     this.nodeCount = 0;
++    this.skipBodies = 0;
++    this.skippedBodies = 0;
++    this.topLevelStatementPos = -1;
++    this.valueNamesInTypes = 0;
+     this.notParenthesizedArrow = new Set<number>();
+     this.possibleAwaitSpans = [];
+     this.reparseList = [];
+@@ -842,6 +886,7 @@ export class Parser extends ScannerErrorReporter {
+     result.nodeCount = this.nodeCount;
+     result.textCount = this.identifierCount;
+     result.identifierCount = this.identifierCount;
++    result.skippedBodies = this.skippedBodies;
+     // JSDoc of TypeScript files is parsed on first use.
+     result.hasLazyJSDoc = !this.isJavaScript();
+     // The table stays with the parser: when top-level await reparsing produces a second source
+@@ -855,6 +900,7 @@ export class Parser extends ScannerErrorReporter {
+ 
+   parseToplevelStatement(index: number): Statement {
+     this.statementHasAwaitIdentifier = false;
++    this.topLevelStatementPos = this.nodePos();
+     const statement = this.parseStatement();
+     // JSDoc reparses produced while parsing this statement are inserted before it.
+     const i = index + this.reparseList.length;
+@@ -2111,13 +2157,23 @@ export class Parser extends ScannerErrorReporter {
+       (modifiers !== undefined && (modifiers.modifierFlags & ModifierFlags.Async) !== 0
+         ? ParseFlags.Await
+         : ParseFlags.None);
++    const valueNames = this.valueNamesInTypes;
+     const typeParameters = this.parseTypeParameters();
+     const saveContextFlags = this.contextFlags;
+     if (modifiers !== undefined && (modifiers.modifierFlags & ModifierFlags.Export) !== 0)
+       this.setContextFlags(NodeFlags.AwaitContext, true);
+     const parameters = this.parseParameters(signatureFlags);
+     const returnType = this.parseReturnType(SyntaxKind.ColonToken, false);
+-    const body = this.parseFunctionBlockOrSemicolon(signatureFlags, Diagnostics.X_or_expected);
++    const skipped =
++      this.skipBodies > 0 &&
++      returnType !== undefined &&
++      pos === this.topLevelStatementPos &&
++      this.valueNamesInTypes === valueNames &&
++      this.token() === SyntaxKind.OpenBraceToken &&
++      signatureIsOfItsTypes(parameters)
++        ? this.skipFunctionBlock(pos)
++        : undefined;
++    const body = skipped ?? this.parseFunctionBlockOrSemicolon(signatureFlags, Diagnostics.X_or_expected);
+     this.contextFlags = saveContextFlags;
+     const result = this.finishWithJSDoc(
+       new FunctionDeclaration(modifiers, asteriskToken, name, typeParameters, parameters, returnType, undefined, body),
+@@ -2128,6 +2184,51 @@ export class Parser extends ScannerErrorReporter {
+     return result;
+   }
+ 
++  /**
++   * The body of the function declaration that starts at `declarationPos`, at the top of the file, left out:
++   * a block without statements that ends where the body is taken to end, or `undefined` for a body to parse.
++   * The parser is at the body's `{`.
++   *
++   * A file is checked by one checker, and the checkers of the other files need of it what its declarations
++   * say: of a function declaration with a return type, the signature. They start once every file is parsed,
++   * so a file that takes long to parse, as a file that is mostly one function does (TypeScript's
++   * `checker.ts`: 3 MB in `createTypeChecker`), keeps them waiting for statements only its own checker reads.
++   * Left out, the body is parsed by that checker (`withFullFile`, parallel-check.ts), which also finds out
++   * whether it ends where it was taken to: at the first line that starts with `}`, in a declaration that
++   * starts a line and whose `{` ends one, which is where a formatter puts it. Nothing is read in between,
++   * so a `}` at the start of a line of a template literal or a comment in the body ends it too early, and a
++   * body that is not indented too late: the file parsed in full then has other statements, and the program
++   * is compiled again without leaving bodies out.
++   *
++   * Only what the signature cannot reach is left out. The names of a body's declarations are in scope in
++   * the parameters and the return type as values (a `typeof` query, a computed property name, an
++   * initializer; not as types), so a signature with one of the first two, or with a parameter whose type
++   * is that of its initializer or its binding pattern, keeps its body (`signatureIsOfItsTypes`).
++   */
++  skipFunctionBlock(declarationPos: number): Block | undefined {
++    const text = this.sourceText;
++    const start = skipTrivia(text, declarationPos);
++    if (start > 0 && text.charCodeAt(start - 1) !== CharacterCodes.lineFeed) return undefined;
++    const open = this.scanner.getTokenStart();
++    let k = open + 1;
++    for (; k < text.length; k++) {
++      const ch = text.charCodeAt(k);
++      if (ch !== CharacterCodes.space && ch !== CharacterCodes.tab && ch !== CharacterCodes.carriageReturn) break;
++    }
++    if (k >= text.length || text.charCodeAt(k) !== CharacterCodes.lineFeed) return undefined;
++    const close = text.indexOf('\n}', k);
++    if (close < 0 || close + 2 - open < this.skipBodies) return undefined;
++    const pos = this.nodePos();
++    const jsdoc = this.jsdocScannerInfo();
++    const block = new Block(this.newNodeList(open + 1, close + 1, []), true);
++    this.scanner.resetPos(close + 2);
++    this.nextToken();
++    this.finishNode(block, pos);
++    this.withJSDoc(block, jsdoc);
++    this.skippedBodies++;
++    return block;
++  }
++
+   parseClassDeclaration(pos: number, jsdoc: JSDocScannerInfo, modifiers: ModifierList | undefined): Statement {
+     return this.parseClassDeclarationOrExpression(pos, jsdoc, modifiers, SyntaxKind.ClassDeclaration);
+   }
+@@ -3548,6 +3649,7 @@ export class Parser extends ScannerErrorReporter {
+     const entityName = this.parseEntityName(true, undefined);
+     // ASI: don't parse the next line's type arguments as part of an instantiation expression.
+     const typeArguments = this.hasPrecedingLineBreak() ? undefined : this.parseTypeArguments();
++    this.valueNamesInTypes++;
+     return this.finishNode(new TypeQueryNode(entityName, typeArguments), pos);
+   }
+ 
+@@ -3841,6 +3943,7 @@ export class Parser extends ScannerErrorReporter {
+     // Any expression is parsed, including comma expressions; the grammar checker reports them.
+     const expression = this.parseExpressionAllowIn();
+     this.parseExpected(SyntaxKind.CloseBracketToken);
++    this.valueNamesInTypes++;
+     return this.finishNode(new ComputedPropertyName(expression), pos);
+   }
+ 
+diff --git a/packages/tsc-ts/src/compiler/thread-entry.ts b/packages/tsc-ts/src/compiler/thread-entry.ts
+index 900341c..b863462 100644
+--- a/packages/tsc-ts/src/compiler/thread-entry.ts
++++ b/packages/tsc-ts/src/compiler/thread-entry.ts
+@@ -70,6 +70,8 @@ export interface ParseThreadData {
+   readonly args: readonly string[];
+   readonly counter: SharedArrayBuffer;
+   readonly index: number;
++  /** The least text of a function body the thread leaves out of a file (`ParserSpawn`), or 0. */
++  readonly skipBodies: number;
+ }
+ 
+ export interface ReferenceThreadData {
+@@ -107,8 +109,8 @@ export function startThreads(
+       checking,
+     });
+   if (sharesPublishedGraphs) {
+-    parallelParse.spawn = (configFileName, counter, index) =>
+-      spawn({ kind: 'parse', configFileName, args, counter, index });
++    parallelParse.spawn = (configFileName, counter, index, skipBodies) =>
++      spawn({ kind: 'parse', configFileName, args, counter, index, skipBodies });
+     // The main thread compares the files a reference thread that failed did not.
+     referenceThreads.spawn = (job) => {
+       const worker = spawn({ kind: 'references', job });
+@@ -209,6 +211,7 @@ function runParseThread(job: ParseThreadData, drivers: ThreadDrivers): void {
+   assignSymbolIdsAtCreation();
+   // The command line comes from the main thread: native worker threads don't inherit process.argv.
+   const thread = drivers.parseThreadOfCommandLine(job.args, job.configFileName);
++  if (thread !== undefined) thread.skipBodies(job.skipBodies);
+   mark('project read');
+   const port = parentPort!;
+   port.on('message', (message: unknown) => {
+diff --git a/packages/tsc-ts/src/compiler/tsc-cli.ts b/packages/tsc-ts/src/compiler/tsc-cli.ts
+index 680454c..ad3040f 100644
+--- a/packages/tsc-ts/src/compiler/tsc-cli.ts
++++ b/packages/tsc-ts/src/compiler/tsc-cli.ts
+@@ -33,7 +33,7 @@ import { Colors, defaultIsPretty, header, printBuildHelp, printHelp, printVersio
+ import { generateTSConfig } from './init.js';
+ import { isIncremental, type CompilerOptions } from './options.js';
+ import { combinePaths, getDirectoryPath, normalizePath } from './path.js';
+-import { checkerThreads, parseThreads } from './parallel-check.js';
++import { checkerThreads, parseThreads, skippedBodyText } from './parallel-check.js';
+ import { ParseSession, parallelParse, reportPreparedFiles } from './parallel-parse.js';
+ import { showConfig, type ShowConfigInput } from './show-config.js';
+ import { assignSymbolIdsAtCreation } from './symbol.js';
+@@ -362,12 +362,15 @@ function executeCompile(sys: System, commandLine: ParsedCommandLine): CommandLin
+   const beforeRootFiles = (projectOptions: CompilerOptions): ((fileName: string) => void) | undefined => {
+     if (projectOptions.watch === true || options.showConfig === true || !parsesAhead(projectOptions)) return undefined;
+     assignSymbolIdsAtCreation();
++    const checkers = checkerThreads(projectOptions.checkers, projectOptions.singleThreaded);
+     const started = new ParseSession(
+-      parseThreads(checkerThreads(projectOptions.checkers, projectOptions.singleThreaded)),
++      parseThreads(checkers),
+       projectOptions,
+       sys.currentDirectory,
+       configFileName,
+       true,
++      undefined,
++      skippedBodyText(projectOptions, checkers),
+     );
+     session = started;
+     // JSON root files load with the program's own options only.
+@@ -435,6 +438,8 @@ function executeCompile(sys: System, commandLine: ParsedCommandLine): CommandLin
+             sys.currentDirectory,
+             configFileName,
+             config.fileNames.length > 0,
++            undefined,
++            skippedBodyText(config.options, threads),
+           );
+         // While the threads load files, the program's first step (a task per root file, which looks
+         // the file up) runs, and the tasks of the files they return are built ahead.
+diff --git a/packages/tsc-ts/src/compiler/tsc-compile.ts b/packages/tsc-ts/src/compiler/tsc-compile.ts
+index ffda0fa..1c91102 100644
+--- a/packages/tsc-ts/src/compiler/tsc-compile.ts
++++ b/packages/tsc-ts/src/compiler/tsc-compile.ts
+@@ -21,7 +21,14 @@ import {
+   type Snapshot,
+   TimeStampHost,
+ } from './incremental.js';
+-import { checkerThreads, shareWithCheckers, startParallelCheck, traceSingleChecker } from './parallel-check.js';
++import {
++  checkerThreads,
++  compileAgainInFull,
++  shareWithCheckers,
++  standsIn,
++  startParallelCheck,
++  traceSingleChecker,
++} from './parallel-check.js';
+ import { sharesPublishedGraphs } from '@scriptc/threads';
+ import { getNormalizedAbsolutePath } from './path.js';
+ import { sortAndDeduplicateDiagnostics } from './program.js';
+@@ -67,6 +74,8 @@ export class SystemTimeStamps extends TimeStampHost {
+ /** Binds, checks and emits the program of `work`; returns the exit status. */
+ export function compile(sys: System, work: CompileWork): ExitStatus {
+   const program = work.program;
++  // A file parsed without a function body is replaced by the checker thread that takes it: none here.
++  if (standsIn(program)) compileAgainInFull();
+   const times = new CompileTimes();
+   times.configTime = work.configTime;
+   times.parseTime = work.parseTime;
+@@ -152,6 +161,9 @@ export function compileInParallel(
+   if (!work.incremental) {
+     if (sharesPublishedGraphs) shareWithCheckers(checked);
+     checking = program.getSyntacticDiagnostics().length === 0 && program.getProgramDiagnostics().length === 0;
++    // Nothing is checked, so no thread parses in full a file that was parsed without a function body:
++    // the syntax errors in the body would not be reported.
++    if (!checking && standsIn(program)) compileAgainInFull();
+   }
+   const finish = (checkTime: number): void => {
+     // An incremental program here has no build info (`compileThreads`).

@@ -1,0 +1,315 @@
+Parse chunks by their bytes, the automatic type directives' files first, large files largest first
+
+The checkers start when every file is parsed. Once the largest file no longer decides when that is
+(the next change), the other files do, and on the TypeScript compiler project they took 35 ms from
+the moment the root files were queued, for 25 ms of work on nine threads:
+
+- The 78 root files went out in chunks of sixteen files, 2.4 MB each: four chunks on three threads,
+  one of them queued behind another, 25 ms each, while six threads had nothing left. A chunk is now
+  also bounded by its bytes (192 KB, about 3 ms of a parse thread).
+- The automatic type directives were one job in the first chunk of root files and came back with it
+  29 ms later, with the 65 files of @types/node to queue, and those with undici-types: two more
+  rounds at the end. They go out with the libraries, and so does the entry file they add.
+- While root files are matched, chunks are queued on the threads ahead, twelve each: for a match of
+  a millisecond that was the whole queue on whichever threads were idle. A thread now holds as many
+  bytes ahead as it loads in the time the match has taken so far, the first files of a match wait
+  2 ms for the others, and the large files go out the largest first.
+
+The last chunk other than checker.ts's came back at 49.3 ms (minimum) and 54.4 (median) of fifteen
+runs before, at 41.5 and 50.4 with this on a loaded machine; the order files are loaded ahead in
+changes nothing the program is built from.
+
+diff --git a/packages/tsc-ts/src/compiler/parallel-parse.ts b/packages/tsc-ts/src/compiler/parallel-parse.ts
+index 13e84b8..424b889 100644
+--- a/packages/tsc-ts/src/compiler/parallel-parse.ts
++++ b/packages/tsc-ts/src/compiler/parallel-parse.ts
+@@ -122,6 +122,8 @@ export type LoadMessage = {
+   readonly kinds: number[];
+   readonly names: string[];
+   readonly depths: number[];
++  /** The size of the chunk's files in bytes, as far as it is known. */
++  readonly bytes: number;
+ };
+ 
+ /**
+@@ -218,6 +220,13 @@ export function fileSize(fileName: string): number {
+ /** Files per chunk at most: small enough that the files a chunk adds are queued again soon. */
+ const maxChunk = 16;
+ 
++/**
++ * Bytes of source text per chunk at most, unless one file has more: about 3 ms of a parse thread.
++ * Sixteen files of the TypeScript compiler are 2.4 MB, which kept a thread for 25 ms while six
++ * others had nothing left, and the files those sixteen import waited as long to be queued.
++ */
++const maxChunkBytes = 192 * 1024;
++
+ /** Files from this size (bytes) on take a parse thread 25 ms or more, and go out ahead of others. */
+ const largeFile = 256 * 1024;
+ 
+@@ -225,10 +234,14 @@ const largeFile = 256 * 1024;
+  * The files to hand out to parse threads, each queued once. Library files go out first, one per
+  * chunk, also those found later through `/// <reference lib>`: a large one (`lib.dom.d.ts`) takes a
+  * thread 100–150 ms, and queued behind other files it would be the last file the program waits for.
+- * Then, for the same reason, large files, one per chunk: root files (TypeScript's 3 MB `checker.ts`,
+- * which in a chunk of root files kept one thread busy after the others were done) and the files the
+- * parse threads found (`csstype`'s 0.9 MB of declarations, found through React's). The other files go
+- * out in program order, in chunks of up to `maxChunk`.
++ * The automatic type directives go out with them, and so do the files they add (`first`): the entry
++ * file of a package names the package's other files (`@types/node`: 65, and those name
++ * `undici-types`), which are queued once it is back; in a chunk of root files, or behind them, it
++ * came back with the last of them. Then, for the same reason, large files, one per chunk and the
++ * largest first: root files (TypeScript's 3 MB `checker.ts`, which in a chunk of root files kept one
++ * thread busy after the others were done) and the files the parse threads found (`csstype`'s 0.9 MB
++ * of declarations, found through React's). The other files go out in program order, in chunks of up
++ * to `maxChunk` files and `maxChunkBytes`.
+  */
+ export class ParseQueue {
+   private readonly libraries = new LoadJobs();
+@@ -241,20 +254,37 @@ export class ParseQueue {
+   /** Files not to load ahead: the program has them already (`ParseSession`'s `skip`). */
+   skip: ((kind: LoadKind, name: string) => boolean) | undefined = undefined;
+ 
+-  /** Queues a file; the size of a root file, which the threads haven't seen, is read here. */
+-  push(kind: LoadKind, name: string, depth: number, size = 0): void {
++  /**
++   * Queues a file; the size of a root file, which the threads haven't seen, is read here. With `first`,
++   * it goes out with the libraries.
++   */
++  push(kind: LoadKind, name: string, depth: number, size = 0, first = false): void {
+     const key = kind === LoadKind.Library ? 'lib:' + name : kind === LoadKind.AutomaticTypes ? 'types:' : name;
+     if (this.seen.has(key)) return;
+     this.seen.add(key);
+     if (this.skip !== undefined && this.skip(kind, name)) return;
+     if (kind === LoadKind.Root) size = fileSize(name);
+-    const jobs =
+-      kind === LoadKind.Library
+-        ? this.libraries
+-        : (kind === LoadKind.File || kind === LoadKind.Root) && size >= largeFile
+-          ? this.large
+-          : this.others;
+-    jobs.push(kind, name, depth, size);
++    if (first || kind === LoadKind.Library || kind === LoadKind.AutomaticTypes) {
++      this.libraries.push(kind, name, depth, size);
++      return;
++    }
++    if (size < largeFile) {
++      this.others.push(kind, name, depth, size);
++      return;
++    }
++    // The largest of the large files not handed out yet goes out first: it is the one the program waits for.
++    const large = this.large;
++    large.push(kind, name, depth, size);
++    for (let k = large.names.length - 1; k > this.largeHead && large.sizes[k - 1]! < size; k--) {
++      large.kinds[k] = large.kinds[k - 1]!;
++      large.names[k] = large.names[k - 1]!;
++      large.depths[k] = large.depths[k - 1]!;
++      large.sizes[k] = large.sizes[k - 1]!;
++      large.kinds[k - 1] = kind;
++      large.names[k - 1] = name;
++      large.depths[k - 1] = depth;
++      large.sizes[k - 1] = size;
++    }
+   }
+ 
+   /** Files queued so far. */
+@@ -276,7 +306,8 @@ export class ParseQueue {
+ 
+   /**
+    * The next chunk for one of `threads` parse threads, or `undefined` when nothing is left. With
+-   * `full`, other files only go out `maxChunk` at a time, and stay queued until there are as many.
++   * `full`, other files only go out as a full chunk (`maxChunk` files or `maxChunkBytes`), and stay
++   * queued until there is one.
+    */
+   next(threads: number, full = false): LoadMessage | undefined {
+     const libraries = this.libraries;
+@@ -287,6 +318,7 @@ export class ParseQueue {
+         kinds: [libraries.kinds[k]!],
+         names: [libraries.names[k]!],
+         depths: [libraries.depths[k]!],
++        bytes: libraries.sizes[k]!,
+       };
+     }
+     const large = this.large;
+@@ -297,20 +329,25 @@ export class ParseQueue {
+         kinds: [large.kinds[k]!],
+         names: [large.names[k]!],
+         depths: [large.depths[k]!],
++        bytes: large.sizes[k]!,
+       };
+     }
+     const queue = this.others;
+     const left = queue.names.length - this.head;
+-    if (left <= 0 || (full && left < maxChunk)) return undefined;
+-    const size = full ? maxChunk : Math.min(maxChunk, Math.max(1, Math.floor(left / threads)));
++    if (left <= 0) return undefined;
++    const most = full ? maxChunk : Math.min(maxChunk, Math.max(1, Math.floor(left / threads)));
+     const start = this.head;
+-    const end = start + size;
++    let end = start;
++    let bytes = 0;
++    while (end - start < most && end < queue.names.length && bytes < maxChunkBytes) bytes += queue.sizes[end++]!;
++    if (full && end - start < maxChunk && bytes < maxChunkBytes) return undefined;
+     this.head = end;
+     return {
+       stop: false,
+       kinds: queue.kinds.slice(start, end),
+       names: queue.names.slice(start, end),
+       depths: queue.depths.slice(start, end),
++      bytes,
+     };
+   }
+ }
+@@ -323,6 +360,22 @@ export class ParseQueue {
+  */
+ const maxQueuedWhileMatching = 12;
+ 
++/**
++ * Bytes of source text a parse thread may have queued for each millisecond the main thread has been
++ * matching: about what a thread loads in that time. A thread keeps the chunks queued on it, so more
++ * than the match lasts leaves it loading while other threads have nothing (the TypeScript compiler's
++ * 78 root files are matched in a millisecond: chunks queued behind the 3 MB of its `checker.ts`
++ * would wait 40 ms for that thread).
++ */
++const queuedBytesPerMs = 96 * 1024;
++
++/**
++ * How long the root files a match finds stay queued before the first of them go out, in milliseconds.
++ * A match that ends within it hands out the files it found in the queue's order, the largest first; one
++ * that takes longer hands them out as it finds them, since the threads would wait for it.
++ */
++const matchHoldMs = 2;
++
+ /**
+  * Chunks a parse thread may have queued while the main thread reads an incremental program's build
+  * info (`queueAhead`), which takes it about 20 ms per MB (270 ms for VS Code's 13.7 MB).
+@@ -344,8 +397,14 @@ export class ParseSession {
+   private readonly verbose = process.env.TSC_TS_CHECKERS_TRACE === '3';
+   private readonly queue = new ParseQueue();
+   private readonly workers: Worker[] = [];
+-  /** Chunks posted to each thread and not yet returned. */
++  /** Chunks posted to each thread and not yet returned, and their bytes (`LoadMessage.bytes`), oldest first. */
+   private readonly outstanding: number[] = [];
++  private readonly posted: number[][] = [];
++  private readonly outstandingBytes: number[] = [];
++  /** Whether each of those chunks is the automatic type directives: the files it adds go out first. */
++  private readonly postedTypes: boolean[][] = [];
++  /** When the first root file was matched (`hint`), or -1. */
++  private matchingSince = -1;
+   /** Whether a thread has a large library to load (`largeLibraries`). */
+   private readonly blocked: boolean[] = [];
+   private readonly alive: boolean[] = [];
+@@ -420,6 +479,9 @@ export class ParseSession {
+       this.workers.push(worker);
+       this.alive.push(true);
+       this.outstanding.push(0);
++      this.posted.push([]);
++      this.postedTypes.push([]);
++      this.outstandingBytes.push(0);
+       this.blocked.push(false);
+       this.idle.push(i);
+       worker.on('message', (message: unknown) =>
+@@ -433,6 +495,9 @@ export class ParseSession {
+         if (waiting >= 0) this.idle.splice(waiting, 1);
+         this.busy -= this.outstanding[i]!;
+         this.outstanding[i] = 0;
++        this.posted[i]!.length = 0;
++        this.postedTypes[i]!.length = 0;
++        this.outstandingBytes[i] = 0;
+         if (!this.finished) this.dispatch();
+       });
+       // The first threads to start get the first chunks: the libraries, largest first.
+@@ -445,8 +510,9 @@ export class ParseSession {
+ 
+   /** A root file the config's `include` patterns matched, while they are still being matched. */
+   hint(fileName: string): void {
++    if (this.matchingSince < 0) this.matchingSince = performance.now();
+     this.queue.push(LoadKind.Root, getNormalizedAbsolutePath(fileName, this.currentDirectory), 0);
+-    this.dispatch();
++    if (performance.now() - this.matchingSince >= matchHoldMs) this.dispatch();
+   }
+ 
+   /** Queues the program's root files, and calls `done` once every prepared file is available. */
+@@ -471,8 +537,9 @@ export class ParseSession {
+         new PackageJsonLookup(lookups.directories[k]!, lookups.exists[k]!, lookups.directoryExists[k]!),
+       );
+     const added = batch.added;
++    const first = this.postedTypes[i]!.shift() === true;
+     for (let k = 0; k < added.names.length; k++)
+-      queue.push(added.kinds[k]!, added.names[k]!, added.depths[k]!, added.sizes[k]!);
++      queue.push(added.kinds[k]!, added.names[k]!, added.depths[k]!, added.sizes[k]!, first);
+     if (this.verbose)
+       process.stderr.write(
+         `parsers: thread ${i} loaded ${batch.files.length} files in ${batch.parseMs.toFixed(1)}ms, at ${(performance.now() - this.startTime).toFixed(1)}ms\n`,
+@@ -480,6 +547,7 @@ export class ParseSession {
+     this.busy--;
+     const outstanding = this.outstanding[i]! - 1;
+     this.outstanding[i] = outstanding;
++    this.outstandingBytes[i] = this.outstandingBytes[i]! - (this.posted[i]!.shift() ?? 0);
+     if (outstanding === 0) {
+       this.blocked[i] = false;
+       this.idle.push(i);
+@@ -491,6 +559,9 @@ export class ParseSession {
+   private post(i: number, chunk: LoadMessage): void {
+     this.workers[i]!.postMessage(chunk);
+     this.outstanding[i] = this.outstanding[i]! + 1;
++    this.posted[i]!.push(chunk.bytes);
++    this.postedTypes[i]!.push(chunk.kinds[0] === LoadKind.AutomaticTypes);
++    this.outstandingBytes[i] = this.outstandingBytes[i]! + chunk.bytes;
+     if (chunk.kinds[0] === LoadKind.Library && largeLibraries.has(chunk.names[0]!)) this.blocked[i] = true;
+     this.busy++;
+     this.chunks++;
+@@ -508,8 +579,9 @@ export class ParseSession {
+     }
+     if (this.matching) {
+       // Queue more on threads, except behind a large library: none of them returns a chunk before the
+-      // config is read.
+-      this.queueOnThreads(maxQueuedWhileMatching);
++      // config is read. As much as a thread loads in the time the match has taken so far.
++      const matched = this.matchingSince < 0 ? 0 : performance.now() - this.matchingSince;
++      this.queueOnThreads(maxQueuedWhileMatching, matched * queuedBytesPerMs);
+       return;
+     }
+     // Every thread is idle (or failed) and nothing is left to hand out: what is not prepared now is
+@@ -518,15 +590,23 @@ export class ParseSession {
+   }
+ 
+   /**
+-   * Queues the full chunks left on the threads, up to `max` chunks each, the least loaded first. A thread
+-   * with chunks queued doesn't wait for the main thread to hand it the next one.
++   * Queues the full chunks left on the threads, up to `max` chunks each and while a thread has fewer than
++   * `bytes` of source text queued, the least loaded first. A thread with chunks queued doesn't wait for
++   * the main thread to hand it the next one.
+    */
+-  private queueOnThreads(max: number): void {
++  private queueOnThreads(max: number, bytes: number): void {
+     for (;;) {
+       let target = -1;
+       for (let i = 0; i < this.count; i++) {
+         if (!this.alive[i]! || this.blocked[i]! || this.outstanding[i]! >= max) continue;
+-        if (target < 0 || this.outstanding[i]! < this.outstanding[target]!) target = i;
++        if (this.outstandingBytes[i]! >= bytes) continue;
++        if (
++          target < 0 ||
++          this.outstandingBytes[i]! < this.outstandingBytes[target]! ||
++          (this.outstandingBytes[i]! === this.outstandingBytes[target]! &&
++            this.outstanding[i]! < this.outstanding[target]!)
++        )
++          target = i;
+       }
+       if (target < 0) break;
+       const chunk = this.queue.next(this.count, true);
+@@ -540,12 +620,12 @@ export class ParseSession {
+    * it hands out no chunks while it reads, and the threads would wait once they finish the one each has.
+    */
+   queueAhead(): void {
+-    if (!this.finished) this.queueOnThreads(maxQueuedAhead);
++    if (!this.finished) this.queueOnThreads(maxQueuedAhead, Number.POSITIVE_INFINITY);
+   }
+ 
+   private finish(): void {
+     this.finished = true;
+-    const stop: LoadMessage = { stop: true, kinds: [], names: [], depths: [] };
++    const stop: LoadMessage = { stop: true, kinds: [], names: [], depths: [], bytes: 0 };
+     for (let i = 0; i < this.workers.length; i++) if (this.alive[i]!) this.workers[i]!.postMessage(stop);
+     // Each thread's listeners hold this session. Without its references to the threads, the session
+     // and the loader its `onIdle` holds are freed when the threads exit, instead of staying as a
