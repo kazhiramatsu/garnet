@@ -7892,6 +7892,8 @@ fn infer_numeric_analysis(
 ) -> NumericAnalysis {
     let mut flat: Vec<&Inst> = Vec::new();
     flatten_inst(body, &mut flat);
+    // the functions that return an integer at every call (`INT_RETURNS`)
+    let proven_returns = INT_RETURNS.read().unwrap();
     let mut loop_nonneg_subs = BTreeSet::new();
     collect_loop_nonneg_subs(body, &mut loop_nonneg_subs);
     // the instructions defining each local (a local defined only by bitwise operators holds an
@@ -8319,46 +8321,31 @@ fn infer_numeric_analysis(
                 | Inst::GetProto { dst, .. }
                 | Inst::NewMap { dst }
                 | Inst::NewSet { dst } => Some((dst.0, NumFact::unknown())),
-                // A return fact is the integer entry's: a call with an argument no integer takes the double entry,
-                // and `f(-2.5)` of a function that returns its parameter is no integer.
-                Inst::Call {
-                    dst: Some(d),
-                    callee: CalleeRef::Direct { .. } | CalleeRef::Set { .. },
-                    recv,
-                    args,
-                    ..
-                } if !recv.iter().chain(args.iter()).all(|a| get(&facts, a.0).i64_safe) => {
-                    Some((d.0, NumFact::unknown()))
-                }
+                // (`call_return_fact`: the `_i64` entry's fact where every argument is an integer, a
+                // function's proven integer return at every call)
                 Inst::Call {
                     dst: Some(d),
                     callee: CalleeRef::Direct { func },
+                    recv,
+                    args,
                     ..
-                } => Some((
-                    d.0,
-                    return_facts
-                        .get(&func.0)
-                        .cloned()
-                        .unwrap_or_else(NumFact::unknown),
-                )),
+                } => {
+                    let args_int = recv.iter().chain(args.iter()).all(|a| get(&facts, a.0).i64_safe);
+                    Some((d.0, call_return_fact(func.0, args_int, return_facts, &proven_returns)))
+                }
                 Inst::Call {
                     dst: Some(d),
                     callee: CalleeRef::Set { funcs },
+                    recv,
+                    args,
                     ..
                 } => {
+                    let args_int = recv.iter().chain(args.iter()).all(|a| get(&facts, a.0).i64_safe);
                     let mut it = funcs.iter();
                     let f = if let Some(first) = it.next() {
-                        let mut acc = return_facts
-                            .get(&first.0)
-                            .cloned()
-                            .unwrap_or_else(NumFact::unknown);
+                        let mut acc = call_return_fact(first.0, args_int, return_facts, &proven_returns);
                         for func in it {
-                            acc = acc.join(
-                                &return_facts
-                                    .get(&func.0)
-                                    .cloned()
-                                    .unwrap_or_else(NumFact::unknown),
-                            );
+                            acc = acc.join(&call_return_fact(func.0, args_int, return_facts, &proven_returns));
                         }
                         acc
                     } else {
@@ -8388,6 +8375,10 @@ fn infer_numeric_analysis(
                     let f = match builtin.as_str() {
                         "json.num.len" | "json.string.len" => NumFact::nonnegative_i64_value(),
                         "math.imul" if imul_inline_enabled() => NumFact::int32_value(),
+                        // an element of an integer array, as a number: within [-2^31, 2^32)
+                        // (a BigInt array's is no number, a float array is a TypeError)
+                        "atomics.load" | "atomics.add" | "atomics.sub" | "atomics.and" | "atomics.or" | "atomics.xor"
+                        | "atomics.exchange" | "atomics.compareExchange" => NumFact::i64_value(),
                         _ => NumFact::unknown(),
                     };
                     Some((d.0, f))
@@ -8746,7 +8737,7 @@ fn infer_program_param_facts(
     // field pass's rounds): an iteration re-analyzes only the callers whose
     // inputs changed.
     thread_local! {
-        static PF_CACHE: std::cell::RefCell<BTreeMap<u32, (BTreeMap<u32, NumFact>, BTreeMap<usize, u8>, Vec<(u32, usize, NumFact)>)>> =
+        static PF_CACHE: std::cell::RefCell<BTreeMap<u32, (BTreeMap<u32, NumFact>, BTreeMap<usize, u8>, Vec<(u32, usize, NumFact)>, Vec<u32>)>> =
             std::cell::RefCell::new(BTreeMap::new());
     }
     if std::env::var("TSAOT_PARAM_FACTS_LOG").as_deref() == Ok("1") {
@@ -8762,8 +8753,13 @@ fn infer_program_param_facts(
             let cached = PF_CACHE.with(|c| {
                 c.borrow()
                     .get(&f.id.0)
-                    .filter(|(pf, ld, _)| *pf == param_facts && *ld == loads)
-                    .map(|(_, _, contrib)| contrib.clone())
+                    .filter(|(pf, ld, _, relied)| {
+                        *pf == param_facts && *ld == loads && {
+                            let proven = INT_RETURNS.read().unwrap();
+                            relied.iter().all(|g| proven.contains(g))
+                        }
+                    })
+                    .map(|(_, _, contrib, _)| contrib.clone())
             });
             let contrib: Vec<(u32, usize, NumFact)> = if let Some(c) = cached {
                 c
@@ -8774,11 +8770,23 @@ fn infer_program_param_facts(
                 let mut flat = Vec::new();
                 flatten_inst(&f.body, &mut flat);
                 let mut out: Vec<(u32, usize, NumFact)> = Vec::new();
+                // the callees whose proven integer return the analysis may have read: the entry
+                // stands while they stay proven (the set only shrinks while it is being found;
+                // one that grew leaves the entry less exact, not wrong)
+                let mut relied: Vec<u32> = Vec::new();
                 for inst in flat {
                     if let Inst::Call {
                         callee, recv, args, ..
                     } = inst
                     {
+                        {
+                            let proven = INT_RETURNS.read().unwrap();
+                            match callee {
+                                CalleeRef::Direct { func } if proven.contains(&func.0) => relied.push(func.0),
+                                CalleeRef::Set { funcs } => relied.extend(funcs.iter().map(|g| g.0).filter(|g| proven.contains(g))),
+                                _ => {}
+                            }
+                        }
                         let mut argv: Vec<u32> = Vec::new();
                         if let Some(r) = recv {
                             argv.push(r.0);
@@ -8812,7 +8820,7 @@ fn infer_program_param_facts(
                     }
                 }
                 PF_CACHE.with(|c| {
-                    c.borrow_mut().insert(f.id.0, (param_facts.clone(), loads.clone(), out.clone()));
+                    c.borrow_mut().insert(f.id.0, (param_facts.clone(), loads.clone(), out.clone(), relied));
                 });
                 out
             };
@@ -12301,6 +12309,40 @@ fn int_store_fields_enabled() -> bool {
 fn set_int_store_fields(set: BTreeSet<(u32, u32)>) {
     *INT_STORE_FIELDS.write().unwrap() = set;
 }
+/// The functions every one of whose returns is an integer value, whatever calls them
+/// (docs/int32_fields_design.md, "Integer returns"): a resolved call of one has an integer
+/// result at every site. The candidates of `infer_int_store_fields`' rounds while it runs,
+/// the proven ones after it; TSAOT_INT_RETURNS=0 leaves it empty.
+static INT_RETURNS: std::sync::RwLock<BTreeSet<u32>> = std::sync::RwLock::new(BTreeSet::new());
+fn int_returns_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("TSAOT_INT_RETURNS").as_deref(),
+            Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        )
+    })
+}
+fn set_int_returns(set: BTreeSet<u32>) {
+    *INT_RETURNS.write().unwrap() = set;
+}
+/// What a resolved call of `func` returns. A fact of `return_facts` is the `_i64` entry's:
+/// it holds where every argument is an integer, the emission's choice of that entry (a call
+/// with an argument no integer takes the double entry, and `f(-2.5)` of a function that
+/// returns its parameter is no integer). A function proven to return an integer whatever
+/// calls it does so at every call.
+fn call_return_fact(func: u32, args_int: bool, return_facts: &BTreeMap<u32, NumFact>, proven: &BTreeSet<u32>) -> NumFact {
+    if args_int {
+        if let Some(f) = return_facts.get(&func) {
+            return f.clone();
+        }
+    }
+    if proven.contains(&func) {
+        NumFact::integer_value()
+    } else {
+        NumFact::unknown()
+    }
+}
 fn int_store_field(declaring: u32, field: u32) -> bool {
     INT_STORE_FIELDS.read().unwrap().contains(&(declaring, field))
 }
@@ -12440,6 +12482,19 @@ fn infer_int_store_fields(program: &Program, indirect: &BTreeSet<u32>) -> BTreeS
             }
         }
     }
+    // Integer returns ("Integer returns" in docs/int32_fields_design.md): a function whose every
+    // return is an integer value returns one whatever calls it, and a store of its result does
+    // not refute a field (`this.pos = this.lineCommentEnd(...)`). The candidates are the live
+    // functions typed to return a number; like the fields they are assumed and refuted in the
+    // same rounds, since a return may be a field's load and a field's store a call's result.
+    let mut ret_cands: BTreeSet<u32> = BTreeSet::new();
+    if int_returns_enabled() {
+        for f in &program.functions {
+            if live.contains(&f.id.0) && !f.is_async && !f.is_generator && type_is_number(program, f.ret) {
+                ret_cands.insert(f.id.0);
+            }
+        }
+    }
     let relevant: Vec<&Function> = program
         .functions
         .iter()
@@ -12447,30 +12502,99 @@ fn infer_int_store_fields(program: &Program, indirect: &BTreeSet<u32>) -> BTreeS
             if !live.contains(&f.id.0) {
                 return false;
             }
+            if ret_cands.contains(&f.id.0) {
+                return true;
+            }
             let mut flat = Vec::new();
             flatten_inst(&f.body, &mut flat);
             flat.iter().any(|i| matches!(i, Inst::StoreField { field, .. } if cand_fields.contains(&field.0)))
         })
         .collect();
+    // What a function's analysis read besides its own body: its parameters' facts, the return
+    // facts of what it calls, the integer slots of the fields it loads. A round analyzes a
+    // function again only when one of those changed since its last analysis, and otherwise keeps
+    // what that analysis found: its stores of a value that is no integer, and whether every
+    // return is one.
+    let mut reads: BTreeMap<u32, (BTreeSet<u32>, BTreeSet<u32>)> = BTreeMap::new();
+    for f in &relevant {
+        let mut flat = Vec::new();
+        flatten_inst(&f.body, &mut flat);
+        let mut callees: BTreeSet<u32> = BTreeSet::new();
+        let mut loaded: BTreeSet<u32> = BTreeSet::new();
+        for inst in flat {
+            match inst {
+                Inst::Call { callee: CalleeRef::Direct { func }, .. } => {
+                    callees.insert(func.0);
+                }
+                Inst::Call { callee: CalleeRef::Set { funcs }, .. } => callees.extend(funcs.iter().map(|g| g.0)),
+                Inst::LoadField { field, .. } => {
+                    loaded.insert(field.0);
+                }
+                _ => {}
+            }
+        }
+        reads.insert(f.id.0, (callees, loaded));
+    }
+    let mut found: BTreeMap<u32, (Vec<((u32, u32), u32)>, bool)> = BTreeMap::new();
+    let mut prev_param_facts: BTreeMap<u32, BTreeMap<u32, NumFact>> = BTreeMap::new();
+    let mut prev_return_facts: BTreeMap<u32, NumFact> = BTreeMap::new();
+    let mut changed_funcs: BTreeSet<u32> = BTreeSet::new();
+    let mut changed_fields: BTreeSet<u32> = BTreeSet::new();
+    let mut analyzed = 0usize;
+    // The parameters' facts and the `_i64` entries' are the program's under what is assumed, and
+    // most of a round's time. They are computed for the first two rounds, where most is refuted,
+    // and then kept: under facts of more assumptions than are left a round may refute too
+    // little, never too much, so once a round refutes nothing they are computed again and the
+    // round repeated; the rounds end with one that refutes nothing under its own facts.
+    let mut param_facts_by_func: BTreeMap<u32, BTreeMap<u32, NumFact>> = BTreeMap::new();
+    let mut return_facts: BTreeMap<u32, NumFact> = BTreeMap::new();
+    let mut verify = false;
     let started = std::time::Instant::now();
-    while !cands.is_empty() {
+    while !cands.is_empty() || !ret_cands.is_empty() {
         rounds += 1;
         set_int_store_fields(cands.clone());
-        let t0 = std::time::Instant::now();
-        let param_facts_by_func = infer_program_param_facts(program, indirect);
-        let t1 = std::time::Instant::now();
-        let i64_fast = infer_i64_fast_funcs(program, indirect, &param_facts_by_func);
-        let return_facts = i64_return_facts(&i64_fast);
-        if verbose {
-            eprintln!(
-                "[int-store-fields]   param facts {:.1} s, i64 returns {:.1} s",
-                (t1 - t0).as_secs_f64(),
-                t1.elapsed().as_secs_f64()
-            );
+        set_int_returns(ret_cands.clone());
+        let mut ret_refuted: BTreeSet<u32> = BTreeSet::new();
+        let facts_fresh = rounds <= 2 || verify;
+        if facts_fresh {
+            let t0 = std::time::Instant::now();
+            param_facts_by_func = infer_program_param_facts(program, indirect);
+            let t1 = std::time::Instant::now();
+            let i64_fast = infer_i64_fast_funcs(program, indirect, &param_facts_by_func);
+            return_facts = i64_return_facts(&i64_fast);
+            if verbose {
+                eprintln!(
+                    "[int-store-fields]   param facts {:.1} s, i64 returns {:.1} s",
+                    (t1 - t0).as_secs_f64(),
+                    t1.elapsed().as_secs_f64()
+                );
+            }
         }
         let empty: BTreeMap<u32, NumFact> = BTreeMap::new();
         let mut refuted: BTreeSet<(u32, u32)> = BTreeSet::new();
+        // the `_i64` entries' return facts that moved since the last round count as changed callees
+        for (id, fact) in &return_facts {
+            if prev_return_facts.get(id) != Some(fact) {
+                changed_funcs.insert(*id);
+            }
+        }
+        for id in prev_return_facts.keys() {
+            if !return_facts.contains_key(id) {
+                changed_funcs.insert(*id);
+            }
+        }
         for f in &relevant {
+            let pf_now = param_facts_by_func.get(&f.id.0).unwrap_or(&empty);
+            let (callees, loaded) = &reads[&f.id.0];
+            let again = !found.contains_key(&f.id.0)
+                || prev_param_facts.get(&f.id.0).unwrap_or(&empty) != pf_now
+                || callees.iter().any(|g| changed_funcs.contains(g))
+                || loaded.iter().any(|x| changed_fields.contains(x));
+            if !again {
+                continue;
+            }
+            analyzed += 1;
+            let mut bad_stores: Vec<((u32, u32), u32)> = Vec::new();
             let mut flat = Vec::new();
             flatten_inst(&f.body, &mut flat);
             let mut local_class = local_class_map(f);
@@ -12486,6 +12610,18 @@ fn infer_int_store_fields(program: &Program, indirect: &BTreeSet<u32>) -> BTreeS
                 let pfs: Vec<String> = f.params.iter().map(|p| format!("{}:{:?}", p.0, pf.get(&p.0).map(|nf| (nf.i64_safe, nf.const_i64)))).collect();
                 eprintln!("[int-store-fields]   {} params {}", cname(f), pfs.join(" "));
             }
+            // every return an integer value (a function that returns nothing is no candidate)
+            let mut returns = 0;
+            let mut returns_integral = true;
+            for inst in &flat {
+                let Inst::Return { src } = inst else { continue };
+                returns += 1;
+                returns_integral = returns_integral
+                    && src
+                        .map(|v| analysis.int_local.contains(&v.0) || analysis.facts.get(&v.0).map(|nf| nf.i64_safe).unwrap_or(false))
+                        .unwrap_or(false);
+            }
+            let ret_ok = returns > 0 && returns_integral;
             for inst in &flat {
                 let Inst::StoreField { obj, field, src, cls, .. } = inst else { continue };
                 // every class the store can be about: the local's known class and
@@ -12501,7 +12637,7 @@ fn infer_int_store_fields(program: &Program, indirect: &BTreeSet<u32>) -> BTreeS
                 for class in targets {
                     let Some(d) = declaring_class(class, field.0, &classes) else { continue };
                     let t = (d, field.0);
-                    if !cands.contains(&t) {
+                    if !cand_fields.contains(&field.0) {
                         continue;
                     }
                     let integral = analysis.int_local.contains(&src.0)
@@ -12517,35 +12653,65 @@ fn infer_int_store_fields(program: &Program, indirect: &BTreeSet<u32>) -> BTreeS
                     if integral {
                         continue;
                     }
-                    if refuted.insert(t) && log {
-                        reasons.push(format!(
-                            "{}.{}: a non-integer store in {} (local {})",
-                            class_name(t.0),
-                            field_name(t.1),
-                            cname(f),
-                            src.0
-                        ));
-                    }
+                    bad_stores.push((t, src.0));
+                }
+            }
+            found.insert(f.id.0, (bad_stores, ret_ok));
+        }
+        // what the analyses found, against what is still assumed
+        for f in &relevant {
+            let Some((bad_stores, ret_ok)) = found.get(&f.id.0) else { continue };
+            if !*ret_ok && ret_cands.contains(&f.id.0) {
+                ret_refuted.insert(f.id.0);
+            }
+            for (t, src) in bad_stores {
+                if cands.contains(t) && refuted.insert(*t) && log {
+                    reasons.push(format!(
+                        "{}.{}: a non-integer store in {} (local {})",
+                        class_name(t.0),
+                        field_name(t.1),
+                        cname(f),
+                        src
+                    ));
                 }
             }
         }
+        if facts_fresh {
+            prev_param_facts = param_facts_by_func.clone();
+            prev_return_facts = return_facts.clone();
+        }
+        changed_funcs = ret_refuted.clone();
+        changed_fields = refuted.iter().map(|(_, x)| *x).collect();
         if log {
             eprintln!(
-                "[int-store-fields] round {}: {} candidates, {} refuted, {:.1} s",
+                "[int-store-fields] round {}: {} candidates, {} refuted, {} integer returns, {} refuted, {:.1} s",
                 rounds,
                 cands.len(),
                 refuted.len(),
+                ret_cands.len(),
+                ret_refuted.len(),
                 started.elapsed().as_secs_f64()
             );
         }
-        if refuted.is_empty() {
-            break;
+        if refuted.is_empty() && ret_refuted.is_empty() {
+            if facts_fresh {
+                break;
+            }
+            verify = true;
+            continue;
         }
+        verify = false;
         for r in &refuted {
             cands.remove(r);
         }
+        for r in &ret_refuted {
+            ret_cands.remove(r);
+        }
     }
+    // what the rounds left is proven; with nothing left the last round's assumptions go too
+    set_int_returns(ret_cands.clone());
     if log {
+        eprintln!("[int-store-fields] {} functions return integers ({} analyses of {} functions)", ret_cands.len(), analyzed, relevant.len());
         eprintln!("[int-store-fields] {} rounds, {} proven:", rounds, cands.len());
         for (c, f) in &cands {
             eprintln!("[int-store-fields]   {}.{}", class_name(*c), field_name(*f));

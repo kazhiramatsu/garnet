@@ -149,6 +149,51 @@ before emission (after `infer_indirect_funcs`):
   examined store with its fact, each relevant function's parameter facts),
   `TSAOT_PARAM_FACTS_LOG=1` (the parameter-fact solver's contributions).
 
+### Integer returns (Session 367)
+
+A store of a call's result refuted its field whenever the callee was not an `_i64` candidate: the
+return facts were those entries' only (no receiver, every parameter a number), so a method's result
+was unknown at every call. One such store makes the field a double everywhere: tsc-ts's
+`Scanner.pos` (`this.pos = this.lineCommentEnd(...)`), converted at every token, and `Symbol.id`,
+converted at every link table lookup. The upstream sources mark such values with `| 0` by hand for
+another native compiler; the proof belongs here.
+
+- **The fact**: a function whose every `Return` is an integer value (an integer local, or a fact
+  that is `i64_safe`) returns an integer whatever calls it. The parameters' facts it was analyzed
+  with are the program's (`infer_program_param_facts`: every resolved call's arguments joined,
+  unknown for a function reachable as a value), so the fact needs no condition on a call's
+  arguments, unlike an `_i64` entry's, which holds where the call takes that entry
+  (`call_return_fact`: the entry's fact where every argument is an integer, the proven return at
+  every call).
+- **The proof** runs in the rounds of the store-proven fields, because the two depend on each
+  other (a return may be a field's load, a store a call's result): the candidates are the live
+  functions typed to return a number that are no coroutine, all assumed; a round refutes a function
+  with a return that is no integer under the assumptions, and a field as before; the rounds end
+  when one refutes nothing. A function that calls itself is proven like any other: its own return
+  is assumed while its returns are examined.
+- **`INT_RETURNS`** holds the candidates during the rounds and the proven set after them, and
+  `infer_numeric_analysis` reads it at a resolved call (a `Set` of callees joins theirs), so every
+  later analysis sees the same facts. `TSAOT_INT_RETURNS=0` leaves it empty.
+- **`Atomics`**: the result of `load`, `add`, `sub`, `and`, `or`, `xor`, `exchange` and
+  `compareExchange` is an element of an integer array as a number (a BigInt array's is no number, a
+  float array is a TypeError): an `i64` fact. `store` returns its argument and has none.
+- **The rounds' cost**: a function is analyzed again only when something its analysis read changed
+  (its parameters' facts, the return fact of a function it calls, the slot of a field it loads),
+  and the parameters' facts, most of a round, are computed for the first two rounds and then kept
+  until a round refutes nothing, when they are computed again and the round repeated (under facts
+  of more assumptions than are left a round refutes too little, never too much). The parameter
+  facts' cache holds an entry while the proven returns it relied on are still proven. On tsc-ts:
+  13 rounds, 24 K analyses of 11.7 K functions, 7.9 s where the fields alone took 4.3 (the analyzer
+  23.7 -> 27.1 s); the emitted C is identical to that of rounds that recompute everything.
+- **Measured** (tsc-ts without its patch `0011`, which marked four such stores by hand, the
+  TypeScript 6.0.3 compiler project): 2,611 functions proven, the integer fields 291 -> 308, one
+  thread 12.978 -> 12.734 G instructions (-1.88%; the four `| 0` were -0.78%), a default run's
+  processes 15.801 -> 15.416 G (-2.44%).
+- Fixture `numbers/integer_returns` (a parameter returned with an integer at one call and a
+  fraction at another, a fraction at the end of a recursion and in a cycle of two, one fractional
+  override among a call's targets, negative zero out of a product, a value past 2^53, a result out
+  of a `finally`, functions called through a value, `Atomics` on signed and unsigned arrays).
+
 ### Typed capture-context fields
 
 A captured variable lives in a field of its owner's capture-context class
