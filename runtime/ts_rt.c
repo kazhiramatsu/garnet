@@ -1231,7 +1231,13 @@ __attribute__((destructor)) static void ts_rt_stats_dump(void){
    each full collection retarget the next trigger from the live byte size. */
 #define TS_GC_MIN_FULL_BYTES ((size_t)4u * 1024u * 1024u)
 
+#if defined(TS_VALUE_CHECK) && TS_VALUE_REP == 1
+/* by the selector alone: the marker and the barriers meet the zero word of unused slots, which the checking
+   build's ts_is_obj refuses in representation 1 */
+static inline int ts_heap_ref(tsv v){ uint16_t t = TS_TOP16(v); return t == TS_SEL_OBJECT || t == TS_SEL_FUNC || t == TS_SEL_STRING; }
+#else
 static inline int ts_heap_ref(tsv v){ return ts_is_obj(v)||ts_is_func(v)||ts_is_heap_str(v); }
+#endif
 /* Every cell kind, the last one included: an old Proxy referenced only in
    the old-pointer form was skipped by a full collection's marking and freed
    while live. */
@@ -2059,6 +2065,7 @@ static tsv ts_new_proto_impl(int pretenured){
   /* a plain function's prototype object inherits from Object.prototype; whoever makes one for another
      chain relinks it */
   if (ts_proto_ref(g_object_proto_v)){ o->proto = g_object_proto_v; ts_write_barrier(v, g_object_proto_v); }
+  else o->proto = TS_NULL;   /* Object.prototype itself: null, not the zero word (representation 1 reads that as an object) */
   return v;
 }
 tsv ts_new_proto(void){ return ts_new_proto_impl(0); }

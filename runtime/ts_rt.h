@@ -434,7 +434,13 @@ static const char* const ts_value_rep_guard __attribute__((used)) = &ts_value_re
 static inline tsv ts_obj(void* p) { return ts_heap_ref_fast(TS_SEL_OBJECT, p); }
 static inline tsv ts_str_v(void* p){ return ts_heap_ref_fast(TS_SEL_STRING, p); }
 static inline tsv ts_func_v(void* p){return ts_heap_ref_fast(TS_SEL_FUNC,   p); }
-static inline int ts_is_obj(tsv v) { return TS_TOP16(v) == TS_SEL_OBJECT; }
+static inline int ts_is_obj(tsv v) {
+#if defined(TS_VALUE_CHECK) && TS_VALUE_REP == 1
+  /* the zero word is no value: zeroed memory read as one (docs/unmasked_pointers_design.md, section 7) */
+  if (TS_RT_UNLIKELY(v == 0)) ts_value_check_failed("ts_is_obj of the zero word", v);
+#endif
+  return TS_TOP16(v) == TS_SEL_OBJECT;
+}
 static inline int ts_is_heap_str(tsv v) { return TS_TOP16(v) == TS_SEL_STRING; }
 static inline int ts_is_short_str(tsv v) { return TS_TOP16(v) == TS_SEL_SHORTSTR; }
 static inline int ts_is_str(tsv v) {
@@ -443,7 +449,13 @@ static inline int ts_is_str(tsv v) {
 }
 static inline int ts_is_func(tsv v){ return TS_TOP16(v) == TS_SEL_FUNC; }
 /* a reference to a cell: an object, a heap string or a function */
+#if defined(TS_VALUE_CHECK) && TS_VALUE_REP == 1
+/* (by the selector alone: the barriers meet the zero word of unused slots, which the checking build's
+   ts_is_obj refuses in representation 1) */
+static inline int ts_is_heap_ref(tsv v){ uint16_t t = TS_TOP16(v); return t == TS_SEL_OBJECT || t == TS_SEL_FUNC || t == TS_SEL_STRING; }
+#else
 static inline int ts_is_heap_ref(tsv v){ return ts_is_obj(v) || ts_is_func(v) || ts_is_heap_str(v); }
+#endif
 #define TS_SHORTSTR_MAX 5u
 /* The longest string (V8's): past it the string builtins are a RangeError, not a truncated length. */
 #define TS_STR_MAX_LENGTH 536870888u
