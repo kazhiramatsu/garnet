@@ -37,6 +37,6 @@ function main(): void {
   let nans = 0;
   for (let i = 0; i < back.length; i++) if (Number.isNaN(back[i])) nans++;
   console.log(nans, back.length);
-  console.log(JSON.stringify(arr.slice(12)), arr.slice(12).map((d) => d * 2 ** 1074).join(","));
+  console.log(JSON.stringify(arr.slice(12)), arr.slice(12).map((d) => d * 2 ** 537 * 2 ** 537).join(","));
 }
 main();

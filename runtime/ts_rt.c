@@ -25331,7 +25331,7 @@ void ts_await_register_v(tsv pv, tsv cv){
 
 static void coro_init(ts_coro* c, size_t size, tsv (*resume)(tsv)){
   c->state=0; c->resume=resume; c->result=TS_UNDEFINED; c->rejected=0; c->async_ctx=TS_UNDEFINED; c->ctx_captured=0;
-  c->nvals=-1; c->frame_size=size; c->ret=TS_UNDEFINED; c->iter_result=TS_UNDEFINED;
+  c->nvals=-1; c->frame_size=size; c->ret=TS_UNDEFINED; c->iter_result=TS_UNDEFINED; c->yielded=TS_UNDEFINED;
   c->gen_status=TS_GEN_SUSPENDED_START;
   c->eh_capacity=TS_CORO_EH_INLINE;
   c->eh_catch_state=c->eh_catch_inline;

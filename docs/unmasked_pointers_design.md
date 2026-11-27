@@ -1,6 +1,7 @@
 # Object pointers stored as themselves
 
-Status: **design and audit, nothing built** (Session 368, 2026-11-24; every line number below is at
+Status: **slices 2, 2b and 3 built** (Session 369, 2026-11-28; "Built" at the end says what was
+found on the way). The design and the audit below are Session 368's (2026-11-24; every line number is at
 commit `f9439c5`). The expected gain is an estimate until slice 4 measures it.
 
 A value is a 64-bit word that holds a double, or a selector in its top 16 bits (`0xFFF8` to `0xFFFE`)
