@@ -376,3 +376,48 @@ representations.
 - Whether representation 0 is kept after the default moves, and for how long.
 - Small integers as values outside their slots (a second form of number): not in this change; whether
   to count the int32 share of boxed numbers on vue and hono, to decide it later.
+
+## Built (Session 369)
+
+**Slice 2** (representation 0 only, as designed):
+- What reads a word's bits is between two marked blocks of `ts_rt.h` (`TS_VALUE_REP definitions: begin` /
+  `end`). The primitives are **macros**, as `TS_TOP16` and `TS_BOX` are: written as inline functions they
+  changed clang's inlining (`array_write_barrier` went into its callers) and its instruction selection at
+  120 functions of the runtime. `ts_is_num` keeps its form in representation 0: clang makes
+  `t < 0xFFF8 || t > 0xFFFE` an add of 2^51 and one compare, where the 16-bit subtraction written above
+  costs an instruction at some sites.
+- `ts_obj_ptr` at the emitter's 24 sites and 82 lines of the header's inline paths. The runtime's own
+  functions keep `ts_ptr`: a mask in representation 1, which is what they pay today; the hot ones are for
+  slice 4's profile.
+- **Verified by identity**: the runtime object byte-identical to the previous sources' (plain, and with the
+  stack check); hono's generated C compiled against the new header byte-identical, and with every
+  `ts_ptr` of it spelled `ts_obj_ptr` the same instructions in all of its 3,905 functions.
+- The source gate (`tests/value_rep_gate.sh`, in the runtime tests) reports the audit's sites on the
+  previous sources, 41 lines, and a 64-bit constant given a name by a macro (what `TS_MAPSET_NEG_ZERO` was).
+
+**Slice 2b**, as designed: four functions of the runtime one instruction longer (the creations' constant;
+a 4-byte store at a dynamic slot index needs its shift, `str w` cannot scale by 8), hono's code 595,097 ->
+595,130 instructions (the constructors' constant).
+
+**Slice 3**:
+- Representation 1's definitions: `ts_heap_ref_fast` is the shift and the or (no mask: cells are below
+  2^47, checked where the cage is mapped), `ts_obj_ptr` the word, `ts_ptr` a 48-bit mask, no stack tag.
+  The collector tells a cell outside the heap by the cage (`gc_payload_outside_heap`); the marker's
+  reference outside the cage returns on the zero word first, then takes the validation a tagged one takes
+  in representation 0.
+- **Section 6 went further than planned**: the runtime's adapter coroutines (then, finally, adoption, the
+  combinators, the queued jobs, an async generator's return wait) have frame maps now, in both
+  representations (their tsv fields lead; `TS_CORO_ADAPTER` counts them). A frame without a map is only
+  the frozen emitter's or `TSAOT_CORO_PRECISE=0`'s, which representation 1 scans through the allocation
+  bitmap when conservative roots are on (the bitmap is maintained only then, which generated programs
+  do from their start), else as representation 0 does.
+- **Section 7, found**: `Object.prototype`'s own `[[Prototype]]` field was never written (the zero word):
+  `ts_get_proto` answered null for it because representation 0 reads +0 there, and representation 1 read an
+  object at address 0 (a `for..in` over an array faulted). It is `TS_NULL` now, as are a coroutine's
+  `yielded` and `g_exception` from their start. Representation 1's checking build aborts on the zero word
+  at `ts_is_obj` to find the rest (the marker's and the barriers' tests read the selector alone there: they
+  meet unused slots). An async function's local read before any write was already undefined
+  (`gc/coro_unwritten_locals`).
+- The link guard as designed (`ts_value_rep_0` / `ts_value_rep_1`).
+- The runtime's 226 unit tests pass in representation 1, in its checking build and in representation 0's
+  checking build; the stack-check test in representation 1.
