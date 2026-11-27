@@ -194,8 +194,8 @@ static inline __attribute__((always_inline)) ts_iso* ts_iso_get(void){
 #ifndef TS_VALUE_REP
 #define TS_VALUE_REP 0
 #endif
-#if TS_VALUE_REP != 0
-#error "TS_VALUE_REP 1 is not built yet (docs/unmasked_pointers_design.md, slice 3)"
+#if TS_VALUE_REP != 0 && TS_VALUE_REP != 1
+#error "TS_VALUE_REP is 0 or 1"
 #endif
 #define TS_SEL_SHIFT 48
 #define TS_PAYLOAD_MASK 0x0000FFFFFFFFFFFFULL
@@ -373,6 +373,7 @@ TS_RT_SLOW_CALL void ts_gc_remember(ts_gc_header* h);
  * load; the tag lives above the user address space. */
 tsv ts_heap_ref_value(uint16_t sel, void* p);
 /* TS_VALUE_REP definitions: begin (heap references) */
+#if TS_VALUE_REP == 0
 #define TS_PTR_STACK_TAG ((uint64_t)1u << 47)
 static inline tsv ts_heap_ref_fast(uint16_t sel, void* p) {
   if (TS_RT_LIKELY(p != NULL)){
@@ -393,6 +394,20 @@ static inline void* ts_ptr(tsv v) {
 #define ts_payload_addr(payload) ((uintptr_t)((payload) & ~TS_PTR_STACK_TAG))
 /* the payload of a reference to a NONHEAP cell at p */
 #define ts_payload_nonheap(p) ((uintptr_t)(p) | TS_PTR_STACK_TAG)
+#else
+/* Representation 1: a reference is the cell's address under its selector, a cell outside the heap's too
+   (its header's gen byte says NONHEAP, and the collector tells it by the cage), so boxing is no load and
+   an object's word is its address. Every cell lies below 2^48 (the cage is checked where it is mapped). */
+static inline tsv ts_heap_ref_fast(uint16_t sel, void* p) {
+  return ((uint64_t)sel << TS_SEL_SHIFT) | (uint64_t)(uintptr_t)p;
+}
+static inline void* ts_ptr(tsv v) {
+  return (void*)(uintptr_t)(v & TS_PAYLOAD_MASK);
+}
+#define ts_payload_stack_tagged(payload) ((void)(payload), 0)
+#define ts_payload_addr(payload) ((uintptr_t)(payload))
+#define ts_payload_nonheap(p) ((uintptr_t)(p))
+#endif
 /* The cell of a word known to carry the object selector: a test that dominates the use, or the allocation
    that made the word, proves it. Representation 1 makes it the word itself, where ts_ptr keeps its mask
    (it serves strings and functions too). The checking build aborts on any other word. */
@@ -400,8 +415,21 @@ static inline void* ts_obj_ptr(tsv v) {
 #ifdef TS_VALUE_CHECK
   if (TS_RT_UNLIKELY(TS_TOP16(v) != TS_SEL_OBJECT)) ts_value_check_failed("ts_obj_ptr of a word that is no object", v);
 #endif
+#if TS_VALUE_REP == 0
   return (void*)(uintptr_t)(v & TS_PAYLOAD_MASK & ~TS_PTR_STACK_TAG);
+#else
+  return (void*)(uintptr_t)v;
+#endif
 }
+/* The runtime and every unit compiled against this header agree on TS_VALUE_REP: each unit refers to a
+   symbol the runtime defines under its representation's name, so a mismatch does not link. */
+#if TS_VALUE_REP == 0
+extern const char ts_value_rep_0;
+static const char* const ts_value_rep_guard __attribute__((used)) = &ts_value_rep_0;
+#else
+extern const char ts_value_rep_1;
+static const char* const ts_value_rep_guard __attribute__((used)) = &ts_value_rep_1;
+#endif
 /* TS_VALUE_REP definitions: end */
 static inline tsv ts_obj(void* p) { return ts_heap_ref_fast(TS_SEL_OBJECT, p); }
 static inline tsv ts_str_v(void* p){ return ts_heap_ref_fast(TS_SEL_STRING, p); }

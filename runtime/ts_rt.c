@@ -1386,12 +1386,17 @@ static inline int gc_direct_header_readable(ts_gc_header* h){
 #endif
   return 1;
 }
-static inline ts_gc_header* ts_heap_ptr(tsv v){
-#if TS_VALUE_REP != 0
-#error "a reference outside the cage carries no tag in representation 1: validate it by the cage (slice 3)"
+/* A cell outside the heap: representation 0 tags its references, 1 leaves them to the cage. */
+static inline int gc_payload_outside_heap(uint64_t payload){
+#if TS_VALUE_REP == 0
+  return ts_payload_stack_tagged(payload) != 0;
+#else
+  return payload != 0 && !gc_payload_in_cage((const void*)(uintptr_t)payload);
 #endif
+}
+static inline ts_gc_header* ts_heap_ptr(tsv v){
   uint64_t payload = ts_payload(v);
-  if (ts_payload_stack_tagged(payload)){
+  if (gc_payload_outside_heap(payload)){
     ts_gc_header* h = (ts_gc_header*)ts_payload_addr(payload);
 #ifdef TSAOT_STACK_CHECK
     if (sc_in_quarantine(h)) return sc_quarantine_ptr(h);
@@ -1499,6 +1504,12 @@ static void gc_config_init(void){
   if (zap && zap[0] && strcmp(zap, "0") != 0) g_gc_zap = 1;
   if (g_gc_zap || g_gc_protect){ g_young_log_kinds = ~0u; g_alloc_every_slow = 1; }   /* dead cells are zapped or quarantined */
 }
+/* the representation this runtime was compiled for (ts_rt.h: every unit refers to it) */
+#if TS_VALUE_REP == 0
+const char ts_value_rep_0 = 0;
+#else
+const char ts_value_rep_1 = 1;
+#endif
 #ifdef TS_VALUE_CHECK
 /* The checking build (docs/unmasked_pointers_design.md): a word that broke an assumption of the
    representation's helpers. Not a JavaScript error: a bug of the runtime or of the generated code. */
@@ -7147,16 +7158,24 @@ static void gc_mark_visit_slow(ts_gc_header* h, int young, int depth){
 static inline void gc_mark_visit(tsv v, int young, int depth){
   RT_STAT_INC(mark_edges);
   if (!ts_heap_ref(v)) return;
-#if TS_VALUE_REP != 0
-#error "the marker's out-of-cage path: a stack or static cell's reference carries no tag in representation 1 (slice 3)"
-#endif
   uint64_t payload = ts_payload(v);
   ts_gc_header* h;
+#if TS_VALUE_REP == 0
   if (TS_RT_UNLIKELY(ts_payload_stack_tagged(payload))){
     h = ts_heap_ptr(v);
     if (!h) return;
   } else {
     if ((uintptr_t)payload - (uintptr_t)g_cage_base >= g_cage_bytes) return;
+#else
+  /* Representation 1 tags nothing: a reference outside the cage takes the validation a tagged one takes in
+     representation 0 (a stack or SROA cell is marked and scanned; null, the zero word of memory never
+     written, and a static literal are not followed). */
+  if (TS_RT_UNLIKELY((uintptr_t)payload - (uintptr_t)g_cage_base >= g_cage_bytes)){
+    if (!payload) return;
+    h = ts_heap_ptr(v);
+    if (!h) return;
+  } else {
+#endif
     h = (ts_gc_header*)(uintptr_t)payload;
     if (TS_RT_UNLIKELY(h->gen > TS_GEN_OLD || !gc_kind_valid(h->kind))){
       if (h->gen == GC_GEN_FREED) gc_freed_reached(h);
@@ -7196,9 +7215,7 @@ static uint64_t g_stack_hi = 0;   /* the main thread's stack base */
 uintptr_t g_gc_debug_watch = 0;   /* tests: report the stack word that names this cell */
 static const uint64_t* g_scan_cur = NULL;
 static void gc_mark_conservative_word(uint64_t w, int young){
-#if TS_VALUE_REP != 0
-#error "a stack word is taken by its low 48 bits; a word outside the cage is not followed (slice 3)"
-#endif
+  /* (representation 1: no word carries the stack tag; one outside the cage is not followed either way) */
   uint64_t a = ts_payload(w);
   /* A stack-tagged word is not followed: a stale one in a live frame may
      name a dead frame's cell, now other frames' words, whose garbage header
@@ -7601,11 +7618,8 @@ void ts_gc_debug_log_young(void){ g_young_log_kinds = ~0u; g_alloc_every_slow = 
    and not a young cell of this cycle). Needs ts_gc_debug_log_young. */
 int ts_gc_debug_cell_live(tsv v){
   if (!ts_heap_ref(v)) return 0;
-#if TS_VALUE_REP != 0
-#error "a stack or static cell is live: outside the cage in representation 1 (slice 3)"
-#endif
   uint64_t payload = ts_payload(v);
-  if (ts_payload_stack_tagged(payload)) return 1;
+  if (gc_payload_outside_heap(payload)) return 1;   /* a stack or static cell */
   char* p = (char*)(uintptr_t)payload;
   if (!gc_payload_in_cage(p)) return 0;
   for (size_t i = 0; i < g_young_log_len; i++) if ((char*)g_young_log[i] == p) return 1;
@@ -24168,7 +24182,7 @@ void ts_site_stats_init(const char** fn_names, uint32_t nfn){
 
 /* ---------------- exceptions (try/catch via setjmp/longjmp) ---------------- */
 static ts_handler* g_handlers = NULL;
-static tsv g_exception;
+static tsv g_exception = TS_UNDEFINED;   /* (not the zero word: representation 1 reads that as an object) */
 /* Handlers are pushed and popped in LIFO order: a popped one goes on a free
    list and the next push reuses it, so a `try` costs no allocation. */
 static ts_handler* g_handler_free = NULL;
@@ -24492,7 +24506,14 @@ void ts_promise_settle_v(tsv pv, tsv v, int rejected){
   ts_gc_unroot(2);
 }
 /* the runtime's adapter coroutines (defined with coro_alloc below): no result promise of their own */
-static tsv ts_coro_alloc_adapter_v(size_t size, tsv (*resume)(tsv));
+static tsv ts_coro_alloc_adapter_vn(size_t size, tsv (*resume)(tsv), int nvals);
+/* An adapter's frame (a struct of its own after the coroutine header): its tsv fields lead, so they are its
+   frame map, counted up to the last one; the int and double fields after them are not looked at. Without
+   the map every word of the frame was read as a value, which representation 1 cannot do (an integer below
+   2^48 reads as a reference there; docs/unmasked_pointers_design.md, section 6). */
+_Static_assert(sizeof(ts_coro) % sizeof(tsv) == 0, "an adapter's first field follows the coroutine header");
+#define TS_CORO_ADAPTER(T, last_val, resume) \
+  ts_coro_alloc_adapter_vn(sizeof(T), (resume), (int)((offsetof(T, last_val) - sizeof(ts_coro)) / sizeof(tsv) + 1))
 /* Promise adoption adapter: when a promise is resolved WITH another promise, an
    adapter coro is registered on the inner promise; it fires as a microtask when
    inner settles and forwards the state to the outer promise `out_v`. This gives
@@ -24605,7 +24626,7 @@ void ts_promise_resolve_v(tsv pv, tsv v){
        eventual state. This preserves ordering when the inner settles between
        resolve(inner) and the first microtask checkpoint. */
     ts_gc_root(&pv); ts_gc_root(&v);
-    tsv wv = ts_coro_alloc_adapter_v(sizeof(ts_adopt),adopt_resume);
+    tsv wv = TS_CORO_ADAPTER(ts_adopt, inner_v, adopt_resume);
     ts_gc_root(&wv);
     ts_adopt* w=(ts_adopt*)ts_ptr(wv);
     w->out_v=pv; w->inner_v=v; w->registered=0;
@@ -24629,7 +24650,7 @@ void ts_promise_resolve_v(tsv pv, tsv v){
       return;
     }
     if (ts_is_callable(then_fn)){
-      tsv wv=ts_coro_alloc_adapter_v(sizeof(ts_thenable_job),thenable_job_resume);
+      tsv wv=TS_CORO_ADAPTER(ts_thenable_job, then_fn, thenable_job_resume);
       ts_gc_root(&wv);
       ts_thenable_job* w=(ts_thenable_job*)ts_ptr(wv);
       w->out_v=pv; w->thenable=v; w->then_fn=then_fn;
@@ -24760,7 +24781,7 @@ tsv ts_promise_all(tsv arr){
   if (n==0){ ts_promise_resolve_v(outv, results); ts_gc_unroot(4); return outv; }
   for (uint32_t i=0;i<n;i++){
     tsv input = ts_array_get(arrv, i);
-    tsv wv = ts_coro_alloc_adapter_v(sizeof(ts_comb),comb_all_resume);
+    tsv wv = TS_CORO_ADAPTER(ts_comb, out_v, comb_all_resume);
     ts_gc_root(&wv);
     ts_comb* w = (ts_comb*)ts_ptr(wv);
     w->out_v = outv; ts_write_barrier(wv, outv); w->idx = (double)i;
@@ -24782,7 +24803,7 @@ tsv ts_promise_race(tsv arr){
   uint32_t n = ts_array_len(arrv);
   for (uint32_t i=0;i<n;i++){           /* empty array -> stays pending forever (spec) */
     tsv input = ts_array_get(arrv, i);
-    tsv wv = ts_coro_alloc_adapter_v(sizeof(ts_comb),comb_race_resume);
+    tsv wv = TS_CORO_ADAPTER(ts_comb, out_v, comb_race_resume);
     ts_gc_root(&wv);
     ts_comb* w = (ts_comb*)ts_ptr(wv);
     w->out_v = outv; ts_write_barrier(wv, outv); w->idx = (double)i;
@@ -24864,7 +24885,7 @@ static tsv finally_resume(tsv cv){
        which the derived promise adopts (two jobs after this one, as V8 orders them) */
     tsv p2=ts_promise_new_v();
     ts_gc_root(&p2);
-    tsv av=ts_coro_alloc_adapter_v(sizeof(ts_finally_after),finally_after_resume);
+    tsv av=TS_CORO_ADAPTER(ts_finally_after, original, finally_after_resume);
     ts_gc_root(&av);
     ts_finally_after* a=(ts_finally_after*)ts_ptr(av);
     a->out_v=p2; a->original=result; a->original_rejected=rejected;
@@ -24909,7 +24930,7 @@ tsv ts_promise_then(tsv pv, tsv on_f, tsv on_r){
   ts_gc_root(&pv); ts_gc_root(&on_f); ts_gc_root(&on_r);
   tsv outv=ts_promise_new_v();
   ts_gc_root(&outv);
-  tsv wv=ts_coro_alloc_adapter_v(sizeof(ts_then),then_resume);
+  tsv wv=TS_CORO_ADAPTER(ts_then, cb1, then_resume);
   ts_gc_root(&wv);
   ts_then* w=(ts_then*)ts_ptr(wv);
   w->out_v=outv; w->cb0=on_f; w->cb1=on_r;
@@ -24954,7 +24975,7 @@ tsv ts_promise_finally(tsv pv, tsv on_fin){
   ts_gc_root(&pv); ts_gc_root(&on_fin);
   tsv outv=ts_promise_new_v();
   ts_gc_root(&outv);
-  tsv wv=ts_coro_alloc_adapter_v(sizeof(ts_then),finally_resume);
+  tsv wv=TS_CORO_ADAPTER(ts_then, cb1, finally_resume);
   ts_gc_root(&wv);
   ts_then* w=(ts_then*)ts_ptr(wv);
   w->out_v=outv; w->cb0=on_fin; w->cb1=TS_UNDEFINED;
@@ -25120,7 +25141,7 @@ tsv ts_import_bundled(tsv record, tsv options){
 }
 static void ts_queue_microtask(tsv cb){
   ts_gc_root(&cb);
-  tsv wv = ts_coro_alloc_adapter_v(sizeof(ts_qm_job), qm_job_resume);
+  tsv wv = TS_CORO_ADAPTER(ts_qm_job, cb, qm_job_resume);
   ((ts_qm_job*)ts_ptr(wv))->cb = cb;
   ts_write_barrier(wv, cb);
   if (g_async_ctx_used){   /* the job runs in the context queueMicrotask was called in, as Node's */
@@ -25239,7 +25260,7 @@ tsv ts_promise_allsettled(tsv arr){
   if (n==0){ ts_promise_resolve_v(outv, results); ts_gc_unroot(4); return outv; }
   for (uint32_t i=0;i<n;i++){
     tsv input = ts_array_get(arrv, i);
-    tsv wv = ts_coro_alloc_adapter_v(sizeof(ts_comb),comb_allsettled_resume);
+    tsv wv = TS_CORO_ADAPTER(ts_comb, out_v, comb_allsettled_resume);
     ts_gc_root(&wv);
     ts_comb* w = (ts_comb*)ts_ptr(wv);
     w->out_v = outv; ts_write_barrier(wv, outv); w->idx = (double)i;
@@ -25271,7 +25292,7 @@ tsv ts_promise_any(tsv arr){
   }
   for (uint32_t i=0;i<n;i++){
     tsv input = ts_array_get(arrv, i);
-    tsv wv = ts_coro_alloc_adapter_v(sizeof(ts_comb),comb_any_resume);
+    tsv wv = TS_CORO_ADAPTER(ts_comb, out_v, comb_any_resume);
     ts_gc_root(&wv);
     ts_comb* w = (ts_comb*)ts_ptr(wv);
     w->out_v = outv; ts_write_barrier(wv, outv); w->idx = (double)i;
@@ -25392,7 +25413,7 @@ static tsv coro_alloc(size_t size, tsv (*resume)(tsv), int nvals, int promise){
 tsv ts_coro_alloc_v(size_t size, tsv (*resume)(tsv)){ return coro_alloc(size, resume, -1, 1); }
 /* an adapter of the runtime's own (then, finally, an adoption, a combinator's element): its resume
    settles the promise it holds, so the frame needs no result promise (one was made and never read) */
-static tsv ts_coro_alloc_adapter_v(size_t size, tsv (*resume)(tsv)){ return coro_alloc(size, resume, -1, 0); }
+static tsv ts_coro_alloc_adapter_vn(size_t size, tsv (*resume)(tsv), int nvals){ return coro_alloc(size, resume, nvals, 0); }
 tsv ts_coro_alloc_vn(size_t size, tsv (*resume)(tsv), uint32_t nvals){
   return coro_alloc(size, resume, nvals > (uint32_t)INT32_MAX ? INT32_MAX : (int)nvals, 1);
 }
@@ -27198,16 +27219,23 @@ static void gc_scan_async_cell(ts_gc_header* h, int young, int depth){
       tsv* vals = (tsv*)((char*)c + sizeof(ts_coro));
       for (int i = 0; i < c->nvals; i++) gc_visit_slot(&vals[i], young, depth, stable);
     } else {
-      /* A frame without the map: scan it conservatively; any 8-byte word that
-         looks like a heap reference is treated as a root. An integer local
-         with such bits is read as a reference too, the reason for the map. */
-#if TS_VALUE_REP != 0
-#error "every integer below 2^48 looks like a reference in representation 1: the allocation bitmap must admit it (slice 3)"
-#endif
+      /* A frame without the map (the frozen emitter's, and generated frames under
+         TSAOT_CORO_PRECISE=0; the runtime's adapters have maps): scan it
+         conservatively; any 8-byte word that looks like a heap reference is
+         treated as a root. An integer local with such bits is read as a
+         reference too, the reason for the map. In representation 1 every
+         integer below 2^48 has the object selector: under conservative roots
+         (the default) a word is admitted only if the allocation bitmap names a
+         cell, as a word of the native stack is; without them, as in
+         representation 0, by the validation of a reference
+         (docs/unmasked_pointers_design.md, section 6). */
       size_t off = sizeof(ts_coro);
       char* base = (char*)c;
       for (; off + sizeof(tsv) <= c->frame_size; off += sizeof(tsv)){
         tsv v; memcpy(&v, base+off, sizeof(tsv));
+#if TS_VALUE_REP != 0
+        if (g_conservative_roots){ gc_mark_conservative_word(v, young); continue; }
+#endif
         gc_mark_visit(v, young, depth);
       }
     }
@@ -28896,7 +28924,7 @@ static void asyncgen_start_next_v(tsv cv){
          overtake it. */
       if (r->kind==2){
         c->ag_running=1;
-        tsv av=ts_coro_alloc_adapter_v(sizeof(ts_asyncgen_return_wait),asyncgen_return_wait_resume);
+        tsv av=TS_CORO_ADAPTER(ts_asyncgen_return_wait, gen_v, asyncgen_return_wait_resume);
         ts_gc_root(&av);
         ts_asyncgen_return_wait* w=(ts_asyncgen_return_wait*)ts_ptr(av);
         w->gen_v=cv; w->resume_generator=0; ts_write_barrier(av,cv);
@@ -28917,7 +28945,7 @@ static void asyncgen_start_next_v(tsv cv){
          allowing user catch/finally code to observe the rejection. */
       c->ag_running=1;
       c->gen_status=TS_GEN_EXECUTING;
-      tsv av=ts_coro_alloc_adapter_v(sizeof(ts_asyncgen_return_wait),asyncgen_return_wait_resume);
+      tsv av=TS_CORO_ADAPTER(ts_asyncgen_return_wait, gen_v, asyncgen_return_wait_resume);
       ts_gc_root(&av);
       ts_asyncgen_return_wait* w=(ts_asyncgen_return_wait*)ts_ptr(av);
       w->gen_v=cv; w->resume_generator=1; ts_write_barrier(av,cv);
