@@ -1373,6 +1373,14 @@ pub(crate) struct ClassDfs {
     /// methods) and its root extends nothing the table does not record (a
     /// library class, a class-valued constant, a mixin expression).
     ranged: BTreeSet<u32>,
+    /// The generic classes the exporter cloned for an instantiation with unboxed number fields (`Box` for
+    /// `Box$number`). A direct call it resolved through a receiver whose provenance it could not prove
+    /// (`b.self().get()` on a `Box<number>`) runs the generic method on the clone's instance, whose number
+    /// field is a raw double where the generic struct has a value: representation 0 read the same bits by
+    /// luck, representation 1 does not (docs/unmasked_pointers_design.md, Session 369). An access through
+    /// such a class's struct tests the class interval whatever the program's closure says, so the clone's
+    /// instance takes the access by name.
+    stand_ins: BTreeSet<u32>,
 }
 
 thread_local! {
@@ -1380,6 +1388,7 @@ thread_local! {
         index: BTreeMap::new(),
         span: BTreeMap::new(),
         ranged: BTreeSet::new(),
+        stand_ins: BTreeSet::new(),
     }));
 }
 
@@ -1398,7 +1407,7 @@ fn compute_class_dfs(classes: &[ClassDef]) -> ClassDfs {
         v.sort_unstable();
     }
     roots.sort_unstable();
-    let mut dfs = ClassDfs { index: BTreeMap::new(), span: BTreeMap::new(), ranged: BTreeSet::new() };
+    let mut dfs = ClassDfs { index: BTreeMap::new(), span: BTreeMap::new(), ranged: BTreeSet::new(), stand_ins: BTreeSet::new() };
     let mut next = 0u32;
     fn visit(c: u32, children: &BTreeMap<u32, Vec<u32>>, dfs: &mut ClassDfs, next: &mut u32) {
         let lo = *next;
@@ -1413,6 +1422,19 @@ fn compute_class_dfs(classes: &[ClassDef]) -> ClassDfs {
     }
     for &r in &roots {
         visit(r, &children, &mut dfs, &mut next);
+    }
+    // the exporter names a specialization `<class>$<type arguments>` (exporter.ts, specializedClassId)
+    let by_name: BTreeMap<&str, u32> = classes.iter().filter_map(|c| c.name.as_deref().map(|n| (n, c.id.0))).collect();
+    for c in classes {
+        let Some((base, _)) = c.name.as_deref().and_then(|n| n.split_once('$')) else { continue };
+        if !c.field_types.values().any(|t| t == "number") {
+            continue;
+        }
+        if let Some(&b) = by_name.get(base) {
+            if b != c.id.0 {
+                dfs.stand_ins.insert(b);
+            }
+        }
     }
     let foreign_base = |c: &ClassDef| {
         c.reasons.iter().any(|r| {
@@ -11861,6 +11883,15 @@ fn receiver_guard(obj: &str, hint: &Option<HintGuard>, c: u32) -> String {
 /// grafted method's `this` of another class is not; without class indices,
 /// a sized instance at all (docs/closed_receivers_design.md, slice 2).
 fn typed_slow_guard_for(obj: &str, c: u32) -> String {
+    if class_index_enabled() {
+        // a generic class a specialization's instance can stand in for (ClassDfs::stand_ins): always tested
+        let dfs = class_dfs();
+        if dfs.stand_ins.contains(&c) {
+            if let (Some(&i), Some(&span)) = (dfs.index.get(&c), dfs.span.get(&c)) {
+                return format!("ts_typed_outside({}, {}u, {}u)", obj, i + 1, span);
+            }
+        }
+    }
     if !closed_receivers() && typed_slow_enabled() && class_index_enabled() {
         let dfs = class_dfs();
         if let (Some(&i), Some(&span)) = (dfs.index.get(&c), dfs.span.get(&c)) {
