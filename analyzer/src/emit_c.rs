@@ -9622,8 +9622,14 @@ fn emit_i64_function(
     let return_facts = i64_return_facts(i64_fast);
     let numeric = infer_numeric_analysis(&f.body, &unboxed, &info.param_facts, &return_facts, &int32_field_loads(&f.body, &local_class, classes));
     let mut int_local = numeric.int_local;
+    // a parameter is an integer local while every definition of it is one: a body that stores a
+    // fraction, a product past the int64 range or a NaN into it reads a double there (the entry still
+    // takes an integer). Every parameter was put here, so `p = 1.5` was read as 1 (the statements
+    // fuzzer, seed 26; numbers/param_reassigned_fraction).
     for p in &info.params {
-        int_local.insert(*p);
+        if numeric.facts.get(p).map_or(false, |nf| nf.i64_safe) {
+            int_local.insert(*p);
+        }
     }
     let nonzero_int_const = numeric.nonzero_int_const;
     let nonzero_int = numeric.nonzero_int;
