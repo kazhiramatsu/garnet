@@ -212,9 +212,21 @@ enum {
   /* Up to five ASCII bytes plus a three-bit length fit in the 48-bit payload.
      This selector is a string primitive, but not a heap reference. The runtime's
      internal markers (TS_ARRAY_HOLE and the others) are words under it too. */
-  TS_SEL_SHORTSTR
+  TS_SEL_SHORTSTR,
+  /* The small integer of an integer slot (docs/unmasked_pointers_design.md, section 5): the int32 under
+     the one selector ts_num never makes. Only integer slots hold such a word; it reads as a number (a
+     NaN in representation 0) and is no value anywhere else: a read of the slot boxes it. */
+  TS_SEL_INT32
 };
-_Static_assert(TS_SEL_SHORTSTR == TS_SEL_OBJECT + 6, "the selectors are seven consecutive values");
+_Static_assert(TS_SEL_SHORTSTR == TS_SEL_OBJECT + 6 && TS_SEL_INT32 == TS_SEL_OBJECT + 7, "the selectors are eight consecutive values");
+_Static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "an integer slot's store writes the low half of the word at its address");
+#ifdef TS_VALUE_CHECK
+/* the checking build (docs/unmasked_pointers_design.md): a word that broke an assumption of these definitions */
+TS_RT_NORETURN void ts_value_check_failed(const char* what, tsv v);
+#define TS_VALUE_CHECK_NOT_INT32(v, what) (TS_RT_UNLIKELY(TS_TOP16(v) == TS_SEL_INT32) ? ts_value_check_failed((what), (v)) : (void)0)
+#else
+#define TS_VALUE_CHECK_NOT_INT32(v, what) ((void)0)
+#endif
 #define TS_BOX(sel, payload) ((((uint64_t)(sel)) << TS_SEL_SHIFT) | ((uint64_t)(payload) & TS_PAYLOAD_MASK))
 /* the low 48 bits of a word: an immediate's payload, a heap reference's address (with the stack tag in
    representation 0). Hashes by identity take it. */
@@ -232,11 +244,11 @@ static inline tsv ts_num(double d) {
 /* (representation 0's form: clang makes it `(v + 2^51) >> 48 >= 7`, one instruction fewer at some sites
    than the form with a 16-bit subtraction) */
 #if TS_VALUE_REP == 0
-static inline int ts_is_num(tsv v) { uint16_t t = TS_TOP16(v); return t < TS_SEL_OBJECT || t > TS_SEL_SHORTSTR; }
+static inline int ts_is_num(tsv v) { TS_VALUE_CHECK_NOT_INT32(v, "ts_is_num of an integer slot's word"); uint16_t t = TS_TOP16(v); return t < TS_SEL_OBJECT || t > TS_SEL_SHORTSTR; }
 #else
-static inline int ts_is_num(tsv v) { return TS_TOP16(v) > TS_SEL_SHORTSTR; }
+static inline int ts_is_num(tsv v) { TS_VALUE_CHECK_NOT_INT32(v, "ts_is_num of an integer slot's word"); return TS_TOP16(v) > TS_SEL_SHORTSTR; }
 #endif
-static inline double ts_to_num(tsv v) { uint64_t b = v ^ TS_NUM_XOR; double d; memcpy(&d, &b, 8); return d; }
+static inline double ts_to_num(tsv v) { TS_VALUE_CHECK_NOT_INT32(v, "ts_to_num of an integer slot's word"); uint64_t b = v ^ TS_NUM_XOR; double d; memcpy(&d, &b, 8); return d; }
 /* the sign bit of a number's word: -0 told from +0 without a conversion */
 #define ts_num_sign(v) ((uint64_t)((v) ^ TS_NUM_XOR) >> 63)
 /* the word of -0 (no other number has it) */
@@ -384,9 +396,6 @@ static inline void* ts_ptr(tsv v) {
 /* The cell of a word known to carry the object selector: a test that dominates the use, or the allocation
    that made the word, proves it. Representation 1 makes it the word itself, where ts_ptr keeps its mask
    (it serves strings and functions too). The checking build aborts on any other word. */
-#ifdef TS_VALUE_CHECK
-TS_RT_NORETURN void ts_value_check_failed(const char* what, tsv v);
-#endif
 static inline void* ts_obj_ptr(tsv v) {
 #ifdef TS_VALUE_CHECK
   if (TS_RT_UNLIKELY(TS_TOP16(v) != TS_SEL_OBJECT)) ts_value_check_failed("ts_obj_ptr of a word that is no object", v);
@@ -3014,17 +3023,22 @@ TS_RT_ALWAYS_INLINE void ts_set_sized_pic_inline_lazy(tsv obj, ts_key key, tsv v
   ts_frame_pop(frame);
 }
 /* Integer slots (docs/record_int_fields_design.md): a shaped object's slot whose
-   attribute flags carry TS_PROP_INT32 holds an int32 zero-extended in its word
-   (never a heap tag, so the collector's scan is unchanged). The static-slot
+   attribute flags carry TS_PROP_INT32 holds a small integer, the int32 under
+   the selector TS_SEL_INT32 (no reference: the collector's scan passes it by).
+   Every creation of such a slot writes the whole word (ts_int_slot_word(0)) and
+   a store of anything but an int32 boxes the slot before its shape moves on
+   (ts_rt.c obj_generalize_slot), so the high half is the selector from the
+   slot's creation to its end and a store writes the low half alone
+   (docs/unmasked_pointers_design.md, section 5). The static-slot
    probe vectors tag such a slot's key with TS_PROBE_INT_TAG: a read the emitter
    types as an integer matches it in one compare, a boxed read boxes it in line,
    and the generic paths box through the slot readers (ts_rt.c obj_val_read). */
 #define TS_PROBE_INT_TAG 0x80000000u
 static inline tsv ts_int_slot_box(tsv w){ return ts_num((double)(int32_t)(uint32_t)w); }
 static inline int32_t ts_int_slot_value(tsv w){ return (int32_t)(uint32_t)w; }
-static inline tsv ts_int_slot_word(int32_t i){ return (tsv)(uint32_t)i; }
-/* a store into an integer slot: the slot's word made from the integer (the creation writes the first) */
-#define ts_int_slot_store(p, i) (*(p) = ts_int_slot_word(i))
+static inline tsv ts_int_slot_word(int32_t i){ return TS_BOX(TS_SEL_INT32, (uint32_t)i); }
+/* a store into an integer slot: its low half (a 4-byte store; the selector above it stays) */
+#define ts_int_slot_store(p, i) do { int32_t ts_isv_ = (int32_t)(i); memcpy((void*)(p), &ts_isv_, 4); } while (0)
 /* An object literal of a layout at a site (docs/alloc_fast_path_design.md, "In the generated
    code"): the zeroed run's bump (the fields not written here are zero), the header, the
    prototype, the layout's shape and the slots (an integer slot's zero, undefined); n and kinds are

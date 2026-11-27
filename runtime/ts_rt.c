@@ -7304,8 +7304,17 @@ static inline void gc_mark_common_props(ts_object* o, int young, int depth, int 
   if (obj_shaped(o)){
     if (!m->len) return;
     const ts_key* ks = g_ts_shape_keys[ts_obj_shape_id(o)];
+#ifdef TS_VALUE_CHECK
+    /* an integer slot's word is the small integer, and no other slot holds one (ts_rt.h, the integer slots) */
+    const uint8_t* fl = g_ts_shape_flags[ts_obj_shape_id(o)];
+#endif
     for (uint32_t i=first;i<end;i++){
       gc_mark_property_key(ks[i], young, depth);
+#ifdef TS_VALUE_CHECK
+      { tsv w = *ts_obj_slot_ptr(o, i);
+        if ((fl[i] & TS_PROP_INT32) ? TS_TOP16(w) != TS_SEL_INT32 : TS_TOP16(w) == TS_SEL_INT32)
+          ts_value_check_failed((fl[i] & TS_PROP_INT32) ? "an integer slot whose word is no small integer" : "a small integer in a slot that is no integer slot", w); }
+#endif
       gc_visit_slot(ts_obj_slot_ptr(o, i), young, depth, stable);
     }
     return;
