@@ -393,6 +393,8 @@ static void gc_cage_init(void){
     break;
   }
   if (!g_cage_base) ts_abort_msg("cannot reserve the heap cage (TSAOT_GC_CAGE_GB)");
+  /* a reference is a cell's address in the 48 bits of a word's payload (and representation 0 tags bit 47) */
+  if ((uintptr_t)g_cage_base + g_cage_bytes > ((uintptr_t)1 << 47)) ts_abort_msg("the heap cage lies above 2^47: no reference could name its cells");
   g_cage_blocks = (uint32_t)(g_cage_bytes >> GC_BLOCK_SHIFT);
   void* bt = mmap(NULL, sizeof(gc_block) * (size_t)g_cage_blocks, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
   void* bm = mmap(NULL, sizeof(uint64_t) * GC_BLOCK_BITMAP_WORDS * (size_t)g_cage_blocks, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);

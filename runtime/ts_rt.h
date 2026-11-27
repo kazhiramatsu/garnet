@@ -190,7 +190,8 @@ static inline __attribute__((always_inline)) ts_iso* ts_iso_get(void){
  *   address, the selectors are 0 to 6, a number's word is its bits xor the constant.
  * The two are one bijection that keeps the selectors' order and spacing, so code that goes through the
  * definitions between these markers computes the same in both; nothing outside them reads a word's bits
- * (the source gate). Representation 1 is slice 3 of the design: not built yet. */
+ * (the source gate). Representation 0 is the default; 1 is built with -DTS_VALUE_REP=1 (the runtime and every
+ * unit alike: the link guard below refuses a mix). */
 #ifndef TS_VALUE_REP
 #define TS_VALUE_REP 0
 #endif
