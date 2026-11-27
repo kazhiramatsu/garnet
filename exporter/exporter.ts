@@ -18238,8 +18238,14 @@ class Exporter {
       if (ctorFunc !== undefined) {
         methods.push({ name: this.internName("__ctor__"), propName: undefined, func: ctorFunc, kind: "method" });
       }
-      // monomorphization: uniform concrete field types, keyed by interned field id
-      const uft = this.uniformFieldTypes(c.id);
+      // monomorphization: uniform concrete field types, keyed by interned field id. A generic class's
+      // specialization (`Box$number`, specializedClassId) keeps its fields as values, the generic class's
+      // layout: a call resolved through a receiver whose provenance is not proven (`b.self().get()`) runs the
+      // generic class's method on the clone's instance, which reads and writes the field through the generic
+      // struct. An unboxed double there was a raw double read as a value, the same number in representation 0
+      // by luck and another in representation 1 (docs/unmasked_pointers_design.md, Session 369).
+      const isSpecializationClone = [...this.genClassSpecializations.values()].includes(c.id);
+      const uft = isSpecializationClone ? {} : this.uniformFieldTypes(c.id);
       const fieldTypes: Record<string, string> = {};
       for (const [fname, tag] of Object.entries(uft)) {
         fieldTypes[String(this.internField(fname))] = tag;
