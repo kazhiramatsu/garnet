@@ -421,3 +421,18 @@ a 4-byte store at a dynamic slot index needs its shift, `str w` cannot scale by 
 - The link guard as designed (`ts_value_rep_0` / `ts_value_rep_1`).
 - The runtime's 226 unit tests pass in representation 1, in its checking build and in representation 0's
   checking build; the stack-check test in representation 1.
+- **Words that are no value, read as one, found by representation 1** (each a value only by luck in
+  representation 0, which reads two integers or a raw double as the same number):
+  - `ts_instanceof` and `ts_get_proto` read the prototype field's offset of any cell with the object
+    selector: a BigInt's length and sign, a Symbol's ids, a generator's state. `-8n instanceof A` walked into
+    `0x100000001` (`types/bigint_cell_words`). A cell without the common header's prototype field starts
+    nowhere now (a primitive is no instance).
+  - **A generic class's specialization read through the generic struct**: under the strict profile the
+    exporter clones `Box<number>` as `Box$number` with its number fields unboxed, and resolves a call to the
+    clone's method only when it proves the receiver's provenance; `b.self().get()`, a method with type
+    parameters of its own and a callback run the generic method on the clone's instance (three strict
+    fixtures: `5` read as `-0.875`). tsc-ts's `ClusteredLinkTable<Node>` and `<EmitNode>` are such clones,
+    reached that way throughout the checker. A class interval guard on the generic class's accesses was
+    right and cost tsc-ts 17.6% of its instructions (every access by name); a clone keeps the generic
+    layout now (no uniform field types), and the guard stays for a clone that would differ
+    (`ClassDfs::stand_ins`, empty today). Fixture `types/specialized_through_generic`.

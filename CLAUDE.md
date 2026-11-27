@@ -115,6 +115,13 @@ Rust in §315; selfhost is kept as a performance metric).
   (`docs/startup_design.md`); when the split gives up it stays one function compiled at `-O0`, whose
   30 K locals the conservative stack scan then walks at every collection of every process (tsc-ts: 2.4%
   of a compile, unnoticed for five sessions). The analyzer says `[units] ... is not split`: read it.
+- **A word is read through the definitions of `ts_rt.h`, and representation 1 is the test of it**
+  (`docs/unmasked_pointers_design.md`, Session 369). Representation 0 reads a raw double, two integers of
+  a cell header and the zero word as numbers, which hid a specialization's double field read through its
+  generic class's struct, `instanceof` walking a BigInt's length as a prototype, and Object.prototype's
+  unwritten prototype field. Only the marked definitions blocks read a word's bits (`tests/value_rep_gate.sh`);
+  a change near values or cell layouts is run with `TSAOT_CC='... -DTS_VALUE_REP=1'` (the runtime and every
+  unit alike: a link guard refuses a mix; tsc-ts also needs `TSAOT_HOST_CC`).
 - **`ts_to_num` is a raw bit reinterpretation (not ToNumber).** `undefined`→NaN matches JS, but
   `null`→NaN does not.
 - **Gate a new feature behind a single predictable branch** (e.g. `if (g_has_proxies && ...)`) = zero

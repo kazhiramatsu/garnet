@@ -13698,3 +13698,88 @@ Next session, in order:
    build; the fixtures the design lists.
 4. Slice 4: the A/B on plain builds (tsc-ts, hono, hono_app, vue, the bench budgets, the kernels over
    number arrays), then the default.
+
+## Session 369 (2026-11-28): the value representation behind its definitions, the integer slot's small integer, representation 1 built and measured
+
+Kaz asked to resume Session 368's plan (`docs/unmasked_pointers_design.md`). Branches `s369-value-rep` (slice 2),
+`s369-int-slot` (2b) and `s369-rep1` (slice 3 and what it found), each on the one before; the work in `build/wt_dc`,
+an editing worktree `build/wt_vr`.
+
+**The whole set on main's tip first** (`build/gates_s369a`, 1c995c8's code, 44 minutes, three jobs, nice 12): unit,
+bundler 56, conformance 829 / 829 plain and strict, 826 / 826 under protect, ci, ir-parity identical (12 extra), GC
+stress, hono / hono_app / vue identical, tsc-ts built (`tsc_ts_native_v0`) with its corpus 6,537 / 6,537 identical to
+s2's. bench: `string_unicode_search_kernel` 106 ms against its 105 right after the protect run, then 105 and 104 alone
+(Session 367's kernel with one millisecond of room). The baselines of what follows are this build's (`*.v0`).
+
+**Slice 2, the representation behind its definitions** (`s369-value-rep`): what reads a word's bits is between two
+marked blocks of `ts_rt.h` (`TS_VALUE_REP` fixed at 0); the barriers, the collector's helpers, the hashes, the sign test
+of `ts_int32_exact`, the word of `-0`, the hole markers, the sparse table's pointer (`ts_raw_word`) and the integer slots'
+stores go through them; `ts_obj_ptr` at the emitter's 24 sites and 82 lines of the header's inline paths. The source gate
+`tests/value_rep_gate.sh` (in the runtime tests) reports the audit's 41 sites on the previous sources.
+- **Verified by identity**: the runtime object byte-identical to the previous sources' (and its stack-check build), hono's
+  generated C compiled against the new header byte-identical, and with every `ts_ptr` spelled `ts_obj_ptr` all 3,905 of
+  its functions the same instructions. The primitives are macros: as inline functions they moved clang's inlining at 120
+  functions. Then unit, conformance 829 / 829 plain, under the checking build (`TS_VALUE_CHECK`) and strict, bench.
+
+**Slice 2b, the integer slot's word is a small integer** (`s369-int-slot`): `TS_SEL_INT32` (0xFFFF here, 7 in
+representation 1); creations write the word, stores its low half (a 4-byte store). The checking build aborts on the small
+integer as a number and on a slot whose word disagrees with its flag. A/B against v0, plain builds, five rounds, outputs
+identical: hono, hono_app and tsc-ts instructions 1.0000, vue 1.0001. The objects fuzzer, seeds 1 to 200: 13 differ, the
+same 13 on main's tip (Session 364's explained set).
+
+**Slice 3, representation 1** (`s369-rep1`): `-DTS_VALUE_REP=1` builds; the runtime's 226 unit tests passed on the first
+build. What it found, each older than this session and right in representation 0 only by luck (a raw double, two integers
+or the zero word read as the same number):
+- `Object.prototype`'s own prototype field was never written (`for..in` over an array walked into address 0): `TS_NULL`
+  now, a coroutine's `yielded` and `g_exception` likewise from their start.
+- `instanceof` and `getPrototypeOf` read the prototype field's offset of any cell with the object selector: a BigInt's
+  length and sign (`-8n instanceof A` walked into 0x100000001), a Symbol's ids, a generator's state. Such a cell starts
+  nowhere now.
+- **A generic class's specialization read through the generic struct** (strict profile): `Box<number>` cloned as
+  `Box$number` with an unboxed double field, and `b.self().get()`, a method with type parameters of its own or a callback
+  running the generic method on the clone's instance (three strict fixtures: `5` read as `-0.875`). tsc-ts's
+  `ClusteredLinkTable<Node>` and `<EmitNode>` are such clones throughout the checker. A class interval guard on the
+  generic accesses was correct and cost tsc-ts **+17.6% instructions** (every access by name: `v3`); a clone keeps the
+  generic layout now (`v3b`: 1.0001 against v2b). Fixture `types/specialized_through_generic`.
+- The runtime's adapter coroutines have frame maps (both representations); a frame without one is the frozen emitter's
+  or `TSAOT_CORO_PRECISE=0`'s, scanned through the allocation bitmap in representation 1. A link guard
+  (`ts_value_rep_<N>`) refuses a runtime of the other representation: it caught tsc-ts's host build, which compiles the
+  runtime with `TSAOT_HOST_CC`.
+- Fixtures: `numbers/value_rep_zero_slots`, `value_rep_nan_payloads`, `maps_sets/value_rep_number_keys`,
+  `gc/coro_unwritten_locals`, `gc/value_rep_slot_words` (in the GC stress filter).
+
+**Gates, representation 1** (`build/gates_s369c`, `gates_s369e`): unit, conformance 835 / 835 plain, under the checking
+build and strict, 831 / 831 under protect, bundler 56, bench within its budgets, GC stress, hono / hono_app / vue
+identical, tsc-ts's corpus 6,537 / 6,537 identical to representation 0's; the fuzzers: numbers 100 and features 100 with
+no difference, objects 200 with main's 13, statements 100 with one (seed 26, below, in both representations).
+**Representation 0 at the branch's tip** (`gates_s369d`, `e`): unit, conformance 835 plain and strict, 832 protect,
+bench, GC stress, the drivers and tsc-ts identical and at v2b's instructions.
+
+**Measured, representation 1 against 0** (plain builds, alternating, instructions / cycles, outputs identical):
+- tsc-ts, the TypeScript 6.0.3 compiler project on one thread (`v3b` against `v1b`, seven rounds): **-8.0% / -5.0%**,
+  wall 1.17 -> 1.11 s, 626 -> 622 MB.
+- hono -5.6% / +0.4%, hono_app -4.8% / -0.7%, vue **-9.0% / -3.7%** (five rounds each).
+- The design's estimate was 3 to 4% of instructions. Not measured yet: a default run's processes, the pattern kernels
+  against Node, the binaries' sizes, the instruction classes.
+
+**Found by the statements fuzzer, older than this session, fixed** (`numbers/param_reassigned_fraction`): the integer
+entry of a function (`*_i64`) made every parameter an integer local, so a body that reassigns one with a fraction
+truncated it (`p0 = 1.5` read as 1; seed 26: `16 >>> ((p0 + p0) | 0)`). A parameter is an integer local of that entry
+only while the numeric analysis says every definition of it is one.
+  Gates (`gates_s369f`, representation 0): unit, conformance 836 / 836 plain and strict, bench, the numbers fuzzer 300 and
+  the statements fuzzer 200 with no difference; hono, hono_app, vue and tsc-ts outputs identical, instructions 1.0001,
+  0.9999, 1.0001, 1.0003.
+
+State at the end of the session: `s369-rep1` (51384d5 and this log) is pushed; main is still 1c995c8. Representation 0
+stays the default; representation 1 is `-DTS_VALUE_REP=1` for the runtime and every unit (`TSAOT_CC`, and
+`TSAOT_NATIVE_CC` with `TSAOT_HOST_CC` for tsc-ts).
+
+Next session, in order:
+1. Representation 1's gates not run yet: ci, selfconf and parity (the frozen twin's emitted C: if it cannot pass, its
+   gates pin representation 0), the stack-check build over conformance, the test262 tier, ir-parity, the hono survey.
+2. Slice 4's measurements left: a default run of tsc-ts (all processes), the pattern kernels against Node, the binaries'
+   sizes, the instruction classes (what the mask and the tag tests are now), the bench kernels over `number[]`.
+3. Kaz's decisions: the default (the design's rule says yes: tsc-ts gains, no kernel left its budget), and whether
+   representation 0 stays buildable after it (the frozen twin, bisects).
+4. `ts_obj_ptr` in the runtime's hot functions, guided by a profile of representation 1 (each `ts_ptr` left there is the
+   mask representation 0 pays).
