@@ -374,6 +374,8 @@ TS_RT_SLOW_CALL void ts_gc_remember(ts_gc_header* h);
  * load; the tag lives above the user address space. */
 tsv ts_heap_ref_value(uint16_t sel, void* p);
 /* TS_VALUE_REP definitions: begin (heap references) */
+/* every cell lies below: a reference's payload is 48 bits, and representation 0 tags bit 47 */
+#define TS_CELL_ADDR_LIMIT ((uintptr_t)1 << 47)
 #if TS_VALUE_REP == 0
 #define TS_PTR_STACK_TAG ((uint64_t)1u << 47)
 static inline tsv ts_heap_ref_fast(uint16_t sel, void* p) {

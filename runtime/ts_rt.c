@@ -394,7 +394,7 @@ static void gc_cage_init(void){
   }
   if (!g_cage_base) ts_abort_msg("cannot reserve the heap cage (TSAOT_GC_CAGE_GB)");
   /* a reference is a cell's address in the 48 bits of a word's payload (and representation 0 tags bit 47) */
-  if ((uintptr_t)g_cage_base + g_cage_bytes > ((uintptr_t)1 << 47)) ts_abort_msg("the heap cage lies above 2^47: no reference could name its cells");
+  if ((uintptr_t)g_cage_base + g_cage_bytes > TS_CELL_ADDR_LIMIT) ts_abort_msg("the heap cage lies above 2^47: no reference could name its cells");
   g_cage_blocks = (uint32_t)(g_cage_bytes >> GC_BLOCK_SHIFT);
   void* bt = mmap(NULL, sizeof(gc_block) * (size_t)g_cage_blocks, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
   void* bm = mmap(NULL, sizeof(uint64_t) * GC_BLOCK_BITMAP_WORDS * (size_t)g_cage_blocks, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -2216,6 +2216,9 @@ tsv ts_get_proto(tsv obj){
   }
   if (!ts_is_obj(obj)) return TS_NULL;
   ts_object* o = ts_ptr(obj);
+  /* a cell without the common header's prototype field (a coroutine, an accessor, a Symbol): its word at that
+     offset is no value (representation 1 reads its integers as a reference) */
+  if (TS_RT_UNLIKELY(o->h.kind > TS_KIND_PROMISE)) return chain_exotic_proto(obj);
   return ts_proto_ref(o->proto) ? o->proto : TS_NULL;
 }
 /* Object.setPrototypeOf: relink the object's prototype to `proto` (object or
@@ -15797,7 +15800,14 @@ int ts_instanceof(tsv obj, tsv target_proto){
   /* start from obj's own prototype (an instance is not its own prototype); a
      promise has no common header, its prototype is Promise.prototype; a function's is
      Function.prototype unless relinked */
-  tsv first = ts_is_func(obj) ? ts_get_proto(obj) : o->h.kind == TS_KIND_PROMISE ? chain_exotic_proto(obj) : o->proto;
+  /* a cell without the common header's prototype field (a coroutine, an accessor, a Symbol, a BigInt) starts
+     nowhere: its word at that offset is no value (two integers, which representation 1 reads as a reference;
+     `-8n instanceof A` faulted there), and a primitive is no instance (OrdinaryHasInstance) */
+  uint8_t kind = o->h.kind;
+  tsv first = ts_is_func(obj) ? ts_get_proto(obj)
+            : kind == TS_KIND_PROMISE ? chain_exotic_proto(obj)
+            : (kind > TS_KIND_PROMISE && kind != TS_KIND_PROXY) ? TS_NULL
+            : o->proto;
   for (tsv p = first; ts_proto_ref(p); ){
     if (p == target_proto || ts_same_cell(p, target_proto)) return 1;
     ts_object* link = (ts_object*)ts_ptr(p);
