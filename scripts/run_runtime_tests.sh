@@ -8,6 +8,7 @@ TSAOT_LDLIBS="${TSAOT_LDLIBS:-}"
 bash "$ROOT/tests/runtime_inline_policy_gate.sh"
 bash "$ROOT/tests/header_bytes_gate.sh"
 bash "$ROOT/tests/propmap_access_gate.sh"
+bash "$ROOT/tests/value_rep_gate.sh"
 cd "$ROOT/runtime"
 echo "[runtime] compiling ts_rt + tests"
 $CC ts_rt_test.c ts_rt.c -DTSAOT_ENABLE_FETCH=1 -lm -lcurl $TSAOT_LDLIBS -o /tmp/tsaot_rt_test

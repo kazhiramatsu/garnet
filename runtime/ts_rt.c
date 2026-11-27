@@ -1387,9 +1387,12 @@ static inline int gc_direct_header_readable(ts_gc_header* h){
   return 1;
 }
 static inline ts_gc_header* ts_heap_ptr(tsv v){
-  uint64_t payload = v & TS_PAYLOAD_MASK;
-  if (payload & TS_PTR_STACK_TAG){
-    ts_gc_header* h = (ts_gc_header*)(uintptr_t)(payload & ~TS_PTR_STACK_TAG);
+#if TS_VALUE_REP != 0
+#error "a reference outside the cage carries no tag in representation 1: validate it by the cage (slice 3)"
+#endif
+  uint64_t payload = ts_payload(v);
+  if (ts_payload_stack_tagged(payload)){
+    ts_gc_header* h = (ts_gc_header*)ts_payload_addr(payload);
 #ifdef TSAOT_STACK_CHECK
     if (sc_in_quarantine(h)) return sc_quarantine_ptr(h);
 #endif
@@ -1496,10 +1499,19 @@ static void gc_config_init(void){
   if (zap && zap[0] && strcmp(zap, "0") != 0) g_gc_zap = 1;
   if (g_gc_zap || g_gc_protect){ g_young_log_kinds = ~0u; g_alloc_every_slow = 1; }   /* dead cells are zapped or quarantined */
 }
+#ifdef TS_VALUE_CHECK
+/* The checking build (docs/unmasked_pointers_design.md): a word that broke an assumption of the
+   representation's helpers. Not a JavaScript error: a bug of the runtime or of the generated code. */
+void ts_value_check_failed(const char* what, tsv v){
+  fprintf(stderr, "[value check] %s: word 0x%016llx (top16 0x%04x)\n", what, (unsigned long long)v, (unsigned)TS_TOP16(v));
+  fflush(stderr);
+  abort();
+}
+#endif
 tsv ts_heap_ref_value(uint16_t sel, void* p){
   if (!p) return TS_BOX(sel, 0);
   ts_gc_header* h = (ts_gc_header*)p;
-  if (h->gen == TS_GEN_NONHEAP) return TS_BOX(sel, (uintptr_t)p | TS_PTR_STACK_TAG);
+  if (h->gen == TS_GEN_NONHEAP) return TS_BOX(sel, ts_payload_nonheap(p));
   return TS_BOX(sel, (uintptr_t)p);
 }
 /* A plain object's remembered card range lives in hdr_spare; a sized class
@@ -2671,8 +2683,8 @@ static void array_compact_front(ts_array* a){
    container must remember. */
 static inline int array_value_is_young(tsv value){
   if (!ts_heap_ref(value)) return 0;
-  uint64_t vp = value & TS_PAYLOAD_MASK;
-  if (!vp || (vp & TS_PTR_STACK_TAG)) return 0; /* stack cells are never young */
+  uint64_t vp = ts_payload(value);
+  if (!vp || ts_payload_stack_tagged(vp)) return 0; /* stack cells are never young */
   return ((const ts_gc_header*)(uintptr_t)vp)->gen == TS_GEN_YOUNG;
 }
 /* Indexed stores remember a bounded span of 64-element cards. Unknown stores
@@ -2708,8 +2720,10 @@ typedef struct ts_sparse_elems {
   uint32_t count, mask;   /* occupied keys (tombstones included); table size - 1 */
   uint32_t keys[];        /* table size keys, then table size values */
 } ts_sparse_elems;
-static inline ts_sparse_elems* array_sparse_table(ts_array* a){ return (ts_sparse_elems*)(uintptr_t)a->inline_data[0]; }
-static inline void array_set_sparse_table(ts_array* a, ts_sparse_elems* s){ a->inline_data[0] = (tsv)(uintptr_t)s; }
+/* the table's pointer is a word that is no value, in the first value slot (ts_raw_word): the scan does not
+   visit `data` while `a->sparse`, and nothing else may take it for a reference */
+static inline ts_sparse_elems* array_sparse_table(ts_array* a){ return (ts_sparse_elems*)(uintptr_t)ts_raw_word_value(a->inline_data[0]); }
+static inline void array_set_sparse_table(ts_array* a, ts_sparse_elems* s){ a->inline_data[0] = ts_raw_word((uint64_t)(uintptr_t)s); }
 static inline tsv* sparse_vals(ts_sparse_elems* s){ return (tsv*)(s->keys + (s->mask + 1u)); }
 static ts_sparse_elems* sparse_alloc(const ts_gc_header* owner, uint32_t size){   /* size: a power of two >= 8 */
   ts_sparse_elems* s = (ts_sparse_elems*)gc_owned_alloc(owner, sizeof(ts_sparse_elems) + (size_t)size * (sizeof(uint32_t) + sizeof(tsv)));
@@ -3552,7 +3566,7 @@ static void obj_generalize_slot(ts_object* o, uint32_t slot){
 static inline void pref_store(tsv obj, ts_pref p, tsv val){
   if (obj_flags_at(p.o, p.i) & TS_PROP_INT32){
     int32_t iv;
-    if (ts_int32_exact(val, &iv)){ *ts_obj_slot_ptr(p.o, p.i) = ts_int_slot_word(iv); return; }
+    if (ts_int32_exact(val, &iv)){ ts_int_slot_store(ts_obj_slot_ptr(p.o, p.i), iv); return; }
     obj_generalize_slot(p.o, p.i);
   }
   tsv* vp = pref_valp(p); *vp = val;
@@ -7133,9 +7147,12 @@ static void gc_mark_visit_slow(ts_gc_header* h, int young, int depth){
 static inline void gc_mark_visit(tsv v, int young, int depth){
   RT_STAT_INC(mark_edges);
   if (!ts_heap_ref(v)) return;
-  uint64_t payload = v & TS_PAYLOAD_MASK;
+#if TS_VALUE_REP != 0
+#error "the marker's out-of-cage path: a stack or static cell's reference carries no tag in representation 1 (slice 3)"
+#endif
+  uint64_t payload = ts_payload(v);
   ts_gc_header* h;
-  if (TS_RT_UNLIKELY(payload & TS_PTR_STACK_TAG)){
+  if (TS_RT_UNLIKELY(ts_payload_stack_tagged(payload))){
     h = ts_heap_ptr(v);
     if (!h) return;
   } else {
@@ -7179,13 +7196,16 @@ static uint64_t g_stack_hi = 0;   /* the main thread's stack base */
 uintptr_t g_gc_debug_watch = 0;   /* tests: report the stack word that names this cell */
 static const uint64_t* g_scan_cur = NULL;
 static void gc_mark_conservative_word(uint64_t w, int young){
-  uint64_t a = w & TS_PAYLOAD_MASK;
+#if TS_VALUE_REP != 0
+#error "a stack word is taken by its low 48 bits; a word outside the cage is not followed (slice 3)"
+#endif
+  uint64_t a = ts_payload(w);
   /* A stack-tagged word is not followed: a stale one in a live frame may
      name a dead frame's cell, now other frames' words, whose garbage header
      can pass the plausibility tests (the protect gate found the scan of such
      a "cell" reading through its garbage). The cells themselves lie in the
      scanned region, so their heap references are found as words. */
-  if (TS_RT_UNLIKELY(a & TS_PTR_STACK_TAG)) return;
+  if (TS_RT_UNLIKELY(ts_payload_stack_tagged(a))) return;
   uintptr_t off = (uintptr_t)a - (uintptr_t)g_cage_base;
   if (off >= g_cage_bytes) return;
   uint32_t bi = (uint32_t)(off >> GC_BLOCK_SHIFT);
@@ -7236,12 +7256,12 @@ static void gc_scan_stack_roots(int young){
 }
 int ts_gc_debug_cell_gen(tsv v){   /* the header's generation byte (tests), -1 for a non-reference */
   if (!ts_heap_ref(v)) return -1;
-  return (int)((const ts_gc_header*)(uintptr_t)(v & TS_PAYLOAD_MASK))->gen;
+  return (int)((const ts_gc_header*)(uintptr_t)ts_payload(v))->gen;
 }
 int ts_gc_debug_alloc_bit(tsv v){
   if (!g_cage_alloc_bits || !ts_heap_ref(v)) return 0;
   gc_young_count_all();   /* the young cells handed out since their classes last counted get their bits */
-  uintptr_t off = (uintptr_t)(v & TS_PAYLOAD_MASK) - (uintptr_t)g_cage_base;
+  uintptr_t off = (uintptr_t)ts_payload(v) - (uintptr_t)g_cage_base;
   if (off >= g_cage_bytes) return 0;
   return gc_alloc_bit_test((uint32_t)(off >> GC_BLOCK_SHIFT), (uint32_t)((off & (GC_BLOCK_BYTES - 1u)) >> 4));
 }
@@ -7572,8 +7592,11 @@ void ts_gc_debug_log_young(void){ g_young_log_kinds = ~0u; g_alloc_every_slow = 
    and not a young cell of this cycle). Needs ts_gc_debug_log_young. */
 int ts_gc_debug_cell_live(tsv v){
   if (!ts_heap_ref(v)) return 0;
-  uint64_t payload = v & TS_PAYLOAD_MASK;
-  if (payload & TS_PTR_STACK_TAG) return 1;
+#if TS_VALUE_REP != 0
+#error "a stack or static cell is live: outside the cage in representation 1 (slice 3)"
+#endif
+  uint64_t payload = ts_payload(v);
+  if (ts_payload_stack_tagged(payload)) return 1;
   char* p = (char*)(uintptr_t)payload;
   if (!gc_payload_in_cage(p)) return 0;
   for (size_t i = 0; i < g_young_log_len; i++) if ((char*)g_young_log[i] == p) return 1;
@@ -9740,10 +9763,10 @@ tsv ts_new_weakset(void){ return ts_new_set_impl(1); }
    iteration skips it) and the hash slot into a tombstone, so positions are
    stable during iteration — deletion mid-forEach now behaves like V8's skip
    instead of shifting. Compaction (which does shift) runs only from the
-   delete path once tombs dominate. The 0xFFFE selector cannot collide with
-   user values: runtime numeric NaNs are canonicalized to 0x7FF8… and boxed
-   selectors stop at 0xFFFD. */
-#define TS_MAPSET_HOLE TS_BOX(0xFFFEu, 0x484F4C45u)
+   delete path once tombs dominate. The marker is a word under the short
+   string selector whose payload no short string has (its length bits say 0
+   over nonzero bytes), so it cannot collide with a user value. */
+#define TS_MAPSET_HOLE TS_BOX(TS_SEL_SHORTSTR, 0x484F4C45u)
 #define TS_MAPSET_LINEAR_MAX 8u
 /* The bits of -0: Map.prototype.set and Set.prototype.add store a -0 key as
    +0 (ECMA-262 24.1.3.9 step 5, 24.2.3.1 step 4), so iteration yields +0. */
@@ -9765,7 +9788,7 @@ TS_RT_ALWAYS_INLINE uint32_t sv0_hash(tsv k){
     if (TS_RT_UNLIKELY(g_has_bigint) && ts_is_bigint(k)) return ts_bigint_hash(k);
     /* identity: the cell's address (cells never move); the high half of
        the product mixes every address bit into the index bits */
-    uint64_t x = ((k & TS_PAYLOAD_MASK) >> 4) * 0x9E3779B97F4A7C15ull;
+    uint64_t x = (ts_payload(k) >> 4) * 0x9E3779B97F4A7C15ull;
     return (uint32_t)(x >> 32);
   } else {
     bits = k;                                    /* bool/undefined/null singletons */
@@ -14772,7 +14795,7 @@ uint32_t g_ts_class_layout_epoch = 1;
 static void prop_ic_location_reset(void);
 static uint32_t class_proto_hash(tsv proto){
   /* identity hash: the cell's address (cells never move) */
-  uint64_t x = ((proto & TS_PAYLOAD_MASK) >> 4) * 0x9E3779B97F4A7C15ull;
+  uint64_t x = (ts_payload(proto) >> 4) * 0x9E3779B97F4A7C15ull;
   return (uint32_t)(x >> 32);
 }
 /* The registry does not keep its prototypes alive: a class evaluated per
@@ -22482,7 +22505,7 @@ void ts_lit_store_slow(tsv obj, uint32_t i, tsv v){
 void ts_lit_store_int_slow(tsv obj, uint32_t i, long long v){
   ts_object* o = (ts_object*)ts_ptr(obj);
   if (obj_shaped(o) && (obj_flags_at(o, i) & TS_PROP_INT32)){
-    if (v >= INT32_MIN && v <= INT32_MAX){ *ts_obj_slot_ptr(o, i) = ts_int_slot_word((int32_t)v); return; }
+    if (v >= INT32_MIN && v <= INT32_MAX){ ts_int_slot_store(ts_obj_slot_ptr(o, i), (int32_t)v); return; }
     obj_generalize_slot(o, i);
   }
   ts_lit_store(obj, i, ts_num((double)v));
@@ -27169,6 +27192,9 @@ static void gc_scan_async_cell(ts_gc_header* h, int young, int depth){
       /* A frame without the map: scan it conservatively; any 8-byte word that
          looks like a heap reference is treated as a root. An integer local
          with such bits is read as a reference too, the reason for the map. */
+#if TS_VALUE_REP != 0
+#error "every integer below 2^48 looks like a reference in representation 1: the allocation bitmap must admit it (slice 3)"
+#endif
       size_t off = sizeof(ts_coro);
       char* base = (char*)c;
       for (; off + sizeof(tsv) <= c->frame_size; off += sizeof(tsv)){

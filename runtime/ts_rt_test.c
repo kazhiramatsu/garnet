@@ -671,7 +671,7 @@ __attribute__((noinline)) static void cr_make_dead(void){
   for (int i = 0; i < CR_DEAD; i++){
     tsv dead = ts_new_object();
     ts_set(dead, kv, ts_num(i));
-    g_cr_dead_addr[i] = (uintptr_t)(dead & TS_PAYLOAD_MASK);
+    g_cr_dead_addr[i] = (uintptr_t)ts_payload(dead);
   }
 }
 __attribute__((noinline)) static void cr_scrub_stack(void){
@@ -1575,8 +1575,8 @@ int main(){
   CK("symbol registry slots take the pointer form",
      ts_strict_eq(registry_again,registry_probe) &&
      ((ts_gc_header*)ts_ptr(registry_again))->gen==TS_GEN_OLD &&
-     ((registry_again & TS_PAYLOAD_MASK) & 1u)==0 &&
-     ts_is_str(registry_probe_key) && ((registry_probe_key & TS_PAYLOAD_MASK) & 1u)==0);
+     (ts_payload(registry_again) & 1u)==0 &&
+     ts_is_str(registry_probe_key) && (ts_payload(registry_probe_key) & 1u)==0);
   ts_gc_unroot(1);
 
   int registered_symbol_caught=0, registered_symbol_set_caught=0;

@@ -905,7 +905,7 @@ fn emit_program_with_string_plans(
             );
             if class_index_enabled() {
                 // a class prototype's mark (TS_CLS_PROTO, ts_rt.h)
-                let _ = writeln!(s, "  ((ts_object*)ts_ptr(CLASS_PROTO[{}]))->cls = TS_CLS_PROTO;", c.id.0);
+                let _ = writeln!(s, "  ((ts_object*)ts_obj_ptr(CLASS_PROTO[{}]))->cls = TS_CLS_PROTO;", c.id.0);
             }
         }
         // Link each prototype to its parent's prototype, forming a real JS
@@ -1678,7 +1678,7 @@ fn emit_vtables(
 fn emit_vtable_call(s: &mut String, ctx: &Ctx, plan: &VtPlan, argv: &[u32], dst: &Option<LocalId>) {
     let _ = writeln!(
         s,
-        "    {{ ts_object* _vo = ts_is_obj(_a[0]) ? (ts_object*)ts_ptr(_a[0]) : NULL; uint32_t _vk = _vo ? _vo->cls - {lo}u : UINT32_MAX; void* _vf = (_vk < {span}u{relinked}{shadow}) ? {t}[_vk] : NULL;",
+        "    {{ ts_object* _vo = ts_is_obj(_a[0]) ? (ts_object*)ts_obj_ptr(_a[0]) : NULL; uint32_t _vk = _vo ? _vo->cls - {lo}u : UINT32_MAX; void* _vf = (_vk < {span}u{relinked}{shadow}) ? {t}[_vk] : NULL;",
         lo = plan.lo,
         span = plan.span,
         relinked = relink_guard(),
@@ -11826,7 +11826,7 @@ fn private_check_expr(obj: &str, spec: &str) -> String {
     });
     match interval {
         Some((lo, span)) => format!(
-            "(TS_RT_LIKELY(ts_is_obj({o}) && (uint32_t)(((ts_object*)ts_ptr({o}))->cls - {lo}u) < {span}u) ? TS_UNDEFINED : ({call}, TS_UNDEFINED))",
+            "(TS_RT_LIKELY(ts_is_obj({o}) && (uint32_t)(((ts_object*)ts_obj_ptr({o}))->cls - {lo}u) < {span}u) ? TS_UNDEFINED : ({call}, TS_UNDEFINED))",
             o = obj
         ),
         None => format!("({}, TS_UNDEFINED)", call),
@@ -11839,7 +11839,7 @@ fn receiver_guard(obj: &str, hint: &Option<HintGuard>, c: u32) -> String {
         None => typed_slow_guard_for(obj, c),
         Some(HintGuard::Root) => format!("!ts_is_obj({}) || ({})", obj, typed_slow_guard_for(obj, c)),
         Some(HintGuard::Leaf(d)) => format!(
-            "!ts_is_obj({o}) || ((ts_object*)ts_ptr({o}))->proto != CLASS_PROTO[{d}] || ({g})",
+            "!ts_is_obj({o}) || ((ts_object*)ts_obj_ptr({o}))->proto != CLASS_PROTO[{d}] || ({g})",
             o = obj,
             d = d,
             g = typed_slow_guard(obj)
@@ -11847,7 +11847,7 @@ fn receiver_guard(obj: &str, hint: &Option<HintGuard>, c: u32) -> String {
         // a class index in the declaring class's interval is a sized,
         // unrelinked instance of it or a subclass: the flag adds nothing
         Some(HintGuard::Range { lo, span }) => format!(
-            "!ts_is_obj({o}) || (uint32_t)(((ts_object*)ts_ptr({o}))->cls - {lo}u) >= {span}u",
+            "!ts_is_obj({o}) || (uint32_t)(((ts_object*)ts_obj_ptr({o}))->cls - {lo}u) >= {span}u",
             o = obj,
             lo = lo,
             span = span
@@ -14117,7 +14117,7 @@ fn emit_coroutine_param_copy(s: &mut String, f: &Function, ctx: &Ctx) {
         let gather = |s: &mut String, from: usize| {
             let _ = writeln!(
                 s,
-                "  {{ tsv _ga = ts_arguments_array(args + {1}, nargs > {1} ? nargs - {1} : 0); _fr = ({2}_frame*)ts_ptr(_cv); _fr->v{0} = _ga; ts_write_barrier(_cv, _ga); }}",
+                "  {{ tsv _ga = ts_arguments_array(args + {1}, nargs > {1} ? nargs - {1} : 0); _fr = ({2}_frame*)ts_obj_ptr(_cv); _fr->v{0} = _ga; ts_write_barrier(_cv, _ga); }}",
                 p.0, from, cname(f)
             );
         };
@@ -14494,7 +14494,7 @@ fn emit_async_function(s: &mut String, f: &Function, ctx: &Ctx) {
 
     // resume function
     let _ = writeln!(s, "static tsv {}_resume(tsv _cv){{", fname);
-    let _ = writeln!(s, "  {}_frame* _fr = ({}_frame*)ts_ptr(_cv);", fname, fname);
+    let _ = writeln!(s, "  {}_frame* _fr = ({}_frame*)ts_obj_ptr(_cv);", fname, fname);
     // #define each local to the frame field, so emit_inst output is unchanged.
     emit_coro_local_defines(s, f, ctx, &stack);
     emit_sm_resume_body(s, f, ctx, SmMode::Async);
@@ -14509,7 +14509,7 @@ fn emit_async_function(s: &mut String, f: &Function, ctx: &Ctx) {
     s.push_str("  (void)nargs;\n");
     emit_coro_alloc(s, &fname, nvals, true);
     s.push_str("  ts_gc_root(&_cv);\n");
-    let _ = writeln!(s, "  {}_frame* _fr = ({}_frame*)ts_ptr(_cv);", fname, fname);
+    let _ = writeln!(s, "  {}_frame* _fr = ({}_frame*)ts_obj_ptr(_cv);", fname, fname);
     // copy params into frame fields
     emit_coroutine_param_copy(s, f, ctx);
     s.push_str("  tsv _ret = _fr->c.ret;\n");
@@ -14543,7 +14543,7 @@ fn emit_generator_function(s: &mut String, f: &Function, ctx: &Ctx) {
     let nvals = emit_coro_frame_struct(s, f, ctx, &fname, &stack);
 
     let _ = writeln!(s, "static tsv {}_resume(tsv _cv){{", fname);
-    let _ = writeln!(s, "  {}_frame* _fr = ({}_frame*)ts_ptr(_cv);", fname, fname);
+    let _ = writeln!(s, "  {}_frame* _fr = ({}_frame*)ts_obj_ptr(_cv);", fname, fname);
     emit_coro_local_defines(s, f, ctx, &stack);
     emit_sm_resume_body(s, f, ctx, SmMode::Generator);
     emit_coro_local_undefs(s, f, ctx, &stack);
@@ -14556,7 +14556,7 @@ fn emit_generator_function(s: &mut String, f: &Function, ctx: &Ctx) {
     s.push_str("  (void)nargs;\n");
     emit_coro_alloc(s, &fname, nvals, false);
     s.push_str("  ts_gc_root(&_cv);\n");
-    let _ = writeln!(s, "  {}_frame* _fr = ({}_frame*)ts_ptr(_cv);", fname, fname);
+    let _ = writeln!(s, "  {}_frame* _fr = ({}_frame*)ts_obj_ptr(_cv);", fname, fname);
     emit_coroutine_param_copy(s, f, ctx);
     if initial_suspend_of(f).is_some() {
         s.push_str("  ts_coro_resume_v(_cv);\n");
@@ -14573,7 +14573,7 @@ fn emit_asyncgen_function(s: &mut String, f: &Function, ctx: &Ctx) {
     let nvals = emit_coro_frame_struct(s, f, ctx, &fname, &stack);
 
     let _ = writeln!(s, "static tsv {}_resume(tsv _cv){{", fname);
-    let _ = writeln!(s, "  {}_frame* _fr = ({}_frame*)ts_ptr(_cv);", fname, fname);
+    let _ = writeln!(s, "  {}_frame* _fr = ({}_frame*)ts_obj_ptr(_cv);", fname, fname);
     emit_coro_local_defines(s, f, ctx, &stack);
     emit_sm_resume_body(s, f, ctx, SmMode::AsyncGenerator);
     emit_coro_local_undefs(s, f, ctx, &stack);
@@ -14586,7 +14586,7 @@ fn emit_asyncgen_function(s: &mut String, f: &Function, ctx: &Ctx) {
     s.push_str("  (void)nargs;\n");
     emit_coro_alloc(s, &fname, nvals, true);
     s.push_str("  ts_gc_root(&_cv);\n");
-    let _ = writeln!(s, "  {}_frame* _fr = ({}_frame*)ts_ptr(_cv);", fname, fname);
+    let _ = writeln!(s, "  {}_frame* _fr = ({}_frame*)ts_obj_ptr(_cv);", fname, fname);
     emit_coroutine_param_copy(s, f, ctx);
     if initial_suspend_of(f).is_some() {
         s.push_str("  ts_coro_resume_v(_cv);\n");
@@ -22769,7 +22769,7 @@ fn candidate_fields(ctx: &Ctx, cands: &[u32], field: u32, obj: u32, dst: Option<
 }
 
 fn cand_test(o: &str, f: &CandField) -> String {
-    format!("ts_is_obj({o}) && (uint32_t)(((ts_object*)ts_ptr({o}))->cls - {lo}u) < {span}u", o = o, lo = f.lo, span = f.span)
+    format!("ts_is_obj({o}) && (uint32_t)(((ts_object*)ts_obj_ptr({o}))->cls - {lo}u) < {span}u", o = o, lo = f.lo, span = f.span)
 }
 
 /// Opens a read's candidates: `if (an instance of D1) dst = its field; else if ...; else {`, the
@@ -22778,7 +22778,7 @@ fn cand_test(o: &str, f: &CandField) -> String {
 fn emit_cand_load_open(s: &mut String, ctx: &Ctx, dst: u32, obj: u32, field: u32, cand: &[CandField]) {
     let o = ctx.vname(obj);
     for (i, f) in cand.iter().enumerate() {
-        let st = format!("(({}*)ts_ptr({}))->f{}", struct_name(f.decl), o, field);
+        let st = format!("(({}*)ts_obj_ptr({}))->f{}", struct_name(f.decl), o, field);
         let _ = writeln!(s, "  {}if ({}) {{", if i == 0 { "" } else { "else " }, cand_test(&o, f));
         if int32_field(f.decl, field, ctx.classes) {
             if ctx.int_local.contains(&dst) {
@@ -22824,7 +22824,7 @@ fn emit_cand_store_open(s: &mut String, ctx: &Ctx, obj: u32, field: u32, src: u3
             ctx.val(src)
         };
         let _ = writeln!(s, "  {}if ({}{}{}) {{", if open { "else " } else { "" }, cand_test(&o, f), num_test, frozen);
-        let _ = writeln!(s, "    (({}*)ts_ptr({}))->f{} = {};", struct_name(f.decl), o, field, rhs);
+        let _ = writeln!(s, "    (({}*)ts_obj_ptr({}))->f{} = {};", struct_name(f.decl), o, field, rhs);
         if !is_num {
             emit_field_store_barrier(s, &o, &rhs);
         }
@@ -22842,7 +22842,7 @@ fn emit_cand_store_open(s: &mut String, ctx: &Ctx, obj: u32, field: u32, src: u3
 fn emit_field_store_barrier(s: &mut String, obj_name: &str, rhs: &str) {
     if barrier_fast_enabled() {
         if !non_heap_value_expr(rhs) {
-            let _ = writeln!(s, "    ts_write_barrier_hdr((ts_gc_header*)ts_ptr({}), {});", obj_name, rhs);
+            let _ = writeln!(s, "    ts_write_barrier_hdr((ts_gc_header*)ts_obj_ptr({}), {});", obj_name, rhs);
         }
     } else {
         let _ = writeln!(s, "    ts_write_barrier({}, {});", obj_name, rhs);
@@ -23117,7 +23117,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                             // the typed pointer lives in a block of its own: a local allocated at two
                             // sites of one function (hono's ssg, an async body resumed) would declare
                             // it twice in one C scope
-                            let _ = writeln!(s, "  {{ {}* hobj{} = ({}*)ts_ptr({});", cn, dst.0, cn, dst_name);
+                            let _ = writeln!(s, "  {{ {}* hobj{} = ({}*)ts_obj_ptr({});", cn, dst.0, cn, dst_name);
                         } else {
                             let alloc = if st == AllocStrategy::PretenuredHeap {
                                 "ts_new_sized_pretenured"
@@ -23125,7 +23125,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                                 "ts_new_sized"
                             };
                             let _ = writeln!(s, "  {} = {}(sizeof({}));", dst_name, alloc, cn);
-                            let _ = writeln!(s, "  {{ {}* hobj{} = ({}*)ts_ptr({});", cn, dst.0, cn, dst_name);
+                            let _ = writeln!(s, "  {{ {}* hobj{} = ({}*)ts_obj_ptr({});", cn, dst.0, cn, dst_name);
                             let _ = writeln!(s, "  hobj{}->header.proto={};", dst.0, proto_expr);
                         }
                         if class_index_enabled() {
@@ -23205,7 +23205,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                             );
                         }
                         if int_layout {
-                            let _ = writeln!(s, "  int _ts_lkok{} = ts_obj_shape_id((ts_object*)ts_ptr({})) == _ts_lit_{}.shape;", id, ctx.vname(dst.0), id);
+                            let _ = writeln!(s, "  int _ts_lkok{} = ts_obj_shape_id((ts_object*)ts_obj_ptr({})) == _ts_lit_{}.shape;", id, ctx.vname(dst.0), id);
                             if let Some(addrs) = addrs {
                                 let mut open = ctx.layout_open.borrow_mut();
                                 for (i, a) in addrs.iter().enumerate() {
@@ -24782,7 +24782,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         let walk = ctx.lazy_linked_int(&format!("ts_instanceof({}, CLASS_PROTO[{}])", o, c));
                         (
                             format!(
-                                "ts_bool(ts_is_obj({o}) && ({{ uint32_t _ci = ((ts_object*)ts_ptr({o}))->cls; ((uint32_t)(_ci - 1u) < 0x7FFFFFFFu{relinked}) ? (uint32_t)(_ci - {lo}u) < {span}u : {walk}; }}))",
+                                "ts_bool(ts_is_obj({o}) && ({{ uint32_t _ci = ((ts_object*)ts_obj_ptr({o}))->cls; ((uint32_t)(_ci - 1u) < 0x7FFFFFFFu{relinked}) ? (uint32_t)(_ci - {lo}u) < {span}u : {walk}; }}))",
                                 o = o,
                                 lo = lo,
                                 span = span,
@@ -24795,7 +24795,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         let walk = ctx.lazy_linked_int(&format!("ts_instanceof({}, CLASS_PROTO[{}])", o, c));
                         (
                             format!(
-                                "ts_bool((ts_is_obj({o}) && ((ts_object*)ts_ptr({o}))->proto == CLASS_PROTO[{c}]) || {walk})",
+                                "ts_bool((ts_is_obj({o}) && ((ts_object*)ts_obj_ptr({o}))->proto == CLASS_PROTO[{c}]) || {walk})",
                                 o = o,
                                 c = c,
                                 walk = walk
@@ -25089,7 +25089,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                     }
                     let _ = std::fmt::write(
                         &mut blk,
-                        format_args!("_pl = (double)((ts_array*)ts_ptr({}))->len; }} else {{ tsv _pa[{}] = {{ ", r, args.len().max(1)),
+                        format_args!("_pl = (double)((ts_array*)ts_obj_ptr({}))->len; }} else {{ tsv _pa[{}] = {{ ", r, args.len().max(1)),
                     );
                     let vals: Vec<String> = args.iter().map(|a| ctx.val(a.0)).collect();
                     let _ = std::fmt::write(&mut blk, format_args!("{} }}; _pl = ts_array_push_foreign({}, _pa, {}); }} _pl; }})", if vals.is_empty() { "TS_UNDEFINED".to_string() } else { vals.join(", ") }, r, args.len()));
@@ -25733,7 +25733,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                 if let Some(off) = struct_offset_for(ctx, obj.0, c, field.0, &hinted) {
                     let cn = field_struct(c, field.0, ctx.classes);
                     let obj_name = ctx.val(obj.0);   // boxed: a lie can leave a number behind a class type
-                    let st = format!("((({}*)ts_ptr({}))->{})", cn, obj_name, off);
+                    let st = format!("((({}*)ts_obj_ptr({}))->{})", cn, obj_name, off);
                     // A receiver that is NOT a struct of class `c` (a Proxy, a
                     // plain object relinked behind the class prototype, a borrowed
                     // method's this) routes `this.field` through ts_get. The
@@ -25978,7 +25978,7 @@ fn emit_inst(s: &mut String, inst: &Inst, ctx: &Ctx) {
                         let _ = writeln!(s, "  if (TS_RT_UNLIKELY(ts_store_frozen({}))) {{ {} }} else", obj_name, slow);
                     }
                     let _ = writeln!(s, "  {{");
-                    let _ = writeln!(s, "    (({}*)ts_ptr({}))->{} = {};", cn, obj_name, off, rhs);
+                    let _ = writeln!(s, "    (({}*)ts_obj_ptr({}))->{} = {};", cn, obj_name, off, rhs);
                     if !is_num {
                         emit_field_store_barrier(s, &obj_name, &rhs);
                     }

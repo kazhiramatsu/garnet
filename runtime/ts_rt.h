@@ -180,36 +180,72 @@ static inline __attribute__((always_inline)) ts_iso* ts_iso_get(void){
 #define g_class_relink_epoch (TS_ISO()->class_relink_epoch)
 #endif
 
-/* NaN-boxing layout: a normal double is any pattern that is NOT a boxed form.
- * Boxed values set the top 16 bits to a quiet-NaN selector 0xFFF8..0xFFFD
- * (sign=1, exp all ones, quiet bit) plus a 3-bit tag, leaving a 48-bit payload.
- * Arithmetic NaNs are canonicalized to positive quiet NaN (top16 0x7FF8), which
- * never collides with our selectors (all have the sign bit set, top16>=0xFFF8). */
+/* TS_VALUE_REP definitions: begin (tests/value_rep_gate.sh: what reads a word's bits is between these markers)
+ *
+ * The value representation (docs/unmasked_pointers_design.md). A value is a 64-bit word: a double, or a
+ * selector in its top 16 bits over a 48-bit payload (an immediate, a cell's address, a short string's bytes).
+ * - TS_VALUE_REP 0 (the default): a double is its own bits; the selectors are 0xFFF8 to 0xFFFE, quiet NaNs
+ *   with the sign bit set. Arithmetic NaNs are canonicalized to 0x7FF8..., which never reads as a selector.
+ * - TS_VALUE_REP 1: every word is representation 0's word exclusive-or TS_NUM_XOR. An object's word is its
+ *   address, the selectors are 0 to 6, a number's word is its bits xor the constant.
+ * The two are one bijection that keeps the selectors' order and spacing, so code that goes through the
+ * definitions between these markers computes the same in both; nothing outside them reads a word's bits
+ * (the source gate). Representation 1 is slice 3 of the design: not built yet. */
+#ifndef TS_VALUE_REP
+#define TS_VALUE_REP 0
+#endif
+#if TS_VALUE_REP != 0
+#error "TS_VALUE_REP 1 is not built yet (docs/unmasked_pointers_design.md, slice 3)"
+#endif
 #define TS_SEL_SHIFT 48
 #define TS_PAYLOAD_MASK 0x0000FFFFFFFFFFFFULL
+#define TS_NUM_XOR (TS_VALUE_REP ? 0xFFF8000000000000ULL : 0ULL)
+#define TS_SEL_BASE (TS_VALUE_REP ? 0x0000U : 0xFFF8U)
 #define TS_TOP16(v) ((uint16_t)((v) >> TS_SEL_SHIFT))
 enum {
-  TS_SEL_OBJECT = 0xFFF8U,
-  TS_SEL_STRING = 0xFFF9U,
-  TS_SEL_FUNC   = 0xFFFAU,
-  TS_SEL_BOOL   = 0xFFFBU,
-  TS_SEL_UNDEF  = 0xFFFCU,
-  TS_SEL_NULL   = 0xFFFDU,
+  TS_SEL_OBJECT = TS_SEL_BASE,
+  TS_SEL_STRING,
+  TS_SEL_FUNC,
+  TS_SEL_BOOL,
+  TS_SEL_UNDEF,
+  TS_SEL_NULL,
   /* Up to five ASCII bytes plus a three-bit length fit in the 48-bit payload.
-     This selector is a string primitive, but not a heap reference. */
-  TS_SEL_SHORTSTR = 0xFFFEU
+     This selector is a string primitive, but not a heap reference. The runtime's
+     internal markers (TS_ARRAY_HOLE and the others) are words under it too. */
+  TS_SEL_SHORTSTR
 };
+_Static_assert(TS_SEL_SHORTSTR == TS_SEL_OBJECT + 6, "the selectors are seven consecutive values");
 #define TS_BOX(sel, payload) ((((uint64_t)(sel)) << TS_SEL_SHIFT) | ((uint64_t)(payload) & TS_PAYLOAD_MASK))
+/* the low 48 bits of a word: an immediate's payload, a heap reference's address (with the stack tag in
+   representation 0). Hashes by identity take it. */
+#define ts_payload(v) ((uint64_t)(v) & TS_PAYLOAD_MASK)
 
 /* ---- numbers ---- */
 static inline tsv ts_num(double d) {
-  tsv v; memcpy(&v, &d, 8);
-  if ((v & 0x7FF8000000000000ULL) == 0x7FF8000000000000ULL && (uint16_t)(v >> TS_SEL_SHIFT) >= TS_SEL_OBJECT)
-    v = 0x7FF8000000000000ULL; /* canonicalize a NaN that looks boxed */
-  return v;
+  uint64_t b; memcpy(&b, &d, 8);
+  /* a NaN whose bits would read as a selector (stated on the double's own bits, the same in both
+     representations): the canonical NaN */
+  if ((b & 0x7FF8000000000000ULL) == 0x7FF8000000000000ULL && (uint16_t)(b >> 48) >= 0xFFF8U)
+    b = 0x7FF8000000000000ULL;
+  return (tsv)(b ^ TS_NUM_XOR);
 }
+/* (representation 0's form: clang makes it `(v + 2^51) >> 48 >= 7`, one instruction fewer at some sites
+   than the form with a 16-bit subtraction) */
+#if TS_VALUE_REP == 0
 static inline int ts_is_num(tsv v) { uint16_t t = TS_TOP16(v); return t < TS_SEL_OBJECT || t > TS_SEL_SHORTSTR; }
-static inline double ts_to_num(tsv v) { double d; memcpy(&d, &v, 8); return d; }
+#else
+static inline int ts_is_num(tsv v) { return TS_TOP16(v) > TS_SEL_SHORTSTR; }
+#endif
+static inline double ts_to_num(tsv v) { uint64_t b = v ^ TS_NUM_XOR; double d; memcpy(&d, &b, 8); return d; }
+/* the sign bit of a number's word: -0 told from +0 without a conversion */
+#define ts_num_sign(v) ((uint64_t)((v) ^ TS_NUM_XOR) >> 63)
+/* the word of -0 (no other number has it) */
+#define TS_NUM_NEG_ZERO_WORD ((tsv)(0x8000000000000000ULL ^ TS_NUM_XOR))
+/* A word that is no value, kept in a value slot (a sparse array's table pointer): stored as the number it
+   reads as in representation 0, in both, so nothing that walks value slots takes it for a reference. */
+#define ts_raw_word(w) ((tsv)((uint64_t)(w) ^ TS_NUM_XOR))
+#define ts_raw_word_value(v) ((uint64_t)(v) ^ TS_NUM_XOR)
+/* TS_VALUE_REP definitions: end */
 /* JS ToInt32 / ToUint32 (ECMA-262): NaN/Inf -> 0; truncate toward zero; reduce
    modulo 2^32; interpret as signed/unsigned 32-bit. Used by bitwise operators. */
 /* ToInt32 / ToUint32 of a value outside the exact range: NaN and infinities
@@ -324,6 +360,7 @@ TS_RT_SLOW_CALL void ts_gc_remember(ts_gc_header* h);
  * the collector and the write barriers tell them from heap cells without a
  * load; the tag lives above the user address space. */
 tsv ts_heap_ref_value(uint16_t sel, void* p);
+/* TS_VALUE_REP definitions: begin (heap references) */
 #define TS_PTR_STACK_TAG ((uint64_t)1u << 47)
 static inline tsv ts_heap_ref_fast(uint16_t sel, void* p) {
   if (TS_RT_LIKELY(p != NULL)){
@@ -333,9 +370,30 @@ static inline tsv ts_heap_ref_fast(uint16_t sel, void* p) {
   }
   return ts_heap_ref_value(sel, p);
 }
+/* any heap reference's cell: an object, a heap string, a function */
 static inline void* ts_ptr(tsv v) {
   return (void*)(uintptr_t)(v & TS_PAYLOAD_MASK & ~TS_PTR_STACK_TAG);
 }
+/* A reference's payload that carries the stack tag: a cell outside the heap (TS_GEN_NONHEAP: a stack or
+   SROA cell, a static literal), told without a load. */
+#define ts_payload_stack_tagged(payload) ((payload) & TS_PTR_STACK_TAG)
+/* the address a reference's payload names (less the stack tag) */
+#define ts_payload_addr(payload) ((uintptr_t)((payload) & ~TS_PTR_STACK_TAG))
+/* the payload of a reference to a NONHEAP cell at p */
+#define ts_payload_nonheap(p) ((uintptr_t)(p) | TS_PTR_STACK_TAG)
+/* The cell of a word known to carry the object selector: a test that dominates the use, or the allocation
+   that made the word, proves it. Representation 1 makes it the word itself, where ts_ptr keeps its mask
+   (it serves strings and functions too). The checking build aborts on any other word. */
+#ifdef TS_VALUE_CHECK
+TS_RT_NORETURN void ts_value_check_failed(const char* what, tsv v);
+#endif
+static inline void* ts_obj_ptr(tsv v) {
+#ifdef TS_VALUE_CHECK
+  if (TS_RT_UNLIKELY(TS_TOP16(v) != TS_SEL_OBJECT)) ts_value_check_failed("ts_obj_ptr of a word that is no object", v);
+#endif
+  return (void*)(uintptr_t)(v & TS_PAYLOAD_MASK & ~TS_PTR_STACK_TAG);
+}
+/* TS_VALUE_REP definitions: end */
 static inline tsv ts_obj(void* p) { return ts_heap_ref_fast(TS_SEL_OBJECT, p); }
 static inline tsv ts_str_v(void* p){ return ts_heap_ref_fast(TS_SEL_STRING, p); }
 static inline tsv ts_func_v(void* p){return ts_heap_ref_fast(TS_SEL_FUNC,   p); }
@@ -347,6 +405,8 @@ static inline int ts_is_str(tsv v) {
   return t == TS_SEL_STRING || t == TS_SEL_SHORTSTR;
 }
 static inline int ts_is_func(tsv v){ return TS_TOP16(v) == TS_SEL_FUNC; }
+/* a reference to a cell: an object, a heap string or a function */
+static inline int ts_is_heap_ref(tsv v){ return ts_is_obj(v) || ts_is_func(v) || ts_is_heap_str(v); }
 #define TS_SHORTSTR_MAX 5u
 /* The longest string (V8's): past it the string builtins are a RangeError, not a truncated length. */
 #define TS_STR_MAX_LENGTH 536870888u
@@ -368,10 +428,10 @@ static inline tsv ts_short_str_ascii(const char* data, uint32_t len){
 extern int g_has_proxies;
 extern int g_has_callable_proxies;   /* a Proxy whose target is callable was made (ts_proxy_new): typeof and the callable tests look for one only then */
 #endif
-static inline int ts_is_proxy(tsv v){ return ts_is_obj(v) && ((ts_gc_header*)ts_ptr(v))->kind == TS_KIND_PROXY; }
+static inline int ts_is_proxy(tsv v){ return ts_is_obj(v) && ((ts_gc_header*)ts_obj_ptr(v))->kind == TS_KIND_PROXY; }
 int ts_proxy_is_callable(tsv v);   /* a Proxy whose target is callable: typeof "function", callable (hono's client is a Proxy of a function at every path step) */
 static inline int ts_is_callable_proxy(tsv v){ return g_has_callable_proxies && ts_is_proxy(v) && ts_proxy_is_callable(v); }
-static inline int ts_is_regexp(tsv v){ return ts_is_obj(v) && ((ts_gc_header*)ts_ptr(v))->kind == TS_KIND_REGEXP; }
+static inline int ts_is_regexp(tsv v){ return ts_is_obj(v) && ((ts_gc_header*)ts_obj_ptr(v))->kind == TS_KIND_REGEXP; }
 
 /* ---- property key space (property_model_redesign §3.6) ----
    A property key is currently an opaque 32-bit token. The key space is logically
@@ -718,7 +778,7 @@ static inline uint32_t ts_obj_integrity(const ts_object* o){ return o->shape >> 
    value the store untags anyway. Sealed and non-extensible instances keep
    their declared fields writable, as in JS. */
 #define TS_OBJ_FROZEN_BIT 0x20000000u
-static inline int ts_store_frozen(tsv v){ return (((const ts_object*)ts_ptr(v))->shape & TS_OBJ_FROZEN_BIT) != 0; }
+static inline int ts_store_frozen(tsv v){ return (((const ts_object*)ts_obj_ptr(v))->shape & TS_OBJ_FROZEN_BIT) != 0; }
 static inline void ts_obj_set_shape(ts_object* o, uint32_t shape){
   o->shape = (o->shape & ~TS_SHAPE_MAX) | (shape & TS_SHAPE_MAX);
 }
@@ -805,7 +865,7 @@ int ts_gc_debug_cell_gen(tsv v);       /* a cell header's generation (tests) */
 extern uintptr_t g_gc_debug_watch;    /* tests: the conservative scan reports the word naming this cell */
 #endif
 static inline int ts_typed_slow(tsv v){
-  return !ts_is_obj(v) || !ts_obj_is_sized((const ts_object*)ts_ptr(v));
+  return !ts_is_obj(v) || !ts_obj_is_sized((const ts_object*)ts_obj_ptr(v));
 }
 /* A receiver outside the class interval [lo, lo + span) of a typed access
    (the class index words of the access's class and its subclasses): not a
@@ -814,14 +874,14 @@ static inline int ts_typed_slow(tsv v){
    instance of another class (a borrowed or grafted method's `this`) takes
    the generic path too. */
 static inline int ts_typed_outside(tsv v, uint32_t lo, uint32_t span){
-  return !ts_is_obj(v) || (uint32_t)(((const ts_object*)ts_ptr(v))->cls - lo) >= span;
+  return !ts_is_obj(v) || (uint32_t)(((const ts_object*)ts_obj_ptr(v))->cls - lo) >= span;
 }
 /* A borrowed method's `this` that is not an instance of the class its `this.m()` was resolved from
    (docs/foreign_receivers_design.md, "Direct calls on a borrowed `this`"): a class without struct fields has plain
    objects for instances, so its test is the prototype, then the chain (a subclass's instance). */
 int ts_this_outside_proto_slow(tsv v, tsv proto);
 static inline int ts_this_outside_proto(tsv v, tsv proto){
-  if (TS_RT_LIKELY(ts_is_obj(v) && ((const ts_object*)ts_ptr(v))->proto == proto)) return 0;
+  if (TS_RT_LIKELY(ts_is_obj(v) && ((const ts_object*)ts_obj_ptr(v))->proto == proto)) return 0;
   return ts_this_outside_proto_slow(v, proto);
 }
 /* A class method read as a value (not called): it may run with any `this`
@@ -1147,7 +1207,7 @@ tsv ts_method_lookup_sized_fill(tsv recv, ts_key fkey, ts_key mkey, ts_prop_ic* 
 /* The site's cached method for `recv` (1, in *out), or 0. */
 TS_RT_ALWAYS_INLINE int ts_method_site_hit(tsv recv, const ts_method_site_ic* sic, tsv* out){
   if (TS_TOP16(recv) == TS_SEL_OBJECT){
-    const ts_sized_head* o = (const ts_sized_head*)ts_ptr(recv);
+    const ts_sized_head* o = (const ts_sized_head*)ts_obj_ptr(recv);
     if (o->cls == sic->cls && sic->cls != 0u && ts_obj_is_sized((const ts_object*)o)){
       tsv v;
       if (sic->kind == TS_MSIC_FIELD){
@@ -1159,7 +1219,7 @@ TS_RT_ALWAYS_INLINE int ts_method_site_hit(tsv recv, const ts_method_site_ic* si
         if (pr->key != sic->key || (pr->flags & TS_PROP_ACCESSOR)) return 0;
         v = pr->val;
       } else if (sic->epoch == g_class_relink_epoch && !o->dyn){
-        const ts_object* hd = (const ts_object*)ts_ptr(sic->holder);
+        const ts_object* hd = (const ts_object*)ts_obj_ptr(sic->holder);
         if (hd->shape != sic->holder_shape) return 0;
         v = *ts_obj_slot_ptr((ts_object*)hd, sic->slot);
       } else return 0;
@@ -1312,7 +1372,7 @@ typedef struct ts_array {
 } ts_array;
 
 static inline int ts_is_indexed_array_fast(tsv v){
-  return ts_is_obj(v) && ((ts_gc_header*)ts_ptr(v))->kind == TS_KIND_ARRAY;
+  return ts_is_obj(v) && ((ts_gc_header*)ts_obj_ptr(v))->kind == TS_KIND_ARRAY;
 }
 /* A dictionary array (`sparse` == TS_ARRAY_DICT, docs/dictionary_arrays_design.md): an element with an accessor or
    an attribute of its own, or a read-only length, moved every element to the property map under its index key. cap is
@@ -1321,9 +1381,9 @@ static inline int ts_is_indexed_array_fast(tsv v){
 #define TS_ARRAY_DICT 2
 #define TS_ARRAY_LENGTH_READONLY 1u   /* kind_spare */
 static inline int ts_is_plain_array(tsv v){
-  return ts_is_indexed_array_fast(v) && ((ts_array*)ts_ptr(v))->sparse != TS_ARRAY_DICT;
+  return ts_is_indexed_array_fast(v) && ((ts_array*)ts_obj_ptr(v))->sparse != TS_ARRAY_DICT;
 }
-static inline int ts_array_is_empty(tsv v){ return ts_is_plain_array(v) && ((ts_array*)ts_ptr(v))->len == 0; }
+static inline int ts_array_is_empty(tsv v){ return ts_is_plain_array(v) && ((ts_array*)ts_obj_ptr(v))->len == 0; }
 /* Typed arrays (docs/typed_arrays_design.md): a buffer owns bytes outside the
    heap; a view points into them and keeps the buffer alive. */
 enum { TS_TA_INT8, TS_TA_UINT8, TS_TA_UINT8C, TS_TA_INT16, TS_TA_UINT16, TS_TA_INT32,
@@ -1354,14 +1414,14 @@ typedef struct ts_typedarray {
   tsv buffer;
 } ts_typedarray;
 static inline int ts_is_typed_array(tsv v){
-  return ts_is_obj(v) && ((ts_gc_header*)ts_ptr(v))->kind == TS_KIND_TYPEDARRAY;
+  return ts_is_obj(v) && ((ts_gc_header*)ts_obj_ptr(v))->kind == TS_KIND_TYPEDARRAY;
 }
 /* One test for both kinds (they are adjacent). */
 static inline int ts_kind_is_buffer_or_view(uint8_t kind){
   return (uint8_t)(kind - TS_KIND_ARRAYBUFFER) <= (uint8_t)(TS_KIND_TYPEDARRAY - TS_KIND_ARRAYBUFFER);
 }
 static inline int ts_is_array_buffer(tsv v){
-  return ts_is_obj(v) && ((ts_gc_header*)ts_ptr(v))->kind == TS_KIND_ARRAYBUFFER;
+  return ts_is_obj(v) && ((ts_gc_header*)ts_obj_ptr(v))->kind == TS_KIND_ARRAYBUFFER;
 }
 tsv  ts_new_typed_array(int elem, tsv* args, int n);
 tsv  ts_new_shared_array_buffer(uint32_t n);   /* a store in shared memory */
@@ -1421,12 +1481,12 @@ static inline int ts_is_array_fast(tsv v){
 TS_RT_COLD_CALL double ts_length_slow(tsv v);
 static inline double ts_length(tsv v){
   if (ts_is_str(v)) return (double)ts_str_len_typed(v);
-  if (ts_is_indexed_array_fast(v)) return (double)((ts_array*)ts_ptr(v))->len;
+  if (ts_is_indexed_array_fast(v)) return (double)((ts_array*)ts_obj_ptr(v))->len;
   return ts_length_slow(v);
 }
 TS_RT_COLD_CALL uint32_t ts_array_len_foreign(tsv v);   /* a Proxy's length through its trap; null and undefined throw; 0 for anything else */
 static inline uint32_t ts_array_len_fast(tsv arr){
-  return TS_RT_LIKELY(ts_is_indexed_array_fast(arr)) ? ((ts_array*)ts_ptr(arr))->len : ts_array_len_foreign(arr);
+  return TS_RT_LIKELY(ts_is_indexed_array_fast(arr)) ? ((ts_array*)ts_obj_ptr(arr))->len : ts_array_len_foreign(arr);
 }
 /* Array.isArray: an array, or a Proxy whose target is one (ECMA-262 IsArray). */
 TS_RT_COLD_CALL int ts_array_is_array_slow(tsv v);
@@ -1441,11 +1501,11 @@ static inline int ts_array_is_array(tsv v){
    it knows the cell's kind). The first limb stood there, so `1n instanceof A` was true. */
 typedef struct ts_bigint { ts_gc_header h; uint32_t len, neg; uint32_t cls, shape; uint64_t limb[]; } ts_bigint;
 _Static_assert(TS_CELL_ZERO_WORDS(ts_bigint), "a BigInt answers the class and shape words with zero");
-static inline int ts_is_bigint(tsv v){ return ts_is_obj(v) && ((ts_gc_header*)ts_ptr(v))->kind == TS_KIND_BIGINT; }
+static inline int ts_is_bigint(tsv v){ return ts_is_obj(v) && ((ts_gc_header*)ts_obj_ptr(v))->kind == TS_KIND_BIGINT; }
 /* a primitive in a cell: what the tests for an object must leave out */
 static inline int ts_is_prim_cell(tsv v){
   if (!ts_is_obj(v)) return 0;
-  uint8_t k = ((ts_gc_header*)ts_ptr(v))->kind;
+  uint8_t k = ((ts_gc_header*)ts_obj_ptr(v))->kind;
   return k == TS_KIND_SYMBOL || k == TS_KIND_BIGINT;
 }
 extern int g_has_bigint;
@@ -1473,7 +1533,7 @@ TS_RT_ALWAYS_INLINE int ts_truthy_fast(tsv v){
   if (ts_is_num(v)){ double d=ts_to_num(v); return d!=0 && !(d!=d); }
   uint16_t t = TS_TOP16(v);
 #ifdef TS_PROGRAM_BIGINT
-  if (t == TS_SEL_OBJECT) return !(((ts_gc_header*)ts_ptr(v))->kind == TS_KIND_BIGINT && ((ts_bigint*)ts_ptr(v))->len == 0);
+  if (t == TS_SEL_OBJECT) return !(((ts_gc_header*)ts_obj_ptr(v))->kind == TS_KIND_BIGINT && ((ts_bigint*)ts_obj_ptr(v))->len == 0);
   if (t == TS_SEL_FUNC) return 1;
 #else
   if (t == TS_SEL_OBJECT || t == TS_SEL_FUNC) return 1;
@@ -2707,10 +2767,10 @@ void ts_frame_restore(ts_frame_hdr* frame);
    value is never young, so the tag answers both without a load; most stores
    go to young owners, so the owner is tested first. */
 static inline void ts_write_barrier(tsv owner, tsv value){
-  if (!(ts_is_obj(value)||ts_is_func(value)||ts_is_heap_str(value))) return;
-  if (!(ts_is_obj(owner)||ts_is_func(owner)||ts_is_heap_str(owner))) return;
-  uint64_t op = owner & TS_PAYLOAD_MASK, vp = value & TS_PAYLOAD_MASK;
-  if (((op | vp) & TS_PTR_STACK_TAG) || !op || !vp) return;
+  if (!ts_is_heap_ref(value)) return;
+  if (!ts_is_heap_ref(owner)) return;
+  uint64_t op = ts_payload(owner), vp = ts_payload(value);
+  if (ts_payload_stack_tagged(op | vp) || !op || !vp) return;
   ts_gc_header* oh = (ts_gc_header*)(uintptr_t)op;
   if (oh->gen != TS_GEN_OLD || ((const ts_gc_header*)(uintptr_t)vp)->gen != TS_GEN_YOUNG) return;
   ts_gc_remember(oh);
@@ -2723,9 +2783,9 @@ static inline void ts_write_barrier_hdr(ts_gc_header* oh, tsv value){
   if (TS_RT_LIKELY(oh->gen != TS_GEN_OLD)) return;
   /* a remembered class instance is scanned whole at the next young collection, whatever the value */
   if ((oh->flags & (TS_HDR_REMEMBERED | TS_HDR_SIZED)) == (TS_HDR_REMEMBERED | TS_HDR_SIZED)) return;
-  if (!(ts_is_obj(value)||ts_is_func(value)||ts_is_heap_str(value))) return;
-  uint64_t vp = value & TS_PAYLOAD_MASK;
-  if ((vp & TS_PTR_STACK_TAG) || !vp) return;
+  if (!ts_is_heap_ref(value)) return;
+  uint64_t vp = ts_payload(value);
+  if (ts_payload_stack_tagged(vp) || !vp) return;
   if (((const ts_gc_header*)(uintptr_t)vp)->gen != TS_GEN_YOUNG) return;
   ts_gc_remember(oh);
 }
@@ -2757,11 +2817,11 @@ static inline void ts_write_barrier_at(tsv owner, ts_gc_header* oh, tsv* p, tsv 
 static inline void ts_write_barrier_ptr(tsv owner, tsv* p, tsv value){
   /* the callers store into a slot of `owner`, an object they probed: its
      generation first (a stack cell is NONHEAP), the value only for an old one */
-  ts_gc_header* oh = (ts_gc_header*)ts_ptr(owner);
+  ts_gc_header* oh = (ts_gc_header*)ts_obj_ptr(owner);
   if (TS_RT_LIKELY(oh->gen != TS_GEN_OLD)) return;
-  if (!(ts_is_obj(value)||ts_is_func(value)||ts_is_heap_str(value))) return;
-  uint64_t vp = value & TS_PAYLOAD_MASK;
-  if ((vp & TS_PTR_STACK_TAG) || !vp) return;
+  if (!ts_is_heap_ref(value)) return;
+  uint64_t vp = ts_payload(value);
+  if (ts_payload_stack_tagged(vp) || !vp) return;
   if (((const ts_gc_header*)(uintptr_t)vp)->gen != TS_GEN_YOUNG) return;
   ts_write_barrier_at(owner, oh, p, value);
 }
@@ -2776,7 +2836,7 @@ static inline void ts_write_barrier_ptr(tsv owner, tsv* p, tsv value){
 TS_RT_ALWAYS_INLINE tsv* ts_prop_ic_probe_fixed_inline(
     tsv obj, ts_key key, ts_prop_ic* ic, uint8_t* flags){
   if (!ic || ic->megamorphic || TS_TOP16(obj) != TS_SEL_OBJECT) return NULL;
-  ts_object* o = (ts_object*)ts_ptr(obj);
+  ts_object* o = (ts_object*)ts_obj_ptr(obj);
   uint32_t sid = ts_obj_shape_id(o);
   if (o->h.kind > TS_KIND_ARRAY || sid == TS_SHAPE_NONE) return NULL;   /* a plain object or an array */
   /* Entry 0 first: its shape (the monomorphic case), then its slot validated
@@ -2894,7 +2954,7 @@ TS_RT_ALWAYS_INLINE const ts_class_word_cache_entry* ts_class_word_cache_probe(c
    megamorphic site reads the registry's cache by class word instead. */
 TS_RT_ALWAYS_INLINE int ts_get_sized_pic_try(tsv obj, ts_key key, const ts_prop_ic* ic, tsv* out){
   if (!ic || TS_TOP16(obj) != TS_SEL_OBJECT) return 0;
-  const ts_object* o = (const ts_object*)ts_ptr(obj);
+  const ts_object* o = (const ts_object*)ts_obj_ptr(obj);
   if (ic->megamorphic){
     const ts_class_word_cache_entry* c = ts_class_word_cache_probe(o, key);
     if (!c) return 0;
@@ -2927,7 +2987,7 @@ TS_RT_ALWAYS_INLINE tsv ts_get_sized_pic_inline_lazy(tsv obj, ts_key key, ts_pro
 }
 TS_RT_ALWAYS_INLINE int ts_set_sized_pic_try(tsv obj, ts_key key, tsv value, ts_prop_ic* ic){
   if (!ic || TS_TOP16(obj) != TS_SEL_OBJECT) return 0;
-  ts_object* o = (ts_object*)ts_ptr(obj);
+  ts_object* o = (ts_object*)ts_obj_ptr(obj);
   if (ic->megamorphic){
     const ts_class_word_cache_entry* c = ts_class_word_cache_probe(o, key);
     if (!c || ts_obj_integrity(o) != 0u) return 0;
@@ -2963,6 +3023,8 @@ TS_RT_ALWAYS_INLINE void ts_set_sized_pic_inline_lazy(tsv obj, ts_key key, tsv v
 static inline tsv ts_int_slot_box(tsv w){ return ts_num((double)(int32_t)(uint32_t)w); }
 static inline int32_t ts_int_slot_value(tsv w){ return (int32_t)(uint32_t)w; }
 static inline tsv ts_int_slot_word(int32_t i){ return (tsv)(uint32_t)i; }
+/* a store into an integer slot: the slot's word made from the integer (the creation writes the first) */
+#define ts_int_slot_store(p, i) (*(p) = ts_int_slot_word(i))
 /* An object literal of a layout at a site (docs/alloc_fast_path_design.md, "In the generated
    code"): the zeroed run's bump (the fields not written here are zero), the header, the
    prototype, the layout's shape and the slots (an integer slot's zero, undefined); n and kinds are
@@ -3001,13 +3063,13 @@ static inline int ts_int32_exact(tsv v, int32_t* out){
   if (!(d >= -2147483648.0 && d <= 2147483647.0)) return 0;
   int32_t i = (int32_t)d;
   if ((double)i != d) return 0;
-  if (i == 0 && (v >> 63)) return 0;
+  if (i == 0 && ts_num_sign(v)) return 0;
   *out = i;
   return 1;
 }
 static inline void ts_instance_of_evaluation(tsv inst){
-  ts_object* o = (ts_object*)ts_ptr(inst);
-  if (ts_is_obj(o->proto) && TS_RT_UNLIKELY(((ts_object*)ts_ptr(o->proto))->h.flags & TS_HDR_LATER_EVAL)) o->cls |= TS_CLS_RELINKED;
+  ts_object* o = (ts_object*)ts_obj_ptr(inst);
+  if (ts_is_obj(o->proto) && TS_RT_UNLIKELY(((ts_object*)ts_obj_ptr(o->proto))->h.flags & TS_HDR_LATER_EVAL)) o->cls |= TS_CLS_RELINKED;
 }
 TS_RT_ALWAYS_INLINE tsv ts_get_pic_checked_inline(
     tsv obj, ts_key key, ts_prop_ic* ic){
@@ -3035,7 +3097,7 @@ TS_RT_ALWAYS_INLINE tsv ts_method_lookup_dyn_ic(tsv recv, ts_key fkey, ts_key mk
     tsv v = (flags & TS_PROP_INT32) ? ts_int_slot_box(*p) : *p;
     if (ts_is_callable(v)) return v;
   }
-  if (TS_TOP16(recv) == TS_SEL_OBJECT && ts_obj_is_sized((const ts_object*)ts_ptr(recv)))
+  if (TS_TOP16(recv) == TS_SEL_OBJECT && ts_obj_is_sized((const ts_object*)ts_obj_ptr(recv)))
     return ts_method_lookup_dyn_fill(recv, fkey, mkey, field_ic, proto_ic, sic);
   tsv mv = ts_get_pic_checked(recv, fkey, field_ic);
   if (!ts_is_callable(mv)) mv = ts_get_pic_checked_inline(recv, mkey, proto_ic);
@@ -3046,14 +3108,14 @@ TS_RT_ALWAYS_INLINE void ts_set_pic_inline(
   uint8_t flags = 0;
   tsv* p = ts_prop_ic_probe_fixed_inline(obj, key, ic, &flags);
   if (p && !(flags & TS_PROP_ACCESSOR) && (flags & TS_PROP_WRITABLE)){
-    ts_object* o = (ts_object*)ts_ptr(obj);
+    ts_object* o = (ts_object*)ts_obj_ptr(obj);
     if (!(ts_obj_integrity(o) & 1u)){
       if (!(flags & TS_PROP_INT32)){
         TS_RT_STAT_PIC_SET_CALL(); TS_RT_STAT_PIC_SET_HIT(); TS_RT_STAT_INLINE_KEY(g_ts_key_inline_set, key);
         *p = value; ts_write_barrier_ptr(obj, p, value); return;
       }
       int32_t _iv;
-      if (ts_int32_exact(value, &_iv)){ TS_RT_STAT_PIC_SET_CALL(); TS_RT_STAT_PIC_SET_HIT(); *p = ts_int_slot_word(_iv); return; }
+      if (ts_int32_exact(value, &_iv)){ TS_RT_STAT_PIC_SET_CALL(); TS_RT_STAT_PIC_SET_HIT(); ts_int_slot_store(p, _iv); return; }
     }
   }
   ts_set_pic(obj, key, value, ic);
@@ -3081,14 +3143,14 @@ TS_RT_ALWAYS_INLINE void ts_set_pic_inline_sized(
   uint8_t flags = 0;
   tsv* p = ts_prop_ic_probe_fixed_inline(obj, key, ic, &flags);
   if (p && !(flags & TS_PROP_ACCESSOR) && (flags & TS_PROP_WRITABLE)){
-    ts_object* o = (ts_object*)ts_ptr(obj);
+    ts_object* o = (ts_object*)ts_obj_ptr(obj);
     if (!(ts_obj_integrity(o) & 1u)){
       if (!(flags & TS_PROP_INT32)){
         TS_RT_STAT_PIC_SET_CALL(); TS_RT_STAT_PIC_SET_HIT(); TS_RT_STAT_INLINE_KEY(g_ts_key_inline_set, key);
         *p = value; ts_write_barrier_ptr(obj, p, value); return;
       }
       int32_t _iv;
-      if (ts_int32_exact(value, &_iv)){ TS_RT_STAT_PIC_SET_CALL(); TS_RT_STAT_PIC_SET_HIT(); *p = ts_int_slot_word(_iv); return; }
+      if (ts_int32_exact(value, &_iv)){ TS_RT_STAT_PIC_SET_CALL(); TS_RT_STAT_PIC_SET_HIT(); ts_int_slot_store(p, _iv); return; }
     }
   }
   if (ts_set_sized_pic_try(obj, key, value, ic)) return;
@@ -3113,14 +3175,14 @@ TS_RT_ALWAYS_INLINE void ts_set_pic_inline_sized_lazy(
   uint8_t flags = 0;
   tsv* p = ts_prop_ic_probe_fixed_inline(obj, key, ic, &flags);
   if (p && !(flags & TS_PROP_ACCESSOR) && (flags & TS_PROP_WRITABLE)){
-    ts_object* o = (ts_object*)ts_ptr(obj);
+    ts_object* o = (ts_object*)ts_obj_ptr(obj);
     if (!(ts_obj_integrity(o) & 1u)){
       if (!(flags & TS_PROP_INT32)){
         TS_RT_STAT_PIC_SET_CALL(); TS_RT_STAT_PIC_SET_HIT(); TS_RT_STAT_INLINE_KEY(g_ts_key_inline_set, key);
         *p = value; ts_write_barrier_ptr(obj, p, value); return;
       }
       int32_t _iv;
-      if (ts_int32_exact(value, &_iv)){ TS_RT_STAT_PIC_SET_CALL(); TS_RT_STAT_PIC_SET_HIT(); *p = ts_int_slot_word(_iv); return; }
+      if (ts_int32_exact(value, &_iv)){ TS_RT_STAT_PIC_SET_CALL(); TS_RT_STAT_PIC_SET_HIT(); ts_int_slot_store(p, _iv); return; }
     }
   }
   if (ts_set_sized_pic_try(obj, key, value, ic)) return;
@@ -3135,7 +3197,7 @@ TS_RT_ALWAYS_INLINE void ts_set_pic_inline_sized_lazy(
    call was 1% of vue's samples. */
 void ts_lit_store_slow(tsv obj, uint32_t i, tsv v);
 TS_RT_ALWAYS_INLINE void ts_lit_store(tsv obj, uint32_t i, tsv v){
-  ts_object* o = (ts_object*)ts_ptr(obj);
+  ts_object* o = (ts_object*)ts_obj_ptr(obj);
   if (TS_RT_LIKELY(o->h.gen != TS_GEN_OLD && i < o->h.inline_cap && ts_obj_shape_id(o) != TS_SHAPE_NONE)){
     ts_obj_inline_vals(o)[i] = v;
     return;
@@ -3145,14 +3207,14 @@ TS_RT_ALWAYS_INLINE void ts_lit_store(tsv obj, uint32_t i, tsv v){
 /* the same when the object is known to be in the layout's shape (the allocation's shape
    compared once, or a constructor's adopted layout): the range test and the store */
 static inline void ts_lit_store_int_direct(tsv obj, uint32_t i, long long v){
-  if (TS_RT_LIKELY(v >= INT32_MIN && v <= INT32_MAX)){ *ts_obj_slot_ptr((ts_object*)ts_ptr(obj), i) = ts_int_slot_word((int32_t)v); return; }
+  if (TS_RT_LIKELY(v >= INT32_MIN && v <= INT32_MAX)){ ts_int_slot_store(ts_obj_slot_ptr((ts_object*)ts_obj_ptr(obj), i), (int32_t)v); return; }
   ts_lit_store_int_slow(obj, i, v);
 }
 static inline void ts_lit_store_int(tsv obj, uint32_t i, long long v){
-  ts_object* o = (ts_object*)ts_ptr(obj);
+  ts_object* o = (ts_object*)ts_obj_ptr(obj);
   uint32_t sid = ts_obj_shape_id(o);
   if (sid != TS_SHAPE_NONE && (g_ts_shape_flags[sid][i] & TS_PROP_INT32) && v >= INT32_MIN && v <= INT32_MAX){
-    *ts_obj_slot_ptr(o, i) = ts_int_slot_word((int32_t)v);
+    ts_int_slot_store(ts_obj_slot_ptr(o, i), (int32_t)v);
     return;
   }
   ts_lit_store_int_slow(obj, i, v);
@@ -3179,14 +3241,14 @@ TS_RT_ALWAYS_INLINE void ts_set_pic_inline_lazy(
   uint8_t flags = 0;
   tsv* p = ts_prop_ic_probe_fixed_inline(obj, key, ic, &flags);
   if (p && !(flags & TS_PROP_ACCESSOR) && (flags & TS_PROP_WRITABLE)){
-    ts_object* o = (ts_object*)ts_ptr(obj);
+    ts_object* o = (ts_object*)ts_obj_ptr(obj);
     if (!(ts_obj_integrity(o) & 1u)){
       if (!(flags & TS_PROP_INT32)){
         TS_RT_STAT_PIC_SET_CALL(); TS_RT_STAT_PIC_SET_HIT(); TS_RT_STAT_INLINE_KEY(g_ts_key_inline_set, key);
         *p = value; ts_write_barrier_ptr(obj, p, value); return;
       }
       int32_t _iv;
-      if (ts_int32_exact(value, &_iv)){ TS_RT_STAT_PIC_SET_CALL(); TS_RT_STAT_PIC_SET_HIT(); *p = ts_int_slot_word(_iv); return; }
+      if (ts_int32_exact(value, &_iv)){ TS_RT_STAT_PIC_SET_CALL(); TS_RT_STAT_PIC_SET_HIT(); ts_int_slot_store(p, _iv); return; }
     }
   }
   ts_frame_push(frame, nslots);
@@ -3202,7 +3264,7 @@ TS_RT_ALWAYS_INLINE void ts_set_pic_inline_lazy(
    0), an accessor or read-only slot. */
 TS_RT_ALWAYS_INLINE tsv* ts_static_slot_probe(tsv obj, ts_key key, uint32_t slot, uint8_t mask, uint8_t want, const ts_prop_ic* ic){
   if (TS_TOP16(obj) != TS_SEL_OBJECT) return NULL;
-  ts_object* o = (ts_object*)ts_ptr(obj);
+  ts_object* o = (ts_object*)ts_obj_ptr(obj);
   if (o->h.kind > TS_KIND_ARRAY) return NULL;
   uint32_t sid = ts_obj_shape_id(o);
   /* `want` is a constant: plain writable data for a write, no accessor for a read */
@@ -3222,7 +3284,7 @@ TS_RT_ALWAYS_INLINE tsv* ts_static_slot_probe(tsv obj, ts_key key, uint32_t slot
 /* Two predicted slots (constructor layouts that disagree after a gap). */
 TS_RT_ALWAYS_INLINE tsv* ts_static_slot_probe2(tsv obj, ts_key key, uint32_t s1, uint32_t s2, uint8_t mask, uint8_t want, const ts_prop_ic* ic){
   if (TS_TOP16(obj) != TS_SEL_OBJECT) return NULL;
-  ts_object* o = (ts_object*)ts_ptr(obj);
+  ts_object* o = (ts_object*)ts_obj_ptr(obj);
   if (o->h.kind > TS_KIND_ARRAY) return NULL;
   uint32_t sid = ts_obj_shape_id(o);
   /* `want` is a constant: plain writable data for a write, no accessor for a read */
@@ -3242,7 +3304,7 @@ TS_RT_ALWAYS_INLINE tsv* ts_static_slot_probe2(tsv obj, ts_key key, uint32_t s1,
    compiler's object, union and intrinsic types). */
 TS_RT_ALWAYS_INLINE tsv* ts_static_slot_probe3(tsv obj, ts_key key, uint32_t s1, uint32_t s2, uint32_t s3, uint8_t mask, uint8_t want, const ts_prop_ic* ic){
   if (TS_TOP16(obj) != TS_SEL_OBJECT) return NULL;
-  ts_object* o = (ts_object*)ts_ptr(obj);
+  ts_object* o = (ts_object*)ts_obj_ptr(obj);
   if (o->h.kind > TS_KIND_ARRAY) return NULL;
   uint32_t sid = ts_obj_shape_id(o);
   /* `want` is a constant: plain writable data for a write, no accessor for a read */
@@ -3263,7 +3325,7 @@ TS_RT_ALWAYS_INLINE tsv* ts_static_slot_probe3(tsv obj, ts_key key, uint32_t s1,
    integer slots pays the old sequence), an integer slot's word is boxed in line. */
 TS_RT_ALWAYS_INLINE tsv ts_get_static_inline(tsv obj, ts_key key, uint32_t slot, ts_prop_ic* ic){
   if (TS_RT_LIKELY(TS_TOP16(obj) == TS_SEL_OBJECT)){
-    ts_object* o = (ts_object*)ts_ptr(obj);
+    ts_object* o = (ts_object*)ts_obj_ptr(obj);
     if (TS_RT_LIKELY(o->h.kind <= TS_KIND_ARRAY)){
       const ts_key* ks = g_ts_probe_rkeys + (size_t)ts_obj_shape_id(o) * TS_STATIC_SLOT_LIMIT;
       ts_key e = ks[slot];
@@ -3298,41 +3360,41 @@ TS_RT_ALWAYS_INLINE tsv ts_get_static3_inline(tsv obj, ts_key key, uint32_t s1, 
 }
 TS_RT_ALWAYS_INLINE void ts_set_static_inline(tsv obj, ts_key key, uint32_t slot, tsv value, ts_prop_ic* ic){
   tsv* p = ts_static_slot_probe(obj, key, slot, TS_PROP_ACCESSOR | TS_PROP_WRITABLE, TS_PROP_WRITABLE, ic);
-  if (p && !(ts_obj_integrity((ts_object*)ts_ptr(obj)) & 1u)){
+  if (p && !(ts_obj_integrity((ts_object*)ts_obj_ptr(obj)) & 1u)){
     TS_RT_STAT_STATIC(set_hit);
     *p = value; ts_write_barrier_ptr(obj, p, value); return;
   }
   { tsv* q = ts_static_slot_probe(obj, key | TS_PROBE_INT_TAG, slot, TS_PROP_ACCESSOR | TS_PROP_WRITABLE, TS_PROP_WRITABLE, ic); int32_t _iv;
-    if (q && !(ts_obj_integrity((ts_object*)ts_ptr(obj)) & 1u) && ts_int32_exact(value, &_iv)){ TS_RT_STAT_STATIC(set_hit); *q = ts_int_slot_word(_iv); return; } }
+    if (q && !(ts_obj_integrity((ts_object*)ts_obj_ptr(obj)) & 1u) && ts_int32_exact(value, &_iv)){ TS_RT_STAT_STATIC(set_hit); ts_int_slot_store(q, _iv); return; } }
   TS_RT_STAT_STATIC(set_miss); TS_RT_STAT_STATIC_MISS_KEY(g_ts_key_static_set_miss, key);
   ts_set_pic(obj, key, value, ic);
 }
 TS_RT_ALWAYS_INLINE void ts_set_static2_inline(tsv obj, ts_key key, uint32_t s1, uint32_t s2, tsv value, ts_prop_ic* ic){
   tsv* p = ts_static_slot_probe2(obj, key, s1, s2, TS_PROP_ACCESSOR | TS_PROP_WRITABLE, TS_PROP_WRITABLE, ic);
-  if (p && !(ts_obj_integrity((ts_object*)ts_ptr(obj)) & 1u)){
+  if (p && !(ts_obj_integrity((ts_object*)ts_obj_ptr(obj)) & 1u)){
     TS_RT_STAT_STATIC(set_hit);
     *p = value; ts_write_barrier_ptr(obj, p, value); return;
   }
   { tsv* q = ts_static_slot_probe2(obj, key | TS_PROBE_INT_TAG, s1, s2, TS_PROP_ACCESSOR | TS_PROP_WRITABLE, TS_PROP_WRITABLE, ic); int32_t _iv;
-    if (q && !(ts_obj_integrity((ts_object*)ts_ptr(obj)) & 1u) && ts_int32_exact(value, &_iv)){ TS_RT_STAT_STATIC(set_hit); *q = ts_int_slot_word(_iv); return; } }
+    if (q && !(ts_obj_integrity((ts_object*)ts_obj_ptr(obj)) & 1u) && ts_int32_exact(value, &_iv)){ TS_RT_STAT_STATIC(set_hit); ts_int_slot_store(q, _iv); return; } }
   TS_RT_STAT_STATIC(set_miss); TS_RT_STAT_STATIC_MISS_KEY(g_ts_key_static_set_miss, key);
   ts_set_pic(obj, key, value, ic);
 }
 TS_RT_ALWAYS_INLINE void ts_set_static3_inline(tsv obj, ts_key key, uint32_t s1, uint32_t s2, uint32_t s3, tsv value, ts_prop_ic* ic){
   tsv* p = ts_static_slot_probe3(obj, key, s1, s2, s3, TS_PROP_ACCESSOR | TS_PROP_WRITABLE, TS_PROP_WRITABLE, ic);
-  if (p && !(ts_obj_integrity((ts_object*)ts_ptr(obj)) & 1u)){
+  if (p && !(ts_obj_integrity((ts_object*)ts_obj_ptr(obj)) & 1u)){
     TS_RT_STAT_STATIC(set_hit);
     *p = value; ts_write_barrier_ptr(obj, p, value); return;
   }
   { tsv* q = ts_static_slot_probe3(obj, key | TS_PROBE_INT_TAG, s1, s2, s3, TS_PROP_ACCESSOR | TS_PROP_WRITABLE, TS_PROP_WRITABLE, ic); int32_t _iv;
-    if (q && !(ts_obj_integrity((ts_object*)ts_ptr(obj)) & 1u) && ts_int32_exact(value, &_iv)){ TS_RT_STAT_STATIC(set_hit); *q = ts_int_slot_word(_iv); return; } }
+    if (q && !(ts_obj_integrity((ts_object*)ts_obj_ptr(obj)) & 1u) && ts_int32_exact(value, &_iv)){ TS_RT_STAT_STATIC(set_hit); ts_int_slot_store(q, _iv); return; } }
   TS_RT_STAT_STATIC(set_miss); TS_RT_STAT_STATIC_MISS_KEY(g_ts_key_static_set_miss, key);
   ts_set_pic(obj, key, value, ic);
 }
 /* Lazily linked frames: the slow path may allocate or throw. */
 TS_RT_ALWAYS_INLINE tsv ts_get_static_inline_lazy(tsv obj, ts_key key, uint32_t slot, ts_prop_ic* ic, ts_frame_hdr* frame, uint32_t nslots){
   if (TS_RT_LIKELY(TS_TOP16(obj) == TS_SEL_OBJECT)){
-    ts_object* o = (ts_object*)ts_ptr(obj);
+    ts_object* o = (ts_object*)ts_obj_ptr(obj);
     if (TS_RT_LIKELY(o->h.kind <= TS_KIND_ARRAY)){
       const ts_key* ks = g_ts_probe_rkeys + (size_t)ts_obj_shape_id(o) * TS_STATIC_SLOT_LIMIT;
       ts_key e = ks[slot];
@@ -3379,7 +3441,7 @@ TS_RT_ALWAYS_INLINE tsv ts_get_static3_inline_lazy(tsv obj, ts_key key, uint32_t
    truncation, as set_val does), else the out-of-line read converted. */
 TS_RT_ALWAYS_INLINE int32_t ts_get_static_int32_inline(tsv obj, ts_key key, uint32_t slot, ts_prop_ic* ic){
   if (TS_RT_LIKELY(TS_TOP16(obj) == TS_SEL_OBJECT)){
-    ts_object* o = (ts_object*)ts_ptr(obj);
+    ts_object* o = (ts_object*)ts_obj_ptr(obj);
     if (TS_RT_LIKELY(o->h.kind <= TS_KIND_ARRAY)){
       const ts_key* ks = g_ts_probe_rkeys + (size_t)ts_obj_shape_id(o) * TS_STATIC_SLOT_LIMIT;
       ts_key e = ks[slot];
@@ -3398,7 +3460,7 @@ TS_RT_ALWAYS_INLINE int32_t ts_get_static_int32_inline(tsv obj, ts_key key, uint
 }
 TS_RT_ALWAYS_INLINE int32_t ts_get_static_int32_inline_lazy(tsv obj, ts_key key, uint32_t slot, ts_prop_ic* ic, ts_frame_hdr* frame, uint32_t nslots){
   if (TS_RT_LIKELY(TS_TOP16(obj) == TS_SEL_OBJECT)){
-    ts_object* o = (ts_object*)ts_ptr(obj);
+    ts_object* o = (ts_object*)ts_obj_ptr(obj);
     if (TS_RT_LIKELY(o->h.kind <= TS_KIND_ARRAY)){
       const ts_key* ks = g_ts_probe_rkeys + (size_t)ts_obj_shape_id(o) * TS_STATIC_SLOT_LIMIT;
       ts_key e = ks[slot];
@@ -3420,7 +3482,7 @@ TS_RT_ALWAYS_INLINE int32_t ts_get_static_int32_inline_lazy(tsv obj, ts_key key,
 }
 TS_RT_ALWAYS_INLINE long long ts_get_static_int64_inline(tsv obj, ts_key key, uint32_t slot, ts_prop_ic* ic){
   if (TS_RT_LIKELY(TS_TOP16(obj) == TS_SEL_OBJECT)){
-    ts_object* o = (ts_object*)ts_ptr(obj);
+    ts_object* o = (ts_object*)ts_obj_ptr(obj);
     if (TS_RT_LIKELY(o->h.kind <= TS_KIND_ARRAY)){
       const ts_key* ks = g_ts_probe_rkeys + (size_t)ts_obj_shape_id(o) * TS_STATIC_SLOT_LIMIT;
       ts_key e = ks[slot];
@@ -3439,7 +3501,7 @@ TS_RT_ALWAYS_INLINE long long ts_get_static_int64_inline(tsv obj, ts_key key, ui
 }
 TS_RT_ALWAYS_INLINE long long ts_get_static_int64_inline_lazy(tsv obj, ts_key key, uint32_t slot, ts_prop_ic* ic, ts_frame_hdr* frame, uint32_t nslots){
   if (TS_RT_LIKELY(TS_TOP16(obj) == TS_SEL_OBJECT)){
-    ts_object* o = (ts_object*)ts_ptr(obj);
+    ts_object* o = (ts_object*)ts_obj_ptr(obj);
     if (TS_RT_LIKELY(o->h.kind <= TS_KIND_ARRAY)){
       const ts_key* ks = g_ts_probe_rkeys + (size_t)ts_obj_shape_id(o) * TS_STATIC_SLOT_LIMIT;
       ts_key e = ks[slot];
@@ -3461,12 +3523,12 @@ TS_RT_ALWAYS_INLINE long long ts_get_static_int64_inline_lazy(tsv obj, ts_key ke
 }
 TS_RT_ALWAYS_INLINE void ts_set_static_inline_lazy(tsv obj, ts_key key, uint32_t slot, tsv value, ts_prop_ic* ic, ts_frame_hdr* frame, uint32_t nslots){
   tsv* p = ts_static_slot_probe(obj, key, slot, TS_PROP_ACCESSOR | TS_PROP_WRITABLE, TS_PROP_WRITABLE, ic);
-  if (p && !(ts_obj_integrity((ts_object*)ts_ptr(obj)) & 1u)){
+  if (p && !(ts_obj_integrity((ts_object*)ts_obj_ptr(obj)) & 1u)){
     TS_RT_STAT_STATIC(set_hit);
     *p = value; ts_write_barrier_ptr(obj, p, value); return;
   }
   { tsv* q = ts_static_slot_probe(obj, key | TS_PROBE_INT_TAG, slot, TS_PROP_ACCESSOR | TS_PROP_WRITABLE, TS_PROP_WRITABLE, ic); int32_t _iv;
-    if (q && !(ts_obj_integrity((ts_object*)ts_ptr(obj)) & 1u) && ts_int32_exact(value, &_iv)){ TS_RT_STAT_STATIC(set_hit); *q = ts_int_slot_word(_iv); return; } }
+    if (q && !(ts_obj_integrity((ts_object*)ts_obj_ptr(obj)) & 1u) && ts_int32_exact(value, &_iv)){ TS_RT_STAT_STATIC(set_hit); ts_int_slot_store(q, _iv); return; } }
   TS_RT_STAT_STATIC(set_miss); TS_RT_STAT_STATIC_MISS_KEY(g_ts_key_static_set_miss, key);
   ts_frame_push(frame, nslots);
   ts_set_pic(obj, key, value, ic);
@@ -3474,12 +3536,12 @@ TS_RT_ALWAYS_INLINE void ts_set_static_inline_lazy(tsv obj, ts_key key, uint32_t
 }
 TS_RT_ALWAYS_INLINE void ts_set_static2_inline_lazy(tsv obj, ts_key key, uint32_t s1, uint32_t s2, tsv value, ts_prop_ic* ic, ts_frame_hdr* frame, uint32_t nslots){
   tsv* p = ts_static_slot_probe2(obj, key, s1, s2, TS_PROP_ACCESSOR | TS_PROP_WRITABLE, TS_PROP_WRITABLE, ic);
-  if (p && !(ts_obj_integrity((ts_object*)ts_ptr(obj)) & 1u)){
+  if (p && !(ts_obj_integrity((ts_object*)ts_obj_ptr(obj)) & 1u)){
     TS_RT_STAT_STATIC(set_hit);
     *p = value; ts_write_barrier_ptr(obj, p, value); return;
   }
   { tsv* q = ts_static_slot_probe2(obj, key | TS_PROBE_INT_TAG, s1, s2, TS_PROP_ACCESSOR | TS_PROP_WRITABLE, TS_PROP_WRITABLE, ic); int32_t _iv;
-    if (q && !(ts_obj_integrity((ts_object*)ts_ptr(obj)) & 1u) && ts_int32_exact(value, &_iv)){ TS_RT_STAT_STATIC(set_hit); *q = ts_int_slot_word(_iv); return; } }
+    if (q && !(ts_obj_integrity((ts_object*)ts_obj_ptr(obj)) & 1u) && ts_int32_exact(value, &_iv)){ TS_RT_STAT_STATIC(set_hit); ts_int_slot_store(q, _iv); return; } }
   TS_RT_STAT_STATIC(set_miss); TS_RT_STAT_STATIC_MISS_KEY(g_ts_key_static_set_miss, key);
   ts_frame_push(frame, nslots);
   ts_set_pic(obj, key, value, ic);
@@ -3487,12 +3549,12 @@ TS_RT_ALWAYS_INLINE void ts_set_static2_inline_lazy(tsv obj, ts_key key, uint32_
 }
 TS_RT_ALWAYS_INLINE void ts_set_static3_inline_lazy(tsv obj, ts_key key, uint32_t s1, uint32_t s2, uint32_t s3, tsv value, ts_prop_ic* ic, ts_frame_hdr* frame, uint32_t nslots){
   tsv* p = ts_static_slot_probe3(obj, key, s1, s2, s3, TS_PROP_ACCESSOR | TS_PROP_WRITABLE, TS_PROP_WRITABLE, ic);
-  if (p && !(ts_obj_integrity((ts_object*)ts_ptr(obj)) & 1u)){
+  if (p && !(ts_obj_integrity((ts_object*)ts_obj_ptr(obj)) & 1u)){
     TS_RT_STAT_STATIC(set_hit);
     *p = value; ts_write_barrier_ptr(obj, p, value); return;
   }
   { tsv* q = ts_static_slot_probe3(obj, key | TS_PROBE_INT_TAG, s1, s2, s3, TS_PROP_ACCESSOR | TS_PROP_WRITABLE, TS_PROP_WRITABLE, ic); int32_t _iv;
-    if (q && !(ts_obj_integrity((ts_object*)ts_ptr(obj)) & 1u) && ts_int32_exact(value, &_iv)){ TS_RT_STAT_STATIC(set_hit); *q = ts_int_slot_word(_iv); return; } }
+    if (q && !(ts_obj_integrity((ts_object*)ts_obj_ptr(obj)) & 1u) && ts_int32_exact(value, &_iv)){ TS_RT_STAT_STATIC(set_hit); ts_int_slot_store(q, _iv); return; } }
   TS_RT_STAT_STATIC(set_miss); TS_RT_STAT_STATIC_MISS_KEY(g_ts_key_static_set_miss, key);
   ts_frame_push(frame, nslots);
   ts_set_pic(obj, key, value, ic);
@@ -3519,7 +3581,7 @@ void ts_array_set_key_f64(tsv arr, double d, tsv v);
    buffer. */
 static inline ts_typedarray* ts_ta_as(tsv v, int elem){
   if (!ts_is_obj(v)) return NULL;
-  ts_typedarray* t = (ts_typedarray*)ts_ptr(v);
+  ts_typedarray* t = (ts_typedarray*)ts_obj_ptr(v);
   return t->o.h.kind == TS_KIND_TYPEDARRAY && t->elem == (uint8_t)elem ? t : NULL;
 }
 static inline uint8_t ts_ta_clamp_u8(double d){
@@ -3695,7 +3757,7 @@ TS_RT_ALWAYS_INLINE int ts_ta_try_store_f(tsv v, double d, double x, int elem){
    timestamps, and 14% longer on n + 0.5 alone (Session 367, the simulation
    in docs/map_direct_index_design.md). The map code and the inline lookups
    below share it. */
-#define TS_MAPSET_NEG_ZERO 0x8000000000000000ull
+#define TS_MAPSET_NEG_ZERO TS_NUM_NEG_ZERO_WORD
 TS_RT_ALWAYS_INLINE uint32_t sv0_hash_num_d(double d){
   uint64_t bits;
   if (d == 0) d = 0;                            /* -0 -> +0 */
@@ -3731,7 +3793,7 @@ TS_RT_ALWAYS_INLINE uint32_t ts_str_hash_fast(tsv s){
    half of the product mixing every address bit into the index bits; the same
    value the runtime's sv0_hash gives a heap reference. */
 TS_RT_ALWAYS_INLINE uint32_t ts_ref_hash(tsv k){
-  uint64_t x = ((k & TS_PAYLOAD_MASK) >> 4) * 0x9E3779B97F4A7C15ull;
+  uint64_t x = (ts_payload(k) >> 4) * 0x9E3779B97F4A7C15ull;
   return (uint32_t)(x >> 32);
 }
 /* The candidate whose hash bits match but whose bits differ: SameValueZero,
@@ -3759,7 +3821,7 @@ TS_RT_ALWAYS_INLINE void ts_mapset_probe_inline(const uint32_t* index, uint32_t 
    all, takes the general entry. */
 TS_RT_ALWAYS_INLINE int ts_map_probe_str(tsv mv, tsv k, long* out){
   if (TS_RT_UNLIKELY(!ts_is_obj(mv))) return 0;
-  ts_map* m = (ts_map*)ts_ptr(mv);
+  ts_map* m = (ts_map*)ts_obj_ptr(mv);
   if (TS_RT_UNLIKELY(m->o.h.kind != TS_KIND_MAP || m->weak || !m->index)) return 0;
   if (TS_RT_UNLIKELY(!ts_is_str(k))) return 0;
   ts_mapset_probe_inline(m->index, m->index_cap, m->keys, k, ts_str_hash_fast(k), 0, out);
@@ -3771,7 +3833,7 @@ TS_RT_ALWAYS_INLINE int ts_map_probe_str(tsv mv, tsv k, long* out){
    general entry. */
 TS_RT_ALWAYS_INLINE int ts_map_probe_ref(tsv mv, tsv k, long* out){
   if (TS_RT_UNLIKELY(!ts_is_obj(mv))) return 0;
-  ts_map* m = (ts_map*)ts_ptr(mv);
+  ts_map* m = (ts_map*)ts_obj_ptr(mv);
   if (TS_RT_UNLIKELY(m->o.h.kind != TS_KIND_MAP || m->weak || !m->index)) return 0;
   if (TS_RT_UNLIKELY(!(ts_is_obj(k) || ts_is_func(k)))) return 0;
   ts_mapset_probe_inline(m->index, m->index_cap, m->keys, k, ts_ref_hash(k), 1, out);
@@ -3779,7 +3841,7 @@ TS_RT_ALWAYS_INLINE int ts_map_probe_ref(tsv mv, tsv k, long* out){
 }
 TS_RT_ALWAYS_INLINE tsv ts_map_get_str(tsv mv, tsv k){
   long i;
-  if (TS_RT_LIKELY(ts_map_probe_str(mv, k, &i))){ TS_RT_STAT_MAPPROBE(i >= 0 ? 5 : 6); return i >= 0 ? ((ts_map*)ts_ptr(mv))->vals[i] : TS_UNDEFINED; }
+  if (TS_RT_LIKELY(ts_map_probe_str(mv, k, &i))){ TS_RT_STAT_MAPPROBE(i >= 0 ? 5 : 6); return i >= 0 ? ((ts_map*)ts_obj_ptr(mv))->vals[i] : TS_UNDEFINED; }
   TS_RT_STAT_MAPPROBE(7);
   return ts_map_get(mv, k);
 }
@@ -3791,7 +3853,7 @@ TS_RT_ALWAYS_INLINE int ts_map_has_str(tsv mv, tsv k){
 }
 TS_RT_ALWAYS_INLINE tsv ts_map_get_ref(tsv mv, tsv k){
   long i;
-  if (TS_RT_LIKELY(ts_map_probe_ref(mv, k, &i))){ TS_RT_STAT_MAPPROBE(i >= 0 ? 8 : 9); return i >= 0 ? ((ts_map*)ts_ptr(mv))->vals[i] : TS_UNDEFINED; }
+  if (TS_RT_LIKELY(ts_map_probe_ref(mv, k, &i))){ TS_RT_STAT_MAPPROBE(i >= 0 ? 8 : 9); return i >= 0 ? ((ts_map*)ts_obj_ptr(mv))->vals[i] : TS_UNDEFINED; }
   TS_RT_STAT_MAPPROBE(10);
   return ts_map_get(mv, k);
 }
@@ -3806,14 +3868,14 @@ TS_RT_ALWAYS_INLINE int ts_map_has_ref(tsv mv, tsv k){
    anything else (not a WeakMap, a map still linear, a symbol key) takes the general entry. */
 TS_RT_ALWAYS_INLINE int ts_weakmap_probe_ref(tsv mv, tsv k, long* out){
   if (TS_RT_UNLIKELY(!ts_is_obj(mv) || !(ts_is_obj(k) || ts_is_func(k)))) return 0;
-  ts_map* m = (ts_map*)ts_ptr(mv);
+  ts_map* m = (ts_map*)ts_obj_ptr(mv);
   if (TS_RT_UNLIKELY(m->o.h.kind != TS_KIND_MAP || !m->weak || !m->index)) return 0;
   ts_mapset_probe_inline(m->index, m->index_cap, m->keys, k, ts_ref_hash(k), 1, out);
   return 1;
 }
 TS_RT_ALWAYS_INLINE tsv ts_weakmap_get_ref(tsv mv, tsv k){
   long i;
-  if (TS_RT_LIKELY(ts_weakmap_probe_ref(mv, k, &i))) return i >= 0 ? ((ts_map*)ts_ptr(mv))->vals[i] : TS_UNDEFINED;
+  if (TS_RT_LIKELY(ts_weakmap_probe_ref(mv, k, &i))) return i >= 0 ? ((ts_map*)ts_obj_ptr(mv))->vals[i] : TS_UNDEFINED;
   return ts_weakmap_get(mv, k);
 }
 TS_RT_ALWAYS_INLINE int ts_weakmap_has_ref(tsv mv, tsv k){
@@ -3825,7 +3887,7 @@ TS_RT_ALWAYS_INLINE int ts_weakmap_has_ref(tsv mv, tsv k){
    indexed set's probe in line, as for Maps. */
 TS_RT_ALWAYS_INLINE int ts_set_probe_str(tsv sv, tsv k, long* out){
   if (TS_RT_UNLIKELY(!ts_is_obj(sv))) return 0;
-  ts_set_t* s = (ts_set_t*)ts_ptr(sv);
+  ts_set_t* s = (ts_set_t*)ts_obj_ptr(sv);
   if (TS_RT_UNLIKELY(s->o.h.kind != TS_KIND_SET || s->weak || !s->index)) return 0;
   if (TS_RT_UNLIKELY(!ts_is_str(k))) return 0;
   ts_mapset_probe_inline(s->index, s->index_cap, s->elems, k, ts_str_hash_fast(k), 0, out);
@@ -3833,7 +3895,7 @@ TS_RT_ALWAYS_INLINE int ts_set_probe_str(tsv sv, tsv k, long* out){
 }
 TS_RT_ALWAYS_INLINE int ts_set_probe_ref(tsv sv, tsv k, long* out){
   if (TS_RT_UNLIKELY(!ts_is_obj(sv))) return 0;
-  ts_set_t* s = (ts_set_t*)ts_ptr(sv);
+  ts_set_t* s = (ts_set_t*)ts_obj_ptr(sv);
   if (TS_RT_UNLIKELY(s->o.h.kind != TS_KIND_SET || s->weak || !s->index)) return 0;
   if (TS_RT_UNLIKELY(!(ts_is_obj(k) || ts_is_func(k)))) return 0;
   ts_mapset_probe_inline(s->index, s->index_cap, s->elems, k, ts_ref_hash(k), 1, out);
@@ -3853,7 +3915,7 @@ TS_RT_ALWAYS_INLINE int ts_set_has_ref(tsv sv, tsv k){
 }
 TS_RT_ALWAYS_INLINE int ts_map_probe_num(tsv mv, double d, long* out){
   if (TS_RT_UNLIKELY(!ts_is_obj(mv))) return 0;
-  ts_map* m = (ts_map*)ts_ptr(mv);
+  ts_map* m = (ts_map*)ts_obj_ptr(mv);
   if (TS_RT_UNLIKELY(m->o.h.kind != TS_KIND_MAP || m->weak)) return 0;
   if (m->direct){
     /* a map of small integer keys (node and symbol ids): the key's own value
@@ -3881,7 +3943,7 @@ TS_RT_ALWAYS_INLINE int ts_map_probe_num(tsv mv, double d, long* out){
 }
 TS_RT_ALWAYS_INLINE tsv ts_map_get_num(tsv mv, double d){
   long i;
-  if (TS_RT_LIKELY(ts_map_probe_num(mv, d, &i))) return i >= 0 ? ((ts_map*)ts_ptr(mv))->vals[i] : TS_UNDEFINED;
+  if (TS_RT_LIKELY(ts_map_probe_num(mv, d, &i))) return i >= 0 ? ((ts_map*)ts_obj_ptr(mv))->vals[i] : TS_UNDEFINED;
   TS_RT_STAT_MAPPROBE(4);
   return ts_map_get(mv, ts_num(d));
 }
@@ -3893,7 +3955,7 @@ TS_RT_ALWAYS_INLINE int ts_map_has_num(tsv mv, double d){
 }
 TS_RT_ALWAYS_INLINE int ts_ta_try_length(tsv v, tsv* out){
   if (!ts_is_obj(v)) return 0;
-  ts_typedarray* t = (ts_typedarray*)ts_ptr(v);
+  ts_typedarray* t = (ts_typedarray*)ts_obj_ptr(v);
   if (t->o.h.kind != TS_KIND_TYPEDARRAY || obj_map_plain(&t->o)->len != 0) return 0;
   *out = ts_num((double)t->length);
   return 1;
@@ -3924,7 +3986,7 @@ static inline tsv ts_array_get_lazy_f64(tsv arr, double d, ts_frame_hdr* frame, 
    before the linked call, reloading them after. */
 TS_RT_ALWAYS_INLINE int ts_get_static_try(tsv obj, ts_key key, uint32_t slot, ts_prop_ic* ic, tsv* out){
   if (TS_RT_LIKELY(TS_TOP16(obj) == TS_SEL_OBJECT)){
-    ts_object* o = (ts_object*)ts_ptr(obj);
+    ts_object* o = (ts_object*)ts_obj_ptr(obj);
     if (TS_RT_LIKELY(o->h.kind <= TS_KIND_ARRAY)){
       const ts_key* ks = g_ts_probe_rkeys + (size_t)ts_obj_shape_id(o) * TS_STATIC_SLOT_LIMIT;
       ts_key e = ks[slot];
@@ -3969,34 +4031,34 @@ TS_RT_ALWAYS_INLINE int ts_get_pic_try(tsv obj, ts_key key, ts_prop_ic* ic, tsv*
 tsv ts_get_linked(tsv obj, ts_key key, ts_prop_ic* ic, ts_frame_hdr* frame, uint32_t nslots);
 TS_RT_ALWAYS_INLINE int ts_set_static_try(tsv obj, ts_key key, uint32_t slot, tsv value, ts_prop_ic* ic){
   tsv* p = ts_static_slot_probe(obj, key, slot, TS_PROP_ACCESSOR | TS_PROP_WRITABLE, TS_PROP_WRITABLE, ic);
-  if (p && !(ts_obj_integrity((ts_object*)ts_ptr(obj)) & 1u)){
+  if (p && !(ts_obj_integrity((ts_object*)ts_obj_ptr(obj)) & 1u)){
     TS_RT_STAT_STATIC(set_hit);
     *p = value; ts_write_barrier_ptr(obj, p, value); return 1;
   }
   { tsv* q = ts_static_slot_probe(obj, key | TS_PROBE_INT_TAG, slot, TS_PROP_ACCESSOR | TS_PROP_WRITABLE, TS_PROP_WRITABLE, ic); int32_t _iv;
-    if (q && !(ts_obj_integrity((ts_object*)ts_ptr(obj)) & 1u) && ts_int32_exact(value, &_iv)){ TS_RT_STAT_STATIC(set_hit); *q = ts_int_slot_word(_iv); return 1; } }
+    if (q && !(ts_obj_integrity((ts_object*)ts_obj_ptr(obj)) & 1u) && ts_int32_exact(value, &_iv)){ TS_RT_STAT_STATIC(set_hit); ts_int_slot_store(q, _iv); return 1; } }
   TS_RT_STAT_STATIC(set_miss); TS_RT_STAT_STATIC_MISS_KEY(g_ts_key_static_set_miss, key);
   return 0;
 }
 TS_RT_ALWAYS_INLINE int ts_set_static2_try(tsv obj, ts_key key, uint32_t s1, uint32_t s2, tsv value, ts_prop_ic* ic){
   tsv* p = ts_static_slot_probe2(obj, key, s1, s2, TS_PROP_ACCESSOR | TS_PROP_WRITABLE, TS_PROP_WRITABLE, ic);
-  if (p && !(ts_obj_integrity((ts_object*)ts_ptr(obj)) & 1u)){
+  if (p && !(ts_obj_integrity((ts_object*)ts_obj_ptr(obj)) & 1u)){
     TS_RT_STAT_STATIC(set_hit);
     *p = value; ts_write_barrier_ptr(obj, p, value); return 1;
   }
   { tsv* q = ts_static_slot_probe2(obj, key | TS_PROBE_INT_TAG, s1, s2, TS_PROP_ACCESSOR | TS_PROP_WRITABLE, TS_PROP_WRITABLE, ic); int32_t _iv;
-    if (q && !(ts_obj_integrity((ts_object*)ts_ptr(obj)) & 1u) && ts_int32_exact(value, &_iv)){ TS_RT_STAT_STATIC(set_hit); *q = ts_int_slot_word(_iv); return 1; } }
+    if (q && !(ts_obj_integrity((ts_object*)ts_obj_ptr(obj)) & 1u) && ts_int32_exact(value, &_iv)){ TS_RT_STAT_STATIC(set_hit); ts_int_slot_store(q, _iv); return 1; } }
   TS_RT_STAT_STATIC(set_miss); TS_RT_STAT_STATIC_MISS_KEY(g_ts_key_static_set_miss, key);
   return 0;
 }
 TS_RT_ALWAYS_INLINE int ts_set_static3_try(tsv obj, ts_key key, uint32_t s1, uint32_t s2, uint32_t s3, tsv value, ts_prop_ic* ic){
   tsv* p = ts_static_slot_probe3(obj, key, s1, s2, s3, TS_PROP_ACCESSOR | TS_PROP_WRITABLE, TS_PROP_WRITABLE, ic);
-  if (p && !(ts_obj_integrity((ts_object*)ts_ptr(obj)) & 1u)){
+  if (p && !(ts_obj_integrity((ts_object*)ts_obj_ptr(obj)) & 1u)){
     TS_RT_STAT_STATIC(set_hit);
     *p = value; ts_write_barrier_ptr(obj, p, value); return 1;
   }
   { tsv* q = ts_static_slot_probe3(obj, key | TS_PROBE_INT_TAG, s1, s2, s3, TS_PROP_ACCESSOR | TS_PROP_WRITABLE, TS_PROP_WRITABLE, ic); int32_t _iv;
-    if (q && !(ts_obj_integrity((ts_object*)ts_ptr(obj)) & 1u) && ts_int32_exact(value, &_iv)){ TS_RT_STAT_STATIC(set_hit); *q = ts_int_slot_word(_iv); return 1; } }
+    if (q && !(ts_obj_integrity((ts_object*)ts_obj_ptr(obj)) & 1u) && ts_int32_exact(value, &_iv)){ TS_RT_STAT_STATIC(set_hit); ts_int_slot_store(q, _iv); return 1; } }
   TS_RT_STAT_STATIC(set_miss); TS_RT_STAT_STATIC_MISS_KEY(g_ts_key_static_set_miss, key);
   return 0;
 }
@@ -4004,24 +4066,24 @@ TS_RT_ALWAYS_INLINE int ts_set_pic_try(tsv obj, ts_key key, tsv value, ts_prop_i
   uint8_t flags = 0;
   tsv* p = ts_prop_ic_probe_fixed_inline(obj, key, ic, &flags);
   if (p && !(flags & TS_PROP_ACCESSOR) && (flags & TS_PROP_WRITABLE)){
-    ts_object* o = (ts_object*)ts_ptr(obj);
+    ts_object* o = (ts_object*)ts_obj_ptr(obj);
     if (!(ts_obj_integrity(o) & 1u)){
       if (!(flags & TS_PROP_INT32)){
         TS_RT_STAT_PIC_SET_CALL(); TS_RT_STAT_PIC_SET_HIT(); TS_RT_STAT_INLINE_KEY(g_ts_key_inline_set, key);
         *p = value; ts_write_barrier_ptr(obj, p, value); return 1;
       }
       int32_t _iv;
-      if (ts_int32_exact(value, &_iv)){ TS_RT_STAT_PIC_SET_CALL(); TS_RT_STAT_PIC_SET_HIT(); *p = ts_int_slot_word(_iv); return 1; }
+      if (ts_int32_exact(value, &_iv)){ TS_RT_STAT_PIC_SET_CALL(); TS_RT_STAT_PIC_SET_HIT(); ts_int_slot_store(p, _iv); return 1; }
     }
   }
   return 0;
 }
 void ts_set_linked(tsv obj, ts_key key, tsv value, ts_prop_ic* ic, ts_frame_hdr* frame, uint32_t nslots);
 /* The hole marker of a sparse array element (never a user-visible value). */
-#define TS_ARRAY_HOLE TS_BOX(0xFFFEu, 0x4152484Fu)
+#define TS_ARRAY_HOLE TS_BOX(TS_SEL_SHORTSTR, 0x4152484Fu)
 static inline int array_is_hole(tsv v){ return v == TS_ARRAY_HOLE; }
 /* The value of a captured binding before its declaration has run (never a user-visible value: docs/tdz_design.md). */
-#define TS_TDZ_HOLE TS_BOX(0xFFFEu, 0x54445A5Au)
+#define TS_TDZ_HOLE TS_BOX(TS_SEL_SHORTSTR, 0x54445A5Au)
 /* A hole reads undefined, unless Array.prototype or Object.prototype was given an element (the library that tracks
    it, docs/array_protocol_design.md): the test is on the path of a hole only. */
 extern int g_proto_elements;
@@ -4041,7 +4103,7 @@ static inline tsv ts_array_hole_value(tsv arr, int64_t i){ return TS_RT_UNLIKELY
    element path for an index and the dynamic property path otherwise. */
 static inline tsv ts_array_get_inline(tsv arr, int64_t i){
   if (ts_is_indexed_array_fast(arr)){
-    ts_array* a = (ts_array*)ts_ptr(arr);
+    ts_array* a = (ts_array*)ts_obj_ptr(arr);
     if ((uint64_t)i < a->cap){ tsv v = a->data[i]; return array_is_hole(v) ? ts_array_hole_value(arr, i) : v; }
     if (!a->sparse && (uint64_t)i < TS_ARRAY_INDEX_LIMIT) return ts_array_hole_value(arr, i);
   }
@@ -4070,7 +4132,7 @@ static inline void ts_array_remember_inline(ts_array* a, uint32_t u, tsv v){
 }
 static inline void ts_array_set_inline(tsv arr, int64_t i, tsv v){
   if (ts_is_indexed_array_fast(arr)){
-    ts_array* a = (ts_array*)ts_ptr(arr);
+    ts_array* a = (ts_array*)ts_obj_ptr(arr);
     if (TS_RT_LIKELY((uint64_t)i < a->cap && ts_obj_integrity(&a->o) == 0u)){
       uint32_t u = (uint32_t)i;
       a->data[u] = v;
@@ -4088,7 +4150,7 @@ static inline void ts_array_set_inline(tsv arr, int64_t i, tsv v){
    there as before). */
 static inline void ts_array_push_inline(tsv arr, tsv v){
   if (ts_is_indexed_array_fast(arr)){
-    ts_array* a = (ts_array*)ts_ptr(arr);
+    ts_array* a = (ts_array*)ts_obj_ptr(arr);
     uint32_t u = a->len;
     if (TS_RT_LIKELY(u < a->cap && ts_obj_integrity(&a->o) == 0u)){
       a->data[u] = v;
@@ -4108,7 +4170,7 @@ static inline void ts_array_set_inline_f64(tsv arr, double d, tsv v){
    ts_forof_open returns an array (walked by index here, in line) or an
    iterator; ts_forof_next returns the next element or TS_ITER_DONE (a marker
    no user value can be: selector 0xFFFE is internal, like the array hole). */
-#define TS_ITER_DONE TS_BOX(0xFFFEu, 0x444F4E45u)
+#define TS_ITER_DONE TS_BOX(TS_SEL_SHORTSTR, 0x444F4E45u)
 /* String accumulators (docs/string_accumulators_design.md): a private buffer
    string a local appends into; each function also accepts an ordinary string. */
 tsv ts_sb_new(tsv init);
@@ -4129,7 +4191,7 @@ tsv ts_forof_next_slow(tsv it, tsv next_method);
 tsv ts_forof_skip_slow(tsv it, tsv next_method);
 /* An array needs no opening; the three tests of a pattern over one fold into one. */
 extern int g_array_iter_patched;   /* Array.prototype[Symbol.iterator] replaced or deleted */
-static inline int ts_forof_plain_array(tsv v){ return ts_is_indexed_array_fast(v) && obj_map_plain((ts_object*)ts_ptr(v))->len == 0 && !g_array_iter_patched; }
+static inline int ts_forof_plain_array(tsv v){ return ts_is_indexed_array_fast(v) && obj_map_plain((ts_object*)ts_obj_ptr(v))->len == 0 && !g_array_iter_patched; }
 static inline tsv ts_forof_open_inline(tsv v){ return ts_forof_plain_array(v) ? v : ts_forof_open(v); }
 static inline tsv ts_forof_open_limit_inline(tsv v, double limit){ return ts_forof_plain_array(v) ? v : ts_forof_open_limit(v, limit); }
 /* The next method of what ts_forof_open returned, read once per loop (GetIterator's record). */
@@ -4139,14 +4201,14 @@ static inline tsv ts_forof_method(tsv it, ts_key nmk){
 static inline tsv ts_forof_next(tsv it, double idx, tsv next_method){
   if (ts_is_indexed_array_fast(it)){
     uint32_t i = (uint32_t)idx;
-    if (i >= ((ts_array*)ts_ptr(it))->len) return TS_ITER_DONE;
+    if (i >= ((ts_array*)ts_obj_ptr(it))->len) return TS_ITER_DONE;
     return ts_array_get_inline(it, i);
   }
   return ts_forof_next_slow(it, next_method);
 }
 /* A pattern's elision: ts_forof_next without the element (undefined for "not done"). */
 static inline tsv ts_forof_skip(tsv it, double idx, tsv next_method){
-  if (ts_is_indexed_array_fast(it)) return (uint32_t)idx >= ((ts_array*)ts_ptr(it))->len ? TS_ITER_DONE : TS_UNDEFINED;
+  if (ts_is_indexed_array_fast(it)) return (uint32_t)idx >= ((ts_array*)ts_obj_ptr(it))->len ? TS_ITER_DONE : TS_UNDEFINED;
   return ts_forof_skip_slow(it, next_method);
 }
 /* IteratorClose of a value an array pattern left open; an array has none to close. */
@@ -4155,7 +4217,7 @@ static inline tsv ts_forof_close(tsv it, ts_key rmk){
 }
 static inline int ts_array_get_inline_try(tsv arr, int64_t i, tsv* out){
   if (ts_is_indexed_array_fast(arr)){
-    ts_array* a = (ts_array*)ts_ptr(arr);
+    ts_array* a = (ts_array*)ts_obj_ptr(arr);
     if ((uint64_t)i < a->cap){ tsv v = a->data[i]; *out = array_is_hole(v) ? ts_array_hole_value(arr, i) : v; return 1; }
     if (!a->sparse && (uint64_t)i < TS_ARRAY_INDEX_LIMIT){ *out = ts_array_hole_value(arr, i); return 1; }
   }
@@ -4177,7 +4239,7 @@ tsv ts_array_get_linked(tsv arr, int64_t i, ts_frame_hdr* frame, uint32_t nslots
 tsv ts_array_get_linked_f64(tsv arr, double d, ts_frame_hdr* frame, uint32_t nslots);
 static inline tsv ts_array_get_inline_lazy(tsv arr, int64_t i, ts_frame_hdr* frame, uint32_t nslots){
   if (ts_is_indexed_array_fast(arr)){
-    ts_array* a = (ts_array*)ts_ptr(arr);
+    ts_array* a = (ts_array*)ts_obj_ptr(arr);
     if ((uint64_t)i < a->cap){ tsv v = a->data[i]; if (TS_RT_LIKELY(!array_is_hole(v) || !g_proto_elements)) return array_is_hole(v) ? TS_UNDEFINED : v; }
     else if (!a->sparse && (uint64_t)i < TS_ARRAY_INDEX_LIMIT && !g_proto_elements) return TS_UNDEFINED;
   }
@@ -4219,7 +4281,7 @@ TS_RT_ALWAYS_INLINE int ts_key_of_string_inline(tsv keyv, ts_key* out){
    entry 0 filled for one key would answer another key's read with its slot. */
 TS_RT_ALWAYS_INLINE tsv* ts_prop_ic_probe_dyn_inline(tsv obj, ts_key key, ts_prop_ic* ic, uint8_t* flags){
   if (!ic || ic->megamorphic) return NULL;
-  ts_object* o = (ts_object*)ts_ptr(obj);
+  ts_object* o = (ts_object*)ts_obj_ptr(obj);
   if (o->h.kind > TS_KIND_ARRAY || ts_obj_is_sized(o) || ts_obj_shape_id(o) == TS_SHAPE_NONE) return NULL;
   for (uint32_t i = 0; i < TS_PROP_IC_SIZE; i++){
     const ts_prop_ic_entry* e = &ic->entries[i];
