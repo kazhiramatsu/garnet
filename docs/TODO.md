@@ -13770,13 +13770,35 @@ only while the numeric analysis says every definition of it is one.
   the statements fuzzer 200 with no difference; hono, hono_app, vue and tsc-ts outputs identical, instructions 1.0001,
   0.9999, 1.0001, 1.0003.
 
-State at the end of the session: `s369-rep1` (51384d5 and this log) is pushed; main is still 1c995c8. Representation 0
-stays the default; representation 1 is `-DTS_VALUE_REP=1` for the runtime and every unit (`TSAOT_CC`, and
-`TSAOT_NATIVE_CC` with `TSAOT_HOST_CC` for tsc-ts).
+**Before main** (Kaz: ci and ir-parity, then main; `build/gates_s369g` and `gates_s369h`, the branch's tip in
+representation 0, with what had last run at 258e79a):
+- Conformance 833 / 833 under protect, GC stress, tsc-ts's corpus 6,537 / 6,537 identical to s2's (`tsc_ts_native_v3c`,
+  51384d5's build).
+- ci failed in `tests/strict_explicit_specialization_gate.sh`, which wanted a `number` field type on `Box$number`: since
+  9e412d7 a class's specialization keeps the generic class's layout, and the gate expects that now (and the
+  specializations `id$number` and `Box$number` themselves, as before). ci passed then.
+- ir-parity: 54 files extra (the nine fixtures added since its snapshot) and 60 different, in the private names' number
+  only (`#count\u000175` against `77`, and the debug names that carry it, `Calc__double_76`). The exporter numbers the
+  classes with private names once per process (`exporter/private_names.ts`: a library file parsed once keeps its names
+  in every program of a batch), and `numbers/value_rep_nan_payloads` uses DataView, whose library file has two such
+  classes, so every fixture after it in the batch counts two more. The snapshot's own set of fixtures, exported by the
+  tip's exporter, is identical (4,932 conformance files; the bundler's and selfhost's were identical in the gate's run).
+  The gate reports the shift until its snapshot is taken again (`build/ir_parity` is shared by the worktrees through a
+  link).
+- bundler failed 54 of 56 at the link: `build/rt.o`, rebuilt only when the runtime's sources are newer, was still
+  representation 1's from `gates_s369c`, and the link guard refused it. `scripts/lib/mf.sh`, `scripts/difftest.sh` and
+  `scripts/typed_selfhost.sh` keep one runtime object per compiler command now (`build/rt-<cksum of the command>.o`);
+  bundler 56 / 56 then, and a `dt` through difftest agrees with V8. (The untracked `build/diff.sh` links `build/rt.o`
+  without rebuilding it: rebuilt in representation 0.)
+
+State at the end of the session: main is `s369-rep1`'s tip (this log), pushed. Representation 0 stays the default;
+representation 1 is `-DTS_VALUE_REP=1` for the runtime and every unit (`TSAOT_CC`, and `TSAOT_NATIVE_CC` with
+`TSAOT_HOST_CC` for tsc-ts).
 
 Next session, in order:
 1. Representation 1's gates not run yet: ci, selfconf and parity (the frozen twin's emitted C: if it cannot pass, its
-   gates pin representation 0), the stack-check build over conformance, the test262 tier, ir-parity, the hono survey.
+   gates pin representation 0), the stack-check build over conformance, the test262 tier, the hono survey. (ir-parity
+   compares the exporter's output, which does not depend on the representation.)
 2. Slice 4's measurements left: a default run of tsc-ts (all processes), the pattern kernels against Node, the binaries'
    sizes, the instruction classes (what the mask and the tag tests are now), the bench kernels over `number[]`.
 3. Kaz's decisions: the default (the design's rule says yes: tsc-ts gains, no kernel left its budget), and whether
