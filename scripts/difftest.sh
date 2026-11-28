@@ -7,7 +7,7 @@
 #   - exporter/node_modules            (npm install in exporter/)
 #   - exporter/exporter.js             (tsc build of exporter.ts)
 #   - analyzer/target/release/tsaot    (cargo build --release)
-#   - build/rt.o                       (gcc -c runtime/ts_rt.c)
+#   - build/rt-<key>.o                 (gcc -c runtime/ts_rt.c, one per compiler command; built here)
 #
 # Compares tsaot's native output against node (which strips TS types via the
 # bundled typescript compiler and evals the result).
@@ -19,7 +19,9 @@ TSAOT_LDLIBS="${TSAOT_LDLIBS:-}"
 . "$ROOT/scripts/lib/mimalloc_flags.sh" || return 1
 . "$ROOT/scripts/lib/regexp_link_flags.sh" || return 1
 mkdir -p "$ROOT/build"
-RT_OBJ="$ROOT/build/rt.o"
+# one object per compiler command: TSAOT_CC can select the value representation (-DTS_VALUE_REP=1), and an
+# object compiled under another does not link (the representation's link guard)
+RT_OBJ="$ROOT/build/rt-$(printf '%s\n' "$CC" | cksum | awk '{print $1}').o"
 if [ ! -f "$RT_OBJ" ] ||
      [ -n "$(find "$ROOT/runtime" -maxdepth 1 \( -name '*.c' -o -name '*.h' \) -newer "$RT_OBJ" -print -quit)" ]; then   # ts_rt.c includes the other runtime files
   $CC -c "$ROOT/runtime/ts_rt.c" -I"$ROOT/runtime" -o "$RT_OBJ" || return 1

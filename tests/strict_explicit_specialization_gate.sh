@@ -45,9 +45,11 @@ check_json "$tmp/default.json" \
   "default exporter must not specialize explicit numeric generics"
 
 node exporter/exporter.js --strict "$tmp/explicit.ts" "$tmp/strict.json" "$tmp/strict.labels.json" >/dev/null 2>"$tmp/strict.err"
+# A class's specialization keeps the generic class's layout (its fields hold values, no field type): the generic
+# class's methods can be handed its instances and read them through the generic struct (Session 369).
 check_json "$tmp/strict.json" \
-  'p.strictTypeOptimizations.enabled === true && p.functions.some(f => f.name === "id$number") && p.classes.some(c => String(c.name).includes("Box$number")) && p.classes.some(c => Object.values(c.fieldTypes || {}).includes("number"))' \
-  "--strict clean program must keep explicit numeric specialization"
+  'p.strictTypeOptimizations.enabled === true && p.functions.some(f => f.name === "id$number") && p.classes.some(c => String(c.name).includes("Box$number")) && !p.classes.some(c => Object.values(c.fieldTypes || {}).includes("number"))' \
+  "--strict clean program must keep explicit numeric specialization, its class in the generic class's layout"
 
 "$TSAOT" "$tmp/strict.json" emit > "$tmp/strict.c" 2>"$tmp/emit.err"
 $CC -c runtime/ts_rt.c -Iruntime -o "$tmp/rt.o" 2>"$tmp/rt.err"

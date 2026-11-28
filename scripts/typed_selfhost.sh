@@ -82,7 +82,9 @@ CC="${TSAOT_CC:-cc -O2}"
 export ROOT CC
 . "$ROOT/scripts/lib/mimalloc_flags.sh" || fail "mimalloc flags"
 . "$ROOT/scripts/lib/regexp_link_flags.sh" || fail "regexp link flags"
-RT_OBJ="$ROOT/build/rt.o"
+# one object per compiler command: TSAOT_CC can select the value representation (-DTS_VALUE_REP=1), and an
+# object compiled under another does not link (the representation's link guard)
+RT_OBJ="$ROOT/build/rt-$(printf '%s\n' "$CC" | cksum | awk '{print $1}').o"
 mkdir -p "$ROOT/build"
 if [ ! -f "$RT_OBJ" ] ||
    [ "$ROOT/runtime/ts_rt.c" -nt "$RT_OBJ" ] ||
